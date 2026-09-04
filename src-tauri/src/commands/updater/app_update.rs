@@ -233,12 +233,42 @@ pub(super) fn progress_payload(info: &Value, stage: ProgressStage<'_>) -> Value 
 /// （`update_popup_show`）能产出，于是弹窗里点「更新」后窗内零反馈、`PopupAction::Cancel`
 /// （仅 Progress 合法）结构性不可达。
 pub(super) fn emit_progress(app: &AppHandle, info: &Value, stage: ProgressStage<'_>) {
-    crate::events::broadcast(
-        app,
-        crate::events::channel::EVENT_UPDATE_PROGRESS,
-        progress_payload(info, stage),
-    );
+    let payload = progress_payload(info, stage);
+    // 快照留档：设置页的更新卡重挂载后靠 `update_get_progress` 回读这一帧（成因见
+    // `runtime/updater.rs` 的 `UpdaterRuntime::last_progress` 字段文档）。
+    //
+    // 存的必须是**这一个** `payload`，不是再调一次 `progress_payload(info, stage)`：那是第二份派生，
+    // 广播出去的与存下来的从此各算各的，一旦 `progress_payload` 里出现任何非纯的东西（时间戳、
+    // 单调计数）两份就会漂，而回读到的与刚收到的事件对不上正是本槽要消掉的那类不一致。
+    //
+    // 位置在广播**之前**：先存后播 ⇒ 收到事件的窗口立刻回读也拿得到这一帧，而不是上一帧。
+    //
+    // 取不到运行时就跳过（与 [`push_popup_state_inner`] 同一写法）：单测环境没有 Tauri runtime，
+    // 快照丢一帧只是回读退化成 `null`，不值得为它 panic。
+    if let Some(rt) = app.try_state::<AppRuntime>() {
+        rt.updater().set_last_progress(payload.clone());
+    }
+    crate::events::broadcast(app, crate::events::channel::EVENT_UPDATE_PROGRESS, payload);
     push_popup_state(app, popup_state_for(info, stage));
+}
+
+/// 回读**最后一帧** App 更新进度（`update:progress` 的原样载荷）。
+///
+/// # 为什么需要一条回读腿
+///
+/// 更新卡的全部状态在组件本地 `useState` 里，初值 idle。组件重挂载（切页 / 窗口销毁重建 /
+/// 轻量模式回收）后它只能等下一帧事件；而下载**已经下完**时那一帧永不再来 —— 卡片就永远停在
+/// 「检查更新」，用户刚下完的那份包在 UI 上凭空消失。下载跑在 `spawn_blocking`，窗口没了照跑。
+///
+/// # `None` ⇒ `null`，不编造 idle 帧
+///
+/// 「本次进程一帧都没发过」与「进度处于 idle」是两回事：前者该让 UI 保持它自己的初值，后者是
+/// 一个后端从不发的态。回一个假的 idle 帧会让 UI 把「不知道」误当成「知道且没在下」。
+#[tauri::command]
+pub async fn update_get_progress(state: State<'_, AppRuntime>) -> Result<ApiResponse<Value>, ()> {
+    Ok(ApiResponse::ok(
+        state.updater().last_progress().unwrap_or(Value::Null),
+    ))
 }
 
 /// 纯映射：一帧下载进度 → 弹窗状态。**与 [`progress_payload`] 同参同源**。
@@ -470,7 +500,7 @@ fn exit_after_detached_update(app: &AppHandle) {
 ///
 /// ✅ **检查侧已接线**：经 `runtime/http.rs` 的真实 client（`state.http()`）走**同一条**
 /// SSRF 安全路径 [`safe_redirect_fetch`](polaris_net_stack::safe_redirect::safe_redirect_fetch)（首 URL + 每跳 Location 都过 `assert_host_allowed`）拉
-/// `2outside/Polaris` 的 releases → `polaris_updater::check_app_update` 纯逻辑转换（过滤 prerelease /
+/// `polaris-arch/Polaris` 的 releases → `polaris_updater::check_app_update` 纯逻辑转换（过滤 prerelease /
 /// 按 `published_at` 挑最新 / `compare_semver` 判新 / 平台架构资产选择 / skip 判定）→ 返
 /// `{ hasUpdate, updateInfo? }`（`updateInfo` 字段与前端 `UpdateInfo` 契约逐字对齐）。
 ///
@@ -1560,7 +1590,7 @@ pub fn update_skip(state: State<'_, AppRuntime>, version: Option<String>) -> Api
 }
 
 /// 泛 releases 列表页（无版本号可用时的回落目标）。
-pub(super) const RELEASES_LIST_URL: &str = "https://github.com/2outside/Polaris/releases";
+pub(super) const RELEASES_LIST_URL: &str = "https://github.com/polaris-arch/Polaris/releases";
 
 /// 拼「查看更新日志」目标 URL（纯函数，可测）：有版本号 → 直达该版本 release 页；否则回落泛列表页。
 ///
