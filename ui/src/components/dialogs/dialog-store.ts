@@ -66,8 +66,11 @@ export type DialogDesc =
   // 仅 localStorage 明确跟踪、且 renderer 重建后由后端 list/status 找回的新增订阅任务。
   | { kind: 'sub-create-task'; operationId: string }
   | { kind: 'warp'; edit?: boolean } // WARP 单例槽，无 serverId（弹窗自查现有节点）
-  | { kind: 'ts-login' }
-  | { kind: 'ts-settings' }
+  // ts-login 身兼新建与编辑：带 serverId = 给该既有节点换 key / 换控制面；不带 = 新建（无节点可编）。
+  | { kind: 'ts-login'; serverId?: string }
+  // Tailscale 不再是单例（meshSingletonConflict 已放宽），必须按 serverId 寻址，否则多节点时
+  // 弹窗会自查到任意一个（通常是第一个）而非调用方想编辑的那个 —— 见 node-edit-routing.ts 的教训。
+  | { kind: 'ts-settings'; serverId: string }
   | { kind: 'taildrop'; serverId: string } // 收件箱按节点开（一个 tailnet 账号 = 一个节点 = 一个收件箱）
   | { kind: 'vpn-auth'; protocol: 'openconnect' | 'openvpn'; serverId: string }
   | { kind: 'wg'; serverId?: string } // WG 可多实例，携 id

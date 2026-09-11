@@ -268,6 +268,16 @@ const IMPL_ONLY: readonly ImplOnlyRow[] = [
       '删除 DNS 策略组会永久移除成员顺序、竞速/回退模式与兜底配置；引用检查只防止悬空引用，不会让删除本身可恢复，' +
       '因此在核心删除按钮上保留原地二次确认。',
   },
+  {
+    key: 'ts-authkey-clear',
+    file: 'components/dialogs/TsSettingsDialog.tsx',
+    why:
+      '清除该 Tailscale 节点已保存的 Auth Key。删的是**长期凭据本身**，界面从不回显它（只显示「已保存/未保存」' +
+      '这一个布尔），因此清掉之后用户没有任何途径把它读回来重填 —— 必须去 Tailscale 控制台重新签发。' +
+      '不可逆的判据在这里不是「盘上还能不能恢复」而是「人还能不能拿回原值」，与同弹窗里可随时改回的' +
+      '主机名 / 出口节点截然不同。它与旁边的「退出登录」也不是同一件事：那条清 state 目录（当前身份），' +
+      '这条清配置（下次拿什么认证），两者各有各的确认。',
+  },
 ];
 
 const PARITY: readonly ParityRow[] = [

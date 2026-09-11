@@ -1045,6 +1045,10 @@ fn main() {
             tailscale_login_cancel,
             tailscale_logout,
             tailscale_state_exists,
+            tun_exclusion_preview,
+            dns_takeover_report,
+            tunnel_conflict_report,
+            endpoint_force_route_report,
             tailscale_get_status,
             // ── OpenConnect / OpenVPN rc.2 原生状态与认证 ──
             vpn_get_status,

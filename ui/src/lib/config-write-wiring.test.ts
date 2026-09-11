@@ -284,7 +284,9 @@ const SITES: readonly Site[] = [
     file: 'components/dialogs/TsSettingsDialog.tsx',
     callee: 'api.server.update(',
     route: 'staged',
-    why: 'servers Class B；写的是该节点的 tailscaleSettings，没有远端副作用（弹窗里从活态回读的只是出口候选列表，不是被写的字段）',
+    why: 'servers Class B；写的是该节点的 tailscaleSettings，没有远端副作用（弹窗里从活态回读的只是出口候选列表，不是被写的字段）。'
+      + '「清除 Auth Key」复用本条腿：它交出的 next 与保存完全同形，只是少了 authKey 这个键（buildTsSettings 的 clearAuthKey 入参），'
+      + '本地删一个 config 键没有任何远端副作用 ⇒ 与其余字段同去向，不另开写入口',
   },
   {
     // cloneServer（含这个调用点）2026-08-30 随 5B 拆分外提到 use-node-actions.ts，登记表跟着落点走。
@@ -322,6 +324,13 @@ const SITES: readonly Site[] = [
     callee: 'api.server.tailscaleLogout(',
     route: 'direct',
     why: 'W-3：清 tailscale state 目录不可逆（BYPASS_TABLE 的 deleteTailscaleNode 同族）',
+  },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.tailscaleLogout(',
+    route: 'direct',
+    why: 'W-3：切 auth_key 前必须先清 state 目录（不清则 tsnet 继续用旧 node key，新 key 不生效），\
+          与 TsSettingsDialog 的登出同族、同样不可逆；且必须在落盘/起核之前发生，进暂存就晚了',
   },
   {
     file: 'components/screens/nodes/NodesScreen.tsx',

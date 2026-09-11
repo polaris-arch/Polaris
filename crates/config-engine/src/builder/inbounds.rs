@@ -7,6 +7,7 @@
 
 use crate::builder::endpoint_routes::{
     collect_rule_targeted_server_ids, mesh_force_routed_servers, mesh_forced_route_cidrs,
+    ObservedTailnetAddresses,
 };
 use crate::builder::helpers::{
     effective_app_rules, effective_custom_rules, get_custom_domestic_dns_endpoint,
@@ -45,6 +46,15 @@ pub struct InboundsDeps {
     /// 日志回调（静默剔除告警：非法段/组网重叠/macOS 物理 LAN 重叠/非直连自定义规则重叠）。
     /// 上游 `deps.log`（`singbox-inbounds-builder.ts` L308-355）。
     pub log: fn(LogLevel, &str),
+    /// 运行期观测到的 tailnet 地址（serverId → 裸地址）。见 [`ObservedTailnetAddresses`]。
+    ///
+    /// **TUN 排除面必须看得见它**：`engaged_mesh` 是「本轮真的会发 force-route 的组网段」，
+    /// 它在本文件有两个下游 —— Windows bypassLAN carve（把组网段从内核排除表里挖掉）与
+    /// 「连入来源排除」减法（用户声明的排除段与组网段相交则整条丢弃，mesh 优先，否则声明段
+    /// 把组网架空）。自建 tailnet 用 `32.0.0.x` 时，若这里仍只有硬编码的 `100.64.0.0/10`，
+    /// 两个下游都会把真实 tailnet 前缀当成「与组网无关的段」处理 —— 规则发射那一条腿修好了，
+    /// 排除面这条腿照样漏。
+    pub observed_tailnet_addresses: ObservedTailnetAddresses,
 }
 
 /// 生成 sing-box inbounds。上游 `buildInbounds`。
@@ -223,11 +233,14 @@ fn build_tun_inbound(
             }
         }
     }
-    let engaged_mesh = mesh_forced_route_cidrs(&mesh_force_routed_servers(
-        &config.servers,
-        config.selected_server_id.as_deref(),
-        &rule_targeted,
-    ));
+    let engaged_mesh = mesh_forced_route_cidrs(
+        &mesh_force_routed_servers(
+            &config.servers,
+            config.selected_server_id.as_deref(),
+            &rule_targeted,
+        ),
+        &deps.observed_tailnet_addresses,
+    );
 
     let mut exclude_addr: Vec<String> = if deps.platform == "win32" && should_bypass_lan {
         let bypass = bypass_lan_cidrs(&effective_bypass_lan(&UConfigBypass(config)));

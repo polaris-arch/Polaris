@@ -25,6 +25,8 @@ import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
 import { planTsLoginSubmit } from './ts-login-server';
+import { controlUrlReject } from '@/domain/control-url';
+import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { InfoIcon } from '@/components/InfoIcon';
 
 /**
@@ -45,7 +47,7 @@ function TsIcon() {
   );
 }
 
-export function TsLoginDialog() {
+export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
   const close = useDialogStore((s) => s.close);
@@ -54,11 +56,48 @@ export function TsLoginDialog() {
   const setTailscaleAuthUrl = useAppStore((s) => s.setTailscaleAuthUrl);
   const setTailscaleLoginInitiated = useAppStore((s) => s.setTailscaleLoginInitiated);
 
-  const existingTs = servers.find((s) => s.protocol === 'tailscale');
+  // serverId 是本弹窗身兼「新建」与「编辑既有节点」的判据：带 id = 给该节点换 key / 换控制面，
+  // 不带 = 新建（Tailscale 不再是单例，没有 id 时不猜、直接走新建路径——不回落 `.find(protocol===...)`，
+  // 否则多节点时会把登录写进任意一个既有节点，重犯 node-edit-routing 那条缺陷）。
+  const existingTs = serverId ? servers.find((s) => s.id === serverId) : undefined;
+
+  // 回显既有控制面地址（再次进入本弹窗时不该看起来像"没配过"）。
+  useEffect(() => {
+    setControlUrl(existingTs?.tailscaleSettings?.controlUrl ?? '');
+  }, [existingTs?.id, existingTs?.tailscaleSettings?.controlUrl]);
+
+  // 有无 state 决定「切 authkey 要不要先登出」。读失败按 false（宁可不多做一次登出）。
+  useEffect(() => {
+    const id = existingTs?.id;
+    if (!id) {
+      setHasState(false);
+      return;
+    }
+    let cancelled = false;
+    api.server
+      .tailscaleStateExists([id])
+      .then((map) => {
+        if (!cancelled) setHasState(map[id] === true);
+      })
+      .catch(() => {
+        if (!cancelled) setHasState(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [existingTs?.id]);
 
   const [mode, setMode] = useState<'browser' | 'authkey'>('browser');
   const [authKey, setAuthKey] = useState('');
   const [errKey, setErrKey] = useState(false);
+  // 自建控制面地址。**登录弹窗必须有这个字段**：登录核确实透传它
+  // （`crates/mesh/src/tailscale_login.rs`），但此前只有「TS 设置」弹窗有控件，
+  // 而那个弹窗要求节点已存在 ⇒ 自建控制面用户的第一次登录必然打向官方 controlplane。
+  const [controlUrl, setControlUrl] = useState('');
+  const [errControl, setErrControl] = useState<string | null>(null);
+  // 该节点是否已有登录 state。切 auth_key 时必须先清掉它 —— tsnet 手上只要有有效 node key
+  // 就不会去用 `auth_key`，于是「填了新 key、提交成功、身份一动不动」。
+  const [hasState, setHasState] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [dirty, setDirty] = useState(false);
   // browser 模式本次登录的 server.id（非空 = 核已起、正在等/已拿到登录地址）。authKey 模式不设：
@@ -138,9 +177,22 @@ export function TsLoginDialog() {
       setErrKey(true);
       return;
     }
-    const { server, persist } = planTsLoginSubmit(existingTs, mode, authKey, () =>
-      crypto.randomUUID()
-    );
+    // 与「TS 设置」弹窗同一判据（`domain/control-url.ts`，与 Rust 侧同源）——
+    // 拦在保存前，光标还停在输入框旁边；后端那道 fail-closed 是下发前的兜底。
+    const badControl = controlUrlReject(controlUrl);
+    if (badControl) {
+      setErrControl(badControl);
+      return;
+    }
+    setErrControl(null);
+    const { server, persist, requiresLogout } = planTsLoginSubmit({
+      existing: existingTs,
+      mode,
+      authKey,
+      controlUrl,
+      hasState,
+      mintId: () => crypto.randomUUID(),
+    });
 
     setSubmitting(true);
     setLoginTimedOut(false);
@@ -151,18 +203,26 @@ export function TsLoginDialog() {
       // 登录**之前**先落盘节点：后端按 server.id 分键存登录 state，节点不在 config 里就等于登录成果
       // 无主（config 里永远不会出现 Tailscale 节点、state 落在对不上号的键下）。authKey 一并写进
       // tailscaleSettings，否则「已提交」只是句空话——key 没进任何持久配置。
+      // 切 auth_key **必须先清 state**，且必须在落盘/起核之前：晚一步，起来的核就已经用旧
+      // node key 完成认证了。失败不吞 —— 登出失败继续走下去只会让用户再次看到「填了没反应」。
+      if (requiresLogout && existingTs) {
+        await api.server.tailscaleLogout(existingTs.id);
+      }
       if (persist === 'add') await api.server.add(server);
       else if (persist === 'update') await api.server.update(server);
       if (persist !== 'none') await loadConfig(true);
 
       const res = await api.server.tailscaleLogin(server);
       if (!res.started) {
-        // 未真正起核（如 inMainCore：该出口已在主核里跑，登录态由主核自身维护）——不能当成功静默关闭，
-        // 否则用户会以为登录已发起。toast 告知原因，弹窗留给用户自行关闭。
+        // 未真正起核：后端此路只有 `inMainCore` 一种（`commands/server.rs` 的三态出口
+        // Started / InMainCore / Failed，Failed 走 reject）——该出口已在运行主核里，
+        // 不需要也不会再起瞬态核。
+        //
+        // **但配置已经落盘了**（上面的 add/update 在此之前）。此前这里只 toast 一句「已在主核」，
+        // 用户读到的是"失败"，而实际上 key/控制面已写、只差重启核 —— 那正是「auth_key 换不上」
+        // 的观感来源。故按是否真的写了配置分两句话说。
         toast.info(
-          res.reason === 'inMainCore'
-            ? t('ts.loginInMainCore')
-            : t('ts.loginAlreadyActive'),
+          persist === 'none' ? t('ts.loginInMainCore') : t('ts.loginInMainCoreNeedsRestart'),
         );
         return;
       }
@@ -209,6 +269,32 @@ export function TsLoginDialog() {
         </>
       }
     >
+      <div className="fld">
+        <label className="fld-l fld-l-info" htmlFor="ts-login-control-url">
+          <span>{t('ts.controlUrl')}</span>
+          <InfoIcon tip={t('ts.controlUrlLoginHint')} />
+        </label>
+        <input
+          id="ts-login-control-url"
+          className="input mono"
+          value={controlUrl}
+          onChange={(e) => {
+            setControlUrl(e.target.value);
+            setErrControl(null);
+            setDirty(true);
+          }}
+          placeholder="https://controlplane.tailscale.com"
+        />
+        {errControl && (
+          <div className="err-line">
+            {t('ts.errControlUrl')}
+            {INVALID_NODE_REASON_KEY[errControl]
+              ? ` — ${t(INVALID_NODE_REASON_KEY[errControl])}`
+              : ''}
+          </div>
+        )}
+      </div>
+
       <div className="fld">
         <label className="fld-l">{t('ts.method')}</label>
         <div className="seg2" role="group" aria-label={t('ts.method')} style={{ display: 'flex' }}>
@@ -320,6 +406,14 @@ export function TsLoginDialog() {
               placeholder="YOUR_TAILSCALE_AUTH_KEY"
             />
             {errKey && <div className="err-line">{t('ts.errKey')}</div>}
+            <div className="card-sub" style={{ marginTop: 6 }}>
+              {t('ts.authKeyEphemeralHint')}
+            </div>
+            {hasState && (
+              <div className="card-sub" style={{ marginTop: 6 }}>
+                {t('ts.authKeySwitchLogoutNote')}
+              </div>
+            )}
           </div>
         </>
       )}

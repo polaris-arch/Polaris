@@ -1386,6 +1386,44 @@ fn system_proxy_residual_probe_never_blocks_start_inner() {
     );
 }
 
+/// 🔴 **外来隧道冲突探测必须真的挂在起核成功段上**——这条守的正是它自己要修的那个缺陷。
+///
+/// # 为什么这道门不可省
+///
+/// `route_probe` + `builder::tunnel_conflict` 两个模块写完了、单测齐备，却**在生产里零调用点**，
+/// 于是对用户而言等于不存在：本机跑着独立 Tailscale / 公司 VPN 时，Polaris 既不探测也不判定。
+/// 那种状态**没有任何运行期表征**——两个模块的单测全绿、clippy 全绿、起核全绿。
+/// 唯一能让「接线又被摘掉」转红的观察面就是源码本身。
+///
+/// 同时钉住它是**后台腿**：四条 `ip … show` 虽轻，`await` 回主链就把 advisory 的成本
+/// 算进了用户等待的那几秒（与上面那条残留探测同一取舍）。
+///
+/// 针不带 `self.` 前缀，理由同上一条：rustfmt 会把调用点折成 `self\n    .foo(`。
+#[test]
+fn foreign_tunnel_conflict_probe_is_wired_into_start_inner_as_a_background_leg() {
+    let body = method_body(
+        &module_code("runtime/proxy"),
+        "    pub(super) async fn start_inner(",
+    );
+    assert_eq!(
+        body.matches(".spawn_foreign_tunnel_conflict_probe(")
+            .count(),
+        1,
+        "起核成功段必须恰好 spawn 一次外来隧道冲突探测 —— 摘掉它，两个模块当场退回死代码"
+    );
+    assert!(
+        !body.contains(".probe_foreign_tunnel_conflicts("),
+        "外来隧道冲突提示只是 advisory，不得 await 回起核关键路径"
+    );
+    // 判据段必须在**起核段内**就地取值（那时 `singbox_config` / `deps` 才是这一次的那份）。
+    // 摘掉这一行改传常量，冲突判定就变成「另一份计算」，自建 tailnet 段判不出来。
+    assert_eq!(
+        body.matches("emitted_conflict_criteria(").count(),
+        1,
+        "三组判据段必须从本次发射的产物就地读回，不得在探测回来之后再算"
+    );
+}
+
 /// 最小 systemProxy UserConfig（供 A1 启用侧决策测试）。
 fn systemproxy_user_config() -> UserConfig {
     serde_json::from_value(serde_json::json!({

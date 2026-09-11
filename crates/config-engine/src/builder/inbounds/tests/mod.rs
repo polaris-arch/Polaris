@@ -9,6 +9,8 @@ fn deps_linux() -> InboundsDeps {
         probe_pool_ports: vec![],
         platform: "linux".into(),
         own_lan_cidrs: vec![],
+        // 无运行期观测 ⇒ engaged_mesh 仅含 tailnet 默认常量段，与本字段出现之前同。
+        observed_tailnet_addresses: Default::default(),
         log: |_, _| {},
     }
 }

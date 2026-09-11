@@ -208,6 +208,69 @@ pub fn extract_ipv4s(stdout: &str) -> Vec<String> {
     out
 }
 
+/// 该解析器是否是「接管会挤掉、且很可能属于另一个 VPN/组网客户端」的那一类。
+///
+/// # 与 [`is_private_ipv4`] 刻意不同，别合并
+///
+/// [`is_private_ipv4`] 服务的是方案 B（挑一个 LAN 解析器来解内网域名），面必须**窄**：
+/// 挑错一个会把用户的内网查询发到不该去的地方。本函数服务的是**告警**：面宁可宽，
+/// 漏报的代价（用户看不到"你的 MagicDNS 被我覆盖了"）远大于误报（多一行提示）。
+///
+/// 故本函数额外收下 [`is_private_ipv4`] **不收**的两族，而那正是本函数存在的理由：
+///
+/// - **CGNAT `100.64.0.0/10`** —— Tailscale 的 MagicDNS 解析器是硬编码的
+///   `100.100.100.100`（quad100），落在这一段。`is_private_ipv4` 只认 RFC1918，
+///   于是今天 quad100 **一个判据都命不中**，被覆盖时全程无声。
+/// - **IPv6 ULA `fc00::/7`** —— 自建 tailnet 的 v6 前缀 `fd7a:115c:a1e0::/48` 在其中。
+///
+/// 排除面：受控 IP 自身、回环、链路本地。**公网解析器（8.8.8.8 之类）刻意不收** ——
+/// 覆盖它们正是接管的本意，报出来只会变成人人忽略的噪声。
+#[must_use]
+pub fn is_displaced_private_resolver(ip: &str, controlled_ip: &str) -> bool {
+    let ip = ip.trim();
+    if ip.is_empty() || ip == controlled_ip.trim() {
+        return false;
+    }
+    if ip.contains(':') {
+        // IPv6：只收 ULA（fc00::/7 ⇒ 首字节 fc / fd）。链路本地 fe80::/10 与回环 ::1 排除。
+        let lower = ip.to_ascii_lowercase();
+        return lower.starts_with("fc") || lower.starts_with("fd");
+    }
+    if ip.starts_with("127.") || ip.starts_with("169.254.") {
+        return false;
+    }
+    if is_private_ipv4(ip) {
+        return true;
+    }
+    // CGNAT 100.64.0.0/10（含 Tailscale 的 quad100）。
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) else {
+        return false;
+    };
+    a == 100 && (64..=127).contains(&b)
+}
+
+/// 接管**会挤掉**的那批非公网解析器（按出现顺序去重）。
+///
+/// 输入取接管前的生效解析器（macOS 走 `scutil --dns`，那是唯一看得见
+/// NetworkExtension / DHCP 下发那一层的读法；`networksetup -getdnsservers` 对它们返空，
+/// 所以 marker 里存的原始值**看不到** Tailscale 设的 quad100 —— 这条是本函数必须
+/// 单独读一次 scutil 的原因）。
+#[must_use]
+pub fn displaced_private_resolvers(effective: &[String], controlled_ip: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in effective {
+        let ip = raw.trim();
+        if is_displaced_private_resolver(ip, controlled_ip) && !out.iter().any(|e| e == ip) {
+            out.push(ip.to_string());
+        }
+    }
+    out
+}
+
 /// 挑「可用于内网域名解析的 LAN 解析器」：私网 IPv4 + 排除受控 IP。
 /// 公网/ISP/IPv6/link-local 不取 → 返回 None。上游 `pickLanResolverIp`。
 pub fn pick_lan_resolver_ip(candidates: &[String], controlled_ip: &str) -> Option<String> {

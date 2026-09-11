@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::builder::endpoint_routes::{
     endpoint_forced_route_cidrs, mesh_always_routes_subnets, referenced_server_ids,
+    ObservedTailnetAddresses,
 };
 use crate::builder::orchestration::{config_generation_norm, server_fingerprint};
 use crate::builder::route::mesh_selected_exit_falls_back_to_direct;
@@ -138,7 +139,15 @@ fn sel_only_forces_subnets(s: Option<&ServerConfig>) -> bool {
         Some(srv) => {
             is_mesh_node(srv)
                 && !mesh_always_routes_subnets(srv)
-                && !endpoint_forced_route_cidrs(srv).is_empty()
+                // 观测面恒传空，且这里**可证明**与传真值等价：本谓词只问「段集非空」，而
+                // `endpoint_forced_route_cidrs` 对 Tailscale 的产出在**两侧都恒非空** ——
+                // 有观测时是「观测段 ∪ MagicDNS 两条」，无观测时是「默认两段」（2026-09-11
+                // 语义从并集改为取代之后仍然如此，见 `endpoint_routes::ObservedTailnetAddresses`
+                // 的「# 语义」一节）。且唯一会被观测面填充的协议是 Tailscale。故 `非空` 这件事
+                // 在有无观测面下同真。（HotSwitchDeps 亦无观测面入口，本批允许面不含它的
+                // src-tauri 构造点；即便有，也不该为一个恒等的判据加一条注入链。）
+                // 由 `sel_only_forces_subnets_is_insensitive_to_observed_addresses` 钉住。
+                && !endpoint_forced_route_cidrs(srv, &ObservedTailnetAddresses::new()).is_empty()
         }
         None => false,
     }

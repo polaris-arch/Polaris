@@ -11,7 +11,8 @@
  *
  * # 为什么在这里新写一份 CIDR 相交
  *
- * 本仓 `domain/endpoint-routes.ts` 的 `meshShadowedCidrs` 只做**字面量去重**（同一条 cidr 串被两个
+ * 生成侧的跨节点结算（Rust `builder::endpoint_routes::settle_force_route_claims`，经
+ * `endpoint_force_route_report` 命令回给节点卡角标）只做**字面量去重**（同一条 cidr 串被两个
  * 节点声明），够它自己那个「同段先声明者胜」的判定，但答不了「`10.0.0.0/8` 与 `10.8.0.0/24` 相交吗」。
  * `domain/rules.ts` 的 `isValidIpCidr` 只判形状。故此处移植 上游 `src/shared/ip.ts:60-102` 的
  * 前缀比对算法（v4 用 uint32、v6 用 BigInt，跨族恒不相交），**逐字同口径**，不引第三方依赖。

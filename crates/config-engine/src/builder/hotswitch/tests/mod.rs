@@ -1016,7 +1016,8 @@ fn sel_only_forces_subnets_matches_pre_extraction_formula() {
             Some(srv) => {
                 is_mesh_node(srv)
                     && !mesh_always_routes_subnets(srv)
-                    && !endpoint_forced_route_cidrs(srv).is_empty()
+                    && !endpoint_forced_route_cidrs(srv, &ObservedTailnetAddresses::new())
+                        .is_empty()
             }
             None => false,
         }
@@ -1105,4 +1106,79 @@ fn sel_only_forces_subnets_matches_pre_extraction_formula() {
             .any(|(_, s)| !sel_only_forces_subnets(Some(s))),
         "输入面必须至少覆盖一个 false 格"
     );
+}
+
+/// 🔴 钉住 [`sel_only_forces_subnets`] 对**运行期观测 tailnet 地址**的不敏感性
+/// （`hotswitch.rs` 里那段「恒传空且可证明等价」注释的判据）。
+///
+/// A-0a 给 `endpoint_forced_route_cidrs` 加了观测面入参，四个消费者里只有这一个恒传空。
+/// 传空之所以不是漏改，是因为本谓词的第三项只问「段集**非空**」，而观测地址只会**追加**、
+/// 且只对 Tailscale 生效 —— TS 的默认两段是常量、恒非空 ⇒ 有无观测，第三项同真 ⇒ 谓词同值。
+///
+/// **变异锁**：若哪天有人把 `endpoint_forced_route_cidrs` 的 Tailscale 分支改成「有观测就用
+/// 观测**替换**默认段」，空观测那一侧会变空、非空观测那一侧不变 ⇒ 下面的逐格相等立刻转红，
+/// 逼改动者回来重新判断这里到底还能不能传空。
+#[test]
+fn sel_only_forces_subnets_is_insensitive_to_observed_addresses() {
+    use crate::builder::endpoint_routes::ObservedTailnetAddresses;
+    use crate::user_config::server_config::TailscaleSettings;
+
+    fn ts_node(id: &str, always: Option<bool>) -> ServerConfig {
+        ServerConfig {
+            id: id.into(),
+            name: id.into(),
+            protocol: Protocol::Tailscale,
+            tailscale_settings: Some(Box::new(TailscaleSettings {
+                exit_node: Some("e1".into()),
+                always_route_subnets: always,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    let mut observed = ObservedTailnetAddresses::new();
+    observed.insert("ts-observed".into(), vec!["32.0.0.28".into()]);
+    let empty = ObservedTailnetAddresses::new();
+
+    // 同一批输入，观测面有/无两侧逐格对差：谓词唯一的可变项（段集非空）在两侧必须同真。
+    let matrix = [
+        (
+            "ts 仅选中发段 + 有观测",
+            ts_node("ts-observed", Some(false)),
+        ),
+        ("ts 仅选中发段 + 无观测", ts_node("ts-other", Some(false))),
+        ("ts 恒发段 + 有观测", ts_node("ts-observed", Some(true))),
+    ];
+    for (label, srv) in &matrix {
+        let with = endpoint_forced_route_cidrs(srv, &observed);
+        let without = endpoint_forced_route_cidrs(srv, &empty);
+        assert!(
+            !with.is_empty() && !without.is_empty(),
+            "{label}：TS 的默认两段恒非空，有无观测都不该出现空段集。with={with:?} without={without:?}"
+        );
+        // 正向对照：被观测点名的那个节点，两侧的**内容**确实不同 —— 证明上面的「同为非空」
+        // 不是因为观测面压根没生效（那样这条恒等就是平凡的、没有信息量）。
+        if srv.id == "ts-observed" {
+            assert_ne!(
+                with, without,
+                "{label}：观测面对该节点没起作用，本测退化成平凡断言"
+            );
+        }
+    }
+
+    // 谓词层：有观测的那个节点，判定值与「同形态但没被观测」的节点一致。
+    assert!(sel_only_forces_subnets(Some(&ts_node(
+        "ts-observed",
+        Some(false)
+    ))));
+    assert!(sel_only_forces_subnets(Some(&ts_node(
+        "ts-other",
+        Some(false)
+    ))));
+    // 反向对照：alwaysRouteSubnets=true ⇒ 第二项假 ⇒ 谓词假（证明它不是恒真）。
+    assert!(!sel_only_forces_subnets(Some(&ts_node(
+        "ts-observed",
+        Some(true)
+    ))));
 }

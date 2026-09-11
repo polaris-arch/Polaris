@@ -3,6 +3,18 @@
 //! 这里故意只放「如何造同一批 fixture、如何找核、如何调用 check、如何判夹具凭据棘轮」：
 //! 出站面门与完整配置门的**射程**不同，绝不能在此把后者削回前者的 surface。
 
+//! # 为什么整模块 `allow(dead_code, unused_imports)`
+//!
+//! `tests/support/` 是**菜单**，不是库：Cargo 把它编进每一个 `tests/*.rs` 集成测试二进制，
+//! 而每个门只点自己要的那几样。于是「本二进制没用到某个 helper」是这个模块的常态，
+//! 不是缺陷信号 —— 加一个新门就会让其余没用到的项在 `-D warnings` 下全体转红
+//! （CI 跑的正是 `cargo clippy --workspace --all-targets -- -D warnings`）。
+//!
+//! 代价如实记：真正废弃的 helper 不会再被 lint 抓到，只能靠改动时人眼看。
+//! 换成逐项 `#[allow]` 并不更强 —— 那样每加一个门仍要去补一轮 attribute，
+//! 漏补的表现同样是 CI 红，而不是「发现了死代码」。
+#![allow(dead_code, unused_imports)]
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -113,6 +125,11 @@ pub fn outbound_deps_for(platform: &str) -> GenerateConfigDeps {
         rule_resources_path: "/fake/userData/rule-resource".into(),
         custom_rules_dir: "/fake/userData/custom-rules".into(),
         tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+        // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+        // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+        tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+        // 无运行期观测（本批生产侧同样恒空）。
+        observed_tailnet_addresses: Default::default(),
         is_valid_srs_fn: |_| true,
         own_lan_cidrs: vec![],
         log: |_, _| {},
@@ -164,6 +181,11 @@ pub fn full_config_deps(case: &SnapshotCase, temp: &TempDir) -> GenerateConfigDe
         rule_resources_path: data.display().to_string(),
         custom_rules_dir: tmp.join("custom-rules").display().to_string(),
         tailscale_state_dir_prefix: tmp.join("tailscale").display().to_string(),
+        // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+        // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+        tailnet_rules_dir: tmp.join("tailnet-rules").display().to_string(),
+        // 无运行期观测（本批生产侧同样恒空）。
+        observed_tailnet_addresses: Default::default(),
         is_valid_srs_fn: real_srs,
         own_lan_cidrs: vec![],
         log: |_, _| {},

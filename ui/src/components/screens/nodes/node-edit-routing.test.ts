@@ -33,8 +33,20 @@ describe('editDialogFor', () => {
     });
   });
 
-  it('Tailscale → TsSettingsDialog（单例，不携 id）', () => {
-    expect(editDialogFor(server({ protocol: 'tailscale', id: 'ts-1' }))).toEqual({ kind: 'ts-settings' });
+  it('Tailscale → TsSettingsDialog（携 id：不再是单例，弹窗不许自查）', () => {
+    expect(editDialogFor(server({ protocol: 'tailscale', id: 'ts-1' }))).toEqual({
+      kind: 'ts-settings',
+      serverId: 'ts-1',
+    });
+  });
+
+  // 反向对照：两个 TS 节点各自编辑必须带各自的 id —— 若实现退回「不带 id」，这条会与上一条撞出同一个结果。
+  it('两个 TS 节点分别编辑 → desc 各自带对应 id（而非同一个）', () => {
+    const a = editDialogFor(server({ protocol: 'tailscale', id: 'ts-a' }));
+    const b = editDialogFor(server({ protocol: 'tailscale', id: 'ts-b' }));
+    expect(a).toEqual({ kind: 'ts-settings', serverId: 'ts-a' });
+    expect(b).toEqual({ kind: 'ts-settings', serverId: 'ts-b' });
+    expect(a).not.toEqual(b);
   });
 
   // WARP 的 protocol 也是 wireguard —— 判定顺序错了就会被当普通 WG 节点丢进 WgDialog。

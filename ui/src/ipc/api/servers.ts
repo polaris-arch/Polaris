@@ -59,7 +59,12 @@ export const serverApi = {
   /** Phase 2 按需登录：拉起瞬态登录核取交互登录 URL。 */
   async tailscaleLogin(server: ServerConfig): Promise<{
     started: boolean;
-    reason?: 'alreadyLoggedIn' | 'inMainCore' | 'alreadyRunning';
+    /**
+     * 后端只发这一个值（`commands/server.rs` 的三态出口 Started / InMainCore / Failed，
+     * Failed 走 reject）。此前这里还声明着 `alreadyLoggedIn` / `alreadyRunning` 两支 ——
+     * 后端从未发过，前端却在为它们写分支，读代码的人会以为那是真实状态。
+     */
+    reason?: 'inMainCore';
     authUrl?: string;
   }> {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server });

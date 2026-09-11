@@ -16,11 +16,18 @@ import {
   type MeshSlotServer,
 } from './endpoint-routes';
 
-/** 单例槽被占的拒绝文案（两个槽各一句，说明「为什么不能有第二个」+「怎么办」）。 */
+/**
+ * 单例槽被占的拒绝文案（说明「为什么不能有第二个」+「怎么办」）。
+ *
+ * **穷举 switch 而不是 if/三元**：`MeshSingletonSlot` 今天只剩 `'warp'` 一支，日后再加一个槽时
+ * 编译器会在这里逼出一句新文案，而不是静默落进某个兜底 —— 那正是 `'tailscale'` 那支的下场：
+ * 判据早撤了，文案还在三元的 else 里活着，一路活成了「不可达且内容已被实测推翻」。
+ */
 export function meshSingletonMessage(slot: MeshSingletonSlot, t: TFunction): string {
-  return slot === 'warp'
-    ? t('nodes.warpSlotTaken')
-    : t('nodes.tsSlotTaken');
+  switch (slot) {
+    case 'warp':
+      return t('nodes.warpSlotTaken');
+  }
 }
 
 /**

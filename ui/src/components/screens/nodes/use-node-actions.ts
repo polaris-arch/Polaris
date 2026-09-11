@@ -59,19 +59,18 @@ export function useNodeActions({
   /** 克隆：剥离 id（新建）+ subscriptionId/providerName（克隆体归自建，不随订阅刷新被当差集删除）。 */
   const cloneServer = useCallback(
     async (server: ServerConfig) => {
-      // 契约「TS 单例硬限 + WARP 单例硬闸门拦第二个（手输/导入/克隆全经 saveServer）」「TS/WARP 克隆恒撞单例被拦」：
-      // 克隆是绕开表单直调 server:add 的一条造节点路径，后端 server_add 无守卫 → 不在此拦就能造出第二实例
-      // （TS 多实例互相顶掉 tailnet 地址；WARP 抢内核 utun 致 Connect: resource busy）。
-      // 判定走 `meshSingletonConflict`（与三个弹窗同一真值）；文案留克隆专属（「无法克隆出第二个」比
-      // 通用的「请先注销现有 WARP」更贴当前动作）。不传 editingId：克隆语义恒为「再加一个」，
-      // 源节点自身即占槽 → 必然被拦，与契约一致。
+      // 「WARP 单例硬闸门拦第二个（手输/导入/克隆全经 saveServer）」：克隆是绕开表单直调 server:add
+      // 的一条造节点路径，后端 server_add 无守卫 → 不在此拦就能造出第二个 WARP（抢内核 utun 致
+      // `Connect: resource busy` FATAL，真机实证）。判定走 `meshSingletonConflict`（与三个弹窗同一
+      // 真值）；文案留克隆专属（「无法克隆出第二个」比通用的「请先注销现有 WARP」更贴当前动作）。
+      // 不传 editingId：克隆语义恒为「再加一个」，源节点自身即占槽 → 必然被拦。
+      //
+      // **Tailscale 那一支已撤**（2026-09-11）：单例槽只剩 WARP，克隆 TS 节点不再被拦，随之删掉的
+      // `nodes.cloneTsSingleton` 说的是被实测推翻的「多个 TS 互相顶掉 tailnet 地址」。真实相交由
+      // 生成侧 `endpoint_force_route_report` 检出（创建期判不了：新节点还没连上控制面）。
       const slot = meshSingletonConflict(server, servers);
       if (slot) {
-        toast.error(
-          slot === 'warp'
-            ? t('nodes.cloneWarpSingleton')
-            : t('nodes.cloneTsSingleton')
-        );
+        toast.error(t('nodes.cloneWarpSingleton'));
         return;
       }
       const { id, subscriptionId, providerName, ...rest } = server;

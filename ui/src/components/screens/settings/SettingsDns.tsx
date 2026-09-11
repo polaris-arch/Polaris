@@ -30,6 +30,8 @@ import {
   TextInput,
   Segmented,
 } from './Primitives';
+import { api } from '@/ipc';
+import { useAppStore } from '@/store/app-store';
 import { ListEditor } from './ListEditor';
 import {
   DNS_FALLBACK,
@@ -110,6 +112,28 @@ export default function SettingsDns({
     foreignDns: DNS_FALLBACK.foreignDns,
     enableFakeIp: true,
   };
+
+  // 系统 DNS 接管挤掉了谁（只读运行期观测）。接管发生在起核那一刻，故随代理运行态重新拉取。
+  //
+  // macOS 的接管把**所有**网络服务的 DNS 改成受控 IP ⇒ 另一个 VPN 装的解析器（Tailscale 的
+  // quad100、公司 VPN 的内网解析器…）被整个挤掉 ⇒ 「IP 通、域名不通」，而此前应用内零提示。
+  const proxyRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
+  const [displacedResolvers, setDisplacedResolvers] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.config
+      .dnsTakeoverReport()
+      .then((report) => {
+        if (!cancelled) setDisplacedResolvers(report.displacedResolvers);
+      })
+      .catch(() => {
+        // 读不到就不显示 —— 这条是**附加告警**，读失败不该在 DNS 页顶上留一块错误。
+        if (!cancelled) setDisplacedResolvers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [proxyRunning]);
 
   function patchDns(patch: Partial<DnsConfig>) {
     void update({ dnsConfig: { ...dns, ...patch } });
@@ -314,6 +338,15 @@ export default function SettingsDns({
   return (
     <section className={embedded ? 'dns-runtime-workspace' : 'screen'} data-sec="dns">
       {!embedded && <Phead title="DNS" sub={t('settings.dns.pageSub')} />}
+
+      {/* 接管挤掉了别人的解析器 —— 放在页首而不是折叠里：它解释的是「另一个 VPN 忽然域名不通」，
+          而那种时候用户不会知道该来 DNS 页展开哪个折叠段。空数组时整块不渲染。 */}
+      {displacedResolvers.length > 0 && (
+        <div className="plat-warn" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span>{t('settings.dns.displacedResolversNote')}</span>
+          <span className="mono">{displacedResolvers.join(', ')}</span>
+        </div>
+      )}
 
       {/* 1. 解析器 */}
       {section !== 'policy' && (<>

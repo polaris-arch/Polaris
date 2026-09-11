@@ -13,6 +13,7 @@ pub mod dns_config;
 pub mod dns_constants;
 pub mod dns_policy;
 pub mod dns_spec;
+pub mod effective_view;
 pub mod fakeip_filter;
 pub mod ip;
 pub mod log_level;

@@ -37,7 +37,7 @@ fn ts_server(id: &str, exit_node: Option<&str>, routes: &[&str]) -> ServerConfig
 fn wg_forced_route_strips_catch_all() {
     let s = wg_server("w1", &["10.0.0.0/24", "0.0.0.0/0"], Some(true));
     assert_eq!(
-        endpoint_forced_route_cidrs(&s),
+        endpoint_forced_route_cidrs(&s, &ObservedTailnetAddresses::new()),
         vec!["10.0.0.0/24".to_string()]
     );
 }
@@ -45,7 +45,7 @@ fn wg_forced_route_strips_catch_all() {
 #[test]
 fn ts_forced_route_includes_tailnet() {
     let s = ts_server("t1", None, &["192.168.10.0/24"]);
-    let cidrs = endpoint_forced_route_cidrs(&s);
+    let cidrs = endpoint_forced_route_cidrs(&s, &ObservedTailnetAddresses::new());
     assert!(cidrs.contains(&TAILNET_CGNAT.to_string()));
     assert!(cidrs.contains(&TAILNET_ULA_V6.to_string()));
     assert!(cidrs.contains(&"192.168.10.0/24".to_string()));
@@ -78,7 +78,7 @@ fn warp_ignores_legacy_custom_route_fields() {
     let mut s = wg_server("warp", &["10.0.0.0/24"], Some(false));
     s.address = "engage.cloudflareclient.com".into();
     assert!(mesh_allows_internet(&s), "WARP 恒为云出口");
-    assert!(endpoint_forced_route_cidrs(&s).is_empty());
+    assert!(endpoint_forced_route_cidrs(&s, &ObservedTailnetAddresses::new()).is_empty());
     assert_eq!(
         wireguard_peer_allowed_ips(&s),
         Some(
@@ -161,7 +161,7 @@ fn mesh_forced_route_union() {
         wg_server("w1", &["10.0.0.0/24"], None),
         wg_server("w2", &["10.0.0.0/24", "172.16.0.0/24"], None), // 10.0 重复
     ];
-    let cidrs = mesh_forced_route_cidrs(&servers);
+    let cidrs = mesh_forced_route_cidrs(&servers, &ObservedTailnetAddresses::new());
     assert_eq!(cidrs.len(), 2); // 去重
     assert!(cidrs.contains(&"10.0.0.0/24".to_string()));
     assert!(cidrs.contains(&"172.16.0.0/24".to_string()));

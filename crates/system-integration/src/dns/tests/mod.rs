@@ -156,3 +156,94 @@ fn is_controlled_predicate() {
     assert!(!is_controlled(&["192.168.1.1".to_string()], "8.8.8.8"));
     assert!(!is_controlled(&[], "8.8.8.8"));
 }
+
+// ── 接管挤掉的非公网解析器（C1：让「MagicDNS 被覆盖」这件事可见）─────────────────
+
+#[test]
+fn displaced_resolver_predicate_covers_cgnat_and_ula() {
+    let controlled = "198.18.0.2";
+
+    // 本函数存在的理由：这两个是 `is_private_ipv4` **命不中**的。
+    assert!(
+        super::is_displaced_private_resolver("100.100.100.100", controlled),
+        "Tailscale 的 quad100 必须命中 —— 它正是被静默覆盖的那个"
+    );
+    assert!(
+        !super::is_private_ipv4("100.100.100.100"),
+        "前提自检：quad100 确实不在 is_private_ipv4 的面里（若它变了，本函数的理由要重写）"
+    );
+    assert!(super::is_displaced_private_resolver(
+        "fd7a:115c:a1e0::53",
+        controlled
+    ));
+    assert!(!super::is_private_ipv4("fd7a:115c:a1e0::53"));
+
+    // RFC1918 三族照收。
+    for ip in ["10.0.0.53", "172.16.0.53", "192.168.1.1"] {
+        assert!(super::is_displaced_private_resolver(ip, controlled), "{ip}");
+    }
+
+    // 排除面：公网 / 受控 IP / 回环 / 链路本地。
+    for ip in [
+        "8.8.8.8",
+        "1.1.1.1",
+        "223.5.5.5",
+        controlled,
+        "127.0.0.1",
+        "::1",
+        "169.254.1.1",
+        "fe80::1",
+        "",
+    ] {
+        assert!(
+            !super::is_displaced_private_resolver(ip, controlled),
+            "{ip} 不该命中 —— 覆盖公网解析器正是接管的本意，报出来只会成为被忽略的噪声"
+        );
+    }
+
+    // CGNAT 边界：100.64 ~ 100.127 在内，100.63 / 100.128 在外。
+    assert!(super::is_displaced_private_resolver(
+        "100.64.0.1",
+        controlled
+    ));
+    assert!(super::is_displaced_private_resolver(
+        "100.127.255.254",
+        controlled
+    ));
+    assert!(!super::is_displaced_private_resolver(
+        "100.63.0.1",
+        controlled
+    ));
+    assert!(!super::is_displaced_private_resolver(
+        "100.128.0.1",
+        controlled
+    ));
+}
+
+#[test]
+fn displaced_resolvers_dedupes_and_keeps_order() {
+    let effective = vec![
+        "192.168.1.1".to_string(),
+        "8.8.8.8".to_string(),
+        "100.100.100.100".to_string(),
+        "192.168.1.1".to_string(),
+        "198.18.0.2".to_string(),
+    ];
+    assert_eq!(
+        super::displaced_private_resolvers(&effective, "198.18.0.2"),
+        vec!["192.168.1.1".to_string(), "100.100.100.100".to_string()]
+    );
+}
+
+/// 现场形态：macOS 上跑官方 Tailscale ⇒ 生效解析器里有 quad100，接管会把它挤掉。
+#[test]
+fn tailscale_quad100_is_reported_as_displaced() {
+    let scutil = "resolver #1\n  nameserver[0] : 192.168.1.1\n  nameserver[1] : 8.8.8.8\n\
+                  resolver #2\n  domain : example.ts.net\n  nameserver[0] : 100.100.100.100\n";
+    let effective = super::parse_scutil_nameservers(scutil);
+    let displaced = super::displaced_private_resolvers(&effective, "198.18.0.2");
+    assert!(
+        displaced.iter().any(|ip| ip == "100.100.100.100"),
+        "quad100 没被报出来：{displaced:?}"
+    );
+}

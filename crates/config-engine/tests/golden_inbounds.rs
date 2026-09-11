@@ -62,6 +62,8 @@ fn inbounds_matches_polaris_golden() {
             probe_pool_ports: case.input.ports.probe_pool.clone(),
             platform: case.input.platform.clone(),
             own_lan_cidrs: vec![],
+            // 无运行期观测 ⇒ engaged_mesh 仅含 tailnet 默认常量段，与本字段出现之前同。
+            observed_tailnet_addresses: Default::default(),
             log: |_, _| {},
         };
 

@@ -16,6 +16,7 @@
  * 仅影响卡片副标题（已连接·实时 IP vs 已登录·上次），由组件层据 proxyRunning 决定文案，不进本派生。
  */
 import type { ServerConfig } from '../contracts/types';
+import type { TailscaleStatusDetails } from '../contracts/tailscale-status';
 
 export type TsCardState =
   | 'no-node' // 无 TS 节点 → 显示「连接 Tailscale」入口
@@ -60,6 +61,22 @@ export function isDefinitiveTsLoginFrame(frame: {
   );
 }
 
+/**
+ * 该节点**存没存** authKey —— 全仓唯一的这条判据（`key-ready` 与设置弹窗的状态行同源）。
+ *
+ * # 为什么返回布尔而不是 key
+ *
+ * pre-auth key 是长期凭据。凡是「要不要显示 / 要不要走静态认证」这类问题，需要的只有存在性；
+ * 把 key 本体递给调用方，泄露面就从「写它的那一个弹窗」扩到「每一个想知道有没有 key 的地方」——
+ * 截图、录屏、演示、日志任取其一就带出去了。故本函数**只输出存在性**，渲染层拿到的永远是布尔。
+ *
+ * 口径与此前内联在 [`deriveTsCardState`] 里的那一句逐字相同（`?.trim()` 非空）：空白串不算凭据，
+ * 它喂给 tsnet 等于没填。第二处若另写一遍 `!!ts?.authKey`，「全是空格的 key」就会在两处判出两个答案。
+ */
+export function hasTsAuthKey(node: ServerConfig | undefined): boolean {
+  return !!node?.tailscaleSettings?.authKey?.trim();
+}
+
 export function deriveTsCardState(
   tsNode: ServerConfig | undefined,
   loggedIn: boolean | undefined,
@@ -68,7 +85,7 @@ export function deriveTsCardState(
 ): TsCardState {
   if (!tsNode) return 'no-node';
   // authKey 形态优先：静态凭据，起核即认证，不进登录态/检测态（与 WG 同质）。
-  if (tsNode.tailscaleSettings?.authKey?.trim()) return 'key-ready';
+  if (hasTsAuthKey(tsNode)) return 'key-ready';
   // 交互登录中：登录【正在进行】(loginActive) 且有 URL 且尚未登录成功。loginActive = 用户显式发起(loginInitiated)
   // OR 该节点是当前选中出口（app 自动连接它=登录进行中，非被动 always-emit）。1.14 主核 always-emit 会为未选中/
   // 未就绪节点持续 emit AUTH_URL——若仅凭 hasAuthUrl 判 'logging-in'，卡片会被这些非活跃 URL 误推进「连接中」。
@@ -77,4 +94,35 @@ export function deriveTsCardState(
   if (loginActive && hasAuthUrl && loggedIn !== true) return 'logging-in';
   if (loggedIn === true) return 'connected';
   return 'needs-login';
+}
+
+/**
+ * Tailscale 账号标识文案：登录名 + tailnet（MagicDNS 后缀兜底），供节点卡片区分「同为已登录，
+ * 但登录的是哪个账号 / 哪个 tailnet」——多账号场景下 `key-ready`/已登录这类登录态文案分不清是哪一个。
+ *
+ * tailnet 段（`networkName`，为空退 `magicDNSSuffix`）恒无歧义，直接取；两者都是控制面下发的
+ * 同帧真值，非默认值。
+ *
+ * **登录名段只在无歧义时取，不猜**：只有 `userGroups.length === 1` 才用那一组的 `loginName`——
+ * 该帧的对端按归属用户分组，恰好一组即代表本节点登录所属账号唯一，无歧义可言。
+ *
+ * `userGroups.length > 1` 时**不显示登录名**（不取 `[0]` 了事）：本节点自身（`details.self`）
+ * 不落进任何一组——`TailscaleUserGroup` 分组的是「对端节点」（proto `started_service.proto`
+ * `TailscaleUserGroup` 头注「对端节点按归属用户(owner/sharee)分组」），而 `self` 是
+ * `TailscaleEndpointStatus` 的独立字段（f7，与 `userGroups` f8 平级），不算「对端」。
+ * 且 `TailscaleStatusPeer`/`TailscalePeerDetails`（本文件 Rust 镜像 `tailscale_status.rs:30-65`）
+ * 都不带 `userID`，无法反过来拿 self 的某个字段去匹配某一组。当前 wire 面没有任何字段能判定
+ * self 归属哪一组——取 `[0]` 是**猜**，猜错的后果是把别的账号的登录名显示成用户自己的（比不显示
+ * 更坏，用户会拿它做换 key / 删节点这类操作判断）。故 `>1` 组时只保留 tailnet 段，不摆一个
+ * 可能猜错的登录名。
+ *
+ * `details` 缺席（未收到 STATUS 帧 / 该节点非 Tailscale）或两段都拿不到值 → `undefined`，
+ * 调用方不渲染任何东西——空态纪律：没有真值就不画，不摆占位符、不摆可能错的近似值。
+ */
+export function tsAccountLabel(details: TailscaleStatusDetails | undefined): string | undefined {
+  if (!details) return undefined;
+  const tailnet = details.networkName.trim() || details.magicDNSSuffix.trim();
+  const login = details.userGroups.length === 1 ? details.userGroups[0].loginName.trim() : '';
+  if (login && tailnet) return `${login} · ${tailnet}`;
+  return login || tailnet || undefined;
 }

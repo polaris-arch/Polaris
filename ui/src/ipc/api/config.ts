@@ -1,6 +1,9 @@
 import { invoke, invokeScalar, listen } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { UserConfig, StagedClassification, SaveOutcome } from '../../contracts/types';
+import type { TunExclusionPreview } from '../../contracts/tun-exclusion-preview';
+import type { TunnelConflictReport } from '../../contracts/tunnel-conflict-report';
+import type { EndpointForceRouteReport } from '../../contracts/endpoint-force-route-report';
 
 // ============================================================================
 // configApi
@@ -9,6 +12,46 @@ import type { UserConfig, StagedClassification, SaveOutcome } from '../../contra
 export const configApi = {
   async get(): Promise<UserConfig> {
     return invoke(IPC_CHANNELS.CONFIG_GET);
+  },
+
+  /**
+   * 本平台该配置下 TUN 实际排除了哪些网段（跑真 builder 读回，只读无副作用）。
+   *
+   * 用途是回答"我填的排除到底生没生效" —— 那件事今天在界面上完全看不出来：
+   * 两张排除表长得一样，谁进 TUN 却是平台相关的。
+   */
+  async tunExclusionPreview(): Promise<TunExclusionPreview> {
+    return invoke(IPC_CHANNELS.TUN_EXCLUSION_PREVIEW);
+  },
+
+  /**
+   * 系统 DNS 接管挤掉了哪些非公网解析器（只读运行期观测）。
+   *
+   * 未接管 / 已还原 / 不接管的平台（win/linux）⇒ 空数组。
+   */
+  async dnsTakeoverReport(): Promise<{ displacedResolvers: string[] }> {
+    return invoke(IPC_CHANNELS.DNS_TAKEOVER_REPORT);
+  },
+
+  /**
+   * 本机**外来**隧道（独立 Tailscale 客户端 / 公司 VPN / ZeroTier）与 Polaris 争不争同一网段。
+   *
+   * 返回的是**四态判别联合**，不是一个冲突数组：只有 `status === 'probed'` 那一支带 `conflicts`。
+   * 渲染端必须按 `status` 分支 —— 「没探成」（macOS/Windows 无探测实现、命令失败、核没起过）
+   * 与「探过了、没冲突」是两件事，混成一句「无冲突」正是本报告要终结的那类谎。
+   */
+  async tunnelConflictReport(): Promise<TunnelConflictReport> {
+    return invoke(IPC_CHANNELS.TUNNEL_CONFLICT_REPORT);
+  },
+
+  /**
+   * Polaris **自己的**组网节点之间 force-route 段互相吸收的结算（只读）。
+   *
+   * `zeroCoverageServerIds` 非空 = 那些节点活着、engaged，却一条流量都收不到（段全被更早的
+   * 节点抢走）—— 静默失效，渲染端必须点名到节点。
+   */
+  async endpointForceRouteReport(): Promise<EndpointForceRouteReport> {
+    return invoke(IPC_CHANNELS.ENDPOINT_FORCE_ROUTE_REPORT);
   },
 
   /**

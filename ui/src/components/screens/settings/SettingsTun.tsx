@@ -17,6 +17,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { UserConfig, TunModeConfig, TunStack, UdpNatType } from '@/contracts/types';
+import { injectedList, injectedRecord } from '@/domain/effective-config';
 import { isValidMacAddress, isValidNeighborDomain } from '@/domain/neighbor';
 import { autoMtuFor, MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
 import { useNavStore } from '@/store/nav-store';
@@ -32,6 +33,13 @@ import {
   Button,
   Pill,
 } from './Primitives';
+import { api } from '@/ipc';
+import { useAppStore } from '@/store/app-store';
+import type { TunExclusionPreview } from '@/contracts/tun-exclusion-preview';
+import type { TunnelConflictReport } from '@/contracts/tunnel-conflict-report';
+import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
+import { TunnelConflictBlock } from './TunnelConflictBlock';
+import { EndpointForceRouteBlock } from './EndpointForceRouteBlock';
 import { ListEditor } from './ListEditor';
 import { bypassLanState, shellPlatformFromDataOs } from './settings-logic';
 import { revealOnToggle } from '@/components/reveal';
@@ -81,22 +89,96 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
   const navigate = useNavStore((s) => s.navigate);
   // 排除网段清单与「网络」页旁路清单同源于 bypassLANList，故同受 bypassLAN 总开关管辖（见下方块注释）。
   const bypassLan = bypassLanState(config);
-  const tun: TunModeConfig = config.tunConfig ?? {
-    stack: 'auto',
-    autoRoute: true,
-    strictRoute: true,
-  };
+  // 生效值由 `config:get` 边界注入（Rust `effective_view::ensure_effective_config`）——
+  // 这里**不许**写 `?? {…}` 兜底：那份兜底就是与内核默认分叉的第二真值源。见 domain/effective-config 模块头。
+  const tun = injectedRecord<TunModeConfig>(config.tunConfig, 'tunConfig');
 
   function patchTun(patch: Partial<TunModeConfig>) {
     void update({ tunConfig: { ...tun, ...patch } });
   }
 
   // 折叠段计数与编辑器清单取同一个数组，防「计数说 3 条、点开是 0 条」的分叉。
-  const bypassList = config.bypassLANList ?? ['localhost', '127.0.0.1', '192.168.0.0/16'];
-  const inboundExcludeCidrs = tun.inboundExcludeCidrs ?? ['100.64.0.0/10'];
+  // 两条都走 injectedList：缺席是**边界故障**（报错 + 空清单），不是"用前端的默认顶上"。
+  // `inboundExcludeCidrs` 的生效默认就是空——官方 Tailscale 的 `100.64.0.0/10` 只作 placeholder
+  // 建议值，不作默认：自建控制面的前缀可任意配（如 `32.0.0.0/24`），默认填官方段既排错了段、
+  // 又让 UI 看起来"已经配好了"。
+  const bypassList = injectedList(config.bypassLANList, 'bypassLANList');
+  const inboundExcludeCidrs = injectedList(
+    tun.inboundExcludeCidrs,
+    'tunConfig.inboundExcludeCidrs'
+  );
 
   // MTU 输入草稿。**不能每键落库**：输入 4064 的中途会经过 "4"/"40"/"406"，逐键提交就是逐键
   // 写盘 + 逐键判非法（"4" 越界标红），且中间那几个值都会真的进配置。故本地持草稿，失焦/回车才提交。
+  // 生效排除面预览：**跑真 builder 读回**，不在前端另算一份（判据由代码持有）。
+  // 依赖键只取真正影响排除面的输入，避免 config 引用每变一次就打一次 IPC。
+  const [preview, setPreview] = useState<TunExclusionPreview | null>(null);
+  const previewKey = JSON.stringify([
+    config.proxyModeType,
+    bypassLan.checked,
+    bypassList,
+    inboundExcludeCidrs,
+    config.enableIPv6,
+  ]);
+  useEffect(() => {
+    let cancelled = false;
+    api.config
+      .tunExclusionPreview()
+      .then((next) => {
+        if (!cancelled) setPreview(next);
+      })
+      .catch(() => {
+        // 预览失败不该打断设置页：保留上一次结果（若有），下面按 null 渲染"读不到"。
+        if (!cancelled) setPreview(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [previewKey]);
+
+  /* 两份只读报告 —— 都不在前端另算一份，跑后端真判据读回来（同上面那条预览的理由）。
+   *
+   * `null` 一律读作「还没拿到 / 读失败」，**绝不**折成「没有冲突」：外来隧道那条在
+   * macOS / Windows 上根本没有探测实现，把读不到画成一句「无冲突」会让用户排除掉真病因。
+   * 四态怎么显示见 `TunnelConflictBlock` 的文件头。
+   *
+   * 拉取时机：
+   *  - 外来隧道冲突：探测是**起核之后**的后台腿 ⇒ 跟着 `proxyRunning` 翻转重拉（同 DNS 接管报告）。
+   *  - 组网段结算：判据是「当前配置 + 运行期观测地址」⇒ 节点集/选中出口变了或核起停都要重拉。 */
+  const proxyRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
+  const [tunnelConflicts, setTunnelConflicts] = useState<TunnelConflictReport | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api.config
+      .tunnelConflictReport()
+      .then((next) => {
+        if (!cancelled) setTunnelConflicts(next);
+      })
+      .catch(() => {
+        // 读不到就如实显示「读不到」（块内 null 分支），不冒充任何一种探测结论。
+        if (!cancelled) setTunnelConflicts(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [proxyRunning]);
+
+  const [forceRoute, setForceRoute] = useState<EndpointForceRouteReport | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api.config
+      .endpointForceRouteReport()
+      .then((next) => {
+        if (!cancelled) setForceRoute(next);
+      })
+      .catch(() => {
+        if (!cancelled) setForceRoute(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [config.servers, config.selectedServerId, proxyRunning]);
+
   const [mtuDraft, setMtuDraft] = useState(tun.mtu === undefined ? '' : String(tun.mtu));
   const [mtuInvalid, setMtuInvalid] = useState(false);
   // 外部改动（配置回显、导入备份、另一处改了 tunConfig）要同步进草稿，否则框里留着陈旧值。
@@ -230,11 +312,31 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
         <SetRow label={t('settings.tun.autoRoute')} tip={t('settings.tun.autoRouteDesc')}>
           <Switch checked={tun.autoRoute} onChange={(v) => patchTun({ autoRoute: v })} />
         </SetRow>
+        {/* 严格路由：**macOS 上内核根本没有这一支实现**。
+            判据（对 1.15.0-alpha.2 实际 pin 的 sing-tun `98e457e39c90` 逐文件核过）：
+              · `tun.go:94` 只**声明**字段 `StrictRoute bool`，全文件仅此一处、无任何读取；
+              · `tun_darwin.go` / `tun_darwin_gvisor.go` / `monitor_darwin.go` / `redirect.go` /
+                `redirect_server.go`（darwin 会编进去的那批）StrictRoute **零命中**；
+              · 真正读它的四个文件全部编不进 darwin：`tun_linux.go` / `tun_windows.go` 靠文件名
+                后缀自动约束，`redirect_iptables.go` / `redirect_nftables_rules.go` **没有平台后缀**，
+                靠首行 `//go:build linux` 约束 —— 这两个只看文件名会误判成"跨平台编译"，
+                必须看 build 约束才下得了结论。
+            升核时按 `core_dep_fingerprint.rs` 的 SING_TUN_PINNED 注释复核。
+
+            这不只是「拨了不生效的控件」—— 原文案承诺的是「防止绕行泄漏」，一个**安全保证**。
+            mac 用户开着它，以为自己有防泄漏保护，实际什么都没装。给出不存在的安全保证比给一个
+            死开关严重一档，故走 disabled + tip（同 Switch 文档里「假可用」标记的既定范式），
+            而不是留着让人拨。值本身照常存盘，只禁交互。 */}
         <SetRow
           label={t('settings.tun.strictRoute')}
           tip={t('settings.tun.strictRouteDesc')}
         >
-          <Switch checked={tun.strictRoute} onChange={(v) => patchTun({ strictRoute: v })} />
+          <Switch
+            checked={tun.strictRoute}
+            onChange={(v) => patchTun({ strictRoute: v })}
+            disabled={platform === 'mac'}
+            tip={platform === 'mac' ? t('settings.tun.strictRouteMacInert') : undefined}
+          />
         </SetRow>
         {/* NAT 类型：内核侧是 udp_mapping × udp_filtering 两个字段，这里刻意收成**一颗**下拉。
             两个字段各 3 个取值 = 9 种组合，只有 4 种对应真实 NAT 语义，逐字段暴露等于把 5 个必然无意义
@@ -407,6 +509,46 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
           />
         </Fold>
       </SetBlock>
+
+      {/* 3.5 生效排除面 —— 上面两张表在**本平台**到底有没有进内核，只有这里说了算。
+          win32 两张都进 TUN、darwin 只进「连入来源排除」、Linux 一张都不进；这件事此前
+          界面上完全看不出来，用户只能靠试（2026-09-08 现场就栽在往 mac 的 bypassLANList
+          里填 tailnet 网段上）。故此处**不解释规则、直接给结果**：后端跑真 builder，把交给
+          内核的那一份读回来 —— 没有第二份计算可漂。 */}
+      <SetBlock header={t('settings.tun.effectiveExcludeBlock')}>
+        <div className="card-sub">{t('settings.tun.effectiveExcludeHint')}</div>
+        {preview === null ? (
+          <div className="card-sub">{t('settings.tun.effectiveExcludeUnavailable')}</div>
+        ) : !preview.tunActive ? (
+          <div className="card-sub">{t('settings.tun.effectiveExcludeNotTun')}</div>
+        ) : preview.effective.length === 0 ? (
+          // 空态**如实显示成空**。这正是本面板要终结的那类谎：此前折叠计数显示 1 条、内核 0 条。
+          <div className="card-sub">{t('settings.tun.effectiveExcludeEmpty')}</div>
+        ) : (
+          <ul className="cidr-eff-list">
+            {preview.effective.map((cidr) => (
+              <li key={cidr} className="mono">
+                {cidr}
+              </li>
+            ))}
+          </ul>
+        )}
+        {preview !== null && preview.notes.length > 0 && (
+          <div className="plat-warn" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {preview.notes.map((note, i) => (
+              <span key={`${note.level}-${i}`}>{note.message}</span>
+            ))}
+          </div>
+        )}
+      </SetBlock>
+
+      {/* 3.6 / 3.7 「谁在和我争同一网段」成对的两条只读报告。
+          前者是**别人的**隧道（独立 Tailscale 客户端 / 公司 VPN / ZeroTier），后者是**我自己的**
+          几个组网节点。两条的成因与自救动作都不一样，故各占一块、不合并。
+          ⚠️ force-route 规则并不只在 TUN 模式发射（route.rules 对任何入站都生效），它落在本页
+          是因为形态与「生效排除面」同源（后端跑真判据读回来），不是因为它属于 TUN。 */}
+      <TunnelConflictBlock report={tunnelConflicts} />
+      <EndpointForceRouteBlock report={forceRoute} servers={config.servers ?? []} />
 
       {/* 4. 局域网网关（契约 L102）——本机作 LAN 网关时的 sing-box 1.14 设备识别簇。
           平台门控走**组件层**（不渲染），而非 CSS 隐藏：这两项在不支持的平台上不是「样式问题」，

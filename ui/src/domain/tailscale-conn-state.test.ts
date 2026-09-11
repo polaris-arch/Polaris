@@ -10,7 +10,13 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { isDefinitiveTsLoginFrame, deriveTsCardState } from './tailscale-conn-state';
+import {
+  isDefinitiveTsLoginFrame,
+  deriveTsCardState,
+  tsAccountLabel,
+  hasTsAuthKey,
+} from './tailscale-conn-state';
+import type { TailscaleStatusDetails, TailscaleUserGroupStatus } from '../contracts/tailscale-status';
 
 const frame = (backendState: string, loggedIn: boolean, expired = false) => ({
   backendState,
@@ -99,6 +105,30 @@ describe('deriveTsCardState', () => {
     );
   });
 
+  /**
+   * `hasTsAuthKey` 是 `key-ready` 这一档与设置弹窗状态行**共用**的那一份判据。
+   * 两处若各写一遍 `!!ts?.authKey`，「全是空格的 key」会在卡片上显示「凭据就绪」、
+   * 在设置里显示「已保存」，而 tsnet 拿它根本认证不了 —— 故口径钉在这里，且它只输出布尔。
+   */
+  it('hasTsAuthKey：空 / 缺席 / 纯空白都不算凭据，且 key-ready 与它同步翻转', () => {
+    expect(hasTsAuthKey(undefined)).toBe(false);
+    expect(hasTsAuthKey(node({}))).toBe(false);
+    expect(hasTsAuthKey(node({ tailscaleSettings: {} }))).toBe(false);
+    expect(hasTsAuthKey(node({ tailscaleSettings: { authKey: '' } }))).toBe(false);
+    expect(hasTsAuthKey(node({ tailscaleSettings: { authKey: '   ' } }))).toBe(false);
+    expect(hasTsAuthKey(node({ tailscaleSettings: { authKey: 'k' } }))).toBe(true);
+    // 同一输入下两条腿必须同答案（判据只有一份的可观测形式）。
+    const blank = node({ tailscaleSettings: { authKey: '   ' } });
+    expect(hasTsAuthKey(blank)).toBe(false);
+    expect(deriveTsCardState(blank, false, false, false)).not.toBe('key-ready');
+  });
+
+  it('hasTsAuthKey 只输出布尔（拿不到 key 本身 ⇒ 调用方无从把它渲染出去）', () => {
+    const out = hasTsAuthKey(node({ tailscaleSettings: { authKey: 'tskey-auth-SENTINEL' } }));
+    expect(typeof out).toBe('boolean');
+    expect(String(out)).not.toContain('SENTINEL');
+  });
+
   it('登录进行中（loginActive + 有 URL + 未登录）→ logging-in', () => {
     expect(deriveTsCardState(node({ tailscaleSettings: {} }), false, true, true)).toBe('logging-in');
   });
@@ -111,5 +141,67 @@ describe('deriveTsCardState', () => {
 
   it('loggedIn → connected（压过 URL 残留）', () => {
     expect(deriveTsCardState(node({ tailscaleSettings: {} }), true, true, true)).toBe('connected');
+  });
+});
+
+describe('tsAccountLabel —— 账号标识文案，登录名只在无歧义时取', () => {
+  const group = (loginName: string): TailscaleUserGroupStatus => ({
+    userID: 1,
+    loginName,
+    displayName: loginName,
+    profilePicURL: '',
+    peers: [],
+  });
+
+  const details = (over: Partial<TailscaleStatusDetails> = {}): TailscaleStatusDetails => ({
+    stateText: '',
+    networkName: '',
+    magicDNSSuffix: '',
+    keyAuth: true,
+    userGroups: [],
+    ...over,
+  });
+
+  it('details 缺席（未收到 STATUS 帧）→ undefined', () => {
+    expect(tsAccountLabel(undefined)).toBeUndefined();
+  });
+
+  it('两段都空（无 tailnet、无账号组）→ undefined', () => {
+    expect(tsAccountLabel(details())).toBeUndefined();
+  });
+
+  it('恰好一组 → 登录名 · tailnet（唯一一组即无歧义账号）', () => {
+    const d = details({ networkName: 'example-tailnet', userGroups: [group('owner@example.com')] });
+    expect(tsAccountLabel(d)).toBe('owner@example.com · example-tailnet');
+  });
+
+  it('networkName 空时 tailnet 段退 magicDNSSuffix', () => {
+    const d = details({ magicDNSSuffix: 'tail1234.ts.net', userGroups: [group('owner@example.com')] });
+    expect(tsAccountLabel(d)).toBe('owner@example.com · tail1234.ts.net');
+  });
+
+  /**
+   * 核心回归：`details.self` 不落进任何一组的 `peers`（proto `TailscaleUserGroup` 头注
+   * 「对端节点按归属用户分组」——self 是独立字段，不算「对端」），当前 wire 面没有字段能判定
+   * self 归属哪一组。>1 组时**绝不能取第一组了事**——那是把别的账号的登录名显示成用户自己的，
+   * 比不显示更坏。正面断言：返回值里不含任何一组的 loginName 字面量，不只断言"不等于某个值"
+   * （否则把返回值错改成第二组的 loginName 这类变异会漏判）。
+   *
+   * 旧实现（`userGroups[0]?.loginName`）在本用例上会红：验证记录见任务回报。
+   */
+  it('多组（跨账号共享）且无法判定 self 归属 → 只显示 tailnet，不含任何一组的登录名', () => {
+    const d = details({
+      networkName: 'example-tailnet',
+      userGroups: [group('owner@example.com'), group('shared-by@other.com')],
+    });
+    const result = tsAccountLabel(d);
+    expect(result).toBe('example-tailnet');
+    expect(result).not.toContain('owner@example.com');
+    expect(result).not.toContain('shared-by@other.com');
+  });
+
+  it('多组且 tailnet 也空 → undefined（不摆任何一组的登录名当替代）', () => {
+    const d = details({ userGroups: [group('owner@example.com'), group('shared-by@other.com')] });
+    expect(tsAccountLabel(d)).toBeUndefined();
   });
 });

@@ -35,6 +35,7 @@ import { parseNumberField } from './FieldSpec';
 import { parseWgQuickConf, type ParsedWgQuick } from '@/domain/wg-quick';
 import { isWarpServer } from '@/domain/warp';
 import { applyDetour, detourDraftValue, DETOUR_NONE } from './detour-options';
+import { applyOnDemand, onDemandDraftValue } from './on-demand-field';
 
 const CATCH_ALL = new Set(['0.0.0.0/0', '::/0']);
 
@@ -102,6 +103,8 @@ export interface WgDraft extends FormValues {
   detour: string;
   /** 物理出口网卡；空 = 继承全局代理出口。 */
   bindInterface: string;
+  /** 按需连接（ServerConfig 顶层，定义见 `on-demand-field.ts`）。缺省关。 */
+  onDemand: boolean;
 }
 
 /**
@@ -145,6 +148,7 @@ export function emptyWgDraft(): WgDraft {
     alwaysRouteSubnets: true,
     detour: DETOUR_NONE, // 缺省即默认：不串联 ⇒ 提交时删键，不写字面量
     bindInterface: '',
+    onDemand: false,
   };
 }
 
@@ -176,6 +180,7 @@ export function draftFromParsed(p: ParsedWgQuick): WgDraft {
     // wg-quick .conf 同样没有「前置代理」这个概念（sing-box 的 Dial Field，不是 WG 协议字段）→ 恒缺省。
     detour: DETOUR_NONE,
     bindInterface: '',
+    onDemand: false,
   };
 }
 
@@ -209,6 +214,7 @@ export function draftFromServer(server: ServerConfig): WgDraft {
     // detour 在 ServerConfig **顶层**（不在 wireguardSettings 里），故取 `server` 而非 `s`。
     detour: detourDraftValue(server),
     bindInterface: server.bindInterface ?? '',
+    onDemand: onDemandDraftValue(server),
   };
 }
 
@@ -279,6 +285,7 @@ export function buildWgServer(
   // WG 表单没有这个控件，只能把存量值原样带过）。本轮补上控件后改由草稿定夺，
   // 「不串联」走删键（见 `detour-options.ts#applyDetour`）。
   applyDetour(server, draft.detour);
+  applyOnDemand(server, draft.onDemand);
   const bindInterface = str(draft.bindInterface).trim();
   if (bindInterface) server.bindInterface = bindInterface;
   else delete server.bindInterface;

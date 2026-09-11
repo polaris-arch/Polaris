@@ -15,8 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::builder::custom_rule_files::uses_fake_ip;
 use crate::builder::custom_rules::{build_custom_rules, CustomRulesDeps};
 use crate::builder::endpoint_routes::{
-    collect_rule_targeted_server_ids, endpoint_forced_route_cidrs, mesh_force_routed_servers,
-    mesh_forced_route_cidrs, mesh_node_carries_full_tunnel, should_force_route_subnets,
+    collect_targeted_mixed, force_route_emission_order_key, force_route_leg,
+    mesh_force_routed_servers, mesh_forced_route_cidrs, mesh_node_carries_full_tunnel,
+    settle_force_route_claims, should_force_route_subnets, tailnet_rule_file_base, ForceRouteLeg,
+    ObservedTailnetAddresses,
 };
 use crate::builder::helpers::{
     apply_rule_set_prune, effective_app_rules, effective_custom_rules,
@@ -40,10 +42,9 @@ use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use crate::user_config::region_routing::{
     effective_region_routing, region_foreign_geo, region_local_geo,
 };
-use crate::user_config::rule::AppRule;
 use crate::user_config::rule::RuleAction;
 use crate::user_config::rules::rule_ip_cidrs;
-use crate::user_config::server_config::{is_mesh_node, Protocol};
+use crate::user_config::server_config::{is_mesh_node, Protocol, ServerConfig};
 use crate::user_config::system_proxy_bypass::{bypass_lan_cidrs, effective_bypass_lan};
 use crate::user_config::tun_config::{FAKEIP_INET4_RANGE, FAKEIP_INET6_RANGE};
 
@@ -112,10 +113,6 @@ pub const DEFAULT_BROWSER_DOH_SUFFIXES: &[&str] = &[
     "doh.libredns.gr",
 ];
 
-/// Tailscale preferred_by 试点开关（上游 `TS_PREFERRED_BY_TRIAL = false`）。
-/// sing-box 源码确证 TS 的 routePrefixes 运行时动态+就绪窗口 nil → 组网段不归位，故 TS 必走 ip_cidr 静态。
-const TS_PREFERRED_BY_TRIAL: bool = false;
-
 /// 注入依赖：上游 `RouteConfigDeps`。实例态（值 + 回调）由 generateSingBoxConfig 注入。
 ///
 /// 对拍：FS 路径注入固定假路径（如 "/fake/rules/"），`is_valid_srs_fn` 由测试夹具控制。
@@ -156,6 +153,16 @@ pub struct RouteConfigDeps<'a> {
     pub platform: String,
     /// 文件存在性 + SRS 魔数检查（对拍 fixture 注入固定 true/false）。
     pub is_valid_srs_fn: fn(&str) -> bool,
+    /// tailnet rule-set 文件目录（块 0c 的 `tailnet-<serverId>.json` 路径前缀）。对拍固定假路径。
+    ///
+    /// **必须是独立目录，不得复用 `custom_rules_dir`**：后者有孤儿对账清扫
+    /// （`custom_rule_files::is_custom_rule_orphan_file` + 起核前 `write_custom_rule_files` 的
+    /// unlink 腿），凡不在「本轮期望集」里的文件都会被删。tailnet 文件由另一条腿产出、不在那个
+    /// 期望集里，放进去等于每次起核先被删一遍 —— 而 `NewLocalRuleSet` 首次 `reloadFile` 失败会
+    /// 让整个核起不来。
+    pub tailnet_rules_dir: String,
+    /// 运行期观测到的 tailnet 地址（serverId → 裸地址）。见 [`ObservedTailnetAddresses`]。
+    pub observed_tailnet_addresses: ObservedTailnetAddresses,
 }
 
 /// QUIC(UDP/443) reject 规则工厂：可选叠加域名/进程等匹配器。route 与各处 blockQuic 共用，
@@ -271,11 +278,14 @@ pub fn build_route_config_with_report(
     let rule_targeted_server_ids = collect_targeted_mixed(&custom_rules_eff, &app_rules_eff);
 
     // mesh 重叠提醒（layer-2 兜底，非阻断）。基准只取「本轮实际会发射 force-route」的节点（与块 0c 同 gate）。
-    let mesh_cidrs_for_warn = mesh_forced_route_cidrs(&mesh_force_routed_servers(
-        &config.servers,
-        config.selected_server_id.as_deref(),
-        &rule_targeted_server_ids,
-    ));
+    let mesh_cidrs_for_warn = mesh_forced_route_cidrs(
+        &mesh_force_routed_servers(
+            &config.servers,
+            config.selected_server_id.as_deref(),
+            &rule_targeted_server_ids,
+        ),
+        &deps.observed_tailnet_addresses,
+    );
     if !mesh_cidrs_for_warn.is_empty() {
         let mut overlapping: BTreeSet<String> = BTreeSet::new();
         for rule in &custom_rules_eff {
@@ -893,8 +903,22 @@ pub fn build_route_config_with_report(
             .iter()
             .map(|e| e.tag.clone())
             .collect();
-        let mut claimed_cidrs: BTreeSet<String> = BTreeSet::new();
-        let mut force_route_conflicts = 0u32;
+        // ── 第一步：按发射顺序收集本轮 claimant + 各自的腿 ─────────────────────────────
+        //
+        // **腿选择与跨节点结算都下沉到 `endpoint_routes`**（`force_route_leg` /
+        // `settle_force_route_claims`），使只读报告（`endpoint_force_route_report`）与本发射端
+        // 是同一份实现。此前这里只留下一个 `force_route_conflicts` 计数：它说得出「有 N 段被重复
+        // 声明」，说不出「哪个节点因此一条流量都收不到」—— 而后者才是用户能看见的那个故障
+        // （节点活着、engaged、用户以为它在工作，tailnet 流量一条都不到它那儿）。
+        struct Claimant<'a> {
+            server: &'a ServerConfig,
+            tag: String,
+            leg: ForceRouteLeg,
+            /// Tailscale 节点的 tailnet rule-set 文件路径（非 TS 恒 None）。与选腿时那次存在性
+            /// 检查**同一个字符串**，不在发射时再拼一次 —— 拼两次就有拼歪一次的机会。
+            tailnet_path: Option<String>,
+        }
+        let mut claimants: Vec<Claimant<'_>> = Vec::new();
         for s in &config.servers {
             let tag = match id_to_tag_map.get(&s.id) {
                 Some(t) => t.clone(),
@@ -910,45 +934,142 @@ pub fn build_route_config_with_report(
             ) {
                 continue;
             }
-            // preferred_by 适用：非全隧道 +（WG 恒 | TS 试点开）。
-            let use_preferred_by = !mesh_node_carries_full_tunnel(s)
-                && (s.protocol == Protocol::Wireguard
-                    || (s.protocol == Protocol::Tailscale && TS_PREFERRED_BY_TRIAL));
-            if use_preferred_by {
-                rules.push(RouteRule {
-                    preferred_by: Some(vec![tag.clone()]),
+            // ── tailnet rule-set 腿（Tailscale 专属，**文件存在才走**）────────────────────
+            //
+            // 形态照搬 `builder::custom_rules` 的 L3 外化腿（:470-520）：`RuleSet{type:"local",
+            // format:"source", path}` + 一条固化的 `{rule_set:<tag>}` 规则。值变了只要原子替换
+            // 文件，sing-box fswatch 热重载，不必重启核 —— 这正是 tailnet 地址需要的：它随控制面
+            // 分配而变，而 `ip_cidr` 字面量固化在 config 里、改一次就得重启。
+            //
+            // **存在性检查是硬门，不是优化**：`NewLocalRuleSet` 在起核时首次 `reloadFile` 失败即
+            // 返回 error、整个核起不来。故与 custom_rules 同款——文件不在就一个字节都不注册，
+            // 回落下面的 inline 腿（产出与本腿存在之前逐字节相同）。
+            //
+            // 存在性用 `ext_rule_file_exists`（真 `existsSync` 等价）而不是 `deps.is_valid_srs_fn`：
+            // 这是 headless **JSON source**、不含 `SRS` 魔数，用魔数判会让本腿 100% 不可达
+            // （`custom_rule_files::ext_rule_file_exists` 的文档记的就是这个坑）。直接取该函数、
+            // 不经 deps 注入，与本文件给 `CustomRulesDeps.exists_fn` 的写法同源（route 侧 FS 单一真值）。
+            //
+            // **跨节点去重对本腿不适用**（`ForceRouteLeg::ExternalRuleSet` 在结算侧既不消耗也不
+            // 贡献 claim）：文件里装的是该 tailnet **自己的**主机地址，而结算的判据是 CIDR
+            // **字面量**，看不见文件内容，想参与也参与不了。对 `absorbed_count` 的影响：走本腿的
+            // 节点不会多计（不拿别人的段去撞）也不会少计（它没有段被别人吸收），取材面仍是
+            // 「仍走 inline 腿的节点之间的字面量重复」⇒ 门③（silent absorption）的 warn 无假读数。
+            //
+            // ⚠️ **本腿仍是一个已知盲区，不是「没有冲突」**：文件内容由落盘侧按
+            // `endpoint_forced_route_cidrs` 重算，结算侧看不见文件里装了什么，故两个走本腿的
+            // 节点之间真相交了也报不出来。
+            //
+            // 盲区的**面积已被本批缩小**：「默认段与观测段的优先级」那个待决策项已经决策 ——
+            // 有观测的节点不再发默认两段（见 `endpoint_routes::ObservedTailnetAddresses` 的
+            // 「# 语义」一节），于是两个**都有观测**的 TS 节点，两份文件里装的是各自 tailnet 的
+            // 主机地址，不再必然相交。残留的是「两个节点都还没有观测」那一格：两份文件都装默认
+            // 两段 ⇒ 真相交、字面量层仍看不见。那一格由下面的发射顺序兜住方向（谁先声明谁在前），
+            // 不由结算兜住计数。
+            //
+            // 文件未落盘 → 回落 inline。**缺席是常态不是故障**（A-0b 的观测/落盘腿没跑、
+            // 节点还没连上控制面都会缺），故此处不置降级标记、不 warn，与 custom_rules 的
+            // ext 腿「文件未落盘 → 回落 inline」同款静默。
+            let tailnet_path = (s.protocol == Protocol::Tailscale).then(|| {
+                format!(
+                    "{}/{}.json",
+                    deps.tailnet_rules_dir,
+                    tailnet_rule_file_base(&s.id)
+                )
+            });
+            let file_exists = tailnet_path
+                .as_deref()
+                .is_some_and(crate::builder::custom_rule_files::ext_rule_file_exists);
+            claimants.push(Claimant {
+                server: s,
+                tag,
+                leg: force_route_leg(s, file_exists),
+                tailnet_path,
+            });
+        }
+
+        // ── 第一步半：排成发射顺序（有观测的节点整体在前）──────────────────────────
+        //
+        // **这条顺序是必需的，不是整洁**：sing-box 的 `route.rules` 按规则顺序 first-match，
+        // 不做最长前缀匹配。有观测的节点发 `/32`、无观测的节点发 `100.64.0.0/10` —— 两者字面
+        // 不同 ⇒ 下面那次跨节点去重一条都拦不下，两条规则都会发出去。此时 `/10` 若排在前面，
+        // 它把 `/32` 那条的流量整个吃掉，而产物里那条 `/32` 明明还在、逐条看一切正常。
+        //
+        // 排在**结算之前**：结算按本序决定「谁先占」、发射按本序输出、只读报告
+        // （`endpoint_force_route_report`）用**同一个 key** 排 —— 三者同序是一个不变量。
+        // 各排各的不会红在任何单侧断言上，只会让报告说的「谁抢走了谁的段」与内核实际匹配到的
+        // 那一条反过来。`sort_by_key` 是稳定排序 ⇒ 组内保持 `config.servers` 的声明顺序。
+        claimants.sort_by_key(|c| {
+            force_route_emission_order_key(c.server, &deps.observed_tailnet_addresses)
+        });
+
+        // ── 第二步：一次结算（跨节点「首声明者占有」）───────────────────────────────
+        let settled = settle_force_route_claims(
+            &claimants
+                .iter()
+                .map(|c| (c.server, c.leg))
+                .collect::<Vec<_>>(),
+            &deps.observed_tailnet_addresses,
+        );
+
+        // ── 第三步：按结算结果发射（顺序 = claimant 顺序，与结算逐项一一对应）──────────
+        for (c, entry) in claimants.iter().zip(settled.servers.iter()) {
+            match c.leg {
+                // preferred_by 适用：非全隧道 +（WG 恒 | TS 试点开）。段由内核按 endpoint 自身
+                // 路由表归位，不产 ip_cidr 字面量 ⇒ 不参与跨节点去重（结算侧同口径）。
+                ForceRouteLeg::PreferredBy => rules.push(RouteRule {
+                    preferred_by: Some(vec![c.tag.clone()]),
                     action: Some("route".to_string()),
-                    outbound: Some(tag),
+                    outbound: Some(c.tag.clone()),
                     ..empty_matcher()
-                });
-                continue;
-            }
-            // 否则（全隧道节点 / TS 试点未开）：手动 ip_cidr force-route（去 0/0 + 跨节点 first-match 去重）。
-            let cidrs: Vec<String> = endpoint_forced_route_cidrs(s)
-                .into_iter()
-                .filter(|c| {
-                    if claimed_cidrs.contains(c) {
-                        force_route_conflicts += 1;
-                        false
-                    } else {
-                        claimed_cidrs.insert(c.clone());
-                        true
+                }),
+                ForceRouteLeg::ExternalRuleSet => {
+                    let Some(path) = c.tailnet_path.clone() else {
+                        continue; // 结构上不可达：ExternalRuleSet 只由 TS + 路径存在派生。
+                    };
+                    let base = tailnet_rule_file_base(&c.server.id);
+                    let rs = route_config.rule_set.get_or_insert_with(Vec::new);
+                    if !rs.iter().any(|e| e.tag == base) {
+                        rs.push(RuleSet {
+                            tag: base.clone(),
+                            type_field: "local".into(),
+                            format: "source".into(),
+                            path: Some(path),
+                            url: None,
+                            http_client: None,
+                            update_interval: None,
+                        });
                     }
-                })
-                .collect();
-            if !cidrs.is_empty() {
-                rules.push(RouteRule {
-                    ip_cidr: Some(cidrs),
-                    action: Some("route".to_string()),
-                    outbound: Some(tag),
-                    ..empty_matcher()
-                });
+                    rules.push(RouteRule {
+                        rule_set: Some(OneOrMany::One(base)),
+                        action: Some("route".to_string()),
+                        outbound: Some(c.tag.clone()),
+                        ..empty_matcher()
+                    });
+                }
+                // 全隧道节点 / TS 试点未开：手动 ip_cidr force-route。`entry.emitted` 已是
+                // 「去 0/0 + 跨节点 first-match 去重」之后的那一份（结算侧算的，此处不复算）。
+                ForceRouteLeg::Inline => {
+                    if !entry.emitted.is_empty() {
+                        rules.push(RouteRule {
+                            ip_cidr: Some(entry.emitted.clone()),
+                            action: Some("route".to_string()),
+                            outbound: Some(c.tag.clone()),
+                            ..empty_matcher()
+                        });
+                    }
+                }
             }
         }
-        if force_route_conflicts > 0 {
-            (deps.log)(LogLevel::Warn, &format!(
-                "{force_route_conflicts} 个 endpoint 路由段被多个节点重复声明，已按节点顺序去重（先声明者生效）"
-            ));
+
+        if settled.absorbed_count > 0 {
+            (deps.log)(
+                LogLevel::Warn,
+                &format!(
+                    "{} 个 endpoint 路由段被多个节点重复声明，已按节点顺序去重（先声明者生效）",
+                    settled.absorbed_count
+                ),
+            );
         }
     }
 
@@ -1534,22 +1655,11 @@ pub fn subscription_update_route_uses_proxy(config: &UserConfig) -> bool {
         && !mesh_selected_exit_falls_back_to_direct(config)
 }
 
-/// 混合收集 Rule + AppRule 的 targetServerId（enabled && action==proxy && targetServerId）。
-/// 上游 `collectRuleTargetedServerIds([...customRules, ...appRules])`。
-fn collect_targeted_mixed(
-    custom_rules: &[crate::user_config::rule::Rule],
-    app_rules: &[AppRule],
-) -> BTreeSet<String> {
-    let mut ids = collect_rule_targeted_server_ids(custom_rules);
-    for r in app_rules {
-        if r.enabled && r.action == RuleAction::Proxy {
-            if let Some(tid) = &r.target_server_id {
-                ids.insert(tid.clone());
-            }
-        }
-    }
-    ids
-}
+/* `collect_targeted_mixed` 已上移至 `builder::endpoint_routes`（2026-09-11）。
+ *
+ * 块 0c 的 engaged 判定与只读报告 `endpoint_force_route_report` 必须用同一次汇集：
+ * 留在本文件就只有 route builder 上下文里的调用方够得着，报告端只能再抄一份，
+ * 而两份 mode-gate 判据分叉时谁也不会红。 */
 
 /// 剪枝后是否**还有任何规则把流量送去用户出口**（= 代理腿是否幸存）。
 ///

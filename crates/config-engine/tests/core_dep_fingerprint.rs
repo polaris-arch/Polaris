@@ -81,7 +81,20 @@ use core_locator::{core_or_skip, repo_root};
 //   gh api 'repos/SagerNet/sing-tun/git/trees/<tag>?recursive=1' \
 //     --jq '.tree[]|select(.type=="blob")|"\(.sha) \(.path)"'
 // 前提未变，故只更新 pin，不改机制。
-const SING_TUN_PINNED: &str = "v0.9.0-beta.4";
+//
+// 2026-09-08 随随包核 1.14.0 → **1.15.0-alpha.2** 复核。sing-tun 从 `v0.9.0-beta.4` 跳到
+// `v0.9.1-0.20260902150540-98e457e39c90`（1.15.0-alpha.2 的 go.mod:58）。逐条按本常量文档的指引核对：
+//   ① 直读新版函数体：`tun.go:128-133` 仍是 `if o.DNSMode == "" { return DNSModeHijack }`，
+//      枚举 `DNSModeHijack = "hijack"`（tun.go:64-66）未变；
+//   ② 全仓对差兜底（防「默认值没动但别处把它绕过去了」）：beta.4 → 该 commit 共 21 个文件变动，
+//      其中 `tun.go` 只改了 **1 行**且与 DNS/路由模式无关；提到 `DNSMode` 的新增行仅
+//      `redirect_iptables.go` 一处 `dnsHijack := options.DNSModeOrDefault() == DNSModeHijack`
+//      —— 那是 Linux redirect/auto_redirect 路径（本仓不开启），是**读取**该默认而非改动它。
+//   ③ 顺带确认 `StrictRoute` 的消费面仍只有 `tun.go`(声明) / `tun_linux.go` / `tun_windows.go` /
+//      `redirect_iptables.go` / `redirect_nftables_rules.go`，**`tun_darwin.go` 一次都没有**
+//      ⇒ macOS 上 `strict_route` 仍是 no-op（这条是 UI 侧「mac 禁用该开关」的判据来源）。
+// 前提未变，故只更新 pin，不改机制。
+const SING_TUN_PINNED: &str = "v0.9.1-0.20260902150540-98e457e39c90";
 
 /// 被钉的依赖模块路径。
 const SING_TUN_MODULE: &str = "github.com/sagernet/sing-tun";

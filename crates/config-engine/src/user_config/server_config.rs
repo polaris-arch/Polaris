@@ -393,6 +393,37 @@ pub struct ServerConfig {
     /// 手动节点的物理出口网卡覆盖。订阅节点忽略本字段，改读订阅级策略。
     #[serde(rename = "bindInterface", skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
+    /// 按需连接（sing-box 1.15 endpoint `on_demand`）。**仅 endpoint 腿有效**
+    /// （WireGuard / Tailscale / OpenVPN Client / OpenConnect —— 内核侧四者共用同一个键）。
+    ///
+    /// # 为什么放 `ServerConfig` 顶层而不是各协议的 settings 里
+    ///
+    /// 它是**端点生命周期**属性，与协议无关：四种 endpoint 的语义逐字相同，且未来新增的
+    /// endpoint 协议同样适用。放进四个 settings 结构 = 四份同义字段 + 四个读取点，
+    /// 与 [`Self::detour`] / [`Self::bind_interface`] 当初不放进 settings 是同一条理由。
+    ///
+    /// # 语义（读 sing-box 1.15.0-alpha.2 源码，非文档转述）
+    ///
+    /// 驱动方是 `route/reference.go` 的 `ReferenceManager`：它从 route/DNS 规则（按当前 clash
+    /// mode）、默认出站、inbound/service 的 `References()` 求引用闭包。**非 on_demand 的 endpoint
+    /// 被无条件塞进队列 ⇒ 恒被引用 ⇒ 恒连**（这是本字段出现之前的唯一行为）；on_demand 的不塞，
+    /// `keep = referencedOutbounds[tag] && !devicePaused`。
+    ///
+    /// 关键配套：`protocol/group/selector.go` 的 `References() = [s.Now()]` —— **只有当前选中的
+    /// 成员算被引用**。故待在 selector 里但未被选中的组网节点会被挂起。
+    ///
+    /// Tailscale 侧挂起 = `localBackend.EditPrefs(WantRunning: false)`，**等价 `tailscale down`**：
+    /// 交出 tailnet 地址、停 MagicDNS 与 DERP，但**不清 state、不改 config**，恢复后身份不变。
+    /// 恢复分两条互斥的腿：`system_interface = true` 走引用恢复即主动 resume；用户态则是
+    /// `DialContext` / `ListenPacket` 开头的懒恢复（**第一笔流量到达时才连**）。
+    ///
+    /// # 缺省即不发射
+    ///
+    /// `None` ⇒ 不下发该键 ⇒ 内核默认 `false` ⇒ 与本字段出现之前逐字节等价（金样零 delta）。
+    /// 默认不开是有意的：开启会改变「节点状态角标」与 Taildrop 的语义（挂起中的节点不在 tailnet 上），
+    /// 默认开等于给存量用户换语义。
+    #[serde(rename = "onDemand", skip_serializing_if = "Option::is_none")]
+    pub on_demand: Option<bool>,
     /// 用户声明的「经该节点可达的内网段」（CIDR）。**仅 endpoint 腿的 VPN 客户端
     /// （openconnect / openvpn-client）读它**，是这两个协议获得组网资格的唯一途径
     /// （见 [`is_mesh_node`]）。
@@ -558,6 +589,33 @@ pub fn is_mesh_protocol(p: Protocol) -> bool {
 /// 射程：`custom` 协议的 endpoint 腿（`customSettings.isEndpoint`）也落 `endpoints[]`，但那要看
 /// 节点的设置而非协议，本函数看不到 ⇒ 调用点若需覆盖它，须自行并上那一支（`speedtest.rs` 的
 /// `build_temp_node` 就是先判 custom-endpoint 再走本判据）。
+/// 全部 [`Protocol`] 变体 —— 供「按协议逐条覆盖」的门做取材面。
+///
+/// 手写数组本身不保证穷尽，故配套 `all_protocols_is_exhaustive` 用一个**穷尽 `match`** 钉住：
+/// 新增变体 ⇒ 那个 match 不编译 ⇒ 必须回来同步本表。没有那条测试，本表就只是一份会悄悄过期的清单，
+/// 而依赖它的门会**静默缩小取材面**（新协议不在表里 = 那条腿没人测，且一片绿）。
+pub const ALL_PROTOCOLS: [Protocol; 19] = [
+    Protocol::Vless,
+    Protocol::Trojan,
+    Protocol::Hysteria2,
+    Protocol::Shadowsocks,
+    Protocol::Anytls,
+    Protocol::Tuic,
+    Protocol::Vmess,
+    Protocol::Naive,
+    Protocol::Snell,
+    Protocol::Socks,
+    Protocol::Http,
+    Protocol::Ssh,
+    Protocol::Wireguard,
+    Protocol::Tailscale,
+    Protocol::Hysteria,
+    Protocol::Tor,
+    Protocol::Openconnect,
+    Protocol::OpenvpnClient,
+    Protocol::Custom,
+];
+
 pub fn lands_in_endpoints(p: Protocol) -> bool {
     matches!(
         p,

@@ -154,6 +154,12 @@ impl ProxyRuntime {
             .and_then(|id| self.mesh.selected_exit_backend_state(id));
         // 缓存整体替换（每帧即全量）——供 `tailscale_get_status` 拉末帧。
         self.mesh.update_ts_status(events.clone());
+        // A-0b：本帧观测到的 tailnet 地址 → 内存观测面 + 已挂载的 tailnet rule-set 文件（原子
+        // 替换触发 sing-box fswatch 热重载，零重启）。**这是真值源的运行中那条腿**：自建控制面
+        // （headscale `prefixes.v4` 可自定义）分到的地址不落在硬编码的 `100.64.0.0/10` 里，不接
+        // 这一条，那些地址的 force-route 规则一条流量都命中不了。
+        // 空帧（核刚起、netmap 未同步）不清空、文件不存在不创建、任何路径都不删 —— 见该方法文档。
+        self.sync_tailnet_rule_files(&events);
         // 逐端点 emit（前端 `onTailscaleStatus` 逐条消费）。未接线 emitter（单测/setup 前）→ 静默跳过。
         if let Some(emitter) = self.error_emitter.get() {
             for ev in &events {

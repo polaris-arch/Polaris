@@ -254,6 +254,15 @@ export interface ServerConfig {
   detour?: string;
   /** 仅手动节点可覆盖；订阅节点从所属订阅继承。 */
   bindInterface?: string;
+  /**
+   * 按需连接（sing-box 1.15 endpoint `on_demand`）。**仅 endpoint 腿有效**
+   * （WireGuard / WARP / Tailscale / OpenVPN Client / OpenConnect）。
+   *
+   * 语义权威在 Rust `ServerConfig::on_demand` 的文档注释：未被任何路由规则/选择器引用时
+   * 断开该端点；Tailscale 侧等价 `tailscale down`（交出 tailnet 地址、停 MagicDNS），
+   * 不清登录状态。缺省即删键 —— 读写一律走 `dialogs/on-demand-field.ts`。
+   */
+  onDemand?: boolean;
 
   /**
    * 用户声明的「经该节点可达的内网段」（CIDR）。**只有 openconnect / openvpn-client 读它** ——

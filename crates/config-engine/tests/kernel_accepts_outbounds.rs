@@ -1572,3 +1572,97 @@ fn bundled_core_accepts_dns_owned_connection_resolution_with_fakeip() {
         "随包核拒绝 DNS 所有权 + FakeIP 组合形状：{diag}\n{surface:#}"
     );
 }
+
+// ── on_demand（sing-box 1.15）：内核真的认这个键吗 ─────────────────────────────────
+//
+// 这道门要证的是**键名与容器位置对**，不是"我们序列化出来了"。它成立的原理是 decode 阶段
+// 对未知字段零容忍（本文件开头那两次出货缺陷的诊断就是 `unknown field "transport"`）：
+// 带 `on_demand` 的 endpoint 若能过 decode，就说明内核 schema 里确实有这个键、且在 endpoint 上。
+// 反过来，写错键名或摆错容器会当场 `unknown field`，不需要另造阴性对照。
+
+/// 四种 endpoint 协议的最小夹具（凭据只需过 decode，不需过 initialize）。
+const ON_DEMAND_FIXTURES: [(&str, &str); 4] = [
+    (
+        "wireguard",
+        r#""wireguardSettings":{"privateKey":"iOwLPBGGWkKDN4hRUPQwq8W4C4rSDPrRLcrHVvHkNlQ=",
+            "peerPublicKey":"iOwLPBGGWkKDN4hRUPQwq8W4C4rSDPrRLcrHVvHkNlQ=",
+            "localAddress":["10.0.0.2/32"],"allowInternet":true}"#,
+    ),
+    ("tailscale", r#""tailscaleSettings":{"hostname":"probe"}"#),
+    (
+        "openconnect",
+        r#""openconnectSettings":{"server":"https://vpn.example.com","username":"u","password":"p"}"#,
+    ),
+    (
+        "openvpn-client",
+        // ⚠️ 这两支的 settings **键名是 snake_case**（= sing-box 键名，见 `server_config.rs` 的
+        // 「serde 名 = sing-box 键名」注释）。写成 camelCase 会落进透传袋原样下发 ⇒ `unknown field`。
+        r#""openvpnClientSettings":{"server":"vpn.example.com","server_port":1194,
+            "username":"u","password":"p"}"#,
+    ),
+];
+
+#[test]
+fn on_demand_decodes_on_every_endpoint_type() {
+    let Some(core) = core_or_skip("on_demand 端点键门") else {
+        return;
+    };
+    let dir = test_temp_dir("polaris-kgate-ondemand-");
+
+    let mut decode_failures: Vec<String> = Vec::new();
+    let mut emitted = 0usize;
+    for (proto, settings) in ON_DEMAND_FIXTURES {
+        let raw = format!(
+            r#"{{
+                "servers": [{{ "id":"n1","name":"N","protocol":"{proto}",
+                    "address":"vpn.example.com","port":443,
+                    "onDemand": true,
+                    {settings} }}],
+                "selectedServerId":"n1","proxyMode":"global",
+                "proxyModeType":"manual","mixedPort":17899
+            }}"#
+        );
+        let user_config: UserConfig =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{proto} 夹具无效: {e}"));
+        let deps = deps_for("linux");
+        let cfg = generate_sing_box_config(&user_config, &BTreeMap::new(), &deps)
+            .unwrap_or_else(|e| panic!("{proto}: 生成失败 {e}"));
+        let value = serde_json::to_value(&cfg).expect("序列化");
+
+        // 前置断言：这条腿真的产出了带 on_demand 的 endpoint。
+        // 少了它，生成侧一旦静默漏发，下面的 check 会因为"配置里压根没这个键"而绿。
+        let carried = value
+            .get("endpoints")
+            .and_then(Value::as_array)
+            .map(|eps| {
+                eps.iter()
+                    .any(|e| e.get("on_demand") == Some(&Value::Bool(true)))
+            })
+            .unwrap_or(false);
+        assert!(
+            carried,
+            "{proto}: 生成的配置里没有带 on_demand 的 endpoint —— 本门此刻检不到任何东西"
+        );
+        emitted += 1;
+
+        let surface = outbound_surface(&value);
+        let p = dir.path().join(format!("ondemand-{proto}.json"));
+        std::fs::write(&p, serde_json::to_vec_pretty(&surface).unwrap()).expect("写盘");
+        let (ok, diag) = check(&core, &p);
+        if !ok && is_decode_stage(&diag) {
+            decode_failures.push(format!("  · {proto} → {diag}"));
+        }
+    }
+
+    assert_eq!(
+        emitted,
+        ON_DEMAND_FIXTURES.len(),
+        "有协议没走到 check —— 覆盖面缩水，先查生成为什么失败"
+    );
+    assert!(
+        decode_failures.is_empty(),
+        "随包核 decode 不了带 `on_demand` 的 endpoint（键名错 / 摆错容器 / 该版本还没有这个字段）。\
+         这类配置一旦下发，**整个核起不来**，不止这个节点：\n{}",
+        decode_failures.join("\n")
+    );
+}

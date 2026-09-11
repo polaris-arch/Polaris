@@ -23,6 +23,7 @@ use super::route_replan::{
     managed_tun_interface_for_session, required_interfaces_unavailable, ExitInterfaceId,
     InterfaceFingerprint, RuntimeBindingState, TunAdapterObservation, TunAdapterVerdict,
 };
+use super::tunnel_conflict::own_tunnel_interfaces;
 use super::PROBE_POOL_SIZE;
 use super::{ProxyRuntime, ProxyStatus, StartError};
 use super::{HELPER_GATE_ABORTED_MSG, HELPER_NOT_INSTALLED_MSG, TUN_ADAPTER_MISSING_MSG};
@@ -847,6 +848,13 @@ impl ProxyRuntime {
         let t_rules_prep = std::time::Instant::now();
         self.write_custom_rule_files(&user_config).await;
 
+        // 3.2 起核前落盘 tailnet rule-set 文件（**同样必须在 generate 前**：块 0c 按
+        //     `ext_rule_file_exists` 决定走 rule_set 引用还是回落 inline）。内容 = 上次已知的
+        //     观测集（盘上文件即持久层）+ 配置期已知段；首次运行无观测 ⇒ 官方默认两段，
+        //     **不写空文件**（空 rule-set 会让该节点整段 tailnet 不可路由）。见 `tailnet_rules`。
+        //     这一趟同时把盘上的观测面读回内存，供下面 `generate_deps` 注入 TUN 排除面。
+        self.write_tailnet_rule_files(&user_config).await;
+
         // ── 内置 geo 规则集播种（调用点 2/2：**每次起核前**；对齐 上游 `ProxyManager.ts:6375`）──
         // 与上面的 writeCustomRuleFiles 同理，**必须在 generate 之前**：route builder 按
         // `is_valid_srs_fn(<rules>/x.srs)` 的真存在性决定注不注入 rule_set，文件不在 → 规则 100% 被剪。
@@ -1578,6 +1586,37 @@ impl ProxyRuntime {
         // 阻塞约 12s，把它 await 在主链会让网卡与路由早已就绪却仍显示「连接中」。后台腿带世代 +
         // running 守卫，停核/重连后不会补发陈旧提示。
         self.spawn_system_proxy_residual_warning(user_config.proxy_mode_type, my_gen);
+        // **A-1a**：TUN 起来了 → 后台探一次本机**其它**隧道（Tailscale / 公司 VPN / ZeroTier），
+        // 与本次发射的配置对撞判冲突（只读不动手，与上一行同款 advisory 后台腿）。
+        //
+        // 判据段必须是**这一次**发射的那份，故在此处（而不是探测回来之后）就地取值：
+        //  · FakeIP 段与 TUN 地址从 `singbox_config` 读回 —— 那就是内核吃进去的字节；
+        //  · 组网段走 `mesh_forced_route_cidrs` + **喂给本次生成的那份观测快照**（`deps` 里的那一份，
+        //    不是现取一份）。现取会让它变成「另一份计算」：核起来之后又收到一帧 STATUS，判定
+        //    用的段就与内核吃的那份分叉；而传空则更糟 —— 自建 tailnet 的真实前缀（实测
+        //    `32.0.0.0/24`）根本进不了 `mesh_cidrs`，`MeshOverlap` 一条都判不出来。
+        //
+        // `own_interfaces` 两个来源都要：配置里的 `interface_name`（Linux/Windows）+ post-flight
+        // 真观测到的出口别名（macOS 的 `utunN` 由内核分配，配置里没有这个名字）。漏了任一条，
+        // 我方自己的路由会被当成"别人的隧道"，自指告警与真告警混在一起，整条告警就废了。
+        let tunnel_conflict_criteria =
+            polaris_config_engine::builder::tunnel_conflict::emitted_conflict_criteria(
+                &singbox_config,
+                &user_config.servers,
+                &deps.observed_tailnet_addresses,
+            );
+        let own_tunnel_interfaces = own_tunnel_interfaces(
+            &singbox_config,
+            captured_tun_interface
+                .as_ref()
+                .and_then(ExitInterfaceId::alias),
+        );
+        self.spawn_foreign_tunnel_conflict_probe(
+            user_config.proxy_mode_type,
+            my_gen,
+            tunnel_conflict_criteria,
+            own_tunnel_interfaces,
+        );
         // C5：核就绪后对齐 mesh 出口路由。契约 #37「绝不抢 sing-box 路由」的让位判定在 crate 内建
         // （仅 TS System + 承载全隧道出口才装单条 ifscope default，其余 None=让位）。**OS 路由操作已全链
         // 接线**（`HelperExitRouteOp`：mac/win 经 helper `route -ifscope`、Linux `ip rule/route` 表 7732）
@@ -2410,10 +2449,32 @@ impl ProxyRuntime {
             runtime_rules_dir: dir.join("rules").to_string_lossy().into_owned(),
             rule_resources_path: rule_resource_dir(dir).to_string_lossy().into_owned(),
             custom_rules_dir: dir.join("custom-rules").to_string_lossy().into_owned(),
+            // A-0a：tailnet rule-set 文件目录。**刻意不复用 `custom-rules`** —— 那个目录有孤儿
+            // 对账清扫（`is_custom_rule_orphan_file` + 起核前 unlink），凡不在本轮期望集里的文件
+            // 都会被删；tailnet 文件由另一条腿产出、不在那个期望集里，放进去等于每次起核先被删
+            // 一遍，而被挂载文件缺失会让 `NewLocalRuleSet` 首次 reloadFile 失败、整个核起不来。
+            //
+            // **A-0b 已落盘**：写侧（`tailnet_rules::write_tailnet_rule_files` / `sync_…`）与这里
+            // 取**同一个** [`tailnet_rules_dir`](Self::tailnet_rules_dir)，不各拼一次字符串 ——
+            // 两边分家的后果是写的和找的是两个目录，而块 0c 那条腿会静默 100% 不可达。
+            // 文件仍可能缺席（首次起核前腿写失败 / mkdir 失败），缺席即回落 inline，功能不损。
+            tailnet_rules_dir: self.tailnet_rules_dir().to_string_lossy().into_owned(),
             tailscale_state_dir_prefix: dir.join("tailscale").to_string_lossy().into_owned(),
             is_valid_srs_fn: is_valid_srs_file,
             // C12：真枚举本机所有非回环接口 CIDR（连入来源排除 guard / bypassLAN carve guard / mesh 重叠告警）。
             own_lan_cidrs: enumerate_own_lan_cidrs(),
+            // A-0b：运行期观测到的 tailnet 地址（`serverId` → 裸地址）。真值源是
+            // `ProxyRuntime::observed_tailnet`，由两条腿写：STATUS 帧（`sync_tailnet_rule_files`）
+            // 与**本次起核前**刚跑过的 `write_tailnet_rule_files`（把盘上文件的主机位条目读回，
+            // 那是跨进程重启唯一的持久层）。
+            //
+            // **这个字段是 TUN 排除面唯一的入口**：`builder::inbounds` 的 `engaged_mesh` 只吃这个
+            // map、不看 tailnet 文件（文件只服务块 0c 的规则发射）。少了这一行，自建 tailnet 的
+            // `32.0.0.x` 仍会被 TUN 的「连入来源排除」减法当成普通用户声明段处理 —— 那正是
+            // 2026-09-11 那次事故里用户的原始症状，只修规则发射治不了。
+            //
+            // 空 map 仍是合法值（没有 TS 节点 / 首次运行且核还没报过帧）⇒ 产出与 A-0a 之前逐字节相同。
+            observed_tailnet_addresses: self.observed_tailnet_snapshot(),
             log: config_log,
             on_degraded: config_on_degraded,
         }
@@ -2902,7 +2963,10 @@ pub(super) fn is_retryable_start_error(message: &str) -> bool {
 ///
 /// 复用 store 的 `<base>.<12hex>.tmp` 唯一后缀命名——其形态被 `is_custom_rule_orphan_file` 的 `.tmp` 分支
 /// 识别，故起核清扫能回收断电/强杀留下的半写 tmp（对齐 上游 atomicWrite 用 `writeFileAtomic`，:1711）。
-fn atomic_write_custom_rule(path: &Path, content: &str) -> Result<(), String> {
+///
+/// **A-0b 起 tailnet rule-set 文件也走它**（`tailnet_rules` 域的两条腿）：两类文件都是「rename-over
+/// 触发 sing-box fswatch 热重载」这一个语义，各写一份原子写就会在 tmp 命名/错误口径上分家。
+pub(super) fn atomic_write_custom_rule(path: &Path, content: &str) -> Result<(), String> {
     polaris_store::fs::atomic_write_plan(path, &polaris_store::fs::random_tmp_suffix(), content)
         .execute(&polaris_store::fs::StdFs)
         .map_err(|e| format!("{e:?}"))

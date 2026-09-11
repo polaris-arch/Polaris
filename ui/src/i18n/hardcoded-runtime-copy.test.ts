@@ -80,6 +80,9 @@ describe('i18n 文案只有 locale 一个真值源', () => {
       'localhost · 10.0.0.0/8 · *.example.cn', 'https://223.5.5.5/dns-query',
       'dns.example.com', 'https://cdn.example/ · cdn.example',
       '••••••••', '172.16.0.0/12', '100.64.0.0/10', '00:11:22:33:44:55',
+      // Tailscale 官方控制面地址：登录弹窗 controlUrl 输入框的占位示例。
+      // 与 `TsSettingsDialog` 的 FieldSpec `ph` 同一个值，属技术示例而非文案。
+      'https://controlplane.tailscale.com',
     ]);
     const violations: string[] = [];
     for (const file of runtimeFiles(sourceRoot)) {

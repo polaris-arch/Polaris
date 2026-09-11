@@ -20,19 +20,44 @@ export interface TsLoginSubmitPlan {
   server: ServerConfig;
   /** 发起登录前需要的落盘动作。 */
   persist: 'add' | 'update' | 'none';
+  /**
+   * 提交前是否必须先退出登录（清 state 目录）。
+   *
+   * **这条是「auth_key 换不上」的根因**：tsnet 手上只要有有效 node key 就不会去用 `auth_key`，
+   * 于是用户填了新 key、提交也成功，登录身份却一动不动。清 state 目录是唯一的解
+   * （`commands/server.rs` 的 `tailscale_logout` 注释：「清 state 目录；保留节点配置/authKey」）。
+   *
+   * 只在「切到 authkey 且该节点确实有 state」时为真：browser 模式本来就是交互登录，
+   * 而没有 state 的节点没什么可退。
+   */
+  requiresLogout: boolean;
+}
+
+/** 提交计划的输入。用对象而非位置参数：五个入参里三个是字符串，位置写反了类型系统看不出来。 */
+export interface TsLoginSubmitInput {
+  /** 既有的 Tailscale 节点（首次接入时缺席）。 */
+  existing?: ServerConfig;
+  mode: TsLoginMode;
+  authKey: string;
+  /**
+   * 自建控制面地址（headscale 等）。空串 = 官方 controlplane。
+   *
+   * **必须能在登录弹窗里填**：登录核确实透传它（`crates/mesh/src/tailscale_login.rs`），
+   * 但此前只有「TS 设置」弹窗有这个控件，而那个弹窗要求节点**已存在** ——
+   * 于是自建控制面用户的第一次登录必然打向官方 controlplane，只能先登错一次再改。
+   */
+  controlUrl: string;
+  /** 该节点当前是否已有登录 state（`tailscaleStateExists`）。无既有节点时传 false。 */
+  hasState: boolean;
+  /** 注入而非直接调 `crypto.randomUUID`，使单测可断言 id 去向。 */
+  mintId: () => string;
 }
 
 /**
- * 依「有无既有 TS 节点 + 登录方式」算出提交计划。
- *
- * @param mintId 注入而非直接调 `crypto.randomUUID`，使单测可断言 id 去向。
+ * 依「有无既有 TS 节点 + 登录方式 + 控制面地址」算出提交计划。
  */
-export function planTsLoginSubmit(
-  existing: ServerConfig | undefined,
-  mode: TsLoginMode,
-  authKey: string,
-  mintId: () => string
-): TsLoginSubmitPlan {
+export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan {
+  const { existing, mode, authKey, controlUrl, hasState, mintId } = input;
   // 绝不 mutate existing（它是 app-store.servers 里的 live 引用）——克隆基础对象 + 克隆 tailscaleSettings，
   // 提交失败不得把 authKey 写脏内存态。
   const server: ServerConfig = existing
@@ -56,11 +81,27 @@ export function planTsLoginSubmit(
     };
   }
 
-  if (!existing) return { server, persist: 'add' };
-  // 已有节点：只有 authKey 真的变了才写盘。browser 模式不碰配置 → 免掉一次无谓的
+  // controlUrl 与登录方式无关（两种方式都要打向同一个控制面），故不放在 authkey 分支里。
+  // 缺省即删键：空串写进配置只会让「用官方控制面」这件事在磁盘上多一个等价噪声键。
+  const trimmedControl = controlUrl.trim();
+  const nextSettings = { ...(server.tailscaleSettings ?? {}) };
+  if (trimmedControl) nextSettings.controlUrl = trimmedControl;
+  else delete nextSettings.controlUrl;
+  server.tailscaleSettings = nextSettings;
+
+  const requiresLogout = mode === 'authkey' && hasState;
+
+  if (!existing) return { server, persist: 'add', requiresLogout };
+  // 已有节点：只有**真的变了**才写盘。browser 模式不改任何字段时不碰配置 → 免掉一次无谓的
   // CONFIG_CHANGED 广播（后端据此重启代理）。
   const keyChanged =
     mode === 'authkey' &&
     server.tailscaleSettings?.authKey !== existing.tailscaleSettings?.authKey;
-  return { server, persist: keyChanged ? 'update' : 'none' };
+  const controlChanged =
+    server.tailscaleSettings?.controlUrl !== existing.tailscaleSettings?.controlUrl;
+  return {
+    server,
+    persist: keyChanged || controlChanged ? 'update' : 'none',
+    requiresLogout,
+  };
 }

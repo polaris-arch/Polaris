@@ -51,9 +51,9 @@ function renderDialog(desc: DialogEntry) {
     case 'warp':
       return <WarpDialog edit={desc.edit} />;
     case 'ts-login':
-      return <TsLoginDialog />;
+      return <TsLoginDialog serverId={desc.serverId} />;
     case 'ts-settings':
-      return <TsSettingsDialog />;
+      return <TsSettingsDialog serverId={desc.serverId} />;
     case 'taildrop':
       return <TaildropDialog serverId={desc.serverId} />;
     case 'vpn-auth':

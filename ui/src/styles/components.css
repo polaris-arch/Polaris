@@ -1127,6 +1127,11 @@
 .plat-warn{ display:none; align-items:center; gap:8px; margin:10px 0 4px; font-size:11.5px; color:hsl(var(--warn));
   background:hsl(var(--warn-weak)/0.6); border:1px solid hsl(var(--warn)/0.35); border-radius:var(--r-sm); padding:8px 11px; }
 .plat-warn svg{ width:15px; flex:none; }
+
+/* 生效排除面列表（SettingsTun §3.5）：只读结果，不是可编辑清单 —— 故用无边框紧凑行，
+   与上面两个 ListEditor 在视觉上区分开，避免被当成"还能在这里改"。 */
+.cidr-eff-list{ list-style:none; margin:6px 0 0; padding:0; display:flex; flex-direction:column; gap:2px; }
+.cidr-eff-list li{ font-size:11.5px; color:hsl(var(--fg-dim)); }
 :root[data-os="lin"] .plat-warn{ display:flex; }
 .webrtc-note{ display:none; margin-top:7px; font-size:11px; color:hsl(var(--warn)); }
 .webrtc-row.disabled .webrtc-note{ display:block; }

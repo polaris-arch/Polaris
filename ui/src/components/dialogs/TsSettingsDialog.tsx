@@ -17,6 +17,12 @@
  *  - `api.server.tailscaleLogout` = REAL（清 state 目录）。
  *  - 保存经 `api.server.update`（把表单写回该 TS 节点的 tailscaleSettings）。
  *
+ * **Auth Key 状态行**（基础页底部）：只呈现「已保存 / 未保存 / 待清除」这一个布尔事实 + 一颗
+ * 原地二次点击的「清除」。清除写的仍是上面这条唯一写腿（`buildTsSettings` 的 `clearAuthKey`
+ * 入参 → 同一次 `api.server.update` / 同一条暂存条目），**不新开第二条写 config 的路**；
+ * 登记见 `lib/config-write-wiring.test.ts` 里本文件那行 `api.server.update(`。
+ * key 本体在这一层**结构上不可达**：判据是 `hasTsAuthKey(node)` 这个布尔，不是字符串。
+ *
  * 无 TS 节点时（未登录）：给 mesh-note 引导先登录，Save/Logout 置灰（无可写目标）。
  * R1：`key` 绑 TS 节点 id（见导出包装）+ useState 同步初始化。
  */
@@ -46,6 +52,7 @@ import {
   EXIT_CUSTOM,
 } from './ts-settings-logic';
 import { applyDetour, endpointDetourOptions } from './detour-options';
+import { applyOnDemand, onDemandDraftValue, ON_DEMAND_FIELD } from './on-demand-field';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
@@ -54,6 +61,13 @@ import { useDialogStore } from './dialog-store';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { groupTsFields } from './mesh-form-layout';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
+import { hasTsAuthKey } from '@/domain/tailscale-conn-state';
+import { useConfirmTwice } from '@/lib/confirm-twice';
+import { InfoIcon } from '@/components/InfoIcon';
+import { cn } from '@/lib/utils';
+
+/** 「清除 Auth Key」的二次点击槽位（单例节点，全弹窗只有这一颗，无需按 id 分槽）。 */
+const AUTH_KEY_CLEAR_KEY = 'ts-authkey-clear';
 
 function TsSetIcon() {
   return (
@@ -113,6 +127,8 @@ const ADV_SPEC: FieldSpec[] = [
   // 两者同归高级并加 `when` 门控，既复刻 上游 分区，也让「开了没反应」这件事结构上不再可能。
   { t: 'switch', k: 'resolveByName', label: 'ts.resolveByName', hint: 'ts.resolveByNameHint' },
   { t: 'switch', k: 'acceptDefaultResolvers', label: 'ts.acceptDefaultResolvers', hint: 'ts.acceptDefaultResolversHint', when: (v) => v.resolveByName === true },
+  // 按需连接：与 `bindInterface` 同属 ServerConfig 顶层，定义与读写收在 `on-demand-field.ts` 一份。
+  ON_DEMAND_FIELD,
 ];
 
 function TsSettingsForm({ node }: { node?: ServerConfig }) {
@@ -137,10 +153,22 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   const [draft, setDraft] = useState<FormValues>(() => ({
     ...initTsDraft(node),
     bindInterface: node?.bindInterface ?? '',
+    onDemand: onDemandDraftValue(node),
   }));
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [formTab, setFormTab] = useState('basic');
+  /**
+   * 「本次提交要不要删掉已存的 authKey」——**草稿意图**，与表单其余字段同一提交时机。
+   *
+   * 不做成「点一下就立刻写盘」的第二条写腿，理由有二：
+   *  ① 本弹窗**每一项**都是保存才生效；一个动作独走会让同一个界面有两套提交语义；
+   *  ② 暂存层开着时（`STAGED_CONFIG_ENABLED` 默认 true）`servers` 的编辑恒走暂存，
+   *     所谓「立刻」本来就落不了盘 —— 写成立刻只会让文案撒谎。
+   * 故这里只记意图，真正删键由 `buildTsSettings(..., authKeyCleared)` 在提交时完成。
+   */
+  const [authKeyCleared, setAuthKeyCleared] = useState(false);
+  const { armed, confirmTwice } = useConfirmTwice();
 
   // 出口候选：拉状态快照（核未跑 / 无节点时为空）。connected=false 时静态提示手动填写。
   // **原样收下全部 peer**，不在这里筛 `exitNodeOption` —— 「没广告出口」与「不在 tailnet 里」
@@ -215,7 +243,28 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   };
 
   const buildSettings = (): TailscaleSettings =>
-    buildTsSettings(node?.tailscaleSettings, draft);
+    buildTsSettings(node?.tailscaleSettings, draft, authKeyCleared);
+
+  /**
+   * 已存 authKey 的**存在性**（布尔，绝不是 key 本身）。判据取 `domain/tailscale-conn-state.ts`
+   * 那一份 —— 节点卡的 `key-ready` 档说的就是同一件事，两处不许各判各的。
+   */
+  const authKeyStored = hasTsAuthKey(node);
+
+  /**
+   * 清除 Auth Key —— 原地二次点击（与删规则/删节点同一交互类，理由见 `ConfirmDialog` 头注：
+   * 破坏性操作不再叠弹窗）。它与「退出登录」是**两件事**，刻意不合并：
+   *  · 退出登录（`handleLogout`）清的是磁盘上的 tsnet state 目录 = 当前这次登录的身份；
+   *  · 清除 Auth Key 清的是 config 里的静态凭据 = 下次认证拿什么去认。
+   * 于是清完 key 后本节点**仍然连着**（state 目录里的 node key 照样有效），变的是「state 一旦
+   * 失效/被清，就没有能自动重认的凭据了，得重新登录」。这两句正是 `ts.authKeyClearHint` 的内容。
+   */
+  const requestClearAuthKey = () => {
+    confirmTwice(AUTH_KEY_CLEAR_KEY, () => {
+      setAuthKeyCleared(true);
+      setDirty(true); // 与改任何一个字段同权：直接关窗要走「放弃更改？」那条闸门
+    });
+  };
 
   const handleSave = async () => {
     if (!node) return;
@@ -240,6 +289,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     try {
       // detour 在顶层，`buildTsSettings` 够不着 —— 单独写回（哨兵 ⇒ 删键）。
       const next = applyDetour({ ...node, tailscaleSettings: buildSettings() }, draft.detour);
+      applyOnDemand(next, draft.onDemand);
       const bindInterface = String(draft.bindInterface ?? '').trim();
       if (bindInterface) next.bindInterface = bindInterface;
       else delete next.bindInterface;
@@ -300,6 +350,42 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     }
   };
 
+  /**
+   * Auth Key 状态行 —— 归**基础**页而非高级：本行存在的理由就是「用户此前无从知道盘上还躺着一把
+   * 长期凭据」（`TsLoginDialog` 的输入框从不回填、退出登录也明说保留 authKey）。把唯一的可见面
+   * 再折进高级页，等于只解决了一半。同族的「退出登录」同样常驻（footer），二者视觉分量相称。
+   *
+   * ⚠️ 这里渲染的每一样东西都是**布尔派生**：三档状态文案 + 一颗按钮。key 的明文、前缀、后几位、
+   * 长度一概不进 DOM —— 截图/录屏/演示都会把 DOM 里的东西带出去，而 pre-auth key 是长期凭据。
+   */
+  const authKeyRow = node ? (
+    <div className="fld swt-row">
+      <div className="swt-tx">
+        <span className="swt-label">
+          <b>{t('ts.authKey')}</b>
+          <InfoIcon tip={t('ts.authKeyClearHint')} />
+        </span>
+        <span className="card-sub">
+          {authKeyCleared
+            ? t('ts.authKeyClearPending')
+            : authKeyStored
+              ? t('ts.authKeySaved')
+              : t('ts.authKeyNone')}
+        </span>
+      </div>
+      {authKeyStored && !authKeyCleared && (
+        <button
+          type="button"
+          className={cn('btn ghost', armed === AUTH_KEY_CLEAR_KEY && 'confirming')}
+          style={{ color: 'hsl(var(--err))', borderColor: 'hsl(var(--err)/0.3)' }}
+          onClick={requestClearAuthKey}
+        >
+          {armed === AUTH_KEY_CLEAR_KEY ? t('ts.authKeyClearAgain') : t('ts.authKeyClear')}
+        </button>
+      )}
+    </div>
+  ) : null;
+
   return (
     <Modal
       titleId="ts-set-title"
@@ -349,10 +435,14 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
             id: 'basic',
             label: t('node.formGroup.basic'),
             fields: groups.basic,
-            children:
-              connected === false ? (
-                <div className="card-sub form-inline-note">{t('ts.exitEmptyHint')}</div>
-              ) : undefined,
+            children: (
+              <>
+                {connected === false && (
+                  <div className="card-sub form-inline-note">{t('ts.exitEmptyHint')}</div>
+                )}
+                {authKeyRow}
+              </>
+            ),
           },
           { id: 'routing', label: t('node.formGroup.routing'), fields: groups.routing },
           { id: 'advanced', label: t('node.formGroup.advanced'), fields: groups.advanced },
@@ -366,10 +456,13 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   );
 }
 
-export function TsSettingsDialog() {
+export function TsSettingsDialog({ serverId }: { serverId: string }) {
   // 展示面：本弹窗的提交腿走暂存（:202），编辑基准必须同源，否则第二次编辑从盘上的旧值起算。
+  // 按 id 精确取——Tailscale 不再是单例（多节点时 `.find(protocol==='tailscale')` 会取到任意一个，
+  // 不一定是调用方（`node-edit-routing.ts` / `MeshJoinDialog`）想编辑的那个）。取不到（节点已被删 /
+  // id 不匹配）**不回落到任意节点**：走 `TsSettingsForm` 已有的 `!node` 空态（mesh-note 引导 + Save/Logout 置灰）。
   const servers = useEffectiveServers();
-  const node = servers.find((s) => s.protocol === 'tailscale');
+  const node = servers.find((s) => s.id === serverId);
   return <TsSettingsForm key={node?.id ?? 'none'} node={node} />;
 }
 

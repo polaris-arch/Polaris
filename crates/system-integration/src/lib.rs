@@ -47,6 +47,7 @@ mod macos_proxy;
 pub mod proxy;
 pub mod proxy_ops;
 pub mod route_ops;
+pub mod route_probe;
 #[cfg(test)]
 mod test_support;
 
@@ -69,6 +70,20 @@ pub type ProdRouteOps = route_ops::SystemRouteOpsImpl<StdCommandRunner>;
 /// 装配生产路由出口探测器（TUN 出口夺取 post-flight 判定用；见 [`route_ops`]）。
 pub fn production_route_ops() -> ProdRouteOps {
     route_ops::SystemRouteOpsImpl::new(StdCommandRunner)
+}
+
+/// 生产外来隧道探测类型（本机平台 + 真实命令执行）。无 marker/状态 → 直接是 ops 本身。
+pub type ProdForeignTunnelProbe = route_probe::ForeignTunnelProbeImpl<StdCommandRunner>;
+
+/// 装配生产外来隧道探测器（本机**其它**隧道宣告了哪些网段；见 [`route_probe`]）。
+///
+/// 判定（哪些算真冲突）不在本 crate，在 `config-engine` 的 `builder::tunnel_conflict`。
+///
+/// **同步**（内部 exec `ip`）：async 语境须 `spawn_blocking`。四条查询全是只读 `show`，
+/// 不改路由/网卡任何状态。**非 Linux 返回 `Unsupported` 而不是空列表**，理由见
+/// [`route_probe::TunnelProbeOutcome`]。
+pub fn production_foreign_tunnel_probe() -> ProdForeignTunnelProbe {
+    route_probe::ForeignTunnelProbeImpl::new(StdCommandRunner)
 }
 
 /// marker 文件名（上游 `SystemProxyBase.getMarkerPath`：`userData/system-proxy.marker.json`）。

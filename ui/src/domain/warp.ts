@@ -65,7 +65,11 @@ export function findWarpNode<T extends Parameters<typeof isWarpServer>[0]>(
 
 /**
  * WARP 单例守卫：已存在 WARP 节点则「槽位」被占——接入区不再提供「再加一个」（行为变更，用户签核）。
- * editingId 排除自身——编辑现有 WARP 节点不算「再加一个」，必须放行（对照 tailscaleSlotTaken）。
+ * editingId 排除自身——编辑现有 WARP 节点不算「再加一个」，必须放行。
+ *
+ * **本函数现在是 `meshSingletonConflict` 唯一还在用的槽**：Tailscale 那一支已于 2026-09-11 撤
+ * （判据换成「网段相交」，而相交创建时判不了，见 `endpoint-routes.ts` 的墓碑注释）。WARP 这支不动 ——
+ * 它守的是内核 utun 资源争用，与地址空间无关。
  * 纯函数：UI 接入区分流 + saveServer/cloneServer 硬闸门（防手输/导入/克隆旁路造第二个）共用，可离线单测。
  */
 export function warpSlotTaken(

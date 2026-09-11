@@ -269,6 +269,11 @@ fn generate_config_matches_polaris_snapshot() {
             rule_resources_path: "/fake/userData/rule-resource".into(),
             custom_rules_dir: "/fake/userData/custom-rules".into(),
             tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+            // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+            // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+            tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+            // 无运行期观测（本批生产侧同样恒空）。
+            observed_tailnet_addresses: Default::default(),
             is_valid_srs_fn: snapshot_is_valid_srs, // 解封 geo .srs；custom-rule .json 落盘前不存在（对齐 Polaris existsSync）
             own_lan_cidrs: vec![],
             log: |_, _| {},
@@ -414,6 +419,11 @@ fn resource_missing_world_never_falls_back_to_plaintext_direct() {
             rule_resources_path: "/fake/userData/rule-resource".into(),
             custom_rules_dir: "/fake/userData/custom-rules".into(),
             tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+            // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+            // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+            tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+            // 无运行期观测（本批生产侧同样恒空）。
+            observed_tailnet_addresses: Default::default(),
             // ★ 与金样唯一的差异：**这个宇宙里一个 .srs 都不在**（= 真机首装的默认状态）。
             is_valid_srs_fn: |_| false,
             own_lan_cidrs: vec![],
@@ -779,6 +789,11 @@ fn scenario_deps_base() -> GenerateConfigDeps {
         rule_resources_path: "/fake/userData/rule-resource".into(),
         custom_rules_dir: "/fake/userData/custom-rules".into(),
         tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+        // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+        // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+        tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+        // 无运行期观测（本批生产侧同样恒空）。
+        observed_tailnet_addresses: Default::default(),
         is_valid_srs_fn: |_| false,
         own_lan_cidrs: vec![],
         log: |_, _| {},
@@ -933,6 +948,11 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
             rule_resources_path: "/fake/userData/rule-resource".into(),
             custom_rules_dir: "/fake/userData/custom-rules".into(),
             tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+            // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+            // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+            tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+            // 无运行期观测（本批生产侧同样恒空）。
+            observed_tailnet_addresses: Default::default(),
             is_valid_srs_fn: snapshot_is_valid_srs,
             own_lan_cidrs: vec![],
             log: |_, _| {},

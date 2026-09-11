@@ -3,6 +3,18 @@
 //! 这些集成测试在不同平台各自执行；macOS 不能按「哪个文件先存在」选核，
 //! 因为打包目录同时带 arm64/x64 两份二进制。package 优先传入打包目标，不能只看 runner 架构。
 
+//! # 为什么整模块 `allow(dead_code, unused_imports)`
+//!
+//! `tests/support/` 是**菜单**，不是库：Cargo 把它编进每一个 `tests/*.rs` 集成测试二进制，
+//! 而每个门只点自己要的那几样。于是「本二进制没用到某个 helper」是这个模块的常态，
+//! 不是缺陷信号 —— 加一个新门就会让其余没用到的项在 `-D warnings` 下全体转红
+//! （CI 跑的正是 `cargo clippy --workspace --all-targets -- -D warnings`）。
+//!
+//! 代价如实记：真正废弃的 helper 不会再被 lint 抓到，只能靠改动时人眼看。
+//! 换成逐项 `#[allow]` 并不更强 —— 那样每加一个门仍要去补一轮 attribute，
+//! 漏补的表现同样是 CI 红，而不是「发现了死代码」。
+#![allow(dead_code, unused_imports)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

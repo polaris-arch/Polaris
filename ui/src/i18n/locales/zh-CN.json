@@ -875,7 +875,7 @@
       "autoRoute": "自动路由",
       "autoRouteDesc": "按平台自动处理局域网 / 组网的路由放行，机制详见下方",
       "strictRoute": "严格路由",
-      "strictRouteDesc": "把所有流量严格锁入 TUN 防止绕行泄漏；可能影响局域网直访与虚拟机网络，遇连不上时先关它",
+      "strictRouteDesc": "在内核层额外拦截绕过 TUN 的流量。各平台实现不同：Windows 装 WFP 过滤器（TUN 无 IPv6 地址时会阻断全部 IPv6 出站；DNS 劫持模式下会阻断非 TUN 接口的所有 53 端口流量，可能打断其它 VPN 的私有 DNS）；Linux 只对未启用的地址族加不可达规则；macOS 无实现。遇到局域网直访、虚拟机网络或其它 VPN 异常时先关它。",
       "natType": "NAT 类型",
       "natTypeDesc": "默认全锥；限制越严，UDP 与 P2P 打洞成功率越低。",
       "natTypeDefault": "跟随内核默认",
@@ -909,7 +909,33 @@
       "addMac": "添加 MAC",
       "mtuDesc": "留空即自动，按协议栈与平台取推荐值。仅在需要手动调优时填写。",
       "mtuAutoPlaceholder": "自动（{{n}}）",
-      "mtuInvalid": "MTU 须为 {{min}}–{{max}} 之间的整数"
+      "mtuInvalid": "MTU 须为 {{min}}–{{max}} 之间的整数",
+      "effectiveExcludeBlock": "本平台生效的排除网段",
+      "effectiveExcludeHint": "上面两张表在不同平台喂给不同的地方。这里是后端按当前已保存的配置算出的、真正下发给内核的排除清单；暂存中的改动要「应用」后才反映到这里。",
+      "effectiveExcludeEmpty": "（空）当前一条都没有排除。若你刚填过网段却在这里看不到，多半是填错了表或被下面的诊断剔除了。",
+      "effectiveExcludeNotTun": "当前不是 TUN 模式，排除清单不生效。",
+      "effectiveExcludeUnavailable": "读取失败，暂时无法显示生效清单。",
+      "strictRouteMacInert": "macOS 上内核没有这一支实现，此开关不产生任何效果 —— 本平台的防绕行完全依赖路由表（auto_route）。",
+      "tunnelConflictBlock": "本机其它隧道",
+      "tunnelConflictHint": "本机同时跑着别的隧道（独立的 Tailscale 客户端、公司 VPN、ZeroTier…）时，它们可能和 Polaris 争同一段地址。下面是起核那一刻探到的结果 —— 探没探成、探到了什么，分开说。",
+      "tunnelConflictUnavailable": "读取失败，暂时拿不到这份报告。",
+      "tunnelConflictNotProbed": "本次还没探测：代理没有以 TUN 模式起来过，或探测腿还没跑完。判定未进行，不能据此认为本机没有别的隧道。",
+      "tunnelConflictUnsupported": "{{platform}} 上还没有探测实现，本次判定未进行。若你同时跑着别的 VPN 或 Tailscale 客户端，需要自己核对它们宣告的网段。",
+      "tunnelConflictFailed": "探测命令失败，本次判定未进行：",
+      "tunnelConflictNone": "已探测：本机另有 {{count}} 条隧道路由，与本次下发的 FakeIP / 组网 / TUN 地址均无冲突。",
+      "tunnelConflictFound": "本机其它隧道与 Polaris 争同一网段，共 {{count}} 条：",
+      "tunnelConflictKindFakeIp": "与 FakeIP 段相交",
+      "tunnelConflictKindMesh": "与组网网段相交",
+      "tunnelConflictKindTun": "与 TUN 接口地址相交",
+      "forceRouteBlock": "组网网段结算",
+      "forceRouteHint": "同一条网段只能指向一个出口，先声明的那个节点生效。下面是后端按当前配置与运行期观测地址算出的结算，与内核实际发射的那批规则同一次计算。",
+      "forceRouteUnavailable": "读取失败，暂时拿不到这份报告。",
+      "forceRouteEmpty": "当前没有会发射网段的组网节点。",
+      "forceRouteNone": "已结算 {{count}} 个组网节点，没有节点的网段被别人抢走。",
+      "forceRouteZeroCoverage": "以下节点在运行，但它的网段已被别的节点全部抢先声明 —— 流量一条都不会经过它：",
+      "forceRouteAbsorbedBy": "实际生效的是「{{node}}」",
+      "forceRouteAbsorbedOnly": "有 {{count}} 条网段被更早声明的节点抢走；涉及的节点本身仍有其它网段生效。",
+      "forceRouteNoObservation": "其中的 Tailscale 节点还没拿到运行期地址，此刻用的是默认 tailnet 网段 —— 两个尚未连上的节点必然重合，这不足以说明它们是同一个账号。等它们连上再看这里。"
     },
     "dns": {
       "pageSub": "系统接管、查询运行时与节点域名解析",
@@ -1021,7 +1047,8 @@
       "browserDohDesc": "浏览器自带的「安全 DNS」会绕开本应用的 DNS 接管，域名分流与 FakeIP 对它不生效。开启后对清单内端点的 443/853 与 QUIC 发 reject，逼浏览器回退到系统 DNS。默认关。",
       "browserDohFold": "DoH 端点清单",
       "browserDohHint": "按域名后缀匹配（填 cloudflare-dns.com 即覆盖其全部子域）。内置的是常用起点，不是全集——DoH 端点可以是任意自建域名，遇到漏网的自行添加。",
-      "domain": "域名"
+      "domain": "域名",
+      "displacedResolversNote": "接管系统 DNS 时覆盖了下列非公网解析器，它们很可能属于本机的其它 VPN / 组网客户端（如 Tailscale 的 MagicDNS）。这些解析器负责的域名在代理开启期间将无法解析，表现为「IP 能连、域名不通」。"
     }
   },
   "rules": {
@@ -1754,7 +1781,9 @@
       "supported": "内核支持该协议",
       "test": "测试内核兼容性",
       "testing": "检测中…"
-    }
+    },
+    "onDemand": "按需连接",
+    "onDemandHint": "只有被当前选中的出口或路由规则引用时才连接；未被引用时断开。Tailscale 会交出 tailnet 地址并停用 MagicDNS，登录状态保留。挂起期间收不到 Taildrop 文件。"
   },
   "nodes": {
     "add": "添加",
@@ -1768,7 +1797,6 @@
     "batchMoveUnavailable": "Polaris 的分组由订阅归属与协议派生，没有可自由分配的分组；把节点写进订阅分组会在下次订阅刷新时被当作已下架删除，故不提供此操作",
     "clone": "克隆",
     "cloneName": "{{name}} 副本",
-    "cloneTsSingleton": "Tailscale 为单例：同一设备只允许一个 Tailscale 节点，无法克隆",
     "cloneWarpSingleton": "WARP 为单例：已存在 WARP 节点，无法克隆出第二个",
     "copyLink": "复制链接",
     "copyLinkOk": "已复制分享链接",
@@ -1895,7 +1923,6 @@
     "importStagedOk": "{{count}} 个节点已加入待保存",
     "shadowed": "网段被覆盖",
     "shadowedHint": "{{cidrs}} 已被「{{by}}」先声明——同一网段只能指向一个出站，本节点上的这些段不会生效。请去重、调整节点顺序，或用自定义规则显式覆盖。",
-    "tsSlotTaken": "Tailscale 为单例：同一设备只允许一个 Tailscale 节点（多个会互相顶掉 tailnet 地址）——请改为编辑现有节点或切换账号。",
     "warpSlotTaken": "WARP 为单例：已存在 WARP 节点。第二个会与主 TUN 抢内核接口导致连接失败——请先在「组网」的接入管理中注销或重新注册现有 WARP。",
     "speedTest": "测速",
     "speedTestDone": "测速完成",
@@ -2110,7 +2137,6 @@
     "exitNotAdvertised": "未广告出口",
     "exitOffline": "离线",
     "hostname": "主机名",
-    "loginAlreadyActive": "登录已在进行中或已完成",
     "loginDiscard": "放弃",
     "loginDiscardMsg": "已填写的内容将不会保存。",
     "loginDiscardTitle": "放弃登录？",
@@ -2136,7 +2162,17 @@
     "signIn": "登录",
     "ssh": "Tailscale SSH",
     "sshHint": "允许通过 tailnet SSH 到本设备（受 ACL 控制）",
-    "errControlUrl": "控制服务器 URL 无效"
+    "errControlUrl": "控制服务器 URL 无效",
+    "controlUrlLoginHint": "自建控制面（如 headscale）填其地址；留空使用官方 controlplane.tailscale.com。首次登录前就要填对，否则会先向官方控制面认证一次。",
+    "authKeySwitchLogoutNote": "该节点已有登录状态。提交时会先退出当前登录再用 Auth Key 认证 —— 不清除旧状态的话，内核会继续用已有身份，Auth Key 不会生效。",
+    "loginInMainCoreNeedsRestart": "配置已保存，但该节点正在运行中的内核里，需要重启代理后新的认证信息才生效。",
+    "authKeyEphemeralHint": "签发时建议加 --ephemeral：非 ephemeral 的 key 每次更换都会在控制面留一个死节点，ephemeral 节点下线即自动移除。",
+    "authKeySaved": "已保存",
+    "authKeyNone": "未保存",
+    "authKeyClearPending": "待清除（保存后生效）",
+    "authKeyClear": "清除",
+    "authKeyClearAgain": "再点一次以清除",
+    "authKeyClearHint": "此处只显示这台节点有没有存过 Auth Key，不显示密钥本身。清除只删配置里的密钥，不影响当前登录状态（登录状态在 state 目录里，要清它用「退出登录」）；清除后该节点在需要重新认证时就没有可用的静态凭据，必须重新登录。保存后生效。"
   },
   "warp": {
     "addTitle": "接入 Cloudflare WARP",

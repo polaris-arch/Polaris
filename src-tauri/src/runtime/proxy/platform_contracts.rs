@@ -30,7 +30,7 @@ pub(super) fn linux_ip_monitor_binary() -> &'static str {
 /// 消费面：macOS「连入来源排除」guard（排除物理 LAN 会触发 NE 反向路由丢包）、Windows bypassLAN carve
 /// guard（保护物理子网不被 mesh carve）、Linux mesh/own-lan 重叠告警。
 #[cfg(unix)]
-pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
+pub(crate) fn enumerate_own_lan_cidrs() -> Vec<String> {
     use nix::ifaddrs::getifaddrs;
     use nix::net::if_::InterfaceFlags;
 
@@ -89,7 +89,7 @@ fn own_lan_v4_addr_prefix(addr: u32, mask: u32) -> Option<(String, u8)> {
 ///
 /// [`netinfo`]: polaris_helper::platform::windows::netinfo
 #[cfg(windows)]
-pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
+pub(crate) fn enumerate_own_lan_cidrs() -> Vec<String> {
     use polaris_helper::platform::windows::netinfo::enumerate_local_unicast_addrs;
     let out: Vec<String> = enumerate_local_unicast_addrs()
         .into_iter()
@@ -101,14 +101,14 @@ pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
 /// **C12**（既非 unix 也非 windows 的假想平台）：无枚举实现 → 空。与 上游 `getOwnLanCidrs` catch→空
 /// 的 best-effort 语义一致（少一层物理子网保护，非破坏、不断网）。
 #[cfg(not(any(unix, windows)))]
-pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
+pub(crate) fn enumerate_own_lan_cidrs() -> Vec<String> {
     Vec::new()
 }
 
 /// 平台标签：config-engine 沿用 上游/Node 约定（`linux` / `darwin` / `win32`），
 /// 与 Rust 的 `std::env::consts::OS`（`linux` / `macos` / `windows`）**不同名** → 必须映射。
 /// 漏映射会让 inbounds/route 的平台分支（如 `platform == "win32"`）全部落空。
-pub(super) fn platform_tag() -> &'static str {
+pub(crate) fn platform_tag() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",

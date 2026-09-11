@@ -19,7 +19,9 @@ pub mod outbound_helpers;
 pub mod outbounds;
 pub mod route;
 pub mod subscription_guard;
+pub mod tun_exclusion_preview;
 pub mod tun_route_exclude;
+pub mod tunnel_conflict;
 
 pub use custom_rule_files::{
     build_custom_rule_files, cond_matcher_fields, custom_rule_file_base,
