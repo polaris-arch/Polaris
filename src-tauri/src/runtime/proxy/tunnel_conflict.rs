@@ -17,6 +17,10 @@
 //! 3. **不放宽判据面。** 只认 FakeIP / Mesh / TUN 地址三类相交，「外来隧道未被排除」刻意不算冲突
 //!    （理由见 `builder::tunnel_conflict` 模块头注：逢隧道必报的告警会被无视或删掉，
 //!    `plat-warn` 已经演过一遍）。本模块只接线，一类都不加。
+//! 4. **收噪声只收在展示面，判定面喂的永远是全量。** 见 [`announced_routes`]：
+//!    link-local 与组播在 `to_wire` 这一步才被摘掉，`detect_tunnel_conflicts` 拿到的仍是
+//!    探测层原样返回的那份事实。反过来做（先滤再判）就是第 3 条说的「动判据面」——
+//!    只不过方向是放窄，一样是让判定跟着一张会漂的过滤表走。
 //!
 //! # 形态取自哪两条既有腿
 //!
@@ -32,7 +36,9 @@ use polaris_config_engine::builder::tunnel_conflict::{
 use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_config_engine::user_config::ProxyModeType;
 use polaris_helper_proto::Platform;
-use polaris_system_integration::route_probe::{ForeignTunnelProbe, RouteEntry, TunnelProbeOutcome};
+use polaris_system_integration::route_probe::{
+    is_link_local_or_multicast, ForeignTunnelProbe, RouteEntry, TunnelProbeOutcome,
+};
 use serde_json::{json, Value};
 
 use super::ProxyRuntime;
@@ -59,11 +65,56 @@ pub(crate) enum TunnelConflictSnapshot {
     },
 }
 
+/// 展示面：外来隧道宣告的**业务**网段 —— link-local 与组播从这里摘出去。
+///
+/// # 为什么这条过滤住在这一层，而不是探测层或渲染层
+///
+/// - **不在探测层**（`route_probe`）：那一层的职责是如实读回路由表，`netstat -rn` 打印的这些
+///   条目确实是那个 utun 宣告的路由。过滤是解释，解释不该混进事实。该层只提供
+///   [`is_link_local_or_multicast`] 这条判据，一处都不调用它。
+/// - **不在渲染层**（`TunnelConflictBlock.tsx`）：那样一来噪声仍会跨过 IPC，命令的**每个**
+///   消费方都得各自再滤一遍；且 TS 侧只有 `cidrsOverlap`、没有 `cidrContains`，收在那里等于
+///   逼出第二份 CIDR 包含算术 —— 而「两份判据迟早会漂」正是这一整条链最要防的东西。
+/// - **在这里**：`to_wire` 本就是事实 → 展示的那一步（同一函数已经在按「哪些键该缺」做展示决策），
+///   过滤只发生一次，`conflicts` 与内存里的快照仍握着未经过滤的全量事实。
+///
+/// # 为什么另有一个 [`suppressed_route_count`]
+///
+/// 2026-09-12 实测：一台 Tailscale 断开的 mac 上，这 36 条噪声摘完**一条不剩**。只报「0 条」
+/// 的话，界面上「探过了」与「压根没探」重新变得同形 —— 而那正是 `TunnelConflictSnapshot`
+/// 分四支要防的事。把摘掉的条数一并下发，「这次真的读了一张路由表」才仍然看得见，
+/// 顺带让过滤本身可审计（收了多少，用户看得见），而不是一次静默的消失。
+///
+/// # 为什么是两个函数而不是一个返回二元组的
+///
+/// `to_wire` 的每一支必须写成 `=> json!({…})` 的**直接字面量**：跨语言线格式门
+/// （`ui/src/contracts/report-wire-parity.test.ts` 的 `toWireArms`）就是照这个形状取材的，
+/// 中间插一个 `let` 会让 `probed` 这一支整个从它的取材面上消失（该门会因「四支不齐」转红，
+/// 不是静默失效）。两个函数共用同一条判据、取相反的一半，按构造互补 ——
+/// 由 `display_face_partitions_the_probe_fact` 钉住。
+fn announced_routes(foreign: &[ForeignTunnelRoute]) -> Vec<&ForeignTunnelRoute> {
+    foreign
+        .iter()
+        .filter(|route| !is_link_local_or_multicast(&route.prefix))
+        .collect()
+}
+
+/// [`announced_routes`] 摘掉了多少条（同一条判据的另一半）。
+fn suppressed_route_count(foreign: &[ForeignTunnelRoute]) -> usize {
+    foreign
+        .iter()
+        .filter(|route| is_link_local_or_multicast(&route.prefix))
+        .count()
+}
+
 impl TunnelConflictSnapshot {
     /// 下发给渲染端的线格式。
     ///
     /// **非 `Probed` 的三支不带 `conflicts` 键**（不是"带一个空数组"）：缺键会逼渲染端按
     /// `status` 分支，带空数组则会被 `conflicts.length === 0` 这种最自然的写法读成「无冲突」。
+    ///
+    /// `foreignTunnels` 是**展示面**（见 [`announced_routes`]）：link-local 与组播在这一步被摘掉，
+    /// 摘掉的条数走 `suppressedRoutes`。`conflicts` 不受影响 —— 它是拿全量事实判出来的。
     fn to_wire(&self) -> Value {
         match self {
             Self::NotProbed => json!({ "status": "notProbed" }),
@@ -81,7 +132,8 @@ impl TunnelConflictSnapshot {
                 criteria,
             } => json!({
                 "status": "probed",
-                "foreignTunnels": foreign,
+                "foreignTunnels": announced_routes(foreign),
+                "suppressedRoutes": suppressed_route_count(foreign),
                 "conflicts": conflicts,
                 "criteria": criteria,
             }),
@@ -172,9 +224,13 @@ fn log_snapshot(snapshot: &TunnelConflictSnapshot) {
             foreign, conflicts, ..
         } => {
             if conflicts.is_empty() {
+                // 两个数都报：只报展示面那个，日志会在一台「36 条全是噪声」的 mac 上写出
+                // 「0 条外来隧道路由」—— 与「压根没探到隧道」同形。只报全量那个，日志又与
+                // 用户在设置页看到的对不上。
+                let suppressed = suppressed_route_count(foreign);
                 log::info!(
-                    "外来隧道探测完成：本机 {} 条外来隧道路由，与本次配置的 FakeIP / 组网 / TUN 地址均不相交",
-                    foreign.len()
+                    "外来隧道探测完成：本机 {} 条外来隧道路由宣告业务网段（另有 {suppressed} 条 link-local / 组播已从展示面收掉），与本次配置的 FakeIP / 组网 / TUN 地址均不相交",
+                    announced_routes(foreign).len()
                 );
                 return;
             }

@@ -18,6 +18,17 @@
  * 判别联合由 `contracts/tunnel-conflict-report.ts` 在类型层强制：不先判 `status` 就取
  * `conflicts`，tsc 直接报错。
  *
+ * # `probed` 为什么有两句话（而不是一句带计数的）
+ *
+ * `foreignTunnels` 是**后端已经收过噪声的展示面**：link-local 与组播在 Rust 侧
+ * （`runtime::proxy::tunnel_conflict`）摘掉，摘掉多少条走 `suppressedRoutes`。本组件一条过滤
+ * 都不写 —— 写在这里会逼出第二份 CIDR 包含算术（TS 侧只有 `cidrsOverlap`），而两份判据迟早会漂。
+ *
+ * 2026-09-12 真机实测：一台 Tailscale 断开的 mac 上，36 条外来隧道路由**全部**是这两族
+ * ⇒ 收完 `foreignTunnels` 为空。那时若仍用「另有 0 条隧道路由」这句，这一支在界面上就与
+ * 「压根没探」同形了 —— 这正是整块要防的那件事。故零条时换一句话说，并把被收掉的条数
+ * 一并摆出来：它是「这次真的读了一张路由表」剩下的唯一可见证据。
+ *
  * # 为什么抽成独立组件
  *
  * 拉取（`useEffect` + IPC）留在 `SettingsTun`，本组件**纯按 props 渲染**：本仓 vitest 是
@@ -83,10 +94,15 @@ export function TunnelConflictBlock({ report }: TunnelConflictBlockProps) {
           <span className="mono">{report.error}</span>
         </Warn>
       ) : report.conflicts.length === 0 ? (
-        // 唯一一句断言。`foreignTunnels.length` 一并给出，使「探测真的跑过」这件事本身可见
-        // —— 否则这句话与上面三支在界面上一样是「什么都没发生」。
+        // 唯一一句断言，分两种说法 —— 因为**最常见的那一种是展示面为零**：任何一台有 utun 的
+        // mac 上，外来隧道宣告的全是 link-local 与组播（2026-09-12 真机实测 36 条全是），
+        // 后端已把它们收掉。那时若沿用下面那句「另有 0 条隧道路由」，这一支在界面上就与
+        // 「压根没探」同形了。故零条时改说「没有任何一条宣告业务网段」，并把被收掉的条数
+        // 一并给出 —— 这两件事合起来才让「探测真的跑过」保持可见。
         <div className="card-sub">
-          {t('settings.tun.tunnelConflictNone', { count: report.foreignTunnels.length })}
+          {report.foreignTunnels.length === 0
+            ? t('settings.tun.tunnelConflictNoBusinessRanges', { count: report.suppressedRoutes })
+            : t('settings.tun.tunnelConflictNone', { count: report.foreignTunnels.length })}
         </div>
       ) : (
         <>

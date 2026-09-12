@@ -1,0 +1,525 @@
+════════════════════════════════════════════════════════════════════════
+Polaris route_probe 真机抓取（macOS）
+
+读这份样本、准备照着写解析器的人，先看这三条 —— 都是照记忆写不出来的：
+
+ 1. classful 缩写：`netstat -rn` 的 Destination 列会把尾部零字节省掉。
+      `192.168.10`  实际是 192.168.10.0/24
+      `169.254`     实际是 169.254.0.0/16
+      `127`         实际是 127.0.0.0/8
+    留下几段就是 8×几。按字面当地址读，`192.168.10` 连一个合法 IP 都不是。
+
+ 2. 长度明写、地址仍缩写：`224.0.0/4` 的 `/4` 是真的前缀长度，
+    但地址 `224.0.0` 还是三段 —— 补零与定长度是两件互相独立的事。
+    "有 / 就照抄、没 / 才补" 这条直觉规则在它身上恰好错。
+
+ 3. IPv6 目的地带 `%作用域`：`fe80::%utun0/64`、`fe80::1%lo0`、`ff01::%utun3/32`。
+    作用域不属于前缀本体，不剥掉过不了 CIDR 校验。
+
+ 另有一条列位置的坑：`Netif` 的列号必须从列头行读。本机列头是
+   Destination Gateway Flags Netif Expire
+ 而老 macOS 中间多出 Refs / Use 两列 —— 写死"第 4 列是接口"在后者上不报错，
+ 只会静默把引用计数当接口名。
+
+落库：把本文件原样放进
+  polaris/crates/system-integration/src/route_probe/tests/fixtures/
+不要手工规整（行尾空格、对齐、空行都是证据）。
+════════════════════════════════════════════════════════════════════════
+@@@META
+platform=macos
+host=hostmacbook-pro
+label=routes-ts-on
+date=2026-09-12 84:d4:fb +0800
+script=polaris-collect-routes-macos.sh
+lang=en_US.UTF-8
+@@@ENV
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+@@@V4
+Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            192.168.10.1       UGScg                 en0       
+default            link#29            UCSIg              utun11       
+32.0.0.1/32        link#29            UCS                utun11       
+32.0.0.2/32        link#29            UCS                utun11       
+32.0.0.3/32        link#29            UCS                utun11       
+32.0.0.4/32        link#29            UCS                utun11       
+32.0.0.5/32        link#29            UCS                utun11       
+32.0.0.7/32        link#29            UCS                utun11       
+32.0.0.8/32        link#29            UCS                utun11       
+32.0.0.9/32        link#29            UCS                utun11       
+32.0.0.10/32       link#29            UCS                utun11       
+32.0.0.12/32       link#29            UCS                utun11       
+32.0.0.13/32       link#29            UCS                utun11       
+32.0.0.14/32       link#29            UCS                utun11       
+32.0.0.15/32       link#29            UCS                utun11       
+32.0.0.17/32       link#29            UCS                utun11       
+32.0.0.19/32       link#29            UCS                utun11       
+32.0.0.20/32       link#29            UCS                utun11       
+32.0.0.21/32       link#29            UCS                utun11       
+32.0.0.23/32       link#29            UCS                utun11       
+32.0.0.24/32       link#29            UCS                utun11       
+32.0.0.25/32       link#29            UCS                utun11       
+32.0.0.26/32       link#29            UCS                utun11       
+32.0.0.27/32       link#29            UCS                utun11       
+32.0.0.28/32       link#29            UCS                utun11       
+32.0.0.29/32       link#29            UCS                utun11       
+32.0.0.30          32.0.0.30          UH                 utun11       
+100.100.100.100/32 link#29            UCS                utun11       
+127                127.0.0.1          UCS                   lo0       
+127.0.0.1          127.0.0.1          UH                    lo0       
+169.254            link#14            UCS                   en0      !
+192.168.10         link#14            UCS                   en0      !
+192.168.10.1/32    link#14            UCS                   en0      !
+192.168.10.1       0:1e:f9:55:9b:2c   UHLWIir               en0   1199
+192.168.10.99      link#14            UHLWI                 en0      !
+192.168.10.105     ab:a6:88:25:9a:a6  UHLWI                 en0   1199
+192.168.10.106     5:32:55:94:64:1e   UHLWI                 en0   1193
+192.168.10.107     71:6d:47:cd:8a:47  UHLWI                 en0    860
+192.168.10.108     42:43:a6:2e:1d:d7  UHLWI                 en0   1198
+192.168.10.109     dc:30:a1:70:aa:70  UHLWIi                en0   1110
+192.168.10.111     ad:86:c7:1d:e4:ad  UHLWI                 en0   1190
+192.168.10.112     6b:2b:ab:5d:42:71  UHLWI                 en0   1185
+192.168.10.114     df:db:a6:aa:c0:2c  UHLWI                 en0   1188
+192.168.10.116     4c:6f:7a:1a:88:5b  UHLWI                 en0   1173
+192.168.10.119     5d:71:94:a1:cb:f8  UHLWI                 en0   1150
+192.168.10.121     5d:71:94:f:1a:9d   UHLWI                 en0   1198
+192.168.10.127     f3:22:e4:d6:ab:1f  UHLWI                 en0   1115
+192.168.10.131     4c:70:38:70:93:33  UHLWI                 en0   1117
+192.168.10.133     81:ad:9a:79:9e:d7  UHLWI                 en0   1181
+192.168.10.139     34:58:3d:8d:db:2e  UHLWI                 en0    612
+192.168.10.141     f3:22:e4:71:db:ad  UHLWI                 en0   1115
+192.168.10.142/32  link#14            UCS                   en0      !
+192.168.10.142     22:70:2f:24:f8:c7  UHLWI                 lo0       
+192.168.10.143     4c:70:38:22:d3:2e  UHLWI                 en0   1179
+192.168.10.146     93:52:ba:5b:1:70   UHLWI                 en0   1135
+192.168.10.147     f3:22:e4:5d:22:86  UHLWI                 en0   1115
+192.168.10.160     5d:71:94:5d:1:33   UHLWI                 en0   1164
+192.168.10.170     20:1a:ad:22:46:52  UHLWI                 en0      !
+192.168.10.186     22:f9:4a:1d:f8:2   UHLWI                 en0   1171
+192.168.10.188     93:52:ba:d3:2f:9b  UHLWI                 en0   1156
+192.168.10.190     0:d6:90:30:8:52    UHLWI                 en0   1115
+192.168.10.191     f3:22:e4:28:cd:27  UHLWI                 en0   1115
+192.168.10.201     be:79:e4:ab:41:9f  UHLWI                 en0      !
+192.168.10.202     d7:29:be:86:81:fd  UHLWI                 en0   1194
+192.168.10.206     70:be:6b:47:94:5f  UHLWI                 en0   1177
+192.168.10.208     4c:70:38:34:70:1d  UHLWI                 en0   1181
+192.168.10.212     6b:2b:ab:2e:7b:d6  UHLWI                 en0   1189
+192.168.10.213     6b:2b:ab:5f:d6:42  UHLWI                 en0   1179
+192.168.10.214     20:bf:3f:a9:43:fe  UHLWI                 en0   1196
+192.168.10.215     d4:47:90:fa:2:28   UHLWI                 en0   1172
+192.168.10.216     1d:71:6f:2c:5d:79  UHLWI                 en0   1045
+192.168.10.218     ab:ba:ab:cb:8d:22  UHLWIi                en0   1153
+192.168.10.222     bf:9e:3d:a9:7a:90  UHLWI                 en0   1182
+192.168.10.229     d7:22:ab:cd:2e:4c  UHLWI                 en0      !
+192.168.10.231     5d:71:94:2:64:43   UHLWI                 en0   1155
+192.168.10.235     d3:4f:89:ab:6a:aa  UHLWI                 en0      !
+192.168.10.236     4c:70:38:9e:1:df   UHLWI                 en0   1139
+192.168.10.237     ad:bd:ad:63:71:7a  UHLWI                 en0   1176
+192.168.10.249     6b:2b:ab:ad:52:1a  UHLWI                 en0   1180
+224.0.0/4          link#14            UmCS                  en0      !
+224.0.0/4          link#29            UmCSI              utun11       
+224.0.0.251        1:0:5f:0:0:5c      UHmLWI                en0       
+239.255.255.250    1:0:5f:33:3c:9b    UHmLWI                en0       
+255.255.255.255/32 link#14            UCS                   en0      !
+255.255.255.255/32 link#29            UCSI               utun11       
+@@@V6
+Routing tables
+
+Internet6:
+Destination                             Gateway                                 Flags               Netif Expire
+default                                 fe80::7fd:1819:1bc5:9967%en0            UGcg                  en0       
+default                                 fe80::%utun0                            UGcIg               utun0       
+default                                 fe80::%utun1                            UGcIg               utun1       
+default                                 fe80::%utun2                            UGcIg               utun2       
+default                                 fe80::%utun3                            UGcIg               utun3       
+default                                 fe80::%utun4                            UGcIg               utun4       
+default                                 fe80::%utun5                            UGcIg               utun5       
+default                                 fe80::%utun6                            UGcIg               utun6       
+default                                 fe80::%utun7                            UGcIg               utun7       
+default                                 fd7a:115c:a1e0::                        UGcIg              utun11       
+::1                                     ::1                                     UHL                   lo0       
+aded:14a8:b9be:ee8b::/64                link#14                                 UC                    en0       
+aded:14a8:b9be:ee8b::/60                fe80::7fd:1819:1bc5:9967%en0            UGc                   en0       
+aded:14a8:b9be:ee8b::1                  0:1e:f9:55:9b:2c                        UHLWIi                en0       
+aded:14a8:b9be:ee8b::7f5                dc:30:a1:70:aa:70                       UHLWI                 en0       
+aded:14a8:b9be:ee8b:490:8939:fd4c:73b4  dc:30:a1:70:aa:70                       UHLWI                 en0       
+aded:14a8:b9be:ee8b:342:21c1:b6d2:8ff7  dc:30:a1:70:aa:70                       UHLWI                 en0       
+aded:14a8:b9be:ee8b:108:e4b:1c21:b564   22:70:2f:24:f8:c7                       UHL                   lo0       
+aded:14a8:b9be:ee8b:1d9b:ecf1:7302:124d dc:30:a1:70:aa:70                       UHLWIi                en0       
+aded:14a8:b9be:ee8b:11b9:9023:de65:a7c8 22:70:2f:24:f8:c7                       UHL                   lo0       
+aded:14a8:b9be:ee8b:6e4b:a2e2:e5f:4bfd  dc:30:a1:70:aa:70                       UHLWI                 en0       
+aded:14a8:b9be:ee8b:4bd5:7dfa:719c:fcbc 22:70:2f:24:f8:c7                       UHL                   lo0       
+aded:14a8:b9be:ee8b:6ec3:5258:a940:6d1d 22:70:2f:24:f8:c7                       UHL                   lo0       
+aded:14a8:b9be:ee8b:abd9:af40:8d2c:a218 dc:30:a1:70:aa:70                       UHLWI                 en0       
+aded:14a8:b9be:ee8b:ec4f:e627:1d3f:7fce 22:70:2f:24:f8:c7                       UHL                   lo0       
+aded:14a8:b9be:ee8b:5bc7:b9ca:d002:74dd 22:70:2f:24:f8:c7                       UHL                   lo0       
+aded:14a8:b9be:ee8b:72ea:7628:a850:b80a 22:70:2f:24:f8:c7                       UHL                   lo0       
+aded:14a8:b9be:ee8b:40bd:927e:22ef:1536 22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e::/64                link#14                                 UC                    en0       
+9757:a50f:cf73:9c4e::/60                fe80::7fd:1819:1bc5:9967%en0            UGc                   en0       
+9757:a50f:cf73:9c4e::1                  0:1e:f9:55:9b:2c                        UHLWIi                en0       
+9757:a50f:cf73:9c4e::818                22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e::7f5                dc:30:a1:70:aa:70                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:1b7:c7bf:e9f1:bd2d  dc:30:a1:70:aa:70                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:108:e4b:1c21:b564   22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e:4d84:736d:a238:c6f6 22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e:6837:d002:9474:1ec5 71:6d:47:cd:8a:47                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:5889:cfde:b3f3:1cd5 71:6d:47:cd:8a:47                       UHLWIi                en0       
+9757:a50f:cf73:9c4e:322f:44e5:6965:51e0 71:6d:47:cd:8a:47                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:399d:d269:186d:dc95 dc:30:a1:70:aa:70                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:4bd5:7dfa:719c:fcbc 22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e:6ec3:5258:a940:6d1d 22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e:aeb0:3710:9fb5:e832 71:6d:47:cd:8a:47                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:c6d6:48aa:e0f:29ea  22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e:11ee:da70:4eff:91ae dc:30:a1:70:aa:70                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:bc35:d302:d15d:7f3e 22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e:8fcf:94ad:2d37:2363 dc:30:a1:70:aa:70                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:2f9f:4d11:e174:e2de dc:30:a1:70:aa:70                       UHLWI                 en0       
+9757:a50f:cf73:9c4e:72ea:7628:a850:b80a 22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:9c4e:bb74:4d6f:1e0f:2757 22:70:2f:24:f8:c7                       UHL                   lo0       
+9757:a50f:cf73:5d01::/64                fe80::1746:94ca:edf3:b388%en0           UGc                   en0       
+d114:342:b8da:6d8e::/64                 link#14                                 UC                    en0       
+d114:342:b8da:6d8e::/56                 fe80::7fd:1819:1bc5:9967%en0            UGc                   en0       
+d114:342:b8da:6d8e::1                   0:1e:f9:55:9b:2c                        UHLWI                 en0       
+d114:342:b8da:6d8e::7f5                 dc:30:a1:70:aa:70                       UHLWI                 en0       
+d114:342:b8da:6d8e:e6d:23af:f4b4:5bbd   22:70:2f:24:f8:c7                       UHL                   lo0       
+d114:342:b8da:6d8e:108:e4b:1c21:b564    22:70:2f:24:f8:c7                       UHL                   lo0       
+d114:342:b8da:6d8e:96a5:d023:56e3:1e63  dc:30:a1:70:aa:70                       UHLWI                 en0       
+d114:342:b8da:6d8e:e5db:75b:1634:7447   dc:30:a1:70:aa:70                       UHLWI                 en0       
+d114:342:b8da:6d8e:4bd5:7dfa:719c:fcbc  22:70:2f:24:f8:c7                       UHL                   lo0       
+d114:342:b8da:6d8e:6ec3:5258:a940:6d1d  22:70:2f:24:f8:c7                       UHL                   lo0       
+d114:342:b8da:6d8e:9f2d:e9c9:f567:c9b6  dc:30:a1:70:aa:70                       UHLWI                 en0       
+d114:342:b8da:6d8e:bc35:d302:d15d:7f3e  22:70:2f:24:f8:c7                       UHL                   lo0       
+d114:342:b8da:6d8e:611e:7bb6:8b3b:3a2b  dc:30:a1:70:aa:70                       UHLWI                 en0       
+d114:342:b8da:6d8e:72ea:7628:a850:b80a  22:70:2f:24:f8:c7                       UHL                   lo0       
+d114:342:b8da:6d8e:1974:5bd6:6a39:d38d  dc:30:a1:70:aa:70                       UHLWI                 en0       
+fd7a:115c:a1e0::/48                     fe80::15d0:72c7:6c59:a236%utun11        Uc                 utun11       
+fd7a:115c:a1e0::d3                      link#29                                 UHL                   lo0       
+fd7a:115c:a1e0::16/128                  link#29                                 UCS                utun11       
+fe80::%lo0/64                           fe80::1%lo0                             UcI                   lo0       
+fe80::1%lo0                             link#1                                  UHLI                  lo0       
+fe80::%en0/64                           link#14                                 UCI                   en0       
+fe80::7fd:1819:1bc5:9967%en0            0:1e:f9:55:9b:2c                        UHLWIir               en0       
+fe80::4c8:6baf:1cd8:8798%en0            dc:30:a1:70:aa:70                       UHLWIi                en0       
+fe80::5c5a:3a4c:f6e7:1531%en0           22:70:2f:24:f8:c7                       UHLI                  lo0       
+fe80::1746:94ca:edf3:b388%en0           d3:4f:89:ab:6a:aa                       UHLWIi                en0       
+fe80::4f71:12b1:f806:1381%en0           71:6d:47:cd:8a:47                       UHLWI                 en0       
+fe80::cbad:eb0e:16e2:760f%en0           34:58:3d:8d:db:2e                       UHLWIi                en0       
+fe80::6dae:6012:14df:9ed5%en0           a9:1:8d:cd:9a:38                        UHLWI                 en0       
+fe80::cf96:175a:b9a3:773e%awdl0         cc:70:6a:a9:7a:8a                       UHLI                  lo0       
+fe80::cf96:175a:b9a3:773e%llw0          cc:70:6a:a9:7a:8a                       UHLI                  lo0       
+fe80::%utun0/64                         fe80::2fe5:3b81:bad1:be1c%utun0         UcI                 utun0       
+fe80::2fe5:3b81:bad1:be1c%utun0         link#18                                 UHLI                  lo0       
+fe80::%utun1/64                         fe80::8b03:d0c:1f89:5550%utun1          UcI                 utun1       
+fe80::8b03:d0c:1f89:5550%utun1          link#19                                 UHLI                  lo0       
+fe80::%utun2/64                         fe80::8433:10d0:de0f:3f3d%utun2         UcI                 utun2       
+fe80::8433:10d0:de0f:3f3d%utun2         link#20                                 UHLI                  lo0       
+fe80::%utun3/64                         fe80::764f:9a0:6d5b:2ea%utun3           UcI                 utun3       
+fe80::764f:9a0:6d5b:2ea%utun3           link#21                                 UHLI                  lo0       
+fe80::%utun4/64                         fe80::7c4a:fd53:105e:d3%utun4           UcI                 utun4       
+fe80::7c4a:fd53:105e:d3%utun4           link#22                                 UHLI                  lo0       
+fe80::%utun5/64                         fe80::f14a:6751:840d:5527%utun5         UcI                 utun5       
+fe80::f14a:6751:840d:5527%utun5         link#23                                 UHLI                  lo0       
+fe80::%utun6/64                         fe80::b5fe:5c32:14c5:1efc%utun6         UcI                 utun6       
+fe80::b5fe:5c32:14c5:1efc%utun6         link#24                                 UHLI                  lo0       
+fe80::%utun7/64                         fe80::db11:96a:cbf8:1949%utun7          UcI                 utun7       
+fe80::db11:96a:cbf8:1949%utun7          link#25                                 UHLI                  lo0       
+fe80::%utun11/64                        fe80::15d0:72c7:6c59:a236%utun11        UcI                utun11       
+fe80::15d0:72c7:6c59:a236%utun11        link#29                                 UHLI                  lo0       
+ff00::/8                                ::1                                     UmCI                  lo0       
+ff00::/8                                link#14                                 UmCI                  en0       
+ff00::/8                                link#16                                 UmCI                awdl0       
+ff00::/8                                link#17                                 UmCI                 llw0       
+ff00::/8                                fe80::2fe5:3b81:bad1:be1c%utun0         UmCI                utun0       
+ff00::/8                                fe80::8b03:d0c:1f89:5550%utun1          UmCI                utun1       
+ff00::/8                                fe80::8433:10d0:de0f:3f3d%utun2         UmCI                utun2       
+ff00::/8                                fe80::764f:9a0:6d5b:2ea%utun3           UmCI                utun3       
+ff00::/8                                fe80::7c4a:fd53:105e:d3%utun4           UmCI                utun4       
+ff00::/8                                fe80::f14a:6751:840d:5527%utun5         UmCI                utun5       
+ff00::/8                                fe80::b5fe:5c32:14c5:1efc%utun6         UmCI                utun6       
+ff00::/8                                fe80::db11:96a:cbf8:1949%utun7          UmCI                utun7       
+ff00::/8                                fe80::15d0:72c7:6c59:a236%utun11        UmCI               utun11       
+ff01::%lo0/32                           ::1                                     UmCI                  lo0       
+ff01::%en0/32                           link#14                                 UmCI                  en0       
+ff01::%utun0/32                         fe80::2fe5:3b81:bad1:be1c%utun0         UmCI                utun0       
+ff01::%utun1/32                         fe80::8b03:d0c:1f89:5550%utun1          UmCI                utun1       
+ff01::%utun2/32                         fe80::8433:10d0:de0f:3f3d%utun2         UmCI                utun2       
+ff01::%utun3/32                         fe80::764f:9a0:6d5b:2ea%utun3           UmCI                utun3       
+ff01::%utun4/32                         fe80::7c4a:fd53:105e:d3%utun4           UmCI                utun4       
+ff01::%utun5/32                         fe80::f14a:6751:840d:5527%utun5         UmCI                utun5       
+ff01::%utun6/32                         fe80::b5fe:5c32:14c5:1efc%utun6         UmCI                utun6       
+ff01::%utun7/32                         fe80::db11:96a:cbf8:1949%utun7          UmCI                utun7       
+ff01::%utun11/32                        fe80::15d0:72c7:6c59:a236%utun11        UmCI               utun11       
+ff02::%lo0/32                           ::1                                     UmCI                  lo0       
+ff02::%en0/32                           link#14                                 UmCI                  en0       
+ff02::%utun0/32                         fe80::2fe5:3b81:bad1:be1c%utun0         UmCI                utun0       
+ff02::%utun1/32                         fe80::8b03:d0c:1f89:5550%utun1          UmCI                utun1       
+ff02::%utun2/32                         fe80::8433:10d0:de0f:3f3d%utun2         UmCI                utun2       
+ff02::%utun3/32                         fe80::764f:9a0:6d5b:2ea%utun3           UmCI                utun3       
+ff02::%utun4/32                         fe80::7c4a:fd53:105e:d3%utun4           UmCI                utun4       
+ff02::%utun5/32                         fe80::f14a:6751:840d:5527%utun5         UmCI                utun5       
+ff02::%utun6/32                         fe80::b5fe:5c32:14c5:1efc%utun6         UmCI                utun6       
+ff02::%utun7/32                         fe80::db11:96a:cbf8:1949%utun7          UmCI                utun7       
+ff02::%utun11/32                        fe80::15d0:72c7:6c59:a236%utun11        UmCI               utun11       
+@@@IFCONFIG
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	options=1203<RXCSUM,TXCSUM,TXSTATUS,SW_TIMESTAMP>
+	inet 127.0.0.1 netmask 0xff000000
+	inet6 ::1 prefixlen 128 
+	inet6 fe80::1%lo0 prefixlen 64 scopeid 0x1 
+	nd6 options=201<PERFORMNUD,DAD>
+gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280
+stf0: flags=0<> mtu 1280
+anpi2: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 30:90:be:cb:3f:6f
+	media: none
+	status: inactive
+anpi0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 30:90:be:cb:3f:5c
+	media: none
+	status: inactive
+anpi1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 30:90:be:cb:3f:ea
+	media: none
+	status: inactive
+en4: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 30:90:be:cb:3f:9a
+	nd6 options=201<PERFORMNUD,DAD>
+	media: none
+	status: inactive
+en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 30:90:be:cb:3f:93
+	nd6 options=201<PERFORMNUD,DAD>
+	media: none
+	status: inactive
+en6: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 30:90:be:cb:3f:ba
+	nd6 options=201<PERFORMNUD,DAD>
+	media: none
+	status: inactive
+en1: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 28:cb:6f:9a:70:29
+	media: autoselect <full-duplex>
+	status: inactive
+en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 28:cb:6f:9a:70:1d
+	media: autoselect <full-duplex>
+	status: inactive
+en3: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 28:cb:6f:9a:70:34
+	media: autoselect <full-duplex>
+	status: inactive
+bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=63<RXCSUM,TXCSUM,TSO4,TSO6>
+	ether 28:cb:6f:9a:70:29
+	Configuration:
+		id 0:0:0:0:0:0 priority 0 hellotime 0 fwddelay 0
+		maxage 0 holdcnt 0 proto stp maxaddr 100 timeout 1200
+		root id 0:0:0:0:0:0 priority 0 ifcost 0 port 0
+		ipfilter disabled flags 0x0
+	member: en1 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 10 priority 0 path cost 0
+	member: en2 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 11 priority 0 path cost 0
+	member: en3 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 12 priority 0 path cost 0
+	nd6 options=201<PERFORMNUD,DAD>
+	media: <unknown type>
+	status: inactive
+ap1: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether cd:d4:1e:d3:3d:9b
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect (none)
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether 22:70:2f:24:f8:c7
+	inet6 fe80::5c5a:3a4c:f6e7:1531%en0 prefixlen 64 secured scopeid 0xe 
+	inet 192.168.10.142 netmask 0xffffff00 broadcast 192.168.10.255
+	inet6 9757:a50f:cf73:9c4e:4d84:736d:a238:c6f6 prefixlen 64 autoconf secured 
+	inet6 aded:14a8:b9be:ee8b:11b9:9023:de65:a7c8 prefixlen 64 autoconf secured 
+	inet6 9757:a50f:cf73:9c4e:bb74:4d6f:1e0f:2757 prefixlen 64 deprecated autoconf temporary 
+	inet6 aded:14a8:b9be:ee8b:40bd:927e:22ef:1536 prefixlen 64 deprecated autoconf temporary 
+	inet6 9757:a50f:cf73:9c4e:c6d6:48aa:e0f:29ea prefixlen 64 deprecated autoconf temporary 
+	inet6 aded:14a8:b9be:ee8b:5bc7:b9ca:d002:74dd prefixlen 64 deprecated autoconf temporary 
+	inet6 d114:342:b8da:6d8e:e6d:23af:f4b4:5bbd prefixlen 64 autoconf secured 
+	inet6 d114:342:b8da:6d8e:bc35:d302:d15d:7f3e prefixlen 64 deprecated autoconf temporary 
+	inet6 9757:a50f:cf73:9c4e:bc35:d302:d15d:7f3e prefixlen 64 deprecated autoconf temporary 
+	inet6 aded:14a8:b9be:ee8b:4bd5:7dfa:719c:fcbc prefixlen 64 deprecated autoconf temporary 
+	inet6 d114:342:b8da:6d8e:4bd5:7dfa:719c:fcbc prefixlen 64 deprecated autoconf temporary 
+	inet6 9757:a50f:cf73:9c4e:4bd5:7dfa:719c:fcbc prefixlen 64 deprecated autoconf temporary 
+	inet6 aded:14a8:b9be:ee8b:6ec3:5258:a940:6d1d prefixlen 64 deprecated autoconf temporary 
+	inet6 d114:342:b8da:6d8e:6ec3:5258:a940:6d1d prefixlen 64 deprecated autoconf temporary 
+	inet6 9757:a50f:cf73:9c4e:6ec3:5258:a940:6d1d prefixlen 64 deprecated autoconf temporary 
+	inet6 aded:14a8:b9be:ee8b:72ea:7628:a850:b80a prefixlen 64 deprecated autoconf temporary 
+	inet6 d114:342:b8da:6d8e:72ea:7628:a850:b80a prefixlen 64 deprecated autoconf temporary 
+	inet6 9757:a50f:cf73:9c4e:72ea:7628:a850:b80a prefixlen 64 deprecated autoconf temporary 
+	inet6 aded:14a8:b9be:ee8b:108:e4b:1c21:b564 prefixlen 64 deprecated autoconf temporary 
+	inet6 d114:342:b8da:6d8e:108:e4b:1c21:b564 prefixlen 64 autoconf temporary 
+	inet6 9757:a50f:cf73:9c4e::818 prefixlen 64 dynamic 
+	inet6 9757:a50f:cf73:9c4e:108:e4b:1c21:b564 prefixlen 64 autoconf temporary 
+	inet6 aded:14a8:b9be:ee8b:ec4f:e627:1d3f:7fce prefixlen 64 autoconf temporary 
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+awdl0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether cc:70:6a:a9:7a:8a
+	inet6 fe80::cf96:175a:b9a3:773e%awdl0 prefixlen 64 scopeid 0x10 
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+llw0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether cc:70:6a:a9:7a:8a
+	inet6 fe80::cf96:175a:b9a3:773e%llw0 prefixlen 64 scopeid 0x11 
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect (none)
+	status: inactive
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	inet6 fe80::2fe5:3b81:bad1:be1c%utun0 prefixlen 64 scopeid 0x12 
+	nd6 options=201<PERFORMNUD,DAD>
+utun1: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::8b03:d0c:1f89:5550%utun1 prefixlen 64 scopeid 0x13 
+	nd6 options=201<PERFORMNUD,DAD>
+utun2: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 2000
+	inet6 fe80::8433:10d0:de0f:3f3d%utun2 prefixlen 64 scopeid 0x14 
+	nd6 options=201<PERFORMNUD,DAD>
+utun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1000
+	inet6 fe80::764f:9a0:6d5b:2ea%utun3 prefixlen 64 scopeid 0x15 
+	nd6 options=201<PERFORMNUD,DAD>
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::7c4a:fd53:105e:d3%utun4 prefixlen 64 scopeid 0x16 
+	nd6 options=201<PERFORMNUD,DAD>
+utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::f14a:6751:840d:5527%utun5 prefixlen 64 scopeid 0x17 
+	nd6 options=201<PERFORMNUD,DAD>
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::b5fe:5c32:14c5:1efc%utun6 prefixlen 64 scopeid 0x18 
+	nd6 options=201<PERFORMNUD,DAD>
+utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::db11:96a:cbf8:1949%utun7 prefixlen 64 scopeid 0x19 
+	nd6 options=201<PERFORMNUD,DAD>
+utun8: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	nd6 options=201<PERFORMNUD,DAD>
+utun9: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+utun10: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+utun11: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	inet6 fe80::15d0:72c7:6c59:a236%utun11 prefixlen 64 scopeid 0x1d 
+	inet 32.0.0.30 --> 32.0.0.30 netmask 0xffffffff
+	inet6 fd7a:115c:a1e0::d3 prefixlen 48 
+	nd6 options=201<PERFORMNUD,DAD>
+@@@NETSTAT_I
+Name       Mtu   Network       Address            Ipkts Ierrs    Opkts Oerrs  Coll
+lo0        16384 <Link#1>                      17555902     0 17555902     0     0
+lo0        16384 127           localhost       17555902     - 17555902     -     -
+lo0        16384 localhost   ::1               17555902     - 17555902     -     -
+lo0        16384 hostmacbook fe80:1::1         17555902     - 17555902     -     -
+gif0*      1280  <Link#2>                             0     0        0     0     0
+stf0*      1280  <Link#3>                             0     0        0     0     0
+anpi2      1500  <Link#4>    30:90:be:cb:3f:6f        0     0        0     0     0
+anpi0      1500  <Link#5>    30:90:be:cb:3f:5c        0     0        0     0     0
+anpi1      1500  <Link#6>    30:90:be:cb:3f:ea        0     0        0     0     0
+en4        1500  <Link#7>    30:90:be:cb:3f:9a        0     0        0     0     0
+en5        1500  <Link#8>    30:90:be:cb:3f:93        0     0        0     0     0
+en6        1500  <Link#9>    30:90:be:cb:3f:ba        0     0        0     0     0
+en1        1500  <Link#10>   28:cb:6f:9a:70:29        0     0        0     0     0
+en2        1500  <Link#11>   28:cb:6f:9a:70:1d        0     0        0     0     0
+en3        1500  <Link#12>   28:cb:6f:9a:70:34        0     0        0     0     0
+bridge0    1500  <Link#15>   28:cb:6f:9a:70:29        0     0        0     0     0
+ap1*       1500  <Link#13>   cd:d4:1e:d3:3d:9b        0     0        0     0     0
+en0        1500  <Link#14>   22:70:2f:24:f8:c7 218943829     0 113290121     0     0
+en0        1500  hostmacbook fe80:1::5c5a:3a4c 218943829     - 113290121     -     -
+en0        1500  192.168.10    192.168.10.142  218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+en0        1500  d114:342:cb d114:342:b8da:986 218943829     - 113290121     -     -
+en0        1500  d114:342:cb d114:342:b8da:986 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+en0        1500  d114:342:cb d114:342:b8da:986 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+en0        1500  d114:342:cb d114:342:b8da:986 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+en0        1500  d114:342:cb d114:342:b8da:986 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+en0        1500  d114:342:cb d114:342:b8da:986 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  9757:a50f:f 9757:a50f:cf73:20 218943829     - 113290121     -     -
+en0        1500  aded:14a8:f aded:14a8:b9be:62 218943829     - 113290121     -     -
+awdl0      1500  <Link#16>   cc:70:6a:a9:7a:8a    70017     0    95985     0     0
+awdl0      1500  fe80::cf96: fe80:fd::cf96:731    70017     -    95985     -     -
+llw0       1500  <Link#17>   cc:70:6a:a9:7a:8a    92502     0   650137     0     0
+llw0       1500  fe80::cf96: fe80:e5::cf96:731    92502     -   650137     -     -
+utun0      1500  <Link#18>                            0     0        1     0     0
+utun0      1500  hostmacbook fe80:92::2fe5:971        0     -        1     -     -
+utun1      1380  <Link#19>                            0     0      437     0     0
+utun1      1380  hostmacbook fe80:32::8b03:d0c        0     -      437     -     -
+utun2      2000  <Link#20>                            0     0      437     0     0
+utun2      2000  hostmacbook fe80:db::8433:cf4        0     -      437     -     -
+utun3      1000  <Link#21>                            0     0      438     0     0
+utun3      1000  hostmacbook fe80:d9::764f:9a0        0     -      438     -     -
+utun4      1380  <Link#22>                          122     0      278     0     0
+utun4      1380  hostmacbook fe80:7f::7c4a:ac7      122     -      278     -     -
+utun5      1380  <Link#23>                           58     0       33     0     0
+utun5      1380  hostmacbook fe80:3f::f14a:f30       58     -       33     -     -
+utun6      1380  <Link#24>                            0     0      438     0     0
+utun6      1380  hostmacbook fe80:dc::b5fe:190        0     -      438     -     -
+utun7      1380  <Link#25>                            0     0      438     0     0
+utun7      1380  hostmacbook fe80:2e::db11:96a        0     -      438     -     -
+utun8      1500  <Link#26>                            0     0        0     0     0
+utun9      1500  <Link#27>                            0     0        0     0     0
+utun10     1500  <Link#28>                            0     0        0     0     0
+utun11     1280  <Link#29>                            0     0        4     0     0
+utun11     1280  hostmacbook fe80:88::15d0:87e        0     -        4     -     -
+utun11     1280  32.0.0.30/32  32.0.0.30              0     -        4     -     -
+utun11     1280  fd7a:115c:7 fd7a:115c:a1e0::1        0     -        4     -     -
+@@@NETWORKSETUP_ORDER
+An asterisk (*) denotes that a network service is disabled.
+(1) USB 10/100/1G/2.5G LAN
+(Hardware Port: USB 10/100/1G/2.5G LAN, Device: en7)
+
+(2) F50 Pro
+(Hardware Port: F50 Pro, Device: en9)
+
+(3) USB 10/100/1000 LAN
+(Hardware Port: USB 10/100/1000 LAN, Device: en11)
+
+(4) Thunderbolt Bridge
+(Hardware Port: Thunderbolt Bridge, Device: bridge0)
+
+(5) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+
+(6) Shadowrocket
+(Hardware Port: com.liguangming.Shadowrocket, Device: )
+
+(7) Tailscale
+(Hardware Port: io.tailscale.ipn.macsys, Device: )
+
+@@@TAILSCALE
+<<POLARIS-CAPTURE-UNAVAILABLE>> 命令 [tailscale] 不在 PATH 上

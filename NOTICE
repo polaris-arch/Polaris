@@ -7,8 +7,8 @@ as LICENSE; the copyright notice above and that permission notice must be
 included in all copies or substantial portions of the Software.
 
 以子进程 / 二进制资源形式集成的第三方组件（非源码链接）：
-  - sing-box v1.14.0 (GPLv3) — https://github.com/SagerNet/sing-box
-        随包版本对应源码：https://github.com/SagerNet/sing-box/tree/v1.14.0
+  - sing-box v1.15.0-alpha.2 (GPLv3) — https://github.com/SagerNet/sing-box
+        随包版本对应源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.2
         （代理内核，以独立 sidecar 子进程运行）
   - cronet-go               — https://github.com/SagerNet/cronet-go     （NaiveProxy 核心，libcronet 动态库）
   - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI）

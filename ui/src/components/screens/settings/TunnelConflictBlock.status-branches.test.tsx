@@ -87,12 +87,26 @@ const PROBE_FAILED: TunnelConflictReport = { status: 'probeFailed', error: 'ip: 
 const PROBED_CLEAN: TunnelConflictReport = {
   status: 'probed',
   foreignTunnels: [{ interface: 'utun4', prefix: '198.18.0.0/16' }],
+  suppressedRoutes: 0,
   conflicts: [],
   criteria: { fakeipRanges: [], meshCidrs: [], tunAddresses: [] },
+};
+/**
+ * **任何一台有 utun 的 mac 的常态**（2026-09-12 p101 实测形态）：外来隧道宣告的 36 条全是
+ * link-local 与组播，后端把它们收在展示面之外 ⇒ `foreignTunnels` 为空、`suppressedRoutes` = 36。
+ * 这一支的界面文本必须仍然有信息量，不能退成一句「另有 0 条」。
+ */
+const PROBED_QUIET: TunnelConflictReport = {
+  status: 'probed',
+  foreignTunnels: [],
+  suppressedRoutes: 36,
+  conflicts: [],
+  criteria: { fakeipRanges: ['198.18.0.0/15'], meshCidrs: [], tunAddresses: ['172.19.0.1/30'] },
 };
 const PROBED_CONFLICT: TunnelConflictReport = {
   status: 'probed',
   foreignTunnels: [{ interface: 'utun4', prefix: '32.0.0.0/24' }],
+  suppressedRoutes: 36,
   conflicts: [{ interface: 'utun4', prefix: '32.0.0.0/24', kind: 'meshOverlap' }],
   criteria: { fakeipRanges: [], meshCidrs: ['32.0.0.0/24'], tunAddresses: [] },
 };
@@ -146,9 +160,14 @@ describe('判据 3 —— 未探测 ≠ 无冲突（逐态断言，中英双语�
 
 describe('守卫自检：四态真的走的是四条不同的分支', () => {
   it('四态两两渲染结果互不相同（塌成一句空话时本条转红）', () => {
-    const bodies = [NOT_PROBED, UNSUPPORTED, PROBE_FAILED, PROBED_CLEAN, PROBED_CONFLICT].map((r) =>
-      render(r, 'zh-CN'),
-    );
+    const bodies = [
+      NOT_PROBED,
+      UNSUPPORTED,
+      PROBE_FAILED,
+      PROBED_CLEAN,
+      PROBED_QUIET,
+      PROBED_CONFLICT,
+    ].map((r) => render(r, 'zh-CN'));
     expect(new Set(bodies).size).toBe(bodies.length);
   });
 
@@ -174,5 +193,52 @@ describe('守卫自检：四态真的走的是四条不同的分支', () => {
         );
       }
     }
+  });
+});
+
+/**
+ * 展示面：link-local / 组播由**后端**收掉（`runtime::proxy::tunnel_conflict` 的 `announced_routes`），
+ * 渲染端一条过滤都不写 —— 它只负责把「收掉了多少」如实说出来。
+ *
+ * 这三条对应任务判据 1/2/3 的渲染侧一半（后端侧一半在 Rust 的
+ * `field_capture_of_pure_noise_shows_nothing_yet_still_proves_it_probed` 等三条上）。
+ */
+describe('判据 1/2 —— 噪声收掉之后，这一支仍然有信息量', () => {
+  for (const lang of LANGS) {
+    it(`[${lang}] 判据 1：36 条全是噪声 ⇒ 一条都不列，但说的是「探过了、没有业务网段宣告」`, () => {
+      const markup = render(PROBED_QUIET, lang);
+      expect(markup).toContain(
+        translate(lang, 'settings.tun.tunnelConflictNoBusinessRanges', { count: 36 }),
+      );
+      // 「探测真的跑过」必须仍然看得见：被收掉的条数是唯一还在变的那个数。
+      expect(markup).toContain('36');
+      // 仍然是一句断言，不是空白。
+      expect(markup).toContain(NO_CONFLICT_NEEDLES[lang]);
+      // 而且不许退回成「另有 0 条隧道路由」那句 —— 那句话与「压根没探」在界面上同形。
+      expect(markup).not.toContain(
+        translate(lang, 'settings.tun.tunnelConflictNone', { count: 0 }),
+      );
+    });
+
+    it(`[${lang}] 判据 2 正向对照：同一支里有一条业务网段时，条数照旧说出来`, () => {
+      const markup = render(PROBED_CLEAN, lang);
+      expect(markup).toContain(translate(lang, 'settings.tun.tunnelConflictNone', { count: 1 }));
+      expect(markup).not.toContain(
+        translate(lang, 'settings.tun.tunnelConflictNoBusinessRanges', { count: 0 }),
+      );
+    });
+  }
+
+  it('判据 3：渲染端自己不过滤 —— 后端留下的 tailnet ULA 不会在这一层消失', () => {
+    const ula: TunnelConflictReport = {
+      status: 'probed',
+      foreignTunnels: [{ interface: 'utun4', prefix: 'fd7a:115c:a1e0::/48' }],
+      suppressedRoutes: 36,
+      conflicts: [],
+      criteria: { fakeipRanges: [], meshCidrs: [], tunAddresses: [] },
+    };
+    expect(render(ula, 'zh-CN')).toContain(
+      translate('zh-CN', 'settings.tun.tunnelConflictNone', { count: 1 }),
+    );
   });
 });
