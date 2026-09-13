@@ -17,8 +17,8 @@ use crate::builder::custom_rules::{build_custom_rules, CustomRulesDeps};
 use crate::builder::endpoint_routes::{
     collect_targeted_mixed, force_route_emission_order_key, force_route_leg,
     mesh_force_routed_servers, mesh_forced_route_cidrs, mesh_node_carries_full_tunnel,
-    settle_force_route_claims, should_force_route_subnets, tailnet_rule_file_base, ForceRouteLeg,
-    ObservedTailnetAddresses,
+    settle_force_route_claims, settled_force_route_cidrs, should_force_route_subnets,
+    tailnet_rule_file_base, ForceRouteLeg, ObservedTailnetAddresses,
 };
 use crate::builder::helpers::{
     apply_rule_set_prune, effective_app_rules, effective_custom_rules,
@@ -896,6 +896,12 @@ pub fn build_route_config_with_report(
     }
 
     // ===== 用户规则之后的功能性强制路由（reorder：原在用户规则之上，现下移）=====
+    // 本轮块 0c 真正接管的段（结算之后；Inline 的 emitted ∪ ExternalRuleSet 会落盘的那份）。
+    // 块 1 的 bypass 表要按它 carve，故提到块外声明 —— 块内那次结算是它的**唯一**来源，
+    // 在块外另算一份就会与内核吃的那一份分家。
+    // 不给初值：块 0c 无条件执行、必定赋值，编译器的定值分析会替我们守住这一点。给个
+    // `Vec::new()` 占位反而会把「块 0c 哪天被加上条件、carve 静默退化成空集」变成一条不红的路。
+    let block_0c_forced_cidrs: Vec<String>;
     // 0c. endpoint 节点（WireGuard/Tailscale）的「配置路由段」强制路由到该节点自身 tag。
     {
         let emitted_endpoint_tags: BTreeSet<String> = deps
@@ -1011,6 +1017,7 @@ pub fn build_route_config_with_report(
                 .collect::<Vec<_>>(),
             &deps.observed_tailnet_addresses,
         );
+        block_0c_forced_cidrs = settled_force_route_cidrs(&settled);
 
         // ── 第三步：按结算结果发射（顺序 = claimant 顺序，与结算逐项一一对应）──────────
         for (c, entry) in claimants.iter().zip(settled.servers.iter()) {
@@ -1097,6 +1104,32 @@ pub fn build_route_config_with_report(
                 ),
             );
         }
+        // 组网 carve：把块 0c 本轮真正接管的段从私网直连表里**算术挖掉**。
+        //
+        // # 为什么产物变了、运行时行为却严格等价
+        //
+        // 被挖掉的段正是块 0c 已经声索的那些，而块 0c 排在本块**之前**、sing-box 的 `route.rules`
+        // 是首匹配 ⇒ 这些段的包在到达本条规则之前就已经被送去组网节点了，本块本来就匹配不到它们。
+        // carve 的唯一效果是：**哪天块 0c 被挪到本块之后，行为也不变**。今天 tailnet 的可达性完全
+        // 押在「块 0c 写在块 1 之前」这个书写顺序上（`fc00::/7` 完整覆盖 tailnet ULA、
+        // `100.64.0.0/10` 字面就是官方 tailnet v4 段），顺序一旦被重构翻过来，结果是 tailnet 静默
+        // 不可达而产物里那条 force-route 规则明明还在。carve 之后这条依赖被消掉。
+        //
+        // # 为什么这里**不需要** `compute_win_bypass_exclude` 那道物理 LAN / guard 闸门
+        //
+        // 那道闸门守的是 Windows 内核排除表：从那张表里挖掉一段，等于把该段的包**交还给内核栈**，
+        // 若它同时是本机物理子网（或回环/链路本地/多播），后果是本机网络自断。本块产出的是
+        // sing-box 的一条**直连路由规则**，挖掉一段只是让它继续往下走 `route.rules`，而上面已经
+        // 论证过它必然已被块 0c 截走 —— 没有「交还给谁」这回事，也就没有那道闸门要守的东西。
+        //
+        // 减数取**结算之后**的 `block_0c_forced_cidrs`，不取 `mesh_forced_route_cidrs` 那种结算前的
+        // 集合：被跨节点结算吸收掉的段本轮一条都没发射，把它也 carve 掉，它就既不走组网也不再
+        // 直连，落到后面的规则里 —— 那是真实行为变化，不是等价改写。
+        let carve_mesh = crate::builder::tun_route_exclude::carve_candidates_within(
+            &bypass_cidrs,
+            &block_0c_forced_cidrs,
+        );
+        let bypass_cidrs = crate::builder::tun_route_exclude::carve_out(bypass_cidrs, &carve_mesh);
         if !bypass_cidrs.is_empty() {
             rules.push(RouteRule {
                 ip_cidr: Some(bypass_cidrs),

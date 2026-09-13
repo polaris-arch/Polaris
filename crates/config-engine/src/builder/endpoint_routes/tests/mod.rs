@@ -691,3 +691,112 @@ fn wg_reverse_mesh_system_vetoed_only_for_warp() {
         "无 warpDevice 标记的旧 WARP 必须按域名兜底否决（导入/手改/迁移绕过前端）"
     );
 }
+
+/// 线格式必须是 camelCase —— 前端 `contracts/endpoint-force-route-report.ts` 按这几个键读。
+///
+/// 漏掉 `rename_all` 或改错一个键名，**两侧的 tsc 与单测都不会红**：TS 那边读到的是
+/// `undefined`，而 `undefined` 在角标判据里是假值 ⇒ 角标恒不亮，表现与「本来就没冲突」一模一样
+/// （`tun_exclusion_preview` 的头注记的是同一个坑）。故键名必须逐条钉死。
+#[test]
+fn server_force_route_wire_shape_is_camel_case() {
+    let entry = ServerForceRoute {
+        server_id: "s".into(),
+        leg: ForceRouteLeg::ExternalRuleSet,
+        has_observation: true,
+        emitted: vec![],
+        external_rule_set_cidrs: vec!["32.0.0.28/32".into()],
+        absorbed: vec![],
+        coverage: ForceRouteCoverage::Covered,
+    };
+    let json = serde_json::to_value(&entry).expect("序列化");
+    let obj = json.as_object().expect("应是对象");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "absorbed",
+            "coverage",
+            "emitted",
+            "externalRuleSetCidrs",
+            "hasObservation",
+            "leg",
+            "serverId",
+        ],
+        "线格式键名漂了 —— 前端按这几个键读，漏一个只会让对应角标恒不亮而不会红"
+    );
+    assert_eq!(
+        obj["externalRuleSetCidrs"],
+        serde_json::json!(["32.0.0.28/32"]),
+        "新字段的值没落到 camelCase 键上"
+    );
+}
+
+/// [`settled_force_route_cidrs`] 的取材面：两条**产段**的腿都在内，`PreferredBy` 不在。
+///
+/// 正向：ExternalRuleSet 腿的段（自建 tailnet 的观测地址只走这条腿）与 Inline 腿结算后的
+/// `emitted` 都进并集，且并集去重。
+/// 负向：`PreferredBy` 腿的段**不进**（它的段由内核运行期归位，配置期这边只有「它声明了什么」，
+/// 没有「内核接管了什么」—— 理由写在 `settled_force_route_cidrs` 的文档里）。
+#[test]
+fn settled_force_route_cidrs_covers_both_producing_legs_and_excludes_preferred_by() {
+    let ts = ts_server("ts-file", None, &[]);
+    let mut observed = ObservedTailnetAddresses::new();
+    observed.insert("ts-file".into(), vec!["32.0.0.28".into()]);
+    let wg_a = wg_server("wg-a", &["10.9.0.0/24"], Some(true));
+    let wg_dup = wg_server("wg-dup", &["10.9.0.0/24"], Some(true));
+    let wg_lan = wg_server("wg-lan", &["192.168.77.0/24"], Some(false));
+
+    let report = settle_force_route_claims(
+        &[
+            (&ts, ForceRouteLeg::ExternalRuleSet),
+            (&wg_a, ForceRouteLeg::Inline),
+            (&wg_dup, ForceRouteLeg::Inline),
+            (&wg_lan, ForceRouteLeg::PreferredBy),
+        ],
+        &observed,
+    );
+    let union = settled_force_route_cidrs(&report);
+
+    // 前提：夹具真的建立起了三种腿各自的形态，否则下面三条断言各自都可能空转。
+    assert_eq!(
+        report.servers[0].external_rule_set_cidrs,
+        endpoint_forced_route_cidrs(&ts, &observed),
+        "前提没建立：ExternalRuleSet 腿没记下它会落盘的那份段"
+    );
+    assert_eq!(
+        report.servers[1].emitted,
+        vec!["10.9.0.0/24".to_string()],
+        "前提没建立：第一个 Inline 节点没发出它的段"
+    );
+    assert!(
+        report.servers[2].emitted.is_empty() && report.servers[2].absorbed.len() == 1,
+        "前提没建立：第二个 Inline 节点的段没有被首声明者吸收，去重那一格失去讨论对象"
+    );
+    assert!(
+        report.servers[3].external_rule_set_cidrs.is_empty()
+            && report.servers[3].emitted.is_empty(),
+        "前提没建立：PreferredBy 腿不该有任何段形态"
+    );
+
+    // 正向：观测段（只走 rule-set 腿）+ Inline 的 emitted 都在。
+    assert!(
+        union.contains(&"32.0.0.28/32".to_string()),
+        "自建 tailnet 的观测段没进并集 —— 它只走 ExternalRuleSet 腿，`emitted` 永远看不见它。实得 {union:?}"
+    );
+    assert!(
+        union.contains(&"10.9.0.0/24".to_string()),
+        "Inline 腿结算后发出的段没进并集。实得 {union:?}"
+    );
+    assert_eq!(
+        union.iter().filter(|c| *c == "10.9.0.0/24").count(),
+        1,
+        "并集没去重：两个 Inline 节点声索同一段时它出现了多次。实得 {union:?}"
+    );
+
+    // 负向：PreferredBy 腿的段不在（登记在案的边界，不是遗漏）。
+    assert!(
+        !union.contains(&"192.168.77.0/24".to_string()),
+        "PreferredBy 腿的段进了并集 —— 那是「它声明了什么」而不是「内核接管了什么」。实得 {union:?}"
+    );
+}

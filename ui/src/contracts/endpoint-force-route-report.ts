@@ -40,6 +40,15 @@ export interface ServerForceRoute {
   hasObservation: boolean;
   /** 本节点**实际发射**的具体段（只有 `inline` 腿非空）。 */
   emitted: string[];
+  /**
+   * 本节点走 `externalRuleSet` 腿时、**会写进 tailnet rule-set 文件**的那份段（其余两条腿恒空）。
+   *
+   * **「本轮哪些段走组网节点」不能只读 `emitted`**：本腿的路由规则里根本没有 `ip_cidr`（段值住在
+   * 文件里、产物只剩一个路径），于是 `emitted` 恒空 —— 而**自建 tailnet 的运行期观测地址恰恰只走
+   * 这条腿**（文件热重载，`ip_cidr` 字面量要重启核才能改）。只读 `emitted` 的消费方对自建 tailnet
+   * 结构性看不见任何段，表现与「没有组网节点」一模一样。
+   */
+  externalRuleSetCidrs: string[];
   absorbed: AbsorbedCidr[];
   coverage: ForceRouteCoverage;
 }

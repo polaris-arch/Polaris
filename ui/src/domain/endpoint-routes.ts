@@ -470,13 +470,24 @@ export function meshSelectedExitFallsBackToDirect(config: UserConfig): boolean {
   );
 }
 
-/**
- * 全部节点的 mesh force-route 段并集（去重）。供「路由规则与组网段重叠」提醒共用：
- * main 的 config-gen warn + renderer 的内联 hint/列表角标。用全量 servers（非仅 emitted）以覆盖潜在重叠。
- */
-export function meshForcedRouteCidrs(servers: ServerConfig[]): string[] {
-  return dedupe(servers.flatMap((s) => endpointForcedRouteCidrs(s)));
-}
+/* `meshForcedRouteCidrs` 已删（本批），请勿凭记忆再移植一份回来。
+ *
+ * 它是「全部组网节点的 force-route 段并集」的**渲染端重算**，唯一消费点是规则列表的
+ * 「覆盖组网」角标。它的段同样来自 `endpointForcedRouteCidrs` —— 对 Tailscale 恒产出
+ * `TAILNET_CGNAT` + `TAILNET_ULA_V6` 两条硬编码常量，而自建 headscale 的 `prefixes.v4`
+ * 可自定义（实测 `32.0.0.0/24`，与官方段零相交）。于是用户写一条覆盖自建 tailnet 的规则、
+ * 那条规则确实会遮蔽 tailnet（自定义规则排在组网之前，首匹配），角标却**结构性不亮**。
+ *
+ * 它还有第二层结构性盲区：自建 tailnet 的观测段走的是**外化 rule-set 腿**（段值住在文件里、
+ * 热重载），渲染端连那条腿的存在都看不见。
+ *
+ * 判据因此搬到有真值的那一端：`endpoint_force_route_report` 命令按块 0c 的同一套腿选择 +
+ * 同一次结算给出逐节点 `emitted` 与 `externalRuleSetCidrs`，角标改为消费它们的并集
+ * （`domain/mesh-rule-overlap.forceRoutedCidrsFromReport`）。
+ *
+ * 与本文件另外三条墓碑（`customEndpointCarriesTraffic` / `referencedServerIds` /
+ * `meshShadowedCidrs`）同一条教训：判据的单一真值在生成侧，渲染端要这个答案就走 IPC 问，
+ * 不要再抄一份会漂的实现。 */
 
 /* `meshShadowedCidrs` / `ShadowedCidr` 已删（本批），请勿凭记忆再移植一份回来。
  *

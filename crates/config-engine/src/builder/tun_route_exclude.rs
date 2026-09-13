@@ -95,6 +95,32 @@ pub fn compute_user_tun_exclude(input: &UserTunExcludeInput) -> UserTunExcludeRe
     }
 }
 
+/// 落在 `base` 某条目内（= 与之相交）的 carve 候选段，去重后保序。
+///
+/// 与 `base` 不相交的候选段对差集**没有任何作用**，却会把下面那道「无可 carve ⇒ 原样返回」的
+/// 短路打掉 —— 而短路正是「该 carve 时才 carve」这条不变量的落点（理由见 [`carve_out`]）。
+/// 两个 carve 调用点（Windows 内核排除表、`builder::route` 块 1 的 bypass 直连表）共用本函数，
+/// 免得一处过滤、另一处不过滤，同一份输入在两张表上给出不同形态。
+pub(crate) fn carve_candidates_within(base: &[String], carve: &[String]) -> Vec<String> {
+    dedupe(carve.iter().cloned())
+        .into_iter()
+        .filter(|c| crate::user_config::cidr::cidr_overlaps_any(c, base))
+        .collect()
+}
+
+/// 从 `base` 里算术挖掉 `carve`；**无可 carve ⇒ 原样返回**。
+///
+/// 短路不是省一次计算：[`subtract_cidrs`] 会把每条能解析的段按 `(网络号, 前缀)` 重新格式化
+/// （`10.0.0.1/8` → `10.0.0.0/8`），于是「carve 集为空」这一格若也走差集，产物里的字面量会被
+/// 无声改写一遍 —— 对内核语义无影响，但会让「没有组网节点时这张表与 carve 之前**逐字节相同**」
+/// 这条负向对照失去判别力（它本来就是用来证明 carve 只在该发生时发生的）。
+pub(crate) fn carve_out(base: Vec<String>, carve: &[String]) -> Vec<String> {
+    if carve.is_empty() {
+        return base;
+    }
+    subtract_cidrs(&base, carve)
+}
+
 /// Windows bypassLAN carve 保护段（回环/链路本地/多播）。
 const WIN_BYPASS_CARVE_GUARD: &[&str] = &[
     "127.0.0.0/8",
@@ -127,11 +153,7 @@ pub fn compute_win_bypass_exclude(input: &WinBypassExcludeInput) -> WinBypassExc
         partition_cidrs_by_overlap(input.bypass_cidrs, input.fakeip_ranges);
 
     // 2. 只考虑落在某 bypass 条目内的 engaged mesh 段。
-    let engaged: Vec<String> = dedupe(input.engaged_mesh_cidrs.iter().cloned());
-    let relevant_mesh: Vec<String> = engaged
-        .into_iter()
-        .filter(|m| crate::user_config::cidr::cidr_overlaps_any(m, &after_fakeip))
-        .collect();
+    let relevant_mesh = carve_candidates_within(&after_fakeip, input.engaged_mesh_cidrs);
 
     // 3. 分流：与保护段（物理子网 + guard）相交的段不 carve。
     let mut guard_with_lan: Vec<String> = input.own_lan_cidrs.to_vec();
@@ -139,18 +161,9 @@ pub fn compute_win_bypass_exclude(input: &WinBypassExcludeInput) -> WinBypassExc
     let (mesh_skipped_own_lan, carve_mesh) =
         partition_cidrs_by_overlap(&relevant_mesh, &guard_with_lan);
 
-    // 4. 无可 carve → 原样返回。
-    if carve_mesh.is_empty() {
-        return WinBypassExcludeResult {
-            exclude: after_fakeip,
-            carved_mesh_cidrs: vec![],
-            mesh_skipped_own_lan,
-        };
-    }
-
-    // 5. 算术差集。
+    // 4. 算术差集（无可 carve ⇒ `carve_out` 原样返回，不经重格式化）。
     WinBypassExcludeResult {
-        exclude: subtract_cidrs(&after_fakeip, &carve_mesh),
+        exclude: carve_out(after_fakeip, &carve_mesh),
         carved_mesh_cidrs: carve_mesh,
         mesh_skipped_own_lan,
     }

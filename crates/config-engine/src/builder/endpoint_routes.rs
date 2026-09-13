@@ -596,9 +596,54 @@ pub struct ServerForceRoute {
     pub has_observation: bool,
     /// 本节点**实际发射**的具体段（只有 [`ForceRouteLeg::Inline`] 腿非空）。
     pub emitted: Vec<String>,
+    /// 本节点走 [`ForceRouteLeg::ExternalRuleSet`] 腿时、**会写进 tailnet rule-set 文件**的那份段
+    /// （其余两条腿恒空）。
+    ///
+    /// # 为什么 `emitted` 一个字段不够
+    ///
+    /// `emitted` 的语义是「产物 `route.rules` 里那条规则自带的 `ip_cidr`」，而本腿的规则里
+    /// **根本没有 `ip_cidr`** —— 段值住在文件里、产物只剩一个路径。于是任何「本轮哪些段走组网
+    /// 节点」的消费方若只读 `emitted`，看到的恒是空集，而**自建 tailnet 的观测地址恰恰只走本腿**
+    /// （文件热重载，`ip_cidr` 字面量要重启核才能改）。这正是「覆盖组网」角标此前对自建 tailnet
+    /// 结构性不亮的成因。
+    ///
+    /// 值取 [`endpoint_forced_route_cidrs`]（= 落盘侧写文件时用的同一个函数），**不参与**跨节点
+    /// 结算：本腿既不消耗也不贡献 `claimed`（理由见 [`settle_force_route_claims`]），故「想发什么」
+    /// 与「会落盘什么」在本腿上是同一件事，不存在 `emitted` 那种「被更早声明者吸收掉一部分」的差。
+    pub external_rule_set_cidrs: Vec<String>,
     /// 被更早声明者吸收掉的段（含抢占者 id）。
     pub absorbed: Vec<AbsorbedCidr>,
     pub coverage: ForceRouteCoverage,
+}
+
+/// 本轮块 0c **实际让哪些段走组网节点**的完整并集（去重，保发射顺序）。
+///
+/// # 取材面：结算**之后**，且两条产段的腿都在内
+///
+/// - [`ForceRouteLeg::Inline`] 取 [`ServerForceRoute::emitted`] —— 结算之后真发出去的那一份。
+///   取结算**之前**的 [`endpoint_forced_route_cidrs`]（或 [`mesh_forced_route_cidrs`]）是错的：
+///   被 [`settle_force_route_claims`] 吸收掉的段本轮**没有发射**，把它算进并集，消费方（如块 1 的
+///   bypass carve）就会对一个既不走组网、也不再直连的段动手，产生真实行为变化。
+/// - [`ForceRouteLeg::ExternalRuleSet`] 取 [`ServerForceRoute::external_rule_set_cidrs`] ——
+///   段在文件里，产物读不回来，而自建 tailnet 的运行期观测地址只走这条腿。
+///
+/// # [`ForceRouteLeg::PreferredBy`] **不在**并集内（如实登记，不是遗漏）
+///
+/// 那条腿产出的是 `{preferred_by:[tag]}`，段由内核按 endpoint 自身路由表在**运行期**归位 ——
+/// 配置期这边没有一份「它到底接管了哪些段」的真值，只有「它声明了哪些段」。拿后者冒充前者
+/// 会让消费方按一个内核可能并不认的清单动手。需要覆盖这条腿的消费方得先有运行期的归位事实，
+/// 那不是本函数能给的。
+///
+/// `report` 必须来自**本轮**的结算（块 0c 的 [`settle_force_route_claims`]，或只读入口
+/// [`endpoint_force_route_report`]），不是另算一份 —— 这个函数的全部价值就在于与块 0c 同源。
+#[must_use]
+pub fn settled_force_route_cidrs(report: &EndpointForceRouteReport) -> Vec<String> {
+    dedupe(report.servers.iter().flat_map(|s| {
+        s.emitted
+            .iter()
+            .chain(s.external_rule_set_cidrs.iter())
+            .cloned()
+    }))
 }
 
 /// 本轮 endpoint force-route 的完整结算：谁和谁撞了、撞在哪一段、谁输了、谁因此零覆盖。
@@ -655,6 +700,14 @@ pub fn settle_force_route_claims(
                 }
             }
         }
+        // 本腿的段写文件、不进产物 `ip_cidr` ⇒ `emitted` 恒空，而它恰是自建 tailnet 观测地址
+        // 走的那一条。单独记一份，让「本轮哪些段走组网节点」的消费方看得见它
+        // （理由见 [`ServerForceRoute::external_rule_set_cidrs`]）。
+        let external_rule_set_cidrs = if *leg == ForceRouteLeg::ExternalRuleSet {
+            desired.clone()
+        } else {
+            Vec::new()
+        };
         let coverage = if desired.is_empty() {
             ForceRouteCoverage::NothingToRoute
         } else if *leg != ForceRouteLeg::Inline || !emitted.is_empty() {
@@ -670,6 +723,7 @@ pub fn settle_force_route_claims(
             leg: *leg,
             has_observation: has_observed_tailnet_cidrs(s, observed),
             emitted,
+            external_rule_set_cidrs,
             absorbed,
             coverage,
         });

@@ -62,6 +62,9 @@ const leg = (over: Partial<ServerForceRoute> & { serverId: string }): ServerForc
   leg: 'inline',
   hasObservation: true,
   emitted: [],
+  // 外化 rule-set 腿的段（本夹具默认走 inline 腿，故恒空）。字段不可省：它是必填的，
+  // 省掉会让「只读 emitted 就够了」这个已被推翻的假设在夹具里悄悄复活。
+  externalRuleSetCidrs: [],
   absorbed: [],
   coverage: 'covered',
   ...over,

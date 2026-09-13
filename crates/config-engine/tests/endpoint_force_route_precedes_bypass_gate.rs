@@ -10,10 +10,34 @@
 //!  - `fc00::/7` **完整覆盖** tailnet ULA `fd7a:115c:a1e0::/48`；
 //!  - `100.64.0.0/10` **完整覆盖** 官方 tailnet v4 段（字面就是同一条）。
 //!
-//! ⇒ **tailnet 两族的可达性，完全靠 `#7` 排在 `#8` 前面托着。** 今天是对的，靠的只是
+//! ⇒ **tailnet 两族的可达性，曾经完全靠 `#7` 排在 `#8` 前面托着。** 那是对的，但靠的只是
 //! `builder/route.rs` 里「块 0c」写在「1. 私有 IP 段直连」之前这个**书写顺序**。谁重构一次把
 //! 旁路块提前、或把块 0c 挪后，结果是 **tailnet 静默不可达，而全部既有门照旧绿** ——
 //! 产物里那条 force-route 规则明明还在，逐条看一切正常。
+//!
+//! # 那个依赖已被消掉：块 1 现在把块 0c 接管的段 carve 出去
+//!
+//! `builder/route.rs` 块 1 在算出 `bypass_cidrs` 之后，把**本轮块 0c 真正接管的段**
+//! （`endpoint_routes::settled_force_route_cidrs`：Inline 腿结算后的 `emitted` ∪ ExternalRuleSet
+//! 腿会落盘的那份）从旁路直连表里算术挖掉。于是两张表**不再相交**，first-match 谁在前都一样。
+//!
+//! 本门的命题因此从「顺序正确」升级成「不相交」，三条腿的处置随之分家：
+//!
+//! | 腿 | 块 1 是否 carve | 本门断言 |
+//! |---|---|---|
+//! | `Inline` | ✅（`emitted`） | 产物里再没有任何段与它相交；且把旁路规则**移到它前面**也仍然不相交 |
+//! | `ExternalRuleSet` | ✅（会落盘的那份） | 同上 |
+//! | `PreferredBy` | ❌ | 仍只能断言**顺序**（见下） |
+//!
+//! `PreferredBy` 腿不 carve 是**有意登记的边界**，不是漏掉：那条腿产出的是 `{preferred_by:[tag]}`，
+//! 段由内核按 endpoint 自身路由表在运行期归位 —— 配置期没有「它到底接管了哪些段」的真值，
+//! 只有「它声明了哪些段」。拿后者去 carve 一张真会影响直连的表，等于按一份内核可能并不认的清单
+//! 开洞。故它的可达性**仍然依赖顺序**，本门对它保留原来的顺序断言
+//! （[`preferred_by_leg_force_route_precedes_every_wider_segment`]）。
+//!
+//! 判据本体（`Verdict` 四态、方向性 `cidr_contains`、逆序探测）一个字节没动 —— 它现在的用途是
+//! **证明 carve 真的发生了**：同一份配置去掉组网节点，旁路表两族各有吃家；加回组网节点，吃家
+//! 一条不剩。少了前半段，「没有吃家」与「判据哑了」在测试输出里长得一模一样。
 //!
 //! 本文件落盘之前，生产侧没有任何门断言这条顺序：`route/tests/` 与 `tests/` 里关于 force-route
 //! 的三道门（`endpoint_force_route_duplicate_cidr_gate` / `_silent_absorption_gate` /
@@ -102,9 +126,12 @@ use polaris_config_engine::builder::endpoint_routes::{
 use polaris_config_engine::builder::generate_sing_box_config;
 use polaris_config_engine::singbox::{RouteRule, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
-use polaris_config_engine::user_config::cidr::cidr_contains;
+use polaris_config_engine::user_config::cidr::{cidr_contains, cidr_overlaps_any};
 use polaris_config_engine::user_config::server_config::{
     Protocol, ServerConfig, TailscaleSettings, WireGuardSettings,
+};
+use polaris_config_engine::user_config::system_proxy_bypass::{
+    bypass_lan_cidrs, DEFAULT_BYPASS_LAN,
 };
 use support::kernel_gate::{default_platform, outbound_deps_for};
 
@@ -296,6 +323,101 @@ fn assert_family_sample(shadows: &[Shadow], v6: bool, what: &str) {
     );
 }
 
+/// 产物里全部带 `ip_cidr` 的规则条目，摊平成 `(下标, 段, outbound)`。
+///
+/// 不预设「旁路块是哪一条」：那条规则今天靠 `outbound=="direct"` + 一张私网表认出来，明天多一条
+/// 同形的规则（geoip 直连、用户规则）就认错。本门问的命题（「还有没有段会吃掉它」）本来就与
+/// 吃家是谁无关，摊平全表反而是判据的原样表达。
+fn ip_cidr_entries(rules: &[RouteRule]) -> Vec<(usize, String, Option<String>)> {
+    let mut out = Vec::new();
+    for (i, r) in rules.iter().enumerate() {
+        let Some(cidrs) = r.ip_cidr.as_ref() else {
+            continue;
+        };
+        for c in cidrs {
+            out.push((i, c.clone(), r.outbound.clone()));
+        }
+    }
+    out
+}
+
+/// 块 1 那条私网直连表的 `ip_cidr`（不在场 ⇒ `None`，那是 `bypassLAN` 关掉时的合法态）。
+///
+/// 定位判据：`outbound=="direct"` + 带 `ip_cidr` + **不带 `port`**。那个 `port` 是必要的：
+/// 同为 direct 的 DNS 上游直连规则也带一串 `ip_cidr`，只靠前两条会认到它头上，而那张表与
+/// 旁路清单毫无关系 —— 命中多于一条直接 panic，夹具不许有歧义。
+fn bypass_rule_cidrs(rules: &[RouteRule]) -> Option<Vec<String>> {
+    let hits: Vec<&RouteRule> = rules
+        .iter()
+        .filter(|r| {
+            r.outbound.as_deref() == Some("direct") && r.ip_cidr.is_some() && r.port.is_none()
+        })
+        .collect();
+    assert!(
+        hits.len() <= 1,
+        "产物里有 {} 条无端口的 direct ip_cidr 规则 —— 认不出哪条是旁路表：{hits:#?}",
+        hits.len()
+    );
+    hits.first().and_then(|r| r.ip_cidr.clone())
+}
+
+/// **正面对照**：这批条目里，两族各有一条段**包含**对应族的被保护段，且至少一条来自 `direct`。
+///
+/// 在「carve 之前」的那份产物上跑。少了它，下面「carve 之后一条吃家都没有」可能是判据算不出来
+/// （族分派漏了一支、`cidr_contains` 被改成恒 false），而那在 `cargo test` 里长得和真通过一样。
+fn assert_covers_both_families(
+    entries: &[(usize, String, Option<String>)],
+    protected: &[String],
+    what: &str,
+) {
+    for v6 in [false, true] {
+        let fam = if v6 { "IPv6" } else { "IPv4" };
+        let victims: Vec<&String> = protected.iter().filter(|p| p.contains(':') == v6).collect();
+        assert!(
+            !victims.is_empty(),
+            "{what}：{fam} 族一个被保护段都没有 —— 前提没建立。protected={protected:?}"
+        );
+        let hits: Vec<&(usize, String, Option<String>)> = entries
+            .iter()
+            .filter(|(_, c, _)| victims.iter().any(|v| cidr_contains(c, v)))
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "{what}：{fam} 族没有任何吃家 —— 本门在这一族上没有取材面，\
+             「carve 之后不再有吃家」于是退化成空断言。全部条目：{entries:#?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|(_, _, ob)| ob.as_deref() == Some("direct")),
+            "{what}：{fam} 族的吃家里没有一条来自 direct（旁路块）—— 本门要钉的那条缝\
+             在这一族上没有取材面。该族吃家：{hits:#?}"
+        );
+    }
+}
+
+/// **正向断言**：产物里除该 force-route 规则自身外，没有任何 `ip_cidr` 条目与被保护段**相交**。
+///
+/// 判据用「相交」而不是本门别处那个方向性的「包含」：carve 走的是算术差集，结果与减数**严格
+/// 不相交**。用「包含」会放过「碎了一半」那种形态（差集实现哪天算漏一个边界，留下一条与 tailnet
+/// 部分重叠的子网 —— 它一样会在 first-match 下截走一部分 tailnet 流量，而 `cidr_contains` 看不见）。
+fn assert_disjoint_from_every_other_rule(
+    entries: &[(usize, String, Option<String>)],
+    force_index: usize,
+    protected: &[String],
+    what: &str,
+) {
+    let intersecting: Vec<&(usize, String, Option<String>)> = entries
+        .iter()
+        .filter(|(i, _, _)| *i != force_index)
+        .filter(|(_, c, _)| cidr_overlaps_any(c, protected))
+        .collect();
+    assert!(
+        intersecting.is_empty(),
+        "🔴 {what}：carve 之后产物里仍有段与组网段相交 —— 可达性仍然押在规则顺序上。\
+         被保护段：{protected:?}；相交的条目：{intersecting:#?}"
+    );
+}
+
 // ─────────────────────────── 夹具 ───────────────────────────
 
 /// Tailscale 节点。`alwaysRouteSubnets` 不设 = 缺省 true ⇒ 恒 engaged，不依赖选中/规则点名。
@@ -351,18 +473,19 @@ fn rules_of(cfg: &SingBoxConfig) -> Vec<RouteRule> {
 
 // ─────────────────────────── 门 ───────────────────────────
 
-/// 🔴 **Inline 腿 · 两族正样本。**
+/// 🔴 **Inline 腿 · 两族都被 carve 出旁路表。**
 ///
-/// 一个无观测的 Tailscale 节点走 Inline 腿，发的是 tailnet 两族默认段
-/// （v4 CGNAT + v6 ULA）。两者在默认旁路清单里各有一个更宽/等宽的吃家
-/// （实测：`100.64.0.0/10` 被同字面的旁路条目等宽覆盖、`fd7a:115c:a1e0::/48` 被 `fc00::/7`
-/// 包含）。本用例只断言「**算出来**的覆盖者全部排在它之后」，不写这两条字面量。
+/// 一个无观测的 Tailscale 节点走 Inline 腿，发的是 tailnet 两族默认段（v4 CGNAT + v6 ULA）。
+/// 两者在默认旁路清单里各有一个更宽/等宽的吃家（实测：`100.64.0.0/10` 被同字面的旁路条目等宽
+/// 覆盖、`fd7a:115c:a1e0::/48` 被 `fc00::/7` 包含）—— 本用例先在**去掉组网节点**的同一份产物上
+/// 把这件事断言出来（正面对照），再断言加回组网节点后那些吃家一条不剩（正向断言）。
+///
+/// 两条字面量一个都不写：吃家是**算出来**的，旁路清单用户可改、也会演进。
 #[test]
-fn inline_leg_force_route_precedes_every_wider_segment_in_both_families() {
+fn inline_leg_segments_are_carved_out_of_the_bypass_table_in_both_families() {
     let node = ts_node("ts-inline");
-    let input = config_with(vec![node.clone()]);
     let deps = outbound_deps_for(&default_platform());
-    let rules = rules_of(&generate(&input, &deps));
+    let rules = rules_of(&generate(&config_with(vec![node.clone()]), &deps));
 
     // 前提①：这条 force-route 真的走 Inline 腿（产物里它自带 ip_cidr）。
     let idx = force_route_rule_index(&rules, "ts-inline")
@@ -373,21 +496,27 @@ fn inline_leg_force_route_precedes_every_wider_segment_in_both_families() {
          本用例失去「Inline」这个讨论对象。规则：{:#?}",
         rules[idx]
     );
+    let protected = protected_cidrs(&node, &rules[idx], &deps.observed_tailnet_addresses);
 
-    let verdict =
-        force_route_order_verdict(&node, "ts-inline", &rules, &deps.observed_tailnet_addresses);
-    let covering = expect_ordered(&verdict, "Inline 腿");
-    assert_family_sample(&covering, false, "Inline 腿");
-    assert_family_sample(&covering, true, "Inline 腿");
+    // 正面对照：同一份配置**只去掉组网节点** ⇒ 旁路表未被 carve ⇒ 两族各有吃家。
+    let baseline = ip_cidr_entries(&rules_of(&generate(&config_with(vec![]), &deps)));
+    assert_covers_both_families(&baseline, &protected, "carve 之前（无组网节点）");
+
+    // 正向断言：加回组网节点后，全表再没有任何段与这两族相交。
+    assert_disjoint_from_every_other_rule(&ip_cidr_entries(&rules), idx, &protected, "Inline 腿");
 }
 
-/// 🔴 **rule-set 腿 · 两族正样本**（真机 E2E 实际走的那一条）。
+/// 🔴 **rule-set 腿 · 两族都被 carve 出旁路表**（真机 E2E 实际走的那一条）。
 ///
 /// tailnet rule-set 文件落盘 ⇒ 块 0c 发的是 `{rule_set:"tailnet-<id>", outbound:<tag>}`，
 /// 规则里**没有 `ip_cidr`**。故定位只能靠 `outbound == tag`、段集只能取
 /// [`endpoint_forced_route_cidrs`]。这正是真机 `#7` 的形态。
+///
+/// 本腿是 carve 的**主射程**：自建 tailnet 的运行期观测地址只走它（文件热重载，`ip_cidr` 字面量
+/// 改一次要重启核）。若块 1 的减数只取 `emitted`，这一腿的段一条都不会被 carve —— 而产物里
+/// 看不出任何异常（规则在、路径在），正是本用例要拦的那个形态。
 #[test]
-fn rule_set_leg_force_route_precedes_every_wider_segment_in_both_families() {
+fn rule_set_leg_segments_are_carved_out_of_the_bypass_table_in_both_families() {
     let tmp = tempfile::TempDir::new().expect("建临时目录");
     let dir = tmp.path().join("tailnet-rules");
     std::fs::create_dir_all(&dir).expect("建 tailnet-rules 目录");
@@ -417,11 +546,104 @@ fn rule_set_leg_force_route_precedes_every_wider_segment_in_both_families() {
         rules[idx]
     );
 
-    let verdict =
-        force_route_order_verdict(&node, "ts-file", &rules, &deps.observed_tailnet_addresses);
-    let covering = expect_ordered(&verdict, "rule-set 腿");
-    assert_family_sample(&covering, false, "rule-set 腿");
-    assert_family_sample(&covering, true, "rule-set 腿");
+    let protected = protected_cidrs(&node, &rules[idx], &deps.observed_tailnet_addresses);
+    assert!(
+        rules[idx].ip_cidr.is_none() && !protected.is_empty(),
+        "前提：本腿的段只能从 endpoint_forced_route_cidrs 取（产物里没有字面量）。\
+         protected={protected:?}"
+    );
+
+    // 正面对照 + 正向断言，同 Inline 腿那一格。
+    let baseline = ip_cidr_entries(&rules_of(&generate(&config_with(vec![]), &deps)));
+    assert_covers_both_families(&baseline, &protected, "carve 之前（无组网节点）");
+    assert_disjoint_from_every_other_rule(&ip_cidr_entries(&rules), idx, &protected, "rule-set 腿");
+}
+
+/// 🔴 **这批改动存在的全部理由：可达性不再依赖块序。**
+///
+/// 把产物里那条旁路直连规则**移到** force-route 之前（= 模拟「有人把块 0c 挪到块 1 之后」那次
+/// 重构），判决仍然是 [`Verdict::NoCoveringRuleAtAll`] —— 没有任何段能吃掉它，谁在前都一样。
+///
+/// 这条断言的牙由 [`detector_flags_the_reversed_order_on_synthetic_rules_in_both_families`] 提供：
+/// 那里用**未 carve** 的同形旁路表做同样的逆序，判据报 `Shadowed`。两条合起来才成立
+/// —— 少了它，本用例的绿可能只是判据对逆序本来就瞎。
+#[test]
+fn tailnet_reachability_survives_putting_the_bypass_block_first() {
+    let node = ts_node("ts-inline");
+    let deps = outbound_deps_for(&default_platform());
+    let rules = rules_of(&generate(&config_with(vec![node.clone()]), &deps));
+    let idx = force_route_rule_index(&rules, "ts-inline")
+        .expect("产物里没有 ts-inline 的 force-route 规则");
+
+    // 把 force-route 那条挪到**最后**，等价于把它前面所有带 ip_cidr 的规则整体提前。
+    let mut reordered: Vec<RouteRule> = rules.clone();
+    let force = reordered.remove(idx);
+    reordered.push(force);
+
+    let new_idx = force_route_rule_index(&reordered, "ts-inline").expect("重排后 force-route 还在");
+    assert_eq!(
+        new_idx,
+        reordered.len() - 1,
+        "前提没建立：force-route 没被挪到最后，本用例没有「块 0c 在最后」这个讨论对象"
+    );
+    let verdict = force_route_order_verdict(
+        &node,
+        "ts-inline",
+        &reordered,
+        &deps.observed_tailnet_addresses,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::NoCoveringRuleAtAll {
+            force_index: new_idx
+        },
+        "🔴 把 force-route 挪到全部规则之后就被吃掉了 ⇒ tailnet 可达性仍然押在书写顺序上，\
+         块 1 的 carve 没生效或减数取错了。实得：{verdict:#?}"
+    );
+}
+
+/// 🟢 **负向对照：没有 engaged 组网节点时，旁路表与 carve 之前逐条完全相同。**
+///
+/// 证明 carve **只在该发生时发生**。两格都要测，因为它们是两条不同的路：
+///  - 压根没有组网节点 ⇒ 块 0c 一个 claimant 都没有；
+///  - 有组网节点但**未 engaged**（`alwaysRouteSubnets=false`、未选中、无规则指向）⇒ 有 claimant
+///    资格却被 `should_force_route_subnets` 挡在门外。第二格是真正易错的那个：减数若取
+///    `mesh_forced_route_cidrs` 那种不过 engaged 闸门的集合，这一格会静默把段挖掉。
+///
+/// 基准取 `bypass_lan_cidrs(DEFAULT_BYPASS_LAN)` —— 生产的同一份清单，不是抄下来的字面量。
+#[test]
+fn bypass_table_is_byte_identical_when_no_mesh_node_is_engaged() {
+    let deps = outbound_deps_for(&default_platform());
+    let baseline: Vec<String> = bypass_lan_cidrs(
+        &DEFAULT_BYPASS_LAN
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        baseline.len() > 5,
+        "前提没建立：默认旁路清单只剩 {} 条，逐条比对失去判别力",
+        baseline.len()
+    );
+
+    let mut idle = ts_node("ts-idle");
+    idle.tailscale_settings
+        .as_mut()
+        .expect("ts_node 必带 tailscaleSettings")
+        .always_route_subnets = Some(false);
+
+    for (what, servers) in [
+        ("没有组网节点", vec![]),
+        ("有组网节点但未 engaged", vec![idle]),
+    ] {
+        let rules = rules_of(&generate(&config_with(servers), &deps));
+        let table = bypass_rule_cidrs(&rules)
+            .unwrap_or_else(|| panic!("{what}：产物里找不到那条私网直连表"));
+        assert_eq!(
+            table, baseline,
+            "{what}：旁路表与 carve 之前不再逐条相同 —— carve 在不该发生时发生了"
+        );
+    }
 }
 
 /// 🔴 **preferred_by 腿**（v4）。
@@ -454,17 +676,19 @@ fn preferred_by_leg_force_route_precedes_every_wider_segment() {
     assert_family_sample(&covering, false, "preferred_by 腿");
 }
 
-/// 🟡 **前提无取材面时如实报告 + 正面对照。**
+/// 🟡 **「无覆盖者」有两条不同的成因，本用例把它们分开，并证明 carve 是外科式的。**
 ///
-/// `bypassLAN` 关掉 ⇒ 私网直连表整条不发 ⇒ 产物里再没有任何段能覆盖 tailnet 两族 ⇒
-/// 「force-route 排在覆盖者之前」这条命题**没有取材面**。本用例把那一态显式钉成
-/// [`Verdict::NoCoveringRuleAtAll`]，而不是让上面那些断言在空集上静默通过。
+/// carve 落地之后，`Verdict::NoCoveringRuleAtAll` 不再是稀有态而是常态，于是必须回答一个新问题：
+/// 这一态到底是 ①`bypassLAN` 关掉、整张表压根没发，还是 ②表发了、只是被挖掉了组网那几段？
+/// 两者在判决上同形，在行为上完全不同（①连私网直连都没有）。
 ///
-/// 后半段是**正面对照**：同一份配置只把 `bypassLAN` 打开，覆盖面立刻非空、且吃家是 `direct`。
-/// 少了这半段，「没有覆盖者」可能是判据算不出来（谓词写反、族分派漏了一支），
-/// 和「确实不存在覆盖者」在测试输出里长得一样。
+/// 三段断言：
+///  - `bypassLAN` **关** + 组网节点 ⇒ 判决 `NoCoveringRuleAtAll`，且旁路表**整条不在场**；
+///  - `bypassLAN` **开** + 组网节点 ⇒ 旁路表**在场且非空**（carve 没把它挖没），但两族都不再有吃家
+///    —— 这是正面断言：carve 是外科式的，不是「整条规则消失了」这种什么都没发生的假绿；
+///  - `bypassLAN` **开** + **无**组网节点 ⇒ 两族各有吃家（判据没哑）。
 #[test]
-fn bypass_lan_off_has_no_covering_rule_at_all_and_says_so() {
+fn bypass_lan_off_and_mesh_carve_are_distinguishable_reasons_for_an_empty_covering_face() {
     let node = ts_node("ts-inline");
     let deps = outbound_deps_for(&default_platform());
 
@@ -488,22 +712,30 @@ fn bypass_lan_off_has_no_covering_rule_at_all_and_says_so() {
         },
         "bypassLAN 关掉时，产物里不应再有任何覆盖 tailnet 两族的段。实得：{verdict_off:#?}"
     );
-
-    // 正面对照：同一份配置开着 bypassLAN ⇒ 覆盖面非空、来自 direct ⇒ 上面那个空集是真的空，
-    // 不是判据哑了。
-    let on = config_with(vec![node.clone()]);
-    let rules_on = rules_of(&generate(&on, &deps));
-    let covering_on = expect_ordered(
-        &force_route_order_verdict(
-            &node,
-            "ts-inline",
-            &rules_on,
-            &deps.observed_tailnet_addresses,
-        ),
-        "正面对照（bypassLAN 开）",
+    assert!(
+        bypass_rule_cidrs(&rules_off).is_none(),
+        "成因①没建立：bypassLAN 关掉时旁路表却还在场 —— 那本用例分不开两种成因"
     );
-    assert_family_sample(&covering_on, false, "正面对照（bypassLAN 开）");
-    assert_family_sample(&covering_on, true, "正面对照（bypassLAN 开）");
+
+    // 成因②：bypassLAN 开 + 组网节点 ⇒ 表在场且非空，但两族都不再有吃家（carve 是外科式的）。
+    let rules_on = rules_of(&generate(&config_with(vec![node.clone()]), &deps));
+    let table_on = bypass_rule_cidrs(&rules_on).expect("bypassLAN 开着时旁路表必须在场");
+    assert!(
+        !table_on.is_empty(),
+        "carve 把整张旁路表挖没了 —— 私网直连整个失效，这不是本批要的等价改写"
+    );
+    let idx_on = force_route_rule_index(&rules_on, "ts-inline").expect("force-route 规则在场");
+    let protected = protected_cidrs(&node, &rules_on[idx_on], &deps.observed_tailnet_addresses);
+    assert_disjoint_from_every_other_rule(
+        &ip_cidr_entries(&rules_on),
+        idx_on,
+        &protected,
+        "bypassLAN 开 + 组网节点",
+    );
+
+    // 判据没哑的正面对照：同一份配置去掉组网节点，两族立刻各有吃家、且来自 direct。
+    let baseline = ip_cidr_entries(&rules_of(&generate(&config_with(vec![]), &deps)));
+    assert_covers_both_families(&baseline, &protected, "正面对照（无组网节点）");
 }
 
 /// 🟢 **判据有牙（合成输入的反向对照）。**
