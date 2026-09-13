@@ -3,6 +3,18 @@
 //! 判定（哪些算真冲突）不在这里，在 `config-engine` 的 `builder::tunnel_conflict`：
 //! 那边是纯函数、本机跑得完单测；这边是平台相关的宿主读取，只负责把事实取回来。
 //!
+//! # 默认路由走**另一条通道**，不并进 `foreign`
+//!
+//! 三个解析器都把默认路由规范成 [`DEFAULT_ROUTE_V4`] / [`DEFAULT_ROUTE_V6`] 并产出条目，
+//! 分桶只发生在 [`foreign_tunnel_routes`] 那一层（判据是 [`is_default_route`]，全仓一份）。
+//! 两个桶的理由是它与**任何**前缀相交：并进 [`ForeignTunnelSnapshot::foreign`]，
+//! `detect_tunnel_conflicts` 会对我方每一条网段各报一次冲突 —— 一条全隧道就把告警刷爆，
+//! 而刷爆的告警等于没有告警（`plat-warn` 已经演过一遍）。
+//!
+//! 不这么做的代价在 2026-09-13 w207 上坐实了：Windows 内置 L2TP 连上之后宣告 `0.0.0.0/0`
+//! metric 1，而它在展示面上只剩一条 `10.55.0.10/32` —— 用户读到的是「某个隧道宣告了一个 /32」，
+//! 真实情况是「它要了全部流量」。回归门 `tests::default_route_gate` 两个方向都钉住。
+//!
 //! # 取材面纪律
 //!
 //! 本模块的解析器全部按**真实抓取的输出**写，不按记忆里的格式写。Linux 侧的样本取自
@@ -14,6 +26,25 @@
 //!    —— 一行里有字面量 `\` + 制表符做分隔，`dev` 只出现在各 nexthop 段里。
 //!
 //! 按"第一段是网段、`dev` 紧随其后"的直觉写，第二种会把 `nexthop` 的 dev 张冠李戴到主路由上。
+//!
+//! ## Linux 的隧道名单：`type tun` 看不见 OpenVPN 2.7（2026-09-13 VM185 实测）
+//!
+//! OpenVPN 2.7 在 Linux 上**默认走 ovpn-dco 内核模块**，它建出来的设备 link type 逐字是
+//! `ovpn`，**不是** `tun`。同一台机器（Ubuntu 26.04 / 内核 7.0.0-30 / OpenVPN 2.7.0 `[DCO]`）：
+//!
+//!  - `ip -o link show type tun` → 只回 `tap0`（传统 TAP；`ip -d link show tap0` 第三行是
+//!    `tun type tap pi off …`）；
+//!  - `ip -o link show type ovpn` → 回 `tun0` 与 `tun1`（第三行是 `ovpn addrgenmode random …`）。
+//!
+//! **设备名叫 `tun0` 不等于 link type 是 `tun`** —— 这正是照记忆写不出来的那一半：按名字前缀
+//! 猜会全中，按 `type tun` 查会全丢。补这条腿之前，`tun1` 上那条 `198.18.42.0/24`
+//! （落在 FakeIP 段 `198.18.0.0/15` 里）压根进不了 `tunnel_interfaces`，于是
+//! `detect_tunnel_conflicts` 在这台机器上返回 **0 条冲突** —— 又一句自信的「无冲突」。
+//!
+//! **只收 `ovpn` 这一种**：`gre` / `sit` / `ipip` / `vti` / `xfrm` / `ip6tnl` 同样是隧道
+//! link type，但仓里一份实测样本都没有。按与 [`WINDOWS_TUNNEL_IF_TYPES`] 同一条**不盲收**
+//! 纪律：判据只写有真机正样本的那些，其余如实登记成缺口（见 `ForeignTunnelProbeImpl::probe_linux`
+//! 的头注，它是私有的所以这里不加链接）。
 //!
 //! # macOS：两半都有样本了，mac 腿是真实现
 //!
@@ -54,9 +85,11 @@
 //! `InterfaceType` 列 —— **IANA ifType 的两个标准值**，两个值各有真机正样本，不是从某台
 //! 机器上看出来的规律：
 //!
-//!  - `131`（`IF_TYPE_TUNNEL`）：Teredo / IP-HTTPS / 6to4，两份 Windows 抓取里都有；
-//!  - `53`（`IF_TYPE_PROP_VIRTUAL`）：**Tailscale 1.102.4 的 wintun**，Windows 11
-//!    build 26200 真机实测（`fixtures/windows-w207-wintun-present-2026-09-12.txt`）。
+//!  - `131`（`IF_TYPE_TUNNEL`）：Teredo / IP-HTTPS / 6to4，每份 Windows 抓取里都有；
+//!  - `53`（`IF_TYPE_PROP_VIRTUAL`）：**两族**用户态 VPN 虚拟网卡各有真机正样本 ——
+//!    Tailscale 1.102.4 的 wintun（2026-09-12，`fixtures/windows-w207-wintun-present-2026-09-12.txt`）
+//!    与 **OpenVPN 的 TAP-Windows Adapter V9**（2026-09-13，
+//!    `fixtures/windows-w207-ovpn-tun-connected-2026-09-13.txt`），都在 Windows 11 build 26200。
 //!
 //! **`53` 是 2026-09-12 被真机坐实的一次判据翻案**：在那之前判据只认 `131`，而 wintun 报的
 //! 是 `53` —— 旧判据在它唯一要做的那件事上静默失败（装着 Tailscale 的机器会拿到一句自信的
@@ -67,7 +100,14 @@
 //! 根本不分隔（`以太网` 与三个隧道同为 `0`）、另一条已被 wintun 那行**直接证伪**（它的
 //! `ComponentID` 是 `Wintun`，不空），故判据只认 ifType 这一列。
 //!
-//! 三半都在了，Windows 腿走 [`TunnelProbeOutcome::Probed`]。
+//! **隧道名单还有第二个来源，2026-09-13 才补上**：Windows RAS（L2TP / IKEv2 / SSTP / PPTP
+//! —— 绝大多数企业 VPN 的形态）连上之后，**承载流量的接口根本不在 `Get-NetAdapter` 里**。
+//! w207 实测（L2TP 连接建立时）：承载接口以 VPN 连接名为别名（`PolarisProbeL2TP`，ifIndex 35），
+//! 宣告 `0.0.0.0/0` metric 1，而 `Get-NetAdapter -IncludeHidden | Where InterfaceIndex -eq 35`
+//! 返回 **0 条**。ifType 白名单那条腿的整个取材面看不到它 ⇒ 装着企业 VPN 的机器又会拿到
+//! 那句自信的「无冲突」。判据只能问 Windows 自己（[`parse_vpn_connection_names`]）。
+//!
+//! 四半都在了，Windows 腿走 [`TunnelProbeOutcome::Probed`]。
 //!
 //! **🔴 仍然缺的三块（如实登记，逐条有绊线）**：
 //!
@@ -78,16 +118,29 @@
 //!     `tests::windows_leg_on_the_connected_capture_keeps_business_prefixes` 与
 //!     `tests::windows_leg_on_the_logged_out_wintun_capture_sees_only_noise`，三份抓取的台阶
 //!     差分钉在 `tests::the_three_windows_captures_step_from_no_wintun_to_business_prefixes`。
-//!  2. **`53` 的假阳性面没有样本**：`IF_TYPE_PROP_VIRTUAL` 是「厂商自有虚拟接口」这个大桶，
-//!     装了 Hyper-V / VMware / Docker 的机器上可能有别的适配器落进来。仓里两份抓取里报 `53`
-//!     的只有 wintun 那一行。
-//!  3. **另外两族隧道驱动的 ifType 仍无样本**：TAP-Windows / OpenVPN（`tap0901`）是以太网
-//!     仿真驱动、Windows 内置 VPN（SSTP / L2TP / IKEv2）走 RAS —— 两者**落在 `{131, 53}` 之外
-//!     的可能性很大**（前者疑报 `6`、后者疑报 `23` = PPP；**均未核实，仓里无样本，需真机抓取，
-//!     code review 判不准**）。不盲收这两个值：`6` 是全部物理网卡，`23` 与 PPPoE 拨号同型 ⇒
-//!     收了就是把一批真业务网卡判成隧道。
+//!  2. ~~`53` 的假阳性面没有样本~~ —— **2026-09-13 补上了 Hyper-V 那一半的负向证据**：同机装
+//!     Hyper-V 之后多出来的两张适配器（`vSwitch (Default Switch)` / `vEthernet (Default Switch)`）
+//!     的 `InterfaceType` 都是 **`6`**，**不是 `53`**（`fixtures/windows-w207-hyperv-present-2026-09-13.txt`）。
+//!     也就是说「装了 Hyper-V 的机器上会有别的适配器落进 `53` 这个宽桶」这条风险，在 Hyper-V
+//!     上被证否了。VMware / Docker 那两半**仍无样本**。
+//!     同一份抓取反向印证了 `6` **绝对不能收**：它在那一份里同时是物理网卡
+//!     （`Red Hat VirtIO Ethernet Adapter`）、Hyper-V 虚拟交换机、与内核调试适配器 ——
+//!     三种东西同一个值。正负两半钉在
+//!     `fixture_harness::iftype_53_admits_the_two_vpn_drivers_but_not_the_hyperv_switches`。
+//!  3. ~~TAP-Windows / OpenVPN 那族的 ifType 无样本~~ —— **2026-09-13 实测是 `53`，此前登记的
+//!     疑值 `6` 是错的**：`OpenVPN TAP-Windows6`（`ComponentID` = `root\tap0901`、
+//!     `DriverDescription` = `TAP-Windows Adapter V9`、驱动 9.27.0.0、`Status` = `Up`、`10.8.0.2`）
+//!     报 `53`。⇒ 现有白名单 `{131, 53}` **本来就覆盖它**，判据不用改。
+//!     ~~RAS 那族疑报 `23`~~ —— **2026-09-13 实测，那条疑值也错了、但结论没错**：
+//!     `WAN Miniport (L2TP/IKEv2/SSTP/PPTP)` 四张全报 **131**，报 `23` 的是
+//!     `WAN Miniport (PPPOE)`（**接入协议不是隧道**）⇒「不收 `23`」这个判断是对的，
+//!     只是理由此前写反了。而真正的问题不在 ifType 上：RAS 的**承载接口压根不在**
+//!     `Get-NetAdapter` 里，那批 `131` 的 miniport 是恒 `Disconnected` 的**协议模板**，
+//!     在路由表上一条都没有。这一族改由 [`parse_vpn_connection_names`] 那条腿承担。
+//!     **仍无样本**：WireGuard NT / 各家企业 VPN 客户端（Zscaler / GlobalProtect 之类）。
 //!
-//! 第 2、3 条由 `fixture_harness::the_wintun_capture_pins_iftype_53_and_two_driver_families_are_still_unverified`
+//! 第 2、3 条剩下的那半由
+//! `fixture_harness::the_captures_pin_iftype_53_for_wintun_and_tap_windows6`
 //! 钉着：哪天有带这些适配器的抓取入库，它会红并要求按实测值重新评估判据面。
 //!
 //! 采集脚本：`~/docs/polaris/scripts/polaris-collect-routes-{macos.sh,windows.ps1}`。
@@ -121,20 +174,75 @@ use thiserror::Error;
 /// 一条路由：目的前缀 + 出接口。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteEntry {
-    /// 规范化后的目的前缀（主机路由补 `/32` / `/128`）。`default` 路由不产出条目。
+    /// 规范化后的目的前缀（主机路由补 `/32` / `/128`，默认路由规范成
+    /// [`DEFAULT_ROUTE_V4`] / [`DEFAULT_ROUTE_V6`]）。
     pub prefix: String,
     /// 出接口名。
     pub interface: String,
 }
 
-/// 解析 `ip -o route show` / `ip -o -6 route show` 的一行。
+/// 这份路由表输出的地址族。
 ///
-/// 返回 `None` 的三种情况，都是**有意跳过**而非失败：
-///  - `default …`（不是具体网段，冲突判定用不上）；
-///  - 顶层没有 `dev`（多路径路由，出接口在各 nexthop 段里 —— 它天然不是单一隧道的宣告）；
-///  - 首段不像地址。
+/// # 为什么必须由调用方传，而不是从行里看出来
+///
+/// 三个平台的默认路由行里，**目的地那一列没有任何一个字节能区分 v4 与 v6**：
+/// Linux 逐字是 `default via …`，macOS 逐字是 `default`。靠网关地址反推，在
+/// `default link#29 … utun11`（2026-09-12 p101 真机抓取里的 Tailscale 那条）这种
+/// 网关列压根不是地址的形态上直接失效；靠「`pref medium` 只出现在 v6 输出里」这类
+/// **从某台机器上看出来的规律**反推，是本模块头注明令禁止的取材方式。
+///
+/// 族是**产生这份输出的那条命令**的属性（`ip -o route show` / `ip -o -6 route show`、
+/// `netstat -rn -f inet` / `-f inet6`），调用方是唯一握着真值的地方。Windows 那支不吃
+/// 这个参数：`route print` 的目的地自带 `0.0.0.0 0.0.0.0` / `::/0`，族写在行里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpFamily {
+    /// IPv4 路由表。
+    V4,
+    /// IPv6 路由表。
+    V6,
+}
+
+impl IpFamily {
+    /// 本族的默认路由规范形。
+    #[must_use]
+    pub fn default_route_prefix(self) -> &'static str {
+        match self {
+            Self::V4 => DEFAULT_ROUTE_V4,
+            Self::V6 => DEFAULT_ROUTE_V6,
+        }
+    }
+}
+
+/// IPv4 默认路由的规范前缀。
+pub const DEFAULT_ROUTE_V4: &str = "0.0.0.0/0";
+
+/// IPv6 默认路由的规范前缀。
+pub const DEFAULT_ROUTE_V6: &str = "::/0";
+
+/// 这条前缀是不是默认路由。
+///
+/// # 全仓只有这一份判据，这是它存在的全部理由
+///
+/// 默认路由在三个平台的原始输出里长三个样（Linux `default via X dev Y` 连 `/0` 都没有、
+/// macOS `default`、Windows `0.0.0.0 0.0.0.0` 与 `::/0`）。三个解析器各自把它规范成
+/// 这两个字面量之一，**分桶只在这一处按规范形判**——分流逻辑写一份比写三份可靠，
+/// 三份迟早会漂成两份半。
 #[must_use]
-pub fn parse_ip_route_line(line: &str) -> Option<RouteEntry> {
+pub fn is_default_route(prefix: &str) -> bool {
+    prefix == DEFAULT_ROUTE_V4 || prefix == DEFAULT_ROUTE_V6
+}
+
+/// 解析 `ip -o route show` / `ip -o -6 route show` 的一行。`family` 见 [`IpFamily`]。
+///
+/// 返回 `None` 的两种情况，都是**有意跳过**而非失败：
+///  - 顶层没有 `dev`（多路径路由，出接口在各 nexthop 段里 —— 它天然不是单一隧道的宣告）；
+///  - 首段不像地址（`multicast` / `broadcast` / `local` 这三种路由类型前缀，以及别的非地址开头）。
+///
+/// `default …` **产出条目**（规范成 `family` 的默认路由前缀）：它是一条真实的宣告，
+/// 而且是最重的那一条。它与具体网段的分桶在 [`foreign_tunnel_routes`] 那一层做，
+/// 不在这里 —— 理由见 [`is_default_route`]。
+#[must_use]
+pub fn parse_ip_route_line(line: &str, family: IpFamily) -> Option<RouteEntry> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -144,10 +252,10 @@ pub fn parse_ip_route_line(line: &str) -> Option<RouteEntry> {
     let head = line.split('\\').next().unwrap_or(line);
     let mut tokens = head.split_whitespace();
     let dest = tokens.next()?;
-    if dest == "default" || dest == "multicast" || dest == "broadcast" || dest == "local" {
+    if dest == "multicast" || dest == "broadcast" || dest == "local" {
         return None;
     }
-    if !dest.contains('.') && !dest.contains(':') {
+    if dest != "default" && !dest.contains('.') && !dest.contains(':') {
         return None;
     }
     // 只在**本段**里找 dev；找不到说明这是多路径主路由行，跳过。
@@ -160,7 +268,9 @@ pub fn parse_ip_route_line(line: &str) -> Option<RouteEntry> {
         }
     }
     let interface = interface?;
-    let prefix = if dest.contains('/') {
+    let prefix = if dest == "default" {
+        family.default_route_prefix().to_string()
+    } else if dest.contains('/') {
         dest.to_string()
     } else if dest.contains(':') {
         format!("{dest}/128")
@@ -170,13 +280,16 @@ pub fn parse_ip_route_line(line: &str) -> Option<RouteEntry> {
     Some(RouteEntry { prefix, interface })
 }
 
-/// 解析整份 `ip -o route show` 输出。
+/// 解析整份 `ip -o route show` 输出。`family` 见 [`IpFamily`]。
 #[must_use]
-pub fn parse_ip_routes(stdout: &str) -> Vec<RouteEntry> {
-    stdout.lines().filter_map(parse_ip_route_line).collect()
+pub fn parse_ip_routes(stdout: &str, family: IpFamily) -> Vec<RouteEntry> {
+    stdout
+        .lines()
+        .filter_map(|line| parse_ip_route_line(line, family))
+        .collect()
 }
 
-/// 解析 `ip -o link show type tun` / `type wireguard` 的接口名。
+/// 解析 `ip -o link show type tun` / `type wireguard` / `type ovpn` 的接口名。
 ///
 /// 形如 `7: tailscale0: <POINTOPOINT,...> mtu 1280 ...` —— 取第二个冒号分隔字段。
 /// 名字可能带 `@父接口`（VLAN/隧道常见），一并剥掉。
@@ -346,21 +459,63 @@ pub fn expand_netstat_destination(dest: &str) -> Option<String> {
     (len <= 32).then(|| format!("{}.{}.{}.{}/{len}", full[0], full[1], full[2], full[3]))
 }
 
-/// 解析整份 `netstat -rn -f inet` / `netstat -rn -f inet6`（macOS/BSD）。
+/// 解析整份 `netstat -rn -f inet` / `netstat -rn -f inet6`（macOS/BSD）。`family` 见 [`IpFamily`]。
 ///
 /// **列位置从列头行读，不写死**：本机抓到的列头是
 /// `Destination Gateway Flags Netif Expire`（`Netif` 在第 4 列），而老 macOS 中间多出
 /// `Refs`/`Use` 两列。写死列号的版本在后者上不会报错，只会静默把别的列当接口名。
 ///
+/// # 🔴 `Flags` 列是判据的一部分：**作用域默认路由不是对全局默认路由的声索**
+///
+/// macOS 的每个 utun 上都挂着一条 `default`，这是**任何一台 mac 的常态**，不是异常。
+/// 仓里三份 p101 真机抓取（2026-09-08 / 09-12 断开态 / 09-12 连接态）里，各有 8–10 条：
+///
+/// ```text
+/// default   fe80::7fd:1819:1bc5:9967%en0   UGcg    en0      ← 全局默认路由（无 I）
+/// default   fe80::%utun0                   UGcIg   utun0    ← 作用域（RTF_IFSCOPE）
+/// default   link#29                        UCSIg   utun11   ← 同上（Tailscale，未开出口节点）
+/// ```
+///
+/// `Flags` 里的 `I` 是 `RTF_IFSCOPE`：这条路由**只服务显式绑定到该接口的流量**，
+/// 不在全局转发面上与别人竞争。按定义它不是「我要全部出站流量」这句声索，
+/// 收进来的后果是**任何一台有 utun 的 mac 每次起核都报 8 条冲突** ——
+/// 逢隧道必报的告警会被无视或删掉，`plat-warn` 已经演过一遍。
+///
+/// 判据取的是标志位的**定义**（作用域路由不在全局面上），不是「看着像系统自带的就跳过」
+/// 这类从某台机器上看出来的规律；三份抓取里 en0 那条全局默认路由**不带** `I`，
+/// 是同一条判据的正样本那一半。
+///
+/// **出处**（p101 `man netstat`，2026-09-13 逐字）：
+///
+/// ```text
+///      I       RTF_IFSCOPE      Route is associated with an interface scope
+///
+///      A route which is marked with the RTF_IFSCOPE flag is instantiated for the
+///      interface scope.
+/// ```
+///
+/// 判据不依赖这个名字成立 —— 它依赖的是三份真机抓取里「utun 那批带 `I`、物理网卡那条不带」
+/// 这个可验证的分隔。但有了出处，「作用域路由不在全局面上」就不再是我对字母的记忆。
+///
+/// **🔴 缺口如实登记**：仓里**没有**「macOS 上外来隧道抢全局默认路由」的正样本
+/// （现有三份 mac 抓取里，不带 `I` 的默认路由全在物理网卡上）。故本条只排除有 `I` 的那一族，
+/// 不带 `I` 的照收 —— 宁可多显示一条，不静默少显示。
+///
 /// # Errors
 ///
-/// 见 [`RouteTableParseError`]：找不到列头、列头缺 `Netif`、数据行被截断、目的地不可识别。
-/// 四种都**不**折成"少几条的 `Ok`" —— 那正是这个 `Result` 存在的理由。
-pub fn parse_netstat_routes(stdout: &str) -> Result<Vec<RouteEntry>, RouteTableParseError> {
+/// 见 [`RouteTableParseError`]：找不到列头、列头缺 `Netif` 或 `Flags`、数据行被截断、
+/// 目的地不可识别。四种都**不**折成"少几条的 `Ok`" —— 那正是这个 `Result` 存在的理由。
+pub fn parse_netstat_routes(
+    stdout: &str,
+    family: IpFamily,
+) -> Result<Vec<RouteEntry>, RouteTableParseError> {
     const CMD: &str = "netstat -rn";
     const COL: &str = "Netif";
+    /// 作用域路由（`RTF_IFSCOPE`）在 `Flags` 列里的字母。
+    const IFSCOPE_FLAG: char = 'I';
 
     let mut netif_idx: Option<usize> = None;
+    let mut flags_idx: Option<usize> = None;
     let mut out = Vec::new();
 
     for (i, raw) in stdout.lines().enumerate() {
@@ -377,25 +532,29 @@ pub fn parse_netstat_routes(stdout: &str) -> Result<Vec<RouteEntry>, RouteTableP
         let tokens: Vec<&str> = line.split_whitespace().collect();
 
         if tokens.first() == Some(&"Destination") {
-            let Some(idx) = tokens.iter().position(|t| *t == COL) else {
-                return Err(RouteTableParseError::MissingColumn {
-                    command: CMD,
-                    column: COL,
-                    header: line.to_string(),
-                });
-            };
-            netif_idx = Some(idx);
+            for (col, slot) in [(COL, &mut netif_idx), ("Flags", &mut flags_idx)] {
+                let Some(idx) = tokens.iter().position(|t| *t == col) else {
+                    return Err(RouteTableParseError::MissingColumn {
+                        command: CMD,
+                        column: col,
+                        header: line.to_string(),
+                    });
+                };
+                *slot = Some(idx);
+            }
             continue;
         }
 
         // 列头还没出现 ⇒ 还在抬头里（脚本写的分节标记、`Routing tables` 之类），跳过。
-        let Some(idx) = netif_idx else { continue };
+        let (Some(idx), Some(flags_at)) = (netif_idx, flags_idx) else {
+            continue;
+        };
 
-        if tokens.len() <= idx {
+        if tokens.len() <= idx.max(flags_at) {
             return Err(RouteTableParseError::TruncatedRow {
                 command: CMD,
                 line_no,
-                want: idx + 1,
+                want: idx.max(flags_at) + 1,
                 got: tokens.len(),
                 line: line.to_string(),
             });
@@ -403,7 +562,15 @@ pub fn parse_netstat_routes(stdout: &str) -> Result<Vec<RouteEntry>, RouteTableP
 
         let dest = tokens[0];
         if dest == "default" {
-            continue; // 与 `parse_ip_route_line` 同口径：默认路由不是具体网段。
+            // 作用域默认路由不是声索（见本函数头注的 `Flags` 一节）。
+            if tokens[flags_at].contains(IFSCOPE_FLAG) {
+                continue;
+            }
+            out.push(RouteEntry {
+                prefix: family.default_route_prefix().to_string(),
+                interface: tokens[idx].to_string(),
+            });
+            continue;
         }
         let Some(prefix) = expand_netstat_destination(dest) else {
             return Err(RouteTableParseError::UnparsableDestination {
@@ -852,6 +1019,12 @@ fn ipv4_mask_to_prefix_len(mask: Ipv4Addr) -> Option<u8> {
 /// `names` 是 [`parse_get_netipaddress`] 建的对照表 —— **没有它就没有接口名**，
 /// 这也是本函数比 mac/Linux 那两支多吃一个参数的全部理由。
 ///
+/// 本函数不吃 [`IpFamily`]：`route print` 的目的地自带 `0.0.0.0 0.0.0.0` / `::/0`，
+/// 族写在行里，不必问调用方。默认路由**照常产出条目**（分桶见 [`is_default_route`]），
+/// 于是它也和别的行一样要过接口名对照 —— 查不到时报
+/// [`RouteTableParseError::UnresolvedInterface`]，与此前"默认路由先跳过、根本不查名"相比
+/// 多了一条出错路径，这是要的：一条查不到接口的默认路由，恰恰是最不该静默丢掉的那条。
+///
 /// # Errors
 ///
 /// - [`RouteTableParseError::UnparsableDestination`]：掩码不是合法的连续掩码；
@@ -886,9 +1059,8 @@ pub fn parse_route_print_routes(
                         dest: format!("{dest} 掩码 {mask}"),
                     });
                 };
-                if len == 0 {
-                    continue; // 默认路由，与 `parse_ip_route_line` / `parse_netstat_routes` 同口径。
-                }
+                // `len == 0` 就是默认路由；照 `{dest}/{len}` 拼出来的正是 `0.0.0.0/0`
+                // 这个规范形，不必单开一支。分桶见 `is_default_route`。
                 let key = interface_ip.to_string();
                 let Some(interface) = names.by_ip(&key) else {
                     return Err(RouteTableParseError::UnresolvedInterface {
@@ -911,9 +1083,7 @@ pub fn parse_route_print_routes(
                         dest: dest.to_string(),
                     });
                 };
-                if prefix == "::/0" {
-                    continue; // 默认路由。
-                }
+                // `::/0` 就是 IPv6 默认路由的规范形，照收（分桶见 `is_default_route`）。
                 let Some(interface) = names.by_index(index) else {
                     return Err(RouteTableParseError::UnresolvedInterface {
                         command: CMD,
@@ -955,16 +1125,31 @@ pub const IF_TYPE_TUNNEL: u32 = 131;
 
 /// IANA ifType `53` = `IF_TYPE_PROP_VIRTUAL`（厂商自有虚拟接口）。
 ///
-/// **实测正样本**：Tailscale 1.102.4 的 wintun 适配器 —— 别名 `Tailscale`、`ComponentID` =
-/// `Wintun`、`DriverDescription` = `Wintun Userspace Tunnel`、`Status` = `Up`，
-/// Windows 11 build 26200，见 `fixtures/windows-w207-wintun-present-2026-09-12.txt`。
-/// 在这份抓取入库之前，判据只认 [`IF_TYPE_TUNNEL`]，也就是**漏掉了它唯一真要防的那一个**。
+/// **实测正样本两族**（都在 Windows 11 build 26200 的同一台机器上）：
+///
+///  - **Tailscale 1.102.4 的 wintun**（2026-09-12）—— 别名 `Tailscale`、`ComponentID` =
+///    `Wintun`、`DriverDescription` = `Wintun Userspace Tunnel`、`Status` = `Up`，
+///    见 `fixtures/windows-w207-wintun-present-2026-09-12.txt`。在这份抓取入库之前，判据只认
+///    [`IF_TYPE_TUNNEL`]，也就是**漏掉了它唯一真要防的那一个**。
+///  - **OpenVPN 的 TAP-Windows Adapter V9**（2026-09-13）—— 别名 `OpenVPN TAP-Windows6`、
+///    `ComponentID` = `root\tap0901`、驱动 9.27.0.0、`Status` = `Up`、地址 `10.8.0.2`，
+///    见 `fixtures/windows-w207-ovpn-tun-connected-2026-09-13.txt`。
+///
+///    🔴 **这一行订正了一条写错的登记**：此前这里写的是「TAP-Windows 是以太网仿真驱动，
+///    **疑报 `6`**、未核实，若成立则本判据漏它」。实测是 `53` —— 白名单本来就覆盖它，
+///    判据一个字都不用改。推论值得记一笔：**「以太网仿真」是数据链路层的形态，与 `InterfaceType`
+///    这个用途分类不是一回事**，从前者推后者（`6` = 以太网）这一步本身就不成立。
+///
+///    同一份抓取还顺带给了「ifType 是驱动属性、不随链路状态漂」一个对照：另一份抓取里同一张
+///    TAP 适配器是 `Disconnected`，仍报 `53`。
 ///
 /// # 它比 [`IF_TYPE_TUNNEL`] 宽，这是**知情**取的
 ///
 /// `53` 是「厂商自有虚拟接口」这个大桶，不是「隧道」。装了 Hyper-V / VMware / Docker 的机器上
-/// 可能有别的虚拟适配器落在这个桶里（仓里没有这种样本 ⇒ **未核实**）。仍然收它，理由是
-/// **代价不对称**：
+/// 可能有别的虚拟适配器落在这个桶里 —— **Hyper-V 那一半 2026-09-13 被证否了**：同机装
+/// Hyper-V 之后多出来的 `vSwitch (Default Switch)` 与 `vEthernet (Default Switch)` 报的都是
+/// **`6`**（`fixtures/windows-w207-hyperv-present-2026-09-13.txt`）。VMware / Docker 仍**未核实**。
+/// 仍然收它，理由是**代价不对称**：
 ///
 ///  - **假阳性便宜**：一个非隧道的虚拟适配器被当成隧道，后果只是它宣告的网段进了**考察面**。
 ///    冲突判定在 `polaris_config_engine::builder::tunnel_conflict::detect_tunnel_conflicts`
@@ -987,8 +1172,19 @@ pub const IF_TYPE_PROP_VIRTUAL: u32 = 53;
 
 /// 隧道判据的**全部**取值：`InterfaceType ∈ {131, 53}`，一个字面量都不额外认。
 ///
-/// 写成 slice（而不是两个 `||`）有一条实用理由：判据面**可枚举** —— 测试能拿它做两份抓取的
+/// 写成 slice（而不是两个 `||`）有一条实用理由：判据面**可枚举** —— 测试能拿它做几份抓取的
 /// 差分，变异也一行改得完（删掉 `53` 那项 = 回到那个已知会漏 wintun 的旧判据）。
+///
+/// # 「不盲收」这条纪律的射程
+///
+/// 名单里只放**有真机正样本**的值。2026-09-13 那两份抓取把这条纪律的两个方向都验了一遍：
+///
+///  - 往里收的方向：TAP-Windows6 实测 `53` ⇒ 白名单**本来就够**，不用动；
+///  - 往外拦的方向：Hyper-V 的两张虚拟适配器实测 `6`，而 `6` 同时还是物理网卡与内核调试
+///    适配器的值 —— 把它收进来就是把一批真业务网卡判成隧道。
+///
+/// 同一条纪律在 Linux 侧的对应物是私有的 `ForeignTunnelProbeImpl::probe_linux` 的 link type 名单
+/// （只收 `tun` / `wireguard` / `ovpn` 三种有样本的）。
 pub const WINDOWS_TUNNEL_IF_TYPES: &[u32] = &[IF_TYPE_TUNNEL, IF_TYPE_PROP_VIRTUAL];
 
 /// Windows `Get-NetAdapter -IncludeHidden` → **全部**隧道接口名（`InterfaceAlias`）。
@@ -1008,9 +1204,24 @@ pub const WINDOWS_TUNNEL_IF_TYPES: &[u32] = &[IF_TYPE_TUNNEL, IF_TYPE_PROP_VIRTU
 /// | `以太网` | 6 | 0 | `PCI\VEN_1AF4&…` | `Red Hat VirtIO Ethernet Adapter` | Up | ❌ |
 /// | `以太网(内核调试器)` | 6 | 14 | `root\kdnic` | `Microsoft Kernel Debug Network Adapter` | Not Present | ❌ |
 ///
+/// 2026-09-13 同机又补了两份抓取（`…-ovpn-tun-connected-…` / `…-hyperv-present-…`），
+/// **三正两负**都是此前没有输入的形态：
+///
+/// | InterfaceAlias | InterfaceType | ComponentID | DriverDescription | Status | 是隧道 |
+/// |---|---|---|---|---|---|
+/// | `OpenVPN TAP-Windows6` | **53** | `root\tap0901` | `TAP-Windows Adapter V9`（9.27.0.0） | **Up**（`10.8.0.2`） | ✅ |
+/// | `OpenVPN TAP-Windows6`（另一份） | **53** | `root\tap0901` | 同上 | Disconnected | ✅ |
+/// | `Tailscale`（同两份） | **53** | `Wintun` | `Wintun Userspace Tunnel` | Up | ✅ |
+/// | `vSwitch (Default Switch)` | **6** | `vms_vsmp` | `Hyper-V Virtual Switch Extension Adapter` | Up | ❌ |
+/// | `vEthernet (Default Switch)` | **6** | （空） | `Hyper-V Virtual Ethernet Adapter` | Up | ❌ |
+///
 /// 两个值各是什么、`53` 为什么宽得起 → [`IF_TYPE_TUNNEL`] / [`IF_TYPE_PROP_VIRTUAL`] 的头注。
 /// **`53` 这一行是本表的全部意义**：2026-09-12 之前判据只认 `131`，而唯一真要防的那个适配器
-/// 报的是 `53`。
+/// 报的是 `53`。2026-09-13 那两份把这个值的两侧都补上了证据 —— 往里，TAP-Windows6 也报 `53`
+/// （此前登记的疑值 `6` 是错的）；往外，Hyper-V 的两张虚拟适配器**不**报 `53`。
+///
+/// 🔴 **`6` 在这张表里同时是三种东西**：真业务网卡、Hyper-V 虚拟交换机、内核调试适配器。
+/// 「不盲收 `6`」这句话此前只是推理，现在有真机数据。
 ///
 /// **另外两列抓回来了，但都不作交叉判据**，理由写在这张表里：
 ///
@@ -1028,14 +1239,24 @@ pub const WINDOWS_TUNNEL_IF_TYPES: &[u32] = &[IF_TYPE_TUNNEL, IF_TYPE_PROP_VIRTU
 ///     未登录那份（`tailscale status` 逐字 `Logged out.`，wintun 上只有 3 条 link-local）留作
 ///     噪声过滤的负样本。两侧分别钉在 `tests::windows_leg_on_the_connected_capture_keeps_business_prefixes`
 ///     与 `tests::windows_leg_on_the_logged_out_wintun_capture_sees_only_noise`。
-///  2. **`53` 的假阳性面没有样本**：仓里两份抓取里报 `53` 的只有 wintun 一行；Hyper-V / VMware /
-///     Docker 机器上有没有别的适配器报它，**未核实**。
-///  3. **TAP-Windows / OpenVPN（`tap0901`）与 Windows 内置 VPN（RAS：SSTP / L2TP / IKEv2）
-///     的 ifType 无样本**：前者疑报 `6`、后者疑报 `23`（PPP），**均未核实**；若成立，本判据漏它们。
-///     不盲收那两个值 —— `6` 是全部物理网卡、`23` 与 PPPoE 拨号同型，收了就是把一批真业务网卡
-///     判成隧道（那才是「报多」真正会翻车的方向）。
+///  2. ~~`53` 的假阳性面没有样本~~ —— **Hyper-V 那一半 2026-09-13 证否**：`vSwitch (Default Switch)`
+///     与 `vEthernet (Default Switch)` 报的是 `6`，不是 `53`。VMware / Docker 仍**未核实**。
+///     正负两半钉在 `fixture_harness::iftype_53_admits_the_two_vpn_drivers_but_not_the_hyperv_switches`。
+///  3. ~~TAP-Windows / OpenVPN（`tap0901`）的 ifType 无样本~~ —— **2026-09-13 实测 `53`**
+///     （此前登记的疑值 `6` 是错的，见上表最后一行）⇒ 判据本来就覆盖它。
+///     ~~RAS（SSTP / L2TP / IKEv2）疑报 `23`~~ —— **2026-09-13 实测订正**：那四张
+///     `WAN Miniport (L2TP/IKEv2/SSTP/PPTP)` 全报 **131**（本函数已经在收了，它们在路由表上
+///     一条都没有，故不产生任何假阳性）；报 `23` 的是 `WAN Miniport (PPPOE)` —— **接入协议
+///     不是隧道**，「不收 `23`」的结论对，理由此前写反了。
 ///
-/// 第 2、3 条由 `fixture_harness::the_wintun_capture_pins_iftype_53_and_two_driver_families_are_still_unverified`
+///     🔴 **但 RAS 这一族本函数根本判不出来，且判不出来不是它的错**：连接建立时承载流量的
+///     接口以 VPN 连接名为别名，**不在 `Get-NetAdapter` 的枚举里**（w207 实测 ifIndex 35 →
+///     `-IncludeHidden` 返回 0 条）。它由 [`parse_vpn_connection_names`] 承担 ——
+///     没有任何 cmdlet 给 RAS 接口一个 IANA ifType，这不是本函数能补的缺口。
+///
+///     **仍无样本**：WireGuard NT / 各家企业 VPN 客户端（Zscaler / GlobalProtect 之类）。
+///
+/// 第 2、3 条剩下的那半由 `fixture_harness::the_captures_pin_iftype_53_for_wintun_and_tap_windows6`
 /// 钉着：带这些适配器的抓取一入库它就会红，并要求按实测值重新评估判据面。
 ///
 /// # Errors
@@ -1102,24 +1323,144 @@ pub fn parse_windows_tunnel_interfaces(
     Ok(tunnels)
 }
 
-/// 从路由表里挑出**外来隧道**宣告的网段。
+/// `Get-VpnConnection` 的 `ConnectionStatus` 里表示「这条连接正在跑」的值。
 ///
-/// `tunnel_interfaces` 来自 `ip -o link show type tun|wireguard`；
+/// 逐字取自 2026-09-13 w207 实测（L2TP 已建立时那一行）。判据只认这一个值：
+/// 这张表列的是**配置**，`Disconnected` 的连接照样躺在里面，把整张表收进来就是「逢配置必报」
+/// —— 一台配了五个公司 VPN、一个都没连的机器会被判成有五条外来隧道。
+pub const VPN_CONNECTED_STATUS: &str = "Connected";
+
+/// Windows `Get-VpnConnection` → **已连接**的 VPN 连接名（= 路由表里的 `InterfaceAlias`）。
+///
+/// # 为什么非要这一支：RAS 的承载接口不在 `Get-NetAdapter` 里
+///
+/// 2026-09-13 w207 实测（L2TP 连接建立时）：承载流量的接口以**连接名**为别名
+/// （`PolarisProbeL2TP`，ifIndex 35），宣告 `0.0.0.0/0` metric 1 —— 一条抢默认路由的全隧道。
+/// 而 `Get-NetAdapter -IncludeHidden | Where InterfaceIndex -eq 35` 返回 **0 条**。
+/// 也就是说 [`parse_windows_tunnel_interfaces`] 的整个取材面看不到它，
+/// 于是装着企业 VPN（L2TP / IKEv2 / SSTP / PPTP —— 绝大多数企业 VPN 的形态）的机器
+/// 又会拿到那句自信的「无冲突」。
+///
+/// `Get-NetAdapter` 里那批 `WAN Miniport (L2TP/IKEv2/SSTP/PPTP)` 是恒 `Disconnected` 的
+/// **协议模板**，它们的 ifType `131` 说明不了任何正在跑的连接（它们在路由表上一条都没有）。
+/// 逐个 cmdlet 问过的结果：
+///
+/// | 来源 | 看得到 ifIndex 35 | 带类型信息 |
+/// |---|---|---|
+/// | `Get-NetAdapter -IncludeHidden` / `MSFT_NetAdapter` / `Win32_NetworkAdapter` | ❌ | — |
+/// | `Get-NetIPInterface` / `netsh interface ipv4 show interfaces` / `Get-NetRoute` | ✅ | 无 ifType |
+/// | `Get-VpnConnection` | ✅（按名） | **`TunnelType=L2tp`** |
+///
+/// **没有任何 cmdlet 给 RAS 接口一个 IANA ifType。**
+///
+/// # 为什么不用「集合差」（`Get-NetIPInterface` 减 `Get-NetAdapter`）
+///
+/// 那是**重实现引擎**：自己从两张表里推断「哪些接口是 VPN」，然后还得手工排掉
+/// `Loopback Pseudo-Interface 1` 之类本来就不在适配器枚举里的东西，假阳性面未知且会随
+/// Windows 版本漂。`Get-VpnConnection` 是 **Windows 自己对「哪些是 VPN」的回答**，
+/// 还顺带给出 `TunnelType` —— 判据该住在真值所在地，去问它，不该从 ifType 反推。
+///
+/// # 空输出是**结果**，不是失败
+///
+/// 绝大多数机器一条 VPN 连接都没配，这一支返回空表是常态。与
+/// [`parse_windows_tunnel_interfaces`]（空名单 = 「这台机器上没有隧道」，必须报错）不同 ——
+/// 那一支的空是「读法塌了」，这一支的空是「真的没有」。两者由**有没有表头**分开：
+/// 输出里有内容却认不出列头 ⇒ 读法塌了，报 [`RouteTableParseError::CaptureIncomplete`]。
+///
+/// # Errors
+///
+/// - [`RouteTableParseError::CaptureIncomplete`]：输出非空但切不出 `Name` / `ConnectionStatus`
+///   两列。折成空表的话，`Select-Object` 的列名一漂移就等于「这台机器上没有 VPN」。
+pub fn parse_vpn_connection_names(vpn_stdout: &str) -> Result<Vec<String>, RouteTableParseError> {
+    const CMD: &str = "Get-VpnConnection";
+    const NAME: &str = "Name";
+    const STATUS: &str = "ConnectionStatus";
+
+    if vpn_stdout.trim().is_empty() {
+        // 这个作用域里一条 VPN 连接都没有。**不是**「没查」—— 那一支由 `TunnelProbeOutcome`
+        // 在类型上独占，不由这个空 `Vec` 兼任。
+        return Ok(Vec::new());
+    }
+
+    let Some(table) = parse_format_table(vpn_stdout, &[NAME, STATUS]) else {
+        return Err(RouteTableParseError::CaptureIncomplete {
+            platform: Platform::Win,
+            command: CMD,
+            missing: "`Name` / `ConnectionStatus` 两列 —— RAS 隧道判据就是它们",
+            needed: "走 `Get-VpnConnection [-AllUserConnection] | Select-Object Name, ServerAddress, TunnelType, ConnectionStatus, SplitTunneling | Format-Table -AutoSize`；RAS 的承载接口不在 `Get-NetAdapter` 里，这条读法没有替代品",
+        });
+    };
+    let find = |name: &'static str| {
+        table
+            .column(name)
+            .ok_or(RouteTableParseError::MissingColumn {
+                command: CMD,
+                column: name,
+                header: table.header.join(" | "),
+            })
+    };
+    let name_idx = find(NAME)?;
+    let status_idx = find(STATUS)?;
+
+    let mut out = Vec::new();
+    for row in &table.rows {
+        let (Some(name), Some(status)) = (
+            FormatTable::cell(row, name_idx),
+            FormatTable::cell(row, status_idx),
+        ) else {
+            continue;
+        };
+        if status == VPN_CONNECTED_STATUS && !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// [`foreign_tunnel_routes`] 的两个桶。**两类事实走两条通道，这是本类型存在的全部理由。**
+///
+/// 默认路由与**任何**前缀相交。把它并进 [`Self::foreign`]，
+/// `detect_tunnel_conflicts` 会对我方每一条网段各报一次冲突 —— 一条全隧道就能把告警刷爆，
+/// 而刷爆的告警等于没有告警。分成两个字段之后，「默认路由被并回去」这件事**改不动类型也编不过**，
+/// 不是靠一句注释拦着。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForeignRoutes {
+    /// 外来隧道宣告的**具体网段**。**恒不含默认路由**（回归门
+    /// `default_route_gate::foreign_never_contains_a_default_route` 直接钉住这一条）。
+    pub foreign: Vec<RouteEntry>,
+    /// 外来隧道宣告的**默认路由**（`0.0.0.0/0` / `::/0`，族信息留在前缀里）。
+    pub default_routes: Vec<RouteEntry>,
+}
+
+/// 从路由表里挑出**外来隧道**宣告的路由，并按「具体网段 / 默认路由」分桶。
+///
+/// `tunnel_interfaces` 来自 `ip -o link show type tun|wireguard|ovpn`；
 /// `own_interfaces` 是 Polaris 自己的 TUN 接口名（不排除它，整张表都会被当成"别人的"）。
+///
+/// **`own_interfaces` 的剔除对两个桶一视同仁**：Polaris 自己的 TUN 同样宣告默认路由
+/// （auto_route 装的是 `0.0.0.0/1` + `128.0.0.0/1`，但用户自配或别的形态下也可能是 `/0`），
+/// 只剔一个桶就是把自己的那条报成「有人在抢默认路由」—— 自指告警与真告警混在一起，整条告警就废了。
+///
+/// **分桶只在这一处按规范形判**（[`is_default_route`]），不在三个解析器里各判一次：
+/// 三个平台的默认路由字面量各不相同，判据写一份比写三份可靠。
 #[must_use]
 pub fn foreign_tunnel_routes(
     routes: &[RouteEntry],
     tunnel_interfaces: &[String],
     own_interfaces: &[String],
-) -> Vec<RouteEntry> {
-    routes
-        .iter()
-        .filter(|r| {
-            tunnel_interfaces.iter().any(|t| t == &r.interface)
-                && !own_interfaces.iter().any(|o| o == &r.interface)
-        })
-        .cloned()
-        .collect()
+) -> ForeignRoutes {
+    let mut out = ForeignRoutes::default();
+    for route in routes.iter().filter(|r| {
+        tunnel_interfaces.iter().any(|t| t == &r.interface)
+            && !own_interfaces.iter().any(|o| o == &r.interface)
+    }) {
+        if is_default_route(&route.prefix) {
+            out.default_routes.push(route.clone());
+        } else {
+            out.foreign.push(route.clone());
+        }
+    }
+    out
 }
 
 /// 「按定义不可能是隧道宣告的业务网段」的五个块：v4/v6 各一对 link-local 与组播，外加受限广播。
@@ -1185,14 +1526,21 @@ pub const TUNNEL_PROBE_CMD_TIMEOUT: Duration = Duration::from_secs(5);
 /// 一次**成功**探测的事实。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ForeignTunnelSnapshot {
-    /// 本机全部隧道接口名（`type tun` ∪ `type wireguard`）。**含**我方 TUN ——
+    /// 本机全部隧道接口名（Linux 侧 = `type tun` ∪ `type wireguard` ∪ `type ovpn`）。**含**我方 TUN ——
     /// 这是「本机有哪些隧道」的原始事实，剔除只发生在 [`Self::foreign`] 上。
     pub tunnel_interfaces: Vec<String>,
-    /// 剔除 `own_interfaces` 之后，外来隧道宣告的路由。
+    /// 剔除 `own_interfaces` 之后，外来隧道宣告的**具体网段**。**恒不含默认路由**。
     ///
     /// 空 `Vec` 在**这一支**里是有意义的结果（看过了，本机没有别的隧道在宣告网段）——
     /// 它与「没看」的区别由 [`TunnelProbeOutcome`] 在类型上承担，不由这个 `Vec` 兼任。
     pub foreign: Vec<RouteEntry>,
+    /// 剔除 `own_interfaces` 之后，外来隧道宣告的**默认路由**（一条抢全部出站流量的全隧道）。
+    ///
+    /// 与 [`Self::foreign`] 同构、互斥，分成两个字段的理由见 [`ForeignRoutes`]。
+    /// 2026-09-13 w207 实测：Windows 内置 L2TP 连上之后，承载接口宣告 `0.0.0.0/0` metric 1，
+    /// 而它在 `foreign` 里剩下的全部业务网段只有一条 `10.55.0.10/32` —— 用户看到的是
+    /// 「某个隧道宣告了一个 /32」，真实情况是「它要了全部流量」。这个字段就是那半事实的通道。
+    pub default_routes: Vec<RouteEntry>,
 }
 
 /// 一次探测的结果。**两支必须在编译期就分得开，这是本类型存在的全部理由。**
@@ -1266,6 +1614,53 @@ const PS_GET_NETADAPTER: &str = "[Console]::OutputEncoding=[Text.Encoding]::UTF8
      NdisPhysicalMedium, ComponentID, DriverDescription, Name, InterfaceDescription, Status, MacAddress, \
      LinkSpeed | Format-Table -AutoSize";
 
+/// Windows 取**已连接的 VPN 连接**的 PowerShell 脚本（RAS 隧道判据的取材面）。
+///
+/// 管道与 `~/docs/polaris/scripts/polaris-collect-routes-windows.ps1` 的
+/// `@@@GET_VPNCONNECTION` 段**逐字同形** —— 解析器照那份抓取写的，命令一漂移解析的就是另一种输出。
+/// 开头那句设输出编码是**生产独有**的一步（理由同 [`PS_GET_NETIPADDRESS`]：VPN 连接名可以是中文）。
+///
+/// # 🔴 未核实：没有 `VpnClient` 模块的 SKU 上这条命令会怎样
+///
+/// `Get-VpnConnection` 属于 `VpnClient` 模块，Windows 客户端 SKU 自带；**Server Core / 精简版
+/// 有没有它，仓里没有任何证据**。若该 cmdlet 不存在，PowerShell 大概率以非零码退出，
+/// 而 [`crate::exec`] 对非零退出一律 `Err` ⇒ 整次 Windows 探测变成 `Err`。
+///
+/// 那个方向是**安全**的（`Err` 在本模块的类型里是「拿不到事实」，绝不会伪装成「无冲突」），
+/// 但它是一次**可用性回归**：这些机器此前探得动。如实登记，不照记忆加一层
+/// `if (Get-Command …)` 守卫 —— 那层守卫的必要性同样需要真机验一次，而「照记忆写防御」
+/// # `Get-Command` 守卫不是"照记忆写防御"
+///
+/// `-ErrorAction SilentlyContinue` 管不了**命令不存在**：那是解析期的
+/// `CommandNotFoundException`，PowerShell 仍以非零退出，而 [`crate::exec`] 对非零一律 `Err`
+/// ⇒ 没装 `VpnClient` 模块的 SKU（Server Core 等）上，整次 Windows 探测会从"探得动"
+/// 退化成 `Err`。方向仍是安全的（`Err` 在本模块类型里是"拿不到事实"，绝不会伪装成"无冲突"），
+/// 但那是**本腿引入的可用性回归**，不是既有行为。
+///
+/// 守卫本身是无副作用的存在性检查：有模块时逐字等价于没有它（由 RAS 夹具那几道门钉住），
+/// 无模块时输出空 —— 而"空"在本模块里已经有确定语义（查了，这台机器没有 VPN 连接），
+/// 与"没查"由 [`TunnelProbeOutcome`] 在类型上分开。
+///
+/// **如实登记**：无 `VpnClient` 模块的机器上没有抓取，这条守卫的行为未在真机上验过；
+/// 受限语言模式（Constrained Language Mode）下 `Get-Command` 的行为同样未验。
+/// 正是本模块反复被打脸的那一半。下一次拿到 Server Core 抓取时按实测决定。
+const PS_GET_VPNCONNECTION: &str = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+     if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) { \
+     Get-VpnConnection -ErrorAction SilentlyContinue | \
+     Select-Object Name, ServerAddress, TunnelType, ConnectionStatus, SplitTunneling | \
+     Format-Table -AutoSize }";
+
+/// 同上，**全局作用域**（`-AllUserConnection`）。
+///
+/// 两个作用域**都要查**，不是冗余：不带参数只列当前用户自己建的连接，管理员按「所有用户」
+/// 建的连接只在 `-AllUserConnection` 里 —— 后者恰恰是企业下发配置的常见形态。
+/// 只查一个作用域会在「VPN 是 IT 推下来的」这种最典型的场景上静默漏掉。
+const PS_GET_VPNCONNECTION_ALLUSER: &str = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+     if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) { \
+     Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue | \
+     Select-Object Name, ServerAddress, TunnelType, ConnectionStatus, SplitTunneling | \
+     Format-Table -AutoSize }";
+
 /// [`ForeignTunnelProbe`] 的生产实现（运行时 [`Platform`] 分派 + [`CommandRunner`] 下发；零 cfg）。
 pub struct ForeignTunnelProbeImpl<R: CommandRunner> {
     runner: R,
@@ -1304,12 +1699,25 @@ impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
             .map_err(SystemIntegrationError::route)
     }
 
-    /// Linux 腿：四条只读 `ip` 查询。
+    /// Linux 腿：五条只读 `ip` 查询。
     ///
-    /// 四条都是**只读**查询（`show`）：读路由表 / 链路表，不发包、不改任何内核状态、非 root。
+    /// 五条都是**只读**查询（`show`）：读路由表 / 链路表，不发包、不改任何内核状态、非 root。
     /// `ip -o` 一条记录一行（多路径的续行用字面量 `\` + 制表符接在同一行里），正是那些解析器的取材形态。
     /// 实测（2026-09-11 本机 iproute2）：`link show type <未知类型>` 不报错、返回空 + rc=0，
-    /// 故没有 wireguard 模块的内核上这条腿是安全的空，不会把整次探测拖成 `Err`。
+    /// 故没有 wireguard / ovpn 模块的内核上那两条腿是安全的空，不会把整次探测拖成 `Err`。
+    ///
+    /// # 隧道 link type 的名单为什么恰好是 `tun` / `wireguard` / `ovpn`
+    ///
+    /// 三种各有真机正样本：前两种是 2026-09-11 本机，`ovpn` 是 2026-09-13 VM185 上
+    /// OpenVPN 2.7 的 ovpn-dco 设备（**名字叫 `tun0`、link type 却是 `ovpn`**，
+    /// `type tun` 查不到它 —— 详见模块头注）。
+    ///
+    /// `gre` / `sit` / `ipip` / `vti` / `xfrm` / `ip6tnl` 也都是隧道 link type，**没有加进来**：
+    /// 仓里一份实测样本都没有，加了就是照记忆写判据 —— 而本模块每一次被真机打脸，都是在
+    /// 「照记忆写」那一半上（`53` 那次、这次的 `ovpn` 都是）。多查一条 `ip link show` 很便宜，
+    /// 但「判据面里混着没人验过的项」会让下一个人分不清哪些结论有收据。
+    /// 这条缺口由 `fixture_harness::linux_tunnel_link_types_are_exactly_the_three_with_samples`
+    /// 钉着：哪天有这些类型的抓取入库，它会红并要求按实测重新评估。
     fn probe_linux(
         &self,
         own_interfaces: &[String],
@@ -1318,11 +1726,13 @@ impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
         let route_v6 = self.run("ip", &["-o", "-6", "route", "show"])?;
         let tun_links = self.run("ip", &["-o", "link", "show", "type", "tun"])?;
         let wireguard_links = self.run("ip", &["-o", "link", "show", "type", "wireguard"])?;
+        let ovpn_links = self.run("ip", &["-o", "link", "show", "type", "ovpn"])?;
         Ok(TunnelProbeOutcome::Probed(assemble_linux_probe(
             &route_v4,
             &route_v6,
             &tun_links,
             &wireguard_links,
+            &ovpn_links,
             own_interfaces,
         )))
     }
@@ -1350,12 +1760,17 @@ impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
             .map_err(|e| SystemIntegrationError::route(e.to_string()))
     }
 
-    /// Windows 腿：四条只读查询。
+    /// Windows 腿：六条只读查询。
     ///
-    /// `route print` 是查询式子命令（`add`/`delete`/`change` 才写内核），两条 cmdlet 是 `Get-`；
-    /// 四条都不发包、不改状态、不需要管理员。argv 与
+    /// `route print` 是查询式子命令（`add`/`delete`/`change` 才写内核），四条 cmdlet 是 `Get-`；
+    /// 六条都不发包、不改状态、不需要管理员。argv 与
     /// `~/docs/polaris/scripts/polaris-collect-routes-windows.ps1` 的
-    /// `@@@ROUTE_PRINT_4/6`、`@@@GET_NETIPADDRESS`、`@@@GET_NETADAPTER` 四段逐字对应。
+    /// `@@@ROUTE_PRINT_4/6`、`@@@GET_NETIPADDRESS`、`@@@GET_NETADAPTER`、
+    /// `@@@GET_VPNCONNECTION`、`@@@GET_VPNCONNECTION_ALLUSER` 六段逐字对应。
+    ///
+    /// **后两条是 2026-09-13 补的**：RAS 族（L2TP / IKEv2 / SSTP / PPTP）连上之后，承载流量的
+    /// 接口**不在 `Get-NetAdapter` 里**，ifType 白名单那条腿看不见它 —— 详见
+    /// [`parse_vpn_connection_names`] 的头注。
     ///
     /// **为什么不用一条 `Get-NetRoute` 代掉两条 `route print` + 对照表**（权衡留档）：
     /// `Get-NetRoute` 一列就给出 `InterfaceAlias`，命令能少两条、也不碰本地化表头。
@@ -1372,9 +1787,19 @@ impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
         let route_v6 = self.run(&self.route_exe, &["print", "-6"])?;
         let addresses = self.run_powershell(PS_GET_NETIPADDRESS)?;
         let adapters = self.run_powershell(PS_GET_NETADAPTER)?;
-        assemble_windows_probe(&route_v4, &route_v6, &addresses, &adapters, own_interfaces)
-            .map(TunnelProbeOutcome::Probed)
-            .map_err(|e| SystemIntegrationError::route(e.to_string()))
+        let vpn = self.run_powershell(PS_GET_VPNCONNECTION)?;
+        let vpn_alluser = self.run_powershell(PS_GET_VPNCONNECTION_ALLUSER)?;
+        assemble_windows_probe(
+            &route_v4,
+            &route_v6,
+            &addresses,
+            &adapters,
+            &vpn,
+            &vpn_alluser,
+            own_interfaces,
+        )
+        .map(TunnelProbeOutcome::Probed)
+        .map_err(|e| SystemIntegrationError::route(e.to_string()))
     }
 
     fn run_powershell(&self, script: &str) -> Result<String, SystemIntegrationError> {
@@ -1403,29 +1828,44 @@ impl<R: CommandRunner> ForeignTunnelProbe for ForeignTunnelProbeImpl<R> {
     }
 }
 
-/// 四段 stdout → 探测事实（纯函数）。
+/// 五段 stdout → 探测事实（纯函数）。
 ///
 /// 命令执行与解析拆开，是为了让单测**注入字符串**而不必 spawn `ip`（与本模块既有单测同形态）。
+///
+/// 三段链路输出的**并集**才是隧道名单：任何**单段**都可以合法地为空（那台机器没装
+/// wireguard / ovpn 模块，`ip link show type <未知>` 返回空 + rc=0）。按段判「空 = 抓漏了」
+/// 会把「这台机器没有这种隧道」误报成缺陷。
 #[must_use]
 pub fn assemble_linux_probe(
     route_v4_stdout: &str,
     route_v6_stdout: &str,
     tun_link_stdout: &str,
     wireguard_link_stdout: &str,
+    ovpn_link_stdout: &str,
     own_interfaces: &[String],
 ) -> ForeignTunnelSnapshot {
-    let mut routes = parse_ip_routes(route_v4_stdout);
-    routes.extend(parse_ip_routes(route_v6_stdout));
+    let mut routes = parse_ip_routes(route_v4_stdout, IpFamily::V4);
+    routes.extend(parse_ip_routes(route_v6_stdout, IpFamily::V6));
     let mut tunnel_interfaces = parse_ip_link_names(tun_link_stdout);
-    for name in parse_ip_link_names(wireguard_link_stdout) {
+    // 去重按**名字**：`ip link show type X` 的输出之间理论上不重叠，但 ovpn-dco 的设备名
+    // 与传统 tun 撞名（两边都爱叫 `tunN`），一旦哪天内核把同一个设备同时报进两张表，
+    // 重复名字会让 `foreign` 里同一条路由出现两遍。
+    for name in parse_ip_link_names(wireguard_link_stdout)
+        .into_iter()
+        .chain(parse_ip_link_names(ovpn_link_stdout))
+    {
         if !tunnel_interfaces.contains(&name) {
             tunnel_interfaces.push(name);
         }
     }
-    let foreign = foreign_tunnel_routes(&routes, &tunnel_interfaces, own_interfaces);
+    let ForeignRoutes {
+        foreign,
+        default_routes,
+    } = foreign_tunnel_routes(&routes, &tunnel_interfaces, own_interfaces);
     ForeignTunnelSnapshot {
         tunnel_interfaces,
         foreign,
+        default_routes,
     }
 }
 
@@ -1435,6 +1875,10 @@ pub fn assemble_linux_probe(
 ///
 ///  - **返回 `Result`**：`netstat` / `ifconfig` 的解析器会失败（截断的抓取、认不出的目的地），
 ///    而 `ip -o` 那侧是「坏行跳过」。一份少一半的 `Ok` 在这里会被读成事实。
+///  - **默认路由那一批基本上是空的**：mac 的 `netstat -rn -f inet6` 里每个 utun 上都挂着一条
+///    `default`（三份 p101 抓取里各 8–10 条，是任何一台 mac 的常态），但它们全是作用域路由
+///    （`Flags` 带 `I` = `RTF_IFSCOPE`），按定义不在全局转发面上竞争，由
+///    [`parse_netstat_routes`] 判掉 —— 理由与正负样本写在那里。
 ///  - **`foreign` 里会有 link-local 与组播**：`netstat -rn` 打印的表比 `ip -o route show` 宽
 ///    —— 每个 utun 上都有 `fe80::/64`、`ff00::/8`、`ff01::/32`、`ff02::/32`。它们确实是那个
 ///    隧道宣告的路由（这里只负责把事实取回来），与 FakeIP / Mesh / TUN 三类判据面不相交，
@@ -1455,40 +1899,72 @@ pub fn assemble_macos_probe(
     ifconfig_stdout: &str,
     own_interfaces: &[String],
 ) -> Result<ForeignTunnelSnapshot, RouteTableParseError> {
-    let mut routes = parse_netstat_routes(netstat_v4_stdout)?;
-    routes.extend(parse_netstat_routes(netstat_v6_stdout)?);
+    let mut routes = parse_netstat_routes(netstat_v4_stdout, IpFamily::V4)?;
+    routes.extend(parse_netstat_routes(netstat_v6_stdout, IpFamily::V6)?);
     let tunnel_interfaces = parse_macos_tunnel_interfaces(ifconfig_stdout)?;
-    let foreign = foreign_tunnel_routes(&routes, &tunnel_interfaces, own_interfaces);
+    let ForeignRoutes {
+        foreign,
+        default_routes,
+    } = foreign_tunnel_routes(&routes, &tunnel_interfaces, own_interfaces);
     Ok(ForeignTunnelSnapshot {
         tunnel_interfaces,
         foreign,
+        default_routes,
     })
 }
 
-/// 四段 stdout → 探测事实（Windows；纯函数）。
+/// 六段 stdout → 探测事实（Windows；纯函数）。
 ///
-/// 与 mac/Linux 那两支的真差异只有一处：路由表**要先有对照表**才落得到接口名上，
-/// 故对照表解析失败时整次探测失败，绝不退成「路由有了、名字将就用 IP」——
-/// 后者给出的是一份名字对不上任何隧道的路由表，也就是一句自信的「无冲突」。
+/// 与 mac/Linux 那两支的真差异有两处：
+///
+///  - 路由表**要先有对照表**才落得到接口名上，故对照表解析失败时整次探测失败，绝不退成
+///    「路由有了、名字将就用 IP」—— 后者给出的是一份名字对不上任何隧道的路由表，
+///    也就是一句自信的「无冲突」；
+///  - 隧道名单来自**两个互不覆盖的来源**：`Get-NetAdapter` 的 ifType 白名单（协议隧道 + 用户态
+///    VPN 虚拟网卡）与 `Get-VpnConnection` 的已连接连接名（RAS 族 —— 它们的承载接口**根本不在**
+///    适配器枚举里）。少任何一边都是一族真隧道静默失联，详见
+///    [`parse_vpn_connection_names`] 的头注。
 ///
 /// # Errors
 ///
-/// 见 [`RouteTableParseError`]：四段任一解析失败即整体失败，不产出半份事实。
+/// 见 [`RouteTableParseError`]：六段任一解析失败即整体失败，不产出半份事实。
+/// 两段 VPN 输出**为空不算失败**（那是「这台机器上没有 VPN 连接」这个常态结果）。
 pub fn assemble_windows_probe(
     route_print_v4_stdout: &str,
     route_print_v6_stdout: &str,
     get_netipaddress_stdout: &str,
     get_netadapter_stdout: &str,
+    get_vpnconnection_stdout: &str,
+    get_vpnconnection_alluser_stdout: &str,
     own_interfaces: &[String],
 ) -> Result<ForeignTunnelSnapshot, RouteTableParseError> {
     let names = parse_get_netipaddress(get_netipaddress_stdout)?;
     let mut routes = parse_route_print_routes(route_print_v4_stdout, &names)?;
     routes.extend(parse_route_print_routes(route_print_v6_stdout, &names)?);
-    let tunnel_interfaces = parse_windows_tunnel_interfaces(get_netadapter_stdout)?;
-    let foreign = foreign_tunnel_routes(&routes, &tunnel_interfaces, own_interfaces);
+    let mut tunnel_interfaces = parse_windows_tunnel_interfaces(get_netadapter_stdout)?;
+    // RAS 那一族（L2TP / IKEv2 / SSTP / PPTP）的承载接口**根本不在** `Get-NetAdapter` 里，
+    // 只能问 Windows 自己 —— 理由与实测逐条写在 `parse_vpn_connection_names` 的头注里。
+    // 两个作用域都要并：不带参数 = 当前用户的连接，`-AllUserConnection` = 全局的。
+    for name in parse_vpn_connection_names(get_vpnconnection_stdout)?
+        .into_iter()
+        .chain(parse_vpn_connection_names(
+            get_vpnconnection_alluser_stdout,
+        )?)
+    {
+        // 同一条连接可能两个作用域都列出来；名字就是路由表里的 `InterfaceAlias`，
+        // 重复名字会让 `foreign` 里同一条路由出现两遍。
+        if !tunnel_interfaces.contains(&name) {
+            tunnel_interfaces.push(name);
+        }
+    }
+    let ForeignRoutes {
+        foreign,
+        default_routes,
+    } = foreign_tunnel_routes(&routes, &tunnel_interfaces, own_interfaces);
     Ok(ForeignTunnelSnapshot {
         tunnel_interfaces,
         foreign,
+        default_routes,
     })
 }
 

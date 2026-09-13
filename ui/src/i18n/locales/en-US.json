@@ -927,6 +927,7 @@
       "tunnelConflictFound": "Other tunnels on this machine claim the same ranges as Polaris ({{count}}):",
       "tunnelConflictKindFakeIp": "overlaps the FakeIP range",
       "tunnelConflictKindMesh": "overlaps a mesh range",
+      "tunnelConflictKindDefaultRoute": "is taking over the default route (full tunnel) — it and the Polaris TUN both claim all outbound traffic",
       "tunnelConflictKindTun": "overlaps the TUN interface address",
       "forceRouteBlock": "Mesh range settlement",
       "forceRouteHint": "A range can only point at one outbound, so the node that declares it first wins. Below is the settlement the backend computes from the current config and the addresses it observed at runtime — the same computation the core rules come from.",

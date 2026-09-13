@@ -507,7 +507,7 @@ describe('门 2 · 外来隧道冲突报告的线格式两侧相等', () => {
     }
   });
 
-  it('ConflictKind：三类冲突逐字相等', () => {
+  it('ConflictKind：四类冲突逐字相等', () => {
     expect(tsUnionLiterals(TUNNEL_TS, 'TunnelConflictKind')).toEqual(
       rustEnumVariants(TUNNEL_LIB_RS, 'ConflictKind'),
     );
@@ -530,7 +530,14 @@ describe('门 2 · 外来隧道冲突报告的线格式两侧相等', () => {
 
   it('正向对照：`probed` 支的载荷键真的被解析出来了（不是空集在自相等）', () => {
     expect(ARMS.get('probed')).toEqual(
-      ['conflicts', 'criteria', 'foreignTunnels', 'status', 'suppressedRoutes'].sort(),
+      [
+        'conflicts',
+        'criteria',
+        'foreignDefaultRoutes',
+        'foreignTunnels',
+        'status',
+        'suppressedRoutes',
+      ].sort(),
     );
     expect(rustStructFields(TUNNEL_LIB_RS, 'ConflictCriteria')).toContain('fakeipRanges');
   });

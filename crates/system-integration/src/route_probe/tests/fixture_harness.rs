@@ -21,14 +21,15 @@
 //! 内容按独占一行的 `@@@<分节ID>` 切段，段内**逐字**保留命令输出。
 
 use crate::route_probe::{
-    expand_netstat_destination, parse_get_netipaddress, parse_macos_interface_flags,
+    assemble_linux_probe, assemble_macos_probe, expand_netstat_destination, parse_get_netipaddress,
+    parse_ip_link_names, parse_ip_routes, parse_macos_interface_flags,
     parse_macos_tunnel_interfaces, parse_netstat_routes, parse_route_print_routes,
-    parse_windows_tunnel_interfaces, RouteEntry, RouteTableParseError, WindowsInterfaceNames,
-    MAC_TUNNEL_FLAG,
+    parse_vpn_connection_names, parse_windows_tunnel_interfaces, ForeignTunnelSnapshot, IpFamily,
+    RouteEntry, RouteTableParseError, WindowsInterfaceNames, MAC_TUNNEL_FLAG,
 };
 use polaris_helper_proto::codec::is_valid_cidr;
 use polaris_helper_proto::Platform;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 /// 夹具目录相对 crate 根的位置（锚在 crate 根，不锚在本文件 —— 理由见 `polaris-source-probe` 头注）。
@@ -71,6 +72,82 @@ const WINDOWS_FIXTURE_WINTUN: &str = "windows-w207-wintun-present-2026-09-12.txt
 /// 于是这一对是「噪声过滤该收什么、不该收什么」的天然正负样本。
 const WINDOWS_FIXTURE_TS_ON: &str = "windows-w207-ts-on-2026-09-12.txt";
 
+/// 2026-09-13 同机、**装了 OpenVPN 的 TAP-Windows6 适配器并已连上**那份抓取。
+///
+/// 它把「TAP-Windows / OpenVPN 那族驱动报什么 ifType」从**推测**（此前登记的疑值 `6`）
+/// 变成**实测**：`OpenVPN TAP-Windows6` 的 `InterfaceType` 逐字是 **`53`**
+/// （`ComponentID` = `root\tap0901`、`DriverDescription` = `TAP-Windows Adapter V9`、
+/// `Status` = `Up`、`10.8.0.2`）—— 也就是说现有白名单 `{131, 53}` **本来就覆盖它**，
+/// 不需要改判据；该改的是那条写错了的登记。
+const WINDOWS_FIXTURE_TAP: &str = "windows-w207-ovpn-tun-connected-2026-09-13.txt";
+
+/// 2026-09-13 同机、**装了 Hyper-V 之后**那份抓取 —— `53` 假阳性面的**负向证据**。
+///
+/// `vSwitch (Default Switch)` 与 `vEthernet (Default Switch)` 的 `InterfaceType` 都是 **`6`**，
+/// 不是 `53`。此前「装了 Hyper-V / VMware / Docker 的机器上可能有别的适配器落进 `53` 这个
+/// 宽桶」是一条**登记在案的未知风险**；这份抓取把 Hyper-V 那一半证否了。
+///
+/// 同一份抓取反向印证了另一件事：`6` **绝对不能**收进白名单 —— 它同时是物理网卡
+/// （`Red Hat VirtIO Ethernet Adapter`）、Hyper-V 虚拟交换机、以及内核调试适配器。
+const WINDOWS_FIXTURE_HYPERV: &str = "windows-w207-hyperv-present-2026-09-13.txt";
+
+/// 2026-09-13 同机、**L2TP 连接已建立**那份抓取 —— Windows RAS 族的第一份真机样本。
+///
+/// 它坐实的缺陷：承载流量的接口以 VPN 连接名为别名（`PolarisProbeL2TP`，ifIndex 35，
+/// 宣告 `0.0.0.0/0` metric 1），而 `Get-NetAdapter -IncludeHidden` 对该 index **返回 0 条** ——
+/// ifType 白名单那条腿整个取材面看不到它。判据只能问 `Get-VpnConnection`。
+///
+/// 同一份里 `WAN Miniport (L2TP/IKEv2/SSTP/PPTP)` 的 ifType 实测 **131**、
+/// `WAN Miniport (PPPOE)` 实测 **23**、`WAN Miniport (IP/IPv6/Network Monitor)` 实测 **6** ——
+/// 「RAS 疑报 23」那条旧登记的真相：`23` 是 **PPPoE**（接入协议不是隧道），「不收 23」是对的。
+const WINDOWS_FIXTURE_RAS: &str = "windows-w207-ras-l2tp-connected-2026-09-13.txt";
+
+/// 虚拟化栈全家福（2026-09-13 w207）：Hyper-V 三型交换机（Default / Internal / Private）、
+/// Tailscale(53)、TAP-Windows6(53)、四张 RAS 协议模板(131)、PPPoE(23)、物理网卡(6)
+/// **同时在场**。目前取材面最全的一份 —— 「不误报」（虚拟网卡不进名单）与「不漏报」
+/// （真隧道仍进名单）两个方向能从同一份输入上取。
+///
+/// 它证否的是 `53` 的假阳性面：Hyper-V 三型交换机全部报 **6**，一条都不沾 `53`。
+/// 反向同时坐实「`6` 不可收」—— 同一台机器上 `6` 既是物理网卡（Red Hat VirtIO）、
+/// 又是三个虚拟交换机扩展适配器、两个虚拟以太网、三张 WAN Miniport、内核调试适配器。
+const WINDOWS_FIXTURE_VIRT: &str = "windows-w207-virtualization-stack-2026-09-13.txt";
+
+/// 2026-09-13 VM185 上 OpenVPN 2.7 的 **ovpn-dco** 抓取（Linux 侧第一份真机夹具）。
+///
+/// 它证的是一件照记忆绝对写不出来的事：**设备名叫 `tun0` / `tun1`，link type 却是 `ovpn`**。
+/// `ip -o link show type tun` 在这台机器上只回 `tap0`，两条 OpenVPN 隧道一条都查不到。
+const LINUX_FIXTURE_OVPN_DCO: &str = "linux-vm185-ovpn-dco-2026-09-13.txt";
+
+/// 2026-09-13 的 macOS **交叉对差**抓取：`netstat -rn` 之外再要一路 `route -n get` 的读数。
+///
+/// `route -n get` 走 PF_ROUTE 的 `RTM_GET`，与 `netstat -rn` 的路由表 dump 是**不同的内核
+/// 接口** —— 这是 macOS 侧第一个能把解析器顶红的独立读数（Windows 侧一直有
+/// `route print` 与 `Get-NetRoute` 两路，mac 侧此前只有一路）。
+const MACOS_FIXTURE_ROUTE_GET: &str = "macos-p101-route-get-ts-on-2026-09-13.txt";
+
+/// **Parallels Desktop 运行中**的抓取（2026-09-13 p101）。虚拟化是常规场景，
+/// 判据要在那种环境下被验证过 —— 这份是 macOS 侧的输入面。
+///
+/// PD 18+ 建的是 `vmenet0/1/2` + `bridge100/101/102`（不是老版本的 `vnic*`），
+/// 六个**全是 `BROADCAST` 型、零 `POINTOPOINT`** ⇒ 判据一个都不收。
+/// 这份同时带着 Tailscale 连接态（utun11），所以"不误报"与"不漏报"能从同一份输入上取。
+const MACOS_FIXTURE_PARALLELS: &str = "macos-p101-parallels-running-2026-09-13.txt";
+
+/// **连接态**的 macOS 抓取：`(文件名, tailnet 网段总条数, 其中挂在 utun11 上的条数)`。
+///
+/// 写成一张表而不是一个「是不是连接态」的布尔：两份抓取隔了一天，tailnet 里的 peer 数就不同了
+/// （29/28 → 32/31）。拿同一组数字去套两份会红得没有信息量，而把数字整个删掉又会让
+/// 「换样本时提醒重核」这件事消失。逐份登记是唯一同时保住这两样的写法。
+///
+/// 不在这张表里的 macOS 抓取 = 断开态，一条 tailnet 网段都不许有（噪声过滤的负样本）。
+const MACOS_CONNECTED_CAPTURES: &[(&str, usize, usize)] = &[
+    (MACOS_FIXTURE_TS_ON, 29, 28),
+    (MACOS_FIXTURE_ROUTE_GET, 32, 31),
+    // PD 运行中那份与前一份同日、同 tailnet ⇒ 同样是 32/31（差的那一条是 `fd7a:…::57/128`
+    // 落在 `lo0` 上：本机自己的 tailnet 地址，不属于 utun11）。
+    (MACOS_FIXTURE_PARALLELS, 32, 31),
+];
+
 /// 判据②专用的**合成**样本：把上面那份的本地化表头换成 en-US，路由数据行一字节不动。
 /// 它在 `synthetic/` 子目录里，故不进 [`scan`] 的正常取材面（扫描只读直接子项）。
 const WINDOWS_SYNTHETIC_EN: &str = "synthetic/windows-w207-route-print-en-headers.txt";
@@ -90,7 +167,22 @@ const PLATFORMS: &[(&str, &str, &str)] = &[
         "Windows",
         "~/docs/polaris/scripts/polaris-collect-routes-windows.ps1",
     ),
+    // ⚠️ Linux 侧**还没有采集脚本**（mac/win 那两条有）。如实写成手抓步骤，而不是指一个
+    // 不存在的路径 —— 「缺席被点名」这套报告的价值全在它说的话是真的。
+    (
+        "linux",
+        "Linux",
+        "（暂无采集脚本，手抓：`ip -o route show` / `ip -o -6 route show` / \
+         `ip -o link show type {tun,wireguard,ovpn}` / `ip -d link show` / `ip -br addr`）",
+    ),
 ];
+
+/// Linux 的三条 `ip -o link show type <T>` 查询各自的分节 ID。
+///
+/// 顺序与 `probe_linux` 的查询序一致。**单条为空是合法的**（那台机器没装 wireguard / ovpn
+/// 模块，`ip link show type <未知>` 返回空 + rc=0）—— 「非空」这条只在三者的**并集**上成立，
+/// 故 [`absorb_file`] 按文件断一次，不按分节断。
+const LINUX_LINK_SECTIONS: &[&str] = &["LINK_TUN", "LINK_WIREGUARD", "LINK_OVPN"];
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURES_REL)
@@ -140,6 +232,10 @@ fn windows_fixture_names() -> Vec<String> {
             WINDOWS_FIXTURE,
             WINDOWS_FIXTURE_WINTUN,
             WINDOWS_FIXTURE_TS_ON,
+            WINDOWS_FIXTURE_TAP,
+            WINDOWS_FIXTURE_HYPERV,
+            WINDOWS_FIXTURE_RAS,
+            WINDOWS_FIXTURE_VIRT,
         ],
     )
 }
@@ -147,8 +243,18 @@ fn windows_fixture_names() -> Vec<String> {
 fn macos_fixture_names() -> Vec<String> {
     fixture_names_starting_with(
         "macos-",
-        &[MACOS_FIXTURE, MACOS_FIXTURE_FULL, MACOS_FIXTURE_TS_ON],
+        &[
+            MACOS_FIXTURE,
+            MACOS_FIXTURE_FULL,
+            MACOS_FIXTURE_TS_ON,
+            MACOS_FIXTURE_ROUTE_GET,
+            MACOS_FIXTURE_PARALLELS,
+        ],
     )
+}
+
+fn linux_fixture_names() -> Vec<String> {
+    fixture_names_starting_with("linux-", &[LINUX_FIXTURE_OVPN_DCO])
 }
 
 /// 这条前缀是不是 tailnet（自建 headscale）装上去的**业务**网段 —— 按抓取里**脱敏后**的形态写。
@@ -249,11 +355,19 @@ fn cut_adapter_table(adapters: &str) -> AdapterTable {
 
 /// 取某个分节的**分节体**；没有该分节直接 panic（断言写错了分节名时当场说出来，不是静默空串）。
 pub(super) fn section(raw: &str, id: &str) -> String {
+    section_opt(raw, id).unwrap_or_else(|| panic!("样本里没有 @@@{id} 分节"))
+}
+
+/// 取某个分节的**分节体**，没有该分节时 `None`。
+///
+/// 与 [`section`] 的区别只在缺席的处置：这一支给调用方自己决定。**默认仍该用 [`section`]** ——
+/// 只有「采集脚本后来才加的分节，老夹具里天然没有」这一种情形才走这里，且调用方必须说清楚
+/// 它把缺席当成什么。
+pub(super) fn section_opt(raw: &str, id: &str) -> Option<String> {
     split_sections(raw)
         .into_iter()
         .find(|(sid, _)| sid == id)
-        .unwrap_or_else(|| panic!("样本里没有 @@@{id} 分节"))
-        .1
+        .map(|(_, body)| body)
 }
 
 /// 把一份抓取切成 `(分节 ID, 分节体)`。
@@ -306,6 +420,14 @@ enum SectionKind {
     WinInterfaceNames,
     /// Windows 适配器枚举。
     WinTunnelInterfaces,
+    /// Linux `ip -o route show` / `ip -o -6 route show`（v4 / v6 共用一个解析器）。
+    LinuxIpRoutes,
+    /// Linux `ip -o link show type <T>` → 隧道接口名（三条查询各一个分节，见 [`LINUX_LINK_SECTIONS`]）。
+    LinuxTunnelLinks,
+    /// Windows `Get-VpnConnection`（两个作用域各一个分节）→ 已连接的 VPN 连接名。
+    ///
+    /// 它是**判据取材面**而不是备查：RAS 族的承载接口根本不在 `Get-NetAdapter` 里。
+    WinVpnConnections,
     /// 采集回来**备查**、不是判据取材面的分节。
     ReferenceOnly,
 }
@@ -319,19 +441,69 @@ enum SectionKind {
 /// 但 Windows 的生产读法定在 `route print`（原生 exe，任何 SKU 都有；`Get-NetRoute` 依赖
 /// NetTCPIP 模块，Server Core / 精简版可能没有）。留它在，是为了下一份抓取能跟 `route print`
 /// 的解析结果对差。
+///
+/// **同一条命令在两代采集脚本里叫过两个名字**（mac 侧 `V4`/`V6`/`IFCONFIG` →
+/// `V4_NETSTAT`/`V6_NETSTAT`/`IFCONFIG_FLAGS`）。两套都认，别名表在 [`MACOS_NETSTAT_V4`] 一族里 ——
+/// 只认新名字会让老夹具悄悄失去覆盖，只认老名字会让新夹具躺在目录里没人解析。
 fn classify(section_id: &str) -> Option<SectionKind> {
     match section_id {
-        "V4" | "V6" => Some(SectionKind::MacNetstatRoutes),
-        "IFCONFIG" => Some(SectionKind::MacTunnelInterfaces),
+        "V4" | "V6" | "V4_NETSTAT" | "V6_NETSTAT" => Some(SectionKind::MacNetstatRoutes),
+        "IFCONFIG" | "IFCONFIG_FLAGS" => Some(SectionKind::MacTunnelInterfaces),
         "ROUTE_PRINT_4" | "ROUTE_PRINT_6" => Some(SectionKind::WinRoutePrint),
         "GET_NETIPADDRESS" => Some(SectionKind::WinInterfaceNames),
         "GET_NETADAPTER" | "NETSH_INTERFACE" => Some(SectionKind::WinTunnelInterfaces),
+        "GET_VPNCONNECTION" | "GET_VPNCONNECTION_ALLUSER" => Some(SectionKind::WinVpnConnections),
+        "V4_ROUTE" | "V6_ROUTE" => Some(SectionKind::LinuxIpRoutes),
+        id if LINUX_LINK_SECTIONS.contains(&id) => Some(SectionKind::LinuxTunnelLinks),
+        // `LINK_DETAIL`（`ip -d link show`）是**证据**不是取材面：ovpn-dco 那条结论
+        // （`tun0` 的第三行是 `ovpn addrgenmode …`、`tap0` 的是 `tun type tap …`）就是从它读出来的，
+        // 但生产判据只认 `ip -o link show type <T>` 的名单，不解析 detail。
+        // `V4_ROUTE_GET` / `V6_ROUTE_GET` 同理：它们是 mac 侧的**第二读数**，由
+        // `macos_netstat_reading_agrees_with_the_independent_route_get_reading` 单独消费。
         "META" | "ENV" | "NETSTAT_I" | "NETWORKSETUP_ORDER" | "TAILSCALE" | "IPCONFIG"
-        | "GET_NETROUTE_4" | "GET_NETROUTE_6" | "NETSH_INTERFACE_6" => {
+        | "GET_NETROUTE_4" | "GET_NETROUTE_6" | "NETSH_INTERFACE_6" | "LINK_DETAIL" | "ADDR"
+        | "V4_ROUTE_GET" | "V6_ROUTE_GET" | "GET_NETIPINTERFACE" | "END" => {
             Some(SectionKind::ReferenceOnly)
         }
         _ => None,
     }
+}
+
+/// 路由表分节 → 它的地址族。
+///
+/// 分节名就是**产生这份输出的那条命令**的记号（`@@@V4` = `netstat -rn -f inet`、
+/// `@@@V6_ROUTE` = `ip -o -6 route show`），族写在名字里而不在内容里 ——
+/// 这正是 [`IpFamily`] 要求调用方传的那个真值，见它的头注。
+fn section_family(section_id: &str) -> IpFamily {
+    if section_id.contains('6') {
+        IpFamily::V6
+    } else {
+        IpFamily::V4
+    }
+}
+
+/// macOS `netstat -rn -f inet` 那一段在两代采集脚本里的分节名（新的在前）。
+const MACOS_NETSTAT_V4: &[&str] = &["V4_NETSTAT", "V4"];
+/// 同上，v6。
+const MACOS_NETSTAT_V6: &[&str] = &["V6_NETSTAT", "V6"];
+/// macOS `ifconfig -a` 那一段在两代采集脚本里的分节名（新的在前）。
+const MACOS_IFCONFIG: &[&str] = &["IFCONFIG_FLAGS", "IFCONFIG"];
+
+/// 取一份抓取里**第一个存在**的候选分节；一个都没有就当场 panic 并把候选名列出来。
+///
+/// 存在的理由是分节改过名：写死单个名字的调用方会在换代那天 panic 成「样本里没有 @@@V4 分节」，
+/// 而真相是它改叫 `@@@V4_NETSTAT` 了 —— 那是个**误导性**的错误消息，会让人去查夹具而不是查别名表。
+pub(super) fn section_any(raw: &str, candidates: &[&str]) -> String {
+    let sections = split_sections(raw);
+    candidates
+        .iter()
+        .find_map(|id| {
+            sections
+                .iter()
+                .find(|(sid, _)| sid == id)
+                .map(|(_, body)| body.clone())
+        })
+        .unwrap_or_else(|| panic!("样本里 {candidates:?} 这几个分节一个都没有"))
 }
 
 /// 一次扫描的结果。
@@ -430,6 +602,26 @@ fn absorb_file(path: &Path, scan: &mut Scan) {
     // 而跳过的结局是一份空的路由表，长得正好像「这台机器没有路由」。
     let names = windows_interface_names(&sections);
 
+    // Linux 的隧道名单散在三条查询里，**任何单条都可以合法为空**（没装 wireguard / ovpn 模块）。
+    // 「非空」这条只在并集上成立，故按文件断一次；按分节断会把「这台机器没有这种隧道」
+    // 误报成抓漏了，而那正是下一个人会照着去重跑一趟现场的那种假缺口。
+    let linux_link_bodies: Vec<&String> = sections
+        .iter()
+        .filter(|(id, _)| LINUX_LINK_SECTIONS.contains(&id.as_str()))
+        .map(|(_, body)| body)
+        .collect();
+    if !linux_link_bodies.is_empty() {
+        let union: Vec<String> = linux_link_bodies
+            .iter()
+            .flat_map(|b| parse_ip_link_names(b))
+            .collect();
+        assert!(
+            !union.is_empty(),
+            "{file}：三条 `ip -o link show type …` 的并集是空的 —— \
+             空名单会被 `foreign_tunnel_routes` 读成「这台机器上没有隧道」"
+        );
+    }
+
     for (id, body) in &sections {
         if body.contains(UNAVAILABLE) {
             scan.note(format!(
@@ -452,7 +644,7 @@ fn absorb_file(path: &Path, scan: &mut Scan) {
                     scan,
                     &file,
                     id,
-                    parse_netstat_routes(body),
+                    parse_netstat_routes(body, section_family(id)),
                     NameStyle::Unixish,
                 );
             }
@@ -501,6 +693,39 @@ fn absorb_file(path: &Path, scan: &mut Scan) {
                     parse_macos_tunnel_interfaces(body),
                     NameStyle::Unixish,
                 );
+            }
+            SectionKind::LinuxIpRoutes => {
+                // `parse_ip_routes` 是「坏行跳过」而不是 `Result`（与 mac/win 那两支的真差异，
+                // 见 `assemble_macos_probe` 的头注）⇒ 这里包成 `Ok` 只是接上同一个形状断言，
+                // 不是把错误吞掉：`ip -o` 那侧压根没有「解析失败」这个结局。
+                absorb_routes(
+                    scan,
+                    &file,
+                    id,
+                    Ok(parse_ip_routes(body, section_family(id))),
+                    NameStyle::Unixish,
+                );
+            }
+            SectionKind::WinVpnConnections => {
+                let parsed = parse_vpn_connection_names(body)
+                    .unwrap_or_else(|e| panic!("{file} 的 @@@{id} 解析失败：{e}"));
+                for n in &parsed {
+                    assert_interface_name_shape(n, NameStyle::WindowsAlias, &file, id);
+                }
+                // **空是合法的**（这个作用域里没有已连接的 VPN 连接，夹具的 ALLUSER 段正是空的），
+                // 故不走 `absorb_interfaces` —— 它的「解析出 0 个接口」那条断言在这里是错的判据。
+                // 空分节与 `<<POLARIS-CAPTURE-UNAVAILABLE>>`（cmdlet 不存在）由**上面**那道
+                // 哨兵分支分开，不在这里混。
+                scan.parsed.push((file.clone(), id.clone(), parsed.len()));
+            }
+            SectionKind::LinuxTunnelLinks => {
+                let parsed = parse_ip_link_names(body);
+                for n in &parsed {
+                    assert_interface_name_shape(n, NameStyle::Unixish, &file, id);
+                }
+                // 空是合法的（非空只在三条的并集上断，见本函数开头），故这里**不**走
+                // `absorb_interfaces` —— 它的「解析出 0 个接口」那条断言在这里是错的判据。
+                scan.parsed.push((file.clone(), id.clone(), parsed.len()));
             }
         }
     }
@@ -758,33 +983,29 @@ fn windows_scan_gaps_are_exactly_the_netsh_fallback_in_every_capture() {
         "`@@@GET_NETADAPTER` 报了缺口 —— 隧道判据的取材面塌了：{gaps:#?}"
     );
 
-    // 逐份点名：两份 Windows 抓取各一条，一条不多一条不少（注记形态是 `<文件> 的 @@@<分节>：…`，
-    // 文件名不含空格）。
+    // 逐份点名：**每一份** Windows 抓取各一条，一条不多一条不少（注记形态是
+    // `<文件> 的 @@@<分节>：…`，文件名不含空格）。
+    //
+    // 🔴 期望值取自 [`windows_fixture_names`]（枚举目录），不是写死的那三份：写死的话，
+    // 第四份抓取入库那天这条会红在「多了一个文件名」上 —— 红得对但说的是错的原因，
+    // 真正的判据是「每份都恰好缺 netsh 这一条」，与仓里有几份抓取无关。
     let mut gap_files: Vec<&str> = gaps
         .iter()
         .map(|g| g.split(' ').next().expect("注记以文件名开头"))
         .collect();
     gap_files.sort();
-    let mut want: Vec<&str> = vec![
-        WINDOWS_FIXTURE,
-        WINDOWS_FIXTURE_WINTUN,
-        WINDOWS_FIXTURE_TS_ON,
-    ];
-    want.sort();
+    let want = windows_fixture_names();
     assert_eq!(
         gap_files,
-        want,
+        want.iter().map(String::as_str).collect::<Vec<_>>(),
         "缺口不是「每份 Windows 抓取的 netsh 各一条」。现在的缺口：{gaps:#?}\n完整报告：\n{}",
         scan.notes.join("\n")
     );
 
     // 正向对照：四个判据分节在**每一份** Windows 抓取里都真的解析出了东西 ——
     // 否则「只剩 netsh 一条缺口」可能只是因为某份抓取整条腿都没接上。
-    for file in [
-        WINDOWS_FIXTURE,
-        WINDOWS_FIXTURE_WINTUN,
-        WINDOWS_FIXTURE_TS_ON,
-    ] {
+    for file in windows_fixture_names() {
+        let file = file.as_str();
         for id in [
             "ROUTE_PRINT_4",
             "ROUTE_PRINT_6",
@@ -802,64 +1023,99 @@ fn windows_scan_gaps_are_exactly_the_netsh_fallback_in_every_capture() {
     }
 }
 
-/// 🔴 **wintun 的 `InterfaceType` 实测是 `53`；仍未验证的是另外两族驱动 + `53` 的假阳性面**。
+/// `53`（`IF_TYPE_PROP_VIRTUAL`）这个宽桶里**已登记**的隧道驱动痕迹
+/// （`ComponentID` / `DriverDescription` / `InterfaceAlias` 任一列里留下的名字）。
 ///
-/// # 这条绊线换过向
+/// 这是白名单，但它**不是生产判据**（生产只认 ifType 那一列）—— 它是「这个宽桶里出现了
+/// 我们没见过的东西」的报警器。
 ///
-/// 上一版钉的是「仓里**没有**任何 VPN 虚拟网卡的抓取 ⇒ wintun 报什么 ifType 无证据」。
-/// 2026-09-12 那份抓取把它验掉了：wintun 报 **`53`**（`IF_TYPE_PROP_VIRTUAL`），**不是 `131`**
-/// —— 旧判据（只认 `131`）在它唯一要做的那件事上静默失败。于是这条绊线改成钉住**新的边界**：
+/// 两族各有真机正样本：
+///  - `Wintun` / `Tailscale`：Tailscale 1.102.4，2026-09-12 w207 实测；
+///  - `tap0901` / `TAP-Windows` / `OpenVPN`：TAP-Windows Adapter V9（驱动 9.27.0.0），
+///    2026-09-13 w207 实测。**此前登记的疑值是 `6`，实测是 `53`** —— 也就是说现有白名单
+///    `{131, 53}` 本来就覆盖它，判据不用改，该改的是那条写错了的登记。
+const REGISTERED_IF_TYPE_53_DRIVERS: &[&str] =
+    &["Wintun", "Tailscale", "tap0901", "TAP-Windows", "OpenVPN"];
+
+/// 🔴 **`53` 的两族正样本（wintun / TAP-Windows6）+ 这个宽桶的假阳性面**。
 ///
-///  1. **`53` 那个值本身**：逐字钉在抓取的那一行上（`ComponentID` = `Wintun`、`Status` = `Up`），
-///     并与生产常量对齐 —— 判据表与实测值改一个忘一个时这里先红；
-///  2. **`53` 的假阳性面**：`IF_TYPE_PROP_VIRTUAL` 是「厂商自有虚拟接口」这个大桶。凡有抓取里
-///     出现**不是已登记正样本**的 `53` 行（Hyper-V / VMware / Docker 的虚拟适配器等），本条红 ——
+/// # 这条绊线换过两次向
+///
+/// ① 最早钉的是「仓里**没有**任何 VPN 虚拟网卡的抓取 ⇒ wintun 报什么 ifType 无证据」。
+/// 2026-09-12 那份把它验掉了：wintun 报 **`53`**，不是 `131` —— 旧判据（只认 `131`）在它
+/// 唯一要做的那件事上静默失败。
+///
+/// ② 2026-09-13 两份新抓取又把它翻了一次：TAP-Windows / OpenVPN 那族**实测也是 `53`**
+/// （此前登记的疑值是 `6`）。于是「另外两族驱动无样本」这条登记只剩一族（WireGuard NT /
+/// 各家企业 VPN 客户端），而 TAP 那族从「判据可能漏它」变成「判据本来就覆盖它」。
+///
+/// 现在钉住的三件事：
+///
+///  1. **两族正样本的 ifType 值本身**：逐字钉在抓取的那两行上，并与生产常量对齐 ——
+///     判据表与实测值改一个忘一个时这里先红；
+///  2. **`53` 的假阳性面**：凡有抓取里出现**不是已登记正样本**的 `53` 行，本条红 ——
 ///     那时要么把它登记成新的隧道驱动正样本，要么重新评估 `{131, 53}` 这条放宽；
-///  3. **另外两族隧道驱动仍无样本**：TAP-Windows / OpenVPN（`tap0901`，以太网仿真，疑报 `6`）与
-///     WireGuard NT / 各家企业 VPN 客户端。它们的 ifType **仓里没有任何证据**；若真报 `6`，
-///     判据漏它们 —— 而 `6` 是全部物理网卡，不能盲收。哪天有这种抓取入库，本条红并要求读出实测值。
+///  3. **仍无样本的驱动族**：WireGuard NT / Zscaler / GlobalProtect 这类。它们的 ifType
+///     仓里没有任何证据；哪天有这种抓取入库，本条红并要求读出实测值。
 ///
 /// 三条的取材面都是**全部** Windows 抓取（[`windows_fixture_names`]），不是写死某一份：
-/// 上一版写死单文件名，第二份抓取带着 wintun 进来那天它压根没看。
+/// 写死单文件名的那一版，第二份抓取带着 wintun 进来那天它压根没看。
 #[test]
-fn the_wintun_capture_pins_iftype_53_and_two_driver_families_are_still_unverified() {
-    // ── ① `53` 逐字钉在那一行上 ──
-    let raw = read_fixture(WINDOWS_FIXTURE_WINTUN);
-    let table = cut_adapter_table(&section(&raw, "GET_NETADAPTER"));
-    let wintun: Vec<&Vec<String>> = table
-        .rows
-        .iter()
-        .filter(|r| table.cell(r, "ComponentID") == "Wintun")
-        .collect();
-    assert_eq!(
-        wintun.len(),
-        1,
-        "这份抓取里 `ComponentID == Wintun` 的行不是恰好一条：{:?}",
-        table.rows
-    );
-    assert_eq!(
-        table.cell(wintun[0], "InterfaceType"),
-        "53",
-        "wintun 报的 ifType 变了 —— 判据表（route_probe 的 IF_TYPE_PROP_VIRTUAL 头注）该跟着改"
-    );
-    assert_eq!(table.cell(wintun[0], "InterfaceAlias"), "Tailscale");
-    assert_eq!(
-        table.cell(wintun[0], "Status"),
-        "Up",
-        "那张 wintun 适配器不是 Up —— 「已装且驱动真的起来了」这条前提没了，这行的说服力打折"
-    );
+fn the_captures_pin_iftype_53_for_wintun_and_tap_windows6() {
+    // ── ① 两族正样本逐字钉在那两行上 ──
+    /// `(抓取, 认这一行的列, 认这一行的值, 期望的 InterfaceAlias, 期望的 Status)`。
+    ///
+    /// 认行**不按别名**：别名是用户可改的显示名，`ComponentID` 是驱动自己写的。
+    const PINNED_53_ROWS: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            WINDOWS_FIXTURE_WINTUN,
+            "ComponentID",
+            "Wintun",
+            "Tailscale",
+            "Up",
+        ),
+        (
+            WINDOWS_FIXTURE_TAP,
+            "ComponentID",
+            r"root\tap0901",
+            "OpenVPN TAP-Windows6",
+            "Up",
+        ),
+    ];
+    for (file, col, value, alias, status) in PINNED_53_ROWS.iter().copied() {
+        let raw = read_fixture(file);
+        let table = cut_adapter_table(&section(&raw, "GET_NETADAPTER"));
+        let hit: Vec<&Vec<String>> = table
+            .rows
+            .iter()
+            .filter(|r| table.cell(r, col) == value)
+            .collect();
+        assert_eq!(
+            hit.len(),
+            1,
+            "{file} 里 `{col} == {value}` 的行不是恰好一条：{:?}",
+            table.rows
+        );
+        assert_eq!(
+            table.cell(hit[0], "InterfaceType"),
+            "53",
+            "{file}：`{value}` 报的 ifType 变了 —— 判据表（route_probe 的 \
+             IF_TYPE_PROP_VIRTUAL 头注）该跟着改"
+        );
+        assert_eq!(table.cell(hit[0], "InterfaceAlias"), alias, "{file}");
+        assert_eq!(
+            table.cell(hit[0], "Status"),
+            status,
+            "{file}：`{value}` 那张适配器不是 {status} —— \
+             「已装且驱动真的起来了」这条前提没了，这行的说服力打折"
+        );
+    }
     // 判据常量与实测值是同一个；改一个忘一个时这里红。
     assert_eq!(crate::route_probe::IF_TYPE_TUNNEL, 131);
     assert_eq!(crate::route_probe::IF_TYPE_PROP_VIRTUAL, 53);
     assert_eq!(crate::route_probe::WINDOWS_TUNNEL_IF_TYPES, &[131_u32, 53]);
 
     // ── ② `53` 的假阳性面：报 53 的行必须是已登记的隧道驱动 ──
-    /// `53`（`IF_TYPE_PROP_VIRTUAL`）这个桶里**已登记**的隧道驱动痕迹（`ComponentID` /
-    /// `DriverDescription` / `InterfaceAlias` 任一列里留下的名字）。
-    ///
-    /// 这是白名单，但它**不是生产判据**（生产只认 ifType 那一列）—— 它是「这个宽桶里出现了
-    /// 我们没见过的东西」的报警器。
-    const REGISTERED_IF_TYPE_53_DRIVERS: &[&str] = &["Wintun", "Tailscale"];
     let mut fifty_three_rows = 0usize;
     for file in windows_fixture_names() {
         let raw = read_fixture(&file);
@@ -873,7 +1129,8 @@ fn the_wintun_capture_pins_iftype_53_and_two_driver_families_are_still_unverifie
                     .any(|d| text.contains(d)),
                 "{file}：报 `53` 的适配器 `{}` 不是已登记的隧道驱动 —— \
                  `IF_TYPE_PROP_VIRTUAL` 是个宽桶，这正是它的假阳性面在真机上露头。该做的是：\
-                 ① 若它是新的隧道驱动，把它登记进 route_probe 的 IF_TYPE_PROP_VIRTUAL 正样本清单；\
+                 ① 若它是新的隧道驱动，把它登记进 REGISTERED_IF_TYPE_53_DRIVERS 与 route_probe 的 \
+                 IF_TYPE_PROP_VIRTUAL 正样本清单；\
                  ② 若它是虚拟交换机之类的非隧道适配器，按 IF_TYPE_PROP_VIRTUAL 头注里的代价对称性\
                  重新评估 `{{131, 53}}` 这条放宽（别忘了假阳性的代价只是展示面多一条网段）。\
                  整行：{text}",
@@ -882,10 +1139,15 @@ fn the_wintun_capture_pins_iftype_53_and_two_driver_families_are_still_unverifie
         }
     }
     // 正向对照：确实有报 `53` 的行，否则上面那个循环恒真（一条都没跑）。
-    // 两份带 wintun 的抓取（未登录 / 已登录）各一行 —— 判据不随连接态漂。
+    // 七份抓取里：`routes-ts-off` 0 行（装 Tailscale 之前）、`wintun-present` 与 `ts-on` 各 1 行、
+    // 四份 2026-09-13 的各 2 行（wintun + TAP）。
+    //
+    // 虚拟化全家福那份**同样只有 2 行** —— 那正是它入库的理由：Hyper-V 的三型交换机
+    // （Default / Internal / Private，五张适配器）一张都没报 `53`，全报 `6`。
+    // 这个数字变大就说明有新的适配器挤进了 `53` 那个宽桶，该重核而不是改数字。
     assert_eq!(
-        fifty_three_rows, 2,
-        "报 `53` 的适配器行数不是 2 —— 取材面变了，`53` 的依据与假阳性面都要重核"
+        fifty_three_rows, 10,
+        "报 `53` 的适配器行数不是 10 —— 取材面变了，`53` 的依据与假阳性面都要重核"
     );
 
     // 🔴 更强的那个正样本：**已登录**那份里 wintun 仍是 `53` 且 `Up`。未登录那份只证得了
@@ -903,19 +1165,35 @@ fn the_wintun_capture_pins_iftype_53_and_two_driver_families_are_still_unverifie
     assert_eq!(on.cell(on_wintun, "InterfaceType"), "53");
     assert_eq!(on.cell(on_wintun, "Status"), "Up");
 
-    // ── ③ 另外两族驱动仍无样本 ──
+    // 🔴 同一条性质在 TAP 那族上的输入：`Up`（已连、`10.8.0.2`）与 `Disconnected` 两份抓取里
+    // 它都报 `53`。ifType 是**驱动属性**，不随链路状态漂 —— 只有一份 `Up` 的抓取时这句是推理。
+    let down = cut_adapter_table(&section(
+        &read_fixture(WINDOWS_FIXTURE_HYPERV),
+        "GET_NETADAPTER",
+    ));
+    let down_tap = down
+        .rows
+        .iter()
+        .find(|r| down.cell(r, "ComponentID") == r"root\tap0901")
+        .expect("Hyper-V 那份里 TAP 那行在名单里");
+    assert_eq!(down.cell(down_tap, "InterfaceType"), "53");
+    assert_eq!(
+        down.cell(down_tap, "Status"),
+        "Disconnected",
+        "前提：这份里的 TAP 确实是断开态，否则「ifType 不随链路状态漂」这条没有对照"
+    );
+
+    // ── ③ 仍无样本的驱动族 ──
     /// ifType **未验证**的隧道驱动族在抓取里会留下的名字。
     ///
     /// 命中 ⇒ 仓里第一次有了这族的真机抓取，该读出它实际报的 `InterfaceType` 并据此决定判据面。
-    const UNVERIFIED_DRIVER_FAMILIES: &[&str] = &[
-        "tap0901",
-        "TAP-Windows",
-        "OpenVPN",
-        "WireGuard",
-        "wireguard",
-        "Zscaler",
-        "GlobalProtect",
-    ];
+    ///
+    /// 🔴 **TAP-Windows / OpenVPN（`tap0901`）2026-09-13 已从本清单划掉** —— 实测 `53`，
+    /// 见本文件 `PINNED_53_ROWS` 那一行。RAS（SSTP / L2TP / IKEv2）那族没有可靠的字面量痕迹
+    /// （适配器名是 `WAN Miniport (IKEv2)` 一类），故它**不在这张表里**：这张表守的是
+    /// 「能靠名字认出来的那些」，RAS 的缺口如实登记在 `parse_windows_tunnel_interfaces` 的头注里。
+    const UNVERIFIED_DRIVER_FAMILIES: &[&str] =
+        &["WireGuard", "wireguard", "Zscaler", "GlobalProtect"];
     for file in windows_fixture_names() {
         let adapters = section(&read_fixture(&file), "GET_NETADAPTER");
         // 前提：这份抓取的适配器段真有内容，否则下面那条否定断言恒真。
@@ -934,10 +1212,104 @@ fn the_wintun_capture_pins_iftype_53_and_two_driver_families_are_still_unverifie
              「这族报什么 InterfaceType 仓里没有证据」这条登记过期了。该做的是：\
              ① 从抓取里按列读出它实际报的 InterfaceType；\
              ② 若落在 `{{131, 53}}` 之外，按 IF_TYPE_PROP_VIRTUAL 头注里的代价对称性决定收不收\
-             （注意 `6` = 全部物理网卡、`23` 与 PPPoE 拨号同型，这两个值收了会把真业务网卡判成隧道）；\
-             ③ 把结论写进 parse_windows_tunnel_interfaces 的判据表，并在这里把它从未验证清单里划掉。"
+             （注意 `6` = 物理网卡 / Hyper-V 虚拟交换机 / 内核调试适配器**三者同型**，\
+             `23` 与 PPPoE 拨号同型，这两个值收了会把真业务网卡判成隧道）；\
+             ③ 把结论写进 parse_windows_tunnel_interfaces 的判据表，并在这里把它划掉。"
         );
     }
+}
+
+/// 🔴 **`53` 的假阳性面有负向证据了：Hyper-V 的两张虚拟适配器报 `6`，不报 `53`**。
+///
+/// 一条门里正负都要，这样两个方向的漂移都会红：
+///
+///  - **负半（白名单被放宽）**：`vEthernet (Default Switch)` / `vSwitch (Default Switch)`
+///    **不得**出现在解析出的隧道名单里。它们是 Hyper-V 装出来的虚拟交换机，实测 `InterfaceType`
+///    都是 **`6`**。谁哪天把 `6` 收进 [`crate::route_probe::WINDOWS_TUNNEL_IF_TYPES`]，这半红。
+///  - **正半（白名单被收窄）**：同一份抓取里的 `Tailscale`（wintun）与 `OpenVPN TAP-Windows6`
+///    **必须**在名单里。谁哪天把 `53` 删掉（= 回到 2026-09-12 之前那个判据），这半红。
+///
+/// # 为什么这份抓取比「多一个正样本」值钱
+///
+/// 「装了 Hyper-V / VMware / Docker 的机器上可能有别的适配器落进 `53` 这个宽桶」此前是一条
+/// **登记在案的未知风险** —— 论证只能靠代价对称性，没有任何输入。这份抓取给了 Hyper-V 那一半
+/// 的**负向证据**：装上之后多出来的两张适配器都报 `6`。
+///
+/// 同一份抓取还反向印证了 `6` **绝对不能**收：它在这一份里同时是物理网卡
+/// （`Red Hat VirtIO Ethernet Adapter`）、Hyper-V 虚拟交换机、以及内核调试适配器 ——
+/// 三种东西同一个值，收了就是把一批真业务网卡判成隧道。这条由下面的 `SIX_IS_THREE_THINGS` 钉住。
+///
+/// 断言跑的是**生产解析器**（`parse_windows_tunnel_interfaces`）而不是测试侧的切列表：
+/// 要证的是「这两张适配器最终没进隧道名单」，而不是「表里那一格写着 6」。
+#[test]
+fn iftype_53_admits_the_two_vpn_drivers_but_not_the_hyperv_switches() {
+    let raw = read_fixture(WINDOWS_FIXTURE_HYPERV);
+    let adapters = section(&raw, "GET_NETADAPTER");
+    let tunnels = parse_windows_tunnel_interfaces(&adapters).expect("适配器段解析得动");
+
+    /// Hyper-V 装出来的两张适配器：**不是**隧道，实测 ifType 都是 `6`。
+    const HYPERV_ADAPTERS: &[&str] = &["vEthernet (Default Switch)", "vSwitch (Default Switch)"];
+    /// 同一份抓取里**必须**被认成隧道的两张 VPN 虚拟网卡（两族 `53` 正样本）。
+    const VPN_ADAPTERS: &[&str] = &["Tailscale", "OpenVPN TAP-Windows6"];
+
+    let table = cut_adapter_table(&adapters);
+    for name in HYPERV_ADAPTERS.iter().copied() {
+        // 正向对照先行：这张适配器**确实在输入里**。缺了它，「它没被判成隧道」可能只是
+        // 因为它压根没进来 —— 那是一条恒真断言。
+        let row = table
+            .rows
+            .iter()
+            .find(|r| table.cell(r, "InterfaceAlias") == name)
+            .unwrap_or_else(|| panic!("`{name}` 不在这份抓取的适配器名单里：{:?}", table.rows));
+        assert_eq!(
+            table.cell(row, "InterfaceType"),
+            "6",
+            "`{name}` 的实测 ifType 变了 —— 「Hyper-V 不落进 53 这个桶」这条负向证据的依据没了"
+        );
+        assert!(
+            !tunnels.iter().any(|t| t == name),
+            "Hyper-V 的 `{name}` 被判成了隧道 —— 白名单放宽到 `6` 了？\
+             `6` 在这一份抓取里同时是物理网卡、虚拟交换机与内核调试适配器。名单：{tunnels:?}"
+        );
+    }
+    for name in VPN_ADAPTERS.iter().copied() {
+        assert!(
+            tunnels.iter().any(|t| t == name),
+            "`{name}` 没进隧道名单 —— 白名单收窄了？（去掉 `53` = 回到 2026-09-12 之前\
+             那个会漏 wintun 的旧判据）名单：{tunnels:?}"
+        );
+    }
+
+    // 🔴 `6` 同时是三种东西 —— 「不能盲收 `6`」这句话的全部依据，钉在真机数据上。
+    const SIX_IS_THREE_THINGS: &[&str] = &[
+        "以太网",                     // Red Hat VirtIO Ethernet Adapter：真业务网卡
+        "vEthernet (Default Switch)", // Hyper-V 虚拟以太网适配器
+        "以太网(内核调试器)",         // Microsoft Kernel Debug Network Adapter
+    ];
+    for name in SIX_IS_THREE_THINGS.iter().copied() {
+        let row = table
+            .rows
+            .iter()
+            .find(|r| table.cell(r, "InterfaceAlias") == name)
+            .unwrap_or_else(|| panic!("`{name}` 不在这份抓取里：{:?}", table.rows));
+        assert_eq!(
+            table.cell(row, "InterfaceType"),
+            "6",
+            "`{name}` 不再报 `6` —— 「`6` 是个三合一的桶」这条论证要重核"
+        );
+    }
+    // 名单整体也断一次：恰好是那两张 VPN 网卡 + 三个 `131` 协议隧道，一个不多一个不少。
+    assert_eq!(
+        tunnels,
+        vec![
+            "Teredo Tunneling Pseudo-Interface".to_string(),
+            "Tailscale".to_string(),
+            "Microsoft IP-HTTPS Platform Interface".to_string(),
+            "OpenVPN TAP-Windows6".to_string(),
+            "6to4 Adapter".to_string(),
+        ],
+        "这份抓取的隧道名单变了（顺序按 Get-NetAdapter 的输出序）"
+    );
 }
 
 /// 每个登记在册的平台，要么真的解析出了东西，要么在报告里有一条署名的说明。
@@ -971,7 +1343,8 @@ fn every_registered_platform_is_either_parsed_or_explicitly_accounted_for() {
 #[test]
 fn macos_fixture_expands_classful_abbreviations() {
     let raw = read_fixture(MACOS_FIXTURE);
-    let routes = parse_netstat_routes(&section(&raw, "V4")).expect("真机 v4 抓取应解析得动");
+    let routes =
+        parse_netstat_routes(&section(&raw, "V4"), IpFamily::V4).expect("真机 v4 抓取应解析得动");
 
     let has = |prefix: &str, iface: &str| {
         routes.contains(&RouteEntry {
@@ -1002,10 +1375,11 @@ fn macos_fixture_expands_classful_abbreviations() {
         has("192.168.10.105/32", "en0"),
         "主机路由没补 /32：{routes:?}"
     );
-    // `default` 不产出条目（与 `parse_ip_route_line` 同口径）。
+    // `default` 行产出条目，规范成 v4 的默认路由前缀（族由调用方给，见 `IpFamily` 头注）。
+    // 这一条是 `netstat -rn` 里唯一**不带** `I`（RTF_IFSCOPE）的默认路由：它在全局转发面上。
     assert!(
-        !routes.iter().any(|r| r.prefix.starts_with("0.0.0.0")),
-        "default 行不该产出条目：{routes:?}"
+        has("0.0.0.0/0", "en0"),
+        "default 行没产出条目 —— 抢默认路由的全隧道正是靠它才看得见：{routes:?}"
     );
 }
 
@@ -1046,7 +1420,8 @@ fn classful_expansion_rejects_the_two_plausible_wrong_answers() {
 #[test]
 fn macos_fixture_strips_ipv6_scope_zones() {
     let raw = read_fixture(MACOS_FIXTURE);
-    let routes = parse_netstat_routes(&section(&raw, "V6")).expect("真机 v6 抓取应解析得动");
+    let routes =
+        parse_netstat_routes(&section(&raw, "V6"), IpFamily::V6).expect("真机 v6 抓取应解析得动");
 
     let has = |prefix: &str, iface: &str| {
         routes.contains(&RouteEntry {
@@ -1091,13 +1466,105 @@ fn macos_fixture_strips_ipv6_scope_zones() {
 ///
 /// **判「这份是不是连接态」不能看 `@@@TAILSCALE`**：连接态那份的该分节仍是「命令不在 PATH 上」
 /// 哨兵（Mac App Store 版不装 CLI）。真值在路由表里。
+/// 虚拟化跑起来时，macOS 判据既不误报也不漏报（Parallels Desktop 运行中的真机抓取）。
+///
+/// # 为什么这道门值得单独存在
+///
+/// macOS 的隧道判据是 [`MAC_TUNNEL_FLAG`]（`POINTOPOINT`）而不是名字前缀清单。
+/// 用 flag 的代价是它**认的是"点对点设备"这件事本身**——虚拟化软件建的网卡若恰好是点对点型，
+/// 就会被整批收进来。PD 18+ 建六个接口（`vmenet0/1/2` + `bridge100/101/102`），
+/// 真机实测**全是 `BROADCAST` 型**，一个 `POINTOPOINT` 都没有。
+///
+/// 这份抓取同时带着 Tailscale 连接态，所以两个方向能从**同一份输入**上取：
+/// 不误报（六个虚拟接口一个都不进名单）与不漏报（12 个 utun 仍全部进名单）。
+/// 只验一半的门会被"判据把所有东西都收了"和"判据什么都不收"各骗一次。
+///
+/// **缺口如实登记**：`vmenet` 是 PD 18+ 的形态，老版本的 `vnic0`/`vnic1` 仓里没有样本；
+/// VMware Fusion 的 `vmnet*` 同样没有。判据不按名字走，所以这两族**理论上**同样不收，
+/// 但那是推论不是实测。
+#[test]
+fn parallels_virtual_nics_are_not_mistaken_for_tunnels() {
+    let raw = read_fixture(MACOS_FIXTURE_PARALLELS);
+    let ifconfig = section_any(&raw, &["IFCONFIG_FLAGS", "IFCONFIG"]);
+    assert!(
+        !ifconfig.trim().is_empty(),
+        "{MACOS_FIXTURE_PARALLELS} 的 ifconfig 分节是空的 —— 下面两半都会空跑"
+    );
+
+    // 前提：这六个接口**确实在输入里**。少了这一条，下面的否定断言会被
+    //「PD 根本没跑、抓取里压根没有虚拟网卡」骗成绿的。
+    const PD_NICS: &[&str] = &[
+        "vmenet0",
+        "vmenet1",
+        "vmenet2",
+        "bridge100",
+        "bridge101",
+        "bridge102",
+    ];
+    for nic in PD_NICS {
+        assert!(
+            ifconfig.contains(&format!("\n{nic}: flags=")),
+            "{MACOS_FIXTURE_PARALLELS} 里没有 `{nic}` —— 这份抓取不是 PD 运行态，\
+             这道门的前提不成立"
+        );
+    }
+
+    let tunnels = parse_macos_tunnel_interfaces(&ifconfig)
+        .expect("PD 运行态那份抓取的 ifconfig 必须解析得动");
+
+    // ① 不误报：PD 的六个虚拟接口一个都不许进隧道名单。
+    for nic in PD_NICS {
+        assert!(
+            !tunnels.iter().any(|t| t == nic),
+            "PD 的虚拟网卡 `{nic}` 被判成了隧道 —— 判据取的是 `{}` flag，\
+             而这六个接口真机实测全是 BROADCAST 型。名单：{tunnels:?}",
+            crate::route_probe::MAC_TUNNEL_FLAG
+        );
+    }
+
+    // ② 不漏报：同一份输入里的真隧道必须仍然全在名单里。
+    //    数字钉死：`gif0` + `utun0..=utun11` = 13 条（与 §21 那批抓取同一台机器）。
+    let utun_count = tunnels.iter().filter(|t| t.starts_with("utun")).count();
+    assert_eq!(utun_count, 12, "utun 少了 —— 名单：{tunnels:?}");
+    assert!(
+        tunnels.iter().any(|t| t == "gif0"),
+        "系统自带的 `gif0` 也该在名单里（它带 POINTOPOINT，只是零宣告）：{tunnels:?}"
+    );
+    assert_eq!(
+        tunnels.len(),
+        13,
+        "隧道名单条数变了 —— 多出来的那个正是本门要抓的误报：{tunnels:?}"
+    );
+
+    // ③ 正向对照：判据本身是活的。把 PD 的一张网卡的 flags 换成点对点型，它必须被收进来 ——
+    //    否则上面那批否定断言可能只是因为解析器压根没在工作。
+    let mutated = ifconfig.replace(
+        "vmenet0: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST>",
+        "vmenet0: flags=8963<UP,POINTOPOINT,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST>",
+    );
+    assert_ne!(
+        mutated, ifconfig,
+        "变异没打上 —— `vmenet0` 那行的字面量变了"
+    );
+    let mutated_tunnels =
+        parse_macos_tunnel_interfaces(&mutated).expect("变异后的 ifconfig 仍应解析得动");
+    assert!(
+        mutated_tunnels.iter().any(|t| t == "vmenet0"),
+        "把 `vmenet0` 改成 POINTOPOINT 之后它仍不在名单里 —— \
+         说明上面那批「不误报」断言是空跑的：{mutated_tunnels:?}"
+    );
+}
+
 #[test]
 fn macos_tailnet_prefixes_appear_only_in_the_connected_capture() {
-    let mut connected_seen = false;
+    let mut connected_seen = 0usize;
     for file in macos_fixture_names() {
         let raw = read_fixture(&file);
-        let mut routes = parse_netstat_routes(&section(&raw, "V4")).expect("v4");
-        routes.extend(parse_netstat_routes(&section(&raw, "V6")).expect("v6"));
+        let mut routes =
+            parse_netstat_routes(&section_any(&raw, MACOS_NETSTAT_V4), IpFamily::V4).expect("v4");
+        routes.extend(
+            parse_netstat_routes(&section_any(&raw, MACOS_NETSTAT_V6), IpFamily::V6).expect("v6"),
+        );
 
         // 正向对照先行：utun **确实**在这份抓取里。否则两侧的结论都可能只是
         // 「utun 压根没抓到」造成的假绿。
@@ -1111,17 +1578,56 @@ fn macos_tailnet_prefixes_appear_only_in_the_connected_capture() {
             .filter(|r| is_tailnet_prefix(&r.prefix))
             .collect();
 
-        if file != MACOS_FIXTURE_TS_ON {
+        let Some((_, want_tailnet, want_on_tunnel)) = MACOS_CONNECTED_CAPTURES
+            .iter()
+            .find(|(f, _, _)| *f == file)
+            .copied()
+        else {
             assert!(
                 tailnet.is_empty(),
                 "{file} 里出现了 tailnet 网段 {tailnet:?} —— 这份登记的是**断开态**。\
-                 若它真换成了连接态抓取，请把它移到连接态那一侧并同步 fixtures/README.md 的覆盖表"
+                 若它真换成了连接态抓取，请把它登记进 MACOS_CONNECTED_CAPTURES 并同步 \
+                 fixtures/README.md 的覆盖表"
             );
             continue;
-        }
+        };
 
-        connected_seen = true;
-        // ── 连接态那份：逐条点名 ──
+        connected_seen += 1;
+        // ── 每份连接态抓取都过的那几条（数字逐份取自 MACOS_CONNECTED_CAPTURES）──
+        assert_eq!(
+            tailnet.len(),
+            want_tailnet,
+            "{file} 里的 tailnet 业务网段条数变了：{tailnet:?}"
+        );
+        let (on_utun11, elsewhere): (Vec<&&RouteEntry>, Vec<&&RouteEntry>) =
+            tailnet.iter().partition(|r| r.interface == "utun11");
+        assert_eq!(
+            on_utun11.len(),
+            want_on_tunnel,
+            "{file} 里挂在 utun11 上的条数变了：{on_utun11:?}"
+        );
+        // 🔴 **本机自己那条 tailnet v6 `/128` 挂在 `lo0` 上，不在 utun 上**（BSD 把本地地址的
+        // 主机路由装到环回）。两份连接态抓取各有一条、地址不同 ⇒ 断的是**形状**不是字面量；
+        // 后果是它进不了 `foreign`（`foreign_tunnel_routes` 按接口名过滤，`lo0` 不在隧道名单里），
+        // 也就是 mac 侧看得见「别人的网段」、看不见自己那条。对本模块（找**外来**隧道）方向恰好
+        // 是对的，但它是真机形态不是设计意图，写在这里免得下一个人以为漏了一条。
+        let elsewhere_shape: Vec<(&str, &str)> = elsewhere
+            .iter()
+            .map(|r| (r.prefix.as_str(), r.interface.as_str()))
+            .collect();
+        assert_eq!(elsewhere_shape.len(), 1, "{file}：{elsewhere_shape:?}");
+        assert!(
+            elsewhere_shape[0].1 == "lo0"
+                && elsewhere_shape[0].0.starts_with("fd7a:115c:a1e0::")
+                && elsewhere_shape[0].0.ends_with("/128"),
+            "{file}：挂在 utun11 之外的 tailnet 网段不是「本机自己那条 v6 /128 在 lo0 上」\
+             这一形状：{elsewhere_shape:?}"
+        );
+
+        if file != MACOS_FIXTURE_TS_ON {
+            continue;
+        }
+        // ── 只在 09-12 那份上做的逐条点名（它是 mac 侧业务网段的首份正样本）──
         let has = |prefix: &str| {
             routes
                 .iter()
@@ -1160,37 +1666,21 @@ fn macos_tailnet_prefixes_appear_only_in_the_connected_capture() {
             !routes.iter().any(|r| r.prefix == "32.0.0.0/24"),
             "出现了 `32.0.0.0/24` 汇总段 —— 「Tailscale 装逐 peer /32」这条形态登记过期了：{tailnet:?}"
         );
-        // 条数钉死（换样本时会红，提醒重核上面的点名）。
+        // 🔴 这份的那条 lo0 网段逐字是 `fd7a:115c:a1e0::d3/128`（`ifconfig utun11` 里逐字有它，
+        // 是这台 mac 自己的 tailnet 地址）。上面那条形状断言对两份抓取都开，这条是它的字面量版本 ——
+        // 只有形状断言的话，「本机那条」被换成任意一条 `fd7a:…/128` 也不会有人发现。
         assert_eq!(
-            tailnet.len(),
-            29,
-            "连接态抓取里的 tailnet 业务网段条数变了：{tailnet:?}"
-        );
-
-        // 🔴 **本机自己那条 v6 `/128` 挂在 `lo0` 上，不在 utun 上** —— 照记忆写不出来：
-        // BSD 把本地地址的主机路由装到环回上（`fd7a:115c:a1e0::d3` 是这台 mac 自己的 tailnet
-        // 地址，`ifconfig utun11` 里逐字有它）。**后果是它进不了 `foreign`**：
-        // `foreign_tunnel_routes` 按接口名过滤，`lo0` 不在隧道名单里。也就是说 mac 侧看得见
-        // 的是「**别人**的网段」，看不见自己那条 —— 对本模块（找**外来**隧道）恰好是对的方向，
-        // 但它是真机形态，不是设计意图，写在这里免得下一个人以为漏了一条。
-        let (on_tunnel, elsewhere): (Vec<&RouteEntry>, Vec<&RouteEntry>) =
-            tailnet.iter().partition(|r| r.interface == "utun11");
-        assert_eq!(
-            elsewhere
-                .iter()
-                .map(|r| (r.prefix.as_str(), r.interface.as_str()))
-                .collect::<Vec<_>>(),
+            elsewhere_shape,
             [("fd7a:115c:a1e0::d3/128", "lo0")],
-            "挂在 utun11 之外的 tailnet 网段不是「本机自己那条 /128 在 lo0 上」这一条：{elsewhere:?}"
-        );
-        assert_eq!(
-            on_tunnel.len(),
-            28,
-            "挂在 utun11 上的条数变了：{on_tunnel:?}"
+            "{file}：{elsewhere_shape:?}"
         );
     }
-    // 缺了这条，上面那个 `if` 整支可能一次都没执行（连接态夹具被改名 / 删掉）。
-    assert!(connected_seen, "连接态那份抓取没进循环 —— 正样本那一半没跑");
+    // 缺了这条，上面那支可能一次都没执行（连接态夹具被改名 / 删掉）。
+    assert_eq!(
+        connected_seen,
+        MACOS_CONNECTED_CAPTURES.len(),
+        "登记在册的连接态抓取没全部进循环 —— 正样本那一半少跑了"
+    );
 }
 
 /// `Netif` 的列号**从列头行读**，不写死。
@@ -1204,7 +1694,7 @@ fn netif_column_is_read_from_the_header_not_hardcoded() {
                        Internet:\n\
                        Destination        Gateway            Flags   Refs      Use   Netif Expire\n\
                        192.168.10         link#4             UCS        1        0     en1\n";
-    let routes = parse_netstat_routes(older_macos).expect("多两列的列头也要解析得动");
+    let routes = parse_netstat_routes(older_macos, IpFamily::V4).expect("多两列的列头也要解析得动");
     assert_eq!(
         routes,
         vec![RouteEntry {
@@ -1225,7 +1715,7 @@ fn malformed_captures_error_instead_of_yielding_a_quiet_empty_list() {
     // 正向对照先行：同一入口对**好样本**是 `Ok` 且非空。没有这条，下面全 `Err` 也可能
     // 只是说明「这个解析器什么都解析不了」。
     let good = section(&read_fixture(MACOS_FIXTURE), "V4");
-    let good = parse_netstat_routes(&good).expect("好样本必须 Ok");
+    let good = parse_netstat_routes(&good, IpFamily::V4).expect("好样本必须 Ok");
     assert!(!good.is_empty(), "好样本解析出 0 条 —— 正向对照本身塌了");
 
     let dir = fixtures_dir().join("malformed");
@@ -1243,7 +1733,7 @@ fn malformed_captures_error_instead_of_yielding_a_quiet_empty_list() {
     for path in &bad_files {
         let name = file_name(path);
         let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("读 {name}：{e}"));
-        let got = parse_netstat_routes(&raw);
+        let got = parse_netstat_routes(&raw, IpFamily::V4);
         assert!(
             got.is_err(),
             "{name}：畸形样本被静默解析成 {got:?} —— 短的/空的 `Ok` 会被下游当成事实"
@@ -1254,7 +1744,7 @@ fn malformed_captures_error_instead_of_yielding_a_quiet_empty_list() {
     // 只断 `is_err()` 的话，一个「凡事都报 MissingHeader」的实现也能全绿。
     assert!(
         matches!(
-            parse_netstat_routes(&read_fixture("malformed/macos-empty.txt")),
+            parse_netstat_routes(&read_fixture("malformed/macos-empty.txt"), IpFamily::V4),
             Err(RouteTableParseError::MissingHeader { .. })
         ),
         "空文件应报「找不到列头」"
@@ -1262,7 +1752,7 @@ fn malformed_captures_error_instead_of_yielding_a_quiet_empty_list() {
     let truncated = read_fixture("malformed/macos-truncated-row.txt");
     assert!(
         matches!(
-            parse_netstat_routes(&truncated),
+            parse_netstat_routes(&truncated, IpFamily::V4),
             Err(RouteTableParseError::TruncatedRow { .. })
         ),
         "截断行应报「列数不够」，而不是被当成列头缺失或被跳过"
@@ -1696,16 +2186,23 @@ fn windows_routes_carry_real_interface_names_not_ips_or_indexes() {
         "v6 的接口名取自 `route print` 的 Interface List（描述列），与 v4 的别名对不上：{v6:?}"
     );
 
-    // 条目数逐字钉死：默认路由（`0.0.0.0/0` 与 `::/0`）不产出条目，永久路由表不产出条目。
-    assert_eq!(v4.len(), 10, "v4 条目数与真机抓取对不上：{v4:?}");
-    assert_eq!(v6.len(), 30, "v6 条目数与真机抓取对不上：{v6:?}");
+    // 条目数逐字钉死：默认路由**产出条目**（各一条，都在 `以太网` 上），
+    // 永久路由表那张（只有 4 列、没有接口列）仍然不产出条目。
+    assert_eq!(v4.len(), 11, "v4 条目数与真机抓取对不上：{v4:?}");
+    assert_eq!(v6.len(), 31, "v6 条目数与真机抓取对不上：{v6:?}");
     assert!(
-        !v4.iter().any(|r| r.prefix.starts_with("0.0.0.0/")),
-        "v4 的默认路由产出了条目：{v4:?}"
+        v4.contains(&RouteEntry {
+            prefix: "0.0.0.0/0".into(),
+            interface: "以太网".into()
+        }),
+        "v4 的默认路由没产出条目 —— 抢默认路由的全隧道正是靠它才看得见：{v4:?}"
     );
     assert!(
-        !v6.iter().any(|r| r.prefix == "::/0"),
-        "v6 的默认路由产出了条目：{v6:?}"
+        v6.contains(&RouteEntry {
+            prefix: "::/0".into(),
+            interface: "以太网".into()
+        }),
+        "v6 的默认路由没产出条目：{v6:?}"
     );
 }
 
@@ -1907,8 +2404,9 @@ fn an_unresolvable_interface_is_an_error_not_a_quietly_shorter_list() {
 /// `route print -4` 末尾那张**永久路由表**只有 4 列、**没有接口列**，不许被当成活动路由。
 ///
 /// ⚠️ 本条用的是**构造**输入而不是真机抓取：那份抓取里唯一一条永久路由恰好是默认路由，
-/// 就算被误当成活动路由也会在「默认路由不产出条目」那一步被吞掉 —— 于是真样本证不了这件事。
-/// 构造一条**非默认**的永久路由来补这个缺口，并在此如实登记它是构造的。
+/// 而活动路由表里本来就有同一条默认路由 —— 误当成活动路由时产出的是一条**重复**条目，
+/// 与「少列数那条腿」的失败形态混在一起看不出来。构造一条**非默认**的永久路由来补这个缺口，
+/// 并在此如实登记它是构造的。
 #[test]
 fn the_persistent_routes_table_is_not_mistaken_for_active_routes() {
     // 列头与标签逐字取自真样本（zh-CN），只有那条永久路由是构造的。
@@ -2005,24 +2503,79 @@ fn route_print_result_matches_the_independent_get_netroute_reading() {
             .collect()
     }
 
-    // 🔴 跑遍**三份** Windows 抓取，不是只对着最早那份。取材面写死一份时，后来入库的
-    // 那两份（含唯一带 wintun 业务路由的那份）压根没人拿它们对差 —— 而「静默丢行」正是
-    // 路由数量多起来之后才容易发生的事（折行、30 条隧道路由）。
-    for (file, want_rows) in [
-        (WINDOWS_FIXTURE, 40),
-        (WINDOWS_FIXTURE_WINTUN, 43),
-        (WINDOWS_FIXTURE_TS_ON, 73),
-    ] {
+    // 🔴 跑遍**每一份** Windows 抓取，不是只对着最早那几份。取材面写死名单时，后来入库的
+    // 抓取压根没人拿它们对差 —— 而「静默丢行」正是路由数量多起来之后才容易发生的事
+    // （折行、30 条隧道路由、RAS 那条抢默认路由的全隧道）。
+    //
+    // 条数表必须**逐份**覆盖枚举出来的文件：新抓取入库那天这里会红在「表里没有它」上，
+    // 逼人真去看一眼那份抓取对不对得上，而不是让它悄悄不进对差面。
+    const EXPECTED_ROWS: &[(&str, usize)] = &[
+        (WINDOWS_FIXTURE, 42),
+        (WINDOWS_FIXTURE_WINTUN, 45),
+        (WINDOWS_FIXTURE_TS_ON, 75),
+        (WINDOWS_FIXTURE_TAP, 85),
+        (WINDOWS_FIXTURE_HYPERV, 44),
+        // 比别的抓取多一条：`以太网` 与 `PolarisProbeL2TP` 各宣告一条 `0.0.0.0/0`。
+        (WINDOWS_FIXTURE_RAS, 52),
+        // 虚拟化全家福：两条默认路由都在 `以太网`（物理网卡）上，三型虚拟交换机一条外来
+        // 默认路由都不产出 —— 这正是「虚拟化是常规场景」那条兼容性的输入面。
+        (WINDOWS_FIXTURE_VIRT, 52),
+    ];
+    let enumerated = windows_fixture_names();
+    let mut listed: Vec<&str> = EXPECTED_ROWS.iter().map(|(f, _)| *f).collect();
+    listed.sort_unstable();
+    assert_eq!(
+        listed,
+        enumerated.iter().map(String::as_str).collect::<Vec<_>>(),
+        "条数表与夹具目录对不上 —— 新抓取要在表里登记一行（先跑一次拿到它的条数）"
+    );
+
+    for (file, want_rows) in EXPECTED_ROWS.iter().copied() {
         let raw = read_fixture(file);
 
-        // 参照侧：Get-NetRoute 的 (前缀, 接口别名)，跳掉默认路由（与生产口径一致）。
+        // 参照侧：Get-NetRoute 的 (前缀, 接口别名)。**默认路由两侧都收**：它是外来隧道
+        // 最重的那一条宣告（RAS 那份里 `0.0.0.0/0 PolarisProbeL2TP` 两张表都有），
+        // 从对差面里剔掉就等于让这一类的解析没有任何独立读数可对。
+        //
+        // 🔴 v6 前缀要**先规范化再比**，不能逐字比字符串：`route print` 那侧的解析走
+        // `Ipv6Addr`，`0ec2` 会被规范成 `ec2`；而参照侧是从文本里逐字切出来的。
+        // 两种写法在真机上本来同形（Windows 自己不打前导零），是**脱敏**造出的差异 ——
+        // 「同长度替换」把一个组换成了带前导零的 `0ec2` / `042f` / `0cf5`。
+        // 规范化用 stdlib 的 `Ipv6Addr`，不碰生产的 `canonical_ipv6_prefix`：复用它等于两边
+        // 共用同一个错，这条对差就没有检出力了。
+        let canonical = |p: &str| -> String {
+            let Some((addr, len)) = p.split_once('/') else {
+                return p.to_string();
+            };
+            match addr.parse::<Ipv6Addr>() {
+                Ok(a) => format!("{a}/{len}"),
+                Err(_) => p.to_string(),
+            }
+        };
+        //
+        // 🔴 第二条真差异：**`Get-NetRoute` 列出 `Disconnected` 接口的路由，`route print` 不列**。
+        // 同一对 2026-09-13 抓取里正负两例俱全，所以这不是猜的：`OpenVPN TAP-Windows6` 在
+        // `…-ovpn-tun-connected-…` 里是 `Up`，两侧都有它那几条；在 `…-hyperv-present-…` 里是
+        // `Disconnected`，只有 `Get-NetRoute` 那侧有。故参照侧按同一份抓取的 `Get-NetAdapter`
+        // 把**非 Up** 的适配器整条剔掉。
+        //
+        // 判据写成「在适配器表里**且** Status != Up 才剔」，不是「不在 Up 名单里就剔」——
+        // `Loopback Pseudo-Interface 1` 压根不在 `Get-NetAdapter` 里（`-IncludeHidden` 也没有），
+        // 按后者写会把它那 5 条一起误杀，而它们在两侧都真实存在。
+        let adapters = cut_adapter_table(&section(&raw, "GET_NETADAPTER"));
+        let not_up: Vec<&str> = adapters
+            .rows
+            .iter()
+            .filter(|r| adapters.cell(r, "Status") != "Up")
+            .map(|r| adapters.cell(r, "InterfaceAlias"))
+            .collect();
         let mut reference: Vec<(String, String)> = ["GET_NETROUTE_4", "GET_NETROUTE_6"]
             .iter()
             .flat_map(|id| {
                 reference_rows(&section(&raw, id), &["DestinationPrefix", "InterfaceAlias"])
             })
-            .filter(|row| row[0] != "0.0.0.0/0" && row[0] != "::/0")
-            .map(|row| (row[0].clone(), row[1].clone()))
+            .filter(|row| !not_up.contains(&row[1].as_str()))
+            .map(|row| (canonical(&row[0]), row[1].clone()))
             .collect();
 
         // 生产侧：`route print` 经对照表解析出来的那份。
@@ -2310,5 +2863,758 @@ fn the_tunnel_criterion_does_not_also_require_an_empty_component_id() {
         tunnels.iter().any(|t| t == "Tailscale"),
         "带 ComponentID 的隧道被排除掉了 —— 判据里混进了「且 ComponentID 为空」，\
          而那正是会漏掉 wintun 的那条土办法：{tunnels:?}"
+    );
+}
+
+// ══════════ Linux（2026-09-13 VM185：OpenVPN 2.7 的 ovpn-dco）══════════
+
+/// 拿 VM185 那份抓取的五个判据分节，跑一遍**真正的** Linux 腿（纯函数那一支）。
+///
+/// 走 [`assemble_linux_probe`] 而不是只调 [`parse_ip_link_names`]：要证的不是「解析器认得
+/// `@@@LINK_OVPN` 里那两行」，而是「这两个接口最终进了 `tunnel_interfaces`、它们宣告的网段
+/// 最终进了 `foreign`」—— 中间还隔着三张链路表的合并去重，那一步漏掉的话名字认对了也没用。
+fn linux_leg(file: &str) -> ForeignTunnelSnapshot {
+    let raw = read_fixture(file);
+    assemble_linux_probe(
+        &section(&raw, "V4_ROUTE"),
+        &section(&raw, "V6_ROUTE"),
+        &section(&raw, "LINK_TUN"),
+        &section(&raw, "LINK_WIREGUARD"),
+        &section(&raw, "LINK_OVPN"),
+        &[],
+    )
+}
+
+/// 🔴 **Linux 腿在 ovpn-dco 抓取上看得见全部三条隧道**（`tap0` / `tun0` / `tun1`）。
+///
+/// # 这份抓取证的是什么
+///
+/// OpenVPN 2.7 在 Linux 上默认走 ovpn-dco 内核模块，设备的 **link type 是 `ovpn`**，
+/// 而设备**名字**仍叫 `tunN`。于是同一台机器上：
+///
+/// | 查询 | 回什么 |
+/// |---|---|
+/// | `ip -o link show type tun` | 只有 `tap0`（传统 TAP） |
+/// | `ip -o link show type ovpn` | `tun0`、`tun1` |
+///
+/// 补 `ovpn` 这条腿**之前**，`tun1` 上那条 `198.18.42.0/24`（落在 FakeIP 段 `198.18.0.0/15`
+/// 里）压根进不了 `tunnel_interfaces`，`detect_tunnel_conflicts` 于是在这台机器上返回
+/// **0 条冲突** —— 那句自信的「无冲突」正是整条链路存在的理由要防的。
+///
+/// # 名字的**来源**也断，不只断结果
+///
+/// 只断「名单里有 `tun0`」的话，一个从 `@@@LINK_DETAIL`（`ip -d link show`，里面什么都有）
+/// 或从路由表 `dev` 列反推名字的实现也能全绿 —— 而那两种都不是生产读法。故先逐段断三张
+/// 链路表各自解析出什么，再断合并结果。
+#[test]
+fn linux_leg_on_the_ovpn_dco_capture_sees_tun0_tun1_and_tap0() {
+    let raw = read_fixture(LINUX_FIXTURE_OVPN_DCO);
+
+    // ── ① 名字的来源：三段各自解析出什么 ──
+    assert_eq!(
+        parse_ip_link_names(&section(&raw, "LINK_TUN")),
+        vec!["tap0".to_string()],
+        "`type tun` 这张表在这台机器上**只有** tap0 —— 两条 OpenVPN 隧道一条都不在里面。\
+         这正是本份抓取要证的那件事；它要是也回了 tunN，说明夹具换了，下面的结论全要重核"
+    );
+    assert!(
+        parse_ip_link_names(&section(&raw, "LINK_WIREGUARD")).is_empty(),
+        "这台机器没装 wireguard 模块，那张表该是空的"
+    );
+    assert_eq!(
+        parse_ip_link_names(&section(&raw, "LINK_OVPN")),
+        vec!["tun0".to_string(), "tun1".to_string()],
+        "`type ovpn` 这张表才是 tun0 / tun1 的唯一来源"
+    );
+
+    // ── ② 合并结果 ──
+    let snapshot = linux_leg(LINUX_FIXTURE_OVPN_DCO);
+    assert_eq!(
+        snapshot.tunnel_interfaces,
+        vec!["tap0".to_string(), "tun0".to_string(), "tun1".to_string()],
+        "三张链路表的并集不对（顺序 = 查询序：tun → wireguard → ovpn）"
+    );
+
+    // ── ③ 业务后果：FakeIP 段上那条宣告真的被摘出来了 ──
+    //
+    // 断到「它落在 FakeIP 块里」为止，而不是只断 `foreign` 非空：这条门要防的缺陷是
+    // 「装着 OpenVPN 的机器拿到一句无冲突」，而那句话是在**判定面**上说的。
+    const FAKE_IP_BLOCK: &str = "198.18.0.0/15";
+    let on_ovpn: Vec<&RouteEntry> = snapshot
+        .foreign
+        .iter()
+        .filter(|r| r.interface == "tun1")
+        .collect();
+    assert!(
+        on_ovpn.iter().any(|r| r.prefix == "198.18.42.0/24"
+            && polaris_config_engine::user_config::cidr::cidr_contains(FAKE_IP_BLOCK, &r.prefix)),
+        "tun1 上那条落在 FakeIP 段 {FAKE_IP_BLOCK} 里的宣告没被摘出来：{on_ovpn:?}"
+    );
+    // 另外两条隧道宣告的业务网段也在（tun0 的 `10.8.0.0/24`、tap0 的 `10.9.0.0/24`）——
+    // 只断 tun1 的话，「ovpn 那张表只带进来了一个名字」这种半截实现也能过。
+    for (iface, prefix) in [("tun0", "10.8.0.0/24"), ("tap0", "10.9.0.0/24")] {
+        assert!(
+            snapshot
+                .foreign
+                .iter()
+                .any(|r| r.interface == iface && r.prefix == prefix),
+            "{iface} 宣告的 {prefix} 没进 foreign：{:?}",
+            snapshot.foreign
+        );
+    }
+
+    // ── ④ 负向对照（**活输入**）：把 `@@@LINK_OVPN` 那一段换成空，两条 OpenVPN 隧道必须消失 ──
+    //
+    // 这一半不能省。缺了它，本条在「ovpn 那条腿被整个删掉」之外的任何一种回归上都还是绿的 ——
+    // 比如有人改成从 `@@@LINK_DETAIL` 里捞名字，结果一样、来源全错。
+    let without_ovpn = assemble_linux_probe(
+        &section(&raw, "V4_ROUTE"),
+        &section(&raw, "V6_ROUTE"),
+        &section(&raw, "LINK_TUN"),
+        &section(&raw, "LINK_WIREGUARD"),
+        "",
+        &[],
+    );
+    assert_eq!(
+        without_ovpn.tunnel_interfaces,
+        vec!["tap0".to_string()],
+        "去掉 ovpn 那一段之后名单里还有别的 —— 说明 tun0/tun1 是从别处捞来的，不是这条腿带进来的"
+    );
+    assert!(
+        !without_ovpn
+            .foreign
+            .iter()
+            .any(|r| r.prefix == "198.18.42.0/24"),
+        "去掉 ovpn 那一段之后 FakeIP 那条宣告还在 —— 判据没咬在链路表上：{:?}",
+        without_ovpn.foreign
+    );
+}
+
+/// 🔴 **Linux 的隧道 link type 名单 = 有真机样本的那三种，其余如实登记成缺口**。
+///
+/// `gre` / `sit` / `ipip` / `vti` / `xfrm` / `ip6tnl` 同样是隧道 link type，判据里**没有**它们：
+/// 仓里一份实测样本都没有。不盲收的理由与 Windows 侧 `WINDOWS_TUNNEL_IF_TYPES` 那条同 ——
+/// 判据面里混着没人验过的项，下一个人就分不清哪些结论有收据。
+///
+/// 本条是那条登记的绊线：哪天有带这些类型的 Linux 抓取入库（`@@@LINK_GRE` 一类的分节，
+/// 或 `@@@LINK_DETAIL` 里出现这些类型名），它会红并要求按实测重新评估判据面。
+///
+/// 取材面是**全部** Linux 抓取（[`linux_fixture_names`]），不是写死某一份。
+#[test]
+fn linux_tunnel_link_types_are_exactly_the_three_with_samples() {
+    /// 判据里认的三种 link type，各有真机正样本。
+    const SAMPLED_LINK_TYPES: &[&str] = &["tun", "wireguard", "ovpn"];
+    /// 仍无样本的隧道 link type：出现即红。
+    ///
+    /// `ip -d link show` 会在接口详情行的**行首**打出 link type（`ovpn addrgenmode …`、
+    /// `tun type tap …`），故按「详情行以某个类型名开头」来找，而不是全文 `contains` ——
+    /// 后者会被 `gre` 撞上 `aggregate`、`sit` 撞上 `transit` 这类子串命中骗成假红。
+    const UNSAMPLED_LINK_TYPES: &[&str] = &[
+        "gre", "gretap", "sit", "ipip", "vti", "vti6", "xfrm", "ip6tnl",
+    ];
+
+    for file in linux_fixture_names() {
+        let raw = read_fixture(&file);
+        let sections = split_sections(&raw);
+
+        // 判据分节名单：三种各一个 `@@@LINK_<T>`，多一个都得有人解释。
+        let link_ids: Vec<&str> = sections
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .filter(|id| id.starts_with("LINK_") && *id != "LINK_DETAIL")
+            .collect();
+        assert_eq!(
+            link_ids,
+            SAMPLED_LINK_TYPES
+                .iter()
+                .map(|t| format!("LINK_{}", t.to_uppercase()))
+                .collect::<Vec<_>>(),
+            "{file} 的链路查询分节不是有样本的那三种 —— 多出来的那个要么登记成新判据、\
+             要么说明为什么只抓不认"
+        );
+
+        // 前提：详情段真有内容，否则下面那条否定断言恒真。
+        let detail = section(&raw, "LINK_DETAIL");
+        assert!(
+            detail.contains("link/"),
+            "{file} 的 @@@LINK_DETAIL 里一行 `link/…` 都没有 —— 下一条否定断言没有信息量"
+        );
+        // 正向对照：这套「行首类型名」的找法在**已知存在**的类型上确实命中
+        // （`ovpn addrgenmode …` 与 `tun type tap …` 都在这份抓取里）。
+        let starts_with_type = |ty: &str| {
+            detail
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{ty} ")))
+        };
+        assert!(
+            starts_with_type("ovpn") && starts_with_type("tun"),
+            "{file}：`ovpn` / `tun` 这两个已知存在的 link type 没被这套找法命中 —— \
+             下面那条否定断言的找法是坏的"
+        );
+
+        let hit: Vec<&str> = UNSAMPLED_LINK_TYPES
+            .iter()
+            .copied()
+            .filter(|ty| starts_with_type(ty))
+            .collect();
+        assert!(
+            hit.is_empty(),
+            "{file} 里出现了仓里没有样本的隧道 link type（命中 {hit:?}）—— \
+             「这几种无实测样本」这条登记过期了。该做的是：\
+             ① 给 probe_linux 加对应的 `ip -o link show type <T>` 查询并补一段抓取；\
+             ② 把它从 UNSAMPLED_LINK_TYPES 划到 SAMPLED_LINK_TYPES；\
+             ③ 同步 route_probe 模块头注里那条「只收 ovpn 这一种」的取舍说明。"
+        );
+    }
+}
+
+// ══════════ 行尾：真正该钉住的不变量是「解析器不因行尾而分叉」 ══════════
+
+/// 🔴 **Windows 侧四支解析器对 CRLF 与 LF 产出逐条相同的结果**。
+///
+/// # 为什么写这条：一道「声称在保护某性质、而那性质早已不在」的配置
+///
+/// 夹具目录的 `.gitattributes` 写着 `*.txt -text`，注释说这是为了让 Windows 抓取的 CRLF
+/// **活着进仓**（仓根规则 `* text=auto eol=lf` 会把它规范成 LF）。可是**三份 2026-09-12 的
+/// Windows 夹具在磁盘上一个 `\r` 都没有** —— 上一轮入库时就丢了。也就是说那条配置在它唯一
+/// 要做的那件事上已经失效了一整轮，而没有任何地方红过：**门在，但没牙**。
+///
+/// 把夹具的行尾修回去只是提高保真度，治不了这个形状 —— 下一次谁再用一个规范化行尾的工具
+/// 过一遍夹具，同样的事会再发生一次，同样没人喊。真正该钉住的不变量不是「夹具里有 `\r`」，
+/// 而是**「解析器不因行尾而分叉」**：那条钉住了，夹具的行尾丢没丢就降级成保真度问题
+/// （仍然该修，但不再是正确性问题）。
+///
+/// # 两个方向都跑
+///
+/// 仓里两类夹具都有（2026-09-13 那两份带 CRLF，2026-09-12 那三份是纯 LF），故不区分来源：
+/// 每一份都在内存里规整出 LF 与 CRLF 两个版本，两份都喂解析器，逐条比。
+/// 另带一条**磁盘普查**：至少得有一份夹具真的带着 CRLF，否则「CRLF 是真机形态」这件事
+/// 在仓里没有任何实物依据，上面那组比对比的就是两个合成串。
+///
+/// # 如实登记：它现在是**回归绊线**，不是活的鉴别器
+///
+/// 变异实测（2026-09-13）：当前实现下这条门**单条**变异打不红 —— `str::lines()` 本身就吃掉
+/// CRLF，后面又全走 `split_whitespace()` / `trim()`，任一处单独改都还是不分叉。
+/// 要两条**同时**打上才红：
+///
+///  1. `parse_format_table` 的 `stdout.lines()` 换成按换行符 `split`（回车留在行尾）；
+///  2. `slice_by_columns` 的 `.trim()` 换成只 trim 空格（回车留在单元格里）。
+///
+/// 两条一起打上时本条逐字红成：`windows-…-hyperv-present-… CRLF 版对照表：
+/// `Get-NetIPAddress` 的列头里没有 `InterfaceIndex` 列` —— 一个看不见的回车把最后一列的
+/// 名字毁掉了，而那张表是另外两支解析器的输入。
+///
+/// 也就是说：这条不变量目前由 `str::lines()` 这**一个收口**结构性地保住，本门守的是
+/// 「别把那个收口换掉」。写下这一条是因为「单条变异打不红」与「这道门没用」长得像，
+/// 而两者该做的事完全不同。
+#[test]
+fn windows_parsers_do_not_fork_on_line_endings() {
+    /// 磁盘上**必须**带着 CRLF 的夹具：真机行尾的实物依据。
+    ///
+    /// 只断「这几份必须有」，**不**断「其余几份必须没有」—— 后者会在有人把 2026-09-12 那三份
+    /// 的行尾修回去（一件好事）那天变成假红。
+    const MUST_CARRY_CRLF: &[&str] = &[
+        WINDOWS_FIXTURE_TAP,
+        WINDOWS_FIXTURE_HYPERV,
+        WINDOWS_FIXTURE_RAS,
+    ];
+
+    for file in MUST_CARRY_CRLF.iter().copied() {
+        let raw = read_fixture(file);
+        assert!(
+            raw.contains("\r\n"),
+            "{file} 在磁盘上没有 CRLF —— `.gitattributes` 的 `*.txt -text` 又一次没顶住，\
+             或者这份夹具被某个规范化行尾的工具过了一遍"
+        );
+    }
+
+    for file in windows_fixture_names() {
+        let raw = read_fixture(&file);
+        // 先统一到 LF，再由它派生 CRLF：直接对原文做 `replace("\n","\r\n")` 会把已有的
+        // CRLF 打成 `\r\r\n`（对已规范化的那三份没事，对带 CRLF 的两份是坏输入）。
+        let lf = raw.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert!(
+            !crlf.contains("\r\r"),
+            "{file}：派生出来的 CRLF 版本里出现了 `\\r\\r` —— 规整步骤写错了"
+        );
+
+        let sec = |body: &str, id: &str| section(body, id);
+        // 四支判据解析器逐一对差。对照表那支先做，另外两支要用它的产出。
+        let names_lf = parse_get_netipaddress(&sec(&lf, "GET_NETIPADDRESS"))
+            .unwrap_or_else(|e| panic!("{file} LF 版对照表：{e}"));
+        let names_crlf = parse_get_netipaddress(&sec(&crlf, "GET_NETIPADDRESS"))
+            .unwrap_or_else(|e| panic!("{file} CRLF 版对照表：{e}"));
+
+        for id in ["ROUTE_PRINT_4", "ROUTE_PRINT_6"] {
+            let a = parse_route_print_routes(&sec(&lf, id), &names_lf)
+                .unwrap_or_else(|e| panic!("{file} 的 @@@{id} LF 版：{e}"));
+            let b = parse_route_print_routes(&sec(&crlf, id), &names_crlf)
+                .unwrap_or_else(|e| panic!("{file} 的 @@@{id} CRLF 版：{e}"));
+            // 正向对照：这一段真的解析出了东西，否则「两版相同」可能只是「两版都空」。
+            assert!(
+                !a.is_empty(),
+                "{file} 的 @@@{id} 解析出 0 条 —— 下面那条相等断言没有信息量"
+            );
+            assert_eq!(a, b, "{file} 的 @@@{id}：解析结果随行尾分叉了");
+        }
+
+        let t_lf = parse_windows_tunnel_interfaces(&sec(&lf, "GET_NETADAPTER"))
+            .unwrap_or_else(|e| panic!("{file} 的 @@@GET_NETADAPTER LF 版：{e}"));
+        let t_crlf = parse_windows_tunnel_interfaces(&sec(&crlf, "GET_NETADAPTER"))
+            .unwrap_or_else(|e| panic!("{file} 的 @@@GET_NETADAPTER CRLF 版：{e}"));
+        assert!(
+            !t_lf.is_empty(),
+            "{file} 的隧道名单是空的 —— 下面那条相等断言没有信息量"
+        );
+        assert_eq!(t_lf, t_crlf, "{file}：隧道名单随行尾分叉了");
+
+        // 对照表本身也比一次（它是另外两支的输入，先塌的话上面几条会一起塌得看不出原因）。
+        assert!(!names_lf.is_empty(), "{file}：对照表解析出 0 条");
+        assert_eq!(names_lf, names_crlf, "{file}：对照表随行尾分叉了");
+    }
+}
+
+// ══════════ macOS 第二读数：`route -n get`（PF_ROUTE / RTM_GET）交叉对差 ══════════
+
+/// `@@@V4_ROUTE_GET` / `@@@V6_ROUTE_GET` 里的一条记录。
+///
+/// 采集脚本对 `netstat -rn` 的 `Destination` 列逐个跑 `route -n get`，每条前面写一行
+/// `### dest=<原样> padded=<补零后>`，后跟命令的完整输出。
+#[derive(Debug)]
+struct RouteGetRecord {
+    /// `### dest=` —— **原样**的 netstat 目的地 token（含 classful 缩写与 `%作用域`）。
+    /// 它是与第一读数对齐的天然连接键：两边问的是同一个字符串。
+    dest: String,
+    /// `### padded=` —— 真正喂给 `route -n get` 的那一份。
+    ///
+    /// 🔴 **v4 必须先补零到四段**：macOS 的 `route -n get` 对 classful 缩写**误解析** ——
+    /// `route -n get 192.168.10` 问到的是 `192.168.0.10`，`169.254` 问到的是 `169.0.0.254`
+    /// （它把缩写当成「省掉的是中间几段」，而 `netstat` 打印的语义是「省掉的是尾部零字节」）。
+    /// 不补零的话第二读数会静悄悄地问了另一批地址，然后与第一读数对不上 —— 而红出来的会是
+    /// 「解析器错了」，方向全反。
+    padded: String,
+    /// `route -n get` 回显的 `destination:` —— **内核自己**渲染的目的地。
+    destination: Option<String>,
+    /// `route -n get` 回显的 `mask:` —— **内核自己**算出来的掩码，v4 / v6 两族都逐字入库。
+    ///
+    /// 主机路由不打印这一行（那是「没有掩码」，不是「掩码为空」），见 [`route_get_prefix`]。
+    mask: Option<String>,
+    /// `interface:` —— 这条门真正要对差的那一列。
+    ///
+    /// `None` 有真形态：`route -n get 255.255.255.255/32` 回的是 `route: bad address`，
+    /// 一行 `interface:` 都没有。那类跳过，**不是**不一致。
+    interface: Option<String>,
+}
+
+/// 切一段 `@@@V*_ROUTE_GET`。
+fn parse_route_get_section(body: &str) -> Vec<RouteGetRecord> {
+    let mut out: Vec<RouteGetRecord> = Vec::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("### dest=") {
+            let mut parts = rest.split(" padded=");
+            let dest = parts.next().unwrap_or_default().trim().to_string();
+            let padded = parts.next().unwrap_or_default().trim().to_string();
+            out.push(RouteGetRecord {
+                dest,
+                padded,
+                destination: None,
+                mask: None,
+                interface: None,
+            });
+            continue;
+        }
+        let Some(cur) = out.last_mut() else { continue };
+        let t = line.trim();
+        // 逐字段各取一次：`route -n get` 的输出是 `字段: 值` 的定宽块，`destination:` 与
+        // `route to:` 长得像但不是一回事（后者是**请求**的地址，前者是内核匹配到的路由）。
+        for (key, slot) in [
+            ("destination:", &mut cur.destination),
+            ("mask:", &mut cur.mask),
+            ("interface:", &mut cur.interface),
+        ] {
+            if let Some(v) = t.strip_prefix(key) {
+                *slot = Some(v.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 连续掩码 → 前缀长度；掩码不连续时 `None`。
+///
+/// 判据是**位级**的：`leading_ones + trailing_zeros == 位宽`。不查这条的话，
+/// 一个坏掩码（`255.0.255.0`）会被 `leading_ones()` 给出一个看着正常的长度 `8`，
+/// 然后悄悄地与另一条前缀对齐上 —— 那比报错危险。
+fn contiguous_prefix_len(bits: u128, width: u32) -> Option<u8> {
+    let shifted = bits << (128 - width);
+    if shifted.leading_ones() + shifted.trailing_zeros() != 128 {
+        return None;
+    }
+    u8::try_from(shifted.leading_ones()).ok()
+}
+
+/// 第二读数的目的前缀 —— **不经过生产的 `expand_netstat_destination`**。
+///
+/// 复用生产的规范化函数等于两边共用同一个错，对差就没有检出力了（同 Windows 侧
+/// `Get-NetRoute` 那条交叉验证的口径：参照解析器在测试里另写一份）。
+///
+/// **v4 / v6 同一套读法**：地址与长度都取自内核回显（`destination:` + `mask:`），
+/// 与生产解析器一行代码都不共用。主机路由不打印 `mask:` ⇒ `/32` / `/128`。
+///
+/// 于是两件事在这条门上被**独立**核了一遍：
+///
+///  - v4 的 classful 展开（`127` → `127.0.0.0/8`、`224.0.0/4` → `224.0.0.0/4` 这条
+///    「长度明写、地址仍缩写」）；
+///  - v6 的前缀长度 —— `fd7a:115c:a1e0::/48` 那条 `/48` 现在是从内核回显的
+///    `mask: ffff:ffff:ffff::` 数出来的，不是抄 `netstat` 打印的 `/48`。
+///
+/// > 2026-09-13 早些时候这里曾登记「v6 的 `mask:` 被脱敏改坏了，长度只能抄 netstat」。
+/// > 那是脱敏脚本的缺陷（把掩码当成普通十六进制组做了同长度替换），**已修**：
+/// > `polaris-redact-fixture.py` 现在按位级判据认出合法 v6 掩码并逐字保留。夹具重生成后
+/// > v6 这一半的长度也成了独立读数，故那条登记删掉 —— 它不再成立。
+fn route_get_prefix(rec: &RouteGetRecord) -> Option<String> {
+    let dest = rec.destination.as_deref()?;
+    if dest.contains(':') {
+        let addr: Ipv6Addr = dest.split('%').next()?.parse().ok()?;
+        let len = match rec.mask.as_deref() {
+            None => 128,
+            Some(m) => contiguous_prefix_len(u128::from(m.parse::<Ipv6Addr>().ok()?), 128)?,
+        };
+        return Some(format!("{addr}/{len}"));
+    }
+    let addr: Ipv4Addr = dest.parse().ok()?;
+    let len = match rec.mask.as_deref() {
+        None => 32,
+        Some(m) => contiguous_prefix_len(u128::from(u32::from(m.parse::<Ipv4Addr>().ok()?)), 32)?,
+    };
+    Some(format!("{addr}/{len}"))
+}
+
+/// 🔴 **macOS 有第二个独立读数了**：`netstat -rn` 的解析结果 vs 同一份抓取里 `route -n get` 的读数。
+///
+/// # 为什么它是**真的**交叉对差
+///
+/// `route -n get` 走 PF_ROUTE 套接字的 `RTM_GET`（问内核「发往 X 会走哪条路由」），
+/// `netstat -rn` 走的是路由表 **dump**。两条是不同的内核接口，产出也不同形
+/// （前者是逐字段的块，后者是列式表）。此前 mac 侧只有一路读数：解析器错了没有任何东西能
+/// 把它顶红 —— Windows 侧一直有 `route print` 与 `Get-NetRoute` 两路（见
+/// [`route_print_result_matches_the_independent_get_netroute_reading`]），mac 侧这是第一次补上。
+///
+/// # 判据：**第二读数给出的接口，必须在第一读数为同一前缀给出的接口集合里**
+///
+/// 是**子集**而不是相等，理由是结构性的：`RTM_GET` 只回**内核会选的那一条**，而 dump 打印
+/// **全部**。`ff00::/8` 在这份抓取里挂在 13 个接口上（每个接口一份组播克隆），`route -n get`
+/// 只会回其中一个 —— 要求相等就是逼一条结构上不可能的事，红了也只能靠加例外来消，
+/// 那样门就退化成一张例外清单。子集这条则两个方向都咬得住：解析器把接口读错（列错位 /
+/// 对照表塌了）时，第二读数给的那个名字不在集合里，立刻红。
+///
+/// 单接口那批（正是业务网段所在的那批）上，子集 + 非空 ⇒ **相等**，一点没放松。
+///
+/// # 三条容忍规则，每条都有正向对照证明它真的被走到过
+///
+///  1. **`route -n get` 没有 `interface:` 行**：`255.255.255.255/32` 回的是 `route: bad address`。
+///     跳过，但名单钉死 —— 悄悄长出第二条就是解析器开始丢东西了。
+///  2. **本机自己的地址回 `lo0`**：`route -n get 192.168.10.142` 回 `lo0`，而同一台机器的
+///     netstat 表里 `192.168.10.142/32` 是 `en0`。这**不是**矛盾：BSD 把本机地址的主机路由
+///     装在环回上，dump 里那两条（`192.168.10.142` → `lo0` 与 `192.168.10.142/32` → `en0`）
+///     **都在**，规范化之后落到同一条前缀上 ⇒ 第一读数的集合是 `{en0, lo0}`，子集规则天然
+///     容得下。这里不写特判分支，而是**断言这个形态真的出现过** —— 写成特判的话它会退化成
+///     一条没有输入的死代码。
+///  3. **`### dest=Destination`**：采集脚本的 `awk` 把 `netstat` 的**列头行**当数据取了一次
+///     （v4 那段的 `padded` 甚至是 `Destination.0.0.0`）。这是**采集噪声不是数据**，跳过；
+///     同样断言它真的在，免得哪天脚本修好了、这条跳过规则却没人发现已经过期。
+///     `dest=default` 同跳：`route -n get default` 回的是网关那一跳、不是一条 `0.0.0.0/0` 宣告，
+///     两侧形态对不上。生产腿**照常产出**默认路由条目（走 `ForeignTunnelSnapshot::default_routes`），
+///     它的对差由 `default_route_gate` 在 Windows 那份抓取上另做，不靠这条 mac 第二读数。
+#[test]
+fn macos_netstat_reading_agrees_with_the_independent_route_get_reading() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let raw = read_fixture(MACOS_FIXTURE_ROUTE_GET);
+
+    // ── 第一读数：生产的 mac 腿 ──
+    let v4 = section_any(&raw, MACOS_NETSTAT_V4);
+    let v6 = section_any(&raw, MACOS_NETSTAT_V6);
+    let ifconfig = section_any(&raw, MACOS_IFCONFIG);
+    let snapshot =
+        assemble_macos_probe(&v4, &v6, &ifconfig, &[]).expect("第一读数：mac 腿应解析得动");
+    let mut first_rows = parse_netstat_routes(&v4, IpFamily::V4).expect("v4");
+    first_rows.extend(parse_netstat_routes(&v6, IpFamily::V6).expect("v6"));
+    let mut first: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for r in &first_rows {
+        first
+            .entry(r.prefix.clone())
+            .or_default()
+            .insert(r.interface.clone());
+    }
+
+    // ── 第二读数：route -n get ──
+    let mut records = parse_route_get_section(&section(&raw, "V4_ROUTE_GET"));
+    records.extend(parse_route_get_section(&section(&raw, "V6_ROUTE_GET")));
+    assert!(
+        records.len() > 100,
+        "第二读数只切出 {} 条 —— 分节切分或 `### dest=` 那条前缀写错了",
+        records.len()
+    );
+
+    /// 采集噪声 / 非具体网段：跳过，理由见本测试头注第 3 条。
+    const SKIPPED_DESTS: &[&str] = &["default", "Destination"];
+
+    let mut second: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut no_interface: Vec<&str> = Vec::new();
+    let mut skipped_named: BTreeSet<&str> = BTreeSet::new();
+    let mut padded_differs: Vec<(&str, &str, String)> = Vec::new();
+    // 长度**由内核回显的 `mask:` 数出来**的那批记录：`(dest, mask, 推出的前缀)`。
+    //
+    // 分 v4 / v6 两张单子，因为这条门的两半此前不是同一强度：v4 一直靠 mask，
+    // v6 一度只能抄 `netstat` 打印的 `/N`（脱敏脚本把掩码改坏了）。脚本修好、夹具重生成之后
+    // 两半同强度，而「同强度」这件事必须有条数在这里钉着 —— 否则哪天 v6 那半悄悄退回抄 `/N`，
+    // 门照样全绿。
+    let mut v4_len_from_mask: Vec<(&str, &str, String)> = Vec::new();
+    let mut v6_len_from_mask: Vec<(&str, &str, String)> = Vec::new();
+    for rec in &records {
+        if let Some(name) = SKIPPED_DESTS.iter().find(|d| **d == rec.dest) {
+            skipped_named.insert(name);
+            continue;
+        }
+        let Some(iface) = rec.interface.as_deref() else {
+            no_interface.push(&rec.dest);
+            continue;
+        };
+        let prefix = route_get_prefix(rec)
+            .unwrap_or_else(|| panic!("第二读数认不出这条记录的目的地：{rec:?}"));
+        // 🔴 补零那一步真的做对了：补出来的四段地址，必须与内核回显里那个地址逐字一致。
+        // 这是 macOS `route -n get` 对 classful 缩写误解析那条真机事实的**收据** ——
+        // 没补零的话 `192.168.10` 会被问成 `192.168.0.10`，`padded` 与内核回显对不上。
+        if rec.padded != rec.dest {
+            let addr = prefix.split('/').next().unwrap_or_default().to_string();
+            assert_eq!(
+                rec.padded, addr,
+                "补零后的目的地与内核回显的 `destination:` 对不上：{rec:?}"
+            );
+            padded_differs.push((&rec.dest, &rec.padded, prefix.clone()));
+        }
+        // 记下长度的**来源**：有 `mask:` 行 ⇒ 长度是内核数出来的；没有 ⇒ 走主机路由的兜底
+        // （`/32` / `/128`），那条兜底不是独立读数，不该算进下面的正向对照条数里。
+        if let Some(mask) = rec.mask.as_deref() {
+            let bucket = if rec.destination.as_deref().is_some_and(|d| d.contains(':')) {
+                &mut v6_len_from_mask
+            } else {
+                &mut v4_len_from_mask
+            };
+            bucket.push((&rec.dest, mask, prefix.clone()));
+        }
+        second.entry(prefix).or_default().insert(iface.to_string());
+    }
+
+    // ── 容忍规则的正向对照：三条都真的被走到过，且名单钉死 ──
+    assert_eq!(
+        no_interface,
+        ["255.255.255.255/32"],
+        "「没有 interface: 行」的记录名单变了 —— 多出来的那条要么是新形态、\
+         要么是第二读数开始丢东西了"
+    );
+    assert_eq!(
+        skipped_named.into_iter().collect::<Vec<_>>(),
+        ["Destination", "default"],
+        "跳过名单没被走全 —— `Destination` 那条是采集脚本 awk 把列头当数据取的噪声，\
+         它要是不在了，说明脚本修好了而这条跳过规则已经过期"
+    );
+    // classful 缩写那批确实进了对比（`127` / `169.254` / `192.168.10` 三条各是一种长度）。
+    let padded_dests: BTreeSet<&str> = padded_differs.iter().map(|(d, _, _)| *d).collect();
+    for want in ["127", "169.254", "192.168.10"] {
+        assert!(
+            padded_dests.contains(want),
+            "classful 缩写 `{want}` 没进第二读数 —— 补零那条收据没有输入：{padded_dests:?}"
+        );
+    }
+
+    // ── 🔴 正向对照：两个地址族的前缀长度**都**是从内核回显的 `mask:` 数出来的 ──
+    //
+    // 条数钉死，换样本时红。只断「有」而不断条数的话，v6 那半退化成只剩一两条时也不会有人发现。
+    assert_eq!(
+        v4_len_from_mask.len(),
+        33,
+        "v4 由 `mask:` 定出长度的记录条数变了：{v4_len_from_mask:?}"
+    );
+    assert_eq!(
+        v6_len_from_mask.len(),
+        42,
+        "v6 由 `mask:` 定出长度的记录条数变了 —— 这一半此前不是独立读数（脱敏脚本把 v6 掩码\
+         改坏了），条数掉下去就说明它又退回抄 `netstat` 打印的 `/N` 了：{v6_len_from_mask:?}"
+    );
+    // 逐条点名两条**非平凡**长度：抄 `/N` 与从 mask 数出来在这两条上会给出同一个答案，
+    // 所以它们证不了独立性 —— 它们证的是「mask 这条读法在真形态上跑得通」。
+    // 真正证独立性的是下面那条变异对照（把 mask 改一位，门必须红）。
+    for (dest, mask, prefix) in [
+        (
+            "fd7a:115c:a1e0::/48",
+            "ffff:ffff:ffff::",
+            "fd7a:115c:a1e0::/48",
+        ),
+        ("ff00::/8", "ff00::", "ff00::/8"),
+    ] {
+        assert!(
+            v6_len_from_mask
+                .iter()
+                .any(|(d, m, p)| *d == dest && *m == mask && p == prefix),
+            "`{dest}` 的长度没从 `{mask}` 数出来：{v6_len_from_mask:?}"
+        );
+    }
+
+    // 🔴 **变异对照（活输入）**：把某条 v6 记录的 `mask:` 改一位，推出来的前缀必须跟着变。
+    // 这一条是「v6 长度真的取自 mask」的唯一硬证据 —— 只断条数的话，一个仍在抄 `/N` 的实现
+    // 同样能让上面那些全绿。
+    let mut mutated = RouteGetRecord {
+        dest: "fd7a:115c:a1e0::/48".to_string(),
+        padded: "fd7a:115c:a1e0::/48".to_string(),
+        destination: Some("fd7a:115c:a1e0::".to_string()),
+        mask: Some("ffff:ffff:ffff::".to_string()),
+        interface: Some("utun11".to_string()),
+    };
+    assert_eq!(
+        route_get_prefix(&mutated).as_deref(),
+        Some("fd7a:115c:a1e0::/48"),
+        "前提：未变异时它就是 /48"
+    );
+    mutated.mask = Some("ffff:ffff::".to_string());
+    assert_eq!(
+        route_get_prefix(&mutated).as_deref(),
+        Some("fd7a:115c:a1e0::/32"),
+        "改了 `mask:` 而前缀长度没跟着变 —— v6 那半还在抄 `netstat` 打印的 `/N`"
+    );
+    // 顺带钉住连续性判据：不连续的掩码必须 `None`，不许被 `leading_ones()` 读成一个正常长度。
+    mutated.mask = Some("ffff::ffff".to_string());
+    assert_eq!(
+        route_get_prefix(&mutated),
+        None,
+        "不连续的掩码被当成合法长度了"
+    );
+
+    // ── 判据主体：子集 ──
+    let violations: Vec<(String, Vec<String>, Vec<String>)> = second
+        .iter()
+        .filter(|(prefix, b)| !b.is_subset(first.get(prefix.as_str()).unwrap_or(&BTreeSet::new())))
+        .map(|(p, b)| {
+            (
+                p.clone(),
+                b.iter().cloned().collect(),
+                first
+                    .get(p)
+                    .map(|a| a.iter().cloned().collect())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "两路读数对不上（第二读数说的接口不在第一读数为同一前缀给出的集合里）：{violations:#?}"
+    );
+
+    // ── 🔴 正向对照①：对上的条数够多，且**业务网段那批逐条相等** ──
+    //
+    // 一道「什么都没比到也绿」的交叉对差门是假绿。这里钉住：第二读数里独指 `utun11`
+    // （= tailnet 那批）的前缀有 30 条，且每一条在第一读数里也**恰好**只有 utun11。
+    let utun11_only: BTreeSet<&str> = second
+        .iter()
+        .filter(|(_, b)| b.len() == 1 && b.contains("utun11"))
+        .map(|(p, _)| p.as_str())
+        .collect();
+    assert_eq!(
+        utun11_only.len(),
+        30,
+        "第二读数独指 utun11 的前缀条数变了：{utun11_only:?}"
+    );
+    for prefix in &utun11_only {
+        assert_eq!(
+            first.get(*prefix).map(|a| a.iter().cloned().collect()),
+            Some(vec!["utun11".to_string()]),
+            "第一读数对 {prefix} 的接口不是「只有 utun11」"
+        );
+    }
+    // 逐条点名那批照记忆写不出来的形态（Tailscale 装的是**逐 peer 的 `/32`**，不是汇总段）。
+    assert_eq!(
+        utun11_only
+            .iter()
+            .filter(|p| p.starts_with("32.0.0.") && p.ends_with("/32"))
+            .count(),
+        27,
+        "逐 peer `/32` 的条数变了：{utun11_only:?}"
+    );
+    for want in [
+        "100.100.100.100/32",
+        "fd7a:115c:a1e0::/48",
+        "fd7a:115c:a1e0::e9/128",
+    ] {
+        assert!(
+            utun11_only.contains(want),
+            "{want} 没进交叉对差：{utun11_only:?}"
+        );
+    }
+    // 生产腿的 `foreign` 与之对得上：上面比的是「解析器 vs 内核」，这条比的是
+    // 「解析器 vs 它自己的下游」—— 名单对了但 foreign 没落上去的话这里红。
+    for prefix in &utun11_only {
+        assert!(
+            snapshot
+                .foreign
+                .iter()
+                .any(|r| r.prefix == *prefix && r.interface == "utun11"),
+            "{prefix} 在两路读数上都属于 utun11，却没进生产腿的 foreign"
+        );
+    }
+
+    // ── 🔴 正向对照②：三条容忍规则里的 lo0 那条，形态真的出现了 ──
+    assert_eq!(
+        first
+            .get("192.168.10.142/32")
+            .map(|a| a.iter().cloned().collect::<Vec<_>>()),
+        Some(vec!["en0".to_string(), "lo0".to_string()]),
+        "「本机地址的主机路由同时出现在 lo0 与物理口上」这个形态不在了 —— \
+         容忍规则第 2 条失去输入，说明里那段话要重核"
+    );
+    assert_eq!(
+        second
+            .get("192.168.10.142/32")
+            .map(|a| a.iter().cloned().collect::<Vec<_>>()),
+        Some(vec!["en0".to_string(), "lo0".to_string()]),
+        "第二读数对本机地址的回答变了"
+    );
+
+    // ── 🔴 正向对照③：「子集而非相等」那条真的被用到了，且只被这两条用到 ──
+    let strict_subset: Vec<&str> = second
+        .iter()
+        .filter(|(p, b)| first.get(p.as_str()) != Some(*b))
+        .map(|(p, _)| p.as_str())
+        .collect();
+    assert_eq!(
+        strict_subset,
+        ["224.0.0.0/4", "ff00::/8"],
+        "「第二读数只回一条、dump 打印多条」的前缀名单变了 —— 子集这条放宽的射程要重核"
+    );
+
+    // ── 🔴 负向对照（**活输入**）：把第二读数里的 utun11 改成 en0，本门必须红 ──
+    //
+    // 缺了这半，上面那一大片相等只证得了「两边现在一样」，证不了「不一样时会被抓到」。
+    let mutated_body = section(&raw, "V4_ROUTE_GET").replace("interface: utun11", "interface: en0");
+    let applied = section(&raw, "V4_ROUTE_GET")
+        .matches("interface: utun11")
+        .count();
+    assert!(
+        applied >= 20,
+        "变异没打上（只替换了 {applied} 处）—— 一次没生效的变异红绿都不算数"
+    );
+    let mutated: Vec<RouteGetRecord> = parse_route_get_section(&mutated_body);
+    let caught = mutated.iter().any(|rec| {
+        rec.interface.as_deref() == Some("en0")
+            && route_get_prefix(rec).is_some_and(|p| {
+                first
+                    .get(&p)
+                    .is_some_and(|a| !a.contains("en0") && a.contains("utun11"))
+            })
+    });
+    assert!(
+        caught,
+        "把第二读数的 utun11 改成 en0 之后子集判据仍然没红 —— 这道门咬不住接口那一列"
     );
 }

@@ -14,7 +14,18 @@
  */
 
 /** 冲突类别。镜像 Rust `builder::tunnel_conflict::ConflictKind`（serde camelCase）。 */
-export type TunnelConflictKind = 'fakeIpOverlap' | 'meshOverlap' | 'tunAddressOverlap';
+export type TunnelConflictKind =
+  | 'fakeIpOverlap'
+  | 'meshOverlap'
+  | 'tunAddressOverlap'
+  /**
+   * 外来隧道宣告了默认路由（全隧道），与本轮 Polaris 的 TUN 同时声索**全部**出站流量。
+   *
+   * 这一类只陈述「两个声索人同时在场」，**不预言谁赢** —— 谁赢取决于平台的路由实现
+   * （Linux 上 sing-box 走 policy routing，根本不在 main 表上竞争；Windows / macOS 才是
+   * 前缀竞争），而且随内核版本漂。文案里不许出现「Polaris 会赢 / 会输」的等价说法。
+   */
+  | 'defaultRouteContended';
 
 /**
  * 探测到的一条**别人的**隧道路由。`interface` 只用于告诉用户「是谁」，不参与判据。
@@ -66,6 +77,18 @@ export type TunnelConflictReport =
        * 又变回同一副样子 —— 而这四支判别联合存在的全部理由就是把这两件事分开。
        */
       suppressedRoutes: number;
+      /**
+       * 外来隧道宣告的**默认路由**（`0.0.0.0/0` / `::/0`）。
+       *
+       * 与 `foreignTunnels` 是**两类事实**，不是它的子集：默认路由与任何前缀相交，
+       * 并进那一批会让冲突判定对我方每条网段各报一次。link-local / 组播那张噪声表是给
+       * `foreignTunnels` 写的，后端**不拿它过滤这一批**（见 Rust 侧 `to_wire` 的头注）。
+       *
+       * 2026-09-13 w207 实测：Windows 内置 L2TP 连上之后，这里有 `0.0.0.0/0`，
+       * 而同一接口在 `foreignTunnels` 里只剩一条 `10.55.0.10/32` —— 少了这个字段，
+       * 界面上「它要了全部流量」会长成「它宣告了一个 /32」。
+       */
+      foreignDefaultRoutes: ForeignTunnelRoute[];
       conflicts: TunnelConflict[];
       criteria: TunnelConflictCriteria;
     };

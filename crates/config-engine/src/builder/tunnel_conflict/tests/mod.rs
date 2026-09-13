@@ -28,6 +28,7 @@ fn self_hosted_tailnet_alone_is_not_a_conflict() {
     ];
     let conflicts = detect_tunnel_conflicts(&ConflictInput {
         foreign: &foreign,
+        default_routes: &[],
         fakeip_ranges: &[FAKEIP_INET4_RANGE.into(), FAKEIP_INET6_RANGE.into()],
         mesh_cidrs: &[],
         tun_addresses: &["172.19.0.1/30".into()],
@@ -44,6 +45,7 @@ fn fakeip_overlap_is_reported() {
     let foreign = vec![route("utun6", "198.18.0.0/16")];
     let conflicts = detect_tunnel_conflicts(&ConflictInput {
         foreign: &foreign,
+        default_routes: &[],
         fakeip_ranges: &[FAKEIP_INET4_RANGE.into()],
         mesh_cidrs: &[],
         tun_addresses: &[],
@@ -59,6 +61,7 @@ fn mesh_overlap_is_reported() {
     let foreign = vec![route("utun4", "100.64.0.0/10")];
     let conflicts = detect_tunnel_conflicts(&ConflictInput {
         foreign: &foreign,
+        default_routes: &[],
         fakeip_ranges: &[],
         mesh_cidrs: &["100.64.0.0/10".into(), "fd7a:115c:a1e0::/48".into()],
         tun_addresses: &[],
@@ -72,6 +75,7 @@ fn tun_address_overlap_is_reported() {
     let foreign = vec![route("utun9", "172.19.0.0/24")];
     let conflicts = detect_tunnel_conflicts(&ConflictInput {
         foreign: &foreign,
+        default_routes: &[],
         fakeip_ranges: &[],
         mesh_cidrs: &[],
         tun_addresses: &["172.19.0.1/30".into()],
@@ -85,6 +89,7 @@ fn multiple_kinds_on_one_prefix_are_all_reported_in_stable_order() {
     let foreign = vec![route("utun4", "100.64.0.0/10")];
     let conflicts = detect_tunnel_conflicts(&ConflictInput {
         foreign: &foreign,
+        default_routes: &[],
         fakeip_ranges: &["100.64.0.0/12".into()],
         mesh_cidrs: &["100.64.0.0/10".into()],
         tun_addresses: &["100.64.0.1/32".into()],
@@ -105,6 +110,7 @@ fn empty_criteria_never_match() {
     let foreign = vec![route("utun4", "10.0.0.0/8")];
     let conflicts = detect_tunnel_conflicts(&ConflictInput {
         foreign: &foreign,
+        default_routes: &[],
         fakeip_ranges: &[],
         mesh_cidrs: &[],
         tun_addresses: &[],
@@ -126,6 +132,7 @@ fn malformed_prefixes_are_skipped() {
     ];
     let conflicts = detect_tunnel_conflicts(&ConflictInput {
         foreign: &foreign,
+        default_routes: &[],
         fakeip_ranges: &[FAKEIP_INET4_RANGE.into()],
         mesh_cidrs: &[],
         tun_addresses: &[],
@@ -136,6 +143,150 @@ fn malformed_prefixes_are_skipped() {
         "只有那条合法且相交的该报：{conflicts:?}"
     );
     assert_eq!(conflicts[0].prefix, "198.18.0.0/16");
+}
+
+// ══════════ 第四类：外来隧道抢默认路由 ══════════
+
+/// 抢默认路由的全隧道 + 本轮确实装了 TUN inbound ⇒ 判出 [`ConflictKind::DefaultRouteContended`]。
+///
+/// 门控**不是**前缀相交：`0.0.0.0/0` 与三组判据段无一不相交，走 `cidr_overlaps_any`
+/// 就是逢隧道必报。这里刻意把三组段全留空，只留 `tun_addresses` ——
+/// 判出来了才说明门控咬的是「我方也是一个声索人」，不是「相交」。
+#[test]
+fn a_foreign_default_route_contends_with_our_tun() {
+    let defaults = vec![route("PolarisProbeL2TP", "0.0.0.0/0")];
+    let conflicts = detect_tunnel_conflicts(&ConflictInput {
+        foreign: &[],
+        default_routes: &defaults,
+        fakeip_ranges: &[],
+        mesh_cidrs: &[],
+        tun_addresses: &["172.19.0.1/30".into()],
+    });
+    assert_eq!(kinds(&conflicts), vec![ConflictKind::DefaultRouteContended]);
+    assert_eq!(conflicts[0].interface, "PolarisProbeL2TP");
+    assert_eq!(
+        conflicts[0].prefix, "0.0.0.0/0",
+        "前缀要保留规范形，族信息不能在这一层丢掉"
+    );
+}
+
+/// v4 / v6 各一条 ⇒ 各出一条，族信息逐条留在前缀里。
+#[test]
+fn both_families_are_reported_separately() {
+    let defaults = vec![
+        route("utun9", "0.0.0.0/0"),
+        route("utun9", "::/0"),
+        route("", "   "),
+    ];
+    let conflicts = detect_tunnel_conflicts(&ConflictInput {
+        foreign: &[],
+        default_routes: &defaults,
+        fakeip_ranges: &[],
+        mesh_cidrs: &[],
+        tun_addresses: &["172.19.0.1/30".into()],
+    });
+    assert_eq!(
+        conflicts
+            .iter()
+            .map(|c| c.prefix.as_str())
+            .collect::<Vec<_>>(),
+        vec!["0.0.0.0/0", "::/0"],
+        "空前缀那条该被跳过，两个族那两条该各出一条：{conflicts:?}"
+    );
+}
+
+/// 🔴 **负向对照①：本轮没装 TUN inbound ⇒ 不报**。
+///
+/// `tun_addresses` 空 = 这次生成压根没发 TUN inbound（systemProxy / manual 模式）。
+/// 那时外来隧道要全部流量与 Polaris **不争** —— 只有一个声索人，不是冲突。
+/// 缺这条对照，上面那条绿可能只是「凡有默认路由就报」。
+#[test]
+fn without_a_tun_inbound_a_foreign_default_route_is_not_a_conflict() {
+    let defaults = vec![route("PolarisProbeL2TP", "0.0.0.0/0")];
+    let input = |tun: &[String]| {
+        detect_tunnel_conflicts(&ConflictInput {
+            foreign: &[],
+            default_routes: &defaults,
+            fakeip_ranges: &["198.18.0.0/15".into()],
+            mesh_cidrs: &["32.0.0.0/24".into()],
+            tun_addresses: tun,
+        })
+    };
+    // 正向对照先行：同一条输入，只把 tun_addresses 填上就必须报。
+    assert_eq!(
+        kinds(&input(&["172.19.0.1/30".into()])),
+        vec![ConflictKind::DefaultRouteContended],
+        "前提：装了 TUN 时它确实会报"
+    );
+    assert!(
+        input(&[]).is_empty(),
+        "没装 TUN inbound 时不该报 —— 只有一个声索人：{:?}",
+        input(&[])
+    );
+}
+
+/// 🔴 **负向对照②：外来隧道不宣告默认路由 ⇒ 不报**，且不连累前三类。
+#[test]
+fn a_tunnel_without_a_default_route_is_not_contended() {
+    let foreign = vec![route("utun4", "198.18.0.0/16")];
+    let conflicts = detect_tunnel_conflicts(&ConflictInput {
+        foreign: &foreign,
+        default_routes: &[],
+        fakeip_ranges: &[FAKEIP_INET4_RANGE.into()],
+        mesh_cidrs: &[],
+        tun_addresses: &["172.19.0.1/30".into()],
+    });
+    assert_eq!(
+        kinds(&conflicts),
+        vec![ConflictKind::FakeIpOverlap],
+        "没有默认路由时只该剩前三类里命中的那条：{conflicts:?}"
+    );
+}
+
+/// 🔴 **新增这一类不许改动前三类的逐条输出**：同一份 `foreign`，加不加 `default_routes`，
+/// 前三类判出来的条目**逐条相同**（顺序也相同），新的那条只能追加在最后。
+///
+/// 没有这条，「顺便把默认路由并进 foreign」这种改法会让前三类各多报一遍，而本条正是它的绊线。
+#[test]
+fn adding_default_routes_does_not_perturb_the_first_three_kinds() {
+    let foreign = vec![
+        route("utun4", "198.18.0.0/16"),
+        route("utun4", "100.64.0.0/10"),
+        route("utun9", "172.19.0.0/24"),
+    ];
+    let criteria = |defaults: &[ForeignTunnelRoute]| {
+        detect_tunnel_conflicts(&ConflictInput {
+            foreign: &foreign,
+            default_routes: defaults,
+            fakeip_ranges: &[FAKEIP_INET4_RANGE.into()],
+            mesh_cidrs: &["100.64.0.0/10".into()],
+            tun_addresses: &["172.19.0.1/30".into()],
+        })
+    };
+    let without = criteria(&[]);
+    assert_eq!(
+        kinds(&without),
+        vec![
+            ConflictKind::FakeIpOverlap,
+            ConflictKind::MeshOverlap,
+            ConflictKind::TunAddressOverlap
+        ],
+        "前提：三类各有一条命中，否则「逐条相同」是空跑"
+    );
+    let with = criteria(&[route("PolarisProbeL2TP", "0.0.0.0/0")]);
+    assert_eq!(
+        with[..without.len()],
+        without[..],
+        "前三类的逐条输出被新类别扰动了"
+    );
+    assert_eq!(
+        with[without.len()..]
+            .iter()
+            .map(|c| c.kind)
+            .collect::<Vec<_>>(),
+        vec![ConflictKind::DefaultRouteContended],
+        "新类别只能追加在最后"
+    );
 }
 
 // ══════════ 判据段的取材面（从本次发射的产物读回）══════════
@@ -260,14 +411,14 @@ fn mesh_criteria_use_the_observed_snapshot() {
         with.mesh_cidrs
     );
     assert_eq!(
-        kinds(&detect_tunnel_conflicts(&with.with_foreign(&foreign))),
+        kinds(&detect_tunnel_conflicts(&with.with_foreign(&foreign, &[]))),
         vec![ConflictKind::MeshOverlap],
         "自建 tailnet 段与本机那条外来隧道争同一段，应判出 MeshOverlap"
     );
 
     let without = emitted_conflict_criteria(&config, &servers, &ObservedTailnetAddresses::new());
     assert!(
-        detect_tunnel_conflicts(&without.with_foreign(&foreign)).is_empty(),
+        detect_tunnel_conflicts(&without.with_foreign(&foreign, &[])).is_empty(),
         "无观测时 mesh 段只有硬编码的 {} 两段，与 32.0.0.0/24 不相交，不该判出任何冲突 —— \
          这里判出来了说明上面那条实验组的绿不是观测面带来的。实际段：{:?}",
         crate::builder::endpoint_routes::TAILNET_CGNAT,

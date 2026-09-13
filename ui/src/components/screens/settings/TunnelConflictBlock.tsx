@@ -63,6 +63,12 @@ const PLATFORM_LABEL: Record<string, string> = {
 function kindLabel(kind: TunnelConflictKind, t: TFunction): string {
   if (kind === 'fakeIpOverlap') return t('settings.tun.tunnelConflictKindFakeIp');
   if (kind === 'meshOverlap') return t('settings.tun.tunnelConflictKindMesh');
+  // 默认路由那一类的措辞只陈述「两个声索人同时在场」，**不预言谁赢**：谁赢取决于平台的
+  // 路由实现（Linux 上 sing-box 的 auto_route 走 policy routing，根本不在 main 表上竞争；
+  // Windows / macOS 才是前缀竞争），而且随内核版本漂。写死一个会漂的结论比不给结论更坏 ——
+  // 用户会据此排除掉真正的病因。判据的射程见 Rust 侧 `ConflictKind::DefaultRouteContended`。
+  if (kind === 'defaultRouteContended')
+    return t('settings.tun.tunnelConflictKindDefaultRoute');
   return t('settings.tun.tunnelConflictKindTun');
 }
 

@@ -14,7 +14,7 @@
 //!    只在 [`TunnelConflictSnapshot::Probed`] 这一支里出现，那时它才真的是一句断言。
 //! 2. **判据段取本次发射的那一份**（`emitted_conflict_criteria`）。核起来之后用户接着改配置、
 //!    观测地址又多一条，都不该让这次判定拿到与内核吃的那份不同的段。
-//! 3. **不放宽判据面。** 只认 FakeIP / Mesh / TUN 地址三类相交，「外来隧道未被排除」刻意不算冲突
+//! 3. **不放宽判据面。** 只认 `builder::tunnel_conflict` 登记在册的那几类，「外来隧道未被排除」刻意不算冲突
 //!    （理由见 `builder::tunnel_conflict` 模块头注：逢隧道必报的告警会被无视或删掉，
 //!    `plat-warn` 已经演过一遍）。本模块只接线，一类都不加。
 //! 4. **收噪声只收在展示面，判定面喂的永远是全量。** 见 [`announced_routes`]：
@@ -60,6 +60,8 @@ pub(crate) enum TunnelConflictSnapshot {
     /// 探到了。`conflicts` 空 = 判据面上真的没有冲突。
     Probed {
         foreign: Vec<ForeignTunnelRoute>,
+        /// 外来隧道宣告的默认路由（全隧道）。与 `foreign` 是**两类事实**，不是它的子集。
+        default_routes: Vec<ForeignTunnelRoute>,
         conflicts: Vec<TunnelConflict>,
         criteria: ConflictCriteria,
     },
@@ -115,6 +117,12 @@ impl TunnelConflictSnapshot {
     ///
     /// `foreignTunnels` 是**展示面**（见 [`announced_routes`]）：link-local 与组播在这一步被摘掉，
     /// 摘掉的条数走 `suppressedRoutes`。`conflicts` 不受影响 —— 它是拿全量事实判出来的。
+    ///
+    /// **`foreignDefaultRoutes` 原样下发，不过 [`announced_routes`]**：那条过滤的判据是
+    /// [`is_link_local_or_multicast`]（整条前缀落在某个 link-local / 组播块**里面**），
+    /// 而 `0.0.0.0/0` / `::/0` 比任何块都宽、按构造不会被它收掉 —— 但「按构造收不掉」
+    /// 与「刻意不让它收」是两件事：把默认路由喂进一张为 `foreign` 写的噪声表，
+    /// 等于把这一类的可见性押在那张表将来不会变宽上。两类事实走两条通道，过滤也各归各。
     fn to_wire(&self) -> Value {
         match self {
             Self::NotProbed => json!({ "status": "notProbed" }),
@@ -128,12 +136,14 @@ impl TunnelConflictSnapshot {
             }),
             Self::Probed {
                 foreign,
+                default_routes,
                 conflicts,
                 criteria,
             } => json!({
                 "status": "probed",
                 "foreignTunnels": announced_routes(foreign),
                 "suppressedRoutes": suppressed_route_count(foreign),
+                "foreignDefaultRoutes": default_routes,
                 "conflicts": conflicts,
                 "criteria": criteria,
             }),
@@ -177,9 +187,18 @@ pub(super) fn snapshot_from_probe(
             prefix: prefix.clone(),
         })
         .collect();
-    let conflicts = detect_tunnel_conflicts(&criteria.with_foreign(&foreign));
+    let default_routes: Vec<ForeignTunnelRoute> = snapshot
+        .default_routes
+        .iter()
+        .map(|RouteEntry { prefix, interface }| ForeignTunnelRoute {
+            interface: interface.clone(),
+            prefix: prefix.clone(),
+        })
+        .collect();
+    let conflicts = detect_tunnel_conflicts(&criteria.with_foreign(&foreign, &default_routes));
     TunnelConflictSnapshot::Probed {
         foreign,
+        default_routes,
         conflicts,
         criteria,
     }

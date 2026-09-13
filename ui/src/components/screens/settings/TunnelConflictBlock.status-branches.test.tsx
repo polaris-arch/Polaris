@@ -43,7 +43,14 @@ const locale = (name: string): Dict =>
     readFileSync(fileURLToPath(new URL(`../../../i18n/locales/${name}.json`, import.meta.url)), 'utf8'),
   ) as Dict;
 
-const DICTS: Record<string, Dict> = { 'zh-CN': locale('zh-CN'), 'en-US': locale('en-US') };
+// 五份 locale 全上。此前只跑中英两份 —— 而「不预言谁赢」那条取舍的守卫（下面的禁词表）
+// 只覆盖 40% 的译文时，它守住的是一个比它声称的小得多的面。
+const LANGS = ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa'] as const;
+
+// 从 `LANGS` 派生，不另写一份名单：两处分家时，少的那一份会让 `translate` 抛「缺键」，
+// 而那条错误信息说的是 locale 缺键 —— 与真正的 i18n 缺口长得一模一样，排查会走错方向
+// （2026-09-13 踩过：扩 LANGS 后 36 条红在「zh-TW 缺键」上，五份 locale 其实一个键都不缺）。
+const DICTS: Record<string, Dict> = Object.fromEntries(LANGS.map((l) => [l, locale(l)]));
 
 /** 当前语种（`vi.mock` 工厂被提升，只能经 `vi.hoisted` 共享）。 */
 const h = vi.hoisted(() => ({ lang: 'zh-CN' }));
@@ -72,14 +79,35 @@ const { TunnelConflictBlock } = await import('./TunnelConflictBlock');
  * 「无冲突」的针眼 —— 中英各一。它们**逐字出现在** `tunnelConflictNone` 那句译文里，
  * 由本文件末尾的正向对照钉住；其余任何一态出现它们即是本门要抓的那种谎。
  */
-const NO_CONFLICT_NEEDLES: Record<string, string> = { 'zh-CN': '无冲突', 'en-US': 'no conflict' };
+const NO_CONFLICT_NEEDLES: Record<(typeof LANGS)[number], string> = {
+  'zh-CN': '无冲突',
+  'zh-TW': '無衝突',
+  'en-US': 'no conflict',
+  ru: 'пересечений',
+  fa: 'هم‌پوشانی ندارد',
+};
+
+/// 「不预言谁赢」那条取舍的禁词表，**按语言给**。
+///
+/// 波斯语没有词表：我写不出可靠的禁词，而照记忆编几个词会让这道门看起来覆盖了五份、
+/// 实际在那一份上恒真 —— 假绿比没有门更坏。故 `fa` 显式留空，并由下面一条断言
+/// **把这个缺席本身钉出来**（跳过名单恰好是 `['fa']`），缺席不许静默。
+///
+/// 俄语那几个词未经母语者复核，如实登记；它们的作用是"改文案时先绊一下"，
+/// 不是"证明译文没预言结果"。
+const WINNER_WORDS: Record<(typeof LANGS)[number], readonly string[]> = {
+  'zh-CN': ['会赢', '会输', '胜出', '优先', '更具体'],
+  'zh-TW': ['會贏', '會輸', '勝出', '優先', '更具體'],
+  'en-US': ['wins', 'will win', 'takes precedence', 'overrides', 'more specific'],
+  ru: ['победит', 'выигрывает', 'приоритет', 'более специфич'],
+  fa: [],
+};
 
 const render = (report: TunnelConflictReport | null, lang: string): string => {
   h.lang = lang;
   return renderToStaticMarkup(<TunnelConflictBlock report={report} />);
 };
 
-const LANGS = ['zh-CN', 'en-US'] as const;
 
 const NOT_PROBED: TunnelConflictReport = { status: 'notProbed' };
 const UNSUPPORTED: TunnelConflictReport = { status: 'unsupported', platform: 'darwin' };
@@ -88,6 +116,7 @@ const PROBED_CLEAN: TunnelConflictReport = {
   status: 'probed',
   foreignTunnels: [{ interface: 'utun4', prefix: '198.18.0.0/16' }],
   suppressedRoutes: 0,
+  foreignDefaultRoutes: [],
   conflicts: [],
   criteria: { fakeipRanges: [], meshCidrs: [], tunAddresses: [] },
 };
@@ -100,6 +129,7 @@ const PROBED_QUIET: TunnelConflictReport = {
   status: 'probed',
   foreignTunnels: [],
   suppressedRoutes: 36,
+  foreignDefaultRoutes: [],
   conflicts: [],
   criteria: { fakeipRanges: ['198.18.0.0/15'], meshCidrs: [], tunAddresses: ['172.19.0.1/30'] },
 };
@@ -107,6 +137,7 @@ const PROBED_CONFLICT: TunnelConflictReport = {
   status: 'probed',
   foreignTunnels: [{ interface: 'utun4', prefix: '32.0.0.0/24' }],
   suppressedRoutes: 36,
+  foreignDefaultRoutes: [],
   conflicts: [{ interface: 'utun4', prefix: '32.0.0.0/24', kind: 'meshOverlap' }],
   criteria: { fakeipRanges: [], meshCidrs: ['32.0.0.0/24'], tunAddresses: [] },
 };
@@ -234,6 +265,7 @@ describe('判据 1/2 —— 噪声收掉之后，这一支仍然有信息量', (
       status: 'probed',
       foreignTunnels: [{ interface: 'utun4', prefix: 'fd7a:115c:a1e0::/48' }],
       suppressedRoutes: 36,
+      foreignDefaultRoutes: [],
       conflicts: [],
       criteria: { fakeipRanges: [], meshCidrs: [], tunAddresses: [] },
     };
@@ -242,3 +274,69 @@ describe('判据 1/2 —— 噪声收掉之后，这一支仍然有信息量', (
     );
   });
 });
+
+/**
+ * 🔴 **第四类：外来隧道抢默认路由** —— 形态取自 2026-09-13 w207 真机抓取
+ * （Windows 内置 L2TP 连上之后，承载接口 `PolarisProbeL2TP` 宣告 `0.0.0.0/0` metric 1）。
+ *
+ * 这一类是本轮加的，而它要修的正是「界面上几乎看不见」：过完噪声过滤，同一接口在
+ * `foreignTunnels` 里只剩一条 `10.55.0.10/32`，用户读到的是「某个隧道宣告了一个 /32」。
+ */
+const PROBED_DEFAULT_ROUTE: TunnelConflictReport = {
+  status: 'probed',
+  foreignTunnels: [{ interface: 'PolarisProbeL2TP', prefix: '10.55.0.10/32' }],
+  suppressedRoutes: 4,
+  foreignDefaultRoutes: [{ interface: 'PolarisProbeL2TP', prefix: '0.0.0.0/0' }],
+  conflicts: [
+    { interface: 'PolarisProbeL2TP', prefix: '0.0.0.0/0', kind: 'defaultRouteContended' },
+  ],
+  criteria: { fakeipRanges: [], meshCidrs: [], tunAddresses: ['172.19.0.1/30'] },
+};
+
+describe('判据 4 —— 抢默认路由的全隧道在界面上说得出「它要了全部流量」', () => {
+  for (const lang of LANGS) {
+    it(`[${lang}] 逐条点名接口 + 默认路由前缀 + 这一类的措辞`, () => {
+      const markup = render(PROBED_DEFAULT_ROUTE, lang);
+      expect(markup).toContain('PolarisProbeL2TP');
+      expect(markup).toContain('0.0.0.0/0');
+      expect(markup).toContain(translate(lang, 'settings.tun.tunnelConflictKindDefaultRoute'));
+      // 它是**冲突**那一支，不许落进「无冲突」的措辞里。
+      expect(markup).not.toContain(NO_CONFLICT_NEEDLES[lang]);
+    });
+
+    it(`[${lang}] 措辞只陈述「两个声索人同时在场」，不预言谁赢`, () => {
+      // 谁赢取决于平台的路由实现（Linux 上 sing-box 走 policy routing，根本不在 main 表上
+      // 竞争；Windows / macOS 才是前缀竞争），而且随内核版本漂。写死一个会漂的结论比不给
+      // 结论更坏 —— 用户会据此排除掉真正的病因。本条是那条取舍的绊线。
+      const copy = translate(lang, 'settings.tun.tunnelConflictKindDefaultRoute');
+      for (const forbidden of WINNER_WORDS[lang]) {
+        expect(copy.toLowerCase()).not.toContain(forbidden.toLowerCase());
+      }
+    });
+
+    it(`[${lang}] 第四类与前三类的措辞互不相同（没塌成同一句）`, () => {
+      const labels = [
+        'settings.tun.tunnelConflictKindFakeIp',
+        'settings.tun.tunnelConflictKindMesh',
+        'settings.tun.tunnelConflictKindTun',
+        'settings.tun.tunnelConflictKindDefaultRoute',
+      ].map((key) => translate(lang, key));
+      expect(new Set(labels).size).toBe(labels.length);
+      // 正向对照：四条译文都真的存在（缺键时 i18next 回退成 key 本身，上面那条仍会过）。
+      for (const label of labels) {
+        expect(label.startsWith('settings.tun.')).toBe(false);
+      }
+    });
+  }
+});
+
+  it('禁词表的缺席面本身是被钉住的（缺席不许静默）', () => {
+    const uncovered = LANGS.filter((l) => WINNER_WORDS[l].length === 0);
+    expect(uncovered).toEqual(['fa']);
+    // 正向对照：有词表的那几份，词表真的非空且真的被用上了（否则上面那批断言恒真）。
+    for (const lang of LANGS.filter((l) => WINNER_WORDS[l].length > 0)) {
+      expect(WINNER_WORDS[lang].length).toBeGreaterThan(0);
+      const copy = translate(lang, 'settings.tun.tunnelConflictKindDefaultRoute');
+      expect(copy.length).toBeGreaterThan(0);
+    }
+  });

@@ -927,6 +927,7 @@
       "tunnelConflictFound": "本機其它隧道與 Polaris 爭同一網段，共 {{count}} 條：",
       "tunnelConflictKindFakeIp": "與 FakeIP 段相交",
       "tunnelConflictKindMesh": "與組網網段相交",
+      "tunnelConflictKindDefaultRoute": "正在接管預設路由（全隧道），與 Polaris 的 TUN 爭奪全部出站流量",
       "tunnelConflictKindTun": "與 TUN 介面位址相交",
       "forceRouteBlock": "組網網段結算",
       "forceRouteHint": "同一條網段只能指向一個出口，先宣告的那個節點生效。下面是後端依目前設定與執行期觀測位址算出的結算，與核心實際發射的那批規則同一次計算。",

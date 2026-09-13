@@ -24,6 +24,9 @@ fn field_probe() -> Result<TunnelProbeOutcome, String> {
                 interface: "utun4".into(),
             },
         ],
+        // 现场那台的 utun4 只宣告了具体网段，没抢默认路由 —— 那一支由
+        // `a_foreign_default_route_reaches_the_display_face` 用另一份输入覆盖。
+        default_routes: Vec::new(),
     }))
 }
 
@@ -424,4 +427,82 @@ fn display_face_partitions_the_probe_fact() {
     );
     assert_eq!(announced_routes(&foreign).len(), 2);
     assert_eq!(suppressed_route_count(&foreign), 36);
+}
+
+// ══════════ 第四类：外来隧道抢默认路由，走的是另一条通道 ══════════
+
+/// 真机抓取（+ 一条外来默认路由）过完整条链 → 线格式。
+///
+/// 默认路由那一条是**追加**在夹具之上的，夹具本身一个字节不动：p101 那台上没有抢默认路由的
+/// 外来隧道（八个 utun 的默认路由全是作用域路由，探测层按 `RTF_IFSCOPE` 判掉了）。
+/// 形态取自 2026-09-13 w207 的真机抓取（`PolarisProbeL2TP` 宣告 `0.0.0.0/0` metric 1）。
+fn field_wire_with_default_route(defaults: &[RouteEntry]) -> Value {
+    let criteria = emitted_conflict_criteria(&emitted_tun(), &[], &ObservedTailnetAddresses::new());
+    let mut probe = field_capture(&[]);
+    if let Ok(TunnelProbeOutcome::Probed(snapshot)) = &mut probe {
+        snapshot.default_routes.extend_from_slice(defaults);
+    }
+    snapshot_from_probe(probe, criteria).to_wire()
+}
+
+/// 🔴 **外来默认路由必须到得了展示面，且不许被那张噪声表吃掉。**
+///
+/// 三半：
+///  - 它出现在 `foreignDefaultRoutes` 里（原样，不过 `announced_routes`）；
+///  - 它判出了 `defaultRouteContended`（本次发射有 TUN 地址 ⇒ 我方也是一个声索人）；
+///  - `foreignTunnels` / `suppressedRoutes` 这两个数**一个都没变** —— 两类事实走两条通道，
+///    新的这一批没有挤进为 `foreign` 写的那半。
+#[test]
+fn a_foreign_default_route_reaches_the_display_face() {
+    let before = field_wire_with_default_route(&[]);
+    let wire = field_wire_with_default_route(&[route("PolarisProbeL2TP", "0.0.0.0/0")]);
+
+    assert_eq!(wire["status"], "probed");
+    assert_eq!(
+        wire["foreignDefaultRoutes"],
+        serde_json::json!([{ "interface": "PolarisProbeL2TP", "prefix": "0.0.0.0/0" }]),
+        "抢默认路由的全隧道没到展示面 —— 用户会读成「这台机器上没有别的隧道在抢流量」：{wire}"
+    );
+    assert_eq!(
+        wire["conflicts"],
+        serde_json::json!([{
+            "interface": "PolarisProbeL2TP",
+            "prefix": "0.0.0.0/0",
+            "kind": "defaultRouteContended"
+        }]),
+        "线格式上的类别名必须是 camelCase（serde rename 漏了会让 TS 侧恒 undefined，\
+         而两侧单测与 tsc 都不会红）：{wire}"
+    );
+    // 负向对照：不追加那一条时，同一份抓取两个键都是空的 —— 否则上面两条可能只是「恒有」。
+    assert_eq!(before["foreignDefaultRoutes"], serde_json::json!([]));
+    assert_eq!(before["conflicts"], serde_json::json!([]));
+    // 另两半没被连累（那 36 条噪声照旧收在 `suppressedRoutes` 里）。
+    assert_eq!(wire["foreignTunnels"], before["foreignTunnels"]);
+    assert_eq!(wire["suppressedRoutes"], before["suppressedRoutes"]);
+    assert_eq!(wire["suppressedRoutes"], serde_json::json!(36));
+}
+
+/// 🔴 **噪声过滤不许伸到默认路由上**：把 `LINK_LOCAL_AND_MULTICAST_BLOCKS` 那条判据
+/// 套到这一批上，`0.0.0.0/0` 与 `::/0` 都不该被它收掉。
+///
+/// 按构造它们确实收不掉（`is_link_local_or_multicast` 判的是**包含**，默认路由比任何块都宽），
+/// 但「按构造收不掉」与「刻意不让它收」是两件事：这条断言钉的是后者 ——
+/// 那张表哪天变宽（例如有人把 `240.0.0.0/4` 整块塞进去），这一类的可见性不许跟着一起没。
+#[test]
+fn the_noise_filter_does_not_reach_default_routes() {
+    for prefix in ["0.0.0.0/0", "::/0"] {
+        assert!(
+            !polaris_system_integration::route_probe::is_link_local_or_multicast(prefix),
+            "`{prefix}` 被噪声判据认成了 link-local / 组播"
+        );
+    }
+    let wire = field_wire_with_default_route(&[
+        route("PolarisProbeL2TP", "0.0.0.0/0"),
+        route("PolarisProbeL2TP", "::/0"),
+    ]);
+    assert_eq!(
+        wire["foreignDefaultRoutes"].as_array().map(Vec::len),
+        Some(2),
+        "两个族的默认路由都该原样下发：{wire}"
+    );
 }
