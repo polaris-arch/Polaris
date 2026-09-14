@@ -139,25 +139,31 @@ fn build_popup_window(app: &AppHandle, boot: &PopupBootstrap) -> Result<(), Stri
     let dark = crate::tray::native_dark(app);
     let bg = crate::tray::surface_color(dark);
 
-    let win = WebviewWindowBuilder::new(app, POPUP_LABEL, WebviewUrl::App(POPUP_PAGE.into()))
-        .title("Polaris Update")
-        // 初始态注入文档：页面 boot 时同步可读 window.__POLARIS_UPDATE_POPUP_INITIAL__。
-        // **这一行是 #300 整类 bug 的结构性解**：无 script 即无页面，无页面即无窗。
-        .initialization_script(&boot.init_script)
-        // 页面主题种子：与上面的 `bg` 出自同一个 `dark`（见该绑定上方注释）。
-        .initialization_script(crate::tray::theme_boot_script(dark))
-        .inner_size(f64::from(boot.width), f64::from(boot.height))
-        .resizable(false)
-        .minimizable(false)
-        .maximizable(false)
-        .decorations(false)
-        // 上游注释：透明窗在 Win/Linux 有鼠标穿透 bug → 恒不透明 + 主题化底色防白闪。
-        .transparent(false)
-        .background_color(bg)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        // 先隐藏：定位完再 show，避免「先出现在错位置再跳」。
-        .visible(false)
+    let mut builder =
+        WebviewWindowBuilder::new(app, POPUP_LABEL, WebviewUrl::App(POPUP_PAGE.into()))
+            .title("Polaris Update")
+            // 初始态注入文档：页面 boot 时同步可读 window.__POLARIS_UPDATE_POPUP_INITIAL__。
+            // **这一行是 #300 整类 bug 的结构性解**：无 script 即无页面，无页面即无窗。
+            .initialization_script(&boot.init_script)
+            // 页面主题种子：与上面的 `bg` 出自同一个 `dark`（见该绑定上方注释）。
+            .initialization_script(crate::tray::theme_boot_script(dark))
+            .inner_size(f64::from(boot.width), f64::from(boot.height))
+            .resizable(false)
+            .minimizable(false)
+            .maximizable(false)
+            .decorations(false)
+            // 上游注释：透明窗在 Win/Linux 有鼠标穿透 bug → 恒不透明 + 主题化底色防白闪。
+            .transparent(false)
+            .background_color(bg)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            // 先隐藏：定位完再 show，避免「先出现在错位置再跳」。
+            .visible(false);
+    // WebView2 启动参数（图形逃生门 `--disable-gpu`）：四个建窗点同值，唯一真值在 graphics_compat。
+    if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
+        builder = builder.additional_browser_args(args);
+    }
+    let win = builder
         .build()
         .map_err(|e| format!("建更新弹窗失败: {e}"))?;
 

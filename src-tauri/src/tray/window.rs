@@ -209,6 +209,10 @@ fn build_overlay(app: &AppHandle, generation: u64) -> Option<tauri::WebviewWindo
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false);
+    // WebView2 启动参数（图形逃生门 `--disable-gpu`）：四个建窗点同值，唯一真值在 graphics_compat。
+    if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
+        builder = builder.additional_browser_args(args);
+    }
 
     // non-activating 浮层会在 Polaris 不是前台 app 时接收用户的第一次点击。Wry 的 WKWebView 默认
     // `acceptsFirstMouse:` 为 false，因此这里复用 Tauri 开关把首击交给 WebView。注意：它只管“首击是否

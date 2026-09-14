@@ -605,11 +605,11 @@ export interface UserConfig {
   // 图形兼容逃生门（正向语义：**默认开**=true，关闭是 opt-in 用户自救；均需重启生效）。
   // 消费一律用 `!== false`（undefined=未设/旧配置=默认开），对齐本仓 autoCheckUpdate 惯例。
   // hardwareAcceleration：false → 改用软件渲染，规避 GPU 进程反复崩溃/白屏/花屏。
-  //   Tauri **没有** Electron `app.disableHardwareAcceleration()` 的等价 API —— webview 的 GPU 开关由各平台
-  //   runtime 的环境变量控制，且必须在 webview 创建**之前**设好（判定见 `src-tauri/src/graphics_compat.rs`，
+  //   Tauri **没有** Electron `app.disableHardwareAcceleration()` 的等价 API —— webview 的 GPU 开关按平台
+  //   走环境变量或 WebView2 API，且必须在 webview 创建**之前**设好（判定见 `src-tauri/src/graphics_compat.rs`，
   //   建窗前同步读 config.json 原文本，此刻 store 尚未装配）：
   //     Linux(WebKitGTK)：WEBKIT_DISABLE_DMABUF_RENDERER=1（主修复：NVIDIA 白屏）+ WEBKIT_DISABLE_COMPOSITING_MODE=1
-  //     Windows(WebView2)：WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--disable-gpu
+  //     Windows(WebView2)：建窗时经 WebView2 API（additional_browser_args）下发 --disable-gpu（提权运行同样生效）
   //     macOS(WKWebView)：**无受支持的开关** → 本项在 mac 是 no-op（设置页 mac 隐藏该行，避免死开关）。
   //   生效面 = Linux/Win（与 Electron 版相反：那边因 Electron 在 Linux 无条件禁 HW accel 而藏 Linux；
   //   Tauri/WebKitGTK 合成默认是开的，Linux 上这个开关是活的）。

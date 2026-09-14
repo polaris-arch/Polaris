@@ -52,8 +52,9 @@ webview 的合成層出不了畫面，但**代理核心本身不受影響**（�
 
 ### ② 平台環境變數（一次性試跑，不改設定）
 
-這些變數由 WebKitGTK / WebView2 **原生讀取，不需要應用程式配合**；Polaris 也刻意不覆寫你已設定的同名變數，
-排障時的臨時實驗不會被應用程式打斷。
+這些變數由 WebKitGTK / WebView2 **原生讀取，不需要應用程式配合**，適合一次性試跑。
+
+**Linux**：Polaris 刻意不覆寫你已設定的同名變數，排障時的臨時實驗不會被應用程式打斷。
 
 ```bash
 # Linux（WebKitGTK）—— DMABUF 是 NVIDIA 白畫面的主要修復，COMPOSITING 兜 resize 當機
@@ -64,6 +65,10 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 polaris
 # Windows（WebView2）
 $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--disable-gpu"; .\Polaris.exe
 ```
+
+**Windows**：**以系統管理員身分執行 Polaris 時，WebView2 會忽略這個環境變數**
+（[微軟文件](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/security#for-an-elevated-host-app-use-appropriate-override-flags)）。
+需要持續生效，或需要以系統管理員身分執行時，改用 ① 的設定項——它經 WebView2 API 下發，兩種執行方式都生效。
 
 macOS 無對應開關（WKWebView 未提供公開 API，WebKit #26651 長期未實作），故 `hardwareAcceleration`
 在 mac 上是 no-op（應用程式會如實記一筆 warn 記錄，不謊稱已生效）。mac 上遇到白畫面請提 issue 並附記錄：

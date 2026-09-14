@@ -46,7 +46,9 @@ Config reading is deliberately fault-tolerant first: a corrupted file or a wrong
 
 ### 2. Platform environment variables (one-off test, no config change)
 
-These variables are read **natively** by WebKitGTK / WebView2 and need no cooperation from the app. Polaris also deliberately does not override variables you have already set, so a temporary experiment during triage will not be disturbed by the app.
+These variables are read **natively** by WebKitGTK / WebView2 and need no cooperation from the app, which makes them handy for a one-off test.
+
+**Linux**: Polaris deliberately does not override variables you have already set, so a temporary experiment during triage will not be disturbed by the app.
 
 ```bash
 # Linux (WebKitGTK) — DMABUF is the main fix for NVIDIA white screens; COMPOSITING covers resize crashes
@@ -57,6 +59,10 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 polaris
 # Windows (WebView2)
 $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--disable-gpu"; .\Polaris.exe
 ```
+
+**Windows**: **when Polaris runs elevated (as Administrator), WebView2 ignores this environment variable**
+([Microsoft docs](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/security#for-an-elevated-host-app-use-appropriate-override-flags)).
+For a change that needs to persist, or when running elevated, use the config option from ① instead — it is delivered through the WebView2 API and works either way.
 
 macOS has no equivalent switch (WKWebView exposes no public API; WebKit #26651 has gone unimplemented for a long time), so `hardwareAcceleration` is a no-op on macOS — the app logs an honest warning instead of claiming it took effect. If you hit a white screen on macOS, please open an issue and attach the logs from
 `~/Library/Application Support/com.polaris.app/polaris/logs/` (on Linux `~/.config/...`, on Windows `%APPDATA%\...`, same `logs/` directory name).

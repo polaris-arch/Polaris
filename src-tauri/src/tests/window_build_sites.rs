@@ -19,6 +19,12 @@
 //! 2. [`every_registered_build_site_keeps_its_entry_discipline`]：每个登记项钉死「构造点在哪个函数里」
 //!    +「这个函数被谁直接调用」，再按项断言入口线程纪律。
 //!
+//! 同一张登记表还挂着第二条纪律 —— **WebView2 启动参数同值**：每个建窗函数体都必须在构造点与 `.build()`
+//! 之间调 [`BROWSER_ARGS_ENTRY`]（图形逃生门 `--disable-gpu` 经 WebView2 API 下发，提权运行也生效）。
+//! WebView2 要求共用同一 data directory 的 webview 参数完全一致，漏接一处 = 关硬件加速后那个窗建环境失败。
+//! 同时禁建窗函数调 `.proxy_url(`：关硬件加速时下发的是固定串，会整体替换 wry 本来按代理追加的
+//! `--proxy-server`（推导见 `graphics_compat.rs`）。
+//!
 //! # 取材面（如实登记）
 //!
 //! - **文件**：`module_files("")` = `src-tauri/src/**.rs`，递归、剔除 `tests/`。
@@ -53,6 +59,9 @@ const BUILDER_NEEDLES: [&str; 7] = [
     "Window::builder(",
     ".add_child(",
 ];
+
+/// 建窗时 WebView2 启动参数的唯一入口（`graphics_compat.rs`）。
+const BROWSER_ARGS_ENTRY: &str = "graphics_compat::webview_additional_browser_args()";
 
 /// 一个登记过的建窗点。
 struct BuildSite {
@@ -276,6 +285,37 @@ fn every_registered_build_site_keeps_its_entry_discipline() {
             site.needle,
             site.enclosing,
             site.discipline
+        );
+
+        // WebView2 启动参数：构造点之后、build 之前经唯一入口下发。
+        let needle_at = body.find(site.needle).expect("上面已断言含构造点");
+        let build_at = body[needle_at..]
+            .find(".build()")
+            .map(|at| needle_at + at)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{}` 的 `{}` 之后找不到 `.build()` —— 取材面塌了，下面的次序断言会失去判据",
+                    site.file, site.enclosing
+                )
+            });
+        let args_at = body[needle_at..build_at].find(BROWSER_ARGS_ENTRY);
+        assert!(
+            args_at.is_some(),
+            "`{}` 的建窗函数 `{}` 没有在 `{}` 与 `.build()` 之间调 `{BROWSER_ARGS_ENTRY}`。\
+             图形逃生门（hardwareAcceleration=false）的 `--disable-gpu` 靠它经 WebView2 API 下发；WebView2 要求同一 \
+             data directory 的 webview 启动参数完全一致，漏接一处 = 关硬件加速后这个窗建环境失败。\
+             写法：`if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {{ builder = \
+             builder.additional_browser_args(args); }}`",
+            site.file,
+            site.enclosing,
+            site.needle
+        );
+        assert!(
+            !body.contains(".proxy_url("),
+            "`{}` 的建窗函数 `{}` 调了 `.proxy_url(`。关硬件加速时下发的是 `graphics_compat` 里的固定启动参数，\
+             会整体替换 wry 按代理追加的 `--proxy-server`，代理在逃生门开启时静默失效。先改 graphics_compat 的推导与串。",
+            site.file,
+            site.enclosing
         );
 
         let name = site
