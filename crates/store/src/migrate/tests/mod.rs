@@ -7,7 +7,7 @@ fn base_config() -> Value {
         "proxyModeType": "tun",
         "logLevel": "info",
         "mixedPort": 7890,
-        "tunConfig": {"mtu": 1350, "stack": "system", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     })
 }
 
@@ -202,7 +202,7 @@ fn builtin_dns_migration_repairs_invalid_bootstrap_without_overwriting_other_edi
 
 #[test]
 fn migrate_all_runs_full_chain_idempotent() {
-    // 旧格式配置：缺 dnsConfig、stack=system、未 migrated、bypassProcesses 非空、appRulesSeeded 缺
+    // 旧格式配置：缺 dnsConfig、遗留 stack=gvisor、未 migrated、bypassProcesses 非空、appRulesSeeded 缺
     let mut v = json!({
         "proxyMode": "smart",
         "proxyModeType": "TUN",
@@ -215,8 +215,12 @@ fn migrate_all_runs_full_chain_idempotent() {
     let delta1 = migrate_all(&mut v);
     assert!(delta1.changed, "首次迁移有变更");
     // 验证迁移效果
-    assert_eq!(v["tunStackMigrated"], json!(true));
-    assert_eq!(v["tunConfig"]["stack"], json!("auto"));
+    // 遗留 stack 被删（TUN stack 已随上游弃用移除），且不再写 `tunStackMigrated` 标记。
+    assert!(v["tunConfig"].get("stack").is_none(), "遗留 stack 应被删除");
+    assert!(
+        v.get("tunStackMigrated").is_none(),
+        "不得再写 tunStackMigrated"
+    );
     // MTU 一并抹掉（存量 1350 是程序写的默认，不是用户意图）→ 缺席 = 自动。
     assert_eq!(v["tunMtuMigrated"], json!(true));
     assert!(v["tunConfig"].get("mtu").is_none(), "存量 mtu 应被抹掉");
@@ -436,7 +440,7 @@ fn migrate_diagnostic_capture_restores_level_and_drops_orphan_key() {
 #[test]
 fn tun_mtu_migration_runs_once_then_respects_user_value() {
     let mut v = json!({
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     });
     let mut d = MigrationDelta::default();
     migrate_tun_mtu(&mut v, &mut d);
@@ -556,4 +560,78 @@ fn migrate_privacy_password_clears_plaintext() {
     // 幂等：已空不再变
     let changed2 = migrate_privacy_password_clear(&mut v);
     assert!(!changed2);
+}
+
+/// 🔴 TUN stack 随上游弃用移除后的收尾：磁盘 / 旧备份里遗留的 `tunConfig.stack`（**任意值**）与旧标记
+/// `tunStackMigrated` 必须被清掉，同对象其余键原样，且二次迁移零变更。
+///
+/// 牙：把 `migrate_tun_stack` 从 `migrate_all` 链上摘掉 → ① 首条断言转红；只删 stack 不删标记 → ① 第二条转红；
+/// 改成按值分支（只删旧版合法的四个值）→ 非法值 / 非字符串那几格转红；无遗留键仍置 `changed` → ③ 转红。
+#[test]
+fn migrate_tun_stack_drops_legacy_key_and_marker_for_any_value() {
+    // ① 经 migrate_all（证明接在链上），遗留值覆盖旧版合法值、新栈名、非法串、非字符串。
+    for legacy in [
+        json!("auto"),
+        json!("system"),
+        json!("gvisor"),
+        json!("mixed"),
+        json!("go"),
+        json!("bogus"),
+        json!(42),
+        Value::Null,
+        json!({ "nested": true }),
+    ] {
+        let mut v = base_config();
+        v["tunConfig"]["stack"] = legacy.clone();
+        v["tunStackMigrated"] = json!(true);
+        migrate_all(&mut v);
+        assert!(
+            v["tunConfig"].get("stack").is_none(),
+            "遗留 stack={legacy} 未被删除：{}",
+            v["tunConfig"]
+        );
+        assert!(
+            v.get("tunStackMigrated").is_none(),
+            "旧标记 tunStackMigrated 未被删除（stack={legacy}）"
+        );
+        assert_eq!(
+            v["tunConfig"]["autoRoute"],
+            json!(true),
+            "同对象其余键不得被连带改动"
+        );
+        assert_eq!(v["tunConfig"]["strictRoute"], json!(true));
+
+        // 幂等：键没了，二次跑整条链零变更。
+        let snapshot = v.clone();
+        let again = migrate_all(&mut v);
+        assert_eq!(v, snapshot);
+        assert!(!again.changed, "stack={legacy} 二次迁移不应再有变更");
+    }
+
+    // ② 只有其一也各自清掉（旧版新装写过标记但 stack 已被用户手删 / 反之）。
+    let mut only_marker = json!({ "tunStackMigrated": true, "tunConfig": { "autoRoute": true } });
+    let mut d = MigrationDelta::default();
+    migrate_tun_stack(&mut only_marker, &mut d);
+    assert!(d.changed);
+    assert_eq!(only_marker, json!({ "tunConfig": { "autoRoute": true } }));
+
+    let mut only_stack = json!({ "tunConfig": { "stack": "mixed", "autoRoute": true } });
+    let mut d = MigrationDelta::default();
+    migrate_tun_stack(&mut only_stack, &mut d);
+    assert!(d.changed);
+    assert_eq!(only_stack, json!({ "tunConfig": { "autoRoute": true } }));
+
+    // ③ 新形态（无遗留键）→ 本迁移零变更，不白写盘。
+    let mut clean = json!({ "tunConfig": { "autoRoute": true, "strictRoute": true } });
+    let before = clean.clone();
+    let mut d = MigrationDelta::default();
+    migrate_tun_stack(&mut clean, &mut d);
+    assert!(!d.changed, "无遗留键不得置 changed");
+    assert_eq!(clean, before);
+
+    // ④ 畸形 tunConfig（非对象）不 panic，也不误报变更。
+    let mut malformed = json!({ "tunConfig": "not-an-object" });
+    let mut d = MigrationDelta::default();
+    migrate_tun_stack(&mut malformed, &mut d);
+    assert!(!d.changed);
 }

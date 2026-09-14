@@ -192,12 +192,8 @@ export interface NetworkInterfaceInfo {
   isUp: boolean;
   addresses: string[];
 }
-// 'auto' = 默认档：跟随平台映射（macOS→gvisor / Windows·Linux→system），经 shared/tun-stack#resolveTunStack
-// 解析成下发给核的具体栈。system/gvisor/mixed = 显式高级兜底。详见 docs/design/tun-stack-option.md。
-export type TunStack = 'auto' | 'system' | 'gvisor' | 'mixed';
 // UDP NAT 类型档（RFC 3489 三种锥形）。**字段缺席 = 跟随内核默认**，故这里没有 'auto' 成员：
-// 「默认」在这套契约里是 `udpNatType === undefined`，不是一个取值（与 TunStack 的 'auto' 相反——
-// 那个档恒会解析成具体栈下发，这个档的语义就是一个键都不发）。
+// 「默认」在这套契约里是 `udpNatType === undefined`，不是一个取值（这个档的语义就是一个键都不发）。
 // 一档映射内核两个字段 udp_mapping × udp_filtering，表在 crates/config-engine/.../builder/inbounds.rs
 // 的 `udp_nat_behaviors`（SoT 在 Rust，前端只传档名，不复制映射表）。
 export type UdpNatType = 'fullCone' | 'restrictedCone' | 'portRestrictedCone';
@@ -369,12 +365,12 @@ export interface ImportParseResult {
 }
 
 export interface TunModeConfig {
-  // 缺席 = 自动：按「最终栈 × 平台」派生（domain/tun-mtu.ts defaultMtuFor，与 Rust
-  // crates/config-engine/src/user_config/tun_stack::default_mtu_for 同口径）。在场 = 用户显式值，逐字下发内核。
+  // 缺席 = 自动：生成期取 Rust `crates/config-engine/src/user_config/tun_config.rs` 的 `DEFAULT_TUN_MTU`
+  // （渲染端副本 domain/tun-mtu.ts `DEFAULT_TUN_MTU`，parity 测试对拍）。在场 = 用户显式值，逐字下发内核。
   // 存量值由 polaris-store 的 migrate_tun_mtu 一次性抹掉——本项此前从未有 UI 入口，磁盘上的
   // 任何值都是程序写的默认，不承载用户意图。
   mtu?: number;
-  stack: TunStack;
+  // 没有 `stack`：TUN stack 随 sing-box 1.15.0-alpha.3 弃用已整体移除，内核一律走 sing-tun 新栈。
   autoRoute: boolean;
   strictRoute: boolean;
   interfaceName?: string;
@@ -563,9 +559,6 @@ export interface UserConfig {
     direct?: string;
     proxy?: string;
   };
-  // TUN stack 一次性迁移标记（幂等）：存量旧强制默认 stack（mac=gvisor / Win·Linux=system，非真实选择）→ 'auto'。
-  // undefined=未迁移（旧配置）；新装由 createDefaultConfig 置 true。详见 ConfigManager.migrateTunStack。
-  tunStackMigrated?: boolean;
   // TUN MTU 一次性迁移标记（幂等）：抹掉存量 tunConfig.mtu → 缺席（= 自动）。
   // undefined=未迁移；新装由 default_config 置 true。详见 polaris-store 的 migrate_tun_mtu。
   tunMtuMigrated?: boolean;

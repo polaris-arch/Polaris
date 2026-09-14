@@ -39,8 +39,7 @@ export const DEMO_CONFIG: UserConfig = {
   selectedServerId: 's1',
   proxyMode: 'smart',
   proxyModeType: 'tun',
-  tunConfig: { mtu: 1350, stack: 'auto', autoRoute: true, strictRoute: true },
-  tunStackMigrated: true,
+  tunConfig: { mtu: 1350, autoRoute: true, strictRoute: true },
   // 单条件规则一律不写 `conditions`（契约：≥2 条件才存在，首条件恒镜像到 type/values），
   // 与旧 fixture 的「一条 geosite + 两个值」逐项对应，不借修 schema 之名改变展示面。
   trafficRules: DEMO_TRAFFIC_RULES,

@@ -1,7 +1,7 @@
 //! sing-box Inbound 配置生成（上游 `singbox-inbounds-builder.ts` 1:1 移植）。
 //!
 //! 装配 mixed inbound（HTTP+SOCKS 同口）+ 探针 inbound（probe-direct/proxy-in/update-in）+
-//! TUN inbound（平台相关排除段/MTU/stack/IPv6/macOS http_proxy platform）。
+//! TUN inbound（平台相关排除段/MTU/IPv6/macOS http_proxy platform；不发 `stack`，一律走 sing-tun 新栈）。
 
 #![forbid(unsafe_code)]
 
@@ -27,9 +27,9 @@ use crate::user_config::system_proxy_bypass::{
     bypass_lan_cidrs, effective_bypass_lan, BypassConfig,
 };
 use crate::user_config::tun_config::{
-    resolve_win_tun_interface_name, UdpNatType, FAKEIP_INET4_RANGE, FAKEIP_INET6_RANGE,
+    resolve_win_tun_interface_name, UdpNatType, DEFAULT_TUN_MTU, FAKEIP_INET4_RANGE,
+    FAKEIP_INET6_RANGE,
 };
-use crate::user_config::tun_stack::{default_mtu_for, resolve_tun_stack};
 use crate::user_config::ProxyModeType;
 use crate::user_config::UserConfig;
 
@@ -83,7 +83,6 @@ pub fn build_inbounds(
         auto_route: None,
         auto_redirect: None,
         strict_route: None,
-        stack: None,
         udp_mapping: None,
         udp_filtering: None,
         route_exclude_address: None,
@@ -139,7 +138,6 @@ fn http_loopback(tag: &str, port: u16) -> Inbound {
         auto_route: None,
         auto_redirect: None,
         strict_route: None,
-        stack: None,
         udp_mapping: None,
         udp_filtering: None,
         route_exclude_address: None,
@@ -161,7 +159,6 @@ fn socks_loopback(tag: &str, port: u16) -> Inbound {
         auto_route: None,
         auto_redirect: None,
         strict_route: None,
-        stack: None,
         udp_mapping: None,
         udp_filtering: None,
         route_exclude_address: None,
@@ -435,16 +432,12 @@ fn build_tun_inbound(
         );
     }
 
-    // stack。**必须先于 MTU 解析** —— 默认 MTU 是栈的函数（gvisor 吃得下大 MTU，system/mixed
-    // 在 65535 下会塌到 11 Mbps），倒过来算就只能退回平台单维度，那正是此前 1350/1400 的形态。
-    let user_stack = tun_cfg.map(|t| t.stack);
-    let effective_stack = resolve_tun_stack(user_stack, &deps.platform);
-
-    // MTU：用户显式值逐字下发；缺席则按「最终栈 × 平台」取默认（判据见 `tun_stack::default_mtu_for`）。
+    // 不发 `stack`：sing-box 1.15.0-alpha.3 起写了就报弃用（含 `"go"`），缺席即走 sing-tun 新栈。
+    // `Inbound` 已无该字段，故这里无从发出；用户配置里遗留的 `stack` 在反序列化时即被忽略。
+    //
+    // MTU：用户显式值逐字下发；缺席则取 `DEFAULT_TUN_MTU`（与栈、平台无关，判据见该常量）。
     // 此处**没有**任何哨兵值 —— 旧实现把 `Some(9000)` 当「未设置」，导致真想要 9000 的用户被静默改写。
-    let effective_mtu = tun_cfg
-        .and_then(|t| t.mtu)
-        .unwrap_or_else(|| default_mtu_for(effective_stack, &deps.platform));
+    let effective_mtu = tun_cfg.and_then(|t| t.mtu).unwrap_or(DEFAULT_TUN_MTU);
 
     let auto_route = tun_cfg.map(|t| t.auto_route).unwrap_or(true);
     let strict_route = tun_cfg.map(|t| t.strict_route).unwrap_or(true);
@@ -452,7 +445,7 @@ fn build_tun_inbound(
     // NAT 类型：**缺席就一个键都不发**（`unwrap_or((None, None))`，不是「缺席回落成全锥」）。
     // 上游两项默认已是 endpoint_independent（全锥），回落写死等价值只会把「当前默认」冻进每一份
     // 生成的配置 —— 金样 config-snapshot.json 当场 delta，且上游日后改默认时我们钉在旧值上却没有
-    // 任何判据支撑（对比 stack/MTU：那两处的显式 pin 有 §0.6 实测撑着，这里没有）。
+    // 任何判据支撑（对比 MTU：那里显式下发是为了让设置页占位符与内核实际取值是同一个数）。
     let (udp_mapping, udp_filtering) = tun_cfg
         .and_then(|t| t.udp_nat_type)
         .map(|nat| {
@@ -472,7 +465,6 @@ fn build_tun_inbound(
         auto_route: Some(auto_route),
         auto_redirect: None,
         strict_route: Some(strict_route),
-        stack: Some(effective_stack.as_str().to_string()),
         udp_mapping,
         udp_filtering,
         route_exclude_address: None,

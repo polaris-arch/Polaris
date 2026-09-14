@@ -451,7 +451,7 @@ describe('shellPlatformFromDataOs 只剩 settings-logic 一份实现', () => {
 // ---------------------------------------------------------------------------
 
 describe('TUN 局域网网关：非法条目内联标红', () => {
-  const tunBase = { mtu: 9000, stack: 'auto' as const, autoRoute: true, strictRoute: true };
+  const tunBase = { mtu: 9000, autoRoute: true, strictRoute: true };
   const tunCfg = (extra: Record<string, unknown>) =>
     ({ proxyModeType: 'tun', tunConfig: { ...tunBase, ...extra } }) as Partial<UserConfig>;
 
@@ -614,7 +614,6 @@ describe('四处清单确实折叠了，且计数跟着真实清单走', () => {
       cfg: {
         tunConfig: {
           mtu: 9000,
-          stack: 'auto',
           autoRoute: true,
           strictRoute: true,
           inboundExcludeCidrs: ['x', 'y', 'z'],
@@ -622,7 +621,7 @@ describe('四处清单确实折叠了，且计数跟着真实清单走', () => {
       },
       n: 3,
       empty: {
-        tunConfig: { mtu: 9000, stack: 'auto', autoRoute: true, strictRoute: true, inboundExcludeCidrs: [] },
+        tunConfig: { mtu: 9000, autoRoute: true, strictRoute: true, inboundExcludeCidrs: [] },
       },
     },
   ];

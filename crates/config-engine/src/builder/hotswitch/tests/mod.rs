@@ -4,7 +4,6 @@ use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use crate::user_config::rule::{Rule, RuleAction, RuleEffects, RuleRouteEffect, RuleType};
 use crate::user_config::server_config::{Protocol, ServerConfig, WireGuardSettings};
 use crate::user_config::tun_config::TunModeConfig;
-use crate::user_config::tun_stack::TunStack;
 
 const NODE_A: &str = "node-a";
 const NODE_B: &str = "node-b";
@@ -322,28 +321,19 @@ fn plan_no_change_is_none() {
 
 /// Windows 192.168.10.207 真机（2026-08-21）：本体 TUN + auto（实际 gVisor）下直接执行
 /// `SelectOutbound`，Hk01-L7 → Hk01 → Hk01-L7 两次读回正确，sing-box PID 恒为 10684。
-/// selector 切换属于管理面操作，不依赖 TUN stack；四种配置值都不得再触发平台式重启。
+/// selector 切换属于管理面操作，不依赖 TUN 栈；TUN 模式下不得触发平台式重启。
+/// （TUN stack 选项已随上游弃用整体移除，原先按四个栈值各跑一遍的循环收成单例。）
 #[test]
-fn plan_tun_stack_does_not_block_selector_hot_switch() {
-    for (stack, label) in [
-        (TunStack::Auto, "auto"),
-        (TunStack::Gvisor, "gvisor"),
-        (TunStack::Mixed, "mixed"),
-        (TunStack::System, "system"),
-    ] {
-        let mut old = base_config();
-        old.proxy_mode_type = ProxyModeType::Tun;
-        old.tun_config = Some(TunModeConfig {
-            stack,
-            ..Default::default()
-        });
-        let mut new_cfg = old.clone();
-        new_cfg.selected_server_id = Some(NODE_B.into());
-        let plan = plan_hot_switch(&old, &new_cfg, &deps_with_tags());
-        assert_eq!(plan.kind, HotSwitchKind::Global, "stack={label}");
-        assert_eq!(plan.puts.len(), 1, "stack={label}");
-        assert_eq!(plan.puts[0].member_tag, "tagB", "stack={label}");
-    }
+fn plan_tun_mode_does_not_block_selector_hot_switch() {
+    let mut old = base_config();
+    old.proxy_mode_type = ProxyModeType::Tun;
+    old.tun_config = Some(TunModeConfig::default());
+    let mut new_cfg = old.clone();
+    new_cfg.selected_server_id = Some(NODE_B.into());
+    let plan = plan_hot_switch(&old, &new_cfg, &deps_with_tags());
+    assert_eq!(plan.kind, HotSwitchKind::Global);
+    assert_eq!(plan.puts.len(), 1);
+    assert_eq!(plan.puts[0].member_tag, "tagB");
 }
 
 // === planHotSwitch route 投影 guard（mesh 退回 direct 翻转 / force-route engaged）===

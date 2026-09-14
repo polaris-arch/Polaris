@@ -2,8 +2,9 @@
  * SettingsTun —— TUN 子页（原型 [data-sec="tun"] L2221-2266）。
  *
  * 四块：
- *  1. TUN 接管：协议栈（Auto/Mixed/gVisor/System）+ 自动路由 + 严格路由 + IPv6（+ FakeIP 联动提示）
- *     + <details> 三平台机制与建议（原生元素，靠 [open] 驱动折叠箭头，非自绘按钮）
+ *  1. TUN 接管：MTU + 自动路由 + 严格路由 + NAT 类型 + IPv6（+ FakeIP 联动提示）
+ *     + <details> 三平台机制（原生元素，靠 [open] 驱动折叠箭头，非自绘按钮）
+ *     没有协议栈选项：TUN stack 随 sing-box 1.15.0-alpha.3 弃用已整体移除，内核一律走 sing-tun 新栈。
  *  2. 排除网段（route_exclude / bypassLANList CIDR）
  *  3. 连入来源排除（inboundExcludeCidrs）+ Linux-only 提示（纯 CSS `:root[data-os="lin"] .plat-warn`门控）
  *  4. 局域网网关（契约 L102）：邻居短名解析 neighborDomains（TUN + Linux/macOS）
@@ -16,10 +17,10 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import type { UserConfig, TunModeConfig, TunStack, UdpNatType } from '@/contracts/types';
+import type { UserConfig, TunModeConfig, UdpNatType } from '@/contracts/types';
 import { injectedList, injectedRecord } from '@/domain/effective-config';
 import { isValidMacAddress, isValidNeighborDomain } from '@/domain/neighbor';
-import { autoMtuFor, MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
+import { DEFAULT_TUN_MTU, MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
 import { useNavStore } from '@/store/nav-store';
 import { Fold } from '@/components/Fold';
 import {
@@ -49,20 +50,12 @@ export interface SettingsTunProps {
   update: (patch: Partial<UserConfig>) => Promise<void>;
 }
 
-const STACK_OPTIONS: { value: TunStack; label: string }[] = [
-  { value: 'auto', label: 'Auto' },
-  { value: 'mixed', label: 'Mixed' },
-  { value: 'gvisor', label: 'gVisor' },
-  { value: 'system', label: 'System' },
-];
-
 /**
  * NAT 类型档。`'default'` 是**只存在于这颗控件里**的哨兵，落库时映射回 `udpNatType: undefined`
  * （删键）—— 同 `macFilterMode` 的 `'off'` 档，理由也同：Csel 的 value 是字符串，表达不了 undefined。
  *
- * 值的顺序即「松 → 严」，与 desc 里那句排序说法必须一致。协议栈那颗下拉的 label 是产品名
- * （Auto/Mixed/gVisor/System，跨语种同形故不进 locale），这颗不是 —— 「受限锥」是要翻译的，
- * 故 label 走 i18n key。
+ * 值的顺序即「松 → 严」，与 desc 里那句排序说法必须一致。label 走 i18n key：「受限锥」这类档名
+ * 是要翻译的，不是跨语种同形的产品名。
  */
 const NAT_TYPE_OPTIONS: { value: UdpNatType | 'default'; key: string }[] = [
   { value: 'default', key: 'settings.tun.natTypeDefault' },
@@ -259,23 +252,8 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
 
       {/* 1. TUN 接管 */}
       <SetBlock header={t('settings.tun.takeoverBlock')}>
-        <SetRow label={t('settings.tun.stack')} tip={t('settings.tun.stackDesc')}>
-          <Select
-            id="tun-stack-sel"
-            value={tun.stack}
-            onChange={(e) => patchTun({ stack: e.target.value as TunStack })}
-            aria-label={t('settings.tun.stack')}
-            style={{ width: '150px' }}
-          >
-            {STACK_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </Select>
-        </SetRow>
-        {/* MTU 紧贴协议栈：默认 MTU 是**栈的函数**（gvisor 吃得下 65535，system/mixed 在 65535 下
-            塌到 11 Mbps），两项分开放会让「换了栈占位符里的数也变了」显得莫名其妙。 */}
+        {/* 占位符里的「自动」值与内核实际拿到的是同一个常量（Rust `DEFAULT_TUN_MTU`，parity 见
+            domain/tun-mtu.test.ts）；与平台无关，故不再读 platform。 */}
         <SetRow
           label="MTU"
           tip={t('settings.tun.mtuDesc')}
@@ -288,7 +266,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
               className="mono"
               value={mtuDraft}
               placeholder={t('settings.tun.mtuAutoPlaceholder', {
-                n: autoMtuFor(tun.stack, platform),
+                n: DEFAULT_TUN_MTU,
               })}
               onChange={(e) => {
                 setMtuDraft(e.target.value);
@@ -413,20 +391,12 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
             />
           </SetRow>
 
-          {/* 三平台机制与建议（原生 <details>，折叠箭头由 CSS [open] 驱动，非自绘按钮态） */}
+          {/* 三平台机制（原生 <details>，折叠箭头由 CSS [open] 驱动，非自绘按钮态） */}
           <details className="tun-details" onToggle={revealOnToggle}>
             <summary>{t('settings.tun.detailsSummary')}</summary>
-            {/* 每条的 `<b>` 里是协议栈名 / 平台名（Mixed·gVisor·System·Auto·macOS·Windows·Linux）——
-                产品名与平台名跨语种同形，不进 locale；破折号之后的说明才是文案，逐条走键。 */}
+            {/* 每条的 `<b>` 里是平台名（macOS·Windows·Linux）—— 跨语种同形，不进 locale；
+                破折号之后的说明才是文案，逐条走键。 */}
             <div className="tun-details-body">
-              <div className="tun-det-h">{t('settings.tun.detStackHead')}</div>
-              <div><b>Mixed</b> — {t('settings.tun.detStackMixed')}</div>
-              <div><b>gVisor</b> — {t('settings.tun.detStackGvisor')}</div>
-              <div><b>System</b> — {t('settings.tun.detStackSystem')}</div>
-              <div><b>Auto</b> — {t('settings.tun.detStackAuto')}</div>
-              <div><b>macOS</b> — {t('settings.tun.detStackMac')}</div>
-              <div><b>Windows</b> — {t('settings.tun.detStackWin')}</div>
-              <div><b>Linux</b> — {t('settings.tun.detStackLinux')}</div>
               <div className="tun-det-h">{t('settings.tun.detRouteHead')}</div>
               <div><b>Windows</b> — {t('settings.tun.detRouteWin')}</div>
               <div><b>macOS</b> — {t('settings.tun.detRouteMac')}</div>
