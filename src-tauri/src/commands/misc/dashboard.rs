@@ -92,23 +92,29 @@ pub async fn open_singbox_dashboard(app: AppHandle, locale: Option<String>) -> A
     };
     // 仅允许停留在本地 api service 源（`http://127.0.0.1:<port>/…`）；跨源 http(s) 拦下。内部 scheme 放行。
     let allowed_prefix = format!("{api_url}/");
-    let win = WebviewWindowBuilder::new(&app, DASHBOARD_WINDOW_LABEL, WebviewUrl::External(parsed))
-        .title("sing-box Dashboard")
-        .inner_size(1100.0, 760.0)
-        .min_inner_size(800.0, 600.0)
-        // preload 等价：document-start 于面板同源预写 localStorage（读前已写）。
-        .initialization_script(&script)
-        // 同一条 preload 通道再挂一次系统右键菜单禁用（面板是第三方产物，改不了它的 JS）。
-        .initialization_script(DISABLE_CONTEXT_MENU_SCRIPT)
-        .on_navigation(move |u| {
-            let scheme = u.scheme();
-            if scheme == "http" || scheme == "https" {
-                u.as_str().starts_with(&allowed_prefix)
-            } else {
-                true // tauri:/about:/data: 等内部 scheme 放行
-            }
-        })
-        .build();
+    let mut builder =
+        WebviewWindowBuilder::new(&app, DASHBOARD_WINDOW_LABEL, WebviewUrl::External(parsed))
+            .title("sing-box Dashboard")
+            .inner_size(1100.0, 760.0)
+            .min_inner_size(800.0, 600.0)
+            // preload 等价：document-start 于面板同源预写 localStorage（读前已写）。
+            .initialization_script(&script)
+            // 同一条 preload 通道再挂一次系统右键菜单禁用（面板是第三方产物，改不了它的 JS）。
+            .initialization_script(DISABLE_CONTEXT_MENU_SCRIPT)
+            .on_navigation(move |u| {
+                let scheme = u.scheme();
+                if scheme == "http" || scheme == "https" {
+                    u.as_str().starts_with(&allowed_prefix)
+                } else {
+                    true // tauri:/about:/data: 等内部 scheme 放行
+                }
+            });
+    // WebView2 启动参数（图形逃生门 `--disable-gpu`）：四个建窗点同值，唯一真值在 graphics_compat。
+    // 面板加载的是外部 URL，但与主窗共用默认 data directory ⇒ 参数必须一致，否则关硬件加速后面板建不出来。
+    if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
+        builder = builder.additional_browser_args(args);
+    }
+    let win = builder.build();
     match win {
         Ok(_) => ApiResponse::ok(json!({ "ok": true })),
         // 快速双击：async 之后两个请求可能都越过上面的查重，后到的那个在 tauri 的 label 登记处

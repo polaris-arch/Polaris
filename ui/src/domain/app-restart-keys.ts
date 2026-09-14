@@ -40,9 +40,9 @@
  * # 成员逐条证据（2026-07-28 于磁盘核实）
  *
  * - **`hardwareAcceleration`** —— `src-tauri/src/main.rs:1196-1202` 在 setup 里、**首个 webview 创建之前**
- *   调 `graphics_compat::apply_hardware_acceleration_escape()` 设 GPU 环境变量
- *   （`WEBKIT_DISABLE_DMABUF_RENDERER` / `WEBKIT_DISABLE_COMPOSITING_MODE` / `--disable-gpu`，
- *   `graphics_compat.rs:92-123`）。各平台 runtime 只在建 webview 那一刻读这些变量 ⇒ 之后改无效。
+ *   调 `graphics_compat::apply_hardware_acceleration_escape()` 关 GPU：Linux 设环境变量
+ *   `WEBKIT_DISABLE_DMABUF_RENDERER` / `WEBKIT_DISABLE_COMPOSITING_MODE`，Windows 经 WebView2 API
+ *   下发 `--disable-gpu`（`graphics_compat.rs:92-123`）。各平台都只在建 webview 那一刻应用 ⇒ 之后改无效。
  * - **`windowEffects`** —— `main.rs:887-888` + `:932-951` + `:982-1010`：`transparent` / `background_color`
  *   是 **builder-only 参数**（运行期不可改），vibrancy/Mica 也只在 `builder.build()` 之后挂一次。
  *   更糟的是前端 `resolveWindowEffectsState`（`components/layout/window-effects.ts:42`）是**实时**读这两个键的：
