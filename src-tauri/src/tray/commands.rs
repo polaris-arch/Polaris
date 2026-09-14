@@ -248,13 +248,9 @@ pub async fn tray_check_update(app: AppHandle) -> ApiResponse<bool> {
         return ApiResponse::err(t(lang, key::NATIVE_UPDATE_INFO_INCOMPLETE));
     };
     let current = app.package_info().version.to_string();
-    let r = crate::commands::update_popup_show(
-        app.clone(),
-        app.state::<crate::runtime::AppRuntime>(),
-        version,
-        current,
-        Some(include_prerelease),
-    );
+    let r =
+        crate::commands::update_popup_show(app.clone(), version, current, Some(include_prerelease))
+            .await;
     if r.success {
         ApiResponse::ok(true)
     } else {

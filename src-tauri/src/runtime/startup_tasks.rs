@@ -253,11 +253,11 @@ fn spawn_auto_check_update(app: AppHandle) {
         let current = app.package_info().version.to_string();
         let r = crate::commands::update_popup_show(
             app.clone(),
-            app.state::<AppRuntime>(),
             version,
             current,
             Some(include_prerelease),
-        );
+        )
+        .await;
         if !r.success {
             log::warn!(
                 "更新提醒弹窗打开失败: {}",
