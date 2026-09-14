@@ -269,7 +269,7 @@ pub async fn backup_import_apply(
         }
     };
     // 恢复后二次 load_full 重走完整迁移链（migrate_all）再广播：备份可能来自旧版本（上游/旧 Polaris），含旧 shape
-    // 字段（legacy DomainRule / subscriptionUpdateViaProxy / 未迁移 tunStack 等）。`save_full` 只 sanitize+validate、
+    // 字段（legacy DomainRule / subscriptionUpdateViaProxy / 遗留 tunConfig.stack 等）。`save_full` 只 sanitize+validate、
     // **不跑迁移链**，直接广播 restored 会让旧 shape 未迁移即入核/下发前端。二次 load_full 触发 migrate_all，
     // 广播迁移后配置。load 异常（刚存的合法配置几乎不可能）→ 回落广播 restored（仍带回填后的私密字段，不裸奔）。
     // 广播**回填后**（restored / 其迁移形）而非 outcome.config：后者 server 私密字段已被导出侧脱敏抹平，入核 = 缺密钥热切换。

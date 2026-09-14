@@ -11,7 +11,7 @@
 //! | `with_utls` | `tls.utls` 指纹字段被拒 | `singbox/outbound.rs` |
 //! | `with_wireguard` / `with_tailscale` | 对应 endpoint 起不来 | `singbox/endpoint.rs` |
 //! | `with_naive_outbound` | naive 出站被拒 | `singbox/outbound.rs` |
-//! | `with_gvisor` | TUN 的 gVisor 栈不可选 | `runtime/proxy.rs` |
+//! | `with_gvisor` | WireGuard endpoint 的用户态栈设备报 `ErrGVisorNotIncluded`（上游 `transport/wireguard/device_stack_stub.go`） | `singbox/endpoint.rs` |
 //! | `with_clash_api` | 面板 / 外部控制器整块失效 | `singbox/config.rs` |
 //!
 //! 关键在于**这件事是逐平台的**：官方发布矩阵完全可能只在某一个 GOOS 上改 tag 集。

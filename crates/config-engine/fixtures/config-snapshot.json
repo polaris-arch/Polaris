@@ -3199,8 +3199,7 @@
               ],
               "mtu": 1350,
               "auto_route": true,
-              "strict_route": true,
-              "stack": "system"
+              "strict_route": true
             }
           ],
           "outbounds": [
@@ -3815,7 +3814,6 @@
               "mtu": 1350,
               "auto_route": true,
               "strict_route": true,
-              "stack": "gvisor",
               "route_exclude_address": [
                 "127.0.0.0/8",
                 "::1/128"
@@ -4451,7 +4449,6 @@
               "mtu": 1350,
               "auto_route": true,
               "strict_route": true,
-              "stack": "gvisor",
               "route_exclude_address": [
                 "10.0.0.0/8",
                 "100.64.0.0/10",
@@ -16180,8 +16177,7 @@
               ],
               "mtu": 1350,
               "auto_route": true,
-              "strict_route": true,
-              "stack": "system"
+              "strict_route": true
             }
           ],
           "outbounds": [
@@ -16819,8 +16815,7 @@
               ],
               "mtu": 1350,
               "auto_route": true,
-              "strict_route": true,
-              "stack": "system"
+              "strict_route": true
             }
           ],
           "outbounds": [
@@ -18095,7 +18090,6 @@
               "mtu": 1350,
               "auto_route": true,
               "strict_route": true,
-              "stack": "gvisor",
               "route_exclude_address": [
                 "10.0.0.0/8",
                 "100.64.0.0/10",
@@ -21058,8 +21052,7 @@
               ],
               "mtu": 1350,
               "auto_route": true,
-              "strict_route": true,
-              "stack": "system"
+              "strict_route": true
             }
           ],
           "outbounds": [
@@ -21682,8 +21675,7 @@
               ],
               "mtu": 1350,
               "auto_route": true,
-              "strict_route": true,
-              "stack": "system"
+              "strict_route": true
             }
           ],
           "outbounds": [

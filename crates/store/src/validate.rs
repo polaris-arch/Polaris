@@ -4,7 +4,6 @@
 //! logLevel/tunConfig 必填/端口范围/布尔必填），以及复用的纯校验单一真值：
 //!   - `shared/server-completeness#ALL_PROTOCOLS` / `protocolRequirementError`
 //!   - `shared/rules#RULE_TYPE_IDS` / `isValidIpCidr` / `validateRuleValue`
-//!   - `shared/tun-stack#TUN_STACK_VALUES`
 //!   - `shared/direct-selection#isDirectSelection`
 //!
 //! 分层：[`crate::sanitize_config`] 先做形状清洗（坏字段删除/退化），
@@ -56,9 +55,6 @@ pub const ALLOWED_PROTOCOLS: &[&str] = &[
 pub fn is_allowed_protocol(proto_lower: &str) -> bool {
     ALLOWED_PROTOCOLS.contains(&proto_lower)
 }
-
-/// TUN stack 合法值（含 auto）。上游 `TUN_STACK_VALUES`。
-pub const TUN_STACK_VALUES: &[&str] = &["auto", "system", "gvisor", "mixed"];
 
 /// 全局直连哨兵（上游 `DIRECT_SERVER_ID`）。selectedServerId 取此值 = 全局直连，豁免存在性校验。
 pub const DIRECT_SERVER_ID: &str = "__direct__";
@@ -185,7 +181,7 @@ pub fn protocol_requirement_ok(proto_lower: &str, server: &Value) -> bool {
 /// 对 sanitize 后的 Value 做最终语义校验（就地归一 proxyModeType 为 camelCase 规范值）。
 ///
 /// Polaris 锚点 validateConfig 中 throw 的分支：proxyMode/proxyModeType/logLevel 枚举、
-/// tunConfig 必填 + mtu 范围 + stack 合法、端口范围、布尔必填。
+/// tunConfig 必填 + mtu 范围、端口范围、布尔必填。
 /// sanitize 已删除类型错的字段，这里对「缺失必填 / 枚举非法 / 范围越界」判 Err。
 ///
 /// proxyModeType 归一：validateConfig 原行为回写规范 camelCase（systemProxy/tun/manual），
@@ -230,7 +226,7 @@ pub fn validate_config(value: &mut Value) -> Result<(), crate::StoreError> {
     let tun = tun
         .as_object()
         .ok_or_else(|| crate::StoreError::validation("tunConfig is required"))?;
-    // mtu **缺席即合法**（= 自动，按最终栈 × 平台派生，见 config-engine `tun_stack::default_mtu_for`）。
+    // mtu **缺席即合法**（= 自动，生成期取 config-engine `tun_config::DEFAULT_TUN_MTU`）。
     // 在场则必须是 1280–65535 的数；`null` / 字符串 / 越界一律拒——「设了但是脏值」与「没设」是两回事，
     // 前者静默吞掉就是又一个「设置了不生效」。
     if let Some(raw) = tun.get("mtu").filter(|v| !v.is_null()) {
@@ -241,12 +237,9 @@ pub fn validate_config(value: &mut Value) -> Result<(), crate::StoreError> {
             ));
         }
     }
-    let stack = tun.get("stack").and_then(|v| v.as_str()).unwrap_or("");
-    if !TUN_STACK_VALUES.contains(&stack) {
-        return Err(crate::StoreError::validation(
-            "tunConfig.stack must be auto, system, gvisor, or mixed",
-        ));
-    }
+    // `stack` **不校验**：TUN stack 随上游弃用已整体移除，遗留值（含非法值）无任何行为后果。
+    // 若在此拒收，带旧 `stack` 的备份经 save 路径（不跑迁移链）导入会整份失败；删键由
+    // `migrate::migrate_tun_stack` 在下一次 load 时完成。
     if !tun.get("autoRoute").is_some_and(|v| v.is_boolean()) {
         return Err(crate::StoreError::validation(
             "tunConfig.autoRoute must be a boolean",

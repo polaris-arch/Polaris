@@ -59,7 +59,7 @@ const STUB = {
     selectedServerId: 's1',
     proxyMode: 'smart',
     proxyModeType: 'tun',
-    tunConfig: { mtu: 9000, stack: 'auto', autoRoute: true, strictRoute: false },
+    tunConfig: { mtu: 9000, autoRoute: true, strictRoute: false },
     customRules: [],
     appRules: [],
     autoStart: false,

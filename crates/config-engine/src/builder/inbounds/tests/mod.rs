@@ -308,12 +308,11 @@ fn tun_linux_no_exclude_addr() {
     let tun = &inbounds[1];
     assert_eq!(tun.type_field, "tun");
     assert_eq!(tun.tag, "tun-in");
-    assert_eq!(tun.stack.as_deref(), Some("system")); // linux 默认 system
     assert!(
         tun.route_exclude_address.is_none()
             || tun.route_exclude_address.as_ref().unwrap().is_empty()
     );
-    assert_eq!(tun.mtu, Some(4064)); // linux auto → system → 4064
+    assert_eq!(tun.mtu, Some(DEFAULT_TUN_MTU)); // 缺席 → 与栈、平台无关的单一默认
 }
 
 #[test]
@@ -326,8 +325,7 @@ fn tun_mac_has_loopback_exclude() {
     deps.platform = "darwin".into();
     let inbounds = build_inbounds(&config, None, &deps);
     let tun = &inbounds[1];
-    assert_eq!(tun.stack.as_deref(), Some("gvisor")); // mac 默认 gvisor
-    assert_eq!(tun.mtu, Some(9000)); // mac auto → gvisor → 9000
+    assert_eq!(tun.mtu, Some(DEFAULT_TUN_MTU)); // mac 与 linux 同值（不再按栈派生）
     let exclude = tun.route_exclude_address.as_ref().unwrap();
     assert!(exclude.contains(&"127.0.0.0/8".to_string()));
     assert!(exclude.contains(&"::1/128".to_string()));
@@ -374,6 +372,152 @@ fn tun_probe_pool_inbounds() {
     assert_eq!(inbounds.len(), 4);
     assert_eq!(inbounds[1].tag, "probe-in-0");
     assert_eq!(inbounds[2].tag, "probe-in-1");
+}
+
+// ── TUN stack 弃用：生成期不发 stack、MTU 默认与栈无关 ──────────────────────
+
+/// Polaris 的全部发行平台（`deps.platform` 的取值域，与 `scripts/fetch-core.mjs` 的三个 OS 对应）。
+const RELEASE_PLATFORMS: [&str; 3] = ["linux", "darwin", "win32"];
+
+/// 在 `platform` 上生成 TUN inbound，取**序列化后的 JSON**（内核读的是它，不是结构体）。
+fn tun_json_on(config: &UserConfig, platform: &str) -> serde_json::Value {
+    let mut deps = deps_linux();
+    deps.platform = platform.into();
+    let tun = build_inbounds(config, None, &deps)
+        .into_iter()
+        .find(|i| i.type_field == "tun")
+        .expect("TUN 模式必产出 tun inbound");
+    serde_json::to_value(tun).expect("tun inbound 序列化失败")
+}
+
+/// 判据本体：TUN inbound 序列化形上的违规清单（空 = 合规）。正向用例与反向对照共用这一份，
+/// 保证「喂进违规输入会红」证明的是**同一段**判据，而不是另写一份更严的。
+fn tun_inbound_violations(tun: &serde_json::Value, want_mtu: u32) -> Vec<String> {
+    let Some(obj) = tun.as_object() else {
+        return vec![format!("tun inbound 不是 JSON 对象：{tun}")];
+    };
+    let mut out = Vec::new();
+    if let Some(stack) = obj.get("stack") {
+        out.push(format!(
+            "发出了 `stack`={stack}（sing-box 1.15.0-alpha.3 起即报弃用，1.17 删除）"
+        ));
+    }
+    if obj.get("mtu") != Some(&serde_json::json!(want_mtu)) {
+        out.push(format!("`mtu` 应为 {want_mtu}，实得 {:?}", obj.get("mtu")));
+    }
+    out
+}
+
+/// 🔴 【生成期断言】三平台生成的 TUN inbound **一律不含 `stack` 键**，且用户未填 MTU 时 `mtu` 恒为
+/// [`DEFAULT_TUN_MTU`]（键在场、值与平台无关）。
+///
+/// 输入刻意带上遗留的 `tunConfig.stack`（旧 UI 的四个取值 + 一个非法值 + 缺席）：磁盘上的旧配置
+/// 在 store 迁移之前就可能被读进来，这里证明它**读得进来且漏不到生成侧**。
+///
+/// 反向对照见 [`tun_inbound_violations_has_teeth`]：同一判据喂「真实生成结果 + 手工塞回 stack」必红。
+#[test]
+fn tun_inbound_never_emits_stack_on_any_platform() {
+    assert_eq!(
+        DEFAULT_TUN_MTU, 65535,
+        "默认值变了须同步 ui/src/domain/tun-mtu.ts"
+    );
+    let legacy_values = [
+        None,
+        Some("auto"),
+        Some("system"),
+        Some("gvisor"),
+        Some("mixed"),
+        Some("bogus"),
+    ];
+    let mut checked = 0usize;
+    for legacy in legacy_values {
+        let mut tun_cfg = serde_json::json!({ "autoRoute": true, "strictRoute": true });
+        if let Some(stack) = legacy {
+            tun_cfg["stack"] = serde_json::json!(stack);
+        }
+        let config: UserConfig = serde_json::from_value(serde_json::json!({
+            "servers": [],
+            "proxyModeType": "tun",
+            "tunConfig": tun_cfg,
+        }))
+        .unwrap_or_else(|e| panic!("遗留 stack={legacy:?} 的用户配置反序列化失败：{e}"));
+        for platform in RELEASE_PLATFORMS {
+            let tun = tun_json_on(&config, platform);
+            let violations = tun_inbound_violations(&tun, DEFAULT_TUN_MTU);
+            assert!(
+                violations.is_empty(),
+                "[{platform} / 输入 stack={legacy:?}] {violations:?}\n实际: {tun}"
+            );
+            checked += 1;
+        }
+    }
+    // 射程对账：6 种输入 × 3 平台，少一格说明有腿被静默跳过。
+    assert_eq!(checked, legacy_values.len() * RELEASE_PLATFORMS.len());
+}
+
+/// 用户显式 MTU 仍**逐字**下发（三平台），不被新默认值顶掉。
+#[test]
+fn explicit_tun_mtu_is_emitted_verbatim_on_every_platform() {
+    for mtu in [1280u32, 1400, 9000, 65535] {
+        let config = UserConfig {
+            proxy_mode_type: ProxyModeType::Tun,
+            tun_config: Some(crate::user_config::tun_config::TunModeConfig {
+                mtu: Some(mtu),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for platform in RELEASE_PLATFORMS {
+            let tun = tun_json_on(&config, platform);
+            let violations = tun_inbound_violations(&tun, mtu);
+            assert!(
+                violations.is_empty(),
+                "[{platform} / mtu={mtu}] {violations:?}"
+            );
+        }
+    }
+}
+
+/// 反向对照：判据必须对「stack 仍被发出」「mtu 不是默认值」两种形态各自转红。
+///
+/// 喂的是**真实生成结果**再手工改一处，而不是另造一份 JSON：这样证明的是「生成形状上的这一个键」
+/// 被抓住，排除「判据其实只是在对象形状不对时才红」的假牙。
+#[test]
+fn tun_inbound_violations_has_teeth() {
+    let config = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        ..Default::default()
+    };
+    for platform in RELEASE_PLATFORMS {
+        let clean = tun_json_on(&config, platform);
+        assert!(tun_inbound_violations(&clean, DEFAULT_TUN_MTU).is_empty());
+
+        for stack in ["go", "system", "gvisor", "mixed", ""] {
+            let mut leaked = clean.clone();
+            leaked["stack"] = serde_json::json!(stack);
+            let v = tun_inbound_violations(&leaked, DEFAULT_TUN_MTU);
+            assert!(
+                v.len() == 1 && v[0].contains("stack"),
+                "[{platform}] 塞回 stack={stack:?} 判据没红：{v:?}"
+            );
+        }
+
+        let mut wrong_mtu = clean.clone();
+        wrong_mtu["mtu"] = serde_json::json!(9000);
+        let v = tun_inbound_violations(&wrong_mtu, DEFAULT_TUN_MTU);
+        assert!(
+            v.len() == 1 && v[0].contains("mtu"),
+            "[{platform}] 改 mtu 判据没红：{v:?}"
+        );
+
+        let mut no_mtu = clean.clone();
+        no_mtu.as_object_mut().unwrap().remove("mtu");
+        assert_eq!(
+            tun_inbound_violations(&no_mtu, DEFAULT_TUN_MTU).len(),
+            1,
+            "[{platform}] mtu 缺席判据没红"
+        );
+    }
 }
 
 // ── NAT 类型（udp_mapping × udp_filtering）─────────────────────────────────

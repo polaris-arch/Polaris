@@ -62,8 +62,9 @@ pub fn ensure_effective_config(cfg: &mut Value) {
 /// `tunConfig` 缺省 → 注入 `TunModeConfig::default()` 的序列化形。
 ///
 /// 生效值来源是 Rust 的 `Default` 实现本身（不是抄一份字面量）：`skip_serializing_if` 会把
-/// 全部 `None` 字段略去，故实得 `{"stack":"auto","autoRoute":true,"strictRoute":true}`
-/// —— 与 `polaris-store` 新装播种写的那三键逐字相同，也与前端此前的 `?? {…}` 兜底相同。
+/// 全部 `None` 字段略去，故实得 `{"autoRoute":true,"strictRoute":true}`
+/// —— 与 `polaris-store` 新装播种写的那两键逐字相同，也与前端此前的 `?? {…}` 兜底相同
+/// （当时三处都还带 `"stack":"auto"`；TUN stack 随上游弃用移除后，三处同步只剩这两键）。
 /// 三处相同**正是问题**：那意味着有三份默认在各自维护。此后只剩 `Default` 一份，另两处由守卫禁止。
 ///
 /// `mtu` 刻意仍然缺席（`Option::is_none` 略去）：缺席即"自动"，写一个具体数会把当时的默认冻在磁盘上。

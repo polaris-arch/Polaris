@@ -106,6 +106,20 @@
 //! - **验收**：生成侧另由 `builder::route::tests::non_tun_modes_leave_per_destination_routing_to_the_os`
 //!   钉住 System/manual 两腿；本门继续要求全量 37/37 diff=0。
 //!
+//! **第八次例外（2026-09-13，TUN stack 随上游弃用移除）**：sing-box 1.15.0-alpha.3 起 TUN inbound
+//! 只要写了 `stack`（含 `"go"`）就报弃用，1.17 删除；Polaris 不再下发该键，一律走 sing-tun 新栈。
+//! 这是**刻意与上游分叉**（上游 TS builder 仍发 `stack`，重生一次回来一次），同第二次例外。
+//!
+//! - **变换**：仅删除 `expected.config.inbounds[]` 里 `type=="tun"` 条目的 `stack` 键；
+//!   `input.tunConfig.stack`（37 处，冻结的上游输入）**一处未动** —— 它们顺带证明遗留键读得进来、漏不到生成侧。
+//! - **计数**：恰好 8 处 = 8 个 TUN case 各 1 条（linux 5 × `system`、win32 2 × `gvisor`、darwin 1 × `gvisor`），
+//!   `stack` 出现在非 tun inbound 上的条目：0。全部 TUN case 的输入均显式 `mtu: 1350`，MTU 默认值
+//!   改动（`DEFAULT_TUN_MTU`）对本夹具零 delta。行级 diff = 14 行删除（`config-snapshot.json` 8 + `inbounds.json` 6）
+//!   + 9 处因 `stack` 是末键而去掉前一行 `strict_route` 尾逗号，无第三类。
+//! - **验收**：变换前 8/37 红、首差异全部是 `缺键 inbounds[1].stack`；变换后 37/37 diff=0。
+//!   生成侧由 `builder::inbounds::tests::tun_inbound_never_emits_stack_on_any_platform`（三平台正向）
+//!   与 `tun_inbound_violations_has_teeth`（反向对照）钉住。`fixtures/inbounds.json` 同批同规则变换（6 处）。
+//!
 //! # 重生方式（不要在本仓手搓）
 //!
 //! 导出器在 **上游仓**：`scripts/export-config-snapshot-fixtures.test.ts`。重生要求 上游 主工作树

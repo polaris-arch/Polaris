@@ -1,69 +1,26 @@
 /**
- * TUN 栈解析 + 默认 MTU 派生 —— 与 Rust 侧 `crates/config-engine/src/user_config/tun_stack.rs`
- * 逐值同口径的渲染端副本。
+ * TUN 默认 MTU —— Rust 侧 `crates/config-engine/src/user_config/tun_config.rs` 的 `DEFAULT_TUN_MTU`
+ * 的渲染端副本。
  *
  * # 为什么渲染端需要一份
  *
- * MTU 设置项的「自动」态要**当场告诉用户自动是多少**（占位符里的那个数）。不算出来就只能写死一句
- * 「按平台自动」——那等于让用户去猜，而这一项的取值范围跨了 16 倍（4064 ↔ 65535），猜不出来。
+ * MTU 设置项的「自动」态要**当场告诉用户自动是多少**（占位符里的那个数），不算出来就只能写一句
+ * 「自动」让用户去猜。
  *
- * # 两侧同口径怎么保证
+ * # 为什么是一个常量，不再是「栈 × 平台」的函数
+ *
+ * sing-box 1.15.0-alpha.3 起 TUN `stack` 弃用，Polaris 已整体移除栈的概念（不下发、无设置项），
+ * 一律走 sing-tun 新栈。此前按栈与平台分三档（65535 / 9000 / 4064）的依据全是旧栈上的实测，
+ * 自变量没了，默认值收敛成上游桌面默认 65535，与平台无关。判据（2026-09-13 两平台实测）见 Rust 侧常量的文档注释。
+ *
+ * # 两侧同值怎么保证
  *
  * 生成期的真值**始终在 Rust**（本文件只影响显示，改坏了也不会让内核拿到别的 MTU）。
- * 同口径由 `tun-mtu.test.ts` 的表锁住：那张表与 Rust 的
- * `default_mtu_by_stack_and_platform` 用例逐格对应，任一侧改值而另一侧没跟，两边各红一处。
- *
- * 数值判据（实测，非推理）见 Rust 侧同名函数的文档注释与
- * vault `design/networking/` 下的 win-tun MTU 基准记录。
+ * `tun-mtu.test.ts` 直接读 Rust 源码里的常量字面量与本常量对拍 —— 任一侧改值而另一侧没跟即红。
  */
 
-import type { TunStack } from '@/contracts/types';
-
-/** 下发给核的具体栈（永不含 auto）。 */
-export type ConcreteTunStack = 'system' | 'gvisor' | 'mixed';
-
-/** 渲染端平台标识 —— 与 `settings-logic.ts::shellPlatformFromDataOs()` 的返回值域一致
- * （含 `undefined`：SSR / 测试渲染下 `document` 不存在，取不到平台）。此处**重声明而非 import**：
- * `domain/` 是纯逻辑层，不反向依赖 `components/`。两者对不上时 `SettingsTun` 的调用处编译报错。 */
-export type ShellPlatform = 'mac' | 'win' | 'lin' | undefined;
-
-/**
- * 平台默认栈：mac·win→gvisor / linux→system / 未知→system。
- *
- * Windows 2026-08-05 从 system 改到 gvisor：同机实测 `gvisor/65535` = 919 Mbps 而
- * `system/65535` = 11 Mbps（链路层塌陷），且 gvisor 下 MTU 越大越快。
- * Linux 保持 system —— 实测栈间无可测差异，没有换默认的依据。
- */
-export function platformDefaultStack(platform: ShellPlatform): ConcreteTunStack {
-  return platform === 'mac' || platform === 'win' ? 'gvisor' : 'system';
-}
-
-/** auto/缺省 → 平台默认；显式 system/gvisor/mixed → 原样（全平台 honor）。 */
-export function resolveTunStack(
-  userStack: TunStack | undefined,
-  platform: ShellPlatform
-): ConcreteTunStack {
-  return userStack === undefined || userStack === 'auto'
-    ? platformDefaultStack(platform)
-    : userStack;
-}
-
-/**
- * 未显式设置 MTU 时的默认值，按**最终栈 × 平台**取。
- *
- * - gvisor + Windows → 65535（实测全矩阵最高格）
- * - gvisor + 其余 → 9000（mac/linux 的吞吐实验都没跑出区分力 → 不照搬 Windows 的极端值）
- * - system / mixed → 4064（下界：1350 会丢 1400B UDP，三平台各自复现；上界：65535 塌到 11 Mbps）
- */
-export function defaultMtuFor(stack: ConcreteTunStack, platform: ShellPlatform): number {
-  if (stack === 'gvisor') return platform === 'win' ? 65535 : 9000;
-  return 4064;
-}
-
-/** 当前配置下「自动」会取到的 MTU（供设置项占位符显示）。 */
-export function autoMtuFor(userStack: TunStack | undefined, platform: ShellPlatform): number {
-  return defaultMtuFor(resolveTunStack(userStack, platform), platform);
-}
+/** 用户未填 MTU 时内核实际拿到的值（= Rust `DEFAULT_TUN_MTU`）。 */
+export const DEFAULT_TUN_MTU = 65535;
 
 /** 内核接受的 MTU 区间（与 `polaris-store` 的 `validate_config` 同值）。 */
 export const MTU_MIN = 1280;

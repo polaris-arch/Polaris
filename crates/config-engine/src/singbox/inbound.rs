@@ -28,8 +28,10 @@ pub struct Inbound {
     pub auto_redirect: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict_route: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stack: Option<String>,
+    // 🔴 刻意**没有** `stack` 字段：sing-box 1.15.0-alpha.3 起写了 `stack`（含 `"go"`）就报弃用，
+    // 1.17 删除；缺席即走 sing-tun 新栈。删字段而不是留 `Option` 恒 `None`：本结构体只由
+    // `builder::inbounds` 构造，没有任何读入外部 inbound 的路径依赖它，删掉后「重新发出 stack」
+    // 连编译都过不了。生成期断言见 `builder::inbounds::tests::tun_inbound_never_emits_stack_on_any_platform`。
     /// udp_mapping / udp_filtering（1.14 新增；**只有 tun / tproxy 两个 inbound 变体带这组键** ——
     /// 随包 beta.7 `sing-box schema` 实测：`$defs/Inbound/oneOf[16].properties.type.const == "tun"`、
     /// `oneOf[13] == "tproxy"`，其余 20 个变体没有）。
@@ -40,8 +42,7 @@ pub struct Inbound {
     /// **缺席即最宽松**：上游两项默认都是 `endpoint_independent`（<https://sing-box.sagernet.org/configuration/shared/udp-nat/>），
     /// 即全锥。故 Polaris 只在用户显式选档时下发（入口见 `user_config::tun_config::UdpNatType`），
     /// 默认一个键都不发 —— 这既保住金样零 delta，也避免把「当前默认值」硬编码进配置、日后上游改默认时
-    /// 我们还钉在旧值上（与 `tun_stack` 刻意 pin 协议栈相反：那里 pin 是因为默认随 build-tag 漂且我们有
-    /// 实测判据要压住，这里没有任何判据说全锥不该是默认）。
+    /// 我们还钉在旧值上（这里没有任何判据说全锥不该是默认）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_mapping: Option<UdpNatBehavior>,
     #[serde(skip_serializing_if = "Option::is_none")]

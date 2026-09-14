@@ -1452,14 +1452,13 @@ Inbound[tun].iproute2_rule_index
 Inbound[tun].iproute2_table_index
 Inbound[tun].loopback_address
 Inbound[tun].mtu
+Inbound[tun].multi_queue
 Inbound[tun].netns
 Inbound[tun].platform
 Inbound[tun].route_address
 Inbound[tun].route_address_set
 Inbound[tun].route_exclude_address
 Inbound[tun].route_exclude_address_set
-Inbound[tun].stack
-Inbound[tun].stack = ["gvisor","mixed","system"]
 Inbound[tun].strict_route
 Inbound[tun].tag
 Inbound[tun].type

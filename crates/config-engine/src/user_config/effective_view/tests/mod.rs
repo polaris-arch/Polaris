@@ -55,9 +55,9 @@ fn injection_adds_nothing_undeclared() {
         .collect();
     for key in tun_keys {
         let path = format!("tunConfig.{key}");
-        // `tunConfig` 整体注入带来的是 `TunModeConfig::default()` 的字段（stack/autoRoute/strictRoute），
+        // `tunConfig` 整体注入带来的是 `TunModeConfig::default()` 的字段（autoRoute/strictRoute），
         // 它们随该对象一起在场，不需要各自登记；只有**独立注入**的键必须登记。
-        if ["stack", "autoRoute", "strictRoute"].contains(&key.as_str()) {
+        if ["autoRoute", "strictRoute"].contains(&key.as_str()) {
             continue;
         }
         assert!(
@@ -68,7 +68,7 @@ fn injection_adds_nothing_undeclared() {
 }
 
 /// `tunConfig` 缺席 → 注入值必须**逐字等于** `TunModeConfig::default()` 的序列化形，
-/// 而不是另抄一份 `{"stack":"auto",…}` 字面量。
+/// 而不是另抄一份 `{"autoRoute":true,…}` 字面量。
 #[test]
 fn tun_config_injection_mirrors_rust_default() {
     let mut cfg = json!({});
@@ -89,6 +89,12 @@ fn tun_config_injection_mirrors_rust_default() {
         cfg["tunConfig"].get("mtu").is_none(),
         "mtu 不该被注入（缺席即自动）"
     );
+    // stack 必须缺席：TUN stack 已随上游弃用移除，前端拿到的生效形里不得再出现这个概念。
+    assert!(
+        cfg["tunConfig"].get("stack").is_none(),
+        "stack 不该被注入（已无此设置项）：{}",
+        cfg["tunConfig"]
+    );
 }
 
 /// `inboundExcludeCidrs` 的注入值必须等于生成侧真正使用的生效值（`unwrap_or(&[])` ⇒ 空）。
@@ -97,8 +103,7 @@ fn tun_config_injection_mirrors_rust_default() {
 /// 就必须先改生成侧的生效语义，改不动这一边就红。
 #[test]
 fn inbound_exclude_injection_mirrors_builder_effective_value() {
-    let mut cfg =
-        json!({ "tunConfig": { "stack": "auto", "autoRoute": true, "strictRoute": true } });
+    let mut cfg = json!({ "tunConfig": { "autoRoute": true, "strictRoute": true } });
     ensure_effective_config(&mut cfg);
     assert_eq!(
         cfg["tunConfig"]["inboundExcludeCidrs"],
@@ -121,7 +126,7 @@ fn existing_values_are_never_overwritten() {
     let mut cfg = json!({
         "bypassLANList": ["10.0.0.0/8"],
         "tunConfig": {
-            "stack": "gvisor",
+            "mtu": 1400,
             "autoRoute": false,
             "strictRoute": false,
             "inboundExcludeCidrs": ["32.0.0.0/24", "fd7a:115c:a1e0::/48"]
@@ -129,7 +134,7 @@ fn existing_values_are_never_overwritten() {
     });
     ensure_effective_config(&mut cfg);
     assert_eq!(cfg["bypassLANList"], json!(["10.0.0.0/8"]));
-    assert_eq!(cfg["tunConfig"]["stack"], json!("gvisor"));
+    assert_eq!(cfg["tunConfig"]["mtu"], json!(1400));
     assert_eq!(cfg["tunConfig"]["autoRoute"], json!(false));
     assert_eq!(
         cfg["tunConfig"]["inboundExcludeCidrs"],
@@ -196,11 +201,11 @@ fn malformed_values_are_passed_through_not_repaired() {
 fn explicit_null_is_treated_as_absent() {
     let mut cfg = json!({ "tunConfig": null });
     ensure_effective_config(&mut cfg);
-    assert_eq!(cfg["tunConfig"]["stack"], json!("auto"));
+    assert_eq!(cfg["tunConfig"]["autoRoute"], json!(true));
     assert_eq!(cfg["tunConfig"]["inboundExcludeCidrs"], json!([]));
 
-    let mut nested = json!({ "tunConfig": { "stack": "system", "inboundExcludeCidrs": null } });
+    let mut nested = json!({ "tunConfig": { "strictRoute": false, "inboundExcludeCidrs": null } });
     ensure_effective_config(&mut nested);
     assert_eq!(nested["tunConfig"]["inboundExcludeCidrs"], json!([]));
-    assert_eq!(nested["tunConfig"]["stack"], json!("system"));
+    assert_eq!(nested["tunConfig"]["strictRoute"], json!(false));
 }

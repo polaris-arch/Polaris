@@ -94,7 +94,23 @@ use core_locator::{core_or_skip, repo_root};
 //      `redirect_iptables.go` / `redirect_nftables_rules.go`，**`tun_darwin.go` 一次都没有**
 //      ⇒ macOS 上 `strict_route` 仍是 no-op（这条是 UI 侧「mac 禁用该开关」的判据来源）。
 // 前提未变，故只更新 pin，不改机制。
-const SING_TUN_PINNED: &str = "v0.9.1-0.20260902150540-98e457e39c90";
+//
+// 2026-09-13 随随包核 1.15.0-alpha.2 → **1.15.0-alpha.3** 复核。sing-tun 从
+// `v0.9.1-0.20260902150540-98e457e39c90` 跳到 `v0.9.4-0.20260912075549-869f0a4d76af`
+// （alpha.3 的 go.mod:58；盘上四份二进制 linux / win / mac-arm64 / mac-x64 的 modinfo 版本串一致）。
+// 取两版 proxy.golang.org 模块 zip 逐条核对：
+//   ① 直读新版函数体：`tun.go:133-138` 仍是 `if o.DNSMode == "" { return DNSModeHijack }`，
+//      枚举 `DNSModeHijack = "hijack"`（tun.go:64-66）未变；`tun.go` 本身只多了 `MultiQueue` 字段
+//      与两段 darwin 注释改写，与 DNS/路由模式无关；
+//   ② 全仓对差兜底：31 个文件改动 + 39 个新增条目（主体是新 go 栈 `stack_go*.go` 及其测试）、0 删除。
+//      抹掉行号后，非测试 `.go` 里提到 `DNSMode` 的**行集合两版逐字相同**（tun.go / tun_linux.go /
+//      tun_windows.go / redirect_iptables.go / redirect_nftables_rules.go /
+//      redirect_route_bypass_android.go）；新增的 `stack_go*.go` 零引用 ⇒ 默认值与消费面都没被绕开。
+//      这也说明 DNS 模式与「用哪个栈」无关 —— 本轮 Polaris 不再下发 `stack`（改走上游新 go 栈）不改变本门前提；
+//   ③ `StrictRoute` 的消费面仍是 `tun.go`(声明) / `tun_linux.go` / `tun_windows.go` /
+//      `redirect_iptables.go` / `redirect_nftables_rules.go`，`tun_darwin.go` 仍零引用。
+// 前提未变，故只更新 pin，不改机制。
+const SING_TUN_PINNED: &str = "v0.9.4-0.20260912075549-869f0a4d76af";
 
 /// 被钉的依赖模块路径。
 const SING_TUN_MODULE: &str = "github.com/sagernet/sing-tun";
