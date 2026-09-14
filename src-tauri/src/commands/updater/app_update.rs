@@ -1943,18 +1943,25 @@ pub(super) fn schedule_popup_auto_close(app: &AppHandle, delay_ms: u64) {
 ///
 /// ✅ **已接线**：建窗路径的初始态随文档注入 —— #300/#301 的「建窗但从未下发初始态」在此**结构性不可达**
 /// （见 `updater::popup` 模块文档）。
+///
+/// **`async fn` 是入口线程纪律，不是风格**：它会建 WebView 窗（`show_update_popup` →
+/// `build_popup_window`）。同步 command 在 Windows 上跑在 WebView2 回调帧内，帧内建窗 = 嵌套消息循环
+/// 等一个不可重入的完成回调 ⇒ 死锁（W18 同族，issue #2 的面板窗即此形态；tauri
+/// `WebviewWindowBuilder::new` 的 Known issues 明写要用 async command）。前端今天没有这条 IPC 通道，
+/// 两个 Rust 调用方也都已在 async 上下文，这里是把「谁都能从回调帧里同步调它」这条路结构性关掉。
+/// 不持 `State` 参数的理由同 `open_singbox_dashboard`（带借用参数的 async command 必须返回 `Result`）。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn update_popup_show(
+pub async fn update_popup_show(
     app: AppHandle,
-    state: State<'_, AppRuntime>,
     version: String,
     current_version: String,
     include_prerelease: Option<bool>,
 ) -> ApiResponse<()> {
+    let state = app.state::<AppRuntime>();
     let u = state.updater();
     let st = UpdatePopupState::remind_with_channel(
         version,

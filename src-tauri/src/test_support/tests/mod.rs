@@ -33,7 +33,7 @@ const MISC_MARKERS: [(&str, &str); 7] = [
     ),
     ("autostart.rs", "pub fn auto_start_set"),
     ("backup.rs", "pub async fn backup_export"),
-    ("dashboard.rs", "pub fn open_singbox_dashboard"),
+    ("dashboard.rs", "pub async fn open_singbox_dashboard"),
     ("ipinfo.rs", "pub(crate) fn ipinfo_probe_is_current"),
     ("logs.rs", "pub(crate) fn clear_log_stream_window"),
     ("support.rs", "pub(super) fn node_platform"),

@@ -23,17 +23,32 @@ const DASHBOARD_WINDOW_LABEL: &str = "singbox-dashboard";
 /// 系统右键菜单：本窗与本仓三个前端入口同口径禁掉（第二条 `initialization_script`，见
 /// [`DISABLE_CONTEXT_MENU_SCRIPT`]）。`initialization_script` 是 **push 语义**（tauri 2.11.5
 /// `webview/mod.rs`：`initialization_scripts.push(..)`），两次调用都会注入，不互相覆盖。
+///
+/// # 为什么必须是 `async fn`（W18 同族，issue #2）
+///
+/// 同步 command 由 tauri-macros 的 Blocking 分支在 **WebView2 `WebResourceRequested` 回调帧内**
+/// （UI 线程）执行。在这里 `build()`：runtime-wry 判定为主线程 → 内联建窗 → wry
+/// `create_environment` 开嵌套消息循环（`webview2_com::wait_with_pump`）等完成回调，而 WebView2
+/// 回调不可重入 ⇒ 永远等不到。表现 = 面板窗白屏、全部 IPC 卡死（主窗 ×、托盘「退出」一起失效）、
+/// 只能杀进程。tauri 自己在 `WebviewWindowBuilder::new` 的 Known issues 里写明：「On Windows, this
+/// function deadlocks when used in a synchronous command or event handlers … You should use `async`
+/// commands」（tauri 2.11.5 `webview/webview_window.rs`）。
+///
+/// async command 被 spawn 到 async runtime，IPC 回调立即返回；`build()` 在工作线程上走
+/// `send_user_message` 的 `PostMessageW` 分支，主线程在全新的事件循环帧里建窗 —— 与 W18 已真机
+/// 验证的 `show_main_window` / `queue_overlay_build` 同一帧形态。
+///
+/// **不持 `State<'_, _>` 参数**：带借用参数的 async command 必须返回 `Result`，而本命令的前端契约是
+/// `ApiResponse` 信封；故在体内取 `app.state::<AppRuntime>()`（先例 `tray::commands::tray_check_update`）。
+///
+/// 建窗点与入口线程纪律由 `src/tests/window_build_sites.rs` 的登记表守。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn open_singbox_dashboard(
-    app: AppHandle,
-    state: State<'_, AppRuntime>,
-    locale: Option<String>,
-) -> ApiResponse<Value> {
-    let info = state.proxy().dashboard_connection();
+pub async fn open_singbox_dashboard(app: AppHandle, locale: Option<String>) -> ApiResponse<Value> {
+    let info = app.state::<AppRuntime>().proxy().dashboard_connection();
     if !info.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         return ApiResponse::ok(json!({ "ok": false }));
     }
@@ -96,6 +111,20 @@ pub fn open_singbox_dashboard(
         .build();
     match win {
         Ok(_) => ApiResponse::ok(json!({ "ok": true })),
+        // 快速双击：async 之后两个请求可能都越过上面的查重，后到的那个在 tauri 的 label 登记处
+        // 被拒（`manager/webview.rs::prepare_webview` → `WebviewLabelAlreadyExists`，
+        // `manager/window.rs::prepare_window` → `WindowLabelAlreadyExists`，经 `?` 原样上抛）。
+        // 窗已由先到的请求建出 = 用户要的结果已经成立，按「已存在则聚焦」处理，不回假错误。
+        // 射程：先到者已走完 `attach_window`/`attach_webview` 登记（`window/mod.rs::build_internal`，
+        // 投递建窗消息后即同步登记，不等主线程）。两者**同时**越过 `prepare_*` 的那段微秒级窗口不在此覆盖。
+        Err(
+            tauri::Error::WindowLabelAlreadyExists(_) | tauri::Error::WebviewLabelAlreadyExists(_),
+        ) => {
+            if let Some(win) = app.get_webview_window(DASHBOARD_WINDOW_LABEL) {
+                let _ = win.set_focus();
+            }
+            ApiResponse::ok(json!({ "ok": true }))
+        }
         Err(e) => ApiResponse::err(format!("建面板窗失败：{e}")),
     }
 }

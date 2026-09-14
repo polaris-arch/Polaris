@@ -7,6 +7,9 @@ mod csp_contract;
 /// 建 `MockRuntime` App 的集成测试每个文件只许一个测试函数（进程级 GTK/tray 初始化会撞）。
 mod mock_runtime_app_isolation;
 
+/// 建窗点登记表 + 入口线程纪律（W18 / issue #2：Windows 上 WebView2 回调帧内建窗即死锁）。
+mod window_build_sites;
+
 /// 双击拖动层 / 系统菜单最大化不经过 `window_maximize_toggle`，必须由原生 resize 事件回读并广播。
 #[test]
 fn main_window_native_maximize_is_bridged_to_renderer() {
