@@ -29,28 +29,247 @@ mod proto_wire_check {
     /// 故 `0x0A <len> "daemon/started_service.proto"` 这串字节就是它的锚点。
     const PROTO_FILE_NAME: &[u8] = b"daemon/started_service.proto";
 
-    /// 随包核的四个平台目录（package.yml 一律全拉，故打包机上四份都在；
-    /// 开发机可能只 `fetch:core --platform=linux` 拉一份，故按「存在即检」处理）。
-    const CORE_RELATIVE_PATHS: [&str; 4] = [
-        "resources/linux/sing-box",
-        "resources/mac-arm64/sing-box",
-        "resources/mac-x64/sing-box",
-        "resources/win/sing-box.exe",
-    ];
-
     /// 仓库根（本 crate 在 `crates/singbox-grpc/`，故上跳两级）。
     pub fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
     }
 
-    /// 盘上真实存在的随包核。空 = 尚未 `node scripts/fetch-core.mjs`（裸 checkout / CI 常态）。
-    pub fn bundled_cores() -> Vec<PathBuf> {
+    // ── 随包核平台枚举：唯一真值源 ────────────────────────────────────────────
+    //
+    // 此前这里写着一份四条字面路径的表。它当时**不缺平台**，要治的是漂移：将来加一个平台
+    // （例如 `linux-arm64`）时，改的是 manifest 与 `scripts/fetch-core.mjs`，而这份表不会跟 ——
+    // 于是本门静默少看一个平台，且那一格不会红，没有任何信号。
+    //
+    // 跨 crate 共享不了 `crates/config-engine/tests/support/core_locator.rs` 的 `CORE_MATRIX`
+    // （`#[path]` 跨 crate include = 把锚点锚在别人的目录结构上），故两侧都改为从**同一份 manifest**
+    // 派生：平台**枚举**取自 manifest 的键集合，平台**路径形态**是一条规则（见
+    // [`core_relative_path`]），不是第二份名单。
+
+    /// 随包核平台枚举的权威真值源（相对仓库根）。
+    ///
+    /// `coreArchiveSha256` 的**键集合**就是「随包核有哪几个平台」：`scripts/fetch-core.mjs`
+    /// 按它逐平台拉核，且缺 pin 即拒绝下载 —— 一个平台要随包，它的键必然先在这里。
+    const CORE_MANIFEST_REL: &str = "src-tauri/core-manifest.json";
+
+    /// manifest 里持有平台枚举的字段名。
+    const CORE_PLATFORM_FIELD: &str = "coreArchiveSha256";
+
+    /// 随包核平台枚举文件的绝对路径。
+    pub fn core_manifest_path() -> PathBuf {
+        repo_root().join(CORE_MANIFEST_REL)
+    }
+
+    /// 打包腿的硬化开关（与 `config-engine/tests/support/core_locator.rs` 的同名开关同义）：
+    /// 置 1 时「manifest 声明了、盘上没有」即红；开发机不置，只报告 ——
+    /// `node scripts/fetch-core.mjs --platform=linux` 只拉一份是常态。
+    pub fn kernel_gate_required() -> bool {
+        std::env::var("POLARIS_REQUIRE_KERNEL_GATE").is_ok_and(|v| v == "1")
+    }
+
+    /// 随包核平台枚举（manifest `coreArchiveSha256` 的键，按文件里的出现顺序）。
+    ///
+    /// 🔴 **读不到 / 解不出 / 一个键都没有一律 panic**，绝不返回空表：下面的普查按
+    /// 「存在即检」过滤，空枚举会退化成「没有平台要查」⇒ 整道门变成恒绿的零信息量摆设。
+    /// 这一档失败响亮，而退化成空表是静默的 —— 两者的代价差着一整条故障链。
+    pub fn core_platforms() -> Vec<String> {
+        let path = core_manifest_path();
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "读不到随包核平台枚举 {}：{e}\n\
+                 该文件是「随包核有哪几个平台」的权威真值源，读不到就确定不了本门的覆盖轴 ——\
+                 故直接失败，不降级成「零平台」。",
+                path.display()
+            )
+        });
+        object_keys(&src, CORE_PLATFORM_FIELD).unwrap_or_else(|e| {
+            panic!(
+                "{} 的 `{CORE_PLATFORM_FIELD}` 解析失败：{e}\n\
+                 本门的覆盖轴就是这个字段的键集合，解不出即无法确定要看哪几个平台。",
+                path.display()
+            )
+        })
+    }
+
+    /// 由平台 key 推导随包核在仓内的相对路径。**本 crate 唯一一处路径形态实现**。
+    ///
+    /// 规则（与 `scripts/fetch-core.mjs` 的 `TARGETS` 同一套）：目录名就是 key 本身，
+    /// 二进制名只有 Windows 那一族带 `.exe`。写成规则而不是名单，是因为规则在加平台时自动跟上，
+    /// 名单不会 —— 而「名单没跟上」的表现正是本次要治的那种静默缩水。
+    pub fn core_relative_path(key: &str) -> String {
+        let bin = if key == "win" || key.starts_with("win-") {
+            "sing-box.exe"
+        } else {
+            "sing-box"
+        };
+        format!("resources/{key}/{bin}")
+    }
+
+    /// manifest 声明的每个平台及其随包核绝对路径（不管盘上在不在）。
+    pub fn core_paths() -> Vec<(String, PathBuf)> {
         let root = repo_root();
-        CORE_RELATIVE_PATHS
-            .iter()
-            .map(|p| root.join(p))
-            .filter(|p| p.is_file())
+        core_platforms()
+            .into_iter()
+            .map(|key| {
+                let path = root.join(core_relative_path(&key));
+                (key, path)
+            })
             .collect()
+    }
+
+    /// 盘上随包核的一次普查。三条分别对应三种「覆盖轴出问题」的形态。
+    pub struct CoreSurvey {
+        /// manifest 声明、盘上也有：本门真正能对拍的那几份。
+        pub present: Vec<(String, PathBuf)>,
+        /// manifest 声明、盘上没有：开发机只拉一份是常态，打包腿上则是 fetch 失败。
+        pub missing: Vec<String>,
+        /// 盘上有 sing-box 二进制、manifest 里却没有对应平台 —— **孤儿核**。
+        /// 它会被 tauri 的 resources 照样打进包，却不在任何一道逐平台门的覆盖轴上。
+        pub orphans: Vec<String>,
+    }
+
+    /// 普查盘上的随包核。覆盖轴来自 manifest，孤儿来自 `resources/` 的实际目录。
+    pub fn survey_bundled_cores() -> CoreSurvey {
+        let declared = core_paths();
+        let mut present = Vec::new();
+        let mut missing = Vec::new();
+        for (key, path) in &declared {
+            if path.is_file() {
+                present.push((key.clone(), path.clone()));
+            } else {
+                missing.push(key.clone());
+            }
+        }
+        assert_eq!(
+            present.len() + missing.len(),
+            declared.len(),
+            "普查漏掉了平台 —— 每个声明过的平台必须落进 present 或 missing 其中一格"
+        );
+
+        // 孤儿：`resources/<dir>/` 里有 sing-box 二进制，但 <dir> 不在 manifest 的键集合里。
+        // `resources/` 下还有 dashboard / data 等非平台目录，故判据是「这个目录里有没有核」
+        // 而不是「这个目录叫什么」。读不到 `resources/` 时（裸 checkout）没有孤儿可言。
+        let declared_keys: Vec<&str> = declared.iter().map(|(key, _)| key.as_str()).collect();
+        let mut orphans = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(repo_root().join("resources")) {
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if declared_keys.contains(&name.as_str()) {
+                    continue;
+                }
+                let dir = entry.path();
+                if dir.join("sing-box").is_file() || dir.join("sing-box.exe").is_file() {
+                    orphans.push(name);
+                }
+            }
+        }
+        orphans.sort();
+
+        CoreSurvey {
+            present,
+            missing,
+            orphans,
+        }
+    }
+
+    // ── 最小 JSON 键读取 ──────────────────────────────────────────────────────
+
+    /// 取 JSON 里某个对象字段的**直接键名**（按出现顺序）。
+    ///
+    /// 手写而不引 JSON crate，理由同本文件开头那段 protobuf 解析：本模块被 `build.rs` /
+    /// `src/lib.rs` / 集成测试三处 `include!`，引一个 crate 要同时进 `[build-dependencies]`、
+    /// `[dependencies]`、`[dev-dependencies]` 三处 —— 为一道门把 JSON 解析塞进**运行期**依赖图
+    /// 不划算。manifest 结构固定、字段名固定，这里只需要「某个对象的键名」这一格。
+    ///
+    /// 🔴 **任何看不懂的形态一律 `Err`，绝不返回空表** —— 空表会被消费点读成「没有平台要查」，
+    /// 那是静默失效；`Err` 在消费点变成 panic，是响亮失效。
+    pub fn object_keys(src: &str, field: &str) -> Result<Vec<String>, String> {
+        let needle = format!("\"{field}\"");
+        let at = src
+            .find(&needle)
+            .ok_or_else(|| format!("找不到字段 `{field}`"))?;
+        let after = src[at + needle.len()..].trim_start();
+        let body = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("`{field}` 后面不是 `:`"))?
+            .trim_start()
+            .strip_prefix('{')
+            .ok_or_else(|| format!("`{field}` 的值不是对象"))?;
+
+        let bytes = body.as_bytes();
+        let (mut i, mut depth) = (0usize, 1usize);
+        let mut pending: Option<String> = None;
+        let mut keys: Vec<String> = Vec::new();
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    let (text, next) = json_string(body, i)?;
+                    pending = Some(text);
+                    i = next;
+                }
+                // 只有本层（depth == 1）的 `"…":` 才是我们要的键；嵌套对象里的键不算。
+                b':' if depth == 1 => {
+                    let key = pending
+                        .take()
+                        .ok_or_else(|| format!("`{field}` 里有个 `:` 前面不是字符串键"))?;
+                    if keys.contains(&key) {
+                        return Err(format!("`{field}` 里键 `{key}` 出现了两次"));
+                    }
+                    keys.push(key);
+                    i += 1;
+                }
+                b'{' | b'[' => {
+                    depth += 1;
+                    pending = None;
+                    i += 1;
+                }
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if bytes[i] != b'}' {
+                            return Err(format!("`{field}` 的对象被 `]` 关掉了"));
+                        }
+                        if keys.is_empty() {
+                            return Err(format!("`{field}` 是个空对象"));
+                        }
+                        return Ok(keys);
+                    }
+                    pending = None;
+                    i += 1;
+                }
+                b',' => {
+                    pending = None;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        Err(format!("`{field}` 的对象没有闭合"))
+    }
+
+    /// 读 `src[start..]` 处的一个 JSON 字符串字面量，返回 `(内容, 右引号之后的下标)`。
+    ///
+    /// 不解转义：manifest 的平台 key 与 sha 都是朴素 ASCII，遇到转义一律 `Err` ——
+    /// 猜错的表现是一个平台名被悄悄改写，那比红一次贵得多。
+    fn json_string(src: &str, start: usize) -> Result<(String, usize), String> {
+        let bytes = src.as_bytes();
+        let mut i = start + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    let text = src
+                        .get(start + 1..i)
+                        .ok_or_else(|| "字符串跨了 UTF-8 边界".to_owned())?;
+                    return Ok((text.to_owned(), i + 1));
+                }
+                b'\\' => {
+                    return Err("字符串里有转义，本读取器只认朴素 ASCII 键".to_owned());
+                }
+                _ => i += 1,
+            }
+        }
+        Err("字符串没有闭合".to_owned())
     }
 
     // ── 最小 protobuf wire 读取 ────────────────────────────────────────────────
