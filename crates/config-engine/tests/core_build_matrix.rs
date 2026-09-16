@@ -15,8 +15,9 @@
 //! | `with_clash_api` | 面板 / 外部控制器整块失效 | `singbox/config.rs` |
 //!
 //! 关键在于**这件事是逐平台的**：官方发布矩阵完全可能只在某一个 GOOS 上改 tag 集。
-//! 而本仓其余两道核相关的门（`core_dep_fingerprint` / `core_schema_surface`）读的都是
-//! **本机那一个平台**的二进制 ⇒ 在 Linux 开发机上、在 CI 的 ubuntu 腿上，
+//! 而 `core_schema_surface` 读的是**本机那一个平台**的二进制（`core_dep_fingerprint` 曾同样只读一份，
+//! 2026-09-16 起改为与本门共用 `support/core_locator.rs` 的 `CORE_MATRIX` 逐平台读）⇒
+//! 在 Linux 开发机上、在 CI 的 ubuntu 腿上，
 //! 「mac 那份核这一版没编 `with_tailscale`」是**结构性看不见**的：
 //! 生成的配置一字节不变、`sing-box check` 在 Linux 上照样 rc=0、全仓单测照样全绿，
 //! 直到 mac 用户点开一个 Tailscale 节点。
@@ -51,7 +52,15 @@
 //! 而本门只有四行 × 十几个 tag ——留一个 `POLARIS_REGEN_*` 等于把「人看一眼」这一步删掉。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[path = "support/core_locator.rs"]
+mod core_locator;
+
+use core_locator::{present_cores, repo_root, require_all_present, CoreBuild, CORE_MATRIX};
+
+/// 缺核信息里用来说明「是哪道门没跑全」的名字。
+const GATE_NAME: &str = "构建面矩阵门未完整执行";
 
 /// 四平台共有的 build tag（排序）。
 ///
@@ -77,53 +86,6 @@ const SHARED_TAGS: &[&str] = &[
     "with_wireguard",
 ];
 
-/// 逐平台额外的 tag。今天只有一条：`with_purego` 只出现在 linux / windows，mac 两份没有
-/// （mac 走 `CGO_ENABLED=1`，用不着 purego 那套无 cgo 兜底）。
-struct CoreBuild {
-    /// 与 `scripts/fetch-core.mjs` 的 `TARGETS[].key` 同名。
-    key: &'static str,
-    rel: &'static str,
-    goos: &'static str,
-    goarch: &'static str,
-    cgo: &'static str,
-    extra_tags: &'static [&'static str],
-}
-
-const MATRIX: &[CoreBuild] = &[
-    CoreBuild {
-        key: "linux",
-        rel: "resources/linux/sing-box",
-        goos: "linux",
-        goarch: "amd64",
-        cgo: "0",
-        extra_tags: &["with_purego"],
-    },
-    CoreBuild {
-        key: "win",
-        rel: "resources/win/sing-box.exe",
-        goos: "windows",
-        goarch: "amd64",
-        cgo: "0",
-        extra_tags: &["with_purego"],
-    },
-    CoreBuild {
-        key: "mac-arm64",
-        rel: "resources/mac-arm64/sing-box",
-        goos: "darwin",
-        goarch: "arm64",
-        cgo: "1",
-        extra_tags: &[],
-    },
-    CoreBuild {
-        key: "mac-x64",
-        rel: "resources/mac-x64/sing-box",
-        goos: "darwin",
-        goarch: "amd64",
-        cgo: "1",
-        extra_tags: &[],
-    },
-];
-
 impl CoreBuild {
     fn expected_tags(&self) -> BTreeSet<String> {
         SHARED_TAGS
@@ -132,18 +94,6 @@ impl CoreBuild {
             .map(|s| (*s).to_owned())
             .collect()
     }
-}
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("CARGO_MANIFEST_DIR 应形如 <repo>/crates/config-engine")
-        .to_path_buf()
-}
-
-fn kernel_gate_required() -> bool {
-    std::env::var("POLARIS_REQUIRE_KERNEL_GATE").is_ok_and(|v| v == "1")
 }
 
 /// 把 Go 二进制内嵌 buildinfo 的 `build` 设置区**一趟扫完**建成表。
@@ -202,47 +152,16 @@ fn tag_set(settings: &BTreeMap<String, String>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// 盘上真实存在的那几份核，连同各自解出的 buildinfo 设置表（字节读完即弃，不驻留 ~50MB×4）。
-fn present_cores() -> Vec<(&'static CoreBuild, BTreeMap<String, String>)> {
-    let root = repo_root();
-    MATRIX
-        .iter()
-        .filter_map(|c| {
-            let path = root.join(c.rel);
-            if !path.is_file() {
-                return None;
-            }
-            let bytes =
-                std::fs::read(&path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
-            Some((c, build_settings(&bytes)))
-        })
-        .collect()
-}
-
-/// 缺核时的统一处置：`POLARIS_REQUIRE_KERNEL_GATE=1` 下缺一即红，否则跳过。
-fn require_all_present(present: &[(&'static CoreBuild, BTreeMap<String, String>)]) -> bool {
-    if present.len() == MATRIX.len() {
-        return true;
-    }
-    let missing: Vec<&str> = MATRIX
-        .iter()
-        .filter(|c| !present.iter().any(|(p, _)| p.key == c.key))
-        .map(|c| c.key)
-        .collect();
-    assert!(
-        !kernel_gate_required(),
-        "POLARIS_REQUIRE_KERNEL_GATE=1 但盘上缺这些平台的随包核：{} —— \
-         打包腿的 `node scripts/fetch-core.mjs`（不传 --platform = 全平台）是不是失败了？\
-         （构建面矩阵门未完整执行）",
-        missing.join(", ")
-    );
-    false
+/// 一份核的 buildinfo 设置表（字节读完即弃，不驻留 ~50MB×4）。
+fn build_settings_of(path: &Path) -> BTreeMap<String, String> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
+    build_settings(&bytes)
 }
 
 #[test]
 fn every_bundled_core_matches_its_pinned_build_face() {
     let present = present_cores();
-    let complete = require_all_present(&present);
+    let complete = require_all_present(&present, GATE_NAME);
     if present.is_empty() {
         eprintln!(
             "⚠ 跳过构建面矩阵门：盘上一份随包核都没有（`.gitignore` 的 /resources/*）。\
@@ -254,7 +173,8 @@ fn every_bundled_core_matches_its_pinned_build_face() {
         eprintln!("⚠ 构建面矩阵门只看到部分平台，未覆盖的平台本轮没有被检查。");
     }
 
-    for (core, settings) in &present {
+    for (core, path) in &present {
+        let settings = build_settings_of(path);
         // GOOS 在任何 Go 二进制里都必然存在 ⇒ 拿它当**提取器活性探针**。
         // 提不出来 = 门失效（Go 换了 buildinfo 编码 / 核被 strip / 拿到的不是 Go 二进制），
         // 必须红而不是静静把它当成「没有 tag」。
@@ -288,7 +208,7 @@ fn every_bundled_core_matches_its_pinned_build_face() {
             core.key, core.cgo
         );
 
-        let actual = tag_set(settings);
+        let actual = tag_set(&settings);
         let expected = core.expected_tags();
         if actual != expected {
             let added: Vec<&str> = actual.difference(&expected).map(String::as_str).collect();
@@ -298,7 +218,7 @@ fn every_bundled_core_matches_its_pinned_build_face() {
                  tag 决定的是「这块代码编没编进来」，配置侧完全看不出来：\
                  生成的配置一字节不变、本机那个平台的 `sing-box check` 照样 rc=0，\
                  而对应平台的用户会在点开某类节点时才发现它不认。\n\
-                 ⇒ 先对着模块头那张表看消失的 tag 本仓有没有消费点，再更新 core_build_matrix.rs 的 MATRIX。\n",
+                 ⇒ 先对着模块头那张表看消失的 tag 本仓有没有消费点，再更新 support/core_locator.rs 的 CORE_MATRIX。\n",
                 core.key,
                 if added.is_empty() {
                     "（无）".to_owned()
@@ -315,15 +235,15 @@ fn every_bundled_core_matches_its_pinned_build_face() {
     }
 }
 
-/// 与上面那条**互不依赖**：它读 `MATRIX` 的期望值，这条只读盘上四份核彼此的关系。
+/// 与上面那条**互不依赖**：它读 `CORE_MATRIX` 的期望值，这条只读盘上四份核彼此的关系。
 ///
-/// 为什么要两条：换核 bump 时人会成批更新 `MATRIX`，此时上面那条按定义会绿。
+/// 为什么要两条：换核 bump 时人会成批更新 `CORE_MATRIX`，此时上面那条按定义会绿。
 /// 而「四平台 tag 集只差 `with_purego`」是 `core_schema_surface` 只落**一份**共享夹具的依据，
-/// 它断了必须有人知道 —— 本条不看 `MATRIX`，成批更新压不住它。
+/// 它断了必须有人知道 —— 本条不看 `CORE_MATRIX`，成批更新压不住它。
 #[test]
 fn tag_sets_differ_only_by_the_documented_extras() {
     let present = present_cores();
-    require_all_present(&present);
+    require_all_present(&present, GATE_NAME);
     if present.len() < 2 {
         eprintln!(
             "⚠ 跳过跨平台 tag 集比对：盘上只有 {} 份核，比不出「平台间差异」。",
@@ -332,14 +252,16 @@ fn tag_sets_differ_only_by_the_documented_extras() {
         return;
     }
 
-    // 允许出现平台间差异的 tag = MATRIX 里登记过的 extra 的并集。其余任何差异都是新情况。
-    let sanctioned: BTreeSet<&str> = MATRIX
+    // 允许出现平台间差异的 tag = CORE_MATRIX 里登记过的 extra 的并集。其余任何差异都是新情况。
+    let sanctioned: BTreeSet<&str> = CORE_MATRIX
         .iter()
         .flat_map(|c| c.extra_tags.iter().copied())
         .collect();
 
-    let sets: Vec<(&str, BTreeSet<String>)> =
-        present.iter().map(|(c, s)| (c.key, tag_set(s))).collect();
+    let sets: Vec<(&str, BTreeSet<String>)> = present
+        .iter()
+        .map(|(c, path)| (c.key, tag_set(&build_settings_of(path))))
+        .collect();
     let (base_key, base) = &sets[0];
 
     for (key, other) in &sets[1..] {
@@ -353,7 +275,7 @@ fn tag_sets_differ_only_by_the_documented_extras() {
             "\n{base_key} 与 {key} 的 build tag 集出现了**未登记**的平台差异：{}\n\
              这条断言是 `core_schema_surface` 只落一份共享夹具的依据之一 ——\
              tag 集真的按平台分叉后，schema 面「四平台恒等」的论证就断了一条腿。\n\
-             ⇒ 要么把新差异登记进 MATRIX 的 extra_tags 并说明为什么，\
+             ⇒ 要么把新差异登记进 CORE_MATRIX 的 extra_tags 并说明为什么，\
              要么去确认 schema 夹具是不是也得按平台拆。\n",
             diff.join(", ")
         );
