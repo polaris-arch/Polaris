@@ -525,6 +525,7 @@ function checkConfs() {
     }
   }
 
+  checkWindowsInstallMode(base);
   checkWindowsInstallerHooks(base);
   checkMacOpenGuide();
   checkLicenseArtifacts(base, platforms, manifest, workflow);
@@ -934,6 +935,123 @@ function checkWindowsNsisLocalization(base) {
   }
 }
 
+/**
+ * Windows 装机形态的**合法取值集** —— Tauri `NSISInstallerMode` 的全部变体
+ * （实证 `tauri-utils` 的 `config.rs`：`CurrentUser` / `PerMachine` / `Both`）。
+ *
+ * 本门只管「这三个之一，且被显式写下来」，**不替产品选**其中哪一个：三者在
+ * 「标准用户能否自己装」与「随包 `polaris-helper.exe` 落不落在同账户可写域」这两件事上取舍不同，
+ * 那是产品决策，理由逐条登记在 `src-tauri/nsis-installer.nsi` 的 installMode 一节。
+ *
+ * 但**拼错**与**没写**不是取舍，是失误：前者在打包期才暴露（或更糟，近形词悄悄过掉），
+ * 后者静默回落 Tauri 的默认值。这两样本门当场拦下。
+ */
+const KNOWN_NSIS_INSTALL_MODES = ['currentUser', 'perMachine', 'both'];
+
+/**
+ * Windows 装机形态必须**被显式声明**，且取值在 [`KNOWN_NSIS_INSTALL_MODES`] 内。
+ *
+ * # 守的是什么（根因）：缺键会静默回落，而这个默认值决定了一条提权链通不通
+ *
+ * helper 的安装/升级脚本以提权身份 `Copy-Item $helperSrc → C:\ProgramData\Polaris\polaris-helper.exe`
+ * 之后 `New-Service … LocalSystem`，拷贝前**没有**任何签名 / hash 校验（`crates/helper-client/src/manager.rs`
+ * 的 `build_win_install_script`）。`$helperSrc` 是随包资源里的那份 `polaris-helper.exe`，它跟着 app 本体走，
+ * 于是装机形态直接决定这条链的两端信任级：
+ *
+ * - `currentUser` → app 落 `%LOCALAPPDATA%\Polaris` ⇒ `$helperSrc` **同账户普通权限进程可写**
+ *   ⇒ 攻击者在那一次 UAC 提权**发生之前**换掉它，受信安装就把攻击者的 exe 装成 SYSTEM 服务。
+ * - `perMachine` → app 落 `%PROGRAMFILES%\Polaris`（Tauri NSIS 模板 `installer.nsi` 的
+ *   `!if "${INSTALLMODE}" == "perMachine"` → `StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"`）
+ *   ⇒ 该目录默认 ACL 对 Users 只读 ⇒ 上面那条链从结构上断开，**代价是安装必须有管理员**。
+ *
+ * 两者是**结构性互斥**的：模板给 per-machine 的落点只有 `$PROGRAMFILES64` / `$PROGRAMFILES` 两支，
+ * 没有任何一支落在标准用户可写的位置 ⇒ 「装进只读目录」与「标准用户能自己装」不可能同时成立，
+ * 不是配置能调和的。所以选哪一个是**产品决策**（2026-09-16：选 `currentUser`，因为标准用户必须能装），
+ * 本门不替产品做这个决定。
+ *
+ * # 本门钉的是**第三种**取值：没写
+ *
+ * 缺键不会报错，Tauri 的 `NSISInstallerMode` 带 `#[default] CurrentUser`（实证
+ * `tauri-utils` 的 `config.rs`）⇒ 删掉这一行，装出来的包照样能跑，所有测试、构建、打包步骤照样绿，
+ * 只是这条链的一端从**被决定过**变成了**碰巧是这样**。写着 `currentUser` 与什么都不写，产物完全相同、
+ * 意义完全不同：前者是一次留痕的选择，后者是没人看见过这个问题。本门要的就是那个痕。
+ *
+ * # 取材面为什么是**全部** `tauri*.json` 而不只是 base
+ *
+ * 打包按平台传 `--config src-tauri/tauri.windows.conf.json`，Tauri 按 RFC 7396 合并。平台 conf 里补一个
+ * `installMode` 就能覆盖 base 的值，而只读 base 的门对此一无所知。这与 `graphics_compat` 那道
+ * 「conf 不得声明 additionalBrowserArgs」同形：判据落在**合并输入的全集**上。
+ */
+function checkWindowsInstallMode(base) {
+  const errorsBefore = errors.length;
+
+  // ① 正面断言：base conf 必须**显式**声明，且值合法。缺键 = 回落 Tauri 默认，与显式声明后果相同
+  //    但少了那次留痕的选择，正是本门要堵的那条缝。
+  const declared = base.bundle?.windows?.nsis?.installMode;
+  if (declared === undefined) {
+    fail(
+      `tauri.conf.json: bundle.windows.nsis.installMode **缺失**。缺键会静默回落 Tauri 默认值 ` +
+        `'currentUser'（tauri-utils 的 NSISInstallerMode 带 #[default]）⇒ 随包 polaris-helper.exe 落进 ` +
+        `%LOCALAPPDATA%（同账户普通权限进程可写），而 helper 安装脚本会以提权身份把它拷成 LocalSystem ` +
+        `服务且拷贝前零校验。这个默认值可以是对的选择，但它必须**被写下来**：产物一样，` +
+        `「选过 currentUser」与「没人想过这件事」不一样。`
+    );
+  } else if (!KNOWN_NSIS_INSTALL_MODES.includes(declared)) {
+    fail(
+      `tauri.conf.json: bundle.windows.nsis.installMode = ${JSON.stringify(declared)}，` +
+        `合法值只有 ${JSON.stringify(KNOWN_NSIS_INSTALL_MODES)}。` +
+        `这三个是 Tauri NSISInstallerMode 的全部变体；近形词（perUser / per-machine / All Users）` +
+        `不会在这里被 Tauri 纠正，只会在打包期才暴露，或者更糟 —— 悄悄回落默认值。`
+    );
+  }
+
+  // ② 取材面：全部 `src-tauri/tauri*.json`，逐份递归找 `installMode` 键（不写死路径 ——
+  //    键挪了层级仍要被扫到；扫到的每一处都必须是合法值）。
+  const scanned = [];
+  const seen = [];
+  for (const name of readdirSync(SRC_TAURI)) {
+    if (!name.startsWith('tauri') || !name.endsWith('.json')) continue;
+    scanned.push(name);
+    const conf = readJson(
+      join(SRC_TAURI, name),
+      `installMode 不变量无从对账（它决定随包 helper.exe 落在哪一级权限的目录里）`
+    );
+    const walk = (node, path) => {
+      if (node === null || typeof node !== 'object') return;
+      for (const [key, value] of Object.entries(node)) {
+        if (key === 'installMode') {
+          seen.push(`${name}:${path}=${JSON.stringify(value)}`);
+          if (!KNOWN_NSIS_INSTALL_MODES.includes(value)) {
+            fail(
+              `src-tauri/${name}: ${path}.installMode = ${JSON.stringify(value)}，合法值只有 ` +
+                `${JSON.stringify(KNOWN_NSIS_INSTALL_MODES)}。平台 conf 经 RFC 7396 合并覆盖 base，` +
+                `在这里写一个非法值会在打包时才暴露，或者更糟 —— 悄悄回落默认。`
+            );
+          }
+        }
+        walk(value, `${path}.${key}`);
+      }
+    };
+    walk(conf, '<root>');
+  }
+
+  // ③ 选择器自检：取材面里必须有 tauri.conf.json，且至少读到过一处 installMode ——
+  //    否则本门在「一个 conf 都没扫到」或「键被整段删掉」时恒绿。
+  if (!scanned.includes('tauri.conf.json')) {
+    fail(`installMode 门的取材面里没有 tauri.conf.json —— 选择器失效，本门恒绿。实际扫到：${JSON.stringify(scanned)}`);
+  }
+  if (seen.length === 0) {
+    fail(
+      `installMode 门在 ${JSON.stringify(scanned)} 里一处 installMode 都没读到 —— ` +
+        `键被删掉即回落 Tauri 默认（currentUser），而本门要求这件事被显式写下来。`
+    );
+  }
+
+  if (errors.length === errorsBefore) {
+    note(`Windows 装机形态：显式声明且取值合法（${seen.join('，')}；取材面 ${scanned.join(', ')}）`);
+  }
+}
+
 /** Windows NSIS 三条自定义钩子的静态契约（安装前清 legacy；安装后归一形态；卸载后清 helper）。 */
 function checkWindowsInstallerHooks(base) {
   const errorsBefore = errors.length;
@@ -1011,8 +1129,124 @@ function checkWindowsInstallerHooks(base) {
   if (nsisHookBody(source, 'NSIS_HOOK_POSTUNINSTALL') === null) {
     fail('nsis-hooks.nsh: 缺既有 NSIS_HOOK_POSTUNINSTALL（真卸载会遗留外置 helper）');
   }
+  checkWindowsHookPrivilegeBoundary(source);
   if (errors.length === errorsBefore) {
     note('Windows NSIS：English/简中/繁中/Russian/Farsi，系统预选+语言选择器；安装前清 legacy resources；安装后清 portable marker；真卸载后清外置 helper');
+  }
+}
+
+/**
+ * NSIS 钩子的**提权边界**门 —— 这个文件里有提权跑的代码，于是「它删什么、它跑什么」
+ * 不是打包细节，而是提权信任边界的一部分。
+ *
+ * # 守的是什么（根因）
+ *
+ * 眼下（`installMode: currentUser`）卸载腿自己就会把一段 PowerShell 提权到管理员再去删
+ * `C:\ProgramData\Polaris`；若将来改 `perMachine`，模板会给**整个**安装器与卸载器发
+ * `RequestExecutionLevel admin`，射程扩到全文件。两种形态下同一条纪律都成立：**提权进程不得
+ * 对用户可写的东西做递归删除或执行**。
+ *
+ * 最容易撞上这条纪律的是「清理存量 per-user 安装」那件事：要清的四样（HKCU 卸载键、HKCU Run
+ * 自启值、per-user 快捷方式、`%LOCALAPPDATA%\Polaris` 目录树）**全部在用户可写域**里，于是在本
+ * 文件里实现它，每一条都是「受信提权动作消费不受信输入」—— 与面 K 一开始要堵的那条链（提权脚本
+ * 拷一份用户可写的 helper.exe 注册成 SYSTEM 服务）同一个根因。完整推导与实证出处写在
+ * `nsis-hooks.nsh` 顶部那一节；本门是那一节的牙齿 —— 写在注释里的「别在这儿做」对下一个改这个
+ * 文件的人没有任何强制力。
+ *
+ * # 三条判据（都落在**剥掉注释后的代码面**上）
+ *
+ * 1. 递归删除**恰好一处**，且逐字是 `RMDir /r "$INSTDIR\resources"`。任何第二处递归删除都要红：
+ *    NSIS 的 `RMDir /r` 跟随 junction（实证 NSIS `Source/exehead/util.c` 的 `myDelete()`：命中
+ *    `FILE_ATTRIBUTE_DIRECTORY` 就递归，全函数无 `FILE_ATTRIBUTE_REPARSE_POINT` 检查），提权进程里
+ *    对用户可写树做递归删除 = 任意文件删除原语。
+ * 2. 代码面不得出现 `$LOCALAPPDATA`。NSIS 把该常量在 **all 上下文**下映射到
+ *    `CSIDL_COMMON_APPDATA`（实证 NSIS `Source/build.cpp` 的 `m_ShellConstants.add`）⇒ 在 all 上下文里
+ *    写 `$LOCALAPPDATA\Polaris` 得到的是 `C:\ProgramData\Polaris`，正是 helper 的受保护目录。
+ *    本文件**现在就有一段跑在 all 上下文里**（POSTUNINSTALL 的 `SetShellVarContext all`），
+ *    按 per-user 直觉写这个常量，删掉的是 helper 而不是旧副本。
+ * 3. 代码面不得出现 `UninstallString`。读它只有一个用途 —— 去跑旧版自带的卸载器；而那个 exe 躺在
+ *    用户可写目录里 ⇒ 以管理员身份执行一个攻击者可替换的二进制。
+ *
+ * # 为什么必须先剥注释（这条门自己的坑）
+ *
+ * 上面三个形态在 `nsis-hooks.nsh` 的**分析注释里逐字出现**（那一节就是在讲它们）。直接对原文 grep
+ * 的门会被自己的文档钉成恒红 —— 然后被人改成「只查某几行」或干脆删掉。所以取材面是代码面；
+ * 而「剥注释」这一步本身需要正向对照：若剥离逻辑失效（什么都没剥），注释里的这些形态会被算进来
+ * ⇒ 判据 1 的计数立刻超标而变红。下面的 ① 把这个对照写成显式断言，不靠「碰巧注释里有」。
+ */
+function checkWindowsHookPrivilegeBoundary(source) {
+  const errorsBefore = errors.length;
+  const isComment = (line) => /^\s*[;#]/.test(line);
+  const rawLines = source.split('\n');
+  const commentLines = rawLines.filter(isComment);
+  const codeLines = rawLines.filter((line) => !isComment(line));
+  const face = codeLines.join('\n');
+  const FORBIDDEN_FORMS = ['RMDir /r', '$LOCALAPPDATA', 'UninstallString'];
+
+  // ① 切点自检：剥注释既要真剥掉、又不能把代码剥没，且这一步要有正向对照。
+  if (commentLines.length === 0) {
+    fail('nsis-hooks.nsh 提权边界门：整份文件一行注释都没剥到 —— 剥离逻辑失效，本门取材面等于原文');
+  }
+  if (codeLines.some(isComment)) {
+    fail('nsis-hooks.nsh 提权边界门：代码面里仍残留整行注释 —— 剥离逻辑与判据不一致');
+  }
+  for (const anchor of [
+    '!macro NSIS_HOOK_PREINSTALL',
+    '!macro NSIS_HOOK_POSTINSTALL',
+    '!macro NSIS_HOOK_POSTUNINSTALL',
+    'SetShellVarContext all',
+  ]) {
+    if (!face.includes(anchor)) {
+      fail(`nsis-hooks.nsh 提权边界门：代码面缺锚点 ${JSON.stringify(anchor)} —— 剥注释把代码也剥掉了，本门恒绿`);
+    }
+  }
+  const commentFace = commentLines.join('\n');
+  const provingForms = FORBIDDEN_FORMS.filter((form) => commentFace.includes(form));
+  if (provingForms.length === 0) {
+    fail(
+      `nsis-hooks.nsh 提权边界门：注释面里一处被禁形态都没有（找的是 ${JSON.stringify(FORBIDDEN_FORMS)}）—— ` +
+        `「剥注释」这一步没有任何输入检验过它，剥离逻辑坏掉时本门会静默恒绿。` +
+        `顶部「迁移腿为什么不能住在本文件里」一节逐字写着这些形态，它被删了才会走到这里。`
+    );
+  }
+
+  // ② 递归删除：恰好一处，且逐字是既有的那一条。
+  const ALLOWED_RECURSIVE_DELETE = 'RMDir /r "$INSTDIR\\resources"';
+  const recursiveDeletes = codeLines.map((line) => line.trim()).filter((line) => /RMDir\s+\/r/i.test(line));
+  const unexpectedDeletes = recursiveDeletes.filter((line) => line !== ALLOWED_RECURSIVE_DELETE);
+  if (recursiveDeletes.length !== 1 || unexpectedDeletes.length > 0) {
+    fail(
+      `nsis-hooks.nsh 提权边界门：代码面只允许一处递归删除且逐字为 ${JSON.stringify(ALLOWED_RECURSIVE_DELETE)}，` +
+        `实为 ${recursiveDeletes.length} 处${unexpectedDeletes.length ? `，越界的是 ${JSON.stringify(unexpectedDeletes)}` : ''}。` +
+        `本文件跑在提权进程里，而 NSIS 的 RMDir /r 跟随 junction（myDelete 无 reparse point 检查）⇒ ` +
+        `对任何用户可写树做递归删除都等于把任意文件删除原语交给同账户的普通权限进程。`
+    );
+  }
+
+  // ③ per-user 路径常量：all 上下文下 $LOCALAPPDATA 就是 ProgramData。
+  if (face.includes('$LOCALAPPDATA')) {
+    fail(
+      `nsis-hooks.nsh 提权边界门：代码面出现 $LOCALAPPDATA。本文件运行在 SetShellVarContext all 下，` +
+        `NSIS 把它映射到 CSIDL_COMMON_APPDATA ⇒ 取到的是 C:\\ProgramData（helper 的受保护目录），` +
+        `不是用户的 %LOCALAPPDATA%。确需 per-user 路径的话要显式切上下文并在此登记理由。`
+    );
+  }
+
+  // ④ 旧卸载器：读 UninstallString 只有一个用途，而那个 exe 在用户可写目录里。
+  if (face.includes('UninstallString')) {
+    fail(
+      `nsis-hooks.nsh 提权边界门：代码面出现 UninstallString —— 读它只为去跑存量 per-user 安装自带的` +
+        `卸载器，而那个 exe 躺在用户可写目录里 ⇒ 受信安装器以管理员身份执行攻击者可替换的二进制。` +
+        `存量迁移的正确执行者是以该用户身份运行的 app 本体，不是本文件。`
+    );
+  }
+
+  if (errors.length === errorsBefore) {
+    note(
+      `Windows NSIS 提权边界：代码面 ${codeLines.length} 行（剥 ${commentLines.length} 行注释，` +
+        `注释面持有 ${JSON.stringify(provingForms)} 作剥离正向对照），递归删除仅 ${JSON.stringify(ALLOWED_RECURSIVE_DELETE)}，` +
+        `无 $LOCALAPPDATA / UninstallString`
+    );
   }
 }
 

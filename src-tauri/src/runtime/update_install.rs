@@ -298,6 +298,15 @@ pub enum InstallAdvisory {
 pub fn install_advisory(plan: &InstallPlan) -> Option<InstallAdvisory> {
     match plan.platform {
         InstallPlatform::LinuxDeb => Some(InstallAdvisory::DebElevation),
+        // 🔮 **前瞻登记（当前不成立，改 `installMode: perMachine` 时必须一并处理）**：
+        // `WindowsSetup` 这条腿跑的是 NSIS setup。当前形态 `currentUser` 下模板发
+        // `RequestExecutionLevel user` ⇒ 装 app 本身不弹 UAC，`windowsSmartScreen` 这条文案是完整的。
+        // 若改成 per-machine，模板改发 `RequestExecutionLevel admin` ⇒ 用户点「继续安装」之后会
+        // **先弹一次 UAC**，而该文案只讲了 SmartScreen、一个字没提管理员授权
+        // （`ui/src/i18n/locales/*.json` 的 `settings.update.advisory.windowsSmartScreen.message`
+        // 是该承诺的真值源）。取消 UAC 时安装不会发生，而此时代理已被停掉 —— 与 `DebElevation`
+        // 那条注释指出的是同一个坏态，deb 腿靠「先弹告知再停代理」规避。
+        // 届时改法是五语文案（新增一条 advisory 或扩写现有 message）+ 跑 ui 门。
         InstallPlatform::WindowsPortable | InstallPlatform::WindowsSetup => {
             Some(InstallAdvisory::WindowsSmartScreen)
         }

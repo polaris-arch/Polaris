@@ -495,6 +495,31 @@ pub enum ManagerError {
 pub struct InstallParams {
     /// 源 helper 二进制（app 资源内 `polaris-helper`，脚本拷到特权路径）。
     /// 上游: `resourceManager.getMacHelperPath()` / `getLinuxHelperPath()` / `getWinHelperPath()`。
+    ///
+    /// # 🔴 这个字段的**所在目录是否对普通用户可写，决定了一条提权链通不通**
+    ///
+    /// 各平台的安装脚本都以提权身份把它拷到特权落点再注册成 root/SYSTEM 服务，**拷贝前不做任何
+    /// 签名 / hash 校验**（Windows 见本模块的 `build_win_install_script`，mac/linux 同形）。于是「谁能写这个
+    /// 路径」就等于「谁能决定那个 root 服务跑什么代码」——受信提权动作读的是一个不受信的源。
+    ///
+    /// 路径由调用方解析（app 侧 `runtime/helper.rs::resolve_helper_binary`，取随包资源目录），所以
+    /// 这件事**由装机形态决定**，不由本 crate 保证：
+    ///
+    /// - macOS：`/Applications/Polaris.app`；Linux：`/usr/lib/Polaris`（deb）—— 均 root-owned，链断开。
+    /// - **Windows：当前形态 `installMode: currentUser` ⇒ app 与随包 `polaris-helper.exe` 落
+    ///   `%LOCALAPPDATA%\Polaris`，同账户 Medium IL 进程可写 ⇒ 这条链当前是通的**：攻击者可在那一次
+    ///   UAC 提权发生**之前**替换它，受信安装随后把他的 exe 装成 LocalSystem 服务。
+    ///   这是**已知残留、如实登记**，不是「已经修好了」。
+    ///
+    /// 为什么不靠改 `installMode` 修：`perMachine` 会把 app 落到 `%PROGRAMFILES%\Polaris`（Users 只读，
+    /// 链断开），但 Tauri NSIS 模板给 per-machine 的落点只有 `$PROGRAMFILES64` / `$PROGRAMFILES`，
+    /// 且必发 `RequestExecutionLevel admin` ⇒ 与「标准用户也能自己装」**结构性互斥**。产品决策选了后者
+    /// （2026-09-16），所以这条链得换别的堵法（签名 / 安装前校验 / 把源换到不可写目录），
+    /// 不是换一个 conf 取值。`scripts/verify-packaging.mjs` 的 `checkWindowsInstallMode` 钉的是
+    /// 「这个取值必须被显式写下来」，不是钉某一个值。
+    ///
+    /// 其它残留（同样诚实登记）：无代码签名 ⇒ 不防「安装包 / 更新包在分发链路被篡改」；
+    /// 本地管理员本就在威胁模型之外。
     pub src_binary: PathBuf,
     /// 随包 sing-box 核（mac/linux 播种 root 受管核；**win 忽略**——win 核走 app 侧）。
     /// 上游: `resourceManager.getBundledSingBoxPath()`。
@@ -504,6 +529,26 @@ pub struct InstallParams {
     pub singbox_path: PathBuf,
     /// 用户 config/data 目录（`--confdir`；**linux 忽略**——核以登录用户跑，config 属主天然对）。
     /// 上游: `getUserDataPath()`。
+    ///
+    /// # ⚠️ 多用户机器的已知限制（如实登记，本批不修）
+    ///
+    /// 这是**装 helper 的那个用户**的目录，会被烤进 Windows 服务的 `BinaryPathName`，而服务本身是
+    /// **机器级**的。helper 起核前用它做白名单前缀比对
+    /// （`crates/helper/src/platform/windows/logic.rs::cfg_allowed`，不符回 `ERR config-path-denied`，
+    /// `platform/windows/helper.rs:281`）。于是同一台机器上的第二个用户：
+    ///
+    /// - 看得到服务、`is_installed` 为真、buildId 相同 ⇒ **不会**被引导去修复/重装（`upgradeable`
+    ///   只看 proto 与 buildId）；
+    /// - 起 TUN 时 cfg 在自己的 profile 下 ⇒ 前缀失配 ⇒ `config-path-denied`；
+    /// - 他若手动重装 helper（一次 UAC），`--confdir` 被改烤成他的目录 ⇒ **换成第一个用户失效**。
+    ///
+    /// 这条限制来自「helper 是机器级服务、`--confdir` 却是安装它那个用户的目录」这一对错配，
+    /// 与装机形态无关。当前形态 `installMode: currentUser` 下它的**可达性较低**：app 是 per-user
+    /// 安装，同机第二个用户通常压根没装 Polaris，撞上需要两个用户各自装过。
+    /// 🔮 若将来改 `perMachine`，app 对全机可见（快捷方式在 All Users 开始菜单）⇒ 这条路径变得**常见**，
+    /// 届时它会从「登记的限制」升级成「必须先修的前置」。
+    /// **彻底修需要 helper 支持多 confdir / 按调用方会话解析**，超出本批（面 K）射程，
+    /// 故按字面登记而不是假装不存在。
     pub conf_dir: PathBuf,
     /// 授权 uid（linux 写 `authorized-uids`；**mac/win 忽略**）。上游(linux): `process.getuid()`。
     pub uid: u32,
@@ -778,8 +823,16 @@ fn write_secure_script(dir: &Path, name: &str, content: &str) -> io::Result<Path
         // 后果不是「注释乱码」这种观感问题：脚本正文里的 `--confdir "<app config dir>"` 含用户 profile
         // 路径，中文账户（`C:\Users\张三\...`）的 UTF-8 字节被按 CP936 解出另一串汉字 ⇒ 服务
         // `BinaryPathName` 指向不存在的目录 ⇒ 之后每次起核都被 helper 的 `cfg_allowed` 判 denied，
-        // 而安装本身「成功」。NSIS 安装态下 app 本体也在 `%LOCALAPPDATA%` ⇒ `$helperSrc` 同样中招，
-        // 会更早死在 `Copy-Item`。
+        // 而安装本身「成功」。
+        //
+        // NSIS 安装态下 app 本体也在 `%LOCALAPPDATA%`（当前形态 `installMode: currentUser`）
+        // ⇒ `$helperSrc` 同样中招，会更早死在 `Copy-Item`。
+        //
+        // 🔮 前瞻：若将来改 `perMachine`，app 与随包 helper 会落 `%PROGRAMFILES%\Polaris`、路径里
+        // 不再有用户名 ⇒ **`$helperSrc` 这一条前提失效，但本注释的结论不变**：BOM 仍然必须带，因为
+        // `--confdir` 指的是 app config 目录（`%APPDATA%\com.polaris.app\…`，永远在用户 profile 下、
+        // 永远可能含中文），那条才是主因，与装机形态无关。
+        // 先写下来，是因为「前提没了但结论仍成立」最容易在下一次重构时被误读成「这段可以删了」。
         //
         // 同仓姊妹腿早就踩过并修好了，只是没推广到这一条：`src-tauri/src/runtime/update_install.rs`
         // 的 `utf16le_with_bom` —— 那里的文档逐字写着 `wscript.exe` 按系统代码页解释无 BOM 脚本、
