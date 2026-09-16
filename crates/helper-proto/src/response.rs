@@ -51,10 +51,27 @@ impl Pong {
 }
 
 /// `status` 响应载荷（三平台，`helper.go:427-430` 等）：running `<pid>` 或 stopped。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    /// `OK running <pid>` —— child sing-box 在跑。
-    Running { pid: u32 },
+    /// `OK running <pid> [created=<十进制u64>] [image=<hex(path)>]` —— child sing-box 在跑。
+    ///
+    /// `created` / `image` 是**可选、向后兼容**的身份 token（Windows helper 起核后持进程句柄读取；
+    /// mac/linux 不发，恒 `None`）：
+    /// - `created`：进程创建时间（Windows `GetProcessTimes`，100ns tick），跨 tick 不变 ⇒ 变了说明
+    ///   受管核已退出、PID 被系统复用（app 侧崩溃监测的身份判据）。
+    /// - `image`：实跑二进制全路径（Windows `QueryFullProcessImageNameW`），供内核自证读到「实际
+    ///   跑起来的是哪个文件」。路径含空格 ⇒ wire 上 hex 编码，避免破坏按空白切 token 的解析。
+    ///
+    /// 旧 helper 不发这两个 token（解析为 `None`），旧客户端只取首 token pid（`parse_pid`）忽略尾部
+    /// —— 四象限兼容矩阵的依据。
+    Running {
+        /// child sing-box 的 pid。
+        pid: u32,
+        /// 进程创建时间令牌（Windows 专属；旧 helper / 其它平台 `None`）。
+        created: Option<u64>,
+        /// 实跑二进制全路径（Windows 专属；旧 helper / 其它平台 `None`）。
+        image: Option<String>,
+    },
     /// `OK stopped` —— 无 child。
     Stopped,
 }
@@ -97,10 +114,23 @@ pub struct StartTiming {
 pub enum Start {
     /// `OK started <pid>` —— 新起了 child sing-box。
     Started { pid: u32 },
-    /// `OK started <pid> forwarding_ms=… process_ms=… job_ms=… log_handoff_ms=… total_ms=…`。
+    /// `OK started <pid> forwarding_ms=… process_ms=… job_ms=… log_handoff_ms=… total_ms=…
+    /// [created=<十进制u64>]`。
     ///
     /// 新版三平台 Rust helper 均可发送；独立变体让旧 helper 的既有形态保持兼容。
-    StartedTimed { pid: u32, timing: StartTiming },
+    ///
+    /// `created` 与 [`Status::Running`] 的同名 token 同源（Windows 进程创建时间），让 app 起核当时
+    /// 就拿到身份基线，不必等第一次 status。**必须是十进制 u64，且 `image=` 绝不进本响应**：
+    /// `parse_start_timing` 对 tail 的**每个** `key=value` 先 `value.parse::<u64>().ok()?`，`?` 作用于
+    /// 整个函数 ⇒ 任何非 u64 的 value（hex 路径含 a-f）都会让旧 app **丢掉全部 timing**。
+    StartedTimed {
+        /// 新起 child sing-box 的 pid。
+        pid: u32,
+        /// helper 侧起核关键路径耗时。
+        timing: StartTiming,
+        /// 进程创建时间令牌（Windows 专属，十进制 u64；旧 helper / 其它平台 `None`）。
+        created: Option<u64>,
+    },
     /// `OK already <pid>` —— 已有 child 在跑，复用（不重启）。
     Already { pid: u32 },
 }
@@ -242,7 +272,11 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
                 .map_or(base.clone(), |build| format!("{base} build={build}"))
         }
         ResponseKind::Version { proto_version } => format!("OK {proto_version}"),
-        ResponseKind::Status(Status::Running { pid }) => format!("OK running {pid}"),
+        ResponseKind::Status(Status::Running {
+            pid,
+            created,
+            image,
+        }) => status_running_to_wire(*pid, *created, image.as_deref()),
         ResponseKind::Status(Status::Stopped) => "OK stopped".to_owned(),
         ResponseKind::Stop(Stop::Stopped { pid }) => format!("OK stopped {pid}"),
         ResponseKind::Stop(Stop::NotRunning) => "OK notrunning".to_owned(),
@@ -250,14 +284,22 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
             format!("OK stop-mismatch {want} {current}")
         }
         ResponseKind::Start(Start::Started { pid }) => format!("OK started {pid}"),
-        ResponseKind::Start(Start::StartedTimed { pid, timing }) => format!(
-            "OK started {pid} forwarding_ms={} process_ms={} job_ms={} log_handoff_ms={} total_ms={}",
-            timing.forwarding_ms,
-            timing.process_ms,
-            timing.job_ms,
-            timing.log_handoff_ms,
-            timing.total_ms
-        ),
+        ResponseKind::Start(Start::StartedTimed {
+            pid,
+            timing,
+            created,
+        }) => {
+            let base = format!(
+                "OK started {pid} forwarding_ms={} process_ms={} job_ms={} log_handoff_ms={} total_ms={}",
+                timing.forwarding_ms,
+                timing.process_ms,
+                timing.job_ms,
+                timing.log_handoff_ms,
+                timing.total_ms
+            );
+            // 十进制 u64 追加在 timing token 之后；**永不**在此追加 image=（见 Start::StartedTimed 文档）。
+            created.map_or_else(|| base.clone(), |c| format!("{base} created={c}"))
+        }
         ResponseKind::Start(Start::Already { pid }) => format!("OK already {pid}"),
         ResponseKind::Cleaned => "OK cleaned".to_owned(),
         ResponseKind::Route => "OK route".to_owned(),
@@ -279,6 +321,23 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
             }
         }
     }
+}
+
+/// `status` 的 running 载荷 → wire（`OK running <pid> [created=<十进制>] [image=<hex>]`）。
+///
+/// 两个 token 都只在有值时出现 —— 不发的 helper 与本函数的 `None` 分支产生**逐字相同**的旧形态
+/// （`OK running <pid>`），故 round-trip 对旧 wire 亦成立。
+fn status_running_to_wire(pid: u32, created: Option<u64>, image: Option<&str>) -> String {
+    let mut line = format!("OK running {pid}");
+    if let Some(created) = created {
+        line.push_str(" created=");
+        line.push_str(&created.to_string());
+    }
+    if let Some(image) = image {
+        line.push_str(" image=");
+        line.push_str(&hex_encode(image.as_bytes()));
+    }
+    line
 }
 
 /// `freeport` 载荷 → wire（`OK free` / `OK killed <pids>` / `OK foreign <names>`）。
@@ -315,9 +374,15 @@ fn parse_ok(rest: &str) -> ResponseKind {
         "version" => ResponseKind::Version { proto_version: 0 }, // version 响应是 "OK <ver>"，ver 是首 token
         // 注意：version 响应 `OK 9` 中 "9" 是首 token，非 "version" —— 上方 "version" 分支永远不命中，
         // 真实 version 响应走下方纯数字兜底。这里保留分支以防未来协议加 "OK version <ver>" 形态。
-        "running" => ResponseKind::Status(Status::Running {
-            pid: parse_pid(tail),
-        }),
+        "running" => {
+            // 首 token 恒为 pid（旧 client 的 `parse_pid` 口径不变）；其后是可选身份 token。
+            let (pid_token, identity) = parse_first_token(tail);
+            ResponseKind::Status(Status::Running {
+                pid: pid_token.parse().unwrap_or(0),
+                created: parse_created(identity),
+                image: parse_image(identity),
+            })
+        }
         "stopped" => {
             // `OK stopped` 或 `OK stopped <pid>`（后者是 stop 响应，前者是 status 响应）
             if tail.trim().is_empty() {
@@ -341,7 +406,11 @@ fn parse_ok(rest: &str) -> ResponseKind {
             let (pid_token, metrics) = parse_first_token(tail);
             let pid = pid_token.parse().unwrap_or(0);
             match parse_start_timing(metrics) {
-                Some(timing) => ResponseKind::Start(Start::StartedTimed { pid, timing }),
+                Some(timing) => ResponseKind::Start(Start::StartedTimed {
+                    pid,
+                    timing,
+                    created: parse_created(metrics),
+                }),
                 None => ResponseKind::Start(Start::Started { pid }),
             }
         }
@@ -446,6 +515,57 @@ fn parse_start_timing(tail: &str) -> Option<StartTiming> {
         log_handoff_ms: log_handoff_ms?,
         total_ms: total_ms?,
     })
+}
+
+/// 从可选 token 尾里取 `created=<十进制 u64>`（[`Status::Running`] / [`Start::StartedTimed`] 共用）。
+///
+/// 缺失、非十进制、溢出一律 `None` —— 身份令牌读不到时下游判「不可观测」，绝不折成「不匹配」
+/// （那会把一次读失败变成一次假崩溃）。
+fn parse_created(tail: &str) -> Option<u64> {
+    tail.split_whitespace()
+        .find_map(|field| field.strip_prefix("created=")?.parse().ok())
+}
+
+/// 从可选 token 尾里取 `image=<hex(path)>` 并解回路径（[`Status::Running`] 专属）。
+///
+/// hex 非法或解出的字节不是 UTF-8 → `None`（同 [`parse_created`]：读不到就说读不到，不伪造路径）。
+fn parse_image(tail: &str) -> Option<String> {
+    tail.split_whitespace().find_map(|field| {
+        let hex = field.strip_prefix("image=")?;
+        String::from_utf8(hex_decode(hex)?).ok()
+    })
+}
+
+/// 16 进制编码（小写）。
+///
+/// # 为何不用 `hex::encode`
+///
+/// 本 crate 是 wire 协议的单一真值，**零第三方依赖**（`Cargo.toml` 的 `[dependencies]` 为空）——
+/// 这条性质让三平台 helper、app、client 引它时都不背额外依赖边。为一个全函数编码腿破这条性质，
+/// 收益（省 10 行无分支代码）远小于成本。同款取舍与 `helper-client/src/token.rs::hex_encode` 一致。
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// [`hex_encode`] 的逆：偶数长度的小写/大写 hex → 字节；任一字符非 hex 或长度为奇数 → `None`。
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 /// 解析 `pid,pid,pid` → `Vec<u32>`（Go `strings.Join(killed, ",")` 的逆）。

@@ -302,6 +302,11 @@ pub struct SystemDnsController<Ops: SystemDnsOps, Fs: MarkerFs> {
     /// `set_dns` 重试退避 sleep（注入便于测试：生产 [`std::thread::sleep`]，测试传 no-op 杜绝真睡；
     /// 对齐 `proxy_ops::SystemProxyOpsImpl` 既有的可注入执行缝风格）。
     sleeper: fn(Duration),
+    /// 本次接管**挤掉**的非公网解析器（很可能属于另一个 VPN/组网客户端）。
+    ///
+    /// 纯运行期观测，不落盘：它描述的是"接管发生时系统上有什么"，重启后要重新观测才有意义。
+    /// 空 = 没挤掉任何非公网解析器（也包括"这次没接管"）。
+    displaced_resolvers: Vec<String>,
 }
 
 impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
@@ -311,6 +316,7 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             marker,
             original: None,
             sleeper: std::thread::sleep,
+            displaced_resolvers: Vec::new(),
         }
     }
 
@@ -335,6 +341,16 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             None => self.ops.read_effective_resolvers().unwrap_or_default(),
         };
         pick_lan_resolver_ip(&candidates, &self.marker.controlled_ip)
+    }
+
+    /// 本次接管挤掉的非公网解析器（见 [`Self::displaced_resolvers`] 字段文档）。
+    ///
+    /// 消费面是**告警**：macOS 的接管会把所有网络服务的 DNS 改成受控 IP，于是另一个 VPN
+    /// （Tailscale 的 `100.100.100.100`、公司 VPN 的内网解析器…）装的解析器被整个挤掉，
+    /// 表现为"IP 通、域名不通"，而此前全程无任何提示。
+    #[must_use]
+    pub fn displaced_resolvers(&self) -> &[String] {
+        &self.displaced_resolvers
     }
 
     /// 读各服务当前 DNS（best-effort：单服务读失败按 `[]`）。
@@ -377,6 +393,19 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             existing.as_ref().map(|m| &m.original),
         );
 
+        // **接管前**观测被挤掉的非公网解析器。必须在 apply 之前、且必须走
+        // `read_effective_resolvers`（scutil）而不是上面 `snapshot_current` 的结果：
+        // 后者读 `networksetup -getdnsservers`，看不见 NetworkExtension / DHCP 那一层，
+        // 而 Tailscale 的 quad100 正是从那一层来的 —— 用 marker 里的原始值判会恒空。
+        // 读失败不阻断接管（best-effort，与本函数其余部分同口径）。
+        self.displaced_resolvers = self
+            .ops
+            .read_effective_resolvers()
+            .map(|effective| {
+                crate::dns::displaced_private_resolvers(&effective, &self.marker.controlled_ip)
+            })
+            .unwrap_or_default();
+
         // marker 前置写（intent）。
         self.original = Some(original.clone());
         self.marker.write(&original);
@@ -418,6 +447,9 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
     }
 
     fn restore_dns_inner(&mut self) -> bool {
+        // 还原即观测作废：那份清单描述的是"接管期间被挤掉了谁"，接管一结束它就不再成立，
+        // 留着会让 UI 在没接管时仍显示告警。
+        self.displaced_resolvers.clear();
         let marker = self.marker.read();
         let original = self
             .original

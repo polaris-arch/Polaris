@@ -46,6 +46,7 @@ mod process_supervision;
 mod recovery;
 mod route_replan;
 mod startup;
+mod tailnet_rules;
 mod ts_exit;
 mod unlock_refresh;
 

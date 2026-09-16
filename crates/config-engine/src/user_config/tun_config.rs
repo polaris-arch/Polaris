@@ -7,7 +7,45 @@
 use serde::{Deserialize, Serialize};
 
 use crate::user_config::neighbor::TunMacFilterMode;
-use crate::user_config::tun_stack::TunStack;
+
+/// 用户未填 MTU（[`TunModeConfig::mtu`] 为 `None`）时 Polaris 显式下发的 TUN MTU —— **与栈、平台都无关**。
+///
+/// # 为什么不再按「栈 × 平台」取
+///
+/// sing-box 1.15.0-alpha.3 起 TUN `stack` 弃用：`protocol/tun/inbound.go:84` 只要 `stack` 非空（含 `"go"`）
+/// 就报 `deprecated.OptionTunStack`，1.16 起 CLI 须 `ENABLE_DEPRECATED_TUN_STACK=true` 才继续认，1.17 删除。
+/// Polaris 因此**不再下发 `stack`**，一律走 sing-tun 新栈（`stack.go`：`case "", "go": return NewGo(options)`）。
+/// 此前的三档默认（gvisor+Windows 65535 / gvisor 其余 9000 / system·mixed 4064）全是**旧栈上的实测函数**，
+/// 自变量没了，那张表也就失去依据，整体删除而不是改写。
+///
+/// # 为什么是 65535
+///
+/// 这是上游 `inbound.go` 在 `options.MTU == 0` 时给桌面平台的默认（Network Extension 取 4064、Android 取 9000，
+/// 均不在 Polaris 的发行面内），即「不发 `mtu` 键」时新栈实际拿到的值。仍然**显式下发**而不是省略键：
+/// 生成的配置里 `mtu` 恒在场，设置页占位符才有一个与内核一致的具体数可显示。渲染端副本是
+/// `ui/src/domain/tun-mtu.ts` 的 `DEFAULT_TUN_MTU`，其 parity 测试逐字读本常量对拍。
+///
+/// # 判据（2026-09-13 实测，sing-box 1.15.0-alpha.3，Windows VM 207 + Linux VM 185）
+///
+/// 预登记三条判据（起核/适配器 MTU/无弃用提示；TCP 不塌陷；UDP 512B·1400B 5/5）两平台全过：
+///
+/// | 平台 | 新栈 / 65535 | 新栈 / 1350 | 当日 gvisor / 65535 | 当日 system / 4064 |
+/// |---|---|---|---|---|
+/// | Windows | **716 Mbps**（≈ 用户态参照 101%） | 174 | 413 | 322 |
+/// | Linux | 2342（各档区间重叠，无区分力） | 2435 | 2316 | 2090 |
+///
+/// Windows 上新栈吞吐随 MTU 单调上升、65535 最高，旧 system 栈在 65535 塌到 11 Mbps 的缺陷不复现。
+/// 完整数据与方法学缺口见 vault `polaris/design/polaris-tun-go-stack-mtu-benchmark-2026-09-13.md`。
+///
+/// **GSO 与 MTU 无关**：`protocol/tun/inbound.go` 构造期虽按 `mtu < 49152` 预判 GSO，但启动期只要存在
+/// TCP `FlowOutbound`（`direct` 即是，Polaris 配置恒有）就强制 `GSO = true`；实测 49151 与 65535 两格
+/// `ethtool -k` 均 `tcp-segmentation-offload: on`、吞吐无差异。macOS 未测（上一轮 Mac 测试床无区分力）。
+///
+/// # 其它平台
+///
+/// Polaris 只发行 darwin / win32 / linux，本常量对三者一视同仁。旧实现「未知平台 → system → 4064」的
+/// 兜底是 system 栈的产物，栈不存在后没有保留依据，故不再保留平台分支。
+pub const DEFAULT_TUN_MTU: u32 = 65535;
 
 /// FakeIP IPv4 段（benchmarking 保留）。上游 `FAKEIP_INET4_RANGE`。
 pub const FAKEIP_INET4_RANGE: &str = "198.18.0.0/15";
@@ -32,7 +70,7 @@ pub const WIN_TUN_INTERFACE: &str = "polaris-tun0";
 /// (`include_mac_address` / `exclude_mac_address`)，不是把两个清单并排摆出来。
 ///
 /// 另一条路（逐字段暴露）唯一的好处是「和内核 schema 一一对应、日后加值不用改 UI」；本页并不追求
-/// 这条 —— `stack` 已经是 auto 档 + 平台解析，`mtu` 已经是「留空即按栈×平台推导」，语汇一直是
+/// 这条 —— `mtu` 已经是「留空即自动」，`macFilterMode` 已经是一颗下拉映射两个字段，语汇一直是
 /// **意图级**而非字段级。
 ///
 /// # 为什么没有「对称 NAT」档
@@ -55,7 +93,7 @@ pub enum UdpNatType {
 /// TUN 模式配置（上游 `TunModeConfig`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunModeConfig {
-    /// TUN MTU。**`None` = 自动**（按最终栈 × 平台取 `tun_stack::default_mtu_for`）。
+    /// TUN MTU。**`None` = 自动**（生成期取 [`DEFAULT_TUN_MTU`]）。
     ///
     /// # 为什么是 `Option` 而不是「默认值 + 哨兵」
     ///
@@ -68,8 +106,9 @@ pub struct TunModeConfig {
     /// 从未有过 UI 入口**，故磁盘上的任何值都是程序写的默认，没有一个承载用户意图。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
-    #[serde(default)]
-    pub stack: TunStack,
+    // 🔴 不再有 `stack`：上游弃用 TUN stack 后 Polaris 一律走新栈（见 [`DEFAULT_TUN_MTU`]）。
+    // 磁盘 / 备份里遗留的 `tunConfig.stack`（任意值）靠 serde 默认的「忽略未知键」读得进来，
+    // 并由 `polaris-store` 的 `migrate_tun_stack` 删掉；生成侧的 `singbox::Inbound` 也没有该字段。
     #[serde(default = "default_true", rename = "autoRoute")]
     pub auto_route: bool,
     #[serde(default = "default_true", rename = "strictRoute")]
@@ -103,9 +142,7 @@ pub struct TunModeConfig {
     /// 零 delta，且「没设过 NAT 类型的用户」拿到的仍是打洞最容易的那一档。
     ///
     /// 与 `mac_filter_mode` 同形（`Option` 而非带 `Auto` 变体的枚举）：那颗下拉的「关闭」档同样落成
-    /// `None`、同样不发键。不学 `stack` 的 `Auto` 变体，是因为 `stack` **恒发**（Polaris 始终显式 pin
-    /// 具体栈，见 `tun_stack` 模块头），`Auto` 只是「发哪一个由平台决定」；本项恰恰相反 —— 默认档的
-    /// 语义就是**不发**。
+    /// `None`、同样不发键 —— 默认档的语义就是**不发**。
     #[serde(rename = "udpNatType", skip_serializing_if = "Option::is_none")]
     pub udp_nat_type: Option<UdpNatType>,
 }
@@ -118,7 +155,6 @@ impl Default for TunModeConfig {
     fn default() -> Self {
         Self {
             mtu: None,
-            stack: TunStack::Auto,
             auto_route: true,
             strict_route: true,
             interface_name: None,

@@ -310,19 +310,30 @@ fn fields_to_object(fields: BTreeMap<String, Vec<serde_json::Value>>) -> serde_j
 /// 落盘后非法 id 会以此名暴露到磁盘（build_custom_rule_files / 孤儿对账），
 /// 故 hash 分支必须真派生唯一名（撞车即两条规则共用一文件，值互相覆盖）。
 pub fn custom_rule_file_base(id: &str) -> String {
+    rule_file_base_with_prefix("custom-rule-", id)
+}
+
+/// [`custom_rule_file_base`] 的前缀参数化形（**同一份实现**，不是第二条腿）。
+///
+/// 凡「把一个用户可控 id 拼进文件名」的腿都必须走它：id 来自可导入的配置 JSON，裸拼进路径
+/// 就是一条目录穿越面（`../../x`），而落盘侧与读取侧一旦各写一份派生规则，两边会在非法 id 上
+/// 分家（写的是 hash 名、找的是裸名 ⇒ 文件永远"不存在" ⇒ 该腿 100% 不可达且无人报错）。
+///
+/// 输出对 `"custom-rule-"` 前缀逐字节等同于提取前，故 [`is_custom_rule_orphan_file`] 的正则面不变。
+pub fn rule_file_base_with_prefix(prefix: &str, id: &str) -> String {
     if !id.is_empty()
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
-        return format!("custom-rule-{id}");
+        return format!("{prefix}{id}");
     }
     // 非法 id（空 / 含特殊字符）→ sha1(id) 十六进制前 12 位。
     let mut hasher = Sha1::new();
     hasher.update(id.as_bytes());
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    format!("custom-rule-h{}", &hex[..12])
+    format!("{prefix}h{}", &hex[..12])
 }
 
 /// 是否启用 FakeIP（纯看开关，不分模式，缺省 true）。上游 `usesFakeIp`。

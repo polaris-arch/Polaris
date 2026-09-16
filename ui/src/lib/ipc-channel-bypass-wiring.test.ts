@@ -388,6 +388,24 @@ describe('G11-4：跨语言通道名单一真值源（两侧字符串必须相�
     );
   });
 
+  it('全部 command 值都出现在 generate_handler![] 里（函数存在 ≠ 已注册）', () => {
+    // 上一条只证明「Rust 里有这个函数」。Tauri 真正的分派表是 `generate_handler![]` ——
+    // 写了 `#[tauri::command]` 却忘了往那张表里加一行，运行期照样 `Command X not found`，
+    // 而函数存在性那条会绿。2026-09-08 加 `tun_exclusion_preview` 时实测：把注册行删掉，
+    // 当时全部 15 条都还是绿的 —— 这个缺口一直在，只是没人踩到。
+    //
+    // 变异对照：从 main.rs 删掉任意一行注册 ⇒ 本条转红。
+    const registered = REGISTERED_COMMANDS;
+    expect(registered.size, 'generate_handler![] 一条都没解析出来 —— 本条会恒绿').toBeGreaterThan(80);
+    const cmds = Object.entries(CHANNELS).filter(([k]) => !k.startsWith('EVENT_'));
+    const unregistered = cmds.filter(([, v]) => !registered.has(v)).map(([k, v]) => `${k}=${v}`);
+    expect(
+      unregistered,
+      '常量表里的 command 没出现在 generate_handler![] —— 运行期 command not found，' +
+        '调用方的 .catch() 会把它吞掉，tsc 也查不出',
+    ).toEqual([]);
+  });
+
   it('常量表之外硬编码的 `event:*` 必须逐条登记，且与 Rust 侧字符串逐字相等', () => {
     const hard = FILES.filter((f) => f.rel !== 'domain/ipc-channels.ts').flatMap((f) =>
       (f.src.match(/'event:[^']+'/g) ?? []).map((s) => `${f.rel} :: ${s.slice(1, -1)}`),

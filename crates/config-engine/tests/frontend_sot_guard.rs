@@ -222,3 +222,246 @@ fn frontend_preset_interface_matches_rust_dto_fields() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 配置默认值：前端一条兜底都不许写
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 递归收集 `ui/src` 下的 `.ts` / `.tsx`（跳过测试与 `node_modules`）。
+///
+/// **取材面必须是整个 `ui/src`，不能只盯 `SettingsTun.tsx`**：这个 bug 的两次发生分别在
+/// 「网络」与「TUN」两个屏，盯单文件的门对第三个屏结构性失明。
+fn frontend_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name == "node_modules" || name == "__tests__" {
+                    continue;
+                }
+                walk(&path, out);
+                continue;
+            }
+            let is_source = name.ends_with(".ts") || name.ends_with(".tsx");
+            // 测试自己会构造缺省态做断言，不该被本门管。
+            let is_test = name.contains(".test.") || name.contains(".spec.");
+            if is_source && !is_test {
+                if let Ok(src) = std::fs::read_to_string(&path) {
+                    out.push((path.display().to_string(), strip_ts_comments(&src)));
+                }
+            }
+        }
+    }
+    let root = format!("{}/../../ui/src", env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    walk(std::path::Path::new(&root), &mut out);
+    assert!(
+        out.len() > 100,
+        "只扫到 {} 个前端源文件 —— 取材面塌了（路径变了？），本门此刻是假绿",
+        out.len()
+    );
+    out
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// 在 `code` 里找 `leaf` 的**读取点自带兜底**，命中返回那一小段原文。
+///
+/// 三种兜底形态都要认（只认 `??` 会漏掉另外两种）：
+///   - `x.leaf ?? […]`  空值合并
+///   - `x.leaf || […]`  逻辑或
+///   - `{ leaf = […] }` 解构默认值
+///
+/// 跨行也要认（`x.leaf\n  ?? […]`），故向后跳过空白**含换行**再判，不做逐行切分。
+fn find_default_fallback(code: &str, leaf: &str) -> Option<String> {
+    let bytes = code.as_bytes();
+    for (idx, _) in code.match_indices(leaf) {
+        // 标识符边界：`leaf` 不得是更长标识符的一截（`stack` 不许命中 `stackMode`）。
+        let before_ok = idx == 0 || !is_ident_char(code[..idx].chars().next_back().unwrap_or(' '));
+        let after = idx + leaf.len();
+        let after_ok =
+            after >= bytes.len() || !is_ident_char(code[after..].chars().next().unwrap_or(' '));
+        if !before_ok || !after_ok {
+            continue;
+        }
+        let rest = code[after..].trim_start();
+        // `=` 形态只在**解构模式**里才是默认值：`const { tunConfig = {} } = cfg`。
+        // 普通声明 `const inboundExcludeCidrs = injectedList(...)` 的 `=` 是赋值，不是兜底——
+        // 首版没分这两者，立门当场就把注入读取点自己误报了（合法写法被误报的门最后一定被删掉）。
+        let prev = code[..idx].trim_end().chars().next_back();
+        let in_destructuring = matches!(prev, Some('{') | Some(','));
+        let hit = rest.starts_with("??")
+            || rest.starts_with("||")
+            || (in_destructuring
+                && rest.starts_with('=')
+                && !rest.starts_with("==")
+                && !rest.starts_with("=>"));
+        if hit {
+            let end = (after + 60).min(code.len());
+            let start = idx.saturating_sub(30);
+            // 切片必须落在 char 边界上（源码含中文注释已剥，但标识符前后仍可能有多字节）。
+            let (mut s, mut e) = (start, end);
+            while !code.is_char_boundary(s) {
+                s -= 1;
+            }
+            while !code.is_char_boundary(e) {
+                e -= 1;
+            }
+            return Some(code[s..e].replace('\n', " "));
+        }
+    }
+    None
+}
+
+/// **门的自检 + 历史缺陷回放**：探测器必须对真实发生过的两种写法转红。
+///
+/// 不先回放就立门 = 只证明了"当前代码干净"，没证明"门抓得住"。
+/// 三条正例都是仓里真实存在过的原文，`?? []` 那条是**修复途中最可能写出的错解**
+/// （空数组同样是前端在挑默认，不因为它"看起来无害"就放行）。
+#[test]
+fn fallback_detector_catches_the_two_historical_defects() {
+    let historical_bypass =
+        "const bypassList = config.bypassLANList ?? ['localhost', '127.0.0.1', '192.168.0.0/16'];";
+    assert!(
+        find_default_fallback(historical_bypass, "bypassLANList").is_some(),
+        "漏掉 bypassLANList 的历史兜底"
+    );
+
+    let historical_inbound =
+        "const inboundExcludeCidrs = tun.inboundExcludeCidrs ?? ['100.64.0.0/10'];";
+    assert!(
+        find_default_fallback(historical_inbound, "inboundExcludeCidrs").is_some(),
+        "漏掉 inboundExcludeCidrs 的历史兜底"
+    );
+
+    let historical_tun = "const tun: TunModeConfig = config.tunConfig ?? {\n stack: 'auto',\n};";
+    assert!(
+        find_default_fallback(historical_tun, "tunConfig").is_some(),
+        "漏掉 tunConfig 的历史兜底"
+    );
+
+    // 另外三种形态。
+    assert!(
+        find_default_fallback("const l = config.bypassLANList ?? [];", "bypassLANList").is_some(),
+        "`?? []` 同样是前端挑默认，必须红"
+    );
+    assert!(
+        find_default_fallback("const l = config.bypassLANList || [];", "bypassLANList").is_some(),
+        "`||` 形态漏网"
+    );
+    assert!(
+        find_default_fallback("const { tunConfig = {} } = config;", "tunConfig").is_some(),
+        "解构默认值形态漏网"
+    );
+    assert!(
+        find_default_fallback(
+            "const l = tun.inboundExcludeCidrs\n  ?? ['100.64.0.0/10'];",
+            "inboundExcludeCidrs"
+        )
+        .is_some(),
+        "跨行兜底漏网"
+    );
+
+    // 负向对照：合法写法不得误报，否则门会被人删掉而不是被遵守。
+    for clean in [
+        "const l = injectedList(config.bypassLANList, 'bypassLANList');",
+        "patchTun({ inboundExcludeCidrs: next })",
+        "if (tun.inboundExcludeCidrs === undefined) report();",
+        "const same = a.tunConfig == b.tunConfig;",
+        "const f = (tunConfig) => tunConfig;",
+    ] {
+        for leaf in ["bypassLANList", "inboundExcludeCidrs", "tunConfig"] {
+            assert!(
+                find_default_fallback(clean, leaf).is_none(),
+                "合法写法被误报为兜底：{clean:?}（leaf={leaf}）"
+            );
+        }
+    }
+
+    // 普通声明的 `=` 不是兜底（首版在此误报了注入读取点自己）。
+    assert!(
+        find_default_fallback(
+            "const inboundExcludeCidrs = injectedList(tun.inboundExcludeCidrs, 'x');",
+            "inboundExcludeCidrs"
+        )
+        .is_none(),
+        "普通 `const x = …` 被误判成解构默认值"
+    );
+
+    // 标识符边界自检：更长标识符的一截不算命中。
+    assert!(
+        find_default_fallback("const tunConfigDraft = x ?? {};", "tunConfig").is_none(),
+        "`tunConfig` 误命中 `tunConfigDraft`"
+    );
+}
+
+/// **本门主体**：`INJECTED_FIELD_PATHS` 里的每个字段，在整个 `ui/src` 都不许有读取点兜底。
+///
+/// 取材面直接读 Rust 那张表 —— 表里加一行，本门自动开始管那个字段，不必改这里。
+#[test]
+fn frontend_holds_no_config_default_fallback() {
+    use polaris_config_engine::user_config::effective_view::INJECTED_FIELD_PATHS;
+
+    let leaves: std::collections::BTreeSet<&str> = INJECTED_FIELD_PATHS
+        .iter()
+        .map(|p| p.rsplit('.').next().unwrap_or(p))
+        .collect();
+    assert!(
+        !leaves.is_empty(),
+        "INJECTED_FIELD_PATHS 空 —— 本门无事可做，必是表被清了"
+    );
+
+    let sources = frontend_sources();
+    let mut offenders: Vec<String> = Vec::new();
+    for (path, code) in &sources {
+        for leaf in &leaves {
+            if let Some(snippet) = find_default_fallback(code, leaf) {
+                offenders.push(format!("{path}\n    …{snippet}…"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "前端又给「由 config:get 边界注入」的字段写了兜底默认值 —— 这正是 bypassLANList / \
+         inboundExcludeCidrs 两次犯过的同一个 bug（UI 与内核分叉 + 首个按键把兜底持久化）。\n\
+         值的真值源在 Rust `user_config::effective_view::ensure_effective_config`；\n\
+         读取点请走 `ui/src/domain/effective-config.ts` 的 injectedList / injectedRecord。\n\
+         命中：\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// 正面断言：注入读取入口确实存在且被消费。
+///
+/// 只有上面那条 `!contains` 的话，把读取点整个删掉、或把 helper 删掉，门都会**平凡通过**。
+#[test]
+fn frontend_reads_injected_fields_through_the_single_accessor() {
+    let helper = frontend_code("domain/effective-config.ts");
+    for export in [
+        "export function injectedList",
+        "export function injectedRecord",
+    ] {
+        assert!(
+            helper.contains(export),
+            "domain/effective-config.ts 缺 {export:?} —— 前端唯一允许的缺席处理点没了"
+        );
+    }
+
+    let screen = frontend_code("components/screens/settings/SettingsTun.tsx");
+    for call in [
+        "injectedList(config.bypassLANList",
+        "injectedList(\n    tun.inboundExcludeCidrs",
+        "injectedRecord<TunModeConfig>(config.tunConfig",
+    ] {
+        assert!(
+            screen.contains(call),
+            "SettingsTun 未经注入读取入口取值：找不到 {call:?}"
+        );
+    }
+}

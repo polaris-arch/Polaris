@@ -260,6 +260,11 @@ fn create_main_window(
     //   · Linux：**恒不开** transparent、**不调用任何特效**——transparent:false 是白屏逃生门路径，绝不翻转。
     #[allow(unused_mut)]
     let mut builder = WebviewWindowBuilder::from_config(app, &window_config)?;
+    // WebView2 启动参数（图形逃生门 `--disable-gpu`）：四个建窗点同值，唯一真值在 graphics_compat。
+    // conf 不得声明 `additionalBrowserArgs`（`graphics_compat/tests` 守着），故这里不存在与 conf 的覆盖冲突。
+    if let Some(args) = graphics_compat::webview_additional_browser_args() {
+        builder = builder.additional_browser_args(args);
+    }
 
     // ── B：主题接线（此前后端零读 `uiTheme`，三处原生面全硬编码深色）──
     //
@@ -655,10 +660,16 @@ fn main() {
             app_language::log_startup_outcome();
 
             // ── 图形兼容逃生门（D 类合成层白屏自救）──
-            // 必须在**首个 webview 创建之前**：各平台 runtime 只在创建 webview 那一刻读 GPU 环境变量。
+            // 必须在**首个 webview 创建之前**：各平台 runtime 只在创建 webview 那一刻读 GPU 开关
+            // （Linux 环境变量 / Windows WebView2 启动参数）。
             // 读 config.json 原文本而非走 store：此刻 store 尚未装配，且逃生门必须在「配置损坏到 store
             // 都加载不了」时仍能工作。容错第一 —— 任何异常一律回落「默认全开 = 行为不变」。
             let raw_config = graphics_compat::read_config_raw(&config_dir);
+            // 硬件加速开关**本进程只定格这一次**：Windows 四个建窗点都经
+            // `graphics_compat::webview_additional_browser_args` 读这一份（WebView2 要求同一 data directory 的
+            // webview 启动参数完全一致），下面的 U-7 基线与逃生门日志也用它，不再各自拿 raw 另算。
+            let hardware_acceleration_disabled =
+                graphics_compat::freeze_hardware_acceleration(raw_config.as_deref());
             // ── U-7 判据基线：本次进程**启动时真正读到的**三个值 ──
             // 必须在这里定格，而不是让渲染端拿「上一次保存值」当基线。反例：进程以 hardwareAcceleration=true
             // 起来 → 用户关掉（弹窗，点「稍后」）→ 又打开 ⇒ 若与上次保存值比就再弹一次，可此刻磁盘值已等于
@@ -667,18 +678,15 @@ fn main() {
             // 语义方向统一为 `UserConfig` 的「该功能是否开」（与渲染端 `effectiveValue` 同口径），
             // 而非各自判定函数的「是否禁用/是否上特效」，避免两侧各记一次反相。
             app.manage(StartupConfigFlags {
-                hardware_acceleration: !graphics_compat::should_disable_hardware_acceleration(
-                    raw_config.as_deref(),
-                ),
+                hardware_acceleration: !hardware_acceleration_disabled,
                 window_effects: graphics_compat::should_apply_window_effects(raw_config.as_deref()),
                 remember_window_size: config_remember_window_size(raw_config.as_deref()),
             });
-            // 图形逃生门：hardwareAcceleration=false → 设 GPU 环境变量（软件渲染）。必须在**首个 webview 创建
-            // 之前**：各平台 runtime 只在建 webview 那一刻读 GPU 环境变量。窗口 vibrancy/Mica 的同一判定在
+            // 图形逃生门：hardwareAcceleration=false → 软件渲染。必须在**首个 webview 创建之前**：Linux 设
+            // WebKitGTK 环境变量（建 webview 那一刻才读）；Windows 这里只记日志，`--disable-gpu` 由各建窗点经
+            // WebView2 API 下发（环境变量在以管理员身份运行时被 WebView2 忽略）。窗口 vibrancy/Mica 的同一判定在
             // `create_main_window` 内按同源 raw config 重算（特效关时**不** apply，避免与逃生门叠加合成负担）。
-            graphics_compat::apply_hardware_acceleration_escape(
-                graphics_compat::should_disable_hardware_acceleration(raw_config.as_deref()),
-            );
+            graphics_compat::apply_hardware_acceleration_escape(hardware_acceleration_disabled);
 
             // ── 可写现役核基目录注入（**必须早于任何起核路径**）──
             // `resolve_core_binary()` 是自由函数（无 AppHandle），故基目录经进程级 OnceLock 注入。
@@ -1045,6 +1053,10 @@ fn main() {
             tailscale_login_cancel,
             tailscale_logout,
             tailscale_state_exists,
+            tun_exclusion_preview,
+            dns_takeover_report,
+            tunnel_conflict_report,
+            endpoint_force_route_report,
             tailscale_get_status,
             // ── OpenConnect / OpenVPN rc.2 原生状态与认证 ──
             vpn_get_status,

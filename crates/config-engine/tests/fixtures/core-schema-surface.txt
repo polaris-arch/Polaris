@@ -40,10 +40,11 @@ BrutalOptions.enabled
 BrutalOptions.up_mbps
 CCMUser.name
 CCMUser.token
+CacheFileOptions.buffer_size
 CacheFileOptions.cache_id
 CacheFileOptions.enabled
+CacheFileOptions.flush_interval
 CacheFileOptions.path
-CacheFileOptions.rdrc_timeout
 CacheFileOptions.store_dns
 CacheFileOptions.store_fakeip
 CertificateProviderReference[acme].account_key
@@ -581,6 +582,7 @@ Endpoint[openconnect].network_strategy
 Endpoint[openconnect].network_strategy = ["default","fallback","hybrid"]
 Endpoint[openconnect].network_type
 Endpoint[openconnect].no_udp
+Endpoint[openconnect].on_demand
 Endpoint[openconnect].password
 Endpoint[openconnect].password_authentication_disabled
 Endpoint[openconnect].pfs
@@ -657,6 +659,7 @@ Endpoint[openvpn-client].network = ["tcp","tcp4","tcp6","udp","udp4","udp6"]
 Endpoint[openvpn-client].network_strategy
 Endpoint[openvpn-client].network_strategy = ["default","fallback","hybrid"]
 Endpoint[openvpn-client].network_type
+Endpoint[openvpn-client].on_demand
 Endpoint[openvpn-client].password
 Endpoint[openvpn-client].peer_address
 Endpoint[openvpn-client].peer_address_ipv6
@@ -793,6 +796,7 @@ Endpoint[tailscale].netns
 Endpoint[tailscale].network_strategy
 Endpoint[tailscale].network_strategy = ["default","fallback","hybrid"]
 Endpoint[tailscale].network_type
+Endpoint[tailscale].on_demand
 Endpoint[tailscale].protect_path
 Endpoint[tailscale].relay_server_port
 Endpoint[tailscale].relay_server_static_endpoints
@@ -830,6 +834,7 @@ Endpoint[wireguard].netns
 Endpoint[wireguard].network_strategy
 Endpoint[wireguard].network_strategy = ["default","fallback","hybrid"]
 Endpoint[wireguard].network_type
+Endpoint[wireguard].on_demand
 Endpoint[wireguard].peers
 Endpoint[wireguard].private_key
 Endpoint[wireguard].protect_path
@@ -1425,6 +1430,7 @@ Inbound[tun].auto_redirect_iproute2_fallback_rule_index
 Inbound[tun].auto_redirect_nfqueue
 Inbound[tun].auto_redirect_output_mark
 Inbound[tun].auto_redirect_reset_mark
+Inbound[tun].auto_redirect_tproxy_mark
 Inbound[tun].auto_route
 Inbound[tun].dns_address
 Inbound[tun].dns_mode
@@ -1446,14 +1452,13 @@ Inbound[tun].iproute2_rule_index
 Inbound[tun].iproute2_table_index
 Inbound[tun].loopback_address
 Inbound[tun].mtu
+Inbound[tun].multi_queue
 Inbound[tun].netns
 Inbound[tun].platform
 Inbound[tun].route_address
 Inbound[tun].route_address_set
 Inbound[tun].route_exclude_address
 Inbound[tun].route_exclude_address_set
-Inbound[tun].stack
-Inbound[tun].stack = ["gvisor","mixed","system"]
 Inbound[tun].strict_route
 Inbound[tun].tag
 Inbound[tun].type

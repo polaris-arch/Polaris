@@ -194,7 +194,7 @@ fn start_with_valid_cfg_starts_and_records_pid() {
         }),
     );
     let HandleOutcome::Respond(Response::Ok(ResponseKind::Start(
-        polaris_helper_proto::Start::StartedTimed { pid, timing },
+        polaris_helper_proto::Start::StartedTimed { pid, timing, .. },
     ))) = out
     else {
         panic!("{out:?}");
@@ -207,7 +207,7 @@ fn start_with_valid_cfg_starts_and_records_pid() {
     assert!(matches!(
         out2,
         HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
-            polaris_helper_proto::Status::Running { pid: 1000 }
+            polaris_helper_proto::Status::Running { pid: 1000, .. }
         )))
     ));
 }
@@ -394,7 +394,7 @@ fn stop_refuses_to_reap_when_managed_pid_is_another_session() {
         matches!(
             h.handle("real-token", Request::Status),
             HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
-                polaris_helper_proto::Status::Running { pid: 1000 }
+                polaris_helper_proto::Status::Running { pid: 1000, .. }
             )))
         ),
         "child 记账必须原样留给新会话（摘掉 = 新核失联，daemon 再也停不掉它）"
@@ -713,7 +713,7 @@ fn watch_parent_keeps_child_when_parent_alive() {
     assert!(matches!(
         out,
         HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
-            polaris_helper_proto::Status::Running { pid: 1000 }
+            polaris_helper_proto::Status::Running { pid: 1000, .. }
         )))
     ));
 }
@@ -769,14 +769,143 @@ fn reap_child_on_exit_killall_when_no_child() {
 
 #[test]
 fn mac_linux_commands_return_unknown() {
-    // Windows helper 无 install-core / flush-dns / default-restore / linux-start
+    // Windows helper 无 install-core / default-restore / linux-start（flush-dns 已由 D4 实现，
+    // 见 `flush_dns_*` 两条）。
     let h = make_helper_defaults();
     let out = h.handle(
         "real-token",
-        Request::FlushDns, // mac 专属
+        Request::DefaultRestore {
+            gateway_ipv4: "192.168.1.1".to_owned(),
+        }, // mac 专属
     );
     let HandleOutcome::Respond(Response::Err(e)) = out else {
         panic!("{out:?}");
     };
     assert_eq!(e.code, polaris_helper_proto::ErrorCode::Unknown);
+}
+
+// ===== D2/D3 身份回传 =====
+
+/// status 把 helper 手里那个句柄读到的两件事一并回传；start 只回传 created。
+///
+/// 两条 wire 断言各锁一个方向：
+/// - status 有 `created=` + `image=`（app 据此发现 pid 复用、据此做内核自证）；
+/// - start **没有** `image=` —— 那个 hex 路径不是 u64，会让旧 app 的 `parse_start_timing`
+///   整段返回 None，五个 timing 字段一起丢。
+#[test]
+fn status_and_start_carry_the_managed_identity() {
+    let proc_ops = MockProcOps::new();
+    proc_ops.set_identity(
+        Some(133_600_000_000_000_000),
+        Some(r"C:\Program Files\Polaris\sing-box.exe"),
+    );
+    let h = make_helper(proc_ops, MockNetTableOps::new());
+
+    let out = h.handle(
+        "real-token",
+        Request::Start(StartParams {
+            cfg: r"C:\Users\polaris\config\c.json".to_owned(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        }),
+    );
+    let HandleOutcome::Respond(start) = out else {
+        panic!("{out:?}");
+    };
+    let start_wire = start.to_wire_line();
+    assert!(
+        start_wire.contains("created=133600000000000000"),
+        "start 未回传身份基线：{start_wire}"
+    );
+    assert!(
+        !start_wire.contains("image="),
+        "start 带上了 image ⇒ 旧 app 会丢掉全部 timing：{start_wire}"
+    );
+
+    let out = h.handle("real-token", Request::Status);
+    let HandleOutcome::Respond(status) = out else {
+        panic!("{out:?}");
+    };
+    let status_wire = status.to_wire_line();
+    assert!(
+        status_wire.contains("created=133600000000000000"),
+        "status 未回传创建时间：{status_wire}"
+    );
+    // 路径 hex 编码后回来（含空格的路径不会破坏按空白切 token）。
+    let Response::Ok(ResponseKind::Status(polaris_helper_proto::Status::Running { image, .. })) =
+        polaris_helper_proto::Response::parse(&status_wire)
+    else {
+        panic!("{status_wire}");
+    };
+    assert_eq!(
+        image.as_deref(),
+        Some(r"C:\Program Files\Polaris\sing-box.exe")
+    );
+}
+
+/// 读不到身份（FFI 失败 / 非受管 pid）→ wire 回到**逐字**的旧形态，旧 app 与新 app 都不受影响。
+///
+/// 这条是「不可观测就说不可观测」的反向对照：mock 不预设身份即等价于 FFI 全部读失败。
+#[test]
+fn status_without_identity_falls_back_to_the_old_wire() {
+    let proc_ops = MockProcOps::new();
+    let h = make_helper(proc_ops, MockNetTableOps::new());
+    let _ = h.handle(
+        "real-token",
+        Request::Start(StartParams {
+            cfg: r"C:\Users\polaris\config\c.json".to_owned(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        }),
+    );
+    let out = h.handle("real-token", Request::Status);
+    let HandleOutcome::Respond(status) = out else {
+        panic!("{out:?}");
+    };
+    assert_eq!(status.to_wire_line(), "OK running 1000");
+}
+
+// ===== D4 flush-dns =====
+
+/// flush-dns 成功 → `OK flushed`，且真的调到了 ProcOps 那条腿（不是分派层自己回了个 OK）。
+#[test]
+fn flush_dns_reports_flushed_and_calls_the_ops_leg() {
+    let proc_ops = MockProcOps::new();
+    let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
+    let out = h.handle("real-token", Request::FlushDns);
+    assert_eq!(
+        out,
+        HandleOutcome::Respond(Response::Ok(ResponseKind::FlushDns(
+            polaris_helper_proto::FlushDns::Flushed
+        )))
+    );
+    assert_eq!(proc_ops.flush_dns_calls(), 1);
+}
+
+/// flush-dns 失败 → `ERR ipconfig <detail>`，detail 原样带回 helper 侧自捕的 stdout 文本。
+///
+/// 「报错路径日志非空」是本条的验收点：ipconfig 的失败文字只在 stdout，若沿用共用 exec 的
+/// 「只带 stderr」格式，这里会得到一条空 detail —— 失败了却说不出为什么。
+#[test]
+fn flush_dns_failure_carries_the_captured_stdout() {
+    let proc_ops = MockProcOps::new();
+    proc_ops.set_flush_dns_error(
+        "ipconfig /flushdns exit 1: Could not flush the DNS Resolver Cache: Function failed during execution.",
+    );
+    let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
+    let out = h.handle("real-token", Request::FlushDns);
+    let HandleOutcome::Respond(Response::Err(e)) = out else {
+        panic!("{out:?}");
+    };
+    assert_eq!(e.code, polaris_helper_proto::ErrorCode::Ipconfig);
+    assert!(
+        e.detail.contains("Could not flush the DNS Resolver Cache"),
+        "错误串丢了 stdout：{}",
+        e.detail
+    );
+    // 反向对照：绝不折成 `ERR unknown` —— 那是「旧 helper 不认识这条命令」，app 会当能力缺失。
+    assert_ne!(e.code, polaris_helper_proto::ErrorCode::Unknown);
+    assert_eq!(proc_ops.flush_dns_calls(), 1);
 }

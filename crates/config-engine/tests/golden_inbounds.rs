@@ -1,6 +1,10 @@
 //! B1/H2 金样对拍 harness —— buildInbounds。
 //!
 //! 读 fixtures/inbounds.json（TS 导出 13 cases），逐条调 Rust build_inbounds，与 output diff。
+//!
+//! 夹具定向变换记录（2026-09-13）：TUN stack 随上游弃用移除，删除 `output[]` 里 `type=="tun"` 条目的
+//! `stack` 键共 6 处（每个 TUN case 1 处），`input.config.tunConfig.stack` 原样保留。变换前 6/13 红、
+//! 变换后 13/13 通过。规则与验收同 `golden_config_snapshot.rs` 头注「第八次例外」。
 
 use polaris_config_engine::builder::inbounds::{build_inbounds, InboundsDeps};
 use polaris_config_engine::user_config::UserConfig;
@@ -62,6 +66,8 @@ fn inbounds_matches_polaris_golden() {
             probe_pool_ports: case.input.ports.probe_pool.clone(),
             platform: case.input.platform.clone(),
             own_lan_cidrs: vec![],
+            // 无运行期观测 ⇒ engaged_mesh 仅含 tailnet 默认常量段，与本字段出现之前同。
+            observed_tailnet_addresses: Default::default(),
             log: |_, _| {},
         };
 

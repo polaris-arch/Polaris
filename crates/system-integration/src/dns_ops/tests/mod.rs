@@ -664,3 +664,63 @@ fn impl_mac_controller_combination_takes_over() {
         &vec!["192.168.1.1".to_string()]
     );
 }
+
+// ── C1：接管挤掉的非公网解析器必须被观测到 ──────────────────────────────────────
+
+/// 现场形态：macOS 上跑官方 Tailscale。`networksetup -getdnsservers` 看不见 quad100
+/// （它由 NetworkExtension 装），只有 `scutil --dns` 看得见 —— 故观测必须走后者。
+///
+/// 这条同时是"别改回去用 marker 原始值判"的护栏：`-getdnsservers` 在本夹具里对
+/// Wi-Fi 返的是「There aren't any DNS Servers set」，用它判会**恒空**、告警永不出现。
+#[test]
+fn set_dns_observes_resolver_displaced_by_takeover() {
+    let runner = MockRunner::default()
+        .with_arg_stdout("-listallnetworkservices", "An asterisk\nWi-Fi\n")
+        .with_arg_stdout(
+            "-getdnsservers",
+            "There aren't any DNS Servers set on Wi-Fi.\n",
+        )
+        .with_arg_stdout(
+            "--dns",
+            "resolver #1\n  nameserver[0] : 192.168.1.1\n  nameserver[1] : 8.8.8.8\n\
+             resolver #2\n  domain : example.ts.net\n  nameserver[0] : 100.100.100.100\n",
+        );
+    let mut controller =
+        SystemDnsController::new(dns_ops_for(Platform::Mac, runner), mem_dns_marker())
+            .with_noop_sleeper();
+    controller.set_dns();
+
+    let displaced = controller.displaced_resolvers().to_vec();
+    assert!(
+        displaced.iter().any(|ip| ip == "100.100.100.100"),
+        "Tailscale 的 quad100 被接管挤掉却没被观测到：{displaced:?}"
+    );
+    assert!(
+        displaced.iter().any(|ip| ip == "192.168.1.1"),
+        "LAN 解析器同样被挤掉，也该报：{displaced:?}"
+    );
+    assert!(
+        !displaced.iter().any(|ip| ip == "8.8.8.8"),
+        "公网解析器不该报 —— 覆盖它正是接管的本意：{displaced:?}"
+    );
+
+    // 还原后观测作废（否则没接管时 UI 仍会显示告警）。
+    controller.restore_dns();
+    assert!(controller.displaced_resolvers().is_empty());
+}
+
+/// 不接管的平台（win/linux）不产生观测 —— 那里根本没挤掉任何东西。
+#[test]
+fn non_takeover_platforms_report_no_displacement() {
+    for platform in [Platform::Win, Platform::Linux] {
+        let mut controller = SystemDnsController::new(
+            dns_ops_for(platform, MockRunner::default()),
+            mem_dns_marker(),
+        );
+        controller.set_dns();
+        assert!(
+            controller.displaced_resolvers().is_empty(),
+            "{platform:?} 不接管系统 DNS，不该报被挤掉的解析器"
+        );
+    }
+}

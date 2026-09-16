@@ -457,13 +457,23 @@ const REGISTRY: readonly PromiseRow[] = [
     },
   },
   {
-    // 承诺是「留空即自动，按协议栈与平台取推荐值」——兑现方是生成期那条派生，不是某个配置键
+    // 承诺是「留空即自动，使用推荐值」——兑现方是生成期那条回落，不是某个配置键
     // （恰恰相反：留空意味着**磁盘上没有那个键**，config-key 这条腿在这里天然举不出证）。
-    snippet: '留空即自动，按协议栈与平台取推荐值',
+    // 两个锚点缺一不可：只锚常量定义的话，builder 改成不回落（mtu 缺席就不发键）照样绿。
+    // TUN stack 移除前的原文是「按协议栈与平台取推荐值」，锚在 `tun_stack.rs::default_mtu_for`。
+    snippet: '留空即自动，使用推荐值',
     evidence: {
-      kind: 'anchor',
-      file: 'crates/config-engine/src/user_config/tun_stack.rs',
-      needle: 'pub fn default_mtu_for',
+      kind: 'anchors',
+      items: [
+        {
+          file: 'crates/config-engine/src/user_config/tun_config',
+          needle: 'pub const DEFAULT_TUN_MTU: u32',
+        },
+        {
+          file: 'crates/config-engine/src/builder/inbounds',
+          needle: '.unwrap_or(DEFAULT_TUN_MTU)',
+        },
+      ],
     },
   },
   {

@@ -453,6 +453,27 @@ fn every_test_directory_is_wired_into_its_parent_module() {
     );
 }
 
+/// 目录里（递归）有没有 `.rs` 源文件。
+///
+/// `every_file_in_a_test_directory_is_declared_in_its_mod_rs` 用它把**纯数据目录**与
+/// 真模块分开。递归而非只看一层：`fixtures/synthetic/` 这种嵌套数据目录同样要被识别成数据。
+fn contains_rust_source(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if contains_rust_source(&path) {
+                return true;
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            return true;
+        }
+    }
+    false
+}
+
 /// 🔴 `tests/` 目录里的每个 `*.rs` 都必须在同目录 `mod.rs` 里被声明。
 ///
 /// 与上一条同源：子文件没被 `mod x;` 引用同样是静默失效。
@@ -479,6 +500,18 @@ fn every_file_in_a_test_directory_is_declared_in_its_mod_rs() {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // 纯数据目录（递归一个 `.rs` 都没有）不是模块，跳过。
+                //
+                // **为什么这不是把门放宽**：本门要抓的是「存在一个 `.rs` 测试文件、却没被 `mod.rs`
+                // 声明 ⇒ 它静默不跑」。一个递归不含任何 `.rs` 的目录**藏不住测试**，
+                // 所以跳过它一条信息都不损失。判据写成「递归探测」而不是「看目录名」：
+                // 哪天有人往 `fixtures/` 里放一个 `.rs`，门立刻重新开火。
+                //
+                // 现实触发点：`crates/system-integration/src/route_probe/tests/fixtures/`
+                // 装的是六份真机路由表抓取（`.txt`）+ 一份 README + `synthetic/`。
+                if !contains_rust_source(&path) {
+                    continue;
+                }
                 // 子目录形态（`tests/foo/mod.rs`）同样要被声明。
                 if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
                     checked += 1;

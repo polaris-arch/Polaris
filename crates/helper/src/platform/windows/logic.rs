@@ -197,6 +197,103 @@ pub const fn pipe_open_mode(first: bool) -> u32 {
     }
 }
 
+/// `flush-dns`（D4）的命令构造：SYSTEM 下跑 `%SystemRoot%\System32\ipconfig.exe /flushdns`。
+///
+/// 纯逻辑（Linux 可测），生产侧 [`crate::platform::windows::winproc`] 逐字消费本结构 ——
+/// 判据住这里，执行腿只负责把它交给 `CreateProcess`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushDnsCommand {
+    /// 可执行文件绝对路径。
+    pub program: String,
+    /// 参数列表。
+    pub args: Vec<&'static str>,
+    /// `CreateProcess` 的 creation flags（见 [`CREATE_NO_WINDOW`]）。
+    pub creation_flags: u32,
+}
+
+/// `CREATE_NO_WINDOW`（winbase.h `0x08000000`）的字面镜像。
+///
+/// 位值硬编码的理由同 [`pipe_open_mode`]：本模块在 Linux 上也编译，而 `windows-sys` 只在
+/// `cfg(windows)` 的依赖图里。`winproc::win` 里有一条 **windows-only 编译期断言**钉住
+/// 「字面值 == `windows-sys` 常量」——两边一动就编不过。
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 构造 `ipconfig /flushdns` 命令（`system_root` = `%SystemRoot%`，缺失回落 `C:\Windows`）。
+///
+/// **为什么必须绝对路径**：部分设备的进程 PATH 缺 `C:\Windows\System32`（注册表 Path 值类型退化、
+/// PATH 超长被截断），裸 `ipconfig` 会解析失败报「不是内部或外部命令」——与权限无关，绝对路径绕开。
+/// 与 app 侧回退腿（`system-integration::exec::system32`）同源口径。
+///
+/// **为什么 `CREATE_NO_WINDOW`**：helper 是 session-0 的 SYSTEM 服务，起控制台程序不得弹窗。
+#[must_use]
+pub fn flush_dns_command(system_root: Option<&str>) -> FlushDnsCommand {
+    let root = system_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(r"C:\Windows");
+    let root = root.trim_end_matches(['\\', '/']);
+    FlushDnsCommand {
+        program: format!(r"{root}\System32\ipconfig.exe"),
+        args: vec!["/flushdns"],
+        creation_flags: CREATE_NO_WINDOW,
+    }
+}
+
+/// `flush-dns` 子进程的硬超时（毫秒）。
+///
+/// # 为什么这条腿必须有上界
+///
+/// `ipconfig` 会去问 **DNS Client（Dnscache）服务**。那个服务挂住时 `ipconfig` 也跟着挂住，
+/// 而 helper 的连接线程是**一个管道实例一条线程**：没有上界就意味着这条线程与它占的管道实例
+/// 一起被扣在那儿，直到 ipconfig 自己回来为止。app 侧 5s 后确实会超时降级，但那只解开 app 这一头。
+///
+/// # 取值 3s 的两条边界（都不是随手取的）
+///
+/// - **不大于** app 侧 `HELPER_FLUSH_TIMEOUT`（5s，`src-tauri/runtime/helper.rs`）：helper 先到点、
+///   先杀、先回一条带原因的 `ERR`，app 才拿得到「ipconfig 卡住了」这个事实；反过来 app 先到点，
+///   它拿到的只是一次 IPC 超时，而 helper 这边仍旧扣着线程与管道实例。
+/// - **对齐** app 侧回退腿的 `dns_flush::EXEC_TIMEOUT`（3s）：同一件事在两条腿上给同样的耐心，
+///   免得「走 helper 时肯等 5s、自己跑时只等 3s」这种说不出理由的不对称。
+pub const FLUSH_DNS_TIMEOUT_MS: u32 = 3_000;
+
+/// flush-dns 子进程超时被强杀时的错误串（纯逻辑，Linux 可测）。
+///
+/// 与 [`flush_dns_result`] 的失败串**刻意不同形**：那条是「ipconfig 跑完了但说不行」，这条是
+/// 「ipconfig 没跑完、被我们掐了」。折成同一句会让排查时分不清是 DNS 缓存刷新被拒，还是
+/// Dnscache 服务本身挂住 —— 后者的修法（重启服务）与前者完全不同。
+#[must_use]
+pub fn flush_dns_timeout_error(timeout_ms: u32) -> String {
+    format!(
+        "ipconfig /flushdns 超过 {timeout_ms}ms 未返回（DNS Client 服务可能已挂住）→ 已强制终止"
+    )
+}
+
+/// `ipconfig /flushdns` 的退出结果 → helper 响应判据（纯逻辑）。
+///
+/// **stdout 必须进错误串**：`ipconfig` 把失败文字写在 **stdout**（「Could not flush the DNS
+/// Resolver Cache: Function failed during execution.」），stderr 常为空。共用的
+/// `system-integration::exec` 只把 stderr 带进错误串 —— 那份格式被按串解析的消费方依赖，改它射程远大于
+/// 收益，故本腿**局部**自捕两条流并合并，不动全局格式。
+///
+/// 合并顺序 stdout 在前：它是 ipconfig 真正的诊断来源；两条都空时给出退出码，避免「失败了但错误串为空」。
+pub fn flush_dns_result(code: Option<i32>, stdout: &str, stderr: &str) -> Result<(), String> {
+    if code == Some(0) {
+        return Ok(());
+    }
+    let mut parts: Vec<&str> = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let exit = match code {
+        Some(c) => format!("exit {c}"),
+        None => "terminated by signal".to_owned(),
+    };
+    if parts.is_empty() {
+        parts.push("no output");
+    }
+    Err(format!("ipconfig /flushdns {exit}: {}", parts.join(" | ")))
+}
+
 /// GetExtendedTcpTable 的 LocalPort 网络字节序解析（移植自 `winproc.go:294-298` 的 `localPortFromNetOrder`）。
 ///
 /// GetExtendedTcpTable 返回的 LocalPort 是「主机内存中按网络序排布的 32 位」，低 16 位是端口。

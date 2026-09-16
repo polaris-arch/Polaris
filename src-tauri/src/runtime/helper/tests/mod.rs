@@ -74,8 +74,22 @@ fn stop_does_not_retry_a_structured_pid_mismatch() {
 fn managed_core_status_parses_running_and_stopped() {
     for (wire, expected) in [
         (
+            // 旧 helper 的 wire：无身份 token ⇒ 两个字段 None（消费方按「不可观测」处理）。
             b"OK running 4242\n".to_vec(),
-            ManagedCoreStatus::Running { pid: 4242 },
+            ManagedCoreStatus::Running {
+                pid: 4242,
+                created: None,
+                image: None,
+            },
+        ),
+        (
+            // 新 Windows helper：created 十进制、image 是 hex 编码的路径（含空格）。
+            b"OK running 4242 created=133600000000000000 image=433a5c50726f6772616d2046696c65735c506f6c617269735c73696e672d626f782e657865\n".to_vec(),
+            ManagedCoreStatus::Running {
+                pid: 4242,
+                created: Some(133_600_000_000_000_000),
+                image: Some(r"C:\Program Files\Polaris\sing-box.exe".to_owned()),
+            },
         ),
         (b"OK stopped\n".to_vec(), ManagedCoreStatus::Stopped),
     ] {
@@ -444,5 +458,71 @@ fn status_wiring_uses_recovery_probe() {
     assert!(
         body.contains(concat!("status_with_recovery", "(&client)")),
         "HelperRuntime::status 必须调 status_with_recovery（W20 恢复腿）"
+    );
+}
+
+/// B1：`start` 回传的 `created=` 必须**存下来**当崩溃监测的初始基线，且拿不到时不留陈值。
+///
+/// 三条各锁一格：
+/// - 拿到 `created` ⇒ 存 `(pid, created)`（正面断言：D2/D3(4) 的「start 拿初值」有东西可取）；
+/// - 换一次核（新 pid、新 created）⇒ 基线整体换新，不是只换一半；
+/// - 无 timing 形态 / 旧 helper ⇒ **落 `None`**，而不是留着上一次的值 —— 留着的话，新核万一拿到
+///   同一个 pid，复核就会拿旧进程的创建时间去比新进程，判出一次假复用（=一次假崩溃自愈）。
+///
+/// 变异锁：把 `Started | Already` 那条腿的 `remember_start_identity(pid, None)` 删掉 → 第三条转红；
+/// 把存储改成「只在 `created` 有值时写」→ 第三条转红。
+#[test]
+fn start_identity_baseline_is_remembered_and_never_goes_stale() {
+    let (runtime, _dir) = runtime();
+    assert_eq!(runtime.managed_start_identity(), None, "初值应为空");
+
+    runtime.remember_start_identity(4242, Some(133_600_000_000_000_000));
+    assert_eq!(
+        runtime.managed_start_identity(),
+        Some((4242, 133_600_000_000_000_000))
+    );
+
+    runtime.remember_start_identity(9001, Some(133_600_000_000_000_777));
+    assert_eq!(
+        runtime.managed_start_identity(),
+        Some((9001, 133_600_000_000_000_777)),
+        "换核后基线必须整体换新"
+    );
+
+    runtime.remember_start_identity(9001, None);
+    assert_eq!(
+        runtime.managed_start_identity(),
+        None,
+        "没拿到 created 就必须落 None —— 留着上一次的值会在同号新核上判出假复用"
+    );
+}
+
+/// **接线门**（B1）：`start_core` 的**两条** Start 响应腿都必须落一次基线。
+///
+/// 行为侧由 `start_identity_baseline_is_remembered_and_never_goes_stale` 覆盖，但那条证明的是
+/// 「存得对」，不是「start 真的去存了」—— 真起核是真机门，本机编译器拦不住有人把这两行删掉。
+///
+/// 两条都钉，缺一条都是一种真缺陷：
+/// - 少了 timed 腿那行 ⇒ 基线永远取不到，D2/D3(4)「start 拿初值」整条落空；
+/// - 少了 `Started | Already` 腿那行 ⇒ 陈值留存，同号新核上判出假复用。
+#[test]
+fn start_core_records_the_identity_baseline_on_both_response_legs() {
+    const HEAD: &str = concat!(
+        "    pub fn start_core(\n",
+        "        &self,\n",
+        "        cfg: &Path,\n",
+        "        log: &Path,\n",
+        "        fwd: bool,\n",
+        "        ppid: Option<u32>,\n",
+        "    ) -> Result<u32, String> {"
+    );
+    let body = impl_method_body(&crate_code("runtime/helper.rs"), HEAD);
+    assert!(
+        body.contains(concat!("remember_start_identity", "(pid, created)")),
+        "timed 腿没记基线 —— 崩溃监测起手取不到初值，退回「首次 status 取初值」的旧口径"
+    );
+    assert!(
+        body.contains(concat!("remember_start_identity", "(pid, None)")),
+        "无 timing 腿没清基线 —— 上一次 start 的陈值会被拿去比同号新核"
     );
 }

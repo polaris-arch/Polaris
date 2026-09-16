@@ -37,6 +37,14 @@ pub(super) const PID_IDENTITY_RECHECK_TICKS: u64 = 10;
 /// 用户 stop 先 bump 并停核 → 身份查询回报退出 → 拿旧世代误判 Crash，最终把用户刚停掉的 TUN
 /// 又由崩溃自愈拉起。把世代读取封在分类点，复用 [`classify_child_exit`] 的既有判据，同时封死这条
 /// stale-snapshot 窗口。
+/// helper `status` 回传的 `created=` → 身份令牌（纯函数）。
+///
+/// 只做「u64 → 可比较的令牌」这一步，判定复用 [`pid_identity_verdict`] 的三态口径（缺任一侧材料
+/// 判 `Unobservable`，不折成 `Mismatch`）。旧 helper 不回传 ⇒ `None` ⇒ 令牌缺失 ⇒ 不可观测。
+pub(super) fn helper_identity_token(created: Option<u64>) -> Option<String> {
+    created.map(|ticks| ticks.to_string())
+}
+
 pub(super) fn classify_observed_child_exit(
     gate: &LifecycleGate,
     my_generation: u64,
@@ -60,6 +68,20 @@ impl ProxyRuntime {
         tokio::spawn(async move {
             // helper 腿的 pid 身份基线：`(基线取自哪个 pid, 令牌)`。见 [`process_identity`]。
             let mut identity: Option<(u32, String)> = None;
+            // **helper 回传的**身份基线（D3）。与上面那个分开存：两者取材不同源（本地
+            // `process_identity` vs helper `status` 的 `created=`），混用会在同一进程上判出假不匹配。
+            //
+            // **初值取自 start 响应**（D2/D3(4)「start 拿初值 + status 复核」按字面成立）：等第一次
+            // status 再取初值会漏掉一格 —— 核在首次 status 之前自然死亡、期间另一方发 start 使旧句柄
+            // 被替换关闭 ⇒ 旧 PID 重新可复用 ⇒ 那次 status 读到的已是另一个进程，拿它当基线后续恒
+            // `Match`。理由全文见 [`HelperRuntime::managed_start_identity`]。拿不到（旧 helper /
+            // 非 Windows）⇒ `None`，退回「首次 status 取初值」的原有口径，不误报。
+            let mut helper_identity: Option<(u32, String)> = me
+                .helper
+                .managed_start_identity()
+                .and_then(|(pid, created)| {
+                    helper_identity_token(Some(created)).map(|token| (pid, token))
+                });
             let mut identity_unobservable_logged = false;
             let mut ticks: u64 = 0;
             loop {
@@ -120,10 +142,35 @@ impl ProxyRuntime {
                                         Ok(Ok(ManagedCoreStatus::Stopped)) => {
                                             ChildObservation::Exited
                                         }
-                                        Ok(Ok(ManagedCoreStatus::Running { pid })) if pid == p => {
-                                            ChildObservation::Alive
+                                        Ok(Ok(ManagedCoreStatus::Running {
+                                            pid, created, ..
+                                        })) if pid == p => {
+                                            // D3：pid 相同还不够——号码可能已被复用。helper 持着受管
+                                            // 核的进程句柄，它回传的创建时间跨 tick 恒定；变了就是
+                                            // 「这个号码上换了进程」。旧 helper 不回传 ⇒ 令牌 None ⇒
+                                            // 判 Unobservable ⇒ 维持原有探活口径，绝不误报崩溃。
+                                            let token = helper_identity_token(created);
+                                            let verdict = pid_identity_verdict(
+                                                helper_identity
+                                                    .as_ref()
+                                                    .filter(|(base_pid, _)| *base_pid == p)
+                                                    .map(|(_, t)| t.as_str()),
+                                                token.as_deref(),
+                                            );
+                                            if let Some(token) = token {
+                                                helper_identity = Some((p, token));
+                                            }
+                                            if verdict == PidIdentity::Mismatch {
+                                                log::warn!(
+                                                    "崩溃监测：helper 报告 pid={p} 的进程创建时间已变 ⇒ \
+                                                     受管核实际已退出、该号码被系统复用"
+                                                );
+                                                ChildObservation::Exited
+                                            } else {
+                                                ChildObservation::Alive
+                                            }
                                         }
-                                        Ok(Ok(ManagedCoreStatus::Running { pid })) => {
+                                        Ok(Ok(ManagedCoreStatus::Running { pid, .. })) => {
                                             log::warn!(
                                                 "崩溃监测：app 记账 pid={p}，helper 受管 pid={pid} ⇒ \
                                                  当前世代的核身份已失配"

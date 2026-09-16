@@ -19,7 +19,10 @@ import { revealElement } from '@/components/reveal';
 import { TextInput, Button } from './Primitives';
 
 export interface ListEditorProps {
-  value: string[];
+  /** 只读入参：本组件从不就地改它（内部草稿是独立 state），且调用方多为
+   *  `domain/effective-config` 注入读出的冻结清单。放宽成 `readonly` 是向后兼容的：
+   *  可变数组照样可传。 */
+  value: readonly string[];
   onChange: (next: string[]) => void;
   placeholder?: string;
   ariaLabel?: string;

@@ -106,12 +106,26 @@ export function invalidControlUrl(draft: FormValues): ControlUrlReject | null {
  *
  * `base` = 该节点现有的 `tailscaleSettings`，用于**保全未建模字段**（如 `authKey`——它由
  * `TsLoginDialog` 写入，本弹窗只能原样带过，绝不能覆写掉）。
+ *
+ * # `clearAuthKey`：保全的**唯一例外**，且必须是显式入参
+ *
+ * 「清除已存 Auth Key」要删的正是上面那条保全规则护着的键，于是它**只能**从这里表达 ——
+ * 在别处先写一次 `delete node.tailscaleSettings.authKey` 再调本函数是错的：用户接着改任何一项
+ * TS 设置都会再走一次本函数，而那时 `base`（取自 store 里该节点的现值）只要还带着 key，
+ * 它就会被 `{...base}` **原样带回来**，清除等于没发生。判据同源，回流才不可能。
+ *
+ * 缺省 `false` 而不是必传：调用点只有一个，改成必传只会让既有调用与单测被迫写一堆 `false` 噪声；
+ * 而「忘了传」在这里是安全侧失效（保全，等于旧行为），不是静默清除凭据。
  */
 export function buildTsSettings(
   base: TailscaleSettings | undefined,
-  draft: FormValues
+  draft: FormValues,
+  clearAuthKey = false
 ): TailscaleSettings {
   const next: TailscaleSettings = { ...(base ?? {}) };
+  // 删键而不是写空串：空串同样会被 `hasTsAuthKey` 判成「没有」，但它会在磁盘上留下一个
+  // `"authKey": ""`——日后任何一次「这个键在不在」的判断都得多带一层空串语义。
+  if (clearAuthKey) delete next.authKey;
   next.hostname = str(draft.hostname).trim() || undefined;
   const exit =
     draft.exitNode === EXIT_CUSTOM ? str(draft.exitNodeCustom).trim() : str(draft.exitNode);

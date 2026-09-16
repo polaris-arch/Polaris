@@ -87,8 +87,14 @@ fn status_roundtrip_parses_running() {
     let (client, _) = client_with(vec![mock]);
     let resp = client.send(&Request::Status).unwrap();
     match resp {
-        Response::Ok(ResponseKind::Status(Status::Running { pid })) => {
+        Response::Ok(ResponseKind::Status(Status::Running {
+            pid,
+            created,
+            image,
+        })) => {
             assert_eq!(pid, 4242);
+            // 旧 wire（无身份 token）→ 两个可选字段都 None。
+            assert_eq!((created, image), (None, None));
         }
         other => panic!("expected Status Running, got {other:?}"),
     }

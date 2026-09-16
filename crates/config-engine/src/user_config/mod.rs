@@ -13,6 +13,7 @@ pub mod dns_config;
 pub mod dns_constants;
 pub mod dns_policy;
 pub mod dns_spec;
+pub mod effective_view;
 pub mod fakeip_filter;
 pub mod ip;
 pub mod log_level;
@@ -32,7 +33,6 @@ pub mod server_config;
 pub mod system_proxy_bypass;
 pub mod tls_spoof;
 pub mod tun_config;
-pub mod tun_stack;
 
 pub use app_config::UserConfig;
 
@@ -81,4 +81,3 @@ pub use rule_validate::{
 };
 pub use rules::{is_valid_port_value, parse_port_values, rule_conditions, rule_ip_cidrs};
 pub use tls_spoof::{validate_tls_spoof_default, TLS_SPOOF_METHODS};
-pub use tun_stack::{resolve_tun_stack, ConcreteTunStack, TunStack};

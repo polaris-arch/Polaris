@@ -33,11 +33,15 @@
 //!
 //! - 本门**不**验默认值本身是什么 —— 二进制里读不到（Go 符号表被剥，`go tool nm` 报
 //!   `no symbol section`）。它只保证「依赖没换过」，换了就把人拦下来。
-//! - 只读**当前打包目标对应的那一个**二进制。package matrix 显式传入目标标签；特别是
-//!   macos-x64 虽在 arm64 runner 交叉构建，也只读 x64 核。三平台同一 release 的依赖版本应一致，
-//!   真出现不一致，那本身就是该红的事。
-//! - 缺核时跳过，`POLARIS_REQUIRE_KERNEL_GATE=1` 时缺核直接红（与 `kernel_accepts_outbounds`
-//!   同一套接线，打包腿强制生效，`ci_step_still_wired` 守着）。
+//! - 覆盖面 = **盘上 present 的每一份核**（linux / win / mac-arm64 / mac-x64），逐份比对 modinfo
+//!   版本串，失败信息点明是哪个平台那一格。平台名单不写在本文件里，从
+//!   `support/core_locator.rs` 的 `CORE_MATRIX` 派生 —— 与 `core_build_matrix` 同一个枚举。
+//!   🔴 2026-09-16 前本门只读**当前构建目标那一份**（走 `core_or_skip`），而文档里写的是
+//!   「四份一致」：那句「一致」是历次升核时人工核的，不是门在查。实测过这道缝 ——
+//!   只重拉了 linux 核就改 `SING_TUN_PINNED`，盘上另外三份仍是旧版旧 pin，本门照样绿。
+//! - 盘上缺哪个平台就少看哪个平台（打 warn，`eprintln!` 同样归 libtest 捕获）；一份都没有时跳过，
+//!   `POLARIS_REQUIRE_KERNEL_GATE=1` 时缺一即红（与 `core_build_matrix` 共用
+//!   `require_all_present`，打包腿强制生效，`ci_step_still_wired` 守着）。
 //! - 🔴 **「跳过」是静默的**：下面那句 `eprintln!` 归 libtest 捕获，**只在测试失败时才回放**。
 //!   实测本门首跑的 CI ubuntu 腿（不拉核）日志里只有 `bundled_core_still_uses_the_pinned_sing_tun
 //!   ... ok`，提示语零命中 ⇒ **那条绿只说明「编得过 + 提取器单测过」，没有比对过任何版本串**。
@@ -46,7 +50,10 @@
 #[path = "support/core_locator.rs"]
 mod core_locator;
 
-use core_locator::{core_or_skip, repo_root};
+use core_locator::{present_cores, repo_root, require_all_present};
+
+/// 缺核信息里用来说明「是哪道门没跑全」的名字。
+const GATE_NAME: &str = "依赖指纹门未完整执行";
 
 /// 随包核当前使用的 `sing-tun` 版本。
 ///
@@ -81,7 +88,51 @@ use core_locator::{core_or_skip, repo_root};
 //   gh api 'repos/SagerNet/sing-tun/git/trees/<tag>?recursive=1' \
 //     --jq '.tree[]|select(.type=="blob")|"\(.sha) \(.path)"'
 // 前提未变，故只更新 pin，不改机制。
-const SING_TUN_PINNED: &str = "v0.9.0-beta.4";
+//
+// 2026-09-08 随随包核 1.14.0 → **1.15.0-alpha.2** 复核。sing-tun 从 `v0.9.0-beta.4` 跳到
+// `v0.9.1-0.20260902150540-98e457e39c90`（1.15.0-alpha.2 的 go.mod:58）。逐条按本常量文档的指引核对：
+//   ① 直读新版函数体：`tun.go:128-133` 仍是 `if o.DNSMode == "" { return DNSModeHijack }`，
+//      枚举 `DNSModeHijack = "hijack"`（tun.go:64-66）未变；
+//   ② 全仓对差兜底（防「默认值没动但别处把它绕过去了」）：beta.4 → 该 commit 共 21 个文件变动，
+//      其中 `tun.go` 只改了 **1 行**且与 DNS/路由模式无关；提到 `DNSMode` 的新增行仅
+//      `redirect_iptables.go` 一处 `dnsHijack := options.DNSModeOrDefault() == DNSModeHijack`
+//      —— 那是 Linux redirect/auto_redirect 路径（本仓不开启），是**读取**该默认而非改动它。
+//   ③ 顺带确认 `StrictRoute` 的消费面仍只有 `tun.go`(声明) / `tun_linux.go` / `tun_windows.go` /
+//      `redirect_iptables.go` / `redirect_nftables_rules.go`，**`tun_darwin.go` 一次都没有**
+//      ⇒ macOS 上 `strict_route` 仍是 no-op（这条是 UI 侧「mac 禁用该开关」的判据来源）。
+// 前提未变，故只更新 pin，不改机制。
+//
+// 2026-09-13 随随包核 1.15.0-alpha.2 → **1.15.0-alpha.3** 复核。sing-tun 从
+// `v0.9.1-0.20260902150540-98e457e39c90` 跳到 `v0.9.4-0.20260912075549-869f0a4d76af`
+// （alpha.3 的 go.mod:58；盘上四份二进制 linux / win / mac-arm64 / mac-x64 的 modinfo 版本串一致）。
+// 取两版 proxy.golang.org 模块 zip 逐条核对：
+//   ① 直读新版函数体：`tun.go:133-138` 仍是 `if o.DNSMode == "" { return DNSModeHijack }`，
+//      枚举 `DNSModeHijack = "hijack"`（tun.go:64-66）未变；`tun.go` 本身只多了 `MultiQueue` 字段
+//      与两段 darwin 注释改写，与 DNS/路由模式无关；
+//   ② 全仓对差兜底：31 个文件改动 + 39 个新增条目（主体是新 go 栈 `stack_go*.go` 及其测试）、0 删除。
+//      抹掉行号后，非测试 `.go` 里提到 `DNSMode` 的**行集合两版逐字相同**（tun.go / tun_linux.go /
+//      tun_windows.go / redirect_iptables.go / redirect_nftables_rules.go /
+//      redirect_route_bypass_android.go）；新增的 `stack_go*.go` 零引用 ⇒ 默认值与消费面都没被绕开。
+//      这也说明 DNS 模式与「用哪个栈」无关 —— 本轮 Polaris 不再下发 `stack`（改走上游新 go 栈）不改变本门前提；
+//   ③ `StrictRoute` 的消费面仍是 `tun.go`(声明) / `tun_linux.go` / `tun_windows.go` /
+//      `redirect_iptables.go` / `redirect_nftables_rules.go`，`tun_darwin.go` 仍零引用。
+// 前提未变，故只更新 pin，不改机制。
+//
+// 2026-09-16 随随包核 1.15.0-alpha.3 → **1.15.0-alpha.4** 复核。sing-tun 从
+// `v0.9.4-0.20260912075549-869f0a4d76af` 跳到 `v0.9.4-0.20260914145202-3a0d3878577a`
+// （alpha.4 的 go.mod:58）。逐条按本常量文档的指引核对：
+//   ① 默认值直读：`tun.go:133-138` 的 `DNSModeOrDefault()` 仍是 `if o.DNSMode == "" { return DNSModeHijack }`
+//      （`gh api -H 'Accept: application/vnd.github.raw' 'repos/SagerNet/sing-tun/contents/tun.go?ref=3a0d3878577a'`）；
+//   ② 全仓对差兜底：**1 个 commit、40 个文件**，改动面全部在新 go 栈（`stack_go*.go`，主体是新增
+//      `stack_go_tcp_{ack,bbr,cong,cubic,rate}.go` 共约 2900 行拥塞控制）与 Windows 内部实现
+//      （`internal/afd/*`、`internal/wintun/session_windows.go`、`tun_windows.go`）加
+//      `gtcpip/header/checksum.go`、`stack.go`。**`tun.go` 不在改动清单里** ⇒ DNSMode 的声明与默认值
+//      一行没动；`tun_windows.go` 的 patch 里 grep `DNSMode|StrictRoute` **零命中** ⇒ 两个符号的消费面
+//      在本次唯一被改到的平台文件里也没变；
+//   ③ `StrictRoute` 的消费面（`tun.go` 声明 / `tun_linux.go` / `redirect_iptables.go` /
+//      `redirect_nftables_rules.go`）本轮全部未被改动，`tun_darwin.go` 仍零引用。
+// 前提未变，故只更新 pin，不改机制。
+const SING_TUN_PINNED: &str = "v0.9.4-0.20260914145202-3a0d3878577a";
 
 /// 被钉的依赖模块路径。
 const SING_TUN_MODULE: &str = "github.com/sagernet/sing-tun";
@@ -107,31 +158,48 @@ fn extract_dep_version(bin: &[u8], module: &str) -> Option<String> {
 
 #[test]
 fn bundled_core_still_uses_the_pinned_sing_tun() {
-    let Some(core) = core_or_skip("依赖指纹门") else {
+    let present = present_cores();
+    let complete = require_all_present(&present, GATE_NAME);
+    if present.is_empty() {
+        eprintln!(
+            "⚠ 跳过依赖指纹门：盘上一份随包核都没有（`.gitignore` 的 /resources/*）。\
+             跑 `node scripts/fetch-core.mjs` 后本门自动生效；\
+             打包腿带 POLARIS_REQUIRE_KERNEL_GATE=1 强制生效。"
+        );
         return;
-    };
+    }
+    if !complete {
+        eprintln!("⚠ 依赖指纹门只看到部分平台，未覆盖的平台本轮没有被检查。");
+    }
 
-    let bytes = std::fs::read(&core).unwrap_or_else(|e| panic!("读不到 {}: {e}", core.display()));
+    for (core, path) in &present {
+        let bytes =
+            std::fs::read(path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
 
-    // 提不出来 = 本门失效（Go 换了 modinfo 编码 / 核被 strip 得更狠 / 拿到的不是 Go 二进制）。
-    // 这种情况必须**红**而不是跳过 —— 否则本门会从「守着依赖」静静退化成「永远绿」。
-    let actual = extract_dep_version(&bytes, SING_TUN_MODULE).unwrap_or_else(|| {
-        panic!(
-            "在 {} 里找不到 `{SING_TUN_MODULE}` 的 modinfo 条目 —— \
-             本门已失效（不是「依赖没变」），先修门再谈结论",
-            core.display()
-        )
-    });
+        // 提不出来 = 本门失效（Go 换了 modinfo 编码 / 核被 strip 得更狠 / 拿到的不是 Go 二进制）。
+        // 这种情况必须**红**而不是跳过 —— 否则本门会从「守着依赖」静静退化成「永远绿」。
+        let actual = extract_dep_version(&bytes, SING_TUN_MODULE).unwrap_or_else(|| {
+            panic!(
+                "在 {} 里找不到 `{SING_TUN_MODULE}` 的 modinfo 条目 —— \
+                 本门已失效（不是「依赖没变」），先修门再谈结论",
+                path.display()
+            )
+        });
 
-    assert_eq!(
-        actual, SING_TUN_PINNED,
-        "\n随包核的 sing-tun 版本变了：{SING_TUN_PINNED} → {actual}\n\
-         本仓的 DNS 截获依赖 sing-tun 的 `DNSModeOrDefault()` 默认值为 `hijack`\
-         （tun inbound 刻意不下发 `dns_mode`）。默认值一变，生成的配置一字节不动、\
-         `sing-box check` 照样 rc=0，而用户侧表现是「能上网但分流失效」。\n\
-         ⇒ 先读新版 `tun.go` 的 `DNSModeOrDefault()` 确认默认仍是 `DNSModeHijack`，\
-         再更新 core_dep_fingerprint.rs 的 SING_TUN_PINNED。取源码路径见该常量的文档注释。\n"
-    );
+        assert_eq!(
+            actual, SING_TUN_PINNED,
+            "\n随包核 **{}**（{}）的 sing-tun 版本变了：{SING_TUN_PINNED} → {actual}\n\
+             ⚠ 只有这一格不符时，其余平台那几份仍是 pin 住的版本 —— 那更可能是\
+             「升核只重拉了部分平台」，而不是上游换了依赖：先看 `node scripts/fetch-core.mjs`\
+             是不是漏了 `--platform`（不传该 flag = 全平台）。\n\
+             本仓的 DNS 截获依赖 sing-tun 的 `DNSModeOrDefault()` 默认值为 `hijack`\
+             （tun inbound 刻意不下发 `dns_mode`）。默认值一变，生成的配置一字节不动、\
+             `sing-box check` 照样 rc=0，而用户侧表现是「能上网但分流失效」。\n\
+             ⇒ 先读新版 `tun.go` 的 `DNSModeOrDefault()` 确认默认仍是 `DNSModeHijack`，\
+             再更新 core_dep_fingerprint.rs 的 SING_TUN_PINNED。取源码路径见该常量的文档注释。\n",
+            core.key, core.rel
+        );
+    }
 }
 
 /// 正向对照：证明提取器真的会「提不到」和「提错不了」，否则上面那条断言可能只是碰巧绿。

@@ -113,9 +113,14 @@ fn test_config() -> MacConfig {
 
 fn assert_started_timed(resp: Response, want_pid: u32) {
     match resp {
-        Response::Ok(ResponseKind::Start(StartResp::StartedTimed { pid, timing })) => {
+        Response::Ok(ResponseKind::Start(StartResp::StartedTimed {
+            pid,
+            timing,
+            created,
+        })) => {
             assert_eq!(pid, want_pid);
             assert_eq!(timing.job_ms, 0, "macOS 没有 Windows Job Object");
+            assert_eq!(created, None, "身份 token 仅 Windows 回传");
         }
         other => panic!("预期带计时的 started，实得 {other:?}"),
     }
@@ -266,7 +271,14 @@ fn status_running_after_start() {
     let _ = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
     let resp = dispatch(&svc, &cfg, "t", &Request::Status);
     match resp {
-        Response::Ok(ResponseKind::Status(Status::Running { pid })) => assert_eq!(pid, 5555),
+        Response::Ok(ResponseKind::Status(Status::Running {
+            pid,
+            created,
+            image,
+        })) => {
+            assert_eq!(pid, 5555);
+            assert_eq!((created, image), (None, None), "身份 token 仅 Windows 回传");
+        }
         other => panic!("{other:?}"),
     }
 }

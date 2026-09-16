@@ -65,7 +65,7 @@ fn validate_accepts_minimal_config() {
         "proxyModeType": "systemProxy",
         "logLevel": "info",
         "mixedPort": 7890,
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     });
     assert!(validate_config(&mut v).is_ok());
 }
@@ -76,7 +76,7 @@ fn validate_rejects_bad_proxy_mode() {
         "proxyMode": "invalid",
         "proxyModeType": "tun",
         "logLevel": "info",
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     });
     assert!(matches!(
         validate_config(&mut v),
@@ -92,7 +92,7 @@ fn control_port_defaults_to_9090_when_missing() {
         "proxyModeType": "systemProxy",
         "logLevel": "info",
         "mixedPort": 7890,
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     });
     validate_config(&mut v).unwrap();
     assert_eq!(v["controlPort"], serde_json::json!(9090));
@@ -107,7 +107,7 @@ fn control_port_collision_with_mixed_reassigns() {
         "logLevel": "info",
         "mixedPort": 7890,
         "controlPort": 7890,
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     });
     validate_config(&mut v).unwrap();
     assert_eq!(v["controlPort"], serde_json::json!(9090));
@@ -123,7 +123,7 @@ fn control_port_collision_at_9090_reassigns_to_9091() {
         "logLevel": "info",
         "mixedPort": 9090,
         "controlPort": 9090,
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     });
     validate_config(&mut v).unwrap();
     assert_eq!(v["controlPort"], serde_json::json!(9091));
@@ -139,7 +139,7 @@ fn control_port_non_colliding_preserved() {
         "logLevel": "info",
         "mixedPort": 8080,
         "controlPort": 9091,
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     });
     validate_config(&mut v).unwrap();
     assert_eq!(v["controlPort"], serde_json::json!(9091));
@@ -151,7 +151,40 @@ fn validate_rejects_bad_mtu() {
         "proxyMode": "direct",
         "proxyModeType": "manual",
         "logLevel": "info",
-        "tunConfig": {"mtu": 100, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 100, "autoRoute": true, "strictRoute": true}
     });
     assert!(validate_config(&mut v).is_err());
+}
+
+/// 🔴 TUN stack 随上游弃用移除后，`validate_config` **不得**再拒收任何遗留 `stack` 值。
+///
+/// 这条卡的是 save 路径：`ConfigStore::save` / `canonicalize_for_save` 只跑 sanitize + validate、不跑迁移链，
+/// 而备份导入正走这条（`backup_import_save_core` 先存、再 `load_full` 触发迁移）。若 validate 还拒收，
+/// 一份带 `"stack":"system"`（旧版合法值）或手改坏的 `"stack":"bogus"` 的旧备份会整份导入失败。
+/// 牙：恢复旧的 `TUN_STACK_VALUES` 校验 → 非法值与非字符串两格转红。
+#[test]
+fn validate_ignores_legacy_tun_stack_of_any_value() {
+    for legacy in [
+        serde_json::json!("auto"),
+        serde_json::json!("system"),
+        serde_json::json!("gvisor"),
+        serde_json::json!("mixed"),
+        serde_json::json!("go"),
+        serde_json::json!("bogus"),
+        serde_json::json!(""),
+        serde_json::json!(42),
+        serde_json::Value::Null,
+    ] {
+        let mut v = serde_json::json!({
+            "proxyMode": "smart",
+            "proxyModeType": "tun",
+            "logLevel": "info",
+            "mixedPort": 7890,
+            "tunConfig": {"stack": legacy.clone(), "autoRoute": true, "strictRoute": true}
+        });
+        assert!(
+            validate_config(&mut v).is_ok(),
+            "遗留 tunConfig.stack={legacy} 不得导致校验失败"
+        );
+    }
 }

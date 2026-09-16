@@ -92,6 +92,9 @@ pub fn build_wireguard_endpoint(
         tag: tag.to_string(),
         domain_resolver: None,
         detour: detour_tag.map(String::from),
+        // 线格式占位：按需连接的**策略**由 `builder::outbounds::apply_on_demand` 在 push 前统一注入，
+        // 不在各 endpoint 构造器里各读一次 `server.on_demand`（四条腿各读一次 = 四个可遗漏点）。
+        on_demand: None,
         extra: serde_json::Map::new(),
         system: None,
         mtu: None,
@@ -182,6 +185,9 @@ pub fn build_tailscale_endpoint(
         tag: tag.to_string(),
         domain_resolver: None,
         detour: detour_tag.map(String::from),
+        // 线格式占位：按需连接的**策略**由 `builder::outbounds::apply_on_demand` 在 push 前统一注入，
+        // 不在各 endpoint 构造器里各读一次 `server.on_demand`（四条腿各读一次 = 四个可遗漏点）。
+        on_demand: None,
         extra: serde_json::Map::new(),
         system: None,
         mtu: None,

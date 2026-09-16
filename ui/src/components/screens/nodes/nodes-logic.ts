@@ -15,17 +15,15 @@
  */
 
 import type { ServerConfig, SubscriptionConfig, InvalidNodeInfo } from '@/contracts/types';
+import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
 import { latencyMapWhen } from '@/store/use-latency-store';
 import {
   isMeshNode,
   isSpeedTestable,
   meshAllowsInternet,
   meshUsesSystemInterface,
-  meshForceRoutedServers,
-  meshShadowedCidrs,
   speedTestableIds,
   type SpeedTestCaps,
-  type ShadowedCidr,
 } from '@/domain/endpoint-routes';
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -341,40 +339,48 @@ export function nodeUseAction(
  * ──────────────────────────────────────────────────────────────────────────── */
 
 /**
- * 组网同网段「被覆盖（shadowed）」角标（契约·节点角标一节）。
+ * 「被覆盖」角标的**成品**（抢占者 id 已解析成显示名），按节点 id 索引。
  *
- * 一条 ip_cidr 只能指向一个 outbound，route-builder 按 servers 顺序「首声明者占有」——排在后面
- * 的同段**静默失效**：用户看到两个节点都配了 10.0.0.0/24，却只有一个真的在路由，界面此前不给任何提示。
+ * # 真值源是后端**本次实际结算**，渲染端不再自己算一份
  *
- * 口径必须与发射端一致（`meshForceRoutedServers` 的 JSDoc 明写本角标与它共用）：只有本轮真会发射
- * force-route 的节点才参与占有/被占判定，否则会对「仅出网且未 engaged」的节点虚报覆盖。
- * `ruleTargetedServerIds` 用 config 原始规则，属该 JSDoc 已登记的 advisory 近似（不在 UI 复刻 backend 的 mode-gate）。
- * 用全量 `servers`（非当前 tab）：订阅里的 endpoint 节点同样参与占有，只看本 tab 会算错归属。
- */
-export function shadowedCidrIndex(
-  servers: readonly ServerConfig[],
-  selectedServerId: string | null | undefined,
-  ruleTargetedServerIds: ReadonlySet<string>,
-): Map<string, ShadowedCidr[]> {
-  return meshShadowedCidrs(meshForceRoutedServers([...servers], selectedServerId, ruleTargetedServerIds));
-}
-
-/**
- * 「被覆盖」角标的**成品**（byId 已解析成显示名），按节点 id 索引。
+ * 角标此前走渲染端重算（`meshShadowedCidrs(meshForceRoutedServers(...))`），而那份重算的段来自
+ * `endpointForcedRouteCidrs` —— 对 Tailscale **恒**产出 `TAILNET_CGNAT` + `TAILNET_ULA_V6`
+ * 两条硬编码常量。于是**任意两个 Tailscale 节点的段必然完全重合**，第二个恒亮角标，
+ * 与它们的 tailnet 是否真的相交无关。那是假告警：自建 headscale 的 `prefixes.v4` 可自定义，
+ * 实测发到 `32.0.0.28`，与官方 CGNAT 段零相交。
  *
- * 为什么要 memo 到这一步、而不是在 `.map()` 里就地 `?.map(...)`：那样每次父层渲染都会给
- * 每个有冲突的节点造一个新数组 ⇒ `shadowedCidrs` 这个 prop 每次都判不等 ⇒ 这些卡的 `memo`
- * 恒失效。冲突节点少，但「少数卡片永远不 bail-out」正是最难被发现的那种回归。
+ * 真实前缀只存在于**运行期观测地址**里，渲染端拿不到这个维度 —— 判据因此搬到有真值的那一端：
+ * `endpoint_force_route_report` 命令按块 0c 的同一套腿选择 + 同一次结算给出逐节点 `absorbed`
+ * （含抢占者 id）。本函数只做「id → 显示名」这一步转译，不做任何判定。
+ *
+ * # 拿不到报告 ⇒ 一个角标都不画
+ *
+ * `report === null`（还没返回 / 命令失败）返回空表。**不退回本地重算兜底** —— 那就是本函数要
+ * 终结的那个形态本身；「没有真值」与「没有冲突」在界面上必须区分，而节点卡表达「没有冲突」的
+ * 方式就是不画角标、也不画任何「无冲突」字样。
+ *
+ * # 为什么要 memo 到「成品」这一步
+ *
+ * 不是在 `.map()` 里就地 `?.map(...)`：那样每次父层渲染都会给每个有冲突的节点造一个新数组 ⇒
+ * `shadowedCidrs` 这个 prop 每次都判不等 ⇒ 这些卡的 `memo` 恒失效。冲突节点少，但
+ * 「少数卡片永远不 bail-out」正是最难被发现的那种回归。
+ *
+ * 口径与设置页的「组网网段结算」块（`settings/EndpointForceRouteBlock`）同源：两者读的是同一条
+ * 命令的同一个 `absorbed`，故不可能一个说被覆盖、另一个说没有。
  */
 export function shadowedCidrNamed(
-  shadowedIndex: ReadonlyMap<string, ShadowedCidr[]>,
+  report: EndpointForceRouteReport | null,
   serverNameById: ReadonlyMap<string, string>,
 ): Map<string, { cidr: string; by: string }[]> {
   const named = new Map<string, { cidr: string; by: string }[]>();
-  for (const [id, list] of shadowedIndex) {
+  if (report === null) return named;
+  for (const s of report.servers) {
+    if (s.absorbed.length === 0) continue;
     named.set(
-      id,
-      list.map((s) => ({ cidr: s.cidr, by: serverNameById.get(s.byId) ?? s.byId }))
+      s.serverId,
+      // 名字查不到就照原样显示 id：这不是兜底默认值，是「这个 id 在当前节点表里已经没有对应
+      // 节点」这件事的如实呈现（报告可能比列表旧一帧）。换成空串会让 tooltip 说「被 "" 覆盖」。
+      s.absorbed.map((a) => ({ cidr: a.cidr, by: serverNameById.get(a.byServerId) ?? a.byServerId })),
     );
   }
   return named;

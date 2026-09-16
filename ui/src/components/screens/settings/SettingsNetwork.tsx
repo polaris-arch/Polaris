@@ -16,6 +16,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { UserConfig } from '@/contracts/types';
+import { injectedList } from '@/domain/effective-config';
 import { appApi, proxyApi } from '@/ipc/api-client';
 import { toast } from '@/lib/error-handler';
 import { Fold } from '@/components/Fold';
@@ -53,7 +54,6 @@ export interface SettingsNetworkProps {
 
 type WebRTC = 'off' | 'proxy' | 'block';
 
-const DEFAULT_BYPASS_LAN_LIST = ['localhost', '127.0.0.1', '192.168.0.0/16'];
 
 /**
  * 测速端点是否合法 —— 与后端 `src-tauri/src/icon_cache.rs::is_http_url` 逐字同口径
@@ -135,7 +135,10 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
   // 复制出去的命令端口错」（见 settings-logic.ts::localProxyPort 注释）。
   const mixedPort = localProxyPort(config);
   const controlPort = controlApiPort(config);
-  const bypassList = config.bypassLANList ?? DEFAULT_BYPASS_LAN_LIST;
+  // 生效清单由 `config:get` 边界注入（27 条 `DEFAULT_BYPASS_LAN`，Rust 单一真值源）。
+  // 此处此前有一份三条的前端兜底常量 —— 与内核默认分叉，且本屏同样有 ListEditor 回写，
+  // 逐字符 onChange 会把那三条当用户清单持久化。见 domain/effective-config 模块头。
+  const bypassList = injectedList(config.bypassLANList, 'bypassLANList');
   const platform = shellPlatformFromDataOs();
   const envSplit = splitTerminalEnvByPlatform(platform, mixedPort);
   // 直接从持久化配置派生：已启用时详情行随之展开，不再因 useState(false) 硬编码而失同步

@@ -113,6 +113,12 @@ pub struct Endpoint {
     /// 「CWD 是什么」，本字段治的是「不依赖 CWD」—— 只做前者，将来任何新的相对路径默认值仍会跟着漂。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub taildrop_directory: Option<String>,
+    /// 按需连接（1.15 新增，四种 endpoint 共用一个键）。
+    ///
+    /// 语义与「为什么默认不发射」见 [`crate::user_config::server_config::ServerConfig::on_demand`]
+    /// —— 判据留在用户配置那一侧一份，此处只是线格式。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_demand: Option<bool>,
     /// **custom（isEndpoint）逃生舱的原样透传载荷**（WG / Tailscale 两条腿一律留空 ⇒ 不产生任何键）。
     ///
     /// 语义、理由与代价见 [`crate::singbox::Outbound::extra`]；endpoint 侧此前的形态**更坏**：

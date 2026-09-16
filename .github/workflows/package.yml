@@ -538,8 +538,9 @@ jobs:
 
       # 构建面矩阵门：四份随包核的 GOOS/GOARCH/CGO_ENABLED + build tag 集一起钉住。
       #
-      # 与上两步的差别在**覆盖面**：那两道读的都是「当前打包目标」的二进制，于是
-      # 「mac 那份核这一版没编 with_tailscale」在 Linux 开发机与 ubuntu 腿上结构性看不见 ——
+      # 与上两步的差别在**判据**（覆盖面已经拉平：依赖指纹门 2026-09-16 起与本步共用
+      # support/core_locator.rs 的 CORE_MATRIX 逐平台读；schema 面门仍只读「当前打包目标」那一份）。
+      # 判据这一格若只看本机：「mac 那份核这一版没编 with_tailscale」在 Linux 开发机与 ubuntu 腿上结构性看不见 ——
       # 配置一字节不变、本机 check 照样 rc=0，直到 mac 用户点开一个 Tailscale 节点。
       # 本步判据是纯字节扫描 Go buildinfo（不需要 Go 工具链，Rust 腿上也没有），
       # 故在任意宿主上都能把四个平台一起看一遍；上一步的 fetch 不传 --platform = 全平台，

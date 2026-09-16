@@ -485,6 +485,8 @@ fn handle_start<P, S, D, SD>(
                     log_handoff_ms: started.log_handoff_ms,
                     total_ms: crate::elapsed_ms(total_started),
                 },
+                // 身份令牌是 Windows 专属（Q6：mac/linux 的 running_exe_path 本就可观测）。
+                created: None,
             }));
             let _ = conn.write_line(&response.to_wire_line());
         }

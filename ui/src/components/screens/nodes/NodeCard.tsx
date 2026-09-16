@@ -28,8 +28,10 @@ import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ServerConfig } from '@/contracts/types';
 import { useLatencyStore } from '@/store/use-latency-store';
+import { useAppStore } from '@/store/app-store';
 import { latLevel } from '@/components/screens/shared/format';
-import { isMeshNode } from '@/domain/endpoint-routes';
+import { isMeshNode, isAccountBasedProtocol } from '@/domain/endpoint-routes';
+import { tsAccountLabel } from '@/domain/tailscale-conn-state';
 import { invalidNodeReasonText } from '@/domain/invalid-node-reason';
 import { useHoverCard, HoverCardPanel } from '@/components/hover-cards/HoverCard';
 import { MeshInfoHoverCardContent } from '@/components/hover-cards/MeshInfoHoverCard';
@@ -104,9 +106,13 @@ export interface NodeCardProps {
   /** 不可测时的原因说明（已本地化）：置灰不给理由等于没说话，用户只会反复点。 */
   speedTestBlockedHint?: string;
   /**
-   * 本节点中**被更早组网节点抢占**、因而不会实际生效的网段（`meshShadowedCidrs`，已把抢占者 id 解析成显示名）。
-   * 空/未传 = 无冲突。一条 ip_cidr 只能指向一个 outbound，后来者静默失效——不显式标出来，
-   * 用户会以为两个节点都在路由这段。
+   * 本节点中**被更早组网节点抢占**、因而不会实际生效的网段（抢占者 id 已解析成显示名）。
+   * 一条 ip_cidr 只能指向一个 outbound，后来者静默失效——不显式标出来，用户会以为两个节点都在路由这段。
+   *
+   * 真值源是后端**本次实际结算**（`endpoint_force_route_report` → `nodes-logic.shadowedCidrNamed`），
+   * 不是渲染端重算。故「未传」的含义是**报告还没到 / 读不到**，与「报告说没冲突」在这一层已经
+   * 合流成同一件事：两种情形都不画角标，卡片也不画任何「无冲突」字样 —— 节点卡没有表达
+   * 「我确认过没问题」的位置，那句话的归宿是设置页的「组网网段结算」块。
    */
   shadowedCidrs?: { cidr: string; by: string }[];
   /** 选中态（多选批选）。 */
@@ -200,6 +206,15 @@ function NodeCardView({
   /* 只订**本节点**那一格（原始值 ⇒ `Object.is` 判等天然稳定）。别改回 `(s) => s.latencyMap`：
      那样每次回包全部卡片的选择器都判不等，逐节点回包会退化成整表重渲（见文件头注）。 */
   const latencyMs = useLatencyStore((s) => s.latencyMap[server.id]);
+  /* 账号标识（登录名 + tailnet/MagicDNS 后缀）：同为已登录，多个 Tailscale 账号时无法只凭卡面
+     现有登录态分清是哪一个。真值取自 STATUS 末帧（store.tailscaleStatuses，App.tsx 订阅写入），
+     只订**本节点**那一条 —— 同 latencyMap 的细粒度订阅理由，逐节点回包不该牵动整张网格重渲。
+     非 Tailscale 协议节点没有账号概念，直接不读表。无帧 / 两段都空 → tsAccountLabel 返回
+     undefined，卡面不画（空态纪律，见该函数文档）。 */
+  const tsStatus = useAppStore((s) =>
+    isAccountBasedProtocol(server.protocol) ? s.tailscaleStatuses[server.id] : undefined
+  );
+  const tsAccount = tsAccountLabel(tsStatus?.details);
   /* 组网信息 ⓘ（Tailscale / WireGuard / WARP）：内网地址 / 路由 / 生效出口 / 对端在线。
      判据 `isMeshNode` —— 代理协议节点没有「内网地址/路由」这套概念，整颗不渲染；
      openconnect / openvpn-client 只在用户声明了内网段时才有。
@@ -284,6 +299,12 @@ function NodeCardView({
 
       <div className="nd-pills">
         <span className="pill proto">{protocolLabel(server.protocol)}</span>
+        {/* 账号标识：多个 Tailscale 账号时区分「这张卡是哪一个」。见上方 tsAccount 派生注释。 */}
+        {tsAccount && (
+          <span className="nd-cap" data-tip={tsAccount}>
+            {tsAccount}
+          </span>
+        )}
         {stagedOnly && (
           <span
             className="nd-cap"

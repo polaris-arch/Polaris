@@ -60,33 +60,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 扩到全部 message 仍是显然的下一步，但要不要扩由人决定，不在此自作主张 —— 扩的成本主要在
 /// 「上游合法新增字段」会不会把门变成噪声源，那需要单独判。
 fn assert_proto_matches_bundled_core() {
-    for rel in [
-        "resources/linux/sing-box",
-        "resources/mac-arm64/sing-box",
-        "resources/mac-x64/sing-box",
-        "resources/win/sing-box.exe",
-    ] {
-        println!(
-            "cargo:rerun-if-changed={}",
-            proto_wire_check::repo_root().join(rel).display()
-        );
+    // 覆盖轴（有哪几个平台）来自 `src-tauri/core-manifest.json` 的 `coreArchiveSha256` 键集合，
+    // 不在这里再写一份名单 —— 此前这里那四条字面路径正是「两处各写一份平台名单」的第三份。
+    // manifest 本身也要进重跑触发面：加/减平台时本门的覆盖轴跟着变。
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_wire_check::core_manifest_path().display()
+    );
+    for (_, path) in proto_wire_check::core_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 
     if std::env::var("PROFILE").as_deref() != Ok("release") {
         return;
     }
 
-    let cores = proto_wire_check::bundled_cores();
+    let survey = proto_wire_check::survey_bundled_cores();
     assert!(
-        !cores.is_empty(),
+        !survey.present.is_empty(),
         "随包 sing-box 内核缺失，拒绝出包：{}/resources/*/sing-box 一份都不存在。\n\
          后果：无法验证 vendored proto 与真核的 wire 契约 —— 这条契约一旦漂移，管理 API 的整条流会\
          静默死掉（2026-08-05 真机：Tailscale 组网列表整块消失，且零日志）。\n\
          修复：node scripts/fetch-core.mjs",
         proto_wire_check::repo_root().display()
     );
+    assert!(
+        survey.orphans.is_empty(),
+        "拒绝出包：`resources/` 下这些目录里有 sing-box 二进制，但 `{}` 的 `coreArchiveSha256` \
+         里没有对应平台：{}\n\
+         它会被 tauri 的 resources 照样打进包，却不在任何一道逐平台门的覆盖轴上（没人对拍过它的 \
+         wire 契约、build tag、依赖指纹）。\n\
+         修复：要么把该平台补进 manifest（并同步 `scripts/fetch-core.mjs` 与 CORE_MATRIX），\
+         要么删掉这份没人认领的核。",
+        proto_wire_check::core_manifest_path().display(),
+        survey.orphans.join(", "),
+    );
+    // 缺平台不拒绝出包（本地 release 构建只拉一份核是合法用法），但必须自曝：
+    // `cargo:warning` 是 build script 里**不会被吞掉**的那一条通道。
+    if !survey.missing.is_empty() {
+        println!(
+            "cargo:warning=随包核平台 {} 不在盘上，本次出包没有对拍过它们的 wire 契约（打包腿应\
+             `node scripts/fetch-core.mjs` 不传 --platform 全拉）",
+            survey.missing.join(", ")
+        );
+    }
 
-    for core in &cores {
+    for (_, core) in &survey.present {
         for (kind, name) in CHECKED_SYMBOLS {
             if let Err(report) =
                 proto_wire_check::check_core_against_proto(core, PROTO_SRC, *kind, name)

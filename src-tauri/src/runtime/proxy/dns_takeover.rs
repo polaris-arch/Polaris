@@ -47,11 +47,37 @@ impl ProxyRuntime {
         match self.dns_controller.lock() {
             Ok(mut c) => {
                 c.set_dns();
+                // 接管挤掉了别人的解析器 ⇒ 出声。macOS 的接管是把**所有**网络服务的 DNS 改成受控 IP，
+                // 于是另一个 VPN（Tailscale 的 quad100、公司 VPN 的内网解析器…）装的解析器被整个挤掉，
+                // 用户侧表现是「IP 通、域名不通」，此前全程无提示。日志只是其中一路，
+                // 面向用户那路走 `dns_takeover_report` 命令 → 设置·DNS 页。
+                let displaced = c.displaced_resolvers();
+                if !displaced.is_empty() {
+                    log::warn!(
+                        "系统 DNS 接管挤掉了 {} 个非公网解析器（可能属于其它 VPN/组网客户端）：{}",
+                        displaced.len(),
+                        displaced.join(", ")
+                    );
+                }
                 c.has_marker()
             }
             Err(e) => {
                 log::error!("dns_controller 锁中毒: {e} → 跳过系统 DNS 接管");
                 false
+            }
+        }
+    }
+
+    /// 本次接管挤掉的非公网解析器（快照拷贝；锁中毒/未接管 → 空）。
+    ///
+    /// 只读，供 `dns_takeover_report` 命令回给设置页。Linux 走 `linux_resolved` 那条腿，
+    /// 不经本控制器，故恒空 —— 与 `takeover_supported` 的平台面一致。
+    pub(crate) fn displaced_dns_resolvers(&self) -> Vec<String> {
+        match self.dns_controller.lock() {
+            Ok(c) => c.displaced_resolvers().to_vec(),
+            Err(error) => {
+                log::error!("dns_controller 锁中毒: {error} → 无法读取被挤掉的解析器");
+                Vec::new()
             }
         }
     }
@@ -206,10 +232,17 @@ impl ProxyRuntime {
     pub(super) fn flush_os_dns_cache_best_effort(self: &Arc<Self>, context: &'static str) {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            // mac helper flush 通道（其它平台不经此腿，见 `flush_os_dns_cache` 平台分派）。
+            // 特权 helper flush 通道（mac root / win SYSTEM；linux 不经此腿，见 `flush_os_dns_cache`
+            // 平台分派）。helper 未装/旧 helper 不认这条命令时该调用回 `ok:false`，由分派腿就地降级。
             let helper_flush = || this.helper.flush_dns();
+            // Windows 腿的前置判据（spec §3.1「if helper ready」，见 `flush_os_dns_cache` 头注）：
+            // 没装 helper 的机器结构上就没有特权通道，每次起停核都发一条「不可用」是纯噪音。
+            // 取 token 在位这条**零副作用**的判据而非 `status().ready`，理由见
+            // [`HelperRuntime::client_token_present`]。
+            let helper_ready = this.helper.client_token_present();
             let flushed = polaris_system_integration::production_flush_os_dns_cache(
                 Some(&helper_flush),
+                helper_ready,
                 &mut |m| log::info!("[dns-flush:{context}] {m}"),
             );
             if Platform::current() == Platform::Linux && !flushed {

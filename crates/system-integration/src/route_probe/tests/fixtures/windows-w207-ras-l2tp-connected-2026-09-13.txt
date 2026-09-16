@@ -1,0 +1,410 @@
+════════════════════════════════════════════════════════════════════════
+Polaris route_probe 真机抓取（Windows）
+
+读这份样本、准备照着写解析器的人，先看这三条：
+
+ 1. 两张表的"接口"列根本不是同一种东西（这是 Windows 与 macOS/Linux 最大的不同）：
+      IPv4 路由表的 Interface 列是【本地 IP 地址】，不是接口名；
+      IPv6 路由表的 If 列是【接口索引】（整数）。
+    两者都落不到接口名上，必须再查一张对照表：route print 开头的 Interface List
+    （索引 → 描述）、@@@GET_NETIPADDRESS（IP → 接口别名）、或直接用 @@@GET_NETROUTE_*
+    （它一列就给出 InterfaceAlias）。这三张表本脚本都抓了，别只拿 route print 就动手。
+
+ 2. route print 的表头是本地化的：中文系统上是「接口列表」「IPv4 路由表」「活动路由」。
+    按英文表头硬匹配的解析器在中文机器上解析出空表 —— 而空表长得像"这台机器没有路由"。
+    本次抓取的语言 / 代码页记在 @@@META 里。中文机器上抓的样本比英文的更有价值。
+
+ 3. 编码：route print / ipconfig 是原生 exe，输出按控制台代码页编码。
+    若 @@@ROUTE_PRINT_4 看起来是乱码，用 Windows PowerShell 5.1 重跑，或先 chcp 65001。
+    @@@GET_NETROUTE_* / @@@GET_NETADAPTER 走 cmdlet 对象、不经控制台解码，天然免疫这条。
+
+@@@GET_NETADAPTER 必须带 InterfaceType（IANA ifType）：131 = IF_TYPE_TUNNEL，6 = 以太网。
+隧道名单只能靠它判 —— 这台机器上实测 Teredo / IP-HTTPS / 6to4 三个隧道全是 131，
+两块以太网卡是 6。两条看着可行的土办法都必错：「描述列为空」恰好圈中 Teredo/IP-HTTPS/6to4，
+但 Tailscale 的 wintun **有**描述；「没有 MAC」会把内核调试适配器一起圈进来，而 wintun **自带** MAC。
+ComponentID / NdisPhysicalMedium 一并带上作交叉判据。
+
+落库：把本文件原样放进
+  polaris/crates/system-integration/src/route_probe/tests/fixtures/
+不要手工规整（行尾空格、对齐、空行、CRLF 都是证据）。
+════════════════════════════════════════════════════════════════════════
+@@@META
+platform=windows
+host=sway
+label=ras-l2tp-visibility
+date=2026-09-13 13:51:74 +08:00
+script=polaris-collect-routes-windows.ps1
+psversion=5.1.26100.9444
+psedition=Desktop
+os=Microsoft Windows NT 10.0.26200.0
+culture=zh-CN
+uiculture=en-US
+consoleoutputencoding=utf-8
+@@@ROUTE_PRINT_4
+===========================================================================
+Interface List
+ 35...........................PolarisProbeL2TP
+  7...........................Tailscale Tunnel
+  8...bc 24 11 24 98 95 ......Red Hat VirtIO Ethernet Adapter
+  3...00 ff 1a 2b d5 64 ......TAP-Windows Adapter V9
+  1...........................Software Loopback Interface 1
+ 25...00 15 5d fe e6 b3 ......Hyper-V Virtual Ethernet Adapter
+===========================================================================
+
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0     192.168.10.1   192.168.10.207   4241
+          0.0.0.0          0.0.0.0         On-link        10.55.0.10     26
+       10.55.0.10  255.255.255.255         On-link        10.55.0.10    281
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1  10036
+        127.0.0.1  255.255.255.255         On-link         127.0.0.1  10036
+  127.255.255.255  255.255.255.255         On-link         127.0.0.1  10036
+      169.254.0.0      255.255.0.0         On-link    169.254.83.107   4486
+   169.254.83.107  255.255.255.255         On-link    169.254.83.107   4486
+  169.254.255.255  255.255.255.255         On-link    169.254.83.107   4486
+     172.22.240.0    255.255.240.0         On-link      172.22.240.1   9481
+     172.22.240.1  255.255.255.255         On-link      172.22.240.1   9481
+   172.22.255.255  255.255.255.255         On-link      172.22.240.1   9481
+     192.168.10.0    255.255.255.0         On-link    192.168.10.207   4496
+   192.168.10.185  255.255.255.255         On-link    192.168.10.207   4241
+   192.168.10.207  255.255.255.255         On-link    192.168.10.207   4496
+   192.168.10.255  255.255.255.255         On-link    192.168.10.207   4496
+        224.0.0.0        240.0.0.0         On-link         127.0.0.1  10036
+        224.0.0.0        240.0.0.0         On-link    192.168.10.207   4496
+        224.0.0.0        240.0.0.0         On-link      172.22.240.1   9481
+        224.0.0.0        240.0.0.0         On-link        10.55.0.10     26
+  255.255.255.255  255.255.255.255         On-link         127.0.0.1  10036
+  255.255.255.255  255.255.255.255         On-link    192.168.10.207   4496
+  255.255.255.255  255.255.255.255         On-link      172.22.240.1   9481
+  255.255.255.255  255.255.255.255         On-link        10.55.0.10    281
+===========================================================================
+Persistent Routes:
+  Network Address          Netmask  Gateway Address  Metric
+          0.0.0.0          0.0.0.0     192.168.10.1       1
+===========================================================================
+@@@ROUTE_PRINT_6
+===========================================================================
+Interface List
+ 35...........................PolarisProbeL2TP
+  7...........................Tailscale Tunnel
+  8...bc 24 11 24 98 95 ......Red Hat VirtIO Ethernet Adapter
+  3...00 ff 1a 2b d5 64 ......TAP-Windows Adapter V9
+  1...........................Software Loopback Interface 1
+ 25...00 15 5d fe e6 b3 ......Hyper-V Virtual Ethernet Adapter
+===========================================================================
+
+IPv6 Route Table
+===========================================================================
+Active Routes:
+ If Metric Network Destination      Gateway
+  8   4496 ::/0                     fe80::fff:1f0b:6e3c:e05a
+  1   4556 ::1/128                  On-link
+  8   4496 530d:ebd9:89bf:95d8::/60 fe80::fff:1f0b:6e3c:e05a
+  8   4496 530d:ebd9:89bf:95d8::/64 On-link
+  8   4496 530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413/128
+                                    On-link
+  8   4496 530d:ebd9:89bf:95d8:43be:99b4:ba0f:0c98/128
+                                    On-link
+  8   4496 8db8:e8a1:92da:9f6b::/60 fe80::fff:1f0b:6e3c:e05a
+  8   4496 8db8:e8a1:92da:9f6b::/64 On-link
+  8   4496 8db8:e8a1:92da:9f6b::2bb/128
+                                    On-link
+  8   4496 8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73/128
+                                    On-link
+  8   4496 8db8:e8a1:92da:9f6b:43be:99b4:ba0f:0c98/128
+                                    On-link
+  8   4496 8db8:e8a1:92da:caa4::/64 fe80::0943:8f79:c8cb:17d0
+  8   4496 8db8:e8a1:92da:caa4::/64 fe80::221f:e5d9:65dd:9095
+  8   4496 16f7:9c0:d0e5:569d::/56  fe80::fff:1f0b:6e3c:e05a
+  8   4496 16f7:9c0:d0e5:569d::/64  On-link
+  8   4496 16f7:9c0:d0e5:569d::2bb/128
+                                    On-link
+  8   4496 16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf/128
+                                    On-link
+  8   4496 16f7:9c0:d0e5:569d:43be:99b4:ba0f:0c98/128
+                                    On-link
+  8   4496 fe80::/64                On-link
+ 25   9481 fe80::/64                On-link
+ 35    281 fe80::/64                On-link
+ 35    281 fe80::3dc9:e6d4:60c9:c888/128
+                                    On-link
+ 25   9481 fe80::d84e:b2fe:810:d72f/128
+                                    On-link
+  8   4496 fe80::8578:0cf5:9048:f4a2/128
+                                    On-link
+  1   4556 ff00::/8                 On-link
+  8   4496 ff00::/8                 On-link
+ 25   9481 ff00::/8                 On-link
+ 35    281 ff00::/8                 On-link
+===========================================================================
+Persistent Routes:
+  None
+@@@GET_NETADAPTER
+
+InterfaceAlias                        InterfaceIndex InterfaceType NdisPhysicalMedium ComponentID                                  DriverDescription                        Name                                  InterfaceDescription                     Status       MacAddress       
+--------------                        -------------- ------------- ------------------ -----------                                  -----------------                        ----                                  --------------------                     ------       ----------       
+本地连接* 6                                           16             6                  0 ms_ndiswanip                                 WAN Miniport (IP)                        本地连接* 6                               WAN Miniport (IP)                        Up                            
+本地连接* 7                                           15             6                  0 ms_ndiswanipv6                               WAN Miniport (IPv6)                      本地连接* 7                               WAN Miniport (IPv6)                      Up                            
+本地连接* 5                                           14            23                  0 ms_pppoeminiport                             WAN Miniport (PPPOE)                     本地连接* 5                               WAN Miniport (PPPOE)                     Disconnected                  
+vSwitch (Default Switch)                          23             6                  0 vms_vsmp                                     Hyper-V Virtual Switch Extension Adapter vSwitch (Default Switch)              Hyper-V Virtual Switch Extension Adapter Up                            
+本地连接* 8                                           13             6                  0 ms_ndiswanbh                                 WAN Miniport (Network Monitor)           本地连接* 8                               WAN Miniport (Network Monitor)           Up                            
+本地连接* 3                                           12           131                  0 ms_l2tpminiport                              WAN Miniport (L2TP)                      本地连接* 3                               WAN Miniport (L2TP)                      Disconnected                  
+Teredo Tunneling Pseudo-Interface                 11           131                  0                                                                                       Teredo Tunneling Pseudo-Interface                                              Not Present                   
+vEthernet (Default Switch)                        25             6                  0                                                                                       vEthernet (Default Switch)            Hyper-V Virtual Ethernet Adapter         Up           84-bd-97-bb-2d-7d
+本地连接* 2                                           10           131                  0 ms_agilevpnminiport                          WAN Miniport (IKEv2)                     本地连接* 2                               WAN Miniport (IKEv2)                     Disconnected                  
+本地连接* 4                                            9           131                  0 ms_pptpminiport                              WAN Miniport (PPTP)                      本地连接* 4                               WAN Miniport (PPTP)                      Disconnected                  
+以太网                                                8             6                  0 PCI\VEN_1AF4&DEV_1000&SUBSYS_00011AF4&REV_00 Red Hat VirtIO Ethernet Adapter          以太网                                   Red Hat VirtIO Ethernet Adapter          Up           81-51-90-51-a6-00
+Tailscale                                          7            53                  0 Wintun                                       Wintun Userspace Tunnel                  Tailscale                             Tailscale Tunnel                         Up                            
+以太网(内核调试器)                                         6             6                 14 root\kdnic                                   Microsoft Kernel Debug Network Adapter   以太网(内核调试器)                            Microsoft Kernel Debug Network Adapter   Not Present                   
+Microsoft IP-HTTPS Platform Interface              5           131                  0                                                                                       Microsoft IP-HTTPS Platform Interface                                          Not Present                   
+本地连接* 1                                            4           131                  0 ms_sstpminiport                              WAN Miniport (SSTP)                      本地连接* 1                               WAN Miniport (SSTP)                      Disconnected                  
+OpenVPN TAP-Windows6                               3            53                  0 root\tap0901                                 TAP-Windows Adapter V9                   OpenVPN TAP-Windows6                  TAP-Windows Adapter V9                   Disconnected 84-3e-18-e6-7b-15
+6to4 Adapter                                       2           131                  0                                                                                       6to4 Adapter                                                                   Not Present                   
+
+
+@@@NETSH_INTERFACE
+
+Idx     Met         MTU          State                Name
+---  ----------  ----------  ------------  ---------------------------
+ 35          25        1400  connected     PolarisProbeL2TP
+  1        9780  4294967295  connected     Loopback Pseudo-Interface 1
+  3        4250        1500  disconnected  OpenVPN TAP-Windows6
+  8        4240        1500  connected     以太网
+  7        4230        1280  connected     Tailscale
+ 25        9225        1500  connected     vEthernet (Default Switch)
+
+@@@GET_NETROUTE_4
+
+DestinationPrefix  InterfaceAlias              InterfaceIndex NextHop      RouteMetric       Store
+-----------------  --------------              -------------- -------      -----------       -----
+127.0.0.0/8        Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+127.0.0.1/32       Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+127.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+224.0.0.0/4        Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+255.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+224.0.0.0/4        OpenVPN TAP-Windows6                     3 0.0.0.0              256 ActiveStore
+255.255.255.255/32 OpenVPN TAP-Windows6                     3 0.0.0.0              256 ActiveStore
+169.254.0.0/16     Tailscale                                7 0.0.0.0              256 ActiveStore
+169.254.255.255/32 Tailscale                                7 0.0.0.0              256 ActiveStore
+169.254.83.107/32  Tailscale                                7 0.0.0.0              256 ActiveStore
+0.0.0.0/0          以太网                                      8 192.168.10.1           1 ActiveStore
+192.168.10.0/24    以太网                                      8 0.0.0.0              256 ActiveStore
+192.168.10.185/32  以太网                                      8 0.0.0.0                1 ActiveStore
+192.168.10.207/32  以太网                                      8 0.0.0.0              256 ActiveStore
+192.168.10.255/32  以太网                                      8 0.0.0.0              256 ActiveStore
+224.0.0.0/4        以太网                                      8 0.0.0.0              256 ActiveStore
+255.255.255.255/32 以太网                                      8 0.0.0.0              256 ActiveStore
+172.22.240.0/20    vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+172.22.240.1/32    vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+172.22.255.255/32  vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+224.0.0.0/4        vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+255.255.255.255/32 vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+0.0.0.0/0          PolarisProbeL2TP                        35 0.0.0.0                1 ActiveStore
+10.55.0.10/32      PolarisProbeL2TP                        35 0.0.0.0              256 ActiveStore
+224.0.0.0/4        PolarisProbeL2TP                        35 0.0.0.0                1 ActiveStore
+255.255.255.255/32 PolarisProbeL2TP                        35 0.0.0.0              256 ActiveStore
+
+
+@@@GET_NETROUTE_6
+
+DestinationPrefix                           InterfaceAlias              InterfaceIndex NextHop                   RouteMetric       Store
+-----------------                           --------------              -------------- -------                   -----------       -----
+::1/128                                     Loopback Pseudo-Interface 1              1 ::                                256 ActiveStore
+ff00::/8                                    Loopback Pseudo-Interface 1              1 ::                                256 ActiveStore
+fe80::/64                                   OpenVPN TAP-Windows6                     3 ::                                256 ActiveStore
+fe80::042f:65e0:22cd:b6c3/128               OpenVPN TAP-Windows6                     3 ::                                256 ActiveStore
+ff00::/8                                    OpenVPN TAP-Windows6                     3 ::                                256 ActiveStore
+::/0                                        以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+530d:ebd9:89bf:95d8::/60                    以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+530d:ebd9:89bf:95d8::/64                    以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413/128 以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:43be:99b4:ba0f:0c98/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b::/60                    以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+8db8:e8a1:92da:9f6b::/64                    以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b::2bb/128                以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:43be:99b4:ba0f:0c98/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:caa4::/64                    以太网                                      8 fe80::221f:e5d9:65dd:9095         256 ActiveStore
+8db8:e8a1:92da:caa4::/64                    以太网                                      8 fe80::0943:8f79:c8cb:17d0         256 ActiveStore
+16f7:9c0:d0e5:569d::/56                     以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+16f7:9c0:d0e5:569d::/64                     以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d::2bb/128                 以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf/128   以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:43be:99b4:ba0f:0c98/128  以太网                                      8 ::                                256 ActiveStore
+fe80::/64                                   以太网                                      8 ::                                256 ActiveStore
+fe80::8578:0cf5:9048:f4a2/128               以太网                                      8 ::                                256 ActiveStore
+ff00::/8                                    以太网                                      8 ::                                256 ActiveStore
+fe80::/64                                   vEthernet (Default Switch)              25 ::                                256 ActiveStore
+fe80::d84e:b2fe:810:d72f/128                vEthernet (Default Switch)              25 ::                                256 ActiveStore
+ff00::/8                                    vEthernet (Default Switch)              25 ::                                256 ActiveStore
+fe80::/64                                   PolarisProbeL2TP                        35 ::                                256 ActiveStore
+fe80::3dc9:e6d4:60c9:c888/128               PolarisProbeL2TP                        35 ::                                256 ActiveStore
+ff00::/8                                    PolarisProbeL2TP                        35 ::                                256 ActiveStore
+
+
+@@@GET_NETIPADDRESS
+
+IPAddress                               PrefixLength AddressFamily InterfaceAlias              InterfaceIndex
+---------                               ------------ ------------- --------------              --------------
+127.0.0.1                                          8          IPv4 Loopback Pseudo-Interface 1              1
+::1                                              128          IPv6 Loopback Pseudo-Interface 1              1
+169.254.59.38                                     16          IPv4 OpenVPN TAP-Windows6                     3
+fe80::042f:65e0:22cd:b6c3%3                       64          IPv6 OpenVPN TAP-Windows6                     3
+169.254.83.107                                    16          IPv4 Tailscale                                7
+fe80::e0f0:5ebb:ee26:2479%7                       64          IPv6 Tailscale                                7
+192.168.10.207                                    24          IPv4 以太网                                      8
+530d:ebd9:89bf:95d8:43be:99b4:ba0f:0c98          128          IPv6 以太网                                      8
+530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413           64          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf             64          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:43be:99b4:ba0f:0c98           128          IPv6 以太网                                      8
+fe80::8578:0cf5:9048:f4a2%8                       64          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d::2bb                          128          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73           64          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b::2bb                         128          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:43be:99b4:ba0f:0c98          128          IPv6 以太网                                      8
+172.22.240.1                                      20          IPv4 vEthernet (Default Switch)              25
+fe80::d84e:b2fe:810:d72f%25                       64          IPv6 vEthernet (Default Switch)              25
+10.55.0.10                                        32          IPv4 PolarisProbeL2TP                        35
+fe80::3dc9:e6d4:60c9:c888%35                      64          IPv6 PolarisProbeL2TP                        35
+
+
+@@@NETSH_INTERFACE_6
+
+Idx     Met         MTU          State                Name
+---  ----------  ----------  ------------  ---------------------------
+ 35          25        1400  connected     PolarisProbeL2TP
+  1        4300  4294967295  connected     Loopback Pseudo-Interface 1
+  3        4250        1500  disconnected  OpenVPN TAP-Windows6
+  8        4240        1492  connected     以太网
+  7        4230        1280  connected     Tailscale
+ 25        9225        1500  connected     vEthernet (Default Switch)
+
+@@@IPCONFIG
+
+Windows IP Configuration
+
+   Host Name . . . . . . . . . . . . : Sway
+   Primary Dns Suffix  . . . . . . . : 
+   Node Type . . . . . . . . . . . . : Hybrid
+   IP Routing Enabled. . . . . . . . : No
+   WINS Proxy Enabled. . . . . . . . : No
+
+PPP adapter PolarisProbeL2TP:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : PolarisProbeL2TP
+   Physical Address. . . . . . . . . : 
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   Link-local IPv6 Address . . . . . : fe80::3dc9:e6d4:60c9:c888%35(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 10.55.0.10(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.255
+   Default Gateway . . . . . . . . . : 0.0.0.0
+   DHCPv6 IAID . . . . . . . . . . . : 599532561
+   DHCPv6 Client DUID. . . . . . . . : 84-e6-e6-84-4a-a4-a6-13-81-51-90-51-98-95
+   DNS Servers . . . . . . . . . . . : 10.55.0.1
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+
+Unknown adapter Tailscale:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Tailscale Tunnel
+   Physical Address. . . . . . . . . : 
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   Link-local IPv6 Address . . . . . : fe80::e0f0:5ebb:ee26:2479%7(Preferred) 
+   Autoconfiguration IPv4 Address. . : 169.254.83.107(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.0.0
+   Default Gateway . . . . . . . . . : 
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+
+Ethernet adapter ��̫��:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Red Hat VirtIO Ethernet Adapter
+   Physical Address. . . . . . . . . : 81-51-90-51-a6-00
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   IPv6 Address. . . . . . . . . . . : 530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413(Preferred) 
+   IPv6 Address. . . . . . . . . . . : 8db8:e8a1:92da:9f6b::2bb(Preferred) 
+   Lease Obtained. . . . . . . . . . : 2026��9��13�� b4:4e:9e
+   Lease Expires . . . . . . . . . . : 2026��9��13�� 95:03:18
+   IPv6 Address. . . . . . . . . . . : 8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73(Preferred) 
+   IPv6 Address. . . . . . . . . . . : 16f7:9c0:d0e5:569d::2bb(Preferred) 
+   Lease Obtained. . . . . . . . . . : 2026��9��13�� b4:4e:9e
+   Lease Expires . . . . . . . . . . : 2026��9��13�� 95:03:18
+   IPv6 Address. . . . . . . . . . . : 16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf(Preferred) 
+   Temporary IPv6 Address. . . . . . : 530d:ebd9:89bf:95d8:43be:99b4:ba0f:0c98(Preferred) 
+   Temporary IPv6 Address. . . . . . : 8db8:e8a1:92da:9f6b:43be:99b4:ba0f:0c98(Preferred) 
+   Temporary IPv6 Address. . . . . . : 16f7:9c0:d0e5:569d:43be:99b4:ba0f:0c98(Preferred) 
+   Link-local IPv6 Address . . . . . : fe80::8578:0cf5:9048:f4a2%8(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 192.168.10.207(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : fe80::fff:1f0b:6e3c:e05a%8
+                                       192.168.10.1
+   DHCPv6 IAID . . . . . . . . . . . : 112993297
+   DHCPv6 Client DUID. . . . . . . . : 84-e6-e6-84-4a-a4-a6-13-81-51-90-51-98-95
+   DNS Servers . . . . . . . . . . . : 8db8:e8a1:92da:9f6b::9
+                                       192.168.10.1
+                                       8db8:e8a1:92da:9f6b::9
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+
+Unknown adapter OpenVPN TAP-Windows6:
+
+   Media State . . . . . . . . . . . : Media disconnected
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : TAP-Windows Adapter V9
+   Physical Address. . . . . . . . . : 84-3e-18-e6-7b-15
+   DHCP Enabled. . . . . . . . . . . : Yes
+   Autoconfiguration Enabled . . . . : Yes
+
+Ethernet adapter vEthernet (Default Switch):
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Hyper-V Virtual Ethernet Adapter
+   Physical Address. . . . . . . . . : 84-bd-97-bb-2d-7d
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   Link-local IPv6 Address . . . . . : fe80::d84e:b2fe:810:d72f%25(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 172.22.240.1(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.240.0
+   Default Gateway . . . . . . . . . : 
+   DHCPv6 IAID . . . . . . . . . . . : 419435869
+   DHCPv6 Client DUID. . . . . . . . : 84-e6-e6-84-4a-a4-a6-13-81-51-90-51-98-95
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+@@@GET_VPNCONNECTION
+
+Name             ServerAddress  TunnelType ConnectionStatus SplitTunneling
+----             -------------  ---------- ---------------- --------------
+PolarisProbeL2TP 192.168.10.185 L2tp       Connected                 False
+
+
+@@@GET_VPNCONNECTION_ALLUSER
+@@@GET_NETIPINTERFACE
+
+InterfaceIndex InterfaceAlias              AddressFamily ConnectionState      NlMtu InterfaceMetric
+-------------- --------------              ------------- ---------------      ----- ---------------
+             1 Loopback Pseudo-Interface 1          IPv6       Connected 4294967295            4300
+             1 Loopback Pseudo-Interface 1          IPv4       Connected 4294967295            9780
+             3 OpenVPN TAP-Windows6                 IPv4    Disconnected       1500            4250
+             3 OpenVPN TAP-Windows6                 IPv6    Disconnected       1500            4250
+             7 Tailscale                            IPv4       Connected       1280            4230
+             7 Tailscale                            IPv6       Connected       1280            4230
+             8 以太网                                  IPv6       Connected       1492            4240
+             8 以太网                                  IPv4       Connected       1500            4240
+            25 vEthernet (Default Switch)           IPv6       Connected       1500            9225
+            25 vEthernet (Default Switch)           IPv4       Connected       1500            9225
+            35 PolarisProbeL2TP                     IPv4       Connected       1400              25
+            35 PolarisProbeL2TP                     IPv6       Connected       1400              25
+
+
+@@@TAILSCALE
+# Health check:
+#     - You are logged out. The last login error was: fetch control key: Get "https://hs.makesall.cn/key?v=142": context canceled
+#     - Unable to connect to the Tailscale coordination server to synchronize the state of your tailnet. Peer reachability might degrade over time.
+#     - Tailscale is starting. Please wait.
+
+unexpected state: NoState
+<<POLARIS-CAPTURE-UNAVAILABLE>> 退出码 1，上面的输出可能不完整

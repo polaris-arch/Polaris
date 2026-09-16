@@ -47,6 +47,7 @@ mod macos_proxy;
 pub mod proxy;
 pub mod proxy_ops;
 pub mod route_ops;
+pub mod route_probe;
 #[cfg(test)]
 mod test_support;
 
@@ -69,6 +70,20 @@ pub type ProdRouteOps = route_ops::SystemRouteOpsImpl<StdCommandRunner>;
 /// 装配生产路由出口探测器（TUN 出口夺取 post-flight 判定用；见 [`route_ops`]）。
 pub fn production_route_ops() -> ProdRouteOps {
     route_ops::SystemRouteOpsImpl::new(StdCommandRunner)
+}
+
+/// 生产外来隧道探测类型（本机平台 + 真实命令执行）。无 marker/状态 → 直接是 ops 本身。
+pub type ProdForeignTunnelProbe = route_probe::ForeignTunnelProbeImpl<StdCommandRunner>;
+
+/// 装配生产外来隧道探测器（本机**其它**隧道宣告了哪些网段；见 [`route_probe`]）。
+///
+/// 判定（哪些算真冲突）不在本 crate，在 `config-engine` 的 `builder::tunnel_conflict`。
+///
+/// **同步**（内部 exec `ip`）：async 语境须 `spawn_blocking`。四条查询全是只读 `show`，
+/// 不改路由/网卡任何状态。**非 Linux 返回 `Unsupported` 而不是空列表**，理由见
+/// [`route_probe::TunnelProbeOutcome`]。
+pub fn production_foreign_tunnel_probe() -> ProdForeignTunnelProbe {
+    route_probe::ForeignTunnelProbeImpl::new(StdCommandRunner)
 }
 
 /// marker 文件名（上游 `SystemProxyBase.getMarkerPath`：`userData/system-proxy.marker.json`）。
@@ -155,15 +170,18 @@ pub fn production_dns_controller(marker_path: impl Into<String>) -> ProdDnsContr
 
 /// 刷 OS DNS 缓存（生产入口）：本机平台 + 真实执行器，best-effort 永不抛。
 ///
-/// `helper_flush` 为 mac root helper 通道（`None` = 不可用 → 走用户级 `dscacheutil` 降级）。
+/// `helper_flush` 为特权 helper 通道（mac root / win SYSTEM；`None` 或返回 `ok:false` → 走用户级降级）。
+/// `helper_ready` 见 [`dns_flush::flush_os_dns_cache`] 的同名参数（Windows 腿的前置判据）。
 pub fn production_flush_os_dns_cache(
     helper_flush: dns_flush::HelperFlushFn,
+    helper_ready: bool,
     on_warn: &mut dyn FnMut(&str),
 ) -> bool {
     dns_flush::flush_os_dns_cache(
         polaris_helper_proto::Platform::current(),
         &StdCommandRunner,
         helper_flush,
+        helper_ready,
         on_warn,
     )
 }

@@ -71,9 +71,17 @@ impl ProxyRuntime {
         use crate::runtime::core_promote::{attest_core_binary, CoreBinaryAttestation};
 
         let expected = expected.to_path_buf();
-        // 观测腿全是阻塞 syscall / 子进程 → spawn_blocking。
+        // D2：Windows 上 `running_exe_path` 恒 None（Medium IL app 读不了 SYSTEM child），自证因此
+        // 恒判「未能进行」。helper 在权限边界另一侧、且持着受管核的句柄，它 status 回传的 `image=`
+        // 就是同一个事实。只在**经 helper 起核**时取这条腿：直起腿本地就读得到，不必多一次 IPC。
+        let helper = self
+            .core_via_helper
+            .load(Ordering::SeqCst)
+            .then(|| Arc::clone(&self.helper));
+        // 观测腿全是阻塞 syscall / 子进程 / 同步 IPC → spawn_blocking。
         let attestation = tokio::task::spawn_blocking(move || {
-            let running = running_exe_path(pid);
+            let running = running_exe_path(pid)
+                .or_else(|| helper_reported_core_image(helper.as_deref(), pid));
             // 路径相同就不必花两次 spawn 去问版本（同一文件，版本必同）。
             let (ev, rv) = match running.as_deref() {
                 Some(r) if r != expected.as_path() => (
@@ -417,6 +425,36 @@ fn running_exe_path(pid: u32) -> Option<PathBuf> {
         return None;
     }
     running_exe_path_impl(pid)
+}
+
+/// **第二观测腿**：helper `status` 回传的实跑映像（`image=`，D2）。
+///
+/// 同步 IPC，只在 [`running_exe_path`] 取不到时才调用（Windows 的 helper 腿）。通信/协议失败
+/// 一律 `None` —— 读不到就是读不到，自证据此判 `Unobservable`（只 warn），绝不冒充通过。
+fn helper_reported_core_image(
+    helper: Option<&crate::runtime::helper::HelperRuntime>,
+    pid: u32,
+) -> Option<PathBuf> {
+    let status = helper?.managed_core_status().ok()?;
+    image_from_managed_status(&status, pid)
+}
+
+/// 纯判定：**只有 helper 手里的受管 pid 与本代 pid 相同**才采信它回传的 image。
+///
+/// pid 对不上说明 helper 正管着另一个会话的核 —— 拿它的映像去和本代期望值对账，判等判不等都是
+/// 在回答另一个问题；那种结论比「没观测到」更坏，因为它看起来像事实。
+pub(super) fn image_from_managed_status(
+    status: &crate::runtime::helper::ManagedCoreStatus,
+    want_pid: u32,
+) -> Option<PathBuf> {
+    match status {
+        crate::runtime::helper::ManagedCoreStatus::Running { pid, image, .. }
+            if *pid == want_pid =>
+        {
+            image.as_deref().map(PathBuf::from)
+        }
+        _ => None,
+    }
 }
 
 /// [`running_exe_path`] 的 linux 实现：`/proc/<pid>/exe` 符号链接（内核直给）。

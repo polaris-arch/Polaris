@@ -1005,6 +1005,8 @@ fn build_base(
         port,
         detour: None,
         bind_interface: None,
+        // 订阅来的节点不带「按需连接」意图：Clash 侧没有对应概念，缺席 ⇒ 内核默认（恒连）。
+        on_demand: None,
         mesh_routes: Vec::new(),
         subscription_id: Some(subscription_id.to_string()),
         provider_name: None,

@@ -27,12 +27,10 @@ import { useDialogStore } from '@/components/dialogs/dialog-store';
 import { toast } from '@/lib/error-handler';
 import { api } from '@/ipc';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
+import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import { initialNodesTab } from './initial-tab';
-import {
-  collectRuleTargetedServerIds,
-  type SpeedTestCaps,
-} from '@/domain/endpoint-routes';
+import { type SpeedTestCaps } from '@/domain/endpoint-routes';
 import { useSubscriptionProgressStore } from '@/store/use-subscription-progress-store';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
@@ -49,7 +47,6 @@ import { useAnchoredMenu } from '@/lib/use-anchored-menu';
 import {
   invalidNodeIndex,
   nodeUseAction,
-  shadowedCidrIndex,
   shadowedCidrNamed,
   type NodeUseVia,
 } from './nodes-logic';
@@ -363,23 +360,38 @@ export function NodesScreen() {
   const invalidNodes = useAppStore((s) => s.invalidNodes);
   const invalidIndex = useMemo(() => invalidNodeIndex(invalidNodes), [invalidNodes]);
 
-  // 组网同网段「被覆盖（shadowed）」角标（契约·节点角标一节）。判据/口径见 nodes-logic.ts
-  // `shadowedCidrIndex`/`shadowedCidrNamed` 的 JSDoc（含与 `meshForceRoutedServers` 发射端同口径的约束）。
-  const ruleTargetedServerIds = useMemo(
-    () => collectRuleTargetedServerIds([...(config?.customRules ?? []), ...(config?.appRules ?? [])]),
-    [config?.customRules, config?.appRules]
-  );
-  const shadowedIndex = useMemo(
-    () => shadowedCidrIndex(servers, selectedServerId, ruleTargetedServerIds),
-    [servers, selectedServerId, ruleTargetedServerIds]
-  );
+  /* 组网同网段「被覆盖（shadowed）」角标（契约·节点角标一节）。
+   *
+   * 真值源是后端**本次实际结算**（`endpoint_force_route_report`），不是渲染端重算 —— 重算那份
+   * 对 Tailscale 恒发两条硬编码 tailnet 常量，会让任意两个 TS 节点互相「被覆盖」，而真实前缀
+   * 只在运行期观测地址里。判据与口径见 `nodes-logic.shadowedCidrNamed` 的 JSDoc。
+   *
+   * 拉取时机与设置页那份同理：判据 = 当前配置 + 运行期观测地址 ⇒ 节点集/选中出口变了、或核起停
+   * 都要重拉。拉不到一律留在 `null`（= 不画角标），**不折成任何一种结论**。 */
+  const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
+  const [forceRouteReport, setForceRouteReport] = useState<EndpointForceRouteReport | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api.config
+      .endpointForceRouteReport()
+      .then((next) => {
+        if (!cancelled) setForceRouteReport(next);
+      })
+      .catch(() => {
+        // 读不到就是读不到：角标消失，而不是退回本地重算或冒充「无冲突」。
+        if (!cancelled) setForceRouteReport(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [servers, selectedServerId, proxyRunning]);
   const serverNameById = useMemo(
     () => new Map(servers.map((s) => [s.id, s.name])),
     [servers]
   );
   const shadowedNamed = useMemo(
-    () => shadowedCidrNamed(shadowedIndex, serverNameById),
-    [shadowedIndex, serverNameById]
+    () => shadowedCidrNamed(forceRouteReport, serverNameById),
+    [forceRouteReport, serverNameById]
   );
 
   // 测速态。结果读**全局 store**、进度走**全局 toast**（两者订阅都在 App.tsx 顶层，切屏不丢）。

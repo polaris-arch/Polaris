@@ -82,14 +82,29 @@ describe('meshSingletonConflict —— WARP 槽被占（逐条逃逸面）', () 
   });
 });
 
-describe('meshSingletonConflict —— Tailscale 槽', () => {
-  it('已有 TS → 再加一个被拦', () => {
-    expect(meshSingletonConflict(tsNode('new'), [tsNode('t1')])).toBe('tailscale');
+describe('meshSingletonConflict —— Tailscale 已放行（判据换成「网段相交」，而相交创建时判不了）', () => {
+  // 撤掉的理由：单例槽的前提「所有 tailnet 共用 100.64.0.0/10」已被真控制面实测推翻
+  // （自建 headscale 实测发 32.0.0.28/29，与官方段不相交）。相交的真值只在运行期观测地址里，
+  // 而新建节点还没连上控制面 ⇒ 创建期判不了 ⇒ 放行，检出改由生成侧
+  // (`endpoint_force_route_report`) 承担。
+  it('已有 TS → 再加一个**放行**', () => {
+    expect(meshSingletonConflict(tsNode('new'), [tsNode('t1')])).toBeNull();
   });
 
-  it('大小写不敏感', () => {
+  it('已有两个 TS → 第三个照样放行（不是「只放宽一个」）', () => {
+    expect(meshSingletonConflict(tsNode('new'), [tsNode('t1'), tsNode('t2')])).toBeNull();
+  });
+
+  it('大小写不敏感那条随之失效（协议不再是判据）', () => {
     const upper = { ...tsNode('new'), protocol: 'Tailscale' } as unknown as ServerConfig;
-    expect(meshSingletonConflict(upper, [tsNode('t1')])).toBe('tailscale');
+    expect(meshSingletonConflict(upper, [tsNode('t1')])).toBeNull();
+  });
+
+  it('**WARP 未被波及**：TS 放行的同时，第二个 WARP 仍被拦（两支理由不同，不得连坐放宽）', () => {
+    // WARP 守的是内核 utun 资源争用（第二个 WARP → Connect: resource busy FATAL，真机实证），
+    // 与地址空间无关。这条正面断言是「放宽 TS 时没顺手放宽 WARP」的唯一凭据。
+    expect(meshSingletonConflict(warpTagged('new'), [tsNode('t1'), warpTagged('w1')])).toBe('warp');
+    expect(meshSingletonConflict(warpByDomain('new'), [tsNode('t1'), warpTagged('w1')])).toBe('warp');
   });
 });
 
@@ -136,13 +151,16 @@ describe('admitMeshSingletons —— 批量导入逐条准入', () => {
     expect(rejected.map((s) => s.id)).toEqual(['n2']);
   });
 
-  it('两个槽各自独立计数（WARP 满、TS 空 → TS 仍可进一个，第二个被拒）', () => {
+  it('**TS 不再占槽、WARP 仍占**：同批两个 TS 全部准入，第二个 WARP 照拒', () => {
+    // 批量入库是第五条造节点腿，与三个弹窗 + 克隆共用 `meshSingletonConflict`。TS 放行必须
+    // 一路传导到这里（漏了它，导入腿就成了唯一还在按协议拦 TS 的入口）；而同一次断言里
+    // WARP 仍被拒，证明放宽是定向的、不是把整个闸门拆了。
     const { admitted, rejected } = admitMeshSingletons(
       [tsNode('n1'), tsNode('n2'), warpTagged('n3')],
       [warpTagged('w1')]
     );
-    expect(admitted.map((s) => s.id)).toEqual(['n1']);
-    expect(rejected.map((s) => s.id)).toEqual(['n2', 'n3']);
+    expect(admitted.map((s) => s.id)).toEqual(['n1', 'n2']);
+    expect(rejected.map((s) => s.id)).toEqual(['n3']);
   });
 
   it('不 mutate 入参（existing 数组与候选数组原样）', () => {

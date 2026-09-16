@@ -254,9 +254,13 @@ pub fn dispatch(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match &*guard {
-                Some(child) => {
-                    Response::Ok(ResponseKind::Status(Status::Running { pid: child.pid }))
-                }
+                // 身份 token（created/image）是 Windows 专属：mac 的 `running_exe_path`
+                //（`ps -p <pid> -o comm=`）与 `lstart` 本就跨用户可读，app 侧不需要 helper 代读。
+                Some(child) => Response::Ok(ResponseKind::Status(Status::Running {
+                    pid: child.pid,
+                    created: None,
+                    image: None,
+                })),
                 None => Response::Ok(ResponseKind::Status(Status::Stopped)),
             }
         }
@@ -465,6 +469,8 @@ fn handle_start(
                 log_handoff_ms: started.log_handoff_ms,
                 total_ms: crate::elapsed_ms(total_started),
             },
+            // 同 status：身份 token 仅 Windows 回传（Q6）。
+            created: None,
         })),
         Err(SpawnError::NotImplemented) => Response::Err(ProtoError::with_detail(
             ErrorCode::Start,

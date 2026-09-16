@@ -35,6 +35,11 @@ fn deps_default() -> GenerateConfigDeps {
         rule_resources_path: "/fake/rule-resources".into(),
         custom_rules_dir: "/fake/custom-rules".into(),
         tailscale_state_dir_prefix: "/fake/ts".into(),
+        // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+        // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+        tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+        // 无运行期观测（本批生产侧同样恒空）。
+        observed_tailnet_addresses: Default::default(),
         is_valid_srs_fn: |_| false,
         own_lan_cidrs: vec![],
         log: |_, _| {},

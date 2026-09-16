@@ -1,0 +1,317 @@
+════════════════════════════════════════════════════════════════════════
+Polaris route_probe 真机抓取（Windows）
+
+读这份样本、准备照着写解析器的人，先看这三条：
+
+ 1. 两张表的"接口"列根本不是同一种东西（这是 Windows 与 macOS/Linux 最大的不同）：
+      IPv4 路由表的 Interface 列是【本地 IP 地址】，不是接口名；
+      IPv6 路由表的 If 列是【接口索引】（整数）。
+    两者都落不到接口名上，必须再查一张对照表：route print 开头的 Interface List
+    （索引 → 描述）、@@@GET_NETIPADDRESS（IP → 接口别名）、或直接用 @@@GET_NETROUTE_*
+    （它一列就给出 InterfaceAlias）。这三张表本脚本都抓了，别只拿 route print 就动手。
+
+ 2. route print 的表头是本地化的：中文系统上是「接口列表」「IPv4 路由表」「活动路由」。
+    按英文表头硬匹配的解析器在中文机器上解析出空表 —— 而空表长得像"这台机器没有路由"。
+    本次抓取的语言 / 代码页记在 @@@META 里。中文机器上抓的样本比英文的更有价值。
+
+ 3. 编码：route print / ipconfig 是原生 exe，输出按控制台代码页编码。
+    若 @@@ROUTE_PRINT_4 看起来是乱码，用 Windows PowerShell 5.1 重跑，或先 chcp 65001。
+    @@@GET_NETROUTE_* / @@@GET_NETADAPTER 走 cmdlet 对象、不经控制台解码，天然免疫这条。
+
+@@@GET_NETADAPTER 必须带 InterfaceType（IANA ifType）：131 = IF_TYPE_TUNNEL，6 = 以太网。
+隧道名单只能靠它判 —— 这台机器上实测 Teredo / IP-HTTPS / 6to4 三个隧道全是 131，
+两块以太网卡是 6。两条看着可行的土办法都必错：「描述列为空」恰好圈中 Teredo/IP-HTTPS/6to4，
+但 Tailscale 的 wintun **有**描述；「没有 MAC」会把内核调试适配器一起圈进来，而 wintun **自带** MAC。
+ComponentID / NdisPhysicalMedium 一并带上作交叉判据。
+
+落库：把本文件原样放进
+  polaris/crates/system-integration/src/route_probe/tests/fixtures/
+不要手工规整（行尾空格、对齐、空行、CRLF 都是证据）。
+════════════════════════════════════════════════════════════════════════
+@@@META
+platform=windows
+host=sway
+label=wintun-present
+date=2026-09-12 79:d3:79 +08:00
+script=polaris-collect-routes-windows.ps1
+psversion=5.1.26100.9444
+psedition=Desktop
+os=Microsoft Windows NT 10.0.26200.0
+culture=zh-CN
+uiculture=zh-CN
+consoleoutputencoding=gb2312
+@@@ROUTE_PRINT_4
+===========================================================================
+接口列表
+ 22...........................Tailscale Tunnel
+  8...1f 88 e5 88 19 7f ......Red Hat VirtIO Ethernet Adapter
+  1...........................Software Loopback Interface 1
+===========================================================================
+
+IPv4 路由表
+===========================================================================
+活动路由:
+网络目标        网络掩码          网关       接口   跃点数
+          0.0.0.0          0.0.0.0     192.168.10.1   192.168.10.207     16
+        127.0.0.0        255.0.0.0            在链路上         127.0.0.1   5811
+        127.0.0.1  255.255.255.255            在链路上         127.0.0.1   5811
+  127.255.255.255  255.255.255.255            在链路上         127.0.0.1   5811
+      169.254.0.0      255.255.0.0            在链路上    169.254.83.107    261
+   169.254.83.107  255.255.255.255            在链路上    169.254.83.107    261
+  169.254.255.255  255.255.255.255            在链路上    169.254.83.107    261
+     192.168.10.0    255.255.255.0            在链路上    192.168.10.207    271
+   192.168.10.207  255.255.255.255            在链路上    192.168.10.207    271
+   192.168.10.255  255.255.255.255            在链路上    192.168.10.207    271
+        224.0.0.0        240.0.0.0            在链路上         127.0.0.1   5811
+        224.0.0.0        240.0.0.0            在链路上    192.168.10.207    271
+  255.255.255.255  255.255.255.255            在链路上         127.0.0.1   5811
+  255.255.255.255  255.255.255.255            在链路上    192.168.10.207    271
+===========================================================================
+永久路由:
+  网络地址          网络掩码  网关地址  跃点数
+          0.0.0.0          0.0.0.0     192.168.10.1       1
+===========================================================================
+@@@ROUTE_PRINT_6
+===========================================================================
+接口列表
+ 22...........................Tailscale Tunnel
+  8...1f 88 e5 88 19 7f ......Red Hat VirtIO Ethernet Adapter
+  1...........................Software Loopback Interface 1
+===========================================================================
+
+IPv6 路由表
+===========================================================================
+活动路由:
+ 接口跃点数网络目标                网关
+  8    271 ::/0                     fe80::7fd:1819:1bc5:9967
+  1    331 ::1/128                  在链路上
+  8    271 aded:14a8:b9be:ee8b::/60 fe80::7fd:1819:1bc5:9967
+  8    271 aded:14a8:b9be:ee8b::/64 在链路上
+  8    271 aded:14a8:b9be:ee8b:f856:b1c9:93f7:98b0/128
+                                    在链路上
+  8    271 aded:14a8:b9be:ee8b:a299:66db:b1c3:dba4/128
+                                    在链路上
+  8    271 aded:14a8:b9be:ee8b:c140:1f55:b504:e61d/128
+                                    在链路上
+  8    271 aded:14a8:b9be:ee8b:84a4:db75:7352:84a9/128
+                                    在链路上
+  8    271 aded:14a8:b9be:ee8b:3b16:5d2f:a812:3f6c/128
+                                    在链路上
+  8    271 9757:a50f:cf73:9c4e::/60 fe80::7fd:1819:1bc5:9967
+  8    271 9757:a50f:cf73:9c4e::/64 在链路上
+  8    271 9757:a50f:cf73:9c4e::965/128
+                                    在链路上
+  8    271 9757:a50f:cf73:9c4e:f856:b1c9:93f7:98b0/128
+                                    在链路上
+  8    271 9757:a50f:cf73:9c4e:c140:1f55:b504:e61d/128
+                                    在链路上
+  8    271 9757:a50f:cf73:9c4e:84a4:db75:7352:84a9/128
+                                    在链路上
+  8    271 9757:a50f:cf73:9c4e:3b16:5d2f:a812:3f6c/128
+                                    在链路上
+  8    271 9757:a50f:cf73:9c4e:c066:168b:3a79:2d99/128
+                                    在链路上
+  8    271 9757:a50f:cf73:5d01::/64 fe80::1746:94ca:edf3:b388
+  8    271 9757:a50f:cf73:5d01::/64 fe80::cbad:eb0e:16e2:760f
+  8    271 d114:342:b8da:6d8e::/56  fe80::7fd:1819:1bc5:9967
+  8    271 d114:342:b8da:6d8e::/64  在链路上
+  8    271 d114:342:b8da:6d8e::965/128
+                                    在链路上
+  8    271 d114:342:b8da:6d8e:f856:b1c9:93f7:98b0/128
+                                    在链路上
+  8    271 d114:342:b8da:6d8e:3734:8e25:ced:bce2/128
+                                    在链路上
+  8    271 d114:342:b8da:6d8e:c140:1f55:b504:e61d/128
+                                    在链路上
+  8    271 d114:342:b8da:6d8e:84a4:db75:7352:84a9/128
+                                    在链路上
+  8    271 d114:342:b8da:6d8e:3b16:5d2f:a812:3f6c/128
+                                    在链路上
+  8    271 fe80::/64                在链路上
+  8    271 fe80::3463:e45e:6a9c:9334/128
+                                    在链路上
+  1    331 ff00::/8                 在链路上
+  8    271 ff00::/8                 在链路上
+===========================================================================
+永久路由:
+  无
+@@@GET_NETADAPTER
+
+InterfaceAlias                        InterfaceIndex InterfaceType NdisPhysicalMedium ComponentID                                  DriverDescription                      Name                                  InterfaceDescription                   Status      MacAddress       
+--------------                        -------------- ------------- ------------------ -----------                                  -----------------                      ----                                  --------------------                   ------      ----------       
+Teredo Tunneling Pseudo-Interface                 12           131                  0                                                                                     Teredo Tunneling Pseudo-Interface                                            Not Present                  
+以太网                                                8             6                  0 PCI\VEN_1AF4&DEV_1000&SUBSYS_00011AF4&REV_00 Red Hat VirtIO Ethernet Adapter        以太网                                   Red Hat VirtIO Ethernet Adapter        Up          5b-88-e5-88-19-7f
+Tailscale                                         22            53                  0 Wintun                                       Wintun Userspace Tunnel                Tailscale                             Tailscale Tunnel                       Up                           
+以太网(内核调试器)                                         7             6                 14 root\kdnic                                   Microsoft Kernel Debug Network Adapter 以太网(内核调试器)                            Microsoft Kernel Debug Network Adapter Not Present                  
+Microsoft IP-HTTPS Platform Interface              6           131                  0                                                                                     Microsoft IP-HTTPS Platform Interface                                        Not Present                  
+6to4 Adapter                                       3           131                  0                                                                                     6to4 Adapter                                                                 Not Present                  
+
+
+@@@NETSH_INTERFACE
+
+Idx     Met         MTU          鐘舵€?               鍚嶇О
+---  ----------  ----------  ------------  ---------------------------
+  1        5555  4294967295  connected     Loopback Pseudo-Interface 1
+  8          15        1500  connected     浠ュお缃?
+ 22           5        1280  connected     Tailscale
+
+@@@GET_NETROUTE_4
+
+DestinationPrefix  InterfaceAlias              InterfaceIndex NextHop      RouteMetric       Store
+-----------------  --------------              -------------- -------      -----------       -----
+127.0.0.0/8        Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+127.0.0.1/32       Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+127.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+224.0.0.0/4        Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+255.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0              256 ActiveStore
+0.0.0.0/0          以太网                                      8 192.168.10.1           1 ActiveStore
+192.168.10.0/24    以太网                                      8 0.0.0.0              256 ActiveStore
+192.168.10.207/32  以太网                                      8 0.0.0.0              256 ActiveStore
+192.168.10.255/32  以太网                                      8 0.0.0.0              256 ActiveStore
+224.0.0.0/4        以太网                                      8 0.0.0.0              256 ActiveStore
+255.255.255.255/32 以太网                                      8 0.0.0.0              256 ActiveStore
+169.254.0.0/16     Tailscale                               22 0.0.0.0              256 ActiveStore
+169.254.255.255/32 Tailscale                               22 0.0.0.0              256 ActiveStore
+169.254.83.107/32  Tailscale                               22 0.0.0.0              256 ActiveStore
+
+
+@@@GET_NETROUTE_6
+
+DestinationPrefix                           InterfaceAlias              InterfaceIndex NextHop                   RouteMetric       Store
+-----------------                           --------------              -------------- -------                   -----------       -----
+::1/128                                     Loopback Pseudo-Interface 1              1 ::                                256 ActiveStore
+ff00::/8                                    Loopback Pseudo-Interface 1              1 ::                                256 ActiveStore
+::/0                                        以太网                                      8 fe80::7fd:1819:1bc5:9967          256 ActiveStore
+aded:14a8:b9be:ee8b::/60                    以太网                                      8 fe80::7fd:1819:1bc5:9967          256 ActiveStore
+aded:14a8:b9be:ee8b::/64                    以太网                                      8 ::                                256 ActiveStore
+aded:14a8:b9be:ee8b:f856:b1c9:93f7:98b0/128 以太网                                      8 ::                                256 ActiveStore
+aded:14a8:b9be:ee8b:a299:66db:b1c3:dba4/128 以太网                                      8 ::                                256 ActiveStore
+aded:14a8:b9be:ee8b:c140:1f55:b504:e61d/128 以太网                                      8 ::                                256 ActiveStore
+aded:14a8:b9be:ee8b:84a4:db75:7352:84a9/128 以太网                                      8 ::                                256 ActiveStore
+aded:14a8:b9be:ee8b:3b16:5d2f:a812:3f6c/128 以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:9c4e::/60                    以太网                                      8 fe80::7fd:1819:1bc5:9967          256 ActiveStore
+9757:a50f:cf73:9c4e::/64                    以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:9c4e::965/128                以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:9c4e:f856:b1c9:93f7:98b0/128 以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:9c4e:c140:1f55:b504:e61d/128 以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:9c4e:84a4:db75:7352:84a9/128 以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:9c4e:3b16:5d2f:a812:3f6c/128 以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:9c4e:c066:168b:3a79:2d99/128 以太网                                      8 ::                                256 ActiveStore
+9757:a50f:cf73:5d01::/64                    以太网                                      8 fe80::cbad:eb0e:16e2:760f         256 ActiveStore
+9757:a50f:cf73:5d01::/64                    以太网                                      8 fe80::1746:94ca:edf3:b388         256 ActiveStore
+d114:342:b8da:6d8e::/56                     以太网                                      8 fe80::7fd:1819:1bc5:9967          256 ActiveStore
+d114:342:b8da:6d8e::/64                     以太网                                      8 ::                                256 ActiveStore
+d114:342:b8da:6d8e::965/128                 以太网                                      8 ::                                256 ActiveStore
+d114:342:b8da:6d8e:f856:b1c9:93f7:98b0/128  以太网                                      8 ::                                256 ActiveStore
+d114:342:b8da:6d8e:3734:8e25:ced:bce2/128   以太网                                      8 ::                                256 ActiveStore
+d114:342:b8da:6d8e:c140:1f55:b504:e61d/128  以太网                                      8 ::                                256 ActiveStore
+d114:342:b8da:6d8e:84a4:db75:7352:84a9/128  以太网                                      8 ::                                256 ActiveStore
+d114:342:b8da:6d8e:3b16:5d2f:a812:3f6c/128  以太网                                      8 ::                                256 ActiveStore
+fe80::/64                                   以太网                                      8 ::                                256 ActiveStore
+fe80::3463:e45e:6a9c:9334/128               以太网                                      8 ::                                256 ActiveStore
+ff00::/8                                    以太网                                      8 ::                                256 ActiveStore
+
+
+@@@GET_NETIPADDRESS
+
+IPAddress                               PrefixLength AddressFamily InterfaceAlias              InterfaceIndex
+---------                               ------------ ------------- --------------              --------------
+127.0.0.1                                          8          IPv4 Loopback Pseudo-Interface 1              1
+::1                                              128          IPv6 Loopback Pseudo-Interface 1              1
+192.168.10.207                                    24          IPv4 以太网                                      8
+9757:a50f:cf73:9c4e::965                         128          IPv6 以太网                                      8
+aded:14a8:b9be:ee8b:3b16:5d2f:a812:3f6c          128          IPv6 以太网                                      8
+9757:a50f:cf73:9c4e:c140:1f55:b504:e61d          128          IPv6 以太网                                      8
+9757:a50f:cf73:9c4e:f856:b1c9:93f7:98b0          128          IPv6 以太网                                      8
+aded:14a8:b9be:ee8b:a299:66db:b1c3:dba4           64          IPv6 以太网                                      8
+aded:14a8:b9be:ee8b:f856:b1c9:93f7:98b0          128          IPv6 以太网                                      8
+aded:14a8:b9be:ee8b:84a4:db75:7352:84a9          128          IPv6 以太网                                      8
+aded:14a8:b9be:ee8b:c140:1f55:b504:e61d          128          IPv6 以太网                                      8
+d114:342:b8da:6d8e:c140:1f55:b504:e61d           128          IPv6 以太网                                      8
+d114:342:b8da:6d8e:3734:8e25:ced:bce2             64          IPv6 以太网                                      8
+d114:342:b8da:6d8e:84a4:db75:7352:84a9           128          IPv6 以太网                                      8
+fe80::3463:e45e:6a9c:9334%8                       64          IPv6 以太网                                      8
+d114:342:b8da:6d8e:3b16:5d2f:a812:3f6c           128          IPv6 以太网                                      8
+9757:a50f:cf73:9c4e:3b16:5d2f:a812:3f6c          128          IPv6 以太网                                      8
+9757:a50f:cf73:9c4e:84a4:db75:7352:84a9          128          IPv6 以太网                                      8
+9757:a50f:cf73:9c4e:c066:168b:3a79:2d99           64          IPv6 以太网                                      8
+d114:342:b8da:6d8e:f856:b1c9:93f7:98b0           128          IPv6 以太网                                      8
+d114:342:b8da:6d8e::965                          128          IPv6 以太网                                      8
+169.254.83.107                                    16          IPv4 Tailscale                               22
+fe80::dd23:f7ec:3365:1fba%22                      64          IPv6 Tailscale                               22
+
+
+@@@NETSH_INTERFACE_6
+
+Idx     Met         MTU          鐘舵€?               鍚嶇О
+---  ----------  ----------  ------------  ---------------------------
+  1          75  4294967295  connected     Loopback Pseudo-Interface 1
+  8          15        1492  connected     浠ュお缃?
+ 22           5        1280  connected     Tailscale
+
+@@@IPCONFIG
+
+Windows IP 配置
+
+   主机名  . . . . . . . . . . . . . : Sway
+   主 DNS 后缀 . . . . . . . . . . . : 
+   节点类型  . . . . . . . . . . . . : 混合
+   IP 路由已启用 . . . . . . . . . . : 否
+   WINS 代理已启用 . . . . . . . . . : 否
+
+未知适配器 Tailscale:
+
+   连接特定的 DNS 后缀 . . . . . . . : 
+   描述. . . . . . . . . . . . . . . : Tailscale Tunnel
+   物理地址. . . . . . . . . . . . . : 
+   DHCP 已启用 . . . . . . . . . . . : 否
+   自动配置已启用. . . . . . . . . . : 是
+   本地链接 IPv6 地址. . . . . . . . : fe80::dd23:f7ec:3365:1fba%22(首选) 
+   自动配置 IPv4 地址  . . . . . . . : 169.254.83.107(首选) 
+   子网掩码  . . . . . . . . . . . . : 255.255.0.0
+   默认网关. . . . . . . . . . . . . : 
+   TCPIP 上的 NetBIOS  . . . . . . . : 已启用
+
+以太网适配器 以太网:
+
+   连接特定的 DNS 后缀 . . . . . . . : 
+   描述. . . . . . . . . . . . . . . : Red Hat VirtIO Ethernet Adapter
+   物理地址. . . . . . . . . . . . . : 5b-88-e5-88-19-7f
+   DHCP 已启用 . . . . . . . . . . . : 否
+   自动配置已启用. . . . . . . . . . : 是
+   IPv6 地址 . . . . . . . . . . . . : aded:14a8:b9be:ee8b:a299:66db:b1c3:dba4(首选) 
+   IPv6 地址 . . . . . . . . . . . . : 9757:a50f:cf73:9c4e::965(首选) 
+   获得租约的时间  . . . . . . . . . : 2026年9月12日 fd:ec:1b
+   租约过期的时间  . . . . . . . . . : 2026年9月12日 11:2e:1b
+   IPv6 地址 . . . . . . . . . . . . : 9757:a50f:cf73:9c4e:c066:168b:3a79:2d99(首选) 
+   IPv6 地址 . . . . . . . . . . . . : d114:342:b8da:6d8e::965(首选) 
+   获得租约的时间  . . . . . . . . . : 2026年9月9日 1:e4:1d
+   租约过期的时间  . . . . . . . . . : 2026年9月12日 11:2e:1d
+   IPv6 地址 . . . . . . . . . . . . : d114:342:b8da:6d8e:3734:8e25:ced:bce2(首选) 
+   临时 IPv6 地址. . . . . . . . . . : aded:14a8:b9be:ee8b:f856:b1c9:93f7:98b0(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : aded:14a8:b9be:ee8b:c140:1f55:b504:e61d(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : aded:14a8:b9be:ee8b:84a4:db75:7352:84a9(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : aded:14a8:b9be:ee8b:3b16:5d2f:a812:3f6c(首选) 
+   临时 IPv6 地址. . . . . . . . . . : 9757:a50f:cf73:9c4e:f856:b1c9:93f7:98b0(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : 9757:a50f:cf73:9c4e:c140:1f55:b504:e61d(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : 9757:a50f:cf73:9c4e:84a4:db75:7352:84a9(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : 9757:a50f:cf73:9c4e:3b16:5d2f:a812:3f6c(首选) 
+   临时 IPv6 地址. . . . . . . . . . : d114:342:b8da:6d8e:f856:b1c9:93f7:98b0(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : d114:342:b8da:6d8e:c140:1f55:b504:e61d(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : d114:342:b8da:6d8e:84a4:db75:7352:84a9(受到抨击) 
+   临时 IPv6 地址. . . . . . . . . . : d114:342:b8da:6d8e:3b16:5d2f:a812:3f6c(首选) 
+   本地链接 IPv6 地址. . . . . . . . : fe80::3463:e45e:6a9c:9334%8(首选) 
+   IPv4 地址 . . . . . . . . . . . . : 192.168.10.207(首选) 
+   子网掩码  . . . . . . . . . . . . : 255.255.255.0
+   默认网关. . . . . . . . . . . . . : fe80::7fd:1819:1bc5:9967%8
+                                       192.168.10.1
+   DHCPv6 IAID . . . . . . . . . . . : 112993297
+   DHCPv6 客户端 DUID  . . . . . . . : 00-1a-1a-00-29-7a-19-32-5b-88-e5-88-98-95
+   DNS 服务器  . . . . . . . . . . . : 9757:a50f:cf73:9c4e::1
+                                       192.168.10.1
+                                       aded:14a8:b9be:ee8b::1
+                                       9757:a50f:cf73:9c4e::1
+   TCPIP 上的 NetBIOS  . . . . . . . : 已启用
+@@@TAILSCALE
+Logged out.
+<<POLARIS-CAPTURE-UNAVAILABLE>> 退出码 1，上面的输出可能不完整

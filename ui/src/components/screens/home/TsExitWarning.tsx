@@ -41,14 +41,16 @@ export function TsExitWarning() {
   });
   if (warning === 'none') return null;
 
-  // 「选择出口设备」→ 打开 TS 设置弹窗（内含出口设备选择，单例弹窗自查现有节点）。
-  const goPickExitNode = () => openDialog({ kind: 'ts-settings' });
+  // 「选择出口设备」→ 打开 TS 设置弹窗，携 tsId（Tailscale 不再是单例，弹窗不许自查；`warning`
+  // 非 'none' 时 tsId 必已由 `deriveTsExitWarning` 的前置条件保证存在——本行只是 TS 类型不知道）。
+  const goPickExitNode = () => tsId && openDialog({ kind: 'ts-settings', serverId: tsId });
   // 「去登录」→ 优先直接开控制面给的这一份 authURL（末帧带；App.tsx 的全局兜底只在 URL **首次**到达
-  // 那一刻自动开过一次浏览器，用户错过就没有第二次）；没有 URL 时退回登录弹窗。
+  // 那一刻自动开过一次浏览器，用户错过就没有第二次）；没有 URL 时退回登录弹窗，携 tsId ——
+  // 若不带 id，登录弹窗会把这次登录当「新建」处理，凭空多出一个 TS 节点而不是给当前这个补登录。
   const goAuth = () => {
     const url = status?.authURL || authUrl;
     if (url) void api.system.openExternal(url);
-    else openDialog({ kind: 'ts-login' });
+    else openDialog({ kind: 'ts-login', serverId: tsId });
   };
 
   const text =

@@ -363,7 +363,13 @@ fn every_protocol_is_filed_under_exactly_one_routing_class() {
 /// 反向也钉：普通出站协议即使填了 `meshRoutes` 也不该产出网段（那个字段只对 endpoint 腿有意义）。
 #[test]
 fn mesh_protocols_actually_have_a_cidr_source() {
-    use polaris_config_engine::builder::endpoint_routes::endpoint_forced_route_cidrs;
+    use polaris_config_engine::builder::endpoint_routes::{
+        endpoint_forced_route_cidrs, ObservedTailnetAddresses,
+    };
+
+    // 本门问的是「声明为组网协议的，拿不拿得出网段」，与运行期观测面无关 —— 给空观测，
+    // 走的就是各协议的配置期来源（WG=allowedIPs / TS=bootstrap 默认两段 / 非组网=空）。
+    let no_observation = ObservedTailnetAddresses::new();
     use polaris_config_engine::user_config::server_config::{
         is_mesh_protocol, ServerConfig, WireGuardSettings,
     };
@@ -379,18 +385,22 @@ fn mesh_protocols_actually_have_a_cidr_source() {
         ..Default::default()
     };
     assert!(
-        is_mesh_protocol(Protocol::Wireguard) && !endpoint_forced_route_cidrs(&wg).is_empty(),
+        is_mesh_protocol(Protocol::Wireguard)
+            && !endpoint_forced_route_cidrs(&wg, &no_observation).is_empty(),
         "WireGuard 声明为组网协议却拿不出网段 —— 判据与实现脱节"
     );
 
-    // Tailscale 的段是协议固定的 tailnet 两族，连设置都不用填。
+    // Tailscale 无观测时回落 bootstrap 默认两段，连设置都不用填。
+    // （有观测时语义是「观测段取代默认段 + MagicDNS 两条恒发」，见 `ObservedTailnetAddresses`
+    //   的「# 语义」一节 —— 那条轴由 config-engine 自己的门管，不在本门射程。）
     let ts = ServerConfig {
         id: "ts".into(),
         protocol: Protocol::Tailscale,
         ..Default::default()
     };
     assert!(
-        is_mesh_protocol(Protocol::Tailscale) && !endpoint_forced_route_cidrs(&ts).is_empty(),
+        is_mesh_protocol(Protocol::Tailscale)
+            && !endpoint_forced_route_cidrs(&ts, &no_observation).is_empty(),
         "Tailscale 声明为组网协议却拿不出网段"
     );
 
@@ -400,5 +410,5 @@ fn mesh_protocols_actually_have_a_cidr_source() {
         protocol: Protocol::Vless,
         ..Default::default()
     };
-    assert!(endpoint_forced_route_cidrs(&vless).is_empty());
+    assert!(endpoint_forced_route_cidrs(&vless, &no_observation).is_empty());
 }

@@ -62,18 +62,36 @@ export function isAccountBasedProtocol(protocol: string | undefined): boolean {
  */
 export type MeshSlotServer = Parameters<typeof isWarpServer>[0] & { id?: string };
 
-/**
- * Tailscale 单节点硬限：已存在一个 Tailscale 节点时该「槽位」即被占用。
- * 同一设备的所有 Tailscale 账号共用同一段网络地址（100.64.0.0/10 tailnet），多个会互相顶掉，故全局只许一个。
- * editingId 排除自身——编辑现有 TS 节点不算「再加一个」，必须放行。
- * 纯函数（仅看协议字段）：UI 主拦截点（use-server-actions）+ ConfigManager 兜底归一共用，可离线单测。
- */
-export function tailscaleSlotTaken(servers: MeshSlotServer[], editingId?: string): boolean {
-  return servers.some((s) => s.protocol?.toLowerCase() === 'tailscale' && s.id !== editingId);
-}
+/* `tailscaleSlotTaken` 已删（2026-09-11，A-1b）。
+ *
+ * 它的判据是「已存在一个 Tailscale 节点 ⇒ 槽位被占」，理由写着「同一设备的所有 Tailscale 账号
+ * 共用同一段网络地址（100.64.0.0/10 tailnet），多个会互相顶掉」。**那个前提已被真控制面实测
+ * 推翻**：自建 headscale 的 `prefixes.v4` 可自定义，实测某 tailnet 把地址发成 `32.0.0.28` /
+ * `32.0.0.29`，与官方 `100.64.0.0/10` 不相交 —— 两个不同控制面的账号在地址空间上根本不打架。
+ * 「共用同一段」的错觉来自 Rust 侧那个硬编码常量（`endpoint_routes.rs` 的 `TAILNET_CGNAT`）。
+ *
+ * 判据的真值是**网段是否相交**，而相交在**创建时判不了**：一个刚建的 Tailscale 节点还没连上
+ * 控制面，它的 tailnet 前缀不可知。在前端猜一个前缀来维持创建期拦截，就是拿想象中的值当判据 ——
+ * 正是本轮要终结的那类错误。故创建期放行，真实相交由生成侧（有运行期观测地址那一端）检出：
+ * `crates/config-engine/src/builder/endpoint_routes.rs::endpoint_force_route_report`，
+ * 经只读 command `endpoint_force_route_report` 暴露。
+ *
+ * **WARP 那一支没跟着放宽**，理由完全不同且仍然成立：第二个 WARP 会与主 TUN 抢内核 utun →
+ * `Connect: resource busy` FATAL（真机实证）。那是内核资源争用，不是地址空间问题。 */
 
-/** 全局至多一个实例的组网协议槽。 */
-export type MeshSingletonSlot = 'warp' | 'tailscale';
+/**
+ * 全局至多一个实例的组网协议槽。
+ *
+ * **只剩 `'warp'` 一支**（2026-09-11 清理完毕）。`'tailscale'` 曾在这里挂着：判据撤掉之后
+ * 那个成员已经不由任何代码路径产出，但两支拒绝文案（`nodes.tsSlotTaken` /
+ * `nodes.cloneTsSingleton`）还在五份 locale 里活着 —— 而它们说的正是被真控制面实测推翻的那句
+ * 「多个 Tailscale 会互相顶掉 tailnet 地址」。本轮连成员带文案一并删除：一个**不可达且内容已错**
+ * 的分支留着，只会在下一次有人读它时把错误前提再传播一遍。
+ *
+ * 留成单成员联合（而不是把它塌成 `'warp'` 字面量到处写）是为了让「再加一个单例槽」这件事仍有
+ * 唯一落点：`meshSingletonMessage` 的穷举 switch 会当场逼出那条新文案。
+ */
+export type MeshSingletonSlot = 'warp';
 
 /**
  * **造节点路径的统一单例闸门**：候选节点会不会撞上已被占用的 WARP / Tailscale 槽位；撞上则返回槽名，否则 null。
@@ -82,10 +100,13 @@ export type MeshSingletonSlot = 'warp' | 'tailscale';
  * 而 WgDialog（粘贴 Cloudflare `.conf` → 端点域名兜底判定即 WARP）、ImportDialog（批量入库）、
  * NodeDialog、克隆 都能绕过接入区直调 `server:add` / `server:addBulk`，后端两命令均无守卫
  * （见 `src-tauri/src/commands/server.rs` 的 DESIGN-REVIEW(mesh-singleton-guard-renderer-only)）。
- * 第二个 WARP 会与主 TUN 抢内核 utun → `Connect: resource busy` FATAL（真机实证，见 meshUsesSystemInterface）；
- * 第二个 Tailscale 会与第一个互顶 tailnet 地址。
+ * 第二个 WARP 会与主 TUN 抢内核 utun → `Connect: resource busy` FATAL（真机实证，见 meshUsesSystemInterface）。
  *
- * editingId 排除自身：编辑现有 WARP/TS 节点不算「再加一个」，必须放行（与两个 slotTaken 同义）。
+ * **只剩 WARP 一个槽**（2026-09-11）：Tailscale 那一支已撤，理由与撤法见本文件
+ * `tailscaleSlotTaken` 的墓碑注释 —— 一句话是「冲突的真值是网段相交，而相交在创建时判不了」。
+ * WARP 这一支**寸步不让**：它守的是内核 utun 资源争用，与地址空间无关，放宽会造出真 FATAL。
+ *
+ * editingId 排除自身：编辑现有 WARP 节点不算「再加一个」，必须放行（与 warpSlotTaken 同义）。
  * 纯函数：三个弹窗 + 克隆 + 批量导入共用同一真值，可离线单测。
  */
 export function meshSingletonConflict(
@@ -94,9 +115,6 @@ export function meshSingletonConflict(
   editingId?: string
 ): MeshSingletonSlot | null {
   if (isWarpServer(candidate) && warpSlotTaken(servers, editingId)) return 'warp';
-  if (candidate.protocol?.toLowerCase() === 'tailscale' && tailscaleSlotTaken(servers, editingId)) {
-    return 'tailscale';
-  }
   return null;
 }
 
@@ -452,41 +470,37 @@ export function meshSelectedExitFallsBackToDirect(config: UserConfig): boolean {
   );
 }
 
-/**
- * 全部节点的 mesh force-route 段并集（去重）。供「路由规则与组网段重叠」提醒共用：
- * main 的 config-gen warn + renderer 的内联 hint/列表角标。用全量 servers（非仅 emitted）以覆盖潜在重叠。
- */
-export function meshForcedRouteCidrs(servers: ServerConfig[]): string[] {
-  return dedupe(servers.flatMap((s) => endpointForcedRouteCidrs(s)));
-}
-
-/** 一条被抢占的网段：`cidr` 不会经本节点路由，实际生效的是 `byId` 那个更早声明它的节点。 */
-export interface ShadowedCidr {
-  cidr: string;
-  /** 抢占者 serverId（首声明者）。角标 tooltip 要答「被谁覆盖」，只给 cidr 用户仍无从下手。 */
-  byId: string;
-}
-
-/**
- * 跨组网节点同网段「被覆盖（shadowed）」检测：按 `servers` 顺序「首声明者占有」（与 route-builder
- * `claimedCidrs` 同一不变量——一条 ip_cidr 只能指向一个 outbound，首条命中即生效）。返回 serverId →
- * 该节点中被更早节点抢占、因而**不会**实际生效的具体段（含抢占者 id，仅含有冲突的节点）。供列表
- * 「网段被覆盖」角标提醒用：用户据此去重/调序/用自定义规则覆盖。
+/* `meshForcedRouteCidrs` 已删（本批），请勿凭记忆再移植一份回来。
  *
- * **调用方应传 emitted 口径**（`meshForceRoutedServers` 的产物），与发射端同口径，避免对「仅出网且未
- * engaged」的节点虚报覆盖——该函数本身不做这层过滤（它只实现「首声明者占有」这一条不变量）。
- */
-export function meshShadowedCidrs(servers: ServerConfig[]): Map<string, ShadowedCidr[]> {
-  const claimedBy = new Map<string, string>();
-  const result = new Map<string, ShadowedCidr[]>();
-  for (const s of servers) {
-    const shadowed: ShadowedCidr[] = [];
-    for (const c of endpointForcedRouteCidrs(s)) {
-      const owner = claimedBy.get(c);
-      if (owner !== undefined) shadowed.push({ cidr: c, byId: owner });
-      else claimedBy.set(c, s.id);
-    }
-    if (shadowed.length > 0) result.set(s.id, shadowed);
-  }
-  return result;
-}
+ * 它是「全部组网节点的 force-route 段并集」的**渲染端重算**，唯一消费点是规则列表的
+ * 「覆盖组网」角标。它的段同样来自 `endpointForcedRouteCidrs` —— 对 Tailscale 恒产出
+ * `TAILNET_CGNAT` + `TAILNET_ULA_V6` 两条硬编码常量，而自建 headscale 的 `prefixes.v4`
+ * 可自定义（实测 `32.0.0.0/24`，与官方段零相交）。于是用户写一条覆盖自建 tailnet 的规则、
+ * 那条规则确实会遮蔽 tailnet（自定义规则排在组网之前，首匹配），角标却**结构性不亮**。
+ *
+ * 它还有第二层结构性盲区：自建 tailnet 的观测段走的是**外化 rule-set 腿**（段值住在文件里、
+ * 热重载），渲染端连那条腿的存在都看不见。
+ *
+ * 判据因此搬到有真值的那一端：`endpoint_force_route_report` 命令按块 0c 的同一套腿选择 +
+ * 同一次结算给出逐节点 `emitted` 与 `externalRuleSetCidrs`，角标改为消费它们的并集
+ * （`domain/mesh-rule-overlap.forceRoutedCidrsFromReport`）。
+ *
+ * 与本文件另外三条墓碑（`customEndpointCarriesTraffic` / `referencedServerIds` /
+ * `meshShadowedCidrs`）同一条教训：判据的单一真值在生成侧，渲染端要这个答案就走 IPC 问，
+ * 不要再抄一份会漂的实现。 */
+
+/* `meshShadowedCidrs` / `ShadowedCidr` 已删（本批），请勿凭记忆再移植一份回来。
+ *
+ * 它是「跨组网节点同网段被覆盖」的**渲染端重算**，唯一消费点是节点卡的「网段被覆盖」角标。
+ * 它的段来自 `endpointForcedRouteCidrs` —— 对 Tailscale **恒**产出 `TAILNET_CGNAT` +
+ * `TAILNET_ULA_V6` 两条硬编码常量 ⇒ 任意两个 TS 节点的段必然完全重合 ⇒ 第二个恒亮角标，
+ * 与它们的 tailnet 是否真的相交无关。那个前提已被真控制面实测推翻（自建 headscale 的
+ * `prefixes.v4` 可自定义，实测发到 `32.0.0.28`，与官方 CGNAT 段零相交）。
+ *
+ * 真实前缀只存在于**运行期观测地址**里，渲染端结构上拿不到这个维度 —— 判据因此搬到有真值的
+ * 那一端：`endpoint_force_route_report` 命令按块 0c 的同一套腿选择 + 同一次结算给出逐节点
+ * `absorbed`（含抢占者 id）与 `zeroCoverageServerIds`。角标改为消费它
+ * （`screens/nodes/nodes-logic.shadowedCidrNamed`），设置页的「组网网段结算」块读同一份。
+ *
+ * 与本文件另外两条墓碑（`customEndpointCarriesTraffic` / `referencedServerIds`）同一条教训：
+ * 判据的单一真值在生成侧，渲染端要这个答案就走 IPC 问，不要再抄一份会漂的实现。 */

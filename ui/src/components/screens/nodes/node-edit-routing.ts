@@ -23,7 +23,8 @@ export function editDialogFor(server: ServerConfig): DialogDesc {
   // WARP 必须先判：它的 protocol 也是 'wireguard'，但走单例槽 warp 弹窗（无 serverId，弹窗自查现有节点）。
   if (isWarpServer(server)) return { kind: 'warp', edit: true };
   if (server.protocol === 'wireguard') return { kind: 'wg', serverId: server.id };
-  // Tailscale 是单例：ts-settings 弹窗自查现有节点，不带 serverId。
-  if (server.protocol === 'tailscale') return { kind: 'ts-settings' };
+  // Tailscale 已不是单例（meshSingletonConflict 只剩 WARP 支）：必须携 serverId，
+  // 否则多个 TS 节点时 ts-settings 弹窗只会自查到任意一个，编辑第二个节点会打开/写坏第一个。
+  if (server.protocol === 'tailscale') return { kind: 'ts-settings', serverId: server.id };
   return { kind: 'node', serverId: server.id };
 }

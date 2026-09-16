@@ -102,3 +102,15 @@ fn wire_ok_matches_go_format() {
     assert_eq!(wire(ResponseKind::Cleaned), "OK cleaned");
     assert_eq!(wire(ResponseKind::Uninstalling), "OK uninstalling");
 }
+
+/// D4：`flush-dns` 必须在解码侧被认出来（无参数行）。
+///
+/// 变异：删掉 `FLUSH_DNS` 那一格 → 本条转红。分派层实现了新分支却漏了解码，serve 循环会在
+/// `parse_request` 返 `None` 时直接回 `ERR unknown`，新分支一辈子够不着。
+#[test]
+fn parse_request_flush_dns() {
+    assert!(matches!(
+        parse_request("flush-dns", &[][..]),
+        Some(Request::FlushDns)
+    ));
+}

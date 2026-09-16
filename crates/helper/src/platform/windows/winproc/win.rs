@@ -10,19 +10,21 @@ use crate::platform::windows::logic::{
     local_port_from_net_order, AF_INET, AF_INET6, MIB_TCP_STATE_LISTEN,
     TCP_TABLE_OWNER_PID_LISTENER,
 };
-use crate::platform::windows::ops::{CoreStart, NetTableOps, ProcOps};
+use crate::platform::windows::ops::{CoreStart, ManagedIdentity, NetTableOps, ProcOps};
 use crate::platform::windows::selfuninstall::self_uninstall_cmd_line;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FALSE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FALSE, FILETIME, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -47,9 +49,10 @@ use windows_sys::Win32::System::Registry::{
     REG_DWORD, REG_OPTION_NON_VOLATILE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+    TerminateProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    DETACHED_PROCESS, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE, STARTUPINFOW,
 };
 
 /// IPv4 TCP owner PID 行（`winproc.go:259-266` `MIB_TCPROW_OWNER_PID`）。
@@ -81,6 +84,37 @@ struct MibTcp6RowOwnerPid {
 /// STILL_ACTIVE（`winproc.go:141`，GetExitCodeProcess 的活跃码 = 259）。
 const STILL_ACTIVE_CODE: u32 = 259;
 
+/// 钉住 [`crate::platform::windows::logic::CREATE_NO_WINDOW`] 里硬编码的位值 == `windows-sys` 常量。
+///
+/// 同 `service::win` 对 `logic::pipe_open_mode` 的断言：纯逻辑层要在 Linux 上可单测，就不能引
+/// `windows-sys`；镜像值与真值的一致性交给这条 windows-only 编译期断言，两边一动即编不过。
+const _: () = {
+    assert!(crate::platform::windows::logic::CREATE_NO_WINDOW == CREATE_NO_WINDOW);
+};
+
+/// 受管核的进程句柄与随之读到的身份（D2/D3）。
+///
+/// **为什么要一直持有这个句柄**：Windows 只在进程对象**没有任何句柄**时才回收其 PID
+/// （[Process Handles and Identifiers]）。此前 start 完就 `drop(child)`，句柄一关，核一退出
+/// 号码立刻可被别的进程复用 —— 于是 `OpenProcess(pid)` 恒成功、helper 报 running、app 的崩溃
+/// 自愈永不触发；`TerminateProcess(OpenProcess(pid))` 更会砍到那个无辜的复用者。
+/// 句柄在手 ⇒ 这个 PID 在核活着与死后都还是它自己的，status/reap/terminate 三条腿据此都变成
+/// 「对同一个进程对象」的操作，而不是「对同一个号码」的操作。
+///
+/// 与 Job Object 无关：`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 系于 **job 句柄**，多持一个进程句柄
+/// 不改变它的语义（helper 一死，job 句柄随进程关闭，内核照样连坐杀 child）。
+///
+/// [Process Handles and Identifiers]: https://learn.microsoft.com/en-us/windows/win32/procthread/process-handles-and-identifiers
+#[derive(Debug)]
+struct ManagedChild {
+    /// 该句柄所指进程的 pid（判「问的是不是手里这个」）。
+    pid: u32,
+    /// CreateProcess 交回的进程句柄，收割完成前不关。
+    handle: OwnedHandle,
+    /// 起核当时从**同一个句柄**读到的身份（created + image）。
+    identity: ManagedIdentity,
+}
+
 /// Windows FFI 生产实现（对应 Go `winproc.go` 全部原语）。
 #[derive(Debug)]
 pub struct WinProcOps {
@@ -88,12 +122,15 @@ pub struct WinProcOps {
     /// 惰性创建（ensure_job），所有 child assign 进去 → helper 死则内核连坐杀 child。
     /// Mutex 保证 ensure_job 的「已建则直接返回」幂等性（`winproc.go:75-78`）。
     job: std::sync::Mutex<Option<HANDLE>>,
+    /// 当前受管核的进程句柄 + 身份（D2/D3，见 [`ManagedChild`]）。收割时取出并关闭。
+    managed: std::sync::Mutex<Option<ManagedChild>>,
 }
 
 impl Default for WinProcOps {
     fn default() -> Self {
         Self {
             job: std::sync::Mutex::new(None),
+            managed: std::sync::Mutex::new(None),
         }
     }
 }
@@ -109,16 +146,17 @@ impl WinProcOps {
     }
 }
 
-// SAFETY: WinProcOps 的 job HANDLE 是内核对象句柄，跨线程共享安全（Windows 句柄本身线程无关）。
-// Mutex 保护句柄的惰性创建，满足 Send + Sync。
+// SAFETY: WinProcOps 的两把句柄（job 的裸 HANDLE、受管核的 OwnedHandle）都是内核对象句柄，
+// 跨线程共享安全（Windows 句柄本身线程无关）。各自的 Mutex 串行化访问，满足 Send + Sync。
+// 手写 impl 只为裸 HANDLE 那把（`*mut c_void` 非 Send/Sync）；OwnedHandle 本就是 Send + Sync。
 #[allow(
     unsafe_code,
-    reason = "the mutex serializes access to the thread-independent job HANDLE"
+    reason = "the mutexes serialize access to the thread-independent job and child HANDLEs"
 )]
 unsafe impl Send for WinProcOps {}
 #[allow(
     unsafe_code,
-    reason = "the mutex serializes access to the thread-independent job HANDLE"
+    reason = "the mutexes serialize access to the thread-independent job and child HANDLEs"
 )]
 unsafe impl Sync for WinProcOps {}
 
@@ -294,6 +332,39 @@ impl WinProcOps {
             CloseHandle(h);
         }
     }
+
+    /// 记账新的受管核句柄，替换（并关闭）上一把 —— 上一把若还在，它的进程早已不是受管核。
+    fn remember_managed_child(&self, child: ManagedChild) {
+        let mut guard = self
+            .managed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(child); // 旧 ManagedChild 在此 drop → CloseHandle（不泄漏）
+    }
+
+    /// 取出（并从槽里摘除）`pid` 的受管句柄；`pid` 不是手里那个 → `None`，不动槽。
+    ///
+    /// 摘除即交出关闭权：调用方收割完 drop 掉它，那一刻 PID 才允许被系统复用。
+    fn take_managed_handle(&self, pid: u32) -> Option<OwnedHandle> {
+        let mut guard = self
+            .managed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.as_ref().is_some_and(|c| c.pid == pid) {
+            return guard.take().map(|c| c.handle);
+        }
+        None
+    }
+
+    /// 用**持有的句柄**判受管核存活；`pid` 不是手里那个 → `None`（调用方回落按 pid 探活）。
+    fn managed_alive(&self, pid: u32) -> Option<bool> {
+        let guard = self
+            .managed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let child = guard.as_ref().filter(|c| c.pid == pid)?;
+        Some(handle_alive(child.handle.as_raw_handle().cast()))
+    }
 }
 
 #[allow(
@@ -302,8 +373,23 @@ impl WinProcOps {
 )]
 impl ProcOps for WinProcOps {
     fn process_alive(&self, ppid: u32) -> bool {
-        // winproc.go:123-143 processAlive。委托无状态自由函数（watchParent 后台线程共用，不捕获 &self）。
-        process_alive_raw(ppid)
+        // D3：问的若是**受管核**，用持有的句柄回答 —— 按 pid 现开句柄的老路答的是「这个号码上有
+        // 进程吗」，核死后号码被复用时它恒真。其余 pid（父死看护的 app ppid 等）仍走无状态自由函数
+        //（winproc.go:123-143 processAlive；watchParent 后台线程共用，不捕获 &self）。
+        self.managed_alive(ppid)
+            .unwrap_or_else(|| process_alive_raw(ppid))
+    }
+
+    fn managed_identity(&self, pid: u32) -> ManagedIdentity {
+        let guard = self
+            .managed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .as_ref()
+            .filter(|c| c.pid == pid)
+            .map(|c| c.identity.clone())
+            .unwrap_or_default()
     }
 
     fn terminate_pid(&self, pid: u32) -> std::io::Result<()> {
@@ -428,8 +514,23 @@ impl ProcOps for WinProcOps {
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        // 生命周期仍由 Job Object + pid 收割链管理；drop Child 只关闭父侧 process handle，不杀进程。
-        drop(child);
+        // D2/D3：**不再 drop child**。把 std 的 Child 拆成裸句柄自行持有 —— drop 会关闭父侧进程
+        // 句柄，而句柄一关，核退出后这个 PID 立刻可被系统复用（见 `ManagedChild` 文档）。
+        // SAFETY: `into_raw_handle` 转移所有权且不关闭句柄；此处立刻用 OwnedHandle 接管，
+        // 关闭时机唯一（收割后 drop）。stdout/stderr 已在上面取走，不受影响。
+        let handle = unsafe { OwnedHandle::from_raw_handle(child.into_raw_handle()) };
+        // 身份从**这个句柄**读一次并缓存：句柄在手 ⇒ 读到的必是刚起的这个进程；
+        // 之后 status 每次直接回缓存值，既不重复 FFI，也不会在核退出后读到复用者的数据。
+        let identity = ManagedIdentity {
+            created: process_created_ticks(handle.as_raw_handle().cast()),
+            image: process_image_by_handle(handle.as_raw_handle().cast()),
+        };
+        let created = identity.created;
+        self.remember_managed_child(ManagedChild {
+            pid,
+            handle,
+            identity,
+        });
         // ensureJob + assignToJob（winproc.go:40-47）：best-effort 防孤儿安全网。失败不阻断 start。
         let job_started = Instant::now();
         if let Some(h_job) = self.ensure_job() {
@@ -458,6 +559,7 @@ impl ProcOps for WinProcOps {
         let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
         Ok(CoreStart {
             pid,
+            created,
             timing: polaris_helper_proto::StartTiming {
                 forwarding_ms,
                 process_ms,
@@ -470,15 +572,17 @@ impl ProcOps for WinProcOps {
 
     fn reap_child(&self, pid: u32) {
         // W6 修：后台异步收割（Go stop/cleanup/uninstall 的 `go terminateChild(c, done)`）——不阻塞
-        // 管道回复（此前同步 sleep(2s) 阻塞 stop 回复）。线程只捕获 pid + 无状态 pid FFI
-        //（send_ctrl_break/terminate_pid_raw），不捕获 &self（故无生命周期问题）。
-        std::thread::spawn(move || reap_sequence(pid));
+        // 管道回复（此前同步 sleep(2s) 阻塞 stop 回复）。线程捕获 pid + **摘下来的句柄**（D3：
+        // 收割全程对同一个进程对象，绝不按号码重开），不捕获 &self（故无生命周期问题）。
+        let handle = self.take_managed_handle(pid);
+        std::thread::spawn(move || reap_sequence(pid, handle));
     }
 
     fn reap_child_blocking(&self, pid: u32) {
         // 同步收割（Go reapChildOnExit 的**同步** terminateChild）：服务停止/关机路径须在返回前杀完
         // child，否则异步收割线程随进程退出消失 → 孤儿。
-        reap_sequence(pid);
+        let handle = self.take_managed_handle(pid);
+        reap_sequence(pid, handle);
     }
 
     fn apply_route(&self, iface: &str, cidr: &str, del: bool) {
@@ -571,6 +675,69 @@ impl ProcOps for WinProcOps {
         }
         // best-effort：失败只记 log（Go: _ = c.Start()）。
         log::warn!("spawn_self_uninstall completed (ok={ok})");
+    }
+
+    fn flush_dns(&self) -> Result<(), String> {
+        // D4：SYSTEM 下跑 ipconfig /flushdns。命令构造与结果判据都在 `logic`（Linux 可测），
+        // 本腿只负责执行 + 自捕两条流。**不能用共用的 `system-integration::exec`**：它只把 stderr
+        // 带进错误串，而 ipconfig 的失败文字在 stdout —— 那份全局格式被按串解析的消费方依赖，
+        // 改它射程远大于收益，故此处局部自捕。
+        let cmd = crate::platform::windows::logic::flush_dns_command(
+            std::env::var("SystemRoot").ok().as_deref(),
+        );
+        let mut child = std::process::Command::new(&cmd.program)
+            .args(&cmd.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(cmd.creation_flags)
+            .spawn()
+            .map_err(|e| format!("{} 启动失败: {e}", cmd.program))?;
+        // 两条流各起一个读线程，**先于任何等待**（本仓纪律：先排空再等 —— 反过来就是子进程写满
+        // 管道等父进程读、父进程等子进程退出那个死锁）。此前这里是 `.output()`：排空是对的，
+        // 但它**没有上界** —— ipconfig 卡在 DNS Client 服务上时，这条连接线程与它占的那个管道实例
+        // 被一起扣到 ipconfig 自己返回为止（取值理由见 `logic::FLUSH_DNS_TIMEOUT_MS`）。
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let out_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(pipe) = out_pipe.as_mut() {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(pipe) = err_pipe.as_mut() {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        });
+        // 有界等待**进程句柄**；到点硬杀 —— 杀掉之后两条管道立刻 EOF，两个读线程随即收工，
+        // 故超时腿既不泄漏线程也不留孤儿。
+        // SAFETY: 句柄由 `child` 持有，本调用期间必然有效；WaitForSingleObject 只读它、不关它。
+        let timed_out = unsafe {
+            WaitForSingleObject(
+                child.as_raw_handle().cast(),
+                crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
+            )
+        } != WAIT_OBJECT_0;
+        if timed_out {
+            let _ = child.kill();
+        }
+        let status = child.wait();
+        let stdout = out_reader.join().unwrap_or_default();
+        let stderr = err_reader.join().unwrap_or_default();
+        if timed_out {
+            return Err(crate::platform::windows::logic::flush_dns_timeout_error(
+                crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
+            ));
+        }
+        crate::platform::windows::logic::flush_dns_result(
+            status.ok().and_then(|s| s.code()),
+            &stdout,
+            &stderr,
+        )
     }
 
     fn enable_ip_forwarding(&self) {
@@ -708,23 +875,31 @@ fn send_ctrl_break_via_child_console(pid: u32) -> std::io::Result<()> {
 ///
 /// [`process_alive_raw`] 的口径是「宁漏勿误」（不确定按存活），故本函数返回 false 只表示
 /// 「没能确认它死了」，不表示它还活着 —— 调用方据此走硬杀兜底，方向是安全的。
-fn wait_child_exit(pid: u32, grace: std::time::Duration) -> bool {
+///
+/// `handle` 在手时按**句柄**问（D3：进程对象没被回收，退出码读得准且绝不会读到复用者）；
+/// 没有句柄（非受管 pid / 已被别处摘走）才回落按 pid 探活。
+fn wait_child_exit(pid: u32, handle: Option<&OwnedHandle>, grace: std::time::Duration) -> bool {
+    let alive = || match handle {
+        Some(h) => handle_alive(h.as_raw_handle().cast()),
+        None => process_alive_raw(pid),
+    };
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
-        if !process_alive_raw(pid) {
+        if !alive() {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    !process_alive_raw(pid)
+    !alive()
 }
 
 /// 收割序列（`helper.go:111-123` `terminateChild`）：优雅信号 CTRL_BREAK → 宽限 2s → 硬杀。
 ///
 /// **无状态**（仅 pid，无 `&self`），供异步 [`WinProcOps::reap_child`] 与同步
 /// [`WinProcOps::reap_child_blocking`] 共用（W6：命令路径异步不阻塞、退出路径同步防孤儿）。
-fn reap_sequence(pid: u32) {
+fn reap_sequence(pid: u32, handle: Option<OwnedHandle>) {
     // ① 直接投递。dev --console 模式下本就有效；服务模式下必然失败（err=6），失败即走 ②。
+    // 优雅信号走的是**进程组**（console 语义），只能按 pid 投——这一步没有句柄版本。
     if send_ctrl_break(pid).is_err() {
         // ② 借子进程自己的 console 再投一次。**这一步才是服务模式下唯一能走通的优雅通道**
         //    （2026-08-12 G3 探针实测，见该函数文档）。任一步失败都只是回到 ③ 硬杀，
@@ -735,14 +910,96 @@ fn reap_sequence(pid: u32) {
     // ③ 宽限期内轮询而不是死等满 2s（helper.go:120 的宽限值不变）。
     //    改动前这里恒睡满 2 秒是**合理的**：那时优雅信号从来不生效，早醒也没有意义。
     //    现在它能生效了，轮询把「停核」从恒定 2 秒缩到实际退出耗时。
-    let exited = wait_child_exit(pid, std::time::Duration::from_millis(2000));
+    let exited = wait_child_exit(pid, handle.as_ref(), std::time::Duration::from_millis(2000));
 
     // ④ 硬杀兜底。**确认已死就不发这一刀** —— 不是为了省一次系统调用，而是躲开
     //    「pid 已被回收并复用给别的进程」这一格：那种情况下这一刀会砍到无关进程。
-    //    `process_alive_raw` 宁漏勿误，故 `exited==false` 时照旧硬杀，方向安全。
+    //    探活宁漏勿误，故 `exited==false` 时照旧硬杀，方向安全。
+    //    句柄在手时**按句柄杀**：那把刀只可能落在我们起的那个进程上，连「复用」这一格都不存在
+    //    （句柄未关 ⇒ PID 未被回收）。没有句柄才回落 `terminate_pid_raw`。
     if !exited {
-        let _ = terminate_pid_raw(pid);
+        match handle.as_ref() {
+            Some(h) => {
+                let _ = terminate_handle(h.as_raw_handle().cast());
+            }
+            None => {
+                let _ = terminate_pid_raw(pid);
+            }
+        }
     }
+    // handle 在此 drop → CloseHandle：核已收割，此刻起系统才可以复用这个 PID。
+}
+
+/// 用**已持有的进程句柄**判存活（`GetExitCodeProcess`）。口径同 [`process_alive_raw`]：
+/// 只有确定读到「已退出」才判死，查询失败按存活（宁漏勿误）。
+#[allow(
+    unsafe_code,
+    reason = "reads the exit code of an already-owned process HANDLE"
+)]
+fn handle_alive(h: HANDLE) -> bool {
+    let mut code: u32 = 0;
+    // SAFETY: h 由 ManagedChild 的 OwnedHandle 持有，调用期间必然有效；code 是可写本栈对象。
+    let ok = unsafe { GetExitCodeProcess(h, &mut code) };
+    if ok == 0 {
+        return true; // 查询失败 → 不确定 → 按存活
+    }
+    code == STILL_ACTIVE_CODE
+}
+
+/// 用**已持有的进程句柄**硬杀（对照 [`terminate_pid_raw`] 的按 pid 版本）。
+#[allow(
+    unsafe_code,
+    reason = "terminates an already-owned process HANDLE without reopening it by pid"
+)]
+fn terminate_handle(h: HANDLE) -> std::io::Result<()> {
+    // SAFETY: h 由调用方的 OwnedHandle 持有；exit code=1（与 terminate_pid_raw 同）。
+    if unsafe { TerminateProcess(h, 1) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// 进程创建时间（`GetProcessTimes`，100ns tick）—— D3 的身份令牌。读不到 → `None`。
+///
+/// 只取 creation time：其余三个（exit/kernel/user）随运行而变，不能当身份用。
+#[allow(
+    unsafe_code,
+    reason = "reads the creation time of an already-owned process HANDLE"
+)]
+fn process_created_ticks(h: HANDLE) -> Option<u64> {
+    let mut created = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: h 有效；四个 FILETIME 均为可写本栈对象（API 要求四个出参都非空）。
+    let ok = unsafe { GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user) };
+    if ok == 0 {
+        return None; // 读不到就说读不到，绝不返回 0 冒充一个创建时间
+    }
+    Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+/// 实跑二进制全路径（`QueryFullProcessImageNameW`）—— D2 的自证事实来源。读不到 → `None`。
+///
+/// 缓冲按 Win32 路径上限（32767 wide chars）一次给足：本函数每次起核只调一次，宁可多要一次分配，
+/// 也不要在长路径上返回一个截断的路径 —— 截断的路径会与期望路径判不等，变成一次假告警。
+#[allow(
+    unsafe_code,
+    reason = "reads the image path of an already-owned process HANDLE"
+)]
+fn process_image_by_handle(h: HANDLE) -> Option<String> {
+    let mut buf = vec![0u16; 32_768];
+    let mut size = buf.len() as u32;
+    // SAFETY: h 有效；buf 可写且 size 与其长度一致；flags=0 = Win32 路径形态。
+    let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size) };
+    if ok == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..size as usize]);
+    (!path.is_empty()).then_some(path)
 }
 
 /// 硬杀指定 pid（`winproc.go:146-153` `terminatePid`）。**无状态**自由函数（收割序列 / trait `terminate_pid`

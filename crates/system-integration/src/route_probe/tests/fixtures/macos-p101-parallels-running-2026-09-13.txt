@@ -1,0 +1,2071 @@
+@@@META
+platform=macos
+capture=route-n-get-crosscheck
+stamp=2026-09-13 4c:89:a8 +0800
+os=26.6.2
+tailscale=
+@@@V4_NETSTAT
+Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            192.168.10.1       UGScg                 en0       
+default            link#29            UCSIg              utun11       
+default            link#31            UCSIg           bridge100      !
+default            link#33            UCSIg           bridge101      !
+10.37.129/24       link#33            UC              bridge101      !
+10.211.55/24       link#31            UC              bridge100      !
+32.0.0.1/32        link#29            UCS                utun11       
+32.0.0.2/32        link#29            UCS                utun11       
+32.0.0.3/32        link#29            UCS                utun11       
+32.0.0.4/32        link#29            UCS                utun11       
+32.0.0.5/32        link#29            UCS                utun11       
+32.0.0.7/32        link#29            UCS                utun11       
+32.0.0.8/32        link#29            UCS                utun11       
+32.0.0.9/32        link#29            UCS                utun11       
+32.0.0.10/32       link#29            UCS                utun11       
+32.0.0.12/32       link#29            UCS                utun11       
+32.0.0.13/32       link#29            UCS                utun11       
+32.0.0.14/32       link#29            UCS                utun11       
+32.0.0.15/32       link#29            UCS                utun11       
+32.0.0.17/32       link#29            UCS                utun11       
+32.0.0.19/32       link#29            UCS                utun11       
+32.0.0.20/32       link#29            UCS                utun11       
+32.0.0.21/32       link#29            UCS                utun11       
+32.0.0.23/32       link#29            UCS                utun11       
+32.0.0.24/32       link#29            UCS                utun11       
+32.0.0.25/32       link#29            UCS                utun11       
+32.0.0.26/32       link#29            UCS                utun11       
+32.0.0.27/32       link#29            UCS                utun11       
+32.0.0.28/32       link#29            UCS                utun11       
+32.0.0.29/32       link#29            UCS                utun11       
+32.0.0.30          32.0.0.30          UH                 utun11       
+32.0.0.31/32       link#29            UCS                utun11       
+32.0.0.32/32       link#29            UCS                utun11       
+79.127.159.187     link#31            UHLWIg          bridge100      !
+79.127.159.187     link#33            UHLWIg          bridge101      !
+84.17.53.155       link#31            UHLWIg          bridge100      !
+84.17.53.155       link#33            UHLWIg          bridge101      !
+100.100.100.100/32 link#29            UCS                utun11       
+127                127.0.0.1          UCS                   lo0       
+127.0.0.1          127.0.0.1          UH                    lo0       
+169.254            link#14            UCS                   en0      !
+185.152.67.145     link#31            UHLWIig         bridge100      !
+185.152.67.145     link#33            UHLWIig         bridge101      !
+192.168.10         link#14            UCS                   en0      !
+192.168.10.1/32    link#14            UCS                   en0      !
+192.168.10.1       7:77:82:d8:a2:7d   UHLWIir               en0   1199
+192.168.10.99      link#14            UHLWI                 en0      !
+192.168.10.103     7:6c:dd:24:4a:26   UHLWI                 en0   1139
+192.168.10.105     41:47:b0:34:1a:47  UHLWI                 en0   1145
+192.168.10.106     e:88:d8:83:a1:77   UHLWI                 en0   1194
+192.168.10.107     9d:03:26:e3:f2:40  UHLWI                 en0   1118
+192.168.10.108     91:ac:47:18:50:0e  UHLWI                 en0   1144
+192.168.10.109     68:52:90:52:87:4c  UHLWIi                en0   1125
+192.168.10.111     90:f7:1a:df:77:cd  UHLWI                 en0   1137
+192.168.10.112     3d:e6:41:7b:03:a1  UHLWI                 en0   1161
+192.168.10.114     92:11:47:87:7a:bd  UHLWI                 en0   1193
+192.168.10.116     03:e9:ca:a0:b0:a6  UHLWI                 en0   1180
+192.168.10.119     82:aa:92:90:3a:b8  UHLWI                 en0   1035
+192.168.10.121     27:bb:89:1:66:92   UHLWI                 en0   1144
+192.168.10.127     e3:da:77:5c:65:10  UHLWI                 en0   1116
+192.168.10.131     03:f2:34:b1:bd:a9  UHLWI                 en0   1184
+192.168.10.133     2b:13:cd:77:65:0e  UHLWI                 en0   1127
+192.168.10.139     74:a0:06:77:74:98  UHLWI                 en0   1028
+192.168.10.141     e3:da:77:9d:b0:ea  UHLWI                 en0   1116
+192.168.10.142/32  link#14            UCS                   en0      !
+192.168.10.142     9d:03:01:41:b8:1a  UHLWI                 lo0       
+192.168.10.143     03:f2:34:18:37:98  UHLWI                 en0   1185
+192.168.10.146     d2:78:e6:98:0:c6   UHLWI                 en0   1142
+192.168.10.147     e3:da:77:7b:6c:f7  UHLWI                 en0   1116
+192.168.10.149     ab:68:2d:84:ac:1a  UHLWI                 en0   1150
+192.168.10.160     27:bb:89:ea:6:ab   UHLWI                 en0   1171
+192.168.10.186     51:82:ac:88:7c:8   UHLWI                 en0   1148
+192.168.10.188     08:e2:2d:37:01:7c  UHLWI                 en0   1163
+192.168.10.190     7:50:d2:1f:4:78    UHLWI                 en0   1116
+192.168.10.191     e3:da:77:80:df:e4  UHLWI                 en0    167
+192.168.10.201     98:77:77:65:fb:53  UHLWI                 en0   1113
+192.168.10.202     0e:58:9a:53:2b:2d  UHLWI                 en0   1191
+192.168.10.205     f7:31:ae:c9:f0:8   UHLWI                 en0      !
+192.168.10.206     a9:98:3d:40:e6:ac  UHLWI                 en0   1159
+192.168.10.208     03:f2:34:74:c1:df  UHLWI                 en0   1127
+192.168.10.212     3d:e6:41:98:a6:df  UHLWI                 en0   1195
+192.168.10.213     3d:e6:41:a6:df:91  UHLWI                 en0   1183
+192.168.10.214     42:18:b0:c9:c6:47  UHLWI                 en0   1173
+192.168.10.215     24:39:80:cd:5:c9   UHLWI                 en0   1179
+192.168.10.216     1d:56:c9:1a:1b:77  UHLWI                 en0   1154
+192.168.10.218     41:2d:8b:89:77:7b  UHLWIi                en0   1064
+192.168.10.222     18:17:06:97:91:08  UHLWI                 en0   1157
+192.168.10.231     27:bb:89:5:b2:72   UHLWI                 en0   1134
+192.168.10.235     c6:84:40:65:6c:87  UHLWI                 en0      !
+192.168.10.236     a4:c6:18:28:6:89   UHLWI                 en0   1145
+192.168.10.237     cd:88:cd:97:aa:91  UHLWI                 en0   1150
+192.168.10.249     3d:e6:41:27:25:a3  UHLWI                 en0   1169
+224.0.0/4          link#14            UmCS                  en0      !
+224.0.0/4          link#29            UmCSI              utun11       
+224.0.0.251        9:7:72:7:7:f9      UHmLWI                en0       
+239.255.255.250    9:7:72:ab:3e:e2    UHmLWI                en0       
+255.255.255.255/32 link#14            UCS                   en0      !
+255.255.255.255/32 link#29            UCSI               utun11       
+@@@V6_NETSTAT
+Routing tables
+
+Internet6:
+Destination                             Gateway                                 Flags               Netif Expire
+default                                 fe80::fff:1f0b:6e3c:e05a%en0            UGcg                  en0       
+default                                 fe80::%utun0                            UGcIg               utun0       
+default                                 fe80::%utun1                            UGcIg               utun1       
+default                                 fe80::%utun2                            UGcIg               utun2       
+default                                 fe80::%utun3                            UGcIg               utun3       
+default                                 fe80::%utun4                            UGcIg               utun4       
+default                                 fe80::%utun5                            UGcIg               utun5       
+default                                 fe80::%utun6                            UGcIg               utun6       
+default                                 fe80::%utun7                            UGcIg               utun7       
+default                                 fd7a:115c:a1e0::                        UGcIg              utun11       
+::1                                     ::1                                     UHL                   lo0       
+530d:ebd9:89bf:95d8::/64                link#14                                 UC                    en0       
+530d:ebd9:89bf:95d8::/60                fe80::fff:1f0b:6e3c:e05a%en0            UGc                   en0       
+530d:ebd9:89bf:95d8::9                  7:77:82:d8:a2:7d                        UHLWI                 en0       
+530d:ebd9:89bf:95d8::c04                68:52:90:52:87:4c                       UHLWI                 en0       
+530d:ebd9:89bf:95d8:fea:720:11bb:d45e   9d:03:01:41:b8:1a                       UHL                   lo0       
+530d:ebd9:89bf:95d8:ed3a:05a8:99b1:baaf 68:52:90:52:87:4c                       UHLWIi                en0       
+530d:ebd9:89bf:95d8:264d:abcd:f6ce:8a36 9d:03:01:41:b8:1a                       UHL                   lo0       
+530d:ebd9:89bf:95d8:2016:6e97:9383:6c7a 68:52:90:52:87:4c                       UHLWI                 en0       
+530d:ebd9:89bf:95d8:7be1:91ee:739:5367  68:52:90:52:87:4c                       UHLWI                 en0       
+530d:ebd9:89bf:95d8:9071:cccb:a7b0:6a27 9d:03:01:41:b8:1a                       UHL                   lo0       
+530d:ebd9:89bf:95d8:e669:e621:166f:35d7 9d:03:01:41:b8:1a                       UHL                   lo0       
+530d:ebd9:89bf:95d8:9940:5c7f:8248:780f 9d:03:01:41:b8:1a                       UHL                   lo0       
+530d:ebd9:89bf:95d8:80cb:92ef:44b8:5889 9d:03:01:41:b8:1a                       UHL                   lo0       
+530d:ebd9:89bf:95d8:b25a:685d:f25f:c278 9d:03:01:41:b8:1a                       UHL                   lo0       
+530d:ebd9:89bf:95d8:8b16:2e14:9b5f:d779 9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b::/64                link#14                                 UC                    en0       
+8db8:e8a1:92da:9f6b::/60                fe80::fff:1f0b:6e3c:e05a%en0            UGc                   en0       
+8db8:e8a1:92da:9f6b::9                  7:77:82:d8:a2:7d                        UHLWIi                en0       
+8db8:e8a1:92da:9f6b::0b9                9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b::c04                68:52:90:52:87:4c                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:162:725a:f658:c9ec  68:52:90:52:87:4c                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:6b1:4472:4d23:482e  9d:03:26:e3:f2:40                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:fea:720:11bb:d45e   9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b:d713:f8f3:8f10:0de7 9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b:b772:44b8:ede1:9d15 9d:03:26:e3:f2:40                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:0ed3:db2d:a288:8e8d 9d:03:26:e3:f2:40                       UHLWIi                en0       
+8db8:e8a1:92da:9f6b:fc3c:d87e:c5f5:6361 9d:03:26:e3:f2:40                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:9071:cccb:a7b0:6a27 9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b:e669:e621:166f:35d7 9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b:bb40:6e51:2dfa:db18 9d:03:26:e3:f2:40                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:c37c:d28a:5a6:0259  9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b:e97b:6ae0:65a8:55df 9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b:7b9e:039e:5d2f:331b 68:52:90:52:87:4c                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:205a:e29f:925a:5b5f 68:52:90:52:87:4c                       UHLWI                 en0       
+8db8:e8a1:92da:9f6b:b25a:685d:f25f:c278 9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:9f6b:0b22:d71b:6570:f0cf 9d:03:01:41:b8:1a                       UHL                   lo0       
+8db8:e8a1:92da:caa4::/64                fe80::221f:e5d9:65dd:9095%en0           UGc                   en0       
+16f7:9c0:d0e5:569d::/64                 link#14                                 UC                    en0       
+16f7:9c0:d0e5:569d::/56                 fe80::fff:1f0b:6e3c:e05a%en0            UGc                   en0       
+16f7:9c0:d0e5:569d::9                   7:77:82:d8:a2:7d                        UHLWI                 en0       
+16f7:9c0:d0e5:569d::c04                 68:52:90:52:87:4c                       UHLWI                 en0       
+16f7:9c0:d0e5:569d:3c0:3b34:ef3c:460a   9d:03:01:41:b8:1a                       UHL                   lo0       
+16f7:9c0:d0e5:569d:fea:720:11bb:d45e    9d:03:01:41:b8:1a                       UHL                   lo0       
+16f7:9c0:d0e5:569d:0551:5494:ee34:ae81  68:52:90:52:87:4c                       UHLWI                 en0       
+16f7:9c0:d0e5:569d:acad:fc15:b4fd:4cc1  68:52:90:52:87:4c                       UHLWI                 en0       
+16f7:9c0:d0e5:569d:9071:cccb:a7b0:6a27  9d:03:01:41:b8:1a                       UHL                   lo0       
+16f7:9c0:d0e5:569d:e669:e621:166f:35d7  9d:03:01:41:b8:1a                       UHL                   lo0       
+16f7:9c0:d0e5:569d:e97b:6ae0:65a8:55df  9d:03:01:41:b8:1a                       UHL                   lo0       
+16f7:9c0:d0e5:569d:9940:5c7f:8248:780f  9d:03:01:41:b8:1a                       UHL                   lo0       
+16f7:9c0:d0e5:569d:b25a:685d:f25f:c278  9d:03:01:41:b8:1a                       UHL                   lo0       
+fd7a:115c:a1e0::/48                     fe80::b985:1449:272e:65ff%utun11        Uc                 utun11       
+fd7a:115c:a1e0::57                      link#29                                 UHL                   lo0       
+fd7a:115c:a1e0::e9/128                  link#29                                 UCS                utun11       
+fd7a:115c:a1e0::e9                      link#29                                 UHWIi              utun11       
+802b:44fb:1f43::/64                     link#31                                 UC              bridge100       
+802b:44fb:1f43::9                       5e.e9.1e.7b.7e.64                       UHL                   lo0       
+802b:44fb:1f43:9::/64                   link#33                                 UC              bridge101       
+802b:44fb:1f43:9::9                     5e.e9.1e.7b.7e.65                       UHL                   lo0       
+fe80::%lo0/64                           fe80::1%lo0                             UcI                   lo0       
+fe80::1%lo0                             link#1                                  UHLI                  lo0       
+fe80::%en0/64                           link#14                                 UCI                   en0       
+fe80::fff:1f0b:6e3c:e05a%en0            7:77:82:d8:a2:7d                        UHLWIir               en0       
+fe80::d93:cbff:dda3:ed7c%en0            ab:68:2d:84:ac:1a                       UHLWI                 en0       
+fe80::285:bbb4:6317:d2b5%en0            68:52:90:52:87:4c                       UHLWIi                en0       
+fe80::28dc:52d6:e49a:aa41%en0           9d:03:01:41:b8:1a                       UHLI                  lo0       
+fe80::221f:e5d9:65dd:9095%en0           c6:84:40:65:6c:87                       UHLWIi                en0       
+fe80::69e8:25d6:c6e0:c127%en0           9d:03:26:e3:f2:40                       UHLWI                 en0       
+fe80::0943:8f79:c8cb:17d0%en0           74:a0:06:77:74:98                       UHLWIi                en0       
+fe80::7894:7415:9ad:ce1a%en0            81:51:90:42:81:7                        UHLWI                 en0       
+fe80::b95f:0a77:0c62:db95%en0           b2:6:90:b8:45:18                        UHLWI                 en0       
+fe80::30b7:2b77:78a4:ff26%awdl0         17:4c:6c:68:ca:f2                       UHLI                  lo0       
+fe80::30b7:2b77:78a4:ff26%llw0          17:4c:6c:68:ca:f2                       UHLI                  lo0       
+fe80::%utun0/64                         fe80::3966:0d89:4830:c064%utun0         UcI                 utun0       
+fe80::3966:0d89:4830:c064%utun0         link#18                                 UHLI                  lo0       
+fe80::%utun1/64                         fe80::120c:f2c:c763:9e71%utun1          UcI                 utun1       
+fe80::120c:f2c:c763:9e71%utun1          link#19                                 UHLI                  lo0       
+fe80::%utun2/64                         fe80::173e:ff55:3f16:ec95%utun2         UcI                 utun2       
+fe80::173e:ff55:3f16:ec95%utun2         link#20                                 UHLI                  lo0       
+fe80::%utun3/64                         fe80::0dee:685:9e38:b55%utun3           UcI                 utun3       
+fe80::0dee:685:9e38:b55%utun3           link#21                                 UHLI                  lo0       
+fe80::%utun4/64                         fe80::31ef:86f1:f2d3:57%utun4           UcI                 utun4       
+fe80::31ef:86f1:f2d3:57%utun4           link#22                                 UHLI                  lo0       
+fe80::%utun5/64                         fe80::14a8:1b27:3a64:c870%utun5         UcI                 utun5       
+fe80::14a8:1b27:3a64:c870%utun5         link#23                                 UHLI                  lo0       
+fe80::%utun6/64                         fe80::ae90:7df4:a152:ae17%utun6         UcI                 utun6       
+fe80::ae90:7df4:a152:ae17%utun6         link#24                                 UHLI                  lo0       
+fe80::%utun7/64                         fe80::9447:eae:4316:e1ec%utun7          UcI                 utun7       
+fe80::9447:eae:4316:e1ec%utun7          link#25                                 UHLI                  lo0       
+fe80::%utun11/64                        fe80::b985:1449:272e:65ff%utun11        UcI                utun11       
+fe80::b985:1449:272e:65ff%utun11        link#29                                 UHLI                  lo0       
+fe80::%bridge100/64                     link#31                                 UCI             bridge100       
+fe80::9e53:9262:8051:a380%bridge100     5e.e9.1e.7b.7e.64                       UHLI                  lo0       
+fe80::%bridge101/64                     link#33                                 UCI             bridge101       
+fe80::9e53:9262:8051:ef64%bridge101     5e.e9.1e.7b.7e.65                       UHLI                  lo0       
+ff00::/8                                ::1                                     UmCI                  lo0       
+ff00::/8                                link#14                                 UmCI                  en0       
+ff00::/8                                link#16                                 UmCI                awdl0       
+ff00::/8                                link#17                                 UmCI                 llw0       
+ff00::/8                                fe80::3966:0d89:4830:c064%utun0         UmCI                utun0       
+ff00::/8                                fe80::120c:f2c:c763:9e71%utun1          UmCI                utun1       
+ff00::/8                                fe80::173e:ff55:3f16:ec95%utun2         UmCI                utun2       
+ff00::/8                                fe80::0dee:685:9e38:b55%utun3           UmCI                utun3       
+ff00::/8                                fe80::31ef:86f1:f2d3:57%utun4           UmCI                utun4       
+ff00::/8                                fe80::14a8:1b27:3a64:c870%utun5         UmCI                utun5       
+ff00::/8                                fe80::ae90:7df4:a152:ae17%utun6         UmCI                utun6       
+ff00::/8                                fe80::9447:eae:4316:e1ec%utun7          UmCI                utun7       
+ff00::/8                                fe80::b985:1449:272e:65ff%utun11        UmCI               utun11       
+ff00::/8                                link#31                                 UmCI            bridge100       
+ff00::/8                                link#33                                 UmCI            bridge101       
+ff01::%lo0/32                           ::1                                     UmCI                  lo0       
+ff01::%en0/32                           link#14                                 UmCI                  en0       
+ff01::%utun0/32                         fe80::3966:0d89:4830:c064%utun0         UmCI                utun0       
+ff01::%utun1/32                         fe80::120c:f2c:c763:9e71%utun1          UmCI                utun1       
+ff01::%utun2/32                         fe80::173e:ff55:3f16:ec95%utun2         UmCI                utun2       
+ff01::%utun3/32                         fe80::0dee:685:9e38:b55%utun3           UmCI                utun3       
+ff01::%utun4/32                         fe80::31ef:86f1:f2d3:57%utun4           UmCI                utun4       
+ff01::%utun5/32                         fe80::14a8:1b27:3a64:c870%utun5         UmCI                utun5       
+ff01::%utun6/32                         fe80::ae90:7df4:a152:ae17%utun6         UmCI                utun6       
+ff01::%utun7/32                         fe80::9447:eae:4316:e1ec%utun7          UmCI                utun7       
+ff01::%utun11/32                        fe80::b985:1449:272e:65ff%utun11        UmCI               utun11       
+ff01::%bridge100/32                     link#31                                 UmCI            bridge100       
+ff01::%bridge101/32                     link#33                                 UmCI            bridge101       
+ff02::%lo0/32                           ::1                                     UmCI                  lo0       
+ff02::%en0/32                           link#14                                 UmCI                  en0       
+ff02::%utun0/32                         fe80::3966:0d89:4830:c064%utun0         UmCI                utun0       
+ff02::%utun1/32                         fe80::120c:f2c:c763:9e71%utun1          UmCI                utun1       
+ff02::%utun2/32                         fe80::173e:ff55:3f16:ec95%utun2         UmCI                utun2       
+ff02::%utun3/32                         fe80::0dee:685:9e38:b55%utun3           UmCI                utun3       
+ff02::%utun4/32                         fe80::31ef:86f1:f2d3:57%utun4           UmCI                utun4       
+ff02::%utun5/32                         fe80::14a8:1b27:3a64:c870%utun5         UmCI                utun5       
+ff02::%utun6/32                         fe80::ae90:7df4:a152:ae17%utun6         UmCI                utun6       
+ff02::%utun7/32                         fe80::9447:eae:4316:e1ec%utun7          UmCI                utun7       
+ff02::%utun11/32                        fe80::b985:1449:272e:65ff%utun11        UmCI               utun11       
+ff02::%bridge100/32                     link#31                                 UmCI            bridge100       
+ff02::%bridge101/32                     link#33                                 UmCI            bridge101       
+@@@V4_ROUTE_GET
+### dest=10.211.55/24 padded=10.211.55/24
+   route to: 10.211.55.0
+destination: 10.211.55.0
+       mask: 255.255.255.0
+  interface: bridge100
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500       -89 
+### dest=10.37.129/24 padded=10.37.129/24
+   route to: 10.37.129.0
+destination: 10.37.129.0
+       mask: 255.255.255.0
+  interface: bridge101
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500       -89 
+### dest=100.100.100.100/32 padded=100.100.100.100/32
+   route to: 100.100.100.100
+destination: 100.100.100.100
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=127 padded=127.0.0.0
+   route to: 127.0.0.0
+destination: 127.0.0.0
+       mask: 255.0.0.0
+  interface: lo0
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+   49152     49152         0         0         0         0     16384         0 
+### dest=127.0.0.1 padded=127.0.0.1
+   route to: 127.0.0.1
+destination: 127.0.0.1
+  interface: lo0
+      flags: <UP,HOST,DONE,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+   49152     49152         0         1         0         0     16384         0 
+### dest=169.254 padded=169.254.0.0
+   route to: 169.254.0.0
+destination: 169.254.0.0
+       mask: 255.255.0.0
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500   -942957 
+### dest=185.152.67.145 padded=185.152.67.145
+   route to: 185.152.67.145
+destination: 185.152.67.145
+    gateway: 192.168.10.1
+  interface: en0
+      flags: <UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE,IFREF,GLOBAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=192.168.10 padded=192.168.10.0
+   route to: 192.168.10.0
+destination: 192.168.10.0
+       mask: 255.255.255.0
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500   -942957 
+### dest=192.168.10.1 padded=192.168.10.1
+   route to: 192.168.10.1
+destination: 192.168.10.1
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF,ROUTER>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0       840        20        17         0      1500      1199 
+### dest=192.168.10.1/32 padded=192.168.10.1/32
+   route to: 192.168.10.1
+destination: 192.168.10.1
+       mask: 255.255.255.255
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500   -942957 
+### dest=192.168.10.103 padded=192.168.10.103
+   route to: 192.168.10.103
+destination: 192.168.10.103
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1139 
+### dest=192.168.10.105 padded=192.168.10.105
+   route to: 192.168.10.105
+destination: 192.168.10.105
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1145 
+### dest=192.168.10.106 padded=192.168.10.106
+   route to: 192.168.10.106
+destination: 192.168.10.106
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1194 
+### dest=192.168.10.107 padded=192.168.10.107
+   route to: 192.168.10.107
+destination: 192.168.10.107
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1118 
+### dest=192.168.10.108 padded=192.168.10.108
+   route to: 192.168.10.108
+destination: 192.168.10.108
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1144 
+### dest=192.168.10.109 padded=192.168.10.109
+   route to: 192.168.10.109
+destination: 192.168.10.109
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0       420         0        28         0      1500      1125 
+### dest=192.168.10.111 padded=192.168.10.111
+   route to: 192.168.10.111
+destination: 192.168.10.111
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1137 
+### dest=192.168.10.112 padded=192.168.10.112
+   route to: 192.168.10.112
+destination: 192.168.10.112
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1161 
+### dest=192.168.10.114 padded=192.168.10.114
+   route to: 192.168.10.114
+destination: 192.168.10.114
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1193 
+### dest=192.168.10.116 padded=192.168.10.116
+   route to: 192.168.10.116
+destination: 192.168.10.116
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1180 
+### dest=192.168.10.119 padded=192.168.10.119
+   route to: 192.168.10.119
+destination: 192.168.10.119
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1035 
+### dest=192.168.10.121 padded=192.168.10.121
+   route to: 192.168.10.121
+destination: 192.168.10.121
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1144 
+### dest=192.168.10.127 padded=192.168.10.127
+   route to: 192.168.10.127
+destination: 192.168.10.127
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1116 
+### dest=192.168.10.131 padded=192.168.10.131
+   route to: 192.168.10.131
+destination: 192.168.10.131
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1184 
+### dest=192.168.10.133 padded=192.168.10.133
+   route to: 192.168.10.133
+destination: 192.168.10.133
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1127 
+### dest=192.168.10.139 padded=192.168.10.139
+   route to: 192.168.10.139
+destination: 192.168.10.139
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1028 
+### dest=192.168.10.141 padded=192.168.10.141
+   route to: 192.168.10.141
+destination: 192.168.10.141
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1116 
+### dest=192.168.10.142 padded=192.168.10.142
+   route to: 192.168.10.142
+destination: 192.168.10.142
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,LOCAL,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=192.168.10.142/32 padded=192.168.10.142/32
+   route to: 192.168.10.142
+destination: 192.168.10.142
+       mask: 255.255.255.255
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500   -942957 
+### dest=192.168.10.143 padded=192.168.10.143
+   route to: 192.168.10.143
+destination: 192.168.10.143
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1185 
+### dest=192.168.10.146 padded=192.168.10.146
+   route to: 192.168.10.146
+destination: 192.168.10.146
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1142 
+### dest=192.168.10.147 padded=192.168.10.147
+   route to: 192.168.10.147
+destination: 192.168.10.147
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1116 
+### dest=192.168.10.149 padded=192.168.10.149
+   route to: 192.168.10.149
+destination: 192.168.10.149
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1150 
+### dest=192.168.10.160 padded=192.168.10.160
+   route to: 192.168.10.160
+destination: 192.168.10.160
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1171 
+### dest=192.168.10.186 padded=192.168.10.186
+   route to: 192.168.10.186
+destination: 192.168.10.186
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1148 
+### dest=192.168.10.188 padded=192.168.10.188
+   route to: 192.168.10.188
+destination: 192.168.10.188
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1163 
+### dest=192.168.10.190 padded=192.168.10.190
+   route to: 192.168.10.190
+destination: 192.168.10.190
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1116 
+### dest=192.168.10.191 padded=192.168.10.191
+   route to: 192.168.10.191
+destination: 192.168.10.191
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500       167 
+### dest=192.168.10.201 padded=192.168.10.201
+   route to: 192.168.10.201
+destination: 192.168.10.201
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1113 
+### dest=192.168.10.202 padded=192.168.10.202
+   route to: 192.168.10.202
+destination: 192.168.10.202
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1191 
+### dest=192.168.10.205 padded=192.168.10.205
+   route to: 192.168.10.205
+destination: 192.168.10.205
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      -267 
+### dest=192.168.10.206 padded=192.168.10.206
+   route to: 192.168.10.206
+destination: 192.168.10.206
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1159 
+### dest=192.168.10.208 padded=192.168.10.208
+   route to: 192.168.10.208
+destination: 192.168.10.208
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1127 
+### dest=192.168.10.212 padded=192.168.10.212
+   route to: 192.168.10.212
+destination: 192.168.10.212
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1195 
+### dest=192.168.10.213 padded=192.168.10.213
+   route to: 192.168.10.213
+destination: 192.168.10.213
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1183 
+### dest=192.168.10.214 padded=192.168.10.214
+   route to: 192.168.10.214
+destination: 192.168.10.214
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1173 
+### dest=192.168.10.215 padded=192.168.10.215
+   route to: 192.168.10.215
+destination: 192.168.10.215
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1179 
+### dest=192.168.10.216 padded=192.168.10.216
+   route to: 192.168.10.216
+destination: 192.168.10.216
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1154 
+### dest=192.168.10.218 padded=192.168.10.218
+   route to: 192.168.10.218
+destination: 192.168.10.218
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0  44480517        14         9         0      1500      1064 
+### dest=192.168.10.222 padded=192.168.10.222
+   route to: 192.168.10.222
+destination: 192.168.10.222
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1157 
+### dest=192.168.10.231 padded=192.168.10.231
+   route to: 192.168.10.231
+destination: 192.168.10.231
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1134 
+### dest=192.168.10.235 padded=192.168.10.235
+   route to: 192.168.10.235
+destination: 192.168.10.235
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500     -1365 
+### dest=192.168.10.236 padded=192.168.10.236
+   route to: 192.168.10.236
+destination: 192.168.10.236
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1145 
+### dest=192.168.10.237 padded=192.168.10.237
+   route to: 192.168.10.237
+destination: 192.168.10.237
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1150 
+### dest=192.168.10.249 padded=192.168.10.249
+   route to: 192.168.10.249
+destination: 192.168.10.249
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500      1169 
+### dest=192.168.10.99 padded=192.168.10.99
+   route to: 192.168.10.99
+destination: 192.168.10.99
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500       -86 
+### dest=224.0.0.251 padded=224.0.0.251
+   route to: 224.0.0.251
+destination: 224.0.0.251
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=224.0.0/4 padded=224.0.0/4
+   route to: 224.0.0.0
+destination: 224.0.0.0
+       mask: 240.0.0.0
+  interface: en0
+      flags: <UP,DONE,CLONING,STATIC,MULTICAST>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500   -942957 
+### dest=239.255.255.250 padded=239.255.255.250
+   route to: 239.255.255.250
+destination: 239.255.255.250
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=255.255.255.255/32 padded=255.255.255.255/32
+route: bad address: 255.255.255.255/32
+### dest=32.0.0.1/32 padded=32.0.0.1/32
+   route to: 32.0.0.1
+destination: 32.0.0.1
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.10/32 padded=32.0.0.10/32
+   route to: 32.0.0.10
+destination: 32.0.0.10
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.12/32 padded=32.0.0.12/32
+   route to: 32.0.0.12
+destination: 32.0.0.12
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.13/32 padded=32.0.0.13/32
+   route to: 32.0.0.13
+destination: 32.0.0.13
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.14/32 padded=32.0.0.14/32
+   route to: 32.0.0.14
+destination: 32.0.0.14
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.15/32 padded=32.0.0.15/32
+   route to: 32.0.0.15
+destination: 32.0.0.15
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.17/32 padded=32.0.0.17/32
+   route to: 32.0.0.17
+destination: 32.0.0.17
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.19/32 padded=32.0.0.19/32
+   route to: 32.0.0.19
+destination: 32.0.0.19
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.2/32 padded=32.0.0.2/32
+   route to: 32.0.0.2
+destination: 32.0.0.2
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.20/32 padded=32.0.0.20/32
+   route to: 32.0.0.20
+destination: 32.0.0.20
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.21/32 padded=32.0.0.21/32
+   route to: 32.0.0.21
+destination: 32.0.0.21
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.23/32 padded=32.0.0.23/32
+   route to: 32.0.0.23
+destination: 32.0.0.23
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.24/32 padded=32.0.0.24/32
+   route to: 32.0.0.24
+destination: 32.0.0.24
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.25/32 padded=32.0.0.25/32
+   route to: 32.0.0.25
+destination: 32.0.0.25
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.26/32 padded=32.0.0.26/32
+   route to: 32.0.0.26
+destination: 32.0.0.26
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.27/32 padded=32.0.0.27/32
+   route to: 32.0.0.27
+destination: 32.0.0.27
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.28/32 padded=32.0.0.28/32
+   route to: 32.0.0.28
+destination: 32.0.0.28
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.29/32 padded=32.0.0.29/32
+   route to: 32.0.0.29
+destination: 32.0.0.29
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.3/32 padded=32.0.0.3/32
+   route to: 32.0.0.3
+destination: 32.0.0.3
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.30 padded=32.0.0.30
+   route to: 32.0.0.30
+destination: 32.0.0.30
+  interface: utun11
+      flags: <UP,HOST,DONE,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.31/32 padded=32.0.0.31/32
+   route to: 32.0.0.31
+destination: 32.0.0.31
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.32/32 padded=32.0.0.32/32
+   route to: 32.0.0.32
+destination: 32.0.0.32
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.4/32 padded=32.0.0.4/32
+   route to: 32.0.0.4
+destination: 32.0.0.4
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.5/32 padded=32.0.0.5/32
+   route to: 32.0.0.5
+destination: 32.0.0.5
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.7/32 padded=32.0.0.7/32
+   route to: 32.0.0.7
+destination: 32.0.0.7
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.8/32 padded=32.0.0.8/32
+   route to: 32.0.0.8
+destination: 32.0.0.8
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=32.0.0.9/32 padded=32.0.0.9/32
+   route to: 32.0.0.9
+destination: 32.0.0.9
+       mask: 255.255.255.255
+  interface: utun11
+      flags: <UP,DONE,CLONING,STATIC>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=79.127.159.187 padded=79.127.159.187
+   route to: 79.127.159.187
+destination: default
+       mask: default
+    gateway: 192.168.10.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=84.17.53.155 padded=84.17.53.155
+   route to: 84.17.53.155
+destination: default
+       mask: default
+    gateway: 192.168.10.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=default padded=default
+   route to: default
+destination: default
+       mask: default
+    gateway: 192.168.10.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=Destination padded=Destination.0.0.0
+route: bad address: Destination.0.0.0
+@@@V6_ROUTE_GET
+### dest=::1 padded=::1
+   route to: ::1
+destination: ::1
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         1         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8::/60 padded=530d:ebd9:89bf:95d8::/60
+   route to: 530d:ebd9:89bf:95d8::
+destination: 530d:ebd9:89bf:95d8::
+       mask: ffff:ffff:ffff:fff0::
+    gateway: fe80::fff:1f0b:6e3c:e05a%en0
+  interface: en0
+      flags: <UP,GATEWAY,DONE,PRCLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=530d:ebd9:89bf:95d8::/64 padded=530d:ebd9:89bf:95d8::/64
+   route to: 530d:ebd9:89bf:95d8::
+destination: 530d:ebd9:89bf:95d8::
+       mask: ffff:ffff:ffff:ffff::
+  interface: en0
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=530d:ebd9:89bf:95d8::9 padded=530d:ebd9:89bf:95d8::9
+   route to: 530d:ebd9:89bf:95d8::9
+destination: 530d:ebd9:89bf:95d8::9
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=530d:ebd9:89bf:95d8::c04 padded=530d:ebd9:89bf:95d8::c04
+   route to: 530d:ebd9:89bf:95d8::c04
+destination: 530d:ebd9:89bf:95d8::c04
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=530d:ebd9:89bf:95d8:ed3a:05a8:99b1:baaf padded=530d:ebd9:89bf:95d8:ed3a:05a8:99b1:baaf
+   route to: 530d:ebd9:89bf:95d8:ed3a:05a8:99b1:baaf
+destination: 530d:ebd9:89bf:95d8:ed3a:05a8:99b1:baaf
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0        25        15         0      1492         0 
+### dest=530d:ebd9:89bf:95d8:264d:abcd:f6ce:8a36 padded=530d:ebd9:89bf:95d8:264d:abcd:f6ce:8a36
+   route to: 530d:ebd9:89bf:95d8:264d:abcd:f6ce:8a36
+destination: 530d:ebd9:89bf:95d8:264d:abcd:f6ce:8a36
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8:2016:6e97:9383:6c7a padded=530d:ebd9:89bf:95d8:2016:6e97:9383:6c7a
+   route to: 530d:ebd9:89bf:95d8:2016:6e97:9383:6c7a
+destination: 530d:ebd9:89bf:95d8:2016:6e97:9383:6c7a
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=530d:ebd9:89bf:95d8:7be1:91ee:739:5367 padded=530d:ebd9:89bf:95d8:7be1:91ee:739:5367
+   route to: 530d:ebd9:89bf:95d8:7be1:91ee:739:5367
+destination: 530d:ebd9:89bf:95d8:7be1:91ee:739:5367
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=530d:ebd9:89bf:95d8:9071:cccb:a7b0:6a27 padded=530d:ebd9:89bf:95d8:9071:cccb:a7b0:6a27
+   route to: 530d:ebd9:89bf:95d8:9071:cccb:a7b0:6a27
+destination: 530d:ebd9:89bf:95d8:9071:cccb:a7b0:6a27
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8:e669:e621:166f:35d7 padded=530d:ebd9:89bf:95d8:e669:e621:166f:35d7
+   route to: 530d:ebd9:89bf:95d8:e669:e621:166f:35d7
+destination: 530d:ebd9:89bf:95d8:e669:e621:166f:35d7
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8:9940:5c7f:8248:780f padded=530d:ebd9:89bf:95d8:9940:5c7f:8248:780f
+   route to: 530d:ebd9:89bf:95d8:9940:5c7f:8248:780f
+destination: 530d:ebd9:89bf:95d8:9940:5c7f:8248:780f
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8:80cb:92ef:44b8:5889 padded=530d:ebd9:89bf:95d8:80cb:92ef:44b8:5889
+   route to: 530d:ebd9:89bf:95d8:80cb:92ef:44b8:5889
+destination: 530d:ebd9:89bf:95d8:80cb:92ef:44b8:5889
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8:b25a:685d:f25f:c278 padded=530d:ebd9:89bf:95d8:b25a:685d:f25f:c278
+   route to: 530d:ebd9:89bf:95d8:b25a:685d:f25f:c278
+destination: 530d:ebd9:89bf:95d8:b25a:685d:f25f:c278
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8:fea:720:11bb:d45e padded=530d:ebd9:89bf:95d8:fea:720:11bb:d45e
+   route to: 530d:ebd9:89bf:95d8:fea:720:11bb:d45e
+destination: 530d:ebd9:89bf:95d8:fea:720:11bb:d45e
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=530d:ebd9:89bf:95d8:8b16:2e14:9b5f:d779 padded=530d:ebd9:89bf:95d8:8b16:2e14:9b5f:d779
+   route to: 530d:ebd9:89bf:95d8:8b16:2e14:9b5f:d779
+destination: 530d:ebd9:89bf:95d8:8b16:2e14:9b5f:d779
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b::/60 padded=8db8:e8a1:92da:9f6b::/60
+   route to: 8db8:e8a1:92da:9f6b::
+destination: 8db8:e8a1:92da:9f6b::
+       mask: ffff:ffff:ffff:fff0::
+    gateway: fe80::fff:1f0b:6e3c:e05a%en0
+  interface: en0
+      flags: <UP,GATEWAY,DONE,PRCLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=8db8:e8a1:92da:9f6b::/64 padded=8db8:e8a1:92da:9f6b::/64
+   route to: 8db8:e8a1:92da:9f6b::
+destination: 8db8:e8a1:92da:9f6b::
+       mask: ffff:ffff:ffff:ffff::
+  interface: en0
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=8db8:e8a1:92da:9f6b::9 padded=8db8:e8a1:92da:9f6b::9
+   route to: 8db8:e8a1:92da:9f6b::9
+destination: 8db8:e8a1:92da:9f6b::9
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b::0b9 padded=8db8:e8a1:92da:9f6b::0b9
+   route to: 8db8:e8a1:92da:9f6b::0b9
+destination: 8db8:e8a1:92da:9f6b::0b9
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b::c04 padded=8db8:e8a1:92da:9f6b::c04
+   route to: 8db8:e8a1:92da:9f6b::c04
+destination: 8db8:e8a1:92da:9f6b::c04
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:d713:f8f3:8f10:0de7 padded=8db8:e8a1:92da:9f6b:d713:f8f3:8f10:0de7
+   route to: 8db8:e8a1:92da:9f6b:d713:f8f3:8f10:0de7
+destination: 8db8:e8a1:92da:9f6b:d713:f8f3:8f10:0de7
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b:b772:44b8:ede1:9d15 padded=8db8:e8a1:92da:9f6b:b772:44b8:ede1:9d15
+   route to: 8db8:e8a1:92da:9f6b:b772:44b8:ede1:9d15
+destination: 8db8:e8a1:92da:9f6b:b772:44b8:ede1:9d15
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:0ed3:db2d:a288:8e8d padded=8db8:e8a1:92da:9f6b:0ed3:db2d:a288:8e8d
+   route to: 8db8:e8a1:92da:9f6b:0ed3:db2d:a288:8e8d
+destination: 8db8:e8a1:92da:9f6b:0ed3:db2d:a288:8e8d
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:fc3c:d87e:c5f5:6361 padded=8db8:e8a1:92da:9f6b:fc3c:d87e:c5f5:6361
+   route to: 8db8:e8a1:92da:9f6b:fc3c:d87e:c5f5:6361
+destination: 8db8:e8a1:92da:9f6b:fc3c:d87e:c5f5:6361
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:9071:cccb:a7b0:6a27 padded=8db8:e8a1:92da:9f6b:9071:cccb:a7b0:6a27
+   route to: 8db8:e8a1:92da:9f6b:9071:cccb:a7b0:6a27
+destination: 8db8:e8a1:92da:9f6b:9071:cccb:a7b0:6a27
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b:e669:e621:166f:35d7 padded=8db8:e8a1:92da:9f6b:e669:e621:166f:35d7
+   route to: 8db8:e8a1:92da:9f6b:e669:e621:166f:35d7
+destination: 8db8:e8a1:92da:9f6b:e669:e621:166f:35d7
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b:bb40:6e51:2dfa:db18 padded=8db8:e8a1:92da:9f6b:bb40:6e51:2dfa:db18
+   route to: 8db8:e8a1:92da:9f6b:bb40:6e51:2dfa:db18
+destination: 8db8:e8a1:92da:9f6b:bb40:6e51:2dfa:db18
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:c37c:d28a:5a6:0259 padded=8db8:e8a1:92da:9f6b:c37c:d28a:5a6:0259
+   route to: 8db8:e8a1:92da:9f6b:c37c:d28a:5a6:0259
+destination: 8db8:e8a1:92da:9f6b:c37c:d28a:5a6:0259
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b:162:725a:f658:c9ec padded=8db8:e8a1:92da:9f6b:162:725a:f658:c9ec
+   route to: 8db8:e8a1:92da:9f6b:162:725a:f658:c9ec
+destination: 8db8:e8a1:92da:9f6b:162:725a:f658:c9ec
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:e97b:6ae0:65a8:55df padded=8db8:e8a1:92da:9f6b:e97b:6ae0:65a8:55df
+   route to: 8db8:e8a1:92da:9f6b:e97b:6ae0:65a8:55df
+destination: 8db8:e8a1:92da:9f6b:e97b:6ae0:65a8:55df
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b:7b9e:039e:5d2f:331b padded=8db8:e8a1:92da:9f6b:7b9e:039e:5d2f:331b
+   route to: 8db8:e8a1:92da:9f6b:7b9e:039e:5d2f:331b
+destination: 8db8:e8a1:92da:9f6b:7b9e:039e:5d2f:331b
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:205a:e29f:925a:5b5f padded=8db8:e8a1:92da:9f6b:205a:e29f:925a:5b5f
+   route to: 8db8:e8a1:92da:9f6b:205a:e29f:925a:5b5f
+destination: 8db8:e8a1:92da:9f6b:205a:e29f:925a:5b5f
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:b25a:685d:f25f:c278 padded=8db8:e8a1:92da:9f6b:b25a:685d:f25f:c278
+   route to: 8db8:e8a1:92da:9f6b:b25a:685d:f25f:c278
+destination: 8db8:e8a1:92da:9f6b:b25a:685d:f25f:c278
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b:0b22:d71b:6570:f0cf padded=8db8:e8a1:92da:9f6b:0b22:d71b:6570:f0cf
+   route to: 8db8:e8a1:92da:9f6b:0b22:d71b:6570:f0cf
+destination: 8db8:e8a1:92da:9f6b:0b22:d71b:6570:f0cf
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:9f6b:6b1:4472:4d23:482e padded=8db8:e8a1:92da:9f6b:6b1:4472:4d23:482e
+   route to: 8db8:e8a1:92da:9f6b:6b1:4472:4d23:482e
+destination: 8db8:e8a1:92da:9f6b:6b1:4472:4d23:482e
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=8db8:e8a1:92da:9f6b:fea:720:11bb:d45e padded=8db8:e8a1:92da:9f6b:fea:720:11bb:d45e
+   route to: 8db8:e8a1:92da:9f6b:fea:720:11bb:d45e
+destination: 8db8:e8a1:92da:9f6b:fea:720:11bb:d45e
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=8db8:e8a1:92da:caa4::/64 padded=8db8:e8a1:92da:caa4::/64
+   route to: 8db8:e8a1:92da:caa4::
+destination: 8db8:e8a1:92da:caa4::
+       mask: ffff:ffff:ffff:ffff::
+    gateway: fe80::221f:e5d9:65dd:9095%en0
+  interface: en0
+      flags: <UP,GATEWAY,DONE,PRCLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=16f7:9c0:d0e5:569d::/56 padded=16f7:9c0:d0e5:569d::/56
+   route to: 16f7:9c0:d0e5:569d::
+destination: 16f7:9c0:d0e5:569d::
+       mask: ffff:ffff:ffff:ff00::
+    gateway: fe80::fff:1f0b:6e3c:e05a%en0
+  interface: en0
+      flags: <UP,GATEWAY,DONE,PRCLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=16f7:9c0:d0e5:569d::/64 padded=16f7:9c0:d0e5:569d::/64
+   route to: 16f7:9c0:d0e5:569d::
+destination: 16f7:9c0:d0e5:569d::
+       mask: ffff:ffff:ffff:ffff::
+  interface: en0
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=16f7:9c0:d0e5:569d::9 padded=16f7:9c0:d0e5:569d::9
+   route to: 16f7:9c0:d0e5:569d::9
+destination: 16f7:9c0:d0e5:569d::9
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=16f7:9c0:d0e5:569d::c04 padded=16f7:9c0:d0e5:569d::c04
+   route to: 16f7:9c0:d0e5:569d::c04
+destination: 16f7:9c0:d0e5:569d::c04
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=16f7:9c0:d0e5:569d:0551:5494:ee34:ae81 padded=16f7:9c0:d0e5:569d:0551:5494:ee34:ae81
+   route to: 16f7:9c0:d0e5:569d:0551:5494:ee34:ae81
+destination: 16f7:9c0:d0e5:569d:0551:5494:ee34:ae81
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=16f7:9c0:d0e5:569d:acad:fc15:b4fd:4cc1 padded=16f7:9c0:d0e5:569d:acad:fc15:b4fd:4cc1
+   route to: 16f7:9c0:d0e5:569d:acad:fc15:b4fd:4cc1
+destination: 16f7:9c0:d0e5:569d:acad:fc15:b4fd:4cc1
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=16f7:9c0:d0e5:569d:9071:cccb:a7b0:6a27 padded=16f7:9c0:d0e5:569d:9071:cccb:a7b0:6a27
+   route to: 16f7:9c0:d0e5:569d:9071:cccb:a7b0:6a27
+destination: 16f7:9c0:d0e5:569d:9071:cccb:a7b0:6a27
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=16f7:9c0:d0e5:569d:e669:e621:166f:35d7 padded=16f7:9c0:d0e5:569d:e669:e621:166f:35d7
+   route to: 16f7:9c0:d0e5:569d:e669:e621:166f:35d7
+destination: 16f7:9c0:d0e5:569d:e669:e621:166f:35d7
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=16f7:9c0:d0e5:569d:e97b:6ae0:65a8:55df padded=16f7:9c0:d0e5:569d:e97b:6ae0:65a8:55df
+   route to: 16f7:9c0:d0e5:569d:e97b:6ae0:65a8:55df
+destination: 16f7:9c0:d0e5:569d:e97b:6ae0:65a8:55df
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=16f7:9c0:d0e5:569d:9940:5c7f:8248:780f padded=16f7:9c0:d0e5:569d:9940:5c7f:8248:780f
+   route to: 16f7:9c0:d0e5:569d:9940:5c7f:8248:780f
+destination: 16f7:9c0:d0e5:569d:9940:5c7f:8248:780f
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=16f7:9c0:d0e5:569d:3c0:3b34:ef3c:460a padded=16f7:9c0:d0e5:569d:3c0:3b34:ef3c:460a
+   route to: 16f7:9c0:d0e5:569d:3c0:3b34:ef3c:460a
+destination: 16f7:9c0:d0e5:569d:3c0:3b34:ef3c:460a
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=16f7:9c0:d0e5:569d:b25a:685d:f25f:c278 padded=16f7:9c0:d0e5:569d:b25a:685d:f25f:c278
+   route to: 16f7:9c0:d0e5:569d:b25a:685d:f25f:c278
+destination: 16f7:9c0:d0e5:569d:b25a:685d:f25f:c278
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=16f7:9c0:d0e5:569d:fea:720:11bb:d45e padded=16f7:9c0:d0e5:569d:fea:720:11bb:d45e
+   route to: 16f7:9c0:d0e5:569d:fea:720:11bb:d45e
+destination: 16f7:9c0:d0e5:569d:fea:720:11bb:d45e
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=default padded=default
+   route to: ::
+destination: ::
+       mask: default
+    gateway: fe80::fff:1f0b:6e3c:e05a%en0
+  interface: en0
+      flags: <UP,GATEWAY,DONE,PRCLONING,GLOBAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=Destination padded=Destination
+Destination: nodename nor servname provided, or not known
+### dest=fd7a:115c:a1e0::/48 padded=fd7a:115c:a1e0::/48
+   route to: fd7a:115c:a1e0::
+destination: fd7a:115c:a1e0::
+       mask: ffff:ffff:ffff::
+  interface: utun11
+      flags: <UP,DONE,PRCLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=fd7a:115c:a1e0::57 padded=fd7a:115c:a1e0::57
+   route to: fd7a:115c:a1e0::57
+destination: fd7a:115c:a1e0::57
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fd7a:115c:a1e0::e9 padded=fd7a:115c:a1e0::e9
+   route to: fd7a:115c:a1e0::e9
+destination: fd7a:115c:a1e0::e9
+  interface: utun11
+      flags: <UP,HOST,DONE,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=fd7a:115c:a1e0::e9/128 padded=fd7a:115c:a1e0::e9/128
+   route to: fd7a:115c:a1e0::e9
+destination: fd7a:115c:a1e0::e9
+  interface: utun11
+      flags: <UP,HOST,DONE,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=802b:44fb:1f43::/64 padded=802b:44fb:1f43::/64
+   route to: 802b:44fb:1f43::
+destination: 802b:44fb:1f43::
+       mask: ffff:ffff:ffff:ffff::
+  interface: bridge100
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=802b:44fb:1f43::9 padded=802b:44fb:1f43::9
+   route to: 802b:44fb:1f43::9
+destination: 802b:44fb:1f43::9
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=802b:44fb:1f43:9::/64 padded=802b:44fb:1f43:9::/64
+   route to: 802b:44fb:1f43:9::
+destination: 802b:44fb:1f43:9::
+       mask: ffff:ffff:ffff:ffff::
+  interface: bridge101
+      flags: <UP,DONE,CLONING>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=802b:44fb:1f43:9::9 padded=802b:44fb:1f43:9::9
+   route to: 802b:44fb:1f43:9::9
+destination: 802b:44fb:1f43:9::9
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::%bridge100/64 padded=fe80::%bridge100/64
+   route to: fe80::%bridge100
+destination: fe80::%bridge100
+       mask: ffff:ffff:ffff:ffff::
+  interface: bridge100
+      flags: <UP,DONE,CLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=fe80::%bridge101/64 padded=fe80::%bridge101/64
+   route to: fe80::%bridge101
+destination: fe80::%bridge101
+       mask: ffff:ffff:ffff:ffff::
+  interface: bridge101
+      flags: <UP,DONE,CLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=fe80::%en0/64 padded=fe80::%en0/64
+   route to: fe80::%en0
+destination: fe80::%en0
+       mask: ffff:ffff:ffff:ffff::
+  interface: en0
+      flags: <UP,DONE,CLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=fe80::%lo0/64 padded=fe80::%lo0/64
+   route to: fe80::%lo0
+destination: fe80::%lo0
+       mask: ffff:ffff:ffff:ffff::
+  interface: lo0
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::%utun0/64 padded=fe80::%utun0/64
+   route to: fe80::%utun0
+destination: fe80::%utun0
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun0
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=fe80::%utun1/64 padded=fe80::%utun1/64
+   route to: fe80::%utun1
+destination: fe80::%utun1
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun1
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=fe80::%utun11/64 padded=fe80::%utun11/64
+   route to: fe80::%utun11
+destination: fe80::%utun11
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun11
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=fe80::%utun2/64 padded=fe80::%utun2/64
+   route to: fe80::%utun2
+destination: fe80::%utun2
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun2
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      2000         0 
+### dest=fe80::%utun3/64 padded=fe80::%utun3/64
+   route to: fe80::%utun3
+destination: fe80::%utun3
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun3
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1000         0 
+### dest=fe80::%utun4/64 padded=fe80::%utun4/64
+   route to: fe80::%utun4
+destination: fe80::%utun4
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun4
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=fe80::%utun5/64 padded=fe80::%utun5/64
+   route to: fe80::%utun5
+destination: fe80::%utun5
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun5
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=fe80::%utun6/64 padded=fe80::%utun6/64
+   route to: fe80::%utun6
+destination: fe80::%utun6
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun6
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=fe80::%utun7/64 padded=fe80::%utun7/64
+   route to: fe80::%utun7
+destination: fe80::%utun7
+       mask: ffff:ffff:ffff:ffff::
+  interface: utun7
+      flags: <UP,DONE,PRCLONING,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=fe80::1%lo0 padded=fe80::1%lo0
+   route to: fe80::1%lo0
+destination: fe80::1%lo0
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::28dc:52d6:e49a:aa41%en0 padded=fe80::28dc:52d6:e49a:aa41%en0
+   route to: fe80::28dc:52d6:e49a:aa41%en0
+destination: fe80::28dc:52d6:e49a:aa41%en0
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::221f:e5d9:65dd:9095%en0 padded=fe80::221f:e5d9:65dd:9095%en0
+   route to: fe80::221f:e5d9:65dd:9095%en0
+destination: fe80::221f:e5d9:65dd:9095%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0        18        13         0      1492         0 
+### dest=fe80::69e8:25d6:c6e0:c127%en0 padded=fe80::69e8:25d6:c6e0:c127%en0
+   route to: fe80::69e8:25d6:c6e0:c127%en0
+destination: fe80::69e8:25d6:c6e0:c127%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0        61        60         0      1492         0 
+### dest=fe80::0943:8f79:c8cb:17d0%en0 padded=fe80::0943:8f79:c8cb:17d0%en0
+   route to: fe80::0943:8f79:c8cb:17d0%en0
+destination: fe80::0943:8f79:c8cb:17d0%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=fe80::3966:0d89:4830:c064%utun0 padded=fe80::3966:0d89:4830:c064%utun0
+   route to: fe80::3966:0d89:4830:c064%utun0
+destination: fe80::3966:0d89:4830:c064%utun0
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::7894:7415:9ad:ce1a%en0 padded=fe80::7894:7415:9ad:ce1a%en0
+   route to: fe80::7894:7415:9ad:ce1a%en0
+destination: fe80::7894:7415:9ad:ce1a%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=fe80::b95f:0a77:0c62:db95%en0 padded=fe80::b95f:0a77:0c62:db95%en0
+   route to: fe80::b95f:0a77:0c62:db95%en0
+destination: fe80::b95f:0a77:0c62:db95%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=fe80::fff:1f0b:6e3c:e05a%en0 padded=fe80::fff:1f0b:6e3c:e05a%en0
+   route to: fe80::fff:1f0b:6e3c:e05a%en0
+destination: fe80::fff:1f0b:6e3c:e05a%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF,ROUTER>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=fe80::d93:cbff:dda3:ed7c%en0 padded=fe80::d93:cbff:dda3:ed7c%en0
+   route to: fe80::d93:cbff:dda3:ed7c%en0
+destination: fe80::d93:cbff:dda3:ed7c%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1492         0 
+### dest=fe80::9e53:9262:8051:a380%bridge100 padded=fe80::9e53:9262:8051:a380%bridge100
+   route to: fe80::9e53:9262:8051:a380%bridge100
+destination: fe80::9e53:9262:8051:a380%bridge100
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::9e53:9262:8051:ef64%bridge101 padded=fe80::9e53:9262:8051:ef64%bridge101
+   route to: fe80::9e53:9262:8051:ef64%bridge101
+destination: fe80::9e53:9262:8051:ef64%bridge101
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::173e:ff55:3f16:ec95%utun2 padded=fe80::173e:ff55:3f16:ec95%utun2
+   route to: fe80::173e:ff55:3f16:ec95%utun2
+destination: fe80::173e:ff55:3f16:ec95%utun2
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::b985:1449:272e:65ff%utun11 padded=fe80::b985:1449:272e:65ff%utun11
+   route to: fe80::b985:1449:272e:65ff%utun11
+destination: fe80::b985:1449:272e:65ff%utun11
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::30b7:2b77:78a4:ff26%awdl0 padded=fe80::30b7:2b77:78a4:ff26%awdl0
+   route to: fe80::30b7:2b77:78a4:ff26%awdl0
+destination: fe80::30b7:2b77:78a4:ff26%awdl0
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::30b7:2b77:78a4:ff26%llw0 padded=fe80::30b7:2b77:78a4:ff26%llw0
+   route to: fe80::30b7:2b77:78a4:ff26%llw0
+destination: fe80::30b7:2b77:78a4:ff26%llw0
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::9447:eae:4316:e1ec%utun7 padded=fe80::9447:eae:4316:e1ec%utun7
+   route to: fe80::9447:eae:4316:e1ec%utun7
+destination: fe80::9447:eae:4316:e1ec%utun7
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::ae90:7df4:a152:ae17%utun6 padded=fe80::ae90:7df4:a152:ae17%utun6
+   route to: fe80::ae90:7df4:a152:ae17%utun6
+destination: fe80::ae90:7df4:a152:ae17%utun6
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::31ef:86f1:f2d3:57%utun4 padded=fe80::31ef:86f1:f2d3:57%utun4
+   route to: fe80::31ef:86f1:f2d3:57%utun4
+destination: fe80::31ef:86f1:f2d3:57%utun4
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::120c:f2c:c763:9e71%utun1 padded=fe80::120c:f2c:c763:9e71%utun1
+   route to: fe80::120c:f2c:c763:9e71%utun1
+destination: fe80::120c:f2c:c763:9e71%utun1
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::285:bbb4:6317:d2b5%en0 padded=fe80::285:bbb4:6317:d2b5%en0
+   route to: fe80::285:bbb4:6317:d2b5%en0
+destination: fe80::285:bbb4:6317:d2b5%en0
+  interface: en0
+      flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0       420         0        48         0      1492         0 
+### dest=fe80::0dee:685:9e38:b55%utun3 padded=fe80::0dee:685:9e38:b55%utun3
+   route to: fe80::0dee:685:9e38:b55%utun3
+destination: fe80::0dee:685:9e38:b55%utun3
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=fe80::14a8:1b27:3a64:c870%utun5 padded=fe80::14a8:1b27:3a64:c870%utun5
+   route to: fe80::14a8:1b27:3a64:c870%utun5
+destination: fe80::14a8:1b27:3a64:c870%utun5
+  interface: lo0
+      flags: <UP,HOST,DONE,LLINFO,LOCAL,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=ff00::/8 padded=ff00::/8
+   route to: ff00::
+destination: ff00::
+       mask: ff00::
+  interface: en0
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff01::%bridge100/32 padded=ff01::%bridge100/32
+   route to: ff01::%bridge100
+destination: ff01::%bridge100
+       mask: ffff:ffff::
+  interface: bridge100
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff01::%bridge101/32 padded=ff01::%bridge101/32
+   route to: ff01::%bridge101
+destination: ff01::%bridge101
+       mask: ffff:ffff::
+  interface: bridge101
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff01::%en0/32 padded=ff01::%en0/32
+   route to: ff01::%en0
+destination: ff01::%en0
+       mask: ffff:ffff::
+  interface: en0
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff01::%lo0/32 padded=ff01::%lo0/32
+   route to: ff01::%lo0
+destination: ff01::%lo0
+       mask: ffff:ffff::
+  interface: lo0
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=ff01::%utun0/32 padded=ff01::%utun0/32
+   route to: ff01::%utun0
+destination: ff01::%utun0
+       mask: ffff:ffff::
+  interface: utun0
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff01::%utun1/32 padded=ff01::%utun1/32
+   route to: ff01::%utun1
+destination: ff01::%utun1
+       mask: ffff:ffff::
+  interface: utun1
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff01::%utun11/32 padded=ff01::%utun11/32
+   route to: ff01::%utun11
+destination: ff01::%utun11
+       mask: ffff:ffff::
+  interface: utun11
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=ff01::%utun2/32 padded=ff01::%utun2/32
+   route to: ff01::%utun2
+destination: ff01::%utun2
+       mask: ffff:ffff::
+  interface: utun2
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      2000         0 
+### dest=ff01::%utun3/32 padded=ff01::%utun3/32
+   route to: ff01::%utun3
+destination: ff01::%utun3
+       mask: ffff:ffff::
+  interface: utun3
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1000         0 
+### dest=ff01::%utun4/32 padded=ff01::%utun4/32
+   route to: ff01::%utun4
+destination: ff01::%utun4
+       mask: ffff:ffff::
+  interface: utun4
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff01::%utun5/32 padded=ff01::%utun5/32
+   route to: ff01::%utun5
+destination: ff01::%utun5
+       mask: ffff:ffff::
+  interface: utun5
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff01::%utun6/32 padded=ff01::%utun6/32
+   route to: ff01::%utun6
+destination: ff01::%utun6
+       mask: ffff:ffff::
+  interface: utun6
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff01::%utun7/32 padded=ff01::%utun7/32
+   route to: ff01::%utun7
+destination: ff01::%utun7
+       mask: ffff:ffff::
+  interface: utun7
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff02::%bridge100/32 padded=ff02::%bridge100/32
+   route to: ff02::%bridge100
+destination: ff02::%bridge100
+       mask: ffff:ffff::
+  interface: bridge100
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff02::%bridge101/32 padded=ff02::%bridge101/32
+   route to: ff02::%bridge101
+destination: ff02::%bridge101
+       mask: ffff:ffff::
+  interface: bridge101
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff02::%en0/32 padded=ff02::%en0/32
+   route to: ff02::%en0
+destination: ff02::%en0
+       mask: ffff:ffff::
+  interface: en0
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff02::%lo0/32 padded=ff02::%lo0/32
+   route to: ff02::%lo0
+destination: ff02::%lo0
+       mask: ffff:ffff::
+  interface: lo0
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0     16384         0 
+### dest=ff02::%utun0/32 padded=ff02::%utun0/32
+   route to: ff02::%utun0
+destination: ff02::%utun0
+       mask: ffff:ffff::
+  interface: utun0
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1500         0 
+### dest=ff02::%utun1/32 padded=ff02::%utun1/32
+   route to: ff02::%utun1
+destination: ff02::%utun1
+       mask: ffff:ffff::
+  interface: utun1
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff02::%utun11/32 padded=ff02::%utun11/32
+   route to: ff02::%utun11
+destination: ff02::%utun11
+       mask: ffff:ffff::
+  interface: utun11
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1280         0 
+### dest=ff02::%utun2/32 padded=ff02::%utun2/32
+   route to: ff02::%utun2
+destination: ff02::%utun2
+       mask: ffff:ffff::
+  interface: utun2
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      2000         0 
+### dest=ff02::%utun3/32 padded=ff02::%utun3/32
+   route to: ff02::%utun3
+destination: ff02::%utun3
+       mask: ffff:ffff::
+  interface: utun3
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1000         0 
+### dest=ff02::%utun4/32 padded=ff02::%utun4/32
+   route to: ff02::%utun4
+destination: ff02::%utun4
+       mask: ffff:ffff::
+  interface: utun4
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff02::%utun5/32 padded=ff02::%utun5/32
+   route to: ff02::%utun5
+destination: ff02::%utun5
+       mask: ffff:ffff::
+  interface: utun5
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff02::%utun6/32 padded=ff02::%utun6/32
+   route to: ff02::%utun6
+destination: ff02::%utun6
+       mask: ffff:ffff::
+  interface: utun6
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+### dest=ff02::%utun7/32 padded=ff02::%utun7/32
+   route to: ff02::%utun7
+destination: ff02::%utun7
+       mask: ffff:ffff::
+  interface: utun7
+      flags: <UP,DONE,CLONING,MULTICAST,IFSCOPE>
+ recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+       0         0         0         0         0         0      1380         0 
+@@@IFCONFIG_FLAGS
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	options=1203<RXCSUM,TXCSUM,TXSTATUS,SW_TIMESTAMP>
+	inet 127.0.0.1 netmask 0xff000000
+	inet6 ::1 prefixlen 128 
+	inet6 fe80::1%lo0 prefixlen 64 scopeid 0x1 
+	nd6 options=201<PERFORMNUD,DAD>
+gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280
+stf0: flags=0<> mtu 1280
+anpi2: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 52:08:98:87:c6:4d
+	media: none
+	status: inactive
+anpi0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 52:08:98:87:c6:cd
+	media: none
+	status: inactive
+anpi1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 52:08:98:87:c6:dd
+	media: none
+	status: inactive
+en4: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 52:08:98:87:c6:1a
+	nd6 options=201<PERFORMNUD,DAD>
+	media: none
+	status: inactive
+en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 52:08:98:87:c6:08
+	nd6 options=201<PERFORMNUD,DAD>
+	media: none
+	status: inactive
+en6: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 52:08:98:87:c6:c5
+	nd6 options=201<PERFORMNUD,DAD>
+	media: none
+	status: inactive
+en1: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 3d:9a:4d:81:4c:f7
+	media: autoselect <full-duplex>
+	status: inactive
+en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 3d:9a:4d:81:4c:1d
+	media: autoselect <full-duplex>
+	status: inactive
+en3: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	options=460<TSO4,TSO6,CHANNEL_IO>
+	ether 3d:9a:4d:81:4c:74
+	media: autoselect <full-duplex>
+	status: inactive
+bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=63<RXCSUM,TXCSUM,TSO4,TSO6>
+	ether 3d:9a:4d:81:4c:f7
+	Configuration:
+		id 7:7:7:7:7:7 priority 0 hellotime 0 fwddelay 0
+		maxage 0 holdcnt 0 proto stp maxaddr 100 timeout 1200
+		root id 7:7:7:7:7:7 priority 0 ifcost 0 port 0
+		ipfilter disabled flags 0x0
+	member: en1 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 10 priority 0 path cost 0
+	member: en2 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 11 priority 0 path cost 0
+	member: en3 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 12 priority 0 path cost 0
+	nd6 options=201<PERFORMNUD,DAD>
+	media: <unknown type>
+	status: inactive
+ap1: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether df:51:72:37:06:7c
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect (none)
+en0: flags=8b63<UP,BROADCAST,SMART,RUNNING,PROMISC,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether 9d:03:01:41:b8:1a
+	inet6 fe80::28dc:52d6:e49a:aa41%en0 prefixlen 64 secured scopeid 0xe 
+	inet 192.168.10.142 netmask 0xffffff00 broadcast 192.168.10.255
+	inet6 8db8:e8a1:92da:9f6b:d713:f8f3:8f10:0de7 prefixlen 64 autoconf secured 
+	inet6 530d:ebd9:89bf:95d8:264d:abcd:f6ce:8a36 prefixlen 64 autoconf secured 
+	inet6 8db8:e8a1:92da:9f6b:0b22:d71b:6570:f0cf prefixlen 64 deprecated autoconf temporary 
+	inet6 530d:ebd9:89bf:95d8:8b16:2e14:9b5f:d779 prefixlen 64 deprecated autoconf temporary 
+	inet6 8db8:e8a1:92da:9f6b:c37c:d28a:5a6:0259 prefixlen 64 deprecated autoconf temporary 
+	inet6 530d:ebd9:89bf:95d8:80cb:92ef:44b8:5889 prefixlen 64 deprecated autoconf temporary 
+	inet6 16f7:9c0:d0e5:569d:3c0:3b34:ef3c:460a prefixlen 64 autoconf secured 
+	inet6 16f7:9c0:d0e5:569d:e97b:6ae0:65a8:55df prefixlen 64 deprecated autoconf temporary 
+	inet6 8db8:e8a1:92da:9f6b:e97b:6ae0:65a8:55df prefixlen 64 deprecated autoconf temporary 
+	inet6 530d:ebd9:89bf:95d8:9071:cccb:a7b0:6a27 prefixlen 64 deprecated autoconf temporary 
+	inet6 16f7:9c0:d0e5:569d:9071:cccb:a7b0:6a27 prefixlen 64 deprecated autoconf temporary 
+	inet6 8db8:e8a1:92da:9f6b:9071:cccb:a7b0:6a27 prefixlen 64 deprecated autoconf temporary 
+	inet6 530d:ebd9:89bf:95d8:e669:e621:166f:35d7 prefixlen 64 deprecated autoconf temporary 
+	inet6 16f7:9c0:d0e5:569d:e669:e621:166f:35d7 prefixlen 64 deprecated autoconf temporary 
+	inet6 8db8:e8a1:92da:9f6b:e669:e621:166f:35d7 prefixlen 64 deprecated autoconf temporary 
+	inet6 530d:ebd9:89bf:95d8:b25a:685d:f25f:c278 prefixlen 64 deprecated autoconf temporary 
+	inet6 16f7:9c0:d0e5:569d:b25a:685d:f25f:c278 prefixlen 64 deprecated autoconf temporary 
+	inet6 8db8:e8a1:92da:9f6b:b25a:685d:f25f:c278 prefixlen 64 deprecated autoconf temporary 
+	inet6 530d:ebd9:89bf:95d8:fea:720:11bb:d45e prefixlen 64 deprecated autoconf temporary 
+	inet6 16f7:9c0:d0e5:569d:fea:720:11bb:d45e prefixlen 64 deprecated autoconf temporary 
+	inet6 8db8:e8a1:92da:9f6b:fea:720:11bb:d45e prefixlen 64 autoconf temporary 
+	inet6 530d:ebd9:89bf:95d8:9940:5c7f:8248:780f prefixlen 64 autoconf temporary 
+	inet6 16f7:9c0:d0e5:569d:9940:5c7f:8248:780f prefixlen 64 autoconf temporary 
+	inet6 8db8:e8a1:92da:9f6b::0b9 prefixlen 64 dynamic 
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+awdl0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether 17:4c:6c:68:ca:f2
+	inet6 fe80::30b7:2b77:78a4:ff26%awdl0 prefixlen 64 scopeid 0x10 
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+llw0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 17:4c:6c:68:ca:f2
+	inet6 fe80::30b7:2b77:78a4:ff26%llw0 prefixlen 64 scopeid 0x11 
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect (none)
+	status: inactive
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	inet6 fe80::3966:0d89:4830:c064%utun0 prefixlen 64 scopeid 0x12 
+	nd6 options=201<PERFORMNUD,DAD>
+utun1: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::120c:f2c:c763:9e71%utun1 prefixlen 64 scopeid 0x13 
+	nd6 options=201<PERFORMNUD,DAD>
+utun2: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 2000
+	inet6 fe80::173e:ff55:3f16:ec95%utun2 prefixlen 64 scopeid 0x14 
+	nd6 options=201<PERFORMNUD,DAD>
+utun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1000
+	inet6 fe80::0dee:685:9e38:b55%utun3 prefixlen 64 scopeid 0x15 
+	nd6 options=201<PERFORMNUD,DAD>
+utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::31ef:86f1:f2d3:57%utun4 prefixlen 64 scopeid 0x16 
+	nd6 options=201<PERFORMNUD,DAD>
+utun5: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::14a8:1b27:3a64:c870%utun5 prefixlen 64 scopeid 0x17 
+	nd6 options=201<PERFORMNUD,DAD>
+utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::ae90:7df4:a152:ae17%utun6 prefixlen 64 scopeid 0x18 
+	nd6 options=201<PERFORMNUD,DAD>
+utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+	inet6 fe80::9447:eae:4316:e1ec%utun7 prefixlen 64 scopeid 0x19 
+	nd6 options=201<PERFORMNUD,DAD>
+utun8: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	nd6 options=201<PERFORMNUD,DAD>
+utun9: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+utun10: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+utun11: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	inet6 fe80::b985:1449:272e:65ff%utun11 prefixlen 64 scopeid 0x1d 
+	inet 32.0.0.30 --> 32.0.0.30 netmask 0xffffffff
+	inet6 fd7a:115c:a1e0::57 prefixlen 48 
+	nd6 options=201<PERFORMNUD,DAD>
+vmenet0: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	ether 24:b8:03:e8:45:7d
+	media: autoselect
+	status: active
+bridge100: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500
+	options=3<RXCSUM,TXCSUM>
+	ether ac:1d:ea:a0:b8:bd
+	inet 10.211.55.2 netmask 0xffffff00 broadcast 10.211.55.255
+	inet6 fe80::9e53:9262:8051:a380%bridge100 prefixlen 64 scopeid 0x1f 
+	inet6 802b:44fb:1f43::9 prefixlen 64 
+	Configuration:
+		id 7:7:7:7:7:7 priority 0 hellotime 0 fwddelay 0
+		maxage 0 holdcnt 0 proto stp maxaddr 100 timeout 1200
+		root id 7:7:7:7:7:7 priority 0 ifcost 0 port 0
+		ipfilter disabled flags 0x0
+	member: vmenet0 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 30 priority 0 path cost 0
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+vmenet1: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	ether 98:bd:82:58:f7:d0
+	media: autoselect
+	status: active
+bridge101: flags=8a63<UP,BROADCAST,SMART,RUNNING,ALLMULTI,SIMPLEX,MULTICAST> mtu 1500
+	options=3<RXCSUM,TXCSUM>
+	ether ac:1d:ea:a0:b8:9e
+	inet 10.37.129.2 netmask 0xffffff00 broadcast 10.37.129.255
+	inet6 fe80::9e53:9262:8051:ef64%bridge101 prefixlen 64 scopeid 0x21 
+	inet6 802b:44fb:1f43:9::9 prefixlen 64 
+	Configuration:
+		id 7:7:7:7:7:7 priority 0 hellotime 0 fwddelay 0
+		maxage 0 holdcnt 0 proto stp maxaddr 100 timeout 1200
+		root id 7:7:7:7:7:7 priority 0 ifcost 0 port 0
+		ipfilter disabled flags 0x0
+	member: vmenet1 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 32 priority 0 path cost 0
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+vmenet2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST> mtu 1500
+	ether aa:51:89:aa:fb:2d
+	media: autoselect
+	status: active
+bridge102: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=3<RXCSUM,TXCSUM>
+	ether ac:1d:ea:a0:b8:03
+	Configuration:
+		id 7:7:7:7:7:7 priority 0 hellotime 0 fwddelay 0
+		maxage 0 holdcnt 0 proto stp maxaddr 100 timeout 1200
+		root id 7:7:7:7:7:7 priority 0 ifcost 0 port 0
+		ipfilter disabled flags 0x0
+	member: vmenet2 flags=3<LEARNING,DISCOVER>
+	        ifmaxaddr 0 port 34 priority 0 path cost 0
+	member: en0 flags=8003<LEARNING,DISCOVER,MACNAT>
+	        ifmaxaddr 0 port 14 priority 0 path cost 0
+	media: autoselect
+	status: active
+@@@END

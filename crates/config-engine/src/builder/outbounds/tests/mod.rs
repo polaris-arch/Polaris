@@ -1008,3 +1008,156 @@ fn dial_domain_resolver_stays_plain_tag_when_ipv6_on() {
         serde_json::json!("dns-node-race")
     );
 }
+
+// ── on_demand（sing-box 1.15）：必须抵达**每一条** endpoint 腿 ─────────────────────
+//
+// 遗漏一条腿的形态是**静默的**：那个协议的节点照常生成、`sing-box check` 照常 rc=0，只是永远
+// 不会挂起。用户侧表现为「开关拨了没反应」，而任何"看生成结果非空"的门都是绿的。
+// 故取材面从 `lands_in_endpoints` 反推（新增 endpoint 协议自动入列），而不是手抄一份协议清单。
+
+/// 造一个该协议下**能真正生成出 endpoint** 的最小节点。
+fn endpoint_node_for(protocol: Protocol, on_demand: Option<bool>) -> ServerConfig {
+    let mut server = ServerConfig {
+        id: "e1".into(),
+        name: "E1".into(),
+        protocol,
+        address: "vpn.example.com".into(),
+        port: 443,
+        ..Default::default()
+    };
+    server.on_demand = on_demand;
+    if protocol == Protocol::Wireguard {
+        server.port = 51820;
+        server.wireguard_settings = Some(Box::new(
+            crate::user_config::server_config::WireGuardSettings {
+                private_key: Some("priv".into()),
+                peer_public_key: Some("pub".into()),
+                local_address: vec!["10.0.0.2/32".into()],
+                // 不设 allow_internet=false，否则 `is_mesh_node_unroutable` 会把它整条跳过，
+                // 断言就退化成"节点不存在也算过"。
+                allow_internet: Some(true),
+                ..Default::default()
+            },
+        ));
+    }
+    server
+}
+
+fn build_single(server: ServerConfig) -> OutboundsResult {
+    let mut config = UserConfig::default();
+    config.servers = vec![server];
+    config.selected_server_id = Some("__direct__".into());
+    let mut deps = deps_default();
+    build_outbounds(&config, &mut deps).expect("最小节点应能生成")
+}
+
+#[test]
+fn on_demand_reaches_every_endpoint_leg() {
+    use crate::user_config::server_config::{lands_in_endpoints, ALL_PROTOCOLS};
+
+    let endpoint_protocols: Vec<Protocol> = ALL_PROTOCOLS
+        .into_iter()
+        .filter(|p| lands_in_endpoints(*p))
+        .collect();
+    // 取材面自检：判据塌成空集时，下面的循环会平凡通过。
+    assert!(
+        endpoint_protocols.len() >= 4,
+        "lands_in_endpoints 只认出 {} 个协议 —— 取材面塌了，本门此刻是假绿",
+        endpoint_protocols.len()
+    );
+
+    for protocol in endpoint_protocols {
+        let name = crate::builder::outbound::protocol_str(protocol);
+
+        // ① 设了 true ⇒ 必须抵达生成结果。
+        let result = build_single(endpoint_node_for(protocol, Some(true)));
+        let ep = result
+            .pending_endpoints
+            .iter()
+            .find(|e| e.tag == "E1")
+            .unwrap_or_else(|| panic!("{name}：最小节点没生成 endpoint，断言无从谈起"));
+        assert_eq!(
+            ep.on_demand,
+            Some(true),
+            "{name}：on_demand 没抵达这条腿 —— 症状是「开关拨了没反应」，且所有看非空的门都绿"
+        );
+        // 序列化面也要有（`skip_serializing_if` 写错会让类型化字段在 JSON 里凭空消失）。
+        let json = serde_json::to_value(ep).unwrap();
+        assert_eq!(
+            json.get("on_demand"),
+            Some(&serde_json::Value::Bool(true)),
+            "{name}：on_demand 在序列化后丢了"
+        );
+
+        // ② 未设置 ⇒ **一个键都不发**（与本字段出现之前逐字节等价）。
+        let result = build_single(endpoint_node_for(protocol, None));
+        let ep = result
+            .pending_endpoints
+            .iter()
+            .find(|e| e.tag == "E1")
+            .unwrap();
+        assert_eq!(ep.on_demand, None, "{name}：未设置却发了 on_demand");
+        let json = serde_json::to_value(ep).unwrap();
+        assert!(
+            json.get("on_demand").is_none(),
+            "{name}：未设置却在 JSON 里出现 on_demand —— 会改动金样字节"
+        );
+    }
+}
+
+/// custom（`isEndpoint`）逃生舱这条腿：`lands_in_endpoints` 看不到它（它看节点设置不看协议），
+/// 故必须单独钉一次，否则唯一能跑 openvpn/openconnect 手写配置的那条通路无人覆盖。
+#[test]
+fn on_demand_reaches_the_custom_endpoint_leg() {
+    let raw = serde_json::json!({ "type": "openconnect", "server": "vpn.example.com" });
+
+    let mut node = custom_node("c1", raw.clone(), true);
+    node.on_demand = Some(true);
+    let (result, _) = build_with_custom(node);
+    let ep = result
+        .pending_endpoints
+        .iter()
+        .find(|e| e.tag == "c1")
+        .expect("custom endpoint 应存在");
+    assert_eq!(ep.on_demand, Some(true), "custom 逃生舱漏了 on_demand");
+
+    // 未设置 ⇒ 不碰 `extra`：raw JSON 里手写的 on_demand 照常原样透传（逃生舱既有语义）。
+    let raw_with_key =
+        serde_json::json!({ "type": "openconnect", "server": "v.example.com", "on_demand": true });
+    let (result, _) = build_with_custom(custom_node("c2", raw_with_key, true));
+    let ep = result
+        .pending_endpoints
+        .iter()
+        .find(|e| e.tag == "c2")
+        .unwrap();
+    let json = serde_json::to_value(ep).unwrap();
+    assert_eq!(
+        json.get("on_demand"),
+        Some(&serde_json::Value::Bool(true)),
+        "raw 里手写的 on_demand 被吃掉了"
+    );
+
+    // 两者同时存在 ⇒ 类型化字段赢，且 JSON 里**只能有一个** on_demand（flatten 重键会出两次）。
+    let raw_conflict = serde_json::json!({
+        "type": "openconnect", "server": "v.example.com", "on_demand": true
+    });
+    let mut node = custom_node("c3", raw_conflict, true);
+    node.on_demand = Some(false);
+    let (result, _) = build_with_custom(node);
+    let ep = result
+        .pending_endpoints
+        .iter()
+        .find(|e| e.tag == "c3")
+        .unwrap();
+    let text = serde_json::to_string(ep).unwrap();
+    assert_eq!(
+        text.matches("\"on_demand\"").count(),
+        1,
+        "on_demand 在 JSON 里出现了不止一次（flatten 重键）：{text}"
+    );
+    assert_eq!(
+        serde_json::to_value(ep).unwrap().get("on_demand"),
+        Some(&serde_json::Value::Bool(false)),
+        "ServerConfig.onDemand 应当压过 raw 里的同名键"
+    );
+}

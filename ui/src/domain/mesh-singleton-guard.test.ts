@@ -118,11 +118,16 @@ describe('blockedByMeshSingleton —— 拦截即报，放行不报', () => {
     expect(errors).toHaveLength(1);
   });
 
-  it('Tailscale 槽被占：返回 true 且弹一次错（与 WARP 文案不同，两个槽的自救动作不一样）', () => {
+  it('已有 Tailscale：**不拦、不弹错**（A-1b：判据换成网段相交，创建期判不了 ⇒ 放行）', () => {
     const ts = (id: string) => srv({ id, protocol: 'tailscale' });
-    expect(blockedByMeshSingleton(ts('new'), [ts('t1')], t)).toBe(true);
+    expect(blockedByMeshSingleton(ts('new'), [ts('t1')], t)).toBe(false);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('TS 放行不牵连 WARP：已有 TS + 已有 WARP，候选 WARP 仍被拦且弹一次错', () => {
+    const ts = (id: string) => srv({ id, protocol: 'tailscale' });
+    expect(blockedByMeshSingleton(warpTagged('new'), [ts('t1'), warpTagged('w1')], t)).toBe(true);
     expect(errors).toHaveLength(1);
-    expect(errors[0]).not.toContain('WARP');
   });
 
   it('editingId 放行自身：编辑现有 WARP 不报错、不拦', () => {

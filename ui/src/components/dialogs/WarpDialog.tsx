@@ -35,6 +35,7 @@ import { applyDetour, endpointDetourOptions, DETOUR_NONE } from './detour-option
 // 表单 → WireGuardSettings 的整段接线共用 `wg-logic.ts`；WARP 内部的路由/接入模式也在提交边界收口，
 // 不能只靠「界面没展示」来假定旧配置里不存在。
 import { buildWarpSettings } from './wg-logic';
+import { applyOnDemand, onDemandDraftValue, ON_DEMAND_FIELD } from './on-demand-field';
 import { useDialogStore } from './dialog-store';
 import { InfoIcon } from '@/components/InfoIcon';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -89,6 +90,7 @@ function advSpec(
     // UDP 转发就静默不通且不回落直连（实测见 `singbox/endpoint.rs`）。
     { t: 'select', k: 'detour', label: 'warp.detour', options: detourOpts, hint: 'warp.detourHint' },
     { t: 'select', k: 'bindInterface', label: 'node.bindInterface', options: interfaceOpts, hint: 'node.bindInterfaceHint' },
+    ON_DEMAND_FIELD,
   ];
 }
 
@@ -130,6 +132,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
           keepalive: initWs?.persistentKeepalive,
           detour: editNode.detour || DETOUR_NONE,
           bindInterface: editNode.bindInterface ?? '',
+          onDemand: onDemandDraftValue(editNode),
         }
       : {
           endpoint: '',
@@ -137,6 +140,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
           keepalive: undefined,
           detour: DETOUR_NONE,
           bindInterface: '',
+          onDemand: false,
         },
   );
   const interfaceOpts: SelectOption[] = buildNetworkInterfaceChoices(
@@ -211,6 +215,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       wireguardSettings: settings,
     };
     applyDetour(server, currentDetour);
+    applyOnDemand(server, draft.onDemand);
     const bindInterface = String(draft.bindInterface ?? '').trim();
     if (bindInterface) server.bindInterface = bindInterface;
     await api.server.add(server);

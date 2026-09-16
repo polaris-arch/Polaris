@@ -14,7 +14,7 @@ fn valid_config() -> Value {
         "logLevel": "info",
         "mixedPort": 7890,
         "controlPort": 9090,
-        "tunConfig": {"mtu": 1350, "stack": "auto", "autoRoute": true, "strictRoute": true}
+        "tunConfig": {"mtu": 1350, "autoRoute": true, "strictRoute": true}
     })
 }
 

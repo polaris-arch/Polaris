@@ -272,7 +272,7 @@ export function showsUnixPersistenceTip(platform: ShellPlatform | undefined): bo
 
 /**
  * 硬件加速行是否渲染。**mac 一律不渲染**：macOS(WKWebView) 没有受支持的关 GPU 途径
- * （Linux 有 `WEBKIT_DISABLE_DMABUF_RENDERER`、Windows 有 `WEBVIEW2_…--disable-gpu`，mac 无等价物，
+ * （Linux 有 `WEBKIT_DISABLE_DMABUF_RENDERER`、Windows 经 WebView2 API 下发 `--disable-gpu`，mac 无等价物，
  * 见 contracts/types.ts:404-411）→ 在 mac 是 no-op 死开关，用户 2026-07-22 要求去掉、不留。
  * Win/Linux 保留（那两平台真能关掉 GPU，是有用的白屏/花屏排障逃生门）。
  *

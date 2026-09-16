@@ -535,6 +535,9 @@ fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
         command::common::ROUTE_ADD => Request::RouteAdd(parse_route_params(&mut next_line)),
         command::common::ROUTE_DEL => Request::RouteDel(parse_route_params(&mut next_line)),
         command::win::UNINSTALL => Request::Uninstall,
+        // D4：flush-dns 无参数行。**解码侧漏了这一格，分派侧的新分支就永远够不着** ——
+        // parse_request 返 None 时 serve 循环直接回 ERR unknown，压根不进 `WinHelper::handle`。
+        command::mac::FLUSH_DNS => Request::FlushDns,
         command::win::IFACE_METRIC => {
             let iface = next_line().to_owned();
             let metric: u16 = next_line().parse().ok()?;

@@ -52,7 +52,7 @@ describe('统一接入表单的信息架构', () => {
       'allowedIPs', 'reverseMesh', 'allowInternet', 'alwaysRouteSubnets',
     ]);
     expect(WG_FORM_GROUP_KEYS.advanced).toEqual([
-      'persistentKeepalive', 'mtu', 'reserved', 'detour', 'bindInterface',
+      'persistentKeepalive', 'mtu', 'reserved', 'detour', 'bindInterface', 'onDemand',
     ]);
   });
 
@@ -65,7 +65,7 @@ describe('统一接入表单的信息架构', () => {
       ],
       advanced: [
         'detour', 'controlUrl', 'advertiseTags', 'ephemeral', 'listenPort', 'relayServerPort',
-        'sshServer', 'resolveByName', 'acceptDefaultResolvers', 'bindInterface',
+        'sshServer', 'resolveByName', 'acceptDefaultResolvers', 'bindInterface', 'onDemand',
       ],
     });
   });

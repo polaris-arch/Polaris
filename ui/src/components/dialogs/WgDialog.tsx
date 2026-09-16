@@ -40,6 +40,7 @@ import { blockedByMeshSingleton } from '@/domain/mesh-singleton-guard';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { editRoute } from '@/lib/staged-config';
+import { ON_DEMAND_FIELD } from './on-demand-field';
 import { useDialogStore } from './dialog-store';
 import { groupWgFields } from './mesh-form-layout';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -106,6 +107,7 @@ export function wgSpec(
     // 不写这句，这个控件就是个陷阱。
     { t: 'select', k: 'detour', label: 'wg.detour', options: detourOpts, hint: 'wg.detourHint' },
     { t: 'select', k: 'bindInterface', label: 'node.bindInterface', options: interfaceOpts, hint: 'node.bindInterfaceHint' },
+    ON_DEMAND_FIELD,
   ];
 }
 

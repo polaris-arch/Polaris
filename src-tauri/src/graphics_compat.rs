@@ -3,7 +3,8 @@
 //! 背景：白屏的 D 类向量（GPU 进程反复崩溃、合成层不出帧）用户无自救手段。`crates/store` 有
 //! `hardwareAcceleration` / `windowEffects` 两个 schema 字段（`store.rs:199-200` 默认值、`sanitize.rs:74-75`
 //! sanitize-not-throw、`config-engine/src/builder/orchestration.rs:124-125` 已排除出重启 norm）。
-//! 本模块消费 `hardwareAcceleration`（GPU 环境变量）与 `windowEffects`（窗口特效门控），两个判定均为纯函数。
+//! 本模块消费 `hardwareAcceleration`（Linux GPU 环境变量 / Windows WebView2 启动参数）与 `windowEffects`
+//! （窗口特效门控），两个判定均为纯函数。
 //!
 //! **正向语义**（迁自 上游 `b180163` 的修正，别迁成反向开关）：字段默认 **true**（开），消费一律
 //! `!= Some(false)`。即「默认开 = 行为逐字节不变」，用户手动关才自救。反向的 `disableX` + 默认 false
@@ -15,10 +16,14 @@
 //! ## Tauri 下的正确形态（与 Electron 的差异）
 //!
 //! - **`hardwareAcceleration`**：Tauri **没有** `app.disableHardwareAcceleration()` 等价 API。webview 的
-//!   GPU 开关由各平台 runtime 的**环境变量**控制，且必须在 webview 创建**之前**设好：
-//!   - Linux（WebKitGTK）：`WEBKIT_DISABLE_DMABUF_RENDERER=1`（主修复：NVIDIA 白屏）
-//!     + `WEBKIT_DISABLE_COMPOSITING_MODE=1`（兜底：resize 崩溃）
-//!   - Windows（WebView2）：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--disable-gpu`
+//!   GPU 开关按平台走不同通道，且都必须在 webview 创建**之前**定下：
+//!   - Linux（WebKitGTK）：**环境变量** `WEBKIT_DISABLE_DMABUF_RENDERER=1`（主修复：NVIDIA 白屏）
+//!     + `WEBKIT_DISABLE_COMPOSITING_MODE=1`（兜底：resize 崩溃），见 [`apply_hardware_acceleration_escape`]。
+//!   - Windows（WebView2）：**WebView2 API** 下发 `--disable-gpu`（建窗时 `additional_browser_args`），
+//!     见 [`webview_additional_browser_args`]。**不用** `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 环境变量：
+//!     宿主以管理员身份运行（High IL）时 WebView2 忽略全部 `WEBVIEW2_*` 环境变量，只认经 API 指定的参数
+//!     （微软 WebView2 security 文档「For an elevated host app」；207 实测提权下环境变量不生效，
+//!     vault `polaris/fixes/polaris-webview2-gpu-escape-hatch-elevated-2026-09-14.md`）。
 //!   - macOS（WKWebView）：**无受支持的开关** → 该项在 mac 上是 no-op（如实登记，不谎称生效）。
 //!
 //!   注：上游 因「Electron 在 Linux 无条件禁 HW accel」把该开关在 Linux 整卡隐藏（死开关）。**Polaris 不适用
@@ -46,6 +51,7 @@
 //!   （`window-vibrancy::clear_vibrancy` 只能撤特效，救不了 transparent 那一半）。UI 文案已如实告知需重启。
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// 从 config.json 原文本判定「是否该禁用硬件加速」。
 ///
@@ -92,10 +98,108 @@ pub fn read_config_raw(config_dir: &Path) -> Option<String> {
     std::fs::read_to_string(config_dir.join("config.json")).ok()
 }
 
-/// 应用硬件加速逃生门：设平台环境变量。**必须在首个 webview 创建之前调用**（各平台 runtime 在创建
-/// webview 时才读这些变量）。
+// ── Windows：经 WebView2 API 下发的启动参数 ─────────────────────────────────────────────────
+//
+// wry 在 `additional_browser_args` 为 `Some` 时**整体替换**它自己拼的默认串，不是追加
+// （`wry-0.55.1/src/webview2/mod.rs:294` `pl_attrs.additional_browser_args.unwrap_or_else(|| { 默认串 })`；
+// `wry-0.55.1/src/lib.rs:1706-1709` 注释要求调用方自己补回默认参数）。所以关硬件加速时传的串 =
+// **Polaris 实际建窗属性下 wry 会拼出的默认串** + ` --disable-gpu`。逐项推导：
+//
+// 1. `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`：无条件项
+//    （`wry-0.55.1/src/webview2/mod.rs:297`）。丢了它 = 静默打开 mini menu 与 SmartScreen。
+// 2. `--autoplay-policy=no-user-gesture-required`：`attributes.autoplay` 为 true 时追加（`mod.rs:300-302`）。
+//    Polaris 恒为 true：wry 默认 `autoplay: true`（`wry-0.55.1/src/lib.rs:843`）；tauri-runtime-wry 从
+//    `WebViewBuilder::new_with_web_context` 起建（`tauri-runtime-wry-2.11.4/src/lib.rs:4816`，该构造器
+//    `..Default::default()`，`wry-0.55.1/src/lib.rs:882-886`），且 tauri / tauri-runtime-wry / tauri-utils
+//    三个 crate 的 `src/` 里 `autoplay` 零命中 —— 没有任何一层会把它关掉。207 普通权限实测默认命令行
+//    里确有该项（正向对照）。
+// 3. `--proxy-server=...`：**不含**。只在 `attributes.proxy_config` 为 `Some` 时追加（`mod.rs:304-321`），
+//    而它只由 tauri 的 `proxy_url` 喂入（`tauri-runtime-wry-2.11.4/src/lib.rs:5047-5051`），默认 `None`
+//    （`tauri-runtime-2.11.3/src/webview.rs:525`）；`tauri.conf.json` 未声明 `proxyUrl`，四个建窗点也都不调
+//    `.proxy_url(`（`tests/window_build_sites.rs` 守着：谁加了代理，这里的固定串就会把它吞掉）。
+//
+// 本串随依赖版本漂移的门：[`WEBVIEW2_DEFAULT_ARGS_REVIEWED_AGAINST`]。
+
+/// 关硬件加速时经 WebView2 API 下发的完整启动参数（推导见上方注释块）。
+const WEBVIEW2_ARGS_HARDWARE_ACCELERATION_OFF: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+     --autoplay-policy=no-user-gesture-required \
+     --disable-gpu";
+
+/// 上面那串默认参数是对着**哪几个依赖版本**逐项复核过的。`graphics_compat/tests` 从 `Cargo.lock` 读实际版本
+/// 比对，任一不等即红。
 ///
-/// 不覆盖用户已显式设置的同名变量（用户手动设的优先级更高，且覆盖会打断排障者的临时实验）。
+/// 🔴 **改这里的版本号之前，先做这件事**：重读新版 `wry/src/webview2/mod.rs` 的 `create_environment`
+/// （`additional_browser_args` 为 `None` 时拼默认串的那段），以及 tauri-runtime-wry 建 `WebViewBuilder`
+/// 时有没有新调 `with_autoplay` / 新喂 `proxy_config`；逐项核对 [`WEBVIEW2_ARGS_HARDWARE_ACCELERATION_OFF`]
+/// 与上方推导注释，**有差异先改串和测试里的逐项清单**，再改版本号。只改版本号就放行 = 关硬件加速的用户
+/// 静默丢掉 `msSmartScreenProtection` 之类的设置，任何单测都不会红。
+///
+/// 为什么钉两个：默认串由 wry 拼（项 1/2/3 的文本与条件），但「autoplay 恒开 / 无代理」这两个条件
+/// 由 tauri-runtime-wry 怎么建 builder 决定 —— 推导依赖两者。
+// 2026-09-14 首次复核：wry 0.55.1 `src/webview2/mod.rs:294-322`、`src/lib.rs:843,882-886`；
+// tauri-runtime-wry 2.11.4 `src/lib.rs:4816,5047-5057`（autoplay 零命中）。
+#[cfg(test)]
+pub(crate) const WEBVIEW2_DEFAULT_ARGS_REVIEWED_AGAINST: [(&str, &str); 2] =
+    [("wry", "0.55.1"), ("tauri-runtime-wry", "2.11.4")];
+
+/// 纯判定：由「是否禁用硬件加速」给出建窗时应传的 `additional_browser_args`。
+///
+/// - 禁用 → `Some(wry 默认串 + --disable-gpu)`；
+/// - 开启 → `None`：不调 builder 的 `additional_browser_args`，由 wry 自己拼默认串。选 `None` 而不是显式传一份
+///   等值串：① 开启是全体用户的默认路径，`None` 让它与本改动前**逐字节相同**（模块头「默认开 = 行为不变」），
+///   wry 升级改了默认也跟着走，手抄串的漂移风险只落在主动关硬件加速的少数人身上；② 一致性不受影响 ——
+///   同一进程内全部建窗点都读 [`webview_additional_browser_args`] 的同一份定格值，要么全 `None`（都由 wry 按
+///   同样的属性拼出同一个默认串），要么全是同一个 `Some`。
+///
+/// 平台无关：非 Windows 上 tauri 只把值存进 `WebviewAttributes`，唯一的消费点在 `#[cfg(windows)]` 块里
+/// （`tauri-runtime-wry-2.11.4/src/lib.rs:5054-5057`；builder 方法本身不设 cfg，
+/// `tauri-2.11.5/src/webview/webview_window.rs:1015`、`tauri-2.11.5/src/webview/mod.rs:956`，文档标
+/// 「macOS / Linux / Android / iOS: Unsupported」）→ 空操作，调用点无需平台门控。
+pub fn webview2_browser_args_for(disable_hardware_acceleration: bool) -> Option<&'static str> {
+    disable_hardware_acceleration.then_some(WEBVIEW2_ARGS_HARDWARE_ACCELERATION_OFF)
+}
+
+/// 进程内定格的「是否禁用硬件加速」。开关本来就重启生效，一个进程只该有一个值。
+static HARDWARE_ACCELERATION_DISABLED: OnceLock<bool> = OnceLock::new();
+
+/// 在进程早期（`setup` 内、首个 webview 创建之前）按 config.json 原文本定格硬件加速开关，返回**实际生效**的
+/// 「是否禁用」。
+///
+/// 读取口径同 [`should_disable_hardware_acceleration`]（原文本、配置损坏也能工作）。重复调用不改判定：
+/// 恒返回首次定格的值 —— 包括「建窗点抢在本函数之前读过、已按默认开定格」的情形（见
+/// [`webview_additional_browser_args`]），此时调用方拿到的返回值才是真相，别再用自己手里的 raw 另算。
+pub fn freeze_hardware_acceleration(raw: Option<&str>) -> bool {
+    *HARDWARE_ACCELERATION_DISABLED.get_or_init(|| should_disable_hardware_acceleration(raw))
+}
+
+/// **全部建窗点的唯一入口**：本进程每个 webview 建窗时应传的 `additional_browser_args`。
+///
+/// 调用点形态：`if let Some(args) = graphics_compat::webview_additional_browser_args() { builder =
+/// builder.additional_browser_args(args); }`。登记表 `tests/window_build_sites.rs` 断言每个建窗函数都调了它。
+///
+/// **为什么必须每个建窗点都接**：WebView2 要求共用同一 data directory 的 webview 启动参数完全一致，否则
+/// 建环境失败（`tauri-utils-2.9.3/src/config.rs:2225`）。Polaris 的窗全用默认 data directory，漏接一处 =
+/// 关硬件加速后那一个窗建不出来。
+///
+/// 未定格就被调用（建窗早于 [`freeze_hardware_acceleration`]，今天的时序下不会发生）：按默认开定格并记
+/// error —— 宁可这个进程的逃生门失效，也不让先后建的窗拿到两种参数。
+pub fn webview_additional_browser_args() -> Option<&'static str> {
+    let disabled = *HARDWARE_ACCELERATION_DISABLED.get_or_init(|| {
+        log::error!(
+            "图形兼容逃生门：建窗早于硬件加速开关定格（freeze_hardware_acceleration）→ 本进程按硬件加速开启处理"
+        );
+        false
+    });
+    webview2_browser_args_for(disabled)
+}
+
+/// 应用硬件加速逃生门的**进程级**部分并如实记日志。**必须在首个 webview 创建之前调用**。
+///
+/// - Linux：设 WebKitGTK 环境变量（WebKitGTK 在创建 webview 时才读）。不覆盖用户已显式设置的同名变量
+///   （用户手动设的优先级更高，且覆盖会打断排障者的临时实验）。
+/// - Windows：这里**不设任何东西**，`--disable-gpu` 由各建窗点经 [`webview_additional_browser_args`] 下发。
+/// - macOS：no-op，如实登记。
 pub fn apply_hardware_acceleration_escape(disable: bool) {
     if !disable {
         return;
@@ -115,8 +219,9 @@ pub fn apply_hardware_acceleration_escape(disable: bool) {
     }
     #[cfg(target_os = "windows")]
     {
-        set_env_if_absent("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--disable-gpu");
-        log::warn!("图形兼容逃生门：hardwareAcceleration=false → 已设 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--disable-gpu");
+        log::warn!(
+            "图形兼容逃生门：hardwareAcceleration=false → 建窗时经 WebView2 API（additional_browser_args）下发 `{WEBVIEW2_ARGS_HARDWARE_ACCELERATION_OFF}`（不走 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS 环境变量，以管理员身份运行同样生效）"
+        );
     }
     #[cfg(target_os = "macos")]
     {
@@ -126,10 +231,14 @@ pub fn apply_hardware_acceleration_escape(disable: bool) {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn set_env_if_absent(key: &str, value: &str) {
     if std::env::var_os(key).is_none() {
-        // SAFETY: 在 Tauri Builder 启动前的单线程 main 早期调用，无并发读者。
+        // SAFETY: `set_var` 的前提是没有其它线程同时读写环境。调用点在 tauri `.setup()` 闭包里（主线程、
+        // 首个 webview 创建之前），**不是**「Builder 启动前的单线程 main」—— 此刻 tauri 插件已初始化，
+        // 进程未必单线程。本仓在这之前起线程的只有 Windows 专属的 QUIC 清理预热（Linux 上直接返回 false，
+        // `crates/system-integration/src/proxy_ops/windows.rs:36-38`）；第三方（tauri 插件 / GTK）此刻有无
+        // 并发读 env 的线程未穷举核实。
         unsafe { std::env::set_var(key, value) };
     }
 }

@@ -36,9 +36,10 @@ use serde::Serialize;
 
 /// 上游 `CONFIG_GET`：加载完整 UserConfig（剥除 privacyPassword）。
 ///
-/// F1：`bypassLANList` 缺省时在此边界补成生效默认（27 条 `DEFAULT_BYPASS_LAN`），使 UI
-/// 的旁路 / route_exclude 编辑器永远编辑真实清单 —— 否则首个按键会把前端 3 条兜底当用户清单
-/// 持久化，静默丢弃 24 条真实默认。语义镜像 `effective_bypass_lan`，对 builder 透明。
+/// F1：缺省字段在此边界补成**生效值**（`bypassLANList` 的 27 条 `DEFAULT_BYPASS_LAN`、
+/// `tunConfig` 的 `TunModeConfig::default()`、`tunConfig.inboundExcludeCidrs` 的 `[]`），
+/// 使 UI 的各编辑器永远编辑真实清单 —— 否则首个按键会把前端兜底当用户清单持久化。
+/// 语义逐字镜像生成侧生效值，对 builder 透明；机制与守卫见 `user_config::effective_view` 模块头。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -66,14 +67,194 @@ pub fn config_get(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
 /// 都返 conflict，功能整体失效。而 `config_get` 恰好不是原样下发：
 ///
 ///  - `strip_privacy_secrets`：设过隐私密码的机器上，磁盘有 `privacyPasswordHash`、前端没有；
-///  - `ensure_bypass_lan_list`：磁盘缺 `bypassLANList` 时前端拿到的是补齐后的 27 条默认。
+///  - `ensure_effective_config`：磁盘缺 `bypassLANList` / `tunConfig` / `tunConfig.inboundExcludeCidrs`
+///    时，前端拿到的是补齐后的生效值。
 ///
 /// 两条都足以让「hash 磁盘」与「hash 前端那份」系统性分叉。故版本的定义域**只能**是本投影。
+///
+/// **新增注入一律加进 `ensure_effective_config`，不要在这里再并列一行** —— 那份表
+/// （`INJECTED_FIELD_PATHS`）同时是前端 SoT 守卫的取材面，绕过它注入的字段守卫管不到。
 fn apply_frontend_view(cfg: &mut Value) {
     // F29：绝不下发隐私密码（历史残留明文 `privacyPassword` + salted hash `privacyPasswordHash`）。
     strip_privacy_secrets(cfg);
-    // F1：补齐 bypassLANList，防编辑器首个按键坍塌默认。
-    polaris_config_engine::user_config::system_proxy_bypass::ensure_bypass_lan_list(cfg);
+    // 生效值注入：前端因此一条默认都不必（也不许）自己兜底。根因与机制见该模块头注。
+    polaris_config_engine::user_config::effective_view::ensure_effective_config(cfg);
+}
+
+/// 「本平台这份配置下，TUN 实际排除了哪些网段」。
+///
+/// # 为什么是一个 command，而不是在前端算或写几条平台说明
+///
+/// `bypassLANList` 与 `tunConfig.inboundExcludeCidrs` 两张表长得一样、都叫"排除"，
+/// 但**谁在本平台真的进 TUN 是平台相关的**（win32 两张都进、darwin 只进后者、Linux 一张都不进），
+/// 而界面上没有任何提示。2026-09-08 的现场就栽在这上面：macOS 用户按外部建议往
+/// `bypassLANList` 填自建 tailnet 网段，那张表在 mac 上**根本不喂 TUN**，填了等于没填。
+///
+/// 补几条"本平台这张表喂给谁"的文案是**表同步型补丁**：手写映射要与 `build_inbounds` 的
+/// `if` 分支两处维护，漂了不会红。故这里不解释规则、直接给结果 —— 跑真正的 `build_inbounds`，
+/// 把交给内核的那一份读回来（判据由代码持有，没有第二份可漂）。
+///
+/// 平台与本机网段取 `runtime::proxy::platform_contracts` 的**同一对函数**，不另探一次：
+/// darwin 分支要用 `own_lan_cidrs` 做减法，两处各探一次就会出现"预览与实际差几条"。
+///
+/// 只读、无副作用（不落盘、不起核、不碰运行中的配置）。
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri IPC command owns its deserialized payload across the call"
+)]
+#[tauri::command]
+pub fn tun_exclusion_preview(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
+    let cfg = match state.config().load_full() {
+        Ok(c) => c,
+        Err(e) => return ApiResponse::err(format!("{e}")),
+    };
+    let user_config: polaris_config_engine::user_config::UserConfig =
+        match serde_json::from_value(cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                return ApiResponse::err_with_code(
+                    format!("配置解析失败: {e}"),
+                    "TUN_EXCLUSION_PREVIEW_BAD_CONFIG",
+                )
+            }
+        };
+    let preview = polaris_config_engine::builder::tun_exclusion_preview::preview_tun_exclusion(
+        &user_config,
+        crate::runtime::proxy::platform_contracts::platform_tag(),
+        crate::runtime::proxy::platform_contracts::enumerate_own_lan_cidrs(),
+        // A-0b：运行期观测到的 tailnet 地址，取**起核时喂 `GenerateConfigDeps` 的同一份快照**
+        // （`ProxyRuntime::observed_tailnet_snapshot`）。传空会让本预览重新变成"另一份计算" ——
+        // 自建控制面（headscale `prefixes.v4` 可自定义）分到的地址进 `engaged_mesh` 后会把
+        // 与之相交的用户声明段整条剔除，预览看不见观测面就会**多显示**那些其实没生效的段，
+        // 而那正是本命令要终结的那类谎（见 `tun_exclusion_preview` 模块头注）。
+        state.proxy().observed_tailnet_snapshot(),
+    );
+    match serde_json::to_value(&preview) {
+        Ok(v) => ApiResponse::ok(v),
+        Err(e) => ApiResponse::err(format!("预览序列化失败: {e}")),
+    }
+}
+
+/// 系统 DNS 接管**挤掉了谁**（只读报告）。
+///
+/// # 为什么需要一条专门的报告
+///
+/// macOS 的接管是把**所有**网络服务的 DNS 改成受控 IP。于是另一个 VPN 装的解析器
+/// （Tailscale 的 `100.100.100.100`、公司 VPN 的内网解析器…）被整个挤掉 —— 用户侧表现是
+/// 「tailnet IP 通、域名不通」，而应用内此前**没有任何提示**，日志也要用户会翻才看得到。
+///
+/// 2026-09-08 的现场就是这个形态，且那台设备不在报障人手里（只有录屏）——
+/// 应用内能看见的一句话，是这类远程报障唯一可读的观测面。
+///
+/// 观测取接管**发生时**的 `scutil --dns` 快照（`networksetup -getdnsservers` 看不见
+/// NetworkExtension 装的解析器，用它判会恒空，判据见 `SystemDnsController::set_dns`）。
+/// 未接管 / 已还原 / 不接管的平台 ⇒ 空数组。
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri IPC command owns its deserialized payload across the call"
+)]
+#[tauri::command]
+pub fn dns_takeover_report(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
+    ApiResponse::ok(json!({
+        "displacedResolvers": state.proxy().displaced_dns_resolvers(),
+    }))
+}
+
+/// 本机**其它**隧道（Tailscale / 公司 VPN / ZeroTier …）与 Polaris 争不争同一网段（只读报告）。
+///
+/// # 为什么需要它
+///
+/// 2026-09-08 的现场：用户跑着自建 Tailscale 控制面（tailnet 前缀 `32.0.0.0/24`），
+/// 与 Polaris 的 TUN 冲突 —— 而应用内**没有任何观测面**能看见"本机还有别的隧道"这件事。
+/// 探测与判定两个模块当时都写完了，只是生产里一个调用点都没有，对用户而言等于不存在。
+///
+/// # 返回的是 `status` 分支，不是一个冲突数组
+///
+/// 「没探成」与「没冲突」必须分得开：本平台无探测实现（macOS/Windows）、探测命令失败、
+/// 本次不是 TUN 模式 / 核没起过，三种情形各有独立 `status` 且**不带 `conflicts` 键**。
+/// 带一个空数组的话，渲染端最自然的 `conflicts.length === 0` 会把它读成一句自信的
+/// 「无冲突」—— 而报障那台恰恰是 macOS，即无探测实现那一支。
+///
+/// 判据面刻意窄（只认 FakeIP / 组网段 / TUN 地址三类相交，「未被排除」不算冲突）：
+/// 理由见 `builder::tunnel_conflict` 模块头注 —— 逢隧道必报的告警会被无视或删掉。
+///
+/// 只读、无副作用（不落盘、不起核、不碰运行中的配置；探测本身是起核后的后台腿，本命令只取快照）。
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri IPC command owns its deserialized payload across the call"
+)]
+#[tauri::command]
+pub fn tunnel_conflict_report(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
+    ApiResponse::ok(state.proxy().tunnel_conflict_report())
+}
+
+/// Polaris **自己的**两个 endpoint 节点争不争同一网段（只读报告）。
+///
+/// 与 [`tunnel_conflict_report`] 成对、射程不重叠：那条问的是「本机**别的**隧道与我撞不撞」，
+/// 本条问的是「我自己配的这几个组网节点之间撞不撞」。两件事的成因、自救动作都不一样。
+///
+/// # 为什么需要它
+///
+/// 此前「至多一个 Tailscale 节点」是前端的一道**创建期硬闸**，理由写着「所有 tailnet 共用
+/// 100.64.0.0/10」。那个前提已被真控制面实测推翻（自建 headscale 实测把地址发成 `32.0.0.28`，
+/// 与官方段不相交）⇒ 闸撤掉。但撤闸不等于冲突不存在：同一个 tailnet 的两个账号仍然真的撞车。
+///
+/// 而**创建时判不了相交** —— 新建节点还没连上控制面，它的 tailnet 前缀不可知。
+/// 判据因此搬到有真值的这一端：运行期观测地址（`ProxyRuntime::observed_tailnet_snapshot`）
+/// 一路喂进 `builder::endpoint_routes::endpoint_force_route_report`，按**块 0c 的同一套腿选择 +
+/// 同一次结算**算出「谁和谁撞了、撞在哪一段、谁输了、谁因此零覆盖」。
+///
+/// 生成侧此前只有一个计数 + 一条 warn：它说得出「有 N 段被重复声明」，说不出「哪个节点因此
+/// 一条流量都收不到」。而后者才是用户能看见的那个故障 —— 节点活着、engaged、用户以为它在工作。
+///
+/// # 每条结论都带它的**证据强度**
+///
+/// 逐节点的 `hasObservation` 位必须消费：Tailscale 的段集恒含两条硬编码默认常量，**没有观测时
+/// 两个节点的段必然完全重合**。那不是「账号撞车」的证据，只是两份一样的猜测。把它读成撞车，
+/// 就是拿想象中的值当判据 —— 正是本轮要终结的那类错误。
+///
+/// 只读、无副作用（不落盘、不起核、不碰运行中的配置）。核没起过 ⇒ 观测面为空，报告照常给出，
+/// 只是每条 `hasObservation` 都是 `false`。
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri IPC command owns its deserialized payload across the call"
+)]
+#[tauri::command]
+pub fn endpoint_force_route_report(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
+    let cfg = match state.config().load_full() {
+        Ok(c) => c,
+        Err(e) => return ApiResponse::err(format!("{e}")),
+    };
+    let user_config: polaris_config_engine::user_config::UserConfig =
+        match serde_json::from_value(cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                return ApiResponse::err_with_code(
+                    format!("配置解析失败: {e}"),
+                    "ENDPOINT_FORCE_ROUTE_REPORT_BAD_CONFIG",
+                )
+            }
+        };
+    // tailnet rule-set 目录：走 config-engine 的目录名常量，**不在此另写一个字面量** ——
+    // 传错目录不会报错，只会让每个 TS 节点都被读成 inline 腿，而内核吃的是 rule-set 腿，
+    // 报告从此系统性说反。落盘侧（`ProxyRuntime::tailnet_rules_dir`）今天仍各拼一次同名字面量，
+    // 已登记为待收口项（那个方法是 `pub(super)`，收口要动 runtime 层）。
+    let tailnet_rules_dir = state
+        .config()
+        .dir()
+        .join(polaris_config_engine::builder::endpoint_routes::TAILNET_RULES_DIR_NAME);
+    let report = polaris_config_engine::builder::endpoint_routes::endpoint_force_route_report(
+        &user_config,
+        // A-0b：与起核时喂 `GenerateConfigDeps` 的**同一份快照**（同 `tun_exclusion_preview`
+        // 那条腿的理由）。传空就等于报告又变回了另一份计算：自建控制面的真实前缀看不见，
+        // 两个节点会被一律读成「段完全重合」。
+        &state.proxy().observed_tailnet_snapshot(),
+        &tailnet_rules_dir.to_string_lossy(),
+    );
+    match serde_json::to_value(&report) {
+        Ok(v) => ApiResponse::ok(v),
+        Err(e) => ApiResponse::err(format!("报告序列化失败: {e}")),
+    }
 }
 
 /// 配置的**内容版本**（spec §2.3.3）：渲染端投影经 `stable_stringify` 后取 FNV-1a 32 位短 hash。

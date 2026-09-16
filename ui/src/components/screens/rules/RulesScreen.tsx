@@ -25,19 +25,18 @@ import {
 } from '@/store/app-store';
 import { api } from '@/ipc';
 import type { Rule, RegionRoutingConfig } from '@/contracts/types';
+import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
 import { effectiveRegionRouting } from '@/domain/region-routing';
 import {
   availableResourceTagSet,
   missingResourceRuleIds,
 } from '@/domain/rule-resource-refs';
-import { meshOverlapRuleIds } from '@/domain/mesh-rule-overlap';
+import {
+  forceRoutedCidrsFromReport,
+  meshOverlapRuleIds,
+} from '@/domain/mesh-rule-overlap';
 import { duplicateRulePayload } from '@/domain/rule-duplicate';
 import { ruleDnsEffect, ruleRouteEffect } from '@/domain/rules';
-import {
-  collectRuleTargetedServerIds,
-  meshForceRoutedServers,
-  meshForcedRouteCidrs,
-} from '@/domain/endpoint-routes';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { editRoute, stagedOnlyIds } from '@/lib/staged-config';
@@ -175,19 +174,46 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
     return missingResourceRuleIds(planeRules, availableResTags);
   }, [planeRules, availableResTags]);
 
-  // 组网 force-route 段：口径必须与**发射端**一致（`meshForceRoutedServers` 只留本轮真会发射
-  // force-route 的节点：ON / 选中 / 被规则指向），否则会对「仅出网、未 engaged」的节点虚报覆盖。
+  // 组网 force-route 段：真值源是后端**本次结算**（`endpoint_force_route_report`），渲染端不再
+  // 自己算一份。重算那份对 Tailscale 恒发两条硬编码 tailnet 常量，看不见自建控制面的真实前缀
+  // （实测 `32.0.0.0/24`），也看不见走外化 rule-set 腿的段 —— 而那正是自建 tailnet 唯一的腿。
+  // 完整理由见 `domain/mesh-rule-overlap.forceRoutedCidrsFromReport` 的头注。
+  //
+  // 拉取时机比节点屏那份**多一条规则面**：后端的 engaged 判定（`should_force_route_subnets`）
+  // 把「被规则显式指向的节点」也算 engaged，故规则改了段集就可能变。依赖数组沿用改动前那一份
+  // 的取材面（trafficRules / policyRules / customRules / appRules），不因换了真值源就悄悄收窄。
+  // 拉不到一律留在 `null` ⇒ 空段集 ⇒ **一个角标都不标**，与 `missingResIds` 那段同一条纪律：
+  // 宁可漏标，不可假警报。
+  const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
+  const [forceRouteReport, setForceRouteReport] =
+    useState<EndpointForceRouteReport | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api.config
+      .endpointForceRouteReport()
+      .then((next) => {
+        if (!cancelled) setForceRouteReport(next);
+      })
+      .catch(() => {
+        if (!cancelled) setForceRouteReport(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    config?.servers,
+    config?.selectedServerId,
+    config?.trafficRules,
+    config?.policyRules,
+    config?.customRules,
+    config?.appRules,
+    proxyRunning,
+  ]);
+
   const meshOverlapIds = useMemo(() => {
     if (plane !== 'route' || !isSmartMode) return new Set<string>();
-    const cidrs = meshForcedRouteCidrs(
-      meshForceRoutedServers(
-        config?.servers,
-        config?.selectedServerId,
-        collectRuleTargetedServerIds([...(config?.trafficRules ?? config?.policyRules ?? config?.customRules ?? []), ...(config?.appRules ?? [])]),
-      ),
-    );
-    return meshOverlapRuleIds(rules, cidrs);
-  }, [plane, isSmartMode, rules, config?.servers, config?.selectedServerId, config?.trafficRules, config?.policyRules, config?.customRules, config?.appRules]);
+    return meshOverlapRuleIds(rules, forceRoutedCidrsFromReport(forceRouteReport));
+  }, [plane, isSmartMode, rules, forceRouteReport]);
 
   // 拖拽重排（原型 L5161 getAfter 算法）：落到 target 前插入。
   const [dragId, setDragId] = useState<string | null>(null);

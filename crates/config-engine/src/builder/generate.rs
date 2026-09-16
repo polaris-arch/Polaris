@@ -191,11 +191,23 @@ pub struct GenerateConfigDeps {
     pub runtime_rules_dir: String,
     pub rule_resources_path: String,
     pub custom_rules_dir: String,
+    /// tailnet rule-set 文件目录（`builder::route` 块 0c 的 `tailnet-<serverId>.json` 前缀）。
+    ///
+    /// **必须是独立目录，不得复用 [`custom_rules_dir`](Self::custom_rules_dir)**：后者有孤儿
+    /// 对账清扫（`custom_rule_files::is_custom_rule_orphan_file` + 起核前 unlink 腿），凡不在
+    /// 本轮期望集里的文件都删；tailnet 文件不在那个期望集里，放进去每次起核先被删一遍。
+    pub tailnet_rules_dir: String,
     pub tailscale_state_dir_prefix: String,
     /// FS 存在性 + SRS 魔数检查（dns/route geo rule_set fail-closed）。对拍 fixture 注入固定 true/false。
     pub is_valid_srs_fn: fn(&str) -> bool,
     /// 本机所有非回环接口 CIDR（buildInbounds own_lan_cidrs）。Polaris getOwnLanCidrs。
     pub own_lan_cidrs: Vec<String>,
+    /// 运行期观测到的 tailnet 地址（serverId → 裸地址）。
+    /// 见 [`crate::builder::endpoint_routes::ObservedTailnetAddresses`]。
+    ///
+    /// 空 map = 本轮无观测 ⇒ 产出与观测面存在之前逐字节相同。**所有构造点都要显式给出这个空值**
+    /// （字段无默认值，编译器会逼每个构造点表态），不许靠"省略即旧行为"。
+    pub observed_tailnet_addresses: crate::builder::endpoint_routes::ObservedTailnetAddresses,
     /// 日志回调（子 builder log）。Polaris (level, message) => this.logToManager —— 此处降级为单参 message。
     pub log: fn(LogLevel, &str),
     /// customRuleFiles 降级回调（route onDegraded）。Polaris () => this.customRuleFilesDegraded = true。
@@ -413,6 +425,7 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         platform: deps.platform.clone(),
         own_lan_cidrs: deps.own_lan_cidrs.clone(),
         log: deps.log,
+        observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
     };
     let inbounds = build_inbounds(config, Some(resolved_ips), &inbounds_deps);
 
@@ -445,6 +458,8 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         arch: deps.arch.clone(),
         platform: deps.platform.clone(),
         is_valid_srs_fn: deps.is_valid_srs_fn,
+        tailnet_rules_dir: deps.tailnet_rules_dir.clone(),
+        observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
     };
     let route_outcome = build_route_config_with_report(config, &id_to_tag_map, &route_deps);
     let mut route = route_outcome.route;

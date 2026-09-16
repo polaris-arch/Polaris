@@ -6,7 +6,7 @@ export type WgFormGroup = 'basic' | 'routing' | 'advanced';
 export const WG_FORM_GROUP_KEYS: Record<WgFormGroup, readonly string[]> = {
   basic: ['address', 'port', 'privateKey', 'localAddress', 'peerPublicKey', 'preSharedKey'],
   routing: ['allowedIPs', 'reverseMesh', 'allowInternet', 'alwaysRouteSubnets'],
-  advanced: ['persistentKeepalive', 'mtu', 'reserved', 'detour', 'bindInterface'],
+  advanced: ['persistentKeepalive', 'mtu', 'reserved', 'detour', 'bindInterface', 'onDemand'],
 };
 
 /** WireGuard 字段按用户任务分组；字段定义本身仍只有调用方的一份。 */
@@ -42,6 +42,7 @@ export const TS_FORM_GROUP_KEYS: Record<TsFormGroup, readonly string[]> = {
     'resolveByName',
     'acceptDefaultResolvers',
     'bindInterface',
+    'onDemand',
   ],
 };
 

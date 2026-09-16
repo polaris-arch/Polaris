@@ -32,6 +32,18 @@ export const IPC_CHANNELS = {
   CONFIG_CLASSIFY_STAGED: 'config_classify_staged',
   CONFIG_SET_STAGED_PENDING: 'config_set_staged_pending',
   CONFIG_SET_VALUE: 'config_set_value',
+  // 本平台该配置下 TUN 实际排除了哪些网段（跑真 builder 读回，只读无副作用）：
+  // bypassLANList 与 inboundExcludeCidrs 谁进 TUN 是平台相关的，界面上无从看出，故直接给结果
+  TUN_EXCLUSION_PREVIEW: 'tun_exclusion_preview',
+  // 系统 DNS 接管挤掉了哪些非公网解析器（另一个 VPN 的 MagicDNS/内网解析器被覆盖 ⇒ 域名不通）
+  DNS_TAKEOVER_REPORT: 'dns_takeover_report',
+  // 本机**外来**隧道（独立 Tailscale 客户端 / 公司 VPN / ZeroTier）与 Polaris 争不争同一网段。
+  // 四态判别联合，**只有 probed 那一支带 conflicts 键** —— 渲染端必须按 status 分支，
+  // 否则「本平台没有探测实现」会被读成一句自信的「无冲突」（见 contracts/tunnel-conflict-report.ts）。
+  TUNNEL_CONFLICT_REPORT: 'tunnel_conflict_report',
+  // Polaris **自己的**组网节点之间 force-route 段互相吸收的结算（谁抢了谁的段、谁因此零覆盖）。
+  // 与上一条成对、射程不重叠：那条是「别人的隧道」，这条是「我自己的节点」。
+  ENDPOINT_FORCE_ROUTE_REPORT: 'endpoint_force_route_report',
   CONFIG_GET_PRIVACY_MODE: 'config_get_privacy_mode',
   CONFIG_SET_PRIVACY_MODE: 'config_set_privacy_mode',
   PRIVACY_SET_PASSWORD: 'privacy_set_password',

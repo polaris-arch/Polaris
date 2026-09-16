@@ -17,7 +17,9 @@
 //! | `message_and_enum_tables_do_not_cross_contaminate` | 否 | **跑** | message 表与 enum 表各走各的，不串味 |
 //! | `vendored_proto_matches_recorded_core_layout` | 否 | **跑** | vendored proto 与实测记录的 beta.7 布局一致 |
 //! | `every_checked_symbol_has_a_recorded_layout` | 否 | **跑** | 进对拍表的符号都留了「核对过真核」的书面证据 |
-//! | `vendored_proto_matches_every_bundled_core` | 是 | 跳过（**静默**） | vendored proto 与**盘上真核**一致 |
+//! | `manifest_key_reader_has_teeth` | 否 | **跑** | 平台枚举的读取器真读得出、且看不懂时真报错（不返回空表） |
+//! | `core_platform_enumeration_comes_from_the_manifest` | 否 | **跑** | 覆盖轴取自 manifest，路径由 key 推导（加平台自动跟上） |
+//! | `vendored_proto_matches_every_bundled_core` | 是 | 跳过（**静默**） | vendored proto 与**盘上真核**一致；孤儿核即红 |
 //!
 //! 只有最后一条依赖真核，而 `ci.yml` 不拉核（只造 `.keep` 占位目录）。故 CI 上它恒跳过 ——
 //! 这不是把门做空：真核那条腿的牙在 `build.rs` 的 release-only 断言上（`package.yml` 构建前四平台
@@ -841,16 +843,150 @@ fn every_checked_symbol_has_a_recorded_layout() {
     }
 }
 
+/// **平台枚举的真值源**：随包核有哪几个平台，只由 `src-tauri/core-manifest.json` 的
+/// `coreArchiveSha256` 键集合决定；平台在仓内的路径由 key 推导，不是第二份名单。
+/// 不需要真核，故 CI 上也跑。
+///
+/// 这条守的是本批要治的那件事：加平台时只改 manifest，覆盖轴自动跟上。反过来，若有人把枚举
+/// 改回字面名单，下面那几条「加了平台路径也对」的断言仍会绿 —— 真正拦住回退的是
+/// `core_locator.rs` 那侧的集合相等断言与本文件的孤儿核断言，两者都以 manifest 为准。
+#[test]
+fn core_platform_enumeration_comes_from_the_manifest() {
+    let platforms = proto_wire_check::core_platforms();
+    assert!(
+        !platforms.is_empty(),
+        "manifest 的平台枚举是空的 —— 空枚举会让逐平台门退化成「没有平台要查」的恒绿摆设"
+    );
+    for key in &platforms {
+        assert!(
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "平台 key `{key}` 不是能直接进路径的朴素 token —— 读取器八成把别的东西当成键了"
+        );
+    }
+
+    // 路径形态是一条规则。今天在册的三种写法：
+    assert_eq!(
+        proto_wire_check::core_relative_path("linux"),
+        "resources/linux/sing-box"
+    );
+    assert_eq!(
+        proto_wire_check::core_relative_path("mac-arm64"),
+        "resources/mac-arm64/sing-box"
+    );
+    assert_eq!(
+        proto_wire_check::core_relative_path("win"),
+        "resources/win/sing-box.exe"
+    );
+    // 明天可能加的平台：规则自动给出正确路径（名单不会）。`.exe` 跟的是 Windows 那一族，
+    // 不是「第四个平台」这种位置性巧合。
+    assert_eq!(
+        proto_wire_check::core_relative_path("linux-arm64"),
+        "resources/linux-arm64/sing-box"
+    );
+    assert_eq!(
+        proto_wire_check::core_relative_path("win-arm64"),
+        "resources/win-arm64/sing-box.exe"
+    );
+}
+
+/// **变异验证（平台枚举读取器有没有牙）**：它读得出真的键，且**看不懂时真的报错** ——
+/// 后半条才是重点。返回空表的读取器会让「按存在即检」的门变成「没核可查 = 绿」，
+/// 那种失效连一行日志都没有。
+#[test]
+fn manifest_key_reader_has_teeth() {
+    use proto_wire_check::object_keys;
+
+    // 正向：本层键按序读出，前后的无关字段不干扰。
+    let src = r#"{ "v": "1.0", "coreArchiveSha256": { "linux": "aa", "win": "bb" }, "z": 1 }"#;
+    assert_eq!(
+        object_keys(src, "coreArchiveSha256").expect("应读得出"),
+        vec!["linux".to_owned(), "win".to_owned()]
+    );
+
+    // 嵌套对象里的键不得漏进来（否则平台枚举会混进 sha 结构里的字段名）。
+    let nested = r#"{"coreArchiveSha256": {"linux": {"sha": "aa"}, "win": "bb"}}"#;
+    assert_eq!(
+        object_keys(nested, "coreArchiveSha256").expect("应读得出"),
+        vec!["linux".to_owned(), "win".to_owned()]
+    );
+
+    // 定位的是**指名的那个字段**，不是「文件里第一个对象」：真 manifest 里紧邻着
+    // `cronetLibrarySha256`，两个字段的键集合本就不同，串了就读成另一批平台。
+    let two = r#"{"coreArchiveSha256": {"linux": "aa", "mac-x64": "bb"},
+                  "cronetLibrarySha256": {"linux": "cc"}}"#;
+    assert_eq!(
+        object_keys(two, "coreArchiveSha256").expect("应读得出"),
+        vec!["linux".to_owned(), "mac-x64".to_owned()]
+    );
+    assert_eq!(
+        object_keys(two, "cronetLibrarySha256").expect("应读得出"),
+        vec!["linux".to_owned()]
+    );
+
+    // 反向对照：以下每一种「看不懂」都必须是 Err，而不是空表。
+    for (bad, why) in [
+        (r#"{"other": {"linux": "aa"}}"#, "字段缺席"),
+        (r#"{"coreArchiveSha256": {}}"#, "空对象"),
+        (r#"{"coreArchiveSha256": []}"#, "值不是对象"),
+        (r#"{"coreArchiveSha256": "linux"}"#, "值是字符串"),
+        (r#"{"coreArchiveSha256" "linux"}"#, "缺冒号"),
+        (r#"{"coreArchiveSha256": {"linux": "aa""#, "对象没闭合"),
+        (r#"{"coreArchiveSha256": {"li\nux": "aa"}}"#, "键里有转义"),
+        (
+            r#"{"coreArchiveSha256": {"linux": "aa", "linux": "bb"}}"#,
+            "键重复",
+        ),
+    ] {
+        assert!(
+            object_keys(bad, "coreArchiveSha256").is_err(),
+            "「{why}」必须报错而不是返回空表：{bad}"
+        );
+    }
+}
+
 /// vendored `.proto` ⇄ **盘上真核**（对拍表里每一个符号）。需要 `node scripts/fetch-core.mjs` 拉过核。
 ///
-/// 无核 → 跳过。🔴 **「跳过」是静默的，别把它读成会自曝**：下面那句 `eprintln!` 归 libtest 捕获，
-/// 只在测试失败时才回放（2026-08-07 实测更正，同 `config-engine/tests/kernel_accepts_outbounds.rs`）。
-/// ⇒ CI ubuntu 腿（不拉核）上这条绿只说明「编得过」，没有比对过任何东西。真核那条腿的牙在 release
-/// 构型下的 `build.rs`，见该文件 `assert_proto_matches_bundled_core` 的文档。
+/// 覆盖轴（有哪几个平台）从 manifest 派生，本文件不存名单。三种缺口分开处置：
+///
+/// - **孤儿核**（盘上有、manifest 不认）⇒ 无条件红。它会被打进包，却不在任何一道逐平台门的
+///   覆盖轴上 —— 这正是「少看一个平台」的另一种形态，且盘上有核就能当场发现，不必等打包腿。
+/// - **缺平台**（manifest 声明、盘上没有）⇒ `POLARIS_REQUIRE_KERNEL_GATE=1` 下红（打包腿一律全拉），
+///   否则报告：开发机 `fetch:core --platform=linux` 只拉一份是常态，在那里硬红只会让人关掉门。
+/// - **一份都没有** ⇒ 跳过。🔴 **「跳过」是静默的，别把它读成会自曝**：下面那句 `eprintln!` 归
+///   libtest 捕获，只在测试失败时才回放（2026-08-07 实测更正）。⇒ CI ubuntu 腿（不拉核）上这条绿
+///   只说明「编得过」，没有比对过任何东西。真核那条腿的牙在 release 构型下的 `build.rs`。
 #[test]
 fn vendored_proto_matches_every_bundled_core() {
-    let cores = proto_wire_check::bundled_cores();
-    if cores.is_empty() {
+    let survey = proto_wire_check::survey_bundled_cores();
+
+    assert!(
+        survey.orphans.is_empty(),
+        "`resources/` 下这些目录里有 sing-box 二进制，但 {} 的 `coreArchiveSha256` 里没有对应平台：{}\n\
+         孤儿核会被 tauri 的 resources 照样打进包，却没有任何一道逐平台门看过它。\n\
+         修复：把该平台补进 manifest（并同步 scripts/fetch-core.mjs 与 config-engine 的 CORE_MATRIX），\
+         或者删掉这份没人认领的核。",
+        proto_wire_check::core_manifest_path().display(),
+        survey.orphans.join(", "),
+    );
+
+    if !survey.missing.is_empty() {
+        assert!(
+            !proto_wire_check::kernel_gate_required(),
+            "POLARIS_REQUIRE_KERNEL_GATE=1 但 manifest 声明的这些平台盘上没有核：{} —— \
+             打包腿的 `node scripts/fetch-core.mjs`（不传 --platform = 全平台）是不是失败了？\
+             （wire 契约门未完整执行）",
+            survey.missing.join(", ")
+        );
+        eprintln!(
+            "⚠ manifest 声明的这些平台盘上没有核，本轮没有对拍：{}",
+            survey.missing.join(", ")
+        );
+    }
+
+    if survey.present.is_empty() {
         eprintln!(
             "[skip] 随包内核不在盘上（resources/*/sing-box），本条跳过。\n\
              \x20      这是 CI 的常态（ci.yml 不拉核，只造 .keep 占位目录），**不代表契约已验证**。\n\
@@ -859,11 +995,21 @@ fn vendored_proto_matches_every_bundled_core() {
         );
         return;
     }
-    for core in &cores {
+
+    let mut checked = 0usize;
+    for (key, core) in &survey.present {
         for (kind, name) in CHECKED_SYMBOLS {
             proto_wire_check::check_core_against_proto(core, PROTO_SRC, *kind, name)
-                .unwrap_or_else(|report| panic!("{report}"));
+                .unwrap_or_else(|report| panic!("{key}: {report}"));
         }
-        eprintln!("[ok] {} 与 vendored proto 一致", core.display());
+        checked += 1;
+        eprintln!("[ok] {key} {} 与 vendored proto 一致", core.display());
     }
+    // 正面断言：盘上每一份声明过的核都真的被对拍了一遍（不是「没报错」）。
+    assert_eq!(
+        checked,
+        survey.present.len(),
+        "盘上有 {} 份随包核，只对拍了 {checked} 份",
+        survey.present.len()
+    );
 }

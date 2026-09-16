@@ -32,7 +32,7 @@ fn load_valid_config_round_trips_through_save() {
         "controlPort": 9091,
         "servers": [{"id":"s1","name":"HK","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw"}],
         "customRules": [{"id":"r1","type":"domain","values":["a.com"],"action":"direct","enabled":true}],
-        "tunConfig": {"mtu":1400,"stack":"gvisor","autoRoute":true,"strictRoute":false}
+        "tunConfig": {"mtu":1400,"autoRoute":true,"strictRoute":false}
     });
     ConfigStore::save(&fs, Path::new(CFG), &cfg, "abcdef012345").unwrap();
     let res = ConfigStore::load(&fs, Path::new(CFG));
@@ -69,7 +69,7 @@ fn load_bad_field_keeps_good_fields_and_preserves_disk() {
             "mixedPort": 7890,
             "servers": "not-an-array",
             "customRules": [{"id":"r1","type":"domain","values":["a.com"],"action":"proxy","enabled":true}],
-            "tunConfig": {"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true}
+            "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
         }"#;
     let fs = MockFs::default().with(Path::new(CFG), original);
     let res = ConfigStore::load(&fs, Path::new(CFG));
@@ -96,7 +96,7 @@ fn load_bad_server_dropped_good_server_kept() {
                 {"id":"","name":"Bad","protocol":"trojan"},
                 {"id":"unknown","name":"U","protocol":"nonexistent","address":"5.6.7.8","port":80}
             ],
-            "tunConfig": {"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true}
+            "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
         }"#;
     let fs = MockFs::default().with(Path::new(CFG), json);
     let res = ConfigStore::load(&fs, Path::new(CFG));
@@ -114,7 +114,7 @@ fn save_rejects_invalid_config() {
         "proxyMode": "invalid-mode",
         "proxyModeType": "tun",
         "logLevel": "info",
-        "tunConfig": {"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true}
+        "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
     });
     let res = ConfigStore::save(&fs, Path::new(CFG), &bad, "abcdef012345");
     assert!(matches!(res, Err(StoreError::Validation(_))));
@@ -156,7 +156,9 @@ fn load_migrates_old_format_and_is_idempotent() {
     assert!(res1.loaded_from_disk);
     assert!(res1.migration_delta.changed, "首次加载有迁移变更");
     // 迁移效果
-    assert_eq!(res1.config["tunStackMigrated"], serde_json::json!(true));
+    // 遗留 `stack` 被删、且不再写 `tunStackMigrated`（TUN stack 已随上游弃用移除）。
+    assert!(res1.config["tunConfig"].get("stack").is_none());
+    assert!(res1.config.get("tunStackMigrated").is_none());
     assert_eq!(
         res1.config["subscriptionProxyPolicy"],
         serde_json::json!("proxy")
@@ -270,7 +272,7 @@ fn load_backs_up_before_rule_migration() {
     // 因 sanitize 会丢弃无 type 的旧规则；备份保原始供回滚）。
     let legacy = r#"{
             "proxyMode":"smart","proxyModeType":"systemProxy","logLevel":"info","mixedPort":7890,
-            "tunConfig":{"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true},
+            "tunConfig":{"mtu":1350,"autoRoute":true,"strictRoute":true},
             "customRules":[{"id":"a","domains":["x.com"],"action":"proxy","enabled":true}]
         }"#;
     let fs = MockFs::default().with(Path::new(CFG), legacy);
@@ -291,7 +293,7 @@ fn load_preserves_legacy_domain_rule_through_migration() {
     // migrate 阶段无旧规则可迁 → rules.len()==0，本测转红。
     let legacy = r#"{
             "proxyMode":"smart","proxyModeType":"systemProxy","logLevel":"info","mixedPort":7890,
-            "tunConfig":{"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true},
+            "tunConfig":{"mtu":1350,"autoRoute":true,"strictRoute":true},
             "customRules":[{"id":"legacy-1","domains":["example.com"],"action":"proxy","enabled":true}]
         }"#;
     let fs = MockFs::default().with(Path::new(CFG), legacy);
@@ -321,7 +323,7 @@ fn load_no_rule_backup_for_modern_rules() {
     // 幂等/无误备：新 shape 规则（含 type）不触发 .pre-rule-migration.bak。
     let modern = r#"{
             "proxyMode":"smart","proxyModeType":"systemProxy","logLevel":"info","mixedPort":7890,
-            "tunConfig":{"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true},
+            "tunConfig":{"mtu":1350,"autoRoute":true,"strictRoute":true},
             "customRules":[{"id":"a","type":"domainSuffix","values":["x.com"],"action":"proxy","enabled":true}]
         }"#;
     let fs = MockFs::default().with(Path::new(CFG), modern);
@@ -335,11 +337,11 @@ fn load_no_rule_backup_for_modern_rules() {
 
 /// 🔴 新装配置**不得**写死 MTU（2026-08-05 起）。
 ///
-/// 此前按平台写 mac 1400 / 其余 1350。那个模型有两处错：① 默认 MTU 真正的自变量是**栈**不是平台
-/// （gvisor 吃得下 65535，system/mixed 在 65535 下塌到 11 Mbps）；② 一旦落盘成具体数，此后默认值
-/// 再怎么改都追不上这台机器——存量 1350/1400 正因此需要 `migrate_tun_mtu` 清一遍。
+/// 此前按平台写 mac 1400 / 其余 1350。一旦落盘成具体数，此后默认值再怎么改都追不上这台机器——
+/// 存量 1350/1400 正因此需要 `migrate_tun_mtu` 清一遍。本轮默认值从「栈 × 平台」改成单一
+/// `DEFAULT_TUN_MTU`，正是这条不变量让存量配置无需再迁移一次。
 ///
-/// 缺席 = 自动，由 config-engine 在生成期按最终栈 × 平台派生。
+/// 缺席 = 自动，由 config-engine 在生成期取 `tun_config::DEFAULT_TUN_MTU`。
 #[test]
 fn default_config_leaves_mtu_absent() {
     let cfg = default_config();
@@ -351,6 +353,16 @@ fn default_config_leaves_mtu_absent() {
     // 新装同时置迁移标记：否则首次启动会对一份本就正确的配置再跑一次迁移（无害但 changed=true，
     // 会白写一次盘 + 白发一次 configChanged）。
     assert_eq!(cfg["tunMtuMigrated"], serde_json::json!(true));
+    // 新装不得再写 TUN stack 相关的任何键（已随上游弃用移除）。
+    assert!(
+        cfg["tunConfig"].get("stack").is_none(),
+        "新装不得写 stack：{}",
+        cfg["tunConfig"]
+    );
+    assert!(
+        cfg.get("tunStackMigrated").is_none(),
+        "新装不得写 tunStackMigrated"
+    );
     assert_eq!(
         cfg["keepTrayMenuWarm"],
         serde_json::json!(true),
@@ -368,4 +380,59 @@ fn backup_corrupt_copies_without_overwriting_original() {
     assert_eq!(fs.snapshot(backup).as_deref(), Some(corrupt));
     // 原文件仍在
     assert_eq!(fs.snapshot(Path::new(CFG)).as_deref(), Some(corrupt));
+}
+
+/// 🔴 端到端：带**非法** `tunConfig.stack` 的旧配置必须正常加载（不走「校验失败 → 备份 + 回落默认」），
+/// 迁移后遗留键消失；save 路径（`canonicalize_for_save` / `save`，备份导入先走它）同样不得拒收。
+///
+/// 回落默认是本类缺陷最伤的形态：用户的节点、规则整份被默认配置顶掉，只因为一个已经没有意义的键。
+/// 对照：同一份配置把 `proxyMode` 改坏 → 必须回落（证明本用例确实走在校验链上，而不是校验被旁路）。
+#[test]
+fn legacy_invalid_tun_stack_loads_and_saves_without_validation_error() {
+    let legacy = r#"{
+            "proxyMode": "smart",
+            "proxyModeType": "tun",
+            "logLevel": "info",
+            "mixedPort": 7890,
+            "servers": [{"id":"s1","name":"HK","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw"}],
+            "tunConfig": {"stack":"bogus","autoRoute":true,"strictRoute":false},
+            "tunStackMigrated": true
+        }"#;
+    let fs = MockFs::default().with(Path::new(CFG), legacy);
+    let res = ConfigStore::load(&fs, Path::new(CFG));
+    assert!(
+        res.error.is_none(),
+        "遗留非法 stack 不得导致加载失败：{:?}",
+        res.error
+    );
+    assert!(res.loaded_from_disk, "不得回落默认配置");
+    assert!(
+        res.migration_delta.changed,
+        "删了遗留键就必须报变更，调用方才会落盘"
+    );
+    assert_eq!(
+        res.config["servers"].as_array().unwrap().len(),
+        1,
+        "用户数据不得丢"
+    );
+    assert_eq!(
+        res.config["tunConfig"]["strictRoute"],
+        serde_json::json!(false)
+    );
+    assert!(res.config["tunConfig"].get("stack").is_none());
+    assert!(res.config.get("tunStackMigrated").is_none());
+
+    // save 路径不跑迁移链：遗留键原样保留，但绝不能因它校验失败。
+    let raw: serde_json::Value = serde_json::from_str(legacy).unwrap();
+    let canonical = ConfigStore::canonicalize_for_save(&raw).expect("save 路径不得拒收遗留 stack");
+    assert_eq!(canonical["tunConfig"]["stack"], serde_json::json!("bogus"));
+    ConfigStore::save(&fs, Path::new(CFG), &raw, "abcdef012345").expect("save 不得拒收遗留 stack");
+
+    // 对照：真正非法的字段仍会让加载回落 —— 证明上面的「不回落」不是因为校验被整体旁路。
+    let broken = legacy.replace(r#""proxyMode": "smart""#, r#""proxyMode": "nope""#);
+    assert_ne!(broken, legacy, "对照输入没改到");
+    let fs2 = MockFs::default().with(Path::new(CFG), &broken);
+    let res2 = ConfigStore::load(&fs2, Path::new(CFG));
+    assert!(!res2.loaded_from_disk, "非法 proxyMode 必须回落默认");
+    assert!(matches!(res2.error, Some(StoreError::Validation(_))));
 }

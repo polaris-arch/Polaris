@@ -192,12 +192,8 @@ export interface NetworkInterfaceInfo {
   isUp: boolean;
   addresses: string[];
 }
-// 'auto' = 默认档：跟随平台映射（macOS→gvisor / Windows·Linux→system），经 shared/tun-stack#resolveTunStack
-// 解析成下发给核的具体栈。system/gvisor/mixed = 显式高级兜底。详见 docs/design/tun-stack-option.md。
-export type TunStack = 'auto' | 'system' | 'gvisor' | 'mixed';
 // UDP NAT 类型档（RFC 3489 三种锥形）。**字段缺席 = 跟随内核默认**，故这里没有 'auto' 成员：
-// 「默认」在这套契约里是 `udpNatType === undefined`，不是一个取值（与 TunStack 的 'auto' 相反——
-// 那个档恒会解析成具体栈下发，这个档的语义就是一个键都不发）。
+// 「默认」在这套契约里是 `udpNatType === undefined`，不是一个取值（这个档的语义就是一个键都不发）。
 // 一档映射内核两个字段 udp_mapping × udp_filtering，表在 crates/config-engine/.../builder/inbounds.rs
 // 的 `udp_nat_behaviors`（SoT 在 Rust，前端只传档名，不复制映射表）。
 export type UdpNatType = 'fullCone' | 'restrictedCone' | 'portRestrictedCone';
@@ -254,6 +250,15 @@ export interface ServerConfig {
   detour?: string;
   /** 仅手动节点可覆盖；订阅节点从所属订阅继承。 */
   bindInterface?: string;
+  /**
+   * 按需连接（sing-box 1.15 endpoint `on_demand`）。**仅 endpoint 腿有效**
+   * （WireGuard / WARP / Tailscale / OpenVPN Client / OpenConnect）。
+   *
+   * 语义权威在 Rust `ServerConfig::on_demand` 的文档注释：未被任何路由规则/选择器引用时
+   * 断开该端点；Tailscale 侧等价 `tailscale down`（交出 tailnet 地址、停 MagicDNS），
+   * 不清登录状态。缺省即删键 —— 读写一律走 `dialogs/on-demand-field.ts`。
+   */
+  onDemand?: boolean;
 
   /**
    * 用户声明的「经该节点可达的内网段」（CIDR）。**只有 openconnect / openvpn-client 读它** ——
@@ -360,12 +365,12 @@ export interface ImportParseResult {
 }
 
 export interface TunModeConfig {
-  // 缺席 = 自动：按「最终栈 × 平台」派生（domain/tun-mtu.ts defaultMtuFor，与 Rust
-  // crates/config-engine/src/user_config/tun_stack::default_mtu_for 同口径）。在场 = 用户显式值，逐字下发内核。
+  // 缺席 = 自动：生成期取 Rust `crates/config-engine/src/user_config/tun_config.rs` 的 `DEFAULT_TUN_MTU`
+  // （渲染端副本 domain/tun-mtu.ts `DEFAULT_TUN_MTU`，parity 测试对拍）。在场 = 用户显式值，逐字下发内核。
   // 存量值由 polaris-store 的 migrate_tun_mtu 一次性抹掉——本项此前从未有 UI 入口，磁盘上的
   // 任何值都是程序写的默认，不承载用户意图。
   mtu?: number;
-  stack: TunStack;
+  // 没有 `stack`：TUN stack 随 sing-box 1.15.0-alpha.3 弃用已整体移除，内核一律走 sing-tun 新栈。
   autoRoute: boolean;
   strictRoute: boolean;
   interfaceName?: string;
@@ -554,9 +559,6 @@ export interface UserConfig {
     direct?: string;
     proxy?: string;
   };
-  // TUN stack 一次性迁移标记（幂等）：存量旧强制默认 stack（mac=gvisor / Win·Linux=system，非真实选择）→ 'auto'。
-  // undefined=未迁移（旧配置）；新装由 createDefaultConfig 置 true。详见 ConfigManager.migrateTunStack。
-  tunStackMigrated?: boolean;
   // TUN MTU 一次性迁移标记（幂等）：抹掉存量 tunConfig.mtu → 缺席（= 自动）。
   // undefined=未迁移；新装由 default_config 置 true。详见 polaris-store 的 migrate_tun_mtu。
   tunMtuMigrated?: boolean;
@@ -603,11 +605,11 @@ export interface UserConfig {
   // 图形兼容逃生门（正向语义：**默认开**=true，关闭是 opt-in 用户自救；均需重启生效）。
   // 消费一律用 `!== false`（undefined=未设/旧配置=默认开），对齐本仓 autoCheckUpdate 惯例。
   // hardwareAcceleration：false → 改用软件渲染，规避 GPU 进程反复崩溃/白屏/花屏。
-  //   Tauri **没有** Electron `app.disableHardwareAcceleration()` 的等价 API —— webview 的 GPU 开关由各平台
-  //   runtime 的环境变量控制，且必须在 webview 创建**之前**设好（判定见 `src-tauri/src/graphics_compat.rs`，
+  //   Tauri **没有** Electron `app.disableHardwareAcceleration()` 的等价 API —— webview 的 GPU 开关按平台
+  //   走环境变量或 WebView2 API，且必须在 webview 创建**之前**设好（判定见 `src-tauri/src/graphics_compat.rs`，
   //   建窗前同步读 config.json 原文本，此刻 store 尚未装配）：
   //     Linux(WebKitGTK)：WEBKIT_DISABLE_DMABUF_RENDERER=1（主修复：NVIDIA 白屏）+ WEBKIT_DISABLE_COMPOSITING_MODE=1
-  //     Windows(WebView2)：WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--disable-gpu
+  //     Windows(WebView2)：建窗时经 WebView2 API（additional_browser_args）下发 --disable-gpu（提权运行同样生效）
   //     macOS(WKWebView)：**无受支持的开关** → 本项在 mac 是 no-op（设置页 mac 隐藏该行，避免死开关）。
   //   生效面 = Linux/Win（与 Electron 版相反：那边因 Electron 在 Linux 无条件禁 HW accel 而藏 Linux；
   //   Tauri/WebKitGTK 合成默认是开的，Linux 上这个开关是活的）。

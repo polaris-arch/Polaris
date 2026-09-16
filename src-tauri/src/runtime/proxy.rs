@@ -39,15 +39,19 @@ mod management_api;
 mod network_monitor;
 mod network_settle;
 mod pending_changes;
-mod platform_contracts;
+// `pub(crate)`：`commands::config` 的排除面预览要用同一份 `platform_tag` /
+// `enumerate_own_lan_cidrs` —— 预览若自己另探一次平台或网卡，就成了第二真值源。
+pub(crate) mod platform_contracts;
 mod process_supervision;
 mod recovery;
 mod route_replan;
 mod selector_reconcile;
 mod startup;
 pub(crate) mod system_takeover;
+mod tailnet_rules;
 mod third_party_vpn;
 mod ts_exit;
+mod tunnel_conflict;
 mod unlock_refresh;
 
 pub(crate) use core_binary::{
@@ -1232,9 +1236,37 @@ pub struct ProxyRuntime {
     ///
     /// [`sync_custom_rule_files`]: Self::sync_custom_rule_files
     custom_rule_files_degraded: AtomicBool,
+    /// **A-0b：运行期观测到的 tailnet 地址**（`serverId` → 裸地址，不带掩码）。
+    ///
+    /// 唯一写入点是 `tailnet_rules` 域的两条腿：STATUS 帧（
+    /// [`sync_tailnet_rule_files`](Self::sync_tailnet_rule_files)）与起核前从盘上读回
+    /// （[`write_tailnet_rule_files`](Self::write_tailnet_rule_files)）；唯一读出点是
+    /// [`observed_tailnet_snapshot`](Self::observed_tailnet_snapshot) → `generate_deps` 的
+    /// `GenerateConfigDeps::observed_tailnet_addresses`。
+    ///
+    /// **停核不清**（与 `mesh.ts_status` 末帧缓存**刻意相反**）：那份缓存是「核此刻报的状态」，
+    /// 核没跑就该诚实空；这份是「这个 tailnet 用的是哪些地址」，核停了它也没变。清掉的代价是
+    /// 下次起核的 TUN 排除面（`builder::inbounds` 的 `engaged_mesh` 只吃这个 map，不读文件）
+    /// 看不见观测地址 —— 那正是 2026-09-11 那次事故里用户的原始症状。
+    observed_tailnet: RwLock<std::collections::BTreeMap<String, Vec<String>>>,
     /// 系统代理 controller + marker 生命周期 + residual 会话门闩的唯一 owner。
     /// 同步 OS 操作的 blocking 隔离与幂等门控全部收敛在 `proxy/system_takeover.rs`。
     system_proxy: SystemProxyTakeover,
+    /// **A-1a**：上一次「本机其它隧道 vs 本次发射的配置」探测 + 判定的结果。
+    ///
+    /// 唯一写入点是 `tunnel_conflict` 域的后台 advisory 腿
+    /// （[`spawn_foreign_tunnel_conflict_probe`](Self::spawn_foreign_tunnel_conflict_probe)，
+    /// 每次起核表态一次：TUN 模式真探，其余模式写回 `NotProbed`）；唯一读出点是
+    /// [`tunnel_conflict_report`](Self::tunnel_conflict_report) → 同名只读 command。
+    ///
+    /// **初值是 `NotProbed` 而不是「空冲突」**：空冲突是一句断言（看过了，没有冲突），
+    /// 而核没起过时我们什么都没看过。两者若共用一个空 `Vec`，界面会把「还没探」
+    /// 显示成「无冲突」—— 那正是这条链最要防的失败形态，故由枚举在类型上分开。
+    ///
+    /// **停核不清**（同 `observed_tailnet` 的取舍）：「本机有另一个隧道在用这段」这件事
+    /// 不因 Polaris 停了就不成立，而用户恰恰是在断开之后去处理它的 —— 停核就清等于
+    /// 让提示在用户动手那一刻消失。下次起核会整份覆盖。
+    tunnel_conflicts: RwLock<tunnel_conflict::TunnelConflictSnapshot>,
     /// `event:proxyError` 发射器（[`set_error`](Self::set_error) 的出口）。
     ///
     /// **`OnceLock` 而非构造参数**：`AppHandle` 要到 Tauri `setup` 才存在，而本运行时在
@@ -1410,7 +1442,9 @@ impl ProxyRuntime {
             helper_upgrade_prompted: AtomicBool::new(false),
             stale_sweep_runs: AtomicUsize::new(0),
             custom_rule_files_degraded: AtomicBool::new(false),
+            observed_tailnet: RwLock::new(std::collections::BTreeMap::new()),
             system_proxy: SystemProxyTakeover::new(proxy_clearer),
+            tunnel_conflicts: RwLock::new(tunnel_conflict::TunnelConflictSnapshot::NotProbed),
             error_emitter: std::sync::OnceLock::new(),
             login_fallback: Mutex::new(LoginFallbackState::default()),
             login_fallback_reconciling: AtomicBool::new(false),

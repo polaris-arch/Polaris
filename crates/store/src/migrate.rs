@@ -13,7 +13,7 @@
 //!   3. migrateFakeIpTunPending（systemProxy+false+migrated → fakeIpTunAutoEnable=true）
 //!   4. migrateNodeResolver（nodeDomainResolver → nodeResolverPool/Single + 标记）
 //!   5. migrateSubscriptionProxyPolicy（旧布尔 subscriptionUpdateViaProxy → 三态）
-//!   6. migrateTunStack（存量 stack → 'auto' + 标记）
+//!   6. migrateTunStack（TUN stack 弃用后的遗留键清理：删 tunConfig.stack + 旧标记 tunStackMigrated）
 //!   7. migrateTunMtu（抹掉存量 tunConfig.mtu → 缺席即自动 + 标记）
 //!   8. migrateTrayMenuWarmDefault（中间构建写入的旧默认 false → 最终默认 true + 标记）
 //!   9. migrateDiagnosticCapture（撤掉的诊断采集机制：还原 logLevel + 清孤儿键）
@@ -1167,20 +1167,38 @@ pub fn migrate_subscription_proxy_policy(value: &mut Value, delta: &mut Migratio
     delta.changed = true;
 }
 
-/// TUN stack 一次性迁移：存量 stack → 'auto' + tunStackMigrated 标记。上游 `migrateTunStackConfig`。
-/// tunStackMigrated===true 即不动。
+/// **TUN stack 遗留键清理**：删 `tunConfig.stack`（任意值）+ 旧一次性迁移留下的 `tunStackMigrated` 标记。
+///
+/// # 为什么从「存量 stack → auto + 标记」改成删键
+///
+/// 此前本函数移植自上游 `migrateTunStackConfig`：把旧版强制写死的默认栈一次性纠回 `auto` 档，
+/// 用 `tunStackMigrated` 保证只纠一次（此后用户显式选的栈不再被碰）。sing-box 1.15.0-alpha.3 起
+/// TUN `stack` 弃用（写了就报 `deprecated.OptionTunStack`，1.17 删除），Polaris 已整体移除栈的概念：
+/// 设置页没有这一项、`config-engine` 不再读它也不再下发。「纠回 auto」没有对象了，
+/// 那个标记要守护的「用户显式选择」也不存在了 —— 两者一起变成没有代码读的孤儿键。
+///
+/// # 判据是「键在即迁移」，不设新标记
+///
+/// 同 [`migrate_diagnostic_capture`]：删完键就没了，天然幂等；再加一个 `tunStackRemoved` 只会是下一个孤儿键。
+/// 无遗留键的配置（新装、已清理过的）走零变更路径，不置 `changed`（否则每次启动白写一次盘）。
+///
+/// # 不看值
+///
+/// 旧版合法的 `auto/system/gvisor/mixed`、非法字符串、非字符串一律删：值已不影响任何行为，按值分支
+/// 只会让非法值残留。`validate_config` 也同步不再校验 `stack`，所以带非法 `stack` 的旧配置 / 旧备份
+/// 在 save 路径（只 sanitize + validate、不跑本链）上同样不报错，下一次 load 时由本迁移清掉。
 pub fn migrate_tun_stack(value: &mut Value, delta: &mut MigrationDelta) {
     let Some(obj) = value.as_object_mut() else {
         return;
     };
-    if obj.get("tunStackMigrated") == Some(&Value::Bool(true)) {
-        return;
+    if obj.remove("tunStackMigrated").is_some() {
+        delta.changed = true;
     }
     if let Some(Value::Object(tun)) = obj.get_mut("tunConfig") {
-        tun.insert("stack".into(), Value::String("auto".into()));
+        if tun.remove("stack").is_some() {
+            delta.changed = true;
+        }
     }
-    obj.insert("tunStackMigrated".into(), Value::Bool(true));
-    delta.changed = true;
 }
 
 /// TUN MTU 一次性迁移：抹掉存量 `tunConfig.mtu` → 缺席（= 自动）+ `tunMtuMigrated` 标记。

@@ -5,8 +5,18 @@
  * **跨族不相交**、**禁用规则不算**。
  */
 import { describe, it, expect } from 'vitest';
-import type { Rule } from '@/contracts/types';
-import { cidrsOverlap, cidrOverlapsAny, meshOverlapRuleIds } from './mesh-rule-overlap';
+import type { Rule, ServerConfig } from '@/contracts/types';
+import type {
+  EndpointForceRouteReport,
+  ServerForceRoute,
+} from '@/contracts/endpoint-force-route-report';
+import {
+  cidrsOverlap,
+  cidrOverlapsAny,
+  forceRoutedCidrsFromReport,
+  meshOverlapRuleIds,
+} from './mesh-rule-overlap';
+import { endpointForcedRouteCidrs, TAILNET_CGNAT, TAILNET_ULA_V6 } from './endpoint-routes';
 
 function rule(id: string, values: string[], enabled = true, type: Rule['type'] = 'ipCidr'): Rule {
   return { id, type, values, action: 'proxy', enabled } as Rule;
@@ -113,5 +123,90 @@ describe('meshOverlapRuleIds', () => {
 
   it('不相交的规则不标（避免全列表刷警告的噪音角标）', () => {
     expect(meshOverlapRuleIds([rule('a', ['192.168.1.0/24'])], mesh)).toEqual(new Set());
+  });
+});
+
+/**
+ * 「覆盖组网」角标的**真值源**：后端本次结算，而不是渲染端重算。
+ *
+ * 本组的主用例（①）钉的是一个**真缺陷**：自建 headscale 的 tailnet 前缀由控制面下发（实测
+ * `32.0.0.0/24`），它只经**外化 rule-set 腿**进配置（段住在文件里、热重载），于是
+ *  - 渲染端重算看到的是两条硬编码常量（用例④证明），
+ *  - 后端报告的 `emitted` 对这条腿恒空（用例⑤证明），
+ * 两条路都标不出来 —— 而用户那条规则确实会遮蔽 tailnet（自定义规则排在组网之前，首匹配）。
+ * 判据因此必须是 `emitted ∪ externalRuleSetCidrs`。
+ */
+describe('forceRoutedCidrsFromReport —— 角标判据的真值源', () => {
+  /** 自建 tailnet：观测地址 32.0.0.28，只走外化 rule-set 腿（emitted 恒空）。 */
+  const EXTERNAL_LEG: ServerForceRoute = {
+    serverId: 'ts-self',
+    leg: 'externalRuleSet',
+    hasObservation: true,
+    emitted: [],
+    externalRuleSetCidrs: ['32.0.0.28/32', '100.100.100.100/32', 'fd7a:115c:a1e0::53/128'],
+    absorbed: [],
+    coverage: 'covered',
+  };
+  const INLINE_LEG: ServerForceRoute = {
+    serverId: 'wg-a',
+    leg: 'inline',
+    hasObservation: false,
+    emitted: ['10.9.0.0/24'],
+    externalRuleSetCidrs: [],
+    absorbed: [],
+    coverage: 'covered',
+  };
+  const report = (servers: ServerForceRoute[]): EndpointForceRouteReport => ({
+    servers,
+    zeroCoverageServerIds: [],
+    absorbedCount: 0,
+  });
+
+  /** 用户写的一条覆盖自建 tailnet 的规则。 */
+  const COVERS_TAILNET = rule('r-tailnet', ['32.0.0.0/24']);
+
+  it('① 仅走 externalRuleSet 腿的 Tailscale 节点 + 覆盖其观测段的规则 ⇒ 角标亮', () => {
+    const cidrs = forceRoutedCidrsFromReport(report([EXTERNAL_LEG]));
+    expect(meshOverlapRuleIds([COVERS_TAILNET], cidrs)).toEqual(new Set(['r-tailnet']));
+  });
+
+  it('② 负向对照：规则不与任何组网段相交 ⇒ 不亮', () => {
+    const cidrs = forceRoutedCidrsFromReport(report([EXTERNAL_LEG, INLINE_LEG]));
+    expect(meshOverlapRuleIds([rule('r-other', ['203.0.113.0/24'])], cidrs)).toEqual(new Set());
+  });
+
+  it('③ 拿不到报告 ⇒ 空段集 ⇒ 一个角标都不标（宁可漏标不可假警报）', () => {
+    expect(forceRoutedCidrsFromReport(null)).toEqual([]);
+    expect(meshOverlapRuleIds([COVERS_TAILNET], forceRoutedCidrsFromReport(null))).toEqual(
+      new Set()
+    );
+  });
+
+  it('④ 正面对照：渲染端重算结构上看不见这个段 —— 判据非搬到后端不可', () => {
+    // 被删掉的 `meshForcedRouteCidrs` 的唯一段来源就是它。对 Tailscale 恒产出两条硬编码常量，
+    // 与自建 tailnet 的 32.0.0.0/24 零相交 ⇒ 角标结构性不亮。这一条红了，说明重算那份又活了
+    // 或者本组的夹具不再代表自建 tailnet，两种情况都必须停下来看。
+    const recomputed = endpointForcedRouteCidrs({
+      id: 'ts-self',
+      name: 'ts-self',
+      protocol: 'tailscale',
+      tailscaleSettings: {},
+    } as unknown as ServerConfig);
+    expect(recomputed).toEqual([TAILNET_CGNAT, TAILNET_ULA_V6]);
+    expect(meshOverlapRuleIds([COVERS_TAILNET], recomputed)).toEqual(new Set());
+  });
+
+  it('⑤ 正面对照：只读 emitted 也标不出来 —— 并集必须含 externalRuleSetCidrs', () => {
+    const emittedOnly = report([EXTERNAL_LEG]).servers.flatMap((s) => s.emitted);
+    expect(emittedOnly).toEqual([]);
+    expect(meshOverlapRuleIds([COVERS_TAILNET], emittedOnly)).toEqual(new Set());
+  });
+
+  it('⑥ inline 腿的 emitted 同样进并集，且跨节点去重', () => {
+    const dup: ServerForceRoute = { ...INLINE_LEG, serverId: 'wg-b' };
+    const cidrs = forceRoutedCidrsFromReport(report([INLINE_LEG, dup, EXTERNAL_LEG]));
+    expect(cidrs.filter((c) => c === '10.9.0.0/24')).toHaveLength(1);
+    expect(cidrs).toContain('32.0.0.28/32');
+    expect(meshOverlapRuleIds([rule('r-wg', ['10.9.0.5'])], cidrs)).toEqual(new Set(['r-wg']));
   });
 });

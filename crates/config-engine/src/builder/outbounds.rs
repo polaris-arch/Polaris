@@ -198,6 +198,29 @@ pub fn required_bind_interfaces(config: &UserConfig) -> BTreeSet<String> {
     required
 }
 
+/// 把节点的「按需连接」意图注入 endpoint（sing-box 1.15 `on_demand`）。
+///
+/// # 为什么是一个 helper 而不是各构造器自己读
+///
+/// 四条 endpoint 腿（WireGuard/WARP、Tailscale、OpenVPN Client/OpenConnect、custom 逃生舱）
+/// 各读一次 `server.on_demand` = 四个可遗漏点，而遗漏的形态是**静默的**：那条腿的节点照常生成、
+/// `sing-box check` 照常 rc=0，只是永远不会挂起。故与既有的 [`apply_bind_interface`] 同形，
+/// 收成一处、在每个 `pending_endpoints.push` 之前调用；覆盖面由
+/// `on_demand_reaches_every_endpoint_leg` 逐协议钉住。
+///
+/// `None`（未设置）⇒ **不动任何键**，与本字段出现之前逐字节等价。
+///
+/// custom 逃生舱的处置：`Some` 时把 `extra` 里同名键摘掉再写类型化字段 —— 否则
+/// `#[serde(flatten)]` 会让同一个 `on_demand` 出现两次。用户没在 `ServerConfig` 上设 `onDemand`
+/// 时不碰 `extra`，raw JSON 里手写的 `on_demand` 照常原样透传（逃生舱的既有语义）。
+fn apply_on_demand(endpoint: &mut Endpoint, server: &ServerConfig) {
+    let Some(on_demand) = server.on_demand else {
+        return;
+    };
+    endpoint.extra.remove("on_demand");
+    endpoint.on_demand = Some(on_demand);
+}
+
 fn apply_bind_interface(
     extra: &mut serde_json::Map<String, serde_json::Value>,
     interface: Option<&str>,
@@ -358,6 +381,7 @@ pub fn build_outbounds_with_runtime_bindings(
                     ep.name = None;
                 }
                 apply_bind_interface(&mut ep.extra, bind_interface.as_deref());
+                apply_on_demand(&mut ep, server);
                 pending_endpoints.push(ep);
                 node_tags.push(tag);
             }
@@ -406,6 +430,7 @@ pub fn build_outbounds_with_runtime_bindings(
                 ep.system_interface_name = None;
             }
             apply_bind_interface(&mut ep.extra, bind_interface.as_deref());
+            apply_on_demand(&mut ep, server);
             pending_endpoints.push(ep);
             node_tags.push(tag);
             continue;
@@ -452,6 +477,7 @@ pub fn build_outbounds_with_runtime_bindings(
             // dial 级解析器**必须给**：server 是域名时 1.14 initialize 会硬失败。
             let mut endpoint = build_vpn_client_endpoint(server, &tag, Some(&dial_resolver))?;
             apply_bind_interface(&mut endpoint.extra, bind_interface.as_deref());
+            apply_on_demand(&mut endpoint, server);
             pending_endpoints.push(endpoint);
             node_tags.push(tag);
             continue;
@@ -491,6 +517,7 @@ pub fn build_outbounds_with_runtime_bindings(
                         ..Default::default()
                     };
                     apply_bind_interface(&mut endpoint.extra, bind_interface.as_deref());
+                    apply_on_demand(&mut endpoint, server);
                     pending_endpoints.push(endpoint);
                     node_tags.push(tag);
                     continue;

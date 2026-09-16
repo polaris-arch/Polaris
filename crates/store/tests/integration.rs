@@ -38,7 +38,7 @@ fn save_then_load_round_trips() {
         "logLevel": "info",
         "mixedPort": 7890,
         "servers": [{"id":"s1","name":"HK","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw"}],
-        "tunConfig": {"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true}
+        "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
     });
     ConfigStore::save(&StdFs, &path, &cfg, "aabbccddeeff").unwrap();
     assert!(path.exists());
@@ -79,7 +79,7 @@ fn bad_field_sanitized_good_field_kept_on_disk_preserved() {
         "mixedPort": 7890,
         "servers": "not-an-array",
         "customRules": [{"id":"r1","type":"domain","values":["a.com"],"action":"proxy","enabled":true}],
-        "tunConfig": {"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true}
+        "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
     }"#;
     std::fs::write(&path, original).unwrap();
 
@@ -113,7 +113,9 @@ fn migration_chain_runs_and_is_idempotent_on_real_fs() {
     let res1 = ConfigStore::load(&StdFs, &path);
     assert!(res1.loaded_from_disk);
     assert!(res1.migration_delta.changed, "首次加载有迁移变更");
-    assert_eq!(res1.config["tunStackMigrated"], serde_json::json!(true));
+    // 遗留 `stack` 被删、且不再写 `tunStackMigrated`（TUN stack 已随上游弃用移除）。
+    assert!(res1.config["tunConfig"].get("stack").is_none());
+    assert!(res1.config.get("tunStackMigrated").is_none());
     assert_eq!(res1.config["keepTrayMenuWarm"], serde_json::json!(true));
     assert_eq!(
         res1.config["keepTrayMenuWarmDefaultMigrated"],
@@ -152,7 +154,7 @@ fn atomic_write_leaves_no_partial_on_success() {
         "proxyModeType": "manual",
         "logLevel": "info",
         "mixedPort": 7890,
-        "tunConfig": {"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true}
+        "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
     });
     ConfigStore::save(&StdFs, &path, &cfg, "deadbeefdead").unwrap();
     // 最终文件存在且完整
@@ -173,7 +175,7 @@ fn save_validates_before_writing() {
         "proxyMode": "not-a-mode",
         "proxyModeType": "tun",
         "logLevel": "info",
-        "tunConfig": {"mtu":1350,"stack":"auto","autoRoute":true,"strictRoute":true}
+        "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
     });
     let res = ConfigStore::save(&StdFs, &path, &bad, "deadbeefdead");
     assert!(matches!(res, Err(StoreError::Validation(_))));

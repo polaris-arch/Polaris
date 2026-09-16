@@ -30,7 +30,7 @@ pub(super) fn linux_ip_monitor_binary() -> &'static str {
 /// 消费面：macOS「连入来源排除」guard（排除物理 LAN 会触发 NE 反向路由丢包）、Windows bypassLAN carve
 /// guard（保护物理子网不被 mesh carve）、Linux mesh/own-lan 重叠告警。
 #[cfg(unix)]
-pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
+pub(crate) fn enumerate_own_lan_cidrs() -> Vec<String> {
     use nix::ifaddrs::getifaddrs;
     use nix::net::if_::InterfaceFlags;
 
@@ -89,7 +89,7 @@ fn own_lan_v4_addr_prefix(addr: u32, mask: u32) -> Option<(String, u8)> {
 ///
 /// [`netinfo`]: polaris_helper::platform::windows::netinfo
 #[cfg(windows)]
-pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
+pub(crate) fn enumerate_own_lan_cidrs() -> Vec<String> {
     use polaris_helper::platform::windows::netinfo::enumerate_local_unicast_addrs;
     let out: Vec<String> = enumerate_local_unicast_addrs()
         .into_iter()
@@ -101,14 +101,105 @@ pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
 /// **C12**（既非 unix 也非 windows 的假想平台）：无枚举实现 → 空。与 上游 `getOwnLanCidrs` catch→空
 /// 的 best-effort 语义一致（少一层物理子网保护，非破坏、不断网）。
 #[cfg(not(any(unix, windows)))]
-pub(super) fn enumerate_own_lan_cidrs() -> Vec<String> {
+pub(crate) fn enumerate_own_lan_cidrs() -> Vec<String> {
     Vec::new()
+}
+
+/// **D1**（Windows）：外来隧道探测的进程内取材源 —— `polaris-helper` 的 `netinfo` FFI
+/// （`GetIpForwardTable2` / `GetAdaptersAddresses` / `RasEnumConnectionsW`，三条只读枚举、免提权、
+/// app 会话作用域）接到 `polaris-system-integration` 定义的
+/// [`WindowsNetInfoSource`](polaris_system_integration::route_probe::netinfo::WindowsNetInfoSource) 上。
+///
+/// **注入而不是让 system-integration 直接调**：macOS 下 `polaris-helper` **依赖**
+/// `polaris-system-integration`（root helper 复用同一份 SystemConfiguration 事务实现），
+/// 反向依赖会成环。三段分工（FFI / trait+判据 / 注入）见该 trait 所在模块的头注；
+/// 本文件已有同型先例 —— [`enumerate_own_lan_cidrs`] 的 Windows 腿就是这么调 helper netinfo 的。
+///
+/// 三腿的错误串带上是哪个 API、Win32 码多少（`NetInfoError` 的 Display）：探测失败在下游只会
+/// 渲染成「探测失败」，诊断信息全靠这一串。
+#[cfg(windows)]
+pub(crate) struct HelperWindowsNetInfo;
+
+#[cfg(windows)]
+impl polaris_system_integration::route_probe::netinfo::WindowsNetInfoSource
+    for HelperWindowsNetInfo
+{
+    fn routes(&self) -> Result<Vec<polaris_system_integration::route_probe::RouteEntry>, String> {
+        polaris_helper::platform::windows::netinfo::enumerate_ip_forward_entries()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| polaris_system_integration::route_probe::RouteEntry {
+                        prefix: row.prefix,
+                        interface: row.interface_alias,
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn adapters(
+        &self,
+    ) -> Result<Vec<polaris_system_integration::route_probe::netinfo::WindowsAdapterKind>, String>
+    {
+        polaris_helper::platform::windows::netinfo::enumerate_adapter_kinds()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        polaris_system_integration::route_probe::netinfo::WindowsAdapterKind {
+                            alias: row.alias,
+                            if_type: row.if_type,
+                        }
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn ras_connections(
+        &self,
+    ) -> Result<Vec<polaris_system_integration::route_probe::netinfo::WindowsRasConnection>, String>
+    {
+        polaris_helper::platform::windows::netinfo::enumerate_ras_connections()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        polaris_system_integration::route_probe::netinfo::WindowsRasConnection {
+                            name: row.name,
+                            all_users: row.all_users,
+                        }
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// 装配生产外来隧道探测器。**Windows 走进程内 API，其余平台原样**。
+///
+/// 这是 `runtime::proxy` 里唯一允许构造该探测器的地方（`tunnel_conflict` 的起核后台腿调它）：
+/// 直接调 `polaris_system_integration::production_foreign_tunnel_probe()` 会拿到一个**没有注入
+/// 取材源**的 probe —— 它在 Windows 上退回六条串行外部命令，正是 D1 要修的那个形态，
+/// 而且退回得毫无声响。由 `tunnel_conflict` 的源码门
+/// `the_tunnel_conflict_probe_is_assembled_through_platform_contracts` 钉住生产调用点只经本函数。
+#[cfg(windows)]
+pub(super) fn production_foreign_tunnel_probe() -> polaris_system_integration::ProdForeignTunnelProbe
+{
+    polaris_system_integration::production_foreign_tunnel_probe()
+        .with_windows_netinfo(std::sync::Arc::new(HelperWindowsNetInfo))
+}
+
+/// 非 Windows：无进程内取材源可注入（Linux `ip` / macOS `netstat` 那两条腿本就是几毫秒的
+/// 只读命令，不是 D1 要解的问题），逐字沿用库的生产装配。
+#[cfg(not(windows))]
+pub(super) fn production_foreign_tunnel_probe() -> polaris_system_integration::ProdForeignTunnelProbe
+{
+    polaris_system_integration::production_foreign_tunnel_probe()
 }
 
 /// 平台标签：config-engine 沿用 上游/Node 约定（`linux` / `darwin` / `win32`），
 /// 与 Rust 的 `std::env::consts::OS`（`linux` / `macos` / `windows`）**不同名** → 必须映射。
 /// 漏映射会让 inbounds/route 的平台分支（如 `platform == "win32"`）全部落空。
-pub(super) fn platform_tag() -> &'static str {
+pub(crate) fn platform_tag() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",

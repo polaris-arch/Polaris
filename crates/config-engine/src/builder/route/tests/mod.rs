@@ -33,6 +33,9 @@ fn deps_default<'a>(pending: &'a [Endpoint]) -> RouteConfigDeps<'a> {
         arch: "x64".to_string(),
         platform: "linux".to_string(),
         is_valid_srs_fn: |_| false,
+        // 夹具目录不存在 ⇒ 块 0c 存在性检查恒假 ⇒ 走 inline 降级腿（与本字段出现之前同）。
+        tailnet_rules_dir: "/fake/tailnet-rules".to_string(),
+        observed_tailnet_addresses: Default::default(),
     }
 }
 

@@ -165,6 +165,88 @@ describe('buildTsSettings：用户没动过就不写显式值（删键而非写 
   });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// 清除 Auth Key —— 保全规则的唯一例外
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 哨兵 key：特征串只此一处出现，于是「它有没有漏到别处（配置 / DOM / 日志）」是可判的。
+ * 真 key 形如 `tskey-auth-xxxxx`，这里保留同前缀，免得判据被「长得不像 key 所以没人管」绕过。
+ */
+const SENTINEL_KEY = 'tskey-auth-SENTINEL-DO-NOT-RENDER';
+
+/**
+ * 全字段样本：`TailscaleSettings` 的**每一个**键都给上非缺省值。
+ *
+ * 「清除没误伤别的字段」只挑两三个字段看是测不出来的 —— 漏掉的恰恰是没被挑中的那个。
+ * 故下面的不误伤判据落在**整个对象相等**上，而这个样本负责让那个相等有内容。
+ */
+const FULL_TS: TailscaleSettings = {
+  authKey: SENTINEL_KEY,
+  allowInternet: false,
+  alwaysRouteSubnets: false,
+  exitNode: 'peer-1',
+  exitNodeAllowLanAccess: true,
+  acceptRoutes: true,
+  routes: ['192.168.50.0/24'],
+  controlUrl: 'https://headscale.example.com',
+  hostname: 'sway-macbook',
+  ephemeral: true,
+  advertiseRoutes: ['10.0.0.0/8'],
+  reverseMesh: true,
+  advertiseTags: ['tag:server'],
+  sshServer: true,
+  relayServerPort: 41641,
+  listenPort: 41642,
+  resolveByName: true,
+  acceptDefaultResolvers: true,
+};
+
+describe('buildTsSettings 的 clearAuthKey：删得掉、不误伤、不回流', () => {
+  const fullDraft = () => initTsDraft(node(FULL_TS));
+
+  it('自检：样本真的覆盖 TailscaleSettings 全字段，且提交后一个都没丢（否则下面的相等是空转）', () => {
+    const kept = buildTsSettings(FULL_TS, fullDraft(), false);
+    expect(Object.keys(kept).sort()).toEqual(Object.keys(FULL_TS).sort());
+  });
+
+  it('判据1 正向：清除后 authKey 这个键真的没了（不是留个空串）', () => {
+    const out = buildTsSettings(FULL_TS, fullDraft(), true);
+    expect(Object.prototype.hasOwnProperty.call(out, 'authKey')).toBe(false);
+    // 阴性对照：同一份入参不清除 ⇒ key 原样保全。缺了这条，上面那行在「本函数把什么都删了」时也绿。
+    const kept = buildTsSettings(FULL_TS, fullDraft(), false);
+    expect(kept.authKey).toBe(SENTINEL_KEY);
+  });
+
+  it('判据2 不误伤：与「不清除」的产物**逐字段**相等，差集恰好只有 authKey', () => {
+    const draft = fullDraft();
+    const kept = buildTsSettings(FULL_TS, draft, false);
+    const cleared = buildTsSettings(FULL_TS, draft, true);
+    const expected = { ...kept };
+    delete expected.authKey;
+    // 全对象相等：controlUrl / hostname / routes / exitNode / 端口 / 三个布尔…… 一个都不许变。
+    expect(cleared).toEqual(expected);
+  });
+
+  it('判据3 不回流：清除意图在，接着改别的设置也不会被 base 带回来', () => {
+    // 用户清了 key 之后没关窗，顺手改了主机名 —— 这一次提交同样经 buildTsSettings，
+    // 而它的 base 仍是 store 里那份带 key 的现值。旧实现（靠 `{...base}` 保全、无本入参）此处必红。
+    const cleared = buildTsSettings(FULL_TS, { ...fullDraft(), hostname: 'renamed' }, true);
+    expect(Object.prototype.hasOwnProperty.call(cleared, 'authKey')).toBe(false);
+    expect(cleared.hostname).toBe('renamed');
+    // 再走一轮（模拟「清除后第二次编辑」）：产物自己当 base，依然不许长出 key。
+    const again = buildTsSettings(cleared, { ...fullDraft(), hostname: 'renamed-2' }, true);
+    expect(Object.prototype.hasOwnProperty.call(again, 'authKey')).toBe(false);
+  });
+
+  it('清除产物里不含哨兵串的任何片段（序列化后整串搜，不只看那一个键）', () => {
+    const out = buildTsSettings(FULL_TS, fullDraft(), true);
+    expect(JSON.stringify(out)).not.toContain('SENTINEL');
+    // 正向对照：证明这条断言抓得住 —— 不清除时它必然命中。
+    expect(JSON.stringify(buildTsSettings(FULL_TS, fullDraft(), false))).toContain('SENTINEL');
+  });
+});
+
 describe('invalidTsCidrs：口径与后端 sanitize_cidr_list 一致', () => {
   it('合法段全过', () => {
     const d = { ...initTsDraft(node({})), routes: '192.168.50.0/24, 10.0.0.0/8', advertiseRoutes: 'fd7a:115c:a1e0::/48' };

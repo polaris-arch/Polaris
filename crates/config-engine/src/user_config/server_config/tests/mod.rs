@@ -500,6 +500,8 @@ fn server_config_stays_narrow() {
         "meshRoutes" => mesh_routes: Plain,
         "subscriptionId" => subscription_id: Plain,
         "bindInterface" => bind_interface: Plain,
+        // `Option<bool>` —— 1 字节 + niche，装箱只会加一次指针跳转，没有取舍空间。
+        "onDemand" => on_demand: Plain,
         "providerName" => provider_name: Plain,
         "uuid" => uuid: Plain,
         "encryption" => encryption: Plain,
@@ -896,4 +898,49 @@ fn r4_absent_token_fields_stay_none() {
     assert_eq!(s.flow, None);
     assert_eq!(s.network, None);
     assert_eq!(s.vmess_security, None);
+}
+
+/// `ALL_PROTOCOLS` 必须穷尽 [`Protocol`] 的全部变体。
+///
+/// 判据是下面这个**穷尽 `match`**（不是数组长度）：新增一个变体，`slot` 立刻编译不过，
+/// 强制来这里加一行；而只加 `slot` 不加数组则 `seen` 有空位、断言转红。两个方向都说话。
+#[test]
+fn all_protocols_is_exhaustive() {
+    fn slot(p: Protocol) -> usize {
+        match p {
+            Protocol::Vless => 0,
+            Protocol::Trojan => 1,
+            Protocol::Hysteria2 => 2,
+            Protocol::Shadowsocks => 3,
+            Protocol::Anytls => 4,
+            Protocol::Tuic => 5,
+            Protocol::Vmess => 6,
+            Protocol::Naive => 7,
+            Protocol::Snell => 8,
+            Protocol::Socks => 9,
+            Protocol::Http => 10,
+            Protocol::Ssh => 11,
+            Protocol::Wireguard => 12,
+            Protocol::Tailscale => 13,
+            Protocol::Hysteria => 14,
+            Protocol::Tor => 15,
+            Protocol::Openconnect => 16,
+            Protocol::OpenvpnClient => 17,
+            Protocol::Custom => 18,
+        }
+    }
+    let mut seen = [false; 19];
+    for p in super::ALL_PROTOCOLS {
+        seen[slot(p)] = true;
+    }
+    let missing: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, ok)| !**ok)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "ALL_PROTOCOLS 漏了 slot {missing:?} 对应的变体 —— 依赖它做取材面的门会静默缩小覆盖面"
+    );
 }
