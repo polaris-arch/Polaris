@@ -21,6 +21,20 @@ use polaris_helper_proto::StartTiming;
 pub struct CoreStart {
     pub pid: u32,
     pub timing: StartTiming,
+    /// 进程创建时间（`GetProcessTimes`，100ns tick）。读不到 → `None`（协议侧不发该 token）。
+    pub created: Option<u64>,
+}
+
+/// 受管核的进程身份（D2/D3）：从 helper **持有的进程句柄**读出的两个事实。
+///
+/// 两个字段各自可缺（FFI 读失败）—— 缺就是 `None`，绝不填一个猜的值：下游据此判「不可观测」，
+/// 而一个编造的值会被当成事实去比对，把读失败变成假崩溃 / 假自证。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedIdentity {
+    /// 进程创建时间（100ns tick）。同一 pid 被复用时必变 ⇒ 崩溃监测的身份判据。
+    pub created: Option<u64>,
+    /// 实跑二进制全路径（`QueryFullProcessImageNameW`）⇒ 内核自证的事实来源。
+    pub image: Option<String>,
 }
 
 /// 进程操作抽象（对应 `winproc.go` 的进程/Job/freeport-kill/singbox-spawn/旁路 spawn 原语）。
@@ -72,6 +86,18 @@ pub trait ProcOps: Send + Sync {
     /// best-effort：失败只记日志（Go `_ = c.Start()`）。旁路须比 helper 活得久（DETACHED_PROCESS、
     /// 不 assignToJob、继承 SYSTEM token）。
     fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str);
+
+    /// 受管核的进程身份（D2/D3）：`pid` 是当前受管核时返回其 created/image，否则全 `None`。
+    ///
+    /// **取材来自 helper 持有的进程句柄**，不是 `OpenProcess(pid)` —— 句柄在手时 PID 不会被系统
+    /// 复用，读到的必是同一个进程；按 pid 现开句柄则可能读到复用者，那正是本条要消除的假象。
+    fn managed_identity(&self, pid: u32) -> ManagedIdentity;
+
+    /// 以 SYSTEM 刷系统 DNS 缓存（D4）：跑 `ipconfig /flushdns`。
+    ///
+    /// 成功 `Ok(())`；失败 `Err(<合并 stdout+stderr 的诊断串>)` —— ipconfig 把错误文字写在 stdout，
+    /// 故本腿局部自捕两条流（判据见 [`logic::flush_dns_result`]），不改共用 exec 的全局错误格式。
+    fn flush_dns(&self) -> Result<(), String>;
 
     /// 开 IP 转发（`winproc.go:414-427` `enableIPForwarding`）。
     ///
@@ -166,6 +192,14 @@ struct MockProcOpsInner {
     pub last_route: std::sync::Mutex<Option<(String, String, bool)>>,
     /// `spawn_watch_parent` 累计调用次数（W15 看护接线断言用）。
     pub watch_parent_calls: std::sync::atomic::AtomicUsize,
+    /// `flush_dns` 累计调用次数（D4 断言用）。
+    pub flush_dns_calls: std::sync::atomic::AtomicUsize,
+    /// 预设的受管核身份（D2/D3）：`start_singbox` 起核后归属于新 pid。
+    pub identity: std::sync::Mutex<ManagedIdentity>,
+    /// 最近一次 `start_singbox` 返回的 pid（身份按 pid 归属，镜像生产的「只认手里那个」）。
+    pub last_started_pid: std::sync::atomic::AtomicU32,
+    /// `flush_dns` 预设失败串（`None` = 成功）。
+    pub flush_dns_error: std::sync::Mutex<Option<String>>,
     /// 最近一次 `spawn_watch_parent` 的 (ppid, child_pid)（断言用）。
     pub last_watch_args: std::sync::Mutex<Option<(u32, u32)>>,
 }
@@ -260,6 +294,27 @@ impl MockProcOps {
         self.inner.last_spawn_args.lock().unwrap().clone()
     }
 
+    /// 预设受管核身份（D2/D3；`start_singbox` 之后按新 pid 生效）。
+    pub fn set_identity(&self, created: Option<u64>, image: Option<&str>) {
+        *self.inner.identity.lock().unwrap() = ManagedIdentity {
+            created,
+            image: image.map(ToOwned::to_owned),
+        };
+    }
+
+    /// 预设 `flush_dns` 失败（模拟 ipconfig 非零退出；串即 helper 侧自捕的 stdout+stderr）。
+    pub fn set_flush_dns_error(&self, detail: &str) {
+        *self.inner.flush_dns_error.lock().unwrap() = Some(detail.to_owned());
+    }
+
+    /// `flush_dns` 累计调用次数（测试断言）。
+    #[must_use]
+    pub fn flush_dns_calls(&self) -> usize {
+        self.inner
+            .flush_dns_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// 预设 `kill_all_singbox` 返回的杀掉数。
     pub fn set_kill_all_return(&self, n: usize) {
         self.inner
@@ -331,11 +386,17 @@ impl ProcOps for MockProcOps {
         if let Some(e) = self.inner.start_error.lock().unwrap().take() {
             return Err(e);
         }
+        let pid = self
+            .inner
+            .next_pid
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // 生产侧 created 与 status 的 created 同源（同一个句柄读一次、缓存起来）——mock 照此归属，
+        // 否则两条腿能各自返回不同的值，测试就再也发现不了「start 与 status 报的不是同一个进程」。
+        self.inner
+            .last_started_pid
+            .store(pid, std::sync::atomic::Ordering::SeqCst);
         Ok(CoreStart {
-            pid: self
-                .inner
-                .next_pid
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            pid,
             timing: StartTiming {
                 forwarding_ms: 0,
                 process_ms: 0,
@@ -343,7 +404,21 @@ impl ProcOps for MockProcOps {
                 log_handoff_ms: 0,
                 total_ms: 0,
             },
+            created: self.inner.identity.lock().unwrap().created,
         })
+    }
+
+    fn managed_identity(&self, pid: u32) -> ManagedIdentity {
+        // 只认「手里那个」：pid 不是最近起的受管核 → 全 None（镜像生产的句柄归属判据）。
+        if pid
+            != self
+                .inner
+                .last_started_pid
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return ManagedIdentity::default();
+        }
+        self.inner.identity.lock().unwrap().clone()
     }
 
     fn reap_child(&self, pid: u32) {
@@ -367,6 +442,16 @@ impl ProcOps for MockProcOps {
         self.inner
             .ip_forward_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn flush_dns(&self) -> Result<(), String> {
+        self.inner
+            .flush_dns_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.inner.flush_dns_error.lock().unwrap().clone() {
+            Some(detail) => Err(detail),
+            None => Ok(()),
+        }
     }
 
     fn apply_route(&self, iface: &str, cidr: &str, del: bool) {

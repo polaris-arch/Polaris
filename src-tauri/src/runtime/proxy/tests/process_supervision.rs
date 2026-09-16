@@ -758,13 +758,25 @@ async fn public_stop_marks_recovery_aborted_and_next_start_resets_it() {
     );
 }
 
-/// **接线门**：纯逻辑对了不代表崩溃监测真的去问了它。
+/// **接线门**：纯逻辑对了不代表崩溃监测真的去问了它（**本地**令牌腿这一半）。
 ///
 /// 本仓两天内被同一形状骗过两次（判据落在「这个词出现过吗」，而词的来源包含判据自身）⇒
 /// 判据取的是 [`method_body`] 截出的 `spawn_crash_monitor` **方法体**（剥掉整行注释、
 /// 到方法末尾封顶），既排除本测试模块自身，也排除方法内注释里的同名文本。
 ///
-/// 打断（把复核那段删掉、只留 `pid_alive`）→ 三条断言全红。
+/// # 为什么还要再切一刀到本地腿
+///
+/// D3 的 helper 令牌腿加进来之后，`pid_identity_verdict(` / `process_identity(p)` /
+/// `PidIdentity::Mismatch` 在这个方法体里各有**两份**（本地一份、helper 一份）。在整个方法体上
+/// 断言，两份互相作证：把**本地**腿的消费分支删光（保留调用、`verdict` 仍参与后面的
+/// `Unobservable` 条件，编得过），这条门照样绿 —— 实测过。
+///
+/// 这份污染不是遗留问题，是加 helper 腿的**同一轮**自己造出来的：加之前方法体里只有一份，
+/// 那时这条门是有牙的。故切点与 [`crash_monitor_consults_the_helper_reported_created_token`]
+/// **互为镜像** —— 那条从 helper 令牌取材处切到臂尾（自检「切片里不得有本地腿」），
+/// 这条从本地复核处切到 helper 腿起手处（自检「切片里不得有 helper 腿」）。
+///
+/// 打断（把复核那段删掉、只留 `pid_alive`）→ 本地腿那几条全红。
 #[test]
 fn crash_monitor_actually_consults_the_pid_identity() {
     const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
@@ -786,18 +798,45 @@ fn crash_monitor_actually_consults_the_pid_identity() {
         "判据区域包含本测试自身 —— 切点选错，断言会被自己的字面量污染"
     );
     let body = method_body(prod, HEAD);
+    // 切到**本地令牌腿**：从本地复核起手，到 helper 腿起手处封顶。
+    // 封顶锚点刻意取**不含 `} else `** 的形态 —— 删掉本地腿消费分支的变异会把 `} else if` 变成
+    // `if`，锚点若带上 `} else ` 就会随变异一起消失，本条于是红在「锚点没了」而不是红在判据上。
+    const LOCAL_LEG_START: &str = "let due = ticks.is_multiple_of(PID_IDENTITY_RECHECK_TICKS);";
+    const LOCAL_LEG_END: &str = "identity.is_none() || verdict == PidIdentity::Unobservable";
+    let leg_at = body
+        .find(LOCAL_LEG_START)
+        .unwrap_or_else(|| panic!("锚点 `{LOCAL_LEG_START}` 消失，本地令牌腿的判据已失去切点"));
+    let leg_end = body[leg_at..]
+        .find(LOCAL_LEG_END)
+        .unwrap_or_else(|| panic!("封顶锚点 `{LOCAL_LEG_END}` 消失，切片会漫进 helper 腿"))
+        + leg_at;
+    let leg = &body[leg_at..leg_end];
+    // 切点自检（与 helper 腿那条镜像）：切片里不得混进 helper 令牌腿，否则它替本地腿作证。
     assert!(
-        body.contains("pid_identity_verdict("),
+        !leg.contains("helper_identity_token(") && !leg.contains("managed_core_status()"),
+        "切片里混进了 helper 令牌腿 —— 封顶选晚了，下面的断言会被它喂饱"
+    );
+    assert!(
+        leg.contains("pid_identity_verdict("),
         "崩溃监测没有调用 pid_identity_verdict —— 身份复核没接线，pid 复用仍不可发现"
     );
     assert!(
-        body.contains("process_identity(p)"),
+        leg.contains("process_identity(p)"),
         "崩溃监测没有取当前令牌 —— 复核会拿基线跟自己比，恒 Match"
     );
     assert!(
-        body.contains("PidIdentity::Mismatch"),
-        "崩溃监测没有据不匹配改判退出 —— 复核结果被丢弃"
+        leg.contains("verdict == PidIdentity::Mismatch"),
+        "本地令牌算了不用 —— 复核结果没进控制流，这条腿恒判存活"
     );
+    assert!(
+        leg.contains("ChildObservation::Exited"),
+        "本地令牌不匹配时没有改判退出 —— pid 复用仍然不可发现"
+    );
+    assert!(
+        leg.contains("崩溃监测：pid={p} 的进程身份令牌已变"),
+        "改判退出时没有留下诊断 —— 真机上这条 warn 是「本地复用检出生效了」的唯一现场证据"
+    );
+    // helper 权威查询腿住在本地腿**之后**，故这两条仍按整个方法体断言。
     assert!(
         body.contains("helper.managed_core_status()"),
         "本地无法观察特权核时必须查询 helper 权威状态"
@@ -805,5 +844,231 @@ fn crash_monitor_actually_consults_the_pid_identity() {
     assert!(
         body.contains("ManagedCoreStatus::Stopped"),
         "helper 明确报告 stopped 时必须改判核退出"
+    );
+}
+
+/// D2：内核自证在本地观测取不到时改问 helper —— 但**只在 pid 对得上**时才采信它的 `image=`。
+///
+/// 三条断言各锁一格：
+/// - pid 相同 + 有 image → 采信（Windows 上这是自证从「未能进行」转为可判的唯一材料）；
+/// - pid 不同 → `None`：helper 管着另一个会话的核，拿它的映像对账是在回答另一个问题；
+/// - 无 image（旧 helper / FFI 读失败）→ `None`：读不到就说读不到，不冒充自证通过。
+#[test]
+fn attestation_only_trusts_the_helper_image_for_its_own_pid() {
+    use crate::runtime::helper::ManagedCoreStatus;
+
+    let running = |pid: u32, image: Option<&str>| ManagedCoreStatus::Running {
+        pid,
+        created: Some(133_600_000_000_000_000),
+        image: image.map(ToOwned::to_owned),
+    };
+    let core = r"C:\ProgramData\Polaris\core\sing-box.exe";
+
+    assert_eq!(
+        image_from_managed_status(&running(4242, Some(core)), 4242),
+        Some(std::path::PathBuf::from(core))
+    );
+    assert_eq!(
+        image_from_managed_status(&running(9001, Some(core)), 4242),
+        None,
+        "helper 手里是另一个会话的核 —— 它的映像不能拿来给本代对账"
+    );
+    assert_eq!(image_from_managed_status(&running(4242, None), 4242), None);
+    assert_eq!(
+        image_from_managed_status(&ManagedCoreStatus::Stopped, 4242),
+        None
+    );
+}
+
+/// **接线门**：自证腿必须真的去问 helper，**并且真的把答案用掉**。
+///
+/// # 为什么不能只断言「函数名出现过」
+///
+/// 只断言 `helper_reported_core_image(...)` 出现在方法体里，挡不住这一类变异：
+///
+/// ```ignore
+/// let running = running_exe_path(pid);
+/// let _ = helper_reported_core_image(helper.as_deref(), pid);   // 调用还在，结果丢了
+/// ```
+///
+/// 调用点一个字没少、门照绿，而 Windows 自证退回恒 `Unobservable` —— D2 整条失效。故断言必须
+/// 咬住**数据流**：helper 的答案要经 `.or_else` 接进 `running`，`running` 再喂给
+/// `attest_core_binary`。判据按**去空白**形态比对（`split_whitespace().collect()`），
+/// 这样 rustfmt 怎么折行都不影响，改的是接线才会红。
+///
+/// 变异锁：删掉 `.or_else(...)` → 第三条红；把 `.or_else` 的结果丢弃（上面那段）→ 第三条红；
+/// 把 `attest_core_binary` 的实参换成 `None` → 第四条红。
+#[test]
+fn attestation_consults_the_helper_reported_image() {
+    const HEAD: &str =
+        "    async fn attest_running_core_binary(&self, pid: u32, expected: &Path, my_gen: u64) {";
+    let src = module_code("runtime/proxy");
+    let at = src
+        .find(HEAD)
+        .unwrap_or_else(|| panic!("锚点 `{HEAD}` 消失，源码型守卫已失去判据"));
+    let cut = src[at..]
+        .find("\n#[cfg(test)]\n")
+        .map_or(src.len(), |i| at + i);
+    let prod = &src[..cut];
+    // 切点自检：判据区域若含本测试自身，断言会被自己的字面量喂饱（生产调用点删光也绿）。
+    assert!(
+        !prod.contains("fn attestation_consults_the_helper_reported_image"),
+        "判据区域包含本测试自身 —— 切点选错"
+    );
+    let body = method_body(prod, HEAD);
+    assert!(
+        body.contains("helper_reported_core_image(helper.as_deref(), pid)"),
+        "自证没有第二观测腿 —— Windows 上 running_exe_path 恒 None，自证恒「未能进行」"
+    );
+    assert!(
+        body.contains("running_exe_path(pid)"),
+        "自证不能只靠 helper：本地读得到时必须优先用本地事实（少一次 IPC，且不受 helper 影响）"
+    );
+    // 消费侧：两条观测腿必须汇进同一个 `running`，`running` 必须真的喂给判定函数。
+    let compact: String = body.split_whitespace().collect();
+    assert!(
+        compact.contains(
+            "letrunning=running_exe_path(pid).or_else(||helper_reported_core_image(helper.as_deref(),pid));"
+        ),
+        "helper 那条腿的结果没有接进 `running` —— 调用还在但答案被丢掉，Windows 自证仍恒「未能进行」"
+    );
+    assert!(
+        compact.contains("attest_core_binary(&expected,running.as_deref(),"),
+        "`running` 没喂给 attest_core_binary —— 观测到了却不参与判定，等于没观测"
+    );
+}
+
+/// **接线门**：崩溃监测必须把 helper 回传的 `created=` 拿去复核，**并且据结果改判**。
+///
+/// # 判据为什么要切到 helper 那一条 match 臂里
+///
+/// 只在整个方法体上断言「`helper_identity_token(created)` 出现过」，挡不住这一类变异：
+///
+/// ```ignore
+/// let verdict = pid_identity_verdict(/* …取材一字不改… */);
+/// let _ = verdict;                 // 判定还在算，分支删了
+/// ChildObservation::Alive          // 恒活
+/// ```
+///
+/// 取材腿一个字没少、门照绿，而 D3 的「helper 令牌复核」整条失效。更麻烦的是
+/// `verdict == PidIdentity::Mismatch` 在**本地令牌腿**里也有一份 —— 在整个方法体上断言它，
+/// 本地那条会替 helper 这条作证。故判据必须先切到 helper 臂内（切点自检见下），再断言消费侧。
+///
+/// 变异锁：把 helper 臂的 `if verdict == PidIdentity::Mismatch {…} else {…}` 换成恒
+/// `ChildObservation::Alive` → 后三条转红；把那段整体换回只比 `pid == p` → 前两条也转红。
+#[test]
+fn crash_monitor_consults_the_helper_reported_created_token() {
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    let src = module_code("runtime/proxy");
+    let at = src
+        .find(HEAD)
+        .unwrap_or_else(|| panic!("锚点 `{HEAD}` 消失，源码型守卫已失去判据"));
+    let cut = src[at..]
+        .find("\n#[cfg(test)]\n")
+        .map_or(src.len(), |i| at + i);
+    let prod = &src[..cut];
+    assert!(
+        !prod.contains("fn crash_monitor_consults_the_helper_reported_created_token"),
+        "判据区域包含本测试自身 —— 切点选错"
+    );
+    let body = method_body(prod, HEAD);
+    assert!(
+        body.contains("helper_identity_token(created)"),
+        "helper 回传的 created 没被取成令牌 —— 身份复核拿不到材料"
+    );
+    assert!(
+        body.contains("helper_identity"),
+        "没有单独的 helper 基线 —— 与本地令牌混用会在同一进程上判出假不匹配"
+    );
+    // 切到 helper 那一条 match 臂：从令牌取材处起，到下一条臂（app 记账 pid ≠ helper 受管 pid）为止。
+    const LEG_START: &str = "let token = helper_identity_token(created);";
+    const LEG_END: &str = "Ok(Ok(ManagedCoreStatus::Running { pid, .. })) => {";
+    let leg_at = body
+        .find(LEG_START)
+        .unwrap_or_else(|| panic!("锚点 `{LEG_START}` 消失，helper 腿的判据已失去切点"));
+    let leg_end = body[leg_at..]
+        .find(LEG_END)
+        .unwrap_or_else(|| panic!("封顶锚点 `{LEG_END}` 消失，切片会漫到臂外"))
+        + leg_at;
+    let leg = &body[leg_at..leg_end];
+    // 切点自检：本地令牌腿必须落在切片**之外**，否则它的 `PidIdentity::Mismatch` 会替 helper 腿作证。
+    assert!(
+        !leg.contains("process_identity(p)"),
+        "切片里混进了本地令牌腿 —— 切点选早了，下面的断言会被它喂饱"
+    );
+    assert!(
+        leg.contains("verdict == PidIdentity::Mismatch"),
+        "helper 令牌算了不用 —— 复核结果没进控制流，这条腿恒判存活"
+    );
+    assert!(
+        leg.contains("ChildObservation::Exited"),
+        "令牌不匹配时没有改判退出 —— pid 复用仍然不可发现"
+    );
+    assert!(
+        leg.contains("崩溃监测：helper 报告 pid={p} 的进程创建时间已变"),
+        "改判退出时没有留下诊断 —— 真机上这条 warn 是「复用检出生效了」的唯一现场证据"
+    );
+}
+
+/// **接线门**（B1）：崩溃监测的 helper 身份基线必须**起手就从 start 响应取初值**。
+///
+/// 不取的话，初值只能来自第一次 status —— 而那一格里有一个真窗口：核在首次 status 之前自然
+/// 死亡，期间另一方发 start 让 helper 换掉受管 child、关掉旧句柄 ⇒ 旧 PID 从那一刻起可被复用；
+/// 第一次 status 读到的已经是另一个进程的创建时间，登记成基线后每次复核都自己跟自己比，恒 `Match`。
+///
+/// 变异（把初值改回 `None`）→ 本条转红；`managed_start_identity` 的存/清由
+/// `runtime::helper::tests::start_identity_baseline_is_remembered_and_never_goes_stale` 覆盖。
+#[test]
+fn crash_monitor_seeds_the_helper_baseline_from_the_start_response() {
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    let src = module_code("runtime/proxy");
+    let at = src
+        .find(HEAD)
+        .unwrap_or_else(|| panic!("锚点 `{HEAD}` 消失，源码型守卫已失去判据"));
+    let cut = src[at..]
+        .find("\n#[cfg(test)]\n")
+        .map_or(src.len(), |i| at + i);
+    let prod = &src[..cut];
+    assert!(
+        !prod.contains("fn crash_monitor_seeds_the_helper_baseline_from_the_start_response"),
+        "判据区域包含本测试自身 —— 切点选错"
+    );
+    let compact: String = method_body(prod, HEAD).split_whitespace().collect();
+    assert!(
+        compact.contains("me.helper.managed_start_identity()"),
+        "helper 基线没取 start 的初值 —— D2/D3(4) 的「start 拿初值」按字面不成立"
+    );
+    assert!(
+        compact.contains("helper_identity_token(Some(created))"),
+        "start 的 created 没被折成与 status 同一种令牌 —— 两边格式不同则首次复核必判假不匹配"
+    );
+}
+
+/// D3：helper 回传的 created 变了 = 这个号码上换了进程；读不到则一律「不可观测」。
+///
+/// 判定复用 [`pid_identity_verdict`] 的三态口径，本条锁的是「created → 令牌」这一步不吃掉信息：
+/// 两个不同的 u64 必须给出两个不同的令牌，否则复用永远判不出来。
+#[test]
+fn helper_created_token_detects_reuse_and_degrades_honestly() {
+    let base = helper_identity_token(Some(133_600_000_000_000_000));
+    let same = helper_identity_token(Some(133_600_000_000_000_000));
+    let reused = helper_identity_token(Some(133_600_000_000_000_001));
+    assert_eq!(base, same);
+    assert_ne!(base, reused, "不同创建时间必须给出不同令牌");
+
+    assert_eq!(
+        pid_identity_verdict(base.as_deref(), reused.as_deref()),
+        PidIdentity::Mismatch,
+        "创建时间变了 ⇒ 判不匹配 ⇒ 崩溃监测据此判核已退出"
+    );
+    assert_eq!(
+        pid_identity_verdict(base.as_deref(), same.as_deref()),
+        PidIdentity::Match
+    );
+    // 旧 helper 不回传 → 令牌缺失 → Unobservable（**不是** Mismatch）：否则每 tick 都是一次假崩溃。
+    assert_eq!(helper_identity_token(None), None);
+    assert_eq!(
+        pid_identity_verdict(base.as_deref(), helper_identity_token(None).as_deref()),
+        PidIdentity::Unobservable
     );
 }

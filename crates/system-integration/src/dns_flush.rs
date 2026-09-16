@@ -70,41 +70,68 @@ pub struct HelperFlushResult {
     pub error: Option<String>,
 }
 
-/// helper flush 通道（mac root helper；缺省 None = 不可用走用户级降级）。
+/// helper flush 通道（mac root / win SYSTEM helper；缺省 None = 不可用走用户级降级）。
 pub type HelperFlushFn<'a> = Option<&'a dyn Fn() -> HelperFlushResult>;
+
+/// 特权 helper 腿（mac/win 共用）：成功 → `true`（调用方不再跑用户级命令）。
+///
+/// `ok` 且 `partial` → 只 warn **不降级**：该步用户级同样做不到，再跑一次只是噪音。
+/// 不可用（未装 / 旧 helper 回 `ERR unknown` / 通信失败）→ warn 一条含原因的降级说明再回 `false`。
+/// `fallback` 是降级目标的人话名字，进 warn 文案。
+fn helper_flush_succeeded(
+    helper_flush: HelperFlushFn,
+    fallback: &str,
+    on_warn: &mut dyn FnMut(&str),
+) -> bool {
+    let Some(helper) = helper_flush else {
+        return false;
+    };
+    let r = helper();
+    if r.ok {
+        if let Some(partial) = r.partial {
+            on_warn(&format!(
+                "已刷新系统 DNS 缓存（helper 特权，partial：{partial}）"
+            ));
+        }
+        return true;
+    }
+    on_warn(&format!(
+        "helper flush-dns 不可用（{}），降级{fallback}",
+        r.error.unwrap_or_else(|| "未知".into())
+    ));
+    false
+}
 
 /// 刷 OS DNS 缓存。best-effort、永不抛（失败仅 on_warn）。
 ///
 /// - mac：helper 可用且 ok → 用 helper；否则降级 `dscacheutil -flushcache`。
-/// - win：`ipconfig /flushdns`。
+/// - win：**helper ready 且** ok → 用 helper（SYSTEM 下 `ipconfig /flushdns`）；否则降级本地
+///   `ipconfig /flushdns`（Medium IL 多半 rc=1，best-effort）。
 /// - linux：`resolvectl flush-caches`。
 /// - 其它：no-op。
+///
+/// # `helper_ready`：Windows 腿的前置判据（spec §3.1 的「if helper ready」）
+///
+/// **只门住「装没装」这一格，不门住失败**：`false` ⇒ 这台机器结构上就没有特权通道（没装 helper /
+/// 装过又卸了），此时每次起停核都发一条「helper flush-dns 不可用」是纯噪音 —— 结论恒定、用户也
+/// 无从行动。`true` ⇒ 照常试、失败照常 warn 并降级，**真失败一格都不吞**（那条 warn 是有信息量的：
+/// 它说的是「你装了 helper，但它这次没干成」）。
+///
+/// mac 腿蓄意不走这个门：那边的降级目标 `dscacheutil` 在用户级**真的能刷**，多试一次的成本与
+/// Windows 腿（降级目标 Medium IL 下几乎恒 rc=1）不是一回事，改它属于另一个取舍，不在本条射程。
 ///
 /// 上游 `flushOsDnsCache`。
 pub fn flush_os_dns_cache<E: FlushExec>(
     platform: Platform,
     exec: &E,
     helper_flush: HelperFlushFn,
+    helper_ready: bool,
     on_warn: &mut dyn FnMut(&str),
 ) -> bool {
     match platform {
         Platform::Mac => {
-            if let Some(helper) = helper_flush {
-                let r = helper();
-                if r.ok {
-                    if r.partial.is_some() {
-                        on_warn(&format!(
-                            "已刷新系统 DNS 缓存（helper root，partial：{}）",
-                            r.partial.unwrap_or_default()
-                        ));
-                    }
-                    // ok（无论 partial）→ 不降级。
-                    return true;
-                }
-                on_warn(&format!(
-                    "helper flush-dns 不可用（{}），降级用户级 dscacheutil",
-                    r.error.unwrap_or_else(|| "未知".into())
-                ));
+            if helper_flush_succeeded(helper_flush, "用户级 dscacheutil", on_warn) {
+                return true;
             }
             // 用户级降级。
             exec.exec(&mac_user_flush_command(), EXEC_TIMEOUT)
@@ -114,13 +141,26 @@ pub fn flush_os_dns_cache<E: FlushExec>(
                     false
                 })
         }
-        Platform::Win => exec
-            .exec(&windows_flush_command(), EXEC_TIMEOUT)
-            .map(|()| true)
-            .unwrap_or_else(|e| {
-                on_warn(&format!("刷新系统 DNS 缓存失败（忽略）: {e}"));
-                false
-            }),
+        // D4：Windows 与 mac 同形。app 是 Medium IL，`ipconfig /flushdns` 在该权限下 rc=1 ——
+        // 这条腿此前**恒失败**，停核后 FakeIP（198.18.x）留在系统缓存里继续命中。装了 helper 就走
+        // SYSTEM 那条；旧 helper 回 `ERR unknown` / 通信失败 → 仍跑本地 ipconfig（best-effort，
+        // 不比改动前差），降级判定就地完成，不外溢给调用方。
+        //
+        // `helper_ready` 是**前置**判据（spec §3.1「if helper ready」）：没装 helper 的机器直接走
+        // 降级腿，一条 warn 都不发 —— 见本函数头注「只门住装没装，不门住失败」。
+        Platform::Win => {
+            if helper_ready
+                && helper_flush_succeeded(helper_flush, "Medium IL ipconfig（多半无权限）", on_warn)
+            {
+                return true;
+            }
+            exec.exec(&windows_flush_command(), EXEC_TIMEOUT)
+                .map(|()| true)
+                .unwrap_or_else(|e| {
+                    on_warn(&format!("刷新系统 DNS 缓存失败（忽略）: {e}"));
+                    false
+                })
+        }
         Platform::Linux => exec
             .exec(&linux_flush_command(), EXEC_TIMEOUT)
             .map(|()| true)

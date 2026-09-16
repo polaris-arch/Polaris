@@ -16,7 +16,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(any(test, target_os = "macos"))]
 use polaris_helper_client::ClientError;
@@ -317,9 +317,20 @@ pub trait HelperStopOps: Send + Sync {
 }
 
 /// helper 对其受管 sing-box 的权威运行视图。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `created` / `image` 是 Windows helper 从**它持有的进程句柄**读到的两个事实（D2/D3），
+/// 其它平台恒 `None`：app 是 Medium IL，对 SYSTEM child 的 `OpenProcess` 会被拒，这两件事只有
+/// 权限边界另一侧的 helper 答得了。旧 helper 不回传 ⇒ 也是 `None` ⇒ 消费方按「不可观测」处理，
+/// 绝不据此报崩溃或宣称自证通过。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ManagedCoreStatus {
-    Running { pid: u32 },
+    Running {
+        pid: u32,
+        /// 受管核的进程创建时间令牌（100ns tick）；跨 tick 变化 = 该 pid 被复用。
+        created: Option<u64>,
+        /// 受管核实跑二进制全路径。
+        image: Option<String>,
+    },
     Stopped,
 }
 
@@ -398,6 +409,9 @@ pub struct HelperRuntime {
     /// 装/载探测的系统面。生产恒 [`StdSysOps`]；**单测必须注入替身**，理由见
     /// `HelperRuntime::never_installed_for_tests`。
     sys_ops: SysOpsFactory,
+    /// **D2/D3(4) 的「start 拿初值」**：最近一次 `start` 响应回传的受管核身份 `(pid, created)`。
+    /// 旧 helper / 非 Windows 不回传 ⇒ `None`。读写见 [`Self::managed_start_identity`]。
+    start_identity: Mutex<Option<(u32, u64)>>,
     /// 与 `sys_ops` 同一隔离边界：测试 fixture 不仅要把“已安装”探测钉成 false，直接调用
     /// `start_core` 的测试也必须被结构性禁止连接真实 socket。
     #[cfg(test)]
@@ -414,6 +428,7 @@ impl HelperRuntime {
             dir,
             platform,
             sys_ops: Arc::new(|| Box::new(StdSysOps)),
+            start_identity: Mutex::new(None),
             #[cfg(test)]
             never_connect: false,
             #[cfg(test)]
@@ -460,6 +475,7 @@ impl HelperRuntime {
             dir,
             platform: Platform::current(),
             sys_ops: Arc::new(|| Box::new(NeverInstalled)),
+            start_identity: Mutex::new(None),
             never_connect: true,
             status_override: None,
         }
@@ -767,7 +783,11 @@ impl HelperRuntime {
             .send_with_timeout(&req, HELPER_START_TIMEOUT)
             .map_err(|e| format!("helper 起核通信失败：{e}"))?;
         match resp {
-            Response::Ok(ResponseKind::Start(Start::StartedTimed { pid, timing })) => {
+            Response::Ok(ResponseKind::Start(Start::StartedTimed {
+                pid,
+                timing,
+                created,
+            })) => {
                 log::info!(
                     "helper core start timing: forwarding={}ms process={}ms job={}ms log_handoff={}ms total={}ms",
                     timing.forwarding_ms,
@@ -776,14 +796,69 @@ impl HelperRuntime {
                     timing.log_handoff_ms,
                     timing.total_ms
                 );
+                // D2/D3(4) 的「start 拿初值」：Windows 新 helper 会带回受管核的进程创建时间，
+                // 存成崩溃监测的**初始**身份基线（消费点见 `proxy::recovery::spawn_crash_monitor`）。
+                self.remember_start_identity(pid, created);
                 Ok(pid)
             }
             Response::Ok(ResponseKind::Start(Start::Started { pid } | Start::Already { pid })) => {
+                // 无 timing 形态 ⇒ 没有 created 可存。**必须显式落 None**：留着上一次 start 的值，
+                // 万一新核拿到同一个 pid，基线就会拿旧进程的创建时间去比新进程，判出一次假复用。
+                self.remember_start_identity(pid, None);
                 Ok(pid)
             }
             Response::Ok(other) => Err(format!("helper 起核返回非预期响应：{other:?}")),
             Response::Err(e) => Err(format!("helper 起核失败：{e}")),
         }
+    }
+
+    /// 记下 `start` 回传的受管核身份（D2/D3(4) 的「start 拿初值」）。
+    ///
+    /// 顺带落一条诊断：真机上「有没有拿到身份令牌」是判断 pid 复用检出是否生效的第一现场，
+    /// 缺了它只能靠猜。
+    fn remember_start_identity(&self, pid: u32, created: Option<u64>) {
+        match created {
+            Some(created) => log::info!("helper 受管核身份令牌：pid={pid} created={created}"),
+            None => {
+                log::debug!("helper 未回传受管核身份令牌（旧 helper 或非 Windows）：pid={pid}")
+            }
+        }
+        if let Ok(mut slot) = self.start_identity.lock() {
+            *slot = created.map(|ticks| (pid, ticks));
+        }
+    }
+
+    /// 特权 helper 通道**结构上是否存在**（app 侧 token 在位）。
+    ///
+    /// 用于 `dns_flush::flush_os_dns_cache` 的 Windows 腿前置判据（spec §3.1「if helper ready」）：
+    /// 没装 helper 的机器每次起停核都吃一条「helper flush-dns 不可用」纯属噪音。
+    ///
+    /// # 为什么不是 `status().ready`
+    ///
+    /// [`Self::status`] 走 `status_with_recovery`——它在 `needs_repair` 时会**尝试拉起停着的服务**。
+    /// 那是一个真副作用，而刷 DNS 缓存这条腿的契约是 best-effort、永不阻塞、不改系统状态；为了少打
+    /// 一行日志去触发一次服务启动，方向是反的。
+    ///
+    /// # 这条判据的射程（如实登记）
+    ///
+    /// token 由 `HelperManager::prepare_token` 在**安装时**写、`clear_token` 在卸载时删，故它回答的
+    /// 是「这台机器上装过且没卸」。它**不**回答「helper 此刻跑不跑得起来」——那一格蓄意留给真正的
+    /// 尝试：token 在而 helper 坏了，照常试、照常报，「真失败」不被这个门吞掉。
+    pub(crate) fn client_token_present(&self) -> bool {
+        !read_token(&self.token_path()).is_empty()
+    }
+
+    /// 崩溃监测的**初始**身份基线：最近一次 `start` 回传的 `(pid, created)`；没拿到 ⇒ `None`。
+    ///
+    /// # 为什么基线不能等第一次 `status` 再取（这条方法存在的全部理由）
+    ///
+    /// 稳态下两者同源同值，差别只在一格：核若在**首次 status 之前**自然死亡，而这期间另一方
+    /// 发了一次 `start` —— helper 用新 child 替换受管 child、**关掉旧句柄** —— 那个 PID 从这一刻
+    /// 起就重新可被系统复用（句柄没关时内核不复用 PID，这正是 D3 的立足点）。此时第一次 status
+    /// 读到的创建时间已经属于**另一个进程**，把它登记成基线，后续每次复核都自己跟自己比：
+    /// 恒 `Match`，复用永远判不出来。start 的值是「这个 pid 刚起来那一刻」的事实，不随后续换手而变。
+    pub(crate) fn managed_start_identity(&self) -> Option<(u32, u64)> {
+        self.start_identity.lock().ok().and_then(|slot| *slot)
     }
 
     /// 查询 helper 自己受管的核状态。
@@ -1059,9 +1134,15 @@ fn managed_core_status_with_client(client: &HelperClient) -> Result<ManagedCoreS
         .send(&Request::Status)
         .map_err(|error| format!("helper 受管核状态通信失败：{error}"))?;
     match response {
-        Response::Ok(ResponseKind::Status(CoreStatus::Running { pid })) => {
-            Ok(ManagedCoreStatus::Running { pid })
-        }
+        Response::Ok(ResponseKind::Status(CoreStatus::Running {
+            pid,
+            created,
+            image,
+        })) => Ok(ManagedCoreStatus::Running {
+            pid,
+            created,
+            image,
+        }),
         Response::Ok(ResponseKind::Status(CoreStatus::Stopped)) => Ok(ManagedCoreStatus::Stopped),
         Response::Ok(other) => Err(format!("helper 受管核状态返回非预期响应：{other:?}")),
         Response::Err(error) => Err(format!("helper 受管核状态查询失败：{error}")),

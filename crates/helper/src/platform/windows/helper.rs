@@ -148,9 +148,19 @@ where
                 // 锁里清账，再诚实回 stopped。探活的「未知」仍由 ProcOps 按宁漏勿误折为 true。
                 let mut state = self.child_mu.lock().unwrap_or_else(PoisonError::into_inner);
                 match self.live_managed_pid(&mut state) {
-                    Some(pid) => HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
-                        polaris_helper_proto::Status::Running { pid },
-                    ))),
+                    Some(pid) => {
+                        // D2/D3：把 helper 手里那个句柄读到的两个事实一并回传。app 是 Medium IL，
+                        // 对 SYSTEM child 的 OpenProcess 会被拒 ⇒ 它自己既读不到创建时间（pid 复用
+                        // 不可发现），也读不到实跑映像（内核自证恒「未能进行」）。
+                        let identity = self.proc.managed_identity(pid);
+                        HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
+                            polaris_helper_proto::Status::Running {
+                                pid,
+                                created: identity.created,
+                                image: identity.image,
+                            },
+                        )))
+                    }
                     None => HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
                         polaris_helper_proto::Status::Stopped,
                     ))),
@@ -227,6 +237,9 @@ where
             Request::RouteAdd(rp) => self.handle_route(&rp.iface, &rp.cidrs, false),
             Request::RouteDel(rp) => self.handle_route(&rp.iface, &rp.cidrs, true),
             Request::IfaceMetric { iface, metric } => self.handle_iface_metric(&iface, metric),
+            // D4：Windows 也刷 DNS 缓存。此前并在下方 `ERR unknown` 分支里 —— app 侧 Medium IL 跑
+            // ipconfig 该机 rc=1（需提权），停核后 FakeIP 记录留在系统缓存里继续命中。
+            Request::FlushDns => self.handle_flush_dns(),
             // 以下命令 Windows helper 不支持（mac/linux 专属）—— Go default 分支回 ERR unknown。
             Request::LinuxStart(_)
             | Request::LinuxDnsSet(_)
@@ -235,8 +248,7 @@ where
             | Request::MacProxyCompareTransaction { .. }
             | Request::MacProxyCompareCapability
             | Request::InstallCore(_)
-            | Request::DefaultRestore { .. }
-            | Request::FlushDns => HandleOutcome::Respond(Response::Err(
+            | Request::DefaultRestore { .. } => HandleOutcome::Respond(Response::Err(
                 polaris_helper_proto::Error::new(polaris_helper_proto::ErrorCode::Unknown),
             )),
         }
@@ -250,7 +262,7 @@ where
     /// child_mu（`is_current`/`on_parent_dead`），持锁调用即自死锁。
     fn handle_start(&self, p: &polaris_helper_proto::StartParams) -> HandleOutcome {
         // ===== 全程持锁的临界区：check → start → record pid =====
-        let (started_pid, start_timing) = {
+        let (started_pid, start_timing, started_created) = {
             let mut state = self.child_mu.lock().unwrap_or_else(PoisonError::into_inner);
             // 先复核旧记账，避免核自然退出后下一次 start 仍把死 pid 当作 already。探活与清账在同一
             // 临界区内，故并发 start 不会越过此判据双起核。
@@ -294,7 +306,7 @@ where
                 Ok(started) => {
                     // Go helper.go:374-385: child = c（收割/Wait goroutine 由生产侧 ProcOps 承载）。
                     state.pid = Some(started.pid);
-                    (started.pid, started.timing)
+                    (started.pid, started.timing, started.created)
                 }
                 Err(e) => {
                     return HandleOutcome::Respond(Response::Err(
@@ -342,8 +354,30 @@ where
             polaris_helper_proto::Start::StartedTimed {
                 pid: started_pid,
                 timing: start_timing,
+                // D3：起核当时就把身份基线交给 app（**只发 created，绝不发 image**——
+                // image 的 hex 路径不是 u64，会让旧 app 的 timing 解析整段返回 None）。
+                created: started_created,
             },
         )))
+    }
+
+    /// `flush-dns` 分支（D4，Windows 新增；mac 的同名命令在 `platform/macos/flush_dns.rs`）。
+    ///
+    /// DNS 缓存是**机器级单缓存**，SYSTEM 下刷一次即全局生效（helper 与 app 不必各刷一次）。
+    /// 失败时把 helper 侧自捕的 stdout+stderr 带进 `ERR ipconfig <detail>` —— 报错路径日志为空
+    /// 等于这条腿没法诊断，而 ipconfig 的错误文字恰恰只在 stdout。
+    fn handle_flush_dns(&self) -> HandleOutcome {
+        match self.proc.flush_dns() {
+            Ok(()) => HandleOutcome::Respond(Response::Ok(ResponseKind::FlushDns(
+                polaris_helper_proto::FlushDns::Flushed,
+            ))),
+            Err(detail) => {
+                HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+                    polaris_helper_proto::ErrorCode::Ipconfig,
+                    detail,
+                )))
+            }
+        }
     }
 
     /// 返回仍存活的受管核 pid；确定已死时原子清除陈旧记账。

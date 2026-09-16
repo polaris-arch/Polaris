@@ -506,3 +506,51 @@ fn the_noise_filter_does_not_reach_default_routes() {
         "两个族的默认路由都该原样下发：{wire}"
     );
 }
+
+/// 🔴 **生产探测器必须经 `platform_contracts` 装配** —— D1 的接线门（源码级）。
+///
+/// # 为什么需要一道源码门（函数被测 ≠ 生产在用它）
+///
+/// 注入本身有单测（`polaris_system_integration` 的
+/// `injecting_the_netinfo_source_replaces_all_six_external_commands`），但那证明的是
+/// 「注入之后 probe 不起进程」。生产这条腿只要写成
+/// `polaris_system_integration::production_foreign_tunnel_probe()`，就会拿到一个**没注入**的
+/// probe —— 它在 Windows 上退回六条串行外部命令（正是 D1 要修的形态），退回得毫无声响：
+/// 编译过、单测全绿、日志里也看不出差别，只有真机在起核峰值窗口里超时。
+///
+/// Windows 那半的注入代码是 `#[cfg(windows)]`，本机 Linux **编不到**，故这道门读的是源码文本
+/// 而不是行为。取材面用 `module_source`（`tunnel_conflict.rs` + `tunnel_conflict/**`，排除
+/// `tests/`）：调用点日后挪进子模块时门跟着走，不会静默失去覆盖。
+///
+/// 三条断言互为对照：① 正面（经 contracts 装配）；② 否定（没有绕过它的直调）；
+/// ③ contracts 那侧真的注了（否则 ① 只是换了个名字调同一个东西）。
+#[test]
+fn the_tunnel_conflict_probe_is_assembled_through_platform_contracts() {
+    use crate::test_support::{crate_code, expect_marker, module_code};
+
+    let leg = expect_marker(
+        module_code("runtime/proxy/tunnel_conflict"),
+        "runtime/proxy/tunnel_conflict",
+        "pub(super) async fn probe_foreign_tunnel_conflicts",
+    );
+    assert!(
+        leg.contains("platform_contracts::production_foreign_tunnel_probe()"),
+        "起核后台探测腿没经 `platform_contracts` 装配探测器 —— Windows 的进程内取材源\
+         （IP Helper / RAS API）在那里注入，绕过去就是静默退回六条串行外部命令"
+    );
+    assert!(
+        !leg.contains("polaris_system_integration::production_foreign_tunnel_probe"),
+        "探测腿里还留着对库装配函数的直调 —— 那条路径拿到的 probe 没有注入取材源"
+    );
+
+    let contracts = expect_marker(
+        crate_code("runtime/proxy/platform_contracts.rs"),
+        "runtime/proxy/platform_contracts.rs",
+        "pub(super) fn production_foreign_tunnel_probe(",
+    );
+    assert!(
+        contracts.contains(".with_windows_netinfo("),
+        "`platform_contracts` 的装配函数里没有 `with_windows_netinfo` —— \
+         上面两条断言只证明了「经过它」，没证明「它真的注入了」"
+    );
+}

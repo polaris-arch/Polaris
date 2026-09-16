@@ -6,6 +6,9 @@ mod fixture_harness;
 /// 「外来隧道抢默认路由」那一类的门：回归门（默认路由永不进 `foreign`）+ 正向/负向对照。
 mod default_route_gate;
 
+/// 进程内取材腿（`netinfo`）与文本解析腿的对照 + 注入接线门（D1）。
+mod netinfo_parity;
+
 /// 2026-09-08 本机 `ip -o route show` 与 `ip -o -6 route show` 的**真实**输出片段。
 ///
 /// 逐字保留（含行尾空格与多路径行里的字面量 `\` + 制表符）——

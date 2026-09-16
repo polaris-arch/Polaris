@@ -168,8 +168,14 @@ use polaris_config_engine::user_config::cidr::cidr_contains;
 use polaris_helper_proto::Platform;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
+/// Windows 进程内取材面（IP Helper / RAS API 的注入缝 + 纯组装）—— 替换六个串行外部进程。
+pub mod netinfo;
+
+use netinfo::WindowsNetInfoSource;
 
 /// 一条路由：目的前缀 + 出接口。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1669,6 +1675,13 @@ pub struct ForeignTunnelProbeImpl<R: CommandRunner> {
     route_exe: String,
     /// Windows `powershell.exe` 绝对路径（同上；与 `route_ops` 同形）。
     powershell_exe: String,
+    /// Windows 进程内取材源（[`netinfo`]）。`Some` ⇒ Windows 腿走三次系统调用，一个进程都不起。
+    ///
+    /// 做成 `Option` 而不是把命令腿直接删掉：注入发生在 `src-tauri`（FFI 住 `polaris-helper`，
+    /// 本 crate 不能反向依赖它，见 [`netinfo`] 头注），而本 crate 自己的调用方 / 单测仍要能构造
+    /// 一个不带注入的 probe —— 那时它的行为**逐字**就是本批之前的现状（六条命令），
+    /// 于是「注入没接上」的失败形态是「退回旧腿」，不是「Windows 腿整条消失」。
+    win_netinfo: Option<Arc<dyn WindowsNetInfoSource>>,
 }
 
 impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
@@ -1686,7 +1699,17 @@ impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
             powershell_exe: crate::exec::system32_from_env(
                 "WindowsPowerShell\\v1.0\\powershell.exe",
             ),
+            win_netinfo: None,
         }
+    }
+
+    /// 注入 Windows 进程内取材源（见 [`netinfo::WindowsNetInfoSource`]）。
+    ///
+    /// 注入之后 Windows 腿**一个外部进程都不起**；其余平台不受影响（`Platform` 分派在前）。
+    #[must_use]
+    pub fn with_windows_netinfo(mut self, source: Arc<dyn WindowsNetInfoSource>) -> Self {
+        self.win_netinfo = Some(source);
+        self
     }
 
     fn run(&self, program: &str, args: &[&str]) -> Result<String, SystemIntegrationError> {
@@ -1783,6 +1806,11 @@ impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
         &self,
         own_interfaces: &[String],
     ) -> Result<TunnelProbeOutcome, SystemIntegrationError> {
+        // 注入了进程内取材源 ⇒ 走三次系统调用，一个进程都不起（D1：六个串行进程在起核峰值
+        // 窗口里跑不完，探测超时 ⇒ 冲突提示整条拿不到）。没注入 ⇒ 逐字维持命令腿。
+        if let Some(source) = &self.win_netinfo {
+            return Self::probe_windows_netinfo(source.as_ref(), own_interfaces);
+        }
         let route_v4 = self.run(&self.route_exe, &["print", "-4"])?;
         let route_v6 = self.run(&self.route_exe, &["print", "-6"])?;
         let addresses = self.run_powershell(PS_GET_NETIPADDRESS)?;
@@ -1800,6 +1828,51 @@ impl<R: CommandRunner> ForeignTunnelProbeImpl<R> {
         )
         .map(TunnelProbeOutcome::Probed)
         .map_err(|e| SystemIntegrationError::route(e.to_string()))
+    }
+
+    /// Windows 腿的进程内形态：三次只读枚举 → [`netinfo::assemble_windows_netinfo_probe`]。
+    ///
+    /// 三腿的失败**不是一刀切**（分界表见 [`netinfo`] 头注）：路由表 / 适配器失败 ⇒ 整次
+    /// `Err`（拿不到事实，绝不折成「没有冲突」）；**RAS 失败 ⇒ 该腿空 + warn** —— 文本腿正是
+    /// 因为把这条也算失败，在没有 `VpnClient` 模块的 SKU 上整次探测从「探得动」退化成 `Err`。
+    fn probe_windows_netinfo(
+        source: &dyn WindowsNetInfoSource,
+        own_interfaces: &[String],
+    ) -> Result<TunnelProbeOutcome, SystemIntegrationError> {
+        let routes = source.routes().map_err(SystemIntegrationError::route)?;
+        let adapters = source.adapters().map_err(SystemIntegrationError::route)?;
+        let ras = match source.ras_connections() {
+            Ok(list) => list,
+            Err(error) => {
+                // 自曝：这一腿缺席时，RAS 族（L2TP / IKEv2 / SSTP / PPTP）的隧道会整族看不见。
+                // 静默降级 = 一句自信的「无冲突」，故必须出声。
+                log::warn!(
+                    "RAS 连接枚举失败 → 本次探测看不见 RAS 族隧道（L2TP / IKEv2 / SSTP / PPTP），\
+                     其余两腿照常：{error}"
+                );
+                Vec::new()
+            }
+        };
+        log::debug!(
+            "进程内隧道探测取材：{} 条路由 / {} 张适配器 / {} 条活动 RAS 连接（其中 {} 条 all-user 作用域）",
+            routes.len(),
+            adapters.len(),
+            ras.len(),
+            ras.iter().filter(|c| c.all_users).count()
+        );
+        // 自曝：三条 API 靠**别名逐字相等**join，两侧若不是同一个命名空间，join 全落空 ——
+        // 而落空的症状是 `foreign` 为空、界面一句自信的「无冲突」，不是报错。这条 warn 是它
+        // 唯一会留下的痕迹（判据见 `netinfo::routes_with_unknown_interface` 的头注）。
+        let unknown = netinfo::routes_with_unknown_interface(&routes, &adapters, &ras);
+        if !routes.is_empty() && unknown == routes.len() {
+            log::warn!(
+                "路由表 {} 条，接口别名**没有一条**能在适配器 / RAS 枚举里对上 —— 两侧别名很可能不是同一个命名空间，本次隧道判定会整体落空（症状只会是一句「无冲突」）",
+                routes.len()
+            );
+        }
+        netinfo::assemble_windows_netinfo_probe(&routes, &adapters, &ras, own_interfaces)
+            .map(TunnelProbeOutcome::Probed)
+            .map_err(|e| SystemIntegrationError::route(e.to_string()))
     }
 
     fn run_powershell(&self, script: &str) -> Result<String, SystemIntegrationError> {

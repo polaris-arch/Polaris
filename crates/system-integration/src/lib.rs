@@ -170,15 +170,18 @@ pub fn production_dns_controller(marker_path: impl Into<String>) -> ProdDnsContr
 
 /// 刷 OS DNS 缓存（生产入口）：本机平台 + 真实执行器，best-effort 永不抛。
 ///
-/// `helper_flush` 为 mac root helper 通道（`None` = 不可用 → 走用户级 `dscacheutil` 降级）。
+/// `helper_flush` 为特权 helper 通道（mac root / win SYSTEM；`None` 或返回 `ok:false` → 走用户级降级）。
+/// `helper_ready` 见 [`dns_flush::flush_os_dns_cache`] 的同名参数（Windows 腿的前置判据）。
 pub fn production_flush_os_dns_cache(
     helper_flush: dns_flush::HelperFlushFn,
+    helper_ready: bool,
     on_warn: &mut dyn FnMut(&str),
 ) -> bool {
     dns_flush::flush_os_dns_cache(
         polaris_helper_proto::Platform::current(),
         &StdCommandRunner,
         helper_flush,
+        helper_ready,
         on_warn,
     )
 }

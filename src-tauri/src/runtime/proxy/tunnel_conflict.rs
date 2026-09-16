@@ -303,7 +303,10 @@ impl ProxyRuntime {
         own_interfaces: Vec<String>,
     ) {
         let probe = tokio::task::spawn_blocking(move || {
-            polaris_system_integration::production_foreign_tunnel_probe()
+            // 经 `platform_contracts` 装配，**不**直接调库的 `production_foreign_tunnel_probe`：
+            // Windows 腿的进程内取材源（IP Helper / RAS API）在那里注入，直调会静默退回
+            // 六条串行外部命令 —— 那正是起核峰值窗口里跑不完、探测超时的形态。
+            super::platform_contracts::production_foreign_tunnel_probe()
                 .probe_foreign_tunnels(&own_interfaces)
         })
         .await;

@@ -66,10 +66,17 @@ fn mac_proxy_transaction_response_roundtrips() {
 fn parse_status_running_stopped() {
     // helper.go:427-430
     let r = Response::parse("OK running 12345");
-    let Response::Ok(ResponseKind::Status(Status::Running { pid })) = r else {
+    let Response::Ok(ResponseKind::Status(Status::Running {
+        pid,
+        created,
+        image,
+    })) = r
+    else {
         panic!("{r:?}");
     };
     assert_eq!(pid, 12345);
+    // 旧 helper 的 wire（无身份 token）→ 两个可选字段都是 None，不伪造。
+    assert_eq!((created, image), (None, None));
 
     let r = Response::parse("OK stopped");
     let Response::Ok(ResponseKind::Status(Status::Stopped)) = r else {
@@ -133,11 +140,17 @@ fn timed_start_is_additive_and_incomplete_metrics_fall_back() {
     let line =
         "OK started 42 forwarding_ms=3 process_ms=1200 job_ms=2 log_handoff_ms=1 total_ms=1206";
     let r = Response::parse(line);
-    let Response::Ok(ResponseKind::Start(Start::StartedTimed { pid, timing })) = r else {
+    let Response::Ok(ResponseKind::Start(Start::StartedTimed {
+        pid,
+        timing,
+        created,
+    })) = r
+    else {
         panic!("{r:?}");
     };
     assert_eq!(pid, 42);
     assert_eq!(timing.process_ms, 1200);
+    assert_eq!(created, None);
     assert_eq!(r.to_wire_line(), line);
 
     // 旧客户端只取 `started` 后首个 pid，尾 token 不改变既有 wire 前缀；新客户端遇到残缺字段
@@ -242,6 +255,104 @@ fn parse_unknown_ok_token_kept_as_raw() {
     assert_eq!(rest, "payload here");
 }
 
+/// status 的两个身份 token（D2/D3）：都可选、hex 路径含空格仍完整回来、读不到就是 `None`。
+#[test]
+fn status_identity_tokens_are_optional_and_survive_paths_with_spaces() {
+    let image = r"C:\Program Files\Polaris\core\sing-box.exe";
+    let wire = Response::Ok(ResponseKind::Status(Status::Running {
+        pid: 4242,
+        created: Some(133_600_000_000_000_000),
+        image: Some(image.to_owned()),
+    }))
+    .to_wire_line();
+    // 逐字钉住 wire 契约：created 十进制在前、image 走 hex（空格不进 wire）。
+    assert!(
+        wire.starts_with("OK running 4242 created=133600000000000000 image="),
+        "{wire}"
+    );
+    // 路径里的空格若泄进 wire，切 token 就会多出字段 —— 恒为 `OK running <pid> created= image=` 五个。
+    assert_eq!(wire.split_whitespace().count(), 5, "{wire}");
+
+    let Response::Ok(ResponseKind::Status(Status::Running {
+        pid,
+        created,
+        image: parsed_image,
+    })) = Response::parse(&wire)
+    else {
+        panic!("{wire}");
+    };
+    assert_eq!(pid, 4242);
+    assert_eq!(created, Some(133_600_000_000_000_000));
+    assert_eq!(parsed_image.as_deref(), Some(image));
+
+    // 旧 helper 的 wire：一个 token 都没有 → 两个字段都 None（不误判、不伪造）。
+    assert_eq!(
+        Response::parse("OK running 7"),
+        Response::Ok(ResponseKind::Status(Status::Running {
+            pid: 7,
+            created: None,
+            image: None,
+        }))
+    );
+
+    // 读不到 ≠ 观测到：非法 hex / 非十进制 created 一律 None，绝不给下游一个编造的值。
+    assert_eq!(
+        Response::parse("OK running 7 created=abc image=zz"),
+        Response::Ok(ResponseKind::Status(Status::Running {
+            pid: 7,
+            created: None,
+            image: None,
+        }))
+    );
+}
+
+/// **必改4 钉死（旧 app × 新 helper）**：start tail 里的 `created=` 是十进制 u64 ⇒ 旧 app 的
+/// [`parse_start_timing`] 仍解析出完整 timing。
+///
+/// 反向对照在同一函数里：把同一位置换成 image 那种含 a-f 的 hex value，旧 app **丢掉全部 timing**
+/// —— 这正是「image 绝不进 start 响应」的原因，不是风格偏好。
+#[test]
+fn start_tail_created_is_decimal_so_old_apps_keep_timing() {
+    let timing = parse_start_timing(
+        "forwarding_ms=1 process_ms=1 job_ms=1 log_handoff_ms=1 total_ms=1 created=1700000000",
+    );
+    assert!(
+        timing.is_some(),
+        "十进制 created 不得破坏旧 app 的 timing 解析"
+    );
+
+    // 反向对照：非 u64 的 value（hex 路径）让整段 timing 归 None。
+    assert!(
+        parse_start_timing(
+            "forwarding_ms=1 process_ms=1 job_ms=1 log_handoff_ms=1 total_ms=1 image=433a5c61"
+        )
+        .is_none(),
+        "非 u64 token 会让旧 app 丢 timing —— 该形态必须永不出现在 start 响应里"
+    );
+}
+
+/// **必改4 钉死（wire 构造侧）**：start 响应**永不**含 `image=` token。
+#[test]
+fn start_wire_never_carries_the_image_token() {
+    let wire = Response::Ok(ResponseKind::Start(Start::StartedTimed {
+        pid: 9,
+        timing: StartTiming {
+            forwarding_ms: 1,
+            process_ms: 2,
+            job_ms: 3,
+            log_handoff_ms: 4,
+            total_ms: 10,
+        },
+        created: Some(133_600_000_000_000_000),
+    }))
+    .to_wire_line();
+    assert!(!wire.contains("image="), "{wire}");
+    assert!(wire.ends_with(" created=133600000000000000"), "{wire}");
+    // 反向对照：整段 tail 的每个 value 都是 u64 ⇒ 旧 app 的 timing 解析仍成立。
+    let (_, tail) = crate::response::parse_first_token(wire.trim_start_matches("OK started "));
+    assert!(parse_start_timing(tail).is_some(), "{wire}");
+}
+
 #[test]
 fn parse_empty_line_no_panic() {
     // 畸形输入兜底：绝不 panic（freeport 任何持 token 用户可触发）
@@ -270,7 +381,11 @@ fn to_wire_line_matches_go_source_literals() {
             "OK 9",
         ),
         (
-            Response::Ok(ResponseKind::Status(Status::Running { pid: 123 })),
+            Response::Ok(ResponseKind::Status(Status::Running {
+                pid: 123,
+                created: None,
+                image: None,
+            })),
             "OK running 123",
         ),
         (
@@ -299,6 +414,7 @@ fn to_wire_line_matches_go_source_literals() {
                     log_handoff_ms: 4,
                     total_ms: 10,
                 },
+                created: None,
             })),
             "OK started 9 forwarding_ms=1 process_ms=2 job_ms=3 log_handoff_ms=4 total_ms=10",
         ),
@@ -360,7 +476,23 @@ fn to_wire_line_round_trips_through_parse() {
             proto_version: 3,
             build_identity: None,
         })),
-        Response::Ok(ResponseKind::Status(Status::Running { pid: 999 })),
+        Response::Ok(ResponseKind::Status(Status::Running {
+            pid: 999,
+            created: None,
+            image: None,
+        })),
+        // 新 helper 的完整身份 token 形态（Windows）：hex 路径含空格也不破坏切 token。
+        Response::Ok(ResponseKind::Status(Status::Running {
+            pid: 1000,
+            created: Some(133_600_000_000_000_000),
+            image: Some(r"C:\Program Files\Polaris\sing-box.exe".to_owned()),
+        })),
+        // 只有 created（image 读失败）也须 round-trip —— 两个 token 各自可选。
+        Response::Ok(ResponseKind::Status(Status::Running {
+            pid: 1001,
+            created: Some(1),
+            image: None,
+        })),
         Response::Ok(ResponseKind::Status(Status::Stopped)),
         Response::Ok(ResponseKind::Stop(Stop::Stopped { pid: 1 })),
         Response::Ok(ResponseKind::Stop(Stop::NotRunning)),
@@ -378,6 +510,18 @@ fn to_wire_line_round_trips_through_parse() {
                 log_handoff_ms: 4,
                 total_ms: 10,
             },
+            created: None,
+        })),
+        Response::Ok(ResponseKind::Start(Start::StartedTimed {
+            pid: 5,
+            timing: StartTiming {
+                forwarding_ms: 1,
+                process_ms: 2,
+                job_ms: 3,
+                log_handoff_ms: 4,
+                total_ms: 10,
+            },
+            created: Some(133_600_000_000_000_000),
         })),
         Response::Ok(ResponseKind::Start(Start::Already { pid: 3 })),
         Response::Ok(ResponseKind::Cleaned),

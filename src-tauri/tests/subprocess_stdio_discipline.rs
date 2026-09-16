@@ -275,6 +275,18 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/windows/winproc/win.rs",
+        // D4 的 `ipconfig /flushdns`：SYSTEM 下跑，两条流局部自捕（ipconfig 的失败文字在 stdout）。
+        anchor: "fn flush_dns(&self) -> Result<(), String> {",
+        kind: SiteKind::Sink,
+        // 两条流各一个读线程读到 EOF，**先于**有界等待与 `child.wait()`。
+        // 此前这条腿用 `.output()`：排空是对的，但没有上界 —— ipconfig 卡在 DNS Client 服务上时，
+        // 这条连接线程与它占的管道实例被一起扣住（见 `windows::logic::FLUSH_DNS_TIMEOUT_MS`）。
+        // 换成「读线程 + `WaitForSingleObject` 有界等待 + 到点硬杀」之后，排空形态从自带排空的
+        // `.output()` 变成显式的 `read_to_string(`，故必须登记在这里。
+        drain_forms: &["read_to_string("],
+    },
+    PipedSite {
+        file: "crates/helper/src/platform/windows/winproc/win.rs",
         anchor: "fn start_singbox(",
         kind: SiteKind::Sink,
         drain_forms: &[

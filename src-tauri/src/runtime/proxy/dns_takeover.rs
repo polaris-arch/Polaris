@@ -232,10 +232,17 @@ impl ProxyRuntime {
     pub(super) fn flush_os_dns_cache_best_effort(self: &Arc<Self>, context: &'static str) {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            // mac helper flush 通道（其它平台不经此腿，见 `flush_os_dns_cache` 平台分派）。
+            // 特权 helper flush 通道（mac root / win SYSTEM；linux 不经此腿，见 `flush_os_dns_cache`
+            // 平台分派）。helper 未装/旧 helper 不认这条命令时该调用回 `ok:false`，由分派腿就地降级。
             let helper_flush = || this.helper.flush_dns();
+            // Windows 腿的前置判据（spec §3.1「if helper ready」，见 `flush_os_dns_cache` 头注）：
+            // 没装 helper 的机器结构上就没有特权通道，每次起停核都发一条「不可用」是纯噪音。
+            // 取 token 在位这条**零副作用**的判据而非 `status().ready`，理由见
+            // [`HelperRuntime::client_token_present`]。
+            let helper_ready = this.helper.client_token_present();
             let flushed = polaris_system_integration::production_flush_os_dns_cache(
                 Some(&helper_flush),
+                helper_ready,
                 &mut |m| log::info!("[dns-flush:{context}] {m}"),
             );
             if Platform::current() == Platform::Linux && !flushed {
