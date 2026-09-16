@@ -21,7 +21,10 @@
 //!   [`crate::token::is_authed_constant_time`]）。
 //! - **不用** [`crate::line_io`]：win 走裸 Win32 `HANDLE` 的**整帧读**（命名管道，一次 `ReadFile` 取整个
 //!   请求帧再切行），不经 `std::io::BufRead` —— 是**真平台差异**，不强行归一。
-//! - **无 install-core**：macOS 专属内核持久化，Windows 由 app 侧 NSIS 安装器处理。
+//! - **install-core 核心**：[`crate::core_install`]（与 mac/linux 同一份）。Windows 侧的差异只有两处
+//!   —— 主二进制名是 `sing-box.exe`（[`crate::core_install::SINGBOX_BIN_NAME_WIN`]），以及受管核在跑时
+//!   回 `ERR busy`（Windows rename 不动运行中的 exe / 已加载的 DLL）。coreDir 由 `--support` 派生，
+//!   不从命令行取；见 [`helper::WinHelper::handle`] 的 install-core 分支。
 //!
 //! ## 移植纪律
 //!
@@ -42,6 +45,7 @@
 //!
 //! - [`selfuninstall`]：零 UAC 自毁卸载旁路命令行拼装（`helper-win/selfuninstall.go`，跨平台纯字符串逻辑）。
 //! - [`logic`]：协议层纯逻辑（iface/cfg/port 白名单、filepath basename、TCP 端口字节序解析、sing-box 镜像匹配）。
+//! - [`coreacl`]：受保护核目录的 owner/DACL **判据**（纯逻辑，Linux 单测；搬运腿在 [`winproc`]）。
 //! - [`ops`]：系统操作 trait（[`ops::ProcessOps`] / [`ops::NetTableOps`] / [`ops::IpForwardingOps`]）+ mock。
 //! - [`wintun`]：wintun 适配器释放探测（维度7 #30，trait 抽象的有界轮询）。
 //! - [`helper`]：协议分派核心（Go `handle()` 的 switch 分支，经 trait 抽象，跨平台可测）。
@@ -60,6 +64,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod coreacl;
 pub mod daemon;
 pub mod helper;
 pub mod logic;
@@ -87,10 +92,10 @@ pub use daemon::{daemon_main, parse_args as parse_daemon_args, WinArgs};
 /// **不移植** 上游的 win=5：那个 5 是 Go helper 的功能加法计数（v2 加 route-add/del、v3/v4 换
 /// iface-metric 实现、v5 PowerShell 全路径），用途是让新 client 认出机器上装着的旧 helper。
 /// Polaris 的 Rust helper 是首发，**上来就带齐全部命令**；后续代次仍随统一协议演进。
-/// 无 install-core（macOS 专属内核持久化，Windows 由 app 侧 NSIS 安装器处理）。
+/// 含 install-core（P4 起与 mac/linux 拉平，见模块文档「共用层」一节）。
 pub const PROTO_VERSION: u32 = polaris_helper_proto::proto_version::CURRENT;
 
-/// 本 helper 的协议谱系平台标识（命名管道 + token 行；无 install-core）。
+/// 本 helper 的协议谱系平台标识（命名管道 + token 行）。
 ///
 /// 用于 [`polaris_helper_proto::codec`] 帧编解码时决定是否在头部加 token 行
 /// （[`polaris_helper_proto::Platform::has_token_line`]）。

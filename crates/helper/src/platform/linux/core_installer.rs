@@ -56,7 +56,7 @@ pub fn install_core(core_dir: Option<&Path>, src_dir: &str, want_hash: &str) -> 
     let src = Path::new(src_dir);
 
     // 公共核心：校验 sing-box 哈希（:190-196）。各 Err 已是 InstallResult，原样返回。
-    let sb_data = match verify_singbox_hash(src, want_hash) {
+    let sb_data = match verify_singbox_hash(src, want_hash, SINGBOX_BIN_NAME) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -68,7 +68,7 @@ pub fn install_core(core_dir: Option<&Path>, src_dir: &str, want_hash: &str) -> 
     };
 
     // 公共核心：逐文件 .new + rename 原子就位（:202-228，含 MkdirAll coreDir）。
-    if let Err(e) = atomic_install_files(src, core_dir, &names, &sb_data) {
+    if let Err(e) = atomic_install_files(src, core_dir, &names, &sb_data, SINGBOX_BIN_NAME) {
         return e;
     }
 

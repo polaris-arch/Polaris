@@ -73,6 +73,21 @@ pub enum ErrorCode {
     SystemProxy,
     /// `ERR set-metric <err>` —— iface-metric 的 PowerShell 失败（win 退役，`helper-win/helper.go:272`）。
     SetMetric,
+    /// `ERR coredir-acl-weakened <detail>` —— 起核前自检发现受保护核目录的 owner/DACL 被放宽
+    /// 或异常（**Polaris 新增，上游无**；win，spec §3.4 · Q9）。
+    ///
+    /// detail 是「哪个路径、哪条 ACE/owner 触发」的可定位串（见
+    /// `platform::windows::coreacl::CoreAclOutcome::findings_detail`）——
+    /// 只有一个裸 code 的话，真机上无从判断是目录还是某个文件、是 owner 还是某条 ACE。
+    ///
+    /// **与 `ERR start` 分开**：那条是「核起起来失败了」，这条是「核根本没被 exec」——
+    /// 处置完全不同（后者要修 ACL，重试无用）。也**不折成 `ERR unknown`**：那是「旧 helper
+    /// 不认识这条命令」的语义，app 会当能力缺失而回退，把一次安全拒绝伪装成兼容性问题。
+    ///
+    /// **旧 app 兼容**：不认识本 token 的旧 app 走 [`ErrorCode::from_wire_token`] 的
+    /// `_ => Self::Other` 兜底，[`Error::parse`] 对 `Other` 保留**完整原文**（含 token）
+    /// ⇒ 不 panic、不丢信息、往返无损（钉住见 `coredir_acl_weakened_is_lossless_for_old_apps`）。
+    CoredirAclWeakened,
     /// 其它 `ERR <token>` —— 未在此枚举的 code（解析到未知前缀时用，保留原 token 在 [`Error::detail`]）。
     ///
     /// 覆盖 `read-singbox`/`readdir`/`mkdir`/`write`/`rename`/`read`（install-core 各步的 OS 错误前缀，
@@ -110,6 +125,7 @@ impl ErrorCode {
             "resolved-dns" => Self::ResolvedDns,
             "system-proxy" => Self::SystemProxy,
             "set-metric" => Self::SetMetric,
+            "coredir-acl-weakened" => Self::CoredirAclWeakened,
             _ => Self::Other,
         }
     }
@@ -143,6 +159,7 @@ impl ErrorCode {
             Self::ResolvedDns => "resolved-dns",
             Self::SystemProxy => "system-proxy",
             Self::SetMetric => "set-metric",
+            Self::CoredirAclWeakened => "coredir-acl-weakened",
         }
     }
 }

@@ -3,8 +3,10 @@
 //! ## 本模块只剩什么
 //!
 //! 合并成单 crate 后，原「re-export 公共层符号」的转发块已删（同 crate 内 `crate::core_install::*`
-//! 直接可达，转发纯属噪音）。本模块只留**真 mac 差异**：[`to_response`] —— 把公共
-//! [`InstallResult`](crate::core_install::InstallResult) 适配成 proto wire [`Response`]。
+//! 直接可达，转发纯属噪音）。本模块只留 [`to_response`] —— mac 调用点（`handler.rs` 的
+//! `handle_install_core`）的就近入口。**它已不含映射判据**：那张手写表在 P4 收敛到公共
+//! [`InstallResult::to_response`](crate::core_install::InstallResult::to_response) 的 wire 往返，
+//! 本模块因此退化成一层命名转发（留着是为了不动 mac 调用点与它的既有单测）。
 //!
 //! ## mac 专属（本模块外）
 //!
@@ -12,49 +14,23 @@
 //! 文件就位后触发（`helper.go:195-196`），不经本模块。
 
 use crate::core_install::InstallResult;
-use polaris_helper_proto::Error as ProtoError;
-use polaris_helper_proto::ErrorCode;
 use polaris_helper_proto::Response;
-use polaris_helper_proto::ResponseKind;
 
-/// 把 [`InstallResult`] 转换成 wire [`Response`]（mac 侧 wire 谱系适配）。
+/// 把 [`InstallResult`] 转换成 wire [`Response`]（mac 调用点的就近入口）。
 ///
 /// 用自由函数而非 `From` trait —— [`Response`] 是 proto crate 的类型，orphan rule 禁止
-/// `impl From<InstallResult> for Response`。detail 格式与公共
-/// [`InstallResult::to_wire_line`](crate::core_install::InstallResult::to_wire_line) 同（`read-singbox <d>` / `readdir <d>` / ...），走
-/// `ErrorCode::Other` + detail，handler 据此构造 wire 响应 + 触发 mac 专属签名步骤。
+/// `impl From<InstallResult> for Response`。
+///
+/// **本函数不再持有映射判据**：原先这里是一张手写的 `variant → ErrorCode` 表，与公共
+/// [`InstallResult::to_wire_line`](crate::core_install::InstallResult::to_wire_line) 是「结果
+/// 相同、机制不同」的两份同语义映射 —— `to_wire_line` 一改只流向走 wire 往返的 Windows 侧，
+/// 不流向这张表，单向漂移。现统一委托
+/// [`InstallResult::to_response`](crate::core_install::InstallResult::to_response)（三平台唯一
+/// 一份，走 wire 往返）。收敛前出过逐 variant 的等价收据（11/11 逐字相同，含 detail），
+/// 无损性由 `wire_roundtrip_is_lossless_for_every_variant` 继续钉住。
 #[must_use]
 pub fn to_response(r: InstallResult) -> Response {
-    match r {
-        InstallResult::Installed => Response::Ok(ResponseKind::Installed),
-        InstallResult::CoreDirUnset => Response::Err(ProtoError::new(ErrorCode::CoredirUnset)),
-        InstallResult::BadArgs => Response::Err(ProtoError::new(ErrorCode::BadArgs)),
-        InstallResult::HashMismatch => Response::Err(ProtoError::new(ErrorCode::HashMismatch)),
-        InstallResult::ReadSingbox(d) => Response::Err(ProtoError::with_detail(
-            ErrorCode::Other,
-            format!("read-singbox {d}"),
-        )),
-        InstallResult::ReadDir(d) => Response::Err(ProtoError::with_detail(
-            ErrorCode::Other,
-            format!("readdir {d}"),
-        )),
-        InstallResult::Mkdir(d) => Response::Err(ProtoError::with_detail(
-            ErrorCode::Other,
-            format!("mkdir {d}"),
-        )),
-        InstallResult::Read { name, detail } => Response::Err(ProtoError::with_detail(
-            ErrorCode::Other,
-            format!("read {name} {detail}"),
-        )),
-        InstallResult::Write { name, detail } => Response::Err(ProtoError::with_detail(
-            ErrorCode::Other,
-            format!("write {name} {detail}"),
-        )),
-        InstallResult::Rename { name, detail } => Response::Err(ProtoError::with_detail(
-            ErrorCode::Other,
-            format!("rename {name} {detail}"),
-        )),
-    }
+    r.to_response()
 }
 
 #[cfg(test)]

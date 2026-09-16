@@ -494,7 +494,7 @@ fn handle_install_core(
     let core_dir = Path::new(&config.core_dir);
     let src_dir = Path::new(&params.src_dir);
     // helper.go:133-198: 文件操作
-    match install_core_files(core_dir, src_dir, &params.want_hash) {
+    match install_core_files(core_dir, src_dir, &params.want_hash, SINGBOX_BIN_NAME) {
         Ok(_) => {
             // helper.go:194-196: mac 专属 —— 清 quarantine + adhoc 签名 sing-box
             let core_dir_str = config.core_dir.as_str();

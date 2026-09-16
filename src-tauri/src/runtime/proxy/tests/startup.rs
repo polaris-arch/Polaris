@@ -2525,6 +2525,62 @@ fn background_attestation_only_commits_to_the_same_running_generation_and_pid() 
     assert!(!attestation_commit_allowed(7, 7, &stopped, 4245));
 }
 
+/// **P4 能力缓存**：「这个 helper 不支持 install-core」的记号必须能失效，且「探不到」不算命中。
+///
+/// 它治的是纯性能坑（旧 Windows helper 回 `ERR unknown` 那条腿此前一个缓存都不记，于是每次起核
+/// 都白跑两个 80MB 的 sha256 + 一次暂存）。但缓存**只要永不失效就变成缺陷**：helper 升级后能力
+/// 会变，而缓存还在替旧 helper 回答。失效键取 helper 自报的 `build_identity` —— 它与
+/// `HelperManager` 判 `upgradeable` 用的是同一个字段，「helper 换了一版而 build_id 没变」与
+/// 「app 判不出可升级」是同一个前提，不会只坏一边。
+#[test]
+fn install_core_capability_cache_keys_on_helper_build_and_never_hits_on_a_failed_probe() {
+    use crate::runtime::helper::{HelperBuildProbe, InstallCoreUnsupportedRecord};
+
+    let recorded = InstallCoreUnsupportedRecord {
+        helper_build_id: Some("build-A".to_owned()),
+    };
+
+    // 同一个 helper 构建 → 命中（这是它存在的理由：省掉重复的 80MB 空转）。
+    assert!(install_core_unsupported_cache_hit(
+        Some(&recorded),
+        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
+    ));
+    // helper 升级（build_id 必变）→ 失效，重新真试一次 install-core。
+    assert!(!install_core_unsupported_cache_hit(
+        Some(&recorded),
+        &HelperBuildProbe::Reported(Some("build-B".to_owned()))
+    ));
+    // 探不到 ≠ 还是那个 helper：宁可白跑一轮完整对账，也不能让缓存永不失效。
+    assert!(!install_core_unsupported_cache_hit(
+        Some(&recorded),
+        &HelperBuildProbe::Unreachable
+    ));
+    // 没记过就不许命中（否则首次起核直接跳过对账 = 加固整条不生效）。
+    assert!(!install_core_unsupported_cache_hit(
+        None,
+        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
+    ));
+
+    // 旧 helper 如实不带 build_identity：`Reported(None)` 本身是个稳定身份，可命中；
+    // 但它与 `Unreachable` 必须分得开 —— 折在一起就等于「探测失败也算命中」。
+    let legacy = InstallCoreUnsupportedRecord {
+        helper_build_id: None,
+    };
+    assert!(install_core_unsupported_cache_hit(
+        Some(&legacy),
+        &HelperBuildProbe::Reported(None)
+    ));
+    assert!(!install_core_unsupported_cache_hit(
+        Some(&legacy),
+        &HelperBuildProbe::Unreachable
+    ));
+    // 旧 helper（无 build_id）升级成本批的新 helper（必带 build_id）→ None ⇒ Some 也要失效。
+    assert!(!install_core_unsupported_cache_hit(
+        Some(&legacy),
+        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
+    ));
+}
+
 #[test]
 fn protected_core_cache_requires_both_unchanged_payloads() {
     let dir = fresh_test_dir();
@@ -3147,5 +3203,51 @@ fn start_inner_feeds_wait_ready_the_scale_derived_budget() {
     assert!(
         !code.contains("timeout_ms: CORE_READY_TIMEOUT_FLOOR_MS"),
         "就绪门的 timeout 回落成了与规模无关的常量 ⇒ 本改动被绕过去了"
+    );
+}
+
+/// 🔴 **S-6：能力记号的身份必须在**发 `install-core` 之前**探到。**
+///
+/// 事后再探会把「回 `ERR unknown` 的那个 helper」与「此刻在管道那头的 helper」混为一谈：
+/// UAC 重装是秒级操作，两者之间完全可能已经换代 ⇒ 记号写成「**新** helper 不支持」⇒
+/// 失效键立刻就是最新值 ⇒ 本会话内永久跳过受保护核对账，而新 helper 其实是支持的。
+/// 反过来（探完才换代）只会让记号挂在旧身份上，下次探到新身份即失效、重试 —— 方向安全。
+///
+/// 源码级的理由：这一格要一个「回 `ERR unknown` 且在两次调用之间被换掉」的真 helper，本机造不出。
+///
+/// 变异锁：把 `helper_build_probe()` 挪到 `install_core(` 之后 → 第二/第三条转红；
+/// 在 `install_core` 之后再探一次（哪怕前面那次留着）→ 第三条转红。
+#[test]
+fn install_core_capability_note_uses_the_identity_probed_before_the_call() {
+    let body = method_body(
+        &module_code("runtime/proxy"),
+        "    async fn reconcile_protected_core(&self, active_core: &Path) {",
+    );
+    // 切点自检：切出来的确实是那个方法（含它的两个锚点），否则下面全是空断言。
+    let install_at = body
+        .find("helper.install_core(")
+        .expect("切点自检失败：方法体里没有 install_core 调用");
+    let probe_at = body
+        .find("let build_before = helper.helper_build_probe();")
+        .expect("能力记号的身份没有单独探一次并存下来（事后再探 = 记号可能挂到新 helper 身上）");
+    assert!(
+        probe_at < install_at,
+        "身份必须在发 install-core **之前**探：两者之间 helper 可能已被重装换代"
+    );
+    // `install_core` 之后不许再出现探测调用 —— 留一条事后腿等于把上面那条顺序断言架空。
+    let after = &body[install_at..];
+    assert!(
+        !after.contains("helper_build_probe()"),
+        "install-core 之后还在探身份：那次探到的可能是刚换上的新 helper"
+    );
+    // 正面断言：记下去的就是 `build_before` 那一份（只钉顺序会被「探了但没用」骗过）。
+    assert!(
+        after.contains("note_install_core_unsupported(&build_before)"),
+        "Unsupported 臂没有拿 `build_before` 去记号"
+    );
+    // 命中判定那一路的探测（缓存命中检查）是另一回事，必须仍在 —— 它探的就是「此刻的 helper」。
+    assert!(
+        body[..install_at].contains("&helper.helper_build_probe()"),
+        "缓存命中判定的即时探测被一起删了：那一路要的恰恰是「此刻在管道那头的是谁」"
     );
 }

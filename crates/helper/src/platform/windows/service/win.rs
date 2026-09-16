@@ -90,9 +90,9 @@ static STATUS_HANDLE: AtomicUsize = AtomicUsize::new(0);
 pub struct ServiceConfig {
     pub singbox_bin: String,
     pub conf_dir: String,
+    /// support 目录；受保护内核目录是它下面的 `core\`（install-core 分支自行派生，不单列字段 ——
+    /// 多一个可注入的核路径入口正是 P4 要收掉的东西）。
     pub support_dir: String,
-    /// core_dir：Windows 接受并忽略（镜像 macOS flag 形态，无 install-core）。
-    pub core_dir: String,
 }
 
 impl ServiceConfig {
@@ -102,7 +102,6 @@ impl ServiceConfig {
             singbox_bin: singbox_bin.into(),
             conf_dir: conf_dir.into(),
             support_dir: DEFAULT_SUPPORT_DIR.to_owned(),
-            core_dir: String::new(),
         }
     }
 }

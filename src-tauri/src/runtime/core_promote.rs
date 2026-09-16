@@ -62,7 +62,13 @@ pub const CORE_PROMOTE_DIR_NAME: &str = "core-promote";
 ///
 /// 仅作为**同一 app 会话内**一次完整 SHA256 对账后的热路径提示：任一文件名、inode、ctime、mtime、
 /// 长度或权限/属主变化都会 miss 并退回完整 hash。它不是持久信任根，也不替代 helper 侧 install-core
-/// 的内容校验。Windows 没有受保护核，非 Unix 字段只是让测试/其它 target 保持可编译。
+/// 的内容校验。
+///
+/// **`cfg(not(unix))` 那一支是 Windows 的生产热路径，不是「只为编译得过」**（本批起，
+/// [`platform_has_protected_core`] 对 Win 返 true）。它比 unix 支少 inode/dev/ctime/uid/gid，
+/// 只剩 `(name, len, mtime)` ⇒ **键更弱**：同长度、同 mtime 的原地替换它认不出来。这个弱化是可
+/// 接受的，因为它的全部作用就是「本会话内省掉一次重复 SHA256」——任何一次 miss 都退回完整 hash，
+/// 而 app 重启后首次连接必重验。别把它当成完整性判据用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PayloadStamp {
     files: Vec<PayloadFileStamp>,
@@ -222,12 +228,19 @@ pub fn sidecar_payload_matches(src_dir: &Path, dest_dir: &Path) -> bool {
 
 /// 本平台是否有「受保护核目录」这个概念（= `install-core` 是否可用）。
 ///
-/// Windows **无** `install-core`：其核走 app 侧，helper 的 `--singbox` 在安装期就指向 app 侧核路径
-/// （`runtime/helper.rs::install_params` 传 `resolve_core_binary()`），路径不变而内容随换核更新 ⇒
-/// 无需提升（`command.rs:58` 已记此差异）。
+/// **P4 起三平台恒真**：Windows helper 已实现 `install-core`，安装脚本把服务 ImagePath 的
+/// `--singbox` 改指 `C:\ProgramData\Polaris\core\sing-box.exe`（`InstallPaths::win().core_dir`
+/// 派生），核不再走 app 侧用户可写路径。此前 Win 返 `false` 是如实反映「那时确实没有受保护目录」，
+/// 不是保守取舍。
+///
+/// 留着这个恒真谓词而不是删掉调用点：它是「本平台有没有受保护核目录」这个问题的**唯一提问处**，
+/// 新增平台（[`Platform::Other`] 当前按 linux 取路径）时只需在此回答一次；下游
+/// [`reconcile_protected_core`](crate::runtime::proxy) 不必各自 `match` 平台。
 #[must_use]
 pub const fn platform_has_protected_core(platform: Platform) -> bool {
-    !matches!(platform, Platform::Win)
+    match platform {
+        Platform::Mac | Platform::Linux | Platform::Win | Platform::Other => true,
+    }
 }
 
 // ── 起核后自证：对账「实跑二进制」而非「两份同源配置」────────────────────────

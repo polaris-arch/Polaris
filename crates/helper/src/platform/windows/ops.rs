@@ -13,6 +13,7 @@
 //! 每个 trait 方法对应一个 Go `winproc.go` 函数，签名镜像其语义（返回值、best-effort 语义）。错误处理对齐 Go：
 //! 大多是 best-effort（失败不阻断主流程），trait 方法返回 `Result` 但调用方据场景决定是否忽略。
 
+use crate::platform::windows::coreacl::ObjectSecurity;
 use crate::platform::windows::logic::{self, ListenEntry};
 use polaris_helper_proto::StartTiming;
 
@@ -120,6 +121,33 @@ pub trait ProcOps: Send + Sync {
     /// 命令路径（stop/cleanup/uninstall）用异步 [`reap_child`](ProcOps::reap_child)（快回复，不阻塞管道）。
     fn reap_child_blocking(&self, pid: u32);
 
+    /// 读一个文件系统对象的 owner + DACL（P4 ACL 自检的**搬运**腿，spec §3.4）。
+    ///
+    /// **只搬运，不判断** —— 判据由纯函数 [`crate::platform::windows::coreacl`] 持有（它无 cfg、
+    /// 在 Linux 上逐形态单测）。本方法的全部职责是把 `GetNamedSecurityInfoW` 读到的 owner SID 与
+    /// 逐条 ACE 转成纯数据。
+    ///
+    /// `Err(<诊断串>)` = **读不到这个对象**（对象不存在 / 无权限），**不是**「读到被放宽」：
+    /// 两者在起核路径上的处置刻意不同（Q9：读不到 → warn 继续；读到放宽 → 拒起核）。
+    ///
+    /// 安全描述符拿到手之后的任何逐格失败（SID 转串、`GetAclInformation`、`GetAce`）**不得**折进
+    /// `Err` —— 那是「这一格判不了」，折过去会让一条判不出的 ACE 把同对象上另一条真放宽的 ACE
+    /// 一起变成 warn。它们各落一条 [`coreacl::AceKind::Unparsed`] 哨兵，由判据侧失败向关。
+    ///
+    /// [`coreacl::AceKind::Unparsed`]: crate::platform::windows::coreacl::AceKind::Unparsed
+    fn read_object_security(&self, path: &str) -> Result<ObjectSecurity, String>;
+
+    /// 列一个目录的**实际条目名**（P4 ACL 自检取材面的枚举腿，spec §3.4）。
+    ///
+    /// **只搬运，不判断**：返回条目名（不含路径），由调用方拼成全路径喂
+    /// [`crate::platform::windows::coreacl::judge_object`]。没有它，取材面就是硬编码的两个白名单
+    /// 文件名，攻击者预创建的第三个文件（带去继承的 `Users:(F)` DACL，安装脚本的 `/inheritance:r`
+    /// 传播按定义跳过它）永远不会被问到。
+    ///
+    /// `Err(<诊断串>)` = **列不出来**（目录不存在 / 无权限），按 Q9 走读不到腿（warn 继续）——
+    /// 与 [`read_object_security`](ProcOps::read_object_security) 同一处置。
+    fn list_dir_names(&self, dir: &str) -> Result<Vec<String>, String>;
+
     /// 启动父死看护线程（`helper.go:131-159` `watchParent` + `helper.go:387-388` 的 `go watchParent`）。
     ///
     /// 每秒探测父 app（`ppid`）存活；父死且 `is_current(child_pid)` 仍为真 → `on_parent_dead(child_pid)`
@@ -202,6 +230,21 @@ struct MockProcOpsInner {
     pub flush_dns_error: std::sync::Mutex<Option<String>>,
     /// 最近一次 `spawn_watch_parent` 的 (ppid, child_pid)（断言用）。
     pub last_watch_args: std::sync::Mutex<Option<(u32, u32)>>,
+    /// `read_object_security` 的**逐路径**预设结果（P4 ACL 自检）。未预设的路径走
+    /// `acl_default`（= spec §3.4 的目标态），故既有 start 测试无需改预设即照常通过。
+    pub acl_results:
+        std::sync::Mutex<std::collections::HashMap<String, Result<ObjectSecurity, String>>>,
+    /// `read_object_security` 的兜底结果（`None` = 用目标态夹具）。
+    pub acl_default: std::sync::Mutex<Option<Result<ObjectSecurity, String>>>,
+    /// `read_object_security` 被查过的路径（**按调用顺序**）。
+    ///
+    /// 「自检根本没被调用」这个 bug 在「默认预设 = 通过」下是**不可见**的 —— 这份记录是唯一
+    /// 能把它照出来的东西（见 `start_consults_the_acl_self_check_on_the_exec_dir`）。
+    pub acl_queries: std::sync::Mutex<Vec<String>>,
+    /// `list_dir_names` 的**逐目录**预设结果（P4 ACL 自检的枚举腿）。未预设的目录返回空表
+    /// （= 目录里只有白名单那两个名字，取材面退化成兜底），故既有测试无需改预设。
+    pub dir_entries:
+        std::sync::Mutex<std::collections::HashMap<String, Result<Vec<String>, String>>>,
 }
 
 /// 内存 mock 的 [`ProcOps`]（测试用）。
@@ -313,6 +356,35 @@ impl MockProcOps {
         self.inner
             .flush_dns_calls
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 预设某个路径的 `read_object_security` 结果（P4 ACL 自检）。
+    pub fn set_acl(&self, path: &str, result: Result<ObjectSecurity, String>) {
+        self.inner
+            .acl_results
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), result);
+    }
+
+    /// 预设 `read_object_security` 的兜底结果（覆盖所有未单独预设的路径）。
+    pub fn set_acl_default(&self, result: Result<ObjectSecurity, String>) {
+        *self.inner.acl_default.lock().unwrap() = Some(result);
+    }
+
+    /// `read_object_security` 被查过的路径（按调用顺序；测试断言自检确实在生产路径上跑过）。
+    #[must_use]
+    pub fn acl_queries(&self) -> Vec<String> {
+        self.inner.acl_queries.lock().unwrap().clone()
+    }
+
+    /// 预设某个目录的 `list_dir_names` 结果（P4 ACL 自检的枚举腿）。
+    pub fn set_dir_entries(&self, dir: &str, result: Result<Vec<String>, String>) {
+        self.inner
+            .dir_entries
+            .lock()
+            .unwrap()
+            .insert(dir.to_owned(), result);
     }
 
     /// 预设 `kill_all_singbox` 返回的杀掉数。
@@ -469,6 +541,33 @@ impl ProcOps for MockProcOps {
         self.inner
             .last_reaped_pid
             .store(pid, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn read_object_security(&self, path: &str) -> Result<ObjectSecurity, String> {
+        self.inner.acl_queries.lock().unwrap().push(path.to_owned());
+        if let Some(r) = self.inner.acl_results.lock().unwrap().get(path) {
+            return r.clone();
+        }
+        // 兜底 = spec §3.4 的目标态（不是一个「恒通过」的布尔量）：既有 start 测试因此真的跑一遍
+        // 判定函数，而不是绕过它。
+        self.inner
+            .acl_default
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Ok(crate::platform::windows::coreacl::locked_down_fixture()))
+    }
+
+    fn list_dir_names(&self, dir: &str) -> Result<Vec<String>, String> {
+        self.inner
+            .dir_entries
+            .lock()
+            .unwrap()
+            .get(dir)
+            .cloned()
+            // 兜底 = 空目录（取材面退化成 `core_acl_targets` 的兜底白名单），不是「枚举失败」——
+            // 后者会给每条既有 start 测试多塞一条 unreadable 记录，噪音掩盖真事。
+            .unwrap_or_else(|| Ok(Vec::new()))
     }
 
     fn spawn_watch_parent(
