@@ -174,7 +174,7 @@ export const IPC_CHANNELS = {
   STATS_PROJECT_TOPOLOGY: 'stats_project_topology', // 完整活动表先过滤，再按首页实际高度投影主要/最近目标
   STATS_CLOSED_CLEAR: 'stats_closed_clear', // 清空独立的已结束连接历史
   CONNECTIONS_CLOSE: 'connections_close', // 关单条连接（main 经 9090 DELETE /connections/{id}）
-  CONNECTIONS_CLOSE_ALL: 'connections_close_all', // 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）
+  CONNECTIONS_CLOSE_ALL: 'connections_close_all', // 关全部连接（后端取 gRPC 连接快照逐条 CloseConnection；不触发 ResetNetwork）
 
   // 出口 IP 信息（本地直连出口 / 代理出口）
   IP_INFO_GET: 'ipinfo_get',

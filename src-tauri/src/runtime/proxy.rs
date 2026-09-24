@@ -1106,7 +1106,7 @@ pub struct ProxyRuntime {
     /// spawn 之后那一段。计数而非布尔：崩溃自愈/去抖重启也直调 `start`，可与用户发起的腿重叠。
     start_inflight: Arc<AtomicU32>,
     /// 后台网络任务的起核稳定门：覆盖整个 start，并在 TUN 成功后延续到 selector 校正与单次连接
-    /// flush 结束。订阅自动更新复用它，避免自身请求被 post-start `CloseAllConnections` 误杀。
+    /// flush 结束。订阅自动更新复用它，避免自身请求被 post-start flush（快照逐条 `CloseConnection`）误杀。
     network_settle: Arc<NetworkSettleGate>,
     /// 去抖重启调度器（switch-engine 既有 timer + 世代守卫，内部复用同一 `gate`）。
     debounced: DebouncedRestart,

@@ -425,8 +425,9 @@ impl SubscriptionScheduler {
         };
 
         let state = app.state::<AppRuntime>();
-        // Windows 冷启动实证：8s 启动补更与 TUN post-start `CloseAllConnections` 两次落在同一毫秒，
-        // reqwest 新连接被无差别 RST 后只剩笼统的「error sending request」。等待代理运行时的统一
+        // Windows 冷启动实证：8s 启动补更与 TUN post-start 连接 flush（当时为 `CloseAllConnections`，
+        // 现为快照逐条 `CloseConnection`）两次落在同一毫秒，reqwest 新连接被 RST 后只剩笼统的
+        // 「error sending request」。等待代理运行时的统一
         // 稳定门，覆盖起核、selector 校正与单次 flush；不靠再调一个会随机器快慢漂移的固定 sleep。
         log::debug!(
             "[订阅自动更新] 进入代理网络稳定门：pending={} ignoreStaleness={ignore_staleness}",

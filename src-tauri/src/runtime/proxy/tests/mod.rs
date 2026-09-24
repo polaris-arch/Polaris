@@ -1028,8 +1028,8 @@ fn test_runtime_errors_with_clearer(
 
 // ── #9 TUN 起核连接 flush：两条守卫 ───────────────────────────────────────────────
 //
-// 四条测试各钉一条腿，合起来把 `flush_connections_once` 的五个出口盖到四个；
-// 第五个（`Flushed` = 真 RST）要活核才有意义，属真机门（见 P4-b 记录）。
+// 三条跳过腿 + 建连后复查 + 逐条关闭 + 快照超时各有行为测试（`flush_connections_with` 注入
+// `FakeConnectionApi`）；真 RST 到 app 连接要活核 + 抓包，属真机门（见 P4-b 记录）。
 
 /// TUN + 同世代 + 核在跑的 runtime（下面三条测试的共同前置）。
 fn flush_ready_runtime() -> (Arc<ProxyRuntime>, TestDir, u64) {

@@ -93,6 +93,73 @@ pub struct GroupSelection {
     pub selected: String,
 }
 
+/// 逐条关闭当前**全部活连接**（快照 → 跳过 `closed_at > 0` 的幽灵 → 逐个 `close_connection`），
+/// 返回成功 / 失败条数。TUN 起核 flush 与连接页「关闭全部」共用。
+///
+/// # 为什么不用 `CloseAllConnections`
+///
+/// sing-box（1.15.0-alpha.7）`daemon/started_service.go:1107` 的 `CloseAllConnections` 除了
+/// `trafficManager.CloseAllConnections()`（路由连接）还调了 `connectionManager.CloseAll()`，后者关的是
+/// `common/dialer/default.go:427/457` 里**默认拨号器登记的全部 socket** —— 包括节点自身的传输连接
+/// （MASQUE 的 QUIC UDP socket、DoH 连接等）。单条 `CloseConnection(id)`（`started_service.go:1090`）
+/// 只走 `trafficManager.Connection(id).Close()`，只碰路由连接。
+///
+/// # 并发
+///
+/// 单条关闭是一次本机 unary RPC；连接数到几百条时串行会把「关闭全部」拖到秒级。以
+/// [`CLOSE_CONCURRENCY`] 为上限并发（`buffer_unordered`，借用 `api` 无需 `'static`），不无界齐射，
+/// 免得几百个并发 RPC 同时压到核的 gRPC 服务端。
+///
+/// # 错误语义
+///
+/// 快照失败（含 [`ManagementError::SnapshotTimeout`]）原样返回 `Err`，由调用方决定如何可观测；
+/// 单条关闭失败计入 [`CloseLiveOutcome::failed`]、不中断其余（与 executor 精准断连同为 best-effort）。
+/// 快照与关闭之间新建的连接不在快照里，不会被关。
+pub async fn close_live_connections(
+    api: &dyn ManagementApi,
+) -> Result<CloseLiveOutcome, ManagementError> {
+    use futures::StreamExt;
+
+    let snapshot = api.first_connection_snapshot().await?;
+    // 快照首帧含历史环死连接（closed_at > 0），与 `select_connections_to_close` 同一判据。
+    // 先取 owned id 再进 stream：借用快照元素的闭包会让外层 future 撞上高阶生命周期推断
+    // （tokio::spawn / tauri::command 要求 Send 时报「FnOnce is not general enough」）。
+    let ids: Vec<String> = snapshot
+        .into_iter()
+        .filter(|c| c.closed_at <= 0)
+        .map(|c| c.id)
+        .collect();
+    let results: Vec<Result<(), ManagementError>> = futures::stream::iter(ids)
+        .map(|id| close_one(api, id))
+        .buffer_unordered(CLOSE_CONCURRENCY)
+        .collect()
+        .await;
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    Ok(CloseLiveOutcome {
+        closed: results.len() - failed,
+        failed,
+    })
+}
+
+/// 关一条；失败逐条 debug（核坏掉时可能几百条同因失败），汇总条数由调用方按 failed 定级。
+async fn close_one(api: &dyn ManagementApi, id: String) -> Result<(), ManagementError> {
+    let r = api.close_connection(&id).await;
+    if let Err(e) = &r {
+        log::debug!("逐条关闭连接失败（id={id}）: {e}");
+    }
+    r
+}
+
+/// [`close_live_connections`] 的单条关闭并发上限。
+const CLOSE_CONCURRENCY: usize = 16;
+
+/// [`close_live_connections`] 的结果：成功 / 失败关闭条数（幽灵不计入任一侧）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CloseLiveOutcome {
+    pub closed: usize,
+    pub failed: usize,
+}
+
 /// gRPC 错误 → trait 错误。
 ///
 /// [`ClientError::SnapshotTimeout`] 单独映射到 [`ManagementError::SnapshotTimeout`]（executor 据此
@@ -172,4 +239,4 @@ impl ManagementApi for GrpcManagementApi {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -63,8 +63,8 @@ polaris-dns-race           = { path = "../crates/dns-race" }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 async-trait.workspace = true
-# futures = async 组合子。**唯一**消费点：测速分波时用 `join_all` 并行热切 K 个探测槽（串行热切要
-# 逐槽等一次 gRPC 往返，K=16 时白摊在每一波上）。已在 workspace 依赖表里（unlock crate 用它齐射
+# futures = async 组合子。消费点之一：测速分波时用 `join_all` 并行热切 K 个探测槽（串行热切要
+# 逐槽等一次 gRPC 往返，K=16 时白摊在每一波上）；另有逐条关闭连接的 `buffer_unordered` 有界并发。已在 workspace 依赖表里（unlock crate 用它齐射
 # checker），此处只是从 dev-dependencies 提到 dependencies —— Cargo.lock 零新增。
 futures.workspace = true
 # window-vibrancy = B6 窗口铬：macOS vibrancy（Sidebar）/ Windows Mica；per-platform，非目标平台 no-op。

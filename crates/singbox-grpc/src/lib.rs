@@ -256,6 +256,11 @@ impl SingBoxApiClient {
     }
 
     /// clash 等价：关闭全部连接（Empty 请求）。
+    ///
+    /// ⚠️ 服务端（sing-box `daemon/started_service.go:1107`）除关路由连接外还会
+    /// `connectionManager.CloseAll()`，**同时关闭默认拨号器登记的全部 socket（含节点传输，如 MASQUE
+    /// QUIC / DoH）**。生产路径不要用，改用快照 + 逐条 [`Self::close_connection`]，见
+    /// `src-tauri/src/runtime/proxy/connection_flush.rs`。
     pub async fn close_all_connections(&self) -> Result<(), ClientError> {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
