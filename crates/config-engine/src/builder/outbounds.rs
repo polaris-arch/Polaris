@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::builder::endpoint_routes::active_physical_root_ids;
 use crate::builder::endpoints::{
-    build_tailscale_endpoint, build_vpn_client_endpoint, build_wireguard_endpoint,
+    build_masque_endpoint, build_tailscale_endpoint, build_vpn_client_endpoint,
+    build_wireguard_endpoint,
 };
 use crate::builder::helpers::{
     build_id_to_tag_map, effective_app_rules, effective_custom_rules, get_domestic_resolver_tag,
@@ -485,6 +486,40 @@ pub fn build_outbounds_with_runtime_bindings(
             continue;
         }
 
+        // ── MASQUE 客户端（2026-09-24）：同属端点族，但地址/凭据/TLS 取自顶层、还要按版本剥键，
+        // 故不塞进上面那个「设置结构原样 flatten」的共享构造器。
+        // 判据取用户原值、在构造之前判（同 control_url 腿）：path / version 非法会让内核
+        // initialize/decode 失败、整份配置起不来 ⇒ 剔除该节点并上报，不下发。
+        if server.protocol == Protocol::MasqueClient {
+            // 前置代理：h3 经它需要 UDP 转发（同 WG），h2/h1 只需 TCP。
+            let detour_tag = resolve_detour_tag(server, config, &id_to_tag);
+            match build_masque_endpoint(
+                server,
+                &tag,
+                Some(&dial_resolver),
+                detour_tag.as_deref(),
+                deps.log,
+            ) {
+                Ok(mut endpoint) => {
+                    apply_bind_interface(&mut endpoint.extra, bind_interface.as_deref());
+                    apply_on_demand(&mut endpoint, server);
+                    pending_endpoints.push(endpoint);
+                    node_tags.push(tag);
+                }
+                Err(token) => {
+                    deps.gate_invalid_nodes.insert(server.id.clone(), token);
+                    (deps.log)(
+                        LogLevel::Warn,
+                        &format!(
+                            "启动前配置校验：MASQUE 节点「{tag}」配置非法（{token}），已剔除 —— \
+                             该写法会让 sing-box 在初始化 endpoint 时整核失败"
+                        ),
+                    );
+                }
+            }
+            continue;
+        }
+
         if server.protocol == Protocol::Custom {
             let is_custom_endpoint = server
                 .custom_settings
@@ -531,10 +566,39 @@ pub fn build_outbounds_with_runtime_bindings(
             }
         }
 
+        // Tailcat（2026-09-24）：坏 key / DERP 冲突会让内核 initialize 整核失败 ⇒ 构造之前按用户原值判，
+        // 不合格剔除并上报（同 control_url 腿）。判据与 selector 兜底判定、store 必填门共用一份。
+        if server.protocol == Protocol::Tailcat {
+            if let Err(token) = crate::user_config::protocol_settings::tailcat_emit_check(
+                server.tailcat_settings.as_deref(),
+            ) {
+                deps.gate_invalid_nodes.insert(server.id.clone(), token);
+                (deps.log)(
+                    LogLevel::Warn,
+                    &format!(
+                        "启动前配置校验：Tailcat 节点「{tag}」配置非法（{token}），已剔除 —— \
+                         该写法会让 sing-box 在初始化 outbound 时整核失败"
+                    ),
+                );
+                continue;
+            }
+        }
+
         // 普通代理 outbound。
         let mut ob = build_proxy_outbound(server, &tag, &dial_resolver, &deps.arch, &deps.platform);
         // detour 代理链。
         ob.detour = resolve_detour_tag(server, config, &id_to_tag);
+        // Tailcat 的 DERP 地图拉取出口跟随前置代理（D10 选项 C）：只有 region 模式才有 `http_client`，
+        // 缺省 `direct` 由构造器写好。`resolve_detour_tag` 已排除 endpoint 与节点自身，故结构上不会
+        // 指回 tailcat 自己或任何 selector（指回会自锁，见 `build_proxy_outbound` 的 Tailcat 分支）；
+        // detour 若随后被死引用剪枝，整个 outbound 连同这里一起删掉，不会留下悬空的地图出口。
+        if server.protocol == Protocol::Tailcat {
+            if let (Some(detour), Some(serde_json::Value::Object(hc))) =
+                (&ob.detour, ob.extra.get_mut("http_client"))
+            {
+                hc.insert("detour".into(), detour.clone().into());
+            }
+        }
         apply_bind_interface(&mut ob.extra, bind_interface.as_deref());
         outbounds.push(ob);
         node_tags.push(tag);

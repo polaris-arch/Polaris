@@ -146,7 +146,21 @@ const GATE_NAME: &str = "依赖指纹门未完整执行";
 //   ③ `StrictRoute` 的消费面（`tun.go` 声明 / `tun_linux.go` / `tun_windows.go` / `redirect_iptables.go` /
 //      `redirect_nftables_rules.go`）行集合两版逐字相同，`tun_darwin.go` 仍零引用。
 // 前提未变，故只更新 pin，不改机制。
-const SING_TUN_PINNED: &str = "v0.9.6-0.20260922105247-aff4131a9e9e";
+//
+// 2026-09-25 随随包核 1.15.0-alpha.7 → **1.15.0-alpha.8** 复核。sing-tun 从
+// `v0.9.6-0.20260922105247-aff4131a9e9e` 跳到 `v0.9.6-0.20260924073434-3077c705bbdb`
+// （alpha.8 的 go.mod:57）。`compare/aff4131a9e9e...3077c705bbdb` 仍是 **diverged**（ahead 21 / behind 17），
+// 故同样取两版 proxy.golang.org 模块 zip 直接对比内容（`diff -rq`：12 个文件有差、0 增 0 删）：
+//   ① 默认值直读：`tun.go` 唯一改动是 `Options` 多了 `BridgeInterface []string`（:102）；
+//      `tun.go:134-139` 的 `DNSModeOrDefault()` 仍是 `if o.DNSMode == "" { return DNSModeHijack }`，
+//      枚举 `DNSModeHijack = "hijack"`（tun.go:66）未变；
+//   ② 消费面兜底：抹掉行号与首尾空白后，非测试 `.go` 里提到 `DNSMode` 的**行集合两版逐字相同**；
+//      sing-box 侧 `protocol/tun/inbound.go:215` 仍是把 `options.DNSMode` 原样透传（a8 该文件只在 :384
+//      多了一行 `BridgeInterface` 赋值）；
+//   ③ `StrictRoute` 的消费面（`tun.go` 声明 / `tun_linux.go` / `tun_windows.go` / `redirect_iptables.go` /
+//      `redirect_nftables_rules.go`）逐文件行集合两版逐字相同，`tun_darwin.go` 仍零引用。
+// 前提未变，故只更新 pin，不改机制。
+const SING_TUN_PINNED: &str = "v0.9.6-0.20260924073434-3077c705bbdb";
 
 /// 被钉的依赖模块路径。
 const SING_TUN_MODULE: &str = "github.com/sagernet/sing-tun";

@@ -53,6 +53,7 @@ export const IPC_CHANNELS = {
   // 服务器管理
   SERVER_SWITCH: 'server_switch',
   SERVER_GENERATE_URL: 'server_generate_url',
+  TAILCAT_KEYPAIR: 'tailcat_keypair', // Tailcat 客户端密钥对：不传私钥=生成新的；传了=只推导公钥（私钥不进日志）
   SERVER_ADD: 'server_add',
   SERVER_ADD_BULK: 'server_add_bulk', // 批量添加自建节点（本地导入，一次 loadConfig→saveConfig）
   LOCAL_IMPORT_PARSE: 'local_import_parse', // 本地导入：解析文件/文本 → 预览（节点 + 订阅 + 统计）；不可识别格式 throw
@@ -173,7 +174,7 @@ export const IPC_CHANNELS = {
   STATS_PROJECT_TOPOLOGY: 'stats_project_topology', // 完整活动表先过滤，再按首页实际高度投影主要/最近目标
   STATS_CLOSED_CLEAR: 'stats_closed_clear', // 清空独立的已结束连接历史
   CONNECTIONS_CLOSE: 'connections_close', // 关单条连接（main 经 9090 DELETE /connections/{id}）
-  CONNECTIONS_CLOSE_ALL: 'connections_close_all', // 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）
+  CONNECTIONS_CLOSE_ALL: 'connections_close_all', // 关全部连接（后端取 gRPC 连接快照逐条 CloseConnection；不触发 ResetNetwork）
 
   // 出口 IP 信息（本地直连出口 / 代理出口）
   IP_INFO_GET: 'ipinfo_get',

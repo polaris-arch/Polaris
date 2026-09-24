@@ -697,6 +697,43 @@ fn fingerprint_excludes_name_includes_cred_and_network() {
     assert_eq!(server_fingerprint(&a), "shadowsocks|cdn.com|443|pw|tcp");
 }
 
+/// Tailcat 无地址、无 uuid/password：cred 链若不认 `serverPublicKey`，同一批里所有 Tailcat 节点指纹都是
+/// `tailcat|||0||tcp` 一个值，`dedupe_by_fingerprint` 会把它们合并成一个（静默丢节点）。
+#[test]
+fn tailcat_fingerprint_distinguishes_server_public_key() {
+    use polaris_config_engine::user_config::protocol_settings::TailcatSettings;
+    let tc = |name: &str, key: &str| ServerConfig {
+        id: format!("id-{name}"),
+        name: name.to_string(),
+        protocol: Protocol::Tailcat,
+        tailcat_settings: Some(Box::new(TailcatSettings {
+            server_public_key: Some(key.to_string()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let a = tc("A", "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=");
+    let b = tc("B", "UvIrUZDx6KnTBhp84wRkENuaKxb0UaM1YL5pgsvN2mE=");
+    assert_ne!(
+        server_fingerprint(&a),
+        server_fingerprint(&b),
+        "服务端公钥不同的两个 Tailcat 节点必须指纹不同"
+    );
+    assert_eq!(
+        dedupe_by_fingerprint(vec![a.clone(), b]).len(),
+        2,
+        "去重不得合并不同对端"
+    );
+    assert_eq!(
+        server_fingerprint(&a),
+        server_fingerprint(&tc(
+            "A-renamed",
+            "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4="
+        )),
+        "改名不改指纹"
+    );
+}
+
 #[test]
 fn dedupe_keeps_first_of_same_fingerprint() {
     let inline = ss("inline", "x.com", 443, "pw");

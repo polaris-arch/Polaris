@@ -26,7 +26,7 @@ const node = (over: Partial<ServerConfig>): ServerConfig =>
 
 describe('endpoint 腿 VPN 客户端的组网资格', () => {
   it('声明了内网段才算组网节点；空白项不算声明', () => {
-    for (const protocol of ['openconnect', 'openvpn-client'] as const) {
+    for (const protocol of ['openconnect', 'openvpn-client', 'masque-client'] as const) {
       expect(isMeshNode(node({ protocol }))).toBe(false);
       expect(isMeshNode(node({ protocol, meshRoutes: [] }))).toBe(false);
       expect(isMeshNode(node({ protocol, meshRoutes: ['   '] }))).toBe(false);
@@ -60,6 +60,12 @@ describe('endpoint 腿 VPN 客户端的组网资格', () => {
     expect(meshAllowsInternet(ov(false))).toBe(false);
     // OpenConnect 无对应开关，本就是全隧道。
     expect(meshAllowsInternet(node({ protocol: 'openconnect' }))).toBe(true);
+  });
+
+  it('MASQUE 与 OpenConnect 同腿：声明段进 force-route（去 catch-all），无全隧道开关恒可作出口', () => {
+    const mq = node({ protocol: 'masque-client', meshRoutes: ['10.77.0.0/24', '::/0'] });
+    expect(endpointForcedRouteCidrs(mq)).toEqual(['10.77.0.0/24']);
+    expect(meshAllowsInternet(mq)).toBe(true);
   });
 
   it('WARP 忽略旧配置的自定义路由字段，恒作为全隧道云出口', () => {

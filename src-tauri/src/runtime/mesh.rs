@@ -793,7 +793,8 @@ pub fn warp_service(
 
 /// 标准 base64 编码（带 padding）。WARP 的 32 字节私钥/公钥 → 44 字符 base64。
 /// 单一用途 32→44，`base64` crate 已在图中但避免升级为直接依赖（禁引新依赖）→ 最小实现。
-fn base64_encode(input: &[u8]) -> String {
+/// Tailcat 客户端密钥对（`commands::server::tailcat_keypair`）同为 32→44，复用本函数。
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {

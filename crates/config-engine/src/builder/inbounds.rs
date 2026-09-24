@@ -306,6 +306,26 @@ fn build_tun_inbound(
                         }
                     }
                 }
+                // Tailcat 的 `address` 恒空（对端经 DERP 定位），上面两腿什么都不加；其「服务器」是 DERP。
+                // servers 模式：各项的 host（裸字符串项即 host）/ `ipv4` / `ipv6` 是 IP 字面值 → 排除；
+                // 主机名 / `"none"` / 空由 `host_to_exclude_cidr` 返回 None 跳过，同一 IP 只加一次（host 常与 ipv4 同值）。
+                // region / 自定义 map 模式 DERP IP 在起核后才从地图得知，此处无从排除 ——
+                // 靠 `route.auto_detect_interface` 让内核自身的拨号绑物理网卡兜底。
+                if let Some(t) = server.tailcat_settings.as_deref().filter(|_| {
+                    server.protocol == crate::user_config::server_config::Protocol::Tailcat
+                }) {
+                    for item in &t.derp_servers {
+                        let field = |k: &str| item.get(k).and_then(serde_json::Value::as_str);
+                        let host = item.as_str().or_else(|| field("host"));
+                        for addr in [host, field("ipv4"), field("ipv6")].into_iter().flatten() {
+                            if let Some(cidr) = host_to_exclude_cidr(addr) {
+                                if !exclude_addr.contains(&cidr) {
+                                    exclude_addr.push(cidr);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

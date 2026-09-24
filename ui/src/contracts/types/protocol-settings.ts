@@ -135,6 +135,39 @@ export interface OpenvpnClientSettings {
   tls?: OpenvpnTlsSettings;
 }
 
+/**
+ * MASQUE（RFC 9484 CONNECT-IP）客户端设置。镜像 Rust `MasqueClientSettings`：键名 = 内核键名，
+ * 其余键是透传袋（索引签名）。地址 / Basic 凭据 / TLS 复用 ServerConfig 顶层，不在此块。
+ */
+export interface MasqueClientSettings {
+  [key: string]: unknown;
+  /** URI 模板路径；非空须以 `/` 开头，否则生成侧剔节点（内核 initialize 失败）。 */
+  path?: string;
+  /** 额外请求头。内核值可为单串或数组（`Listable`），读回两种都得认。 */
+  headers?: Record<string, string | string[]>;
+  /** 缺省 = 内核 3 且可回落；1/2 时生成侧剥掉不兼容的调优键。 */
+  version?: number;
+  mtu?: number;
+}
+
+/**
+ * Tailcat 设置。镜像 Rust `TailcatSettings`：camelCase 具名字段 + 内核键名透传袋（索引签名），形态同
+ * `TorSettings`。无 server/port（对端由两把服务端公钥 + DERP 定位）。`derpRegion > 0` 与 `derpServers`
+ * 非空恰好其一；key 均为 44 字符标准 base64（32 字节）—— 不满足的节点生成侧剔除，判据见
+ * `domain/server-completeness.ts#tailcatSettingsError`。
+ */
+export interface TailcatSettings {
+  [key: string]: unknown;
+  serverPublicKey?: string;
+  serverDiscoKey?: string;
+  preSharedKey?: string;
+  privateKey?: string;
+  derpRegion?: number;
+  derpMapUrl?: string;
+  /** 每项是裸主机名，或内核原生对象 `{host, ipv4, ipv6, derp_port, stun_port, cert_name}`。 */
+  derpServers?: (string | Record<string, unknown>)[];
+}
+
 export interface Hysteria2Settings {
   upMbps?: number;
   downMbps?: number;

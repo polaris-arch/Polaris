@@ -55,11 +55,12 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use polaris_config_engine::builder::endpoints::{
-    build_vpn_client_endpoint, build_wireguard_endpoint,
+    build_masque_endpoint, build_vpn_client_endpoint, build_wireguard_endpoint,
 };
 use polaris_config_engine::builder::outbound::build_proxy_outbound;
 use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
 use polaris_config_engine::singbox::DomainResolver;
+use polaris_config_engine::user_config::protocol_settings::tailcat_emit_check;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
 use polaris_core_supervisor::{
@@ -1006,6 +1007,30 @@ fn build_temp_node(
         });
     }
 
+    if s.protocol == Protocol::MasqueClient {
+        // 与主核发射腿共用 `build_masque_endpoint`（含剔节点判据）：落进下面的 `build_proxy_outbound`
+        // 会把 endpoint 塞进 `outbounds[]` ⇒ 临时核 `unknown outbound type` 整核失败。
+        // detour 恒 `None`，理由同 WG 腿（前置代理不在临时核里）。`Err` 原样上抛：它就是主核剔该节点
+        // 用的 reason token（`INVALID_REASON_MASQUE_*`），两条链路的缺席原因逐字对得上（同 Tailcat 腿）。
+        let endpoint = build_masque_endpoint(
+            s,
+            tag,
+            Some(&DomainResolver::Tag(DIRECT_DNS_TAG.to_string())),
+            None,
+            |_, msg| log::warn!("{msg}"),
+        )?;
+        let mut node = serde_json::to_value(endpoint).map_err(|_| "masque 端点序列化")?;
+        set_bind_interface(&mut node, bind_interface).ok_or("masque 端点网卡绑定")?;
+        return Ok(TempNode {
+            id: s.id.clone(),
+            tag: tag.to_string(),
+            node,
+            companion_outbounds: Vec::new(),
+            is_endpoint: true,
+            has_local_v6: false,
+        });
+    }
+
     if is_custom_endpoint {
         // 自定义 endpoint：原样透传用户 JSON，仅覆盖 tag、剥内层 detour（对齐 config-engine
         // `build_outbounds` 的自定义 endpoint 腿；detour 在临时核里指向不存在的 tag 会 FATAL）。
@@ -1027,6 +1052,14 @@ fn build_temp_node(
             is_endpoint: true,
             has_local_v6: false,
         });
+    }
+
+    // Tailcat：坏 key / DERP 冲突会让内核 initialize 失败 —— 临时核里坏的是**整批**，不只它自己。
+    // 与主核发射腿、selector 兜底判定共用 `tailcat_emit_check`（设计 §6.2：三处一份判据，复刻清单会
+    // 随发射腿改动静默漂移）；缺席原因直接用主核同一个 reason token，两条链路的日志逐字对得上。
+    // 绕过 store sanitize 的来路（手改配置、旧版本落盘）正是这道闸存在的理由。
+    if s.protocol == Protocol::Tailcat {
+        tailcat_emit_check(s.tailcat_settings.as_deref())?;
     }
 
     // 纯 tag 而非 #335 的结构化形态，理由同上面 WG 那条腿（临时核无顶层 `dns.strategy` 可覆盖）。

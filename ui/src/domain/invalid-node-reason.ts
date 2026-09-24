@@ -29,6 +29,14 @@ export const INVALID_NODE_REASON_KEY: Readonly<Record<string, string>> = {
   'control-url-ip': 'nodes.invalidControlUrlIp',
   'control-url-scheme': 'nodes.invalidControlUrlScheme',
   'control-url-invalid': 'nodes.invalidControlUrlMalformed',
+  // Tailcat（config-engine `tailcat_emit_check`）：两把服务端 key 缺失/形态不对、DERP 模式冲突。
+  'tailcat-key-invalid': 'nodes.invalidTailcatKey',
+  'tailcat-derp-invalid': 'nodes.invalidTailcatDerp',
+  // MASQUE（config-engine `build_masque_endpoint`）：path 非空且不以 / 开头、version 超出内核 0–3。
+  'masque-path-invalid': 'nodes.invalidMasquePath',
+  'masque-version-invalid': 'nodes.invalidMasqueVersion',
+  // 自定义节点的 outbound JSON 不是带 string `type` 的对象（`INVALID_REASON_CUSTOM_MALFORMED`）。
+  'custom-outbound-malformed': 'nodes.invalidCustomOutbound',
 };
 
 /**

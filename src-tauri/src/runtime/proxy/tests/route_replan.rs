@@ -1,5 +1,7 @@
 use super::*;
+use crate::runtime::management_api::tests::FakeConnectionApi;
 use crate::runtime::proxy::connection_flush::FlushOutcome;
+use polaris_switch_engine::ManagementError;
 
 /// 被测对象是 `managed_tun_interface_for_network_watcher` / `managed_tun_interface_for_session` /
 /// `ExitInterfaceId` —— 三者都留在 src-tauri，故这半段不随 E2② 搬走。
@@ -609,32 +611,114 @@ fn connection_flush_is_reachable_only_after_status_commit() {
     );
 }
 
-/// 🔴 **建连之后必须再查一次世代**（上面四条行为测试够不着的那半条守卫）。
+/// 🔴 **建连之后必须再查一次世代**：建连（await 点）期间被接管 → 放弃，一条都不关。
 ///
-/// 为什么只能用源码守卫：这条腿只在「建连**成功**、随后被接管」时才走到，而单测里没有活的
-/// 管理 API —— 建连必失败、必在此之前返回。造一个假 gRPC 服务端来喂它，代价远超这条断言的价值；
-/// 真实覆盖在真机门（TUN 起核 + 窗口内点停止）。
+/// 原先是源码守卫（数 `self.gate.generation() != my_gen` 出现两次），因为单测里没有活的管理 API、
+/// 建连必失败。建连现经 `connect` 注入，替身可以在「建连成功」的同时 bump 世代，故改为行为断言。
 ///
-/// **变异锁**：删掉建连后的那次世代比对 → 计数从 2 掉到 1 → 本测转红。
-#[test]
-fn flush_rechecks_generation_after_connect() {
-    let body = method_body(
-        &module_code("runtime/proxy"),
-        "    pub(super) async fn flush_connections_once(",
-    );
+/// **变异锁**：删掉建连后的那次世代比对 → 落到 `Flushed` 且替身记录到关闭 → 本测转红。
+#[tokio::test]
+async fn flush_rechecks_generation_after_connect() {
+    let (rt, _dir, my_gen) = flush_ready_runtime();
+    let api = FakeConnectionApi::with_snapshot(&[("a", 0)]);
+    let closed = Arc::clone(&api.closed);
+    let outcome = rt
+        .flush_connections_with(ProxyModeType::Tun, my_gen, || async {
+            rt.bump_generation(); // 建连期间来了一次 stop / restart
+            Ok(api)
+        })
+        .await;
     assert_eq!(
-        body.matches("self.gate.generation() != my_gen").count(),
-        2,
-        "世代必须查两次：建连前一次、建连（await 点）后一次 —— 少一次就可能把新核的连接 RST 掉"
+        outcome,
+        FlushOutcome::SkippedSuperseded,
+        "建连后世代已变仍开枪 = 把新核刚建立的连接关掉"
     );
-    let connect = body
-        .find("SingBoxApiClient::connect(")
-        .expect("锚点 `SingBoxApiClient::connect(` 消失，顺序守卫已失去判据");
-    let last_check = body
-        .rfind("self.gate.generation() != my_gen")
-        .expect("上一条断言已保证存在");
-    assert!(
-        connect < last_check,
-        "第二次世代比对必须排在建连之后，排在前面等于两次查同一个时刻"
+    assert!(closed.lock().unwrap().is_empty(), "被接管后不得关任何连接");
+}
+
+/// 🔴 **逐条关闭活连接，跳过幽灵**（不是 `CloseAllConnections`）。
+///
+/// `CloseAllConnections` 会连带关掉默认拨号器登记的节点传输 socket（MASQUE QUIC / DoH），见
+/// `connection_flush.rs` 模块文档。trait 面上没有 close-all，故走替身「从不调 close-all」是结构性的；
+/// 这里钉的是：快照里每条活连接恰好单条关闭一次、`closed_at > 0` 的历史环幽灵被跳过、条数可观测。
+///
+/// **变异锁**：去掉 `close_live_connections` 的 `closed_at <= 0` 过滤 → 幽灵被关 → 转红。
+#[tokio::test]
+async fn flush_closes_each_live_connection_individually() {
+    let (rt, _dir, my_gen) = flush_ready_runtime();
+    let api = FakeConnectionApi::with_snapshot(&[("a", 0), ("ghost", 1_000_000_000), ("b", 0)]);
+    let closed = Arc::clone(&api.closed);
+    let outcome = rt
+        .flush_connections_with(ProxyModeType::Tun, my_gen, || async { Ok(api) })
+        .await;
+    assert_eq!(
+        outcome,
+        FlushOutcome::Flushed {
+            closed: 2,
+            failed: 0
+        }
     );
+    let mut ids = closed.lock().unwrap().clone();
+    ids.sort(); // 并发关闭：断言集合不断言次序
+    assert_eq!(
+        ids,
+        vec!["a".to_string(), "b".to_string()],
+        "每条活连接恰好关一次，幽灵跳过"
+    );
+}
+
+/// 🔴 **单条关闭失败必须在 `Flushed.failed` 上可观测**（日志据此升 warn）。
+///
+/// **变异锁**：flush 把 `failed` 丢成 0 → 转红。
+#[tokio::test]
+async fn flush_reports_failed_close_count() {
+    let (rt, _dir, my_gen) = flush_ready_runtime();
+    let api = FakeConnectionApi::with_snapshot(&[("a", 0), ("b", 0)]).rejecting("a");
+    let outcome = rt
+        .flush_connections_with(ProxyModeType::Tun, my_gen, || async { Ok(api) })
+        .await;
+    assert_eq!(
+        outcome,
+        FlushOutcome::Flushed {
+            closed: 1,
+            failed: 1
+        }
+    );
+}
+
+/// 🔴 **快照超时必须作为独立出口可观测**，不得静默成 `Flushed { closed: 0 }`。
+#[tokio::test]
+async fn flush_reports_snapshot_timeout() {
+    let (rt, _dir, my_gen) = flush_ready_runtime();
+    let api = FakeConnectionApi::snapshot_err(ManagementError::SnapshotTimeout);
+    let closed = Arc::clone(&api.closed);
+    let outcome = rt
+        .flush_connections_with(ProxyModeType::Tun, my_gen, || async { Ok(api) })
+        .await;
+    assert_eq!(outcome, FlushOutcome::SnapshotTimeout);
+    assert!(closed.lock().unwrap().is_empty());
+}
+
+/// 🔴 **flush 与「关闭全部」的生产代码不得再调 `close_all_connections`**（剥注释后取材）。
+///
+/// 行为测试走的是 trait 替身，而 trait 面上本就没有 close-all；真正的回退形态是在 gRPC 客户端上
+/// 直接调它（本批修掉的正是这种写法），替身看不见 —— 只能由源码守卫兜。
+///
+/// **变异锁**：在 `flush_connections_once` 或 `connections_close_all` 里改回
+/// `client.close_all_connections()` → 转红。
+#[test]
+fn flush_and_close_all_never_call_close_all_connections() {
+    let flush = module_code("runtime/proxy");
+    let cmd = crate::test_support::module_code("commands/proxy");
+    for (name, code) in [("runtime/proxy", &flush), ("commands/proxy", &cmd)] {
+        assert!(
+            !code.contains("close_all_connections("),
+            "{name} 生产代码调用了 close_all_connections：它会连带关掉节点传输 socket（见 connection_flush.rs）"
+        );
+        // 正面对照：取材面确实覆盖到两处调用点（取材为空时上面的否定断言恒绿）。
+        assert!(
+            code.contains("close_live_connections("),
+            "{name} 取材面上找不到 close_live_connections 调用点，判据已失去取材"
+        );
+    }
 }

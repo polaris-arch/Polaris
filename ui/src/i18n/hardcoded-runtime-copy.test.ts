@@ -70,7 +70,7 @@ describe('i18n 文案只有 locale 一个真值源', () => {
       '简体中文', '繁體中文',
     ]);
     const technicalNames = new Set([
-      'Cloudflare WARP', 'Tailscale', 'OpenConnect', 'OpenVPN', 'WireGuard',
+      'Cloudflare WARP', 'Tailscale', 'OpenConnect', 'OpenVPN', 'WireGuard', 'MASQUE',
       'AI', 'DNS', 'FakeIP', 'TUN', 'MTU', 'CIDR', 'MAC', 'DoH URL',
     ]);
     const technicalExamples = new Set([

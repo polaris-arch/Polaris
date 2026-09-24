@@ -48,6 +48,9 @@ pub const ALLOWED_PROTOCOLS: &[&str] = &[
     // 端点族 VPN 客户端（进 endpoints[]，但语义是普通出口、不是组网）。
     "openconnect",
     "openvpn-client",
+    "masque-client",
+    // 2026-09-24：无地址 outbound（同 tor），DERP 引导的点对点 WireGuard。
+    "tailcat",
     "custom",
 ];
 
@@ -165,7 +168,18 @@ pub fn protocol_requirement_ok(proto_lower: &str, server: &Value) -> bool {
                     .and_then(|s| s.get("tls"))
                     .is_some_and(Value::is_object)
         }
-        "socks" | "http" | "ssh" | "tailscale" | "tor" => true, // 仅需通用 address/port，或协议本身无地址/无硬必填
+        // masque-client：server/port 走通用地址校验，Basic 凭据可选（服务端 users 为空时不校验），
+        // TLS 由生成侧恒开 ⇒ 没有协议级硬必填。
+        "socks" | "http" | "ssh" | "tailscale" | "tor" | "masque-client" => true, // 仅需通用 address/port，或协议本身无地址/无硬必填
+        // tailcat：key 形态与 DERP 模式直接用生成侧的剔节点判据（同一个函数，两处不会漂移）——
+        // 这些写法下发即整核失败，落盘门没有理由比生成侧宽。设置块解析不了同样视为不合格。
+        "tailcat" => obj
+            .get("tailcatSettings")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .is_some_and(|t| {
+                polaris_config_engine::user_config::protocol_settings::tailcat_emit_check(Some(&t))
+                    .is_ok()
+            }),
         "custom" => {
             // raw-JSON 透传：须是含 type 字段的 outbound 对象
             obj.get("customSettings")

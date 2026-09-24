@@ -29,8 +29,8 @@
 //! 缺旧成员 tag（pair 不可建）或旧==新（指向未变）的 pair **跳过**该 selector 的断连。
 //! 误杀（关掉本该保留的新成员 / 固定规则连接）会导致 app 被迫重连产生抖动；漏关（旧连接
 //! 留在旧成员）只是该连接继续走旧路径直到自然结束，对单条存量连接可接受。故 pair 缺失时
-//! 跳过而非全量关——与 `CloseAllConnections` 的无差别 RST 形成对比（后者是启用代理 flush 的
-//! 正交路径，见 scheduleConnectionFlush）。
+//! 跳过而非全量关——与启用代理 flush 的全量关（快照逐条 `CloseConnection` 关闭全部活连接，不用
+//! `CloseAllConnections`）形成对比（后者是正交路径，见 `schedule_connection_flush`）。
 
 #![forbid(unsafe_code)]
 

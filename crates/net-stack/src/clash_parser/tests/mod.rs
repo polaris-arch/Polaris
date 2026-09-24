@@ -514,6 +514,35 @@ fn unsupported_type_skipped() {
     assert!(r.warnings.iter().any(|w| w.contains("ssr")));
 }
 
+/// mihomo `type: masque` 是 WARP 专用客户端（Cloudflare SNI + `cf-connect-ip` + ECDSA 密钥对），与 sing-box
+/// `masque-client`（通用 CONNECT-IP + Basic/TLS）只是同名 ⇒ 必须跳过，不得被映射成 `MasqueClient`。
+///
+/// 断言跳过原因**恰为** `masque(1)`：若有人把它接到 `MasqueClient` 上、又被 `is_supported_clash_type`
+/// 挡下，跳过原因会变成 `masqueclient`，只查「含 masque」会被这种半接线骗过。
+#[test]
+fn mihomo_masque_is_skipped_not_mapped_to_masque_client() {
+    assert_eq!(normalize_clash_type(&Value::String("masque".into())), None);
+    let r = parse_one(
+        r#"
+- name: warp-masque
+  type: masque
+  server: 162.159.198.1
+  port: 443
+  private-key: MHcCAQEEIFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeoAoGCCqGSM49
+  public-key: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFakeFakeFake
+  ip: 172.16.0.2
+  ipv6: 2606:4700:110:8a36::2
+"#,
+    );
+    assert_eq!(r.servers.len(), 0, "mihomo masque 被误映射成了节点");
+    assert_eq!((r.skipped, r.failed), (1, 0));
+    assert!(
+        r.warnings.iter().any(|w| w.contains("masque(1)")),
+        "跳过原因应恰为 masque：{:?}",
+        r.warnings
+    );
+}
+
 #[test]
 fn unsupported_transport_fails() {
     let r = parse_one(

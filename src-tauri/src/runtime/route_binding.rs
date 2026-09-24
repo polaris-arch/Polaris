@@ -273,7 +273,8 @@ fn runtime_binding_candidates_for_roots(
 
 fn server_route_host(server: &ServerConfig) -> Option<String> {
     let raw = match server.protocol {
-        Protocol::Tailscale | Protocol::Tor => return None,
+        // 无服务器主机可绑：Tailcat 同 Tor 没有 server（DERP 主机由内核按地图/servers 自行拨）。
+        Protocol::Tailscale | Protocol::Tor | Protocol::Tailcat => return None,
         Protocol::Openconnect => server.openconnect_settings.as_ref()?.server.as_deref()?,
         Protocol::OpenvpnClient => server.openvpn_client_settings.as_ref()?.server.as_deref()?,
         Protocol::Custom => server

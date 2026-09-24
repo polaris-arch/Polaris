@@ -163,3 +163,82 @@ fn absent_keys_still_default_to_empty() {
     assert!(uc.rule_resources.is_empty());
     assert!(uc.custom_rules.is_empty());
 }
+
+/// MASQUE 节点的真实键名：`masqueClientSettings` 是 camelCase 外壳，里面是**内核键名**（snake_case，
+/// 与 openconnect/openvpn 设置同一契约）。外壳漏 rename ⇒ 设置整块静默丢失；里层写成 camelCase ⇒
+/// 落进透传袋原样下发 ⇒ 内核 `unknown field`。
+#[test]
+fn masque_client_settings_deserialize_from_real_keys() {
+    use polaris_config_engine::user_config::server_config::Protocol;
+    let uc: UserConfig = serde_json::from_value(json!({
+        "servers": [{
+            "id": "m1", "name": "MQ", "protocol": "masque-client",
+            "address": "mq.example.com", "port": 443,
+            "masqueClientSettings": {
+                "path": "/masque", "version": 2, "mtu": 1400,
+                "headers": { "Authorization": "Bearer t" },
+                "udp_timeout": "5m"
+            }
+        }]
+    }))
+    .expect("真实 config 应可反序列化");
+    let s = &uc.servers[0];
+    assert_eq!(s.protocol, Protocol::MasqueClient);
+    let m = s
+        .masque_client_settings
+        .as_deref()
+        .expect("masqueClientSettings 没读进来（外壳漏 rename）");
+    assert_eq!(m.path.as_deref(), Some("/masque"));
+    assert_eq!(m.version, Some(2));
+    assert_eq!(m.mtu, Some(1400));
+    assert!(m
+        .headers
+        .as_ref()
+        .is_some_and(|h| h.contains_key("Authorization")));
+    assert_eq!(
+        m.extra.get("udp_timeout"),
+        Some(&json!("5m")),
+        "未建模键应进透传袋"
+    );
+}
+
+/// Tailcat 节点的真实键名：`tailcatSettings` 外壳与内层都是 camelCase（同 `torSettings`），未建模键按
+/// **内核键名**进透传袋。外壳漏 rename ⇒ 设置整块静默丢失、节点被剔为 key 缺失。
+#[test]
+fn tailcat_settings_deserialize_from_real_keys() {
+    use polaris_config_engine::user_config::server_config::Protocol;
+    let uc: UserConfig = serde_json::from_value(json!({
+        "servers": [{
+            "id": "t1", "name": "TC", "protocol": "tailcat",
+            "tailcatSettings": {
+                "serverPublicKey": "P", "serverDiscoKey": "D", "preSharedKey": "K",
+                "privateKey": "V", "derpRegion": 900,
+                "derpMapUrl": "https://derp.example/m.json",
+                "derpServers": ["d1.example", { "host": "d2.example", "derp_port": 443 }],
+                "udp_timeout": "5m"
+            }
+        }]
+    }))
+    .expect("真实 config 应可反序列化");
+    let s = &uc.servers[0];
+    assert_eq!(s.protocol, Protocol::Tailcat);
+    let t = s
+        .tailcat_settings
+        .as_deref()
+        .expect("tailcatSettings 没读进来（外壳漏 rename）");
+    assert_eq!(t.server_public_key.as_deref(), Some("P"));
+    assert_eq!(t.server_disco_key.as_deref(), Some("D"));
+    assert_eq!(t.pre_shared_key.as_deref(), Some("K"));
+    assert_eq!(t.private_key.as_deref(), Some("V"));
+    assert_eq!(t.derp_region, Some(900));
+    assert_eq!(
+        t.derp_map_url.as_deref(),
+        Some("https://derp.example/m.json")
+    );
+    assert_eq!(t.derp_servers.len(), 2);
+    assert_eq!(
+        t.extra.get("udp_timeout"),
+        Some(&json!("5m")),
+        "未建模键应进透传袋"
+    );
+}

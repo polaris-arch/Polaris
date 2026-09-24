@@ -65,6 +65,15 @@ fn explicit_binding_and_dynamic_tailscale_targets_are_not_inferred() {
     assert!(!needs_runtime_binding_plan(&config));
 }
 
+/// Tailcat 没有服务器主机（DERP 主机由内核按地图/servers 自拨）：顶层 address 即便残留了值也不得
+/// 被当成出口主机去绑网卡。
+#[test]
+fn addressless_tailcat_has_no_route_host() {
+    let mut tc = server("tc", "left-over.example.com");
+    tc.protocol = Protocol::Tailcat;
+    assert_eq!(server_route_host(&tc), None);
+}
+
 #[test]
 fn active_roots_stay_minimal_while_hot_switch_plan_covers_all_nodes() {
     let config = UserConfig {

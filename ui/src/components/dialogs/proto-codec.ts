@@ -29,7 +29,9 @@ import type { ServerConfig, Network, Security } from '@/contracts/types';
 import type {
   GrpcSettings,
   HttpSettings,
+  MasqueClientSettings,
   MultiplexSettings,
+  TailcatSettings,
   TlsSettings,
   WebSocketSettings,
 } from '@/contracts/types/protocol-settings';
@@ -52,11 +54,16 @@ export type ProtoCodecErrorCode =
   | 'customJsonInvalid'
   | 'customJsonObject'
   | 'customJsonTypeRequired'
-  | 'certPinInvalid';
+  | 'certPinInvalid'
+  | 'derpServerInvalid'
+  | 'extraJsonInvalid';
 
-/** 编解码层只抛稳定错误码；面向用户的文案由 NodeDialog 按当前 locale 渲染。 */
+/**
+ * 编解码层只抛稳定错误码；面向用户的文案由 NodeDialog 按当前 locale 渲染。
+ * `field` = 出错的草稿键（FieldSpec.k），NodeDialog 据此切到该字段所在页签（`nodeFieldTab`）。
+ */
 export class ProtoCodecError extends Error {
-  constructor(readonly code: ProtoCodecErrorCode, readonly detail?: string) {
+  constructor(readonly code: ProtoCodecErrorCode, readonly detail?: string, readonly field?: string) {
     super(code);
     this.name = 'ProtoCodecError';
   }
@@ -180,11 +187,14 @@ function headersFromText(v: FormValue): Record<string, string[]> | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** `Record<string, string[]>` → `名称: 值` 多行文本（与 [`headersFromText`] 成对，往返恒等）。 */
-function headersToText(h: Record<string, string[]> | undefined): string {
+/**
+ * `Record<string, string[]>` → `名称: 值` 多行文本（与 [`headersFromText`] 成对，往返恒等）。
+ * 也收单串值：MASQUE 的 `headers` 在内核是 `Listable`，导入的 `{"X":"v"}` 不能在回显时丢掉。
+ */
+function headersToText(h: Record<string, string | string[]> | undefined): string {
   if (h === undefined) return '';
   return Object.entries(h)
-    .flatMap(([name, values]) => values.map((value) => `${name}: ${value}`))
+    .flatMap(([name, values]) => (Array.isArray(values) ? values : [values]).map((value) => `${name}: ${value}`))
     .join('\n');
 }
 
@@ -448,13 +458,72 @@ const MODELED_SETTING_KEYS: readonly string[] = [
   'no_udp', 'pfs', 'allow_insecure_crypto', 'user_agent', 'reported_os', 'system',
   'network', 'cipher', 'redirect_gateway', 'tls',
 ];
-const bagOf = (settings: unknown): Record<string, unknown> => {
+const bagOf = (
+  settings: unknown,
+  modeled: readonly string[] = MODELED_SETTING_KEYS
+): Record<string, unknown> => {
   if (!settings || typeof settings !== 'object') return {};
   return Object.fromEntries(
     Object.entries(settings as Record<string, unknown>).filter(
-      ([k]) => !MODELED_SETTING_KEYS.includes(k)
+      ([k]) => !modeled.includes(k)
     )
   );
+};
+
+/**
+ * `bagOf` 的补集：base 设置里落在共用建模表内的键。openconnect / openvpn-client / hysteria / tor 四条腿
+ * 用它代替整块 `...base.xxxSettings` 起底 —— 设置块 = 本函数结果 + 当前袋 + 表单具名字段。
+ *
+ * 为什么不能直接去掉起底：共用表是四个协议的并集，某键在本协议里既不映射成表单字段、又被 `bagOf`
+ * 挡在袋外时，它**两边都不收**，只能从 base 按键名带过来。已知实例：hysteria 的 `auth`（Rust 具名字段、
+ * 表单无控件）与 `network`（v1 内核键，导入器放进 extra，却因 openvpn 的 `network` 在共用表里被藏出袋）。
+ * 表单写的键随后被具名字段覆盖，故这里不必再按协议细分。袋内键（非建模键）**只**来自当前 extraJson ——
+ * 用户在 JSON 里删掉的键不会从 base 复活。
+ */
+const modeledOf = (settings: unknown): Record<string, unknown> => {
+  if (!settings || typeof settings !== 'object') return {};
+  return Object.fromEntries(
+    Object.entries(settings as Record<string, unknown>).filter(([k]) => MODELED_SETTING_KEYS.includes(k))
+  );
+};
+
+/**
+ * MASQUE 建模键 = Rust `MasqueClientSettings` 的具名字段。**单列一张，不并进上面那张共用表**：
+ * `version` 在 openconnect 那边是内核键却未建模（schema 有 `Endpoint[openconnect].version`），
+ * 并进共用表会把它从 openconnect 的透传袋视图里藏掉，用户就再也看不到、改不了它。
+ */
+const MASQUE_MODELED_KEYS = ['path', 'headers', 'version', 'mtu'] as const;
+
+/** Tailcat 建模键 = Rust `TailcatSettings` 的具名字段（camelCase）；其余键是内核键名的透传袋。 */
+const TAILCAT_MODELED_KEYS = [
+  'serverPublicKey', 'serverDiscoKey', 'preSharedKey', 'privateKey', 'derpRegion', 'derpMapUrl', 'derpServers',
+] as const;
+
+/** `derpServers` → 行文本：裸主机名原样，对象写成单行 JSON（与 [`textToDerpServers`] 成对，往返恒等）。 */
+const derpServersToText = (items: TailcatSettings['derpServers']): string =>
+  (items ?? []).map((item) => (typeof item === 'string' ? item : JSON.stringify(item))).join('\n');
+/**
+ * 行文本 → `derpServers`。每行一个裸主机名，或一个以 `{` 开头的单行 JSON 对象；空行丢弃。
+ * 一项不剩 → `undefined`（删键）；任一对象行 JSON 解析失败 ⇒ **拒绝保存**（抛 `derpServerInvalid`，detail 点名
+ * 坏行；同证书 pin 口径）。不能静默保留旧值：编辑已有节点时用户看不出改动没生效。
+ */
+const textToDerpServers = (v: FormValue): TailcatSettings['derpServers'] | undefined => {
+  const out: NonNullable<TailcatSettings['derpServers']> = [];
+  for (const raw of (typeof v === 'string' ? v : '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (!line.startsWith('{')) {
+      out.push(line);
+      continue;
+    }
+    try {
+      // 以 `{` 开头的串要么解析成对象、要么抛错，不存在「解析成功但不是对象」这一支。
+      out.push(JSON.parse(line) as Record<string, unknown>);
+    } catch {
+      throw new ProtoCodecError('derpServerInvalid', line, 'derpServers');
+    }
+  }
+  return out.length ? out : undefined;
 };
 
 /** OpenVPN `tls` 是独立嵌套命名空间，不能复用父 settings 的建模键表。 */
@@ -481,18 +550,23 @@ const bagToText = (bag: unknown): string => {
   const keys = Object.keys(m);
   return keys.length ? JSON.stringify(m, null, 2) : '';
 };
-/** 解析失败 → `undefined`（保留 base 里的旧袋，不把用户手误变成静默清空）。 */
-const textToBag = (v: unknown): Record<string, unknown> | undefined => {
+/**
+ * 空文本 / 纯空白 → `{}`（无袋，合法）。解析失败或不是 JSON 对象 ⇒ **拒绝保存**（抛 `extraJsonInvalid`，
+ * `field` 点名是哪个袋）。不能静默保留旧袋：用户看不出改动没生效（同 `derpServerInvalid` 口径）。
+ */
+const textToBag = (v: unknown, field: string): Record<string, unknown> => {
   const t = typeof v === 'string' ? v.trim() : '';
   if (!t) return {};
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(t);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
+    parsed = JSON.parse(t);
   } catch {
-    return undefined;
+    throw new ProtoCodecError('extraJsonInvalid', undefined, field);
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ProtoCodecError('extraJsonInvalid', undefined, field);
+  }
+  return parsed as Record<string, unknown>;
 };
 
 export const protoCodec: Record<NodeProto, ProtoCodec> = {
@@ -702,8 +776,8 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         // 顶层字段：**不进 openconnectSettings** —— 那个块整体 flatten 下发给内核，塞个内核不认的键会硬报错。
         meshRoutes: cidrLines(draft.meshRoutes),
         openconnectSettings: {
-          ...base.openconnectSettings,
-          ...(textToBag(draft.extraJson) ?? bagOf(base.openconnectSettings)),
+          ...modeledOf(base.openconnectSettings),
+          ...textToBag(draft.extraJson, 'extraJson'),
           server: base.address && base.port ? endpointHostPort(base.address, base.port) : undefined,
           username: str(draft.user),
           password: str(draft.pwd),
@@ -751,8 +825,8 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         ...base,
         meshRoutes: cidrLines(draft.meshRoutes),
         openvpnClientSettings: {
-          ...base.openvpnClientSettings,
-          ...(textToBag(draft.extraJson) ?? bagOf(base.openvpnClientSettings)),
+          ...modeledOf(base.openvpnClientSettings),
+          ...textToBag(draft.extraJson, 'extraJson'),
           server: base.address || undefined,
           server_port: base.port || undefined,
           username: str(draft.user),
@@ -767,12 +841,58 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           redirect_gateway: draft.redirectGw === true ? true : false,
           system: draft.sysIface === true ? true : undefined,
           tls: {
-            ...(textToBag(draft.ovpnTlsExtraJson) ?? openvpnTlsBagOf(base.openvpnClientSettings?.tls)),
+            ...textToBag(draft.ovpnTlsExtraJson, 'ovpnTlsExtraJson'),
             certificate: lines(draft.ovpnCa),
             client_certificate: lines(draft.ovpnCert),
             client_key: lines(draft.ovpnKey),
           },
         },
+      };
+    },
+  },
+
+  // MASQUE：地址 / Basic 凭据 / TLS 在顶层（Rust `build_masque_endpoint` 从顶层取），设置块只装内核键名的
+  // 四个建模键 + 透传袋。设置块**不以 base 起底**：非建模键全在袋里，起底只会让用户在 JSON 里删掉的键从
+  // base 复活。TLS 恒开 ⇒ 没有清除门，与 hy2/tuic 同构。
+  'masque-client': {
+    fromConfig(cfg) {
+      const d = base0('masque-client');
+      const m = cfg.masqueClientSettings;
+      d.user = cfg.username ?? '';
+      d.pwd = cfg.password ?? '';
+      d.sni = cfg.tlsSettings?.serverName ?? '';
+      d.insecure = cfg.tlsSettings?.allowInsecure === true;
+      // 0 与缺省同义（内核按 3 处理）→ 回显「默认」；表外值（如 5）原样留给下拉的保留表外当前值机制，
+      // 不偷偷改成默认 —— 那种节点后端会剔除并上报，改写会把问题藏起来。
+      d.version = m?.version ? String(m.version) : '';
+      d.path = m?.path ?? '';
+      d.headers = headersToText(m?.headers);
+      d.mtu = m?.mtu;
+      certPinDraft(cfg, d);
+      d.meshRoutes = (cfg.meshRoutes ?? []).join('\n');
+      d.extraJson = bagToText(bagOf(m, MASQUE_MODELED_KEYS));
+      return d;
+    },
+    toConfig(draft, base) {
+      return {
+        ...base,
+        username: str(draft.user),
+        password: str(draft.pwd),
+        meshRoutes: cidrLines(draft.meshRoutes),
+        tlsSettings: mergeTls(base.tlsSettings, {
+          serverName: str(draft.sni),
+          allowInsecure: draft.insecure === true ? true : undefined,
+          ...certPinPatch(draft),
+        }),
+        masqueClientSettings: mergeBlock<MasqueClientSettings>(
+          textToBag(draft.extraJson, 'extraJson') as MasqueClientSettings,
+          {
+            path: str(draft.path),
+            headers: headersFromText(draft.headers),
+            version: str(draft.version) ? Number(draft.version) : undefined,
+            mtu: num(draft.mtu),
+          }
+        ),
       };
     },
   },
@@ -801,14 +921,14 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         hysteriaSettings: {
-          ...base.hysteriaSettings,
+          ...modeledOf(base.hysteriaSettings),
           authStr: str(draft.authStr),
           upMbps: num(draft.up),
           downMbps: num(draft.down),
           obfs: str(draft.obfs),
           serverPorts: str(draft.ports),
           hopInterval: str(draft.hopInterval),
-          ...(textToBag(draft.extraJson) ?? bagOf(base.hysteriaSettings)),
+          ...textToBag(draft.extraJson, 'extraJson'),
         },
         // v1 的 TLS 恒开（后端 TLS_PROTOCOLS 含 hysteria），无 sec 开关，故与 hy2 同样无清除门。
         tlsSettings: mergeTls(base.tlsSettings, {
@@ -840,13 +960,52 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         torSettings: {
-          ...base.torSettings,
+          ...modeledOf(base.torSettings),
           executablePath: str(draft.torExec),
           dataDirectory: str(draft.torDataDir),
           extraArgs: args ? args.split(/\s+/).filter(Boolean) : undefined,
           torrc: textToTorrc(draft.torrcText),
-          ...(textToBag(draft.extraJson) ?? bagOf(base.torSettings)),
+          ...textToBag(draft.extraJson, 'extraJson'),
         },
+      };
+    },
+  },
+
+  // Tailcat：无地址（同 Tor），设置块写法同 MASQUE —— **不以 base 起底**（非建模键全在袋里，起底会让
+  // 用户在 JSON 里删掉的键从 base 复活）。DERP 三模式互斥：只写当前模式的键，其余删键，否则
+  // 「region 与 servers 同时设」会被生成侧剔除、被 store 落盘门直接丢弃。
+  tailcat: {
+    fromConfig(cfg) {
+      const d = base0('tailcat');
+      const s = cfg.tailcatSettings;
+      d.serverPublicKey = s?.serverPublicKey ?? '';
+      d.serverDiscoKey = s?.serverDiscoKey ?? '';
+      d.preSharedKey = s?.preSharedKey ?? '';
+      d.privateKey = s?.privateKey ?? '';
+      d.derpMode = s?.derpServers?.length ? 'servers' : s?.derpMapUrl ? 'customMap' : 'region';
+      d.derpRegion = s?.derpRegion;
+      d.derpMapUrl = s?.derpMapUrl ?? '';
+      d.derpServers = derpServersToText(s?.derpServers);
+      d.extraJson = bagToText(bagOf(s, TAILCAT_MODELED_KEYS));
+      return d;
+    },
+    toConfig(draft, base) {
+      const mode = draft.derpMode;
+      const servers = mode === 'servers' ? textToDerpServers(draft.derpServers) : undefined;
+      return {
+        ...base,
+        tailcatSettings: mergeBlock<TailcatSettings>(
+          textToBag(draft.extraJson, 'extraJson') as TailcatSettings,
+          {
+            serverPublicKey: str(draft.serverPublicKey),
+            serverDiscoKey: str(draft.serverDiscoKey),
+            preSharedKey: str(draft.preSharedKey),
+            privateKey: str(draft.privateKey),
+            derpRegion: mode === 'servers' ? undefined : num(draft.derpRegion),
+            derpMapUrl: mode === 'customMap' ? str(draft.derpMapUrl) : undefined,
+            derpServers: servers,
+          }
+        ),
       };
     },
   },

@@ -20,14 +20,17 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use polaris_config_engine::builder::endpoint_routes::{has_catch_all, strip_catch_all};
+use polaris_config_engine::builder::endpoints::build_masque_endpoint;
+use polaris_config_engine::builder::outbound::build_proxy_outbound;
 use polaris_config_engine::legacy_keys::migrate_hysteria_v1_legacy_keys;
+use polaris_config_engine::singbox::DomainResolver;
 use polaris_config_engine::user_config::normalize::normalize_token;
 use polaris_config_engine::user_config::protocol_settings::{
-    custom_outbound_type, AnyTlsSettings, CustomSettings, GrpcSettings, HttpSettings,
-    Hysteria2ObfsSettings, Hysteria2Settings, HysteriaSettings, MultiplexSettings, NaiveSettings,
-    OpenconnectSettings, OpenvpnClientSettings, OpenvpnTlsSettings, RealitySettings,
-    ShadowsocksSettings, SnellSettings, SshSettings, TlsSettings, TorSettings, TuicSettings,
-    WebSocketSettings,
+    custom_outbound_type, tailcat_emit_check, AnyTlsSettings, CustomSettings, GrpcSettings,
+    HttpSettings, Hysteria2ObfsSettings, Hysteria2Settings, HysteriaSettings, MasqueClientSettings,
+    MultiplexSettings, NaiveSettings, OpenconnectSettings, OpenvpnClientSettings,
+    OpenvpnTlsSettings, RealitySettings, ShadowsocksSettings, SnellSettings, SshSettings,
+    TailcatSettings, TlsSettings, TorSettings, TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{
     Protocol, SecurityMode, ServerConfig, WireGuardSettings,
@@ -818,6 +821,28 @@ pub fn parse_singbox_outbounds(
             r.skipped += 1;
             continue;
         }
+        // ── tailcat（I1，2026-09-24）：第一期**只收本地文件**（D4）──
+        // 它没有命令执行向量，但远端放开只会多出面（`derp_map_url` 可指向任意 URL）而没有已知受众：
+        // 新协议远端订阅本来就不下发。远端腿按「不支持类型」跳过并计入 skipped。
+        // 无 server/port（同 tor），不走 `map_singbox_outbound` 的公共前置守卫。
+        if ty == "tailcat" {
+            if origin != ImportOrigin::LocalFile {
+                bump(&mut skip_by_type, ty.clone());
+                r.skipped += 1;
+                continue;
+            }
+            match map_tailcat_outbound(ob, sub_id, now, id_gen) {
+                Some((s, ignored)) => {
+                    r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
+                    r.servers.push(s);
+                }
+                None => {
+                    missing_fields += 1;
+                    r.failed += 1;
+                }
+            }
+            continue;
+        }
         if !SINGBOX_SUPPORTED_TYPES.contains(&ty.as_str()) {
             // direct/block/selector 等内部 outbound 不计噪声。
             if SINGBOX_INTERNAL_TYPES.contains(&ty.as_str()) {
@@ -888,6 +913,7 @@ pub fn parse_singbox_outbounds(
 ///
 /// - `wireguard` → [`Protocol::Wireguard`] 建模映射（见 `map_wireguard_endpoint`）。
 /// - `tailscale` → **恒 skipped**（不建模、也不透传 custom），四条理由见函数体内该 match 臂的注释。
+/// - `masque-client` → [`Protocol::MasqueClient`]（`map_endpoint_masque`），**只收本地文件**，远端 skipped（D4）。
 /// - 其余三种 + 未知 type → 按 `origin` 走 custom 逃生舱（`isEndpoint = true`）/ skipped，
 ///   与 [`parse_singbox_outbounds`] 同一条信任级判据。
 pub fn parse_singbox_endpoints(
@@ -905,6 +931,7 @@ pub fn parse_singbox_endpoints(
     let mut skip_by_type: Vec<(String, usize)> = Vec::new();
     let mut tailscale_skipped = 0usize;
     let mut missing_fields = 0usize;
+    let mut masque_failed = 0usize;
 
     for ep in arr {
         if !ep.is_object() {
@@ -948,6 +975,22 @@ pub fn parse_singbox_endpoints(
             // 同一条信任判据：openconnect 的 `csd`（Cisco CSD 脚本）/ `tncc`（Juniper）是
             // **执行外部脚本**的键，透传袋会把它们从远端订阅原样带进下发配置 ⇒ 与 tor 同族的
             // 命令执行向量。故只许本地文件；远端订阅仍按「不支持类型」跳过并告警。
+            // ── masque-client（I1，2026-09-24）：第一期**只收本地文件**（D4），理由同 tailcat ——
+            // 没有命令执行向量，但远端放开会多出 `advertise_routes` 这条反向入站面，却没有已知受众。
+            "masque-client" if origin != ImportOrigin::LocalFile => {
+                bump(&mut skip_by_type, ty.clone());
+                r.skipped += 1;
+            }
+            "masque-client" => match map_endpoint_masque(ep, sub_id, now, id_gen) {
+                Some((s, ignored)) => {
+                    r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
+                    r.servers.push(s);
+                }
+                None => {
+                    masque_failed += 1;
+                    r.failed += 1;
+                }
+            },
             "openconnect" | "openvpn-client" if origin != ImportOrigin::LocalFile => {
                 bump(&mut skip_by_type, ty.clone());
                 r.skipped += 1;
@@ -995,6 +1038,12 @@ pub fn parse_singbox_endpoints(
             "跳过 {missing_fields} 个缺 private_key / peers 必填字段的 wireguard endpoint"
         ));
     }
+    if masque_failed > 0 {
+        r.warnings.push(format!(
+            "跳过 {masque_failed} 个缺 server / server_port，或 path / version 非法（会让内核整核起不来）\
+             的 masque-client endpoint"
+        ));
+    }
     r.finish()
 }
 
@@ -1014,6 +1063,7 @@ pub fn parse_singbox_endpoints(
 /// | `peers[0].persistent_keepalive_interval` | `persistentKeepalive`（>0 才写） |
 /// | `peers[0].reserved` | `reserved`（**恰 3 项**才写，与生成侧 `s.reserved.len() == 3` 对称） |
 /// | `mtu` | `mtu`（>0 才写） |
+/// | `on_demand` / `bind_interface` | 顶层 `onDemand` / `bindInterface`（[`ENDPOINT_TOP_LEVEL_KEYS`]，同 MASQUE） |
 ///
 /// `allowed_ips` 的拆分口径与粘贴 wg-quick `.conf` 那条腿逐字同源
 /// （`ui/src/components/dialogs/wg-logic.ts#draftFromParsed`）：全网段是「全隧道意图」、由
@@ -1035,6 +1085,7 @@ pub fn parse_singbox_endpoints(
 /// 载荷形态与生成侧**对称**：生成时把设置结构整体序列化 flatten 进 endpoint，
 /// 故导入时反过来 —— 建模键各归各位，其余原样进透传袋。
 /// 两侧共用同一份「哪些键建模了」的清单（下面的 `MODELED_*`），复制第二份必然漂移。
+/// `on_demand` / `bind_interface` 例外：生成侧读顶层，故提到顶层（[`ENDPOINT_TOP_LEVEL_KEYS`]，同 MASQUE）。
 ///
 /// 地址/端口：openconnect 的 `server` 是 `host:port` **单串**，openvpn 才有独立的 `server_port`。
 /// `ServerConfig` 的 address/port 是落盘门 `sanitize_servers` 的必填项，故从各自形态里拆出来。
@@ -1081,17 +1132,6 @@ fn map_endpoint_vpn_client(
         "domain_resolver",
         "detour",
     ];
-    let bag = |modeled: &[&str]| -> serde_json::Map<String, Value> {
-        let mut m = serde_json::Map::new();
-        if let Some(obj) = ep.as_object() {
-            for (k, v) in obj {
-                if !modeled.contains(&k.as_str()) {
-                    m.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        m
-    };
 
     let raw_server = str_ne(ep.get("server"))?;
     let (addr, port) = if ty == "openconnect" {
@@ -1115,6 +1155,7 @@ fn map_endpoint_vpn_client(
         Protocol::OpenvpnClient
     };
     let mut s = new_server(id_gen, ep, protocol, addr, port, sub_id, now);
+    lift_endpoint_top_level_keys(&mut s, ep);
 
     if ty == "openconnect" {
         s.openconnect_settings = Some(Box::new(OpenconnectSettings {
@@ -1131,7 +1172,7 @@ fn map_endpoint_vpn_client(
             user_agent: str_ne(ep.get("user_agent")),
             reported_os: str_ne(ep.get("reported_os")),
             system: ep.get("system").map(|v| bool_true(Some(v))),
-            extra: bag(MODELED_OC),
+            extra: endpoint_bag(ep, MODELED_OC),
         }));
     } else {
         let pem = |k: &str| -> Vec<String> {
@@ -1173,10 +1214,233 @@ fn map_endpoint_vpn_client(
                     })
                     .unwrap_or_default(),
             }),
-            extra: bag(MODELED_OV),
+            extra: endpoint_bag(ep, MODELED_OV),
         }));
     }
     Some(s)
+}
+
+/// 端点族（WireGuard / MASQUE / OpenConnect / OpenVPN Client）里生成侧按 `ServerConfig` **顶层**写的键。
+///
+/// 生成侧装配层对每条 endpoint 腿统一调 `apply_on_demand` / `apply_bind_interface`，读的是顶层
+/// `onDemand` / `bindInterface`：袋里的 `on_demand` 会原样下发而 UI 读顶层（界面显示关、内核实开），
+/// 袋里的 `bind_interface` 会被 `apply_bind_interface` 静默删掉。故导入时一律提到顶层、不进袋。
+const ENDPOINT_TOP_LEVEL_KEYS: &[&str] = &["on_demand", "bind_interface"];
+
+/// 把 [`ENDPOINT_TOP_LEVEL_KEYS`] 提到节点顶层。
+fn lift_endpoint_top_level_keys(s: &mut ServerConfig, ep: &Value) {
+    s.on_demand = ep.get("on_demand").and_then(Value::as_bool);
+    s.bind_interface = str_ne(ep.get("bind_interface"));
+}
+
+/// endpoint 的透传袋：`modeled` 与 [`ENDPOINT_TOP_LEVEL_KEYS`] 之外的键原样保留。
+fn endpoint_bag(ep: &Value, modeled: &[&str]) -> serde_json::Map<String, Value> {
+    ep.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| {
+            !modeled.contains(&k.as_str()) && !ENDPOINT_TOP_LEVEL_KEYS.contains(&k.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// 导入时丢弃的键 → 一条告警（无则 `None`）。
+///
+/// 被丢的都是「存下来也不会下发」的形态：生成侧会剥掉（`system` / `advertise_routes` / 版本不兼容的
+/// 调优键 / `http_client` …）或生成侧不读（MASQUE 的 `tls.alpn` 等）。悄悄存下，用户在编辑器里会以为
+/// 它生效；悄悄丢掉，用户不知道文件里那份设置没被照做。故丢，并在导入预览里说出来。
+fn ignored_keys_warning(name: &str, ignored: &[String]) -> Option<String> {
+    (!ignored.is_empty()).then(|| {
+        format!(
+            "节点「{name}」导入时忽略了 Polaris 不会下发的键：{}",
+            ignored.join(", ")
+        )
+    })
+}
+
+/// 透传袋里生成器不会下发的键 → 移出袋子并记进 `ignored`。
+///
+/// 「会不会下发」**问生成器本身**（`emitted` = 同一节点经生成侧构造器得到的键集），不在导入侧另抄
+/// 一份剥键表：剥键常量（`MASQUE_STRIPPED_KEYS`、按版本的 H2/QUIC 键、`TAILCAT_GENERATED_KEYS`）
+/// 以后怎么改，导入侧自动跟随，两边不会漂移。
+fn drop_unemitted_bag_keys(
+    bag: &mut serde_json::Map<String, Value>,
+    emitted: &serde_json::Map<String, Value>,
+    ignored: &mut Vec<String>,
+) {
+    bag.retain(|k, _| {
+        let kept = emitted.contains_key(k);
+        if !kept {
+            ignored.push(k.clone());
+        }
+        kept
+    });
+}
+
+/// `endpoints[].{type:"masque-client"}` → [`Protocol::MasqueClient`]。`None` = 计 failed。
+///
+/// # 映射（与生成侧 `build_masque_endpoint` 对位）
+///
+/// - `server` / `server_port` / `username` / `password` → 顶层（生成侧读顶层，不另存第二份）；
+/// - `on_demand` / `bind_interface` → 顶层同名字段（生成侧装配层按顶层写，袋里那份会被覆盖或删掉）；
+/// - `tls` 只收生成侧读的四项（`server_name` / `insecure` / 两种 pin），pin 走与其它协议同一个
+///   [`keep_valid_cert_pins`]；`security` 恒 `Tls`（生成侧恒开 TLS）——不复用 [`apply_tls`]：它会把
+///   `alpn` / `utls` / `ech` / `reality` 存进 `tlsSettings`，而 MASQUE 生成侧一个都不下发（`reality` 还会
+///   让导入汇合点 `drop_unemitted_cert_pins` 把 pin 当成不生效而删掉）；
+/// - `path` / `headers` / `version` / `mtu` → `masqueClientSettings` 具名字段，其余进透传袋；
+/// - `detour` / `domain_resolver` 指向文件内的 tag，对本机无意义，静默丢（与其余导入腿同口径）。
+///
+/// # 与生成侧同一判据
+///
+/// 装配完的节点直接喂给 `build_masque_endpoint`：`Err`（path / version 非法，内核整核起不来）⇒ 计 failed，
+/// 而不是导入一个生成时必被剔除的节点；袋里被它剥掉的键（`system` / `name` / `advertise_routes` /
+/// 版本不兼容的调优键）⇒ 不存并告警。
+fn map_endpoint_masque(
+    ep: &Value,
+    sub_id: &str,
+    now: &str,
+    id_gen: &mut impl FnMut() -> String,
+) -> Option<(ServerConfig, Vec<String>)> {
+    const MODELED: &[&str] = &[
+        "type",
+        "tag",
+        "server",
+        "server_port",
+        "username",
+        "password",
+        "tls",
+        "path",
+        "headers",
+        "version",
+        "mtu",
+        "detour",
+        "domain_resolver",
+    ];
+    let addr = str_ne(ep.get("server"))?;
+    let port = port_val(num_val(ep.get("server_port"))?)?;
+    let mut s = new_server(id_gen, ep, Protocol::MasqueClient, addr, port, sub_id, now);
+    s.username = str_ne(ep.get("username"));
+    s.password = str_ne(ep.get("password"));
+    lift_endpoint_top_level_keys(&mut s, ep);
+    s.security = Some(SecurityMode::Tls);
+
+    let mut ignored = Vec::new();
+    if let Some(tls) = ep.get("tls").and_then(Value::as_object) {
+        for (k, v) in tls {
+            match k.as_str() {
+                "server_name"
+                | "insecure"
+                | "certificate_sha256"
+                | "certificate_public_key_sha256" => {}
+                // `enabled:false` 也记：生成侧恒开 TLS，文件里的明文意图不会被照做。
+                "enabled" if v.as_bool() != Some(false) => {}
+                _ => ignored.push(format!("tls.{k}")),
+            }
+        }
+        s.tls_settings = Some(TlsSettings {
+            server_name: str_ne(tls.get("server_name")),
+            allow_insecure: Some(bool_true(tls.get("insecure"))),
+            certificate_sha256: cert_pins_str(tls.get("certificate_sha256")),
+            certificate_public_key_sha256: cert_pins_str(tls.get("certificate_public_key_sha256")),
+            ..Default::default()
+        });
+    }
+    let headers = ep.get("headers");
+    if headers.is_some_and(|h| !h.is_object()) {
+        ignored.push("headers".into());
+    }
+    let extra = endpoint_bag(ep, MODELED);
+    s.masque_client_settings = Some(Box::new(MasqueClientSettings {
+        path: str_ne(ep.get("path")),
+        headers: headers
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        version: num_val(ep.get("version")),
+        mtu: num_val(ep.get("mtu")),
+        extra,
+    }));
+
+    let emitted = build_masque_endpoint(&s, "import", None, None, |_, _| {}).ok()?;
+    let bag = &mut s.masque_client_settings.as_mut()?.extra;
+    drop_unemitted_bag_keys(bag, &emitted.extra, &mut ignored);
+    Some((s, ignored))
+}
+
+/// `outbounds[].{type:"tailcat"}` → [`Protocol::Tailcat`]。`None` = 计 failed。
+///
+/// 三把 key、psk、DERP 字段进 `tailcatSettings` 具名字段，其余进透传袋；`bind_interface` → 顶层；
+/// `http_client` 丢弃并告警（拉图出口由生成侧决定：`direct` 或前置代理，写成 selector 会自锁）；
+/// `detour` / `domain_resolver` 静默丢（文件内 tag，同其余导入腿）。
+///
+/// 与生成侧同一判据：`tailcat_emit_check` 不过（缺服务端 key / key 形态错 / DERP 冲突，内核整核起不来）
+/// ⇒ 计 failed；servers 模式下残留的 `derp_region` / `derp_map_url` 生成侧不下发 ⇒ 不存并告警；
+/// 袋里被生成器剥掉的键同样问 `build_proxy_outbound` 本身。
+fn map_tailcat_outbound(
+    ob: &Value,
+    sub_id: &str,
+    now: &str,
+    id_gen: &mut impl FnMut() -> String,
+) -> Option<(ServerConfig, Vec<String>)> {
+    const MODELED: &[&str] = &[
+        "type",
+        "tag",
+        "server_public_key",
+        "server_disco_key",
+        "pre_shared_key",
+        "private_key",
+        "derp_region",
+        "derp_map_url",
+        "derp_servers",
+        "bind_interface",
+        "http_client",
+        "detour",
+        "domain_resolver",
+    ];
+    let mut s = new_server(id_gen, ob, Protocol::Tailcat, String::new(), 0, sub_id, now);
+    s.bind_interface = str_ne(ob.get("bind_interface"));
+    let mut ignored = Vec::new();
+    if ob.get("http_client").is_some() {
+        ignored.push("http_client".to_string());
+    }
+    let mut extra = serde_json::Map::new();
+    if let Some(obj) = ob.as_object() {
+        for (k, v) in obj {
+            if !MODELED.contains(&k.as_str()) {
+                extra.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let mut t = TailcatSettings {
+        server_public_key: str_ne(ob.get("server_public_key")),
+        server_disco_key: str_ne(ob.get("server_disco_key")),
+        pre_shared_key: str_ne(ob.get("pre_shared_key")),
+        private_key: str_ne(ob.get("private_key")),
+        derp_region: ob.get("derp_region").and_then(Value::as_i64),
+        derp_map_url: str_ne(ob.get("derp_map_url")),
+        derp_servers: ob
+            .get("derp_servers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        extra,
+    };
+    tailcat_emit_check(Some(&t)).ok()?;
+    if !t.derp_servers.is_empty() {
+        // 过了判据 ⇒ 这里的 region 必 <= 0（内核视同未设）；两者生成侧在 servers 模式下都不写。
+        if t.derp_region.take().is_some() {
+            ignored.push("derp_region".into());
+        }
+        if t.derp_map_url.take().is_some() {
+            ignored.push("derp_map_url".into());
+        }
+    }
+    s.tailcat_settings = Some(Box::new(t));
+
+    let emitted = build_proxy_outbound(&s, "import", &DomainResolver::Tag(String::new()), "", "");
+    let bag = &mut s.tailcat_settings.as_mut()?.extra;
+    drop_unemitted_bag_keys(bag, &emitted.extra, &mut ignored);
+    Some((s, ignored))
 }
 
 fn map_wireguard_endpoint(
@@ -1221,7 +1485,7 @@ fn map_wireguard_endpoint(
     }
 
     let name = str_ne(ep.get("tag")).unwrap_or_else(|| format!("{server_addr}:{port}"));
-    Some(ServerConfig {
+    let mut s = ServerConfig {
         id: id_gen(),
         name,
         protocol: Protocol::Wireguard,
@@ -1232,7 +1496,9 @@ fn map_wireguard_endpoint(
         created_at: Some(now.to_string()),
         updated_at: Some(now.to_string()),
         ..Default::default()
-    })
+    };
+    lift_endpoint_top_level_keys(&mut s, ep);
+    Some(s)
 }
 
 fn bump(counts: &mut Vec<(String, usize)>, key: String) {

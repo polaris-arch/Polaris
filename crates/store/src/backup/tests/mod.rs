@@ -94,6 +94,28 @@ fn classify_endpoint_protocols_are_mesh() {
     );
 }
 
+/// 凭 `meshRoutes` 组网的 endpoint 腿（openconnect / openvpn-client / masque-client）：声明了非空段
+/// 才归「组网」，否则归「手动」—— 与 `is_mesh_node` 同口径（两处共用 `declares_mesh_routes`）。
+#[test]
+fn classify_mesh_routes_protocols_by_declared_routes() {
+    for proto in ["openconnect", "openvpn-client", "masque-client"] {
+        assert_eq!(
+            classify_server(&json!({ "protocol": proto, "meshRoutes": ["10.77.0.0/24"] })),
+            NodeCategory::Mesh,
+            "{proto} 声明了段"
+        );
+        assert_eq!(
+            classify_server(&json!({ "protocol": proto, "meshRoutes": ["  "] })),
+            NodeCategory::Manual,
+            "{proto} 只有空白项不算声明"
+        );
+        assert_eq!(
+            classify_server(&json!({ "protocol": proto })),
+            NodeCategory::Manual
+        );
+    }
+}
+
 // ── countCategory ──
 
 #[test]

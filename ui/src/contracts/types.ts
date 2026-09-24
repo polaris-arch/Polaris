@@ -5,6 +5,8 @@ import type {
   TorSettings,
   OpenconnectSettings,
   OpenvpnClientSettings,
+  MasqueClientSettings,
+  TailcatSettings,
   SnellSettings,
   TuicSettings,
   WireGuardSettings,
@@ -162,6 +164,10 @@ export type Protocol =
   | 'tor'
   | 'openconnect'
   | 'openvpn-client'
+  // 2026-09-24：MASQUE（RFC 9484 CONNECT-IP）客户端，内核 endpoint。
+  | 'masque-client'
+  // 2026-09-24：Tailcat（无地址 outbound，同 tor，DERP 引导的点对点 WireGuard）。
+  | 'tailcat'
   | 'custom';
 export type Network = 'tcp' | 'ws' | 'grpc' | 'http' | 'httpupgrade';
 export type Security = 'none' | 'tls' | 'reality';
@@ -261,8 +267,8 @@ export interface ServerConfig {
   onDemand?: boolean;
 
   /**
-   * 用户声明的「经该节点可达的内网段」（CIDR）。**只有 openconnect / openvpn-client 读它** ——
-   * 这两个协议的网段由服务端在隧道建立后 push、配置期不可知，故只认用户手填的这份；填了它们才具备
+   * 用户声明的「经该节点可达的内网段」（CIDR）。**只有 openconnect / openvpn-client / masque-client 读它** ——
+   * 这三个协议的网段由服务端在隧道建立后 push、配置期不可知，故只认用户手填的这份；填了它们才具备
    * 组网能力（`isMeshNode`）。WG 的段在 `wireguardSettings.allowedIPs`，TS 的由协议固定，都不走这里。
    *
    * 放顶层而不放各自的 settings 块：那两个块的键名 = sing-box 键名、整体 flatten 下发，塞个内核不认
@@ -298,6 +304,8 @@ export interface ServerConfig {
   torSettings?: TorSettings;
   openconnectSettings?: OpenconnectSettings;
   openvpnClientSettings?: OpenvpnClientSettings;
+  masqueClientSettings?: MasqueClientSettings;
+  tailcatSettings?: TailcatSettings;
 
   tuicSettings?: TuicSettings;
 

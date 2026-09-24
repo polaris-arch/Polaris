@@ -947,7 +947,8 @@ fn node_fingerprint(v: &Value) -> String {
 }
 
 /// 凭据落点（上游 `cred` 链）：uuid → password → shadowsocksSettings.password → username →
-/// sshSettings.password → wireguardSettings.peerPublicKey，首个非空即取（空串视缺）。
+/// sshSettings.password → wireguardSettings.peerPublicKey → tailcatSettings.serverPublicKey，
+/// 首个非空即取（空串视缺）。
 fn node_cred(v: &Value) -> String {
     let pick = |val: Option<&Value>| {
         val.and_then(Value::as_str)
@@ -963,6 +964,12 @@ fn node_cred(v: &Value) -> String {
             pick(
                 v.get("wireguardSettings")
                     .and_then(|s| s.get("peerPublicKey")),
+            )
+        })
+        .or_else(|| {
+            pick(
+                v.get("tailcatSettings")
+                    .and_then(|s| s.get("serverPublicKey")),
             )
         })
         .unwrap_or_default()

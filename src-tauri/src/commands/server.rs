@@ -8,6 +8,7 @@
 //! - `server:deleteBatch` → [`server_delete_batch`]
 //! - `server:switch` → [`server_switch`]
 //! - `server:generateUrl` → [`server_generate_url`]（config-engine ProtocolParser 等价）
+//! - `tailcat_keypair` → [`tailcat_keypair`]（Tailcat 客户端密钥对：生成 / 由私钥推导公钥）
 //! - `warp:register` / `warp:applyLicense` → [`warp_register`] / [`warp_apply_license`]（mesh crate）
 //! - `tailscale:login` / `loginCancel` / `logout` / `stateExists` / `getStatus` → tailscale_* （mesh crate）
 //!
@@ -558,6 +559,69 @@ pub fn server_generate_url(_state: State<'_, AppRuntime>, server: Value) -> ApiR
         Ok(url) => ApiResponse::ok(url),
         Err(e) => ApiResponse::err(e),
     }
+}
+
+/// `tailcat_keypair`：Tailcat 客户端密钥对（设计 D5）。`private_key` 缺省/空 ⇒ 生成新私钥；给了 ⇒ 只推导它的公钥。
+/// 返回 `{privateKey, publicKey}`（标准 base64）。
+///
+/// 推导照 sing-box `protocol/tailscale/tailcat_key.go`：公钥 = X25519(私钥, 基点 9)；新私钥落盘前按 X25519
+/// 裁剪（`clampTailcatPrivateKey`），与 `sing-box generate tailcat-keypair` 打印的私钥同形。disco 密钥由私钥
+/// 派生、只在客户端内部使用，服务端 `users` 只认公钥 ⇒ 不返回。**私钥不进日志**：错误文案不回显输入。
+#[tauri::command]
+pub fn tailcat_keypair(private_key: Option<String>) -> ApiResponse<Value> {
+    match tailcat_keypair_core(private_key.as_deref()) {
+        Ok((private, public)) => {
+            ApiResponse::ok(json!({ "privateKey": private, "publicKey": public }))
+        }
+        Err(e) => ApiResponse::err(e),
+    }
+}
+
+fn tailcat_keypair_core(private_key: Option<&str>) -> Result<(String, String), String> {
+    use crate::runtime::mesh::{base64_encode, generate_warp_seed};
+    let private = match private_key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => decode_tailcat_key(k)
+            .ok_or_else(|| "私钥须为 32 字节的标准 base64（44 个字符）".to_string())?,
+        None => {
+            let mut k =
+                generate_warp_seed().map_err(|_| "系统随机源不可用，无法生成密钥".to_string())?;
+            k[0] &= 248;
+            k[31] = (k[31] & 127) | 64;
+            k
+        }
+    };
+    let public = crate::runtime::x25519::x25519_base(&private);
+    Ok((base64_encode(&private), base64_encode(&public)))
+}
+
+/// 标准 base64 的 32 字节 key（44 字符、恰一个 `=`）→ 字节。形态判据与 config-engine
+/// `tailcat_emit_check` 相同：它拒的，这里也拒。
+fn decode_tailcat_key(s: &str) -> Option<[u8; 32]> {
+    let b = s.as_bytes();
+    if b.len() != 44 || b[43] != b'=' {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let (mut acc, mut bits, mut i) = (0u32, 0u32, 0usize);
+    for &c in &b[..43] {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out[i] = (acc >> bits) as u8;
+            i += 1;
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// 上游 `WARP_REGISTER`：注册匿名 WARP 设备 → WireGuard 草稿（mesh crate WarpService）。

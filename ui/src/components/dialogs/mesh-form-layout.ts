@@ -56,7 +56,10 @@ export function groupTsFields(fields: FieldSpec[]): Record<TsFormGroup, FieldSpe
   };
 }
 
-/** OpenConnect / OpenVPN 组网隧道的本地语法门；内核语义仍由后端最终校验。 */
+/**
+ * OpenConnect / OpenVPN / MASQUE 组网隧道的本地语法门；内核语义仍由后端最终校验。
+ * MASQUE 没有必填分支：Basic 凭据可选（服务端 users 为空时不校验），地址走 NodeDialog 通用校验。
+ */
 export function meshTunnelDraftError(
   proto: NodeProto,
   draft: FormValues

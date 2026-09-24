@@ -384,3 +384,60 @@ fn resolve_fallback_selected_requires_surviving_candidate() {
         "servers 字段缺失 → 无可校验候选 → 落直连哨兵（不写回未经校验的 id）"
     );
 }
+
+// ── Tailcat 客户端密钥对（设计 D5）──
+// 向量取自随包核 `resources/linux/sing-box generate tailcat-keypair`（1.15.0-alpha.7，一次性密钥）：
+// 同一私钥喂给本实现，公钥必须逐字节等于 sing-box 打印的 PublicKey。
+const SING_BOX_TAILCAT_VECTORS: [(&str, &str); 2] = [
+    (
+        "6FHZ9B+YJrldLRgyXQwnuhJDhPnxUtHoHOq0At8smHQ=",
+        "dinJxIQiMsfg+X5vvV6QhuPIaxT4C1Buurk/GDTskCw=",
+    ),
+    (
+        "aHmcg+xCMTDI1u1sVtiBEeOGO+kKXr+I8m8gKGZtm3Q=",
+        "SacA1bTwO2c88WnlkNufPAdRjQSdYz+B9jJQUiL+2iA=",
+    ),
+];
+
+#[test]
+fn tailcat_public_key_matches_sing_box_generate() {
+    for (private, public) in SING_BOX_TAILCAT_VECTORS {
+        let (p, pubkey) = tailcat_keypair_core(Some(private)).expect("合法私钥应能推导");
+        assert_eq!(p, private, "推导腿不改写私钥");
+        assert_eq!(pubkey, public, "公钥与 sing-box 推导不一致");
+    }
+}
+
+#[test]
+fn tailcat_generated_private_key_is_clamped_and_derivable() {
+    let (private, public) = tailcat_keypair_core(None).expect("生成应成功");
+    let bytes = decode_tailcat_key(&private).expect("生成的私钥必须是 44 字符标准 base64");
+    assert_eq!(
+        bytes[0] & 7,
+        0,
+        "低 3 位须清零（sing-box clampTailcatPrivateKey）"
+    );
+    assert_eq!(bytes[31] & 0xC0, 0x40, "最高位清零、次高位置 1");
+    assert_eq!(
+        tailcat_keypair_core(Some(&private)).unwrap().1,
+        public,
+        "同一私钥两条腿公钥一致"
+    );
+    let (again, _) = tailcat_keypair_core(Some("  ")).unwrap();
+    assert_ne!(again, private, "空白私钥等同未填 ⇒ 生成新私钥");
+}
+
+#[test]
+fn tailcat_keypair_rejects_malformed_private_key_without_echoing_it() {
+    let hex = "e851d9f41f9826b95d2d18325d0c27ba124384f9f152d1e81ceab402df2c9874";
+    let url_safe = "6FHZ9B-YJrldLRgyXQwnuhJDhPnxUtHoHOq0At8smHQ=";
+    for bad in [
+        hex,
+        url_safe,
+        "6FHZ9B+YJrldLRgyXQwnuhJDhPnxUtHoHOq0At8smHQ",
+        "c2hvcnQ=",
+    ] {
+        let err = tailcat_keypair_core(Some(bad)).expect_err(bad);
+        assert!(!err.contains(bad), "错误文案不得回显私钥：{err}");
+    }
+}

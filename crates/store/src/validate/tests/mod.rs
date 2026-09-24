@@ -56,6 +56,31 @@ fn protocol_requirement_checks() {
         "openvpn-client",
         &serde_json::json!({"openvpnClientSettings":{"server":"x"}})
     ));
+    // masque-client：地址走通用校验、Basic 可选、TLS 生成侧恒开 ⇒ 无协议级必填。
+    assert!(protocol_requirement_ok(
+        "masque-client",
+        &serde_json::json!({"address":"mq.example.com","port":443})
+    ));
+    // tailcat：与生成侧同一个判据（坏 key / DERP 冲突下发即整核失败，落盘门不得更宽）。
+    let tc = |settings: serde_json::Value| serde_json::json!({ "tailcatSettings": settings });
+    let pk = "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=";
+    assert!(protocol_requirement_ok(
+        "tailcat",
+        &tc(serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk,"derpRegion":1}))
+    ));
+    for bad in [
+        serde_json::json!({"serverPublicKey":pk,"derpRegion":1}),
+        serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk}),
+        serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk,"derpRegion":1,
+            "derpServers":["d.example"]}),
+        serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk,"derpRegion":"1"}),
+    ] {
+        assert!(
+            !protocol_requirement_ok("tailcat", &tc(bad.clone())),
+            "{bad}"
+        );
+    }
+    assert!(!protocol_requirement_ok("tailcat", &serde_json::json!({})));
 }
 
 #[test]

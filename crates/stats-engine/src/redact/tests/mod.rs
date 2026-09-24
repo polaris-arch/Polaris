@@ -851,3 +851,48 @@ fn 红线_端到端_配置加日志无明文密钥与节点身份() {
         "占位符应出现"
     );
 }
+
+/// MASQUE `headers` 里的鉴权头：键名归一后命中 `authorization` ⇒ 整值打码；同一节点的形态信息
+/// （`path` / `version` / 非鉴权头）必须保留 —— 打码过度同样毁掉诊断价值。
+#[test]
+fn 红线_masque_authorization_头打码_形态保留() {
+    let v = json!({ "servers": [{
+        "protocol": "masque-client",
+        "masqueClientSettings": {
+            "path": "/masque", "version": 2,
+            "headers": { "Authorization": ["Bearer MASQUE_TOKEN"], "X-Tenant": "acme" }
+        }
+    }]});
+    let out = redact(&v);
+    assert_no_plaintext(&out, &["MASQUE_TOKEN"]);
+    let m = &out["servers"][0]["masqueClientSettings"];
+    assert_eq!(m["headers"]["Authorization"], json!(REDACTED));
+    assert_eq!(m["headers"]["X-Tenant"], json!("acme"));
+    assert_eq!(m["path"], json!("/masque"));
+    assert_eq!(m["version"], json!(2));
+}
+
+/// Tailcat 服务端公钥是准入凭据 ⇒ 打码（camelCase 设置与内核 snake_case 两种键名都要命中）；
+/// 同族的 disco key 明文过线、DERP region 是形态信息 ⇒ 保留。
+#[test]
+fn 红线_tailcat_服务端公钥打码_disco_key保留() {
+    let v = json!({
+        "servers": [{
+            "protocol": "tailcat",
+            "tailcatSettings": {
+                "serverPublicKey": "TC_SERVER_PUB", "serverDiscoKey": "TC_DISCO",
+                "preSharedKey": "TC_PSK", "derpRegion": 900
+            }
+        }],
+        "outbounds": [{ "type": "tailcat", "server_public_key": "TC_SERVER_PUB_WIRE",
+                        "server_disco_key": "TC_DISCO" }]
+    });
+    let out = redact(&v);
+    assert_no_plaintext(&out, &["TC_SERVER_PUB", "TC_SERVER_PUB_WIRE", "TC_PSK"]);
+    let t = &out["servers"][0]["tailcatSettings"];
+    assert_eq!(t["serverPublicKey"], json!(REDACTED));
+    assert_eq!(t["serverDiscoKey"], json!("TC_DISCO"));
+    assert_eq!(t["derpRegion"], json!(900));
+    assert_eq!(out["outbounds"][0]["server_public_key"], json!(REDACTED));
+    assert_eq!(out["outbounds"][0]["server_disco_key"], json!("TC_DISCO"));
+}

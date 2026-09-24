@@ -394,3 +394,64 @@ fn full_config_gate_rejects_missing_srs_path_mutation() {
         "变异未精确还原"
     );
 }
+
+/// Tailcat servers 模式的 DERP 字面 IP 进 TUN `route_exclude_address`（非 Linux）后，完整配置仍被真核接受。
+///
+/// 出站面门（`kernel_accepts_outbounds::bundled_core_accepts_tailcat_outbound`）剥掉了 inbounds，
+/// 看不到 TUN 排除表；这里在 darwin / win32 TUN 基线上换成 Tailcat 出口，整份配置喂 check。
+#[test]
+fn bundled_core_accepts_tailcat_derp_ips_in_tun_route_exclude() {
+    let temp = tempdir().expect("建 TempDir");
+    let tailcat: polaris_config_engine::user_config::server_config::ServerConfig =
+        serde_json::from_value(json!({
+            "id": "tc", "name": "TC-SERVERS", "protocol": "tailcat",
+            "tailcatSettings": {
+                "serverPublicKey": "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=",
+                "serverDiscoKey": "qQ+kiWwZ8BrTYDZpj+6bnx2JxWxx0SAh1krqPGndCmQ=",
+                "derpServers": ["derp1.example",
+                    { "host": "derp2.example", "ipv4": "192.0.2.10", "ipv6": "2001:db8::10" },
+                    { "host": "derp3.example", "ipv4": "none" }, { "host": "192.0.2.20" }]
+            }
+        }))
+        .expect("Tailcat 夹具无效");
+    let mut values = Vec::new();
+    for name in ["TUN+trojan-darwin", "TUN+trojan-win32"] {
+        let mut case = load_cases()
+            .into_iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("基线 fixture {name} 不得丢失"));
+        case.input.servers.push(tailcat.clone());
+        case.input.selected_server_id = Some("tc".into());
+        let deps = full_config_deps(&case, &temp);
+        let cfg = generate_sing_box_config(&case.input, &BTreeMap::new(), &deps)
+            .unwrap_or_else(|e| panic!("{name} 生成失败: {e}"));
+        let value = serde_json::to_value(&cfg).expect("序列化");
+        let tun = value["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "tun")
+            .unwrap_or_else(|| panic!("{name} 缺 tun inbound"));
+        let exclude = tun["route_exclude_address"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for cidr in ["192.0.2.10/32", "2001:db8::10/128", "192.0.2.20/32"] {
+            assert!(
+                exclude.contains(&json!(cidr)),
+                "{name} 排除表缺 {cidr}：{exclude:?}"
+            );
+        }
+        values.push((name, value));
+    }
+
+    let Some(core) = core_or_skip("Tailcat DERP 排除完整配置门") else {
+        return;
+    };
+    for (i, (name, value)) in values.iter().enumerate() {
+        let path = temp.path().join(format!("tailcat-tun-{i}.json"));
+        std::fs::write(&path, serde_json::to_vec_pretty(value).expect("JSON 编码")).expect("写盘");
+        let (ok, diag) = check(&core, &path);
+        assert!(ok, "{name} 含 DERP 排除的完整配置被真核拒绝：{diag}");
+    }
+}

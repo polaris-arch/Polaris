@@ -14,7 +14,7 @@
  *  - 已结束：订阅首帧/reset 为最多 1000 条全量，常态只合并本批新增/淘汰项
  *  - TOP：statsApi.subscribe('aggregate') + onConnectionsAggregate
  *  - 关单条：connectionsApi.close(id)（真调管理 API gRPC CloseConnection）+ 乐观移除（失败回滚）
- *  - 关全部：connectionsApi.closeAll()（真调 CloseAllConnections）
+ *  - 关全部：connectionsApi.closeAll()（后端取连接快照逐条 gRPC CloseConnection；不调 CloseAllConnections、不触发 ResetNetwork）
  *  - 暂停：**退订**冻结（不是只冻渲染）——暂停即 unsubscribe('detail')，后端据订阅集降 worker demand，
  *    整条 1s 轮询 + 逐帧序列化链路停机；恢复即重订，下一帧（≤1s）回填。
  *    **切到其它视图是同一次退订**：活动列表不再消费明细帧时，整条数据链立即停机。

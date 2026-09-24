@@ -22,6 +22,7 @@ use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 
 use crate::events::channel::{EVENT_PROXY_STARTED, EVENT_PROXY_STOPPED};
 use crate::response::{ok_void, ApiResponse};
+use crate::runtime::management_api::{close_live_connections, GrpcManagementApi};
 use crate::runtime::proxy::{PendingChangesSummary, ProxyStatus, StartError};
 use crate::runtime::AppRuntime;
 
@@ -573,9 +574,15 @@ pub async fn connections_close(
     })
 }
 
-/// 上游 `CONNECTIONS_CLOSE_ALL`：关全部连接（管理 API gRPC `CloseAllConnections`，clash `DELETE /connections` 等价，触发 ResetNetwork）。
+/// 上游 `CONNECTIONS_CLOSE_ALL`：关全部连接 —— 取连接快照后对每条活连接逐条 gRPC `CloseConnection`
+/// （[`close_live_connections`]，与 TUN 起核 flush 共用）。
 ///
-/// 核未运行 / gRPC 失败 → clean error；成功 → `{ ok: true }`。
+/// **不调 `CloseAllConnections`**：sing-box 该 RPC 还会 `connectionManager.CloseAll()`，连带关掉默认拨号器
+/// 登记的节点传输 socket（MASQUE QUIC / DoH 等），隧道重建期间解析黑洞（因果链见
+/// `runtime/proxy/connection_flush.rs` 模块文档）。本路径也**不**触发 ResetNetwork（那是 clash
+/// `DELETE /connections` 的行为，gRPC 路径从未调用）。
+///
+/// 核未运行 / 建连或快照失败 → clean error；成功 → `{ ok: true, closed, failed }`（成功 / 单条失败条数；单条失败不中断其余，也不把整体判失败）。
 #[tauri::command]
 pub async fn connections_close_all(state: State<'_, AppRuntime>) -> Result<ApiResponse<Value>, ()> {
     let (port, secret) = match management_endpoint(&state) {
@@ -586,10 +593,12 @@ pub async fn connections_close_all(state: State<'_, AppRuntime>) -> Result<ApiRe
         Ok(c) => c,
         Err(e) => return Ok(ApiResponse::err(format!("管理 API 连接失败: {e}"))),
     };
-    Ok(match client.close_all_connections().await {
-        Ok(()) => ApiResponse::ok(json!({ "ok": true })),
-        Err(e) => ApiResponse::err(format!("关闭全部连接失败: {e}")),
-    })
+    Ok(
+        match close_live_connections(&GrpcManagementApi::new(client)).await {
+            Ok(o) => ApiResponse::ok(json!({ "ok": true, "closed": o.closed, "failed": o.failed })),
+            Err(e) => ApiResponse::err(format!("关闭全部连接失败: {e}")),
+        },
+    )
 }
 
 /// 上游 `SYSTEM_PROXY_DISABLE`：用户主动清理系统代理残留设置（TUN 残留提示的一键恢复动作）。

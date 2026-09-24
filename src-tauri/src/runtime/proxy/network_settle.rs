@@ -7,8 +7,8 @@ use tokio::sync::Notify;
 
 /// Polaris 自身发起网络请求前的**起核稳定门**。
 ///
-/// TUN 起核会在 selector 校正后延迟调用一次 `CloseAllConnections`。若后台订阅恰在这段窗口内发请求，
-/// 那条新连接也会被无差别 RST；Windows 冷启动日志已出现两次「flush 成功」与订阅传输失败同毫秒的
+/// TUN 起核会在 selector 校正后延迟做一次连接 flush（取快照、逐条 `CloseConnection` 关闭全部活连接）。
+/// 若后台订阅恰在这段窗口内发请求、且那条新连接已进快照，它也会被一并 RST；Windows 冷启动日志已出现两次「flush 成功」与订阅传输失败同毫秒的
 /// 实证。计数而非布尔是因为显式 start / 去抖重启 / 崩溃自愈可能重叠；只有最后一条起核/flush 腿
 /// 退场，等待者才可继续。
 #[derive(Default)]

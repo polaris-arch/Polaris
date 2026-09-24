@@ -1471,6 +1471,10 @@ pub fn encode_share_url(c: &ServerConfig) -> Result<String, String> {
         Protocol::OpenvpnClient => {
             Err("openvpn-client 的凭据是证书材料，不适合塞进分享链接".into())
         }
+        // sing-box 不定义分享链接；mihomo 的 `type: masque` 是 WARP 专用、也不产 URI —— 无一手文法。
+        Protocol::MasqueClient => Err("masque-client 无标准分享链接文法".into()),
+        // 上游 tailcat 有 `tc…` 地址（CBOR），但 sing-box 服务端不产出它、数据面互通未验证，本期不做（D5）。
+        Protocol::Tailcat => Err("tailcat 无 server/port，本期不支持分享链接".into()),
         Protocol::Hysteria => Err("hysteria (v1) 无标准分享链接文法".into()),
         Protocol::Tor => Err("tor 无 server/port，分享链接的前提不成立".into()),
         Protocol::Vless => encode_vless(c),

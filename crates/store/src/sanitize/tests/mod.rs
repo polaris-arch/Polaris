@@ -46,6 +46,28 @@ fn bad_server_dropped_good_server_kept() {
     assert_eq!(servers[0]["id"], "good");
 }
 
+/// tailcat 是无地址协议（同 tor）：没有 address/port 也保留；设置块不合格则按必填门丢弃。
+#[test]
+fn addressless_tailcat_kept_invalid_tailcat_dropped() {
+    let pk = "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=";
+    let json = format!(
+        r#"{{"servers":[
+            {{"id":"tc","name":"TC","protocol":"tailcat",
+              "tailcatSettings":{{"serverPublicKey":"{pk}","serverDiscoKey":"{pk}","derpRegion":1}}}},
+            {{"id":"bad","name":"Bad","protocol":"tailcat",
+              "tailcatSettings":{{"serverPublicKey":"{pk}","derpRegion":1}}}}
+        ]}}"#
+    );
+    let v = sanitize_config(&json).unwrap();
+    let ids: Vec<&str> = v["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["tc"]);
+}
+
 #[test]
 fn bool_field_bad_removed() {
     let json = r#"{

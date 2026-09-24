@@ -189,10 +189,13 @@ function rustJsonKeys(src: string, structName: string): string[] {
     at: m.index as number,
   }));
   expect(decls.length, `${structName} 没解析出任何字段 —— 解析器失效，必须转红`).toBeGreaterThan(0);
-  return decls.map((d, i) => {
+  return decls.flatMap((d, i) => {
     const attrs = body.slice(i === 0 ? 0 : decls[i - 1].at, d.at);
+    // `#[serde(flatten)]` 的透传袋没有自己的 JSON 键（内容摊平进父对象），前端对应的是索引签名。
+    // 不跳过的话 MASQUE 这类「建模键 + 袋」结构会被要求在 TS 里声明一个根本不存在的 `extra` 键。
+    if (/serde\(\s*flatten\s*\)/.test(attrs)) return [];
     const renamed = /rename\s*=\s*"([^"]+)"/.exec(attrs);
-    return renamed ? renamed[1] : d.name;
+    return [renamed ? renamed[1] : d.name];
   });
 }
 
@@ -642,6 +645,59 @@ function protoVariants(seg: string, label: string): string[] {
 /** 恒需 TLS 块的协议（`builder/outbound.rs` 的 `TLS_PROTOCOLS`，符号即解析锚点）。 */
 const RUST_TLS_PROTOCOLS = rustStrSlice(RUST_OUTBOUND, 'TLS_PROTOCOLS');
 
+/** Rust `Protocol` 变体 → wire 名（per-variant `rename` 优先，否则枚举级 lowercase）。 */
+const RUST_WIRE_NAMES: ReadonlyMap<string, string> = (() => {
+  const body = /pub enum Protocol \{([\s\S]*?)\n\}/.exec(RUST_SERVER_CONFIG)?.[1];
+  expect(body, 'Rust 侧 pub enum Protocol 解析失败 —— 解析不到必须转红').toBeDefined();
+  const out = new Map<string, string>();
+  let pending: string | null = null;
+  for (const line of (body as string).split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('//')) continue;
+    const rename = /#\[serde\(rename = "([^"]+)"/.exec(t);
+    if (rename) pending = rename[1];
+    const v = /^([A-Z]\w*)\s*,/.exec(t);
+    if (v) {
+      out.set(v[1], pending ?? v[1].toLowerCase());
+      pending = null;
+    }
+  }
+  expect(out.get('MasqueClient'), 'wire 名解析器没读到 per-variant rename').toBe('masque-client');
+  return out;
+})();
+
+/**
+ * `builder/endpoints.rs` 里**读 `tls_settings`** 的 endpoint 构造函数所对应的协议（wire 名）。
+ * `TLS_PROTOCOLS` 只是 outbound 腿的清单，endpoint 腿的 TLS 消费点不在里面 —— 不把这里并进对拍源，
+ * 「给某个 endpoint 协议接了 TLS 而归属表没跟」就不会红。协议从同一函数体里的 `Protocol::X` 取。
+ */
+const RUST_ENDPOINT_TLS_READERS: readonly string[] = (() => {
+  const src = read('../../../crates/config-engine/src/builder/endpoints.rs');
+  const masked = maskRust(src);
+  const out = new Set<string>();
+  for (const m of masked.matchAll(/pub fn (\w+)\(/g)) {
+    const open = masked.indexOf('{', m.index as number);
+    let depth = 0;
+    let end = -1;
+    for (let i = open; i < masked.length; i++) {
+      if (masked[i] === '{') depth++;
+      else if (masked[i] === '}' && --depth === 0) {
+        end = i;
+        break;
+      }
+    }
+    expect(end, `endpoints.rs 的 ${m[1]} 花括号不配对 —— 解析器失效`).toBeGreaterThan(open);
+    const fnBody = masked.slice(open, end);
+    if (!/\btls_settings\b/.test(fnBody)) continue;
+    for (const v of fnBody.matchAll(/Protocol::(\w+)/g)) {
+      const wire = RUST_WIRE_NAMES.get(v[1]);
+      expect(wire, `endpoints.rs 引用了未知变体 Protocol::${v[1]}`).toBeDefined();
+      out.add(wire as string);
+    }
+  }
+  return [...out];
+})();
+
 /** multiplex 真正下发的协议面（`apply_anti_censorship_options` 里那句 `matches!`）。 */
 const RUST_MUX_PROTOCOLS = protoVariants(
   rustMatchesArgs(RUST_OUTBOUND, 'if let Some(mux) = &server.multiplex_settings'),
@@ -716,7 +772,9 @@ const RUST_NO_FRAGMENT = (() => {
 const STRUCT_OWNERS: Record<string, readonly NodeProto[]> = {
   // 'hysteria'（v1）2026-08-11 进 Rust 的 TLS_PROTOCOLS：随包核对缺 TLS 的 v1 出站判
   // `initialize outbound[0]: TLS required`（initialize 阶段硬失败，不是可选块）。
-  TlsSettings: ['vless', 'vmess', 'trojan', 'hysteria2', 'tuic', 'http', 'anytls', 'naive', 'hysteria'],
+  // 'masque-client' 2026-09-24：endpoint 腿而非 outbound，故不在 `TLS_PROTOCOLS` 里；它的消费点是
+  // `builder/endpoints.rs::build_masque_endpoint`，由锁 5 的「endpoint 构造函数读 tls_settings」那条对拍。
+  TlsSettings: ['vless', 'vmess', 'trojan', 'hysteria2', 'tuic', 'http', 'anytls', 'naive', 'hysteria', 'masque-client'],
   RealitySettings: ['vless', 'anytls'],
   WebSocketSettings: ['vless', 'vmess', 'trojan'],
   GrpcSettings: ['vless', 'vmess', 'trojan'],
@@ -732,6 +790,8 @@ const STRUCT_OWNERS: Record<string, readonly NodeProto[]> = {
   SshSettings: ['ssh'],
   ShadowTlsSettings: ['shadowsocks'],
   CustomSettings: ['custom'],
+  MasqueClientSettings: ['masque-client'],
+  TailcatSettings: ['tailcat'],
 };
 
 /** `结构体::协议` —— 债务表与豁免表共用的键形。 */
@@ -1102,7 +1162,34 @@ const GRPC_MULTIMODE_EXEMPT: Record<string, Exemption> = {
   },
 };
 
+
+/**
+ * MASQUE 的 TLS 块由 `build_masque_endpoint` **新造**：只取 SNI / insecure / 两种 pin，其余项逐个写死
+ * `None` ⇒ 这些键在 MASQUE 上一律到不了内核，给控件就是假开关。锚点定在该函数体上：
+ * `alpn: None,` 之类在 `builder/endpoints.rs` 里目前只此一处，但 naive 臂那次的教训是同形姊妹迟早会长出来。
+ */
+const MASQUE_FN = 'pub fn build_masque_endpoint(';
+const MASQUE_ENDPOINTS_RS = 'crates/config-engine/src/builder/endpoints.rs';
+const masqueTlsNone = (needle: string, why: string): Exemption => ({
+  why,
+  cite: [
+    { at: MASQUE_ENDPOINTS_RS, scope: MASQUE_FN, needle: 'TLS 恒开' },
+    { at: MASQUE_ENDPOINTS_RS, scope: MASQUE_FN, needle },
+  ],
+});
+const MASQUE_TLS_EXEMPT: Record<string, Exemption> = {
+  alpn: masqueTlsNone('alpn: None,', 'ALPN 由 version 决定；用户手填会与 version 自相矛盾，构造函数写死 None。'),
+  fingerprint: masqueTlsNone('utls: None,', 'uTLS 本期不下发（QUIC 路径用不了），构造函数写死 None。'),
+  fragment: masqueTlsNone('fragment: None,', 'ClientHello 分片是 TCP-TLS 手法，endpoint 腿不走全局分片循环，构造函数写死 None。'),
+  engine: masqueTlsNone('engine: None,', 'TLS 栈引擎本期不下发，构造函数写死 None。'),
+  ech: masqueTlsNone('ech: None,', 'ECH 本期不下发，构造函数写死 None。'),
+  echConfig: masqueTlsNone('ech: None,', '同 `ech`：整个 ECH 块写死 None，配置串无处可去。'),
+  spoofSni: masqueTlsNone('spoof: None,', 'TLS spoof 本期不下发，构造函数写死 None。'),
+  spoofMethod: masqueTlsNone('spoof_method: None,', '同 `spoofSni`：两键是一对，一并写死 None。'),
+};
+
 const NODE_EXEMPT: Record<string, Record<string, Exemption>> = {
+  [pairKey('TlsSettings', 'masque-client')]: MASQUE_TLS_EXEMPT,
   [pairKey('TlsSettings', 'hysteria2')]: QUIC_TLS_EXEMPT,
   // hysteria v1 与 hy2/tuic 在上游走同一个 tls.NewClient，TLS 同由 QUIC 栈接管 ⇒ 同一份豁免。
   [pairKey('TlsSettings', 'hysteria')]: QUIC_TLS_EXEMPT,
@@ -1299,6 +1386,8 @@ const MIN_FIELDS: Record<string, number> = {
   SshSettings: 11,
   ShadowTlsSettings: 4,
   CustomSettings: 3,
+  MasqueClientSettings: 4,
+  TailcatSettings: 7,
 };
 
 // ── 断言 ──
@@ -1711,6 +1800,18 @@ describe('锁 5：归属表自身的牙（否则归属表就是下一个盲区�
       expect(
         owners('TlsSettings'),
         `builder/outbound.rs 的 TLS_PROTOCOLS 含 "${p}"（该协议恒有 TLS 块），但 STRUCT_OWNERS.TlsSettings 里没有它`
+      ).toContain(p);
+    }
+  });
+
+  it('Rust endpoint 构造函数读 `tls_settings` 的协议全在 TlsSettings 的 owners 里（TLS_PROTOCOLS 只管 outbound）', () => {
+    const readers = RUST_ENDPOINT_TLS_READERS;
+    // 正向对照：今天至少 MASQUE 一支读它 —— 解析器若把函数体切空，这里先红，而不是下面的循环空转。
+    expect(readers).toContain('masque-client');
+    for (const p of readers) {
+      expect(
+        owners('TlsSettings'),
+        `builder/endpoints.rs 里 "${p}" 的构造函数读 tls_settings，但 STRUCT_OWNERS.TlsSettings 里没有它`
       ).toContain(p);
     }
   });

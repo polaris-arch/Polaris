@@ -37,7 +37,9 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value};
 
 use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
-use polaris_config_engine::user_config::server_config::{is_mesh_protocol, Protocol};
+use polaris_config_engine::user_config::server_config::{
+    declares_mesh_routes, is_mesh_protocol, Protocol,
+};
 
 /// 备份类别（上游 `BackupCategory`）。序列化形 = 前端字符串（camelCase）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -213,7 +215,7 @@ fn servers(config: &Value) -> &[Value] {
 /// 协议解析失败（未知/缺失/非串）→ 非组网（对齐 TS `isMeshProtocol(undefined)` = false），
 /// 即归手动节点：**宁可把坏节点算进手动类也不丢**（备份类别是搬运分桶，不是校验门）。
 ///
-/// 判据与前端的组网页签同源（`is_mesh_node` 的节点级口径）：openconnect / openvpn-client 只在用户
+/// 判据与前端的组网页签同源（`is_mesh_node` 的节点级口径）：`declares_mesh_routes` 命中的协议只在用户
 /// 声明了 `meshRoutes` 时才算组网。这里直接读 JSON 而不反序列化整个 `ServerConfig` —— 备份搬的是
 /// 用户磁盘上的原始 config，其中可能有本仓当前建模不了的字段，整体反序列化失败就会把整个节点丢掉。
 fn classify_server(server: &Value) -> NodeCategory {
@@ -224,7 +226,7 @@ fn classify_server(server: &Value) -> NodeCategory {
         .get("protocol")
         .and_then(Value::as_str)
         .and_then(|p| serde_json::from_value::<Protocol>(Value::String(p.to_string())).ok());
-    let declares_mesh_routes = || {
+    let has_mesh_routes = || {
         server
             .get("meshRoutes")
             .and_then(Value::as_array)
@@ -233,11 +235,8 @@ fn classify_server(server: &Value) -> NodeCategory {
                     .any(|c| c.as_str().is_some_and(|s| !s.trim().is_empty()))
             })
     };
-    let is_mesh = proto.is_some_and(|p| {
-        is_mesh_protocol(p)
-            || (matches!(p, Protocol::Openconnect | Protocol::OpenvpnClient)
-                && declares_mesh_routes())
-    });
+    let is_mesh = proto
+        .is_some_and(|p| is_mesh_protocol(p) || (declares_mesh_routes(p) && has_mesh_routes()));
     if is_mesh {
         NodeCategory::Mesh
     } else {

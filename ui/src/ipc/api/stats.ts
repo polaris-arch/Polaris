@@ -76,8 +76,8 @@ export const connectionsApi = {
   async close(id: string): Promise<{ ok: boolean }> {
     return invoke(IPC_CHANNELS.CONNECTIONS_CLOSE, { id });
   },
-  /** 关全部连接（后端经 9090 DELETE /connections，触发 ResetNetwork）。 */
-  async closeAll(): Promise<{ ok: boolean }> {
+  /** 关全部连接（后端取快照逐条 CloseConnection，不触发 ResetNetwork，不碰节点自身传输连接）。 */
+  async closeAll(): Promise<{ ok: boolean; closed?: number; failed?: number }> {
     return invoke(IPC_CHANNELS.CONNECTIONS_CLOSE_ALL);
   },
 };

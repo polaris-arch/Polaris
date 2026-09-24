@@ -43,6 +43,8 @@ export type NodeProto =
   | 'tor'
   | 'openconnect'
   | 'openvpn-client'
+  | 'masque-client'
+  | 'tailcat'
   | 'custom';
 
 /** 协议下拉选项（value = NodeProto，label = 展示名）。 */
@@ -63,6 +65,9 @@ export const PROTO_OPTIONS: readonly (readonly [NodeProto, string])[] = [
   ['tor', 'Tor'],
   ['openconnect', 'OpenConnect'],
   ['openvpn-client', 'OpenVPN'],
+  // 展示名与 wire 名解耦（同 openvpn-client → OpenVPN）：wire 名取内核 type 名，三张登记表照它对齐。
+  ['masque-client', 'MASQUE'],
+  ['tailcat', 'Tailcat'],
   ['custom', 'Custom'],
 ];
 
@@ -88,10 +93,10 @@ const COMMON: readonly NodeProto[] = [
 ];
 
 /** 普通入口的其它代理。显式列举，避免把新的组网 endpoint 误吸进普通节点下拉。 */
-const PROXY: readonly NodeProto[] = ['socks', 'http', 'snell', 'ssh', 'hysteria', 'tor'];
+const PROXY: readonly NodeProto[] = ['socks', 'http', 'snell', 'ssh', 'hysteria', 'tor', 'tailcat'];
 
 /** 组网弹窗中由 NodeDialog 承载的隧道接入。WireGuard 有自己的专用弹窗。 */
-export const MESH_TUNNEL_NODE_PROTOCOLS = ['openconnect', 'openvpn-client'] as const satisfies readonly NodeProto[];
+export const MESH_TUNNEL_NODE_PROTOCOLS = ['openconnect', 'openvpn-client', 'masque-client'] as const satisfies readonly NodeProto[];
 
 /** 仅用于选择正确的表单入口，不代表后端协议类型。 */
 export function isMeshTunnelNodeProtocol(proto: NodeProto): boolean {
@@ -809,6 +814,33 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       { t: 'textarea', k: 'extraJson', label: 'node.field.extraJson', hint: 'node.field.extraJsonHint', mono: true, rows: 4, opt: true },
     ],
   },
+  // ── Tailcat（2026-09-24）── 无地址 outbound（同 Tor）：对端由两把服务端公钥定位，经 DERP 引导打洞/中继。
+  // 地址行由 NodeDialog 按 `isAddresslessProtocol` 隐藏（D8）。DERP 三种模式只是草稿态：`derpMode` 不落盘，
+  // 由「derpServers 非空 / derpMapUrl 非空」推导（codec），免得模式与字段各执一词。
+  // 刻意不给的控件：`http_client`（生成侧按前置代理决定，写成 route.final 会自锁）、Dial Fields 的
+  // domain_resolver（装配层注入）。前置代理只承载 DERP 连接，说明挂在 detour 的提示上。
+  tailcat: {
+    cred: [
+      // 服务端不校验 users 时它就是准入凭据 ⇒ secret（后端也进脱敏表）。disco 公钥在直连 UDP 上明文携带，不算秘密。
+      { t: 'text', k: 'serverPublicKey', label: 'node.field.tcServerPub', hint: 'node.field.tcServerPubHint', mono: true, secret: true },
+      { t: 'text', k: 'serverDiscoKey', label: 'node.field.tcServerDisco', mono: true },
+      { t: 'text', k: 'preSharedKey', label: 'node.field.tcPsk', mono: true, opt: true, secret: true },
+    ],
+    adv: [
+      {
+        t: 'select', k: 'derpMode', label: 'node.field.derpMode', hint: 'node.field.derpModeHint',
+        options: [['region', 'node.derpModeRegion'], ['customMap', 'node.derpModeCustomMap'], ['servers', 'node.derpModeServers']],
+      },
+      { t: 'number', k: 'derpRegion', label: 'node.field.derpRegion', hint: 'node.field.derpRegionHint', ph: '1', when: (v) => v.derpMode !== 'servers' },
+      { t: 'text', k: 'derpMapUrl', label: 'node.field.derpMapUrl', hint: 'node.field.derpMapUrlHint', ph: 'https://tailcat.dev/derpmap.json', mono: true, when: (v) => v.derpMode === 'customMap' },
+      // 每行一个裸主机名，或一个单行 JSON 对象（内核原生形态，不自造 host:port 语法）。
+      // R0 实测：`cert_name: "sha256-raw:<hex>"` 还校验主机名 ⇒ 提示须写明主机名要与 DERP 证书一致。
+      { t: 'textarea', k: 'derpServers', label: 'node.field.derpServers', hint: 'node.field.derpServersHint', mono: true, rows: 3, ph: 'derp.example.com', when: (v) => v.derpMode === 'servers' },
+      // 私钥放在 DERP 之后、紧挨「生成密钥对」（NodeDialog 在连接页末尾渲染）：可选，缺省每次起核随机。
+      { t: 'text', k: 'privateKey', label: 'node.field.tcPrivateKey', hint: 'node.field.tcPrivateKeyHint', mono: true, opt: true, secret: true },
+      { t: 'textarea', k: 'extraJson', label: 'node.field.extraJson', hint: 'node.field.extraJsonHint', mono: true, rows: 4, opt: true },
+    ],
+  },
   // ── OpenConnect（2026-08-11）──
   // 一个协议覆盖六家商用 VPN，由 flavor 区分。内核需要的 `server: host:port` 由 NodeDialog 顶部
   // 公共地址/端口派生，表单不再维护第二份 server 真值。
@@ -891,6 +923,56 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       },
     ],
   },
+  // ── MASQUE 客户端（2026-09-24，RFC 9484 CONNECT-IP）──
+  // 与 OpenConnect/OpenVPN 同族（内核 endpoint，网段由服务端隧道建立后推送 ⇒ 凭 meshRoutes 组网），
+  // 但地址 / Basic 凭据 / TLS 走 ServerConfig 顶层，设置块只装内核键名的 path/headers/version/mtu + 透传袋。
+  // 刻意不给的控件（后端 `build_masque_endpoint` 同步不下发或强制剥掉）：
+  //  · `system`：系统网卡与 Polaris 自己的 TUN、helper 提权模型冲突，且内核这支不装路由 —— 暴露它
+  //    等于给一个「拨了节点就静默不可测、甚至拖垮整核」的开关（设计 §4.1.3）；
+  //  · TLS 开关：恒开。v3 缺 TLS 整核失败，h1/h2 明文会让 Basic 凭据裸奔；
+  //  · ALPN / uTLS / ECH / 分片 / spoof：ALPN 由 version 决定，其余本期不下发。
+  // user/pwd 可选：服务端 `users` 为空时不校验 Basic。
+  'masque-client': {
+    cred: [],
+    adv: [],
+    groups: [
+      {
+        id: 'basic',
+        fields: [
+          { t: 'text', k: 'user', label: 'node.field.user', opt: true },
+          { t: 'text', k: 'pwd', label: 'node.field.pwd', mono: true, opt: true, secret: true },
+          // sni 留空 = 后端回落节点地址。
+          { t: 'text', k: 'sni', label: 'node.field.sni', ph: 'example.com', opt: true },
+          { t: 'switch', k: 'insecure', label: 'node.field.insecure', hint: 'node.field.insecureHint' },
+          // 首项空串 = 不下发 = 内核缺省（HTTP/3，失败回落 HTTP/2）。UDP 被封的网络直接选 HTTP/2，
+          // 免得每次先等 QUIC 超时。选项文案是协议名，不入 i18n；「默认」复用通用键。
+          {
+            t: 'select', k: 'version', label: 'node.field.masqueVersion', hint: 'node.field.masqueVersionHint',
+            options: [['', 'common.default'], ['3', 'HTTP/3'], ['2', 'HTTP/2'], ['1', 'HTTP/1.1']],
+          },
+        ],
+      },
+      {
+        id: 'routing',
+        fields: [
+          { t: 'textarea', k: 'meshRoutes', label: 'node.field.meshRoutes', hint: 'node.field.meshRoutesHint', mono: true, rows: 3, opt: true, ph: '10.10.0.0/16' },
+        ],
+      },
+      {
+        id: 'advanced',
+        fields: [
+          { t: 'text', k: 'path', label: 'node.field.masquePath', hint: 'node.field.masquePathHint', ph: '/.well-known/masque/ip/{target}/{ipproto}/', mono: true, opt: true },
+          { t: 'textarea', k: 'headers', label: 'node.field.masqueHeaders', hint: 'node.field.masqueHeadersHint', mono: true, rows: 3, opt: true, ph: 'Authorization: Bearer …' },
+          { t: 'number', k: 'mtu', label: 'node.field.mtu', ph: '1280', opt: true },
+          // TLS 恒开 ⇒ pin 恒生效，无门。自签服务端的首选方案（比 insecure 安全）。
+          ...F_CERT_PIN,
+          // 不给「按需连接」：与 OpenConnect/OpenVPN 同口径（NodeDialog 族都没有），主核缺省开不开等
+          // 真机 A/B（设计 D9）。存量 `onDemand` 由 codec 的 `...base` 原样保留，不会被编辑抹掉。
+          { t: 'textarea', k: 'extraJson', label: 'node.field.extraJson', hint: 'node.field.extraJsonHint', mono: true, rows: 4, opt: true },
+        ],
+      },
+    ],
+  },
   // SSH：无强制必填字段（后端 protocol_requirement_ok 仅需 address/port）。
   // 算法协商四项（hostKeyAlgorithms / cipher / mac / kexAlgorithm）2026-08-06 已补齐 —— 此前这里写着
   // 「不建模，与 vless 的 ECH/spoof/engine 同级高级逃生舱」，而那批同样已补齐，那句说辞本身就是
@@ -944,6 +1026,7 @@ export function allFields(proto: NodeProto): FieldSpec[] {
  */
 const BASIC_FIELDS_FROM_ADV: Partial<Record<NodeProto, readonly string[]>> = {
   tor: ['torExec', 'torDataDir'],
+  tailcat: ['derpMode', 'derpRegion', 'derpMapUrl', 'derpServers', 'privateKey'],
   ssh: ['privateKey', 'privateKeyPath', 'privateKeyPassphrase'],
 };
 
@@ -959,6 +1042,7 @@ const ADVANCED_FIELD_KEYS: Partial<Record<NodeProto, readonly string[]>> = {
   snell: ['reuse', 'userkey'],
   hysteria: ['ech', 'echConfig', 'certSha256', 'certPkSha256', 'extraJson'],
   tor: ['torArgs', 'torrcText', 'extraJson'],
+  tailcat: ['extraJson'],
   ssh: ['hostKeyAlgorithms', 'clientVersion', 'cipher', 'mac', 'kexAlgorithm'],
   custom: ['isEndpoint', 'secretKeys'],
 };
@@ -968,7 +1052,7 @@ const ADVANCED_FIELD_KEYS: Partial<Record<NodeProto, readonly string[]>> = {
  *
  * - VLESS/VMess/Trojan/SS 等有独立的连接与高级调优任务；
  * - Hysteria/TUIC/AnyTLS/SSH/Tor 的低频参数足以构成独立页；
- * - OpenConnect/OpenVPN 还多一个路由任务页。
+ * - OpenConnect/OpenVPN/MASQUE 还多一个路由任务页。
  *
  * HTTP/Naive/Snell/SOCKS/Custom 保持单页：它们的高级项要么由单一开关才显示、要么只有两三项，
  * 切页反而会制造「只剩一个框」的空洞面板。调用方会把 basic + transport 合成「连接」，
@@ -984,9 +1068,11 @@ const TABBED_NODE_PROTOCOLS = new Set<NodeProto>([
   'anytls',
   'hysteria',
   'tor',
+  'tailcat',
   'ssh',
   'openconnect',
   'openvpn-client',
+  'masque-client',
 ]);
 
 export function nodeFormUsesTabs(proto: NodeProto): boolean {
@@ -1017,6 +1103,11 @@ export function nodeFormGroups(proto: NodeProto): NodeFieldGroup[] {
     ...(transport.length > 0 ? [{ id: 'transport' as const, fields: transport }] : []),
     { id: 'advanced', fields: advanced },
   ];
+}
+
+/** 草稿键所在的表单分组（保存被拒时据此把用户带到出错字段）；该协议没有此字段 → `null`。 */
+export function nodeFieldGroup(proto: NodeProto, key: string): NodeFieldGroupId | null {
+  return nodeFormGroups(proto).find((group) => group.fields.some((field) => field.k === key))?.id ?? null;
 }
 
 // ── C10：custom 协议内核兼容性 probe（`kernel:probeOutbound`）显示态 ──────────────────────

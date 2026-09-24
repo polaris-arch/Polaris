@@ -142,6 +142,14 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.SERVER_GENERATE_URL, { server });
   },
 
+  /**
+   * Tailcat 客户端密钥对（D5）：不传私钥 ⇒ 生成新的；传了 ⇒ 只推导公钥（与 sing-box 同一 X25519 推导）。
+   * 私钥只在表单与本次调用里流转，调用方不得打日志。
+   */
+  async tailcatKeypair(privateKey?: string): Promise<{ privateKey: string; publicKey: string }> {
+    return invoke(IPC_CHANNELS.TAILCAT_KEYPAIR, { privateKey });
+  },
+
   /** Cloudflare WARP：注册匿名设备 → 返回 WireGuard 草稿。 */
   async registerWarp(licenseKey?: string): Promise<WarpWireGuardDraft> {
     return invoke(IPC_CHANNELS.WARP_REGISTER, { licenseKey });

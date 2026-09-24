@@ -296,7 +296,8 @@ fn sanitize_servers(obj: &mut Map<String, Value>) {
         // 「豁免 address/port」又当「单例硬限」的判据。tor 需要前者、**不需要**后者
         // （它是内嵌客户端，可以有多个；实测给内核传 `server` 直接 `unknown field "server"`，
         // 故它天生没有 address/port）。两个语义合用一个名字，加第二个成员时必然误伤。
-        let addressless = matches!(proto_lower.as_str(), "tailscale" | "tor");
+        // tailcat 同 tor：对端由服务端公钥 + DERP 定位，内核这支没有 server/server_port。
+        let addressless = matches!(proto_lower.as_str(), "tailscale" | "tor" | "tailcat");
         let is_custom = proto_lower == "custom";
         if !addressless && !is_custom {
             if !str_nonempty(so, "address") {

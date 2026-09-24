@@ -46,6 +46,7 @@ import {
   PROTO_OPTIONS,
   isMeshTunnelNodeProtocol,
   meshTunnelNodeProtocols,
+  nodeFieldGroup,
   nodeFormGroups,
   nodeFormUsesTabs,
   protosInGroup,
@@ -58,6 +59,8 @@ import {
 } from './node-spec';
 import { protoCodec, ProtoCodecError } from './proto-codec';
 import { blockedByMeshSingleton } from '@/domain/mesh-singleton-guard';
+import { isAddresslessProtocol, tailcatSettingsError } from '@/domain/server-completeness';
+import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { meshTunnelDraftError } from './mesh-form-layout';
 import { InfoIcon } from '@/components/InfoIcon';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -122,6 +125,9 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
   // （而非拆子组件）与本文件其余「协议特定但状态挂在 NodeForm 顶层」的既有写法（如 `detour`）一致。
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState<ProbeDisplay | null>(null);
+  // Tailcat 客户端公钥（D5）：只是展示态，由后端从私钥推导；私钥一改就作废，不落盘、不进日志。
+  const [tcPublicKey, setTcPublicKey] = useState('');
+  const [tcKeyBusy, setTcKeyBusy] = useState(false);
 
   const setField = (k: string, v: FormValue) => {
     setDraft((d) => ({ ...d, [k]: v }));
@@ -130,6 +136,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
     // 编辑过 JSON 后，上一次探测结果已经对不上新文本——清掉比留着一条可能早已过期的「支持/不支持」
     // 更诚实。只在 outbound 字段上生效：其它协议的字段编辑与 probe 结果无关。
     if (k === 'outbound') setProbeResult(null);
+    if (k === 'privateKey') setTcPublicKey('');
   };
 
   const changeProto = (next: NodeProto) => {
@@ -138,6 +145,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
     setDraft(draftFromSpecs(allFields(next)));
     setDirty(true);
     setProbeResult(null); // 换出 custom 协议后旧探测结果同样失效。
+    setTcPublicKey('');
     setFormTab('connection');
     setRevealGroup(null);
   };
@@ -175,6 +183,25 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       });
     } finally {
       setProbing(false);
+    }
+  };
+
+  /**
+   * Tailcat 客户端密钥（D5）：私钥空 ⇒ 后端生成新密钥对并回填私钥；私钥已填 ⇒ 只推导公钥给用户交给服务端。
+   * 公钥推导走后端（`runtime/x25519.rs`，与 sing-box 同一算法、逐字节对拍），前端不复刻 X25519。
+   * 失败只记不含密钥的 IPC 错误（后端文案不回显输入）。
+   */
+  const runTailcatKeypair = async () => {
+    const current = typeof draft.privateKey === 'string' ? draft.privateKey.trim() : '';
+    setTcKeyBusy(true);
+    try {
+      const r = await api.server.tailcatKeypair(current || undefined);
+      if (!current) setField('privateKey', r.privateKey);
+      setTcPublicKey(r.publicKey);
+    } catch (e) {
+      toast.error(t('node.tcKeyFailed'), e instanceof Error ? e.message : undefined);
+    } finally {
+      setTcKeyBusy(false);
     }
   };
 
@@ -223,18 +250,25 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
   const handleSubmit = async () => {
     const nameEmpty = !name.trim();
     const port = parseNumberField(portStr);
-    const addrEmpty = !address.trim() || port === undefined;
+    // 无地址协议（Tor / Tailcat，D8）不收地址行，也就不校验它；落盘写空地址 + 0 端口（同 TS 登录建节点）。
+    const addressless = isAddresslessProtocol(proto);
+    const addrEmpty = !addressless && (!address.trim() || port === undefined);
     setErrName(nameEmpty);
     setErrAddr(addrEmpty);
     if (nameEmpty || addrEmpty) return;
 
+    // 把用户带到出错分组：页签协议切页（basic/transport 合成「连接」页），单页协议展开对应折叠段。
+    const revealFormGroup = (group: NodeFieldGroupId) => {
+      if (nodeFormUsesTabs(proto)) {
+        setFormTab(group === 'basic' || group === 'transport' ? 'connection' : group);
+      } else {
+        setRevealGroup(group);
+      }
+    };
+
     const meshError = meshTunnelDraftError(proto, draft);
     if (meshError) {
-      if (nodeFormUsesTabs(proto)) {
-        setFormTab(meshError.group === 'basic' ? 'connection' : meshError.group);
-      } else {
-        setRevealGroup(meshError.group);
-      }
+      revealFormGroup(meshError.group);
       toast.error(
         meshError.key === 'json'
           ? t('node.meshTunnelJsonInvalid')
@@ -249,8 +283,8 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
         id: base?.id ?? '',
         name: name.trim(),
         protocol: proto,
-        address: address.trim(),
-        port: port as number,
+        address: addressless ? '' : address.trim(),
+        port: addressless ? 0 : (port as number),
       };
       if (detour) meta.detour = detour;
       if (!base?.subscriptionId && bindInterface) meta.bindInterface = bindInterface;
@@ -265,6 +299,15 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       const full = protoCodec[proto].toConfig(draft, codecBase);
       if (base?.subscriptionId || !bindInterface) delete full.bindInterface;
       else full.bindInterface = bindInterface;
+
+      // Tailcat 的 key/DERP 形态门与生成侧、store 落盘门同一判据（`tailcatSettingsError` 镜像 Rust
+      // `tailcat_emit_check`）。不在这里拦，节点会被 store 的 sanitize 静默丢掉 —— 用户看到的是「保存了但没了」。
+      const tailcatReason = full.protocol === 'tailcat' ? tailcatSettingsError(full.tailcatSettings) : null;
+      if (tailcatReason) {
+        setFormTab('connection');
+        toast.error(t('common.saveFailed'), t(INVALID_NODE_REASON_KEY[tailcatReason]));
+        return;
+      }
 
       // 组网单例硬闸门（与 WgDialog / ImportDialog / 克隆同一真值）。
       // **今天在本弹窗恒不命中**：`PROTO_OPTIONS`（node-spec.ts:36）不含 wireguard/tailscale，
@@ -304,6 +347,8 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       closeInstance(instanceId);
     } catch (e) {
       console.error('[NodeDialog] save failed:', e);
+      const codecGroup = e instanceof ProtoCodecError && e.field ? nodeFieldGroup(proto, e.field) : null;
+      if (codecGroup) revealFormGroup(codecGroup);
       const detail = e instanceof ProtoCodecError
         ? t(`node.codecError.${e.code}`, { detail: e.detail ?? '' })
         : t('errors.operationFailed');
@@ -335,7 +380,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
     <div className="fld">
       <div className="fld-l fld-l-info">
         <span>{t('node.chainVia')}</span>
-        <InfoIcon tip={t('node.chainHint')} />
+        <InfoIcon tip={proto === 'tailcat' ? t('node.tcChainHint') : t('node.chainHint')} />
       </div>
       <Csel
         id="nd-detour"
@@ -386,6 +431,33 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       {interfaces.failed && <div className="err-line">{t('settings.network.interfaceListFailed')}</div>}
     </div>
   );
+
+  const tailcatKeyField = proto === 'tailcat' ? (
+    <div className="fld">
+      <div className="fld-l fld-l-info">
+        <span>{t('node.tcPublicKey')}</span>
+        <InfoIcon tip={t('node.tcPublicKeyHint')} />
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 10 }}>
+        <input
+          className="input mono"
+          readOnly
+          value={tcPublicKey}
+          aria-label={t('node.tcPublicKey')}
+        />
+        <button
+          type="button"
+          className="btn ghost sm"
+          onClick={() => void runTailcatKeypair()}
+          disabled={tcKeyBusy}
+        >
+          {typeof draft.privateKey === 'string' && draft.privateKey.trim()
+            ? t('node.tcDerivePublic')
+            : t('node.tcGenerate')}
+        </button>
+      </div>
+    </div>
+  ) : undefined;
 
   return (
     <Modal
@@ -450,44 +522,46 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
         {errName && <div className="err-line">{t('node.errName')}</div>}
       </div>
 
-      {/* 地址 / 端口 */}
-      <div className="fld">
-        <label className="fld-l">
-          <span>{t('node.serverPort')}</span> <span className="req-star">*</span>
-        </label>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 96px', gap: 10 }}>
-          <input
-            className="input"
-            value={address}
-            onChange={(e) => {
-              setAddress(e.target.value);
-              setDirty(true);
-              setErrAddr(false);
-            }}
-            placeholder="example.com"
-            aria-label={t('node.server')}
-          />
-          <input
-            className="input mono"
-            inputMode="numeric"
-            value={portStr}
-            onChange={(e) => {
-              // R2：port 复用 parseNumberField 的空→undefined 语义（此处存原始串以允许退格删空，提交时校验）。
-              const raw = e.target.value;
-              if (raw === '' || parseNumberField(raw) !== undefined) {
-                setPortStr(raw);
+      {/* 地址 / 端口（无地址协议不渲染，D8） */}
+      {!isAddresslessProtocol(proto) && (
+        <div className="fld">
+          <label className="fld-l">
+            <span>{t('node.serverPort')}</span> <span className="req-star">*</span>
+          </label>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 96px', gap: 10 }}>
+            <input
+              className="input"
+              value={address}
+              onChange={(e) => {
+                setAddress(e.target.value);
                 setDirty(true);
                 setErrAddr(false);
-              }
-            }}
-            placeholder={defaultPortPlaceholder(proto)}
-            aria-label={t('node.port')}
-          />
+              }}
+              placeholder="example.com"
+              aria-label={t('node.server')}
+            />
+            <input
+              className="input mono"
+              inputMode="numeric"
+              value={portStr}
+              onChange={(e) => {
+                // R2：port 复用 parseNumberField 的空→undefined 语义（此处存原始串以允许退格删空，提交时校验）。
+                const raw = e.target.value;
+                if (raw === '' || parseNumberField(raw) !== undefined) {
+                  setPortStr(raw);
+                  setDirty(true);
+                  setErrAddr(false);
+                }
+              }}
+              placeholder={defaultPortPlaceholder(proto)}
+              aria-label={t('node.port')}
+            />
+          </div>
+          {errAddr && (
+            <div className="err-line">{t('node.errAddr')}</div>
+          )}
         </div>
-        {errAddr && (
-          <div className="err-line">{t('node.errAddr')}</div>
-        )}
-      </div>
+      )}
 
       {/* 复杂协议按任务切页；basic + transport 合并成「连接」，不让 UUID/凭据单独占一页。
           轻量协议仍保持连续单页 + 高级折叠，避免为了格式统一制造空洞页签。 */}
@@ -500,6 +574,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
               id: 'connection',
               label: t('node.formGroup.connection'),
               fields: connectionFields,
+              children: tailcatKeyField,
             },
             ...(routingFields.length > 0
               ? [{ id: 'routing', label: t('node.formGroup.routing'), fields: routingFields }]

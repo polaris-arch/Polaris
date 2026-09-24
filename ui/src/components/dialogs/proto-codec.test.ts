@@ -43,6 +43,12 @@ import {
 import { parseNumberField, draftFromSpecs, toCselOptions, FieldRenderer } from './FieldSpec';
 import type { FormValue, FormValues } from './FieldSpec';
 
+/** Tailcat 的 44 字符标准 base64 key 样本（32 字节）。 */
+const TC_KEY_A = 'dinJxIQiMsfg+X5vvV6QhuPIaxT4C1Buurk/GDTskCw=';
+const TC_KEY_B = 'zajBCXWDxF7WZrnWNJ0Y4T91BEcb2ZnVjbOK2s6cFHo=';
+const TC_KEY_C = 'ICyC+7hv0tBjFTrqlkAqxPzXkRzEnX5ow1saOdO0f2A=';
+const TC_KEY_D = '6FHZ9B+YJrldLRgyXQwnuhJDhPnxUtHoHOq0At8smHQ=';
+
 const META: Pick<ServerConfig, 'id' | 'name' | 'address' | 'port'> = {
   id: 'srv-1',
   name: '香港 01',
@@ -175,6 +181,19 @@ const SAMPLES: Record<NodeProto, ServerConfig> = {
       torrc: { ExitNodes: '{jp}', StrictNodes: '1' },
     },
   },
+  // Tailcat：无地址（同 Tor），servers 模式 + 字符串/对象混合行 + 透传袋。
+  tailcat: {
+    ...META,
+    protocol: 'tailcat',
+    tailcatSettings: {
+      serverPublicKey: TC_KEY_A,
+      serverDiscoKey: TC_KEY_B,
+      preSharedKey: TC_KEY_C,
+      privateKey: TC_KEY_D,
+      derpServers: ['derp1.example', { host: 'derp2.example', ipv4: '192.0.2.1', cert_name: 'sha256-raw:ab' }],
+      udp_timeout: '2m',
+    },
+  },
   // OpenConnect：server 是 host:port **单串**；flavor 决定按哪家商用 VPN 的方言握手。
   openconnect: {
     ...META,
@@ -194,6 +213,27 @@ const SAMPLES: Record<NodeProto, ServerConfig> = {
       network: 'tcp', cipher: 'AES-256-GCM', auth: 'SHA256', mtu: 1400,
       redirect_gateway: true,
       tls: { certificate: ['-----BEGIN CERTIFICATE-----', 'MIIB', '-----END CERTIFICATE-----'] },
+    },
+  },
+  // MASQUE：地址 / Basic 凭据 / TLS 在顶层，设置块只装内核键名的 path/headers/version/mtu（+ 透传袋）。
+  'masque-client': {
+    ...META,
+    protocol: 'masque-client',
+    username: 'mq-user',
+    password: 'mq-pass',
+    meshRoutes: ['10.77.0.0/24'],
+    onDemand: true,
+    tlsSettings: {
+      serverName: 'mq.example',
+      allowInsecure: true,
+      certificateSha256: 'a'.repeat(64),
+    },
+    masqueClientSettings: {
+      path: '/masque/ip/{target}/{ipproto}/',
+      headers: { 'X-Token': ['t1', 't2'] },
+      version: 2,
+      mtu: 1350,
+      udp_timeout: '2m',
     },
   },
 };
@@ -326,6 +366,9 @@ const KEY_ASSERTS: Record<NodeProto, (out: ServerConfig) => void> = {
     expect(o.tlsSettings?.alpn).toEqual(['h3']);
     expect(o.tlsSettings?.allowInsecure).toBe(true);
   },
+  tailcat: (o) => {
+    expect(o.tailcatSettings).toEqual(SAMPLES.tailcat.tailcatSettings);
+  },
   tor: (o) => {
     expect(o.torSettings?.executablePath).toBe('/usr/bin/tor');
     expect(o.torSettings?.dataDirectory).toBe('/var/lib/tor');
@@ -353,13 +396,31 @@ const KEY_ASSERTS: Record<NodeProto, (out: ServerConfig) => void> = {
       '-----BEGIN CERTIFICATE-----', 'MIIB', '-----END CERTIFICATE-----',
     ]);
   },
+  'masque-client': (o) => {
+    expect(o.username).toBe('mq-user');
+    expect(o.password).toBe('mq-pass');
+    expect(o.meshRoutes).toEqual(['10.77.0.0/24']);
+    expect(o.onDemand).toBe(true);
+    expect(o.tlsSettings).toEqual({
+      serverName: 'mq.example',
+      allowInsecure: true,
+      certificateSha256: 'a'.repeat(64),
+    });
+    expect(o.masqueClientSettings).toEqual({
+      path: '/masque/ip/{target}/{ipproto}/',
+      headers: { 'X-Token': ['t1', 't2'] },
+      version: 2,
+      mtu: 1350,
+      udp_timeout: '2m',
+    });
+  },
 };
 
 describe('protoCodec round-trip (R5)', () => {
   const protos = PROTO_OPTIONS.map(([p]) => p);
 
-  it('覆盖全部 17 协议（不含 wireguard/tailscale，见 node-spec.ts 文件头注释）', () => {
-    expect(protos).toHaveLength(17);
+  it('覆盖全部 19 协议（不含 wireguard/tailscale，见 node-spec.ts 文件头注释）', () => {
+    expect(protos).toHaveLength(19);
     expect(Object.keys(protoCodec).sort()).toEqual([...protos].sort());
   });
 
@@ -2112,6 +2173,9 @@ const DUMMY: Record<string, FormValue> = {
   outbound: '{"type":"vless","server":"e.com","server_port":443}',
   certSha256: PIN_SAMPLE,
   certPkSha256: PIN_SAMPLE,
+  // 透传袋坏 JSON 拒绝保存（extraJsonInvalid）⇒ 填满时给合法的非空对象。
+  extraJson: '{"x_bag":"x"}',
+  ovpnTlsExtraJson: '{"x_bag":"x"}',
 };
 
 /** 把该协议**表里真有的控件**全部填满：文本 → 非空、数字 → 1、开关 → 开、下拉 → 首项（可覆写）。 */
@@ -2526,7 +2590,7 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
   // 手建节点根本够不到 —— 等于「支持 AnyConnect 全部能力」只对导入成立。
   // openconnect 内核那支 61 个键，表单给 13；剩下的 csd / cookie / compression_mode …
   // 必须能从这一个控件写进去，且不必改用「自定义」协议（那会丢掉本协议的表单与校验）。
-  const BAG_PROTOS = ['openconnect', 'openvpn-client', 'hysteria', 'tor'] as const;
+  const BAG_PROTOS = ['openconnect', 'openvpn-client', 'hysteria', 'tor', 'masque-client', 'tailcat'] as const;
 
   for (const proto of BAG_PROTOS) {
     it(`${proto}：extraJson 写入的键活着进设置，且同名时具名字段压过袋子`, () => {
@@ -2539,6 +2603,8 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
         'openvpn-client': 'openvpnClientSettings',
         hysteria: 'hysteriaSettings',
         tor: 'torSettings',
+        'masque-client': 'masqueClientSettings',
+        tailcat: 'tailcatSettings',
       }[proto];
       const settings = out[key] as Record<string, unknown>;
       expect(settings.csd, '袋子里的键没进设置 —— 手建节点仍够不到未建模字段').toBe(
@@ -2547,14 +2613,41 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
       expect(settings.dpd_interval).toBe('30s');
     });
 
-    it(`${proto}：extraJson 是坏 JSON 时保留旧袋，不静默清空`, () => {
+    it(`${proto}：extraJson 坏 JSON / 非对象 → 抛 extraJsonInvalid 拒绝保存（静默保留旧袋用户看不出没生效）`, () => {
       const base = { ...SAMPLES[proto] };
       const draft = protoCodec[proto].fromConfig(base);
-      draft.extraJson = '{ 这不是 JSON';
-      // 不抛异常即可 —— 用户手误不该让保存崩掉，也不该把已有的袋子清空。
-      expect(() => protoCodec[proto].toConfig(draft, base)).not.toThrow();
+      for (const bad of ['{ 这不是 JSON', '[1, 2]', '"str"', '42', 'null']) {
+        let err: unknown;
+        try {
+          protoCodec[proto].toConfig({ ...draft, extraJson: bad }, base);
+        } catch (e) {
+          err = e;
+        }
+        expect(err, bad).toBeInstanceOf(ProtoCodecError);
+        expect((err as ProtoCodecError).code, bad).toBe('extraJsonInvalid');
+        expect((err as ProtoCodecError).field, bad).toBe('extraJson');
+      }
+      // 空文本 / 纯空白 = 无袋，合法。
+      for (const empty of ['', '  \n ']) {
+        expect(() => protoCodec[proto].toConfig({ ...draft, extraJson: empty }, base), JSON.stringify(empty)).not.toThrow();
+      }
     });
   }
+
+  it('openvpn-client：tls 嵌套袋 ovpnTlsExtraJson 同口径，field 点名是 tls 那个袋', () => {
+    const base = { ...SAMPLES['openvpn-client'] };
+    const draft = protoCodec['openvpn-client'].fromConfig(base);
+    let err: unknown;
+    try {
+      protoCodec['openvpn-client'].toConfig({ ...draft, ovpnTlsExtraJson: '{bad' }, base);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ProtoCodecError);
+    expect((err as ProtoCodecError).code).toBe('extraJsonInvalid');
+    expect((err as ProtoCodecError).field).toBe('ovpnTlsExtraJson');
+    expect(() => protoCodec['openvpn-client'].toConfig({ ...draft, ovpnTlsExtraJson: ' ' }, base)).not.toThrow();
+  });
 });
 
 
@@ -2713,4 +2806,278 @@ describe('证书固定：合法形态照存、非法值拒绝保存、reality �
     const asTls = { ...stored, security: 'tls', tlsSettings: { certificateSha256: HEX } } as ServerConfig;
     expect(protoCodec.vless.toConfig(protoCodec.vless.fromConfig(asTls), asTls).tlsSettings?.certificateSha256).toBe(HEX);
   });
+});
+
+describe('MASQUE 表单编解码', () => {
+  const base = SAMPLES['masque-client'];
+  const draftOf = () => protoCodec['masque-client'].fromConfig(base);
+  const save = (patch: FormValues, from: ServerConfig = base) =>
+    protoCodec['masque-client'].toConfig({ ...protoCodec['masque-client'].fromConfig(from), ...patch }, from);
+
+  it('version：「默认」删键、各档落数字；0 与缺省同义回显为默认', () => {
+    expect(draftOf().version).toBe('2');
+    expect(save({ version: '' }).masqueClientSettings?.version).toBeUndefined();
+    expect(save({ version: '1' }).masqueClientSettings?.version).toBe(1);
+    expect(save({ version: '3' }).masqueClientSettings?.version).toBe(3);
+    const zero = { ...base, masqueClientSettings: { version: 0 } } as ServerConfig;
+    expect(protoCodec['masque-client'].fromConfig(zero).version).toBe('');
+  });
+
+  it('version 表外值原样往返，不被悄悄改成默认（后端会剔除并上报这种节点）', () => {
+    const odd = { ...base, masqueClientSettings: { version: 5 } } as ServerConfig;
+    const d = protoCodec['masque-client'].fromConfig(odd);
+    expect(d.version).toBe('5');
+    expect(protoCodec['masque-client'].toConfig(d, odd).masqueClientSettings?.version).toBe(5);
+  });
+
+  it('headers：单串值（内核 Listable 的另一形态）读回不丢，逐行写回成数组', () => {
+    const single = {
+      ...base,
+      masqueClientSettings: { headers: { Authorization: 'Basic abc', 'X-A': ['1', '2'] } },
+    } as ServerConfig;
+    const d = protoCodec['masque-client'].fromConfig(single);
+    expect(d.headers).toBe('Authorization: Basic abc\nX-A: 1\nX-A: 2');
+    expect(protoCodec['masque-client'].toConfig(d, single).masqueClientSettings?.headers).toEqual({
+      Authorization: ['Basic abc'],
+      'X-A': ['1', '2'],
+    });
+    expect(save({ headers: '  \n' }).masqueClientSettings?.headers).toBeUndefined();
+  });
+
+  it('地址 / 凭据 / TLS 落顶层，设置块里没有 server/username/tls（生成侧从顶层取）', () => {
+    const out = save({});
+    const settings = out.masqueClientSettings as Record<string, unknown>;
+    for (const k of ['server', 'server_port', 'username', 'password', 'tls', 'system']) {
+      expect(settings[k], k).toBeUndefined();
+    }
+    expect(out.tlsSettings?.serverName).toBe('mq.example');
+  });
+
+  it('TLS 恒开：pin 无门控，非法 pin 拒绝保存', () => {
+    expect(save({ certPkSha256: 'b'.repeat(64) }).tlsSettings?.certificatePublicKeySha256).toBe('b'.repeat(64));
+    expect(() => save({ certSha256: 'not-a-pin' })).toThrow(ProtoCodecError);
+  });
+
+  it('存量 onDemand（顶层）编辑后原样保留 —— 表单不给控件，但不能把它抹掉', () => {
+    expect(save({}).onDemand).toBe(true);
+  });
+
+  it('从 extraJson 删掉的键不会从 base 复活（设置块不以 base 起底）', () => {
+    const d = draftOf();
+    expect(JSON.parse(d.extraJson as string)).toEqual({ udp_timeout: '2m' });
+    const out = protoCodec['masque-client'].toConfig({ ...d, extraJson: '' }, base);
+    expect(out.masqueClientSettings).toEqual({
+      path: '/masque/ip/{target}/{ipproto}/',
+      headers: { 'X-Token': ['t1', 't2'] },
+      version: 2,
+      mtu: 1350,
+    });
+  });
+
+  it('表单不给 system 控件（系统网卡与主 TUN / helper 提权冲突，后端也强制剥掉）', () => {
+    expect(allFields('masque-client').map((f) => f.k)).not.toContain('sysIface');
+  });
+
+  it('MASQUE 的建模键不外溢：openconnect 的 `version`（内核键、未建模）仍在它自己的透传袋里', () => {
+    const oc = {
+      ...SAMPLES.openconnect,
+      openconnectSettings: { ...SAMPLES.openconnect.openconnectSettings, version: 'v' },
+    } as ServerConfig;
+    expect(JSON.parse(protoCodec.openconnect.fromConfig(oc).extraJson as string)).toEqual({ version: 'v' });
+  });
+});
+
+describe('Tailcat 表单编解码', () => {
+  const base = SAMPLES.tailcat;
+  const codec = protoCodec.tailcat;
+  const save = (patch: FormValues, from: ServerConfig = base) =>
+    codec.toConfig({ ...codec.fromConfig(from), ...patch }, from);
+  const withSettings = (tailcatSettings: ServerConfig['tailcatSettings']) =>
+    ({ ...base, tailcatSettings }) as ServerConfig;
+
+  it('derpMode 由字段推导（不落盘）：servers 非空 → servers，有地图 URL → customMap，否则 region', () => {
+    expect(codec.fromConfig(base).derpMode).toBe('servers');
+    expect(codec.fromConfig(withSettings({ derpRegion: 3, derpMapUrl: 'https://m.example/map.json' })).derpMode).toBe('customMap');
+    expect(codec.fromConfig(withSettings({ derpRegion: 3 })).derpMode).toBe('region');
+    expect(save({}).tailcatSettings).not.toHaveProperty('derpMode');
+  });
+
+  it('DERP 三模式互斥：只写当前模式的键，切走的模式删键（两者并存会被剔节点并被 store 丢弃）', () => {
+    const region = save({ derpMode: 'region', derpRegion: 7, derpMapUrl: 'https://m.example/map.json' }).tailcatSettings;
+    expect(region?.derpRegion).toBe(7);
+    expect(region).not.toHaveProperty('derpMapUrl');
+    expect(region).not.toHaveProperty('derpServers');
+    const custom = save({ derpMode: 'customMap', derpRegion: 7, derpMapUrl: 'https://m.example/map.json' }).tailcatSettings;
+    expect(custom?.derpMapUrl).toBe('https://m.example/map.json');
+    expect(custom?.derpRegion).toBe(7);
+    const servers = save({ derpMode: 'servers', derpRegion: 7 }, withSettings({ ...base.tailcatSettings, derpRegion: 7 })).tailcatSettings;
+    expect(servers).not.toHaveProperty('derpRegion');
+    expect(servers?.derpServers).toHaveLength(2);
+  });
+
+  it('derpServers 行格式：裸主机名 ⇄ 串、单行 JSON ⇄ 对象，空行丢弃', () => {
+    const text = codec.fromConfig(base).derpServers as string;
+    expect(text.split('\n')).toEqual([
+      'derp1.example',
+      '{"host":"derp2.example","ipv4":"192.0.2.1","cert_name":"sha256-raw:ab"}',
+    ]);
+    expect(save({ derpServers: `\n  a.example  \n\n{"host":"b.example","derp_port":8443}\n` }).tailcatSettings?.derpServers)
+      .toEqual(['a.example', { host: 'b.example', derp_port: 8443 }]);
+    expect(save({ derpServers: '  \n' }).tailcatSettings).not.toHaveProperty('derpServers');
+  });
+
+  it('derpServers 某行 JSON 坏掉 → 抛 derpServerInvalid 拒绝保存（静默保留旧值用户看不出改动没生效），detail 点名坏行', () => {
+    for (const [bad, line] of [
+      ['a.example\n{"host": ', '{"host":'],
+      ['a.example\n{} x', '{} x'],
+      ['[1]\n{"host":"x"', '{"host":"x"'],
+      ['{"host":"x"}\n  {1}  ', '{1}'],
+    ]) {
+      let err: unknown;
+      try {
+        save({ derpServers: bad });
+      } catch (e) {
+        err = e;
+      }
+      expect(err, bad).toBeInstanceOf(ProtoCodecError);
+      expect((err as ProtoCodecError).code, bad).toBe('derpServerInvalid');
+      expect((err as ProtoCodecError).detail, bad).toBe(line);
+      expect((err as ProtoCodecError).field, bad).toBe('derpServers');
+    }
+    // 纯主机名行不受影响；非 servers 模式不解析该字段（切走模式时留下的坏草稿不拦保存）。
+    expect(save({ derpServers: 'a.example\n[1]' }).tailcatSettings?.derpServers).toEqual(['a.example', '[1]']);
+    expect(save({ derpMode: 'region', derpRegion: 7, derpServers: '{bad' }).tailcatSettings?.derpRegion).toBe(7);
+  });
+
+  it('key 去首尾空白、空串删键；四把 key 与袋都落在 tailcatSettings，不碰顶层地址/凭据', () => {
+    const out = save({ serverPublicKey: `  ${TC_KEY_A}  `, preSharedKey: '', privateKey: ' ' });
+    expect(out.tailcatSettings?.serverPublicKey).toBe(TC_KEY_A);
+    expect(out.tailcatSettings).not.toHaveProperty('preSharedKey');
+    expect(out.tailcatSettings).not.toHaveProperty('privateKey');
+    expect(out.tailcatSettings?.udp_timeout).toBe('2m');
+    expect(out.password).toBeUndefined();
+    expect(out.username).toBeUndefined();
+  });
+
+  it('从 extraJson 删掉的键不会从 base 复活（设置块不以 base 起底）', () => {
+    const d = codec.fromConfig(base);
+    expect(JSON.parse(d.extraJson as string)).toEqual({ udp_timeout: '2m' });
+    expect(codec.toConfig({ ...d, extraJson: '' }, base).tailcatSettings).not.toHaveProperty('udp_timeout');
+  });
+
+  it('表单不给 http_client / domain_resolver 控件（生成侧决定，写错会自锁）', () => {
+    const keys = allFields('tailcat').map((f) => f.k);
+    expect(keys).not.toContain('httpClient');
+    expect(keys).not.toContain('http_client');
+    expect(keys).not.toContain('domainResolver');
+  });
+});
+
+describe('透传袋删键不复活：openconnect / openvpn-client / hysteria / tor 设置块不以 base 起底', () => {
+  // 缺陷原型：toConfig 先展开 `...base.xxxSettings` 再叠袋 ⇒ 用户在「原样 JSON」里删掉的键从旧配置复活，
+  // 清空袋也删不掉。参照物是 masque-client / tailcat（设置块 = 具名字段 + 当前袋）。
+  // 每条 case：base 带两个袋键 drop/keep + 一个「两边都不收」的建模表键 hidden（表单不映射、bagOf 又挡在袋外，
+  // 只能从 base 按键名带过来）+ 若干具名字段。
+  type Case = {
+    key: 'openconnectSettings' | 'openvpnClientSettings' | 'hysteriaSettings' | 'torSettings';
+    base: ServerConfig;
+    named: Record<string, unknown>;
+    hidden: Record<string, unknown>;
+  };
+  const CASES: Record<'openconnect' | 'openvpn-client' | 'hysteria' | 'tor', Case> = {
+    openconnect: {
+      key: 'openconnectSettings',
+      base: {
+        ...SAMPLES.openconnect,
+        openconnectSettings: {
+          ...SAMPLES.openconnect.openconnectSettings,
+          server: `${SAMPLES.openconnect.address}:${SAMPLES.openconnect.port}`,
+          drop_me: 'd', keep_me: 'k', network: 'tcp',
+        },
+      },
+      named: { username: 'u', flavor: 'anyconnect', auth_group: 'grp', mtu: 1400, no_udp: true, system: true },
+      hidden: { network: 'tcp' },
+    },
+    'openvpn-client': {
+      key: 'openvpnClientSettings',
+      base: {
+        ...SAMPLES['openvpn-client'],
+        openvpnClientSettings: {
+          ...SAMPLES['openvpn-client'].openvpnClientSettings,
+          server: SAMPLES['openvpn-client'].address,
+          server_port: SAMPLES['openvpn-client'].port,
+          drop_me: 'd', keep_me: 'k', flavor: 'x',
+        },
+      },
+      named: { username: 'u', network: 'tcp', cipher: 'AES-256-GCM', auth: 'SHA256', redirect_gateway: true },
+      hidden: { flavor: 'x' },
+    },
+    hysteria: {
+      key: 'hysteriaSettings',
+      base: {
+        ...SAMPLES.hysteria,
+        hysteriaSettings: {
+          ...SAMPLES.hysteria.hysteriaSettings,
+          auth: 'YmFzZTY0', network: 'udp', drop_me: 'd', keep_me: 'k',
+        },
+      },
+      named: { authStr: 'hy1-auth', upMbps: 10, downMbps: 50, obfs: 'obfs-pw' },
+      hidden: { auth: 'YmFzZTY0', network: 'udp' },
+    },
+    tor: {
+      key: 'torSettings',
+      base: {
+        ...SAMPLES.tor,
+        torSettings: { ...SAMPLES.tor.torSettings, drop_me: 'd', keep_me: 'k', username: 'x' } as ServerConfig['torSettings'],
+      },
+      named: { executablePath: '/usr/bin/tor', dataDirectory: '/var/lib/tor', extraArgs: ['--quiet', '--x'] },
+      hidden: { username: 'x' },
+    },
+  };
+
+  for (const [proto, c] of Object.entries(CASES) as [keyof typeof CASES, Case][]) {
+    const codec = protoCodec[proto];
+    const settingsOf = (cfg: ServerConfig) => (cfg as unknown as Record<string, Record<string, unknown>>)[c.key];
+
+    it(`${proto}：extraJson 删掉的键不复活；保留的袋键、具名字段、两边都不收的键照常输出`, () => {
+      const d = codec.fromConfig(c.base);
+      expect(JSON.parse(d.extraJson as string)).toEqual({ drop_me: 'd', keep_me: 'k' });
+      const out = settingsOf(codec.toConfig({ ...d, extraJson: JSON.stringify({ keep_me: 'k' }) }, c.base));
+      expect(out, '袋里删掉的键从 base 复活').not.toHaveProperty('drop_me');
+      expect(out.keep_me).toBe('k');
+      expect(out).toMatchObject({ ...c.named, ...c.hidden });
+    });
+
+    it(`${proto}：清空 extraJson → 袋键全部消失，两边都不收的键仍保留`, () => {
+      const d = codec.fromConfig(c.base);
+      const out = settingsOf(codec.toConfig({ ...d, extraJson: '' }, c.base));
+      expect(out, '清空袋后袋键仍在').not.toHaveProperty('drop_me');
+      expect(out).not.toHaveProperty('keep_me');
+      expect(out).toMatchObject({ ...c.named, ...c.hidden });
+    });
+
+    it(`${proto}：fromConfig → toConfig 不改动时设置块与输入等价（不丢本应保留的字段）`, () => {
+      expect(settingsOf(codec.toConfig(codec.fromConfig(c.base), c.base))).toEqual(settingsOf(c.base));
+    });
+  }
+});
+
+it('openvpn-client：tls 子袋 ovpnTlsExtraJson 删键/清空不复活（tls 块同样不以 base.tls 起底）', () => {
+  const base = {
+    ...SAMPLES['openvpn-client'],
+    openvpnClientSettings: {
+      ...SAMPLES['openvpn-client'].openvpnClientSettings,
+      tls: { certificate: ['CA'], server_name: 'old.example', peer_fingerprint: 'ab' },
+    },
+  } as ServerConfig;
+  const codec = protoCodec['openvpn-client'];
+  const d = codec.fromConfig(base);
+  expect(JSON.parse(d.ovpnTlsExtraJson as string)).toEqual({ server_name: 'old.example', peer_fingerprint: 'ab' });
+  const kept = codec.toConfig({ ...d, ovpnTlsExtraJson: '{"peer_fingerprint":"ab"}' }, base).openvpnClientSettings?.tls;
+  expect(kept).not.toHaveProperty('server_name');
+  expect(kept).toMatchObject({ certificate: ['CA'], peer_fingerprint: 'ab' });
+  const cleared = codec.toConfig({ ...d, ovpnTlsExtraJson: '' }, base).openvpnClientSettings?.tls;
+  expect(cleared).not.toHaveProperty('server_name');
+  expect(cleared).not.toHaveProperty('peer_fingerprint');
+  expect(cleared?.certificate).toEqual(['CA']);
 });

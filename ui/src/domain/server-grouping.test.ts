@@ -68,9 +68,10 @@ describe('groupServersBySubscription —— 空订阅的可达性', () => {
     const groups = groupServersBySubscription([
       server('oc', { protocol: 'openconnect' }),
       server('ovpn', { protocol: 'openvpn-client', meshRoutes: ['10.10.0.0/16'] }),
+      server('mq', { protocol: 'masque-client' }),
       server('proxy'),
     ]);
-    expect(groups.find((g) => g.id === 'mesh')!.servers.map((s) => s.id)).toEqual(['oc', 'ovpn']);
+    expect(groups.find((g) => g.id === 'mesh')!.servers.map((s) => s.id)).toEqual(['oc', 'ovpn', 'mq']);
     expect(groups.find((g) => g.id === 'manual')!.servers.map((s) => s.id)).toEqual(['proxy']);
   });
 
