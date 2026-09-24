@@ -113,5 +113,33 @@ pub fn keep_valid_cert_pins(raw: &str) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join(","))
 }
 
+/// 导入预览提示：本批里会真正下发 pin 的节点数 > 0 时给一句话，否则 `None`。
+///
+/// 为什么要提示：mihomo / Xray 的 pin 命中证书链上**任一张**即可（含上级 CA），sing-box 只比
+/// **服务器证书本身**（`common/tls/std_client.go` v1.15.0-alpha.7 `VerifyPinnedCertificate` 只看
+/// `rawCerts[0]`）。订阅固定的若是 CA，导入后该节点握手必败（失败关闭，不放行）——而用户在导入
+/// 这一刻最容易把「连不上」和「订阅刚导入」联系起来，故提示放在导入预览。
+/// 计数口径 = 生成侧会下发的面：reality / naive 下 pin 不下发（builder 写死 None），不计。
+pub fn cert_pin_import_warning(
+    servers: &[crate::user_config::server_config::ServerConfig],
+) -> Option<String> {
+    use crate::user_config::server_config::{Protocol, SecurityMode};
+    let n = servers
+        .iter()
+        .filter(|s| s.protocol != Protocol::Naive && s.security != Some(SecurityMode::Reality))
+        .filter(|s| {
+            s.tls_settings.as_ref().is_some_and(|t| {
+                t.certificate_sha256.is_some() || t.certificate_public_key_sha256.is_some()
+            })
+        })
+        .count();
+    (n > 0).then(|| {
+        format!(
+            "{n} 个节点带证书固定：Polaris 只比对服务器证书本身，若订阅固定的是上级（CA）证书，\
+             这些节点会连不上——可在节点编辑里改填服务器证书的指纹或清空"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests;

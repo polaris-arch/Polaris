@@ -103,3 +103,25 @@ fn base64_codec_round_trips_every_padding_shape() {
     assert_eq!(encode_std_base64(&[0]), "AA==");
     assert_eq!(encode_std_base64(&[0, 0]), "AAA=");
 }
+
+fn server(json: &str) -> crate::user_config::server_config::ServerConfig {
+    serde_json::from_str(json).expect("server json")
+}
+
+/// 导入提示只数会真正下发 pin 的节点：reality / naive 不计，无 pin 不提示。
+#[test]
+fn import_warning_counts_only_nodes_whose_pin_is_emitted() {
+    let pinned = format!(
+        r#"{{"id":"a","name":"a","protocol":"trojan","address":"a.com","port":443,"password":"p",
+            "security":"tls","tlsSettings":{{"certificateSha256":"{X_HEX}"}}}}"#
+    );
+    let reality = format!(
+        r#"{{"id":"b","name":"b","protocol":"vless","address":"a.com","port":443,"uuid":"u",
+            "security":"reality","tlsSettings":{{"certificateSha256":"{X_HEX}"}}}}"#
+    );
+    let plain = r#"{"id":"c","name":"c","protocol":"trojan","address":"a.com","port":443,"password":"p","security":"tls"}"#;
+    let w = cert_pin_import_warning(&[server(&pinned), server(&reality), server(plain)])
+        .expect("pinned node must warn");
+    assert!(w.starts_with("1 个节点"), "{w}");
+    assert!(cert_pin_import_warning(&[server(&reality), server(plain)]).is_none());
+}

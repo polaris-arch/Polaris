@@ -1638,7 +1638,7 @@
       "alpn": "ALPN",
       "bbr": "BBR congestion control",
       "cc": "Congestion control",
-      "certPinHint": "Trust only a server certificate whose SHA-256 matches; this replaces CA and hostname checks, so self-signed servers work without \"Allow insecure certificates\". Hex (colons allowed) or Base64; separate multiple values with commas. If both fields are set, either may match.",
+      "certPinHint": "Trust only a server certificate whose SHA-256 matches; this replaces CA and hostname checks, so self-signed servers work without \"Allow insecure certificates\". Hex (colons allowed) or Base64; separate multiple values with commas. If both fields are set, either may match. Only the server's own certificate is compared; a CA fingerprint will fail to connect.",
       "certPkSha256": "Public key SHA-256 pin",
       "certSha256": "Certificate SHA-256 pin",
       "cipher": "Ciphers (comma-separated)",

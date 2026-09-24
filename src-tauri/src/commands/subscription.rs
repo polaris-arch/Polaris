@@ -1392,7 +1392,12 @@ fn parse_local_import_owned(text: String) -> ApiResponse<Value> {
             "skipped": parsed.skipped,
             "failed": parsed.failed,
         },
-        "warnings": parsed.warnings,
+        "warnings": parsed
+            .warnings
+            .iter()
+            .cloned()
+            .chain(polaris_config_engine::user_config::tls_pin::cert_pin_import_warning(&parsed.servers))
+            .collect::<Vec<_>>(),
         "format": import_format_label(format),
     }))
 }
