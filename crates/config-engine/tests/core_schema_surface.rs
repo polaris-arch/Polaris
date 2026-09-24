@@ -33,7 +33,7 @@
 //!   单份共享夹具的依据是 2026-08-09 逐条核过的上游源码：`option/` 零 build tag；`include/` 里
 //!   三对 GOOS/cgo 门控（ccm / usbip / resolved）两侧注册的是**同一批 option 类型与同一个 type 常量**；
 //!   option 字段类型闭包里唯一的 GOOS 门控类型（`miekg/dns.SessionUDP`）不可达。
-//!   该论证的一条腿由 `core_build_matrix` 守着（四份核 tag 集只差 `with_purego`），断了会先在那边红。
+//!   该论证的一条腿由 `core_build_matrix` 守着（四份核 tag 集只差 `with_purego` 与 `with_gvisor`），断了会先在那边红。
 //! - 看**属性路径的存在性 + 取值域**（`enum` / `const`），不看类型与数值上下界。
 //!   取值域这一维是 2026-08-09 补的，回放对照见 [`the_domain_dimension_catches_value_only_narrowing`]。
 //! - 覆盖面 = **根对象的 `properties` + 每个 `$defs` 条目**。根那一段是后补的：此前只钉 `$defs`，

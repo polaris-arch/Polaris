@@ -11,7 +11,7 @@
 //! | `with_utls` | `tls.utls` 指纹字段被拒 | `singbox/outbound.rs` |
 //! | `with_wireguard` / `with_tailscale` | 对应 endpoint 起不来 | `singbox/endpoint.rs` |
 //! | `with_naive_outbound` | naive 出站被拒 | `singbox/outbound.rs` |
-//! | `with_gvisor` | WireGuard endpoint 的用户态栈设备报 `ErrGVisorNotIncluded`（上游 `transport/wireguard/device_stack_stub.go`） | `singbox/endpoint.rs` |
+//! | `with_gvisor` | 1.15.0-alpha.7 起仅门控 sing-tun 已弃用的 `gvisor` / `mixed` TUN 栈（此前还门控 WireGuard 用户态栈与 tailscale endpoint，alpha.7 已解耦；windows 那份自 alpha.7 起不带） | 无（本仓不下发 `stack`） |
 //! | `with_clash_api` | 面板 / 外部控制器整块失效 | `singbox/config.rs` |
 //!
 //! 关键在于**这件事是逐平台的**：官方发布矩阵完全可能只在某一个 GOOS 上改 tag 集。
@@ -27,10 +27,11 @@
 //! # 它同时守着 `core_schema_surface` 的前提
 //!
 //! 那道门只落了**一份**夹具，而它在打包腿上是四条腿各跑各的核。单份夹具成立的依据是
-//! 「schema 面四平台恒等」，该结论的一条腿正是**四份核的 tag 集只差 `with_purego`**
+//! 「schema 面四平台恒等」，该结论的一条腿正是**四份核的 tag 集只差 `with_purego` 与 `with_gvisor`**
 //! （2026-08-09 逐条核过上游：`option/` 零 build tag；`include/` 里三对 GOOS/cgo 门控
 //! ——ccm / usbip / resolved——两侧注册的是同一批 option 类型与同一个 type 常量；
-//! `with_purego` 在 sing-box 模块内零引用，是依赖层的 tag）。
+//! `with_purego` 在 sing-box 模块内零引用，是依赖层的 tag；`with_gvisor` 自 1.15.0-alpha.7 起
+//! 同样在 sing-box 模块内零引用，只门控 sing-tun 的 TUN 栈实现，不注册任何 option 类型）。
 //! tag 集一旦真的分叉，那份共享夹具的依据就断了 ⇒ 本门的 [`tag_sets_differ_only_by_the_documented_extras`]
 //! 会先红一步，提示去看 schema 夹具要不要按平台拆。
 //!
@@ -74,7 +75,6 @@ const SHARED_TAGS: &[&str] = &[
     "with_clash_api",
     "with_cloudflared",
     "with_dhcp",
-    "with_gvisor",
     "with_naive_outbound",
     "with_ocm",
     "with_openconnect",
@@ -238,7 +238,7 @@ fn every_bundled_core_matches_its_pinned_build_face() {
 /// 与上面那条**互不依赖**：它读 `CORE_MATRIX` 的期望值，这条只读盘上四份核彼此的关系。
 ///
 /// 为什么要两条：换核 bump 时人会成批更新 `CORE_MATRIX`，此时上面那条按定义会绿。
-/// 而「四平台 tag 集只差 `with_purego`」是 `core_schema_surface` 只落**一份**共享夹具的依据，
+/// 而「四平台 tag 集只差 `with_purego` 与 `with_gvisor`」是 `core_schema_surface` 只落**一份**共享夹具的依据，
 /// 它断了必须有人知道 —— 本条不看 `CORE_MATRIX`，成批更新压不住它。
 #[test]
 fn tag_sets_differ_only_by_the_documented_extras() {

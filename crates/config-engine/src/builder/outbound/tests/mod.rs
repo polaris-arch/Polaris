@@ -1442,12 +1442,14 @@ fn http_protocol_masquerade_goes_to_top_level_never_transport() {
     let v = outbound_json_from(
         r#"{"id":"s1","name":"n","protocol":"http","address":"a.com","port":8080,
                 "username":"u","password":"p","network":"http",
-                "httpSettings":{"path":"/tunnel","headers":{"Host":["a.example.com"]}}}"#,
+                "httpSettings":{"path":"/tunnel","headers":{"X-Cover":["a.example.com"]}}}"#,
     );
+    // 头名不用 `Host`：path + Host 在 1.15.0-alpha.7 起整核 FATAL，builder 会丢 Host，
+    // 见 `http_path_drops_host_header`。
     assert_eq!(v["path"], serde_json::json!("/tunnel"));
     assert_eq!(
         v["headers"],
-        serde_json::json!({"Host": ["a.example.com"]}),
+        serde_json::json!({"X-Cover": ["a.example.com"]}),
         "headers 对齐 schema 的 $defs/HTTPHeader = map<string, string|string[]>"
     );
     assert!(
@@ -1772,4 +1774,29 @@ fn fragment_is_dropped_for_quic_managed_protocols() {
             "{proto} 的 TLS 在 QUIC 内自管，fragment 永不下发 ⇒ 给控件即假控件"
         );
     }
+}
+
+/// http 节点同时有 path 与 `Host` 头：丢 `Host`、留 path 与其余头。
+///
+/// 1.15.0-alpha.7 起内核对两者并存在 initialize 阶段 FATAL（整核起不来），见 builder 注释。
+/// 键名大小写不敏感（内核 `headers.Get("Host")` 走 canonical），故用 `host` 小写喂。
+#[test]
+fn http_path_drops_host_header() {
+    let v = outbound_json_from(
+        r#"{"id":"s1","name":"n","protocol":"http","address":"a.com","port":8080,
+                "httpSettings":{"path":"/x","headers":{"host":["h.com"],"X-A":["1"]}}}"#,
+    );
+    assert_eq!(v["path"], serde_json::json!("/x"));
+    assert_eq!(v["headers"], serde_json::json!({"X-A": ["1"]}));
+}
+
+/// 反向对照：没有 path 时 `Host` 头原样下发（内核允许单独的 Host）。
+#[test]
+fn http_host_header_kept_without_path() {
+    let v = outbound_json_from(
+        r#"{"id":"s1","name":"n","protocol":"http","address":"a.com","port":8080,
+                "httpSettings":{"headers":{"Host":["h.com"]}}}"#,
+    );
+    assert!(v.get("path").is_none());
+    assert_eq!(v["headers"], serde_json::json!({"Host": ["h.com"]}));
 }

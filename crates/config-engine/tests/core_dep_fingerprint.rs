@@ -132,7 +132,21 @@ const GATE_NAME: &str = "依赖指纹门未完整执行";
 //   ③ `StrictRoute` 的消费面（`tun.go` 声明 / `tun_linux.go` / `redirect_iptables.go` /
 //      `redirect_nftables_rules.go`）本轮全部未被改动，`tun_darwin.go` 仍零引用。
 // 前提未变，故只更新 pin，不改机制。
-const SING_TUN_PINNED: &str = "v0.9.4-0.20260914145202-3a0d3878577a";
+//
+// 2026-09-24 随随包核 1.15.0-alpha.4 → **1.15.0-alpha.7** 复核。sing-tun 从
+// `v0.9.4-0.20260914145202-3a0d3878577a` 跳到 `v0.9.6-0.20260922105247-aff4131a9e9e`
+// （alpha.7 的 go.mod:57；盘上四份二进制 linux / win / mac-arm64 / mac-x64 的 modinfo 版本串一致）。
+// 🔴 本次 `compare/3a0d3878577a...aff4131a9e9e` 的 status 是 **diverged**（ahead 19 / behind 8，
+// 上游 rebase 过），三点 diff 报 117 个文件含 `tun.go` —— 那不是 A→B 的差集，故改取两个 commit 的
+// 源码 tarball 直接对比内容：
+//   ① 默认值直读：两版 `tun.go` **逐字节相同**；`tun.go:133-138` 的 `DNSModeOrDefault()` 仍是
+//      `if o.DNSMode == "" { return DNSModeHijack }`，枚举 `DNSModeHijack = "hijack"`（tun.go:64-66）未变；
+//   ② 消费面兜底：抹掉行号后，非测试 `.go` 里提到 `DNSMode` 的**行集合两版逐字相同**；
+//      sing-box 侧 `protocol/tun/inbound.go:215` 仍是把 `options.DNSMode` 原样透传（空值不改写）；
+//   ③ `StrictRoute` 的消费面（`tun.go` 声明 / `tun_linux.go` / `tun_windows.go` / `redirect_iptables.go` /
+//      `redirect_nftables_rules.go`）行集合两版逐字相同，`tun_darwin.go` 仍零引用。
+// 前提未变，故只更新 pin，不改机制。
+const SING_TUN_PINNED: &str = "v0.9.6-0.20260922105247-aff4131a9e9e";
 
 /// 被钉的依赖模块路径。
 const SING_TUN_MODULE: &str = "github.com/sagernet/sing-tun";
