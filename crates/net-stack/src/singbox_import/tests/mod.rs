@@ -1183,14 +1183,11 @@ fn remote_subscription_skips_masque_and_tailcat() {
     assert!(r.warnings.iter().any(|w| w.contains("masque-client(2)")));
 }
 
-/// 🔴 **本地文件往返走真核**：导入 → `generate_sing_box_config_with_report` → 随包核 `check` rc=0，
-/// 且未建模键活着到产物、证书 pin 以 base64 下发。
-///
-/// 前置断言钉产物里真有这四个对象（排除「生成器把它们剔了所以核没意见」）；阴性对照证明 check 真读了
-/// 它们：masque 挪进 `outbounds[]`、tailcat 公钥改坏，两者都必红。缺核时开发机跳过、
-/// `POLARIS_REQUIRE_KERNEL_GATE=1` 下硬红（同 config-engine 真核门的定位器）。
-#[test]
-fn local_import_round_trips_through_the_bundled_core() {
+/// 本地导入产物 → 生成侧（`generate_sing_box_config_with_report`）。同生产本地导入腿剥掉 `subscriptionId`
+/// （`commands/subscription.rs` 本地导入：不归属任何订阅），否则顶层 `bindInterface` 会被订阅级策略遮蔽。
+fn generate_local_import(
+    servers: &[ServerConfig],
+) -> polaris_config_engine::builder::GenerateOutcome {
     use polaris_config_engine::builder::{
         generate_sing_box_config_with_report, GenerateConfigDeps,
     };
@@ -1198,19 +1195,14 @@ fn local_import_round_trips_through_the_bundled_core() {
     use polaris_config_engine::user_config::LogLevel;
     use std::collections::BTreeMap;
 
-    #[path = "../../../../config-engine/tests/support/core_locator.rs"]
-    mod core_locator;
-
-    let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::LocalFile);
-    assert_eq!(r.servers.len(), 4);
-    let mut servers = serde_json::to_value(&r.servers).unwrap();
-    // 导入腿不带 id 语义以外的东西；给个 selected，四个节点才全进生成。
-    let selected = servers[0]["id"].clone();
-    for s in servers.as_array_mut().unwrap() {
+    let mut servers_json = serde_json::to_value(servers).unwrap();
+    // 导入腿不带 id 语义以外的东西；给个 selected，全部节点才进生成。
+    let selected = servers_json[0]["id"].clone();
+    for s in servers_json.as_array_mut().unwrap() {
         s.as_object_mut().unwrap().remove("subscriptionId");
     }
     let input: UserConfig = serde_json::from_value(json!({
-        "servers": servers, "selectedServerId": selected, "proxyMode": "smart",
+        "servers": servers_json, "selectedServerId": selected, "proxyMode": "smart",
         "proxyModeType": "manual", "mixedPort": 17899
     }))
     .expect("导入产物反序列化成 UserConfig 失败");
@@ -1247,8 +1239,23 @@ fn local_import_round_trips_through_the_bundled_core() {
         log: |_, _| {},
         on_degraded: || {},
     };
-    let outcome =
-        generate_sing_box_config_with_report(&input, &BTreeMap::new(), &deps).expect("生成配置");
+    generate_sing_box_config_with_report(&input, &BTreeMap::new(), &deps).expect("生成配置")
+}
+
+/// 🔴 **本地文件往返走真核**：导入 → `generate_sing_box_config_with_report` → 随包核 `check` rc=0，
+/// 且未建模键活着到产物、证书 pin 以 base64 下发。
+///
+/// 前置断言钉产物里真有这四个对象（排除「生成器把它们剔了所以核没意见」）；阴性对照证明 check 真读了
+/// 它们：masque 挪进 `outbounds[]`、tailcat 公钥改坏，两者都必红。缺核时开发机跳过、
+/// `POLARIS_REQUIRE_KERNEL_GATE=1` 下硬红（同 config-engine 真核门的定位器）。
+#[test]
+fn local_import_round_trips_through_the_bundled_core() {
+    #[path = "../../../../config-engine/tests/support/core_locator.rs"]
+    mod core_locator;
+
+    let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::LocalFile);
+    assert_eq!(r.servers.len(), 4);
+    let outcome = generate_local_import(&r.servers);
     assert!(
         outcome.invalid_nodes.is_empty(),
         "导入的节点在生成时被剔：{:?}",
@@ -1353,4 +1360,66 @@ fn local_import_round_trips_through_the_bundled_core() {
         !ok_bad && diag_bad.contains("server_public_key"),
         "tailcat 坏公钥没被拒 —— 上面的绿不说明内核读过它：{diag_bad}"
     );
+}
+
+/// OpenConnect / OpenVPN Client 的 `on_demand` / `bind_interface` 提到顶层（同 MASQUE）：生成侧装配层对
+/// 每条 endpoint 腿按顶层写（`apply_on_demand` / `apply_bind_interface`）。留在袋里的后果 ——
+/// `on_demand` 原样下发而 UI 读顶层（界面关、内核开），`bind_interface` 被 `apply_bind_interface` 静默删掉。
+/// 以产物为准：导入 → 生成，产物里两键与源文件一致，且袋里不残留。
+#[test]
+fn vpn_client_on_demand_and_bind_interface_lift_to_top_level_and_reach_output() {
+    let doc = json!({ "endpoints": [
+        { "type": "openconnect", "tag": "OC", "server": "vpn.example.com:443",
+          "username": "u", "password": "p", "on_demand": true, "bind_interface": "eth9" },
+        { "type": "openvpn-client", "tag": "OV", "server": "ovpn.example.com", "server_port": 1194,
+          "username": "u", "password": "p", "on_demand": false, "bind_interface": "eth8",
+          "tls": { "peer_fingerprint":
+                   "e0593c478275d2bd1722039e5b7ba37fd39cd75cacff0a81bc66b46b5628f9bf" } }
+    ] });
+    let r = parse_eps(doc, ImportOrigin::LocalFile);
+    assert_eq!(r.servers.len(), 2);
+    let (oc, ov) = (by_name(&r, "OC"), by_name(&r, "OV"));
+    assert_eq!(
+        (oc.on_demand, oc.bind_interface.as_deref()),
+        (Some(true), Some("eth9"))
+    );
+    assert_eq!(
+        (ov.on_demand, ov.bind_interface.as_deref()),
+        (Some(false), Some("eth8"))
+    );
+    let oc_bag = &oc.openconnect_settings.as_ref().unwrap().extra;
+    let ov_bag = &ov.openvpn_client_settings.as_ref().unwrap().extra;
+    for k in ["on_demand", "bind_interface"] {
+        assert!(
+            !oc_bag.contains_key(k),
+            "openconnect 袋里残留 `{k}`：{oc_bag:?}"
+        );
+        assert!(
+            !ov_bag.contains_key(k),
+            "openvpn 袋里残留 `{k}`：{ov_bag:?}"
+        );
+    }
+
+    let outcome = generate_local_import(&r.servers);
+    assert!(
+        outcome.invalid_nodes.is_empty(),
+        "{:?}",
+        outcome.invalid_nodes
+    );
+    let cfg = serde_json::to_value(&outcome.config).unwrap();
+    let ep = |ty: &str| -> Value {
+        let hits: Vec<&Value> = cfg["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == ty)
+            .collect();
+        assert_eq!(hits.len(), 1, "前置断言：endpoints[] 里 {ty} 应恰 1 个");
+        hits[0].clone()
+    };
+    let (oc_out, ov_out) = (ep("openconnect"), ep("openvpn-client"));
+    assert_eq!(oc_out["on_demand"], json!(true), "{oc_out:#}");
+    assert_eq!(oc_out["bind_interface"], json!("eth9"), "{oc_out:#}");
+    assert_eq!(ov_out["on_demand"], json!(false), "{ov_out:#}");
+    assert_eq!(ov_out["bind_interface"], json!("eth8"), "{ov_out:#}");
 }

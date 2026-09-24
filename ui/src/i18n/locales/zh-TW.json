@@ -1978,6 +1978,9 @@
     "invalidControlUrlMalformed": "控制伺服器 URL 格式無法辨識，請檢查主機名稱與連接埠",
     "invalidTailcatKey": "伺服器公鑰或 Disco 公鑰缺失，或某個金鑰不是 44 字元的標準 base64",
     "invalidTailcatDerp": "DERP 設定無效：區域 ID（大於 0）與自建伺服器須且只能填一種，每個伺服器都要有主機名稱",
+    "invalidMasquePath": "URI 路徑須留空或以 / 開頭",
+    "invalidMasqueVersion": "HTTP 版本取值無效，請重新選擇",
+    "invalidCustomOutbound": "自訂 Outbound JSON 須是帶字串 type 欄位的物件",
     "exitCapableBadge": "出口",
     "meshLoginFallbackTitle": "組網登入期已暫時直連",
     "meshLoginFallbackRestored": "已連接「{{name}}」，已切回該出口"

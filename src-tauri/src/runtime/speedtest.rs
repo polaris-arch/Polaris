@@ -1010,15 +1010,15 @@ fn build_temp_node(
     if s.protocol == Protocol::MasqueClient {
         // 与主核发射腿共用 `build_masque_endpoint`（含剔节点判据）：落进下面的 `build_proxy_outbound`
         // 会把 endpoint 塞进 `outbounds[]` ⇒ 临时核 `unknown outbound type` 整核失败。
-        // detour 恒 `None`，理由同 WG 腿（前置代理不在临时核里）。
+        // detour 恒 `None`，理由同 WG 腿（前置代理不在临时核里）。`Err` 原样上抛：它就是主核剔该节点
+        // 用的 reason token（`INVALID_REASON_MASQUE_*`），两条链路的缺席原因逐字对得上（同 Tailcat 腿）。
         let endpoint = build_masque_endpoint(
             s,
             tag,
             Some(&DomainResolver::Tag(DIRECT_DNS_TAG.to_string())),
             None,
             |_, msg| log::warn!("{msg}"),
-        )
-        .map_err(|_| "masque 端点构造")?;
+        )?;
         let mut node = serde_json::to_value(endpoint).map_err(|_| "masque 端点序列化")?;
         set_bind_interface(&mut node, bind_interface).ok_or("masque 端点网卡绑定")?;
         return Ok(TempNode {

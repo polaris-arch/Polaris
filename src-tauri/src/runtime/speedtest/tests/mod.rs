@@ -520,7 +520,9 @@ fn masque_client_goes_into_endpoints_without_detour() {
         plan.unusable,
         vec![(
             bad.id.clone(),
-            UnusableReason::BuildFailed("masque 端点构造")
+            UnusableReason::BuildFailed(
+                polaris_config_engine::builder::endpoints::INVALID_REASON_MASQUE_PATH
+            )
         )]
     );
 }

@@ -1978,6 +1978,9 @@
     "invalidControlUrlMalformed": "控制服务器 URL 格式无法识别，请检查主机名与端口",
     "invalidTailcatKey": "服务端公钥或 Disco 公钥缺失，或某个密钥不是 44 字符的标准 base64",
     "invalidTailcatDerp": "DERP 配置无效：区域 ID（大于 0）与自建服务器须且只能填一种，每个服务器都要有主机名",
+    "invalidMasquePath": "URI 路径须留空或以 / 开头",
+    "invalidMasqueVersion": "HTTP 版本取值无效，请重新选择",
+    "invalidCustomOutbound": "自定义 Outbound JSON 须是带字符串 type 字段的对象",
     "exitCapableBadge": "出口",
     "meshLoginFallbackTitle": "组网登录期已临时直连",
     "meshLoginFallbackRestored": "已连接「{{name}}」，已切回该出口"

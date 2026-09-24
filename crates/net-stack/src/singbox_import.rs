@@ -1084,6 +1084,7 @@ pub fn parse_singbox_endpoints(
 /// 载荷形态与生成侧**对称**：生成时把设置结构整体序列化 flatten 进 endpoint，
 /// 故导入时反过来 —— 建模键各归各位，其余原样进透传袋。
 /// 两侧共用同一份「哪些键建模了」的清单（下面的 `MODELED_*`），复制第二份必然漂移。
+/// `on_demand` / `bind_interface` 例外：生成侧读顶层，故提到顶层（[`ENDPOINT_TOP_LEVEL_KEYS`]，同 MASQUE）。
 ///
 /// 地址/端口：openconnect 的 `server` 是 `host:port` **单串**，openvpn 才有独立的 `server_port`。
 /// `ServerConfig` 的 address/port 是落盘门 `sanitize_servers` 的必填项，故从各自形态里拆出来。
@@ -1130,17 +1131,6 @@ fn map_endpoint_vpn_client(
         "domain_resolver",
         "detour",
     ];
-    let bag = |modeled: &[&str]| -> serde_json::Map<String, Value> {
-        let mut m = serde_json::Map::new();
-        if let Some(obj) = ep.as_object() {
-            for (k, v) in obj {
-                if !modeled.contains(&k.as_str()) {
-                    m.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        m
-    };
 
     let raw_server = str_ne(ep.get("server"))?;
     let (addr, port) = if ty == "openconnect" {
@@ -1164,6 +1154,7 @@ fn map_endpoint_vpn_client(
         Protocol::OpenvpnClient
     };
     let mut s = new_server(id_gen, ep, protocol, addr, port, sub_id, now);
+    lift_endpoint_top_level_keys(&mut s, ep);
 
     if ty == "openconnect" {
         s.openconnect_settings = Some(Box::new(OpenconnectSettings {
@@ -1180,7 +1171,7 @@ fn map_endpoint_vpn_client(
             user_agent: str_ne(ep.get("user_agent")),
             reported_os: str_ne(ep.get("reported_os")),
             system: ep.get("system").map(|v| bool_true(Some(v))),
-            extra: bag(MODELED_OC),
+            extra: endpoint_bag(ep, MODELED_OC),
         }));
     } else {
         let pem = |k: &str| -> Vec<String> {
@@ -1222,10 +1213,35 @@ fn map_endpoint_vpn_client(
                     })
                     .unwrap_or_default(),
             }),
-            extra: bag(MODELED_OV),
+            extra: endpoint_bag(ep, MODELED_OV),
         }));
     }
     Some(s)
+}
+
+/// 端点族（MASQUE / OpenConnect / OpenVPN Client）里生成侧按 `ServerConfig` **顶层**写的键。
+///
+/// 生成侧装配层对每条 endpoint 腿统一调 `apply_on_demand` / `apply_bind_interface`，读的是顶层
+/// `onDemand` / `bindInterface`：袋里的 `on_demand` 会原样下发而 UI 读顶层（界面显示关、内核实开），
+/// 袋里的 `bind_interface` 会被 `apply_bind_interface` 静默删掉。故导入时一律提到顶层、不进袋。
+const ENDPOINT_TOP_LEVEL_KEYS: &[&str] = &["on_demand", "bind_interface"];
+
+/// 把 [`ENDPOINT_TOP_LEVEL_KEYS`] 提到节点顶层。
+fn lift_endpoint_top_level_keys(s: &mut ServerConfig, ep: &Value) {
+    s.on_demand = ep.get("on_demand").and_then(Value::as_bool);
+    s.bind_interface = str_ne(ep.get("bind_interface"));
+}
+
+/// endpoint 的透传袋：`modeled` 与 [`ENDPOINT_TOP_LEVEL_KEYS`] 之外的键原样保留。
+fn endpoint_bag(ep: &Value, modeled: &[&str]) -> serde_json::Map<String, Value> {
+    ep.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| {
+            !modeled.contains(&k.as_str()) && !ENDPOINT_TOP_LEVEL_KEYS.contains(&k.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// 导入时丢弃的键 → 一条告警（无则 `None`）。
@@ -1292,8 +1308,6 @@ fn map_endpoint_masque(
         "server_port",
         "username",
         "password",
-        "on_demand",
-        "bind_interface",
         "tls",
         "path",
         "headers",
@@ -1307,8 +1321,7 @@ fn map_endpoint_masque(
     let mut s = new_server(id_gen, ep, Protocol::MasqueClient, addr, port, sub_id, now);
     s.username = str_ne(ep.get("username"));
     s.password = str_ne(ep.get("password"));
-    s.on_demand = ep.get("on_demand").and_then(Value::as_bool);
-    s.bind_interface = str_ne(ep.get("bind_interface"));
+    lift_endpoint_top_level_keys(&mut s, ep);
     s.security = Some(SecurityMode::Tls);
 
     let mut ignored = Vec::new();
@@ -1336,14 +1349,7 @@ fn map_endpoint_masque(
     if headers.is_some_and(|h| !h.is_object()) {
         ignored.push("headers".into());
     }
-    let mut extra = serde_json::Map::new();
-    if let Some(obj) = ep.as_object() {
-        for (k, v) in obj {
-            if !MODELED.contains(&k.as_str()) {
-                extra.insert(k.clone(), v.clone());
-            }
-        }
-    }
+    let extra = endpoint_bag(ep, MODELED);
     s.masque_client_settings = Some(Box::new(MasqueClientSettings {
         path: str_ne(ep.get("path")),
         headers: headers

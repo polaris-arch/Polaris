@@ -1978,6 +1978,9 @@
     "invalidControlUrlMalformed": "The control server URL could not be parsed. Check the host name and port",
     "invalidTailcatKey": "The server public or disco key is missing, or a key is not 44-character standard base64",
     "invalidTailcatDerp": "Invalid DERP settings: set exactly one of region ID (above 0) or self-hosted servers, and give every server a host name",
+    "invalidMasquePath": "The URI path must be empty or start with /",
+    "invalidMasqueVersion": "Invalid HTTP version. Choose it again",
+    "invalidCustomOutbound": "The custom outbound JSON must be an object with a string type field",
     "exitCapableBadge": "Exit",
     "meshLoginFallbackTitle": "Temporarily connecting directly (mesh login)",
     "meshLoginFallbackRestored": "Connected to {{name}}, routing switched back to this exit"
