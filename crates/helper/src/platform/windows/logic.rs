@@ -5,7 +5,7 @@
 //! - iface / cidr / sha256 白名单 → 复用 `helper-proto`（不重复定义，消灭 drift）。
 //! - winproc 特有的端口解析、镜像匹配、basename、路径归一化 → 本模块（Go `winproc.go` 对应）。
 
-use polaris_helper_proto::codec;
+use polaris_helper_proto::{codec, command, Request};
 
 /// Windows 接口白名单（移植自 `helper.go:50-60` 的 `ifaceAllowed`）。
 ///
@@ -357,6 +357,102 @@ pub fn filter_listen_pids(rows: &[ListenEntry], target: u16) -> Vec<u32> {
         }
     }
     out
+}
+
+// ===== 线协议解码（命名管道一帧 → token / 命令 / Request）=====
+//
+// 住这里而不是 `service/win.rs`：那个文件整模块 `cfg(windows)`，本机 `cargo test` 碰不到。解码器与
+// 分派表（[`crate::platform::windows::helper::WinHelper::handle`]）之间的缝就是生产路径 —— 批一
+// `flush-dns`、批三 `install-core` 两次都是「分派加了、解码没加」，而测试直接喂 `Request` 绕过了解码，
+// 全绿。判据要落在 Linux 上跑得到的地方。
+
+/// 一帧请求切出来的三段（Platform::Win 帧结构：行1=token，行2=command，行3..=args）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame<'a> {
+    /// 行1：客户端 token（未验）。
+    pub token: &'a str,
+    /// 行2：命令名。
+    pub command: &'a str,
+    /// 行3..：命令特定参数行。
+    pub args: Vec<&'a str>,
+}
+
+/// 把一次 `ReadFile` 读回的整帧按行切成 [`Frame`]。连 token 行 + 命令行都凑不齐 ⇒ `None`。
+///
+/// `str::lines` 同时剥 `\n` 与 `\r\n`，与客户端 `codec::frame_to_bytes`（每行尾 `\n`）对偶。
+#[must_use]
+pub fn split_frame(raw: &str) -> Option<Frame<'_>> {
+    let mut lines = raw.lines();
+    let token = lines.next()?;
+    let command = lines.next()?;
+    Some(Frame {
+        token,
+        command,
+        args: lines.collect(),
+    })
+}
+
+/// 解析 command + arg lines 为 Request（对应 Go handle() 各 case 的 readLine 序列）。
+///
+/// 缺行一律按 Go `readLine` 的 EOF 语义取 `""`；参数值是否合法由各分派腿自己判（例如
+/// install-core 的空 src / 非 64 hex hash 由 [`crate::core_install::install_core_files`] 回
+/// `ERR bad-args`），解码层不重复造判据。返回 `None` = 不认识的命令（或参数连类型都解不出）。
+#[must_use]
+pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
+    let mut iter = args.iter();
+    let mut next_line = || iter.next().copied().unwrap_or("");
+    Some(match cmd {
+        command::common::PING => Request::Ping,
+        command::common::VERSION => Request::Version,
+        command::common::STATUS => Request::Status,
+        // stop 的受管 pid 身份行可选：旧客户端不发 → next_line() 返 "" → None（旧语义）。
+        command::common::STOP => Request::Stop {
+            pid: polaris_helper_proto::parse_stop_pid(next_line()),
+        },
+        command::common::CLEANUP => Request::Cleanup,
+        command::common::FREEPORT => {
+            let port = parse_port(next_line())?;
+            Request::FreePort { port }
+        }
+        command::common::START => Request::Start(polaris_helper_proto::StartParams {
+            cfg: next_line().to_owned(),
+            log: next_line().to_owned(),
+            fwd: next_line() == "1",
+            parent_pid: next_line().parse::<u32>().ok(),
+        }),
+        command::common::ROUTE_ADD => Request::RouteAdd(parse_route_params(&mut next_line)),
+        command::common::ROUTE_DEL => Request::RouteDel(parse_route_params(&mut next_line)),
+        command::win::UNINSTALL => Request::Uninstall,
+        // D4：flush-dns 无参数行。**解码侧漏了这一格，分派侧的新分支就永远够不着** ——
+        // parse_request 返 None 时 serve 循环直接回 ERR unknown，压根不进 `WinHelper::handle`。
+        command::mac::FLUSH_DNS => Request::FlushDns,
+        // P4：src 行 + wantHash 行（与编码侧 `Request::write_args` 同序；与 mac `decode_request`
+        // 同形：src 原样、hash trim）。批三只加了分派没加这一格 ⇒ 真机 0 字节 / 233。
+        command::mac::INSTALL_CORE => {
+            Request::InstallCore(polaris_helper_proto::InstallCoreParams {
+                src_dir: next_line().to_owned(),
+                want_hash: next_line().trim().to_owned(),
+            })
+        }
+        command::win::IFACE_METRIC => {
+            let iface = next_line().to_owned();
+            let metric: u16 = next_line().parse().ok()?;
+            Request::IfaceMetric { iface, metric }
+        }
+        _ => return None, // ERR unknown
+    })
+}
+
+/// 解析 route-add/route-del 的 iface + cidrs 两行。
+fn parse_route_params<'a>(next: &mut impl FnMut() -> &'a str) -> polaris_helper_proto::RouteParams {
+    let iface = next().to_owned();
+    let cidrs_line = next();
+    let cidrs = if cidrs_line.is_empty() {
+        Vec::new()
+    } else {
+        cidrs_line.split(',').map(|s| s.trim().to_owned()).collect()
+    };
+    polaris_helper_proto::RouteParams { iface, cidrs }
 }
 
 #[cfg(test)]

@@ -10,14 +10,12 @@
 // （CreateNamedPipeW/ConnectNamedPipe/ConvertStringSecurityDescriptorToSecurityDescriptorW/
 // StartServiceCtrlDispatcherW/RegisterServiceCtrlHandlerExW/SetServiceStatus/...）必须 unsafe。
 // 每处 unsafe 块附 SAFETY 理由。
-use crate::platform::windows::helper::{HandleOutcome, WinHelper};
+use crate::platform::windows::helper::{FlushMode, WinHelper};
 use crate::platform::windows::logic;
 use crate::platform::windows::winproc::WinProcOps;
 use crate::platform::windows::{DEFAULT_SUPPORT_DIR, PIPE_NAME, PIPE_SDDL, SERVICE_NAME};
 use crate::token::FileTokenStore;
 use polaris_helper_proto::codec::MAX_FRAME_BYTES;
-use polaris_helper_proto::command;
-use polaris_helper_proto::Request;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -61,21 +59,8 @@ const ERROR_BROKEN_PIPE: u32 = 109;
 /// 写腿取同一预算 —— 同一个连接、同一个对端，两腿的耐心没有理由不同。
 const IO_TIMEOUT_SECS: u64 = 5;
 
-/// 响应写完后要不要等对端把它读走（= 要不要 `FlushFileBuffers`）。
-///
-/// 命名管道服务端在 `DisconnectNamedPipe` 前不 flush，client 尚未读走的字节会被丢弃
-/// （稳定复现 ERROR_PIPE_NOT_CONNECTED(233)）—— 所以正常响应必须等。但「等对端」这件事本身
-/// 是可被滥用的：等多久完全由对端决定。故按**对端是否已鉴权**分两档。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlushMode {
-    /// 已鉴权的正常响应：等对端读走（仍受 [`IoTimeoutGuard`] 的 5s 上界约束）。
-    WaitPeer,
-    /// 鉴权失败 / 帧不合法 / 未知命令：**不等对端**。这些响应的收件人恰恰是「还没证明自己是谁」
-    /// 的进程，不能让它用「发一帧、不读」把 SYSTEM 服务的线程按住。代价：这条错误行可能被随后的
-    /// `DisconnectNamedPipe` 丢弃，合法但 token 过期的 client 侧表现为管道断开而非 `ERR auth`
-    /// （两者都进同一条「本次调用失败」分支，不改变 app 的处置）。
-    NoWait,
-}
+// 响应的 flush 档位（`FlushMode`）住在跨平台的 `helper` 模块：档位由 `WinHelper::handle_frame`
+// 按「对端是否已鉴权」决定（Linux 可测），本文件只照档位执行。
 
 /// 全局停止标志（SCM STOP/SHUTDOWN 时置 true，accept 循环据此退出）。
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -318,41 +303,17 @@ where
         }
     };
     let raw = String::from_utf8_lossy(&buf[..n]);
-    let lines: Vec<&str> = raw.lines().collect();
-    // 帧结构（Platform::Win）：行1=token，行2=command，行3..=args。
-    // 帧不合法 / 未知命令：此刻 token 还没验过（甚至可能压根没发）⇒ 一律 NoWait。
-    let (token_line, cmd_line, arg_lines) = match lines.as_slice() {
-        [tok, cmd, args @ ..] => (*tok, *cmd, args),
-        _ => {
-            write_response(h, b"ERR unknown\n", FlushMode::NoWait);
-            cleanup_pipe(h);
-            return;
-        }
-    };
-    let req = match parse_request(cmd_line, arg_lines) {
-        Some(r) => r,
-        None => {
-            write_response(h, b"ERR unknown\n", FlushMode::NoWait);
-            cleanup_pipe(h);
-            return;
-        }
-    };
-    let outcome = helper.handle(token_line, req);
-    let (response_line, flush) = match outcome {
-        // 鉴权失败：对端未证明身份，不给它「按住服务线程」的机会。
-        HandleOutcome::AuthFailed => ("ERR auth\n".to_owned(), FlushMode::NoWait),
-        HandleOutcome::Respond(resp) => (format!("{}\n", resp.to_wire_line()), FlushMode::WaitPeer),
-        HandleOutcome::UninstallAndExit(resp) => {
-            let line = format!("{}\n", resp.to_wire_line());
-            write_response(h, line.as_bytes(), FlushMode::WaitPeer);
-            cleanup_pipe(h);
-            // 800ms 后 os.Exit（Go helper.go:291-294）。
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            std::process::exit(0);
-        }
-    };
-    write_response(h, response_line.as_bytes(), flush);
+    // 切行 → 验 token → 解码 → 分派 全在 `handle_frame`（跨平台、Linux 有门）；这里只管 IO。
+    // 顺序与各腿的 flush 档位见该方法文档：token 不对时不看命令（已知/未知不可区分），
+    // 已鉴权而命令未知的 `ERR unknown` 走 WaitPeer 可靠送达。
+    let reply = helper.handle_frame(&raw);
+    write_response(h, reply.line.as_bytes(), reply.flush);
     cleanup_pipe(h);
+    if reply.exit_after {
+        // 800ms 后 os.Exit（Go helper.go:291-294）。
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        std::process::exit(0);
+    }
 }
 
 /// 读一个请求帧（**单次 ReadFile**，对应 mod.rs「一次 ReadFile 取整个请求帧再切行」的设计）。
@@ -506,57 +467,9 @@ fn cleanup_pipe(h: HANDLE) {
     }
 }
 
-/// 解析 command + arg lines 为 Request（对应 Go handle() 各 case 的 readLine 序列）。
-///
-/// clippy needless_lifetimes：显式 `<'a>` 可省（Request 为 owned，不借 args 生命周期）→ 用省略式。
-fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
-    let mut iter = args.iter();
-    let mut next_line = || iter.next().copied().unwrap_or("");
-    Some(match cmd {
-        command::common::PING => Request::Ping,
-        command::common::VERSION => Request::Version,
-        command::common::STATUS => Request::Status,
-        // stop 的受管 pid 身份行可选：旧客户端不发 → next_line() 返 "" → None（旧语义）。
-        command::common::STOP => Request::Stop {
-            pid: polaris_helper_proto::parse_stop_pid(next_line()),
-        },
-        command::common::CLEANUP => Request::Cleanup,
-        command::common::FREEPORT => {
-            let port = crate::platform::windows::logic::parse_port(next_line())?;
-            Request::FreePort { port }
-        }
-        command::common::START => Request::Start(polaris_helper_proto::StartParams {
-            cfg: next_line().to_owned(),
-            log: next_line().to_owned(),
-            fwd: next_line() == "1",
-            parent_pid: next_line().parse::<u32>().ok(),
-        }),
-        command::common::ROUTE_ADD => Request::RouteAdd(parse_route_params(&mut next_line)),
-        command::common::ROUTE_DEL => Request::RouteDel(parse_route_params(&mut next_line)),
-        command::win::UNINSTALL => Request::Uninstall,
-        // D4：flush-dns 无参数行。**解码侧漏了这一格，分派侧的新分支就永远够不着** ——
-        // parse_request 返 None 时 serve 循环直接回 ERR unknown，压根不进 `WinHelper::handle`。
-        command::mac::FLUSH_DNS => Request::FlushDns,
-        command::win::IFACE_METRIC => {
-            let iface = next_line().to_owned();
-            let metric: u16 = next_line().parse().ok()?;
-            Request::IfaceMetric { iface, metric }
-        }
-        _ => return None, // ERR unknown
-    })
-}
-
-/// 解析 route-add/route-del 的 iface + cidrs 两行。
-fn parse_route_params<'a>(next: &mut impl FnMut() -> &'a str) -> polaris_helper_proto::RouteParams {
-    let iface = next().to_owned();
-    let cidrs_line = next();
-    let cidrs = if cidrs_line.is_empty() {
-        Vec::new()
-    } else {
-        cidrs_line.split(',').map(|s| s.trim().to_owned()).collect()
-    };
-    polaris_helper_proto::RouteParams { iface, cidrs }
-}
+// 线协议解码（`split_frame` / `parse_request`）已搬到 `logic`（跨平台）：本文件整模块 `cfg(windows)`，
+// 解码器留在这里 = 本机 `cargo test` 永远碰不到它（批一 flush-dns、批三 install-core 两次「分派加了、
+// 解码没加」都是这么漏过去的）。
 
 // wire 写方向已上提 helper-proto：见 [`polaris_helper_proto::Response::to_wire_line`]
 //（与 `Response::parse` 成对，三平台共用）。原 win 私有副本（`wire_response`/`wire_ok`，38 行）已删。

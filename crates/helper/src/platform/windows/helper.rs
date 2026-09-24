@@ -3,9 +3,9 @@
 //! ## 设计
 //!
 //! Go 源 `handle(conn)` 读 token+command+args 行 → `mu.Lock()` → switch command → 回复。本 Rust 实现把
-//! 「帧已解析」与「分派」解耦：调用方（`service.rs` 的 serve 循环）负责读帧 + 鉴权 + 解析为
-//! [`polaris_helper_proto::Request`]，本模块的 [`WinHelper::handle`] 负责 switch 分派 + 子进程状态管理
-//! + 回复构造。这样：
+//! 「读帧」与「处理」解耦：调用方（`service/win.rs` 的 serve 循环）只负责读回一整帧、把结果写出去；
+//! 本模块的 [`WinHelper::handle_frame`] 负责切行 → 鉴权 → 解码为 [`polaris_helper_proto::Request`]
+//! → [`WinHelper::handle`] 的 switch 分派 + 子进程状态管理 + 回复构造。这样：
 //! - 分派逻辑（=Go switch 主体）跨平台纯逻辑，Linux 可单测。
 //! - IO（命名管道读写）由 `service.rs` 承接（`#[cfg(windows)]`）。
 //!
@@ -77,6 +77,81 @@ pub struct WinHelper<T, P, N> {
     support_dir: String,
 }
 
+/// 响应写完后要不要等对端把它读走（= 要不要 `FlushFileBuffers`）。
+///
+/// 命名管道服务端在 `DisconnectNamedPipe` 前不 flush，client 尚未读走的字节会被丢弃
+/// （稳定复现 ERROR_PIPE_NOT_CONNECTED(233)）—— 所以正常响应必须等。但「等对端」这件事本身
+/// 是可被滥用的：等多久完全由对端决定。故按**对端是否已鉴权**分两档。
+///
+/// 住在本模块（跨平台）而非 `service/win.rs`：档位由 [`WinHelper::handle_frame`] 决定，那是
+/// Linux 上可测的判据；`service/win.rs` 只照档位执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushMode {
+    /// 已鉴权的响应（含已鉴权但命令未知的 `ERR unknown`）：等对端读走（仍受 service 层
+    /// `IoTimeoutGuard` 的 5s 上界约束）。
+    WaitPeer,
+    /// 鉴权失败 / 帧不合法：**不等对端**。这些响应的收件人恰恰是「还没证明自己是谁」
+    /// 的进程，不能让它用「发一帧、不读」把 SYSTEM 服务的线程按住。代价：这条错误行可能被随后的
+    /// `DisconnectNamedPipe` 丢弃，合法但 token 过期的 client 侧表现为管道断开而非 `ERR auth`
+    /// （两者都进同一条「本次调用失败」分支，不改变 app 的处置）。
+    NoWait,
+}
+
+/// 一帧的处理结果：要写回的整行（含 `\n`）+ flush 档位 + 写完后是否自退（uninstall）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameReply {
+    /// 写回管道的响应行（含行尾 `\n`）。
+    pub line: String,
+    /// 写完后要不要等对端读走。
+    pub flush: FlushMode,
+    /// 写完并断开后 800ms 退出进程（Go `uninstall` 分支，helper.go:291-294）。
+    pub exit_after: bool,
+}
+
+impl FrameReply {
+    fn no_wait(line: String) -> Self {
+        Self {
+            line,
+            flush: FlushMode::NoWait,
+            exit_after: false,
+        }
+    }
+
+    fn from_outcome(outcome: HandleOutcome) -> Self {
+        match outcome {
+            // 鉴权失败：对端未证明身份，不给它「按住服务线程」的机会。
+            HandleOutcome::AuthFailed => Self::no_wait(format!(
+                "{}\n",
+                Response::Err(polaris_helper_proto::Error::new(
+                    polaris_helper_proto::ErrorCode::Auth
+                ))
+                .to_wire_line()
+            )),
+            HandleOutcome::Respond(resp) => Self {
+                line: format!("{}\n", resp.to_wire_line()),
+                flush: FlushMode::WaitPeer,
+                exit_after: false,
+            },
+            HandleOutcome::UninstallAndExit(resp) => Self {
+                line: format!("{}\n", resp.to_wire_line()),
+                flush: FlushMode::WaitPeer,
+                exit_after: true,
+            },
+        }
+    }
+}
+
+/// `ERR unknown\n`（帧不合法 / 已鉴权但命令解不出，两条腿同一行）。
+fn unknown_line() -> String {
+    format!(
+        "{}\n",
+        Response::Err(polaris_helper_proto::Error::new(
+            polaris_helper_proto::ErrorCode::Unknown
+        ))
+        .to_wire_line()
+    )
+}
+
 /// 单次 handle 的结果（成功响应，或鉴权失败/其它需提前终止的情形）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandleOutcome {
@@ -132,10 +207,49 @@ where
     #[must_use]
     pub fn handle(&self, client_token: &str, req: Request) -> HandleOutcome {
         // Go helper.go:169: if tok == "" || tok != tokenValue() { ERR auth; return }
-        if !is_authed_constant_time(client_token, &self.token.token_value()) {
+        if !self.is_authed(client_token) {
             return HandleOutcome::AuthFailed;
         }
-        // 鉴权通过 → 进 switch（持锁分派）
+        self.dispatch(req)
+    }
+
+    /// 处理命名管道读回的**一整帧**（切行 → 验 token → 解码 → 分派），产出要写回的那一行。
+    ///
+    /// `service/win.rs` 的 `handle_connection` 只负责读帧与把 [`FrameReply`] 写出去；顺序判据全在
+    /// 这里，好让它在 Linux 上有门可跑。顺序：
+    ///
+    /// 1. 帧行数不足（连 token/命令都没有）⇒ `ERR unknown` + [`FlushMode::NoWait`]（对端连身份都没报）。
+    /// 2. **先验 token** ⇒ 不合法回 `ERR auth` + `NoWait`，**不看命令**：对已知 / 未知 / 参数解不出的
+    ///    命令一律同一行，未鉴权对端探测不出 helper 认识哪些命令。
+    /// 3. 已鉴权而命令解不出 ⇒ `ERR unknown` + [`FlushMode::WaitPeer`]：收件人已证明身份，这行必须
+    ///    送达 —— 它是 app 判「这个 helper 不支持某命令」的唯一依据（旧顺序在验 token 之前 NoWait
+    ///    回它，DisconnectNamedPipe 常把它丢掉，app 只看到 0 字节 / 233）。
+    /// 4. 分派。
+    #[must_use]
+    pub fn handle_frame(&self, raw: &str) -> FrameReply {
+        let Some(frame) = logic::split_frame(raw) else {
+            return FrameReply::no_wait(unknown_line());
+        };
+        if !self.is_authed(frame.token) {
+            return FrameReply::from_outcome(HandleOutcome::AuthFailed);
+        }
+        let Some(req) = logic::parse_request(frame.command, &frame.args) else {
+            return FrameReply {
+                line: unknown_line(),
+                flush: FlushMode::WaitPeer,
+                exit_after: false,
+            };
+        };
+        FrameReply::from_outcome(self.dispatch(req))
+    }
+
+    /// token 常量时间比对（Go helper.go:169）。[`Self::handle`] 与 [`Self::handle_frame`] 共用。
+    fn is_authed(&self, client_token: &str) -> bool {
+        is_authed_constant_time(client_token, &self.token.token_value())
+    }
+
+    /// 鉴权已过之后的 switch 分派（Go `handle()` 的 switch 主体）。
+    fn dispatch(&self, req: Request) -> HandleOutcome {
         match req {
             Request::Ping => HandleOutcome::Respond(Response::Ok(ResponseKind::Pong(
                 // Go helper.go:179: Windows Getuid()=-1 破坏正则，固定发 0。

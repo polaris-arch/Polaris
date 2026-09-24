@@ -18,7 +18,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[cfg(any(test, target_os = "macos"))]
 use polaris_helper_client::ClientError;
 #[cfg(test)]
 use polaris_helper_client::ConnectionStream;
@@ -1009,26 +1008,7 @@ impl HelperRuntime {
     /// `ERR unknown` 单列为 [`InstallCoreError::Unsupported`]，理由见该变体文档。
     pub fn install_core(&self, src_dir: &Path, want_hash: &str) -> Result<(), InstallCoreError> {
         let client = self.build_client().map_err(InstallCoreError::Failed)?;
-        let req = Request::InstallCore(InstallCoreParams {
-            src_dir: src_dir.to_string_lossy().into_owned(),
-            want_hash: want_hash.to_owned(),
-        });
-        // install-core 走长超时（sha256 + 80MB 量级复制），沿用 client 侧既有常量，不另开一个。
-        let resp = client
-            .send_with_timeout(&req, Duration::from_millis(INSTALL_CORE_TIMEOUT_MS))
-            .map_err(|e| InstallCoreError::Failed(format!("helper 装核通信失败：{e}")))?;
-        match resp {
-            Response::Ok(ResponseKind::Installed) => Ok(()),
-            Response::Ok(other) => Err(InstallCoreError::Failed(format!(
-                "helper 装核返回非预期响应：{other:?}"
-            ))),
-            // `ERR unknown` = 这个 helper 压根不认识 install-core（旧 Windows helper 的常态）。
-            // 与「这次装核失败了」分开：前者重试一万次也是同一个结果，后者可能下次就好了。
-            Response::Err(e) if e.code == polaris_helper_proto::ErrorCode::Unknown => {
-                Err(InstallCoreError::Unsupported)
-            }
-            Response::Err(e) => Err(InstallCoreError::Failed(format!("helper 装核失败：{e}"))),
-        }
+        install_core_with_client(&client, src_dir, want_hash)
     }
 
     /// 探一次已装 helper 自报的**构建身份**（一次 `Ping`，无副作用）。
@@ -1236,6 +1216,91 @@ fn classify_mac_proxy_client_error(
         ClientError::Timeout | ClientError::Io(_) | ClientError::EmptyResponse => {
             MacProxyWriterError::Failed(error.to_string())
         }
+    }
+}
+
+/// install-core 的可测试通信核（[`HelperRuntime::install_core`] 的全部判据）。
+///
+/// # Windows 上「写出了、对端 0 字节就断开」的归类
+///
+/// 批三之前的 Windows helper 不认识 install-core，批三到本批之间的 helper 分派认识、线协议解码器
+/// 不认识 —— 两者都在**验 token 之前** NoWait 回 `ERR unknown` 并 `DisconnectNamedPipe`，这行
+/// 几乎总被丢掉，app 读到 0 字节（真机：`ERROR_PIPE_NOT_CONNECTED`(233)，客户端读腿已把它归为
+/// EOF ⇒ [`ClientError::EmptyResponse`]）。不归类的话 `Unsupported` 分支在 Windows 上永远不触发，
+/// 能力缓存形同虚设，每次起核白 stage 约 80MB。
+///
+/// 三种失败要分开（`helper-client` 已按类型分开，见 `windows_pipe::is_peer_gone`）：
+/// - 连不上（[`ClientError::Connect`]）：helper 没在听 ⇒ `Failed`；
+/// - 请求没写出（[`ClientError::Io`]，写腿）⇒ `Failed`；
+/// - 写出了、对端一个字节没回就断开（[`ClientError::EmptyResponse`]）⇒ **复核**后才可能 `Unsupported`。
+///
+/// 只对 Windows 的 install-core 做这件事：`ping`/`start` 收到 0 字节是真故障；mac/linux 的旧
+/// helper 会如实回 `ERR unknown` 文本，不需要猜。
+///
+/// # 为什么要复核一帧，而不是直接归 `Unsupported`
+///
+/// 记号的失效键是 helper 自报的构建身份，而它只在 helper 换代或 `install()` 成功时才变。
+/// **新** helper（认识 install-core）若在装核途中偶发断开（进程崩溃、被 SCM 重启），直接记号就会把
+/// 「这一次失败」钉成「整个会话不再尝试」，受保护目录停在旧核。故再发一帧**无副作用**的
+/// install-core（空 src / 空 hash）：认识它的 helper 会在落盘之前回一行文本（`ERR busy` /
+/// `ERR bad-args` / `ERR coredir-acl-weakened`，核心 `install_core_files` 对空 src 首先回
+/// `BadArgs`），不认识的旧 helper 仍是 0 字节或 `ERR unknown`。只有复核也是这两种之一才归
+/// `Unsupported`；复核拿到任何其它应答、或连不上，都按这一次的偶发失败处理（`Failed`，不记号）。
+fn install_core_with_client(
+    client: &HelperClient,
+    src_dir: &Path,
+    want_hash: &str,
+) -> Result<(), InstallCoreError> {
+    let req = Request::InstallCore(InstallCoreParams {
+        src_dir: src_dir.to_string_lossy().into_owned(),
+        want_hash: want_hash.to_owned(),
+    });
+    // install-core 走长超时（sha256 + 80MB 量级复制），沿用 client 侧既有常量，不另开一个。
+    match client.send_with_timeout(&req, Duration::from_millis(INSTALL_CORE_TIMEOUT_MS)) {
+        Ok(resp) => install_core_response(resp),
+        Err(ClientError::EmptyResponse) if client.platform() == Platform::Win => {
+            confirm_install_core_unsupported(client)
+        }
+        Err(e) => Err(InstallCoreError::Failed(format!(
+            "helper 装核通信失败：{e}"
+        ))),
+    }
+}
+
+/// install-core 应答 → 结果分类。
+fn install_core_response(resp: Response) -> Result<(), InstallCoreError> {
+    match resp {
+        Response::Ok(ResponseKind::Installed) => Ok(()),
+        Response::Ok(other) => Err(InstallCoreError::Failed(format!(
+            "helper 装核返回非预期响应：{other:?}"
+        ))),
+        // `ERR unknown` = 这个 helper 压根不认识 install-core（旧 Windows helper 的常态）。
+        // 与「这次装核失败了」分开：前者重试一万次也是同一个结果，后者可能下次就好了。
+        Response::Err(e) if e.code == polaris_helper_proto::ErrorCode::Unknown => {
+            Err(InstallCoreError::Unsupported)
+        }
+        Response::Err(e) => Err(InstallCoreError::Failed(format!("helper 装核失败：{e}"))),
+    }
+}
+
+/// Windows 上 install-core 0 字节之后的复核帧（理由见 [`install_core_with_client`]）。
+fn confirm_install_core_unsupported(client: &HelperClient) -> Result<(), InstallCoreError> {
+    let probe = Request::InstallCore(InstallCoreParams {
+        src_dir: String::new(),
+        want_hash: String::new(),
+    });
+    match client.send(&probe) {
+        Err(ClientError::EmptyResponse) => Err(InstallCoreError::Unsupported),
+        Ok(Response::Err(e)) if e.code == polaris_helper_proto::ErrorCode::Unknown => {
+            Err(InstallCoreError::Unsupported)
+        }
+        Ok(resp) => Err(InstallCoreError::Failed(format!(
+            "helper 装核连接写出后 0 字节即断开；复核帧得到应答 {resp:?} ⇒ helper 认识 \
+             install-core，按本次偶发故障处理"
+        ))),
+        Err(e) => Err(InstallCoreError::Failed(format!(
+            "helper 装核连接写出后 0 字节即断开；复核帧也失败（{e}）⇒ 无法判定能力，按本次失败处理"
+        ))),
     }
 }
 

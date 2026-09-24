@@ -5,6 +5,8 @@ use crate::platform::windows::ops::{MockNetTableOps, MockProcOps};
 use crate::token::StaticTokenStore;
 use polaris_helper_proto::StartParams;
 
+mod wire_gate;
+
 /// **已迁移**形态（P4 的目标态，也是安装脚本装出来的形态）：`--singbox` 就在
 /// `<support>\core` 里，故实际执行面 == 派生的落盘目标面 ⇒ 起核自检真的会跑判定。
 ///

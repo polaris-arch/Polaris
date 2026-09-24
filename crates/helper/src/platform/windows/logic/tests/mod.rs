@@ -335,7 +335,8 @@ fn scm_stop_wakes_the_blocked_accept_loop() {
 /// `FlushFileBuffers` 在命名管道服务端按定义会一直等到 client 把数据读走 ⇒ 「连上、发一帧、不读」
 /// 即可无限期钉住一个 SYSTEM 服务线程 + 一个管道 HANDLE；此前该腿既无守卫、又在鉴权失败/未知命令
 /// 分支同样执行（读腿早有 `IoTimeoutGuard`，同连接内两腿不对齐）。服务模块仅在 Windows 编译，
-/// 故这里以源码契约在 Linux 本地守住；行为面属 Windows 真机项。
+/// 故这里以源码契约在 Linux 本地守住；行为面属 Windows 真机项。档位**判据**（谁 NoWait、谁
+/// WaitPeer）已搬进 `WinHelper::handle_frame`，由 `helper/tests/wire_gate.rs` 做行为门。
 #[test]
 fn response_write_is_bounded_and_unauthenticated_replies_never_wait_for_the_peer() {
     let src = polaris_source_probe::crate_source!("platform/windows/service/win.rs");
@@ -363,7 +364,9 @@ fn response_write_is_bounded_and_unauthenticated_replies_never_wait_for_the_peer
     let write = wbody.find("let ok = WriteFile(").expect("WriteFile 锚点");
     assert!(arm < write, "守卫必须在同步 WriteFile 之前装上");
 
-    // ② 调用点分档：未鉴权/未识别的三条响应一律 NoWait，正常响应 WaitPeer。
+    // ② 调用点分档：档位判据已搬到跨平台的 `WinHelper::handle_frame`（行为门见
+    //    `windows/helper/tests/wire_gate.rs`：token 不对 / 帧不合法 ⇒ NoWait，已鉴权 ⇒ WaitPeer，
+    //    含已鉴权而命令未知的 `ERR unknown`）。这里只钉住 service 层**照档位执行、不自行改档**。
     let hat = src
         .find("fn handle_connection<")
         .expect("handle_connection 消失");
@@ -372,33 +375,14 @@ fn response_write_is_bounded_and_unauthenticated_replies_never_wait_for_the_peer
         .map_or(src.len(), |i| hat + i);
     let hbody = &src[hat..hend];
     assert!(hbody.contains("cleanup_pipe(h)"), "窗口没盖住连接处理");
-    assert_eq!(
-        hbody.matches("FlushMode::NoWait").count(),
-        3,
-        "未鉴权响应共 3 条（帧不合法 / 未知命令 / 鉴权失败），少一条就是留了个钉住点"
-    );
-    // 鉴权失败分支本身：切到下一 arm 之前，只能是 NoWait。
-    let auth = hbody
-        .find("HandleOutcome::AuthFailed")
-        .expect("鉴权失败分支消失");
-    let respond = hbody
-        .find("HandleOutcome::Respond")
-        .expect("正常响应分支消失");
-    assert!(auth < respond, "分支顺序变了，下面的切片会取错");
-    let auth_arm = &hbody[auth..respond];
     assert!(
-        auth_arm.contains("FlushMode::NoWait"),
-        "鉴权失败分支仍等对端读走响应"
+        hbody.contains("write_response(h, reply.line.as_bytes(), reply.flush)"),
+        "写回没有照 handle_frame 给的 flush 档位"
     );
+    let code = polaris_source_probe::mask_comments_and_strings(hbody);
     assert!(
-        !auth_arm.contains("FlushMode::WaitPeer"),
-        "鉴权失败分支等对端"
-    );
-    // 反向对照：正常（已鉴权）响应必须仍然 flush —— 否则 DisconnectNamedPipe 丢字节，
-    // 回到 ERROR_PIPE_NOT_CONNECTED(233) 那个老坑。
-    assert!(
-        hbody.contains("FlushMode::WaitPeer"),
-        "已鉴权响应也不 flush 了 ⇒ client 稳定收 233"
+        !code.contains("FlushMode::"),
+        "service 层自己挑了 flush 档位 —— 未鉴权对端的 NoWait 判据会被绕开"
     );
     // 反向对照：不得再有不带模式的裸调用。
     assert!(
@@ -553,4 +537,162 @@ fn flush_dns_result_folds_exit_and_carries_stdout() {
     // 被信号带走（无退出码）同样是失败，且不得伪装成 exit 0。
     let signaled = flush_dns_result(None, "", "").expect_err("无退出码必须是 Err");
     assert!(signaled.contains("terminated by signal"), "{signaled}");
+}
+
+// ===== 线协议解码（原住 `service/win/tests`，随解码器搬到 logic：此前整组测试 cfg(windows)，
+// 本机 `cargo test` 一条都没跑过）=====
+
+#[test]
+fn parse_request_ping_status() {
+    assert!(matches!(
+        parse_request("ping", &[][..]),
+        Some(Request::Ping)
+    ));
+    assert!(matches!(
+        parse_request("status", &[][..]),
+        Some(Request::Status)
+    ));
+}
+
+/// stop 的受管 pid 身份行可选：有则解出，无（旧客户端）则 `None`。
+///
+/// 变异：把 `STOP` 分支退回不读身份行的 `Request::Stop { pid: None }` → 首条转红
+/// （身份判据从此永远拿不到 want = 形同虚设）。
+#[test]
+fn parse_request_stop_reads_optional_pid() {
+    assert_eq!(
+        parse_request("stop", &["4242"]).unwrap(),
+        Request::Stop { pid: Some(4242) }
+    );
+    assert_eq!(
+        parse_request("stop", &[][..]).unwrap(),
+        Request::Stop { pid: None },
+        "旧客户端不发身份行 → None → 沿用「停当前受管核」"
+    );
+}
+
+#[test]
+fn parse_request_freeport() {
+    let r = parse_request("freeport", &["9090"]).unwrap();
+    assert_eq!(r, Request::FreePort { port: 9090 });
+}
+
+#[test]
+fn parse_request_freeport_bad_port_returns_none() {
+    assert!(parse_request("freeport", &["abc"]).is_none());
+}
+
+#[test]
+fn parse_request_start_full() {
+    let r = parse_request("start", &["/c/cfg.json", "/l/log.txt", "1", "4242"]).unwrap();
+    let Request::Start(p) = r else { panic!() };
+    assert_eq!(p.cfg, "/c/cfg.json");
+    assert_eq!(p.log, "/l/log.txt");
+    assert!(p.fwd);
+    assert_eq!(p.parent_pid, Some(4242));
+}
+
+#[test]
+fn parse_request_start_without_ppid() {
+    let r = parse_request("start", &["/c/cfg.json", "", "0"]).unwrap();
+    let Request::Start(p) = r else { panic!() };
+    assert_eq!(p.parent_pid, None);
+}
+
+#[test]
+fn parse_request_route_add() {
+    let r = parse_request("route-add", &["polaris-tun0", "10.0.0.0/8,172.16.0.0/12"]).unwrap();
+    let Request::RouteAdd(rp) = r else { panic!() };
+    assert_eq!(rp.iface, "polaris-tun0");
+    assert_eq!(rp.cidrs, vec!["10.0.0.0/8", "172.16.0.0/12"]);
+}
+
+#[test]
+fn parse_request_uninstall_iface_metric() {
+    assert!(matches!(
+        parse_request("uninstall", &[][..]),
+        Some(Request::Uninstall)
+    ));
+    let r = parse_request("iface-metric", &["polaris-tun0", "999"]).unwrap();
+    let Request::IfaceMetric { iface, metric } = r else {
+        panic!()
+    };
+    assert_eq!(iface, "polaris-tun0");
+    assert_eq!(metric, 999);
+}
+
+#[test]
+fn parse_request_unknown_returns_none() {
+    assert!(parse_request("bogus", &[][..]).is_none());
+}
+
+/// D4：`flush-dns` 必须在解码侧被认出来（无参数行）。
+///
+/// 变异：删掉 `FLUSH_DNS` 那一格 → 本条转红。分派层实现了新分支却漏了解码，serve 循环会在
+/// `parse_request` 返 `None` 时直接回 `ERR unknown`，新分支一辈子够不着。
+#[test]
+fn parse_request_flush_dns() {
+    assert!(matches!(
+        parse_request("flush-dns", &[][..]),
+        Some(Request::FlushDns)
+    ));
+}
+
+/// P4：`install-core` 必须在解码侧被认出来（src 行 + wantHash 行）。
+///
+/// 变异：删掉 `INSTALL_CORE` 那一格 → 本条转红（= 批三真机缺陷的形态：分派有、解码无 ⇒ 0 字节 / 233）。
+#[test]
+fn parse_request_install_core() {
+    let hash = "ab".repeat(32);
+    assert_eq!(
+        parse_request(
+            "install-core",
+            &[r"C:\Users\bob\stage core", &format!(" {hash} ")]
+        ),
+        Some(Request::InstallCore(
+            polaris_helper_proto::InstallCoreParams {
+                src_dir: r"C:\Users\bob\stage core".to_owned(),
+                want_hash: hash,
+            }
+        )),
+        "src 原样（路径可含空格）、hash trim（与 mac decode_request 同形）"
+    );
+    // 缺行不在解码层拒：解成空串，交给 install_core_files 的 BadArgs 判（不在两处各造一份判据）。
+    assert_eq!(
+        parse_request("install-core", &[][..]),
+        Some(Request::InstallCore(
+            polaris_helper_proto::InstallCoreParams {
+                src_dir: String::new(),
+                want_hash: String::new(),
+            }
+        ))
+    );
+}
+
+/// 切行：行1 token、行2 命令、其余参数；`\r\n` 与 `\n` 同剥；凑不齐两行 ⇒ None。
+#[test]
+fn split_frame_cuts_token_command_and_args() {
+    assert_eq!(
+        split_frame("tok\r\nroute-add\r\npolaris-tun0\r\n10.0.0.0/8\r\n"),
+        Some(Frame {
+            token: "tok",
+            command: "route-add",
+            args: vec!["polaris-tun0", "10.0.0.0/8"],
+        })
+    );
+    assert_eq!(
+        split_frame("tok\nping\n"),
+        Some(Frame {
+            token: "tok",
+            command: "ping",
+            args: vec![],
+        })
+    );
+    // 空参数行必须保留（install-core 缺 src 时是空行，不能被吞掉把 hash 顶到 src 位）。
+    assert_eq!(
+        split_frame("tok\ninstall-core\n\nHASH\n").map(|f| f.args),
+        Some(vec!["", "HASH"])
+    );
+    assert_eq!(split_frame("only-token\n"), None);
+    assert_eq!(split_frame(""), None);
 }

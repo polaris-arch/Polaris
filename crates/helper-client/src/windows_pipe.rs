@@ -11,7 +11,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_BROKEN_PIPE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    GetLastError, ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -28,6 +29,20 @@ use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 /// **数值可调，无契约源**：取与同 crate `PipeConnector` 的 `ERROR_PIPE_BUSY` 重试同一节拍（10ms）；
 /// 相对真机单次往返 ~0.2s 可忽略，且仅在「无数据可读」时才付这份等待。
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// 读腿上「对端已走」的两个错误码 ⇒ 按 EOF 处理（返回已读字节数，0 字节即 `EmptyResponse`）。
+///
+/// - `ERROR_BROKEN_PIPE`(109)：服务端直接关句柄。
+/// - `ERROR_PIPE_NOT_CONNECTED`(233)：服务端 `DisconnectNamedPipe` 后再读（helper 每次应答都是
+///   write → disconnect → close，故这是「应答完就走」的常态形态）。
+///
+/// 只在**读**腿归一：写腿失败意味着请求没送出去，仍是 IO 错误。这样上层能把三种失败分开 ——
+/// 连不上（`ClientError::Connect`）、请求没写出（`ClientError::Io`）、写出了但对端一个字节没回就
+/// 断开（`ClientError::EmptyResponse`）。旧 Windows helper 对不认识的命令正是第三种（它在验 token
+/// 前就 NoWait 回 `ERR unknown` 并断开，这行常被丢掉），app 侧据此对 install-core 做能力判定。
+fn is_peer_gone(error: u32) -> bool {
+    error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED
+}
 
 /// 独占拥有一条双向同步命名管道连接。
 pub(crate) struct WinPipeStream {
@@ -73,7 +88,8 @@ impl WinPipeStream {
         self.handle.as_raw_handle().cast()
     }
 
-    /// 非阻塞探测管道中当前可读字节数（不消费数据）。对端已关闭时回 `ERROR_BROKEN_PIPE`。
+    /// 非阻塞探测管道中当前可读字节数（不消费数据）。对端已走时回 `ERROR_BROKEN_PIPE` /
+    /// `ERROR_PIPE_NOT_CONNECTED`（见 [`is_peer_gone`]）。
     fn peek_available(&self) -> io::Result<u32> {
         let mut avail = 0u32;
         // SAFETY: handle 由 self 独占且在调用期间有效；除 lpTotalBytesAvail 外全部传 NULL
@@ -118,8 +134,10 @@ impl ConnectionStream for WinPipeStream {
             }
             let avail = match self.peek_available() {
                 Ok(n) => n,
-                // 对端已关闭 = EOF（与下方 ReadFile 的同码分支一致）。
-                Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => return Ok(total),
+                // 对端已走 = EOF（与下方 ReadFile 的同判据分支一致）。
+                Err(e) if e.raw_os_error().is_some_and(|c| is_peer_gone(c as u32)) => {
+                    return Ok(total)
+                }
                 Err(e) => return Err(e),
             };
             if avail == 0 {
@@ -137,7 +155,7 @@ impl ConnectionStream for WinPipeStream {
                 if ok == 0 {
                     // SAFETY: 紧邻失败的 ReadFile，线程未穿插其它 Win32 调用。
                     let error = unsafe { GetLastError() };
-                    if error == ERROR_BROKEN_PIPE {
+                    if is_peer_gone(error) {
                         return Ok(total);
                     }
                     return Err(io::Error::from_raw_os_error(error as i32));

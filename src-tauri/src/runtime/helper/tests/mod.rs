@@ -649,3 +649,195 @@ fn a_successful_install_clears_the_install_core_capability_note() {
         "清记号必须先于就绪轮询：轮询超时走 NotReady 分支，而那时 helper 二进制已经换了一份"
     );
 }
+
+// ===== install-core：Windows 上「写出了、0 字节就断开」的归类 =====
+
+/// 把写出的帧记下来的流（验复核帧是**无副作用**的空参 install-core）。
+struct RecordingStream {
+    inner: polaris_helper_client::MockStream,
+    frames: Arc<Mutex<Vec<String>>>,
+}
+
+impl ConnectionStream for RecordingStream {
+    fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.inner.read_until_timeout(buf)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(data)?;
+        self.frames
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(data).into_owned());
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown()
+    }
+}
+
+struct RecordingConnector {
+    streams: Mutex<Vec<polaris_helper_client::MockStream>>,
+    frames: Arc<Mutex<Vec<String>>>,
+    connects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Connector for RecordingConnector {
+    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        let mut streams = self.streams.lock().unwrap();
+        if streams.is_empty() {
+            return Err(ClientError::Connect("测试连接已耗尽".to_owned()));
+        }
+        Ok(Box::new(RecordingStream {
+            inner: streams.remove(0),
+            frames: Arc::clone(&self.frames),
+        }))
+    }
+}
+
+struct InstallCoreRun {
+    result: Result<(), InstallCoreError>,
+    connects: usize,
+    frames: Vec<String>,
+}
+
+fn run_install_core(
+    platform: Platform,
+    streams: Vec<polaris_helper_client::MockStream>,
+) -> InstallCoreRun {
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connector = RecordingConnector {
+        streams: Mutex::new(streams),
+        frames: Arc::clone(&frames),
+        connects: Arc::clone(&connects),
+    };
+    let client = HelperClient::new(Box::new(connector), platform, "TOK");
+    let result = install_core_with_client(&client, Path::new(r"C:\stage"), &"ab".repeat(32));
+    let frames = frames.lock().unwrap().clone();
+    InstallCoreRun {
+        result,
+        connects: connects.load(Ordering::SeqCst),
+        frames,
+    }
+}
+
+fn silent() -> polaris_helper_client::MockStream {
+    // 连上、收下整帧、一个字节不回就断开（= 旧 Windows helper 对不认识命令的真机表现）。
+    polaris_helper_client::MockStream::with_response(Vec::new())
+}
+
+fn replying(line: &str) -> polaris_helper_client::MockStream {
+    polaris_helper_client::MockStream::with_response(line.as_bytes().to_vec())
+}
+
+/// 旧 Windows helper：装核帧 0 字节、复核帧也 0 字节 ⇒ `Unsupported`（能力缓存得以记号）；
+/// 复核帧必须是空参 install-core（认识它的 helper 在落盘前就回 bad-args，不产生任何写）。
+#[test]
+fn windows_install_core_silent_twice_is_unsupported() {
+    let run = run_install_core(Platform::Win, vec![silent(), silent()]);
+    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
+    assert_eq!(run.connects, 2, "0 字节之后必须复核恰好一帧");
+    assert_eq!(
+        run.frames,
+        vec![
+            format!("TOK\ninstall-core\nC:\\stage\n{}\n", "ab".repeat(32)),
+            "TOK\ninstall-core\n\n\n".to_owned(),
+        ],
+        "复核帧不是空参 install-core"
+    );
+}
+
+/// 旧 helper 偶尔来得及把 `ERR unknown` 送到（NoWait 竞态的另一面）⇒ 同样 `Unsupported`。
+#[test]
+fn windows_install_core_silent_then_err_unknown_is_unsupported() {
+    let run = run_install_core(Platform::Win, vec![silent(), replying("ERR unknown\n")]);
+    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
+    assert_eq!(run.connects, 2);
+}
+
+/// 永久误记号的防线：**新** helper 装核途中偶发断开，复核帧得到任何文本应答（它认识
+/// install-core）⇒ `Failed`，不记号。
+#[test]
+fn windows_install_core_silent_then_any_reply_is_a_transient_failure() {
+    for reply in [
+        "ERR bad-args\n",
+        "ERR busy\n",
+        "ERR coredir-acl-weakened C:\\x\n",
+    ] {
+        let run = run_install_core(Platform::Win, vec![silent(), replying(reply)]);
+        let Err(InstallCoreError::Failed(msg)) = &run.result else {
+            panic!("{reply:?} ⇒ {:?}", run.result);
+        };
+        assert!(msg.contains("复核帧得到应答"), "{msg}");
+        assert_eq!(run.connects, 2);
+    }
+    // 复核连不上（helper 正被 SCM 重启）同样判不了能力 ⇒ Failed。
+    let run = run_install_core(Platform::Win, vec![silent()]);
+    assert!(
+        matches!(&run.result, Err(InstallCoreError::Failed(m)) if m.contains("复核帧也失败")),
+        "{:?}",
+        run.result
+    );
+}
+
+/// 连不上 / 请求没写出 ⇒ `Failed`，且不发复核帧（那不是「写出了、0 字节」）。
+#[test]
+fn windows_install_core_connect_or_write_failure_stays_failed_without_probe() {
+    let run = run_install_core(Platform::Win, vec![]);
+    assert!(
+        matches!(run.result, Err(InstallCoreError::Failed(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.connects, 1, "连不上不得复核");
+
+    let run = run_install_core(
+        Platform::Win,
+        vec![polaris_helper_client::MockStream::broken(
+            std::io::ErrorKind::BrokenPipe,
+        )],
+    );
+    assert!(
+        matches!(run.result, Err(InstallCoreError::Failed(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.connects, 1, "请求没写出不得复核");
+}
+
+/// 只对 Windows：mac/linux 的旧 helper 会如实回 `ERR unknown`，0 字节在那里是真故障。
+#[test]
+fn non_windows_install_core_silence_is_a_plain_failure() {
+    for platform in [Platform::Mac, Platform::Linux] {
+        let run = run_install_core(platform, vec![silent(), silent()]);
+        assert!(
+            matches!(run.result, Err(InstallCoreError::Failed(_))),
+            "{platform:?} ⇒ {:?}",
+            run.result
+        );
+        assert_eq!(run.connects, 1, "{platform:?} 不得复核");
+    }
+}
+
+/// 正面对照：有文本应答时照旧分类（`OK installed` / `ERR unknown` / 其它 `ERR`），不复核。
+#[test]
+fn install_core_textual_replies_are_classified_without_probe() {
+    let run = run_install_core(Platform::Win, vec![replying("OK installed\n")]);
+    assert_eq!(run.result, Ok(()));
+    assert_eq!(run.connects, 1);
+
+    let run = run_install_core(Platform::Win, vec![replying("ERR unknown\n")]);
+    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
+    assert_eq!(run.connects, 1);
+
+    let run = run_install_core(Platform::Win, vec![replying("ERR hash-mismatch\n")]);
+    assert!(
+        matches!(run.result, Err(InstallCoreError::Failed(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.connects, 1);
+}

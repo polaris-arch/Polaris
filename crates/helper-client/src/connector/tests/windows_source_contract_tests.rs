@@ -137,3 +137,58 @@ fn windows_pipe_read_is_bounded_by_a_deadline() {
         "判据不具区分力：写路径也命中 deadline"
     );
 }
+
+/// 读腿把 `ERROR_PIPE_NOT_CONNECTED`(233) 与 `ERROR_BROKEN_PIPE` 一并按 EOF 处理；写腿不归一。
+///
+/// 为什么要紧：旧 Windows helper 对不认识的命令会在验 token 前 NoWait 回 `ERR unknown` 并
+/// `DisconnectNamedPipe`，那行常被丢掉，客户端下一次 peek/read 拿到 233。读腿不归一 ⇒ 它以
+/// `ClientError::Io` 上抛，与「请求根本没写出去」同形，app 侧就分不出「连上了、写出了、0 字节」
+/// 这一格（install-core 能力判定的唯一依据）。写腿若也归一，则「请求没送达」会被误读成「对端
+/// 看过请求后一言不发」。cfg(windows) 代码本机不编译：源码门 + msvc 交叉 clippy 各守一半。
+#[test]
+fn windows_pipe_read_treats_pipe_not_connected_as_eof_but_write_does_not() {
+    let pipe = polaris_source_probe::crate_source!("windows_pipe.rs");
+    assert!(
+        pipe.contains("struct WinPipeStream"),
+        "取材面错位：拿到的不是 windows_pipe.rs"
+    );
+    let code = polaris_source_probe::mask_comments(&pipe);
+    // 判据本体：「对端已走」集合含两个码。
+    let at = code.find("fn is_peer_gone(").expect("is_peer_gone 消失");
+    let end = code[at..]
+        .find("\n}")
+        .map(|i| at + i)
+        .expect("is_peer_gone 体");
+    let body = &code[at..end];
+    for c in ["ERROR_BROKEN_PIPE", "ERROR_PIPE_NOT_CONNECTED"] {
+        assert!(body.contains(c), "「对端已走」集合缺 {c}");
+    }
+    // 读腿两个出口（peek 与 ReadFile）都经它判。
+    assert_eq!(code.matches("fn read_until_timeout").count(), 1);
+    let read_body = code
+        .split("fn read_until_timeout")
+        .nth(1)
+        .and_then(|t| t.split("fn set_read_timeout").next())
+        .expect("read_until_timeout 方法体");
+    assert_eq!(
+        read_body.matches("is_peer_gone(").count(),
+        2,
+        "peek 与 ReadFile 两个出口必须都按「对端已走 = EOF」判"
+    );
+    // 读腿不得再有只认 BROKEN_PIPE 的旁路分支（改一处漏一处）。
+    assert!(
+        !read_body.contains("ERROR_BROKEN_PIPE"),
+        "读腿里还有绕开 is_peer_gone 的裸 ERROR_BROKEN_PIPE 判断"
+    );
+    // 反向对照：写腿不归一。
+    let write_body = code
+        .split("fn write_all")
+        .nth(1)
+        .and_then(|t| t.split("fn shutdown").next())
+        .expect("write_all 方法体");
+    assert!(!write_body.contains("is_peer_gone"), "写腿也吞成 EOF 了");
+    assert!(
+        write_body.contains("last_os_error()"),
+        "写腿失败不再如实上抛 IO 错误"
+    );
+}
