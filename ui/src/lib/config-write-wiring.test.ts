@@ -164,6 +164,7 @@ const SITES: readonly Site[] = [
       'components/screens/settings/CoreUpdateCard.tsx',
       'components/dialogs/DnsResourceDialog.tsx',
       'components/screens/rules/DnsPolicyWorkspace.tsx',
+      'components/screens/rules/NetworkProfilePanel.tsx',
     ] as const
   ).map((file): Site => ({
     file,
@@ -391,6 +392,14 @@ const SITES: readonly Site[] = [
     callee: 'api.rules.update(',
     route: 'staged',
     why: 'customRules Class B；编辑提交的同样是完整 Rule（base 起底保全 tlsSpoof 等非模型字段）',
+  },
+  {
+    // 新建带网络场景的规则插到最前（spec §3.4-4）：暂存腿写 `order:<orderKey>` 整序列条目，
+    // 直写腿在 rules.add 之后调既有 rules.reorder —— 与 RulesScreen 拖拽排序同一对去向。
+    file: 'components/dialogs/rule-submit.ts',
+    callee: 'api.rules.reorder(',
+    route: 'staged',
+    why: 'routeRuleOrder / dnsRuleOrder 是 UserConfig 字段（Class B）；新建带场景规则的插首位，暂存腿与拖拽同形',
   },
   {
     // 规则删除的唯一执行腿（列表行内垃圾桶 + 规则弹窗 footer 共用），2026-07-30 从 RuleDialog 抽出。

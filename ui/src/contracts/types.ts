@@ -34,6 +34,7 @@ import type {
   DnsServerGroup,
   DnsServerResource,
   DestinationResolutionMode,
+  NetworkProfile,
 } from './types/rules';
 import type { SubscriptionProxyPolicy } from '../domain/subscription-proxy';
 
@@ -101,6 +102,11 @@ export type {
   RuleResourceCatalogResult,
   AppRule,
   CustomAppPreset,
+  NetworkProbeSource,
+  NetworkProfile,
+  ResolvedProbe,
+  BuiltinDhcpStatus,
+  ProbeReason,
 } from './types/rules';
 
 // ============================================================================
@@ -582,6 +588,8 @@ export interface UserConfig {
   dnsRuleOrder?: string[];
   dnsServers?: DnsServerResource[];
   dnsServerGroups?: DnsServerGroup[];
+  /** 网络场景（规则经 `networkProfileId` 引用）。缺省为空。SoT = Rust `UserConfig.network_profiles`。 */
+  networkProfiles?: NetworkProfile[];
   dnsDefaults?: {
     directServerId: string;
     proxyServerId: string;

@@ -32,6 +32,10 @@ import { ResCatalogDialog } from './ResCatalogDialog';
 import { BackupImportDialog } from './BackupImportDialog';
 import { MeshJoinDialog } from './MeshJoinDialog';
 import { DnsGroupDialog, DnsServerDialog } from './DnsResourceDialog';
+import {
+  NetworkProfileDialog,
+  NetworkProfilesDialog,
+} from '../screens/rules/NetworkProfilePanel';
 import { VpnAuthDialog } from './VpnAuthDialog';
 
 function renderDialog(desc: DialogEntry) {
@@ -74,6 +78,10 @@ function renderDialog(desc: DialogEntry) {
       return <DnsServerDialog serverId={desc.serverId} />;
     case 'dns-group':
       return <DnsGroupDialog groupId={desc.groupId} />;
+    case 'network-profiles':
+      return <NetworkProfilesDialog />;
+    case 'network-profile':
+      return <NetworkProfileDialog profileId={desc.profileId} onSaved={desc.onSaved} />;
     case 'proc-pick':
       return <ProcPickDialog initialSelected={desc.initialSelected} onPick={desc.onPick} />;
     case 'rule-pick':

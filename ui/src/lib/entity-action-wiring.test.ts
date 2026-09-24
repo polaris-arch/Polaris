@@ -228,6 +228,15 @@ const SITES: readonly ActionSite[] = [
     why: 'staged 分流后不可达',
   },
   {
+    // 新建带场景的规则插到最前（spec §3.4-4）的直写腿：只在规则走直写时发生，此时暂存层不活跃
+    // （无暂存条目）⇒ 序列里不可能有 staged-only 的 id；新 id 取自 rules.add 的落盘返回。
+    file: 'components/dialogs/rule-submit.ts',
+    callee: 'api.rules.reorder',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（暂存腿写顺序条目、不发 IPC）；直写腿时暂存层不活跃，序列里没有 staged-only id',
+  },
+  {
     file: 'components/RuleSubjectMenuItems.tsx',
     callee: 'api.rules.update',
     count: 1,

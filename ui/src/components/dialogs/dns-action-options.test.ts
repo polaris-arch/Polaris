@@ -104,3 +104,52 @@ describe('DNS action choice codec', () => {
     });
   });
 });
+
+describe('内置解析器「当前网络 DHCP 下发的 DNS」（spec D5）', () => {
+  const netenv = 'server:builtin-netenv-dhcp';
+  const values = (groups: ReturnType<typeof buildDnsActionGroups>) =>
+    groups.flatMap((group) => group.options.map((option) => option));
+
+  it('includeNetenv 时出现在解析器分组里、可选；选中后映射成 server 动作（保留 id 原样落盘）', () => {
+    const groups = buildDnsActionGroups({ servers, groups: [], t, currentValue: netenv, includeNetenv: true });
+    const serverGroup = groups.find((group) => group.label === 'rules.dnsActionServerHeading');
+    const option = serverGroup?.options.find((o) => o.value === netenv);
+    expect(option).toMatchObject({ label: 'rules.networkProfile.dnsNetenvName' });
+    expect(option?.disabled).toBeFalsy();
+    // 选中它时不能再被当成「已删除的解析器」补一条 missing 项。
+    expect(values(groups).filter((o) => o.value === netenv)).toHaveLength(1);
+    expect(dnsActionFromChoice(netenv, 'server:builtin-domestic')).toEqual({
+      type: 'server',
+      serverId: 'builtin-netenv-dhcp',
+    });
+  });
+
+  it('默认不列（hosts 兜底 / 未命中默认动作不提供它）', () => {
+    const groups = buildDnsActionGroups({ servers, groups: [], t });
+    expect(values(groups).some((o) => o.value === netenv)).toBe(false);
+  });
+});
+
+describe('内置 DHCP 解析器在本机不可用（builtinDhcpStatus）', () => {
+  const netenv = 'server:builtin-netenv-dhcp';
+  const find = (status: Parameters<typeof buildDnsActionGroups>[0]['netenvStatus']) =>
+    buildDnsActionGroups({ servers, groups: [], t, currentValue: netenv, includeNetenv: true, netenvStatus: status })
+      .flatMap((g) => g.options)
+      .filter((o) => o.value === netenv);
+
+  it('不可用 ⇒ 置灰并标原因；已选中时仍是这一项（回显值与原因，不补 missing、不清空）', () => {
+    const hits = find({ available: false, reason: 'dhcpNeedsPrivilege' });
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({
+      label: 'rules.networkProfile.dnsNetenvName',
+      disabled: true,
+      description: 'rules.dnsActionUnavailable · rules.networkProfile.reasonDhcpNeedsPrivilege',
+    });
+  });
+
+  it('可用 / 拿不到结果 ⇒ 不置灰（不知道就不猜）', () => {
+    expect(find({ available: true, reason: null })[0].disabled).toBeFalsy();
+    expect(find(null)[0].disabled).toBeFalsy();
+    expect(find(undefined)[0].description).toBe('rules.networkProfile.dnsNetenvDesc');
+  });
+});

@@ -29,7 +29,8 @@ import {
   useEffectiveRules,
   useEffectiveServers,
 } from '@/store/app-store';
-import type { Rule, RuleType } from '@/contracts/types';
+import type { TFunction } from 'i18next';
+import type { NetworkProfile, Rule, RuleType } from '@/contracts/types';
 import {
   RULE_TYPE_IDS,
   RULE_TYPES,
@@ -53,7 +54,8 @@ import { useConfirmTwice } from '@/lib/confirm-twice';
 import { useRuleDelete } from '@/lib/use-rule-delete';
 import { cn } from '@/lib/utils';
 import { Modal } from './Modal';
-import type { CselGroup } from './Csel';
+import type { CselGroup, CselOption } from './Csel';
+import { InfoIcon } from '@/components/InfoIcon';
 import { useDialogStore } from './dialog-store';
 import { useRulePools, EMPTY_SNAP } from './use-rule-pools';
 import { submitRule } from './rule-submit';
@@ -61,6 +63,34 @@ import { useRuleRouteEffect, RuleRouteEffectFields } from './RuleRouteEffect';
 import { useRuleDnsEffect, RuleDnsEffectFields } from './RuleDnsEffect';
 import { useRuleTestFold, RuleTestFold } from './RuleTestFold';
 import { CondRow } from './RuleCondRow';
+import { Csel } from './Csel';
+
+/** 「生效网络」下拉里「新建场景…」这一项的哨兵值（不是场景 id：场景 id 恒以 `np-` 起头）。 */
+const NEW_PROFILE_CHOICE = '__new-network-profile__';
+
+/**
+ * 「生效网络」候选：任何网络 / 各场景（停用的标注但仍可选 —— 选中即「停用期间不生效」，与场景面板语义一致）/
+ * 新建场景…。当前值指向已删除的场景时补一项「场景已删除」，不让下拉静默显示成别的值。
+ */
+function networkProfileOptions(
+  profiles: readonly NetworkProfile[],
+  current: string,
+  t: TFunction,
+): CselOption[] {
+  const options: CselOption[] = [
+    { value: '', label: t('rules.networkProfile.anyNetwork') },
+    ...profiles.map((p) => ({
+      value: p.id,
+      label: p.name,
+      description: p.enabled ? undefined : t('rules.networkProfile.disabledBadge'),
+    })),
+  ];
+  if (current && !profiles.some((p) => p.id === current)) {
+    options.push({ value: current, label: t('rules.networkProfile.badgeMissing'), disabled: true });
+  }
+  options.push({ value: NEW_PROFILE_CHOICE, label: t('rules.networkProfile.newOption') });
+  return options;
+}
 
 function RuleIcon() {
   return (
@@ -87,12 +117,14 @@ interface RuleFormProps {
   isEdit: boolean;
   preset?: RulePreset;
   initialPlane?: 'route' | 'dns';
+  /** 本平面现有规则 id（新建带场景的规则插到最前时用，spec §3.4-4）。 */
+  planeRuleIds?: readonly string[];
 }
 
 /** footer 左侧「删除此规则」的原地二次确认 key（原型 :4095 `rule-del-dlg`）。 */
 const RULE_DEL_KEY = 'rule-del-dlg';
 
-function RuleForm({ base, isEdit, preset, initialPlane = 'route' }: RuleFormProps) {
+function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds = [] }: RuleFormProps) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
   const close = useDialogStore((s) => s.close);
@@ -110,6 +142,12 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route' }: RuleFormProp
   const dnsServers = useEffectiveConfig((c) => c?.dnsServers ?? []);
   const dnsGroups = useEffectiveConfig((c) => c?.dnsServerGroups ?? []);
   const dnsDefaults = useEffectiveConfig((c) => c?.dnsDefaults);
+  /** 「生效网络」下拉的候选（展示面：暂存中新建的场景也要立刻可选）。 */
+  const networkProfiles = useEffectiveConfig((c) => c?.networkProfiles);
+  /** 本平面的持久化顺序（展示面：与规则列表同一份，含暂存）。 */
+  const persistedOrder = useEffectiveConfig((c) =>
+    initialPlane === 'dns' ? c?.dnsRuleOrder : c?.routeRuleOrder,
+  );
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
   const stage = useStagedConfigStore((s) => s.stage);
@@ -165,8 +203,11 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route' }: RuleFormProp
     setDnsPredefinedExtra,
     dnsActionGroups,
     dnsFallbackGroups,
+    netenvStatus,
   } = useRuleDnsEffect(baseDnsEffect, initialPlane, dnsServers, dnsGroups, servers, dnsDefaults, t);
   const [name, setName] = useState(base?.remarks ?? preset?.value ?? '');
+  /** 生效网络：'' = 任何网络（`networkProfileId` 缺省）。 */
+  const [networkProfileId, setNetworkProfileId] = useState(base?.networkProfileId ?? '');
   const [test, setTest] = useState('');
 
   const [dirty, setDirty] = useState(false);
@@ -295,6 +336,8 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route' }: RuleFormProp
       conds,
       name,
       setErrName,
+      networkProfileId,
+      planeOrder: { ruleIds: planeRuleIds, persistedOrder: persistedOrder ?? [] },
       logic,
       target,
       dnsAction,
@@ -446,6 +489,35 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route' }: RuleFormProp
         </div>
       </div>
 
+      {/* 生效网络（spec §6.1）：放在效果区上方；字段不进 RULE_TYPES 描述符表（那张表只管条件类型）。 */}
+      <div className="fld">
+        <span className="fld-l">
+          {t('rules.networkProfile.ruleField')}
+          <InfoIcon tip={t('rules.networkProfile.ruleFieldHint')} />
+        </span>
+        <Csel
+          id="rule-network-profile"
+          ariaLabel={t('rules.networkProfile.ruleField')}
+          value={networkProfileId}
+          onChange={(value) => {
+            if (value === NEW_PROFILE_CHOICE) {
+              // 建完直接选中：onSaved 回传新 id（弹窗叠在本表单之上，关掉即回到这里）。
+              open({
+                kind: 'network-profile',
+                onSaved: (id) => {
+                  setNetworkProfileId(id);
+                  touch();
+                },
+              });
+              return;
+            }
+            setNetworkProfileId(value);
+            touch();
+          }}
+          options={networkProfileOptions(networkProfiles ?? [], networkProfileId, t)}
+        />
+      </div>
+
       {routeEnabled && (
         <RuleRouteEffectFields
           t={t}
@@ -479,6 +551,7 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route' }: RuleFormProp
           setDnsPredefinedExtra={setDnsPredefinedExtra}
           dnsActionGroups={dnsActionGroups}
           dnsFallbackGroups={dnsFallbackGroups}
+          netenvStatus={netenvStatus}
         />
       )}
 
@@ -509,6 +582,7 @@ export function RuleDialog({
       isEdit={base != null}
       preset={preset}
       initialPlane={plane}
+      planeRuleIds={rules.map((r) => r.id)}
     />
   );
 }

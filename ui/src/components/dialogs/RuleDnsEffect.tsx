@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { TFunction } from 'i18next';
 import type {
+  BuiltinDhcpStatus,
   DnsServerGroup,
   DnsServerResource,
   RuleDnsAnswerMode,
@@ -9,6 +10,8 @@ import type {
   ServerConfig,
   UserConfig,
 } from '@/contracts/types';
+import { api } from '@/ipc';
+import { BUILTIN_NETENV_DHCP_ID, probeReasonKey } from '@/domain/network-profile';
 import { buildDnsActionGroups, dnsActionChoice } from './dns-action-options';
 import { Csel } from './Csel';
 
@@ -69,6 +72,22 @@ export function useRuleDnsEffect(
   const [dnsPredefinedExtra, setDnsPredefinedExtra] = useState(
     () => basePredefined?.extra?.join('\n') ?? '',
   );
+  /** 内置解析器「当前网络 DHCP 下发的 DNS」在本机是否可用；拿不到 ⇒ null（不置灰，不猜）。 */
+  const [netenvStatus, setNetenvStatus] = useState<BuiltinDhcpStatus | null>(null);
+  useEffect(() => {
+    let active = true;
+    api.networkProfile
+      .builtinDhcpStatus()
+      .then((status) => {
+        if (active) setNetenvStatus(status && typeof status.available === 'boolean' ? status : null);
+      })
+      .catch(() => {
+        if (active) setNetenvStatus(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
   const dnsActionGroups = useMemo(
     () => buildDnsActionGroups({
       servers: dnsServers,
@@ -76,8 +95,10 @@ export function useRuleDnsEffect(
       nodes: servers,
       t,
       currentValue: dnsAction,
+      includeNetenv: true,
+      netenvStatus,
     }),
-    [dnsServers, dnsGroups, servers, t, dnsAction],
+    [dnsServers, dnsGroups, servers, t, dnsAction, netenvStatus],
   );
   const dnsFallbackGroups = useMemo(
     () => buildDnsActionGroups({
@@ -111,6 +132,7 @@ export function useRuleDnsEffect(
     setDnsPredefinedExtra,
     dnsActionGroups,
     dnsFallbackGroups,
+    netenvStatus,
   };
 }
 
@@ -141,6 +163,7 @@ export function RuleDnsEffectFields({
   setDnsPredefinedNs,
   dnsPredefinedExtra,
   setDnsPredefinedExtra,
+  netenvStatus,
 }: RuleDnsEffectFieldsProps) {
   return (
     <div className="fld">
@@ -163,6 +186,12 @@ export function RuleDnsEffectFields({
           }}
           options={dnsActionGroups}
         />
+        {/* 已选中内置 DHCP 解析器、而它在本机不可用：值照常回显，原因写在下面（不悄悄清空）。 */}
+        {dnsAction === `server:${BUILTIN_NETENV_DHCP_ID}` && netenvStatus?.available === false && (
+          <div className="err-line">
+            {t('rules.networkProfile.probeUnavailable', { reason: t(probeReasonKey(netenvStatus.reason)) })}
+          </div>
+        )}
         {dnsAction.startsWith('hosts:') && (
           <Csel
             id="rule-dns-hosts-fallback"

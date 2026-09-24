@@ -17,6 +17,7 @@ import type { Rule, RuleCondition } from '@/contracts/types';
 import { ruleConditions, ruleDnsEffect, ruleRouteEffect } from '@/domain/rules';
 import { RULE_TYPE_CATEGORY } from '@/domain/rules';
 import { cn } from '@/lib/utils';
+import type { RuleProfileBadge } from '@/domain/network-profile';
 import { useHoverCard, HoverCardPanel } from '@/components/hover-cards/HoverCard';
 import { RuleHoverCardContent } from '@/components/hover-cards/RuleHoverCard';
 
@@ -140,6 +141,62 @@ function actionPill(action: Rule['action'], t: (key: string) => string): { cls: 
   }
 }
 
+/** 角标⑤：生效网络。文案与 tip 全部走 `rules.networkProfile.*`。 */
+function NetworkProfilePill({ badge }: { badge: RuleProfileBadge }) {
+  const { t } = useTranslation();
+  if (badge.state === 'missing') {
+    return (
+      <span className="pill warn" data-tip={t('rules.networkProfile.badgeMissingTip')}>
+        {t('rules.networkProfile.badgeMissing')}
+      </span>
+    );
+  }
+  const text = t('rules.networkProfile.badge', { name: badge.name });
+  if (badge.state === 'disabled') {
+    return (
+      <span className="pill warn" data-tip={t('rules.networkProfile.badgeDisabledTip')}>
+        {text}
+      </span>
+    );
+  }
+  if (badge.state === 'warning') {
+    return (
+      <span className="pill warn" data-tip={t(badge.warningKey)}>
+        {text}
+      </span>
+    );
+  }
+  if (badge.state === 'unavailable') {
+    return (
+      <span
+        className="pill warn"
+        data-tip={t('rules.networkProfile.badgeUnavailableTip', { reason: t(badge.reasonKey) })}
+      >
+        {text}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="pill region"
+      data-tip={
+        badge.source
+          ? t('rules.networkProfile.badgeTip', {
+              name: badge.name,
+              source: t(
+                badge.source === 'dhcp'
+                  ? 'rules.networkProfile.sourceDhcp'
+                  : 'rules.networkProfile.sourceSystem',
+              ),
+            })
+          : t('rules.networkProfile.badgeTipNoSource', { name: badge.name })
+      }
+    >
+      {text}
+    </span>
+  );
+}
+
 function GripIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
@@ -190,6 +247,11 @@ export interface RuleItemProps {
   stagedOnly?: boolean;
   /** 非 smart 模式只忽略流量效果；DNS 效果仍生效。 */
   routeInactive?: boolean;
+  /**
+   * 角标⑤「生效网络」：规则挂了网络场景（判据 `domain/network-profile.ruleProfileBadge`）。场景已删 /
+   * 已停用 / 本机探测源不可用 ⇒ 规则不生成（fail-closed），用 warn 色；正常为中性色。第一期无命中态（D8）。
+   */
+  networkProfileBadge?: RuleProfileBadge | null;
   onToggle?: (rule: Rule) => void;
   onEdit?: (rule: Rule) => void;
   /**
@@ -233,6 +295,7 @@ export function RuleItem({
   targetMissing,
   stagedOnly,
   routeInactive,
+  networkProfileBadge,
   onToggle,
   onEdit,
   onDuplicate,
@@ -333,6 +396,9 @@ export function RuleItem({
           {/* 角标②「覆盖组网」：中性色（pill region）——它不是错误，是「你可能没意识到的优先级后果」，
               与真正失效的①③（warn 色）分级，避免把两种严重度混成一片橙。文案/口径对齐 上游
               sortable-rule-row.tsx:226-236。 */}
+          {networkProfileBadge && (
+            <NetworkProfilePill badge={networkProfileBadge} />
+          )}
           {stagedOnly && (
             <span
               className="pill"

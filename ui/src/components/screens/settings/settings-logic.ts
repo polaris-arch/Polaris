@@ -879,6 +879,7 @@ export const STAGED_SETTING_SECTION_LABELS: Readonly<Record<string, string>> = {
   dnsServers: 'settings.section.dns',
   dnsServerGroups: 'settings.section.dns',
   dnsDefaults: 'settings.section.dns',
+  networkProfiles: 'rules.networkProfile.title',
   ruleResources: 'settings.section.ruleResources',
   regionRouting: 'settings.section.regionRouting',
   singboxDashboard: 'settings.section.singboxDashboard',

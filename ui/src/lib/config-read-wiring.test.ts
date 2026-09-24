@@ -548,6 +548,20 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: '资源引用徽章：哪些规则引用了该资源，问的是用户现在这套规则',
   },
   {
+    file: 'components/screens/rules/NetworkProfilePanel.tsx',
+    shape: "useEffectiveRules('route')",
+    count: 1,
+    surface: 'display',
+    why: '网络场景列表的引用计数：被多少条流量规则引用，问的是用户现在这套规则（含暂存）',
+  },
+  {
+    file: 'components/screens/rules/NetworkProfilePanel.tsx',
+    shape: "useEffectiveRules('dns')",
+    count: 1,
+    surface: 'display',
+    why: '网络场景列表的引用计数：被多少条 DNS 规则引用，问的是用户现在这套规则（含暂存）',
+  },
+  {
     file: 'components/screens/rules/RulesScreen.tsx',
     shape: 'useEffectiveRules(plane)',
     count: 1,
