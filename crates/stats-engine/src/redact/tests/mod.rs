@@ -871,3 +871,28 @@ fn 红线_masque_authorization_头打码_形态保留() {
     assert_eq!(m["path"], json!("/masque"));
     assert_eq!(m["version"], json!(2));
 }
+
+/// Tailcat 服务端公钥是准入凭据 ⇒ 打码（camelCase 设置与内核 snake_case 两种键名都要命中）；
+/// 同族的 disco key 明文过线、DERP region 是形态信息 ⇒ 保留。
+#[test]
+fn 红线_tailcat_服务端公钥打码_disco_key保留() {
+    let v = json!({
+        "servers": [{
+            "protocol": "tailcat",
+            "tailcatSettings": {
+                "serverPublicKey": "TC_SERVER_PUB", "serverDiscoKey": "TC_DISCO",
+                "preSharedKey": "TC_PSK", "derpRegion": 900
+            }
+        }],
+        "outbounds": [{ "type": "tailcat", "server_public_key": "TC_SERVER_PUB_WIRE",
+                        "server_disco_key": "TC_DISCO" }]
+    });
+    let out = redact(&v);
+    assert_no_plaintext(&out, &["TC_SERVER_PUB", "TC_SERVER_PUB_WIRE", "TC_PSK"]);
+    let t = &out["servers"][0]["tailcatSettings"];
+    assert_eq!(t["serverPublicKey"], json!(REDACTED));
+    assert_eq!(t["serverDiscoKey"], json!("TC_DISCO"));
+    assert_eq!(t["derpRegion"], json!(900));
+    assert_eq!(out["outbounds"][0]["server_public_key"], json!(REDACTED));
+    assert_eq!(out["outbounds"][0]["server_disco_key"], json!("TC_DISCO"));
+}

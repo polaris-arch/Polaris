@@ -849,3 +849,41 @@ fn masque_forced_route_comes_from_mesh_routes() {
         vec!["10.77.0.0/24".to_string()]
     );
 }
+
+/// 【Tailcat 复用真判据】key / DERP 非法的 Tailcat 会在发射期被剔 ⇒ 选中它时 selector 可能落兜底；
+/// 合法 ⇒ 必定发射。本用例红 = 判据与发射腿漂移了（误判「必定发射」= 错跳重启）。
+#[test]
+fn selector_fallback_tracks_tailcat_emit_check() {
+    use crate::user_config::app_config::UserConfig;
+    use crate::user_config::protocol_settings::TailcatSettings;
+    let tc = ServerConfig {
+        id: "tc".into(),
+        name: "TC".into(),
+        protocol: Protocol::Tailcat,
+        tailcat_settings: Some(Box::new(TailcatSettings {
+            server_public_key: Some("lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=".into()),
+            server_disco_key: Some("qQ+kiWwZ8BrTYDZpj+6bnx2JxWxx0SAh1krqPGndCmQ=".into()),
+            derp_region: Some(1),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let mut config = UserConfig {
+        servers: vec![tc, ss("s2", "2.2.2.2")],
+        selected_server_id: Some("tc".into()),
+        ..Default::default()
+    };
+    assert!(
+        !selector_default_may_fall_back(&config),
+        "合法 Tailcat 必定发射"
+    );
+    config.servers[0]
+        .tailcat_settings
+        .as_mut()
+        .unwrap()
+        .derp_servers = vec![serde_json::json!("d.example")];
+    assert!(
+        selector_default_may_fall_back(&config),
+        "region 与 servers 同时设的 Tailcat 会被剔除 → 兜底可能触发"
+    );
+}

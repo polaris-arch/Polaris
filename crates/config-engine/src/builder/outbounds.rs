@@ -566,10 +566,39 @@ pub fn build_outbounds_with_runtime_bindings(
             }
         }
 
+        // Tailcat（2026-09-24）：坏 key / DERP 冲突会让内核 initialize 整核失败 ⇒ 构造之前按用户原值判，
+        // 不合格剔除并上报（同 control_url 腿）。判据与 selector 兜底判定、store 必填门共用一份。
+        if server.protocol == Protocol::Tailcat {
+            if let Err(token) = crate::user_config::protocol_settings::tailcat_emit_check(
+                server.tailcat_settings.as_deref(),
+            ) {
+                deps.gate_invalid_nodes.insert(server.id.clone(), token);
+                (deps.log)(
+                    LogLevel::Warn,
+                    &format!(
+                        "启动前配置校验：Tailcat 节点「{tag}」配置非法（{token}），已剔除 —— \
+                         该写法会让 sing-box 在初始化 outbound 时整核失败"
+                    ),
+                );
+                continue;
+            }
+        }
+
         // 普通代理 outbound。
         let mut ob = build_proxy_outbound(server, &tag, &dial_resolver, &deps.arch, &deps.platform);
         // detour 代理链。
         ob.detour = resolve_detour_tag(server, config, &id_to_tag);
+        // Tailcat 的 DERP 地图拉取出口跟随前置代理（D10 选项 C）：只有 region 模式才有 `http_client`，
+        // 缺省 `direct` 由构造器写好。`resolve_detour_tag` 已排除 endpoint 与节点自身，故结构上不会
+        // 指回 tailcat 自己或任何 selector（指回会自锁，见 `build_proxy_outbound` 的 Tailcat 分支）；
+        // detour 若随后被死引用剪枝，整个 outbound 连同这里一起删掉，不会留下悬空的地图出口。
+        if server.protocol == Protocol::Tailcat {
+            if let (Some(detour), Some(serde_json::Value::Object(hc))) =
+                (&ob.detour, ob.extra.get_mut("http_client"))
+            {
+                hc.insert("detour".into(), detour.clone().into());
+            }
+        }
         apply_bind_interface(&mut ob.extra, bind_interface.as_deref());
         outbounds.push(ob);
         node_tags.push(tag);

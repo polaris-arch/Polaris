@@ -1241,6 +1241,7 @@ fn encode_rejects_unrepresentable_protocols() {
         Protocol::Tailscale,
         Protocol::Ssh,
         Protocol::MasqueClient,
+        Protocol::Tailcat,
         Protocol::Custom,
     ] {
         let c = ServerConfig {

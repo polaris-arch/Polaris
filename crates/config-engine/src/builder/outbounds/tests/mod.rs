@@ -1161,3 +1161,268 @@ fn on_demand_reaches_the_custom_endpoint_leg() {
         "ServerConfig.onDemand 应当压过 raw 里的同名键"
     );
 }
+
+// ── Tailcat（2026-09-24）──
+
+const TC_PUB: &str = "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=";
+const TC_DISCO: &str = "qQ+kiWwZ8BrTYDZpj+6bnx2JxWxx0SAh1krqPGndCmQ=";
+
+fn tailcat_node(
+    id: &str,
+    settings: crate::user_config::protocol_settings::TailcatSettings,
+) -> ServerConfig {
+    ServerConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Tailcat,
+        tailcat_settings: Some(Box::new(settings)),
+        ..Default::default()
+    }
+}
+
+fn tailcat_region() -> crate::user_config::protocol_settings::TailcatSettings {
+    crate::user_config::protocol_settings::TailcatSettings {
+        server_public_key: Some(TC_PUB.into()),
+        server_disco_key: Some(TC_DISCO.into()),
+        derp_region: Some(1),
+        ..Default::default()
+    }
+}
+
+/// 🔴 **剔节点判据逐条照内核**：下面每个坏形态都是随包 1.15.0-alpha.7 `check` 实测整核失败的写法
+/// （无填充 / url-safe / hex / 首尾空白的 key、缺服务端 key、DERP 两者都有或都没有、region ≤ 0、
+/// servers 项缺 host 或非串非对象）⇒ 必须剔除并以对应 token 上报；好形态（含内核放行的空 PSK）必须发射。
+#[test]
+fn tailcat_emit_check_drops_every_core_killing_shape() {
+    use crate::user_config::protocol_settings::{
+        TailcatSettings, INVALID_REASON_TAILCAT_DERP, INVALID_REASON_TAILCAT_KEY,
+    };
+    let key = |f: fn(&mut TailcatSettings)| {
+        let mut t = tailcat_region();
+        f(&mut t);
+        t
+    };
+    let bad: Vec<(&str, TailcatSettings, &str)> = vec![
+        (
+            "no-pub",
+            key(|t| t.server_public_key = None),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "no-disco",
+            key(|t| t.server_disco_key = None),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "nopad",
+            key(|t| t.server_public_key = Some(TC_PUB.trim_end_matches('=').into())),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "urlsafe",
+            key(|t| t.server_disco_key = Some(TC_DISCO.replace('+', "-"))),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "hex",
+            key(|t| {
+                t.server_public_key =
+                    Some("94f2c31cfd18a2b10d428baa812531d461eefb739c0dcfc5ef5677ae83134b2e".into())
+            }),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "space",
+            key(|t| t.server_public_key = Some(format!(" {}", &TC_PUB[1..]))),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "bad-psk",
+            key(|t| t.pre_shared_key = Some("x".into())),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "bad-priv",
+            key(|t| t.private_key = Some(TC_PUB.replace('=', "A"))),
+            INVALID_REASON_TAILCAT_KEY,
+        ),
+        (
+            "no-derp",
+            key(|t| t.derp_region = None),
+            INVALID_REASON_TAILCAT_DERP,
+        ),
+        (
+            "region-0",
+            key(|t| t.derp_region = Some(0)),
+            INVALID_REASON_TAILCAT_DERP,
+        ),
+        (
+            "region-neg",
+            key(|t| t.derp_region = Some(-1)),
+            INVALID_REASON_TAILCAT_DERP,
+        ),
+        (
+            "both",
+            key(|t| t.derp_servers = vec![serde_json::json!("d.example")]),
+            INVALID_REASON_TAILCAT_DERP,
+        ),
+        (
+            "srv-empty",
+            key(|t| {
+                t.derp_region = None;
+                t.derp_servers = vec![serde_json::json!("")]
+            }),
+            INVALID_REASON_TAILCAT_DERP,
+        ),
+        (
+            "srv-nohost",
+            key(|t| {
+                t.derp_region = None;
+                t.derp_servers = vec![serde_json::json!({"ipv4":"192.0.2.1"})]
+            }),
+            INVALID_REASON_TAILCAT_DERP,
+        ),
+        (
+            "srv-num",
+            key(|t| {
+                t.derp_region = None;
+                t.derp_servers = vec![serde_json::json!(1)]
+            }),
+            INVALID_REASON_TAILCAT_DERP,
+        ),
+    ];
+    let good: Vec<(&str, TailcatSettings)> = vec![
+        ("region", tailcat_region()),
+        ("empty-psk", key(|t| t.pre_shared_key = Some(String::new()))),
+        (
+            "servers-mixed",
+            key(|t| {
+                t.derp_region = None;
+                t.derp_servers = vec![
+                    serde_json::json!("d1.example"),
+                    serde_json::json!({"host":"d2.example"}),
+                ];
+            }),
+        ),
+    ];
+    let mut config = UserConfig::default();
+    config.servers = bad
+        .iter()
+        .map(|(id, t, _)| tailcat_node(id, t.clone()))
+        .chain(good.iter().map(|(id, t)| tailcat_node(id, t.clone())))
+        .collect();
+    // 缺设置块本身也不合格（没有服务端 key）。
+    config.servers.push(ServerConfig {
+        id: "no-settings".into(),
+        name: "no-settings".into(),
+        protocol: Protocol::Tailcat,
+        ..Default::default()
+    });
+    config.selected_server_id = Some("__direct__".into());
+    let mut deps = deps_default();
+    let result = build_outbounds(&config, &mut deps).unwrap();
+    let emitted: Vec<&str> = result
+        .outbounds
+        .iter()
+        .filter(|o| o.type_field == "tailcat")
+        .map(|o| o.tag.as_str())
+        .collect();
+    for (id, _, token) in &bad {
+        assert_eq!(
+            deps.gate_invalid_nodes.get(*id).copied(),
+            Some(*token),
+            "{id}"
+        );
+        assert!(!emitted.contains(id), "{id} 坏形态被下发了");
+    }
+    assert_eq!(
+        deps.gate_invalid_nodes.get("no-settings").copied(),
+        Some(INVALID_REASON_TAILCAT_KEY)
+    );
+    for (id, _) in &good {
+        assert!(
+            emitted.contains(id),
+            "{id} 好形态被误剔：{:?}",
+            deps.gate_invalid_nodes
+        );
+    }
+}
+
+/// 🔴 **`http_client` 只在 region 模式出现、缺省 `direct`、有前置代理时跟随它（D10 选项 C）**；
+/// servers 模式三者全无（与 derp_servers 互斥）；透传袋里的生成侧键（`http_client` / `detour` /
+/// `server` / 另一模式的 DERP 键）一律剥掉，袋里的无害键原样下发（证明合并确实发生过）。
+#[test]
+fn tailcat_http_client_is_region_only_and_follows_detour() {
+    let mut chained = tailcat_node("chained", tailcat_region());
+    chained.detour = Some("s".into());
+    let mut bag = serde_json::Map::new();
+    bag.insert(
+        "http_client".into(),
+        serde_json::json!({"detour": "proxy-selector"}),
+    );
+    bag.insert("detour".into(), serde_json::json!("x"));
+    bag.insert("server".into(), serde_json::json!("x.example"));
+    bag.insert("derp_region".into(), serde_json::json!(9));
+    bag.insert("udp_timeout".into(), serde_json::json!("5m"));
+    let mut servers = tailcat_node(
+        "servers",
+        crate::user_config::protocol_settings::TailcatSettings {
+            derp_region: None,
+            derp_map_url: Some("https://left-over.example/m.json".into()),
+            derp_servers: vec![serde_json::json!("d.example")],
+            extra: bag,
+            ..tailcat_region()
+        },
+    );
+    servers.detour = Some("s".into());
+    let mut config = UserConfig::default();
+    config.servers = vec![
+        ServerConfig {
+            id: "s".into(),
+            name: "SOCKS".into(),
+            protocol: Protocol::Socks,
+            address: "1.2.3.4".into(),
+            port: 1080,
+            ..Default::default()
+        },
+        tailcat_node("plain", tailcat_region()),
+        chained,
+        servers,
+    ];
+    config.selected_server_id = Some("plain".into());
+    let mut deps = deps_default();
+    let result = build_outbounds(&config, &mut deps).unwrap();
+    let get = |tag: &str| {
+        serde_json::to_value(result.outbounds.iter().find(|o| o.tag == tag).unwrap()).unwrap()
+    };
+    assert_eq!(
+        get("plain")["http_client"],
+        serde_json::json!({"detour": "direct"})
+    );
+    assert_eq!(
+        get("chained")["http_client"],
+        serde_json::json!({"detour": "SOCKS"})
+    );
+    assert_eq!(get("chained")["detour"], serde_json::json!("SOCKS"));
+    let s = get("servers");
+    for k in [
+        "http_client",
+        "derp_region",
+        "derp_map_url",
+        "server",
+        "server_port",
+    ] {
+        assert!(s.get(k).is_none(), "servers 模式不得带 `{k}`：{s:#}");
+    }
+    assert_eq!(
+        s["detour"],
+        serde_json::json!("SOCKS"),
+        "袋里的 detour 不得盖过装配层的真值"
+    );
+    assert_eq!(
+        s["udp_timeout"],
+        serde_json::json!("5m"),
+        "袋里的无害键应原样下发"
+    );
+    assert_eq!(s["derp_servers"], serde_json::json!(["d.example"]));
+}

@@ -406,6 +406,99 @@ pub struct MasqueClientSettings {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Tailcat 设置（2026-09-24）。camelCase 类型化 + 内核键名透传袋，形态同 [`TorSettings`]。
+///
+/// 无 server/server_port（同 Tor）：对端由两把服务端公钥定位，经 DERP 引导打洞/中继。
+/// 生成侧见 `builder::outbound::build_proxy_outbound` 的 Tailcat 分支；下发前先过
+/// [`tailcat_emit_check`]，不合格的节点剔除并上报 —— 下面每条校验都对应一种**整核起不来**的写法。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TailcatSettings {
+    /// 服务端 WireGuard 公钥（必填，标准 base64 的 32 字节）。服务端不校验 users 时它就是准入凭据
+    /// （上游称其为 tailcat 地址里不可猜的部分）⇒ 按秘密处理，进脱敏表。
+    #[serde(rename = "serverPublicKey", skip_serializing_if = "Option::is_none")]
+    pub server_public_key: Option<String>,
+    /// 服务端 disco 公钥（必填，同上形态）。disco 包在直连 UDP 上明文携带它，不算秘密。
+    #[serde(rename = "serverDiscoKey", skip_serializing_if = "Option::is_none")]
+    pub server_disco_key: Option<String>,
+    /// 可选；空串等同未填（内核对空串放行，实测）。
+    #[serde(rename = "preSharedKey", skip_serializing_if = "Option::is_none")]
+    pub pre_shared_key: Option<String>,
+    /// 可选；缺省时内核每次起核随机生成。服务端开了 users 校验或 DERP 开了 `verify_client_*` 时必填。
+    #[serde(rename = "privateKey", skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// region 模式：必须与服务端所用 region 一致（内核无自动选区）。`i64` 而非 `u32`：手改配置里的
+    /// 负数不该让整份 UserConfig 反序列化失败，交给 [`tailcat_emit_check`] 剔节点即可。
+    #[serde(rename = "derpRegion", skip_serializing_if = "Option::is_none")]
+    pub derp_region: Option<i64>,
+    /// region 模式可选：自建 DERP 地图 URL（内核缺省 `https://tailcat.dev/derpmap.json`）。
+    #[serde(rename = "derpMapUrl", skip_serializing_if = "Option::is_none")]
+    pub derp_map_url: Option<String>,
+    /// servers 模式：每项是裸主机名字符串，或内核原生对象
+    /// `{host, ipv4, ipv6, derp_port, stun_port, cert_name}`，原样下发。
+    ///
+    /// ⚠️ `cert_name: "sha256-raw:<hex>"` **不只比证书哈希，还校验主机名**：`host` 必须在该证书的
+    /// SAN 里（sagernet/tailscale `a8fbeb4b0838` `net/tlsdial/tlsdial.go:341-345` 的
+    /// `cert.VerifyHostname`，host 为空才跳过）。不匹配时客户端 TLS 断开，内核日志只有
+    /// `wait for server: context deadline exceeded`，看不出原因（R0 实测）。生成侧拿不到证书、
+    /// 判不了这一条，故不校验；UI 提示文案须写明「主机名必须与 DERP 证书一致」。
+    #[serde(rename = "derpServers", default, skip_serializing_if = "Vec::is_empty")]
+    pub derp_servers: Vec<serde_json::Value>,
+    /// **透传袋**：内核键名，同 [`TorSettings::extra`]。`http_client` 与 Dial Fields 由生成侧决定，
+    /// 袋里出现也剥掉。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Tailcat 密钥形态非法（服务端两把公钥缺失，或任一把 key 不是标准 base64 的 32 字节）的 reason token。
+pub const INVALID_REASON_TAILCAT_KEY: &str = "tailcat-key-invalid";
+/// Tailcat DERP 配置非法（region 与 servers 同时设 / 都没设 / servers 项缺 host）的 reason token。
+pub const INVALID_REASON_TAILCAT_DERP: &str = "tailcat-derp-invalid";
+
+/// Tailcat 节点能否下发。主核发射腿、`selected_server_precludes_selector_fallback`、store 落盘必填门
+/// 共用这一份判据（复刻条件清单会随发射腿改动静默漂移）。
+///
+/// 每条都**照内核判据写**，不多不少（随包 1.15.0-alpha.7 `check` 逐条实测，均为 initialize/decode
+/// 整核失败）：key 必须是带填充的标准 base64 且解出 32 字节（无填充 / url-safe / hex / 首尾空白都判
+/// FATAL）；`derp_region > 0` 与 `derp_servers` 非空恰好其一（`<= 0` 内核视同未设）；servers 每项的
+/// host 非空（数字等非串非对象项是 decode 失败）。
+pub fn tailcat_emit_check(settings: Option<&TailcatSettings>) -> Result<(), &'static str> {
+    let Some(t) = settings else {
+        return Err(INVALID_REASON_TAILCAT_KEY);
+    };
+    // 32 字节的标准 base64 恒为 44 字符、恰一个 `=` 填充；反之亦然。
+    let key_ok = |k: &str| {
+        let b = k.as_bytes();
+        b.len() == 44
+            && b[43] == b'='
+            && b[..43]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
+    };
+    let required = [&t.server_public_key, &t.server_disco_key];
+    let optional = [&t.pre_shared_key, &t.private_key];
+    if !required.iter().all(|k| k.as_deref().is_some_and(key_ok))
+        || !optional
+            .iter()
+            .all(|k| k.as_deref().is_none_or(|k| k.is_empty() || key_ok(k)))
+    {
+        return Err(INVALID_REASON_TAILCAT_KEY);
+    }
+    let region = t.derp_region.is_some_and(|r| r > 0);
+    let servers_ok = t.derp_servers.iter().all(|item| {
+        let host = match item {
+            serde_json::Value::String(h) => Some(h.as_str()),
+            serde_json::Value::Object(o) => o.get("host").and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        host.is_some_and(|h| !h.is_empty())
+    });
+    if region == t.derp_servers.is_empty() && servers_ok {
+        Ok(())
+    } else {
+        Err(INVALID_REASON_TAILCAT_DERP)
+    }
+}
+
 /// OpenVPN 的 TLS 材料（内核 `$defs/OpenVPNOutboundTLSOptions` 的子集）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OpenvpnTlsSettings {

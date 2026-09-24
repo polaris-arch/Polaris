@@ -12,6 +12,16 @@
 //! 调用面：`service/api/dashboard.go:106` 与 `route/rule/rule_set_remote.go:282`）。本门就按
 //! 这两条逐一断言显式声明到位。
 //!
+//! # 第三个消费点：Tailcat 的 DERP 地图拉取（2026-09-24）
+//!
+//! `outbounds[type=tailcat]` 在 region 模式（带 `derp_region`）下懒拉 DERP 地图
+//! （`protocol/tailscale/tailcat_derp.go` 的 `fetchMap`）。它缺省**不**走上面那条弃用回落（空
+//! `http_client` 解析成直连），但有两种失效：① 不写 = 隐式直连，门里无法区分「有意直连」与「忘了写」；
+//! ② 指向 `route.final` / 任何 selector / 自身 = **自锁**：tailcat 被选为出口时，地图请求经 selector
+//! 回到 tailcat，再次去拿 `acquire` 持有的同一把非重入锁，阻塞到 10s 超时，首次起核无缓存 ⇒ 永远
+//! 连不上（`tailcat_outbound.go:143-169`、`tailcat_derp.go:121-131`）。`sing-box check` 两种都放行。
+//! 故断言：region 模式必须带 `http_client.detour`，它 ∈ 已知 tag，且不是任何 selector/urltest、不是自身。
+//!
 //! # 为什么门里带正向对照
 //!
 //! 本仓当前**不生成任何 `type:"remote"` rule-set**（fail-closed 改造后全量 `type:"local"`），
@@ -116,7 +126,77 @@ fn violations(cfg: &Value) -> Vec<String> {
         }
     }
 
+    // ── 消费点 3：outbounds[type=tailcat] 的 region 模式地图拉取（见头注第三节）──
+    let group_tags: Vec<&str> = cfg
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|o| matches!(o["type"].as_str(), Some("selector" | "urltest")))
+        .filter_map(|o| o.get("tag")?.as_str())
+        .collect();
+    if let Some(outs) = cfg.get("outbounds").and_then(Value::as_array) {
+        for ob in outs.iter().filter(|o| o["type"] == "tailcat") {
+            if ob.get("derp_region").is_none() {
+                continue;
+            }
+            let tag = ob["tag"].as_str().unwrap_or("?");
+            match ob.pointer("/http_client/detour").and_then(Value::as_str) {
+                None | Some("") => out.push(format!(
+                    "tailcat({tag}) 在 region 模式下缺 http_client.detour（地图拉取落隐式直连）"
+                )),
+                Some(d) if !known_tags.contains(&d) => out.push(format!(
+                    "tailcat({tag}).http_client.detour={d:?} 不在出站/endpoint tag 集合里"
+                )),
+                Some(d) if group_tags.contains(&d) || d == tag => out.push(format!(
+                    "tailcat({tag}).http_client.detour={d:?} 指回 selector/自身 —— 被选中时地图拉取自锁"
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+
     out
+}
+
+/// 生成依赖：管理 API 与 dashboard 一律打开（金样默认 false，本门必须打开才碰得到 services）。
+fn gate_deps(platform: &str, serve_dir: Option<String>) -> GenerateConfigDeps {
+    GenerateConfigDeps {
+        platform: platform.to_string(),
+        arch: "x86_64".into(),
+        race_server_port: 0,
+        probe_direct_port: None,
+        probe_proxy_port: None,
+        update_in_port: None,
+        subscription_update_in_port: None,
+        probe_pool_ports: vec![],
+        lan_resolver_for_dns: None,
+        race_upstream_ips: vec![],
+        race_upstream_ports: vec![],
+        has_cronet: true,
+        cronet_copy_failed: false,
+        has_management_api: true, // 金样默认 false；本门必须打开才碰得到 services
+        privacy_mode: false,
+        log_level: polaris_config_engine::user_config::LogLevel::Info,
+        disable_log_file: false,
+        dashboard_serve_dir: serve_dir,
+        tailscale_api_port: 51066,
+        cache_path: "/fake/userData/cache.db".into(),
+        log_file_path: Some("/fake/userData/singbox.log".into()),
+        runtime_rules_dir: "/fake/userData/rules".into(),
+        rule_resources_path: "/fake/userData/rule-resource".into(),
+        custom_rules_dir: "/fake/userData/custom-rules".into(),
+        tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+        // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
+        // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
+        tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+        // 无运行期观测（本批生产侧同样恒空）。
+        observed_tailnet_addresses: Default::default(),
+        is_valid_srs_fn: is_valid_srs,
+        own_lan_cidrs: vec![],
+        log: |_, _| {},
+        on_degraded: || {},
+    }
 }
 
 /// 主门：37 例金样输入 × {带 serve_dir, 不带 serve_dir} 全量生成后逐条查不变式。
@@ -145,42 +225,7 @@ fn no_implicit_default_http_client_in_generated_config() {
             let mut input = case.input.clone();
             input.singbox_dashboard = Some(true);
 
-            let deps = GenerateConfigDeps {
-                platform: case.platform.clone(),
-                arch: "x86_64".into(),
-                race_server_port: 0,
-                probe_direct_port: None,
-                probe_proxy_port: None,
-                update_in_port: None,
-                subscription_update_in_port: None,
-                probe_pool_ports: vec![],
-                lan_resolver_for_dns: None,
-                race_upstream_ips: vec![],
-                race_upstream_ports: vec![],
-                has_cronet: true,
-                cronet_copy_failed: false,
-                has_management_api: true, // 金样默认 false；本门必须打开才碰得到 services
-                privacy_mode: false,
-                log_level: polaris_config_engine::user_config::LogLevel::Info,
-                disable_log_file: false,
-                dashboard_serve_dir: serve_dir.clone(),
-                tailscale_api_port: 51066,
-                cache_path: "/fake/userData/cache.db".into(),
-                log_file_path: Some("/fake/userData/singbox.log".into()),
-                runtime_rules_dir: "/fake/userData/rules".into(),
-                rule_resources_path: "/fake/userData/rule-resource".into(),
-                custom_rules_dir: "/fake/userData/custom-rules".into(),
-                tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
-                // A-0a：tailnet rule-set 目录。夹具里这个目录**不存在** ⇒ 块 0c 的存在性检查
-                // 恒假 ⇒ 走 inline 降级腿 ⇒ 产出与本字段出现之前逐字节相同（金样不动）。
-                tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
-                // 无运行期观测（本批生产侧同样恒空）。
-                observed_tailnet_addresses: Default::default(),
-                is_valid_srs_fn: is_valid_srs,
-                own_lan_cidrs: vec![],
-                log: |_, _| {},
-                on_degraded: || {},
-            };
+            let deps = gate_deps(&case.platform, serve_dir.clone());
 
             let Ok(config) = generate_sing_box_config(&input, &BTreeMap::new(), &deps) else {
                 // 生成失败（如场景本身构造了非法节点）不是本门的判据，跳过但不计入覆盖。
@@ -279,9 +324,45 @@ fn predicate_has_teeth() {
         "legacy download_detour 未被抓到"
     );
 
+    // 7. Tailcat region 模式：缺 http_client / 指向 route.final（proxy-selector）/ 指向含它的 urltest /
+    //    指向自身 / 悬空 → 各报一条；servers 模式不拉地图，不查。
+    let tailcat_outbounds = json!([
+        { "tag": "proxy-selector", "type": "selector", "outbounds": ["TC", "direct"] },
+        { "tag": "auto", "type": "urltest", "outbounds": ["TC"] },
+        { "tag": "direct", "type": "direct" },
+        { "tag": "TC", "type": "tailcat", "derp_region": 1 },
+        { "tag": "TC-FINAL", "type": "tailcat", "derp_region": 1,
+          "http_client": { "detour": "proxy-selector" } },
+        { "tag": "TC-URLTEST", "type": "tailcat", "derp_region": 1,
+          "http_client": { "detour": "auto" } },
+        { "tag": "TC-SELF", "type": "tailcat", "derp_region": 1,
+          "http_client": { "detour": "TC-SELF" } },
+        { "tag": "TC-DANGLING", "type": "tailcat", "derp_region": 1,
+          "http_client": { "detour": "nope" } },
+        { "tag": "TC-SERVERS", "type": "tailcat", "derp_servers": ["derp.example"] },
+    ]);
+    let v = violations(&json!({
+        "outbounds": tailcat_outbounds,
+        "route": { "final": "proxy-selector" },
+    }));
+    assert_eq!(v.len(), 5, "Tailcat 五种违规未全部抓到：{v:#?}");
+    for tag in [
+        "(TC)",
+        "(TC-FINAL)",
+        "(TC-URLTEST)",
+        "(TC-SELF)",
+        "(TC-DANGLING)",
+    ] {
+        assert!(v.iter().any(|x| x.contains(tag)), "{tag} 未被报出：{v:#?}");
+    }
+
     // 6. 合规形态 → 零违规（防谓词恒报错这种「反向恒真」）。
     let good = json!({
-        "outbounds": base_outbounds,
+        "outbounds": [
+            { "tag": "proxy-selector" }, { "tag": "direct" }, { "tag": "SOCKS", "type": "socks" },
+            { "tag": "TC", "type": "tailcat", "derp_region": 1, "http_client": { "detour": "direct" } },
+            { "tag": "TC2", "type": "tailcat", "derp_region": 1, "http_client": { "detour": "SOCKS" } },
+        ],
         "services": [{ "type": "api", "dashboard": { "enabled": true, "http_client": { "detour": "proxy-selector" } } }],
         "route": { "rule_set": [
             { "tag": "r1", "type": "remote", "format": "binary", "url": "https://x/y.srs",
@@ -293,5 +374,66 @@ fn predicate_has_teeth() {
         violations(&good).is_empty(),
         "合规配置被误报：{:?}",
         violations(&good)
+    );
+}
+
+/// 第三消费点的语料侧：金样里没有 Tailcat（主门对它恒真），故在这里用真实生成器产出含 Tailcat 的配置 ——
+/// 包括它**被选为出口**（`route.final` 的 selector 默认值就是它，正是自锁的触发条件）、带/不带前置代理、
+/// 以及 servers 模式 —— 逐条过同一个谓词。
+#[test]
+fn tailcat_derp_map_fetch_is_explicit_and_never_self_locking() {
+    const PUB: &str = "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=";
+    const DISCO: &str = "qQ+kiWwZ8BrTYDZpj+6bnx2JxWxx0SAh1krqPGndCmQ=";
+    let tc = |id: &str, detour: Option<&str>, derp: Value| {
+        let mut settings = json!({ "serverPublicKey": PUB, "serverDiscoKey": DISCO });
+        settings
+            .as_object_mut()
+            .unwrap()
+            .extend(derp.as_object().unwrap().clone());
+        let mut node =
+            json!({ "id": id, "name": id, "protocol": "tailcat", "tailcatSettings": settings });
+        if let Some(d) = detour {
+            node["detour"] = json!(d);
+        }
+        node
+    };
+    let mut checked_region = 0usize;
+    for selected in ["t-direct", "t-chain"] {
+        let input: UserConfig = serde_json::from_value(json!({
+            "servers": [
+                { "id": "s", "name": "SOCKS", "protocol": "socks", "address": "1.2.3.4", "port": 1080 },
+                tc("t-direct", None, json!({ "derpRegion": 1 })),
+                tc("t-chain", Some("s"), json!({ "derpRegion": 2 })),
+                tc("t-servers", None, json!({ "derpServers": ["derp.example"] })),
+            ],
+            "selectedServerId": selected,
+            "proxyMode": "global",
+        }))
+        .expect("夹具无效");
+        let config = generate_sing_box_config(&input, &BTreeMap::new(), &gate_deps("linux", None))
+            .expect("生成配置");
+        let value = serde_json::to_value(&config).expect("序列化");
+        // 前置断言：选中的 tailcat 确实是 selector 默认值（否则没碰到自锁的触发条件）。
+        let sel = value["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["type"] == "selector" && o["default"] == selected);
+        assert!(
+            sel.is_some(),
+            "{selected} 没成为 selector 默认值：{value:#}"
+        );
+        checked_region += value["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["type"] == "tailcat" && o.get("derp_region").is_some())
+            .count();
+        let v = violations(&value);
+        assert!(v.is_empty(), "选中 {selected} 时：{v:#?}");
+    }
+    assert_eq!(
+        checked_region, 4,
+        "region 模式 tailcat 应每轮两个 —— 门在空转"
     );
 }

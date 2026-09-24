@@ -40,6 +40,26 @@ pub fn protocol_can_carry_transport(protocol: Protocol) -> bool {
     TRANSPORT_CAPABLE.contains(&protocol)
 }
 
+/// Tailcat 透传袋里必须剥掉的键：生成侧自己写的建模键（袋里再留一份会与具名值打架）、
+/// 装配层决定的 Dial Fields（`detour` / `domain_resolver`，`Outbound` 上是具名字段，袋里再有一份就会
+/// 序列化出重复键），以及由 DERP 模式推导的 `http_client`（写错指向会自锁，见 Tailcat 分支）。
+const TAILCAT_GENERATED_KEYS: &[&str] = &[
+    "type",
+    "tag",
+    "server",
+    "server_port",
+    "detour",
+    "domain_resolver",
+    "server_public_key",
+    "server_disco_key",
+    "pre_shared_key",
+    "private_key",
+    "derp_region",
+    "derp_map_url",
+    "derp_servers",
+    "http_client",
+];
+
 /// 生成代理 Outbound。上游 `buildProxyOutbound`。
 /// arch/platform 注入。
 ///
@@ -455,6 +475,52 @@ pub fn build_proxy_outbound(
                 }
             }
             // Tor 自带传输层，不叠 TLS/transport。
+            return ob;
+        }
+        // ── Tailcat（2026-09-24）── 无地址 outbound，写法同 Tor：清 server/port → 铺透传袋 → 剥掉
+        // 生成侧自己决定的键 → 写具名键。调用方须先过 `tailcat_emit_check`（坏 key / DERP 冲突会让
+        // 整核起不来）；本函数不重复判，只负责形状。
+        Protocol::Tailcat => {
+            ob.server = None;
+            ob.server_port = None;
+            if let Some(t) = &server.tailcat_settings {
+                ob.extra.extend(t.extra.clone());
+                for k in TAILCAT_GENERATED_KEYS {
+                    ob.extra.remove(*k);
+                }
+                for (k, v) in [
+                    ("server_public_key", &t.server_public_key),
+                    ("server_disco_key", &t.server_disco_key),
+                    ("pre_shared_key", &t.pre_shared_key),
+                ] {
+                    if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+                        ob.extra.insert(k.into(), v.into());
+                    }
+                }
+                ob.private_key = t.private_key.clone().filter(|v| !v.is_empty());
+                if t.derp_servers.is_empty() {
+                    // region 模式才拉 DERP 地图。拉取出口写成显式 `direct`（D10 选项 C）：
+                    // 装配层若给节点接了前置代理，再改写成同一个 tag（`builder/outbounds.rs`）。
+                    // 绝不能指向 `route.final` / 任何 selector：tailcat 被选为出口时，地图请求经
+                    // selector 回到 tailcat 自己，再次去拿同一把非重入锁，首次起核无缓存 ⇒ 永远连不上。
+                    if let Some(r) = t.derp_region {
+                        ob.extra.insert("derp_region".into(), r.into());
+                    }
+                    if let Some(u) = t.derp_map_url.as_deref().filter(|u| !u.is_empty()) {
+                        ob.extra.insert("derp_map_url".into(), u.into());
+                    }
+                    ob.extra.insert(
+                        "http_client".into(),
+                        serde_json::json!({ "detour": crate::user_config::dns_constants::DIRECT_TAG }),
+                    );
+                } else {
+                    // servers 模式与 derp_region / derp_map_url / http_client 都互斥（内核实测整核失败），
+                    // 故那三者一个都不写 —— UI 切模式留下的 region/URL 草稿值在这里丢掉。
+                    ob.extra
+                        .insert("derp_servers".into(), t.derp_servers.clone().into());
+                }
+            }
+            // Tailcat 自带 WireGuard + DERP，不叠 TLS/transport。
             return ob;
         }
         Protocol::Ssh => {
@@ -916,6 +982,7 @@ pub(crate) fn protocol_str(p: Protocol) -> String {
         Protocol::Openconnect => "openconnect",
         Protocol::OpenvpnClient => "openvpn-client",
         Protocol::MasqueClient => "masque-client",
+        Protocol::Tailcat => "tailcat",
         Protocol::Custom => "custom",
     }
     .to_string()

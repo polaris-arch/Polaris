@@ -420,6 +420,42 @@ fn fingerprint_matches_net_stack_typed() {
     );
 }
 
+/// Tailcat 两侧指纹：json 侧与 typed 侧都必须把 `serverPublicKey` 算进 cred，否则无地址的 Tailcat 节点
+/// 全部撞成同一个指纹，对账时互相覆盖（跨类型等价同时锁住两侧公式同步）。
+#[test]
+fn tailcat_fingerprint_distinguishes_server_public_key_on_both_sides() {
+    use polaris_config_engine::user_config::protocol_settings::TailcatSettings;
+    use polaris_config_engine::user_config::server_config::Protocol;
+    let tc = |key: &str| ServerConfig {
+        id: "t".into(),
+        name: "T".into(),
+        protocol: Protocol::Tailcat,
+        tailcat_settings: Some(Box::new(TailcatSettings {
+            server_public_key: Some(key.into()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let a = tc("lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=");
+    let b = tc("UvIrUZDx6KnTBhp84wRkENuaKxb0UaM1YL5pgsvN2mE=");
+    let (va, vb) = (
+        serde_json::to_value(&a).unwrap(),
+        serde_json::to_value(&b).unwrap(),
+    );
+    assert_ne!(
+        node_fingerprint(&va),
+        node_fingerprint(&vb),
+        "json 侧撞指纹"
+    );
+    for (sc, v) in [(&a, &va), (&b, &vb)] {
+        assert_eq!(
+            node_fingerprint(v),
+            polaris_net_stack::subscription::server_fingerprint(sc),
+            "json 侧与 typed 侧指纹须一致"
+        );
+    }
+}
+
 // ── A7 · subscription_delete 腿：选中随订阅删除 → →direct 哨兵 → 出口变（失效牙）─────
 // 打断 `apply_subscription_delete` 的置哨兵（不改选中）→ 断言转红；打断 `selected_exit_changed` → 转红。
 #[test]

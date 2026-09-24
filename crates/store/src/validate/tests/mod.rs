@@ -61,6 +61,26 @@ fn protocol_requirement_checks() {
         "masque-client",
         &serde_json::json!({"address":"mq.example.com","port":443})
     ));
+    // tailcat：与生成侧同一个判据（坏 key / DERP 冲突下发即整核失败，落盘门不得更宽）。
+    let tc = |settings: serde_json::Value| serde_json::json!({ "tailcatSettings": settings });
+    let pk = "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=";
+    assert!(protocol_requirement_ok(
+        "tailcat",
+        &tc(serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk,"derpRegion":1}))
+    ));
+    for bad in [
+        serde_json::json!({"serverPublicKey":pk,"derpRegion":1}),
+        serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk}),
+        serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk,"derpRegion":1,
+            "derpServers":["d.example"]}),
+        serde_json::json!({"serverPublicKey":pk,"serverDiscoKey":pk,"derpRegion":"1"}),
+    ] {
+        assert!(
+            !protocol_requirement_ok("tailcat", &tc(bad.clone())),
+            "{bad}"
+        );
+    }
+    assert!(!protocol_requirement_ok("tailcat", &serde_json::json!({})));
 }
 
 #[test]

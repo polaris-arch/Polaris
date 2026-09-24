@@ -1021,6 +1021,7 @@ fn build_base(
         openconnect_settings: None,
         openvpn_client_settings: None,
         masque_client_settings: None,
+        tailcat_settings: None,
         address: server,
         port,
         detour: None,

@@ -163,6 +163,11 @@ pub enum Protocol {
     /// （serde 名 / `ALLOWED_PROTOCOLS` / UI `NodeProto`）照它对齐；`alias` 收下折叠拼法。
     #[serde(rename = "masque-client", alias = "masqueclient")]
     MasqueClient,
+    /// Tailcat：无控制面的点对点 WireGuard（经 DERP 打洞/中继）。内核只收在 `outbounds[]`
+    /// （塞 `endpoints[]` 得 `unknown endpoint type: tailcat`，实测）。与 [`Self::Tor`] 同属
+    /// 「无地址协议」：没有 server/server_port，对端由 `tailcatSettings` 里的两把服务端公钥 + DERP 定位。
+    /// wire 名 `tailcat` 由枚举级 `rename_all` 自然产出，与内核 type 名相同，不需要单独 rename。
+    Tailcat,
     Custom,
 }
 
@@ -523,6 +528,9 @@ pub struct ServerConfig {
     )]
     pub masque_client_settings:
         Option<Box<crate::user_config::protocol_settings::MasqueClientSettings>>,
+    /// Tailcat（无地址 outbound，同 Tor）。生成侧先过 `tailcat_emit_check`，不合格剔节点。
+    #[serde(rename = "tailcatSettings", skip_serializing_if = "Option::is_none")]
+    pub tailcat_settings: Option<Box<crate::user_config::protocol_settings::TailcatSettings>>,
     #[serde(rename = "wireguardSettings", skip_serializing_if = "Option::is_none")]
     pub wireguard_settings: Option<Box<WireGuardSettings>>,
     #[serde(rename = "tailscaleSettings", skip_serializing_if = "Option::is_none")]
@@ -609,7 +617,7 @@ pub fn is_mesh_protocol(p: Protocol) -> bool {
 /// 手写数组本身不保证穷尽，故配套 `all_protocols_is_exhaustive` 用一个**穷尽 `match`** 钉住：
 /// 新增变体 ⇒ 那个 match 不编译 ⇒ 必须回来同步本表。没有那条测试，本表就只是一份会悄悄过期的清单，
 /// 而依赖它的门会**静默缩小取材面**（新协议不在表里 = 那条腿没人测，且一片绿）。
-pub const ALL_PROTOCOLS: [Protocol; 20] = [
+pub const ALL_PROTOCOLS: [Protocol; 21] = [
     Protocol::Vless,
     Protocol::Trojan,
     Protocol::Hysteria2,
@@ -629,6 +637,7 @@ pub const ALL_PROTOCOLS: [Protocol; 20] = [
     Protocol::Openconnect,
     Protocol::OpenvpnClient,
     Protocol::MasqueClient,
+    Protocol::Tailcat,
     Protocol::Custom,
 ];
 

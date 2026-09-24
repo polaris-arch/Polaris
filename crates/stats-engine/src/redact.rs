@@ -46,7 +46,7 @@ pub const REDACTED: &str = "<redacted>";
 /// `username` 保留（naive 用户名单独不可用，且有助定位），仅 password 类打码。
 ///
 /// **改这张表 = 改红线**。新增协议若引入新密钥键，必须同步加进来 + 补 `tests` 里的穷举用例。
-pub const SECRET_KEYS: [&str; 16] = [
+pub const SECRET_KEYS: [&str; 17] = [
     "password",
     "uuid",
     "privatekey",
@@ -65,6 +65,9 @@ pub const SECRET_KEYS: [&str; 16] = [
     // MASQUE `headers` 里的 Bearer/Basic 头（`{"Authorization": [...]}`，键名归一后命中）：
     // 自建 CONNECT-IP 服务端常用额外头鉴权，值即凭据。
     "authorization",
+    // Tailcat 服务端公钥（`serverPublicKey` / `server_public_key`）：服务端不校验 users 时它就是准入
+    // 凭据（上游称其为 tailcat 地址里不可猜的部分）。同名族的 `serverDiscoKey` 明文过线，**不**打码。
+    "serverpublickey",
 ];
 
 /// url 类键名（值按 url 处理：仅保留 origin，path/query 都打码 —— 订阅 token 可能在 path 或 query）。

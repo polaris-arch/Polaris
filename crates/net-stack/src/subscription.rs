@@ -1275,6 +1275,14 @@ pub fn server_fingerprint(s: &ServerConfig) -> String {
                     .and_then(|w| w.peer_public_key.clone()),
             )
         })
+        // Tailcat 无地址、无 uuid/password：不认服务端公钥，同批所有 Tailcat 节点撞成一个指纹被去重合并。
+        .or_else(|| {
+            non_empty(
+                s.tailcat_settings
+                    .as_ref()
+                    .and_then(|t| t.server_public_key.clone()),
+            )
+        })
         .unwrap_or_default();
     let network = s.network.as_deref().unwrap_or("tcp").to_ascii_lowercase();
     format!("{protocol}|{}|{}|{cred}|{network}", s.address, s.port)

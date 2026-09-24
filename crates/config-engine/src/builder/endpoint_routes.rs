@@ -853,7 +853,8 @@ const CARRY_TRAFFIC_KEYS: &[&str] = &[
 /// - Tailscale 的非法 `control_url` 会在发射循环中被剔除；其余 Tailscale 与普通代理 outbound
 ///   无失败腿 → 必定发射；
 /// - MASQUE：path / version 非法会被发射循环剔除 → 同 WireGuard，直接调 `build_masque_endpoint`
-///   取真判据（缺设置不剔，发射腿按缺省处理）。
+///   取真判据（缺设置不剔，发射腿按缺省处理）；
+/// - Tailcat：key / DERP 非法会被发射循环剔除 → 调同一个 `tailcat_emit_check`（缺设置即剔）。
 ///
 /// 外部注入的 `gate_invalid_nodes` 不建模：两个生成入口都传空集。发射循环自身会写入的
 /// Tailscale / custom 静态剔除门已在上面逐项复用；detour 剪枝若命中选中节点则返回 `Err`，不会形成
@@ -872,6 +873,10 @@ fn selected_server_precludes_selector_fallback(s: &ServerConfig) -> bool {
             .is_none(),
         Protocol::MasqueClient => {
             crate::builder::endpoints::build_masque_endpoint(s, "", None, None, |_, _| {}).is_ok()
+        }
+        Protocol::Tailcat => {
+            crate::user_config::protocol_settings::tailcat_emit_check(s.tailcat_settings.as_deref())
+                .is_ok()
         }
         Protocol::Custom => s.custom_settings.as_ref().is_some_and(|c| {
             crate::user_config::protocol_settings::custom_outbound_type(&c.outbound).is_some()
