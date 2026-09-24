@@ -31,7 +31,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { MESH_PROTOCOLS, ENDPOINT_LEG_PROTOCOLS } from '@/domain/endpoint-routes';
+import { MESH_PROTOCOLS, ENDPOINT_LEG_PROTOCOLS, MESH_ROUTES_PROTOCOLS } from '@/domain/endpoint-routes';
 
 const SRC = fileURLToPath(
   new URL('../../../crates/config-engine/src/user_config/server_config.rs', import.meta.url)
@@ -96,16 +96,32 @@ describe('组网 / endpoint 腿谓词跨语言一致', () => {
     expect([...ENDPOINT_LEG_PROTOCOLS].sort()).toEqual(membersOf('lands_in_endpoints'));
   });
 
+  // 第三份名单：凭 meshRoutes 组网的协议。Rust 侧 `declares_mesh_routes` 被 is_mesh_node / force-route /
+  // 备份分类三处共用；TS 侧 `declaresMeshRoutes` 被 isMeshNode / endpointForcedRouteCidrs 共用。
+  // 两边任一侧加协议而另一侧没跟，页面会把它当组网渲染而生成侧不发 force-route（或反之）。
+  it('MESH_ROUTES_PROTOCOLS ⟺ Rust declares_mesh_routes', () => {
+    expect([...MESH_ROUTES_PROTOCOLS].sort()).toEqual(membersOf('declares_mesh_routes'));
+  });
+
+  it('凭 meshRoutes 组网的协议 ⊂ endpoint 腿，且与组网协议不相交', () => {
+    for (const p of MESH_ROUTES_PROTOCOLS) {
+      expect(ENDPOINT_LEG_PROTOCOLS).toContain(p);
+      expect(MESH_PROTOCOLS).not.toContain(p);
+    }
+  });
+
   it('组网 ⊂ endpoint 腿（真子集，两侧都该成立）', () => {
     for (const p of MESH_PROTOCOLS) expect(ENDPOINT_LEG_PROTOCOLS).toContain(p);
     expect(ENDPOINT_LEG_PROTOCOLS.length).toBeGreaterThan(MESH_PROTOCOLS.length);
   });
 
   it('解析器自检：wire 名映射真的解析到了 per-variant rename', () => {
-    // 这条钉住解析器本身。`OpenvpnClient` 是全枚举唯一需要 per-variant rename 的变体
+    // 这条钉住解析器本身。`OpenvpnClient` 是第一个需要 per-variant rename 的变体
     // （枚举级 lowercase 会把它折成 `openvpnclient`）—— 解析器若漏读 rename，这里先红，
     // 而不是让上面两条以「两边都错成 openvpnclient」的方式空过。
     expect(wireNames().get('OpenvpnClient')).toBe('openvpn-client');
+    // MasqueClient 的属性行是 `rename = "…", alias = "…"` 复合形态，钉住解析器没被 alias 带偏。
+    expect(wireNames().get('MasqueClient')).toBe('masque-client');
     expect(wireNames().get('Wireguard')).toBe('wireguard');
   });
 });

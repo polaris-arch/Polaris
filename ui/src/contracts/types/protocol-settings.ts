@@ -135,6 +135,21 @@ export interface OpenvpnClientSettings {
   tls?: OpenvpnTlsSettings;
 }
 
+/**
+ * MASQUE（RFC 9484 CONNECT-IP）客户端设置。镜像 Rust `MasqueClientSettings`：键名 = 内核键名，
+ * 其余键是透传袋（索引签名）。地址 / Basic 凭据 / TLS 复用 ServerConfig 顶层，不在此块。
+ */
+export interface MasqueClientSettings {
+  [key: string]: unknown;
+  /** URI 模板路径；非空须以 `/` 开头，否则生成侧剔节点（内核 initialize 失败）。 */
+  path?: string;
+  /** 额外请求头。内核值可为单串或数组（`Listable`），读回两种都得认。 */
+  headers?: Record<string, string | string[]>;
+  /** 缺省 = 内核 3 且可回落；1/2 时生成侧剥掉不兼容的调优键。 */
+  version?: number;
+  mtu?: number;
+}
+
 export interface Hysteria2Settings {
   upMbps?: number;
   downMbps?: number;

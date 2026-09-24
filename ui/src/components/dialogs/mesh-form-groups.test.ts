@@ -27,7 +27,7 @@ const localeValue = (dict: unknown, key: string): unknown =>
   );
 
 describe('统一接入表单的信息架构', () => {
-  it.each(['openconnect', 'openvpn-client'] as const)('%s uses three task-oriented groups without duplicating fields', (protocol) => {
+  it.each(['openconnect', 'openvpn-client', 'masque-client'] as const)('%s uses three task-oriented groups without duplicating fields', (protocol) => {
     const groups = ND_SPEC[protocol].groups;
     expect(groups?.map((group) => group.id)).toEqual(['basic', 'routing', 'advanced']);
     const keys = allFields(protocol).map((field) => field.k);
@@ -85,6 +85,20 @@ describe('统一接入表单的信息架构', () => {
       .toEqual({ group: 'advanced', key: 'json' });
     expect(meshTunnelDraftError('openvpn-client', { user: 'u', pwd: 'p', ovpnCa: 'CA', extraJson: '{}' }))
       .toBeNull();
+    // MASQUE 无必填项（Basic 可选、地址走通用校验），只剩透传袋的 JSON 形态门。
+    expect(meshTunnelDraftError('masque-client', {})).toBeNull();
+    expect(meshTunnelDraftError('masque-client', { extraJson: '[]' })).toEqual({ group: 'advanced', key: 'json' });
+  });
+
+  it('MASQUE 三页签的字段归属与设计 §7 一致（system 与 TLS 开关刻意缺席）', () => {
+    const byGroup = Object.fromEntries(
+      nodeFormGroups('masque-client').map((g) => [g.id, g.fields.map((f) => f.k)]),
+    );
+    expect(byGroup).toEqual({
+      basic: ['user', 'pwd', 'sni', 'insecure', 'version'],
+      routing: ['meshRoutes'],
+      advanced: ['path', 'headers', 'mtu', 'certSha256', 'certPkSha256', 'extraJson'],
+    });
   });
 
   it('统一添加菜单下的实际录入表单共用 540px，接入方式选择器单独使用 700px', () => {
@@ -134,7 +148,7 @@ describe('统一接入表单的信息架构', () => {
   it('复杂协议切页，轻量协议保持单页，不用字段数动态让页签闪现', () => {
     for (const protocol of [
       'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2', 'tuic',
-      'anytls', 'hysteria', 'tor', 'ssh', 'openconnect', 'openvpn-client',
+      'anytls', 'hysteria', 'tor', 'ssh', 'openconnect', 'openvpn-client', 'masque-client',
     ] as const) {
       expect(nodeFormUsesTabs(protocol), protocol).toBe(true);
     }

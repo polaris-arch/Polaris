@@ -229,11 +229,13 @@ describe('前置代理候选：endpoint 腿的 VPN 客户端同样排除', () =>
     const servers = [
       { id: 'oc', name: 'OC', protocol: 'openconnect' },
       { id: 'ov', name: 'OV', protocol: 'openvpn-client' },
+      { id: 'mq', name: 'MQ', protocol: 'masque-client' },
       { id: 'v', name: 'V', protocol: 'vless' },
     ] as ServerConfig[];
     const ids = endpointDetourOptions(servers, undefined, '不串联').map(([v]) => v);
     expect(ids).not.toContain('oc');
     expect(ids).not.toContain('ov');
+    expect(ids).not.toContain('mq');
     expect(ids).toContain('v');
   });
 });

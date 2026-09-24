@@ -196,6 +196,27 @@ const SAMPLES: Record<NodeProto, ServerConfig> = {
       tls: { certificate: ['-----BEGIN CERTIFICATE-----', 'MIIB', '-----END CERTIFICATE-----'] },
     },
   },
+  // MASQUE：地址 / Basic 凭据 / TLS 在顶层，设置块只装内核键名的 path/headers/version/mtu（+ 透传袋）。
+  'masque-client': {
+    ...META,
+    protocol: 'masque-client',
+    username: 'mq-user',
+    password: 'mq-pass',
+    meshRoutes: ['10.77.0.0/24'],
+    onDemand: true,
+    tlsSettings: {
+      serverName: 'mq.example',
+      allowInsecure: true,
+      certificateSha256: 'a'.repeat(64),
+    },
+    masqueClientSettings: {
+      path: '/masque/ip/{target}/{ipproto}/',
+      headers: { 'X-Token': ['t1', 't2'] },
+      version: 2,
+      mtu: 1350,
+      udp_timeout: '2m',
+    },
+  },
 };
 
 /** 每协议断言往返后必须保留的关键字段（表单建模的字段）。 */
@@ -353,13 +374,31 @@ const KEY_ASSERTS: Record<NodeProto, (out: ServerConfig) => void> = {
       '-----BEGIN CERTIFICATE-----', 'MIIB', '-----END CERTIFICATE-----',
     ]);
   },
+  'masque-client': (o) => {
+    expect(o.username).toBe('mq-user');
+    expect(o.password).toBe('mq-pass');
+    expect(o.meshRoutes).toEqual(['10.77.0.0/24']);
+    expect(o.onDemand).toBe(true);
+    expect(o.tlsSettings).toEqual({
+      serverName: 'mq.example',
+      allowInsecure: true,
+      certificateSha256: 'a'.repeat(64),
+    });
+    expect(o.masqueClientSettings).toEqual({
+      path: '/masque/ip/{target}/{ipproto}/',
+      headers: { 'X-Token': ['t1', 't2'] },
+      version: 2,
+      mtu: 1350,
+      udp_timeout: '2m',
+    });
+  },
 };
 
 describe('protoCodec round-trip (R5)', () => {
   const protos = PROTO_OPTIONS.map(([p]) => p);
 
-  it('覆盖全部 17 协议（不含 wireguard/tailscale，见 node-spec.ts 文件头注释）', () => {
-    expect(protos).toHaveLength(17);
+  it('覆盖全部 18 协议（不含 wireguard/tailscale，见 node-spec.ts 文件头注释）', () => {
+    expect(protos).toHaveLength(18);
     expect(Object.keys(protoCodec).sort()).toEqual([...protos].sort());
   });
 
@@ -2526,7 +2565,7 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
   // 手建节点根本够不到 —— 等于「支持 AnyConnect 全部能力」只对导入成立。
   // openconnect 内核那支 61 个键，表单给 13；剩下的 csd / cookie / compression_mode …
   // 必须能从这一个控件写进去，且不必改用「自定义」协议（那会丢掉本协议的表单与校验）。
-  const BAG_PROTOS = ['openconnect', 'openvpn-client', 'hysteria', 'tor'] as const;
+  const BAG_PROTOS = ['openconnect', 'openvpn-client', 'hysteria', 'tor', 'masque-client'] as const;
 
   for (const proto of BAG_PROTOS) {
     it(`${proto}：extraJson 写入的键活着进设置，且同名时具名字段压过袋子`, () => {
@@ -2539,6 +2578,7 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
         'openvpn-client': 'openvpnClientSettings',
         hysteria: 'hysteriaSettings',
         tor: 'torSettings',
+        'masque-client': 'masqueClientSettings',
       }[proto];
       const settings = out[key] as Record<string, unknown>;
       expect(settings.csd, '袋子里的键没进设置 —— 手建节点仍够不到未建模字段').toBe(
@@ -2712,5 +2752,84 @@ describe('证书固定：合法形态照存、非法值拒绝保存、reality �
     // 正向对照：同一存量切回 tls 保存，合法值保留。
     const asTls = { ...stored, security: 'tls', tlsSettings: { certificateSha256: HEX } } as ServerConfig;
     expect(protoCodec.vless.toConfig(protoCodec.vless.fromConfig(asTls), asTls).tlsSettings?.certificateSha256).toBe(HEX);
+  });
+});
+
+describe('MASQUE 表单编解码', () => {
+  const base = SAMPLES['masque-client'];
+  const draftOf = () => protoCodec['masque-client'].fromConfig(base);
+  const save = (patch: FormValues, from: ServerConfig = base) =>
+    protoCodec['masque-client'].toConfig({ ...protoCodec['masque-client'].fromConfig(from), ...patch }, from);
+
+  it('version：「默认」删键、各档落数字；0 与缺省同义回显为默认', () => {
+    expect(draftOf().version).toBe('2');
+    expect(save({ version: '' }).masqueClientSettings?.version).toBeUndefined();
+    expect(save({ version: '1' }).masqueClientSettings?.version).toBe(1);
+    expect(save({ version: '3' }).masqueClientSettings?.version).toBe(3);
+    const zero = { ...base, masqueClientSettings: { version: 0 } } as ServerConfig;
+    expect(protoCodec['masque-client'].fromConfig(zero).version).toBe('');
+  });
+
+  it('version 表外值原样往返，不被悄悄改成默认（后端会剔除并上报这种节点）', () => {
+    const odd = { ...base, masqueClientSettings: { version: 5 } } as ServerConfig;
+    const d = protoCodec['masque-client'].fromConfig(odd);
+    expect(d.version).toBe('5');
+    expect(protoCodec['masque-client'].toConfig(d, odd).masqueClientSettings?.version).toBe(5);
+  });
+
+  it('headers：单串值（内核 Listable 的另一形态）读回不丢，逐行写回成数组', () => {
+    const single = {
+      ...base,
+      masqueClientSettings: { headers: { Authorization: 'Basic abc', 'X-A': ['1', '2'] } },
+    } as ServerConfig;
+    const d = protoCodec['masque-client'].fromConfig(single);
+    expect(d.headers).toBe('Authorization: Basic abc\nX-A: 1\nX-A: 2');
+    expect(protoCodec['masque-client'].toConfig(d, single).masqueClientSettings?.headers).toEqual({
+      Authorization: ['Basic abc'],
+      'X-A': ['1', '2'],
+    });
+    expect(save({ headers: '  \n' }).masqueClientSettings?.headers).toBeUndefined();
+  });
+
+  it('地址 / 凭据 / TLS 落顶层，设置块里没有 server/username/tls（生成侧从顶层取）', () => {
+    const out = save({});
+    const settings = out.masqueClientSettings as Record<string, unknown>;
+    for (const k of ['server', 'server_port', 'username', 'password', 'tls', 'system']) {
+      expect(settings[k], k).toBeUndefined();
+    }
+    expect(out.tlsSettings?.serverName).toBe('mq.example');
+  });
+
+  it('TLS 恒开：pin 无门控，非法 pin 拒绝保存', () => {
+    expect(save({ certPkSha256: 'b'.repeat(64) }).tlsSettings?.certificatePublicKeySha256).toBe('b'.repeat(64));
+    expect(() => save({ certSha256: 'not-a-pin' })).toThrow(ProtoCodecError);
+  });
+
+  it('存量 onDemand（顶层）编辑后原样保留 —— 表单不给控件，但不能把它抹掉', () => {
+    expect(save({}).onDemand).toBe(true);
+  });
+
+  it('从 extraJson 删掉的键不会从 base 复活（设置块不以 base 起底）', () => {
+    const d = draftOf();
+    expect(JSON.parse(d.extraJson as string)).toEqual({ udp_timeout: '2m' });
+    const out = protoCodec['masque-client'].toConfig({ ...d, extraJson: '' }, base);
+    expect(out.masqueClientSettings).toEqual({
+      path: '/masque/ip/{target}/{ipproto}/',
+      headers: { 'X-Token': ['t1', 't2'] },
+      version: 2,
+      mtu: 1350,
+    });
+  });
+
+  it('表单不给 system 控件（系统网卡与主 TUN / helper 提权冲突，后端也强制剥掉）', () => {
+    expect(allFields('masque-client').map((f) => f.k)).not.toContain('sysIface');
+  });
+
+  it('MASQUE 的建模键不外溢：openconnect 的 `version`（内核键、未建模）仍在它自己的透传袋里', () => {
+    const oc = {
+      ...SAMPLES.openconnect,
+      openconnectSettings: { ...SAMPLES.openconnect.openconnectSettings, version: 'v' },
+    } as ServerConfig;
+    expect(JSON.parse(protoCodec.openconnect.fromConfig(oc).extraJson as string)).toEqual({ version: 'v' });
   });
 });

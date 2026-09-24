@@ -1587,7 +1587,8 @@
     "wg": ".conf import or manual setup",
     "oc": "Enterprise VPN access",
     "ovpn": "Account and certificate access",
-    "routesHint": "OpenConnect / OpenVPN always appear under Mesh. Internal routes only control which private subnets are forced through the connection; leave them empty to use it as a regular VPN exit."
+    "routesHint": "OpenConnect / OpenVPN / MASQUE always appear under Mesh. Internal routes only control which private subnets are forced through the connection; leave them empty to use it as a regular VPN exit.",
+    "masque": "Self-hosted IP tunnel"
   },
   "node": {
     "add": "Add",
@@ -1742,7 +1743,7 @@
       "torArgs": "Extra arguments",
       "torArgsHint": "Space-separated, passed through to the tor process",
       "meshRoutes": "Intranet routes (CIDR, one per line)",
-      "meshRoutesHint": "One subnet per line for forced routing through this node. Leave empty to disable forced subnet routing. OpenConnect/OpenVPN routes arrive after connection and cannot be filled automatically.",
+      "meshRoutesHint": "One subnet per line for forced routing through this node. Leave empty to disable forced subnet routing. OpenConnect/OpenVPN/MASQUE routes arrive after connection and cannot be filled automatically.",
       "flavor": "Vendor",
       "authGroup": "Auth group",
       "token": "Token",
@@ -1767,7 +1768,13 @@
       "extraJson": "Advanced (raw JSON)",
       "extraJsonHint": "Fields not listed above, written as a JSON object using sing-box key names; merged verbatim into the config on save. Controls above win on name collision. Leave empty for none.",
       "torrc": "torrc options",
-      "torrcHint": "Native torrc syntax, one `Key Value` per line (e.g. `ExitNodes {jp}`). Blank lines and # comments are not saved — the core side is a key/value map and cannot hold them."
+      "torrcHint": "Native torrc syntax, one `Key Value` per line (e.g. `ExitNodes {jp}`). Blank lines and # comments are not saved — the core side is a key/value map and cannot hold them.",
+      "masqueVersion": "HTTP version",
+      "masqueVersionHint": "Default tries HTTP/3 (UDP) first and falls back to HTTP/2. On networks that restrict UDP, pick HTTP/2 directly. Through an upstream proxy, HTTP/3 needs a proxy that supports UDP.",
+      "masquePath": "URI path",
+      "masquePathHint": "Set only if the server uses a custom CONNECT-IP path template; must start with /. Leave empty for the default template.",
+      "masqueHeaders": "Extra headers",
+      "masqueHeadersHint": "One \"Name: value\" per line, sent with the CONNECT-IP request (e.g. an auth header the server requires). Repeated names are merged."
     },
     "customProbe": {
       "unsupported": "Configuration validation failed. Check the outbound configuration.",

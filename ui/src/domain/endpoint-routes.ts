@@ -38,7 +38,7 @@ export function landsInEndpoints(protocol: string | undefined): boolean {
 /**
  * 该**节点**是否具备组网能力 —— [`isMeshProtocol`] 的节点级形态，镜像 Rust `is_mesh_node`。
  *
- * 判据仍是「配置期能否声明可达网段」，只是对 openconnect / openvpn-client 而言这件事由用户填没填
+ * 判据仍是「配置期能否声明可达网段」，只是对 [`declaresMeshRoutes`] 的协议而言这件事由用户填没填
  * `meshRoutes` 决定：填了，生成侧就为它发 force-route 规则，它与一个填了 `allowedIPs` 的 WG 节点在
  * 路由上再无分别；没填，它只是个普通出口。force-route、出口兜底等**看能力**的地方用本函数；
  * 节点页的 UI 归组看 [`landsInEndpoints`]，两者不能再耦合。
@@ -46,8 +46,19 @@ export function landsInEndpoints(protocol: string | undefined): boolean {
 export function isMeshNode(server: { protocol?: string; meshRoutes?: string[] }): boolean {
   const p = server.protocol?.toLowerCase();
   if (isMeshProtocol(p)) return true;
-  if (p !== 'openconnect' && p !== 'openvpn-client') return false;
+  if (!declaresMeshRoutes(p)) return false;
   return !!server.meshRoutes?.some((c) => c.trim() !== '');
+}
+
+/**
+ * 凭用户手填 `meshRoutes` 获得组网资格的协议 —— 网段由服务端在隧道建立后推送、配置期不可知。
+ * 镜像 Rust `declares_mesh_routes`（`mesh-predicates-parity` 对拍）。抽成单一谓词是因为这份名单
+ * 此前在 [`isMeshNode`] 与 [`endpointForcedRouteCidrs`] 各写一份：加协议漏改一处不会报错，
+ * 只会让该节点在那一处被静默当成普通出口。
+ */
+export const MESH_ROUTES_PROTOCOLS: readonly Protocol[] = ['openconnect', 'openvpn-client', 'masque-client'];
+export function declaresMeshRoutes(protocol: string | undefined): boolean {
+  return !!protocol && MESH_ROUTES_PROTOCOLS.includes(protocol.toLowerCase() as Protocol);
 }
 
 /** 账号制协议（连控制面、无 server address/port）：当前仅 Tailscale。供连接闸门/校验豁免 address/port。 */
@@ -193,8 +204,8 @@ export function endpointForcedRouteCidrs(server: ServerConfig): string[] {
     // 两族 tailnet 段恒发（v4 CGNAT + v6 ULA）：v6 段实际生效由全局 enableIPv6 门控——关闭时 AAAA 抑制、无 v6 流量，
     // force-route 规则携 v6 ip_cidr 无害；开启时确保 v6 tailnet peer（fd7a:115c:a1e0::/48）走 tailnet 而非 exit（原缺此段=bug）。
     raw = [TAILNET_CGNAT, TAILNET_ULA_V6, ...stripCatchAll(server.tailscaleSettings?.routes)];
-  } else if (p === 'openconnect' || p === 'openvpn-client') {
-    // 用户手填的内网段（这两个协议的段本由服务端运行期 push、配置期不可知）。去 catch-all 与另两支
+  } else if (declaresMeshRoutes(p)) {
+    // 用户手填的内网段（这几个协议的段本由服务端运行期 push、配置期不可知）。去 catch-all 与另两支
     // 同理：0/0 属「全隧道」意图，由各自的出网开关表达，混进 force-route 会绕过那个开关。
     raw = stripCatchAll(server.meshRoutes);
   } else {

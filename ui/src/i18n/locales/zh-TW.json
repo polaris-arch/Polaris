@@ -1587,7 +1587,8 @@
     "wg": ".conf / 手動設定",
     "oc": "企業 VPN 接入",
     "ovpn": "帳號與憑證接入",
-    "routesHint": "OpenConnect / OpenVPN 始終歸入組網；「內網段」只決定強制路由的企業網段，留空時仍可作為一般 VPN 出口。"
+    "routesHint": "OpenConnect / OpenVPN / MASQUE 始終歸入組網；「內網段」只決定強制路由的企業網段，留空時仍可作為一般 VPN 出口。",
+    "masque": "自建 IP 隧道"
   },
   "node": {
     "add": "新增",
@@ -1742,7 +1743,7 @@
       "torArgs": "額外參數",
       "torArgsHint": "以空白分隔，逐個傳給 tor 行程",
       "meshRoutes": "內網段（CIDR，每行一個）",
-      "meshRoutesHint": "每行一個經此節點強制路由的子網；留空不啟用強制路由。OpenConnect/OpenVPN 的路由會在連線後下發，無法自動預填。",
+      "meshRoutesHint": "每行一個經此節點強制路由的子網；留空不啟用強制路由。OpenConnect/OpenVPN/MASQUE 的路由會在連線後下發，無法自動預填。",
       "flavor": "廠商",
       "authGroup": "認證群組",
       "token": "權杖",
@@ -1767,7 +1768,13 @@
       "extraJson": "進階（原樣 JSON）",
       "extraJsonHint": "本協定未在上方列出的欄位，依 sing-box 鍵名原樣寫成 JSON 物件，儲存時原樣合併進設定。與上方控制項同名時以控制項為準。留空表示無。",
       "torrc": "torrc 設定",
-      "torrcHint": "torrc 原生語法，每行一條 `鍵 值`（如 `ExitNodes {jp}`）。空行與 # 註解不會保存——核心端是鍵值表，承載不了它們。"
+      "torrcHint": "torrc 原生語法，每行一條 `鍵 值`（如 `ExitNodes {jp}`）。空行與 # 註解不會保存——核心端是鍵值表，承載不了它們。",
+      "masqueVersion": "HTTP 版本",
+      "masqueVersionHint": "預設先用 HTTP/3（UDP），不通時回退 HTTP/2。UDP 受限的網路可直接選 HTTP/2。經前置代理時，HTTP/3 要求前置代理支援 UDP。",
+      "masquePath": "URI 路徑",
+      "masquePathHint": "伺服器改過 CONNECT-IP 路徑範本時填寫，須以 / 開頭；留空使用預設範本。",
+      "masqueHeaders": "附加請求標頭",
+      "masqueHeadersHint": "每行一個「名稱: 值」，隨 CONNECT-IP 請求送出（如伺服器要求的驗證標頭）；同名多行合併。"
     },
     "customProbe": {
       "unsupported": "設定驗證失敗，請檢查出站設定",

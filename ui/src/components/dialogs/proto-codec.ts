@@ -29,6 +29,7 @@ import type { ServerConfig, Network, Security } from '@/contracts/types';
 import type {
   GrpcSettings,
   HttpSettings,
+  MasqueClientSettings,
   MultiplexSettings,
   TlsSettings,
   WebSocketSettings,
@@ -180,11 +181,14 @@ function headersFromText(v: FormValue): Record<string, string[]> | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** `Record<string, string[]>` → `名称: 值` 多行文本（与 [`headersFromText`] 成对，往返恒等）。 */
-function headersToText(h: Record<string, string[]> | undefined): string {
+/**
+ * `Record<string, string[]>` → `名称: 值` 多行文本（与 [`headersFromText`] 成对，往返恒等）。
+ * 也收单串值：MASQUE 的 `headers` 在内核是 `Listable`，导入的 `{"X":"v"}` 不能在回显时丢掉。
+ */
+function headersToText(h: Record<string, string | string[]> | undefined): string {
   if (h === undefined) return '';
   return Object.entries(h)
-    .flatMap(([name, values]) => values.map((value) => `${name}: ${value}`))
+    .flatMap(([name, values]) => (Array.isArray(values) ? values : [values]).map((value) => `${name}: ${value}`))
     .join('\n');
 }
 
@@ -448,14 +452,24 @@ const MODELED_SETTING_KEYS: readonly string[] = [
   'no_udp', 'pfs', 'allow_insecure_crypto', 'user_agent', 'reported_os', 'system',
   'network', 'cipher', 'redirect_gateway', 'tls',
 ];
-const bagOf = (settings: unknown): Record<string, unknown> => {
+const bagOf = (
+  settings: unknown,
+  modeled: readonly string[] = MODELED_SETTING_KEYS
+): Record<string, unknown> => {
   if (!settings || typeof settings !== 'object') return {};
   return Object.fromEntries(
     Object.entries(settings as Record<string, unknown>).filter(
-      ([k]) => !MODELED_SETTING_KEYS.includes(k)
+      ([k]) => !modeled.includes(k)
     )
   );
 };
+
+/**
+ * MASQUE 建模键 = Rust `MasqueClientSettings` 的具名字段。**单列一张，不并进上面那张共用表**：
+ * `version` 在 openconnect 那边是内核键却未建模（schema 有 `Endpoint[openconnect].version`），
+ * 并进共用表会把它从 openconnect 的透传袋视图里藏掉，用户就再也看不到、改不了它。
+ */
+const MASQUE_MODELED_KEYS = ['path', 'headers', 'version', 'mtu'] as const;
 
 /** OpenVPN `tls` 是独立嵌套命名空间，不能复用父 settings 的建模键表。 */
 const OPENVPN_TLS_KEYS = ['certificate', 'client_certificate', 'client_key'] as const;
@@ -773,6 +787,52 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
             client_key: lines(draft.ovpnKey),
           },
         },
+      };
+    },
+  },
+
+  // MASQUE：地址 / Basic 凭据 / TLS 在顶层（Rust `build_masque_endpoint` 从顶层取），设置块只装内核键名的
+  // 四个建模键 + 透传袋。设置块**不以 base 起底**：非建模键全在袋里，起底只会让用户在 JSON 里删掉的键从
+  // base 复活。TLS 恒开 ⇒ 没有清除门，与 hy2/tuic 同构。
+  'masque-client': {
+    fromConfig(cfg) {
+      const d = base0('masque-client');
+      const m = cfg.masqueClientSettings;
+      d.user = cfg.username ?? '';
+      d.pwd = cfg.password ?? '';
+      d.sni = cfg.tlsSettings?.serverName ?? '';
+      d.insecure = cfg.tlsSettings?.allowInsecure === true;
+      // 0 与缺省同义（内核按 3 处理）→ 回显「默认」；表外值（如 5）原样留给下拉的保留表外当前值机制，
+      // 不偷偷改成默认 —— 那种节点后端会剔除并上报，改写会把问题藏起来。
+      d.version = m?.version ? String(m.version) : '';
+      d.path = m?.path ?? '';
+      d.headers = headersToText(m?.headers);
+      d.mtu = m?.mtu;
+      certPinDraft(cfg, d);
+      d.meshRoutes = (cfg.meshRoutes ?? []).join('\n');
+      d.extraJson = bagToText(bagOf(m, MASQUE_MODELED_KEYS));
+      return d;
+    },
+    toConfig(draft, base) {
+      return {
+        ...base,
+        username: str(draft.user),
+        password: str(draft.pwd),
+        meshRoutes: cidrLines(draft.meshRoutes),
+        tlsSettings: mergeTls(base.tlsSettings, {
+          serverName: str(draft.sni),
+          allowInsecure: draft.insecure === true ? true : undefined,
+          ...certPinPatch(draft),
+        }),
+        masqueClientSettings: mergeBlock<MasqueClientSettings>(
+          (textToBag(draft.extraJson) ?? bagOf(base.masqueClientSettings, MASQUE_MODELED_KEYS)) as MasqueClientSettings,
+          {
+            path: str(draft.path),
+            headers: headersFromText(draft.headers),
+            version: str(draft.version) ? Number(draft.version) : undefined,
+            mtu: num(draft.mtu),
+          }
+        ),
       };
     },
   },

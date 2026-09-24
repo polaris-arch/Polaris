@@ -175,13 +175,14 @@ describe('判据 1 —— 单个 Tailscale 节点：结构零回归', () => {
     h.servers = [tsNode('ts-a', '家里')];
     const all = tiles(tree());
     const titles = all.map((el) => el.props.title);
-    // 五块 tile 的完整清单与顺序（WARP 在 Tailscale 之前，隧道三块在后）—— 与改动前逐字相同。
+    // 六块 tile 的完整清单与顺序（WARP 在 Tailscale 之前，隧道四块在后；MASQUE 2026-09-24 追加在末尾）。
     expect(titles).toEqual([
       'Cloudflare WARP',
       'Tailscale',
       'OpenConnect',
       'OpenVPN',
       'WireGuard',
+      'MASQUE',
     ]);
   });
 
@@ -261,6 +262,7 @@ describe('判据 2 —— 多个 Tailscale 节点：逐行各自寻址', () => {
       'OpenConnect',
       'OpenVPN',
       'WireGuard',
+      'MASQUE',
     ]);
   });
 
@@ -337,5 +339,15 @@ describe('判据 2 —— 多个 Tailscale 节点：逐行各自寻址', () => {
     expect(markup).toContain('家里');
     expect(markup).toContain('公司');
     expect(markup.match(/meshJoin\.taildrop/g) ?? []).toHaveLength(2);
+  });
+});
+
+describe('隧道接入：MASQUE 入口', () => {
+  it('点 MASQUE 打开通用节点弹窗并预选 masque-client（取的是生产 JSX 上挂的那个闭包）', () => {
+    const masque = tiles(tree()).find((el) => el.props.title === 'MASQUE');
+    expect(masque, '组网弹窗里没有 MASQUE 卡片').toBeDefined();
+    expect(masque!.props.description).toBe('meshJoin.masque');
+    (masque!.props.onClick as () => void)();
+    expect(h.opened).toEqual([{ kind: 'node', initialProto: 'masque-client' }]);
   });
 });

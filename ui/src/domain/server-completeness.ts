@@ -31,6 +31,7 @@ export const ALL_PROTOCOLS: readonly Protocol[] = [
   'tor',
   'openconnect',
   'openvpn-client',
+  'masque-client',
   'custom',
 ];
 
@@ -113,6 +114,9 @@ export function protocolRequirementError(server: ServerConfig): string | null {
     case 'http':
     case 'ssh':
       return null; // 仅需 address/port（通用校验）
+    case 'masque-client':
+      // 地址/凭据/TLS 都在顶层：address/port 走通用校验；Basic 可选（服务端 users 为空时不校验）。
+      return null;
     case 'tailscale':
       return null; // 账号制：auth_key 可选（无则运行时交互登录），无硬必填项；亦无 address/port
     case 'custom':

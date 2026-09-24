@@ -195,6 +195,7 @@ export function MeshJoinDialog({ onTsLogout, onWarpReregister, onWarpDeregister 
         <Choice title="OpenConnect" description={t('meshJoin.oc')} icon={shield} onClick={() => go({ kind: 'node', initialProto: 'openconnect' })} />
         <Choice title="OpenVPN" description={t('meshJoin.ovpn')} icon={shield} onClick={() => go({ kind: 'node', initialProto: 'openvpn-client' })} />
         <Choice title="WireGuard" description={t('meshJoin.wg')} icon={shield} onClick={() => go({ kind: 'wg' })} />
+        <Choice title="MASQUE" description={t('meshJoin.masque')} icon={shield} onClick={() => go({ kind: 'node', initialProto: 'masque-client' })} />
       </div>
     </Modal>
   );

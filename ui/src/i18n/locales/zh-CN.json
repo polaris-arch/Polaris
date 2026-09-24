@@ -1587,7 +1587,8 @@
     "wg": ".conf / 手动配置",
     "oc": "企业 VPN 接入",
     "ovpn": "账号与证书接入",
-    "routesHint": "OpenConnect / OpenVPN 始终归入组网；“内网段”只决定强制路由的企业网段，留空时仍可作为普通 VPN 出口。"
+    "routesHint": "OpenConnect / OpenVPN / MASQUE 始终归入组网；“内网段”只决定强制路由的企业网段，留空时仍可作为普通 VPN 出口。",
+    "masque": "自建 IP 隧道"
   },
   "node": {
     "add": "添加",
@@ -1742,7 +1743,7 @@
       "torArgs": "额外参数",
       "torArgsHint": "空格分隔，逐个传给 tor 进程",
       "meshRoutes": "内网段（CIDR，每行一个）",
-      "meshRoutesHint": "每行一个经此节点强制路由的子网；留空不启用强制路由。OpenConnect/OpenVPN 的路由在连接后下发，无法自动预填。",
+      "meshRoutesHint": "每行一个经此节点强制路由的子网；留空不启用强制路由。OpenConnect/OpenVPN/MASQUE 的路由在连接后下发，无法自动预填。",
       "flavor": "厂商",
       "authGroup": "认证组",
       "token": "令牌",
@@ -1767,7 +1768,13 @@
       "extraJson": "高级（原样 JSON）",
       "extraJsonHint": "本协议未在上方列出的字段，按 sing-box 键名原样写成 JSON 对象，保存时原样合并进配置。与上方控件同名时以控件为准。留空表示无。",
       "torrc": "torrc 配置",
-      "torrcHint": "torrc 原生语法，每行一条 `键 值`（如 `ExitNodes {jp}`）。空行与 # 注释不保存——内核侧是键值表，承载不了它们。"
+      "torrcHint": "torrc 原生语法，每行一条 `键 值`（如 `ExitNodes {jp}`）。空行与 # 注释不保存——内核侧是键值表，承载不了它们。",
+      "masqueVersion": "HTTP 版本",
+      "masqueVersionHint": "默认先用 HTTP/3（UDP），不通时回落 HTTP/2。UDP 受限的网络可直接选 HTTP/2。经前置代理时，HTTP/3 要求前置代理支持 UDP。",
+      "masquePath": "URI 路径",
+      "masquePathHint": "服务端改过 CONNECT-IP 路径模板时填写，须以 / 开头；留空使用默认模板。",
+      "masqueHeaders": "附加请求头",
+      "masqueHeadersHint": "每行一个“名称: 值”，随 CONNECT-IP 请求发送（如服务端要求的鉴权头）；同名多行合并。"
     },
     "customProbe": {
       "unsupported": "配置校验失败，请检查出站配置",

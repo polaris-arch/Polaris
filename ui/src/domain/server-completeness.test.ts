@@ -12,7 +12,7 @@ const base = (protocol: ServerConfig['protocol']): ServerConfig => ({
 
 describe('server completeness endpoint VPN coverage', () => {
   it('runtime registry covers every Protocol member added for endpoint VPNs', () => {
-    for (const protocol of ['hysteria', 'tor', 'openconnect', 'openvpn-client'] as const) {
+    for (const protocol of ['hysteria', 'tor', 'openconnect', 'openvpn-client', 'masque-client'] as const) {
       expect(ALL_PROTOCOLS).toContain(protocol);
     }
   });
@@ -28,5 +28,10 @@ describe('server completeness endpoint VPN coverage', () => {
       openvpnClientSettings: { server: 'vpn.example.com', server_port: 1194, username: 'u', password: 'p', tls: {} },
     })).toBe(true);
     expect(isServerComplete(base('openvpn-client'))).toBe(false);
+  });
+
+  it('MASQUE 只要地址/端口（凭据可选、设置块可缺）；缺地址不完整', () => {
+    expect(isServerComplete(base('masque-client'))).toBe(true);
+    expect(isServerComplete({ ...base('masque-client'), address: '' })).toBe(false);
   });
 });

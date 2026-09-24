@@ -91,8 +91,14 @@ describe('协议下拉的分组与顺序', () => {
     expect(protosInGroup('custom')).toEqual(['custom']);
   });
 
-  it('组网隧道节点选项只含 OpenConnect / OpenVPN，并按展示名排序', () => {
-    expect(meshTunnelNodeProtocols()).toEqual(['openconnect', 'openvpn-client']);
+  it('组网隧道节点选项只含 MASQUE / OpenConnect / OpenVPN，并按展示名排序', () => {
+    expect(meshTunnelNodeProtocols()).toEqual(['masque-client', 'openconnect', 'openvpn-client']);
+  });
+
+  it('MASQUE 展示名与 wire 名解耦，只从组网入口进', () => {
+    expect(new Map(PROTO_OPTIONS).get('masque-client')).toBe('MASQUE');
+    expect(isMeshTunnelNodeProtocol('masque-client')).toBe(true);
+    expect(PROTO_GROUP_ORDER.flatMap((g) => protosInGroup(g))).not.toContain('masque-client');
   });
 
   it('所有普通分组都按展示名排序，NaiveProxy 归入常用', () => {
