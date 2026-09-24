@@ -2695,7 +2695,7 @@ describe('证书固定：合法形态照存、非法值拒绝保存、reality �
     expect(bad.split(',')).toContain((err as ProtoCodecError).detail);
   });
 
-  it('reality 下两框隐藏（后端不下发），存量值照写回', () => {
+  it('reality 下两框隐藏（后端不下发），保存时清掉存量值', () => {
     const fields = allFields('vless').filter((f) => f.k === 'certSha256' || f.k === 'certPkSha256');
     expect(fields).toHaveLength(2);
     const reality = filledDraft('vless', { sec: 'reality' });
@@ -2704,8 +2704,13 @@ describe('证书固定：合法形态照存、非法值拒绝保存、reality �
       expect(f.when?.(reality), `${f.k} 在 reality 下仍显示`).toBe(false);
       expect(f.when?.(tls), `${f.k} 在 tls 下不显示（正向对照）`).toBe(true);
     }
-    const stored = { ...base('vless'), security: 'reality', tlsSettings: { certificateSha256: HEX } } as ServerConfig;
+    const stored = { ...base('vless'), security: 'reality', tlsSettings: { certificateSha256: HEX, certificatePublicKeySha256: 'bad' } } as ServerConfig;
+    // 隐藏的非法值也不能挡保存（用户找不到那个框）。
     const cfg = protoCodec.vless.toConfig(protoCodec.vless.fromConfig(stored), stored);
-    expect(cfg.tlsSettings?.certificateSha256).toBe(HEX);
+    expect(cfg.tlsSettings?.certificateSha256).toBeUndefined();
+    expect(cfg.tlsSettings?.certificatePublicKeySha256).toBeUndefined();
+    // 正向对照：同一存量切回 tls 保存，合法值保留。
+    const asTls = { ...stored, security: 'tls', tlsSettings: { certificateSha256: HEX } } as ServerConfig;
+    expect(protoCodec.vless.toConfig(protoCodec.vless.fromConfig(asTls), asTls).tlsSettings?.certificateSha256).toBe(HEX);
   });
 });

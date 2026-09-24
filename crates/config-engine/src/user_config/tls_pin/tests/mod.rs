@@ -125,3 +125,36 @@ fn import_warning_counts_only_nodes_whose_pin_is_emitted() {
     assert!(w.starts_with("1 个节点"), "{w}");
     assert!(cert_pin_import_warning(&[server(&reality), server(plain)]).is_none());
 }
+
+/// 剔除只打 reality / naive；TLS 节点原样保留。
+#[test]
+fn drop_unemitted_cert_pins_only_touches_reality_and_naive() {
+    let mk = |proto: &str, sec: &str| {
+        server(&format!(
+            r#"{{"id":"x","name":"x","protocol":"{proto}","address":"a.com","port":443,"uuid":"u","password":"p",
+                "security":"{sec}","tlsSettings":{{"certificateSha256":"{X_HEX}","certificatePublicKeySha256":"{X_HEX}"}}}}"#
+        ))
+    };
+    let mut v = vec![
+        mk("vless", "reality"),
+        mk("naive", "tls"),
+        mk("trojan", "tls"),
+    ];
+    drop_unemitted_cert_pins(&mut v);
+    for s in &v[..2] {
+        let t = s.tls_settings.as_ref().unwrap();
+        assert!(
+            t.certificate_sha256.is_none() && t.certificate_public_key_sha256.is_none(),
+            "{:?}",
+            s.protocol
+        );
+    }
+    assert_eq!(
+        v[2].tls_settings
+            .as_ref()
+            .unwrap()
+            .certificate_sha256
+            .as_deref(),
+        Some(X_HEX)
+    );
+}

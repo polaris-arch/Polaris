@@ -113,20 +113,39 @@ pub fn keep_valid_cert_pins(raw: &str) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join(","))
 }
 
+/// 内核会不会真正校验这个节点的 pin —— 与生成侧同一判据：reality / naive 下 builder 写死不下发
+/// （reality 客户端用自己的 verifier 覆盖 pin 回调、naive 不转交 pin，内核都**静默忽略**）。
+fn pin_is_emitted(s: &crate::user_config::server_config::ServerConfig) -> bool {
+    use crate::user_config::server_config::{Protocol, SecurityMode};
+    s.protocol != Protocol::Naive && s.security != Some(SecurityMode::Reality)
+}
+
+/// 导入侧：剔除内核不会校验的 pin（reality / naive 节点）。
+///
+/// 这类值存下来只会「存着、看不到（编辑器在 reality 下隐藏、naive 不提供）、不生效」，
+/// 用户也无从处理 —— 不存。放在导入汇合点调用，而不是各导入器里各判一次：安全层（reality）
+/// 与 pin 在不同导入器里解析顺序不同，汇合点拿到的是装配完的节点。
+pub fn drop_unemitted_cert_pins(servers: &mut [crate::user_config::server_config::ServerConfig]) {
+    for s in servers.iter_mut().filter(|s| !pin_is_emitted(s)) {
+        if let Some(t) = s.tls_settings.as_mut() {
+            t.certificate_sha256 = None;
+            t.certificate_public_key_sha256 = None;
+        }
+    }
+}
+
 /// 导入预览提示：本批里会真正下发 pin 的节点数 > 0 时给一句话，否则 `None`。
 ///
 /// 为什么要提示：mihomo / Xray 的 pin 命中证书链上**任一张**即可（含上级 CA），sing-box 只比
 /// **服务器证书本身**（`common/tls/std_client.go` v1.15.0-alpha.7 `VerifyPinnedCertificate` 只看
 /// `rawCerts[0]`）。订阅固定的若是 CA，导入后该节点握手必败（失败关闭，不放行）——而用户在导入
 /// 这一刻最容易把「连不上」和「订阅刚导入」联系起来，故提示放在导入预览。
-/// 计数口径 = 生成侧会下发的面：reality / naive 下 pin 不下发（builder 写死 None），不计。
 pub fn cert_pin_import_warning(
     servers: &[crate::user_config::server_config::ServerConfig],
 ) -> Option<String> {
-    use crate::user_config::server_config::{Protocol, SecurityMode};
     let n = servers
         .iter()
-        .filter(|s| s.protocol != Protocol::Naive && s.security != Some(SecurityMode::Reality))
+        .filter(|s| pin_is_emitted(s))
         .filter(|s| {
             s.tls_settings.as_ref().is_some_and(|t| {
                 t.certificate_sha256.is_some() || t.certificate_public_key_sha256.is_some()

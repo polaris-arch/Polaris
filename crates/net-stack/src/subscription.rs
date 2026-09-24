@@ -1115,6 +1115,10 @@ fn parse_subscription_bundle_inner(
         },
     };
     let mut bundle = bundle;
+    // 在量体积之前剔：量的应是真正落盘的那份。
+    polaris_config_engine::user_config::tls_pin::drop_unemitted_cert_pins(
+        &mut bundle.parsed.servers,
+    );
     if let Some(limits) = limits {
         bundle.output_metrics = Some(measure_parse_output_typed(&bundle.parsed, limits)?);
     }

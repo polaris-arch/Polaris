@@ -19,7 +19,7 @@ use polaris_config_engine::user_config::protocol_settings::{
     SshSettings, TlsSettings, TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
-use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
+use polaris_config_engine::user_config::tls_pin::{drop_unemitted_cert_pins, keep_valid_cert_pins};
 use serde_yaml::Value;
 
 /// Structure budget for Clash documents.
@@ -1594,6 +1594,8 @@ pub fn parse_clash_proxies(
             fail_reasons[..limit].join("; ")
         ));
     }
+    // proxy-providers 直调本函数、不经 `subscription` 的汇合点，故在这里也剔一次（幂等）。
+    drop_unemitted_cert_pins(&mut result.servers);
 
     result.finish()
 }

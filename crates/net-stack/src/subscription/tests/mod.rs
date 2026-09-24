@@ -866,3 +866,35 @@ https://bob:pw@b.example.com:443#HTTPS-B";
         r.warnings
     );
 }
+
+/// 汇合点剔除覆盖分享链接腿：vless reality 链接的 `pcs` 不落盘，TLS 链接的保留。
+#[test]
+fn share_link_reality_pin_is_dropped_at_the_funnel() {
+    let pin = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+    let text = format!(
+        "vless://u-1@a.com:443?security=reality&sni=s.com&pbk=pk&sid=ab&pcs={pin}#r\n\
+         vless://u-1@a.com:443?security=tls&sni=s.com&pcs={pin}#t\n"
+    );
+    let mut n = 0u32;
+    let mut gen = move || {
+        n += 1;
+        format!("id-{n}")
+    };
+    let r = parse_subscription(
+        &text,
+        "sub",
+        "2026-01-01T00:00:00Z",
+        &mut gen,
+        ImportOrigin::RemoteSubscription,
+    );
+    assert_eq!(r.servers.len(), 2, "{:?}", r.warnings);
+    let pin_of = |name: &str| {
+        r.servers
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.tls_settings.as_ref())
+            .and_then(|t| t.certificate_sha256.clone())
+    };
+    assert_eq!(pin_of("r"), None, "reality 链接的 pin 必须剔除");
+    assert_eq!(pin_of("t").as_deref(), Some(pin), "TLS 链接的 pin 必须保留");
+}

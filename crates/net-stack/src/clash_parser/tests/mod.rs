@@ -808,3 +808,25 @@ fn mihomo_fingerprint_browser_name_is_not_a_pin() {
         None
     );
 }
+
+/// reality 节点带来的 `fingerprint` 不落盘：内核 reality 下静默忽略 pin，存下来只会「看不到、不生效」。
+/// 同批 trojan+TLS 作正向对照，证明剔除只打到 reality。
+#[test]
+fn reality_node_fingerprint_is_not_stored() {
+    let pin = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+    let r = parse_one(&format!(
+        r#"
+- {{name: r, type: vless, server: a.com, port: 443, uuid: u, tls: true, servername: s.com, fingerprint: "{pin}", reality-opts: {{public-key: pk, short-id: ab}}}}
+- {{name: t, type: trojan, server: a.com, port: 443, password: pw, fingerprint: "{pin}"}}
+"#
+    ));
+    assert_eq!(r.servers.len(), 2, "{:?}", r.warnings);
+    let pin_of = |i: usize| {
+        r.servers[i]
+            .tls_settings
+            .as_ref()
+            .and_then(|t| t.certificate_sha256.clone())
+    };
+    assert_eq!(pin_of(0), None, "reality 节点的 pin 必须剔除");
+    assert_eq!(pin_of(1).as_deref(), Some(pin), "TLS 节点的 pin 必须保留");
+}

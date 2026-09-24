@@ -339,9 +339,12 @@ function certPinText(v: FormValue): string | undefined {
 
 /**
  * 证书固定两键的 patch/草稿 —— TCP-TLS 五协议经 `tlsAdvPatch` 带上，hy2/tuic/hysteria 直接展开。
- * reality 下控件隐藏但照写回（理由同 `tlsAdvPatch` 里 engine 那段：草稿与 base 同源，写回即保全）。
+ * **reality 下删键**（不同于 engine 的「隐藏照写回」）：内核 reality 客户端用自己的 verifier 覆盖 pin
+ * 回调、静默不校验，后端也不下发 ⇒ 留着只是一个看不到、不生效的值；且隐藏的非法值会让保存被
+ * `certPinInvalid` 拒绝而用户找不到输入框。与导入侧 `drop_unemitted_cert_pins` 同一判据。
  */
 function certPinPatch(draft: FormValues): Pick<TlsSettings, 'certificateSha256' | 'certificatePublicKeySha256'> {
+  if (whenReality(draft)) return { certificateSha256: undefined, certificatePublicKeySha256: undefined };
   return {
     certificateSha256: certPinText(draft.certSha256),
     certificatePublicKeySha256: certPinText(draft.certPkSha256),
