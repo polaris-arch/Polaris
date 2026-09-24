@@ -198,6 +198,7 @@ fn gate_deps(platform: &str, serve_dir: Option<String>) -> GenerateConfigDeps {
         on_degraded: || {},
         system_dns_takeover_active: false,
         netenv_dhcp_suppressed: false,
+        network_canary_port: None,
     }
 }
 

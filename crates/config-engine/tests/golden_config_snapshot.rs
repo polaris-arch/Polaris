@@ -294,6 +294,7 @@ fn generate_config_matches_polaris_snapshot() {
             on_degraded: || {},
             system_dns_takeover_active: false,
             netenv_dhcp_suppressed: false,
+            network_canary_port: None,
         };
 
         let resolved_ips = BTreeMap::new();
@@ -447,6 +448,7 @@ fn resource_missing_world_never_falls_back_to_plaintext_direct() {
             on_degraded: || {},
             system_dns_takeover_active: false,
             netenv_dhcp_suppressed: false,
+            network_canary_port: None,
         };
 
         let resolved_ips = BTreeMap::new();
@@ -819,6 +821,7 @@ fn scenario_deps_base() -> GenerateConfigDeps {
         on_degraded: || {},
         system_dns_takeover_active: false,
         netenv_dhcp_suppressed: false,
+        network_canary_port: None,
     }
 }
 
@@ -980,6 +983,7 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
             on_degraded: || {},
             system_dns_takeover_active: false,
             netenv_dhcp_suppressed: false,
+            network_canary_port: None,
         };
 
         let resolved_ips = BTreeMap::new();

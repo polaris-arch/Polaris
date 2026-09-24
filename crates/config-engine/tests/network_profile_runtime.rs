@@ -210,13 +210,13 @@ fn run(core: &Path, config: &Path, temp: &TempDir, tag: &str) -> Running {
 }
 
 /// 等回环入站可答（canary 兜底恒有应答）；进程先退出则带日志报错。
-fn wait_answering(running: &mut Running, addr: SocketAddr) {
+fn wait_answering(running: &mut Running, addr: SocketAddr, probe: &str) {
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
         if let Ok(Some(status)) = running.child.try_wait() {
             panic!("sing-box 起核后退出（{status}）：\n{}", running.log());
         }
-        if ask(addr, &canary("ready")).is_some() {
+        if ask(addr, probe).is_some() {
             return;
         }
         thread::sleep(Duration::from_millis(100));
@@ -266,7 +266,7 @@ fn system_source_env_rules_start_and_evaluate_on_bundled_core() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let started = Instant::now();
     let mut running = run(&core, &path, &temp, "np-system");
-    wait_answering(&mut running, addr);
+    wait_answering(&mut running, addr, &canary("ready"));
     assert!(
         hit(addr, &canary("any")),
         "正向 canary（dns-local ∈ 0.0.0.0/0,::/0）必须命中：\n{}",
@@ -278,6 +278,86 @@ fn system_source_env_rules_start_and_evaluate_on_bundled_core() {
     );
     assert!(!hit(addr, &canary("nothing")), "兜底必须 NXDOMAIN");
     assert_alive_without_fatal(&mut running, started, "system 源");
+}
+
+/// **N4 生产 canary 形态**（spec §11 N4 验收 ①②③）：canary 入站、`hijack-dns` 与 canary DNS 规则全部由
+/// 生成器产出（`GenerateConfigDeps::network_canary_port`），本门只剥掉**其它**入站与 services（不建 TUN、
+/// 不监听别的端口），canary 入站原样保留。隐私模式开着（核日志抬到 ≥warn）：命中态走 DNS 查询，不读日志。
+#[test]
+fn production_canary_answers_hit_and_miss_on_bundled_core_in_privacy_mode() {
+    let Some(core) = core_or_skip("网络场景起核门（生产 canary）") else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let port = free_udp_port();
+    let input = user_config(
+        "systemProxy",
+        json!([
+            profile("np-any", &["0.0.0.0/0", "::/0"], "system"),
+            profile("np-neg", &["192.0.2.1/32"], "system"),
+        ]),
+        json!([canary_rule("any", "np-any")]),
+        traffic_rules("np-any"),
+    );
+    let case = SnapshotCase {
+        name: "生产 canary".into(),
+        platform: "linux".into(),
+        input,
+    };
+    let mut deps = full_config_deps(&case, &temp);
+    deps.network_canary_port = Some(port);
+    deps.privacy_mode = true;
+    let outcome =
+        generate_sing_box_config_with_report(&case.input, &BTreeMap::new(), &deps).expect("生成");
+    let plan = outcome
+        .network_canary
+        .expect("两个可用场景 ⇒ 必须生成 canary");
+    assert_eq!(plan.port, port);
+    let domain_of = |id: &str| {
+        plan.canaries
+            .iter()
+            .find(|c| c.profile_id == id)
+            .unwrap_or_else(|| panic!("{id} 没有 canary：{:?}", plan.canaries))
+            .domain
+            .clone()
+    };
+    let mut value = serde_json::to_value(&outcome.config).expect("序列化");
+    let level = value["log"]["level"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        matches!(level.as_str(), "warn" | "error" | "fatal" | "panic"),
+        "隐私模式下核日志级别应 ≥warn（本门要证明命中态不依赖日志），实际 {level:?}"
+    );
+    value["inbounds"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|i| i["tag"] == PROBE_INBOUND);
+    assert_eq!(
+        value["inbounds"].as_array().unwrap().len(),
+        1,
+        "生产配置里必须有 canary 入站"
+    );
+    value.as_object_mut().unwrap().remove("services");
+    let path = write_config(&temp, "np-canary.json", &value);
+    let (ok, diag) = check(&core, &path);
+    assert!(ok, "生产 canary 配置被 check 拒绝：{diag}");
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let started = Instant::now();
+    let mut running = run(&core, &path, &temp, "np-canary");
+    wait_answering(&mut running, addr, &domain_of("np-neg"));
+    assert!(
+        hit(addr, &domain_of("np-any")),
+        "正向 canary（dns-local ∈ 0.0.0.0/0,::/0）必须命中：\n{}",
+        running.log()
+    );
+    assert!(
+        !hit(addr, &domain_of("np-neg")),
+        "反向 canary（192.0.2.1/32）不得命中"
+    );
+    assert_alive_without_fatal(&mut running, started, "生产 canary");
 }
 
 /// 反向对照：绕过剪枝让坏引用进配置 ⇒ `check` 仍 rc=0（拦不住），`run` 必须 FATAL。
@@ -432,7 +512,7 @@ fn dhcp_source_env_rules_start_and_fail_closed_without_privilege() {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let started = Instant::now();
     let mut running = run(&core, &path, &temp, "np-dhcp");
-    wait_answering(&mut running, addr);
+    wait_answering(&mut running, addr, &canary("ready"));
     // dhcp 首次失败是粘滞的（spec K7），等它记下失败再查，避免把「还在取」误读成「不命中」。
     let deadline = Instant::now() + Duration::from_secs(6);
     while !running.log().contains("dhcp: fetch DNS servers") && Instant::now() < deadline {

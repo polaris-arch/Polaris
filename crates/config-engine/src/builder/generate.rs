@@ -28,7 +28,8 @@ use crate::builder::helpers::{build_id_to_tag_map, ServerLike};
 use crate::builder::inbounds::{build_inbounds, InboundsDeps};
 use crate::builder::log::{build_log_config, LogBuildDeps, LogConfigInput};
 use crate::builder::network_env::{
-    builder_skipped_rules, prune_invalid_env_condition_refs, NetworkEnv, ProbeFacts, PrunedEnvRule,
+    apply_network_canaries, builder_skipped_rules, prune_invalid_env_condition_refs,
+    NetworkCanaryPlan, NetworkEnv, ProbeFacts, PrunedEnvRule,
 };
 use crate::builder::orchestration::fix_route_dead_references;
 use crate::builder::outbounds::OutboundsDeps;
@@ -215,6 +216,10 @@ pub struct GenerateConfigDeps {
     /// 后兜底重试一次时置 `true`（spec R4）。解析为 dhcp 的场景规则与引用内置 `builtin-netenv-dhcp`
     /// 的 DNS 规则本次都不生成并进报告。无场景/无内置解析器引用时本值不影响任何输出。
     pub netenv_dhcp_suppressed: bool,
+    /// 网络场景 canary 探针的回环 UDP 端口（spec §6.3 方案 2）。`None` = 不生成 canary；`Some` 也只在
+    /// 有可出 canary 的场景时才生成入站与规则（[`crate::builder::network_env::apply_network_canaries`]），
+    /// 无场景的配置逐字节不变。
+    pub network_canary_port: Option<u16>,
     /// 运行期观测到的 tailnet 地址（serverId → 裸地址）。
     /// 见 [`crate::builder::endpoint_routes::ObservedTailnetAddresses`]。
     ///
@@ -276,6 +281,9 @@ pub struct GenerateOutcome {
     /// 以及后置剪枝剔除的环境引用不合格规则（`rule_id = None`）；另含「带告警仍生成」的条目
     /// （[`PrunedEnvRule::is_warning`]，如 dhcp 源只写了 IPv6 地址段）。**空 = 无剔除、无告警**。
     pub pruned_env_rules: Vec<PrunedEnvRule>,
+    /// 本次写进配置的网络场景 canary（端口 + 场景 → 查询域名）。`None` = 没有 canary 入站与规则；
+    /// 运行时据此探测「当前是否处在该网络」。
+    pub network_canary: Option<NetworkCanaryPlan>,
 }
 
 /// [`generate_sing_box_config`] + 剔除报告。
@@ -578,6 +586,12 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         );
     }
 
+    // ── 12c. 网络场景 canary 探针（spec §6.3 方案 2）：回环 UDP 入站 + hijack-dns + dns.rules 最前的
+    // canary 规则。放在后置剪枝**之后**：canary 的环境项来自同一份已按生成 server 集校验过的
+    // `network_env`，不能让剪枝把正向规则剔掉而留下兜底（那会把「不知道」报成「不在该网络」）。
+    let network_canary =
+        apply_network_canaries(&mut singbox, &network_env, deps.network_canary_port);
+
     // ── 13. 调试日志（L3631-3634）───────────────────────────────────────────────
     let rule_set_count = singbox
         .route
@@ -626,6 +640,7 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
             .into_iter()
             .collect(),
         pruned_env_rules,
+        network_canary,
     })
 }
 

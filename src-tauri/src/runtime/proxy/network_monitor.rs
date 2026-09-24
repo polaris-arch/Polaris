@@ -68,6 +68,9 @@ impl ProxyRuntime {
     /// 显式绑定失效 fail-closed（保留当前核、告警、不改默认出口）；推断绑定失效或路由变化则重启
     /// TUN，在接口撤销后重新读取真实物理路由。
     async fn handle_network_change(self: &Arc<Self>, impact: NetworkChangeImpact) {
+        // 网络场景命中态：旧网络的结果先作废（未知），canary 探测任务被唤醒立即重探。放在最前：
+        // 下面几条腿可能 await 很久或调度重启，命中态不该在这期间继续显示旧网络的判定。
+        self.invalidate_network_canary();
         self.reconcile_system_dns_best_effort().await;
         let Some(config) = self
             .current_config

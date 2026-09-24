@@ -43,6 +43,7 @@ fn deps(platform: &str, takeover: bool, custom_rules_dir: &str) -> GenerateConfi
         own_lan_cidrs: vec![],
         system_dns_takeover_active: takeover,
         netenv_dhcp_suppressed: false,
+        network_canary_port: None,
         log: |_, _| {},
         on_degraded: || {},
     }
@@ -878,7 +879,7 @@ fn n2a_resolved_probe_reports_v6_only_warning_as_available() {
     assert_eq!(
         json,
         json!({"profileId": "np", "probeSource": "dhcp", "available": true,
-            "reason": "dhcpIpv6Only"})
+            "reason": "dhcpIpv6Only", "matched": null})
     );
     let clean = resolved_probe(
         &np(NetworkProbeSource::System, &["10.0.0.0/8"], &[]),
@@ -1103,4 +1104,191 @@ fn n2_builtin_dhcp_status_matches_generation_side_b() {
             "查询与生成侧 B 必须同判据：{facts:?}"
         );
     }
+}
+
+// ── N4 canary 探针（spec §6.3 方案 2 / §5.4）─────────────────────────────────────
+
+const CANARY_PORT: u16 = 53999;
+
+struct CanaryOut {
+    json: Value,
+    plan: Option<NetworkCanaryPlan>,
+}
+
+fn generate_canary(
+    cfg: &UserConfig,
+    platform: &str,
+    port: Option<u16>,
+    tweak: impl FnOnce(&mut GenerateConfigDeps),
+) -> CanaryOut {
+    let mut d = deps(platform, false, "/fake/custom-rules");
+    d.network_canary_port = port;
+    tweak(&mut d);
+    let outcome =
+        generate_sing_box_config_with_report(cfg, &BTreeMap::new(), &d).expect("生成配置");
+    CanaryOut {
+        json: serde_json::to_value(&outcome.config).expect("序列化"),
+        plan: outcome.network_canary,
+    }
+}
+
+fn canary_inbounds(json: &Value) -> Vec<&Value> {
+    json["inbounds"]
+        .as_array()
+        .expect("inbounds")
+        .iter()
+        .filter(|i| i["tag"] == NETWORK_CANARY_INBOUND_TAG)
+        .collect()
+}
+
+#[test]
+fn n4_canary_rules_lead_dns_rules_and_hijack_leads_route_rules() {
+    let cfg = config(json!({
+        "networkProfiles": [
+            profile("np-a", &["10.20.0.0/16"], &["corp.example"], "system"),
+            json!({"id": "np-off", "name": "off", "enabled": false,
+                "match": {"dnsServerCidrs": ["10.0.0.0/8"]}, "probe": "system"}),
+            profile("np-dhcp", &["10.0.0.0/8"], &[], "dhcp"),
+        ],
+        "dnsRules": [dns_rule("r-dns", "corp.example", Some("np-a"), domestic())],
+    }));
+    let out = generate_canary(&cfg, "linux", Some(CANARY_PORT), |_| {});
+    let plan = out.plan.expect("有可用场景 ⇒ 必须生成 canary");
+    assert_eq!(plan.port, CANARY_PORT);
+    assert_eq!(
+        plan.canaries,
+        vec![NetworkCanary {
+            profile_id: "np-a".into(),
+            domain: format!("p0.{NETWORK_CANARY_SUFFIX}"),
+        }],
+        "停用场景与本机不可用（linux 系统代理 dhcp）的场景都不出 canary"
+    );
+    let domain = format!("p0.{NETWORK_CANARY_SUFFIX}");
+    let rules = out.json["dns"]["rules"].as_array().expect("dns.rules");
+    let head: Vec<&Value> = rules.iter().take(3).collect();
+    for rule in &head {
+        assert_eq!(rule["domain"], json!([domain]), "{rule}");
+        assert_eq!(
+            rule["inbound"],
+            json!([NETWORK_CANARY_INBOUND_TAG]),
+            "{rule}"
+        );
+        assert_eq!(rule["action"], "predefined", "{rule}");
+    }
+    assert_eq!(
+        head[0]["dns_server_address"],
+        json!({"dns-local": ["10.20.0.0/16"]})
+    );
+    assert_eq!(
+        head[1]["dns_search_domain"],
+        json!({"dns-local": ["corp.example."]})
+    );
+    for hit in &head[..2] {
+        assert_eq!(hit["rcode"], "NOERROR");
+        assert_eq!(hit["answer"], json!([format!("{domain}. IN A 127.0.0.1")]));
+        assert_eq!(
+            env_keys(hit).len(),
+            1,
+            "每条正向规则只带一种环境项（D2）：{hit}"
+        );
+    }
+    assert_eq!(head[2]["rcode"], "NXDOMAIN");
+    assert!(env_keys(head[2]).is_empty(), "兜底不带环境项：{}", head[2]);
+    assert_eq!(
+        rules
+            .iter()
+            .filter(|r| r.to_string().contains(NETWORK_CANARY_SUFFIX))
+            .count(),
+        3,
+        "canary 规则只在最前那一组"
+    );
+
+    let inbounds = canary_inbounds(&out.json);
+    assert_eq!(inbounds.len(), 1);
+    assert_eq!(
+        *inbounds[0],
+        json!({"type": "direct", "tag": NETWORK_CANARY_INBOUND_TAG,
+            "listen": "127.0.0.1", "listen_port": CANARY_PORT, "network": "udp"})
+    );
+    assert_eq!(
+        out.json["route"]["rules"][0],
+        json!({"inbound": [NETWORK_CANARY_INBOUND_TAG], "action": "hijack-dns"})
+    );
+}
+
+#[test]
+fn n4_no_profile_or_no_port_emits_no_canary_byte() {
+    // ④ 无场景：给了端口也一个字节不变（与不给端口逐字节相同）。
+    let plain = config(json!({
+        "dnsRules": [dns_rule("r-dns", "corp.example", None, domestic())],
+    }));
+    let with_port = generate_canary(&plain, "linux", Some(CANARY_PORT), |_| {});
+    let without = generate_canary(&plain, "linux", None, |_| {});
+    assert!(with_port.plan.is_none());
+    assert_eq!(
+        with_port.json, without.json,
+        "无场景时 canary 端口不得改动配置"
+    );
+    assert!(!with_port.json.to_string().contains(NETWORK_CANARY_SUFFIX));
+
+    // 有场景但没端口（分配失败）：同样不生成。
+    let cfg = config(json!({
+        "networkProfiles": [profile("np-a", &["10.20.0.0/16"], &[], "system")],
+    }));
+    let out = generate_canary(&cfg, "linux", None, |_| {});
+    assert!(out.plan.is_none());
+    assert!(canary_inbounds(&out.json).is_empty());
+    assert!(!out.json.to_string().contains(NETWORK_CANARY_SUFFIX));
+}
+
+#[test]
+fn n4_canary_inbound_stays_loopback_under_allow_lan_and_privacy() {
+    let cfg = config(json!({
+        "allowLan": true,
+        "networkProfiles": [profile("np-a", &["10.20.0.0/16"], &[], "system")],
+    }));
+    let out = generate_canary(&cfg, "linux", Some(CANARY_PORT), |d| d.privacy_mode = true);
+    assert!(
+        out.plan.is_some(),
+        "隐私模式不影响 canary 生成（命中态不依赖日志）"
+    );
+    let inbounds = canary_inbounds(&out.json);
+    assert_eq!(inbounds.len(), 1);
+    assert_eq!(
+        inbounds[0]["listen"], "127.0.0.1",
+        "allowLan 只放开 mixed-in"
+    );
+    let mixed = out.json["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["tag"] == "mixed-in")
+        .expect("mixed-in");
+    assert_eq!(
+        mixed["listen"], "::",
+        "正向对照：allowLan 确实生效在 mixed-in 上"
+    );
+}
+
+#[test]
+fn n4_dhcp_profile_gets_canary_only_when_netenv_is_emitted_for_rules() {
+    let profiles = json!([profile("np-dhcp", &["10.0.0.0/8"], &[], "dhcp")]);
+    // linux TUN：dhcp 可用；没有规则引用 ⇒ 不生成 dns-netenv ⇒ 不为显示命中态多绑一次 UDP 68。
+    let idle = config(json!({"proxyModeType": "tun", "networkProfiles": profiles.clone()}));
+    let out = generate_canary(&idle, "linux", Some(CANARY_PORT), |_| {});
+    assert!(out.plan.is_none(), "{:?}", out.plan);
+    assert!(!out.json.to_string().contains(NETENV_DNS_TAG));
+
+    let used = config(json!({
+        "proxyModeType": "tun",
+        "networkProfiles": profiles,
+        "dnsRules": [dns_rule("r-dns", "corp.example", Some("np-dhcp"), domestic())],
+    }));
+    let out = generate_canary(&used, "linux", Some(CANARY_PORT), |_| {});
+    let plan = out.plan.expect("规则引用 ⇒ dns-netenv 生成 ⇒ 出 canary");
+    assert_eq!(plan.canaries.len(), 1);
+    assert_eq!(
+        out.json["dns"]["rules"][0]["dns_server_address"],
+        json!({"dns-netenv": ["10.0.0.0/8"]})
+    );
 }

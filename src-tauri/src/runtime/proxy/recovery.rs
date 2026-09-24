@@ -236,6 +236,8 @@ impl ProxyRuntime {
                         me.mesh.exit_route_reset_state().await;
                         // 核已死 → 停通用网络 watcher；自愈重启后由 start_inner 重起。
                         me.stop_network_watcher();
+                        // 核已死 → 网络场景命中态回到未知；自愈重启就绪后重新 arm。
+                        me.disarm_network_canary();
                         if let Ok(mut state) = me.runtime_binding_state.lock() {
                             *state = RuntimeBindingState::default();
                         }

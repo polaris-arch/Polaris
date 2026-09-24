@@ -259,14 +259,14 @@ fn resolved_sources_query_uses_generation_facts() {
     assert_eq!(
         got,
         serde_json::json!([{"profileId": "np", "probeSource": "dhcp", "available": false,
-            "reason": "dhcpNeedsPrivilege"}])
+            "reason": "dhcpNeedsPrivilege", "matched": null}])
     );
     cfg["proxyModeType"] = serde_json::json!("tun");
     let got = serde_json::to_value(rt.network_profile_resolved_sources(&cfg).unwrap()).unwrap();
     assert_eq!(
         got,
         serde_json::json!([{"profileId": "np", "probeSource": "dhcp", "available": true,
-            "reason": null}])
+            "reason": null, "matched": null}])
     );
     assert!(rt.suppress_netenv_after_fatal(Some(CoreFatalKind::DhcpMonitorMissing)));
     let got = serde_json::to_value(rt.network_profile_resolved_sources(&cfg).unwrap()).unwrap();
@@ -300,5 +300,174 @@ fn builtin_dhcp_status_query_uses_generation_facts() {
     assert_eq!(
         json(&rt, &cfg),
         serde_json::json!({"available": false, "reason": "dhcpMonitorMissing"})
+    );
+}
+
+// ══════════════ N4 canary 命中态接线（spec §11 N4）══════════════
+
+/// 命中态进 IPC：运行核的探测结果经 `matched` 给出；按磁盘配置本机不可用的场景恒 `null`；
+/// 核停（disarm）⇒ 全部 `null` 且发一次变更信号；网络变化（invalidate）同样回到 `null` 并发信号。
+#[tokio::test(start_paused = true)]
+async fn canary_matches_flow_into_resolved_sources_and_reset_on_stop() {
+    use super::super::network_canary::{run_canary_probe, CANARY_PROBE_INTERVAL};
+    use polaris_config_engine::builder::network_env::{NetworkCanary, NetworkCanaryPlan};
+    if Platform::parse(platform_tag()) != Platform::Linux {
+        return;
+    }
+    let (rt, _dir) = test_runtime();
+    let signals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        network_match_changed: Arc::clone(&signals),
+        ..Default::default()
+    }));
+    // np-sys：system 源（可用）；np-dhcp：linux 系统代理下 dhcp 不可用。
+    let cfg = serde_json::json!({
+        "servers": [], "selectedServerId": "__direct__", "proxyMode": "smart",
+        "proxyModeType": "systemProxy", "configSchemaVersion": 4,
+        "networkProfiles": [
+            {"id": "np-sys", "name": "a", "enabled": true, "probe": "system",
+                "match": {"dnsServerCidrs": ["10.0.0.0/8"]}},
+            {"id": "np-dhcp", "name": "b", "enabled": true, "probe": "dhcp",
+                "match": {"dnsServerCidrs": ["10.0.0.0/8"]}},
+        ],
+    });
+    let matched = |rt: &ProxyRuntime| -> Vec<Value> {
+        serde_json::to_value(rt.network_profile_resolved_sources(&cfg).unwrap())
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["matched"].clone())
+            .collect()
+    };
+    assert_eq!(
+        matched(&rt),
+        vec![Value::Null, Value::Null],
+        "核未运行 ⇒ 未知"
+    );
+
+    let plan = NetworkCanaryPlan {
+        port: 53999,
+        canaries: ["np-sys", "np-dhcp"]
+            .iter()
+            .enumerate()
+            .map(|(k, id)| NetworkCanary {
+                profile_id: (*id).into(),
+                domain: format!("p{k}.x.invalid"),
+            })
+            .collect(),
+    };
+    let (session, _) = rt.network_canary.arm(Some(plan));
+    let state = Arc::clone(&rt.network_canary);
+    let probe = tokio::spawn(async move {
+        run_canary_probe(
+            &state,
+            session,
+            CANARY_PROBE_INTERVAL,
+            |_, _| std::future::ready(Some(true)),
+            || {},
+        )
+        .await;
+    });
+    for _ in 0..50 {
+        if rt.network_profile_matched("np-sys").is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        matched(&rt),
+        vec![Value::Bool(true), Value::Null],
+        "可用场景显示内核结果；本机不可用的场景即使运行核里有结果也不显示"
+    );
+
+    let before = signals.load(std::sync::atomic::Ordering::SeqCst);
+    rt.invalidate_network_canary();
+    assert_eq!(
+        matched(&rt),
+        vec![Value::Null, Value::Null],
+        "网络变化 ⇒ 立即未知"
+    );
+    assert_eq!(
+        signals.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1
+    );
+
+    rt.disarm_network_canary();
+    assert_eq!(matched(&rt), vec![Value::Null, Value::Null], "核停 ⇒ 未知");
+    for _ in 0..50 {
+        if probe.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(probe.is_finished(), "核停后探测任务必须退场");
+}
+
+/// 接线守卫：起核就绪 arm、停核 / 崩溃 disarm、网络变化 invalidate，canary 口按轮分配进 deps。
+/// 行为测试够不着（真起核 + 真网络变化 = 真机门）。
+#[test]
+fn network_canary_is_wired_into_lifecycle_legs() {
+    let code = module_code("runtime/proxy");
+    let compact = |sig: &str| -> String { method_body(&code, sig).split_whitespace().collect() };
+    let start = compact("    pub(super) async fn start_inner(");
+    assert_eq!(
+        start
+            .matches("self.arm_network_canary(my_gen,network_canary)")
+            .count(),
+        1,
+        "起核就绪必须恰好 arm 一次"
+    );
+    assert!(
+        start.contains("deps.network_canary_port=self.resolve_network_canary_port("),
+        "canary 口必须随每轮端口一起分配进 deps"
+    );
+    let stop = compact("    pub(super) async fn stop_inner(");
+    assert_eq!(
+        stop.matches("self.disarm_network_canary()").count(),
+        1,
+        "停核必须 disarm"
+    );
+    let crash = compact("    pub(super) fn spawn_crash_monitor(");
+    assert_eq!(
+        crash.matches("me.disarm_network_canary()").count(),
+        1,
+        "崩溃腿必须 disarm"
+    );
+    let change = compact("    async fn handle_network_change(");
+    let invalidate = change
+        .find("self.invalidate_network_canary();")
+        .expect("网络变化必须作废命中态");
+    let first_await = change.find(".await").expect("切片自检：该方法体内有 await");
+    assert!(
+        invalidate < first_await,
+        "网络变化必须在任何 await 之前作废命中态"
+    );
+}
+
+/// canary 探针口：有场景才分配（按 UDP 可绑取），且不与本轮其它口撞；无场景不分配。
+#[test]
+fn network_canary_port_is_allocated_only_with_profiles_and_avoids_start_ports() {
+    let (rt, _dir) = test_runtime();
+    let with: UserConfig = serde_json::from_value(serde_json::json!({
+        "servers": [], "selectedServerId": "__direct__", "configSchemaVersion": 4,
+        "mixedPort": 17890,
+        "networkProfiles": [{"id": "np", "name": "a", "enabled": true, "probe": "system",
+            "match": {"dnsServerCidrs": ["10.0.0.0/8"]}}],
+    }))
+    .unwrap();
+    let port = rt
+        .resolve_network_canary_port(&with, 9090, 19091, 19092, 19093)
+        .expect("有场景 ⇒ 分配 canary 口");
+    assert!(
+        ![0, 9090, 17890, 19091, 19092, 19093].contains(&port),
+        "{port}"
+    );
+    let mut without = with.clone();
+    without.network_profiles.clear();
+    assert_eq!(
+        rt.resolve_network_canary_port(&without, 9090, 19091, 19092, 19093),
+        None,
+        "无场景不分配（无场景的配置不得出现 canary 入站）"
     );
 }

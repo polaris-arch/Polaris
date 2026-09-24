@@ -293,6 +293,7 @@ export const IPC_CHANNELS = {
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
   EVENT_PROXY_PENDING_CHANGES: 'event:proxyPendingChanges', // R2 待应用差集 PUSH：switch_mode 末尾推 {added, modified, removed}（与 pull 同构）；待应用操作条数据源
   EVENT_PROXY_INVALID_NODES: 'proxy:invalid-nodes', // 启动 gate 剔除的非法节点（空数组=清陈旧标灰）
+  EVENT_NETWORK_PROFILE_MATCH_CHANGED: 'event:networkProfileMatchChanged', // 网络场景命中态变更（无载荷，收到即重拉 NETWORK_PROFILE_RESOLVED_SOURCES）
   EVENT_IP_INFO_UPDATED: 'event:ipInfoUpdated',
   EVENT_UNLOCK_PROGRESS: 'event:unlockProgress', // 解锁检测：单个服务 settle 逐个点亮
   EVENT_UNLOCK_INVALIDATED: 'event:unlockInvalidated', // 解锁检测：切节点/起停代理 → 缓存失效，渲染端复位重跑

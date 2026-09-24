@@ -214,6 +214,12 @@ export interface ResolvedProbe {
    * 告警（available 仍为 true）：`dhcpIpv6Only`（dhcp 源只写了 IPv6 地址段，永不命中）。
    */
   reason: ProbeReason | null;
+  /**
+   * 「当前是否处在该网络」（N4）：运行核的 canary 探针结果，内核亲自求值。
+   * true 命中 / false 未命中 / null 未知（核未运行、本场景本次没有探针、网络刚变化还没探完、或本机不可用）。
+   * 变化时后端发无载荷事件 `EVENT_NETWORK_PROFILE_MATCH_CHANGED`，渲染端重拉本接口。
+   */
+  matched: boolean | null;
 }
 
 /** 系统进程信息（进程快速选择器用）。 */

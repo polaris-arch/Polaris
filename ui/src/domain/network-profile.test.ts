@@ -13,8 +13,11 @@ import {
   probeInputsDiffer,
   probeReasonKey,
   probeWarningKey,
+  profileMatch,
   profileRowStatus,
   PROBE_WARNING_KEYS,
+  PROFILE_MATCH_DOT_CLASS,
+  PROFILE_MATCH_KEYS,
   profileRefCounts,
   ruleProfileBadge,
   validateNetworkProfileDraft,
@@ -41,6 +44,7 @@ const resolved = (over: Partial<ResolvedProbe> = {}): ResolvedProbe => ({
   probeSource: 'system',
   available: true,
   reason: null,
+  matched: null,
   ...over,
 });
 
@@ -206,13 +210,40 @@ describe('ruleProfileBadge', () => {
       state: 'ok',
       name: '公司网络',
       source: 'dhcp',
+      match: 'unknown',
     });
-    expect(ruleProfileBadge(rule('r', 'np-corp'), profiles, null)).toEqual({ state: 'ok', name: '公司网络', source: undefined });
+    expect(ruleProfileBadge(rule('r', 'np-corp'), profiles, null)).toEqual({
+      state: 'ok',
+      name: '公司网络',
+      source: undefined,
+      match: 'unknown',
+    });
   });
   it('后端告警 dhcpIpv6Only ⇒ warning（规则照常生成，但判据永不命中）', () => {
     expect(
       ruleProfileBadge(rule('r', 'np-corp'), profiles, [resolved({ probeSource: 'dhcp', reason: 'dhcpIpv6Only' })]),
-    ).toEqual({ state: 'warning', name: '公司网络', warningKey: 'rules.networkProfile.ipv6DhcpWarn' });
+    ).toEqual({ state: 'warning', name: '公司网络', warningKey: 'rules.networkProfile.ipv6DhcpWarn', match: 'unknown' });
+  });
+  it('徽标带内核命中态（N4）：命中 / 未命中 / 未知', () => {
+    const at = (matched: boolean | null) => ruleProfileBadge(rule('r', 'np-corp'), profiles, [resolved({ matched })]);
+    expect(at(true)).toMatchObject({ state: 'ok', match: 'matched' });
+    expect(at(false)).toMatchObject({ state: 'ok', match: 'unmatched' });
+    expect(at(null)).toMatchObject({ state: 'ok', match: 'unknown' });
+  });
+});
+
+describe('profileMatch（N4 命中态：只翻译后端 matched，不推算）', () => {
+  it('true / false / null / 缺项 / 拿不到结果', () => {
+    expect(profileMatch('np-corp', [resolved({ matched: true })])).toBe('matched');
+    expect(profileMatch('np-corp', [resolved({ matched: false })])).toBe('unmatched');
+    expect(profileMatch('np-corp', [resolved({ matched: null })])).toBe('unknown');
+    expect(profileMatch('np-other', [resolved({ matched: true })])).toBe('unknown');
+    expect(profileMatch('np-corp', null)).toBe('unknown');
+  });
+  it('未知与未命中在圆点形状与文案上都不同（不只靠颜色）', () => {
+    expect(PROFILE_MATCH_DOT_CLASS.unknown).not.toBe(PROFILE_MATCH_DOT_CLASS.unmatched);
+    expect(new Set(Object.values(PROFILE_MATCH_DOT_CLASS)).size).toBe(3);
+    expect(new Set(Object.values(PROFILE_MATCH_KEYS)).size).toBe(3);
   });
 });
 
@@ -252,7 +283,20 @@ describe('profileRowStatus（停用场景只显示「已停用」）', () => {
       kind: 'probe',
       display: { kind: 'ok', source: 'dhcp' },
       warningKey: 'rules.networkProfile.ipv6DhcpWarn',
+      match: 'unknown',
     });
-    expect(profileRowStatus(profile(), null)).toEqual({ kind: 'probe', display: { kind: 'unknown' }, warningKey: null });
+    expect(profileRowStatus(profile(), null)).toEqual({
+      kind: 'probe',
+      display: { kind: 'unknown' },
+      warningKey: null,
+      match: null,
+    });
+  });
+  it('命中态只对本机可用的场景显示（N4）', () => {
+    expect(profileRowStatus(profile(), [resolved({ matched: true })])).toMatchObject({ match: 'matched' });
+    expect(profileRowStatus(profile(), [resolved({ matched: false })])).toMatchObject({ match: 'unmatched' });
+    expect(
+      profileRowStatus(profile(), [resolved({ available: false, reason: 'dhcpNeedsPrivilege', matched: true })]),
+    ).toMatchObject({ match: null });
   });
 });

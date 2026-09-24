@@ -17,7 +17,11 @@ import type { Rule, RuleCondition } from '@/contracts/types';
 import { ruleConditions, ruleDnsEffect, ruleRouteEffect } from '@/domain/rules';
 import { RULE_TYPE_CATEGORY } from '@/domain/rules';
 import { cn } from '@/lib/utils';
-import type { RuleProfileBadge } from '@/domain/network-profile';
+import {
+  PROFILE_MATCH_DOT_CLASS,
+  PROFILE_MATCH_KEYS,
+  type RuleProfileBadge,
+} from '@/domain/network-profile';
 import { useHoverCard, HoverCardPanel } from '@/components/hover-cards/HoverCard';
 import { RuleHoverCardContent } from '@/components/hover-cards/RuleHoverCard';
 
@@ -160,8 +164,10 @@ function NetworkProfilePill({ badge }: { badge: RuleProfileBadge }) {
     );
   }
   if (badge.state === 'warning') {
+    const matchText = t(PROFILE_MATCH_KEYS[badge.match]);
     return (
-      <span className="pill warn" data-tip={t(badge.warningKey)}>
+      <span className="pill warn" data-tip={`${t(badge.warningKey)} · ${matchText}`}>
+        <span className={PROFILE_MATCH_DOT_CLASS[badge.match]} role="img" aria-label={matchText} />
         {text}
       </span>
     );
@@ -176,22 +182,21 @@ function NetworkProfilePill({ badge }: { badge: RuleProfileBadge }) {
       </span>
     );
   }
+  // 命中态圆点（N4）：内核 canary 的结果；提示里写成文字，未知与未命中不只靠颜色区分。
+  const matchText = t(PROFILE_MATCH_KEYS[badge.match]);
+  const tip = badge.source
+    ? t('rules.networkProfile.badgeTip', {
+        name: badge.name,
+        source: t(
+          badge.source === 'dhcp'
+            ? 'rules.networkProfile.sourceDhcp'
+            : 'rules.networkProfile.sourceSystem',
+        ),
+      })
+    : t('rules.networkProfile.badgeTipNoSource', { name: badge.name });
   return (
-    <span
-      className="pill region"
-      data-tip={
-        badge.source
-          ? t('rules.networkProfile.badgeTip', {
-              name: badge.name,
-              source: t(
-                badge.source === 'dhcp'
-                  ? 'rules.networkProfile.sourceDhcp'
-                  : 'rules.networkProfile.sourceSystem',
-              ),
-            })
-          : t('rules.networkProfile.badgeTipNoSource', { name: badge.name })
-      }
-    >
+    <span className="pill region" data-tip={`${tip} · ${matchText}`}>
+      <span className={PROFILE_MATCH_DOT_CLASS[badge.match]} role="img" aria-label={matchText} />
       {text}
     </span>
   );

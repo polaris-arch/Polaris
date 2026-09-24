@@ -1826,6 +1826,10 @@ describe('⑩ 网络场景面板 / 规则弹窗「生效网络」（五语种）
   const ERR_LINE = ['errName', 'errNoCriteria', 'errCidr', 'errDomain', 'deleteRefsWarn'].map((k) => NP + k);
   const TIPS = ['cidrsHint', 'domainsHint', 'probeHint', 'enabledHint', 'ruleFieldHint'].map((k) => NP + k);
   const SEG = ['probeAuto', 'probeSystem', 'probeDhcp'].map((k) => NP + k);
+  // N4 命中态行（`.card-sub.np-match`：7px 圆点 + 6px gap + 文案）。
+  const MATCH = ['matchIn', 'matchOut', 'matchUnknown'].map((k) => NP + k);
+  const MATCH_DOT_AND_GAP =
+    px(decl('./prototype.css', '.dot', 'width')) + px(decl('./screens.css', '.np-match', 'gap'));
   const labelWrap = wraps(FLD_LABEL_SELS);
   const box = (where: string, avail: number, fontSize: number, maxLines: number): Box => ({
     where,
@@ -1859,17 +1863,18 @@ describe('⑩ 网络场景面板 / 规则弹窗「生效网络」（五语种）
       expect(panel.includes(`'${k}'`), `NetworkProfilePanel 已不再消费 ${k}`).toBe(true);
     }
     const domain = src('../domain/network-profile.ts');
-    for (const k of ['ipv6DhcpWarn', 'reasonProfileInvalid', 'reasonDhcpNeedsPrivilege', 'reasonSystemNoSearchDomain', 'reasonDhcpMonitorMissing'])
+    for (const k of ['ipv6DhcpWarn', 'reasonProfileInvalid', 'reasonDhcpNeedsPrivilege', 'reasonSystemNoSearchDomain', 'reasonDhcpMonitorMissing', 'matchIn', 'matchOut', 'matchUnknown'])
       expect(domain.includes(`'${NP}${k}'`), `domain/network-profile 已不再消费 ${NP}${k}`).toBe(true);
     expect(rule.includes(`'${LABEL_RULE}'`) && rule.includes(`'${NP}ruleFieldHint'`), 'RuleDialog 不再消费生效网络字段').toBe(true);
     for (const loc of LOCALES)
-      for (const k of [...LABELS_ENTRY, LABEL_RULE, SWT_LABEL, ...CARD_SUB, ...ERR_LINE, ...TIPS, ...SEG])
+      for (const k of [...LABELS_ENTRY, LABEL_RULE, SWT_LABEL, ...CARD_SUB, ...ERR_LINE, ...TIPS, ...SEG, ...MATCH])
         expect(DICT[loc][k], `${loc} 缺键 ${k}`).toBeTruthy();
   });
 
   it('几何链从 CSS 现场解出', () => {
     expect([seg2GapPx, seg2PadX, seg2BorderX, seg2BtnFont, seg2BtnPadX]).toEqual([3, 6, 2, 12.5, 30]);
     expect([errLineFont, warnLineFont, warnLineIcon, warnLineGap]).toEqual([11, 11, 14, 7]);
+    expect(MATCH_DOT_AND_GAP, '命中态行：圆点宽 + gap').toBe(13);
     expect(px(decl('./prototype.css', '.err-line', 'font-size')), '.err-line 两份副本分叉').toBe(errLineFont);
   });
 
@@ -1886,6 +1891,8 @@ describe('⑩ 网络场景面板 / 规则弹窗「生效网络」（五语种）
         DICT[loc][SWT_LABEL],
       );
       for (const k of CARD_SUB) check(over, box('⑩ 说明行 .card-sub', FLD_AVAIL, cardSubFont, CARD_SUB_MAX), loc, k, DICT[loc][k]);
+      for (const k of MATCH)
+        check(over, box('⑩ 命中态行 .card-sub.np-match', FLD_AVAIL - MATCH_DOT_AND_GAP, cardSubFont, CARD_SUB_MAX), loc, k, DICT[loc][k]);
       for (const k of ERR_LINE) check(over, box('⑩ 错误行 .err-line', FLD_AVAIL, errLineFont, ERR_LINE_MAX), loc, k, DICT[loc][k]);
       for (const text of unavailableTexts(loc))
         check(over, box('⑩ 不可用行 .err-line', FLD_AVAIL, errLineFont, ERR_LINE_MAX), loc, NP + 'probeUnavailable', text);

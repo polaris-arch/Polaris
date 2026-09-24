@@ -555,8 +555,15 @@ fn bundled_core_accepts_network_profile_rules_in_every_shape() {
         };
         let mut deps = full_config_deps(&case, &temp);
         deps.system_dns_takeover_active = takeover;
+        // N4：canary 探针（回环 UDP direct 入站 + hijack-dns + canary DNS 规则）一并过四平台 check。
+        deps.network_canary_port = Some(19553);
         let outcome = generate_sing_box_config_with_report(&case.input, &BTreeMap::new(), &deps)
             .unwrap_or_else(|e| panic!("{name} 生成失败: {e}"));
+        assert_eq!(
+            outcome.network_canary.as_ref().map(|p| p.canaries.len()),
+            Some(2),
+            "{name}：两个场景都可用 ⇒ 各出一个 canary"
+        );
         assert!(
             outcome.pruned_env_rules.is_empty(),
             "{name}：夹具里不该有被剪的场景规则：{:?}",

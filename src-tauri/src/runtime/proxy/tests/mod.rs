@@ -662,6 +662,8 @@ struct RecordingErrorEmitter {
     exit_blocked_marks: ExitBlockedMarks,
     pending_changes: PendingChangesEvents,
     lifecycle: LifecycleEvents,
+    /// 网络场景命中态变更信号次数。
+    network_match_changed: Arc<std::sync::atomic::AtomicUsize>,
     /// 预置的隐私模式活态（生产侧读 `commands::config` 的进程状态机；mock 直接回放）。
     privacy_mode: bool,
     /// 门被调用的次数（`0` = 这条入口**根本没经过门** → 变异「某入口绕过门」立刻转红）。
@@ -749,6 +751,9 @@ impl ProxyErrorEmitter for RecordingErrorEmitter {
     }
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent) {
         self.lifecycle.lock().unwrap().push(event.clone());
+    }
+    fn emit_network_profile_match_changed(&self) {
+        self.network_match_changed.fetch_add(1, Ordering::SeqCst);
     }
 
     /// 记录一次门调用 + 回放预置决策（默认 `Abort`：mock 绝不代替用户点「安装」）。

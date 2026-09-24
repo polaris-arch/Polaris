@@ -176,8 +176,8 @@ export type RuleProfileBadge =
   | { state: 'missing' }
   | { state: 'disabled'; name: string }
   | { state: 'unavailable'; name: string; reasonKey: string }
-  | { state: 'warning'; name: string; warningKey: string }
-  | { state: 'ok'; name: string; source?: 'system' | 'dhcp' };
+  | { state: 'warning'; name: string; warningKey: string; match: ProfileMatch }
+  | { state: 'ok'; name: string; source?: 'system' | 'dhcp'; match: ProfileMatch };
 
 export function ruleProfileBadge(
   rule: Rule,
@@ -194,9 +194,42 @@ export function ruleProfileBadge(
     return { state: 'unavailable', name: profile.name, reasonKey: probeReasonKey(hit.reason) };
   }
   const warningKey = probeWarningKey(hit);
-  if (warningKey) return { state: 'warning', name: profile.name, warningKey };
-  return { state: 'ok', name: profile.name, source: hit?.probeSource };
+  const match = profileMatch(id, resolved);
+  if (warningKey) return { state: 'warning', name: profile.name, warningKey, match };
+  return { state: 'ok', name: profile.name, source: hit?.probeSource, match };
 }
+
+/**
+ * 「当前是否处在该网络」（N4，spec §6.3 方案 2）：**内核亲自求值**的 canary 结果，后端经
+ * `ResolvedProbe.matched` 给出，渲染端只翻成显示态，不推算。
+ *  - `matched` / `unmatched`：内核判定命中 / 未命中；
+ *  - `unknown`：核未运行、本场景本次没有探针、网络刚变化还没探完、或拿不到后端结果（`matched: null` / 缺项）。
+ *
+ * 未知与未命中**必须可区分**：前者是「不知道」，后者是内核说「不在」—— dhcp 首次失败粘滞（spec R1）时
+ * 用户看到的正是持续的「不在」，那是要引导的真问题，不能和「代理没开」混成一种样子。
+ */
+export type ProfileMatch = 'matched' | 'unmatched' | 'unknown';
+
+export function profileMatch(profileId: string, resolved: readonly ResolvedProbe[] | null): ProfileMatch {
+  const value = resolved?.find((r) => r.profileId === profileId)?.matched;
+  if (value === true) return 'matched';
+  if (value === false) return 'unmatched';
+  return 'unknown';
+}
+
+/** 命中态文案键（列表行说明 + 徽标提示共用）。 */
+export const PROFILE_MATCH_KEYS: Readonly<Record<ProfileMatch, string>> = {
+  matched: 'rules.networkProfile.matchIn',
+  unmatched: 'rules.networkProfile.matchOut',
+  unknown: 'rules.networkProfile.matchUnknown',
+};
+
+/** 命中态圆点的类名：命中 = 实心绿、未命中 = 实心灰、未知 = 空心（形状不同，不只靠颜色区分）。 */
+export const PROFILE_MATCH_DOT_CLASS: Readonly<Record<ProfileMatch, string>> = {
+  matched: 'dot ok',
+  unmatched: 'dot idle',
+  unknown: 'dot np-unknown',
+};
 
 /** 判据摘要（列表行）：地址段与搜索域各几条，外加前两个值作样例。 */
 export function criteriaSummary(profile: NetworkProfile): {
@@ -236,16 +269,19 @@ export function orderWithNewRuleFirst(
  */
 export type ProfileRowStatus =
   | { kind: 'disabled' }
-  | { kind: 'probe'; display: ProbeDisplay; warningKey: string | null };
+  | { kind: 'probe'; display: ProbeDisplay; warningKey: string | null; match: ProfileMatch | null };
 
 export function profileRowStatus(
   profile: NetworkProfile,
   resolved: readonly ResolvedProbe[] | null,
 ): ProfileRowStatus {
   if (!profile.enabled) return { kind: 'disabled' };
+  const display = probeDisplay(profile.id, resolved);
   return {
     kind: 'probe',
-    display: probeDisplay(profile.id, resolved),
+    display,
     warningKey: probeWarningKey(resolved?.find((r) => r.profileId === profile.id)),
+    // 命中态只对本机可用的场景显示：不可用的场景根本不生成规则，「在不在该网络」对它没有意义。
+    match: display.kind === 'ok' ? profileMatch(profile.id, resolved) : null,
   };
 }

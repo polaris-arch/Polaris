@@ -36,6 +36,7 @@ mod hot_switch;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
+mod network_canary;
 mod network_monitor;
 mod network_settle;
 mod pending_changes;
@@ -660,6 +661,14 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法无需动 main.rs。
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent);
 
+    /// **网络场景命中态变更信号**（`event:networkProfileMatchChanged`，**无载荷** `{}`）。
+    ///
+    /// canary 探针结果变化（起核 / 停核 / 网络变化 / 周期探测翻转）时发；渲染端收到即重拉
+    /// `network_profile_resolved_sources`（其 `matched` 字段是真值）。与 [`emit_lifecycle`](Self::emit_lifecycle)
+    /// 同一约定：事件是变更信号，payload 不复制易过期的快照。复用本 trait 的理由同上（已持 `AppHandle`，
+    /// 扩方法无需动 main.rs）。
+    fn emit_network_profile_match_changed(&self);
+
     /// **TUN 提权引导门**（移植 上游 `promptHelperGate`，`src/main/index.ts:370-500`）：TUN 起核前
     /// helper 不可用时，**同步**弹一次原生对话框问用户；用户确认 → 在本调用内**就地**执行授权安装
     /// （macOS `SMAppService` / Windows UAC / Linux `pkexec`，各弹一次系统授权框），返回
@@ -881,6 +890,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             &self.app,
             crate::events::channel::EVENT_PROXY_LIFECYCLE,
             event,
+        );
+    }
+
+    fn emit_network_profile_match_changed(&self) {
+        crate::events::broadcast(
+            &self.app,
+            crate::events::channel::EVENT_NETWORK_PROFILE_MATCH_CHANGED,
+            serde_json::json!({}),
         );
     }
 
@@ -1177,6 +1194,9 @@ pub struct ProxyRuntime {
     /// 网络场景 R4 兜底的会话态：本次起核因 `missing monitor for auto DHCP` 剔除了 dhcp transport。
     /// `start_inner` 入口复位；生成依赖与「本机解析后的探测源」查询都读它（二者同源）。
     netenv_dhcp_suppressed: AtomicBool,
+    /// 网络场景命中态（内核 canary 探针，spec §6.3 方案 2）：运行核的 canary 表 + 最近一轮结果。
+    /// 起核就绪 arm、停核 / 崩溃 disarm、网络变化 invalidate（见 `network_canary` 模块文档）。
+    network_canary: Arc<network_canary::NetworkCanaryState>,
     /// 崩溃自愈状态机（core-supervisor 既有决策机：退避 / 上限 / 让位 / 补发全在其中）。
     ///
     /// 后台崩溃监测任务检测到核**意外**退出时喂它决策，本层只执行「退避 sleep + restart」的 I/O。
@@ -1443,6 +1463,7 @@ impl ProxyRuntime {
             selector_reconcile: Arc::new(SelectorReconcileOwner::default()),
             restart_deferred: AtomicBool::new(false),
             netenv_dhcp_suppressed: AtomicBool::new(false),
+            network_canary: Arc::default(),
             crash_recovery: Mutex::new(CrashRecoveryMachine::default()),
             diagnostics: Mutex::new(DiagnosticCounters::new()),
             kernel_gate_cache: Mutex::new(kernel_gate_cache),

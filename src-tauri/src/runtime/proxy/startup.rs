@@ -42,8 +42,8 @@ use polaris_config_engine::builder::endpoint_routes::{
 };
 use polaris_config_engine::builder::helpers::ServerLike;
 use polaris_config_engine::builder::network_env::{
-    builtin_dhcp_status, resolved_probe, BuiltinDhcpStatus, ProbeFacts, PrunedEnvRule,
-    ResolvedProbe,
+    builtin_dhcp_status, resolved_probe, BuiltinDhcpStatus, NetworkCanaryPlan, ProbeFacts,
+    PrunedEnvRule, ResolvedProbe,
 };
 use polaris_config_engine::builder::outbounds::required_bind_interfaces;
 use polaris_config_engine::builder::{
@@ -249,6 +249,22 @@ struct PortProviderExcluding {
 impl FreePortProvider for PortProviderExcluding {
     fn try_allocate(&self) -> Option<u16> {
         let port = FreePortProvider::try_allocate(&TokioPortProvider)?;
+        (port != self.excluded).then_some(port)
+    }
+}
+
+/// 网络场景 canary 入站只听 UDP：候选口按 **UDP** 可绑来取（TCP 口空闲说明不了 UDP 口空闲），
+/// 其余同 [`PortProviderExcluding`]。
+struct UdpPortProviderExcluding {
+    excluded: u16,
+}
+
+impl FreePortProvider for UdpPortProviderExcluding {
+    fn try_allocate(&self) -> Option<u16> {
+        let port = std::net::UdpSocket::bind(("127.0.0.1", 0))
+            .and_then(|s| s.local_addr())
+            .ok()?
+            .port();
         (port != self.excluded).then_some(port)
     }
 }
@@ -1015,6 +1031,7 @@ impl ProxyRuntime {
             deps,
             pruned_rule_set_tags,
             pruned_env_rules,
+            network_canary,
             binary,
             effective_user_config,
         ) = loop {
@@ -1040,7 +1057,7 @@ impl ProxyRuntime {
                 probe_proxy_port,
                 pool_ports,
             ) = self.resolve_start_ports(&user_config, control_port);
-            let deps = self.generate_deps(
+            let mut deps = self.generate_deps(
                 api_port,
                 update_in_port,
                 subscription_update_in_port,
@@ -1048,6 +1065,14 @@ impl ProxyRuntime {
                 &pool_ports,
                 &config,
                 takeover_active,
+            );
+            // 网络场景 canary 探针口：与上面几个口同轮分配（重试腿换口自愈）；无场景不分配。
+            deps.network_canary_port = self.resolve_network_canary_port(
+                &user_config,
+                control_port,
+                api_port,
+                update_in_port,
+                subscription_update_in_port,
             );
             // 核二进制解析（**移到闸门之前**：闸门要拿它跑 `sing-box check`）。**此处刻意不 `?`** ——
             // 保住既有次序不变式「解析失败是终态 Err，但 gate 剔除结果须已推给渲染端」：先把 Result
@@ -1110,6 +1135,8 @@ impl ProxyRuntime {
             let pruned_rule_set_tags = gate.pruned_rule_set_tags;
             // 网络场景规则报告（剔除 + 告警）：同上，必须是**这一次**生成的产物（R4 重试腿会变）。
             let pruned_env_rules = gate.pruned_env_rules;
+            // 本次写进配置的 canary 表（同上：随**这一次**的配置带出，探测对的是运行核）。
+            let network_canary = gate.network_canary;
             let singbox_config = gate.config;
             let effective_user_config = gate.effective_user_config;
             let config_gen_attempt_ms = t_config_gen.elapsed().as_millis();
@@ -1317,6 +1344,7 @@ impl ProxyRuntime {
                             deps,
                             pruned_rule_set_tags,
                             pruned_env_rules,
+                            network_canary,
                             // 本次真正解析出的核路径 —— 起核后的内核自证要对账的正是**这一次**的期望值
                             //（每次尝试都重解析，故必须随本轮结果带出循环，不能在循环外重算）。
                             binary,
@@ -1634,6 +1662,8 @@ impl ProxyRuntime {
         // **网络场景规则告知**：场景失效 / 探测源本机不可用 / R4 剔除 dhcp / dhcp 源只写 IPv6 地址段。
         // 与上一条同属「核在跑、规则面降级」，各自 emit；报告为空 ⇒ 清掉本码（修好即消失）。
         self.warn_network_profile_rules(&pruned_env_rules);
+        // **网络场景命中态**（spec §6.3 方案 2）：换上本次运行核的 canary 表并挂探测任务（无表 ⇒ 只复位）。
+        self.arm_network_canary(my_gen, network_canary);
         // **出口自证**：核已就绪 → 校验「实际生效出口 == 选中节点」，不一致即告警，绝不静默显示「已连接」。
         // 放在 A1 之后：二者是正交的两条降级轴（A1 = OS 没把流量导进核；本检查 = 核内部出口指错了），
         // 各自独立 emit，互不遮蔽。纯静态、零 I/O、微秒级 → 不给已经偏慢的起核路径增加任何延迟。
@@ -2424,6 +2454,44 @@ impl ProxyRuntime {
         )
     }
 
+    /// 网络场景 canary 探针的回环 UDP 口（spec §6.3 方案 2）。沿用 update-in 的分配路径
+    /// （`PortAllocator` + 同一排除集：管理 API / control / http / mixed / 订阅入口，外加 update-in），
+    /// provider 换成按 UDP 探测。
+    ///
+    /// 没有网络场景 ⇒ `None`（不分配）；5 次都撞排除集 ⇒ `None`（不回落固定口：撞口会让整核起不来，
+    /// 而少一个命中态只是 UI 显示「未知」）。
+    pub(super) fn resolve_network_canary_port(
+        &self,
+        user_config: &UserConfig,
+        control_port: u16,
+        api_port: u16,
+        update_in_port: u16,
+        subscription_update_in_port: u16,
+    ) -> Option<u16> {
+        if user_config.network_profiles.is_empty() {
+            return None;
+        }
+        let excl = PortExclusions {
+            socks: subscription_update_in_port,
+            ..PortExclusions::for_login_api(
+                api_port,
+                Some(control_port),
+                user_config.http_port,
+                None,
+                user_config.mixed_port,
+            )
+        };
+        let resolved = PortAllocator::new(UdpPortProviderExcluding {
+            excluded: update_in_port,
+        })
+        .resolve_free_local_port(&excl, 0);
+        if resolved.used_fallback {
+            log::warn!("网络场景 canary 端口 5 次解析均撞排除集 → 本次不生成命中态探针");
+            return None;
+        }
+        Some(resolved.port)
+    }
+
     /// 起核重试退避 sleep（第 `attempt` 次失败后、下一次尝试前）。**可被取消中断**。
     /// 指数：`delay * 2^(attempt-1)`；恒定：`delay`（对齐 上游 retry util `delay * 2^attempt`，其 attempt 0-based）。
     ///
@@ -2643,6 +2711,8 @@ impl ProxyRuntime {
             // R4：本会话 dhcp transport 已被剔除（起核报 `missing monitor for auto DHCP` 后的兜底重试）。
             // 运行时状态，不是配置键；每次 `start_inner` 入口复位。
             netenv_dhcp_suppressed: self.netenv_dhcp_suppressed.load(Ordering::SeqCst),
+            // canary 探针口由起核腿按轮分配后覆写（`resolve_network_canary_port`）；本装配体不分配端口。
+            network_canary_port: None,
             // A-0b：运行期观测到的 tailnet 地址（`serverId` → 裸地址）。真值源是
             // `ProxyRuntime::observed_tailnet`，由两条腿写：STATUS 帧（`sync_tailnet_rule_files`）
             // 与**本次起核前**刚跑过的 `write_tailnet_rule_files`（把盘上文件的主机位条目读回，
@@ -2674,7 +2744,15 @@ impl ProxyRuntime {
         Ok(user_config
             .network_profiles
             .iter()
-            .map(|profile| resolved_probe(profile, &facts))
+            .map(|profile| {
+                let mut probe = resolved_probe(profile, &facts);
+                // 命中态只对「按磁盘配置本机可用」的场景给出：不可用的场景下次起核就没有规则，
+                // 运行核里残留的结果不该再显示成「在该网络」。
+                if probe.available {
+                    probe.matched = self.network_profile_matched(&profile.id);
+                }
+                probe
+            })
             .collect())
     }
 
@@ -2929,6 +3007,8 @@ pub(super) struct GateOutcome {
     pub(super) pruned_rule_set_tags: Vec<String>,
     /// 网络场景规则报告（`GenerateOutcome::pruned_env_rules` 原样带出）。
     pub(super) pruned_env_rules: Vec<PrunedEnvRule>,
+    /// 本次写进配置的网络场景 canary（`GenerateOutcome::network_canary` 原样带出）。
+    pub(super) network_canary: Option<NetworkCanaryPlan>,
     /// 生成侧 gate 剔除的 ∪ 内核闸门剥掉的（走同一条 `EVENT_PROXY_INVALID_NODES` 通道）。
     pub(super) invalid_nodes: Vec<InvalidNode>,
     /// 本次真跑了几次 `sing-box check`（缓存命中 0、首次健康 1、剥除腿可 >1）；
@@ -2979,6 +3059,7 @@ impl GateOutcome {
             config: outcome.config,
             pruned_rule_set_tags: outcome.pruned_rule_set_tags,
             pruned_env_rules: outcome.pruned_env_rules,
+            network_canary: outcome.network_canary,
             invalid_nodes: outcome
                 .invalid_nodes
                 .into_iter()

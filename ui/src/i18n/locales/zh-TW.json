@@ -1392,7 +1392,10 @@
       "dnsNetenvDesc": "隨所在網路自動切換",
       "reasonProfileInvalid": "場景已停用或未填寫判據",
       "reasonDhcpMonitorMissing": "本次啟動時無法監看網卡變化，DHCP 偵測已停用，重新連線後再試",
-      "moveFirstFailed": "規則已儲存，但未能移到清單最前，請手動調整順序"
+      "moveFirstFailed": "規則已儲存，但未能移到清單最前，請手動調整順序",
+      "matchIn": "目前位於此網路",
+      "matchOut": "目前不在此網路",
+      "matchUnknown": "是否位於此網路：未知（代理未執行或正在偵測）"
     }
   },
   "sub": {

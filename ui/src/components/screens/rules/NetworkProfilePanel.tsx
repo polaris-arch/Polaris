@@ -9,7 +9,8 @@
  * 取消不留半份配置（口径同 `DnsResourceDialog`）。
  *
  * 「本机将使用哪种探测、可不可用」由后端算好经 `api.networkProfile.resolvedSources()` 返回，本文件只显示
- * （spec §4.4 末段：渲染端重算必然漂移）。第一期不显示命中态（D8，放 N4）。
+ * （spec §4.4 末段：渲染端重算必然漂移）。命中态（N4）同样来自后端：`ResolvedProbe.matched` 是运行核
+ * canary 探针的结果，变化时后端发无载荷信号，`useResolvedProbes` 收到即重拉。
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -26,10 +27,13 @@ import {
   probeInputsDiffer,
   probeWarningKey,
   profileRowStatus,
+  PROFILE_MATCH_DOT_CLASS,
+  PROFILE_MATCH_KEYS,
   profileRefCounts,
   validateNetworkProfileDraft,
   type NetworkProfileFormError,
   type ProbeDisplay,
+  type ProfileMatch,
 } from '@/domain/network-profile';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
 import { Modal } from '@/components/dialogs/Modal';
@@ -47,11 +51,14 @@ function ProfileIcon() {
 }
 
 /**
- * 后端解析后的探测源。`dep` 变了就重拉（场景、代理模式、TUN 配置都会改变解析结果）。
+ * 后端解析后的探测源 + 命中态。`dep` 变了就重拉（场景、代理模式、TUN 配置都会改变解析结果）；
+ * 命中态变更信号（`onMatchChanged`，N4）到达时也重拉。
  * 拉不到（IPC 失败 / 后端还没有这条命令 / 返回不是数组）⇒ `null` ⇒ 显示「暂时无法获取」，不猜。
  */
 export function useResolvedProbes(dep: unknown): ResolvedProbe[] | null {
   const [resolved, setResolved] = useState<ResolvedProbe[] | null>(null);
+  const [matchTick, setMatchTick] = useState(0);
+  useEffect(() => api.networkProfile.onMatchChanged(() => setMatchTick((n) => n + 1)), []);
   useEffect(() => {
     let active = true;
     api.networkProfile
@@ -65,8 +72,23 @@ export function useResolvedProbes(dep: unknown): ResolvedProbe[] | null {
     return () => {
       active = false;
     };
-  }, [dep]);
+  }, [dep, matchTick]);
   return resolved;
+}
+
+/** 命中态圆点（场景列表行与规则徽标共用）：形状 + 颜色 + 文案三路区分命中 / 未命中 / 未知。 */
+export function MatchDot({ match, label }: { match: ProfileMatch; label: string }) {
+  return <span className={PROFILE_MATCH_DOT_CLASS[match]} role="img" aria-label={label} />;
+}
+
+function MatchLine({ match, t }: { match: ProfileMatch; t: TFunction }) {
+  const text = t(PROFILE_MATCH_KEYS[match]);
+  return (
+    <div className="card-sub np-match" style={{ marginTop: 4 }}>
+      <MatchDot match={match} label={text} />
+      {text}
+    </div>
+  );
 }
 
 const SOURCE_KEY = {
@@ -193,6 +215,7 @@ function ProfileList({ config, update }: { config: NonNullable<UseConfigResult['
                 {/* 停用的场景只显示「已停用」（标题旁的徽标），不显示探测结果：后端对它恒报
                     profileInvalid，再画一行红字只是重复同一件事。 */}
                 {status.kind === 'probe' && <ProbeLine display={status.display} t={t} />}
+                {status.kind === 'probe' && status.match && <MatchLine match={status.match} t={t} />}
                 {status.kind === 'probe' && status.warningKey && (
                   <ProbeWarn warningKey={status.warningKey} t={t} />
                 )}

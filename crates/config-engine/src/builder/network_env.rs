@@ -192,6 +192,10 @@ pub struct ResolvedProbe {
     pub available: bool,
     /// 不可用原因或告警原因（camelCase，见 [`ProbeReason`]）；可用且无告警时为 `null`。
     pub reason: Option<ProbeReason>,
+    /// 内核 canary 探针（spec §6.3 方案 2）给出的「当前是否处在该网络」：`true` 命中 / `false` 未命中 /
+    /// `null` 未知（核未运行、本场景本次没有 canary、网络刚变化还没探完）。本函数恒给 `None`，由运行时
+    /// 按运行核的探测结果填入 —— 判据只有内核那一份，这里不推算。
+    pub matched: Option<bool>,
 }
 
 /// 单个场景在本机的处置：解析表 + 可用性 + 场景自身有效性 + 告警，**唯一判据**。
@@ -231,6 +235,7 @@ pub fn resolved_probe(profile: &NetworkProfile, facts: &ProbeFacts) -> ResolvedP
         probe_source,
         available: unavailable.is_none(),
         reason: unavailable.or(v6_only_on_dhcp.then_some(ProbeReason::DhcpIpv6Only)),
+        matched: None,
     }
 }
 
@@ -705,6 +710,122 @@ pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEn
         });
     }
     pruned
+}
+
+/// canary 探针的回环入站 tag（spec §6.3 方案 2）。
+pub const NETWORK_CANARY_INBOUND_TAG: &str = "np-probe-in";
+/// canary 域名后缀：RFC 6761 保留的 `.invalid`，与任何真实查询不相交。
+pub const NETWORK_CANARY_SUFFIX: &str = "np-canary.polaris.invalid";
+
+/// 一个场景的 canary：查询 `domain`，内核按该场景的环境项亲自求值（命中 ⇒ A 127.0.0.1，否则 NXDOMAIN）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkCanary {
+    pub profile_id: String,
+    pub domain: String,
+}
+
+/// 本次生成实际写进配置的 canary：回环端口 + 每个场景一项。`None`（见 [`apply_network_canaries`]）
+/// = 本次没有 canary 入站与规则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkCanaryPlan {
+    pub port: u16,
+    pub canaries: Vec<NetworkCanary>,
+}
+
+impl NetworkEnv {
+    /// 能出 canary 的场景：本机可用、且环境项引用的 transport 本次确实生成了（与规则注入同一份预解析，
+    /// 第一道防线同源）。按场景 id 排序，输出确定。
+    fn canary_candidates(&self) -> impl Iterator<Item = (&String, &[EnvCondition])> {
+        self.profiles.iter().filter_map(|(id, entry)| {
+            let entry = entry.as_ref().ok()?;
+            (!entry.conditions.is_empty()).then_some((id, entry.conditions.as_slice()))
+        })
+    }
+}
+
+/// 生成 canary 探针（spec §6.3 方案 2 / §5.4）：
+///
+/// - 每个候选场景一组 DNS 规则：每个环境项一条 `{domain, inbound, <环境项>} → predefined A 127.0.0.1`，
+///   外加一条同名兜底 `→ predefined NXDOMAIN`；整组 `unshift` 到 `dns.rules` **绝对最前**（与探测池规则同一
+///   插入点）。`inbound` 限定在探针入站，真实查询即使撞上这个域名也不会被它们答复。
+/// - 一个只听 `127.0.0.1` 的 UDP `direct` 入站 + `route.rules` 最前的 `{inbound, hijack-dns}`。
+///
+/// 场景的地址段与搜索域之间是「任一命中」（D2），与规则展开同形：任一条正向规则命中即 A 记录。
+/// `predefined` 不经 transport 缓存（spec K10），每次查询都重新求值。
+///
+/// 无端口、或没有任何候选场景 ⇒ 一个字节都不改（老配置零 diff），返回 `None`。
+/// 候选只看场景本身，不看有没有规则引用它：system 源场景恒可出 canary；dhcp 源场景只有在 `dns-netenv`
+/// 因规则需要而生成时才有（不为了显示命中态去多绑一次 UDP 68）。
+pub fn apply_network_canaries(
+    cfg: &mut SingBoxConfig,
+    env: &NetworkEnv,
+    port: Option<u16>,
+) -> Option<NetworkCanaryPlan> {
+    let port = port.filter(|p| *p > 0)?;
+    let canaries: Vec<(NetworkCanary, &[EnvCondition])> = env
+        .canary_candidates()
+        .enumerate()
+        .map(|(k, (id, conditions))| {
+            let canary = NetworkCanary {
+                profile_id: id.clone(),
+                domain: format!("p{k}.{NETWORK_CANARY_SUFFIX}"),
+            };
+            (canary, conditions)
+        })
+        .collect();
+    if canaries.is_empty() {
+        return None;
+    }
+    let inbound = || {
+        Some(crate::singbox::OneOrMany::Many(vec![
+            NETWORK_CANARY_INBOUND_TAG.to_string(),
+        ]))
+    };
+    let mut rules: Vec<DnsRule> = Vec::new();
+    for (canary, conditions) in &canaries {
+        let base = DnsRule {
+            domain: Some(vec![canary.domain.clone()]),
+            inbound: inbound(),
+            action: Some("predefined".into()),
+            ..Default::default()
+        };
+        for condition in *conditions {
+            let mut hit = DnsRule {
+                rcode: Some("NOERROR".into()),
+                answer: Some(vec![format!("{}. IN A 127.0.0.1", canary.domain)]),
+                ..base.clone()
+            };
+            condition.apply_to_dns_rule(&mut hit);
+            rules.push(hit);
+        }
+        rules.push(DnsRule {
+            rcode: Some("NXDOMAIN".into()),
+            ..base
+        });
+    }
+    if let Some(dns) = cfg.dns.as_mut() {
+        let existing = dns.rules.get_or_insert_with(Vec::new);
+        existing.splice(0..0, rules);
+    }
+    cfg.inbounds
+        .push(crate::builder::inbounds::udp_direct_loopback(
+            NETWORK_CANARY_INBOUND_TAG,
+            port,
+        ));
+    if let Some(route) = cfg.route.as_mut() {
+        route.rules.insert(
+            0,
+            RouteRule {
+                inbound: inbound(),
+                action: Some("hijack-dns".into()),
+                ..Default::default()
+            },
+        );
+    }
+    Some(NetworkCanaryPlan {
+        port,
+        canaries: canaries.into_iter().map(|(c, _)| c).collect(),
+    })
 }
 
 #[cfg(test)]

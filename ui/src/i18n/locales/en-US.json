@@ -1392,7 +1392,10 @@
       "dnsNetenvDesc": "Follows whichever network you are on",
       "reasonProfileInvalid": "the profile is off or has no ranges or domains",
       "reasonDhcpMonitorMissing": "network changes could not be watched this session, so DHCP detection is off. Reconnect to retry",
-      "moveFirstFailed": "Rule saved, but it could not be moved to the top. Reorder it manually"
+      "moveFirstFailed": "Rule saved, but it could not be moved to the top. Reorder it manually",
+      "matchIn": "You're on this network now",
+      "matchOut": "Not on this network now",
+      "matchUnknown": "Unknown whether you're on this network (proxy not running or still checking)"
     }
   },
   "sub": {
