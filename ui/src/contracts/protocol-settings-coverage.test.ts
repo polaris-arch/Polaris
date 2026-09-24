@@ -1194,6 +1194,26 @@ const NODE_EXEMPT: Record<string, Record<string, Exemption>> = {
         { at: 'crates/config-engine/src/builder/outbound.rs', scope: NAIVE_ARM, needle: 'spoof: None,' },
       ],
     },
+    certificateSha256: {
+      why:
+        'naive 出站不读 pin：内核拒绝名单里没有它、建 Cronet 客户端时也不转交 ⇒ 下发即**静默不校验**' +
+        '（用户以为固定了其实没有）。naive 分支因此写死 None，给控件就是假开关。',
+      cite: [
+        { at: 'crates/config-engine/src/builder/outbound.rs', scope: NAIVE_ARM, needle: 'certificate_sha256: None,' },
+        { at: 'crates/config-engine/src/builder/outbound', needle: 'naive_never_carries_cert_pins' },
+      ],
+    },
+    certificatePublicKeySha256: {
+      why: '同 `certificateSha256`：两键同一条内核路径，naive 分支一并写死 None。',
+      cite: [
+        {
+          at: 'crates/config-engine/src/builder/outbound.rs',
+          scope: NAIVE_ARM,
+          needle: 'certificate_public_key_sha256: None,',
+        },
+        { at: 'crates/config-engine/src/builder/outbound', needle: 'naive_never_carries_cert_pins' },
+      ],
+    },
     spoofMethod: {
       why: '同 `spoofSni`：协议门 + naive 分支的 `spoof_method: None` 两道都挡着。',
       cite: [

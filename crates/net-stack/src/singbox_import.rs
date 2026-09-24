@@ -32,6 +32,7 @@ use polaris_config_engine::user_config::protocol_settings::{
 use polaris_config_engine::user_config::server_config::{
     Protocol, SecurityMode, ServerConfig, WireGuardSettings,
 };
+use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
 
 use crate::clash_parser::ClashParseResult;
 
@@ -197,6 +198,21 @@ fn ech_config_str(ech: Option<&Value>) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
+/// sing-box `tls.certificate_sha256` / `certificate_public_key_sha256` → 逗号串。内核类型是
+/// `badoption.Listable[[]byte]`（单个 base64 串或其数组，`option/tls.go` v1.15.0-alpha.7 :121-122），
+/// 两种形态都收；base64 原文保留，生成侧 `tls_pin::cert_pins_for_kernel` 认得它 ⇒ 往返逐字闭合。
+fn cert_pins_str(v: Option<&Value>) -> Option<String> {
+    let joined = match v? {
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| str_val(Some(x)))
+            .collect::<Vec<_>>()
+            .join(","),
+        other => str_val(Some(other))?,
+    };
+    keep_valid_cert_pins(&joined)
+}
+
 /// TLS/Reality 层（上游：`ob.tls && ob.tls.enabled !== false`）。
 fn apply_tls(server: &mut ServerConfig, tls: Option<&Value>) {
     let Some(tls) = tls.filter(|v| v.is_object()) else {
@@ -237,6 +253,8 @@ fn apply_tls(server: &mut ServerConfig, tls: Option<&Value>) {
             None
         },
         fragment: bool_true(tls.get("fragment")).then_some(true),
+        certificate_sha256: cert_pins_str(tls.get("certificate_sha256")),
+        certificate_public_key_sha256: cert_pins_str(tls.get("certificate_public_key_sha256")),
         ..Default::default()
     });
     if has_reality {

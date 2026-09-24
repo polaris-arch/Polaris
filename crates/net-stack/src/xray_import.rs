@@ -29,6 +29,7 @@ use polaris_config_engine::user_config::protocol_settings::{
     WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
+use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
 
 use crate::clash_parser::ClashParseResult;
 
@@ -180,6 +181,11 @@ fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>) {
                     &str_ne(tls.and_then(|t| t.get("fingerprint")))
                         .unwrap_or_else(|| "chrome".to_string()),
                 ),
+                // Xray `tlsSettings.pinnedPeerCertSha256`：逗号分隔 hex（可带 `:`），整张证书 DER 的 SHA-256
+                // （XTLS/Xray-core infra/conf/transport_security.go @60e2a0c :314、:364-379）⇒ `certificateSha256`。
+                // 语义差同 share_link 的 `pcs`：Xray 也接受命中链上 CA，sing-box 只比叶子。
+                certificate_sha256: str_ne(tls.and_then(|t| t.get("pinnedPeerCertSha256")))
+                    .and_then(|p| keep_valid_cert_pins(&p)),
                 ..Default::default()
             });
         }

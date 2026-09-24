@@ -15,6 +15,7 @@ use crate::singbox::{
 use crate::user_config::normalize::normalize_token;
 use crate::user_config::protocol_settings::custom_outbound_type;
 use crate::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
+use crate::user_config::tls_pin;
 use crate::user_config::tls_spoof::validate_tls_spoof_default;
 
 /// TLS 协议集（恒需 TLS 块即使无 tlsSettings）。
@@ -333,6 +334,11 @@ pub fn build_proxy_outbound(
                 reality: None,
                 ech: None,
                 fragment: None,
+                // pin 不下发：naive 出站既不校验也不转交这两键（`protocol/naive/outbound.go`
+                // v1.15.0-alpha.7 :45-86 的拒绝名单里没有它们、:178-197 建 Cronet 客户端时也不传）
+                // ⇒ 内核**静默忽略**。下发 = 用户以为固定了其实没有，宁可不发。
+                certificate_sha256: None,
+                certificate_public_key_sha256: None,
             });
             if let Some(n) = &server.naive_settings {
                 if n.use_http3 == Some(true) {
@@ -507,6 +513,23 @@ pub fn build_proxy_outbound(
             reality: None,
             ech: None,
             fragment: None,
+            // 证书固定。std / uTLS / windows / apple 四个客户端都实现了 pin 校验，ECH 包的是同一个
+            // tls.Config（pin 回调随之生效）⇒ 本段无条件下发。与 insecure 并存无冲突：内核见 pin
+            // 会自行置 InsecureSkipVerify 并挂 pin 回调（std_client.go :138-146、utls_client.go :212-220、
+            // system_client_engine.go :104），insecure 真假都由 pin 单独把关。reality 不在此列 ——
+            // 见下方 Reality 段整体替换本块时写死的 None。
+            certificate_sha256: tls_pin::cert_pins_for_kernel(
+                server
+                    .tls_settings
+                    .as_ref()
+                    .and_then(|t| t.certificate_sha256.as_deref()),
+            ),
+            certificate_public_key_sha256: tls_pin::cert_pins_for_kernel(
+                server
+                    .tls_settings
+                    .as_ref()
+                    .and_then(|t| t.certificate_public_key_sha256.as_deref()),
+            ),
         });
 
         let tls_engine = server
@@ -605,6 +628,12 @@ pub fn build_proxy_outbound(
                 }),
                 ech: None,
                 fragment: None,
+                // 🔴 pin 在 reality 下**必须写死 None**：内核 reality 客户端握手时用自己的
+                // `realityVerifier` 覆盖 uTLS 那份 `VerifyPeerCertificate`（`common/tls/reality_client.go`
+                // v1.15.0-alpha.7 :134-141），pin 回调被整个换掉 —— check 与起核都 rc=0，但**静默不校验**。
+                // reality 的身份认证本就靠 public_key，不靠证书。
+                certificate_sha256: None,
+                certificate_public_key_sha256: None,
             });
         }
     }
@@ -632,6 +661,15 @@ pub fn build_proxy_outbound(
                 ob.transport = generate_transport_config(server);
             }
         }
+    }
+
+    // https 代理节点钉 HTTP/1.1。1.15.0-alpha.7 起内核 http 出站缺省 h2：TLS 腿 ALPN 默认带
+    // `h2`，只在 ALPN **没选中** h2 时回落 1.1；服务端宣告 h2 却不支持 h2 CONNECT 时直接失败、
+    // 不回落（207 回环实测 `HTTP/2 CONNECT: http2: frame too large`，nginx + proxy_connect
+    // 开了 http2 即此形态）。钉 1 = 升核前行为。明文腿内核本就只走 1.1（无 TLS 不进 h2 分支），
+    // 不下发，以免无谓改动产物。
+    if server.protocol == Protocol::Http && ob.tls.as_ref().is_some_and(|t| t.enabled) {
+        ob.version = Some(crate::singbox::OutboundVersion::Num(1));
     }
 
     // 抗封后处理。

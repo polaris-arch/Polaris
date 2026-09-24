@@ -31,6 +31,7 @@ pub mod rule_validate;
 pub mod rules;
 pub mod server_config;
 pub mod system_proxy_bypass;
+pub mod tls_pin;
 pub mod tls_spoof;
 pub mod tun_config;
 

@@ -20,6 +20,11 @@ export interface TlsSettings {
   //   表单按 arch 门控置灰；构建期对 IP 字面量、等于 server_name、QUIC/naive 协议不 emit。
   spoofSni?: string;
   spoofMethod?: 'wrong-ack' | 'wrong-md5' | 'wrong-timestamp';
+  // 证书固定（sing-box tls.certificate_sha256 / certificate_public_key_sha256）：逗号分隔多条，每条是叶子证书
+  // （或其公钥 SPKI）的 SHA-256，hex（可带 `:`/`-`）或标准 base64 均可；生成侧统一转成内核要的 base64。
+  // 内核见 pin 即以它取代 CA/主机名校验；reality 与 naive 下内核不校验 pin，后端不下发、表单不显示。
+  certificateSha256?: string;
+  certificatePublicKeySha256?: string;
 }
 
 export interface RealitySettings {

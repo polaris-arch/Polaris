@@ -1800,3 +1800,137 @@ fn http_host_header_kept_without_path() {
     assert!(v.get("path").is_none());
     assert_eq!(v["headers"], serde_json::json!({"Host": ["h.com"]}));
 }
+
+/// https 代理节点钉 `version: 1`；明文 http 节点不下发 `version`。
+///
+/// 1.15.0-alpha.7 起内核 http 出站缺省 h2，服务端宣告 h2 却不支持 h2 CONNECT 时不回落，
+/// 见 builder 注释。明文腿内核本就只走 1.1。
+#[test]
+fn http_tls_pins_version_1_plain_does_not() {
+    let tls = outbound_json_from(
+        r#"{"id":"s1","name":"n","protocol":"http","address":"a.com","port":443,"security":"tls"}"#,
+    );
+    assert_eq!(tls["version"], serde_json::json!(1));
+    let plain = outbound_json_from(
+        r#"{"id":"s1","name":"n","protocol":"http","address":"a.com","port":8080}"#,
+    );
+    assert!(plain.get("version").is_none());
+}
+
+// ── TLS 证书固定（certificate_sha256 / certificate_public_key_sha256）─────────────────
+//
+// 参照值独立算出：`printf x | sha256sum` → X_HEX，`printf x | openssl dgst -sha256 -binary | base64` → X_B64。
+const PIN_X_HEX: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+const PIN_X_B64: &str = "LXEWQrcmsEQBYnyp+6wy9chTD7GQPMTbAiWHF5IaSIE=";
+
+fn pin_node(proto: &str, cred: &str, security: &str, extra_tls: &str) -> String {
+    format!(
+        r#"{{"id":"s1","name":"n","protocol":"{proto}","address":"a.com","port":443,{cred},
+                "security":"{security}","realitySettings":{{"publicKey":"pk","shortId":"ab"}},
+                "tlsSettings":{{"serverName":"s.com","certificateSha256":"{PIN_X_HEX}",
+                    "certificatePublicKeySha256":"{PIN_X_B64}"{extra_tls}}}}}"#
+    )
+}
+
+/// 八个走标准 TLS 段的协议：pin 一律以**标准 base64 数组**下发（hex 原样下发内核 check 照收，
+/// 却每次握手都失败 —— 见 `user_config::tls_pin` 模块头的实测）。
+#[test]
+fn cert_pins_reach_the_kernel_as_base64_for_every_tls_protocol() {
+    for (proto, cred) in [
+        ("vless", r#""uuid":"u-1""#),
+        ("vmess", r#""uuid":"u-1""#),
+        ("trojan", r#""password":"pw""#),
+        ("anytls", r#""password":"pw""#),
+        ("http", r#""username":"u""#),
+        ("hysteria2", r#""password":"pw""#),
+        ("tuic", r#""uuid":"u-1","password":"pw""#),
+        ("hysteria", r#""password":"pw""#),
+    ] {
+        let v = outbound_json_from(&pin_node(proto, cred, "tls", ""));
+        assert_eq!(
+            v["tls"]["certificate_sha256"],
+            serde_json::json!([PIN_X_B64]),
+            "{proto}"
+        );
+        assert_eq!(
+            v["tls"]["certificate_public_key_sha256"],
+            serde_json::json!([PIN_X_B64]),
+            "{proto}"
+        );
+    }
+}
+
+/// pin 与 uTLS / 平台 engine / ECH / insecure 并存时照发 —— 四者内核都实现了 pin（见生成段注释）。
+#[test]
+fn cert_pins_coexist_with_utls_engine_ech_and_insecure() {
+    let v = outbound_json_on(
+        &pin_node(
+            "vless",
+            r#""uuid":"u-1""#,
+            "tls",
+            r#","engine":"windows","ech":true,"allowInsecure":true,"fingerprint":"chrome""#,
+        ),
+        "x64",
+        "win32",
+    );
+    let tls = &v["tls"];
+    assert_eq!(tls["engine"], serde_json::json!("windows"));
+    assert_eq!(tls["utls"]["enabled"], serde_json::json!(true));
+    assert_eq!(tls["ech"]["enabled"], serde_json::json!(true));
+    assert_eq!(tls["insecure"], serde_json::json!(true));
+    assert_eq!(tls["certificate_sha256"], serde_json::json!([PIN_X_B64]));
+}
+
+/// 没填 pin ⇒ 两个键都不出现（金样逐字不变的前提）；非法值 ⇒ 同样不出现。
+#[test]
+fn cert_pins_absent_or_illegal_produce_no_key() {
+    for tls_settings in [
+        r#"{"serverName":"s.com"}"#,
+        r#"{"certificateSha256":"chrome","certificatePublicKeySha256":"AAAA"}"#,
+    ] {
+        let v = outbound_json_from(&format!(
+            r#"{{"id":"s1","name":"n","protocol":"trojan","address":"a.com","port":443,
+                    "password":"pw","tlsSettings":{tls_settings}}}"#
+        ));
+        let tls = v["tls"].as_object().expect("trojan 恒有 TLS 块");
+        assert!(
+            !tls.contains_key("certificate_sha256")
+                && !tls.contains_key("certificate_public_key_sha256"),
+            "{tls_settings} 不应产生 pin 键：{tls:?}"
+        );
+    }
+}
+
+/// reality 下 pin **不下发**：内核 reality 客户端用自己的 verifier 覆盖 pin 回调，下发 = 静默不校验。
+#[test]
+fn reality_never_carries_cert_pins() {
+    // 正向对照：同一份 tlsSettings 在 security=tls 下 pin 是下发的。
+    let plain = outbound_json_from(&pin_node("vless", r#""uuid":"u-1""#, "tls", ""));
+    assert_eq!(
+        plain["tls"]["certificate_sha256"],
+        serde_json::json!([PIN_X_B64])
+    );
+
+    let v = outbound_json_from(&pin_node("vless", r#""uuid":"u-1""#, "reality", ""));
+    assert_eq!(v["tls"]["reality"]["public_key"], serde_json::json!("pk"));
+    assert!(v["tls"].get("certificate_sha256").is_none());
+    assert!(v["tls"].get("certificate_public_key_sha256").is_none());
+}
+
+/// naive 下 pin **不下发**：naive 出站不读这两键（Cronet 不接收），下发 = 静默不校验。
+#[test]
+fn naive_never_carries_cert_pins() {
+    let v = outbound_json_from(&pin_node(
+        "naive",
+        r#""username":"u","password":"pw""#,
+        "tls",
+        "",
+    ));
+    let keys: Vec<&str> = v["tls"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["enabled", "server_name"]);
+}

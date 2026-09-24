@@ -393,3 +393,22 @@ fn socks_outbound_maps_address_and_optional_credentials() {
     );
     assert_eq!(b.name, "t.example.com:1081", "无 tag → address:port");
 }
+
+#[test]
+fn xray_pinned_peer_cert_sha256_maps_to_certificate_sha256() {
+    let out = parse(json!({ "outbounds": [{
+            "protocol": "trojan",
+            "settings": { "servers": [{ "address": "a.com", "port": 443, "password": "pw" }] },
+            "streamSettings": { "security": "tls",
+                "tlsSettings": { "serverName": "s.com", "pinnedPeerCertSha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881,bad" } }
+        }] }));
+    assert_eq!(
+        out.servers[0]
+            .tls_settings
+            .as_ref()
+            .unwrap()
+            .certificate_sha256
+            .as_deref(),
+        Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881")
+    );
+}
