@@ -35,7 +35,7 @@
  */
 
 /**
- * Rust `UserConfig` 声明的 44 个序列化键，**按声明序**（顺序不参与语义，仅便于与 Rust 侧肉眼对齐）。
+ * Rust `UserConfig` 声明的 45 个序列化键，**按声明序**（顺序不参与语义，仅便于与 Rust 侧肉眼对齐）。
  *
  * SoT = `crates/config-engine/src/user_config/app_config.rs` 的 `UserConfig::FIELD_NAMES`。
  */
@@ -54,6 +54,7 @@ export const USER_CONFIG_FIELDS = [
   'dnsRules',
   'routeRuleOrder',
   'dnsRuleOrder',
+  'networkProfiles',
   'dnsServers',
   'dnsServerGroups',
   'dnsDefaults',

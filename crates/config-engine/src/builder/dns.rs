@@ -11,6 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::builder::helpers::probe_pool_inbound_tag;
+use crate::builder::network_env::{
+    netenv_required, EnvCondition, NetworkEnv, RuleEnv, NETENV_DNS_TAG, PRUNE_PROFILE_REF_INVALID,
+};
 use crate::singbox::endpoint::Endpoint;
 use crate::singbox::DnsConfig;
 use crate::singbox::DnsRule;
@@ -35,6 +38,7 @@ use crate::user_config::{
     DnsServerResource, BUILTIN_BOOTSTRAP_DNS_ID, BUILTIN_DOMESTIC_DNS_ID, BUILTIN_REMOTE_DNS_ID,
     DNS_BOOTSTRAP_TAG,
 };
+use polaris_helper_proto::Platform;
 
 use super::custom_rule_files::{custom_rule_file_base, plan_custom_rule, uses_fake_ip, RulePlan};
 use super::helpers::{
@@ -359,6 +363,9 @@ pub struct DnsConfigDeps {
     /// **绝不复用 `is_valid_srs_fn`**：JSON 无 SRS 魔数，复用会使「落盘后 DNS ext 分支」100% 不可达。
     /// 生产默认注入 [`crate::builder::custom_rule_files::ext_rule_file_exists`]；对拍 fixture 注入固定值。
     pub exists_fn: fn(&str) -> bool,
+    /// 运行期事实「macOS + TUN + 接管系统 DNS 生效」（网络场景 auto 探测源解析用，见
+    /// [`crate::builder::network_env::resolve_probe_source`]）。
+    pub system_dns_takeover_active: bool,
 }
 
 impl DnsConfigDeps {
@@ -901,6 +908,38 @@ pub fn build_dns_config(
         });
     }
 
+    // 网络场景专用 dhcp transport：只在有规则需要时生成（否则一个字节都不变）。
+    // 独立 tag，**不复用 dns-lan**（dns-lan 一旦存在会改写 .lan/.arpa/captive 的解析路径，spec D9）。
+    // 保留 id 被用户资源占用时（写入校验本应拦住，N2）tag 已存在：不再重复 push（重复 tag 会整核 FATAL），
+    // 环境项对那个非 dhcp 的同名 transport 由类型判据剔除。
+    if !emitted_resource_tags.contains(NETENV_DNS_TAG)
+        && netenv_required(
+            config,
+            Platform::parse(&deps.platform),
+            deps.system_dns_takeover_active,
+        )
+    {
+        dns_servers.push(DnsServer {
+            tag: NETENV_DNS_TAG.into(),
+            type_field: Some("dhcp".into()),
+            server: None,
+            server_port: None,
+            path: None,
+            predefined: None,
+            domain_resolver: None,
+            detour: None,
+            endpoint: None,
+            accept_search_domain: None,
+            accept_default_resolvers: None,
+            neighbor_domain: None,
+            address: None,
+            address_resolver: None,
+            inet4_range: None,
+            inet6_range: None,
+        });
+        emitted_resource_tags.insert(NETENV_DNS_TAG.to_string());
+    }
+
     // Q1 死循环防护（仅 Windows）：Win TUN strict_route(WFP) 把所有 :53 逼进 TUN；type:local 经 svchost → 进 TUN → ∞。
     // winLoopRisk 解耦（T2）：死环源于 Win strict_route(WFP) + type:local 本身 → 改为「Win + TUN」恒判。
     let win_loop_risk =
@@ -1374,12 +1413,28 @@ pub fn build_dns_config(
         (!matcher.is_empty()).then_some(matcher)
     };
 
+    // 网络场景环境项：与流量侧同一函数、按本次已生成的 server 集解析（第一道防线）。
+    let network_env = NetworkEnv::new(
+        &config.network_profiles,
+        Platform::parse(&deps.platform),
+        matches!(config.proxy_mode_type, ProxyModeType::Tun),
+        deps.system_dns_takeover_active,
+        &dns_config.servers,
+    );
     for rule in config.ordered_dns_rules() {
         if !rule.enabled || rule.effects.is_none() {
             continue;
         }
         let Some(effect) = rule.dns_effect() else {
             continue;
+        };
+        let env_variants: Vec<Option<EnvCondition>> = match network_env.for_rule(rule) {
+            RuleEnv::Unconditional => vec![None],
+            RuleEnv::Conditions(conditions) => conditions.into_iter().map(Some).collect(),
+            RuleEnv::Skip(reason) => {
+                deps.log_warn(&format!("{reason}:{}", rule.id));
+                continue;
+            }
         };
         let conditions = rule_conditions(rule);
         if conditions
@@ -1440,19 +1495,31 @@ pub fn build_dns_config(
             } else {
                 conditions.iter().filter_map(matcher_for).collect()
             };
-        for matcher in matchers {
-            append_dns_policy_action(
-                &mut dns_rules,
-                matcher,
-                &action,
-                rule.route_action(),
-                config.dns_defaults.as_ref(),
-                &config.dns_server_groups,
-                &emitted_resource_tags,
-                enable_fake_ip,
-                &rule.id,
-                deps.log,
-            );
+        // 展开（D2 OR）在规则级：每个环境变体产出一份完整规则序列。group 的 respond 不加环境项——
+        // 它靠 match_response 与本份 evaluate 联动，evaluate 没命中就不会产生该标签。
+        for env in &env_variants {
+            for matcher in &matchers {
+                let start = dns_rules.len();
+                append_dns_policy_action(
+                    &mut dns_rules,
+                    matcher.clone(),
+                    &action,
+                    rule.route_action(),
+                    config.dns_defaults.as_ref(),
+                    &config.dns_server_groups,
+                    &emitted_resource_tags,
+                    enable_fake_ip,
+                    &rule.id,
+                    deps.log,
+                );
+                if let Some(env) = env {
+                    for emitted in &mut dns_rules[start..] {
+                        if emitted.action.as_deref() != Some("respond") {
+                            env.apply_to_dns_rule(emitted);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1501,6 +1568,12 @@ pub fn build_dns_config(
         let externalize = proxy_mode != "direct";
         for rule in &dns_custom_rules {
             if !rule.enabled || rule.effects.is_some() || rule.bypass_fakeip != Some(true) {
+                continue;
+            }
+            // 桶是跨规则合并的，带不了逐规则的环境项 ⇒ 挂了场景的旧式 bypass 不进桶（否则在任何网络都
+            // 生效）。新规则走 effects.dns，不经这条兼容腿。
+            if rule.network_profile_id.is_some() {
+                deps.log_warn(&format!("{PRUNE_PROFILE_REF_INVALID}:{}", rule.id));
                 continue;
             }
             let bucket = if rule.action == RuleAction::Proxy {

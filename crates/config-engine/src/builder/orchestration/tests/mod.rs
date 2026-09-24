@@ -141,6 +141,7 @@ fn config_generation_norm_global_ignores_user_routing() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }];
     let norm = config_generation_norm(&config, None);
     // global 模式 → authoritative trafficRules 投影为 []

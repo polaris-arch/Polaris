@@ -152,6 +152,31 @@ export interface Rule {
    */
   tlsSpoof?: string;
   tlsSpoofMethod?: 'wrong-ack' | 'wrong-md5' | 'wrong-timestamp';
+  /**
+   * 仅在该网络场景（`NetworkProfile.id`）下生效；缺省 = 任何网络。场景不存在/停用/本机探测源不可用时
+   * 本规则不生成（绝不退化成无条件规则）。SoT = Rust `Rule.network_profile_id`。
+   */
+  networkProfileId?: string;
+}
+
+/** 网络场景的探测源：auto 由后端按平台与模式解析（渲染端不重算）。 */
+export type NetworkProbeSource = 'auto' | 'system' | 'dhcp';
+
+/**
+ * 网络场景（`UserConfig.networkProfiles[]`）。两种判据之间「任一命中」；搜索域是精确匹配（不含子域）。
+ * SoT = Rust `crates/config-engine/src/user_config/network_profile.rs`。
+ */
+export interface NetworkProfile {
+  id: string;
+  name: string;
+  enabled: boolean;
+  match: {
+    /** 当前网络 DNS 服务器地址落在其中任一网段即命中（CIDR 或裸 IP）。 */
+    dnsServerCidrs?: string[];
+    /** 当前网络搜索域精确等于其中之一即命中。 */
+    searchDomains?: string[];
+  };
+  probe: NetworkProbeSource;
 }
 
 /** 系统进程信息（进程快速选择器用）。 */

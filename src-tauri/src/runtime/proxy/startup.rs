@@ -2553,6 +2553,9 @@ impl ProxyRuntime {
             is_valid_srs_fn: is_valid_srs_file,
             // C12：真枚举本机所有非回环接口 CIDR（连入来源排除 guard / bypassLAN carve guard / mesh 重叠告警）。
             own_lan_cidrs: enumerate_own_lan_cidrs(),
+            // 网络场景 auto 探测源的「mac + TUN + 接管系统 DNS 生效」运行期事实。N1 只加字段、
+            // 暂按 false 注入（无场景规则时不影响任何输出；UI 入口在 N3 才出现）；真值注入归 N2。
+            system_dns_takeover_active: false,
             // A-0b：运行期观测到的 tailnet 地址（`serverId` → 裸地址）。真值源是
             // `ProxyRuntime::observed_tailnet`，由两条腿写：STATUS 帧（`sync_tailnet_rule_files`）
             // 与**本次起核前**刚跑过的 `write_tailnet_rule_files`（把盘上文件的主机位条目读回，

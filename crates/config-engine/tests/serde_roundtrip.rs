@@ -124,6 +124,8 @@ fn one_or_many_serializes_single_as_bare() {
         type_field: None,
         mode: None,
         rules: None,
+        dns_search_domain: None,
+        dns_server_address: None,
     };
     let v: serde_json::Value = serde_json::to_value(&r).unwrap();
     assert_eq!(v["rule_set"], json!("geosite-cn"));
@@ -171,6 +173,8 @@ fn one_or_many_serializes_many_as_array() {
         type_field: None,
         mode: None,
         rules: None,
+        dns_search_domain: None,
+        dns_server_address: None,
     };
     let v: serde_json::Value = serde_json::to_value(&r).unwrap();
     assert_eq!(v["rule_set"], json!(["geosite-cn", "geoip-cn"]));

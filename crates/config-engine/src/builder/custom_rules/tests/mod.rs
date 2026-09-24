@@ -15,6 +15,7 @@ fn deps_default() -> CustomRulesDeps {
         is_valid_srs_fn: |_| false, // res: 二进制 .srs 默认不存在
         exists_fn: |_| false,       // ext JSON 未落盘 → 回落 inline
         log: |_, _| {},
+        network_env: Default::default(),
     }
 }
 
@@ -72,6 +73,7 @@ fn rule_single(id: &str, t: RuleType, values: &[&str], action: RuleAction) -> Ru
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 
@@ -391,6 +393,7 @@ fn cross_dimension_or_emits_logical() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     let id_map = empty_id_map();
     let result = build_custom_rules(

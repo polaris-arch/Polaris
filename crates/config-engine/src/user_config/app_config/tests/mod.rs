@@ -30,6 +30,8 @@ fn fully_populated() -> UserConfig {
         dns_rules: Some(Vec::new()),
         route_rule_order: Vec::new(),
         dns_rule_order: Vec::new(),
+        // 非空：`skip_serializing_if = "Vec::is_empty"`，空表不进投影 ⇒ 相等断言会少测这一项。
+        network_profiles: vec![NetworkProfile::default()],
         dns_servers: Vec::new(),
         dns_server_groups: Vec::new(),
         dns_defaults: Some(DnsPolicyDefaults::default()),

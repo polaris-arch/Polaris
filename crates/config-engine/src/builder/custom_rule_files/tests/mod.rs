@@ -24,6 +24,7 @@ fn rule_single(t: RuleType, values: &[&str]) -> Rule {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 
@@ -94,6 +95,7 @@ fn plan_inline_when_has_geosite() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     assert!(matches!(plan_custom_rule(&rule), RulePlan::Inline));
 }
@@ -134,6 +136,7 @@ fn plan_ext_or_group_mergeable() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     let plan = plan_custom_rule(&rule);
     match plan {
@@ -166,6 +169,7 @@ fn plan_ext_logical_when_cross_dimension_or() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     let plan = plan_custom_rule(&rule);
     match plan {

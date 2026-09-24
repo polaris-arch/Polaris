@@ -56,6 +56,7 @@ fn ext_rule(id: &str, target: Option<&str>) -> Rule {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 

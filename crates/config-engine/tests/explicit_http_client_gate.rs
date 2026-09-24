@@ -196,6 +196,7 @@ fn gate_deps(platform: &str, serve_dir: Option<String>) -> GenerateConfigDeps {
         own_lan_cidrs: vec![],
         log: |_, _| {},
         on_degraded: || {},
+        system_dns_takeover_active: false,
     }
 }
 

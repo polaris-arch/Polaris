@@ -242,3 +242,33 @@ fn tailcat_settings_deserialize_from_real_keys() {
         "未建模键应进透传袋"
     );
 }
+
+/// 网络场景的真实键名：`networkProfiles[].match.{dnsServerCidrs,searchDomains}` + `probe`，
+/// 规则侧 `networkProfileId`。漏 rename ⇒ 场景静默为空 ⇒ 挂场景的规则全部被判「引用失效」不生成。
+#[test]
+fn network_profiles_deserialize_from_real_keys() {
+    use polaris_config_engine::user_config::NetworkProbeSource;
+    let uc: UserConfig = serde_json::from_value(json!({
+        "servers": [],
+        "networkProfiles": [{
+            "id": "np-corp", "name": "公司网络", "enabled": true,
+            "match": { "dnsServerCidrs": ["10.20.0.0/16"], "searchDomains": ["corp.example"] },
+            "probe": "dhcp"
+        }],
+        "trafficRules": [{ "id": "r", "type": "domainSuffix", "values": ["corp.example"],
+            "action": "direct", "enabled": true, "networkProfileId": "np-corp" }]
+    }))
+    .expect("真实 config 应可反序列化");
+    let p = &uc.network_profiles[0];
+    assert_eq!(p.id, "np-corp");
+    assert_eq!(p.criteria.dns_server_cidrs, ["10.20.0.0/16"]);
+    assert_eq!(p.criteria.search_domains, ["corp.example"]);
+    assert_eq!(p.probe, NetworkProbeSource::Dhcp);
+    assert_eq!(
+        uc.effective_traffic_rules()[0]
+            .network_profile_id
+            .as_deref(),
+        Some("np-corp"),
+        "Rule.networkProfileId 没读进来（漏 rename ⇒ 场景规则退化成无条件规则）"
+    );
+}

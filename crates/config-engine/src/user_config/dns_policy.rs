@@ -25,6 +25,10 @@ pub fn dns_server_tag(id: &str) -> String {
         BUILTIN_DOMESTIC_DNS_ID => "dns-domestic".to_string(),
         BUILTIN_REMOTE_DNS_ID => "dns-remote".to_string(),
         BUILTIN_BOOTSTRAP_DNS_ID => DNS_BOOTSTRAP_TAG.to_string(),
+        // 保留 id：「当前网络 DHCP 下发的 DNS」→ 场景专用 dhcp transport（按需生成，见 builder::network_env）。
+        crate::user_config::network_profile::BUILTIN_NETENV_DHCP_ID => {
+            crate::builder::network_env::NETENV_DNS_TAG.to_string()
+        }
         _ => {
             let safe: String = id
                 .chars()

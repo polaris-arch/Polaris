@@ -102,6 +102,7 @@ fn rule(type_field: RuleType, values: Vec<&str>, conditions: Option<Vec<RuleCond
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 

@@ -13,6 +13,7 @@ pub mod helpers;
 pub mod hotswitch;
 pub mod inbounds;
 pub mod log;
+pub mod network_env;
 pub mod orchestration;
 pub mod outbound;
 pub mod outbound_helpers;

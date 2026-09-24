@@ -28,6 +28,7 @@ fn deps_false() -> DnsConfigDeps {
         rule_resources_path: "/fake/rule-resources/".into(),
         is_valid_srs_fn: |_| false,
         exists_fn: |_| false,
+        system_dns_takeover_active: false,
     }
 }
 
@@ -79,6 +80,7 @@ fn dns_effect_rule(
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 
@@ -948,6 +950,7 @@ fn custom_bypass_fakeip_inline_rule() {
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
+            network_profile_id: None,
         }];
         let c = build_dns_config(&cfg, &BTreeMap::new(), &deps_false());
         c.rules
