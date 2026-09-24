@@ -170,7 +170,7 @@ fn str(v: &Value) -> Option<String> {
 /// mihomo `fingerprint`（**证书固定**，不是 `client-fingerprint` 那个 uTLS 指纹）→ `certificateSha256`。
 ///
 /// 语义依据（MetaCubeX/mihomo `component/ca/fingerprint.go` @ab405ba :14-57，
-/// https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/component/ca/fingerprint.go#L14-L57）：
+/// <https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/component/ca/fingerprint.go#L14-L57>）：
 /// 去 `:` 后 hex 解码、必须 32 字节，与 `sha256.Sum256(cert.Raw)` 比 —— 即**整张证书 DER** 的摘要
 /// （不是公钥）⇒ 映射到 sing-box `certificate_sha256`。浏览器名（`chrome` 等）mihomo 直接报错，
 /// 这里经 `keep_valid_cert_pins` 过滤掉，不留死值。
