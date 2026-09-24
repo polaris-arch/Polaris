@@ -10,7 +10,7 @@
 //! | 鉴权边界 | token 行 | token 行 | **SO_PEERCRED**（内核背书）+ uid 允许列表 |
 //! | 帧读取 | 行读（泛型 `std::io`，走 [`crate::line_io`]） | **裸 Win32 `HANDLE` 整帧读** | 行读（走 [`crate::line_io`]） |
 //! | freeport 持有者定位 | `lsof` + `ps` + kill 子进程 | `GetExtendedTcpTable` | `ss` 正则 + `/proc` + `kill(2)` |
-//! | install-core | 有（+ xattr/codesign hook） | 无（NSIS 安装器负责） | 有（+ 保守 `lib*.so` prune） |
+//! | install-core | 有（+ xattr/codesign hook） | 有（`sing-box.exe` + 核在跑回 `ERR busy`） | 有（+ 保守 `lib*.so` prune） |
 //!
 //! ## 门控矩阵（**在模块声明处**，非文件内逐 item）
 //!

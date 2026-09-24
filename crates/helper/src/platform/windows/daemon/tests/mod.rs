@@ -15,15 +15,36 @@ fn parse_args_all_flags() {
         r"C:\conf",
         "--support",
         r"C:\ProgramData\Polaris",
-        "--coredir",
-        r"C:\core",
         "--console",
     ]));
     assert_eq!(a.singbox_bin, r"C:\sb.exe");
     assert_eq!(a.conf_dir, r"C:\conf");
     assert_eq!(a.support_dir, r"C:\ProgramData\Polaris");
-    assert_eq!(a.core_dir, r"C:\core");
     assert!(a.console);
+}
+
+/// `--coredir` 已删（P4）：它曾是「接受并忽略」的空壳，而受保护内核目录现在由 `--support` 派生。
+/// 传了也只是被当成未知 flag 丢掉，**不得**再有字段承接它 —— 否则 SCM ImagePath 就又成了一条
+/// 能改核路径的入口。这里正面钉住「其余 flag 照常解析」，反面钉住「coredir 不改变任何解析结果」。
+#[test]
+fn parse_args_ignores_removed_coredir_flag() {
+    let with_flag = parse_args(argv(&[
+        "--singbox",
+        r"C:\sb.exe",
+        "--support",
+        r"C:\ProgramData\Polaris",
+        "--coredir",
+        r"C:\evil\core",
+    ]));
+    let without_flag = parse_args(argv(&[
+        "--singbox",
+        r"C:\sb.exe",
+        "--support",
+        r"C:\ProgramData\Polaris",
+    ]));
+    assert_eq!(with_flag.singbox_bin, r"C:\sb.exe");
+    assert_eq!(with_flag.support_dir, r"C:\ProgramData\Polaris");
+    assert_eq!(with_flag, without_flag, "--coredir 不得影响任何解析结果");
 }
 
 #[test]
@@ -33,7 +54,6 @@ fn parse_args_support_defaults_and_service_mode() {
     assert_eq!(a.support_dir, super::super::DEFAULT_SUPPORT_DIR);
     assert!(!a.console);
     assert_eq!(a.conf_dir, "");
-    assert_eq!(a.core_dir, "");
 }
 
 #[test]

@@ -68,7 +68,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::logging::SING_BOX_TARGET;
-use crate::runtime::helper::{HelperStatusSnapshot, HelperStopOps};
+use crate::runtime::helper::{
+    HelperBuildProbe, HelperStatusSnapshot, HelperStopOps, InstallCoreError,
+    InstallCoreUnsupportedRecord,
+};
 use crate::runtime::route_binding::plan_runtime_bindings;
 
 /// 就绪等待预算的**下限**（ms）——上游 `ProxyManager.CORE_READY_TIMEOUT_MS`（:524）那个固定门的原值。
@@ -307,11 +310,41 @@ pub(super) fn protected_core_cache_hit(
     })
 }
 
+/// 能力缓存是否命中（**纯函数**）。
+///
+/// 失效键 = helper 自报的 `build_identity`。它在**发布构建**上必变：`build_identity::current()`
+/// 取 `POLARIS_BUILD_ID`（发布流水线注入的 `github.sha`），每次发版都不同 ——`HelperManager` 正是
+/// 拿同一个比较判 `upgradeable`（`manager.rs` 的 `same_proto_build_mismatch`）。
+///
+/// **源码构建下它不变**（如实登记，别当它是万能键）：`POLARIS_BUILD_ID` 未注入时
+/// `build_identity::current()` 回落 `CARGO_PKG_VERSION` —— 开源项目的本地构建、CI 的非发布产物
+/// 都走这条。于是「重编 helper → 点升级/修复 → 新 helper 仍自报同一个 `0.x.y`」这条链上，
+/// 光靠本键失效不了。那一格由 [`crate::runtime::helper::HelperRuntime::install`] 的成功分支主动清记号补上
+/// （`runtime/helper.rs` 的 `clear_install_core_unsupported`）：二进制换了就作废，与它自报什么无关。
+///
+/// [`HelperBuildProbe::Unreachable`] 恒判不命中：探不到 ≠ 还是那个 helper。宁可白跑一轮完整对账，
+/// 也不能把「没问到」当成身份不变——那会让缓存永不失效。
+pub(super) fn install_core_unsupported_cache_hit(
+    cached: Option<&InstallCoreUnsupportedRecord>,
+    probe: &HelperBuildProbe,
+) -> bool {
+    match (cached, probe) {
+        (Some(cached), HelperBuildProbe::Reported(now)) => &cached.helper_build_id == now,
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 enum ProtectedCoreReconcileOutcome {
     Cached,
     Verified,
     Promoted(String),
+    /// 这个 helper 不支持 install-core：本轮跳过（能力缓存命中）或刚刚记下（首次撞上）。
+    /// `bool` = 是否由缓存命中提前退出（命中与首次撞上的日志必须可分辨，否则「能力探测没跑」
+    /// 与「跑了且命中」在现场长得一样）。
+    InstallCoreUnsupported {
+        from_cache: bool,
+    },
 }
 
 pub(super) fn attestation_commit_allowed(
@@ -1843,11 +1876,18 @@ impl ProxyRuntime {
     /// [`attest_running_core_binary`](Self::attest_running_core_binary) 按**实跑二进制**判 ——
     /// 提升失败但受保护核本来就已是新版（例如上一轮已推成功）时，报警才是噪音。
     /// 这是刻意的分工：**本方法是机制，自证是判据**。
+    ///
+    /// ⚠️ **但在 Windows 的存量机器上那个判据并不存在**（如实登记，别把它当兜底）：
+    /// `running_exe_path` 在 Windows 上恒 `None`（Medium IL 的 app 读不了 SYSTEM child），
+    /// 自证的第二条腿靠 D2 的 helper `status` 回传 `image=` —— 而**旧 helper 没有这个字段**。
+    /// 于是「旧 helper + Windows」这一格里自证恒落 `Unobservable`：只 warn，不报警、不判失败。
+    /// 那正是本方法失败时最需要判据的那一格（旧 helper 也是 `ERR unknown` 的那一格）。
+    /// helper 升级到本批之后这条腿才真的在；在此之前，Windows 上现场只有日志。
     async fn reconcile_protected_core(&self, active_core: &Path) {
         use crate::runtime::core_promote as promote;
 
         if !promote::platform_has_protected_core(self.helper.platform()) {
-            return; // Windows：核走 app 侧，helper 的 --singbox 即 app 侧核路径，无受保护目录。
+            return; // 当前三平台恒假不成立；留着是给「新增平台没有受保护目录」一条早退。
         }
         let Some(src_dir) = active_core.parent().map(Path::to_path_buf) else {
             log::warn!(
@@ -1868,6 +1908,22 @@ impl ProxyRuntime {
 
         // 全程同步 FS + 阻塞 IPC（sha256 两个 80MB 量级文件 + 可能的 30s install-core）→ spawn_blocking。
         let outcome = tokio::task::spawn_blocking(move || {
+            // 能力缓存：这个 helper 构建已经回过 `ERR unknown` 就不必再走整条重路。放在**最前**
+            // ——放在 stage 之后等于白省，两个 80MB 的 sha256 才是这条腿的主要开销。
+            // 探测本身是一次微秒级 ping；探不到（Unreachable）判不命中，宁可白跑一轮。
+            let cached_unsupported = helper.install_core_unsupported_note();
+            // `&&` 的短路是**有意的**：没记过「不支持」时这一路必然不命中，为它去 ping 等于给
+            // mac/linux 的稳态热路径平白加一次 IPC（那两个平台永远不会走到记号那一步）。
+            if cached_unsupported.is_some()
+                && install_core_unsupported_cache_hit(
+                    cached_unsupported.as_ref(),
+                    &helper.helper_build_probe(),
+                )
+            {
+                return Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported {
+                    from_cache: true,
+                });
+            }
             // 首次完整对账通过后，同一会话内只做廉价 metadata 对账。两侧必须同时可观测且与缓存
             // 完全一致才命中；任一读取失败/变化都清缓存并回到 SHA256，不把“观测不到”当“没变化”。
             let active_before = promote::payload_stamp(&src_dir, &core_filename)?;
@@ -1914,13 +1970,30 @@ impl ProxyRuntime {
                 return Err(format!("现役核目录没有可提升的文件：{}", src_dir.display()));
             }
             promote::stage_promote_dir(&src_dir, &staged_dir, &names)?;
+            // 🔴 身份必须在**发 install-core 之前**探。事后再探会把「回 ERR unknown 的那个
+            // helper」与「此刻在管道那头的 helper」混为一谈：UAC 重装是秒级操作，两者之间完全
+            // 可能已经换代 ⇒ 记号写成「**新** helper 不支持」⇒ 本会话内永久跳过对账，而新
+            // helper 其实支持。反过来（探完才换代）只会让记号挂在旧身份上 ⇒ 下次探到新身份即
+            // 失效、重试 —— 方向是安全的。成本与 install-core 本身同量级下可忽略（一次 ping）。
+            let build_before = helper.helper_build_probe();
             let r = helper.install_core(&staged_dir, &src_hash);
             // 暂存目录用完即清（硬链不占额外空间，但留着会让下一轮的"先清后建"多做一次 I/O，
             // 且用户目录里躺一个 80MB 影子核容易被误读为"又一份核"）。
             let _ = std::fs::remove_dir_all(&staged_dir);
             // 提升成功也不立即把 metadata 当作“完整对账通过”：helper 对核心做了 hash 校验，但 sidecar
             // 复制没有独立摘要。下一次连接完整验一次后再进入热路径，避免扩大信任假设。
-            r.map(|()| ProtectedCoreReconcileOutcome::Promoted(src_hash))
+            match r {
+                Ok(()) => Ok(ProtectedCoreReconcileOutcome::Promoted(src_hash)),
+                // 能力缺失才记号；`Failed` 一律不记——那可能是磁盘满/瞬态 IPC，下次就好了，
+                // 记下来会把一次偶发失败变成整个会话都不再尝试。
+                // 用的是 `build_before`（发 install-core **之前**探到的身份），理由见那行注释；
+                // 「探不到就不记」由 `note_install_core_unsupported` 统一持有。
+                Err(InstallCoreError::Unsupported) => {
+                    helper.note_install_core_unsupported(&build_before);
+                    Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { from_cache: false })
+                }
+                Err(e) => Err(e.to_string()),
+            }
         })
         .await;
 
@@ -1937,7 +2010,24 @@ impl ProxyRuntime {
                 &h[..h.len().min(12)],
                 core_dir.display()
             ),
-            // 只警告不中止：判据在下游的实跑自证（见方法文档）。
+            // 「没执行」必须自曝：命中与首次撞上分两句，否则「能力探测根本没跑」与「跑了且命中」
+            // 在日志里长得一样。行为与本批前完全一致——warn 一句、继续起核（spec §3.5）。
+            Ok(Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { from_cache })) => {
+                if from_cache {
+                    log::warn!(
+                        "已装 helper 不支持 install-core（能力缓存命中，{elapsed_ms}ms）→ 跳过受保护核对账；\
+                         helper 升级后自动重试，本次仍按 helper 锁定的核起（加固未生效）"
+                    );
+                } else {
+                    log::warn!(
+                        "已装 helper 不支持 install-core（ERR unknown，{elapsed_ms}ms）→ 记下能力缺失，\
+                         本会话内不再重复推送；起核继续（加固未生效，等 helper 升级）"
+                    );
+                }
+            }
+            // 只警告不中止：判据在下游的实跑自证（见方法文档）。**Windows + 旧 helper 这一格
+            // 没有那个判据**（`running_exe_path` 恒 None，第二腿要的 `image=` 旧 helper 不带）
+            // ⇒ 自证恒 `Unobservable`，现场只剩这一行 warn。
             Ok(Err(e)) => log::warn!(
                 "受保护核提升失败（{elapsed_ms}ms；起核继续，由起核后自证判定是否告警）：{e}"
             ),

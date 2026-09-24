@@ -526,3 +526,318 @@ fn start_core_records_the_identity_baseline_on_both_response_legs() {
         "无 timing 腿没清基线 —— 上一次 start 的陈值会被拿去比同号新核"
     );
 }
+
+/// **S-2 记号语义**：失效键取「探到的那次身份」，`Unreachable` 一律不记（也不留旧值）。
+///
+/// 「探不到就不记」这条以前写在 `reconcile_protected_core` 的闭包里，够不着任何行为测试；
+/// 搬到 `HelperRuntime` 之后它有了直接判据。**第三条最要紧**：探不到时若只是「不覆盖」，
+/// 旧记号会原地留着 —— 那正是「没有失效键的缓存」的另一种长相。
+#[test]
+fn install_core_note_keys_on_the_probed_build_and_drops_on_an_unreachable_probe() {
+    let (rt, _dir) = runtime();
+    assert!(
+        rt.install_core_unsupported_note().is_none(),
+        "初始必须无记号，否则首次起核直接跳过对账 = 加固整条不生效"
+    );
+
+    rt.note_install_core_unsupported(&HelperBuildProbe::Reported(Some("build-A".to_owned())));
+    assert_eq!(
+        rt.install_core_unsupported_note(),
+        Some(InstallCoreUnsupportedRecord {
+            helper_build_id: Some("build-A".to_owned())
+        }),
+        "记号必须带上探到的构建身份（那是它唯一的失效键）"
+    );
+
+    // 探不到 ≠ 还是那个 helper：不记新的，**也不许把旧的留着**。
+    rt.note_install_core_unsupported(&HelperBuildProbe::Unreachable);
+    assert!(
+        rt.install_core_unsupported_note().is_none(),
+        "探不到身份时留着旧记号 = 一个永不失效的缓存"
+    );
+
+    // 旧 helper 如实不带 build_identity：`Reported(None)` 本身是稳定身份，照记。
+    rt.note_install_core_unsupported(&HelperBuildProbe::Reported(None));
+    assert_eq!(
+        rt.install_core_unsupported_note(),
+        Some(InstallCoreUnsupportedRecord {
+            helper_build_id: None
+        }),
+        "`Reported(None)` 与 `Unreachable` 必须分得开"
+    );
+}
+
+/// 🔴 **S-2 反向对照：失败的 install 绝不清记号。**
+///
+/// 清记号挂的是「提权脚本真跑成功 ⇒ 磁盘上的 helper 已换一份」，不是「`install()` 被调了一次」。
+/// 没有这一条，把清除挪到方法开头（每次点一下就清，哪怕缺二进制早返）也照样全绿 ——
+/// 那等于把能力缓存变成「用户每点一次修复就白跑一轮 80MB 对账」。
+#[test]
+fn a_failed_install_never_clears_the_capability_note() {
+    std::env::remove_var("POLARIS_HELPER_PATH");
+    let (rt, _dir) = runtime();
+    rt.note_install_core_unsupported(&HelperBuildProbe::Reported(Some("build-A".to_owned())));
+
+    let r = rt.install();
+    assert!(!r.success, "无 bundled helper 必须早返失败（不弹提权框）");
+    assert_eq!(
+        rt.install_core_unsupported_note(),
+        Some(InstallCoreUnsupportedRecord {
+            helper_build_id: Some("build-A".to_owned())
+        }),
+        "install 失败却把记号清了 —— 清除被挂在了「调用发生」而不是「二进制被替换」上"
+    );
+}
+
+/// 🔴 **S-2 接线：`install()` 的成功分支必须清掉能力记号。**
+///
+/// # 为什么这条非有不可
+///
+/// 记号的失效键是 helper 自报的 `build_identity`，而
+/// `polaris_helper_proto::build_identity::current()` 在 `POLARIS_BUILD_ID` 未注入时落
+/// `CARGO_PKG_VERSION` —— **开源项目的源码构建、CI 的非发布产物都不注入**。于是这条链上失效键
+/// 恒不变：旧 helper 回 `ERR unknown` → 记号 `{build=0.x.y}` → 拉新源码重编 helper → 设置页点
+/// 「升级/修复」（同一个 app 进程）→ 新 helper 仍自报 `0.x.y` → 缓存**命中** → 本会话内
+/// install-core 永不再试，受保护目录停在旧核，现场只有一句 warn 可查。
+/// app 自己刚把 helper 装了一遍，这是能拿到的最精确的失效事件。
+///
+/// # 为什么是源码级
+///
+/// `EscalationOutcome::Success` 那一臂要真跑一次提权脚本（UAC/osascript/pkexec）才到得了，
+/// 属真机门；本机能测的只有失败腿（上面那条反向对照）。
+///
+/// 变异锁：删掉臂里的 `clear_install_core_unsupported()` → 第一条红；
+/// 挪到 `wait_until_ready` 之后 → 第三条红；挪出 Success 臂（例如方法开头）→ 第一条红
+/// 且上面那条行为对照同时红。
+#[test]
+fn a_successful_install_clears_the_install_core_capability_note() {
+    let body = impl_method_body(
+        &crate_code("runtime/helper.rs"),
+        "    pub fn install(&self) -> HelperActionResult {",
+    );
+    let arm = crate::commands::guard_scan::match_arm_body(
+        &body,
+        "Ok(EscalationOutcome::Success) => {",
+        "Ok(EscalationOutcome::",
+    );
+    // 切点自检：臂体不是空的、且确实是那条成功臂（含就绪轮询）。空切片上的正面断言必然假红，
+    // 但「臂体里混进了别的臂」会造成**假绿** —— 后者由 `match_arm_body` 自己的输出自检兜。
+    assert!(
+        arm.contains("wait_until_ready"),
+        "切点自检失败：切出来的不是 Success 臂（里面没有就绪轮询）"
+    );
+    assert!(
+        arm.contains(concat!("clear_install_core_unsupported", "()")),
+        "install 成功后没清「helper 不支持 install-core」的记号 —— 源码构建下 build_identity \
+         不变，失效键指望不上，重装 helper 也唤不醒受保护核对账"
+    );
+    // 只有一个调用点：散在多处会让「射程到底覆盖哪条腿」取决于书写顺序。
+    assert_eq!(
+        body.matches(concat!("clear_install_core_unsupported", "()"))
+            .count(),
+        1,
+        "install() 里出现了不止一个清除调用点"
+    );
+    // 顺序：清除挂在**二进制已被替换**这个事实上，不是挂在「新 helper 就绪」上 ——
+    // 回退粒度要等于故障粒度。就绪轮询可能超时（NotReady），而那时二进制早就换过了。
+    let clear_at = arm
+        .find(concat!("clear_install_core_unsupported", "()"))
+        .expect("上面刚断言过");
+    let ready_at = arm.find("wait_until_ready").expect("上面刚断言过");
+    assert!(
+        clear_at < ready_at,
+        "清记号必须先于就绪轮询：轮询超时走 NotReady 分支，而那时 helper 二进制已经换了一份"
+    );
+}
+
+// ===== install-core：Windows 上「写出了、0 字节就断开」的归类 =====
+
+/// 把写出的帧记下来的流（验复核帧是**无副作用**的空参 install-core）。
+struct RecordingStream {
+    inner: polaris_helper_client::MockStream,
+    frames: Arc<Mutex<Vec<String>>>,
+}
+
+impl ConnectionStream for RecordingStream {
+    fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.inner.read_until_timeout(buf)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(data)?;
+        self.frames
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(data).into_owned());
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown()
+    }
+}
+
+struct RecordingConnector {
+    streams: Mutex<Vec<polaris_helper_client::MockStream>>,
+    frames: Arc<Mutex<Vec<String>>>,
+    connects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Connector for RecordingConnector {
+    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        let mut streams = self.streams.lock().unwrap();
+        if streams.is_empty() {
+            return Err(ClientError::Connect("测试连接已耗尽".to_owned()));
+        }
+        Ok(Box::new(RecordingStream {
+            inner: streams.remove(0),
+            frames: Arc::clone(&self.frames),
+        }))
+    }
+}
+
+struct InstallCoreRun {
+    result: Result<(), InstallCoreError>,
+    connects: usize,
+    frames: Vec<String>,
+}
+
+fn run_install_core(
+    platform: Platform,
+    streams: Vec<polaris_helper_client::MockStream>,
+) -> InstallCoreRun {
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let connector = RecordingConnector {
+        streams: Mutex::new(streams),
+        frames: Arc::clone(&frames),
+        connects: Arc::clone(&connects),
+    };
+    let client = HelperClient::new(Box::new(connector), platform, "TOK");
+    let result = install_core_with_client(&client, Path::new(r"C:\stage"), &"ab".repeat(32));
+    let frames = frames.lock().unwrap().clone();
+    InstallCoreRun {
+        result,
+        connects: connects.load(Ordering::SeqCst),
+        frames,
+    }
+}
+
+fn silent() -> polaris_helper_client::MockStream {
+    // 连上、收下整帧、一个字节不回就断开（= 旧 Windows helper 对不认识命令的真机表现）。
+    polaris_helper_client::MockStream::with_response(Vec::new())
+}
+
+fn replying(line: &str) -> polaris_helper_client::MockStream {
+    polaris_helper_client::MockStream::with_response(line.as_bytes().to_vec())
+}
+
+/// 旧 Windows helper：装核帧 0 字节、复核帧也 0 字节 ⇒ `Unsupported`（能力缓存得以记号）；
+/// 复核帧必须是空参 install-core（认识它的 helper 在落盘前就回 bad-args，不产生任何写）。
+#[test]
+fn windows_install_core_silent_twice_is_unsupported() {
+    let run = run_install_core(Platform::Win, vec![silent(), silent()]);
+    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
+    assert_eq!(run.connects, 2, "0 字节之后必须复核恰好一帧");
+    assert_eq!(
+        run.frames,
+        vec![
+            format!("TOK\ninstall-core\nC:\\stage\n{}\n", "ab".repeat(32)),
+            "TOK\ninstall-core\n\n\n".to_owned(),
+        ],
+        "复核帧不是空参 install-core"
+    );
+}
+
+/// 旧 helper 偶尔来得及把 `ERR unknown` 送到（NoWait 竞态的另一面）⇒ 同样 `Unsupported`。
+#[test]
+fn windows_install_core_silent_then_err_unknown_is_unsupported() {
+    let run = run_install_core(Platform::Win, vec![silent(), replying("ERR unknown\n")]);
+    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
+    assert_eq!(run.connects, 2);
+}
+
+/// 永久误记号的防线：**新** helper 装核途中偶发断开，复核帧得到任何文本应答（它认识
+/// install-core）⇒ `Failed`，不记号。
+#[test]
+fn windows_install_core_silent_then_any_reply_is_a_transient_failure() {
+    for reply in [
+        "ERR bad-args\n",
+        "ERR busy\n",
+        "ERR coredir-acl-weakened C:\\x\n",
+    ] {
+        let run = run_install_core(Platform::Win, vec![silent(), replying(reply)]);
+        let Err(InstallCoreError::Failed(msg)) = &run.result else {
+            panic!("{reply:?} ⇒ {:?}", run.result);
+        };
+        assert!(msg.contains("复核帧得到应答"), "{msg}");
+        assert_eq!(run.connects, 2);
+    }
+    // 复核连不上（helper 正被 SCM 重启）同样判不了能力 ⇒ Failed。
+    let run = run_install_core(Platform::Win, vec![silent()]);
+    assert!(
+        matches!(&run.result, Err(InstallCoreError::Failed(m)) if m.contains("复核帧也失败")),
+        "{:?}",
+        run.result
+    );
+}
+
+/// 连不上 / 请求没写出 ⇒ `Failed`，且不发复核帧（那不是「写出了、0 字节」）。
+#[test]
+fn windows_install_core_connect_or_write_failure_stays_failed_without_probe() {
+    let run = run_install_core(Platform::Win, vec![]);
+    assert!(
+        matches!(run.result, Err(InstallCoreError::Failed(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.connects, 1, "连不上不得复核");
+
+    let run = run_install_core(
+        Platform::Win,
+        vec![polaris_helper_client::MockStream::broken(
+            std::io::ErrorKind::BrokenPipe,
+        )],
+    );
+    assert!(
+        matches!(run.result, Err(InstallCoreError::Failed(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.connects, 1, "请求没写出不得复核");
+}
+
+/// 只对 Windows：mac/linux 的旧 helper 会如实回 `ERR unknown`，0 字节在那里是真故障。
+#[test]
+fn non_windows_install_core_silence_is_a_plain_failure() {
+    for platform in [Platform::Mac, Platform::Linux] {
+        let run = run_install_core(platform, vec![silent(), silent()]);
+        assert!(
+            matches!(run.result, Err(InstallCoreError::Failed(_))),
+            "{platform:?} ⇒ {:?}",
+            run.result
+        );
+        assert_eq!(run.connects, 1, "{platform:?} 不得复核");
+    }
+}
+
+/// 正面对照：有文本应答时照旧分类（`OK installed` / `ERR unknown` / 其它 `ERR`），不复核。
+#[test]
+fn install_core_textual_replies_are_classified_without_probe() {
+    let run = run_install_core(Platform::Win, vec![replying("OK installed\n")]);
+    assert_eq!(run.result, Ok(()));
+    assert_eq!(run.connects, 1);
+
+    let run = run_install_core(Platform::Win, vec![replying("ERR unknown\n")]);
+    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
+    assert_eq!(run.connects, 1);
+
+    let run = run_install_core(Platform::Win, vec![replying("ERR hash-mismatch\n")]);
+    assert!(
+        matches!(run.result, Err(InstallCoreError::Failed(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.connects, 1);
+}

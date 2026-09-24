@@ -67,8 +67,9 @@ pub mod win {
     /// `OK iface-metric` / `ERR iface-denied` / `ERR bad-metric` / `ERR set-metric ...`（退役保留兼容：把内核接口
     /// metric 设高，PowerShell `Set-NetIPInterface`；win proto v3-v5，新客户端 EXPECTED_PROTO 已降回 v1 不再调用）。
     pub const IFACE_METRIC: &str = "iface-metric";
-    // 注意：Windows **无** install-core（macOS 专属内核持久化，Windows 由 app 侧 NSIS 安装器处理；
-    // `helper-win/main.go:22` coreDir flag 接受并忽略仅为镜像 mac 形态）。
+    // 注意：install-core 不在本模块 —— 三平台同名同参，常量取 [`super::mac::INSTALL_CORE`]。
+    // （Windows 的 install-core 是 Polaris P4 新增，上游 Go `helper-win` 没有；那边的 `--coredir`
+    // 是「接受并忽略」的空壳 flag，Polaris 这侧已删，coreDir 改由 `--support` 派生。）
 }
 
 /// Linux 专属命令（移植自 `helper-linux/helper.go`）。

@@ -5,6 +5,7 @@
 
 // 具体 item 才局部放开 crate 级 `#![deny(unsafe_code)]`：windows-sys FFI 调用
 //（OpenProcess/TerminateProcess/CreateProcessW/...）必须 unsafe。每处 unsafe 块附 SAFETY 理由。
+use crate::platform::windows::coreacl::{self, ObjectSecurity};
 use crate::platform::windows::logic::{
     eq_ignore_ascii_case_path, filepath_base, filepath_dir, filter_listen_pids, is_locked_singbox,
     local_port_from_net_order, AF_INET, AF_INET6, MIB_TCP_STATE_LISTEN,
@@ -23,14 +24,24 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, FALSE, FILETIME, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, LocalFree, ERROR_INVALID_PARAMETER, FALSE, FILETIME, GENERIC_ALL,
+    GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    AclSizeInformation, GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    SYNCHRONIZE,
+    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS,
+    FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_EXECUTE,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    FILE_WRITE_DATA, FILE_WRITE_EA, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Console::{
     AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
@@ -748,6 +759,23 @@ impl ProcOps for WinProcOps {
             .args(["interface", "ipv6", "set", "global", "forwarding=enabled"])
             .spawn();
     }
+
+    fn read_object_security(&self, path: &str) -> Result<ObjectSecurity, String> {
+        // P4 ACL 自检的搬运腿（判据在 `coreacl`，本函数一个判断都不做）。委托无状态自由函数
+        //（不捕获 &self，与本文件其它 FFI 原语同款组织）。
+        read_object_security_raw(path)
+    }
+
+    fn list_dir_names(&self, dir: &str) -> Result<Vec<String>, String> {
+        // 取材面的枚举腿：目录里**实际有什么**就问什么（硬编码两个白名单名会漏掉攻击者预创建、
+        // 带去继承 DACL 的第三个文件 —— 见 `coreacl::extend_targets_with_dir_entries`）。
+        // 子目录也一并返回：受保护目录里一个谁都能写的子目录同样是可注入面。
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir({dir}) failed: {e}"))?;
+        Ok(entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect())
+    }
 }
 
 impl NetTableOps for WinProcOps {
@@ -1191,6 +1219,281 @@ fn enable_ip_forwarding_ipv4_registry() {
     };
     // SAFETY: 关键句柄。
     unsafe { RegCloseKey(hkey) };
+}
+
+// ===== P4：受保护核目录的 owner/DACL 读取（搬运腿，判据在 `coreacl`）=====
+
+/// `ACCESS_ALLOWED_ACE_TYPE`。
+///
+/// 值取自 `Win32_System_SystemServices`（该 feature **未开**）。不为两个 `u8` 常量多开一个
+/// windows-sys feature —— 同 `service::win` 里 `SDDL_REVISION_1` / `FILE_FLAG_FIRST_PIPE_INSTANCE`
+/// 的先例（那两个也是 winbase.h 字面值）。这两个值是 ACE 的 ABI 常量，改动等于换协议。
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+/// `ACCESS_DENIED_ACE_TYPE`（同上）。
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+/// 钉住 [`coreacl`] 里硬编码的掩码 == `windows-sys` 常量的并集。
+///
+/// 那些位值**必须**写在 `coreacl` 里（它在 Linux 上也编译，好让判据有门可跑；而 `windows-sys`
+/// 是 `[target.'cfg(windows)'.dependencies]`，Linux 上不在依赖图里）。这几条 windows-only
+/// 编译期断言是两侧之间唯一的对账 —— 任一侧改了就编不过，且 CI 的
+/// `cargo clippy --target x86_64-pc-windows-msvc` 会把它跑到。
+///
+/// 后两条断言不是重言：它们钉住的是**判据层**的两个结论 —— icacls `(F)` 必被判成写类、
+/// `(RX)` 必**不**被判成写类。把 `FILE_ALL_ACCESS` 整值并进掩码（它含 `READ_CONTROL` 与
+/// `SYNCHRONIZE`，而 `(RX)` 同样含这两位）会让第三条立刻编不过。
+const _: () = {
+    assert!(
+        coreacl::WRITE_ACCESS_MASK
+            == FILE_WRITE_DATA
+                | FILE_APPEND_DATA
+                | FILE_WRITE_EA
+                | FILE_DELETE_CHILD
+                | FILE_WRITE_ATTRIBUTES
+                | DELETE
+                | WRITE_DAC
+                | WRITE_OWNER
+                | GENERIC_ALL
+                | GENERIC_WRITE
+    );
+    assert!(FILE_ALL_ACCESS & coreacl::WRITE_ACCESS_MASK != 0);
+    assert!((FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) & coreacl::WRITE_ACCESS_MASK == 0);
+    assert!(coreacl::ACE_FLAG_INHERIT_ONLY == INHERIT_ONLY_ACE);
+    // 只读执行那份掩码同样两侧对账；末一条钉住的是结论：icacls `(RX)` 必落进读执行类
+    //（否则 `Users:(RX)` 缺失的 warn 自曝腿会恒不触发，而缺失恰恰是它要报的那个事）。
+    assert!(
+        coreacl::READ_EXECUTE_ACCESS_MASK
+            == FILE_READ_DATA | FILE_EXECUTE | GENERIC_ALL | GENERIC_EXECUTE | GENERIC_READ
+    );
+    assert!((FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) & coreacl::READ_EXECUTE_ACCESS_MASK != 0);
+};
+
+/// 读一个文件系统对象的 owner SID + DACL，搬运成纯数据（spec §3.4）。
+///
+/// `Err` 恒表示**读不到这个对象**，且只剩两格：`GetNamedSecurityInfoW` 自身失败、返回的安全描述符
+/// 为 null。调用方按 Q9 warn 继续。
+///
+/// **描述符拿到手之后就再没有 `Err` 了**：owner SID 转串失败落 `owner_sid: None`，
+/// `GetAclInformation` / `GetAce` / ACE 的 SID 转串失败各落一条 [`coreacl::AceKind::Unparsed`]
+/// 哨兵 —— 那些都是「这一格判不了」，不是「这个对象读不到」，折过去就是一个失败向**开**的洞
+///（一条判不出的 ACE 会把同对象上另一条真放宽的 ACE 一起藏掉）。
+/// 「读到了、但被放宽」同样不在本函数的表达范围内：那是 [`coreacl::judge_object`] 的事。
+///
+/// **所有权纪律**：`GetNamedSecurityInfoW` 成功时返回一个 `LocalAlloc` 的安全描述符，
+/// owner 与 DACL 两个出参都指向**它内部**（不各自分配）⇒ 只需释放 `sd` 一次，且必须在把
+/// 需要的字节拷成 owned 数据之后。SACL 不要（读它需 `SE_SECURITY_NAME` 特权）、group 不要。
+#[allow(
+    unsafe_code,
+    reason = "reads one object's security descriptor and frees its single LocalAlloc allocation"
+)]
+fn read_object_security_raw(path: &str) -> Result<ObjectSecurity, String> {
+    let path_w = wide_null(OsString::from(path));
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: path_w 是 NUL 结尾 UTF-16；四个出参均为本栈帧的有效可写位置。成功（返回
+    // ERROR_SUCCESS）时 sd 取得 LocalAlloc 所有权，owner/dacl 指向 sd 内部（不单独释放）。
+    // 失败时三者不被写入所有权，无需释放。
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        // WIN32_ERROR：2 = ERROR_FILE_NOT_FOUND（如不带 cronet 的核里没有 libcronet.dll）、
+        // 5 = ERROR_ACCESS_DENIED。原样带出码值供真机定位。
+        return Err(format!("GetNamedSecurityInfoW({path}) failed: {rc}"));
+    }
+    if sd.is_null() {
+        return Err(format!(
+            "GetNamedSecurityInfoW({path}) returned a null security descriptor"
+        ));
+    }
+    let parsed = parse_object_security(path, owner, dacl);
+    // SAFETY: sd 是上面 GetNamedSecurityInfoW 成功返回且尚未释放的 LocalAlloc 指针；
+    // parse_object_security 已把需要的字节拷成 owned（String / Vec），此后 owner/dacl 都不再被
+    // 借用 ⇒ 恰好释放一次。
+    let free_result = unsafe { LocalFree(sd.cast()) };
+    // 泄漏要在 release 里也说得出来：`debug_assert!` 在生产二进制里整条消失，于是「每次自检漏一块
+    // 安全描述符」这种缓增故障没有任何自曝腿（helper 是常驻服务，起核一次漏一次）。
+    if !free_result.is_null() {
+        log::warn!("LocalFree(security descriptor for {path}) failed; the allocation leaked");
+    }
+    Ok(parsed)
+}
+
+/// 把 owner SID 与 DACL 指针搬成 [`ObjectSecurity`]（**必须在 `LocalFree(sd)` 之前调**）。
+#[allow(
+    unsafe_code,
+    reason = "reads borrowed SID and ACL bytes out of a live security descriptor"
+)]
+fn parse_object_security(path: &str, owner: PSID, dacl: *mut ACL) -> ObjectSecurity {
+    // owner 为 NULL = 安全描述符里**没有属主**；SID 转串失败 = 有属主但判读不了。两者都落
+    // `None`，由判据判成异常（`AclIssue::OwnerMissing`）。
+    //
+    // **刻意不折成 `Err`**：`Err` 的语义是「这个对象读不到」（→ warn 继续），而这里对象是读到了
+    // 的，只是属主这一格没法呈现。折过去既是事实错误，也是本门里的一个失败向开的洞 ——
+    // 「判不出属主」必须与「属主不对」同向处置。
+    let owner_sid = if owner.is_null() {
+        None
+    } else {
+        sid_to_string(owner)
+    };
+    // dacl 为 NULL = **NULL DACL**（Win32 语义：所有人完全访问）。与「0 条 ACE 的空 DACL」
+    // 语义相反，故两者在 `ObjectSecurity` 里是不同的表示（None vs Some(vec![])）。
+    if dacl.is_null() {
+        return ObjectSecurity {
+            owner_sid,
+            dacl: None,
+        };
+    }
+    let mut info: ACL_SIZE_INFORMATION = ACL_SIZE_INFORMATION {
+        AceCount: 0,
+        AclBytesInUse: 0,
+        AclBytesFree: 0,
+    };
+    // SAFETY: dacl 非空且指向 sd 内部的有效 ACL；info 是本栈帧的 ACL_SIZE_INFORMATION，
+    // 长度按其 size_of 传入（API 据 class 决定写多少）。
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            std::ptr::addr_of_mut!(info).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        // **不折成 `Err`**：`Err` 的语义是「这个对象读不到」（→ warn 继续），可
+        // `GetNamedSecurityInfoW` 刚刚成功返回，对象是**读到了**的 —— Q9 的「读不到 ≠ 被放宽」
+        // 这条前提在这里不成立。读不出条数的 DACL 就是一份判不了的 DACL ⇒ 一条哨兵 ACE，由判据
+        // 侧既有的失败向关处置（`AclIssue::UnparsedAce`）。判据零改动。
+        log::warn!("GetAclInformation({path}) failed; treating the DACL as unreadable");
+        return ObjectSecurity {
+            owner_sid,
+            dacl: Some(vec![coreacl::Ace::unreadable()]),
+        };
+    }
+    let mut aces = Vec::with_capacity(info.AceCount as usize);
+    for i in 0..info.AceCount {
+        aces.push(read_ace(path, dacl, i));
+    }
+    ObjectSecurity {
+        owner_sid,
+        dacl: Some(aces),
+    }
+}
+
+/// 读第 `index` 条 ACE（**必须在 `LocalFree(sd)` 之前调**）。
+///
+/// **不返回 `Result`**：本函数的任何失败都只意味着「这条 ACE 判不了」，而不是「这个对象读不到」
+/// —— 后者会把一条判不出的 ACE 变成 warn 继续，于是同一对象上另一条**真放宽**的 ACE 被一起藏掉。
+#[allow(
+    unsafe_code,
+    reason = "reads one borrowed ACE out of a live ACL by its Win32 layout"
+)]
+fn read_ace(path: &str, dacl: *mut ACL, index: u32) -> coreacl::Ace {
+    let mut pace: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: dacl 指向 sd 内部的有效 ACL；index < AceCount（由调用方的循环上界保证）。
+    // 成功时 pace 指向 ACL 内部的一条 ACE（**借用**，不拥有）。
+    let ok = unsafe { GetAce(dacl, index, &mut pace) };
+    if ok == 0 || pace.is_null() {
+        log::warn!("GetAce({path}, {index}) failed; treating the ACE as unreadable");
+        return coreacl::Ace::unreadable();
+    }
+    // ACE_HEADER 在**所有** ACE 类型里都位于起始处、布局相同 ⇒ AceType/AceFlags 恒可读。
+    // SAFETY: pace 指向一条完整 ACE，其首字段即 ACE_HEADER（ACL 内的 ACE 按 DWORD 对齐）。
+    let header = unsafe { *pace.cast::<ACE_HEADER>() };
+    let flags = u32::from(header.AceFlags);
+    let kind = match header.AceType {
+        ACCESS_ALLOWED_ACE_TYPE => coreacl::AceKind::Allow,
+        ACCESS_DENIED_ACE_TYPE => coreacl::AceKind::Deny,
+        // 其余两族都走这里，但成因不同（细节见 `coreacl::AceKind::Unparsed`）：
+        // - **object ACE**（5/6/7…）头部多一个 Flags + 最多两个 GUID ⇒ `SidStart` 偏移与
+        //   `ACCESS_ALLOWED_ACE` **不同**，按那个布局读出来的 SID 是垃圾；
+        // - **callback / conditional ACE**（9 / 0xA）布局**逐字节相同**，SID 与 mask 其实读得出来，
+        //   但条件表达式（挂在 SID 之后）本批不解析 —— 条件为假时该 ACE 不生效，按 mask 直接判会假红。
+        // 两族都只报原始类型号，让判据失败向关。
+        other => {
+            return coreacl::Ace {
+                sid: String::new(),
+                mask: 0,
+                kind: coreacl::AceKind::Unparsed(other),
+                flags,
+            }
+        }
+    };
+    // ACCESS_ALLOWED_ACE 与 ACCESS_DENIED_ACE 布局逐字节相同（Header/Mask/SidStart），
+    // 故两族共用这一个布局读取。
+    let ace = pace.cast::<ACCESS_ALLOWED_ACE>();
+    // SAFETY: 同上；kind 已证实是 allow/deny 两族之一，其布局即 ACCESS_ALLOWED_ACE。
+    let mask = unsafe { (*ace).Mask };
+    // SidStart 是 SID 的**首字段**（不是指针）—— 取它的地址即 PSID。
+    // SAFETY: 同上；addr_of! 不构造引用，避免对紧随其后的变长 SID 字节做越界假设。
+    let psid: PSID = unsafe { std::ptr::addr_of!((*ace).SidStart) }
+        .cast::<std::ffi::c_void>()
+        .cast_mut();
+    // SID 转串失败 ⇒ 「读到了这条 ACE，但说不出它授给谁」。与未知 ACE 类型**同一族**，同样报
+    // `Unparsed`（失败向关：判不出受托主体就无法证明它不是一条授给非特权主体的授予）。
+    //
+    // **刻意不折成 `Err`**：那会把「这条 ACE 判不了」变成「这个对象读不到」→ warn 继续，于是
+    // 一条 SID 判不出来的 ACE 就能把同一对象上另一条真放宽的 ACE 一起藏掉。
+    let Some(sid) = sid_to_string(psid) else {
+        return coreacl::Ace {
+            sid: String::new(),
+            mask,
+            kind: coreacl::AceKind::Unparsed(header.AceType),
+            flags,
+        };
+    };
+    coreacl::Ace {
+        sid,
+        mask,
+        kind,
+        flags,
+    }
+}
+
+/// PSID → `S-1-...` 串。失败返回 `None`（调用方折成读失败）。
+///
+/// **所有权纪律**：`ConvertSidToStringSidW` 成功时返回一个 `LocalAlloc` 的宽串，调用方负责
+/// `LocalFree`（与安全描述符是两块独立分配，漏了就是每次自检泄漏一块）。
+#[allow(
+    unsafe_code,
+    reason = "converts one borrowed SID and frees the string it allocates"
+)]
+fn sid_to_string(psid: PSID) -> Option<String> {
+    let mut out: *mut u16 = std::ptr::null_mut();
+    // SAFETY: psid 指向调用方持有的有效 SID（sd 内部）。成功时 out 取得 LocalAlloc 所有权。
+    let ok = unsafe { ConvertSidToStringSidW(psid, &mut out) };
+    if ok == 0 || out.is_null() {
+        return None;
+    }
+    // SAFETY: out 是 NUL 结尾的宽串（API 契约）；只读到首个 NUL 为止，不越界。
+    let len = unsafe {
+        let mut n = 0usize;
+        while *out.add(n) != 0 {
+            n += 1;
+        }
+        n
+    };
+    // SAFETY: [out, out+len) 是上面数出来的有效宽字符区间。
+    let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(out, len) });
+    // SAFETY: out 是 ConvertSidToStringSidW 成功返回且尚未释放的 LocalAlloc 指针；
+    // 上一行已把字节拷进 owned String，此后不再借用 ⇒ 恰好释放一次。
+    let free_result = unsafe { LocalFree(out.cast()) };
+    // 同 `read_object_security_raw`：release 下也要自曝（每条 ACE 一块，比描述符那块漏得更快）。
+    if !free_result.is_null() {
+        log::warn!("LocalFree(SID string {s}) failed; the allocation leaked");
+    }
+    Some(s)
 }
 
 /// 宽字符串辅助：OsStr → null 终止 UTF-16（供 windows-sys API）。

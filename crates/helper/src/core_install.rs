@@ -32,6 +32,28 @@ use std::path::Path;
 /// sing-box 主二进制文件名（`helper.go:140,194`：`filepath.Join(srcDir, "sing-box")`）。
 pub const SINGBOX_BIN_NAME: &str = "sing-box";
 
+/// Windows 侧的 sing-box 主二进制文件名（PE 必须带 `.exe`，否则 `CreateProcessW` 找不到）。
+///
+/// 与 [`SINGBOX_BIN_NAME`] 并列而不是在函数里按 `cfg(windows)` 挑：本模块在 Linux 上也要能对
+/// **两个**名字各跑一遍单测（三平台 helper 同 crate，win 分支的纯逻辑本就在本机测）。
+pub const SINGBOX_BIN_NAME_WIN: &str = "sing-box.exe";
+
+/// Windows 侧与核同目录的配套 DLL 名（cronet-naive 出站用；ACL 自检覆盖面的第二个白名单文件）。
+///
+/// **住在这里、不住在 `platform::windows::coreacl` 的理由是结构性的**（该路径在非 Windows 上
+/// 不入编译，故此处只能写成普通代码体、不能写成 intra-doc 链接 —— 写成链接会让 `cargo doc`
+/// 在 Linux 上红，这本身就是下面那条 cfg 论证的又一个实例）：`platform::windows`
+/// 的门是 `#[cfg(any(target_os = "windows", test))]`，那个 `test` 只在 **polaris-helper 自己**的
+/// test 编译期成立；src-tauri 在 Linux 上跑测试时 polaris-helper 是普通依赖（`cfg(test)` 关），
+/// 整个 `platform::windows` 不入编译 ⇒ 放在那里的字面量**物理上进不了**
+/// `src-tauri/src/runtime/core_paths/tests` 的跨 crate 等值门。本模块无 cfg，进得去。
+///
+/// 少了那道门的后果不是编译错而是门少一条腿且不自曝：cronet 升版改名时
+/// `core_sidecar_filename_for("windows")` 与 `manager::WIN_CORE_SIDECAR_NAME` 被门钉着会一起改，
+/// 这份不会 ⇒ 自检去问一个不存在的路径 ⇒ 落 `unreadable` ⇒ 只 warn、起核照常 ⇒ 真正躺在 exec
+/// 目录里的那个 DLL 从此无人检查。
+pub const CRONET_DLL_NAME_WIN: &str = "libcronet.dll";
+
 /// install-core 结果（统一命名，融合 mac `InstallResult` 与 linux `InstallOutcome`，二者同构）。
 ///
 /// 对照 Go `installCore` 的所有 return 分支（`helper.go:133-198` / `helper-linux/helper.go:183-244`）。
@@ -58,6 +80,12 @@ pub enum InstallResult {
     Write { name: String, detail: String },
     /// `ERR rename <name> <err>`（mac `helper.go:174` / linux `:225`：rename 失败）。
     Rename { name: String, detail: String },
+    /// `ERR busy`（**Polaris 新增，上游无**：受管核在跑时拒绝安装 —— 目前只有 Windows 会产出）。
+    ///
+    /// Windows 既 rename 不动运行中的 exe，也 rename 不动已被加载的 DLL：不挡的话 `.new` 写得进去、
+    /// `rename` 失败，安装半途而废且错误面目全非。mac/linux 的 rename 在同样情形下会成功（旧 inode
+    /// 继续被运行中的进程持有），故那两支不产出本变体。
+    Busy,
 }
 
 impl InstallResult {
@@ -79,6 +107,7 @@ impl InstallResult {
             Self::Read { name, detail } => format!("ERR read {name} {detail}"),
             Self::Write { name, detail } => format!("ERR write {name} {detail}"),
             Self::Rename { name, detail } => format!("ERR rename {name} {detail}"),
+            Self::Busy => "ERR busy".to_string(),
         }
     }
 
@@ -86,6 +115,30 @@ impl InstallResult {
     #[must_use]
     pub const fn is_ok(&self) -> bool {
         matches!(self, Self::Installed)
+    }
+
+    /// 转 proto [`polaris_helper_proto::Response`]（**三平台唯一一份**）。
+    ///
+    /// 走既有的两个单一真值往返：[`InstallResult::to_wire_line`] 是 install-core 响应行的权威
+    /// 形态，[`polaris_helper_proto::Error::parse`] 是 wire→`Error` 的权威解析（未知 token 归
+    /// `Other` 且 detail 保留原文 ⇒ 往返无损）。
+    ///
+    /// **刻意不再有第二张 `variant → ErrorCode` 映射表**：mac 侧曾手写过一张，与本往返「结果
+    /// 相同但机制不同」—— `to_wire_line` 一改只流向走往返的那侧，不流向那张表，下次加 variant
+    /// 必漏一边。收敛前先出过逐 variant 的等价收据（11/11 逐字相同，含 detail），不是直接替换。
+    ///
+    /// 非 `Installed` 的 `to_wire_line` 恒以 `"ERR "` 开头 ⇒ `parse` 必 `Some`。真解析不出来说明
+    /// `to_wire_line` 换了形态，那时诚实回 `unknown`（失败向关），不能假装装好了。
+    #[must_use]
+    pub fn to_response(&self) -> polaris_helper_proto::Response {
+        use polaris_helper_proto::{Error as ProtoError, ErrorCode, Response, ResponseKind};
+        if self.is_ok() {
+            return Response::Ok(ResponseKind::Installed);
+        }
+        ProtoError::parse(&self.to_wire_line()).map_or_else(
+            || Response::Err(ProtoError::new(ErrorCode::Unknown)),
+            Response::Err,
+        )
     }
 }
 
@@ -102,10 +155,18 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// 校验 sing-box 主二进制 sha256（移植自 `helper.go:140-147`）。
 ///
-/// 读 src_dir/sing-box 全字节，计算 sha256 与 want_hash 比对（大小写不敏感，对齐 Go `EqualFold`）。
+/// 读 src_dir/`bin_name` 全字节，计算 sha256 与 want_hash 比对（大小写不敏感，对齐 Go `EqualFold`）。
 /// 返回读到的字节（供后续原子写入复用，堵 TOCTOU —— 见 Go `helper.go:161`：`data := sbData`）。
-pub fn verify_singbox_hash(src_dir: &Path, want_hash: &str) -> Result<Vec<u8>, InstallResult> {
-    let sb_path = src_dir.join(SINGBOX_BIN_NAME);
+///
+/// `bin_name` 由调用方给（mac/linux 传 [`SINGBOX_BIN_NAME`]，Windows 传
+/// [`SINGBOX_BIN_NAME_WIN`]）—— 它必须与 [`atomic_install_files`] 那侧传的是**同一个**名字，
+/// 否则被校验的字节和被复用的字节不是同一个文件，TOCTOU 那层就空了。
+pub fn verify_singbox_hash(
+    src_dir: &Path,
+    want_hash: &str,
+    bin_name: &str,
+) -> Result<Vec<u8>, InstallResult> {
+    let sb_path = src_dir.join(bin_name);
     let sb_data = fs::read(&sb_path).map_err(|e| InstallResult::ReadSingbox(e.to_string()))?;
     // helper.go:144-146: sha256.Sum256 + hex + EqualFold
     let actual = sha256_hex(&sb_data);
@@ -152,25 +213,44 @@ pub fn list_src_files(src_dir: &Path) -> Result<Vec<String>, InstallResult> {
 /// }
 /// ```
 ///
-/// `sing-box` 用传入的 `sb_data`（已校验字节，堵 TOCTOU）；其它文件从 src_dir 读。
+/// `bin_name` 那一项用传入的 `sb_data`（已校验字节，堵 TOCTOU）；其它文件从 src_dir 读。
+/// 判等必须用调用方给的 `bin_name`，不能写死 [`SINGBOX_BIN_NAME`]：Windows 的 `sing-box.exe`
+/// 与 `"sing-box"` 不等 ⇒ 落进 else 分支被二次读盘，**编译得过但 hash 校验与实际写入的字节脱钩**。
 /// tmp 路径构造逐字对照 Go `dst + ".new"`（`helper-linux/helper.go:218-228`）—— 直接在 dst
 /// 后缀 `.new`，而非 mac 原版的「set_extension 替换扩展名」（原 mac 实现对无扩展名的 `sing-box`
 /// 会变成 `sing-box.new` 而非 `sing-box.new`，二者结果一致；但对带扩展名的 `libcronet.dylib`
 /// mac 原版产出 `libcronet.dylib.new` 也是对的——与 linux 同）。统一采用 linux 的「append .new」
 /// 形式以更贴合 Go 源且更易读。
+///
+/// ## `bin_name` 恒第一个处理（**不是**按 `names` 的字母序）
+///
+/// 「`.new` + rename 保证半成品不会变成生效文件」这句只对**单个文件**成立，对**一组文件**不成立：
+/// 装核过了判活闸后锁就放了，并发 start 把核起起来时，`libcronet.dll`（字母序在 `sing-box.exe`
+/// 之前）**只在 cronet-naive 出站被用到时才加载** ⇒ 它的 rename 成功、`sing-box.exe` 的失败 ⇒
+/// 整个函数 Err、prune 不跑 ⇒ 受保护目录留下「新 DLL + 旧 exe」的**持久化版本错配**（跑着的旧
+/// exe 此后首次用到 cronet 出站就会加载新 DLL，ABI 不匹配）。
+///
+/// 我方受管核恒持有 exe 句柄 ⇒ 把 `bin_name` 排到最前，撞锁时**第一个** rename 就失败，零文件
+/// 被改动即干净中止。unix 侧 rename 恒成功（旧 inode 仍被运行中的进程持有），顺序无行为影响。
 pub fn atomic_install_files(
     src_dir: &Path,
     core_dir: &Path,
     names: &[String],
     sb_data: &[u8],
+    bin_name: &str,
 ) -> Result<(), InstallResult> {
     // helper.go:152-154: MkdirAll(coreDir, 0755)
     fs::create_dir_all(core_dir).map_err(|e| InstallResult::Mkdir(e.to_string()))?;
 
-    for name in names {
+    // `bin_name` 先行（见函数文档「`bin_name` 恒第一个处理」），其余保持 `names` 的原序。
+    for name in names
+        .iter()
+        .filter(|n| n.as_str() == bin_name)
+        .chain(names.iter().filter(|n| n.as_str() != bin_name))
+    {
         let dst = core_dir.join(name);
         // helper.go:161-166: sing-box 复用 sbData，否则读 src/name
-        let data: Vec<u8> = if name == SINGBOX_BIN_NAME {
+        let data: Vec<u8> = if name == bin_name {
             sb_data.to_vec()
         } else {
             fs::read(src_dir.join(name)).map_err(|e| InstallResult::Read {
@@ -249,6 +329,7 @@ pub fn install_core_files(
     core_dir: &Path,
     src_dir: &Path,
     want_hash: &str,
+    bin_name: &str,
 ) -> Result<Vec<String>, InstallResult> {
     // helper.go:134-138: 参数校验
     if core_dir.as_os_str().is_empty() {
@@ -258,11 +339,11 @@ pub fn install_core_files(
         return Err(InstallResult::BadArgs);
     }
     // helper.go:140-147: 校验 sing-box 哈希
-    let sb_data = verify_singbox_hash(src_dir, want_hash)?;
+    let sb_data = verify_singbox_hash(src_dir, want_hash, bin_name)?;
     // helper.go:148-151: 枚举源目录
     let names = list_src_files(src_dir)?;
-    // helper.go:156-178: 逐文件原子写入
-    atomic_install_files(src_dir, core_dir, &names, &sb_data)?;
+    // helper.go:156-178: 逐文件原子写入（bin_name 与上面校验的是同一个名字 —— 单一入参保证）
+    atomic_install_files(src_dir, core_dir, &names, &sb_data, bin_name)?;
     // helper.go:179-192: 清理多余旧文件
     prune_extra_files(core_dir, &names);
     Ok(names)

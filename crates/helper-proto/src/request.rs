@@ -122,7 +122,7 @@ pub enum Request {
     RouteAdd(RouteParams),
     /// `route-del <iface> <cidrs>`（mac/win）。
     RouteDel(RouteParams),
-    /// `install-core <srcDir> <wantHash>`（mac/linux）。
+    /// `install-core <srcDir> <wantHash>`（三平台；Windows 侧为 Polaris P4 新增，上游 Go 无）。
     InstallCore(InstallCoreParams),
     /// Linux：`resolved-dns-set <interface> <server-ip>`（proto v1 兼容扩展）。
     LinuxDnsSet(LinuxDnsSetParams),

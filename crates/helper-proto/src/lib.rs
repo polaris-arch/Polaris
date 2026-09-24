@@ -33,6 +33,7 @@
 //!
 //! ## 模块布局
 //!
+//! - [`windows_helper`]：Windows helper 服务名 / 管道 / support 目录（helper 与 client 共用的会合点）。
 //! - [`proto_version`] / [`Platform`]：协议版本 + 平台标识（B0 建立的骨架，本批保持向后兼容）。
 //! - [`command`]：wire 命令名常量（逐字对照 Go `case` 分支）。
 //! - [`error`]：错误码 [`ErrorCode`] + [`Error`]（对照 Go 所有 `ERR <code>` 调用点）。
@@ -76,6 +77,28 @@ pub mod linux_dns {
     pub fn takeover_request_allowed(interface_name: &str, server_ip: &str) -> bool {
         interface_name == TUN_INTERFACE_NAME && server_ip == CONTROLLED_DNS_IP
     }
+}
+
+/// Windows helper 的会合点跨 crate 契约（SCM 服务名 / 命名管道 / support 目录）。
+///
+/// helper 侧（`polaris-helper` 的 `platform::windows`）按它注册服务、创建管道、落 token；
+/// app 侧（`polaris-helper-client` 的 `InstallPaths::win` 与安装/卸载脚本）按它连管道、`sc` 起停、
+/// 外置 helper.exe 与播种受保护核。两侧早先各写一份字面量且零门对账，漂移后果全是**静默**的
+/// （`sc query` 打空 ⇒ 恒判未装；连错管道 ⇒ 恒判未运行；脚本装进另一个目录 ⇒ 服务 ImagePath 与
+/// helper 实际读的 token/核脱钩）。
+///
+/// 放在这里而不是 helper 的 `platform::windows`：那个模块的门是 `cfg(any(target_os = "windows", test))`，
+/// `test` 只在 polaris-helper 自己的测试编译期成立，别的 crate 在 Linux 上根本看不见它；而
+/// helper-client 不依赖 polaris-helper（特权 daemon 的平台依赖不该被装卸壳拖进来）。本 crate 无 cfg、
+/// 两侧都已依赖 ⇒ 构造上单源，不需要等值门。
+pub mod windows_helper {
+    /// Windows SCM 服务名（上游 `helper-win/main.go:15`，`const serviceName`）。
+    pub const SERVICE_NAME: &str = "PolarisHelper";
+    /// 命名管道路径（上游 `helper-win/service.go:16`，`const pipeName`）。
+    pub const PIPE_NAME: &str = r"\\.\pipe\polaris-helper";
+    /// helper 的 support 目录（上游 `helper-win/main.go:21` 的 `--support` 默认值）：
+    /// helper.exe 外置副本、`helper.token`、受保护核目录都落在它下面。
+    pub const DEFAULT_SUPPORT_DIR: &str = r"C:\ProgramData\Polaris";
 }
 
 /// 协议版本（**三平台统一**，单一常量）。

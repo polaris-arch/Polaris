@@ -107,6 +107,22 @@ fn install_paths_mac_match_polaris() {
     assert!(p.socket.to_string_lossy().contains("helper.sock"));
 }
 
+/// win 的 client 连接目标必须是 daemon 创建的那条管道、`sc` 起停的必须是 daemon 注册的那个服务。
+/// 两侧共引 `polaris_helper_proto::windows_helper`；本条钉的是**本 crate 真的在用它**——
+/// 早先这里是内联字面量 `PathBuf::from(r"\\.\pipe\...")`，连常量都不是，与 daemon 零对账，
+/// 改错一个字符的后果是 app 恒判 helper 未运行、每次起核都弹 UAC 重装。字面量写死：引常量的话
+/// 常量一改判据跟着漂。
+#[test]
+fn win_install_paths_rendezvous_with_the_daemon() {
+    let p = InstallPaths::win();
+    assert_eq!(p.socket, PathBuf::from(r"\\.\pipe\polaris-helper"));
+    assert_eq!(p.service_label, "PolarisHelper");
+    assert_eq!(
+        p.binary,
+        PathBuf::from(r"C:\ProgramData\Polaris\polaris-helper.exe")
+    );
+}
+
 #[test]
 fn install_paths_for_platform() {
     assert_eq!(
@@ -758,7 +774,6 @@ fn install_params(script_dir: PathBuf, src: PathBuf) -> InstallParams {
     InstallParams {
         src_binary: src,
         bundled_core: PathBuf::from("/app/resources/sing-box"),
-        singbox_path: PathBuf::from("/app/resources/sing-box"),
         conf_dir: PathBuf::from("/home/user/.config/polaris"),
         uid: 1000,
         script_dir,
@@ -1109,12 +1124,11 @@ fn linux_install_script_chmods_authfile_0600_matching_helper_auth_contract() {
 fn win_install_script_targets_the_same_paths_status_probes() {
     let paths = InstallPaths::win();
     // 故意用与目标不同的源文件名：落点应恒为 WIN_HELPER_EXE，不随 src 漂移。
-    let mut p = install_params(
+    let p = install_params(
         PathBuf::from("/x"),
         PathBuf::from(r"C:\app\renamed-helper.exe"),
     );
-    p.singbox_path = PathBuf::from(r"C:\app\sing-box.exe");
-    let script = build_win_install_script(&p, "WTOKEN");
+    let script = build_win_install_script(&paths, &p, "WTOKEN");
 
     let binary = paths.binary.to_string_lossy();
     assert!(
@@ -1139,12 +1153,11 @@ fn win_install_script_targets_the_same_paths_status_probes() {
 
 #[test]
 fn win_install_script_has_all_steps() {
-    let mut p = install_params(
+    let p = install_params(
         PathBuf::from("/x"),
         PathBuf::from(r"C:\app\polaris-helper.exe"),
     );
-    p.singbox_path = PathBuf::from(r"C:\app\sing-box.exe");
-    let s = build_win_install_script(&p, "WTOKEN");
+    let s = build_win_install_script(&InstallPaths::win(), &p, "WTOKEN");
     // 外置副本到 ProgramData
     assert!(
         s.contains(r"$helperDst = 'C:\ProgramData\Polaris\polaris-helper.exe'"),
@@ -1152,18 +1165,19 @@ fn win_install_script_has_all_steps() {
     );
     // 锁 ACL
     assert!(
-        s.contains(r#"/grant:r "SYSTEM:(OI)(CI)(F)" "Administrators:(OI)(CI)(F)""#),
-        "缺目录 ACL 锁"
+        s.contains(r#"/grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)""#),
+        "缺目录 ACL 锁（主体须为数值 SID，英文组名在非英文 Windows 上解析不到）"
     );
     // 写 token
     assert!(
         s.contains("Set-Content -Path $tokenFile -Value 'WTOKEN' -NoNewline -Encoding ascii"),
         "缺写 token"
     );
-    // binPath 含 daemon flag（真双引号）
+    // binPath 含 daemon flag（真双引号）。P4：`--singbox` 由受保护核目录派生，**不再**是
+    // `params` 里那个 app 侧用户可写核（原断言是 `C:\app\sing-box.exe`）。
     assert!(
-        s.contains(r#"--singbox "C:\app\sing-box.exe" --confdir"#),
-        "binPath 缺 --singbox"
+        s.contains(r#"--singbox "C:\ProgramData\Polaris\core\sing-box.exe" --confdir"#),
+        "binPath 的 --singbox 必须指受保护核目录"
     );
     assert!(
         s.contains(r#"--support "C:\ProgramData\Polaris""#),
@@ -1207,9 +1221,14 @@ fn win_install_script_has_all_steps() {
 /// 两者都必须在首次 `sc start` 之前，且各带 `$LASTEXITCODE` 守卫——PS 5.1 的 EAP=Stop 拦不住
 /// 外部程序非零退出（评审 F3），静默失败会让安装「看着成功」而自愈全没配上。
 /// 变异锁：删任一行 / 删守卫 / 挪到 start 之后 → 转红。
+///
+/// 第 ⑤ 段把「哪些外部命令必须带守卫」从**手写清单**改成**扫描派生**（S-3）：新增一条
+/// `& $icacls …` / `& $sc …` 自动进覆盖面，不改这里一个字。
+/// 变异锁：加一条无守卫的假腿 → 计数与逐条定位双红；把守卫写到别处凑数 → 计数红。
 #[test]
 fn win_install_script_self_heals_and_grants_iu_start_before_first_start() {
     let script = build_win_install_script(
+        &InstallPaths::win(),
         &install_params(
             PathBuf::from("/x"),
             PathBuf::from(r"C:\app\polaris-helper.exe"),
@@ -1235,11 +1254,304 @@ fn win_install_script_self_heals_and_grants_iu_start_before_first_start() {
         sdset_at < failure_at && failure_at < start_at,
         "自愈配置必须在首次 start 之前（首启即被覆盖）"
     );
-    assert_eq!(
-        script.matches("if ($LASTEXITCODE -ne 0)").count(),
-        3,
-        "sdset/failure/start 三步必须各带退出码守卫（EAP=Stop 拦不住外部程序非零退出）"
+    // ⑤ **覆盖轴从脚本自身派生，不写手工清单**。
+    //
+    // 上一版这里是一张写死的 10 条 icacls 腿 + 精确计数 13。那张清单的绕过面是现成的：新增
+    // 第 11 条 `& $icacls …` 且不带守卫，只要把计数改一下、再在任意一条非 icacls 行后面多写
+    // 一个 `if ($LASTEXITCODE -ne 0)`（写进注释里都行——`matches()` 不剥注释），门就全绿。
+    // 即「覆盖面由夹具定」而不是「由判据定」。改成扫描派生后，新增腿**自动进取材面**。
+    let face = script_code_face(&script);
+    let head = guarded_region(&face);
+    let calls = derived_guarded_calls(head);
+
+    // 取材面自检①：派生集合非空。空集会让下面的逐条断言与计数一起变成恒真。
+    assert!(
+        !calls.is_empty(),
+        "取材面自检失败：一条待守卫的外部命令都没派生出来（变量名改了？）—— \
+         空集上的逐条断言与计数断言都恒真"
     );
+    // 取材面自检②：两族都在。只剩一族（例如 `$icacls` 改了变量名）时集合仍非空，
+    // 但那一族的全部腿会**静默**退出覆盖面。
+    assert!(
+        calls.iter().any(|l| l.starts_with("& $icacls ")),
+        "取材面自检失败：派生集合里没有 icacls 腿"
+    );
+    assert!(
+        calls.iter().any(|l| l.starts_with("& $sc ")),
+        "取材面自检失败：派生集合里没有 sc 腿"
+    );
+    // 取材面自检③：不许有重复行 —— 逐条定位用 `find()` 取首次出现，重复行会让第二次
+    // 迭代重复验证第一处，那条真腿无人检查。
+    let mut seen = HashSet::new();
+    for call in &calls {
+        assert!(
+            seen.insert(*call),
+            "派生集合里有重复行（逐条定位会重复查到第一处）：{call}"
+        );
+    }
+    // 正面断言（防缩水）：当前脚本的待守卫外部命令是 7 条 icacls + 3 条 sc。派生集合会随脚本
+    // 一起缩小，故单靠「派生数 == 守卫数」拦不住「把整段 ACL 加固删了」——那一刀下去两边同时
+    // 归零仍然相等。这条地板不是门本身，是门的下限。
+    assert!(
+        calls.len() >= 10,
+        "待守卫的外部命令只剩 {} 条（应 ≥10）：ACL 加固或自愈配置被整段删了？",
+        calls.len()
+    );
+
+    // 计数：**恰好**等于派生集合大小。多一个 = 有人在非受守行后面凑了个守卫；少一个 = 有腿
+    // 没守。`} catch {` 之后不计——回滚段是 EAP=SilentlyContinue 的 best-effort，刻意不守。
+    assert_eq!(
+        head.matches("if ($LASTEXITCODE -ne 0)").count(),
+        calls.len(),
+        "退出码守卫数与待守卫的外部命令数不等（EAP=Stop 拦不住外部程序非零退出）"
+    );
+    // 计数只保证「有 N 处」，不保证它们长在哪儿——N 条全挂在 sdset 后面也是 N。
+    // 故逐条钉「这条命令之后、下一条 `& $` 调用之前就是它的守卫」。
+    for call in &calls {
+        let at = head
+            .find(call)
+            .unwrap_or_else(|| panic!("派生腿在净化面里找不回来：{call}"));
+        let rest = &head[at + call.len()..];
+        let guard_at = rest
+            .find("if ($LASTEXITCODE -ne 0)")
+            .unwrap_or_else(|| panic!("外部命令没有退出码守卫：{call}"));
+        // 下一条外部命令调用（`& $`）必须在守卫之后 —— 否则守卫查的是别人的退出码。
+        let next_call = rest.find("\n& $").unwrap_or(rest.len());
+        assert!(
+            guard_at < next_call,
+            "退出码守卫被下一条外部命令抢在前面（查的不是它自己的退出码）：{call}"
+        );
+    }
+}
+
+/// PowerShell 脚本的**净化取材面**：`#` 整行注释整行抹空（保留行数与行序，`find()` 的顺序
+/// 语义不变）。
+///
+/// 非剥不可：本文件的判据全是 `contains` / `find` / `matches().count()` 型，而注释里随手写一句
+/// `if ($LASTEXITCODE -ne 0)` 就能替一条真腿作证 —— 判据被自己的取材面污染。
+/// 偏移在净化面里自洽，故**下游一律拿净化面自己去 find**，绝不把它的偏移套回原串。
+fn script_code_face(script: &str) -> String {
+    script
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with('#') {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 净化面里「必须守退出码」的区域：升级事务的 `} catch {` **之前**。
+///
+/// 回滚段刻意是 best-effort（`$ErrorActionPreference = 'SilentlyContinue'`，失败也要把能恢复的
+/// 恢复完），它里面的 `& $sc …` 不该被要求带守卫。锚点取不到即 panic：门失去射程必须当场红。
+fn guarded_region(face: &str) -> &str {
+    let at = face
+        .find("} catch {")
+        .expect("找不到 `} catch {` —— 事务边界没了，守卫门的射程无从谈起");
+    &face[..at]
+}
+
+/// 从安装脚本**派生**「必须带退出码守卫的外部命令」集合（S-3：覆盖轴由判据定，不由夹具定）。
+///
+/// 取材规则逐条：
+/// 1. 入参必须是 [`guarded_region`] 切出来的**净化面**（注释已抹空、catch 段已切掉）；
+/// 2. 行首（`trim_start` 后）是 `& $icacls ` 或 `& $sc ` 的行 —— 即脚本里全部外部程序调用；
+/// 3. **排除**以 `2>$null | Out-Null` 结尾的行：`sc stop` / `sc delete` 在幂等重装时本就期望
+///    非零退出（服务不存在是常态），给它们加守卫等于把每次「首次安装」判成失败。
+///    这一条是**有意不守**的唯一形态，写成后缀判据而不是列服务名，新增同形腿自动豁免。
+fn derived_guarded_calls(head: &str) -> Vec<&str> {
+    head.lines()
+        .map(str::trim_end)
+        .filter(|l| {
+            let t = l.trim_start();
+            (t.starts_with("& $icacls ") || t.starts_with("& $sc "))
+                && !t.ends_with("2>$null | Out-Null")
+        })
+        .collect()
+}
+
+/// **本地化门**：icacls 的主体一律用数值 SID，不许出现英文组名。
+///
+/// BUILTIN / NT AUTHORITY 的账户名**是本地化的**（德语 `Benutzer`、法语 `Utilisateurs`…）。英文名
+/// 在非英文 Windows 上解析不到 → icacls 报「No mapping between account names and security IDs was
+/// done」并非零退出。本批给每条 icacls 都补了退出码守卫，若还留着英文名，原先的**静默弱 ACL**就会
+/// 变成**装不上**；换 well-known SID 后这条故障路径整条消失，守卫也就不会误伤正常机器。
+///
+/// 判据钉 **SID 串本身**而不是「包含 Users」：后者改回英文名 `Users:` 照样绿，门等于没有。
+#[test]
+fn win_install_script_uses_numeric_sids_so_localized_windows_resolves_them() {
+    let script = build_win_install_script(
+        &InstallPaths::win(),
+        &install_params(
+            PathBuf::from("/x"),
+            PathBuf::from(r"C:\app\polaris-helper.exe"),
+        ),
+        "WTOKEN",
+    );
+
+    // 取材面自检：先证明「所有 icacls 行」这个集合非空且完整，否则下面的全称否定是空集恒过。
+    let icacls_lines: Vec<&str> = script
+        .lines()
+        .filter(|l| l.trim_start().starts_with("& $icacls "))
+        .collect();
+    // 7 = 4 条 `/setowner` + 3 条 `/inheritance:r /grant:r`（N-1a 把后两类合并成一条命令之后
+    // 从 10 条降到 7 条；这是**地板**，防的是取材面缩水后全称否定变成空集恒过）。
+    assert!(
+        icacls_lines.len() >= 7,
+        "取材面自检失败：只取到 {} 条 icacls 行（应 ≥7），全称否定会变成空集恒过",
+        icacls_lines.len()
+    );
+
+    // 全称否定：一条 icacls 行都不许出现英文主体名。
+    for line in &icacls_lines {
+        for english in ["SYSTEM:", "Administrators:", "Users:"] {
+            assert!(
+                !line.contains(english),
+                "icacls 用了本地化敏感的英文组名 `{english}`（非英文 Windows 上解析失败 → \
+                 非零退出 → 守卫 throw → 装不上）：{line}"
+            );
+        }
+        // 正面断言：每条带主体的腿都得真的出现 `*S-`。`/inheritance:r` 不带主体，豁免。
+        assert!(
+            line.contains("/inheritance:r") || line.contains("*S-"),
+            "icacls 腿既没有主体 SID 也不是 /inheritance:r：{line}"
+        );
+    }
+
+    // 逐字钉三个 well-known SID（跨语言恒等，与 helper 侧 `coreacl` 的白名单同源）。
+    assert!(
+        script.contains(
+            r#"& $icacls $coreDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-5-32-545:(OI)(CI)(RX)""#
+        ),
+        "受保护核目录的 grant 必须是 SYSTEM/Administrators/Users 三个数值 SID"
+    );
+    assert!(
+        script.contains(
+            r#"& $icacls $support /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)""#
+        ),
+        "support 目录的 grant 必须换成数值 SID（这条腿此前是英文名且无守卫）"
+    );
+    assert!(
+        script.contains(
+            r#"& $icacls $helperDst /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)""#
+        ),
+        "helper.exe 的 grant 必须换成数值 SID（这条腿此前是英文名且无守卫）"
+    );
+}
+
+/// 🔴 **N-1a + N-1b：DACL 一次写入 + owner 归 Administrators。**
+///
+/// # N-1a：`/inheritance:r` 与 `/grant:r` 必须在**同一条** icacls 命令里
+///
+/// 拆成两条时，`/setowner` 已先把属主交出去，而**新建目录上的 ACE 全是继承来的**，
+/// `/inheritance:r` 把它们一次删光 ⇒ 中间存在一个「调用者既非 owner、又没有任何 ACE」的
+/// 空 DACL 瞬间。此时紧随的 `/grant:r` 写不写得进去，取决于 icacls 会不会自行启用
+/// `SeRestorePrivilege` —— 无一手来源。任一依赖不成立 ⇒ 守卫 throw ⇒ **全新安装装不上**
+/// （不是本地化机器才炸，是全量）。合成一条 = 一次 `SetNamedSecurityInfo`，中间态不存在。
+///
+/// # N-1b：`/setowner` 的目标是 `*S-1-5-32-544` 而不是 `*S-1-5-18`
+///
+/// 设一个**不在调用者 token 里**的 SID 当 owner（SYSTEM 对提权管理员正是如此）需要
+/// `SeRestorePrivilege` 已启用；`BUILTIN\Administrators` 在提权 token 里且带 `SE_GROUP_OWNER`，
+/// 设它当 owner 零特权。安全上无差：Administrators 本就持 `(F)`，owner 隐含的 `WRITE_DAC`
+/// 不增加任何能力，而「预创建者以 CREATOR OWNER 留在 owner 位」照样被替掉。544 在 helper 侧
+/// `coreacl::PRIVILEGED_SIDS`（owner 白名单）内 ⇒ 起核前自检照常放行。
+///
+/// 变异锁：把任一条合并调用拆回两条 → N-1a 段红；把任一 `/setowner` 改回 `*S-1-5-18` → N-1b 段红。
+#[test]
+fn win_install_script_writes_each_dacl_in_one_call_and_owns_by_administrators() {
+    let script = build_win_install_script(
+        &InstallPaths::win(),
+        &install_params(
+            PathBuf::from("/x"),
+            PathBuf::from(r"C:\app\polaris-helper.exe"),
+        ),
+        "WTOKEN",
+    );
+    let face = script_code_face(&script);
+    let icacls: Vec<&str> = face
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| l.trim_start().starts_with("& $icacls "))
+        .collect();
+    // 取材面自检：集合非空且覆盖全部四个受保护对象，否则下面按子集分组的断言会变成空集恒过。
+    assert!(
+        icacls.len() >= 7,
+        "取材面自检失败：只取到 {} 条 icacls 行（应 ≥7）",
+        icacls.len()
+    );
+    for obj in ["$support", "$coreDir", "$tokenFile", "$helperDst"] {
+        assert!(
+            icacls.iter().any(|l| l.contains(obj)),
+            "取材面自检失败：没有一条 icacls 打在 {obj} 上"
+        );
+    }
+
+    // ── N-1a：去继承与授权同命令 ──────────────────────────────────────────────
+    let inherit: Vec<&str> = icacls
+        .iter()
+        .copied()
+        .filter(|l| l.contains("/inheritance:r"))
+        .collect();
+    let grant: Vec<&str> = icacls
+        .iter()
+        .copied()
+        .filter(|l| l.contains("/grant:r"))
+        .collect();
+    assert_eq!(
+        inherit.len(),
+        3,
+        "去继承的对象应恰好是 $support / $coreDir / $helperDst 三个，实得 {inherit:?}"
+    );
+    assert_eq!(
+        inherit, grant,
+        "`/inheritance:r` 与 `/grant:r` 必须逐条同命令：拆开会在两条命令之间留出空 DACL \
+         中间态（调用者既非 owner 又无 ACE），第二条能否写入取决于 icacls 是否自行启用 \
+         SeRestorePrivilege —— 不成立则全新安装装不上"
+    );
+    for line in &inherit {
+        let inherit_at = line.find("/inheritance:r").expect("上面刚筛过");
+        let grant_at = line.find("/grant:r").expect("上面刚筛过");
+        assert!(
+            inherit_at < grant_at,
+            "同一条命令里 `/inheritance:r` 必须在 `/grant:r` 之前（顺序即语义）：{line}"
+        );
+    }
+
+    // ── N-1b：owner 归 Administrators ─────────────────────────────────────────
+    let setowner: Vec<&str> = icacls
+        .iter()
+        .copied()
+        .filter(|l| l.contains("/setowner"))
+        .collect();
+    assert_eq!(
+        setowner.len(),
+        4,
+        "四个受保护对象（$support/$coreDir/$tokenFile/$helperDst）都要显式 /setowner，实得 {setowner:?}"
+    );
+    for line in &setowner {
+        assert!(
+            line.contains(r#"/setowner "*S-1-5-32-544""#),
+            "/setowner 的主体必须是 BUILTIN\\Administrators（*S-1-5-32-544）：{line}"
+        );
+        assert!(
+            !line.contains("*S-1-5-18"),
+            "owner 设成不在提权 token 里的 SID（SYSTEM）需要 SeRestorePrivilege 已启用，\
+             无一手来源保证 icacls 会自行启用它：{line}"
+        );
+    }
+    // 正面对照：544 当 owner 不等于「放弃 SYSTEM 的权」—— 三条 grant 里 SYSTEM 的 (F) 必须还在，
+    // 否则「owner 换人」就悄悄变成了「服务身份失去完全控制」。
+    for line in &grant {
+        assert!(
+            line.contains("*S-1-5-18:("),
+            "grant 里丢了 SYSTEM 的完全控制（服务本体就是以 SYSTEM 跑的）：{line}"
+        );
+    }
 }
 
 /// W24：覆盖升级不是“删旧 → 祈祷新服务能起”。旧 helper/token/SCM 快照必须先于第一处
@@ -1247,6 +1559,7 @@ fn win_install_script_self_heals_and_grants_iu_start_before_first_start() {
 #[test]
 fn win_helper_upgrade_is_transactional_and_keeps_recovery_copies_on_failure() {
     let script = build_win_install_script(
+        &InstallPaths::win(),
         &install_params(
             PathBuf::from("/x"),
             PathBuf::from(r"C:\app\polaris-helper.exe"),
@@ -1295,6 +1608,168 @@ fn win_helper_upgrade_is_transactional_and_keeps_recovery_copies_on_failure() {
     ] {
         assert!(script[rollback..].contains(needle), "回滚腿缺：{needle}");
     }
+}
+
+/// **P4 · S 受保护内核目录的写侧门**：ImagePath 指受保护路径 + 播种 + `/setowner` 先行 + `Users:(RX)`。
+///
+/// 这一条是让整批「有牙」的那一条：helper 侧的 chokepoint（install-core 分派 + ACL 自检）在前两片
+/// 就建好了，但只要安装脚本还把 `--singbox` 烧成 app 侧用户可写路径，装完之后起核跑的仍是老路径
+/// 那一份 —— chokepoint 没人用。
+///
+/// 每条断言对应一个**静默**失效形态（都不编译错、真机才炸）：
+/// - `--singbox` 退回 `params.singbox_path` ⇒ 受保护目录白建，helper exec 用户可写核；
+/// - 播种挪到 `New-Service` 之后 ⇒ 服务先起、ImagePath 指空目录 ⇒ TUN 整条不可用（spec §4.4 首行风险）；
+/// - `/setowner` 挪到 `/grant:r` 之后 ⇒ 预创建者的 owner 隐含 WRITE_DAC 没被中和，DACL 设了也能改回去；
+/// - 漏 `Users:(OI)(CI)(RX)` ⇒ app 侧 `sha256_file(dest)` 读不到、自证无执行权 ⇒ 每次起核白推 80MB；
+/// - 路径用 `/` 分隔（`PathBuf::join` 在 Linux 上的形态）⇒ 真机 ImagePath 指向不存在的路径。
+#[test]
+fn win_install_script_seeds_and_locks_the_protected_core_dir() {
+    let paths = InstallPaths::win();
+    let p = install_params(
+        PathBuf::from("/x"),
+        PathBuf::from(r"C:\app\polaris-helper.exe"),
+    );
+    let script = build_win_install_script(&paths, &p, "WTOKEN");
+
+    // ── ① 受保护路径从 `InstallPaths::win().core_dir` 派生，且是纯反斜杠形态 ───────────────
+    let core_dir = paths.core_dir.to_string_lossy().into_owned();
+    let core_bin = format!(r"{core_dir}\{WIN_CORE_BIN_NAME}");
+    let core_sidecar = format!(r"{core_dir}\{WIN_CORE_SIDECAR_NAME}");
+    assert_eq!(
+        core_bin, r"C:\ProgramData\Polaris\core\sing-box.exe",
+        "受保护核路径的形态改了必须过 review（app 侧 reconcile 与 helper 侧自检都锚在它上）"
+    );
+    assert!(
+        script.contains(&format!("$coreBin = '{core_bin}'")),
+        "脚本里的 $coreBin 必须由 InstallPaths::win().core_dir 派生"
+    );
+    assert!(
+        script.contains(&format!(r#"--singbox "{core_bin}" --confdir"#)),
+        "服务 ImagePath 的 --singbox 必须指受保护核，而不是 app 侧用户可写核"
+    );
+    // 取材面自检 + 反向对照：脚本里凡提到受保护核目录的行，一条都不许出现正斜杠。
+    // （`PathBuf::join` 在 Linux 上拼 `/`，这种错不编译错、只让真机 ImagePath 指向不存在的路径。）
+    let core_lines: Vec<&str> = script
+        .lines()
+        .filter(|l| l.contains(r"ProgramData\Polaris\core") || l.contains("ProgramData/Polaris"))
+        .collect();
+    assert!(
+        core_lines.len() >= 4,
+        "取材面自检失败：提到受保护核目录的行只有 {} 条，下面的全称否定会变成空集恒过",
+        core_lines.len()
+    );
+    for line in &core_lines {
+        assert!(
+            !line.contains(r"Polaris/"),
+            "受保护核路径出现正斜杠（PathBuf::join 的宿主分隔符漏了出来）：{line}"
+        );
+    }
+
+    // ── ② 播种：条件播、先 .seed.new 再 Move，且**整段在 New-Service 之前** ─────────────────
+    // `-PathType Leaf` 是判据的一部分，不是装饰：裸 `Test-Path` 对**目录**也返 True，同账户用户
+    // 抢先建一个名叫 sing-box.exe 的目录就能让播种被跳过（ACL 三步照样全过、安装「成功」），
+    // 而 helper 之后 CreateProcess 一个目录必败、install-core 的 rename 覆盖目录也必败。
+    let seed_guard = script
+        .find("if (-not (Test-Path -LiteralPath $coreBin -PathType Leaf))")
+        .expect("缺条件播种，或漏了 -PathType Leaf（预建同名目录即可跳过播种）");
+    let seed_copy = script
+        .find(r#"Copy-Item -LiteralPath $bundledCore -Destination "$coreBin.seed.new" -Force"#)
+        .expect("缺核播种");
+    let seed_move = script
+        .find(r#"Move-Item -LiteralPath "$coreBin.seed.new" -Destination $coreBin -Force"#)
+        .expect("缺核播种的原子落位（先 .seed.new 再 Move，杜绝 exec 到写了一半的 exe）");
+    let sidecar_guard = script
+        .find("if (Test-Path -LiteralPath $bundledSidecar)")
+        .expect("缺 cronet 的条件播种（不随包时必须跳过，对齐 linux 的 `[ -f ] &&`）");
+    let new_service = script
+        .find("New-Service -Name PolarisHelper -BinaryPathName $bp")
+        .expect("缺 New-Service");
+    assert!(
+        seed_guard < seed_copy && seed_copy < seed_move,
+        "播种次序错：必须先判缺失、再落 .seed.new、最后 Move 就位"
+    );
+    assert!(
+        seed_move < new_service && sidecar_guard < new_service,
+        "播种必须早于 New-Service —— 否则服务起来时 ImagePath 指向空目录，TUN 整条不可用"
+    );
+    assert!(
+        script.contains(&format!("$coreSidecar = '{core_sidecar}'")),
+        "cronet 播种目标必须与核同目录"
+    );
+
+    // ── ③ ACL 三步的**顺序**：/setowner → /inheritance:r → /grant:r（面 I / 必改2）──────────
+    // 只钉「都包含」会被「顺序反了」骗过：/setowner 在 /grant:r 之后跑，等于先设 DACL 再换 owner，
+    // 中间那一刻预创建者的 WRITE_DAC 仍在，门就是摆设。
+    let core_setowner = script
+        .find(r#"& $icacls $coreDir /setowner "*S-1-5-32-544" /T"#)
+        .expect("缺受保护核目录 /setowner（/T 连播下的文件一起收）");
+    // `/inheritance:r` 与 `/grant:r` 已合成一条命令（N-1a：拆开会留空 DACL 中间态），
+    // 故这里只剩两步顺序：先 setowner，再一次性重建 DACL。
+    let core_dacl = script
+        .find("& $icacls $coreDir /inheritance:r /grant:r")
+        .expect("缺受保护核目录的 /inheritance:r + /grant:r（必须同一条命令）");
+    let core_grant = core_dacl;
+    assert!(
+        core_setowner < core_dacl,
+        "受保护核目录的 ACL 顺序必须是 /setowner → （/inheritance:r + /grant:r 同命令）"
+    );
+    assert!(
+        seed_move < core_setowner,
+        "/setowner /T 必须在播种之后 —— 提权 PowerShell 新建文件的默认属主是创建者账户，\
+         不在自检白名单里，先设后播等于把 owner 判定留在放宽态"
+    );
+    // $support / $tokenFile / $helperDst 三处也必须 setowner 先行（面 I 同理）。
+    for (obj, inherit) in [
+        (
+            r#"& $icacls $support /setowner "*S-1-5-32-544""#,
+            "& $icacls $support /inheritance:r /grant:r",
+        ),
+        (
+            r#"& $icacls $helperDst /setowner "*S-1-5-32-544""#,
+            "& $icacls $helperDst /inheritance:r /grant:r",
+        ),
+    ] {
+        let a = script.find(obj).unwrap_or_else(|| panic!("缺 {obj}"));
+        let b = script
+            .find(inherit)
+            .unwrap_or_else(|| panic!("缺 {inherit}"));
+        assert!(a < b, "/setowner 必须先于 /inheritance:r：{obj}");
+    }
+    let token_write = script
+        .find("Set-Content -Path $tokenFile")
+        .expect("缺写 token");
+    let token_setowner = script
+        .find(r#"& $icacls $tokenFile /setowner "*S-1-5-32-544""#)
+        .expect("缺 token /setowner");
+    assert!(
+        token_write < token_setowner,
+        "token 得先写出来才谈得上改属主"
+    );
+
+    // ── ④ Users:(RX) 一格都不许少（必改7）──────────────────────────────────────────────
+    // 主体钉 `*S-1-5-32-545`（BUILTIN\Users 的 well-known SID）而不是英文名 `Users:` ——
+    // 英文名在本地化 Windows 上解析不到，见 `win_install_script_uses_numeric_sids_...`。
+    assert!(
+        script.contains(
+            r#"& $icacls $coreDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-5-32-545:(OI)(CI)(RX)""#
+        ),
+        "受保护核目录必须显式授 *S-1-5-32-545:(OI)(CI)(RX)：继承父目录只有 SYSTEM/Admin(F)，\
+         Users 一条 ACE 都没有 ⇒ app 侧 sha256_file(受保护核) 读不到、内核自证无执行权"
+    );
+    // 反向：不得给 Users 授写类权（helper 侧 coreacl 判「放宽」→ 拒起核）。
+    assert!(
+        !script.contains("\"*S-1-5-32-545:(OI)(CI)(F)\"")
+            && !script.contains("\"*S-1-5-32-545:(OI)(CI)(M)\""),
+        "给 Users 授写类权会被 helper 的 ACL 自检判放宽并拒起核"
+    );
+
+    // ── ⑤ 事务边界：受保护核这一段刻意在 try 之外（失败时既有安装完整无损）───────────────
+    let transaction = script.find("try {\n").expect("缺升级事务边界");
+    assert!(
+        core_grant < transaction,
+        "建目录/播种/锁 ACL 应落在 try 之外：那几步对既有安装幂等且非破坏，\
+         失败时在动旧 token/helper/服务之前就非零退出，比进 try 后靠 catch 收拾更可回退"
+    );
 }
 
 #[test]
@@ -1575,4 +2050,131 @@ fn both_write_legs_pass_the_right_platform_flag() {
         !body.contains("f.write_all(content.as_bytes())"),
         "还有分支在绕过 script_bytes 直接写原文"
     );
+}
+
+/// 🔴 **S-4 跨 crate 等值门：Windows 受保护核目录名只有一个值。**
+///
+/// `WIN_CORE_DIR_NAME` 与 helper 侧 `derived_core_dir()` 里的 `join("core")` 是两份独立字面量：
+/// daemon 只从命令行拿 `--support`，核目录由它**自己派生**（刻意不从 wire 取 —— ImagePath 提权后
+/// 可改，少一个被读的核路径参数就少一条注入向量）。本 crate 又看不见 `polaris-helper`
+/// （不是它的依赖），故收敛只能靠门。
+///
+/// 漂移后果**全程静默**：ImagePath、seed、app 侧 dest 都跟本常量走，helper 的 install-core 却写进
+/// 另一个目录 ⇒ app 每次起核都判「受保护核不存在」⇒ 每次白推 80MB 且日志恒「已提升」，而 helper
+/// exec 的仍是安装期播下的那份 ⇒ **换核永远不生效**，且盘面上看不出任何异常。
+///
+/// 取材面取**整个 `crates/helper/src`** 而不是写死那一个文件：`derived_core_dir` 搬到别的模块时，
+/// 写死路径的门会读到一个仍然存在、但已不含该函数的文件 —— 静默失去判据。
+#[test]
+fn win_core_dir_name_agrees_with_the_helper_side_derivation() {
+    let files = polaris_source_probe::repo_dir_files_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "crates/helper/src",
+        "rs",
+    );
+    // 注释必须剥：`derived_core_dir` 的文档注释里就写着「两处各写一遍 `"core"`」，不剥的话
+    // 判据会拿注释当证据（那行改成别的值也照样绿）。字符串字面量**不能**剥 —— 针本身就是它。
+    let hits: Vec<(&str, String)> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), polaris_source_probe::mask_comments(text)))
+        .filter(|(_, code)| code.contains("fn derived_core_dir("))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "helper 侧 `derived_core_dir` 的定义点不是恰好一个（实得 {:?}）—— \
+         0 个 = 函数改名/删了，门失去判据；>1 个 = 又多了一份派生，下面只验了第一份",
+        hits.iter().map(|(p, _)| *p).collect::<Vec<_>>()
+    );
+    let (path, code) = &hits[0];
+    let at = code.find("fn derived_core_dir(").expect("上面刚筛过");
+    // 切到方法体的收尾 `}`（本仓 impl 内方法恒 4 空格缩进）。切点自检在下面三条。
+    let end = code[at..]
+        .find("\n    }")
+        .map_or(code.len(), |i| at + i + "\n    }".len());
+    let body = &code[at..end];
+    assert!(
+        body.contains("support_dir"),
+        "切点自检失败：切出来的片段里没有 support_dir，切的不是 derived_core_dir（{path}）"
+    );
+    assert!(
+        body.len() < 400,
+        "切点自检失败：切出来 {} 字节，远超单表达式方法体 —— 收尾锚点没命中，\
+         片段里混进了后续方法（{path}）",
+        body.len()
+    );
+    assert_eq!(
+        body.matches(".join(").count(),
+        1,
+        "derived_core_dir 里出现了不止一次 join —— 下面只会验到第一处，其余悄悄逃出覆盖面（{path}）"
+    );
+
+    // 取材器自检（正向对照）：同一套抠法喂一个哨兵串必须抠出哨兵值 —— 证明它在**真的读**那份
+    // 源码，而不是在返回一个常量。这条是 helper 侧变异的替代品：`crates/helper` 由另一条线持有，
+    // 本轮不得改动，故「改 helper 侧 → 本门转红」这个方向没法用实跑变异证。
+    assert_eq!(
+        join_literal(r#"fn f() { Path::new(&self.support_dir).join("polaris-sentinel") }"#),
+        Some("polaris-sentinel"),
+        "取材器自检失败：join 字面量抠不出来，本门的判据是假的"
+    );
+
+    // 判据：把 helper 侧真正 join 的那个字面量抠出来，与本 crate 的常量逐字相等。
+    let joined = join_literal(body)
+        .expect("derived_core_dir 不再是 `join(\"<字面量>\")` 形态 —— 判据失效，必须重写门");
+    assert_eq!(
+        joined, WIN_CORE_DIR_NAME,
+        "helper 侧派生的核目录名与安装脚本/app 侧的 WIN_CORE_DIR_NAME 分叉（{path}）：\
+         helper 会把 install-core 写进 `<support>\\{joined}`，而 ImagePath/seed/app 侧 dest 全指 \
+         `<support>\\{WIN_CORE_DIR_NAME}` ⇒ 换核永久不生效且无任何报错"
+    );
+    // 正面断言：上面是「A == B」，两侧同时被改成同一个错值仍然全绿。故再钉一次绝对值 +
+    // 与安装路径的实际拼接结果（脚本烧进 ImagePath 的就是它）。
+    assert_eq!(WIN_CORE_DIR_NAME, "core");
+    assert_eq!(
+        InstallPaths::win().core_dir,
+        PathBuf::from(format!(r"{WIN_SUPPORT_DIR}\{WIN_CORE_DIR_NAME}")),
+        "安装脚本派生受保护核路径时没走 WIN_CORE_DIR_NAME"
+    );
+}
+
+/// 抠出 `…join("<字面量>")` 里的那个字面量；形态不符返 `None`（不返空串 —— 空串上的等值断言
+/// 会把「抠不出来」伪装成一次普通的不相等，错误信息指向错误的方向）。
+fn join_literal(src: &str) -> Option<&str> {
+    src.split(".join(\"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+}
+
+/// cronet 的播种源必须是**随包核同目录**下的绝对路径。
+///
+/// 回归来由（2026-09-24 207 真机）：原实现用 `Path::parent()` 取目录，而单测跑在 Linux 上，
+/// `Path::new(r"C:\…\sing-box.exe").parent()` 返回 `Some("")` ⇒ 渲染成裸名 `libcronet.dll`。
+/// 生产（Windows）不受影响，但此前没有断言看这个值 —— 测试看到的是错值却照样绿，
+/// 将来真改坏了也照不出来。本条让 Linux 上渲染出的就是生产真值。
+#[test]
+fn win_install_script_seeds_cronet_from_the_bundled_core_directory() {
+    let p = InstallParams {
+        src_binary: PathBuf::from(
+            r"C:\Users\u\AppData\Local\Polaris\_up_\resources\win\polaris-helper.exe",
+        ),
+        bundled_core: PathBuf::from(
+            r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris\core_update\sing-box.exe",
+        ),
+        conf_dir: PathBuf::from(r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris"),
+        uid: 0,
+        script_dir: PathBuf::from(r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris"),
+    };
+    let script =
+        build_win_install_script(&InstallPaths::win(), &p, "0123456789abcdef0123456789abcdef");
+    let want = r"$bundledSidecar = 'C:\Users\u\AppData\Roaming\com.polaris.app\polaris\core_update\libcronet.dll'";
+    assert!(
+        script.contains(want),
+        "cronet 播种源不是随包核同目录下的绝对路径：\n{}",
+        script
+            .lines()
+            .find(|l| l.starts_with("$bundledSidecar"))
+            .unwrap_or("<缺这一行>")
+    );
+    // 反向：绝不能退化成相对路径的裸名（`Test-Path` 相对当前目录 ⇒ 静默不播种）。
+    assert!(!script.contains("$bundledSidecar = 'libcronet.dll'"));
 }

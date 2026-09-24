@@ -62,7 +62,13 @@ pub struct InstallPaths {
     pub descriptor: Option<PathBuf>,
     /// socket / pipe 路径（client 连接目标）。
     pub socket: PathBuf,
-    /// 受保护核目录（sing-box 锁定路径）。**win 不用**（核走 app 侧，见 [`InstallParams`]）。
+    /// 受保护核目录（sing-box 锁定路径）。**三平台都有消费者**：mac/linux 烧进 plist/unit 的
+    /// `--coredir`，win（P4 起）由 `build_win_install_script`（本 crate 私有）派生服务 ImagePath 的 `--singbox`
+    /// 并在此播种受保护核 —— 它是 Windows 受保护核路径在**安装脚本与 app 侧**的唯一来源。
+    ///
+    /// **helper 侧不读它**：daemon 只拿 `--support`，核目录由它自己的 `derived_core_dir()`
+    /// （`<support>\core`）独立派生。两份字面量靠 [`WIN_CORE_DIR_NAME`] 的等值门收敛，
+    /// 见 `manager/tests` 的 `win_core_dir_name_agrees_with_the_helper_side_derivation`。
     pub core_dir: PathBuf,
     /// 服务标识：mac = launchd label，linux = systemd unit 名，**win = SCM 服务名**。
     ///
@@ -120,10 +126,12 @@ impl InstallPaths {
             // Windows 服务定义在 SCM，磁盘无描述符文件 → is_installed 走 SysOps::service_exists
             // 单证据（W17：support 目录 ACL 锁拒未提权 stat，文件证据不可用；取舍见 is_installed 头注）。
             descriptor: None,
-            socket: PathBuf::from(r"\\.\pipe\polaris-helper"),
-            // win 不播种受管核（核走 app 侧，`InstallParams::bundled_core` 在 win 忽略）；
-            // 此字段在 win 无消费者，留占位值仅为结构完整。
-            core_dir: PathBuf::from(format!(r"{WIN_SUPPORT_DIR}\core")),
+            socket: PathBuf::from(WIN_PIPE_NAME),
+            // P4 起有消费者：[`build_win_install_script`] 在此建目录、播种核、锁 ACL，并把
+            // `<core_dir>\sing-box.exe` 拼成服务 ImagePath 的 `--singbox`；app 侧
+            // `HelperRuntime::protected_core_dir_path` 对账的也是同一个值。同样字面量拼接
+            // 而非 `join`（理由见上面 `binary`）。
+            core_dir: PathBuf::from(format!(r"{WIN_SUPPORT_DIR}\{WIN_CORE_DIR_NAME}")),
             service_label: WIN_SERVICE_NAME,
         }
     }
@@ -444,14 +452,41 @@ const LINUX_SERVICE_NAME: &str = "polaris-helper.service";
 const LINUX_AUTH_FILE: &str = "/var/lib/polaris/authorized-uids";
 /// linux 授权文件所在状态目录（`AUTH_FILE` 的父）。
 const LINUX_STATE_DIR: &str = "/var/lib/polaris";
-/// win SCM 服务名（= daemon `windows/mod.rs:SERVICE_NAME`）。
-const WIN_SERVICE_NAME: &str = "PolarisHelper";
-/// win support 目录（= daemon `--support` 默认，`windows/mod.rs:DEFAULT_SUPPORT_DIR`；helper.exe 外置副本 + helper.token 落此）。
-const WIN_SUPPORT_DIR: &str = r"C:\ProgramData\Polaris";
+/// win SCM 服务名。与 daemon 侧共引 helper-proto 的同一份真值（构造上单源，见该模块文档）。
+const WIN_SERVICE_NAME: &str = polaris_helper_proto::windows_helper::SERVICE_NAME;
+/// win 命名管道（client 连接目标）。与 daemon 侧 `CreateNamedPipeW` 共引同一份真值。
+const WIN_PIPE_NAME: &str = polaris_helper_proto::windows_helper::PIPE_NAME;
+/// win support 目录（= daemon `--support` 默认；helper.exe 外置副本 + helper.token 落此）。与 daemon 侧
+/// 共引同一份真值。
+const WIN_SUPPORT_DIR: &str = polaris_helper_proto::windows_helper::DEFAULT_SUPPORT_DIR;
 /// win helper 外置副本文件名。**单一真相源**：[`InstallPaths::win`] 与
 /// [`build_win_install_script`] 必须同取此常量。早先脚本用 `win_basename(src_binary)` 现算、
 /// 而 `InstallPaths::win()` 另写死一个不同路径，两者分叉即 Windows 恒判「未安装」的成因。
 const WIN_HELPER_EXE: &str = "polaris-helper.exe";
+/// win 受保护核目录名（`<support>\core`）。
+///
+/// **跨 crate 第二份**：helper 侧 `platform::windows::helper.rs` 的 `derived_core_dir()` 自己
+/// `join("core")`（它只拿到 `--support`，看不见本 crate）。漂移后果**静默**：ImagePath、seed、
+/// app 侧 dest 全跟本常量走，helper 的 install-core 却写进另一个目录 ⇒ app 每次起核都判
+/// 「受保护核不存在」、每次白推 80MB 且日志恒「已提升」，而 helper exec 的是安装期播下的那份
+/// ⇒ 换核永远不生效。两份由 `manager/tests` 的
+/// `win_core_dir_name_agrees_with_the_helper_side_derivation` 钉在一起。
+pub const WIN_CORE_DIR_NAME: &str = "core";
+/// helper token 文件名（`<support>\helper.token` / `$SUPPORT/helper.token`）。
+///
+/// 与 helper 侧的 `polaris_helper::token::TOKEN_FILENAME` 是两份同值字面量（本 crate 不依赖
+/// helper），由 `src-tauri` 的等值门 `helper_token_filename_agrees_across_crates` 钉住：
+/// 漂移后安装脚本写一个名字、daemon 读另一个 ⇒ helper 恒回 `ERR auth`，而安装本身「成功」。
+pub const HELPER_TOKEN_FILENAME: &str = "helper.token";
+/// win 受保护核目录里的核文件名。
+///
+/// 与 helper 侧的 `polaris_helper::core_install::SINGBOX_BIN_NAME_WIN` 和 app 侧的
+/// `core_paths::core_filename_for("windows")` 是三份同值字面量 —— 本 crate 既看不见 helper
+/// 也看不见 app，故不在 crate 间新开真值源，改由 `src-tauri` 的等值门把三者钉在一起
+/// （`runtime/proxy/platform_contracts` 的 `win_core_binary_names_agree_across_crates`）。
+pub const WIN_CORE_BIN_NAME: &str = "sing-box.exe";
+/// win 受保护核目录里的 NaiveProxy 配套 DLL 名（同上，由等值门钉住）。
+pub const WIN_CORE_SIDECAR_NAME: &str = "libcronet.dll";
 
 /// install 就绪轮询：装完等 daemon 起来绑 socket/pipe 的次数。2026-08-19 真机实测从上游的
 /// `for i<10` 放宽：脚本侧 sc 删旧等待窗（≤15s）+ New-Service 重试后，服务起管道常超 3s，
@@ -495,15 +530,71 @@ pub enum ManagerError {
 pub struct InstallParams {
     /// 源 helper 二进制（app 资源内 `polaris-helper`，脚本拷到特权路径）。
     /// 上游: `resourceManager.getMacHelperPath()` / `getLinuxHelperPath()` / `getWinHelperPath()`。
+    ///
+    /// # 🔴 这个字段的**所在目录是否对普通用户可写，决定了一条提权链通不通**
+    ///
+    /// 各平台的安装脚本都以提权身份把它拷到特权落点再注册成 root/SYSTEM 服务，**拷贝前不做任何
+    /// 签名 / hash 校验**（Windows 见本模块的 `build_win_install_script`，mac/linux 同形）。于是「谁能写这个
+    /// 路径」就等于「谁能决定那个 root 服务跑什么代码」——受信提权动作读的是一个不受信的源。
+    ///
+    /// 路径由调用方解析（app 侧 `runtime/helper.rs::resolve_helper_binary`，取随包资源目录），所以
+    /// 这件事**由装机形态决定**，不由本 crate 保证：
+    ///
+    /// - macOS：`/Applications/Polaris.app`；Linux：`/usr/lib/Polaris`（deb）—— 均 root-owned，链断开。
+    /// - **Windows：当前形态 `installMode: currentUser` ⇒ app 与随包 `polaris-helper.exe` 落
+    ///   `%LOCALAPPDATA%\Polaris`，同账户 Medium IL 进程可写 ⇒ 这条链当前是通的**：攻击者可在那一次
+    ///   UAC 提权发生**之前**替换它，受信安装随后把他的 exe 装成 LocalSystem 服务。
+    ///   这是**已知残留、如实登记**，不是「已经修好了」。
+    ///
+    /// 为什么不靠改 `installMode` 修：`perMachine` 会把 app 落到 `%PROGRAMFILES%\Polaris`（Users 只读，
+    /// 链断开），但 Tauri NSIS 模板给 per-machine 的落点只有 `$PROGRAMFILES64` / `$PROGRAMFILES`，
+    /// 且必发 `RequestExecutionLevel admin` ⇒ 与「标准用户也能自己装」**结构性互斥**。产品决策选了后者
+    /// （2026-09-16），所以这条链得换别的堵法（签名 / 安装前校验 / 把源换到不可写目录），
+    /// 不是换一个 conf 取值。`scripts/verify-packaging.mjs` 的 `checkWindowsInstallMode` 钉的是
+    /// 「这个取值必须被显式写下来」，不是钉某一个值。
+    ///
+    /// 其它残留（同样诚实登记）：无代码签名 ⇒ 不防「安装包 / 更新包在分发链路被篡改」；
+    /// 本地管理员本就在威胁模型之外。
     pub src_binary: PathBuf,
-    /// 随包 sing-box 核（mac/linux 播种 root 受管核；**win 忽略**——win 核走 app 侧）。
+    /// 安装脚本用来**播种**受保护核目录的源文件（三平台同构；P4 起含 win）。
+    ///
+    /// # ⚠️ 字段名名不副实（如实登记，别照名字写代码）
+    ///
+    /// 名字读作「随包核」，但唯一的生产装配点
+    /// （`src-tauri/src/runtime/helper.rs::install_params`）传的是
+    /// `crate::runtime::proxy::resolve_core_binary()` —— 那是**现役核**：优先级为
+    /// 环境覆盖 → `<config>/core_update/sing-box[.exe]`（用户可写）→ 最后才是随包种子。
+    /// 也就是说播下去的可能是用户换过的核，而不是安装包里那一份。
+    ///
+    /// 这是刻意与 mac/linux 保持同构，安全上**不构成信任锚点**：面 K 开着时 app 本体同样在
+    /// 用户可写域，改随包核与改现役核对同账户攻击者是同一道门。真要的是内容鉴权（spec §2.6），
+    /// 不是换一个 seed 源。播种只在目标不存在时发生，随后的内容对账由起核前的
+    /// `reconcile_protected_core` → `install-core`（带 sha256 校验）负责。
+    ///
     /// 上游: `resourceManager.getBundledSingBoxPath()`。
     pub bundled_core: PathBuf,
-    /// win `--singbox` 指向的 sing-box 路径（app 侧核）。**mac/linux 忽略**（用锁定的 `core_dir/sing-box`）。
-    /// 上游(win): `resourceManager.getSingBoxPath()`。
-    pub singbox_path: PathBuf,
     /// 用户 config/data 目录（`--confdir`；**linux 忽略**——核以登录用户跑，config 属主天然对）。
     /// 上游: `getUserDataPath()`。
+    ///
+    /// # ⚠️ 多用户机器的已知限制（如实登记，本批不修）
+    ///
+    /// 这是**装 helper 的那个用户**的目录，会被烤进 Windows 服务的 `BinaryPathName`，而服务本身是
+    /// **机器级**的。helper 起核前用它做白名单前缀比对
+    /// （`crates/helper/src/platform/windows/logic.rs::cfg_allowed`，不符回 `ERR config-path-denied`，
+    /// `platform/windows/helper.rs:281`）。于是同一台机器上的第二个用户：
+    ///
+    /// - 看得到服务、`is_installed` 为真、buildId 相同 ⇒ **不会**被引导去修复/重装（`upgradeable`
+    ///   只看 proto 与 buildId）；
+    /// - 起 TUN 时 cfg 在自己的 profile 下 ⇒ 前缀失配 ⇒ `config-path-denied`；
+    /// - 他若手动重装 helper（一次 UAC），`--confdir` 被改烤成他的目录 ⇒ **换成第一个用户失效**。
+    ///
+    /// 这条限制来自「helper 是机器级服务、`--confdir` 却是安装它那个用户的目录」这一对错配，
+    /// 与装机形态无关。当前形态 `installMode: currentUser` 下它的**可达性较低**：app 是 per-user
+    /// 安装，同机第二个用户通常压根没装 Polaris，撞上需要两个用户各自装过。
+    /// 🔮 若将来改 `perMachine`，app 对全机可见（快捷方式在 All Users 开始菜单）⇒ 这条路径变得**常见**，
+    /// 届时它会从「登记的限制」升级成「必须先修的前置」。
+    /// **彻底修需要 helper 支持多 confdir / 按调用方会话解析**，超出本批（面 K）射程，
+    /// 故按字面登记而不是假装不存在。
     pub conf_dir: PathBuf,
     /// 授权 uid（linux 写 `authorized-uids`；**mac/win 忽略**）。上游(linux): `process.getuid()`。
     pub uid: u32,
@@ -555,7 +646,6 @@ impl HelperManager {
         let params = InstallParams {
             src_binary: PathBuf::new(),
             bundled_core: PathBuf::new(),
-            singbox_path: PathBuf::new(),
             conf_dir: PathBuf::new(),
             uid: 0,
             script_dir: script_dir.to_path_buf(),
@@ -618,7 +708,7 @@ impl HelperManager {
             Platform::Linux | Platform::Other => {
                 Ok(build_linux_install_script(&self.paths, params))
             }
-            Platform::Win => Ok(build_win_install_script(params, token)),
+            Platform::Win => Ok(build_win_install_script(&self.paths, params, token)),
         }
     }
 
@@ -778,8 +868,16 @@ fn write_secure_script(dir: &Path, name: &str, content: &str) -> io::Result<Path
         // 后果不是「注释乱码」这种观感问题：脚本正文里的 `--confdir "<app config dir>"` 含用户 profile
         // 路径，中文账户（`C:\Users\张三\...`）的 UTF-8 字节被按 CP936 解出另一串汉字 ⇒ 服务
         // `BinaryPathName` 指向不存在的目录 ⇒ 之后每次起核都被 helper 的 `cfg_allowed` 判 denied，
-        // 而安装本身「成功」。NSIS 安装态下 app 本体也在 `%LOCALAPPDATA%` ⇒ `$helperSrc` 同样中招，
-        // 会更早死在 `Copy-Item`。
+        // 而安装本身「成功」。
+        //
+        // NSIS 安装态下 app 本体也在 `%LOCALAPPDATA%`（当前形态 `installMode: currentUser`）
+        // ⇒ `$helperSrc` 同样中招，会更早死在 `Copy-Item`。
+        //
+        // 🔮 前瞻：若将来改 `perMachine`，app 与随包 helper 会落 `%PROGRAMFILES%\Polaris`、路径里
+        // 不再有用户名 ⇒ **`$helperSrc` 这一条前提失效，但本注释的结论不变**：BOM 仍然必须带，因为
+        // `--confdir` 指的是 app config 目录（`%APPDATA%\com.polaris.app\…`，永远在用户 profile 下、
+        // 永远可能含中文），那条才是主因，与装机形态无关。
+        // 先写下来，是因为「前提没了但结论仍成立」最容易在下一次重构时被误读成「这段可以删了」。
         //
         // 同仓姊妹腿早就踩过并修好了，只是没推广到这一条：`src-tauri/src/runtime/update_install.rs`
         // 的 `utf16le_with_bom` —— 那里的文档逐字写着 `wscript.exe` 按系统代码页解释无 BOM 脚本、
@@ -878,8 +976,8 @@ umask 077\n\
 # umask 077 会把新建目录设成 700 → 普通用户 app 无法穿越连 socket(EACCES)。目录须 755 可穿越\n\
 # （socket 内部仍靠 token 鉴权 + token 文件 600 保护）。\n\
 chmod 755 /Library/PrivilegedHelperTools \"$SUPPORT\"\n\
-	printf '%s' {token} > \"$SUPPORT/helper.token\"\n\
-chown root:wheel \"$SUPPORT/helper.token\"; chmod 600 \"$SUPPORT/helper.token\"\n\
+	printf '%s' {token} > \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"\n\
+chown root:wheel \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"; chmod 600 \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"\n\
 COREDIR={core_dir}\n\
 BUNDLED_SB={bundled_sb}\n\
 mkdir -p \"$COREDIR\"\n\
@@ -1227,7 +1325,7 @@ echo polaris-helper-uninstall-ok\n",
 /// 旧文件、旧 binPath/start mode 与原运行态，避免覆盖升级把可用 helper 留成半安装态。
 /// `$ErrorActionPreference = Stop` 让失败以非零退出透出（提权 executor 归类 Failed；privilege.rs 的
 /// uac_escalation 无 上游的 flag-file 错误回写协议 —— 见报告 DESIGN-REVIEW）。
-fn build_win_install_script(params: &InstallParams, token: &str) -> String {
+fn build_win_install_script(paths: &InstallPaths, params: &InstallParams, token: &str) -> String {
     let support = WIN_SUPPORT_DIR;
     let exe = params.src_binary.to_string_lossy();
     // helperDst = SUPPORT\WIN_HELPER_EXE —— **不从 src_binary 现算 basename**：落点必须与
@@ -1237,14 +1335,39 @@ fn build_win_install_script(params: &InstallParams, token: &str) -> String {
     // 单一真相源：与 `InstallPaths::win().binary` 同取 WIN_HELPER_EXE（此前这里用
     // `win_basename(src_binary)` 现算，与状态探测那侧的写死路径分叉 → Windows 恒判未安装）。
     let helper_dst = format!(r"{support}\{WIN_HELPER_EXE}");
-    let token_file = format!(r"{support}\helper.token");
+    let token_file = format!(r"{support}\{HELPER_TOKEN_FILENAME}");
     let helper_backup = format!(r"{support}\{WIN_HELPER_EXE}.rollback");
-    let token_backup = format!(r"{support}\helper.token.rollback");
-    let singbox = params.singbox_path.to_string_lossy();
+    let token_backup = format!(r"{support}\{HELPER_TOKEN_FILENAME}.rollback");
+    // ★S（P4）：`--singbox` 由 `paths.core_dir` 派生的**受保护**路径，不再取 `params` 里那个
+    // app 侧用户可写核 —— 安装脚本与 app 侧 `protected_core_dir_path()` 的唯一来源是
+    // `InstallPaths::win().core_dir`；helper 自检（`coreacl`）查的目录由它自己从 `--support`
+    // 独立派生（`derived_core_dir()` = `<support>\core`），两侧靠 [`WIN_CORE_DIR_NAME`] 的等值门收敛。
+    //
+    // 🔴 **字面量拼接，不用 `PathBuf::join`**：`core_dir` 是硬编码的 Windows 路径字符串，而
+    // `join` 用**宿主**分隔符 —— 在本机（Linux）生成脚本时会拼出
+    // `C:\ProgramData\Polaris\core/sing-box.exe`。这种错不编译错、本机测试也照样绿，只会让
+    // 真机的 ImagePath 指向一个不存在的路径（服务起不来 = TUN 整条不可用）。同 `binary`
+    // 那条的理由，由 `win_install_script_seeds_and_locks_the_protected_core_dir` 钉死。
+    let core_dir = paths.core_dir.to_string_lossy();
+    let core_bin = format!(r"{core_dir}\{WIN_CORE_BIN_NAME}");
+    let core_sidecar = format!(r"{core_dir}\{WIN_CORE_SIDECAR_NAME}");
+    // 播种源：`bundled_core` 与同目录的 cronet（与 linux 腿同构，`[ -f ] &&` 形态 → 条件播种）。
+    //
+    // 🔴 **按 Windows 字符串切父目录，不用 `Path::parent`**：本函数只产出 Windows 脚本，而单测跑在
+    // Linux 上 —— 那里 `Path::new(r"C:\…\sing-box.exe").parent()` 返回 `Some("")`，拼出来的是
+    // **裸名** `libcronet.dll`（相对 PowerShell 当前目录，`Test-Path` 恒假 ⇒ 静默不播种 cronet）。
+    // 生产在 Windows 上 `parent()` 正常，所以这个错只在测试里出现、且此前没有任何断言看这个值：
+    // 测试看到的是错值却照样绿。改成字符串切分后，Linux 测试渲染出的就是生产真值，
+    // 由 `win_install_script_seeds_cronet_from_the_bundled_core_directory` 钉住。
+    let bundled_core = params.bundled_core.to_string_lossy().into_owned();
+    let bundled_sidecar = bundled_core.rsplit_once(['\\', '/']).map_or_else(
+        || WIN_CORE_SIDECAR_NAME.to_owned(),
+        |(dir, _)| format!(r"{dir}\{WIN_CORE_SIDECAR_NAME}"),
+    );
     let conf_dir = params.conf_dir.to_string_lossy();
     // BinaryPathName：各含空格路径用真双引号包裹，经 New-Service 单一字符串直达 CreateService。
     let bin_path = format!(
-        "\"{helper_dst}\" --singbox \"{singbox}\" --confdir \"{conf_dir}\" --support \"{support}\""
+        "\"{helper_dst}\" --singbox \"{core_bin}\" --confdir \"{conf_dir}\" --support \"{support}\""
     );
     // 🔴 $env: 引用必须走「双引号变量赋值 + 裸变量调用」：PowerShell 单引号是字面量，
     // `& '$env:SystemRoot\icacls.exe'` 不展开 → CommandNotFound + EAP=Stop → 脚本死在
@@ -1252,6 +1375,32 @@ fn build_win_install_script(params: &InstallParams, token: &str) -> String {
     // 该病自 TS 移植起就存在、从未在任何 Windows 机器上成功执行过（E0 的深层前提）。
     let sc = r#"$sc = "$env:SystemRoot\System32\sc.exe""#;
     let icacls = r#"$icacls = "$env:SystemRoot\System32\icacls.exe""#;
+    // 🔴 **所有 icacls 主体一律用数值 SID（`*` 前缀），不用英文组名**。
+    //
+    // 根因：BUILTIN / NT AUTHORITY 的账户名**是本地化的**（德语 `Benutzer`、法语 `Utilisateurs`…），
+    // 英文名在非英文 Windows 上解析不到，icacls 报「No mapping between account names and security
+    // IDs was done」并非零退出。此前四条腿（`$support`/`$helperDst` 的 `/inheritance:r` + `/grant:r`）
+    // 一直写英文名**且没有退出码守卫** ⇒ 在那些机器上安全加固**从来没生效过，而且完全静默**。
+    // 本批给每条 icacls 都补了守卫，若还留着英文名，静默弱 ACL 就会变成「装不上」——换 SID 才是治本：
+    // well-known SID 跨语言恒等，守卫因此不会误伤正常机器。
+    // MS 官方口径（icacls 文档 Remarks）：「SIDs may be in either numerical or friendly name form.
+    // If you use a numerical form, affix the wildcard character * to the beginning of the SID.」
+    const SID_SYSTEM: &str = "*S-1-5-18"; // NT AUTHORITY\SYSTEM（服务本体的运行身份）
+    const SID_ADMINS: &str = "*S-1-5-32-544"; // BUILTIN\Administrators
+    const SID_USERS: &str = "*S-1-5-32-545"; // BUILTIN\Users（只读执行，app 侧对账腿要用）
+                                             // 🔴 **`/setowner` 的目标是 Administrators（544），不是 SYSTEM（S-1-5-18）**。
+                                             //
+                                             // 把 owner 设成**不在调用者 token 里**的 SID 需要 `SeRestorePrivilege` 处于**已启用**态；
+                                             // 提权 PowerShell 的 token 里 SYSTEM 并不在列，那条路要靠 icacls 自己去 enable 特权，
+                                             // 无一手来源可依。而 `BUILTIN\Administrators` **在提权 token 里且带 `SE_GROUP_OWNER`**，
+                                             // 设它当 owner 是 `SetNamedSecurityInfo` 的零特权路径 —— 装不上的风险整条消失。
+                                             //
+                                             // 安全上无差：Administrators 本就持 `(F)`，owner 隐含的 `WRITE_DAC` 不给它任何新能力；
+                                             // 要中和的「预创建者以 CREATOR OWNER 身份留在 owner 位上」照样被替掉。
+                                             // helper 侧 `coreacl` 的 owner 白名单是 `{S-1-5-18, S-1-5-32-544}`
+                                             // （`platform/windows/coreacl.rs` 的 `PRIVILEGED_SIDS` / `is_privileged_sid`），544 在内，
+                                             // 故自检照常放行，helper 侧无需任何改动。
+    const SID_OWNER: &str = SID_ADMINS;
     format!(
         "$ErrorActionPreference = 'Stop'\n\
 {sc}\n\
@@ -1263,10 +1412,57 @@ $helperDst = '{helper_dst_q}'\n\
 $helperBackup = '{helper_backup_q}'\n\
 $tokenBackup = '{token_backup_q}'\n\
 $bp = '{bin_path_q}'\n\
+$coreDir = '{core_dir_q}'\n\
+$coreBin = '{core_bin_q}'\n\
+$coreSidecar = '{core_sidecar_q}'\n\
+$bundledCore = '{bundled_core_q}'\n\
+$bundledSidecar = '{bundled_sidecar_q}'\n\
 New-Item -ItemType Directory -Force -Path $support | Out-Null\n\
+# ★面 I（必改2）：先取所有权再改 DACL。普通用户可在 C:\\ProgramData 下直建子目录并成\n\
+# CREATOR OWNER 拿完全控制——owner 隐含 WRITE_DAC，不中和的话下面 /inheritance:r + /grant:r\n\
+# 设得再严，预创建者都能把自己加回去。/setowner 必须在 /inheritance:r 与 /grant:r 之前。\n\
+& $icacls $support /setowner \"{sid_owner}\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner 助手支持目录失败（退出码 $LASTEXITCODE）\" }}\n\
 # 锁目录 ACL：去继承、仅 SYSTEM/Administrators 完全控制并 (OI)(CI) 下传 → token/exe 出生即 SYSTEM/Admin 私有。\n\
-& $icacls $support /inheritance:r | Out-Null\n\
-& $icacls $support /grant:r \"SYSTEM:(OI)(CI)(F)\" \"Administrators:(OI)(CI)(F)\" | Out-Null\n\
+# 🔴 `/inheritance:r` 与 `/grant:r` **必须同一条命令**（一次 SetNamedSecurityInfo 写入）。\n\
+# 拆成两条会在中间留出一个**空 DACL**的瞬间：`/setowner` 已把属主交给 Administrators，\n\
+# 新建目录的 ACE 全是继承来的、被 `:r` 一次删光 ⇒ 此刻调用者既非 owner 又无任何 ACE，\n\
+# 下一条 `/grant:r` 能不能写回去只能指望 icacls 自行启用 SeRestorePrivilege（无一手来源）。\n\
+# 任一前提不成立 ⇒ 守卫 throw ⇒ 全新安装必然装不上。合成一条则空 DACL 中间态根本不存在。\n\
+& $icacls $support /inheritance:r /grant:r \"{sid_system}:(OI)(CI)(F)\" \"{sid_admins}:(OI)(CI)(F)\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"icacls /inheritance:r + /grant:r 助手支持目录失败（退出码 $LASTEXITCODE）\" }}\n\
+# ★S 受保护内核目录（spec §3.1 安装期流）。刻意放在升级事务（try）**之外**：\n\
+# 建目录 + 条件播种对既有安装是幂等且非破坏的，失败时 EAP=Stop 让脚本在动旧 token/helper/服务\n\
+# 之前就非零退出 —— 既有安装完整无损，比「进 try 后靠 catch 收拾」更可回退。反之若失败发生在\n\
+# try 内，catch 恢复的是旧 binPath（仍指旧路径），残留的 core 目录反而成了没人引用的孤儿。\n\
+New-Item -ItemType Directory -Force -Path $coreDir | Out-Null\n\
+# 播种必须早于 New-Service：ImagePath 已改指 $coreBin，服务先起来会 exec 一个空目录 ⇒ TUN 不可用。\n\
+# 只在缺失时播（与 mac `if [ ! -x ]` / linux `if [ ! -x ]` 同构）：已有内容归起核前的\n\
+# reconcile → install-core 按 sha256 对账，安装脚本不做内容判断。\n\
+# 先落 .seed.new 再 Move-Item：杜绝服务恰好在此刻启动时 exec 到一个写了一半的 exe。\n\
+# `-PathType Leaf` 不是装饰：裸 Test-Path 对**目录**也返 True。同账户用户可抢先在受保护核目录\n\
+# 下建一个名叫 sing-box.exe 的**目录** ⇒ 播种被跳过 ⇒ ACL 三步照样全过（装得「成功」）⇒\n\
+# helper CreateProcess 一个目录必败、install-core 的 rename 覆盖目录也必败 ⇒ 要管理员手清。\n\
+if (-not (Test-Path -LiteralPath $coreBin -PathType Leaf)) {{\n\
+  Copy-Item -LiteralPath $bundledCore -Destination \"$coreBin.seed.new\" -Force\n\
+  Move-Item -LiteralPath \"$coreBin.seed.new\" -Destination $coreBin -Force\n\
+  if (Test-Path -LiteralPath $bundledSidecar) {{\n\
+    Copy-Item -LiteralPath $bundledSidecar -Destination \"$coreSidecar.seed.new\" -Force\n\
+    Move-Item -LiteralPath \"$coreSidecar.seed.new\" -Destination $coreSidecar -Force\n\
+  }}\n\
+}}\n\
+# ★S+面 I：/setowner 先行（同上），/T 连同刚播下的文件一起收 —— 提权 PowerShell 新建的文件\n\
+# 默认属主是**创建者账户**而非 SYSTEM/Administrators，不 /T 的话 helper 起核前自检读到的\n\
+# owner 就落在白名单外 ⇒ ERR coredir-acl-weakened ⇒ 装完直接起不了核。\n\
+# 刻意**不带 `/C`**：那个开关让 icacls 跳过出错项继续跑，退出码不再如实反映失败 ⇒ 下面那条守卫失去牙。\n\
+& $icacls $coreDir /setowner \"{sid_owner}\" /T | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner 受保护内核目录失败（退出码 $LASTEXITCODE）\" }}\n\
+# Users:(OI)(CI)(RX) 不能漏（必改7）：父目录只有 SYSTEM/Admin(F)，光继承会让 Users 一条 ACE 都没有\n\
+# ⇒ app 侧 reconcile 的 sha256_file(受保护核) 读不到、内核自证跑 `sing-box version` 无执行权\n\
+# ⇒ 每次起核白推 80MB 且自证恒告警。(RX) 只读执行不属写类权，helper 自检放行。\n\
+# `/inheritance:r` 与 `/grant:r` 合一的理由同 $support（空 DACL 中间态）。\n\
+& $icacls $coreDir /inheritance:r /grant:r \"{sid_system}:(OI)(CI)(F)\" \"{sid_admins}:(OI)(CI)(F)\" \"{sid_users}:(OI)(CI)(RX)\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"icacls /inheritance:r + /grant:r 受保护内核目录失败（退出码 $LASTEXITCODE）\" }}\n\
 # 升级事务快照：属性来自 Win32_Service，不解析受系统显示语言影响的 sc qc 文本。\n\
 $oldService = Get-CimInstance -ClassName Win32_Service -Filter \"Name='{service}'\" -ErrorAction SilentlyContinue\n\
 $serviceExisted = $null -ne $oldService\n\
@@ -1282,6 +1478,9 @@ try {{\n\
 # 先删残留旧 token 再写（旧 Admin 只读会拒 Set-Content 覆盖；经目录 FILE_DELETE_CHILD 删旧不受其自身 DACL 阻挡）。\n\
 Remove-Item -Force -Path $tokenFile -ErrorAction SilentlyContinue\n\
 Set-Content -Path $tokenFile -Value '{token_q}' -NoNewline -Encoding ascii\n\
+# ★面 I：token 文件属主归 Administrators（新建文件的默认属主是创建者账户，owner 隐含 WRITE_DAC）。\n\
+& $icacls $tokenFile /setowner \"{sid_owner}\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner 助手 token 失败（退出码 $LASTEXITCODE）\" }}\n\
 & $sc stop {service} 2>$null | Out-Null\n\
 & $sc delete {service} 2>$null | Out-Null\n\
 # sc delete 异步标记删除 → 轮询等服务真消失，否则 New-Service 撞 1072。\n\
@@ -1294,8 +1493,11 @@ for ($i = 0; $i -lt 10 -and -not $copied; $i++) {{\n\
   catch {{ Start-Sleep -Milliseconds 300 }}\n\
 }}\n\
 if (-not $copied) {{ throw \"复制 helper.exe 到 ProgramData 失败（旧服务二进制可能仍被占用，请稍后重试或重启后再装）\" }}\n\
-& $icacls $helperDst /inheritance:r | Out-Null\n\
-& $icacls $helperDst /grant:r \"SYSTEM:(F)\" \"Administrators:(F)\" | Out-Null\n\
+# ★面 I：同理，helper.exe 副本的属主也归 Administrators（顺序仍是 setowner → inheritance:r + grant:r）。\n\
+& $icacls $helperDst /setowner \"{sid_owner}\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner helper.exe 失败（退出码 $LASTEXITCODE）\" }}\n\
+& $icacls $helperDst /inheritance:r /grant:r \"{sid_system}:(F)\" \"{sid_admins}:(F)\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"icacls /inheritance:r + /grant:r helper.exe 失败（退出码 $LASTEXITCODE）\" }}\n\
 # New-Service 退避重试（1072 窗口）：BinaryPathName 单一字符串直达 CreateService；默认 LocalSystem；Automatic 开机自启。\n\
 $created = $false\n\
 $lastErr = $null\n\
@@ -1356,6 +1558,15 @@ Remove-Item -Force -Path $helperBackup,$tokenBackup -ErrorAction SilentlyContinu
         helper_backup_q = ps_quote(&helper_backup),
         token_backup_q = ps_quote(&token_backup),
         bin_path_q = ps_quote(&bin_path),
+        core_dir_q = ps_quote(&core_dir),
+        core_bin_q = ps_quote(&core_bin),
+        core_sidecar_q = ps_quote(&core_sidecar),
+        bundled_core_q = ps_quote(&bundled_core),
+        bundled_sidecar_q = ps_quote(&bundled_sidecar),
+        sid_system = SID_SYSTEM,
+        sid_admins = SID_ADMINS,
+        sid_users = SID_USERS,
+        sid_owner = SID_OWNER,
         token_q = ps_quote(token),
         icacls = icacls,
         sc = sc,

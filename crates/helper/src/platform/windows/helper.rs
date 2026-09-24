@@ -3,9 +3,9 @@
 //! ## 设计
 //!
 //! Go 源 `handle(conn)` 读 token+command+args 行 → `mu.Lock()` → switch command → 回复。本 Rust 实现把
-//! 「帧已解析」与「分派」解耦：调用方（`service.rs` 的 serve 循环）负责读帧 + 鉴权 + 解析为
-//! [`polaris_helper_proto::Request`]，本模块的 [`WinHelper::handle`] 负责 switch 分派 + 子进程状态管理
-//! + 回复构造。这样：
+//! 「读帧」与「处理」解耦：调用方（`service/win.rs` 的 serve 循环）只负责读回一整帧、把结果写出去；
+//! 本模块的 [`WinHelper::handle_frame`] 负责切行 → 鉴权 → 解码为 [`polaris_helper_proto::Request`]
+//! → [`WinHelper::handle`] 的 switch 分派 + 子进程状态管理 + 回复构造。这样：
 //! - 分派逻辑（=Go switch 主体）跨平台纯逻辑，Linux 可单测。
 //! - IO（命名管道读写）由 `service.rs` 承接（`#[cfg(windows)]`）。
 //!
@@ -25,10 +25,13 @@
 //! 故 [`ChildState`] 只存 `Option<u32>`（pid）。真正的 `Wait()` 回收（Go `go func() { c.Wait(); close(done) }`）
 //! 由 [`ops::ProcOps`] 实现内部承载（生产侧 `winproc` 持有 `std::process::Child` 或 Job Object 句柄）。
 
+use crate::core_install::{install_core_files, InstallResult, SINGBOX_BIN_NAME_WIN};
+use crate::platform::windows::coreacl;
 use crate::platform::windows::logic;
 use crate::platform::windows::ops::{NetTableOps, ProcOps};
 use crate::token::{is_authed_constant_time, TokenStore};
 use polaris_helper_proto::{Request, Response, ResponseKind};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Windows helper 错误（helper 内部分派/状态错误，非协议错误码）。
@@ -72,6 +75,81 @@ pub struct WinHelper<T, P, N> {
     conf_dir: String,
     service_name: String,
     support_dir: String,
+}
+
+/// 响应写完后要不要等对端把它读走（= 要不要 `FlushFileBuffers`）。
+///
+/// 命名管道服务端在 `DisconnectNamedPipe` 前不 flush，client 尚未读走的字节会被丢弃
+/// （稳定复现 ERROR_PIPE_NOT_CONNECTED(233)）—— 所以正常响应必须等。但「等对端」这件事本身
+/// 是可被滥用的：等多久完全由对端决定。故按**对端是否已鉴权**分两档。
+///
+/// 住在本模块（跨平台）而非 `service/win.rs`：档位由 [`WinHelper::handle_frame`] 决定，那是
+/// Linux 上可测的判据；`service/win.rs` 只照档位执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushMode {
+    /// 已鉴权的响应（含已鉴权但命令未知的 `ERR unknown`）：等对端读走（仍受 service 层
+    /// `IoTimeoutGuard` 的 5s 上界约束）。
+    WaitPeer,
+    /// 鉴权失败 / 帧不合法：**不等对端**。这些响应的收件人恰恰是「还没证明自己是谁」
+    /// 的进程，不能让它用「发一帧、不读」把 SYSTEM 服务的线程按住。代价：这条错误行可能被随后的
+    /// `DisconnectNamedPipe` 丢弃，合法但 token 过期的 client 侧表现为管道断开而非 `ERR auth`
+    /// （两者都进同一条「本次调用失败」分支，不改变 app 的处置）。
+    NoWait,
+}
+
+/// 一帧的处理结果：要写回的整行（含 `\n`）+ flush 档位 + 写完后是否自退（uninstall）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameReply {
+    /// 写回管道的响应行（含行尾 `\n`）。
+    pub line: String,
+    /// 写完后要不要等对端读走。
+    pub flush: FlushMode,
+    /// 写完并断开后 800ms 退出进程（Go `uninstall` 分支，helper.go:291-294）。
+    pub exit_after: bool,
+}
+
+impl FrameReply {
+    fn no_wait(line: String) -> Self {
+        Self {
+            line,
+            flush: FlushMode::NoWait,
+            exit_after: false,
+        }
+    }
+
+    fn from_outcome(outcome: HandleOutcome) -> Self {
+        match outcome {
+            // 鉴权失败：对端未证明身份，不给它「按住服务线程」的机会。
+            HandleOutcome::AuthFailed => Self::no_wait(format!(
+                "{}\n",
+                Response::Err(polaris_helper_proto::Error::new(
+                    polaris_helper_proto::ErrorCode::Auth
+                ))
+                .to_wire_line()
+            )),
+            HandleOutcome::Respond(resp) => Self {
+                line: format!("{}\n", resp.to_wire_line()),
+                flush: FlushMode::WaitPeer,
+                exit_after: false,
+            },
+            HandleOutcome::UninstallAndExit(resp) => Self {
+                line: format!("{}\n", resp.to_wire_line()),
+                flush: FlushMode::WaitPeer,
+                exit_after: true,
+            },
+        }
+    }
+}
+
+/// `ERR unknown\n`（帧不合法 / 已鉴权但命令解不出，两条腿同一行）。
+fn unknown_line() -> String {
+    format!(
+        "{}\n",
+        Response::Err(polaris_helper_proto::Error::new(
+            polaris_helper_proto::ErrorCode::Unknown
+        ))
+        .to_wire_line()
+    )
 }
 
 /// 单次 handle 的结果（成功响应，或鉴权失败/其它需提前终止的情形）。
@@ -129,10 +207,49 @@ where
     #[must_use]
     pub fn handle(&self, client_token: &str, req: Request) -> HandleOutcome {
         // Go helper.go:169: if tok == "" || tok != tokenValue() { ERR auth; return }
-        if !is_authed_constant_time(client_token, &self.token.token_value()) {
+        if !self.is_authed(client_token) {
             return HandleOutcome::AuthFailed;
         }
-        // 鉴权通过 → 进 switch（持锁分派）
+        self.dispatch(req)
+    }
+
+    /// 处理命名管道读回的**一整帧**（切行 → 验 token → 解码 → 分派），产出要写回的那一行。
+    ///
+    /// `service/win.rs` 的 `handle_connection` 只负责读帧与把 [`FrameReply`] 写出去；顺序判据全在
+    /// 这里，好让它在 Linux 上有门可跑。顺序：
+    ///
+    /// 1. 帧行数不足（连 token/命令都没有）⇒ `ERR unknown` + [`FlushMode::NoWait`]（对端连身份都没报）。
+    /// 2. **先验 token** ⇒ 不合法回 `ERR auth` + `NoWait`，**不看命令**：对已知 / 未知 / 参数解不出的
+    ///    命令一律同一行，未鉴权对端探测不出 helper 认识哪些命令。
+    /// 3. 已鉴权而命令解不出 ⇒ `ERR unknown` + [`FlushMode::WaitPeer`]：收件人已证明身份，这行必须
+    ///    送达 —— 它是 app 判「这个 helper 不支持某命令」的唯一依据（旧顺序在验 token 之前 NoWait
+    ///    回它，DisconnectNamedPipe 常把它丢掉，app 只看到 0 字节 / 233）。
+    /// 4. 分派。
+    #[must_use]
+    pub fn handle_frame(&self, raw: &str) -> FrameReply {
+        let Some(frame) = logic::split_frame(raw) else {
+            return FrameReply::no_wait(unknown_line());
+        };
+        if !self.is_authed(frame.token) {
+            return FrameReply::from_outcome(HandleOutcome::AuthFailed);
+        }
+        let Some(req) = logic::parse_request(frame.command, &frame.args) else {
+            return FrameReply {
+                line: unknown_line(),
+                flush: FlushMode::WaitPeer,
+                exit_after: false,
+            };
+        };
+        FrameReply::from_outcome(self.dispatch(req))
+    }
+
+    /// token 常量时间比对（Go helper.go:169）。[`Self::handle`] 与 [`Self::handle_frame`] 共用。
+    fn is_authed(&self, client_token: &str) -> bool {
+        is_authed_constant_time(client_token, &self.token.token_value())
+    }
+
+    /// 鉴权已过之后的 switch 分派（Go `handle()` 的 switch 主体）。
+    fn dispatch(&self, req: Request) -> HandleOutcome {
         match req {
             Request::Ping => HandleOutcome::Respond(Response::Ok(ResponseKind::Pong(
                 // Go helper.go:179: Windows Getuid()=-1 破坏正则，固定发 0。
@@ -240,6 +357,9 @@ where
             // D4：Windows 也刷 DNS 缓存。此前并在下方 `ERR unknown` 分支里 —— app 侧 Medium IL 跑
             // ipconfig 该机 rc=1（需提权），停核后 FakeIP 记录留在系统缓存里继续命中。
             Request::FlushDns => self.handle_flush_dns(),
+            // P4：Windows 也落受保护内核目录（此前只有 mac/linux 有这个 chokepoint，win 落 ERR unknown，
+            // helper 以 LocalSystem 直接 exec 用户可写路径下的 sing-box.exe）。
+            Request::InstallCore(p) => self.handle_install_core(&p),
             // 以下命令 Windows helper 不支持（mac/linux 专属）—— Go default 分支回 ERR unknown。
             Request::LinuxStart(_)
             | Request::LinuxDnsSet(_)
@@ -247,7 +367,6 @@ where
             | Request::MacProxyTransaction { .. }
             | Request::MacProxyCompareTransaction { .. }
             | Request::MacProxyCompareCapability
-            | Request::InstallCore(_)
             | Request::DefaultRestore { .. } => HandleOutcome::Respond(Response::Err(
                 polaris_helper_proto::Error::new(polaris_helper_proto::ErrorCode::Unknown),
             )),
@@ -295,6 +414,12 @@ where
                 return HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::new(
                     polaris_helper_proto::ErrorCode::LogPathDenied,
                 )));
+            }
+            // P4（spec §3.4 · Q9）：exec 之前复核「核住的地方还是 SYSTEM 写、普通用户只读」吗。
+            // 判定为放宽/异常 → 拒起核（下方 `core_acl_gate`）。锁内调用：这一步是 3 次
+            // `GetNamedSecurityInfoW`，比本临界区里已有的 `start_singbox`（真起进程）便宜得多。
+            if let Some(err) = self.core_acl_gate() {
+                return HandleOutcome::Respond(Response::Err(err));
             }
             // Go helper.go:358-369: fwd=="1" → enableIPForwarding + startSingbox（均在生产侧
             // start_singbox 内；失败 → ERR start）。持锁调用 —— start_singbox 起进程后即返回（不 Wait），
@@ -378,6 +503,203 @@ where
                 )))
             }
         }
+    }
+
+    /// `install-core` 分支（P4：S 受保护内核目录，Windows 拉平到 mac/linux 的形态）。
+    ///
+    /// **定位**：这是与 mac/linux 拉平的 chokepoint + 纵深，**不是消除提权面** —— helper.exe 本体
+    /// 仍源自用户可写域（面 K 仍开着），故对同账户攻击者的边际收益≈0。它买到的是：核此后住在
+    /// SYSTEM 写、普通用户只读的目录里，且每次换核都过一道 sha256 闸（读全字节进内存再落盘）。
+    ///
+    /// **与 mac/linux 有意不同构**：core_dir 由 `--support` 派生（`<support>\core`），**不读**任何
+    /// 命令行/wire 传来的核路径。mac/linux 的 coreDir 来自安装期烧进 plist/unit 的 `--coredir`；
+    /// Windows 这侧连那个入口一起收掉 —— SCM ImagePath 是提权后可改的，少一个会被读的路径参数
+    /// 就少一条注入向量。
+    ///
+    /// **child 在跑 → `ERR busy`**：Windows 既 rename 不动运行中的 exe，也 rename 不动已被加载的
+    /// DLL，不挡就是「`.new` 写得进、rename 失败」的半吊子安装。判活用 [`Self::live_managed_pid`]
+    /// —— 与 [`Self::handle_start`] 同一把锁、同一个判据，不另造判活原语。
+    ///
+    /// **落盘目标被放宽 → `ERR coredir-acl-weakened` 且不写盘**（[`Self::install_core_acl_gate`]）：
+    /// 与起核那道自检守的是**不同的面** —— 那条守 `dir(--singbox)`，本条守 `<support>\core`，而
+    /// 未迁移窗口里前者按设计跳过。往一个普通用户能改的目录里落核，等于亲手把 sha256 闸校验过的
+    /// 字节交给别人替换。
+    fn handle_install_core(&self, p: &polaris_helper_proto::InstallCoreParams) -> HandleOutcome {
+        // 判活在 child_mu 临界区内（与 handle_start 同款，顺带清掉核自然退出后的陈旧记账）。
+        // 锁只覆盖判活，不覆盖落盘：装核要写几十 MB，持锁会把并发 ping/status/stop 一起按住
+        // （本模块顶部的并发纪律）。放锁后若真有 start 抢进来，rename 会硬失败 → `ERR rename …`，
+        // 是一条如实的错误；`.new + rename` 保证半成品永远不会变成生效的那个文件。
+        let busy = {
+            let mut state = self.child_mu.lock().unwrap_or_else(PoisonError::into_inner);
+            self.live_managed_pid(&mut state).is_some()
+        };
+        if busy {
+            return HandleOutcome::Respond(InstallResult::Busy.to_response());
+        }
+        // S5：落盘前复核落盘目标本身（**不是** exec 面）。放宽即回 `ERR coredir-acl-weakened` 且
+        // 一个字节都不写 —— 见 [`Self::install_core_acl_gate`]。判活闸在前：`ERR busy` 是更具体的
+        // 前置条件，且核在跑时 rename 本就必失败。
+        if let Some(err) = self.install_core_acl_gate() {
+            return HandleOutcome::Respond(Response::Err(err));
+        }
+        let core_dir = self.derived_core_dir();
+        match install_core_files(
+            &core_dir,
+            Path::new(&p.src_dir),
+            &p.want_hash,
+            SINGBOX_BIN_NAME_WIN,
+        ) {
+            Ok(_) => HandleOutcome::Respond(Response::Ok(ResponseKind::Installed)),
+            Err(e) => HandleOutcome::Respond(e.to_response()),
+        }
+    }
+
+    /// 起核前的受保护核目录自检（P4 · spec §3.4 · Q9）。
+    ///
+    /// 返回 `Some(err)` = **拒起核**（判定为放宽/异常）；`None` = 放行。
+    ///
+    /// **两条腿刻意不合并**（Q9 拍板）：
+    /// - 判定为「放宽/异常」→ 拒起核 + `ERR coredir-acl-weakened <哪个路径哪条 ACE>`。
+    ///   通过态是不可被改的（安装脚本设成 SYSTEM/Administrators 私有 + `Users:(RX)`），所以
+    ///   误判只可能来自判定函数本身 —— 宁严。
+    /// - **读不到**（FFI 报错、对象不存在、`--singbox` 推不出目录）→ **warn 继续**。
+    ///   读不到 ≠ 被放宽：把它折进拒绝腿，一次 FFI 失败就让用户连不上网，而那台机器的 ACL
+    ///   可能完全正常。`libcronet.dll` 在不带 cronet 的核里本就缺席，正落这条腿。
+    ///
+    /// 自检对象取 `singbox_bin` 的**父目录**（真正要被 exec 的那个），不是 `<support>\core`
+    /// —— 理由见 [`crate::platform::windows::coreacl::core_acl_targets`]。
+    ///
+    /// ## 两者不一致 ⇒ **warn + 放行，且跳过 ACL 判定**（不是「照样喂判据」）
+    ///
+    /// 不一致唯一会发生的状态里，`dir(--singbox)` 就是 `%APPDATA%\…\core_update`，owner 是登录
+    /// 用户 ⇒ 必判 `OwnerNotPrivileged` ⇒ 拒起核。而这台机器**本就还没被加固**：它要跑的核与本批
+    /// 之前跑的是同一个，拒它换不来任何安全收益，只是把「加固未生效」变成「彻底不可用」——
+    /// 违反 spec §3.5「四象限无一 brick」与 §3.6「未迁移用户不打断」。
+    ///
+    /// 这条路径不是理论：安装脚本每次 `sc delete` + `New-Service`，正常升级不留不一致；**可达的是
+    /// catch 回滚腿** —— 新增的 icacls 守卫任一 throw → 回滚 → `Copy-Item $helperBackup → $helperDst`
+    /// 若被文件锁挡住，机器就停在「新 helper.exe + 旧 binPath」，那时拒起核 = 永久 brick。
+    ///
+    /// **放行不是安全退让**：要构造这个不一致必须改服务 ImagePath（HKLM，需管理员），已在威胁模型外；
+    /// 而这台机器的 `<support>\core` 那一面仍由 install-core 那条腿守着（见 [`Self::install_core_acl_gate`]）。
+    fn core_acl_gate(&self) -> Option<polaris_helper_proto::Error> {
+        let Some(targets) = coreacl::core_acl_targets(&self.singbox_bin) else {
+            // 推不出目录 = 配置异常，不是「被放宽」→ 同读不到腿（warn 继续）。但必须说出来：
+            // 静默放行等于这道门在这台机器上根本不存在。
+            log::warn!(
+                "core acl self-check skipped: cannot derive a directory from --singbox {}",
+                self.singbox_bin
+            );
+            return None;
+        };
+        // 实际执行面 != install-core 的落盘目标 ⇒ 这台机器的 helper ImagePath 还没迁移到受保护
+        // 路径 ⇒ 加固根本还没生效。按「读不到」腿处理：warn + 放行，不喂判定（理由见函数文档）。
+        let derived = self.derived_core_dir();
+        let derived = derived.to_string_lossy();
+        if !coreacl::same_win_path(&targets[0], &derived) {
+            log::warn!(
+                "core acl self-check skipped: the core still runs from {} instead of the protected \
+                 {derived} — this machine's core-directory hardening is NOT in effect yet; \
+                 reinstalling or upgrading the helper migrates it",
+                targets[0]
+            );
+            return None;
+        }
+        self.judge_acl_targets(targets)
+    }
+
+    /// install-core 落盘前的受保护核目录自检（S5）。
+    ///
+    /// **与 [`Self::core_acl_gate`] 不是同形第二腿，守的是不同的面**：那条守 `dir(--singbox)`
+    /// （实际执行面），本条守 [`Self::derived_core_dir`]（落盘目标面）。两者相等时它们查同一批对象，
+    /// 但在未迁移窗口里前者**主动跳过** —— 少了本条，那段窗口里 `<support>\core` 没有任何腿在守，
+    /// 而 install-core 恰恰是往那里写几十 MB 的那条命令。
+    ///
+    /// 判定为放宽 ⇒ 回 `ERR coredir-acl-weakened` 且**不写盘**（往一个普通用户能改的目录里落核，
+    /// 等于亲手把 sha256 闸校验过的字节交给别人替换）。
+    fn install_core_acl_gate(&self) -> Option<polaris_helper_proto::Error> {
+        let core_dir = self.derived_core_dir();
+        // 复用同一个兜底取材面构造器（目录 + 核 + 配套 DLL）：两处各拼一遍 = 两份会分叉的白名单。
+        let bin = coreacl::join_win(&core_dir.to_string_lossy(), SINGBOX_BIN_NAME_WIN);
+        let Some(targets) = coreacl::core_acl_targets(&bin) else {
+            log::warn!(
+                "install-core acl self-check skipped: cannot derive a directory from {}",
+                core_dir.display()
+            );
+            return None;
+        };
+        self.judge_acl_targets(targets)
+    }
+
+    /// 两条腿共用的「枚举取材面 → 逐对象读 owner/DACL → 判定 → 分篮子处置」。
+    ///
+    /// **取材面 = 兜底白名单 ∪ 目录实际条目**：只问硬编码的两个文件名，攻击者在首装前预创建的
+    /// 第三个文件（带 `SE_DACL_PROTECTED` 的 `Users:(F)`，安装脚本 `/inheritance:r` 的传播**按定义
+    /// 跳过**它）永远不会被问到 —— 全程 Medium IL、零特权即可布置。判据侧（`judge_object`）零改动。
+    ///
+    /// 目录列不出来 ⇒ 进 `unreadable`（warn 继续），不是拒起核：Q9 的「读不到 ≠ 被放宽」在这里同样成立。
+    fn judge_acl_targets(&self, targets: Vec<String>) -> Option<polaris_helper_proto::Error> {
+        let dir = targets[0].clone();
+        let (targets, enumerate_error) = match self.proc.list_dir_names(&dir) {
+            Ok(names) => (
+                coreacl::extend_targets_with_dir_entries(&targets, &dir, &names),
+                None,
+            ),
+            Err(e) => (targets, Some(e)),
+        };
+        let read: Vec<(String, Result<coreacl::ObjectSecurity, String>)> = targets
+            .into_iter()
+            .map(|path| {
+                let sec = self.proc.read_object_security(&path);
+                (path, sec)
+            })
+            .collect();
+        // `Users:(RX)` 缺席只 warn、绝不拒起核（helper 改不了 ACL，但这条链没有别的自曝腿 ——
+        // app 读不到 dest ⇒ 每次起核白推 80MB + 内核自证恒告警，真机上完全静默）。
+        let missing_read: Vec<&str> = read
+            .iter()
+            .filter(|(_, sec)| {
+                sec.as_ref()
+                    .is_ok_and(|s| !coreacl::grants_non_privileged_read_execute(s))
+            })
+            .map(|(path, _)| path.as_str())
+            .collect();
+        if !missing_read.is_empty() {
+            log::warn!(
+                "core acl self-check: no non-privileged read/execute grant on {} — the app runs at \
+                 medium integrity and will not see the protected core, re-pushing it on every start",
+                missing_read.join("; ")
+            );
+        }
+        let mut outcome = coreacl::judge_core_objects(&read);
+        if let Some(error) = enumerate_error {
+            outcome.unreadable.push(coreacl::UnreadableObject {
+                path: dir,
+                error: format!("enumerate entries: {error}"),
+            });
+        }
+        if !outcome.unreadable.is_empty() {
+            log::warn!(
+                "core acl self-check could not read: {}",
+                outcome.unreadable_detail()
+            );
+        }
+        if outcome.is_weakened() {
+            log::error!("refusing to start the core: {}", outcome.findings_detail());
+            return Some(polaris_helper_proto::Error::with_detail(
+                polaris_helper_proto::ErrorCode::CoredirAclWeakened,
+                outcome.findings_detail(),
+            ));
+        }
+        None
+    }
+
+    /// install-core 的落盘目标 = `<support>\core`（**派生**，不从命令行/wire 取 —— SCM ImagePath
+    /// 是提权后可改的，少一个会被读的核路径参数就少一条注入向量）。
+    ///
+    /// 与起核自检共用同一个表达式：两处各写一遍 `"core"`，改一处漏一处就是「装到 A、守着 B」。
+    fn derived_core_dir(&self) -> std::path::PathBuf {
+        Path::new(&self.support_dir).join("core")
     }
 
     /// 返回仍存活的受管核 pid；确定已死时原子清除陈旧记账。

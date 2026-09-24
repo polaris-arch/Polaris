@@ -360,10 +360,20 @@ pub fn build_proxy_outbound(
             // `h.host` / `h.method` **无处可去**：内核 http 出站没有这两键（写顶层同样 FATAL），故此处
             // 刻意不读——它们只在 h2 **传输**那条腿（`generate_transport_config` 的 "http"|"h2" 分支）
             // 有意义，那里的容器是 `transport`，schema 允许。
+            //
+            // path 与 `Host` 头**互斥**，有 path 时丢掉 `Host`（大小写不敏感，内核按 canonical 取）。
+            // 1.15.0-alpha.7 起内核在 `transport/http/client.go` 的 `NewClient` 里对两者并存直接报
+            // `Host header and path are not allowed at the same time`，落点是 initialize ⇒ **整核起不来**。
+            // alpha.4 及以前同一条检查在每次 CONNECT 时才触发（`sing/protocol/http/client.go`），
+            // 即这种节点本来就连不上、只是不拖垮别的节点。故丢 `Host` 不让任何原本能用的节点变坏。
             if let Some(h) = &server.http_settings {
+                let has_path = h.path.as_deref().is_some_and(|p| !p.is_empty());
                 if let Some(headers) = &h.headers {
                     let mut m = BTreeMap::new();
                     for (k, v) in headers {
+                        if has_path && k.eq_ignore_ascii_case("host") {
+                            continue;
+                        }
                         m.insert(k.clone(), OneOrMany::Many(v.clone()));
                     }
                     ob.headers = Some(m);

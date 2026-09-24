@@ -151,10 +151,35 @@ fn payload_stamp_requires_the_core_file() {
 }
 
 #[test]
-fn windows_has_no_protected_core() {
-    assert!(!platform_has_protected_core(Platform::Win));
+fn every_platform_has_a_protected_core() {
+    // P4：Windows 由 `false` 翻成 `true` —— 不是把判据改软，而是那个 `false` 描述的事实已不存在
+    //（helper 实现了 install-core，ImagePath 改指 `<support>\core\sing-box.exe`）。
+    // 真正守住这条腿的不是本断言，而是下面那条：受保护核路径必须由 `InstallPaths` 派生。
+    assert!(platform_has_protected_core(Platform::Win));
     assert!(platform_has_protected_core(Platform::Mac));
     assert!(platform_has_protected_core(Platform::Linux));
+    assert!(platform_has_protected_core(Platform::Other));
+}
+
+/// 上一条翻成恒真后，「Win 到底把核放哪」必须另有一条**正面**断言接管 —— 否则
+/// `platform_has_protected_core` 恒真只是一句空话：它不说那个目录在哪。
+///
+/// app 侧起核前对账（`reconcile_protected_core` → `sha256_file(dest)`）读的目录来自
+/// `HelperRuntime::protected_core_dir_path()` = `InstallPaths::for_platform(Win).core_dir`，
+/// 而安装脚本的 seed / ACL / ImagePath 全部锚在**同一个** `InstallPaths::win().core_dir` 上
+/// （写侧由 `win_install_script_seeds_and_locks_the_protected_core_dir` 钉）。两侧一致时
+/// 稳态是零动作；不一致的后果不是报错而是**静默空转**——reconcile 永远算出「受保护核不存在」
+/// ⇒ 每次起核白推 80MB，而 helper exec 的是另一个文件。
+#[test]
+fn windows_protected_core_dir_is_the_programdata_one() {
+    // 判据写死字面量而不是引生产常量：引常量的话常量一改判据跟着漂，门就跟着被判对象走了。
+    assert_eq!(
+        polaris_helper_client::manager::InstallPaths::for_platform(Platform::Win)
+            .core_dir
+            .to_string_lossy(),
+        r"C:\ProgramData\Polaris\core",
+        "受保护核目录改址必须过 review：安装脚本的 seed/ACL/ImagePath 与 app 侧对账都锚在它上"
+    );
 }
 
 // ── attest_core_binary ──

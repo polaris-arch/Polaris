@@ -417,8 +417,10 @@ impl ProxyRuntime {
 /// - **macOS**：`ps -p <pid> -o comm=`（无 `/proc`；`comm` 给的是完整路径而非 16 字节的 `p_comm`
 ///   短名——2026-07-31 在 p101 以普通用户查 root helper 实测得到完整 46 字符路径）。
 ///   受保护核路径含空格，故 `comm=` 必须是**唯一**输出字段，整行即路径。
-/// - **windows**：返 `None`（无低成本 std 途径；且 win 的核走 app 侧、无受保护核目录，
-///   本自证在该平台的价值本就最小）。`None` ⇒ 判 `Unobservable` ⇒ 只 warn 不误报。
+/// - **windows**：返 `None`（无低成本 std 途径）。`None` ⇒ 判 `Unobservable` ⇒ 只 warn 不误报。
+///   **P4 起该平台已有受保护核目录**（`C:\ProgramData\Polaris\core`），故本自证在 win 上不再是
+///   「本就没价值」而是「这条腿还没接」——真正的 win 侧实跑映像来自 D2/D3 的 `status` 回传
+///   `image=`（见 spec §3.1），不是本函数。
 fn running_exe_path(pid: u32) -> Option<PathBuf> {
     // pid=0 = 调用方还没拿到真 pid（helper 未回传 / spawn 失败）→ 没有可观测对象。
     if pid == 0 {

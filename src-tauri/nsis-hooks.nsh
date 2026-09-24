@@ -28,11 +28,112 @@
 ;   3. **应用内「完全卸载」**（`runtime/uninstall.rs`）→ 它先经 helper 自卸把服务与 ProgramData 清掉，
 ;      再唤起本卸载器 ⇒ 届时下面的探测两条都不命中 ⇒ 跳过，**不弹第二次 UAC**。
 ;
-; ── 提权 ──
-; `installMode: currentUser` 的卸载器默认以**普通用户**运行，而 `sc delete` 与删 ProgramData 需管理员。
-; 经「外层普通 PS 唤起内层提权 PS」完成（`Start-Process -Verb RunAs -Wait`），全程只弹一次 UAC。
+; ── 提权（当前形态：`installMode: currentUser`）──
+; 模板对 currentUser 发 `RequestExecutionLevel user`（tauri-cli 2.11.4 的 `installer.nsi`：
+; `!if "${INSTALLMODE}" == "currentUser"` → `RequestExecutionLevel user`）⇒ 卸载器默认以**普通用户**
+; 运行，而 `sc delete` 与删 ProgramData 需要管理员。经「外层普通 PS 唤起内层提权 PS」完成
+; （`Start-Process -Verb RunAs -Wait`），全程只弹一次 UAC。
 ; **best-effort**：用户取消 UAC 时退出码非 0，此处**不阻断卸载**（宁可残留，也不让卸载卡死）。
 ; 兜底是下次安装时 helper 安装脚本自身的幂等清理（停删同名旧服务）。
+;
+; 前瞻（若将来改成 `perMachine`）：模板改发 `RequestExecutionLevel admin`，该属性同时写进安装器与
+; 卸载器的 manifest ⇒ 本钩子运行时进程本身已是管理员，`sc delete` 与删 ProgramData 直接就有权限。
+; 届时下面那一跳**仍应保留、不要简化**：已提权时 `-Verb RunAs` 不再弹第二次 UAC（直接以当前提升令牌
+; 起进程）⇒ 零成本；而它是眼下唯一在真机上验过的执行路径，删它等于在没有真机的情况下换掉已验路径。
+;
+; ── 🔮 前瞻登记：currentUser → perMachine 会是**安装形态变更**，不是原地升级 ──
+; 下面这一整节描述的是**假如**把 `installMode` 改成 `perMachine` 会发生什么。当前形态是
+; `currentUser`，所以这些后果**眼下都不成立**；登记在这里是因为它们是那次改动的前置清单，
+; 逐条都按 tauri-cli 2.11.4 的 `installer.nsi` / `utils.nsh` 原文核过，别在下一轮重新推一遍。
+;
+; 模板的「已装过旧版」探测读的是 `SHCTX` 下的卸载键（`ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""`，
+; 取不到就 `Abort` 掉重装页），而 `SHCTX` 由 `utils.nsh` 的 `SetContext` 按 INSTALLMODE 定：
+; currentUser→HKCU、perMachine→HKLM。于是在一台**只装过 per-user 旧版**的机器上：
+;   · 新的 per-machine 安装器会在 HKLM 里查不到任何东西 ⇒ **不提示、不卸载旧版**，直接装进 Program Files；
+;   · 旧的 `%LOCALAPPDATA%\Polaris` 副本、HKCU 卸载项、per-user 开始菜单/桌面快捷方式**原样留下**
+;     ⇒ 用户会在「应用和功能」里看到两个 Polaris，开始菜单里看到两个同名项（新的在 All Users 侧，
+;        因为 per-machine 下 `SetShellVarContext all`）。
+;   · `RestorePreviousInstallLocation` 同样读 `SHCTX "${MANUPRODUCTKEY}"` ⇒ 也不会把安装目录拉回旧路径。
+;   · 用户数据不受影响：`%APPDATA%\com.polaris.app` / `%LOCALAPPDATA%\com.polaris.app` 是 per-user 目录，
+;     与装机形态无关 ⇒ 新装的 app 读到的是同一份配置（这是好的那一面）。
+;   · 自启项是隐患：`tauri-plugin-autostart` 写的是 HKCU `…\CurrentVersion\Run`，值指向**旧副本的 exe**。
+;     旧副本还在盘上 ⇒ 开机自启拉起的仍是旧版本，直到用户卸掉旧副本或重新开关一次自启。
+;   · 若用户事后卸掉那个遗留的 per-user 条目：旧卸载器会跑**它自己那一版**的本钩子 ⇒ `sc delete
+;     PolarisHelper` + 删 `C:\ProgramData\Polaris`，把新装 app 仍在用的 helper 一并清掉。后果是
+;     TUN 暂不可用 + 下次起核时走既有「安装 helper」引导（多一次 UAC），**不 brick**。
+;
+; ── 🔮 前瞻登记：那条迁移腿为什么**不能**写在本文件里（2026-09-16 核实，结论与出处原样保留）──
+; 同样是「假如将来改 per-machine」才用得上的结论，但它值得先写下来，因为它的失效方向最坏：
+; 在本文件里实现那段清理，代码**写得出、编得过、看起来也对**，而它是一个提权漏洞。
+; 结论是「换执行者」，不是「换个写法」。
+;
+; 前提：per-machine 的安装器是**提权进程**（模板对它发 `RequestExecutionLevel admin`）。
+; 而迁移要清的四样东西**全部住在用户可写域**里，于是逐条都是「受信提权动作消费不受信输入」——
+; 与本批要堵的那条链（提权脚本拷一份用户可写的 `polaris-helper.exe` 注册成 SYSTEM 服务）
+; **同一个根因**。在这里实现迁移，等于一边堵旧洞一边开新洞：
+;
+;   ① **跑旧版自带的卸载器 = 以管理员身份执行用户可写的二进制。** 路径取自 HKCU 的
+;      `UninstallString`（用户可写）；即便改成从 `HKLM\…\ProfileList\<SID>\ProfileImagePath`
+;      （只有管理员能写）推出默认路径 `<profile>\AppData\Local\Polaris\uninstall.exe`，
+;      **那个文件本身仍躺在用户可写目录里** ⇒ 攻击者换掉它，受信安装器替他提权执行。
+;      路径怎么推出来都救不了：不受信的是**文件**，不是路径。
+;      （附带事实，留给下一批：旧卸载器带 `/UPDATE` 跑时，本文件的 POSTUNINSTALL 整段被
+;        `${If} $UpdateMode <> 1` 跳过 ⇒ **不会**删 helper 服务与 ProgramData；而模板侧的
+;        `DeleteRegKey HKCU "${UNINSTKEY}"` 不受 UpdateMode 闸门约束 ⇒ 卸载项照样清掉。
+;        所以「跑旧卸载器会打掉 helper」这一条其实绕得开 —— 绕不开的是上面那条 EoP。）
+;
+;   ② **提权后 `RMDir /r` 一个用户可控路径 = 任意目录删除。** `InstallLocation` 在 HKCU
+;      （用户可写），指到 `C:\Windows\System32` 就删 System32。加「目录名必须是 Polaris /
+;      必须含 uninstall.exe+Polaris.exe」这类形态校验也堵不住：NSIS 的 `RMDir /r`**跟随 junction**
+;      —— 实证 NSIS `Source/exehead/util.c` 的 `myDelete()`：命中 `FILE_ATTRIBUTE_DIRECTORY` 就
+;      `myDelete(buf,flags)` 递归，全函数**没有一处** `FILE_ATTRIBUTE_REPARSE_POINT` 检查，而
+;      `FindFirstFile("<junction>\*.*")` 枚举的是 junction 指向的目标。建 junction 不需要任何特权
+;      ⇒ 攻击者在自己 profile 的旧安装目录里挂一个指向 System32 的 junction，提权递归删除就变成
+;      任意文件删除。**凡是在用户可写树里做提权递归删除都有这个洞**，与路径来源无关。
+;
+;   ③ **提权后的 HKCU 不一定是发起用户的。** 用户本身是管理员时走 UAC 过滤令牌提权，SID 不变、
+;      HKCU 对；标准用户输入**别人的**管理员凭据提权时，进程属于那个管理员 ⇒ HKCU 换了 hive，
+;      `SetShellVarContext current` 下的 `$SMPROGRAMS` / `$DESKTOP` 也全部解析到管理员的 profile
+;      ⇒ 清理**静默什么都没做**（不报错、不留痕，最坏的一种失败）。
+;      遍历 `HKEY_USERS` 只能看见**已加载**的 hive（当前已登录的用户），没登录的用户看不见；
+;      要覆盖全部用户得逐个 `reg load` 他们的 `NTUSER.DAT`，那是另一个量级的风险，不做。
+;
+;   ④ 🔴 **路径常量陷阱 —— 这一条与 installMode 无关，现在就成立**：NSIS 的 `$LOCALAPPDATA`
+;      在 **all 上下文**下映射到 `CSIDL_COMMON_APPDATA`，实证 NSIS `Source/build.cpp`：
+;      `m_ShellConstants.add(_T("LOCALAPPDATA"), CSIDL_LOCAL_APPDATA, CSIDL_COMMON_APPDATA);`
+;      ⇒ 在 all 上下文里写 `$LOCALAPPDATA\Polaris` 得到的是 **`C:\ProgramData\Polaris`**，
+;      正是 helper 的受保护目录。本文件**眼下就有一段跑在 all 上下文里**（下面 POSTUNINSTALL 的
+;      `SetShellVarContext all`，那里是**刻意**要 `$APPDATA` 解析成 ProgramData）；若将来改
+;      per-machine，模板会在 `un.onInit` 把整个卸载器都设成 all ⇒ 射程扩到全文件。
+;      谁按 per-user 直觉在那个上下文里写这个常量，删掉的就是 helper 而不是旧副本。
+;
+; 而这四样要清的东西**没有一样需要管理员权限**：HKCU 卸载键、HKCU `…\CurrentVersion\Run` 自启值、
+; per-user 开始菜单/桌面快捷方式、`%LOCALAPPDATA%\Polaris` 目录树 —— 全部是发起用户自己就能删的。
+; 既然不需要提权、而提权反倒同时制造 ①②③，迁移腿的正确执行者是**以该用户身份运行的 app 本体**
+; （首次启动自检并清理），不是安装器。换到那一侧，③ 顺带变成零成本：每个用户第一次跑新 app 时清
+; 自己的残留，天然落在对的 hive 与对的 profile 上，连「哪个用户」这个问题都不存在。
+;
+; 自启值那一项在 app 侧也不必猜格式：`tauri-plugin-autostart` 的 `enable()` 用 `current_exe()`
+; 重写 HKCU Run 值（`auto-launch` 0.5.0 `windows.rs`：值名 = app name、值 = `"{app_path} {args}"`），
+; 而它的 `is_enabled()` 只看值**在不在**、不看指向谁 ⇒ 存量用户的自启值会一直指着旧 exe，
+; 直到有人显式 `enable()` 一次。「重写还是删除」因此不是取舍：重写是顺手的，删除才要额外写代码，
+; 且删除会让本来开机自启的用户静默失去自启。
+; （同处顺带登记，改 per-machine 会新出现的一条：`auto-launch` 写 Run 值时**不给路径加引号**，
+;   而 per-machine 的落点 `C:\Program Files\Polaris\Polaris.exe` 必然含空格（当前的
+;   `%LOCALAPPDATA%\Polaris\Polaris.exe` 只在用户名含空格时才含）。CreateProcess 的前缀歧义
+;   启发式会依次试 `C:\Program.exe` 再试全路径，故能起来。它会不会同时变成劫持点，取决于 `C:\`
+;   根的 ACL 是否允许标准用户建**文件**（通行说法是只允许建目录、不允许建文件，**本仓未实测**）——
+;   要下结论得在真机上验，别照抄这句。）
+;
+; 这条边界由 `scripts/verify-packaging.mjs` 的 `checkWindowsHookPrivilegeBoundary` 钉在**代码面**上，
+; **而且它与 installMode 无关、现在就生效**：写在注释里的「别在这儿做」对下一个改本文件的人没有任何
+; 强制力，而上面 ①②④ 三条在 currentUser 下也一样是真的（本文件已经有一段跑在 all 上下文里，
+; 且卸载腿本来就会把自己提权到管理员再去删 ProgramData）。
+;
+; 若将来真要做那条迁移腿：它的执行者是 app，不是安装器；发布说明在迁移腿落地之前得指引用户手动
+; 卸掉旧的 per-user 条目，并**连带写上**上面那条后果（手动卸旧条目会跑旧版自己的 POSTUNINSTALL
+; ⇒ helper 服务与 `C:\ProgramData\Polaris` 被清掉 ⇒ 下次起核多一次 UAC 重装 helper）。
+; 只说「请卸掉旧的那个」，用户会把随后那次 UAC 当成新版本的缺陷。
 
 ; 安装器文案 i18n：运行时按 `$LANGUAGE` 的 LCID 选 English / 简中 / 繁中 / Russian / Farsi。
 ;
@@ -68,6 +169,13 @@
 ; 本宏只删**安装目录内、由旧安装包拥有**的 legacy 根；用户配置在 AppData，外置 helper 在
 ; ProgramData，portable 不经过 NSIS，均不在射程。随后模板才复制本包 `_up_` 资源，失败也不会回落
 ; 旧 payload 冒充安装成功。
+;
+; 🔮 前瞻：当前形态 `installMode: currentUser` 下 `$INSTDIR` 是 `%LOCALAPPDATA%\Polaris`，本宏清的
+; 就是这一份，射程完整。若将来改 `perMachine`，`$INSTDIR` 变成 `%PROGRAMFILES%\Polaris`
+; ⇒ 本宏只清得到新那一份，而**旧 per-user 时代留在 `%LOCALAPPDATA%\Polaris` 的整棵树落到射程之外**
+; （详见顶部「前瞻登记：currentUser → perMachine」一节）。届时也**不要**在这里顺手去删那棵树：
+; 它是旧安装器的资产，删了会把「应用和功能」里那条卸载项变成指向空目录的死项，
+; 而且提权进程删用户可写树本身就是那一节 ②说的那个洞。
 !macro NSIS_HOOK_PREINSTALL
   !echo "[polaris] NSIS_HOOK_PREINSTALL 已插入 —— 安装前清理 legacy resources"
   Push $R8
@@ -141,7 +249,15 @@
 
   ${If} $UpdateMode <> 1
     ; ProgramData 的绝对路径：`SetShellVarContext all` 下 `$APPDATA` 即 `C:\ProgramData`。
-    ; 取完立刻还原成 current —— 不给本宏之后的任何代码留下被改过的上下文。
+    ; 这一句不能省：模板在紧邻本钩子之前的「删除应用数据」分支里发了 `SetShellVarContext current`
+    ; （勾了复选框时），所以进入本宏时的上下文不确定，必须自己定。
+    ;
+    ; 取完**立刻还原成 current** —— 不给本宏之后的任何代码留下被改过的上下文。`current` 就是环境值：
+    ; 模板在 `un.onInit` 经 `utils.nsh` 的 `SetContext` 按 INSTALLMODE 定上下文，当前形态
+    ; `installMode: currentUser` 对应 `SetShellVarContext current`。
+    ; 🔮 前瞻：若将来改 `perMachine`，同一段模板会把环境上下文设成 `all`
+    ; （`!if "${INSTALLMODE}" == "perMachine"` → `SetShellVarContext all`）⇒ 届时**环境值变成 `all`**，
+    ; 下面这句还原会反过来变成「留下被改过的上下文」，要一并改掉。
     SetShellVarContext all
     StrCpy $R9 "$APPDATA\Polaris"
     SetShellVarContext current

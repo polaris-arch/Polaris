@@ -22,7 +22,10 @@
 //!   win-gated）**均落地**，直接接现有 [`run_console`](super::service::run_console) /
 //!   [`run_service`](super::service::run_service)（二者已建 production `WinHelper` + serve + Ctrl+C/SCM 收割）。
 //! - Windows daemon 侧本就最全（能力册 W2..W18 多为真实现）；本批只补「缺 main 入口」这一环（W19 🟡）。
-//! - `--coredir` 接受并忽略（镜像 macOS flag 形态，Windows 无 install-core）。
+//! - **`--coredir` 已删**（P4）：Windows 的受保护内核目录由 `--support` 派生（`<support>\core`，
+//!   见 [`WinHelper::handle`](super::helper::WinHelper::handle) 的 install-core 分支），不从命令行取。
+//!   Go 源那行 flag 是「接受并忽略」的空壳，`build_helper` 从没读过它；留着它就是给 SCM ImagePath
+//!   留一个「现在没人读、将来会有人读」的核路径注入入口。
 
 /// Windows daemon flag 解析结果（纯数据，跨平台可测；不引 `windows-sys`）。
 ///
@@ -34,15 +37,14 @@ pub struct WinArgs {
     pub singbox_bin: String,
     /// 允许的配置文件目录（`--confdir`）。
     pub conf_dir: String,
-    /// support 目录（`--support`，helper.token 落此）。
+    /// support 目录（`--support`，helper.token 落此；受保护内核目录 `<support>\core` 由它派生）。
     pub support_dir: String,
-    /// core 目录（`--coredir`，接受并忽略）。
-    pub core_dir: String,
     /// 前台 console 模式（`--console`；否则 SCM 服务）。
     pub console: bool,
 }
 
-/// 解析 daemon flag → [`WinArgs`]（对照 Go `main.go` 的 `flag.StringVar`/`flag.BoolVar` 五项）。
+/// 解析 daemon flag → [`WinArgs`]（对照 Go `main.go` 的 `flag.StringVar`/`flag.BoolVar`，
+/// 去掉其中「接受并忽略」的 `--coredir`）。
 #[must_use]
 pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> WinArgs {
     let m = crate::cli::parse_flags(argv, &["console"]);
@@ -53,7 +55,6 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> WinArgs {
             .get("support")
             .cloned()
             .unwrap_or_else(|| super::DEFAULT_SUPPORT_DIR.to_owned()),
-        core_dir: m.get("coredir").cloned().unwrap_or_default(),
         console: m.contains_key("console"),
     }
 }
@@ -94,7 +95,6 @@ fn run(args: WinArgs) -> std::process::ExitCode {
         singbox_bin: args.singbox_bin,
         conf_dir: args.conf_dir,
         support_dir: args.support_dir,
-        core_dir: args.core_dir,
     };
 
     // main.go: console → 前台 runConsole；否则 SCM runService。

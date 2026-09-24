@@ -231,10 +231,20 @@ impl FileTokenStore {
     ///
     /// 不套 unix 判据：`fstat`/uid/mode 在 Windows 上无对应语义（`MetadataExt::mode()` 不存在，
     /// `st_uid` 恒 0 是模拟值，照搬会得到一个恒真的假判据）。等价校验须读文件 DACL
-    /// （`GetSecurityInfo` + 逐 ACE 枚举，判定除 SYSTEM/Administrators 外无主体有访问权），
-    /// 依赖 `windows-sys` 且「哪些 SID 算可接受」本身是一套需单独拍板的判据 —— 成本与误判风险
-    /// 都远高于本批射程，**登记不硬造**（写侧现状：安装脚本 `icacls /inheritance:r` +
-    /// 仅授 `SYSTEM`/`Administrators` `(OI)(CI)(F)`，token 出生即 SYSTEM/Admin 私有）。
+    /// （`GetNamedSecurityInfoW` + 逐 ACE 枚举 + owner 判定）。
+    ///
+    /// **那套读侧机制已在 P4 落地**：判据在
+    /// [`crate::platform::windows::coreacl`]（白名单 SID + 写类权掩码 + NULL/空 DACL 与
+    /// `INHERIT_ONLY`/`DENY` 三个陷阱），搬运腿在
+    /// [`crate::platform::windows::winproc`] 的 `read_object_security`，消费点是起核前的受保护
+    /// 内核目录自检。
+    ///
+    /// **但 token 文件本身的等价校验仍未做**：本读腿逐字保持修前实现（`std::fs::read` + trim），
+    /// 没有任何 owner/DACL 前置判定。两者判据也不同 —— 核目录要的是「除 SYSTEM/Administrators
+    /// 外无主体可**写**」（`Users:(RX)` 放行，app 要读核），token 要的是「除
+    /// SYSTEM/Administrators 外无主体可**读**」（读到即可冒充 app），掩码与放行面都得另拍。
+    /// 登记不硬造（写侧现状：安装脚本 `icacls /inheritance:r` + 仅授
+    /// `SYSTEM`/`Administrators` `(OI)(CI)(F)`，token 出生即 SYSTEM/Admin 私有）。
     #[cfg(not(unix))]
     fn read_token_value(&self) -> String {
         // Go: b, _ := os.ReadFile(...); return strings.TrimSpace(string(b))
