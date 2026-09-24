@@ -216,7 +216,11 @@ describe('统一接入表单的信息架构', () => {
     const node = readDialog('NodeDialog.tsx');
     expect(node).toMatch(/group\.id === 'basic' \|\| group\.id === 'transport'/);
     expect(node).toContain("label: t('node.formGroup.connection')");
-    expect(node).toContain("setFormTab(meshError.group === 'basic' ? 'connection' : meshError.group)");
+    expect(node).toContain("setFormTab(group === 'basic' || group === 'transport' ? 'connection' : group)");
+    expect(node).toContain('revealFormGroup(meshError.group);');
+    // 编解码层拒绝保存（DERP 行 / 透传袋坏 JSON…）同样定位：错误带 field，按字段所在分组切页。
+    expect(node).toContain('e instanceof ProtoCodecError && e.field ? nodeFieldGroup(proto, e.field) : null');
+    expect(node).toContain('if (codecGroup) revealFormGroup(codecGroup);');
 
     const wg = readDialog('WgDialog.tsx');
     expect(wg).toContain("setFormTab('connection')");

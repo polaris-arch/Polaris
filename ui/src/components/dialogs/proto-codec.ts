@@ -54,11 +54,16 @@ export type ProtoCodecErrorCode =
   | 'customJsonInvalid'
   | 'customJsonObject'
   | 'customJsonTypeRequired'
-  | 'certPinInvalid';
+  | 'certPinInvalid'
+  | 'derpServerInvalid'
+  | 'extraJsonInvalid';
 
-/** 编解码层只抛稳定错误码；面向用户的文案由 NodeDialog 按当前 locale 渲染。 */
+/**
+ * 编解码层只抛稳定错误码；面向用户的文案由 NodeDialog 按当前 locale 渲染。
+ * `field` = 出错的草稿键（FieldSpec.k），NodeDialog 据此切到该字段所在页签（`nodeFieldTab`）。
+ */
 export class ProtoCodecError extends Error {
-  constructor(readonly code: ProtoCodecErrorCode, readonly detail?: string) {
+  constructor(readonly code: ProtoCodecErrorCode, readonly detail?: string, readonly field?: string) {
     super(code);
     this.name = 'ProtoCodecError';
   }
@@ -482,9 +487,10 @@ const derpServersToText = (items: TailcatSettings['derpServers']): string =>
   (items ?? []).map((item) => (typeof item === 'string' ? item : JSON.stringify(item))).join('\n');
 /**
  * 行文本 → `derpServers`。每行一个裸主机名，或一个以 `{` 开头的单行 JSON 对象；空行丢弃。
- * 一项不剩 → `undefined`（删键）；任一对象行 JSON 解析失败 → `null`（调用方保留旧值，同 [`textToBag`] 口径）。
+ * 一项不剩 → `undefined`（删键）；任一对象行 JSON 解析失败 ⇒ **拒绝保存**（抛 `derpServerInvalid`，detail 点名
+ * 坏行；同证书 pin 口径）。不能静默保留旧值：编辑已有节点时用户看不出改动没生效。
  */
-const textToDerpServers = (v: FormValue): TailcatSettings['derpServers'] | null | undefined => {
+const textToDerpServers = (v: FormValue): TailcatSettings['derpServers'] | undefined => {
   const out: NonNullable<TailcatSettings['derpServers']> = [];
   for (const raw of (typeof v === 'string' ? v : '').split(/\r?\n/)) {
     const line = raw.trim();
@@ -497,7 +503,7 @@ const textToDerpServers = (v: FormValue): TailcatSettings['derpServers'] | null 
       // 以 `{` 开头的串要么解析成对象、要么抛错，不存在「解析成功但不是对象」这一支。
       out.push(JSON.parse(line) as Record<string, unknown>);
     } catch {
-      return null;
+      throw new ProtoCodecError('derpServerInvalid', line, 'derpServers');
     }
   }
   return out.length ? out : undefined;
@@ -527,18 +533,23 @@ const bagToText = (bag: unknown): string => {
   const keys = Object.keys(m);
   return keys.length ? JSON.stringify(m, null, 2) : '';
 };
-/** 解析失败 → `undefined`（保留 base 里的旧袋，不把用户手误变成静默清空）。 */
-const textToBag = (v: unknown): Record<string, unknown> | undefined => {
+/**
+ * 空文本 / 纯空白 → `{}`（无袋，合法）。解析失败或不是 JSON 对象 ⇒ **拒绝保存**（抛 `extraJsonInvalid`，
+ * `field` 点名是哪个袋）。不能静默保留旧袋：用户看不出改动没生效（同 `derpServerInvalid` 口径）。
+ */
+const textToBag = (v: unknown, field: string): Record<string, unknown> => {
   const t = typeof v === 'string' ? v.trim() : '';
   if (!t) return {};
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(t);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
+    parsed = JSON.parse(t);
   } catch {
-    return undefined;
+    throw new ProtoCodecError('extraJsonInvalid', undefined, field);
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ProtoCodecError('extraJsonInvalid', undefined, field);
+  }
+  return parsed as Record<string, unknown>;
 };
 
 export const protoCodec: Record<NodeProto, ProtoCodec> = {
@@ -749,7 +760,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         meshRoutes: cidrLines(draft.meshRoutes),
         openconnectSettings: {
           ...base.openconnectSettings,
-          ...(textToBag(draft.extraJson) ?? bagOf(base.openconnectSettings)),
+          ...textToBag(draft.extraJson, 'extraJson'),
           server: base.address && base.port ? endpointHostPort(base.address, base.port) : undefined,
           username: str(draft.user),
           password: str(draft.pwd),
@@ -798,7 +809,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         meshRoutes: cidrLines(draft.meshRoutes),
         openvpnClientSettings: {
           ...base.openvpnClientSettings,
-          ...(textToBag(draft.extraJson) ?? bagOf(base.openvpnClientSettings)),
+          ...textToBag(draft.extraJson, 'extraJson'),
           server: base.address || undefined,
           server_port: base.port || undefined,
           username: str(draft.user),
@@ -813,7 +824,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           redirect_gateway: draft.redirectGw === true ? true : false,
           system: draft.sysIface === true ? true : undefined,
           tls: {
-            ...(textToBag(draft.ovpnTlsExtraJson) ?? openvpnTlsBagOf(base.openvpnClientSettings?.tls)),
+            ...textToBag(draft.ovpnTlsExtraJson, 'ovpnTlsExtraJson'),
             certificate: lines(draft.ovpnCa),
             client_certificate: lines(draft.ovpnCert),
             client_key: lines(draft.ovpnKey),
@@ -857,7 +868,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           ...certPinPatch(draft),
         }),
         masqueClientSettings: mergeBlock<MasqueClientSettings>(
-          (textToBag(draft.extraJson) ?? bagOf(base.masqueClientSettings, MASQUE_MODELED_KEYS)) as MasqueClientSettings,
+          textToBag(draft.extraJson, 'extraJson') as MasqueClientSettings,
           {
             path: str(draft.path),
             headers: headersFromText(draft.headers),
@@ -900,7 +911,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           obfs: str(draft.obfs),
           serverPorts: str(draft.ports),
           hopInterval: str(draft.hopInterval),
-          ...(textToBag(draft.extraJson) ?? bagOf(base.hysteriaSettings)),
+          ...textToBag(draft.extraJson, 'extraJson'),
         },
         // v1 的 TLS 恒开（后端 TLS_PROTOCOLS 含 hysteria），无 sec 开关，故与 hy2 同样无清除门。
         tlsSettings: mergeTls(base.tlsSettings, {
@@ -937,7 +948,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           dataDirectory: str(draft.torDataDir),
           extraArgs: args ? args.split(/\s+/).filter(Boolean) : undefined,
           torrc: textToTorrc(draft.torrcText),
-          ...(textToBag(draft.extraJson) ?? bagOf(base.torSettings)),
+          ...textToBag(draft.extraJson, 'extraJson'),
         },
       };
     },
@@ -967,7 +978,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         tailcatSettings: mergeBlock<TailcatSettings>(
-          (textToBag(draft.extraJson) ?? bagOf(base.tailcatSettings, TAILCAT_MODELED_KEYS)) as TailcatSettings,
+          textToBag(draft.extraJson, 'extraJson') as TailcatSettings,
           {
             serverPublicKey: str(draft.serverPublicKey),
             serverDiscoKey: str(draft.serverDiscoKey),
@@ -975,7 +986,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
             privateKey: str(draft.privateKey),
             derpRegion: mode === 'servers' ? undefined : num(draft.derpRegion),
             derpMapUrl: mode === 'customMap' ? str(draft.derpMapUrl) : undefined,
-            derpServers: servers === null ? base.tailcatSettings?.derpServers : servers,
+            derpServers: servers,
           }
         ),
       };

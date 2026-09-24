@@ -1641,7 +1641,9 @@
       "customJsonInvalid": "Custom protocol JSON is invalid: {{detail}}",
       "customJsonObject": "Custom protocol JSON must be an object",
       "customJsonTypeRequired": "Custom protocol JSON requires a non-empty \"type\" field",
-      "certPinInvalid": "Invalid certificate pin: {{detail}} (expected a SHA-256 digest in hex or Base64)"
+      "certPinInvalid": "Invalid certificate pin: {{detail}} (expected a SHA-256 digest in hex or Base64)",
+      "derpServerInvalid": "DERP server line is not valid JSON: {{detail}}",
+      "extraJsonInvalid": "Extension settings must be a valid JSON object (leave empty for none)"
     },
     "field": {
       "aid": "AlterID",

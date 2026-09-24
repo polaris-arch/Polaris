@@ -1063,6 +1063,7 @@ pub fn parse_singbox_endpoints(
 /// | `peers[0].persistent_keepalive_interval` | `persistentKeepalive`（>0 才写） |
 /// | `peers[0].reserved` | `reserved`（**恰 3 项**才写，与生成侧 `s.reserved.len() == 3` 对称） |
 /// | `mtu` | `mtu`（>0 才写） |
+/// | `on_demand` / `bind_interface` | 顶层 `onDemand` / `bindInterface`（[`ENDPOINT_TOP_LEVEL_KEYS`]，同 MASQUE） |
 ///
 /// `allowed_ips` 的拆分口径与粘贴 wg-quick `.conf` 那条腿逐字同源
 /// （`ui/src/components/dialogs/wg-logic.ts#draftFromParsed`）：全网段是「全隧道意图」、由
@@ -1219,7 +1220,7 @@ fn map_endpoint_vpn_client(
     Some(s)
 }
 
-/// 端点族（MASQUE / OpenConnect / OpenVPN Client）里生成侧按 `ServerConfig` **顶层**写的键。
+/// 端点族（WireGuard / MASQUE / OpenConnect / OpenVPN Client）里生成侧按 `ServerConfig` **顶层**写的键。
 ///
 /// 生成侧装配层对每条 endpoint 腿统一调 `apply_on_demand` / `apply_bind_interface`，读的是顶层
 /// `onDemand` / `bindInterface`：袋里的 `on_demand` 会原样下发而 UI 读顶层（界面显示关、内核实开），
@@ -1484,7 +1485,7 @@ fn map_wireguard_endpoint(
     }
 
     let name = str_ne(ep.get("tag")).unwrap_or_else(|| format!("{server_addr}:{port}"));
-    Some(ServerConfig {
+    let mut s = ServerConfig {
         id: id_gen(),
         name,
         protocol: Protocol::Wireguard,
@@ -1495,7 +1496,9 @@ fn map_wireguard_endpoint(
         created_at: Some(now.to_string()),
         updated_at: Some(now.to_string()),
         ..Default::default()
-    })
+    };
+    lift_endpoint_top_level_keys(&mut s, ep);
+    Some(s)
 }
 
 fn bump(counts: &mut Vec<(String, usize)>, key: String) {

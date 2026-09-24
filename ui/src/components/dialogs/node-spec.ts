@@ -1105,6 +1105,11 @@ export function nodeFormGroups(proto: NodeProto): NodeFieldGroup[] {
   ];
 }
 
+/** 草稿键所在的表单分组（保存被拒时据此把用户带到出错字段）；该协议没有此字段 → `null`。 */
+export function nodeFieldGroup(proto: NodeProto, key: string): NodeFieldGroupId | null {
+  return nodeFormGroups(proto).find((group) => group.fields.some((field) => field.k === key))?.id ?? null;
+}
+
 // ── C10：custom 协议内核兼容性 probe（`kernel:probeOutbound`）显示态 ──────────────────────
 //
 // 对齐 `SubDialog.tsx` 的 `runPreview`/`previewMsg` 套路（先探测/预检、按 ok/error 出内联结果条），

@@ -2227,7 +2227,9 @@
       "customJsonInvalid": "JSON پروتکل سفارشی نامعتبر است: {{detail}}",
       "customJsonObject": "JSON پروتکل سفارشی باید یک شیء باشد",
       "customJsonTypeRequired": "JSON پروتکل سفارشی به فیلد غیرخالی \"type\" نیاز دارد",
-      "certPinInvalid": "مقدار پین گواهی نامعتبر است: {{detail}} (هش SHA-256 به‌صورت hex یا Base64 لازم است)"
+      "certPinInvalid": "مقدار پین گواهی نامعتبر است: {{detail}} (هش SHA-256 به‌صورت hex یا Base64 لازم است)",
+      "derpServerInvalid": "خط سرور DERP یک JSON معتبر نیست: {{detail}}",
+      "extraJsonInvalid": "تنظیمات افزونه باید یک شیء JSON معتبر باشد (برای هیچ، خالی بگذارید)"
     },
     "onDemand": "اتصال بر حسب نیاز",
     "onDemandHint": "فقط زمانی متصل شود که خروجی انتخاب‌شده یا یک قانون مسیریابی به آن ارجاع دهد؛ در غیر این صورت قطع شود. Tailscale نشانی tailnet را آزاد و MagicDNS را متوقف می‌کند و ورود حفظ می‌شود. در حالت تعلیق فایل‌های Taildrop دریافت نمی‌شوند."

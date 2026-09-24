@@ -1423,3 +1423,54 @@ fn vpn_client_on_demand_and_bind_interface_lift_to_top_level_and_reach_output() 
     assert_eq!(ov_out["on_demand"], json!(false), "{ov_out:#}");
     assert_eq!(ov_out["bind_interface"], json!("eth8"), "{ov_out:#}");
 }
+
+/// WireGuard endpoint 的 `on_demand` / `bind_interface` 同样提到顶层：WireGuard 腿无透传袋，
+/// 不提就是静默丢弃（生成侧 WireGuard 腿同调 `apply_on_demand` / `apply_bind_interface`，读顶层）。
+/// 以产物为准：导入 → 生成，产物里两键与源文件一致。
+#[test]
+fn wireguard_on_demand_and_bind_interface_lift_to_top_level_and_reach_output() {
+    let mut a = wg_endpoint_doc()["endpoints"][0].clone();
+    a["system"] = json!(false);
+    a["on_demand"] = json!(true);
+    a["bind_interface"] = json!("eth7");
+    let mut b = a.clone();
+    b["tag"] = json!("WG-JP");
+    b["on_demand"] = json!(false);
+    b["bind_interface"] = json!("eth6");
+    let r = parse_eps(json!({ "endpoints": [a, b] }), ImportOrigin::LocalFile);
+    assert_eq!(r.servers.len(), 2);
+    let (hk, jp) = (by_name(&r, "WG-HK"), by_name(&r, "WG-JP"));
+    assert_eq!(
+        (hk.on_demand, hk.bind_interface.as_deref()),
+        (Some(true), Some("eth7"))
+    );
+    assert_eq!(
+        (jp.on_demand, jp.bind_interface.as_deref()),
+        (Some(false), Some("eth6"))
+    );
+
+    let outcome = generate_local_import(&r.servers);
+    assert!(
+        outcome.invalid_nodes.is_empty(),
+        "{:?}",
+        outcome.invalid_nodes
+    );
+    let cfg = serde_json::to_value(&outcome.config).unwrap();
+    let wgs: Vec<&Value> = cfg["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "wireguard")
+        .collect();
+    assert_eq!(
+        wgs.len(),
+        2,
+        "前置断言：endpoints[] 里 wireguard 应恰 2 个：{cfg:#}"
+    );
+    let got: Vec<(Value, Value)> = wgs
+        .iter()
+        .map(|e| (e["on_demand"].clone(), e["bind_interface"].clone()))
+        .collect();
+    assert!(got.contains(&(json!(true), json!("eth7"))), "{got:?}");
+    assert!(got.contains(&(json!(false), json!("eth6"))), "{got:?}");
+}

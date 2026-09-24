@@ -9,8 +9,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   describeProbeResult,
+  allFields,
   isMeshTunnelNodeProtocol,
   meshTunnelNodeProtocols,
+  nodeFieldGroup,
   PROTO_GROUP_ORDER,
   PROTO_OPTIONS,
   protosInGroup,
@@ -125,5 +127,22 @@ describe('协议下拉的分组与顺序', () => {
     expect(isMeshTunnelNodeProtocol('openconnect')).toBe(true);
     expect(isMeshTunnelNodeProtocol('openvpn-client')).toBe(true);
     expect(isMeshTunnelNodeProtocol('vless')).toBe(false);
+  });
+});
+
+describe('nodeFieldGroup：保存被拒时定位出错字段所在分组', () => {
+  it('Tailcat 的 DERP 服务器在基础组（NodeDialog 合成「连接」页）', () => {
+    expect(nodeFieldGroup('tailcat', 'derpServers')).toBe('basic');
+  });
+
+  it('凡有透传袋的协议，extraJson / ovpnTlsExtraJson 都在高级组', () => {
+    const withBag = PROTO_OPTIONS.map(([p]) => p).filter((p) => allFields(p).some((f) => f.k === 'extraJson'));
+    expect(withBag.length, '取材面塌了：一个带 extraJson 的协议都没找到').toBeGreaterThanOrEqual(6);
+    for (const p of withBag) expect(nodeFieldGroup(p, 'extraJson'), p).toBe('advanced');
+    expect(nodeFieldGroup('openvpn-client', 'ovpnTlsExtraJson')).toBe('advanced');
+  });
+
+  it('该协议没有此字段 → null（不乱切页）', () => {
+    expect(nodeFieldGroup('vless', 'derpServers')).toBeNull();
   });
 });

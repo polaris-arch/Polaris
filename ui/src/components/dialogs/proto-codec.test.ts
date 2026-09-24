@@ -2173,6 +2173,9 @@ const DUMMY: Record<string, FormValue> = {
   outbound: '{"type":"vless","server":"e.com","server_port":443}',
   certSha256: PIN_SAMPLE,
   certPkSha256: PIN_SAMPLE,
+  // 透传袋坏 JSON 拒绝保存（extraJsonInvalid）⇒ 填满时给合法的非空对象。
+  extraJson: '{"x_bag":"x"}',
+  ovpnTlsExtraJson: '{"x_bag":"x"}',
 };
 
 /** 把该协议**表里真有的控件**全部填满：文本 → 非空、数字 → 1、开关 → 开、下拉 → 首项（可覆写）。 */
@@ -2610,14 +2613,41 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
       expect(settings.dpd_interval).toBe('30s');
     });
 
-    it(`${proto}：extraJson 是坏 JSON 时保留旧袋，不静默清空`, () => {
+    it(`${proto}：extraJson 坏 JSON / 非对象 → 抛 extraJsonInvalid 拒绝保存（静默保留旧袋用户看不出没生效）`, () => {
       const base = { ...SAMPLES[proto] };
       const draft = protoCodec[proto].fromConfig(base);
-      draft.extraJson = '{ 这不是 JSON';
-      // 不抛异常即可 —— 用户手误不该让保存崩掉，也不该把已有的袋子清空。
-      expect(() => protoCodec[proto].toConfig(draft, base)).not.toThrow();
+      for (const bad of ['{ 这不是 JSON', '[1, 2]', '"str"', '42', 'null']) {
+        let err: unknown;
+        try {
+          protoCodec[proto].toConfig({ ...draft, extraJson: bad }, base);
+        } catch (e) {
+          err = e;
+        }
+        expect(err, bad).toBeInstanceOf(ProtoCodecError);
+        expect((err as ProtoCodecError).code, bad).toBe('extraJsonInvalid');
+        expect((err as ProtoCodecError).field, bad).toBe('extraJson');
+      }
+      // 空文本 / 纯空白 = 无袋，合法。
+      for (const empty of ['', '  \n ']) {
+        expect(() => protoCodec[proto].toConfig({ ...draft, extraJson: empty }, base), JSON.stringify(empty)).not.toThrow();
+      }
     });
   }
+
+  it('openvpn-client：tls 嵌套袋 ovpnTlsExtraJson 同口径，field 点名是 tls 那个袋', () => {
+    const base = { ...SAMPLES['openvpn-client'] };
+    const draft = protoCodec['openvpn-client'].fromConfig(base);
+    let err: unknown;
+    try {
+      protoCodec['openvpn-client'].toConfig({ ...draft, ovpnTlsExtraJson: '{bad' }, base);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ProtoCodecError);
+    expect((err as ProtoCodecError).code).toBe('extraJsonInvalid');
+    expect((err as ProtoCodecError).field).toBe('ovpnTlsExtraJson');
+    expect(() => protoCodec['openvpn-client'].toConfig({ ...draft, ovpnTlsExtraJson: ' ' }, base)).not.toThrow();
+  });
 });
 
 
@@ -2896,10 +2926,27 @@ describe('Tailcat 表单编解码', () => {
     expect(save({ derpServers: '  \n' }).tailcatSettings).not.toHaveProperty('derpServers');
   });
 
-  it('derpServers 某行 JSON 坏掉 / 不是对象时保留旧值，不把手误变成清空', () => {
-    for (const bad of ['a.example\n{"host": ', 'a.example\n{} x', '[1]\n{"host":"x"', '{"host":"x"}\n{1}']) {
-      expect(save({ derpServers: bad }).tailcatSettings?.derpServers, bad).toEqual(base.tailcatSettings?.derpServers);
+  it('derpServers 某行 JSON 坏掉 → 抛 derpServerInvalid 拒绝保存（静默保留旧值用户看不出改动没生效），detail 点名坏行', () => {
+    for (const [bad, line] of [
+      ['a.example\n{"host": ', '{"host":'],
+      ['a.example\n{} x', '{} x'],
+      ['[1]\n{"host":"x"', '{"host":"x"'],
+      ['{"host":"x"}\n  {1}  ', '{1}'],
+    ]) {
+      let err: unknown;
+      try {
+        save({ derpServers: bad });
+      } catch (e) {
+        err = e;
+      }
+      expect(err, bad).toBeInstanceOf(ProtoCodecError);
+      expect((err as ProtoCodecError).code, bad).toBe('derpServerInvalid');
+      expect((err as ProtoCodecError).detail, bad).toBe(line);
+      expect((err as ProtoCodecError).field, bad).toBe('derpServers');
     }
+    // 纯主机名行不受影响；非 servers 模式不解析该字段（切走模式时留下的坏草稿不拦保存）。
+    expect(save({ derpServers: 'a.example\n[1]' }).tailcatSettings?.derpServers).toEqual(['a.example', '[1]']);
+    expect(save({ derpMode: 'region', derpRegion: 7, derpServers: '{bad' }).tailcatSettings?.derpRegion).toBe(7);
   });
 
   it('key 去首尾空白、空串删键；四把 key 与袋都落在 tailcatSettings，不碰顶层地址/凭据', () => {

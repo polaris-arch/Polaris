@@ -46,6 +46,7 @@ import {
   PROTO_OPTIONS,
   isMeshTunnelNodeProtocol,
   meshTunnelNodeProtocols,
+  nodeFieldGroup,
   nodeFormGroups,
   nodeFormUsesTabs,
   protosInGroup,
@@ -256,13 +257,18 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
     setErrAddr(addrEmpty);
     if (nameEmpty || addrEmpty) return;
 
+    // 把用户带到出错分组：页签协议切页（basic/transport 合成「连接」页），单页协议展开对应折叠段。
+    const revealFormGroup = (group: NodeFieldGroupId) => {
+      if (nodeFormUsesTabs(proto)) {
+        setFormTab(group === 'basic' || group === 'transport' ? 'connection' : group);
+      } else {
+        setRevealGroup(group);
+      }
+    };
+
     const meshError = meshTunnelDraftError(proto, draft);
     if (meshError) {
-      if (nodeFormUsesTabs(proto)) {
-        setFormTab(meshError.group === 'basic' ? 'connection' : meshError.group);
-      } else {
-        setRevealGroup(meshError.group);
-      }
+      revealFormGroup(meshError.group);
       toast.error(
         meshError.key === 'json'
           ? t('node.meshTunnelJsonInvalid')
@@ -341,6 +347,8 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       closeInstance(instanceId);
     } catch (e) {
       console.error('[NodeDialog] save failed:', e);
+      const codecGroup = e instanceof ProtoCodecError && e.field ? nodeFieldGroup(proto, e.field) : null;
+      if (codecGroup) revealFormGroup(codecGroup);
       const detail = e instanceof ProtoCodecError
         ? t(`node.codecError.${e.code}`, { detail: e.detail ?? '' })
         : t('errors.operationFailed');

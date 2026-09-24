@@ -1641,7 +1641,9 @@
       "customJsonInvalid": "自定义协议 JSON 格式错误：{{detail}}",
       "customJsonObject": "自定义协议 JSON 必须是对象",
       "customJsonTypeRequired": "自定义协议 JSON 缺少必填的 \"type\" 字段",
-      "certPinInvalid": "证书固定值无效：{{detail}}（需为 SHA-256 摘要的十六进制或 Base64）"
+      "certPinInvalid": "证书固定值无效：{{detail}}（需为 SHA-256 摘要的十六进制或 Base64）",
+      "derpServerInvalid": "DERP 服务器行不是合法 JSON：{{detail}}",
+      "extraJsonInvalid": "扩展配置必须是合法的 JSON 对象（留空表示不设置）"
     },
     "field": {
       "aid": "AlterID",
