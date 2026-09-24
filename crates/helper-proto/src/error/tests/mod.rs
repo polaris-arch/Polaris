@@ -87,43 +87,72 @@ fn err_parse_non_err_returns_none() {
     assert!(Error::parse("").is_none());
 }
 
+/// 已知 code 名单 + 各自的 wire token 金标（**唯一**一处，宏同时展开成数组与穷举 `match`）。
+///
+/// 早先名单是手写数组，加变体时 `as_wire_token` 的穷举 `match` 会编译错逼人补 token，名单却不会红
+/// ⇒ 曾静默漏掉 `Ipconfig`/`ResolvedDns`/`SystemProxy` 三个。现在同一份条目既生成
+/// [`KNOWN_CODES`]，又生成**无 `_` 臂**的 [`golden_wire_token`]：新增变体而不来这里登记 ⇒
+/// `match` 不穷举 ⇒ **编译错**（E0004）；而要让它编译过，唯一的写法就是往宏调用里加一条，
+/// 数组也就跟着有了它 —— 名单与枚举全集在构造上绑死，不靠人记得同步两处。
+///
+/// token 用字面量写死，不从 `as_wire_token` 取：判据自己喂自己就锁不住「两侧一起改名」这种
+/// 协议破坏（与已部署 helper 断协议）。
+macro_rules! known_codes {
+    ($($variant:ident => $token:literal,)*) => {
+        const KNOWN_CODES: &[ErrorCode] = &[$(ErrorCode::$variant,)*];
+
+        /// 金标 token；[`ErrorCode::Other`] 无自己的 token（序列化兜底为 `unknown`），返 `None`。
+        fn golden_wire_token(code: ErrorCode) -> Option<&'static str> {
+            match code {
+                $(ErrorCode::$variant => Some($token),)*
+                ErrorCode::Other => None,
+            }
+        }
+    };
+}
+
+known_codes! {
+    Auth => "auth",
+    Peercred => "peercred",
+    Unauthorized => "unauthorized",
+    Unknown => "unknown",
+    NoConfig => "no-config",
+    BadArgs => "bad-args",
+    ConfigPathDenied => "config-path-denied",
+    LogPathDenied => "log-path-denied",
+    CorePathDenied => "core-path-denied",
+    ConfigNotOwned => "config-not-owned",
+    CoreMissing => "core-missing",
+    IfaceDenied => "iface-denied",
+    BadGateway => "bad-gateway",
+    BadPort => "bad-port",
+    BadMetric => "bad-metric",
+    CoredirUnset => "coredir-unset",
+    HashMismatch => "hash-mismatch",
+    Enum => "enum",
+    Start => "start",
+    Dscacheutil => "dscacheutil",
+    Ipconfig => "ipconfig",
+    ResolvedDns => "resolved-dns",
+    SystemProxy => "system-proxy",
+    SetMetric => "set-metric",
+    CoredirAclWeakened => "coredir-acl-weakened",
+}
+
 #[test]
 fn all_known_codes_roundtrip_through_wire_token() {
     // 锁住 wire token 不漂移 —— 改名 = 与已部署 helper 断协议
-    let known = [
-        ErrorCode::Auth,
-        ErrorCode::Peercred,
-        ErrorCode::Unauthorized,
-        ErrorCode::Unknown,
-        ErrorCode::NoConfig,
-        ErrorCode::BadArgs,
-        ErrorCode::ConfigPathDenied,
-        ErrorCode::LogPathDenied,
-        ErrorCode::CorePathDenied,
-        ErrorCode::ConfigNotOwned,
-        ErrorCode::CoreMissing,
-        ErrorCode::IfaceDenied,
-        ErrorCode::BadGateway,
-        ErrorCode::BadPort,
-        ErrorCode::BadMetric,
-        ErrorCode::CoredirUnset,
-        ErrorCode::HashMismatch,
-        ErrorCode::Enum,
-        ErrorCode::Start,
-        ErrorCode::Dscacheutil,
-        ErrorCode::SetMetric,
-        // 本表是手写名单（不是从枚举派生），此前已静默漏掉三个已存在的 code —— 顺手补齐，
-        // 否则新加的 `CoredirAclWeakened` 只是落进一份本来就不全的名单里。
-        ErrorCode::Ipconfig,
-        ErrorCode::ResolvedDns,
-        ErrorCode::SystemProxy,
-        ErrorCode::CoredirAclWeakened,
-    ];
-    for c in known {
-        let tok = c.as_wire_token();
-        assert_eq!(ErrorCode::from_wire_token(tok), c, "token {tok} mismatch");
-        // 其它 -> 序列化为 "unknown"（兜底，调用方构造时通常已知具体 code）
-        assert_eq!(ErrorCode::from_wire_token("read-singbox"), ErrorCode::Other);
-        let _ = tok; // suppress unused in case of empty
+    for &c in KNOWN_CODES {
+        let golden = golden_wire_token(c).expect("KNOWN_CODES 里不该有 Other");
+        assert_eq!(c.as_wire_token(), golden, "{c:?} 的 wire token 漂移");
+        assert_eq!(
+            ErrorCode::from_wire_token(golden),
+            c,
+            "token {golden} 解析不回 {c:?}"
+        );
     }
+    // Other 不在名单里：它没有自己的 token，序列化兜底为 `unknown`，未知 token 解析回它。
+    assert_eq!(golden_wire_token(ErrorCode::Other), None);
+    assert_eq!(ErrorCode::Other.as_wire_token(), "unknown");
+    assert_eq!(ErrorCode::from_wire_token("read-singbox"), ErrorCode::Other);
 }

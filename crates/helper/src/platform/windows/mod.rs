@@ -101,15 +101,12 @@ pub const PROTO_VERSION: u32 = polaris_helper_proto::proto_version::CURRENT;
 /// （[`polaris_helper_proto::Platform::has_token_line`]）。
 pub const PLATFORM: polaris_helper_proto::Platform = polaris_helper_proto::Platform::Win;
 
-/// Windows SCM 服务名（`helper-win/main.go:15`，`const serviceName = "PolarisHelper"`）。
-///
-/// 安装期固定常量，sc.exe stop/delete 与自毁旁路均引用本名。
-pub const SERVICE_NAME: &str = "PolarisHelper";
-
-/// 命名管道名（`helper-win/service.go:16`，`const pipeName = \\.\pipe\polaris-helper`）。
-///
-/// 镜像 macOS 的 helper.sock 命名谱系（polaris-helper）。Windows 命名管道路径形如 `\\.\pipe\<name>`。
-pub const PIPE_NAME: &str = r"\\.\pipe\polaris-helper";
+// Windows SCM 服务名 / 命名管道名 / 默认 supportDir：真值住 helper-proto 的无 cfg 模块。
+// 本模块的门带 `cfg(any(target_os = "windows", test))`，放在这里的常量别的 crate 在 Linux 上看不见；
+// helper-client（装卸脚本、连管道、`sc` 起停）必须与本侧逐字一致，故两侧共引同一份（构造上单源）。
+// sc.exe stop/delete 与自毁旁路均引用 `SERVICE_NAME`；`DEFAULT_SUPPORT_DIR` 是 `--support` 默认值，
+// `helper.token` 落此目录（SYSTEM 私有，ACL 由安装期设定）。
+pub use polaris_helper_proto::windows_helper::{DEFAULT_SUPPORT_DIR, PIPE_NAME, SERVICE_NAME};
 
 /// 命名管道 SDDL（纵深防御；token 仍是主鉴权边界，`helper-win/service.go:34`）。
 ///
@@ -122,11 +119,6 @@ pub const PIPE_NAME: &str = r"\\.\pipe\polaris-helper";
 /// 不授予服务账户/远程会话/网络登录。GENERIC_READ|WRITE 足以连接管道 + ReadFile/WriteFile，
 /// 不授予 FILE_ALL_ACCESS（无需改 ACL/删管道）。
 pub const PIPE_SDDL: &str = "D:(A;;FA;;;SY)(A;;GRGW;;;IU)";
-
-/// Windows 默认 supportDir（`helper-win/main.go:21`，`--support` 默认值）。
-///
-/// `helper.token` 落此目录（SYSTEM 私有，ACL 由安装期设定）。
-pub const DEFAULT_SUPPORT_DIR: &str = r"C:\ProgramData\Polaris";
 
 /// 安全占位路径（`selfuninstall.go:26`）—— 恶意 supportDir 命中 cmd 元字符时改用此路径（rmdir 落空，不注入）。
 pub const SAFE_PLACEHOLDER_DIR: &str = r"C:\Polaris\safe-placeholder-nonexistent";

@@ -126,7 +126,7 @@ impl InstallPaths {
             // Windows 服务定义在 SCM，磁盘无描述符文件 → is_installed 走 SysOps::service_exists
             // 单证据（W17：support 目录 ACL 锁拒未提权 stat，文件证据不可用；取舍见 is_installed 头注）。
             descriptor: None,
-            socket: PathBuf::from(r"\\.\pipe\polaris-helper"),
+            socket: PathBuf::from(WIN_PIPE_NAME),
             // P4 起有消费者：[`build_win_install_script`] 在此建目录、播种核、锁 ACL，并把
             // `<core_dir>\sing-box.exe` 拼成服务 ImagePath 的 `--singbox`；app 侧
             // `HelperRuntime::protected_core_dir_path` 对账的也是同一个值。同样字面量拼接
@@ -452,10 +452,13 @@ const LINUX_SERVICE_NAME: &str = "polaris-helper.service";
 const LINUX_AUTH_FILE: &str = "/var/lib/polaris/authorized-uids";
 /// linux 授权文件所在状态目录（`AUTH_FILE` 的父）。
 const LINUX_STATE_DIR: &str = "/var/lib/polaris";
-/// win SCM 服务名（= daemon `windows/mod.rs:SERVICE_NAME`）。
-const WIN_SERVICE_NAME: &str = "PolarisHelper";
-/// win support 目录（= daemon `--support` 默认，`windows/mod.rs:DEFAULT_SUPPORT_DIR`；helper.exe 外置副本 + helper.token 落此）。
-const WIN_SUPPORT_DIR: &str = r"C:\ProgramData\Polaris";
+/// win SCM 服务名。与 daemon 侧共引 helper-proto 的同一份真值（构造上单源，见该模块文档）。
+const WIN_SERVICE_NAME: &str = polaris_helper_proto::windows_helper::SERVICE_NAME;
+/// win 命名管道（client 连接目标）。与 daemon 侧 `CreateNamedPipeW` 共引同一份真值。
+const WIN_PIPE_NAME: &str = polaris_helper_proto::windows_helper::PIPE_NAME;
+/// win support 目录（= daemon `--support` 默认；helper.exe 外置副本 + helper.token 落此）。与 daemon 侧
+/// 共引同一份真值。
+const WIN_SUPPORT_DIR: &str = polaris_helper_proto::windows_helper::DEFAULT_SUPPORT_DIR;
 /// win helper 外置副本文件名。**单一真相源**：[`InstallPaths::win`] 与
 /// [`build_win_install_script`] 必须同取此常量。早先脚本用 `win_basename(src_binary)` 现算、
 /// 而 `InstallPaths::win()` 另写死一个不同路径，两者分叉即 Windows 恒判「未安装」的成因。

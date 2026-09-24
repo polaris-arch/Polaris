@@ -107,6 +107,22 @@ fn install_paths_mac_match_polaris() {
     assert!(p.socket.to_string_lossy().contains("helper.sock"));
 }
 
+/// win 的 client 连接目标必须是 daemon 创建的那条管道、`sc` 起停的必须是 daemon 注册的那个服务。
+/// 两侧共引 `polaris_helper_proto::windows_helper`；本条钉的是**本 crate 真的在用它**——
+/// 早先这里是内联字面量 `PathBuf::from(r"\\.\pipe\...")`，连常量都不是，与 daemon 零对账，
+/// 改错一个字符的后果是 app 恒判 helper 未运行、每次起核都弹 UAC 重装。字面量写死：引常量的话
+/// 常量一改判据跟着漂。
+#[test]
+fn win_install_paths_rendezvous_with_the_daemon() {
+    let p = InstallPaths::win();
+    assert_eq!(p.socket, PathBuf::from(r"\\.\pipe\polaris-helper"));
+    assert_eq!(p.service_label, "PolarisHelper");
+    assert_eq!(
+        p.binary,
+        PathBuf::from(r"C:\ProgramData\Polaris\polaris-helper.exe")
+    );
+}
+
 #[test]
 fn install_paths_for_platform() {
     assert_eq!(

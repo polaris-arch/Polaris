@@ -45,6 +45,20 @@ fn platform_carries_frame_shape_not_version() {
     assert_ne!(mac, linux, "平台差异体现在帧结构上");
 }
 
+/// Windows helper 会合点的绝对值金标。helper 与 helper-client 都引 [`windows_helper`] 的同一份
+/// 常量，两侧之间不可能再分叉；剩下的风险是「这一份被改了」——而已部署的 helper 服务名、管道名、
+/// 目录都烧在用户机器上（SCM 注册、ImagePath、ACL），改值 = 新 app 找不到旧 helper。故判据写死
+/// 字面量：引常量的话常量一改判据跟着漂。
+#[test]
+fn windows_helper_rendezvous_is_pinned() {
+    assert_eq!(windows_helper::SERVICE_NAME, "PolarisHelper");
+    assert_eq!(windows_helper::PIPE_NAME, r"\\.\pipe\polaris-helper");
+    assert_eq!(
+        windows_helper::DEFAULT_SUPPORT_DIR,
+        r"C:\ProgramData\Polaris"
+    );
+}
+
 #[test]
 fn build_identity_is_a_single_safe_wire_token() {
     assert!(build_identity::is_wire_safe(build_identity::current()));
