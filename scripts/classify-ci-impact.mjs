@@ -114,6 +114,18 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: NO_LEG,
     why: '随包核的 gRPC(h2c) API 面，核换版即断 ⇒ 走内核门；纯 lib，不改包内容 ⇒ 不加腿。',
   },
+  'crates/net-stack/src/singbox_import.rs': {
+    kernel: true,
+    platforms: NO_LEG,
+    why:
+      '本地 sing-box JSON 导入：`local_import_round_trips_through_the_bundled_core` 拿真核 check 导入产物，'
+      + 'ci.yml 的 test job 不拉核会静默跳过，只有内核门那一步能让它真跑。不改包内容 ⇒ 不加腿。',
+  },
+  'crates/net-stack/src/singbox_import/': {
+    kernel: true,
+    platforms: NO_LEG,
+    why: '同 `singbox_import.rs`：模块的测试实体与真核往返测试都在这里。',
+  },
   'crates/helper/': {
     kernel: false,
     platforms: ALL,

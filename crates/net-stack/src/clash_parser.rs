@@ -286,6 +286,12 @@ fn normalize_clash_type(raw: &Value) -> Option<Protocol> {
         "snell" => Protocol::Snell,
         "ssh" => Protocol::Ssh,
         // ssr/wireguard/hysteria(v1)/mieru/direct/dns 等 → 不支持
+        //
+        // ⚠️ mihomo 的 `masque` **不要**映射到 `Protocol::MasqueClient`，两边只是同名：mihomo 那支是 WARP
+        // 客户端（写死 Cloudflare 的 SNI 与 `cf-connect-ip` 升级令牌、凭据是 ECDSA 密钥对，字段
+        // `private-key/public-key/ip/ipv6`），sing-box `masque-client` 是通用 RFC 9484 CONNECT-IP +
+        // Basic/TLS，没有可保真的映射；Polaris 也不做 WARP-MASQUE（内核写死 `connect-ip`）。
+        // 维持跳过，回归测试 `mihomo_masque_is_skipped_not_mapped_to_masque_client`。
         _ => return None,
     };
     Some(p)

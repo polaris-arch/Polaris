@@ -932,3 +932,425 @@ fn tls_cert_pins_imported_and_round_trip_through_the_builder() {
     assert_eq!(ob["tls"]["certificate_sha256"], json!([B64, B64_2]));
     assert_eq!(ob["tls"]["certificate_public_key_sha256"], json!([B64]));
 }
+
+// ── I1：masque-client / tailcat 导入（2026-09-24）─────────────────────────────────
+
+const TC_PUB: &str = "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=";
+const TC_DISCO: &str = "qQ+kiWwZ8BrTYDZpj+6bnx2JxWxx0SAh1krqPGndCmQ=";
+const TC_PSK: &str = "Z/ieR+hhJp4BrgYOuu/v6aBC6yOsxfJMynnLwRjodrA=";
+const PIN_B64: &str = "LXEWQrcmsEQBYnyp+6wy9chTD7GQPMTbAiWHF5IaSIE=";
+const PIN_HEX: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+
+/// 本机文件里的一份 MASQUE + Tailcat 语料：每个节点都带「会被生成侧剥掉的键」与「无害的未建模键」，
+/// 供映射单测与真核往返共用。
+fn masque_tailcat_doc() -> Value {
+    json!({
+        "endpoints": [{
+            "type": "masque-client", "tag": "MQ3", "server": "mq.example.com", "server_port": 18443,
+            "username": "u", "password": "p", "on_demand": true, "bind_interface": "eth9",
+            "detour": "front", "domain_resolver": "dns-x",
+            "path": "/.well-known/masque/ip/", "mtu": 1400,
+            "headers": { "Authorization": "Bearer t", "X-A": ["1", "2"] },
+            "tls": { "enabled": true, "server_name": "sni.example.com", "insecure": true,
+                     "certificate_sha256": [PIN_HEX, "not-a-pin"],
+                     "certificate_public_key_sha256": PIN_B64,
+                     "alpn": ["h3"], "utls": { "enabled": true, "fingerprint": "chrome" } },
+            // 无害的未建模键（缺省版本下 H2/QUIC 键都收）—— 必须活着到产物。
+            "udp_timeout": "5m", "max_concurrent_streams": 8, "connect_timeout": "7s",
+            // 生成侧恒剥的三个键。
+            "system": true, "name": "mq0", "advertise_routes": ["10.0.0.0/8"]
+        }, {
+            "type": "masque-client", "tag": "MQ2", "server": "mq.example.com", "server_port": 18444,
+            "version": 2, "idle_timeout": "30s", "initial_packet_size": 1280
+        }],
+        "outbounds": [{
+            "type": "tailcat", "tag": "TC-REGION",
+            "server_public_key": TC_PUB, "server_disco_key": TC_DISCO, "pre_shared_key": TC_PSK,
+            "derp_region": 900, "derp_map_url": "https://derp.example/derpmap.json",
+            "http_client": { "detour": "proxy" }, "detour": "front", "bind_interface": "eth9",
+            "connect_timeout": "7s", "server": "stray.example.com"
+        }, {
+            "type": "tailcat", "tag": "TC-SERVERS",
+            "server_public_key": TC_PUB, "server_disco_key": TC_DISCO,
+            "derp_servers": [ "derp1.example.com",
+                              { "host": "derp2.example.com", "derp_port": 18444 } ],
+            "derp_region": 0, "derp_map_url": "https://leftover.example/derpmap.json"
+        }]
+    })
+}
+
+fn parse_doc(doc: &Value, origin: ImportOrigin) -> ClashParseResult {
+    let mut g = id_gen();
+    crate::subscription::parse_subscription(
+        &doc.to_string(),
+        "",
+        "2026-09-24T00:00:00Z",
+        &mut g,
+        origin,
+    )
+}
+
+fn by_name<'a>(r: &'a ClashParseResult, name: &str) -> &'a ServerConfig {
+    r.servers
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("缺节点 {name}：{:?}", r.servers))
+}
+
+/// MASQUE 本地文件映射：顶层字段 / TLS 四项 / 具名设置 / 透传袋各归各位；生成侧会剥掉的键**不存**并告警。
+///
+/// **反向对照**：同一个袋里的 `udp_timeout` / `max_concurrent_streams` / `connect_timeout` 必须留下 ——
+/// 证明「剥」只剥了生成侧不下发的键，而不是把袋子整个清空（全清也能让禁止键断言变绿）。
+/// v2 节点同理：`idle_timeout`（H2 键）留下、`initial_packet_size`（QUIC 键）剥掉。
+#[test]
+fn masque_client_local_mapping_strips_what_generation_would_drop() {
+    let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::LocalFile);
+    assert_eq!((r.skipped, r.failed), (0, 0), "{:?}", r.warnings);
+
+    let m = by_name(&r, "MQ3");
+    assert_eq!(m.protocol, Protocol::MasqueClient);
+    assert_eq!((m.address.as_str(), m.port), ("mq.example.com", 18443));
+    assert_eq!(m.username.as_deref(), Some("u"));
+    assert_eq!(m.password.as_deref(), Some("p"));
+    assert_eq!(m.on_demand, Some(true));
+    assert_eq!(m.bind_interface.as_deref(), Some("eth9"));
+    assert_eq!(m.detour, None, "文件内 tag 对本机无意义");
+    assert_eq!(m.security, Some(SecurityMode::Tls));
+    let tls = m.tls_settings.as_ref().unwrap();
+    assert_eq!(tls.server_name.as_deref(), Some("sni.example.com"));
+    assert_eq!(tls.allow_insecure, Some(true));
+    assert_eq!(
+        tls.certificate_sha256.as_deref(),
+        Some(PIN_HEX),
+        "pin 走 keep_valid_cert_pins：合法原文保留、非法条目丢"
+    );
+    assert_eq!(tls.certificate_public_key_sha256.as_deref(), Some(PIN_B64));
+    assert_eq!(tls.alpn, None, "MASQUE 生成侧不下发 alpn，存下来就是假设置");
+    assert_eq!(tls.fingerprint, None, "MASQUE 生成侧不下发 uTLS");
+
+    let ms = m.masque_client_settings.as_ref().unwrap();
+    assert_eq!(ms.path.as_deref(), Some("/.well-known/masque/ip/"));
+    assert_eq!(ms.mtu, Some(1400));
+    assert_eq!(ms.headers.as_ref().unwrap()["X-A"], json!(["1", "2"]));
+    for k in ["system", "name", "advertise_routes"] {
+        assert!(
+            !ms.extra.contains_key(k),
+            "生成侧恒剥的 `{k}` 被存进了透传袋"
+        );
+    }
+    for k in ["udp_timeout", "max_concurrent_streams", "connect_timeout"] {
+        assert!(
+            ms.extra.contains_key(k),
+            "反向对照：无害的未建模键 `{k}` 被丢了"
+        );
+    }
+    let w = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("「MQ3」"))
+        .expect("剥键没有告警");
+    for k in ["system", "name", "advertise_routes", "tls.alpn", "tls.utls"] {
+        assert!(w.contains(k), "告警里缺 `{k}`：{w}");
+    }
+
+    let v2 = by_name(&r, "MQ2");
+    let v2s = v2.masque_client_settings.as_ref().unwrap();
+    assert_eq!(v2s.version, Some(2));
+    assert!(v2s.extra.contains_key("idle_timeout"), "v2 下 H2 键应保留");
+    assert!(
+        !v2s.extra.contains_key("initial_packet_size"),
+        "v2 下 QUIC 键生成侧会剥，不该存"
+    );
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("「MQ2」") && w.contains("initial_packet_size")));
+}
+
+/// 生成侧会剔除的 MASQUE 节点（path 不以 `/` 开头、version > 3）与缺地址的节点：计 failed，不入库。
+/// 反向对照：合法 path 的同形节点照常入库。
+#[test]
+fn masque_client_that_generation_would_drop_counts_failed() {
+    let base = json!({ "type": "masque-client", "server": "mq.example.com", "server_port": 443 });
+    let with = |k: &str, v: Value| {
+        let mut e = base.clone();
+        e[k] = v;
+        e
+    };
+    let doc = json!({ "endpoints": [
+        with("path", json!("no-slash")),
+        with("version", json!(4)),
+        with("server_port", Value::Null),
+        with("path", json!("/ok")),
+    ] });
+    let r = parse_eps(doc, ImportOrigin::LocalFile);
+    assert_eq!(r.failed, 3);
+    assert_eq!(r.servers.len(), 1, "反向对照：合法节点应入库");
+    assert_eq!(
+        r.servers[0]
+            .masque_client_settings
+            .as_ref()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some("/ok")
+    );
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("3 个") && w.contains("masque-client")));
+}
+
+/// Tailcat 本地文件映射：key / DERP 进具名字段，`http_client` 不存并告警（出口由生成侧决定），
+/// servers 模式残留的 region / URL 不存并告警，袋里生成侧会剥的 `server` 不存。
+///
+/// **反向对照**：同袋的 `connect_timeout` 必须留下。
+#[test]
+fn tailcat_local_mapping_strips_what_generation_would_drop() {
+    let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::LocalFile);
+    let t = by_name(&r, "TC-REGION");
+    assert_eq!(t.protocol, Protocol::Tailcat);
+    assert_eq!((t.address.as_str(), t.port), ("", 0), "无地址协议");
+    assert_eq!(t.bind_interface.as_deref(), Some("eth9"));
+    assert_eq!(t.detour, None);
+    let ts = t.tailcat_settings.as_ref().unwrap();
+    assert_eq!(ts.server_public_key.as_deref(), Some(TC_PUB));
+    assert_eq!(ts.server_disco_key.as_deref(), Some(TC_DISCO));
+    assert_eq!(ts.pre_shared_key.as_deref(), Some(TC_PSK));
+    assert_eq!(ts.derp_region, Some(900));
+    assert_eq!(
+        ts.derp_map_url.as_deref(),
+        Some("https://derp.example/derpmap.json")
+    );
+    assert!(!ts.extra.contains_key("http_client"));
+    assert!(
+        !ts.extra.contains_key("server"),
+        "生成侧会剥的 `server` 被存了"
+    );
+    assert!(
+        ts.extra.contains_key("connect_timeout"),
+        "反向对照：无害的未建模键被丢了"
+    );
+    let w = r
+        .warnings
+        .iter()
+        .find(|w| w.contains("「TC-REGION」"))
+        .expect("剥键没有告警");
+    assert!(w.contains("http_client") && w.contains("server"), "{w}");
+
+    let s = by_name(&r, "TC-SERVERS");
+    let ss = s.tailcat_settings.as_ref().unwrap();
+    assert_eq!(ss.derp_servers.len(), 2);
+    assert_eq!((ss.derp_region, ss.derp_map_url.as_deref()), (None, None));
+    assert!(r.warnings.iter().any(|w| w.contains("「TC-SERVERS」")
+        && w.contains("derp_region")
+        && w.contains("derp_map_url")));
+}
+
+/// `tailcat_emit_check` 不过的节点（hex 误填公钥 / region 与 servers 同时设 / 缺 disco key）计 failed；
+/// 反向对照：合格节点入库。
+#[test]
+fn tailcat_that_generation_would_drop_counts_failed() {
+    let good = json!({ "type": "tailcat", "server_public_key": TC_PUB,
+                       "server_disco_key": TC_DISCO, "derp_region": 1 });
+    let with = |k: &str, v: Value| {
+        let mut o = good.clone();
+        o[k] = v;
+        o
+    };
+    let r = parse_local(json!({ "outbounds": [
+        with("server_public_key", json!(PIN_HEX)),
+        with("derp_servers", json!(["derp.example.com"])),
+        with("server_disco_key", Value::Null),
+        good,
+    ] }));
+    assert_eq!(r.failed, 3);
+    assert_eq!(r.servers.len(), 1, "反向对照：合格节点应入库");
+    assert_eq!(r.servers[0].protocol, Protocol::Tailcat);
+}
+
+/// D4：第一期只收本地文件 —— **同一份**语料走远端订阅，两类节点一个不导，全部计 skipped 并按类型告警。
+#[test]
+fn remote_subscription_skips_masque_and_tailcat() {
+    let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::RemoteSubscription);
+    assert!(r.servers.is_empty(), "远端订阅导入了：{:?}", r.servers);
+    assert_eq!((r.skipped, r.failed), (4, 0));
+    assert!(
+        r.warnings.iter().any(|w| w.contains("tailcat(2)")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(r.warnings.iter().any(|w| w.contains("masque-client(2)")));
+}
+
+/// 🔴 **本地文件往返走真核**：导入 → `generate_sing_box_config_with_report` → 随包核 `check` rc=0，
+/// 且未建模键活着到产物、证书 pin 以 base64 下发。
+///
+/// 前置断言钉产物里真有这四个对象（排除「生成器把它们剔了所以核没意见」）；阴性对照证明 check 真读了
+/// 它们：masque 挪进 `outbounds[]`、tailcat 公钥改坏，两者都必红。缺核时开发机跳过、
+/// `POLARIS_REQUIRE_KERNEL_GATE=1` 下硬红（同 config-engine 真核门的定位器）。
+#[test]
+fn local_import_round_trips_through_the_bundled_core() {
+    use polaris_config_engine::builder::{
+        generate_sing_box_config_with_report, GenerateConfigDeps,
+    };
+    use polaris_config_engine::user_config::app_config::UserConfig;
+    use polaris_config_engine::user_config::LogLevel;
+    use std::collections::BTreeMap;
+
+    #[path = "../../../../config-engine/tests/support/core_locator.rs"]
+    mod core_locator;
+
+    let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::LocalFile);
+    assert_eq!(r.servers.len(), 4);
+    let mut servers = serde_json::to_value(&r.servers).unwrap();
+    // 导入腿不带 id 语义以外的东西；给个 selected，四个节点才全进生成。
+    let selected = servers[0]["id"].clone();
+    for s in servers.as_array_mut().unwrap() {
+        s.as_object_mut().unwrap().remove("subscriptionId");
+    }
+    let input: UserConfig = serde_json::from_value(json!({
+        "servers": servers, "selectedServerId": selected, "proxyMode": "smart",
+        "proxyModeType": "manual", "mixedPort": 17899
+    }))
+    .expect("导入产物反序列化成 UserConfig 失败");
+    let deps = GenerateConfigDeps {
+        platform: "linux".into(),
+        arch: "x86_64".into(),
+        race_server_port: 0,
+        probe_direct_port: None,
+        probe_proxy_port: None,
+        update_in_port: None,
+        subscription_update_in_port: None,
+        probe_pool_ports: vec![],
+        lan_resolver_for_dns: None,
+        race_upstream_ips: vec![],
+        race_upstream_ports: vec![],
+        has_cronet: true,
+        cronet_copy_failed: false,
+        has_management_api: false,
+        privacy_mode: false,
+        log_level: LogLevel::Info,
+        disable_log_file: false,
+        dashboard_serve_dir: None,
+        tailscale_api_port: 0,
+        cache_path: "/fake/userData/cache.db".into(),
+        log_file_path: None,
+        runtime_rules_dir: "/fake/userData/rules".into(),
+        rule_resources_path: "/fake/userData/rule-resource".into(),
+        custom_rules_dir: "/fake/userData/custom-rules".into(),
+        tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+        tailnet_rules_dir: "/fake/userData/tailnet-rules".into(),
+        observed_tailnet_addresses: Default::default(),
+        is_valid_srs_fn: |_| true,
+        own_lan_cidrs: vec![],
+        log: |_, _| {},
+        on_degraded: || {},
+    };
+    let outcome =
+        generate_sing_box_config_with_report(&input, &BTreeMap::new(), &deps).expect("生成配置");
+    assert!(
+        outcome.invalid_nodes.is_empty(),
+        "导入的节点在生成时被剔：{:?}",
+        outcome.invalid_nodes
+    );
+    let cfg = serde_json::to_value(&outcome.config).unwrap();
+    let find = |arr: &str, ty: &str, key: &str, val: Value| -> Value {
+        cfg[arr]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["type"] == ty && o[key] == val)
+            .cloned()
+            .unwrap_or_else(|| panic!("前置断言：{arr}[] 里缺 {ty} {key}={val}"))
+    };
+    let mq3 = find("endpoints", "masque-client", "server_port", json!(18443));
+    let mq2 = find("endpoints", "masque-client", "server_port", json!(18444));
+    let tcr = find("outbounds", "tailcat", "derp_region", json!(900));
+    let tcs = cfg["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["type"] == "tailcat" && o.get("derp_servers").is_some())
+        .cloned()
+        .expect("前置断言：outbounds[] 里缺 servers 模式的 tailcat");
+    assert_eq!(tcs["derp_servers"].as_array().map(Vec::len), Some(2));
+    assert!(
+        tcs.get("derp_region").is_none() && tcs.get("http_client").is_none(),
+        "servers 模式不得带 region / http_client（内核 conflicts 整核失败）：{tcs:#}"
+    );
+    for k in ["udp_timeout", "max_concurrent_streams", "connect_timeout"] {
+        assert!(mq3.get(k).is_some(), "未建模键 `{k}` 没活到产物：{mq3:#}");
+    }
+    assert_eq!(mq3["tls"]["certificate_sha256"], json!([PIN_B64]));
+    assert_eq!(mq3["headers"]["Authorization"], json!("Bearer t"));
+    assert_eq!(mq2["idle_timeout"], json!("30s"));
+    assert_eq!(
+        tcr["connect_timeout"],
+        json!("7s"),
+        "Tailcat 未建模键没活到产物"
+    );
+    assert_eq!(tcr["http_client"]["detour"], json!("direct"));
+    let n_tc = cfg["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["type"] == "tailcat")
+        .count();
+    assert_eq!(n_tc, 2);
+
+    let Some(core) = core_locator::core_or_skip("导入往返真核门") else {
+        return;
+    };
+    // 只留出站面（同 config-engine 真核门的 `outbound_surface`）：route/rule_set 引用的是夹具假路径。
+    let mut surface = json!({
+        "log": { "disabled": true },
+        "outbounds": cfg["outbounds"],
+        "endpoints": cfg["endpoints"],
+    });
+    if let Some(servers) = cfg.get("dns").and_then(|d| d.get("servers")) {
+        surface["dns"] = json!({ "servers": servers });
+    }
+    let dir = std::env::temp_dir().join(format!("polaris-i1-import-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let check = |name: &str, v: &Value| -> (bool, String) {
+        let p = dir.join(name);
+        std::fs::write(&p, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+        let out = core_locator::command_for_core(&core)
+            .args(["--disable-color", "check", "-c"])
+            .arg(&p)
+            .arg("-D")
+            .arg(&dir)
+            .output()
+            .expect("跑随包核");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, diag) = check("import.json", &surface);
+
+    // 阴性对照 ①：masque 挪进 outbounds[] ⇒ 必红（内核只收在 endpoints[]）。
+    let mut moved = surface.clone();
+    moved["outbounds"].as_array_mut().unwrap().push(mq3.clone());
+    let (ok_moved, diag_moved) = check("moved.json", &moved);
+    // 阴性对照 ②：tailcat 公钥改成 hex ⇒ 必红（证明内核读了 tailcat 对象的 key）。
+    let mut badkey = surface.clone();
+    for o in badkey["outbounds"].as_array_mut().unwrap() {
+        if o["type"] == "tailcat" {
+            o["server_public_key"] = json!(PIN_HEX);
+        }
+    }
+    let (ok_bad, diag_bad) = check("badkey.json", &badkey);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(ok, "随包核拒绝了导入往返的配置：{diag}");
+    assert!(
+        !ok_moved && diag_moved.contains("masque-client"),
+        "masque 放进 outbounds[] 没被拒 —— 上面的绿不说明内核读过它：{diag_moved}"
+    );
+    assert!(
+        !ok_bad && diag_bad.contains("server_public_key"),
+        "tailcat 坏公钥没被拒 —— 上面的绿不说明内核读过它：{diag_bad}"
+    );
+}

@@ -60,6 +60,7 @@ use polaris_config_engine::builder::endpoints::{
 use polaris_config_engine::builder::outbound::build_proxy_outbound;
 use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
 use polaris_config_engine::singbox::DomainResolver;
+use polaris_config_engine::user_config::protocol_settings::tailcat_emit_check;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
 use polaris_core_supervisor::{
@@ -1051,6 +1052,14 @@ fn build_temp_node(
             is_endpoint: true,
             has_local_v6: false,
         });
+    }
+
+    // Tailcat：坏 key / DERP 冲突会让内核 initialize 失败 —— 临时核里坏的是**整批**，不只它自己。
+    // 与主核发射腿、selector 兜底判定共用 `tailcat_emit_check`（设计 §6.2：三处一份判据，复刻清单会
+    // 随发射腿改动静默漂移）；缺席原因直接用主核同一个 reason token，两条链路的日志逐字对得上。
+    // 绕过 store sanitize 的来路（手改配置、旧版本落盘）正是这道闸存在的理由。
+    if s.protocol == Protocol::Tailcat {
+        tailcat_emit_check(s.tailcat_settings.as_deref())?;
     }
 
     // 纯 tag 而非 #335 的结构化形态，理由同上面 WG 那条腿（临时核无顶层 `dns.strategy` 可覆盖）。

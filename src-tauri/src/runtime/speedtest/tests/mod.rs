@@ -525,6 +525,83 @@ fn masque_client_goes_into_endpoints_without_detour() {
     );
 }
 
+/// Tailcat 坏节点在临时核里**剔除且不连累同批**：坏 key / DERP 冲突会让内核 initialize 失败，而临时核
+/// 一次起一批 —— 放进去坏的是整批。判据与主核发射腿共用 `tailcat_emit_check`，缺席原因即主核那个
+/// reason token（设计 §6.2 三处一份判据）。合格节点照常可测，地图拉取出口是临时核里必定存在的 `direct`。
+///
+/// **变异锁**：删掉 `build_temp_node` 里的 Tailcat 闸 ⇒ 坏节点进 `testable`，两段 unusable 断言转红。
+#[test]
+fn tailcat_invalid_node_is_excluded_with_the_main_core_reason() {
+    use polaris_config_engine::user_config::protocol_settings::{
+        TailcatSettings, INVALID_REASON_TAILCAT_DERP, INVALID_REASON_TAILCAT_KEY,
+    };
+    const PUB: &str = "lPLDHP0YorENQouqgSUx1GHu+3OcDc/F71Z3roMTSy4=";
+    const DISCO: &str = "qQ+kiWwZ8BrTYDZpj+6bnx2JxWxx0SAh1krqPGndCmQ=";
+    let tc = |id: &str, settings: TailcatSettings| ServerConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Tailcat,
+        tailcat_settings: Some(Box::new(settings)),
+        ..Default::default()
+    };
+    let good = tc(
+        "tcgood11",
+        TailcatSettings {
+            server_public_key: Some(PUB.into()),
+            server_disco_key: Some(DISCO.into()),
+            derp_region: Some(1),
+            ..Default::default()
+        },
+    );
+    // hex 误填公钥（内核 `unexpected key length` 整核失败）。
+    let bad_key = tc(
+        "tcbadkey",
+        TailcatSettings {
+            server_public_key: Some(
+                "94f2c31cfd18a2b10d428baa812531d461eefb739c0dcfc5ef5677ae83134b2e".into(),
+            ),
+            ..good.tailcat_settings.as_deref().cloned().unwrap()
+        },
+    );
+    // region 与 servers 同时设（内核 conflicts 整核失败）。
+    let bad_derp = tc(
+        "tcbadder",
+        TailcatSettings {
+            derp_servers: vec![json!("derp.example.com")],
+            ..good.tailcat_settings.as_deref().cloned().unwrap()
+        },
+    );
+
+    let plan = plan_temp_core(&[bad_key.clone(), good.clone(), bad_derp.clone()], &env());
+    assert_eq!(
+        plan.unusable,
+        vec![
+            (
+                bad_key.id.clone(),
+                UnusableReason::BuildFailed(INVALID_REASON_TAILCAT_KEY)
+            ),
+            (
+                bad_derp.id.clone(),
+                UnusableReason::BuildFailed(INVALID_REASON_TAILCAT_DERP)
+            ),
+        ],
+        "坏 Tailcat 节点必须在起核前剔除，原因与主核一致"
+    );
+    assert_eq!(plan.testable.len(), 1, "合格节点不该被同批坏节点连累");
+    assert_eq!(plan.testable[0].id, good.id);
+    let cfg = build_temp_core_config(&plan.testable, &[20001], "warn");
+    let obs = cfg["outbounds"].as_array().expect("应有 outbounds[]");
+    let ob = obs
+        .iter()
+        .find(|o| o["type"] == "tailcat")
+        .expect("合格 Tailcat 节点没进临时核");
+    assert_eq!(ob["http_client"]["detour"], json!("direct"));
+    assert!(
+        obs.iter().any(|o| o["tag"] == "direct"),
+        "地图拉取出口 `direct` 必须在临时核里存在"
+    );
+}
+
 #[test]
 fn vpn_client_without_settings_is_excluded_before_temp_core_start() {
     for protocol in [Protocol::Openconnect, Protocol::OpenvpnClient] {
