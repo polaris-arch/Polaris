@@ -64,7 +64,8 @@ pub use neighbor::{
     TunMacFilterMode,
 };
 pub use network_profile::{
-    NetworkProbeSource, NetworkProfile, NetworkProfileCriteria, BUILTIN_NETENV_DHCP_ID,
+    is_valid_search_domain, NetworkProbeSource, NetworkProfile, NetworkProfileCriteria,
+    BUILTIN_NETENV_DHCP_ID,
 };
 pub use normalize::{de_opt_token, normalize_token};
 pub use proxy_mode::{ProxyMode, ProxyModeType};

@@ -179,6 +179,43 @@ export interface NetworkProfile {
   probe: NetworkProbeSource;
 }
 
+/**
+ * 某个网络场景在本机实际使用的探测源（IPC `network_profile_resolved_sources` 的元素）。
+ * 由后端按与生成侧同一判据算好，渲染端只显示、不重算。
+ * SoT = Rust `builder/network_env.rs` `ResolvedProbe`。
+ */
+export type ProbeReason =
+  | 'profileInvalid'
+  | 'dhcpNeedsPrivilege'
+  | 'systemNoSearchDomain'
+  | 'dhcpMonitorMissing'
+  | 'dhcpIpv6Only';
+
+/**
+ * 内置解析器 `builtin-netenv-dhcp`（当前网络 DHCP 下发的 DNS）在本机是否可用
+ * （IPC `network_profile_builtin_dhcp_status`）。不可用时引用它的 DNS 规则本次不生成。
+ * reason：`dhcpNeedsPrivilege` / `dhcpMonitorMissing`；可用时 null。
+ */
+export interface BuiltinDhcpStatus {
+  available: boolean;
+  reason: ProbeReason | null;
+}
+
+export interface ResolvedProbe {
+  profileId: string;
+  /** 本机使用（不可用时为按解析表本应使用）的探测源。 */
+  probeSource: 'system' | 'dhcp';
+  /** false = 引用该场景的规则本次不生成。 */
+  available: boolean;
+  /**
+   * 不可用或告警原因（Rust `ProbeReason` 的 camelCase）；可用且无告警时为 null。
+   * 不可用：`profileInvalid`（停用/判据全空）、`dhcpNeedsPrivilege`（本机核无特权绑 UDP 68）、
+   * `systemNoSearchDomain`（Windows 系统 DNS 读不到搜索域）、`dhcpMonitorMissing`（本次起核 dhcp 兜底剔除）。
+   * 告警（available 仍为 true）：`dhcpIpv6Only`（dhcp 源只写了 IPv6 地址段，永不命中）。
+   */
+  reason: ProbeReason | null;
+}
+
 /** 系统进程信息（进程快速选择器用）。 */
 export interface SystemProcessInfo {
   name: string;

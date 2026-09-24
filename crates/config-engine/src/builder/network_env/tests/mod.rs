@@ -42,6 +42,7 @@ fn deps(platform: &str, takeover: bool, custom_rules_dir: &str) -> GenerateConfi
         is_valid_srs_fn: |_| false,
         own_lan_cidrs: vec![],
         system_dns_takeover_active: takeover,
+        netenv_dhcp_suppressed: false,
         log: |_, _| {},
         on_degraded: || {},
     }
@@ -87,6 +88,13 @@ fn traffic_rule(id: &str, suffix: &str, profile_id: Option<&str>, action: &str) 
     }
     rule
 }
+
+const WIN: ProbeFacts = ProbeFacts {
+    platform: Platform::Win,
+    tun: false,
+    takeover_active: false,
+    dhcp_suppressed: false,
+};
 
 fn domestic() -> Value {
     json!({"type": "server", "serverId": "builtin-domestic"})
@@ -552,20 +560,14 @@ fn u12b_builder_refuses_env_ref_to_absent_transport() {
         inet4_range: None,
         inet6_range: None,
     };
-    let env = NetworkEnv::new(
-        &profiles,
-        Platform::Win,
-        false,
-        false,
-        std::slice::from_ref(&local),
-    );
+    let env = NetworkEnv::new(&profiles, &WIN, std::slice::from_ref(&local));
     assert_eq!(env.for_rule(&rule), RuleEnv::Skip(PRUNE_REF_MISSING));
     let wrong_type = DnsServer {
         tag: NETENV_DNS_TAG.into(),
         type_field: Some("udp".into()),
         ..local.clone()
     };
-    let env = NetworkEnv::new(&profiles, Platform::Win, false, false, &[wrong_type]);
+    let env = NetworkEnv::new(&profiles, &WIN, &[wrong_type]);
     assert_eq!(
         env.for_rule(&rule),
         RuleEnv::Skip(PRUNE_REF_UNSUPPORTED_TYPE)
@@ -575,7 +577,7 @@ fn u12b_builder_refuses_env_ref_to_absent_transport() {
         type_field: Some("dhcp".into()),
         ..local
     };
-    let env = NetworkEnv::new(&profiles, Platform::Win, false, false, &[ok]);
+    let env = NetworkEnv::new(&profiles, &WIN, &[ok]);
     assert!(matches!(env.for_rule(&rule), RuleEnv::Conditions(_)));
 }
 
@@ -800,4 +802,305 @@ fn reserved_netenv_id_collision_never_duplicates_tag_nor_leaks_bad_ref() {
         }],
         "应由 builder（第一道）以类型判据剔除并带 rule_id"
     );
+}
+
+// ── N2 ─────────────────────────────────────────────────────────────────────────
+
+fn generate_suppressed(cfg: &UserConfig, platform: &str, suppressed: bool) -> Out {
+    let mut d = deps(platform, false, "/fake/custom-rules");
+    d.netenv_dhcp_suppressed = suppressed;
+    let outcome =
+        generate_sing_box_config_with_report(cfg, &BTreeMap::new(), &d).expect("生成配置");
+    Out {
+        json: serde_json::to_value(&outcome.config).expect("序列化"),
+        pruned: outcome.pruned_env_rules,
+    }
+}
+
+fn netenv_action() -> Value {
+    json!({"type": "server", "serverId": BUILTIN_NETENV_DHCP_ID})
+}
+
+/// N2-A：dhcp 源 + 地址段只有 IPv6 ⇒ 规则照常生成，但以告警原因码进同一份报告（不是剪枝）。
+/// 反向对照：IPv4 地址段 / system 源的 IPv6 地址段都不告警。
+#[test]
+fn n2a_dhcp_ipv6_only_address_is_reported_as_warning_not_pruned() {
+    let cfg = config(json!({
+        "networkProfiles": [profile("np", &["240e:37a:ad00:b100::1/128"], &[], "dhcp")],
+        "dnsRules": [dns_rule("r-dns", "corp.example", Some("np"), domestic())],
+    }));
+    let out = generate(&cfg, "win32", false);
+    let rules = rules_mentioning(&out, "dns", "corp.example");
+    assert_eq!(rules.len(), 1, "告警不剪枝：规则必须照常生成");
+    assert_eq!(
+        rules[0]["dns_server_address"],
+        json!({NETENV_DNS_TAG: ["240e:37a:ad00:b100::1/128"]})
+    );
+    assert_eq!(
+        out.pruned,
+        [PrunedEnvRule {
+            rule_id: Some("r-dns".into()),
+            reason: WARN_DHCP_IPV6_ONLY,
+        }]
+    );
+    assert!(out.pruned[0].is_warning());
+
+    let v4 = config(json!({
+        "networkProfiles": [profile("np", &["192.168.10.1/32"], &[], "dhcp")],
+        "dnsRules": [dns_rule("r-dns", "corp.example", Some("np"), domestic())],
+    }));
+    assert!(
+        generate(&v4, "win32", false).pruned.is_empty(),
+        "IPv4 地址段不告警"
+    );
+    let system_v6 = config(json!({
+        "networkProfiles": [profile("np", &["240e::/16"], &[], "system")],
+        "dnsRules": [dns_rule("r-dns", "corp.example", Some("np"), domestic())],
+    }));
+    assert!(
+        generate(&system_v6, "linux", false).pruned.is_empty(),
+        "system 源读得到 IPv6 DNS，不告警"
+    );
+}
+
+/// N2-A 的查询接口同判据：available 仍为 true，reason 为告警码。
+#[test]
+fn n2a_resolved_probe_reports_v6_only_warning_as_available() {
+    let facts = ProbeFacts {
+        platform: Platform::Win,
+        ..WIN
+    };
+    let got = resolved_probe(&np(NetworkProbeSource::Dhcp, &["240e::/16"], &[]), &facts);
+    assert_eq!(got.probe_source, ProbeSourceKind::Dhcp);
+    assert!(got.available);
+    assert_eq!(got.reason, Some(ProbeReason::DhcpIpv6Only));
+    let json = serde_json::to_value(&got).unwrap();
+    assert_eq!(
+        json,
+        json!({"profileId": "np", "probeSource": "dhcp", "available": true,
+            "reason": "dhcpIpv6Only"})
+    );
+    let clean = resolved_probe(
+        &np(NetworkProbeSource::System, &["10.0.0.0/8"], &[]),
+        &facts,
+    );
+    assert_eq!(
+        serde_json::to_value(&clean).unwrap()["reason"],
+        Value::Null,
+        "可用且无告警时 reason 必须序列化为 null（IPC 契约）"
+    );
+}
+
+/// N2-B：Linux 系统代理（核无特权）下 DNS 规则动作引用内置 `builtin-netenv-dhcp` ⇒ 整条剔除并报
+/// `PROBE_UNAVAILABLE`，不生成 dns-netenv，也不退化到 group 里别的成员。正向对照：Linux TUN 照常生成。
+#[test]
+fn n2b_linux_system_proxy_builtin_netenv_action_is_pruned_not_rerouted() {
+    let rules = json!([
+        dns_rule("r-d5", "corp.example", None, netenv_action()),
+        dns_rule(
+            "r-grp",
+            "grp.example",
+            None,
+            json!({"type": "group", "groupId": "g1"})
+        ),
+    ]);
+    let groups = json!([{"id": "g1", "name": "g1", "enabled": true, "mode": "race",
+        "members": [BUILTIN_NETENV_DHCP_ID, "builtin-domestic"]}]);
+    let cfg = config(json!({"dnsRules": rules, "dnsServerGroups": groups}));
+    let out = generate(&cfg, "linux", false);
+    assert!(!server_tags(&out).contains(&NETENV_DNS_TAG.to_string()));
+    assert!(rules_mentioning(&out, "dns", "corp.example").is_empty());
+    assert!(
+        rules_mentioning(&out, "dns", "grp.example").is_empty(),
+        "group 含内置解析器时不得退化成只剩其它成员"
+    );
+    assert_eq!(
+        out.pruned,
+        [
+            PrunedEnvRule {
+                rule_id: Some("r-d5".into()),
+                reason: PRUNE_PROBE_UNAVAILABLE,
+            },
+            PrunedEnvRule {
+                rule_id: Some("r-grp".into()),
+                reason: PRUNE_PROBE_UNAVAILABLE,
+            },
+        ]
+    );
+
+    let mut tun = cfg.clone();
+    tun.proxy_mode_type = crate::user_config::ProxyModeType::Tun;
+    let out = generate(&tun, "linux", false);
+    assert!(server_tags(&out).contains(&NETENV_DNS_TAG.to_string()));
+    assert_eq!(
+        rules_mentioning(&out, "dns", "corp.example")[0]["server"],
+        NETENV_DNS_TAG
+    );
+    assert!(out.pruned.is_empty(), "{:?}", out.pruned);
+}
+
+/// followRouteDefault 解出的默认解析器是内置 `builtin-netenv-dhcp` 时同样算「用到」：生成 dns-netenv
+/// 并路由到它（此前只看显式 server/group/hostsFirst，默认腿漏了 ⇒ 不生成 transport ⇒ 规则静默丢失）。
+#[test]
+fn n2b_follow_route_default_to_builtin_netenv_counts_as_use() {
+    let cfg = config(json!({
+        "dnsDefaults": {"directServerId": BUILTIN_NETENV_DHCP_ID,
+            "proxyServerId": "builtin-remote"},
+        "dnsRules": [dns_rule("r-f", "corp.example", None,
+            json!({"type": "followRouteDefault"}))],
+    }));
+    let out = generate(&cfg, "win32", false);
+    assert!(server_tags(&out).contains(&NETENV_DNS_TAG.to_string()));
+    assert_eq!(
+        rules_mentioning(&out, "dns", "corp.example")[0]["server"],
+        NETENV_DNS_TAG
+    );
+    let out = generate(&cfg, "linux", false);
+    assert_eq!(
+        out.pruned,
+        [PrunedEnvRule {
+            rule_id: Some("r-f".into()),
+            reason: PRUNE_PROBE_UNAVAILABLE,
+        }]
+    );
+}
+
+/// R4：运行时剔除 dhcp transport 重试（`netenv_dhcp_suppressed`）⇒ dhcp 源场景规则与内置解析器规则
+/// 都以 `DHCP_MONITOR_MISSING` 剔除，dns-netenv 不生成；system 源规则不受影响。反向对照：不剔除时照常。
+#[test]
+fn r4_suppressed_dhcp_prunes_netenv_users_and_keeps_system_rules() {
+    let cfg = config(json!({
+        "networkProfiles": [
+            profile("np-dhcp", &[], &["corp.example"], "auto"),
+            profile("np-sys", &["10.20.0.0/16"], &[], "system"),
+        ],
+        "dnsRules": [
+            dns_rule("r-dhcp", "corp.example", Some("np-dhcp"), domestic()),
+            dns_rule("r-sys", "sys.example", Some("np-sys"), domestic()),
+            dns_rule("r-d5", "d5.example", None, netenv_action()),
+        ],
+    }));
+    let out = generate_suppressed(&cfg, "win32", true);
+    assert!(!server_tags(&out).contains(&NETENV_DNS_TAG.to_string()));
+    assert!(rules_mentioning(&out, "dns", "corp.example").is_empty());
+    assert!(rules_mentioning(&out, "dns", "d5.example").is_empty());
+    assert_eq!(rules_mentioning(&out, "dns", "sys.example").len(), 1);
+    for id in ["r-dhcp", "r-d5"] {
+        assert!(
+            out.pruned.contains(&PrunedEnvRule {
+                rule_id: Some(id.into()),
+                reason: PRUNE_DHCP_MONITOR_MISSING,
+            }),
+            "{id}：{:?}",
+            out.pruned
+        );
+    }
+    assert_eq!(out.pruned.len(), 2, "{:?}", out.pruned);
+
+    let out = generate_suppressed(&cfg, "win32", false);
+    assert!(server_tags(&out).contains(&NETENV_DNS_TAG.to_string()));
+    assert!(out.pruned.is_empty(), "{:?}", out.pruned);
+}
+
+/// IPC `reason` 的全部取值（camelCase，N3 按名映射文案）。牙：改任一变体名 / 去掉 rename_all → 转红。
+#[test]
+fn n2_probe_reason_wire_names_are_camel_case() {
+    let names: Vec<Value> = [
+        ProbeReason::ProfileInvalid,
+        ProbeReason::DhcpNeedsPrivilege,
+        ProbeReason::SystemNoSearchDomain,
+        ProbeReason::DhcpMonitorMissing,
+        ProbeReason::DhcpIpv6Only,
+    ]
+    .iter()
+    .map(|r| serde_json::to_value(r).unwrap())
+    .collect();
+    assert_eq!(
+        names,
+        [
+            json!("profileInvalid"),
+            json!("dhcpNeedsPrivilege"),
+            json!("systemNoSearchDomain"),
+            json!("dhcpMonitorMissing"),
+            json!("dhcpIpv6Only"),
+        ]
+    );
+    let linux = ProbeFacts {
+        platform: Platform::Linux,
+        ..WIN
+    };
+    let dhcp_on_linux = resolved_probe(&np(NetworkProbeSource::Dhcp, &["10.0.0.0/8"], &[]), &linux);
+    assert_eq!(
+        (dhcp_on_linux.probe_source, dhcp_on_linux.reason),
+        (ProbeSourceKind::Dhcp, Some(ProbeReason::DhcpNeedsPrivilege))
+    );
+    let search_only_win = resolved_probe(
+        &np(NetworkProbeSource::System, &[], &["corp.example"]),
+        &WIN,
+    );
+    assert_eq!(
+        (search_only_win.probe_source, search_only_win.reason),
+        (
+            ProbeSourceKind::System,
+            Some(ProbeReason::SystemNoSearchDomain)
+        )
+    );
+}
+
+/// 内置解析器可用性查询与生成侧 B 同判据：不可用 ⇔ 引用它的 DNS 规则被 `dns_action_skip` 剔除；
+/// JSON 形状即 IPC 契约（reason camelCase / null）。牙：让查询不看 `dhcp_unavailable`（恒可用）→ 转红。
+#[test]
+fn n2_builtin_dhcp_status_matches_generation_side_b() {
+    let cfg = config(json!({
+        "dnsRules": [dns_rule("r-d5", "corp.example", None, netenv_action())],
+    }));
+    let rule = cfg.ordered_dns_rules()[0].clone();
+    let cases = [
+        (
+            Platform::Linux,
+            false,
+            false,
+            json!({"available": false, "reason": "dhcpNeedsPrivilege"}),
+        ),
+        (
+            Platform::Linux,
+            true,
+            false,
+            json!({"available": true, "reason": null}),
+        ),
+        (
+            Platform::Linux,
+            true,
+            true,
+            json!({"available": false, "reason": "dhcpMonitorMissing"}),
+        ),
+        (
+            Platform::Win,
+            false,
+            false,
+            json!({"available": true, "reason": null}),
+        ),
+        (
+            Platform::Mac,
+            false,
+            false,
+            json!({"available": true, "reason": null}),
+        ),
+    ];
+    for (platform, tun, suppressed, want) in cases {
+        let facts = ProbeFacts {
+            platform,
+            tun,
+            takeover_active: false,
+            dhcp_suppressed: suppressed,
+        };
+        let status = builtin_dhcp_status(&facts);
+        assert_eq!(serde_json::to_value(status).unwrap(), want, "{facts:?}");
+        let skipped = NetworkEnv::new(&[], &facts, &[]).dns_action_skip(&rule, &cfg);
+        assert_eq!(
+            skipped.is_some(),
+            !status.available,
+            "查询与生成侧 B 必须同判据：{facts:?}"
+        );
+    }
 }

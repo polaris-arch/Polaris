@@ -303,6 +303,72 @@ pub fn validate_config(value: &mut Value) -> Result<(), crate::StoreError> {
     Ok(())
 }
 
+/// **只在写入时**跑的校验（[`crate::store::ConfigStore::canonicalize_for_save`]）：拒掉「形状合法但写进去
+/// 就永不生效 / 会与保留资源撞 tag」的值。
+///
+/// **为什么不放进 [`validate_config`]**：那个函数 load 也跑，load 失败 = 整份配置回落默认（见
+/// `ConfigStore::load` 的 `fallback_corrupt`）。一个场景写错一个网段不该让用户丢掉全部配置；写入时拒掉、
+/// 报出是哪个值，用户改掉即可。
+///
+/// - 网络场景的 `dnsServerCidrs` 逐值必须是合法 CIDR / 裸 IP，`searchDomains` 逐值必须是合法域名
+///   （生成侧对非法值是静默丢弃，写入时拒掉才不会「配了但永不命中」）。
+/// - 保留 id `builtin-netenv-dhcp`（D5 内置解析器）不得被用户 DNS 资源 / DNS 组 / 场景占用：占用后
+///   动作引用会被解析到用户那条资源上，而生成侧的内置 transport 又不能重复生成同名 tag。
+///
+/// 规则 `networkProfileId` 指向不存在的场景**不在这里拦**：删场景、导入缺场景的备份都合法，
+/// 生成侧 fail-closed；只在规则 IPC 写入时拦（`commands::rules` 的 `RULE_INVALID`）。
+pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
+    use polaris_config_engine::user_config::{is_valid_search_domain, BUILTIN_NETENV_DHCP_ID};
+    for key in ["dnsServers", "dnsServerGroups", "networkProfiles"] {
+        let squatted = value
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some(BUILTIN_NETENV_DHCP_ID));
+        if squatted {
+            return Err(crate::StoreError::validation(format!(
+                "{key}: id \"{BUILTIN_NETENV_DHCP_ID}\" is reserved for the built-in DHCP resolver"
+            )));
+        }
+    }
+    for profile in value
+        .get("networkProfiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = profile.get("id").and_then(Value::as_str).unwrap_or("");
+        let values = |field: &str| -> Vec<&str> {
+            profile
+                .get("match")
+                .and_then(|m| m.get(field))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect()
+        };
+        if let Some(bad) = values("dnsServerCidrs")
+            .into_iter()
+            .find(|v| !is_valid_ip_cidr(v.trim()))
+        {
+            return Err(crate::StoreError::validation(format!(
+                "networkProfiles[{id}].match.dnsServerCidrs: invalid CIDR or IP \"{bad}\""
+            )));
+        }
+        if let Some(bad) = values("searchDomains")
+            .into_iter()
+            .find(|v| !is_valid_search_domain(v))
+        {
+            return Err(crate::StoreError::validation(format!(
+                "networkProfiles[{id}].match.searchDomains: invalid domain \"{bad}\""
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 校验端口字段范围。required=true 时缺失/非法 → Err。
 fn validate_port(
     obj: &serde_json::Map<String, Value>,

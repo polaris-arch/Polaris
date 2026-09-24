@@ -28,7 +28,7 @@ use crate::builder::helpers::{build_id_to_tag_map, ServerLike};
 use crate::builder::inbounds::{build_inbounds, InboundsDeps};
 use crate::builder::log::{build_log_config, LogBuildDeps, LogConfigInput};
 use crate::builder::network_env::{
-    builder_skipped_rules, prune_invalid_env_condition_refs, NetworkEnv, PrunedEnvRule,
+    builder_skipped_rules, prune_invalid_env_condition_refs, NetworkEnv, ProbeFacts, PrunedEnvRule,
 };
 use crate::builder::orchestration::fix_route_dead_references;
 use crate::builder::outbounds::OutboundsDeps;
@@ -211,6 +211,10 @@ pub struct GenerateConfigDeps {
     /// **经 deps 注入而不进 `DnsConfig` 投影**：把 `takeoverSystemDns` 加进投影会改变
     /// `config_generation_norm` 的投影面（额外的行为变化）。无场景规则时本值不影响任何输出。
     pub system_dns_takeover_active: bool,
+    /// 本次会话 dhcp transport（`dns-netenv`）已被运行时剔除：起核报 `missing monitor for auto DHCP`
+    /// 后兜底重试一次时置 `true`（spec R4）。解析为 dhcp 的场景规则与引用内置 `builtin-netenv-dhcp`
+    /// 的 DNS 规则本次都不生成并进报告。无场景/无内置解析器引用时本值不影响任何输出。
+    pub netenv_dhcp_suppressed: bool,
     /// 运行期观测到的 tailnet 地址（serverId → 裸地址）。
     /// 见 [`crate::builder::endpoint_routes::ObservedTailnetAddresses`]。
     ///
@@ -269,7 +273,8 @@ pub struct GenerateOutcome {
     /// （`RULE_RESOURCES_MISSING`）并收紧出口自证白名单。资源齐全时恒空 ⇒ 不产生噪音。
     pub pruned_rule_set_tags: Vec<String>,
     /// 网络场景规则的剔除报告：场景不存在/停用、探测源本机不可用（builder 阶段，带 `rule_id`），
-    /// 以及后置剪枝剔除的环境引用不合格规则（`rule_id = None`）。**空 = 没有场景规则被丢**。
+    /// 以及后置剪枝剔除的环境引用不合格规则（`rule_id = None`）；另含「带告警仍生成」的条目
+    /// （[`PrunedEnvRule::is_warning`]，如 dhcp 源只写了 IPv6 地址段）。**空 = 无剔除、无告警**。
     pub pruned_env_rules: Vec<PrunedEnvRule>,
 }
 
@@ -425,15 +430,19 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         // ext JSON source 存在性走 existsSync 等价（生产真 FS）。见 RouteConfigDeps 处同款说明。
         exists_fn: crate::builder::custom_rule_files::ext_rule_file_exists,
         system_dns_takeover_active: deps.system_dns_takeover_active,
+        netenv_dhcp_suppressed: deps.netenv_dhcp_suppressed,
     };
     let mut dns = build_dns_config(&cfg, &id_to_tag_map, &dns_deps);
     // 网络场景环境项按**已生成的** DNS server 预解析（第一道防线：只引用类型合格、确实生成了的 tag）。
     // DNS builder 内部以同一函数、同一 server 集自建一份，二者同源。
     let network_env = NetworkEnv::new(
         &cfg.network_profiles,
-        Platform::parse(deps.platform.as_str()),
-        matches!(cfg.proxy_mode_type, ProxyModeType::Tun),
-        deps.system_dns_takeover_active,
+        &ProbeFacts {
+            platform: Platform::parse(deps.platform.as_str()),
+            tun: matches!(cfg.proxy_mode_type, ProxyModeType::Tun),
+            takeover_active: deps.system_dns_takeover_active,
+            dhcp_suppressed: deps.netenv_dhcp_suppressed,
+        },
         &dns.servers,
     );
 
@@ -559,11 +568,12 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
     let mut pruned_env_rules = builder_skipped_rules(&cfg, &network_env);
     pruned_env_rules.extend(prune_invalid_env_condition_refs(&mut singbox));
     if !pruned_env_rules.is_empty() {
+        let warned = pruned_env_rules.iter().filter(|r| r.is_warning()).count();
         (deps.log)(
             LogLevel::Warn,
             &format!(
-                "网络场景：{} 条规则因场景失效/探测源不可用/环境引用不合格未生成",
-                pruned_env_rules.len()
+                "网络场景：{} 条规则因场景失效/探测源不可用/环境引用不合格未生成，{warned} 条带告警照常生成",
+                pruned_env_rules.len() - warned
             ),
         );
     }

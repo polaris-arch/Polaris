@@ -129,6 +129,7 @@ impl ConfigStore {
         let mut value = config.clone();
         crate::sanitize::sanitize_value_in_place_pub(&mut value);
         validate_config(&mut value)?;
+        crate::validate::validate_for_save(&value)?;
         Ok(value)
     }
 

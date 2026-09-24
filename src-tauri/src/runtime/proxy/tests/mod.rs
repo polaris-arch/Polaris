@@ -41,6 +41,7 @@ mod lifecycle;
 mod login_fallback;
 mod module_boundary;
 mod network_monitor;
+mod network_profile;
 mod platform_contracts;
 mod process_supervision;
 mod recovery;

@@ -88,6 +88,23 @@ pub fn normalize_search_domain(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase())
 }
 
+/// 搜索域逐值校验（store 写入层用）：规范化后非空，按 `.` 分出的每个标签 1–63 个字符、只含 ASCII
+/// 字母数字与 `-`/`_`，总长 ≤253。内核对 `dns_search_domain` 做规范化后**精确**比较（spec K1），
+/// 通配、空格、空标签一律不可能命中，落盘前拒掉，免得用户以为配了实际永不命中。
+#[must_use]
+pub fn is_valid_search_domain(raw: &str) -> bool {
+    let Some(domain) = normalize_search_domain(raw) else {
+        return false;
+    };
+    domain.len() <= 253
+        && domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
 /// `networkProfiles` 的容错反序列化：**逐条**解析，坏条目（类型不对、未知 probe 值…）与缺 id 的条目
 /// 丢弃，整份 `UserConfig` 照常读出；键的值不是数组时视为空。
 ///

@@ -31,6 +31,21 @@ fn validate_rule_payload(rule: &Value) -> Result<(), String> {
     }
 }
 
+/// 规则挂的网络场景必须在**本次写入所基于的那份配置**里存在（spec §7 写入校验，报 `RULE_INVALID`）。
+///
+/// 只在规则 IPC 写入时拦：删场景、导入缺场景的备份都合法（生成侧 fail-closed，引用失效的规则不生成），
+/// 故不放进 store 写入层。在配置事务闭包里判，与写入同一把锁，不存在「判时在、写时已删」的窗口。
+fn network_profile_ref_error(cfg: &Value, rule: &Value) -> Option<String> {
+    let id = rule.get("networkProfileId").and_then(Value::as_str)?;
+    let exists = cfg
+        .get("networkProfiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|profile| profile.get("id").and_then(Value::as_str) == Some(id));
+    (!exists).then(|| format!("网络场景不存在: {id}"))
+}
+
 fn plane_keys(plane: &str) -> Result<(&'static str, &'static str), &'static str> {
     match plane {
         "route" => Ok(("trafficRules", "routeRuleOrder")),
@@ -146,16 +161,20 @@ pub fn rules_add(
     }
     let created = new_rule.clone();
     match state.config().update(|cfg| {
+        if let Some(msg) = network_profile_ref_error(cfg, &new_rule) {
+            return Decision::Skip(Err(msg));
+        }
         let mut rules = plane_rules(cfg, collection_key);
         rules.push(new_rule);
         sync_plane_order(cfg, order_key, &rules);
         write_plane_rules(cfg, collection_key, rules);
-        Decision::Write(())
+        Decision::Write(Ok(()))
     }) {
-        Ok(((), Some(cfg))) => {
+        Ok((Ok(()), Some(cfg))) => {
             broadcast_config_changed(&app, &cfg);
             ApiResponse::ok(created)
         }
+        Ok((Err(msg), None)) => ApiResponse::err_with_code(msg, ERR_RULE_INVALID),
         Ok(_) => unreachable!("rules_add decision and persistence must agree"),
         Err(e) => ApiResponse::err(format!("{e}")),
     }
@@ -190,12 +209,15 @@ pub fn rules_update(
         return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
     }
     match state.config().update(|cfg| {
+        if let Some(msg) = network_profile_ref_error(cfg, &rule) {
+            return Decision::Skip(Err((msg, Some(ERR_RULE_INVALID))));
+        }
         let mut rules = plane_rules(cfg, collection_key);
         let Some(idx) = rules
             .iter()
             .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(&id))
         else {
-            return Decision::Skip(Err(format!("Rule not found: {id}")));
+            return Decision::Skip(Err((format!("Rule not found: {id}"), None)));
         };
         rules[idx] = rule;
         sync_plane_order(cfg, order_key, &rules);
@@ -206,7 +228,8 @@ pub fn rules_update(
             broadcast_config_changed(&app, &cfg);
             ok_void()
         }
-        Ok((Err(error), None)) => ApiResponse::err(error),
+        Ok((Err((error, Some(code))), None)) => ApiResponse::err_with_code(error, code),
+        Ok((Err((error, None)), None)) => ApiResponse::err(error),
         Ok(_) => unreachable!("rules_update decision and persistence must agree"),
         Err(e) => ApiResponse::err(format!("{e}")),
     }

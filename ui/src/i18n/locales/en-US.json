@@ -316,6 +316,7 @@
     "meshTunnelVpnError": "This node's connection reported an error; its private network may be unreachable. Try connecting again.",
     "myDevice": "My Device",
     "networkCheckTip": "Network check (latency · unlock · exit info)",
+    "networkProfileRulesPruned": "Some network-profile rules are not in effect (profile invalid, probe unavailable on this device, or criteria that can never match) · check network profiles on the Routing page",
     "networkSettingsTip": "Network settings",
     "noActiveConnections": "No active connections",
     "noServerConfig": "No server configured",

@@ -316,6 +316,7 @@
     "meshTunnelVpnError": "該節點的連線發生錯誤，內網可能無法存取，請嘗試重新連線。",
     "myDevice": "我的裝置",
     "networkCheckTip": "網路檢測（延遲 · 解鎖 · 出口資訊）",
+    "networkProfileRulesPruned": "部分網路場景規則本次未生效（場景失效、探測來源本機不可用或判據永不命中）· 請到「路由」頁檢查網路場景",
     "networkSettingsTip": "網路設定",
     "noActiveConnections": "暫無活動連線",
     "noServerConfig": "暫無伺服器設定",

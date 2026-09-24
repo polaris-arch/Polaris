@@ -271,3 +271,16 @@ pub(super) fn dns_takeover_enabled(config: &Value) -> Option<bool> {
         .and_then(|d| d.get("takeoverSystemDns"))
         .and_then(Value::as_bool)
 }
+
+/// 网络场景 auto 探测源要的运行期事实「macOS + TUN + 接管系统 DNS 生效」（spec §4.4）。
+///
+/// 与起核尾 C7 接管门同一组输入、同一口径（`is_tun && takeover != Some(false)`），只多一个平台前提：
+/// Linux 的接管加在 TUN link 上、不影响物理网卡 link 的 `local` 取值，Windows TUN 下不接管 —— 只有 mac
+/// 的 `networksetup` 接管会让 `local` 看到受控 IP。起核腿与「本机解析后的探测源」查询接口都只调它。
+pub(super) fn system_dns_takeover_active(
+    platform: polaris_helper_proto::Platform,
+    is_tun: bool,
+    takeover: Option<bool>,
+) -> bool {
+    platform == polaris_helper_proto::Platform::Mac && is_tun && takeover != Some(false)
+}

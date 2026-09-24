@@ -358,6 +358,13 @@ pub mod code {
     ///
     /// 非终态（核确在跑，只是分流退化），同走 `set_nonfatal_error`。渲染端据此引导去「规则资源」页下载。
     pub const RULE_RESOURCES_MISSING: &str = "RULE_RESOURCES_MISSING";
+    /// **网络场景规则未生成 / 可能永不命中**：本次生成的网络场景报告（`GenerateOutcome::pruned_env_rules`）
+    /// 非空 —— 场景不存在/停用、探测源本机不可用、内置 DHCP 解析器本机不可用、R4 剔除了 dhcp transport，
+    /// 或 dhcp 源只写了 IPv6 地址段（告警，规则仍生成）。判据是生成侧交回的清单，非猜 message；
+    /// **无问题时清单恒空 ⇒ 不发，且清掉本码**（修好即消失）。
+    ///
+    /// 非终态（核确在跑），同走 `set_nonfatal_error`。先例：[`RULE_RESOURCES_MISSING`]。
+    pub const NETWORK_PROFILE_RULES_PRUNED: &str = "NETWORK_PROFILE_RULES_PRUNED";
     /// **自动故障切换落空**：连通性连续失败已**真的触发**了自动换节点、候选也规划出来了，但有节点
     /// 因为「切过去要整核重启」（`needs_restart`）被挡在切换门外，本轮没能换成 ——「无感自愈」在这里
     /// 退化成「无感地什么都没发生」，用户就一直干等在一条不通的代理里。
@@ -1167,6 +1174,9 @@ pub struct ProxyRuntime {
     /// 清账点**只有核真正按磁盘配置起来那一刻**（与 `startup_snapshot` 同刻）+ 停核复位。
     /// 后续的 NoOp / 热切腿都**不清**：它们没有把先前欠下的那份配置送进核。
     restart_deferred: AtomicBool,
+    /// 网络场景 R4 兜底的会话态：本次起核因 `missing monitor for auto DHCP` 剔除了 dhcp transport。
+    /// `start_inner` 入口复位；生成依赖与「本机解析后的探测源」查询都读它（二者同源）。
+    netenv_dhcp_suppressed: AtomicBool,
     /// 崩溃自愈状态机（core-supervisor 既有决策机：退避 / 上限 / 让位 / 补发全在其中）。
     ///
     /// 后台崩溃监测任务检测到核**意外**退出时喂它决策，本层只执行「退避 sleep + restart」的 I/O。
@@ -1432,6 +1442,7 @@ impl ProxyRuntime {
             switch_serial: AsyncMutex::new(()),
             selector_reconcile: Arc::new(SelectorReconcileOwner::default()),
             restart_deferred: AtomicBool::new(false),
+            netenv_dhcp_suppressed: AtomicBool::new(false),
             crash_recovery: Mutex::new(CrashRecoveryMachine::default()),
             diagnostics: Mutex::new(DiagnosticCounters::new()),
             kernel_gate_cache: Mutex::new(kernel_gate_cache),

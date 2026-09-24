@@ -44,6 +44,10 @@ export const IPC_CHANNELS = {
   // Polaris **自己的**组网节点之间 force-route 段互相吸收的结算（谁抢了谁的段、谁因此零覆盖）。
   // 与上一条成对、射程不重叠：那条是「别人的隧道」，这条是「我自己的节点」。
   ENDPOINT_FORCE_ROUTE_REPORT: 'endpoint_force_route_report',
+  // 网络场景：本机解析后的探测源（只读；场景写入走 CONFIG_PATCH 的 networkProfiles）
+  NETWORK_PROFILE_RESOLVED_SOURCES: 'network_profile_resolved_sources',
+  // 内置解析器 builtin-netenv-dhcp 本机是否可用（只读）
+  NETWORK_PROFILE_BUILTIN_DHCP_STATUS: 'network_profile_builtin_dhcp_status',
   CONFIG_GET_PRIVACY_MODE: 'config_get_privacy_mode',
   CONFIG_SET_PRIVACY_MODE: 'config_set_privacy_mode',
   PRIVACY_SET_PASSWORD: 'privacy_set_password',

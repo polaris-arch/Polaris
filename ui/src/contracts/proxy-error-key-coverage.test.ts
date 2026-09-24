@@ -244,6 +244,8 @@ const MUST_BE_ROUTED_IN_APP = [
   // 自动换节点落空（可用节点都要整核重启才能切过去）：整件事全程在后台发生、用户完全无感。
   // 不上屏 = 用户只知道「网怎么突然不通了」，不知道自己其实可以手动换个节点或重启代理。
   'AUTO_SWITCH_NEEDS_RESTART',
+  // 网络场景规则没生成 / 可能永不命中：不上屏 = 用户以为「在公司才直连」的规则在生效，其实没有。
+  'NETWORK_PROFILE_RULES_PRUNED',
 ] as const;
 
 describe('G3 接线：App.tsx 的分腿与映射表对得上，且文案真的走解析器', () => {

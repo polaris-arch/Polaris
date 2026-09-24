@@ -66,6 +66,7 @@ fn sanitize_value_in_place(value: &mut Value) {
     ensure_array_or_remove(obj, "dnsRuleOrder");
     ensure_array_or_remove(obj, "dnsServers");
     ensure_array_or_remove(obj, "dnsServerGroups");
+    ensure_array_or_remove(obj, "networkProfiles");
     ensure_array_or_remove(obj, "appRules");
     ensure_array_or_remove(obj, "customAppPresets");
     ensure_array_or_remove(obj, "ruleResources");
@@ -171,6 +172,7 @@ fn sanitize_value_in_place(value: &mut Value) {
     sanitize_rules(obj, "trafficRules", false);
     sanitize_rules(obj, "dnsRules", false);
     sanitize_dns_policy(obj);
+    sanitize_network_profiles(obj);
     sanitize_tun_config(obj);
     sanitize_dns_config(obj);
 }
@@ -591,6 +593,47 @@ fn sanitize_dns_policy(obj: &mut Map<String, Value>) {
         .is_err()
     }) {
         obj.remove("routeDefaults");
+    }
+}
+
+/// 网络场景形状清洗（spec §7 sanitize）：缺 id / 重复 id / 结构坏的条目逐条丢弃（不能让整份配置失败；
+/// 引用它的规则在生成侧按「引用失效」不生成，fail-closed）；`searchDomains` 规范化（去首尾空白与点、
+/// 小写，空值丢弃、去重）。值是否合法（CIDR / 域名形状）归写入校验
+/// [`crate::validate::validate_for_save`]，这里不静默吞。
+fn sanitize_network_profiles(obj: &mut Map<String, Value>) {
+    use polaris_config_engine::user_config::network_profile::normalize_search_domain;
+    let Some(Value::Array(profiles)) = obj.get_mut("networkProfiles") else {
+        return;
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    profiles.retain(|value| {
+        let id = value.get("id").and_then(Value::as_str).unwrap_or("").trim();
+        !id.is_empty()
+            && seen.insert(id.to_string())
+            && serde_json::from_value::<polaris_config_engine::user_config::NetworkProfile>(
+                value.clone(),
+            )
+            .is_ok()
+    });
+    for profile in profiles.iter_mut() {
+        let Some(Value::Array(domains)) = profile
+            .get_mut("match")
+            .and_then(|m| m.get_mut("searchDomains"))
+        else {
+            continue;
+        };
+        let mut normalized: Vec<Value> = Vec::with_capacity(domains.len());
+        for domain in domains
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(normalize_search_domain)
+        {
+            let domain = Value::String(domain);
+            if !normalized.contains(&domain) {
+                normalized.push(domain);
+            }
+        }
+        *domains = normalized;
     }
 }
 

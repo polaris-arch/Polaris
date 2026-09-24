@@ -316,6 +316,7 @@
     "meshTunnelVpnError": "该节点的连接出错，内网可能无法访问，请尝试重新连接。",
     "myDevice": "我的设备",
     "networkCheckTip": "网络检测（延迟 · 解锁 · 出口信息）",
+    "networkProfileRulesPruned": "部分网络场景规则本次未生效（场景失效、探测源本机不可用或判据永不命中）· 请到「路由」页检查网络场景",
     "networkSettingsTip": "网络设置",
     "noActiveConnections": "暂无活动连接",
     "noServerConfig": "暂无服务器配置",

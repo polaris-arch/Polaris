@@ -970,3 +970,123 @@ fn data_fields_and_excluded_are_disjoint() {
         );
     }
 }
+
+// ── 网络场景随规则类导出 / 导入（N2，spec §7 D12）──────────────────────────────
+
+fn profile(id: &str, name: &str) -> Value {
+    json!({"id": id, "name": name, "enabled": true, "probe": "auto",
+        "match": {"dnsServerCidrs": ["10.20.0.0/16"]}})
+}
+
+fn with_scoped_rules() -> Value {
+    let mut c = cfg();
+    c["trafficRules"][0]["networkProfileId"] = json!("np-traffic");
+    c["dnsRules"][0]["networkProfileId"] = json!("np-dns");
+    c["networkProfiles"] = json!([
+        profile("np-traffic", "t"),
+        profile("np-dns", "d"),
+        profile("np-unused", "u"),
+    ]);
+    c
+}
+
+fn exported_ids(out: &Value) -> Option<Vec<String>> {
+    out.get("networkProfiles").map(|v| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    })
+}
+
+/// 导出：选了任一规则类就带上**全部**场景（含未被任何规则引用的）；不导规则时不外带（也不漏进通用设置）。
+/// 牙：改回按引用闭包 → np-unused 缺席 ⇒ 转红；删掉导出 → 规则类导出不带场景 ⇒ 转红。
+#[test]
+fn network_profiles_export_all_when_any_rule_category_selected() {
+    let c = with_scoped_rules();
+    let all = Some(vec![
+        "np-traffic".to_string(),
+        "np-dns".to_string(),
+        "np-unused".to_string(),
+    ]);
+    for selected in [
+        vec![C::CustomRules],
+        vec![C::DnsRules],
+        vec![C::CustomRules, C::DnsRules],
+    ] {
+        assert_eq!(
+            exported_ids(&pick_categories(&c, &selected)),
+            all,
+            "{selected:?}"
+        );
+    }
+    assert_eq!(
+        exported_ids(&pick_categories(&c, &[C::GeneralSettings, C::ManualNodes])),
+        None,
+        "networkProfiles 是数据字段：不随通用设置外带"
+    );
+}
+
+/// 导入按 id 合并：同 id 以备份为准，current 里其余场景保留，新 id 追加。
+/// 牙：合并改成整表替换 → np-local 丢失 ⇒ 转红。
+#[test]
+fn network_profiles_import_merges_by_id() {
+    let mut current = cfg();
+    current["networkProfiles"] = json!([profile("np-traffic", "old"), profile("np-local", "keep")]);
+    let backup = pick_categories(&with_scoped_rules(), &[C::CustomRules, C::DnsRules]);
+    let merged = merge_categories(&current, &backup, &[C::CustomRules]).config;
+    let got: Vec<(String, String)> = merged["networkProfiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().unwrap().into(),
+                p["name"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("np-traffic".into(), "t".into()),
+            ("np-local".into(), "keep".into()),
+            ("np-dns".into(), "d".into()),
+            ("np-unused".into(), "u".into()),
+        ]
+    );
+}
+
+/// 缺失场景 fail-closed：备份里的规则引用了一个哪边都没有的场景 ⇒ 导入照常、引用原样保留（**不**删引用
+/// 变成无条件规则）、写入层不拒；生成侧对它判「引用失效」整条不生成。
+/// 牙：导入时剥掉悬空 `networkProfileId` → 第一条断言转红；写入层对悬空引用报错 → 第二条转红。
+#[test]
+fn import_rule_with_missing_profile_keeps_reference_and_fails_closed() {
+    let mut backup = pick_categories(&cfg(), &[C::CustomRules]);
+    backup["trafficRules"][0]["networkProfileId"] = json!("np-gone");
+    let merged = merge_categories(&cfg(), &backup, &[C::CustomRules]).config;
+    assert_eq!(merged["trafficRules"][0]["networkProfileId"], "np-gone");
+
+    let mut full = crate::store::default_config();
+    full["trafficRules"] = merged["trafficRules"].clone();
+    let saved =
+        crate::ConfigStore::canonicalize_for_save(&full).expect("悬空场景引用不得让导入写入失败");
+
+    use polaris_config_engine::builder::network_env::{
+        NetworkEnv, ProbeFacts, RuleEnv, PRUNE_PROFILE_REF_INVALID,
+    };
+    let user: polaris_config_engine::user_config::UserConfig =
+        serde_json::from_value(saved).expect("UserConfig");
+    let facts = ProbeFacts {
+        platform: polaris_config_engine::builder::Platform::Linux,
+        tun: false,
+        takeover_active: false,
+        dhcp_suppressed: false,
+    };
+    let env = NetworkEnv::new(&user.network_profiles, &facts, &[]);
+    assert_eq!(
+        env.for_rule(&user.effective_traffic_rules()[0]),
+        RuleEnv::Skip(PRUNE_PROFILE_REF_INVALID)
+    );
+}

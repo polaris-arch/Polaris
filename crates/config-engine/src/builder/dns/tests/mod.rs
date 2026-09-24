@@ -29,6 +29,7 @@ fn deps_false() -> DnsConfigDeps {
         is_valid_srs_fn: |_| false,
         exists_fn: |_| false,
         system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
     }
 }
 

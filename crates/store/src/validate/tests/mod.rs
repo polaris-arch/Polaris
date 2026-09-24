@@ -213,3 +213,79 @@ fn validate_ignores_legacy_tun_stack_of_any_value() {
         );
     }
 }
+
+// ── 网络场景写入校验（N2，spec §7「写入校验」）─────────────────────────────────
+
+fn with_profiles(extra: serde_json::Value) -> serde_json::Value {
+    let mut cfg = crate::store::default_config();
+    for (k, v) in extra.as_object().expect("extra 必须是 object") {
+        cfg[k] = v.clone();
+    }
+    cfg
+}
+
+/// 合法场景可写；CIDR / 搜索域逐值校验，任一坏值整次写入被拒并点名那个值。
+/// 牙：删掉 `validate_for_save` 在 `canonicalize_for_save` 里的调用 → 三条 is_err 转红。
+#[test]
+fn save_rejects_bad_network_profile_values_and_accepts_good_ones() {
+    let good = with_profiles(
+        serde_json::json!({"networkProfiles": [{"id": "np", "name": "office",
+        "enabled": true, "probe": "auto",
+        "match": {"dnsServerCidrs": ["10.20.0.0/16", "192.168.10.1"], "searchDomains": ["Corp.Example."]}}]}),
+    );
+    let saved = crate::ConfigStore::canonicalize_for_save(&good).expect("合法场景必须可写");
+    assert_eq!(
+        saved["networkProfiles"][0]["match"]["searchDomains"],
+        serde_json::json!(["corp.example"]),
+        "写入前 sanitize 规范化搜索域"
+    );
+    for (field, bad) in [
+        ("dnsServerCidrs", "10.20.0.0/40"),
+        ("dnsServerCidrs", "not-an-ip"),
+        ("searchDomains", "corp example"),
+        ("searchDomains", "*.corp.example"),
+    ] {
+        let mut cfg = good.clone();
+        cfg["networkProfiles"][0]["match"][field] = serde_json::json!([bad]);
+        let err = crate::ConfigStore::canonicalize_for_save(&cfg)
+            .expect_err(&format!("{field}={bad} 必须被拒"));
+        assert!(format!("{err}").contains(bad), "错误信息应点名坏值：{err}");
+    }
+}
+
+/// 保留 id `builtin-netenv-dhcp` 不得被用户 DNS 资源 / DNS 组 / 场景占用；load 路径不受影响（不能因此
+/// 把整份配置回落默认）。牙：删掉保留 id 检查 → 三条 is_err 转红。
+#[test]
+fn save_rejects_reserved_netenv_id_but_load_validation_tolerates_it() {
+    let squats = [
+        (
+            "dnsServers",
+            serde_json::json!([{"id": "builtin-netenv-dhcp", "name": "x",
+            "enabled": true, "type": "udp", "outbound": {"type": "direct"}}]),
+        ),
+        (
+            "dnsServerGroups",
+            serde_json::json!([{"id": "builtin-netenv-dhcp", "name": "g",
+            "enabled": true, "mode": "race", "members": ["builtin-domestic"]}]),
+        ),
+        (
+            "networkProfiles",
+            serde_json::json!([{"id": "builtin-netenv-dhcp", "name": "p",
+            "enabled": true, "probe": "auto", "match": {"dnsServerCidrs": ["10.0.0.0/8"]}}]),
+        ),
+    ];
+    for (key, value) in squats {
+        let mut cfg = crate::store::default_config();
+        cfg[key] = value;
+        let err = crate::ConfigStore::canonicalize_for_save(&cfg)
+            .expect_err(&format!("{key} 占用保留 id 必须被拒"));
+        assert!(format!("{err}").contains("builtin-netenv-dhcp"), "{err}");
+        let mut loaded = cfg.clone();
+        assert!(
+            validate_config(&mut loaded).is_ok(),
+            "load 也跑 validate_config：保留 id 冲突不得让整份配置回落默认（{key}）"
+        );
+    }
+    let clean = crate::store::default_config();
+    assert!(crate::ConfigStore::canonicalize_for_save(&clean).is_ok());
+}

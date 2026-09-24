@@ -135,6 +135,7 @@ pub fn outbound_deps_for(platform: &str) -> GenerateConfigDeps {
         log: |_, _| {},
         on_degraded: || {},
         system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
     }
 }
 
@@ -192,6 +193,7 @@ pub fn full_config_deps(case: &SnapshotCase, temp: &TempDir) -> GenerateConfigDe
         log: |_, _| {},
         on_degraded: || {},
         system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
     }
 }
 

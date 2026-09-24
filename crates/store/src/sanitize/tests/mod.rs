@@ -198,3 +198,29 @@ fn empty_input_is_error() {
     let res = sanitize_config("");
     assert!(matches!(res, Err(crate::StoreError::Parse(_))));
 }
+
+/// 网络场景 sanitize（spec §7）：缺 id / 重复 id / 结构坏的条目丢弃，其余保留；搜索域去首尾点、小写、
+/// 去空、去重。牙：删掉 `sanitize_network_profiles` 调用 → 条目数与规范化断言转红。
+#[test]
+fn network_profiles_sanitize_drops_idless_entries_and_normalizes_domains() {
+    let json = r#"{
+        "proxyMode": "smart",
+        "proxyModeType": "systemProxy",
+        "networkProfiles": [
+            {"name": "no id", "match": {"dnsServerCidrs": ["10.0.0.0/8"]}},
+            {"id": "np", "name": "office", "match": {"searchDomains": [".Corp.Example.", "corp.example", "  ", "LAN"]}},
+            {"id": "np", "name": "dup"},
+            {"id": "bad", "probe": "sometimes"}
+        ]
+    }"#;
+    let v = sanitize_config(json).unwrap();
+    let profiles = v["networkProfiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 1, "{profiles:?}");
+    assert_eq!(profiles[0]["name"], "office", "重复 id 保留首个");
+    assert_eq!(
+        profiles[0]["match"]["searchDomains"],
+        serde_json::json!(["corp.example", "lan"])
+    );
+    let not_array = sanitize_config(r#"{"networkProfiles": {"id": "x"}}"#).unwrap();
+    assert!(not_array.get("networkProfiles").is_none(), "非数组整键删除");
+}

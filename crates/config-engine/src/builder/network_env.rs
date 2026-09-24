@@ -22,13 +22,13 @@ use std::collections::BTreeMap;
 use polaris_helper_proto::Platform;
 use serde::Serialize;
 
+use crate::builder::dns::follow_route_default_server_id;
 use crate::singbox::{DnsRule, DnsServer, RouteRule, SingBoxConfig};
 use crate::user_config::app_config::UserConfig;
 use crate::user_config::network_profile::{
     normalize_search_domain, NetworkProbeSource, NetworkProfile, BUILTIN_NETENV_DHCP_ID,
 };
-use crate::user_config::proxy_mode::ProxyModeType;
-use crate::user_config::rule::Rule;
+use crate::user_config::rule::{Rule, RuleAction};
 use crate::user_config::{is_valid_ip_cidr, DnsPolicyAction, DnsServerGroup};
 
 /// 系统 DNS transport（type local，DNS builder 恒生成）。
@@ -50,6 +50,108 @@ pub const PRUNE_PROBE_UNAVAILABLE: &str = "NETWORK_PROFILE_PROBE_UNAVAILABLE";
 pub const PRUNE_REF_MISSING: &str = "NETWORK_ENV_REF_MISSING";
 /// 环境项引用的 DNS server 类型不支持环境项。
 pub const PRUNE_REF_UNSUPPORTED_TYPE: &str = "NETWORK_ENV_REF_UNSUPPORTED_TYPE";
+/// 本次起核因 `missing monitor for auto DHCP` 失败后，运行时剔除 dhcp transport 重试（spec R4）：
+/// 解析为 dhcp 的场景规则与引用内置 `builtin-netenv-dhcp` 的 DNS 规则本次都不生成。
+pub const PRUNE_DHCP_MONITOR_MISSING: &str = "NETWORK_PROFILE_DHCP_MONITOR_MISSING";
+/// **告警，不剪枝**：探测源为 dhcp 而地址段判据只有 IPv6。DHCPv4 只下发 IPv4 DNS（N0 207 实测），
+/// 地址段判据永不命中；规则照常生成（与剪掉行为等价但保留用户意图），只让它可见。
+pub const WARN_DHCP_IPV6_ONLY: &str = "NETWORK_PROFILE_DHCP_IPV6_ONLY";
+
+/// 报告里「只告警、规则仍生成」的原因码；其余原因码 = 该规则本次未生成。
+pub const ENV_REPORT_WARNINGS: &[&str] = &[WARN_DHCP_IPV6_ONLY];
+
+/// 探测源判定的全部本机输入（生成侧与「本机解析后的探测源」查询接口共用同一份，渲染端不重算）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeFacts {
+    pub platform: Platform,
+    pub tun: bool,
+    /// 运行期事实「macOS + TUN + 接管系统 DNS 生效」（见 [`resolve_probe_source`]）。
+    pub takeover_active: bool,
+    /// 本次会话 dhcp transport 已被运行时剔除（spec R4：起核报 `missing monitor for auto DHCP`）。
+    pub dhcp_suppressed: bool,
+}
+
+impl ProbeFacts {
+    /// dhcp transport（`dns-netenv`）本机本次不可用的原因；`None` = 可用。
+    ///
+    /// dhcp 源场景与 D5 内置解析器 `builtin-netenv-dhcp` 共用这一个判据：二者是同一个 transport。
+    #[must_use]
+    pub fn dhcp_unavailable(&self) -> Option<ProbeReason> {
+        if !dhcp_privileged(self.platform, self.tun) {
+            Some(ProbeReason::DhcpNeedsPrivilege)
+        } else if self.dhcp_suppressed {
+            Some(ProbeReason::DhcpMonitorMissing)
+        } else {
+            None
+        }
+    }
+}
+
+/// 内置解析器 `builtin-netenv-dhcp`（D5）在本机本次是否可用：IPC `network_profile_builtin_dhcp_status`
+/// 的返回体（JSON camelCase）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BuiltinDhcpStatus {
+    pub available: bool,
+    pub reason: Option<ProbeReason>,
+}
+
+/// 内置解析器可用性：与生成侧 B（[`NetworkEnv::dns_action_skip`]）同一个判据
+/// [`ProbeFacts::dhcp_unavailable`]，不另写一份。
+#[must_use]
+pub fn builtin_dhcp_status(facts: &ProbeFacts) -> BuiltinDhcpStatus {
+    let reason = facts.dhcp_unavailable();
+    BuiltinDhcpStatus {
+        available: reason.is_none(),
+        reason,
+    }
+}
+
+/// 场景 / 探测源的不可用或告警原因。IPC（[`ResolvedProbe::reason`]）按 camelCase 序列化这个枚举；
+/// 生成报告与非致命信号用 [`Self::report_code`] 的原因码（同一原因的两种形态，由本枚举单点映射）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProbeReason {
+    /// 场景已停用，或两项判据规范化后都为空 ⇒ 引用它的规则不生成。
+    ProfileInvalid,
+    /// dhcp 需要绑 UDP 68 而核无特权（Linux / 未知平台的非 TUN）。
+    DhcpNeedsPrivilege,
+    /// Windows 的系统 DNS 读不到搜索域，而场景只有搜索域判据。
+    SystemNoSearchDomain,
+    /// 本次起核报 `missing monitor for auto DHCP`，运行时已剔除 dhcp transport（spec R4）。
+    DhcpMonitorMissing,
+    /// **告警**：dhcp 源而地址段判据只有 IPv6（DHCPv4 只带 IPv4 DNS，地址段永不命中）；规则仍生成。
+    DhcpIpv6Only,
+}
+
+impl ProbeReason {
+    /// 生成报告 / 非致命信号里的原因码。
+    #[must_use]
+    pub fn report_code(self) -> &'static str {
+        match self {
+            ProbeReason::ProfileInvalid => PRUNE_PROFILE_REF_INVALID,
+            ProbeReason::DhcpNeedsPrivilege | ProbeReason::SystemNoSearchDomain => {
+                PRUNE_PROBE_UNAVAILABLE
+            }
+            ProbeReason::DhcpMonitorMissing => PRUNE_DHCP_MONITOR_MISSING,
+            ProbeReason::DhcpIpv6Only => WARN_DHCP_IPV6_ONLY,
+        }
+    }
+}
+
+impl From<ProbeUnavailable> for ProbeReason {
+    fn from(value: ProbeUnavailable) -> Self {
+        match value {
+            ProbeUnavailable::DhcpNeedsPrivilege => ProbeReason::DhcpNeedsPrivilege,
+            ProbeUnavailable::SystemNoSearchDomain => ProbeReason::SystemNoSearchDomain,
+        }
+    }
+}
+
+/// dhcp 需要绑 UDP 68：Windows 普通用户 / SYSTEM 都能绑（N0 207 实测）；macOS 非特权可绑 <1024；
+/// Linux 只有 TUN（helper 给了 CAP_NET_BIND_SERVICE/RAW）才行。未知平台按 Linux 保守处理。
+fn dhcp_privileged(platform: Platform, tun: bool) -> bool {
+    matches!(platform, Platform::Win | Platform::Mac) || tun
+}
 
 /// 探测源在本机不可用的原因（UI「本机将使用：不可用（原因）」由后端给出，渲染端不重算）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -68,6 +170,68 @@ pub enum ProbeResolution {
     System,
     Dhcp,
     Unavailable(ProbeUnavailable),
+}
+
+/// 本机实际使用的探测源（「不可用」时也给出按解析表**本应**使用的那一个，供 UI 说明原因）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProbeSourceKind {
+    System,
+    Dhcp,
+}
+
+/// 「本机解析后的探测源」：IPC `network_profile_resolved_sources` 的元素（JSON camelCase）。
+///
+/// 与生成侧同一判据（[`resolved_probe`]），渲染端只显示、不重算。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedProbe {
+    pub profile_id: String,
+    pub probe_source: ProbeSourceKind,
+    /// `false` = 引用本场景的规则本次不生成。
+    pub available: bool,
+    /// 不可用原因或告警原因（camelCase，见 [`ProbeReason`]）；可用且无告警时为 `null`。
+    pub reason: Option<ProbeReason>,
+}
+
+/// 单个场景在本机的处置：解析表 + 可用性 + 场景自身有效性 + 告警，**唯一判据**。
+///
+/// 生成侧（[`NetworkEnv`] / [`netenv_required`]）与查询接口都只调它。
+#[must_use]
+pub fn resolved_probe(profile: &NetworkProfile, facts: &ProbeFacts) -> ResolvedProbe {
+    let (cidrs, domains) = effective_criteria(profile);
+    let resolution =
+        resolve_probe_source(profile, facts.platform, facts.tun, facts.takeover_active);
+    let probe_source = match resolution {
+        ProbeResolution::System
+        | ProbeResolution::Unavailable(ProbeUnavailable::SystemNoSearchDomain) => {
+            ProbeSourceKind::System
+        }
+        ProbeResolution::Dhcp
+        | ProbeResolution::Unavailable(ProbeUnavailable::DhcpNeedsPrivilege) => {
+            ProbeSourceKind::Dhcp
+        }
+    };
+    let unavailable = if !profile.enabled || (cidrs.is_empty() && domains.is_empty()) {
+        Some(ProbeReason::ProfileInvalid)
+    } else {
+        match resolution {
+            ProbeResolution::Unavailable(why) => Some(why.into()),
+            ProbeResolution::Dhcp => facts.dhcp_unavailable(),
+            ProbeResolution::System => None,
+        }
+    };
+    // 地址段判据只有 IPv6 且走 dhcp：DHCPv4 只带 IPv4 DNS ⇒ 地址段永不命中（有效 CIDR 已过校验，
+    // 含 `:` 即 IPv6）。
+    let v6_only_on_dhcp = probe_source == ProbeSourceKind::Dhcp
+        && !cidrs.is_empty()
+        && cidrs.iter().all(|cidr| cidr.contains(':'));
+    ResolvedProbe {
+        profile_id: profile.id.clone(),
+        probe_source,
+        available: unavailable.is_none(),
+        reason: unavailable.or(v6_only_on_dhcp.then_some(ProbeReason::DhcpIpv6Only)),
+    }
 }
 
 /// 场景判据经规范化后的有效值：`(合法 CIDR/IP, FQDN 形式的搜索域)`。
@@ -117,10 +281,7 @@ pub fn resolve_probe_source(
         }
     };
     if dhcp {
-        // Windows 普通用户 / SYSTEM 都能绑 68（N0 207 实测）；macOS 非特权可绑 <1024；Linux 只有
-        // TUN（helper 给了 CAP_NET_BIND_SERVICE/RAW）才行。未知平台按 Linux 保守处理。
-        let privileged = matches!(platform, Platform::Win | Platform::Mac) || tun;
-        if privileged {
+        if dhcp_privileged(platform, tun) {
             ProbeResolution::Dhcp
         } else {
             ProbeResolution::Unavailable(ProbeUnavailable::DhcpNeedsPrivilege)
@@ -208,28 +369,35 @@ pub enum RuleEnv {
 /// 按场景预解析好的环境项。缺省（空表）= 任何挂了场景的规则都按「引用失效」剔除（fail-closed）。
 #[derive(Debug, Clone, Default)]
 pub struct NetworkEnv {
-    profiles: BTreeMap<String, Result<Vec<EnvCondition>, &'static str>>,
+    profiles: BTreeMap<String, Result<ProfileEnv, &'static str>>,
+    /// dhcp transport 本机本次不可用的原因（D5 内置解析器动作据此剔除，见 [`Self::dns_action_skip`]）。
+    /// 缺省 `None` 只出现在「没有任何场景输入」的默认值里，那里也不会有 DNS 规则经过它。
+    dhcp_unavailable: Option<&'static str>,
+}
+
+/// 单个场景的预解析结果：环境项 + 告警（告警不影响生成）。
+#[derive(Debug, Clone)]
+struct ProfileEnv {
+    conditions: Vec<EnvCondition>,
+    warning: Option<&'static str>,
 }
 
 impl NetworkEnv {
     /// `servers` = 本次已生成的 DNS server；环境项只引用其中类型合格者（第一道防线）。
     #[must_use]
-    pub fn new(
-        profiles: &[NetworkProfile],
-        platform: Platform,
-        tun: bool,
-        takeover_active: bool,
-        servers: &[DnsServer],
-    ) -> Self {
+    pub fn new(profiles: &[NetworkProfile], facts: &ProbeFacts, servers: &[DnsServer]) -> Self {
         let mut resolved = BTreeMap::new();
         for profile in profiles {
             if profile.id.trim().is_empty() || resolved.contains_key(&profile.id) {
                 continue;
             }
-            let entry = resolve_profile(profile, platform, tun, takeover_active, servers);
+            let entry = resolve_profile(profile, facts, servers);
             resolved.insert(profile.id.clone(), entry);
         }
-        Self { profiles: resolved }
+        Self {
+            profiles: resolved,
+            dhcp_unavailable: facts.dhcp_unavailable().map(ProbeReason::report_code),
+        }
     }
 
     #[must_use]
@@ -240,28 +408,45 @@ impl NetworkEnv {
         match self.profiles.get(profile_id) {
             None => RuleEnv::Skip(PRUNE_PROFILE_REF_INVALID),
             Some(Err(reason)) => RuleEnv::Skip(reason),
-            Some(Ok(conditions)) => RuleEnv::Conditions(conditions.clone()),
+            Some(Ok(entry)) => RuleEnv::Conditions(entry.conditions.clone()),
         }
+    }
+
+    /// 规则挂的场景带告警（规则仍生成）时的告警原因码。
+    fn warning_for(&self, rule: &Rule) -> Option<&'static str> {
+        let id = rule.network_profile_id.as_deref()?;
+        self.profiles.get(id)?.as_ref().ok()?.warning
+    }
+
+    /// DNS 规则的动作用到内置 `builtin-netenv-dhcp`（含 group 成员/回退、hostsFirst 两腿、
+    /// followRouteDefault 解出的默认），而 dhcp transport 本机本次不可用 ⇒ 整条剔除的原因码。
+    ///
+    /// 剔除而**不**退化成别的解析器（spec §4.4 口径）：Linux 系统代理下核无特权绑 68，查询必然失败，
+    /// 悄悄换成别的解析器会把「公司内网解析」送去错误的上游。
+    #[must_use]
+    pub fn dns_action_skip(&self, rule: &Rule, config: &UserConfig) -> Option<&'static str> {
+        self.dhcp_unavailable
+            .filter(|_| dns_rule_uses_netenv(rule, config))
     }
 }
 
 fn resolve_profile(
     profile: &NetworkProfile,
-    platform: Platform,
-    tun: bool,
-    takeover_active: bool,
+    facts: &ProbeFacts,
     servers: &[DnsServer],
-) -> Result<Vec<EnvCondition>, &'static str> {
-    let (cidrs, domains) = effective_criteria(profile);
-    if !profile.enabled || (cidrs.is_empty() && domains.is_empty()) {
-        return Err(PRUNE_PROFILE_REF_INVALID);
+) -> Result<ProfileEnv, &'static str> {
+    let probe = resolved_probe(profile, facts);
+    if !probe.available {
+        return Err(probe
+            .reason
+            .map_or(PRUNE_PROBE_UNAVAILABLE, ProbeReason::report_code));
     }
-    let tag = match resolve_probe_source(profile, platform, tun, takeover_active) {
-        ProbeResolution::System => LOCAL_DNS_TAG,
-        ProbeResolution::Dhcp => NETENV_DNS_TAG,
-        ProbeResolution::Unavailable(_) => return Err(PRUNE_PROBE_UNAVAILABLE),
+    let tag = match probe.probe_source {
+        ProbeSourceKind::System => LOCAL_DNS_TAG,
+        ProbeSourceKind::Dhcp => NETENV_DNS_TAG,
     };
     env_condition_ref_ok(servers, tag).map_err(EnvRefError::reason)?;
+    let (cidrs, domains) = effective_criteria(profile);
     let mut conditions = Vec::with_capacity(2);
     if !cidrs.is_empty() {
         conditions.push(EnvCondition {
@@ -277,7 +462,10 @@ fn resolve_profile(
             values: domains,
         });
     }
-    Ok(conditions)
+    Ok(ProfileEnv {
+        conditions,
+        warning: probe.reason.map(ProbeReason::report_code),
+    })
 }
 
 /// 环境项引用不合格的原因。
@@ -309,7 +497,8 @@ pub fn env_condition_ref_ok(servers: &[DnsServer], tag: &str) -> Result<(), EnvR
     }
 }
 
-/// 被剔除的一条场景规则（`GenerateOutcome::pruned_env_rules` 的元素）。
+/// 场景规则报告的一条（`GenerateOutcome::pruned_env_rules` 的元素）：被剔除的规则，或带告警
+/// 仍生成的规则（原因码在 [`ENV_REPORT_WARNINGS`] 里，见 [`Self::is_warning`]）。
 ///
 /// builder 阶段剔除的带 `rule_id`；后置剪枝看的是最终 JSON，内核规则上没有用户规则 id ⇒ `None`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -319,19 +508,36 @@ pub struct PrunedEnvRule {
     pub reason: &'static str,
 }
 
+impl PrunedEnvRule {
+    /// `true` = 只告警、规则本次仍生成。
+    #[must_use]
+    pub fn is_warning(&self) -> bool {
+        ENV_REPORT_WARNINGS.contains(&self.reason)
+    }
+}
+
 /// DNS builder 会处理的用户 DNS 规则（与 `builder::dns` 用户规则块的入口过滤同口径）。
 #[must_use]
 pub fn dns_rule_is_candidate(rule: &Rule) -> bool {
     rule.enabled && rule.effects.is_some() && rule.dns_effect().is_some()
 }
 
-fn action_refs_server(action: &DnsPolicyAction, groups: &[DnsServerGroup], id: &str) -> bool {
+fn action_refs_server(
+    action: &DnsPolicyAction,
+    route_action: Option<RuleAction>,
+    config: &UserConfig,
+    id: &str,
+) -> bool {
+    let groups: &[DnsServerGroup] = &config.dns_server_groups;
     match action {
         DnsPolicyAction::Server { server_id } => server_id == id,
+        DnsPolicyAction::FollowRouteDefault => {
+            follow_route_default_server_id(route_action, config.dns_defaults.as_ref()) == id
+        }
         DnsPolicyAction::HostsFirst {
             hosts_server_id,
             fallback,
-        } => hosts_server_id == id || action_refs_server(fallback, groups, id),
+        } => hosts_server_id == id || action_refs_server(fallback, route_action, config, id),
         DnsPolicyAction::Group { group_id } => groups
             .iter()
             .filter(|g| g.id == *group_id && g.enabled)
@@ -342,23 +548,32 @@ fn action_refs_server(action: &DnsPolicyAction, groups: &[DnsServerGroup], id: &
     }
 }
 
-/// 本次是否需要生成 `dns-netenv`（spec §4.2「只在需要时生成」）：某条会生成的规则挂了解析为 dhcp 的
-/// 启用场景，或某条 DNS 规则的动作引用了 [`BUILTIN_NETENV_DHCP_ID`]。否则一个字节都不变。
+/// DNS 规则的动作是否用到内置 [`BUILTIN_NETENV_DHCP_ID`]（`dns-netenv`）。
 #[must_use]
-pub fn netenv_required(config: &UserConfig, platform: Platform, takeover_active: bool) -> bool {
-    let tun = config.proxy_mode_type == ProxyModeType::Tun;
+pub fn dns_rule_uses_netenv(rule: &Rule, config: &UserConfig) -> bool {
+    rule.dns_effect()
+        .and_then(|effect| effect.action)
+        .is_some_and(|action| {
+            action_refs_server(&action, rule.route_action(), config, BUILTIN_NETENV_DHCP_ID)
+        })
+}
+
+/// 本次是否需要生成 `dns-netenv`（spec §4.2「只在需要时生成」）：某条会生成的规则挂了解析为 dhcp 的
+/// 启用场景，或某条 DNS 规则的动作用到了 [`BUILTIN_NETENV_DHCP_ID`]——两者都以 dhcp transport 本机
+/// 本次可用为前提（不可用时那些规则整条剔除，生成它只会白绑一次 68）。否则一个字节都不变。
+///
+/// `facts.tun` 由调用方按 `config.proxy_mode_type` 给出（与 [`NetworkEnv::new`] 同一份）。
+#[must_use]
+pub fn netenv_required(config: &UserConfig, facts: &ProbeFacts) -> bool {
     let dns_rules: Vec<&Rule> = config
         .effective_dns_rules()
         .iter()
         .filter(|r| dns_rule_is_candidate(r))
         .collect();
-    let by_action = dns_rules.iter().any(|rule| {
-        rule.dns_effect()
-            .and_then(|effect| effect.action)
-            .is_some_and(|action| {
-                action_refs_server(&action, &config.dns_server_groups, BUILTIN_NETENV_DHCP_ID)
-            })
-    });
+    let by_action = facts.dhcp_unavailable().is_none()
+        && dns_rules
+            .iter()
+            .any(|rule| dns_rule_uses_netenv(rule, config));
     if by_action {
         return true;
     }
@@ -372,11 +587,8 @@ pub fn netenv_required(config: &UserConfig, platform: Platform, takeover_active:
         .filter_map(|rule| rule.network_profile_id.as_deref())
         .filter_map(|id| config.network_profiles.iter().find(|p| p.id == id))
         .any(|profile| {
-            let (cidrs, domains) = effective_criteria(profile);
-            profile.enabled
-                && !(cidrs.is_empty() && domains.is_empty())
-                && resolve_probe_source(profile, platform, tun, takeover_active)
-                    == ProbeResolution::Dhcp
+            let probe = resolved_probe(profile, facts);
+            probe.available && probe.probe_source == ProbeSourceKind::Dhcp
         })
 }
 
@@ -393,15 +605,27 @@ pub fn builder_skipped_rules(config: &UserConfig, env: &NetworkEnv) -> Vec<Prune
         .into_iter()
         .filter(|r| dns_rule_is_candidate(r));
     let mut out: Vec<PrunedEnvRule> = Vec::new();
-    for rule in traffic.chain(dns) {
-        if let RuleEnv::Skip(reason) = env.for_rule(rule) {
-            let entry = PrunedEnvRule {
-                rule_id: Some(rule.id.clone()),
-                reason,
-            };
-            if !out.contains(&entry) {
-                out.push(entry);
-            }
+    let mut push = |rule: &Rule, reason: &'static str| {
+        let entry = PrunedEnvRule {
+            rule_id: Some(rule.id.clone()),
+            reason,
+        };
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    };
+    // 与 DNS builder 用户规则块同序判定：场景处置先于动作处置（场景已剔除就不再看动作）。
+    for (rule, is_dns) in traffic.map(|r| (r, false)).chain(dns.map(|r| (r, true))) {
+        match env.for_rule(rule) {
+            RuleEnv::Skip(reason) => push(rule, reason),
+            _ => match is_dns.then(|| env.dns_action_skip(rule, config)).flatten() {
+                Some(reason) => push(rule, reason),
+                None => {
+                    if let Some(warning) = env.warning_for(rule) {
+                        push(rule, warning);
+                    }
+                }
+            },
         }
     }
     out

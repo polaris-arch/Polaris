@@ -12,9 +12,9 @@ use super::core_binary::resolve_dashboard_serve_dir;
 use super::core_binary::resolve_core_binary;
 use super::core_log::{
     config_log, config_on_degraded, log_axes_from_config, pipe_to_log, settle_start_failure,
-    CoreFatalSlot, CoreLogHandoff,
+    CoreFatalKind, CoreFatalSlot, CoreLogHandoff,
 };
-use super::dns_takeover::dns_takeover_enabled;
+use super::dns_takeover::{dns_takeover_enabled, system_dns_takeover_active};
 use super::lifecycle::{now_ms, sleep_unless_superseded_on};
 use super::platform_contracts::{enumerate_own_lan_cidrs, platform_tag};
 use super::process_supervision::pid_alive;
@@ -41,6 +41,10 @@ use polaris_config_engine::builder::endpoint_routes::{
     mesh_system_supported_on_platform, mesh_uses_system_interface,
 };
 use polaris_config_engine::builder::helpers::ServerLike;
+use polaris_config_engine::builder::network_env::{
+    builtin_dhcp_status, resolved_probe, BuiltinDhcpStatus, ProbeFacts, PrunedEnvRule,
+    ResolvedProbe,
+};
 use polaris_config_engine::builder::outbounds::required_bind_interfaces;
 use polaris_config_engine::builder::{
     build_id_to_tag_map, generate_sing_box_config_with_report_and_runtime_bindings,
@@ -856,6 +860,14 @@ impl ProxyRuntime {
         // 会被 move 进 `startup_snapshot`）。三态：`Some(false)` = 用户显式关，其余（缺省 / true / 非布尔）
         // 一律视作开（对齐 上游 `takeoverSystemDns !== false` 与 `validateConfig` 的布尔口径）。
         let dns_takeover = dns_takeover_enabled(&config);
+        // 网络场景 auto 探测源用的「接管生效」事实：与起核尾 C7 接管门同一组输入（平台 + TUN + 开关）。
+        let takeover_active = system_dns_takeover_active(
+            Platform::parse(platform_tag()),
+            user_config.proxy_mode_type.is_tun(),
+            dns_takeover,
+        );
+        // R4 兜底的会话态每次起核复位：上一次会话剔除过 dhcp，不代表这一次也会失败。
+        self.netenv_dhcp_suppressed.store(false, Ordering::SeqCst);
         let preflight_ms = t_preflight.elapsed().as_millis();
         log::info!("起核耗时：配置解析+网卡绑定前置校验={preflight_ms}ms");
 
@@ -1002,6 +1014,7 @@ impl ProxyRuntime {
             singbox_config,
             deps,
             pruned_rule_set_tags,
+            pruned_env_rules,
             binary,
             effective_user_config,
         ) = loop {
@@ -1034,6 +1047,7 @@ impl ProxyRuntime {
                 probe_proxy_port,
                 &pool_ports,
                 &config,
+                takeover_active,
             );
             // 核二进制解析（**移到闸门之前**：闸门要拿它跑 `sing-box check`）。**此处刻意不 `?`** ——
             // 保住既有次序不变式「解析失败是终态 Err，但 gate 剔除结果须已推给渲染端」：先把 Result
@@ -1094,6 +1108,8 @@ impl ProxyRuntime {
             // 因本地 .srs 缺失被 fail-closed 剪枝的 rule_set tag（空 = 规则集完整）。随本次尝试的
             // config 一起带出循环：出口自证与用户可见信号都必须对账**这一次**生成的产物。
             let pruned_rule_set_tags = gate.pruned_rule_set_tags;
+            // 网络场景规则报告（剔除 + 告警）：同上，必须是**这一次**生成的产物（R4 重试腿会变）。
+            let pruned_env_rules = gate.pruned_env_rules;
             let singbox_config = gate.config;
             let effective_user_config = gate.effective_user_config;
             let config_gen_attempt_ms = t_config_gen.elapsed().as_millis();
@@ -1300,6 +1316,7 @@ impl ProxyRuntime {
                             singbox_config,
                             deps,
                             pruned_rule_set_tags,
+                            pruned_env_rules,
                             // 本次真正解析出的核路径 —— 起核后的内核自证要对账的正是**这一次**的期望值
                             //（每次尝试都重解析，故必须随本轮结果带出循环，不能在循环外重算）。
                             binary,
@@ -1369,6 +1386,11 @@ impl ProxyRuntime {
                     // #332：核自己吐的 FATAL 才知道**为什么**退出（就绪门只看得到「没了」）。
                     let fatal =
                         self.observe_core_fatal(via_helper, startup_log_cursor, &fatal_slot);
+                    if self.suppress_netenv_after_fatal(fatal) {
+                        // R4：本腿不计入重试预算（失败是配置形态导致的确定性失败，不是资源竞态）。
+                        attempt = attempt.saturating_sub(1);
+                        continue;
+                    }
                     // #159/#176：起核期退出（CoreStartRetryError 等价，恒可重试）→ 预算内静默重起（届时
                     // wintun 适配器/双 utun 已释放，新尝试重解析端口+重生成盘）。上面已 kill_core → 无孤儿核。
                     if attempt <= budget.max_retries {
@@ -1400,6 +1422,10 @@ impl ProxyRuntime {
                     // #332：超时腿同样可能是核已 FATAL 退出、只是就绪门先走完了预算（真因照样在 stderr 里）。
                     let fatal =
                         self.observe_core_fatal(via_helper, startup_log_cursor, &fatal_slot);
+                    if self.suppress_netenv_after_fatal(fatal) {
+                        attempt = attempt.saturating_sub(1);
+                        continue;
+                    }
                     if attempt <= budget.max_retries {
                         log::warn!("sing-box 起核超时（第 {attempt} 次）→ 预算内自动重试");
                         // 同 Dead 腿：已 `kill_core()` → 取消腿无孤儿。
@@ -1605,6 +1631,9 @@ impl ProxyRuntime {
         // 命中应由它覆写 status（更贴近用户观感的「走错出口」）。两条都各自 emit 事件，互不遮蔽。
         // 空清单（资源齐全）→ 不发，零噪音。
         self.warn_pruned_rule_resources(&pruned_rule_set_tags);
+        // **网络场景规则告知**：场景失效 / 探测源本机不可用 / R4 剔除 dhcp / dhcp 源只写 IPv6 地址段。
+        // 与上一条同属「核在跑、规则面降级」，各自 emit；报告为空 ⇒ 清掉本码（修好即消失）。
+        self.warn_network_profile_rules(&pruned_env_rules);
         // **出口自证**：核已就绪 → 校验「实际生效出口 == 选中节点」，不一致即告警，绝不静默显示「已连接」。
         // 放在 A1 之后：二者是正交的两条降级轴（A1 = OS 没把流量导进核；本检查 = 核内部出口指错了），
         // 各自独立 emit，互不遮蔽。纯静态、零 I/O、微秒级 → 不给已经偏慢的起核路径增加任何延迟。
@@ -2060,6 +2089,51 @@ impl ProxyRuntime {
         );
     }
 
+    /// **网络场景规则告知** → 用户可见非致命信号（`NETWORK_PROFILE_RULES_PRUNED`）。
+    ///
+    /// 入参是生成侧交回的报告（`GenerateOutcome::pruned_env_rules`，剔除与告警两类，原因码区分）——
+    /// 不是猜的：没有场景规则出问题时它恒空。**正反两向**：非空 ⇒ 落码 + emit；空 ⇒ 只清**本码**
+    /// （`clear_nonfatal_error_if`，不抹掉并发产生的其它告警），用户修好场景、重连后信号即消失。
+    ///
+    /// 非终态（核确在跑，只是部分场景规则没生成）→ `set_nonfatal_error`。
+    pub(super) fn warn_network_profile_rules(&self, report: &[PrunedEnvRule]) {
+        if report.is_empty() {
+            self.clear_nonfatal_error_if(code::NETWORK_PROFILE_RULES_PRUNED);
+            return;
+        }
+        let mut reasons: Vec<&str> = report.iter().map(|r| r.reason).collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        let warned = report.iter().filter(|r| r.is_warning()).count();
+        self.set_nonfatal_error(
+            &format!(
+                "网络场景：{} 条规则本次未生成，{warned} 条规则可能永不命中（原因：{}）。请到「规则」页检查网络场景。",
+                report.len() - warned,
+                reasons.join("、")
+            ),
+            code::NETWORK_PROFILE_RULES_PRUNED,
+        );
+    }
+
+    /// **R4 兜底判定**：本腿核 FATAL 真因是 `missing monitor for auto DHCP`（非 TUN 且 network monitor
+    /// 建不出来时，dhcp transport 在 Start 阶段整核 FATAL，`check` 拦不住）且本次起核还没剔除过 ⇒
+    /// 置会话态「剔除 dhcp transport」并返回 `true`，调用方据此重生成配置再起一次。
+    ///
+    /// **只重试一次**：剔除后配置里不再有 dhcp transport，同一真因不可能再出现；万一再出现也不再
+    /// 进本分支（标志已置），落回常规失败路径。被剔除的规则进生成报告，由
+    /// [`Self::warn_network_profile_rules`] 以 `NETWORK_PROFILE_DHCP_MONITOR_MISSING` 告知用户。
+    pub(super) fn suppress_netenv_after_fatal(&self, fatal: Option<CoreFatalKind>) -> bool {
+        if fatal != Some(CoreFatalKind::DhcpMonitorMissing)
+            || self.netenv_dhcp_suppressed.swap(true, Ordering::SeqCst)
+        {
+            return false;
+        }
+        log::warn!(
+            "sing-box 起核报 missing monitor for auto DHCP → 剔除网络场景 dhcp 探测源（dns-netenv）后重试一次"
+        );
+        true
+    }
+
     /// **出口自证**：核就绪后校验「实际生效出口 == 用户选中节点」，不一致即经同一 error/warn 通道告警。
     ///
     /// 判据与「为什么不用探针 / 不查 selector」见 [`attest_effective_exit`] 上方的模块级说明。
@@ -2469,6 +2543,10 @@ impl ProxyRuntime {
     ///
     /// **C12**：`own_lan_cidrs` 由 [`enumerate_own_lan_cidrs`] 真枚举本机非回环接口（unix getifaddrs，
     /// 只读非破坏性）。**C19**：`update_in_port` 由 `start` 分配的空闲口注入（>0 时生成 update-in 入站+路由）。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "每个参数都是起核腿本次算出的独立事实；打包成结构体只是把同样 8 个字段换个地方列"
+    )]
     pub(super) fn generate_deps(
         &self,
         api_port: u16,
@@ -2477,6 +2555,7 @@ impl ProxyRuntime {
         probe_proxy_port: Option<u16>,
         pool_ports: &[u16],
         config: &Value,
+        system_dns_takeover_active: bool,
     ) -> GenerateConfigDeps {
         let dir = self.config.dir();
         // A2/C13：日志两轴跟随 config（此前硬编码 Info + 不落 disableLogFile）。
@@ -2553,9 +2632,17 @@ impl ProxyRuntime {
             is_valid_srs_fn: is_valid_srs_file,
             // C12：真枚举本机所有非回环接口 CIDR（连入来源排除 guard / bypassLAN carve guard / mesh 重叠告警）。
             own_lan_cidrs: enumerate_own_lan_cidrs(),
-            // 网络场景 auto 探测源的「mac + TUN + 接管系统 DNS 生效」运行期事实。N1 只加字段、
-            // 暂按 false 注入（无场景规则时不影响任何输出；UI 入口在 N3 才出现）；真值注入归 N2。
-            system_dns_takeover_active: false,
+            // 网络场景 auto 探测源的「mac + TUN + 接管系统 DNS 生效」运行期事实，由起核腿用 C7 接管门
+            // 的**同一组输入**算好传进来（[`system_dns_takeover_active`](super::dns_takeover::system_dns_takeover_active)）。
+            //
+            // 刻意**不**在本装配体里读 `dnsConfig.takeoverSystemDns`：spec §4.4 定了它不进 norm 投影
+            // （进投影会改变 `config_generation_norm` 的投影面），而本装配体里读到的每个键都必须对 norm
+            // 可见（`every_generation_input_key_is_visible_to_norm`）。代价：运行中只改接管开关不会让
+            // 场景 auto 源的解析结果进 pending —— 与接管开关本身「下次起核才生效」同一口径。
+            system_dns_takeover_active,
+            // R4：本会话 dhcp transport 已被剔除（起核报 `missing monitor for auto DHCP` 后的兜底重试）。
+            // 运行时状态，不是配置键；每次 `start_inner` 入口复位。
+            netenv_dhcp_suppressed: self.netenv_dhcp_suppressed.load(Ordering::SeqCst),
             // A-0b：运行期观测到的 tailnet 地址（`serverId` → 裸地址）。真值源是
             // `ProxyRuntime::observed_tailnet`，由两条腿写：STATUS 帧（`sync_tailnet_rule_files`）
             // 与**本次起核前**刚跑过的 `write_tailnet_rule_files`（把盘上文件的主机位条目读回，
@@ -2571,6 +2658,50 @@ impl ProxyRuntime {
             log: config_log,
             on_degraded: config_on_degraded,
         }
+    }
+
+    /// 「本机解析后的探测源」查询（IPC `network_profile_resolved_sources` 的真值，spec §4.4 末条）。
+    ///
+    /// 每个场景一项，与生成侧**同一判据**（`network_env::resolved_probe`）、同一组本机输入：平台取
+    /// [`platform_tag`]（与 `generate_deps` 同源）、TUN 取 `raw` 里的代理模式、接管事实走
+    /// [`system_dns_takeover_active`]（与起核腿同一函数）、R4 会话态取本运行时的标志。
+    /// `raw` = 磁盘上的当前配置（即下次起核会用的那份）。
+    pub(crate) fn network_profile_resolved_sources(
+        &self,
+        raw: &Value,
+    ) -> Result<Vec<ResolvedProbe>, String> {
+        let (user_config, facts) = self.network_probe_facts(raw)?;
+        Ok(user_config
+            .network_profiles
+            .iter()
+            .map(|profile| resolved_probe(profile, &facts))
+            .collect())
+    }
+
+    /// 内置解析器 `builtin-netenv-dhcp` 在本机本次是否可用（IPC `network_profile_builtin_dhcp_status`）。
+    /// 判据与生成侧 B 同一个函数（`ProbeFacts::dhcp_unavailable`），输入同 [`Self::network_profile_resolved_sources`]。
+    pub(crate) fn network_profile_builtin_dhcp_status(
+        &self,
+        raw: &Value,
+    ) -> Result<BuiltinDhcpStatus, String> {
+        let (_, facts) = self.network_probe_facts(raw)?;
+        Ok(builtin_dhcp_status(&facts))
+    }
+
+    /// 两个查询接口共用的本机输入：平台取 [`platform_tag`]（与 `generate_deps` 同源）、TUN 取 `raw`
+    /// 的代理模式、接管事实走 [`system_dns_takeover_active`]（与起核腿同一函数）、R4 会话态取本运行时标志。
+    fn network_probe_facts(&self, raw: &Value) -> Result<(UserConfig, ProbeFacts), String> {
+        let user_config: UserConfig = serde_json::from_value(raw.clone())
+            .map_err(|e| format!("配置解析失败（UserConfig）: {e}"))?;
+        let platform = Platform::parse(platform_tag());
+        let tun = user_config.proxy_mode_type.is_tun();
+        let facts = ProbeFacts {
+            platform,
+            tun,
+            takeover_active: system_dns_takeover_active(platform, tun, dns_takeover_enabled(raw)),
+            dhcp_suppressed: self.netenv_dhcp_suppressed.load(Ordering::SeqCst),
+        };
+        Ok((user_config, facts))
     }
 
     fn kernel_gate_cache_hit(&self, record: &KernelGateCacheRecord) -> bool {
@@ -2796,6 +2927,8 @@ impl ProxyRuntime {
 pub(super) struct GateOutcome {
     pub(super) config: SingBoxConfig,
     pub(super) pruned_rule_set_tags: Vec<String>,
+    /// 网络场景规则报告（`GenerateOutcome::pruned_env_rules` 原样带出）。
+    pub(super) pruned_env_rules: Vec<PrunedEnvRule>,
     /// 生成侧 gate 剔除的 ∪ 内核闸门剥掉的（走同一条 `EVENT_PROXY_INVALID_NODES` 通道）。
     pub(super) invalid_nodes: Vec<InvalidNode>,
     /// 本次真跑了几次 `sing-box check`（缓存命中 0、首次健康 1、剥除腿可 >1）；
@@ -2845,6 +2978,7 @@ impl GateOutcome {
         Self {
             config: outcome.config,
             pruned_rule_set_tags: outcome.pruned_rule_set_tags,
+            pruned_env_rules: outcome.pruned_env_rules,
             invalid_nodes: outcome
                 .invalid_nodes
                 .into_iter()
