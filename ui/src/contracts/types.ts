@@ -162,6 +162,8 @@ export type Protocol =
   | 'tor'
   | 'openconnect'
   | 'openvpn-client'
+  // 2026-09-24：MASQUE（RFC 9484 CONNECT-IP）客户端，内核 endpoint。编辑器在 M2 落地。
+  | 'masque-client'
   | 'custom';
 export type Network = 'tcp' | 'ws' | 'grpc' | 'http' | 'httpupgrade';
 export type Security = 'none' | 'tls' | 'reality';

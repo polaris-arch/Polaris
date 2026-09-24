@@ -16,7 +16,11 @@ fn mesh_protocols_are_a_strict_subset_of_the_endpoint_leg() {
     for p in [Protocol::Wireguard, Protocol::Tailscale] {
         assert!(is_mesh_protocol(p) && lands_in_endpoints(p), "{p:?}");
     }
-    for p in [Protocol::Openconnect, Protocol::OpenvpnClient] {
+    for p in [
+        Protocol::Openconnect,
+        Protocol::OpenvpnClient,
+        Protocol::MasqueClient,
+    ] {
         assert!(!is_mesh_protocol(p) && lands_in_endpoints(p), "{p:?}");
     }
 }
@@ -33,7 +37,11 @@ fn endpoint_leg_vpn_is_a_mesh_node_only_when_it_declares_routes() {
         mesh_routes: routes,
         ..Default::default()
     };
-    for proto in [Protocol::Openconnect, Protocol::OpenvpnClient] {
+    for proto in [
+        Protocol::Openconnect,
+        Protocol::OpenvpnClient,
+        Protocol::MasqueClient,
+    ] {
         assert!(!is_mesh_node(&mk(proto, vec![])), "{proto:?} 未声明");
         assert!(
             !is_mesh_node(&mk(proto, vec!["  ".into()])),
@@ -382,10 +390,10 @@ fn server_config_stays_narrow() {
     use std::collections::BTreeSet;
     use std::mem::{size_of, size_of_val};
 
-    /// 2026-09-24 实测值（内联的 `TlsSettings` 新增两个有意的字符串字段 `certificateSha256` /
-    /// `certificatePublicKeySha256` 后 1152 → 1200 B；此前 2026-08-26 加 `bindInterface` 1128 → 1152 B；
+    /// 2026-09-24 实测值（新增装箱的 `masqueClientSettings` 1200 → 1208 B；同日内联的 `TlsSettings`
+    /// 新增两个有意的字符串字段 `certificateSha256` / `certificatePublicKeySha256` 后 1152 → 1200 B；此前 2026-08-26 加 `bindInterface` 1128 → 1152 B；
     /// 装箱前 3096 B；只装 6 项时 1904 B，8 项时 1512 B）。
-    const MEASURED: usize = 1200;
+    const MEASURED: usize = 1208;
     let actual = size_of::<ServerConfig>();
     assert!(
         actual <= MEASURED,
@@ -525,6 +533,8 @@ fn server_config_stays_narrow() {
             Boxed(size_of::<ps::OpenconnectSettings>()),
         "openvpnClientSettings" => openvpn_client_settings:
             Boxed(size_of::<ps::OpenvpnClientSettings>()),
+        "masqueClientSettings" => masque_client_settings:
+            Boxed(size_of::<ps::MasqueClientSettings>()),
         "wireguardSettings" => wireguard_settings: Boxed(size_of::<WireGuardSettings>()),
         "tailscaleSettings" => tailscale_settings: Boxed(size_of::<TailscaleSettings>()),
         "customSettings" => custom_settings: Plain,
@@ -742,6 +752,10 @@ fn boxed_protocol_settings_serialize_transparently() {
             server_port: Some(1194),
             ..Default::default()
         })),
+        masque_client_settings: Some(Box::new(ps::MasqueClientSettings {
+            version: Some(2),
+            ..Default::default()
+        })),
         ssh_settings: Some(Box::new(ps::SshSettings {
             private_key: Some("KEY".into()),
             ..Default::default()
@@ -800,6 +814,7 @@ fn boxed_protocol_settings_serialize_transparently() {
             "torSettings": { "executablePath": "/usr/bin/tor" },
             "openconnectSettings": { "server": "vpn.example.com:443" },
             "openvpnClientSettings": { "server_port": 1194 },
+            "masqueClientSettings": { "version": 2 },
             "sshSettings": { "privateKey": "KEY" },
             "wireguardSettings": { "privateKey": "PRIV", "allowedIPs": ["0.0.0.0/0"] },
             "tailscaleSettings": {
@@ -832,7 +847,7 @@ fn boxed_protocol_settings_serialize_transparently() {
         serde_json::json!({
             "id": "s2", "name": "n2", "protocol": "vless", "address": "b.com", "port": 443
         }),
-        "十二个装箱字段缺席时一个键都不该出现"
+        "十三个装箱字段缺席时一个键都不该出现"
     );
     // 第三态：装箱字段**在场、但内容全缺省**。前两态都盖不到它，而它才是两个谓词分岔的地方：
     // 字段级的 `Option::is_none` 只看**字段在不在**、与内容无关；一旦有人把它换成内容相关的
@@ -840,11 +855,11 @@ fn boxed_protocol_settings_serialize_transparently() {
     // 而前两态一条都不红。顺带这也是子结构里那些 `skip_serializing_if = "Vec::is_empty"`
     // 唯一有牙的一态 —— 满字段态里那些 `Vec` 恒非空，碰不到该谓词。
     //
-    // 🔴 **十二个装箱字段一个都不能少**：本态的判据是「字段级谓词是否与内容无关」，那是**每个**
+    // 🔴 **十三个装箱字段一个都不能少**：本态的判据是「字段级谓词是否与内容无关」，那是**每个**
     // 装箱字段各自的属性，不是可以抽样的共性。少写一个，同一个变异换到那个字段上就一态不红。
     // 本态初版只放了 wireguard/tailscale 两个（补装它俩那批顺手加的），另外六个在三态里的形态
     // 是「填了个标量 / 缺席 / 缺席」—— 恰好绕开本态要拦的那件事，等于门只补到 2/8。
-    // 期望值是**实测**来的（十二个结构 `Default` 逐个序列化确认），不是「反正全带
+    // 期望值是**实测**来的（十三个结构 `Default` 逐个序列化确认），不是「反正全带
     // skip_serializing_if 所以应该是空」的推断 —— 这一批就当场证伪了那个推断：
     // `snellSettings` 实测是 `{"version":0}`、`shadowsocksSettings` 是
     // `{"method":"","password":""}`，因为它们各有不带 skip 的必填标量。
@@ -860,6 +875,7 @@ fn boxed_protocol_settings_serialize_transparently() {
         tor_settings: Some(Box::new(ps::TorSettings::default())),
         openconnect_settings: Some(Box::new(ps::OpenconnectSettings::default())),
         openvpn_client_settings: Some(Box::new(ps::OpenvpnClientSettings::default())),
+        masque_client_settings: Some(Box::new(ps::MasqueClientSettings::default())),
         ssh_settings: Some(Box::new(ps::SshSettings::default())),
         wireguard_settings: Some(Box::new(WireGuardSettings::default())),
         tailscale_settings: Some(Box::new(TailscaleSettings::default())),
@@ -875,7 +891,8 @@ fn boxed_protocol_settings_serialize_transparently() {
             "id": "s3", "name": "n3", "protocol": "wireguard",
             "address": "c.com", "port": 51820,
             "hysteria2Settings": {}, "hysteriaSettings": {}, "torSettings": {},
-            "openconnectSettings": {}, "openvpnClientSettings": {}, "sshSettings": {},
+            "openconnectSettings": {}, "openvpnClientSettings": {}, "masqueClientSettings": {},
+            "sshSettings": {},
             "wireguardSettings": {}, "tailscaleSettings": {},
             // 这两个**不是** `{}`，且这正是本态期望值必须实测、不能靠「反正都带 skip」推断的
             // 活证据：`SnellSettings::version` 与 `ShadowsocksSettings::{method,password}`
@@ -927,10 +944,11 @@ fn all_protocols_is_exhaustive() {
             Protocol::Tor => 15,
             Protocol::Openconnect => 16,
             Protocol::OpenvpnClient => 17,
-            Protocol::Custom => 18,
+            Protocol::MasqueClient => 18,
+            Protocol::Custom => 19,
         }
     }
-    let mut seen = [false; 19];
+    let mut seen = [false; 20];
     for p in super::ALL_PROTOCOLS {
         seen[slot(p)] = true;
     }

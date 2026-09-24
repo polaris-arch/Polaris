@@ -915,6 +915,7 @@ pub(crate) fn protocol_str(p: Protocol) -> String {
         Protocol::Tor => "tor",
         Protocol::Openconnect => "openconnect",
         Protocol::OpenvpnClient => "openvpn-client",
+        Protocol::MasqueClient => "masque-client",
         Protocol::Custom => "custom",
     }
     .to_string()

@@ -47,6 +47,155 @@ pub fn build_vpn_client_endpoint(
     })
 }
 
+/// MASQUE 节点 `path` 非法（非空且不以 `/` 开头）的 reason token。
+pub const INVALID_REASON_MASQUE_PATH: &str = "masque-path-invalid";
+/// MASQUE 节点 `version` 不在内核接受的 0–3 之内的 reason token。
+pub const INVALID_REASON_MASQUE_VERSION: &str = "masque-version-invalid";
+
+/// 生成侧恒不下发、透传袋里出现也剥掉的键。
+///
+/// - `system` / `name`：系统网卡模式与 Polaris 自己的 TUN（默认路由归它）、helper 提权模型
+///   （系统代理与测速临时核都不提权起核）冲突，且内核这支不装路由、没有流量会主动进那块网卡；
+///   固定走内部栈（未设置 = 内核缺省 false）。
+/// - `advertise_routes`：请服务端把这些前缀打进本机当入站处理，而本仓 route 规则不按 endpoint 入站
+///   区分 ⇒ 平白多出一条入站暴露面；它还在 `CARRY_TRAFFIC_KEYS` 里，会改变承流判定。
+/// - 其余是生成侧自己写的键（顶层字段 / endpoint 具名字段）：袋里再留一份会与具名值重复或打架。
+const MASQUE_STRIPPED_KEYS: &[&str] = &[
+    "system",
+    "name",
+    "advertise_routes",
+    "type",
+    "tag",
+    "server",
+    "server_port",
+    "username",
+    "password",
+    "tls",
+    "detour",
+    "domain_resolver",
+];
+
+/// HTTP/2 调优键（sing-box `option/http.go` 的 HTTP2Options，以 v1.15.0-alpha.7 为准）。
+/// `version: 1` 下出现即 decode 失败、整核起不来（随包核实测）。
+const MASQUE_H2_KEYS: &[&str] = &[
+    "idle_timeout",
+    "keep_alive_period",
+    "stream_receive_window",
+    "connection_receive_window",
+    "max_concurrent_streams",
+];
+/// QUIC 独有键（QUICOptions 在 HTTP2Options 之上多出的两个）。`version: 1/2` 下出现即 decode 失败。
+const MASQUE_QUIC_ONLY_KEYS: &[&str] = &["initial_packet_size", "disable_path_mtu_discovery"];
+
+/// 该版本下内核不认、必须剥掉的调优键。缺省 / 0 / 3 同时接受两组（schema 把两者铺平）。
+fn masque_incompatible_keys(version: Option<u32>) -> Vec<&'static str> {
+    match version {
+        Some(1) => [MASQUE_H2_KEYS, MASQUE_QUIC_ONLY_KEYS].concat(),
+        Some(2) => MASQUE_QUIC_ONLY_KEYS.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// MASQUE 客户端 endpoint 构造。主核发射腿、测速临时核、`selected_server_precludes_selector_fallback`
+/// 共用本函数：剔节点的判据只有这一份，三处不会漂移。
+///
+/// 失败即关闭：`Err(reason token)` 表示该节点会让**整份配置**起不来（内核 initialize/decode 失败），
+/// 调用方须剔除并上报，而不是下发。版本与调优键不兼容**不剔节点**，只剥键并经 `log` 记 Warn ——
+/// 用户切版本是合法操作，残留的调优键不该让节点消失。
+///
+/// 缺 `masqueClientSettings` 按缺省处理：必需内容都在顶层，空设置本来就是完整节点。
+pub fn build_masque_endpoint(
+    server: &ServerConfig,
+    tag: &str,
+    domain_resolver: Option<&DomainResolver>,
+    detour_tag: Option<&str>,
+    log: fn(crate::user_config::log_level::LogLevel, &str),
+) -> Result<Endpoint, &'static str> {
+    let settings = server.masque_client_settings.as_deref();
+    if settings
+        .and_then(|s| s.path.as_deref())
+        .is_some_and(|p| !p.is_empty() && !p.starts_with('/'))
+    {
+        return Err(INVALID_REASON_MASQUE_PATH);
+    }
+    let version = settings.and_then(|s| s.version);
+    if version.is_some_and(|v| v > 3) {
+        return Err(INVALID_REASON_MASQUE_VERSION);
+    }
+    // 设置结构的 serde 名即内核键名 ⇒ 序列化结果 = 建模键 ∪ 透传袋，顺序固定为
+    // 「袋 → 剥禁止键与不兼容键 → 具名字段覆盖」（同 Tor 腿）。
+    let mut extra = match serde_json::to_value(settings) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    for k in MASQUE_STRIPPED_KEYS {
+        extra.remove(*k);
+    }
+    let dropped: Vec<&str> = masque_incompatible_keys(version)
+        .into_iter()
+        .filter(|k| extra.remove(*k).is_some())
+        .collect();
+    if !dropped.is_empty() {
+        log(
+            crate::user_config::log_level::LogLevel::Warn,
+            &format!(
+                "节点「{tag}」：已忽略与 HTTP/{} 不兼容的键 {}（内核在该版本下不认，下发会让整核起不来）",
+                version.unwrap_or_default(),
+                dropped.join(", ")
+            ),
+        );
+    }
+
+    extra.insert("server".into(), server.address.clone().into());
+    extra.insert("server_port".into(), server.port.into());
+    for (key, value) in [
+        ("username", &server.username),
+        ("password", &server.password),
+    ] {
+        if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+            extra.insert(key.into(), v.into());
+        }
+    }
+    // TLS 恒开：v3 缺 TLS 整核失败；h1/h2 明文虽合法，但 Basic 凭据会明文过线，没有产品场景。
+    // 只取 SNI / insecure / 两种 pin；ALPN 由 version 决定，uTLS/ECH/分片本期不下发。
+    let tls = server.tls_settings.as_ref();
+    let tls = crate::singbox::outbound::OutboundTls {
+        enabled: true,
+        server_name: Some(
+            tls.and_then(|t| t.server_name.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| server.address.clone()),
+        ),
+        insecure: Some(tls.and_then(|t| t.allow_insecure).unwrap_or(false)),
+        alpn: None,
+        engine: None,
+        spoof: None,
+        spoof_method: None,
+        utls: None,
+        reality: None,
+        ech: None,
+        fragment: None,
+        certificate_sha256: crate::user_config::tls_pin::cert_pins_for_kernel(
+            tls.and_then(|t| t.certificate_sha256.as_deref()),
+        ),
+        certificate_public_key_sha256: crate::user_config::tls_pin::cert_pins_for_kernel(
+            tls.and_then(|t| t.certificate_public_key_sha256.as_deref()),
+        ),
+    };
+    if let Ok(v) = serde_json::to_value(tls) {
+        extra.insert("tls".into(), v);
+    }
+
+    Ok(Endpoint {
+        type_field: crate::builder::outbound::protocol_str(Protocol::MasqueClient),
+        tag: tag.to_owned(),
+        domain_resolver: domain_resolver.cloned(),
+        detour: detour_tag.map(String::from),
+        extra,
+        ..Default::default()
+    })
+}
+
 /// WireGuard endpoint 构造。上游 `buildWireGuardEndpoint`。
 /// domain_resolver + platform + tailscale_state_dir（路径）注入。
 ///

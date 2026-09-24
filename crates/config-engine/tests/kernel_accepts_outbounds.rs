@@ -1202,6 +1202,177 @@ fn bundled_core_accepts_tailscale_endpoint() {
     }
 }
 
+/// 🔴 **MASQUE 客户端 endpoint：从 `UserConfig` 走生成器，随包核 decode + initialize 全过。**
+///
+/// 覆盖 version 缺省 / 2 / 1、两种 pin、meshRoutes、on_demand、detour、headers/path/mtu 与透传袋。
+/// 只判 rc=0 不够：先钉产物（真在 `endpoints[]`、禁止键被剥、不兼容键被剥、无害袋键仍在），
+/// 再问内核；末尾三条阴性对照证明 check 真读了这个对象、且剥键与 path 校验都有牙。
+#[test]
+fn bundled_core_accepts_masque_client_endpoint() {
+    const B64: &str = "LXEWQrcmsEQBYnyp+6wy9chTD7GQPMTbAiWHF5IaSIE=";
+    const HEX: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+    let raw = format!(
+        r#"{{
+            "servers": [
+              {{"id":"s","name":"SOCKS","protocol":"socks","address":"1.2.3.4","port":1080}},
+              {{"id":"m3","name":"MQ3","protocol":"masque-client","address":"mq.example.com",
+                "port":18443,"username":"u","password":"p","detour":"s","onDemand":true,
+                "meshRoutes":["10.77.0.0/24"],
+                "tlsSettings":{{"serverName":"sni.example.com","allowInsecure":true,
+                    "certificateSha256":"{HEX}","certificatePublicKeySha256":"{B64}"}},
+                "masqueClientSettings":{{"path":"/.well-known/masque/ip/","mtu":1400,
+                    "headers":{{"Authorization":"Bearer t","X-A":["1","2"]}},
+                    "udp_timeout":"5m","max_concurrent_streams":8,"initial_packet_size":1280,
+                    "system":true,"name":"mq0","advertise_routes":["10.0.0.0/8"]}}}},
+              {{"id":"m2","name":"MQ2","protocol":"masque-client","address":"mq.example.com",
+                "port":18444,
+                "masqueClientSettings":{{"version":2,"idle_timeout":"30s","initial_packet_size":1280}}}},
+              {{"id":"m1","name":"MQ1","protocol":"masque-client","address":"mq.example.com",
+                "port":18445,
+                "masqueClientSettings":{{"version":1,"idle_timeout":"30s",
+                    "disable_path_mtu_discovery":true}}}},
+              {{"id":"bad","name":"MQBAD","protocol":"masque-client","address":"mq.example.com",
+                "port":18446,"masqueClientSettings":{{"path":"no-slash"}}}}
+            ],
+            "selectedServerId":"m3","proxyMode":"smart",
+            "proxyModeType":"manual","mixedPort":17899
+        }}"#
+    );
+    let input: UserConfig = serde_json::from_str(&raw).expect("夹具无效");
+    let outcome = polaris_config_engine::builder::generate_sing_box_config_with_report(
+        &input,
+        &BTreeMap::new(),
+        &deps_for("linux"),
+    )
+    .expect("生成配置");
+    let value = serde_json::to_value(&outcome.config).expect("序列化");
+
+    // path 非法的节点被剔除并上报，不进产物（它会让内核 initialize 失败、整核起不来）。
+    assert!(
+        outcome
+            .invalid_nodes
+            .iter()
+            .any(|n| n.id == "bad" && n.reason == "masque-path-invalid"),
+        "path 非法的节点没被上报：{:?}",
+        outcome.invalid_nodes
+    );
+
+    let eps = value["endpoints"].as_array().cloned().unwrap_or_default();
+    let mq: Vec<&Value> = eps
+        .iter()
+        .filter(|e| e["type"] == "masque-client")
+        .collect();
+    assert_eq!(
+        mq.len(),
+        3,
+        "前置断言：endpoints[] 里应恰有三个 masque-client（bad 已剔）：{eps:#?}"
+    );
+    assert!(
+        !value["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["type"] == "masque-client"),
+        "masque-client 跑进了 outbounds[] —— 内核判 unknown outbound type，整个核起不来"
+    );
+    let by_port = |port: u64| -> &Value {
+        mq.iter()
+            .find(|e| e["server_port"] == port)
+            .unwrap_or_else(|| panic!("缺 server_port={port} 的 endpoint"))
+    };
+
+    let e3 = by_port(18443);
+    assert_eq!(e3["server"], json!("mq.example.com"));
+    assert_eq!(e3["username"], json!("u"));
+    assert_eq!(e3["password"], json!("p"));
+    assert_eq!(e3["detour"], json!("SOCKS"), "D2：MASQUE 接前置代理");
+    assert_eq!(e3["on_demand"], json!(true));
+    assert_eq!(e3["tls"]["enabled"], json!(true));
+    assert_eq!(e3["tls"]["server_name"], json!("sni.example.com"));
+    assert_eq!(e3["tls"]["insecure"], json!(true));
+    assert_eq!(e3["tls"]["certificate_sha256"], json!([B64]));
+    assert_eq!(e3["tls"]["certificate_public_key_sha256"], json!([B64]));
+    assert_eq!(e3["path"], json!("/.well-known/masque/ip/"));
+    assert_eq!(e3["mtu"], json!(1400));
+    assert_eq!(e3["headers"]["X-A"], json!(["1", "2"]));
+    for k in [
+        "udp_timeout",
+        "max_concurrent_streams",
+        "initial_packet_size",
+    ] {
+        assert!(e3.get(k).is_some(), "缺省版本下袋键 `{k}` 应原样下发");
+    }
+    for k in ["system", "name", "advertise_routes"] {
+        assert!(
+            e3.get(k).is_none(),
+            "禁止键 `{k}` 从透传袋漏进了产物：{e3:#}"
+        );
+    }
+    let e2 = by_port(18444);
+    assert_eq!(e2["version"], json!(2));
+    assert!(e2.get("idle_timeout").is_some(), "v2 应保留 H2 键");
+    assert!(
+        e2.get("initial_packet_size").is_none(),
+        "v2 下 QUIC 键必须剥掉"
+    );
+    let e1 = by_port(18445);
+    assert_eq!(e1["version"], json!(1));
+    for k in ["idle_timeout", "disable_path_mtu_discovery"] {
+        assert!(e1.get(k).is_none(), "v1 下 `{k}` 必须剥掉");
+    }
+    // meshRoutes 让它具备组网资格 ⇒ 生成侧必须为该段发 force-route 到它自己的 tag。
+    let route_text = value["route"].to_string();
+    assert!(
+        route_text.contains("10.77.0.0/24") && route_text.contains("\"MQ3\""),
+        "meshRoutes 没有落成指向 MQ3 的 force-route：{route_text}"
+    );
+
+    let Some(core) = core_or_skip("MASQUE 客户端 endpoint 门") else {
+        return;
+    };
+    let dir = test_temp_dir("polaris-kgate-masque-");
+    let surface = outbound_surface(&value);
+    let p = dir.path().join("masque.json");
+    std::fs::write(&p, serde_json::to_vec_pretty(&surface).unwrap()).expect("写盘");
+    let (ok, diag) = check(&core, &p);
+    assert!(ok, "随包核拒绝了 masque-client endpoint：{diag}");
+
+    // 阴性对照 ①：同一个对象塞进 outbounds[] ⇒ 必红（证明 check 真的读到了它）。
+    let mut moved = surface.clone();
+    let obj = e3.clone();
+    moved["outbounds"].as_array_mut().unwrap().push(obj);
+    let pm = dir.path().join("masque-in-outbounds.json");
+    std::fs::write(&pm, serde_json::to_vec_pretty(&moved).unwrap()).expect("写盘");
+    let (ok, diag) = check(&core, &pm);
+    assert!(
+        !ok && diag.contains("masque-client"),
+        "masque-client 放进 outbounds[] 居然没被拒 —— 上面那条绿不说明内核读过它；实得：{diag}"
+    );
+
+    // 阴性对照 ② / ③：把生成侧剥掉的 QUIC 键放回 v2、把 path 换成非法值 ⇒ 都必红
+    // （证明剥键与 path 剔除不是在防一个内核并不在乎的东西）。
+    for (name, key, val) in [
+        ("v2-quic", "initial_packet_size", json!(1280)),
+        ("bad-path", "path", json!("no-slash")),
+    ] {
+        let mut bad = surface.clone();
+        let ep = bad["endpoints"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|e| e["server_port"] == 18444)
+            .unwrap();
+        ep[key] = val;
+        let pb = dir.path().join(format!("masque-{name}.json"));
+        std::fs::write(&pb, serde_json::to_vec_pretty(&bad).unwrap()).expect("写盘");
+        let (ok, diag) = check(&core, &pb);
+        assert!(
+            !ok && diag.contains(key.split('_').next().unwrap()),
+            "{name}：内核居然收下了 —— 对应的生成侧拦截没有牙；实得：{diag}"
+        );
+    }
+}
+
 /// 每个协议的产物**都必须被某条真核门判过** —— 谁认领，写下来。
 ///
 /// # 为什么要有这条
@@ -1253,6 +1424,7 @@ fn every_protocol_is_claimed_by_some_kernel_gate() {
         Protocol::Tor,
         Protocol::Openconnect,
         Protocol::OpenvpnClient,
+        Protocol::MasqueClient,
         Protocol::Custom,
     ];
 
@@ -1267,6 +1439,7 @@ fn every_protocol_is_claimed_by_some_kernel_gate() {
             Openconnect | OpenvpnClient => Claim::Named(
                 "endpoint_family_vpn_clients_land_in_endpoints_and_the_core_accepts_them",
             ),
+            MasqueClient => Claim::Named("bundled_core_accepts_masque_client_endpoint"),
             Custom => Claim::Exempt(
                 "载荷是用户原样 JSON，本文件不替用户造夹具；同一份 JSON 由 C10「测试内核兼容性」\
                  按钮与 custom 腿共用的 `custom_outbound_type` 谓词判形状",
@@ -1580,8 +1753,9 @@ fn bundled_core_accepts_dns_owned_connection_resolution_with_fakeip() {
 // 带 `on_demand` 的 endpoint 若能过 decode，就说明内核 schema 里确实有这个键、且在 endpoint 上。
 // 反过来，写错键名或摆错容器会当场 `unknown field`，不需要另造阴性对照。
 
-/// 四种 endpoint 协议的最小夹具（凭据只需过 decode，不需过 initialize）。
-const ON_DEMAND_FIXTURES: [(&str, &str); 4] = [
+/// 每种 endpoint 协议的最小夹具（凭据只需过 decode，不需过 initialize）。
+/// 协议集由下面的门对着 `lands_in_endpoints` 派生校验 —— 本表手写、不会自己长。
+const ON_DEMAND_FIXTURES: [(&str, &str); 5] = [
     (
         "wireguard",
         r#""wireguardSettings":{"privateKey":"iOwLPBGGWkKDN4hRUPQwq8W4C4rSDPrRLcrHVvHkNlQ=",
@@ -1600,10 +1774,38 @@ const ON_DEMAND_FIXTURES: [(&str, &str); 4] = [
         r#""openvpnClientSettings":{"server":"vpn.example.com","server_port":1194,
             "username":"u","password":"p"}"#,
     ),
+    // 地址/凭据/TLS 都在顶层，设置结构可缺省。
+    ("masque-client", r#""username":"u","password":"p""#),
 ];
 
 #[test]
 fn on_demand_decodes_on_every_endpoint_type() {
+    // 覆盖轴从 `lands_in_endpoints` 派生：新增 endpoint 协议而夹具没跟上 ⇒ 当场红，
+    // 而不是本门静默缩小取材面。
+    {
+        use polaris_config_engine::user_config::server_config::{
+            lands_in_endpoints, ALL_PROTOCOLS,
+        };
+        let mut want: Vec<String> = ALL_PROTOCOLS
+            .into_iter()
+            .filter(|p| lands_in_endpoints(*p))
+            .map(|p| match serde_json::to_value(p).expect("序列化") {
+                Value::String(s) => s,
+                other => panic!("{p:?} 序列化成非字符串 {other:?}"),
+            })
+            .collect();
+        let mut have: Vec<String> = ON_DEMAND_FIXTURES
+            .iter()
+            .map(|(p, _)| (*p).to_string())
+            .collect();
+        want.sort();
+        have.sort();
+        assert_eq!(
+            have, want,
+            "ON_DEMAND_FIXTURES 与 lands_in_endpoints 的协议集对不上"
+        );
+    }
+
     let Some(core) = core_or_skip("on_demand 端点键门") else {
         return;
     };

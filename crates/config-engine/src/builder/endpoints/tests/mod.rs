@@ -208,3 +208,237 @@ fn warp_endpoint_policy_differs_from_plain_wireguard() {
         "显式 0 应关闭保活，不能被改写回 25 秒"
     );
 }
+
+// ── MASQUE 客户端 ─────────────────────────────────────────────────────────────
+
+fn masque(
+    settings: Option<crate::user_config::protocol_settings::MasqueClientSettings>,
+) -> ServerConfig {
+    ServerConfig {
+        id: "m1".into(),
+        name: "MQ".into(),
+        protocol: Protocol::MasqueClient,
+        address: "mq.example.com".into(),
+        port: 443,
+        masque_client_settings: settings.map(Box::new),
+        ..Default::default()
+    }
+}
+
+fn masque_bag(
+    pairs: serde_json::Value,
+) -> crate::user_config::protocol_settings::MasqueClientSettings {
+    serde_json::from_value(pairs).expect("MASQUE 设置夹具无效")
+}
+
+fn no_log(_: crate::user_config::log_level::LogLevel, _: &str) {}
+
+fn masque_ep(s: &ServerConfig) -> serde_json::Value {
+    let ep = build_masque_endpoint(s, "MQ", None, None, no_log).expect("合法节点应能构造");
+    serde_json::to_value(ep).expect("序列化")
+}
+
+/// 顶层字段映射：server/port/凭据取顶层；TLS 恒开、SNI 缺省回落节点地址、pin 转成内核要的 base64。
+/// 缺设置结构也是完整节点（必需内容都在顶层）。
+#[test]
+fn masque_maps_top_level_fields_and_always_enables_tls() {
+    use crate::user_config::protocol_settings::TlsSettings;
+    const HEX: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+    const B64: &str = "LXEWQrcmsEQBYnyp+6wy9chTD7GQPMTbAiWHF5IaSIE=";
+
+    let bare = masque_ep(&masque(None));
+    assert_eq!(bare["type"], "masque-client");
+    assert_eq!(bare["server"], "mq.example.com");
+    assert_eq!(bare["server_port"], 443);
+    assert_eq!(
+        bare["tls"]["enabled"], true,
+        "TLS 必须恒开：v3 缺 TLS 整核失败"
+    );
+    assert_eq!(
+        bare["tls"]["server_name"], "mq.example.com",
+        "未填 SNI 时回落节点地址"
+    );
+    assert_eq!(bare["tls"]["insecure"], false);
+    for k in ["username", "password", "version", "path", "detour"] {
+        assert!(bare.get(k).is_none(), "未设置的 `{k}` 不应下发：{bare}");
+    }
+
+    let mut s = masque(None);
+    s.username = Some("u".into());
+    s.password = Some("p".into());
+    s.tls_settings = Some(TlsSettings {
+        server_name: Some("sni.example.com".into()),
+        allow_insecure: Some(true),
+        certificate_sha256: Some(HEX.into()),
+        certificate_public_key_sha256: Some(B64.into()),
+        alpn: Some(vec!["h2".into()]),
+        ..Default::default()
+    });
+    let ep = masque_ep(&s);
+    assert_eq!(ep["username"], "u");
+    assert_eq!(ep["password"], "p");
+    assert_eq!(ep["tls"]["server_name"], "sni.example.com");
+    assert_eq!(ep["tls"]["insecure"], true);
+    assert_eq!(ep["tls"]["certificate_sha256"], serde_json::json!([B64]));
+    assert_eq!(
+        ep["tls"]["certificate_public_key_sha256"],
+        serde_json::json!([B64])
+    );
+    assert!(
+        ep["tls"].get("alpn").is_none(),
+        "ALPN 由 version 决定，用户手填的不下发"
+    );
+}
+
+/// 透传袋里的 `system` / `name` / `advertise_routes` 一律发不出去；同一个袋里的无害键
+/// `udp_timeout` 必须发出去（反向对照：证明合并确实发生过，不是整袋被丢）。
+/// 袋里冒名顶替的生成侧键（server/tls/detour）同样被具名值压住。
+#[test]
+fn masque_strips_forbidden_keys_but_keeps_the_rest_of_the_bag() {
+    let s = masque(Some(masque_bag(serde_json::json!({
+        "system": true,
+        "name": "mq0",
+        "advertise_routes": ["10.0.0.0/8"],
+        "udp_timeout": "5m",
+        "server": "evil.example.com",
+        "tls": {"enabled": false},
+        "detour": "ghost",
+    }))));
+    let ep = masque_ep(&s);
+    for k in ["system", "name", "advertise_routes", "detour"] {
+        assert!(ep.get(k).is_none(), "`{k}` 从透传袋漏进了产物：{ep}");
+    }
+    assert_eq!(ep["udp_timeout"], "5m", "无害袋键必须原样下发");
+    assert_eq!(ep["server"], "mq.example.com", "顶层地址是唯一真值");
+    assert_eq!(ep["tls"]["enabled"], true);
+}
+
+/// 版本 × 键矩阵，逐格对着随包核实测表（缺省/3 两组都收；2 只收 H2；1 都不收）。
+#[test]
+fn masque_strips_keys_incompatible_with_the_http_version() {
+    const H2: &[&str] = &[
+        "idle_timeout",
+        "keep_alive_period",
+        "stream_receive_window",
+        "connection_receive_window",
+        "max_concurrent_streams",
+    ];
+    const QUIC: &[&str] = &["initial_packet_size", "disable_path_mtu_discovery"];
+    let mut bag = serde_json::json!({
+        "idle_timeout": "30s", "keep_alive_period": "10s", "stream_receive_window": 1048576,
+        "connection_receive_window": 1048576, "max_concurrent_streams": 8,
+        "initial_packet_size": 1280, "disable_path_mtu_discovery": true,
+    });
+    for (version, keep_h2, keep_quic) in [
+        (None, true, true),
+        (Some(3), true, true),
+        (Some(2), true, false),
+        (Some(1), false, false),
+    ] {
+        bag["version"] = serde_json::to_value(version).unwrap();
+        let ep = masque_ep(&masque(Some(masque_bag(bag.clone()))));
+        for k in H2 {
+            assert_eq!(
+                ep.get(*k).is_some(),
+                keep_h2,
+                "version={version:?} 下 H2 键 `{k}`"
+            );
+        }
+        for k in QUIC {
+            assert_eq!(
+                ep.get(*k).is_some(),
+                keep_quic,
+                "version={version:?} 下 QUIC 键 `{k}`"
+            );
+        }
+    }
+}
+
+/// 剥键要记 Warn（用户该知道自己的调优键没生效），不剥时不吵。
+#[test]
+fn masque_logs_a_warning_only_when_it_strips() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WARNS: AtomicUsize = AtomicUsize::new(0);
+    fn count(level: crate::user_config::log_level::LogLevel, msg: &str) {
+        if level == crate::user_config::log_level::LogLevel::Warn
+            && msg.contains("initial_packet_size")
+        {
+            WARNS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let s = masque(Some(masque_bag(
+        serde_json::json!({"version": 2, "initial_packet_size": 1280}),
+    )));
+    build_masque_endpoint(&s, "MQ", None, None, count).unwrap();
+    assert_eq!(WARNS.load(Ordering::SeqCst), 1);
+    let s = masque(Some(masque_bag(
+        serde_json::json!({"initial_packet_size": 1280}),
+    )));
+    build_masque_endpoint(&s, "MQ", None, None, count).unwrap();
+    assert_eq!(
+        WARNS.load(Ordering::SeqCst),
+        1,
+        "缺省版本不剥键，不该记 Warn"
+    );
+}
+
+/// fail-closed：path 非空且不以 `/` 开头、version 超出 0–3 ⇒ 内核整核失败 ⇒ 构造器拒绝并给 token。
+/// 空 path 内核接受（等于缺省模板），不拒。
+#[test]
+fn masque_rejects_values_that_would_fail_the_whole_core() {
+    let with = |bag: serde_json::Value| masque(Some(masque_bag(bag)));
+    assert_eq!(
+        build_masque_endpoint(
+            &with(serde_json::json!({"path": "no-slash"})),
+            "MQ",
+            None,
+            None,
+            no_log
+        )
+        .unwrap_err(),
+        INVALID_REASON_MASQUE_PATH
+    );
+    assert_eq!(
+        build_masque_endpoint(
+            &with(serde_json::json!({"path": " /x"})),
+            "MQ",
+            None,
+            None,
+            no_log
+        )
+        .unwrap_err(),
+        INVALID_REASON_MASQUE_PATH,
+        "前导空格实测同样被内核拒"
+    );
+    assert_eq!(
+        build_masque_endpoint(
+            &with(serde_json::json!({"version": 4})),
+            "MQ",
+            None,
+            None,
+            no_log
+        )
+        .unwrap_err(),
+        INVALID_REASON_MASQUE_VERSION
+    );
+    for ok in [
+        serde_json::json!({"path": ""}),
+        serde_json::json!({"path": "/masque"}),
+        serde_json::json!({"version": 0}),
+    ] {
+        assert!(
+            build_masque_endpoint(&with(ok.clone()), "MQ", None, None, no_log).is_ok(),
+            "{ok} 内核接受，不该被拒"
+        );
+    }
+}
+
+/// detour / domain_resolver 走 endpoint 具名字段（D2：MASQUE 接前置代理）。
+#[test]
+fn masque_carries_detour_and_domain_resolver() {
+    let dial = crate::builder::helpers::get_node_dial_domain_resolver("dns-bootstrap", false);
+    let ep =
+        build_masque_endpoint(&masque(None), "MQ", Some(&dial), Some("SOCKS"), no_log).unwrap();
+    assert_eq!(ep.detour.as_deref(), Some("SOCKS"));
+    assert_eq!(ep.domain_resolver, Some(dial));
+}

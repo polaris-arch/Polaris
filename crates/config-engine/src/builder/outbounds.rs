@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::builder::endpoint_routes::active_physical_root_ids;
 use crate::builder::endpoints::{
-    build_tailscale_endpoint, build_vpn_client_endpoint, build_wireguard_endpoint,
+    build_masque_endpoint, build_tailscale_endpoint, build_vpn_client_endpoint,
+    build_wireguard_endpoint,
 };
 use crate::builder::helpers::{
     build_id_to_tag_map, effective_app_rules, effective_custom_rules, get_domestic_resolver_tag,
@@ -482,6 +483,40 @@ pub fn build_outbounds_with_runtime_bindings(
             apply_on_demand(&mut endpoint, server);
             pending_endpoints.push(endpoint);
             node_tags.push(tag);
+            continue;
+        }
+
+        // ── MASQUE 客户端（2026-09-24）：同属端点族，但地址/凭据/TLS 取自顶层、还要按版本剥键，
+        // 故不塞进上面那个「设置结构原样 flatten」的共享构造器。
+        // 判据取用户原值、在构造之前判（同 control_url 腿）：path / version 非法会让内核
+        // initialize/decode 失败、整份配置起不来 ⇒ 剔除该节点并上报，不下发。
+        if server.protocol == Protocol::MasqueClient {
+            // 前置代理：h3 经它需要 UDP 转发（同 WG），h2/h1 只需 TCP。
+            let detour_tag = resolve_detour_tag(server, config, &id_to_tag);
+            match build_masque_endpoint(
+                server,
+                &tag,
+                Some(&dial_resolver),
+                detour_tag.as_deref(),
+                deps.log,
+            ) {
+                Ok(mut endpoint) => {
+                    apply_bind_interface(&mut endpoint.extra, bind_interface.as_deref());
+                    apply_on_demand(&mut endpoint, server);
+                    pending_endpoints.push(endpoint);
+                    node_tags.push(tag);
+                }
+                Err(token) => {
+                    deps.gate_invalid_nodes.insert(server.id.clone(), token);
+                    (deps.log)(
+                        LogLevel::Warn,
+                        &format!(
+                            "启动前配置校验：MASQUE 节点「{tag}」配置非法（{token}），已剔除 —— \
+                             该写法会让 sing-box 在初始化 endpoint 时整核失败"
+                        ),
+                    );
+                }
+            }
             continue;
         }
 

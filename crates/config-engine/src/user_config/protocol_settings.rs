@@ -380,6 +380,32 @@ pub struct OpenvpnClientSettings {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// MASQUE 客户端设置（2026-09-24）。serde 名 = sing-box 键名，理由同 [`OpenconnectSettings`]。
+///
+/// ⚠️ 与 openconnect 的差别：`server` / `server_port` / `username` / `password` / `tls` **不在这里**，
+/// 复用 `ServerConfig` 顶层的 address/port/username/password/tlsSettings —— 内核这支的 server 本就是
+/// 拆开的两个键，另存一份只会造出第二份真值（`route_binding`、sanitize 地址校验、订阅指纹都读顶层）。
+/// 生成侧见 `builder::endpoints::build_masque_endpoint`：透传袋 → 剥禁止键/不兼容键 → 具名字段覆盖。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MasqueClientSettings {
+    /// URI 模板路径；非空时必须以 `/` 开头，否则内核 initialize 失败、整核起不来（生成侧剔节点）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// 额外 HTTP 头。值可为字符串或字符串数组（内核 `Listable`），故不收窄成 `Vec<String>` ——
+    /// 收窄会让导入的单串形态整份 UserConfig 反序列化失败。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// HTTP 版本：缺省（内核 = 3 并可回落）/ 3 / 2 / 1。决定哪些 H2/QUIC 调优键可下发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+    /// **透传袋**：同 [`OpenconnectSettings::extra`]。其中 `system` / `name` / `advertise_routes`
+    /// 由生成侧强制剥掉（理由见 `build_masque_endpoint`）。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
 /// OpenVPN 的 TLS 材料（内核 `$defs/OpenVPNOutboundTLSOptions` 的子集）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OpenvpnTlsSettings {

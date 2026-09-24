@@ -163,3 +163,41 @@ fn absent_keys_still_default_to_empty() {
     assert!(uc.rule_resources.is_empty());
     assert!(uc.custom_rules.is_empty());
 }
+
+/// MASQUE 节点的真实键名：`masqueClientSettings` 是 camelCase 外壳，里面是**内核键名**（snake_case，
+/// 与 openconnect/openvpn 设置同一契约）。外壳漏 rename ⇒ 设置整块静默丢失；里层写成 camelCase ⇒
+/// 落进透传袋原样下发 ⇒ 内核 `unknown field`。
+#[test]
+fn masque_client_settings_deserialize_from_real_keys() {
+    use polaris_config_engine::user_config::server_config::Protocol;
+    let uc: UserConfig = serde_json::from_value(json!({
+        "servers": [{
+            "id": "m1", "name": "MQ", "protocol": "masque-client",
+            "address": "mq.example.com", "port": 443,
+            "masqueClientSettings": {
+                "path": "/masque", "version": 2, "mtu": 1400,
+                "headers": { "Authorization": "Bearer t" },
+                "udp_timeout": "5m"
+            }
+        }]
+    }))
+    .expect("真实 config 应可反序列化");
+    let s = &uc.servers[0];
+    assert_eq!(s.protocol, Protocol::MasqueClient);
+    let m = s
+        .masque_client_settings
+        .as_deref()
+        .expect("masqueClientSettings 没读进来（外壳漏 rename）");
+    assert_eq!(m.path.as_deref(), Some("/masque"));
+    assert_eq!(m.version, Some(2));
+    assert_eq!(m.mtu, Some(1400));
+    assert!(m
+        .headers
+        .as_ref()
+        .is_some_and(|h| h.contains_key("Authorization")));
+    assert_eq!(
+        m.extra.get("udp_timeout"),
+        Some(&json!("5m")),
+        "未建模键应进透传袋"
+    );
+}

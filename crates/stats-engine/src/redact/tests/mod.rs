@@ -851,3 +851,23 @@ fn 红线_端到端_配置加日志无明文密钥与节点身份() {
         "占位符应出现"
     );
 }
+
+/// MASQUE `headers` 里的鉴权头：键名归一后命中 `authorization` ⇒ 整值打码；同一节点的形态信息
+/// （`path` / `version` / 非鉴权头）必须保留 —— 打码过度同样毁掉诊断价值。
+#[test]
+fn 红线_masque_authorization_头打码_形态保留() {
+    let v = json!({ "servers": [{
+        "protocol": "masque-client",
+        "masqueClientSettings": {
+            "path": "/masque", "version": 2,
+            "headers": { "Authorization": ["Bearer MASQUE_TOKEN"], "X-Tenant": "acme" }
+        }
+    }]});
+    let out = redact(&v);
+    assert_no_plaintext(&out, &["MASQUE_TOKEN"]);
+    let m = &out["servers"][0]["masqueClientSettings"];
+    assert_eq!(m["headers"]["Authorization"], json!(REDACTED));
+    assert_eq!(m["headers"]["X-Tenant"], json!("acme"));
+    assert_eq!(m["path"], json!("/masque"));
+    assert_eq!(m["version"], json!(2));
+}

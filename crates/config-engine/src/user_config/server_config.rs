@@ -155,6 +155,14 @@ pub enum Protocol {
     /// 三处登记表的一致性由 `crates/store/tests/protocol_registries_agree.rs` 钉住。
     #[serde(rename = "openvpn-client", alias = "openvpnclient")]
     OpenvpnClient,
+    /// MASQUE（RFC 9484 CONNECT-IP）客户端 endpoint。内核只收在 `endpoints[]`（塞 `outbounds[]` 得
+    /// `unknown outbound type: masque-client`，实测）。对接通用 CONNECT-IP 服务端（如自建
+    /// `masque-server`），**不是** WARP-MASQUE：内核把 upgrade token 写死为 `connect-ip`。
+    ///
+    /// 与 [`Self::OpenvpnClient`] 同理需要 per-variant rename：wire 名取内核 type 名，三张登记表
+    /// （serde 名 / `ALLOWED_PROTOCOLS` / UI `NodeProto`）照它对齐；`alias` 收下折叠拼法。
+    #[serde(rename = "masque-client", alias = "masqueclient")]
+    MasqueClient,
     Custom,
 }
 
@@ -424,9 +432,9 @@ pub struct ServerConfig {
     /// 默认开等于给存量用户换语义。
     #[serde(rename = "onDemand", skip_serializing_if = "Option::is_none")]
     pub on_demand: Option<bool>,
-    /// 用户声明的「经该节点可达的内网段」（CIDR）。**仅 endpoint 腿的 VPN 客户端
-    /// （openconnect / openvpn-client）读它**，是这两个协议获得组网资格的唯一途径
-    /// （见 [`is_mesh_node`]）。
+    /// 用户声明的「经该节点可达的内网段」（CIDR）。**仅 [`declares_mesh_routes`] 命中的 endpoint 腿
+    /// VPN 客户端（openconnect / openvpn-client / masque-client）读它**，是这些协议获得组网资格的唯一
+    /// 途径（见 [`is_mesh_node`]）。
     ///
     /// # 为什么它们需要用户手填，而 WG/TS 不用
     ///
@@ -508,6 +516,13 @@ pub struct ServerConfig {
     )]
     pub openvpn_client_settings:
         Option<Box<crate::user_config::protocol_settings::OpenvpnClientSettings>>,
+    /// MASQUE 客户端（端点族；凭 `meshRoutes` 获得组网资格）。地址/凭据/TLS 复用顶层字段。
+    #[serde(
+        rename = "masqueClientSettings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub masque_client_settings:
+        Option<Box<crate::user_config::protocol_settings::MasqueClientSettings>>,
     #[serde(rename = "wireguardSettings", skip_serializing_if = "Option::is_none")]
     pub wireguard_settings: Option<Box<WireGuardSettings>>,
     #[serde(rename = "tailscaleSettings", skip_serializing_if = "Option::is_none")]
@@ -584,7 +599,7 @@ pub fn is_mesh_protocol(p: Protocol) -> bool {
 /// 落 sing-box 顶层 `endpoints[]`（而非 `outbounds[]`）的协议 —— **内核的数据模型形态**。
 ///
 /// 与 [`is_mesh_protocol`] 是两件事：那个判「能不能声明网段」（产品能力），这个判「JSON 该塞哪个数组」
-/// （内核形态）。四个协议命中，前两个两者皆是，后两个只是形态。
+/// （内核形态）。五个协议命中，前两个两者皆是，后三个只是形态。
 ///
 /// 射程：`custom` 协议的 endpoint 腿（`customSettings.isEndpoint`）也落 `endpoints[]`，但那要看
 /// 节点的设置而非协议，本函数看不到 ⇒ 调用点若需覆盖它，须自行并上那一支（`speedtest.rs` 的
@@ -594,7 +609,7 @@ pub fn is_mesh_protocol(p: Protocol) -> bool {
 /// 手写数组本身不保证穷尽，故配套 `all_protocols_is_exhaustive` 用一个**穷尽 `match`** 钉住：
 /// 新增变体 ⇒ 那个 match 不编译 ⇒ 必须回来同步本表。没有那条测试，本表就只是一份会悄悄过期的清单，
 /// 而依赖它的门会**静默缩小取材面**（新协议不在表里 = 那条腿没人测，且一片绿）。
-pub const ALL_PROTOCOLS: [Protocol; 19] = [
+pub const ALL_PROTOCOLS: [Protocol; 20] = [
     Protocol::Vless,
     Protocol::Trojan,
     Protocol::Hysteria2,
@@ -613,13 +628,18 @@ pub const ALL_PROTOCOLS: [Protocol; 19] = [
     Protocol::Tor,
     Protocol::Openconnect,
     Protocol::OpenvpnClient,
+    Protocol::MasqueClient,
     Protocol::Custom,
 ];
 
 pub fn lands_in_endpoints(p: Protocol) -> bool {
     matches!(
         p,
-        Protocol::Wireguard | Protocol::Tailscale | Protocol::Openconnect | Protocol::OpenvpnClient
+        Protocol::Wireguard
+            | Protocol::Tailscale
+            | Protocol::Openconnect
+            | Protocol::OpenvpnClient
+            | Protocol::MasqueClient
     )
 }
 
@@ -633,8 +653,20 @@ pub fn lands_in_endpoints(p: Protocol) -> bool {
 /// [`lands_in_endpoints`]；只在拿不到整个节点时才退回 [`is_mesh_protocol`]。
 pub fn is_mesh_node(s: &ServerConfig) -> bool {
     is_mesh_protocol(s.protocol)
-        || (matches!(s.protocol, Protocol::Openconnect | Protocol::OpenvpnClient)
-            && s.mesh_routes.iter().any(|c| !c.trim().is_empty()))
+        || (declares_mesh_routes(s.protocol) && s.mesh_routes.iter().any(|c| !c.trim().is_empty()))
+}
+
+/// 凭用户手填 [`ServerConfig::mesh_routes`] 获得组网资格的协议 —— 网段由服务端在隧道建立后推送、
+/// 配置期不可知，只能认用户声明的那份。
+///
+/// 抽成单一谓词是因为「这类协议是谁」此前在 [`is_mesh_node`]、
+/// `endpoint_routes::endpoint_forced_route_cidrs`、`store::backup::classify_server` 三处各写一份
+/// `matches!`：加协议时漏改一处不会编译失败，只会让该节点在那一处被静默当成普通出口。
+pub fn declares_mesh_routes(p: Protocol) -> bool {
+    matches!(
+        p,
+        Protocol::Openconnect | Protocol::OpenvpnClient | Protocol::MasqueClient
+    )
 }
 
 #[cfg(test)]

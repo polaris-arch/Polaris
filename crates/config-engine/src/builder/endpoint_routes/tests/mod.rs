@@ -800,3 +800,52 @@ fn settled_force_route_cidrs_covers_both_producing_legs_and_excludes_preferred_b
         "PreferredBy 腿的段进了并集 —— 那是「它声明了什么」而不是「内核接管了什么」。实得 {union:?}"
     );
 }
+
+/// 【MASQUE 复用真判据】path 非法的 MASQUE 会在发射期被剔 ⇒ 选中它时 selector 可能落兜底；
+/// 合法（含缺设置）⇒ 必定发射。本用例红 = 判据与发射腿漂移了。
+#[test]
+fn selector_fallback_tracks_masque_buildability() {
+    use crate::user_config::app_config::UserConfig;
+    use crate::user_config::protocol_settings::MasqueClientSettings;
+    let mq = ServerConfig {
+        id: "mq".into(),
+        name: "MQ".into(),
+        protocol: Protocol::MasqueClient,
+        address: "mq.example.com".into(),
+        port: 443,
+        ..Default::default()
+    };
+    let mut config = UserConfig {
+        servers: vec![mq, ss("s2", "2.2.2.2")],
+        selected_server_id: Some("mq".into()),
+        ..Default::default()
+    };
+    assert!(
+        !selector_default_may_fall_back(&config),
+        "缺设置的 MASQUE 也是完整节点，必定发射"
+    );
+    config.servers[0].masque_client_settings = Some(Box::new(MasqueClientSettings {
+        path: Some("no-slash".into()),
+        ..Default::default()
+    }));
+    assert!(
+        selector_default_may_fall_back(&config),
+        "path 非法的 MASQUE 会被剔除 → 不发射 → 兜底可能触发"
+    );
+    assert!(referenced_server_ids(&config).contains("s2"));
+}
+
+/// MASQUE 凭 `meshRoutes` 获得组网资格，force-route 段只认用户声明的那份（去 catch-all）。
+#[test]
+fn masque_forced_route_comes_from_mesh_routes() {
+    let mq = ServerConfig {
+        id: "mq".into(),
+        protocol: Protocol::MasqueClient,
+        mesh_routes: vec!["10.77.0.0/24".into(), "0.0.0.0/0".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        endpoint_forced_route_cidrs(&mq, &ObservedTailnetAddresses::new()),
+        vec!["10.77.0.0/24".to_string()]
+    );
+}

@@ -51,6 +51,7 @@ const ALL_PROTOCOLS: &[Protocol] = &[
     Protocol::Tor,
     Protocol::Openconnect,
     Protocol::OpenvpnClient,
+    Protocol::MasqueClient,
     Protocol::Custom,
 ];
 
@@ -75,6 +76,8 @@ fn ui_claim(p: Protocol) -> UiClaim {
         // 组网节点走「组网」页签的专属流程（要 auth_key / 对端配置 / 单例约束），
         // 不从通用节点对话框建；`is_mesh_protocol` 的消费点也按这个前提分组。
         Wireguard | Tailscale => UiClaim::NotInDialog("组网节点，由组网页签建，不进通用节点对话框"),
+        // 后端先行（批次 M1），表单在 M2 落地时翻成 `InDialog`。
+        MasqueClient => UiClaim::NotInDialog("UI 在 M2 落地"),
     }
 }
 
@@ -340,7 +343,7 @@ fn every_protocol_is_filed_under_exactly_one_routing_class() {
     for &p in ALL_PROTOCOLS {
         let class = match p {
             Wireguard | Tailscale => Class::Mesh,
-            Openconnect | OpenvpnClient => Class::EndpointLeg,
+            Openconnect | OpenvpnClient | MasqueClient => Class::EndpointLeg,
             Vless | Vmess | Trojan | Shadowsocks | Hysteria2 | Tuic | Socks | Http | Anytls
             | Naive | Snell | Ssh | Hysteria | Tor | Custom => Class::Outbound,
         };

@@ -29,6 +29,7 @@ export const ENDPOINT_LEG_PROTOCOLS: readonly Protocol[] = [
   'tailscale',
   'openconnect',
   'openvpn-client',
+  'masque-client',
 ];
 export function landsInEndpoints(protocol: string | undefined): boolean {
   return !!protocol && ENDPOINT_LEG_PROTOCOLS.includes(protocol.toLowerCase() as Protocol);

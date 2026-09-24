@@ -14,7 +14,9 @@ use crate::user_config::app_config::UserConfig;
 use crate::user_config::collections::{dedupe, dedupe_trim};
 use crate::user_config::dns_constants::is_sentinel_selection;
 use crate::user_config::rule::{Rule, RuleAction};
-use crate::user_config::server_config::{is_mesh_node, lands_in_endpoints, Protocol, ServerConfig};
+use crate::user_config::server_config::{
+    declares_mesh_routes, is_mesh_node, lands_in_endpoints, Protocol, ServerConfig,
+};
 
 /// 全网段（catch-all）。上游 `FULL_TUNNEL_CIDRS`。
 pub const FULL_TUNNEL_CIDRS: &[&str] = &["0.0.0.0/0", "::/0"];
@@ -277,7 +279,7 @@ pub fn endpoint_forced_route_cidrs(
         }
         // 用户手填的内网段。去 catch-all 与另两支同理：0/0 属「全隧道」意图，由各自的出网开关
         // 表达（OpenVPN 是 `redirect_gateway`），混进 force-route 会绕过那个开关。
-        Protocol::Openconnect | Protocol::OpenvpnClient => strip_catch_all(&server.mesh_routes),
+        p if declares_mesh_routes(p) => strip_catch_all(&server.mesh_routes),
         _ => return vec![],
     };
     dedupe_trim(raw)
@@ -849,7 +851,9 @@ const CARRY_TRAFFIC_KEYS: &[&str] = &[
 ///   之后是**不成立**的（形状坏的 custom outbound 现在会被剔），故必须一并收紧，否则这个
 ///   sound under-approximation 就朝「误判必定发射」＝错跳重启的方向破了；
 /// - Tailscale 的非法 `control_url` 会在发射循环中被剔除；其余 Tailscale 与普通代理 outbound
-///   无失败腿 → 必定发射。
+///   无失败腿 → 必定发射；
+/// - MASQUE：path / version 非法会被发射循环剔除 → 同 WireGuard，直接调 `build_masque_endpoint`
+///   取真判据（缺设置不剔，发射腿按缺省处理）。
 ///
 /// 外部注入的 `gate_invalid_nodes` 不建模：两个生成入口都传空集。发射循环自身会写入的
 /// Tailscale / custom 静态剔除门已在上面逐项复用；detour 剪枝若命中选中节点则返回 `Err`，不会形成
@@ -866,6 +870,9 @@ fn selected_server_precludes_selector_fallback(s: &ServerConfig) -> bool {
             .and_then(|settings| settings.control_url.as_deref())
             .and_then(crate::user_config::control_url::tailscale_control_url_reject)
             .is_none(),
+        Protocol::MasqueClient => {
+            crate::builder::endpoints::build_masque_endpoint(s, "", None, None, |_, _| {}).is_ok()
+        }
         Protocol::Custom => s.custom_settings.as_ref().is_some_and(|c| {
             crate::user_config::protocol_settings::custom_outbound_type(&c.outbound).is_some()
         }),

@@ -56,6 +56,11 @@ fn protocol_requirement_checks() {
         "openvpn-client",
         &serde_json::json!({"openvpnClientSettings":{"server":"x"}})
     ));
+    // masque-client：地址走通用校验、Basic 可选、TLS 生成侧恒开 ⇒ 无协议级必填。
+    assert!(protocol_requirement_ok(
+        "masque-client",
+        &serde_json::json!({"address":"mq.example.com","port":443})
+    ));
 }
 
 #[test]

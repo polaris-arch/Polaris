@@ -55,7 +55,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use polaris_config_engine::builder::endpoints::{
-    build_vpn_client_endpoint, build_wireguard_endpoint,
+    build_masque_endpoint, build_vpn_client_endpoint, build_wireguard_endpoint,
 };
 use polaris_config_engine::builder::outbound::build_proxy_outbound;
 use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
@@ -996,6 +996,30 @@ fn build_temp_node(
         .map_err(|_| "vpn-client 端点构造")?;
         let mut node = serde_json::to_value(endpoint).map_err(|_| "vpn-client 端点序列化")?;
         set_bind_interface(&mut node, bind_interface).ok_or("vpn-client 端点网卡绑定")?;
+        return Ok(TempNode {
+            id: s.id.clone(),
+            tag: tag.to_string(),
+            node,
+            companion_outbounds: Vec::new(),
+            is_endpoint: true,
+            has_local_v6: false,
+        });
+    }
+
+    if s.protocol == Protocol::MasqueClient {
+        // 与主核发射腿共用 `build_masque_endpoint`（含剔节点判据）：落进下面的 `build_proxy_outbound`
+        // 会把 endpoint 塞进 `outbounds[]` ⇒ 临时核 `unknown outbound type` 整核失败。
+        // detour 恒 `None`，理由同 WG 腿（前置代理不在临时核里）。
+        let endpoint = build_masque_endpoint(
+            s,
+            tag,
+            Some(&DomainResolver::Tag(DIRECT_DNS_TAG.to_string())),
+            None,
+            |_, msg| log::warn!("{msg}"),
+        )
+        .map_err(|_| "masque 端点构造")?;
+        let mut node = serde_json::to_value(endpoint).map_err(|_| "masque 端点序列化")?;
+        set_bind_interface(&mut node, bind_interface).ok_or("masque 端点网卡绑定")?;
         return Ok(TempNode {
             id: s.id.clone(),
             tag: tag.to_string(),

@@ -1240,6 +1240,7 @@ fn encode_rejects_unrepresentable_protocols() {
         Protocol::Wireguard,
         Protocol::Tailscale,
         Protocol::Ssh,
+        Protocol::MasqueClient,
         Protocol::Custom,
     ] {
         let c = ServerConfig {

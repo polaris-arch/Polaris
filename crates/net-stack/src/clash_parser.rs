@@ -1020,6 +1020,7 @@ fn build_base(
         tor_settings: None,
         openconnect_settings: None,
         openvpn_client_settings: None,
+        masque_client_settings: None,
         address: server,
         port,
         detour: None,

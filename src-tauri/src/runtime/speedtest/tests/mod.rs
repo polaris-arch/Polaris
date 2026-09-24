@@ -468,6 +468,63 @@ fn endpoint_leg_vpn_clients_go_into_endpoints_not_outbounds() {
     );
 }
 
+/// MASQUE 是 endpoint：必须落临时核 `endpoints[]`（落进 `outbounds[]` = 整核 FATAL），不带 detour
+/// （前置代理不在临时核里），且与主核共用构造器 —— path 非法的节点在起核前就被判不可测，
+/// 不会带着一个必 FATAL 的对象进临时核。
+///
+/// **变异锁**：删掉 MASQUE 构造腿（落回 `build_proxy_outbound`）⇒ 第一段转红；
+/// 构造腿不再传 `None` 给 detour ⇒ detour 断言转红。
+#[test]
+fn masque_client_goes_into_endpoints_without_detour() {
+    use polaris_config_engine::user_config::protocol_settings::MasqueClientSettings;
+    let node = ServerConfig {
+        id: "mq111111".into(),
+        name: "MQ".into(),
+        protocol: Protocol::MasqueClient,
+        address: "mq.example.com".into(),
+        port: 443,
+        detour: Some("some-front".into()),
+        ..Default::default()
+    };
+    let plan = plan_temp_core(std::slice::from_ref(&node), &env());
+    assert_eq!(plan.testable.len(), 1, "MASQUE 节点应可测");
+    assert!(plan.testable[0].is_endpoint, "MASQUE 没被判成 endpoint 腿");
+    let cfg = build_temp_core_config(&plan.testable, &[20001], "warn");
+    let endpoints = cfg["endpoints"].as_array().expect("应有 endpoints[]");
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(endpoints[0]["type"], json!("masque-client"));
+    assert_eq!(endpoints[0]["server"], json!("mq.example.com"));
+    assert!(
+        endpoints[0].get("detour").is_none(),
+        "临时核里前置代理不存在，detour 必须剥掉"
+    );
+    assert!(
+        !cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["type"] == "masque-client"),
+        "masque-client 出现在 outbounds[] ⇒ 内核 unknown outbound type，整核起不来"
+    );
+
+    let bad = ServerConfig {
+        masque_client_settings: Some(Box::new(MasqueClientSettings {
+            path: Some("no-slash".into()),
+            ..Default::default()
+        })),
+        ..node
+    };
+    let plan = plan_temp_core(std::slice::from_ref(&bad), &env());
+    assert!(plan.testable.is_empty(), "path 非法的节点不得进临时核");
+    assert_eq!(
+        plan.unusable,
+        vec![(
+            bad.id.clone(),
+            UnusableReason::BuildFailed("masque 端点构造")
+        )]
+    );
+}
+
 #[test]
 fn vpn_client_without_settings_is_excluded_before_temp_core_start() {
     for protocol in [Protocol::Openconnect, Protocol::OpenvpnClient] {
