@@ -156,6 +156,8 @@ DNS.timeout
 DNSRule.auth_user
 DNSRule.clash_mode
 DNSRule.default_interface_address
+DNSRule.dns_search_domain
+DNSRule.dns_server_address
 DNSRule.domain
 DNSRule.domain_keyword
 DNSRule.domain_regex
@@ -1674,6 +1676,8 @@ NTPOptions.write_to_system
 NestedDNSRule.auth_user
 NestedDNSRule.clash_mode
 NestedDNSRule.default_interface_address
+NestedDNSRule.dns_search_domain
+NestedDNSRule.dns_server_address
 NestedDNSRule.domain
 NestedDNSRule.domain_keyword
 NestedDNSRule.domain_regex
@@ -1733,6 +1737,8 @@ NestedRule.auth_user
 NestedRule.clash_mode
 NestedRule.client
 NestedRule.default_interface_address
+NestedRule.dns_search_domain
+NestedRule.dns_server_address
 NestedRule.domain
 NestedRule.domain_keyword
 NestedRule.domain_regex
@@ -2628,6 +2634,8 @@ Rule.auth_user
 Rule.clash_mode
 Rule.client
 Rule.default_interface_address
+Rule.dns_search_domain
+Rule.dns_server_address
 Rule.domain
 Rule.domain_keyword
 Rule.domain_regex
