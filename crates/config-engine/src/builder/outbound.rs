@@ -634,6 +634,15 @@ pub fn build_proxy_outbound(
         }
     }
 
+    // https 代理节点钉 HTTP/1.1。1.15.0-alpha.7 起内核 http 出站缺省 h2：TLS 腿 ALPN 默认带
+    // `h2`，只在 ALPN **没选中** h2 时回落 1.1；服务端宣告 h2 却不支持 h2 CONNECT 时直接失败、
+    // 不回落（207 回环实测 `HTTP/2 CONNECT: http2: frame too large`，nginx + proxy_connect
+    // 开了 http2 即此形态）。钉 1 = 升核前行为。明文腿内核本就只走 1.1（无 TLS 不进 h2 分支），
+    // 不下发，以免无谓改动产物。
+    if server.protocol == Protocol::Http && ob.tls.as_ref().is_some_and(|t| t.enabled) {
+        ob.version = Some(crate::singbox::OutboundVersion::Num(1));
+    }
+
     // 抗封后处理。
     apply_anti_censorship_options(&mut ob, server, arch);
 

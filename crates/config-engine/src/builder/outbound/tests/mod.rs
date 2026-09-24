@@ -1800,3 +1800,19 @@ fn http_host_header_kept_without_path() {
     assert!(v.get("path").is_none());
     assert_eq!(v["headers"], serde_json::json!({"Host": ["h.com"]}));
 }
+
+/// https 代理节点钉 `version: 1`；明文 http 节点不下发 `version`。
+///
+/// 1.15.0-alpha.7 起内核 http 出站缺省 h2，服务端宣告 h2 却不支持 h2 CONNECT 时不回落，
+/// 见 builder 注释。明文腿内核本就只走 1.1。
+#[test]
+fn http_tls_pins_version_1_plain_does_not() {
+    let tls = outbound_json_from(
+        r#"{"id":"s1","name":"n","protocol":"http","address":"a.com","port":443,"security":"tls"}"#,
+    );
+    assert_eq!(tls["version"], serde_json::json!(1));
+    let plain = outbound_json_from(
+        r#"{"id":"s1","name":"n","protocol":"http","address":"a.com","port":8080}"#,
+    );
+    assert!(plain.get("version").is_none());
+}
