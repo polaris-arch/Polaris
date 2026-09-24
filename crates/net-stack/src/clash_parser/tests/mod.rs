@@ -754,3 +754,57 @@ fn normalize_duration_rules() {
     );
     assert_eq!(normalize_duration(&Value::String("".into())), None);
 }
+
+// ── mihomo `fingerprint`（证书固定）→ certificateSha256 ──────────────────────────
+//
+// 四个 TLS 装配点各一条：通用段（vless/vmess/trojan/anytls）、hysteria2、tuic、http。
+// 同一条里放 `client-fingerprint` 作对照：两个名字相近的键不许串位。
+#[test]
+fn mihomo_fingerprint_maps_to_certificate_sha256_on_every_tls_arm() {
+    let colon = "2D:71:16:42:B7:26:B0:44:01:62:7C:A9:FB:AC:32:F5:C8:53:0F:B1:90:3C:C4:DB:02:25:87:17:92:1A:48:81";
+    let r = parse_one(&format!(
+        r#"
+- {{name: t, type: trojan, server: a.com, port: 443, password: pw, client-fingerprint: chrome, fingerprint: "{colon}"}}
+- {{name: h2, type: hysteria2, server: a.com, port: 443, password: pw, fingerprint: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"}}
+- {{name: tu, type: tuic, server: a.com, port: 443, uuid: u, password: pw, fingerprint: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"}}
+- {{name: hp, type: http, server: a.com, port: 443, tls: true, fingerprint: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"}}
+"#
+    ));
+    assert_eq!(r.servers.len(), 4);
+    let t = r.servers[0].tls_settings.as_ref().unwrap();
+    assert_eq!(
+        t.certificate_sha256.as_deref(),
+        Some(colon),
+        "原文保留，转码归生成侧"
+    );
+    assert_eq!(
+        t.fingerprint.as_deref(),
+        Some("chrome"),
+        "client-fingerprint 仍归 uTLS 指纹"
+    );
+    for s in &r.servers[1..] {
+        assert_eq!(
+            s.tls_settings
+                .as_ref()
+                .and_then(|t| t.certificate_sha256.as_deref()),
+            Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"),
+            "{} 的 fingerprint 没映射",
+            s.name
+        );
+    }
+}
+
+/// 老配置把浏览器名误填进 `fingerprint`（mihomo 对它是报错）→ 不落成死值。
+#[test]
+fn mihomo_fingerprint_browser_name_is_not_a_pin() {
+    let r = parse_one(
+        "- {name: t, type: trojan, server: a.com, port: 443, password: pw, fingerprint: chrome}\n",
+    );
+    assert_eq!(
+        r.servers[0]
+            .tls_settings
+            .as_ref()
+            .and_then(|t| t.certificate_sha256.clone()),
+        None
+    );
+}

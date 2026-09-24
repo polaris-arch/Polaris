@@ -2106,7 +2106,13 @@ function emptyRequired(cfg: ServerConfig): string[] {
 }
 
 /** 草稿默认值之外的填充值（其余文本框一律 'x'）。 */
-const DUMMY: Record<string, FormValue> = { outbound: '{"type":"vless","server":"e.com","server_port":443}' };
+// 证书固定两框有格式校验（非法值拒绝保存），'x' 会被当成坏值抛错 —— 与 custom JSON 同理给合法样本。
+const PIN_SAMPLE = '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881';
+const DUMMY: Record<string, FormValue> = {
+  outbound: '{"type":"vless","server":"e.com","server_port":443}',
+  certSha256: PIN_SAMPLE,
+  certPkSha256: PIN_SAMPLE,
+};
 
 /** 把该协议**表里真有的控件**全部填满：文本 → 非空、数字 → 1、开关 → 开、下拉 → 首项（可覆写）。 */
 function filledDraft(proto: NodeProto, override: Record<string, FormValue> = {}): FormValues {
@@ -2633,5 +2639,73 @@ describe('endpoint 腿 VPN 客户端的内网段与全隧道开关', () => {
     const base = { id: 'x', name: 'X', protocol: 'openvpn-client', address: 'v.example.com', port: 1194 } as ServerConfig;
     expect(protoCodec['openvpn-client'].toConfig({ redirectGw: false }, base).openvpnClientSettings?.redirect_gateway).toBe(false);
     expect(protoCodec['openvpn-client'].toConfig({ redirectGw: true }, base).openvpnClientSettings?.redirect_gateway).toBe(true);
+  });
+});
+
+// ── 证书固定（tlsSettings.certificateSha256 / certificatePublicKeySha256）─────────────
+//
+// 判据镜像 Rust `user_config::tls_pin::decode_pin`：同一批样本两边各测一遍（Rust 侧见
+// `tls_pin/tests`），任何一边放宽/收窄都会让这组与那组对不上。
+describe('证书固定：合法形态照存、非法值拒绝保存、reality 下隐藏但保全', () => {
+  const HEX = PIN_SAMPLE;
+  const B64 = 'LXEWQrcmsEQBYnyp+6wy9chTD7GQPMTbAiWHF5IaSIE=';
+  const COLON = HEX.match(/../g)!.join(':').toUpperCase();
+  const base = (protocol: NodeProto): ServerConfig =>
+    ({ id: 's1', name: 'n', protocol, address: 'a.com', port: 443 }) as ServerConfig;
+
+  it.each(['vless', 'trojan', 'http', 'hysteria2', 'tuic', 'hysteria'] as NodeProto[])(
+    '%s：hex / 冒号 hex / base64 / 逗号多条原样落盘，两键各归其位',
+    (proto) => {
+      const cfg = protoCodec[proto].toConfig(
+        // `sec:'tls'`：vless 的 sec 下拉首项是 none（整块清 tlsSettings）；其余协议无此键、忽略它。
+        filledDraft(proto, { sec: 'tls', certSha256: ` ${HEX} , ${COLON} `, certPkSha256: B64 }),
+        base(proto),
+      );
+      expect(cfg.tlsSettings?.certificateSha256).toBe(`${HEX},${COLON}`);
+      expect(cfg.tlsSettings?.certificatePublicKeySha256).toBe(B64);
+      // 往返：fromConfig 读回的草稿再写一次逐字相同。
+      const again = protoCodec[proto].toConfig(protoCodec[proto].fromConfig(cfg), cfg);
+      expect(again.tlsSettings?.certificateSha256).toBe(cfg.tlsSettings?.certificateSha256);
+    },
+  );
+
+  it('留空 → 删键（不写空串）', () => {
+    const cfg = protoCodec.trojan.toConfig(filledDraft('trojan', { certSha256: '  ', certPkSha256: ' , ' }), base('trojan'));
+    expect(cfg.tlsSettings).not.toHaveProperty('certificateSha256');
+    expect(cfg.tlsSettings).not.toHaveProperty('certificatePublicKeySha256');
+  });
+
+  it.each([
+    ['浏览器名', 'chrome'],
+    ['少一字节', HEX.slice(0, 62)],
+    ['多一字节', `${HEX}00`],
+    ['3 字节 base64（内核 check 照收，本门必须拒）', 'AAAA'],
+    ['无填充 base64', B64.replace('=', '')],
+    ['url-safe base64', B64.replace('+', '-').replace('/', '_')],
+    ['多条里夹一条坏的', `${HEX},nope`],
+  ])('非法（%s）→ 抛 certPinInvalid，detail 点名坏条目', (_why, bad) => {
+    let err: unknown;
+    try {
+      protoCodec.vless.toConfig(filledDraft('vless', { sec: 'tls', certPkSha256: bad }), base('vless'));
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ProtoCodecError);
+    expect((err as ProtoCodecError).code).toBe('certPinInvalid');
+    expect(bad.split(',')).toContain((err as ProtoCodecError).detail);
+  });
+
+  it('reality 下两框隐藏（后端不下发），存量值照写回', () => {
+    const fields = allFields('vless').filter((f) => f.k === 'certSha256' || f.k === 'certPkSha256');
+    expect(fields).toHaveLength(2);
+    const reality = filledDraft('vless', { sec: 'reality' });
+    const tls = filledDraft('vless', { sec: 'tls' });
+    for (const f of fields) {
+      expect(f.when?.(reality), `${f.k} 在 reality 下仍显示`).toBe(false);
+      expect(f.when?.(tls), `${f.k} 在 tls 下不显示（正向对照）`).toBe(true);
+    }
+    const stored = { ...base('vless'), security: 'reality', tlsSettings: { certificateSha256: HEX } } as ServerConfig;
+    const cfg = protoCodec.vless.toConfig(protoCodec.vless.fromConfig(stored), stored);
+    expect(cfg.tlsSettings?.certificateSha256).toBe(HEX);
   });
 });

@@ -903,3 +903,32 @@ fn unmodeled_endpoint_types_wrap_as_custom_endpoint() {
         .iter()
         .any(|w| w.contains("openconnect(1)") && w.contains("openvpn-client(1)")));
 }
+
+/// sing-box `tls.certificate_sha256` / `certificate_public_key_sha256`：Listable（单串或数组）都收，
+/// base64 原文保留 —— 生成侧再转一次必须逐字回到原值（往返闭合）。
+#[test]
+fn tls_cert_pins_imported_and_round_trip_through_the_builder() {
+    use polaris_config_engine::builder::outbound::build_proxy_outbound;
+    use polaris_config_engine::singbox::DomainResolver;
+
+    const B64: &str = "LXEWQrcmsEQBYnyp+6wy9chTD7GQPMTbAiWHF5IaSIE=";
+    const B64_2: &str = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+    let out = parse(json!({ "outbounds": [{
+            "type": "trojan", "server": "t.com", "server_port": 443, "password": "pw",
+            "tls": { "enabled": true, "server_name": "s.com",
+                     "certificate_sha256": [B64, B64_2],
+                     "certificate_public_key_sha256": B64 }
+        }] }));
+    let s = &out.servers[0];
+    let tls = s.tls_settings.as_ref().unwrap();
+    assert_eq!(
+        tls.certificate_sha256.as_deref(),
+        Some(format!("{B64},{B64_2}").as_str())
+    );
+    assert_eq!(tls.certificate_public_key_sha256.as_deref(), Some(B64));
+
+    let resolver = DomainResolver::Tag("dns-bootstrap".to_string());
+    let ob = serde_json::to_value(build_proxy_outbound(s, "p", &resolver, "x64", "linux")).unwrap();
+    assert_eq!(ob["tls"]["certificate_sha256"], json!([B64, B64_2]));
+    assert_eq!(ob["tls"]["certificate_public_key_sha256"], json!([B64]));
+}

@@ -19,6 +19,7 @@ use polaris_config_engine::user_config::protocol_settings::{
     SshSettings, TlsSettings, TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
+use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
 use serde_yaml::Value;
 
 /// Structure budget for Clash documents.
@@ -164,6 +165,22 @@ fn str(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
+}
+
+/// mihomo `fingerprint`（**证书固定**，不是 `client-fingerprint` 那个 uTLS 指纹）→ `certificateSha256`。
+///
+/// 语义依据（MetaCubeX/mihomo `component/ca/fingerprint.go` @ab405ba :14-57，
+/// https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/component/ca/fingerprint.go#L14-L57）：
+/// 去 `:` 后 hex 解码、必须 32 字节，与 `sha256.Sum256(cert.Raw)` 比 —— 即**整张证书 DER** 的摘要
+/// （不是公钥）⇒ 映射到 sing-box `certificate_sha256`。浏览器名（`chrome` 等）mihomo 直接报错，
+/// 这里经 `keep_valid_cert_pins` 过滤掉，不留死值。
+///
+/// ⚠️ 语义差：mihomo 会拿它比对链上**每一张**证书（命中中间/根证书时再以它为根验链），
+/// sing-box 只比叶子。订阅若固定的是 CA 而非叶子，导入后该节点**握手失败**（fail-closed，不会放行）。
+fn clash_cert_pin(m: &Value) -> Option<String> {
+    m.get("fingerprint")
+        .and_then(str)
+        .and_then(|f| keep_valid_cert_pins(&f))
 }
 
 /// 数字规整。上游 `num`。返回 u32（对齐 ServerConfig.port=u16 / alterId=u32 等）。
@@ -859,10 +876,12 @@ fn apply_transport_and_tls(
         if let Some(fp) = p.get("client-fingerprint").and_then(str) {
             tls.fingerprint = Some(fp);
         }
+        tls.certificate_sha256 = clash_cert_pin(p);
         if tls.server_name.is_some()
             || tls.allow_insecure.is_some()
             || tls.alpn.is_some()
             || tls.fingerprint.is_some()
+            || tls.certificate_sha256.is_some()
         {
             config.tls_settings = Some(tls);
         }
@@ -1216,10 +1235,12 @@ fn map_node(
                 if let Some(fp) = m.get("client-fingerprint").and_then(str) {
                     tls.fingerprint = Some(fp);
                 }
+                tls.certificate_sha256 = clash_cert_pin(m);
                 if tls.server_name.is_some()
                     || tls.allow_insecure.is_some()
                     || tls.alpn.is_some()
                     || tls.fingerprint.is_some()
+                    || tls.certificate_sha256.is_some()
                 {
                     config.tls_settings = Some(tls);
                 }
@@ -1301,7 +1322,12 @@ fn map_node(
                 if let Some(alpn) = m.get("alpn").and_then(to_alpn_fn) {
                     tls.alpn = Some(alpn);
                 }
-                if tls.server_name.is_some() || tls.allow_insecure.is_some() || tls.alpn.is_some() {
+                tls.certificate_sha256 = clash_cert_pin(m);
+                if tls.server_name.is_some()
+                    || tls.allow_insecure.is_some()
+                    || tls.alpn.is_some()
+                    || tls.certificate_sha256.is_some()
+                {
                     config.tls_settings = Some(tls);
                 }
             }
@@ -1433,6 +1459,7 @@ fn map_node(
                     if m.get("skip-cert-verify").and_then(bool_val) == Some(true) {
                         tls.allow_insecure = Some(true);
                     }
+                    tls.certificate_sha256 = clash_cert_pin(m);
                     config.tls_settings = Some(tls);
                 }
             }

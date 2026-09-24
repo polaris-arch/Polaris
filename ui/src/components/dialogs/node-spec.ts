@@ -426,8 +426,21 @@ function tlsAdvFields(
     { t: 'select', k: 'engine', label: 'node.field.tlsEngine', hint: 'node.field.tlsEngineHint', options: O_TLS_ENGINE, when: engineGate },
     { t: 'select', k: 'spoofMethod', label: 'node.field.spoofMethod', hint: 'node.field.spoofMethodHint', options: O_SPOOF_METHOD, when: gate },
     { t: 'text', k: 'spoofSni', label: 'node.field.spoofSni', ph: 'www.bing.com', when: spoofGate },
+    // 证书固定：门借 `engineGate`（= 一级门且非 reality）。reality 下后端写死不下发 —— 内核 reality
+    // 客户端用自己的 verifier 覆盖 pin 回调，发了也是静默不校验（`builder/outbound.rs` Reality 段注释）。
+    ...F_CERT_PIN.map((f) => ({ ...f, when: engineGate })),
   ];
 }
+
+/**
+ * 证书固定两键（`tlsSettings.certificateSha256` / `certificatePublicKeySha256`）。
+ * 取值口径与校验见 `proto-codec.ts` 的 `certPinPatch`（非法值拒绝保存）。
+ * 三个 QUIC 协议（hy2/tuic/hysteria）TLS 恒开、无门，直接展开；TCP-TLS 五协议经 `tlsAdvFields` 挂门。
+ */
+const F_CERT_PIN: FieldSpec[] = [
+  { t: 'text', k: 'certSha256', label: 'node.field.certSha256', hint: 'node.field.certPinHint', ph: 'AB:CD:…', mono: true, opt: true },
+  { t: 'text', k: 'certPkSha256', label: 'node.field.certPkSha256', hint: 'node.field.certPinHint', ph: 'AB:CD:…', mono: true, opt: true },
+];
 
 /**
  * vless / vmess / trojan / anytls 的 TLS 高级组（alpn + fragment + 三件套 + ECH）。
@@ -625,6 +638,7 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       // ECH（反审查，加密 ClientHello 隐藏 SNI）——hy2 TLS 恒开（QUIC 自管）。echConfig 空=从 DNS HTTPS RR 自取。
       { t: 'switch', k: 'ech', label: 'node.field.ech', hint: 'node.field.echHint' },
       { t: 'textarea', k: 'echConfig', label: 'node.field.echConfig', mono: true, rows: 3, opt: true, when: whenEch },
+      ...F_CERT_PIN,
     ],
   },
   tuic: {
@@ -647,6 +661,7 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       // ECH（反审查）——tuic TLS 恒开（QUIC 自管）。echConfig 空=从 DNS HTTPS RR 自取。
       { t: 'switch', k: 'ech', label: 'node.field.ech', hint: 'node.field.echHint' },
       { t: 'textarea', k: 'echConfig', label: 'node.field.echConfig', mono: true, rows: 3, opt: true, when: whenEch },
+      ...F_CERT_PIN,
     ],
   },
   socks: {
@@ -762,6 +777,7 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       // ECH：与 hy2 同待遇（三者走同一个 tls.NewClient，TLS 由 QUIC 栈接管）。
       { t: 'switch', k: 'ech', label: 'node.field.ech' },
       { t: 'text', k: 'echConfig', label: 'node.field.echConfig', mono: true, opt: true },
+      ...F_CERT_PIN,
       // ── 透传袋入口（2026-08-11）──
       // 表单是**精选子集**，其余键（openconnect 61 键里的 csd/cookie/compression_mode…）
       // 此前只有「从本地文件导入」才进得了袋子，手建节点根本够不到 —— 等于「支持」只对导入成立。
@@ -932,16 +948,16 @@ const BASIC_FIELDS_FROM_ADV: Partial<Record<NodeProto, readonly string[]>> = {
 };
 
 const ADVANCED_FIELD_KEYS: Partial<Record<NodeProto, readonly string[]>> = {
-  vless: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'mux', 'muxProto', 'muxMax', 'muxMin', 'muxPad'],
-  vmess: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'mux', 'muxProto', 'muxMax', 'muxMin', 'muxPad'],
-  trojan: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'mux', 'muxProto', 'muxMax', 'muxMin', 'muxPad'],
+  vless: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'certSha256', 'certPkSha256', 'mux', 'muxProto', 'muxMax', 'muxMin', 'muxPad'],
+  vmess: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'certSha256', 'certPkSha256', 'mux', 'muxProto', 'muxMax', 'muxMin', 'muxPad'],
+  trojan: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'certSha256', 'certPkSha256', 'mux', 'muxProto', 'muxMax', 'muxMin', 'muxPad'],
   shadowsocks: ['mux', 'muxProto', 'muxMax', 'muxMin', 'muxPad'],
-  hysteria2: ['obfsMin', 'obfsMax', 'bbr', 'noParrot', 'ech', 'echConfig'],
-  tuic: ['zeroRtt', 'heartbeat', 'ech', 'echConfig'],
-  http: ['fragment', 'engine', 'spoofMethod', 'spoofSni'],
-  anytls: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'idleCheck', 'idleTimeout', 'minIdle'],
+  hysteria2: ['obfsMin', 'obfsMax', 'bbr', 'noParrot', 'ech', 'echConfig', 'certSha256', 'certPkSha256'],
+  tuic: ['zeroRtt', 'heartbeat', 'ech', 'echConfig', 'certSha256', 'certPkSha256'],
+  http: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'certSha256', 'certPkSha256'],
+  anytls: ['fragment', 'engine', 'spoofMethod', 'spoofSni', 'ech', 'echConfig', 'certSha256', 'certPkSha256', 'idleCheck', 'idleTimeout', 'minIdle'],
   snell: ['reuse', 'userkey'],
-  hysteria: ['ech', 'echConfig', 'extraJson'],
+  hysteria: ['ech', 'echConfig', 'certSha256', 'certPkSha256', 'extraJson'],
   tor: ['torArgs', 'torrcText', 'extraJson'],
   ssh: ['hostKeyAlgorithms', 'clientVersion', 'cipher', 'mac', 'kexAlgorithm'],
   custom: ['isEndpoint', 'secretKeys'],

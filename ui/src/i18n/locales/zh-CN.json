@@ -1630,13 +1630,17 @@
     "codecError": {
       "customJsonInvalid": "自定义协议 JSON 格式错误：{{detail}}",
       "customJsonObject": "自定义协议 JSON 必须是对象",
-      "customJsonTypeRequired": "自定义协议 JSON 缺少必填的 \"type\" 字段"
+      "customJsonTypeRequired": "自定义协议 JSON 缺少必填的 \"type\" 字段",
+      "certPinInvalid": "证书固定值无效：{{detail}}（需为 SHA-256 摘要的十六进制或 Base64）"
     },
     "field": {
       "aid": "AlterID",
       "alpn": "ALPN",
       "bbr": "BBR 拥塞控制",
       "cc": "拥塞控制",
+      "certPinHint": "只信任 SHA-256 与此匹配的服务端证书，取代 CA 与域名校验——自签证书无需再开「允许不安全证书」。十六进制（可带冒号）或 Base64，多个用逗号分隔；两项都填时任一匹配即可。",
+      "certPkSha256": "公钥 SHA-256 固定",
+      "certSha256": "证书 SHA-256 固定",
       "cipher": "对称加密算法（逗号分隔）",
       "clientVersion": "客户端版本字符串",
       "customOutbound": "自定义 Outbound JSON",

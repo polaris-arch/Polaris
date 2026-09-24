@@ -1536,3 +1536,51 @@ fn naive_marker_whitespace_behaviour_is_pinned() {
         );
     }
 }
+
+// ── 证书固定参数：pcs（Xray/v2rayN）/ pinSHA256（hysteria2 官方）──────────────────
+
+const PIN_HEX: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+
+#[test]
+fn pcs_query_maps_to_certificate_sha256() {
+    let c = parse_ok(&format!(
+        "vless://{U}@a.com:443?security=tls&sni=s.com&pcs={PIN_HEX}%2Cchrome#n"
+    ));
+    assert_eq!(
+        c.tls_settings.unwrap().certificate_sha256.as_deref(),
+        Some(PIN_HEX),
+        "逗号串里的非法条目丢弃、合法条目原文保留"
+    );
+}
+
+#[test]
+fn hysteria2_pin_sha256_maps_and_yields_to_pcs() {
+    let colon = "2d:71:16:42:b7:26:b0:44:01:62:7c:a9:fb:ac:32:f5:c8:53:0f:b1:90:3c:c4:db:02:25:87:17:92:1a:48:81";
+    let c = parse_ok(&format!("hysteria2://pw@a.com:443?pinSHA256={colon}#n"));
+    assert_eq!(
+        c.tls_settings.unwrap().certificate_sha256.as_deref(),
+        Some(colon)
+    );
+    let both = parse_ok(&format!(
+        "hysteria2://pw@a.com:443?pinSHA256={colon}&pcs={PIN_HEX}#n"
+    ));
+    assert_eq!(
+        both.tls_settings.unwrap().certificate_sha256.as_deref(),
+        Some(PIN_HEX)
+    );
+}
+
+#[test]
+fn vmess_json_pcs_maps_to_certificate_sha256() {
+    let body = format!(
+        r#"{{"v":"2","ps":"n","add":"a.com","port":"443","id":"{U}","net":"tcp","tls":"tls","pcs":"{PIN_HEX}"}}"#
+    );
+    let c = parse_ok(&format!(
+        "vmess://{}",
+        base64_encode(body.as_bytes(), false, true)
+    ));
+    assert_eq!(
+        c.tls_settings.unwrap().certificate_sha256.as_deref(),
+        Some(PIN_HEX)
+    );
+}

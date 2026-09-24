@@ -1666,3 +1666,92 @@ fn on_demand_decodes_on_every_endpoint_type() {
         decode_failures.join("\n")
     );
 }
+
+/// 🔴 **带证书固定的 TLS 出站：随包核 decode + initialize 全过，且 pin 以 base64 落盘。**
+///
+/// 三个 TLS 客户端各一：trojan（std，指纹 `none`）/ vless（uTLS 缺省 chrome）/ hysteria2（QUIC 取
+/// std `tls.Config`）；三种用户输入形态（裸 hex / 冒号 hex / base64）各喂一次。
+///
+/// ⚠️ 本门**判不了编码语义**：实测裸 hex 下发同样 rc=0（被当 base64 解成 48 字节，永不匹配）。
+/// 那条由 `user_config::tls_pin` 与 `builder/outbound` 的单测守；这里先做结构断言（形态必须是
+/// 32 字节 base64），再问内核收不收。末尾的阴性对照证明本键确实被 decode —— 冒号 hex 必 FATAL，
+/// 若生成侧哪天原样透传用户的冒号串，这里会红。
+#[test]
+fn bundled_core_accepts_cert_pinned_tls_outbounds() {
+    let Some(core) = core_or_skip("证书固定出站门") else {
+        return;
+    };
+    const HEX: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+    const B64: &str = "LXEWQrcmsEQBYnyp+6wy9chTD7GQPMTbAiWHF5IaSIE=";
+    let colon_hex = HEX
+        .as_bytes()
+        .chunks(2)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join(":");
+    let raw = format!(
+        r#"{{
+            "servers": [
+              {{"id":"t","name":"t","protocol":"trojan","address":"a.example.com","port":443,
+                "password":"pw","tlsSettings":{{"fingerprint":"none","certificateSha256":"{HEX}"}}}},
+              {{"id":"v","name":"v","protocol":"vless","address":"a.example.com","port":443,
+                "uuid":"bf000d23-0752-40b4-affe-68f7707a9661","security":"tls",
+                "tlsSettings":{{"certificatePublicKeySha256":"{colon_hex}"}}}},
+              {{"id":"h","name":"h","protocol":"hysteria2","address":"a.example.com","port":443,
+                "password":"pw","tlsSettings":{{"certificateSha256":"{B64},{HEX}",
+                    "certificatePublicKeySha256":"{B64}"}}}}
+            ],
+            "selectedServerId":"t","proxyMode":"global",
+            "proxyModeType":"manual","mixedPort":17899
+        }}"#
+    );
+    let input: UserConfig = serde_json::from_str(&raw).expect("夹具无效");
+    let cfg =
+        generate_sing_box_config(&input, &BTreeMap::new(), &deps_for("linux")).expect("生成配置");
+    let value = serde_json::to_value(&cfg).expect("序列化");
+
+    let mut pinned = 0;
+    for ob in value["outbounds"].as_array().expect("outbounds 数组") {
+        for key in ["certificate_sha256", "certificate_public_key_sha256"] {
+            let Some(list) = ob["tls"].get(key) else {
+                continue;
+            };
+            for pin in list.as_array().expect("pin 必须是数组") {
+                assert_eq!(
+                    pin, B64,
+                    "{} 的 {key} 不是内核要的 base64 形态：{pin}",
+                    ob["tag"]
+                );
+                pinned += 1;
+            }
+        }
+    }
+    assert_eq!(pinned, 5, "pin 数目不对 —— 有节点的 pin 没下发或被重复下发");
+
+    let dir = test_temp_dir("polaris-kgate-pin-");
+    let p = dir.path().join("pin.json");
+    std::fs::write(
+        &p,
+        serde_json::to_vec_pretty(&outbound_surface(&value)).unwrap(),
+    )
+    .expect("写盘");
+    let (ok, diag) = check(&core, &p);
+    assert!(ok, "随包核拒绝了带 pin 的 TLS 出站：{diag}");
+
+    // 阴性对照：同一份出站面，把一条 pin 换成冒号 hex（用户原文）→ 必须 decode 失败。
+    let mut bad = outbound_surface(&value);
+    let ob = bad["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|o| o["tls"].get("certificate_sha256").is_some())
+        .expect("至少一个带 pin 的出站");
+    ob["tls"]["certificate_sha256"] = json!([colon_hex]);
+    let pb = dir.path().join("pin-bad.json");
+    std::fs::write(&pb, serde_json::to_vec_pretty(&bad).unwrap()).expect("写盘");
+    let (ok, diag) = check(&core, &pb);
+    assert!(
+        !ok && is_decode_stage(&diag) && diag.contains("certificate_sha256"),
+        "冒号 hex 居然没在 decode 阶段被拒 —— 上面那条绿因此不说明内核读过这个键；实得：{diag}"
+    );
+}

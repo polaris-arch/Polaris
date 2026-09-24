@@ -274,6 +274,12 @@ pub struct OutboundTls {
     pub ech: Option<Ech>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fragment: Option<bool>,
+    /// 证书固定（1.13+）：每条是 32 字节摘要的**标准 base64**（Go `[]byte` 的 JSON 形态），
+    /// 由 `user_config::tls_pin` 转码。内核见 pin 即把 CA/主机名校验整个换成 pin 比对。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_sha256: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_public_key_sha256: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

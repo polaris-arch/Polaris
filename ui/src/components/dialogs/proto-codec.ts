@@ -48,7 +48,11 @@ import {
   type NodeProto,
 } from './node-spec';
 
-export type ProtoCodecErrorCode = 'customJsonInvalid' | 'customJsonObject' | 'customJsonTypeRequired';
+export type ProtoCodecErrorCode =
+  | 'customJsonInvalid'
+  | 'customJsonObject'
+  | 'customJsonTypeRequired'
+  | 'certPinInvalid';
 
 /** 编解码层只抛稳定错误码；面向用户的文案由 NodeDialog 按当前 locale 渲染。 */
 export class ProtoCodecError extends Error {
@@ -305,6 +309,7 @@ function tlsAdvPatch(draft: FormValues, withEch: boolean): Partial<TlsSettings> 
     engine: str(draft.engine) as TlsSettings['engine'],
     spoofMethod: spoofOn ? (spoofMethod as TlsSettings['spoofMethod']) : undefined,
     spoofSni: spoofOn ? spoofSni : undefined,
+    ...certPinPatch(draft),
     ...(withEch
       ? {
           ech: draft.ech === true ? true : undefined,
@@ -314,6 +319,40 @@ function tlsAdvPatch(draft: FormValues, withEch: boolean): Partial<TlsSettings> 
   };
 }
 
+/**
+ * 证书固定单条的合法形态 —— **逐条镜像** Rust `user_config::tls_pin::decode_pin`（生成侧真值）：
+ * 去 `:`/`-` 后恰 64 位 hex，或恰 44 字符的标准 base64（一个 `=`，解出正好 32 字节）。
+ * 两边判据必须同宽：TS 更宽 ⇒ 存进去的值后端静默丢弃（用户以为固定了）；TS 更窄 ⇒ 订阅带来的合法值保存被拒。
+ */
+function isCertPin(item: string): boolean {
+  return /^[0-9a-fA-F]{64}$/.test(item.replace(/[:-]/g, '')) || /^[A-Za-z0-9+/]{43}=$/.test(item);
+}
+
+/** 草稿 → 逗号分隔 pin 串；空 → 删键；**有任一非法条目 ⇒ 拒绝保存**（同 custom JSON 的 ProtoCodecError 口径）。 */
+function certPinText(v: FormValue): string | undefined {
+  const items = listFromText(v);
+  if (!items) return undefined;
+  const bad = items.find((x) => !isCertPin(x));
+  if (bad !== undefined) throw new ProtoCodecError('certPinInvalid', bad);
+  return items.join(',');
+}
+
+/**
+ * 证书固定两键的 patch/草稿 —— TCP-TLS 五协议经 `tlsAdvPatch` 带上，hy2/tuic/hysteria 直接展开。
+ * reality 下控件隐藏但照写回（理由同 `tlsAdvPatch` 里 engine 那段：草稿与 base 同源，写回即保全）。
+ */
+function certPinPatch(draft: FormValues): Pick<TlsSettings, 'certificateSha256' | 'certificatePublicKeySha256'> {
+  return {
+    certificateSha256: certPinText(draft.certSha256),
+    certificatePublicKeySha256: certPinText(draft.certPkSha256),
+  };
+}
+
+function certPinDraft(cfg: ServerConfig, d: FormValues): void {
+  d.certSha256 = cfg.tlsSettings?.certificateSha256 ?? '';
+  d.certPkSha256 = cfg.tlsSettings?.certificatePublicKeySha256 ?? '';
+}
+
 /** TLS 高级组 → 草稿（`withEch` 语义同 `tlsAdvPatch`）。 */
 function tlsAdvDraft(cfg: ServerConfig, d: FormValues, withEch: boolean): void {
   d.alpn = cfg.tlsSettings?.alpn?.join(',') ?? '';        // 不归一：ALPN 协议名大小写敏感（`h2` ≠ `H2`）
@@ -321,6 +360,7 @@ function tlsAdvDraft(cfg: ServerConfig, d: FormValues, withEch: boolean): void {
   d.engine = lc(cfg.tlsSettings?.engine) ?? '';           // R3：'Windows' 这类变体归一，否则后端精确匹配不上
   d.spoofMethod = lc(cfg.tlsSettings?.spoofMethod) ?? ''; // R3：同上（is_valid_tls_spoof_method 是精确比较）
   d.spoofSni = cfg.tlsSettings?.spoofSni ?? '';
+  certPinDraft(cfg, d);
   if (withEch) {
     d.ech = cfg.tlsSettings?.ech === true;
     d.echConfig = cfg.tlsSettings?.echConfig ?? '';
@@ -750,6 +790,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       d.ech = cfg.tlsSettings?.ech === true;
       d.echConfig = cfg.tlsSettings?.echConfig ?? '';
+      certPinDraft(cfg, d);
       d.extraJson = bagToText(bagOf(cfg.hysteriaSettings));
       return d;
     },
@@ -773,6 +814,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           allowInsecure: draft.insecure === true ? true : undefined,
           ech: draft.ech === true ? true : undefined,
           echConfig: str(draft.echConfig),
+          ...certPinPatch(draft),
         }),
       };
     },
@@ -826,6 +868,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       d.ech = cfg.tlsSettings?.ech === true;                  // ECH（hy2 TLS 恒开，QUIC 自管）
       d.echConfig = cfg.tlsSettings?.echConfig ?? '';
+      certPinDraft(cfg, d);
       return d;
     },
     toConfig(draft, base) {
@@ -867,6 +910,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           allowInsecure: draft.insecure === true ? true : undefined,
           ech: draft.ech === true ? true : undefined,
           echConfig: draft.ech === true ? str(draft.echConfig) : undefined,
+          ...certPinPatch(draft),
         }),
       };
     },
@@ -886,6 +930,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       d.ech = cfg.tlsSettings?.ech === true;                     // ECH（tuic TLS 恒开，QUIC 自管）
       d.echConfig = cfg.tlsSettings?.echConfig ?? '';
+      certPinDraft(cfg, d);
       return d;
     },
     toConfig(draft, base) {
@@ -911,6 +956,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           alpn: listFromText(draft.alpn),
           ech: draft.ech === true ? true : undefined,
           echConfig: draft.ech === true ? str(draft.echConfig) : undefined,
+          ...certPinPatch(draft),
         }),
       };
     },

@@ -36,6 +36,7 @@ use polaris_config_engine::user_config::protocol_settings::{
     TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
+use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
 use url::Url;
 
 /// 分享链接支持的 scheme 白名单。**与前端 `ui/src/shared/protocol-url-schemes.ts` 同源**
@@ -368,6 +369,13 @@ fn parse_tls_settings(params: &Params) -> TlsSettings {
     if let Some(fp) = params.get_ne("fp").or_else(|| params.get_ne("fingerprint")) {
         s.fingerprint = normalize_token(&fp);
     }
+    // `pcs` = Xray `pinnedPeerCertSha256` 的分享链接短名（Xray-core 自己的报错文案即
+    // `"pinnedPeerCertSha256"(pcs)`：infra/conf/transport_security.go @60e2a0c :362）。取值是逗号分隔的
+    // hex（可带 `:`），每条是**整张证书 DER** 的 SHA-256（同文件 :364-379 + transport/internet/tls/pin.go
+    // :10-16 `sha256.Sum256(cert.Raw)`）⇒ `certificateSha256`。v2rayN 在 vless/trojan 等 query 里原样读它
+    // （ServiceLib/Handler/Fmt/BaseFmt.cs @e1cb99c :211）。
+    // ⚠️ 语义差同 mihomo：Xray 也接受命中链上 CA，sing-box 只比叶子 ⇒ 固定 CA 的链接导入后握手失败。
+    s.certificate_sha256 = params.get_ne("pcs").and_then(|v| keep_valid_cert_pins(&v));
     s
 }
 
@@ -513,6 +521,16 @@ fn parse_hysteria2(
     }
 
     let mut tls = parse_tls_settings(&b.params);
+    // hysteria2 官方 URI 的 `pinSHA256`：叶子证书 DER 的 SHA-256 hex，可带 `:`/`-`（apernet/hysteria
+    // app/cmd/client.go @e1366b1 :613-614 读参、:389-399 只比 `rawCerts[0]`、:1256-1261 去 `:`/`-`）
+    // ⇒ `certificateSha256`，与 sing-box 同为只比叶子，无语义差。`pcs` 已有时让位（同 v2rayN
+    // Hysteria2Fmt.cs @e1cb99c :171-174 的先后）。
+    if tls.certificate_sha256.is_none() {
+        tls.certificate_sha256 = b
+            .params
+            .get_ne("pinSHA256")
+            .and_then(|v| keep_valid_cert_pins(&v));
+    }
     if tls.server_name.is_none() {
         // 必开 TLS：parse_tls_settings 没解析到 SNI 时兜底。
         tls.server_name = Some(
@@ -1089,6 +1107,8 @@ fn parse_vmess(raw_url: &str, id_gen: &mut impl FnMut() -> String) -> Result<Ser
             ),
             fingerprint: normalize_token(&json_str(v.get("fp")).unwrap_or("chrome".into()))
                 .or_else(|| Some("chrome".to_string())),
+            // vmess JSON 的 `pcs`：同 `parse_tls_settings` 的 `pcs`（v2rayN VmessFmt.cs @e1cb99c :147）。
+            certificate_sha256: json_str(v.get("pcs")).and_then(|p| keep_valid_cert_pins(&p)),
             ..Default::default()
         };
         // alpn 可能是逗号串或已是数组；两路都过 dedupe_trim（保序去重 + 丢空白项）。

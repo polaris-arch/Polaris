@@ -382,9 +382,10 @@ fn server_config_stays_narrow() {
     use std::collections::BTreeSet;
     use std::mem::{size_of, size_of_val};
 
-    /// 2026-08-26 实测值（新增一个有意的小字符串字段 `bindInterface` 后 1128 → 1152 B；
+    /// 2026-09-24 实测值（内联的 `TlsSettings` 新增两个有意的字符串字段 `certificateSha256` /
+    /// `certificatePublicKeySha256` 后 1152 → 1200 B；此前 2026-08-26 加 `bindInterface` 1128 → 1152 B；
     /// 装箱前 3096 B；只装 6 项时 1904 B，8 项时 1512 B）。
-    const MEASURED: usize = 1152;
+    const MEASURED: usize = 1200;
     let actual = size_of::<ServerConfig>();
     assert!(
         actual <= MEASURED,

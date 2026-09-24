@@ -40,6 +40,17 @@ pub struct TlsSettings {
     pub spoof_sni: Option<String>,
     #[serde(rename = "spoofMethod", skip_serializing_if = "Option::is_none")]
     pub spoof_method: Option<String>,
+    /// 证书固定：叶子证书 DER 的 SHA-256（sing-box `certificate_sha256`）。逗号分隔多条，
+    /// 每条 hex（可带 `:`/`-`）或标准 base64；生成侧经 `tls_pin::cert_pins_for_kernel` 转内核形态。
+    #[serde(rename = "certificateSha256", skip_serializing_if = "Option::is_none")]
+    pub certificate_sha256: Option<String>,
+    /// 公钥固定：叶子证书 SubjectPublicKeyInfo（PKIX DER）的 SHA-256（sing-box
+    /// `certificate_public_key_sha256`）。换证不换钥时仍匹配。口径同上。
+    #[serde(
+        rename = "certificatePublicKeySha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub certificate_public_key_sha256: Option<String>,
 }
 
 /// Reality 设置。上游 `RealitySettings`。

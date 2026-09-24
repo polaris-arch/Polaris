@@ -276,6 +276,8 @@ pub fn build_shadow_tls_outbound(
         reality: None,
         ech: None,
         fragment: None,
+        certificate_sha256: None,
+        certificate_public_key_sha256: None,
     });
     apply_bind_interface(&mut outbound.extra, bind_interface);
     Some(outbound)
