@@ -61,6 +61,7 @@ function protocolLabel(proto: string): string {
     openconnect: 'OpenConnect',
     'openvpn-client': 'OpenVPN',
     'masque-client': 'MASQUE',
+    tailcat: 'Tailcat',
     custom: 'Custom',
   };
   return map[proto.toLowerCase()] ?? proto;
@@ -72,6 +73,7 @@ function transferSummary(server: ServerConfig): string {
   if (proto === 'wireguard') return 'udp · wg';
   if (proto === 'tailscale') return 'mesh · wg';
   if (proto === 'openconnect') return 'enterprise vpn';
+  if (proto === 'tailcat') return 'derp · wg';
   if (proto === 'openvpn-client') return server.openvpnClientSettings?.network || 'udp · vpn';
   if (proto === 'masque-client') {
     // 缺省 / 0 / 3 都是 HTTP/3（内核可回落，卡片只报用户选的首选档）。

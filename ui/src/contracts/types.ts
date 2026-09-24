@@ -6,6 +6,7 @@ import type {
   OpenconnectSettings,
   OpenvpnClientSettings,
   MasqueClientSettings,
+  TailcatSettings,
   SnellSettings,
   TuicSettings,
   WireGuardSettings,
@@ -165,7 +166,7 @@ export type Protocol =
   | 'openvpn-client'
   // 2026-09-24：MASQUE（RFC 9484 CONNECT-IP）客户端，内核 endpoint。
   | 'masque-client'
-  // 2026-09-24：Tailcat（无地址 outbound，同 tor，DERP 引导的点对点 WireGuard）。编辑器在 T2 落地。
+  // 2026-09-24：Tailcat（无地址 outbound，同 tor，DERP 引导的点对点 WireGuard）。
   | 'tailcat'
   | 'custom';
 export type Network = 'tcp' | 'ws' | 'grpc' | 'http' | 'httpupgrade';
@@ -304,6 +305,7 @@ export interface ServerConfig {
   openconnectSettings?: OpenconnectSettings;
   openvpnClientSettings?: OpenvpnClientSettings;
   masqueClientSettings?: MasqueClientSettings;
+  tailcatSettings?: TailcatSettings;
 
   tuicSettings?: TuicSettings;
 

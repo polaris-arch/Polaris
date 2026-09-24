@@ -791,6 +791,7 @@ const STRUCT_OWNERS: Record<string, readonly NodeProto[]> = {
   ShadowTlsSettings: ['shadowsocks'],
   CustomSettings: ['custom'],
   MasqueClientSettings: ['masque-client'],
+  TailcatSettings: ['tailcat'],
 };
 
 /** `结构体::协议` —— 债务表与豁免表共用的键形。 */
@@ -1386,6 +1387,7 @@ const MIN_FIELDS: Record<string, number> = {
   ShadowTlsSettings: 4,
   CustomSettings: 3,
   MasqueClientSettings: 4,
+  TailcatSettings: 7,
 };
 
 // ── 断言 ──

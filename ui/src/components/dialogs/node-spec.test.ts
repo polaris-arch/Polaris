@@ -101,6 +101,12 @@ describe('协议下拉的分组与顺序', () => {
     expect(PROTO_GROUP_ORDER.flatMap((g) => protosInGroup(g))).not.toContain('masque-client');
   });
 
+  it('Tailcat 与 Tor 同在代理组（无地址 outbound），不进组网入口', () => {
+    expect(new Map(PROTO_OPTIONS).get('tailcat')).toBe('Tailcat');
+    expect(protosInGroup('proxy')).toEqual(expect.arrayContaining(['tor', 'tailcat']));
+    expect(isMeshTunnelNodeProtocol('tailcat')).toBe(false);
+  });
+
   it('所有普通分组都按展示名排序，NaiveProxy 归入常用', () => {
     const label = new Map(PROTO_OPTIONS);
     for (const group of PROTO_GROUP_ORDER) {

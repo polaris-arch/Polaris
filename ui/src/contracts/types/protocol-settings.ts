@@ -150,6 +150,24 @@ export interface MasqueClientSettings {
   mtu?: number;
 }
 
+/**
+ * Tailcat 设置。镜像 Rust `TailcatSettings`：camelCase 具名字段 + 内核键名透传袋（索引签名），形态同
+ * `TorSettings`。无 server/port（对端由两把服务端公钥 + DERP 定位）。`derpRegion > 0` 与 `derpServers`
+ * 非空恰好其一；key 均为 44 字符标准 base64（32 字节）—— 不满足的节点生成侧剔除，判据见
+ * `domain/server-completeness.ts#tailcatSettingsError`。
+ */
+export interface TailcatSettings {
+  [key: string]: unknown;
+  serverPublicKey?: string;
+  serverDiscoKey?: string;
+  preSharedKey?: string;
+  privateKey?: string;
+  derpRegion?: number;
+  derpMapUrl?: string;
+  /** 每项是裸主机名，或内核原生对象 `{host, ipv4, ipv6, derp_port, stun_port, cert_name}`。 */
+  derpServers?: (string | Record<string, unknown>)[];
+}
+
 export interface Hysteria2Settings {
   upMbps?: number;
   downMbps?: number;

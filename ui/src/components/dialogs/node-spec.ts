@@ -44,6 +44,7 @@ export type NodeProto =
   | 'openconnect'
   | 'openvpn-client'
   | 'masque-client'
+  | 'tailcat'
   | 'custom';
 
 /** 协议下拉选项（value = NodeProto，label = 展示名）。 */
@@ -66,6 +67,7 @@ export const PROTO_OPTIONS: readonly (readonly [NodeProto, string])[] = [
   ['openvpn-client', 'OpenVPN'],
   // 展示名与 wire 名解耦（同 openvpn-client → OpenVPN）：wire 名取内核 type 名，三张登记表照它对齐。
   ['masque-client', 'MASQUE'],
+  ['tailcat', 'Tailcat'],
   ['custom', 'Custom'],
 ];
 
@@ -91,7 +93,7 @@ const COMMON: readonly NodeProto[] = [
 ];
 
 /** 普通入口的其它代理。显式列举，避免把新的组网 endpoint 误吸进普通节点下拉。 */
-const PROXY: readonly NodeProto[] = ['socks', 'http', 'snell', 'ssh', 'hysteria', 'tor'];
+const PROXY: readonly NodeProto[] = ['socks', 'http', 'snell', 'ssh', 'hysteria', 'tor', 'tailcat'];
 
 /** 组网弹窗中由 NodeDialog 承载的隧道接入。WireGuard 有自己的专用弹窗。 */
 export const MESH_TUNNEL_NODE_PROTOCOLS = ['openconnect', 'openvpn-client', 'masque-client'] as const satisfies readonly NodeProto[];
@@ -812,6 +814,33 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       { t: 'textarea', k: 'extraJson', label: 'node.field.extraJson', hint: 'node.field.extraJsonHint', mono: true, rows: 4, opt: true },
     ],
   },
+  // ── Tailcat（2026-09-24）── 无地址 outbound（同 Tor）：对端由两把服务端公钥定位，经 DERP 引导打洞/中继。
+  // 地址行由 NodeDialog 按 `isAddresslessProtocol` 隐藏（D8）。DERP 三种模式只是草稿态：`derpMode` 不落盘，
+  // 由「derpServers 非空 / derpMapUrl 非空」推导（codec），免得模式与字段各执一词。
+  // 刻意不给的控件：`http_client`（生成侧按前置代理决定，写成 route.final 会自锁）、Dial Fields 的
+  // domain_resolver（装配层注入）。前置代理只承载 DERP 连接，说明挂在 detour 的提示上。
+  tailcat: {
+    cred: [
+      // 服务端不校验 users 时它就是准入凭据 ⇒ secret（后端也进脱敏表）。disco 公钥在直连 UDP 上明文携带，不算秘密。
+      { t: 'text', k: 'serverPublicKey', label: 'node.field.tcServerPub', hint: 'node.field.tcServerPubHint', mono: true, secret: true },
+      { t: 'text', k: 'serverDiscoKey', label: 'node.field.tcServerDisco', mono: true },
+      { t: 'text', k: 'preSharedKey', label: 'node.field.tcPsk', mono: true, opt: true, secret: true },
+    ],
+    adv: [
+      {
+        t: 'select', k: 'derpMode', label: 'node.field.derpMode', hint: 'node.field.derpModeHint',
+        options: [['region', 'node.derpModeRegion'], ['customMap', 'node.derpModeCustomMap'], ['servers', 'node.derpModeServers']],
+      },
+      { t: 'number', k: 'derpRegion', label: 'node.field.derpRegion', hint: 'node.field.derpRegionHint', ph: '1', when: (v) => v.derpMode !== 'servers' },
+      { t: 'text', k: 'derpMapUrl', label: 'node.field.derpMapUrl', hint: 'node.field.derpMapUrlHint', ph: 'https://tailcat.dev/derpmap.json', mono: true, when: (v) => v.derpMode === 'customMap' },
+      // 每行一个裸主机名，或一个单行 JSON 对象（内核原生形态，不自造 host:port 语法）。
+      // R0 实测：`cert_name: "sha256-raw:<hex>"` 还校验主机名 ⇒ 提示须写明主机名要与 DERP 证书一致。
+      { t: 'textarea', k: 'derpServers', label: 'node.field.derpServers', hint: 'node.field.derpServersHint', mono: true, rows: 3, ph: 'derp.example.com', when: (v) => v.derpMode === 'servers' },
+      // 私钥放在 DERP 之后、紧挨「生成密钥对」（NodeDialog 在连接页末尾渲染）：可选，缺省每次起核随机。
+      { t: 'text', k: 'privateKey', label: 'node.field.tcPrivateKey', hint: 'node.field.tcPrivateKeyHint', mono: true, opt: true, secret: true },
+      { t: 'textarea', k: 'extraJson', label: 'node.field.extraJson', hint: 'node.field.extraJsonHint', mono: true, rows: 4, opt: true },
+    ],
+  },
   // ── OpenConnect（2026-08-11）──
   // 一个协议覆盖六家商用 VPN，由 flavor 区分。内核需要的 `server: host:port` 由 NodeDialog 顶部
   // 公共地址/端口派生，表单不再维护第二份 server 真值。
@@ -997,6 +1026,7 @@ export function allFields(proto: NodeProto): FieldSpec[] {
  */
 const BASIC_FIELDS_FROM_ADV: Partial<Record<NodeProto, readonly string[]>> = {
   tor: ['torExec', 'torDataDir'],
+  tailcat: ['derpMode', 'derpRegion', 'derpMapUrl', 'derpServers', 'privateKey'],
   ssh: ['privateKey', 'privateKeyPath', 'privateKeyPassphrase'],
 };
 
@@ -1012,6 +1042,7 @@ const ADVANCED_FIELD_KEYS: Partial<Record<NodeProto, readonly string[]>> = {
   snell: ['reuse', 'userkey'],
   hysteria: ['ech', 'echConfig', 'certSha256', 'certPkSha256', 'extraJson'],
   tor: ['torArgs', 'torrcText', 'extraJson'],
+  tailcat: ['extraJson'],
   ssh: ['hostKeyAlgorithms', 'clientVersion', 'cipher', 'mac', 'kexAlgorithm'],
   custom: ['isEndpoint', 'secretKeys'],
 };
@@ -1037,6 +1068,7 @@ const TABBED_NODE_PROTOCOLS = new Set<NodeProto>([
   'anytls',
   'hysteria',
   'tor',
+  'tailcat',
   'ssh',
   'openconnect',
   'openvpn-client',

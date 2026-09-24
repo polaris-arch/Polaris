@@ -53,6 +53,7 @@ export const IPC_CHANNELS = {
   // 服务器管理
   SERVER_SWITCH: 'server_switch',
   SERVER_GENERATE_URL: 'server_generate_url',
+  TAILCAT_KEYPAIR: 'tailcat_keypair', // Tailcat 客户端密钥对：不传私钥=生成新的；传了=只推导公钥（私钥不进日志）
   SERVER_ADD: 'server_add',
   SERVER_ADD_BULK: 'server_add_bulk', // 批量添加自建节点（本地导入，一次 loadConfig→saveConfig）
   LOCAL_IMPORT_PARSE: 'local_import_parse', // 本地导入：解析文件/文本 → 预览（节点 + 订阅 + 统计）；不可识别格式 throw

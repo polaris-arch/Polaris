@@ -178,6 +178,13 @@ const SITES: readonly ActionSite[] = [
     why: 'staged 分流后不可达（同一 handleSubmit 里 editRoute 命中即 stage + return）',
   },
   {
+    file: 'components/dialogs/NodeDialog.tsx',
+    callee: 'api.server.tailcatKeypair',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id：只传表单里的私钥串（可空），后端纯计算密钥对，不读不写配置',
+  },
+  {
     file: 'components/dialogs/WgDialog.tsx',
     callee: 'api.server.add',
     count: 1,

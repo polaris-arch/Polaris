@@ -43,6 +43,12 @@ import {
 import { parseNumberField, draftFromSpecs, toCselOptions, FieldRenderer } from './FieldSpec';
 import type { FormValue, FormValues } from './FieldSpec';
 
+/** Tailcat 的 44 字符标准 base64 key 样本（32 字节）。 */
+const TC_KEY_A = 'dinJxIQiMsfg+X5vvV6QhuPIaxT4C1Buurk/GDTskCw=';
+const TC_KEY_B = 'zajBCXWDxF7WZrnWNJ0Y4T91BEcb2ZnVjbOK2s6cFHo=';
+const TC_KEY_C = 'ICyC+7hv0tBjFTrqlkAqxPzXkRzEnX5ow1saOdO0f2A=';
+const TC_KEY_D = '6FHZ9B+YJrldLRgyXQwnuhJDhPnxUtHoHOq0At8smHQ=';
+
 const META: Pick<ServerConfig, 'id' | 'name' | 'address' | 'port'> = {
   id: 'srv-1',
   name: '香港 01',
@@ -173,6 +179,19 @@ const SAMPLES: Record<NodeProto, ServerConfig> = {
     torSettings: {
       executablePath: '/usr/bin/tor', dataDirectory: '/var/lib/tor', extraArgs: ['--quiet', '--x'],
       torrc: { ExitNodes: '{jp}', StrictNodes: '1' },
+    },
+  },
+  // Tailcat：无地址（同 Tor），servers 模式 + 字符串/对象混合行 + 透传袋。
+  tailcat: {
+    ...META,
+    protocol: 'tailcat',
+    tailcatSettings: {
+      serverPublicKey: TC_KEY_A,
+      serverDiscoKey: TC_KEY_B,
+      preSharedKey: TC_KEY_C,
+      privateKey: TC_KEY_D,
+      derpServers: ['derp1.example', { host: 'derp2.example', ipv4: '192.0.2.1', cert_name: 'sha256-raw:ab' }],
+      udp_timeout: '2m',
     },
   },
   // OpenConnect：server 是 host:port **单串**；flavor 决定按哪家商用 VPN 的方言握手。
@@ -347,6 +366,9 @@ const KEY_ASSERTS: Record<NodeProto, (out: ServerConfig) => void> = {
     expect(o.tlsSettings?.alpn).toEqual(['h3']);
     expect(o.tlsSettings?.allowInsecure).toBe(true);
   },
+  tailcat: (o) => {
+    expect(o.tailcatSettings).toEqual(SAMPLES.tailcat.tailcatSettings);
+  },
   tor: (o) => {
     expect(o.torSettings?.executablePath).toBe('/usr/bin/tor');
     expect(o.torSettings?.dataDirectory).toBe('/var/lib/tor');
@@ -397,8 +419,8 @@ const KEY_ASSERTS: Record<NodeProto, (out: ServerConfig) => void> = {
 describe('protoCodec round-trip (R5)', () => {
   const protos = PROTO_OPTIONS.map(([p]) => p);
 
-  it('覆盖全部 18 协议（不含 wireguard/tailscale，见 node-spec.ts 文件头注释）', () => {
-    expect(protos).toHaveLength(18);
+  it('覆盖全部 19 协议（不含 wireguard/tailscale，见 node-spec.ts 文件头注释）', () => {
+    expect(protos).toHaveLength(19);
     expect(Object.keys(protoCodec).sort()).toEqual([...protos].sort());
   });
 
@@ -2565,7 +2587,7 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
   // 手建节点根本够不到 —— 等于「支持 AnyConnect 全部能力」只对导入成立。
   // openconnect 内核那支 61 个键，表单给 13；剩下的 csd / cookie / compression_mode …
   // 必须能从这一个控件写进去，且不必改用「自定义」协议（那会丢掉本协议的表单与校验）。
-  const BAG_PROTOS = ['openconnect', 'openvpn-client', 'hysteria', 'tor', 'masque-client'] as const;
+  const BAG_PROTOS = ['openconnect', 'openvpn-client', 'hysteria', 'tor', 'masque-client', 'tailcat'] as const;
 
   for (const proto of BAG_PROTOS) {
     it(`${proto}：extraJson 写入的键活着进设置，且同名时具名字段压过袋子`, () => {
@@ -2579,6 +2601,7 @@ describe('透传袋入口：表单必须够得到未建模字段', () => {
         hysteria: 'hysteriaSettings',
         tor: 'torSettings',
         'masque-client': 'masqueClientSettings',
+        tailcat: 'tailcatSettings',
       }[proto];
       const settings = out[key] as Record<string, unknown>;
       expect(settings.csd, '袋子里的键没进设置 —— 手建节点仍够不到未建模字段').toBe(
@@ -2831,5 +2854,74 @@ describe('MASQUE 表单编解码', () => {
       openconnectSettings: { ...SAMPLES.openconnect.openconnectSettings, version: 'v' },
     } as ServerConfig;
     expect(JSON.parse(protoCodec.openconnect.fromConfig(oc).extraJson as string)).toEqual({ version: 'v' });
+  });
+});
+
+describe('Tailcat 表单编解码', () => {
+  const base = SAMPLES.tailcat;
+  const codec = protoCodec.tailcat;
+  const save = (patch: FormValues, from: ServerConfig = base) =>
+    codec.toConfig({ ...codec.fromConfig(from), ...patch }, from);
+  const withSettings = (tailcatSettings: ServerConfig['tailcatSettings']) =>
+    ({ ...base, tailcatSettings }) as ServerConfig;
+
+  it('derpMode 由字段推导（不落盘）：servers 非空 → servers，有地图 URL → customMap，否则 region', () => {
+    expect(codec.fromConfig(base).derpMode).toBe('servers');
+    expect(codec.fromConfig(withSettings({ derpRegion: 3, derpMapUrl: 'https://m.example/map.json' })).derpMode).toBe('customMap');
+    expect(codec.fromConfig(withSettings({ derpRegion: 3 })).derpMode).toBe('region');
+    expect(save({}).tailcatSettings).not.toHaveProperty('derpMode');
+  });
+
+  it('DERP 三模式互斥：只写当前模式的键，切走的模式删键（两者并存会被剔节点并被 store 丢弃）', () => {
+    const region = save({ derpMode: 'region', derpRegion: 7, derpMapUrl: 'https://m.example/map.json' }).tailcatSettings;
+    expect(region?.derpRegion).toBe(7);
+    expect(region).not.toHaveProperty('derpMapUrl');
+    expect(region).not.toHaveProperty('derpServers');
+    const custom = save({ derpMode: 'customMap', derpRegion: 7, derpMapUrl: 'https://m.example/map.json' }).tailcatSettings;
+    expect(custom?.derpMapUrl).toBe('https://m.example/map.json');
+    expect(custom?.derpRegion).toBe(7);
+    const servers = save({ derpMode: 'servers', derpRegion: 7 }, withSettings({ ...base.tailcatSettings, derpRegion: 7 })).tailcatSettings;
+    expect(servers).not.toHaveProperty('derpRegion');
+    expect(servers?.derpServers).toHaveLength(2);
+  });
+
+  it('derpServers 行格式：裸主机名 ⇄ 串、单行 JSON ⇄ 对象，空行丢弃', () => {
+    const text = codec.fromConfig(base).derpServers as string;
+    expect(text.split('\n')).toEqual([
+      'derp1.example',
+      '{"host":"derp2.example","ipv4":"192.0.2.1","cert_name":"sha256-raw:ab"}',
+    ]);
+    expect(save({ derpServers: `\n  a.example  \n\n{"host":"b.example","derp_port":8443}\n` }).tailcatSettings?.derpServers)
+      .toEqual(['a.example', { host: 'b.example', derp_port: 8443 }]);
+    expect(save({ derpServers: '  \n' }).tailcatSettings).not.toHaveProperty('derpServers');
+  });
+
+  it('derpServers 某行 JSON 坏掉 / 不是对象时保留旧值，不把手误变成清空', () => {
+    for (const bad of ['a.example\n{"host": ', 'a.example\n{} x', '[1]\n{"host":"x"', '{"host":"x"}\n{1}']) {
+      expect(save({ derpServers: bad }).tailcatSettings?.derpServers, bad).toEqual(base.tailcatSettings?.derpServers);
+    }
+  });
+
+  it('key 去首尾空白、空串删键；四把 key 与袋都落在 tailcatSettings，不碰顶层地址/凭据', () => {
+    const out = save({ serverPublicKey: `  ${TC_KEY_A}  `, preSharedKey: '', privateKey: ' ' });
+    expect(out.tailcatSettings?.serverPublicKey).toBe(TC_KEY_A);
+    expect(out.tailcatSettings).not.toHaveProperty('preSharedKey');
+    expect(out.tailcatSettings).not.toHaveProperty('privateKey');
+    expect(out.tailcatSettings?.udp_timeout).toBe('2m');
+    expect(out.password).toBeUndefined();
+    expect(out.username).toBeUndefined();
+  });
+
+  it('从 extraJson 删掉的键不会从 base 复活（设置块不以 base 起底）', () => {
+    const d = codec.fromConfig(base);
+    expect(JSON.parse(d.extraJson as string)).toEqual({ udp_timeout: '2m' });
+    expect(codec.toConfig({ ...d, extraJson: '' }, base).tailcatSettings).not.toHaveProperty('udp_timeout');
+  });
+
+  it('表单不给 http_client / domain_resolver 控件（生成侧决定，写错会自锁）', () => {
+    const keys = allFields('tailcat').map((f) => f.k);
+    expect(keys).not.toContain('httpClient');
+    expect(keys).not.toContain('http_client');
+    expect(keys).not.toContain('domainResolver');
   });
 });

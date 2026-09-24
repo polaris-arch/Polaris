@@ -31,6 +31,7 @@ import type {
   HttpSettings,
   MasqueClientSettings,
   MultiplexSettings,
+  TailcatSettings,
   TlsSettings,
   WebSocketSettings,
 } from '@/contracts/types/protocol-settings';
@@ -471,6 +472,37 @@ const bagOf = (
  */
 const MASQUE_MODELED_KEYS = ['path', 'headers', 'version', 'mtu'] as const;
 
+/** Tailcat 建模键 = Rust `TailcatSettings` 的具名字段（camelCase）；其余键是内核键名的透传袋。 */
+const TAILCAT_MODELED_KEYS = [
+  'serverPublicKey', 'serverDiscoKey', 'preSharedKey', 'privateKey', 'derpRegion', 'derpMapUrl', 'derpServers',
+] as const;
+
+/** `derpServers` → 行文本：裸主机名原样，对象写成单行 JSON（与 [`textToDerpServers`] 成对，往返恒等）。 */
+const derpServersToText = (items: TailcatSettings['derpServers']): string =>
+  (items ?? []).map((item) => (typeof item === 'string' ? item : JSON.stringify(item))).join('\n');
+/**
+ * 行文本 → `derpServers`。每行一个裸主机名，或一个以 `{` 开头的单行 JSON 对象；空行丢弃。
+ * 一项不剩 → `undefined`（删键）；任一对象行 JSON 解析失败 → `null`（调用方保留旧值，同 [`textToBag`] 口径）。
+ */
+const textToDerpServers = (v: FormValue): TailcatSettings['derpServers'] | null | undefined => {
+  const out: NonNullable<TailcatSettings['derpServers']> = [];
+  for (const raw of (typeof v === 'string' ? v : '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (!line.startsWith('{')) {
+      out.push(line);
+      continue;
+    }
+    try {
+      // 以 `{` 开头的串要么解析成对象、要么抛错，不存在「解析成功但不是对象」这一支。
+      out.push(JSON.parse(line) as Record<string, unknown>);
+    } catch {
+      return null;
+    }
+  }
+  return out.length ? out : undefined;
+};
+
 /** OpenVPN `tls` 是独立嵌套命名空间，不能复用父 settings 的建模键表。 */
 const OPENVPN_TLS_KEYS = ['certificate', 'client_certificate', 'client_key'] as const;
 const openvpnTlsBagOf = (tls: unknown): Record<string, unknown> => {
@@ -907,6 +939,45 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           torrc: textToTorrc(draft.torrcText),
           ...(textToBag(draft.extraJson) ?? bagOf(base.torSettings)),
         },
+      };
+    },
+  },
+
+  // Tailcat：无地址（同 Tor），设置块写法同 MASQUE —— **不以 base 起底**（非建模键全在袋里，起底会让
+  // 用户在 JSON 里删掉的键从 base 复活）。DERP 三模式互斥：只写当前模式的键，其余删键，否则
+  // 「region 与 servers 同时设」会被生成侧剔除、被 store 落盘门直接丢弃。
+  tailcat: {
+    fromConfig(cfg) {
+      const d = base0('tailcat');
+      const s = cfg.tailcatSettings;
+      d.serverPublicKey = s?.serverPublicKey ?? '';
+      d.serverDiscoKey = s?.serverDiscoKey ?? '';
+      d.preSharedKey = s?.preSharedKey ?? '';
+      d.privateKey = s?.privateKey ?? '';
+      d.derpMode = s?.derpServers?.length ? 'servers' : s?.derpMapUrl ? 'customMap' : 'region';
+      d.derpRegion = s?.derpRegion;
+      d.derpMapUrl = s?.derpMapUrl ?? '';
+      d.derpServers = derpServersToText(s?.derpServers);
+      d.extraJson = bagToText(bagOf(s, TAILCAT_MODELED_KEYS));
+      return d;
+    },
+    toConfig(draft, base) {
+      const mode = draft.derpMode;
+      const servers = mode === 'servers' ? textToDerpServers(draft.derpServers) : undefined;
+      return {
+        ...base,
+        tailcatSettings: mergeBlock<TailcatSettings>(
+          (textToBag(draft.extraJson) ?? bagOf(base.tailcatSettings, TAILCAT_MODELED_KEYS)) as TailcatSettings,
+          {
+            serverPublicKey: str(draft.serverPublicKey),
+            serverDiscoKey: str(draft.serverDiscoKey),
+            preSharedKey: str(draft.preSharedKey),
+            privateKey: str(draft.privateKey),
+            derpRegion: mode === 'servers' ? undefined : num(draft.derpRegion),
+            derpMapUrl: mode === 'customMap' ? str(draft.derpMapUrl) : undefined,
+            derpServers: servers === null ? base.tailcatSettings?.derpServers : servers,
+          }
+        ),
       };
     },
   },

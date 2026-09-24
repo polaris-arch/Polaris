@@ -29,6 +29,9 @@ export const INVALID_NODE_REASON_KEY: Readonly<Record<string, string>> = {
   'control-url-ip': 'nodes.invalidControlUrlIp',
   'control-url-scheme': 'nodes.invalidControlUrlScheme',
   'control-url-invalid': 'nodes.invalidControlUrlMalformed',
+  // Tailcat（config-engine `tailcat_emit_check`）：两把服务端 key 缺失/形态不对、DERP 模式冲突。
+  'tailcat-key-invalid': 'nodes.invalidTailcatKey',
+  'tailcat-derp-invalid': 'nodes.invalidTailcatDerp',
 };
 
 /**

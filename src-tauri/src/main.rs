@@ -1046,6 +1046,7 @@ fn main() {
             server_delete_batch,
             server_switch,
             server_generate_url,
+            tailcat_keypair,
             // ── mesh 节点（warp + tailscale）──
             warp_register,
             warp_apply_license,

@@ -148,7 +148,7 @@ describe('统一接入表单的信息架构', () => {
   it('复杂协议切页，轻量协议保持单页，不用字段数动态让页签闪现', () => {
     for (const protocol of [
       'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2', 'tuic',
-      'anytls', 'hysteria', 'tor', 'ssh', 'openconnect', 'openvpn-client', 'masque-client',
+      'anytls', 'hysteria', 'tor', 'tailcat', 'ssh', 'openconnect', 'openvpn-client', 'masque-client',
     ] as const) {
       expect(nodeFormUsesTabs(protocol), protocol).toBe(true);
     }
@@ -173,6 +173,43 @@ describe('统一接入表单的信息架构', () => {
     expect(warp).not.toContain('<FormTabs');
     expect(warp).toContain('<FormSection');
     expect(warp).toContain('collapsible');
+  });
+
+  it('Tailcat：连接页 = 服务端 key → DERP → 客户端私钥（紧挨生成按钮），高级页只剩透传袋', () => {
+    const byGroup = Object.fromEntries(nodeFormGroups('tailcat').map((g) => [g.id, g.fields.map((f) => f.k)]));
+    expect(byGroup).toEqual({
+      basic: ['serverPublicKey', 'serverDiscoKey', 'preSharedKey', 'derpMode', 'derpRegion', 'derpMapUrl', 'derpServers', 'privateKey'],
+      advanced: ['extraJson'],
+    });
+    const secret = allFields('tailcat').filter((f) => (f.t === 'text' || f.t === 'textarea') && f.secret).map((f) => f.k);
+    expect(secret.sort()).toEqual(['preSharedKey', 'privateKey', 'serverPublicKey']);
+  });
+
+  it('Tailcat DERP 字段按模式显隐：region 只见区域，customMap 加地图 URL，servers 只见服务器', () => {
+    const shown = (derpMode: string) =>
+      allFields('tailcat')
+        .filter((f) => f.k.startsWith('derp') && f.k !== 'derpMode')
+        .filter((f) => !f.when || f.when({ derpMode }))
+        .map((f) => f.k);
+    expect(shown('region')).toEqual(['derpRegion']);
+    expect(shown('customMap')).toEqual(['derpRegion', 'derpMapUrl']);
+    expect(shown('servers')).toEqual(['derpServers']);
+    const mode = allFields('tailcat').find((f) => f.k === 'derpMode');
+    expect(mode?.t === 'select' && mode.options.map(([v]) => v)).toEqual(['region', 'customMap', 'servers']);
+  });
+
+  it('NodeDialog：无地址协议不渲染地址行、不校验地址（D8）；Tailcat 保存前过同一判据、连接页挂密钥生成', () => {
+    const node = readDialog('NodeDialog.tsx');
+    const gate = node.indexOf('{!isAddresslessProtocol(proto) && (');
+    expect(gate, '地址行没有无地址门').toBeGreaterThan(0);
+    const block = node.slice(gate, node.indexOf('\n      )}\n', gate));
+    expect(block).toContain("t('node.serverPort')");
+    expect(block).toContain('aria-label={t(\'node.port\')}');
+    expect(node).toContain('const addrEmpty = !addressless && (');
+    expect(node).toContain("address: addressless ? '' : address.trim(),");
+    expect(node).toContain("full.protocol === 'tailcat' ? tailcatSettingsError(full.tailcatSettings) : null");
+    expect(node).toContain('children: tailcatKeyField,');
+    expect(node).toContain('api.server.tailcatKeypair(current || undefined)');
   });
 
   it('基础与传输合并成连接页，校验失败定位到所属页', () => {
