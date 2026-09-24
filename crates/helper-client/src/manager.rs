@@ -1352,12 +1352,17 @@ fn build_win_install_script(paths: &InstallPaths, params: &InstallParams, token:
     let core_bin = format!(r"{core_dir}\{WIN_CORE_BIN_NAME}");
     let core_sidecar = format!(r"{core_dir}\{WIN_CORE_SIDECAR_NAME}");
     // 播种源：`bundled_core` 与同目录的 cronet（与 linux 腿同构，`[ -f ] &&` 形态 → 条件播种）。
-    // 这两个是**宿主原生**路径（生产上由 Windows 自己解析出来），故用 `Path` 原生 API 取父目录；
-    // 与上面 `core_dir` 的字面量拼接不矛盾 —— 那个是恒为 Windows 形态的硬编码常量。
+    //
+    // 🔴 **按 Windows 字符串切父目录，不用 `Path::parent`**：本函数只产出 Windows 脚本，而单测跑在
+    // Linux 上 —— 那里 `Path::new(r"C:\…\sing-box.exe").parent()` 返回 `Some("")`，拼出来的是
+    // **裸名** `libcronet.dll`（相对 PowerShell 当前目录，`Test-Path` 恒假 ⇒ 静默不播种 cronet）。
+    // 生产在 Windows 上 `parent()` 正常，所以这个错只在测试里出现、且此前没有任何断言看这个值：
+    // 测试看到的是错值却照样绿。改成字符串切分后，Linux 测试渲染出的就是生产真值，
+    // 由 `win_install_script_seeds_cronet_from_the_bundled_core_directory` 钉住。
     let bundled_core = params.bundled_core.to_string_lossy().into_owned();
-    let bundled_sidecar = params.bundled_core.parent().map_or_else(
+    let bundled_sidecar = bundled_core.rsplit_once(['\\', '/']).map_or_else(
         || WIN_CORE_SIDECAR_NAME.to_owned(),
-        |d| d.join(WIN_CORE_SIDECAR_NAME).to_string_lossy().into_owned(),
+        |(dir, _)| format!(r"{dir}\{WIN_CORE_SIDECAR_NAME}"),
     );
     let conf_dir = params.conf_dir.to_string_lossy();
     // BinaryPathName：各含空格路径用真双引号包裹，经 New-Service 单一字符串直达 CreateService。

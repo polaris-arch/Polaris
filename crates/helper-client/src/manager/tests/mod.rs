@@ -2144,3 +2144,37 @@ fn join_literal(src: &str) -> Option<&str> {
         .nth(1)
         .and_then(|r| r.split('"').next())
 }
+
+/// cronet 的播种源必须是**随包核同目录**下的绝对路径。
+///
+/// 回归来由（2026-09-24 207 真机）：原实现用 `Path::parent()` 取目录，而单测跑在 Linux 上，
+/// `Path::new(r"C:\…\sing-box.exe").parent()` 返回 `Some("")` ⇒ 渲染成裸名 `libcronet.dll`。
+/// 生产（Windows）不受影响，但此前没有断言看这个值 —— 测试看到的是错值却照样绿，
+/// 将来真改坏了也照不出来。本条让 Linux 上渲染出的就是生产真值。
+#[test]
+fn win_install_script_seeds_cronet_from_the_bundled_core_directory() {
+    let p = InstallParams {
+        src_binary: PathBuf::from(
+            r"C:\Users\u\AppData\Local\Polaris\_up_\resources\win\polaris-helper.exe",
+        ),
+        bundled_core: PathBuf::from(
+            r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris\core_update\sing-box.exe",
+        ),
+        conf_dir: PathBuf::from(r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris"),
+        uid: 0,
+        script_dir: PathBuf::from(r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris"),
+    };
+    let script =
+        build_win_install_script(&InstallPaths::win(), &p, "0123456789abcdef0123456789abcdef");
+    let want = r"$bundledSidecar = 'C:\Users\u\AppData\Roaming\com.polaris.app\polaris\core_update\libcronet.dll'";
+    assert!(
+        script.contains(want),
+        "cronet 播种源不是随包核同目录下的绝对路径：\n{}",
+        script
+            .lines()
+            .find(|l| l.starts_with("$bundledSidecar"))
+            .unwrap_or("<缺这一行>")
+    );
+    // 反向：绝不能退化成相对路径的裸名（`Test-Path` 相对当前目录 ⇒ 静默不播种）。
+    assert!(!script.contains("$bundledSidecar = 'libcronet.dll'"));
+}
