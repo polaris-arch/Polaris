@@ -173,7 +173,9 @@ function ProfileList({ config, update }: { config: NonNullable<UseConfigResult['
                   type="button"
                   className={confirming ? 'btn ghost sm danger-text confirming' : 'btn ghost sm danger-text'}
                   onClick={() =>
-                    confirmTwice(delKey, () => commit(profiles.filter((p) => p.id !== profile.id)))
+                    confirmTwice(`network-profile:${profile.id}`, () =>
+                      commit(profiles.filter((p) => p.id !== profile.id)),
+                    )
                   }
                 >
                   {t(confirming ? 'common.confirmAgain' : 'common.delete')}
