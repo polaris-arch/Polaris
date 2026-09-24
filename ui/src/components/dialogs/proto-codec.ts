@@ -471,6 +471,23 @@ const bagOf = (
 };
 
 /**
+ * `bagOf` 的补集：base 设置里落在共用建模表内的键。openconnect / openvpn-client / hysteria / tor 四条腿
+ * 用它代替整块 `...base.xxxSettings` 起底 —— 设置块 = 本函数结果 + 当前袋 + 表单具名字段。
+ *
+ * 为什么不能直接去掉起底：共用表是四个协议的并集，某键在本协议里既不映射成表单字段、又被 `bagOf`
+ * 挡在袋外时，它**两边都不收**，只能从 base 按键名带过来。已知实例：hysteria 的 `auth`（Rust 具名字段、
+ * 表单无控件）与 `network`（v1 内核键，导入器放进 extra，却因 openvpn 的 `network` 在共用表里被藏出袋）。
+ * 表单写的键随后被具名字段覆盖，故这里不必再按协议细分。袋内键（非建模键）**只**来自当前 extraJson ——
+ * 用户在 JSON 里删掉的键不会从 base 复活。
+ */
+const modeledOf = (settings: unknown): Record<string, unknown> => {
+  if (!settings || typeof settings !== 'object') return {};
+  return Object.fromEntries(
+    Object.entries(settings as Record<string, unknown>).filter(([k]) => MODELED_SETTING_KEYS.includes(k))
+  );
+};
+
+/**
  * MASQUE 建模键 = Rust `MasqueClientSettings` 的具名字段。**单列一张，不并进上面那张共用表**：
  * `version` 在 openconnect 那边是内核键却未建模（schema 有 `Endpoint[openconnect].version`），
  * 并进共用表会把它从 openconnect 的透传袋视图里藏掉，用户就再也看不到、改不了它。
@@ -759,7 +776,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         // 顶层字段：**不进 openconnectSettings** —— 那个块整体 flatten 下发给内核，塞个内核不认的键会硬报错。
         meshRoutes: cidrLines(draft.meshRoutes),
         openconnectSettings: {
-          ...base.openconnectSettings,
+          ...modeledOf(base.openconnectSettings),
           ...textToBag(draft.extraJson, 'extraJson'),
           server: base.address && base.port ? endpointHostPort(base.address, base.port) : undefined,
           username: str(draft.user),
@@ -808,7 +825,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         ...base,
         meshRoutes: cidrLines(draft.meshRoutes),
         openvpnClientSettings: {
-          ...base.openvpnClientSettings,
+          ...modeledOf(base.openvpnClientSettings),
           ...textToBag(draft.extraJson, 'extraJson'),
           server: base.address || undefined,
           server_port: base.port || undefined,
@@ -904,7 +921,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         hysteriaSettings: {
-          ...base.hysteriaSettings,
+          ...modeledOf(base.hysteriaSettings),
           authStr: str(draft.authStr),
           upMbps: num(draft.up),
           downMbps: num(draft.down),
@@ -943,7 +960,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         torSettings: {
-          ...base.torSettings,
+          ...modeledOf(base.torSettings),
           executablePath: str(draft.torExec),
           dataDirectory: str(draft.torDataDir),
           extraArgs: args ? args.split(/\s+/).filter(Boolean) : undefined,

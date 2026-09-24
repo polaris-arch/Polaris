@@ -2972,3 +2972,112 @@ describe('Tailcat 表单编解码', () => {
     expect(keys).not.toContain('domainResolver');
   });
 });
+
+describe('透传袋删键不复活：openconnect / openvpn-client / hysteria / tor 设置块不以 base 起底', () => {
+  // 缺陷原型：toConfig 先展开 `...base.xxxSettings` 再叠袋 ⇒ 用户在「原样 JSON」里删掉的键从旧配置复活，
+  // 清空袋也删不掉。参照物是 masque-client / tailcat（设置块 = 具名字段 + 当前袋）。
+  // 每条 case：base 带两个袋键 drop/keep + 一个「两边都不收」的建模表键 hidden（表单不映射、bagOf 又挡在袋外，
+  // 只能从 base 按键名带过来）+ 若干具名字段。
+  type Case = {
+    key: 'openconnectSettings' | 'openvpnClientSettings' | 'hysteriaSettings' | 'torSettings';
+    base: ServerConfig;
+    named: Record<string, unknown>;
+    hidden: Record<string, unknown>;
+  };
+  const CASES: Record<'openconnect' | 'openvpn-client' | 'hysteria' | 'tor', Case> = {
+    openconnect: {
+      key: 'openconnectSettings',
+      base: {
+        ...SAMPLES.openconnect,
+        openconnectSettings: {
+          ...SAMPLES.openconnect.openconnectSettings,
+          server: `${SAMPLES.openconnect.address}:${SAMPLES.openconnect.port}`,
+          drop_me: 'd', keep_me: 'k', network: 'tcp',
+        },
+      },
+      named: { username: 'u', flavor: 'anyconnect', auth_group: 'grp', mtu: 1400, no_udp: true, system: true },
+      hidden: { network: 'tcp' },
+    },
+    'openvpn-client': {
+      key: 'openvpnClientSettings',
+      base: {
+        ...SAMPLES['openvpn-client'],
+        openvpnClientSettings: {
+          ...SAMPLES['openvpn-client'].openvpnClientSettings,
+          server: SAMPLES['openvpn-client'].address,
+          server_port: SAMPLES['openvpn-client'].port,
+          drop_me: 'd', keep_me: 'k', flavor: 'x',
+        },
+      },
+      named: { username: 'u', network: 'tcp', cipher: 'AES-256-GCM', auth: 'SHA256', redirect_gateway: true },
+      hidden: { flavor: 'x' },
+    },
+    hysteria: {
+      key: 'hysteriaSettings',
+      base: {
+        ...SAMPLES.hysteria,
+        hysteriaSettings: {
+          ...SAMPLES.hysteria.hysteriaSettings,
+          auth: 'YmFzZTY0', network: 'udp', drop_me: 'd', keep_me: 'k',
+        },
+      },
+      named: { authStr: 'hy1-auth', upMbps: 10, downMbps: 50, obfs: 'obfs-pw' },
+      hidden: { auth: 'YmFzZTY0', network: 'udp' },
+    },
+    tor: {
+      key: 'torSettings',
+      base: {
+        ...SAMPLES.tor,
+        torSettings: { ...SAMPLES.tor.torSettings, drop_me: 'd', keep_me: 'k', username: 'x' } as ServerConfig['torSettings'],
+      },
+      named: { executablePath: '/usr/bin/tor', dataDirectory: '/var/lib/tor', extraArgs: ['--quiet', '--x'] },
+      hidden: { username: 'x' },
+    },
+  };
+
+  for (const [proto, c] of Object.entries(CASES) as [keyof typeof CASES, Case][]) {
+    const codec = protoCodec[proto];
+    const settingsOf = (cfg: ServerConfig) => (cfg as unknown as Record<string, Record<string, unknown>>)[c.key];
+
+    it(`${proto}：extraJson 删掉的键不复活；保留的袋键、具名字段、两边都不收的键照常输出`, () => {
+      const d = codec.fromConfig(c.base);
+      expect(JSON.parse(d.extraJson as string)).toEqual({ drop_me: 'd', keep_me: 'k' });
+      const out = settingsOf(codec.toConfig({ ...d, extraJson: JSON.stringify({ keep_me: 'k' }) }, c.base));
+      expect(out, '袋里删掉的键从 base 复活').not.toHaveProperty('drop_me');
+      expect(out.keep_me).toBe('k');
+      expect(out).toMatchObject({ ...c.named, ...c.hidden });
+    });
+
+    it(`${proto}：清空 extraJson → 袋键全部消失，两边都不收的键仍保留`, () => {
+      const d = codec.fromConfig(c.base);
+      const out = settingsOf(codec.toConfig({ ...d, extraJson: '' }, c.base));
+      expect(out, '清空袋后袋键仍在').not.toHaveProperty('drop_me');
+      expect(out).not.toHaveProperty('keep_me');
+      expect(out).toMatchObject({ ...c.named, ...c.hidden });
+    });
+
+    it(`${proto}：fromConfig → toConfig 不改动时设置块与输入等价（不丢本应保留的字段）`, () => {
+      expect(settingsOf(codec.toConfig(codec.fromConfig(c.base), c.base))).toEqual(settingsOf(c.base));
+    });
+  }
+});
+
+it('openvpn-client：tls 子袋 ovpnTlsExtraJson 删键/清空不复活（tls 块同样不以 base.tls 起底）', () => {
+  const base = {
+    ...SAMPLES['openvpn-client'],
+    openvpnClientSettings: {
+      ...SAMPLES['openvpn-client'].openvpnClientSettings,
+      tls: { certificate: ['CA'], server_name: 'old.example', peer_fingerprint: 'ab' },
+    },
+  } as ServerConfig;
+  const codec = protoCodec['openvpn-client'];
+  const d = codec.fromConfig(base);
+  expect(JSON.parse(d.ovpnTlsExtraJson as string)).toEqual({ server_name: 'old.example', peer_fingerprint: 'ab' });
+  const kept = codec.toConfig({ ...d, ovpnTlsExtraJson: '{"peer_fingerprint":"ab"}' }, base).openvpnClientSettings?.tls;
+  expect(kept).not.toHaveProperty('server_name');
+  expect(kept).toMatchObject({ certificate: ['CA'], peer_fingerprint: 'ab' });
+  const cleared = codec.toConfig({ ...d, ovpnTlsExtraJson: '' }, base).openvpnClientSettings?.tls;
+  expect(cleared).not.toHaveProperty('server_name');
+  expect(cleared).not.toHaveProperty('peer_fingerprint');
+  expect(cleared?.certificate).toEqual(['CA']);
+});
