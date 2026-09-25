@@ -2645,7 +2645,13 @@ impl ProxyRuntime {
                 .then_some(subscription_update_in_port),
             // §15：起核分配的 K 个测速探测池端口（空 = 分配失败/回滚 → 池不注入，测速回退活跃出口）。
             probe_pool_ports: pool_ports.to_vec(),
-            lan_resolver_for_dns: None,
+            lan_resolver_for_dns: match self.dns_controller.lock() {
+                Ok(controller) => controller.get_lan_resolver_for_dns(),
+                Err(error) => {
+                    log::error!("dns_controller 锁中毒: {error} → LAN DNS 失败关闭");
+                    None
+                }
+            },
             race_upstream_ips,
             race_upstream_ports,
             // macOS(arm64+x64) cronet 静态编入内核（无 dylib 文件）→ 不能只看落盘，否则误拦所有 naive 节点。

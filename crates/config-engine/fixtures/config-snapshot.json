@@ -85,9 +85,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -107,10 +136,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -685,9 +710,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -707,10 +761,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -1292,9 +1342,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -1314,10 +1393,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -1899,9 +1974,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -1921,10 +2025,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -2499,9 +2599,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -2521,10 +2650,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -3068,9 +3193,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -3090,10 +3244,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -3682,9 +3832,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -3704,10 +3883,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -4307,9 +4482,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -4326,12 +4530,6 @@
                   "dns.google"
                 ],
                 "server": "dns-bootstrap"
-              },
-              {
-                "domain_suffix": [
-                  ".local"
-                ],
-                "server": "dns-local"
               },
               {
                 "domain_suffix": [
@@ -4358,14 +4556,6 @@
                   ".1234567.com.cn",
                   ".gw.com.cn",
                   ".tdx.com.cn"
-                ],
-                "server": "dns-domestic"
-              },
-              {
-                "domain_suffix": [
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa"
                 ],
                 "server": "dns-domestic"
               },
@@ -4956,9 +5146,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -4978,10 +5197,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -5552,9 +5767,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -5574,10 +5818,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -6192,9 +6432,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -6214,10 +6483,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -6794,9 +7059,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -6816,10 +7110,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -7380,9 +7670,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -7402,10 +7721,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -7995,9 +8310,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -8017,10 +8361,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -8695,9 +9035,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -8717,10 +9086,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -9450,9 +9815,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com",
@@ -9475,10 +9869,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -10115,9 +10505,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -10137,10 +10556,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -10735,9 +11150,38 @@
                 "path": "/dns-query",
                 "domain_resolver": "dns-bootstrap",
                 "detour": "proxy-selector"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -10757,10 +11201,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -11281,9 +11721,38 @@
                 "path": "/dns-query",
                 "domain_resolver": "dns-bootstrap",
                 "detour": "proxy-selector"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -11303,10 +11772,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -11834,9 +12299,38 @@
                 "path": "/dns-query",
                 "domain_resolver": "dns-bootstrap",
                 "detour": "proxy-selector"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -11856,10 +12350,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -12377,9 +12867,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -12399,10 +12918,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -12986,9 +13501,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -13008,10 +13552,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -13614,9 +14154,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -13636,10 +14205,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -14221,9 +14786,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com",
@@ -14246,10 +14840,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -14838,9 +15428,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -14860,10 +15479,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -15445,9 +16060,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -15467,10 +16111,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -16045,9 +16685,38 @@
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15",
                 "inet6_range": "2001:2::/48"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -16067,10 +16736,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -16672,9 +17337,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -16694,10 +17388,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -17337,10 +18027,39 @@
               },
               {
                 "tag": "dns-lan",
-                "type": "dhcp"
+                "type": "udp",
+                "server": "192.168.1.1"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "server": "dns-lan"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -17357,12 +18076,6 @@
                   "dns.google"
                 ],
                 "server": "dns-bootstrap"
-              },
-              {
-                "domain_suffix": [
-                  ".local"
-                ],
-                "server": "dns-local"
               },
               {
                 "domain_suffix": [
@@ -17391,14 +18104,6 @@
                   ".tdx.com.cn"
                 ],
                 "server": "dns-local"
-              },
-              {
-                "domain_suffix": [
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa"
-                ],
-                "server": "dns-lan"
               },
               {
                 "domain": [
@@ -17948,9 +18653,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -17967,12 +18701,6 @@
                   "dns.google"
                 ],
                 "server": "dns-bootstrap"
-              },
-              {
-                "domain_suffix": [
-                  ".local"
-                ],
-                "server": "dns-local"
               },
               {
                 "domain_suffix": [
@@ -17999,14 +18727,6 @@
                   ".1234567.com.cn",
                   ".gw.com.cn",
                   ".tdx.com.cn"
-                ],
-                "server": "dns-domestic"
-              },
-              {
-                "domain_suffix": [
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa"
                 ],
                 "server": "dns-domestic"
               },
@@ -18595,9 +19315,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "inbound": [
                   "probe-proxy-in"
@@ -18629,10 +19378,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -19228,9 +19973,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -19250,10 +20024,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -19836,9 +20606,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -19858,10 +20657,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -20254,9 +21049,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -20276,10 +21100,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -20921,9 +21741,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -20943,10 +21792,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -21544,9 +22389,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -21566,10 +22440,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",
@@ -22165,9 +23035,38 @@
                 "tag": "fakeip",
                 "type": "fakeip",
                 "inet4_range": "198.18.0.0/15"
+              },
+              {
+                "tag": "dns-mdns",
+                "type": "mdns"
               }
             ],
             "rules": [
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "action": "predefined",
+                "rcode": "SERVFAIL"
+              },
               {
                 "domain": [
                   "a.example.com"
@@ -22187,10 +23086,6 @@
               },
               {
                 "domain_suffix": [
-                  ".local",
-                  ".arpa",
-                  ".lan",
-                  ".home.arpa",
                   ".microdone.cn",
                   ".icbc.com.cn",
                   ".boc.cn",

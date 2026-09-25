@@ -564,3 +564,120 @@ fn dhcp_source_env_rules_start_and_fail_closed_without_privilege() {
     );
     assert_alive_without_fatal(&mut running, started, "dhcp 源");
 }
+
+/// LAN DNS 的完整生成链：公网解析器设为有答案的陷阱；LAN 无上游必须 SERVFAIL，
+/// 有上游只进入私网 UDP。仅测试时将已验过的私网地址替换为本机 UDP fixture。
+#[test]
+fn lan_names_never_fall_through_to_public_dns() {
+    if !kernel_run_or_skip("lan_names_never_fall_through_to_public_dns") {
+        return;
+    }
+    let Some(core) = core_or_skip("LAN DNS isolation") else {
+        return;
+    };
+    let names = [
+        "router.lan",
+        "lan",
+        "nas.home.arpa",
+        "home.arpa",
+        "nas.home",
+        "db.internal",
+        "printer",
+        "1.10.168.192.in-addr.arpa",
+        "1.0.0.0.ip6.arpa",
+    ];
+    for candidate in [None, Some("192.168.1.1"), Some("8.8.8.8")] {
+        let temp = TempDir::new().unwrap();
+        let input = user_config("systemProxy", json!([]), json!([]), json!([]));
+        let case = SnapshotCase {
+            name: "LAN isolation".into(),
+            platform: "win32".into(),
+            input,
+        };
+        let mut deps = full_config_deps(&case, &temp);
+        deps.lan_resolver_for_dns = candidate.map(str::to_string);
+        let outcome =
+            generate_sing_box_config_with_report(&case.input, &BTreeMap::new(), &deps).unwrap();
+        let mut cfg = serde_json::to_value(outcome.config).unwrap();
+        let private = candidate == Some("192.168.1.1");
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let upstream_port = socket.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_reader = stop.clone();
+        let upstream = thread::spawn(move || {
+            let mut queries = std::collections::BTreeSet::new();
+            let mut packet = [0u8; 4096];
+            while !stop_reader.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((size, peer)) = socket.recv_from(&mut packet) else {
+                    continue;
+                };
+                let mut response = packet[..size].to_vec();
+                response[2..4].copy_from_slice(&[0x81, 0x80]);
+                response[6..8].copy_from_slice(&[0, 1]);
+                response
+                    .extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 10, 66, 66, 1]);
+                socket.send_to(&response, peer).unwrap();
+                let mut offset = 12;
+                let mut labels = Vec::new();
+                while packet[offset] != 0 {
+                    let len = usize::from(packet[offset]);
+                    offset += 1;
+                    labels
+                        .push(String::from_utf8_lossy(&packet[offset..offset + len]).into_owned());
+                    offset += len;
+                }
+                queries.insert(labels.join("."));
+            }
+            queries
+        });
+        for server in cfg["dns"]["servers"].as_array_mut().unwrap() {
+            let tag = server["tag"].as_str().unwrap().to_string();
+            if tag == "dns-lan" {
+                assert!(private);
+                assert_eq!(server["type"], "udp");
+                assert_eq!(server["server"], "192.168.1.1");
+                server["server"] = json!("127.0.0.1");
+                server["server_port"] = json!(upstream_port);
+            } else if tag == "dns-mdns" {
+                assert_eq!(server["type"], "mdns");
+            } else {
+                // 落入任何原公网/系统/FakeIP 解析器都会得到 NOERROR，不能伪装成失败关闭。
+                let predefined: serde_json::Map<String, Value> = names
+                    .iter()
+                    .map(|name| (name.to_string(), json!(["203.0.113.99"])))
+                    .collect();
+                *server = json!({"tag": tag, "type": "hosts", "predefined": predefined});
+            }
+        }
+        let port = free_udp_port();
+        cfg["log"] = json!({"level": "debug", "timestamp": false});
+        cfg["inbounds"] = json!([{"type":"direct", "tag":"lan-test", "network":"udp",
+            "listen":"127.0.0.1", "listen_port":port}]);
+        cfg.as_object_mut().unwrap().remove("services");
+        cfg["route"]["rules"] = json!([{"inbound":["lan-test"], "action":"hijack-dns"}]);
+        let path = write_config(&temp, "lan.json", &cfg);
+        let (ok, output) = check(&core, &path);
+        assert!(ok, "LAN DNS check: {output}");
+        let mut running = run(&core, &path, &temp, "lan");
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        wait_answering(&mut running, addr, names[0]);
+        for name in names {
+            assert_eq!(
+                ask(addr, name),
+                Some(if private { (0, 1) } else { (2, 0) }),
+                "{candidate:?} {name}: {}",
+                running.log()
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let queries = upstream.join().unwrap();
+        if private {
+            assert_eq!(queries, names.into_iter().map(str::to_string).collect());
+        } else {
+            assert!(queries.is_empty());
+        }
+    }
+}

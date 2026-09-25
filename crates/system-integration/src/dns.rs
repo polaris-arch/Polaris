@@ -271,15 +271,14 @@ pub fn displaced_private_resolvers(effective: &[String], controlled_ip: &str) ->
     out
 }
 
-/// 挑「可用于内网域名解析的 LAN 解析器」：私网 IPv4 + 排除受控 IP。
-/// 公网/ISP/IPv6/link-local 不取 → 返回 None。上游 `pickLanResolverIp`。
+/// 挑非公网 LAN 解析器（私网 IPv4 / CGNAT / IPv6 ULA），排除受控 IP。
 pub fn pick_lan_resolver_ip(candidates: &[String], controlled_ip: &str) -> Option<String> {
     for raw in candidates {
         let ip = raw.trim();
         if ip == controlled_ip {
             continue;
         }
-        if is_private_ipv4(ip) {
+        if polaris_config_engine::builder::dns::is_lan_dns_ip(ip) {
             return Some(ip.to_string());
         }
     }

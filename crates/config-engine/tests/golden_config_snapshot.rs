@@ -6,6 +6,11 @@
 //! fixture 来源：scripts/export-config-snapshot-fixtures.mts（复用 Polaris config-snapshot.test.ts 的 snap() 场景）。
 //! 这是 B1 的最终 gate——覆盖协议×模式×地区分流×TUN/systemProxy×FakeIP×DNS进阶×mesh/endpoint×抗封×transport 矩阵。
 //!
+//! 2026-09-25 LAN DNS 修复的定向变换（37 个场景）：新增 dns-mdns 与最前两条本地保护；
+//! 原混合 LAN/银行规则仅保留银行后缀，银行/captive 解析器与其余规则相对顺序不变。
+//! 无私网 DNS 时 LAN 返回 SERVFAIL；唯一注入场景 dns-lan 从 DHCP 改为 UDP 192.168.1.1。
+//! 未从 Rust 输出重录；独立按上述规则变换冻结期望，防止把无关差异带入金样。
+//!
 //! 纪律：serde_json::Value 比较（规范化结构等价，忽略键序/空白）。路径分隔符归一化（\ → /）。
 //!
 //! # 夹具的来历与「定向更新」的例外（读之前必看）
