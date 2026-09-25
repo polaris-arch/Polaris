@@ -210,8 +210,8 @@ async fn observed_frame_reaches_file_route_rules_and_tun_exclusion() {
         .find(|rs| rs.tag == tag)
         .expect("产物里没有该节点的 tailnet rule_set 声明");
     assert_eq!(
-        declared.path.as_deref(),
-        Some(path.to_string_lossy().as_ref()),
+        declared.path.as_deref().map(std::path::Path::new),
+        Some(path.as_path()),
         "rule_set 指向的路径必须就是落盘侧写的那个文件（两边分家 = 该腿 100% 不可达）"
     );
     assert!(

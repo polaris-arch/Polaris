@@ -574,8 +574,8 @@ fn existing_tailnet_file_switches_to_local_rule_set() {
         "必须是 headless JSON source（非 binary srs）"
     );
     assert_eq!(
-        def.path.as_deref(),
-        Some(path.display().to_string().as_str()),
+        def.path.as_deref().map(std::path::Path::new),
+        Some(path.as_path()),
         "定义里的 path 与实际落盘路径不一致 ⇒ NewLocalRuleSet 首次 reloadFile 会失败、整个核起不来"
     );
 
