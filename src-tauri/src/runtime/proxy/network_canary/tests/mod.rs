@@ -256,3 +256,51 @@ async fn rearm_retires_previous_session_task() {
     );
     state.disarm();
 }
+
+/// Android 兜底腿：Android 上**没有**通用网络变化 watcher（`spawn_network_watcher` 只在 mac/linux/win
+/// 起；Kotlin `DefaultNetworkMonitor` 的回调只喂 libbox，没有推到 Rust 的腿），`invalidate` 在那里永远
+/// 不会被调 —— 命中态翻转**只靠周期探测**。钉两件事：
+///  ① 不调 `invalidate`，网络（桩的应答）变了也会在一个周期内翻到新结果并发变更信号；
+///  ② 周期本身不超过 5s（= Android 上 Wi-Fi/蜂窝切换后圆点翻转的延迟上界，另加一次 ≤800ms 的查询）。
+#[tokio::test(start_paused = true)]
+async fn periodic_probe_alone_flips_match_within_one_interval() {
+    assert!(
+        CANARY_PROBE_INTERVAL <= Duration::from_secs(5),
+        "Android 没有网络变化即时腿，周期就是翻转延迟上界；调大它 = 手机上圆点更久停在旧网络"
+    );
+    let state = Arc::new(NetworkCanaryState::default());
+    let stub = Stub::default();
+    stub.set("p0.np-canary.polaris.invalid", Some(true));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (session, _) = state.arm(Some(plan(&["np-a"])));
+    let task = {
+        let (state, stub, changes) = (Arc::clone(&state), stub.clone(), Arc::clone(&changes));
+        tokio::spawn(async move {
+            run_canary_probe(&state, session, CANARY_PROBE_INTERVAL, stub.query(), || {
+                changes.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+        })
+    };
+    until(|| state.matched("np-a") == Some(true)).await;
+    let signals = changes.load(Ordering::SeqCst);
+
+    // 换了网络，但没有任何人调 invalidate（Android 的真实形态）。
+    stub.set("p0.np-canary.polaris.invalid", Some(false));
+    let t0 = tokio::time::Instant::now();
+    tokio::time::sleep(CANARY_PROBE_INTERVAL).await;
+    until(|| state.matched("np-a") == Some(false)).await;
+    assert!(
+        t0.elapsed() <= CANARY_PROBE_INTERVAL,
+        "周期探测没在一个周期内翻转：{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(
+        changes.load(Ordering::SeqCst),
+        signals + 1,
+        "翻转 ⇒ 发一次变更信号"
+    );
+
+    assert!(state.disarm());
+    until(|| task.is_finished()).await;
+}

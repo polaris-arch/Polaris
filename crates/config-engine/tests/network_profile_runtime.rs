@@ -367,6 +367,15 @@ fn production_canary_answers_hit_and_miss_on_bundled_core_in_privacy_mode() {
         !hit(addr, &domain_of("np-neg")),
         "反向 canary（192.0.2.1/32）不得命中"
     );
+    // 不可借道（Android 回环全设备共享，`direct` 入站没有 users）：这个口上的**非 canary** 查询由真核在本地
+    // 直接 REFUSED，不落进通用规则 / `dns.final`（那些 server 的 detour 可能是代理）。取 `.invalid` 名：
+    // 即便兜底失效，也只会是一次对保留域名的查询，不是可解析的真实域名。
+    assert_eq!(
+        ask(addr, "borrow-check.polaris.invalid"),
+        Some((5, 0)),
+        "canary 口上的非 canary 查询必须被真核 REFUSED（rcode 5）：\n{}",
+        running.log()
+    );
     assert_alive_without_fatal(&mut running, started, "生产 canary");
 }
 

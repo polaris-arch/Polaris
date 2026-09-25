@@ -41,6 +41,12 @@ pub(super) fn network_watcher_restart_delay(consecutive_failures: u32) -> Durati
 
 impl ProxyRuntime {
     /// 起通用网络变化 watcher。三平台均在核就绪后启动；已在跑则先停旧再起新（幂等）。
+    ///
+    /// **Android / iOS 不起**：移动端的网络变化由原生侧（Android `DefaultNetworkMonitor`）直接喂给进程内
+    /// libbox，没有推到 Rust 的腿（数据面桥是「Rust 拉」，见 `StatsBridge.kt` 头注），故
+    /// [`Self::handle_network_change`] 在那里不会被调。依赖它的网络场景命中态在 Android 上**只靠 canary
+    /// 周期探测**翻转（上界 = `network_canary::CANARY_PROBE_INTERVAL` + 一次查询超时），不会先被置为「未知」；
+    /// 该兜底由 `network_canary/tests` 的 `periodic_probe_alone_flips_match_within_one_interval` 钉住。
     pub(super) fn spawn_network_watcher(self: &Arc<Self>, managed_tun_interface: Option<String>) {
         if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             return;

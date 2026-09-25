@@ -746,8 +746,9 @@ impl NetworkEnv {
 /// 生成 canary 探针（spec §6.3 方案 2 / §5.4）：
 ///
 /// - 每个候选场景一组 DNS 规则：每个环境项一条 `{domain, inbound, <环境项>} → predefined A 127.0.0.1`，
-///   外加一条同名兜底 `→ predefined NXDOMAIN`；整组 `unshift` 到 `dns.rules` **绝对最前**（与探测池规则同一
-///   插入点）。`inbound` 限定在探针入站，真实查询即使撞上这个域名也不会被它们答复。
+///   外加一条同名兜底 `→ predefined NXDOMAIN`；所有场景之后再一条入站级兜底 `{inbound} → predefined REFUSED`
+///   （本入站上的非 canary 查询不落进通用规则，见函数体内注释）；整组 `unshift` 到 `dns.rules`
+///   **绝对最前**（与探测池规则同一插入点）。`inbound` 限定在探针入站，真实查询即使撞上这个域名也不会被它们答复。
 /// - 一个只听 `127.0.0.1` 的 UDP `direct` 入站 + `route.rules` 最前的 `{inbound, hijack-dns}`。
 ///
 /// 场景的地址段与搜索域之间是「任一命中」（D2），与规则展开同形：任一条正向规则命中即 A 记录。
@@ -803,6 +804,24 @@ pub fn apply_network_canaries(
             ..base
         });
     }
+    // 🔴 入站级兜底：本入站上**一切非 canary 查询**一律 REFUSED，不许落进后面的通用 `dns.rules`。
+    //
+    // 为什么必须有：路由侧 `{inbound: [np-probe-in]} → hijack-dns` 已把这个口的每个 UDP 包钉给 DNS 路由
+    // （不是 DNS 报文的包解析失败即丢，不会到任何出站）；但 DNS 路由里只有 canary 域名那几条带了
+    // `inbound` 限定，别的域名会一路落到通用规则与 `dns.final`，而那些 server 的 detour 可能是代理。
+    // 回环 `direct` 入站没有 `users` 认证字段 —— Android 的回环全设备共享（`inbounds.rs` mixed-in
+    // 那段），被 `exclude_package` 排出隧道的应用把这里当 DNS 服务器用，就能经代理解析任意域名
+    // （= 借道，且可当 DNS 隧道外带数据）。这条兜底让这个口只剩「问 canary、得 A/NXDOMAIN」一种用法。
+    //
+    // [选 A：DNS 规则钉死，全平台同一条] 口保留，命中态在 Android 上仍是真值；桌面回环本是机器级信任
+    //   边界，多一条只收紧不放宽，不另长平台分支（第二条腿会让既有门失去牙）。
+    // [不选 B：Android 不发该入站、命中态恒 null] 功能在手机上整块变「未知」，而洞用 A 已能完全关上。
+    rules.push(DnsRule {
+        inbound: inbound(),
+        action: Some("predefined".into()),
+        rcode: Some("REFUSED".into()),
+        ..Default::default()
+    });
     if let Some(dns) = cfg.dns.as_mut() {
         let existing = dns.rules.get_or_insert_with(Vec::new);
         existing.splice(0..0, rules);

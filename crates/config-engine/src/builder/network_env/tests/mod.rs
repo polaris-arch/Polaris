@@ -1195,6 +1195,11 @@ fn n4_canary_rules_lead_dns_rules_and_hijack_leads_route_rules() {
     assert_eq!(head[2]["rcode"], "NXDOMAIN");
     assert!(env_keys(head[2]).is_empty(), "兜底不带环境项：{}", head[2]);
     assert_eq!(
+        rules[3],
+        json!({"inbound": [NETWORK_CANARY_INBOUND_TAG], "action": "predefined", "rcode": "REFUSED"}),
+        "canary 组之后紧跟入站级兜底：本入站上的非 canary 查询不落进通用规则"
+    );
+    assert_eq!(
         rules
             .iter()
             .filter(|r| r.to_string().contains(NETWORK_CANARY_SUFFIX))
@@ -1290,5 +1295,63 @@ fn n4_dhcp_profile_gets_canary_only_when_netenv_is_emitted_for_rules() {
     assert_eq!(
         out.json["dns"]["rules"][0]["dns_server_address"],
         json!({"dns-netenv": ["10.0.0.0/8"]})
+    );
+}
+
+/// 🔴 canary 入站不可借道（Android 回环全设备共享，`direct` 入站没有 `users`；陈先生 2026-09-25 口径）。
+///
+/// 外部应用向该口发 UDP 的全部去向由两处钉死，本测逐条正面断言：
+///  1. 路由：`route.rules[0]` 恰为 `{inbound:[np-probe-in]} → hijack-dns`，且**别处再无**引用该入站的路由规则
+///     ⇒ 这个口的包只能进 DNS 路由，不会被任何后续规则送到代理出站。
+///  2. DNS：从 `dns.rules[0]` 起连续一段**全部**限定 `inbound:[np-probe-in]`，以
+///     `{inbound} → predefined REFUSED` 收尾，且这条兜底之前没有任何不带 inbound 限定的规则
+///     ⇒ 非 canary 域名在这里被拒，到不了通用规则 / `dns.final`（后者的 detour 可能是代理）。
+#[test]
+fn n4_canary_inbound_cannot_be_borrowed_on_android() {
+    let cfg = config(json!({
+        "networkProfiles": [profile("np-a", &["10.20.0.0/16"], &["corp.example"], "system")],
+        "dnsRules": [dns_rule("r-dns", "corp.example", Some("np-a"), domestic())],
+    }));
+    let out = generate_canary(&cfg, "android", Some(CANARY_PORT), |_| {});
+    let plan = out
+        .plan
+        .expect("android 上 system 源场景也出 canary（命中态是真值，不是恒未知）");
+    assert_eq!(plan.canaries.len(), 1);
+    assert_eq!(canary_inbounds(&out.json).len(), 1);
+
+    let tag = json!([NETWORK_CANARY_INBOUND_TAG]);
+    let route = out.json["route"]["rules"].as_array().expect("route.rules");
+    assert_eq!(route[0], json!({"inbound": tag, "action": "hijack-dns"}));
+    assert_eq!(
+        route
+            .iter()
+            .filter(|r| r.to_string().contains(NETWORK_CANARY_INBOUND_TAG))
+            .count(),
+        1,
+        "引用 canary 入站的路由规则只能是最前那条 hijack-dns"
+    );
+
+    let rules = out.json["dns"]["rules"].as_array().expect("dns.rules");
+    let refused = json!({"inbound": tag, "action": "predefined", "rcode": "REFUSED"});
+    let catch_all = rules
+        .iter()
+        .position(|r| *r == refused)
+        .expect("缺入站级 REFUSED 兜底：非 canary 查询会落进通用规则");
+    assert!(
+        catch_all >= 2,
+        "兜底之前必须先有 canary 规则（切片自检）：{catch_all}"
+    );
+    for r in &rules[..catch_all] {
+        assert_eq!(
+            r["inbound"], tag,
+            "兜底之前出现了不限定 canary 入站的规则：{r}"
+        );
+        assert_eq!(r["action"], "predefined", "{r}");
+    }
+    assert!(
+        rules[catch_all + 1..]
+            .iter()
+            .all(|r| !r.to_string().contains(NETWORK_CANARY_INBOUND_TAG)),
+        "兜底之后不该再有引用 canary 入站的规则"
     );
 }
