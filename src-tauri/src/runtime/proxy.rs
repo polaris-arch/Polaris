@@ -1504,6 +1504,8 @@ impl ProxyRuntime {
     /// 注入，避免为了测试恢复到会意外 spawn 本机真核的全局回落路径。
     #[cfg(test)]
     pub(crate) fn inject_real_core_for_test(&self, binary: PathBuf) {
+        // 注入真核 = 此后 start 会真起 `sing-box run`：本机禁起核（POLARIS_NO_KERNEL_RUN=1）时当场红。
+        crate::runtime::kernel_run::forbid_kernel_run("ProxyRuntime 注入真核");
         *self
             .core_binary_override
             .lock()

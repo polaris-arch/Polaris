@@ -15,13 +15,15 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
     // ── 孤儿①（本 app）：用本 app 核路径直接 spawn，不经 ProxyRuntime → 成孤儿 ──
     let ours_cfg = dir.join("orphan-ours.json");
     write_bare_singbox_config(&ours_cfg, free_port());
-    let mut ours_orphan = tokio::process::Command::new(&core)
-        .args(["run", "-c", ours_cfg.to_str().unwrap(), "--disable-color"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn 本 app 孤儿核");
+    let mut ours_orphan = tokio::process::Command::from(crate::runtime::kernel_run::with_run(
+        std::process::Command::new(&core),
+    ))
+    .args(["-c", ours_cfg.to_str().unwrap(), "--disable-color"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("spawn 本 app 孤儿核");
     let ours_pid = ours_orphan.id().expect("本 app 孤儿 pid");
     // 清扫器在 SIGKILL 后会再次探活。若测试自己一直持有未 wait 的 Child，Linux 会把已死进程
     // 留成 zombie，`kill(pid, 0)` 仍会报存在，清扫器便会误判为 EPERM/root survivor。
@@ -33,18 +35,15 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
     std::fs::copy(&core, &foreign_bin).expect("复制核到异路径（std::fs::copy 保留可执行位）");
     let foreign_cfg = dir.join("foreign.json");
     write_bare_singbox_config(&foreign_cfg, free_port());
-    let mut foreign = tokio::process::Command::new(&foreign_bin)
-        .args([
-            "run",
-            "-c",
-            foreign_cfg.to_str().unwrap(),
-            "--disable-color",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn 非本 app sing-box（异路径）");
+    let mut foreign = tokio::process::Command::from(crate::runtime::kernel_run::with_run(
+        std::process::Command::new(&foreign_bin),
+    ))
+    .args(["-c", foreign_cfg.to_str().unwrap(), "--disable-color"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("spawn 非本 app sing-box（异路径）");
     let foreign_pid = foreign.id().expect("非本 app sing-box pid");
 
     // 等两个核都真正起来。

@@ -66,6 +66,12 @@ pub mod x25519;
 #[cfg(test)]
 pub(crate) static REAL_CORE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// 起核（`sing-box run`）用例的唯一判定：本机门禁禁起核、CI 照跑（开关名与语义见被引入的文件头注）。
+/// 与 `crates/config-engine` 的起核门共用**同一份**源文件，不各写一份判定。
+#[cfg(test)]
+#[path = "../../crates/config-engine/tests/support/kernel_run.rs"]
+pub(crate) mod kernel_run;
+
 use std::sync::Arc;
 
 use crate::runtime::{

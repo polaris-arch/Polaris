@@ -13,6 +13,9 @@
 //! **不触网保障（dhcp 用例）**：开跑前断言非 root、CapEff/CapAmb 全零、`ip_unprivileged_port_start > 68`、
 //! 核文件无 file capability ⇒ 内核绑 UDP 68 必在发包之前 EACCES（spec K6，`dhcp.go` 先 listen 后发包）。
 //! 不满足：`POLARIS_REQUIRE_KERNEL_GATE=1` 下红，否则跳过。**绝不以 root 身份跑本门。**
+//!
+//! **本机禁起核**：`POLARIS_NO_KERNEL_RUN=1`（本机 `scripts/gate-rust.sh` 自动设）下全部用例跳过，覆盖交给 CI；
+//! 判定与 `run` 子命令的拼接只在 `support/kernel_run.rs` 一处。
 
 mod support;
 
@@ -28,6 +31,7 @@ use polaris_config_engine::user_config::app_config::UserConfig;
 use serde_json::{json, Value};
 use support::core_locator::{command_for_core, kernel_gate_required};
 use support::kernel_gate::{check, core_or_skip, full_config_deps, SnapshotCase};
+use support::kernel_run::{kernel_run_or_skip, with_run};
 use tempfile::TempDir;
 
 const CANARY_SUFFIX: &str = "np-canary.polaris.invalid";
@@ -197,9 +201,9 @@ impl Drop for Running {
 
 fn run(core: &Path, config: &Path, temp: &TempDir, tag: &str) -> Running {
     let log = temp.path().join(format!("{tag}.log"));
-    let child = command_for_core(core)
-        .arg("--disable-color")
-        .arg("run")
+    let mut cmd = command_for_core(core);
+    cmd.arg("--disable-color");
+    let child = with_run(cmd)
         .arg("-c")
         .arg(config)
         .stdout(Stdio::null())
@@ -240,6 +244,9 @@ fn assert_alive_without_fatal(running: &mut Running, since: Instant, what: &str)
 
 #[test]
 fn system_source_env_rules_start_and_evaluate_on_bundled_core() {
+    if !kernel_run_or_skip("网络场景起核门（system 源）") {
+        return;
+    }
     let Some(core) = core_or_skip("网络场景起核门（system 源）") else {
         return;
     };
@@ -285,6 +292,9 @@ fn system_source_env_rules_start_and_evaluate_on_bundled_core() {
 /// 不监听别的端口），canary 入站原样保留。隐私模式开着（核日志抬到 ≥warn）：命中态走 DNS 查询，不读日志。
 #[test]
 fn production_canary_answers_hit_and_miss_on_bundled_core_in_privacy_mode() {
+    if !kernel_run_or_skip("网络场景起核门（生产 canary）") {
+        return;
+    }
     let Some(core) = core_or_skip("网络场景起核门（生产 canary）") else {
         return;
     };
@@ -363,6 +373,9 @@ fn production_canary_answers_hit_and_miss_on_bundled_core_in_privacy_mode() {
 /// 反向对照：绕过剪枝让坏引用进配置 ⇒ `check` 仍 rc=0（拦不住），`run` 必须 FATAL。
 #[test]
 fn bad_env_ref_bypassing_prune_is_fatal_at_start() {
+    if !kernel_run_or_skip("网络场景起核门（反向对照）") {
+        return;
+    }
     let Some(core) = core_or_skip("网络场景起核门（反向对照）") else {
         return;
     };
@@ -466,6 +479,9 @@ fn dhcp_cannot_emit_packets(core: &Path) -> Result<(), String> {
 
 #[test]
 fn dhcp_source_env_rules_start_and_fail_closed_without_privilege() {
+    if !kernel_run_or_skip("网络场景起核门（dhcp 源）") {
+        return;
+    }
     let Some(core) = core_or_skip("网络场景起核门（dhcp 源）") else {
         return;
     };
