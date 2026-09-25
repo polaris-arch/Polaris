@@ -3252,3 +3252,24 @@ fn install_core_capability_note_uses_the_identity_probed_before_the_call() {
         "缓存命中判定的即时探测被一起删了：那一路要的恰恰是「此刻在管道那头的是谁」"
     );
 }
+
+/// 取值函数单测不能覆盖历史漏接；从真实 controller marker 穿过生产 generate_deps。
+#[test]
+fn lan_resolver_flows_from_controller_into_generated_dependencies() {
+    let (rt, dir) = test_runtime();
+    let marker = dir.join("lan-wiring.marker.json");
+    std::fs::write(
+        &marker,
+        serde_json::to_vec(&serde_json::json!({
+            "controlled_ip": "8.8.8.8", "original": {"Wi-Fi": ["192.168.42.1"]}, "at": 0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    *rt.dns_controller.lock().unwrap() = polaris_system_integration::production_dns_controller(
+        marker.to_string_lossy().into_owned(),
+    );
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
+    assert_eq!(deps.lan_resolver_for_dns.as_deref(), Some("192.168.42.1"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
