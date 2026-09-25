@@ -112,9 +112,19 @@ fn with_dot_prefix(d: &str) -> Vec<String> {
 /// 上游 `TS_NAME_DNS_TAG`。
 const TS_NAME_DNS_TAG: &str = "dns-tailscale";
 
-/// 内网 / 反向解析后缀（非 .local 组播）：内网域 .lan / .home.arpa + 反查 .arpa。
-/// 上游 `INTERNAL_DNS_SUFFIXES`。
-const INTERNAL_DNS_SUFFIXES: &[&str] = &[".arpa", ".lan", ".home.arpa"];
+/// 内网与反向解析命名空间；裸后缀同时匹配 apex 和子域名。
+const INTERNAL_DNS_SUFFIXES: &[&str] = &["arpa", "lan", "home.arpa", "home", "internal"];
+
+/// LAN DNS 只能是非公网单播地址；生成边界复验，避免坏注入恢复公网兜底。
+pub fn is_lan_dns_ip(value: &str) -> bool {
+    match value.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_private() || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+        }
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_unique_local(),
+        Err(_) => false,
+    }
+}
 
 #[derive(Default, Clone)]
 struct DnsEffectMatcher {
@@ -912,13 +922,16 @@ pub fn build_dns_config(
         });
     }
 
-    // 方案B + Q1：dns-lan（type:dhcp）——读到内网 LAN 解析器(私网 IPv4)时建，把内网域名重定向到它解析。
-    let lan_resolver = deps.lan_resolver_for_dns.as_deref();
+    // 使用已核验的接管前地址；不能用 DHCP transport 忽略该地址，也不能退回系统/公网 DNS。
+    let lan_resolver = deps
+        .lan_resolver_for_dns
+        .as_deref()
+        .filter(|ip| is_lan_dns_ip(ip));
     if lan_resolver.is_some() {
         dns_servers.push(DnsServer {
             tag: "dns-lan".into(),
-            type_field: Some("dhcp".into()),
-            server: None,
+            type_field: Some("udp".into()),
+            server: lan_resolver.map(str::to_string),
             server_port: None,
             path: None,
             predefined: None,
@@ -967,7 +980,7 @@ pub fn build_dns_config(
     // winLoopRisk 解耦（T2）：死环源于 Win strict_route(WFP) + type:local 本身 → 改为「Win + TUN」恒判。
     let win_loop_risk =
         deps.platform == "win32" && matches!(config.proxy_mode_type, ProxyModeType::Tun);
-    // 内网/反查/captive 解析器：优先 dns-lan；无则 Win 退 dns-domestic，非 Win 退 dns-local。
+    // Captive 是公网连通性域名，保持原有解析器选择，与 LAN 的失败关闭分开。
     let internal_resolver_tag = if lan_resolver.is_some() {
         "dns-lan"
     } else if win_loop_risk {
@@ -1012,6 +1025,50 @@ pub fn build_dns_config(
             .filter(|n| n.is_finite() && *n > 0.0)
             .map(|n| format!("{}ms", n.round() as i64)),
     };
+    // .local 与链路本地反查直接用组播，不经过可能已被 TUN 接管的系统解析器。
+    let mut mdns = dns_config
+        .servers
+        .iter()
+        .find(|s| s.tag == "dns-local")
+        .unwrap()
+        .clone();
+    mdns.tag = "dns-mdns".into();
+    mdns.type_field = Some("mdns".into());
+    dns_config.servers.push(mdns);
+    let lan_rules = vec![
+        DnsRule {
+            domain_suffix: Some(
+                [
+                    "local",
+                    "254.169.in-addr.arpa",
+                    "8.e.f.ip6.arpa",
+                    "9.e.f.ip6.arpa",
+                    "a.e.f.ip6.arpa",
+                    "b.e.f.ip6.arpa",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ),
+            server: Some("dns-mdns".into()),
+            ..Default::default()
+        },
+        DnsRule {
+            domain_suffix: Some(
+                INTERNAL_DNS_SUFFIXES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            // 单标签主机名同样不应离开本地网络。
+            domain_regex: Some(vec![r"^[^.]+\.?$".into()]),
+            server: lan_resolver.map(|_| "dns-lan".into()),
+            action: lan_resolver.is_none().then(|| "predefined".into()),
+            rcode: lan_resolver.is_none().then(|| "SERVFAIL".into()),
+            ..Default::default()
+        },
+    ];
+
     let mut dns_rules: Vec<DnsRule> = vec![];
 
     // ── rule1：代理服务器域名必须用真实 DNS 解析（避免 FakeIP 劫持死循环）。
@@ -1119,100 +1176,17 @@ pub fn build_dns_config(
         });
     }
 
-    // ── mDNS / 本地反向解析 / 银行。
-    // 三者全为 dns-local → 合并回原单条规则（byte-diff 零变化）；否则拆三条。
-    if internal_resolver_tag == "dns-local" && bank_resolver_tag == "dns-local" {
-        let mut suffixes: Vec<String> = vec![".local".into()];
-        suffixes.extend(INTERNAL_DNS_SUFFIXES.iter().map(|s| s.to_string()));
-        suffixes.extend(
+    // 银行公网域名保留原有平台选择。LAN 规则已在节点/Bootstrap 之前阻止泄漏。
+    dns_rules.push(DnsRule {
+        domain_suffix: Some(
             DOMESTIC_BANK_AND_STOCK_DOMAINS
                 .iter()
-                .map(|s| s.to_string()),
-        );
-        dns_rules.push(DnsRule {
-            rule_set: None,
-            query_type: None,
-            domain: None,
-            domain_suffix: Some(suffixes),
-            domain_keyword: None,
-            domain_regex: None,
-            source_mac_address: None,
-            source_hostname: None,
-            preferred_by: None,
-            type_field: None,
-            action: None,
-            server: Some("dns-local".into()),
-            inbound: None,
-            disable_cache: None,
-            rewrite_ttl: None,
-            ..Default::default()
-        });
-    } else {
-        dns_rules.push(DnsRule {
-            rule_set: None,
-            query_type: None,
-            domain: None,
-            domain_suffix: Some(vec![".local".into()]),
-            domain_keyword: None,
-            domain_regex: None,
-            source_mac_address: None,
-            source_hostname: None,
-            preferred_by: None,
-            type_field: None,
-            action: None,
-            server: Some("dns-local".into()),
-            inbound: None,
-            disable_cache: None,
-            rewrite_ttl: None,
-            ..Default::default()
-        });
-        dns_rules.push(DnsRule {
-            rule_set: None,
-            query_type: None,
-            domain: None,
-            domain_suffix: Some(
-                DOMESTIC_BANK_AND_STOCK_DOMAINS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            ),
-            domain_keyword: None,
-            domain_regex: None,
-            source_mac_address: None,
-            source_hostname: None,
-            preferred_by: None,
-            type_field: None,
-            action: None,
-            server: Some(bank_resolver_tag.into()),
-            inbound: None,
-            disable_cache: None,
-            rewrite_ttl: None,
-            ..Default::default()
-        });
-        dns_rules.push(DnsRule {
-            rule_set: None,
-            query_type: None,
-            domain: None,
-            domain_suffix: Some(
-                INTERNAL_DNS_SUFFIXES
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-            ),
-            domain_keyword: None,
-            domain_regex: None,
-            source_mac_address: None,
-            source_hostname: None,
-            preferred_by: None,
-            type_field: None,
-            action: None,
-            server: Some(internal_resolver_tag.into()),
-            inbound: None,
-            disable_cache: None,
-            rewrite_ttl: None,
-            ..Default::default()
-        });
-    }
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        server: Some(bank_resolver_tag.into()),
+        ..Default::default()
+    });
 
     // ── fake-ip-filter 默认清单（仅 FakeIP 开启且有义；config.fakeIpFilter === false 可关）。
     if enable_fake_ip && config.fake_ip_filter != Some(false) {
@@ -2077,6 +2051,8 @@ pub fn build_dns_config(
         );
     }
 
+    // 探针也不能把本地名称送到公共 DNS；用户规则之间的相对优先级保持原样。
+    dns_rules.splice(0..0, lan_rules);
     dns_config.rules = Some(dns_rules);
     dns_config
 }

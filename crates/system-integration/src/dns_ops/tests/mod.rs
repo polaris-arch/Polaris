@@ -8,6 +8,7 @@ struct MockDnsOps {
     apply_calls: RefCell<Vec<(String, Vec<String>)>>,
     apply_fail_targets: Vec<String>,
     list_fails: bool,
+    effective: RefCell<Vec<String>>,
     /// 模拟平台是否接管（mac=true / win·linux=false）。
     takeover: bool,
     /// 仅对**该 target** 生效的「瞬时失败」计数器：每次对它的 `apply_dns` 调用消耗 1，耗尽后
@@ -28,6 +29,7 @@ impl Default for MockDnsOps {
             apply_calls: RefCell::new(Vec::new()),
             apply_fail_targets: Vec::new(),
             list_fails: false,
+            effective: RefCell::new(vec!["192.168.1.1".into()]),
             takeover: true,
             transient_fail_target: None,
             transient_fail_count: RefCell::new(0),
@@ -83,7 +85,7 @@ impl SystemDnsOps for MockDnsOps {
     fn read_effective_resolvers(
         &self,
     ) -> Result<Vec<String>, crate::error::SystemIntegrationError> {
-        Ok(vec!["192.168.1.1".to_string()])
+        Ok(self.effective.borrow().clone())
     }
 }
 
@@ -621,12 +623,11 @@ fn impl_win_read_paths_stay_live_for_plan_b() {
 }
 
 #[test]
-fn impl_linux_dns_is_fully_noop() {
-    // 上游 LinuxSystemDns 逐字：读也返空，写 no-op，零命令。
+fn impl_linux_dns_write_is_noop() {
+    // 写路径继续 no-op；读路径单独测试。
     let ops = dns_ops_for(Platform::Linux, MockRunner::default());
     assert!(ops.list_targets().unwrap().is_empty());
     assert!(ops.read_dns("eth0").unwrap().is_empty());
-    assert!(ops.read_effective_resolvers().unwrap().is_empty());
     ops.apply_dns("eth0", &["8.8.8.8".to_string()]).unwrap();
     assert!(ops.runner.snapshot().is_empty(), "linux 全 no-op，零命令");
 }
@@ -723,4 +724,61 @@ fn non_takeover_platforms_report_no_displacement() {
             "{platform:?} 不接管系统 DNS，不该报被挤掉的解析器"
         );
     }
+}
+
+#[test]
+fn lan_dns_keeps_dhcp_before_mac_takeover_without_changing_restore_snapshot() {
+    let mut c = controller(MockDnsOps {
+        targets: vec!["Wi-Fi".into()],
+        ..Default::default()
+    });
+    assert_eq!(c.get_lan_resolver_for_dns().as_deref(), Some("192.168.1.1"));
+    c.set_dns();
+    *c.ops.effective.borrow_mut() = vec!["8.8.8.8".into()];
+    assert!(c.marker.read().unwrap().original["Wi-Fi"].is_empty());
+    assert_eq!(c.get_lan_resolver_for_dns().as_deref(), Some("192.168.1.1"));
+    c.set_dns();
+    assert_eq!(c.get_lan_resolver_for_dns().as_deref(), Some("192.168.1.1"));
+    c.restore_dns();
+    assert!(c.ops.dns_state.borrow()["Wi-Fi"].is_empty());
+    assert!(c.get_lan_resolver_for_dns().is_none());
+    *c.ops.effective.borrow_mut() = vec!["10.20.0.1".into()];
+    assert_eq!(c.get_lan_resolver_for_dns().as_deref(), Some("10.20.0.1"));
+}
+
+#[test]
+fn lan_dns_without_private_upstream_fails_closed() {
+    let c = controller(MockDnsOps {
+        effective: RefCell::new(vec![
+            "8.8.8.8".into(),
+            "127.0.0.53".into(),
+            "1.1.1.1".into(),
+        ]),
+        ..Default::default()
+    });
+    assert!(c.get_lan_resolver_for_dns().is_none());
+}
+
+#[test]
+fn linux_reads_real_link_dns_and_falls_back_without_resolved() {
+    let runner = MockRunner::default().with_arg_stdout(
+        "dns",
+        "Global: 127.0.0.53\nLink 2 (eth0): 192.168.1.1 fd00::53\nLink 3 (polaris-tun0): 8.8.8.8\n",
+    );
+    let ops = dns_ops_for(Platform::Linux, runner);
+    assert_eq!(
+        pick_lan_resolver_ip(&ops.read_effective_resolvers().unwrap(), "8.8.8.8").as_deref(),
+        Some("192.168.1.1")
+    );
+    assert_eq!(ops.runner.snapshot().len(), 1);
+    let runner = MockRunner {
+        fail_programs: vec!["resolvectl".into()],
+        ..Default::default()
+    }
+    .with_arg_stdout(
+        "/etc/resolv.conf",
+        "# nameserver 10.0.0.99\nsearch lan\nnameserver fd00::53\n",
+    );
+    let ops = dns_ops_for(Platform::Linux, runner);
+    assert_eq!(ops.read_effective_resolvers().unwrap(), vec!["fd00::53"]);
 }

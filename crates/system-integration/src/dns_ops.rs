@@ -137,7 +137,7 @@ pub const DNS_CMD_TIMEOUT: Duration = Duration::from_secs(5);
 ///   生效解析器读 `scutil --dns`（含 DHCP 下发的，`-getdnsservers` 对 DHCP 返空拿不到）。
 /// - **win**：**写路径 no-op**（`takeover_supported=false`，判据见该方法）；读路径真实现
 ///   （`netsh interface ipv4 show ...`，非提权可跑）供方案B 用。
-/// - **linux**：本物理网卡抽象全 no-op（读也返空）；生产接管另走 [`crate::linux_resolved`]。
+/// - **linux**：写路径 no-op；生效解析器读 resolvectl / resolv.conf，接管另走 [`crate::linux_resolved`]。
 pub struct SystemDnsOpsImpl<R: CommandRunner> {
     runner: R,
     platform: Platform,
@@ -256,7 +256,34 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
                 }
                 Ok(all)
             }
-            Platform::Linux | Platform::Other => Ok(vec![]),
+            Platform::Linux => {
+                // resolved stub (127.0.0.53) 不是上游；先读各链路真实 DNS，失败再读 resolv.conf。
+                let resolved = self.run(&Command::new("resolvectl", ["dns"]));
+                let mut ips: Vec<String> = resolved
+                    .ok()
+                    .map(|out| {
+                        out.stdout
+                            .split_whitespace()
+                            .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if pick_lan_resolver_ip(&ips, controlled_tun_dns_ip()).is_none() {
+                    if let Ok(out) = self.run(&Command::new("cat", ["/etc/resolv.conf"])) {
+                        ips.extend(out.stdout.lines().filter_map(|line| {
+                            let mut fields = line.split_whitespace();
+                            (fields.next() == Some("nameserver"))
+                                .then(|| fields.next())
+                                .flatten()
+                                .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
+                                .map(str::to_string)
+                        }));
+                    }
+                }
+                Ok(ips)
+            }
+            Platform::Other => Ok(vec![]),
         }
     }
 }
@@ -307,6 +334,8 @@ pub struct SystemDnsController<Ops: SystemDnsOps, Fs: MarkerFs> {
     /// 纯运行期观测，不落盘：它描述的是"接管发生时系统上有什么"，重启后要重新观测才有意义。
     /// 空 = 没挤掉任何非公网解析器（也包括"这次没接管"）。
     displaced_resolvers: Vec<String>,
+    /// 接管前生效的 LAN DNS（包括 DHCP）；不能混入用于恢复静态设置的 marker.original。
+    original_lan_resolver: Option<String>,
 }
 
 impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
@@ -317,6 +346,7 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             original: None,
             sleeper: std::thread::sleep,
             displaced_resolvers: Vec::new(),
+            original_lan_resolver: None,
         }
     }
 
@@ -332,15 +362,23 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         &self.marker.controlled_ip
     }
 
-    /// 方案B：挑接管前的内网 LAN 解析器（私网 IPv4，排除受控 IP）。
-    /// marker 在 → 用 marker.original；否则读生效解析器。上游 `getLanResolverForDns`。
+    /// 挑接管前的非公网 LAN 解析器，排除受控 IP。
+    /// 先读本次接管的生效快照，再读恢复 marker，最后读当前生效解析器。
     pub fn get_lan_resolver_for_dns(&self) -> Option<String> {
+        if let Some(ip) = &self.original_lan_resolver {
+            return Some(ip.clone());
+        }
         let marker = self.marker.read();
-        let candidates: Vec<String> = match &marker {
-            Some(m) => m.original.values().flatten().cloned().collect(),
-            None => self.ops.read_effective_resolvers().unwrap_or_default(),
-        };
-        pick_lan_resolver_ip(&candidates, &self.marker.controlled_ip)
+        let original: Vec<String> = marker
+            .as_ref()
+            .map(|m| m.original.values().flatten().cloned().collect())
+            .unwrap_or_default();
+        pick_lan_resolver_ip(&original, &self.marker.controlled_ip).or_else(|| {
+            pick_lan_resolver_ip(
+                &self.ops.read_effective_resolvers().unwrap_or_default(),
+                &self.marker.controlled_ip,
+            )
+        })
     }
 
     /// 本次接管挤掉的非公网解析器（见 [`Self::displaced_resolvers`] 字段文档）。
@@ -406,6 +444,11 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             })
             .unwrap_or_default();
 
+        // DHCP 在 networksetup 静态快照里是 []，另存生效地址；再次接管保留上一份。
+        if self.original_lan_resolver.is_none() {
+            self.original_lan_resolver = self.get_lan_resolver_for_dns();
+        }
+
         // marker 前置写（intent）。
         self.original = Some(original.clone());
         self.marker.write(&original);
@@ -450,6 +493,7 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         // 还原即观测作废：那份清单描述的是"接管期间被挤掉了谁"，接管一结束它就不再成立，
         // 留着会让 UI 在没接管时仍显示告警。
         self.displaced_resolvers.clear();
+        self.original_lan_resolver = None;
         let marker = self.marker.read();
         let original = self
             .original

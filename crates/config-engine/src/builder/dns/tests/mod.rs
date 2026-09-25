@@ -445,14 +445,15 @@ fn strategy_follows_ipv6() {
 }
 
 #[test]
-fn lan_resolver_adds_dns_lan_dhcp() {
-    // lanResolver 注入 → dns-lan(type:dhcp) + internalResolver=dns-lan。
+fn lan_resolver_adds_dns_lan_udp() {
+    // 注入地址必须真正成为 UDP 上游，而不是丢弃地址后改用 DHCP。
     let mut deps = deps_false();
     deps.lan_resolver_for_dns = Some("192.168.1.1".into());
     let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps);
     let lan = c.servers.iter().find(|s| s.tag == "dns-lan");
     assert!(lan.is_some(), "dns-lan server present");
-    assert_eq!(lan.unwrap().type_field.as_deref(), Some("dhcp"));
+    assert_eq!(lan.unwrap().type_field.as_deref(), Some("udp"));
+    assert_eq!(lan.unwrap().server.as_deref(), Some("192.168.1.1"));
 }
 
 #[test]
@@ -505,58 +506,88 @@ fn bootstrap_rule_includes_only_explicitly_referenced_domains() {
 }
 
 #[test]
-fn merged_local_rule_when_no_win_loop_no_lan() {
-    // 非.Win + 无 lanResolver → 三合一单条 dns-local 规则（含 .local/.arpa/.lan/银行）。
-    // fakeIpFilter=false 关闭 captive filter（否则 captive→dns-local 会多一条）。
-    let mut cfg = base_config();
-    cfg.dns_config = Some(UserDnsConfig {
-        enable_fake_ip: Some(true),
-        ..Default::default()
-    });
-    cfg.fake_ip_filter = Some(false);
-    let c = build_dns_config(&cfg, &BTreeMap::new(), &deps_false());
-    let local_rules: Vec<_> = c
-        .rules
-        .as_ref()
-        .unwrap()
-        .iter()
-        .filter(|r| r.server.as_deref() == Some("dns-local"))
-        .collect();
-    assert_eq!(local_rules.len(), 1, "合并为单条 dns-local 规则");
-    let suffixes = local_rules[0].domain_suffix.as_ref().unwrap();
-    assert!(suffixes.contains(&".local".into()));
-    assert!(suffixes.contains(&".arpa".into()));
-    assert!(suffixes.contains(&".lan".into()));
-    assert!(suffixes.contains(&".microdone.cn".into())); // 银行域名
-}
-
-#[test]
-fn win_tun_splits_three_local_rules() {
-    // Win + TUN → 拆三条（.local / 银行 dns-domestic / 内网 dns-domestic）。
-    let mut cfg = base_config();
-    cfg.proxy_mode_type = ProxyModeType::Tun;
-    let mut deps = deps_false();
-    deps.platform = "win32".into();
-    let c = build_dns_config(&cfg, &BTreeMap::new(), &deps);
-    let local_rules: Vec<_> = c
-        .rules
-        .as_ref()
-        .unwrap()
-        .iter()
-        .filter(|r| r.server.as_deref() == Some("dns-local"))
-        .collect();
-    assert_eq!(local_rules.len(), 1, "Win 死环防护仅 .local 留 dns-local");
-    // 银行 + 内网 → dns-domestic（无 lanResolver）。
-    let domestic_rules: Vec<_> = c
-        .rules
-        .as_ref()
-        .unwrap()
-        .iter()
-        .filter(|r| r.server.as_deref() == Some("dns-domestic"))
-        .collect();
-    // captive filter 不开（enableFakeIp 缺省 true 但... 这里 enableFakeIp=true → 无 captive filter 块需 fakeIpFilter!==false）
-    // 至少银行 + 内网两条 dns-domestic。
-    assert!(domestic_rules.len() >= 2);
+fn lan_dns_is_private_or_fails_closed_on_every_platform() {
+    for platform in ["win32", "darwin", "linux", "android", "ios"] {
+        for mode in [ProxyModeType::Tun, ProxyModeType::SystemProxy] {
+            for candidate in [
+                None,
+                Some("192.168.1.1"),
+                Some("fd00::53"),
+                Some("100.100.100.100"),
+                Some("8.8.8.8"),
+                Some("127.0.0.1"),
+                Some("::1"),
+                Some("2001:4860:4860::8888"),
+                Some("bad"),
+            ] {
+                let mut cfg = base_config();
+                cfg.proxy_mode_type = mode;
+                cfg.servers[0].address = "proxy.lan".into();
+                cfg.custom_rules = vec![dns_effect_rule(
+                    "override",
+                    RuleType::DomainSuffix,
+                    &["lan"],
+                    RuleDnsResolver::Proxy,
+                    RuleDnsAnswerMode::Real,
+                )];
+                let mut deps = deps_false();
+                deps.platform = platform.into();
+                deps.lan_resolver_for_dns = candidate.map(str::to_string);
+                deps.probe_proxy_port = Some(12345);
+                deps.probe_pool_ports = vec![12346];
+                let built = build_dns_config(&cfg, &BTreeMap::new(), &deps);
+                let rules = built.rules.as_ref().unwrap();
+                assert_eq!(rules[0].server.as_deref(), Some("dns-mdns"));
+                assert!(rules[0]
+                    .domain_suffix
+                    .as_ref()
+                    .unwrap()
+                    .contains(&"local".into()));
+                let lan = &rules[1];
+                for suffix in ["lan", "arpa", "home.arpa", "internal", "home"] {
+                    assert!(lan.domain_suffix.as_ref().unwrap().contains(&suffix.into()));
+                }
+                assert_eq!(lan.domain_regex, Some(vec![r"^[^.]+\.?$".into()]));
+                // 独立预期，不调用生产谓词自证。
+                let private = matches!(
+                    candidate,
+                    Some("192.168.1.1" | "fd00::53" | "100.100.100.100")
+                );
+                if private {
+                    assert_eq!(lan.server.as_deref(), Some("dns-lan"));
+                    assert!(lan.action.is_none());
+                    let upstream = built.servers.iter().find(|s| s.tag == "dns-lan").unwrap();
+                    assert_eq!(upstream.type_field.as_deref(), Some("udp"));
+                    assert_eq!(upstream.server.as_deref(), candidate);
+                } else {
+                    assert!(lan.server.is_none());
+                    assert_eq!(lan.action.as_deref(), Some("predefined"));
+                    assert_eq!(lan.rcode.as_deref(), Some("SERVFAIL"));
+                    assert!(!built.servers.iter().any(|s| s.tag == "dns-lan"));
+                }
+                let mdns = built.servers.iter().find(|s| s.tag == "dns-mdns").unwrap();
+                assert_eq!(mdns.type_field.as_deref(), Some("mdns"));
+                assert!(mdns.server.is_none());
+                assert!(mdns.detour.is_none());
+                let bank = rules
+                    .iter()
+                    .find(|r| {
+                        r.domain_suffix
+                            .as_ref()
+                            .is_some_and(|s| s.contains(&".microdone.cn".into()))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    bank.server.as_deref(),
+                    Some(if platform == "win32" && mode == ProxyModeType::Tun {
+                        "dns-domestic"
+                    } else {
+                        "dns-local"
+                    })
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -781,17 +812,17 @@ fn probe_pool_emits_servers_and_leading_rules() {
     let tags = server_tags(&c);
     assert!(tags.contains(&"dns-probe-exit-0".into()));
     assert!(tags.contains(&"dns-probe-exit-1".into()));
-    // 规则置顶：前两条是 probe-in-{0,1}。
+    // 规则置顶：LAN 保护之后两条是 probe-in-{0,1}。
     let rules = c.rules.as_ref().unwrap();
     assert_eq!(
-        rules[0].inbound,
+        rules[2].inbound,
         Some(OneOrMany::Many(vec!["probe-in-0".into()]))
     );
     assert_eq!(
-        rules[1].inbound,
+        rules[3].inbound,
         Some(OneOrMany::Many(vec!["probe-in-1".into()]))
     );
-    assert_eq!(rules[0].disable_cache, Some(true));
+    assert_eq!(rules[2].disable_cache, Some(true));
 }
 
 #[test]
@@ -803,9 +834,9 @@ fn probe_proxy_emits_server_and_leading_rule() {
     let proxy_srv = c.servers.iter().find(|s| s.tag == "dns-probe-exit-proxy");
     assert!(proxy_srv.is_some());
     assert_eq!(proxy_srv.unwrap().detour.as_deref(), Some("proxy-selector"));
-    // 规则[0] = probe-proxy-in。
+    // 规则[2] = probe-proxy-in。
     assert_eq!(
-        c.rules.as_ref().unwrap()[0].inbound,
+        c.rules.as_ref().unwrap()[2].inbound,
         Some(OneOrMany::Many(vec!["probe-proxy-in".into()]))
     );
 }
