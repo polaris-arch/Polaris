@@ -10,6 +10,10 @@ included in all copies or substantial portions of the Software.
   - sing-box v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
         随包版本对应源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
         （代理内核，以独立 sidecar 子进程运行）
+        Windows 修复构建：1.15.0-alpha.8.polaris.1（DNS-only 变更缓存刷新）
+        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
+        补丁与构建说明：https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches
+        构建脚本：scripts/lib/build-windows-core.mjs；完整 pin：src-tauri/core-manifest.json
   - cronet-go               — https://github.com/SagerNet/cronet-go     （NaiveProxy 核心，libcronet 动态库）
   - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI）
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）

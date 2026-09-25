@@ -94,6 +94,16 @@ jobs:
         with:
           node-version: '26'
 
+      - name: Read Windows core toolchain pin
+        id: core-go
+        shell: bash
+        run: node -e 'console.log("version=" + require("./src-tauri/core-manifest.json").windowsBuild.goVersion)' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.core-go.outputs.version }}
+          cache: false
+
       - name: Fetch sing-box core
         run: node scripts/fetch-core.mjs
 

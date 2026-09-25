@@ -509,3 +509,33 @@ fn seeded_core_is_executable() {
         "落位后的核必须三位可执行，实得 {mode:o}"
     );
 }
+
+#[test]
+fn managed_windows_core_reseeds_official_but_respects_manual_imports() {
+    let baseline = "1.15.0-alpha.8.polaris.1";
+    assert_eq!(
+        decide_reseed(
+            true,
+            Some(&marker("sing-box version 1.15.0-alpha.8")),
+            baseline
+        ),
+        ReseedAction::Reseed
+    );
+    assert_eq!(
+        decide_reseed(
+            true,
+            Some(&marker(&format!("sing-box version {baseline}"))),
+            baseline
+        ),
+        ReseedAction::Keep
+    );
+    let manual = CoreSeedMarker {
+        version_line: "sing-box version 1.15.0-alpha.8".into(),
+        source: "manual".into(),
+    };
+    assert_eq!(
+        decide_reseed(true, Some(&manual), baseline),
+        ReseedAction::Keep
+    );
+    assert_eq!(decide_reseed(true, None, baseline), ReseedAction::Keep);
+}

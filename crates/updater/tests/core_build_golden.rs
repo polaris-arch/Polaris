@@ -538,3 +538,49 @@ fn classify_official_dev_hex_lower_bound_is_seven_polaris_addition() {
         "7 位 hex 后缀 = 官方 dev 短 commit 下限 → 应判 official"
     );
 }
+
+#[test]
+fn managed_core_upgrade_order_and_online_update_policy() {
+    let bundled = "1.15.0-alpha.8.polaris.2";
+    for (current, reseed) in [
+        ("1.15.0-alpha.7", true),
+        ("1.15.0-alpha.8", true),
+        ("1.15.0-alpha.8.polaris.1", true),
+        (bundled, false),
+        ("1.15.0-alpha.8.polaris.3", false),
+        ("1.15.0-alpha.9", false),
+        ("1.15.0", false),
+        ("1.15.0-alpha.7-other", false),
+        ("unknown", false),
+    ] {
+        let kind = classify_core_build(current);
+        assert_eq!(
+            decide_core_override(kind, &ComparableVersion::normalize(current), bundled).reseed,
+            reseed,
+            "{current}"
+        );
+    }
+    assert_eq!(classify_core_build(bundled), CoreBuildKind::Polaris);
+    assert!(CoreBuildKind::Polaris.blocks_online_update());
+    assert!(CoreBuildKind::Fork.blocks_online_update());
+    assert!(!CoreBuildKind::Official.blocks_online_update());
+    for malformed in [
+        "1.15.0-alpha.8.polaris.",
+        "1.15.0-alpha.8.polaris.1-other",
+        "1.15.0-alpha.8-polaris.1",
+    ] {
+        assert_eq!(classify_core_build(malformed), CoreBuildKind::Fork);
+    }
+    assert!(!reseed_applied("1.15.0-alpha.8", bundled));
+    assert!(reseed_applied(bundled, bundled));
+    assert!(!classify_reseed_result("", "1.15.0-alpha.8", bundled).applied);
+    // When upstream incorporates the fix, app bundles can return to official releases.
+    assert!(
+        decide_core_override(
+            CoreBuildKind::Polaris,
+            &ComparableVersion::normalize(bundled),
+            "1.15.0-alpha.9"
+        )
+        .reseed
+    );
+}

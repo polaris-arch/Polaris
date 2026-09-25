@@ -49,7 +49,7 @@ export function useCoreUpdate() {
   const [coreVer, setCoreVer] = useState<{
     current: string;
     hasBackup: boolean;
-    build: 'official' | 'fork' | 'unknown';
+    build: 'official' | 'polaris' | 'fork' | 'unknown';
   } | null>(null);
   const [staged, setStaged] = useState<{ version: string; stagedAt: string } | null>(null);
   const [coreBusy, setCoreBusy] = useState(false);
@@ -244,7 +244,7 @@ export function useCoreUpdate() {
     latest,
     onlineMessage,
     onlineError,
-    coreForkBlocked: coreVer?.build === 'fork',
+    coreForkBlocked: coreVer?.build === 'fork' || coreVer?.build === 'polaris',
     applyStaged,
     replaceManual,
     rollback,

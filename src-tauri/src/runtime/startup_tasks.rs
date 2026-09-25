@@ -121,7 +121,7 @@ pub fn should_auto_check_update(config: &Value) -> bool {
 /// - `sing-box schema` 只描述**形状**不描述取值域，够不着「这个核认不认这份配置」。
 #[must_use]
 pub fn should_warn_core_baseline(build: CoreBuildKind, current: &str, bundled: &str) -> bool {
-    if build == CoreBuildKind::Official {
+    if matches!(build, CoreBuildKind::Official | CoreBuildKind::Polaris) {
         return false;
     }
     let cur = ComparableVersion::normalize(current);

@@ -398,7 +398,7 @@ const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs'
  * 逐文件枚举会原样重造这个盲区（下一个抽出来的共享模块又落表外），故按目录整取；
  * 只被非内核脚本引用的将来模块因此被**从严**判为内核门 —— 方向是 fail-closed，可接受。
  */
-const CORE_PATH_PREFIXES = ['scripts/lib/'];
+const CORE_PATH_PREFIXES = ['scripts/lib/', 'scripts/core-patches/'];
 
 const SHARED_PACKAGE_PATHS = new Set([
   '.cargo/config.toml',

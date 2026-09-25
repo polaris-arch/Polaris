@@ -17,7 +17,7 @@
 
 import { compareSemver } from './version';
 
-export type CoreBuildKind = 'official' | 'fork' | 'unknown';
+export type CoreBuildKind = 'official' | 'polaris' | 'fork' | 'unknown';
 
 // 官方所有合法 version 形态（read_tag 产出：release 剥 v 的纯 semver；dev = base + '-' + 短 commit hex）。
 const OFFICIAL_RELEASE = /^\d+\.\d+\.\d+$/;
@@ -77,6 +77,7 @@ export function comparableCoreVersion(version: string): string {
 export function classifyCoreBuild(versionLine: string): CoreBuildKind {
   const tok = extractVersionToken(versionLine);
   if (!tok || tok.toLowerCase() === 'unknown') return 'unknown';
+  if (/^\d+\.\d+\.\d+-(alpha|beta|rc)\.\d+\.polaris\.\d+$/.test(tok)) return 'polaris';
   if (OFFICIAL_RELEASE.test(tok) || OFFICIAL_PRERELEASE.test(tok) || OFFICIAL_DEV.test(tok)) {
     return 'official';
   }
@@ -101,7 +102,7 @@ export function decideCoreOverride(
   bundledVersion: string
 ): { reseed: boolean; warn: boolean } {
   const cmp = compareSemver(coreVersion, bundledVersion);
-  if (kind === 'official') {
+  if (kind === 'official' || kind === 'polaris') {
     // 官方非内置核：严格旧于内置 → 内置替换（取更新的随包核）；同版/更新 → 保持
     //（同版不重播种，避免每次启动徒劳换核——seed 后受保护核==内置是常态；更新不降级用户装的官方核）。
     return { reseed: cmp < 0, warn: false };

@@ -168,3 +168,28 @@ fn core_download_gate_is_wired_into_both_core_legs() {
         "自动换核腿又传回了 16 MiB 的通用内存闸"
     );
 }
+
+#[test]
+fn managed_core_update_guards_precede_network_and_disk_swap() {
+    let src = module_code("commands/updater");
+    for (name, effect) in [
+        (
+            "pub(super) async fn core_update_check_inner(",
+            "fetch_releases_json(",
+        ),
+        ("pub async fn core_update_run(", ".download("),
+        ("pub(super) async fn apply_staged_inner(", "std::fs::read("),
+        (
+            "pub(super) async fn swap_core_with_restart(",
+            "install_core_bytes(",
+        ),
+    ] {
+        let body = top_level_fn_body(&src, name);
+        let guard = body.find("blocks_online_update()").expect(name);
+        let effect = body.find(effect).expect(name);
+        assert!(
+            guard < effect,
+            "{name}: managed core must be protected before side effects"
+        );
+    }
+}

@@ -631,6 +631,14 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   // 取材面是 NOTICE 全文（纯文本，无注释/字符串层需要剥）。两条正则各自**至少命中一次**是正面断言：
   // 只写「不许出现别的版本号」会被「把版本号整段删掉」骗过（删了就一处都不命中，仍是零违反）。
   const version = String(manifest.bundledCoreVersion ?? '');
+  if (manifest.windowsBuild) {
+    const build = manifest.windowsBuild;
+    if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
+        || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
+        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
+      fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
+    }
+  }
   if (!/^\d[\w.\-+]*$/.test(version)) {
     fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
     return;
@@ -1624,6 +1632,12 @@ function checkPayload(label, root) {
       // 若哪天它也开始失配且无 Build ID 可证 ⇒ 红（fail-loud，来龙去脉当场可查）。
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
+        if (label === 'windows' && family.what === 'sing-box') {
+          const build = readJson(join(SRC_TAURI, 'core-manifest.json')).windowsBuild;
+          if (build && createHash('sha256').update(readFileSync(p)).digest('hex') !== build.binarySha256) {
+            fail(`${scope.name}: Windows 修复核 SHA-256 与 manifest 不符：${p}`);
+          }
+        }
         const src = join(srcDir, basename(p));
         if (!existsSync(src)) {
           fail(`${scope.name}: 产物里有 ${p}，但源 ${src} 不存在 —— 完整性无从比对（前置缺失判红，不跳过）`);

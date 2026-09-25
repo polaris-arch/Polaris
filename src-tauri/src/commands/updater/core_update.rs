@@ -82,9 +82,13 @@ pub(super) async fn core_update_check_inner(
     let current = u.read_core_version();
 
     // ── fork 硬闸：前置，零网络。
-    if u.core_build_kind() == CoreBuildKind::Fork {
+    if u.core_build_kind().blocks_online_update() {
         return Ok(ApiResponse::err_with_code(
-            "当前为第三方（非官方）内核，已禁用在线更新；请先回滚或重置到出厂内核",
+            if u.core_build_kind() == CoreBuildKind::Polaris {
+                "当前内核随 Polaris 应用更新，请检查应用更新"
+            } else {
+                "当前为第三方（非官方）内核，已禁用在线更新；请先回滚或重置到出厂内核"
+            },
             CODE_FORK_BLOCKED,
         ));
     }
@@ -247,9 +251,13 @@ pub async fn core_update_run(
         Err(resp) => return Ok(resp),
     };
     let u = state.updater();
-    if u.core_build_kind() == CoreBuildKind::Fork {
+    if u.core_build_kind().blocks_online_update() {
         return Ok(ApiResponse::err_with_code(
-            "当前为第三方（非官方）内核，已禁用在线更新；请先回滚或重置到出厂内核",
+            if u.core_build_kind() == CoreBuildKind::Polaris {
+                "当前内核随 Polaris 应用更新，请检查应用更新"
+            } else {
+                "当前为第三方（非官方）内核，已禁用在线更新；请先回滚或重置到出厂内核"
+            },
             CODE_FORK_BLOCKED,
         ));
     }
@@ -494,6 +502,15 @@ pub(super) async fn swap_core_with_restart(
     previous_version: &str,
     interrupt: SwapInterrupt,
 ) -> ApiResponse<Value> {
+    // 下载期间用户可能已重置为随包修复核；落位前再确认来源，且不影响手动导入/回滚。
+    if matches!(source, core_swap::SwapSource::Update)
+        && state.updater().core_build_kind().blocks_online_update()
+    {
+        return ApiResponse::err_with_code(
+            "当前内核不接受官方在线更新，请检查 Polaris 应用更新或手动导入内核",
+            CODE_FORK_BLOCKED,
+        );
+    }
     // ── wire 契约前置检查：**非随包核唯一有牙的地方** ──────────────────────────
     //
     // `crates/singbox-grpc/build.rs` 那道 release 硬门的取材面只有 `resources/*/sing-box` 四条路径，
@@ -755,6 +772,7 @@ pub fn core_get_version_info(state: State<'_, AppRuntime>) -> ApiResponse<Value>
     let st = u.state();
     let build = match u.core_build_kind() {
         CoreBuildKind::Official => "official",
+        CoreBuildKind::Polaris => "polaris",
         CoreBuildKind::Fork => "fork",
         CoreBuildKind::Unknown => "unknown",
     };
@@ -1008,6 +1026,10 @@ pub(super) async fn apply_staged_inner(
     let Some(staged) = state.updater().state().staged else {
         return ApiResponse::ok(json!({ "result": "noop" }));
     };
+    if state.updater().core_build_kind().blocks_online_update() {
+        discard_staged_dir(state, &staged.dir);
+        return ApiResponse::ok(json!({ "result": "discarded" }));
+    }
     let base = match core_base_dir::<Value>() {
         Ok(b) => b,
         Err(resp) => return resp,

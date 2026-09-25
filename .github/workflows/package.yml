@@ -501,6 +501,16 @@ jobs:
       # ── 资产拉取（SHA256 钉扎，供应链防护核心）──
       # 三平台一律全拉（不按 runner 过滤）——支持 Linux 上交叉构建。
       # fetch 脚本缺 pin 即 fail（绝不无校验拉可执行核）。
+      - name: Read Windows core toolchain pin
+        id: core-go
+        shell: bash
+        run: node -e 'console.log("version=" + require("./src-tauri/core-manifest.json").windowsBuild.goVersion)' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.core-go.outputs.version }}
+          cache: false
+
       - name: Fetch sing-box core (SHA256-pinned)
         run: node scripts/fetch-core.mjs
 
