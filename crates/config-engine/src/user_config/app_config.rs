@@ -11,6 +11,7 @@ use crate::user_config::dns_policy::{
     builtin_dns_server_resources, DnsPolicyDefaults, DnsServerGroup, DnsServerResource,
     RoutePolicyDefaults,
 };
+use crate::user_config::network_profile::{deserialize_network_profiles, NetworkProfile};
 use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use crate::user_config::region_routing::RegionRoutingConfig;
 use crate::user_config::rule::{AppRule, CustomAppPreset, Rule, RuleResource};
@@ -70,6 +71,14 @@ pub struct UserConfig {
     pub route_rule_order: Vec<String>,
     #[serde(rename = "dnsRuleOrder", default)]
     pub dns_rule_order: Vec<String>,
+    /// 网络场景（规则经 `networkProfileId` 引用）。逐条容错反序列化：坏条目丢弃，不炸整份配置。
+    #[serde(
+        rename = "networkProfiles",
+        default,
+        deserialize_with = "deserialize_network_profiles",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub network_profiles: Vec<NetworkProfile>,
     #[serde(rename = "dnsServers", default = "default_dns_server_resources")]
     pub dns_servers: Vec<DnsServerResource>,
     #[serde(rename = "dnsServerGroups", default)]
@@ -213,6 +222,7 @@ impl Default for UserConfig {
             dns_rules: None,
             route_rule_order: Vec::new(),
             dns_rule_order: Vec::new(),
+            network_profiles: Vec::new(),
             dns_servers: default_dns_server_resources(),
             dns_server_groups: Vec::new(),
             dns_defaults: None,
@@ -330,6 +340,7 @@ impl UserConfig {
         "dnsRules",
         "routeRuleOrder",
         "dnsRuleOrder",
+        "networkProfiles",
         "dnsServers",
         "dnsServerGroups",
         "dnsDefaults",

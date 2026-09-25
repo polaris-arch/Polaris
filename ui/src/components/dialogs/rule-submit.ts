@@ -12,6 +12,7 @@ import { toast } from '@/lib/error-handler';
 import { isRuleTypeDnsEffectSupported, ruleTypeNameKey, validateRule } from '@/domain/rules';
 import { invalidCondValues, splitVals, type Cond } from './rule-cond';
 import { dnsActionFromChoice } from './dns-action-options';
+import { orderWithNewRuleFirst } from '@/domain/network-profile';
 import { splitDnsRecordLines } from './RuleDnsEffect';
 
 export interface RuleSubmitArgs {
@@ -19,6 +20,13 @@ export interface RuleSubmitArgs {
   conds: readonly Cond[];
   name: string;
   setErrName: (v: boolean) => void;
+  /** 生效网络：'' = 任何网络（不写 `networkProfileId`）。 */
+  networkProfileId: string;
+  /**
+   * 本平面现有规则 id（集合顺序）与持久化顺序 —— 新建**带场景**的规则时用来把它排到最前
+   * （spec §3.4-4）。缺省 = 不调整顺序（沿用后端 `rules_add` 的追加到末尾）。
+   */
+  planeOrder?: { ruleIds: readonly string[]; persistedOrder: readonly string[] };
   logic: 'and' | 'or';
   target: string;
   dnsAction: string;
@@ -59,6 +67,8 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
     conds,
     name,
     setErrName,
+    networkProfileId,
+    planeOrder,
     logic,
     target,
     dnsAction,
@@ -83,6 +93,15 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
   const routeEnabled = initialPlane === 'route';
   const dnsEnabled = initialPlane === 'dns';
   const collectionKey = dnsEnabled ? 'dnsRules' : 'trafficRules';
+  const orderKey = dnsEnabled ? 'dnsRuleOrder' : 'routeRuleOrder';
+  /**
+   * 新建带场景的规则插到最前（spec §3.4-4）：给出新 id 时的整序列；不需要调整时为 null。
+   * 只在新建分支里调用（编辑保持原位置），故这里不再判 isEdit。
+   */
+  const firstOrder = (newId: string): string[] | null =>
+    networkProfileId && planeOrder
+      ? orderWithNewRuleFirst(planeOrder.ruleIds, planeOrder.persistedOrder, newId)
+      : null;
 
   // 名称必填：与 SubDialog / NodeDialog / WarpDialog / WgDialog / AppAddDialog 同一口径（errName +
   // .err-line），此前本表单是全仓唯一放行空名的 —— 空 remarks 会让规则列表的标题回落成裸类型名
@@ -191,6 +210,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
         enabled: base.enabled,
         bypassFakeIP: bypass,
         remarks,
+        networkProfileId: networkProfileId || undefined,
       };
       if (stageRule) {
         stage({
@@ -216,6 +236,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
         targetServerId,
         bypassFakeIP: bypass,
         remarks,
+        ...(networkProfileId ? { networkProfileId } : {}),
       };
       // 新增时前端自铸 id：后端 `rules_add` 只在落盘那一刻发 id，而条目现在就需要稳定的
       // 实体寻址键（同一条规则改两次要覆盖同一条条目，否则计数虚高）。
@@ -228,10 +249,32 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
           entityPath: [collectionKey, entityId],
           nextValue: { ...rest, id: entityId },
         });
+        // 顺序条目与 RulesScreen.commitOrder 同形（整序列、同一个条目 id ⇒ 覆盖而不叠加）；
+        // replay 里实体在前、顺序在后，新规则的 id 在重放顺序时已存在。
+        const order = firstOrder(entityId);
+        if (order && editRoute(orderKey, stagingEnabled) === 'staged') {
+          stage({
+            id: `order:${orderKey}`,
+            kind: 'rule',
+            label: t('home.stagedRuleOrder'),
+            entityPath: [orderKey],
+            nextValue: order,
+          });
+        }
         close();
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
-      await api.rules.add(rest, initialPlane);
+      const created = await api.rules.add(rest, initialPlane);
+      const order = created?.id ? firstOrder(created.id) : null;
+      if (order) {
+        // 沿用既有 rules_reorder（不改排序协议）。规则已落盘，重排失败只提示、不当作保存失败。
+        try {
+          await api.rules.reorder(order, initialPlane);
+        } catch (err) {
+          console.error('[RuleDialog] move new rule to top failed:', err);
+          toast.error(t('rules.networkProfile.moveFirstFailed'));
+        }
+      }
     }
     void loadConfig(true); // 同上：不刷则列表看不到新增/编辑结果
     close();

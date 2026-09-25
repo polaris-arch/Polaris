@@ -9,6 +9,7 @@
 //!   subscriptions   订阅源     —— subscriptions[] + 其展开节点（servers 有 subscriptionId）；两者一体进出
 //!   customRules     流量规则   —— trafficRules[] + routeRuleOrder（兼容镜像 policyRules/customRules）
 //!   dnsRules        DNS 规则   —— dnsRules[] + dnsRuleOrder（自动闭包 DNS 资源）
+//!   （两类规则共同）          —— networkProfiles[]：选任一规则类即整表导出，导入按 id 合并
 //!   dnsResources    DNS 资源   —— dnsServers[] + dnsServerGroups[] + dnsDefaults
 //!   appRules        应用分流   —— appRules[]（+ appRulesSeeded / customAppPresets 同族）
 //!   generalSettings 通用设置   —— 其余所有 config 字段，用**排除法**（自动涵盖未来新增设置）
@@ -122,9 +123,11 @@ impl NodeCategory {
 ///
 /// - `customRuleSets` / `ruleResources` 是两类规则共享的匹配资源（ruleSet 规则按 `res:<id>`
 ///   引用它们）；`customAppPresets` 随应用分流类（`appRule.appId` 引用它）。
+/// - `networkProfiles`（网络场景）不是独立类别：随「流量规则」/「DNS 规则」整表导出、按 id 合并导入
+///   （spec §7 / D12，见 [`pick_categories`] / [`merge_categories`]）。
 /// - `selectedServerId` 跟节点走、不随通用设置导入；导入节点后若失效，[`merge_categories`] 末尾主动归零
 ///   （[`crate::validate::validate_config`] 对失效 selectedServerId 是 **Err、非归零**，不兜底会令整份导入失败）。
-const DATA_FIELDS: [&str; 19] = [
+const DATA_FIELDS: [&str; 20] = [
     "servers",
     "subscriptions",
     "customRules",
@@ -139,6 +142,7 @@ const DATA_FIELDS: [&str; 19] = [
     "dnsServerGroups",
     "dnsDefaults",
     "routeDefaults",
+    "networkProfiles",
     "configSchemaVersion",
     "appRules",
     "appRulesSeeded",
@@ -367,6 +371,13 @@ pub fn pick_categories(config: &Value, selected: &[BackupCategory]) -> Value {
             out.insert("ruleResources".into(), config["ruleResources"].clone());
         }
     }
+    // 网络场景：选了任一引用场景的规则类（流量规则 / DNS 规则）就带上**全部**场景（D12 修订：
+    // 场景不属于任何独立类别，按引用闭包会让未被引用的场景在全量备份里也丢失）。导入按 id 合并。
+    if sel(BackupCategory::CustomRules) || sel(BackupCategory::DnsRules) {
+        if let Some(profiles) = config.get("networkProfiles").filter(|v| v.is_array()) {
+            out.insert("networkProfiles".into(), profiles.clone());
+        }
+    }
     if sel(BackupCategory::DnsResources) {
         out.insert("dnsServers".into(), arr_or_empty(config, "dnsServers"));
         out.insert(
@@ -587,6 +598,31 @@ pub fn merge_categories(
             );
         } else {
             skipped.push(BackupCategory::DnsRules);
+        }
+    }
+
+    // 网络场景随任一规则类导入：**按 id 合并**（同 id 以备份为准，其余保留 current）。备份里没带某条规则
+    // 引用的场景 ⇒ 规则照常导入、`networkProfileId` 原样保留，生成侧按「引用失效」不生成（fail-closed，
+    // spec §3.4-2）——**绝不**删掉引用把它变成无条件规则。
+    if sel(BackupCategory::CustomRules) || sel(BackupCategory::DnsRules) {
+        if let Some(incoming) = backup.get("networkProfiles").and_then(Value::as_array) {
+            let mut merged = arr_or_empty(&result, "networkProfiles")
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for profile in incoming {
+                let Some(id) = profile.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                match merged
+                    .iter_mut()
+                    .find(|p| p.get("id").and_then(Value::as_str) == Some(id))
+                {
+                    Some(existing) => *existing = profile.clone(),
+                    None => merged.push(profile.clone()),
+                }
+            }
+            set(&mut result, "networkProfiles", Value::Array(merged));
         }
     }
 

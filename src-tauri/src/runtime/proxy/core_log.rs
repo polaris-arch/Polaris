@@ -534,7 +534,17 @@ fn strip_level_prefix(s: &str) -> &str {
 pub(crate) enum CoreFatalKind {
     /// 给 TUN 网卡装地址这一步失败（地址被占 / 系统拒绝分配）→ [`code::TUN_ADDRESS_UNAVAILABLE`]。
     TunAddressUnavailable,
+    /// 网络场景 dhcp transport（`dns-netenv`）在 Start 阶段要 network monitor 而没有（非 TUN 且
+    /// `NewNetworkUpdateMonitor` 出错，spec R4/K4）→ 起核腿剔除 dhcp 探测源重试一次
+    /// （[`ProxyRuntime::suppress_netenv_after_fatal`]）。
+    ///
+    /// 判据字面量取自 sing-box `dns/transport/dhcp`：`missing monitor for auto DHCP, set
+    /// route.auto_detect_interface`，已在随包 linux 核 1.15.0-alpha.8 二进制里 `strings` 逐字验到。
+    DhcpMonitorMissing,
 }
+
+/// R4 判据字面量（内核源码里的 ASCII 常量，与系统语言无关）。
+pub(super) const DHCP_MONITOR_MISSING_TOKEN: &str = "missing monitor for auto DHCP";
 
 /// [`CoreFatalKind`] 的跨任务投递槽：`pipe_to_log` 的转发任务写、起核腿失败时读。
 pub(crate) type CoreFatalSlot = Arc<Mutex<Option<CoreFatalKind>>>;
@@ -575,6 +585,9 @@ pub(super) fn classify_core_fatal_line(line: &str, level: log::Level) -> Option<
     // 只看错误档（FATAL/ERROR）。正常 INFO 行里出现这些词只可能是别人的日志噪音。
     if level != log::Level::Error {
         return None;
+    }
+    if line.contains(DHCP_MONITOR_MISSING_TOKEN) {
+        return Some(CoreFatalKind::DhcpMonitorMissing);
     }
     // 外层包装必须在：单看 `add address` 会把任何提到该词的行都算上。
     if !line.contains("configure tun interface") {
@@ -630,7 +643,8 @@ pub(super) fn settle_start_failure(
             TUN_ADDRESS_UNAVAILABLE_MSG.to_string(),
             code::TUN_ADDRESS_UNAVAILABLE,
         ),
-        None => (base_msg, code::STARTUP_FAILED),
+        // R4 已在起核腿就地兜底重试；走到终态说明重试后仍失败，没有专属文案可给。
+        Some(CoreFatalKind::DhcpMonitorMissing) | None => (base_msg, code::STARTUP_FAILED),
     }
 }
 

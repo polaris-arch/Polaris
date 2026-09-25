@@ -36,6 +36,7 @@ fn deps_default<'a>(pending: &'a [Endpoint]) -> RouteConfigDeps<'a> {
         // 夹具目录不存在 ⇒ 块 0c 存在性检查恒假 ⇒ 走 inline 降级腿（与本字段出现之前同）。
         tailnet_rules_dir: "/fake/tailnet-rules".to_string(),
         observed_tailnet_addresses: Default::default(),
+        network_env: Default::default(),
     }
 }
 
@@ -169,6 +170,7 @@ fn v4_ignores_stale_per_traffic_rule_resolution() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }];
 
     assert!(!uses_dns_connection_resolution(&config));
@@ -223,6 +225,7 @@ fn legacy_explicit_destination_resolution_survives_non_smart_mode() {
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
+            network_profile_id: None,
         }];
         let route = build_route_config(&config, &empty_id_map(), &deps_default(&[]));
         let matching: Vec<_> = route
@@ -572,6 +575,7 @@ fn browser_doh_block_emits_only_when_switched_on() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }];
     let deps = deps_default(&[]);
     let rules = build_route_config(&ordered, &empty_id_map(), &deps).rules;
@@ -930,6 +934,7 @@ fn dangling_custom_geo_rule() -> crate::user_config::rule::Rule {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 
@@ -1305,6 +1310,7 @@ fn direct_mode_never_prunes_so_final_stays_direct() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }];
     config.region_routing = Some(crate::user_config::region_routing::RegionRoutingConfig {
         enabled: true,

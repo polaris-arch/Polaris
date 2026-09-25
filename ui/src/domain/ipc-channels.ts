@@ -44,6 +44,10 @@ export const IPC_CHANNELS = {
   // Polaris **自己的**组网节点之间 force-route 段互相吸收的结算（谁抢了谁的段、谁因此零覆盖）。
   // 与上一条成对、射程不重叠：那条是「别人的隧道」，这条是「我自己的节点」。
   ENDPOINT_FORCE_ROUTE_REPORT: 'endpoint_force_route_report',
+  // 网络场景：本机解析后的探测源（只读；场景写入走 CONFIG_PATCH 的 networkProfiles）
+  NETWORK_PROFILE_RESOLVED_SOURCES: 'network_profile_resolved_sources',
+  // 内置解析器 builtin-netenv-dhcp 本机是否可用（只读）
+  NETWORK_PROFILE_BUILTIN_DHCP_STATUS: 'network_profile_builtin_dhcp_status',
   CONFIG_GET_PRIVACY_MODE: 'config_get_privacy_mode',
   CONFIG_SET_PRIVACY_MODE: 'config_set_privacy_mode',
   PRIVACY_SET_PASSWORD: 'privacy_set_password',
@@ -289,6 +293,7 @@ export const IPC_CHANNELS = {
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
   EVENT_PROXY_PENDING_CHANGES: 'event:proxyPendingChanges', // R2 待应用差集 PUSH：switch_mode 末尾推 {added, modified, removed}（与 pull 同构）；待应用操作条数据源
   EVENT_PROXY_INVALID_NODES: 'proxy:invalid-nodes', // 启动 gate 剔除的非法节点（空数组=清陈旧标灰）
+  EVENT_NETWORK_PROFILE_MATCH_CHANGED: 'event:networkProfileMatchChanged', // 网络场景命中态变更（无载荷，收到即重拉 NETWORK_PROFILE_RESOLVED_SOURCES）
   EVENT_IP_INFO_UPDATED: 'event:ipInfoUpdated',
   EVENT_UNLOCK_PROGRESS: 'event:unlockProgress', // 解锁检测：单个服务 settle 逐个点亮
   EVENT_UNLOCK_INVALIDATED: 'event:unlockInvalidated', // 解锁检测：切节点/起停代理 → 缓存失效，渲染端复位重跑

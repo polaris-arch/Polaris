@@ -234,6 +234,13 @@ export function handleProxyErrorEvent(
     );
     return;
   }
+  // 网络场景规则降级（后端 `set_nonfatal_error`，核仍在跑）：部分场景规则本次没生成或可能永不命中。
+  // **不**刷连接态；warning toast 指向「路由」页检查场景。不发桌面通知：它只在起核那一刻产生，
+  // 用户刚做完「连接 / 保存场景」这一步，应用内 toast 送得到。
+  if (data.errorCode === 'NETWORK_PROFILE_RULES_PRUNED') {
+    toast.warning(proxyErrorText(data, t));
+    return;
+  }
   if (data.errorCode === 'SYSTEM_DNS_TAKEOVER_FAILED') {
     toast.warning(proxyErrorText(data, t));
     void notifyDesktop(

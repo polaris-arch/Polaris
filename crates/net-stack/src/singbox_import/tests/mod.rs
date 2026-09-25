@@ -1236,6 +1236,9 @@ fn generate_local_import(
         observed_tailnet_addresses: Default::default(),
         is_valid_srs_fn: |_| true,
         own_lan_cidrs: vec![],
+        system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
+        network_canary_port: None,
         log: |_, _| {},
         on_degraded: || {},
     };

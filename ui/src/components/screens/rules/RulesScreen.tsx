@@ -37,6 +37,8 @@ import {
 } from '@/domain/mesh-rule-overlap';
 import { duplicateRulePayload } from '@/domain/rule-duplicate';
 import { ruleDnsEffect, ruleRouteEffect } from '@/domain/rules';
+import { BUILTIN_NETENV_DHCP_ID, ruleProfileBadge } from '@/domain/network-profile';
+import { netenvDnsDisplayName } from '@/components/dialogs/dns-action-options';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { editRoute, stagedOnlyIds } from '@/lib/staged-config';
@@ -48,6 +50,7 @@ import { toast } from '@/lib/error-handler';
 import { RuleItem } from './RuleItem';
 import { GeoCard } from './GeoCard';
 import { PriorityFlow } from './PriorityFlow';
+import { useResolvedProbes } from './NetworkProfilePanel';
 import {
   DnsPolicyWorkspace,
   type DnsWorkspaceView,
@@ -140,8 +143,14 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
             : server.name;
       names.set(server.id, name);
     }
+    // 内置「当前网络 DHCP 下发的 DNS」不在 dnsServers 资源表里（生成器按需产出，spec D5）。
+    names.set(BUILTIN_NETENV_DHCP_ID, netenvDnsDisplayName(t));
     return names;
   }, [config?.dnsServers, t]);
+
+  // 网络场景徽标：场景表取展示面（暂存中的新场景也要认得），探测源取后端解析结果（渲染端不重算）。
+  const networkProfiles = useMemo(() => config?.networkProfiles ?? [], [config?.networkProfiles]);
+  const resolvedProbes = useResolvedProbes(config);
 
   const dnsGroupNameById = useMemo(
     () => new Map((config?.dnsServerGroups ?? []).map((group) => [group.id, group.name])),
@@ -534,6 +543,19 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
           <h1>{t(plane === 'dns' ? 'sidebar.dns' : 'sidebar.rules')}</h1>
         </div>
         <div className="acts">
+          {/* 网络场景（spec §6.1 D13）：两个平面打开同一个面板，场景同时被流量与 DNS 规则引用。 */}
+          {(plane !== 'dns' || dnsView === 'rules') && (
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => openDialog({ kind: 'network-profiles' })}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+                <path d="M5 12.5a10 10 0 0114 0M8.5 16a5 5 0 017 0M12 19.5h.01M2 9a14.5 14.5 0 0120 0" />
+              </svg>
+              <span>{t('rules.networkProfile.entry')}</span>
+            </button>
+          )}
           <button
             type="button"
             className="btn flow"
@@ -749,6 +771,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
                   stagedOnly={stagedOnlyRuleIds.has(rule.id)}
                   hasMissingResource={missingResIds.has(rule.id)}
                   hasMeshOverlap={meshOverlapIds.has(rule.id)}
+                  networkProfileBadge={ruleProfileBadge(rule, networkProfiles, resolvedProbes)}
                   routeInactive={plane === 'route' && modeInactive && route !== null}
                   onToggle={handleToggle}
                   onEdit={(r) => openDialog({ kind: 'rule', ruleId: r.id, initialPlane: plane })}

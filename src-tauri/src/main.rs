@@ -1102,6 +1102,9 @@ fn main() {
             rules_update,
             rules_delete,
             rules_reorder,
+            // ── 网络场景：本机解析后的探测源（只读；场景写入走 config_patch）──
+            network_profile_resolved_sources,
+            network_profile_builtin_dhcp_status,
             // ── 应用分流预设（内置表 Rust SoT 下发）──
             app_presets_list,
             // ── 自定义应用图标缓存（设定即下载到 userData，渲染零出站）──

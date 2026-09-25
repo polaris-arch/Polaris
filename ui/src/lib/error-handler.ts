@@ -104,6 +104,7 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.SYSTEM_DNS_TAKEOVER_FAILED:
     case ProxyErrorCode.EXIT_MISMATCH:
     case ProxyErrorCode.RULE_RESOURCES_MISSING:
+    case ProxyErrorCode.NETWORK_PROFILE_RULES_PRUNED:
     case ProxyErrorCode.BINARY_NOT_EXECUTABLE:
     case ProxyErrorCode.BINARY_NOT_FOUND:
     case ProxyErrorCode.CRONET_LIB_MISSING:

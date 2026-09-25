@@ -44,6 +44,9 @@ fn deps_default() -> GenerateConfigDeps {
         own_lan_cidrs: vec![],
         log: |_, _| {},
         on_degraded: || {},
+        system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
+        network_canary_port: None,
     }
 }
 
@@ -104,6 +107,7 @@ fn dns_rule_set_rule(id: &str, rule_set: &str) -> Rule {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 
@@ -122,6 +126,7 @@ fn traffic_rule_set_rule(id: &str, rule_set: &str) -> Rule {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 
@@ -242,6 +247,7 @@ fn dns_builtin_rule_set_definitions_survive_all_proxy_modes() {
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
+            network_profile_id: None,
         }];
         let mut deps = deps_default();
         deps.is_valid_srs_fn = |_| true;

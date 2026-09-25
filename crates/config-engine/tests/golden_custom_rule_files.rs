@@ -137,6 +137,7 @@ fn parse_rule(v: &serde_json::Value) -> Rule {
             .get("tlsSpoofMethod")
             .and_then(|t| t.as_str())
             .map(String::from),
+        network_profile_id: None,
     }
 }
 

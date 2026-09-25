@@ -16,6 +16,7 @@ fn rule_with_conditions(conditions: Vec<RuleCondition>) -> Rule {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     }
 }
 
@@ -52,6 +53,7 @@ fn rule_conditions_falls_back_to_mirror() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     let conds = rule_conditions(&rule);
     assert_eq!(conds.len(), 1);
@@ -74,6 +76,7 @@ fn rule_conditions_empty_conditions_falls_back() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     let conds = rule_conditions(&rule);
     assert_eq!(conds.len(), 1);

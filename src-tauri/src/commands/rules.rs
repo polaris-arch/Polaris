@@ -5,10 +5,12 @@
 
 mod crud;
 pub(crate) mod icons;
+mod network_profiles;
 mod resources;
 
 pub use crud::{app_presets_list, rules_add, rules_delete, rules_reorder, rules_update};
 pub use icons::{rule_resources_icon_galleries, rule_resources_refresh_icon_galleries};
+pub use network_profiles::{network_profile_builtin_dhcp_status, network_profile_resolved_sources};
 pub(crate) use resources::{
     remove_builtin_rule_resource_files, remove_rule_resource_file,
     rule_resource_file_is_referenced, rule_resources_redownload_silent,

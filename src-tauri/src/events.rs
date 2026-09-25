@@ -55,6 +55,10 @@ pub mod channel {
     /// `runtime/proxy.rs` 在真状态跃迁点发，订阅方仅待应用操作条 + 连接态显示。
     /// **托盘刻意不订阅**（托盘图标语汇另有待拍板项，不捆进来）。
     pub const EVENT_PROXY_LIFECYCLE: &str = "event:proxyLifecycle";
+    /// **网络场景命中态变更**（无载荷 `{}`）：内核 canary 探针结果变了，渲染端重拉
+    /// `network_profile_resolved_sources`（`matched` 字段）。发射点 `runtime/proxy/network_canary.rs` 的
+    /// 各状态跃迁经 `ProxyErrorEmitter::emit_network_profile_match_changed`。
+    pub const EVENT_NETWORK_PROFILE_MATCH_CHANGED: &str = "event:networkProfileMatchChanged";
 
     // 配置变更。**无载荷**：payload 恒为 `{}`，四个消费方（三个渲染端 + Rust 侧托盘汇流）全部丢弃，
     // 详见 `commands/config.rs::broadcast_config_changed_with` 与其调用点守卫。

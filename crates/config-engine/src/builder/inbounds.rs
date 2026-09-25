@@ -77,6 +77,7 @@ pub fn build_inbounds(
         tag: "mixed-in".into(),
         listen: Some(listen_addr.into()),
         listen_port: Some(local_proxy_port(config)),
+        network: None,
         interface_name: None,
         address: None,
         mtu: None,
@@ -132,6 +133,7 @@ fn http_loopback(tag: &str, port: u16) -> Inbound {
         tag: tag.into(),
         listen: Some("127.0.0.1".into()),
         listen_port: Some(port),
+        network: None,
         interface_name: None,
         address: None,
         mtu: None,
@@ -147,12 +149,24 @@ fn http_loopback(tag: &str, port: u16) -> Inbound {
     }
 }
 
+/// 只听 UDP 的回环 `direct` 入站（网络场景 canary 探针用，spec §6.3 方案 2）。
+///
+/// **恒 `127.0.0.1`，不看 `allowLan`**：它和其它探针入站一样只服务本应用自己，局域网放开只针对 mixed-in。
+pub(crate) fn udp_direct_loopback(tag: &str, port: u16) -> Inbound {
+    Inbound {
+        type_field: "direct".into(),
+        network: Some("udp".into()),
+        ..socks_loopback(tag, port)
+    }
+}
+
 fn socks_loopback(tag: &str, port: u16) -> Inbound {
     Inbound {
         type_field: "socks".into(),
         tag: tag.into(),
         listen: Some("127.0.0.1".into()),
         listen_port: Some(port),
+        network: None,
         interface_name: None,
         address: None,
         mtu: None,
@@ -479,6 +493,7 @@ fn build_tun_inbound(
         tag: "tun-in".into(),
         listen: None,
         listen_port: None,
+        network: None,
         interface_name: None,
         address: Some(tun_address),
         mtu: Some(effective_mtu),

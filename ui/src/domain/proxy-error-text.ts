@@ -29,6 +29,7 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   EXIT_MISMATCH: 'home.proxyMisdirected',
   CORE_BINARY_MISMATCH: 'errors.coreBinaryMismatch',
   RULE_RESOURCES_MISSING: 'home.ruleResourcesMissing',
+  NETWORK_PROFILE_RULES_PRUNED: 'home.networkProfileRulesPruned',
   AUTO_SWITCH_NEEDS_RESTART: 'errors.autoSwitchNeedsRestart',
   OUTBOUND_INTERFACE_UNAVAILABLE: 'errors.outboundInterfaceUnavailable',
   HELPER_GATE_ABORTED: 'errors.helperGateAborted',

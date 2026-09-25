@@ -74,7 +74,27 @@ run_gate fmt cargo fmt --all -- --check
 run_gate clippy env RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets -- -D warnings
 run_gate rustdoc env RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags -D rustdoc::private_intra_doc_links -D rustdoc::redundant_explicit_links" cargo doc --no-deps --workspace --bins --lib --document-private-items
 run_gate build cargo build --workspace --verbose
+# ── 本机专属：禁起核（陈先生决策 2026-09-25）──
+# 本机硬约束「不许起 sing-box run」，而 `cargo test --workspace` 里有真起核的门（盘上有随包核就真起）。
+# 决策：本机跳过起核用例，覆盖交给 CI。判定与 `run` 的拼接只在
+# crates/config-engine/tests/support/kernel_run.rs 一处（源码级门 kernel_run_single_entry.rs 钉死）。
+# 只在非 CI（GITHUB_ACTIONS 未设）时 export；ci.yml / package.yml / release-risk.yml 不设，照常起核。
+# 不改下面那条 `run_gate test` 行本身：它与 ci.yml 由 gate-rust-ci-parity.test.mjs 逐字对拍。
+# 自曝：cargo test 吞掉通过用例的 stderr，故跳过记账写进文件、由本脚本汇总打印「跳过 N 个」；
+# 若本机 shell 里还设着 POLARIS_REQUIRE_KERNEL_GATE=1，helper 会当场红（二者互斥）。
+kernel_skip_log=""
+if [ -z "${GITHUB_ACTIONS:-}" ]; then
+  export POLARIS_NO_KERNEL_RUN=1
+  kernel_skip_log="$(mktemp "${TMPDIR:-/var/tmp}/polaris-kernel-run-skip.XXXXXX")"
+  export POLARIS_KERNEL_RUN_SKIP_LOG="$kernel_skip_log"
+fi
 run_gate test cargo test --workspace --no-fail-fast
+if [ -n "$kernel_skip_log" ]; then
+  kernel_skip_n=$(wc -l < "$kernel_skip_log")
+  echo "⛔ 本机禁起核（POLARIS_NO_KERNEL_RUN=1）：跳过 ${kernel_skip_n} 个起核用例（覆盖交给 CI）"
+  sort "$kernel_skip_log" | sed 's/^/   · /'
+  rm -f "$kernel_skip_log"
+fi
 
 if [ "$WITH_CROSS" = 1 ]; then
   run_gate cross-clippy bash -c '

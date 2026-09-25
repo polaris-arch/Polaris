@@ -196,6 +196,7 @@ fn inbound_exclude_warns_custom_rule_overlap() {
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
+            network_profile_id: None,
         }],
         ..Default::default()
     };

@@ -18,6 +18,7 @@ pub mod fakeip_filter;
 pub mod ip;
 pub mod log_level;
 pub mod neighbor;
+pub mod network_profile;
 pub mod normalize;
 pub mod own_lan;
 pub mod protocol_settings;
@@ -61,6 +62,10 @@ pub use neighbor::{
     is_source_device_match_supported, is_tun_mac_filter_supported, is_valid_mac_address,
     is_valid_neighbor_domain, is_valid_source_hostname, normalize_neighbor_domain,
     TunMacFilterMode,
+};
+pub use network_profile::{
+    is_valid_search_domain, NetworkProbeSource, NetworkProfile, NetworkProfileCriteria,
+    BUILTIN_NETENV_DHCP_ID,
 };
 pub use normalize::{de_opt_token, normalize_token};
 pub use proxy_mode::{ProxyMode, ProxyModeType};

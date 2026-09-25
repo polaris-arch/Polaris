@@ -133,6 +133,7 @@ fn collect_targeted_from_rules() {
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
+            network_profile_id: None,
         },
         Rule {
             id: "r2".into(),
@@ -148,6 +149,7 @@ fn collect_targeted_from_rules() {
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
+            network_profile_id: None,
         },
     ];
     let ids = collect_rule_targeted_server_ids(&rules);
@@ -302,6 +304,7 @@ fn referenced_ids_rule_target_included() {
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
+            network_profile_id: None,
         }],
         ..Default::default()
     };

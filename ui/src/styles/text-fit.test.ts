@@ -1791,3 +1791,140 @@ describe('⑨ 导入弹窗解析结果预览（.imp-*，.dlg 460px 定宽，五�
     expect(worstName - IMP_NAME_MIN, '下限已不再贴着今天最差值 —— 语料变了就把它重新钉一次').toBeLessThan(2);
   });
 });
+
+// ── ⑩ 网络场景面板与规则弹窗「生效网络」（`rules.networkProfile.*`）：几何链 ─────────────────────
+//
+// 场景列表与场景编辑都是 `entry-form-dlg`（540px ⇒ 内容槽 FLD_AVAIL=502）；规则弹窗是基准 `.dlg`
+// （460px ⇒ BASE_FLD_AVAIL=422）。探测方式是 `.seg2` 分段控件：`inline-flex` + 按钮 `nowrap`
+// ⇒ 三档必须**单行**装进内容槽，超了就是整组按钮画出 `.dlg-body`（横向滚动条，同 S11 硬判据）。
+const seg2GapPx = px(decl('./prototype.css', '.seg2', 'gap')); // 3
+const seg2PadX = padX(decl('./prototype.css', '.seg2', 'padding')); // 3*2
+const seg2BorderX = px(decl('./prototype.css', '.seg2', 'border').split(/\s+/)[0]) * 2; // 1*2
+const seg2BtnFont = px(decl('./prototype.css', '.seg2 button', 'font-size')); // 12.5
+const seg2BtnPadX = padX(decl('./prototype.css', '.seg2 button', 'padding')); // 15*2
+const errLineFont = px(decl('./components.css', '.err-line', 'font-size')); // 11
+const warnLineFont = px(decl('./components.css', '.warn-line', 'font-size')); // 11
+const warnLineIcon = px(decl('./components.css', '.warn-line svg', 'width')); // 14
+const warnLineGap = px(decl('./components.css', '.warn-line', 'gap')); // 7
+
+/**
+ * ⑩ 网络场景（N3 新增的两个弹窗 + 规则弹窗新增的一个字段）。
+ *
+ * 量什么：字段标签（`.fld-l` / 开关标签）、说明行（`.card-sub`）、状态行（`.err-line` / `.warn-line`，
+ * 含插值的按模板长度量，射程自曝 b.）、统一信息提示（`#tip`）、探测方式三档（`.seg2` 单行）。
+ * 不量：列表行的 `.dns-resource-title/meta`（nowrap + ellipsis，且主体是场景名 / 判据值这些用户数据，
+ * 射程自曝 a.）；规则行徽标「仅 {{name}}」（`.pill` 在可折行的 flex 容器里，主体是场景名）。
+ *
+ * 行数预算是**棘轮**（同 S11：`.dlg-body{overflow-y:auto}`，纵向不裁），钉在今天五语最差那一格。
+ */
+describe('⑩ 网络场景面板 / 规则弹窗「生效网络」（五语种）', () => {
+  const NP = 'rules.networkProfile.';
+  const LABELS_ENTRY = ['name', 'cidrs', 'domains', 'probe'].map((k) => NP + k);
+  const LABEL_RULE = NP + 'ruleField';
+  const SWT_LABEL = NP + 'enabled';
+  const CARD_SUB = ['intro', 'criteriaHint', 'probeUses', 'probePending', 'probeUnknown'].map((k) => NP + k);
+  const ERR_LINE = ['errName', 'errNoCriteria', 'errCidr', 'errDomain', 'deleteRefsWarn'].map((k) => NP + k);
+  const TIPS = ['cidrsHint', 'domainsHint', 'probeHint', 'enabledHint', 'ruleFieldHint'].map((k) => NP + k);
+  const SEG = ['probeAuto', 'probeSystem', 'probeDhcp'].map((k) => NP + k);
+  // N4 命中态行（`.card-sub.np-match`：7px 圆点 + 6px gap + 文案）。
+  const MATCH = ['matchIn', 'matchOut', 'matchUnknown'].map((k) => NP + k);
+  const MATCH_DOT_AND_GAP =
+    px(decl('./prototype.css', '.dot', 'width')) + px(decl('./screens.css', '.np-match', 'gap'));
+  const labelWrap = wraps(FLD_LABEL_SELS);
+  const box = (where: string, avail: number, fontSize: number, maxLines: number): Box => ({
+    where,
+    avail,
+    type: { fontSize },
+    wrap: true,
+    breakAnywhere: false,
+    maxLines,
+  });
+  const LABEL_BOX = (avail: number, where: string): Box => ({
+    ...box(where, avail, fldLabelFont, labelWrap ? FLD_MAX_LINES.LABEL : 1),
+    wrap: labelWrap,
+    breakAnywhere: breaksAnywhere(FLD_LABEL_SELS),
+  });
+  /** 不可用原因插进 probeUnavailable 模板后的最长那句才是真实最坏值（插值不按模板量）。 */
+  const unavailableTexts = (loc: Locale) =>
+    ['reasonProfileInvalid', 'reasonDhcpNeedsPrivilege', 'reasonSystemNoSearchDomain', 'reasonDhcpMonitorMissing', 'reasonUnknown'].map((r) =>
+      DICT[loc][NP + 'probeUnavailable'].replace('{{reason}}', DICT[loc][NP + r]),
+    );
+  // 棘轮：今天五语最差正好 3 行（模型口径，真机只会更少；实测 2026-09-25：说明行 / 错误行 / 提示行最差均为 3，
+  // 标签 1 行，#tip 6 行）。ru/fa 的原因句最长。
+  const CARD_SUB_MAX = 3;
+  const ERR_LINE_MAX = 3;
+  const WARN_LINE_MAX = 3;
+
+  it('本节量的键仍真的被消费、且五语齐备（改名 / 删控件后本节不得继续量死键）', () => {
+    const panel = src('../components/screens/rules/NetworkProfilePanel.tsx');
+    const rule = src('../components/dialogs/RuleDialog.tsx');
+    const panelTips = TIPS.filter((k) => k !== NP + 'ruleFieldHint');
+    for (const k of [...LABELS_ENTRY, SWT_LABEL, ...CARD_SUB, ...ERR_LINE, ...panelTips, ...SEG, NP + 'probeUnavailable']) {
+      expect(panel.includes(`'${k}'`), `NetworkProfilePanel 已不再消费 ${k}`).toBe(true);
+    }
+    const domain = src('../domain/network-profile.ts');
+    for (const k of ['ipv6DhcpWarn', 'reasonProfileInvalid', 'reasonDhcpNeedsPrivilege', 'reasonSystemNoSearchDomain', 'reasonDhcpMonitorMissing', 'matchIn', 'matchOut', 'matchUnknown'])
+      expect(domain.includes(`'${NP}${k}'`), `domain/network-profile 已不再消费 ${NP}${k}`).toBe(true);
+    expect(rule.includes(`'${LABEL_RULE}'`) && rule.includes(`'${NP}ruleFieldHint'`), 'RuleDialog 不再消费生效网络字段').toBe(true);
+    for (const loc of LOCALES)
+      for (const k of [...LABELS_ENTRY, LABEL_RULE, SWT_LABEL, ...CARD_SUB, ...ERR_LINE, ...TIPS, ...SEG, ...MATCH])
+        expect(DICT[loc][k], `${loc} 缺键 ${k}`).toBeTruthy();
+  });
+
+  it('几何链从 CSS 现场解出', () => {
+    expect([seg2GapPx, seg2PadX, seg2BorderX, seg2BtnFont, seg2BtnPadX]).toEqual([3, 6, 2, 12.5, 30]);
+    expect([errLineFont, warnLineFont, warnLineIcon, warnLineGap]).toEqual([11, 11, 14, 7]);
+    expect(MATCH_DOT_AND_GAP, '命中态行：圆点宽 + gap').toBe(13);
+    expect(px(decl('./prototype.css', '.err-line', 'font-size')), '.err-line 两份副本分叉').toBe(errLineFont);
+  });
+
+  it('标签 / 说明 / 状态行 / 信息提示 × 5 语种装得下', () => {
+    const over: Over[] = [];
+    for (const loc of LOCALES) {
+      for (const k of LABELS_ENTRY) check(over, LABEL_BOX(FLD_AVAIL, '⑩ 场景表单标签'), loc, k, DICT[loc][k]);
+      check(over, LABEL_BOX(BASE_FLD_AVAIL, '⑩ 规则弹窗生效网络标签'), loc, LABEL_RULE, DICT[loc][LABEL_RULE]);
+      check(
+        over,
+        { ...box('⑩ 启用开关标签', swtTextAvail(FLD_AVAIL), swtLabelFont, FLD_MAX_LINES.SWT_LABEL), wrap: labelWrap },
+        loc,
+        SWT_LABEL,
+        DICT[loc][SWT_LABEL],
+      );
+      for (const k of CARD_SUB) check(over, box('⑩ 说明行 .card-sub', FLD_AVAIL, cardSubFont, CARD_SUB_MAX), loc, k, DICT[loc][k]);
+      for (const k of MATCH)
+        check(over, box('⑩ 命中态行 .card-sub.np-match', FLD_AVAIL - MATCH_DOT_AND_GAP, cardSubFont, CARD_SUB_MAX), loc, k, DICT[loc][k]);
+      for (const k of ERR_LINE) check(over, box('⑩ 错误行 .err-line', FLD_AVAIL, errLineFont, ERR_LINE_MAX), loc, k, DICT[loc][k]);
+      for (const text of unavailableTexts(loc))
+        check(over, box('⑩ 不可用行 .err-line', FLD_AVAIL, errLineFont, ERR_LINE_MAX), loc, NP + 'probeUnavailable', text);
+      check(
+        over,
+        box('⑩ IPv6 提示 .warn-line', FLD_AVAIL - warnLineIcon - warnLineGap, warnLineFont, WARN_LINE_MAX),
+        loc,
+        NP + 'ipv6DhcpWarn',
+        DICT[loc][NP + 'ipv6DhcpWarn'],
+      );
+      for (const k of TIPS) check(over, box('⑩ 信息提示 #tip', tipAvail, tipFont, FLD_MAX_LINES.TIP), loc, k, DICT[loc][k]);
+    }
+    expect(over.length, `网络场景文案溢出：\n${fmt(over)}`).toBe(0);
+  });
+
+  it('探测方式三档 × 5 语种单行装进内容槽（.seg2 nowrap，超了整组画出弹窗）', () => {
+    const rowW = (loc: Locale) =>
+      SEG.reduce((sum, k) => sum + textPx(DICT[loc][k], { fontSize: seg2BtnFont }) + seg2BtnPadX, 0) +
+      seg2GapPx * (SEG.length - 1) +
+      seg2PadX +
+      seg2BorderX;
+    const bad = LOCALES.filter((loc) => rowW(loc) > FLD_AVAIL).map((loc) => `${loc} ${rowW(loc).toFixed(1)}px > ${FLD_AVAIL}px`);
+    expect(bad).toEqual([]);
+    // 阳性对照：三档各换成一句话，本判据必须抓到。
+    const fat = 3 * (textPx('Read the current system DNS settings', { fontSize: seg2BtnFont }) + seg2BtnPadX);
+    expect(fat).toBeGreaterThan(FLD_AVAIL);
+  });
+
+  it('阳性对照：超长说明与超宽不可断串都必须被抓到', () => {
+    const bucket: Over[] = [];
+    check(bucket, box('⑩ 说明行 .card-sub', FLD_AVAIL, cardSubFont, CARD_SUB_MAX), 'ru', `${NP}__probeLines`, 'слово '.repeat(200));
+    check(bucket, LABEL_BOX(BASE_FLD_AVAIL, '⑩ 规则弹窗生效网络标签'), 'ru', `${NP}__probeWidth`, 'X'.repeat(200));
+    expect(bucket.length, '合成缺陷没被抓到 —— 本节是装饰').toBe(2);
+  });
+});

@@ -142,6 +142,13 @@ pub struct DnsRule {
     pub ns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<Vec<String>>,
+    /// 环境项：当前网络 DNS 服务器地址落在网段内（1.15；`{<transport tag>: [cidr]}`）。
+    /// 引用的 tag 在 Start 阶段解析（`check` 拦不住），由 `builder::network_env` 生成侧自校验。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_server_address: Option<BTreeMap<String, Vec<String>>>,
+    /// 环境项：当前网络搜索域精确匹配（1.15；`{<transport tag>: [fqdn]}`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_search_domain: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// `dns.fakeip`（`singbox-config-types.ts:64`）。

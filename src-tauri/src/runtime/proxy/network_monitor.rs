@@ -41,6 +41,12 @@ pub(super) fn network_watcher_restart_delay(consecutive_failures: u32) -> Durati
 
 impl ProxyRuntime {
     /// 起通用网络变化 watcher。三平台均在核就绪后启动；已在跑则先停旧再起新（幂等）。
+    ///
+    /// **Android / iOS 不起**：移动端的网络变化由原生侧（Android `DefaultNetworkMonitor`）直接喂给进程内
+    /// libbox，没有推到 Rust 的腿（数据面桥是「Rust 拉」，见 `StatsBridge.kt` 头注），故
+    /// [`Self::handle_network_change`] 在那里不会被调。依赖它的网络场景命中态在 Android 上**只靠 canary
+    /// 周期探测**翻转（上界 = `network_canary::CANARY_PROBE_INTERVAL` + 一次查询超时），不会先被置为「未知」；
+    /// 该兜底由 `network_canary/tests` 的 `periodic_probe_alone_flips_match_within_one_interval` 钉住。
     pub(super) fn spawn_network_watcher(self: &Arc<Self>, managed_tun_interface: Option<String>) {
         if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             return;
@@ -68,6 +74,9 @@ impl ProxyRuntime {
     /// 显式绑定失效 fail-closed（保留当前核、告警、不改默认出口）；推断绑定失效或路由变化则重启
     /// TUN，在接口撤销后重新读取真实物理路由。
     async fn handle_network_change(self: &Arc<Self>, impact: NetworkChangeImpact) {
+        // 网络场景命中态：旧网络的结果先作废（未知），canary 探测任务被唤醒立即重探。放在最前：
+        // 下面几条腿可能 await 很久或调度重启，命中态不该在这期间继续显示旧网络的判定。
+        self.invalidate_network_canary();
         self.reconcile_system_dns_best_effort().await;
         let Some(config) = self
             .current_config

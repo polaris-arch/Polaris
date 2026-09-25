@@ -2,9 +2,13 @@
 //!
 //! `check` 只能证明 JSON 可解码；本门还真起核心、真走 SOCKS inbound，并用受控 DNS 与上游
 //! SOCKS 观察器证明 resolve → private reject → route 的运行顺序。危险地址若抵达上游观察器即失败。
+//!
+//! **本机禁起核**：`POLARIS_NO_KERNEL_RUN=1`（本机 `scripts/gate-rust.sh` 自动设）下跳过，覆盖交给 CI。
 
 #[path = "support/core_locator.rs"]
 mod core_locator;
+#[path = "support/kernel_run.rs"]
+mod kernel_run;
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -15,6 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use core_locator::{command_for_core, core_or_skip};
+use kernel_run::{kernel_run_or_skip, with_run};
 use polaris_config_engine::builder::subscription_guard::{
     subscription_update_route_rules, SUBSCRIPTION_UPDATE_INBOUND_TAG,
 };
@@ -248,6 +253,9 @@ fn config(inbound_port: u16, dns_addr: SocketAddr, upstream_addr: SocketAddr) ->
 
 #[test]
 fn bundled_core_enforces_subscription_update_guard_at_runtime() {
+    if !kernel_run_or_skip("subscription-update-in 真运行安全门") {
+        return;
+    }
     let Some(core) = core_or_skip("subscription-update-in 真运行安全门") else {
         return;
     };
@@ -288,8 +296,7 @@ fn bundled_core_enforces_subscription_update_guard_at_runtime() {
     assert_eq!(formatted["route"]["rules"][1]["no_drop"], true);
     assert_eq!(formatted["route"]["rules"][2]["outbound"], "fixture-exit");
 
-    let mut child = command_for_core(&core)
-        .arg("run")
+    let mut child = with_run(command_for_core(&core))
         .arg("-c")
         .arg(&config_path)
         .stdout(Stdio::null())

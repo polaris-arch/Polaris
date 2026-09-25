@@ -27,6 +27,10 @@ use crate::builder::endpoint_routes::mesh_system_supported_on_platform;
 use crate::builder::helpers::{build_id_to_tag_map, ServerLike};
 use crate::builder::inbounds::{build_inbounds, InboundsDeps};
 use crate::builder::log::{build_log_config, LogBuildDeps, LogConfigInput};
+use crate::builder::network_env::{
+    apply_network_canaries, builder_skipped_rules, prune_invalid_env_condition_refs,
+    NetworkCanaryPlan, NetworkEnv, ProbeFacts, PrunedEnvRule,
+};
 use crate::builder::orchestration::fix_route_dead_references;
 use crate::builder::outbounds::OutboundsDeps;
 use crate::builder::route::{
@@ -202,6 +206,20 @@ pub struct GenerateConfigDeps {
     pub is_valid_srs_fn: fn(&str) -> bool,
     /// 本机所有非回环接口 CIDR（buildInbounds own_lan_cidrs）。Polaris getOwnLanCidrs。
     pub own_lan_cidrs: Vec<String>,
+    /// 运行期事实「macOS + TUN + 接管系统 DNS 生效」（网络场景 `auto` 探测源据此选 dhcp，见
+    /// [`crate::builder::network_env::resolve_probe_source`]）。
+    ///
+    /// **经 deps 注入而不进 `DnsConfig` 投影**：把 `takeoverSystemDns` 加进投影会改变
+    /// `config_generation_norm` 的投影面（额外的行为变化）。无场景规则时本值不影响任何输出。
+    pub system_dns_takeover_active: bool,
+    /// 本次会话 dhcp transport（`dns-netenv`）已被运行时剔除：起核报 `missing monitor for auto DHCP`
+    /// 后兜底重试一次时置 `true`（spec R4）。解析为 dhcp 的场景规则与引用内置 `builtin-netenv-dhcp`
+    /// 的 DNS 规则本次都不生成并进报告。无场景/无内置解析器引用时本值不影响任何输出。
+    pub netenv_dhcp_suppressed: bool,
+    /// 网络场景 canary 探针的回环 UDP 端口（spec §6.3 方案 2）。`None` = 不生成 canary；`Some` 也只在
+    /// 有可出 canary 的场景时才生成入站与规则（[`crate::builder::network_env::apply_network_canaries`]），
+    /// 无场景的配置逐字节不变。
+    pub network_canary_port: Option<u16>,
     /// 运行期观测到的 tailnet 地址（serverId → 裸地址）。
     /// 见 [`crate::builder::endpoint_routes::ObservedTailnetAddresses`]。
     ///
@@ -259,6 +277,13 @@ pub struct GenerateOutcome {
     /// **空 = 规则集完整**。非空 ⟺ 本次生成真的丢了分流规则 → 运行时层据此发用户可见信号
     /// （`RULE_RESOURCES_MISSING`）并收紧出口自证白名单。资源齐全时恒空 ⇒ 不产生噪音。
     pub pruned_rule_set_tags: Vec<String>,
+    /// 网络场景规则的剔除报告：场景不存在/停用、探测源本机不可用（builder 阶段，带 `rule_id`），
+    /// 以及后置剪枝剔除的环境引用不合格规则（`rule_id = None`）；另含「带告警仍生成」的条目
+    /// （[`PrunedEnvRule::is_warning`]，如 dhcp 源只写了 IPv6 地址段）。**空 = 无剔除、无告警**。
+    pub pruned_env_rules: Vec<PrunedEnvRule>,
+    /// 本次写进配置的网络场景 canary（端口 + 场景 → 查询域名）。`None` = 没有 canary 入站与规则；
+    /// 运行时据此探测「当前是否处在该网络」。
+    pub network_canary: Option<NetworkCanaryPlan>,
 }
 
 /// [`generate_sing_box_config`] + 剔除报告。
@@ -412,8 +437,22 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         is_valid_srs_fn: deps.is_valid_srs_fn,
         // ext JSON source 存在性走 existsSync 等价（生产真 FS）。见 RouteConfigDeps 处同款说明。
         exists_fn: crate::builder::custom_rule_files::ext_rule_file_exists,
+        system_dns_takeover_active: deps.system_dns_takeover_active,
+        netenv_dhcp_suppressed: deps.netenv_dhcp_suppressed,
     };
     let mut dns = build_dns_config(&cfg, &id_to_tag_map, &dns_deps);
+    // 网络场景环境项按**已生成的** DNS server 预解析（第一道防线：只引用类型合格、确实生成了的 tag）。
+    // DNS builder 内部以同一函数、同一 server 集自建一份，二者同源。
+    let network_env = NetworkEnv::new(
+        &cfg.network_profiles,
+        &ProbeFacts {
+            platform: Platform::parse(deps.platform.as_str()),
+            tun: matches!(cfg.proxy_mode_type, ProxyModeType::Tun),
+            takeover_active: deps.system_dns_takeover_active,
+            dhcp_suppressed: deps.netenv_dhcp_suppressed,
+        },
+        &dns.servers,
+    );
 
     // ── 7. buildInbounds（L3534-3541）───────────────────────────────────────────
     let inbounds_deps = InboundsDeps {
@@ -460,6 +499,7 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         is_valid_srs_fn: deps.is_valid_srs_fn,
         tailnet_rules_dir: deps.tailnet_rules_dir.clone(),
         observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
+        network_env: network_env.clone(),
     };
     let route_outcome = build_route_config_with_report(config, &id_to_tag_map, &route_deps);
     let mut route = route_outcome.route;
@@ -531,6 +571,27 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         fix_route_dead_references(&singbox.outbounds, &pending_endpoints, &mut route.rules);
     }
 
+    // ── 12b. 网络场景：builder 阶段剔除的规则 + 后置剪枝（第二道防线，看最终 JSON）──────────
+    // 两类都进报告；运行时据此发非致命信号（N2：`NETWORK_PROFILE_RULES_PRUNED`）。
+    let mut pruned_env_rules = builder_skipped_rules(&cfg, &network_env);
+    pruned_env_rules.extend(prune_invalid_env_condition_refs(&mut singbox));
+    if !pruned_env_rules.is_empty() {
+        let warned = pruned_env_rules.iter().filter(|r| r.is_warning()).count();
+        (deps.log)(
+            LogLevel::Warn,
+            &format!(
+                "网络场景：{} 条规则因场景失效/探测源不可用/环境引用不合格未生成，{warned} 条带告警照常生成",
+                pruned_env_rules.len() - warned
+            ),
+        );
+    }
+
+    // ── 12c. 网络场景 canary 探针（spec §6.3 方案 2）：回环 UDP 入站 + hijack-dns + dns.rules 最前的
+    // canary 规则。放在后置剪枝**之后**：canary 的环境项来自同一份已按生成 server 集校验过的
+    // `network_env`，不能让剪枝把正向规则剔掉而留下兜底（那会把「不知道」报成「不在该网络」）。
+    let network_canary =
+        apply_network_canaries(&mut singbox, &network_env, deps.network_canary_port);
+
     // ── 13. 调试日志（L3631-3634）───────────────────────────────────────────────
     let rule_set_count = singbox
         .route
@@ -578,6 +639,8 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
+        pruned_env_rules,
+        network_canary,
     })
 }
 
@@ -608,6 +671,8 @@ fn close_dns_rule_set_graph(
         is_valid_srs_fn: route_deps.is_valid_srs_fn,
         exists_fn: crate::builder::custom_rule_files::ext_rule_file_exists,
         log: route_deps.log,
+        // 本处只借 `resolve_resource_rule_set` 补 rule_set 定义，不生成规则。
+        network_env: NetworkEnv::default(),
     };
     for tag in &referenced {
         if defined.contains(tag) {

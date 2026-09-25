@@ -302,7 +302,7 @@ fn log_axes_follow_config() {
 fn privacy_mode_flows_into_generate_deps() {
     let (rt, _dir) = test_runtime(); // 未接线 emitter
     assert!(
-        !rt.generate_deps(1, 0, 0, None, &[], &serde_json::json!({}))
+        !rt.generate_deps(1, 0, 0, None, &[], &serde_json::json!({}), false)
             .privacy_mode,
         "emitter 未接线（单测 / setup 前）→ 保守 false，与接线前逐字节同"
     );
@@ -311,7 +311,7 @@ fn privacy_mode_flows_into_generate_deps() {
         ..Default::default()
     }));
     assert!(
-        rt.generate_deps(1, 0, 0, None, &[], &serde_json::json!({}))
+        rt.generate_deps(1, 0, 0, None, &[], &serde_json::json!({}), false)
             .privacy_mode,
         "隐私模式开启时 deps 必须为 true，否则核日志级别不抬 ⇒ 隐私期域名照写 helper stderr"
     );
@@ -323,7 +323,7 @@ fn privacy_mode_flows_into_generate_deps() {
 fn runtime_log_output_is_owned_by_bounded_sink_not_core() {
     let (rt, _dir) = test_runtime();
     assert!(
-        rt.generate_deps(1, 0, 0, None, &[], &serde_json::json!({}))
+        rt.generate_deps(1, 0, 0, None, &[], &serde_json::json!({}), false)
             .log_file_path
             .is_none(),
         "runtime config 不得把固定 output 文件重新交给 sing-box 持有"

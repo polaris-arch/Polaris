@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::config::HttpClient;
@@ -128,6 +130,15 @@ pub struct RouteRule {
     pub tls_spoof: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_spoof_method: Option<String>,
+    /// 环境项：当前网络 DNS 服务器地址落在网段内（1.15；`{<transport tag>: [cidr]}`）。
+    ///
+    /// **必须声明**：`build_custom_rules` 经 `serde_json::from_value` 把字段表转成本结构，未声明的键会
+    /// 被静默丢掉。只能写在引用 rule-set 的外层规则上（headless rule-set 在 decode 阶段就拒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_server_address: Option<BTreeMap<String, Vec<String>>>,
+    /// 环境项：当前网络搜索域精确匹配（1.15；`{<transport tag>: [fqdn]}`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_search_domain: Option<BTreeMap<String, Vec<String>>>,
     /// logical 规则（多条件跨维度 OR/AND）：type:'logical' + mode + rules。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "type")]

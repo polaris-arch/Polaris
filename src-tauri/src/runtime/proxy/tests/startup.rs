@@ -106,7 +106,7 @@ fn test_mode_start_refuses_real_core_unless_injected() {
 fn race_server_default_is_off_zero_port() {
     let (rt, _dir) = test_runtime();
     assert_eq!(rt.race_server_port(), 0, "未起 sidecar → race off");
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}));
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert_eq!(deps.race_server_port, 0, "注入面回落 0（race off）");
     assert!(
         deps.race_upstream_ips.is_empty(),
@@ -136,6 +136,7 @@ fn subscription_update_port_is_independent_and_flows_into_generate_deps() {
         probe,
         &pool,
         &serde_json::json!({}),
+        false,
     );
     assert_eq!(deps.update_in_port, Some(update));
     assert_eq!(deps.subscription_update_in_port, Some(subscription));
@@ -151,7 +152,7 @@ fn race_server_injects_positive_port_and_upstreams() {
         vec![443, 8443],
     );
     assert_eq!(rt.race_server_port(), 5353);
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}));
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert_eq!(
         deps.race_server_port, 5353,
         "端口须透传进 GenerateConfigDeps"
@@ -168,7 +169,7 @@ fn race_server_injects_positive_port_and_upstreams() {
     );
     // clear → 回落 race off。
     rt.clear_race_server();
-    let deps2 = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}));
+    let deps2 = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert_eq!(deps2.race_server_port, 0);
     assert!(deps2.race_upstream_ips.is_empty());
     assert!(deps2.race_upstream_ports.is_empty(), "清理须两轴一起翻");
@@ -201,7 +202,7 @@ async fn race_off_starts_no_sidecar_and_keeps_generate_deps_at_zero() {
         )
         .await;
     assert_eq!(rt.race_server_port(), 0, "竞速关 → 端口恒 0");
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}));
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert_eq!(deps.race_server_port, 0);
     assert!(
         deps.race_upstream_ips.is_empty(),
@@ -235,7 +236,7 @@ async fn race_on_starts_sidecar_and_feeds_port_and_custom_upstream_ips() {
         .await;
     let port = rt.race_server_port();
     assert!(port > 0, "竞速开 → sidecar 应绑到回环口");
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}));
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert_eq!(deps.race_server_port, port, "端口须与 sidecar 实际监听一致");
     assert!(
         deps.race_upstream_ips.contains(&"9.9.9.9".to_string()),
@@ -255,7 +256,7 @@ async fn race_on_starts_sidecar_and_feeds_port_and_custom_upstream_ips() {
     // 停 → 端口与放行清零（生成侧回落单上游）。
     rt.clear_race_server();
     assert_eq!(rt.race_server_port(), 0);
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}));
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert!(
         deps.race_upstream_ports.is_empty(),
         "停 sidecar 后端口轴须一起清（否则 config 会放行一个已无人使用的端口）"
@@ -2626,7 +2627,7 @@ async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_str
     let path = dir.join("gate-cache.json");
 
     let rt = test_runtime_in(dir.clone());
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg);
+    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let mut peeled = BTreeMap::new();
     let first = rt
         .generate_and_gate(&user_config, &deps, &path, Some(&binary), &mut peeled)
@@ -2645,7 +2646,7 @@ async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_str
     drop(rt);
 
     let restarted = test_runtime_in(dir.clone());
-    let restarted_deps = restarted.generate_deps(0, 0, 0, None, &[], &cfg);
+    let restarted_deps = restarted.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let after_restart = restarted
         .generate_and_gate(
             &user_config,
@@ -2684,7 +2685,7 @@ async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_str
     let mut changed_cfg = cfg;
     changed_cfg["mixedPort"] = Value::from(17891);
     let changed_user: UserConfig = serde_json::from_value(changed_cfg.clone()).unwrap();
-    let changed_deps = restarted.generate_deps(0, 0, 0, None, &[], &changed_cfg);
+    let changed_deps = restarted.generate_deps(0, 0, 0, None, &[], &changed_cfg, false);
     let changed = restarted
         .generate_and_gate(
             &changed_user,
@@ -2716,7 +2717,7 @@ async fn kernel_rejected_node_is_regenerated_out_and_reported_through_the_existi
     let (rt, dir) = test_runtime();
     let cfg = gate_two_node_config();
     let user_config: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg);
+    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let path = dir.join("gate-probe.json");
 
     // ① failOpen 腿（无核）：闸门整个跳过 —— 两个节点都在，且**没有**任何剔除上报。
@@ -2780,7 +2781,7 @@ async fn kernel_rejecting_the_selected_node_yields_blocked_not_a_silent_exit_swi
     let (rt, dir) = test_runtime();
     let cfg = gate_two_node_config();
     let user_config: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg);
+    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let path = dir.join("gate-probe.json");
 
     let mut peeled = BTreeMap::new();
@@ -2862,7 +2863,7 @@ async fn peeling_reshuffles_duplicate_name_tags_so_the_gate_hands_back_the_peele
         "mixedPort": 17891,
     });
     let user_config: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg);
+    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let path = dir.join("gate-dup.json");
 
     // 前提对照：未剥之前，两个同名节点确实拿到不同 tag（去重规则还在）。
@@ -2947,7 +2948,7 @@ async fn retry_leg_keeps_reporting_nodes_peeled_by_an_earlier_leg() {
     let (rt, dir) = test_runtime();
     let cfg = gate_two_node_config();
     let user_config: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg);
+    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let path = dir.join("gate-retry.json");
 
     // 假核：marker 已存在 ⇒ 本次 check 一律 rc=0（= 上一腿已把坏节点剥干净的现场）。

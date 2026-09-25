@@ -208,6 +208,12 @@ pub struct Rule {
     pub tls_spoof: Option<String>,
     #[serde(rename = "tlsSpoofMethod", skip_serializing_if = "Option::is_none")]
     pub tls_spoof_method: Option<String>,
+    /// 仅在该网络场景（`UserConfig.networkProfiles[].id`）下生效。缺省 = 任何网络。
+    ///
+    /// 与 `conditions`/`combineMode` 正交、恒为 AND；场景不存在/停用/本机探测源不可用 ⇒ 本规则**不生成**，
+    /// 绝不退化成无条件规则（`builder::network_env`）。
+    #[serde(rename = "networkProfileId", skip_serializing_if = "Option::is_none")]
+    pub network_profile_id: Option<String>,
 }
 
 impl Rule {

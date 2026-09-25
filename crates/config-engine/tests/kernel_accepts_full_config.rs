@@ -455,3 +455,159 @@ fn bundled_core_accepts_tailcat_derp_ips_in_tun_route_exclude() {
         assert!(ok, "{name} 含 DERP 排除的完整配置被真核拒绝：{diag}");
     }
 }
+
+/// 网络场景规则全形态（system/dhcp × DNS/流量 × inline/logical/外化）逐平台生成，完整配置喂 `check`。
+///
+/// `check` 只 decode + initialize，**拦不住环境项的坏引用**（Start 才解析，spec K3）——那一格归
+/// `network_profile_runtime` 起核门。本门锁的是另一件事：环境项的键名/值形态、外化外层规则、
+/// logical 包裹、`dns-netenv`(dhcp) transport 在随包核上都能 decode。打包腿按目标各跑一次
+/// （`POLARIS_KERNEL_GATE_TARGET`），故四平台随包核各自过一遍这批产物。
+#[test]
+fn bundled_core_accepts_network_profile_rules_in_every_shape() {
+    use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
+    use polaris_config_engine::builder::generate_sing_box_config_with_report;
+    use polaris_config_engine::user_config::app_config::UserConfig;
+
+    let temp = tempdir().expect("建 TempDir");
+    let custom_dir = temp.path().join("custom-rules");
+    std::fs::create_dir_all(&custom_dir).expect("建 custom-rules");
+    let traffic = |id: &str, profile: &str, conditions: Value, mode: &str| {
+        json!({"id": id, "type": conditions[0]["type"], "values": conditions[0]["values"],
+            "conditions": conditions, "combineMode": mode, "networkProfileId": profile,
+            "action": "direct", "enabled": true,
+            "effects": {"route": {"enabled": true, "action": "direct"}}})
+    };
+    let dns = |id: &str, suffix: &str, profile: Option<&str>, action: Value| {
+        let mut rule = json!({"id": id, "type": "domainSuffix", "values": [suffix],
+            "action": "direct", "enabled": true,
+            "effects": {"dns": {"enabled": true, "action": action,
+                "resolver": "inherit", "answerMode": "real"}}});
+        if let Some(p) = profile {
+            rule["networkProfileId"] = json!(p);
+        }
+        rule
+    };
+    // (平台, 模式, 接管, 场景 A 的 probe, 场景 B 的 probe, 期望生成 dns-netenv)
+    let shapes = [
+        ("linux", "tun", false, "system", "dhcp", true),
+        ("win32", "systemProxy", false, "auto", "system", true),
+        ("darwin", "tun", true, "auto", "system", true),
+        ("darwin", "systemProxy", false, "system", "auto", false),
+    ];
+    let Some(core) = core_or_skip("网络场景规则完整配置门") else {
+        return;
+    };
+    for (platform, mode, takeover, probe_a, probe_b, want_netenv) in shapes {
+        let name = format!("网络场景全形态 {platform}/{mode}");
+        let mut rules = Vec::new();
+        for (profile, tag) in [("np-a", "a"), ("np-b", "b")] {
+            let ext = json!([{"type": "domainSuffix", "values": [format!("{tag}.corp.example")]}]);
+            let inline = json!([{"type": "geosite", "values": ["cn"]}]);
+            let logical = json!([
+                {"type": "geosite", "values": ["cn"]}, {"type": "port", "values": ["8443"]}]);
+            rules.push(traffic(&format!("{tag}-ext"), profile, ext, "or"));
+            rules.push(traffic(&format!("{tag}-inline"), profile, inline, "or"));
+            rules.push(traffic(&format!("{tag}-logical"), profile, logical, "and"));
+        }
+        let mut dns_rules = vec![
+            dns(
+                "d-a",
+                "corp.example",
+                Some("np-a"),
+                json!({"type": "server", "serverId": "builtin-domestic"}),
+            ),
+            dns(
+                "d-b",
+                "b.corp.example",
+                Some("np-b"),
+                json!({"type": "fakeIp"}),
+            ),
+        ];
+        if platform == "linux" {
+            // D5：DNS 动作引用内置「当前网络 DHCP 下发的 DNS」。
+            dns_rules.push(dns(
+                "d-netenv",
+                "lan.corp.example",
+                None,
+                json!({"type": "server", "serverId": "builtin-netenv-dhcp"}),
+            ));
+        }
+        let input: UserConfig = serde_json::from_value(json!({
+            "configSchemaVersion": 4, "servers": [], "selectedServerId": "__direct__",
+            "proxyMode": "smart", "proxyModeType": mode,
+            "networkProfiles": [
+                {"id": "np-a", "name": "A", "match": {"dnsServerCidrs": ["10.20.0.0/16"],
+                    "searchDomains": ["corp.example"]}, "probe": probe_a},
+                {"id": "np-b", "name": "B", "match": {"dnsServerCidrs": ["10.30.0.0/16", "fd00::/8"],
+                    "searchDomains": ["b.corp.example"]}, "probe": probe_b},
+            ],
+            "customRules": rules,
+            "dnsRules": dns_rules,
+        }))
+        .expect("fixture UserConfig");
+        for (file, content) in build_custom_rule_files(&input) {
+            std::fs::write(custom_dir.join(file), content).expect("写外化文件");
+        }
+        let case = SnapshotCase {
+            name: name.clone(),
+            platform: platform.into(),
+            input,
+        };
+        let mut deps = full_config_deps(&case, &temp);
+        deps.system_dns_takeover_active = takeover;
+        // N4：canary 探针（回环 UDP direct 入站 + hijack-dns + canary DNS 规则）一并过四平台 check。
+        deps.network_canary_port = Some(19553);
+        let outcome = generate_sing_box_config_with_report(&case.input, &BTreeMap::new(), &deps)
+            .unwrap_or_else(|e| panic!("{name} 生成失败: {e}"));
+        assert_eq!(
+            outcome.network_canary.as_ref().map(|p| p.canaries.len()),
+            Some(2),
+            "{name}：两个场景都可用 ⇒ 各出一个 canary"
+        );
+        assert!(
+            outcome.pruned_env_rules.is_empty(),
+            "{name}：夹具里不该有被剪的场景规则：{:?}",
+            outcome.pruned_env_rules
+        );
+        let value = serde_json::to_value(&outcome.config).expect("序列化");
+        let text = value.to_string();
+        let netenv = value["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["tag"] == "dns-netenv" && s["type"] == "dhcp");
+        assert_eq!(
+            netenv, want_netenv,
+            "{name}：dns-netenv 只在有规则需要时生成"
+        );
+        let route_env = value["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r.to_string().contains("\"dns_se"))
+            .count();
+        // 6 条流量规则 × 2 判据 = 12 条（外化/inline/logical 各 4）。
+        assert_eq!(route_env, 12, "{name}：流量环境规则条数不对");
+        let ext_outer = value["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["rule_set"].to_string().contains("custom-rule-")
+                    && r.to_string().contains("\"dns_se")
+            })
+            .count();
+        assert_eq!(
+            ext_outer, 4,
+            "{name}：外化规则的环境项必须在外层 rule_set 规则上"
+        );
+        assert!(
+            text.contains("\"type\":\"logical\""),
+            "{name}：缺 logical 形态"
+        );
+        let path = temp.path().join(format!("np-{platform}-{mode}.json"));
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("JSON 编码")).expect("写盘");
+        let (ok, diag) = check(&core, &path);
+        assert!(ok, "{name} 被随包核拒绝：{diag}");
+    }
+}

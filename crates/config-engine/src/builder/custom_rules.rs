@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use crate::builder::custom_rule_files::{
     cond_matcher_fields, custom_rule_file_base, is_ext_type, plan_custom_rule, RulePlan,
 };
+use crate::builder::network_env::{EnvCondition, NetworkEnv, RuleEnv};
 use crate::singbox::{RouteRule, RuleSet};
 use crate::user_config::builtin_geo_rulesets::resolve_builtin_rule_set_ref_meta;
 use crate::user_config::log_level::LogLevel;
@@ -356,6 +357,8 @@ pub struct CustomRulesDeps {
     /// 签名与 [`crate::builder::route::RouteConfigDeps::log`] 一致 → route 直接透传，生产落
     /// `log::warn!(target: "config-engine", …)`；测试注收集器。
     pub log: fn(LogLevel, &str),
+    /// 网络场景环境项（`builder::network_env`）。缺省空表 ⇒ 挂场景的规则一律不生成（fail-closed）。
+    pub network_env: NetworkEnv,
 }
 
 impl CustomRulesDeps {
@@ -452,6 +455,15 @@ pub fn build_custom_rules(
         if !rule.enabled {
             continue;
         }
+        // 网络场景：按判据展开成至多 2 份完整规则序列（每份一种环境项）；引用失效 ⇒ 整条不生成。
+        let env_variants: Vec<Option<EnvCondition>> = match deps.network_env.for_rule(rule) {
+            RuleEnv::Unconditional => vec![None],
+            RuleEnv::Conditions(conditions) => conditions.into_iter().map(Some).collect(),
+            RuleEnv::Skip(reason) => {
+                deps.log_warn(&format!("{reason}:{}", rule.id));
+                continue;
+            }
+        };
 
         let resolve_plan = resolve_plan(rule);
 
@@ -521,21 +533,18 @@ pub fn build_custom_rules(
                     "rule_set".into(),
                     serde_json::Value::Array(vec![serde_json::Value::from(ext_base.clone())]),
                 );
-                append_resolve_rule(&mut resolve_rules, ext_fields.clone(), &resolve_plan);
-                if let Some(action) = rule.route_action() {
-                    apply_rule_action(
-                        &mut ext_fields,
-                        action,
-                        rule.route_target_server_id(),
-                        id_to_tag_map,
-                        selected_server_tag,
-                        Some(&rule.id),
-                        rule.tls_spoof.as_deref(),
-                        rule.tls_spoof_method.as_deref(),
-                        &deps.arch,
-                    );
-                    rules.push(fields_to_route_rule(ext_fields));
-                }
+                // 环境项只加在外层 `{rule_set}` 规则上，绝不写进 `<base>.json`（headless 不支持，decode 即拒）。
+                emit_route_variants(
+                    &mut resolve_rules,
+                    &mut rules,
+                    ext_fields,
+                    &env_variants,
+                    &resolve_plan,
+                    rule,
+                    id_to_tag_map,
+                    selected_server_tag,
+                    &deps.arch,
+                );
                 continue;
             }
             // 文件未落盘 → 回落 inline（onDegraded 由调用方处理，此处不注入）。
@@ -637,15 +646,55 @@ pub fn build_custom_rules(
             }
         };
 
-        let mut final_fields = match final_rule_fields {
+        let final_fields = match final_rule_fields {
             Some(f) => f,
             None => continue,
         };
 
-        append_resolve_rule(&mut resolve_rules, final_fields.clone(), &resolve_plan);
+        emit_route_variants(
+            &mut resolve_rules,
+            &mut rules,
+            final_fields,
+            &env_variants,
+            &resolve_plan,
+            rule,
+            id_to_tag_map,
+            selected_server_tag,
+            &deps.arch,
+        );
+    }
+
+    CustomRulesResult {
+        resolve_rules,
+        rules,
+        rule_sets,
+    }
+}
+
+/// 一条用户规则的匹配字段 → 每个环境变体一份「resolve 兼容规则 + 终结动作规则」。
+///
+/// 环境项在 `append_resolve_rule` **之前**注入：v1-v3 resolve 兼容规则复制的是注入后的字段，自动继承。
+#[allow(clippy::too_many_arguments)]
+fn emit_route_variants(
+    resolve_rules: &mut Vec<RouteRule>,
+    rules: &mut Vec<RouteRule>,
+    fields: RouteFields,
+    env_variants: &[Option<EnvCondition>],
+    resolve_plan: &ResolvePlan,
+    rule: &Rule,
+    id_to_tag_map: &BTreeMap<String, String>,
+    selected_server_tag: &str,
+    arch: &str,
+) {
+    for env in env_variants {
+        let mut fields = fields.clone();
+        if let Some(env) = env {
+            env.apply_to_route_fields(&mut fields);
+        }
+        append_resolve_rule(resolve_rules, fields.clone(), resolve_plan);
         if let Some(action) = rule.route_action() {
             apply_rule_action(
-                &mut final_fields,
+                &mut fields,
                 action,
                 rule.route_target_server_id(),
                 id_to_tag_map,
@@ -653,16 +702,10 @@ pub fn build_custom_rules(
                 Some(&rule.id),
                 rule.tls_spoof.as_deref(),
                 rule.tls_spoof_method.as_deref(),
-                &deps.arch,
+                arch,
             );
-            rules.push(fields_to_route_rule(final_fields));
+            rules.push(fields_to_route_rule(fields));
         }
-    }
-
-    CustomRulesResult {
-        resolve_rules,
-        rules,
-        rule_sets,
     }
 }
 

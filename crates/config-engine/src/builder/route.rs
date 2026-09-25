@@ -163,6 +163,28 @@ pub struct RouteConfigDeps<'a> {
     pub tailnet_rules_dir: String,
     /// 运行期观测到的 tailnet 地址（serverId → 裸地址）。见 [`ObservedTailnetAddresses`]。
     pub observed_tailnet_addresses: ObservedTailnetAddresses,
+    /// 网络场景环境项（按本次已生成的 DNS server 预解析）。缺省空表 ⇒ 挂场景的规则一律不生成（fail-closed）。
+    pub network_env: crate::builder::network_env::NetworkEnv,
+}
+
+/// 流量规则是否进 `build_custom_rules`（v1-v3 规则级目标解析兼容，或 smart 模式下有流量动作）。
+///
+/// 单一口径：route builder 的入口过滤与 `network_env`（`dns-netenv` 按需生成、剔除报告）共用本函数，
+/// 两处各写一份会让「规则被生成」与「为它生成 dns-netenv」悄悄分叉。
+pub(crate) fn traffic_rule_is_built(
+    rule: &crate::user_config::rule::Rule,
+    config: &UserConfig,
+) -> bool {
+    let legacy_rule_resolution = config.config_schema_version.unwrap_or(0) < 4;
+    rule.enabled
+        && ((legacy_rule_resolution
+            && rule.effects.as_ref().is_some_and(|effects| {
+                effects
+                    .route
+                    .as_ref()
+                    .is_some_and(|route| route.enabled && route.destination_resolution.is_some())
+            }))
+            || (proxy_mode_str(config) == "smart" && rule.route_action().is_some()))
 }
 
 /// QUIC(UDP/443) reject 规则工厂：可选叠加域名/进程等匹配器。route 与各处 blockQuic 共用，
@@ -729,19 +751,11 @@ pub fn build_route_config_with_report(
         is_valid_srs_fn: deps.is_valid_srs_fn,
         exists_fn: crate::builder::custom_rule_files::ext_rule_file_exists,
         log: deps.log,
+        network_env: deps.network_env.clone(),
     };
     let custom_rules_for_build: Vec<_> = ordered_route_rules
         .iter()
-        .filter(|rule| {
-            rule.enabled
-                && ((legacy_rule_resolution
-                    && rule.effects.as_ref().is_some_and(|effects| {
-                        effects.route.as_ref().is_some_and(|route| {
-                            route.enabled && route.destination_resolution.is_some()
-                        })
-                    }))
-                    || (proxy_mode == "smart" && rule.route_action().is_some()))
-        })
+        .filter(|rule| traffic_rule_is_built(rule, config))
         .cloned()
         .collect();
     let custom_result = build_custom_rules(
@@ -1590,6 +1604,8 @@ fn empty_matcher() -> RouteRule {
         override_address: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        dns_server_address: None,
+        dns_search_domain: None,
         type_field: None,
         mode: None,
         rules: None,

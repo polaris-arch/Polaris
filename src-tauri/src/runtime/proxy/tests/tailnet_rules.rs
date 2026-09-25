@@ -191,7 +191,7 @@ async fn observed_frame_reaches_file_route_rules_and_tun_exclusion() {
     );
 
     // ── 消费面 ①：真跑 generate（deps 取自生产装配 `generate_deps`，不是手拼）。
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json());
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json(), false);
     assert!(
         deps.observed_tailnet_addresses
             .get("ts1")
@@ -360,7 +360,7 @@ async fn write_failure_falls_back_to_inline_without_fatal() {
     rt.write_tailnet_rule_files(&config).await; // 不得 panic
     rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4], vec![])]); // 不得 panic
 
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json());
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json(), false);
     let cfg = generate_sing_box_config(&config, &BTreeMap::new(), &deps).expect("生成配置");
     let route = cfg.route.as_ref().expect("没有 route 段");
     assert!(
@@ -413,7 +413,7 @@ async fn write_failure_on_a_node_without_observation_keeps_bootstrap() {
         "前置：本例的观测面必须是空的，否则测的不是 bootstrap 腿"
     );
 
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json());
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json(), false);
     let cfg = generate_sing_box_config(&config, &BTreeMap::new(), &deps).expect("生成配置");
     let route = cfg.route.as_ref().expect("没有 route 段");
     let inline = route

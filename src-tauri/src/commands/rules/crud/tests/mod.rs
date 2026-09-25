@@ -185,3 +185,44 @@ fn command_shell_short_circuits_on_net_zero_order() {
         "Skip 腿必须直接成功且不广播"
     );
 }
+
+/// 规则挂的网络场景必须存在（spec §7 写入校验）：不存在 ⇒ 错误；存在 / 未挂场景 ⇒ 放行。
+/// 牙：让 `network_profile_ref_error` 恒返回 None → 第一条转红。
+#[test]
+fn network_profile_ref_must_exist_in_the_config_being_written() {
+    let cfg = json!({ "networkProfiles": [{ "id": "np-office", "name": "office" }] });
+    let dangling = json!({ "id": "r1", "networkProfileId": "np-gone" });
+    let msg = network_profile_ref_error(&cfg, &dangling).expect("悬空场景引用必须被拒");
+    assert!(msg.contains("np-gone"), "{msg}");
+    let ok = json!({ "id": "r1", "networkProfileId": "np-office" });
+    assert_eq!(network_profile_ref_error(&cfg, &ok), None);
+    assert_eq!(
+        network_profile_ref_error(&cfg, &json!({ "id": "r2" })),
+        None
+    );
+    assert!(
+        network_profile_ref_error(&json!({}), &dangling).is_some(),
+        "配置里没有 networkProfiles 键时同样视为不存在"
+    );
+}
+
+/// 接线守卫：add / update 两条写入腿都在**配置事务闭包内**判场景引用，并以 `RULE_INVALID` 回报。
+/// 牙：从任一腿删掉调用 → 对应断言转红。
+#[test]
+fn rule_writes_check_network_profile_ref_inside_the_transaction() {
+    let src = crate_code("commands/rules/crud.rs");
+    for head in ["pub fn rules_add(", "pub fn rules_update("] {
+        let body = top_level_fn_body(&src, head);
+        let tx = body
+            .find("state.config().update(|cfg|")
+            .unwrap_or_else(|| panic!("{head} 必须走配置事务"));
+        let check = body
+            .find("network_profile_ref_error(cfg,")
+            .unwrap_or_else(|| panic!("{head} 漏了网络场景引用校验"));
+        assert!(tx < check, "{head}：校验必须在事务闭包内（与写入同一把锁）");
+        assert!(
+            body.contains("ERR_RULE_INVALID"),
+            "{head} 必须以 RULE_INVALID 回报"
+        );
+    }
+}

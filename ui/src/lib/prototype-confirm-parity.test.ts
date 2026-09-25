@@ -225,6 +225,14 @@ interface ImplOnlyRow {
 
 const IMPL_ONLY: readonly ImplOnlyRow[] = [
   {
+    key: 'network-profile',
+    file: 'components/screens/rules/NetworkProfilePanel.tsx',
+    why:
+      '删除一个网络场景：引用它的流量/DNS 规则从下一次生成起**整条不再生效**（fail-closed，不会退化成无条件规则），' +
+      '场景的地址段与搜索域判据随之丢失、无撤销腿，要手工重建并重新挂回每条规则。旁边的启停开关是可逆的、不确认。' +
+      'key 带 `:<场景 id>` 实例后缀（一行一个武装态）。',
+  },
+  {
     key: 'logs-delete-legacy',
     file: 'components/screens/logs/LogsScreen.tsx',
     why:

@@ -466,6 +466,8 @@ impl ProxyRuntime {
         // 停核 → 停通用网络 watcher。先于还原 DNS：避免 watcher 在
         // 还原窗口里看到链路事件又重灌（幂等无害，但停在前更干净）。
         self.stop_network_watcher();
+        // 核停 ⇒ 没有运行核可问：网络场景命中态回到未知（探测任务随会话代退场）。
+        self.disarm_network_canary();
         if let Ok(mut state) = self.runtime_binding_state.lock() {
             *state = RuntimeBindingState::default();
         }

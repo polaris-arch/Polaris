@@ -1,6 +1,12 @@
 import type { TFunction } from 'i18next';
-import type { DnsPolicyAction, DnsServerGroup, DnsServerResource } from '@/contracts/types';
+import type {
+  BuiltinDhcpStatus,
+  DnsPolicyAction,
+  DnsServerGroup,
+  DnsServerResource,
+} from '@/contracts/types';
 import type { CselGroup, CselOption } from './Csel';
+import { BUILTIN_NETENV_DHCP_ID, probeReasonKey } from '@/domain/network-profile';
 
 export type DnsResponseChoice = 'fakeIp' | 'reject' | 'predefined';
 
@@ -50,6 +56,16 @@ interface BuildDnsActionGroupsArgs {
   currentValue?: string;
   includeHosts?: boolean;
   responses?: readonly DnsResponseChoice[];
+  /**
+   * 列出内置解析器「当前网络 DHCP 下发的 DNS」（`builtin-netenv-dhcp` → 内核 `dns-netenv`，spec D5）。
+   * 它不是 `dnsServers` 里的资源（生成器按需产出），故不在资源列表里，需显式加。只给规则主动作用。
+   */
+  includeNetenv?: boolean;
+  /**
+   * 该内置解析器在本机是否可用（`api.networkProfile.builtinDhcpStatus()`，与生成侧同一判据）。
+   * 不可用 ⇒ 置灰并标原因；`null`/缺省 = 拿不到结果 ⇒ 不置灰（不知道就不猜）。
+   */
+  netenvStatus?: BuiltinDhcpStatus | null;
 }
 
 export function dnsServerDisplayName(server: DnsServerResource, t: TFunction): string {
@@ -57,6 +73,30 @@ export function dnsServerDisplayName(server: DnsServerResource, t: TFunction): s
   if (server.id === 'builtin-remote') return t('settings.dns.builtinRemoteName');
   if (server.id === 'builtin-bootstrap') return t('settings.dns.builtinBootstrapName');
   return server.name;
+}
+
+/**
+ * 内置解析器「当前网络 DHCP 下发的 DNS」的下拉项。不可用时置灰并把原因写进说明 ——
+ * 已选中它的旧规则仍能在触发框里看到这个值（Csel 按 value 取 label，置灰不影响回显），不会被悄悄清空。
+ */
+export function netenvOption(t: TFunction, status: BuiltinDhcpStatus | null | undefined): CselOption {
+  const base = {
+    value: `server:${BUILTIN_NETENV_DHCP_ID}`,
+    label: netenvDnsDisplayName(t),
+  };
+  if (status && !status.available) {
+    return {
+      ...base,
+      description: `${t('rules.dnsActionUnavailable')} · ${t(probeReasonKey(status.reason))}`,
+      disabled: true,
+    };
+  }
+  return { ...base, description: t('rules.networkProfile.dnsNetenvDesc') };
+}
+
+/** 内置解析器「当前网络 DHCP 下发的 DNS」的显示名（规则列表与动作下拉共用）。 */
+export function netenvDnsDisplayName(t: TFunction): string {
+  return t('rules.networkProfile.dnsNetenvName');
 }
 
 function dnsOutboundDescription(
@@ -147,6 +187,8 @@ export function buildDnsActionGroups({
   currentValue = '',
   includeHosts = true,
   responses = ['fakeIp', 'reject', 'predefined'],
+  includeNetenv = false,
+  netenvStatus = null,
 }: BuildDnsActionGroupsArgs): CselGroup[] {
   const networkOptions = servers
     .filter((server) => server.type !== 'hosts')
@@ -157,6 +199,9 @@ export function buildDnsActionGroups({
       server.enabled,
       t,
     ));
+  if (includeNetenv) {
+    networkOptions.push(netenvOption(t, netenvStatus));
+  }
   const groupOptions = groups.map((group) => resourceOption(
     `group:${group.id}`,
     group.name,

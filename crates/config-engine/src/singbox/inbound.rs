@@ -14,6 +14,10 @@ pub struct Inbound {
     pub listen: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen_port: Option<u16>,
+    /// 监听的传输层（`"udp"` / `"tcp"`；缺席 = 两者都听）。只有网络场景 canary 探针入站发它：
+    /// 那是纯 UDP 的 `direct` 入站，不该白占一个 TCP 口（见 `builder::network_env::apply_network_canaries`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
     // TUN 模式
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_name: Option<String>,

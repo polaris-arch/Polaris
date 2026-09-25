@@ -36,6 +36,7 @@ import { autoStartApi, systemApi, windowApi, helperApi, appApi } from './api/sys
 import { versionApi, updateApi, coreUpdateApi } from './api/updater';
 import { subscriptionApi, localImportApi, backupApi } from './api/subscriptions';
 import { ipInfoApi } from './api/ip-info';
+import { networkProfileApi } from './api/network-profiles';
 
 export * from './api/proxy';
 export * from './api/config';
@@ -49,6 +50,7 @@ export * from './api/updater';
 export * from './api/subscriptions';
 export * from './api/ip-info';
 export * from './api/unlock';
+export * from './api/network-profiles';
 
 // ============================================================================
 // 聚合导出（与 Polaris `api` 形状完全一致，组件 import { api } from '@/ipc' 沿用）
@@ -61,6 +63,7 @@ export const api = {
   server: serverApi,
   vpn: vpnApi,
   rules: rulesApi,
+  networkProfile: networkProfileApi,
   logs: logsApi,
   autoStart: autoStartApi,
   stats: statsApi,

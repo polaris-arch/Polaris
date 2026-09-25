@@ -81,6 +81,7 @@ fn effective_rules_smart_only() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     assert_eq!(
         effective_custom_rules("smart", std::slice::from_ref(&rule)).len(),
@@ -106,6 +107,7 @@ fn geo_categories_from_rules() {
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
+        network_profile_id: None,
     };
     let (geosite, geoip) = get_required_geo_categories(&[rule], &[], &[]);
     assert!(geosite.contains("cn")); // lowercase

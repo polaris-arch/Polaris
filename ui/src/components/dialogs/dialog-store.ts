@@ -84,6 +84,10 @@ export type DialogDesc =
   | { kind: 'rule'; ruleId?: string; preset?: RulePreset; initialPlane?: 'route' | 'dns' }
   | { kind: 'dns-server'; serverId?: string }
   | { kind: 'dns-group'; groupId?: string }
+  // 网络场景：列表面板（规则页两个平面共用入口）+ 单个场景的编辑表单。onSaved 回传新场景 id，
+  // 供规则弹窗「生效网络 → 新建场景…」建完直接选中（同 sub.onAdded 先例）。
+  | { kind: 'network-profiles' }
+  | { kind: 'network-profile'; profileId?: string; onSaved?: (profileId: string) => void }
   | {
       kind: 'proc-pick';
       initialSelected: string[];
