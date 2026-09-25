@@ -252,7 +252,7 @@ fn disabled_switch_short_circuits_before_any_network() {
     );
     // fork 硬闸同理：零网络早退（第三方核绝不被官方核覆盖）。
     let fork_at = body
-        .find("CoreBuildKind::Fork")
+        .find("blocks_online_update()")
         .expect("fork 硬闸被删了 —— 官方 release 会覆盖用户明确选择的特性分支核");
     assert!(fork_at < network_at, "fork 闸也必须前置于网络请求");
 

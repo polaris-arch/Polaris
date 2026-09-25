@@ -821,6 +821,7 @@
     },
     "core": {
       "applied": "Core updated",
+      "managedByApp": "This patched core updates with the Polaris app.",
       "forkBlocked": "A third-party (unofficial) core is in use; online updates are disabled. Roll back or restore the factory core first.",
       "noBackup": "No backup version available to roll back to",
       "replaceConfirmMessage": "The selected core version ({{upload}}) is not newer than the bundled version ({{bundled}}); it may lack newer features or compatibility fixes. Replace anyway?",

@@ -42,11 +42,21 @@ use crate::version::compare_semver;
 pub enum CoreBuildKind {
     /// 官方构建：纯 semver / 官方预发布（`-alpha|beta|rc.N`）/ 官方 dev（base + 7+ 位短 commit hex）。
     Official,
+    /// Polaris 随应用更新的修复构建（来源标签，不是签名认证）。
+    Polaris,
     /// 第三方 fork：以 `X.Y.Z` 开头但带非官方后缀（`-reF1nd` / `-nekolsd` …）。
     Fork,
     /// 无法判定：token 为 `unknown`，或无法解析为 `X.Y.Z` 开头（go install / 源码自建——官方也会
     /// 落到 unknown，**不硬判 fork**）。
     Unknown,
+}
+
+impl CoreBuildKind {
+    /// 官方在线更新器不能替换随包修复核或用户选择的第三方核。
+    #[must_use]
+    pub fn blocks_online_update(self) -> bool {
+        matches!(self, Self::Polaris | Self::Fork)
+    }
 }
 
 /// 剥掉**一个**前导 `v` / `V`（= 上游 `.replace(/^v/i, '')`，只剥一个）。
@@ -289,6 +299,16 @@ pub fn classify_core_build(version_line: &str) -> CoreBuildKind {
     if tok.is_empty() || tok.eq_ignore_ascii_case("unknown") {
         return CoreBuildKind::Unknown;
     }
+    if let Some((base, revision)) = tok.rsplit_once(".polaris.") {
+        if !revision.is_empty()
+            && revision.bytes().all(|b| b.is_ascii_digit())
+            && split_triple_numeric_prefix(base)
+                .and_then(split_official_prerelease)
+                .is_some_and(str::is_empty)
+        {
+            return CoreBuildKind::Polaris;
+        }
+    }
     // 官方三形态（= OFFICIAL_RELEASE / OFFICIAL_PRERELEASE / OFFICIAL_DEV 三条正则的并集）。
     if let Some(rest) = split_triple_numeric_prefix(&tok) {
         // `^\d+\.\d+\.\d+$` —— 纯 release。
@@ -368,7 +388,7 @@ pub fn decide_core_override(
     bundled_version: &str,
 ) -> CoreOverrideDecision {
     let cmp = cmp_against_baseline(core_version.as_str(), bundled_version);
-    if kind == CoreBuildKind::Official {
+    if matches!(kind, CoreBuildKind::Official | CoreBuildKind::Polaris) {
         // 官方非内置核：严格旧于内置 → 内置替换；同版/更新 → 保持。
         return CoreOverrideDecision {
             reseed: cmp < 0,

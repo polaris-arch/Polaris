@@ -43,7 +43,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use polaris_updater::core_build::CoreBuildKind;
 use polaris_updater::scheduler::{ScheduleConfig, SystemClock, UpdateScheduler};
 use polaris_updater::staged::{
     ApplyOutcome, CoreStagedUpdater, StagedConfig, StagedInfo, StagedStateStore, StagedUpdateError,
@@ -549,9 +548,9 @@ impl CoreUpdateScheduler {
             return false;
         }
         // ── 闸 2：fork 硬闸（零网络）。第三方核绝不被官方核覆盖，并作废任何暂存的官方核。
-        if state.updater().core_build_kind() == CoreBuildKind::Fork {
+        if state.updater().core_build_kind().blocks_online_update() {
             if state.updater().state().staged.is_some() {
-                log::info!("当前为第三方内核，作废暂存的官方内核（不覆盖用户内核）");
+                log::info!("当前为 Polaris 修复核或第三方内核，作废暂存的官方内核");
                 discard_staged(state.updater());
                 emit_auto_status(app, state.updater(), None);
             }

@@ -62,6 +62,13 @@ const CORE_MANIFEST_JSON: &str = include_str!("../../core-manifest.json");
 struct CoreManifest {
     #[serde(rename = "bundledCoreVersion")]
     bundled_core_version: String,
+    #[serde(rename = "windowsBuild")]
+    windows_build: Option<WindowsBuild>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WindowsBuild {
+    version: String,
 }
 
 /// 解析编译期嵌入的 `core-manifest.json`，取随包基线版本。
@@ -69,7 +76,14 @@ struct CoreManifest {
 /// 解析失败 → 回落空串（调用方据此跳过基线比较；**不 panic**：清单损坏不该让整个 App 起不来）。
 fn bundled_core_version() -> String {
     serde_json::from_str::<CoreManifest>(CORE_MANIFEST_JSON)
-        .map(|m| m.bundled_core_version)
+        .map(|m| {
+            if cfg!(target_os = "windows") {
+                m.windows_build
+                    .map_or(m.bundled_core_version, |w| w.version)
+            } else {
+                m.bundled_core_version
+            }
+        })
         .unwrap_or_else(|e| {
             log::error!("core-manifest.json 解析失败 {e}：基线比较将跳过");
             String::new()

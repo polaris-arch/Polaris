@@ -3,6 +3,7 @@
  * fetch-core.mjs — 按 core-manifest.json 的 bundledCoreVersion 从 SagerNet/sing-box 官方 release
  * 下载各平台 sing-box 二进制到 resources/{平台}/，供 Tauri bundle externalBin/resources 随安装包打包
  * （与 libcronet/dashboard 同「现拉现打、不入库」模式）。
+ * Windows 存在 windowsBuild 时改走固定源码 + 补丁构建，并校验最终二进制 SHA；见 core-patches/README.md。
  *
  * 用法：node scripts/fetch-core.mjs [--force] [--platform=<key>[,<key>…]]
  *
@@ -47,6 +48,7 @@ import { fileURLToPath } from 'url';
 
 import { extractZip, findInZipRoot } from './lib/extract-zip.mjs';
 import { isFresh, readStamps, recordStamp } from './lib/fetch-stamp.mjs';
+import { buildWindowsCore } from './lib/build-windows-core.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -105,6 +107,17 @@ const stamps = readStamps(ROOT);
 for (const t of PICKED) {
   const absDir = join(ROOT, t.dir);
   const dest = join(absDir, t.bin);
+
+  if (t.key === 'win' && manifest.windowsBuild) {
+    try {
+      buildWindowsCore(ROOT, manifest, dest, FORCE);
+      ok++;
+    } catch (e) {
+      console.error(`  FAILED win: ${e.message}`);
+      failed++;
+    }
+    continue;
+  }
 
   // 完整性 pin 是供应链防护核心：缺 pin 直接 fail（绝不无校验拉可执行核）。
   // **位置在 skip 判据之前**：指纹要拿 pin 参与构成，且缺 pin 时无论盘上有什么都该红。

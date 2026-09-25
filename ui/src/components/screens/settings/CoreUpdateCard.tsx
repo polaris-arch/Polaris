@@ -45,6 +45,9 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
     runCoreUpdate,
   } = useCoreUpdate();
 
+  const blockedNote = t(coreVer?.build === 'polaris'
+    ? 'settings.core.managedByApp' : 'settings.core.forkBlocked');
+
   return (
     <>
       <CoreVersionBanner />
@@ -59,8 +62,8 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
             <div style={{ flex: 1 }}>
               <b>{t('settings.update.coreCurrent')}</b> <span className="cv-tag">{coreVer.current}</span>
               <CardSub>
-                {coreVer.build === 'fork'
-                  ? t('settings.core.forkBlocked')
+                {coreForkBlocked
+                  ? blockedNote
                   : coreVer.build === 'unknown'
                     ? t('settings.coreManagement.srcNoteUnknown')
                     : t('settings.coreManagement.srcNoteOfficial')}
@@ -68,10 +71,12 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
             </div>
             <Pill
               variant={
-                coreVer.build === 'official' ? 'ok' : coreVer.build === 'fork' ? 'warn' : 'default'
+                (coreVer.build === 'official' || coreVer.build === 'polaris') ? 'ok' : coreVer.build === 'fork' ? 'warn' : 'default'
               }
             >
-              {coreVer.build === 'official'
+              {coreVer.build === 'polaris'
+                ? 'Polaris'
+                : coreVer.build === 'official'
                 ? t('settings.coreManagement.sourceOfficial')
                 : coreVer.build === 'fork'
                   ? t('settings.coreManagement.sourceFork')
@@ -80,7 +85,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
           </div>
         )}
 
-        {staged && (
+        {staged && !coreForkBlocked && (
           <div className="core-ver" style={{ marginTop: 8 }}>
             <Dot variant="idle" />
             <div style={{ flex: 1 }}>
@@ -113,7 +118,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
               variant="ghost"
               size="sm"
               disabled={coreForkBlocked || coreBusy}
-              data-tip={coreForkBlocked ? t('settings.core.forkBlocked') : undefined}
+              data-tip={coreForkBlocked ? blockedNote : undefined}
               onClick={() => void checkCoreUpdate()}
             >
               <span>{t('settings.coreManagement.checkCoreUpdate')}</span>
@@ -205,7 +210,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
               id="auto-core-swt"
               checked={!!config.autoUpdateCore}
               disabled={coreForkBlocked}
-              tip={coreForkBlocked ? t('settings.core.forkBlocked') : undefined}
+              tip={coreForkBlocked ? blockedNote : undefined}
               onChange={(value) => void update({ autoUpdateCore: value })}
               aria-label={t('settings.coreManagement.autoUpdate')}
             />

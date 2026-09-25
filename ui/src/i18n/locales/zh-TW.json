@@ -821,6 +821,7 @@
     },
     "core": {
       "applied": "內核已更新",
+      "managedByApp": "此修復核心隨 Polaris 應用程式更新。",
       "forkBlocked": "目前為第三方（非官方）內核，已停用線上更新；請先回滾或重置到出廠內核",
       "noBackup": "沒有可回滾的備份版本",
       "replaceConfirmMessage": "所選內核版本（{{upload}}）不高於隨應用出廠的版本（{{bundled}}），可能缺少新特性或相容性修復。仍要替換嗎？",

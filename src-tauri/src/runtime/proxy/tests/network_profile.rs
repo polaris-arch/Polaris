@@ -3,7 +3,7 @@
 
 use super::*;
 use polaris_config_engine::builder::network_env::{
-    PrunedEnvRule, PRUNE_DHCP_MONITOR_MISSING, PRUNE_PROBE_UNAVAILABLE, WARN_DHCP_IPV6_ONLY,
+    PrunedEnvRule, PRUNE_PROBE_UNAVAILABLE, WARN_DHCP_IPV6_ONLY,
 };
 
 fn pruned(id: &str, reason: &'static str) -> PrunedEnvRule {
@@ -149,6 +149,8 @@ fn tun_netenv_config() -> Value {
 #[cfg(unix)]
 #[tokio::test]
 async fn r4_regeneration_drops_netenv_and_reports_it() {
+    use polaris_config_engine::builder::network_env::PRUNE_DHCP_MONITOR_MISSING;
+
     let dir = fresh_test_dir();
     let rt = test_runtime_in(dir.clone());
     let cfg = tun_netenv_config();

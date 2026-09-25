@@ -9,5 +9,13 @@
   "cronetLibrarySha256": {
     "linux": "23109c55b08829bb1a68682a61a64852b1bbf243753b153cbd8f6e4ea2c05294",
     "win": "3217c6260fbca5f16072e0b79735742f40109a63bb0ff88fd6b96dd6b54a2928"
+  },
+  "windowsBuild": {
+    "version": "1.15.0-alpha.8.polaris.1",
+    "sourceCommit": "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
+    "sourceSha256": "77aabf518a4464832f6f4792196a8ab9aadadcc616dbbd82327137ce664a5862",
+    "patchSha256": "69ae099ae06710bdb46c47448909e1bda11cb63dd944e85208c29a19b10bb7c9",
+    "goVersion": "1.25.5",
+    "binarySha256": "75c33fa1b51d6e7dbb9273b415a31e01bc124cebc062814191e2bdce46224492"
   }
 }
