@@ -3,6 +3,7 @@
  * fetch-core.mjs — 按 core-manifest.json 的 bundledCoreVersion 从 SagerNet/sing-box 官方 release
  * 下载各平台 sing-box 二进制到 resources/{平台}/，供 Tauri bundle externalBin/resources 随安装包打包
  * （与 libcronet/dashboard 同「现拉现打、不入库」模式）。
+ * Windows 存在 windowsBuild 时改走固定源码 + 补丁构建，并校验最终二进制 SHA；见 core-patches/README.md。
  *
  * 用法：node scripts/fetch-core.mjs [--force] [--platform=<key>[,<key>…]]
  *

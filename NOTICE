@@ -18,7 +18,8 @@ included in all copies or substantial portions of the Software.
   - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI）
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）
 
-随包 sing-box 的版本真值是 `src-tauri/core-manifest.json` 的 `bundledCoreVersion`。
+随包 sing-box 的上游基线是 `src-tauri/core-manifest.json` 的 `bundledCoreVersion`；
+Windows 修复版本及构建输入/产物校验值记录在同文件的 `windowsBuild`。
 上面写死的版本号与 tag 链接由 `scripts/verify-packaging.mjs confs` 与该真值对拍，
 两边不一致即构建转红 —— 版本号写在这里是因为法律声明不该让读者去翻另一个文件。
 
