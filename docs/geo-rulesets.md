@@ -25,10 +25,12 @@
 
 ## 更新
 
-内置集在 app 内更新（规则资源 → 更新；自动更新默认开启）。如需从官方源手动刷新单个文件，例如：
+内置集在 app 内更新（规则资源 → 更新；自动更新默认开启）。
+
+SagerNet 的 `.srs` 位于 `rule-set` 分支；release 中的 `.db` 数据库不能作为 `.srs` 使用。如需从官方源手动刷新单个文件，例如：
 
 ```bash
-curl -L -o geoip-cn.srs https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-cn.srs
+curl -fL -o geoip-cn.srs https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs
 ```
 
 ## 在 sing-box 配置中使用

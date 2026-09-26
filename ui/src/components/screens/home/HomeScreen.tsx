@@ -1106,7 +1106,9 @@ export function HomeScreen() {
                         </span>
                         {!sentinelSelected && currentServer?.protocol && (
                           <span className="pill proto" id="cur-proto">
-                            {currentServer.protocol.toUpperCase()}
+                            {currentServer.protocol === 'masque-client'
+                              ? 'MASQUE'
+                              : currentServer.protocol.toUpperCase()}
                           </span>
                         )}
                       </div>

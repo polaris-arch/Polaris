@@ -14,6 +14,9 @@
  * 加订阅前先确认发射点存在——本仓 33 个事件常量里曾有 16 个是「定义了没人发也没人听」的死通道。
  */
 
+import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
+import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
+import { authorizeFromMainFrame, claimLoginUrl, loginAttemptActive, mainAuthUrlOwner, openLoginUrl } from '@/domain/tailscale-login-progress';
 import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore, useEffectiveConfig } from './store/app-store';
@@ -528,11 +531,28 @@ export default function App() {
   useEffect(() => {
     const off = api.proxy.onTailscaleStatus((data) => {
       useAppStore.getState().setTailscaleStatus(data);
+      const progress = useTailscaleLoginProgressStore.getState();
+      const authorized = authorizeFromMainFrame(progress.attempts[data.serverId], data);
+      if (authorized) {
+        progress.apply(authorized);
+        useAppStore.getState().setTailscaleAuthUrl(data.serverId, null);
+        useAppStore.getState().setTailscaleLoginInitiated(data.serverId, false);
+      }
+      const active = useTailscaleLoginProgressStore.getState().attempts[data.serverId];
+      const owner = mainAuthUrlOwner(active);
+      if (!authorized && active?.phase === 'mainCore' && owner && validatedTailscaleAuthUrl(data.authURL)) {
+        progress.apply({ ...active, url: data.authURL! });
+        useAppStore.getState().setTailscaleAuthUrl(data.serverId, data.authURL!);
+        if (claimLoginUrl(tsAuthSeen.current, data.serverId, owner, data.authURL!)) {
+          void openLoginUrl(data.authURL!, api.system.openExternal, () => toast.error(t('ts.browserOpenFailed')));
+          void notifyDesktop(t('notify.tsLogin.title'), t('notify.tsLogin.body'));
+        }
+      }
       if (!isDefinitiveTsLoginFrame(data)) return;
       useAppStore.getState().setTailscaleLoginState(data.serverId, data.loggedIn);
     });
     return off;
-  }, []);
+  }, [t]);
 
   // Tailscale 交互登录 URL 全局兜底（对齐 上游 ProxyManager 抓到 authURL 即
   // `shell.openExternal` 自动开浏览器 + 系统通知，见 ProxyManager.ts:6634/6854）。**必须挂在 App 全局
@@ -545,18 +565,40 @@ export default function App() {
   useEffect(() => {
     const setTailscaleAuthUrl = useAppStore.getState().setTailscaleAuthUrl;
     return api.proxy.onTailscaleAuth((data) => {
-      if (!data.url) return;
+      if (data.transient) return; // Transient URLs are fenced by attemptId in the progress subscription.
+      if (!validatedTailscaleAuthUrl(data.url)) return;
+      const current = data.serverId ? useTailscaleLoginProgressStore.getState().attempts[data.serverId] : undefined;
+      const owner = mainAuthUrlOwner(current);
+      if (!owner) return;
+      if (current) useTailscaleLoginProgressStore.getState().apply({ ...current, url: data.url });
       if (data.serverId) setTailscaleAuthUrl(data.serverId, data.url);
-      const owner = data.serverId || UNOWNED_TAILSCALE_AUTH_KEY;
-      if (tsAuthSeen.current.get(owner) === data.url) return;
-      tsAuthSeen.current.set(owner, data.url);
-      void api.system.openExternal(data.url);
+      if (!claimLoginUrl(tsAuthSeen.current, data.serverId || UNOWNED_TAILSCALE_AUTH_KEY, owner, data.url)) return;
+      void openLoginUrl(data.url, api.system.openExternal, () => toast.error(t('ts.browserOpenFailed')));
       void notifyDesktop(
         t('notify.tsLogin.title'),
         t('notify.tsLogin.body')
       );
     });
   }, [t]);
+
+  useEffect(() => api.proxy.onTailscaleLoginProgress((data) => {
+    if ((data.phase === 'awaitingAuth' || (data.phase === 'mainCore' && data.url)) && !validatedTailscaleAuthUrl(data.url)) {
+      if (useTailscaleLoginProgressStore.getState().apply({ ...data, phase: 'failed', reason: 'invalidAuthUrl', url: null })) {
+        void api.server.tailscaleLoginCancel(data.serverId, data.attemptId).catch(() => {});
+      }
+      return;
+    }
+    if (!useTailscaleLoginProgressStore.getState().apply(data)) return;
+    const store = useAppStore.getState();
+    store.setTailscaleLoginInitiated(data.serverId, loginAttemptActive(data.phase));
+    store.setTailscaleAuthUrl(data.serverId, data.phase === 'awaitingAuth' || data.phase === 'mainCore' ? data.url ?? null : null);
+    if (data.phase === 'authorized') store.setTailscaleLoginState(data.serverId, true);
+    if ((data.phase === 'awaitingAuth' || (data.phase === 'mainCore' && !data.reason)) && data.url) {
+      if (!claimLoginUrl(tsAuthSeen.current, data.serverId, data.attemptId, data.url)) return;
+      void openLoginUrl(data.url, api.system.openExternal, () => toast.error(t('ts.browserOpenFailed')));
+      void notifyDesktop(t('notify.tsLogin.title'), t('notify.tsLogin.body'));
+    }
+  }), [t]);
 
   // 登录期出口让位（A4）：**后端 `reconcile_login_fallback` 真 emit**（选中账号制 TS 全隧道出口未就绪时，
   // 默认路由零重启热切 direct → engaged=true；就绪/关开关后切回 → engaged=false）。故此订阅是真接线（非死通道，

@@ -74,8 +74,16 @@ pub fn build_tailscale_login_config(
         "state_directory".to_string(),
         Value::String(state_dir.to_string_lossy().to_string()),
     );
-    // auth_key 故意不写入：本核只服务交互登录（无 key）。
+    // The caller clears auth_key for browser requests; preauthorized requests need it here.
     if let Some(ts) = ts {
+        if let Some(key) = ts
+            .auth_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            endpoint.insert("auth_key".into(), Value::String(key.into()));
+        }
         if let Some(control_url) = ts.control_url.as_deref() {
             let trimmed = control_url.trim();
             if !trimmed.is_empty() {

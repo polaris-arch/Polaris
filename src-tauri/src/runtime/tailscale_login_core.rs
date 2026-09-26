@@ -29,7 +29,7 @@
 //!   建不起来」，而 `ReconnectingStream` 本身就带退避重连，这类抖动它自己会吞掉；真的一直连不上，
 //!   由既有超时臂杀核并留下明确日志 —— 这是**响的**失败，不是静默降级。
 //!
-//! stdout/stderr 仍整段转日志（诊断价值不变），但**不再是任何判据的来源**。
+//! stdout/stderr 经已知密钥与登录链接脱敏后转日志，但不再是任何判据的来源。
 //!
 //! ## 诚实边界（务必读）
 //! 本命令的**端到端价值 = 真 sing-box + 真出站 + 真 Tailscale 控制面**：起一个真核去连 Tailscale 控制服务器、
@@ -52,12 +52,11 @@
 //! （耦合方向是现成的：`ProxyRuntime` 已持有 `Arc<MeshRuntime>`，`MeshRuntime` 已持有本注册表）。
 //! 一个**上次会话遗留**的登录核不在表里，届时被扫掉仍是**期望行为**（它本就该在应用退出时清）。
 //!
-//! 射程与两处未覆盖的窗口（spawn→注册之间那次 STATUS 订阅 `await`；cancel 先出表后收核）如实登记在
-//! [`LoginCoreRegistry::inflight_login_pids`] 的文档里，别从这一段推断「全覆盖」。
+//! PID 在 spawn 后、订阅 await 前登记，直到 terminate + reap 才注销；主核起停与登录共用 state gate。
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -66,8 +65,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use tauri::AppHandle;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
+mod attempts;
+use attempts::{Attempt, AttemptGuard, Attempts};
+pub use attempts::{LoginMode, LoginRequest};
+
+#[cfg(test)]
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
@@ -76,13 +80,13 @@ use polaris_core_supervisor::{
     SpawnError, SpawnRequest, StdioPolicy, TokioSpawner, CONFIG_CHECK_TIMEOUT,
 };
 use polaris_mesh::tailscale_login::{
-    advance_login_state, build_tailscale_login_config, login_config_to_json,
-    tailscale_endpoint_in_running_core, LoginEvent, LoginState, TailscaleLoginApiService,
+    advance_login_state, build_tailscale_login_config, login_config_to_json, LoginEvent,
+    LoginState, TailscaleLoginApiService,
 };
 use polaris_singbox_grpc::{daemon, Endpoint, ReconnectConfig, SingBoxApiClient};
 
-use crate::events::{broadcast, channel::EVENT_TAILSCALE_AUTH_URL};
-use crate::runtime::proxy::core_log::pipe_to_log;
+use crate::events::broadcast;
+use crate::runtime::proxy::core_log::pipe_to_log_with_secrets;
 use crate::runtime::proxy::{pid_alive, resolve_core_binary, send_signal};
 use crate::runtime::tailscale_status::decode_tailscale_status;
 
@@ -103,7 +107,18 @@ const LOGIN_STOP_GRACE: Duration = Duration::from_secs(5);
 /// 来源筛也分不出是哪个核。
 const LOGIN_CORE_LOG_TARGET: &str = "tailscale-login";
 
-/// 核二进制解析器（注入点）：生产走 [`resolve_core_binary`]，测试注入固定路径以免依赖真实落盘的 sing-box。
+/// Ready primary-core identity and ports, read under the shared state gate.
+#[derive(Default, Clone)]
+pub struct MainLoginSnapshot {
+    pub alive: bool,
+    pub generation: u64,
+    pub api_secret: String,
+    pub api_port: u16,
+    pub http_port: Option<u16>,
+    pub mixed_port: Option<u16>,
+}
+
+/// Production resolves the bundled binary; tests inject a path without running a real core.
 type BinaryResolver = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 
 // ── 抽象 trait（生产真实现 / 测试 mock；这是「无真进程无网络单测」的关键）────────────────────────
@@ -118,7 +133,7 @@ type BinaryResolver = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 pub trait LoginCoreChild: Send {
     /// 子进程 pid（假子进程返回占位值）。
     ///
-    /// **不只是日志**：`start_login` 把它记进 [`LoginEntry::pid`]，
+    /// **不只是日志**：`start_attempt` 把它记进 [`LoginEntry::pid`]，
     /// [`LoginCoreRegistry::inflight_login_pids`] 据此喂 `ProxyRuntime::cleanup_stale_cores`
     /// 的排除表 —— 返错 pid 会让清扫放过一个真孤儿，返 `None` 只会让本核在飞时失去保护。
     fn pid(&self) -> Option<u32>;
@@ -148,6 +163,15 @@ pub trait ConfigChecker: Send + Sync {
 pub trait AuthUrlEmitter: Send + Sync {
     /// 发射一条登录 URL 事件（URL 首次出现或发生变更时发）。
     fn emit_auth_url(&self, server_id: &str, node_name: &str, url: &str);
+    fn progress(
+        &self,
+        _server_id: &str,
+        _attempt_id: &str,
+        _phase: &str,
+        _reason: Option<&str>,
+        _url: Option<&str>,
+    ) {
+    }
 }
 
 /// 瞬态核 STATUS 流（每帧 = 全量端点快照）。生产是 `SubscribeTailscaleStatus` 的自动重连流，
@@ -323,17 +347,31 @@ pub struct AppHandleEmitter {
 }
 
 impl AuthUrlEmitter for AppHandleEmitter {
-    fn emit_auth_url(&self, server_id: &str, node_name: &str, url: &str) {
+    fn progress(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+        phase: &str,
+        reason: Option<&str>,
+        url: Option<&str>,
+    ) {
         broadcast(
             &self.app,
-            EVENT_TAILSCALE_AUTH_URL,
+            crate::events::channel::EVENT_TAILSCALE_LOGIN_PROGRESS,
             json!({
-                "serverId": server_id,
-                "nodeName": node_name,
-                "url": url,
-                "transient": true,
+                "serverId": server_id, "attemptId": attempt_id, "phase": phase, "reason": reason, "url": url,
             }),
         );
+        if phase == "awaitingAuth" {
+            broadcast(
+                &self.app,
+                crate::events::channel::EVENT_TAILSCALE_AUTH_URL,
+                json!({"serverId": server_id, "attemptId": attempt_id, "nodeName": "", "url": url, "transient": true}),
+            );
+        }
+    }
+    fn emit_auth_url(&self, _server_id: &str, _node_name: &str, _url: &str) {
+        // Transient URLs travel only in the attempt-scoped progress event.
     }
 }
 
@@ -351,7 +389,8 @@ struct LoginEntry {
     /// 「与 `cleanup_stale_cores` 的关系」）。
     pid: Option<u32>,
     /// 通知 supervisor kill+reap（cancel / kill-on-relogin 用）。
-    cancel_tx: oneshot::Sender<()>,
+    cancel_tx: Option<oneshot::Sender<()>>,
+    done: watch::Receiver<bool>,
 }
 
 /// 注册表共享状态（supervisor 任务与命令层共享）。
@@ -359,6 +398,8 @@ struct LoginEntry {
 struct Shared {
     /// serverId → 在飞登录核条目。
     entries: Mutex<HashMap<String, LoginEntry>>,
+    main_ids: Mutex<HashSet<String>>,
+    main_endpoints: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 impl Shared {
@@ -367,6 +408,7 @@ impl Shared {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     fn take(&self, id: &str) -> Option<LoginEntry> {
         self.guard().remove(id)
     }
@@ -393,20 +435,22 @@ impl Shared {
         self.guard().values().filter_map(|e| e.pid).collect()
     }
 
-    #[cfg(test)]
     fn contains(&self, id: &str) -> bool {
         self.guard().contains_key(id)
     }
 }
 
-/// [`start_login`](LoginCoreRegistry::start_login) 的结果。命令层据此折成前端 `{ started, reason?, authUrl? }`。
+/// [`start_attempt`](LoginCoreRegistry::start_attempt) 的结果；Started 表示仍待授权。
 pub enum StartLoginOutcome {
     /// 已起瞬态登录核（登录 URL 稍后经事件到达，非「已登录」）。
     Started,
     /// 双写守卫命中：该 TS endpoint 已在运行主核里，无需瞬态核（前端 `reason: 'inMainCore'`）。
     InMainCore,
+    InMainCorePending,
     /// 起核前失败（resolve / 写配置 / check / spawn）。返 error，未留表项、未起核。
     Failed(String),
+    /// The request was cancelled before its process was started.
+    Cancelled,
 }
 
 /// 瞬态登录核生命周期注册表。持有注入的 spawner/checker/binary-resolver（生产真实现，测试 mock）。
@@ -423,6 +467,7 @@ pub struct LoginCoreRegistry {
     /// 串行化「检查旧代 → 起核 → 注册」事务，防同一 server 的并发 IPC 各自都看见空表，
     /// 后写者覆盖前写者的 cancel sender，留下无法再取消的孤儿核。
     start_gate: tokio::sync::Mutex<()>,
+    attempts: Attempts,
 }
 
 impl LoginCoreRegistry {
@@ -456,6 +501,7 @@ impl LoginCoreRegistry {
             timeout,
             epoch: AtomicU64::new(1),
             start_gate: tokio::sync::Mutex::new(()),
+            attempts: Attempts::default(),
         }
     }
 
@@ -469,17 +515,8 @@ impl LoginCoreRegistry {
     /// 等着扫码时又去开 TUN」这条日常序列会把在飞登录核 SIGTERM 掐死：登录 URL 作废、
     /// 用户只看到「登录没反应」，且起核腿还要白等两段宽限。
     ///
-    /// # 覆盖面（如实登记，别高估）
-    ///
-    /// 覆盖 **register(i) → supervisor 收核后注销** 这一段。两端各有一格不在射程内：
-    /// - **spawn(g) → register(i)**：中间隔着 STATUS 流订阅那次真 `await`（[`LoginStatusSubscriber`]
-    ///   要建 gRPC 连接），窗口比测速临时核的「几微秒同步代码」宽得多。这一格本批未关。
-    /// - **cancel / kill-on-relogin**：[`cancel_login`](Self::cancel_login) 是先 `take` 出表、再通知
-    ///   supervisor `terminate()`，故出表时进程**还活着**（最长一段 SIGTERM 宽限）。这一格里清扫会
-    ///   把它当孤儿杀——而它本来就正在被杀，终局一致，只是可能多走一次信号。
-    ///
-    /// 自然退出 / 超时 / 登录成功三条路径都是 `terminate()`/`wait()` 收割**之后**才
-    /// `remove_if_epoch`，故那三条的「出表时进程已死」成立。
+    /// Spawn immediately registers its PID before STATUS subscription awaits. Cancellation retains
+    /// the entry until terminate + reap. Primary cleanup runs under the same state gate.
     #[must_use]
     pub fn inflight_login_pids(&self) -> Vec<u32> {
         self.shared.pids()
@@ -490,7 +527,7 @@ impl LoginCoreRegistry {
     ///
     /// 放在这里而不是在 proxy 侧另造一张表：那样门测的就是测试自己写的表，而不是生产真的会读的
     /// 那一张。本函数只做 `insert`，读侧走的仍是生产的 [`inflight_login_pids`](Self::inflight_login_pids)。
-    /// pid 字段本身「由 `child.pid()` 填」这一半由本模块的行为门（走真 `start_login`）单独钉。
+    /// pid 字段本身「由 `child.pid()` 填」这一半由本模块的行为门（走生产 `start_attempt`）单独钉。
     #[cfg(test)]
     pub(crate) fn register_inflight_for_test(&self, server_id: &str, pid: u32) {
         let (cancel_tx, _cancel_rx) = oneshot::channel();
@@ -499,7 +536,8 @@ impl LoginCoreRegistry {
             LoginEntry {
                 epoch: 0,
                 pid: Some(pid),
-                cancel_tx,
+                cancel_tx: Some(cancel_tx),
+                done: watch::channel(true).1,
             },
         );
     }
@@ -510,29 +548,200 @@ impl LoginCoreRegistry {
         self.shared.take(server_id);
     }
 
-    /// 取消某 server 在飞的瞬态登录核（kill + 注销）。幂等：无在飞核返 `false`（非错误）。
+    /// Signal cancellation while retaining PID/state ownership until reap.
+    #[cfg(test)]
     pub fn cancel_login(&self, server_id: &str) -> bool {
-        match self.shared.take(server_id) {
-            Some(entry) => {
-                // 通知 supervisor kill+reap；发送失败（supervisor 已退）无妨。
-                let _ = entry.cancel_tx.send(());
-                true
-            }
-            None => false,
+        let mut entries = self.shared.guard();
+        let Some(entry) = entries.get_mut(server_id) else {
+            return false;
+        };
+        if let Some(tx) = entry.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+        true
+    }
+
+    pub async fn cancel_and_wait(&self, server_id: &str) {
+        let done = {
+            let mut entries = self.shared.guard();
+            entries.get_mut(server_id).map(|entry| {
+                if let Some(tx) = entry.cancel_tx.take() {
+                    let _ = tx.send(());
+                }
+                entry.done.clone()
+            })
+        };
+        if let Some(mut done) = done {
+            let _ = done.wait_for(|v| *v).await;
         }
     }
 
-    /// 起一个瞬态登录核。
-    ///
-    /// 流程：双写守卫 → 解析核 → 解析管理 API 端口 + 生成 secret → 建 config → 写盘 →
-    /// `sing-box check` → kill-on-relogin（先杀该 server 旧核）→ spawn → 订阅 STATUS 流 →
-    /// 注册 + 计时臂 + 后台 supervise。
-    ///
-    /// `primary_api_port` = **运行中主核**的管理 API 端口（未运行传 0）：瞬态核的 api 端口必须避开它，
-    /// 否则两个 api service 抢同一个 bind → 瞬态核直接 FATAL。其余排除项（control/http/mixed）取自
-    /// `running_config` —— 与双写守卫同一份快照，语义正好：**只排除此刻真的被占着的端口**。
-    ///
-    /// `started ≠ 已登录`：登录 URL 经 [`AuthUrlEmitter`] 事件异步到达（源 = STATUS 帧的 `authURL`）。
+    pub fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+        self.attempts.prepare(server_id, attempt_id).map(|_| ())
+    }
+
+    pub async fn cancel_attempt(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+        let attempt = self.attempts.cancel(server_id, attempt_id)?;
+        attempt.finished().await;
+        Ok(())
+    }
+
+    /// Lock order: proxy lifecycle -> this gate. Login never waits for proxy lifecycle.
+    pub async fn state_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.start_gate.lock().await
+    }
+
+    /// The deletion callback runs only when neither the main core nor a login process owns state.
+    pub async fn logout<F>(
+        &self,
+        server_id: &str,
+        main_alive: &(dyn Fn() -> bool + Send + Sync),
+        keep_attempt: Option<&str>,
+        delete: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(&tokio::sync::MutexGuard<'_, ()>) -> std::io::Result<()> + Send,
+    {
+        let _gate = self.state_gate().await;
+        if self.main_owns(server_id, main_alive()) {
+            return Ok(false);
+        }
+        if keep_attempt.is_some_and(|id| !self.attempts.can_preserve(server_id, id)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Only a prepared login request may be preserved",
+            ));
+        }
+        self.attempts
+            .cancel_node_except(server_id, keep_attempt)
+            .await;
+        self.cancel_and_wait(server_id).await;
+        delete(&_gate)?;
+        Ok(true)
+    }
+
+    /// Called while holding state_gate; includes check/subscription and process reap windows.
+    pub fn state_in_use(&self, server_id: &str, main_alive: bool) -> bool {
+        self.main_owns(server_id, main_alive)
+            || self.shared.contains(server_id)
+            || self.attempts.owns_state(server_id)
+    }
+
+    pub fn main_owns(&self, server_id: &str, main_alive: bool) -> bool {
+        main_alive
+            && self
+                .shared
+                .main_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(server_id)
+    }
+
+    /// Called under the gate with the final, peeled generated endpoint set, before spawn.
+    pub async fn reserve_main_states(&self, generated: &serde_json::Value, root: &Path) {
+        let state_root = root.join("tailscale");
+        let ids: HashSet<String> = generated
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|ep| ep.get("type").and_then(serde_json::Value::as_str) == Some("tailscale"))
+            .filter_map(|ep| {
+                ep.get("state_directory")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .filter_map(|dir| {
+                let path = Path::new(dir);
+                (path.parent() == Some(state_root.as_path()))
+                    .then(|| path.file_name()?.to_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect();
+        let endpoints: HashMap<String, serde_json::Value> = generated
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|ep| {
+                let path = Path::new(ep.get("state_directory")?.as_str()?);
+                let id = path.file_name()?.to_str()?;
+                ids.contains(id).then(|| {
+                    let relevant = ["tag", "auth_key", "control_url", "hostname", "ephemeral"]
+                        .into_iter()
+                        .filter_map(|key| ep.get(key).map(|value| (key.to_owned(), value.clone())))
+                        .collect::<serde_json::Map<_, _>>();
+                    (id.to_owned(), serde_json::Value::Object(relevant))
+                })
+            })
+            .collect();
+        self.shared
+            .main_endpoints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(endpoints);
+        for id in &ids {
+            self.cancel_and_wait(id).await;
+        }
+        self.shared
+            .main_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(ids);
+    }
+
+    pub fn release_main_states(&self) {
+        self.shared
+            .main_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.shared
+            .main_endpoints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    fn main_matches_request(&self, server: &ServerConfig, mode: LoginMode) -> bool {
+        let endpoints = self
+            .shared
+            .main_endpoints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(endpoint) = endpoints.get(&server.id) else {
+            return false;
+        };
+        let settings = server.tailscale_settings.as_ref();
+        let normalized = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let key = if mode == LoginMode::Browser {
+            None
+        } else {
+            settings.and_then(|ts| ts.auth_key.as_deref())
+        };
+        [
+            ("auth_key", key),
+            (
+                "control_url",
+                settings.and_then(|ts| ts.control_url.as_deref()),
+            ),
+            ("hostname", settings.and_then(|ts| ts.hostname.as_deref())),
+        ]
+        .iter()
+        .all(|(name, value)| {
+            normalized(*value)
+                == normalized(endpoint.get(*name).and_then(serde_json::Value::as_str))
+        }) && settings.is_some_and(|ts| ts.ephemeral == Some(true))
+            == (endpoint
+                .get("ephemeral")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true))
+    }
+
+    #[cfg(test)]
     pub async fn start_login(
         &self,
         server: &ServerConfig,
@@ -542,22 +751,243 @@ impl LoginCoreRegistry {
         primary_api_port: u16,
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
-        let _start_guard = self.start_gate.lock().await;
-
-        // (a) 双写守卫：endpoint 已在运行主核 → 拒起瞬态核（两个核同写 tailscale-state 会冲突）。
-        if tailscale_endpoint_in_running_core(&server.id, is_running, running_config) {
+        if polaris_mesh::tailscale_login::tailscale_endpoint_in_running_core(
+            &server.id,
+            is_running,
+            running_config,
+        ) {
             return StartLoginOutcome::InMainCore;
         }
-        if !self.shared.can_start(&server.id) {
-            return StartLoginOutcome::Failed(format!(
-                "并发 Tailscale 登录已达上限 {MAX_ACTIVE_LOGIN_CORES}"
-            ));
-        }
+        let request = LoginRequest {
+            attempt_id: format!("test-{}", self.epoch.fetch_add(1, Ordering::SeqCst)),
+            mode: LoginMode::Browser,
+        };
+        self.prepare(&server.id, &request.attempt_id).unwrap();
+        self.start_attempt(
+            server,
+            user_data,
+            request,
+            &|| MainLoginSnapshot {
+                api_port: primary_api_port,
+                http_port: running_config.and_then(|c| c.http_port),
+                mixed_port: running_config.and_then(|c| c.mixed_port),
+                ..Default::default()
+            },
+            emitter,
+        )
+        .await
+    }
 
+    /// Start a prepared request under the shared state gate. Main ownership and port exclusions
+    /// come from its actual startup snapshot. A spawned child is registered before subscription;
+    /// request cancellation and terminal events wait for reap. Started means authorization pending.
+    pub async fn start_attempt(
+        &self,
+        server: &ServerConfig,
+        user_data: &Path,
+        request: LoginRequest,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+    ) -> StartLoginOutcome {
+        let attempt = match self.attempts.get(&server.id, &request.attempt_id) {
+            Ok(attempt) => attempt,
+            Err(reason) => return StartLoginOutcome::Failed(reason),
+        };
+        if attempt.claimed.swap(true, Ordering::SeqCst) {
+            return StartLoginOutcome::Failed("attemptAlreadyUsed".into());
+        }
+        let mut request_guard = AttemptGuard(attempt.clone(), false);
+        emitter.progress(&server.id, &request.attempt_id, "starting", None, None);
+        let outcome = self
+            .launch_attempt(
+                server,
+                user_data,
+                &request,
+                &attempt,
+                main_core,
+                emitter.clone(),
+            )
+            .await;
+        if !attempt.is_finished() {
+            match &outcome {
+                StartLoginOutcome::Started => {}
+                StartLoginOutcome::InMainCore => {
+                    emitter.progress(&server.id, &request.attempt_id, "mainCore", None, None);
+                    attempt.finish();
+                }
+                StartLoginOutcome::InMainCorePending => {
+                    emitter.progress(
+                        &server.id,
+                        &request.attempt_id,
+                        "mainCore",
+                        Some("configurationPending"),
+                        None,
+                    );
+                    attempt.finish();
+                }
+                StartLoginOutcome::Cancelled => {
+                    emitter.progress(&server.id, &request.attempt_id, "cancelled", None, None);
+                    attempt.finish();
+                }
+                StartLoginOutcome::Failed(reason) => {
+                    emitter.progress(
+                        &server.id,
+                        &request.attempt_id,
+                        "failed",
+                        Some(reason),
+                        None,
+                    );
+                    attempt.finish();
+                }
+            }
+        }
+        request_guard.1 = true;
+        outcome
+    }
+
+    /// A steady Running core need not send another global frame. Subscribe once for a fresh
+    /// initial snapshot; this query never starts/stops the primary core or keeps its stream alive.
+    async fn confirm_main_request(
+        &self,
+        server: &ServerConfig,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        main: &MainLoginSnapshot,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+    ) -> StartLoginOutcome {
+        let tag = self
+            .shared
+            .main_endpoints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&server.id)
+            .and_then(|ep| ep.get("tag"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let Some(tag) = tag.filter(|_| main.api_port != 0) else {
+            return StartLoginOutcome::Failed("statusSubscriptionFailed".into());
+        };
+        emitter.progress(
+            &server.id,
+            &request.attempt_id,
+            "mainCore",
+            Some("confirmingMainCore"),
+            None,
+        );
+        let query = async {
+            let mut stream = self
+                .subscriber
+                .subscribe(main.api_port, &main.api_secret)
+                .await
+                .map_err(|_| "statusSubscriptionFailed")?;
+            let frame = stream.recv().await.ok_or("statusStreamEnded")?;
+            let current = main_core();
+            if !current.alive
+                || current.generation != main.generation
+                || current.api_port != main.api_port
+            {
+                return Err("mainCoreChanged");
+            }
+            let endpoint = frame
+                .endpoints
+                .iter()
+                .find(|ep| ep.endpoint_tag == tag)
+                .ok_or("statusSubscriptionFailed")?;
+            let authorized = endpoint.backend_state == "Running"
+                && !endpoint.self_.as_ref().is_some_and(|peer| peer.expired);
+            let url = if authorized || endpoint.auth_url.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::runtime::tailscale_status::validated_tailscale_auth_url(
+                        &endpoint.auth_url,
+                    )
+                    .ok_or("invalidAuthUrl")?,
+                )
+            };
+            Ok((authorized, url))
+        };
+        let result = tokio::select! {
+            biased;
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            result = tokio::time::timeout(self.timeout.min(CONFIG_CHECK_TIMEOUT), query) => result,
+        };
+        if attempt.cancelled() {
+            return StartLoginOutcome::Cancelled;
+        }
+        match result {
+            Ok(Ok((authorized, url))) => {
+                emitter.progress(
+                    &server.id,
+                    &request.attempt_id,
+                    if authorized { "authorized" } else { "mainCore" },
+                    None,
+                    if authorized { None } else { url.as_deref() },
+                );
+                attempt.finish();
+                StartLoginOutcome::InMainCore
+            }
+            Ok(Err(reason)) => StartLoginOutcome::Failed(reason.into()),
+            Err(_) => {
+                emitter.progress(
+                    &server.id,
+                    &request.attempt_id,
+                    "timedOut",
+                    Some("authorizationTimedOut"),
+                    None,
+                );
+                attempt.finish();
+                StartLoginOutcome::Failed("authorizationTimedOut".into())
+            }
+        }
+    }
+
+    async fn launch_attempt(
+        &self,
+        server: &ServerConfig,
+        user_data: &Path,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+    ) -> StartLoginOutcome {
+        let _start_guard = tokio::select! {
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            guard = self.start_gate.lock() => guard,
+        };
+        if attempt.cancelled() {
+            return StartLoginOutcome::Cancelled;
+        }
+        let main = main_core();
+        if self.main_owns(&server.id, main.alive) {
+            return if self.main_matches_request(server, request.mode) {
+                self.confirm_main_request(server, request, attempt, &main, main_core, emitter)
+                    .await
+            } else {
+                StartLoginOutcome::InMainCorePending
+            };
+        }
+        if !self.shared.can_start(&server.id) {
+            return StartLoginOutcome::Failed("tooManyLogins".into());
+        }
+        let mut server = server.clone();
+        if request.mode == LoginMode::Browser {
+            if let Some(ts) = server.tailscale_settings.as_mut() {
+                ts.auth_key = None;
+            }
+        } else if server
+            .tailscale_settings
+            .as_ref()
+            .and_then(|ts| ts.auth_key.as_deref())
+            .is_none_or(|key| key.trim().is_empty())
+        {
+            return StartLoginOutcome::Failed("authKeyRequired".into());
+        }
         // (b) 解析核二进制（复用 proxy 的解析，禁重复实现）。
         let binary = match (self.resolve_binary)() {
             Ok(b) => b,
-            Err(e) => return StartLoginOutcome::Failed(e),
+            Err(_) => return StartLoginOutcome::Failed("coreUnavailable".into()),
         };
 
         // (c) 瞬态核管理 API：独立空闲端口 + 每次随机 secret。端口走既有簿记设施
@@ -565,12 +995,12 @@ impl LoginCoreRegistry {
         // control_api+2），secret 走与 clashApiSecret 同源的 CSPRNG。**secret 不是洁癖**：
         // 管理 API 虽只监听回环，但同机任意进程都能连上它读 tailnet 拓扑。
         let exclusions = PortExclusions::for_login_api(
-            primary_api_port,
+            main.api_port,
             // UserConfig 无 controlPort 字段（`impl PortConfig for UserConfig` 恒 None）→ 走默认 9090。
             None,
-            running_config.and_then(|c| c.http_port),
+            main.http_port,
             None,
-            running_config.and_then(|c| c.mixed_port),
+            main.mixed_port,
         );
         let resolved =
             PortAllocator::new(TokioPortProvider).resolve_tailscale_login_api_port(&exclusions);
@@ -596,9 +1026,9 @@ impl LoginCoreRegistry {
         // 旧代 supervisor 的删除就会打在**新代**刚写好的那份上（它的 `terminate()` 有最长 5s 的
         // SIGTERM 宽限，删除随时可能晚于新核 spawn）。带代次后每份 config 只有一个主人。
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst);
-        let cfg = match build_tailscale_login_config(server, user_data, &api) {
+        let cfg = match build_tailscale_login_config(&server, user_data, &api) {
             Ok(config) => config,
-            Err(error) => return StartLoginOutcome::Failed(error.to_string()),
+            Err(_) => return StartLoginOutcome::Failed("invalidNode".into()),
         };
         let json_cfg = login_config_to_json(&cfg);
         let config_path = user_data.join(format!(
@@ -607,75 +1037,85 @@ impl LoginCoreRegistry {
         ));
         let bytes = match serde_json::to_vec_pretty(&json_cfg) {
             Ok(b) => b,
-            Err(e) => return StartLoginOutcome::Failed(format!("序列化登录配置失败: {e}")),
+            Err(_) => return StartLoginOutcome::Failed("configWriteFailed".into()),
         };
-        if let Err(e) = write_login_config_secure(&config_path, &bytes) {
-            return StartLoginOutcome::Failed(format!(
-                "写登录配置失败 {}: {e}",
-                config_path.display()
-            ));
+        // Independent authorization also works before the primary core has ever initialized its files.
+        if create_login_parent(user_data)
+            .and_then(|()| write_login_config_secure(&config_path, &bytes))
+            .is_err()
+        {
+            return StartLoginOutcome::Failed("configWriteFailed".into());
         }
         // 从含 secret 的文件出现这一刻起，任何提前返回或 future 取消都必须清理；成功把路径
         // 移交 supervisor 后才解除。不能只在已知 Err 分支手写 remove，否则新增 await/return 会再漏。
         let mut config_guard = LoginConfigGuard::new(&config_path);
 
         // (e) sing-box check 先验配置形状（失败快退、不 spawn —— 这一段可单测）。
-        if let Err(e) = self.checker.check(&binary, &config_path).await {
-            return StartLoginOutcome::Failed(e);
+        tokio::select! {
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            result = self.checker.check(&binary, &config_path) => if result.is_err() {
+                return StartLoginOutcome::Failed("configurationCheckFailed".into());
+            },
         }
 
         // (f) kill-on-relogin：先杀该 server 在飞的旧瞬态核（若有），再起新核。
-        self.cancel_login(&server.id);
+        self.cancel_and_wait(&server.id).await;
+        if attempt.cancelled() {
+            return StartLoginOutcome::Cancelled;
+        }
 
         // (g) spawn 瞬态登录核（`run -c <cfg> --disable-color`，避免 ANSI 污染日志）。
         //
         // 两条流的去向在**请求里**一次说清：spawner 在返回之前就把读端交给这个回调，核从起来的
         // 第一毫秒起就有人读它。**纯诊断**：登录 URL 与登录成功都只认 STATUS 流（见模块头），
         // 这两条流不是任何判据的来源。target 用本腿自己的，不与主核混（见 `LOGIN_CORE_LOG_TARGET`）。
+        let secrets: Vec<String> = [
+            Some(api.secret.clone()),
+            server
+                .tailscale_settings
+                .as_ref()
+                .and_then(|ts| ts.auth_key.as_deref().map(str::trim).map(str::to_owned)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let mut req = SpawnRequest::new(
             &binary,
             &config_path,
-            StdioPolicy::drain(|stdout, stderr| {
-                pipe_to_log(stdout, LOGIN_CORE_LOG_TARGET, None, None);
-                pipe_to_log(stderr, LOGIN_CORE_LOG_TARGET, None, None);
+            StdioPolicy::drain(move |stdout, stderr| {
+                pipe_to_log_with_secrets(
+                    stdout,
+                    LOGIN_CORE_LOG_TARGET,
+                    None,
+                    None,
+                    secrets.clone(),
+                );
+                pipe_to_log_with_secrets(stderr, LOGIN_CORE_LOG_TARGET, None, None, secrets);
             }),
         );
         req.extra_args = vec!["--disable-color".to_string()];
-        let mut child = match self.spawner.spawn(req) {
+        req.working_dir = Some(user_data.to_path_buf());
+        let child = match self.spawner.spawn(req) {
             Ok(c) => c,
-            Err(e) => return StartLoginOutcome::Failed(format!("{e}")),
+            Err(_) => return StartLoginOutcome::Failed("processStartFailed".into()),
         };
 
-        // (h) 订阅瞬态核自己的 STATUS 流。**建不起来就硬失败**（不回退 stdout，理由见模块头）：
-        // 此时核已起，必须先收掉它再报错，否则留下一个谁都不认识的孤儿核。
-        let status = match self.subscriber.subscribe(api.port, &api.secret).await {
-            Ok(s) => s,
-            Err(e) => {
-                child.terminate().await;
-                return StartLoginOutcome::Failed(format!(
-                    "瞬态登录核 STATUS 流订阅失败（登录 URL 与登录成功判据均取自它，无回退路径）: {e}"
-                ));
-            }
-        };
-
-        // (i) 注册 + 后台 supervise（内含超时臂 / STATUS→URL relay / Running→收核 / cancel / reap）。
-        // 复用 (d) 已取的 `epoch`：注册表代次与 config 文件名必须是**同一个**代次，否则「谁该删这份
-        // config」与「谁该注销这个表项」会各按各的编号走。
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        // pid 必须在 `child` 被移进 supervise 之前取：它是孤儿清扫排除表的唯一来源
-        // （见 [`inflight_login_pids`]）。取不到（假 child / 已退出）时留 `None`，排除表少一项，
-        // 方向仍是「宁可漏排除，不可乱排除」。
-        let pid = child.pid();
+        let (done_tx, done_rx) = watch::channel(false);
         self.shared.insert(
             server.id.clone(),
             LoginEntry {
                 epoch,
-                pid,
-                cancel_tx,
+                pid: child.pid(),
+                cancel_tx: Some(cancel_tx),
+                done: done_rx,
             },
         );
         let ctx = SuperviseCtx {
             shared: self.shared.clone(),
+            attempt: attempt.clone(),
+            attempt_id: request.attempt_id.clone(),
+            done: done_tx,
             server_id: server.id.clone(),
             node_name: server.name.clone(),
             // 瞬态核只含本节点一个 endpoint，其 tag = server.name（见 `build_tailscale_login_config`）。
@@ -683,12 +1123,23 @@ impl LoginCoreRegistry {
             tag_to_id: BTreeMap::from([(server.name.clone(), server.id.clone())]),
             config_path: config_path.clone(),
             epoch,
-            timeout: self.timeout,
+            deadline: tokio::time::Instant::now() + self.timeout,
             emitter,
         };
         config_guard.disarm();
-        tokio::spawn(supervise(ctx, child, status, cancel_rx));
-        StartLoginOutcome::Started
+        attempt.process_owned.store(true, Ordering::SeqCst);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tokio::spawn(subscribe_and_supervise(
+            ctx,
+            child,
+            self.subscriber.clone(),
+            api,
+            cancel_rx,
+            ready_tx,
+        ));
+        ready_rx
+            .await
+            .unwrap_or_else(|_| StartLoginOutcome::Failed("processExited".into()))
     }
 }
 
@@ -703,6 +1154,9 @@ fn generate_login_api_secret() -> Result<String, String> {
 /// supervisor 任务的入参束（避免 `too_many_arguments`）。
 struct SuperviseCtx {
     shared: Arc<Shared>,
+    attempt: Arc<Attempt>,
+    attempt_id: String,
+    done: watch::Sender<bool>,
     server_id: String,
     node_name: String,
     /// 单条映射 `server.name → server.id`：喂给 [`decode_tailscale_status`]，顺带把「别的 tag」的
@@ -714,7 +1168,7 @@ struct SuperviseCtx {
     /// 核一退它就是一份没人再用、却仍躺在盘上的凭据 —— 生命周期该跟核一致。
     config_path: PathBuf,
     epoch: u64,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
     emitter: Arc<dyn AuthUrlEmitter>,
 }
 
@@ -731,6 +1185,44 @@ enum ExitReason {
     /// STATUS 流内部终止（`ReconnectingStream` 正常永不如此）。没有流就没有任何判据来源
     /// （不回退 stdout，见模块头），继续挂着只是让核空跑到超时 → 就地收核。
     StatusStreamEnded,
+    InvalidAuthUrl,
+}
+
+async fn subscribe_and_supervise(
+    ctx: SuperviseCtx,
+    mut child: Box<dyn LoginCoreChild>,
+    subscriber: Arc<dyn LoginStatusSubscriber>,
+    api: TailscaleLoginApiService,
+    mut cancel_rx: oneshot::Receiver<()>,
+    ready: oneshot::Sender<StartLoginOutcome>,
+) {
+    let result = tokio::select! {
+        () = ctx.attempt.cancellation() => Err(("cancelled", "cancelled")),
+        _ = &mut cancel_rx => Err(("cancelled", "cancelled")),
+        () = tokio::time::sleep_until(ctx.deadline) => Err(("timedOut", "authorizationTimedOut")),
+        result = subscriber.subscribe(api.port, &api.secret) => result.map_err(|_| ("failed", "statusSubscriptionFailed")),
+    };
+    match result {
+        Ok(status) => {
+            let _ = ready.send(StartLoginOutcome::Started);
+            supervise(ctx, child, status, cancel_rx).await;
+        }
+        Err((phase, reason)) => {
+            child.terminate().await;
+            remove_login_config(&ctx.config_path);
+            ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
+            ctx.done.send_replace(true);
+            ctx.emitter
+                .progress(&ctx.server_id, &ctx.attempt_id, phase, Some(reason), None);
+            ctx.attempt.finish();
+            let outcome = if phase == "cancelled" {
+                StartLoginOutcome::Cancelled
+            } else {
+                StartLoginOutcome::Failed(reason.into())
+            };
+            let _ = ready.send(outcome);
+        }
+    }
 }
 
 /// 单个瞬态登录核的后台 supervisor：消费 STATUS 流（authURL → 事件、Running → 收核）、
@@ -741,23 +1233,27 @@ async fn supervise(
     mut status: Box<dyn LoginStatusStream>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) {
-    // stdout/stderr 的排空**不在这里**：它在 `start_login` 构造 `SpawnRequest` 时就接好了，
+    // stdout/stderr 的排空**不在这里**：它在 `start_attempt` 构造 `SpawnRequest` 时就接好了，
     // spawner 返回之前已经生效。放在 supervise 里曾经意味着「spawn 与接管之间有一段没人读的
     // 窗口」，而那正是本轮根因缺陷的形态（测速临时核那条腿连这一步都没有）。
     // 登录状态机（`polaris_mesh`，纯逻辑已单测）：它同时承担「同一 URL 反复到达不重复通知用户」
     // 与「后到的 authURL 不得把已登录态打回去」两条不变式，此处不再另写去重标志。
     let mut state = LoginState::Idle;
-    let sleep = tokio::time::sleep(ctx.timeout);
+    let sleep = tokio::time::sleep_until(ctx.deadline);
     tokio::pin!(sleep);
 
     let reason = loop {
         tokio::select! {
             _ = &mut cancel_rx => break ExitReason::Cancelled,
+            () = ctx.attempt.cancellation() => break ExitReason::Cancelled,
             () = &mut sleep => break ExitReason::TimedOut,
             () = child.wait() => break ExitReason::SelfExit,
             frame = status.recv() => {
                 let Some(update) = frame else { break ExitReason::StatusStreamEnded };
-                state = apply_status_frame(&ctx, &state, &update);
+                state = match apply_status_frame(&ctx, &state, &update) {
+                    Ok(state) => state,
+                    Err(()) => break ExitReason::InvalidAuthUrl,
+                };
                 if state == LoginState::LoggedIn {
                     break ExitReason::LoggedIn;
                 }
@@ -779,8 +1275,7 @@ async fn supervise(
         }
         ExitReason::TimedOut => {
             log::warn!(
-                "瞬态登录核 {:?} 内未完成登录 → 超时终止：server={}",
-                ctx.timeout,
+                "瞬态登录核未在授权期限内完成登录 → 超时终止：server={}",
                 ctx.server_id
             );
             child.terminate().await;
@@ -801,11 +1296,26 @@ async fn supervise(
             );
             child.terminate().await;
         }
+        ExitReason::InvalidAuthUrl => {
+            child.terminate().await;
+        }
     }
     // 核已收割 → 删掉带 secret 的临时 config。
     remove_login_config(&ctx.config_path);
     // reap 后注销（epoch 守卫：不误删 kill-on-relogin 后的新代次表项）。
     ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
+    ctx.done.send_replace(true);
+    let (phase, reason) = match reason {
+        ExitReason::LoggedIn => ("authorized", None),
+        ExitReason::Cancelled => ("cancelled", None),
+        ExitReason::TimedOut => ("timedOut", Some("authorizationTimedOut")),
+        ExitReason::SelfExit => ("failed", Some("processExited")),
+        ExitReason::StatusStreamEnded => ("failed", Some("statusStreamEnded")),
+        ExitReason::InvalidAuthUrl => ("failed", Some("invalidAuthUrl")),
+    };
+    ctx.emitter
+        .progress(&ctx.server_id, &ctx.attempt_id, phase, reason, None);
+    ctx.attempt.finish();
 }
 
 /// 删掉本次登录写盘的临时 config（内含一次性管理 API secret）。best-effort：
@@ -821,10 +1331,22 @@ fn remove_login_config(path: &Path) {
     }
 }
 
-/// 以独占创建 + Unix 0600 落含 bearer secret 的瞬态配置。
+/// 独占创建携密配置：Unix 0600；Windows 同既有 ConfigFs 写入，继承用户 app_config 目录 ACL。
+/// 此处不声称单独设置了 Windows DACL。
 ///
 /// `create_new` 同时拒绝已存在文件和符号链接，避免可预测文件名被预置后覆盖其它路径；旧的崩溃残件
 /// 宁可让本次登录明确失败，也不能复用/截断一个身份不明的 inode。
+fn create_login_parent(root: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(root)
+}
+
 fn write_login_config_secure(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -836,7 +1358,12 @@ fn write_login_config_secure(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(bytes)
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 struct LoginConfigGuard<'a> {
@@ -870,12 +1397,21 @@ fn apply_status_frame(
     ctx: &SuperviseCtx,
     current: &LoginState,
     update: &daemon::TailscaleStatusUpdate,
-) -> LoginState {
+) -> Result<LoginState, ()> {
+    if update.endpoints.iter().any(|ep| {
+        ctx.tag_to_id.contains_key(&ep.endpoint_tag)
+            && !ep.auth_url.is_empty()
+            && (ep.backend_state != "Running" || ep.self_.as_ref().is_some_and(|peer| peer.expired))
+            && crate::runtime::tailscale_status::validated_tailscale_auth_url(&ep.auth_url)
+                .is_none()
+    }) {
+        return Err(());
+    }
     let mut state = current.clone();
     for ev in decode_tailscale_status(update, &ctx.tag_to_id) {
         // 登录成功判据 = **backendState 字面为 Running**，不是 `logged_in`（后者含 `Starting`，那还
         // 只是「在连」；上游 `handleTransientTailscaleStatus` 同样只认 Running）。
-        if ev.backend_state == "Running" {
+        if ev.backend_state == "Running" && !ev.expired {
             state = advance_login_state(&state, &LoginEvent::StatusRunning);
         }
         if let Some(url) = ev.auth_url {
@@ -883,13 +1419,20 @@ fn apply_status_frame(
             // 状态真的变了才发：同一 URL 每帧都来（核只在换 URL 时才换值），发一次就够。
             if next != state {
                 if let LoginState::AwaitingAuth(u) = &next {
+                    ctx.emitter.progress(
+                        &ctx.server_id,
+                        &ctx.attempt_id,
+                        "awaitingAuth",
+                        None,
+                        Some(u),
+                    );
                     ctx.emitter.emit_auth_url(&ctx.server_id, &ctx.node_name, u);
                 }
             }
             state = next;
         }
     }
-    state
+    Ok(state)
 }
 
 /// server id → 安全文件名片段（防路径穿越；非字母数字/-/_ 归一为 `_`）。

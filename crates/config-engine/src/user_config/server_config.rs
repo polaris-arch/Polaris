@@ -201,6 +201,8 @@ pub struct WireGuardSettings {
     pub reserved: Vec<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<u32>,
     #[serde(rename = "reverseMesh", skip_serializing_if = "Option::is_none")]
     pub reverse_mesh: Option<bool>,
     #[serde(rename = "warpDevice", skip_serializing_if = "Option::is_none")]
@@ -288,22 +290,12 @@ pub struct TailscaleSettings {
 ///
 /// **两者的出现率证据不同强度，分开记**（真机 60 节点配置实测均 0/60，但那只是一台机器一份配置）：
 ///
-/// - `tailscaleSettings` 有**近似结构性的上限**：`store/src/sanitize.rs` 的 `first_tailscale`
-///   只留第一个 tailscale 节点、其余整条剔除（前端 `tailscaleSlotTaken` 同源）。
-///   ⚠️ 该闸**只按 `protocol == "tailscale"` 计数**，且同函数里那段 `tailscaleSettings` 清洗对**所有**
-///   保留节点都跑、只洗 CIDR 不剥键 ⇒ 一个协议不是 tailscale 却挂着该键的脏节点既不占槽也不被清掉。
-///   所以准确说法是「**tailscale 协议节点**恒 ≤ 1」，不是「该键的出现率恒 ≤ 1/n」。实践上后者仍成立
-///   （没有写入路径会给非 TS 节点造这个键），但它是经验而非闸门保证。
-///
-/// - `wireguardSettings` **能被订阅量产，N 无界** —— 这条别再写成「量产腿产不出它」：
-///   三条量产导入腿里，分享链接侧 `wireguard://` 不在 `is_supported_share_url`（实测）、Clash 侧
-///   `clash_parser.rs` 恒填 `None`（WG 不在 Clash proxies 支持面），**但 sing-box JSON 订阅这条腿能**：
-///   `subscription.rs` 的 `SingboxJson` 分支无条件把 `endpoints[]` 交给 `parse_singbox_endpoints`，
-///   那里的 `"wireguard"` 臂**不看 `origin`**（隔壁 `openconnect`/`openvpn-client` 臂才有
-///   `if origin != ImportOrigin::LocalFile` 闸），直接进 `map_wireguard_endpoint` 填本字段；而订阅刷新
-///   正是以 `ImportOrigin::RemoteSubscription` 调进来的。前端批量准入 `meshSingletonConflict` 也只挡
-///   WARP 与 tailscale，普通 WG **不占槽、无上限**。「机场下发 WireGuard 组网」本就是这条腿的立项理由
-///   （见 `parse_subscription` 头注）。
+/// - `tailscaleSettings` 与 `wireguardSettings` 都允许多个 userspace 节点。仅实际生成 System
+///   接口时，配置生成侧按协议各限一个，避免同名 `polaris-ts` / `polaris-wg` 冲突；
+///   存储清洗不删用户的第二个 Tailscale 节点。出现率仍是经验观测，不是节点数上限。
+/// - `wireguardSettings` **能被订阅量产，N 无界**：sing-box JSON endpoint 与 mihomo/Clash
+///   `type: wireguard` 都可导入为本字段。普通 userspace WG 不占单例槽；System WG 只在实际生成时
+///   受同名内核接口约束。导入面演进时别再凭旧注释把 Clash WG 当成不支持。
 ///
 /// **即便如此仍该装**，因为盈亏平衡点极高：WG 内联 216 B，装箱后在场节点付 `8 B + 224 B` glibc chunk
 /// （`align16(216+8)`）= 232 B ⇒ 每节点亏 **16 B**；缺席节点省 `216−8 = 208 B` ⇒

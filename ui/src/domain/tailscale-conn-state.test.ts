@@ -82,7 +82,17 @@ describe('接线：App.tsx 的 STATUS 订阅必须过这道门', () => {
   it('onTailscaleStatus 回调里先判 isDefinitiveTsLoginFrame 再写 store', () => {
     const at = SRC.indexOf('api.proxy.onTailscaleStatus(');
     expect(at, '订阅锚点消失，守卫已失去判据').toBeGreaterThan(-1);
-    const body = SRC.slice(at, at + 400);
+    const open = SRC.indexOf('=> {', at) + 3;
+    expect(open).toBeGreaterThan(at);
+    let depth = 0;
+    let end = open;
+    do {
+      if (SRC[end] === '{') depth++;
+      if (SRC[end] === '}') depth--;
+      end++;
+    } while (depth > 0 && end < SRC.length);
+    expect(depth, 'STATUS 回调花括号未闭合').toBe(0);
+    const body = SRC.slice(open, end);
     expect(body).toContain('isDefinitiveTsLoginFrame(data)');
     // 顺序有牙：门必须排在写入之前，排后面等于没门。
     expect(body.indexOf('isDefinitiveTsLoginFrame')).toBeLessThan(

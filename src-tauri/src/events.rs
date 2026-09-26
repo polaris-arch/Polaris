@@ -193,6 +193,7 @@ pub mod channel {
 
     // Tailscale
     pub const EVENT_TAILSCALE_AUTH_URL: &str = "event:tailscaleAuthUrl";
+    pub const EVENT_TAILSCALE_LOGIN_PROGRESS: &str = "event:tailscaleLoginProgress";
     pub const EVENT_TAILSCALE_STATUS: &str = "event:tailscaleStatus";
     /// Taildrop 发件任务完整快照（开始、逐文件进度、取消与终态共用同一载荷）。
     pub const EVENT_TAILDROP_TASK_UPDATED: &str = "event:taildropTaskUpdated";

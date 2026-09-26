@@ -607,6 +607,15 @@ jobs:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test kernel_accepts_full_config
 
+      - name: Kernel accepts local and remote subscription imports
+        if: env.POLARIS_RUN_KERNEL_GATES == '1'
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: |
+          cargo test -p polaris-net-stack --lib singbox_import::tests::local_import_round_trips_through_the_bundled_core -- --exact
+          cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
+          cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
+
       # 网络场景起核门：真 `run`（只监听 127.0.0.1，不建 TUN）验证环境条件规则的 Start 期引用——
       # `check` 拦不住引用不存在/类型不支持的 DNS server。dhcp 用例只在 Linux 且证明发不出包时跑，其余平台跳过。
       - name: Kernel starts configs with network-profile rules (network-profile runtime gate)

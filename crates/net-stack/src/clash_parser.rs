@@ -22,6 +22,10 @@ use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, 
 use polaris_config_engine::user_config::tls_pin::{drop_unemitted_cert_pins, keep_valid_cert_pins};
 use serde_yaml::Value;
 
+mod hysteria_import;
+mod openvpn_import;
+mod wireguard_import;
+
 /// Structure budget for Clash documents.
 ///
 /// JSON runs a byte-level structural preflight before `serde_json` allocates its AST, then this
@@ -261,6 +265,9 @@ fn is_supported_clash_type(p: Protocol) -> bool {
             | Protocol::Trojan
             | Protocol::Shadowsocks
             | Protocol::Hysteria2
+            | Protocol::Hysteria
+            | Protocol::Wireguard
+            | Protocol::OpenvpnClient
             | Protocol::Tuic
             | Protocol::Anytls
             | Protocol::Snell
@@ -276,6 +283,9 @@ fn normalize_clash_type(raw: &Value) -> Option<Protocol> {
     let p = match t.as_str() {
         "ss" | "shadowsocks" => Protocol::Shadowsocks,
         "hysteria2" | "hy2" => Protocol::Hysteria2,
+        "hysteria" | "hy" => Protocol::Hysteria,
+        "wireguard" | "wg" => Protocol::Wireguard,
+        "openvpn" => Protocol::OpenvpnClient,
         "socks5" | "socks" => Protocol::Socks,
         "http" | "https" => Protocol::Http,
         "vless" => Protocol::Vless,
@@ -285,7 +295,7 @@ fn normalize_clash_type(raw: &Value) -> Option<Protocol> {
         "anytls" => Protocol::Anytls,
         "snell" => Protocol::Snell,
         "ssh" => Protocol::Ssh,
-        // ssr/wireguard/hysteria(v1)/mieru/direct/dns 等 → 不支持
+        // ssr/mieru/direct/dns 等仍无等价模型。
         //
         // ⚠️ mihomo 的 `masque` **不要**映射到 `Protocol::MasqueClient`，两边只是同名：mihomo 那支是 WARP
         // 客户端（写死 Cloudflare 的 SNI 与 `cf-connect-ip` 升级令牌、凭据是 ECDSA 密钥对，字段
@@ -1105,6 +1115,14 @@ fn map_node(
         .and_then(str)
         .unwrap_or_else(|| "(未命名)".to_string());
 
+    if protocol == Protocol::Wireguard {
+        return match wireguard_import::parse_wireguard_proxy(m, subscription_id, now, id_gen()) {
+            Ok(server) => NodeOutcome::Server(Box::new(server)),
+            Err(reason) if reason.contains("多 peer") => NodeOutcome::Skip { reason },
+            Err(reason) => NodeOutcome::Fail { reason },
+        };
+    }
+
     let server = m.get("server").and_then(str);
     let port = m.get("port").and_then(num);
     if server.is_none() || port.is_none() {
@@ -1119,6 +1137,12 @@ fn map_node(
             .ok_or_else(|| format!("节点 \"{name}\" 缺 server/port"))?;
 
         match protocol {
+            Protocol::OpenvpnClient => {
+                config = openvpn_import::parse_openvpn_proxy(m, config)?;
+            }
+            Protocol::Hysteria => {
+                hysteria_import::apply_hysteria_proxy(m, &mut config)?;
+            }
             Protocol::Vless => {
                 let uuid = m.get("uuid").and_then(str);
                 let uuid = uuid.ok_or_else(|| format!("vless 节点 \"{name}\" 缺 uuid"))?;
@@ -1510,7 +1534,7 @@ fn map_node(
                 }
             }
             _ => {
-                // wireguard/tailscale/naive/custom 不在 Clash proxies 支持（Clash 走 endpoint）。
+                // 其余协议无可保真的 mihomo 映射。
                 return Ok(NodeOutcome::Skip {
                     reason: format!("{protocol:?}").to_ascii_lowercase(),
                 });
@@ -1583,6 +1607,11 @@ pub fn parse_clash_proxies(
         }
     }
 
+    if let Some(count) = skip_by_reason.get("masque") {
+        result.warnings.push(format!(
+            "跳过 {count} 个 mihomo MASQUE 节点：需 ECDSA 客户端证书、服务端公钥校验及 cf-connect-ip；固定核的 masque-client 使用不同认证和 connect-ip，不能等价转换"
+        ));
+    }
     if !skip_by_reason.is_empty() {
         let detail = skip_by_reason
             .iter()

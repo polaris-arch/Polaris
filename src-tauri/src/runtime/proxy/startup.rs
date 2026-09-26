@@ -1184,6 +1184,13 @@ impl ProxyRuntime {
             // 与长度，失败时才能只扫本腿，不把上一次会话的 FATAL 误当本次真因。
             let startup_log_cursor = self.startup_log_cursor(via_helper);
 
+            self.mesh
+                .reserve_tailscale_main_states(&serde_json::to_value(&singbox_config).map_err(
+                    |_| {
+                        StartError::from("Cannot identify Tailscale endpoint ownership".to_string())
+                    },
+                )?)
+                .await;
             let t_spawn = std::time::Instant::now();
             let pid = if via_helper {
                 // 经 helper 起（阻塞 IPC 挪 spawn_blocking；helper 核无本地 child 句柄）。
@@ -1551,6 +1558,12 @@ impl ProxyRuntime {
         if let Ok(mut g) = self.current_config.write() {
             *g = Some(config.clone());
         }
+        self.mesh.release_tailscale_main_states();
+        self.mesh
+            .reserve_tailscale_main_states(&serde_json::to_value(&singbox_config).map_err(
+                |_| StartError::from("Cannot identify Tailscale endpoint ownership".to_string()),
+            )?)
+            .await;
         if let Ok(mut snap) = self.startup_snapshot.write() {
             *snap = Some(config);
         }

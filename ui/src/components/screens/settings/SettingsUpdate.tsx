@@ -25,6 +25,7 @@ import {
   backgroundIntervalSelectValue,
   ruleResourceAutoStatus,
   ruleResourceAutoUpdateChecked,
+  ruleResourceAutoUpdatePatch,
   subscriptionAutoUpdateStatus,
 } from './settings-logic';
 
@@ -142,12 +143,7 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
           <Switch
             id="res-auto-swt"
             checked={ruleResourceAutoUpdateChecked(config)}
-            onChange={(value) =>
-              void update({
-                ruleResourceAutoUpdate: value,
-                ruleResourceUpdateIntervalHours: config.subscriptionUpdateIntervalHours,
-              })
-            }
+            onChange={(value) => void update(ruleResourceAutoUpdatePatch(value))}
             aria-label={t('settings.update.ruleResourceAutoCard')}
           />
         </SetRow>

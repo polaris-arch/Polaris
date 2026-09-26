@@ -126,6 +126,21 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: NO_LEG,
     why: '同 `singbox_import.rs`：模块的测试实体与真核往返测试都在这里。',
   },
+  'crates/net-stack/src/clash_parser.rs': {
+    kernel: true,
+    platforms: NO_LEG,
+    why: 'mihomo 协议映射生成 sing-box 配置；远端订阅协议对齐门须拿随包核 check。不改包内容。',
+  },
+  'crates/net-stack/src/clash_parser/': {
+    kernel: true,
+    platforms: NO_LEG,
+    why: '同 `clash_parser.rs`：协议映射与回归测试在这里。',
+  },
+  'crates/net-stack/tests/fixtures/assets/openvpn-test-ca.txt': {
+    kernel: true,
+    platforms: NO_LEG,
+    why: '导入协议真核门使用的公开测试 CA；证书夹具变化同样须回放内核 check。',
+  },
   'crates/helper/': {
     kernel: false,
     platforms: ALL,

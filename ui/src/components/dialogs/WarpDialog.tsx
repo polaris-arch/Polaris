@@ -13,7 +13,7 @@
  * R1：`key` 绑编辑目标 id（见导出包装）+ useState 同步初始化。
  */
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
@@ -21,7 +21,7 @@ import { useStagedConfigStore } from '@/store/staged-config-store';
 import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 import { api } from '@/ipc';
 import type { ServerConfig, WireGuardSettings } from '@/contracts/types';
-import { findWarpNode, WARP_MTU, type WarpWireGuardDraft } from '@/domain/warp';
+import { findWarpNode, WARP_MTU } from '@/domain/warp';
 import { registerWarpIfSlotFree } from '@/domain/mesh-singleton-guard';
 import { Modal } from './Modal';
 import {
@@ -34,11 +34,12 @@ import {
 import { applyDetour, endpointDetourOptions, DETOUR_NONE } from './detour-options';
 // 表单 → WireGuardSettings 的整段接线共用 `wg-logic.ts`；WARP 内部的路由/接入模式也在提交边界收口，
 // 不能只靠「界面没展示」来假定旧配置里不存在。
-import { buildWarpSettings } from './wg-logic';
+import { buildWarpSettings, workersInputInvalid } from './wg-logic';
 import { applyOnDemand, onDemandDraftValue, ON_DEMAND_FIELD } from './on-demand-field';
 import { useDialogStore } from './dialog-store';
 import { InfoIcon } from '@/components/InfoIcon';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
+import { executeWarpRegistration, type WarpRegistrationSession } from './warp-registration';
 
 function WarpIcon() {
   return (
@@ -81,6 +82,7 @@ function advSpec(
   return [
     { t: 'text', k: 'endpoint', label: 'warp.endpoint', ph: endpointPlaceholder, mono: true },
     { t: 'number', k: 'mtu', label: 'warp.mtu', ph: String(WARP_MTU), mono: true, opt: true },
+    { t: 'number', k: 'workers', label: 'wg.workers', hint: 'wg.workersHint', mono: true, opt: true },
     { t: 'number', k: 'keepalive', label: 'warp.keepalive', ph: '25', mono: true, opt: true },
     // 前置代理 —— **对 上游的有意偏离**（它的 WARP 表单没有这一项）。本轮之前这个控件是个
     // **装饰开关**：值写进了 `server.detour`，但 Rust 侧 `Endpoint` 结构体压根没有 detour 字段，
@@ -129,6 +131,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       ? {
           endpoint: `${editNode.address}:${editNode.port}`,
           mtu: initWs?.mtu,
+          workers: initWs?.workers,
           keepalive: initWs?.persistentKeepalive,
           detour: editNode.detour || DETOUR_NONE,
           bindInterface: editNode.bindInterface ?? '',
@@ -137,6 +140,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       : {
           endpoint: '',
           mtu: undefined,
+          workers: undefined,
           keepalive: undefined,
           detour: DETOUR_NONE,
           bindInterface: '',
@@ -159,6 +163,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const registration = useRef<WarpRegistrationSession>({});
 
   const setField = (k: string, v: FormValue) => {
     setDraft((d) => ({ ...d, [k]: v }));
@@ -195,31 +200,36 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
     // 单例闸**前置到 CF 请求之前**：registerWarp 在 Cloudflare 侧真建一台匿名设备（远端副作用、
     // 本地拦不回来）。接入区卡片只在「打开弹窗那一刻」无 WARP 时才给入口，弹窗停留期间槽位可能被
     // 克隆/导入/WgDialog 抢走 —— 那时先打请求再拦 = 白烧一台孤儿设备。闸不过：toast + 返回 null，零请求。
-    const draftResp: WarpWireGuardDraft | null = await registerWarpIfSlotFree(servers, t, () =>
-      api.server.registerWarp(plan === 'plus' ? license.trim() : undefined),
-    );
-    if (!draftResp) return false; // 已 toast；保持弹窗打开，用户可取消或先去处理现有 WARP
-    const base: Partial<WireGuardSettings> = {
-      privateKey: draftResp.privateKey,
-      localAddress: draftResp.localAddress,
-      peerPublicKey: draftResp.peerPublicKey,
-      reserved: draftResp.reserved,
-      warpDevice: draftResp.warpDevice,
-    };
-    const settings = settingsOverride(base);
-    const server: Omit<ServerConfig, 'id'> = {
-      name: name.trim(),
-      protocol: 'wireguard',
-      address: endpointOverride?.host ?? draftResp.address,
-      port: endpointOverride?.port ?? draftResp.port,
-      wireguardSettings: settings,
-    };
-    applyDetour(server, currentDetour);
-    applyOnDemand(server, draft.onDemand);
-    const bindInterface = String(draft.bindInterface ?? '').trim();
-    if (bindInterface) server.bindInterface = bindInterface;
-    await api.server.add(server);
-    return true;
+    return executeWarpRegistration(registration.current, {
+      register: () => registerWarpIfSlotFree(servers, t, () =>
+        api.server.registerWarp(plan === 'plus' ? license.trim() : undefined)),
+      mintId: () => crypto.randomUUID(),
+      build: (draftResp, id) => {
+        const settings = settingsOverride({
+          privateKey: draftResp.privateKey,
+          localAddress: draftResp.localAddress,
+          peerPublicKey: draftResp.peerPublicKey,
+          reserved: draftResp.reserved,
+          warpDevice: draftResp.warpDevice,
+        });
+        const server: ServerConfig = {
+          id,
+          name: name.trim(),
+          protocol: 'wireguard',
+          address: endpointOverride?.host ?? draftResp.address,
+          port: endpointOverride?.port ?? draftResp.port,
+          wireguardSettings: settings,
+        };
+        applyDetour(server, currentDetour);
+        applyOnDemand(server, draft.onDemand);
+        const bindInterface = String(draft.bindInterface ?? '').trim();
+        if (bindInterface) server.bindInterface = bindInterface;
+        return server;
+      },
+      save: (server) => api.server.add(server),
+      refresh: () => loadConfig(true),
+      readback: async () => (await api.config.get()).servers ?? [],
+    });
   };
 
   const doEdit = async (ep: { host: string; port: number }) => {
@@ -268,6 +278,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
   };
 
   const handleSubmit = async () => {
+    if (submitting) return;
     if (done) {
       close();
       return;
@@ -287,6 +298,10 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       toast.error(t('warp.errEndpoint'));
       return;
     }
+    if (workersInputInvalid(draft.workers)) {
+      toast.error(t('wg.errWorkers'));
+      return;
+    }
     setSubmitting(true);
     try {
       if (isEdit) {
@@ -296,7 +311,6 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       } else {
         const registered = await doRegister(ep);
         if (registered) {
-          void loadConfig(true);
           setDone(true);
         }
       }

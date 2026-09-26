@@ -308,7 +308,8 @@ pub struct OpenconnectSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
+    /// 内核的 OTP 设置对象；Value 保留旧配置中的字符串形态供读取，远端导入只接收对象。
+    pub token: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

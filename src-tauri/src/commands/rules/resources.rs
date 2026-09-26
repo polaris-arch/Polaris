@@ -711,10 +711,9 @@ async fn redownload_with_mode(
     Ok(ApiResponse::ok(result.into_value(&plan)))
 }
 
-/// 上游 `RULE_RESOURCES_UPDATE_ALL`：更新全部已登记资源（**真下载**）。
+/// `RULE_RESOURCES_UPDATE_ALL`：更新全部已登记外置资源与内置注册表资源（**真下载**）。
 ///
-/// 逐个 redownload `config.ruleResources` 里的每一项，返回 `RuleResourceDownloadResult[]`（数组，
-/// 对齐前端 `.map()` 契约）。逐 item 独立容错；成功项一次性 upsert + 保存 + 广播。
+/// 逐个更新外置资源和真实注册表里的全部内置项，逐项容错并返回结果；整批只广播一次。
 #[tauri::command]
 pub async fn rule_resources_update_all(
     app: AppHandle,
@@ -733,7 +732,8 @@ pub async fn rule_resources_update_all(
     let http = state.http().clone();
     let gh_prefix = gh_proxy_prefix(&state);
 
-    let mut results: Vec<Value> = Vec::with_capacity(raw_entries.len());
+    let builtins = builtin_geo_rulesets();
+    let mut results: Vec<Value> = Vec::with_capacity(raw_entries.len() + builtins.len());
     let mut stored: Vec<RuleResource> = Vec::new();
     for entry in &raw_entries {
         // 结构非法的条目**如实报失败**（P8）——旧实现 `filter_map(.ok())` 静默丢弃：既不更新也不出现在结果里。
@@ -757,7 +757,36 @@ pub async fn rule_resources_update_all(
         results.push(outcome.into_value(&plan));
     }
     if !stored.is_empty() {
-        persist_resources(&app, &state, &stored, BroadcastMode::Immediate);
+        persist_resources(&app, &state, &stored, BroadcastMode::Deferred);
+    }
+    let mut builtin_ok = false;
+    for builtin in builtins {
+        let result = update_builtin_with_mode(
+            &app,
+            &state,
+            builtin.tag.clone(),
+            ProgressMode::Live,
+            BroadcastMode::Deferred,
+        )
+        .await
+        .ok()
+        .and_then(|response| response.data)
+        .unwrap_or_else(|| {
+            err_result(
+                Some(&builtin_id_for(&builtin.tag)),
+                Some(&builtin.tag),
+                "内置规则集更新失败",
+                ERR_RESOURCE_WRITE_FAILED,
+            )
+        });
+        builtin_ok |= result.get("ok").and_then(Value::as_bool) == Some(true);
+        results.push(result);
+    }
+    if !stored.is_empty() || builtin_ok {
+        match state.config().current() {
+            Ok(latest) => broadcast_config_changed(&app, &latest),
+            Err(error) => log::warn!("规则资源整批更新已落盘，但读回配置广播失败: {error}"),
+        }
     }
     Ok(ApiResponse::ok(results))
 }
@@ -1082,44 +1111,107 @@ async fn update_builtin_with_mode(
         )));
     };
     let plan = plan_from_builtin(&b).with_gh_proxy(&gh_proxy_prefix(state));
-    let runtime_dir = builtin_runtime_dir(state);
-    // 暂存区放在生效目录**之内**：跨目录 rename 只有同一文件系统才原子，同父目录是最稳的保证
-    // （`<userData>` 与临时目录可能分属不同挂载点）。
-    let stage_dir = runtime_dir.join(".update");
     let http = state.http().clone();
     let sink = BroadcastSink { app, mode };
-    let outcome =
-        download_with_progress(&sink, http.as_ref(), &SystemDnsLookup, &plan, &stage_dir).await;
+    let outcome = update_builtin_resource(
+        &sink,
+        http.as_ref(),
+        &SystemDnsLookup,
+        &plan,
+        &builtin_runtime_dir(state),
+        |resource| {
+            persist_builtin_geo_updated(app, state, &b.tag, &resource.downloaded_at, broadcast)
+        },
+    )
+    .await;
+    Ok(ApiResponse::ok(outcome.into_value(&plan)))
+}
 
-    let outcome = match outcome {
-        DownloadOutcome::Stored { resource, .. } => {
-            let staged = stage_dir.join(&plan.file_name);
-            let live = runtime_dir.join(&plan.file_name);
-            // `existedBefore` 要看**生效副本**存不存在，不是暂存区（那儿必然是新建的）。
-            let existed_before = live.is_file();
-            match std::fs::rename(&staged, &live) {
-                Ok(()) => DownloadOutcome::Stored {
-                    resource,
-                    existed_before,
-                },
-                Err(e) => {
-                    let _ = std::fs::remove_file(&staged);
-                    DownloadOutcome::Failed {
-                        message: format!("替换生效副本失败: {e}"),
-                        code: ERR_RESOURCE_WRITE_FAILED,
-                    }
-                }
+/// 同 tag 的手动、后台和 all 更新共用这把锁，覆盖下载、替换与元数据保存。
+fn builtin_update_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Locks = Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(id.to_owned(), std::sync::Arc::downgrade(&lock));
+    lock
+}
+
+struct BuiltinStageDir(std::path::PathBuf);
+impl Drop for BuiltinStageDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(parent) = self.0.parent() {
+            let _ = std::fs::remove_dir(parent); // 只清空的 .update，不干扰其他 tag。
+        }
+    }
+}
+
+/// 暂存下载的 done 帧要等 live 替换和元数据持久化后再发，防止保存失败仍显示成功。
+struct PendingBuiltinCommit<'a>(&'a dyn ProgressSink);
+impl ProgressSink for PendingBuiltinCommit<'_> {
+    fn emit(&self, frame: Value) {
+        if frame.get("status").and_then(Value::as_str) != Some("done") {
+            self.0.emit(frame);
+        }
+    }
+}
+
+async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
+    sink: &dyn ProgressSink,
+    client: &H,
+    lookup: &L,
+    plan: &ResourcePlan,
+    runtime_dir: &Path,
+    persist: impl FnOnce(&RuleResource) -> Result<(), String>,
+) -> DownloadOutcome {
+    let lock = builtin_update_lock(&plan.id);
+    let _guard = lock.lock().await;
+    // 同盘且每次独立目录；取消/失败/函数退出均清理自己的暂存，不碰其他在途下载。
+    let stage = BuiltinStageDir(runtime_dir.join(".update").join(new_uuid()));
+    let outcome =
+        download_with_progress(&PendingBuiltinCommit(sink), client, lookup, plan, &stage.0).await;
+    let DownloadOutcome::Stored { resource, .. } = outcome else {
+        return outcome;
+    };
+    let live = runtime_dir.join(&plan.file_name);
+    let existed_before = live.is_file();
+    let committed = std::fs::rename(stage.0.join(&plan.file_name), &live)
+        .map_err(|error| format!("替换生效副本失败: {error}"))
+        .and_then(|()| persist(&resource));
+    match committed {
+        Ok(()) => {
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({ "received": resource.size, "total": resource.size,
+                    "percent": 100.0, "status": "done" }),
+            );
+            DownloadOutcome::Stored {
+                resource,
+                existed_before,
             }
         }
-        other => other,
-    };
-    // 只删空目录：非空说明有别的在途下载的暂存文件，硬删会打断它。
-    let _ = std::fs::remove_dir(&stage_dir);
-
-    if let DownloadOutcome::Stored { ref resource, .. } = outcome {
-        persist_builtin_geo_updated(app, state, &b.tag, &resource.downloaded_at, broadcast);
+        Err(message) => {
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({ "received": 0, "total": null, "percent": null, "status": "error",
+                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED }),
+            );
+            DownloadOutcome::Failed {
+                message,
+                code: ERR_RESOURCE_WRITE_FAILED,
+            }
+        }
     }
-    Ok(ApiResponse::ok(outcome.into_value(&plan)))
 }
 
 /// 记「该内置 tag 已网络更新过」：`config.builtinGeoMeta[tag].updatedAt = <ISO>`。
@@ -1134,7 +1226,7 @@ fn persist_builtin_geo_updated(
     tag: &str,
     updated_at: &str,
     broadcast: BroadcastMode,
-) {
+) -> Result<(), String> {
     match state.config().update(|cfg| {
         let Some(obj) = cfg.as_object_mut() else {
             return Decision::Skip(false);
@@ -1159,14 +1251,15 @@ fn persist_builtin_geo_updated(
             if broadcast == BroadcastMode::Immediate {
                 broadcast_config_changed(app, &cfg);
             }
+            Ok(())
         }
-        Ok((false, None)) => {
-            log::error!("内置 geo `{tag}` 已更新到盘上，但 config 根不是对象（更新标记未落）");
-        }
-        Ok(_) => log::error!("内置 geo `{tag}` 更新标记事务返回非法状态"),
-        Err(e) => {
-            log::error!("内置 geo `{tag}` 已更新到盘上，但保存 config 失败（更新标记未落）: {e}");
-        }
+        Ok((false, None)) => Err(format!(
+            "内置 geo `{tag}` 更新标记未保存：config 根不是对象"
+        )),
+        Ok(_) => Err(format!("内置 geo `{tag}` 更新标记事务返回非法状态")),
+        Err(e) => Err(format!(
+            "内置 geo `{tag}` 生效文件已替换，但更新标记保存失败，可重试: {e}"
+        )),
     }
 }
 
@@ -1652,8 +1745,13 @@ async fn download_and_store<H: HttpClient, L: DnsLookup>(
     // 但**写到一半失败**（磁盘满 / 断电 / 进程被杀）会把用户已有的那份规则资源截断成半截文件 ——
     // 而 SRS 魔数只校验前 3 字节，截断的尾部照样过校验，坏文件会一直被当好的用下去
     // （陈先生 2026-07-30：「规则更新的时候要确保更新失败不破坏已有资源」）。
-    // 临时名带 pid：同一资源两条在途下载（手动 + 后台调度）不会互相覆盖对方的半成品。
-    let tmp = res_dir.join(format!(".{}.{}.tmp", plan.file_name, std::process::id()));
+    // pid 不区分本进程的并发请求；独立 UUID 防止手动/后台下载互相覆盖临时文件。
+    let tmp = res_dir.join(format!(
+        ".{}.{}.{}.tmp",
+        plan.file_name,
+        std::process::id(),
+        new_uuid()
+    ));
     let staged = std::fs::create_dir_all(res_dir)
         .and_then(|()| std::fs::write(&tmp, &bytes))
         .and_then(|()| std::fs::rename(&tmp, &dest));
@@ -1697,10 +1795,10 @@ pub enum ProgressMode {
 ///
 /// # 为什么必须可延后（真机实证 2026-08-02）
 ///
-/// 后台保鲜一轮要更新 **8 条已登记资源 + 25 个内置 geo**，每条各自落盘 + 广播 ⇒ 一轮启动补更
+/// 后台保鲜一轮会更新已登记资源和内置 geo；逐条广播曾让一轮启动补更
 /// 打出 **33 次 `switch_mode`**（真机日志 11 秒内 35 条 `switchMode：核未运行 → 仅更新配置`）。
 /// 核没跑时只是刷屏；**核在跑时每条都进热切换/去抖重启判定** —— 每次启动补更与每 30 分钟巡检
-/// 都在给运行中的核连砸 33 次。而这一轮的语义本就是「一批」：批内每条的中间态没有任何消费者
+/// 都在反复触发运行中的核。而这一轮的语义本就是「一批」：批内每条的中间态没有任何消费者
 /// 需要看见。
 ///
 /// 落盘仍**逐条**（每条各自 `save_full`）：磁盘真值随下随记，批次中途崩溃只丢已下载条目的

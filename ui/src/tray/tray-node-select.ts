@@ -25,6 +25,7 @@ const PROTOCOL_SHORT: Record<string, string> = {
   tailscale: 'TS',
   shadowsocks: 'SS',
   hysteria2: 'Hy2',
+  'masque-client': 'MASQUE',
 };
 
 /** 协议短标签：命中短写表取短写，否则大写（对齐 上游 `PROTOCOL_SHORT[...] ?? toUpperCase()`）。 */

@@ -14,10 +14,31 @@ import {
   validateWgDraft,
   parseReserved,
   reservedInputInvalid,
+  workersInputInvalid,
   isWarpDraft,
   type WgDraft,
 } from './wg-logic';
 import type { ServerConfig, WireGuardSettings } from '@/contracts/types';
+
+describe('WireGuard workers 高级设置', () => {
+  it('导入值可回显、修改、清空；WARP 使用相同缺省语义', () => {
+    const base: ServerConfig = {
+      id: 'wg', name: 'WG', protocol: 'wireguard', address: 'wg.example', port: 51820,
+      wireguardSettings: { privateKey: 'p', peerPublicKey: 'q', localAddress: ['10.0.0.2/32'], workers: 4 },
+    };
+    const draft = draftFromServer(base);
+    expect(draft.workers).toBe(4);
+    expect(buildWgServer('WG', { ...draft, workers: 8 }, base).wireguardSettings?.workers).toBe(8);
+    expect(buildWgServer('WG', { ...draft, workers: undefined }, base).wireguardSettings?.workers).toBeUndefined();
+    expect(buildWarpSettings(base.wireguardSettings!, { workers: 8 }).workers).toBe(8);
+    expect(buildWarpSettings(base.wireguardSettings!, {}).workers).toBeUndefined();
+  });
+
+  it('留空和 0 自动；只接受 uint32 整数', () => {
+    for (const value of [undefined, '', 0, 4, 4294967295]) expect(workersInputInvalid(value)).toBe(false);
+    for (const value of [-1, 1.5, 4294967296, 'invalid']) expect(workersInputInvalid(value)).toBe(true);
+  });
+});
 
 const SAMPLE_CONF = `
 [Interface]

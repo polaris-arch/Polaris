@@ -186,11 +186,9 @@ impl ProxyRuntime {
         snap
     }
 
-    /// 运行中主核所用的用户配置快照（`current_config`）。Tailscale 瞬态登录去重守卫用：
-    /// 判该 TS 节点是否已在运行主核里（双写防护 `tailscale_endpoint_in_running_core`）。
-    /// 核未跑时 `current_config` 可能仍留上次配置 → 调用方须结合 `status().running` 短路。
-    pub(crate) fn current_config_snapshot(&self) -> Option<Value> {
-        self.current_config.read().ok().and_then(|g| g.clone())
+    /// Actual ready-core snapshot, updated only after startup succeeds; saved/pending configuration is separate.
+    pub(crate) fn running_config_snapshot(&self) -> Option<Value> {
+        self.startup_snapshot.read().ok().and_then(|g| g.clone())
     }
 
     /// 当前**运行核快照**里的接管模式；与磁盘 `config.current()` 刻意分离。
@@ -227,8 +225,14 @@ impl ProxyRuntime {
     }
 
     /// 核是否运行（`singboxProcess || singboxPid` 等价，上游 :1736）。
-    pub(super) fn core_running(&self) -> bool {
+    pub(crate) fn core_running(&self) -> bool {
         self.status.read().map(|g| g.running).unwrap_or(false)
+    }
+
+    pub(crate) fn tailscale_writer_alive(&self) -> bool {
+        self.core_running()
+            || self.core_via_helper.load(Ordering::SeqCst)
+            || self.pid.lock().ok().is_some_and(|pid| pid.is_some())
     }
 
     /// 世代 +1 **并唤醒在飞起核腿**（`start`/`stop`/`restart` 入口的唯一 bump 通道）。
@@ -269,6 +273,11 @@ impl ProxyRuntime {
         // 下面 `?` 早退（清扫 → ROOT_ORPHAN_BLOCKED）也归还计数。
         self.start_inflight.fetch_add(1, Ordering::SeqCst);
         let inflight = InflightGuard(Arc::clone(&self.start_inflight));
+        let my_gen = self.bump_generation();
+        let _tailscale_gate = self.mesh.tailscale_state_gate().await;
+        if self.gate.generation() != my_gen {
+            return Ok(self.status());
+        }
         // **每次** start 都清扫孤儿核（对齐 上游 :700），只杀「本 app 二进制起的」核——见
         // `cleanup_stale_cores`。孤儿不只来自上个会话崩溃，也来自本会话中途失败的起核尝试，
         // 故不能只清一次（见 `stale_sweep_disabled` 字段文档：那个门闩正是本次事故的放大器）。
@@ -290,16 +299,18 @@ impl ProxyRuntime {
         // 保存阶段只落期望配置与删除意图；真正的文件/state/远端注销必须等旧核已经不存在。
         // 冷启动与 restart 的 start 腿都在这里汇流。重复 start 若仍有运行核则跳过，绝不碰活会话资产。
         if !self.core_running() {
-            self.process_deferred_config_deletions();
+            self.process_deferred_config_deletions_under_gate(&_tailscale_gate);
         }
         // 用户/其它显式 start 接管后，清掉此前主动 stop 留下的自愈中止标记。状态机已有这一语义，
         // 这里补齐生产写侧；否则一旦主动停过，后续新会话真的崩溃也会被永久当作用户仍在阻止自愈。
         self.crash_lock().reset_user_aborted();
         // 世代 +1（上游 :632 start 入口）：本腿快照世代，被更新的 start/stop 接管即让位（#176）。
-        let my_gen = self.bump_generation();
         self.gate.begin();
         let t_start_inner = std::time::Instant::now();
         let r = self.start_inner(config, my_gen).await;
+        if !self.tailscale_writer_alive() {
+            self.mesh.release_tailscale_main_states();
+        }
         let start_inner_ms = t_start_inner.elapsed().as_millis();
         let t_terminal_settle = std::time::Instant::now();
         // end 恒执行（成功/失败/让位三路），否则 depth 永不归零 → 后续 apply 全被误判 deferred。
@@ -381,7 +392,7 @@ impl ProxyRuntime {
         if self.stop_inner().await? {
             // Stop 完成后旧核已不存在，已保存删除的保护对象随之消失：此刻就是与 Apply/冷启动同级的
             // 安全提交点。只消费后端 journal，**绝不**触碰渲染端尚未保存的 staged 条目。
-            self.process_deferred_config_deletions();
+            self.process_deferred_config_deletions().await;
             // 维度7 #8 对称收口（见方法文档）：marker 门控幂等，失败只记日志不阻断停止。
             self.clear_system_proxy().await;
         }
@@ -432,7 +443,15 @@ impl ProxyRuntime {
         // 唤醒在飞起核腿，**取消当场生效**而不是等它退避睡满（这就是「点了立刻停」的那一下）。
         let my_gen = self.bump_generation();
         self.gate.begin();
+        let _tailscale_gate = self.mesh.tailscale_state_gate().await;
+        if self.stop_superseded(my_gen, "tailscale_state_gate") {
+            self.finish_lifecycle(LifecycleKind::Stop);
+            return Ok(false);
+        }
         let kill_result = self.kill_core().await;
+        if kill_result.is_ok() {
+            self.mesh.release_tailscale_main_states();
+        }
         // 请求在飞期间若已被新 start/stop 接管，结果属于旧腿，不能覆盖接管方终态。
         if self.stop_superseded(my_gen, "kill_core") {
             self.finish_lifecycle(LifecycleKind::Stop);

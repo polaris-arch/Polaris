@@ -152,3 +152,24 @@ fn serialized_field_names_match_frontend_contract() {
     assert!(peer.get("exitNodeOption").is_some());
     assert_eq!(peer.get("stableID").and_then(|x| x.as_str()), Some("sid"));
 }
+
+#[test]
+fn auth_urls_require_web_scheme_and_host_but_allow_custom_headscale() {
+    for url in [
+        "https://login.tailscale.com/a/key",
+        "http://headscale.example:8080/register/key",
+        "https://hs.example/custom?token=value",
+    ] {
+        assert_eq!(validated_tailscale_auth_url(url).as_deref(), Some(url));
+    }
+    for url in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "ftp://hs.example/login",
+        "https://",
+        "/login",
+        "not a url",
+    ] {
+        assert!(validated_tailscale_auth_url(url).is_none());
+    }
+}

@@ -479,6 +479,8 @@ pub fn build_outbounds_with_runtime_bindings(
             }
             // dial 级解析器**必须给**：server 是域名时 1.14 initialize 会硬失败。
             let mut endpoint = build_vpn_client_endpoint(server, &tag, Some(&dial_resolver))?;
+            // VPN 端点同样拥有 dial detour；统一解析本地节点 id 并沿用环/失效目标守卫。
+            endpoint.detour = resolve_detour_tag(server, config, &id_to_tag);
             apply_bind_interface(&mut endpoint.extra, bind_interface.as_deref());
             apply_on_demand(&mut endpoint, server);
             pending_endpoints.push(endpoint);
@@ -868,12 +870,51 @@ pub fn build_outbounds_with_runtime_bindings(
         &mut pending_endpoints,
         selected_server,
     )?;
+    reject_duplicate_system_mesh_interfaces(&pending_endpoints)?;
 
     Ok(OutboundsResult {
         outbounds,
         pending_endpoints,
         pending_rule_selectors,
     })
+}
+
+/// System 模式的接口名由内核固定生成。多个同协议 endpoint 同时发射会抢同一接口；
+/// 这里只检查最终实际下发的 System endpoint，不删除用户节点、不限制 userspace 节点。
+fn reject_duplicate_system_mesh_interfaces(endpoints: &[Endpoint]) -> Result<(), String> {
+    type SystemProtocol = (&'static str, &'static str, fn(&Endpoint) -> bool);
+    let system_protocols: [SystemProtocol; 2] = [
+        (
+            "tailscale",
+            crate::builder::endpoint_routes::TS_SYSTEM_INTERFACE_NAME,
+            |ep: &Endpoint| {
+                ep.system_interface == Some(true)
+                    || ep.extra.get("system_interface") == Some(&serde_json::Value::Bool(true))
+            },
+        ),
+        (
+            "wireguard",
+            crate::builder::endpoint_routes::WG_SYSTEM_INTERFACE_NAME,
+            |ep: &Endpoint| {
+                ep.system == Some(true)
+                    || ep.extra.get("system") == Some(&serde_json::Value::Bool(true))
+            },
+        ),
+    ];
+    for (protocol, interface, uses_system) in system_protocols {
+        let tags: Vec<&str> = endpoints
+            .iter()
+            .filter(|ep| ep.type_field == protocol && uses_system(ep))
+            .map(|ep| ep.tag.as_str())
+            .collect();
+        if tags.len() > 1 {
+            return Err(format!(
+                "{protocol} System 接口「{interface}」一次只能运行一个节点；当前有：{}。请将多余节点改为 userspace 模式",
+                tags.join("、")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `server.detour`（**节点 id**）→ 生成集合里的 **outbound tag**；不可用一律 `None`。

@@ -269,13 +269,12 @@ fn object_or_remove(obj: &mut Map<String, Value>, key: &str) {
 ///
 /// Polaris 锚点 validateConfig servers 段：缺 id/name/未知协议/缺 address/port/协议必填缺失 → 剔除该节点；
 /// endpoint（WG/Tailscale）allowedIPs/routes/localAddress 非法 CIDR 丢弃保留合法；
-/// allowInternet 非 bool 删除；Tailscale 单节点硬限（保留第一个）。
+/// allowInternet 非 bool 删除；多个合法 Tailscale 节点均保留，System 接口冲突由生成侧判定。
 fn sanitize_servers(obj: &mut Map<String, Value>) {
     let Some(Value::Array(servers)) = obj.get_mut("servers") else {
         return;
     };
     let mut kept: Vec<Value> = Vec::with_capacity(servers.len());
-    let mut first_tailscale = false;
     for s in servers.drain(..) {
         let Some(so) = s.as_object() else {
             continue; // 非对象 → 丢弃
@@ -294,11 +293,7 @@ fn sanitize_servers(obj: &mut Map<String, Value>) {
         }
         // **无地址协议** / custom 豁免 address/port；其余必须有合法 address + port∈1..=65535。
         //
-        // 2026-08-11 拆分：此前这里叫 `account_based` 且只含 tailscale，同一个变量既当
-        // 「豁免 address/port」又当「单例硬限」的判据。tor 需要前者、**不需要**后者
-        // （它是内嵌客户端，可以有多个；实测给内核传 `server` 直接 `unknown field "server"`，
-        // 故它天生没有 address/port）。两个语义合用一个名字，加第二个成员时必然误伤。
-        // tailcat 同 tor：对端由服务端公钥 + DERP 定位，内核这支没有 server/server_port。
+        // TS/Tor/Tailcat 的对端由协议设置定位；System TS/WG 同名接口的运行约束不属于存储清洗。
         let addressless = matches!(proto_lower.as_str(), "tailscale" | "tor" | "tailcat");
         let is_custom = proto_lower == "custom";
         if !addressless && !is_custom {
@@ -315,13 +310,6 @@ fn sanitize_servers(obj: &mut Map<String, Value>) {
         // 协议必填校验（单一真值 crate::validate::protocol_requirement_ok）
         if !crate::validate::protocol_requirement_ok(&proto_lower, &s) {
             continue;
-        }
-        // Tailscale 单节点硬限（**只对 tailscale**，不随 `addressless` 扩大）
-        if proto_lower == "tailscale" {
-            if first_tailscale {
-                continue;
-            }
-            first_tailscale = true;
         }
         // 拷贝并 sanitize endpoint CIDR
         let mut server = s.clone();

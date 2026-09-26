@@ -34,8 +34,8 @@ impl BuiltinGeoRuleSet {
     ///
     /// 此前这层被认为「缺失、需要随包 manifest 才能补」，复核后不成立：地址完全由 tag 推导得出，
     /// 两个源各自的拼法都已在仓内有据 ——
-    /// - CN 三件套（`CN_BASELINE_TAGS`）→ SagerNet 的 release 资产，资产名逐字等于 `file_name`
-    ///   （`docs/geo-rulesets.md:31` 的 curl 示例就是这条 URL）；
+    /// - CN 三件套（`CN_BASELINE_TAGS`）→ SagerNet `rule-set` 分支，文件名等于 `file_name`；
+    ///   release 中的 `.db` 资产不是 sing-box `.srs` 规则集；
     /// - 其余 → MetaCubeX `meta-rules-dat@sing`，目录已带分类、**文件名是裸名**
     ///   （`rule_resource_catalog.rs:114` 派生 `geo/<kind>/<name>.srs`，非 `geo/<kind>/<kind>-<name>.srs`）。
     ///   裸名由 `file_name` 去掉 `<kind>-` 前缀得到，`category-ai → category-ai-!cn` 这类改名
@@ -50,8 +50,8 @@ impl BuiltinGeoRuleSet {
         };
         if CN_BASELINE_TAGS.contains(&self.tag.as_str()) {
             let base = match self.category {
-                GeoCategory::Geosite => SAGERNET_GEOSITE_RELEASE,
-                GeoCategory::Geoip => SAGERNET_GEOIP_RELEASE,
+                GeoCategory::Geosite => SAGERNET_GEOSITE_RULE_SET,
+                GeoCategory::Geoip => SAGERNET_GEOIP_RULE_SET,
             };
             return format!("{base}/{}", self.file_name);
         }
@@ -99,13 +99,13 @@ const REGION_GEOIP_TAGS: &[&str] = &["ir", "ru"];
 const MRD_GEO_RAW_BASE: &str =
     "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo";
 
-/// 国内基线三件套：**源不是 MetaCubeX 而是 SagerNet**（`docs/geo-rulesets.md:10` 登记的出处），
-/// 且它们走 release 资产而非仓库 raw 路径 —— 混用会 404。
+/// 国内基线三件套：SagerNet `rule-set` 分支发布 `.srs`，保留 geosite/geoip 文件名前缀。
+/// 与 MetaCubeX raw 路径的裸文件名口径不同，也不能拼到 SagerNet 的 `.db` release 资产上。
 const CN_BASELINE_TAGS: &[&str] = &["geosite-cn", "geosite-geolocation-!cn", "geoip-cn"];
-const SAGERNET_GEOSITE_RELEASE: &str =
-    "https://github.com/SagerNet/sing-geosite/releases/latest/download";
-const SAGERNET_GEOIP_RELEASE: &str =
-    "https://github.com/SagerNet/sing-geoip/releases/latest/download";
+const SAGERNET_GEOSITE_RULE_SET: &str =
+    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
+const SAGERNET_GEOIP_RULE_SET: &str =
+    "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
 
 /// 构建 app/region geo 条目。上游 `appGeoEntry`（仅 tag/fileName/category 部分）。
 fn app_geo_entry(cat: GeoCategory, tag: &str) -> BuiltinGeoRuleSet {

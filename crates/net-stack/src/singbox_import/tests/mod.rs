@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::json;
 
+#[path = "../../../../config-engine/tests/support/core_locator.rs"]
+mod core_locator;
+
 fn id_gen() -> impl FnMut() -> String {
     let mut n = 0;
     move || {
@@ -822,6 +825,22 @@ fn wireguard_endpoint_reserved_must_be_exactly_three() {
 }
 
 #[test]
+fn wireguard_multiple_peers_are_rejected_without_truncation() {
+    let one = json!({ "address": "peer.example", "port": 51820, "public_key": "key", "allowed_ips": ["0.0.0.0/0"] });
+    let r = parse_eps(
+        json!({ "endpoints": [{ "type": "wireguard", "tag": "multi", "private_key": "private",
+        "address": ["10.0.0.2/32"], "peers": [one.clone(), one] }] }),
+        ImportOrigin::RemoteSubscription,
+    );
+    assert_eq!((r.servers.len(), r.skipped, r.failed), (0, 1, 0));
+    assert!(
+        r.warnings.iter().any(|w| w.contains("单 peer")),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
 fn tailscale_endpoint_always_skipped_never_custom() {
     for origin in [ImportOrigin::RemoteSubscription, ImportOrigin::LocalFile] {
         let out = parse_eps(
@@ -834,7 +853,7 @@ fn tailscale_endpoint_always_skipped_never_custom() {
         assert_eq!(out.servers.len(), 0, "{origin:?}：账号制凭据不导入");
         assert!(
             out.servers.iter().all(|s| s.protocol != Protocol::Custom),
-            "{origin:?}：也不得包成 custom（会绕过前端 tailscale 单例闸门）"
+            "{origin:?}：也不得包成 custom（会绕过本机账号/状态目录授权）"
         );
         assert_eq!(out.skipped, 1);
         assert!(out
@@ -894,14 +913,12 @@ fn unmodeled_endpoint_types_wrap_as_custom_endpoint() {
         "未建模的 TLS 材料被丢掉了"
     );
 
-    // 订阅腿：同一份输入一个不导，计 skipped。
+    // 订阅腿：可移植凭据与网络字段也可导入。
     let remote = parse_eps(doc, ImportOrigin::RemoteSubscription);
-    assert_eq!(remote.servers.len(), 0);
-    assert_eq!(remote.skipped, 2);
-    assert!(remote
-        .warnings
-        .iter()
-        .any(|w| w.contains("openconnect(1)") && w.contains("openvpn-client(1)")));
+    assert_eq!(
+        (remote.servers.len(), remote.skipped, remote.failed),
+        (2, 0, 0)
+    );
 }
 
 /// sing-box `tls.certificate_sha256` / `certificate_public_key_sha256`：Listable（单串或数组）都收，
@@ -1169,24 +1186,259 @@ fn tailcat_that_generation_would_drop_counts_failed() {
     assert_eq!(r.servers[0].protocol, Protocol::Tailcat);
 }
 
-/// D4：第一期只收本地文件 —— **同一份**语料走远端订阅，两类节点一个不导，全部计 skipped 并按类型告警。
+/// 远端按字段筛选：本机接口等依赖拒绝，纯网络节点仍能导入。
 #[test]
-fn remote_subscription_skips_masque_and_tailcat() {
+fn remote_subscription_filters_masque_and_tailcat_by_fields() {
     let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::RemoteSubscription);
-    assert!(r.servers.is_empty(), "远端订阅导入了：{:?}", r.servers);
-    assert_eq!((r.skipped, r.failed), (4, 0));
-    assert!(
-        r.warnings.iter().any(|w| w.contains("tailcat(2)")),
+    assert_eq!((r.servers.len(), r.skipped, r.failed), (2, 2, 0));
+    assert_eq!(by_name(&r, "MQ2").protocol, Protocol::MasqueClient);
+    assert_eq!(by_name(&r, "TC-SERVERS").protocol, Protocol::Tailcat);
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("masque-client.bind_interface")));
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("tailcat.bind_interface")));
+}
+
+#[test]
+fn remote_portable_vpn_and_masque_token_round_trip() {
+    let doc = json!({ "endpoints": [
+        {"type":"masque-client","tag":"MQ","server":"mq.example","server_port":443,
+         "headers":{"X-Test":["a","b"]},"disable_version_fallback":true},
+        {"type":"openconnect","tag":"OC","server":"[2001:db8::1]:4443",
+         "token":{"mode":"totp","secret":"inline","counter":1},
+         "tls":{"certificate_authority":"-----BEGIN CERTIFICATE-----\ninline\n-----END CERTIFICATE-----"}},
+        {"type":"openvpn-client","tag":"OV","server":"ov.example","server_port":1194,
+         "tls":{"certificate":"pem","control_wrap":{"type":"tls_auth","key":["line1","line2"]}}},
+        {"type":"openconnect","tag":"OC-UNSAFE","server":"oc.example:443",
+         "token":{"mode":"totp","secret_path":"/tmp/secret"}},
+        {"type":"openconnect","tag":"OC-BAD-MODE","server":"oc.example:443",
+         "token":{"mode":1,"secret":"inline"}},
+        {"type":"openconnect","tag":"OC-BAD-COUNTER","server":"oc.example:443",
+         "token":{"mode":"hotp","secret":"inline","counter":"1"}},
+        {"type":"openvpn-client","tag":"OV-UNSAFE","server":"ov.example","server_port":1194,
+         "tls":{"certificate_path":"/tmp/ca.pem"}}
+    ], "outbounds": [
+        {"type":"tailcat","tag":"TC","server_public_key":TC_PUB,"server_disco_key":TC_DISCO,
+         "derp_servers":{"host":"derp.example","ipv4":"192.0.2.10","stun_port":3478,"cert_name":"derp.example"}},
+        {"type":"tailcat","tag":"TC-UNSAFE","server_public_key":TC_PUB,"server_disco_key":TC_DISCO,
+         "derp_region":1,"derp_map_url":"file:///tmp/derp.json"}
+    ]});
+    let result = parse_doc(&doc, ImportOrigin::RemoteSubscription);
+    assert_eq!(
+        (result.servers.len(), result.skipped, result.failed),
+        (4, 5, 0),
         "{:?}",
-        r.warnings
+        result.warnings
     );
-    assert!(r.warnings.iter().any(|w| w.contains("masque-client(2)")));
+    assert_eq!(by_name(&result, "OC").address, "2001:db8::1");
+    assert_eq!(by_name(&result, "OC").port, 4443);
+    let oc = by_name(&result, "OC");
+    let round: ServerConfig = serde_json::from_value(serde_json::to_value(oc).unwrap()).unwrap();
+    assert_eq!(
+        round
+            .openconnect_settings
+            .as_ref()
+            .unwrap()
+            .token
+            .as_ref()
+            .unwrap()["mode"],
+        "totp"
+    );
+    let ov = by_name(&result, "OV");
+    assert_eq!(
+        ov.openvpn_client_settings
+            .as_ref()
+            .unwrap()
+            .tls
+            .as_ref()
+            .unwrap()
+            .certificate,
+        vec!["pem"]
+    );
+    let tc = by_name(&result, "TC");
+    assert_eq!(tc.tailcat_settings.as_ref().unwrap().derp_servers.len(), 1);
+    assert!(result
+        .warnings
+        .iter()
+        .any(|w| w.contains("openconnect.token")));
+    assert_eq!(
+        result
+            .warnings
+            .join(" ")
+            .matches("openconnect.token")
+            .count(),
+        3
+    );
+    assert!(result
+        .warnings
+        .iter()
+        .any(|w| w.contains("openvpn-client.tls.certificate_path")));
+    assert!(result
+        .warnings
+        .iter()
+        .any(|w| w.contains("tailcat.derp_map_url")));
+}
+
+#[test]
+fn remote_openvpn_static_key_mode_omits_tls_and_checks_with_core() {
+    let doc = json!({"endpoints":[
+        {"type":"openvpn-client","tag":"STATIC","server":"192.0.2.1","server_port":1194,
+         "mode":"static_key","address":"10.0.0.2/24","peer_address":"10.0.0.1",
+         "cipher":"AES-128-CBC","auth":"SHA256","static_key":"abcdef"},
+        {"type":"openvpn-client","tag":"STATIC6","server":"192.0.2.1","server_port":1194,
+         "mode":"static_key","address":"fd00::2/64","peer_address_ipv6":"fd00::1",
+         "cipher":"AES-128-CBC","auth":"SHA256","static_key":["abcdef"]},
+        {"type":"openvpn-client","tag":"STATIC-DUAL","server":"192.0.2.1","server_port":1194,
+         "mode":"static_key","address":["10.0.0.2/24","fd00::2/64"],
+         "peer_address":"10.0.0.1","peer_address_ipv6":"fd00::1",
+         "cipher":"AES-128-CBC","auth":"SHA256","static_key":"abcdef"},
+        {"type":"openvpn-client","tag":"INVALID","server":"192.0.2.1","server_port":1194,
+         "mode":"static_key","address":"10.0.0.2/24","peer_address":"10.0.0.1",
+         "cipher":"AES-128-CBC","auth":"SHA256","static_key":"abcdef","tls":{}},
+        {"type":"openvpn-client","tag":"MISSING6","server":"192.0.2.1","server_port":1194,
+         "mode":"static_key","address":["10.0.0.2/24","fd00::2/64"],"peer_address":"10.0.0.1",
+         "cipher":"AES-128-CBC","auth":"SHA256","static_key":"abcdef"},
+        {"type":"openvpn-client","tag":"EXTRA4","server":"192.0.2.1","server_port":1194,
+         "mode":"static_key","address":"fd00::2/64","peer_address":"10.0.0.1","peer_address_ipv6":"fd00::1",
+         "cipher":"AES-128-CBC","auth":"SHA256","static_key":"abcdef"},
+        {"type":"openvpn-client","tag":"BAD-CIDR","server":"192.0.2.1","server_port":1194,
+         "mode":"static_key","address":"fd00::2/129","peer_address_ipv6":"fd00::1",
+         "cipher":"AES-128-CBC","auth":"SHA256","static_key":"abcdef"}
+    ]});
+    let parsed = parse_eps(doc, ImportOrigin::RemoteSubscription);
+    assert_eq!(
+        (parsed.servers.len(), parsed.skipped, parsed.failed),
+        (3, 4, 0),
+        "{:?}",
+        parsed.warnings
+    );
+    assert!(parsed.warnings.iter().any(|w| w.contains("static_key.tls")));
+    for key in [
+        "static_key.peer_address_ipv6",
+        "static_key.peer_address",
+        "static_key.address",
+    ] {
+        assert!(parsed.warnings.iter().any(|w| w.contains(key)));
+    }
+    assert!(parsed.servers[0]
+        .openvpn_client_settings
+        .as_ref()
+        .unwrap()
+        .tls
+        .is_none());
+    let generated = generate_remote_import(&parsed.servers, "sub1");
+    assert!(generated.invalid_nodes.is_empty());
+    let cfg = serde_json::to_value(&generated.config).unwrap();
+    let endpoints: Vec<&Value> = cfg["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|ep| ep["type"] == "openvpn-client")
+        .collect();
+    assert_eq!(endpoints.len(), 3);
+    for endpoint in &endpoints {
+        assert_eq!(endpoint["mode"], "static_key");
+        assert!(endpoint.get("tls").is_none());
+    }
+    let Some(core) = core_locator::core_or_skip("远端 OpenVPN static_key 真核门") else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("polaris-ov-static-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("static.json");
+    let mut surface = json!({"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":endpoints});
+    if let Some(servers) = cfg.get("dns").and_then(|dns| dns.get("servers")) {
+        surface["dns"] = json!({"servers":servers});
+    }
+    surface["route"] = json!({"default_domain_resolver":"dns-bootstrap"});
+    std::fs::write(&path, serde_json::to_vec_pretty(&surface).unwrap()).unwrap();
+    let output = core_locator::command_for_core(&core)
+        .args(["--disable-color", "check", "-c"])
+        .arg(&path)
+        .arg("-D")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "static_key 生成配置被随包核拒绝：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+}
+
+#[test]
+fn remote_openconnect_url_preserves_auth_path_and_native_default_port() {
+    let source = "https://[2001:db8::1]:4443/auth/path?group=office";
+    let parsed = parse_eps(
+        json!({"endpoints":[
+            {"type":"openconnect","tag":"OC-URL","server":source},
+            {"type":"openconnect","tag":"OC-DEFAULT","server":"http://vpn.example/auth"},
+            {"type":"openconnect","tag":"OC-HTTP80","server":"http://vpn.example:80/auth"}
+        ]}),
+        ImportOrigin::RemoteSubscription,
+    );
+    assert_eq!(
+        (parsed.servers.len(), parsed.skipped, parsed.failed),
+        (3, 0, 0)
+    );
+    let url = by_name(&parsed, "OC-URL");
+    assert_eq!((&*url.address, url.port), ("2001:db8::1", 4443));
+    assert_eq!(
+        url.openconnect_settings.as_ref().unwrap().server.as_deref(),
+        Some(source)
+    );
+    assert_eq!(by_name(&parsed, "OC-DEFAULT").port, 443);
+    assert_eq!(by_name(&parsed, "OC-HTTP80").port, 80);
+}
+
+#[test]
+fn openvpn_multi_remote_list_is_rejected_without_creating_conflicting_server() {
+    for origin in [ImportOrigin::LocalFile, ImportOrigin::RemoteSubscription] {
+        let parsed = parse_eps(
+            json!({"endpoints":[{"type":"openvpn-client","tag":"OV-MULTI",
+                "servers":[{"server":"a.example","server_port":1194},
+                           {"server":"b.example","server_port":1194}]}]}),
+            origin,
+        );
+        assert_eq!(
+            (parsed.servers.len(), parsed.skipped, parsed.failed),
+            (0, 1, 0)
+        );
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("servers 多远端轮换")));
+    }
 }
 
 /// 本地导入产物 → 生成侧（`generate_sing_box_config_with_report`）。同生产本地导入腿剥掉 `subscriptionId`
 /// （`commands/subscription.rs` 本地导入：不归属任何订阅），否则顶层 `bindInterface` 会被订阅级策略遮蔽。
 fn generate_local_import(
     servers: &[ServerConfig],
+) -> polaris_config_engine::builder::GenerateOutcome {
+    generate_import(servers, None)
+}
+
+/// 订阅入口保留每个节点的归属，并提供生成侧消费的订阅出口策略元数据。
+fn generate_remote_import(
+    servers: &[ServerConfig],
+    subscription_id: &str,
+) -> polaris_config_engine::builder::GenerateOutcome {
+    assert!(servers
+        .iter()
+        .all(|server| server.subscription_id.as_deref() == Some(subscription_id)));
+    generate_import(servers, Some(subscription_id))
+}
+
+fn generate_import(
+    servers: &[ServerConfig],
+    subscription_id: Option<&str>,
 ) -> polaris_config_engine::builder::GenerateOutcome {
     use polaris_config_engine::builder::{
         generate_sing_box_config_with_report, GenerateConfigDeps,
@@ -1196,14 +1448,17 @@ fn generate_local_import(
     use std::collections::BTreeMap;
 
     let mut servers_json = serde_json::to_value(servers).unwrap();
-    // 导入腿不带 id 语义以外的东西；给个 selected，全部节点才进生成。
+    // 给个 selected，全部节点才进生成。仅本地文件导入剥掉订阅归属。
     let selected = servers_json[0]["id"].clone();
-    for s in servers_json.as_array_mut().unwrap() {
-        s.as_object_mut().unwrap().remove("subscriptionId");
+    if subscription_id.is_none() {
+        for s in servers_json.as_array_mut().unwrap() {
+            s.as_object_mut().unwrap().remove("subscriptionId");
+        }
     }
     let input: UserConfig = serde_json::from_value(json!({
         "servers": servers_json, "selectedServerId": selected, "proxyMode": "smart",
-        "proxyModeType": "manual", "mixedPort": 17899
+        "proxyModeType": "manual", "mixedPort": 17899,
+        "subscriptions": subscription_id.map(|id| vec![json!({"id": id})]).unwrap_or_default()
     }))
     .expect("导入产物反序列化成 UserConfig 失败");
     let deps = GenerateConfigDeps {
@@ -1253,9 +1508,6 @@ fn generate_local_import(
 /// `POLARIS_REQUIRE_KERNEL_GATE=1` 下硬红（同 config-engine 真核门的定位器）。
 #[test]
 fn local_import_round_trips_through_the_bundled_core() {
-    #[path = "../../../../config-engine/tests/support/core_locator.rs"]
-    mod core_locator;
-
     let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::LocalFile);
     assert_eq!(r.servers.len(), 4);
     let outcome = generate_local_import(&r.servers);
@@ -1363,6 +1615,115 @@ fn local_import_round_trips_through_the_bundled_core() {
         !ok_bad && diag_bad.contains("server_public_key"),
         "tailcat 坏公钥没被拒 —— 上面的绿不说明内核读过它：{diag_bad}"
     );
+}
+
+/// 生产订阅分流入口覆盖 sing-box JSON 与 mihomo YAML，导入产物必须被随包核接收。
+#[test]
+fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
+    let json = format!(
+        r#"{{"outbounds":[{{"type":"tailcat","tag":"TC","server_public_key":"{TC_PUB}","server_disco_key":"{TC_DISCO}","derp_region":1}}],"endpoints":[
+        {{"type":"masque-client","tag":"MQ","server":"mq.example","server_port":443,"path":"/","tls":{{"enabled":true,"certificate_sha256":["{PIN_HEX}"]}}}},
+        {{"type":"openconnect","tag":"OC","server":"vpn.example:443","username":"u","password":"p","tcp_keep_alive":"1m","network_type":["wifi"],"dtls_local_port":4444,"form_entries":[{{"form_id":"login","name":"group","value":"office","promote":false}}],"token":{{"mode":"totp","secret":"JBSWY3DPEHPK3PXP"}}}},
+        {{"type":"openvpn-client","tag":"OV","server":"ov.example","server_port":1194,"tls":{{"peer_fingerprint":"{PIN_HEX}"}},"mss_fix":1360,"explicit_exit_notify":1,"udp_timeout":60,"renegotiate_bytes":4294967296,"renegotiate_packets":4294967297,"fallback_network_type":["ethernet"],"static_challenge":"OTP","static_challenge_echo":false,"routes":["10.30.0.0/16"],"pull_filters":[{{"action":"ignore","text":"route-ipv6"}}]}},
+        {{"type":"openvpn-client","tag":"OV-STATIC","server":"192.0.2.1","server_port":1194,"mode":"static_key","address":"10.0.0.2/24","peer_address":"10.0.0.1","cipher":"AES-128-CBC","auth":"SHA256","static_key":["abcdef"]}}
+    ]}}"#
+    );
+    let ca = polaris_source_probe::crate_file!("tests/fixtures/assets/openvpn-test-ca.txt");
+    let clash = format!(
+        r#"proxies:
+      - {{name: WG, type: wireguard, server: wg.example, port: 51820, ip: 10.0.0.2/32, private-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEk=, public-key: bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=, workers: 4}}
+      - {{name: HY, type: hysteria, server: hy.example, port: 443, auth-str: secret, up: 100, down: 100}}
+      - name: OV-MIHOMO
+        type: openvpn
+        server: ov.example
+        port: 1194
+        username: test-user
+        ca: {}
+    "#,
+        serde_json::to_string(&ca).unwrap()
+    );
+    let mut id = id_gen();
+    let mut servers = Vec::new();
+    for body in [json.as_str(), clash.as_str()] {
+        let parsed = crate::subscription::parse_subscription(
+            body,
+            "sub-parity",
+            "2026-09-26T00:00:00Z",
+            &mut id,
+            ImportOrigin::RemoteSubscription,
+        );
+        assert_eq!(
+            (parsed.skipped, parsed.failed),
+            (0, 0),
+            "{:?}",
+            parsed.warnings
+        );
+        servers.extend(parsed.servers);
+    }
+    assert_eq!(servers.len(), 8, "生产订阅入口未接全八条协议映射");
+    let outcome = generate_remote_import(&servers, "sub-parity");
+    assert!(
+        outcome.invalid_nodes.is_empty(),
+        "生成剔除了导入节点：{:?}",
+        outcome.invalid_nodes
+    );
+    let cfg = serde_json::to_value(&outcome.config).unwrap();
+    let eps = cfg["endpoints"].as_array().unwrap();
+    let outs = cfg["outbounds"].as_array().unwrap();
+    for ty in [
+        "masque-client",
+        "openconnect",
+        "openvpn-client",
+        "wireguard",
+    ] {
+        assert!(eps.iter().any(|ep| ep["type"] == ty), "缺 {ty} endpoint");
+    }
+    assert_eq!(
+        eps.iter().find(|ep| ep["type"] == "wireguard").unwrap()["workers"],
+        4
+    );
+    for ty in ["tailcat", "hysteria"] {
+        assert!(outs.iter().any(|ob| ob["type"] == ty), "缺 {ty} outbound");
+    }
+    assert_eq!(
+        eps.iter()
+            .filter(|ep| ep["type"] == "openvpn-client")
+            .count(),
+        3
+    );
+    let mq = eps.iter().find(|ep| ep["type"] == "masque-client").unwrap();
+    assert_eq!(mq["tls"]["certificate_sha256"], json!([PIN_B64]));
+    assert_eq!(
+        eps.iter().find(|ep| ep["mode"] == "static_key").unwrap()["static_key"],
+        json!(["abcdef"])
+    );
+    let oc = eps.iter().find(|ep| ep["type"] == "openconnect").unwrap();
+    assert_eq!(oc["token"]["mode"], "totp");
+    let Some(core) = core_locator::core_or_skip("远端订阅协议对齐真核门") else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("polaris-import-parity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("remote-import.json");
+    let mut surface = json!({"log":{"disabled":true},"outbounds":outs,"endpoints":eps});
+    if let Some(servers) = cfg.get("dns").and_then(|dns| dns.get("servers")) {
+        surface["dns"] = json!({"servers": servers});
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&surface).unwrap()).unwrap();
+    let output = core_locator::command_for_core(&core)
+        .args(["--disable-color", "check", "-c"])
+        .arg(&path)
+        .arg("-D")
+        .arg(&dir)
+        .output()
+        .expect("运行随包核 check");
+    assert!(
+        output.status.success(),
+        "远端订阅生成配置未通过真核 check：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
 }
 
 /// OpenConnect / OpenVPN Client 的 `on_demand` / `bind_interface` 提到顶层（同 MASQUE）：生成侧装配层对

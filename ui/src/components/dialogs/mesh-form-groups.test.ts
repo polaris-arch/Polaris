@@ -52,7 +52,7 @@ describe('统一接入表单的信息架构', () => {
       'allowedIPs', 'reverseMesh', 'allowInternet', 'alwaysRouteSubnets',
     ]);
     expect(WG_FORM_GROUP_KEYS.advanced).toEqual([
-      'persistentKeepalive', 'mtu', 'reserved', 'detour', 'bindInterface', 'onDemand',
+      'persistentKeepalive', 'mtu', 'workers', 'reserved', 'detour', 'bindInterface', 'onDemand',
     ]);
   });
 

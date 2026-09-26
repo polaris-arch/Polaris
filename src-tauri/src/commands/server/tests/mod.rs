@@ -167,41 +167,81 @@ fn server_add_core_persists_node_with_minted_id() {
     assert_eq!(servers[0]["name"], json!("手动节点"));
 }
 
-/// D4 兜底出口的 viable 校验（单删/批删共用）：传入的兜底 id 必须**存活于删除后的 servers**。
-/// 回归到「前端传被删节点自身 id」→ 该 id 已不在 servers → 必须落直连哨兵而非把死 id 写回选中。
-/// A5：logout runningNeedsRestart 装配判定。核未跑 / 快照缺失 → false；运行中且该 TS 节点在运行配置里 → true。
-/// 回归到硬编码 false（旧态）或打断 crate 调用 → 「true」用例转红。
 #[test]
-fn logout_needs_restart_true_only_when_ts_in_running_core() {
-    use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
-
-    // 运行配置含 id=ts1 的 tailscale 节点（round-trip 保证可反序列化）。
-    let mut cfg = UserConfig::default();
-    cfg.servers.push(ServerConfig {
-        id: "ts1".into(),
-        protocol: Protocol::Tailscale,
-        ..Default::default()
+fn warp_draft_wire_contract_persists_through_the_real_add_command_core() {
+    let dir = temp_dir("warp-draft");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let draft: polaris_mesh::warp::WarpWireGuardDraft = serde_json::from_value(json!({
+        "address": "engage.cloudflareclient.com", "port": 2408,
+        "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "peer_public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=",
+        "localAddress": ["172.16.0.2/32", "2606:4700:110:1000::2/128"],
+        "reserved": [1, 2, 3],
+        "meta": {"deviceId": "device", "accountId": "account", "license": "", "warpPlus": false},
+        "warpDevice": {"deviceId": "device", "token": "test-token"}
+    }))
+    .unwrap();
+    // Exact keys consumed by WarpDialog from the serialized IPC draft.
+    let wire = serde_json::to_value(draft).unwrap();
+    let node = json!({
+        "id": "warp-stable", "name": "WARP", "protocol": "wireguard",
+        "address": wire["address"], "port": wire["port"],
+        "wireguardSettings": {
+            "privateKey": wire["privateKey"], "peerPublicKey": wire["peerPublicKey"],
+            "localAddress": wire["localAddress"], "reserved": wire["reserved"],
+            "warpDevice": wire["warpDevice"], "allowInternet": true
+        }
     });
-    let running = serde_json::to_value(&cfg).unwrap();
+    server_add_core(&mgr, node.clone()).unwrap();
+    server_add_core(&mgr, node.clone()).expect("same identity/content retry is idempotent");
+    let cfg = ConfigManager::new(dir.clone()).load_full().unwrap();
+    assert_eq!(cfg["servers"].as_array().unwrap().len(), 4);
+    let persisted = cfg["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "warp-stable")
+        .unwrap();
+    assert_eq!(persisted, &node);
+    assert_eq!(cfg["selectedServerId"], "n-a");
+    let typed: UserConfig = serde_json::from_value(cfg).unwrap();
+    assert!(typed
+        .servers
+        .iter()
+        .any(|n| n.id == "warp-stable" && n.wireguard_settings.is_some()));
+}
 
-    assert!(
-        logout_needs_restart("ts1", true, Some(&running)),
-        "运行中 + TS 节点在运行核 → 需重启"
-    );
-    assert!(
-        !logout_needs_restart("other", true, Some(&running)),
-        "节点不在运行核 → 无需重启"
-    );
-    assert!(
-        !logout_needs_restart("ts1", false, Some(&running)),
-        "核未跑 → 无需重启"
-    );
-    assert!(
-        !logout_needs_restart("ts1", true, None),
-        "运行配置快照缺失 → 保守 false"
+#[test]
+fn single_add_rejects_invalid_or_conflicting_input_without_changing_config() {
+    let dir = temp_dir("add-invalid");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let before = mgr.load_full().unwrap();
+    let disk_before = std::fs::read(mgr.path()).unwrap();
+    for node in [
+        json!(null),
+        json!({"id":"bad","name":"WARP","protocol":"wireguard","address":"engage.cloudflareclient.com","port":2408,
+            "wireguardSettings":{"localAddress":["172.16.0.2/32"]}}),
+        json!({"id":"bad","name":"WARP","protocol":"wireguard","address":"engage.cloudflareclient.com","port":2408,
+            "wireguardSettings":{"privateKey":"key","peerPublicKey":"peer","localAddress":["not-a-cidr"]}}),
+        json!({"id":"bad","name":"node","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw","tlsSettings": "invalid"}),
+        json!({"id":"n-a","name":"conflict","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw"}),
+    ] {
+        assert!(server_add_core(&mgr, node).is_err());
+        assert_eq!(mgr.load_full().unwrap(), before);
+        assert_eq!(std::fs::read(mgr.path()).unwrap(), disk_before);
+    }
+    server_add_core(&mgr, before["servers"][0].clone()).unwrap();
+    assert_eq!(
+        std::fs::read(mgr.path()).unwrap(),
+        disk_before,
+        "idempotent add does not rewrite disk"
     );
 }
 
+/// D4 兜底出口的 viable 校验（单删/批删共用）：传入的兜底 id 必须**存活于删除后的 servers**。
+/// 回归到「前端传被删节点自身 id」→ 该 id 已不在 servers → 必须落直连哨兵而非把死 id 写回选中。
 /// 项2（server:addBulk 返回实际新增数）：核心须返回 `added == 入参 len`（对齐 上游 `added=list.length`），
 /// 且节点真落盘。变异牙：回归到硬编码 0（`Ok((cfg, 0))`）→「added==3」断言转红；打断 push/init 落盘 →
 /// 重 load 的 servers.len() 断言转红。

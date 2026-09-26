@@ -8,6 +8,7 @@
 //! api 端口与 secret 的解析 / check-fail 不 spawn / spawn-fail 不留表项 / 双写守卫拦截。
 //! 真 spawn+控制面路径**不在此覆盖**（真机门槛，见模块头）。
 
+mod attempt_lifecycle;
 /// 真子进程腿：探针只在 unix 有（理由见 [`crate::test_support::write_sleeping_probe`]）。
 #[cfg(unix)]
 mod config_checker_process;
@@ -169,11 +170,30 @@ impl ConfigChecker for ConcurrentChecker {
     }
 }
 
+type CapturedLoginProgress = (String, String, String, Option<String>, Option<String>);
+
 #[derive(Default)]
 struct FakeEmitter {
     captured: Mutex<Vec<(String, String, String)>>,
+    progress: Mutex<Vec<CapturedLoginProgress>>,
 }
 impl AuthUrlEmitter for FakeEmitter {
+    fn progress(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+        phase: &str,
+        reason: Option<&str>,
+        url: Option<&str>,
+    ) {
+        self.progress.lock().unwrap().push((
+            server_id.into(),
+            attempt_id.into(),
+            phase.into(),
+            reason.map(str::to_owned),
+            url.map(str::to_owned),
+        ));
+    }
     fn emit_auth_url(&self, server_id: &str, node_name: &str, url: &str) {
         self.captured.lock().unwrap().push((
             server_id.to_string(),
@@ -892,7 +912,10 @@ async fn cancel_kills_and_deregisters() {
     ));
     wait_until(|| reg.shared.contains("ts1")).await;
     assert!(reg.cancel_login("ts1"), "取消在飞登录返 true");
-    assert!(!reg.shared.contains("ts1"), "cancel 立即注销");
+    assert!(
+        reg.shared.contains("ts1"),
+        "cancel retains ownership until reap"
+    );
     let st = spawner.spawned.lock().unwrap()[0].clone();
     wait_until(|| st.terminated.load(Ordering::SeqCst)).await;
     // 幂等：再取消不存在的登录 → false（非错误）。

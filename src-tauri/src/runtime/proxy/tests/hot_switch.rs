@@ -3456,3 +3456,52 @@ fn unknown_log_level_still_parses_and_degrades_to_info() {
         "值的解释权仍在 log_axes_from_config：非法级别退化 Info、非 true 的 disableLogFile 记 false"
     );
 }
+
+#[tokio::test]
+async fn deferred_tailscale_state_waits_for_main_and_transient_writers_then_retries() {
+    let (rt, dir) = test_runtime();
+    let mut current = rt.config.load_full().unwrap();
+    current["servers"] = serde_json::json!([{ "id":"ts-deferred", "protocol":"tailscale" }]);
+    rt.config.save_full(&current).unwrap();
+    let state = rt.mesh.tailscale_state_dir("ts-deferred").unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("sentinel"), b"keep").unwrap();
+    let mut incoming = current.clone();
+    incoming["servers"] = serde_json::json!([]);
+    rt.config
+        .save_full_deferred_cleanup(&current, &incoming)
+        .unwrap();
+    {
+        let gate = rt.mesh.tailscale_state_gate().await;
+        rt.mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            )
+            .await;
+        mark_running(&rt);
+        rt.process_deferred_config_deletions_under_gate(&gate);
+        assert!(
+            state.join("sentinel").exists(),
+            "main owner preserves deferred state and journal"
+        );
+    }
+    rt.mesh.release_tailscale_main_states();
+    *rt.status.write().unwrap() = ProxyStatus::default();
+    rt.mesh
+        .login_registry_for_test()
+        .register_inflight_for_test("ts-deferred", 4242);
+    assert_eq!(rt.apply_pending().await, "skipped");
+    assert!(
+        state.join("sentinel").exists(),
+        "transient PID preserves the deferred entry"
+    );
+    rt.mesh
+        .login_registry_for_test()
+        .deregister_inflight_for_test("ts-deferred");
+    assert_eq!(rt.apply_pending().await, "skipped");
+    assert!(
+        !state.exists(),
+        "same production journal retry deletes state once no writer remains"
+    );
+    assert!(dir.exists());
+}

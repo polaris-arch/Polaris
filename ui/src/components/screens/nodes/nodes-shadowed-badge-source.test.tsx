@@ -305,3 +305,9 @@ describe('接线 · 角标的真值源是后端报告，渲染端不得再重算
     expect(ROUTES_RAW).toContain('`meshShadowedCidrs` / `ShadowedCidr` 已删');
   });
 });
+
+it('Tailscale cards keep their protocol identity without a hardcoded WireGuard transport claim', async () => {
+  const html = await cardMarkup(undefined);
+  expect(html).toContain('Tailscale');
+  expect(html).not.toContain('mesh · wg');
+});

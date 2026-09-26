@@ -78,6 +78,26 @@ fn plan_without_prefix_is_identity() {
     assert_eq!(plan.url, RAW);
 }
 
+/// CN 内置更新计划使用官方 SRS 分支；加速只改变请求地址，保留原始 sourceUrl。
+#[test]
+fn cn_builtin_plan_mirrors_official_rule_set_source() {
+    for (tag, repo) in [
+        ("geosite-cn", "sing-geosite"),
+        ("geosite-geolocation-!cn", "sing-geosite"),
+        ("geoip-cn", "sing-geoip"),
+    ] {
+        let source =
+            format!("https://raw.githubusercontent.com/SagerNet/{repo}/rule-set/{tag}.srs");
+        let builtin = find_builtin(tag).unwrap();
+        let direct = plan_from_builtin(&builtin);
+        assert_eq!(direct.url, source);
+        assert_eq!(direct.fetch_url, source);
+        let mirrored = direct.with_gh_proxy(PREFIX);
+        assert_eq!(mirrored.url, source);
+        assert_eq!(mirrored.fetch_url, format!("https://gh-proxy.org/{source}"));
+    }
+}
+
 /// 已登记资源（redownload / update_all 腿）同样套前缀，且 `sourceUrl` 原址不被改写。
 #[test]
 fn registered_resource_plan_also_mirrors() {

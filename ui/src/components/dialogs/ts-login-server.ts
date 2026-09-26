@@ -79,6 +79,8 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
       ...(server.tailscaleSettings ?? {}),
       authKey: authKey.trim(),
     };
+  } else {
+    delete server.tailscaleSettings?.authKey;
   }
 
   // controlUrl 与登录方式无关（两种方式都要打向同一个控制面），故不放在 authkey 分支里。
@@ -95,7 +97,6 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
   // 已有节点：只有**真的变了**才写盘。browser 模式不改任何字段时不碰配置 → 免掉一次无谓的
   // CONFIG_CHANGED 广播（后端据此重启代理）。
   const keyChanged =
-    mode === 'authkey' &&
     server.tailscaleSettings?.authKey !== existing.tailscaleSettings?.authKey;
   const controlChanged =
     server.tailscaleSettings?.controlUrl !== existing.tailscaleSettings?.controlUrl;
@@ -104,4 +105,53 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
     persist: keyChanged || controlChanged ? 'update' : 'none',
     requiresLogout,
   };
+}
+
+export interface TsLoginExecution {
+  isActive: () => boolean;
+  prepare: () => Promise<void>;
+  verifyState?: () => Promise<boolean>;
+  logout: () => Promise<unknown>;
+  save: () => Promise<void>;
+  onSaved: () => void;
+  refresh: () => Promise<unknown>;
+  start: () => Promise<{ started: boolean; reason?: string }>;
+  cancel: () => Promise<void>;
+}
+
+/** Save and authorize are separate transactions. Cancellation is checked at every IPC boundary. */
+export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 'handedOff' | 'cancelled' | 'failed'; reason?: string }> {
+  let handedOff = false;
+  let stage = 'authorizationRequestFailed';
+  try {
+    await input.prepare();
+    if (!input.isActive()) return { phase: 'cancelled' };
+    if (input.verifyState) {
+      stage = 'stateQueryFailed';
+      const exists = await input.verifyState();
+      if (!input.isActive()) return { phase: 'cancelled' };
+      if (exists) {
+        stage = 'logoutFailed';
+        await input.logout();
+        if (!input.isActive()) return { phase: 'cancelled' };
+      }
+    }
+    stage = 'saveFailed';
+    await input.save();
+    input.onSaved();
+    if (!input.isActive()) return { phase: 'cancelled' };
+    stage = 'configurationRefreshFailed';
+    await input.refresh();
+    if (!input.isActive()) return { phase: 'cancelled' };
+    stage = 'authorizationRequestFailed';
+    const result = await input.start();
+    if (!input.isActive()) return { phase: 'cancelled' };
+    handedOff = result.started || result.reason === 'inMainCore';
+    return { phase: handedOff ? 'handedOff' : 'cancelled' };
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
+    return { phase: 'failed', reason: code === 'TAILSCALE_LOGOUT_MAIN_CORE' ? 'mainCoreInUse' : stage };
+  } finally {
+    if (!handedOff) await input.cancel().catch(() => {});
+  }
 }

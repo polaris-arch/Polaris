@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn draft_uses_renderer_camel_case_and_accepts_legacy_keys() {
+    let raw = json!({
+        "address": "engage.cloudflareclient.com", "port": 2408,
+        "private_key": "private", "peer_public_key": "peer", "local_address": ["172.16.0.2/32"],
+        "meta": {"deviceId": "device", "accountId": "account", "license": "", "warpPlus": false},
+        "warp_device": {"deviceId": "device", "token": "token"}
+    });
+    let draft: WarpWireGuardDraft = serde_json::from_value(raw).unwrap();
+    let wire = serde_json::to_value(&draft).unwrap();
+    assert_eq!(wire["privateKey"], "private");
+    assert_eq!(wire["peerPublicKey"], "peer");
+    assert_eq!(wire["localAddress"], json!(["172.16.0.2/32"]));
+    assert!(wire.get("private_key").is_none());
+    assert!(wire.get("peer_public_key").is_none());
+    assert_eq!(
+        serde_json::from_value::<WarpWireGuardDraft>(wire).unwrap(),
+        draft
+    );
+}
+
 fn b64(bytes: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::new();

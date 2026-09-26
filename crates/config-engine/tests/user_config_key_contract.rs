@@ -18,6 +18,36 @@
 use polaris_config_engine::user_config::UserConfig;
 use serde_json::json;
 
+#[test]
+fn openconnect_token_object_survives_user_config_round_trip() {
+    let source = json!({"servers": [{
+        "id": "oc", "name": "oc", "protocol": "openconnect", "address": "vpn.example", "port": 443,
+        "openconnectSettings": {
+            "server": "vpn.example:443",
+            "token": {"mode": "totp", "secret": "inline", "counter": 1},
+            "tls": {"certificate_authority": "inline-pem"}
+        }
+    }]});
+    let config: UserConfig =
+        serde_json::from_value(source).expect("token 对象须能入 configstore 模型");
+    let serialized = serde_json::to_value(&config).expect("token 对象须能序列化");
+    assert_eq!(
+        serialized["servers"][0]["openconnectSettings"]["token"]["mode"],
+        "totp"
+    );
+    let again: UserConfig = serde_json::from_value(serialized).expect("token 对象须能往返");
+    assert_eq!(
+        again.servers[0]
+            .openconnect_settings
+            .as_ref()
+            .unwrap()
+            .token
+            .as_ref()
+            .unwrap()["secret"],
+        "inline"
+    );
+}
+
 /// 真实 config.json 的最小形态（键名取自 `ui/src/shared/types/rules.ts` + `store/src/sanitize.rs`）。
 fn real_config_json() -> serde_json::Value {
     json!({

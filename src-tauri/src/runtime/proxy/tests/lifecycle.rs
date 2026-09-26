@@ -1605,3 +1605,67 @@ fn set_error_without_emitter_still_records_state() {
         Some(code::PROCESS_EXITED)
     );
 }
+
+/// The old stop waits at the real shared gate, then a newer generation owns the actual endpoint.
+/// Without the check immediately after acquisition it clears the replacement's reservation.
+#[tokio::test]
+async fn old_stop_waiting_for_tailscale_gate_preserves_new_generation_owner() {
+    let (rt, dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let old_generation = rt.gate.generation();
+    let rt2 = rt.clone();
+    let stop = tokio::spawn(async move { rt2.stop_inner().await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while rt.gate.generation() == old_generation {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    rt.bump_generation();
+    rt.mesh.reserve_tailscale_main_states(&serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":dir.join("tailscale/new-session")}]})).await;
+    mark_running(&rt);
+    drop(gate);
+    assert!(!stop.await.unwrap().unwrap());
+    assert!(rt.status().running);
+    assert!(rt.mesh.main_owns_tailscale("new-session", true));
+}
+
+#[test]
+fn tailscale_state_remains_owned_during_helper_start_before_pid_publication() {
+    let (rt, _dir) = test_runtime();
+    assert!(!rt.tailscale_writer_alive());
+    // Helper start/stop IPC can outlive a dropped await. Its marker is published before IPC,
+    // so a missing ready snapshot/PID must not allow a transient writer into the same state.
+    rt.core_via_helper.store(true, Ordering::SeqCst);
+    assert!(rt.tailscale_writer_alive());
+    rt.core_via_helper.store(false, Ordering::SeqCst);
+    assert!(!rt.tailscale_writer_alive());
+}
+
+#[test]
+fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
+    let src = module_code("runtime/proxy");
+    let start = method_body(&src, "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {");
+    let gate = start
+        .find("self.mesh.tailscale_state_gate().await")
+        .unwrap();
+    let sweep = start.find("self.cleanup_stale_cores().await").unwrap();
+    let inner = start
+        .find("self.start_inner(config, my_gen).await")
+        .unwrap();
+    assert!(
+        gate < sweep && sweep < inner,
+        "primary start must hold the shared gate across cleanup and spawn"
+    );
+    assert!(
+        start[gate..sweep].contains("self.gate.generation() != my_gen"),
+        "old start may not clean up a newer generation after waiting"
+    );
+    let inner = method_body(&src, "    pub(super) async fn start_inner(");
+    let reservation = inner.find("reserve_tailscale_main_states").unwrap();
+    let spawn = inner.find("let t_spawn =").unwrap();
+    let final_reservation = inner.rfind("reserve_tailscale_main_states").unwrap();
+    let ready_snapshot = inner.find("self.startup_snapshot.write()").unwrap();
+    assert!(reservation < spawn && final_reservation < ready_snapshot);
+}

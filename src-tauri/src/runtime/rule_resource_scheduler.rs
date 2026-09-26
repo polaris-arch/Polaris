@@ -175,6 +175,60 @@ pub fn select_due_resources(
     out
 }
 
+/// 本轮两类资源的共同计划；生成后两腿独立执行，外置表为空不影响内置项。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DueUpdatePlan {
+    external_ids: Vec<String>,
+    builtin_tags: Vec<String>,
+}
+
+fn plan_due_updates(
+    config: &Value,
+    now: u64,
+    backoff: &mut BackoffTracker,
+    file_exists: &dyn Fn(&str) -> bool,
+) -> DueUpdatePlan {
+    let mut active: HashSet<String> = config
+        .get("ruleResources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    active.extend(
+        builtin_geo_rulesets()
+            .iter()
+            .map(|b| builtin_id_for(&b.tag)),
+    );
+    backoff.prune(&active);
+
+    let external_ids = select_due_resources(config, now, backoff, file_exists);
+    let Some(interval_ms) = auto_update_interval_ms(config) else {
+        return DueUpdatePlan {
+            external_ids,
+            builtin_tags: Vec::new(),
+        };
+    };
+    let meta = config.get("builtinGeoMeta").unwrap_or(&Value::Null);
+    let builtin_tags = builtin_geo_rulesets()
+        .into_iter()
+        .filter(|b| backoff.is_eligible(&builtin_id_for(&b.tag), now))
+        .filter(|b| {
+            let updated_at = meta
+                .get(&b.tag)
+                .and_then(|v| v.get("updatedAt"))
+                .and_then(Value::as_str)
+                .and_then(rfc3339_to_epoch_ms);
+            updated_at.is_none_or(|last| elapsed_or_clock_rollback(now, last, interval_ms))
+        })
+        .map(|b| b.tag)
+        .collect();
+    DueUpdatePlan {
+        external_ids,
+        builtin_tags,
+    }
+}
+
 /// 规则资源自动更新调度器（含退避 + 防重入）。
 pub struct RuleResourceScheduler {
     inner: Arc<Mutex<Inner>>,
@@ -269,26 +323,15 @@ impl RuleResourceScheduler {
         self.refresh_catalog_if_due(app, &config, now, &res_dir, reason)
             .await;
 
-        let due = {
+        let plan = {
             let mut inner = lock_inner(&self.inner);
-            let active: HashSet<String> = config
-                .get("ruleResources")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            inner.backoff.prune(&active); // 资源被删后剪退避键，防内存无界增长
-            select_due_resources(&config, now, &inner.backoff, &|f| res_dir.join(f).exists())
+            plan_due_updates(&config, now, &mut inner.backoff, &|f| {
+                res_dir.join(f).exists()
+            })
         };
-        if due.is_empty() {
-            return;
-        }
 
         let (mut ok_count, mut failures) = (0usize, Vec::new());
-        for id in due {
+        for id in plan.external_ids {
             // 走既有下载核心而非直接调下载函数：命令层已收口「条目解析 / 落盘 / persist + 广播」，
             // 绕过它就得在这里复刻一份必然漂移的副本。
             //
@@ -320,7 +363,7 @@ impl RuleResourceScheduler {
         }
         // ── 随包内置 geo 也纳入自动更新射程 ──
         //
-        // 此前只遍历 `config.ruleResources`，而内置 geo **从不入册** ⇒ 随包那 28 个 `.srs`
+        // 此前只遍历 `config.ruleResources`，而内置 geo **从不入册** ⇒ 注册表里的随包 `.srs`
         // 一旦出厂就永不更新，用户看到的分流数据可能落后好几个月
         // （陈先生 2026-07-30：「本地 srs 应该跟随更新」）。
         // 它们的更新腿是本批之前才补上的 `rule_resources_update_builtin`，缺腿才是当初漏掉的真因。
@@ -328,7 +371,9 @@ impl RuleResourceScheduler {
         // 与已登记资源共用同一个总开关和同一个间隔（`auto_update_interval_ms`）——
         // 「我关了自动更新」必须对两类都成立。退避表也共用，键用 `builtin:<tag>`（= 它的资源 id，
         // 与前端列表里那一行同名），故不会与已登记资源的 id 撞键。
-        let builtin_ok = self.run_builtin_geo(app, &config, now, reason).await;
+        let builtin_ok = self
+            .run_builtin_geo(app, plan.builtin_tags, now, reason)
+            .await;
 
         // ── 整批收尾：广播一次（而不是批内每条各广播一次）──
         //
@@ -372,35 +417,10 @@ impl RuleResourceScheduler {
     async fn run_builtin_geo(
         &self,
         app: &tauri::AppHandle,
-        config: &Value,
+        due: Vec<String>,
         now: u64,
         reason: &str,
     ) -> usize {
-        let Some(interval_ms) = auto_update_interval_ms(config) else {
-            return 0; // 总开关关 / 间隔为「仅手动」→ 整条腿不跑（与已登记资源同口径）
-        };
-        let meta = config.get("builtinGeoMeta").cloned().unwrap_or(Value::Null);
-        let due: Vec<String> = {
-            let inner = lock_inner(&self.inner);
-            builtin_geo_rulesets()
-                .into_iter()
-                .filter(|b| {
-                    if !inner.backoff.is_eligible(&builtin_id_for(&b.tag), now) {
-                        return false;
-                    }
-                    let updated_at = meta
-                        .get(&b.tag)
-                        .and_then(|v| v.get("updatedAt"))
-                        .and_then(Value::as_str);
-                    match updated_at.and_then(rfc3339_to_epoch_ms) {
-                        // 从未联网更新过 → 立即到期。
-                        None => true,
-                        Some(t) => elapsed_or_clock_rollback(now, t, interval_ms),
-                    }
-                })
-                .map(|b| b.tag)
-                .collect()
-        };
         if due.is_empty() {
             return 0;
         }

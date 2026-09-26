@@ -284,7 +284,9 @@ export function NodeMenu({
                       `FlagImg`——需要分开的是**数据源**，不是渲染体。默认 `.flag` 盒（18×12）即行内尺寸。 */}
                   <FlagImg code={flagCodeForName(s.name)} />
                   <span className="nm-name">{s.name}</span>
-                  <span className="nm-badge">{s.protocol.toUpperCase()}</span>
+                  <span className="nm-badge">
+                    {s.protocol === 'masque-client' ? 'MASQUE' : s.protocol.toUpperCase()}
+                  </span>
                   <span className={cn('nm-lat', latLevel(lat))}>{latText(lat)}</span>
                   {on && <NmCheck />}
                 </button>

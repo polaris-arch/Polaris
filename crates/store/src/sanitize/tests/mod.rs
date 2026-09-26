@@ -46,6 +46,30 @@ fn bad_server_dropped_good_server_kept() {
     assert_eq!(servers[0]["id"], "good");
 }
 
+#[test]
+fn multiple_userspace_tailscale_nodes_survive_storage_roundtrip() {
+    let original = r#"{"servers":[
+        {"id":"ts-a","name":"Tailnet A","protocol":"tailscale",
+         "tailscaleSettings":{"reverseMesh":false,"controlUrl":"https://a.example"}},
+        {"id":"ts-b","name":"Tailnet B","protocol":"tailscale",
+         "tailscaleSettings":{"reverseMesh":false,"controlUrl":"https://b.example"}}
+    ]}"#;
+    let first = sanitize_config(original).unwrap();
+    let saved = serde_json::to_string(&first).unwrap();
+    let loaded = sanitize_config(&saved).unwrap();
+    let ids: Vec<_> = loaded["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|server| server["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["ts-a", "ts-b"]);
+    assert_eq!(
+        loaded["servers"][1]["tailscaleSettings"]["controlUrl"],
+        "https://b.example"
+    );
+}
+
 /// tailcat 是无地址协议（同 tor）：没有 address/port 也保留；设置块不合格则按必填门丢弃。
 #[test]
 fn addressless_tailcat_kept_invalid_tailcat_dropped() {

@@ -455,6 +455,19 @@ describe('protoCodec round-trip (R5)', () => {
     expect(out.subscriptionId).toBe('sub-9');
     expect(out.tlsSettings?.fragment).toBe(true); // 未建模的 tls 项经 mergeTls 保留
   });
+
+  it('OpenConnect 内嵌 OTP token 对象经表单高级 JSON 编辑后保持对象', () => {
+    const token = { mode: 'totp', secret: 'inline', counter: 1 };
+    const cfg: ServerConfig = {
+      ...SAMPLES.openconnect,
+      openconnectSettings: { ...SAMPLES.openconnect.openconnectSettings, token },
+    };
+    const draft = protoCodec.openconnect.fromConfig(cfg);
+    expect(draft.token).toBe('');
+    expect(draft.extraJson).toContain('"mode"');
+    const out = protoCodec.openconnect.toConfig(draft, cfg);
+    expect(out.openconnectSettings?.token).toEqual(token);
+  });
 });
 
 describe('fromConfig 归一（R3/R4）', () => {
@@ -2695,6 +2708,41 @@ describe('endpoint 腿 VPN 客户端的内网段与全隧道开关', () => {
   it('OpenConnect server 只由公共地址/端口派生，IPv6 自动补方括号', () => {
     const base = { id: 'x', name: 'X', protocol: 'openconnect', address: '2001:db8::1', port: 4443 } as ServerConfig;
     expect(protoCodec.openconnect.toConfig({}, base).openconnectSettings?.server).toBe('[2001:db8::1]:4443');
+  });
+
+  it('OpenConnect URL 保留认证路径，公共地址变化时更新 host/port', () => {
+    const raw = 'https://vpn.example.com:4443/auth/path?group=office';
+    const base = {
+      id: 'x', name: 'X', protocol: 'openconnect', address: 'vpn.example.com', port: 4443,
+      openconnectSettings: { server: raw },
+    } as ServerConfig;
+    const draft = protoCodec.openconnect.fromConfig(base);
+    expect(protoCodec.openconnect.toConfig(draft, base).openconnectSettings?.server).toBe(raw);
+    expect(protoCodec.openconnect.toConfig(draft, { ...base, address: '2001:db8::1', port: 8443 })
+      .openconnectSettings?.server).toBe('https://[2001:db8::1]:8443/auth/path?group=office');
+    const http = { ...base, port: 80, openconnectSettings: { server: 'http://vpn.example.com:80/auth' } };
+    expect(protoCodec.openconnect.toConfig(draft, http).openconnectSettings?.server)
+      .toBe('http://vpn.example.com:80/auth');
+    expect(protoCodec.openconnect.toConfig(draft, { ...http, address: 'new.example' }).openconnectSettings?.server)
+      .toBe('http://new.example:80/auth');
+    const noPort = { ...base, port: 443, openconnectSettings: { server: 'http://vpn.example.com/auth' } };
+    expect(protoCodec.openconnect.toConfig(draft, noPort).openconnectSettings?.server)
+      .toBe('http://vpn.example.com/auth');
+  });
+
+  it('OpenVPN static_key 导入形状编辑保存不增加 TLS', () => {
+    const base = {
+      id: 'x', name: 'STATIC', protocol: 'openvpn-client', address: '192.0.2.1', port: 1194,
+      openvpnClientSettings: {
+        mode: 'static_key', address: ['10.0.0.2/24'], peer_address: '10.0.0.1',
+        cipher: 'AES-128-CBC', auth: 'SHA256', static_key: ['inline'],
+      },
+    } as ServerConfig;
+    const draft = protoCodec['openvpn-client'].fromConfig(base);
+    const out = protoCodec['openvpn-client'].toConfig(draft, { ...base, name: 'RENAMED' });
+    expect(out.openvpnClientSettings?.mode).toBe('static_key');
+    expect(out.openvpnClientSettings?.static_key).toEqual(['inline']);
+    expect(out.openvpnClientSettings?.tls).toBeUndefined();
   });
 
   it('OpenVPN 根级与 TLS 扩展使用两个独立透传袋', () => {

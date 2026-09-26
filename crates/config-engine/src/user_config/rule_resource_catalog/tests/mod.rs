@@ -81,7 +81,7 @@ fn every_builtin_item_is_bundled() {
 
 /// 内置条目的下载地址必须与随包更新腿的 `source_url()` 同址 —— 不同址就意味着同一份数据
 /// 在「资源库下载」与「内置更新」两条腿会取到两个来源。
-/// CN 三件套除外：它们的更新腿走 SagerNet release 资产，本就不是 MRD raw（见随包表注释）。
+/// CN 三件套除外：它们的更新腿走 SagerNet `rule-set` 分支，本就不是 MRD raw。
 #[test]
 fn catalog_url_matches_builtin_source_url() {
     use super::super::builtin_geo_rulesets::mrd_geo_raw_base;

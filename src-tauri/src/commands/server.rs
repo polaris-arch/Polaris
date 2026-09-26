@@ -36,7 +36,7 @@ const DIRECT_SERVER_ID: &str = "__direct__";
 /// id 缺失 / 空 → mint uuid（镜像 [`server_add_bulk`] 的 `s["id"]=new_uuid()`）。
 ///
 /// 此前 `server_add` 直接 push 原值不补 id → `store::sanitize` 丢弃 id 缺失/空的节点（要求 id 非空字符串）
-/// → 克隆 / 手动加的节点产出不可用、不持久。非对象入参不动（交 sanitize 丢弃）。
+/// → 克隆 / 手动加的节点产出不可用、不持久。非对象由单条新增校验拒绝。
 fn ensure_server_id(mut server: Value) -> Value {
     if let Some(obj) = server.as_object_mut() {
         let has_id = obj
@@ -50,34 +50,63 @@ fn ensure_server_id(mut server: Value) -> Value {
     server
 }
 
-/// `server:add` 核心（注入 `ConfigManager`，便于真实 ConfigStore 驱动测试）：补 id + 落盘，返回新 config。
+/// 单条新增先走存储层同一套清洗与模型解码，避免被保存腿过滤后仍返回成功。
+fn validate_server_add(server: Value) -> Result<Value, String> {
+    let mut probe = polaris_store::sanitize_config(&json!({"servers": [server]}).to_string())
+        .map_err(|_| "SERVER_ADD_INVALID".to_string())?;
+    let server = probe["servers"]
+        .as_array_mut()
+        .filter(|servers| servers.len() == 1)
+        .map(|servers| servers.remove(0))
+        .ok_or_else(|| "SERVER_ADD_INVALID".to_string())?;
+    serde_json::from_value::<ServerConfig>(server.clone())
+        .map_err(|_| "SERVER_ADD_INVALID".to_string())?;
+    if !polaris_store::validate::protocol_requirement_ok(
+        &server["protocol"]
+            .as_str()
+            .expect("validated protocol")
+            .to_lowercase(),
+        &server,
+    ) {
+        return Err("SERVER_ADD_INVALID".to_string());
+    }
+    Ok(server)
+}
+
+/// `server:add` 核心：校验、补 id、原子落盘并确认存活。同 id 同内容重试幂等，冲突不写。
 fn server_add_core(config: &ConfigManager, server: Value) -> Result<Value, String> {
-    let (_, saved) = config
+    let server = validate_server_add(ensure_server_id(server))?;
+    let id = server["id"].as_str().expect("validated server id");
+    let (result, saved) = config
         .update(|cfg| {
-            if let Some(servers) = cfg.get_mut("servers").and_then(Value::as_array_mut) {
-                servers.push(ensure_server_id(server));
+            let Some(servers) = cfg.get("servers").and_then(Value::as_array) else {
+                return Decision::Skip(Err("SERVER_ADD_INVALID_CONFIG".to_string()));
+            };
+            if let Some(existing) = servers.iter().find(|existing| existing["id"] == id) {
+                return if *existing == server {
+                    Decision::Skip(Ok(Some(cfg.clone())))
+                } else {
+                    Decision::Skip(Err("SERVER_ADD_ID_CONFLICT".to_string()))
+                };
             }
-            Decision::Write(())
+            cfg["servers"].as_array_mut().unwrap().push(server.clone());
+            Decision::Write(Ok(None))
         })
         .map_err(|e| format!("{e}"))?;
-    Ok(saved.expect("server_add 的 Write 腿必须返回已落盘配置"))
+    let persisted = saved.or(result?).expect("write or idempotent snapshot");
+    if !persisted["servers"]
+        .as_array()
+        .is_some_and(|servers| servers.contains(&server))
+    {
+        return Err("SERVER_ADD_NOT_PERSISTED".to_string());
+    }
+    Ok(persisted)
 }
 
 /// 上游 `SERVER_ADD`：新增节点（id 缺失/空则 mint，防 sanitize 丢弃）。
 ///
-/// DESIGN-REVIEW(mesh-singleton-guard-renderer-only)：**WARP / Tailscale 单例槽的闸门只在渲染端**
-/// （`ui/src/domain/endpoint-routes.ts#meshSingletonConflict`，接线于 NodeDialog / WgDialog /
-/// ImportDialog / 节点克隆四条腿；WarpDialog 由接入区卡片分流、TsLoginDialog 由
-/// `planTsLoginSubmit` 复用既有节点，结构上不产生第二实例）。本命令与 [`server_add_bulk`] 刻意**不加**
-/// 对应守卫，理由：
-///  1. 判定谓词 `isWarpServer` 在 Rust 侧无对应物（`domain/warp.ts` 头注已登记此边界：输入均在前端
-///     store，漂移后果止于 UI）。在此复刻一份「端点域名兜底 + warpDevice 标记」的启发式 = 造第二真值源，
-///     无 codegen 约束，日后必然与 TS 侧分叉——这正是本仓反复吃过的亏。
-///  2. 误判方向不可接受：本命令同时是备份恢复 / 导入的落盘substrate，Rust 侧启发式误拒一个合法节点，
-///     用户在 UI 上无从修复；而渲染端误拒最多是弹一次错、用户改地址重来。
-///  3. 威胁模型：`server:add` 只被本应用自己的 webview 调用，不接受外部不可信输入。
-///
-/// 若日后新增**非渲染端**的写入方（CLI / 深链接 / 远程配置下发），本决定即失效，须在此补守卫。
+/// WARP 单例槽继续由渲染端 `meshSingletonConflict` 在注册前检查。本入口负责单条输入
+/// 校验和持久化确认；Tailscale 可保存多个节点，其状态写入所有权由登录运行时管理。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -718,111 +747,177 @@ pub async fn warp_apply_license(
     }
 }
 
-/// 上游 `TAILSCALE_LOGIN`：拉起瞬态登录核抓交互登录 URL（Phase 2）。
-///
-/// 语义契约：`started:true` 仅表示**已起核**，非「已登录」——登录 URL 经 `event:tailscaleAuthUrl` 异步到达
-/// （前端弹窗监听），真正登录成功要用户在浏览器完成。双写守卫命中（该 endpoint 已在运行主核）→
-/// `{started:false, reason:'inMainCore'}`（复用 `tailscale_endpoint_in_running_core`，避两核同写 state 冲突）。
-/// 起核前失败（配置解析/resolve/端口或 secret 解析/写盘/`sing-box check`/spawn/STATUS 订阅）→ 结构化 error
-/// （信封 success=false + code）。
-///
-/// **URL 与登录成功都取自瞬态核自己的管理 API STATUS 流**（`authURL` / `backendState=Running`），核 stdout
-/// 只进日志、不再是判据来源；gRPC 腿建不起来即硬失败，不回退 stdout（取舍与理由见
-/// `runtime::tailscale_login_core` 模块头）。
-///
-/// **诚实边界（真机门槛）**：真 spawn + 连 Tailscale 控制面 + 真登录 URL 一段**在本机无法验证**（本仓禁跑
-/// 触碰宿主网络的测试；`sing-box check` 只验配置形状，验不了运行时是否真吐 URL）。可单测面（注册表生命周期 /
-/// 去重 / 超时 / 取消 / reap / STATUS→URL relay / Running→收核）已用 mock spawner + mock STATUS 流覆盖于
-/// `runtime::tailscale_login_core`；端到端登录待真机会话，验收清单见
-/// `~/docs/polaris/design/polaris-tailscale-login-wiring.md`。
+/// Register the renderer-minted identity before save/check/subscribe can be cancelled.
+/// Registration never starts a process; cancelled identities remain bounded tombstones.
+#[tauri::command]
+pub fn tailscale_login_prepare(
+    state: State<'_, AppRuntime>,
+    server_id: String,
+    attempt_id: String,
+) -> ApiResponse<()> {
+    if polaris_mesh::tailscale_state::tailscale_state_dir(std::path::Path::new("."), &server_id)
+        .is_err()
+    {
+        return ApiResponse::err_with_code(
+            "Invalid Tailscale node identity",
+            "TAILSCALE_LOGIN_BAD_SERVER",
+        );
+    }
+    match state
+        .mesh()
+        .prepare_tailscale_login(&server_id, &attempt_id)
+    {
+        Ok(()) => ok_void(),
+        Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_BAD_ATTEMPT"),
+    }
+}
+
+/// Authorize the persisted node with an explicit browser/AuthKey mode and prepared attempt identity.
+/// `started` denotes process startup only; request-scoped STATUS progress confirms Running after reap.
+/// A matching primary owner is queried once for fresh STATUS; a changed configuration remains pending.
+/// Real control-plane authorization is outside the mock/check-only test boundary.
 #[tauri::command]
 pub async fn tailscale_login(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     server: Value,
+    request: crate::runtime::tailscale_login_core::LoginRequest,
 ) -> Result<ApiResponse<Value>, ()> {
-    let server_cfg: ServerConfig = match serde_json::from_value(server) {
-        Ok(s) => s,
-        Err(e) => {
-            return Ok(ApiResponse::err_with_code(
-                format!("Tailscale 登录：节点配置解析失败: {e}"),
-                "TAILSCALE_LOGIN_BAD_SERVER",
-            ))
+    let Some(server_id) = server.get("id").and_then(Value::as_str) else {
+        return Ok(ApiResponse::err_with_code(
+            "Invalid Tailscale node",
+            "TAILSCALE_LOGIN_BAD_SERVER",
+        ));
+    };
+    // Login consumes the persisted node, so a failed/staged save cannot authorize another identity.
+    let Ok(saved) = state.config().current() else {
+        return Ok(ApiResponse::err_with_code(
+            "Cannot read the saved node",
+            "TAILSCALE_LOGIN_BAD_SERVER",
+        ));
+    };
+    let Some(server_cfg) = saved
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(server_id))
+        })
+        .and_then(|node| serde_json::from_value::<ServerConfig>(node.clone()).ok())
+        .filter(|node| {
+            node.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale
+        })
+    else {
+        return Ok(ApiResponse::err_with_code(
+            "Save the Tailscale node before authorization",
+            "TAILSCALE_LOGIN_BAD_SERVER",
+        ));
+    };
+    let main_core = || {
+        let cfg = state
+            .proxy()
+            .running_config_snapshot()
+            .and_then(|v| serde_json::from_value::<UserConfig>(v).ok());
+        crate::runtime::tailscale_login_core::MainLoginSnapshot {
+            alive: state.proxy().tailscale_writer_alive(),
+            generation: state.proxy().core_generation(),
+            api_secret: cfg
+                .as_ref()
+                .and_then(|c| c.clash_api_secret.clone())
+                .unwrap_or_default(),
+            api_port: state.proxy().status().clash_api_port,
+            http_port: cfg.as_ref().and_then(|c| c.http_port),
+            mixed_port: cfg.as_ref().and_then(|c| c.mixed_port),
         }
     };
-    // 双写守卫入参：运行主核状态 + 运行配置（endpoint 已在运行主核则不再起瞬态核）。
-    // `clash_api_port` 一并带上：瞬态核自己的管理 API 端口要避开主核那个（同一份运行快照，
-    // 语义正好 = 此刻真的被占着的端口；核没跑时它是 0，`PortExclusions` 自会滤掉）。
-    let status = state.proxy().status();
-    let is_running = status.running;
-    let running_cfg: Option<UserConfig> = state
-        .proxy()
-        .current_config_snapshot()
-        .and_then(|v| serde_json::from_value(v).ok());
     match state
         .mesh()
-        .start_tailscale_login(
-            app,
-            &server_cfg,
-            is_running,
-            running_cfg.as_ref(),
-            status.clash_api_port,
-        )
+        .start_tailscale_login(app, &server_cfg, request, &main_core)
         .await
     {
-        StartLoginOutcome::Started => Ok(ApiResponse::ok(json!({ "started": true }))),
+        StartLoginOutcome::Started => Ok(ApiResponse::ok(json!({"started": true}))),
         StartLoginOutcome::InMainCore => Ok(ApiResponse::ok(
-            json!({ "started": false, "reason": "inMainCore" }),
+            json!({"started": false, "reason": "inMainCore"}),
         )),
-        StartLoginOutcome::Failed(e) => Ok(ApiResponse::err_with_code(e, "TAILSCALE_LOGIN_FAILED")),
+        StartLoginOutcome::InMainCorePending => Ok(ApiResponse::ok(
+            json!({"started": false, "reason": "inMainCore", "configurationPending": true}),
+        )),
+        StartLoginOutcome::Cancelled => Ok(ApiResponse::ok(
+            json!({"started": false, "reason": "cancelled"}),
+        )),
+        StartLoginOutcome::Failed(reason) => {
+            Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED"))
+        }
     }
 }
 
-/// 上游 `TAILSCALE_LOGIN_CANCEL`：取消某节点在飞的瞬态登录核（kill + 注销）。
+/// 上游 `TAILSCALE_LOGIN_CANCEL`：取消一个请求，等待其核收割后注销。
 /// 幂等：取消一个不存在的登录不算错（对齐 Polaris handler 的静默 ok）。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn tailscale_login_cancel(state: State<'_, AppRuntime>, server_id: String) -> ApiResponse<()> {
-    let _ = state.mesh().cancel_tailscale_login(&server_id);
-    ok_void()
+pub async fn tailscale_login_cancel(
+    state: State<'_, AppRuntime>,
+    server_id: String,
+    attempt_id: String,
+) -> Result<ApiResponse<()>, ()> {
+    Ok(
+        match state
+            .mesh()
+            .cancel_tailscale_login_attempt(&server_id, &attempt_id)
+            .await
+        {
+            Ok(()) => ok_void(),
+            Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_CANCEL_FAILED"),
+        },
+    )
 }
 
-/// 上游 `TAILSCALE_LOGOUT`：退出登录（清 state 目录；保留节点配置/authKey）。
-///
-/// `runningNeedsRestart`：该 TS endpoint 是否仍在**当前运行主核**内。1.14 always-emit 下「节点在运行配置里
-/// = 已在主核」——登出只清了盘上 state 目录，运行中的主核仍持该 endpoint 的旧登录态，须重启核才真正生效
-/// → 前端据此提示重启。判定复用 mesh crate `tailscale_endpoint_in_running_core`（与 login 双写守卫同真值源）。
+/// Logout cancels and reaps transient writers before deleting state. A live primary owner is
+/// rejected without stopping the connection. An optional unclaimed attempt survives AuthKey replacement.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn tailscale_logout(state: State<'_, AppRuntime>, server_id: String) -> ApiResponse<Value> {
-    if let Err(error) = state.mesh().tailscale_logout(&server_id) {
-        let code = if error.kind() == std::io::ErrorKind::InvalidInput {
-            "TAILSCALE_LOGOUT_INVALID_SERVER_ID"
-        } else {
-            "TAILSCALE_LOGOUT_FAILED"
-        };
-        return ApiResponse::err_with_code(error.to_string(), code);
+pub async fn tailscale_logout(
+    state: State<'_, AppRuntime>,
+    server_id: String,
+    keep_attempt_id: Option<String>,
+) -> Result<ApiResponse<Value>, ()> {
+    match state
+        .mesh()
+        .logout_tailscale_safely(
+            &server_id,
+            &|| state.proxy().tailscale_writer_alive(),
+            keep_attempt_id.as_deref(),
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(ApiResponse::err_with_code(
+                "Stop the main connection before signing this node out",
+                "TAILSCALE_LOGOUT_MAIN_CORE",
+            ))
+        }
+        Err(error) => {
+            let code = if error.kind() == std::io::ErrorKind::InvalidInput {
+                "TAILSCALE_LOGOUT_INVALID_SERVER_ID"
+            } else {
+                "TAILSCALE_LOGOUT_FAILED"
+            };
+            return Ok(ApiResponse::err_with_code(
+                "Cannot clear Tailscale state",
+                code,
+            ));
+        }
     }
-    let is_running = state.proxy().status().running;
-    let running_cfg = state.proxy().current_config_snapshot();
-    let needs_restart = logout_needs_restart(&server_id, is_running, running_cfg.as_ref());
-    ApiResponse::ok(json!({ "runningNeedsRestart": needs_restart }))
-}
-
-/// `tailscale_logout.runningNeedsRestart` 装配判定：运行配置快照（JSON）反序列化后交 mesh crate
-/// `tailscale_endpoint_in_running_core`。核未跑 / 快照缺失 / 结构不符 → false（保守：判不准不误报重启）。
-fn logout_needs_restart(server_id: &str, is_running: bool, running_cfg: Option<&Value>) -> bool {
-    if !is_running {
-        return false;
-    }
-    let cfg: Option<UserConfig> = running_cfg.and_then(|v| serde_json::from_value(v.clone()).ok());
-    polaris_mesh::tailscale_endpoint_in_running_core(server_id, is_running, cfg.as_ref())
+    // Compatibility response field: a running owner is rejected above, so success never needs restart.
+    Ok(ApiResponse::ok(json!({ "runningNeedsRestart": false })))
 }
 
 /// 上游 `TAILSCALE_STATE_EXISTS`：批量查 TS 节点 state 目录存在性。
@@ -835,8 +930,27 @@ pub fn tailscale_state_exists(
     state: State<'_, AppRuntime>,
     server_ids: Vec<String>,
 ) -> ApiResponse<Value> {
-    let map = state.mesh().tailscale_state_exists(&server_ids);
-    ApiResponse::ok(serde_json::to_value(map).unwrap_or_default())
+    let mut map = serde_json::Map::new();
+    for id in server_ids {
+        let Ok(path) = state.mesh().tailscale_state_dir(&id) else {
+            return ApiResponse::err_with_code(
+                "Cannot verify Tailscale state",
+                "TAILSCALE_STATE_QUERY_FAILED",
+            );
+        };
+        let exists = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => {
+                return ApiResponse::err_with_code(
+                    "Cannot verify Tailscale state",
+                    "TAILSCALE_STATE_QUERY_FAILED",
+                )
+            }
+        };
+        map.insert(id, Value::Bool(exists));
+    }
+    ApiResponse::ok(Value::Object(map))
 }
 
 /// 上游 `TAILSCALE_GET_STATUS`：拉各 TS 节点状态末帧（sing-box 管理 API STATUS 流缓存）。

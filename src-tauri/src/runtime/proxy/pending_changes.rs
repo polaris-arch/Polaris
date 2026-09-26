@@ -180,7 +180,7 @@ impl ProxyRuntime {
         // 2. 真未运行 → 下次 start 从磁盘纳入新节点。
         if !self.core_running() {
             // 无活核可保护时，Apply 本身就是安全事务点；不必强迫用户再启动一次才能完成物理删除。
-            self.process_deferred_config_deletions();
+            self.process_deferred_config_deletions().await;
             log::info!("applyPendingChanges：核未运行 → skipped");
             return "skipped";
         }
@@ -195,7 +195,16 @@ impl ProxyRuntime {
     }
 
     /// 消费由暂存保存腿写下的不可逆删除意图。失败条目保留在 journal，下次 Apply/启动重试。
-    pub(crate) fn process_deferred_config_deletions(&self) {
+    pub(crate) async fn process_deferred_config_deletions(&self) {
+        let gate = self.mesh.tailscale_state_gate().await;
+        self.process_deferred_config_deletions_under_gate(&gate);
+    }
+
+    /// Startup already owns the gate; never recursively acquire it while flushing its journal.
+    pub(crate) fn process_deferred_config_deletions_under_gate(
+        &self,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) {
         let config_dir = self.config.dir().to_path_buf();
         let result = self
             .config
@@ -219,7 +228,11 @@ impl ProxyRuntime {
                     app_id,
                 ),
                 DeferredConfigDeletion::TailscaleState { server_id } => {
-                    match self.mesh.tailscale_logout(server_id) {
+                    match self.mesh.tailscale_logout_under_gate(
+                        server_id,
+                        gate,
+                        self.tailscale_writer_alive(),
+                    ) {
                         Ok(()) => Ok(()),
                         // 旧版恶意/损坏配置可能把不安全 id 留进 journal；它不可能对应受管目录，
                         // 安全丢弃该删除意图，避免每次启动永久重试。

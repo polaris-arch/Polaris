@@ -24,10 +24,12 @@ The authoritative list lives in `crates/config-engine/src/user_config/builtin_ge
 
 ## Updating
 
-Built-in sets refresh in-app (Rule Resources → update; auto-update is on by default). To refresh a single file manually from the official source, e.g.:
+Built-in sets refresh in-app (Rule Resources → update; auto-update is on by default).
+
+SagerNet publishes `.srs` files on the `rule-set` branch. The `.db` release assets cannot be used as `.srs` rule-sets. To refresh a single file manually from the official source, e.g.:
 
 ```bash
-curl -L -o geoip-cn.srs https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-cn.srs
+curl -fL -o geoip-cn.srs https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs
 ```
 
 ## Using a rule-set in a sing-box config

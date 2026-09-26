@@ -141,6 +141,7 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     "spawn_pipe_loggers_with_preopened_files",
     "spawn_pipe_drainers",
     "pipe_to_log(",
+    "pipe_to_log_with_secrets(",
     "drain(",
     "lines()",
     // 直接读到 EOF。**这一条今天没有任何生产站点在用**，它在集合里是因为它是 `resolvectl` 那条腿在
@@ -401,14 +402,15 @@ const PRODUCER_CONSUMERS: &[Consumer] = &[
     },
     Consumer {
         file: "src-tauri/src/runtime/tailscale_login_core.rs",
-        anchor: "pub async fn start_login(",
-        drain_form: "pipe_to_log(",
+        // Prepared attempts moved production spawn assembly here; start_login is a test-only wrapper.
+        anchor: "async fn launch_attempt(",
+        drain_form: "pipe_to_log_with_secrets(",
         // 瞬态登录核：整改前这条腿在源码级上是**零门**（计数判据被一行补计数的调用绕过），
         // 而它与临时核共用同一个 spawner、同一份排空实现，缺陷形态完全同构。
         wiring: &[
-            "StdioPolicy::drain(|stdout,stderr|{",
-            "pipe_to_log(stdout,LOGIN_CORE_LOG_TARGET,None,None);",
-            "pipe_to_log(stderr,LOGIN_CORE_LOG_TARGET,None,None);",
+            "StdioPolicy::drain(move|stdout,stderr|{",
+            "pipe_to_log_with_secrets(stdout,LOGIN_CORE_LOG_TARGET,None,None,secrets.clone(),);",
+            "pipe_to_log_with_secrets(stderr,LOGIN_CORE_LOG_TARGET,None,None,secrets);",
         ],
     },
 ];

@@ -354,6 +354,19 @@ pub(crate) fn pipe_to_log<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    pipe_to_log_with_secrets(stream, target, fatal, handoff, Vec::new());
+}
+
+/// The login process knows its exact credentials; scrub them before forwarding any diagnostic.
+pub(crate) fn pipe_to_log_with_secrets<R>(
+    stream: R,
+    target: &'static str,
+    fatal: Option<CoreFatalSlot>,
+    handoff: Option<CoreLogHandoff>,
+    secrets: Vec<String>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         // **按字节读、不用 `lines()`**：`AsyncBufReadExt::lines()` 遇非 UTF-8 字节返回
         // `Err(InvalidData)`，而 `while let Ok(Some(_))` 会把它当成流结束 ⇒ 整条 drain 就此退出、
@@ -372,7 +385,7 @@ pub(crate) fn pipe_to_log<R>(
             while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
                 buf.pop();
             }
-            let line = String::from_utf8_lossy(&buf);
+            let line = redact_known_process_secrets(&String::from_utf8_lossy(&buf), &secrets);
             let level = singbox_line_level(&line);
             // 已交接给 SubscribeLog 流 → 不转发（分类照跑：就绪后的 log.Fatal 仍只走 stderr）。
             // 瞬态核没有那条流，`handoff` 恒 `None` ⇒ 恒转发。
@@ -389,6 +402,19 @@ pub(crate) fn pipe_to_log<R>(
             }
         }
     });
+}
+
+pub(crate) fn redact_known_process_secrets(raw: &str, secrets: &[String]) -> String {
+    let mut line = raw.to_owned();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        line = line.replace(secret, "[REDACTED]");
+    }
+    if !secrets.is_empty() {
+        if let Some((prefix, _)) = line.split_once("Waiting for authentication:") {
+            line = format!("{prefix}Waiting for authentication: [REDACTED]");
+        }
+    }
+    line
 }
 
 /// 核侧 `LogLevel`（七档、0=PANIC 最严重）→ 本仓 sink 的 `log::Level`（五档）。

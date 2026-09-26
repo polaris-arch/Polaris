@@ -344,7 +344,8 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     } catch (e) {
       // 登出不是保存 —— 标题取 NodesScreen:696 同一操作已在用的那个键，别套 `common.saveFailed`。
       console.error('[TsSettingsDialog] logout failed:', e);
-      toast.error(t('nodes.meshTsLogoutFail'));
+      const busy = e && typeof e === 'object' && 'code' in e && e.code === 'TAILSCALE_LOGOUT_MAIN_CORE';
+      toast.error(t(busy ? 'ts.reasonMainCoreInUse' : 'nodes.meshTsLogoutFail'));
     } finally {
       setBusy(false);
     }

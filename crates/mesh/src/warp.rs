@@ -56,18 +56,21 @@ pub const WARP_DEREGISTER_MAX_PER_DRAIN: usize = 10;
 
 /// WARP 注册产出的 WireGuard 草稿（无 id，供渲染端填表）。上游 `WarpWireGuardDraft`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WarpWireGuardDraft {
     pub address: String,
     pub port: u16,
+    #[serde(alias = "private_key")]
     pub private_key: String,
+    #[serde(alias = "peer_public_key")]
     pub peer_public_key: String,
-    #[serde(rename = "localAddress")]
+    #[serde(alias = "local_address")]
     pub local_address: Vec<String>,
     #[serde(rename = "reserved", default, skip_serializing_if = "Option::is_none")]
     pub reserved: Option<Vec<u8>>,
     pub meta: WarpDraftMeta,
     /// 远端设备自删凭据（deviceId+token）。删除此节点时据它发 DELETE 注销匿名设备。
-    #[serde(rename = "warpDevice")]
+    #[serde(alias = "warp_device")]
     pub warp_device: WarpDeviceCreds,
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use polaris_config_engine::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use polaris_config_engine::user_config::server_config::{ServerConfig, TailscaleSettings};
 use std::sync::{Arc, Mutex};
 
@@ -89,6 +90,8 @@ fn ts_system_exit_server(exit_node: Option<&str>) -> ServerConfig {
 
 fn config_with(server: ServerConfig) -> UserConfig {
     UserConfig {
+        selected_server_id: Some(server.id.clone()),
+        proxy_mode_type: ProxyModeType::Tun,
         servers: vec![server],
         ..Default::default()
     }
@@ -120,6 +123,7 @@ fn plan_none_when_no_exit_node() {
 fn plan_some_when_system_exit_node_v4_only() {
     let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     let plan = plan_mesh_exit_route(&cfg, false).unwrap();
+    assert_eq!(plan.server_id, "ts1");
     assert_eq!(plan.iface, TS_SYSTEM_INTERFACE_NAME);
     assert_eq!(plan.cidrs, vec!["0.0.0.0/0"]);
 }
@@ -129,6 +133,45 @@ fn plan_includes_v6_when_enabled() {
     let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     let plan = plan_mesh_exit_route(&cfg, true).unwrap();
     assert_eq!(plan.cidrs, vec!["0.0.0.0/0", "::/0"]);
+}
+
+#[test]
+fn plan_only_follows_exact_selected_tailscale_node() {
+    let mut first = ts_system_exit_server(Some("100.64.0.1"));
+    first.id = "ts-first".into();
+    first.tailscale_settings.as_mut().unwrap().reverse_mesh = Some(false);
+    let mut second = ts_system_exit_server(Some("100.64.0.2"));
+    second.id = "ts-selected".into();
+    let mut cfg = config_with(second);
+    cfg.servers.insert(0, first);
+    assert_eq!(
+        plan_mesh_exit_route(&cfg, false).unwrap().server_id,
+        "ts-selected"
+    );
+    cfg.selected_server_id = Some("ts-first".into());
+    assert!(plan_mesh_exit_route(&cfg, false).is_none());
+    cfg.selected_server_id = None;
+    assert!(plan_mesh_exit_route(&cfg, false).is_none());
+}
+
+#[test]
+fn plan_yields_when_tailscale_is_not_selected_or_traffic_is_not_tun() {
+    let mut cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
+    cfg.servers.push(ServerConfig {
+        id: "vless".into(),
+        protocol: Protocol::Vless,
+        ..Default::default()
+    });
+    cfg.selected_server_id = Some("vless".into());
+    assert!(plan_mesh_exit_route(&cfg, false).is_none());
+    cfg.selected_server_id = Some("ts1".into());
+    cfg.proxy_mode = ProxyMode::Direct;
+    assert!(plan_mesh_exit_route(&cfg, false).is_none());
+    cfg.proxy_mode = ProxyMode::Smart;
+    for mode in [ProxyModeType::Manual, ProxyModeType::SystemProxy] {
+        cfg.proxy_mode_type = mode;
+        assert!(plan_mesh_exit_route(&cfg, false).is_none());
+    }
 }
 
 #[test]
@@ -188,11 +231,61 @@ async fn reconcile_linux_installs_route_when_plan_present() {
     assert!(out.changed);
     let installed = mgr.installed().unwrap();
     assert_eq!(installed.iface, "polaris-ts");
+    assert_eq!(installed.server_id, "ts1");
     assert_eq!(installed.cidrs, vec!["0.0.0.0/0"]);
     let routes = op.routes.lock().unwrap();
     assert_eq!(routes.len(), 1);
     assert_eq!(routes[0].0, "add");
     assert_eq!(routes[0].1, "polaris-ts");
+}
+
+#[tokio::test]
+async fn windows_reconcile_does_not_touch_routes() {
+    let op = mock_with_iface("polaris-ts");
+    let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
+    let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Win);
+    let out = reconcile_now(&mut mgr, &cfg, false).await;
+    assert!(!out.changed);
+    assert!(out.installed.is_none());
+    assert!(op.routes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn switching_selected_tailscale_replaces_same_cidr_route() {
+    let op = mock_with_iface("polaris-ts");
+    let first = config_with(ts_system_exit_server(Some("100.64.0.1")));
+    let mut second_server = ts_system_exit_server(Some("100.64.0.2"));
+    second_server.id = "ts2".into();
+    let second = config_with(second_server);
+    let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Linux);
+    reconcile_now(&mut mgr, &first, false).await;
+    op.routes.lock().unwrap().clear();
+    let out = reconcile_now(&mut mgr, &second, false).await;
+    assert!(out.changed);
+    assert_eq!(mgr.installed().unwrap().server_id, "ts2");
+    let operations: Vec<_> = op
+        .routes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|route| route.0.clone())
+        .collect();
+    assert_eq!(operations, ["del", "add"]);
+}
+
+#[tokio::test]
+async fn reassert_clears_route_after_selection_loses_system_exit() {
+    let op = mock_with_iface("polaris-ts");
+    let active = config_with(ts_system_exit_server(Some("100.64.0.1")));
+    let mut inactive = active.clone();
+    inactive.proxy_mode = ProxyMode::Direct;
+    let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Linux);
+    reconcile_now(&mut mgr, &active, false).await;
+    op.routes.lock().unwrap().clear();
+    let out = reassert_now(&mut mgr, &inactive, false).await;
+    assert!(out.changed);
+    assert!(mgr.installed().is_none());
+    assert_eq!(op.routes.lock().unwrap()[0].0, "del");
 }
 
 #[tokio::test]
@@ -260,6 +353,7 @@ async fn clear_on_windows_is_noop() {
     let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Win);
     // Windows 下手动塞一个 installed（模拟跨平台状态），clear 应 no-op。
     mgr.installed = Some(InstalledRoute {
+        server_id: "ts1".into(),
         iface: "polaris-ts".into(),
         cidrs: vec!["0.0.0.0/0".into()],
     });

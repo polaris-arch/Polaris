@@ -1274,6 +1274,52 @@ fn mesh_system_unavailable_on_win32_tun() {
 }
 
 #[test]
+fn duplicate_system_tailscale_rejected_only_when_generator_can_emit_system_interfaces() {
+    let mut cfg = base_config();
+    cfg.proxy_mode_type = ProxyModeType::Tun;
+    cfg.servers = ["ts1", "ts2"]
+        .map(|id| ServerConfig {
+            id: id.into(),
+            name: id.into(),
+            protocol: Protocol::Tailscale,
+            tailscale_settings: Some(Box::new(
+                crate::user_config::server_config::TailscaleSettings {
+                    reverse_mesh: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        })
+        .into();
+    cfg.selected_server_id = Some("ts1".into());
+
+    let error = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap_err();
+    assert!(error.contains("polaris-ts"), "{error}");
+
+    cfg.proxy_mode_type = ProxyModeType::Manual;
+    let manual = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap();
+    assert_eq!(manual.endpoints.as_ref().unwrap().len(), 2);
+    assert!(manual
+        .endpoints
+        .as_ref()
+        .unwrap()
+        .iter()
+        .all(|ep| ep.system_interface != Some(true)));
+
+    cfg.proxy_mode_type = ProxyModeType::Tun;
+    let mut win = deps_default();
+    win.platform = "win32".into();
+    let windows = generate_sing_box_config(&cfg, &BTreeMap::new(), &win).unwrap();
+    assert_eq!(windows.endpoints.as_ref().unwrap().len(), 2);
+    assert!(windows
+        .endpoints
+        .as_ref()
+        .unwrap()
+        .iter()
+        .all(|ep| ep.system_interface != Some(true)));
+}
+
+#[test]
 fn probe_ports_propagate_to_inbounds_and_dns() {
     // probe_direct/proxy/port 注入 → inbounds 含 probe-direct-in/proxy-in。
     let mut deps = deps_default();

@@ -5,3 +5,5 @@ mod resource_delete_tests;
 mod resource_download_tests;
 
 mod catalog_tests;
+
+mod builtin_update_tests;

@@ -798,7 +798,9 @@ pub fn parse_singbox_outbounds(
     };
 
     let mut skip_by_type: Vec<(String, usize)> = Vec::new();
+    let mut unsafe_rejections = Vec::new();
     let mut skip_by_transport: Vec<(String, usize)> = Vec::new();
+    let mut tor_skipped = 0usize;
     let mut missing_fields = 0usize;
 
     for ob in arr {
@@ -818,18 +820,19 @@ pub fn parse_singbox_outbounds(
         // 故在此显式复用同一条信任判据，而不是依赖「它现在是建模协议了」。
         if ty == "tor" && origin != ImportOrigin::LocalFile {
             bump(&mut skip_by_type, ty.clone());
+            tor_skipped += 1;
             r.skipped += 1;
             continue;
         }
-        // ── tailcat（I1，2026-09-24）：第一期**只收本地文件**（D4）──
-        // 它没有命令执行向量，但远端放开只会多出面（`derp_map_url` 可指向任意 URL）而没有已知受众：
-        // 新协议远端订阅本来就不下发。远端腿按「不支持类型」跳过并计入 skipped。
+        // Tailcat 没有本地执行向量；远端只接收已知可移植字段，拒绝透传袋。
         // 无 server/port（同 tor），不走 `map_singbox_outbound` 的公共前置守卫。
         if ty == "tailcat" {
-            if origin != ImportOrigin::LocalFile {
-                bump(&mut skip_by_type, ty.clone());
-                r.skipped += 1;
-                continue;
+            if origin == ImportOrigin::RemoteSubscription {
+                if let Some(key) = remote_endpoint_rejection(ob, TAILCAT_REMOTE_KEYS, None) {
+                    unsafe_rejections.push(format!("tailcat.{key}"));
+                    r.skipped += 1;
+                    continue;
+                }
             }
             match map_tailcat_outbound(ob, sub_id, now, id_gen) {
                 Some((s, ignored)) => {
@@ -877,6 +880,17 @@ pub fn parse_singbox_outbounds(
         }
     }
 
+    if !unsafe_rejections.is_empty() {
+        r.warnings.push(format!(
+            "远程订阅节点含本地依赖或不可安全转换的字段，已跳过: {}",
+            unsafe_rejections.join(", ")
+        ));
+    }
+    if tor_skipped > 0 {
+        r.warnings.push(format!(
+            "跳过 {tor_skipped} 个 tor outbound：远端订阅可设置 executable_path/extra_args 拉起本机程序，仅接受本地文件导入"
+        ));
+    }
     if !skip_by_type.is_empty() {
         r.warnings.push(format!(
             "跳过不支持的 outbound 类型: {}",
@@ -903,18 +917,19 @@ pub fn parse_singbox_outbounds(
 ///
 /// # 内核 type 域（实测，随包核 `resources/linux/sing-box` = 1.14.0-beta.7）
 ///
-/// `sing-box check` 对 `endpoints[0].type` 逐个探得**恰五种**可解码：`wireguard` / `tailscale` /
-/// `openconnect` / `openvpn-client` / `openvpn-server`（余者 `unknown endpoint type: <t>`），
+/// 随包核可解码 `wireguard` / `tailscale` / `masque-client` / `masque-server` /
+/// `openconnect` / `openvpn-client` / `openvpn-server` 七种 endpoint；
 /// 与 `outbounds[]` 的 type 域**不相交**（`wireguard` 作 outbound 已于 1.13 移除、`tailscale`
 /// 作 outbound 即 unknown）。故本函数与 [`parse_singbox_outbounds`] 各管一个数组，无重复计数。
-/// Polaris 建模其中两种（[`Protocol::Wireguard`] / `Tailscale`），另三种无落点 → custom 逃生舱。
+/// Polaris 建模其中五种（`wireguard` / `tailscale` / `masque-client` / `openconnect` /
+/// `openvpn-client`）；剩余服务端类型走 custom 逃生舱。
 ///
 /// # 分流
 ///
 /// - `wireguard` → [`Protocol::Wireguard`] 建模映射（见 `map_wireguard_endpoint`）。
-/// - `tailscale` → **恒 skipped**（不建模、也不透传 custom），四条理由见函数体内该 match 臂的注释。
-/// - `masque-client` → [`Protocol::MasqueClient`]（`map_endpoint_masque`），**只收本地文件**，远端 skipped（D4）。
-/// - 其余三种 + 未知 type → 按 `origin` 走 custom 逃生舱（`isEndpoint = true`）/ skipped，
+/// - `tailscale` → **恒 skipped**（不建模、也不透传 custom），原因见函数体内该 match 臂的注释。
+/// - `masque-client` / `openconnect` / `openvpn-client` → 建模映射；远端逐字段筛选本地依赖。
+/// - 其余类型 → 按 `origin` 走 custom 逃生舱（`isEndpoint = true`）/ skipped，
 ///   与 [`parse_singbox_outbounds`] 同一条信任级判据。
 pub fn parse_singbox_endpoints(
     endpoints: &Value,
@@ -929,8 +944,11 @@ pub fn parse_singbox_endpoints(
     };
 
     let mut skip_by_type: Vec<(String, usize)> = Vec::new();
+    let mut unsafe_rejections = Vec::new();
     let mut tailscale_skipped = 0usize;
     let mut missing_fields = 0usize;
+    let mut multi_peer_skipped = 0usize;
+    let mut multi_remote_skipped = 0usize;
     let mut masque_failed = 0usize;
 
     for ep in arr {
@@ -941,46 +959,77 @@ pub fn parse_singbox_endpoints(
         let ty = str_val(ep.get("type"))
             .unwrap_or_default()
             .to_ascii_lowercase();
+        if ty == "openvpn-client" && ep.get("servers").is_some() {
+            // 核心要求 server 与 servers 互斥；当前节点地址/端口编辑只表达一个远端。
+            // 不能取首项，也不能将两种字段同时下发制造核拒绝的配置。
+            multi_remote_skipped += 1;
+            r.skipped += 1;
+            continue;
+        }
+        if origin == ImportOrigin::RemoteSubscription {
+            let allowed = match ty.as_str() {
+                "masque-client" => Some((MASQUE_REMOTE_KEYS, Some(MASQUE_TLS_KEYS))),
+                "openconnect" => Some((OPENCONNECT_REMOTE_KEYS, Some(OPENCONNECT_TLS_KEYS))),
+                "openvpn-client" => Some((OPENVPN_REMOTE_KEYS, Some(OPENVPN_TLS_KEYS))),
+                _ => None,
+            };
+            if let Some((keys, tls_keys)) = allowed {
+                if let Some(key) = remote_endpoint_rejection(ep, keys, tls_keys) {
+                    unsafe_rejections.push(format!("{ty}.{key}"));
+                    r.skipped += 1;
+                    continue;
+                }
+            }
+        }
         match ty.as_str() {
+            "wireguard"
+                if ep
+                    .get("peers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|peers| peers.len() > 1) =>
+            {
+                multi_peer_skipped += 1;
+                r.skipped += 1;
+            }
             "wireguard" => match map_wireguard_endpoint(ep, sub_id, now, id_gen) {
-                Some(s) => r.servers.push(s),
+                Some(s) => {
+                    let ignored: Vec<String> = [
+                        "system",
+                        "listen_port",
+                        "udp_timeout",
+                        "name",
+                        "detour",
+                        "domain_resolver",
+                    ]
+                    .iter()
+                    .filter(|key| ep.get(**key).is_some())
+                    .map(|key| (*key).to_string())
+                    .collect();
+                    r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
+                    r.servers.push(s);
+                }
                 None => {
                     missing_fields += 1;
                     r.failed += 1;
                 }
             },
-            // ── tailscale endpoint 恒不导入（判断依据，勿散落）─────────────────────────
-            // 1. **凭据归属反转**：该 endpoint 的唯一实质内容是 `auth_key`（tailnet 预授权密钥）。
-            //    导入它 = 把**本机**加进**下发方的 tailnet**（对方可见本机、可路由到本机）。
-            //    节点列表不是这个意图的载体。
-            // 2. **不可移植**：`state_directory` 由 Polaris 生成时注入本机路径
+            // ── tailscale endpoint 恒不导入（账号授权须由本机发起）─────────────────────────
+            // 1. **账号加入须明确授权**：`auth_key` 会让本机加入对应 tailnet；目前导入流程没有
+            //    提供账号加入确认或本机状态初始化。即使文件来自用户本人，也不能仅凭节点列表代做此事。
+            // 2. **状态目录不可移植**：`state_directory` 由 Polaris 生成时注入本机路径
             //    （`builder/endpoints.rs` 的 `build_tailscale_endpoint`），文件里那份对本机无意义。
-            // 3. **单例硬限**：Polaris 全局只许一个 Tailscale 节点（`store/src/sanitize.rs` 的
-            //    `first_tailscale` + 前端 `tailscaleSlotTaken`）。批量导入至多贡献 1 个，
-            //    且会与用户自己那个抢槽。
-            // 4. **实测无内容可导**：`{"type":"tailscale","tag":"x"}`（零字段）`sing-box check`
+            // 3. **实测无内容可导**：`{"type":"tailscale","tag":"x"}`（零字段）`sing-box check`
             //    rc=0 —— 没有任何必填的、可移植的、非凭据字段。
-            // **也不走 custom 逃生舱**：custom 节点 protocol 是 `custom`，前端单例闸门
-            // `meshSingletonConflict` 只认 `protocol === 'tailscale'`
-            // （`ui/src/domain/endpoint-routes.ts`）⇒ 包成 custom 等于替下发方绕过单例闸门，比跳过更坏。
+            // **也不走 custom 逃生舱**：这会绕过本机账号与状态目录的授权流程。
             "tailscale" => {
                 tailscale_skipped += 1;
                 r.skipped += 1;
             }
             // ── 端点族 VPN 客户端（2026-08-11）──
-            // 与 tailscale 相反：它们的凭据归属**不反转**（是「本机连出去」而不是「把本机加进
-            // 对方的网」），也没有单例限制，故正常导入。
+            // 它们的凭据用于本机主动连远端服务器，故可按远端字段安全策略导入。
             // 未建模的键原样进透传袋 —— 表单是精选子集（openconnect 61 键 / openvpn 78 键，
             // 多数是调优旋钮），没有袋子时「导入 → 编辑 → 保存」会静默丢掉它们。
-            // 同一条信任判据：openconnect 的 `csd`（Cisco CSD 脚本）/ `tncc`（Juniper）是
-            // **执行外部脚本**的键，透传袋会把它们从远端订阅原样带进下发配置 ⇒ 与 tor 同族的
-            // 命令执行向量。故只许本地文件；远端订阅仍按「不支持类型」跳过并告警。
-            // ── masque-client（I1，2026-09-24）：第一期**只收本地文件**（D4），理由同 tailcat ——
-            // 没有命令执行向量，但远端放开会多出 `advertise_routes` 这条反向入站面，却没有已知受众。
-            "masque-client" if origin != ImportOrigin::LocalFile => {
-                bump(&mut skip_by_type, ty.clone());
-                r.skipped += 1;
-            }
+            // openconnect 的 `csd` / `tncc` 等外部脚本键在远端入口被拒。
             "masque-client" => match map_endpoint_masque(ep, sub_id, now, id_gen) {
                 Some((s, ignored)) => {
                     r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
@@ -991,13 +1040,17 @@ pub fn parse_singbox_endpoints(
                     r.failed += 1;
                 }
             },
-            "openconnect" | "openvpn-client" if origin != ImportOrigin::LocalFile => {
-                bump(&mut skip_by_type, ty.clone());
-                r.skipped += 1;
-            }
             "openconnect" | "openvpn-client" => {
                 match map_endpoint_vpn_client(&ty, ep, sub_id, now, id_gen) {
-                    Some(s) => r.servers.push(s),
+                    Some(s) => {
+                        let ignored: Vec<String> = ["detour", "domain_resolver"]
+                            .iter()
+                            .filter(|key| ep.get(**key).is_some())
+                            .map(|key| (*key).to_string())
+                            .collect();
+                        r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
+                        r.servers.push(s);
+                    }
                     None => {
                         missing_fields += 1;
                         r.failed += 1;
@@ -1021,10 +1074,26 @@ pub fn parse_singbox_endpoints(
         }
     }
 
+    if !unsafe_rejections.is_empty() {
+        r.warnings.push(format!(
+            "远程订阅节点含本地依赖或不可安全转换的字段，已跳过: {}",
+            unsafe_rejections.join(", ")
+        ));
+    }
     if tailscale_skipped > 0 {
         r.warnings.push(format!(
-            "跳过 {tailscale_skipped} 个 tailscale endpoint：账号制组网需本机登录，\
-             订阅/配置文件里的 auth_key 属他人 tailnet 凭据，不导入"
+            "跳过 {tailscale_skipped} 个 tailscale endpoint：账号加入与本机状态目录目前须经本机配置流程，\
+             导入流程尚未实现该授权和状态初始化"
+        ));
+    }
+    if multi_peer_skipped > 0 {
+        r.warnings.push(format!(
+            "跳过 {multi_peer_skipped} 个 wireguard endpoint：Polaris 仅支持单 peer，不能无损导入多 peer 配置"
+        ));
+    }
+    if multi_remote_skipped > 0 {
+        r.warnings.push(format!(
+            "跳过 {multi_remote_skipped} 个 openvpn-client endpoint：servers 多远端轮换尚未映射到节点编辑模型，不能取首项或同时下发 server 与 servers"
         ));
     }
     if !skip_by_type.is_empty() {
@@ -1075,8 +1144,9 @@ pub fn parse_singbox_endpoints(
 /// - **`system` → `reverseMesh`**：`system:true` 要抢内核 utun（需提权、与主 TUN 冲突，
 ///   `builder/endpoint_routes.rs:112-128` 记有 WARP 恒否决与 `resource busy` FATAL 实证）。
 ///   外部文件不该能翻这个开关；且 wg-quick 导入腿同样恒 false（`wg-logic.ts:170`）。
-///   丢它**不产假节点**：用户态 gVisor 就是客户端常态，只是不可被反向接入。
-/// - **`listen_port` / `udp_timeout` / `workers` / `name`**：`WireGuardSettings` 无落点。
+///   导入时保持用户态默认值；用户态并不禁止入站，是否可反向接入由路由与对端配置决定。
+/// - **`listen_port` / `udp_timeout` / `name`**：`WireGuardSettings` 无落点；
+///   导入汇合处应向用户报告这些字段未保留。
 /// - **`detour`**：`ServerConfig.detour` 存的是**本地节点 id**，外部 tag 无从解析。
 ///
 /// [`build_wireguard_endpoint`]: polaris_config_engine::builder::endpoints::build_wireguard_endpoint
@@ -1135,12 +1205,52 @@ fn map_endpoint_vpn_client(
 
     let raw_server = str_ne(ep.get("server"))?;
     let (addr, port) = if ty == "openconnect" {
-        // `host:port` 单串：末个冒号后是端口则拆开，否则默认 443。
-        match raw_server.rsplit_once(':') {
-            Some((h, p)) if !h.is_empty() && p.parse::<u16>().is_ok() => {
-                (h.to_string(), p.parse::<u16>().ok()?)
+        // OpenConnect 的 server 是 host:port；IPv6 必须按括号形式解析，裸 IPv6 默认 443。
+        if raw_server.contains("://") {
+            let uri = url::Url::parse(&raw_server).ok()?;
+            if !matches!(uri.scheme(), "http" | "https") {
+                return None;
             }
-            _ => (raw_server.clone(), 443u16),
+            let host = match uri.host()? {
+                url::Host::Ipv6(ip) => ip.to_string(),
+                host => host.to_string(),
+            };
+            // url::Url 会规范化掉 http 的显式 :80；原生 Go URL.Port() 会保留它。
+            // 因此端口从原始 authority 读取，未写时恒回落 443。
+            let authority = raw_server
+                .split_once("://")?
+                .1
+                .split(['/', '?', '#'])
+                .next()?;
+            let authority = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            let explicit_port = if authority.starts_with('[') {
+                authority.split_once(']')?.1.strip_prefix(':')
+            } else {
+                authority.rsplit_once(':').map(|(_, port)| port)
+            };
+            let port = match explicit_port {
+                Some(port) => port_val(port.parse::<u32>().ok()?)?,
+                None => 443,
+            };
+            (host, port)
+        } else if let Some(rest) = raw_server.strip_prefix('[') {
+            let (host, suffix) = rest.split_once(']')?;
+            let port = if let Some(port) = suffix.strip_prefix(':') {
+                port_val(port.parse::<u32>().ok()?)?
+            } else if suffix.is_empty() {
+                443
+            } else {
+                return None;
+            };
+            (host.to_string(), port)
+        } else if raw_server.matches(':').count() > 1 {
+            (raw_server.clone(), 443)
+        } else if let Some((host, port)) = raw_server.rsplit_once(':') {
+            (host.to_string(), port_val(port.parse::<u32>().ok()?)?)
+        } else {
+            (raw_server.clone(), 443)
         }
     } else {
         (
@@ -1164,7 +1274,7 @@ fn map_endpoint_vpn_client(
             password: str_ne(ep.get("password")),
             flavor: str_ne(ep.get("flavor")),
             auth_group: str_ne(ep.get("auth_group")),
-            token: str_ne(ep.get("token")),
+            token: ep.get("token").cloned(),
             mtu: num_val(ep.get("mtu")),
             no_udp: ep.get("no_udp").map(|v| bool_true(Some(v))),
             pfs: ep.get("pfs").map(|v| bool_true(Some(v))),
@@ -1178,8 +1288,14 @@ fn map_endpoint_vpn_client(
         let pem = |k: &str| -> Vec<String> {
             ep.get("tls")
                 .and_then(|t| t.get(k))
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| str_val(Some(x))).collect())
+                .map(|value| match value {
+                    Value::String(s) => vec![s.clone()],
+                    Value::Array(a) => a
+                        .iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect(),
+                    _ => Vec::new(),
+                })
                 .unwrap_or_default()
         };
         s.openvpn_client_settings = Some(Box::new(OpenvpnClientSettings {
@@ -1193,26 +1309,28 @@ fn map_endpoint_vpn_client(
             mtu: num_val(ep.get("mtu")),
             redirect_gateway: ep.get("redirect_gateway").map(|v| bool_true(Some(v))),
             system: ep.get("system").map(|v| bool_true(Some(v))),
-            tls: Some(OpenvpnTlsSettings {
-                certificate: pem("certificate"),
-                client_certificate: pem("client_certificate"),
-                client_key: pem("client_key"),
-                // 嵌套袋：tls 下未建模的子键（peer_fingerprint / server_name / version_* …）
-                extra: ep
-                    .get("tls")
-                    .and_then(Value::as_object)
-                    .map(|m| {
-                        m.iter()
-                            .filter(|(k, _)| {
-                                !matches!(
-                                    k.as_str(),
-                                    "certificate" | "client_certificate" | "client_key"
-                                )
-                            })
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+            tls: (ep.get("mode").and_then(Value::as_str) != Some("static_key")).then(|| {
+                OpenvpnTlsSettings {
+                    certificate: pem("certificate"),
+                    client_certificate: pem("client_certificate"),
+                    client_key: pem("client_key"),
+                    // 嵌套袋：tls 下未建模的子键（peer_fingerprint / server_name / version_* …）
+                    extra: ep
+                        .get("tls")
+                        .and_then(Value::as_object)
+                        .map(|m| {
+                            m.iter()
+                                .filter(|(k, _)| {
+                                    !matches!(
+                                        k.as_str(),
+                                        "certificate" | "client_certificate" | "client_key"
+                                    )
+                                })
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
             }),
             extra: endpoint_bag(ep, MODELED_OV),
         }));
@@ -1243,6 +1361,676 @@ fn endpoint_bag(ep: &Value, modeled: &[&str]) -> serde_json::Map<String, Value> 
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+// 远端 endpoint 只接收明确映射或经随包核 schema 确认的可移植字段。不能把本地文件的
+// `extra` 逃生舱直接放给订阅：其中的 *_path、脚本认证、系统接口等会读写本机资源。
+const MASQUE_REMOTE_KEYS: &[&str] = &[
+    "type",
+    "tag",
+    "server",
+    "server_port",
+    "username",
+    "password",
+    "tls",
+    "path",
+    "headers",
+    "version",
+    "mtu",
+    "on_demand",
+    "connect_timeout",
+    "idle_timeout",
+    "keep_alive_period",
+    "stream_receive_window",
+    "connection_receive_window",
+    "max_concurrent_streams",
+    "initial_packet_size",
+    "disable_path_mtu_discovery",
+    "disable_version_fallback",
+    "fallback_delay",
+    "fallback_network_type",
+    "network_strategy",
+    "network_type",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "disable_tcp_keep_alive",
+    "udp_fragment",
+    "udp_timeout",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "reuse_addr",
+    "bind_address_no_port",
+    // 这些键被 mapper/生成器剥离并报告，保留现有本地导入的诊断语义。
+    "system",
+    "name",
+    "advertise_routes",
+    "detour",
+    "domain_resolver",
+];
+const MASQUE_TLS_KEYS: &[&str] = &[
+    "enabled",
+    "server_name",
+    "insecure",
+    "certificate_sha256",
+    "certificate_public_key_sha256",
+];
+const TAILCAT_REMOTE_KEYS: &[&str] = &[
+    "type",
+    "tag",
+    "server_public_key",
+    "server_disco_key",
+    "pre_shared_key",
+    "private_key",
+    "derp_region",
+    "derp_map_url",
+    "derp_servers",
+    "connect_timeout",
+    "fallback_delay",
+    "fallback_network_type",
+    "network_strategy",
+    "network_type",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "disable_tcp_keep_alive",
+    "udp_fragment",
+    "reuse_addr",
+    "bind_address_no_port",
+    "http_client",
+    "detour",
+    "domain_resolver",
+];
+const OPENCONNECT_REMOTE_KEYS: &[&str] = &[
+    "type",
+    "tag",
+    "server",
+    "username",
+    "password",
+    "flavor",
+    "auth_group",
+    "token",
+    "mtu",
+    "no_udp",
+    "pfs",
+    "allow_insecure_crypto",
+    "user_agent",
+    "reported_os",
+    "on_demand",
+    "tls",
+    "cookie",
+    "dtls_local_port",
+    "form_entries",
+    "fortinet_host_check",
+    "base_mtu",
+    "compression_disabled",
+    "compression_mode",
+    "connect_timeout",
+    "dpd_interval",
+    "external_auth_disabled",
+    "http_keepalive_disabled",
+    "ipv6_disabled",
+    "local_hostname",
+    "mobile",
+    "password_authentication_disabled",
+    "queue_length",
+    "reconnect_timeout",
+    "tcp_keep_alive_enabled",
+    "trojan_interval",
+    "version",
+    "xml_post_disabled",
+    "fallback_delay",
+    "fallback_network_type",
+    "network_strategy",
+    "network_type",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "disable_tcp_keep_alive",
+    "udp_fragment",
+    "udp_timeout",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "reuse_addr",
+    "bind_address_no_port",
+    "detour",
+    "domain_resolver",
+];
+const OPENVPN_REMOTE_KEYS: &[&str] = &[
+    "type",
+    "tag",
+    "address",
+    "server",
+    "server_port",
+    "username",
+    "password",
+    "network",
+    "cipher",
+    "auth",
+    "mtu",
+    "redirect_gateway",
+    "tls",
+    "on_demand",
+    "data_ciphers",
+    "data_ciphers_fallback",
+    "ping_interval",
+    "ping_restart",
+    "handshake_window",
+    "key_direction",
+    "compression_lzo",
+    "allow_compression",
+    "compression",
+    "auth_retry",
+    "static_challenge",
+    "static_challenge_echo",
+    "block_ipv6",
+    "connect_timeout",
+    "explicit_exit_notify",
+    "fragment",
+    "mode",
+    "mss_fix",
+    "mss_fix_disabled",
+    "mss_fix_mode",
+    "peer_address",
+    "peer_address_ipv6",
+    "ping_restart_disabled",
+    "redirect_gateway_flags",
+    "redirect_private",
+    "remote_random",
+    "renegotiate_bytes",
+    "renegotiate_disabled",
+    "renegotiate_interval",
+    "renegotiate_packets",
+    "replay_window",
+    "replay_window_time",
+    "route_gateway",
+    "route_metric",
+    "route_no_pull",
+    "routes",
+    "pull_filters",
+    "static_key",
+    "tls_timeout",
+    "topology",
+    "fallback_delay",
+    "fallback_network_type",
+    "network_strategy",
+    "network_type",
+    "tcp_fast_open",
+    "tcp_multi_path",
+    "tcp_keep_alive",
+    "tcp_keep_alive_interval",
+    "disable_tcp_keep_alive",
+    "udp_fragment",
+    "udp_timeout",
+    "udp_mapping",
+    "udp_filtering",
+    "udp_nat_max",
+    "reuse_addr",
+    "bind_address_no_port",
+    "detour",
+    "domain_resolver",
+];
+const OPENCONNECT_TLS_KEYS: &[&str] = &[
+    "certificate_authority",
+    "client_certificate",
+    "client_key",
+    "client_key_password",
+    "insecure",
+    "mca_certificate",
+    "mca_key",
+    "mca_key_password",
+    "peer_fingerprint",
+    "server_name",
+    "system_trust_disabled",
+];
+const OPENVPN_TLS_KEYS: &[&str] = &[
+    "certificate",
+    "client_certificate",
+    "client_key",
+    "peer_fingerprint",
+    "server_name",
+    "control_wrap",
+    "certificate_profile",
+    "cipher",
+    "groups",
+    "ns_certificate_type",
+    "remote_certificate_eku",
+    "remote_certificate_ku",
+    "remote_certificate_tls",
+    "server_name_type",
+    "version_max",
+    "version_min",
+];
+
+/// 返回拒绝的键名供聚合告警使用；绝不把订阅字段值（可能是凭据）写进日志。
+fn remote_endpoint_rejection(
+    node: &Value,
+    allowed: &[&str],
+    tls_allowed: Option<&[&str]>,
+) -> Option<String> {
+    let obj = node.as_object()?;
+    if obj.get("type").and_then(Value::as_str) == Some("openvpn-client") {
+        if obj.contains_key("mode") && !obj.get("mode").is_some_and(Value::is_string) {
+            return Some("mode".into());
+        }
+        let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("tls");
+        if !matches!(mode, "tls" | "static_key") {
+            return Some("mode".into());
+        }
+        if mode == "static_key" {
+            for (key, valid) in [
+                (
+                    "address",
+                    obj.get("address").is_some_and(nonempty_listable_strings),
+                ),
+                (
+                    "cipher",
+                    obj.get("cipher")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty()),
+                ),
+                (
+                    "auth",
+                    obj.get("auth")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty()),
+                ),
+                (
+                    "static_key",
+                    obj.get("static_key").is_some_and(nonempty_listable_strings),
+                ),
+            ] {
+                if !valid {
+                    return Some(format!("static_key.{key}"));
+                }
+            }
+            let addresses: Vec<&str> = match obj.get("address")? {
+                Value::String(address) => vec![address],
+                Value::Array(addresses) => addresses.iter().filter_map(Value::as_str).collect(),
+                _ => return Some("static_key.address".into()),
+            };
+            let mut has_ipv4 = false;
+            let mut has_ipv6 = false;
+            for address in addresses {
+                let Some((ip, prefix)) = address.split_once('/') else {
+                    return Some("static_key.address".into());
+                };
+                let (Ok(ip), Ok(prefix)) = (ip.parse::<std::net::IpAddr>(), prefix.parse::<u8>())
+                else {
+                    return Some("static_key.address".into());
+                };
+                if prefix > if ip.is_ipv4() { 32 } else { 128 } {
+                    return Some("static_key.address".into());
+                }
+                has_ipv4 |= ip.is_ipv4();
+                has_ipv6 |= ip.is_ipv6();
+            }
+            for (key, ipv6, has_family) in [
+                ("peer_address", false, has_ipv4),
+                ("peer_address_ipv6", true, has_ipv6),
+            ] {
+                match obj.get(key) {
+                    None if !has_family => {}
+                    Some(value)
+                        if has_family
+                            && value
+                                .as_str()
+                                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+                                .is_some_and(|ip| ip.is_ipv6() == ipv6) => {}
+                    _ => return Some(format!("static_key.{key}")),
+                }
+            }
+            if obj.contains_key("tls") {
+                return Some("static_key.tls".into());
+            }
+        } else if obj.contains_key("static_key") {
+            return Some("mode".into());
+        }
+    }
+    for (key, value) in obj {
+        if !allowed.contains(&key.as_str()) {
+            return Some(key.clone());
+        }
+        if !matches!(
+            key.as_str(),
+            "tls"
+                | "headers"
+                | "derp_servers"
+                | "derp_map_url"
+                | "token"
+                | "mobile"
+                | "form_entries"
+                | "fortinet_host_check"
+                | "pull_filters"
+        ) && !remote_scalar_shape(
+            key,
+            value,
+            obj.get("type").and_then(Value::as_str).unwrap_or_default(),
+        ) {
+            return Some(key.clone());
+        }
+        if key == "tls" {
+            let Some(tls) = value.as_object() else {
+                return Some("tls".into());
+            };
+            for (nested, val) in tls {
+                if !tls_allowed.is_some_and(|keys| keys.contains(&nested.as_str())) {
+                    return Some(format!("tls.{nested}"));
+                }
+                if matches!(
+                    nested.as_str(),
+                    "certificate"
+                        | "certificate_authority"
+                        | "client_certificate"
+                        | "client_key"
+                        | "mca_certificate"
+                        | "mca_key"
+                ) && !listable_strings(val)
+                {
+                    return Some(format!("tls.{nested}"));
+                }
+                if nested == "control_wrap" {
+                    let Some(wrap) = val.as_object() else {
+                        return Some("tls.control_wrap".into());
+                    };
+                    if wrap
+                        .keys()
+                        .any(|k| !["type", "key", "direction"].contains(&k.as_str()))
+                        || !wrap.get("key").is_some_and(nonempty_listable_strings)
+                        || !wrap.get("type").and_then(Value::as_str).is_some_and(|ty| {
+                            matches!(ty, "tls_auth" | "tls_crypt" | "tls_crypt_v2")
+                        })
+                        || wrap.get("direction").is_some_and(|v| {
+                            !v.as_str().is_some_and(|d| matches!(d, "client" | "server"))
+                        })
+                    {
+                        return Some("tls.control_wrap".into());
+                    }
+                } else if matches!(
+                    nested.as_str(),
+                    "enabled" | "insecure" | "system_trust_disabled"
+                ) && !val.is_boolean()
+                    || matches!(
+                        nested.as_str(),
+                        "groups"
+                            | "remote_certificate_ku"
+                            | "peer_fingerprint"
+                            | "certificate_sha256"
+                            | "certificate_public_key_sha256"
+                    ) && !listable_strings(val)
+                    || !matches!(
+                        nested.as_str(),
+                        "control_wrap"
+                            | "enabled"
+                            | "insecure"
+                            | "system_trust_disabled"
+                            | "certificate"
+                            | "certificate_authority"
+                            | "client_certificate"
+                            | "client_key"
+                            | "mca_certificate"
+                            | "mca_key"
+                            | "groups"
+                            | "remote_certificate_ku"
+                            | "peer_fingerprint"
+                            | "certificate_sha256"
+                            | "certificate_public_key_sha256"
+                    ) && !val.is_string()
+                {
+                    return Some(format!("tls.{nested}"));
+                }
+            }
+        }
+    }
+    if obj.get("derp_map_url").is_some_and(|value| {
+        let Some(raw) = value.as_str() else {
+            return true;
+        };
+        url::Url::parse(raw).map_or(true, |u| {
+            !matches!(u.scheme(), "http" | "https")
+                || u.host_str().is_none()
+                || !u.username().is_empty()
+                || u.password().is_some()
+        })
+    }) {
+        return Some("derp_map_url".into());
+    }
+    if obj.get("derp_servers").is_some_and(|value| {
+        let servers: Vec<&Value> = match value {
+            Value::Array(items) => items.iter().collect(),
+            Value::String(_) | Value::Object(_) => vec![value],
+            _ => return true,
+        };
+        !servers.iter().all(|server| match server {
+            Value::String(host) => !host.is_empty(),
+            Value::Object(fields) => {
+                fields
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .is_some_and(|h| !h.is_empty())
+                    && fields.keys().all(|key| {
+                        [
+                            "host",
+                            "ipv4",
+                            "ipv6",
+                            "derp_port",
+                            "stun_port",
+                            "cert_name",
+                        ]
+                        .contains(&key.as_str())
+                    })
+                    && ["ipv4", "ipv6", "cert_name"]
+                        .iter()
+                        .all(|key| fields.get(*key).is_none_or(Value::is_string))
+                    && ["derp_port", "stun_port"].iter().all(|key| {
+                        fields
+                            .get(*key)
+                            .is_none_or(|port| num_val(Some(port)).and_then(port_val).is_some())
+                    })
+            }
+            _ => false,
+        })
+    }) {
+        return Some("derp_servers".into());
+    }
+    if obj.get("headers").is_some_and(|value| {
+        !value
+            .as_object()
+            .is_some_and(|headers| headers.values().all(listable_strings))
+    }) {
+        return Some("headers".into());
+    }
+    if obj.get("token").is_some_and(|value| {
+        !value.as_object().is_some_and(|token| {
+            token.keys().all(|key| {
+                ["mode", "secret", "counter", "pin", "password", "device_id"]
+                    .contains(&key.as_str())
+            }) && token.iter().all(|(key, value)| {
+                if key == "counter" {
+                    value.as_u64().is_some()
+                } else if key == "mode" {
+                    value
+                        .as_str()
+                        .is_some_and(|mode| matches!(mode, "hotp" | "oidc" | "stoken" | "totp"))
+                } else {
+                    value.is_string()
+                }
+            })
+        })
+    }) {
+        return Some("token".into());
+    }
+    if obj.get("mobile").is_some_and(|value| {
+        !value.as_object().is_some_and(|mobile| {
+            mobile.keys().all(|key| {
+                ["device_type", "device_unique_id", "platform_version"].contains(&key.as_str())
+            }) && mobile.values().all(Value::is_string)
+        })
+    }) {
+        return Some("mobile".into());
+    }
+    if obj.get("form_entries").is_some_and(|value| {
+        !value.as_array().is_some_and(|entries| {
+            entries.iter().all(|entry| {
+                entry.as_object().is_some_and(|fields| {
+                    fields.iter().all(|(key, value)| match key.as_str() {
+                        "form_id" | "submission_key" | "name" | "value" => value.is_string(),
+                        "promote" => value.is_boolean(),
+                        _ => false,
+                    }) && !(fields.get("promote").and_then(Value::as_bool) == Some(true)
+                        && fields
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.is_empty()))
+                })
+            })
+        })
+    }) {
+        return Some("form_entries".into());
+    }
+    if obj.get("fortinet_host_check").is_some_and(|value| {
+        !value.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| {
+                matches!(key.as_str(), "hostcheck" | "check_virtual_desktop") && value.is_string()
+            })
+        })
+    }) {
+        return Some("fortinet_host_check".into());
+    }
+    if obj.get("pull_filters").is_some_and(|value| {
+        !value.as_array().is_some_and(|filters| {
+            filters.iter().all(|filter| {
+                filter.as_object().is_some_and(|fields| {
+                    fields
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "action" | "text"))
+                        && fields.get("text").is_some_and(Value::is_string)
+                        && fields
+                            .get("action")
+                            .and_then(Value::as_str)
+                            .is_some_and(|action| matches!(action, "accept" | "ignore" | "reject"))
+                })
+            })
+        })
+    }) {
+        return Some("pull_filters".into());
+    }
+    None
+}
+
+fn listable_strings(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        Value::Array(values) => values.iter().all(Value::is_string),
+        _ => false,
+    }
+}
+
+fn nonempty_listable_strings(value: &Value) -> bool {
+    match value {
+        Value::String(s) => !s.is_empty(),
+        Value::Array(values) => {
+            !values.is_empty()
+                && values
+                    .iter()
+                    .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        }
+        _ => false,
+    }
+}
+
+fn remote_scalar_shape(key: &str, value: &Value, ty: &str) -> bool {
+    // 丢弃字段不进入配置；内部 tag 没有本机解析语义。
+    if matches!(
+        key,
+        "system" | "name" | "advertise_routes" | "detour" | "domain_resolver" | "http_client"
+    ) {
+        return true;
+    }
+    if matches!(
+        key,
+        "on_demand"
+            | "no_udp"
+            | "pfs"
+            | "allow_insecure_crypto"
+            | "compression_disabled"
+            | "external_auth_disabled"
+            | "http_keepalive_disabled"
+            | "ipv6_disabled"
+            | "password_authentication_disabled"
+            | "tcp_keep_alive_enabled"
+            | "xml_post_disabled"
+            | "redirect_gateway"
+            | "block_ipv6"
+            | "ping_restart_disabled"
+            | "redirect_private"
+            | "remote_random"
+            | "renegotiate_disabled"
+            | "route_no_pull"
+            | "disable_tcp_keep_alive"
+            | "tcp_fast_open"
+            | "tcp_multi_path"
+            | "udp_fragment"
+            | "reuse_addr"
+            | "bind_address_no_port"
+            | "disable_path_mtu_discovery"
+            | "disable_version_fallback"
+            | "mss_fix_disabled"
+            | "static_challenge_echo"
+    ) {
+        return value.is_boolean();
+    }
+    if matches!(
+        key,
+        "server_port"
+            | "dtls_local_port"
+            | "mtu"
+            | "base_mtu"
+            | "queue_length"
+            | "max_concurrent_streams"
+            | "initial_packet_size"
+            | "udp_nat_max"
+            | "fragment"
+            | "derp_region"
+            | "replay_window"
+            | "mss_fix"
+            | "explicit_exit_notify"
+    ) {
+        return num_val(Some(value)).is_some();
+    }
+    if matches!(key, "renegotiate_bytes" | "renegotiate_packets") {
+        return value.as_u64().is_some();
+    }
+    if key == "route_metric" {
+        return value.as_i64().is_some();
+    }
+    if key == "version" && ty == "masque-client" {
+        return num_val(Some(value)).is_some();
+    }
+    if matches!(key, "stream_receive_window" | "connection_receive_window") {
+        return value.is_string() || value.is_number();
+    }
+    if key == "udp_timeout" && ty == "openvpn-client" {
+        return value.is_string() || value.is_number();
+    }
+    if matches!(
+        key,
+        "data_ciphers"
+            | "redirect_gateway_flags"
+            | "address"
+            | "routes"
+            | "static_key"
+            | "network_type"
+            | "fallback_network_type"
+    ) {
+        return listable_strings(value);
+    }
+    value.is_string()
 }
 
 /// 导入时丢弃的键 → 一条告警（无则 `None`）。
@@ -1418,11 +2206,11 @@ fn map_tailcat_outbound(
         private_key: str_ne(ob.get("private_key")),
         derp_region: ob.get("derp_region").and_then(Value::as_i64),
         derp_map_url: str_ne(ob.get("derp_map_url")),
-        derp_servers: ob
-            .get("derp_servers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
+        derp_servers: match ob.get("derp_servers") {
+            Some(Value::Array(items)) => items.clone(),
+            Some(value @ (Value::String(_) | Value::Object(_))) => vec![value.clone()],
+            _ => Vec::new(),
+        },
         extra,
     };
     tailcat_emit_check(Some(&t)).ok()?;
@@ -1449,7 +2237,12 @@ fn map_wireguard_endpoint(
     now: &str,
     id_gen: &mut impl FnMut() -> String,
 ) -> Option<ServerConfig> {
-    let peer = ep.get("peers")?.as_array()?.first()?;
+    // Polaris 单 peer 模型不能保真多 peer：取首个会静默丢掉其余路由与密钥。
+    let peers = ep.get("peers")?.as_array()?;
+    if peers.len() != 1 {
+        return None;
+    }
+    let peer = &peers[0];
     // 必填：落盘门 `validate::protocol_requirement_ok("wireguard")` 要 privateKey + peerPublicKey
     // + 非空 localAddress；`sanitize_servers` 另要非空 address + port∈1..=65535。缺任一造出来也会
     // 被剔除 —— 与其静默入库再消失，不如此处计 failed 并聚合告警。
@@ -1475,6 +2268,9 @@ fn map_wireguard_endpoint(
     }
     if let Some(m) = num_val(ep.get("mtu")).filter(|m| *m > 0) {
         wg.mtu = Some(m);
+    }
+    if let Some(workers) = num_val(ep.get("workers")).filter(|workers| *workers > 0) {
+        wg.workers = Some(workers);
     }
     // reserved 恰 3 项才承载（与生成侧 `if s.reserved.len() == 3` 对称；残值等价缺席）。
     if let Some(rs) = peer.get("reserved").and_then(Value::as_array) {

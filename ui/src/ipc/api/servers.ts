@@ -57,27 +57,26 @@ export const serverApi = {
   },
 
   /** Phase 2 按需登录：拉起瞬态登录核取交互登录 URL。 */
-  async tailscaleLogin(server: ServerConfig): Promise<{
-    started: boolean;
-    /**
-     * 后端只发这一个值（`commands/server.rs` 的三态出口 Started / InMainCore / Failed，
-     * Failed 走 reject）。此前这里还声明着 `alreadyLoggedIn` / `alreadyRunning` 两支 ——
-     * 后端从未发过，前端却在为它们写分支，读代码的人会以为那是真实状态。
-     */
-    reason?: 'inMainCore';
-    authUrl?: string;
-  }> {
-    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server });
+  async tailscaleLoginPrepare(serverId: string, attemptId: string): Promise<void> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PREPARE, { serverId, attemptId });
   },
 
-  /** 取消某节点在飞的瞬态登录核（用户手动取消）。 */
-  async tailscaleLoginCancel(serverId: string): Promise<void> {
-    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_CANCEL, { serverId });
+  async tailscaleLogin(server: ServerConfig, request: { attemptId: string; mode: 'browser' | 'authkey' }): Promise<{
+    started: boolean;
+    reason?: 'inMainCore' | 'cancelled';
+    configurationPending?: boolean;
+  }> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server, request });
+  },
+
+  /** Resolves only after the cancelled request no longer owns a process/state writer. */
+  async tailscaleLoginCancel(serverId: string, attemptId: string): Promise<void> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_CANCEL, { serverId, attemptId });
   },
 
   /** 退出登录：清该节点 Tailscale 持久登录会话（state 目录）。 */
-  async tailscaleLogout(serverId: string): Promise<{ runningNeedsRestart: boolean }> {
-    return invoke(IPC_CHANNELS.TAILSCALE_LOGOUT, { serverId });
+  async tailscaleLogout(serverId: string, keepAttemptId?: string): Promise<{ runningNeedsRestart: boolean }> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGOUT, { serverId, keepAttemptId });
   },
 
   /** 批量查 TS 节点 state 目录存在性（不起核判「登录过没」）。 */

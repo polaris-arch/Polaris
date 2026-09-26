@@ -31,6 +31,7 @@ import type {
   HttpSettings,
   MasqueClientSettings,
   MultiplexSettings,
+  OpenconnectSettings,
   TailcatSettings,
   TlsSettings,
   WebSocketSettings,
@@ -544,6 +545,32 @@ export function endpointHostPort(address: string, port: number): string {
   return `${host.includes(':') && !bracketed ? `[${host}]` : host}:${port}`;
 }
 
+/** OpenConnect URL 的认证路径属于连接配置；改公共 host/port 时仍保留它。 */
+function openconnectServer(base: ServerConfig): string | undefined {
+  if (!base.address || !base.port) return undefined;
+  const raw = base.openconnectSettings?.server;
+  if (raw?.includes('://')) {
+    try {
+      const url = new URL(raw);
+      const host = url.hostname.replace(/^\[|\]$/g, '');
+      const address = base.address.trim().replace(/^\[|\]$/g, '');
+      const parts = raw.match(/^([^:]+:\/\/)([^/?#]*)(.*)$/);
+      if (!parts) return endpointHostPort(base.address, base.port);
+      const authority = parts[2];
+      const userInfoEnd = authority.lastIndexOf('@') + 1;
+      const remote = authority.slice(userInfoEnd);
+      const explicitPort = remote.startsWith('[')
+        ? remote.match(/^\[[^\]]+\]:(\d+)$/)?.[1]
+        : remote.match(/:(\d+)$/)?.[1];
+      // 原生 OpenConnect 对任何 URL 未写端口时都使用 443。
+      if (host === address && Number(explicitPort || 443) === base.port) return raw;
+      // 保留原始 authority 的凭据和其余 URL；URL.port 会删掉 http 的显式 :80，不能用于重建。
+      return `${parts[1]}${authority.slice(0, userInfoEnd)}${endpointHostPort(address, base.port)}${parts[3]}`;
+    } catch { /* 旧配置不是合法 URL 时按公共地址/端口修复。 */ }
+  }
+  return endpointHostPort(base.address, base.port);
+}
+
 /** 透传袋 ⇄ 表单：袋子在表单里是一段原样 JSON。空对象 → 空串（不给用户看 `{}`）。 */
 const bagToText = (bag: unknown): string => {
   const m = bag && typeof bag === 'object' ? (bag as Record<string, unknown>) : {};
@@ -758,7 +785,8 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.pwd = cfg.openconnectSettings?.password ?? '';
       d.flavor = cfg.openconnectSettings?.flavor ?? 'anyconnect';
       d.authGroup = cfg.openconnectSettings?.auth_group ?? '';
-      d.token = cfg.openconnectSettings?.token ?? '';
+      const ocToken = cfg.openconnectSettings?.token;
+      d.token = typeof ocToken === 'string' ? ocToken : '';
       d.mtu = cfg.openconnectSettings?.mtu;
       d.noUdp = cfg.openconnectSettings?.no_udp === true;
       d.pfs = cfg.openconnectSettings?.pfs === true;
@@ -767,23 +795,30 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.reportedOs = cfg.openconnectSettings?.reported_os ?? '';
       d.sysIface = cfg.openconnectSettings?.system === true;
       d.meshRoutes = (cfg.meshRoutes ?? []).join('\n');
-      d.extraJson = bagToText(bagOf(cfg.openconnectSettings));
+      d.extraJson = bagToText({
+        ...bagOf(cfg.openconnectSettings),
+        ...(ocToken && typeof ocToken === 'object' ? { token: ocToken } : {}),
+      });
       return d;
     },
     toConfig(draft, base) {
+      const extra = textToBag(draft.extraJson, 'extraJson');
+      const objectToken = extra.token && typeof extra.token === 'object' && !Array.isArray(extra.token)
+        ? extra.token as OpenconnectSettings['token']
+        : undefined;
       return {
         ...base,
         // 顶层字段：**不进 openconnectSettings** —— 那个块整体 flatten 下发给内核，塞个内核不认的键会硬报错。
         meshRoutes: cidrLines(draft.meshRoutes),
         openconnectSettings: {
           ...modeledOf(base.openconnectSettings),
-          ...textToBag(draft.extraJson, 'extraJson'),
-          server: base.address && base.port ? endpointHostPort(base.address, base.port) : undefined,
+          ...extra,
+          server: openconnectServer(base),
           username: str(draft.user),
           password: str(draft.pwd),
           flavor: str(draft.flavor),
           auth_group: str(draft.authGroup),
-          token: str(draft.token),
+          token: str(draft.token) ?? objectToken,
           mtu: num(draft.mtu),
           no_udp: draft.noUdp === true ? true : undefined,
           pfs: draft.pfs === true ? true : undefined,
@@ -821,12 +856,13 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         const t = str(v);
         return t ? t.split(/\r?\n/).map((x) => x.trim()).filter(Boolean) : undefined;
       };
+      const extra = textToBag(draft.extraJson, 'extraJson');
       return {
         ...base,
         meshRoutes: cidrLines(draft.meshRoutes),
         openvpnClientSettings: {
           ...modeledOf(base.openvpnClientSettings),
-          ...textToBag(draft.extraJson, 'extraJson'),
+          ...extra,
           server: base.address || undefined,
           server_port: base.port || undefined,
           username: str(draft.user),
@@ -840,7 +876,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           // 判「承载全隧道」⇒ 用户关了开关，出口兜底却不生效。
           redirect_gateway: draft.redirectGw === true ? true : false,
           system: draft.sysIface === true ? true : undefined,
-          tls: {
+          tls: extra.mode === 'static_key' ? undefined : {
             ...textToBag(draft.ovpnTlsExtraJson, 'ovpnTlsExtraJson'),
             certificate: lines(draft.ovpnCa),
             client_certificate: lines(draft.ovpnCert),

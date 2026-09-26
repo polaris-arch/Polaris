@@ -15,6 +15,7 @@ import {
   bypassLanState,
   autoCheckUpdateChecked,
   ruleResourceAutoUpdateChecked,
+  ruleResourceAutoUpdatePatch,
   closeBehaviorOf,
   minimizeToTrayFor,
   backgroundIntervalSelectValue,
@@ -175,29 +176,46 @@ describe('ruleResourceAutoStatus —— 开关开 ≠ 真会刷新', () => {
   it('开关显式关 → off（无论间隔）', () => {
     expect(ruleResourceAutoStatus({ ruleResourceAutoUpdate: false })).toBe('off');
     expect(
-      ruleResourceAutoStatus({ ruleResourceAutoUpdate: false, subscriptionUpdateIntervalHours: 12 })
+      ruleResourceAutoStatus({ ruleResourceAutoUpdate: false, ruleResourceUpdateIntervalHours: 12 })
     ).toBe('off');
   });
 
   it('开关开 + 正常周期 → active（可以给绿点）', () => {
     expect(
-      ruleResourceAutoStatus({ ruleResourceAutoUpdate: true, subscriptionUpdateIntervalHours: 24 })
+      ruleResourceAutoStatus({ ruleResourceAutoUpdate: true, ruleResourceUpdateIntervalHours: 24 })
     ).toBe('active');
   });
 
   // 这条是本函数存在的理由：开关开着但间隔=0，后端周期腿整轮不跑，绝不能显示绿点。
   it('开关开 + 仅手动(0) → manual，绝不判 active（防假绿）', () => {
     expect(
-      ruleResourceAutoStatus({ ruleResourceAutoUpdate: true, subscriptionUpdateIntervalHours: 0 })
+      ruleResourceAutoStatus({ ruleResourceAutoUpdate: true, ruleResourceUpdateIntervalHours: 0 })
     ).toBe('manual');
   });
 
   it('开关缺省（视为开）+ 仅手动(0) → manual', () => {
-    expect(ruleResourceAutoStatus({ subscriptionUpdateIntervalHours: 0 })).toBe('manual');
+    expect(ruleResourceAutoStatus({ ruleResourceUpdateIntervalHours: 0 })).toBe('manual');
   });
 
   it('开关缺省 + 间隔缺省 → active（双缺省走 12h 周期，确实会刷新）', () => {
     expect(ruleResourceAutoStatus({})).toBe('active');
+  });
+
+  it('两类周期不同：资源状态只读资源周期，切开关保留两类周期', () => {
+    const config = {
+      ruleResourceAutoUpdate: true,
+      subscriptionUpdateIntervalHours: 0,
+      ruleResourceUpdateIntervalHours: 24,
+    };
+    expect(ruleResourceAutoStatus(config)).toBe('active');
+    const disabled = { ...config, ...ruleResourceAutoUpdatePatch(false) };
+    expect(disabled.subscriptionUpdateIntervalHours).toBe(0);
+    expect(disabled.ruleResourceUpdateIntervalHours).toBe(24);
+    const enabled = { ...disabled, ...ruleResourceAutoUpdatePatch(true) };
+    expect(ruleResourceAutoStatus(enabled)).toBe('active');
+    expect(ruleResourceAutoStatus({ ...enabled, ruleResourceUpdateIntervalHours: 0 })).toBe('manual');
+    const src = readFileSync(new URL('./SettingsUpdate.tsx', import.meta.url), 'utf8');
+    expect(src).toContain('update(ruleResourceAutoUpdatePatch(value))');
   });
 });
 

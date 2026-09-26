@@ -333,6 +333,11 @@ export function ruleResourceAutoUpdateChecked(config: { ruleResourceAutoUpdate?:
   return defaultOn(config.ruleResourceAutoUpdate);
 }
 
+/** 开关只改变启用状态，保留规则和订阅各自的已有周期。 */
+export function ruleResourceAutoUpdatePatch(enabled: boolean): { ruleResourceAutoUpdate: boolean } {
+  return { ruleResourceAutoUpdate: enabled };
+}
+
 /* ────────────────────────────────────────────────────────────────────────────
  * #10 关闭主窗口行为 ↔ minimizeToTray 双向派生
  * ──────────────────────────────────────────────────────────────────────────── */
@@ -389,10 +394,10 @@ export type RuleResourceAutoStatus = 'off' | 'manual' | 'active';
 
 export function ruleResourceAutoStatus(config: {
   ruleResourceAutoUpdate?: boolean;
-  subscriptionUpdateIntervalHours?: number;
+  ruleResourceUpdateIntervalHours?: number;
 }): RuleResourceAutoStatus {
   if (!ruleResourceAutoUpdateChecked(config)) return 'off';
-  return isManualInterval(config.subscriptionUpdateIntervalHours) ? 'manual' : 'active';
+  return isManualInterval(config.ruleResourceUpdateIntervalHours) ? 'manual' : 'active';
 }
 
 /**

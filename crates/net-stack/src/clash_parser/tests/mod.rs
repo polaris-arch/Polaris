@@ -541,6 +541,125 @@ fn mihomo_masque_is_skipped_not_mapped_to_masque_client() {
         "跳过原因应恰为 masque：{:?}",
         r.warnings
     );
+    assert!(r.warnings[0].contains("cf-connect-ip"));
+}
+
+#[test]
+fn mihomo_wireguard_simplified_and_single_peer_map_without_losing_routes() {
+    let r = parse_one(
+        r#"
+- name: wg-simple
+  type: wireguard
+  server: wg.example
+  port: 51820
+  ip: 10.0.0.2
+  ipv6: fd00::2/128
+  private-key: private
+  public-key: peer
+  reserved: [1, 2, 3]
+  workers: 4
+- name: wg-peer
+  type: wireguard
+  ip: 10.0.0.3/32
+  private-key: private
+  peers:
+    - server: mesh.example
+      port: 51821
+      public-key: meshkey
+      allowed-ips: [10.20.0.0/16]
+"#,
+    );
+    assert_eq!(
+        (r.servers.len(), r.skipped, r.failed),
+        (2, 0, 0),
+        "{:?}",
+        r.warnings
+    );
+    let simple = r.servers.iter().find(|s| s.name == "wg-simple").unwrap();
+    let wg = simple.wireguard_settings.as_ref().unwrap();
+    assert_eq!(wg.local_address, vec!["10.0.0.2/32", "fd00::2/128"]);
+    assert_eq!(wg.allow_internet, Some(true));
+    assert_eq!(wg.reserved, vec![1, 2, 3]);
+    assert_eq!(wg.workers, Some(4));
+    assert_eq!(wg.persistent_keepalive, Some(0));
+    let mesh = r.servers.iter().find(|s| s.name == "wg-peer").unwrap();
+    let wg = mesh.wireguard_settings.as_ref().unwrap();
+    assert_eq!(wg.allowed_ips, vec!["10.20.0.0/16"]);
+    assert_eq!(wg.allow_internet, Some(false));
+}
+
+#[test]
+fn mihomo_wireguard_multi_peer_and_amnezia_rejected() {
+    let r = parse_one(
+        r#"
+- name: multi
+  type: wireguard
+  ip: 10.0.0.2
+  private-key: private
+  peers:
+    - {server: a.example, port: 51820, public-key: a, allowed-ips: [10.0.0.0/8]}
+    - {server: b.example, port: 51820, public-key: b, allowed-ips: [192.168.0.0/16]}
+- name: amnezia
+  type: wireguard
+  server: a.example
+  port: 51820
+  ip: 10.0.0.2
+  private-key: private
+  public-key: peer
+  amnezia-wg-option: {jc: 5}
+- name: malformed-peers
+  type: wireguard
+  server: a.example
+  port: 51820
+  ip: 10.0.0.2
+  private-key: private
+  public-key: peer
+  peers: ignored
+"#,
+    );
+    assert_eq!((r.servers.len(), r.skipped, r.failed), (0, 1, 2));
+    assert!(r.warnings.iter().any(|w| w.contains("多 peer")));
+    assert!(r.warnings.iter().any(|w| w.contains("AmneziaWG")));
+    assert!(r.warnings.iter().any(|w| w.contains("peers 必须是数组")));
+}
+
+#[test]
+fn mihomo_hysteria_v1_maps_auth_bandwidth_obfs_ports_tls() {
+    let r = parse_one(
+        r#"
+- name: hy1
+  type: hysteria
+  server: hy.example
+  port: 443
+  auth-str: secret
+  up: "1 Gbps"
+  down: "200 Mbps"
+  obfs: scramble
+  ports: 443,8443-8450
+  hop-interval: 30
+  sni: hy.example
+  skip-cert-verify: true
+"#,
+    );
+    assert_eq!(
+        (r.servers.len(), r.skipped, r.failed),
+        (1, 0, 0),
+        "{:?}",
+        r.warnings
+    );
+    let s = &r.servers[0];
+    assert_eq!(s.protocol, Protocol::Hysteria);
+    let hy = s.hysteria_settings.as_ref().unwrap();
+    assert_eq!(hy.auth_str.as_deref(), Some("secret"));
+    assert_eq!(hy.up_mbps, Some(1000));
+    assert_eq!(hy.down_mbps, Some(200));
+    assert_eq!(hy.obfs.as_deref(), Some("scramble"));
+    assert_eq!(hy.server_ports.as_deref(), Some("443:443,8443:8450"));
+    assert_eq!(hy.hop_interval.as_deref(), Some("30s"));
+    assert_eq!(
+        s.tls_settings.as_ref().unwrap().server_name.as_deref(),
+        Some("hy.example")
+    );
 }
 
 #[test]

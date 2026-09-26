@@ -203,6 +203,63 @@ fn missing_or_bad_resources_array_is_empty() {
     assert!(select_due_resources(&cfg, NOW, &tracker(), &all_missing).is_empty());
 }
 
+#[test]
+fn round_plan_keeps_builtin_updates_when_external_leg_has_no_work() {
+    let registered: Vec<String> = builtin_geo_rulesets().into_iter().map(|b| b.tag).collect();
+    for cfg in [
+        json!({}),
+        cfg_with(json!([])),
+        cfg_with(json!([fresh("a")])),
+    ] {
+        let plan = plan_due_updates(&cfg, NOW, &mut tracker(), &all_present);
+        assert!(plan.external_ids.is_empty());
+        assert_eq!(plan.builtin_tags, registered);
+    }
+    // 调用点也必须消费共同计划的两腿；重新插入 external 空早退会抓红这条编排守卫。
+    let body = fn_body("async fn run_due_updates(");
+    assert!(body.contains("plan_due_updates("));
+    assert!(body.contains("for id in plan.external_ids"));
+    assert!(body.contains("run_builtin_geo(app, plan.builtin_tags"));
+    let planned = body.find("plan_due_updates(").unwrap();
+    let builtin = body.find("run_builtin_geo(").unwrap();
+    assert!(!body[planned..builtin].contains("return;"));
+}
+
+#[test]
+fn round_plan_respects_builtin_staleness_switch_interval_and_backoff_pruning() {
+    let builtins = builtin_geo_rulesets();
+    let tag = &builtins[0].tag;
+    let key = builtin_id_for(tag);
+    let mut cfg = json!({ "builtinGeoMeta": {} });
+    for b in &builtins {
+        cfg["builtinGeoMeta"][&b.tag] = json!({ "updatedAt": iso(NOW - HOUR) });
+    }
+    assert!(plan_due_updates(&cfg, NOW, &mut tracker(), &all_present)
+        .builtin_tags
+        .is_empty());
+    cfg["builtinGeoMeta"][tag] = json!({ "updatedAt": iso(NOW - 24 * HOUR) });
+    let mut backoff = tracker();
+    backoff.record_failure(&key, NOW);
+    backoff.record_failure("removed-external", NOW);
+    let plan = plan_due_updates(&cfg, NOW + 1, &mut backoff, &all_present);
+    assert!(plan.builtin_tags.is_empty(), "内置失败退避须跨 prune 保留");
+    assert!(!backoff.is_eligible(&key, NOW + 1));
+    assert!(backoff.is_eligible("removed-external", NOW + 1));
+    assert_eq!(
+        plan_due_updates(&cfg, NOW + BACKOFF_BASE_MS, &mut backoff, &all_present).builtin_tags,
+        vec![tag.clone()]
+    );
+    for (field, value) in [
+        ("ruleResourceAutoUpdate", json!(false)),
+        ("ruleResourceUpdateIntervalHours", json!(0)),
+    ] {
+        let mut disabled = cfg.clone();
+        disabled[field] = value;
+        let plan = plan_due_updates(&disabled, NOW, &mut tracker(), &all_missing);
+        assert_eq!(plan, DueUpdatePlan::default());
+    }
+}
+
 /* ── 资源库目录（catalog）刷新腿 ─────────────────────────────────────────────────── */
 
 /// 空配置（总开关缺省=开、间隔缺省 12h）。
@@ -398,7 +455,7 @@ fn catalog_leg_cannot_short_circuit_the_resource_leg() {
         "目录刷新腿不得用 `?` 传播——那会让一次目录刷新失败吞掉整轮资源更新"
     );
     // 且必须排在资源选取之前（同 上游的顺序：目录先刷新，随后按新目录做资源判定）。
-    let sel = body.find("select_due_resources(").expect("资源腿仍在");
+    let sel = body.find("plan_due_updates(").expect("资源规划仍在");
     assert!(at < sel, "目录刷新应在资源选取之前");
 }
 

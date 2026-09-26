@@ -71,7 +71,7 @@ function protocolLabel(proto: string): string {
 function transferSummary(server: ServerConfig): string {
   const proto = server.protocol.toLowerCase();
   if (proto === 'wireguard') return 'udp · wg';
-  if (proto === 'tailscale') return 'mesh · wg';
+  if (proto === 'tailscale') return ''; // Tailscale identity and live status already describe this node.
   if (proto === 'openconnect') return 'enterprise vpn';
   if (proto === 'tailcat') return 'derp · wg';
   if (proto === 'openvpn-client') return server.openvpnClientSettings?.network || 'udp · vpn';

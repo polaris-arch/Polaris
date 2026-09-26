@@ -84,6 +84,13 @@ export function reservedInputInvalid(raw: unknown): boolean {
   return splitCsv(raw).length > 0 && parseReserved(raw) === undefined;
 }
 
+export function workersInputInvalid(raw: unknown): boolean {
+  const text = String(raw ?? '').trim();
+  if (!text) return false;
+  const value = Number(text);
+  return !Number.isInteger(value) || value < 0 || value > 4294967295;
+}
+
 /** WG 表单草稿键（与 WG_SPEC 的 FieldSpec.k 一一对应）。 */
 export interface WgDraft extends FormValues {
   address: string;
@@ -95,6 +102,7 @@ export interface WgDraft extends FormValues {
   allowedIPs: string;
   persistentKeepalive: number | undefined;
   mtu: number | undefined;
+  workers: number | undefined;
   reserved: string;
   reverseMesh: boolean;
   allowInternet: boolean;
@@ -142,6 +150,7 @@ export function emptyWgDraft(): WgDraft {
     allowedIPs: '',
     persistentKeepalive: 25,
     mtu: 1408,
+    workers: undefined,
     reserved: '', // 缺省即默认（见文件头）：不填 = 不下发 reserved
     reverseMesh: false, // 缺省即默认（见文件头）：gVisor 用户态，零提权
     allowInternet: true,
@@ -170,6 +179,7 @@ export function draftFromParsed(p: ParsedWgQuick): WgDraft {
     allowedIPs: specific.join(', '),
     persistentKeepalive: p.settings.persistentKeepalive ?? 25,
     mtu: p.settings.mtu ?? 1408,
+    workers: p.settings.workers,
     // wg-quick .conf 里没有 Reserved（它是 sing-box/xray 对 WG 的扩展，不是 wg-quick 的 INI 键，
     // 故 `domain/wg-quick.ts` 的解析结果里也没有这一项）→ 恒缺省，由用户在表单里补。
     reserved: '',
@@ -204,6 +214,7 @@ export function draftFromServer(server: ServerConfig): WgDraft {
     allowedIPs: all.filter((a) => !CATCH_ALL.has(a)).join(', '),
     persistentKeepalive: s?.persistentKeepalive ?? 25,
     mtu: s?.mtu ?? 1408,
+    workers: s?.workers,
     // 缺席回显空串（= 真实缺省「不下发」）。回显**照盘上原样**而不套 [`parseReserved`]：盘上若躺着
     // 一个不满足谓词的残值（如 `[1,2]`），用户得先看见它才谈得上改；提交时它会按同一条谓词被删掉。
     reserved: (s?.reserved ?? []).join(', '),
@@ -260,6 +271,9 @@ export function buildWgServer(
   if (keep !== undefined) settings.persistentKeepalive = keep;
   const mtu = parseNumberField(String(draft.mtu ?? ''));
   if (mtu !== undefined) settings.mtu = mtu;
+  const workers = parseNumberField(String(draft.workers ?? ''));
+  if (workers !== undefined && workers > 0 && !workersInputInvalid(workers)) settings.workers = workers;
+  else delete settings.workers;
 
   // Reserved —— **缺省即默认**：不满足消费侧谓词（恰 3 项 × 0–255）即等价于缺席，删键而非留残值。
   // `delete` 同样不是多余：上面 `...base?.wireguardSettings` 起底了存量值，不删就清不掉。
@@ -324,6 +338,9 @@ export function buildWarpSettings(
   const mtu = parseNumberField(String(draft.mtu ?? ''));
   if (mtu !== undefined && Number.isInteger(mtu) && mtu > 0) s.mtu = mtu;
   else delete s.mtu;
+  const workers = parseNumberField(String(draft.workers ?? ''));
+  if (workers !== undefined && workers > 0 && !workersInputInvalid(workers)) s.workers = workers;
+  else delete s.workers;
   const keep = parseNumberField(String(draft.keepalive ?? ''));
   if (keep !== undefined && Number.isInteger(keep) && keep >= 0) s.persistentKeepalive = keep;
   else delete s.persistentKeepalive;

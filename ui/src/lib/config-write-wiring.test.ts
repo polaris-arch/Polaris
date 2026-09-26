@@ -321,6 +321,12 @@ const SITES: readonly Site[] = [
     why: 'W-3：撤销已发起的远端登录会话，副作用已经在远端发生',
   },
   {
+    file: 'App.tsx',
+    callee: 'api.server.tailscaleLoginCancel(',
+    route: 'direct',
+    why: 'W-0/Class A：控制面返回无效登录URL时，立即取消本次授权并等待进程收割；取消进程的会话命令不能暂存',
+  },
+  {
     file: 'components/dialogs/TsSettingsDialog.tsx',
     callee: 'api.server.tailscaleLogout(',
     route: 'direct',

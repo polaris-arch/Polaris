@@ -3,6 +3,7 @@
 //! 状态机纯逻辑（reconcile/clear/latest-wins/macOS 防误删）由 `polaris_mesh::exit_route` 单测覆盖。
 use super::super::*;
 use crate::test_support::TestDir;
+use polaris_config_engine::user_config::proxy_mode::ProxyModeType;
 use polaris_config_engine::user_config::server_config::{
     Protocol, ServerConfig, TailscaleSettings,
 };
@@ -22,6 +23,8 @@ fn ts_system_exit_cfg() -> UserConfig {
         ..Default::default()
     };
     UserConfig {
+        selected_server_id: Some("ts1".into()),
+        proxy_mode_type: ProxyModeType::Tun,
         servers: vec![server],
         ..Default::default()
     }

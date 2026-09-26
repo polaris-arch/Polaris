@@ -33,11 +33,17 @@ test('配置生成变更只开启真实内核门', () => {
   });
 });
 
-test('本地 sing-box 导入变更开启真实内核门（真核往返测试只在内核门里真跑）', () => {
-  for (const path of ['crates/net-stack/src/singbox_import.rs', 'crates/net-stack/src/singbox_import/tests/mod.rs']) {
+test('sing-box JSON 与 mihomo 导入变更开启真实内核门', () => {
+  for (const path of [
+    'crates/net-stack/src/singbox_import.rs',
+    'crates/net-stack/src/singbox_import/tests/mod.rs',
+    'crates/net-stack/src/clash_parser.rs',
+    'crates/net-stack/src/clash_parser/wireguard_import.rs',
+    'crates/net-stack/src/clash_parser/tests/mod.rs',
+    'crates/net-stack/tests/fixtures/assets/openvpn-test-ca.txt',
+  ]) {
     assert.equal(classifyImpact([path]).kernel, true, path);
   }
-  assert.equal(classifyImpact(['crates/net-stack/src/clash_parser.rs']).kernel, false);
 });
 
 test('内核版本与资产钉扎变更强制四平台', () => {

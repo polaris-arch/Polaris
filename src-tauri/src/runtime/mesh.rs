@@ -361,8 +361,19 @@ impl MeshRuntime {
         out
     }
 
-    /// 退出某节点 TS 登录（上游 `tailscale:logout`）：清 state 目录（best-effort，不存在不报错）。
-    pub fn tailscale_logout(&self, server_id: &str) -> std::io::Result<()> {
+    /// Physical deletion is available only under the shared gate and after state writers exit.
+    pub(crate) fn tailscale_logout_under_gate(
+        &self,
+        server_id: &str,
+        _gate: &tokio::sync::MutexGuard<'_, ()>,
+        main_alive: bool,
+    ) -> std::io::Result<()> {
+        if self.login_registry.state_in_use(server_id, main_alive) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Tailscale state is in use",
+            ));
+        }
         let dir = self.tailscale_state_dir(server_id)?;
         if !dir.exists() {
             return Ok(());
@@ -549,43 +560,73 @@ impl MeshRuntime {
         });
     }
 
-    /// 起某 TS 节点的瞬态登录核（上游 `tailscale:login`）：spawn 独立 sing-box，订阅它自己的管理 API
-    /// STATUS 流，把帧里的 `authURL` 发成登录 URL 事件、`backendState=Running` 当登录成功并收核。
-    ///
-    /// `is_running`/`running_config`/`primary_api_port` 由命令层从 `ProxyRuntime` 取：前两者供双写守卫
-    /// （该 endpoint 是否已在运行主核），后者供瞬态核 api 端口避开主核已占的那个。
-    /// 返 [`StartLoginOutcome`]，命令层折成前端 `{ started, reason?, authUrl? }`。
+    pub fn prepare_tailscale_login(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+        self.login_registry.prepare(server_id, attempt_id)
+    }
+
     pub async fn start_tailscale_login(
         &self,
         app: AppHandle,
         server: &ServerConfig,
-        is_running: bool,
-        running_config: Option<&UserConfig>,
-        primary_api_port: u16,
+        request: crate::runtime::tailscale_login_core::LoginRequest,
+        main_core: &(dyn Fn() -> crate::runtime::tailscale_login_core::MainLoginSnapshot
+              + Send
+              + Sync),
     ) -> StartLoginOutcome {
-        let emitter = Arc::new(AppHandleEmitter { app });
         self.login_registry
-            .start_login(
+            .start_attempt(
                 server,
                 &self.config_dir,
-                is_running,
-                running_config,
-                primary_api_port,
-                emitter,
+                request,
+                main_core,
+                Arc::new(AppHandleEmitter { app }),
             )
             .await
     }
 
-    /// 取消某 TS 节点在飞的瞬态登录核（上游 `tailscale:loginCancel`）。幂等：无在飞核也返 ok。
-    pub fn cancel_tailscale_login(&self, server_id: &str) -> bool {
-        self.login_registry.cancel_login(server_id)
+    pub async fn cancel_tailscale_login_attempt(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), String> {
+        self.login_registry
+            .cancel_attempt(server_id, attempt_id)
+            .await
     }
 
-    /// **此刻在飞**的瞬态登录核 pid —— `ProxyRuntime::cleanup_stale_cores` 排除表的 mesh 侧来源。
-    ///
-    /// 这条转发就是「mesh↔proxy 反向耦合」的全部：方向本来就是现成的（`ProxyRuntime` 持有
-    /// `Arc<MeshRuntime>`，`MeshRuntime` 持有 [`LoginCoreRegistry`]），只缺注册表里的 pid 字段。
-    /// 射程与两处未覆盖窗口见 [`LoginCoreRegistry::inflight_login_pids`]。
+    pub async fn tailscale_state_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.login_registry.state_gate().await
+    }
+
+    pub async fn reserve_tailscale_main_states(&self, generated: &serde_json::Value) {
+        self.login_registry
+            .reserve_main_states(generated, &self.config_dir)
+            .await;
+    }
+
+    pub fn release_tailscale_main_states(&self) {
+        self.login_registry.release_main_states();
+    }
+
+    #[cfg(test)]
+    pub fn main_owns_tailscale(&self, id: &str, alive: bool) -> bool {
+        self.login_registry.main_owns(id, alive)
+    }
+
+    pub async fn logout_tailscale_safely(
+        &self,
+        id: &str,
+        main_alive: &(dyn Fn() -> bool + Send + Sync),
+        keep_attempt: Option<&str>,
+    ) -> std::io::Result<bool> {
+        self.login_registry
+            .logout(id, main_alive, keep_attempt, |gate| {
+                self.tailscale_logout_under_gate(id, gate, main_alive())
+            })
+            .await
+    }
+
+    /// PID 保留至进程被收割；主核清扫持有同一 state gate。
     #[must_use]
     pub fn inflight_login_core_pids(&self) -> Vec<u32> {
         self.login_registry.inflight_login_pids()

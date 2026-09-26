@@ -446,7 +446,7 @@ fn core_log_relay_applies_privacy_floor_per_frame_and_guards_reset_history() {
 /// 都收不到任何东西，行为测试对这两种改法**结构上零信息量**。装一个进程级 logger 又会污染同一
 /// 测试二进制里 `logging.rs` 那几条已经串行化的全局级别用例。故按本模块既有惯例落成源码断言。
 ///
-/// **判据区域排除自身**：只在 `pipe_to_log` 函数体这一段里找（起于其函数头、止于其闭合大括号）。
+/// **判据区域排除自身**：只在共用的 `pipe_to_log_with_secrets` 排空函数体这一段里找（起于其函数头、止于其闭合大括号）。
 /// 旧版还要断言该函数头出现在 `mod tests` 之前——测试实体外移到 `runtime/proxy/tests/` 之后，
 /// `runtime/proxy.rs` 全文恒为生产码，本测试自己写下的字面量结构上已不可能给判据充数，那条
 /// 自检既不再需要也不再成立（文件里已无 `mod tests {`）。
@@ -454,8 +454,8 @@ fn core_log_relay_applies_privacy_floor_per_frame_and_guards_reset_history() {
 fn pipe_to_log_yields_forwarding_on_handoff_but_never_yields_fatal_classification() {
     let src = module_code("runtime/proxy");
     let start = src
-        .find("pub(crate) fn pipe_to_log<R>(")
-        .expect("锚点 `pub(crate) fn pipe_to_log<R>(` 消失，源码型守卫已失去判据");
+        .find("pub(crate) fn pipe_to_log_with_secrets<R>(")
+        .expect("锚点 `pub(crate) fn pipe_to_log_with_secrets<R>(` 消失，源码型守卫已失去判据");
     let body = &src[start..];
     let body = &body[..body.find("\n}\n").expect("pipe_to_log 函数体没闭合")];
 
@@ -518,5 +518,26 @@ async fn pipe_to_log_keeps_reading_past_a_non_utf8_line() {
     assert!(
         drained,
         "坏字节之后必须继续排空：写手只推进到 {written} / {TOTAL} 字节 —— 转发任务在坏行处退出了"
+    );
+}
+
+#[test]
+fn login_diagnostics_hide_exact_headscale_key_api_secret_and_auth_url() {
+    let raw = "DEBUG rejected PRIVATE_HEADSCALE_KEY api=PRIVATE_API_SECRET Waiting for authentication: https://hs.example/register/PRIVATE_URL_TOKEN";
+    let redacted = redact_known_process_secrets(
+        raw,
+        &["PRIVATE_HEADSCALE_KEY".into(), "PRIVATE_API_SECRET".into()],
+    );
+    assert!(redacted.contains("DEBUG rejected"));
+    for private in [
+        "PRIVATE_HEADSCALE_KEY",
+        "PRIVATE_API_SECRET",
+        "PRIVATE_URL_TOKEN",
+    ] {
+        assert!(!redacted.contains(private));
+    }
+    assert_eq!(
+        redact_known_process_secrets("INFO normal diagnostic", &["secret".into()]),
+        "INFO normal diagnostic"
     );
 }

@@ -2,6 +2,7 @@ import { invoke, listen } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent } from '../../contracts/types';
 import type { TailscaleStatusEvent } from '../../contracts/tailscale-status';
+import type { TailscaleLoginProgress } from '../../domain/tailscale-login-progress';
 
 // ============================================================================
 // proxyApi
@@ -154,6 +155,10 @@ export const proxyApi = {
     }) => void
   ): () => void {
     return listen(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_URL, listener);
+  },
+
+  onTailscaleLoginProgress(listener: (data: TailscaleLoginProgress) => void): () => void {
+    return listen(IPC_CHANNELS.EVENT_TAILSCALE_LOGIN_PROGRESS, listener);
   },
 
   /** 监听 sing-box 1.14 管理 API 推送的 Tailscale 节点真实态。 */

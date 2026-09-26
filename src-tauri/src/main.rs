@@ -1051,6 +1051,7 @@ fn main() {
             warp_register,
             warp_apply_license,
             tailscale_login,
+            tailscale_login_prepare,
             tailscale_login_cancel,
             tailscale_logout,
             tailscale_state_exists,

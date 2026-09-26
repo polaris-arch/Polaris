@@ -284,6 +284,7 @@ pub fn build_wireguard_endpoint(
         1408
     };
     ep.mtu = Some(s.mtu.filter(|mtu| *mtu > 0).unwrap_or(default_mtu));
+    ep.workers = s.workers.filter(|workers| *workers > 0);
     ep.address = Some(s.local_address.clone());
     ep.private_key = Some(private_key);
     let mut peer = WireGuardPeer {

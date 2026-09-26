@@ -92,7 +92,7 @@ export function NodesToolbar({
         onChange={setProtoFilter}
         options={[
           { value: '', label: t('nodes.filter.allProto') },
-          ...protoOptions.map((p) => ({ value: p, label: p })),
+          ...protoOptions.map((p) => ({ value: p, label: p === 'masque-client' ? 'MASQUE' : p })),
         ]}
       />
 

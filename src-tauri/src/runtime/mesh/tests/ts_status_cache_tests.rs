@@ -25,8 +25,8 @@ fn event(id: &str, logged_in: bool) -> TailscaleStatusEvent {
     }
 }
 
-#[test]
-fn logout_rejects_path_escape_without_touching_sibling_directory() {
+#[tokio::test]
+async fn logout_rejects_path_escape_without_touching_sibling_directory() {
     let root = temp_dir("logout-escape");
     let config = root.join("config");
     let victim = root.join("victim");
@@ -35,14 +35,17 @@ fn logout_rejects_path_escape_without_touching_sibling_directory() {
     std::fs::write(victim.join("sentinel"), b"keep").unwrap();
 
     let mesh = MeshRuntime::new(config);
-    let error = mesh.tailscale_logout("../victim").unwrap_err();
+    let error = mesh
+        .logout_tailscale_safely("../victim", &|| false, None)
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(victim.join("sentinel").exists());
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[test]
-fn logout_removes_only_the_valid_managed_state_directory() {
+#[tokio::test]
+async fn logout_removes_only_the_valid_managed_state_directory() {
     let root = temp_dir("logout-valid");
     let config = root.join("config");
     let mesh = MeshRuntime::new(config.clone());
@@ -50,15 +53,17 @@ fn logout_removes_only_the_valid_managed_state_directory() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("tailscaled.state"), b"state").unwrap();
 
-    mesh.tailscale_logout("srv-1").unwrap();
+    mesh.logout_tailscale_safely("srv-1", &|| false, None)
+        .await
+        .unwrap();
     assert!(!state.exists());
     assert!(config.exists());
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
-#[test]
-fn logout_rejects_a_state_root_symlink_escape() {
+#[tokio::test]
+async fn logout_rejects_a_state_root_symlink_escape() {
     let root = temp_dir("logout-symlink");
     let config = root.join("config");
     let victim_state = root.join("victim/srv-1");
@@ -68,7 +73,10 @@ fn logout_rejects_a_state_root_symlink_escape() {
     std::os::unix::fs::symlink(root.join("victim"), config.join("tailscale")).unwrap();
 
     let mesh = MeshRuntime::new(config);
-    let error = mesh.tailscale_logout("srv-1").unwrap_err();
+    let error = mesh
+        .logout_tailscale_safely("srv-1", &|| false, None)
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(victim_state.join("sentinel").exists());
     let _ = std::fs::remove_dir_all(root);

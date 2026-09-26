@@ -439,6 +439,9 @@ pub fn build_proxy_outbound(
                     ob.extra.remove(k);
                 }
                 ob.auth_str = h.auth_str.clone();
+                if let Some(auth) = &h.auth {
+                    ob.extra.insert("auth".into(), auth.clone().into());
+                }
                 ob.up_mbps = h.up_mbps;
                 ob.down_mbps = h.down_mbps;
                 if let Some(o) = &h.obfs {

@@ -21,23 +21,23 @@ fn category_ai_uses_noncn_filename() {
     assert_eq!(ai.file_name, "geosite-category-ai-!cn.srs");
 }
 
-/// CN 三件套走 SagerNet **release 资产**，资产名 = file_name。
-/// 混成 MetaCubeX raw 路径就是 404 —— 这条锁住两个源不串。
+/// CN 三件套取 SagerNet `rule-set` 分支的 SRS，保留完整文件名。
+/// release 只提供数据库资产；这些 URL 必须与官方 SRS 发布路径一致。
 #[test]
-fn cn_baseline_source_url_is_sagernet_release() {
+fn cn_baseline_source_url_is_sagernet_rule_set() {
     let all = builtin_geo_rulesets();
     let by = |t: &str| all.iter().find(|b| b.tag == t).unwrap().source_url();
     assert_eq!(
         by("geoip-cn"),
-        "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-cn.srs"
+        "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
     );
     assert_eq!(
         by("geosite-cn"),
-        "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite-cn.srs"
+        "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
     );
     assert_eq!(
         by("geosite-geolocation-!cn"),
-        "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite-geolocation-!cn.srs"
+        "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs"
     );
 }
 

@@ -27,6 +27,7 @@ use polaris_config_engine::builder::endpoint_routes::{
     mesh_node_carries_full_tunnel, mesh_uses_system_interface, TS_SYSTEM_INTERFACE_NAME,
 };
 use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use polaris_config_engine::user_config::server_config::Protocol;
 use polaris_helper_proto::Platform;
 
@@ -38,6 +39,8 @@ pub const EXIT_DEFAULT_V6: &[&str] = &["::/0"];
 /// 出口路由计划。上游 `MeshExitRoutePlan`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshExitRoutePlan {
+    /// 选中节点身份；同一逻辑接口切换节点也必须重新对账。
+    pub server_id: String,
     /// 内核接口名（逻辑名 polaris-ts）。
     pub iface: String,
     /// 要装的出口路由（按 enable_ipv6 含/不含 v6）。
@@ -51,16 +54,20 @@ pub fn mesh_system_supported_on_platform(platform: Platform) -> bool {
 
 /// 出口托管决策（纯函数）：当前选中的全局出口节点是否需要 Polaris 自装出口路由、装到哪张内核接口。
 ///
-/// 仅 **TS System + 承载全隧道（exit_node 设了）** 需要。返回 None 的情形：
-/// - 无 TS 节点 / TS 是 gVisor / TS 无 exit_node（不承载全隧道）；
+/// 仅 **TUN 模式选中的 TS System + 承载全隧道（exit_node 设了）** 需要。返回 None 的情形：
+/// - 未选中 TS / direct / manual / systemProxy / TS 是 userspace / TS 无 exit_node；
 /// - WG/WARP 由 sing-box 按 allowed_ips 自装 → 本函数只管 TS。
 ///
 /// 上游 `planMeshExitRoute`。`enable_ipv6` 控制是否含 v6 默认路由。
 pub fn plan_mesh_exit_route(config: &UserConfig, enable_ipv6: bool) -> Option<MeshExitRoutePlan> {
+    if config.proxy_mode == ProxyMode::Direct || config.proxy_mode_type != ProxyModeType::Tun {
+        return None;
+    }
+    let selected_id = config.selected_server_id.as_deref()?;
     let ts = config
         .servers
         .iter()
-        .find(|s| s.protocol == Protocol::Tailscale)?;
+        .find(|s| s.id == selected_id && s.protocol == Protocol::Tailscale)?;
     if !mesh_uses_system_interface(ts) {
         return None;
     }
@@ -84,6 +91,7 @@ pub fn plan_mesh_exit_route(config: &UserConfig, enable_ipv6: bool) -> Option<Me
         cidrs.extend(EXIT_DEFAULT_V6.iter().map(|s| s.to_string()));
     }
     Some(MeshExitRoutePlan {
+        server_id: ts.id.clone(),
         iface: TS_SYSTEM_INTERFACE_NAME.to_string(),
         cidrs,
     })
@@ -92,6 +100,7 @@ pub fn plan_mesh_exit_route(config: &UserConfig, enable_ipv6: bool) -> Option<Me
 /// 已装路由的内存态。上游 `InstalledRoute`。iface = 实际装路由的接口名（macOS=反查到的 utunN）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledRoute {
+    pub server_id: String,
     pub iface: String,
     pub cidrs: Vec<String>,
 }
@@ -335,16 +344,15 @@ where
                 changed: false,
             };
         }
-        let desired_key = plan.as_ref().map(|p| p.cidrs.join(",")).unwrap_or_default();
-        let current_key = self
-            .installed
-            .as_ref()
-            .map(|i| i.cidrs.join(","))
-            .unwrap_or_default();
-        // 注：macOS 接口名动态，desired.iface 是逻辑名；实际接口在 apply 内反查。仅以 cidrs 判变更。
-        let has_plan = plan.is_some();
-        let has_installed = self.installed.is_some();
-        if desired_key == current_key && has_plan == has_installed {
+        // macOS 接口名动态（plan 为逻辑名、installed 为 utunN），故比较节点身份与 CIDR。
+        let same_plan = match (plan.as_ref(), self.installed.as_ref()) {
+            (None, None) => true,
+            (Some(plan), Some(installed)) => {
+                plan.server_id == installed.server_id && plan.cidrs == installed.cidrs
+            }
+            _ => false,
+        };
+        if same_plan {
             // 无变更。
             return ReconcileOutcome {
                 installed: self.installed.clone(),
@@ -367,6 +375,7 @@ where
     /// ① installed 为空——resolveIface 18s 轮询超时过 → 路由从未装成 → 重新 reconcile 补装；
     /// ② macOS installed.iface 已消失（接口换名/停了 → 其 ifscope 路由随接口自动失效，内存 installed 残留）
     ///   → 复位 installed 后 reconcile 重装。
+    /// ③ 选中节点/模式/CIDR 已变 → 清旧并按新计划对账。
     /// 其余情形不动——避免对已存 ifscope 路由重发 `route add` 的 EEXIST 噪音。上游 `reassert`。
     ///
     /// `token` 语义同 [`reconcile`](Self::reconcile)（调用方拿锁前快照，一路带到 `apply`）。
@@ -382,16 +391,18 @@ where
                 changed: false,
             };
         }
-        // 无 System exit 出口 → 无路由可保。仅判 Some/None（reassert 不消费 plan 细节——不 churn 已存路由）。
-        if plan_mesh_exit_route(config, enable_ipv6).is_none() {
-            return ReconcileOutcome {
-                installed: self.installed.clone(),
-                changed: false,
-            };
-        }
-        if self.installed.is_none() {
-            // 从未装成 → 重新对账补装。
-            return self.reconcile(config, enable_ipv6, token).await;
+        let plan = plan_mesh_exit_route(config, enable_ipv6);
+        // 重申也可能撞上切节点/切模式后的旧安装态；身份或 CIDR 变了须先清旧再对账。
+        match (plan.as_ref(), self.installed.as_ref()) {
+            (None, None) => {
+                return ReconcileOutcome {
+                    installed: None,
+                    changed: false,
+                }
+            }
+            (Some(plan), Some(installed))
+                if plan.server_id == installed.server_id && plan.cidrs == installed.cidrs => {}
+            _ => return self.reconcile(config, enable_ipv6, token).await,
         }
         // macOS：installed.iface 是否已消失。
         if self.platform == Platform::Mac {
@@ -515,6 +526,7 @@ where
         let ok = self.op.run_route("add", &iface, &plan.cidrs).await;
         if ok {
             self.installed = Some(InstalledRoute {
+                server_id: plan.server_id.clone(),
                 iface: iface.clone(),
                 cidrs: plan.cidrs.clone(),
             });

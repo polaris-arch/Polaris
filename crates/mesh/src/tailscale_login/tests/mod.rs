@@ -215,3 +215,15 @@ fn state_machine_reset_returns_idle() {
     let next = advance_login_state(&LoginState::LoggedIn, &LoginEvent::Reset);
     assert_eq!(next, LoginState::Idle);
 }
+
+#[test]
+fn preauthorized_login_keeps_key_and_headscale_control_url() {
+    let server = ts_server(TailscaleSettings {
+        auth_key: Some("  preauthorized-private-key  ".into()),
+        control_url: Some("https://headscale.example".into()),
+        ..Default::default()
+    });
+    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+    assert_eq!(cfg.endpoints[0]["auth_key"], "preauthorized-private-key");
+    assert_eq!(cfg.endpoints[0]["control_url"], "https://headscale.example");
+}

@@ -1051,6 +1051,198 @@ fn build_single(server: ServerConfig) -> OutboundsResult {
     build_outbounds(&config, &mut deps).expect("最小节点应能生成")
 }
 
+fn vpn_client_node(protocol: Protocol) -> ServerConfig {
+    let mut vpn = endpoint_node_for(protocol, None);
+    vpn.openconnect_settings = (protocol == Protocol::Openconnect).then(|| {
+        Box::new(crate::user_config::protocol_settings::OpenconnectSettings {
+            server: Some("vpn.example.com:443".into()),
+            ..Default::default()
+        })
+    });
+    vpn.openvpn_client_settings = (protocol == Protocol::OpenvpnClient).then(|| {
+        Box::new(
+            crate::user_config::protocol_settings::OpenvpnClientSettings {
+                server: Some("vpn.example.com".into()),
+                server_port: Some(1194),
+                tls: Some(Default::default()),
+                ..Default::default()
+            },
+        )
+    });
+    vpn
+}
+
+fn vpn_forward_node() -> ServerConfig {
+    ServerConfig {
+        id: "forward-id".into(),
+        name: "Forward SOCKS".into(),
+        protocol: Protocol::Socks,
+        address: "127.0.0.1".into(),
+        port: 1080,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn vpn_client_endpoints_resolve_local_detour_ids_to_outbound_tags() {
+    let forward = vpn_forward_node();
+    for protocol in [Protocol::Openconnect, Protocol::OpenvpnClient] {
+        let mut vpn = vpn_client_node(protocol);
+        vpn.detour = Some(forward.id.clone());
+        let config = UserConfig {
+            selected_server_id: Some(vpn.id.clone()),
+            servers: vec![vpn, forward.clone()],
+            ..Default::default()
+        };
+        let result = build_outbounds(&config, &mut deps_default()).unwrap();
+        let forward_tag = result
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.server.as_deref() == Some("127.0.0.1"))
+            .map(|outbound| outbound.tag.as_str())
+            .expect("前置代理应生成 outbound");
+        let endpoint = result
+            .pending_endpoints
+            .iter()
+            .find(|endpoint| {
+                endpoint.type_field == crate::builder::outbound::protocol_str(protocol)
+            })
+            .expect("VPN 客户端应生成 endpoint");
+        assert_eq!(endpoint.detour.as_deref(), Some(forward_tag));
+        assert_ne!(endpoint.detour.as_deref(), Some("forward-id"));
+        assert_eq!(
+            serde_json::to_value(endpoint).unwrap()["detour"],
+            serde_json::json!(forward_tag)
+        );
+    }
+}
+
+#[test]
+fn vpn_client_endpoints_reject_missing_self_cyclic_and_endpoint_detours() {
+    for protocol in [Protocol::Openconnect, Protocol::OpenvpnClient] {
+        for case in ["missing", "self", "cycle", "endpoint"] {
+            let mut vpn = vpn_client_node(protocol);
+            let mut other = Vec::new();
+            match case {
+                "missing" => vpn.detour = Some("absent".into()),
+                "self" => vpn.detour = Some(vpn.id.clone()),
+                "cycle" => {
+                    vpn.detour = Some("forward-id".into());
+                    let mut forward = vpn_forward_node();
+                    forward.detour = Some(vpn.id.clone());
+                    other.push(forward);
+                }
+                "endpoint" => {
+                    vpn.detour = Some("other-endpoint".into());
+                    other.push(mesh_node("other-endpoint", Protocol::Tailscale, false));
+                }
+                _ => unreachable!(),
+            }
+            let config = UserConfig {
+                selected_server_id: Some(vpn.id.clone()),
+                servers: std::iter::once(vpn).chain(other).collect(),
+                ..Default::default()
+            };
+            let result = build_outbounds(&config, &mut deps_default()).unwrap();
+            let endpoint = result
+                .pending_endpoints
+                .iter()
+                .find(|ep| ep.type_field == crate::builder::outbound::protocol_str(protocol))
+                .expect("VPN 客户端仍应生成");
+            assert!(endpoint.detour.is_none(), "{protocol:?}: {case}");
+        }
+    }
+}
+
+fn mesh_node(id: &str, protocol: Protocol, system: bool) -> ServerConfig {
+    let mut node = endpoint_node_for(protocol, None);
+    node.id = id.into();
+    node.name = id.into();
+    match protocol {
+        Protocol::Tailscale => {
+            node.tailscale_settings = Some(Box::new(
+                crate::user_config::server_config::TailscaleSettings {
+                    reverse_mesh: Some(system),
+                    ..Default::default()
+                },
+            ));
+        }
+        Protocol::Wireguard => {
+            node.wireguard_settings.as_mut().unwrap().reverse_mesh = Some(system);
+        }
+        _ => unreachable!(),
+    }
+    node
+}
+
+#[test]
+fn system_mesh_interface_conflict_rejects_only_duplicate_active_system_type() {
+    for (protocol, interface) in [
+        (Protocol::Tailscale, "polaris-ts"),
+        (Protocol::Wireguard, "polaris-wg"),
+    ] {
+        let config = UserConfig {
+            selected_server_id: Some("a".into()),
+            servers: vec![
+                mesh_node("a", protocol, true),
+                mesh_node("b", protocol, true),
+            ],
+            ..Default::default()
+        };
+        let mut deps = deps_default();
+        deps.system_interface_available = true;
+        let error = build_outbounds(&config, &mut deps).unwrap_err();
+        assert!(error.contains(interface), "{error}");
+        assert!(error.contains('a') && error.contains('b'), "{error}");
+
+        let mut userspace = config.clone();
+        userspace.servers[1] = mesh_node("b", protocol, false);
+        let result = build_outbounds(&userspace, &mut deps).unwrap();
+        assert_eq!(result.pending_endpoints.len(), 2);
+
+        userspace.servers[0] = mesh_node("a", protocol, false);
+        let result = build_outbounds(&userspace, &mut deps).unwrap();
+        assert_eq!(result.pending_endpoints.len(), 2);
+
+        let mut unavailable = deps_default();
+        let result = build_outbounds(&config, &mut unavailable).unwrap();
+        assert_eq!(result.pending_endpoints.len(), 2);
+        assert!(result
+            .pending_endpoints
+            .iter()
+            .all(|ep| { ep.system != Some(true) && ep.system_interface != Some(true) }));
+    }
+
+    let config = UserConfig {
+        selected_server_id: Some("ts".into()),
+        servers: vec![
+            mesh_node("ts", Protocol::Tailscale, true),
+            mesh_node("wg", Protocol::Wireguard, true),
+        ],
+        ..Default::default()
+    };
+    let mut deps = deps_default();
+    deps.system_interface_available = true;
+    let result = build_outbounds(&config, &mut deps).unwrap();
+    assert_eq!(result.pending_endpoints.len(), 2);
+
+    // custom endpoint 透传袋也会成为真正的 System 接口，不能绕过同名冲突守卫。
+    let config = UserConfig {
+        selected_server_id: Some("ts".into()),
+        servers: vec![
+            mesh_node("ts", Protocol::Tailscale, true),
+            custom_node(
+                "custom-ts",
+                serde_json::json!({ "type": "tailscale", "system_interface": true }),
+                true,
+            ),
+        ],
+        ..Default::default()
+    };
+    let error = build_outbounds(&config, &mut deps).unwrap_err();
+    assert!(error.contains("polaris-ts"), "{error}");
+}
+
 #[test]
 fn on_demand_reaches_every_endpoint_leg() {
     use crate::user_config::server_config::{lands_in_endpoints, ALL_PROTOCOLS};

@@ -32,6 +32,7 @@ import {
   buildWgServer,
   validateWgDraft,
   reservedInputInvalid,
+  workersInputInvalid,
   isWarpDraft,
   splitCsv,
   type WgDraft,
@@ -71,6 +72,7 @@ export function wgSpec(
     { t: 'text', k: 'allowedIPs', label: 'wg.allowed', ph: '10.0.0.0/24', mono: true, opt: true },
     { t: 'number', k: 'persistentKeepalive', label: 'wg.keep', ph: '25', mono: true },
     { t: 'number', k: 'mtu', label: 'wg.mtu', ph: '1408', mono: true },
+    { t: 'number', k: 'workers', label: 'wg.workers', hint: 'wg.workersHint', mono: true, opt: true },
     // Reserved：**对所有 WG 节点开放**，不是 WARP 专属。上游 `wireguard-form.tsx:488` 同样把它放在
     // 通用 WG 表单里（其 `:53` 注释「reserved 仅 Cloudflare WARP 等需要」说的是**用途**，不是限制）——
     // 「等」不是虚指：任何在 WG 之上做多路复用的服务端（WARP 类网关、自建 xray/sing-box 对端）都靠
@@ -236,6 +238,12 @@ function WgForm({ base }: { base?: ServerConfig }) {
       setSrc('manual');
       setFormTab('advanced');
       toast.error(t('wg.errReserved'));
+      return;
+    }
+    if (workersInputInvalid(draft.workers)) {
+      setSrc('manual');
+      setFormTab('advanced');
+      toast.error(t('wg.errWorkers'));
       return;
     }
     const server = buildWgServer(name, draft, base);

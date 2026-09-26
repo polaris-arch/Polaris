@@ -541,7 +541,9 @@ export function ImportDialog({ instanceId, onAdded }: { instanceId: string; onAd
                     {t('import.unsupportedBadge')}
                   </span>
                 ) : (
-                  <span className="imp-proto">{n.protocol}</span>
+                  <span className="imp-proto">
+                    {n.protocol === 'masque-client' ? 'MASQUE' : n.protocol}
+                  </span>
                 )}
               </li>
             ))}

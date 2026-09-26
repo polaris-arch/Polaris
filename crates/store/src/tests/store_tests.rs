@@ -46,6 +46,36 @@ fn load_valid_config_round_trips_through_save() {
 }
 
 #[test]
+fn two_tailscale_userspace_nodes_survive_real_save_load() {
+    let fs = MockFs::default();
+    let cfg = serde_json::json!({
+        "proxyMode": "smart",
+        "proxyModeType": "systemProxy",
+        "mixedPort": 8080,
+        "controlPort": 9091,
+        "logLevel": "warn",
+        "tunConfig": {"mtu":1400,"autoRoute":true,"strictRoute":false},
+        "servers": [
+            {"id":"ts-a", "name":"Tailnet A", "protocol":"tailscale",
+             "tailscaleSettings":{"reverseMesh":false,"controlUrl":"https://a.example"}},
+            {"id":"ts-b", "name":"Tailnet B", "protocol":"tailscale",
+             "tailscaleSettings":{"reverseMesh":false,"controlUrl":"https://b.example"}}
+        ]
+    });
+    ConfigStore::save(&fs, Path::new(CFG), &cfg, "abcdef012345").unwrap();
+    let loaded = ConfigStore::load(&fs, Path::new(CFG));
+    assert!(loaded.error.is_none());
+    let nodes = loaded.config["servers"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0]["id"], "ts-a");
+    assert_eq!(nodes[1]["id"], "ts-b");
+    assert_eq!(
+        nodes[1]["tailscaleSettings"]["controlUrl"],
+        "https://b.example"
+    );
+}
+
+#[test]
 fn load_corrupt_json_returns_default_and_does_not_overwrite_disk() {
     // 维度7 #7 核心：坏 JSON → 内存回落默认，**磁盘真实文件原样保留**（绝不覆盖）。
     let corrupt = "{ this is not valid json";
