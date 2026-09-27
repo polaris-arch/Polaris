@@ -49,6 +49,8 @@ export const TEMP_CORE_NAIVE_CEILING_HINT = 110;
 export function speedTestErrorMessage(err: unknown, t: TFunction): string {
   const code = err instanceof IpcError ? err.code : undefined;
   switch (code) {
+    case 'SYSTEM_INTERFACE_REQUIRES_HELPER':
+      return t('nodes.speedTestSystemInterfaceRequiresHelper');
     case 'SPEEDTEST_NO_ACTIVE_EXIT':
       return t('nodes.speedTestNoActiveExit');
     case 'SPEEDTEST_PROBE_POOL_UNWIRED':
@@ -97,7 +99,7 @@ export function speedTestErrorMessage(err: unknown, t: TFunction): string {
  * 同一事实由 Home 的「N 项待应用」操作条承载，故非静默，登记为已知残留。
  */
 export function notInPoolMessage(
-  r: Pick<SpeedTestInvokeResult, 'notInPool' | 'tsNotReady'>,
+  r: Pick<SpeedTestInvokeResult, 'notInPool' | 'tsNotReady' | 'systemInterfaceBlocked'>,
   t: TFunction
 ): string | null {
   const parts: string[] = [];
@@ -116,6 +118,9 @@ export function notInPoolMessage(
         count: tsNotReady,
       })
     );
+  }
+  if (r?.systemInterfaceBlocked?.length) {
+    parts.push(t('nodes.speedTestSkippedSystemInterface', { count: r.systemInterfaceBlocked.length }));
   }
   return parts.length > 0 ? parts.join('\n') : null;
 }

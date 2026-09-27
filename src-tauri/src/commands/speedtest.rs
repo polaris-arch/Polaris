@@ -812,6 +812,19 @@ async fn run_temp_core_speed_test(
         .collect();
     let plan = plan_temp_core_with_bindings(&servers, &proxy.core_build_env(), &bind_interfaces);
     if plan.testable.is_empty() {
+        if !plan.system_interface_blocked.is_empty() {
+            let blocked_names: Vec<String> = servers
+                .iter()
+                .filter(|server| plan.system_interface_blocked.contains(&server.id))
+                .map(|server| server.name.clone())
+                .collect();
+            return ApiResponse::err_with_code(
+                polaris_config_engine::builder::system_interfaces::system_interface_ownership_error(
+                    &blocked_names,
+                ),
+                crate::runtime::proxy::code::SYSTEM_INTERFACE_REQUIRES_HELPER,
+            );
+        }
         return ApiResponse::err_with_code(
             temp_core_none_testable_message(
                 requested.len(),
@@ -874,6 +887,7 @@ async fn run_temp_core_speed_test(
             "outcome": outcome,
             "notInPool": not_in_pool,
             "tsNotReady": plan.tailscale,
+            "systemInterfaceBlocked": plan.system_interface_blocked,
             "dirty": Vec::<String>::new(),
         })),
         // 起核前就被主核接管 → 一个节点都没测。**失败信封**：零进度事件 + 成功信封会把前端测速按钮
@@ -883,6 +897,10 @@ async fn run_temp_core_speed_test(
             CODE_TEMP_CORE_FAILED,
         ),
         TempCoreOutcome::Failed(e) => ApiResponse::err_with_code(e, CODE_TEMP_CORE_FAILED),
+        TempCoreOutcome::SystemInterfaceRequired(e) => ApiResponse::err_with_code(
+            e,
+            crate::runtime::proxy::code::SYSTEM_INTERFACE_REQUIRES_HELPER,
+        ),
         // 规模超限**必须**是独立的码：并进 `CODE_TEMP_CORE_FAILED` 就等于告诉用户「测速中断」，
         // 与就绪超时逐字相同，而两者的修法南辕北辙（一个是少选 naive 节点，一个是查网络/端口）。
         TempCoreOutcome::Oversized(e) => ApiResponse::err_with_code(e, CODE_TEMP_CORE_OVERSIZED),

@@ -31,6 +31,10 @@ const t = ((key: string, opts?: unknown) => {
 }) as unknown as TFunction;
 
 describe('speedTestErrorMessage', () => {
+  it('系统接口拒绝有可行动说明，不误报网络中断', () => {
+    const err = new IpcError('server_speed_test', 'private diagnostics', 'SYSTEM_INTERFACE_REQUIRES_HELPER');
+    expect(speedTestErrorMessage(err, t)).toBe('nodes.speedTestSystemInterfaceRequiresHelper');
+  });
   it('无活跃出口 → 专用文案（不是笼统「失败」）', () => {
     const err = new IpcError('server_speed_test', 'backend msg', 'SPEEDTEST_NO_ACTIVE_EXIT');
     expect(speedTestErrorMessage(err, t)).toBe('nodes.speedTestNoActiveExit');
@@ -80,6 +84,11 @@ describe('speedTestErrorMessage', () => {
 });
 
 describe('notInPoolMessage', () => {
+  it('系统接口节点单独计数，不发重启内核纳入的提示', () => {
+    const message = notInPoolMessage({ notInPool: [], tsNotReady: [], systemInterfaceBlocked: ['oc', 'ov'] }, t);
+    expect(message).toBe('nodes.speedTestSkippedSystemInterface:2');
+    expect(message).not.toContain('nodes.speedTestSkipped:');
+  });
   it('全部测到 → null（不打扰）', () => {
     expect(notInPoolMessage({ notInPool: [], tsNotReady: [] }, t)).toBeNull();
   });

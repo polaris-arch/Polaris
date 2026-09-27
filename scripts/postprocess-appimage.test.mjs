@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
 
-import { APPIMAGE_HOST_WAYLAND_LIBS, appImageRuntimeViolations } from './postprocess-appimage.mjs';
+import { APPIMAGE_CORE_MEMBER, APPIMAGE_HOST_WAYLAND_LIBS, appImageRuntimeViolations, patchGtkHook, restoreCoreSeed, verifyAppImageMembers } from './postprocess-appimage.mjs';
 
 // 判据与修复同源：`appImageRuntimeViolations` 由 postprocess-appimage.mjs 导出、被
 // verify-packaging.mjs 的 payload 门 import（`verify-packaging.mjs:71` / `:1454`），即
@@ -145,4 +146,242 @@ test('冲突库清单本身是判据的一部分：四项且逐字锁定', () =>
     'libwayland-egl.so.1',
     'libwayland-server.so.0',
   ]);
+});
+
+// Current official Tauri GTK template uses MODULE_DIR directly; it can render a
+// doubled slash because gio's giomoduledir is absolute. Both forms stay in AppDir.
+for (const rhs of [BUNDLED_GIO, `"$APPDIR//${GIO_RELATIVE}"`]) {
+  test(`module-only upstream hook is valid and remains unchanged: ${rhs}`, (t) => {
+    const appDir = withAppDir(t, { waylandLibs: [], gioExtra: [], gioModuleDir: [rhs] });
+    const hook = join(appDir, 'apprun-hooks', 'linuxdeploy-plugin-gtk.sh');
+    const before = readFileSync(hook, 'utf8');
+    assert.deepEqual(appImageRuntimeViolations(appDir), []);
+    assert.equal(patchGtkHook(appDir), false);
+    assert.equal(readFileSync(hook, 'utf8'), before);
+  });
+}
+
+test('legacy extra-only hook gains MODULE_DIR exactly once and is idempotent', (t) => {
+  const appDir = withAppDir(t, { waylandLibs: [] });
+  assert.equal(patchGtkHook(appDir), true);
+  assert.deepEqual(appImageRuntimeViolations(appDir), []);
+  const hook = join(appDir, 'apprun-hooks', 'linuxdeploy-plugin-gtk.sh');
+  const patched = readFileSync(hook, 'utf8');
+  assert.equal(patchGtkHook(appDir), false);
+  assert.equal(readFileSync(hook, 'utf8'), patched);
+  assert.equal(patched.split('export GIO_MODULE_DIR=').length - 1, 1);
+});
+
+for (const [label, options] of [
+  ['missing both declarations', { gioExtra: [], gioModuleDir: [] }],
+  ['duplicate extra', { gioExtra: [BUNDLED_GIO, BUNDLED_GIO], gioModuleDir: [BUNDLED_GIO] }],
+  ['duplicate module dir', { gioExtra: [], gioModuleDir: [BUNDLED_GIO, BUNDLED_GIO] }],
+  ['module-only host path', { gioExtra: [], gioModuleDir: ['"/usr/lib/gio/modules"'] }],
+  ['module-only absent directory', { gioExtra: [], gioModuleDir: [BUNDLED_GIO], modulesDir: false }],
+  ['legacy absent directory', { modulesDir: false }],
+  ['inconsistent declarations', { gioModuleDir: ['"$APPDIR/usr/lib/gio/modules"'], extraDirs: ['usr/lib/gio/modules'] }],
+]) {
+  test(`refuses unsafe GTK hook without changing it: ${label}`, (t) => {
+    const appDir = withAppDir(t, { waylandLibs: [], ...options });
+    const hook = join(appDir, 'apprun-hooks', 'linuxdeploy-plugin-gtk.sh');
+    const before = readFileSync(hook, 'utf8');
+    assert.notDeepEqual(appImageRuntimeViolations(appDir), []);
+    assert.throws(() => patchGtkHook(appDir), /无法安全修补 GTK hook/);
+    assert.equal(readFileSync(hook, 'utf8'), before);
+  });
+}
+
+test('dot-dot and symlink paths cannot escape AppDir even if the outside directory exists', (t) => {
+  const outside = mkdtempSync(join(tmpdir(), 'polaris-host-gio-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  for (const mode of ['dot-dot', 'symlink']) {
+    const appDir = withAppDir(t, { waylandLibs: [], gioExtra: [], gioModuleDir: [], modulesDir: false });
+    const rhs = mode === 'dot-dot'
+      ? `"$APPDIR/../${outside.split('/').at(-1)}"`
+      : '"$APPDIR/usr/lib/gio/modules"';
+    if (mode === 'symlink') {
+      mkdirSync(join(appDir, 'usr/lib/gio'), { recursive: true });
+      symlinkSync(outside, join(appDir, 'usr/lib/gio/modules'));
+    }
+    const hook = join(appDir, 'apprun-hooks', 'linuxdeploy-plugin-gtk.sh');
+    writeFileSync(hook, `export GIO_MODULE_DIR=${rhs}\n`);
+    assert.deepEqual(appImageRuntimeViolations(appDir), [
+      `GIO_MODULE_DIR 必须锚在 $APPDIR 内，实为 ${rhs}`,
+    ]);
+    assert.throws(() => patchGtkHook(appDir), /必须锚在 \$APPDIR 内/);
+  }
+});
+
+test('CLI repairs both hook layouts and reaches repack only after the runtime contract passes', (t) => {
+  for (const layout of ['legacy', 'module-only']) {
+    const root = mkdtempSync(join(tmpdir(), 'polaris-repack-'));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const original = makeAppDir(layout === 'legacy' ? {} : {
+      gioExtra: [], gioModuleDir: [`"$APPDIR//${GIO_RELATIVE}"`],
+    });
+    const appDir = join(root, 'Polaris.AppDir');
+    renameSync(original, appDir);
+    const artifact = join(root, 'Polaris.AppImage');
+    writeFileSync(artifact, 'unprocessed');
+    seedCoreFixture(root, appDir);
+    mkdirSync(join(root, 'scripts'));
+    const script = join(root, 'scripts/postprocess-appimage.mjs');
+    copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
+    // The plugin is a fixture, but its output is a real SquashFS behind a dummy
+    // runtime header. The verifier never executes that header or the core.
+    const tool = join(root, 'fixture-output-plugin');
+    writeFileSync(tool, fixtureOutputPlugin());
+    chmodSync(tool, 0o700);
+    execFileSync(process.execPath, [script, '--root', root, '--tool', tool, '--arch', 'x86_64'], {
+      stdio: 'pipe',
+    });
+    assert.deepEqual(appImageRuntimeViolations(appDir), []);
+    assert.ok(statSync(artifact).size > 1024 * 1024);
+    assert.equal(readFileSync(artifact)[0], 7);
+    assert.equal(readFileSync(join(appDir, APPIMAGE_CORE_MEMBER), 'utf8'), 'verified-core-seed');
+  }
+});
+
+function seedCoreFixture(root, appDir) {
+  const source = join(root, 'resources/linux/sing-box');
+  const target = join(appDir, APPIMAGE_CORE_MEMBER);
+  mkdirSync(dirname(source), { recursive: true });
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(source, 'verified-core-seed', { mode: 0o755 });
+  writeFileSync(target, 'linuxdeploy-changed-core', { mode: 0o700 });
+  writeFileSync(join(dirname(target), 'libcronet.so'), 'bundled-cronet', { mode: 0o755 });
+  return { source, target };
+}
+
+function fixtureOutputPlugin(tamper = false) {
+  return `#!/usr/bin/env node
+const fs = require('node:fs');
+const cp = require('node:child_process');
+const dir = process.argv[2].slice('--appdir='.length);
+${tamper ? `fs.writeFileSync(require('node:path').join(dir, ${JSON.stringify(APPIMAGE_CORE_MEMBER)}), 'untrusted-core-xxx');` : ''}
+const squash = process.env.LDAI_OUTPUT + '.squashfs';
+cp.execFileSync('mksquashfs', [dir, squash, '-noappend', '-processors', '1', '-no-progress'], {stdio:'ignore'});
+fs.writeFileSync(process.env.LDAI_OUTPUT, Buffer.concat([Buffer.alloc(1024*1024, 7), fs.readFileSync(squash)]));
+fs.unlinkSync(squash);
+`;
+}
+
+function coreFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), 'polaris-core-seed-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const appDir = join(root, 'Polaris.AppDir');
+  mkdirSync(appDir);
+  return { root, appDir, ...seedCoreFixture(root, appDir) };
+}
+
+function packFixture(root, appDir, { falseMagic = false, duplicateFilesystem = false } = {}) {
+  const squash = join(root, 'payload.squashfs');
+  execFileSync('mksquashfs', [appDir, squash, '-noappend', '-processors', '1', '-no-progress'], { stdio: 'ignore' });
+  const header = Buffer.alloc(1024, 7);
+  if (falseMagic) header.write('hsqs', 12);
+  const bytes = readFileSync(squash);
+  const artifact = join(root, 'fixture.AppImage');
+  writeFileSync(artifact, Buffer.concat([header, bytes, ...(duplicateFilesystem ? [bytes] : [])]));
+  return artifact;
+}
+
+test('restores seed SHA/mode atomically without modifying a linked former target', (t) => {
+  const { root, appDir, source, target } = coreFixture(t);
+  const linked = join(root, 'previous-core-hardlink');
+  linkSync(target, linked);
+  const expected = restoreCoreSeed(appDir, root);
+  assert.deepEqual(readFileSync(target), readFileSync(source));
+  assert.equal(lstatSync(target).mode & 0o7777, 0o755);
+  assert.equal(readFileSync(linked, 'utf8'), 'linuxdeploy-changed-core');
+  verifyAppImageMembers(packFixture(root, appDir, { falseMagic: true }), expected);
+});
+
+for (const fault of ['source symlink', 'target symlink', 'parent symlink', 'duplicate core', 'nonexecutable source', 'missing Cronet']) {
+  test(`refuses unsafe core seed layout: ${fault}`, (t) => {
+    const { root, appDir, source, target } = coreFixture(t);
+    if (fault === 'source symlink' || fault === 'target symlink') {
+      const path = fault === 'source symlink' ? source : target;
+      renameSync(path, `${path}.original`);
+      symlinkSync(`${path}.original`, path);
+    } else if (fault === 'parent symlink') {
+      renameSync(dirname(target), `${dirname(target)}.original`);
+      symlinkSync(`${dirname(target)}.original`, dirname(target));
+    } else if (fault === 'duplicate core') {
+      writeFileSync(join(appDir, 'sing-box'), 'unexpected-core');
+    } else if (fault === 'nonexecutable source') {
+      chmodSync(source, 0o644);
+    } else {
+      rmSync(join(dirname(target), 'libcronet.so'));
+    }
+    assert.throws(() => restoreCoreSeed(appDir, root));
+  });
+}
+
+for (const fault of ['same-size wrong SHA', 'wrong mode', 'core symlink', 'missing member', 'multiple filesystems', 'missing tool']) {
+  test(`actual SquashFS member gate rejects ${fault}`, (t) => {
+    const { root, appDir, target } = coreFixture(t);
+    const expected = restoreCoreSeed(appDir, root);
+    if (fault === 'same-size wrong SHA') writeFileSync(target, 'untrusted-core-xxx');
+    if (fault === 'wrong mode') chmodSync(target, 0o700);
+    if (fault === 'core symlink') {
+      renameSync(target, `${target}.original`);
+      symlinkSync('sing-box.original', target);
+    }
+    if (fault === 'missing member') rmSync(target);
+    const artifact = packFixture(root, appDir, { duplicateFilesystem: fault === 'multiple filesystems' });
+    assert.throws(() => verifyAppImageMembers(artifact, expected, fault === 'missing tool' ? join(root, 'absent-unsquashfs') : 'unsquashfs'));
+  });
+}
+
+test('CLI refuses a repacker changing core bytes and leaves the previous artifact intact', (t) => {
+  const { root, appDir } = coreFixture(t);
+  const graphical = makeAppDir({ waylandLibs: [], gioExtra: [], gioModuleDir: [BUNDLED_GIO] });
+  t.after(() => rmSync(graphical, { recursive: true, force: true }));
+  renameSync(join(graphical, 'apprun-hooks'), join(appDir, 'apprun-hooks'));
+  mkdirSync(join(appDir, GIO_RELATIVE), { recursive: true });
+  mkdirSync(join(root, 'scripts'));
+  const script = join(root, 'scripts/postprocess-appimage.mjs');
+  copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
+  const artifact = join(root, 'Polaris.AppImage');
+  writeFileSync(artifact, 'previous-artifact');
+  const tool = join(root, 'fixture-output-plugin');
+  writeFileSync(tool, fixtureOutputPlugin(true), { mode: 0o700 });
+  assert.throws(() => execFileSync(process.execPath, [script, '--root', root, '--tool', tool, '--arch', 'x86_64'], { stdio: 'pipe' }), /AppImage 实际成员 SHA\/权限不符/);
+  assert.equal(readFileSync(artifact, 'utf8'), 'previous-artifact');
+});
+
+test('Linux payload CLI rejects same-size substituted core bytes in a previously passing bundle', (t) => {
+  const { root, appDir } = coreFixture(t);
+  restoreCoreSeed(appDir, root);
+  writeFileSync(join(root, 'resources/linux/polaris-helper'), 'helper');
+  writeFileSync(join(root, 'resources/linux/libcronet.so'), 'bundled-cronet');
+  copyFileSync(join(root, 'resources/linux/polaris-helper'), join(dirname(join(appDir, APPIMAGE_CORE_MEMBER)), 'polaris-helper'));
+  const graphical = makeAppDir({ waylandLibs: [], gioExtra: [], gioModuleDir: [BUNDLED_GIO] });
+  t.after(() => rmSync(graphical, { recursive: true, force: true }));
+  renameSync(join(graphical, 'apprun-hooks'), join(appDir, 'apprun-hooks'));
+  mkdirSync(join(appDir, GIO_RELATIVE), { recursive: true });
+  mkdirSync(join(root, 'resources/data'));
+  mkdirSync(join(appDir, 'usr/lib/Polaris/_up_/resources/data'));
+  mkdirSync(join(appDir, 'usr/lib/Polaris/_up_/resources/dashboard'));
+  writeFileSync(join(appDir, 'usr/lib/Polaris/_up_/resources/dashboard/index.html'), 'fixture dashboard');
+  const bundle = join(root, 'bundle');
+  mkdirSync(join(bundle, 'appimage'), { recursive: true });
+  mkdirSync(join(bundle, 'deb'), { recursive: true });
+  cpSync(appDir, join(bundle, 'deb/package/data'), { recursive: true });
+  const packedDir = join(bundle, 'appimage/Polaris.AppDir');
+  renameSync(appDir, packedDir);
+  mkdirSync(join(root, 'scripts'));
+  mkdirSync(join(root, 'src-tauri'));
+  for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs']) {
+    copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));
+  }
+  writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify({ coreArchiveSha256: { linux: 'fixture' } }));
+  writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'Polaris' }));
+  const args = [join(root, 'scripts/verify-packaging.mjs'), 'payload', '--label', 'linux', '--root', bundle];
+  execFileSync(process.execPath, args, { stdio: 'pipe' });
+  const target = join(packedDir, APPIMAGE_CORE_MEMBER);
+  const beforeSize = statSync(target).size;
+  writeFileSync(target, 'untrusted-core-xxx');
+  assert.equal(statSync(target).size, beforeSize);
+  assert.throws(() => execFileSync(process.execPath, args, { stdio: 'pipe' }), /Linux 随包原核 SHA-256\/权限与源不符/);
 });

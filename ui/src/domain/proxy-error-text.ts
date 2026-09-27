@@ -32,6 +32,7 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   NETWORK_PROFILE_RULES_PRUNED: 'home.networkProfileRulesPruned',
   AUTO_SWITCH_NEEDS_RESTART: 'errors.autoSwitchNeedsRestart',
   OUTBOUND_INTERFACE_UNAVAILABLE: 'errors.outboundInterfaceUnavailable',
+  SYSTEM_INTERFACE_REQUIRES_HELPER: 'errors.systemInterfaceRequiresHelper',
   HELPER_GATE_ABORTED: 'errors.helperGateAborted',
   TUN_ROUTE_NOT_CAPTURED: 'errors.tunRouteNotCaptured',
   TUN_ADAPTER_MISSING: 'errors.tunAdapterMissing',

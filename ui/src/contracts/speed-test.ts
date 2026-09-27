@@ -50,6 +50,8 @@ export interface SpeedTestInvokeResult {
   outcome: SpeedTestOutcome;
   notInPool: string[];
   tsNotReady: string[];
+  /** System endpoints cannot run in an unmanaged temporary core. */
+  systemInterfaceBlocked?: string[];
 }
 
 /**

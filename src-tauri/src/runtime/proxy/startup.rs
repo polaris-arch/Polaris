@@ -46,6 +46,10 @@ use polaris_config_engine::builder::network_env::{
     PrunedEnvRule, ResolvedProbe,
 };
 use polaris_config_engine::builder::outbounds::required_bind_interfaces;
+use polaris_config_engine::builder::system_interfaces::{
+    endpoint_requests_system_interface, ensure_managed_system_interfaces,
+    INVALID_REASON_SYSTEM_INTERFACE_REQUIRES_HELPER,
+};
 use polaris_config_engine::builder::{
     build_id_to_tag_map, generate_sing_box_config_with_report_and_runtime_bindings,
     GenerateConfigDeps, GenerateOutcome, InvalidNode,
@@ -1163,6 +1167,41 @@ impl ProxyRuntime {
                         continue;
                     }
                 }
+            }
+
+            // Check the final post-gate endpoints before any mesh ownership or core spawn. An
+            // invalid-node report alone must never turn this into a silently running direct exit.
+            if let Err(msg) = ensure_managed_system_interfaces(
+                singbox_config.endpoints.as_deref().unwrap_or_default(),
+                via_helper,
+            ) {
+                let wrappers: Vec<ServerLikeRef<'_>> = effective_user_config
+                    .servers
+                    .iter()
+                    .map(ServerLikeRef)
+                    .collect();
+                let tags = build_id_to_tag_map(&wrappers);
+                let mut invalid_nodes = gate.invalid_nodes;
+                for endpoint in singbox_config
+                    .endpoints
+                    .iter()
+                    .flatten()
+                    .filter(|e| endpoint_requests_system_interface(e))
+                {
+                    if let Some((id, _)) = tags.iter().find(|(_, tag)| **tag == endpoint.tag) {
+                        invalid_nodes.push(InvalidNode {
+                            id: id.clone(),
+                            tag: endpoint.tag.clone(),
+                            reason: INVALID_REASON_SYSTEM_INTERFACE_REQUIRES_HELPER.into(),
+                        });
+                    }
+                }
+                self.emit_invalid_nodes(&invalid_nodes);
+                self.set_error(&msg, code::SYSTEM_INTERFACE_REQUIRES_HELPER);
+                return Err(StartError::coded(
+                    msg,
+                    code::SYSTEM_INTERFACE_REQUIRES_HELPER,
+                ));
             }
 
             let binary = binary_res?;

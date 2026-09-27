@@ -444,7 +444,7 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
-            libdbus-1-dev pkg-config
+            libdbus-1-dev pkg-config squashfs-tools
 
       # ── 原生构建前置：protoc（singbox-grpc build.rs 三平台都要）+ Windows NASM（喂 btls-sys
       # 的 BoringSSL 汇编；曾名 boring-sys2，grep "boring" 会扑空——2026-08-18 探针实测移除该步
@@ -755,7 +755,8 @@ jobs:
       # 退出，窗口只剩黑/白底。DEB 同一二进制使用宿主 GUI 栈则正常，真机最小变异证实只剔除
       # 4 个 Wayland 基础库并隔离 GIO module 即可，bundled WebKitGTK/GTK/GLib 其余部分保留。
       # 脚本复用 Tauri 本步刚下载的官方 AppImage 输出插件重封；紧随的 payload 门同时断言
-      # AppDir 不再含冲突库、GIO hook 已补齐、FHS 资源仍完整。
+      # AppDir 不再含冲突库、GIO hook 已补齐；同时恢复原核心种子并用宿主 unsquashfs 验
+      # 重封后实际 AppImage 的核心/Cronet 成员 SHA/权限（不执行候选 AppImage/核心）。
       - name: Harden AppImage host graphics compatibility
         if: runner.os == 'Linux'
         shell: bash

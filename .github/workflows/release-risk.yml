@@ -37,6 +37,11 @@ jobs:
         with:
           node-version: '26'
 
+      - name: Install SquashFS fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools
+
       - name: Test release impact classifier
         # 走 gate-node-test.sh 而不是直接 `node --test`：后者指向空目录/文件被移走/错误
         # cwd 时是 rc=0 静默判绿（scripts/gate-node-test.sh 顶部注释有实测）；本机全量门单

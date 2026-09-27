@@ -299,6 +299,134 @@ fn should_start_via_helper_truth_table() {
     }
 }
 
+#[test]
+fn system_interface_ownership_preserves_desktop_tun_helper_for_vpn_clients() {
+    use polaris_config_engine::builder::endpoints::build_vpn_client_endpoint;
+    use polaris_config_engine::builder::system_interfaces::ensure_managed_system_interfaces;
+    for (protocol, settings_key, settings) in [
+        (
+            "openconnect",
+            "openconnectSettings",
+            serde_json::json!({"server":"vpn.example:443", "system":true}),
+        ),
+        (
+            "openvpn-client",
+            "openvpnClientSettings",
+            serde_json::json!({"server":"vpn.example", "server_port":1194, "tls":{}, "system":true}),
+        ),
+    ] {
+        let server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "id":"vpn", "name":"VPN", "protocol":protocol, settings_key:settings
+        }))
+        .unwrap();
+        let endpoint = build_vpn_client_endpoint(&server, "VPN", None).unwrap();
+        for platform in [
+            Platform::Mac,
+            Platform::Win,
+            Platform::Linux,
+            Platform::Other,
+        ] {
+            for mode in [
+                ProxyModeType::Manual,
+                ProxyModeType::SystemProxy,
+                ProxyModeType::Tun,
+            ] {
+                let managed = should_start_via_helper(mode, platform);
+                assert_eq!(
+                    ensure_managed_system_interfaces(std::slice::from_ref(&endpoint), managed)
+                        .is_ok(),
+                    mode == ProxyModeType::Tun && platform != Platform::Other,
+                    "{protocol}: {mode:?}@{platform:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn main_start_rejects_final_system_endpoints_with_node_diagnostics() {
+    for mode in ["manual", "systemProxy"] {
+        for (protocol, settings_key, settings) in [
+            (
+                "openconnect",
+                "openconnectSettings",
+                serde_json::json!({"server":"vpn.example:443", "system":true}),
+            ),
+            (
+                "openvpn-client",
+                "openvpnClientSettings",
+                serde_json::json!({"server":"vpn.example", "server_port":1194, "tls":{}, "system":true}),
+            ),
+            (
+                "custom",
+                "customSettings",
+                serde_json::json!({"isEndpoint":true,"outbound":{"type":"tailscale","system_interface":true}}),
+            ),
+        ] {
+            let clearer: Box<dyn SystemProxyClearer> = Box::new(RecordingClearer {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+            let (rt, _dir, frames, _residual) = test_runtime_recording_full(clearer);
+            rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+            // Test runtimes deny resolving a real binary, so a missing guard cannot spawn either.
+            // The ownership code and node report prove this guard, rather than binary denial, fired.
+            let config = serde_json::json!({"servers":[{"id":"vpn", "name":"System VPN", "protocol":protocol,
+                settings_key:settings}], "selectedServerId":"vpn", "proxyMode":"global", "proxyModeType":mode});
+            let error = rt.start(config).await.unwrap_err();
+            assert_eq!(error.code, Some(code::SYSTEM_INTERFACE_REQUIRES_HELPER));
+            assert!(error.message.contains("System VPN"));
+            assert!(!rt.status().running);
+            assert_eq!(rt.status().pid, 0);
+            assert_eq!(
+                rt.status().error_code.as_deref(),
+                Some(code::SYSTEM_INTERFACE_REQUIRES_HELPER)
+            );
+            assert!(frames
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|node| node.id == "vpn" && node.reason == "system-interface-requires-helper"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn main_system_guard_does_not_block_pruned_or_userspace_endpoints() {
+    for system in [true, false] {
+        let clearer: Box<dyn SystemProxyClearer> = Box::new(RecordingClearer {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let (rt, _dir, frames, _residual) = test_runtime_recording_full(clearer);
+        rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+        let unselected = if system {
+            // Malformed custom endpoint is rejected by the generator before the runtime guard.
+            serde_json::json!({"id":"unselected", "name":"Unselected VPN", "protocol":"custom",
+                "customSettings":{"isEndpoint":true, "outbound":{"system":true}}})
+        } else {
+            serde_json::json!({"id":"unselected", "name":"Unselected VPN", "protocol":"openconnect",
+                "openconnectSettings":{"server":"vpn.example:443", "system":false}})
+        };
+        let config = serde_json::json!({
+            "servers":[
+                {"id":"user", "name":"User VPN", "protocol":"openconnect", "openconnectSettings":{"server":"vpn.example:443","system":false}},
+                unselected
+            ], "selectedServerId":"user", "proxyMode":"global", "proxyModeType":"manual"
+        });
+        let error = rt.start(config).await.unwrap_err();
+        assert_ne!(error.code, Some(code::SYSTEM_INTERFACE_REQUIRES_HELPER));
+        assert!(!error.message.contains("System interface requested"));
+        if system {
+            assert!(frames
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|node| node.id == "unselected" && node.reason == "custom-outbound-malformed"));
+        }
+    }
+}
+
 /// helper 起核前置校验（R27.3 preflight）：TUN 需 helper 且未装 → 拦截；非 TUN → 放行。
 ///
 /// 本机/CI 从不安装 `polaris-helper`（系统路径），故 `status().installed` 恒 false（与既有

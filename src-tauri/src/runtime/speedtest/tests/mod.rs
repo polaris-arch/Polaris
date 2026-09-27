@@ -14,6 +14,45 @@ fn env() -> CoreBuildEnv {
     }
 }
 
+fn system_endpoint_servers(system: bool) -> Vec<ServerConfig> {
+    [
+        json!({"id":"oc-system", "name":"OC", "protocol":"openconnect",
+            "openconnectSettings":{"server":"vpn.example:443", "system":system}}),
+        json!({"id":"ov-system", "name":"OV", "protocol":"openvpn-client",
+            "openvpnClientSettings":{"server":"vpn.example", "server_port":1194, "tls":{}, "system":system}}),
+        json!({"id":"raw-system", "name":"Custom", "protocol":"custom",
+            "customSettings":{"isEndpoint":true,"outbound":{"type":"tailscale", "system_interface":system}}}),
+    ].into_iter().map(|value| serde_json::from_value(value).unwrap()).collect()
+}
+
+#[test]
+fn temp_planner_partitions_system_interfaces_without_losing_userspace_nodes() {
+    for platform in ["linux", "darwin", "win32"] {
+        let mut build_env = env();
+        build_env.platform = platform.into();
+        let mut servers = system_endpoint_servers(true);
+        let mut userspace = system_endpoint_servers(false);
+        for server in &mut userspace {
+            server.id.push_str("-userspace");
+        }
+        servers.extend(userspace);
+        let plan = plan_temp_core(&servers, &build_env);
+        assert_eq!(
+            plan.system_interface_blocked,
+            ["oc-system", "ov-system", "raw-system"]
+        );
+        assert!(
+            plan.unusable.is_empty(),
+            "system requests are not restart-to-join failures"
+        );
+        assert_eq!(plan.testable.len(), 3);
+        assert!(plan
+            .testable
+            .iter()
+            .all(|node| node.id.ends_with("-userspace")));
+    }
+}
+
 /// 🔴 **`-1`（真测了没通）与「未测」必须分开计**（陈先生 2026-08-02：「全部测速全部显示 -1，
 /// 跟实际不符」）。两者在日志里混成一类，就再也分不出「网络真挂了」和「本轮压根没测、
 /// 前端把缺席画成了 -1」——而这两件事的修法完全相反。
@@ -1606,6 +1645,40 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
 }
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+#[tokio::test]
+async fn temp_final_system_interface_guard_rejects_planner_bypass_before_spawn() {
+    for (protocol, field) in [
+        ("openconnect", "system"),
+        ("openvpn-client", "system"),
+        ("wireguard", "system"),
+        ("tailscale", "system_interface"),
+        ("custom", "system_interface"),
+    ] {
+        let mut h = harness(true, false, vec![20001]);
+        // A failing checker proves the ownership failure is reached before check as well as spawn.
+        h.deps.checker = Arc::new(FakeChecker { ok: false });
+        let mut node = three_nodes().remove(0);
+        node.is_endpoint = true;
+        node.node = json!({"type":protocol, "tag":"System node", field:true});
+        let outcome = TempCoreSession::run(
+            &h.deps,
+            &[node],
+            &|| false,
+            |_| async { Some(50_u32) },
+            &mut |_, _| {},
+        )
+        .await;
+        let TempCoreOutcome::SystemInterfaceRequired(error) = outcome else {
+            panic!("system interface bypass must be rejected: {outcome:?}");
+        };
+        assert!(error.contains("System node"));
+        assert!(error.contains("already running managed desktop TUN core"));
+        assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+        assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+        cleanup(&h.dir);
+    }
+}
 
 fn cleanup(dir: &PathBuf) {
     let _ = std::fs::remove_dir_all(dir);

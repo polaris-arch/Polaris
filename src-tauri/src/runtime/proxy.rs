@@ -307,8 +307,10 @@ pub struct ProxyStatus {
 /// 代理错误码（前端 `ui/src/contracts/types/runtime.ts` 的 `ProxyErrorCode` string enum 子集镜像）。
 ///
 /// **只收录本层能从控制流位置诚实断言的成员**：本仓无「核 stderr / 退出码 → 错误码」分类器，
-/// 补全其余成员就只能靠猜 message 关键字 = 伪造分类。故此处刻意只有 3 个 —— 缺的不是漏了，是**没有依据**。
+/// 只收录可由控制流直接证明的分类；未收录的类别需先建立判据，不能靠 message 关键字补全。
 pub mod code {
+    /// Final generated endpoints request system interfaces without the managed helper runtime.
+    pub const SYSTEM_INTERFACE_REQUIRES_HELPER: &str = "SYSTEM_INTERFACE_REQUIRES_HELPER";
     /// 起核腿失败（就绪门判定核已死 / 就绪超时）——「启动失败」轴。
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
     /// 核**意外**退出且无法自愈（无可用配置重启）——「运行中崩了」轴。

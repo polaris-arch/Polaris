@@ -59,6 +59,9 @@ use polaris_config_engine::builder::endpoints::{
 };
 use polaris_config_engine::builder::outbound::build_proxy_outbound;
 use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
+use polaris_config_engine::builder::system_interfaces::{
+    raw_endpoint_requests_system_interface, system_interface_ownership_error,
+};
 use polaris_config_engine::singbox::DomainResolver;
 use polaris_config_engine::user_config::protocol_settings::tailcat_emit_check;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
@@ -801,6 +804,8 @@ pub enum UnusableReason {
 pub struct TempCorePlan {
     /// 进临时核真测的节点。
     pub testable: Vec<TempNode>,
+    /// System endpoints require a managed main core; never merge these into restart-to-join hints.
+    pub system_interface_blocked: Vec<String>,
     /// 因协议是 tailscale 而缺席（回报进响应的 `tsNotReady`，对齐 上游 L-2 `:248-250`）。
     pub tailscale: Vec<String>,
     /// 因 naive 缺 cronet / 构造失败而缺席（回报进响应的 `notInPool`：对用户同样是「本轮没测」），
@@ -884,6 +889,9 @@ pub fn plan_temp_core_with_bindings(
         let tag = unique_temp_core_tag(&s.id, &seen_tags);
         seen_tags.insert(tag.clone());
         match build_temp_node(s, &tag, env, bind_interfaces.get(&s.id).map(String::as_str)) {
+            Ok(node) if node.is_endpoint && raw_endpoint_requests_system_interface(&node.node) => {
+                out.system_interface_blocked.push(s.id.clone());
+            }
             Ok(node) => out.testable.push(node),
             Err(step) => {
                 // tag 已占坑但节点没建成 → 归还，免得后一个真能建成的同 tag 节点被误判成碰撞。
@@ -1909,6 +1917,8 @@ impl TempCoreDeps {
 /// 一次临时核测速的结局（命令层折成响应信封）。
 #[derive(Debug)]
 pub enum TempCoreOutcome {
+    /// A caller bypassed planning and supplied a system endpoint to the unmanaged temporary core.
+    SystemInterfaceRequired(String),
     /// 跑完了（可能部分节点 `-1` = 真实不可测）。`outcome` 同主核路径语义。
     Ran {
         results: serde_json::Map<String, Value>,
@@ -1943,6 +1953,7 @@ pub enum TempCoreOutcome {
 /// 就是「第一批测完即宣告整轮结束」——分批最危险的那个失效面。
 #[derive(Debug)]
 enum BatchOutcome {
+    SystemInterfaceRequired(String),
     /// 走到了测量阶段。载荷是**本批**的结果（可能部分节点真实 `-1`，也可能中途被中断 ——
     /// 成因已记进 [`RoundProgress`]，不在这里重复）。
     Ran(serde_json::Map<String, Value>),
@@ -1950,7 +1961,10 @@ enum BatchOutcome {
     ///
     /// `oversized` = 本批规模越过 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`]。分批之后它在生产上不可达
     /// （见该常量的射程说明），但仍要与「核起不来」分开：两者在用户侧不是一句话，修法也南辕北辙。
-    Failed { detail: String, oversized: bool },
+    Failed {
+        detail: String,
+        oversized: bool,
+    },
     /// 起核前/就绪期间被主核接管 ⇒ **整轮**到此为止（后面的批一个都不该再起）。
     Superseded,
 }
@@ -2058,6 +2072,9 @@ impl TempCoreSession {
                 progress.emit_progress(emit);
             }
             match Self::run_batch(deps, batch, superseded, &measure, emit, &mut progress).await {
+                BatchOutcome::SystemInterfaceRequired(detail) => {
+                    return TempCoreOutcome::SystemInterfaceRequired(detail);
+                }
                 BatchOutcome::Ran(batch_results) => {
                     measured_any_batch = true;
                     for (id, latency) in batch_results {
@@ -2211,6 +2228,26 @@ impl TempCoreSession {
         // 而不是另读一次配置 —— 它就是本次真正下发给核的那一档（`temp_core_log_level` 的产出）。
         let keep_config = matches!(deps.log_level.as_str(), "debug" | "trace");
         let cfg = build_temp_core_config(nodes, &ports, &deps.log_level);
+        // Defense at the actual final config boundary, even for callers that bypass the planner.
+        let system_tags: Vec<String> = cfg
+            .get("endpoints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|endpoint| raw_endpoint_requests_system_interface(endpoint))
+            .map(|endpoint| {
+                endpoint
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<untagged>")
+                    .to_owned()
+            })
+            .collect();
+        if !system_tags.is_empty() {
+            return BatchOutcome::SystemInterfaceRequired(system_interface_ownership_error(
+                &system_tags,
+            ));
+        }
         let bytes = match serde_json::to_vec_pretty(&cfg) {
             Ok(b) => b,
             Err(e) => {

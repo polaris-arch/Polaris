@@ -20,6 +20,7 @@ pub mod outbound_helpers;
 pub mod outbounds;
 pub mod route;
 pub mod subscription_guard;
+pub mod system_interfaces;
 pub mod tun_exclusion_preview;
 pub mod tun_route_exclude;
 pub mod tunnel_conflict;
