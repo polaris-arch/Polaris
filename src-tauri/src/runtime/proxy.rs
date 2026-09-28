@@ -37,6 +37,10 @@ mod hot_switch;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
+// S4a value contract. The managed Apply entry is deliberately not wired until
+// staging, lifecycle ownership and platform receipts have real adapters.
+#[allow(dead_code)]
+mod mesh_apply;
 mod mesh_route_report;
 mod network_canary;
 mod network_monitor;
