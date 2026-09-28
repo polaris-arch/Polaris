@@ -325,8 +325,26 @@ enum StagePoint {
     AfterManifestRename,
 }
 
-/// Stage one immutable generation. A failure never overwrites an old plan;
-/// an incomplete directory stays unusable and cannot be retried with planId.
+/// Payload exists but no manifest does. A failed core check leaves this
+/// generation unusable; its planId cannot be retried or silently recycled.
+#[derive(Debug)]
+pub(crate) struct PendingArtifacts {
+    pub(super) data_dir: PathBuf,
+    pub(super) config_path: PathBuf,
+    root: PathBuf,
+    manifest_ref: String,
+    manifest: ArtifactManifest,
+}
+
+impl PendingArtifacts {
+    pub(super) fn manifest(&self) -> &ArtifactManifest {
+        &self.manifest
+    }
+}
+
+/// Test-only convenience for the original S4b staging assertions. Production
+/// callers must stage payload, run a strict core check, then publish.
+#[cfg(test)]
 pub(crate) fn stage_artifacts(
     data_dir: &Path,
     plan: &ManagedMeshRoutePlan,
@@ -344,6 +362,7 @@ pub(crate) fn stage_artifacts(
     )
 }
 
+#[cfg(test)]
 fn stage_artifacts_with_hook(
     data_dir: &Path,
     plan: &ManagedMeshRoutePlan,
@@ -352,6 +371,44 @@ fn stage_artifacts_with_hook(
     generator_version: &str,
     mut hook: impl FnMut(StagePoint) -> Result<(), ArtifactError>,
 ) -> Result<StagedArtifacts, ArtifactError> {
+    let pending = stage_payload_with_hook(
+        data_dir,
+        plan,
+        final_config,
+        rule_files,
+        generator_version,
+        &mut hook,
+    )?;
+    publish_manifest_with_hook(pending, plan, &mut hook)
+}
+
+/// Write and fsync every immutable payload byte without making the generation
+/// referenceable. No old generation is ever overwritten.
+pub(crate) fn stage_payload(
+    data_dir: &Path,
+    plan: &ManagedMeshRoutePlan,
+    final_config: &[u8],
+    rule_files: &[(String, Vec<u8>)],
+    generator_version: &str,
+) -> Result<PendingArtifacts, ArtifactError> {
+    stage_payload_with_hook(
+        data_dir,
+        plan,
+        final_config,
+        rule_files,
+        generator_version,
+        &mut |_| Ok(()),
+    )
+}
+
+fn stage_payload_with_hook(
+    data_dir: &Path,
+    plan: &ManagedMeshRoutePlan,
+    final_config: &[u8],
+    rule_files: &[(String, Vec<u8>)],
+    generator_version: &str,
+    hook: &mut impl FnMut(StagePoint) -> Result<(), ArtifactError>,
+) -> Result<PendingArtifacts, ArtifactError> {
     if generator_version.is_empty() || generator_version.len() > 128 || rule_files.len() > MAX_FILES
     {
         return Err(ArtifactError::Invalid(
@@ -408,6 +465,59 @@ fn stage_artifacts_with_hook(
         plan: artifact_file(PLAN_NAME, &plan_bytes),
         rule_files: entries,
     };
+    Ok(PendingArtifacts {
+        data_dir: data_dir.to_path_buf(),
+        config_path: root.join(CONFIG_NAME),
+        root,
+        manifest_ref,
+        manifest,
+    })
+}
+
+fn verify_pending_payload(
+    pending: &PendingArtifacts,
+    plan: &ManagedMeshRoutePlan,
+) -> Result<(), ArtifactError> {
+    if pending.manifest.plan_id != plan.plan_id
+        || pending.manifest.plan_digest
+            != plan_digest(plan).map_err(|_| ArtifactError::Invalid("plan serialization"))?
+    {
+        return Err(ArtifactError::Invalid("pending plan binding mismatch"));
+    }
+    inspect_real_directory(&pending.data_dir)?;
+    inspect_directory(&pending.data_dir.join("mesh-routes"))?;
+    inspect_directory(&pending.data_dir.join("mesh-routes/plans"))?;
+    inspect_directory(&pending.root)?;
+    let plan_bytes = verify_entry(&pending.root, &pending.manifest.plan)?;
+    if polaris_updater::verify::sha256_hex(&plan_bytes) != pending.manifest.plan_digest {
+        return Err(ArtifactError::Invalid("pending plan digest mismatch"));
+    }
+    verify_entry(&pending.root, &pending.manifest.config)?;
+    for entry in &pending.manifest.rule_files {
+        verify_entry(&pending.root, entry)?;
+    }
+    Ok(())
+}
+
+/// Publish only after an external strict check has accepted this exact
+/// config. The caller owns that proof and rechecks its state claim afterward.
+pub(crate) fn publish_manifest(
+    pending: PendingArtifacts,
+    plan: &ManagedMeshRoutePlan,
+) -> Result<StagedArtifacts, ArtifactError> {
+    publish_manifest_with_hook(pending, plan, &mut |_| Ok(()))
+}
+
+fn publish_manifest_with_hook(
+    pending: PendingArtifacts,
+    plan: &ManagedMeshRoutePlan,
+    hook: &mut impl FnMut(StagePoint) -> Result<(), ArtifactError>,
+) -> Result<StagedArtifacts, ArtifactError> {
+    verify_pending_payload(&pending, plan)?;
+    let root = pending.root;
+    let manifest = pending.manifest;
+    let data_dir = pending.data_dir;
+    let manifest_ref = pending.manifest_ref;
     let bytes = serde_json::to_vec(&manifest)
         .map_err(|_| ArtifactError::Invalid("manifest serialization"))?;
     // Temp is in the same private generation. A crash before rename leaves no
@@ -421,7 +531,7 @@ fn stage_artifacts_with_hook(
     hook(StagePoint::AfterManifestRename)
         .map_err(|error| ArtifactError::CommitUncertain(format!("{error:?}")))?;
     sync_dir(&root).map_err(|error| ArtifactError::CommitUncertain(format!("{error:?}")))?;
-    let verified = verify_artifacts(data_dir, plan)
+    let verified = verify_artifacts(&data_dir, plan)
         .map_err(|error| ArtifactError::CommitUncertain(format!("{error:?}")))?;
     if verified != manifest {
         return Err(ArtifactError::CommitUncertain(

@@ -99,6 +99,23 @@ fn failed_stage_never_publishes_manifest_or_reuses_incomplete_plan_id() {
 }
 
 #[test]
+fn unpublished_payload_is_not_referenceable_and_tamper_blocks_publish() {
+    let dir = tempdir();
+    let plan = plan("stage-pending-tamper");
+    let pending = stage_payload(dir.path(), &plan, b"{}", &files(), "generator-1").unwrap();
+    let root = dir.path().join("mesh-routes/plans/stage-pending-tamper");
+    assert!(!root.join(MANIFEST_NAME).exists());
+    assert!(verify_artifacts(dir.path(), &plan).is_err());
+    fs::write(root.join(CONFIG_NAME), b"[]").unwrap();
+    assert_eq!(
+        publish_manifest(pending, &plan).unwrap_err(),
+        ArtifactError::Invalid("artifact hash or size mismatch")
+    );
+    assert!(!root.join(MANIFEST_NAME).exists());
+    assert!(stage_payload(dir.path(), &plan, b"{}", &[], "generator-1").is_err());
+}
+
+#[test]
 fn after_manifest_rename_failure_is_commit_uncertain_and_re_readable() {
     let dir = tempdir();
     let plan = plan("stage-plan-c");

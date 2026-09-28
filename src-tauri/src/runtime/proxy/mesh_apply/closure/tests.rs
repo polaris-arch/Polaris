@@ -4,7 +4,11 @@ use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshCandidate;
 use polaris_config_engine::user_config::mesh_route_state::{
     MeshOwnerRef, MeshRoutePolicy, MeshRouteState,
 };
+use polaris_core_supervisor::{ConfigCheckVerdict, KernelRejection, RejectedArray};
 use serde_json::json;
+use std::fs;
+
+use super::super::preflight::{checked_stage_with, stage_checked_with_core, PreflightError};
 
 fn fixture() -> (
     TestDir,
@@ -75,7 +79,7 @@ fn fixture() -> (
         .config;
     let rules = vec![RulePayload {
         relative_path: "rules/a.json".into(),
-        bytes: b"{\"version\":1}".to_vec(),
+        bytes: b"{\"version\":1,\"rules\":[{\"ip_cidr\":[\"100.80.0.0/16\"]}]}".to_vec(),
     }];
     (dir, input, plan, legacy, config, rules)
 }
@@ -379,4 +383,196 @@ fn missing_or_duplicate_endpoint_is_rejected_by_the_same_emitter() {
         ClosureError::EmissionMismatch
     );
     assert!(!dir.path().join("mesh-routes").exists());
+}
+
+#[tokio::test]
+async fn accepted_check_runs_before_manifest_publish() {
+    let (dir, input, plan, legacy, config, rules) = fixture();
+    let expected = receipt(&input, &plan, &config, &rules);
+    let closure = validate_closure(
+        dir.path(),
+        &plan,
+        &input,
+        &legacy,
+        &config,
+        &expected,
+        rules,
+    )
+    .unwrap();
+    let root = dir.path().join("mesh-routes/plans/closure-plan");
+    let during_check = root.clone();
+    let staged = checked_stage_with(
+        &plan,
+        closure,
+        "generator-1",
+        move |config_path| async move {
+            assert_eq!(
+                fs::read(config_path).unwrap(),
+                serde_json::to_vec_pretty(&config).unwrap()
+            );
+            assert!(!during_check.join("manifest.json").exists());
+            ConfigCheckVerdict::Accepted
+        },
+        || Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(staged.manifest.plan_digest, expected.plan_digest);
+    assert!(root.join("manifest.json").exists());
+}
+
+#[tokio::test]
+async fn rejected_unattributable_and_unavailable_checks_leave_no_manifest() {
+    let cases = [
+        (
+            ConfigCheckVerdict::Rejected(KernelRejection {
+                array: RejectedArray::Outbounds,
+                index: 0,
+                detail: "rejected".into(),
+            }),
+            PreflightError::CoreRejected,
+        ),
+        (
+            ConfigCheckVerdict::Unattributable("bad route".into()),
+            PreflightError::CoreUnattributable,
+        ),
+        (
+            ConfigCheckVerdict::Unavailable("timeout".into()),
+            PreflightError::CoreUnavailable,
+        ),
+    ];
+    for (verdict, expected_error) in cases {
+        let (dir, input, plan, legacy, config, rules) = fixture();
+        let expected = receipt(&input, &plan, &config, &rules);
+        let closure = validate_closure(
+            dir.path(),
+            &plan,
+            &input,
+            &legacy,
+            &config,
+            &expected,
+            rules,
+        )
+        .unwrap();
+        let root = dir.path().join("mesh-routes/plans/closure-plan");
+        let during_check = root.clone();
+        let result = checked_stage_with(
+            &plan,
+            closure,
+            "generator-1",
+            move |path| async move {
+                assert!(path.exists());
+                assert!(!during_check.join("manifest.json").exists());
+                verdict
+            },
+            || Ok(()),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), expected_error);
+        assert!(!root.join("manifest.json").exists());
+        assert!(super::super::artifact::verify_artifacts(dir.path(), &plan).is_err());
+    }
+}
+
+#[tokio::test]
+async fn changed_binary_or_payload_after_check_cannot_publish_manifest() {
+    let (dir, input, plan, legacy, config, rules) = fixture();
+    let expected = receipt(&input, &plan, &config, &rules);
+    let closure = validate_closure(
+        dir.path(),
+        &plan,
+        &input,
+        &legacy,
+        &config,
+        &expected,
+        rules,
+    )
+    .unwrap();
+    let root = dir.path().join("mesh-routes/plans/closure-plan");
+    let result = checked_stage_with(
+        &plan,
+        closure,
+        "generator-1",
+        |_| std::future::ready(ConfigCheckVerdict::Accepted),
+        || Err(PreflightError::BinaryChanged),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), PreflightError::BinaryChanged);
+    assert!(!root.join("manifest.json").exists());
+
+    let (dir, input, plan, legacy, config, rules) = fixture();
+    let expected = receipt(&input, &plan, &config, &rules);
+    let closure = validate_closure(
+        dir.path(),
+        &plan,
+        &input,
+        &legacy,
+        &config,
+        &expected,
+        rules,
+    )
+    .unwrap();
+    let root = dir.path().join("mesh-routes/plans/closure-plan");
+    let config_path = root.join("config.json");
+    let result = checked_stage_with(
+        &plan,
+        closure,
+        "generator-1",
+        |_| std::future::ready(ConfigCheckVerdict::Accepted),
+        move || {
+            fs::write(config_path, b"tampered").unwrap();
+            Ok(())
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(PreflightError::Artifact(_))));
+    assert!(!root.join("manifest.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fixed_b609_core_check_accepts_only_the_staged_config_bytes() {
+    let bundled =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/linux/sing-box");
+    let binary = std::env::var_os("POLARIS_TEST_CORE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(bundled);
+    if !binary.is_file() {
+        assert_ne!(
+            std::env::var("POLARIS_REQUIRE_KERNEL_GATE").as_deref(),
+            Ok("1"),
+            "fixed b609 core is required for this gate"
+        );
+        eprintln!("fixed b609 core absent; set POLARIS_TEST_CORE or fetch package core");
+        return;
+    }
+    let version = std::process::Command::new(&binary)
+        .arg("version")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&version.stdout)
+        .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
+    let (dir, input, plan, legacy, config, rules) = fixture();
+    let expected = receipt(&input, &plan, &config, &rules);
+    let closure = validate_closure(
+        dir.path(),
+        &plan,
+        &input,
+        &legacy,
+        &config,
+        &expected,
+        rules,
+    )
+    .unwrap();
+    let checked = stage_checked_with_core(&plan, closure, "generator-1", &binary)
+        .await
+        .unwrap();
+    assert_eq!(checked.core_check.plan_digest, expected.plan_digest);
+    assert_eq!(checked.core_check.config_sha256, expected.config_sha256);
+    assert_eq!(checked.core_check.manifest_ref, checked.staged.manifest_ref);
+    assert_eq!(checked.core_check.binary_sha256.len(), 64);
+    assert!(dir
+        .path()
+        .join("mesh-routes/plans/closure-plan/manifest.json")
+        .exists());
 }
