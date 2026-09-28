@@ -85,6 +85,14 @@ fn fixture() -> (
     (dir, input, plan, legacy, config, rules)
 }
 
+#[test]
+fn emitted_managed_config_preserves_every_field_through_exact_start_read() {
+    let (_, _, _, _, emitted, _) = fixture();
+    let original = serde_json::to_value(&emitted).unwrap();
+    let read: SingBoxConfig = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(serde_json::to_value(read).unwrap(), original);
+}
+
 fn receipt(
     input: &ManagedMeshPlanInput,
     plan: &ManagedMeshRoutePlan,
@@ -731,10 +739,13 @@ async fn fixed_b609_core_check_accepts_only_the_staged_config_bytes() {
     let checked = stage_checked_with_core(&plan, closure, "generator-1", &binary)
         .await
         .unwrap();
-    assert_eq!(checked.core_check.plan_digest, expected.plan_digest);
-    assert_eq!(checked.core_check.config_sha256, expected.config_sha256);
-    assert_eq!(checked.core_check.manifest_ref, checked.staged.manifest_ref);
-    assert_eq!(checked.core_check.binary_sha256.len(), 64);
+    assert_eq!(checked.core_check().plan_digest, expected.plan_digest);
+    assert_eq!(checked.core_check().config_sha256, expected.config_sha256);
+    assert_eq!(
+        checked.core_check().manifest_ref,
+        checked.staged().manifest_ref
+    );
+    assert_eq!(checked.core_check().binary_sha256.len(), 64);
     assert!(dir
         .path()
         .join("mesh-routes/plans/closure-plan/manifest.json")

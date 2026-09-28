@@ -67,6 +67,15 @@ pub(crate) struct StagedArtifacts {
     pub durability: DurableWriteGuarantee,
 }
 
+/// Owned bytes checked against one published manifest. This is read-only
+/// evidence, not permission to start a core: a path can change after this
+/// read, and runtime generation facts are not carried by the manifest.
+pub(super) struct VerifiedArtifactContents {
+    pub manifest: ArtifactManifest,
+    pub config_bytes: Vec<u8>,
+    pub rule_files: Vec<(String, Vec<u8>)>,
+}
+
 /// Owned, fully verified bytes of the plan named by the durable activePlan.
 /// This is evidence of historical route scope only. It says nothing about
 /// whether a process or Tailscale state-directory owner is still alive.
@@ -413,6 +422,14 @@ pub(crate) fn verify_artifacts(
     data_dir: &Path,
     plan: &ManagedMeshRoutePlan,
 ) -> Result<ArtifactManifest, ArtifactError> {
+    verify_artifacts_with(data_dir, plan, |_, _| {})
+}
+
+fn verify_artifacts_with(
+    data_dir: &Path,
+    plan: &ManagedMeshRoutePlan,
+    mut retain: impl FnMut(&str, Vec<u8>),
+) -> Result<ArtifactManifest, ArtifactError> {
     let (root, _) = artifact_paths(data_dir, &plan.plan_id)?;
     inspect_real_directory(data_dir)?;
     inspect_directory(&data_dir.join("mesh-routes"))?;
@@ -446,16 +463,36 @@ pub(crate) fn verify_artifacts(
     if polaris_updater::verify::sha256_hex(&plan_bytes) != manifest.plan_digest {
         return Err(ArtifactError::Invalid("plan artifact digest mismatch"));
     }
-    verify_entry(&root, &manifest.config)?;
+    retain(CONFIG_NAME, verify_entry(&root, &manifest.config)?);
     let mut seen = BTreeSet::from([CONFIG_NAME, PLAN_NAME, MANIFEST_NAME]);
     for entry in &manifest.rule_files {
         validate_relative(&entry.relative_path)?;
         if !seen.insert(&entry.relative_path) {
             return Err(ArtifactError::Invalid("duplicate artifact path"));
         }
-        verify_entry(&root, entry)?;
+        retain(&entry.relative_path, verify_entry(&root, entry)?);
     }
     Ok(manifest)
+}
+
+pub(super) fn verify_artifact_contents(
+    data_dir: &Path,
+    plan: &ManagedMeshRoutePlan,
+) -> Result<VerifiedArtifactContents, ArtifactError> {
+    let mut config_bytes = None;
+    let mut rule_files = Vec::new();
+    let manifest = verify_artifacts_with(data_dir, plan, |path, bytes| {
+        if path == CONFIG_NAME {
+            config_bytes = Some(bytes);
+        } else {
+            rule_files.push((path.to_string(), bytes));
+        }
+    })?;
+    Ok(VerifiedArtifactContents {
+        manifest,
+        config_bytes: config_bytes.ok_or(ArtifactError::Invalid("missing config bytes"))?,
+        rule_files,
+    })
 }
 
 /// Recover a committed plan only through the durable ledger's exact identity.

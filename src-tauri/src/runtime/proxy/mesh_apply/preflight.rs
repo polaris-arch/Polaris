@@ -3,10 +3,14 @@
 //! manifest. This does not start a core, acquire a lifecycle generation, or
 //! constitute a core-ready/platform ACK.
 
-use super::artifact::{publish_manifest, stage_payload, ArtifactError, StagedArtifacts};
+use super::artifact::{
+    artifact_paths, publish_manifest, stage_payload, verify_artifact_contents, ArtifactError,
+    StagedArtifacts,
+};
 use super::closure::ValidatedClosure;
 use super::plan_digest;
 use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
+use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_core_supervisor::{run_config_check, ConfigCheckVerdict};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -22,6 +26,8 @@ pub(crate) enum PreflightError {
     CoreRejected,
     CoreUnattributable,
     CoreUnavailable,
+    CandidateMismatch,
+    InvalidConfig,
 }
 
 impl From<ArtifactError> for PreflightError {
@@ -41,8 +47,47 @@ pub(crate) struct CoreCheckEvidence {
 
 #[derive(Debug)]
 pub(crate) struct CheckedArtifacts {
-    pub staged: StagedArtifacts,
-    pub core_check: CoreCheckEvidence,
+    staged: StagedArtifacts,
+    core_check: CoreCheckEvidence,
+}
+
+impl CheckedArtifacts {
+    pub(crate) fn staged(&self) -> &StagedArtifacts {
+        &self.staged
+    }
+
+    pub(crate) fn core_check(&self) -> &CoreCheckEvidence {
+        &self.core_check
+    }
+}
+
+/// The current preflight does not freeze the effective user config, generated
+/// deps (including race/probe ports and auth), runtime bindings or canary.
+/// Until those facts are captured with the same final config, this proof is
+/// deliberately not a launch input. There is no fallback to recomputing them
+/// after the old core stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactStartReadiness {
+    UnsupportedRuntimeFacts,
+}
+
+/// Owned, read-only proof of the exact staged candidate. Config and rule
+/// bytes are retained so a future under-gate launch can reverify them and the
+/// paths immediately before spawn. No path in this type is currently exposed
+/// to a spawner; validation here alone does not close a later path-swap race.
+pub(crate) struct VerifiedExactStart {
+    pub plan_id: String,
+    pub config_version: String,
+    pub input_state_revision: String,
+    pub plan_digest: String,
+    pub manifest_ref: String,
+    pub config_sha256: String,
+    pub binary_sha256: String,
+    pub readiness: ExactStartReadiness,
+    config_path: PathBuf,
+    config_bytes: Vec<u8>,
+    rule_files: Vec<(String, Vec<u8>)>,
+    config: SingBoxConfig,
 }
 
 fn binary_digest(binary: &Path) -> Result<String, PreflightError> {
@@ -144,3 +189,63 @@ pub(crate) async fn stage_checked_with_core(
         staged,
     })
 }
+
+/// Re-read the published candidate and executable using the artifact reader's
+/// no-follow, bounded, hash-checked path. This binds plan id/version/revision
+/// through the plan digest, plus the exact manifest/config/rules/check evidence.
+/// A later launch must repeat this proof under the held TS gate at the spawn
+/// boundary; neither this read nor an earlier Accepted check pins a pathname.
+pub(crate) fn verify_exact_start(
+    data_dir: &Path,
+    plan: &ManagedMeshRoutePlan,
+    checked: &CheckedArtifacts,
+    binary: &Path,
+) -> Result<VerifiedExactStart, PreflightError> {
+    let digest = plan_digest(plan).map_err(|_| PreflightError::CandidateMismatch)?;
+    let (root, manifest_ref) = artifact_paths(data_dir, &plan.plan_id)?;
+    let evidence = &checked.core_check;
+    if checked.staged.manifest.plan_id != plan.plan_id
+        || checked.staged.manifest.plan_digest != digest
+        || checked.staged.manifest_ref != manifest_ref
+        || evidence.plan_digest != digest
+        || evidence.manifest_ref != manifest_ref
+        || evidence.config_sha256 != checked.staged.manifest.config.sha256
+    {
+        return Err(PreflightError::CandidateMismatch);
+    }
+    let before = binary_digest(binary)?;
+    if before != evidence.binary_sha256 {
+        return Err(PreflightError::BinaryChanged);
+    }
+    let contents = verify_artifact_contents(data_dir, plan)?;
+    if contents.manifest != checked.staged.manifest {
+        return Err(PreflightError::CandidateMismatch);
+    }
+    let config: SingBoxConfig = serde_json::from_slice(&contents.config_bytes)
+        .map_err(|_| PreflightError::InvalidConfig)?;
+    let original: serde_json::Value = serde_json::from_slice(&contents.config_bytes)
+        .map_err(|_| PreflightError::InvalidConfig)?;
+    if serde_json::to_value(&config).map_err(|_| PreflightError::InvalidConfig)? != original {
+        return Err(PreflightError::InvalidConfig);
+    }
+    if binary_digest(binary)? != before {
+        return Err(PreflightError::BinaryChanged);
+    }
+    Ok(VerifiedExactStart {
+        plan_id: plan.plan_id.clone(),
+        config_version: plan.config_version.clone(),
+        input_state_revision: plan.input_state_revision.clone(),
+        plan_digest: digest,
+        manifest_ref,
+        config_sha256: evidence.config_sha256.clone(),
+        binary_sha256: before,
+        readiness: ExactStartReadiness::UnsupportedRuntimeFacts,
+        config_path: root.join(&contents.manifest.config.relative_path),
+        config_bytes: contents.config_bytes,
+        rule_files: contents.rule_files,
+        config,
+    })
+}
+
+#[cfg(test)]
+mod tests;
