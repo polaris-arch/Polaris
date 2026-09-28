@@ -119,7 +119,7 @@
   inset: 5px 0;
   border: 1px solid var(--activity-line);
   border-radius: 8px;
-  background: var(--activity-paper);
+  background: hsl(var(--mobile-action-neutral));
 }
 .mc .mc-btn:not(.icon)::before { inset: var(--mobile-action-inset) 0; box-sizing: border-box; }
 .mc .mc-choice .mc-btn { padding-block: 0; border: 1px solid transparent; font-weight: 400; line-height: normal; white-space: nowrap; }

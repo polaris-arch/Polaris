@@ -5,6 +5,7 @@
   --mobile-tap: 44px;
   --mobile-action-hit: var(--mobile-tap);
   --mobile-action-inset: 4px;
+  --mobile-action-neutral: var(--surface-3);
   --mobile-field: 40px;
   --mobile-tab: 40px;
   --mobile-tool: 38px;
@@ -28,7 +29,7 @@
 .m-shell button.mn-act.primary:active { opacity: 1; }
 .m-shell .mn-act.primary:active::before { background: hsl(var(--flow) / .18); }
 .m-form-layer button.m-form-btn:active { opacity: 1; }
-.m-form-layer .m-form-btn:active::before { background: hsl(var(--surface-3)); }
+.m-form-layer .m-form-btn:not(.primary):not(.danger):active::before { background: hsl(var(--surface-2)); }
 .m-form-layer .m-form-btn.primary:active::before { background: hsl(var(--flow)); border-color: hsl(var(--fg) / .35); }
 .m-form-layer .m-form-btn.danger:active::before { background: hsl(var(--err)); border-color: hsl(var(--bg) / .35); }
 .m-form-layer .m-form-seg > button.on:active::before { background: hsl(var(--surface-2)); }
@@ -198,6 +199,12 @@
 .mn .mn-act.primary { background: transparent; font-weight: 600; }
 .mn-act.primary::before { content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0; box-sizing: border-box; border-radius: 7px; background: hsl(var(--flow-weak)); }
 .mn-act:not(.primary) { background: transparent; border-color: transparent; }
+.mn .mn-act:not(.more):not(.primary):not(.danger)::before {
+  content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0;
+  box-sizing: border-box; border: 1px solid hsl(var(--line)); border-radius: 7px;
+  background: hsl(var(--mobile-action-neutral));
+}
+.mn .mn-act:not(.more):not(.primary):not(.danger):not(:disabled):active::before { background: hsl(var(--surface-2)); }
 .mn-segs { gap: 4px; padding-top: 4px; }
 .mn-seg { min-height: var(--mobile-tab); padding-inline: 9px; font-size: var(--mobile-control-font); }
 .mn-sub { padding: 8px 10px; }
@@ -301,15 +308,17 @@
 .m-settings-btn::before, .m-form-btn::before, .h-sheetsubmit::before, .h-emptyact::before {
   content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0;
   box-sizing: border-box; border: 1px solid hsl(var(--line)); border-radius: 8px;
-  background: hsl(var(--surface-2));
+  background: hsl(var(--mobile-action-neutral));
 }
 .m-settings-btn { max-width: 100%; color: hsl(var(--fg)); }
+.h-emptyact { color: hsl(var(--fg)); }
 .m-settings-btn.primary, .m-form-btn.primary, .h-sheetsubmit { font-weight: 600; }
 .m-settings-btn.primary { color: #00141d; }
 .m-settings-btn.primary::before, .h-sheetsubmit::before { border-color: transparent; background: hsl(var(--flow)); }
 .m-settings-btn:disabled { opacity: .5; cursor: default; }
 .m-settings-btn:focus-visible, .m-settings-list-remove:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
-.h-emptyact::before { background: transparent; }
+.m-shell .m-settings-btn:not(.primary):not(:disabled):active::before,
+.m-shell .h-emptyact:not(:disabled):active::before { background: hsl(var(--surface-2)); }
 .m-settings-list-remove {
   position: relative; isolation: isolate; box-sizing: border-box;
   flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;

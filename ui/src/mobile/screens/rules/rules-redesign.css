@@ -225,6 +225,9 @@
   background: var(--rule-paper);
 }
 .mr-screen .mr-btn:not(.icon)::before { inset: var(--mobile-action-inset) 0; box-sizing: border-box; }
+.mr-screen .mr-btn:where(:not(.flow, .ghost, .icon, .danger))::before {
+  background: hsl(var(--mobile-action-neutral));
+}
 
 .mr-screen .mr-btn.flow {
   background: transparent;
