@@ -2,6 +2,8 @@
 //! through `ConfigManager::update_mesh_state_if_revision` before the next
 //! external action. A phase or a receipt alone never proves OS protection.
 
+pub(crate) mod artifact;
+
 use polaris_config_engine::builder::managed_mesh_plan::{ManagedMeshRoutePlan, ManagedPlanTarget};
 use polaris_config_engine::user_config::mesh_route_state::{
     MeshActivePlan, MeshBindingState, MeshDesiredRun, MeshOwnerRef, MeshRouteState,
