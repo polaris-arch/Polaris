@@ -12,8 +12,8 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use polaris_config_engine::user_config::mesh_identity_reconcile::{
     canonical_control_authority, reconcile_controlled_identity, ControlledIdentityChange,
@@ -36,6 +36,21 @@ const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
 const DEFERRED_DELETIONS_VERSION: u8 = 1;
 const STAGED_PENDING_FILE: &str = "staged-config.pending";
 const STAGED_PENDING_VERSION: u8 = 1;
+
+/// A legacy operation owns admission until its last stop/start/swap effect has
+/// completed. The counter is incremented under ConfigManager's write lock;
+/// managed opt-in checks the same counter under that lock before publishing its
+/// first marker. This guard owns only an Arc, so it can cross async awaits.
+#[must_use]
+pub(crate) struct LegacyStartLease {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for LegacyStartLease {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -330,6 +345,7 @@ pub struct ConfigManager {
     /// `load_full_under_write_lock`（末尾取 `cache` 写锁）与保存腿（先取读锁拿旧 icon id、末尾取写锁刷缓存），
     /// 若本锁与 `cache` 是同一把，那两次调用就是自死锁。
     write_lock: Mutex<()>,
+    legacy_start_leases: Arc<AtomicUsize>,
     /// 配置保存与延迟删除消费的事务锁。所有 save 都经它串行，关掉「journal 已写、config 未写时被
     /// Apply 提前消费」及「消费复核后实体又被并发加入」两类竞态；与 `write_lock` 分离以免锁层反转。
     deferred_delete_lock: Mutex<()>,
@@ -364,6 +380,7 @@ impl ConfigManager {
             path,
             cache: RwLock::new(None),
             write_lock: Mutex::new(()),
+            legacy_start_leases: Arc::new(AtomicUsize::new(0)),
             deferred_delete_lock: Mutex::new(()),
             staged_mask: RwLock::new(StagedNodeMask {
                 pending: staged_pending,
@@ -385,6 +402,82 @@ impl ConfigManager {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Legacy start admission reads the raw disk document under the same lock as
+    /// marker publication and config writes. A present marker (including a bad
+    /// or preparing marker), managed fields without a marker, or unreadable raw
+    /// input cannot be interpreted as permission to use the old start path.
+    /// This is only a legacy fence; managed starts require the shared Apply
+    /// coordinator's persisted claim and are unsupported here.
+    pub(crate) fn admit_legacy_start(&self) -> Result<(), StoreError> {
+        deny_inside_projection("admit_legacy_start");
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.admit_legacy_start_under_write_lock()
+    }
+
+    pub(crate) fn lease_legacy_start(&self) -> Result<LegacyStartLease, StoreError> {
+        deny_inside_projection("lease_legacy_start");
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.admit_legacy_start_under_write_lock()?;
+        self.legacy_start_leases.fetch_add(1, Ordering::SeqCst);
+        Ok(LegacyStartLease {
+            active: Arc::clone(&self.legacy_start_leases),
+        })
+    }
+
+    /// Keep an already-admitted legacy operation fenced while its blocking
+    /// helper IPC runs after the awaiting future is cancelled. A standalone
+    /// Stop has no legacy lease, so it remains usable in managed mode.
+    pub(crate) fn retain_active_legacy_start_lease(&self) -> Option<LegacyStartLease> {
+        deny_inside_projection("retain_active_legacy_start_lease");
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.legacy_start_leases.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+        self.legacy_start_leases.fetch_add(1, Ordering::SeqCst);
+        Some(LegacyStartLease {
+            active: Arc::clone(&self.legacy_start_leases),
+        })
+    }
+
+    fn admit_legacy_start_under_write_lock(&self) -> Result<(), StoreError> {
+        match std::fs::symlink_metadata(self.mesh_marker_path()) {
+            Ok(_) => {
+                return Err(StoreError::validation(
+                    "managed mesh route requires a coordinated start (unsupported)",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error.to_string())),
+        }
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(StoreError::Io(error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(StoreError::validation(
+                "legacy start requires a regular config document",
+            ));
+        }
+        let raw = std::fs::read(&self.path).map_err(|error| StoreError::Io(error.to_string()))?;
+        let document: Value = serde_json::from_slice(&raw).map_err(StoreError::from_parse)?;
+        if !document.is_object() || mesh_guard::has_managed_fields(&document) {
+            return Err(StoreError::validation(
+                "legacy start requires an intact unmanaged config document",
+            ));
+        }
+        Ok(())
     }
 
     /// 渲染端未保存草稿的跨入口镜像。只表达“有/无”，草稿正文仍唯一保存在主窗 `localStorage`。
@@ -693,6 +786,11 @@ impl ConfigManager {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.legacy_start_leases.load(Ordering::SeqCst) != 0 {
+            return Err(StoreError::validation(
+                "legacy start operation is active; managed opt-in must retry",
+            ));
+        }
         if self.mesh_required_marker()?.is_some() {
             return Err(StoreError::validation("mesh route marker already exists"));
         }

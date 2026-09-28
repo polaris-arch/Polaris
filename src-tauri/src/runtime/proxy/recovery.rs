@@ -333,6 +333,11 @@ impl ProxyRuntime {
                         // 操作**时自动发生的，此处弹系统授权框 = 凭空索要管理员密码，且崩溃循环里最多
                         // 连弹 MAX_RESTART_COUNT 次。抑制后退回类型化终态，待用户手动启停时经门引导。
                         RestartFate::Start => {
+                            if let Err(error) = self.admit_legacy_start() {
+                                log::warn!("崩溃自愈准入拒绝: {error}");
+                                self.report_auto_restart_giveup(&error);
+                                return;
+                            }
                             match with_helper_gate_suppressed(self.restart(cfg.clone())).await {
                                 Ok(st) if st.running => {
                                     let _ = self.crash_lock().post_start(false);

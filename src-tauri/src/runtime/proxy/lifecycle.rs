@@ -24,6 +24,7 @@ use polaris_switch_engine::DebouncedOutcome;
 use super::route_replan::RuntimeBindingState;
 use super::system_takeover::should_clear_system_proxy_between_restart;
 use super::{ProxyRuntime, ProxyStatus, StartError};
+use crate::runtime::config::LegacyStartLease;
 
 pub(super) enum StartLeg {
     Finished(Result<ProxyStatus, StartError>, Option<u64>),
@@ -199,6 +200,31 @@ pub(super) fn monotonic_now_ms() -> u64 {
 }
 
 impl ProxyRuntime {
+    /// Transitional desktop fence. No managed claim is accepted by this API;
+    /// the shared coordinator must provide one before that path can open.
+    pub(super) fn lease_legacy_start(&self) -> Result<Option<LegacyStartLease>, StartError> {
+        #[cfg(not(target_os = "android"))]
+        {
+            self.config
+                .lease_legacy_start()
+                .map(Some)
+                .map_err(|error| StartError {
+                    message: format!("旧启动路径已被多 TS 受管状态阻断: {error}"),
+                    code: None,
+                    admission_denied: true,
+                })
+        }
+        #[cfg(target_os = "android")]
+        {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn admit_legacy_start(&self) -> Result<(), StartError> {
+        drop(self.lease_legacy_start()?);
+        Ok(())
+    }
+
     /// 置「换核验证窗口」抑制位（上游 `setAutoRestartSuppressed`）。
     ///
     /// 窗口内核**意外退出不自动重启**：让首次失败立刻上报，而不是在坏核上退避空转 3 次 ——
@@ -340,6 +366,13 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
     ) -> StartLeg {
+        // Reject legacy requests before claiming a generation or sweeping old
+        // processes. Claiming first would retire the live core's crash monitor
+        // even though this request is not allowed to start a replacement.
+        let _legacy_lease = match self.lease_legacy_start() {
+            Ok(lease) => lease,
+            Err(error) => return StartLeg::Finished(Err(error), None),
+        };
         // Explicit starts take ownership before their first await. This preserves the order of
         // two start requests (the later one wins), and lets a later stop supersede an earlier
         // start while it waits for the TS gate. Keep abort reset and claim under the same short
@@ -430,11 +463,16 @@ impl ProxyRuntime {
         // 挂在 public `start` 包装（**而非 command 层**）→ 覆盖全部入口（IPC/托盘/自动连接）+ restart 的
         // start 腿（`restart` 内部直调 `self.start`）——后者正是本不变式的主场景（重启失败→死端口→全网断）。
         // 挂 command 层会漏掉 restart 腿 = §K7「门开在别处却当全域门」。
-        self.maybe_clear_system_proxy_on_start_failure(&r, my_gen)
-            .await;
-        // C11：起核失败 → 把刚起的竞速 sidecar 一并收掉，别留一个没有内核在消费的 UDP 监听
-        // （端口占着、下次起核换新口，而生成侧状态还指着旧口）。守卫同上：被接管则交接管方收口。
-        self.maybe_stop_race_sidecar_on_start_failure(&r, my_gen);
+        // Admission can fail after async preflight while an older core still
+        // owns these surfaces. Preserve that session; without a live core,
+        // ordinary failure cleanup still removes any newly opened sidecar.
+        if !(r.as_ref().is_err_and(|error| error.admission_denied) && self.core_running()) {
+            self.maybe_clear_system_proxy_on_start_failure(&r, my_gen)
+                .await;
+            // C11：起核失败 → 把刚起的竞速 sidecar 一并收掉，别留一个没有内核在消费的 UDP 监听
+            // （端口占着、下次起核换新口，而生成侧状态还指着旧口）。守卫同上：被接管则交接管方收口。
+            self.maybe_stop_race_sidecar_on_start_failure(&r, my_gen);
+        }
         // **成功生命周期的唯一广播点**：必须等 `start_inner` 的整条接管事务（含 Windows 系统代理写入）
         // 返回，再先归还 `starting` 在飞计数，最后才告诉 UI ready。这样事件订阅方回拉到的是
         // `running:true + starting:false` 的完整终态，不会在旧 TUN 核 / 注册表写入中的半成品上探活。
@@ -721,9 +759,13 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
     ) -> Result<ProxyStatus, StartError> {
+        let legacy_lease = self.lease_legacy_start()?;
         self.gate.begin(); // restart 外层 begin（上游 beginLifecycleOp，:1500）→ depth≥1 不变式起点。
-        self.restart_with_claim(config, StopClaim::Request(expected_generation))
-            .await
+        let result = self
+            .restart_with_claim(config, StopClaim::Request(expected_generation))
+            .await;
+        drop(legacy_lease);
+        result
     }
 
     /// The debounced timer already claimed both the stop generation and outer lifecycle depth
@@ -732,9 +774,13 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         config: Value,
         claimed_generation: u64,
+        legacy_lease: Option<LegacyStartLease>,
     ) -> Result<ProxyStatus, StartError> {
-        self.restart_with_claim(config, StopClaim::AlreadyClaimed(claimed_generation))
-            .await
+        let result = self
+            .restart_with_claim(config, StopClaim::AlreadyClaimed(claimed_generation))
+            .await;
+        drop(legacy_lease);
+        result
     }
 
     async fn restart_with_claim(
@@ -766,6 +812,16 @@ impl ProxyRuntime {
 
     /// [`restart`](Self::restart) 内层：瞬态停核 + 重建。外层 begin/finish 由 `restart` 持有（depth≥1 不变式）。
     async fn restart_inner(self: &Arc<Self>, config: Value, claim: StopClaim<'_>) -> RestartLeg {
+        // A marker can be published while an already claimed timer is waiting
+        // to execute. Recheck before stop_inner so rejection keeps the old core.
+        if let Err(error) = self.admit_legacy_start() {
+            let generation = match &claim {
+                StopClaim::AlreadyClaimed(generation)
+                | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
+                StopClaim::Request(_) => None,
+            };
+            return RestartLeg::Finished(Err(error), generation);
+        }
         // 旧接管模式以就绪时的 startup_snapshot 为准，须在 stop_inner 清快照之前取。
         // 去抖重启的目标配置由调用方传入（timer 从最新 D/显式 force 快照取），不是旧核快照。
         let old_mode = self
@@ -912,7 +968,7 @@ impl ProxyRuntime {
                                 // Claim the exact snapshot, selector intent, lifecycle generation,
                                 // and outer depth before any await. An obsolete force id must never
                                 // fall back to the full disk config.
-                                let Some((snapshot, claimed_generation)) = me
+                                let Some((snapshot, claimed_generation, legacy_lease)) = me
                                     .claim_debounced_restart(
                                         force_id,
                                         scheduled_generation,
@@ -932,7 +988,10 @@ impl ProxyRuntime {
                                         return;
                                     }
                                 };
-                                if let Err(e) = me.restart_claimed(cfg, claimed_generation).await {
+                                if let Err(e) = me
+                                    .restart_claimed(cfg, claimed_generation, legacy_lease)
+                                    .await
+                                {
                                     log::error!("去抖重启失败: {e}");
                                 }
                             });
@@ -950,7 +1009,16 @@ impl ProxyRuntime {
         force_id: Option<u64>,
         scheduled_generation: u64,
         ticket: u64,
-    ) -> Option<(Option<Value>, u64)> {
+    ) -> Option<(Option<Value>, u64, Option<LegacyStartLease>)> {
+        // This check precedes try_begin_restart: a denied timer must not bump
+        // the generation and silently retire the current monitor/report.
+        let legacy_lease = match self.lease_legacy_start() {
+            Ok(lease) => lease,
+            Err(error) => {
+                log::warn!("去抖重启准入拒绝，保留当前内核: {error}");
+                return None;
+            }
+        };
         self.selector_reconcile.with_intent_claim(|current_intent| {
             let mut pending = self
                 .pending_force_restart
@@ -984,7 +1052,7 @@ impl ProxyRuntime {
             if force_id.is_some() {
                 *pending = None;
             }
-            Some((snapshot, generation))
+            Some((snapshot, generation, legacy_lease))
         })
     }
 

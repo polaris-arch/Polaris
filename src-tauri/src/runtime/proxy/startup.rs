@@ -1386,6 +1386,11 @@ impl ProxyRuntime {
                         code::STARTUP_FAILED,
                     )
                 })?;
+            // A marker may have appeared during the async preflight. The final
+            // shared claim/Stop-to-spawn exclusion is still unsupported; this
+            // late fence ensures the legacy path does not intentionally spawn
+            // after observing a managed document.
+            self.admit_legacy_start()?;
             let t_spawn = std::time::Instant::now();
             let pid = if cfg!(target_os = "android") {
                 // ── Android 腿（既有 `via_helper` seam 的**第三条腿**）──
@@ -2084,6 +2089,8 @@ impl ProxyRuntime {
     ///
     /// 返回 `Ok(Some(pid))` = 已起（daemon 报告受管核 pid）；`Ok(None)` = 起核前被接管 → 让位；
     /// `Err` = 通信/起核失败。
+    /// This is a legacy-only result: helper Started/Already both collapse to a
+    /// PID without plan/run identity, so neither is a managed CoreReceipt.
     ///
     /// DESIGN-REVIEW(c6-5-src-tauri-helper-wiring)：(R27.3) 不实现 上游 #159「helper 起核失败→回退
     /// UAC/osascript 直起重试」增强腿——失败直接报错（前端 SettingsHelper 引导先装 helper）。
@@ -2118,10 +2125,15 @@ impl ProxyRuntime {
         let ppid = Some(std::process::id());
         let helper = Arc::clone(&self.helper);
         let config_path = config_path.to_path_buf();
+        // spawn_blocking continues after its async caller is cancelled. Give
+        // the blocking IPC its own lease so opt-in cannot publish a marker
+        // while an abandoned helper call is still able to start the old core.
+        let helper_call_lease = self.lease_legacy_start().map_err(|error| error.message)?;
         // HelperClient::send 是同步阻塞 IPC → 挪出 async worker 线程。
         // **不传 bin**：helper 单方面决定跑哪个二进制（见 `HelperRuntime::start_core` 文档），
         // 传了也只会被丢掉——正是本缺陷的成因。
         let started = tokio::task::spawn_blocking(move || {
+            let _helper_call_lease = helper_call_lease;
             helper.start_core(&config_path, &log_path, fwd, ppid)
         })
         .await
@@ -2213,7 +2225,9 @@ impl ProxyRuntime {
         let started = std::time::Instant::now();
 
         // 全程同步 FS + 阻塞 IPC（sha256 两个 80MB 量级文件 + 可能的 30s install-core）→ spawn_blocking。
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
         let outcome = tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
             // 能力缓存：这个 helper 构建已经回过 `ERR unknown` 就不必再走整条重路。放在**最前**
             // ——放在 stage 之后等于白省，两个 80MB 的 sha256 才是这条腿的主要开销。
             // 探测本身是一次微秒级 ping；探不到（Unreachable）判不命中，宁可白跑一轮。

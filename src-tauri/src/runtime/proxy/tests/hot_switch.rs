@@ -804,7 +804,7 @@ async fn claimed_selected_restart_receipt_is_pending_until_explicit_stop_takes_o
         decision,
         polaris_switch_engine::DebouncedOutcome::Proceed(Some(id)) if id == force_id
     ));
-    let (_, claimed_generation) = rt
+    let (_, claimed_generation, _legacy_lease) = rt
         .claim_debounced_restart(Some(force_id), starting_generation, ticket)
         .expect("selected projection must be claimed by its exact force id");
     assert_eq!(
@@ -3059,7 +3059,7 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
         outcome,
         polaris_switch_engine::DebouncedOutcome::Proceed(Some(force_id)) if force_id == id
     ));
-    let (snapshot, _claimed_generation) = rt
+    let (snapshot, _claimed_generation, _legacy_lease) = rt
         .claim_debounced_restart(Some(id), scheduled_generation, ticket)
         .expect("去抖回调必须按同一 id/世代认领 Apply 配置");
     let landed = snapshot.expect("Apply 必须带完整快照");

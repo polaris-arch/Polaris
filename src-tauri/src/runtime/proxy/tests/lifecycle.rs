@@ -1,5 +1,48 @@
 use super::*;
 
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sweep() {
+    let (rt, dir) = test_runtime();
+    std::fs::write(
+        dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE),
+        b"bad marker",
+    )
+    .unwrap();
+    let generation = rt.gate.generation();
+    let sweeps = rt.stale_sweep_runs.load(Ordering::SeqCst);
+
+    assert!(rt.start(bad_config()).await.is_err());
+    assert_eq!(rt.gate.generation(), generation);
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
+    assert!(rt.restart(bad_config()).await.is_err());
+    assert_eq!(rt.gate.generation(), generation);
+    assert!(
+        !rt.gate.is_busy(),
+        "restart must not begin a denied lifecycle"
+    );
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |outcome, ticket| {
+            let _ = tx.send((outcome, ticket));
+        });
+    let (outcome, ticket) = rx.await.unwrap();
+    assert!(matches!(
+        outcome,
+        polaris_switch_engine::DebouncedOutcome::Proceed(None)
+    ));
+    assert!(rt
+        .claim_debounced_restart(None, generation, ticket)
+        .is_none());
+    assert_eq!(
+        rt.gate.generation(),
+        generation,
+        "timer must not retire the live generation"
+    );
+}
+
 /// 停止终态必须丢弃暂存的 switch（停止优先：不得停后又被 switch 拉起）。
 #[tokio::test]
 async fn stop_terminal_discards_pending_switch() {
@@ -1410,6 +1453,7 @@ fn lifecycle_payload_contract_keys() {
     let uncoded = serde_json::to_value(ProxyLifecycleEvent::failed(&StartError {
         message: "写盘失败".into(),
         code: None,
+        admission_denied: false,
     }))
     .expect("可序列化");
     assert_eq!(

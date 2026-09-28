@@ -168,8 +168,14 @@ impl ProxyRuntime {
             return Ok(());
         }
         log::info!("停核：pid={pid}（SIGTERM → {STOP_GRACE:?} 宽限 → SIGKILL）");
+        // The escalation task survives cancellation of this async Stop. Keep
+        // an existing restart/update lease through its final possible SIGKILL.
+        let escalation_lease = self.config.retain_active_legacy_start_lease();
         let escalation = ProcessKiller::escalate_async(
-            move |sig| send_signal(pid, sig),
+            move |sig| {
+                let _held = &escalation_lease;
+                send_signal(pid, sig);
+            },
             move || pid_alive(pid),
             STOP_GRACE,
         )
@@ -200,24 +206,32 @@ impl ProxyRuntime {
     ) -> Result<(), String> {
         let intended = self.pid.lock().ok().and_then(|g| *g);
         // 阻塞 IPC 挪出 async worker。
-        let result =
-            match tokio::task::spawn_blocking(move || ops.stop_managed_core(intended)).await {
-                Ok(Ok(())) => {
-                    log::info!("经 helper 停核完成（pid={intended:?}）");
-                    Ok(())
-                }
-                // daemon 可能已因父死看护/崩溃自行收割 → stop 返 notrunning/错误，非致命；
-                // 也可能是身份不匹配的诚实 no-op（消息自述），那正是本守卫生效的痕迹。
-                Ok(Err(e)) => {
-                    log::warn!("经 helper 停核未完成：{e}");
-                    Err(e)
-                }
-                Err(e) => {
-                    let error = format!("helper 停核任务 join 失败：{e}");
-                    log::error!("{error}");
-                    Err(error)
-                }
-            };
+        // An updater/restart may be cancelled while this blocking stop still
+        // runs. Retain its existing legacy lease in the closure; a normal Stop
+        // owns no such lease and must remain available in managed mode.
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        let result = match tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
+            ops.stop_managed_core(intended)
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                log::info!("经 helper 停核完成（pid={intended:?}）");
+                Ok(())
+            }
+            // daemon 可能已因父死看护/崩溃自行收割 → stop 返 notrunning/错误，非致命；
+            // 也可能是身份不匹配的诚实 no-op（消息自述），那正是本守卫生效的痕迹。
+            Ok(Err(e)) => {
+                log::warn!("经 helper 停核未完成：{e}");
+                Err(e)
+            }
+            Err(e) => {
+                let error = format!("helper 停核任务 join 失败：{e}");
+                log::error!("{error}");
+                Err(error)
+            }
+        };
         if result.is_ok() {
             self.clear_helper_core_bookkeeping(intended);
         }
@@ -402,7 +416,13 @@ impl ProxyRuntime {
         if self.helper.status().installed {
             let helper = Arc::clone(&self.helper);
             // `cleanup_cores` 是同步阻塞 IPC → 挪出 async worker 线程（同 start_core/stop_core）。
-            match tokio::task::spawn_blocking(move || helper.cleanup_cores()).await {
+            let blocking_lease = self.config.retain_active_legacy_start_lease();
+            match tokio::task::spawn_blocking(move || {
+                let _blocking_lease = blocking_lease;
+                helper.cleanup_cores()
+            })
+            .await
+            {
                 Ok(Ok(())) => {
                     tokio::time::sleep(STALE_KILL_GRACE).await;
                     let still: Vec<u32> = survivors

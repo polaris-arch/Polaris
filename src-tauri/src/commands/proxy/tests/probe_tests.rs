@@ -150,6 +150,7 @@ fn start_err_response_preserves_structured_code() {
     let e = StartError {
         message: "已取消".to_string(),
         code: Some(code::HELPER_GATE_ABORTED),
+        admission_denied: false,
     };
     let r = start_err_response(e);
     assert_eq!(r.code.as_deref(), Some(code::HELPER_GATE_ABORTED));

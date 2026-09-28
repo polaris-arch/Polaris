@@ -6,6 +6,109 @@ fn temp_dir(tag: &str) -> TestDir {
 }
 
 #[test]
+fn legacy_start_admission_reads_raw_disk_and_rejects_uncertain_mode() {
+    let dir = temp_dir("legacy-start-admission");
+    let manager = ConfigManager::new(dir.clone());
+    assert!(
+        manager.admit_legacy_start().is_ok(),
+        "fresh install is legacy"
+    );
+
+    let mut legacy = polaris_store::store::default_config();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    assert!(manager.admit_legacy_start().is_ok());
+
+    legacy[mesh_guard::STATE_KEY] = serde_json::Value::Null;
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "partial managed raw fields must block"
+    );
+
+    std::fs::write(dir.join("config.json"), b"{broken json").unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "a permissive load fallback is not admission"
+    );
+
+    std::fs::write(dir.join("config.json"), b"42").unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "non-object raw config is uncertain"
+    );
+
+    std::fs::write(dir.join("config.json"), b"{}").unwrap();
+    std::fs::write(dir.join(REQUIRED_MARKER_FILE), b"{broken marker").unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "bad marker still blocks legacy"
+    );
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Preparing,
+            local_id: "local".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "preparing must block"
+    );
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "enabled requires a managed claim"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_start_admission_rejects_dangling_marker() {
+    let dir = temp_dir("dangling-mesh-marker");
+    std::os::unix::fs::symlink("missing-marker-target", dir.join(REQUIRED_MARKER_FILE)).unwrap();
+    assert!(ConfigManager::new(dir.clone())
+        .admit_legacy_start()
+        .is_err());
+}
+
+#[test]
+fn legacy_start_lease_excludes_marker_publication_until_last_operation_finishes() {
+    let dir = temp_dir("legacy-start-lease");
+    let manager = ConfigManager::new(dir.clone());
+    let first = manager.lease_legacy_start().unwrap();
+    let second = manager.lease_legacy_start().unwrap();
+    assert!(manager.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    drop(first);
+    assert!(manager.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    drop(second);
+    manager.prepare_mesh_route_enable("local-test-1").unwrap();
+    assert!(dir.join(REQUIRED_MARKER_FILE).exists());
+    assert!(manager.lease_legacy_start().is_err());
+}
+
+#[test]
 fn ordinary_config_writes_preserve_managed_ledger_and_cannot_drop_dns_policy() {
     let dir = temp_dir("mesh-protected-writes");
     let wire: Value = serde_json::from_str(include_str!(

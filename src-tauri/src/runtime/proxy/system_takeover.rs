@@ -16,6 +16,8 @@ use polaris_system_integration::proxy_ops::{
     ProxyEnableRequest, SystemProxyController, SystemProxyOps,
 };
 
+use crate::runtime::config::LegacyStartLease;
+
 use super::{code, ProxyRuntime, ProxyStatus, StartError};
 
 /// 系统代理「清理收口」能力——失败腿的最小注入面。
@@ -75,9 +77,10 @@ impl SystemProxyTakeover {
     }
 
     /// marker 门控清理。无 marker 时 controller 自身幂等 no-op。
-    async fn clear(&self) -> bool {
+    async fn clear(&self, blocking_lease: Option<LegacyStartLease>) -> bool {
         let controller = Arc::clone(&self.controller);
         let outcome = tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
             controller
                 .lock()
                 .map(|mut guard| guard.ensure_cleared())
@@ -136,9 +139,11 @@ impl SystemProxyTakeover {
     async fn enable(
         &self,
         request: ProxyEnableRequest,
+        blocking_lease: Option<LegacyStartLease>,
     ) -> Result<Result<(), String>, tokio::task::JoinError> {
         let controller = Arc::clone(&self.controller);
         tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
             controller
                 .lock()
                 .map(|mut guard| guard.enable_system_proxy(&request))
@@ -230,7 +235,8 @@ impl ProxyRuntime {
 
     /// marker 门控的公开清理 facade，供 stop、失败腿与 command 复用。
     pub async fn clear_system_proxy(&self) -> bool {
-        self.system_proxy.clear().await
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        self.system_proxy.clear(blocking_lease).await
     }
 
     /// 启动期恢复系统代理 marker，并在同一启动汇流点恢复系统 DNS marker。
@@ -267,7 +273,8 @@ impl ProxyRuntime {
             socks_port: mixed_port,
             bypass_list: effective_bypass_lan(&BypassCfg(user_config)),
         };
-        match self.system_proxy.enable(request).await {
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        match self.system_proxy.enable(request, blocking_lease).await {
             Ok(Ok(())) => {
                 log::info!(
                     "系统代理已指向本地 mixed 入站（127.0.0.1:{mixed_port}）→ 流量经本地核（A1）"

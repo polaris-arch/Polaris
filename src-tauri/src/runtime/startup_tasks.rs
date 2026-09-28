@@ -193,6 +193,11 @@ fn spawn_exit_ip_probe(app: AppHandle) {
 fn spawn_auto_connect(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(AUTO_CONNECT_DELAY_MS)).await;
+        #[cfg(not(target_os = "android"))]
+        if let Err(error) = app.state::<AppRuntime>().config().admit_legacy_start() {
+            log::warn!("启动时自动连接准入拒绝: {error}");
+            return;
+        }
         let Some(config) = load_config(&app, "启动时自动连接") else {
             return;
         };
@@ -208,6 +213,11 @@ fn spawn_auto_connect(app: AppHandle) {
             }
             AutoConnectDecision::Connect { server_id }
             | AutoConnectDecision::AdoptSystemCore { server_id } => {
+                #[cfg(not(target_os = "android"))]
+                if let Err(error) = app.state::<AppRuntime>().config().admit_legacy_start() {
+                    log::warn!("启动时自动连接准入拒绝: {error}");
+                    return;
+                }
                 log::info!(
                     "启动时{}（节点 {server_id}），正在连接...",
                     if system_core_running {

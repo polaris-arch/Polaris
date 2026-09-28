@@ -529,6 +529,9 @@ pub struct StartError {
     pub message: String,
     /// 本次失败的结构化码（[`code`] 模块常量）。`None` = 无可诚实断言的分类。
     pub code: Option<&'static str>,
+    /// A rejected legacy admission has not started a replacement. Its caller
+    /// must preserve the existing core's OS proxy and race sidecar.
+    pub(crate) admission_denied: bool,
 }
 
 impl StartError {
@@ -538,6 +541,7 @@ impl StartError {
         Self {
             message: message.into(),
             code: Some(code),
+            admission_denied: false,
         }
     }
 }
@@ -557,6 +561,7 @@ impl From<String> for StartError {
         Self {
             message,
             code: None,
+            admission_denied: false,
         }
     }
 }

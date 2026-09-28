@@ -133,6 +133,63 @@ impl HelperStopOps for RecordingStop {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn cancelled_helper_stop_keeps_existing_legacy_lease_until_ipc_returns() {
+    let (rt, dir) = test_runtime();
+    let outer_lease = rt.config.lease_legacy_start().unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let held = Arc::clone(&release);
+    let entered = Mutex::new(Some(entered_tx));
+    let (ops, _, _) = RecordingStop::with_hook(
+        Ok(()),
+        Some(Box::new(move || {
+            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            let (lock, wake) = &*held;
+            let mut released = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !*released {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "test did not release helper IPC");
+                released = wake.wait_timeout(released, remaining).unwrap().0;
+            }
+        })),
+    );
+    let task = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>).await }
+    });
+    entered_rx.await.unwrap();
+    task.abort();
+    let _ = task.await;
+    drop(outer_lease);
+    assert!(rt.config.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir
+        .join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE)
+        .exists());
+
+    {
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_one();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if rt.config.prepare_mesh_route_enable("local-test-1").is_ok() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "blocking IPC did not release its lease"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(dir
+        .join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE)
+        .exists());
+}
+
 // ─── 停核的受管 pid 身份：app 侧下发 + 记账收口 ────────────────────────────────
 
 /// **变异门（下发侧）**：helper 停核腿必须把「本腿意图停的那个 pid」**随请求带下去**。

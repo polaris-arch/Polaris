@@ -563,6 +563,14 @@ pub(super) async fn swap_core_with_restart(
 
     let proxy = state.proxy.clone();
     let was_running = proxy.status().running;
+    // This must precede stop and binary replacement. Keep the lease through
+    // every await and rollback: managed opt-in cannot publish its first marker
+    // while this old swap operation can still stop or restart a core.
+    #[cfg(not(target_os = "android"))]
+    let _legacy_lease = match state.config().lease_legacy_start() {
+        Ok(lease) => lease,
+        Err(error) => return ApiResponse::err(format!("换核准入拒绝，现有内核保持运行: {error}")),
+    };
     // ── 「绝不主动断流」硬不变量：判在**拥有 stop 的这一层**（成因见 `swap_blocked_by_no_interrupt`）。
     //    此后到 `proxy.stop()` 之间不得再插入任何 await —— 那会把 TOCTOU 窗口重新撑开。
     if swap_blocked_by_no_interrupt(interrupt, was_running) {
