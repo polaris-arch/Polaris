@@ -325,7 +325,7 @@ pub fn mesh_route_report(
 /// 输出 `5000` ⇒ 该形态下两侧分叉。config 里唯一的浮点字段是 `dnsConfig.dnsTimeoutMs`，其写入路径
 /// （前端提交 / `sanitize_dns_config` 取整成 i64）都产出整数字面量，故只有**手改 config.json 写成
 /// `5000.0`** 才够得着。后果是保存恒返 conflict（不丢数据、不误写），不是静默错值。
-fn config_version(cfg: &Value) -> String {
+pub(crate) fn config_version(cfg: &Value) -> String {
     let mut view = cfg.clone();
     apply_frontend_view(&mut view);
     config_content_hash(&view)

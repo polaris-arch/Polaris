@@ -3,6 +3,40 @@
 use super::*;
 
 #[test]
+fn current_generation_guard_serializes_a_later_stop_claim() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let gate = Arc::new(LifecycleGate::default());
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let (attempting_tx, attempting_rx) = mpsc::channel();
+    let (claimed_tx, claimed_rx) = mpsc::channel();
+    let other = Arc::clone(&gate);
+    let worker = gate
+        .with_current_generation(old, |live| {
+            assert_eq!(live.generation(), old);
+            assert_eq!(live.owner(), Some(LifecycleKind::Start));
+            let worker = std::thread::spawn(move || {
+                attempting_tx.send(()).unwrap();
+                let stop = other
+                    .claim_generation(Some(old), LifecycleKind::Stop)
+                    .unwrap();
+                claimed_tx.send(stop).unwrap();
+            });
+            attempting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(claimed_rx.try_recv().is_err());
+            worker
+        })
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        old + 1
+    );
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+}
+
+#[test]
 fn begin_end_pairs_track_depth_and_busy() {
     let g = LifecycleGate::default();
     assert!(!g.is_busy());

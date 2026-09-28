@@ -1,6 +1,7 @@
-//! S4a's value-level Apply journal. Callers must persist each returned state
-//! through `ConfigManager::update_mesh_state_if_revision` before the next
-//! external action. A phase or a receipt alone never proves OS protection.
+//! S4's value-level Apply journal. Production callers must use
+//! `ConfigManager::apply_mesh_step_if_current` under a live generation guard
+//! before the next external action. A phase or receipt alone never proves OS
+//! protection.
 
 pub(crate) mod artifact;
 pub(crate) mod closure;
@@ -14,7 +15,7 @@ use polaris_config_engine::user_config::mesh_route_state::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ApplyError {
+pub(crate) enum ApplyError {
     Conflict,
     Superseded,
     Invalid(&'static str),
@@ -23,7 +24,7 @@ pub(super) enum ApplyError {
 /// The journal's immutable claim. `expected_state_revision` is intentionally
 /// absent: journal writes themselves advance that CAS revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ApplyClaim {
+pub(crate) struct ApplyClaim {
     pub plan_id: String,
     pub plan_digest: String,
     pub input_config_version: String,
@@ -48,14 +49,14 @@ impl From<&MeshTransaction> for ApplyClaim {
 /// Receipt producer must independently prove the core instance; this type
 /// only prevents a valid receipt for another plan/run/boot being reused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CoreReceipt {
+pub(crate) struct CoreReceipt {
     pub claim: ApplyClaim,
     pub run_id: String,
     pub identity_bindings: Vec<MeshOwnerRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProtectionResult {
+pub(crate) enum ProtectionResult {
     Complete,
     Partial,
     Unknown,
@@ -64,7 +65,7 @@ pub(super) enum ProtectionResult {
 /// Produced by the platform adapter after checking its actual TUN/proxy scope.
 /// `scope` and `evidence` are mandatory, but their truth is adapter-owned.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PlatformReceipt {
+pub(crate) struct PlatformReceipt {
     pub core: CoreReceipt,
     pub scope: String,
     pub protected_cidrs: Vec<String>,
@@ -77,7 +78,7 @@ pub(super) struct PlatformReceipt {
 /// Stable, non-sensitive journal errors. Raw core/OS error text can contain
 /// credentials or paths and must stay outside the persisted mesh ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum JournalErrorCode {
+pub(crate) enum JournalErrorCode {
     Preflight,
     StopTimeout,
     StopUnknown,
@@ -108,7 +109,7 @@ impl JournalErrorCode {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum PhaseEvent<'a> {
+pub(crate) enum PhaseEvent<'a> {
     RequestStop,
     /// The supervisor proved that no old primary or temporary owner existed.
     NoOldCore,
@@ -132,6 +133,31 @@ pub(super) enum PhaseEvent<'a> {
     },
     Fail(JournalErrorCode),
     Interrupt(JournalErrorCode),
+}
+
+/// The only state mutations admitted through ConfigManager's guarded Apply
+/// CAS. No caller-supplied closure may rewrite the managed ledger directly.
+pub(crate) enum ApplyStep<'a> {
+    Prepare {
+        plan: &'a ManagedMeshRoutePlan,
+        boot_id: &'a str,
+        manifest_ref: &'a str,
+    },
+    Advance {
+        plan: &'a ManagedMeshRoutePlan,
+        claim: &'a ApplyClaim,
+        event: PhaseEvent<'a>,
+    },
+    /// The gate must already have claimed `new_generation` as Start, and the
+    /// journal must still carry `old_generation`. Persist before spawn.
+    RequestStartReserved {
+        plan: &'a ManagedMeshRoutePlan,
+        claim: &'a ApplyClaim,
+        run_id: &'a str,
+        old_generation: u64,
+        new_generation: u64,
+    },
+    StopIntent,
 }
 
 pub(super) fn plan_digest(plan: &ManagedMeshRoutePlan) -> Result<String, ApplyError> {
@@ -218,7 +244,7 @@ fn check_plan(
 /// Pure candidate for the first durable CAS. The caller must have completed
 /// compile, staging, manifest verification and platform preflight before
 /// persisting this `Prepared` transaction. It cannot act on the old core yet.
-pub(super) fn record_prepared(
+pub(crate) fn record_prepared(
     state: &MeshRouteState,
     expected_state_revision: &str,
     current_config_version: &str,
@@ -355,7 +381,7 @@ fn check_core(tx: &MeshTransaction, receipt: &CoreReceipt) -> Result<(), ApplyEr
 
 /// One journal step. Its returned state must be written by a short CAS before
 /// any next await/action; a CAS miss means the caller has lost ownership.
-pub(super) fn advance(
+pub(crate) fn advance(
     state: &MeshRouteState,
     expected_state_revision: &str,
     current_config_version: &str,
@@ -457,10 +483,54 @@ pub(super) fn advance(
     Ok(next)
 }
 
+/// The sole old→new generation transition. `advance` normally requires the
+/// old claim to be live and must not be called with a fabricated old live
+/// generation after the gate has already reserved a new Start generation.
+pub(crate) fn request_start_reserved(
+    state: &MeshRouteState,
+    expected_state_revision: &str,
+    current_config_version: &str,
+    current_boot_id: &str,
+    live_new_generation: u64,
+    claim: &ApplyClaim,
+    plan: &ManagedMeshRoutePlan,
+    run_id: &str,
+    old_generation: u64,
+    new_generation: u64,
+) -> Result<MeshRouteState, ApplyError> {
+    if claim.lifecycle_generation != old_generation.to_string()
+        || live_new_generation != new_generation
+        || old_generation.checked_add(1) != Some(new_generation)
+        || !valid_id(run_id)
+    {
+        return Err(ApplyError::Superseded);
+    }
+    check_stored_claim(
+        state,
+        expected_state_revision,
+        current_config_version,
+        claim,
+        plan,
+    )?;
+    if claim.boot_id != current_boot_id {
+        return Err(ApplyError::Superseded);
+    }
+    let tx = state.transaction.as_ref().ok_or(ApplyError::Superseded)?;
+    if tx.phase != MeshTransactionPhase::OldStopped {
+        return Err(ApplyError::Invalid("start reservation requires oldStopped"));
+    }
+    let mut next = state.clone();
+    let tx = next.transaction.as_mut().ok_or(ApplyError::Superseded)?;
+    tx.candidate_run_id = Some(run_id.into());
+    tx.lifecycle_generation = new_generation.to_string();
+    tx.phase = MeshTransactionPhase::StartRequested;
+    Ok(next)
+}
+
 /// Stop claims a newer durable intent first. The caller may perform emergency
 /// stop after a write error, but must report that the stopped intent was not
 /// saved. The phase never claims that the process has actually exited.
-pub(super) fn record_stop_intent(
+pub(crate) fn record_stop_intent(
     state: &MeshRouteState,
     expected_state_revision: &str,
 ) -> Result<MeshRouteState, ApplyError> {

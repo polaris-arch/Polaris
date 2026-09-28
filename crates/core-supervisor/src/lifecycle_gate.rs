@@ -77,6 +77,23 @@ pub struct LifecycleGate {
     inner: Mutex<Inner>,
 }
 
+/// A non-forgeable, synchronous proof that a lifecycle generation remains
+/// current. It holds the gate lock until the caller's closure returns. Never
+/// await, call another gate method, or perform IPC while holding this guard.
+pub struct LiveClaimGuard<'a> {
+    inner: std::sync::MutexGuard<'a, Inner>,
+}
+
+impl LiveClaimGuard<'_> {
+    pub fn generation(&self) -> u64 {
+        self.inner.generation
+    }
+
+    pub fn owner(&self) -> Option<LifecycleKind> {
+        self.inner.generation_owner
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     /// 引用计数（重入：restart 内嵌 stop+start 时 depth=2，:1519-1521）。
@@ -89,6 +106,22 @@ struct Inner {
 }
 
 impl LifecycleGate {
+    /// Recheck a generation and execute one synchronous commit under the same
+    /// lock as Stop/Start claims. The closure may take the config write lock
+    /// and durably rename its document, but must not await or reenter this gate.
+    pub fn with_current_generation<T>(
+        &self,
+        expected: u64,
+        commit: impl FnOnce(&LiveClaimGuard<'_>) -> T,
+    ) -> Option<T> {
+        let inner = self.inner.lock().expect("lifecycle lock poisoned");
+        if inner.generation != expected {
+            return None;
+        }
+        let live = LiveClaimGuard { inner };
+        Some(commit(&live))
+    }
+
     /// 进入一次 lifecycle 操作（beginLifecycleOp，:1522）。depth += 1。
     pub fn begin(&self) {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");

@@ -37,7 +37,7 @@ pub use crash_recovery::{
     PostStartOutcome, RestartFate,
 };
 pub use lifecycle_gate::{
-    LifecycleGate, LifecycleKind, PendingDrain, PendingSnapshot, StopDiscard,
+    LifecycleGate, LifecycleKind, LiveClaimGuard, PendingDrain, PendingSnapshot, StopDiscard,
 };
 pub use port_bookkeeping::{PortAllocator, PortExclusions, ResolvedPort};
 pub use process_killer::{EscalatedKill, ProcessKiller, Signal};

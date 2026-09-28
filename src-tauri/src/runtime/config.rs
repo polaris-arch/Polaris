@@ -22,11 +22,15 @@ use polaris_config_engine::user_config::mesh_identity_reconcile::{
 use polaris_config_engine::user_config::mesh_route_state::{
     revise_semantic, MeshOwnerRef, MeshRoutePolicy, MeshRouteState,
 };
+use polaris_core_supervisor::{LifecycleKind, LiveClaimGuard};
 use polaris_store::fs::{durable_atomic_write, durable_remove, random_tmp_suffix, ConfigFs, StdFs};
 use polaris_store::mesh_guard::{self, REQUIRED_MARKER_FILE};
 use polaris_store::{ConfigStore, LoadResult, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::commands::config::config_version;
+use crate::runtime::proxy::mesh_apply::{self, ApplyError, ApplyStep, PhaseEvent};
 
 const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
 const DEFERRED_DELETIONS_VERSION: u8 = 1;
@@ -52,6 +56,29 @@ struct MeshRequiredMarker {
 pub(crate) enum MeshPrepareRecovery {
     AwaitingCommit,
     Enabled,
+}
+
+/// Both content version and ledger revision are checked from the same raw
+/// document under ConfigManager's write lock. `StopIntent` deliberately ignores
+/// content version so a user Stop can supersede a concurrent ordinary edit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ApplyCasExpected<'a> {
+    pub config_version: &'a str,
+    pub state_revision: &'a str,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Caller wiring follows in S4; preserve StoreError for commit uncertainty.
+pub(crate) enum ApplyPersistError {
+    Store(StoreError),
+    ConfigChanged,
+    Step(ApplyError),
+}
+
+impl From<StoreError> for ApplyPersistError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
 }
 
 /// S4 must mint this only while it holds lifecycle + TS state gates and has
@@ -673,7 +700,7 @@ impl ConfigManager {
 
     /// Trusted state-only CAS. Ordinary config writes cannot submit this
     /// ledger, and a no-op observation does not touch disk or bump revision.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn update_mesh_state_if_revision(
         &self,
         expected_revision: &str,
@@ -922,6 +949,122 @@ impl ConfigManager {
         self.persist_canonical_under_write_lock(&canonical)?;
         if let Ok(mut cache) = self.cache.write() {
             *cache = Some(canonical);
+        }
+        Ok(next)
+    }
+
+    /// Synchronous managed Apply CAS. The caller must first obtain the TS
+    /// async gate, then enter `LifecycleGate::with_current_generation`; this
+    /// method takes `write_lock` inside that short live-generation guard.
+    /// No await, IPC, gate reentry, or external core action may occur here.
+    #[allow(dead_code)]
+    pub(crate) fn apply_mesh_step_if_current(
+        &self,
+        expected: ApplyCasExpected<'_>,
+        current_boot_id: &str,
+        live: &LiveClaimGuard<'_>,
+        step: ApplyStep<'_>,
+    ) -> Result<MeshRouteState, ApplyPersistError> {
+        deny_inside_projection("apply_mesh_step_if_current");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut raw = self.raw_disk_for_mesh_under_write_lock()?;
+        let previous: MeshRouteState = serde_json::from_value(raw[mesh_guard::STATE_KEY].clone())
+            .map_err(StoreError::from_parse)?;
+        let is_stop = matches!(&step, ApplyStep::StopIntent);
+        let actual_config_version = config_version(&raw);
+        if !is_stop && actual_config_version != expected.config_version {
+            return Err(ApplyPersistError::ConfigChanged);
+        }
+        let live_generation = live.generation();
+        let next = match step {
+            ApplyStep::Prepare {
+                plan,
+                boot_id,
+                manifest_ref,
+            } => {
+                if !matches!(
+                    live.owner(),
+                    Some(LifecycleKind::Start | LifecycleKind::Restart)
+                ) || boot_id != current_boot_id
+                {
+                    return Err(ApplyPersistError::Step(ApplyError::Superseded));
+                }
+                mesh_apply::record_prepared(
+                    &previous,
+                    expected.state_revision,
+                    &actual_config_version,
+                    plan,
+                    boot_id,
+                    &live_generation.to_string(),
+                    manifest_ref,
+                )
+            }
+            ApplyStep::Advance { plan, claim, event } => {
+                if matches!(&event, PhaseEvent::RequestStart { .. }) {
+                    return Err(ApplyPersistError::Step(ApplyError::Invalid(
+                        "requestStart requires a reserved generation",
+                    )));
+                }
+                mesh_apply::advance(
+                    &previous,
+                    expected.state_revision,
+                    &actual_config_version,
+                    current_boot_id,
+                    &live_generation.to_string(),
+                    claim,
+                    plan,
+                    event,
+                )
+            }
+            ApplyStep::RequestStartReserved {
+                plan,
+                claim,
+                run_id,
+                old_generation,
+                new_generation,
+            } => {
+                if live.owner() != Some(LifecycleKind::Start) {
+                    return Err(ApplyPersistError::Step(ApplyError::Superseded));
+                }
+                mesh_apply::request_start_reserved(
+                    &previous,
+                    expected.state_revision,
+                    &actual_config_version,
+                    current_boot_id,
+                    live_generation,
+                    claim,
+                    plan,
+                    run_id,
+                    old_generation,
+                    new_generation,
+                )
+            }
+            ApplyStep::StopIntent => {
+                if live.owner() != Some(LifecycleKind::Stop) {
+                    return Err(ApplyPersistError::Step(ApplyError::Superseded));
+                }
+                mesh_apply::record_stop_intent(&previous, expected.state_revision)
+            }
+        }
+        .map_err(ApplyPersistError::Step)?;
+        if next.local_id != previous.local_id {
+            return Err(ApplyPersistError::Step(ApplyError::Invalid(
+                "mesh localId is immutable",
+            )));
+        }
+        let next = revise_semantic(&previous, expected.state_revision, next)
+            .map_err(|error| ApplyPersistError::Store(StoreError::validation(error)))?
+            .ok_or_else(|| {
+                ApplyPersistError::Step(ApplyError::Invalid("Apply step made no change"))
+            })?;
+        raw[mesh_guard::STATE_KEY] = serde_json::to_value(&next).map_err(StoreError::from)?;
+        let canonical = ConfigStore::canonicalize_for_save(&raw)?;
+        self.persist_canonical_under_write_lock(&canonical)?;
+        if let Ok(mut guard) = self.cache.write() {
+            *guard = Some(canonical);
         }
         Ok(next)
     }
