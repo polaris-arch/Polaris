@@ -66,15 +66,17 @@ export function meshRouteIsApplied(report: MeshRouteReport): boolean {
     s.loadEvidence === 'startupReady' && !s.snapshotStale;
 }
 
-export function meshRouteState(report: MeshRouteReport | null, serverId?: string, previous = false, legacy = false): RouteState {
+export function meshRouteState(report: MeshRouteReport | null, serverId?: string, previous = false, legacy = false,
+  contextMismatch = false): RouteState {
   if (legacy) return 'legacy';
   if (report === null) return 'unavailable';
+  if (contextMismatch) return 'unknown';
   if (previous || report.snapshot.snapshotStale) return 'previous';
   if (report.snapshot.scope === 'preview') return 'preview';
   if (!meshRouteIsApplied(report)) return 'pending';
   if (report.unknownReasons.length > 0 || report.results.length !== report.snapshot.candidates.length ||
       report.totalCandidateCount > report.snapshot.candidates.length) return 'unknown';
-  if (report.results.length === 0) return 'empty';
+  if (report.results.length === 0) return serverId === undefined ? 'empty' : 'absent';
   const results = serverId === undefined ? report.results : report.results.filter((result) => result.serverId === serverId);
   if (results.length === 0) return 'absent';
   if (results.some((result) => result.effective === null || result.coverage === 'unknown')) return 'unknown';
@@ -88,8 +90,9 @@ export function meshRouteState(report: MeshRouteReport | null, serverId?: string
   return active.some((result) => (result.effective?.length ?? 0) > 0) ? 'partial' : 'none';
 }
 
-export function meshRouteSummaryKey(report: MeshRouteReport | null, serverId?: string, previous = false, legacy = false): string {
-  return `mobileMeshRouteEvidence.summary.${meshRouteState(report, serverId, previous, legacy)}`;
+export function meshRouteSummaryKey(report: MeshRouteReport | null, serverId?: string, previous = false, legacy = false,
+  contextMismatch = false): string {
+  return `mobileMeshRouteEvidence.summary.${meshRouteState(report, serverId, previous, legacy, contextMismatch)}`;
 }
 
 function sourceKey(source: SourcedCidr['source']): string {
@@ -120,22 +123,25 @@ function Ranges({ values, emptyKey }: { values: readonly string[]; emptyKey: str
 }
 
 /** Both node cards and TUN use this exact evidence view; no CIDR arbitration lives here. */
-export function MobileMeshRouteEvidence({ report, serverId, nameOf, previous = false, legacy = false }: {
+export function MobileMeshRouteEvidence({ report, serverId, nameOf, previous = false, legacy = false,
+  contextMismatch = false }: {
   report: MeshRouteReport | null;
   serverId?: string;
   nameOf: (id: string) => string;
   previous?: boolean;
   legacy?: boolean;
+  contextMismatch?: boolean;
 }): ReactElement {
   const { t } = useTranslation();
   if (report === null) return <p style={line}>{t(legacy ? 'mobileMeshRouteEvidence.legacy' : 'mobileMeshRouteEvidence.unavailable')}</p>;
   const s = report.snapshot;
   const incomplete = report.unknownReasons.length > 0 || report.results.length !== s.candidates.length ||
     report.totalCandidateCount > s.candidates.length;
-  const loaded = meshRouteIsApplied(report) && !previous && !incomplete;
+  const loaded = meshRouteIsApplied(report) && !previous && !incomplete && !contextMismatch;
   const results = serverId === undefined ? report.results : report.results.filter((r) => r.serverId === serverId);
   const candidates = new Map(s.candidates.map((candidate) => [candidate.serverId, candidate]));
-  const scopeKey = previous || s.snapshotStale ? 'previous' : loaded ? 'applied' : s.scope === 'preview' ? 'preview' : 'pending';
+  const scopeKey = contextMismatch ? 'unmatchedConfig' : previous || s.snapshotStale ? 'previous'
+    : loaded ? 'applied' : s.scope === 'preview' ? 'preview' : 'pending';
   return <div data-mesh-route-scope={scopeKey}>
     <section style={section}>
       <h3 style={heading}>{t('mobileMeshRouteEvidence.scopeTitle')}</h3>
@@ -155,7 +161,10 @@ export function MobileMeshRouteEvidence({ report, serverId, nameOf, previous = f
       const noPrivateRanges = result.requested.length === 0 && result.effective?.length === 0;
       return <section key={result.serverId} style={section}>
         <h3 style={heading}>{nameOf(result.serverId)}</h3>
-        <p style={line}>{t(noPrivateRanges ? 'mobileMeshRouteEvidence.noRequested' : `mobileMeshRouteEvidence.coverage.${result.coverage}`)}</p>
+        <p style={line}>{contextMismatch
+          ? t('mobileMeshRouteEvidence.runningResult', { result: t(noPrivateRanges
+            ? 'mobileMeshRouteEvidence.noRequested' : `mobileMeshRouteEvidence.coverage.${result.coverage}`) })
+          : t(noPrivateRanges ? 'mobileMeshRouteEvidence.noRequested' : `mobileMeshRouteEvidence.coverage.${result.coverage}`)}</p>
         {!noPrivateRanges && !loaded && <p style={line}>{t('mobileMeshRouteEvidence.coverageCaveat')}</p>}
         {candidate && <p style={line}>{t(`mobileMeshRouteEvidence.leg.${candidate.leg}`)} · {candidate.generated
           ? t('mobileMeshRouteEvidence.generated') : t('mobileMeshRouteEvidence.notGenerated')}</p>}

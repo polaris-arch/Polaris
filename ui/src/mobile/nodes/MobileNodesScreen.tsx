@@ -92,6 +92,7 @@ import {
 } from '@/components/screens/nodes/nodes-logic';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
 import { asMeshRouteReport } from '../MobileMeshRouteEvidence';
+import { meshRouteMatchesVisibleConfig } from '../mesh-route-context';
 import { projectVisibleServers } from '@/components/screens/nodes/nodes-list-projection';
 import {
   notInPoolMessage,
@@ -209,6 +210,10 @@ export function MobileNodesScreen(): ReactElement {
   const serverNameById = useMemo(
     () => new Map(servers.map((s) => [s.id, s.name])),
     [servers],
+  );
+  const meshReportMatchesScreen = useMemo(
+    () => meshRouteMatchesVisibleConfig(meshRoute.report, config, { servers }),
+    [meshRoute.report, config, servers],
   );
 
   // ── 写操作：唯一出口 `runWrite`（IA 裁定 #14）─────────────────────────────
@@ -520,6 +525,8 @@ export function MobileNodesScreen(): ReactElement {
     () =>
       visibleServers.map((server) => {
         const mesh = activeGroup?.isMesh === true || isMeshNode(server);
+        const meshRouteContextMismatch = mesh && meshRoute.report?.snapshot.configSource === 'running' &&
+          (!meshReportMatchesScreen || stagedOnly.has(server.id));
         const reason = speedTestBlockReason(server, speedTestCaps, stagedOnly.has(server.id));
         return {
           server,
@@ -537,7 +544,8 @@ export function MobileNodesScreen(): ReactElement {
           meshRouteReport: mesh ? meshRoute.report : undefined,
           meshRoutePrevious: meshRoute.previous,
           meshRouteLegacy: meshRoute.legacy,
-          meshRouteNames: serverNameById,
+          meshRouteContextMismatch,
+          meshRouteNames: meshRouteContextMismatch ? undefined : serverNameById,
           deletable: server.subscriptionId === undefined,
           transport: transferSummary(server),
           protocolLabel: protocolLabel(server.protocol),
@@ -553,6 +561,7 @@ export function MobileNodesScreen(): ReactElement {
       testedAt,
       invalidIndex,
       meshRoute,
+      meshReportMatchesScreen,
       serverNameById,
       t,
     ],

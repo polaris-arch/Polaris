@@ -55,6 +55,8 @@ export interface NodeRowVM {
   readonly meshRouteReport?: MeshRouteReport | null;
   readonly meshRoutePrevious?: boolean;
   readonly meshRouteLegacy?: boolean;
+  /** Running report does not describe this visible edit, even if the server ID is unchanged. */
+  readonly meshRouteContextMismatch?: boolean;
   readonly meshRouteNames?: ReadonlyMap<string, string>;
   /** 是否渲染删除入口（订阅节点为 false —— 删了下次对账会拉回来）。 */
   readonly deletable: boolean;

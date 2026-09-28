@@ -46,7 +46,6 @@ import type {
 } from '@/contracts/types';
 import { effectiveRegionRouting } from '@/domain/region-routing';
 import { availableResourceTagSet, missingResourceRuleIds } from '@/domain/rule-resource-refs';
-import { meshOverlapRuleIds } from '@/domain/mesh-rule-overlap';
 import { duplicateRulePayload } from '@/domain/rule-duplicate';
 import { ruleDnsEffect, ruleRouteEffect } from '@/domain/rules';
 import {
@@ -60,7 +59,8 @@ import {
 import { netenvDnsDisplayName } from '@/components/dialogs/dns-action-options';
 import { probeDisplayText, useResolvedProbes } from '@/components/screens/rules/network-profile-probes';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
-import { asMeshRouteReport, meshRouteIsApplied, meshRouteSummaryKey, MobileMeshRouteEvidence } from '../../MobileMeshRouteEvidence';
+import { asMeshRouteReport, meshRouteSummaryKey, MobileMeshRouteEvidence } from '../../MobileMeshRouteEvidence';
+import { meshRouteRuleHints } from '../../mesh-route-context';
 import { MobileInfo } from '../../MobileInfo';
 import { isMeshNode } from '@/domain/endpoint-routes';
 import { mergeAppPresets, type AppPreset } from '@/domain/app-rules-preset';
@@ -375,18 +375,8 @@ export function MobileRulesScreen(): ReactElement {
   }, [config, routeRules, proxyRunning]);
 
   const meshRuleHints = useMemo(() => {
-    const report = meshRoute.report;
-    const meshExists = (config?.servers ?? []).some(isMeshNode);
-    if (!isSmartMode || !meshExists) return { ids: new Set<string>(), unknown: false };
-    const known = report?.results.flatMap((result) => result.requested.map((range) => range.cidr)) ?? [];
-    const ids = meshOverlapRuleIds(routeRules, known);
-    const unknown = report === null || meshRoute.previous || !meshRouteIsApplied(report) ||
-      report.unknownReasons.length > 0 || report.totalCandidateCount > report.snapshot.candidates.length ||
-      report.results.length !== report.snapshot.candidates.length ||
-      report.results.some((result) => result.effective === null) ||
-      report.snapshot.candidates.some((candidate) => candidate.matchCidrs === null);
-    return { ids, unknown };
-  }, [isSmartMode, routeRules, meshRoute, config?.servers]);
+    return meshRouteRuleHints(meshRoute.report, config, servers, routeRules, meshRoute.previous, isSmartMode);
+  }, [isSmartMode, routeRules, meshRoute, config, servers]);
 
   const stagedOnlyRoute = useMemo(
     () => stagedOnlyIds(routeRules, diskRouteRules),
@@ -1769,11 +1759,13 @@ export function MobileRulesScreen(): ReactElement {
           isSmartMode={isSmartMode}
           onBackToSmart={() => void handleBackToSmart()}
           rows={trafficRows}
-          meshInfo={(config?.servers ?? []).some(isMeshNode) ? <MobileInfo
+          meshInfo={servers.some(isMeshNode) ? <MobileInfo
             title={tr('mobileMeshRouteEvidence.title')}
-            summary={tr(meshRouteSummaryKey(meshRoute.report, undefined, meshRoute.previous, meshRoute.legacy))}
+            summary={tr(meshRouteSummaryKey(meshRoute.report, undefined, meshRoute.previous, meshRoute.legacy,
+              meshRuleHints.contextMismatch))}
             details={<MobileMeshRouteEvidence report={meshRoute.report} previous={meshRoute.previous}
-              legacy={meshRoute.legacy} nameOf={(id) => serverNameById.get(id) ?? id} />}
+              legacy={meshRoute.legacy} contextMismatch={meshRuleHints.contextMismatch}
+              nameOf={(id) => meshRuleHints.contextMismatch ? id : serverNameById.get(id) ?? id} />}
           /> : null}
           errorOf={errorOf}
         />

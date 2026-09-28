@@ -300,6 +300,7 @@ function NodeRow({
         </span>
         {hasMeshRoute && <span className="mn-route-summary">{t(meshRouteSummaryKey(
           row.meshRouteReport ?? null, row.server.id, row.meshRoutePrevious, row.meshRouteLegacy,
+          row.meshRouteContextMismatch,
         ))}</span>}
         {/* Invalid configuration remains directly visible and actionable, rather than hidden in help. */}
         {row.invalidReason !== undefined && <p className="mn-note">{row.invalidReason}</p>}
@@ -312,6 +313,7 @@ function NodeRow({
         details={<>
           {hasMeshRoute && <MobileMeshRouteEvidence report={row.meshRouteReport ?? null}
             serverId={row.server.id} previous={row.meshRoutePrevious} legacy={row.meshRouteLegacy}
+            contextMismatch={row.meshRouteContextMismatch}
             nameOf={(id) => row.meshRouteNames?.get(id) ?? id} />}
           {explanations.map((section, index) => <section key={index}><h3>{section.title}</h3><p>{section.text}</p></section>)}
         </>}

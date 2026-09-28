@@ -1468,6 +1468,16 @@ describe('⑦ IA §4.12：桌面 data-tip 的每一条解释都有移动端落�
     expect(main).not.toContain('m-info-trigger');
   });
 
+  it('当前编辑与运行报告失配时，节点卡不沿用旧报告的无重叠结论', () => {
+    const html = render({ rows: [row('a', {
+      meshRouteReport: meshReport,
+      meshRouteContextMismatch: true,
+    })] });
+    expect(html).toContain('mobileMeshRouteEvidence.summary.unknown');
+    expect(html).not.toContain('mobileMeshRouteEvidence.summary.full');
+    expect(html).not.toContain('mobileMeshRouteEvidence.summary.preview');
+  });
+
   it('同一卡片的 i 保留全部适用解释，待保存文案区分保存与应用，错误仍只在卡面', () => {
     const node = row('info', { invalidReason: 'invalid visible', speedTestable: false,
       speedTestBlockedHint: 'why.blocked', lanOnly: true, meshRouteReport: meshReport });

@@ -2768,9 +2768,11 @@
     },
     "incomplete": "The report omits some candidates or has unresolved evidence; an empty list does not prove no overlap.",
     "coverageCaveat": "These results cover only the listed candidates and do not establish current overall ownership.",
+    "runningResult": "Running-config report: {{result}}; this does not describe the current edit.",
     "scopeTitle": "Report status",
     "reportNotes": "Report scope and notes",
     "scope": {
+      "unmatchedConfig": "This running-config report is for reference. The current edits have not been matched to it, so it cannot establish ownership for the visible nodes or rules.",
       "previous": "Previous result; refresh before judging the current route.",
       "applied": "Loaded in the recorded running generation. This describes the mesh route layer only.",
       "preview": "Configuration preview; apply is still pending.",
