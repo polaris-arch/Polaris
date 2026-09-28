@@ -408,7 +408,7 @@ async fn status_auth_url_emits_event() {
     let ud = temp_ud();
     let server = ts_server("ts1", "myts");
     let emitter = started(&reg, &ud, &server).await;
-    sub.push(0, frame("myts", "NeedsLogin", URL_1));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
     wait_until(|| !emitter.captured.lock().unwrap().is_empty()).await;
     let cap = emitter.captured.lock().unwrap();
     assert_eq!(cap.len(), 1);
@@ -440,7 +440,7 @@ async fn stdout_auth_line_is_no_longer_a_url_source() {
         "stdout 的 Waiting for authentication 行不得再产出登录 URL 事件"
     );
     // 正向对照：同一个 URL 走 STATUS 就必须发得出来。
-    sub.push(0, frame("myts", "NeedsLogin", URL_1));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
     wait_until(|| !captured(&emitter).is_empty()).await;
     assert_eq!(captured(&emitter), vec![URL_1.to_string()]);
     reg.cancel_login("ts1");
@@ -457,8 +457,8 @@ async fn repeated_auth_url_emits_once_changed_url_emits_again() {
     let ud = temp_ud();
     let server = ts_server("ts1", "myts");
     let emitter = started(&reg, &ud, &server).await;
-    sub.push(0, frame("myts", "NeedsLogin", URL_1));
-    sub.push(0, frame("myts", "NeedsLogin", URL_1));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
     wait_until(|| !captured(&emitter).is_empty()).await;
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert_eq!(
@@ -466,7 +466,7 @@ async fn repeated_auth_url_emits_once_changed_url_emits_again() {
         vec![URL_1.to_string()],
         "同 URL 只发一次"
     );
-    sub.push(0, frame("myts", "NeedsLogin", URL_2));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_2));
     wait_until(|| captured(&emitter).len() == 2).await;
     assert_eq!(
         captured(&emitter),
@@ -490,7 +490,7 @@ async fn running_backend_state_reaps_core_but_starting_does_not() {
     let server = ts_server("ts1", "myts");
     let _emitter = started(&reg, &ud, &server).await;
     // Starting（`logged_in` 谓词会把它算作已登录）**不是**收核判据：那只是「在连」。
-    sub.push(0, frame("myts", "Starting", ""));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "Starting", ""));
     tokio::time::sleep(Duration::from_millis(120)).await;
     let st = spawner.spawned.lock().unwrap()[0].clone();
     assert!(
@@ -499,7 +499,7 @@ async fn running_backend_state_reaps_core_but_starting_does_not() {
     );
     assert!(reg.shared.contains("ts1"));
     // Running → 收核 + 注销。
-    sub.push(0, frame("myts", "Running", ""));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "Running", ""));
     wait_until(|| st.terminated.load(Ordering::SeqCst)).await;
     wait_until(|| !reg.shared.contains("ts1")).await;
     let _ = std::fs::remove_dir_all(&ud);
@@ -553,7 +553,7 @@ async fn inflight_login_pid_comes_from_the_child_handle() {
     );
 
     let st = spawner.spawned.lock().unwrap()[0].clone();
-    sub.push(0, frame("myts", "Running", ""));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "Running", ""));
     wait_until(|| st.terminated.load(Ordering::SeqCst)).await;
     wait_until(|| reg.inflight_login_pids().is_empty()).await;
     assert_eq!(
@@ -584,7 +584,7 @@ async fn frame_for_other_endpoint_tag_is_ignored() {
         "不在册 tag 的 Running 不得当成本节点登录成功"
     );
     // 正向对照：换成本节点 tag 就必须两样都发生。
-    sub.push(0, frame("myts", "NeedsLogin", URL_1));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
     wait_until(|| !captured(&emitter).is_empty()).await;
     let _ = std::fs::remove_dir_all(&ud);
 }

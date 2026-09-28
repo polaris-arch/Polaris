@@ -1,9 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
-import { acceptLoginProgress, authorizeFromMainFrame, copyLoginUrl, claimLoginUrl, mainAuthUrlOwner, openLoginUrl, loginFailureReasonKey, type TailscaleLoginProgress } from './tailscale-login-progress';
+import { acceptLoginProgress, authorizeFromMainFrame, copyLoginUrl, claimLoginUrl, mainAuthUrlOwner, openLoginUrl, loginFailureReasonKey, progressForLoginRequest, type TailscaleLoginProgress } from './tailscale-login-progress';
 import { validatedTailscaleAuthUrl } from './tailscale-auth-url';
 
 const current: TailscaleLoginProgress = { serverId: 'ts1', attemptId: 'new', phase: 'starting' };
 describe('Tailscale login request identity and result', () => {
+  it('同一节点的新 B 尝试不能出现在旧 A 面板的 URL、成功或错误显示读点', () => {
+    const a = { serverId: 'ts1', attemptId: 'A' };
+    const b = { serverId: 'ts1', attemptId: 'B' };
+    const waiting: TailscaleLoginProgress = { ...b, phase: 'awaitingAuth', url: 'https://hs.example/B' };
+    expect(progressForLoginRequest(waiting, a)).toBeUndefined();
+    expect(progressForLoginRequest({ ...waiting, phase: 'authorized' }, a)).toBeUndefined();
+    expect(progressForLoginRequest({ ...waiting, phase: 'failed', reason: 'authorizationTimedOut' }, a)).toBeUndefined();
+    expect(progressForLoginRequest(waiting, b)).toEqual(waiting);
+    const own: TailscaleLoginProgress = { ...waiting, attemptId: 'A', url: 'https://hs.example/A' };
+    expect(progressForLoginRequest(own, a)).toEqual(own);
+    expect(progressForLoginRequest(waiting, { serverId: 'other', attemptId: 'B' })).toBeUndefined();
+    expect(progressForLoginRequest(waiting, null)).toBeUndefined();
+  });
   it('late old URLs/cancel/success do not affect a newer request', () => {
     for (const phase of ['awaitingAuth', 'cancelled', 'authorized'] as const) {
       expect(acceptLoginProgress(current, { ...current, attemptId: 'old', phase })).toBe(false);

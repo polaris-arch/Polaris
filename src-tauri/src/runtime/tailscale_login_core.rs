@@ -81,7 +81,7 @@ use polaris_core_supervisor::{
 };
 use polaris_mesh::tailscale_login::{
     advance_login_state, build_tailscale_login_config, login_config_to_json, LoginEvent,
-    LoginState, TailscaleLoginApiService,
+    LoginState, TailscaleLoginApiService, TAILSCALE_LOGIN_ENDPOINT_TAG,
 };
 use polaris_singbox_grpc::{daemon, Endpoint, ReconnectConfig, SingBoxApiClient};
 
@@ -1118,9 +1118,12 @@ impl LoginCoreRegistry {
             done: done_tx,
             server_id: server.id.clone(),
             node_name: server.name.clone(),
-            // 瞬态核只含本节点一个 endpoint，其 tag = server.name（见 `build_tailscale_login_config`）。
-            // 复用主核那套解码器就得给它同一份 tag→id 映射；一并承担了「别的 tag 的帧一律丢弃」。
-            tag_to_id: BTreeMap::from([(server.name.clone(), server.id.clone())]),
+            // 瞬态核使用固定 endpoint tag；显示名称仍取 server.name。
+            // 复用主核解码器时只登记此 tag，别的 tag 的 STATUS 帧一律丢弃。
+            tag_to_id: BTreeMap::from([(
+                TAILSCALE_LOGIN_ENDPOINT_TAG.to_owned(),
+                server.id.clone(),
+            )]),
             config_path: config_path.clone(),
             epoch,
             deadline: tokio::time::Instant::now() + self.timeout,
@@ -1159,7 +1162,7 @@ struct SuperviseCtx {
     done: watch::Sender<bool>,
     server_id: String,
     node_name: String,
-    /// 单条映射 `server.name → server.id`：喂给 [`decode_tailscale_status`]，顺带把「别的 tag」的
+    /// 单条映射 `TAILSCALE_LOGIN_ENDPOINT_TAG → server.id`：喂给 [`decode_tailscale_status`]，顺带把「别的 tag」的
     /// 端点整段丢掉（瞬态核理论上只有一个 endpoint，但判据不该建立在「理论上」之上）。
     tag_to_id: BTreeMap<String, String>,
     /// 本次登录写盘的临时 config 路径，收核后删。

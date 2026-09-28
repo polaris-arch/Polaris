@@ -23,7 +23,10 @@ use std::path::Path;
 
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
+
+/// 瞬态核唯一的 Tailscale endpoint tag；路由/DNS 入站拒绝与 STATUS 映射共用。
+pub const TAILSCALE_LOGIN_ENDPOINT_TAG: &str = "tailscale-login";
 
 /// 瞬态登录核管理 API（1.14 services[]）入参：独立空闲端口 + 随机 secret，使瞬态核暴露 STATUS 流。
 /// 上游 `TailscaleLoginApiService`。
@@ -35,7 +38,7 @@ pub struct TailscaleLoginApiService {
     pub secret: String,
 }
 
-/// 登录专用 config 的最小形状（无 inbound / 无 route，仅 tailscale endpoint + direct + 管理 api service）。
+/// 登录专用 config 的最小形状（无代理 inbound；仅 TS endpoint + 入站拒绝 + direct + 管理 API）。
 /// 上游 `TailscaleLoginConfig`。以 serde_json::Value 输出（与 sing-box check 输入一致；builder 由上层序列化）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TailscaleLoginConfig {
@@ -45,16 +48,21 @@ pub struct TailscaleLoginConfig {
     pub endpoints: Vec<Value>,
     /// 单个 direct outbound。
     pub outbounds: Vec<Value>,
+    /// 只拒绝该 endpoint 的新入站连接；控制面仍走 direct。
+    pub route: Value,
+    /// 独立拒绝该 endpoint 的 DNS 入站；未匹配的控制面解析继续使用内核默认本地解析器。
+    pub dns: Value,
     /// 1.14 管理 API（恒一条）：瞬态核据此暴露 `SubscribeTailscaleStatus` —— 登录 URL 与登录成功
     /// 判据的**唯一**来源（见模块头）。
     pub services: Vec<Value>,
 }
 
-/// 生成登录专用 config：仅含该节点的 tailscale endpoint（state_directory 复用 tailscale-state）+ 一个 direct
-/// outbound + 管理 api service。**auth_key 永不写入**（有 authKey 就不需要交互登录）。
+/// 生成登录专用 config：仅含该节点的 tailscale endpoint（state_directory 复用 tailscale-state）、
+/// endpoint 入站拒绝、一个 direct outbound 和管理 API service。预授权请求保留 auth_key。
 ///
 /// log.level 强制 info + timestamp:true → 核侧诊断行不受日志等级摆布（**不再**是 URL 来源，只是日志）。
-/// 不含 inbound/route：瞬态无监听代理端口，故与主核并存无冲突（api service 端口由调用方独立解析）。
+/// 无代理 inbound；route/DNS 仅按固定 endpoint tag 拒绝新入站，避免已授权重试到收核前直通本机。
+/// 控制面拨号与普通 DNS 无该入站 tag，分别仍走 direct 与内核默认本地解析器；TS 内置服务不经此规则。
 ///
 /// controlUrl/hostname 等身份字段从 tailscaleSettings 透传（与 buildTailscaleEndpoint 同语义），但只透传
 /// 登录相关的少量字段——瞬态核只为拿 URL + 落 state，不承载路由/出口。
@@ -68,7 +76,10 @@ pub fn build_tailscale_login_config(
     let ts = server.tailscale_settings.as_ref();
     let mut endpoint = Map::new();
     endpoint.insert("type".to_string(), Value::String("tailscale".to_string()));
-    endpoint.insert("tag".to_string(), Value::String(server.name.clone()));
+    endpoint.insert(
+        "tag".to_string(),
+        Value::String(TAILSCALE_LOGIN_ENDPOINT_TAG.into()),
+    );
     let state_dir = crate::tailscale_state::tailscale_state_dir(user_data, &server.id)?;
     endpoint.insert(
         "state_directory".to_string(),
@@ -121,11 +132,21 @@ pub fn build_tailscale_login_config(
         svc.insert("secret".to_string(), Value::String(secret.to_string()));
     }
     let services = vec![Value::Object(svc)];
+    let route = json!({
+        "rules":[{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject","no_drop":true}],
+        "final":"direct"
+    });
+    let dns = json!({
+        "rules":[{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject",
+            "method":"default","no_drop":true}]
+    });
 
     Ok(TailscaleLoginConfig {
         log,
         endpoints: vec![Value::Object(endpoint)],
         outbounds: vec![Value::Object(direct)],
+        route,
+        dns,
         services,
     })
 }
@@ -139,6 +160,8 @@ pub fn login_config_to_json(cfg: &TailscaleLoginConfig) -> Value {
     root.insert("log".to_string(), Value::Object(cfg.log.clone()));
     root.insert("endpoints".to_string(), Value::Array(cfg.endpoints.clone()));
     root.insert("outbounds".to_string(), Value::Array(cfg.outbounds.clone()));
+    root.insert("route".to_string(), cfg.route.clone());
+    root.insert("dns".to_string(), cfg.dns.clone());
     root.insert("services".to_string(), Value::Array(cfg.services.clone()));
     Value::Object(root)
 }

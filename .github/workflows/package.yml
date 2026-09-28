@@ -607,6 +607,12 @@ jobs:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test kernel_accepts_full_config
 
+      - name: Kernel accepts isolated Tailscale login config
+        if: env.POLARIS_RUN_KERNEL_GATES == '1'
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-mesh --test tailscale_login_kernel_check
+
       - name: Kernel accepts local and remote subscription imports
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
         env:
@@ -624,11 +630,11 @@ jobs:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test network_profile_runtime
 
-      - name: Userspace mesh inbound TCP UDP and DNS runtime gate
+      - name: Userspace WG IPv4 IPv6 and MASQUE H3 inbound TCP UDP DNS runtime gate
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test mesh_inbound_runtime
+        run: cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture
 
       - name: Fetch sing-box dashboard
         run: node scripts/fetch-dashboard.mjs

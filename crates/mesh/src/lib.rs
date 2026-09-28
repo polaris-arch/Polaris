@@ -45,7 +45,7 @@ pub use polaris_helper_proto::Platform;
 pub use tailscale_login::{
     advance_login_state, build_tailscale_login_config, login_config_to_json,
     tailscale_endpoint_in_running_core, LoginEvent, LoginState, TailscaleLoginApiService,
-    TailscaleLoginConfig,
+    TailscaleLoginConfig, TAILSCALE_LOGIN_ENDPOINT_TAG,
 };
 pub use tailscale_state::{
     state_exists, tailscale_state_dir, InvalidTailscaleStateId, TailscaleStateFs,

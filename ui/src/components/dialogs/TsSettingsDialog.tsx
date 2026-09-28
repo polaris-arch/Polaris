@@ -49,6 +49,7 @@ import {
   initTsDraft,
   invalidTsCidrs,
   invalidControlUrl,
+  peersForTsNode,
   EXIT_CUSTOM,
 } from './ts-settings-logic';
 import { applyDetour, endpointDetourOptions } from './detour-options';
@@ -173,25 +174,28 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   const { armed, confirmTwice } = useConfirmTwice();
 
   // 出口候选：拉状态快照（核未跑 / 无节点时为空）。connected=false 时静态提示手动填写。
-  // **原样收下全部 peer**，不在这里筛 `exitNodeOption` —— 「没广告出口」与「不在 tailnet 里」
+  // **原样收下当前节点的全部 peer**，不在这里筛 `exitNodeOption` —— 「没广告出口」与「不在 tailnet 里」
   // 此前在界面上是同一种表现（都不在列表里），用户无从知道该去哪台机器上开那个开关。
   // 筛/排/去重/禁用/注记一律下沉 `exitNodeOptions`（纯函数，有单测）。
   useEffect(() => {
     let cancelled = false;
+    setPeers([]);
+    setConnected(null);
     api.server
       .tailscaleGetStatus()
       .then((snap) => {
         if (cancelled) return;
         setConnected(snap.connected);
-        setPeers(snap.statuses.flatMap((s) => s.peers));
+        setPeers(peersForTsNode(snap, node?.id));
       })
       .catch(() => {
-        /* 非 Tauri / 失败 → 保持空候选，走手动填写降级 */
+        if (cancelled) return;
+        setPeers([]); // 非 Tauri / 失败 → 空候选，走手动填写降级。
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [node?.id]);
 
   // 判据取**已保存值**而非草稿值（禁用豁免须在整个弹窗生命期内稳定，见 exitNodeOptions 头注）。
   const savedExit = node?.tailscaleSettings?.exitNode ?? '';

@@ -127,26 +127,31 @@ fn every_kernel_run_in_test_sources_goes_through_the_helper() {
 /// 已知起核用例全部接上 helper（正面断言：防「删掉起核调用」也能让上一条变绿的误读）。
 #[test]
 fn known_kernel_run_tests_are_wired_to_the_helper() {
-    // (文件, 用例入口必须调 kernel_run_or_skip 的次数 = 该文件的起核用例数)
+    // (文件, 总用例数, 真起核用例数)。纯 check 用例计入总数，但不调用起核跳过闸。
     let skip_wired = [
-        ("crates/config-engine/tests/network_profile_runtime.rs", 5),
-        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 1),
+        (
+            "crates/config-engine/tests/network_profile_runtime.rs",
+            5,
+            5,
+        ),
+        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 3, 2),
         (
             "crates/config-engine/tests/subscription_update_guard_runtime.rs",
             1,
+            1,
         ),
     ];
-    for (rel, n) in skip_wired {
+    for (rel, total_tests, run_tests) in skip_wired {
         let code = mask_comments_and_strings(&read_repo(rel));
         let tests = code.matches("#[test]").count();
         let skips = code.matches("kernel_run_or_skip(").count();
         assert_eq!(
-            tests, n,
-            "{rel}：起核用例数漂移（{tests} ≠ {n}），先确认新用例也经 helper 跳过"
+            tests, total_tests,
+            "{rel}：总用例数漂移（{tests} ≠ {total_tests}），先区分起核与纯 check 用例"
         );
         assert_eq!(
-            skips, n,
-            "{rel}：{n} 个起核用例应各调一次 kernel_run_or_skip，实测 {skips}"
+            skips, run_tests,
+            "{rel}：{run_tests} 个起核用例应各调一次 kernel_run_or_skip，实测 {skips}"
         );
         assert!(code.contains("with_run("), "{rel}：起核不再经 with_run");
     }

@@ -1,5 +1,8 @@
 use super::*;
-use polaris_config_engine::user_config::server_config::TailscaleSettings;
+use polaris_config_engine::user_config::server_config::{
+    MeshInboundGrant, MeshInboundNetwork, MeshInboundPolicy, MeshInboundTarget, TailscaleSettings,
+};
+use serde_json::json;
 
 fn ts_server(over: TailscaleSettings) -> ServerConfig {
     ServerConfig {
@@ -27,7 +30,7 @@ fn login_config_minimal_endpoint_state_dir_and_direct() {
     assert_eq!(cfg.endpoints.len(), 1);
     let ep = cfg.endpoints[0].as_object().unwrap();
     assert_eq!(ep["type"], "tailscale");
-    assert_eq!(ep["tag"], "myts");
+    assert_eq!(ep["tag"], TAILSCALE_LOGIN_ENDPOINT_TAG);
     // 生产侧把 `Path::join` 结果 `to_string_lossy` 进 JSON → Windows 上是 `/ud\tailscale\ts1`
     // （sing-box 在 Windows 上本就该收反斜杠）。用同样的 join 语义构造期望值，仍钉住
     // 「user_data / "tailscale" / server.id 三段及其顺序」。
@@ -36,7 +39,7 @@ fn login_config_minimal_endpoint_state_dir_and_direct() {
         ep["state_directory"].as_str().unwrap(),
         want.to_string_lossy().as_ref()
     );
-    // auth_key 永不写入。
+    // 未指定 auth_key 时不写入；预授权登录会保留它。
     assert!(ep.get("auth_key").is_none());
     // 无 control_url/hostname/ephemeral 时不写入。
     assert!(ep.get("control_url").is_none());
@@ -48,6 +51,82 @@ fn login_config_minimal_endpoint_state_dir_and_direct() {
     assert_eq!(ob["tag"], "direct");
     // 管理 api service 恒注入（登录 URL / 登录成功的唯一真值源，见模块头）。
     assert_eq!(cfg.services.len(), 1);
+    assert_eq!(
+        cfg.route["rules"],
+        json!([{
+            "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject", "no_drop": true
+        }])
+    );
+    assert_eq!(cfg.route["final"], "direct");
+    assert_eq!(
+        cfg.dns["rules"],
+        json!([{
+            "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject",
+            "method": "default", "no_drop": true
+        }])
+    );
+    assert!(
+        cfg.dns.get("final").is_none(),
+        "普通控制面 DNS 保留内核默认解析器"
+    );
+}
+
+#[test]
+fn login_ingress_reject_is_independent_of_name_and_user_policy() {
+    let allow = MeshInboundPolicy::Allowlist {
+        rules: vec![MeshInboundGrant {
+            source_cidrs: vec!["100.64.0.2/32".into()],
+            network: MeshInboundNetwork::Both,
+            ports: vec!["53".into()],
+            target: MeshInboundTarget::Local,
+            target_cidrs: vec![],
+        }],
+    };
+    for name in ["", "renamed-node"] {
+        for policy in [None, Some(allow.clone()), Some(MeshInboundPolicy::Block)] {
+            let mut server = ts_server(TailscaleSettings {
+                auth_key: Some("preauthorized-private-key".into()),
+                control_url: Some("https://headscale.example".into()),
+                ..Default::default()
+            });
+            server.name = name.into();
+            server.mesh_inbound_policy = policy;
+            let config = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+            let value = login_config_to_json(&config);
+            assert_eq!(value["endpoints"][0]["tag"], TAILSCALE_LOGIN_ENDPOINT_TAG);
+            assert_eq!(
+                value["endpoints"][0]["auth_key"],
+                "preauthorized-private-key"
+            );
+            assert_eq!(
+                value["endpoints"][0]["control_url"],
+                "https://headscale.example"
+            );
+            assert_eq!(
+                value["route"]["rules"],
+                json!([{
+                    "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject", "no_drop": true
+                }])
+            );
+            assert_eq!(value["route"]["final"], "direct");
+            assert_eq!(
+                value["dns"]["rules"],
+                json!([{
+                    "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject",
+                    "method": "default", "no_drop": true
+                }])
+            );
+            assert!(value["dns"].get("final").is_none());
+            assert_eq!(
+                value["outbounds"],
+                json!([{"type": "direct", "tag": "direct"}])
+            );
+            assert_eq!(value["services"][0]["type"], "api");
+            assert_eq!(value["services"][0]["listen"], "127.0.0.1");
+            assert_eq!(value["services"][0]["listen_port"], 51234);
+            assert_eq!(value["services"][0]["secret"], "rand-secret");
+        }
+    }
 }
 
 #[test]

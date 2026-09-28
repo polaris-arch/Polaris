@@ -7,12 +7,13 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { ServerConfig, TailscaleSettings } from '@/contracts/types';
-import type { TailscaleStatusPeer } from '@/contracts/tailscale-status';
+import type { TailscaleStatusEvent, TailscaleStatusPeer, TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
 import {
   buildTsSettings,
   exitNodeOptions,
   initTsDraft,
   invalidTsCidrs,
+  peersForTsNode,
   EXIT_CUSTOM,
   type ExitNodeLabels,
 } from './ts-settings-logic';
@@ -298,6 +299,43 @@ function peer(p: Partial<TailscaleStatusPeer> & { hostName: string }): Tailscale
     ...p,
   };
 }
+
+function status(serverId: string, peers: TailscaleStatusPeer[]): TailscaleStatusEvent {
+  return {
+    serverId, peers, backendState: 'Running', loggedIn: true,
+    tailscaleIPs: [], expired: false, canShareFiles: false,
+    waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0,
+  };
+}
+
+describe('TS 出口候选按当前节点隔离', () => {
+  const a = peer({ hostName: 'tailnet-a-exit', ip: '100.64.0.10' });
+  const b = peer({ hostName: 'tailnet-b-exit', ip: '100.65.0.20' });
+  const snapshot: TailscaleStatusSnapshot = {
+    connected: true,
+    statuses: [status('ts-b', [b]), status('ts-a', [a])],
+  };
+
+  it('两套控制面同在快照里时，只列当前节点的 peer 与当前已保存的自定义出口', () => {
+    const options = exitNodeOptions(peersForTsNode(snapshot, 'ts-a'), 'manual-a', L);
+    expect(devices(options).map(([value]) => value)).toEqual(['tailnet-a-exit', 'manual-a']);
+    expect(options.map(([value]) => value)).not.toContain('tailnet-b-exit');
+    expect(exitNodeOptions(peersForTsNode(snapshot, 'ts-b'), '', L)).toEqual([
+      ['', '<none>'],
+      ['tailnet-b-exit', 'tailnet-b-exit · 100.65.0.20', false],
+      [EXIT_CUSTOM, '<custom>'],
+    ]);
+  });
+
+  it('当前节点没有 STATUS 时不借别的节点候选，保留自己的已保存值供回显', () => {
+    const missing = { ...snapshot, statuses: [status('ts-b', [b])] };
+    expect(peersForTsNode(missing, 'ts-a')).toEqual([]);
+    expect(peersForTsNode(missing, undefined)).toEqual([]);
+    expect(exitNodeOptions(peersForTsNode(missing, 'ts-a'), 'manual-a', L)).toEqual([
+      ['', '<none>'], ['manual-a', 'manual-a'], [EXIT_CUSTOM, '<custom>'],
+    ]);
+  });
+});
 
 /** 只取设备行（掐掉首尾的「无 / 自定义…」），断言时不必每条都数偏移。 */
 const devices = (opts: readonly (readonly [string, string, boolean?])[]) => opts.slice(1, -1);

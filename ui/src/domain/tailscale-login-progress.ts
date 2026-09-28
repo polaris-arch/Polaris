@@ -10,6 +10,16 @@ export interface TailscaleLoginProgress {
   url?: string | null;
 }
 
+/** 弹窗只显示自己发起的请求；同节点的新尝试不可借旧面板展示 URL 或成功状态。 */
+export function progressForLoginRequest(
+  progress: TailscaleLoginProgress | undefined,
+  request: Pick<TailscaleLoginProgress, 'serverId' | 'attemptId'> | null,
+): TailscaleLoginProgress | undefined {
+  if (!request || !progress) return undefined;
+  return progress.serverId === request.serverId && progress.attemptId === request.attemptId
+    ? progress : undefined;
+}
+
 export function loginAttemptActive(phase: TailscaleLoginPhase): boolean {
   return phase === 'starting' || phase === 'awaitingAuth' || phase === 'mainCore';
 }

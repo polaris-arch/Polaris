@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ServerConfig } from '@/contracts/types';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
-import { copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl } from '@/domain/tailscale-login-progress';
+import { copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { api } from '@/ipc';
@@ -83,7 +83,10 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const [submitting, setSubmitting] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [pendingServerId, setPendingServerId] = useState<string | null>(null);
-  const progress = useTailscaleLoginProgressStore((s) => pendingServerId ? s.attempts[pendingServerId] : undefined);
+  const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
+    pendingServerId ? s.attempts[pendingServerId] : undefined,
+    activeRequest.current,
+  ));
   const cachedAuthUrl = useAppStore((s) => pendingServerId ? s.tailscaleAuthUrls[pendingServerId] : undefined);
   const authUrl = validatedTailscaleAuthUrl( progress?.phase === 'awaitingAuth' ? progress.url :
     progress?.phase === 'mainCore' && !progress.reason ? cachedAuthUrl : null);

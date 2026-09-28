@@ -263,7 +263,7 @@ async fn authorization_event_is_emitted_only_after_reap() {
     let (reg, spawner) = slow_registry(sub.clone());
     let ud = temp_ud();
     let emitter = started(&reg, &ud, &ts_server("ts1", "myts")).await;
-    sub.push(0, frame("myts", "Running", ""));
+    sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "Running", ""));
     acquire(&spawner.terminating).await;
     assert!(emitter
         .progress
@@ -610,7 +610,14 @@ async fn executable_auth_url_terminates_and_reaps_before_failure() {
     let (reg, spawner) = slow_registry(sub.clone());
     let ud = temp_ud();
     let emitter = started(&reg, &ud, &ts_server("ts1", "myts")).await;
-    sub.push(0, frame("myts", "NeedsLogin", "javascript:alert(1)"));
+    sub.push(
+        0,
+        frame(
+            TAILSCALE_LOGIN_ENDPOINT_TAG,
+            "NeedsLogin",
+            "javascript:alert(1)",
+        ),
+    );
     acquire(&spawner.terminating).await;
     assert!(emitter
         .progress
@@ -921,7 +928,14 @@ async fn transient_running_success_ignores_a_residual_invalid_auth_url() {
     );
     let ud = temp_ud();
     let emitter = started(&reg, &ud, &ts_server("ts1", "myts")).await;
-    sub.push(0, frame("myts", "Running", "javascript:residual"));
+    sub.push(
+        0,
+        frame(
+            TAILSCALE_LOGIN_ENDPOINT_TAG,
+            "Running",
+            "javascript:residual",
+        ),
+    );
     wait_until(|| {
         emitter
             .progress
