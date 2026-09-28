@@ -1861,6 +1861,99 @@ async fn old_stop_waiting_for_tailscale_gate_preserves_new_generation_owner() {
     assert!(rt.mesh.main_owns_tailscale("new-session", true));
 }
 
+#[tokio::test]
+async fn preclaimed_stop_under_tailscale_gate_does_not_reacquire_or_admit_waiter() {
+    let (rt, _dir) = test_runtime();
+    let acquired = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let route_holder = {
+        let (mesh, acquired, release) = (
+            Arc::clone(&rt.mesh),
+            Arc::clone(&acquired),
+            Arc::clone(&release),
+        );
+        tokio::spawn(async move {
+            mesh.occupy_exit_route_lock_for_test(acquired, release)
+                .await;
+        })
+    };
+    acquired.notified().await;
+    let generation = rt.gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    let (gate_owned_tx, gate_owned_rx) = tokio::sync::oneshot::channel();
+    let stop = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            let held = rt.mesh.tailscale_state_gate().await;
+            gate_owned_tx.send(()).unwrap();
+            rt.stop_inner_under_gate(generation, &held).await
+        })
+    };
+    gate_owned_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rt.gate.depth() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("under-gate stop must enter the shared teardown body");
+    let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
+    let waiter = {
+        let mesh = Arc::clone(&rt.mesh);
+        tokio::spawn(async move {
+            let _held = mesh.tailscale_state_gate().await;
+            waiter_tx.send(()).unwrap();
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        waiter_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(
+        !stop.is_finished(),
+        "route lock must suspend the stop while it owns the state gate"
+    );
+    release.notify_one();
+    route_holder.await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), stop)
+            .await
+            .expect("holding the state gate must not deadlock the stop")
+            .unwrap()
+            .unwrap(),
+        Some(generation)
+    );
+    tokio::time::timeout(Duration::from_secs(2), &mut waiter_rx)
+        .await
+        .expect("gate waiter must enter after the stop releases it")
+        .unwrap();
+    waiter.await.unwrap();
+    assert_eq!(rt.gate.depth(), 0);
+}
+
+#[tokio::test]
+async fn superseded_preclaimed_stop_under_gate_balances_lifecycle() {
+    let (rt, _dir) = test_runtime();
+    let held = rt.mesh.tailscale_state_gate().await;
+    let obsolete = rt.gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    let newer = rt
+        .gate
+        .claim_generation(None, LifecycleKind::Start)
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rt.stop_inner_under_gate(obsolete, &held)
+        )
+        .await
+        .expect("already held gate must not be acquired twice")
+        .unwrap(),
+        None
+    );
+    assert_eq!(rt.gate.generation(), newer);
+    assert_eq!(rt.gate.depth(), 0, "superseded stop must pair begin/end");
+}
+
 #[test]
 fn tailscale_state_remains_owned_during_helper_start_before_pid_publication() {
     let (rt, _dir) = test_runtime();

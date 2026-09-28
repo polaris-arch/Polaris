@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio::sync::{MutexGuard, Notify};
 
 use polaris_config_engine::builder::InvalidNode;
 use polaris_config_engine::user_config::app_config::UserConfig;
@@ -32,9 +32,31 @@ pub(super) enum StartLeg {
 
 /// Restart must conditionally claim after its stop leg; explicit stop already owns a token
 /// before its first await. The two paths share one teardown body without double-bumping.
-pub(super) enum StopClaim {
+pub(super) enum StopClaim<'a> {
     Request(Option<u64>),
     AlreadyClaimed(u64),
+    AlreadyClaimedUnderGate(u64, &'a MutexGuard<'a, ()>),
+}
+
+// Retain either form of the state gate through every await in the shared teardown body.
+// The borrowed variant is the proof that a caller already owns the gate; its Drop-bound
+// lifetime prevents that borrow from ending after the initial generation check.
+enum StopStateGate<'a> {
+    Acquired(MutexGuard<'a, ()>),
+    Borrowed(&'a MutexGuard<'a, ()>),
+}
+
+impl Drop for StopStateGate<'_> {
+    fn drop(&mut self) {
+        match self {
+            Self::Acquired(guard) => {
+                let _ = &**guard;
+            }
+            Self::Borrowed(guard) => {
+                let _ = &***guard;
+            }
+        }
+    }
 }
 
 enum RestartLeg {
@@ -500,6 +522,20 @@ impl ProxyRuntime {
         Ok(())
     }
 
+    /// Enter the shared stop teardown while the caller still holds the Tailscale state gate.
+    /// Its generation was claimed before entry; this leg neither reclaims nor reacquires.
+    pub(super) async fn stop_inner_under_gate<'a>(
+        self: &Arc<Self>,
+        preclaimed_generation: u64,
+        state_guard: &'a MutexGuard<'a, ()>,
+    ) -> Result<Option<u64>, String> {
+        self.stop_inner(StopClaim::AlreadyClaimedUnderGate(
+            preclaimed_generation,
+            state_guard,
+        ))
+        .await
+    }
+
     /// 停核主体（**不含系统代理收口**）：世代 +1 → kill → 清状态/快照 → `end(Stop)` 丢弃 pending。
     ///
     /// 1. 世代 +1（接管在飞的 start：其就绪门即刻让位）
@@ -540,20 +576,24 @@ impl ProxyRuntime {
     /// （`commands::helper::join_watchdog_cooperatively` 文档里记的那条最重后果）。
     pub(super) async fn stop_inner(
         self: &Arc<Self>,
-        claim: StopClaim,
+        claim: StopClaim<'_>,
     ) -> Result<Option<u64>, String> {
         // Restart claims here; an explicit user stop already claimed at its entry before await.
-        let my_gen = match claim {
+        let my_gen = match &claim {
             StopClaim::Request(expected) => {
-                let Some(generation) = self.claim_generation(expected, LifecycleKind::Stop) else {
+                let Some(generation) = self.claim_generation(*expected, LifecycleKind::Stop) else {
                     return Ok(None);
                 };
                 generation
             }
-            StopClaim::AlreadyClaimed(generation) => generation,
+            StopClaim::AlreadyClaimed(generation)
+            | StopClaim::AlreadyClaimedUnderGate(generation, _) => *generation,
         };
         self.gate.begin();
-        let _tailscale_gate = self.mesh.tailscale_state_gate().await;
+        let _tailscale_gate = match &claim {
+            StopClaim::AlreadyClaimedUnderGate(_, guard) => StopStateGate::Borrowed(guard),
+            _ => StopStateGate::Acquired(self.mesh.tailscale_state_gate().await),
+        };
         if self.stop_superseded(my_gen, "tailscale_state_gate") {
             self.finish_lifecycle(LifecycleKind::Stop);
             return Ok(None);
@@ -700,7 +740,7 @@ impl ProxyRuntime {
     async fn restart_with_claim(
         self: &Arc<Self>,
         config: Value,
-        claim: StopClaim,
+        claim: StopClaim<'_>,
     ) -> Result<ProxyStatus, StartError> {
         let leg = self.restart_inner(config, claim).await;
         // finish 恒执行。最新 owner 若为 Stop，旧 restart 归零时须按停止终态丢弃 pending；
@@ -725,7 +765,7 @@ impl ProxyRuntime {
     }
 
     /// [`restart`](Self::restart) 内层：瞬态停核 + 重建。外层 begin/finish 由 `restart` 持有（depth≥1 不变式）。
-    async fn restart_inner(self: &Arc<Self>, config: Value, claim: StopClaim) -> RestartLeg {
+    async fn restart_inner(self: &Arc<Self>, config: Value, claim: StopClaim<'_>) -> RestartLeg {
         // 旧接管模式以就绪时的 startup_snapshot 为准，须在 stop_inner 清快照之前取。
         // 去抖重启的目标配置由调用方传入（timer 从最新 D/显式 force 快照取），不是旧核快照。
         let old_mode = self
