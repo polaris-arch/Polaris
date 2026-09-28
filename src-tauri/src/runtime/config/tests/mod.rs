@@ -118,6 +118,17 @@ fn preparing_marker_blocks_ordinary_writes_and_only_proven_legacy_can_cancel() {
 }
 
 #[test]
+fn preparing_refuses_legacy_fallback_from_corrupt_disk() {
+    let dir = temp_dir("mesh-prepare-corrupt-legacy");
+    let corrupt = b"{broken-legacy";
+    std::fs::write(dir.join("config.json"), corrupt).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    assert!(mgr.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), corrupt);
+}
+
+#[test]
 fn prepared_commit_and_state_only_cas_preserve_policy_and_reject_stale_revision() {
     let dir = temp_dir("mesh-prepare-commit");
     let mgr = ConfigManager::new(dir.clone());

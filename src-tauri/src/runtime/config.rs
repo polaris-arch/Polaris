@@ -498,10 +498,20 @@ impl ConfigManager {
             return Err(StoreError::validation("mesh route marker already exists"));
         }
         let legacy = self.load_full_under_write_lock()?;
+        // Legacy load historically falls back to in-memory defaults for a
+        // corrupt on-disk file. Opt-in may not bind a marker to that fallback:
+        // the original file must remain readable and semantically identical.
+        let disk_legacy = self.read_mesh_document()?;
+        let digest = Self::legacy_mesh_digest(&legacy)?;
+        if Self::legacy_mesh_digest(&disk_legacy)? != digest {
+            return Err(StoreError::validation(
+                "legacy config changed during mesh preparation",
+            ));
+        }
         let marker = MeshRequiredMarker {
             phase: MeshMarkerPhase::Preparing,
             local_id: local_id.into(),
-            legacy_config_digest: Self::legacy_mesh_digest(&legacy)?,
+            legacy_config_digest: digest,
         };
         let result = self.write_mesh_marker(&marker);
         self.clear_cached_config();
