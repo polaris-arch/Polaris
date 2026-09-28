@@ -1,6 +1,6 @@
 use super::*;
 use crate::builder::managed_mesh_plan::ManagedMeshCandidate;
-use crate::user_config::cidr::cidr_contains;
+use crate::user_config::cidr::{cidr_contains, cidrs_overlap};
 use crate::user_config::mesh_route_state::{
     MeshOverride, MeshOwnerRef, MeshRoutePolicy, MeshRouteState, MeshTarget,
 };
@@ -458,6 +458,54 @@ fn scoped_override_accepts_same_target_or_atoms_but_rejects_cross_scope() {
     assert_eq!(cross_scope.unwrap().action.as_deref(), Some("reject"));
     let (rule, _) = trace_domain(rules, &["100.80.2.1/32"], None, 443).unwrap();
     assert_eq!(rule.unwrap().outbound.as_deref(), Some("ep-b"));
+}
+
+#[test]
+fn and_of_disjoint_ip_atoms_rejects_answers_split_across_atoms() {
+    assert!(!cidrs_overlap("100.80.2.0/24", "100.80.3.0/24"));
+    let mut input = input();
+    input.policy.overrides.push(MeshOverride {
+        rule_id: "both-atoms".into(),
+        scope_cidrs: vec!["100.80.2.0/23".into()],
+        target: MeshTarget::Owner {
+            server_id: "ts-b".into(),
+            identity_epoch: "epoch-b".into(),
+        },
+    });
+    let matcher = RouteRule {
+        type_field: Some("logical".into()),
+        mode: Some("and".into()),
+        rules: Some(vec![
+            RouteRule {
+                ip_cidr: Some(vec!["100.80.2.0/24".into()]),
+                ..Default::default()
+            },
+            RouteRule {
+                ip_cidr: Some(vec!["100.80.3.0/24".into()]),
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    };
+    let answers = &["100.80.2.1/32", "100.80.3.1/32"];
+    assert!(rule_matches(
+        &matcher, answers, true, None, None, "tcp", 443
+    ));
+    assert!(answers.iter().all(|ip| cidr_contains("100.80.2.0/23", ip)));
+    input
+        .scopeable_rule_matchers
+        .insert("both-atoms".into(), matcher);
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let built = emit_managed_mesh_config(&legacy(), &input, &plan).unwrap();
+    let (hit, resolves) = trace_domain(
+        &built.config.route.as_ref().unwrap().rules,
+        answers,
+        None,
+        443,
+    )
+    .unwrap();
+    assert_eq!(resolves, 1);
+    assert_eq!(hit.unwrap().action.as_deref(), Some("reject"));
 }
 
 #[test]

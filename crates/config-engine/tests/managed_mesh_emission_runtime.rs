@@ -25,6 +25,7 @@ use polaris_config_engine::builder::managed_mesh_plan::{
     compile_managed_mesh_plan, ManagedMeshCandidate, ManagedMeshPlanInput,
 };
 use polaris_config_engine::singbox::SingBoxConfig;
+use polaris_config_engine::user_config::cidr::cidrs_overlap;
 use polaris_config_engine::user_config::mesh_route_state::{
     MeshOwnerRef, MeshRoutePolicy, MeshRouteState,
 };
@@ -38,6 +39,7 @@ fn owner(server_id: &str, identity_epoch: &str) -> MeshOwnerRef {
 }
 
 fn plan_input() -> ManagedMeshPlanInput {
+    assert!(!cidrs_overlap("100.80.8.0/24", "100.80.9.0/24"));
     let mut wire: Value = serde_json::from_str(include_str!(
         "../../../ui/src/contracts/mesh-route-state.fixture.json"
     ))
@@ -48,10 +50,16 @@ fn plan_input() -> ManagedMeshPlanInput {
         {"cidr":"100.82.0.0/16","target":{"kind":"unmanaged"}},
         {"cidr":"fd7a:115c:a1e0:1::/64","target":{"kind":"owner","serverId":"ts-a","identityEpoch":"epoch-a"}}
     ]);
-    wire["meshRoutePolicy"]["overrides"] = json!([{
-        "ruleId":"atom-override","scopeCidrs":["100.80.0.0/21"],
-        "target":{"kind":"owner","serverId":"ts-b","identityEpoch":"epoch-b"}
-    }]);
+    wire["meshRoutePolicy"]["overrides"] = json!([
+        {
+            "ruleId":"atom-override","scopeCidrs":["100.80.0.0/21"],
+            "target":{"kind":"owner","serverId":"ts-b","identityEpoch":"epoch-b"}
+        },
+        {
+            "ruleId":"and-atom-override","scopeCidrs":["100.80.8.0/23"],
+            "target":{"kind":"owner","serverId":"ts-b","identityEpoch":"epoch-b"}
+        }
+    ]);
     wire["meshRouteState"]["identities"]
         .as_array_mut()
         .unwrap()
@@ -76,6 +84,13 @@ fn plan_input() -> ManagedMeshPlanInput {
         ]
     }))
     .unwrap();
+    let and_matcher = serde_json::from_value(json!({
+        "type":"logical","mode":"and","rules":[
+            {"ip_cidr":["100.80.8.0/24"]},
+            {"ip_cidr":["100.80.9.0/24"]}
+        ]
+    }))
+    .unwrap();
     ManagedMeshPlanInput {
         plan_id: "b609-connect".into(),
         config_version: "connect-1".into(),
@@ -95,7 +110,10 @@ fn plan_input() -> ManagedMeshPlanInput {
                 evidence_complete: true,
             },
         ],
-        scopeable_rule_matchers: BTreeMap::from([("atom-override".into(), matcher)]),
+        scopeable_rule_matchers: BTreeMap::from([
+            ("atom-override".into(), matcher),
+            ("and-atom-override".into(), and_matcher),
+        ]),
     }
 }
 
@@ -151,6 +169,7 @@ fn dns_answers(name: &str, qtype: u16) -> Vec<Vec<u8>> {
         ("cross-public.test", 1) => vec![v4(100, 80, 4, 1), v4(203, 0, 113, 5)],
         ("cross-release.test", 1) => vec![v4(100, 80, 4, 1), v4(100, 82, 4, 1)],
         ("override-atoms.test", 1) => vec![v4(100, 80, 2, 1), v4(100, 80, 3, 1)],
+        ("and-atom-split.test", 1) => vec![v4(100, 80, 8, 1), v4(100, 80, 9, 1)],
         ("override-domain.test", 1) => vec![v4(100, 80, 2, 1), v4(100, 80, 4, 1)],
         ("override-domain-fail.test", 1) => vec![v4(100, 80, 2, 1), v4(100, 80, 4, 1)],
         ("ipv6-owner.test", 28) => vec!["fd7a:115c:a1e0:1::9"
@@ -478,6 +497,7 @@ fn b609_connect_observes_managed_multi_answer_guards() {
         "cross-reject.test",
         "cross-public.test",
         "cross-release.test",
+        "and-atom-split.test",
         "override-domain-fail.test",
         "ipv6-cross.test",
     ] {
