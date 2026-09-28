@@ -162,15 +162,20 @@ fn rule_matches(
         .network
         .as_ref()
         .is_none_or(|networks| networks.iter().any(|item| item == network));
-    matches &= rule.ip_cidr.as_ref().is_none_or(|cidrs| {
+    let ip_match = rule.ip_cidr.as_ref().is_some_and(|cidrs| {
         resolved
             && answers
                 .iter()
                 .any(|ip| cidrs.iter().any(|cidr| cidr_contains(cidr, ip)))
     });
-    matches &= rule.domain_suffix.as_ref().is_none_or(|suffixes| {
+    let domain_match = rule.domain_suffix.as_ref().is_some_and(|suffixes| {
         domain.is_some_and(|name| suffixes.iter().any(|suffix| name.ends_with(suffix)))
     });
+    // b609 puts destination domain and destination IP items in one OR group
+    // even when both fields occur in the same default rule.
+    if rule.ip_cidr.is_some() || rule.domain_suffix.is_some() {
+        matches &= ip_match || domain_match;
+    }
     if rule.invert.unwrap_or(false) {
         !matches
     } else {
@@ -414,7 +419,7 @@ fn complete_answer_set_cannot_cross_q_owner_or_release() {
 }
 
 #[test]
-fn scoped_override_rejects_cross_scope_and_cross_ip_atom_answers() {
+fn scoped_override_accepts_same_target_or_atoms_but_rejects_cross_scope() {
     let mut input = input();
     input.policy.overrides.push(MeshOverride {
         rule_id: "two-atoms".into(),
@@ -445,19 +450,167 @@ fn scoped_override_rejects_cross_scope_and_cross_ip_atom_answers() {
     let plan = compile_managed_mesh_plan(input.clone()).unwrap();
     let built = emit_managed_mesh_config(&legacy(), &input, &plan).unwrap();
     let rules = &built.config.route.as_ref().unwrap().rules;
-    for answers in [
-        vec!["100.80.2.1/32", "100.80.3.1/32"], // separate matcher atoms
-        vec!["100.80.2.1/32", "100.80.4.1/32"], // outside scope
-    ] {
-        let (rule, _) = trace_domain(rules, &answers, None, 443).unwrap();
-        assert_eq!(
-            rule.unwrap().action.as_deref(),
-            Some("reject"),
-            "{answers:?}"
-        );
-    }
+    let (same_target, _) =
+        trace_domain(rules, &["100.80.2.1/32", "100.80.3.1/32"], None, 443).unwrap();
+    assert_eq!(same_target.unwrap().outbound.as_deref(), Some("ep-b"));
+    let (cross_scope, _) =
+        trace_domain(rules, &["100.80.2.1/32", "100.80.4.1/32"], None, 443).unwrap();
+    assert_eq!(cross_scope.unwrap().action.as_deref(), Some("reject"));
     let (rule, _) = trace_domain(rules, &["100.80.2.1/32"], None, 443).unwrap();
     assert_eq!(rule.unwrap().outbound.as_deref(), Some("ep-b"));
+}
+
+#[test]
+fn domain_or_ip_override_keeps_domain_branch_and_rejects_unsafe_ip_branch() {
+    let mut input = input();
+    input.policy.overrides.push(MeshOverride {
+        rule_id: "domain-or-ip".into(),
+        scope_cidrs: vec!["100.80.2.0/23".into()],
+        target: MeshTarget::Owner {
+            server_id: "ts-b".into(),
+            identity_epoch: "epoch-b".into(),
+        },
+    });
+    let matcher = RouteRule {
+        type_field: Some("logical".into()),
+        mode: Some("and".into()),
+        rules: Some(vec![
+            RouteRule {
+                network: Some(vec!["tcp".into()]),
+                ..Default::default()
+            },
+            RouteRule {
+                type_field: Some("logical".into()),
+                mode: Some("or".into()),
+                rules: Some(vec![
+                    RouteRule {
+                        type_field: Some("logical".into()),
+                        mode: Some("and".into()),
+                        rules: Some(vec![
+                            RouteRule {
+                                domain_suffix: Some(vec!["svc.example".into()]),
+                                ..Default::default()
+                            },
+                            RouteRule {
+                                inbound: Some(OneOrMany::One("test-in".into())),
+                                ..Default::default()
+                            },
+                        ]),
+                        ..Default::default()
+                    },
+                    RouteRule {
+                        ip_cidr: Some(vec!["100.80.2.0/24".into()]),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    };
+    input
+        .scopeable_rule_matchers
+        .insert("domain-or-ip".into(), matcher);
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let built = emit_managed_mesh_config(&legacy(), &input, &plan).unwrap();
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    let answers = &["100.80.2.1/32", "100.80.3.1/32"];
+    let (domain_branch, _) =
+        trace_named_domain(rules, "svc.example", answers, Some("test-in"), 443).unwrap();
+    assert_eq!(domain_branch.unwrap().outbound.as_deref(), Some("ep-b"));
+    let (ip_only, _) =
+        trace_named_domain(rules, "other.example", answers, Some("test-in"), 443).unwrap();
+    assert_eq!(ip_only.unwrap().action.as_deref(), Some("reject"));
+    let (wrong_inbound, _) = trace_named_domain(rules, "svc.example", answers, None, 443).unwrap();
+    assert_eq!(wrong_inbound.unwrap().action.as_deref(), Some("reject"));
+    for bad_answers in [
+        vec!["100.80.2.1/32", "100.80.4.1/32"],
+        vec!["100.80.2.1/32", "203.0.113.5/32"],
+    ] {
+        let (bad, _) =
+            trace_named_domain(rules, "svc.example", &bad_answers, Some("test-in"), 443).unwrap();
+        assert_eq!(bad.unwrap().action.as_deref(), Some("reject"));
+    }
+}
+
+#[test]
+fn default_rule_domain_and_ip_share_b609_destination_or_group() {
+    let mut input = input();
+    input.policy.overrides.push(MeshOverride {
+        rule_id: "default-or".into(),
+        scope_cidrs: vec!["100.80.2.0/23".into()],
+        target: MeshTarget::Owner {
+            server_id: "ts-b".into(),
+            identity_epoch: "epoch-b".into(),
+        },
+    });
+    input.scopeable_rule_matchers.insert(
+        "default-or".into(),
+        RouteRule {
+            domain_suffix: Some(vec!["svc.example".into()]),
+            ip_cidr: Some(vec!["100.80.2.0/24".into()]),
+            ..Default::default()
+        },
+    );
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let built = emit_managed_mesh_config(&legacy(), &input, &plan).unwrap();
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    let answers = &["100.80.2.1/32", "100.80.3.1/32"];
+    let (domain_branch, _) = trace_named_domain(rules, "svc.example", answers, None, 443).unwrap();
+    assert_eq!(domain_branch.unwrap().outbound.as_deref(), Some("ep-b"));
+    let (ip_only, _) = trace_named_domain(rules, "other.example", answers, None, 443).unwrap();
+    assert_eq!(ip_only.unwrap().action.as_deref(), Some("reject"));
+}
+
+#[test]
+fn unsupported_invert_and_exponential_override_branches_fail_closed() {
+    let mut input = input();
+    input.policy.overrides.push(MeshOverride {
+        rule_id: "bounded".into(),
+        scope_cidrs: vec!["100.80.2.0/23".into()],
+        target: MeshTarget::Reject,
+    });
+    input.scopeable_rule_matchers.insert(
+        "bounded".into(),
+        RouteRule {
+            domain_suffix: Some(vec!["svc.example".into()]),
+            invert: Some(true),
+            ..Default::default()
+        },
+    );
+    assert!(compile_managed_mesh_plan(input.clone())
+        .unwrap_err()
+        .contains("unsupported matcher"));
+    let pairs = (0..8)
+        .map(|index| RouteRule {
+            type_field: Some("logical".into()),
+            mode: Some("or".into()),
+            rules: Some(vec![
+                RouteRule {
+                    domain_suffix: Some(vec![format!("a{index}.example")]),
+                    ..Default::default()
+                },
+                RouteRule {
+                    domain_suffix: Some(vec![format!("b{index}.example")]),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        })
+        .collect();
+    input.scopeable_rule_matchers.insert(
+        "bounded".into(),
+        RouteRule {
+            type_field: Some("logical".into()),
+            mode: Some("and".into()),
+            rules: Some(pairs),
+            ..Default::default()
+        },
+    );
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    assert!(emit_managed_mesh_config(&legacy(), &input, &plan)
+        .unwrap_err()
+        .contains("branch budget"));
 }
 
 #[test]

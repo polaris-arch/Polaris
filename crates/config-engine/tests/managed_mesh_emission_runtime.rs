@@ -49,7 +49,7 @@ fn plan_input() -> ManagedMeshPlanInput {
         {"cidr":"fd7a:115c:a1e0:1::/64","target":{"kind":"owner","serverId":"ts-a","identityEpoch":"epoch-a"}}
     ]);
     wire["meshRoutePolicy"]["overrides"] = json!([{
-        "ruleId":"atom-override","scopeCidrs":["100.80.2.0/23"],
+        "ruleId":"atom-override","scopeCidrs":["100.80.0.0/21"],
         "target":{"kind":"owner","serverId":"ts-b","identityEpoch":"epoch-b"}
     }]);
     wire["meshRouteState"]["identities"]
@@ -70,6 +70,7 @@ fn plan_input() -> ManagedMeshPlanInput {
         }));
     let matcher = serde_json::from_value(json!({
         "type":"logical","mode":"or","rules":[
+            {"domain_suffix":["override-domain.test"]},
             {"ip_cidr":["100.80.2.0/24"]},
             {"ip_cidr":["100.80.3.0/24"]}
         ]
@@ -150,6 +151,8 @@ fn dns_answers(name: &str, qtype: u16) -> Vec<Vec<u8>> {
         ("cross-public.test", 1) => vec![v4(100, 80, 4, 1), v4(203, 0, 113, 5)],
         ("cross-release.test", 1) => vec![v4(100, 80, 4, 1), v4(100, 82, 4, 1)],
         ("override-atoms.test", 1) => vec![v4(100, 80, 2, 1), v4(100, 80, 3, 1)],
+        ("override-domain.test", 1) => vec![v4(100, 80, 2, 1), v4(100, 80, 4, 1)],
+        ("override-domain-fail.test", 1) => vec![v4(100, 80, 2, 1), v4(100, 80, 4, 1)],
         ("ipv6-owner.test", 28) => vec!["fd7a:115c:a1e0:1::9"
             .parse::<Ipv6Addr>()
             .unwrap()
@@ -404,6 +407,30 @@ fn b609_accepts_emitted_connect_fixture_without_starting_core() {
 }
 
 #[test]
+fn release_risk_mandatory_core_job_runs_both_managed_tests() {
+    let workflow = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/release-risk.yml"
+    ))
+    .unwrap();
+    let mandatory = workflow
+        .split("- name: Run mandatory bundled-core gates")
+        .nth(1)
+        .unwrap()
+        .split("\n  package:")
+        .next()
+        .unwrap();
+    assert!(mandatory.contains("POLARIS_REQUIRE_KERNEL_GATE: '1'"));
+    assert!(mandatory.contains(
+        "cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture"
+    ));
+    assert!(!mandatory.contains("POLARIS_NO_KERNEL_RUN"));
+    let source = include_str!("managed_mesh_emission_runtime.rs");
+    assert!(source.contains("fn b609_accepts_emitted_connect_fixture_without_starting_core"));
+    assert!(source.contains("fn b609_connect_observes_managed_multi_answer_guards"));
+}
+
+#[test]
 fn b609_connect_observes_managed_multi_answer_guards() {
     if !kernel_run_or_skip("D1 managed multi-answer CONNECT") {
         return;
@@ -451,7 +478,7 @@ fn b609_connect_observes_managed_multi_answer_guards() {
         "cross-reject.test",
         "cross-public.test",
         "cross-release.test",
-        "override-atoms.test",
+        "override-domain-fail.test",
         "ipv6-cross.test",
     ] {
         assert!(!connect(inbound, name), "{name} must reject before dialing");
@@ -463,6 +490,16 @@ fn b609_connect_observes_managed_multi_answer_guards() {
             b_rx.recv_timeout(Duration::from_millis(100)).is_err(),
             "{name} reached owner B"
         );
+    }
+    for name in ["override-atoms.test", "override-domain.test"] {
+        assert!(
+            connect(inbound, name),
+            "{name} must keep its valid override"
+        );
+        assert!(b_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .starts_with("100.80."));
     }
     assert!(connect(inbound, "ipv6-owner.test"));
     assert_eq!(
