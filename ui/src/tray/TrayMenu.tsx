@@ -45,6 +45,7 @@ import { speedTestableIds } from '@/domain/endpoint-routes';
 // 桌面通知出口（浮层无 toast 层，且托盘操作常在主窗关闭时发生 → 系统通知是唯一送达路径）。
 import { notifyDesktop, setDesktopNotificationsEnabled } from '@/lib/desktop-notify';
 import { withConfigWriteLock } from '@/lib/config-write-lock';
+import { traySwitchFeedback } from './switch-receipt';
 import { useNodeSortStore } from '@/store/use-node-sort-store';
 import { useLatencyStore, subscribeLatencyEvents } from '@/store/use-latency-store';
 import { latLevel } from '@/components/screens/shared/format';
@@ -549,65 +550,39 @@ export default function TrayMenu() {
     hide();
   };
 
-  const switchNode = async (id: string) => {
+  const switchExit = async (id: string, node: string) => {
     try {
-      const saved = await withConfigWriteLock(async () => {
-        await api.server.switch(id);
-        return api.config.get();
+      const { receipt, saved } = await withConfigWriteLock(async () => {
+        const receipt = await api.server.switch(id);
+        return { receipt, saved: await api.config.get() };
       });
       setConfig(saved);
-      setSelectedId(saved.selectedServerId ?? id);
+      setSelectedId(saved.selectedServerId);
+      const feedback = traySwitchFeedback(receipt, node, t);
+      setNotice(feedback.notice ?? '');
+      if (feedback.close) {
+        setView('main');
+        hide();
+      }
     } catch (err) {
-      noticeActionFailure(servers.find((s) => s.id === id)?.name ?? t('tray.nodes'), err);
-      return; // 失败不切视图不关浮层（W14）
+      noticeActionFailure(node, err);
     }
-    setView('main');
-    hide();
   };
 
-  // 直连哨兵走 selectedServerId 顶层 patch 而非 server:switch —— 后者要求 id 命中真实 servers
-  // 列表，哨兵不在其中会被拒绝；config-engine 已对该哨兵放行校验（见 crates/store/validate.rs）。
+  const switchNode = (id: string) => switchExit(id, servers.find((s) => s.id === id)?.name ?? t('tray.nodes'));
+
+  // 直连与节点选择共用原子后端事务和活核收据；浮层快照只用于是否已加载的门。
   const pickDirect = async () => {
-    if (config) {
-      try {
-        // **顶层 patch** 而非整份覆盖：本动作只改 `selectedServerId`，而整份写会把浮层这份快照里
-        // **其它所有键**一并按快照回写 —— 浮层的 config 只在它打开时取一次，期间主窗改的任何设置
-        // 都会被这次「切直连」静默回滚。后端在锁内最新配置上打补丁，结构上不可能误伤别的键。
-        // 入核行为不变：该命令同样走 `broadcast_config_changed` → `switch_mode`，也同样做
-        // `invalidate_unlock_on_exit_change`（见 `commands/config.rs::config_patch`）。
-        const saved = await withConfigWriteLock(() =>
-          api.config.patch({ selectedServerId: DIRECT_SERVER_ID })
-        );
-        setConfig(saved);
-        setSelectedId(DIRECT_SERVER_ID);
-      } catch (err) {
-        noticeActionFailure(t('tray.modeDirect'), err);
-        return; // 失败不关浮层（W14）
-      }
-    }
-    setView('main');
-    hide();
+    if (!config) return;
+    await switchExit(DIRECT_SERVER_ID, t('tray.modeDirect'));
   };
 
-  // 阻断哨兵同 pickDirect：走顶层 patch 写 `selectedServerId`（server:switch 只收真实节点 id；
-  // 不用整份 `config.save`，理由见 pickDirect 处那段——浮层快照会静默回滚主窗的改动）。
+  // 阻断哨兵也交给同一受限选择事务；真正的 route 变化由后端给出重启/待应用收据。
   // 直连模式下该项已 disabled，这里二次守门 —— 走到这里说明浮层渲染态与配置态脱节
-  // （如浮层关着的期间主窗改了 proxyMode），静默返回胜过写入一个不会生效的出口。
+  // （如浮层关着的期间主窗改了 proxyMode），保留后端同款二次守门。
   const pickBlock = async () => {
-    if (config && !blockDisabledReason) {
-      try {
-        const saved = await withConfigWriteLock(() =>
-          api.config.patch({ selectedServerId: BLOCK_SERVER_ID })
-        );
-        setConfig(saved);
-        setSelectedId(BLOCK_SERVER_ID);
-      } catch (err) {
-        noticeActionFailure(t('tray.blocked'), err);
-        return; // 失败不关浮层（W14）
-      }
-    }
-    setView('main');
-    hide();
+    if (!config || blockDisabledReason) return;
+    await switchExit(BLOCK_SERVER_ID, t('tray.blocked'));
   };
 
   /* ── 测速：**全量**（A5）──

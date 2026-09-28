@@ -5,6 +5,7 @@ import type { WarpWireGuardDraft } from '../../domain/warp';
 import type { TailscaleStatusSnapshot } from '../../contracts/tailscale-status';
 import type { TaildropInbox, TaildropSaveResult, TaildropSendResult, TaildropTaskSnapshot } from '../../contracts/taildrop';
 import type { SpeedTestDonePayload, SpeedTestInvokeResult } from '../../contracts/speed-test';
+import type { ServerSwitchReceipt } from '../../contracts/server-switch';
 
 // ============================================================================
 // serverApi
@@ -133,7 +134,7 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILDROP_SAVE, { serverId, name });
   },
 
-  async switch(serverId: string): Promise<void> {
+  async switch(serverId: string): Promise<ServerSwitchReceipt> {
     return invoke(IPC_CHANNELS.SERVER_SWITCH, { serverId });
   },
 

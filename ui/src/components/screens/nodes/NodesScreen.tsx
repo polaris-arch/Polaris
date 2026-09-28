@@ -54,6 +54,7 @@ import { useNodeSpeedTest } from './use-node-speed-test';
 import { useNodeSubscriptionActions } from './use-node-subscription-actions';
 import { useNodeDeletion } from './use-node-deletion';
 import { useNodeActions } from './use-node-actions';
+import { performMeshTsLogout } from './mesh-ts-logout';
 import type { NodesListSortKey } from './nodes-list-projection';
 import { useNodesRenderWindow } from './use-nodes-render-window';
 import { NodesHeader } from './NodesHeader';
@@ -476,13 +477,15 @@ export function NodesScreen() {
         toast.info(t('home.stagedOnlyBlocked'));
         return;
       }
-      try {
-        await api.server.tailscaleLogout(node.id);
-        setTailscaleLoginState(node.id, false);
-        toast.success(t('nodes.meshTsLogoutOk'));
-      } catch (err) {
-        console.error('[NodesScreen] tailscale logout failed:', err);
-        toast.error(t('nodes.meshTsLogoutFail'));
+      const result = await performMeshTsLogout(
+        node.id,
+        (serverId) => api.server.tailscaleLogout(serverId),
+        setTailscaleLoginState,
+      );
+      if (result.ok) toast.success(t(result.noticeKey));
+      else {
+        console.error('[NodesScreen] tailscale logout failed:', result.error);
+        toast.error(t(result.noticeKey));
       }
     },
     [setTailscaleLoginState, stagedOnly, stagedEntries, t]

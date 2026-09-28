@@ -23,11 +23,50 @@ fn server_switch_core_updates_selection_and_mru_in_one_write() {
     let mgr = ConfigManager::new(dir.clone());
     seed_switch_nodes(&mgr);
 
-    let (cfg, changed) = server_switch_core(&mgr, "n-b", |_| Ok(()), || {}).expect("切换应成功");
+    let (cfg, changed, intent) =
+        server_switch_core(&mgr, "n-b", |_| Ok(()), || 7).expect("切换应成功");
     assert!(changed);
+    assert_eq!(intent, 7);
     assert_eq!(cfg["selectedServerId"], json!("n-b"));
     assert_eq!(cfg["recentServerIds"], json!(["n-b"]));
     assert_eq!(mgr.load_full().unwrap()["selectedServerId"], json!("n-b"));
+}
+
+#[test]
+fn server_switch_block_is_a_sentinel_and_does_not_enter_recent_nodes() {
+    let dir = temp_dir("switch-block-sentinel");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let (saved, changed, intent) = server_switch_core(&mgr, BLOCK_SERVER_ID, |_| Ok(()), || 8)
+        .expect("smart-mode block selection should be saved");
+    assert!(changed);
+    assert_eq!(intent, 8);
+    assert_eq!(saved["selectedServerId"], BLOCK_SERVER_ID);
+    assert!(saved.get("recentServerIds").is_none());
+    assert_eq!(
+        mgr.load_full().unwrap()["selectedServerId"],
+        BLOCK_SERVER_ID
+    );
+}
+
+#[test]
+fn server_switch_rejects_block_in_saved_direct_mode_before_intent_or_write() {
+    let dir = temp_dir("switch-block-direct");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let mut before = mgr.load_full().unwrap();
+    before["proxyMode"] = json!("direct");
+    mgr.save_full(&before).unwrap();
+
+    let error = server_switch_core(
+        &mgr,
+        BLOCK_SERVER_ID,
+        |_| panic!("invalid block candidate must not reach binding preflight"),
+        || panic!("invalid block candidate must not claim selector intent"),
+    )
+    .expect_err("direct mode cannot generate blocking routes");
+    assert!(matches!(error, ServerSwitchError::Other(_)));
+    assert_eq!(mgr.load_full().unwrap(), before);
 }
 
 #[test]
@@ -370,7 +409,7 @@ fn both_delete_commands_prune_recent_ids() {
     for anchor in [
         "pub fn server_delete(",
         "pub fn server_delete_batch(",
-        "pub fn server_switch(",
+        "pub async fn server_switch(",
     ] {
         assert!(src.contains(anchor), "锚点消失，守卫已失去判据: {anchor}");
     }
@@ -384,7 +423,7 @@ fn both_delete_commands_prune_recent_ids() {
     let single = body_of("pub fn server_delete(", "pub fn server_delete_batch(");
     // D14：`server_get_all`（死 IPC command，D12 已删前端调用点）已退役，`server_delete_batch`
     // 之后紧邻的下一个命令签名改为 `server_switch`。
-    let batch = body_of("pub fn server_delete_batch(", "pub fn server_switch(");
+    let batch = body_of("pub fn server_delete_batch(", "pub async fn server_switch(");
 
     assert!(
         single.contains("prune_recent_server_ids_to_existing("),
@@ -396,7 +435,7 @@ fn both_delete_commands_prune_recent_ids() {
     );
     // 反向自检：切片确实各自独立（否则「两段都命中」可能只是因为切成了同一段整文件）。
     assert!(!single.contains("pub fn server_delete_batch("));
-    assert!(!batch.contains("pub fn server_switch("));
+    assert!(!batch.contains("pub async fn server_switch("));
 }
 
 #[test]

@@ -514,6 +514,12 @@ jobs:
       - name: Fetch sing-box core (SHA256-pinned)
         run: node scripts/fetch-core.mjs
 
+      # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
+      # REQUIRE 仅限本步，缺任一 manifest 平台时不能以本机允许的 skip 冒充验证通过。
+      - name: Bundled core gRPC wire contract (all platforms)
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
 
       # 依赖指纹门：随包核里 sing-tun 的版本一动就红。
       #

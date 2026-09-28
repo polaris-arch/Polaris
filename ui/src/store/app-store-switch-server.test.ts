@@ -11,9 +11,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { ServerSwitchReceipt } from '../contracts/server-switch';
 
 // api 必须在 import store 之前 mock（store 模块顶层 import 了它）。
-const switchMock = vi.fn(async (_id: string) => undefined);
+const switchMock = vi.fn(async (_id: string): Promise<ServerSwitchReceipt> => ({ status: 'applied' }));
 const configGetMock = vi.fn(async () => authoritativeConfig('__direct__'));
 vi.mock('../ipc', () => ({
   api: {
@@ -49,7 +50,7 @@ function authoritativeConfig(selectedServerId: string) {
 describe('app-store switchServer', () => {
   beforeEach(async () => {
     switchMock.mockReset();
-    switchMock.mockResolvedValue(undefined);
+    switchMock.mockResolvedValue({ status: 'applied' });
     configGetMock.mockReset();
     configGetMock.mockImplementation(async () =>
       authoritativeConfig(switchMock.mock.calls.slice(-1)[0]?.[0] ?? '__direct__'),
@@ -68,6 +69,27 @@ describe('app-store switchServer', () => {
     expect(s.selectedServerId).toBe('n-hk');
     // ↓ 这一条就是本 bug 的根因断言：漏了它，起核就会按 `__direct__` 落直连。
     expect(s.config?.selectedServerId).toBe('n-hk');
+  });
+
+  it('已保存但未应用时仍同步磁盘选择，并把权威回执交给 UI', async () => {
+    seed('n-old');
+    switchMock.mockResolvedValueOnce({ status: 'deferred', reason: 'nodeRequiresApply' });
+    const receipt = await useAppStore.getState().switchServer('n-new');
+    expect(receipt).toEqual({ status: 'deferred', reason: 'nodeRequiresApply' });
+    expect(useAppStore.getState().config?.selectedServerId).toBe('n-new');
+    expect(useAppStore.getState().selectedServerId).toBe('n-new');
+  });
+
+  it('旧选择被接管时保留后端最新磁盘选择，并传回 superseded', async () => {
+    seed('n-old');
+    switchMock.mockResolvedValueOnce({ status: 'superseded' });
+    configGetMock.mockResolvedValueOnce(authoritativeConfig('n-newer'));
+
+    const receipt = await useAppStore.getState().switchServer('n-stale');
+
+    expect(receipt).toEqual({ status: 'superseded' });
+    expect(useAppStore.getState().selectedServerId).toBe('n-newer');
+    expect(useAppStore.getState().config?.selectedServerId).toBe('n-newer');
   });
 
   it('config 里绝不残留旧的直连哨兵（起核按它走会落明文直连）', async () => {
@@ -111,8 +133,8 @@ describe('app-store switchServer', () => {
     seed('n-a');
     let releaseFirst!: () => void;
     switchMock.mockImplementationOnce(
-      () => new Promise<undefined>((resolve) => {
-        releaseFirst = () => resolve(undefined);
+      () => new Promise<{ status: 'applied' }>((resolve) => {
+        releaseFirst = () => resolve({ status: 'applied' });
       }),
     );
 

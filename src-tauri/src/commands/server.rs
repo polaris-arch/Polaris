@@ -15,17 +15,20 @@
 //! 节点 CRUD 经 config 的 load/save（servers 数组原地改 + 原子写）+ 广播 event:configChanged。
 //! DIRECT_SERVER_ID 哨兵 + 删选中节点的兜底出口逻辑对齐 Polaris（D4/F-1）。
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, State};
 
 use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 use polaris_config_engine::user_config::server_config::ServerConfig;
+use polaris_config_engine::user_config::ProxyMode;
 use polaris_mesh::warp_http::RegisterOptions;
 
-use crate::commands::config::broadcast_config_changed;
+use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
-use crate::runtime::proxy::code;
+use crate::runtime::proxy::{code, SwitchOutcome};
 use crate::runtime::tailscale_login_core::StartLoginOutcome;
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
 use crate::runtime::AppRuntime;
@@ -468,9 +471,9 @@ fn server_switch_core<F>(
     server_id: &str,
     validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
     register_intent: F,
-) -> Result<(Value, bool), ServerSwitchError>
+) -> Result<(Value, bool, u64), ServerSwitchError>
 where
-    F: FnOnce(),
+    F: FnOnce() -> u64,
 {
     let mut validate_candidate = Some(validate_candidate);
     let mut register_intent = Some(register_intent);
@@ -483,7 +486,7 @@ where
                     arr.iter()
                         .any(|s| s.get("id").and_then(Value::as_str) == Some(server_id))
                 });
-            if !exists {
+            if !exists && server_id != DIRECT_SERVER_ID && server_id != BLOCK_SERVER_ID {
                 return Decision::Skip(Err(ServerSwitchError::Other(format!(
                     "服务器不存在: {server_id}"
                 ))));
@@ -504,6 +507,13 @@ where
                     ))));
                 }
             };
+            // Block is emitted as reject routes, not as a selector member. A running
+            // direct-mode core cannot honor a saved block selection.
+            if server_id == BLOCK_SERVER_ID && candidate.proxy_mode == ProxyMode::Direct {
+                return Decision::Skip(Err(ServerSwitchError::Other(
+                    "直连模式下不能选择阻断".to_string(),
+                )));
+            }
             if let Err(message) =
                 validate_candidate
                     .take()
@@ -513,18 +523,49 @@ where
             }
             // 必须在 ConfigManager 的写事务内取得 selector 所有权：若先写 D、解锁后才 bump，auto
             // rollback 可在间隙内看到“D 仍等于候选”并覆盖一次同目标的用户新意图。
-            register_intent
+            let intent_generation = register_intent
                 .take()
-                .expect("server_switch 的 Write 腿只能执行一次")();
+                .expect("server_switch 的 Write 腿只能执行一次")(
+            );
             if let Some(obj) = cfg.as_object_mut() {
-                push_recent_server_id(obj, server_id);
+                if server_id != DIRECT_SERVER_ID && server_id != BLOCK_SERVER_ID {
+                    push_recent_server_id(obj, server_id);
+                }
             }
-            Decision::Write(Ok(exit_changed))
+            Decision::Write(Ok((exit_changed, intent_generation)))
         })
         .map_err(|e| ServerSwitchError::Other(format!("{e}")))?;
-    let exit_changed = exit_changed?;
+    let (exit_changed, intent_generation) = exit_changed?;
     let cfg = saved.expect("server_switch 的 Write 腿必须返回已落盘配置");
-    Ok((cfg, exit_changed))
+    Ok((cfg, exit_changed, intent_generation))
+}
+
+/// 保存选择与实际运行态分开回执；只有严格读回才报告 applied。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerSwitchReceipt {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+impl ServerSwitchReceipt {
+    pub(crate) fn status(&self) -> &'static str {
+        self.status
+    }
+
+    fn from_outcome(outcome: Option<SwitchOutcome>) -> Self {
+        let (status, reason) = match outcome {
+            Some(SwitchOutcome::HotSwitched | SwitchOutcome::NoOp | SwitchOutcome::Unchanged) => {
+                ("applied", None)
+            }
+            Some(SwitchOutcome::Pending | SwitchOutcome::Restarting) => ("pending", None),
+            Some(SwitchOutcome::NotRunning) => ("notRunning", None),
+            Some(SwitchOutcome::Deferred) => ("deferred", Some("nodeRequiresApply")),
+            None => ("superseded", None),
+        };
+        Self { status, reason }
+    }
 }
 
 /// 上游 `SERVER_SWITCH`：切换选中节点。
@@ -533,39 +574,46 @@ where
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn server_switch(
+pub async fn server_switch(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     server_id: String,
-) -> ApiResponse<()> {
+) -> Result<ApiResponse<ServerSwitchReceipt>, ()> {
     match server_switch_core(
         state.config(),
         &server_id,
         |candidate| {
             state
                 .proxy()
-                .validate_required_bind_interfaces_blocking(candidate)
+                .validate_selected_server_candidate_blocking(candidate)
         },
-        || {
-            state.proxy().register_selector_intent();
-        },
+        || state.proxy().register_selector_intent(),
     ) {
-        Ok((cfg, exit_changed)) => {
-            broadcast_config_changed(&app, &cfg);
-            // A7：换节点 = 出口 identity 变 → 作废旧出口的解锁探测缓存（否则解锁角标最长陈旧 30min，
-            // 即缓存 FRESH_TTL）。重选同一节点（identity 未变）不失效，避免白刷探测。
-            // exit_blocked=false：切换瞬间尚未探新出口，交前端按 running 复位「检测中」并重跑（对齐 invalidate 契约）。
-            if exit_changed {
-                let sink = BroadcastSink::new(&app);
-                let running = state.proxy().status().running;
-                state.unlock().invalidate(&sink, running, false);
+        Ok((_cfg, _exit_changed, intent_generation)) => {
+            // Only signal disk observers. A regular config broadcast would Apply unrelated D debt.
+            emit_config_changed_signal(&app);
+            let starting_generation = state.proxy().core_generation();
+            match state
+                .proxy
+                .switch_selected_server_if_current(&server_id, intent_generation)
+                .await
+            {
+                Ok(outcome) => {
+                    let outcome = state.proxy().settle_selected_switch_receipt(
+                        outcome,
+                        starting_generation,
+                        intent_generation,
+                    );
+                    Ok(ApiResponse::ok(ServerSwitchReceipt::from_outcome(outcome)))
+                }
+                Err(error) => Ok(ApiResponse::err(error)),
             }
-            ok_void()
         }
-        Err(ServerSwitchError::InterfaceUnavailable(message)) => {
-            ApiResponse::err_with_code(message, code::OUTBOUND_INTERFACE_UNAVAILABLE)
-        }
-        Err(ServerSwitchError::Other(message)) => ApiResponse::err(message),
+        Err(ServerSwitchError::InterfaceUnavailable(message)) => Ok(ApiResponse::err_with_code(
+            message,
+            code::OUTBOUND_INTERFACE_UNAVAILABLE,
+        )),
+        Err(ServerSwitchError::Other(message)) => Ok(ApiResponse::err(message)),
     }
 }
 

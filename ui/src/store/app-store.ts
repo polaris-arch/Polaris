@@ -18,6 +18,7 @@ import type {
 } from '../contracts/types';
 import type { UnlockResult, UnlockEgress, UnlockSnapshot } from '../contracts/unlock-detection';
 import type { TailscaleStatusEvent } from '../contracts/tailscale-status';
+import type { ServerSwitchReceipt } from '../contracts/server-switch';
 import { api } from '../ipc';
 import { withConfigWriteLock } from '../lib/config-write-lock';
 import { replay, type StagedEntry } from '../lib/staged-config';
@@ -171,7 +172,7 @@ export interface AppState {
   updateProxyMode: (mode: ProxyMode) => Promise<void>;
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
-  switchServer: (serverId: string) => Promise<void>;
+  switchServer: (serverId: string) => Promise<ServerSwitchReceipt>;
   setProxyStatus: (status: ProxyStatus | null) => void;
   refreshProxyStatus: () => Promise<void>;
   setTrafficStats: (stats: TrafficStats | null) => void;
@@ -375,9 +376,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   switchServer: async (serverId) => {
     // 与暂存保存/配置补丁共用同一条 webview 内写队列：快速连点必须按调用顺序落盘，
     // 否则较慢的旧 IPC 可能最后回包，把最后一次点击覆盖回旧节点。
-    const config = await withConfigWriteLock(async () => {
-      await api.server.switch(serverId);
-      return api.config.get();
+    const { receipt, config } = await withConfigWriteLock(async () => {
+      const receipt = await api.server.switch(serverId);
+      return { receipt, config: await api.config.get() };
     });
     invalidateLoadConfig();
     set({
@@ -388,6 +389,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       dnsRules: config.dnsRules ?? [],
     });
     hydrateStagedConfig(config);
+    return receipt;
   },
 
   setProxyStatus: (status) => set({ proxyStatus: status }),

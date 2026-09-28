@@ -133,6 +133,17 @@ jobs:
           rustup default stable
           rustc -Vv
 
+      - name: Fetch pinned protoc for gRPC wire check
+        if: needs.classify.outputs.kernel == 'true'
+        run: node scripts/fetch-protoc.mjs
+
+      # 只读四平台 core descriptor，不启动 sing-box；REQUIRE 仅作用于本步。
+      - name: Bundled core gRPC wire contract (all platforms)
+        if: needs.classify.outputs.kernel == 'true'
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
+
       # release-risk 的真核门只在 Ubuntu 跑：只需 Linux SO；两个 go.mod 依赖仍由脚本交叉校验。
       - name: Fetch cronet library (Linux)
         if: needs.classify.outputs.kernel == 'true'

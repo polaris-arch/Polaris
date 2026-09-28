@@ -54,8 +54,8 @@ const ACTION_CHANNELS_BANNED_SWALLOWS = [
   'TRAY_QUIT).catch(() => {})',
 ] as const;
 
-/** TrayMenu 里 `noticeActionFailure` 的调点数：定义 1 + 八个动作 handler（六改 + lockNow/onSpeedTest）+ 五个按钮包裹。 */
-const NOTICE_CALL_SITES = 14;
+/** TrayMenu 里 `noticeActionFailure` 的调点数：三种出口选择共用一个失败回显，其余动作独立保留。 */
+const NOTICE_CALL_SITES = 12;
 
 /** lockNow 的顺序语义（Med-1）：必须「await 成功 → 才 hide」。先 hide 再 await 的旧序在失败时
  * 连 notice 都无处显示。以 indexOf 顺序钉住——重排回去（hide 在 await 之前）即红。 */

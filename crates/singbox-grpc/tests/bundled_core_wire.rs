@@ -1,4 +1,4 @@
-//! vendored proto ⇄ 随包内核 wire 契约门（开发机侧）。
+//! vendored proto ⇄ 随包内核 wire 契约门（开发机与 CI 静态对拍）。
 //!
 //! # 与 `mock_server.rs` 的分工
 //!
@@ -9,7 +9,7 @@
 //!
 //! # 各测试的信息量边界（重要，别把 skip 当绿）
 //!
-//! | 测试 | 需要真核 | CI（无核）跑吗 | 它能证明什么 |
+//! | 测试 | 需要盘上真核 | 普通 `ci.yml`（无核） | 它能证明什么 |
 //! |---|---|---|---|
 //! | `machinery_detects_field_number_drift` | 否 | **跑** | 解析器 + 对拍器本身是活的：字段号被改一位必被抓出 |
 //! | `machinery_detects_enum_value_drift` | 否 | **跑** | 枚举那条腿同样是活的（含「值号 0 合法」这一格） |
@@ -19,11 +19,12 @@
 //! | `every_checked_symbol_has_a_recorded_layout` | 否 | **跑** | 进对拍表的符号都留了「核对过真核」的书面证据 |
 //! | `manifest_key_reader_has_teeth` | 否 | **跑** | 平台枚举的读取器真读得出、且看不懂时真报错（不返回空表） |
 //! | `core_platform_enumeration_comes_from_the_manifest` | 否 | **跑** | 覆盖轴取自 manifest，路径由 key 推导（加平台自动跟上） |
-//! | `vendored_proto_matches_every_bundled_core` | 是 | 跳过（**静默**） | vendored proto 与**盘上真核**一致；孤儿核即红 |
+//! | `vendored_proto_matches_every_bundled_core` | 是 | 执行但跳过对拍（**静默**） | vendored proto 与**盘上真核**一致；孤儿核即红 |
 //!
-//! 只有最后一条依赖真核，而 `ci.yml` 不拉核（只造 `.keep` 占位目录）。故 CI 上它恒跳过 ——
-//! 这不是把门做空：真核那条腿的牙在 `build.rs` 的 release-only 断言上（`package.yml` 构建前四平台
-//! 全拉核），其余几条则保证「门自己没坏」和「proto 没被改坏」在每一次 CI 都被验一遍。
+//! 只有最后一条依赖盘上真核。普通 `ci.yml` 不拉核（只造 `.keep` 占位目录），该测试虽执行，
+//! 但没有 descriptor 可对拍。`package.yml` 与 `release-risk.yml` 在全平台 fetch 后分别以仅限本步的
+//! `POLARIS_REQUIRE_KERNEL_GATE=1` 精确执行该测试：缺任一 manifest 平台即红，对每份盘上核逐个对拍，
+//! 不启动 sing-box。`build.rs` 的 release-only 断言仍守打包构型；无核的机制测试在普通 CI 继续运行。
 //!
 //! # 换核之后会发生什么（这是设计意图，不是维护负担）
 //!
@@ -955,9 +956,9 @@ fn manifest_key_reader_has_teeth() {
 ///   覆盖轴上 —— 这正是「少看一个平台」的另一种形态，且盘上有核就能当场发现，不必等打包腿。
 /// - **缺平台**（manifest 声明、盘上没有）⇒ `POLARIS_REQUIRE_KERNEL_GATE=1` 下红（打包腿一律全拉），
 ///   否则报告：开发机 `fetch:core --platform=linux` 只拉一份是常态，在那里硬红只会让人关掉门。
-/// - **一份都没有** ⇒ 跳过。🔴 **「跳过」是静默的，别把它读成会自曝**：下面那句 `eprintln!` 归
-///   libtest 捕获，只在测试失败时才回放（2026-08-07 实测更正）。⇒ CI ubuntu 腿（不拉核）上这条绿
-///   只说明「编得过」，没有比对过任何东西。真核那条腿的牙在 release 构型下的 `build.rs`。
+/// - **一份都没有且未设 REQUIRE** ⇒ 跳过。🔴 **「跳过」是静默的，别把它读成会自曝**：下面那句
+///   `eprintln!` 归 libtest 捕获，只在测试失败或显式 `--nocapture` 时展示。普通 `ci.yml` 无核时
+///   这条绿只说明「编得过」，没有对拍任何核；Package / Release Risk 的 scoped REQUIRE 会先因缺平台转红。
 #[test]
 fn vendored_proto_matches_every_bundled_core() {
     let survey = proto_wire_check::survey_bundled_cores();
@@ -989,9 +990,9 @@ fn vendored_proto_matches_every_bundled_core() {
     if survey.present.is_empty() {
         eprintln!(
             "[skip] 随包内核不在盘上（resources/*/sing-box），本条跳过。\n\
-             \x20      这是 CI 的常态（ci.yml 不拉核，只造 .keep 占位目录），**不代表契约已验证**。\n\
+             \x20      普通 ci.yml 不拉核（只造 .keep 占位目录），**不代表契约已验证**。\n\
              \x20      本机要跑它：node scripts/fetch-core.mjs --platform=linux\n\
-             \x20      出包腿的硬门在 crates/singbox-grpc/build.rs（release-only）。"
+             \x20      Package / Release Risk 全平台 fetch 后以 scoped REQUIRE 精确对拍；release build.rs 另守打包构型。"
         );
         return;
     }

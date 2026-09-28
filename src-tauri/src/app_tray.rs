@@ -916,6 +916,18 @@ pub(crate) fn notify_menu_response_failure<T>(
     true
 }
 
+/// Native tray has no persistent notice area; only receipts that still need user attention
+/// produce a localized system notification. A superseded request is owned by its successor.
+pub(crate) fn native_exit_selection_notice(status: &str) -> Option<&'static str> {
+    match status {
+        "applied" | "superseded" => None,
+        "pending" => Some(crate::i18n::key::TRAY_SWITCH_PENDING),
+        "notRunning" => Some(crate::i18n::key::TRAY_SWITCH_SAVED_FOR_NEXT_START),
+        "deferred" => Some(crate::i18n::key::TRAY_SWITCH_REQUIRES_APPLY),
+        _ => Some(crate::i18n::key::NATIVE_UNKNOWN_ERROR),
+    }
+}
+
 /// Linux 原生菜单动作执行（副作用腿）。
 ///
 /// 业务动作**复用 `commands::*` 里那几个 `#[tauri::command]` 函数本体**，不另写一份：它们同时也是浮层
@@ -1039,19 +1051,11 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
             };
 
             let app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            tauri::async_runtime::spawn(async move {
                 let lang = i18n::app_lang(&app);
                 let state = app.state::<AppRuntime>();
-                let (response, action_key) = if server_id == DIRECT_SERVER_ID {
-                    (
-                        commands::config::config_set_value(
-                            app.clone(),
-                            state,
-                            "selectedServerId".to_string(),
-                            serde_json::Value::String(server_id),
-                        ),
-                        i18n::key::TRAY_MODE_DIRECT,
-                    )
+                let action_key = if server_id == DIRECT_SERVER_ID {
+                    i18n::key::TRAY_MODE_DIRECT
                 } else if server_id == BLOCK_SERVER_ID {
                     // 菜单打开后配置仍可能被别的窗口改成 direct；执行腿二次守门，不能只信旧菜单的 disabled。
                     let direct = state
@@ -1070,22 +1074,60 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
                         );
                         return;
                     }
-                    (
-                        commands::config::config_set_value(
-                            app.clone(),
-                            state,
-                            "selectedServerId".to_string(),
-                            serde_json::Value::String(server_id),
-                        ),
-                        i18n::key::TRAY_BLOCKED,
-                    )
+                    i18n::key::TRAY_BLOCKED
                 } else {
-                    (
-                        commands::server::server_switch(app.clone(), state, server_id),
-                        i18n::key::TRAY_NODES,
-                    )
+                    i18n::key::TRAY_NODES
                 };
-                notify_menu_response_failure(&app, lang, action_key, &response);
+                let node_label = if server_id == DIRECT_SERVER_ID || server_id == BLOCK_SERVER_ID {
+                    i18n::t(lang, action_key)
+                } else {
+                    state
+                        .config()
+                        .with_current(|config| {
+                            config
+                                .get("servers")
+                                .and_then(serde_json::Value::as_array)
+                                .and_then(|servers| {
+                                    servers.iter().find(|server| {
+                                        server.get("id").and_then(serde_json::Value::as_str)
+                                            == Some(server_id.as_str())
+                                    })
+                                })
+                                .and_then(|server| server.get("name"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| i18n::t(lang, action_key))
+                };
+                match commands::server::server_switch(app.clone(), state, server_id).await {
+                    Ok(response) => {
+                        if notify_menu_response_failure(&app, lang, action_key, &response) {
+                            return;
+                        }
+                        if let Some(receipt) = response.data.as_ref() {
+                            if let Some(key) = native_exit_selection_notice(receipt.status()) {
+                                let title = i18n::t(lang, action_key);
+                                let body = i18n::t(lang, key).replace("{{node}}", &node_label);
+                                notify_user(&app, &title, &body);
+                            }
+                        } else {
+                            notify_menu_action_error(
+                                &app,
+                                lang,
+                                action_key,
+                                &i18n::t(lang, i18n::key::NATIVE_UNKNOWN_ERROR),
+                            );
+                        }
+                    }
+                    Err(()) => notify_menu_action_error(
+                        &app,
+                        lang,
+                        action_key,
+                        &i18n::t(lang, i18n::key::NATIVE_UNKNOWN_ERROR),
+                    ),
+                }
             });
         }
         MenuAction::SpeedTest => {

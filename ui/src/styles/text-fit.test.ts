@@ -594,9 +594,10 @@ function connTableFixedCols(): { key: string; cls: string }[] {
  */
 function trayKeys(): string[] {
   const s = src('../tray/TrayMenu.tsx');
+  const receipt = src('../tray/switch-receipt.ts');
   // 键后跟 `)`（单参）或 `,`（带 vars 的插值形态，如 W14 的 `t('tray.actionFailed', {…})`）。
   // 消费点检测不需要解析参数——只认 `t('key')` 的话，插值键会从扫描器缝里漏成「死键」假红。
-  const inline = grepAll(s, /\bt\('(tray\.[\w]+)'[),]/g, "TrayMenu t('tray.x') 键").map((m) => m[1]);
+  const inline = grepAll(s + receipt, /\bt\('(tray\.[\w]+)'[),]/g, "TrayMenu t('tray.x') 键").map((m) => m[1]);
   const tables = grepAll(s, /\bk:\s*'(tray\.[\w]+)'/g, 'TrayMenu MODES/TAKEOVERS 表键').map((m) => m[1]);
   return [...new Set([...inline, ...tables])];
 }
@@ -1231,6 +1232,9 @@ const TRAY_SLOT: Record<
   'tray.fakeIpAutoEnabled': 'NOTE',
   'tray.noTestableNodes': 'NOTE',
   'tray.checkingUpdate': 'NOTE',
+  'tray.switchPending': 'NOTE',
+  'tray.switchSavedForNextStart': 'NOTE',
+  'tray.switchRequiresApply': 'NOTE',
   // 检查结果不再占 tray-note 新行，而是检查更新按钮右侧的固定宽短徽标。
   'tray.upToDate': 'BADGE',
   'tray.updateCheckFailed': 'BADGE',

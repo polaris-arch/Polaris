@@ -41,7 +41,10 @@
     "quit": "Quit Polaris",
     "manageInMain": "Manage in main window…",
     "actionFailed": "\"{{action}}\" failed: {{detail}}",
-    "actionFailedDetail": "The operation could not be completed"
+    "actionFailedDetail": "The operation could not be completed",
+    "switchPending": "Switch to {{node}} requested; check connection status",
+    "switchSavedForNextStart": "{{node}} saved for the next connection",
+    "switchRequiresApply": "{{node}} saved; apply pending changes before use"
   },
   "updatePopup": {
     "newVersion": "New version {{version}}",

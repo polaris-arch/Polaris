@@ -580,6 +580,29 @@ fn sentinel_selection_keeps_cascading_node_groups_available() {
 }
 
 #[test]
+fn native_exit_selection_receipts_distinguish_applied_pending_and_saved() {
+    use crate::i18n::key;
+    assert_eq!(native_exit_selection_notice("applied"), None);
+    assert_eq!(native_exit_selection_notice("superseded"), None);
+    assert_eq!(
+        native_exit_selection_notice("pending"),
+        Some(key::TRAY_SWITCH_PENDING)
+    );
+    assert_eq!(
+        native_exit_selection_notice("notRunning"),
+        Some(key::TRAY_SWITCH_SAVED_FOR_NEXT_START)
+    );
+    assert_eq!(
+        native_exit_selection_notice("deferred"),
+        Some(key::TRAY_SWITCH_REQUIRES_APPLY)
+    );
+    assert_eq!(
+        native_exit_selection_notice("unknown"),
+        Some(key::NATIVE_UNKNOWN_ERROR)
+    );
+}
+
+#[test]
 fn menu_model_gate_repaints_on_every_field_and_only_then() {
     use crate::i18n::Lang;
     let base = TrayMenuModel {

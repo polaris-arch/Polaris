@@ -356,6 +356,9 @@ pub mod key {
     pub const TRAY_BLOCKED: &str = "tray.blocked";
     /// 直连模式下无效。
     pub const TRAY_NO_EFFECT_IN_DIRECT: &str = "tray.noEffectInDirect";
+    pub const TRAY_SWITCH_PENDING: &str = "tray.switchPending";
+    pub const TRAY_SWITCH_SAVED_FOR_NEXT_START: &str = "tray.switchSavedForNextStart";
+    pub const TRAY_SWITCH_REQUIRES_APPLY: &str = "tray.switchRequiresApply";
     /// 接管方式子菜单标题。
     pub const TRAY_GROUP_TAKEOVER: &str = "tray.groupTakeover";
     /// 分流策略子菜单标题。

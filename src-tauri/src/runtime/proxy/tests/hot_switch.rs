@@ -1,4 +1,903 @@
 use super::*;
+use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
+
+fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
+    let (rt, dir) = test_runtime();
+    let running = two_node_config(7891, "node-a");
+    rt.config.save_full(&running).expect("seed D");
+    mark_running_with_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let sink = Arc::new(TestPutSink::default());
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    (rt, dir, sink, running)
+}
+
+#[tokio::test]
+async fn block_saved_over_direct_running_mode_is_deferred_without_false_blocking() {
+    let (rt, _dir, sink, mut running) = explicit_selection_fixture();
+    running["proxyMode"] = serde_json::json!("direct");
+    mark_running_with_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let mut disk = running.clone();
+    disk["proxyMode"] = serde_json::json!("smart");
+    disk["selectedServerId"] = serde_json::json!(BLOCK_SERVER_ID);
+    rt.config.save_full(&disk).unwrap();
+    let intent = rt.register_selector_intent();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current(BLOCK_SERVER_ID, intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Deferred)
+    );
+    assert!(sink.calls().is_empty());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
+    );
+    assert_eq!(rt.current_config_snapshot().unwrap()["proxyMode"], "direct");
+    assert!(rt.pending_changes().restart_deferred);
+}
+
+#[tokio::test]
+async fn entering_and_leaving_block_restart_only_the_running_projection() {
+    for (old, new) in [("node-a", BLOCK_SERVER_ID), (BLOCK_SERVER_ID, "node-a")] {
+        let (rt, _dir, sink, _) = explicit_selection_fixture();
+        let mut running = two_node_config(7891, old);
+        running["proxyMode"] = serde_json::json!("smart");
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_snapshot(&rt, &running);
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!(new);
+        disk["logLevel"] = serde_json::json!("debug");
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+
+        assert_eq!(
+            rt.switch_selected_server_if_current(new, intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Restarting),
+            "{old} -> {new} must regenerate reject routes"
+        );
+        assert!(sink.calls().is_empty(), "block has no selector member");
+        let (_, projected, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+        assert_eq!(
+            source,
+            ForceRestartSource::Selected {
+                intent_generation: intent
+            }
+        );
+        assert_eq!(projected["selectedServerId"], new);
+        assert_eq!(
+            projected["logLevel"], running["logLevel"],
+            "D debt leaked into R'"
+        );
+        assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectedServerId"],
+            old
+        );
+        rt.gate.bump_generation(); // Fake core must not execute the scheduled restart.
+    }
+}
+
+#[tokio::test]
+async fn already_blocked_requires_ready_startup_proof_before_applied_receipt() {
+    for has_startup_proof in [true, false] {
+        let (rt, _dir, sink, _) = explicit_selection_fixture();
+        let mut running = two_node_config(7891, BLOCK_SERVER_ID);
+        running["proxyMode"] = serde_json::json!("smart");
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_snapshot(&rt, &running);
+        *rt.startup_snapshot.write().unwrap() = has_startup_proof.then_some(running.clone());
+        let mut disk = running.clone();
+        disk["logLevel"] = serde_json::json!("debug");
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+
+        let outcome = rt
+            .switch_selected_server_if_current(BLOCK_SERVER_ID, intent)
+            .await
+            .unwrap();
+        assert!(sink.calls().is_empty(), "block must never be PUT");
+        if has_startup_proof {
+            assert!(matches!(
+                outcome,
+                Some(SwitchOutcome::Unchanged | SwitchOutcome::NoOp)
+            ));
+            assert!(rt.pending_force_restart.read().unwrap().is_none());
+            assert_eq!(
+                rt.current_config_snapshot().unwrap()["logLevel"],
+                running["logLevel"]
+            );
+            assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+        } else {
+            assert_eq!(outcome, Some(SwitchOutcome::Restarting));
+            let projected = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
+            assert_eq!(projected["selectedServerId"], BLOCK_SERVER_ID);
+            assert_eq!(projected["logLevel"], running["logLevel"]);
+            rt.gate.bump_generation(); // Fake core must not execute the scheduled restart.
+        }
+    }
+}
+
+#[tokio::test]
+async fn clean_mesh_selection_that_changes_routes_restarts_only_the_running_projection() {
+    let mut ts_routes = mesh_only_ts_node("ts-routes", "TS Routes");
+    ts_routes["tailscaleSettings"]["exitNode"] = serde_json::json!("peer-exit");
+    ts_routes["tailscaleSettings"]["alwaysRouteSubnets"] = serde_json::json!(false);
+    for (label, node) in [
+        (
+            "TS without public exit flips final-route fallback",
+            mesh_only_ts_node("ts-mesh", "TS Mesh"),
+        ),
+        (
+            "TS selected-only tailnet CIDRs change route rules",
+            ts_routes,
+        ),
+        (
+            "WG selected-only subnets change route rules",
+            valid_force_route_wg_node("wg-force", "WG Force"),
+        ),
+    ] {
+        let target = node["id"].as_str().expect("target id").to_string();
+        let (rt, _dir) = test_runtime();
+        let running = config_with_nodes("node-a", &[node]);
+        rt.config.save_full(&running).expect("seed running D");
+        let running = rt
+            .config
+            .current()
+            .expect("running snapshot uses persisted config");
+        mark_running_with_named_snapshot(&rt, &running);
+        cover_running_binding_roots(&rt, &running);
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!(target);
+        disk["logLevel"] = serde_json::json!("debug");
+        disk["dnsConfig"]["enableFakeIp"] = serde_json::json!(false);
+        disk["trafficRules"] = serde_json::json!([{
+            "id": "saved-only-rule", "remarks": "saved-only-rule", "type": "ruleSet",
+            "values": ["res:synthetic"], "action": "proxy", "enabled": true
+        }]);
+        rt.config
+            .save_full(&disk)
+            .expect("save selected id with unrelated D debt");
+        let persisted = rt.config.current().expect("read saved selection");
+        {
+            let snap = rt.switch_snapshot.read().unwrap();
+            let snapshot = snap.as_ref().expect("running selector snapshot");
+            assert!(
+                snapshot.id_to_tag.contains_key(&target),
+                "{label}: target must survive persistence"
+            );
+            assert!(
+                snapshot.fingerprints.contains_key(&target),
+                "{label}: target has a running fingerprint"
+            );
+            assert_eq!(
+                node_fingerprints::modified_table_json(&persisted).get(&target),
+                snapshot.fingerprints.get(&target),
+                "{label}: target must remain a clean running member"
+            );
+        }
+        assert!(
+            !rt.config.staged_node_mask().pending,
+            "{label}: no unsaved draft"
+        );
+        let intent = rt.register_selector_intent();
+        assert_eq!(
+            rt.switch_selected_server_if_current(&target, intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Restarting),
+            "{label}: clean runtime member needs a selected-only restart"
+        );
+        let pending = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
+        assert_eq!(pending["selectedServerId"], target, "{label}");
+        assert_eq!(
+            pending["logLevel"], running["logLevel"],
+            "{label}: D log debt leaked into R"
+        );
+        assert_eq!(
+            pending["dnsConfig"], running["dnsConfig"],
+            "{label}: D DNS debt leaked into R"
+        );
+        assert_eq!(
+            pending["trafficRules"], running["trafficRules"],
+            "{label}: D rule debt leaked into R"
+        );
+        assert_eq!(
+            rt.config.current().unwrap()["logLevel"],
+            "debug",
+            "{label}: disk D must remain saved"
+        );
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectedServerId"],
+            "node-a",
+            "{label}: no applied receipt before restart succeeds"
+        );
+        assert!(
+            rt.pending_changes().restart_deferred,
+            "{label}: restart debt remains visible"
+        );
+        rt.gate.bump_generation(); // Fake runtime must never execute the scheduled restart.
+    }
+}
+
+#[tokio::test]
+async fn leaving_an_openvpn_mesh_exit_restarts_the_running_projection() {
+    let (rt, _dir) = test_runtime();
+    let running = config_with_nodes(
+        "ovpn-mesh",
+        &[valid_mesh_only_openvpn_node("ovpn-mesh", "OVPN Mesh")],
+    );
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    cover_running_binding_roots(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let sink = Arc::new(TestPutSink::default());
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-a");
+    rt.config.save_full(&disk).unwrap();
+    let intent = rt.register_selector_intent();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-a", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Restarting),
+        "leaving a mesh-only exit removes the direct fallback route"
+    );
+    assert!(
+        sink.calls().is_empty(),
+        "a route-changing selection must not PUT"
+    );
+    let projected = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
+    assert_eq!(projected["selectedServerId"], "node-a");
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "ovpn-mesh"
+    );
+    rt.gate.bump_generation();
+}
+
+#[tokio::test]
+async fn successful_new_selection_cancels_an_older_selected_restart_timer() {
+    let (rt, _dir) = test_runtime();
+    let running = config_with_nodes(
+        "node-a",
+        &[
+            mesh_only_ts_node("ts-mesh", "TS Mesh"),
+            ss_node("node-c", "Node C", 18003),
+        ],
+    );
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let sink = Arc::new(TestPutSink::default());
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node C")]);
+    *rt.management_api_stub.lock().unwrap() = Some(sink);
+    let generation = rt.gate.generation();
+
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("ts-mesh");
+    disk["logLevel"] = serde_json::json!("debug");
+    rt.config.save_full(&disk).unwrap();
+    let first = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("ts-mesh", first)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Restarting)
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_some());
+
+    disk["selectedServerId"] = serde_json::json!("node-c");
+    rt.config.save_full(&disk).unwrap();
+    let second = rt.register_selector_intent();
+    let outcome = rt
+        .switch_selected_server_if_current("node-c", second)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, Some(SwitchOutcome::HotSwitched)),
+        "new selection returned {outcome:?}"
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    tokio::time::sleep(
+        polaris_switch_engine::debounced_restart::RESTART_DEBOUNCE + Duration::from_millis(80),
+    )
+    .await;
+    assert_eq!(
+        rt.gate.generation(),
+        generation,
+        "old timer must not stop or restart the running core"
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["logLevel"],
+        running["logLevel"]
+    );
+    assert!(
+        rt.pending_changes().restart_deferred,
+        "saved log debt must remain unapplied"
+    );
+}
+
+#[tokio::test]
+async fn registered_warp_full_tunnel_keeps_the_normal_hot_switch_path() {
+    let mut warp = valid_force_route_wg_node("warp-test", "WARP Test");
+    warp["address"] = serde_json::json!("engage.cloudflareclient.com");
+    warp["port"] = serde_json::json!(2408);
+    warp["wireguardSettings"]["allowedIPs"] = serde_json::json!(["0.0.0.0/0", "::/0"]);
+    warp["wireguardSettings"]["alwaysRouteSubnets"] = serde_json::json!(true);
+    warp["wireguardSettings"]["warpDevice"] =
+        serde_json::json!({ "deviceId": "synthetic-device", "token": "synthetic-token" });
+    let (rt, _dir) = test_runtime();
+    let running = config_with_nodes("node-a", &[warp]);
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    cover_running_binding_roots(&rt, &running);
+    let sink = Arc::new(TestPutSink::default());
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "WARP Test")]);
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    let mut disk = running;
+    disk["selectedServerId"] = serde_json::json!("warp-test");
+    rt.config.save_full(&disk).unwrap();
+    let intent = rt.register_selector_intent();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current("warp-test", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched),
+        "a full-tunnel WARP WireGuard member is not the selected-only route exception"
+    );
+    assert_eq!(
+        sink.calls(),
+        vec![(PROXY_SELECTOR_TAG.into(), "WARP Test".into())]
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn registered_openconnect_and_masque_full_tunnel_keep_selector_hot_switch() {
+    for (label, node) in [
+        (
+            "OpenConnect",
+            serde_json::json!({
+                "id":"oc-full", "name":"OC Full", "protocol":"openconnect",
+                "address":"127.0.0.1", "port":443, "meshRoutes":["10.51.0.0/24"],
+                "openconnectSettings": {
+                    "server":"127.0.0.1:443", "username":"synthetic-user",
+                    "password":"synthetic-password", "flavor":"anyconnect", "system":false
+                }
+            }),
+        ),
+        (
+            "MASQUE",
+            serde_json::json!({
+                "id":"masque-full", "name":"MASQUE Full", "protocol":"masque-client",
+                "address":"127.0.0.1", "port":443, "meshRoutes":["10.52.0.0/24"],
+                "masqueClientSettings":{"path":"/masque", "version":3}
+            }),
+        ),
+    ] {
+        let target = node["id"].as_str().unwrap().to_string();
+        let member = node["name"].as_str().unwrap().to_string();
+        let (rt, _dir) = test_runtime();
+        let running = config_with_nodes("node-a", &[node]);
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_named_snapshot(&rt, &running);
+        cover_running_binding_roots(&rt, &running);
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let sink = Arc::new(TestPutSink::default());
+        *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, &member)]);
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!(target);
+        disk["logLevel"] = serde_json::json!("debug");
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+
+        assert_eq!(
+            rt.switch_selected_server_if_current(&target, intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::HotSwitched),
+            "{label}: full-tunnel endpoint should retain the selector path"
+        );
+        assert_eq!(sink.calls(), vec![(PROXY_SELECTOR_TAG.into(), member)]);
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["logLevel"],
+            running["logLevel"]
+        );
+        assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+    }
+}
+
+#[tokio::test]
+async fn structural_selection_rejects_an_intent_superseded_before_entry() {
+    let (rt, _dir) = test_runtime();
+    let running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
+    rt.config.save_full(&running).unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    let old_intent = rt.register_selector_intent();
+    rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("ts-mesh", old_intent)
+            .await
+            .unwrap(),
+        None,
+        "a newer selection owns the running core before the old intent can queue Restart"
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
+    );
+}
+
+#[tokio::test]
+async fn explicit_selection_requires_runtime_readback_and_keeps_staged_d_out_of_r() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    disk["logLevel"] = serde_json::json!("debug"); // 模拟另一个已保存未 Apply 的生成字段。
+    disk["trafficRules"] = serde_json::json!([{
+        "id": "r1", "remarks": "未应用名称", "type": "ruleSet",
+        "values": ["res:a"], "action": "proxy", "enabled": true
+    }]);
+    rt.config.save_full(&disk).unwrap();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+    let intent = rt.register_selector_intent();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched)
+    );
+    assert_eq!(
+        sink.calls(),
+        vec![(PROXY_SELECTOR_TAG.into(), "Node B".into())]
+    );
+    let runtime = rt.current_config.read().unwrap().clone().unwrap();
+    assert_eq!(runtime["selectedServerId"], "node-b");
+    assert_eq!(runtime["logLevel"], running["logLevel"], "不能夹带完整 D");
+    assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+    assert!(
+        rt.pending_force_restart.read().unwrap().is_none(),
+        "有效热切不得重启"
+    );
+    assert!(
+        rt.pending_changes().restart_deferred,
+        "选择债已清，但 D 的日志/规则改动仍未 Apply，不能把整条欠账提示清掉"
+    );
+    rt.config.save_full(&runtime).unwrap();
+    assert!(
+        !rt.pending_changes().restart_deferred,
+        "磁盘回退到已热切的 R 后欠账自然清除"
+    );
+}
+
+#[tokio::test]
+async fn explicit_direct_sentinel_is_a_clean_runtime_member() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running;
+    disk["selectedServerId"] = serde_json::json!(DIRECT_SERVER_ID);
+    rt.config.save_full(&disk).unwrap();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, DIRECT_TAG)]);
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current(DIRECT_SERVER_ID, intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched),
+        "直连哨兵无需节点指纹，也必须经 proxy-selector 严格读回"
+    );
+    assert_eq!(
+        sink.calls(),
+        vec![(PROXY_SELECTOR_TAG.into(), DIRECT_TAG.into())]
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        DIRECT_SERVER_ID
+    );
+}
+
+#[tokio::test]
+async fn explicit_selection_wrong_or_missing_group_falls_back_to_r_only_restart() {
+    for groups in [
+        Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]),
+        Some(vec![]),
+        None,
+    ] {
+        let (rt, _dir, sink, running) = explicit_selection_fixture();
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!("node-b");
+        disk["logLevel"] = serde_json::json!("debug");
+        rt.config.save_full(&disk).unwrap();
+        *sink.groups.lock().unwrap() = groups;
+        let intent = rt.register_selector_intent();
+
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-b", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Restarting),
+            "错值、缺 selector、读回不可用都不能报已应用"
+        );
+        assert_eq!(
+            rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+            "node-a"
+        );
+        let force = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
+        assert_eq!(force["selectedServerId"], "node-b");
+        assert_eq!(
+            force["logLevel"], running["logLevel"],
+            "fallback 不可夹带 D"
+        );
+        assert!(
+            rt.pending_changes().restart_deferred,
+            "等待重启时选择债可见"
+        );
+        rt.gate.bump_generation(); // 让定时器让位，假核不可真正重启。
+    }
+}
+
+#[tokio::test]
+async fn explicit_selection_superseded_during_put_never_acks_or_restarts() {
+    for stop in [false, true] {
+        let (rt, _dir, sink, running) = explicit_selection_fixture();
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!("node-b");
+        rt.config.save_full(&disk).unwrap();
+        *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+        let owner = Arc::clone(&rt);
+        *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+            if stop {
+                owner.gate.bump_generation();
+                owner.status.write().unwrap().running = false;
+            } else {
+                owner.register_selector_intent();
+            }
+        }));
+        let intent = rt.register_selector_intent();
+
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-b", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Pending)
+        );
+        assert_eq!(
+            rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+            "node-a"
+        );
+        assert!(
+            rt.pending_force_restart.read().unwrap().is_none(),
+            "旧腿不得拉起新核"
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_restart_claim_during_selected_put_queues_current_selection_for_drain() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    rt.config.save_full(&disk).unwrap();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+    let owner = Arc::clone(&rt);
+    *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+        let generation = owner.gate.generation();
+        assert!(owner.gate.try_begin_restart(generation, None).is_some());
+    }));
+    let intent = rt.register_selector_intent();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    assert_eq!(
+        rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+        "node-a",
+        "old R must not be committed after Full restart claims the gate"
+    );
+    assert!(matches!(
+        rt.pending_switch.read().unwrap().as_ref(),
+        Some((_, PendingSwitch::Selected { server_id, intent_generation }))
+            if server_id == "node-b" && *intent_generation == intent
+    ));
+
+    rt.finish_lifecycle(LifecycleKind::Restart);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"] == "node-b" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restart drain must replay the latest selected intent");
+    assert_eq!(sink.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn full_restart_claim_during_unchanged_readback_queues_only_current_selection() {
+    for newer_intent in [false, true] {
+        let (rt, _dir, sink, running) = explicit_selection_fixture();
+        rt.config.save_full(&running).unwrap();
+        *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+        let intent = rt.register_selector_intent();
+        let starting_generation = rt.core_generation();
+        let owner = Arc::clone(&rt);
+        *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
+            if newer_intent {
+                owner.register_selector_intent();
+            } else {
+                let generation = owner.gate.generation();
+                assert!(owner.gate.try_begin_restart(generation, None).is_some());
+            }
+        }));
+
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-a", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Pending)
+        );
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectedServerId"],
+            "node-a"
+        );
+        let queued = rt.pending_switch.read().unwrap().clone();
+        if newer_intent {
+            assert!(queued.is_none(), "superseded intent must never be replayed");
+            assert_eq!(
+                rt.settle_selected_switch_receipt(
+                    Some(SwitchOutcome::Pending),
+                    starting_generation,
+                    intent,
+                ),
+                None,
+                "newer intent must silence the obsolete receipt"
+            );
+        } else {
+            assert!(matches!(
+                queued.as_ref(),
+                Some((_, PendingSwitch::Selected { server_id, intent_generation }))
+                    if server_id == "node-a" && *intent_generation == intent
+            ));
+            assert_eq!(
+                rt.settle_selected_switch_receipt(
+                    Some(SwitchOutcome::Pending),
+                    starting_generation,
+                    intent,
+                ),
+                Some(SwitchOutcome::Pending),
+                "queued same-intent selection must remain visible as pending"
+            );
+            *rt.pending_switch.write().unwrap() = None;
+            assert_eq!(
+                rt.settle_selected_switch_receipt(
+                    Some(SwitchOutcome::Pending),
+                    starting_generation,
+                    intent,
+                ),
+                None,
+                "generation change without an owned replay may not claim pending"
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_selection_receipt_rejects_old_pending_and_old_success() {
+    let (rt, _dir, _sink, _running) = explicit_selection_fixture();
+    let generation = rt.core_generation();
+    let old_intent = rt.register_selector_intent();
+    rt.register_selector_intent();
+    for old in [SwitchOutcome::Pending, SwitchOutcome::HotSwitched] {
+        assert_eq!(
+            rt.settle_selected_switch_receipt(Some(old), generation, old_intent),
+            None,
+            "新选择已接管时旧请求既不可报 applied，也不可伪报 pending"
+        );
+    }
+
+    let current_intent = rt.register_selector_intent();
+    rt.gate.claim_generation(None, LifecycleKind::Stop);
+    assert_eq!(
+        rt.settle_selected_switch_receipt(Some(SwitchOutcome::Pending), generation, current_intent),
+        Some(SwitchOutcome::NotRunning),
+        "Stop 已接管时旧排队回执应说明下次启动才生效"
+    );
+}
+
+#[tokio::test]
+async fn explicit_selection_dirty_target_is_deferred_without_put_and_pending_bar_tracks_it() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    disk["servers"][1]["port"] = serde_json::json!(29002);
+    rt.config.save_full(&disk).unwrap();
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Deferred)
+    );
+    assert!(sink.calls().is_empty());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(rt.pending_changes().restart_deferred);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a",
+        "未应用 D 选中 node-b 时，检测读取的 R 仍必须是 node-a"
+    );
+
+    // 用户切回当前运行出口后，选择债由 D/R 真值比较自然清掉；不误清别的 Save 债。
+    rt.config.save_full(&running).unwrap();
+    assert!(!rt.pending_changes().restart_deferred);
+}
+
+#[tokio::test]
+async fn explicit_selection_busy_replays_latest_id_but_stop_discards_it() {
+    let (rt, _dir, _sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    rt.config.save_full(&disk).unwrap();
+    rt.gate.begin();
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    assert!(matches!(
+        rt.pending_switch.read().unwrap().as_ref(),
+        Some((_, PendingSwitch::Selected { server_id, .. })) if server_id == "node-b"
+    ));
+    rt.finish_lifecycle(LifecycleKind::Stop);
+    assert!(rt.pending_switch.read().unwrap().is_none());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn explicit_selection_busy_replays_only_latest_selection_after_start_settles() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    rt.gate.begin();
+    let mut first_disk = running.clone();
+    first_disk["selectedServerId"] = serde_json::json!(DIRECT_SERVER_ID);
+    rt.config.save_full(&first_disk).unwrap();
+    let first_intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current(DIRECT_SERVER_ID, first_intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    rt.config.save_full(&disk).unwrap();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+    let latest_intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", latest_intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    rt.finish_lifecycle(LifecycleKind::Start);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while sink.calls().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("settle 后须执行最终选择");
+    assert_eq!(
+        sink.calls(),
+        vec![(PROXY_SELECTOR_TAG.into(), "Node B".into())]
+    );
+    assert_eq!(
+        rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+        "node-b"
+    );
+}
+
+#[tokio::test]
+async fn explicit_selection_preserves_existing_apply_snapshot_fields() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    disk["logLevel"] = serde_json::json!("debug");
+    rt.config.save_full(&disk).unwrap();
+    let apply_id = rt.force_restart_seq.fetch_add(1, Ordering::SeqCst);
+    *rt.pending_force_restart.write().unwrap() =
+        Some((apply_id, disk.clone(), ForceRestartSource::Full));
+    rt.gate.set_force_restart(apply_id);
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched)
+    );
+    let (retained_id, pending, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+    assert_eq!(source, ForceRestartSource::Full);
+    assert_eq!(retained_id, apply_id);
+    assert_eq!(pending["selectedServerId"], "node-b");
+    assert_eq!(
+        pending["logLevel"], "debug",
+        "显式 Apply 的其它授权字段必须保留"
+    );
+    assert_eq!(
+        rt.current_config.read().unwrap().as_ref().unwrap()["logLevel"],
+        running["logLevel"]
+    );
+}
+
+#[tokio::test]
+async fn selected_rule_file_write_failure_restarts_only_the_running_projection() {
+    let (rt, _dir, sink, mut running) = explicit_selection_fixture();
+    running["proxyMode"] = serde_json::json!("smart");
+    running["customRules"] = serde_json::json!([{
+        "id": "r1", "type": "domain", "values": ["synthetic.invalid"],
+        "action": "proxy", "enabled": true
+    }]);
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let rule_dir = rt.custom_rules_dir();
+    std::fs::create_dir_all(rule_dir.join("custom-rule-r1.json")).unwrap();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    disk["logLevel"] = serde_json::json!("debug");
+    rt.config.save_full(&disk).unwrap();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Restarting),
+        "an actual atomic-write failure must request a restart"
+    );
+    let (_, projected, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+    assert_eq!(
+        source,
+        ForceRestartSource::Selected {
+            intent_generation: intent
+        }
+    );
+    assert_eq!(projected["selectedServerId"], "node-b");
+    assert_eq!(projected["logLevel"], running["logLevel"]);
+    assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+    rt.gate.bump_generation(); // Fake runtime must not execute the scheduled restart.
+}
 
 /// 起一个只统计「被连了几次」的本地 TCP 监听器（不说 SS 协议——核**拨过来**这一事实本身
 /// 就是路由证据；握手成不成功无关紧要）。
@@ -870,6 +1769,26 @@ fn force_route_wg_node(id: &str, name: &str) -> Value {
     })
 }
 
+fn valid_force_route_wg_node(id: &str, name: &str) -> Value {
+    let mut node = force_route_wg_node(id, name);
+    node["wireguardSettings"]["localAddress"] = serde_json::json!(["10.40.0.2/32"]);
+    node["wireguardSettings"]["privateKey"] =
+        serde_json::json!("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=");
+    node["wireguardSettings"]["peerPublicKey"] =
+        serde_json::json!("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=");
+    node
+}
+
+fn valid_mesh_only_openvpn_node(id: &str, name: &str) -> Value {
+    let mut node = mesh_only_openvpn_node(id, name);
+    node["openvpnClientSettings"]["server"] = serde_json::json!("127.0.0.1");
+    node["openvpnClientSettings"]["server_port"] = serde_json::json!(1194);
+    node["openvpnClientSettings"]["username"] = serde_json::json!("synthetic-user");
+    node["openvpnClientSettings"]["password"] = serde_json::json!("synthetic-password");
+    node["openvpnClientSettings"]["tls"] = serde_json::json!({});
+    node
+}
+
 /// 只走内网的 Tailscale 组网节点：**无 exit node** ⇒ `meshAllowsInternet` 假
 /// （TS 的出网开关就是 exit node 本身，没有独立的 allowInternet 语义）。
 fn mesh_only_ts_node(id: &str, name: &str) -> Value {
@@ -904,6 +1823,12 @@ fn config_with_nodes(selected: &str, extra: &[Value]) -> Value {
         .extend(extra.iter().cloned());
     cfg["selectedServerId"] = Value::String(selected.to_string());
     cfg
+}
+
+fn cover_running_binding_roots(rt: &ProxyRuntime, running: &Value) {
+    let parsed: UserConfig = serde_json::from_value(running.clone()).expect("valid running config");
+    rt.runtime_binding_state.lock().unwrap().plan.covered_roots =
+        crate::runtime::route_binding::automatic_runtime_binding_root_ids(&parsed);
 }
 
 /// 同 [`mark_running_with_snapshot`]，但 id→tag 表**从配置里的节点名派生**。
@@ -1276,7 +2201,9 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
     let gate = body
         .find("if self.gate.is_busy()")
         .expect("lifecycle 判定锚点");
-    let execute = body.find("SwitchExecutor.execute").expect("热切换执行锚点");
+    let execute = body
+        .find("self.execute_hot_switch_plan(&plan, interrupt).await")
+        .expect("热切换执行锚点");
     let commit = body
         .find("self.commit_applied(&new_config)")
         .expect("热切换提交锚点");
@@ -1284,6 +2211,11 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
         gate < execute && execute < commit,
         "锁须覆盖判定、PUT 与 commit 全链路"
     );
+    let helper = method_body(
+        &module_code("runtime/proxy"),
+        "    async fn execute_hot_switch_plan(",
+    );
+    assert!(helper.contains("SwitchExecutor.execute(&api, plan, interrupt).await"));
 }
 
 /// 腿 0（顺序门）：lifecycle 在飞 → Pending 暂存，**即使核看起来没在跑**。
@@ -1405,9 +2337,11 @@ async fn switch_mode_node_switch_falls_back_to_restart_when_grpc_unavailable() {
     let (rt, _dir) = test_runtime();
     let cfg = two_node_config(7891, "node-a");
     mark_running_with_snapshot(&rt, &cfg);
+    let next = two_node_config(7891, "node-b");
+    rt.config.save_full(&next).unwrap();
 
     // mark_running 给的是假 apiPort（19090，无核监听）→ 连不上 → ClientNotReady。
-    let out = rt.switch_mode(two_node_config(7891, "node-b")).await;
+    let out = rt.switch_mode(next).await;
     assert_eq!(
         out,
         SwitchOutcome::Restarting,
@@ -1419,9 +2353,10 @@ async fn switch_mode_node_switch_falls_back_to_restart_when_grpc_unavailable() {
             .unwrap()
             .as_ref()
             .and_then(|c| c.get("selectedServerId").and_then(Value::as_str))
-            == Some("node-b"),
-        "回退重启腿也必须把 current_config 对账到新配置"
+            == Some("node-a"),
+        "重启等待期间 R 必须仍是旧核的选择，不能先把 D 冒充已运行出口"
     );
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-b");
 }
 
 /// 腿 3-重启：改 norm 内字段（mixedPort）→ 结构性变更 → 去抖重启，**不**热切。
@@ -1541,11 +2476,17 @@ async fn pending_switch_carries_the_defer_restart_intent_across_replay() {
         .read()
         .unwrap()
         .as_ref()
-        .map(|(id, _, _)| *id)
+        .map(|(id, _)| *id)
         .expect("在飞时必须暂存");
-    let (replayed, defer) = rt
+    let PendingSwitch::Config {
+        config: replayed,
+        defer_restart: defer,
+    } = rt
         .take_pending_switch(Some(id))
-        .expect("按 id 认领应取得载荷");
+        .expect("按 id 认领应取得载荷")
+    else {
+        panic!("普通配置广播必须重放 Config 意图");
+    };
     assert_eq!(replayed, cfg, "重放的配置必须逐字节是暂存那份");
     assert!(defer, "「保存不重启」的意图必须跟着载荷一起被取回");
 }
@@ -1558,10 +2499,10 @@ async fn pending_switch_carries_the_defer_restart_intent_across_replay() {
 fn replay_leg_feeds_the_defer_restart_intent_back_into_the_decision() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub(super) fn finish_lifecycle(self: &Arc<Self>, kind: LifecycleKind) {",
+        "    fn apply_lifecycle_end(self: &Arc<Self>, result: LifecycleEndResult, kind: LifecycleKind) {",
     );
     assert!(
-        body.contains("me.switch_mode_with(cfg, defer_restart).await"),
+        body.contains("me.switch_mode_with(config, defer_restart).await"),
         "排空重放必须把取回的意图喂回去；调 switch_mode(cfg) 会静默降级成「保存后仍重启」"
     );
 }
@@ -1580,10 +2521,7 @@ fn deferred_debt_is_cleared_where_the_startup_snapshot_is_written_and_cleared() 
             && started.contains("restart_deferred.store(false"),
         "起核就绪腿必须与写 startup_snapshot 同刻清账 —— 否则核已按新配置起来了，条上还挂着「待应用」"
     );
-    let stopped = method_body(
-        &src,
-        "    pub(super) async fn stop_inner(self: &Arc<Self>) -> Result<bool, String> {",
-    );
+    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
     assert!(
         stopped.contains("restart_deferred.store(false"),
         "停核腿必须复位欠账 —— 否则停核期间挂着一条谈不上「待应用」的提示，且下次起核前无人清"
@@ -1612,18 +2550,12 @@ fn pending_changes_push_is_wired_on_both_sides_of_the_diff() {
         "分子侧（落盘/切节点）必须推 —— 否则改完配置条根本不出现"
     );
     // 分母侧（运行核换了）：start 成功终态 / stop 拆除终态。
-    let started = method_body(
-        &src,
-        "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
-    );
+    let started = method_body(&src, "    pub(super) async fn start_guarded(");
     assert!(
         started.contains("self.push_pending_changes();"),
         "起核就绪腿必须推 —— 否则「立即应用」引发的重启落地后没人告诉 UI 差集已清，条停在「立即应用」"
     );
-    let stopped = method_body(
-        &src,
-        "    pub(super) async fn stop_inner(self: &Arc<Self>) -> Result<bool, String> {",
-    );
+    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
     assert!(
         stopped.contains("self.push_pending_changes();"),
         "停核腿必须推 —— 重启内嵌的这次停核不经命令层，只靠前端 proxyStopped 的 pull 是漏的一半"
@@ -1834,7 +2766,7 @@ async fn non_restart_leg_refreshes_pending_force_restart_snapshot_keeping_id() {
         .insert("language".into(), serde_json::json!("zh-CN"));
     mark_running_with_snapshot(&rt, &cfg);
     // 模拟已有待决 force-restart（apply_pending 排程过），载荷是旧 cfg。
-    *rt.pending_force_restart.write().unwrap() = Some((42, cfg.clone()));
+    *rt.pending_force_restart.write().unwrap() = Some((42, cfg.clone(), ForceRestartSource::Full));
 
     let mut next = cfg.clone();
     next.as_object_mut()
@@ -1857,19 +2789,33 @@ async fn non_restart_leg_refreshes_pending_force_restart_snapshot_keeping_id() {
 /// 结构性重启用最新完整 config → 旧 force 快照必须让位，否则它反 shadow 本次变更。
 #[tokio::test]
 async fn restart_leg_discards_pending_force_restart_snapshot() {
-    let (rt, _dir) = test_runtime();
-    let cfg = two_node_config(7891, "node-a");
-    mark_running_with_snapshot(&rt, &cfg);
-    *rt.pending_force_restart.write().unwrap() = Some((42, cfg.clone()));
+    for old_source in [
+        ForceRestartSource::Full,
+        ForceRestartSource::Selected {
+            intent_generation: 7,
+        },
+    ] {
+        let (rt, _dir) = test_runtime();
+        let cfg = two_node_config(7891, "node-a");
+        mark_running_with_snapshot(&rt, &cfg);
+        *rt.pending_force_restart.write().unwrap() = Some((42, cfg, old_source));
+        rt.gate.set_force_restart(42);
+        let next = two_node_config(7899, "node-a");
+        rt.config.save_full(&next).unwrap();
 
-    assert_eq!(
-        rt.switch_mode(two_node_config(7899, "node-a")).await,
-        SwitchOutcome::Restarting
-    );
-    assert!(
-        rt.pending_force_restart.read().unwrap().is_none(),
-        "重启腿必须丢弃旧 force 快照（否则去抖回调消费它 → 重启回旧配置）"
-    );
+        assert_eq!(rt.switch_mode(next).await, SwitchOutcome::Restarting);
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        assert_eq!(rt.gate.pending().force_restart_id, None);
+        assert!(
+            matches!(
+                rt.debounced.decide_now(true, false),
+                polaris_switch_engine::DebouncedOutcome::Proceed(None)
+            ),
+            "new structural restart must select latest full disk D, not the old force id"
+        );
+        assert_eq!(rt.config.current().unwrap()["mixedPort"], 7899);
+        rt.gate.bump_generation(); // Synthetic running core must not execute the scheduled timer.
+    }
 }
 
 // ── apply_pending 真实状态（此前硬编码 "applied" → UI 误报成功）──
@@ -1960,7 +2906,7 @@ async fn apply_pending_applied_when_running_and_idle() {
 /// 变异对照（真能转红的）：
 /// - `apply_pending` 改成拿 `current_config`（在飞 start 会覆盖它）而非 `self.config.current()`
 ///   做快照 → 落地装回旧配置 → `added` 里 node-c 还在 → 红；
-/// - `take_force_restart_config` 不按 id 认领（恒取 / 恒不取）→ `expect` 炸或取到 None → 红；
+/// - timer 的严格 id/世代认领若吞掉快照 → `expect` 炸或取到 None → 红；
 /// - `pending_changes` 的 `modified` 旧侧改成现算磁盘 → 差集恒空，本条的**正向对照**那一半先红。
 #[tokio::test]
 async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
@@ -1995,12 +2941,26 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
         .force_restart_id
         .expect("applied 必须在 gate 里记下 force id");
 
-    // 模拟去抖重启落地 = `schedule_restart` 回调取配置 + `start_inner` 就绪腿装快照/清欠账。
-    let landed = rt
-        .take_force_restart_config(Some(id))
-        .expect("去抖回调必须能按 id 取回 apply 排程那一刻的 config");
+    // 走真实去抖判定与严格认领；只替代会启动真实进程的 stop/start 半边。
+    let scheduled_generation = rt.gate.generation();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |outcome, ticket| {
+            let _ = tx.send((outcome, ticket));
+        });
+    let (outcome, ticket) = rx.await.unwrap();
+    assert!(matches!(
+        outcome,
+        polaris_switch_engine::DebouncedOutcome::Proceed(Some(force_id)) if force_id == id
+    ));
+    let (snapshot, _claimed_generation) = rt
+        .claim_debounced_restart(Some(id), scheduled_generation, ticket)
+        .expect("去抖回调必须按同一 id/世代认领 Apply 配置");
+    let landed = snapshot.expect("Apply 必须带完整快照");
     install_startup_snapshot(&rt, &landed);
+    *rt.current_config.write().unwrap() = Some(landed);
     rt.restart_deferred.store(false, Ordering::SeqCst);
+    rt.finish_lifecycle(LifecycleKind::Restart);
 
     assert_eq!(
         rt.pending_changes(),
@@ -2042,21 +3002,39 @@ async fn apply_pending_deferred_when_busy_even_though_core_appears_stopped() {
     assert!(rt.pending_force_restart.read().unwrap().is_some());
 }
 
-/// force-restart 快照按 id 消费：id 对不上（更新的 apply 已换快照）→ 不消费旧的。
+/// An old timer must not consume the newer Apply snapshot or advance the core generation.
 #[tokio::test]
-async fn take_force_restart_config_matches_by_id() {
+async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
     let (rt, _dir) = test_runtime();
-    *rt.pending_force_restart.write().unwrap() = Some((7, serde_json::json!({"k": 1})));
-    // id 对不上 → 不取。
-    assert!(rt.take_force_restart_config(Some(8)).is_none());
-    // None（用 currentConfig）→ 不消费专用快照。
-    assert!(rt.take_force_restart_config(None).is_none());
-    // id 对得上 → 取出并清空。
+    let generation = rt.gate.generation();
+    let original = serde_json::json!({"selectedServerId": "node-a"});
+    *rt.pending_force_restart.write().unwrap() = Some((7, original, ForceRestartSource::Full));
+    rt.gate.set_force_restart(7);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |outcome, ticket| {
+            let _ = tx.send((outcome, ticket));
+        });
+    let (outcome, ticket) = rx.await.unwrap();
+    assert!(matches!(
+        outcome,
+        polaris_switch_engine::DebouncedOutcome::Proceed(Some(7))
+    ));
+    let next = serde_json::json!({"selectedServerId": "node-b", "logLevel": "debug"});
+    {
+        let mut pending = rt.pending_force_restart.write().unwrap();
+        *pending = Some((8, next.clone(), ForceRestartSource::Full));
+        rt.gate.set_force_restart(8);
+    }
+    assert!(rt
+        .claim_debounced_restart(Some(7), generation, ticket)
+        .is_none());
+    assert_eq!(rt.gate.generation(), generation);
     assert_eq!(
-        rt.take_force_restart_config(Some(7)),
-        Some(serde_json::json!({"k": 1}))
+        rt.pending_force_restart.read().unwrap().as_ref().unwrap().1,
+        next
     );
-    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(rt.gate.pending().force_restart_id, Some(8));
 }
 
 /// **本任务的核心 gate**：切节点 → 核进程 PID 不变（= 热切换真的生效，不是重启）。

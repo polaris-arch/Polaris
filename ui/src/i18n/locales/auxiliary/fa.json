@@ -41,7 +41,10 @@
     "quit": "خروج از Polaris",
     "manageInMain": "مدیریت در پنجره اصلی…",
     "actionFailed": "«{{action}}» ناموفق بود: {{detail}}",
-    "actionFailedDetail": "عملیات انجام نشد"
+    "actionFailedDetail": "عملیات انجام نشد",
+    "switchPending": "درخواست تغییر به {{node}} ثبت شد؛ وضعیت اتصال را بررسی کنید",
+    "switchSavedForNextStart": "{{node}} ذخیره شد؛ هنگام اتصال بعدی اعمال می‌شود",
+    "switchRequiresApply": "{{node}} ذخیره شد؛ پیش از استفاده تغییرات معلق را اعمال کنید"
   },
   "updatePopup": {
     "newVersion": "نسخه جدید {{version}}",

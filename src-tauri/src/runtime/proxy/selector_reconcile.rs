@@ -38,6 +38,9 @@ struct WorkerState {
 #[derive(Debug, Default)]
 pub(super) struct SelectorReconcileOwner {
     intent_generation: AtomicU64,
+    /// Serializes intent publication with a selected-only timer's lifecycle claim. The claim
+    /// closure may take only the pending-snapshot and lifecycle locks; it must never read D.
+    intent_claim: Mutex<()>,
     required: AtomicBool,
     worker: Mutex<WorkerState>,
     wake: Notify,
@@ -46,9 +49,21 @@ pub(super) struct SelectorReconcileOwner {
 impl SelectorReconcileOwner {
     /// 同一目标被再选一次也是新意图；所有权不能只靠目标 id 推断。
     pub(super) fn register_intent(&self) -> u64 {
+        let _claim = self
+            .intent_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.intent_generation
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1)
+    }
+
+    pub(super) fn with_intent_claim<T>(&self, claim: impl FnOnce(u64) -> T) -> T {
+        let _guard = self
+            .intent_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claim(self.intent_generation())
     }
 
     pub(super) fn intent_generation(&self) -> u64 {
@@ -125,6 +140,10 @@ impl ProxyRuntime {
     /// 的两次选择仍可区分先后。
     pub(crate) fn register_selector_intent(&self) -> u64 {
         self.selector_reconcile.register_intent()
+    }
+
+    pub(crate) fn selector_intent_is_current(&self, intent_generation: u64) -> bool {
+        self.selector_reconcile.intent_generation() == intent_generation
     }
 }
 

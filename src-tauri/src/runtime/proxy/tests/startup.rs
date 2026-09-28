@@ -1214,21 +1214,37 @@ async fn start_lands_custom_rule_files_before_generate() {
     );
 }
 
-/// public start 必须在 stale 清扫之前就占住稳定门；否则清扫较慢时，8s 订阅补更仍可从缝里起跑，
-/// 随后被成功 TUN 的 flush 杀掉。源码顺序门补足上面纯 gate 测试够不着的生产接线。
+/// public start 经 guarded 起核腿，在任何 await（含 TS 状态门和 stale 清扫）之前占住稳定门；
+/// 否则清扫较慢时，8s 订阅补更仍可从缝里起跑，随后被成功 TUN 的 flush 杀掉。
+/// 同时锁住 public 入口到 guarded 腿的委托，避免只检查一个未被调用的方法而假绿。
 #[test]
 fn public_start_arms_network_settle_before_any_await() {
-    let body = method_body(
-        &module_code("runtime/proxy"),
+    let source = module_code("runtime/proxy");
+    let public = method_body(
+        &source,
         "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
     );
-    let arm = body
+    let delegate = public
+        .find("self.start_guarded(config, None).await")
+        .expect("public start 必须委托 guarded 起核腿");
+    assert_eq!(
+        public.find(".await"),
+        Some(delegate + "self.start_guarded(config, None)".len()),
+        "public start 不能先 await 再委托 guarded 起核腿"
+    );
+    let guarded = method_body(&source, "    ) -> StartLeg {");
+    let arm = guarded
         .find("let _network_settle = self.network_settle.begin(\"proxy-start\")")
-        .expect("public start 必须占住订阅稳定门");
-    let first_await = body
+        .expect("guarded 起核腿必须占住订阅稳定门");
+    let first_await = guarded.find(".await").expect("guarded 起核腿必须有 await");
+    assert!(
+        arm < first_await,
+        "稳定门必须先于 guarded 起核腿的首个 await"
+    );
+    let stale_sweep = guarded
         .find("self.cleanup_stale_cores().await")
         .expect("stale 清扫锚必须存在");
-    assert!(arm < first_await, "稳定门必须先于 start 的第一个 await");
+    assert!(first_await < stale_sweep, "TS 状态门须先于 stale 清扫");
 }
 
 /// ① **退避期取消 → 就地退场**（本任务的主门；直接对应「点了立刻停 vs 静默等 35s」）。

@@ -96,7 +96,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     const appStore = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
     expect(appStore).toContain('withConfigWriteLock(() => api.config.patch(patch))');
     expect(appStore).toContain('withConfigWriteLock(() => api.config.mutateEntities(mutations))');
-    expect(appStore).toContain('withConfigWriteLock(async () => {\n      await api.server.switch(serverId)');
+    expect(appStore).toContain('withConfigWriteLock(async () => {\n      const receipt = await api.server.switch(serverId)');
     // performSave 是薄壳：整个函数体（**含开头读 entries**）都在临界区内。
     expect(readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8')).toContain(
       'withConfigWriteLock(() => performSaveLocked(set, get))'

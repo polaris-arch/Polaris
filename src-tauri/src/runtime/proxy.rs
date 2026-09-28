@@ -76,9 +76,10 @@ use dns_takeover::dns_takeover_enabled;
 // 调用方改动），`SwitchSnapshot` / `TestPutSink` 是 `ProxyRuntime` 的字段类型（结构体定义按
 // §A.5 钉死在 façade）。
 pub use hot_switch::StagedClassification;
-use hot_switch::SwitchSnapshot;
+pub use hot_switch::SwitchOutcome;
 #[cfg(test)]
 use hot_switch::TestPutSink;
+use hot_switch::{PendingSwitch, SwitchSnapshot};
 // B8：`ProxyLifecycleEvent` 是 `ProxyErrorEmitter::emit_lifecycle` 的载荷类型（trait 定义按
 // §C 例外② 钉死在 façade），按 §A.3 由 façade `pub use` 再导出。
 // B9：同批注释里的 `now_ms` / `sleep_unless_superseded_on` 随 `start_inner` / `wait_ready`
@@ -1101,6 +1102,14 @@ pub struct SpeedProbeTargets {
 /// 代理运行时（`State`-managed，单实例）。
 ///
 /// 持有 config / helper / mesh 引用（跨运行时协作：启动需读 config + 可能经 helper 提权 + mesh exit route）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForceRestartSource {
+    /// A user Apply or full-config change owns the whole snapshot.
+    Full,
+    /// A selection may restart only the projection of the running configuration.
+    Selected { intent_generation: u64 },
+}
+
 pub struct ProxyRuntime {
     config: Arc<ConfigManager>,
     /// 提权 helper（C6-5 接线）：TUN 模式经它起停 root/SYSTEM 受管核（见 [`should_start_via_helper`](startup::should_start_via_helper)）。
@@ -1152,7 +1161,7 @@ pub struct ProxyRuntime {
     ///
     /// **不可用 currentConfig 替代**：in-flight start 腿会覆盖 currentConfig，drain 必须读本字段
     /// 才能重启到 apply 当时那份 cfg（上游 `pendingForceRestartConfig`，:1729-1730）。
-    pending_force_restart: RwLock<Option<(u64, Value)>>,
+    pending_force_restart: RwLock<Option<(u64, Value, ForceRestartSource)>>,
     /// force-restart 快照 id 发号器（LifecycleGate 只存不透明 id，载荷由本层关联）。
     force_restart_seq: AtomicU64,
     /// 最后**已应用**到运行核的配置（上游 `ProxyManager.currentConfig`）。
@@ -1169,7 +1178,7 @@ pub struct ProxyRuntime {
     /// **`defer_restart` 必须跟着一起暂存**：它是「本次落盘由谁触发」的意图，不是配置内容的一部分。
     /// 若排空重放时丢掉它，用户在核重启窗口内点的那次「保存」会在几秒后自己触发一次重启 ——
     /// 恰是「保存不重启」承诺的反面，且现象是延迟的、极难归因。
-    pending_switch: RwLock<Option<(u64, Value, bool)>>,
+    pending_switch: RwLock<Option<(u64, PendingSwitch)>>,
     /// switch 快照 id 发号器（与 force_restart_seq 同构，各自独立编号）。
     switch_seq: AtomicU64,
     /// 配置入核单飞锁。正常热切换含管理 API I/O；没有这把锁时，快速连续切节点会让多个

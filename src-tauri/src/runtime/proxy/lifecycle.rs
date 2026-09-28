@@ -25,6 +25,23 @@ use super::route_replan::RuntimeBindingState;
 use super::system_takeover::should_clear_system_proxy_between_restart;
 use super::{ProxyRuntime, ProxyStatus, StartError};
 
+pub(super) enum StartLeg {
+    Finished(Result<ProxyStatus, StartError>, Option<u64>),
+    Superseded,
+}
+
+/// Restart must conditionally claim after its stop leg; explicit stop already owns a token
+/// before its first await. The two paths share one teardown body without double-bumping.
+pub(super) enum StopClaim {
+    Request(Option<u64>),
+    AlreadyClaimed(u64),
+}
+
+enum RestartLeg {
+    Finished(Result<ProxyStatus, StartError>, Option<u64>),
+    Superseded,
+}
+
 /// `event:proxyLifecycle` 的载荷：**这一次核起停尝试的真实结局**。
 ///
 /// # 三个 phase 的判据（都是可诚实断言的控制流位置，不猜）
@@ -191,12 +208,19 @@ impl ProxyRuntime {
         self.startup_snapshot.read().ok().and_then(|g| g.clone())
     }
 
+    /// Current applied R, including successful in-core selector changes after initial startup.
+    #[cfg(test)]
+    pub(crate) fn current_config_snapshot(&self) -> Option<Value> {
+        self.current_config.read().ok().and_then(|g| g.clone())
+    }
+
     /// 当前**运行核快照**里的接管模式；与磁盘 `config.current()` 刻意分离。
     ///
     /// 结构性切换会先把磁盘期望值改成新模式，再去抖重启旧核。系统代理活态若读磁盘值，就会在
     /// “新配置=systemProxy、旧运行核仍=TUN”窗口里去查 OS 代理并误判未生效。旧核唯一可信真值是
-    /// `startup_snapshot`：结构重启的 `apply_restart` 会在去抖前先把 `current_config` 前推到新配置，
-    /// 而起核快照只在新核真正就绪时换代、停核时清空。模式本身是结构字段，热切/no-op 不会改变它。
+    /// `startup_snapshot`：它只在新核真正就绪时换代、停核时清空。`current_config`
+    /// 也保留已应用的运行态，但某些非结构性热切会更新它；模式仍以起核快照为准。
+    ///
     pub(crate) fn running_proxy_mode_type(&self) -> Option<ProxyModeType> {
         if !self.core_running() {
             return None;
@@ -235,15 +259,26 @@ impl ProxyRuntime {
             || self.pid.lock().ok().is_some_and(|pid| pid.is_some())
     }
 
-    /// 世代 +1 **并唤醒在飞起核腿**（`start`/`stop`/`restart` 入口的唯一 bump 通道）。
+    /// 测试和非起停诊断用的世代失效通道；生产起停走 `claim_generation`。
     ///
-    /// 世代仍是唯一真值（`gate` 持有），此处只是把「世代变了」这条消息同点发出去 —— 两者同一表达式
-    /// 内落值，结构上不可能分叉。**绕过本方法直接调 `self.gate.bump_generation()` 即回归**：世代变了
-    /// 但没人被叫醒 ⇒ 正在退避 sleep 的起核腿要等睡满才发现自己该让位（有单测锁死）。
+    /// 世代仍是唯一真值（`gate` 持有），此处把「世代变了」的消息同点发出去。
+    /// 世代变更和通知必须同点发生，否则正在退避的起核腿会睡满才发现让位。
+    #[allow(
+        dead_code,
+        reason = "lifecycle takeover tests use this direct invalidation path"
+    )]
     pub(super) fn bump_generation(&self) -> u64 {
         let g = self.gate.bump_generation();
         self.gen_changed.notify_waiters();
         g
+    }
+
+    fn claim_generation(&self, expected: Option<u64>, kind: LifecycleKind) -> Option<u64> {
+        let generation = self.gate.claim_generation(expected, kind);
+        if generation.is_some() {
+            self.gen_changed.notify_waiters();
+        }
+        generation
     }
 
     /// [`sleep_unless_superseded_on`] 的实例侧入口（本运行时的 gate + 取消信号）。
@@ -263,6 +298,33 @@ impl ProxyRuntime {
     ///
     /// **边界**：系统代理 enable / TUN / helper 提权起核**不在本批次**——见模块级声明。
     pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
+        match self.start_guarded(config, None).await {
+            StartLeg::Finished(result, _) => result,
+            StartLeg::Superseded => Ok(self.status()),
+        }
+    }
+
+    /// 重启的起核腿必须持有刚完成的 stop 世代；普通显式 start 不受此限制。
+    pub(super) async fn start_guarded(
+        self: &Arc<Self>,
+        config: Value,
+        expected_generation: Option<u64>,
+    ) -> StartLeg {
+        // Explicit starts take ownership before their first await. This preserves the order of
+        // two start requests (the later one wins), and lets a later stop supersede an earlier
+        // start while it waits for the TS gate. Keep abort reset and claim under the same short
+        // crash lock used by the explicit stop entry; no mutex is held across await.
+        let explicit_generation = if expected_generation.is_none() {
+            let mut crash = self.crash_lock();
+            let generation = self
+                .claim_generation(None, LifecycleKind::Start)
+                .expect("unconditional start claim");
+            crash.reset_user_aborted();
+            Some(generation)
+        } else {
+            None
+        };
+        let requested_generation = expected_generation.or(explicit_generation).unwrap();
         let t_start_request = std::time::Instant::now();
         // 后台网络任务须等整个起核事务稳定。TUN 成功腿会在 selector 校正/flush 任务里先接棒一个
         // 新 guard，再由本 guard 退场，因此计数不会在两段之间短暂归零、放进一条注定被 RST 的请求。
@@ -273,10 +335,17 @@ impl ProxyRuntime {
         // 下面 `?` 早退（清扫 → ROOT_ORPHAN_BLOCKED）也归还计数。
         self.start_inflight.fetch_add(1, Ordering::SeqCst);
         let inflight = InflightGuard(Arc::clone(&self.start_inflight));
-        let my_gen = self.bump_generation();
+        // Freeze transient-login ownership before stale-process scanning. Without this gate a
+        // transient child could be spawned before its PID is registered while the sweep scans it,
+        // then be mistaken for an orphan at the exclusion check.
+        // The gate remains held through final-config reservation and primary spawn; the supervisor
+        // close path does not reacquire it.
         let _tailscale_gate = self.mesh.tailscale_state_gate().await;
-        if self.gate.generation() != my_gen {
-            return Ok(self.status());
+        // A guarded restart may have waited here while a newer stop/start took ownership. Do not
+        // run even the stale sweep for that obsolete request; claim_generation checks again after
+        // the sweep because stop can still supersede us during its awaits.
+        if self.gate.generation() != requested_generation {
+            return StartLeg::Superseded;
         }
         // **每次** start 都清扫孤儿核（对齐 上游 :700），只杀「本 app 二进制起的」核——见
         // `cleanup_stale_cores`。孤儿不只来自上个会话崩溃，也来自本会话中途失败的起核尝试，
@@ -291,20 +360,32 @@ impl ProxyRuntime {
                     t_stale_sweep.elapsed().as_millis(),
                     t_start_request.elapsed().as_millis()
                 );
-                return Err(error);
+                return StartLeg::Finished(Err(error), None);
             }
         }
         let stale_sweep_ms = t_stale_sweep.elapsed().as_millis();
         log::info!("代理启动请求耗时：孤儿核清扫={stale_sweep_ms}ms");
         // 保存阶段只落期望配置与删除意图；真正的文件/state/远端注销必须等旧核已经不存在。
         // 冷启动与 restart 的 start 腿都在这里汇流。重复 start 若仍有运行核则跳过，绝不碰活会话资产。
+        // 清扫可能 await 很久；重启腿必须在这之后同锁比较并认领世代，不能凭清扫前的一次裸检查。
+        // Restart claims the stop generation only after cleanup, with an atomic recheck. An
+        // explicit start already claimed at entry; both paths reject any intervening owner.
+        let my_gen = if let Some(generation) = explicit_generation {
+            if self.gate.generation() != generation {
+                return StartLeg::Superseded;
+            }
+            generation
+        } else {
+            let Some(generation) =
+                self.claim_generation(Some(requested_generation), LifecycleKind::Start)
+            else {
+                return StartLeg::Superseded;
+            };
+            generation
+        };
         if !self.core_running() {
             self.process_deferred_config_deletions_under_gate(&_tailscale_gate);
         }
-        // 用户/其它显式 start 接管后，清掉此前主动 stop 留下的自愈中止标记。状态机已有这一语义，
-        // 这里补齐生产写侧；否则一旦主动停过，后续新会话真的崩溃也会被永久当作用户仍在阻止自愈。
-        self.crash_lock().reset_user_aborted();
-        // 世代 +1（上游 :632 start 入口）：本腿快照世代，被更新的 start/stop 接管即让位（#176）。
         self.gate.begin();
         let t_start_inner = std::time::Instant::now();
         let r = self.start_inner(config, my_gen).await;
@@ -360,7 +441,7 @@ impl ProxyRuntime {
             t_start_request.elapsed().as_millis(),
             if r.is_ok() { "ok" } else { "error" }
         );
-        r
+        StartLeg::Finished(r, Some(my_gen))
     }
 
     /// 停止 sing-box（上游 `proxy:stop`）——**主动停止终态**：停核 ＋ 清系统代理（维度7 #8 对称面）。
@@ -382,14 +463,26 @@ impl ProxyRuntime {
     /// 代理，故 [`restart_inner`](Self::restart_inner) 在 stop 腿完成后按新旧模式选择性调用本收口点。
     /// restart 若在 start 腿失败留下死端口，仍由上面的 start 失败腿收口。故 [`restart`](Self::restart)
     /// 调 [`stop_inner`](Self::stop_inner) 而非本方法。
-    /// **换代即让位**：`stop_inner` 返 `false` 表示本腿在停核期间已被更新的 start/stop 接管
+    /// **换代即让位**：`stop_inner` 返 `None` 表示本腿在停核期间已被更新的 start/stop 接管
     /// （见该方法的换代守卫）。此时系统代理**属接管方**——清它就是把新会话刚设好的代理抹掉、
     /// 用户全网走直连。故这条收口也一并让位，由接管方自己的终态负责。
     pub async fn stop(self: &Arc<Self>) -> Result<(), String> {
-        // 主动停止是崩溃自愈的终止意图：先置位，再由 stop_inner bump 世代并停核。退避中的自愈腿
-        // 会在 post_backoff 读到该标记并放弃；下次显式 start 在其入口复位。
-        self.crash_lock().mark_user_aborted();
-        if self.stop_inner().await? {
+        // Stop claims before its first await, paired with explicit start's claim/reset under
+        // the same short lock. A newer start can then supersede this stop without its late
+        // teardown touching the new session. Pass the owned token through: no second bump.
+        let generation = {
+            let mut crash = self.crash_lock();
+            let generation = self
+                .claim_generation(None, LifecycleKind::Stop)
+                .expect("unconditional stop claim");
+            crash.mark_user_aborted();
+            generation
+        };
+        if self
+            .stop_inner(StopClaim::AlreadyClaimed(generation))
+            .await?
+            .is_some()
+        {
             // Stop 完成后旧核已不存在，已保存删除的保护对象随之消失：此刻就是与 Apply/冷启动同级的
             // 安全提交点。只消费后端 journal，**绝不**触碰渲染端尚未保存的 staged 条目。
             self.process_deferred_config_deletions().await;
@@ -405,14 +498,14 @@ impl ProxyRuntime {
     /// 2. kill 进程（core-supervisor `ProcessKiller`：SIGTERM → 宽限 → SIGKILL）
     /// 3. 清状态 + 快照；`end(Stop)` 丢弃全部 pending（停止优先）
     ///
-    /// **[`restart`](Self::restart) 复用本腿**；本腿自身不碰系统代理。restart 会在它返回 `true` 后按
+    /// **[`restart`](Self::restart) 复用本腿**；本腿自身不碰系统代理。restart 会在它返回 `Some(generation)` 后按
     /// 新旧模式选择性收口（同为 systemProxy 则保留，离开 systemProxy 才清），见
     /// [`restart_inner`](Self::restart_inner)。
     ///
     /// # 返回值
     ///
-    /// - `Ok(true)` = 本腿跑完拆除且仍当权；[`stop`](Self::stop) 可继续收口系统代理。
-    /// - `Ok(false)` = 中途已被更新的 start/stop 接管，余下步骤整段让位。
+    /// - `Ok(Some(generation))` = 本腿跑完拆除且仍当权；token 可供重启起核腿条件认领。
+    /// - `Ok(None)` = 入场前或中途已被更新的 start/stop 接管，余下步骤整段让位。
     /// - `Err` = helper 停核没有得到确定回执；保留运行态与 pid，禁止广播假的 stopped、禁止重启叠核。
     ///
     /// # 换代守卫：超预算残 stop 的**晚落地换代毒性**
@@ -437,16 +530,25 @@ impl ProxyRuntime {
     /// 让位路径**照样 `finish_lifecycle(Stop)`**：`gate.begin()` 与 `end()` 必须配对，漏掉即
     /// `LifecycleGate` depth 永久 >0 ⇒ 此后每一次 switch_mode / 去抖重启都只置 pending 不执行
     /// （`commands::helper::join_watchdog_cooperatively` 文档里记的那条最重后果）。
-    pub(super) async fn stop_inner(self: &Arc<Self>) -> Result<bool, String> {
-        // 必须先 bump（早于取 child 锁）：与 start 的「持锁判世代」共同封死孤儿窗口。
-        // 走 [`bump_generation`](Self::bump_generation) 而非 `gate.bump_generation()`：同一次调用里
-        // 唤醒在飞起核腿，**取消当场生效**而不是等它退避睡满（这就是「点了立刻停」的那一下）。
-        let my_gen = self.bump_generation();
+    pub(super) async fn stop_inner(
+        self: &Arc<Self>,
+        claim: StopClaim,
+    ) -> Result<Option<u64>, String> {
+        // Restart claims here; an explicit user stop already claimed at its entry before await.
+        let my_gen = match claim {
+            StopClaim::Request(expected) => {
+                let Some(generation) = self.claim_generation(expected, LifecycleKind::Stop) else {
+                    return Ok(None);
+                };
+                generation
+            }
+            StopClaim::AlreadyClaimed(generation) => generation,
+        };
         self.gate.begin();
         let _tailscale_gate = self.mesh.tailscale_state_gate().await;
         if self.stop_superseded(my_gen, "tailscale_state_gate") {
             self.finish_lifecycle(LifecycleKind::Stop);
-            return Ok(false);
+            return Ok(None);
         }
         let kill_result = self.kill_core().await;
         if kill_result.is_ok() {
@@ -455,7 +557,7 @@ impl ProxyRuntime {
         // 请求在飞期间若已被新 start/stop 接管，结果属于旧腿，不能覆盖接管方终态。
         if self.stop_superseded(my_gen, "kill_core") {
             self.finish_lifecycle(LifecycleKind::Stop);
-            return Ok(false);
+            return Ok(None);
         }
         if let Err(error) = kill_result {
             // helper 停核结果不明时保留 running/pid/core_via_helper：清成 stopped 会让仍在跑的
@@ -468,7 +570,7 @@ impl ProxyRuntime {
         self.mesh.exit_route_clear().await;
         if self.stop_superseded(my_gen, "exit_route_clear") {
             self.finish_lifecycle(LifecycleKind::Stop);
-            return Ok(false);
+            return Ok(None);
         }
         // R2：停核 → 复位 TS 出口无效直判的翻转对账缓存（新会话首帧须能重新触发 none→blocked，
         // 对齐 上游 会话起点 `lastTsExitBlock = null`）。
@@ -495,7 +597,7 @@ impl ProxyRuntime {
         self.restore_system_dns_best_effort().await;
         if self.stop_superseded(my_gen, "restore_system_dns") {
             self.finish_lifecycle(LifecycleKind::Stop);
-            return Ok(false);
+            return Ok(None);
         }
         // C7：停核尾刷 OS DNS 缓存（fire-and-forget，对齐 上游 `flushOsDnsCacheBestEffort('stop')`）。
         self.flush_os_dns_cache_best_effort("stop");
@@ -519,16 +621,15 @@ impl ProxyRuntime {
         // `push_lifecycle(stopped)` 同上必须相邻：核停了就谈不上「正在应用」，条该离开转圈态。
         self.push_pending_changes();
         self.push_lifecycle(&ProxyLifecycleEvent::stopped());
-        if let Ok(mut g) = self.pending_force_restart.write() {
-            *g = None;
-        }
+        // A restart's stop leg may await while a newer Apply queues its own full snapshot.
+        // Only the terminal Stop outcome discards pending work; clearing here loses that Apply.
         // 核停 → 热切换基准失效（上游 :1386-1388）。留着会让下次 switch_mode 拿「上一个核」的
         // id→tag 去 PUT 新核里不存在的成员。current_config 保留（上游 :1758 未运行腿仍读写它）。
         if let Ok(mut g) = self.switch_snapshot.write() {
             *g = None;
         }
         self.finish_lifecycle(LifecycleKind::Stop);
-        Ok(true)
+        Ok(Some(my_gen))
     }
 
     /// 停核拆除腿的换代让位判据（见 [`stop_inner`](Self::stop_inner) 的换代守卫段）。
@@ -561,18 +662,61 @@ impl ProxyRuntime {
     /// [`should_clear_system_proxy_between_restart`] 单点判定。restart 若在 start 腿失败留死端口，仍由
     /// `maybe_clear_system_proxy_on_start_failure` 统一收口——见 [`stop`](Self::stop) 文档。
     pub async fn restart(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
+        self.restart_guarded(config, None).await
+    }
+
+    pub(super) async fn restart_guarded(
+        self: &Arc<Self>,
+        config: Value,
+        expected_generation: Option<u64>,
+    ) -> Result<ProxyStatus, StartError> {
         self.gate.begin(); // restart 外层 begin（上游 beginLifecycleOp，:1500）→ depth≥1 不变式起点。
-        let r = self.restart_inner(config).await;
-        // finish 恒执行（成功/失败/让位三路，try/finally 语义）：depth 归 0 时按 Restart 排空一次
-        // 暂存 switch（其内部再分流热切/重启）+ 尾随去抖重启（上游 endLifecycleOp('restart')，:1506）。
-        self.finish_lifecycle(LifecycleKind::Restart);
-        r
+        self.restart_with_claim(config, StopClaim::Request(expected_generation))
+            .await
+    }
+
+    /// The debounced timer already claimed both the stop generation and outer lifecycle depth
+    /// under the gate lock. Do not claim a second generation or begin a second outer scope.
+    async fn restart_claimed(
+        self: &Arc<Self>,
+        config: Value,
+        claimed_generation: u64,
+    ) -> Result<ProxyStatus, StartError> {
+        self.restart_with_claim(config, StopClaim::AlreadyClaimed(claimed_generation))
+            .await
+    }
+
+    async fn restart_with_claim(
+        self: &Arc<Self>,
+        config: Value,
+        claim: StopClaim,
+    ) -> Result<ProxyStatus, StartError> {
+        let leg = self.restart_inner(config, claim).await;
+        // finish 恒执行。最新 owner 若为 Stop，旧 restart 归零时须按停止终态丢弃 pending；
+        // 若为新显式 Start，则保留其 pending 排空。判定与 end 在 gate 同一把锁内。
+        match leg {
+            RestartLeg::Finished(result, Some(generation)) => {
+                self.apply_lifecycle_end(
+                    self.gate.end_restart_after(Some(generation)),
+                    LifecycleKind::Restart,
+                );
+                result
+            }
+            RestartLeg::Finished(result, None) => {
+                self.finish_lifecycle(LifecycleKind::Restart);
+                result
+            }
+            RestartLeg::Superseded => {
+                self.apply_lifecycle_end(self.gate.end_restart_after(None), LifecycleKind::Restart);
+                Ok(self.status())
+            }
+        }
     }
 
     /// [`restart`](Self::restart) 内层：瞬态停核 + 重建。外层 begin/finish 由 `restart` 持有（depth≥1 不变式）。
-    async fn restart_inner(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
-        // `apply_restart` 在调度前已经把 current_config 提交成**新**配置，不能据它判断旧模式；唯一可信的
-        // 旧核真值是就绪时落下的 startup_snapshot。必须在 stop_inner 清快照之前取。
+    async fn restart_inner(self: &Arc<Self>, config: Value, claim: StopClaim) -> RestartLeg {
+        // 旧接管模式以就绪时的 startup_snapshot 为准，须在 stop_inner 清快照之前取。
+        // 去抖重启的目标配置由调用方传入（timer 从最新 D/显式 force 快照取），不是旧核快照。
         let old_mode = self
             .startup_snapshot
             .read()
@@ -588,21 +732,32 @@ impl ProxyRuntime {
             .lock()
             .ok()
             .and_then(|state| state.managed_tun_interface.clone());
-        // `Ok(false)` 只表示旧停核腿已被接管，仍可让新的 start 以世代规则竞争；`Err` 则是 helper
-        // 未确认旧核已停，必须中止重建，否则可能在同一 daemon 下复用旧配置或叠第二个核。
-        let stop_completed = self.stop_inner().await?;
-        if stop_completed && should_clear_system_proxy_between_restart(old_mode, new_mode) {
+        let stop_generation = match self.stop_inner(claim).await {
+            Ok(Some(generation)) => generation,
+            Ok(None) => return RestartLeg::Superseded,
+            Err(error) => return RestartLeg::Finished(Err(error.into()), None),
+        };
+        if should_clear_system_proxy_between_restart(old_mode, new_mode) {
             log::info!("重启跨模式离开 systemProxy → 起新核前清理旧会话系统代理");
             self.clear_system_proxy().await;
         }
-        if stop_completed
-            && old_mode.is_some_and(ProxyModeType::is_tun)
+        if old_mode.is_some_and(ProxyModeType::is_tun)
             && new_mode.is_some_and(ProxyModeType::is_tun)
         {
             self.wait_for_retiring_tun_route(retiring_tun_interface.as_ref())
                 .await;
         }
-        self.start(config).await
+        match self.start_guarded(config, Some(stop_generation)).await {
+            StartLeg::Superseded => RestartLeg::Superseded,
+            StartLeg::Finished(result, generation) => {
+                let owned = generation.unwrap_or(stop_generation);
+                if self.gate.generation() != owned {
+                    RestartLeg::Superseded
+                } else {
+                    RestartLeg::Finished(result, Some(owned))
+                }
+            }
+        }
     }
 
     /// 短暂借出诊断计数器（慢起轴更新同步、绝不跨 await 持锁）。
@@ -614,7 +769,11 @@ impl ProxyRuntime {
 
     /// lifecycle 收尾：`end` + 按返回的排空/丢弃指令动作（**语义全在 core-supervisor，本处只执行**）。
     pub(super) fn finish_lifecycle(self: &Arc<Self>, kind: LifecycleKind) {
-        match self.gate.end(kind) {
+        self.apply_lifecycle_end(self.gate.end(kind), kind);
+    }
+
+    fn apply_lifecycle_end(self: &Arc<Self>, result: LifecycleEndResult, kind: LifecycleKind) {
+        match result {
             LifecycleEndResult::StillBusy(depth) => {
                 log::debug!("lifecycle end（{kind:?}）：depth={depth} 仍在飞，pending 留给最外层");
             }
@@ -647,13 +806,29 @@ impl ProxyRuntime {
                 // 排空暂存的 switchMode（上游 :1540 `void this.switchMode(pendingSwitch)`）。
                 // depth 已归零 → 重放时不会再落回 Pending 腿，可正常判热切/重启。
                 if let Some(id) = drain.replay_switch_id {
-                    if let Some((cfg, defer_restart)) = self.take_pending_switch(Some(id)) {
-                        log::info!(
-                            "depth 归零 → 重放暂存的 switchMode（defer_restart={defer_restart}）"
-                        );
+                    if let Some(pending) = self.take_pending_switch(Some(id)) {
+                        log::info!("depth 归零 → 重放最新配置/节点选择意图");
                         let me = Arc::clone(self);
                         tokio::spawn(async move {
-                            me.switch_mode_with(cfg, defer_restart).await;
+                            match pending {
+                                super::hot_switch::PendingSwitch::Config {
+                                    config,
+                                    defer_restart,
+                                } => {
+                                    me.switch_mode_with(config, defer_restart).await;
+                                }
+                                super::hot_switch::PendingSwitch::Selected {
+                                    server_id,
+                                    intent_generation,
+                                } => {
+                                    let _ = me
+                                        .switch_selected_server_if_current(
+                                            &server_id,
+                                            intent_generation,
+                                        )
+                                        .await;
+                                }
+                            }
                         });
                     }
                 }
@@ -663,41 +838,98 @@ impl ProxyRuntime {
 
     /// 调度一次去抖重启（接线 switch-engine [`DebouncedRestart`](polaris_switch_engine::debounced_restart::DebouncedRestart)：timer + 世代守卫 + gate 顺序门）。
     pub(super) fn schedule_restart(self: &Arc<Self>) {
-        let me = Arc::clone(self);
-        // handle 不持有：drop 不取消 task（task 自查 gate 决策，过期自行 Superseded）。
-        let _handle = self
-            .debounced
-            .schedule(self.core_running(), move |outcome| {
-                match outcome {
-                    DebouncedOutcome::Proceed(force_id) => {
-                        tokio::spawn(async move {
-                            // H-1：优先读 force-restart 专用快照（in-flight start 会覆盖 currentConfig）。
-                            let cfg = me.take_force_restart_config(force_id);
-                            let cfg = match cfg.or_else(|| me.config.current().ok()) {
-                                Some(c) => c,
-                                None => {
-                                    log::warn!("去抖重启：无可用配置 → 放弃");
-                                    return;
-                                }
-                            };
-                            if let Err(e) = me.restart(cfg).await {
-                                log::error!("去抖重启失败: {e}");
-                            }
-                        });
-                    }
-                    other => log::info!("去抖重启未执行：{other:?}"),
-                }
-            });
+        let scheduled_generation = self.gate.generation();
+        self.schedule_restart_for_generation(scheduled_generation);
     }
 
-    /// 取出并清除 force-restart 专用配置快照（id 对得上才取；对不上回落 None）。
-    pub(super) fn take_force_restart_config(&self, id: Option<u64>) -> Option<Value> {
-        let mut g = self.pending_force_restart.write().ok()?;
-        match (&*g, id) {
-            (Some((sid, _)), Some(want)) if *sid == want => g.take().map(|(_, c)| c),
-            // id 为 None（用 currentConfig）或对不上（更新的 apply 已换快照）→ 不消费。
-            _ => None,
-        }
+    /// 已在 gate 锁内认领过的尾随重启沿用该世代，Stop 即使插在认领与 timer 注册之间，
+    /// restart_guarded 也只会让旧请求退场，不能错误读取停止后的新世代。
+    pub(super) fn schedule_restart_for_generation(self: &Arc<Self>, scheduled_generation: u64) {
+        let me = Arc::clone(self);
+        // handle 不持有：drop 不取消 task（task 自查 gate 决策，过期自行 Superseded）。
+        let _handle =
+            self.debounced
+                .schedule_with_ticket(self.core_running(), move |outcome, ticket| {
+                    match outcome {
+                        DebouncedOutcome::Proceed(force_id) => {
+                            tokio::spawn(async move {
+                                // Claim the exact snapshot, selector intent, lifecycle generation,
+                                // and outer depth before any await. An obsolete force id must never
+                                // fall back to the full disk config.
+                                let Some((snapshot, claimed_generation)) = me
+                                    .claim_debounced_restart(
+                                        force_id,
+                                        scheduled_generation,
+                                        ticket,
+                                    )
+                                else {
+                                    return;
+                                };
+                                let cfg = match snapshot.or_else(|| me.config.current().ok()) {
+                                    Some(c) => c,
+                                    None => {
+                                        log::warn!("去抖重启：无可用配置 → 放弃");
+                                        me.apply_lifecycle_end(
+                                            me.gate.end_restart_after(Some(claimed_generation)),
+                                            LifecycleKind::Restart,
+                                        );
+                                        return;
+                                    }
+                                };
+                                if let Err(e) = me.restart_claimed(cfg, claimed_generation).await {
+                                    log::error!("去抖重启失败: {e}");
+                                }
+                            });
+                        }
+                        other => log::info!("去抖重启未执行：{other:?}"),
+                    }
+                });
+    }
+
+    /// Lock order: selector intent → force snapshot → lifecycle gate. The selector mutex also
+    /// serializes a new selection's publication, so a selected-only restart cannot claim stale
+    /// intent and then stop the core after a newer selection has taken ownership.
+    pub(super) fn claim_debounced_restart(
+        &self,
+        force_id: Option<u64>,
+        scheduled_generation: u64,
+        ticket: u64,
+    ) -> Option<(Option<Value>, u64)> {
+        self.selector_reconcile.with_intent_claim(|current_intent| {
+            let mut pending = self
+                .pending_force_restart
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self.debounced.is_current_ticket(ticket) {
+                return None;
+            }
+            let snapshot = match (force_id, pending.as_ref()) {
+                (Some(want), Some((id, value, source))) if want == *id => {
+                    if let super::ForceRestartSource::Selected { intent_generation } = source {
+                        if *intent_generation != current_intent {
+                            *pending = None;
+                            if self.gate.pending().force_restart_id == Some(want) {
+                                self.gate.clear_force_restart();
+                            }
+                            return None;
+                        }
+                    }
+                    Some(value.clone())
+                }
+                (None, None) => None,
+                // A newer Apply replaced the snapshot after the timer decided, or a force
+                // snapshot appeared after a plain timer decided. Leave the new owner intact.
+                _ => return None,
+            };
+            let generation = self
+                .gate
+                .try_begin_restart(scheduled_generation, force_id)?;
+            self.gen_changed.notify_waiters();
+            if force_id.is_some() {
+                *pending = None;
+            }
+            Some((snapshot, generation))
+        })
     }
 
     /// 置错误态（起核失败）。

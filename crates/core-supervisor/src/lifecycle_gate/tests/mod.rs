@@ -144,6 +144,126 @@ fn generation_is_monotonic_per_bump() {
 }
 
 #[test]
+fn debounced_restart_claim_requeues_exact_force_id_when_busy() {
+    let gate = LifecycleGate::default();
+    let generation = gate.generation();
+    gate.begin();
+    assert_eq!(gate.try_begin_restart(generation, Some(41)), None);
+    assert_eq!(gate.generation(), generation);
+    assert_eq!(gate.pending().force_restart_id, Some(41));
+    assert!(gate.pending().restart_pending);
+    let LifecycleEndResult::Drained(drain) = gate.end(LifecycleKind::Start) else {
+        panic!("the busy owner must drain the exact pending restart")
+    };
+    assert!(drain.schedule_restart);
+    assert_eq!(
+        gate.try_begin_restart(generation, Some(41)),
+        Some(generation + 1)
+    );
+    assert_eq!(gate.depth(), 1);
+    assert_eq!(
+        gate.generation_state(),
+        (generation + 1, Some(LifecycleKind::Restart))
+    );
+    assert!(matches!(
+        gate.end_restart_after(Some(generation + 1)),
+        LifecycleEndResult::Drained(_)
+    ));
+    assert_eq!(gate.depth(), 0);
+}
+
+#[test]
+fn explicit_stop_supersedes_claimed_restart_and_discards_pending() {
+    let gate = LifecycleGate::default();
+    let claimed = gate
+        .try_begin_restart(gate.generation(), None)
+        .expect("idle restart claims the outer lifecycle");
+    gate.set_switch_pending(23);
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    assert!(stop > claimed);
+    assert_eq!(gate.generation_state(), (stop, Some(LifecycleKind::Stop)));
+    assert!(matches!(
+        gate.end_restart_after(Some(claimed)),
+        LifecycleEndResult::Stopped(_)
+    ));
+    assert!(gate.pending().is_empty());
+}
+
+#[test]
+fn stale_debounced_restart_neither_claims_nor_requeues() {
+    let gate = LifecycleGate::default();
+    let old = gate.generation();
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    assert_eq!(gate.try_begin_restart(old, Some(12)), None);
+    assert_eq!(gate.generation(), stop);
+    assert!(gate.pending().is_empty());
+}
+
+#[test]
+fn stale_timer_does_not_take_a_new_apply_force_id() {
+    let gate = LifecycleGate::default();
+    let old = gate.generation();
+    gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    gate.set_force_restart(73);
+    assert!(gate
+        .debounced_restart_decision_if_current(old, true)
+        .is_none());
+    assert_eq!(gate.pending().force_restart_id, Some(73));
+    assert!(matches!(
+        gate.debounced_restart_decision_if_current(gate.generation(), true),
+        Some(DebouncedDecision::Proceed(Some(73)))
+    ));
+}
+
+#[test]
+fn stale_restart_cannot_claim_after_stop_and_stop_owns_pending() {
+    let gate = LifecycleGate::default();
+    let old = gate.generation();
+    gate.begin(); // 旧 restart 外层
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    assert_eq!(gate.claim_generation(Some(old), LifecycleKind::Stop), None);
+    assert_eq!(gate.claim_generation(Some(old), LifecycleKind::Start), None);
+    assert_eq!(gate.generation(), stop, "失败认领不得推进世代");
+    gate.set_switch_pending(7);
+    assert!(matches!(
+        gate.end_restart_after(None),
+        LifecycleEndResult::Stopped(_)
+    ));
+    assert!(gate.pending().is_empty(), "新 stop 的终态丢弃待决切换");
+    assert_eq!(gate.depth(), 0);
+}
+
+#[test]
+fn superseded_restart_preserves_new_start_pending() {
+    let gate = LifecycleGate::default();
+    gate.begin(); // 旧 restart 外层
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    let _new_start = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    gate.set_switch_pending(8);
+    let LifecycleEndResult::Drained(drain) = gate.end_restart_after(Some(stop)) else {
+        panic!("新 start 接管后旧 restart 不得以 Stop 清掉新会话 pending")
+    };
+    assert_eq!(drain.replay_switch_id, Some(8));
+    assert_eq!(gate.depth(), 0);
+}
+
+#[test]
+fn owned_restart_start_claim_drains_normally() {
+    let gate = LifecycleGate::default();
+    gate.begin();
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    let start = gate
+        .claim_generation(Some(stop), LifecycleKind::Start)
+        .expect("stop 后无新起停，重启应可认领起核");
+    gate.set_switch_pending(9);
+    let LifecycleEndResult::Drained(drain) = gate.end_restart_after(Some(start)) else {
+        panic!("正常 restart 应排空 pending")
+    };
+    assert_eq!(drain.replay_switch_id, Some(9));
+    assert_eq!(gate.depth(), 0);
+}
+
+#[test]
 fn debounced_defer_when_busy_overrides_core_state() {
     // #3：depth>0 必须先判（置 pending），即使核已停也不能进 CoreStopped 分支（顺序不可颠倒）。
     let g = LifecycleGate::default();

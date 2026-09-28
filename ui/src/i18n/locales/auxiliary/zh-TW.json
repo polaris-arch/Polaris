@@ -41,7 +41,10 @@
     "quit": "結束 Polaris",
     "manageInMain": "在主視窗管理…",
     "actionFailed": "「{{action}}」失敗：{{detail}}",
-    "actionFailedDetail": "操作未完成"
+    "actionFailedDetail": "操作未完成",
+    "switchPending": "已送出切換至 {{node}} 的請求，請查看連線狀態",
+    "switchSavedForNextStart": "{{node}} 已儲存，下次連線時生效",
+    "switchRequiresApply": "{{node}} 已儲存，請套用待處理變更後使用"
   },
   "updatePopup": {
     "newVersion": "發現新版本 {{version}}",
