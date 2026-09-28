@@ -95,6 +95,8 @@ fn to_outcome(decision: DebouncedDecision, gen_changed: bool) -> DebouncedOutcom
 pub struct DebouncedRestart {
     gate: Arc<LifecycleGate>,
     schedule_epoch: Arc<AtomicU64>,
+    /// Serializes ticket publication/invalidation with the gate decision that consumes a force id.
+    decision_guard: Arc<Mutex<()>>,
     active_timer: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
@@ -104,6 +106,7 @@ impl DebouncedRestart {
         Self {
             gate,
             schedule_epoch: Arc::new(AtomicU64::new(0)),
+            decision_guard: Arc::new(Mutex::new(())),
             active_timer: Arc::new(Mutex::new(None)),
         }
     }
@@ -123,7 +126,20 @@ impl DebouncedRestart {
     where
         F: FnOnce(DebouncedOutcome) + Send + 'static,
     {
+        self.schedule_with_ticket(core_running, move |outcome, _| on_fire(outcome))
+    }
+
+    /// The ticket remains checkable after the callback has fired but before its async restart
+    /// claims ownership. A successful newer hot switch can invalidate that already-fired task.
+    pub fn schedule_with_ticket<F>(&self, core_running: bool, on_fire: F) -> DebouncedHandle
+    where
+        F: FnOnce(DebouncedOutcome, u64) + Send + 'static,
+    {
         let gate = self.gate.clone();
+        let decision_guard = Arc::clone(&self.decision_guard);
+        let _publication = decision_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let epoch = self.schedule_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let schedule_epoch = Arc::clone(&self.schedule_epoch);
         // 世代快照：防 timer 回调打到已换的核（Polaris scheduleConnectionFlush 同款守卫）。
@@ -141,6 +157,7 @@ impl DebouncedRestart {
             previous.notify_one();
         }
         let cancel_for_task = cancel.clone();
+        let timer_decision_guard = Arc::clone(&decision_guard);
         let join = tokio::spawn(async move {
             // 去抖延迟（可被显式 cancel 中断；handle drop 不中断）。
             tokio::select! {
@@ -148,13 +165,21 @@ impl DebouncedRestart {
                 _ = cancel_for_task.notified() => return,
             }
             // cancel 与 sleep 同时 ready 时 select 的选择没有先后保证；epoch 是第二道、无歧义的 newer-wins 门。
-            if schedule_epoch.load(Ordering::SeqCst) != epoch {
-                return;
-            }
-            // trailing 回调：世代守卫 + gate 顺序门决策。
-            let gen_changed = gate.generation() != gen0;
-            let decision = gate.debounced_restart_decision(core_running);
-            on_fire(to_outcome(decision, gen_changed));
+            let outcome = {
+                let _decision = timer_decision_guard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if schedule_epoch.load(Ordering::SeqCst) != epoch {
+                    return;
+                }
+                // A replacement/invalidation cannot publish a new force id between the ticket
+                // check and this consuming decision.
+                gate.debounced_restart_decision_if_current(gen0, core_running)
+                    .map_or(DebouncedOutcome::Superseded, |decision| {
+                        to_outcome(decision, false)
+                    })
+            };
+            on_fire(outcome, epoch);
         });
         DebouncedHandle {
             cancel: Some(cancel),
@@ -162,12 +187,62 @@ impl DebouncedRestart {
         }
     }
 
+    pub fn is_current_ticket(&self, ticket: u64) -> bool {
+        self.schedule_epoch.load(Ordering::SeqCst) == ticket
+    }
+
+    /// Cancel a pending timer and invalidate a callback that already fired but has not claimed
+    /// its lifecycle. The caller must remove the corresponding force snapshot under its own lock.
+    pub fn invalidate_pending(&self) {
+        let _decision = self
+            .decision_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.schedule_epoch.fetch_add(1, Ordering::SeqCst);
+        if let Some(active) = self
+            .active_timer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            active.notify_one();
+        }
+    }
+
+    /// Replace a selected-only force id and invalidate its older timer as one decision-level
+    /// operation. On a rejected generation/busy gate, the prior timer remains intact.
+    pub fn replace_force_if_current(&self, expected_generation: u64, id: u64) -> bool {
+        let _decision = self
+            .decision_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self
+            .gate
+            .set_force_restart_if_current(expected_generation, id)
+        {
+            return false;
+        }
+        self.schedule_epoch.fetch_add(1, Ordering::SeqCst);
+        if let Some(active) = self
+            .active_timer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            active.notify_one();
+        }
+        true
+    }
+
     /// 同步立即触发一次去抖决策（不经 timer）——用于测试 / endLifecycleOp 排空时的即时查询。
     ///
     /// 不调度延迟，直接查 gate 当前状态。带世代守卫（`gen_changed` 由调用方传入）。
     pub fn decide_now(&self, core_running: bool, gen_changed: bool) -> DebouncedOutcome {
+        if gen_changed {
+            return DebouncedOutcome::Superseded;
+        }
         let decision = self.gate.debounced_restart_decision(core_running);
-        to_outcome(decision, gen_changed)
+        to_outcome(decision, false)
     }
 
     /// 通知 lifecycle 操作开始（beginLifecycleOp，L1522）。depth += 1。

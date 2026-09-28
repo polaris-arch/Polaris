@@ -1,8 +1,17 @@
 //! 待应用节点差集（pull `proxy:getPendingChanges` + push `event:proxyPendingChanges`）与
 //! 延迟配置删除 journal 消费。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
+use polaris_config_engine::builder::helpers::{effective_app_rules, effective_custom_rules};
+use polaris_config_engine::builder::orchestration::config_generation_norm;
+use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::rule::RuleAction;
+use polaris_config_engine::user_config::ProxyMode;
+use serde_json::Value;
 
 use crate::runtime::config::DeferredConfigDeletion;
 use crate::runtime::node_fingerprints;
@@ -40,9 +49,50 @@ pub struct PendingChangesSummary {
     /// 差集恒空却确实需要重启才生效。少了这一位，「保存」在条上就是完全无痕的
     /// —— 与本仓刚收口的「第四类重启」同一种静默。
     ///
-    /// 真值来源是 `switch_mode` 的记账（`ProxyRuntime::restart_deferred`），不是现算的 norm 对比
-    /// （后者在 kind=rules 热切后恒真，理由见该字段注释）。
+    /// 真值来源是已应用 `current_config` 与磁盘 D 的有效生成投影、外化文件及规则 selector 目标。
+    /// 起核快照只作节点身份分母：规则热切后它会落后于已应用 R，不能用于本字段。
     pub restart_deferred: bool,
+}
+
+/// 与 `generate_rule_selectors` 同一组有效性判据；比较目标值而非目标 id 集合，
+/// 才不会漏掉两条规则把 A/B 目标对调的保存债。
+fn effective_rule_selector_targets(config: &UserConfig) -> BTreeMap<String, Option<String>> {
+    if config.proxy_mode != ProxyMode::Smart {
+        return BTreeMap::new();
+    }
+    let mut targets = BTreeMap::new();
+    for rule in effective_custom_rules("smart", config.effective_traffic_rules()) {
+        if rule.enabled && rule.route_action() == Some(RuleAction::Proxy) {
+            targets.insert(
+                format!("custom:{}", rule.id),
+                rule.route_target_server_id().map(str::to_owned),
+            );
+        }
+    }
+    for rule in effective_app_rules(
+        config.app_routing_enabled != Some(false),
+        "smart",
+        &config.app_rules,
+    ) {
+        if rule.enabled && rule.action == RuleAction::Proxy {
+            targets.insert(format!("app:{}", rule.app_id), rule.target_server_id);
+        }
+    }
+    targets
+}
+
+/// `Some` means both sides parsed and the non-node difference is known. The old atomic marker
+/// remains a conservative fallback only when either side cannot be projected.
+fn non_node_runtime_debt(applied: &Value, disk: &Value) -> Option<bool> {
+    let applied: UserConfig = serde_json::from_value(applied.clone()).ok()?;
+    let disk: UserConfig = serde_json::from_value(disk.clone()).ok()?;
+    let no_servers = BTreeSet::new();
+    Some(
+        config_generation_norm(&applied, Some(&no_servers))
+            != config_generation_norm(&disk, Some(&no_servers))
+            || build_custom_rule_files(&applied) != build_custom_rule_files(&disk)
+            || effective_rule_selector_targets(&applied) != effective_rule_selector_targets(&disk),
+    )
 }
 
 impl ProxyRuntime {
@@ -55,8 +105,9 @@ impl ProxyRuntime {
     ///
     /// # 接线不变式：差集有**两侧**，两侧都得推
     ///
-    /// `pending_changes()` = f(分子: `config.current()`，分母: `startup_snapshot` + `switch_snapshot`
-    /// + `restart_deferred`)。**任一侧被改写都改变差集**，故 PUSH 必须挂在两侧各自的写入点上：
+    /// `pending_changes()` = f(分子: `config.current()`，节点分母: `startup_snapshot` +
+    /// `switch_snapshot`，非节点分母: 已应用 `current_config`)。解析失败才保守使用
+    /// `restart_deferred` 标记。**任一侧被改写都改变差集**，故 PUSH 必须挂在两侧各自的写入点上：
     ///
     /// - **分子**（配置变了）→ [`switch_mode_with`](Self::switch_mode_with) 尾。
     /// - **分母**（运行核换了）→ [`start`](Self::start) 成功收口与 [`stop_inner`](Self::stop_inner)
@@ -141,19 +192,23 @@ impl ProxyRuntime {
         // 显式选择只改磁盘 D 而目标不在当前核时，没有节点增/改/删也可能留下
         // selectedServerId 债。直接比 D/R 真值，切回运行出口后自然清掉，不污染“保存未应用”
         // 的独立 restart_deferred 标记。
-        let selected_pending = self
+        let applied = self
             .current_config
             .read()
             .ok()
-            .and_then(|g| g.as_ref().cloned())
-            .is_some_and(|runtime| {
-                runtime.get("selectedServerId") != current.get("selectedServerId")
-            });
+            .and_then(|g| g.as_ref().cloned());
+        let selected_pending = applied.as_ref().is_some_and(|runtime| {
+            runtime.get("selectedServerId") != current.get("selectedServerId")
+        });
+        let non_node_pending = applied
+            .as_ref()
+            .and_then(|runtime| non_node_runtime_debt(runtime, &current))
+            .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
         PendingChangesSummary {
             added,
             modified,
             removed,
-            restart_deferred: self.restart_deferred.load(Ordering::SeqCst) || selected_pending,
+            restart_deferred: non_node_pending || selected_pending,
         }
     }
 
@@ -180,10 +235,15 @@ impl ProxyRuntime {
 
         // 1. lifecycle 在飞 → 排入 drain（由 end() depth 归零时排空一次）。
         if self.gate.is_busy() {
-            if let Ok(mut g) = self.pending_force_restart.write() {
-                *g = Some((id, new_config));
+            {
+                let mut pending = self
+                    .pending_force_restart
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.debounced.invalidate_pending();
+                *pending = Some((id, new_config, super::ForceRestartSource::Full));
+                self.gate.set_force_restart(id);
             }
-            self.gate.set_force_restart(id);
             self.gate.set_restart_pending();
             log::info!("applyPendingChanges：lifecycle 在飞（depth>0）→ deferred（排入 drain）");
             return "deferred";
@@ -196,10 +256,15 @@ impl ProxyRuntime {
             return "skipped";
         }
         // 3. depth=0 且运行中 → 去抖重启（drain 亦读专用字段，绕开潜在覆盖）。
-        if let Ok(mut g) = self.pending_force_restart.write() {
-            *g = Some((id, new_config));
+        {
+            let mut pending = self
+                .pending_force_restart
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.debounced.invalidate_pending();
+            *pending = Some((id, new_config, super::ForceRestartSource::Full));
+            self.gate.set_force_restart(id);
         }
-        self.gate.set_force_restart(id);
         self.schedule_restart();
         log::info!("applyPendingChanges：运行中 + 非在飞 → applied（已排程去抖重启）");
         "applied"

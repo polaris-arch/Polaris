@@ -629,9 +629,8 @@ impl ProxyRuntime {
         // `push_lifecycle(stopped)` 同上必须相邻：核停了就谈不上「正在应用」，条该离开转圈态。
         self.push_pending_changes();
         self.push_lifecycle(&ProxyLifecycleEvent::stopped());
-        if let Ok(mut g) = self.pending_force_restart.write() {
-            *g = None;
-        }
+        // A restart's stop leg may await while a newer Apply queues its own full snapshot.
+        // Only the terminal Stop outcome discards pending work; clearing here loses that Apply.
         // 核停 → 热切换基准失效（上游 :1386-1388）。留着会让下次 switch_mode 拿「上一个核」的
         // id→tag 去 PUT 新核里不存在的成员。current_config 保留（上游 :1758 未运行腿仍读写它）。
         if let Ok(mut g) = self.switch_snapshot.write() {
@@ -680,7 +679,27 @@ impl ProxyRuntime {
         expected_generation: Option<u64>,
     ) -> Result<ProxyStatus, StartError> {
         self.gate.begin(); // restart 外层 begin（上游 beginLifecycleOp，:1500）→ depth≥1 不变式起点。
-        let leg = self.restart_inner(config, expected_generation).await;
+        self.restart_with_claim(config, StopClaim::Request(expected_generation))
+            .await
+    }
+
+    /// The debounced timer already claimed both the stop generation and outer lifecycle depth
+    /// under the gate lock. Do not claim a second generation or begin a second outer scope.
+    async fn restart_claimed(
+        self: &Arc<Self>,
+        config: Value,
+        claimed_generation: u64,
+    ) -> Result<ProxyStatus, StartError> {
+        self.restart_with_claim(config, StopClaim::AlreadyClaimed(claimed_generation))
+            .await
+    }
+
+    async fn restart_with_claim(
+        self: &Arc<Self>,
+        config: Value,
+        claim: StopClaim,
+    ) -> Result<ProxyStatus, StartError> {
+        let leg = self.restart_inner(config, claim).await;
         // finish 恒执行。最新 owner 若为 Stop，旧 restart 归零时须按停止终态丢弃 pending；
         // 若为新显式 Start，则保留其 pending 排空。判定与 end 在 gate 同一把锁内。
         match leg {
@@ -703,11 +722,7 @@ impl ProxyRuntime {
     }
 
     /// [`restart`](Self::restart) 内层：瞬态停核 + 重建。外层 begin/finish 由 `restart` 持有（depth≥1 不变式）。
-    async fn restart_inner(
-        self: &Arc<Self>,
-        config: Value,
-        expected_generation: Option<u64>,
-    ) -> RestartLeg {
+    async fn restart_inner(self: &Arc<Self>, config: Value, claim: StopClaim) -> RestartLeg {
         // 旧接管模式以就绪时的 startup_snapshot 为准，须在 stop_inner 清快照之前取。
         // 去抖重启的目标配置由调用方传入（timer 从最新 D/显式 force 快照取），不是旧核快照。
         let old_mode = self
@@ -725,10 +740,7 @@ impl ProxyRuntime {
             .lock()
             .ok()
             .and_then(|state| state.managed_tun_interface.clone());
-        let stop_generation = match self
-            .stop_inner(StopClaim::Request(expected_generation))
-            .await
-        {
+        let stop_generation = match self.stop_inner(claim).await {
             Ok(Some(generation)) => generation,
             Ok(None) => return RestartLeg::Superseded,
             Err(error) => return RestartLeg::Finished(Err(error.into()), None),
@@ -848,41 +860,89 @@ impl ProxyRuntime {
     pub(super) fn schedule_restart_for_generation(self: &Arc<Self>, scheduled_generation: u64) {
         let me = Arc::clone(self);
         // handle 不持有：drop 不取消 task（task 自查 gate 决策，过期自行 Superseded）。
-        let _handle = self
-            .debounced
-            .schedule(self.core_running(), move |outcome| {
-                match outcome {
-                    DebouncedOutcome::Proceed(force_id) => {
-                        tokio::spawn(async move {
-                            // H-1：优先读 force-restart 专用快照（in-flight start 会覆盖 currentConfig）。
-                            let cfg = me.take_force_restart_config(force_id);
-                            let cfg = match cfg.or_else(|| me.config.current().ok()) {
-                                Some(c) => c,
-                                None => {
-                                    log::warn!("去抖重启：无可用配置 → 放弃");
+        let _handle =
+            self.debounced
+                .schedule_with_ticket(self.core_running(), move |outcome, ticket| {
+                    match outcome {
+                        DebouncedOutcome::Proceed(force_id) => {
+                            tokio::spawn(async move {
+                                // Claim the exact snapshot, selector intent, lifecycle generation,
+                                // and outer depth before any await. An obsolete force id must never
+                                // fall back to the full disk config.
+                                let Some((snapshot, claimed_generation)) = me
+                                    .claim_debounced_restart(
+                                        force_id,
+                                        scheduled_generation,
+                                        ticket,
+                                    )
+                                else {
                                     return;
+                                };
+                                let cfg = match snapshot.or_else(|| me.config.current().ok()) {
+                                    Some(c) => c,
+                                    None => {
+                                        log::warn!("去抖重启：无可用配置 → 放弃");
+                                        me.apply_lifecycle_end(
+                                            me.gate.end_restart_after(Some(claimed_generation)),
+                                            LifecycleKind::Restart,
+                                        );
+                                        return;
+                                    }
+                                };
+                                if let Err(e) = me.restart_claimed(cfg, claimed_generation).await {
+                                    log::error!("去抖重启失败: {e}");
                                 }
-                            };
-                            if let Err(e) =
-                                me.restart_guarded(cfg, Some(scheduled_generation)).await
-                            {
-                                log::error!("去抖重启失败: {e}");
-                            }
-                        });
+                            });
+                        }
+                        other => log::info!("去抖重启未执行：{other:?}"),
                     }
-                    other => log::info!("去抖重启未执行：{other:?}"),
-                }
-            });
+                });
     }
 
-    /// 取出并清除 force-restart 专用配置快照（id 对得上才取；对不上回落 None）。
-    pub(super) fn take_force_restart_config(&self, id: Option<u64>) -> Option<Value> {
-        let mut g = self.pending_force_restart.write().ok()?;
-        match (&*g, id) {
-            (Some((sid, _)), Some(want)) if *sid == want => g.take().map(|(_, c)| c),
-            // id 为 None（用 currentConfig）或对不上（更新的 apply 已换快照）→ 不消费。
-            _ => None,
-        }
+    /// Lock order: selector intent → force snapshot → lifecycle gate. The selector mutex also
+    /// serializes a new selection's publication, so a selected-only restart cannot claim stale
+    /// intent and then stop the core after a newer selection has taken ownership.
+    pub(super) fn claim_debounced_restart(
+        &self,
+        force_id: Option<u64>,
+        scheduled_generation: u64,
+        ticket: u64,
+    ) -> Option<(Option<Value>, u64)> {
+        self.selector_reconcile.with_intent_claim(|current_intent| {
+            let mut pending = self
+                .pending_force_restart
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self.debounced.is_current_ticket(ticket) {
+                return None;
+            }
+            let snapshot = match (force_id, pending.as_ref()) {
+                (Some(want), Some((id, value, source))) if want == *id => {
+                    if let super::ForceRestartSource::Selected { intent_generation } = source {
+                        if *intent_generation != current_intent {
+                            *pending = None;
+                            if self.gate.pending().force_restart_id == Some(want) {
+                                self.gate.clear_force_restart();
+                            }
+                            return None;
+                        }
+                    }
+                    Some(value.clone())
+                }
+                (None, None) => None,
+                // A newer Apply replaced the snapshot after the timer decided, or a force
+                // snapshot appeared after a plain timer decided. Leave the new owner intact.
+                _ => return None,
+            };
+            let generation = self
+                .gate
+                .try_begin_restart(scheduled_generation, force_id)?;
+            self.gen_changed.notify_waiters();
+            if force_id.is_some() {
+                *pending = None;
+            }
+            Some((snapshot, generation))
+        })
     }
 
     /// 置错误态（起核失败）。

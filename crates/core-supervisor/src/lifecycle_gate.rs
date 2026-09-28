@@ -168,6 +168,33 @@ impl LifecycleGate {
         Some(g.generation)
     }
 
+    /// Atomically claim a debounced restart and enter its outer lifecycle scope. A competing
+    /// lifecycle operation cannot enter between the generation check and `begin`. If already
+    /// busy, leave one trailing restart for the current owner to drain.
+    pub fn try_begin_restart(
+        &self,
+        expected_generation: u64,
+        force_id: Option<u64>,
+    ) -> Option<u64> {
+        let mut g = self.inner.lock().expect("lifecycle lock poisoned");
+        if g.generation != expected_generation {
+            return None;
+        }
+        if g.depth != 0 {
+            g.pending.restart_pending = true;
+            // Proceed already consumed this id. Requeue the same exact snapshot for drain;
+            // otherwise the next timer would see None and incorrectly read full disk D.
+            if let Some(id) = force_id {
+                g.pending.force_restart_id = Some(id);
+            }
+            return None;
+        }
+        g.generation = g.generation.wrapping_add(1);
+        g.generation_owner = Some(LifecycleKind::Stop);
+        g.depth = 1;
+        Some(g.generation)
+    }
+
     /// 当前世代（供 readiness/recovery 比对让位，:4522/5960）。
     pub fn generation(&self) -> u64 {
         self.inner
@@ -272,6 +299,27 @@ impl LifecycleGate {
     /// 不是重启），一律不碰。
     pub fn debounced_restart_decision(&self, core_running: bool) -> DebouncedDecision {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
+        Self::debounced_restart_decision_locked(&mut g, core_running)
+    }
+
+    /// A stale timer must not consume a newer Apply's force id while deciding to yield.
+    /// Compare the captured generation and take the id under one gate lock.
+    pub fn debounced_restart_decision_if_current(
+        &self,
+        expected_generation: u64,
+        core_running: bool,
+    ) -> Option<DebouncedDecision> {
+        let mut g = self.inner.lock().expect("lifecycle lock poisoned");
+        if g.generation != expected_generation {
+            return None;
+        }
+        Some(Self::debounced_restart_decision_locked(
+            &mut g,
+            core_running,
+        ))
+    }
+
+    fn debounced_restart_decision_locked(g: &mut Inner, core_running: bool) -> DebouncedDecision {
         // 1. depth>0 → 置 pending，由 end 排空（#1/#3，顺序不可颠倒）。
         if g.depth > 0 {
             g.pending.restart_pending = true;

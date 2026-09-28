@@ -1158,6 +1158,16 @@ pub struct SpeedProbeTargets {
 /// 代理运行时（`State`-managed，单实例）。
 ///
 /// 持有 config / helper / mesh 引用（跨运行时协作：启动需读 config + 可能经 helper 提权 + mesh exit route）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForceRestartSource {
+    /// An explicit Apply or full-config operation owns the snapshot; later selector intents only
+    /// update its selected id and must not revoke the authorized full restart.
+    Full,
+    /// Only the running projection may enter the restarted core. A newer selector intent
+    /// supersedes this snapshot unless it refreshes its target and ownership.
+    Selected { intent_generation: u64 },
+}
+
 pub struct ProxyRuntime {
     config: Arc<ConfigManager>,
     /// 提权 helper（C6-5 接线）：TUN 模式经它起停 root/SYSTEM 受管核（见 [`should_start_via_helper`](startup::should_start_via_helper)）。
@@ -1205,11 +1215,11 @@ pub struct ProxyRuntime {
     /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`Child`] 句柄）。
     /// 起核提交时置、停核/直起时清。
     core_via_helper: Arc<AtomicBool>,
-    /// H-1 强制重启专用配置快照（`(id, config)`）。
+    /// H-1 强制重启专用配置快照（`(id, config, source)`）。
     ///
     /// **不可用 currentConfig 替代**：in-flight start 腿会覆盖 currentConfig，drain 必须读本字段
     /// 才能重启到 apply 当时那份 cfg（上游 `pendingForceRestartConfig`，:1729-1730）。
-    pending_force_restart: RwLock<Option<(u64, Value)>>,
+    pending_force_restart: RwLock<Option<(u64, Value, ForceRestartSource)>>,
     /// force-restart 快照 id 发号器（LifecycleGate 只存不透明 id，载荷由本层关联）。
     force_restart_seq: AtomicU64,
     /// 最后**已应用**到运行核的配置（上游 `ProxyManager.currentConfig`）。

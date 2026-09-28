@@ -144,6 +144,61 @@ fn generation_is_monotonic_per_bump() {
 }
 
 #[test]
+fn debounced_restart_claim_requeues_exact_force_id_when_busy() {
+    let gate = LifecycleGate::default();
+    let generation = gate.generation();
+    gate.begin();
+    assert_eq!(gate.try_begin_restart(generation, Some(41)), None);
+    assert_eq!(gate.generation(), generation);
+    assert_eq!(gate.pending().force_restart_id, Some(41));
+    assert!(gate.pending().restart_pending);
+    let LifecycleEndResult::Drained(drain) = gate.end(LifecycleKind::Start) else {
+        panic!("the busy owner must drain the exact pending restart")
+    };
+    assert!(drain.schedule_restart);
+    assert_eq!(
+        gate.try_begin_restart(generation, Some(41)),
+        Some(generation + 1)
+    );
+    assert_eq!(gate.depth(), 1);
+    assert_eq!(
+        gate.generation_state(),
+        (generation + 1, Some(LifecycleKind::Stop))
+    );
+    assert!(matches!(
+        gate.end_restart_after(Some(generation + 1)),
+        LifecycleEndResult::Drained(_)
+    ));
+    assert_eq!(gate.depth(), 0);
+}
+
+#[test]
+fn stale_debounced_restart_neither_claims_nor_requeues() {
+    let gate = LifecycleGate::default();
+    let old = gate.generation();
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    assert_eq!(gate.try_begin_restart(old, Some(12)), None);
+    assert_eq!(gate.generation(), stop);
+    assert!(gate.pending().is_empty());
+}
+
+#[test]
+fn stale_timer_does_not_take_a_new_apply_force_id() {
+    let gate = LifecycleGate::default();
+    let old = gate.generation();
+    gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    gate.set_force_restart(73);
+    assert!(gate
+        .debounced_restart_decision_if_current(old, true)
+        .is_none());
+    assert_eq!(gate.pending().force_restart_id, Some(73));
+    assert!(matches!(
+        gate.debounced_restart_decision_if_current(gate.generation(), true),
+        Some(DebouncedDecision::Proceed(Some(73)))
+    ));
+}
+
+#[test]
 fn stale_restart_cannot_claim_after_stop_and_stop_owns_pending() {
     let gate = LifecycleGate::default();
     let old = gate.generation();

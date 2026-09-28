@@ -2811,8 +2811,9 @@ impl ProxyRuntime {
 
     /// 运行中外化规则「值」热更：仅原子替换内容变化的文件（rename-over 触发 sing-box fswatch 热重载），
     /// **绝不删文件**（运行中删被挂载文件会致 sing-box reload 报错；删除只在起核 `write_custom_rule_files`
-    /// 清扫）。移植 上游 `syncCustomRuleFiles`（:1688）。任一写失败 → 退回去抖重启兜底。
-    pub(super) async fn sync_custom_rule_files(self: &Arc<Self>, config: &UserConfig) {
+    /// 清扫）。移植 上游 `syncCustomRuleFiles`（:1688）。返回是否全部成功，由调用方按
+    /// Full/SelectedOnly 范围选择重启配置；此处不能自行从磁盘 D 排程。
+    pub(super) async fn sync_custom_rule_files(self: &Arc<Self>, config: &UserConfig) -> bool {
         let dir = self.custom_rules_dir();
         let expected = build_custom_rule_files(config);
         for (name, content) in &expected {
@@ -2823,10 +2824,10 @@ impl ProxyRuntime {
             }
             if let Err(e) = atomic_write_custom_rule(&file_path, content) {
                 log::warn!("热更外化规则文件失败，退回去抖重启：{name}（{e}）");
-                self.schedule_restart();
-                return;
+                return false;
             }
         }
+        true
     }
 
     /// 装配 [`GenerateConfigDeps`]（上游侧所有 `this.*` 实例态的真值注入）。

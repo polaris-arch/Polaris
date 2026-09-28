@@ -19,6 +19,44 @@ async fn stop_terminal_discards_pending_switch() {
     );
 }
 
+#[tokio::test]
+async fn apply_during_a_restart_stop_wait_keeps_its_exact_snapshot() {
+    let (rt, _dir) = test_runtime();
+    let disk = two_node_config(7891, "node-b");
+    rt.config.save_full(&disk).unwrap();
+    let held = rt.mesh.tailscale_state_gate().await;
+    let restart = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.restart(bad_config()).await })
+    };
+    for _ in 0..10_000 {
+        if rt.gate.is_busy() && rt.gate.generation() > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rt.gate.is_busy(),
+        "restart must own its outer lifecycle while stop waits"
+    );
+    assert_eq!(rt.apply_pending().await, "deferred");
+    let (id, saved, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+    assert_eq!(saved, rt.config.current().unwrap());
+    assert_eq!(source, ForceRestartSource::Full);
+    drop(held);
+    let _ = restart.await.unwrap(); // synthetic bad start may fail; the pending Apply must survive.
+    assert_eq!(
+        rt.pending_force_restart
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|(next, _, _)| *next),
+        Some(id),
+        "the transient stop leg must not clear an Apply received during its await"
+    );
+    rt.gate.bump_generation();
+}
+
 /// **生命周期 PUSH 与差集 PUSH 的配对守卫**（接线级，锚点失配自带 panic）。
 ///
 /// `ready`/`stopped` 两个 phase 必须与 `push_pending_changes()` **严格同处、紧邻**：它们是同一次
@@ -898,7 +936,7 @@ fn restart_cross_mode_proxy_cleanup_is_owned_and_between_legs() {
     let body = method_body(&module_code("runtime/proxy"), "    async fn restart_inner(");
     let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
     let stop = compact
-        .find("letstop_generation=matchself.stop_inner(StopClaim::Request(expected_generation)).await{")
+        .find("letstop_generation=matchself.stop_inner(claim).await{")
         .unwrap();
     let clear = compact
         .find("ifshould_clear_system_proxy_between_restart(old_mode,new_mode,platform)")

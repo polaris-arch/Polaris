@@ -719,6 +719,36 @@ impl ProxyRuntime {
             && self.selector_reconcile.intent_generation() == intent_generation
     }
 
+    /// The debounced Full restart claims the same intent lock before stopping the core. Keep
+    /// the final selected-only check and R commit together, so a completed PUT cannot publish
+    /// an obsolete running projection after that restart has claimed ownership. No disk config
+    /// is read under this lock (config writers acquire their lock before publishing intent).
+    fn with_selected_projection_claim(
+        self: &Arc<Self>,
+        projected: &Value,
+        generation: u64,
+        intent_generation: u64,
+        on_current: impl FnOnce(),
+    ) -> bool {
+        self.selector_reconcile.with_intent_claim(|current_intent| {
+            if current_intent != intent_generation {
+                return false;
+            }
+            if self.gate.generation() != generation || self.gate.is_busy() || !self.core_running() {
+                if self.gate.is_busy() {
+                    if let Some(server_id) =
+                        projected.get("selectedServerId").and_then(Value::as_str)
+                    {
+                        self.queue_selected_switch(server_id, intent_generation);
+                    }
+                }
+                return false;
+            }
+            on_current();
+            true
+        })
+    }
+
     /// IPC 最终回执必须重新看意图与起停所有权。旧 PUT 即使返回 Pending，若已被
     /// 新选择或 Stop 接管，也不能伪称仍有一条属于它的排队操作。
     pub(crate) fn settle_selected_switch_receipt(
@@ -978,10 +1008,14 @@ impl ProxyRuntime {
                             intent_generation,
                         );
                     }
-                    if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || self.commit_selected_projection(&new_config, intent_generation),
+                    ) {
                         return SwitchOutcome::Pending;
                     }
-                    self.commit_selected_projection(&new_config);
                 } else if let Ok(mut g) = self.current_config.write() {
                     *g = Some(new_config.clone());
                 }
@@ -1017,8 +1051,17 @@ impl ProxyRuntime {
                 );
                 match self.execute_hot_switch_plan(&plan, interrupt).await {
                     HotSwitchOutcome::Applied { disconnect } => {
-                        if !self.selector_operation_is_current(switch_generation, intent_generation)
-                        {
+                        let current = if scope == SwitchApplyScope::SelectedOnly {
+                            self.with_selected_projection_claim(
+                                &new_config,
+                                switch_generation,
+                                intent_generation,
+                                || {},
+                            )
+                        } else {
+                            self.selector_operation_is_current(switch_generation, intent_generation)
+                        };
+                        if !current {
                             self.selector_reconcile.mark_required();
                             log::info!(
                                 "switchMode：selector PUT 后发现更新配置意图/内核世代 → 交给新所有者收敛"
@@ -1028,9 +1071,12 @@ impl ProxyRuntime {
                         }
                         if scope == SwitchApplyScope::SelectedOnly {
                             let groups = self.read_selector_groups().await;
-                            if !self
-                                .selector_operation_is_current(switch_generation, intent_generation)
-                            {
+                            if !self.with_selected_projection_claim(
+                                &new_config,
+                                switch_generation,
+                                intent_generation,
+                                || {},
+                            ) {
                                 self.selector_reconcile.mark_required();
                                 return SwitchOutcome::Pending;
                             }
@@ -1044,7 +1090,15 @@ impl ProxyRuntime {
                                     intent_generation,
                                 );
                             }
-                            self.commit_selected_projection(&new_config);
+                            if !self.with_selected_projection_claim(
+                                &new_config,
+                                switch_generation,
+                                intent_generation,
+                                || self.commit_selected_projection(&new_config, intent_generation),
+                            ) {
+                                self.selector_reconcile.mark_required();
+                                return SwitchOutcome::Pending;
+                            }
                         } else {
                             self.commit_applied(&new_config);
                         }
@@ -1075,8 +1129,12 @@ impl ProxyRuntime {
                     // 见交付说明「边界声明」。
                     other => {
                         if scope == SwitchApplyScope::SelectedOnly
-                            && !self
-                                .selector_operation_is_current(switch_generation, intent_generation)
+                            && !self.with_selected_projection_claim(
+                                &new_config,
+                                switch_generation,
+                                intent_generation,
+                                || {},
+                            )
                         {
                             self.selector_reconcile.mark_required();
                             return SwitchOutcome::Pending;
@@ -1109,10 +1167,14 @@ impl ProxyRuntime {
                             intent_generation,
                         );
                     }
-                    if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || self.commit_selected_projection(&new_config, intent_generation),
+                    ) {
                         return SwitchOutcome::Pending;
                     }
-                    self.commit_selected_projection(&new_config);
                 } else {
                     self.commit_applied(&new_config);
                 }
@@ -1139,8 +1201,14 @@ impl ProxyRuntime {
             }
             SwitchDecision::Restart => {
                 if scope == SwitchApplyScope::SelectedOnly {
-                    self.defer_selected_switch("目标需要生成新的内核配置");
-                    return SwitchOutcome::Deferred;
+                    if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                        return SwitchOutcome::Pending;
+                    }
+                    return self.restart_selected_projection(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                    );
                 }
                 log::info!("switchMode：结构性变更 → 调度去抖重启");
                 self.apply_restart();
@@ -1157,10 +1225,23 @@ impl ProxyRuntime {
             // L3 外化规则「值」热更：norm 排除了外化规则的值 → 结构相等但值可能变（如「切节点 + 改外化规则
             // 值」同一次 save）。非重启腿（热切/no-op/defer）补一次文件对账（通常零 diff、幂等）。降级态文件
             // 无消费者 → 改走去抖重启重落盘（对齐 上游 三腿 :1806-1807/:1850-1851/:1877-1878）。
-            if self.custom_rule_files_degraded() {
-                self.schedule_restart();
+            let needs_rule_file_restart = if self.custom_rule_files_degraded() {
+                true
             } else {
-                self.sync_custom_rule_files(&new_cfg).await;
+                !self.sync_custom_rule_files(&new_cfg).await
+            };
+            if needs_rule_file_restart {
+                if scope == SwitchApplyScope::SelectedOnly {
+                    if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                        return SwitchOutcome::Pending;
+                    }
+                    return self.restart_selected_projection(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                    );
+                }
+                self.schedule_restart();
             }
             if let Some(reconcile_config) = self
                 .current_config
@@ -1518,30 +1599,45 @@ impl ProxyRuntime {
             *g = Some(new_config.clone());
         }
         if let Ok(mut g) = self.pending_force_restart.write() {
-            if let Some((id, _)) = g.take() {
-                *g = Some((id, new_config.clone()));
+            if let Some((id, _, _)) = g.take() {
+                *g = Some((id, new_config.clone(), super::ForceRestartSource::Full));
             }
         }
     }
 
     /// 显式选择只提交运行态投影。已排程的用户 Apply 快照保留全部获授权字段，
     /// 只将其 selectedServerId 刷到最新选择，不能被较窄的 R 投影整份覆盖。
-    fn commit_selected_projection(&self, projected: &Value) {
+    fn commit_selected_projection(self: &Arc<Self>, projected: &Value, intent_generation: u64) {
         if let Ok(mut current) = self.current_config.write() {
             *current = Some(projected.clone());
         }
         if let Some(selected) = projected.get("selectedServerId").cloned() {
             if let Ok(mut pending) = self.pending_force_restart.write() {
-                if let Some((_, config)) = pending.as_mut() {
+                if let Some((id, config, source)) = pending.as_mut() {
                     if let Some(object) = config.as_object_mut() {
                         object.insert("selectedServerId".into(), selected);
+                    }
+                    if matches!(source, super::ForceRestartSource::Selected { .. }) {
+                        // The new selection has now been strictly read back, so its predecessor's
+                        // selected-only restart is no longer needed. A degraded rule file is the
+                        // exception: the common tail below will schedule a fresh R projection.
+                        if !self.custom_rule_files_degraded() {
+                            let old_id = *id;
+                            *pending = None;
+                            self.debounced.invalidate_pending();
+                            if self.gate.pending().force_restart_id == Some(old_id) {
+                                self.gate.clear_force_restart();
+                            }
+                        } else {
+                            *source = super::ForceRestartSource::Selected { intent_generation };
+                        }
                     }
                 }
             }
         }
     }
 
-    /// 热切 PUT/读回失败的保守兜底：只重启运行态 R 的选择投影。
+    /// 热切 PUT/读回失败或选择引起结构性变化时，只重启运行态 R 的选择投影。
     /// pending_force_restart 若已经是用户明确 Apply 的完整 D，则保留它，只更新选择字段。
     fn restart_selected_projection(
         self: &Arc<Self>,
@@ -1556,11 +1652,11 @@ impl ProxyRuntime {
         if let Ok(mut pending) = self.pending_force_restart.write() {
             let id = pending.as_ref().map_or_else(
                 || self.force_restart_seq.fetch_add(1, Ordering::SeqCst),
-                |(id, _)| *id,
+                |(id, _, _)| *id,
             );
             if !self
-                .gate
-                .set_force_restart_if_current(expected_generation, id)
+                .debounced
+                .replace_force_if_current(expected_generation, id)
             {
                 drop(pending);
                 if self.gate.is_busy()
@@ -1572,12 +1668,19 @@ impl ProxyRuntime {
                 }
                 return SwitchOutcome::Pending;
             }
-            if let Some((_, config)) = pending.as_mut() {
+            if let Some((_, config, source)) = pending.as_mut() {
                 if let Some(object) = config.as_object_mut() {
                     object.insert("selectedServerId".into(), selected);
                 }
+                if matches!(source, super::ForceRestartSource::Selected { .. }) {
+                    *source = super::ForceRestartSource::Selected { intent_generation };
+                }
             } else {
-                *pending = Some((id, projected.clone()));
+                *pending = Some((
+                    id,
+                    projected.clone(),
+                    super::ForceRestartSource::Selected { intent_generation },
+                ));
             }
         } else {
             self.defer_selected_switch("重启快照锁不可用");
@@ -1628,12 +1731,20 @@ impl ProxyRuntime {
 
     /// 重启腿收尾：保留当前运行态 R，**丢弃**旧 force-restart 快照 + 调度去抖重启。
     ///
-    /// 上游 :1886-1889：结构性重启用的是最新完整 config → 超代任何待决 force-restart 快照
-    /// （newer 胜，避免旧 force cfg 反 shadow 本次变更）。快照清空后，去抖回调按 id 取不到载荷 →
-    /// 自然回落 `config.current()`（磁盘上的最新配置）。
+    /// 上游 :1886-1889：结构性重启用的是最新完整 config → 超代任何待决 force-restart 快照。
+    /// 快照和 gate id 必须同一临界区一起清除；严格 id 认领不允许旧 id 回落到磁盘 D。
     fn apply_restart(self: &Arc<Self>) {
-        if let Ok(mut g) = self.pending_force_restart.write() {
-            *g = None;
+        {
+            let mut pending = self
+                .pending_force_restart
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old_id = pending.as_ref().map(|(id, _, _)| *id);
+            self.debounced.invalidate_pending();
+            *pending = None;
+            if old_id.is_some() && self.gate.pending().force_restart_id == old_id {
+                self.gate.clear_force_restart();
+            }
         }
         self.schedule_restart();
     }
