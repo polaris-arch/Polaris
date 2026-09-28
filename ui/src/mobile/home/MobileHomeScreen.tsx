@@ -80,6 +80,9 @@ import { isReverseRegionRouting } from '@/domain/region-routing';
 import { countryCodeToFlagAsset } from '@/domain/flag-assets';
 import { localizeRegion, resolveExitNodeFlagCode, resolveExitRegion } from '@/domain/exit-flag';
 import { deriveTsExitWarning } from '@/domain/tailscale-exit-warning';
+import { tsExitAction } from '../ts-exit-action';
+import { loginAttemptActive } from '@/domain/tailscale-login-progress';
+import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
 import { createTopicSubscription } from '@/lib/topic-subscription';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
 import { editRoute, stagedOnlyIds } from '@/lib/staged-config';
@@ -305,6 +308,8 @@ export function MobileHomeScreen(): ReactElement {
   const tsId = currentServer?.protocol?.toLowerCase() === 'tailscale' ? currentServer.id : undefined;
   const tsLoggedIn = useAppStore((s) => (tsId ? !!s.tailscaleLoginStates[tsId] : false));
   const tsStatus = useAppStore((s) => (tsId ? s.tailscaleStatuses[tsId] : undefined));
+  const tsAuthUrl = useAppStore((s) => (tsId ? s.tailscaleAuthUrls[tsId] : undefined));
+  const tsLoginAttempt = useTailscaleLoginProgressStore((s) => (tsId ? s.attempts[tsId] : undefined));
   const tsExitWarning = deriveTsExitWarning({
     selectedServer: currentServer,
     loggedIn: tsLoggedIn,
@@ -572,29 +577,17 @@ export function MobileHomeScreen(): ReactElement {
   );
 
 
-  /**
-   * TS 出口警示的动作。桌面那两个动作分别开「TS 设置弹窗」与「登录弹窗」。
-   *
-   * **登录**那一半仍不走弹窗：控制面已给 authURL 就开外部浏览器（登录本来就发生在浏览器里）。
-   * **选出口**那一半 2026-09-06（W-05）接上了 —— 移动端有了自己的表单宿主
-   * （`mobile/forms/**`），出口选择器只搬 `TsSettingsDialog.tsx:73` 那一格，候选构造与写回
-   * 全部复用带单测的纯函数。节点屏那处（`MobileNodesScreen#onTsExitAction`）是**同一条腿**，
-   * 分支顺序也逐字相同：authURL 在就先开浏览器，否则开选择器。
-   */
+  /** Match the action to the warning: missing auth URL must not open exit setup. */
   const onTsExitAction = useCallback(() => {
-    const url = tsStatus?.authURL;
-    if (!url) {
-      if (tsId === undefined) {
-        /* 结构上不可达（理由与节点屏那处逐字相同：`deriveTsExitWarning:67` 与 `tsId` 用的是
-           同一个谓词、同一个 `currentServer`）。日志而不是 UI 文案。 */
-        console.error('[mobile-home] TS exit action fired without a tailscale node');
-        return;
-      }
-      openMobileForm({ kind: 'ts-exit', serverId: tsId });
-      return;
+    if (tsId === undefined) return;
+    const storeUrl = !tsLoginAttempt || loginAttemptActive(tsLoginAttempt.phase) ? tsAuthUrl : null;
+    const action = tsExitAction(tsExitWarning, tsStatus?.authURL, storeUrl);
+    if (action.kind === 'login-url') {
+      void runWrite('switch-node', () => api.system.openExternal(action.url));
+    } else {
+      openMobileForm({ kind: action.kind === 'login-panel' ? 'ts-login' : 'ts-exit', serverId: tsId });
     }
-    void runWrite('switch-node', () => api.system.openExternal(url));
-  }, [tsStatus, tsId, runWrite]);
+  }, [tsExitWarning, tsStatus?.authURL, tsAuthUrl, tsLoginAttempt, tsId, runWrite, openMobileForm]);
 
   /* ── ⑦ 规则写腿。三个入口（快速两颗 / 新建 / 合并）共用一个控件 id 与一条暂存闸门 ──────── */
 

@@ -74,6 +74,9 @@ import {
 } from '@/domain/endpoint-routes';
 import { isMeshNode, meshAllowsInternet } from '@/domain/endpoint-routes';
 import { deriveTsExitWarning } from '@/domain/tailscale-exit-warning';
+import { tsExitAction } from '../ts-exit-action';
+import { loginAttemptActive } from '@/domain/tailscale-login-progress';
+import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
 import { deriveMeshTunnelHealth } from '@/domain/mesh-tunnel-health';
 import { invalidNodeReasonText } from '@/domain/invalid-node-reason';
 import { subscriptionErrorDetail } from '@/domain/subscription-error-text';
@@ -473,6 +476,7 @@ export function MobileNodesScreen(): ReactElement {
   const tsLoggedIn = useAppStore((s) => (tsId ? !!s.tailscaleLoginStates[tsId] : false));
   const tsStatus = useAppStore((s) => (tsId ? s.tailscaleStatuses[tsId] : undefined));
   const tsAuthUrl = useAppStore((s) => (tsId ? s.tailscaleAuthUrls[tsId] : undefined));
+  const tsLoginAttempt = useTailscaleLoginProgressStore((s) => (tsId ? s.attempts[tsId] : undefined));
   const tsExitWarning = deriveTsExitWarning({
     selectedServer,
     loggedIn: tsLoggedIn,
@@ -480,42 +484,17 @@ export function MobileNodesScreen(): ReactElement {
     proxyRunning,
     status: tsStatus,
   });
-  /**
-   * 桌面这条腿的两个动作分别开「TS 设置弹窗」与「登录弹窗」。
-   *
-   * **登录**那一半仍不走弹窗：控制面已经给了 authURL 就直接开外部浏览器（登录本来就发生在浏览器里）。
-   * **选出口**那一半 2026-09-06（W-05）接上了 —— 移动端有自己的表单宿主，出口选择器只搬
-   * `TsSettingsDialog.tsx:73` 那一格（候选构造复用带单测的纯函数 `exitNodeOptions`，
-   * 写回复用 `buildTsSettings` + `api.server.update`）。整张 TS 设置表不在本批射程内。
-   *
-   * 分支顺序是有意的：`needs-auth` 档下先要拿到 authURL 才谈得上选出口，故 authURL 在就先开浏览器。
-   */
+  /** Match the action to the warning, not merely the presence of an auth URL. */
   const onTsExitAction = useCallback(() => {
-    const url = tsStatus?.authURL || tsAuthUrl;
-    if (!url) {
-      if (tsId === undefined) {
-        /* **结构上不可达**：这颗按钮只在 `tsExitWarning !== 'none'` 时渲染，而
-           `deriveTsExitWarning:67` 的第一道守卫就是「选中节点不是 tailscale ⇒ 恒 'none'」——
-           与 `tsId` 用的是同一个谓词、同一个 `selectedServer`。留一行日志而不是一句 UI 文案：
-           面向用户的话在这里只能是一句永远说不出口的话，而那种话会随时间变成假的
-           （旧那句 `nodes.mobileTsExitNeedsDesktop` 就是这么活到今天的）。 */
-        console.error('[mobile-nodes] TS exit action fired without a tailscale node');
-        return;
-      }
-      openMobileForm({ kind: 'ts-exit', serverId: tsId });
+    if (tsId === undefined) return;
+    const storeUrl = !tsLoginAttempt || loginAttemptActive(tsLoginAttempt.phase) ? tsAuthUrl : null;
+    const action = tsExitAction(tsExitWarning, tsStatus?.authURL, storeUrl);
+    if (action.kind !== 'login-url') {
+      openMobileForm({ kind: action.kind === 'login-panel' ? 'ts-login' : 'ts-exit', serverId: tsId });
       return;
     }
-    /* 开外部浏览器同样会失败（系统没有可处理该 scheme 的应用、Tauri 的 opener 被拒）。
-       裁定 #14 的射程包含它：失败而无回显 = 用户点了「完成登录授权」什么也没发生。
-       文案取中性的 `errors.operationFailed`：旧那句「出口设备要在桌面端选」2026-09-06 起是**假的**
-       （出口选择器就在同一颗按钮的另一条分支上），而拿一句假话当错误提示比不提示更坏。 */
-    void runWrite(
-      async () => {
-        await api.system.openExternal(url);
-      },
-      () => t('errors.operationFailed'),
-    );
-  }, [tsStatus?.authURL, tsAuthUrl, tsId, runWrite, t]);
+    void runWrite(() => api.system.openExternal(action.url), () => t('errors.operationFailed'));
+  }, [tsExitWarning, tsStatus?.authURL, tsAuthUrl, tsLoginAttempt, tsId, runWrite, t, openMobileForm]);
 
   // ── 组网隧道健康：只在组网分组（IA 裁定 #3 后半）────────────────────────────
   const openVpnStatus = useVpnStatusStore((s) => (selectedServer ? s.openVpn[selectedServer.id] : undefined));

@@ -525,10 +525,10 @@ const SITES: readonly ActionSite[] = [
   {
     file: 'mobile/forms/TsSettingsPanel.tsx',
     callee: 'api.server.tailscaleLogout',
-    count: 1,
+    count: 2,
     route: 'ruled',
     op: 'server.tailscaleLogout',
-    why: '同 TsSettingsDialog：登出清的是磁盘上的 TS state 目录，盘上没有这个节点就没有作用对象；staged-only 节点必须挡住并提示先保存',
+    why: '正常登出与主核持有时用户确认断开后的第二次登出均清磁盘 TS state；staged-only 节点必须挡住并提示先保存，后者还复核节点仍在磁盘镜像中并由原生 writer gate 兜底',
   },
   {
     file: 'mobile/forms/WarpPanel.tsx',

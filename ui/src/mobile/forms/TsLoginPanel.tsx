@@ -19,7 +19,7 @@ import type { TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
 import { controlUrlReject } from '@/domain/control-url';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
-import { copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
+import { authorizeFromMainFrame, copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
 import { toast } from '@/lib/error-handler';
 import { useAppStore } from '@/store/app-store';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
@@ -43,6 +43,7 @@ export function TsLoginPanel({
   const loadConfig = useAppStore((s) => s.loadConfig);
   const setTailscaleAuthUrl = useAppStore((s) => s.setTailscaleAuthUrl);
   const setTailscaleLoginInitiated = useAppStore((s) => s.setTailscaleLoginInitiated);
+  const setTailscaleLoginState = useAppStore((s) => s.setTailscaleLoginState);
 
   /* `serverId` 是本面板身兼「新建」与「编辑既有节点」的判据：带 id = 给该节点换 key / 换控制面，
      不带 = 新建。**不回落成按协议 `.find()`** —— Tailscale 已不是单例
@@ -68,6 +69,8 @@ export function TsLoginPanel({
   type PendingLogin = { serverId: string; attemptId: string; source: 'transient' | 'main'; persisted: boolean };
   const [pending, setPending] = useState<PendingLogin | null>(null);
   const pendingRef = useRef<PendingLogin | null>(null);
+  const editedAfterSaveRef = useRef(false);
+  const editRevisionRef = useRef(0);
   const pendingServerId = pending?.serverId ?? null;
   const [mainSnapshot, setMainSnapshot] = useState<TailscaleStatusSnapshot | null>(null);
   const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
@@ -75,10 +78,11 @@ export function TsLoginPanel({
     pending,
   ));
 
-  /* 回显既有控制面地址（再次进入本面板时不该看起来像「没配过」）。 */
+  /* 回显既有控制面地址；保存回包不能覆盖提交期间新输入的草稿。 */
   useEffect(() => {
+    if (dirty) return;
     setControlUrl(existingTs?.tailscaleSettings?.controlUrl ?? '');
-  }, [existingTs?.id, existingTs?.tailscaleSettings?.controlUrl]);
+  }, [dirty, existingTs?.id, existingTs?.tailscaleSettings?.controlUrl]);
 
   /* 首次查询只驱动旧会话提示；提交 Auth Key 前会重新读取，读取失败中断，不操作旧会话。 */
   useEffect(() => {
@@ -152,6 +156,36 @@ export function TsLoginPanel({
     };
   }, [pending]);
 
+  // A main-core STATUS pull may be the only fresh Running frame after returning from the
+  // browser. It belongs to this prepared request only when the live core owns its configuration.
+  useEffect(() => {
+    if (pending?.source !== 'main' || !pending.persisted || progress?.phase !== 'mainCore'
+      || progress.reason || !mainSnapshot?.connected) return;
+    const frame = mainSnapshot.statuses.find((status) => status.serverId === pending.serverId);
+    if (!frame) return;
+    const authorized = authorizeFromMainFrame(progress, frame);
+    if (authorized && useTailscaleLoginProgressStore.getState().apply(authorized)) {
+      setTailscaleLoginState(pending.serverId, true);
+    }
+  }, [pending, progress, mainSnapshot, setTailscaleLoginState]);
+
+  // Authorization is a terminal receipt for this exact attempt. Detach before closing so the
+  // unmount cleanup cannot send a late native cancel for an already authorized session.
+  useEffect(() => {
+    if (!pending?.persisted || progress?.phase !== 'authorized' || !hasInstance(instanceId)) return;
+    const active = pendingRef.current;
+    const current = useTailscaleLoginProgressStore.getState().attempts[pending.serverId];
+    if (active?.serverId !== pending.serverId || active.attemptId !== pending.attemptId
+      || current?.attemptId !== pending.attemptId || current.phase !== 'authorized') return;
+    pendingRef.current = null;
+    setPending(null);
+    setTailscaleAuthUrl(pending.serverId, null);
+    setTailscaleLoginInitiated(pending.serverId, false);
+    setNotice({ tone: 'ok', text: t('ts.authorizationComplete') });
+    if (!editedAfterSaveRef.current) closeInstance(instanceId);
+  }, [pending, progress?.phase, hasInstance, instanceId, closeInstance,
+    setTailscaleAuthUrl, setTailscaleLoginInitiated, t]);
+
   const revokePendingLogin = (request: PendingLogin): void => {
     const current = useTailscaleLoginProgressStore.getState().attempts[request.serverId];
     if (current?.attemptId !== request.attemptId) return;
@@ -163,6 +197,8 @@ export function TsLoginPanel({
   };
 
   const cancelPendingLogin = async (request: PendingLogin, detached = false): Promise<boolean> => {
+    const current = useTailscaleLoginProgressStore.getState().attempts[request.serverId];
+    if (current?.attemptId === request.attemptId && current.phase === 'authorized') return true;
     revokePendingLogin(request);
     try {
       await api.server.tailscaleLoginCancel(request.serverId, request.attemptId);
@@ -264,6 +300,7 @@ export function TsLoginPanel({
     }
     setErrControl(null);
     const submissionBase = savedServer ?? existingTs;
+    const submissionRevision = editRevisionRef.current;
     setSubmitting(true);
     setNotice(undefined);
     let persisted = false;
@@ -312,7 +349,8 @@ export function TsLoginPanel({
             pendingRef.current = savedRequest;
             setPending(savedRequest);
           }
-          if (stillActive()) setDirty(false);
+          editedAfterSaveRef.current = editRevisionRef.current !== submissionRevision;
+          if (stillActive() && !editedAfterSaveRef.current) setDirty(false);
         },
         refresh: async () => {
           if (persist === 'none') return;
@@ -328,7 +366,11 @@ export function TsLoginPanel({
           startResult = await api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode });
           return startResult;
         },
-        cancel: () => api.server.tailscaleLoginCancel(server.id, request.attemptId),
+        cancel: async () => {
+          const latest = useTailscaleLoginProgressStore.getState().attempts[server.id];
+          if (latest?.attemptId === request.attemptId && latest.phase === 'authorized') return;
+          await api.server.tailscaleLoginCancel(server.id, request.attemptId);
+        },
       });
       if (!stillActive()) return;
       const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
@@ -400,6 +442,8 @@ export function TsLoginPanel({
             setControlUrl(e.target.value);
             setErrControl(null);
             setDirty(true);
+            editedAfterSaveRef.current = true;
+            editRevisionRef.current++;
           }}
         />
         <div className="m-form-hint"><MobileInfo title={t('ts.controlUrl')} summary={t('mobileHelp.tsControlUrl')} details={t('ts.controlUrlLoginHint')} /></div>
@@ -422,7 +466,7 @@ export function TsLoginPanel({
             aria-pressed={mode === 'browser'}
             disabled={submitting}
             onClick={() => {
-              void discardPendingLogin().then((ok) => { if (ok) { setMode('browser'); setDirty(true); } });
+              void discardPendingLogin().then((ok) => { if (ok) { setMode('browser'); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
             }}
           >
             {t('ts.browserLogin')}
@@ -433,7 +477,7 @@ export function TsLoginPanel({
             aria-pressed={mode === 'authkey'}
             disabled={submitting}
             onClick={() => {
-              void discardPendingLogin().then((ok) => { if (ok) { setMode('authkey'); setDirty(true); } });
+              void discardPendingLogin().then((ok) => { if (ok) { setMode('authkey'); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
             }}
           >
             {t('ts.authKey')}
@@ -461,6 +505,8 @@ export function TsLoginPanel({
               setAuthKey(e.target.value);
               setErrKey(false);
               setDirty(true);
+              editedAfterSaveRef.current = true;
+              editRevisionRef.current++;
             }}
           />
           <p className="m-form-hint">{t('ts.authkeyHint')}</p>

@@ -60,6 +60,7 @@ import { MeshInboundPolicyFields } from './MeshInboundPolicyFields';
 import { FormSheet } from './FormSheet';
 import { FormGroup } from './FormGroup';
 import { useMobileFormStore } from './form-store';
+import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout } from './ts-logout-flow';
 
 /** 分组的呈现顺序与标题键（分区本身来自 `groupTsFields`）。 */
 const TS_GROUPS: ReadonlyArray<readonly [TsFormGroup, string]> = [
@@ -244,9 +245,24 @@ export function TsSettingsPanel({
     }
   };
 
-  /** 登出：破坏性 ⇒ 叠一层确认（触屏没有 hover，桌面那种「按钮翻红再点一次」在这里不成立）。 */
+  const completeLogout = async (serverId: string): Promise<void> => {
+    const store = useAppStore.getState();
+    store.setTailscaleLoginState(serverId, false);
+    store.setTailscaleAuthUrl(serverId, null);
+    store.setTailscaleLoginInitiated(serverId, false);
+    store.clearTailscaleStatus(serverId);
+    try {
+      await loadConfig(true);
+      closeInstance(instanceId);
+    } catch {
+      setNotice({ tone: 'info', text: t('ts.logoutRefreshFailed') });
+    }
+  };
+
+  /** 登出：主核持有该节点时另问一次是否断开，绝不从通用错误推断可以停核。 */
   const requestLogout = (): void => {
     if (node === undefined) return;
+    const serverId = node.id;
     const confirmId = open({
       kind: 'confirm',
       payload: {
@@ -259,7 +275,7 @@ export function TsSettingsPanel({
           const stagedOnly = stagedOnlyIds(servers, diskServers);
           const split = splitStagedOnly(
             'server.tailscaleLogout',
-            [node.id],
+            [serverId],
             stagedOnly,
             stagedEntries,
             'servers',
@@ -271,13 +287,52 @@ export function TsSettingsPanel({
           }
           setBusy(true);
           try {
-            await api.server.tailscaleLogout(node.id);
-            await loadConfig(true);
-            closeInstance(instanceId);
+            await api.server.tailscaleLogout(serverId);
+            await completeLogout(serverId);
           } catch (e) {
-            /* 登出不是保存 —— 用这条腿自己的失败键，别套 `common.saveFailed`。 */
-            console.error('[mobile-ts-settings] logout failed:', e);
-            setNotice({ tone: 'err', text: t('nodes.meshTsLogoutFail') });
+            if (!isMainCoreLogoutError(e)) {
+              setNotice({ tone: 'err', text: t('nodes.meshTsLogoutFail') });
+              return;
+            }
+            // The native writer gate refused this exact node. Capture the live core before asking
+            // to stop it; a later confirmation must not stop a replacement/user-selected core.
+            const ownerStatus = await api.proxy.getStatus().catch(() => null);
+            if (!ownerStatus || !sameRunningCore(ownerStatus, ownerStatus)) {
+              setNotice({ tone: 'info', text: t('ts.logoutStopChanged') });
+              return;
+            }
+            const owner = { serverId, selectedId: useAppStore.getState().selectedServerId,
+              status: ownerStatus };
+            const stopConfirmId = open({
+              kind: 'confirm',
+              payload: {
+                title: t('ts.logoutStopTitle'),
+                message: t('ts.logoutStopMessage'),
+                confirmLabel: t('ts.logoutStopConfirm'),
+                danger: true,
+                onConfirm: async () => {
+                  closeInstance(stopConfirmId);
+                  if (!hasInstance(instanceId)) return;
+                  setBusy(true);
+                  try {
+                    const result = await stopOwnedCoreThenLogout(owner, {
+                      selectedId: () => useAppStore.getState().selectedServerId,
+                      serverPresent: (id) => useAppStore.getState().servers.some((s) => s.id === id),
+                      status: () => api.proxy.getStatus(),
+                      stop: () => useAppStore.getState().stopProxy(),
+                      logout: async (id) => { await api.server.tailscaleLogout(id); },
+                    });
+                    if (result.kind === 'loggedOut') await completeLogout(serverId);
+                    else if (result.kind === 'changed') setNotice({ tone: 'info', text: t('ts.logoutStopChanged') });
+                    else if (result.kind === 'stopFailed') setNotice({ tone: 'err', text: t('ts.logoutStopFailed') });
+                    else setNotice({ tone: 'err', text: t(result.code === 'TAILSCALE_LOGOUT_MAIN_CORE'
+                      ? 'ts.reasonMainCoreInUse' : 'nodes.meshTsLogoutFail') });
+                  } finally {
+                    if (hasInstance(instanceId)) setBusy(false);
+                  }
+                },
+              },
+            });
           } finally {
             if (hasInstance(instanceId)) setBusy(false);
           }

@@ -212,6 +212,7 @@ export interface AppState {
   applyTailscaleStateExists: (states: Record<string, boolean>) => void;
   setTailscaleAuthUrl: (serverId: string, url: string | null) => void;
   setTailscaleStatus: (event: TailscaleStatusEvent) => void;
+  clearTailscaleStatus: (serverId: string) => void;
   setTailscaleLoginInitiated: (serverId: string, initiated: boolean) => void;
   /** 当前配置删除节点后统一驱逐所有以 serverId 为键的派生状态。 */
   retainServerIds: (serverIds: readonly string[]) => void;
@@ -606,6 +607,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       return;
     }
     set({ tailscaleStatuses: { ...prev, [event.serverId]: event } });
+  },
+
+  /** A successful native logout invalidates only that node's last main-core frame. */
+  clearTailscaleStatus: (serverId) => {
+    const prev = get().tailscaleStatuses;
+    if (!(serverId in prev)) return;
+    const next = { ...prev };
+    delete next[serverId];
+    set({ tailscaleStatuses: next });
   },
 
   /** 标记/清除「用户显式发起的登录在飞」。 */

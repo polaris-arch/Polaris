@@ -756,6 +756,13 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: 'staged-only 差集的磁盘镜像一侧：tailscaleLogout 是后端**按 id** 去清磁盘上的 TS state 目录，盘上没有这个 id 就没有对象（与 TsSettingsDialog 的 diskServers 逐字同一条）',
   },
   {
+    file: 'mobile/forms/TsSettingsPanel.tsx',
+    shape: 'useAppStore.getState().servers.some',
+    count: 1,
+    surface: 'operation',
+    why: '断开主核后的第二次按 id 登出前复核该节点仍在磁盘镜像中；确认等待期间节点可能被删除，effective 暂存集合不能证明后端仍有对象。',
+  },
+  {
     file: 'mobile/forms/TsLoginPanel.tsx',
     shape: 'useAppStore((s)=>s.servers)',
     count: 1,

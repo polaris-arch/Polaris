@@ -332,7 +332,7 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     // 故两颗共用**一处** `open({ kind: 'confirm' …})`（它就是那个 deps 的实现）。
     'mobile/forms/WarpPanel.tsx': 2,
     'mobile/forms/TsLoginPanel.tsx': 1, // 脏表单放弃
-    'mobile/forms/TsSettingsPanel.tsx': 2, // 脏表单放弃 + 退出登录
+    'mobile/forms/TsSettingsPanel.tsx': 3, // 脏表单放弃 + 退出登录 + 主核持有时明确确认断开再退出
     'mobile/forms/SubFormPanel.tsx': 2, // 脏表单放弃 + 恢复面「取消添加」（ζ 批 A8，同桌面 SubscriptionCreateTaskDialog 那一处）
     // Taildrop 收件箱（批 16）：删一个待处理文件 —— 破坏性，叠一层确认面板。
     // 本面板**没有**脏表单放弃那一处：它不是一张表单，关掉不丢任何草稿。

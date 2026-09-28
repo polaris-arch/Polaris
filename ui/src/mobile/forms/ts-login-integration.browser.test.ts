@@ -44,18 +44,32 @@ api.subscription.onCreateProgressReady = async fn => on('onCreateProgressReady')
 api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
 api.server.tailscaleStateExists = async () => ({ 'ts-1': false });
-api.server.tailscaleGetStatus = async () => ({ connected: false, statuses: [] });
-const test = window.__tsTest = { opens: [], cancels: [], starts: 0, prepares: 0, releasePrepare: null, mode };
+const test = window.__tsTest = { opens: [], cancels: [], starts: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, mode };
+api.server.tailscaleGetStatus = async () => mode?.startsWith('main') && test.starts > 0
+  ? { connected: true, statuses: [{ serverId: 'ts-1', backendState: 'Running', loggedIn: true,
+      expired: false, peers: [], tailscaleIPs: [], canShareFiles: false,
+      waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0 }] }
+  : { connected: false, statuses: [] };
 api.system.openExternal = async url => { test.opens.push(url); };
 api.server.tailscaleLoginPrepare = async () => {
   test.prepares++;
   if (mode === 'prepare') await new Promise(resolve => { test.releasePrepare = resolve; });
 };
 api.server.tailscaleLoginCancel = async (serverId, attemptId) => { test.cancels.push([serverId,attemptId]); };
-api.server.tailscaleLogin = async () => { test.starts++; return { started: true }; };
+api.server.tailscaleLogin = async () => {
+  test.starts++;
+  if (mode === 'early-start') await new Promise(resolve => { test.releaseStart = resolve; });
+  if (mode?.startsWith('main')) return { started: false, reason: 'inMainCore',
+    configurationPending: mode === 'main-pending' };
+  return { started: true };
+};
 const server = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: {} };
 useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
   refreshProxyStatus: async () => {}, loadConfig: async () => {} });
+api.server.update = async next => {
+  if (mode === 'delayed-save') await new Promise(resolve => { test.releaseSave = resolve; });
+  useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [] } });
+};
 const off = startMobileAppWiring(key => key);
 test.emit = (name, payload) => { for (const fn of listeners.get(name) || []) fn(payload); };
 test.attempt = () => useTailscaleLoginProgressStore.getState().attempts['ts-1'];
@@ -158,5 +172,84 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       expect(await page.evaluate(() => (window as any).__tsTest.initiated())).toBe(true);
       expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toContainEqual(['ts-1', oldId]);
     } finally { await page.close(); }
+  }, 30_000);
+
+  it('confirmed authorization closes its own panel without cancelling or keeping the submitted notice', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleLoginProgress', { serverId: 'ts-1', attemptId: test.attempt().attemptId,
+          phase: 'authorized', url: null });
+      });
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+      expect(await page.evaluate(() => (window as any).__tsTest.initiated())).not.toBe(true);
+      expect(await page.evaluate(() => (window as any).__tsTest.authUrl())).toBeFalsy();
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('authorization may arrive before the start receipt; its late receipt does not revive the panel', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=early-start`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseStart);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleLoginProgress', { serverId: 'ts-1', attemptId: test.attempt().attemptId,
+          phase: 'authorized', url: null });
+      });
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
+      await page.evaluate(() => (window as any).__tsTest.releaseStart());
+      await page.waitForTimeout(50);
+      expect(await page.getByRole('dialog').count()).toBe(0);
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('edits made while save is in flight remain visible after authorization', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=delayed-save`);
+      await page.locator('#mts-control-url').fill('https://first.example');
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseSave);
+      await page.locator('#mts-control-url').fill('https://second.example');
+      await page.evaluate(() => (window as any).__tsTest.releaseSave());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleLoginProgress', { serverId: 'ts-1', attemptId: test.attempt().attemptId,
+          phase: 'authorized', url: null });
+      });
+      await page.getByText('授权已完成').waitFor();
+      expect(await page.getByRole('dialog').count()).toBe(1);
+      expect(await page.locator('#mts-control-url').inputValue()).toBe('https://second.example');
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('a fresh main-core pull completes the owned attempt; pending config cannot inherit that success', async () => {
+    for (const mode of ['main', 'main-pending']) {
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+      try {
+        await page.goto(`${origin}/__ts-login?mode=${mode}`);
+        await page.locator('.m-form-foot .primary').click();
+        await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+        if (mode === 'main') {
+          await page.getByRole('dialog').waitFor({ state: 'detached' });
+          expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('authorized');
+          expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+        } else {
+          await page.waitForTimeout(100);
+          expect(await page.getByRole('dialog').count()).toBe(1);
+          expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('mainCore');
+        }
+      } finally { await page.close(); }
+    }
   }, 30_000);
 });
