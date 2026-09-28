@@ -1,4 +1,5 @@
 use super::*;
+use polaris_config_engine::builder::orchestration::config_generation_norm;
 use polaris_config_engine::user_config::protocol_settings::{
     ShadowsocksSettings, WebSocketSettings,
 };
@@ -16,6 +17,34 @@ fn srv(id: &str) -> ServerConfig {
         network: Some("tcp".into()),
         ..Default::default()
     }
+}
+
+#[test]
+fn mesh_ingress_edit_enters_pending_generation_without_dirtying_speedtest() {
+    let base = srv("mesh");
+    let mut blocked = base.clone();
+    blocked.mesh_inbound_policy = Some(serde_json::from_value(json!({"mode":"block"})).unwrap());
+    let mut allowed = base.clone();
+    allowed.mesh_inbound_policy = Some(
+        serde_json::from_value(json!({
+            "mode":"allowlist", "rules":[{"sourceCidrs":["10.0.0.2/32"],
+            "network":"tcp", "ports":["8080"], "target":"local"}]
+        }))
+        .unwrap(),
+    );
+    let norm = |server: ServerConfig| {
+        let cfg = polaris_config_engine::user_config::app_config::UserConfig {
+            servers: vec![server],
+            ..Default::default()
+        };
+        config_generation_norm(&cfg, None)
+    };
+    assert_ne!(modified_fingerprint(&base), modified_fingerprint(&blocked));
+    assert_ne!(modified_fingerprint(&base), modified_fingerprint(&allowed));
+    assert_ne!(norm(base.clone()), norm(blocked.clone()));
+    assert_ne!(norm(base.clone()), norm(allowed.clone()));
+    assert_eq!(dirty_fingerprint(&base), dirty_fingerprint(&blocked));
+    assert_eq!(dirty_fingerprint(&base), dirty_fingerprint(&allowed));
 }
 
 /// 两条判据**必须**是两个不同公式 —— 整个模块的前提。

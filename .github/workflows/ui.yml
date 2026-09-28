@@ -108,3 +108,17 @@ jobs:
 
       - name: Test
         run: pnpm exec vitest run --exclude 'src/lib/prototype-confirm-parity.test.ts'
+
+      - name: Browser form round trip (mock IPC, no app or core)
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright test --config playwright.config.ts
+
+      - name: Browser form failure evidence (mock fixture only)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mesh-form-playwright-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ui/test-results/
+          if-no-files-found: ignore
+          retention-days: 3

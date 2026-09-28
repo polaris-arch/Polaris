@@ -28,7 +28,7 @@ import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { editRoute } from '@/lib/staged-config';
 import { api } from '@/ipc';
-import type { ServerConfig } from '@/contracts/types';
+import type { MeshInboundPolicy, ServerConfig } from '@/contracts/types';
 import { Modal } from './Modal';
 import { Csel, type CselGroup, type CselOption } from './Csel';
 import { useDialogStore } from './dialog-store';
@@ -64,6 +64,7 @@ import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { meshTunnelDraftError } from './mesh-form-layout';
 import { InfoIcon } from '@/components/InfoIcon';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
+import { MeshInboundPolicyEditor, applyMeshInboundPolicy, meshInboundPolicyError, normalizeMeshInboundPolicy } from './MeshInboundPolicyEditor';
 
 const NODE_PROTOS = new Set<string>(PROTO_OPTIONS.map(([p]) => p));
 function isNodeProto(p: string): p is NodeProto {
@@ -112,6 +113,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       ? protoCodec[base.protocol].fromConfig(base)
       : draftFromSpecs(allFields(initProto)),
   );
+  const [meshPolicy, setMeshPolicy] = useState<MeshInboundPolicy | undefined>(base?.meshInboundPolicy);
 
   const [dirty, setDirty] = useState(false);
   const [errName, setErrName] = useState(false);
@@ -141,6 +143,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
 
   const changeProto = (next: NodeProto) => {
     setProto(next);
+    setMeshPolicy(undefined);
     // 换协议：公共字段（名/址/端口/detour）保留在各自 state；协议特定字段重置为新协议默认。
     setDraft(draftFromSpecs(allFields(next)));
     setDirty(true);
@@ -276,6 +279,13 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       );
       return;
     }
+    const policy = normalizeMeshInboundPolicy(meshPolicy);
+    const policyError = isMeshTunnelNodeProtocol(proto) ? meshInboundPolicyError(policy, proto) : null;
+    if (policyError) {
+      revealFormGroup('routing');
+      toast.error(t(policyError));
+      return;
+    }
 
     setSubmitting(true);
     try {
@@ -297,6 +307,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       const codecBase =
         base && base.protocol === proto ? { ...base, ...meta } : meta;
       const full = protoCodec[proto].toConfig(draft, codecBase);
+      if (isMeshTunnelNodeProtocol(proto)) applyMeshInboundPolicy(full, policy);
       if (base?.subscriptionId || !bindInterface) delete full.bindInterface;
       else full.bindInterface = bindInterface;
 
@@ -577,7 +588,10 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
               children: tailcatKeyField,
             },
             ...(routingFields.length > 0
-              ? [{ id: 'routing', label: t('node.formGroup.routing'), fields: routingFields }]
+              ? [{ id: 'routing', label: t('node.formGroup.routing'), fields: routingFields,
+                  children: isMeshTunnelNodeProtocol(proto)
+                    ? <MeshInboundPolicyEditor idPrefix="node" value={meshPolicy} onChange={(next) => { setMeshPolicy(next); setDirty(true); }} />
+                    : undefined }]
               : []),
             {
               id: 'advanced',

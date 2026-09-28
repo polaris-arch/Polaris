@@ -126,6 +126,8 @@ impl ConfigStore {
     /// 运行时缓存、乐观并发版本与 API 返回值必须使用这份结果，而不是清洗前入参；否则磁盘已经删除
     /// 坏字段/归一枚举，内存却仍保留旧形，下一次读改写会基于一个磁盘上从未存在过的版本。
     pub fn canonicalize_for_save(config: &Value) -> Result<Value, StoreError> {
+        // 安全字段不能先 sanitize：显式坏策略若被改成 block 后再校验，写入者会误以为原值已生效。
+        crate::validate::validate_raw_mesh_inbound_policies(config)?;
         let mut value = config.clone();
         crate::sanitize::sanitize_value_in_place_pub(&mut value);
         validate_config(&mut value)?;

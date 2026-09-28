@@ -784,6 +784,105 @@ fn endpoints_injected_when_present() {
     assert!(!result.endpoints.as_ref().unwrap().is_empty());
 }
 
+fn mesh_policy_config() -> UserConfig {
+    let mut cfg = base_config();
+    cfg.servers[0] = ServerConfig {
+        id: "wg1".into(),
+        name: "Mesh".into(),
+        protocol: Protocol::Wireguard,
+        address: "peer.example.com".into(),
+        port: 51820,
+        wireguard_settings: Some(Box::new(
+            crate::user_config::server_config::WireGuardSettings {
+                private_key: Some("priv".into()),
+                local_address: vec!["10.8.0.1/32".into()],
+                peer_public_key: Some("pub".into()),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    cfg.selected_server_id = Some("wg1".into());
+    cfg
+}
+
+#[test]
+fn mesh_policy_heads_generated_route_and_dns_with_scope_separation() {
+    use crate::user_config::server_config::MeshInboundPolicy;
+    let mut cfg = mesh_policy_config();
+    cfg.servers[0].mesh_inbound_policy = Some(
+        serde_json::from_value(serde_json::json!({
+            "mode":"allowlist", "rules":[
+                {"sourceCidrs":[" 10.8.0.2/32 "], "network":"tcp", "ports":["8080"], "target":"local"},
+                {"sourceCidrs":["10.8.0.2/32"], "network":"both", "ports":["80-90"],
+                 "target":"forward", "targetCidrs":[" 0.0.0.0/0 ", "::/0"]}
+            ]
+        })).unwrap()
+    );
+    let built = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap();
+    let output = serde_json::to_value(built).unwrap();
+    let tag = output["endpoints"][0]["tag"].as_str().unwrap();
+    let route = output["route"]["rules"].as_array().unwrap();
+    assert_eq!(route[0]["inbound"][0], tag);
+    assert_eq!(route[0]["action"], "route");
+    assert_eq!(route[0]["outbound"], "direct");
+    assert_eq!(route[0]["source_ip_cidr"][0], "10.8.0.2/32");
+    assert_eq!(route[0]["ip_cidr"][0], "127.0.0.1/32");
+    assert!(
+        !route[0]["ip_cidr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cidr| cidr == "127.0.0.0/8"),
+        "本机 grant 不应开放其他 127/8 别名"
+    );
+    assert_eq!(route[1]["action"], "reject");
+    assert!(route[1]["ip_cidr"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cidr| cidr == "::ffff:127.0.0.0/104"));
+    assert!(route[1]["ip_cidr"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cidr| cidr == "::ffff:0.0.0.0/128"));
+    assert_eq!(route[2]["action"], "route");
+    assert_eq!(route[2]["ip_cidr"][0], "0.0.0.0/0");
+    assert_eq!(route[3]["action"], "reject");
+    assert!(route[3].get("ip_cidr").is_none());
+    assert_eq!(output["dns"]["rules"][0]["inbound"][0], tag);
+    assert_eq!(output["dns"]["rules"][0]["action"], "reject");
+    assert_eq!(output["dns"]["rules"][0]["method"], "default");
+    assert_eq!(output["dns"]["rules"][0]["no_drop"], true);
+
+    cfg.servers[0].mesh_inbound_policy = Some(MeshInboundPolicy::Block);
+    let blocked = serde_json::to_value(
+        generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(blocked["route"]["rules"][0]["action"], "reject");
+    assert!(blocked["route"]["rules"][0].get("ip_cidr").is_none());
+}
+
+#[test]
+fn mesh_policy_rejects_emitted_system_endpoint_instead_of_silent_fallback() {
+    let mut cfg = mesh_policy_config();
+    cfg.proxy_mode_type = ProxyModeType::Tun;
+    cfg.servers[0].mesh_inbound_policy =
+        Some(crate::user_config::server_config::MeshInboundPolicy::Block);
+    cfg.servers[0]
+        .wireguard_settings
+        .as_mut()
+        .unwrap()
+        .reverse_mesh = Some(true);
+    let err = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap_err();
+    assert_eq!(
+        err,
+        crate::builder::mesh_inbound::SYSTEM_INTERFACE_POLICY_ERROR
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // endpoint 前置代理（detour）—— 对 上游的**有意偏离**（上游 三个组网表单与
 // `SingBoxEndpoint` 类型都没有 detour）。语义实测与「WG 需 UDP 转发」见

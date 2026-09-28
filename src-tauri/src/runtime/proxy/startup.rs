@@ -1114,6 +1114,12 @@ impl ProxyRuntime {
                         );
                         self.emit_invalid_nodes(&peeled_so_far);
                     }
+                    if e.strip_prefix("sing-box 配置生成失败: ")
+                        == Some(polaris_config_engine::builder::mesh_inbound::SYSTEM_INTERFACE_POLICY_ERROR)
+                    {
+                        self.set_error(&e, code::MESH_INBOUND_SYSTEM_INTERFACE);
+                        return Err(StartError::coded(e, code::MESH_INBOUND_SYSTEM_INTERFACE));
+                    }
                     return Err(e.into());
                 }
             };

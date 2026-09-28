@@ -269,6 +269,154 @@ pub struct TailscaleSettings {
     pub accept_default_resolvers: Option<bool>,
 }
 
+/// 本机 endpoint 入站策略。缺席即原有行为；显式策略只在用户态 endpoint 施行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum MeshInboundPolicy {
+    Block,
+    Allowlist { rules: Vec<MeshInboundGrant> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshInboundNetwork {
+    Tcp,
+    Udp,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeshInboundTarget {
+    Local,
+    Forward,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MeshInboundGrant {
+    pub source_cidrs: Vec<String>,
+    pub network: MeshInboundNetwork,
+    /// 单端口或闭区间 `start-end`；不接受隐式“所有端口”。
+    pub ports: Vec<String>,
+    pub target: MeshInboundTarget,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_cidrs: Vec<String>,
+}
+
+/// Serde 的 internally-tagged unit variant 会忽略多余键；权限对象必须显式拒绝它们。
+pub fn mesh_inbound_policy_shape_ok(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let keys_ok = match obj.get("mode").and_then(serde_json::Value::as_str) {
+        Some("block") => obj.len() == 1,
+        Some("allowlist") => obj.len() == 2 && obj.contains_key("rules"),
+        _ => false,
+    };
+    keys_ok && serde_json::from_value::<MeshInboundPolicy>(value.clone()).is_ok()
+}
+
+fn pure_local_alias(cidr: &str) -> bool {
+    use std::net::IpAddr;
+    let Some((raw, mask)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(address) = raw.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = mask.parse::<u8>() else {
+        return false;
+    };
+    match address {
+        IpAddr::V4(v4) => {
+            (v4.is_loopback() && prefix >= 8) || (v4.is_unspecified() && prefix == 32)
+        }
+        IpAddr::V6(v6) => {
+            (v6.is_loopback() || v6.is_unspecified()) && prefix == 128
+                || v6.to_ipv4_mapped().is_some_and(|v4| {
+                    (v4.is_loopback() && prefix >= 104) || (v4.is_unspecified() && prefix == 128)
+                })
+        }
+    }
+}
+
+/// 唯一语义门：存盘、生成和 UI 的后端兜底都必须使用此判据。
+pub fn validate_mesh_inbound_policy(server: &ServerConfig) -> Result<(), &'static str> {
+    let Some(policy) = &server.mesh_inbound_policy else {
+        return Ok(());
+    };
+    if !matches!(
+        server.protocol,
+        Protocol::Wireguard
+            | Protocol::Tailscale
+            | Protocol::MasqueClient
+            | Protocol::Openconnect
+            | Protocol::OpenvpnClient
+    ) || crate::warp::is_warp_server(server)
+    {
+        return Err("mesh-inbound-unsupported-protocol");
+    }
+    let MeshInboundPolicy::Allowlist { rules } = policy else {
+        return Ok(());
+    };
+    if server.protocol == Protocol::Wireguard
+        && !server.wireguard_settings.as_ref().is_some_and(|wg| {
+            !wg.local_address.is_empty()
+                && wg.local_address.iter().all(|cidr| {
+                    let expected = if cidr.contains(':') { "/128" } else { "/32" };
+                    cidr.ends_with(expected)
+                        && crate::user_config::rule_validate::is_valid_ip_cidr(cidr)
+                })
+        })
+    {
+        return Err("mesh-inbound-wg-host-prefix-required");
+    }
+    for rule in rules {
+        if rule.source_cidrs.is_empty()
+            || !rule
+                .source_cidrs
+                .iter()
+                .all(|c| c.contains('/') && crate::user_config::rule_validate::is_valid_ip_cidr(c))
+        {
+            return Err("mesh-inbound-source-cidr-invalid");
+        }
+        if rule.ports.is_empty()
+            || !rule
+                .ports
+                .iter()
+                .all(|p| crate::user_config::rules::is_valid_port_value(p))
+        {
+            return Err("mesh-inbound-port-invalid");
+        }
+        if !match rule.target {
+            MeshInboundTarget::Local => rule.target_cidrs.is_empty(),
+            MeshInboundTarget::Forward => {
+                !rule.target_cidrs.is_empty()
+                    && rule.target_cidrs.iter().all(|c| {
+                        c.contains('/')
+                            && crate::user_config::rule_validate::is_valid_ip_cidr(c)
+                            && !pure_local_alias(c.trim())
+                    })
+            }
+        } {
+            return Err("mesh-inbound-target-cidr-invalid");
+        }
+        if rule.network != MeshInboundNetwork::Tcp
+            && rule.ports.iter().any(|p| {
+                let token = p.trim();
+                let (start, end) = token.split_once('-').unwrap_or((token, token));
+                let start = start.parse::<u16>().unwrap_or(0);
+                let end = end.parse::<u16>().unwrap_or(0);
+                start <= 53 && 53 <= end
+            })
+        {
+            return Err("mesh-inbound-udp53-unsupported");
+        }
+    }
+    Ok(())
+}
+
 /// 节点配置（上游 `ServerConfig` 全字段）。buildOutbounds 消费。
 /// CustomSettings 含 serde_json::Value（非 Eq）→ 不 derive Eq。
 ///
@@ -451,6 +599,9 @@ pub struct ServerConfig {
     /// 被丢），两处生效；本字段只喂 `route.rules`，OpenVPN/OpenConnect 客户端侧没有对应的过滤层。
     #[serde(rename = "meshRoutes", default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_routes: Vec<String>,
+    /// 缺席保留存量入站行为；显式策略由用户态 endpoint 入站标签约束。
+    #[serde(rename = "meshInboundPolicy", skip_serializing_if = "Option::is_none")]
+    pub mesh_inbound_policy: Option<MeshInboundPolicy>,
     #[serde(rename = "subscriptionId", skip_serializing_if = "Option::is_none")]
     pub subscription_id: Option<String>,
     #[serde(rename = "providerName", skip_serializing_if = "Option::is_none")]

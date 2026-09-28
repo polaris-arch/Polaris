@@ -109,6 +109,7 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.BINARY_NOT_FOUND:
     case ProxyErrorCode.CRONET_LIB_MISSING:
     case ProxyErrorCode.SYSTEM_INTERFACE_REQUIRES_HELPER:
+    case ProxyErrorCode.MESH_INBOUND_SYSTEM_INTERFACE:
     case ProxyErrorCode.HELPER_NOT_INSTALLED:
     case ProxyErrorCode.HELPER_GATE_ABORTED:
     case ProxyErrorCode.TUN_ROUTE_NOT_CAPTURED:

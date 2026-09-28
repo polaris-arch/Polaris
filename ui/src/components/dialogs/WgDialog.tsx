@@ -15,7 +15,7 @@ import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { api } from '@/ipc';
-import type { ServerConfig } from '@/contracts/types';
+import type { MeshInboundPolicy, ServerConfig } from '@/contracts/types';
 import { Modal } from './Modal';
 import {
   FormTabs,
@@ -45,6 +45,7 @@ import { ON_DEMAND_FIELD } from './on-demand-field';
 import { useDialogStore } from './dialog-store';
 import { groupWgFields } from './mesh-form-layout';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
+import { MeshInboundPolicyEditor, applyMeshInboundPolicy, meshInboundPolicyError, normalizeMeshInboundPolicy } from './MeshInboundPolicyEditor';
 
 const CATCH_ALL = new Set(['0.0.0.0/0', '::/0']);
 
@@ -157,6 +158,7 @@ function WgForm({ base }: { base?: ServerConfig }) {
   const [src, setSrc] = useState<'manual' | 'conf'>('manual');
   const [name, setName] = useState(base?.name ?? '');
   const [draft, setDraft] = useState<WgDraft>(() => (base ? draftFromServer(base) : emptyWgDraft()));
+  const [meshPolicy, setMeshPolicy] = useState<MeshInboundPolicy | undefined>(base?.meshInboundPolicy);
   const [confText, setConfText] = useState('');
   const [confErr, setConfErr] = useState<string | null>(null);
   const [preview, setPreview] = useState<WgPreview | null>(null);
@@ -246,7 +248,18 @@ function WgForm({ base }: { base?: ServerConfig }) {
       toast.error(t('wg.errWorkers'));
       return;
     }
+    const policy = normalizeMeshInboundPolicy(meshPolicy);
+    const policyError = !isWarpDraft(draft, base)
+      ? meshInboundPolicyError(policy, 'wireguard', splitCsv(draft.localAddress))
+      : null;
+    if (policyError) {
+      setSrc('manual');
+      setFormTab('routing');
+      toast.error(t(policyError));
+      return;
+    }
     const server = buildWgServer(name, draft, base);
+    if (!isWarpDraft(draft, base)) applyMeshInboundPolicy(server, policy);
     // WARP 单例硬闸门。**本弹窗是它最真实的旁路腿**：粘贴 Cloudflare 的 wg-quick `.conf`，端点
     // `engage.cloudflareclient.com` 会被 `isWarpServer` 的域名兜底判成 WARP（`domain/warp.ts:31-37`），
     // 于是在已有 WARP 时造出第二个 → 两者抢内核 utun → `Connect: resource busy` FATAL。
@@ -393,7 +406,8 @@ function WgForm({ base }: { base?: ServerConfig }) {
             ariaLabel={t('node.formGroup.aria')}
             tabs={[
               { id: 'connection', label: t('node.formGroup.connection'), fields: groups.basic },
-              { id: 'routing', label: t('node.formGroup.routing'), fields: groups.routing },
+              { id: 'routing', label: t('node.formGroup.routing'), fields: groups.routing,
+                children: !isWarpDraft(draft, base) && <MeshInboundPolicyEditor idPrefix="wg" value={meshPolicy} onChange={(next) => { setMeshPolicy(next); setDirty(true); }} /> },
               { id: 'advanced', label: t('node.formGroup.advanced'), fields: groups.advanced },
             ]}
             active={formTab}

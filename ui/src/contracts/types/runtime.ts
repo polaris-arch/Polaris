@@ -73,6 +73,7 @@ export enum ProxyErrorCode {
   NETWORK_PROFILE_RULES_PRUNED = 'NETWORK_PROFILE_RULES_PRUNED', // 核在跑但部分网络场景规则本次未生成（场景失效/探测源本机不可用/R4 剔除 dhcp）或可能永不命中（dhcp 源只写 IPv6 地址段）（非终态；见 runtime/proxy::warn_network_profile_rules）
   AUTO_SWITCH_NEEDS_RESTART = 'AUTO_SWITCH_NEEDS_RESTART', // 自动故障切换已触发、候选也规划出来了，但每个候选都要整核重启 → 这轮一个都没探（非终态；见 runtime/auto_switch::switch_blocked_by_restart）
   SYSTEM_INTERFACE_REQUIRES_HELPER = 'SYSTEM_INTERFACE_REQUIRES_HELPER', // System endpoints require the managed desktop TUN helper path
+  MESH_INBOUND_SYSTEM_INTERFACE = 'MESH_INBOUND_SYSTEM_INTERFACE', // Explicit userspace ingress policy cannot cover an effective System interface
   OUTBOUND_INTERFACE_UNAVAILABLE = 'OUTBOUND_INTERFACE_UNAVAILABLE', // 配置绑定的物理出口不存在或 down：起核 fail-closed；热切换保留旧运行配置并进入待应用态，绝不静默回落到系统默认出口
   BINARY_NOT_EXECUTABLE = 'BINARY_NOT_EXECUTABLE', // 退出码 126
   BINARY_NOT_FOUND = 'BINARY_NOT_FOUND', // 退出码 127

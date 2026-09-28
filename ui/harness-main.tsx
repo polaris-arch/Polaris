@@ -18,6 +18,16 @@ import { TOPOLOGY_OTHERS_KEY, type ConnectionsAggregate } from './src/contracts/
 // 交互验证不能把配置夹具当只读快照：DNS 资源的增删改都经 config_save 整份回写，
 // 随后的 config_get 必须读到新值，否则受控表单会被旧夹具立即覆盖。
 let demoConfig = structuredClone(DEMO_CONFIG);
+const meshIngressFixture = new URLSearchParams(window.location.search).has('mesh-inbound-fixture');
+const meshIngressStorageKey = 'polaris-harness-mesh-inbound';
+if (meshIngressFixture) {
+  const stored = window.sessionStorage.getItem(meshIngressStorageKey);
+  if (stored) demoConfig = JSON.parse(stored) as typeof DEMO_CONFIG;
+  else demoConfig.servers.push({
+    id: 'mesh-ingress-ts', name: 'Mesh ingress test', protocol: 'tailscale',
+    address: '', port: 0, tailscaleSettings: {},
+  });
+}
 
 /**
  * 首页连接流向的保真数据源：64 个目标足以覆盖默认 16 槽与最大化运行态 40 槽。
@@ -87,13 +97,23 @@ mockIPC((cmd, payload) => {
       }
       return Promise.resolve(null);
     }
-    case 'server_get_all': return Promise.resolve(DEMO_SERVERS);
+    case 'server_get_all': return Promise.resolve(demoConfig.servers);
+    case 'system_list_network_interfaces': return Promise.resolve([]);
+    case 'server_update': {
+      const server = (payload as { server?: typeof DEMO_SERVERS[number] } | null)?.server;
+      if (!server) return Promise.reject(new Error('missing server'));
+      demoConfig.servers = demoConfig.servers.map((existing) => existing.id === server.id ? structuredClone(server) : existing);
+      if (meshIngressFixture) window.sessionStorage.setItem(meshIngressStorageKey, JSON.stringify(demoConfig));
+      return Promise.resolve(null);
+    }
     case 'app_presets_list': return Promise.resolve([]);
     case 'rule_resources_list': return Promise.resolve([]);
     // 契约是 RuleResourceCatalogResult（{items, fetchedAt, source}），不是裸数组——回 [] 会让
     // 资源库/添加应用两个弹窗读 `catalog.items.filter` 时炸在 undefined 上。
     case 'rule_resources_get_catalog': return Promise.resolve({ items: [], fetchedAt: null, source: 'builtin' });
-    case 'proxy_get_status': return Promise.resolve({ running: true, startTime: Date.now() - 300_000 });
+    case 'proxy_get_status': return Promise.resolve(
+      meshIngressFixture ? { running: false } : { running: true, startTime: Date.now() - 300_000 },
+    );
     case 'stats_subscribe': return Promise.resolve(null);
     case 'stats_unsubscribe': return Promise.resolve(null);
     case 'stats_project_topology': return Promise.resolve(demoTopology(payload));
@@ -103,10 +123,20 @@ mockIPC((cmd, payload) => {
   }
 }, { shouldMockEvents: true }); // 开事件模拟：verify 脚本用 emit() 喂 EVENT_CONNECTIONS_AGGREGATE 等推送事件
 
-void i18nReady.then(() => {
-  ReactDOM.createRoot(document.getElementById('root')!).render(
-    <React.StrictMode>
-      <App />
-    </React.StrictMode>,
-  );
+void i18nReady.then(async () => {
+  if (meshIngressFixture) {
+    const [{ useAppStore }, { default: TsSettingsDialog }] = await Promise.all([
+      import('./src/store/app-store'), import('./src/components/dialogs/TsSettingsDialog'),
+    ]);
+    await useAppStore.getState().loadConfig(true);
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <TsSettingsDialog serverId="mesh-ingress-ts" />,
+    );
+  } else {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <App />
+      </React.StrictMode>,
+    );
+  }
 });

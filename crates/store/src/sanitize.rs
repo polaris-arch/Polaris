@@ -326,6 +326,28 @@ fn sanitize_servers(obj: &mut Map<String, Value>) {
             sanitize_cidr_list(map, "advertiseRoutes");
             bool_or_remove(map, "allowInternet");
         }
+        // 缺席=存量行为；显式坏策略必须降为 block，绝不可清掉后放开入站。
+        if server.get("meshInboundPolicy").is_some() {
+            let valid = server.get("meshInboundPolicy").is_some_and(
+                polaris_config_engine::user_config::server_config::mesh_inbound_policy_shape_ok,
+            ) && serde_json::from_value::<
+                polaris_config_engine::user_config::server_config::ServerConfig,
+            >(server.clone())
+            .ok()
+            .is_some_and(|typed| {
+                polaris_config_engine::user_config::server_config::validate_mesh_inbound_policy(
+                    &typed,
+                )
+                .is_ok()
+                    && typed.mesh_inbound_policy.is_some()
+            });
+            if !valid {
+                server.as_object_mut().expect("server is object").insert(
+                    "meshInboundPolicy".into(),
+                    serde_json::json!({"mode":"block"}),
+                );
+            }
+        }
         kept.push(server);
     }
     *servers = kept;

@@ -318,6 +318,7 @@ pub fn validate_config(value: &mut Value) -> Result<(), crate::StoreError> {
 /// 规则 `networkProfileId` 指向不存在的场景**不在这里拦**：删场景、导入缺场景的备份都合法，
 /// 生成侧 fail-closed；只在规则 IPC 写入时拦（`commands::rules` 的 `RULE_INVALID`）。
 pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
+    validate_raw_mesh_inbound_policies(value)?;
     use polaris_config_engine::user_config::{is_valid_search_domain, BUILTIN_NETENV_DHCP_ID};
     for key in ["dnsServers", "dnsServerGroups", "networkProfiles"] {
         let squatted = value
@@ -365,6 +366,37 @@ pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
                 "networkProfiles[{id}].match.searchDomains: invalid domain \"{bad}\""
             )));
         }
+    }
+    Ok(())
+}
+
+/// 写入前检查原值，不能让安全策略经宽容清洗变成旧的无限制语义。
+pub(crate) fn validate_raw_mesh_inbound_policies(value: &Value) -> Result<(), crate::StoreError> {
+    use polaris_config_engine::user_config::server_config::{
+        mesh_inbound_policy_shape_ok, validate_mesh_inbound_policy, ServerConfig,
+    };
+    for server in value
+        .get("servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(raw_policy) = server.get("meshInboundPolicy") else {
+            continue;
+        };
+        if !mesh_inbound_policy_shape_ok(raw_policy) {
+            return Err(crate::StoreError::validation(
+                "meshInboundPolicy: invalid shape",
+            ));
+        }
+        let typed: ServerConfig = serde_json::from_value(server.clone())
+            .map_err(|_| crate::StoreError::validation("meshInboundPolicy: invalid shape"))?;
+        if typed.mesh_inbound_policy.is_none() {
+            return Err(crate::StoreError::validation(
+                "meshInboundPolicy: null is not a policy",
+            ));
+        }
+        validate_mesh_inbound_policy(&typed).map_err(crate::StoreError::validation)?;
     }
     Ok(())
 }

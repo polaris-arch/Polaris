@@ -8,6 +8,83 @@ use polaris_store::{ConfigStore, LoadResult, StdFs, StoreError};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+fn mesh_config(policy: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "proxyMode":"smart", "proxyModeType":"systemProxy", "logLevel":"info", "mixedPort":7890,
+        "servers":[{"id":"ts1","name":"TS","protocol":"tailscale",
+            "tailscaleSettings":{}, "meshInboundPolicy":policy}],
+        "tunConfig":{"mtu":1350,"autoRoute":true,"strictRoute":true}
+    })
+}
+
+#[test]
+fn mesh_inbound_save_rejects_raw_bad_policy_before_sanitize() {
+    let valid = serde_json::json!({"mode":"allowlist","rules":[
+        {"sourceCidrs":["10.0.0.2/32"],"network":"tcp","ports":["443"],"target":"local"}]});
+    let persisted = ConfigStore::canonicalize_for_save(&mesh_config(valid.clone())).unwrap();
+    assert_eq!(persisted["servers"][0]["meshInboundPolicy"], valid);
+    for bad in [
+        serde_json::Value::Null,
+        serde_json::json!({"mode":"allowlist","rules":[
+            {"sourceCidrs":[],"network":"tcp","ports":["443"],"target":"local"}]}),
+        serde_json::json!({"mode":"allowlist","rules":[
+            {"sourceCidrs":["10.0.0.2/32"],"network":"both","ports":["50-60"],"target":"local"}]}),
+        serde_json::json!({"mode":"block","unexpected":true}),
+    ] {
+        assert!(
+            ConfigStore::canonicalize_for_save(&mesh_config(bad.clone())).is_err(),
+            "显式坏值写盘必须报错，不能被清洗成旧的无约束值：{bad}"
+        );
+    }
+}
+
+#[test]
+fn mesh_inbound_bad_disk_value_fails_closed_without_overwriting_file() {
+    let dir = TempDir::new().unwrap();
+    let path = cfg_path(&dir);
+    let bad = mesh_config(serde_json::json!({"mode":"allowlist","rules":[
+        {"sourceCidrs":[],"network":"tcp","ports":["443"],"target":"local"}]}));
+    let original = serde_json::to_string(&bad).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    let loaded = ConfigStore::load(&StdFs, &path);
+    assert!(loaded.loaded_from_disk, "坏策略不能使整份用户配置回落默认");
+    assert_eq!(
+        loaded.config["servers"][0]["meshInboundPolicy"],
+        serde_json::json!({"mode":"block"})
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        original,
+        "load 不改原件"
+    );
+}
+
+#[test]
+fn mesh_inbound_valid_policy_save_load_edit_and_remove_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let path = cfg_path(&dir);
+    let allow = serde_json::json!({"mode":"allowlist","rules":[
+        {"sourceCidrs":["10.0.0.2/32"],"network":"tcp","ports":["8080"],"target":"local"}
+    ]});
+    ConfigStore::save(&StdFs, &path, &mesh_config(allow.clone()), "111111111111").unwrap();
+    let mut loaded = ConfigStore::load(&StdFs, &path).config;
+    assert_eq!(loaded["servers"][0]["meshInboundPolicy"], allow);
+    loaded["servers"][0]["meshInboundPolicy"] = serde_json::json!({"mode":"block"});
+    ConfigStore::save(&StdFs, &path, &loaded, "222222222222").unwrap();
+    let mut blocked = ConfigStore::load(&StdFs, &path).config;
+    assert_eq!(
+        blocked["servers"][0]["meshInboundPolicy"],
+        serde_json::json!({"mode":"block"})
+    );
+    blocked["servers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("meshInboundPolicy");
+    ConfigStore::save(&StdFs, &path, &blocked, "333333333333").unwrap();
+    let legacy = ConfigStore::load(&StdFs, &path).config;
+    assert!(legacy["servers"][0].get("meshInboundPolicy").is_none());
+}
+
 fn cfg_path(dir: &TempDir) -> PathBuf {
     dir.path().join("config.json")
 }

@@ -591,6 +591,11 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
     // `network_env`，不能让剪枝把正向规则剔掉而留下兜底（那会把「不知道」报成「不在该网络」）。
     let network_canary =
         apply_network_canaries(&mut singbox, &network_env, deps.network_canary_port);
+    crate::builder::mesh_inbound::apply_mesh_inbound_policies(
+        config,
+        &id_to_tag_map,
+        &mut singbox,
+    )?;
 
     // ── 13. 调试日志（L3631-3634）───────────────────────────────────────────────
     let rule_set_count = singbox

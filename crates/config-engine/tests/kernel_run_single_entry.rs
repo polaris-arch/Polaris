@@ -130,6 +130,7 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
     // (文件, 用例入口必须调 kernel_run_or_skip 的次数 = 该文件的起核用例数)
     let skip_wired = [
         ("crates/config-engine/tests/network_profile_runtime.rs", 5),
+        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 1),
         (
             "crates/config-engine/tests/subscription_update_guard_runtime.rs",
             1,

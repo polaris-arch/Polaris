@@ -1072,6 +1072,13 @@ fn reconcile_subscription_servers(
     let new_vals: Vec<Value> = new_servers
         .into_iter()
         .filter_map(|s| serde_json::to_value(s).ok())
+        .map(|mut value| {
+            // 本地设备入站授权不来自订阅服务器。匹配旧节点时仅从旧盘值恢复。
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("meshInboundPolicy");
+            }
+            value
+        })
         .collect();
 
     let existing: Vec<Value> = cfg
@@ -1110,6 +1117,9 @@ fn reconcile_subscription_servers(
                 }
                 if let Some(created) = old.get("createdAt").cloned() {
                     nobj.insert("createdAt".to_string(), created);
+                }
+                if let Some(policy) = old.get("meshInboundPolicy").cloned() {
+                    nobj.insert("meshInboundPolicy".to_string(), policy);
                 }
             }
             if !node_content_eq(&nv, &old) {

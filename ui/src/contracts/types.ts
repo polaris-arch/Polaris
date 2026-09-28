@@ -281,6 +281,8 @@ export interface ServerConfig {
    * 的键会硬报错。镜像 Rust `ServerConfig::mesh_routes`。
    */
   meshRoutes?: string[];
+  /** 本机设备入站授权；缺席保持既有行为，仅用户态 endpoint 可执行。 */
+  meshInboundPolicy?: MeshInboundPolicy;
 
   subscriptionId?: string;
 
@@ -352,6 +354,18 @@ export interface ServerConfig {
 
   createdAt?: string;
   updatedAt?: string;
+}
+
+export type MeshInboundPolicy =
+  | { mode: 'block' }
+  | { mode: 'allowlist'; rules: MeshInboundGrant[] };
+
+export interface MeshInboundGrant {
+  sourceCidrs: string[];
+  network: 'tcp' | 'udp' | 'both';
+  ports: string[];
+  target: 'local' | 'forward';
+  targetCidrs?: string[];
 }
 
 // ============================================================================

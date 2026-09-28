@@ -55,6 +55,38 @@ fn srv_uuid(name: &str, addr: &str, port: u16, uuid: &str) -> ServerConfig {
 }
 
 #[test]
+fn subscription_cannot_grant_mesh_ingress_and_keeps_local_policy_on_match() {
+    let mut cfg = json!({"servers": [{
+        "id":"local-a", "name":"old", "protocol":"vless", "address":"a.com",
+        "port":443, "subscriptionId":"sub1", "uuid":"11111111-1111-1111-1111-111111111111",
+        "meshInboundPolicy":{"mode":"block"}
+    }]});
+    let mut matched = srv("new", "a.com", 443);
+    matched.mesh_inbound_policy =
+        Some(serde_json::from_value(json!({"mode":"allowlist","rules":[]})).unwrap());
+    let mut added = srv("added", "b.com", 443);
+    added.mesh_inbound_policy = matched.mesh_inbound_policy.clone();
+    let outcome =
+        reconcile_subscription_servers(&mut cfg, "sub1", vec![matched, added], false, &[]);
+    assert_eq!((outcome.added, outcome.updated), (1, 1));
+    let servers = cfg["servers"].as_array().unwrap();
+    assert_eq!(
+        servers.iter().find(|s| s["name"] == "new").unwrap()["meshInboundPolicy"],
+        json!({"mode":"block"}),
+        "本地已设授权只由本地保留"
+    );
+    assert!(
+        servers
+            .iter()
+            .find(|s| s["name"] == "added")
+            .unwrap()
+            .get("meshInboundPolicy")
+            .is_none(),
+        "订阅新增节点不得自带本机入站授权"
+    );
+}
+
+#[test]
 fn reconcile_adds_updates_deletes_and_preserves_id() {
     let mut cfg = json!({
         "selectedServerId": "id-A",

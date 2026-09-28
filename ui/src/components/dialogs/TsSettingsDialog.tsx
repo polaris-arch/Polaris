@@ -32,7 +32,7 @@ import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { api } from '@/ipc';
-import type { ServerConfig } from '@/contracts/types';
+import type { MeshInboundPolicy, ServerConfig } from '@/contracts/types';
 import type { TailscaleSettings } from '@/contracts/types';
 import type { TailscaleStatusPeer } from '@/contracts/tailscale-status';
 import { Modal } from './Modal';
@@ -65,6 +65,7 @@ import { hasTsAuthKey } from '@/domain/tailscale-conn-state';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { InfoIcon } from '@/components/InfoIcon';
 import { cn } from '@/lib/utils';
+import { MeshInboundPolicyEditor, applyMeshInboundPolicy, meshInboundPolicyError, normalizeMeshInboundPolicy } from './MeshInboundPolicyEditor';
 
 /** 「清除 Auth Key」的二次点击槽位（单例节点，全弹窗只有这一颗，无需按 id 分槽）。 */
 const AUTH_KEY_CLEAR_KEY = 'ts-authkey-clear';
@@ -155,6 +156,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     bindInterface: node?.bindInterface ?? '',
     onDemand: onDemandDraftValue(node),
   }));
+  const [meshPolicy, setMeshPolicy] = useState<MeshInboundPolicy | undefined>(node?.meshInboundPolicy);
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [formTab, setFormTab] = useState('basic');
@@ -268,6 +270,13 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
 
   const handleSave = async () => {
     if (!node) return;
+    const policy = normalizeMeshInboundPolicy(meshPolicy);
+    const policyError = meshInboundPolicyError(policy, 'tailscale');
+    if (policyError) {
+      setFormTab('routing');
+      toast.error(t(policyError));
+      return;
+    }
     // 非法 CIDR 必须前端拦：后端 sanitize 对非法项是**静默丢弃**，不拦就成了「界面收下了、盘上没有」。
     const badCidr = invalidTsCidrs(draft);
     if (badCidr.length) {
@@ -289,6 +298,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     try {
       // detour 在顶层，`buildTsSettings` 够不着 —— 单独写回（哨兵 ⇒ 删键）。
       const next = applyDetour({ ...node, tailscaleSettings: buildSettings() }, draft.detour);
+      applyMeshInboundPolicy(next, policy);
       applyOnDemand(next, draft.onDemand);
       const bindInterface = String(draft.bindInterface ?? '').trim();
       if (bindInterface) next.bindInterface = bindInterface;
@@ -445,7 +455,11 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
               </>
             ),
           },
-          { id: 'routing', label: t('node.formGroup.routing'), fields: groups.routing },
+          { id: 'routing', label: t('node.formGroup.routing'), fields: groups.routing,
+            children: node && <>
+              <MeshInboundPolicyEditor idPrefix="ts" value={meshPolicy} onChange={(next) => { setMeshPolicy(next); setDirty(true); }} />
+              <div className="card-sub form-inline-note">{t('meshInbound.tsBoundary')}</div>
+            </> },
           { id: 'advanced', label: t('node.formGroup.advanced'), fields: groups.advanced },
         ]}
         active={formTab}

@@ -1141,6 +1141,8 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
     let mut outbounds = Vec::new();
     let mut endpoints = Vec::new();
     let mut route_rules = Vec::new();
+    let mut endpoint_route_rejects = Vec::new();
+    let mut endpoint_dns_rejects = Vec::new();
     let mut dns_servers = vec![json!({
         "tag": DIRECT_DNS_TAG, "type": "udp", "server": "223.5.5.5", "server_port": 53,
     })];
@@ -1155,6 +1157,14 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
             "inbound": [inbound_tag], "action": "route", "outbound": node.tag,
         }));
         if node.is_endpoint {
+            // 测速临时核不是本机服务入口。内核对新建 endpoint ingress 用自身 tag；
+            // 测速 HTTP in-<tag> 仍只负责出站，不能拿它代替这道拒绝。
+            endpoint_route_rejects.push(json!({
+                "inbound": [node.tag], "action": "reject", "no_drop": true,
+            }));
+            endpoint_dns_rejects.push(json!({
+                "inbound": [node.tag], "action": "reject", "method": "default", "no_drop": true,
+            }));
             let exit_dns_tag = format!("dns-exit-{}", node.tag);
             dns_servers.push(json!({
                 "tag": exit_dns_tag, "type": "udp", "server": "223.5.5.5", "server_port": 53,
@@ -1196,6 +1206,11 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
             outbounds.extend(node.companion_outbounds.iter().cloned());
         }
     }
+
+    endpoint_route_rejects.extend(route_rules);
+    let route_rules = endpoint_route_rejects;
+    endpoint_dns_rejects.extend(dns_rules);
+    let dns_rules = endpoint_dns_rejects;
 
     // sing-box 启动要求至少一个 direct 出站（也是 DNS 直发腿的落点）。
     outbounds.push(json!({ "type": "direct", "tag": "direct" }));

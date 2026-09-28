@@ -1,5 +1,109 @@
 use super::*;
 
+fn inbound_server(protocol: &str, policy: serde_json::Value, wg_address: &str) -> ServerConfig {
+    serde_json::from_value(serde_json::json!({
+        "id":"inbound", "name":"inbound", "protocol":protocol,
+        "address":"vpn.example", "port":51820,
+        "wireguardSettings":{"localAddress":[wg_address]},
+        "meshInboundPolicy":policy,
+    }))
+    .unwrap()
+}
+
+fn grant(network: &str, ports: &[&str], target: &str, target_cidrs: &[&str]) -> serde_json::Value {
+    serde_json::json!({"sourceCidrs":["10.5.0.2/32"], "network":network,
+        "ports":ports, "target":target, "targetCidrs":target_cidrs})
+}
+
+#[test]
+fn mesh_inbound_explicit_policy_has_strict_scope_and_ports() {
+    let block = serde_json::json!({"mode":"block"});
+    assert!(
+        validate_mesh_inbound_policy(&inbound_server("wireguard", block.clone(), "10.5.0.1/24"))
+            .is_ok(),
+        "block 不要求 WG host prefix"
+    );
+    assert!(
+        validate_mesh_inbound_policy(&inbound_server(
+            "tailscale",
+            serde_json::json!({"mode":"allowlist","rules":[]}),
+            ""
+        ))
+        .is_ok(),
+        "空 allowlist 等价拒绝"
+    );
+    assert_eq!(
+        validate_mesh_inbound_policy(&inbound_server(
+            "wireguard",
+            serde_json::json!({"mode":"allowlist","rules":[]}),
+            "10.5.0.1/24"
+        )),
+        Err("mesh-inbound-wg-host-prefix-required")
+    );
+    assert_eq!(
+        validate_mesh_inbound_policy(&inbound_server("vless", block, "")),
+        Err("mesh-inbound-unsupported-protocol")
+    );
+
+    for network in ["udp", "both"] {
+        for port in ["53", "50-60", "0053"] {
+            let policy = serde_json::json!({"mode":"allowlist","rules":[grant(network, &[port], "local", &[])]});
+            assert_eq!(
+                validate_mesh_inbound_policy(&inbound_server("tailscale", policy, "")),
+                Err("mesh-inbound-udp53-unsupported"),
+                "{network}/{port}"
+            );
+        }
+    }
+    let tcp_dns =
+        serde_json::json!({"mode":"allowlist","rules":[grant("tcp", &["53"], "local", &[])]});
+    assert!(validate_mesh_inbound_policy(&inbound_server("tailscale", tcp_dns, "")).is_ok());
+    let bad_port = serde_json::json!({"mode":"allowlist","rules":[grant("tcp", &["0", "65536"], "local", &[])]});
+    assert_eq!(
+        validate_mesh_inbound_policy(&inbound_server("tailscale", bad_port, "")),
+        Err("mesh-inbound-port-invalid")
+    );
+}
+
+#[test]
+fn mesh_inbound_target_does_not_turn_local_aliases_into_forward_grants() {
+    for target in [
+        "127.0.0.1/32",
+        "127.0.0.0/8",
+        "0.0.0.0/32",
+        "::1/128",
+        "0:0:0:0:0:0:0:1/128",
+        "::/128",
+        "::ffff:127.0.0.1/128",
+        "::ffff:127.0.0.0/104",
+        "::ffff:0.0.0.0/128",
+    ] {
+        let policy = serde_json::json!({"mode":"allowlist","rules":[grant("tcp", &["443"], "forward", &[target])]});
+        assert_eq!(
+            validate_mesh_inbound_policy(&inbound_server("tailscale", policy, "")),
+            Err("mesh-inbound-target-cidr-invalid"),
+            "{target}"
+        );
+    }
+    let broad = serde_json::json!({"mode":"allowlist","rules":[grant("tcp", &["443"], "forward", &["0.0.0.0/0", "::/0"])]});
+    assert!(
+        validate_mesh_inbound_policy(&inbound_server("tailscale", broad, "")).is_ok(),
+        "宽段由路由前置 loopback/unspecified reject 守住"
+    );
+    let bad_source = serde_json::json!({"mode":"allowlist","rules":[
+        {"sourceCidrs":[],"network":"tcp","ports":["443"],"target":"local"}]});
+    assert_eq!(
+        validate_mesh_inbound_policy(&inbound_server("tailscale", bad_source, "")),
+        Err("mesh-inbound-source-cidr-invalid")
+    );
+    let unknown = serde_json::json!({"mode":"allowlist","rules":[
+        {"sourceCidrs":["10.5.0.2/32"],"network":"tcp","ports":["443"],"target":"local","unexpected":true}]});
+    assert!(
+        serde_json::from_value::<MeshInboundPolicy>(unknown).is_err(),
+        "权限字段不能悄悄忽略未知键"
+    );
+}
+
 #[test]
 fn endpoint_protocol_classification() {
     assert!(is_mesh_protocol(Protocol::Wireguard));
@@ -390,11 +494,13 @@ fn server_config_stays_narrow() {
     use std::collections::BTreeSet;
     use std::mem::{size_of, size_of_val};
 
+    /// 2026-09-28 实测值：本地入站策略 `Option<MeshInboundPolicy>` 增 24 B
+    ///（1216 → 1240 B）；授权规则本体在 Vec 堆内，未内联大型协议设置。
     /// 2026-09-24 实测值（新增装箱的 `tailcatSettings` 1208 → 1216 B；同日新增装箱的
     /// `masqueClientSettings` 1200 → 1208 B；同日内联的 `TlsSettings`
     /// 新增两个有意的字符串字段 `certificateSha256` / `certificatePublicKeySha256` 后 1152 → 1200 B；此前 2026-08-26 加 `bindInterface` 1128 → 1152 B；
     /// 装箱前 3096 B；只装 6 项时 1904 B，8 项时 1512 B）。
-    const MEASURED: usize = 1216;
+    const MEASURED: usize = 1240;
     let actual = size_of::<ServerConfig>();
     assert!(
         actual <= MEASURED,
@@ -508,6 +614,7 @@ fn server_config_stays_narrow() {
         "port" => port: Plain,
         "detour" => detour: Plain,
         "meshRoutes" => mesh_routes: Plain,
+        "meshInboundPolicy" => mesh_inbound_policy: Plain,
         "subscriptionId" => subscription_id: Plain,
         "bindInterface" => bind_interface: Plain,
         // `Option<bool>` —— 1 字节 + niche，装箱只会加一次指针跳转，没有取舍空间。

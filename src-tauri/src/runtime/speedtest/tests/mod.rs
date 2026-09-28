@@ -716,8 +716,8 @@ fn config_wires_endpoint_nodes_with_tunneled_dns() {
     };
     let cfg = build_temp_core_config(&[node], &[20001], "warn");
     assert_eq!(cfg["endpoints"].as_array().unwrap().len(), 1);
-    // 纯 v4 端点：rules[0] 是 AAAA 抑制（见下一条），route 规则排在它**后面**。
-    let rule = &cfg["dns"]["rules"][1];
+    // endpoint 入站拒绝在最前，纯 v4 的 AAAA 抑制与 route 随后。
+    let rule = &cfg["dns"]["rules"][2];
     assert_eq!(rule["inbound"][0], json!("in-out-e1111111"));
     assert_eq!(rule["server"], json!("dns-exit-out-e1111111"));
     assert_eq!(rule["disable_cache"], json!(true));
@@ -729,6 +729,35 @@ fn config_wires_endpoint_nodes_with_tunneled_dns() {
         .find(|s| s["tag"] == json!("dns-exit-out-e1111111"))
         .expect("端点必须配自己的穿隧道 DNS server");
     assert_eq!(exit["detour"], json!("out-e1111111"));
+}
+
+#[test]
+fn temporary_endpoint_refuses_unsolicited_ingress_but_keeps_outbound_test_path() {
+    let node = TempNode {
+        id: "e1111111".into(),
+        tag: "out-e1111111".into(),
+        node: json!({"type":"wireguard","tag":"out-e1111111"}),
+        companion_outbounds: Vec::new(),
+        is_endpoint: true,
+        has_local_v6: false,
+    };
+    let cfg = build_temp_core_config(&[node], &[20001], "warn");
+    let reject = &cfg["route"]["rules"][0];
+    assert_eq!(reject["inbound"], json!(["out-e1111111"]));
+    assert_eq!(reject["action"], "reject");
+    assert_eq!(reject["no_drop"], true);
+    let outgoing = &cfg["route"]["rules"][1];
+    assert_eq!(outgoing["inbound"], json!(["in-out-e1111111"]));
+    assert_eq!(outgoing["outbound"], "out-e1111111");
+    let dns_reject = &cfg["dns"]["rules"][0];
+    assert_eq!(dns_reject["inbound"], json!(["out-e1111111"]));
+    assert_eq!(dns_reject["action"], "reject");
+    assert_eq!(dns_reject["method"], "default");
+    assert_eq!(dns_reject["no_drop"], true);
+    assert_eq!(
+        cfg["dns"]["rules"][2]["inbound"],
+        json!(["in-out-e1111111"])
+    );
 }
 
 /// 🔴 **纯 v4 端点：AAAA 前置一条 `predefined` 空 NOERROR，且必须排在 route 规则之前**
@@ -751,9 +780,9 @@ fn config_suppresses_aaaa_before_routing_for_v4_only_endpoints() {
     };
     let cfg = build_temp_core_config(&[node], &[20001], "warn");
     let rules = cfg["dns"]["rules"].as_array().unwrap();
-    assert_eq!(rules.len(), 2, "纯 v4 端点 = 抑制规则 + route 规则");
+    assert_eq!(rules.len(), 3, "endpoint 拒绝 + 抑制规则 + route 规则");
     assert_eq!(
-        rules[0],
+        rules[1],
         json!({
             "inbound": ["in-out-e1111111"],
             "query_type": ["AAAA"],
@@ -763,7 +792,7 @@ fn config_suppresses_aaaa_before_routing_for_v4_only_endpoints() {
         "抑制规则形状必须逐字对齐（键名写错 = 静默失效）"
     );
     assert_eq!(
-        rules[1]["action"],
+        rules[2]["action"],
         json!("route"),
         "抑制规则必须排在同 inbound 的 route（catch-all）之前，否则 AAAA 先被 route 吃掉"
     );
@@ -786,8 +815,12 @@ fn config_emits_no_family_preference_for_dual_stack_endpoints() {
     };
     let cfg = build_temp_core_config(&[node], &[20001], "warn");
     let rules = cfg["dns"]["rules"].as_array().unwrap();
-    assert_eq!(rules.len(), 1, "含 v6 的端点只有 route 规则，无抑制规则");
-    assert_eq!(rules[0]["action"], json!("route"));
+    assert_eq!(
+        rules.len(),
+        2,
+        "含 v6 的端点有入站拒绝和出站 route，无抑制规则"
+    );
+    assert_eq!(rules[1]["action"], json!("route"));
 }
 
 /// 🔴 **全配置禁 1.16 DNS 旧形态**：legacy rule-action `strategy` 与未启用

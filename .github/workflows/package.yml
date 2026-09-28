@@ -624,6 +624,12 @@ jobs:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test network_profile_runtime
 
+      - name: Userspace mesh inbound TCP UDP and DNS runtime gate
+        if: env.POLARIS_RUN_KERNEL_GATES == '1'
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-config-engine --test mesh_inbound_runtime
+
       - name: Fetch sing-box dashboard
         run: node scripts/fetch-dashboard.mjs
 
