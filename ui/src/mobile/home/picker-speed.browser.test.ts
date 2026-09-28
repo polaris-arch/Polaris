@@ -107,6 +107,20 @@ function App(){
 }
 createRoot(document.getElementById('root')).render(<App/>);
 `;
+const speedFeedbackEntry = `
+import { useHomeSpeedTest } from '/src/mobile/home/use-home-speed-test';
+import { api } from '/src/ipc';
+${fullHomeEntry.replace(
+  "const [query,setQuery]=useState('');const [open,setOpen]=useState(true);",
+  "const [query,setQuery]=useState('');const [open,setOpen]=useState(false);const speed=useHomeSpeedTest({servers,diskServers:servers,selectedId:'sub-a',running:true,routing:'smart'});window.__speedFeedback.view=()=>speed.view;",
+).replace(
+  "latencyCheck:{busyKind:null,error:null,feedback:null,blocked:null,blockedStatus:'mobileHome.notApplicable',allUnavailable:null,onRunCurrent:noop,onRunAll:noop}",
+  'latencyCheck:speed.view',
+).replace(
+  'function App(){',
+  "const pending=[];const control=window.__speedFeedback={calls:0,resolve:receipt=>pending.shift()?.resolve(receipt),view:()=>null};api.server.speedTest=(ids)=>new Promise(resolve=>{control.calls++;pending.push({ids,resolve});});function App(){",
+)}
+`;
 const sentinelEntry = `
 import React from 'react';
 import { createRoot } from 'react-dom/client';
@@ -144,13 +158,14 @@ let server: ViteDevServer; let browser: Browser; let origin: string;
 describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and measured task consumers', () => {
   beforeAll(async () => {
     server=await createServer({root,cacheDir:path.join(tmpdir(),'polaris-picker-speed-vite-'+process.pid),server:{host:'127.0.0.1',port:0,watch:null},plugins:[{
-      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx'||id==='/full-home-fixture.tsx'||id==='/sentinel-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;if(id==='/full-home-fixture.tsx')return fullHomeEntry;if(id==='/sentinel-fixture.tsx')return sentinelEntry;},
+      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx'||id==='/full-home-fixture.tsx'||id==='/speed-feedback-fixture.tsx'||id==='/sentinel-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;if(id==='/full-home-fixture.tsx')return fullHomeEntry;if(id==='/speed-feedback-fixture.tsx')return speedFeedbackEntry;if(id==='/sentinel-fixture.tsx')return sentinelEntry;},
       configureServer(vite){vite.middlewares.use(async(req,res,next)=>{
-        if(req.url!=='/__picker-speed'&&req.url!=='/__full-home'&&req.url!=='/__sentinel')return next();
+        if(req.url!=='/__picker-speed'&&req.url!=='/__full-home'&&req.url!=='/__speed-feedback'&&req.url!=='/__sentinel')return next();
         const full=req.url?.includes('full-home');
         const sentinel=req.url?.includes('sentinel');
-        const html=await vite.transformIndexHtml(full?'/__full-home':sentinel?'/__sentinel':'/__picker-speed',
-          '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/'+(full?'full-home-fixture':sentinel?'sentinel-fixture':'picker-speed-fixture')+'.tsx"></script></html>');
+        const speed=req.url?.includes('speed-feedback');
+        const html=await vite.transformIndexHtml(full?'/__full-home':sentinel?'/__sentinel':speed?'/__speed-feedback':'/__picker-speed',
+          '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/'+(full?'full-home-fixture':sentinel?'sentinel-fixture':speed?'speed-feedback-fixture':'picker-speed-fixture')+'.tsx"></script></html>');
         res.setHeader('Content-Type','text/html');res.end(html);
       });},
     }]});await server.listen();const address=server.httpServer!.address();if(!address||typeof address!=='object')throw new Error('Vite did not bind');origin='http://127.0.0.1:'+address.port;
@@ -309,6 +324,23 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     expect(await page.evaluate(()=>(window as any).__pickerTest.store.getState().task.phase)).toBe('completed');
     await page.evaluate(()=>{(window as any).__pickerTest.store.getState().begin(['b'],'current');});
     await page.getByText('准备测速…',{exact:true}).waitFor();
+    await page.close();
+  },30_000);
+  it('a completed Home batch clears the previous note and renders no completion status',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});await page.goto(origin+'/__speed-feedback');
+    const all=page.getByRole('button',{name:'全部测速'});await all.waitFor();
+    await all.click();
+    expect(await page.evaluate(()=>(window as any).__speedFeedback.calls)).toBe(1);
+    await page.evaluate(()=>(window as any).__speedFeedback.resolve({runId:'1',results:{'sub-a':26},outcome:'completed',notInPool:['manual-0'],tsNotReady:[]}));
+    await page.getByText('未纳入本次测速',{exact:false}).waitFor();
+    expect(await page.locator('.h-latency-note[role="status"]').count()).toBe(1);
+    await all.click();
+    expect(await page.evaluate(()=>(window as any).__speedFeedback.calls)).toBe(2);
+    await page.evaluate(()=>(window as any).__speedFeedback.resolve({runId:'2',results:{'sub-a':27},outcome:'completed',notInPool:[],tsNotReady:[]}));
+    await page.waitForFunction(()=>document.querySelector('.h-latency-action[aria-busy="true"]')===null);
+    expect(await page.evaluate(()=>(window as any).__speedFeedback.view().feedback)).toBeNull();
+    expect(await page.locator('.h-latency-note[role="status"]').count()).toBe(0);
+    expect(await page.getByText('已返回',{exact:false}).count()).toBe(0);
     await page.close();
   },30_000);
   it('the live Home picker switches both sentinel exits through the receipt path and keeps its guards',async()=>{

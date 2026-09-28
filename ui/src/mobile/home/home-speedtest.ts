@@ -18,24 +18,23 @@ export function planAllHomeSpeedTest(
   );
 }
 
-export type HomeSpeedTestFeedback = { tone: 'ok' | 'info'; text: string };
+export type HomeSpeedTestFeedback = { tone: 'info'; text: string };
 
-/** A skipped or interrupted request is never described as an all-success result. */
+/** Successful completion updates latency in place; only actionable exceptions stay visible. */
 export function batchSpeedTestFeedback(
   result: SpeedTestInvokeResult,
   requestedCount: number,
   t: TFunction,
-): HomeSpeedTestFeedback {
+): HomeSpeedTestFeedback | null {
   const tested = Object.keys(result.results).length;
   const skipped = notInPoolMessage(result, t);
   const eligible = Math.max(0, requestedCount - result.notInPool.length - result.tsNotReady.length);
+  if (result.outcome === 'completed' && tested > 0 && skipped === null) return null;
   const status = result.outcome === 'interrupted'
     ? t('nodes.speedTestInterruptedSummary', { tested, total: eligible })
-    : tested === 0
-      ? t('nodes.speedTestNotApplicable')
-      : t('mobileHome.speedTestReturned', { count: tested });
+    : tested === 0 ? t('nodes.speedTestNotApplicable') : null;
   return {
-    tone: result.outcome === 'interrupted' || skipped !== null || tested === 0 ? 'info' : 'ok',
+    tone: 'info',
     text: [status, skipped].filter(Boolean).join(' · '),
   };
 }

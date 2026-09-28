@@ -2498,7 +2498,6 @@
     "currentSpeedTest": "آزمایش فعلی",
     "allSpeedTest": "آزمایش همه",
     "allSpeedTestBusy": "در حال آزمایش همه",
-    "speedTestReturned": "{{count}} نتیجهٔ آزمایش دریافت شد",
     "listedHostsTotal": "جمع دامنه‌های نمایش‌داده‌شده",
     "connect": "اتصال",
     "disconnect": "قطع اتصال",

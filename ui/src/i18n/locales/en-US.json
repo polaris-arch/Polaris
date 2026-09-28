@@ -2498,7 +2498,6 @@
     "currentSpeedTest": "Test current",
     "allSpeedTest": "Test all",
     "allSpeedTestBusy": "Testing all",
-    "speedTestReturned": "{{count}} speed-test results returned",
     "listedHostsTotal": "Listed hosts total",
     "connect": "Connect",
     "disconnect": "Disconnect",

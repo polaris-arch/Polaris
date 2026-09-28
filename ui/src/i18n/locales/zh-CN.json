@@ -2498,7 +2498,6 @@
     "currentSpeedTest": "当前测速",
     "allSpeedTest": "全部测速",
     "allSpeedTestBusy": "全部测速中",
-    "speedTestReturned": "已返回 {{count}} 项测速结果",
     "listedHostsTotal": "所列域名合计",
     "connect": "连接",
     "disconnect": "断开",

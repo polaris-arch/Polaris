@@ -19,16 +19,23 @@ describe('Home all-node speed test', () => {
     expect(planAllHomeSpeedTest(effective, disk, true)).toEqual(['subscription', 'manual']);
   });
 
-  it('does not report skipped or interrupted results as all-success', () => {
+  it('hides a completed batch receipt while preserving skipped, empty, and interrupted feedback', () => {
     const completed = batchSpeedTestFeedback(
       { results: { a: 26, b: -1 }, outcome: 'completed', notInPool: [], tsNotReady: [] }, 2, t,
     );
-    expect(completed.tone).toBe('ok');
-    expect(completed.text).toContain('mobileHome.speedTestReturned');
+    expect(completed).toBeNull();
+    const skipped = batchSpeedTestFeedback(
+      { results: { a: 26 }, outcome: 'completed', notInPool: ['b'], tsNotReady: [] }, 2, t,
+    );
+    expect(skipped).toEqual({ tone: 'info', text: 'nodes.speedTestSkipped' });
+    const empty = batchSpeedTestFeedback(
+      { results: {}, outcome: 'completed', notInPool: [], tsNotReady: [] }, 2, t,
+    );
+    expect(empty).toEqual({ tone: 'info', text: 'nodes.speedTestNotApplicable' });
     const interrupted = batchSpeedTestFeedback(
       { results: { a: 26 }, outcome: 'interrupted', notInPool: ['b'], tsNotReady: [] }, 3, t,
     );
-    expect(interrupted.tone).toBe('info');
-    expect(interrupted.text).toContain('nodes.speedTestInterruptedSummary');
+    expect(interrupted?.tone).toBe('info');
+    expect(interrupted?.text).toContain('nodes.speedTestInterruptedSummary');
   });
 });

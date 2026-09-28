@@ -2498,7 +2498,6 @@
     "currentSpeedTest": "Проверить текущий",
     "allSpeedTest": "Проверить все",
     "allSpeedTestBusy": "Проверка всех",
-    "speedTestReturned": "Получено результатов: {{count}}",
     "listedHostsTotal": "Итого по показанным доменам",
     "connect": "Подключить",
     "disconnect": "Отключить",
