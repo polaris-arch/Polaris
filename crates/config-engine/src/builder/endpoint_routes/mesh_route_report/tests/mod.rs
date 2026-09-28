@@ -140,28 +140,31 @@ fn narrower_first_carves_later_wider_range_and_matches_every_small_address() {
     assert_eq!(report.results[1].coverage, MeshRouteCoverage::Partial);
     assert_eq!(report.results[1].blocked_by[0].cidr, "10.20.1.0/24");
     for third in 0..=255_u8 {
-        let ip = Ipv4Addr::new(10, 20, third, 17);
-        let expected = if third == 1 { "a" } else { "b" };
-        assert_eq!(first_match_v4(&candidates, ip), Some(expected));
-        let resolved = report.results.iter().find(|result| {
-            result.effective.as_ref().is_some_and(|ranges| {
-                ranges.iter().any(|range| {
-                    let (network, bits) = range.split_once('/').unwrap();
-                    let bits: u32 = bits.parse().unwrap();
-                    let mask = if bits == 0 {
-                        0
-                    } else {
-                        u32::MAX << (32 - bits)
-                    };
-                    u32::from(ip) & mask == u32::from(network.parse::<Ipv4Addr>().unwrap()) & mask
+        for fourth in 0..=255_u8 {
+            let ip = Ipv4Addr::new(10, 20, third, fourth);
+            let expected = if third == 1 { "a" } else { "b" };
+            assert_eq!(first_match_v4(&candidates, ip), Some(expected));
+            let resolved = report.results.iter().find(|result| {
+                result.effective.as_ref().is_some_and(|ranges| {
+                    ranges.iter().any(|range| {
+                        let (network, bits) = range.split_once('/').unwrap();
+                        let bits: u32 = bits.parse().unwrap();
+                        let mask = if bits == 0 {
+                            0
+                        } else {
+                            u32::MAX << (32 - bits)
+                        };
+                        u32::from(ip) & mask
+                            == u32::from(network.parse::<Ipv4Addr>().unwrap()) & mask
+                    })
                 })
-            })
-        });
-        assert_eq!(
-            resolved.map(|r| r.server_id.as_str()),
-            Some(expected),
-            "{ip}"
-        );
+            });
+            assert_eq!(
+                resolved.map(|r| r.server_id.as_str()),
+                Some(expected),
+                "{ip}"
+            );
+        }
     }
 }
 
