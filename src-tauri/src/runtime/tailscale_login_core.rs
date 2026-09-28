@@ -564,6 +564,15 @@ pub enum StartLoginOutcome {
     Cancelled,
 }
 
+/// Facts from this process's Tailscale login registry only. `Vacant` says nothing about an OS,
+/// Android, or helper-owned process and must not by itself authorize identity retirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TsRegistryOwnerState {
+    Busy,
+    Unknown,
+    Vacant,
+}
+
 /// 瞬态登录核生命周期注册表。持有注入的 spawner/checker/binary-resolver（生产真实现，测试 mock）。
 ///
 /// 支撑：kill-on-relogin、超时自动杀、取消、自然退出 reap。与 `ProxyRuntime` 的常驻代理核隔离。
@@ -739,6 +748,48 @@ impl LoginCoreRegistry {
     /// Lock order: proxy lifecycle -> this gate. Login never waits for proxy lifecycle.
     pub async fn state_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.start_gate.lock().await
+    }
+
+    /// A registry-local fact while the caller continuously holds this exact registry's gate.
+    /// The gate prevents new prepare/reserve/spawn admissions; a supervisor may only clear an
+    /// existing entry while it is held. Each std mutex is read and released separately.
+    pub(crate) fn owner_state_under_gate(
+        &self,
+        server_id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> TsRegistryOwnerState {
+        if server_id.is_empty()
+            || !std::ptr::eq(tokio::sync::MutexGuard::mutex(gate), &self.start_gate)
+        {
+            return TsRegistryOwnerState::Unknown;
+        }
+        let main_reserved = match self.shared.main_ids.lock() {
+            Ok(ids) => ids.contains(server_id),
+            Err(_) => return TsRegistryOwnerState::Unknown,
+        };
+        let attempt_busy = match self.attempts.local_owner_in_use(server_id) {
+            Ok(busy) => busy,
+            Err(()) => return TsRegistryOwnerState::Unknown,
+        };
+        let transient = match self.shared.entries.lock() {
+            Ok(entries) => entries.get(server_id).map(|entry| {
+                if entry.cancel_tx.is_closed() || entry.closed_rx.has_changed().is_err() {
+                    TsRegistryOwnerState::Unknown
+                } else {
+                    match &*entry.closed_rx.borrow() {
+                        None => TsRegistryOwnerState::Busy,
+                        Some(_) => TsRegistryOwnerState::Unknown,
+                    }
+                }
+            }),
+            Err(_) => return TsRegistryOwnerState::Unknown,
+        };
+        match transient {
+            Some(TsRegistryOwnerState::Unknown) => TsRegistryOwnerState::Unknown,
+            Some(TsRegistryOwnerState::Busy) => TsRegistryOwnerState::Busy,
+            _ if main_reserved || attempt_busy => TsRegistryOwnerState::Busy,
+            _ => TsRegistryOwnerState::Vacant,
+        }
     }
 
     /// The deletion callback runs only when neither the main core nor a login process owns state.

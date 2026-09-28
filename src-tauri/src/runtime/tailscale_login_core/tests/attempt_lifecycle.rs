@@ -146,6 +146,194 @@ async fn retirement_fences_prepared_ids_and_a_late_prepare_until_state_commit_fi
 }
 
 #[tokio::test]
+async fn local_owner_fact_counts_unspawned_main_reservation_and_prepared_attempt() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let ud = temp_ud();
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    let generated = json!({"endpoints": [{
+        "type": "tailscale",
+        "tag": "myts",
+        "state_directory": ud.join("tailscale/ts1")
+    }]});
+    reg.reserve_main_states(&generated, &ud).await.unwrap();
+    assert!(!reg.main_owns("ts1", false));
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Busy,
+        "reservation blocks even before the primary core has spawned"
+    );
+    assert_eq!(
+        reg.owner_state_under_gate("ts2", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    reg.release_main_states();
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    drop(gate);
+
+    reg.prepare("ts1", "prepared").await.unwrap();
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Busy,
+        "unclaimed prepare is still an admission"
+    );
+    reg.retire_attempts_under_state_gate("ts1", &gate)
+        .await
+        .unwrap();
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant,
+        "finished retired attempts have no local owner and remain fenced by ID"
+    );
+    drop(gate);
+    assert!(reg.prepare("ts1", "prepared").await.is_err());
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn local_owner_fact_rejects_a_foreign_gate_and_waiting_claim() {
+    let spawner = fake_spawner(vec![], false, false);
+    let reg = Arc::new(reg_with(
+        spawner.clone(),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    ));
+    let foreign = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let wrong_gate = foreign.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &wrong_gate),
+        TsRegistryOwnerState::Unknown
+    );
+    drop(wrong_gate);
+
+    reg.prepare("ts1", "claim").await.unwrap();
+    let gate = reg.state_gate().await;
+    let ud = temp_ud();
+    let (reg2, ud2) = (reg.clone(), ud.clone());
+    let waiting = tokio::spawn(async move {
+        reg2.start_attempt(
+            &ts_server("ts1", "myts"),
+            &ud2,
+            request("claim"),
+            &offline,
+            Arc::new(FakeEmitter::default()),
+        )
+        .await
+    });
+    let claimed = reg.attempts.get("ts1", "claim").unwrap();
+    wait_until(|| claimed.claimed.load(Ordering::SeqCst)).await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Busy
+    );
+    reg.retire_attempts_under_state_gate("ts1", &gate)
+        .await
+        .unwrap();
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    drop(gate);
+    assert!(matches!(
+        waiting.await.unwrap(),
+        StartLoginOutcome::Cancelled
+    ));
+    assert_eq!(spawner.count.load(Ordering::SeqCst), 0);
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn local_owner_fact_rejects_lost_cleanup_channel_and_poisoned_reservation_table() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    reg.register_inflight_for_test("ts1", 4242);
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Unknown,
+        "a detached supervisor cannot certify native cleanup"
+    );
+    reg.deregister_inflight_for_test("ts1");
+    drop(gate);
+
+    let shared = reg.shared.clone();
+    assert!(std::thread::spawn(move || {
+        let _held = shared.main_ids.lock().unwrap();
+        panic!("poison reservation table");
+    })
+    .join()
+    .is_err());
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Unknown,
+        "poison cannot be recovered into a no-owner fact"
+    );
+}
+
+#[tokio::test]
+async fn local_owner_fact_does_not_infer_vacancy_from_missing_pid_or_retained_close_receipt() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (closed_tx, closed_rx) = tokio::sync::watch::channel(None);
+    reg.shared.insert(
+        "ts1".into(),
+        LoginEntry {
+            epoch: 1,
+            attempt_id: "no-pid".into(),
+            pid: None,
+            cancel_tx,
+            closed_rx,
+        },
+    );
+    let gate = reg.state_gate().await;
+    assert!(reg.inflight_login_pids().is_empty());
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Busy,
+        "a live entry is busy even before any PID is available"
+    );
+    closed_tx.send_replace(Some(Ok(())));
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Unknown,
+        "a close receipt without successful deregistration is not vacant"
+    );
+    reg.deregister_inflight_for_test("ts1");
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+}
+
+#[tokio::test]
 async fn retired_ids_survive_pruning_and_capacity_exhaustion_fails_closed() {
     let spawner = fake_spawner(vec![], false, false);
     let reg = reg_with(
@@ -329,6 +517,40 @@ async fn relogin_waits_for_old_writer_reap_before_spawn() {
 }
 
 #[tokio::test]
+async fn local_owner_fact_keeps_transient_busy_through_reap() {
+    let (reg, spawner) = slow_registry(fake_subscriber(false));
+    let ud = temp_ud();
+    started(&reg, &ud, &ts_server("ts1", "myts")).await;
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Busy,
+        "subscription holds the transient entry"
+    );
+    drop(gate);
+
+    let reg2 = reg.clone();
+    let closing = tokio::spawn(async move { reg2.cancel_login("ts1").await });
+    acquire(&spawner.terminating).await;
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Busy,
+        "a requested close is still a local owner until reap"
+    );
+    drop(gate);
+    spawner.release.add_permits(1);
+    assert!(closing.await.unwrap().unwrap());
+    wait_until(|| !reg.attempts.owns_state("ts1")).await;
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
 async fn retirement_waits_for_transient_reap_and_keeps_failed_close_as_owner() {
     let (reg, spawner) = slow_registry(fake_subscriber(false));
     let ud = temp_ud();
@@ -350,6 +572,13 @@ async fn retirement_waits_for_transient_reap_and_keeps_failed_close_as_owner() {
         "failed close cannot prove retirement"
     );
     assert!(reg.shared.contains("ts1"), "failed close retains the owner");
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Unknown,
+        "failed native close is cleanupUnknown, not vacant"
+    );
+    drop(gate);
 
     let reg2 = reg.clone();
     let retry = tokio::spawn(async move {
@@ -363,6 +592,11 @@ async fn retirement_waits_for_transient_reap_and_keeps_failed_close_as_owner() {
     retry.await.unwrap().unwrap();
     assert!(!reg.shared.contains("ts1"));
     assert!(reg.inflight_login_pids().is_empty());
+    let gate = reg.state_gate().await;
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
     std::fs::remove_dir_all(ud).unwrap();
 }
 

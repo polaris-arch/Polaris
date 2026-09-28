@@ -76,6 +76,33 @@ struct AttemptState {
 pub(super) struct Attempts(Mutex<AttemptState>);
 
 impl Attempts {
+    /// Inspect all admissions for one node, including prepared requests that have not claimed
+    /// the state yet. `Err` means this table cannot certify a local absence.
+    pub fn local_owner_in_use(&self, server_id: &str) -> Result<bool, ()> {
+        let state = self.0.lock().map_err(|_| ())?;
+        if state.retired_exhausted {
+            return Err(());
+        }
+        let mut busy = false;
+        for (id, attempt) in state
+            .entries
+            .iter()
+            .filter(|(_, a)| a.server_id == server_id)
+        {
+            if state.retired_ids.contains(id) && !attempt.cancelled() {
+                return Err(());
+            }
+            if attempt.is_finished() {
+                if attempt.process_owned.load(Ordering::SeqCst) {
+                    return Err(());
+                }
+            } else {
+                busy = true;
+            }
+        }
+        Ok(busy)
+    }
+
     pub fn registration_exhausted(&self) -> bool {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         state.retired_exhausted || state.retired_ids.len() >= MAX_RETIRED_ATTEMPTS
