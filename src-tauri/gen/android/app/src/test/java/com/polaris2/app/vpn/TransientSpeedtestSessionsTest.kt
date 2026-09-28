@@ -11,6 +11,8 @@ import org.junit.Test
 
 class TransientSpeedtestSessionsTest {
     private fun await(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
+    private fun id(sequence: Int, epoch: String = "a".repeat(32)): String =
+        "$epoch:${sequence.toString(16).padStart(16, '0')}"
 
     private fun start(
         sessions: TransientSpeedtestSessions,
@@ -40,14 +42,14 @@ class TransientSpeedtestSessionsTest {
             override fun start() { inStart.countDown(); await(releaseStart) }
             override fun close() { closeCalls.incrementAndGet(); releaseStart.countDown() }
         }
-        val (started, startResult) = start(sessions, "blocked-start", engine)
+        val (started, startResult) = start(sessions, id(1), engine)
         await(inStart)
-        val (closed, closeResult) = close(sessions, "blocked-start")
+        val (closed, closeResult) = close(sessions, id(1))
         await(closed)
         await(started)
         assertEquals(null, closeResult.get())
         assertEquals("Android 临时测速已取消", startResult.get())
-        assertEquals("closed", sessions.status("blocked-start"))
+        assertEquals("closed", sessions.status(id(1)))
         assertEquals(1, closeCalls.get())
     }
 
@@ -60,7 +62,7 @@ class TransientSpeedtestSessionsTest {
             override fun start() {}
             override fun close() { closeEntered.countDown(); await(releaseClose) }
         }
-        val (started, _) = start(sessions, "before-main", engine)
+        val (started, _) = start(sessions, id(1), engine)
         await(started)
         val mainOwner = Any()
         val mainEntered = CountDownLatch(1)
@@ -71,12 +73,12 @@ class TransientSpeedtestSessionsTest {
         }.start()
         await(closeEntered)
         assertFalse(mainEntered.await(30, TimeUnit.MILLISECONDS))
-        val (blocked, busy) = start(sessions, "during-main", engine)
+        val (blocked, busy) = start(sessions, id(2), engine)
         await(blocked)
         assertTrue(busy.get()!!.contains("忙"))
         releaseClose.countDown()
         await(mainDone)
-        assertEquals("closed", sessions.status("before-main"))
+        assertEquals("closed", sessions.status(id(1)))
         sessions.closeMain(mainOwner) {}
     }
 
@@ -90,25 +92,25 @@ class TransientSpeedtestSessionsTest {
             override fun start() {}
             override fun close() { oldCloseCalls.incrementAndGet(); closeEntered.countDown(); await(releaseClose) }
         }
-        val (started, _) = start(sessions, "old", old)
+        val (started, _) = start(sessions, id(1), old)
         await(started)
-        val (closed, closeResult) = close(sessions, "old")
+        val (closed, closeResult) = close(sessions, id(1))
         await(closeEntered)
         await(closed)
         assertTrue(closeResult.get()!!.contains("未知"))
-        assertEquals("cleanupUnknown", sessions.status("old"))
+        assertEquals("cleanupUnknown", sessions.status(id(1)))
         val mainEntered = AtomicInteger()
         val owner = Any()
         val rejected = runCatching { sessions.withMainStart(owner, { true }) { mainEntered.incrementAndGet() } }
         assertTrue(rejected.isFailure)
         assertEquals(0, mainEntered.get())
-        val (blocked, _) = start(sessions, "new", old)
+        val (blocked, _) = start(sessions, id(2), old)
         await(blocked)
-        assertEquals("unknown", sessions.status("new"))
+        assertEquals("closed", sessions.status(id(2)))
         releaseClose.countDown()
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
-        while (sessions.status("old") != "closed" && System.nanoTime() < deadline) Thread.yield()
-        assertEquals("closed", sessions.status("old"))
+        while (sessions.status(id(1)) != "closed" && System.nanoTime() < deadline) Thread.yield()
+        assertEquals("closed", sessions.status(id(1)))
         assertEquals(0, mainEntered.get())
         val newCloseCalls = AtomicInteger()
         val next = object : TransientSpeedtestSessions.Engine {
@@ -116,12 +118,12 @@ class TransientSpeedtestSessionsTest {
             override fun start() {}
             override fun close() { newCloseCalls.incrementAndGet() }
         }
-        val (nextStarted, _) = start(sessions, "new", next)
+        val (nextStarted, _) = start(sessions, id(3), next)
         await(nextStarted)
-        assertEquals("running", sessions.status("new"))
+        assertEquals("running", sessions.status(id(3)))
         assertEquals(1, oldCloseCalls.get())
         assertEquals(0, newCloseCalls.get())
-        val (nextClosed, _) = close(sessions, "new")
+        val (nextClosed, _) = close(sessions, id(3))
         await(nextClosed)
         assertEquals(1, newCloseCalls.get())
     }
@@ -134,13 +136,13 @@ class TransientSpeedtestSessionsTest {
             override fun start() {}
             override fun close() { closeCalls.incrementAndGet(); error("native close failed") }
         }
-        val (started, _) = start(sessions, "failed-close", engine)
+        val (started, _) = start(sessions, id(1), engine)
         await(started)
-        val (closed, result) = close(sessions, "failed-close")
+        val (closed, result) = close(sessions, id(1))
         await(closed)
         assertTrue(result.get()!!.contains("未知"))
-        assertEquals("cleanupUnknown", sessions.status("failed-close"))
-        val (again, second) = close(sessions, "failed-close")
+        assertEquals("cleanupUnknown", sessions.status(id(1)))
+        val (again, second) = close(sessions, id(1))
         await(again)
         assertTrue(second.get()!!.contains("未知"))
         assertEquals(1, closeCalls.get())
@@ -160,16 +162,16 @@ class TransientSpeedtestSessionsTest {
             override fun start() { starts.incrementAndGet() }
             override fun close() { closes.incrementAndGet() }
         }
-        val (started, _) = start(sessions, "factory", engine)
+        val (started, _) = start(sessions, id(1), engine)
         await(preparing)
-        val (closed, result) = close(sessions, "factory")
+        val (closed, result) = close(sessions, id(1))
         await(closed)
         assertTrue(result.get()!!.contains("未知"))
         releasePrepare.countDown()
         await(started)
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
-        while (sessions.status("factory") != "closed" && System.nanoTime() < deadline) Thread.yield()
-        assertEquals("closed", sessions.status("factory"))
+        while (sessions.status(id(1)) != "closed" && System.nanoTime() < deadline) Thread.yield()
+        assertEquals("closed", sessions.status(id(1)))
         assertEquals(0, starts.get())
         assertEquals(1, closes.get())
     }
@@ -181,42 +183,42 @@ class TransientSpeedtestSessionsTest {
             override fun start() { error("start failed") }
             override fun close() {}
         }
-        val (started, result) = start(sessions, "failed-start", failed)
+        val (started, result) = start(sessions, id(1), failed)
         await(started)
         assertTrue(result.get()!!.contains("启动失败"))
-        val (closed, _) = close(sessions, "failed-start")
+        val (closed, _) = close(sessions, id(1))
         await(closed)
         val good = object : TransientSpeedtestSessions.Engine {
             override fun prepare() {}
             override fun start() {}
             override fun close() {}
         }
-        val (retried, retryResult) = start(sessions, "retry", good)
+        val (retried, retryResult) = start(sessions, id(2), good)
         await(retried)
         assertEquals(null, retryResult.get())
-        val (wrong, wrongResult) = close(sessions, "failed-start-unknown")
+        val (wrong, wrongResult) = close(sessions, id(3))
         await(wrong)
         assertEquals(null, wrongResult.get())
-        assertEquals("closed", sessions.status("failed-start-unknown"))
-        assertEquals("running", sessions.status("retry"))
-        val (end, _) = close(sessions, "retry")
+        assertEquals("closed", sessions.status(id(3)))
+        assertEquals("running", sessions.status(id(2)))
+        val (end, _) = close(sessions, id(2))
         await(end)
     }
 
     @Test fun closeBeforeDelayedStartRevokesIdWithoutConstructingNativeEngine() {
         val sessions = TransientSpeedtestSessions()
-        assertEquals("unknown", sessions.status("late"))
-        val (closed, closeResult) = close(sessions, "late")
+        assertEquals("unknown", sessions.status(id(1)))
+        val (closed, closeResult) = close(sessions, id(1))
         await(closed)
         assertEquals(null, closeResult.get())
-        assertEquals("closed", sessions.status("late"))
+        assertEquals("closed", sessions.status(id(1)))
         val touched = AtomicInteger()
         val engine = object : TransientSpeedtestSessions.Engine {
             override fun prepare() { touched.incrementAndGet() }
             override fun start() { touched.incrementAndGet() }
             override fun close() { touched.incrementAndGet() }
         }
-        val (started, result) = start(sessions, "late", engine)
+        val (started, result) = start(sessions, id(1), engine)
         await(started)
         assertTrue(result.get()!!.contains("忙"))
         assertEquals(0, touched.get())
@@ -233,14 +235,103 @@ class TransientSpeedtestSessionsTest {
             override fun start() { untouched.incrementAndGet() }
             override fun close() { untouched.incrementAndGet() }
         }
-        val (blocked, _) = start(sessions, "main-owned", engine)
+        val (blocked, _) = start(sessions, id(1), engine)
         await(blocked)
         assertEquals(0, untouched.get())
         sessions.closeMain(owner) {}
-        val (admitted, _) = start(sessions, "main-owned", engine)
+        val (admitted, _) = start(sessions, id(2), engine)
         await(admitted)
-        assertEquals("running", sessions.status("main-owned"))
-        val (closed, _) = close(sessions, "main-owned")
+        assertEquals("running", sessions.status(id(2)))
+        val (closed, _) = close(sessions, id(2))
         await(closed)
+    }
+
+    @Test fun futureCloseAndWrongEpochCannotCloseActiveSession() {
+        val sessions = TransientSpeedtestSessions()
+        val closeCalls = AtomicInteger()
+        val engine = object : TransientSpeedtestSessions.Engine {
+            override fun prepare() {}
+            override fun start() {}
+            override fun close() { closeCalls.incrementAndGet() }
+        }
+        val (started, _) = start(sessions, id(1), engine)
+        await(started)
+        val (future, futureResult) = close(sessions, id(3))
+        await(future)
+        assertEquals(null, futureResult.get())
+        assertEquals("running", sessions.status(id(1)))
+        assertEquals("closed", sessions.status(id(2)))
+        assertEquals(0, closeCalls.get())
+        val otherEpoch = "b".repeat(32)
+        val (wrong, wrongResult) = close(sessions, id(4, otherEpoch))
+        await(wrong)
+        assertTrue(wrongResult.get()!!.contains("epoch"))
+        assertEquals("running", sessions.status(id(1)))
+        val (oldClosed, _) = close(sessions, id(1))
+        await(oldClosed)
+        assertEquals(1, closeCalls.get())
+        val (next, nextResult) = start(sessions, id(4), engine)
+        await(next)
+        assertEquals(null, nextResult.get())
+        val (end, _) = close(sessions, id(4))
+        await(end)
+    }
+
+    @Test fun busyRejectedIdCannotBeReplayedAfterOwnerCloses() {
+        val sessions = TransientSpeedtestSessions()
+        val engine = object : TransientSpeedtestSessions.Engine {
+            override fun prepare() {}
+            override fun start() {}
+            override fun close() {}
+        }
+        val (first, _) = start(sessions, id(1), engine)
+        await(first)
+        val (busy, busyResult) = start(sessions, id(2), engine)
+        await(busy)
+        assertTrue(busyResult.get()!!.contains("忙"))
+        val (firstClosed, _) = close(sessions, id(1))
+        await(firstClosed)
+        val (replayed, replayResult) = start(sessions, id(2), engine)
+        await(replayed)
+        assertTrue(replayResult.get()!!.contains("忙"))
+        assertEquals("closed", sessions.status(id(2)))
+        val (third, thirdResult) = start(sessions, id(3), engine)
+        await(third)
+        assertEquals(null, thirdResult.get())
+        val (thirdClosed, _) = close(sessions, id(3))
+        await(thirdClosed)
+    }
+
+    @Test fun thousandsOfCompletedRoundsAndUnknownClosesKeepAdmissionOpen() {
+        val sessions = TransientSpeedtestSessions(closeTimeoutMillis = 2_000)
+        val starts = AtomicInteger()
+        val closes = AtomicInteger()
+        val engine = object : TransientSpeedtestSessions.Engine {
+            override fun prepare() {}
+            override fun start() { starts.incrementAndGet() }
+            override fun close() { closes.incrementAndGet() }
+        }
+        for (sequence in 1..2_050) {
+            val (started, result) = start(sessions, id(sequence), engine)
+            await(started)
+            assertEquals(null, result.get())
+            val (closed, closeResult) = close(sessions, id(sequence))
+            await(closed)
+            assertEquals(null, closeResult.get())
+        }
+        assertEquals(2_050, starts.get())
+        assertEquals(2_050, closes.get())
+        for (sequence in 2_051..12_050) {
+            val (closed, result) = close(sessions, id(sequence))
+            await(closed)
+            assertEquals(null, result.get())
+        }
+        val (next, result) = start(sessions, id(12_051), engine)
+        await(next)
+        assertEquals(null, result.get())
+        val (end, _) = close(sessions, id(12_051))
+        await(end)
+        assertEquals(2_051, starts.get())
+        assertEquals(2_051, closes.get())
     }
 }

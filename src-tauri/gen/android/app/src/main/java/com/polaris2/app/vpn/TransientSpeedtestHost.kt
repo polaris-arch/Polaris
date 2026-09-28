@@ -46,6 +46,11 @@ internal object TransientSpeedtestHost {
                 val endpoint = endpoints.getJSONObject(index)
                 check(endpoint.getString("type") != "tailscale")
             }
+            val outbounds = root.optJSONArray("outbounds")
+            if (root.has("outbounds")) check(outbounds != null)
+            if (outbounds != null) for (index in 0 until outbounds.length()) {
+                check(outbounds.getJSONObject(index).getString("type") != "tailscale")
+            }
             SystemEndpointGuard.requireSupported(config)
             // Every admitted inbound is HTTP, so no TUN can be constructed.
         } catch (_: Exception) {

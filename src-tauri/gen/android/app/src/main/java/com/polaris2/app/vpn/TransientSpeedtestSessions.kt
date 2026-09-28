@@ -18,7 +18,7 @@ internal class TransientSpeedtestSessions(
         fun close()
     }
 
-    private class Entry(val id: String, val engine: Engine) {
+    private class Entry(val id: String, val sequence: String, val engine: Engine) {
         var revoked = false
         var prepared = false
         var closeLaunched = false
@@ -26,25 +26,36 @@ internal class TransientSpeedtestSessions(
         val closed = CompletableFuture<Unit>()
     }
 
+    private data class Identity(val epoch: String, val sequence: String)
+    private val idPattern = Regex("([0-9a-f]{32}):([0-9a-f]{16})")
+    private val zeroSequence = "0000000000000000"
     private val lock = Object()
-    private val closedIds = LinkedHashSet<String>()
+    private var epoch: String? = null
+    // Fixed-width hex makes lexical and unsigned numeric order identical. A close
+    // revokes every earlier sequence, so no per-session tombstones or TTL are needed.
+    private var closedThrough = zeroSequence
     private val mainOwners = mutableSetOf<Any>()
     private var active: Entry? = null
-    // Never evict a revoked ID: a delayed IPC start could otherwise revive it.
-    // Exhaustion closes speedtest admission until process restart.
-    private var admissionClosed = false
     private val timer = Executors.newSingleThreadScheduledExecutor {
         Thread(it, "polaris-speedtest-timer").apply { isDaemon = true }
     }
 
     fun start(id: String, engine: Engine, done: (String?) -> Unit) {
-        if (id.isBlank() || id.length > 256) {
+        val identity = parseIdentity(id)
+        if (identity == null) {
             done("Android 临时测速实例标识无效")
             return
         }
         val entry = synchronized(lock) {
-            if (admissionClosed || mainOwners.isNotEmpty() || active != null || id in closedIds) null
-            else Entry(id, engine).also { active = it }
+            if (epoch == null) epoch = identity.epoch
+            if (epoch != identity.epoch || identity.sequence <= closedThrough) null
+            else {
+                // Consuming before admission means a busy/rejected invocation cannot
+                // be replayed after the current owner eventually closes.
+                rememberClosed(identity.sequence)
+                if (mainOwners.isNotEmpty() || active != null) null
+                else Entry(id, identity.sequence, engine).also { active = it }
+            }
         }
         if (entry == null) {
             done("Android 临时测速实例忙或标识重复")
@@ -76,18 +87,23 @@ internal class TransientSpeedtestSessions(
     }
 
     fun close(id: String, done: (String?) -> Unit) {
-        if (id.isBlank() || id.length > 256) {
+        val identity = parseIdentity(id)
+        if (identity == null) {
             done("Android 临时测速实例标识无效")
             return
         }
-        val entry = synchronized(lock) {
-            active?.takeIf { it.id == id } ?: run {
-                // Close may overtake the start IPC. This cancellation tombstone prevents
-                // a late start from constructing native resources after close resolves.
-                rememberClosed(id)
-                null
+        val (entry, wrongEpoch) = synchronized(lock) {
+            if (epoch == null) epoch = identity.epoch
+            if (epoch != identity.epoch) Pair(null, true)
+            else {
+                val owned = active?.takeIf { it.id == id }
+                // Close may overtake start. Advance the watermark before acknowledging;
+                // a delayed start for this or any older generation is then impossible.
+                if (owned == null) rememberClosed(identity.sequence)
+                Pair(owned, false)
             }
         }
+        if (wrongEpoch) { done("Android 临时测速实例 epoch 不匹配"); return }
         if (entry == null) { done(null); return }
         requestClose(entry)
         val replied = AtomicBoolean(false)
@@ -105,9 +121,15 @@ internal class TransientSpeedtestSessions(
         }
     }
 
-    fun status(id: String): String = synchronized(lock) {
-        if (active?.id == id) active!!.state
-        else if (id in closedIds) "closed" else "unknown"
+    fun status(id: String): String {
+        val identity = parseIdentity(id) ?: return "unknown"
+        return synchronized(lock) {
+            when {
+                active?.id == id -> active!!.state
+                epoch == identity.epoch && identity.sequence <= closedThrough -> "closed"
+                else -> "unknown"
+            }
+        }
     }
 
     /** Claim first, revoke token second, wait boundedly, then enter main JNI. */
@@ -143,10 +165,16 @@ internal class TransientSpeedtestSessions(
         synchronized(lock) { mainOwners.remove(owner) }
     }
 
+    private fun parseIdentity(id: String): Identity? {
+        val match = idPattern.matchEntire(id) ?: return null
+        val sequence = match.groupValues[2]
+        if (sequence == zeroSequence) return null
+        return Identity(match.groupValues[1], sequence)
+    }
+
     /** Caller holds [lock]. */
-    private fun rememberClosed(id: String) {
-        closedIds.add(id)
-        if (closedIds.size >= 2_048) admissionClosed = true
+    private fun rememberClosed(sequence: String) {
+        if (sequence > closedThrough) closedThrough = sequence
     }
 
     private fun isRevoked(entry: Entry): Boolean = synchronized(lock) { entry.revoked || active !== entry }
@@ -169,7 +197,7 @@ internal class TransientSpeedtestSessions(
             synchronized(lock) {
                 if (failure == null) {
                     if (active === entry) active = null
-                    rememberClosed(entry.id)
+                    rememberClosed(entry.sequence)
                     entry.state = "closed"
                 } else {
                     entry.state = "cleanupUnknown"
