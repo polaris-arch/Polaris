@@ -238,6 +238,8 @@
     }
   },
   "connections": {
+    "previousColumns": "View earlier columns",
+    "nextColumns": "View later columns",
     "pageTitle": "Connections",
     "topologyTab": "Topology",
     "active": "Active",
@@ -1882,6 +1884,8 @@
     "onDemandHint": "Connect only while referenced by the selected outbound or a routing rule; disconnect otherwise. Tailscale releases its tailnet address and stops MagicDNS; the login stays. Taildrop files are not received while suspended."
   },
   "nodes": {
+    "previousSubscriptions": "Show earlier subscriptions",
+    "nextSubscriptions": "Show later subscriptions",
     "add": "Add",
     "addSubscription": "Add Subscription",
     "batch": "Multi-select",

@@ -17,6 +17,21 @@
 @import './prototype.css';
 @config '../../tailwind.config.js';
 
+/* Shared horizontal navigation. Native wheel/trackpad scrolling is left intact. */
+.horizontal-scroll-arrow{ display:flex; align-items:center; justify-content:center; width:28px; height:28px;
+  padding:0; border:0; border-radius:var(--r-sm); background:transparent; color:hsl(var(--fg-dim)); cursor:pointer; flex:none; }
+.horizontal-scroll-arrow:disabled{ visibility:hidden; }
+.horizontal-scroll-arrow:hover{ background:hsl(var(--surface-2)); color:hsl(var(--fg)); }
+.horizontal-scroll-arrow:focus-visible{ outline:2px solid hsl(var(--ring)); outline-offset:-2px; }
+.horizontal-scroll-arrow svg{ width:16px; height:16px; }
+.horizontal-scroll-arrow.scroll-next svg{ transform:rotate(180deg); }
+:root[dir="rtl"] .horizontal-scroll-arrow svg{ transform:rotate(180deg); }
+:root[dir="rtl"] .horizontal-scroll-arrow.scroll-next svg{ transform:none; }
+.conn-horizontal-nav{ display:flex; flex:none; gap:4px; margin-inline-start:auto; }
+.nd-name:focus-visible{ outline:2px solid hsl(var(--ring)); outline-offset:-2px; border-radius:var(--r-sm); }
+/* Wrap visually without changing the command string used by the copy buttons. */
+.term-row code{ white-space:pre-wrap; overflow-wrap:anywhere; overflow-x:visible; }
+
 /* “重新下载当前版本”是可逆的恢复动作：用琥珀色与普通检查区分，但不使用危险操作的红色。
  * 安装仍由后续“重启并安装”单独确认，因此这里不制造一次只确认带宽消耗的阻断弹窗。 */
 .btn.warn-action{ color:hsl(var(--warn)); border-color:hsl(var(--warn)/0.42);

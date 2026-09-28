@@ -238,6 +238,8 @@
     }
   },
   "connections": {
+    "previousColumns": "Показать предыдущие столбцы",
+    "nextColumns": "Показать следующие столбцы",
     "pageTitle": "Подключения",
     "topologyTab": "Топология",
     "active": "Активные",
@@ -1594,6 +1596,8 @@
     }
   },
   "nodes": {
+    "previousSubscriptions": "Показать предыдущие подписки",
+    "nextSubscriptions": "Показать следующие подписки",
     "batchDeleteConfirmAgain": "Удалить выбранные?",
     "batchDeleteOk": "Удалено узлов: {{count}}",
     "batchExit": "Выйти",
