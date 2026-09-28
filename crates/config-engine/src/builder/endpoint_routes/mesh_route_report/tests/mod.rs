@@ -333,10 +333,9 @@ fn acknowledged_running_snapshot_can_prove_mesh_layer_owner() {
 
 #[test]
 fn cross_platform_wire_fixture_matches_resolver() {
-    let fixture: MeshRouteReport = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../ui/src/contracts/mesh-route-report.fixture.json"
-    )))
+    let fixture: MeshRouteReport = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "ui/src/contracts/mesh-route-report.fixture.json"
+    ))
     .unwrap();
     assert_eq!(
         resolve_mesh_route_snapshot(fixture.snapshot.clone()),

@@ -53,7 +53,14 @@ async fn final_gate_inline_absorption_keeps_unemitted_request() {
     let core_path = dir.join("core.json");
     let mut peeled = BTreeMap::new();
     let gate = rt
-        .generate_and_gate(&config, &deps, &core_path, None, &mut peeled)
+        .generate_and_gate_with_runtime_bindings(
+            &config,
+            &deps,
+            &core_path,
+            None,
+            &mut peeled,
+            &BTreeMap::new(),
+        )
         .await
         .unwrap();
     assert_eq!(gate.mesh_route_candidates.len(), 2);
@@ -140,7 +147,14 @@ async fn final_gate_external_reads_retained_file_not_new_observation_projection(
     let core_path = dir.join("core.json");
     let mut peeled = BTreeMap::new();
     let gate = rt
-        .generate_and_gate(&config, &deps, &core_path, None, &mut peeled)
+        .generate_and_gate_with_runtime_bindings(
+            &config,
+            &deps,
+            &core_path,
+            None,
+            &mut peeled,
+            &BTreeMap::new(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -251,7 +265,14 @@ async fn dns_owner_exists_without_any_force_route_claimant() {
     let core_path = dir.join("core.json");
     let mut peeled = BTreeMap::new();
     let gate = rt
-        .generate_and_gate(&config, &deps, &core_path, None, &mut peeled)
+        .generate_and_gate_with_runtime_bindings(
+            &config,
+            &deps,
+            &core_path,
+            None,
+            &mut peeled,
+            &BTreeMap::new(),
+        )
         .await
         .unwrap();
     assert!(gate.mesh_route_candidates.is_empty());

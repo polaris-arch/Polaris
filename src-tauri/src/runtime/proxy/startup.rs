@@ -3093,7 +3093,7 @@ impl ProxyRuntime {
     ///
     /// 外层起核重试（端口重分配自愈）会重跑本函数。内核对某个节点的拒收是**确定性**的（同一个节点、
     /// 同一个核，判定不会变），故第 2 腿起无需重新发现，直接沿用 ⇒ 重试腿恒只付 1 次 check。
-    async fn generate_and_gate_with_runtime_bindings(
+    pub(super) async fn generate_and_gate_with_runtime_bindings(
         &self,
         user_config: &UserConfig,
         deps: &GenerateConfigDeps,
