@@ -8,6 +8,7 @@ use polaris_core_supervisor::{ConfigCheckVerdict, KernelRejection, RejectedArray
 use serde_json::json;
 use std::fs;
 
+use super::super::materialize::{materialize_local_rule_sets, MaterializeError};
 use super::super::preflight::{checked_stage_with, stage_checked_with_core, PreflightError};
 
 fn fixture() -> (
@@ -111,6 +112,169 @@ fn receipt(
             .map(|rule| (rule.relative_path.clone(), sha256(&rule.bytes)))
             .collect(),
     }
+}
+
+fn source_fixture() -> (
+    TestDir,
+    ManagedMeshPlanInput,
+    ManagedMeshRoutePlan,
+    SingBoxConfig,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Vec<u8>,
+) {
+    let (dir, input, plan, mut legacy, _, rules) = fixture();
+    let source_root = dir.path().join("sources");
+    fs::create_dir(&source_root).unwrap();
+    let source = source_root.join("builtin-geo.json");
+    fs::write(&source, &rules[0].bytes).unwrap();
+    legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].path =
+        Some(source.to_string_lossy().into_owned());
+    (
+        dir,
+        input,
+        plan,
+        legacy,
+        source_root,
+        source,
+        rules[0].bytes.clone(),
+    )
+}
+
+#[tokio::test]
+async fn materializer_snapshots_local_rule_bytes_and_emits_private_paths() {
+    let (dir, input, plan, mut legacy, source_root, source, original) = source_fixture();
+    let binary = source_root.join("builtin-geo.srs");
+    let binary_bytes = b"binary-rule-set-snapshot".to_vec();
+    fs::write(&binary, &binary_bytes).unwrap();
+    let rule_sets = legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap();
+    let mut second = rule_sets[0].clone();
+    second.tag = "managed-b".into();
+    second.format = "binary".into();
+    second.path = Some(binary.to_string_lossy().into_owned());
+    rule_sets.push(second);
+    let materialized =
+        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root]).unwrap();
+    let root = dir.path().join("mesh-routes/plans/closure-plan");
+    assert_eq!(
+        materialized
+            .emission
+            .config
+            .route
+            .as_ref()
+            .unwrap()
+            .rule_set
+            .as_ref()
+            .unwrap()[0]
+            .path
+            .as_deref(),
+        Some(root.join("rules/rs-0000.json").to_str().unwrap())
+    );
+    assert_eq!(materialized.closure.rule_files[0].1, original);
+    assert_eq!(materialized.closure.rule_files[1].1, binary_bytes);
+    assert_eq!(
+        materialized
+            .emission
+            .config
+            .route
+            .as_ref()
+            .unwrap()
+            .rule_set
+            .as_ref()
+            .unwrap()[1]
+            .path
+            .as_deref(),
+        Some(root.join("rules/rs-0001.srs").to_str().unwrap())
+    );
+    assert!(!root.exists());
+
+    // The source may change after snapshot; staging consumes the owned bytes.
+    fs::write(source, b"different").unwrap();
+    fs::write(binary, b"also different").unwrap();
+    let checked = checked_stage_with(
+        &plan,
+        materialized.closure,
+        "generator-1",
+        |_| std::future::ready(ConfigCheckVerdict::Accepted),
+        || Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(root.join("rules/rs-0000.json")).unwrap(), original);
+    assert_eq!(
+        fs::read(root.join("rules/rs-0001.srs")).unwrap(),
+        binary_bytes
+    );
+    assert_eq!(checked.manifest.rule_files.len(), 2);
+}
+
+#[test]
+fn materializer_rejects_stale_plan_remote_missing_and_untrusted_sources_without_writes() {
+    let (dir, input, plan, mut legacy, source_root, source, _) = source_fixture();
+    let mut stale = input.clone();
+    stale.config_version = "config-3".into();
+    assert_eq!(
+        materialize_local_rule_sets(dir.path(), &plan, &stale, &legacy, &[source_root.clone()])
+            .unwrap_err(),
+        MaterializeError::SnapshotMismatch
+    );
+
+    legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].type_field = "remote".into();
+    assert_eq!(
+        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root.clone()])
+            .unwrap_err(),
+        MaterializeError::UnsupportedRuleSet
+    );
+    legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].type_field = "local".into();
+    legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].path = Some(
+        source_root
+            .join("absent.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert_eq!(
+        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root.clone()])
+            .unwrap_err(),
+        MaterializeError::MissingRuleSource
+    );
+    legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].path = Some(
+        dir.path()
+            .join("outside.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert_eq!(
+        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root.clone()])
+            .unwrap_err(),
+        MaterializeError::UntrustedRuleSource
+    );
+    assert!(source.exists());
+    assert!(!dir.path().join("mesh-routes").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn materializer_rejects_symlinked_source_or_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let (dir, input, plan, mut legacy, source_root, source, _) = source_fixture();
+    let link = source_root.join("link.json");
+    symlink(&source, &link).unwrap();
+    legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].path =
+        Some(link.to_string_lossy().into_owned());
+    assert_eq!(
+        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root.clone()])
+            .unwrap_err(),
+        MaterializeError::UntrustedRuleSource
+    );
+    let linked_root = dir.path().join("linked-sources");
+    symlink(&source_root, &linked_root).unwrap();
+    assert_eq!(
+        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[linked_root])
+            .unwrap_err(),
+        MaterializeError::InvalidSourceRoot
+    );
+    assert!(!dir.path().join("mesh-routes").exists());
 }
 
 #[test]

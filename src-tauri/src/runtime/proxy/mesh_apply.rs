@@ -4,6 +4,7 @@
 
 pub(crate) mod artifact;
 pub(crate) mod closure;
+pub(crate) mod materialize;
 pub(crate) mod preflight;
 
 use polaris_config_engine::builder::managed_mesh_plan::{ManagedMeshRoutePlan, ManagedPlanTarget};

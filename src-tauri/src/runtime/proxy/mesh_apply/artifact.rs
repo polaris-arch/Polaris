@@ -12,8 +12,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 const ARTIFACT_SCHEMA_VERSION: u32 = 1;
-const MAX_FILES: usize = 512;
-const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+pub(super) const MAX_FILES: usize = 512;
+pub(super) const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MANIFEST_NAME: &str = "manifest.json";
 const CONFIG_NAME: &str = "config.json";
