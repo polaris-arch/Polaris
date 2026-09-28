@@ -381,6 +381,90 @@ fn startup_ack_is_revoked_even_when_file_content_is_restored() {
 }
 
 #[test]
+fn externally_changed_file_cannot_regain_startup_ack_after_restore() {
+    let (rt, dir) = test_runtime();
+    let core_path = dir.join("config.json");
+    let rule_path = dir.join("tailnet.json");
+    let original = super::super::tailnet_rules::tailnet_rule_file_json(&["10.1.0.0/16".into()]);
+    std::fs::write(&core_path, "{}").unwrap();
+    std::fs::write(&rule_path, &original).unwrap();
+    rt.publish_mesh_route_run(ready_evidence(&rt, &core_path, &rule_path, &original), 7);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        start_time: Some(7),
+        ..Default::default()
+    };
+    assert_eq!(
+        rt.mesh_route_report(Some("r-version".into()))
+            .snapshot
+            .scope,
+        MeshRouteScope::Applied
+    );
+
+    let changed = super::super::tailnet_rules::tailnet_rule_file_json(&["10.2.0.0/16".into()]);
+    std::fs::write(&rule_path, changed).unwrap();
+    let changed_report = rt.mesh_route_report(Some("r-version".into()));
+    assert_eq!(
+        changed_report.snapshot.scope,
+        MeshRouteScope::PersistedUnknown
+    );
+    assert_eq!(
+        changed_report.snapshot.load_evidence,
+        MeshRouteLoadEvidence::FileWrittenUnacknowledged
+    );
+    assert_eq!(changed_report.results[0].effective, None);
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), 0);
+
+    std::fs::write(&rule_path, original).unwrap();
+    let restored = rt.mesh_route_report(Some("r-version".into()));
+    assert_eq!(restored.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_eq!(
+        restored.snapshot.load_evidence,
+        MeshRouteLoadEvidence::FileWrittenUnacknowledged
+    );
+    assert_eq!(restored.results[0].effective, None);
+}
+
+#[test]
+fn unreadable_core_artifact_cannot_regain_startup_ack_after_restore() {
+    let (rt, dir) = test_runtime();
+    let core_path = dir.join("config.json");
+    let rule_path = dir.join("tailnet.json");
+    let original = super::super::tailnet_rules::tailnet_rule_file_json(&["10.1.0.0/16".into()]);
+    std::fs::write(&core_path, "{}").unwrap();
+    std::fs::write(&rule_path, &original).unwrap();
+    rt.publish_mesh_route_run(ready_evidence(&rt, &core_path, &rule_path, &original), 7);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        start_time: Some(7),
+        ..Default::default()
+    };
+    assert_eq!(
+        rt.mesh_route_report(Some("r-version".into()))
+            .snapshot
+            .scope,
+        MeshRouteScope::Applied
+    );
+
+    std::fs::remove_file(&core_path).unwrap();
+    let missing = rt.mesh_route_report(Some("r-version".into()));
+    assert_eq!(missing.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_eq!(
+        missing.snapshot.load_evidence,
+        MeshRouteLoadEvidence::Unknown
+    );
+
+    std::fs::write(&core_path, "{}").unwrap();
+    let restored = rt.mesh_route_report(Some("r-version".into()));
+    assert_eq!(restored.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_eq!(
+        restored.snapshot.load_evidence,
+        MeshRouteLoadEvidence::Unknown
+    );
+    assert_eq!(restored.results[0].effective, None);
+}
+
+#[test]
 fn prepare_unacknowledged_and_old_generation_cannot_become_ready() {
     let (rt, dir) = test_runtime();
     let core_path = dir.join("config.json");

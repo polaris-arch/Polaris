@@ -441,6 +441,7 @@ impl ProxyRuntime {
         snapshot.load_evidence = evidence.load_evidence;
         let before = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
         let mut file_failed = false;
+        let mut file_changed = false;
         let mut remaining_file_bytes = MAX_TOTAL_RULE_FILE_BYTES;
         for item in &mut evidence.candidates {
             let Some(path) = item.external_path.as_deref() else {
@@ -455,7 +456,7 @@ impl ProxyRuntime {
                     remaining_file_bytes -= content.len();
                     let (configured, observed) = source_sets(&item.candidate);
                     if evidence.file_baselines.get(path) != Some(&content) {
-                        snapshot.load_evidence = MeshRouteLoadEvidence::FileWrittenUnacknowledged;
+                        file_changed = true;
                     }
                     item.candidate.referenced_file = Some(MeshRouteFileSnapshot {
                         cidrs: Some(cidrs.clone()),
@@ -495,24 +496,40 @@ impl ProxyRuntime {
             .map(|item| item.candidate)
             .collect();
         let after = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        let core_config_matches = evidence
-            .core_config_sha256
-            .as_ref()
-            .is_some_and(|expected| {
-                read_bounded(&evidence.core_config_path, MAX_CORE_CONFIG_BYTES)
-                    .ok()
-                    .is_some_and(|content| {
-                        polaris_updater::verify::sha256_hex(content.as_bytes()) == *expected
-                    })
-            });
-        if file_failed {
-            snapshot.load_evidence = MeshRouteLoadEvidence::Unknown;
-        } else if before != after
-            || before % 2 != 0
-            || before != evidence.write_epoch
-            || (evidence.core_config_sha256.is_some() && !core_config_matches)
-        {
-            snapshot.load_evidence = MeshRouteLoadEvidence::FileWrittenUnacknowledged;
+        let core_config_read = evidence.core_config_sha256.as_ref().map(|expected| {
+            read_bounded(&evidence.core_config_path, MAX_CORE_CONFIG_BYTES)
+                .map(|content| polaris_updater::verify::sha256_hex(content.as_bytes()) == *expected)
+        });
+        let observed_invalidation =
+            if file_failed || core_config_read.as_ref().is_some_and(Result::is_err) {
+                Some(MeshRouteLoadEvidence::Unknown)
+            } else if file_changed
+                || core_config_read == Some(Ok(false))
+                || evidence.core_config_sha256.is_none()
+                || before != after
+                || before % 2 != 0
+                || before != evidence.write_epoch
+            {
+                Some(MeshRouteLoadEvidence::FileWrittenUnacknowledged)
+            } else {
+                None
+            };
+        if let Some(invalidated) = observed_invalidation {
+            snapshot.load_evidence = invalidated;
+            // A later read of restored bytes is not a reload acknowledgement. Revoke the
+            // stored ready claim for this exact run; never overwrite a newer startup.
+            if let Ok(mut slot) = self.mesh_route_run.write() {
+                if let Some(current) = slot.as_mut() {
+                    if current.run_generation == evidence.run_generation
+                        && current.ready_at_ms == evidence.ready_at_ms
+                        && current.write_epoch == evidence.write_epoch
+                        && current.load_evidence == MeshRouteLoadEvidence::StartupReady
+                    {
+                        current.load_evidence = invalidated;
+                        current.eligible_for_ack = false;
+                    }
+                }
+            }
         }
         if status.running
             && !status.starting
