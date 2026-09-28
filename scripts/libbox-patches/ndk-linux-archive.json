@@ -1,0 +1,8 @@
+{
+  "release": "https://github.com/android/ndk/releases/tag/r30-rc1",
+  "url": "https://dl.google.com/android/repository/android-ndk-r30-beta3-linux.zip",
+  "bytes": 738755979,
+  "sha1": "f66e852ac01a57f74bcf6fd96dcea04dda5ea392",
+  "sha256": "2698cca1e9f161048ecd84e1e70a556e1aa00b78409473d4c1e87969d40c3efc",
+  "archiveRoot": "android-ndk-r30-beta3"
+}

@@ -520,6 +520,15 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       'libbox.aar 的唯一来源。它的坑② 明写「不能靠摘掉 with_naive_outbound 绕过 NDK 报错」—— '
       + '摘了之后 aar/APK/CI 全绿，只有真机上 naive/H3 静默连不上，唯一能抓到的就是本腿的 so 指纹判据。',
   },
+  'scripts/libbox-patches/': {
+    why: 'libbox 固定来源、工具链、补丁、构建与收据核验同属 AAR 来源；任何改动都须重跑 Android APK 腿。',
+  },
+  'scripts/build-android-apk.sh': {
+    why: '标准 Android 构建入口统一 Rust NDK 并驱动一次 Tauri/Gradle 构建；改坏它会让 APK 腿跳过或混用工具链。',
+  },
+  'scripts/android-rust-ndk.version': {
+    why: 'Rust Android 构建默认使用的已验稳定 NDK 版本；改版本须重跑 APK 腿验证交叉编译与 Gradle。',
+  },
   'scripts/verify-apk.mjs': {
     why:
       '本腿的产物级判据本体（三份许可文本逐字节对拍 / libbox.so 的 naive+cronet 指纹 / .srs 份数 / '
@@ -555,7 +564,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
     why: '上一条判据的变异测试：判据有没有牙由它守（含把「针被本仓注释喂绿」那条真缺陷原样回放）。',
   },
   '.github/workflows/android.yml': {
-    why: '本腿本体（工具链解析、libbox 来源、两步走构建、开箱验的调用点全在这一份里）。',
+    why: '本腿本体（工具链解析、libbox 来源、Tauri 构建、开箱验的调用点全在这一份里）。',
   },
   '.github/workflows/release-risk.yml': {
     why: '本腿的派发处：`android` job 的 `if` 与 gate job 里「被选中就必须 success」那条断言。',

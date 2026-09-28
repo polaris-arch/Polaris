@@ -1164,8 +1164,8 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     // 它自己在头注里写清了这一点（2026-09-13 落地时实测撞过一次，故留此记录）。
     let publish_job = slice_between(&workflow_raw, "\n  release-apk:\n", "", ANDROID_WORKFLOW);
     assert!(
-        publish_job.contains("run: ./gradlew assembleArm64Release -x rustBuildArm64Release\n"),
-        "{ANDROID_WORKFLOW}：`release-apk` 里没有那条**不带逃生门**的 assemble 行 —— \
+        publish_job.contains("bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\\n"),
+        "{ANDROID_WORKFLOW}：`release-apk` 里没有那条**不带逃生门**的 Tauri 构建行 —— \
          发布腿要么没在构建 release，要么已经改成了别的形态，先来这里说清楚。"
     );
     assert!(
@@ -1174,6 +1174,16 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
          `polarisAllowUnsigned`。那个逃生门产出的是未签名包，而 Android 只接受与已装应用同一把 \
          签名的升级包 —— 发出去就是一个所有老用户都装不上的资产，且失败发生在系统安装器里，\
          应用内看不见。"
+    );
+    let smoke_job = slice_between(
+        &workflow_raw,
+        "\n  release-smoke:\n",
+        "\n  release-apk:\n",
+        ANDROID_WORKFLOW,
+    );
+    assert!(
+        smoke_job.contains("--config src-tauri/tauri.android.conf.json -- -PpolarisAllowUnsigned=true"),
+        "{ANDROID_WORKFLOW}：release 冒烟腿没有把仅本次有效的 unsigned 逃生门交给 Tauri runner"
     );
     // 正面对照：这个词在别处（`release-smoke` 那条腿）**必须**还在，否则上面那条否定断言
     // 可能只是因为整份 workflow 里它已经消失了（那时逃生门的判据本身塌了，不是发布腿干净）。
@@ -1383,10 +1393,9 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
          又保住了什么（seeds.txt）。",
     ),
     (
-        "        run: ./gradlew assembleArm64Release -x rustBuildArm64Release \
-         -PpolarisAllowUnsigned=true",
-        1,
-        "让 R8 真的跑一次。逃生门只在这一行的实参里生效（读取点只认命令行实参），\
+        "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
+        2,
+        "让 R8 真的跑一次。逃生门通过 Tauri runner 实参只对本次 Gradle 生效，\
          不落文件、不进环境变量，所以不会留给后面任何一次构建。",
     ),
 ];

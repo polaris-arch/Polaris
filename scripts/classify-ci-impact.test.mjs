@@ -287,6 +287,11 @@ test('Android 面点亮 android 腿，且不误伤桌面腿', () => {
     'src-tauri/gen/android/app/src/main/AndroidManifest.xml',
     'src-tauri/tauri.android.conf.json',
     'scripts/build-libbox.sh',
+    'scripts/libbox-patches/source-manifest.json',
+    'scripts/libbox-patches/build.py',
+    'scripts/libbox-patches/verify-receipt.py',
+    'scripts/build-android-apk.sh',
+    'scripts/android-rust-ndk.version',
     'scripts/verify-apk.mjs',
     '.github/workflows/android.yml',
   ]) {

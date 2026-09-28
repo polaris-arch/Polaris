@@ -1,5 +1,4 @@
 import java.io.File
-import org.apache.tools.ant.taskdefs.condition.Os
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
 import org.gradle.api.logging.LogLevel
@@ -16,44 +15,21 @@ open class BuildTask : DefaultTask() {
 
     @TaskAction
     fun assemble() {
-        val executable = """pnpm""";
-        try {
-            runTauriCli(executable)
-        } catch (e: Exception) {
-            if (Os.isFamily(Os.FAMILY_WINDOWS)) {
-                // Try different Windows-specific extensions
-                val fallbacks = listOf(
-                    "$executable.exe",
-                    "$executable.cmd",
-                    "$executable.bat",
-                )
-
-                var lastException: Exception = e
-                for (fallback in fallbacks) {
-                    try {
-                        runTauriCli(fallback)
-                        return
-                    } catch (fallbackException: Exception) {
-                        lastException = fallbackException
-                    }
-                }
-                throw lastException
-            } else {
-                throw e;
-            }
-        }
-    }
-
-    fun runTauriCli(executable: String) {
         val rootDirRel = rootDirRel ?: throw GradleException("rootDirRel cannot be null")
         val target = target ?: throw GradleException("target cannot be null")
         val release = release ?: throw GradleException("release cannot be null")
-        val args = listOf("tauri", "android", "android-studio-script");
+        val tauriDir = File(project.projectDir, rootDirRel).canonicalFile
+        // The Android project lives under src-tauri, while the only package.json and
+        // installed Tauri CLI live in ui/. Keep src-tauri as the CLI working directory.
+        val cli = File(tauriDir, "../ui/node_modules/@tauri-apps/cli/tauri.js").canonicalFile
+        if (!cli.isFile) {
+            throw GradleException("Tauri CLI is missing at $cli; install the ui/ dependencies first")
+        }
 
         project.exec {
-            workingDir(File(project.projectDir, rootDirRel))
-            executable(executable)
-            args(args)
+            workingDir(tauriDir)
+            executable("node")
+            args(cli.absolutePath, "android", "android-studio-script")
             if (project.logger.isEnabled(LogLevel.DEBUG)) {
                 args("-vv")
             } else if (project.logger.isEnabled(LogLevel.INFO)) {

@@ -152,7 +152,7 @@ const NON_CORE_CONFS = {
     ciLeg: {
       workflow: 'android.yml',
       bind: '--config src-tauri/tauri.android.conf.json',
-      invocation: './ui/node_modules/.bin/tauri android build',
+      invocation: 'bash scripts/build-android-apk.sh',
     },
   },
   'tauri.ios.conf.json': {
