@@ -66,6 +66,46 @@ fn absent_policy_is_exact_legacy_dns_even_without_ledger() {
 }
 
 #[test]
+fn managed_overlay_finds_legacy_anchor_after_probe_prefix() {
+    let (policy, state) = fixture();
+    let mut legacy = legacy_dns();
+    let prefix: DnsRule = serde_json::from_value(json!({
+        "inbound":["probe-proxy-in"],
+        "query_type":["A","AAAA"],
+        "action":"route",
+        "server":"dns-remote",
+        "disable_cache":true
+    }))
+    .unwrap();
+    legacy.rules.as_mut().unwrap().insert(0, prefix.clone());
+    let built = build_mesh_dns_overlay(&legacy, Some(&policy), Some(&state), &emitted()).unwrap();
+    let rules = built.dns.rules.as_ref().unwrap();
+    assert_eq!(rules[0], prefix);
+    assert_eq!(rules[1].server.as_deref(), Some("dns-mdns"));
+    assert_ne!(rules[2].server.as_deref(), Some("dns-lan"));
+    assert!(rules
+        .iter()
+        .any(|rule| rule.server.as_deref() == Some("dns-lan")));
+
+    let duplicate = legacy.rules.as_ref().unwrap()[1].clone();
+    legacy.rules.as_mut().unwrap().push(duplicate);
+    assert_eq!(
+        build_mesh_dns_overlay(&legacy, Some(&policy), Some(&state), &emitted()).unwrap_err(),
+        MeshDnsBuildError::LegacyDnsShapeChanged
+    );
+
+    let mut broad_prefix = legacy_dns();
+    broad_prefix.rules.as_mut().unwrap().insert(
+        0,
+        serde_json::from_value(json!({"query_type":["A","AAAA"],"server":"dns-remote"})).unwrap(),
+    );
+    assert_eq!(
+        build_mesh_dns_overlay(&broad_prefix, Some(&policy), Some(&state), &emitted()).unwrap_err(),
+        MeshDnsBuildError::LegacyDnsShapeChanged
+    );
+}
+
+#[test]
 fn explicit_owners_emit_one_resolver_per_endpoint_without_global_preferred_by() {
     let (policy, state) = fixture();
     let built = build(&policy, &state);

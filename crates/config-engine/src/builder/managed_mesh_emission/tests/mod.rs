@@ -118,23 +118,64 @@ fn first_match<'a>(rules: &'a [RouteRule], ip: &str, network: &str, port: u32) -
     rules
         .iter()
         .find(|rule| {
-            if matches!(rule.action.as_deref(), Some("sniff" | "resolve"))
-                || rule.process_name.is_some()
-                || rule.inbound.is_some()
-            {
+            if matches!(rule.action.as_deref(), Some("sniff" | "resolve")) {
                 return false;
             }
-            let ip_matches = rule
-                .ip_cidr
-                .as_ref()
-                .is_none_or(|cidrs| cidrs.iter().any(|cidr| cidr_contains(cidr, ip)));
-            let net_matches = rule
-                .network
-                .as_ref()
-                .is_none_or(|networks| networks.iter().any(|item| item == network));
-            ip_matches && net_matches && rule.port.as_ref().is_none_or(|_| has_port(rule, port))
+            rule_matches(rule, &[ip], true, None, None, network, port)
         })
         .unwrap()
+}
+
+fn rule_matches(
+    rule: &RouteRule,
+    answers: &[&str],
+    resolved: bool,
+    inbound: Option<&str>,
+    domain: Option<&str>,
+    network: &str,
+    port: u32,
+) -> bool {
+    let mut matches = if rule.type_field.as_deref() == Some("logical") {
+        let children = rule.rules.as_ref().unwrap();
+        match rule.mode.as_deref() {
+            Some("and") => children.iter().all(|child| {
+                rule_matches(child, answers, resolved, inbound, domain, network, port)
+            }),
+            Some("or") => children.iter().any(|child| {
+                rule_matches(child, answers, resolved, inbound, domain, network, port)
+            }),
+            other => panic!("unsupported test matcher mode {other:?}"),
+        }
+    } else {
+        true
+    };
+    matches &= rule.process_name.is_none();
+    matches &= match &rule.inbound {
+        Some(OneOrMany::One(tag)) => inbound == Some(tag.as_str()),
+        Some(OneOrMany::Many(tags)) => {
+            inbound.is_some_and(|value| tags.iter().any(|tag| tag == value))
+        }
+        None => true,
+    };
+    matches &= rule.port.as_ref().is_none_or(|_| has_port(rule, port));
+    matches &= rule
+        .network
+        .as_ref()
+        .is_none_or(|networks| networks.iter().any(|item| item == network));
+    matches &= rule.ip_cidr.as_ref().is_none_or(|cidrs| {
+        resolved
+            && answers
+                .iter()
+                .any(|ip| cidrs.iter().any(|cidr| cidr_contains(cidr, ip)))
+    });
+    matches &= rule.domain_suffix.as_ref().is_none_or(|suffixes| {
+        domain.is_some_and(|name| suffixes.iter().any(|suffix| name.ends_with(suffix)))
+    });
+    if rule.invert.unwrap_or(false) {
+        !matches
+    } else {
+        matches
+    }
 }
 
 /// Independent first-match model for the fixed core's non-terminal resolve:
@@ -145,7 +186,17 @@ fn trace_domain<'a>(
     inbound: Option<&str>,
     port: u32,
 ) -> Result<(Option<&'a RouteRule>, usize), &'static str> {
-    trace_destination(rules, answers, inbound, port, true)
+    trace_destination(rules, answers, inbound, Some("ordinary.test"), port, true)
+}
+
+fn trace_named_domain<'a>(
+    rules: &'a [RouteRule],
+    name: &str,
+    answers: &[&str],
+    inbound: Option<&str>,
+    port: u32,
+) -> Result<(Option<&'a RouteRule>, usize), &'static str> {
+    trace_destination(rules, answers, inbound, Some(name), port, true)
 }
 
 fn trace_ip<'a>(
@@ -154,41 +205,24 @@ fn trace_ip<'a>(
     inbound: Option<&str>,
     port: u32,
 ) -> Result<(Option<&'a RouteRule>, usize), &'static str> {
-    trace_destination(rules, &[ip], inbound, port, false)
+    trace_destination(rules, &[ip], inbound, None, port, false)
 }
 
 fn trace_destination<'a>(
     rules: &'a [RouteRule],
     answers: &[&str],
     inbound: Option<&str>,
+    domain: Option<&str>,
     port: u32,
     is_domain: bool,
 ) -> Result<(Option<&'a RouteRule>, usize), &'static str> {
     let mut resolved = !is_domain;
     let mut resolve_count = 0;
     for rule in rules {
-        if rule.action.as_deref() == Some("sniff") || rule.process_name.is_some() {
+        if rule.action.as_deref() == Some("sniff") {
             continue;
         }
-        let inbound_matches = match &rule.inbound {
-            Some(OneOrMany::One(tag)) => inbound == Some(tag.as_str()),
-            Some(OneOrMany::Many(tags)) => {
-                inbound.is_some_and(|value| tags.iter().any(|tag| tag == value))
-            }
-            None => true,
-        };
-        if inbound_matches == rule.invert.unwrap_or(false) {
-            continue;
-        }
-        if rule.port.is_some() && !has_port(rule, port) {
-            continue;
-        }
-        if rule.ip_cidr.as_ref().is_some_and(|cidrs| {
-            !resolved
-                || !answers
-                    .iter()
-                    .any(|ip| cidrs.iter().any(|cidr| cidr_contains(cidr, ip)))
-        }) {
+        if !rule_matches(rule, answers, resolved, inbound, domain, "tcp", port) {
             continue;
         }
         match rule.action.as_deref() {
@@ -317,6 +351,259 @@ fn resolved_domain_ipv6_and_fakeip_name_reach_q_before_legacy_final() {
 }
 
 #[test]
+fn complete_answer_set_cannot_cross_q_owner_or_release() {
+    let mut input = input();
+    input
+        .policy
+        .assignments
+        .retain(|assignment| assignment.cidr != "fd7a:115c:a1e0::/48");
+    input.candidates[0]
+        .configured_cidrs
+        .push("fd7a:115c:a1e0:1::/64".into());
+    input
+        .policy
+        .assignments
+        .push(crate::user_config::mesh_route_state::MeshAssignment {
+            cidr: "100.82.0.0/16".into(),
+            target: MeshTarget::Unmanaged,
+        });
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    assert!(
+        plan.owner_routes.iter().any(|route| {
+            route.owner_ref == owner("ts-a", "epoch-a")
+                && cidr_contains(&route.cidr, "fd7a:115c:a1e0:1::9/128")
+        }),
+        "owner routes: {:?}",
+        plan.owner_routes
+    );
+    assert!(plan
+        .released_cidrs
+        .iter()
+        .any(|cidr| cidr_contains(cidr, "100.82.1.1/32")));
+    let built = emit_managed_mesh_config(&legacy(), &input, &plan).unwrap();
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    for answers in [
+        vec!["100.80.2.3/32", "100.81.2.3/32"],           // two owners
+        vec!["100.80.2.3/32", "100.90.2.3/32"],           // owner + reject Q
+        vec!["100.80.2.3/32", "203.0.113.5/32"],          // Q + public
+        vec!["100.80.2.3/32", "100.82.1.1/32"],           // Q + released
+        vec!["100.80.2.3/32", "fd7a:115c:a1e0:2::9/128"], // dual-stack other Q
+    ] {
+        let (rule, resolves) = trace_domain(rules, &answers, None, 443).unwrap();
+        assert_eq!(resolves, 1, "{answers:?}");
+        assert_eq!(
+            rule.unwrap().action.as_deref(),
+            Some("reject"),
+            "{answers:?}"
+        );
+    }
+    for answers in [
+        vec!["100.80.2.3/32", "100.80.3.3/32"],
+        vec!["100.80.2.3/32", "fd7a:115c:a1e0:1::9/128"],
+    ] {
+        let (rule, resolves) = trace_domain(rules, &answers, None, 443).unwrap();
+        assert_eq!(resolves, 1);
+        assert_eq!(
+            rule.unwrap().outbound.as_deref(),
+            Some("ep-a"),
+            "{answers:?}"
+        );
+    }
+    let (released, _) = trace_domain(rules, &["100.82.1.1/32"], None, 443).unwrap();
+    assert_eq!(released.unwrap().outbound.as_deref(), Some("direct"));
+}
+
+#[test]
+fn scoped_override_rejects_cross_scope_and_cross_ip_atom_answers() {
+    let mut input = input();
+    input.policy.overrides.push(MeshOverride {
+        rule_id: "two-atoms".into(),
+        scope_cidrs: vec!["100.80.2.0/23".into()],
+        target: MeshTarget::Owner {
+            server_id: "ts-b".into(),
+            identity_epoch: "epoch-b".into(),
+        },
+    });
+    input.scopeable_rule_matchers.insert(
+        "two-atoms".into(),
+        RouteRule {
+            type_field: Some("logical".into()),
+            mode: Some("or".into()),
+            rules: Some(vec![
+                RouteRule {
+                    ip_cidr: Some(vec!["100.80.2.0/24".into()]),
+                    ..Default::default()
+                },
+                RouteRule {
+                    ip_cidr: Some(vec!["100.80.3.0/24".into()]),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        },
+    );
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let built = emit_managed_mesh_config(&legacy(), &input, &plan).unwrap();
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    for answers in [
+        vec!["100.80.2.1/32", "100.80.3.1/32"], // separate matcher atoms
+        vec!["100.80.2.1/32", "100.80.4.1/32"], // outside scope
+    ] {
+        let (rule, _) = trace_domain(rules, &answers, None, 443).unwrap();
+        assert_eq!(
+            rule.unwrap().action.as_deref(),
+            Some("reject"),
+            "{answers:?}"
+        );
+    }
+    let (rule, _) = trace_domain(rules, &["100.80.2.1/32"], None, 443).unwrap();
+    assert_eq!(rule.unwrap().outbound.as_deref(), Some("ep-b"));
+}
+
+#[test]
+fn guard_expansion_and_final_route_bytes_are_bounded() {
+    let input = input();
+    let mut plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    plan.protected_cidrs = (0..4097)
+        .map(|index| {
+            format!(
+                "10.{}.{}.{}/32",
+                index / 65536,
+                (index / 256) % 256,
+                index % 256
+            )
+        })
+        .collect();
+    assert!(guard::guarded_rules(&plan)
+        .unwrap_err()
+        .contains("CIDR budget"));
+
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let mut legacy = legacy();
+    legacy.route.as_mut().unwrap().rules.push(RouteRule {
+        domain_suffix: Some(vec!["a".repeat(4 * 1024 * 1024)]),
+        action: Some("route".into()),
+        outbound: Some("direct".into()),
+        ..Default::default()
+    });
+    assert!(emit_managed_mesh_config(&legacy, &input, &plan)
+        .unwrap_err()
+        .contains("rule byte budget"));
+}
+
+#[test]
+fn real_generator_normal_two_tailscale_config_emits_managed_rules() {
+    use crate::builder::{generate_sing_box_config, GenerateConfigDeps};
+    use crate::user_config::app_config::UserConfig;
+    use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
+    use crate::user_config::server_config::{Protocol, ServerConfig, TailscaleSettings};
+    let user = UserConfig {
+        servers: ["ts-a", "ts-b"]
+            .map(|id| ServerConfig {
+                id: id.into(),
+                name: id.into(),
+                protocol: Protocol::Tailscale,
+                tailscale_settings: Some(Box::new(TailscaleSettings {
+                    auth_key: Some("tskey-auth-example".into()),
+                    control_url: Some("https://localhost".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .into(),
+        selected_server_id: Some("ts-a".into()),
+        proxy_mode: ProxyMode::Direct,
+        proxy_mode_type: ProxyModeType::Manual,
+        ..Default::default()
+    };
+    let deps = GenerateConfigDeps {
+        platform: "linux".into(),
+        arch: "x86_64".into(),
+        race_server_port: 0,
+        probe_direct_port: Some(21001),
+        probe_proxy_port: Some(21002),
+        update_in_port: Some(21003),
+        subscription_update_in_port: None,
+        loopback_auth: None,
+        probe_pool_ports: vec![21004],
+        lan_resolver_for_dns: None,
+        race_upstream_ips: vec![],
+        race_upstream_ports: vec![],
+        has_cronet: true,
+        cronet_copy_failed: false,
+        has_management_api: false,
+        privacy_mode: false,
+        log_level: crate::user_config::LogLevel::Info,
+        disable_log_file: false,
+        dashboard_serve_dir: None,
+        tailscale_api_port: 15490,
+        cache_path: "/tmp/d1-cache.db".into(),
+        log_file_path: None,
+        runtime_rules_dir: "/tmp/d1-rules".into(),
+        rule_resources_path: "/tmp/d1-resources".into(),
+        custom_rules_dir: "/tmp/d1-custom".into(),
+        tailnet_rules_dir: "/tmp/d1-tailnet".into(),
+        tailscale_state_dir_prefix: "/tmp/d1-ts".into(),
+        is_valid_srs_fn: |_| false,
+        own_lan_cidrs: vec![],
+        system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
+        network_canary_port: None,
+        observed_tailnet_addresses: Default::default(),
+        log: |_, _| {},
+        on_degraded: || {},
+    };
+    let generated = generate_sing_box_config(&user, &BTreeMap::new(), &deps).unwrap();
+    let endpoints = generated.endpoints.as_ref().unwrap();
+    assert_eq!(endpoints.len(), 2);
+    let mut input = input();
+    for (candidate, endpoint) in input.candidates.iter_mut().zip(endpoints) {
+        candidate.endpoint_tag = Some(endpoint.tag.clone());
+    }
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let built = emit_managed_mesh_config(&generated, &input, &plan).unwrap();
+    assert_eq!(built.internal_inbound_exceptions.len(), 4);
+    assert!(built
+        .config
+        .route
+        .as_ref()
+        .unwrap()
+        .rules
+        .iter()
+        .any(|rule| {
+            rule.domain_suffix
+                .as_ref()
+                .is_some_and(|suffixes| suffixes == &["doh.pub"])
+        }));
+    assert!(built
+        .config
+        .route
+        .as_ref()
+        .unwrap()
+        .rules
+        .iter()
+        .any(|rule| { rule.override_address.as_deref() == Some("127.0.0.1") }));
+    if let Some(core) = std::env::var_os("POLARIS_TEST_CORE") {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("generated-managed.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&built.config).unwrap()).unwrap();
+        for subcommand in ["check", "format"] {
+            let output = std::process::Command::new(&core)
+                .arg(subcommand)
+                .arg("-c")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "real generated managed config failed b609 {subcommand}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn subscription_guard_precedes_q_and_pin_cannot_preempt_q() {
     let input = input();
     let plan = compile_managed_mesh_plan(input.clone()).unwrap();
@@ -367,7 +654,7 @@ fn subscription_guard_precedes_q_and_pin_cannot_preempt_q() {
 }
 
 #[test]
-fn unproved_legacy_resolution_or_internal_pin_blocks_managed_emission() {
+fn known_internal_pin_rejects_q_and_unknown_pin_blocks_managed_emission() {
     let input = input();
     let plan = compile_managed_mesh_plan(input.clone()).unwrap();
     let mut config = legacy();
@@ -382,14 +669,33 @@ fn unproved_legacy_resolution_or_internal_pin_blocks_managed_emission() {
     );
     assert!(emit_managed_mesh_config(&config, &input, &plan)
         .unwrap_err()
-        .contains("inbound pin"));
+        .contains("DNS resolver"));
+    config
+        .dns
+        .as_mut()
+        .unwrap()
+        .servers
+        .push(serde_json::from_value(json!({"tag":"dns-bootstrap","type":"local"})).unwrap());
+    let built = emit_managed_mesh_config(&config, &input, &plan).unwrap();
+    assert_eq!(built.internal_inbound_exceptions, vec!["probe-direct-in"]);
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    let (q, resolves) =
+        trace_domain(rules, &["100.80.2.3/32"], Some("probe-direct-in"), 443).unwrap();
+    assert_eq!(resolves, 1);
+    assert_eq!(q.unwrap().action.as_deref(), Some("reject"));
+    let (public, resolves) =
+        trace_domain(rules, &["203.0.113.5/32"], Some("probe-direct-in"), 443).unwrap();
+    assert_eq!(resolves, 1);
+    assert_eq!(public.unwrap().outbound.as_deref(), Some("direct"));
     let mut config = legacy();
     config.route.as_mut().unwrap().rules.push(RouteRule {
         inbound: Some(OneOrMany::Many(vec!["custom-in".into()])),
         action: Some("resolve".into()),
         ..Default::default()
     });
-    assert!(emit_managed_mesh_config(&config, &input, &plan).is_err());
+    assert!(emit_managed_mesh_config(&config, &input, &plan)
+        .unwrap_err()
+        .contains("unknown inbound"));
     let mut config = legacy();
     config.route.as_mut().unwrap().rules.push(RouteRule {
         domain_suffix: Some(vec!["bank.example".into()]),
@@ -397,9 +703,14 @@ fn unproved_legacy_resolution_or_internal_pin_blocks_managed_emission() {
         outbound: Some("direct".into()),
         ..Default::default()
     });
-    assert!(emit_managed_mesh_config(&config, &input, &plan)
-        .unwrap_err()
-        .contains("domain-pinned"));
+    let built = emit_managed_mesh_config(&config, &input, &plan).unwrap();
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    let (q, _) =
+        trace_named_domain(rules, "secure.bank.example", &["100.80.2.3/32"], None, 443).unwrap();
+    assert_eq!(q.unwrap().outbound.as_deref(), Some("ep-a"));
+    let (public, _) =
+        trace_named_domain(rules, "secure.bank.example", &["203.0.113.5/32"], None, 443).unwrap();
+    assert_eq!(public.unwrap().outbound.as_deref(), Some("direct"));
 }
 
 #[test]
@@ -514,7 +825,15 @@ fn scoped_override_is_and_of_original_matcher_and_protected_scope() {
     let rules = &built.config.route.as_ref().unwrap().rules;
     let scoped = rules
         .iter()
-        .find(|rule| rule.type_field.as_deref() == Some("logical"))
+        .find(|rule| {
+            rule.type_field.as_deref() == Some("logical")
+                && rule.rules.as_ref().is_some_and(|children| {
+                    children.first().is_some_and(|child| {
+                        child.domain_suffix.as_deref()
+                            == Some(["corp.example.invalid".into()].as_slice())
+                    })
+                })
+        })
         .unwrap();
     assert_eq!(scoped.mode.as_deref(), Some("and"));
     assert_eq!(scoped.action.as_deref(), Some("reject"));

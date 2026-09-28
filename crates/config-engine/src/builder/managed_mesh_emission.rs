@@ -14,6 +14,8 @@ use crate::builder::subscription_guard::{
 use crate::singbox::{OneOrMany, RouteRule, SingBoxConfig};
 use crate::user_config::cidr::cidrs_overlap;
 
+mod guard;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManagedMeshEmission {
     pub config: SingBoxConfig,
@@ -21,6 +23,10 @@ pub struct ManagedMeshEmission {
     /// Ordinary TCP/UDP 53 to Q still reaches the generic DNS hijack before
     /// owner/Q rules. S4 must disclose this scoped exception in preview/ACK.
     pub ordinary_port53_hijack_cidrs: Vec<String>,
+    /// Internal probe/update inbounds have dedicated DNS resolution and a Q
+    /// reject before their original pinned outbound. S4 must show these
+    /// exceptions in the preview alongside ordinary port-53 hijack.
+    pub internal_inbound_exceptions: Vec<String>,
 }
 
 /// The input, plan and already generated legacy config must come from one
@@ -88,14 +94,24 @@ pub fn emit_managed_mesh_config(
         .as_mut()
         .ok_or("generated config has no route section")?;
 
-    // Reorder only rules whose exact baseline shape is known. Internal
-    // probe/update inbounds would otherwise either resolve before their pin
-    // or bypass Q unresolved, so they block this managed emitter for now.
-    let hijack_index = route
+    // Move only exact built-in exceptions ahead of the managed Q settlement.
+    // Unknown inbound or local override shapes cannot silently bypass it.
+    let generic_hijack = RouteRule {
+        port: Some(OneOrMany::Many(vec![53])),
+        action: Some("hijack-dns".into()),
+        ..Default::default()
+    };
+    let mut hijack_indices = route
         .rules
         .iter()
-        .position(|rule| rule.action.as_deref() == Some("hijack-dns") && has_port(rule, 53))
+        .enumerate()
+        .filter_map(|(index, rule)| (rule == &generic_hijack).then_some(index));
+    let hijack_index = hijack_indices
+        .next()
         .ok_or("generic DNS hijack rule is missing")?;
+    if hijack_indices.next().is_some() {
+        return Err("generic DNS hijack rule is ambiguous".into());
+    }
     let bootstrap_index = hijack_index
         .checked_sub(1)
         .ok_or("bootstrap DNS direct rule is missing")?;
@@ -157,31 +173,54 @@ pub fn emit_managed_mesh_config(
         ..Default::default()
     };
     let mut legacy_resolve_index = None;
+    let mut internal_pins = Vec::new();
+    let mut local_override_index = None;
     for (index, rule) in route.rules.iter().enumerate() {
         if rule.inbound.is_some() && !subscription_indices.contains(&index) {
-            return Err("managed mesh cannot preserve a probe or update inbound pin".into());
+            if is_exact_userspace_local_route(rule, endpoints) {
+                continue;
+            }
+            let Some((tag, resolver)) = internal_pin_resolver(rule) else {
+                return Err("managed mesh cannot preserve an unknown inbound pin".into());
+            };
+            if internal_pins.iter().any(|(_, known, _)| known == &tag)
+                || !dns.dns.servers.iter().any(|server| server.tag == resolver)
+            {
+                return Err("managed mesh internal pin has no unique DNS resolver".into());
+            }
+            internal_pins.push((index, tag, resolver));
         }
         if rule.action.as_deref() == Some("resolve") && !subscription_indices.contains(&index) {
             if rule != &bare_resolve || legacy_resolve_index.replace(index).is_some() {
                 return Err("managed mesh cannot place a scoped legacy resolve after Q".into());
             }
         }
-        if rule.action.as_deref() == Some("route")
-            && (rule.domain.is_some()
-                || rule.domain_suffix.is_some()
-                || rule.domain_keyword.is_some()
-                || rule.domain_regex.is_some())
-        {
-            return Err(
-                "managed mesh needs an explicit exception for a domain-pinned route".into(),
-            );
+        if rule.override_address.is_some() {
+            if !is_exact_microdone_local_override(rule)
+                || local_override_index.replace(index).is_some()
+                || plan
+                    .protected_cidrs
+                    .iter()
+                    .any(|q| cidrs_overlap(q, "127.0.0.1/32"))
+            {
+                return Err("managed mesh local override changed shape or overlaps Q".into());
+            }
         }
     }
     let core = route.rules[core_index].clone();
     let bootstrap = route.rules[bootstrap_index].clone();
     let hijack = route.rules[hijack_index].clone();
+    let local_override = local_override_index.map(|index| route.rules[index].clone());
+    let pinned_rules: Vec<_> = internal_pins
+        .iter()
+        .map(|(index, tag, resolver)| (route.rules[*index].clone(), tag.clone(), resolver.clone()))
+        .collect();
     let mut removed = vec![core_index, bootstrap_index, hijack_index];
     removed.extend(subscription_indices);
+    removed.extend(internal_pins.iter().map(|(index, _, _)| *index));
+    if let Some(index) = local_override_index {
+        removed.push(index);
+    }
     if let Some(index) = legacy_resolve_index {
         removed.push(index);
     }
@@ -194,6 +233,21 @@ pub fn emit_managed_mesh_config(
     if let Some(sub) = &subscription {
         managed.extend(sub[..2].iter().cloned());
     }
+    for (_, tag, resolver) in &pinned_rules {
+        managed.push(RouteRule {
+            inbound: Some(OneOrMany::Many(vec![tag.clone()])),
+            action: Some("resolve".into()),
+            server: Some(resolver.clone()),
+            ..Default::default()
+        });
+        let mut reject_q = RouteRule {
+            inbound: Some(OneOrMany::Many(vec![tag.clone()])),
+            ip_cidr: Some(plan.protected_cidrs.clone()),
+            ..Default::default()
+        };
+        reject(&mut reject_q);
+        managed.push(reject_q);
+    }
     if let Some(service) = &dns.service {
         let mut rule = RouteRule {
             ip_cidr: Some(MAGIC_DNS_SERVICE_CIDRS.map(str::to_owned).to_vec()),
@@ -204,54 +258,24 @@ pub fn emit_managed_mesh_config(
         set_target(&mut rule, service);
         managed.push(rule);
     }
+    managed.extend(pinned_rules.iter().map(|(pin, _, _)| pin.clone()));
+    if let Some(local_override) = local_override {
+        managed.push(local_override);
+    }
     managed.push(bootstrap);
     managed.push(hijack);
     let mut managed_resolve = bare_resolve;
+    let mut exceptions: Vec<String> = pinned_rules.iter().map(|(_, tag, _)| tag.clone()).collect();
     if subscription.is_some() {
-        managed_resolve.inbound =
-            Some(OneOrMany::Many(
-                vec![SUBSCRIPTION_UPDATE_INBOUND_TAG.into()],
-            ));
+        exceptions.push(SUBSCRIPTION_UPDATE_INBOUND_TAG.into());
+    }
+    if !exceptions.is_empty() {
+        managed_resolve.inbound = Some(OneOrMany::Many(exceptions.clone()));
         managed_resolve.invert = Some(true);
     }
     managed.push(managed_resolve);
 
-    for override_rule in &plan.overrides {
-        if override_rule.scope_cidrs.is_empty() {
-            continue;
-        }
-        let mut rule = RouteRule {
-            type_field: Some("logical".into()),
-            mode: Some("and".into()),
-            rules: Some(vec![
-                override_rule.matcher.clone(),
-                RouteRule {
-                    ip_cidr: Some(override_rule.scope_cidrs.clone()),
-                    ..Default::default()
-                },
-            ]),
-            ..Default::default()
-        };
-        set_plan_target(&mut rule, &override_rule.target)?;
-        managed.push(rule);
-    }
-    for owner_route in &plan.owner_routes {
-        let rule = RouteRule {
-            ip_cidr: Some(vec![owner_route.cidr.clone()]),
-            action: Some("route".into()),
-            outbound: Some(owner_route.endpoint_tag.clone()),
-            ..Default::default()
-        };
-        managed.push(rule);
-    }
-    for cidr in &plan.reject_cidrs {
-        let mut rule = RouteRule {
-            ip_cidr: Some(vec![cidr.clone()]),
-            ..Default::default()
-        };
-        reject(&mut rule);
-        managed.push(rule);
-    }
+    managed.extend(guard::guarded_rules(plan)?);
     if let Some(sub) = subscription {
         managed.push(sub[2].clone());
     }
@@ -265,11 +289,77 @@ pub fn emit_managed_mesh_config(
         return Err("leading route sniff rule is missing".into());
     }
     route.rules.splice(sniff_end..sniff_end, managed);
+    guard::check_final_route_budget(&route.rules)?;
     Ok(ManagedMeshEmission {
         config,
         dns,
         ordinary_port53_hijack_cidrs: plan.protected_cidrs.clone(),
+        internal_inbound_exceptions: exceptions,
     })
+}
+
+fn internal_pin_resolver(rule: &RouteRule) -> Option<(String, String)> {
+    let tag = match &rule.inbound {
+        Some(OneOrMany::Many(tags)) if tags.len() == 1 => tags[0].as_str(),
+        _ => return None,
+    };
+    let outbound = rule.outbound.as_deref()?;
+    let resolver = match tag {
+        "probe-direct-in" if outbound == "direct" => "dns-bootstrap".to_owned(),
+        "probe-proxy-in" => "dns-probe-exit-proxy".to_owned(),
+        "update-in" if outbound == "direct" => "dns-bootstrap".to_owned(),
+        "update-in" => "dns-remote".to_owned(),
+        _ => {
+            let index = tag.strip_prefix("probe-in-")?;
+            if index.is_empty()
+                || index.parse::<usize>().ok()?.to_string() != index
+                || outbound != format!("probe-selector-{index}")
+            {
+                return None;
+            }
+            format!("dns-probe-exit-{index}")
+        }
+    };
+    let expected = RouteRule {
+        inbound: Some(OneOrMany::Many(vec![tag.to_owned()])),
+        action: Some("route".into()),
+        outbound: Some(outbound.to_owned()),
+        ..Default::default()
+    };
+    (rule == &expected).then_some((tag.to_owned(), resolver))
+}
+
+fn is_exact_microdone_local_override(rule: &RouteRule) -> bool {
+    rule == &RouteRule {
+        domain_suffix: Some(vec![".microdone.cn".into()]),
+        action: Some("route".into()),
+        outbound: Some("direct".into()),
+        override_address: Some("127.0.0.1".into()),
+        ..Default::default()
+    }
+}
+
+fn is_exact_userspace_local_route(
+    rule: &RouteRule,
+    endpoints: &[crate::singbox::Endpoint],
+) -> bool {
+    let Some(OneOrMany::Many(tags)) = &rule.inbound else {
+        return false;
+    };
+    if tags.len() != 1
+        || !endpoints
+            .iter()
+            .any(|endpoint| endpoint.tag == tags[0] && endpoint.type_field == "tailscale")
+    {
+        return false;
+    }
+    rule == &RouteRule {
+        inbound: Some(OneOrMany::Many(tags.clone())),
+        ip_cidr: Some(vec!["127.0.0.1/32".into(), "::1/128".into()]),
+        action: Some("route".into()),
+        outbound: Some("direct".into()),
+        ..Default::default()
+    }
 }
 
 fn has_subscription_inbound(rule: &RouteRule) -> bool {

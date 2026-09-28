@@ -261,25 +261,56 @@ pub fn build_mesh_dns_overlay(
                 .as_ref()
                 .is_some_and(|tags| tags.iter().any(|tag| tag == LEGACY_TS_DNS_TAG)))
     });
-    let mdns_rule = rules
-        .first()
-        .ok_or(MeshDnsBuildError::LegacyDnsShapeChanged)?;
-    let lan_rule = rules
-        .get(1)
-        .ok_or(MeshDnsBuildError::LegacyDnsShapeChanged)?;
-    if mdns_rule.server.as_deref() != Some("dns-mdns")
-        || !mdns_rule
-            .domain_suffix
-            .as_ref()
-            .is_some_and(|names| names.iter().any(|name| name == "local"))
-        || lan_rule.server.as_deref() != Some("dns-lan")
-            && lan_rule.action.as_deref() != Some("predefined")
-        || !lan_rule
-            .domain_regex
-            .as_ref()
-            .is_some_and(|names| names.iter().any(|name| name == SHORT_NAME_REGEX))
+    // Probe and network-profile rules can precede the legacy anchors. Locate
+    // their unique adjacent pair instead of assuming dns.rules[0..2].
+    let mdns_positions: Vec<_> = rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| {
+            (rule.server.as_deref() == Some("dns-mdns")
+                && rule
+                    .domain_suffix
+                    .as_ref()
+                    .is_some_and(|names| names.iter().any(|name| name == "local")))
+            .then_some(index)
+        })
+        .collect();
+    let short_positions: Vec<_> = rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| {
+            ((rule.server.as_deref() == Some("dns-lan")
+                || rule.action.as_deref() == Some("predefined"))
+                && rule
+                    .domain_regex
+                    .as_ref()
+                    .is_some_and(|names| names.iter().any(|name| name == SHORT_NAME_REGEX)))
+            .then_some(index)
+        })
+        .collect();
+    if mdns_positions.len() != 1
+        || short_positions.len() != 1
+        || short_positions[0] != mdns_positions[0] + 1
+        || rules[..mdns_positions[0]]
+            .iter()
+            .any(|rule| rule.inbound.is_none())
     {
         return Err(MeshDnsBuildError::LegacyDnsShapeChanged);
+    }
+    // The mDNS anchor remains before the overlay. A managed suffix hidden by
+    // either earlier local-name matcher would make its owner/reject promise
+    // false even though compilation and core check both succeeded.
+    for (suffix, _) in &suffixes {
+        for anchor in [mdns_positions[0], short_positions[0]] {
+            if rules[anchor].domain_suffix.as_ref().is_some_and(|names| {
+                names.iter().any(|name| {
+                    let name = name.trim_start_matches('.').to_ascii_lowercase();
+                    suffix == &name || suffix.ends_with(&format!(".{name}"))
+                })
+            }) {
+                return Err(MeshDnsBuildError::InvalidSuffix(suffix.clone()));
+            }
+        }
     }
 
     let mut occupied: BTreeSet<String> = dns
@@ -319,7 +350,7 @@ pub fn build_mesh_dns_overlay(
         );
         overlay_rules.push(rule);
     }
-    rules.splice(1..1, overlay_rules);
+    rules.splice(short_positions[0]..short_positions[0], overlay_rules);
 
     Ok(MeshDnsBuild {
         dns,
