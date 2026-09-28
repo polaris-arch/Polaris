@@ -1,5 +1,5 @@
 //! Host-only restore acceptance: synthetic data in disposable ConfigManager directories.
-//! The Tauri picker/broadcast shell is not constructible here; this drives real local file I/O,
+//! The Tauri picker/broadcast shell is not constructible here; this drives its real file gateway,
 //! backup category functions and transactional save core, then opens a new manager from disk.
 
 use super::*;
@@ -113,12 +113,20 @@ fn all_eight_categories_survive_export_preview_apply_and_reopen() {
     }
 
     let backup_path = source_dir.path().join("synthetic.polaris-backup");
+    let gateway = RecordingGateway::new(source_dir.path().join("unused-gateway"));
     let body = json!({
         "version": BACKUP_FILE_VERSION, "platform": "linux", "config": backup_config
     })
     .to_string();
-    std::fs::write(&backup_path, &body).unwrap();
-    let raw = std::fs::read_to_string(&backup_path).unwrap();
+    assert_eq!(
+        finish_export(&gateway, Some(desktop_target(&backup_path)), &body)["success"],
+        true
+    );
+    let ImportSource::Loaded { raw, file_path } =
+        read_import_source(&gateway, Some(desktop_target(&backup_path)))
+    else {
+        panic!("exported document must be readable for preview");
+    };
     let preview = parse_backup_content(&raw).unwrap();
     assert_eq!(detect_categories(&preview.config), BACKUP_CATEGORIES);
     for category in BACKUP_CATEGORIES {
@@ -127,7 +135,7 @@ fn all_eight_categories_survive_export_preview_apply_and_reopen() {
             "{category:?}"
         );
     }
-    let apply_raw = std::fs::read_to_string(&backup_path).unwrap();
+    let apply_raw = read_apply_source(&gateway, &file_path).unwrap();
     let parsed = parse_backup_content(&apply_raw).unwrap();
     let saved = crate::commands::config::backup_import_save_core(
         &target_manager,

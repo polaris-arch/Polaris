@@ -22,6 +22,8 @@ use crate::commands::picked_file::tests::{
 };
 use crate::test_support::TestDir;
 
+mod restore_integration;
+
 #[test]
 fn exporting_to_a_content_uri_is_not_reported_as_cancelled_and_really_writes() {
     let dir = TestDir::new("polaris-backup-export-uri");
