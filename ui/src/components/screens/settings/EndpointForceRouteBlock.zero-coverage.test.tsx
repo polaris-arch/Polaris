@@ -3,10 +3,10 @@
  *
  * # 守什么
  *
- * `zeroCoverageServerIds` 说的是：这个节点活着、engaged、用户以为它在工作，而它的网段已被更早
- * 声明的节点**全部**抢走 —— 流量一条都不会到它那儿。这是**静默失效**，不是一条信息：
+ * `zeroCoverageServerIds` 说的是：在这次结算里，节点的网段已被更早声明的节点**全部**占用。
+ * 这不证明当前运行或连通，却是需要点名的配置覆盖风险，不是一条泛泛的计数：
  * 界面上若只给一个「有 N 段被吸收」的计数，用户永远不知道是**哪个节点**整个废了。
- * 故本门断言：零覆盖非空时，界面**点名到节点**（节点名 + 被谁抢走）。
+ * 故本门断言：零覆盖非空时，界面**点名到节点**（节点名 + 本次归属）。
  *
  * 三条对照成组，缺一条都能被绕过：
  *  - 正面：零覆盖节点名、抢占者节点名、被抢的那一段都出现；
@@ -103,7 +103,8 @@ describe('判据 4 —— 零覆盖节点必须被点名', () => {
     // 证明「点名」这件事挂在 zeroCoverageServerIds 上，不是无条件画一行。
     const markup = render({ ...winnerLoser(true), zeroCoverageServerIds: [] });
     expect(markup).not.toContain(ZERO_LINE);
-    expect(markup).not.toContain('公司');
+    // 明细仍点名公司；只禁止零覆盖告警（不能靠隐藏整个节点使测试变绿）。
+    expect(markup).toContain('公司');
     // 但「有段被吸收」这件事仍要说 —— 不是零覆盖就当作什么都没发生。
     expect(markup).toContain(translate('settings.tun.forceRouteAbsorbedOnly', { count: 1 }));
   });
@@ -130,6 +131,65 @@ describe('判据 4 —— 零覆盖节点必须被点名', () => {
     const markup = render(winnerLoser(true), []);
     expect(markup).toContain(ZERO_LINE);
     expect(markup).toContain('ts-b');
+  });
+});
+
+describe('逐节点明细 —— 保持报告顺序和三条发射腿的语义', () => {
+  it('inline 分配、external rule-set、被吸收归属与 TS 观测标记同屏可读', () => {
+    const report: EndpointForceRouteReport = {
+      servers: [
+        leg({ serverId: 'ts-b', leg: 'externalRuleSet', emitted: [],
+          externalRuleSetCidrs: ['32.0.0.28/32'], hasObservation: true }),
+        leg({ serverId: 'ts-a', emitted: ['10.0.0.0/24'], hasObservation: false,
+          absorbed: [{ cidr: '10.2.0.0/16', byServerId: 'ts-b' }] }),
+      ],
+      zeroCoverageServerIds: [], absorbedCount: 1,
+    };
+    const markup = render(report);
+    expect(markup).toContain('<details');
+    expect(markup).toContain(translate('settings.tun.forceRouteDetails'));
+    expect(markup.indexOf('公司')).toBeLessThan(markup.indexOf('家里'));
+    expect(markup).toContain('32.0.0.28/32');
+    expect(markup).toContain(translate('settings.tun.forceRouteRuleSetRanges'));
+    expect(markup).toContain(translate('settings.tun.forceRouteAllocated'));
+    expect(markup).toContain(translate('settings.tun.forceRouteObserved'));
+    expect(markup).toContain(translate('settings.tun.forceRouteEstimated'));
+    expect(markup).toContain('10.2.0.0/16');
+    expect(markup).toContain(translate('settings.tun.forceRouteAbsorbedRanges'));
+  });
+
+  it('preferredBy 的 WG 原 allowedIPs 单列，包含 0/0，不伪称报告分配了零条', () => {
+    const wg = node('wg', '机房', 'wireguard');
+    wg.wireguardSettings = {
+      privateKey: '', localAddress: [], peerPublicKey: '',
+      allowedIPs: ['10.8.0.0/16', '0.0.0.0/0', '::/0'],
+    };
+    const markup = render({ servers: [leg({ serverId: 'wg', leg: 'preferredBy',
+      emitted: [], coverage: 'covered' })], zeroCoverageServerIds: [], absorbedCount: 0 }, [wg]);
+    expect(markup).toContain(translate('settings.tun.forceRouteDeclared'));
+    expect(markup).toContain('10.8.0.0/16');
+    expect(markup).toContain('0.0.0.0/0');
+    expect(markup).toContain('::/0');
+    expect(markup).toContain(translate('settings.tun.forceRoutePreferredByNote'));
+    expect(markup).not.toContain(translate('settings.tun.forceRouteNoRanges'));
+  });
+
+  it('没有网段的节点明确显示空态；刷新中的旧报告不能继续当作当前结果', () => {
+    const report: EndpointForceRouteReport = {
+      servers: [leg({ serverId: 'ts-a', coverage: 'nothingToRoute' })],
+      zeroCoverageServerIds: [], absorbedCount: 0,
+    };
+    expect(render(report)).toContain(translate('settings.tun.forceRouteNoRanges'));
+    const loading = renderToStaticMarkup(<EndpointForceRouteBlock
+      report={report} servers={SERVERS} loading onRefresh={() => {}}
+    />);
+    expect(loading).toContain(translate('settings.tun.forceRouteLoading'));
+    expect(loading).not.toContain(translate('settings.tun.forceRouteDetails'));
+    const failed = renderToStaticMarkup(<EndpointForceRouteBlock
+      report={null} servers={SERVERS} error onRefresh={() => {}}
+    />);
+    expect(failed).toContain(translate('settings.tun.forceRouteUnavailable'));
+    expect(failed).not.toContain('家里');
   });
 });
 

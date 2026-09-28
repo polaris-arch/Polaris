@@ -1704,6 +1704,16 @@ body:has(.pending-bar.show) #toast-stack{
 .tun-details[open] summary{ color:hsl(var(--fg)); border-bottom:1px solid hsl(var(--line)); }
 .tun-details-body{ margin-top:0; padding:11px; }
 
+/* Saved-config mesh settlement: compact per-node rows inside a native keyboard-accessible details. */
+.mesh-route-heading{ display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; }
+.tun-details.mesh-route-details{ margin-top:10px; }
+.mesh-route-nodes{ list-style:none; padding:4px 11px 11px; margin:0; display:flex; flex-direction:column; gap:10px; }
+.mesh-route-nodes > li{ border-top:1px solid hsl(var(--line)); padding-top:8px; min-width:0; }
+.mesh-route-node-title{ display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 8px; font-size:11.5px; }
+.mesh-route-node-title b{ color:hsl(var(--fg)); }
+.mesh-route-observation{ color:hsl(var(--fg-dim)); }
+.mesh-route-nodes .mono{ overflow-wrap:anywhere; }
+
 /* ── 导入弹窗的解析结果预览（#83）─────────────────────────────────────────────────────────
  * 后端一直在返回 `stats`（imported / unsupported / skipped / failed）与 `warnings`，
  * 而弹窗此前把它们整个丢掉、只在撞上单例槽时报一句 —— 「37 个里 4 个因缺字段被丢了」这种

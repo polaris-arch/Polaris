@@ -250,6 +250,12 @@ const SITES: readonly Site[] = [
     route: 'disk',
     why: '基准类：把 uiTheme 同步进 app-store 那份**磁盘镜像**，读的必须是被改的那个对象本身',
   },
+  {
+    file: 'components/screens/settings/SettingsTun.tsx',
+    shape: 'useAppStore((s)=>s.config)',
+    route: 'disk',
+    why: '对账类：网段结算命令读已保存配置；刷新键与节点名必须使用同一磁盘快照，不能混入设置页的暂存回显',
+  },
 
   {
     file: 'components/screens/rules/RulesScreen.tsx',

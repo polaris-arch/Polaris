@@ -14,7 +14,7 @@
  * 与 legacy dnsConfig 镜像。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { UserConfig, TunModeConfig, UdpNatType } from '@/contracts/types';
@@ -41,6 +41,7 @@ import type { TunnelConflictReport } from '@/contracts/tunnel-conflict-report';
 import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
 import { TunnelConflictBlock } from './TunnelConflictBlock';
 import { EndpointForceRouteBlock } from './EndpointForceRouteBlock';
+import { createLatestReportLoader, type ReportLoadState } from './latest-report-loader';
 import { ListEditor } from './ListEditor';
 import { bypassLanState, shellPlatformFromDataOs } from './settings-logic';
 import { revealOnToggle } from '@/components/reveal';
@@ -137,7 +138,8 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
    *
    * 拉取时机：
    *  - 外来隧道冲突：探测是**起核之后**的后台腿 ⇒ 跟着 `proxyRunning` 翻转重拉（同 DNS 接管报告）。
-   *  - 组网段结算：判据是「当前配置 + 运行期观测地址」⇒ 节点集/选中出口变了或核起停都要重拉。 */
+   *  - 组网段结算：后端按已保存配置 + 可用运行期地址观测重算；相关配置或核起停改变时重拉，
+   *    不跟随每一帧 Tailscale 状态轮询，用户也可手动刷新。 */
   const proxyRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
   const [tunnelConflicts, setTunnelConflicts] = useState<TunnelConflictReport | null>(null);
   useEffect(() => {
@@ -156,21 +158,34 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
     };
   }, [proxyRunning]);
 
-  const [forceRoute, setForceRoute] = useState<EndpointForceRouteReport | null>(null);
+  // SettingsPage's `config` includes staged replay. The command reads disk config, so the
+  // refresh trigger and displayed node names must come from the unmodified saved snapshot.
+  const savedConfig = useAppStore((s) => s.config);
+  const forceRouteKey = useMemo(() => JSON.stringify(savedConfig && [
+    savedConfig.servers,
+    savedConfig.selectedServerId,
+    savedConfig.proxyMode,
+    savedConfig.configSchemaVersion,
+    savedConfig.trafficRules,
+    savedConfig.policyRules,
+    savedConfig.customRules,
+    savedConfig.routeRuleOrder,
+    savedConfig.appRoutingEnabled,
+    savedConfig.appRules,
+  ]), [savedConfig]);
+  const [forceRouteState, setForceRouteState] = useState<ReportLoadState<EndpointForceRouteReport>>({
+    report: null,
+    loading: true,
+    error: false,
+  });
+  const forceRouteLoader = useMemo(() => createLatestReportLoader(
+    () => api.config.endpointForceRouteReport(),
+    setForceRouteState,
+  ), []);
   useEffect(() => {
-    let cancelled = false;
-    api.config
-      .endpointForceRouteReport()
-      .then((next) => {
-        if (!cancelled) setForceRoute(next);
-      })
-      .catch(() => {
-        if (!cancelled) setForceRoute(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [config.servers, config.selectedServerId, proxyRunning]);
+    forceRouteLoader.refresh();
+    return () => forceRouteLoader.invalidate();
+  }, [forceRouteLoader, forceRouteKey, proxyRunning]);
 
   const [mtuDraft, setMtuDraft] = useState(tun.mtu === undefined ? '' : String(tun.mtu));
   const [mtuInvalid, setMtuInvalid] = useState(false);
@@ -518,7 +533,13 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
           ⚠️ force-route 规则并不只在 TUN 模式发射（route.rules 对任何入站都生效），它落在本页
           是因为形态与「生效排除面」同源（后端跑真判据读回来），不是因为它属于 TUN。 */}
       <TunnelConflictBlock report={tunnelConflicts} />
-      <EndpointForceRouteBlock report={forceRoute} servers={config.servers ?? []} />
+      <EndpointForceRouteBlock
+        report={forceRouteState.report}
+        loading={forceRouteState.loading}
+        error={forceRouteState.error}
+        onRefresh={() => forceRouteLoader.refresh()}
+        servers={savedConfig?.servers ?? []}
+      />
 
       {/* 4. 局域网网关（契约 L102）——本机作 LAN 网关时的 sing-box 1.14 设备识别簇。
           平台门控走**组件层**（不渲染），而非 CSS 隐藏：这两项在不支持的平台上不是「样式问题」，

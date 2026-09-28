@@ -3,10 +3,9 @@
  *
  * # 这一块要说的那句话
  *
- * 同一条 `ip_cidr` 只能指向一个 outbound，内核 first-match ⇒ 两个组网节点声明同一段时，
- * **只有更早发射的那个生效**。后果里最坏的一种不是「少了一段」，而是一个节点的段被**全部**
- * 吸收：节点活着、engaged、用户以为它在工作，而流量一条都不会到它那儿。
- * 这就是 `zeroCoverageServerIds` —— 静默失效，不是信息，故它单独成一条告警并**点名到节点**。
+ * inline `ip_cidr` 走 first-match，两个组网节点声明同一段时，只有结算顺序更早的节点取得它。
+ * `zeroCoverageServerIds` 指本次计算中一个节点的所有具体段均被吸收；必须单独告警并点名节点。
+ * 报告由已保存配置与可用观测重算，不能据此宣称此刻节点正在运行、流量已承载或一定可达。
  *
  * # 为什么这里必须消费 `hasObservation`
  *
@@ -32,31 +31,54 @@ import { useTranslation } from 'react-i18next';
 import type { ServerConfig } from '@/contracts/types';
 import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
 import { isAccountBasedProtocol } from '@/domain/endpoint-routes';
+import { revealOnToggle } from '@/components/reveal';
 import { SetBlock } from './Primitives';
 
 export interface EndpointForceRouteBlockProps {
-  /** `null` = 还没拉到 / 拉取失败。 */
+  /** `null` = 尚未取得当前已保存配置的报告。 */
   report: EndpointForceRouteReport | null;
-  /** 用于把报告里的 serverId 换成用户看得懂的节点名，并判断败方是不是 Tailscale。 */
+  loading?: boolean;
+  error?: boolean;
+  onRefresh?: () => void;
+  /** 已保存配置中的节点；暂存回显不可混入这份后端报告。 */
   servers: readonly ServerConfig[];
 }
 
-export function EndpointForceRouteBlock({ report, servers }: EndpointForceRouteBlockProps) {
-  const { t } = useTranslation();
-  const nameOf = (id: string) => servers.find((s) => s.id === id)?.name ?? id;
-  const isTs = (id: string) =>
-    isAccountBasedProtocol(servers.find((s) => s.id === id)?.protocol);
+const PROTOCOL_LABELS: Record<string, string> = {
+  wireguard: 'WireGuard',
+  tailscale: 'Tailscale',
+  openconnect: 'OpenConnect',
+  'openvpn-client': 'OpenVPN',
+  'masque-client': 'MASQUE',
+};
 
-  if (report === null) {
+export function EndpointForceRouteBlock({
+  report,
+  loading = false,
+  error = false,
+  onRefresh,
+  servers,
+}: EndpointForceRouteBlockProps) {
+  const { t } = useTranslation();
+  const serverOf = (id: string) => servers.find((s) => s.id === id);
+  const nameOf = (id: string) => serverOf(id)?.name ?? id;
+  const isTs = (id: string) =>
+    isAccountBasedProtocol(serverOf(id)?.protocol);
+
+  if (loading || error || report === null) {
     return (
-      <Block>
-        <div className="card-sub">{t('settings.tun.forceRouteUnavailable')}</div>
+      <Block loading={loading} onRefresh={onRefresh}>
+        <div className="card-sub" role={error ? 'alert' : undefined}>
+          {loading
+            ? t('settings.tun.forceRouteLoading')
+            : t('settings.tun.forceRouteUnavailable')}
+        </div>
       </Block>
     );
   }
   if (report.servers.length === 0) {
     return (
-      <Block>
+      <Block loading={loading} onRefresh={onRefresh}>
         <div className="card-sub">{t('settings.tun.forceRouteEmpty')}</div>
       </Block>
     );
@@ -69,7 +91,7 @@ export function EndpointForceRouteBlock({ report, servers }: EndpointForceRouteB
   );
 
   return (
-    <Block>
+    <Block loading={loading} onRefresh={onRefresh}>
       {zero.length > 0 && (
         <>
           <div className="plat-warn" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -104,15 +126,97 @@ export function EndpointForceRouteBlock({ report, servers }: EndpointForceRouteB
       {weakEvidence && (
         <div className="card-sub">{t('settings.tun.forceRouteNoObservation')}</div>
       )}
+      <details className="tun-details mesh-route-details" onToggle={revealOnToggle}>
+        <summary>{t('settings.tun.forceRouteDetails')}</summary>
+        <ol className="mesh-route-nodes">
+          {report.servers.map((entry) => {
+            const server = serverOf(entry.serverId);
+            const declared = server?.protocol === 'wireguard'
+              ? server.wireguardSettings?.allowedIPs ?? []
+              : [];
+            const allocated = entry.leg === 'externalRuleSet'
+              ? entry.externalRuleSetCidrs
+              : entry.emitted;
+            return (
+              <li key={entry.serverId}>
+                <div className="mesh-route-node-title">
+                  <b>{nameOf(entry.serverId)}</b>
+                  <span>{PROTOCOL_LABELS[server?.protocol ?? ''] ?? server?.protocol ?? entry.serverId}</span>
+                  {isTs(entry.serverId) && (
+                    <span className="mesh-route-observation">
+                      {entry.hasObservation
+                        ? t('settings.tun.forceRouteObserved')
+                        : t('settings.tun.forceRouteEstimated')}
+                    </span>
+                  )}
+                </div>
+                {entry.leg === 'preferredBy' ? (
+                  <>
+                    <div className="card-sub">{t('settings.tun.forceRouteDeclared')}</div>
+                    {declared.length > 0 ? (
+                      <ul className="cidr-eff-list">
+                        {declared.map((cidr, index) => <li className="mono" key={index}>{cidr}</li>)}
+                      </ul>
+                    ) : (
+                      <div className="card-sub">{t('settings.tun.forceRouteNoDeclared')}</div>
+                    )}
+                    <div className="card-sub">{t('settings.tun.forceRoutePreferredByNote')}</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="card-sub">
+                      {entry.leg === 'externalRuleSet'
+                        ? t('settings.tun.forceRouteRuleSetRanges')
+                        : t('settings.tun.forceRouteAllocated')}
+                    </div>
+                    {allocated.length > 0 ? (
+                      <ul className="cidr-eff-list">
+                        {allocated.map((cidr) => <li className="mono" key={cidr}>{cidr}</li>)}
+                      </ul>
+                    ) : (
+                      <div className="card-sub">{t('settings.tun.forceRouteNoRanges')}</div>
+                    )}
+                  </>
+                )}
+                {entry.absorbed.length > 0 && (
+                  <>
+                    <div className="card-sub">{t('settings.tun.forceRouteAbsorbedRanges')}</div>
+                    <ul className="cidr-eff-list">
+                      {entry.absorbed.map(({ cidr, byServerId }) => (
+                        <li key={`${cidr}-${byServerId}`}>
+                          <span className="mono">{cidr}</span>{' → '}{nameOf(byServerId)}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      </details>
     </Block>
   );
 }
 
 /** 块壳与说明行在四条腿上逐字相同，抽出来免得「改了一处、另外三处还是旧话」。 */
-function Block({ children }: { children: ReactNode }) {
+function Block({
+  children,
+  loading,
+  onRefresh,
+}: { children: ReactNode; loading: boolean; onRefresh?: () => void }) {
   const { t } = useTranslation();
   return (
-    <SetBlock header={t('settings.tun.forceRouteBlock')}>
+    <SetBlock header={
+      <div className="mesh-route-heading">
+        <span>{t('settings.tun.forceRouteBlock')}</span>
+        {onRefresh && (
+          <button type="button" className="btn ghost sm" onClick={onRefresh} disabled={loading}>
+            {loading ? t('settings.tun.forceRouteLoading') : t('common.refresh')}
+          </button>
+        )}
+      </div>
+    }>
       <div className="card-sub">{t('settings.tun.forceRouteHint')}</div>
       {children}
     </SetBlock>
