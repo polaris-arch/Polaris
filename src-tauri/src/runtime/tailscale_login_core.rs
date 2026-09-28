@@ -702,15 +702,37 @@ impl LoginCoreRegistry {
         self.cancel_login(server_id).await.map(|_| ())
     }
 
-    pub fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+    pub async fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+        let _gate = self.state_gate().await;
         self.attempts.prepare(server_id, attempt_id).map(|_| ())
+    }
+
+    /// Fence every request already prepared for this state directory. The caller keeps the
+    /// state gate through its identity commit; a later prepare cannot register until then.
+    /// A failed native close leaves its registry entry in place and fails this retirement.
+    pub async fn retire_attempts_under_state_gate(
+        &self,
+        server_id: &str,
+        _gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        let cancelled = self.attempts.retire_node_except(server_id, None)?;
+        self.cancel_and_wait(server_id).await?;
+        for attempt in cancelled {
+            attempt.finished().await;
+        }
+        if self.shared.contains(server_id) || self.attempts.owns_state(server_id) {
+            return Err("Tailscale login owner has not been reaped".into());
+        }
+        Ok(())
     }
 
     pub async fn cancel_attempt(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
         let attempt = self.attempts.cancel(server_id, attempt_id)?;
         self.cancel_matching_login(server_id, Some(attempt_id))
             .await?;
-        attempt.finished().await;
+        if let Some(attempt) = attempt {
+            attempt.finished().await;
+        }
         Ok(())
     }
 
@@ -740,12 +762,21 @@ impl LoginCoreRegistry {
                 "Only a prepared login request may be preserved",
             ));
         }
-        let cancelled = self.attempts.cancel_node_except(server_id, keep_attempt);
-        self.cancel_and_wait(server_id)
-            .await
-            .map_err(std::io::Error::other)?;
-        for attempt in cancelled {
-            attempt.finished().await;
+        if keep_attempt.is_none() {
+            self.retire_attempts_under_state_gate(server_id, &_gate)
+                .await
+                .map_err(std::io::Error::other)?;
+        } else {
+            let cancelled = self
+                .attempts
+                .retire_node_except(server_id, keep_attempt)
+                .map_err(std::io::Error::other)?;
+            self.cancel_and_wait(server_id)
+                .await
+                .map_err(std::io::Error::other)?;
+            for attempt in cancelled {
+                attempt.finished().await;
+            }
         }
         delete(&_gate)?;
         Ok(true)
@@ -898,7 +929,7 @@ impl LoginCoreRegistry {
             attempt_id: format!("test-{}", self.epoch.fetch_add(1, Ordering::SeqCst)),
             mode: LoginMode::Browser,
         };
-        self.prepare(&server.id, &request.attempt_id).unwrap();
+        self.prepare(&server.id, &request.attempt_id).await.unwrap();
         self.start_attempt(
             server,
             user_data,
@@ -917,6 +948,7 @@ impl LoginCoreRegistry {
     /// Start a prepared request under the shared state gate. Main ownership and port exclusions
     /// come from its actual startup snapshot. A spawned child is registered before subscription;
     /// request cancellation and terminal events wait for reap. Started means authorization pending.
+    #[cfg(test)]
     pub async fn start_attempt(
         &self,
         server: &ServerConfig,
@@ -925,7 +957,29 @@ impl LoginCoreRegistry {
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
-        let attempt = match self.attempts.get(&server.id, &request.attempt_id) {
+        self.start_attempt_with_saved(
+            server,
+            user_data,
+            request,
+            &|| Ok(server.clone()),
+            main_core,
+            emitter,
+        )
+        .await
+    }
+
+    /// The saved server is loaded only after acquiring the state gate. The request's TS identity
+    /// must still name that saved server; a stale renderer request cannot start an old state.
+    pub async fn start_attempt_with_saved(
+        &self,
+        requested: &ServerConfig,
+        user_data: &Path,
+        request: LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+    ) -> StartLoginOutcome {
+        let attempt = match self.attempts.get(&requested.id, &request.attempt_id) {
             Ok(attempt) => attempt,
             Err(reason) => return StartLoginOutcome::Failed(reason),
         };
@@ -933,13 +987,14 @@ impl LoginCoreRegistry {
             return StartLoginOutcome::Failed("attemptAlreadyUsed".into());
         }
         let mut request_guard = AttemptGuard(attempt.clone(), false);
-        emitter.progress(&server.id, &request.attempt_id, "starting", None, None);
+        emitter.progress(&requested.id, &request.attempt_id, "starting", None, None);
         let outcome = self
             .launch_attempt(
-                server,
+                requested,
                 user_data,
                 &request,
                 &attempt,
+                saved_server,
                 main_core,
                 emitter.clone(),
             )
@@ -948,12 +1003,12 @@ impl LoginCoreRegistry {
             match &outcome {
                 StartLoginOutcome::Started => {}
                 StartLoginOutcome::InMainCore => {
-                    emitter.progress(&server.id, &request.attempt_id, "mainCore", None, None);
+                    emitter.progress(&requested.id, &request.attempt_id, "mainCore", None, None);
                     attempt.finish();
                 }
                 StartLoginOutcome::InMainCorePending => {
                     emitter.progress(
-                        &server.id,
+                        &requested.id,
                         &request.attempt_id,
                         "mainCore",
                         Some("configurationPending"),
@@ -962,12 +1017,12 @@ impl LoginCoreRegistry {
                     attempt.finish();
                 }
                 StartLoginOutcome::Cancelled => {
-                    emitter.progress(&server.id, &request.attempt_id, "cancelled", None, None);
+                    emitter.progress(&requested.id, &request.attempt_id, "cancelled", None, None);
                     attempt.finish();
                 }
                 StartLoginOutcome::Failed(reason) => {
                     emitter.progress(
-                        &server.id,
+                        &requested.id,
                         &request.attempt_id,
                         "failed",
                         Some(reason),
@@ -1081,10 +1136,11 @@ impl LoginCoreRegistry {
 
     async fn launch_attempt(
         &self,
-        server: &ServerConfig,
+        requested: &ServerConfig,
         user_data: &Path,
         request: &LoginRequest,
         attempt: &Arc<Attempt>,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
@@ -1095,10 +1151,24 @@ impl LoginCoreRegistry {
         if attempt.cancelled() {
             return StartLoginOutcome::Cancelled;
         }
+        if self.attempts.registration_exhausted() {
+            return StartLoginOutcome::Failed(attempts::RETIRED_LIMIT_ERROR.into());
+        }
+        let server = match saved_server() {
+            Ok(server)
+                if server.id == requested.id
+                    && server.protocol
+                        == polaris_config_engine::user_config::server_config::Protocol::Tailscale
+                    && server.tailscale_settings == requested.tailscale_settings =>
+            {
+                server
+            }
+            _ => return StartLoginOutcome::Failed("savedTailscaleIdentityChanged".into()),
+        };
         let main = main_core();
         if self.main_owns(&server.id, main.alive) {
-            return if self.main_matches_request(server, request.mode) {
-                self.confirm_main_request(server, request, attempt, &main, main_core, emitter)
+            return if self.main_matches_request(&server, request.mode) {
+                self.confirm_main_request(&server, request, attempt, &main, main_core, emitter)
                     .await
             } else {
                 StartLoginOutcome::InMainCorePending

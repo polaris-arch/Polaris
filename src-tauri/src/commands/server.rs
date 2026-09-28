@@ -809,26 +809,29 @@ pub async fn warp_apply_license(
 /// Register the renderer-minted identity before save/check/subscribe can be cancelled.
 /// Registration never starts a process; cancelled identities remain bounded tombstones.
 #[tauri::command]
-pub fn tailscale_login_prepare(
+pub async fn tailscale_login_prepare(
     state: State<'_, AppRuntime>,
     server_id: String,
     attempt_id: String,
-) -> ApiResponse<()> {
+) -> Result<ApiResponse<()>, ()> {
     if polaris_mesh::tailscale_state::tailscale_state_dir(std::path::Path::new("."), &server_id)
         .is_err()
     {
-        return ApiResponse::err_with_code(
+        return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node identity",
             "TAILSCALE_LOGIN_BAD_SERVER",
-        );
+        ));
     }
-    match state
-        .mesh()
-        .prepare_tailscale_login(&server_id, &attempt_id)
-    {
-        Ok(()) => ok_void(),
-        Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_BAD_ATTEMPT"),
-    }
+    Ok(
+        match state
+            .mesh()
+            .prepare_tailscale_login(&server_id, &attempt_id)
+            .await
+        {
+            Ok(()) => ok_void(),
+            Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_BAD_ATTEMPT"),
+        },
+    )
 }
 
 /// Authorize the persisted node with an explicit browser/AuthKey mode and prepared attempt identity.
@@ -842,36 +845,79 @@ pub async fn tailscale_login(
     server: Value,
     request: crate::runtime::tailscale_login_core::LoginRequest,
 ) -> Result<ApiResponse<Value>, ()> {
-    let Some(server_id) = server.get("id").and_then(Value::as_str) else {
+    let Ok(requested) = serde_json::from_value::<ServerConfig>(server) else {
         return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node",
             "TAILSCALE_LOGIN_BAD_SERVER",
         ));
     };
-    // Login consumes the persisted node, so a failed/staged save cannot authorize another identity.
-    let Ok(saved) = state.config().current() else {
+    if requested.id.is_empty()
+        || requested.protocol
+            != polaris_config_engine::user_config::server_config::Protocol::Tailscale
+    {
         return Ok(ApiResponse::err_with_code(
-            "Cannot read the saved node",
+            "Invalid Tailscale node",
             "TAILSCALE_LOGIN_BAD_SERVER",
         ));
-    };
-    let Some(server_cfg) = saved
-        .get("servers")
-        .and_then(Value::as_array)
-        .and_then(|nodes| {
-            nodes
+    }
+    // Resolve only after the registry takes the TS state gate. A renderer request may have
+    // waited through an identity retirement after this command was dispatched.
+    let saved_server = || -> Result<ServerConfig, String> {
+        let saved = state
+            .config()
+            .current()
+            .map_err(|_| "Cannot read the saved Tailscale node".to_string())?;
+        let nodes = saved
+            .get("servers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Saved Tailscale nodes are unavailable".to_string())?;
+        let matching: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.get("id").and_then(Value::as_str) == Some(&requested.id))
+            .collect();
+        let &[node] = matching.as_slice() else {
+            return Err("Saved Tailscale node is absent or duplicated".into());
+        };
+        let current: ServerConfig = serde_json::from_value(node.clone())
+            .map_err(|_| "Saved Tailscale node is invalid".to_string())?;
+        if current.protocol
+            != polaris_config_engine::user_config::server_config::Protocol::Tailscale
+        {
+            return Err("Saved Tailscale identity changed".into());
+        }
+        if let Some(raw_state) = saved.get("meshRouteState") {
+            use polaris_config_engine::user_config::mesh_route_state::{
+                MeshBindingState, MeshRouteState,
+            };
+            let state: MeshRouteState = serde_json::from_value(raw_state.clone())
+                .map_err(|_| "Saved mesh identity ledger is invalid".to_string())?;
+            let active: Vec<_> = state
+                .identities
                 .iter()
-                .find(|node| node.get("id").and_then(Value::as_str) == Some(server_id))
-        })
-        .and_then(|node| serde_json::from_value::<ServerConfig>(node.clone()).ok())
-        .filter(|node| {
-            node.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale
-        })
-    else {
-        return Ok(ApiResponse::err_with_code(
-            "Save the Tailscale node before authorization",
-            "TAILSCALE_LOGIN_BAD_SERVER",
-        ));
+                .filter(|identity| {
+                    identity.server_id == requested.id
+                        && matches!(
+                            identity.binding_state,
+                            MeshBindingState::Bound | MeshBindingState::Unbound
+                        )
+                })
+                .collect();
+            if active.len() != 1 {
+                return Err("Saved Tailscale identity epoch is unavailable".into());
+            }
+            let authority = current
+                .tailscale_settings
+                .as_ref()
+                .and_then(|settings| settings.control_url.as_deref())
+                .filter(|url| !url.is_empty())
+                .unwrap_or("https://controlplane.tailscale.com");
+            let canonical = polaris_config_engine::user_config::mesh_identity_reconcile::canonical_control_authority(authority)
+                .map_err(|_| "Saved Tailscale authority is invalid".to_string())?;
+            if canonical != active[0].control_authority {
+                return Err("Saved Tailscale identity authority changed".into());
+            }
+        }
+        Ok(current)
     };
     let main_core = || {
         let cfg = state
@@ -892,7 +938,7 @@ pub async fn tailscale_login(
     };
     match state
         .mesh()
-        .start_tailscale_login(app, &server_cfg, request, &main_core)
+        .start_tailscale_login(app, &requested, request, &saved_server, &main_core)
         .await
     {
         StartLoginOutcome::Started => Ok(ApiResponse::ok(json!({"started": true}))),

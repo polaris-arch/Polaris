@@ -560,8 +560,12 @@ impl MeshRuntime {
         });
     }
 
-    pub fn prepare_tailscale_login(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
-        self.login_registry.prepare(server_id, attempt_id)
+    pub async fn prepare_tailscale_login(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), String> {
+        self.login_registry.prepare(server_id, attempt_id).await
     }
 
     pub async fn start_tailscale_login(
@@ -569,15 +573,17 @@ impl MeshRuntime {
         app: AppHandle,
         server: &ServerConfig,
         request: crate::runtime::tailscale_login_core::LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
         main_core: &(dyn Fn() -> crate::runtime::tailscale_login_core::MainLoginSnapshot
               + Send
               + Sync),
     ) -> StartLoginOutcome {
         self.login_registry
-            .start_attempt(
+            .start_attempt_with_saved(
                 server,
                 &self.config_dir,
                 request,
+                saved_server,
                 main_core,
                 Arc::new(AppHandleEmitter { app }),
             )
