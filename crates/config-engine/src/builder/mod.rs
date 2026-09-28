@@ -14,6 +14,7 @@ pub mod hotswitch;
 pub mod inbounds;
 pub mod log;
 pub mod managed_mesh_plan;
+pub mod managed_mesh_emission;
 pub mod mesh_dns;
 pub mod mesh_inbound;
 pub mod network_env;

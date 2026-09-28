@@ -401,7 +401,9 @@ fn managed_policy_requires_ledger_and_does_not_fall_back() {
 #[test]
 fn oversized_history_is_an_error_not_a_truncated_reject_scope() {
     let (policy, mut state) = fixture();
-    state.observations[0].magic_dns_suffixes = vec!["corp.ts.net".into(); MAX_SUFFIXES + 1];
+    state.observations[0].magic_dns_suffixes = (0..=MAX_SUFFIXES)
+        .map(|index| format!("node{index}.corp.ts.net"))
+        .collect();
     let endpoints = emitted();
     assert_eq!(
         build_mesh_dns_overlay(&legacy_dns(), Some(&policy), Some(&state), &endpoints),
