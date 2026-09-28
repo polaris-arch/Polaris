@@ -465,6 +465,93 @@ fn unreadable_core_artifact_cannot_regain_startup_ack_after_restore() {
 }
 
 #[test]
+fn earlier_report_cannot_use_an_ack_revoked_by_another_reader() {
+    let (rt, dir) = test_runtime();
+    let core_path = dir.join("config.json");
+    let rule_path = dir.join("tailnet.json");
+    let original = super::super::tailnet_rules::tailnet_rule_file_json(&["10.1.0.0/16".into()]);
+    std::fs::write(&core_path, "{}").unwrap();
+    std::fs::write(&rule_path, &original).unwrap();
+    rt.publish_mesh_route_run(ready_evidence(&rt, &core_path, &rule_path, &original), 7);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        start_time: Some(7),
+        ..Default::default()
+    };
+
+    // Pause the first report just before its final ACK check. A second report
+    // observes the external change and revokes the stored claim.
+    let old_evidence = rt.mesh_route_run.read().unwrap().as_ref().unwrap().clone();
+    let mut old_snapshot = rt.mesh_route_report(Some("r-version".into())).snapshot;
+    assert_eq!(old_snapshot.scope, MeshRouteScope::Applied);
+    let initial_snapshot = old_snapshot.clone();
+    let changed = super::super::tailnet_rules::tailnet_rule_file_json(&["10.2.0.0/16".into()]);
+    std::fs::write(&rule_path, changed).unwrap();
+    assert_eq!(
+        rt.mesh_route_report(Some("r-version".into()))
+            .snapshot
+            .scope,
+        MeshRouteScope::PersistedUnknown
+    );
+    rt.reconcile_mesh_route_report_ack(&old_evidence, &mut old_snapshot);
+    assert_eq!(old_snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_eq!(
+        old_snapshot.load_evidence,
+        MeshRouteLoadEvidence::FileWrittenUnacknowledged
+    );
+
+    // An old reader cannot revoke or regain a replacement startup's claim.
+    let mut new_run = ready_evidence(&rt, &core_path, &rule_path, &original);
+    new_run.run_generation += 1;
+    new_run.ready_at_ms = Some(8);
+    new_run.load_evidence = MeshRouteLoadEvidence::StartupReady;
+    *rt.mesh_route_run.write().unwrap() = Some(new_run);
+    let mut replaced_snapshot = initial_snapshot;
+    rt.reconcile_mesh_route_report_ack(&old_evidence, &mut replaced_snapshot);
+    assert!(replaced_snapshot.snapshot_stale);
+    assert_eq!(replaced_snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_eq!(
+        replaced_snapshot.load_evidence,
+        MeshRouteLoadEvidence::Unknown
+    );
+    assert_eq!(
+        rt.mesh_route_run
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .load_evidence,
+        MeshRouteLoadEvidence::StartupReady
+    );
+}
+
+#[test]
+fn absent_prepare_core_baseline_is_unknown_not_a_claim_of_file_write() {
+    let (rt, dir) = test_runtime();
+    let core_path = dir.join("config.json");
+    let rule_path = dir.join("tailnet.json");
+    let original = super::super::tailnet_rules::tailnet_rule_file_json(&["10.1.0.0/16".into()]);
+    std::fs::write(&core_path, "{}").unwrap();
+    std::fs::write(&rule_path, &original).unwrap();
+    let mut evidence = ready_evidence(&rt, &core_path, &rule_path, &original);
+    evidence.core_config_sha256 = None;
+    evidence.eligible_for_ack = false;
+    rt.publish_mesh_route_run(evidence, 7);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        start_time: Some(7),
+        ..Default::default()
+    };
+    let report = rt.mesh_route_report(Some("r-version".into()));
+    assert_eq!(report.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_eq!(
+        report.snapshot.load_evidence,
+        MeshRouteLoadEvidence::Unknown
+    );
+    assert_eq!(report.results[0].effective, None);
+}
+
+#[test]
 fn prepare_unacknowledged_and_old_generation_cannot_become_ready() {
     let (rt, dir) = test_runtime();
     let core_path = dir.join("config.json");

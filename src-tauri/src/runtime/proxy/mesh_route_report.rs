@@ -406,6 +406,38 @@ impl ProxyRuntime {
         }
     }
 
+    /// A report may have cloned StartupReady before another reader revoked it.
+    /// Only the current claim for the same startup can authorize Applied.
+    pub(super) fn reconcile_mesh_route_report_ack(
+        &self,
+        evidence: &MeshRouteRunEvidence,
+        snapshot: &mut MeshRouteSnapshot,
+    ) {
+        if snapshot.load_evidence != MeshRouteLoadEvidence::StartupReady {
+            return;
+        }
+        let current = self.mesh_route_run.read().ok().and_then(|slot| {
+            slot.as_ref().and_then(|current| {
+                (current.run_generation == evidence.run_generation
+                    && current.ready_at_ms == evidence.ready_at_ms
+                    && current.write_epoch == evidence.write_epoch)
+                    .then_some(current.load_evidence)
+            })
+        });
+        match current {
+            Some(MeshRouteLoadEvidence::StartupReady) => {}
+            Some(revoked) => {
+                snapshot.load_evidence = revoked;
+                snapshot.scope = MeshRouteScope::PersistedUnknown;
+            }
+            None => {
+                snapshot.load_evidence = MeshRouteLoadEvidence::Unknown;
+                snapshot.scope = MeshRouteScope::PersistedUnknown;
+                snapshot.snapshot_stale = true;
+            }
+        }
+    }
+
     /// 调用方填入与启动快照对应的内容版本；报告读文件值，写代变化即撤销 applied 断言。
     pub(crate) fn mesh_route_report(&self, config_version: Option<String>) -> MeshRouteReport {
         let status = self.status();
@@ -436,8 +468,8 @@ impl ProxyRuntime {
         snapshot.config_source = MeshRouteConfigSource::Running;
         snapshot.config_version = config_version;
         snapshot.run_generation = Some(evidence.run_generation);
-        snapshot.dns_owner_server_id = evidence.dns_owner_server_id;
-        snapshot.preceding_exceptions = evidence.preceding_exceptions;
+        snapshot.dns_owner_server_id = evidence.dns_owner_server_id.take();
+        snapshot.preceding_exceptions = std::mem::take(&mut evidence.preceding_exceptions);
         snapshot.load_evidence = evidence.load_evidence;
         let before = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
         let mut file_failed = false;
@@ -490,8 +522,7 @@ impl ProxyRuntime {
                 }
             }
         }
-        snapshot.candidates = evidence
-            .candidates
+        snapshot.candidates = std::mem::take(&mut evidence.candidates)
             .into_iter()
             .map(|item| item.candidate)
             .collect();
@@ -500,20 +531,21 @@ impl ProxyRuntime {
             read_bounded(&evidence.core_config_path, MAX_CORE_CONFIG_BYTES)
                 .map(|content| polaris_updater::verify::sha256_hex(content.as_bytes()) == *expected)
         });
-        let observed_invalidation =
-            if file_failed || core_config_read.as_ref().is_some_and(Result::is_err) {
-                Some(MeshRouteLoadEvidence::Unknown)
-            } else if file_changed
-                || core_config_read == Some(Ok(false))
-                || evidence.core_config_sha256.is_none()
-                || before != after
-                || before % 2 != 0
-                || before != evidence.write_epoch
-            {
-                Some(MeshRouteLoadEvidence::FileWrittenUnacknowledged)
-            } else {
-                None
-            };
+        let observed_invalidation = if file_failed
+            || core_config_read.is_none()
+            || core_config_read.as_ref().is_some_and(Result::is_err)
+        {
+            Some(MeshRouteLoadEvidence::Unknown)
+        } else if file_changed
+            || core_config_read == Some(Ok(false))
+            || before != after
+            || before % 2 != 0
+            || before != evidence.write_epoch
+        {
+            Some(MeshRouteLoadEvidence::FileWrittenUnacknowledged)
+        } else {
+            None
+        };
         if let Some(invalidated) = observed_invalidation {
             snapshot.load_evidence = invalidated;
             // A later read of restored bytes is not a reload acknowledgement. Revoke the
@@ -531,6 +563,7 @@ impl ProxyRuntime {
                 }
             }
         }
+        self.reconcile_mesh_route_report_ack(&evidence, &mut snapshot);
         if status.running
             && !status.starting
             && status.start_time == evidence.ready_at_ms
