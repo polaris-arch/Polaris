@@ -1,4 +1,5 @@
 use super::*;
+use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 
 fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
     let (rt, dir) = test_runtime();
@@ -9,6 +10,120 @@ fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>
     let sink = Arc::new(TestPutSink::default());
     *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
     (rt, dir, sink, running)
+}
+
+#[tokio::test]
+async fn block_saved_over_direct_running_mode_is_deferred_without_false_blocking() {
+    let (rt, _dir, sink, mut running) = explicit_selection_fixture();
+    running["proxyMode"] = serde_json::json!("direct");
+    mark_running_with_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let mut disk = running.clone();
+    disk["proxyMode"] = serde_json::json!("smart");
+    disk["selectedServerId"] = serde_json::json!(BLOCK_SERVER_ID);
+    rt.config.save_full(&disk).unwrap();
+    let intent = rt.register_selector_intent();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current(BLOCK_SERVER_ID, intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Deferred)
+    );
+    assert!(sink.calls().is_empty());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
+    );
+    assert_eq!(rt.current_config_snapshot().unwrap()["proxyMode"], "direct");
+    assert!(rt.pending_changes().restart_deferred);
+}
+
+#[tokio::test]
+async fn entering_and_leaving_block_restart_only_the_running_projection() {
+    for (old, new) in [("node-a", BLOCK_SERVER_ID), (BLOCK_SERVER_ID, "node-a")] {
+        let (rt, _dir, sink, _) = explicit_selection_fixture();
+        let mut running = two_node_config(7891, old);
+        running["proxyMode"] = serde_json::json!("smart");
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_snapshot(&rt, &running);
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!(new);
+        disk["logLevel"] = serde_json::json!("debug");
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+
+        assert_eq!(
+            rt.switch_selected_server_if_current(new, intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Restarting),
+            "{old} -> {new} must regenerate reject routes"
+        );
+        assert!(sink.calls().is_empty(), "block has no selector member");
+        let (_, projected, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+        assert_eq!(
+            source,
+            ForceRestartSource::Selected {
+                intent_generation: intent
+            }
+        );
+        assert_eq!(projected["selectedServerId"], new);
+        assert_eq!(
+            projected["logLevel"], running["logLevel"],
+            "D debt leaked into R'"
+        );
+        assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectedServerId"],
+            old
+        );
+        rt.gate.bump_generation(); // Fake core must not execute the scheduled restart.
+    }
+}
+
+#[tokio::test]
+async fn already_blocked_requires_ready_startup_proof_before_applied_receipt() {
+    for has_startup_proof in [true, false] {
+        let (rt, _dir, sink, _) = explicit_selection_fixture();
+        let mut running = two_node_config(7891, BLOCK_SERVER_ID);
+        running["proxyMode"] = serde_json::json!("smart");
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_snapshot(&rt, &running);
+        *rt.startup_snapshot.write().unwrap() = has_startup_proof.then_some(running.clone());
+        let mut disk = running.clone();
+        disk["logLevel"] = serde_json::json!("debug");
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+
+        let outcome = rt
+            .switch_selected_server_if_current(BLOCK_SERVER_ID, intent)
+            .await
+            .unwrap();
+        assert!(sink.calls().is_empty(), "block must never be PUT");
+        if has_startup_proof {
+            assert!(matches!(
+                outcome,
+                Some(SwitchOutcome::Unchanged | SwitchOutcome::NoOp)
+            ));
+            assert!(rt.pending_force_restart.read().unwrap().is_none());
+            assert_eq!(
+                rt.current_config_snapshot().unwrap()["logLevel"],
+                running["logLevel"]
+            );
+            assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+        } else {
+            assert_eq!(outcome, Some(SwitchOutcome::Restarting));
+            let projected = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
+            assert_eq!(projected["selectedServerId"], BLOCK_SERVER_ID);
+            assert_eq!(projected["logLevel"], running["logLevel"]);
+            rt.gate.bump_generation(); // Fake core must not execute the scheduled restart.
+        }
+    }
 }
 
 #[tokio::test]

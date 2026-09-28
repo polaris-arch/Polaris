@@ -35,6 +35,43 @@ fn server_switch_core_updates_selection_and_mru_in_one_write() {
 }
 
 #[test]
+fn server_switch_block_is_a_sentinel_and_does_not_enter_recent_nodes() {
+    let dir = temp_dir("switch-block-sentinel");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let (saved, changed, intent) = server_switch_core(&mgr, BLOCK_SERVER_ID, |_| Ok(()), || 8)
+        .expect("smart-mode block selection should be saved");
+    assert!(changed);
+    assert_eq!(intent, 8);
+    assert_eq!(saved["selectedServerId"], BLOCK_SERVER_ID);
+    assert!(saved.get("recentServerIds").is_none());
+    assert_eq!(
+        mgr.load_full().unwrap()["selectedServerId"],
+        BLOCK_SERVER_ID
+    );
+}
+
+#[test]
+fn server_switch_rejects_block_in_saved_direct_mode_before_intent_or_write() {
+    let dir = temp_dir("switch-block-direct");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let mut before = mgr.load_full().unwrap();
+    before["proxyMode"] = json!("direct");
+    mgr.save_full(&before).unwrap();
+
+    let error = server_switch_core(
+        &mgr,
+        BLOCK_SERVER_ID,
+        |_| panic!("invalid block candidate must not reach binding preflight"),
+        || panic!("invalid block candidate must not claim selector intent"),
+    )
+    .expect_err("direct mode cannot generate blocking routes");
+    assert!(matches!(error, ServerSwitchError::Other(_)));
+    assert_eq!(mgr.load_full().unwrap(), before);
+}
+
+#[test]
 fn server_switch_rejects_binding_preflight_before_persisting() {
     let dir = temp_dir("switch-binding-preflight");
     let mgr = ConfigManager::new(dir.clone());

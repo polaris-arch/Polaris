@@ -30,7 +30,7 @@ use polaris_config_engine::builder::{build_id_to_tag_map, GenerateConfigDeps};
 use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::dns_constants::{
-    is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
+    is_block_selection, is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
 };
 use polaris_config_engine::user_config::rule::RuleAction;
 use polaris_config_engine::user_config::ProxyModeType;
@@ -851,9 +851,17 @@ impl ProxyRuntime {
             .map_err(|e| e.to_string())?
             .clone()
             .ok_or("运行核缺少当前配置基准")?;
+        // D may have saved a non-direct mode which has not been Applied. A block
+        // selection projected onto the actual direct-mode R would not reject traffic.
+        if is_block_selection(Some(server_id))
+            && runtime.get("proxyMode").and_then(Value::as_str) == Some("direct")
+        {
+            self.defer_selected_switch("运行核仍处于直连模式，阻断选择需要先应用模式变更");
+            return Ok(Some(SwitchOutcome::Deferred));
+        }
         let clean_member = self.switch_snapshot.read().ok().and_then(|g| {
             let snapshot = g.as_ref()?;
-            if is_direct_selection(Some(server_id)) {
+            if is_direct_selection(Some(server_id)) || is_block_selection(Some(server_id)) {
                 return Some(true);
             }
             let expected = snapshot.fingerprints.get(server_id)?;
@@ -1043,6 +1051,37 @@ impl ProxyRuntime {
         // ── 腿 3：三腿分发（决策全在 switch-engine，本处只执行）──
         let outcome = match decision {
             SwitchDecision::HotSwitch(plan) => {
+                // Block is expressed by generated reject routes, never by selector PUT.
+                // The builder already classifies entry/exit as structural; keep the
+                // executor fail-closed if that classification ever regresses.
+                let old_is_block = self.current_config.read().ok().is_some_and(|current| {
+                    is_block_selection(
+                        current
+                            .as_ref()
+                            .and_then(|config| config.get("selectedServerId"))
+                            .and_then(Value::as_str),
+                    )
+                });
+                if scope == SwitchApplyScope::SelectedOnly
+                    && (old_is_block
+                        || is_block_selection(
+                            new_config.get("selectedServerId").and_then(Value::as_str),
+                        ))
+                {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || {},
+                    ) {
+                        return SwitchOutcome::Pending;
+                    }
+                    return self.restart_selected_projection(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                    );
+                }
                 let interrupt = new_cfg.interrupt_connections_on_switch == Some(true);
                 log::info!(
                     "switchMode：热切换腿（kind={:?}，{} 个 selector PUT，断连开关={interrupt}）",
@@ -1695,6 +1734,26 @@ impl ProxyRuntime {
         let Some(server_id) = projected.get("selectedServerId").and_then(Value::as_str) else {
             return false;
         };
+        if is_block_selection(Some(server_id)) {
+            // No selector member exists for block. Only the ready core's startup
+            // snapshot and current R together prove that reject routes were emitted.
+            // The caller's selected-projection claim checks generation and intent
+            // before publishing an applied receipt.
+            let started_blocked = self.startup_snapshot.read().ok().is_some_and(|snapshot| {
+                snapshot.as_ref().is_some_and(|config| {
+                    config.get("selectedServerId").and_then(Value::as_str) == Some(server_id)
+                        && config.get("proxyMode").and_then(Value::as_str) != Some("direct")
+                })
+            });
+            return started_blocked
+                && self.core_running()
+                && self.current_config.read().ok().is_some_and(|current| {
+                    current.as_ref().is_some_and(|config| {
+                        config.get("selectedServerId").and_then(Value::as_str) == Some(server_id)
+                            && config.get("proxyMode").and_then(Value::as_str) != Some("direct")
+                    })
+                });
+        }
         let target = if is_direct_selection(Some(server_id)) {
             Some(DIRECT_TAG.to_string())
         } else {

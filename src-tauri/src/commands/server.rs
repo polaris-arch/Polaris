@@ -20,7 +20,9 @@ use serde_json::{json, Map, Value};
 use tauri::{AppHandle, State};
 
 use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 use polaris_config_engine::user_config::server_config::ServerConfig;
+use polaris_config_engine::user_config::ProxyMode;
 use polaris_mesh::warp_http::RegisterOptions;
 
 use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
@@ -495,7 +497,7 @@ where
                     arr.iter()
                         .any(|s| s.get("id").and_then(Value::as_str) == Some(server_id))
                 });
-            if !exists && server_id != DIRECT_SERVER_ID {
+            if !exists && server_id != DIRECT_SERVER_ID && server_id != BLOCK_SERVER_ID {
                 return Decision::Skip(Err(ServerSwitchError::Other(format!(
                     "服务器不存在: {server_id}"
                 ))));
@@ -516,6 +518,14 @@ where
                     ))));
                 }
             };
+            // Block is a route-level reject, not a selector member. In direct mode the
+            // generated route remains direct, so persisting a block selection would falsely
+            // promise that traffic is blocked. Reject inside the atomic write transaction.
+            if server_id == BLOCK_SERVER_ID && candidate.proxy_mode == ProxyMode::Direct {
+                return Decision::Skip(Err(ServerSwitchError::Other(
+                    "直连模式下不能选择阻断".to_string(),
+                )));
+            }
             if let Err(message) =
                 validate_candidate
                     .take()
@@ -530,7 +540,7 @@ where
                 .expect("server_switch 的 Write 腿只能执行一次")(
             );
             if let Some(obj) = cfg.as_object_mut() {
-                if server_id != DIRECT_SERVER_ID {
+                if server_id != DIRECT_SERVER_ID && server_id != BLOCK_SERVER_ID {
                     push_recent_server_id(obj, server_id);
                 }
             }
