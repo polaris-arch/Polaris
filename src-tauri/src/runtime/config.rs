@@ -44,7 +44,7 @@ enum MeshMarkerPhase {
     Enabled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MeshRequiredMarker {
     phase: MeshMarkerPhase,
@@ -58,9 +58,48 @@ pub(crate) enum MeshPrepareRecovery {
     Enabled,
 }
 
-/// Both content version and ledger revision are checked from the same raw
-/// document under ConfigManager's write lock. `StopIntent` deliberately ignores
-/// content version so a user Stop can supersede a concurrent ordinary edit.
+/// An owned, strict disk snapshot for managed Apply preflight. The raw source
+/// includes credentials, so this type deliberately implements neither Debug
+/// nor Serialize. Its private digest binds later admission to the entire raw
+/// JSON value read while ConfigManager held its write lock. configVersion is
+/// a frontend compatibility token, not a strong content identity.
+#[allow(dead_code)] // Production Apply wiring follows this admission slice.
+pub(crate) struct ApplyInputSnapshot {
+    raw: Value,
+    policy: MeshRoutePolicy,
+    state: MeshRouteState,
+    config_version: String,
+    raw_document_sha256: String,
+    marker: MeshRequiredMarker,
+}
+
+#[allow(dead_code)]
+impl ApplyInputSnapshot {
+    pub(crate) fn raw(&self) -> &Value {
+        &self.raw
+    }
+
+    pub(crate) fn policy(&self) -> &MeshRoutePolicy {
+        &self.policy
+    }
+
+    pub(crate) fn state(&self) -> &MeshRouteState {
+        &self.state
+    }
+
+    pub(crate) fn config_version(&self) -> &str {
+        &self.config_version
+    }
+
+    pub(crate) fn raw_document_sha256(&self) -> &str {
+        &self.raw_document_sha256
+    }
+}
+
+/// Content version and ledger revision are checked from the same raw document
+/// under ConfigManager's write lock. Prepare additionally requires its opaque
+/// `ApplyInputSnapshot` and strong raw-document digest. `StopIntent`
+/// deliberately ignores content version so a user Stop can supersede an edit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ApplyCasExpected<'a> {
     pub config_version: &'a str,
@@ -541,6 +580,89 @@ impl ConfigManager {
         Ok(raw)
     }
 
+    fn raw_mesh_document_digest(raw: &Value) -> Result<String, StoreError> {
+        let bytes = serde_json::to_vec(raw).map_err(StoreError::from)?;
+        Ok(polaris_updater::sha256_hex(&bytes))
+    }
+
+    /// Read one owned Apply input from the raw disk document. This does not
+    /// migrate, sanitize, cache, claim a lifecycle generation, or write a
+    /// journal. A legacy fallback and a Preparing marker are both forbidden.
+    #[allow(dead_code)] // Production Apply preflight follows this slice.
+    pub(crate) fn read_mesh_apply_snapshot(&self) -> Result<ApplyInputSnapshot, StoreError> {
+        deny_inside_projection("read_mesh_apply_snapshot");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.read_mesh_apply_snapshot_under_write_lock()
+    }
+
+    fn read_mesh_apply_snapshot_under_write_lock(&self) -> Result<ApplyInputSnapshot, StoreError> {
+        let marker = self
+            .mesh_required_marker()?
+            .ok_or_else(|| StoreError::validation("managed Apply requires an enabled marker"))?;
+        if marker.phase != MeshMarkerPhase::Enabled {
+            return Err(StoreError::validation(
+                "managed Apply requires an enabled marker",
+            ));
+        }
+        // The raw disk value matters: `current()` could be a stale sanitized
+        // cache, and an unknown raw key must invalidate this preflight even if
+        // the frontend's projected FNV version is unchanged. JSON whitespace
+        // and object-key order are intentionally semantically irrelevant.
+        let content = StdFs.read_to_string(&self.path)?;
+        let raw: Value = serde_json::from_str(&content).map_err(StoreError::from_parse)?;
+        if !mesh_guard::validate_raw(&raw)? {
+            return Err(StoreError::validation(
+                "managed Apply requires a complete raw document",
+            ));
+        }
+        let policy: MeshRoutePolicy = serde_json::from_value(raw[mesh_guard::POLICY_KEY].clone())
+            .map_err(StoreError::from_parse)?;
+        let state: MeshRouteState = serde_json::from_value(raw[mesh_guard::STATE_KEY].clone())
+            .map_err(StoreError::from_parse)?;
+        if state.local_id != marker.local_id {
+            return Err(StoreError::validation(
+                "managed Apply marker and document do not match",
+            ));
+        }
+        Ok(ApplyInputSnapshot {
+            config_version: config_version(&raw),
+            raw_document_sha256: Self::raw_mesh_document_digest(&raw)?,
+            raw,
+            policy,
+            state,
+            marker,
+        })
+    }
+
+    /// Read-only admission after any asynchronous preflight. The entire raw
+    /// JSON value and enabled marker must still match the original
+    /// owned snapshot; a matching configVersion or state revision alone is
+    /// insufficient. The future Prepare CAS must repeat this comparison
+    /// under its own write lock immediately before durable publication.
+    #[allow(dead_code)] // Production Apply preflight follows this slice.
+    pub(crate) fn admit_mesh_apply_snapshot(
+        &self,
+        snapshot: &ApplyInputSnapshot,
+    ) -> Result<(), StoreError> {
+        deny_inside_projection("admit_mesh_apply_snapshot");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.read_mesh_apply_snapshot_under_write_lock()?;
+        if current.raw_document_sha256 != snapshot.raw_document_sha256
+            || current.marker != snapshot.marker
+            || current.config_version != snapshot.config_version
+            || current.state.revision != snapshot.state.revision
+        {
+            return Err(StoreError::validation("managed Apply snapshot changed"));
+        }
+        Ok(())
+    }
+
     fn legacy_mesh_digest(config: &Value) -> Result<String, StoreError> {
         if mesh_guard::has_managed_fields(config) {
             return Err(StoreError::validation(
@@ -970,7 +1092,21 @@ impl ConfigManager {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut raw = self.raw_disk_for_mesh_under_write_lock()?;
+        let mut raw = if let ApplyStep::Prepare { snapshot, .. } = &step {
+            let current = self.read_mesh_apply_snapshot_under_write_lock()?;
+            if current.raw_document_sha256 != snapshot.raw_document_sha256
+                || current.marker != snapshot.marker
+                || current.config_version != snapshot.config_version
+                || current.state.revision != snapshot.state.revision
+                || expected.config_version != snapshot.config_version
+                || expected.state_revision != snapshot.state.revision
+            {
+                return Err(ApplyPersistError::ConfigChanged);
+            }
+            current.raw
+        } else {
+            self.raw_disk_for_mesh_under_write_lock()?
+        };
         let previous: MeshRouteState = serde_json::from_value(raw[mesh_guard::STATE_KEY].clone())
             .map_err(StoreError::from_parse)?;
         let is_stop = matches!(&step, ApplyStep::StopIntent);
@@ -981,6 +1117,7 @@ impl ConfigManager {
         let live_generation = live.generation();
         let next = match step {
             ApplyStep::Prepare {
+                snapshot: _,
                 plan,
                 boot_id,
                 manifest_ref,

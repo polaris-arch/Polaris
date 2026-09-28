@@ -136,6 +136,165 @@ fn managed_apply_cas_fixture() -> (
 }
 
 #[test]
+fn apply_snapshot_is_strict_owned_raw_value_and_read_only() {
+    let (dir, mgr, _plan, version) = managed_apply_cas_fixture();
+    let original = std::fs::read(dir.join("config.json")).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(snapshot.config_version(), version);
+    assert_eq!(snapshot.state().revision, "1");
+    assert_eq!(snapshot.policy().schema_version, 1);
+    assert_eq!(snapshot.raw()[mesh_guard::STATE_KEY]["revision"], "1");
+    assert_eq!(
+        snapshot.raw_document_sha256(),
+        polaris_updater::sha256_hex(&serde_json::to_vec(snapshot.raw()).unwrap())
+    );
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), original);
+    assert!(mgr.cache.read().unwrap().is_none());
+    mgr.admit_mesh_apply_snapshot(&snapshot).unwrap();
+
+    // This is a digest of the raw parsed document, not whitespace or key order.
+    let raw: Value = serde_json::from_slice(&original).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec_pretty(&raw).unwrap(),
+    )
+    .unwrap();
+    mgr.admit_mesh_apply_snapshot(&snapshot).unwrap();
+}
+
+#[test]
+fn apply_snapshot_admission_rejects_plain_save_stop_and_identity_epoch_change() {
+    use crate::runtime::proxy::mesh_apply::ApplyStep;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (_dir, mgr, _plan, _version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    mgr.set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    assert!(mgr.admit_mesh_apply_snapshot(&snapshot).is_err());
+
+    let (_dir, mgr, _plan, version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let gate = LifecycleGate::default();
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    gate.with_current_generation(stop, |live| {
+        mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: "1",
+            },
+            "boot-admission",
+            live,
+            ApplyStep::StopIntent,
+        )
+    })
+    .unwrap()
+    .unwrap();
+    let stopped = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(stopped.config_version(), version);
+    assert_ne!(
+        stopped.raw_document_sha256(),
+        snapshot.raw_document_sha256()
+    );
+    assert!(mgr.admit_mesh_apply_snapshot(&snapshot).is_err());
+
+    let (dir, mgr, _plan, version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw[mesh_guard::STATE_KEY]["identities"][0]["identityEpoch"] = serde_json::json!("epoch-b");
+    raw[mesh_guard::STATE_KEY]["reservations"][0]["ownerRef"]["identityEpoch"] =
+        serde_json::json!("epoch-b");
+    raw[mesh_guard::STATE_KEY]["observations"][0]["ownerRef"]["identityEpoch"] =
+        serde_json::json!("epoch-b");
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("2");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_ok());
+    assert_eq!(config_version(&raw), version);
+    assert!(mgr.admit_mesh_apply_snapshot(&snapshot).is_err());
+}
+
+#[test]
+fn apply_snapshot_requires_enabled_marker_and_complete_raw_managed_document() {
+    let (dir, mgr, _plan, _version) = managed_apply_cas_fixture();
+    std::fs::remove_file(dir.join(REQUIRED_MARKER_FILE)).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Preparing,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw.as_object_mut().unwrap().remove(mesh_guard::POLICY_KEY);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    raw[mesh_guard::POLICY_KEY] = mesh_wire_fixture()[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["localId"] = serde_json::json!("other-local");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    std::fs::write(dir.join("config.json"), b"{broken-json").unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+}
+
+#[test]
+fn prepare_cas_requires_typed_snapshot_even_when_version_and_revision_match() {
+    use crate::runtime::proxy::mesh_apply::ApplyStep;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let gate = LifecycleGate::default();
+    let start = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw[mesh_guard::STATE_KEY]["intent"]["desiredRun"] = serde_json::json!("running");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(config_version(&raw), version);
+    assert_eq!(raw[mesh_guard::STATE_KEY]["revision"], "1");
+    assert!(mgr.read_mesh_apply_snapshot().is_ok());
+
+    let rejected = gate
+        .with_current_generation(start, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-admission",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-admission",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap();
+    assert!(matches!(rejected, Err(ApplyPersistError::ConfigChanged)));
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert!(after[mesh_guard::STATE_KEY]["transaction"].is_null());
+}
+
+#[test]
 fn apply_cas_checks_disk_config_and_state_together_but_stop_survives_config_edits() {
     use crate::runtime::proxy::mesh_apply::{ApplyError, ApplyStep};
     use polaris_config_engine::user_config::mesh_route_state::{
@@ -146,6 +305,7 @@ fn apply_cas_checks_disk_config_and_state_together_but_stop_survives_config_edit
     let (dir, mgr, mut plan, original_version) = managed_apply_cas_fixture();
     let gate = LifecycleGate::default();
     let start = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let stale_snapshot = mgr.read_mesh_apply_snapshot().unwrap();
     mgr.set_value("logLevel", serde_json::json!("debug"))
         .unwrap();
     let current: Value =
@@ -163,6 +323,7 @@ fn apply_cas_checks_disk_config_and_state_together_but_stop_survives_config_edit
                 "boot-cas",
                 live,
                 ApplyStep::Prepare {
+                    snapshot: &stale_snapshot,
                     plan: &plan,
                     boot_id: "boot-cas",
                     manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
@@ -176,6 +337,7 @@ fn apply_cas_checks_disk_config_and_state_together_but_stop_survives_config_edit
     assert!(unchanged[mesh_guard::STATE_KEY]["transaction"].is_null());
 
     plan.config_version = latest_version.clone();
+    let fresh_snapshot = mgr.read_mesh_apply_snapshot().unwrap();
     let prepared = gate
         .with_current_generation(start, |live| {
             mgr.apply_mesh_step_if_current(
@@ -186,6 +348,7 @@ fn apply_cas_checks_disk_config_and_state_together_but_stop_survives_config_edit
                 "boot-cas",
                 live,
                 ApplyStep::Prepare {
+                    snapshot: &fresh_snapshot,
                     plan: &plan,
                     boot_id: "boot-cas",
                     manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
@@ -250,6 +413,7 @@ fn reserved_start_must_bind_old_claim_to_the_live_new_generation_before_spawn() 
     let (_dir, mgr, plan, version) = managed_apply_cas_fixture();
     let gate = LifecycleGate::default();
     let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
     let prepared = gate
         .with_current_generation(old, |live| {
             mgr.apply_mesh_step_if_current(
@@ -260,6 +424,7 @@ fn reserved_start_must_bind_old_claim_to_the_live_new_generation_before_spawn() 
                 "boot-cas",
                 live,
                 ApplyStep::Prepare {
+                    snapshot: &snapshot,
                     plan: &plan,
                     boot_id: "boot-cas",
                     manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",

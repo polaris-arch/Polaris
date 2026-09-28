@@ -9,6 +9,7 @@ pub(crate) mod materialize;
 pub(crate) mod owner_scope;
 pub(crate) mod preflight;
 
+use crate::runtime::config::ApplyInputSnapshot;
 use polaris_config_engine::builder::managed_mesh_plan::{ManagedMeshRoutePlan, ManagedPlanTarget};
 use polaris_config_engine::user_config::mesh_route_state::{
     MeshActivePlan, MeshBindingState, MeshDesiredRun, MeshOwnerRef, MeshRouteState,
@@ -140,6 +141,10 @@ pub(crate) enum PhaseEvent<'a> {
 /// CAS. No caller-supplied closure may rewrite the managed ledger directly.
 pub(crate) enum ApplyStep<'a> {
     Prepare {
+        /// An opaque, strict raw document snapshot. The ConfigManager CAS
+        /// rechecks its strong digest under the same write lock; callers
+        /// cannot substitute a configVersion-only claim.
+        snapshot: &'a ApplyInputSnapshot,
         plan: &'a ManagedMeshRoutePlan,
         boot_id: &'a str,
         manifest_ref: &'a str,
