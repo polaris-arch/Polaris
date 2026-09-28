@@ -190,7 +190,8 @@ export function TsLoginPanel({
     setPending(null);
     setTailscaleAuthUrl(pending.serverId, null);
     setTailscaleLoginInitiated(pending.serverId, false);
-    setNotice({ tone: 'ok', text: t('ts.authorizationComplete') });
+    setNotice(undefined);
+    toast.success(t('ts.authorizationComplete'));
     if (!editedAfterSaveRef.current) closeInstance(instanceId);
   }, [pending, progress?.phase, hasInstance, instanceId, closeInstance,
     setTailscaleAuthUrl, setTailscaleLoginInitiated, t]);
@@ -260,7 +261,8 @@ export function TsLoginPanel({
   const copyAuthUrl = async (url: string): Promise<void> => {
     try {
       await copyLoginUrl(url, navigator.clipboard);
-      setNotice({ tone: 'ok', text: t('ts.authUrlCopied') });
+      setNotice(undefined);
+      toast.success(t('ts.authUrlCopied'));
     } catch {
       setNotice({ tone: 'err', text: t('connections.copyFailed') });
     }

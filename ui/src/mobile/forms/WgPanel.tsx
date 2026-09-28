@@ -36,6 +36,7 @@ import { useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import { revealElement, useRevealAfterCommit } from '@/components/reveal';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import type { MeshInboundPolicy } from '@/contracts/types';
 import type { FormValue, SelectOption } from '@/components/dialogs/field-spec';
 import { wgSpec } from '@/components/dialogs/wg-spec';
@@ -244,6 +245,7 @@ export function WgPanel({
          不刷则本屏列表看不到这次改动 —— 后端广播是慢路径，表单已经关了。 */
       await loadConfig(true);
       closeInstance(instanceId);
+      toast.success(t('common.saved'));
     } catch (e) {
       /* 🔴 只吐错误对象，**绝不吐 `draft` / `server`** —— 里面有私钥（见文件头纪律 ②③）。 */
       console.error('[mobile-wg-form] save failed:', e);

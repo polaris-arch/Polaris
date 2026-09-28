@@ -837,8 +837,6 @@ export function MobileConnectionsScreen(): ReactElement {
    * （`LogsScreen.tsx` 的 `legacyLog` state）。
    */
   const [legacyLog, setLegacyLog] = useState<{ exists: boolean; bytes: number } | null>(null);
-  /** 归档 / 删除成功后的回执键（提示块**原地换成**这一句，而不是凭空消失）。 */
-  const [legacyDone, setLegacyDone] = useState<string | null>(null);
 
   useEffect(() => {
     if (segment !== 'logs') return;
@@ -859,14 +857,13 @@ export function MobileConnectionsScreen(): ReactElement {
   }, [segment]);
 
   const onArchiveLegacy = useCallback(() => {
-    setLegacyDone(null);
     void runWrite(LEGACY_WRITE_KEY, 'logs.archiveLegacyFailed', async () => {
       const res = await api.logs.archiveLegacy();
       /* 用户在系统保存器里自己按了取消 —— **不是失败**，什么都不说（同两条导出腿）。 */
       if (res.error === 'cancelled') return true;
       if (!res.success) return false;
       setLegacyLog((cur) => (cur === null ? cur : { ...cur, exists: false, bytes: 0 }));
-      if (res.archived) setLegacyDone('logs.archiveLegacyDone');
+      if (res.archived) toast.success(trRef.current('logs.archiveLegacyDone'));
       return true;
     });
   }, [runWrite]);
@@ -885,7 +882,6 @@ export function MobileConnectionsScreen(): ReactElement {
    * `onConfirm` 自行关闭那一层（`MobileConfirmPayload` 的既定语义）。
    */
   const onDeleteLegacy = useCallback(() => {
-    setLegacyDone(null);
     const size = legacyLog === null ? '' : fmtBytes(legacyLog.bytes);
     const instanceId = openMobileForm({
       kind: 'confirm',
@@ -899,7 +895,7 @@ export function MobileConnectionsScreen(): ReactElement {
           void runWrite(LEGACY_WRITE_KEY, 'logs.deleteLegacyFailed', async () => {
             const res = await api.logs.deleteLegacy();
             setLegacyLog((cur) => (cur === null ? cur : { ...cur, exists: false, bytes: 0 }));
-            if (res.deleted) setLegacyDone('logs.deleteLegacyDone');
+            if (res.deleted) toast.success(trRef.current('logs.deleteLegacyDone'));
             return true;
           });
         },
@@ -907,22 +903,15 @@ export function MobileConnectionsScreen(): ReactElement {
     });
   }, [legacyLog, runWrite]);
 
-  /** 日志段那块提示的呈现态（`warn` = 旧日志还在；`ok` = 刚归档 / 删除完的回执）。 */
-  const legacyNotice = useMemo((): { tone: 'warn' | 'ok'; text: string } | null => {
-    if (legacyDone !== null) return { tone: 'ok', text: tr(legacyDone) };
+  /** 旧日志仍在时持续提醒；操作完成后由短 Toast 回执。 */
+  const legacyNotice = useMemo((): { tone: 'warn'; text: string } | null => {
     if (legacyLog === null || !legacyLog.exists) return null;
     return {
       tone: 'warn',
       text: `${tr('logs.legacyTitle')} ${tr('logs.legacyBody', { size: fmtBytes(legacyLog.bytes) })}`,
     };
-  }, [legacyDone, legacyLog, tr]);
+  }, [legacyLog, tr]);
 
-  /**
-   * 导出成功的回执（i18n 键）。移动端没有 toast 宿主（`lib/error-handler` 的门面在未注入实现时
-   * 落 console），失败走 `runWrite` 的红字，成功就得有一条自己的通道 —— 否则「系统保存器弹了
-   * 又关了，界面上一个字都没有」与静默失败在用户那里是同一件事。
-   */
-  const [exportDone, setExportDone] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState<'report' | 'logs' | null>(null);
   const exportInFlight = useRef(false);
   const [copyBusy, setCopyBusy] = useState(false);
@@ -943,13 +932,11 @@ export function MobileConnectionsScreen(): ReactElement {
     if (exportInFlight.current) return;
     exportInFlight.current = true;
     setExportBusy('report');
-    setExportDone(null);
     void runWrite('export:report', 'logs.exportDiagFailed', async () => {
       const res = await api.diagnostic.export();
-      if (res.error === 'cancelled') { setExportDone('mobileActions.cancelled'); return true; }
+      if (res.error === 'cancelled') return true;
       if (!res.success) return false;
       const done = res.shared ? 'mobileActions.shareOpened' : 'logs.exportDiagDone';
-      setExportDone(done);
       toast.success(trRef.current(done));
       return true;
     }).finally(() => { exportInFlight.current = false; setExportBusy(null); });
@@ -959,12 +946,10 @@ export function MobileConnectionsScreen(): ReactElement {
     if (exportInFlight.current) return;
     exportInFlight.current = true;
     setExportBusy('logs');
-    setExportDone(null);
     void runWrite('export:logs', 'logs.exportFailed', async () => {
       const res = await api.logs.export();
-      if (res.error === 'cancelled') { setExportDone('mobileActions.cancelled'); return true; }
+      if (res.error === 'cancelled') return true;
       if (!res.success) return false;
-      setExportDone('logs.exportDone');
       toast.success(trRef.current('logs.exportDone'));
       return true;
     }).finally(() => { exportInFlight.current = false; setExportBusy(null); });
@@ -986,8 +971,7 @@ export function MobileConnectionsScreen(): ReactElement {
       await navigator.clipboard.writeText(text);
       toast.success(trRef.current('connections.copied'));
       return true;
-    }).then((ok) => { if (!ok) toast.error(trRef.current('common.copyFail')); })
-      .finally(() => { copyInFlight.current = false; setCopyBusy(false); });
+    }).finally(() => { copyInFlight.current = false; setCopyBusy(false); });
   }, [visibleLogs, redacting, runWrite]);
 
   const onCopyText = useCallback(
@@ -999,8 +983,7 @@ export function MobileConnectionsScreen(): ReactElement {
         await navigator.clipboard.writeText(text);
         toast.success(trRef.current('connections.copied'));
         return true;
-      }).then((ok) => { if (!ok) toast.error(trRef.current('common.copyFail')); })
-        .finally(() => { copyInFlight.current = false; setCopyBusy(false); });
+      }).finally(() => { copyInFlight.current = false; setCopyBusy(false); });
     },
     [runWrite],
   );
@@ -1193,7 +1176,6 @@ export function MobileConnectionsScreen(): ReactElement {
         submenu: true,
         description: tr('mobileActions.exportHint'),
         onSelect: () => {
-          setExportDone(null);
           setSheet('export');
         },
       },
@@ -1343,7 +1325,7 @@ export function MobileConnectionsScreen(): ReactElement {
       return {
         title: tr('mobileActions.chooseExport'),
         body: tr('mobileActions.exportHint'),
-        status: exportBusy ? tr('mobileActions.preparing') : exportDone ? tr(exportDone) : undefined,
+        status: exportBusy ? tr('mobileActions.preparing') : undefined,
         error: writeErrors['export:report'] ?? writeErrors['export:logs'],
         items: [
           {
@@ -1351,10 +1333,7 @@ export function MobileConnectionsScreen(): ReactElement {
             label: tr('mobileActions.report'),
             disabled: exportBusy !== null,
             busy: exportBusy === 'report',
-            description:
-              exportDone === 'logs.exportDiagDone'
-                ? tr('logs.exportDiagDone')
-                : tr('mobileActions.reportHint'),
+            description: tr('mobileActions.reportHint'),
             onSelect: onExportReport,
           },
           {
@@ -1362,10 +1341,7 @@ export function MobileConnectionsScreen(): ReactElement {
             label: tr('mobileActions.saveLogs'),
             disabled: exportBusy !== null,
             busy: exportBusy === 'logs',
-            description:
-              exportDone === 'logs.exportDone'
-                ? tr('logs.exportDone')
-                : tr('logs.exportLogsOnlyDesc'),
+            description: tr('logs.exportLogsOnlyDesc'),
             onSelect: onExportLogs,
           },
         ],
@@ -1545,7 +1521,6 @@ export function MobileConnectionsScreen(): ReactElement {
     displayLevel,
     diagnosticMode,
     logSource,
-    exportDone,
     exportBusy,
     tr,
     onLevelChange,

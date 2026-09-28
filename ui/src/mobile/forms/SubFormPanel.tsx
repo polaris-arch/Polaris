@@ -92,6 +92,7 @@ export function SubFormPanel({
   const loadConfig = useAppStore((s) => s.loadConfig);
   const startCreate = useSubscriptionCreateOperationStore((s) => s.start);
   const clearTerminal = useSubscriptionCreateOperationStore((s) => s.clearTerminal);
+  const markTerminalHandled = useSubscriptionCreateOperationStore((s) => s.markTerminalHandled);
 
   const base = subId === undefined ? undefined : config?.subscriptions?.find((s) => s.id === subId);
   const isEdit = base !== undefined;
@@ -142,6 +143,7 @@ export function SubFormPanel({
     }
     if (snapshot.phase !== 'succeeded' || !snapshot.result) return;
     const createdId = snapshot.result.subscription.id;
+    const partial = snapshot.result.partial === true;
     void (async () => {
       await loadConfig(true);
       /* 🔴 **强刷之后要问一句「真的发布到 store 了吗」**（桌面
@@ -161,14 +163,19 @@ export function SubFormPanel({
          水合时这次成功的创建才捞得回来。清在 `hasInstance` 之前等于把它永久丢掉（桌面
          同一处的注释逐字写着这条）。 */
       if (!hasInstance(instanceId)) return;
+      const shouldToast = subscriptionCreateTerminalNeedsAnnouncement(
+        useSubscriptionCreateOperationStore.getState().handledTerminalRevisions[snapshot.operationId], snapshot,
+      );
+      if (shouldToast) markTerminalHandled(snapshot.operationId, snapshot.revision);
       clearTerminal(snapshot.operationId);
       onAdded?.(createdId);
       closeInstance(instanceId);
+      if (shouldToast) toast.success(t(partial ? 'sub.addedPartial' : 'sub.added'));
     })().catch((err: unknown) => {
       console.error('[mobile-sub-form] completion refresh failed:', err);
       setNotice({ tone: 'err', text: t('common.configLoadFail') });
     });
-  }, [snapshot, clearTerminal, loadConfig, hasInstance, instanceId, onAdded, closeInstance, t]);
+  }, [snapshot, clearTerminal, markTerminalHandled, loadConfig, hasInstance, instanceId, onAdded, closeInstance, t]);
 
   const requestClose = (): void => {
     /* 创建进行中不许关：终态之后的发布（强刷 + 切 tab）要回到这一层来做。 */
@@ -256,6 +263,7 @@ export function SubFormPanel({
         await api.subscription.update(next);
         await loadConfig(true);
         closeInstance(instanceId);
+        toast.success(t('sub.updated'));
         return;
       }
       /* 新增：调用方自持 operationId（响应丢失后按同一个 id 重挂，见头注）。 */

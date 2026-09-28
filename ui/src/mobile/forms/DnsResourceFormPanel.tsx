@@ -44,6 +44,9 @@ import {
 } from '@/components/dialogs/dns-resource-logic';
 import { isIpLiteral } from '@/domain/ip-literal';
 import { useConfig } from '@/components/screens/settings/use-config';
+import { toast } from '@/lib/error-handler';
+import { editRoute } from '@/lib/staged-config';
+import { useStagingActive } from '@/store/use-staging-active';
 import { FormSheet } from './FormSheet';
 import { useMobileFormStore } from './form-store';
 
@@ -68,6 +71,7 @@ export function DnsServerFormPanel({
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
   const { config, update } = useConfig();
+  const stagingEnabled = useStagingActive();
 
   const dnsServers = useMemo(() => config?.dnsServers ?? [], [config?.dnsServers]);
   const base = serverId === undefined ? undefined : dnsServers.find((s) => s.id === serverId);
@@ -207,6 +211,7 @@ export function DnsServerFormPanel({
       try {
         await update({ dnsServers: nextServers }, { throwOnError: true });
         closeInstance(instanceId);
+        if (editRoute('dnsServers', stagingEnabled) === 'direct') toast.success(tr('common.saved'));
       } catch (err) {
         console.error('[mobile-dns-server-form] save failed:', err);
         /* 表单可能已被关掉（异步 continuation）⇒ 先确认宿主还在再落回显。 */
@@ -455,6 +460,7 @@ export function DnsGroupFormPanel({
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
   const { config, update } = useConfig();
+  const stagingEnabled = useStagingActive();
 
   const dnsServers = useMemo(() => config?.dnsServers ?? [], [config?.dnsServers]);
   const dnsGroups = useMemo(() => config?.dnsServerGroups ?? [], [config?.dnsServerGroups]);
@@ -531,6 +537,7 @@ export function DnsGroupFormPanel({
       try {
         await update({ dnsServerGroups: nextGroups }, { throwOnError: true });
         closeInstance(instanceId);
+        if (editRoute('dnsServerGroups', stagingEnabled) === 'direct') toast.success(tr('common.saved'));
       } catch (err) {
         console.error('[mobile-dns-group-form] save failed:', err);
         if (hasInstance(instanceId)) setNotice({ tone: 'err', text: tr('common.saveFailed') });

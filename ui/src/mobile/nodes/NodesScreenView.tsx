@@ -572,9 +572,8 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
           <p className="mn-notice-text">{t(MESH_HEALTH_KEY[props.meshTunnelHealth])}</p>
         </div>
       )}
-      {/* 行内反馈（IA 裁定 #14）。移动外壳既无 `DialogHost` 也无 toast 宿主，而本批**不许**
-          往外壳里造全局宿主 ⇒ 写失败落成这条紧贴屏内的红字。没有它，一次写失败的表现是
-          「开关自己弹回去，一句话都没有」—— 那正是 `action-failure-visibility` 那道门守的形态。 */}
+      {/* 写失败与持续状态留在屏内；真实完成由移动端 Toast 宿主短暂回执。
+          行内错误保留动作上下文，避免用户只看到状态回滚。 */}
       {props.notice !== undefined && (
         <div className={`mn-notice ${props.notice.tone}`} role="status">
           <p className="mn-notice-text">{props.notice.text}</p>

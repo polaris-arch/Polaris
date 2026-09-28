@@ -49,6 +49,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
 import { useEffect, useMemo, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import type { CustomAppPreset, InstalledApp } from '@/contracts/types';
 import { availableResourceTagSet } from '@/domain/rule-resource-refs';
 import { parseProcessNames } from '@/components/dialogs/process-selection';
@@ -291,6 +292,7 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
             { collection: 'customAppPresets', entityId: preset.id, value: preset },
           ]);
         closeInstance(instanceId);
+        toast.success(tr('common.saved'));
       } catch (err) {
         console.error('[mobile-app-add] save failed:', err);
         if (hasInstance(instanceId)) setNotice({ tone: 'err', text: tr('common.saveFailed') });

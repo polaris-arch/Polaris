@@ -33,6 +33,7 @@ import { useTranslation } from 'react-i18next';
    故走同一条腿，不在这里另写一个滚动。 */
 import { revealElement, useRevealAfterCommit } from '@/components/reveal';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import type { MeshInboundPolicy } from '@/contracts/types';
 import type { TailscaleStatusPeer } from '@/contracts/tailscale-status';
 import type { FormValue, FormValues, SelectOption } from '@/components/dialogs/field-spec';
@@ -244,6 +245,7 @@ export function TsSettingsPanel({
       await api.server.update(next);
       await loadConfig(true);
       closeInstance(instanceId);
+      toast.success(t('common.saved'));
     } catch (e) {
       console.error('[mobile-ts-settings] save failed:', e);
       setNotice({ tone: 'err', text: t('common.saveFailed') });
@@ -261,6 +263,7 @@ export function TsSettingsPanel({
     try {
       await loadConfig(true);
       closeInstance(instanceId);
+      toast.success(t('nodes.meshTsLogoutOk'));
     } catch {
       setNotice({ tone: 'info', text: t('ts.logoutRefreshFailed') });
     }

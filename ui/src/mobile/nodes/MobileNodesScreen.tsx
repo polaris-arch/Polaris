@@ -239,7 +239,6 @@ export function MobileNodesScreen(): ReactElement {
         console.error('[mobile-nodes] write failed:', err);
         const message = describe(err);
         setNotice({ tone: 'err', text: message });
-        toast.error(message);
       }
     },
     [],
@@ -253,7 +252,10 @@ export function MobileNodesScreen(): ReactElement {
         async () => {
           const receipt = await switchServer(row.server.id);
           const feedback = mobileSwitchReceiptFeedback(receipt, row.server.name, t);
-          if (feedback) setNotice({ tone: feedback.tone === 'success' ? 'ok' : feedback.tone === 'warning' ? 'warn' : 'info', text: feedback.text });
+          if (feedback?.tone === 'success') {
+            setNotice(undefined);
+            toast.success(feedback.text);
+          } else if (feedback) setNotice({ tone: feedback.tone === 'warning' ? 'warn' : 'info', text: feedback.text });
           else if (receipt.status === 'notRunning') setNotice(undefined);
         },
         (err) => serverSwitchErrorText(err instanceof IpcError ? err.code : undefined, t),
@@ -306,11 +308,10 @@ export function MobileNodesScreen(): ReactElement {
         } catch (err) {
           console.error('[mobile-nodes] generate share url failed:', err);
           setNotice({ tone: 'err', text: t('nodes.copyLinkUnsupported') });
-          toast.error(t('nodes.copyLinkUnsupported'));
           return;
         }
         await navigator.clipboard.writeText(url);
-        setNotice({ tone: 'ok', text: t('nodes.copyLinkOk') });
+        setNotice(undefined);
         toast.success(t('nodes.copyLinkOk'));
       }, () => t('nodes.copyLinksFailed')).finally(() => {
         copyInFlight.current = false;
@@ -336,18 +337,11 @@ export function MobileNodesScreen(): ReactElement {
         const skipped = settled.length - urls.length;
         if (urls.length === 0) {
           setNotice({ tone: 'err', text: t('nodes.copyLinkUnsupported') });
-          toast.error(t('nodes.copyLinkUnsupported'));
           return;
         }
         await navigator.clipboard.writeText(urls.join('\n'));
+        setNotice(undefined);
         toast.success(t(skipped > 0 ? 'nodes.copyLinksPartial' : 'nodes.copyLinksOk', { count: urls.length, skipped }));
-        setNotice({
-          tone: 'ok',
-          text:
-            skipped > 0
-              ? t('nodes.copyLinksPartial', { count: urls.length, skipped })
-              : t('nodes.copyLinksOk', { count: urls.length }),
-        });
       }, () => t('nodes.copyLinksFailed')).finally(() => {
         copyInFlight.current = false;
         setCopyBusy(false);
@@ -395,7 +389,7 @@ export function MobileNodesScreen(): ReactElement {
     /* 删除腿走**本屏那个唯一写出口**（裁定 #14）：它自带 try/catch 会在同一个屏上开出
        第二条失败回显通道，而「唯一出口」正是本屏那道门判的形态。 */
     runWrite,
-    notify: setNotice,
+    clearNotice: () => setNotice(undefined),
     confirm: confirmLayer,
     dismiss: closeMobileForm,
     exitBatch: exitBatchMode,
@@ -427,7 +421,8 @@ export function MobileNodesScreen(): ReactElement {
       void runWrite(
         async () => {
           // 暂存闸门与节点表单同一个 `editRoute`，不在这里另写一条判定。
-          if (editRoute('servers', stagingEnabled) === 'staged') {
+          const staged = editRoute('servers', stagingEnabled) === 'staged';
+          if (staged) {
             const entityId = crypto.randomUUID();
             stage({
               id: `server:${entityId}`,
@@ -440,9 +435,9 @@ export function MobileNodesScreen(): ReactElement {
             await api.server.add({ ...rest, name: cloneName });
             await useAppStore.getState().loadConfig(true);
           }
-          /* 副本落在**自建**分组（上面剥了 subscriptionId）。当前若停在订阅 tab，新行不在本 tab
-             可见 ⇒ 没有这条回显的话点了完全没反应（桌面同一条理由）。 */
-          setNotice({ tone: 'ok', text: t('nodes.cloneSuccess') });
+          /* 副本落在自建分组；直接写入完成后给短回执，暂存由底部待应用条持续说明。 */
+          setNotice(undefined);
+          if (!staged) toast.success(t('nodes.cloneSuccess'));
         },
         () => t('nodes.cloneFail'),
       );
@@ -662,7 +657,7 @@ export function MobileNodesScreen(): ReactElement {
         setCopyBusy(true);
         void runWrite(async () => {
           await navigator.clipboard.writeText(sub.url);
-          setNotice({ tone: 'ok', text: t('nodes.subCopyUrlOk') });
+          setNotice(undefined);
           toast.success(t('nodes.subCopyUrlOk'));
         }, () => t('nodes.copyLinksFailed')).finally(() => {
           copyInFlight.current = false;

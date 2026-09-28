@@ -48,6 +48,7 @@ import { useTranslation } from 'react-i18next';
    故走同一条腿，不在这里另写一个滚动。 */
 import { revealElement, useRevealAfterCommit } from '@/components/reveal';
 import { api, IpcError } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import type { MeshInboundPolicy, ServerConfig } from '@/contracts/types';
 import {
   parseNumberField,
@@ -419,6 +420,7 @@ export function NodeFormPanel({
          不刷则本屏列表看不到这次改动 —— 后端广播是慢路径，表单已经关了。 */
       await loadConfig(true);
       closeInstance(instanceId);
+      toast.success(t('common.saved'));
     } catch (e) {
       console.error('[mobile-node-form] save failed:', e);
       /* 编解码被拒（证书固定值 / DERP 行 / 扩展 JSON 非法…）⇒ 展开出错字段所在的那一组（同桌面）。 */

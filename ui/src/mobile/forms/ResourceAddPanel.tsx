@@ -31,6 +31,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
 import { useEffect, useMemo, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import type {
   RuleResourceCatalogItem,
   RuleResourceCategory,
@@ -194,6 +195,7 @@ export function ResCatalogPanel({ instanceId }: { instanceId: string }): ReactEl
         const outcome = downloadOutcome(await api.ruleResources.download(items), tr, items.length);
         if (outcome.ok) {
           closeInstance(instanceId);
+          toast.success(tr('resCatalog.downloaded'));
           return;
         }
         if (hasInstance(instanceId)) setNotice({ tone: 'err', text: outcome.text });
@@ -384,6 +386,7 @@ export function ResUrlPanel({ instanceId }: { instanceId: string }): ReactElemen
         const outcome = downloadOutcome(await api.ruleResources.download(items), tr, items.length);
         if (outcome.ok) {
           closeInstance(instanceId);
+          toast.success(tr('resCatalog.downloaded'));
           return;
         }
         if (hasInstance(instanceId)) {

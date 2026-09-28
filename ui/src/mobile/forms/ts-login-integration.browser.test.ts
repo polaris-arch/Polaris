@@ -14,6 +14,7 @@ import { useAppStore } from '/src/store/app-store';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { useTailscaleLoginProgressStore } from '/src/store/use-tailscale-login-progress-store';
 import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';
+import { MobileToaster } from '/src/mobile/MobileToaster';
 import { startMobileAppWiring } from '/src/mobile/app-wiring';
 import { i18nReady } from '/src/i18n';
 import '/src/styles/tokens.resolved.css';
@@ -83,7 +84,7 @@ function Host() {
     ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} /> : null);
 }
 useMobileFormStore.getState().open({kind:'ts-login', serverId:'ts-1'});
-createRoot(document.getElementById('root')).render(<main className="mobile-root"><Host /></main>);
+createRoot(document.getElementById('root')).render(<main className="mobile-root"><Host /><MobileToaster /></main>);
 `;
 
 let server: ViteDevServer;
@@ -186,6 +187,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
           phase: 'authorized', url: null });
       });
       await page.getByRole('dialog').waitFor({ state: 'detached' });
+      await page.locator('.m-toast').filter({ hasText: '授权已完成' }).waitFor();
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(1);
       expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
       expect(await page.evaluate(() => (window as any).__tsTest.initiated())).not.toBe(true);
       expect(await page.evaluate(() => (window as any).__tsTest.authUrl())).toBeFalsy();

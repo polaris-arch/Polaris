@@ -20,8 +20,8 @@
  *
  *  · **二次确认**：桌面是原地 `confirmTwice`（按钮翻红 + 再点一次），这里是叠一层确认面板 ——
  *    触屏没有 hover，翻红那一下在拇指底下被自己的手指挡住，而第二击极易被读成误触重复。
- *  · **失败回显**：桌面落 toast，这里落**屏级行内 notice**（IA 裁定 #14）。一屏几十行节点，
- *    一条飘过去的 toast 说得清「发生了什么」，说不清「是哪一行」。
+ *  · **回显**：失败留屏级行内 notice 以保留归属；真正完成的删除给短 Toast。
+ *    暂存中的删除由底部待应用条持续说明。
  *
  * 本模块不认识 React 之外的 UI：确认与回显都由调用方以闭包传进来，故它在 node 环境下可直测。
  */
@@ -29,6 +29,7 @@
 import { useCallback } from 'react';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import { DIRECT_SERVER_ID } from '@/domain/direct-selection';
 import {
   fallbackExitAfterDelete,
@@ -44,8 +45,8 @@ import type { MobileConfirmPayload } from '../forms/form-store';
 
 export interface MobileDeletionDeps {
   readonly t: (key: string, vars?: Record<string, unknown>) => string;
-  /** 屏级行内回显（成功 / 失败都要说话）。 */
-  readonly notify: (n: { tone: 'ok' | 'info' | 'warn' | 'err'; text: string }) => void;
+  /** 成功后清除这张屏或面板上先前留下的失败回执。 */
+  readonly clearNotice: () => void;
   /**
    * 屏内**唯一写出口**（`MobileNodesScreen#runWrite`）。删除腿不自带 try/catch ——
    * 那会在同一个屏上开出第二条失败回显通道，而 `write-failure-visibility.test.ts` 的
@@ -97,7 +98,7 @@ export interface MobileDeletion {
 }
 
 export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion {
-  const { t, notify, confirm, dismiss, exitBatch, runWrite } = deps;
+  const { t, clearNotice, confirm, dismiss, exitBatch, runWrite } = deps;
   const servers = useEffectiveServers();
   const diskServers = useAppStore((s) => s.servers);
   const selectedServerId = useAppStore((s) => s.selectedServerId);
@@ -153,22 +154,23 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
   const runDeleteOne = useCallback(
     async (server: ServerConfig, opts?: MobileWarpRemovalOptions): Promise<void> => {
       const okText = opts?.okText ?? t('nodes.deleteSuccess');
-      const done = (): void => {
-        notify({ tone: 'ok', text: okText });
+      const done = (showToast: boolean): void => {
+        clearNotice();
+        if (showToast) toast.success(okText);
         opts?.afterDelete?.();
       };
       const split = splitStagedOnly('server.delete', [server.id], stagedOnly, stagedEntries, 'servers');
       if (split.backend.length === 0) {
         // 全是 staged-only ⇒ 撤销那条暂存条目，零 IPC。
         split.revertEntryIds.forEach(revertStaged);
-        done();
+        done(true);
         return;
       }
       const routes = partitionNodeDeleteRoutes(diskServers, split.backend, policy);
       if (routes.staged.length > 0) {
         split.revertEntryIds.forEach(revertStaged);
         stageServerDeletions(routes.staged, new Set([server.id]));
-        done();
+        done(false);
         return;
       }
       const id = routes.directIds[0];
@@ -184,14 +186,14 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
         async () => {
           await api.server.delete(id, fallback);
           split.revertEntryIds.forEach(revertStaged);
-          done();
+          done(true);
         },
         () => t('nodes.deleteFail'),
       );
     },
     [
       diskServers,
-      notify,
+      clearNotice,
       policy,
       runWrite,
       revertStaged,
@@ -283,7 +285,9 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
                 stageServerDeletions(routes.staged, ids, groupId);
               }
               exitBatch();
-              notify({ tone: 'ok', text: t('nodes.batchDeleteOk', { count: ids.size }) });
+              clearNotice();
+              const completed = routes.directIds.length + split.revertEntryIds.length;
+              if (completed > 0) toast.success(t('nodes.batchDeleteOk', { count: completed }));
             },
             () => t('nodes.deleteFail'),
           );
@@ -292,10 +296,10 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
     },
     [
       confirm,
+      clearNotice,
       diskServers,
       dismiss,
       exitBatch,
-      notify,
       policy,
       runWrite,
       revertStaged,
@@ -333,20 +337,21 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
               groupId,
             });
             stageServerDeletions(targets, removedIds, groupId);
-            notify({ tone: 'ok', text: t('nodes.subDeleteOk', { count }) });
+            clearNotice();
             return;
           }
           void runWrite(
             async () => {
               await api.subscription.delete(sub.id);
-              notify({ tone: 'ok', text: t('nodes.subDeleteOk', { count }) });
+              clearNotice();
+              toast.success(t('nodes.subDeleteOk', { count }));
             },
             () => t('nodes.deleteFail'),
           );
         },
       });
     },
-    [confirm, diskServers, dismiss, notify, runWrite, stage, stageServerDeletions, stagingEnabled, t],
+    [confirm, clearNotice, diskServers, dismiss, runWrite, stage, stageServerDeletions, stagingEnabled, t],
   );
 
   return { deleteNode, deleteBatch, deleteSubscription, removeWarpNode };

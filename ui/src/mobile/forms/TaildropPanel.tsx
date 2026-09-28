@@ -79,6 +79,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import { IpcError } from '@/ipc/ipc-client';
 import type { TaildropInbox, TaildropTaskSnapshot } from '@/contracts/taildrop';
 import { fmtBytes } from '@/components/screens/shared/format';
@@ -232,9 +233,7 @@ export function TaildropPanel({
         const r = await api.server.taildropSave(serverId, name);
         /* 取消不是失败：用户按了保存框的取消，什么都不该提示。后端把那一档与「选好了位置但
            这台设备写不进去」**分开**报，正是为了让这里分得开。 */
-        if (!r.canceled && hasInstance(instanceId)) {
-          setNotice({ tone: 'ok', text: t('taildrop.saved') });
-        }
+        if (!r.canceled) toast.success(t('taildrop.saved'));
         await refresh();
       } catch (e) {
         console.error('[mobile-taildrop] save failed:', e);

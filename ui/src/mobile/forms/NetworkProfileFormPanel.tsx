@@ -34,6 +34,9 @@ import {
   type NetworkProfileFormError,
 } from '@/domain/network-profile';
 import { useConfig, type UseConfigResult } from '@/components/screens/settings/use-config';
+import { toast } from '@/lib/error-handler';
+import { editRoute } from '@/lib/staged-config';
+import { useStagingActive } from '@/store/use-staging-active';
 import { probeDisplayText, useResolvedProbes } from '@/components/screens/rules/network-profile-probes';
 import { MobileListEditor } from '../settings/SettingsChrome';
 import { mobileReasonKey } from '../screens/rules/network-profile-copy';
@@ -124,6 +127,7 @@ function ProfileForm({
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
+  const stagingEnabled = useStagingActive();
   const isEdit = base !== undefined;
 
   const [id] = useState(() => base?.id ?? `np-${crypto.randomUUID()}`);
@@ -186,6 +190,7 @@ function ProfileForm({
         await update({ networkProfiles: next }, { throwOnError: true });
         closeInstance(instanceId);
         onSaved?.(id);
+        if (editRoute('networkProfiles', stagingEnabled) === 'direct') toast.success(t('common.saved'));
       } catch (err) {
         console.error('[mobile-network-profile-form] save failed:', err);
         /* 表单可能已被关掉（异步 continuation）⇒ 先确认宿主还在再落回显。 */

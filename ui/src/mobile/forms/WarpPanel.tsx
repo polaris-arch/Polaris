@@ -56,6 +56,7 @@ import { useTranslation } from 'react-i18next';
    展开时新长出来的五个字段整段落在 `.m-form-body` 的视区之外。 */
 import { revealElement, useRevealAfterCommit } from '@/components/reveal';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
 import type { ServerConfig } from '@/contracts/types';
 import type { FormValue, FormValues, SelectOption } from '@/components/dialogs/field-spec';
 import {
@@ -125,8 +126,7 @@ export function WarpPanel({
   /**
    * 「重新注册 / 注销」那条腿。**复用节点屏那一份编排**（`mobile/nodes/node-deletion.ts`），
    * 本面板只提供它的四个出口：
-   *  · `notify` → 本面板的 `notice`（表单宿主的既定形态，见 `write-failure-visibility.test.ts`
-   *    FEEDBACK 表「表单宿主」那一行）。`warn` 在这张表上没有第四种语气，映到 `info`。
+   *  · `clearNotice` → 删除完成后清掉先前的失败；成功短 Toast 由共用删除腿发送。
    *  · `runWrite` → 一层 try/catch：**写调用本身住在 `node-deletion.ts` 里**，
    *    本文件不因此多出一处写腿。
    *  · `confirm` / `dismiss` → 表单栈的 `confirm` 那一支（**不是** `window.confirm`：
@@ -135,7 +135,6 @@ export function WarpPanel({
    */
   const deletion = useMobileNodeDeletion({
     t,
-    notify: (n) => setNotice({ tone: n.tone === 'warn' ? 'info' : n.tone, text: n.text }),
     runWrite: async (op, describe) => {
       try {
         await op();
@@ -144,6 +143,7 @@ export function WarpPanel({
         if (hasInstance(instanceId)) setNotice({ tone: 'err', text: describe(e) });
       }
     },
+    clearNotice: () => setNotice(undefined),
     confirm: (payload) => open({ kind: 'confirm', payload }),
     dismiss: closeInstance,
     exitBatch: () => {},
@@ -301,6 +301,7 @@ export function WarpPanel({
         await api.server.update(next);
         await loadConfig(true);
         closeInstance(instanceId);
+        toast.success(t('common.saved'));
         return;
       }
 
