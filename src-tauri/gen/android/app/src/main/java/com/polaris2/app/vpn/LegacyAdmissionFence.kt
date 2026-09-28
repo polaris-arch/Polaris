@@ -33,9 +33,13 @@ internal class LegacyAdmissionFence<Pending>(
         val reason: String? = null,
     )
 
-    fun <T> admit(action: () -> T): T? = synchronized(gate) {
-        if (fence != null) null else action()
+    data class Admission<T>(val rejectedByFence: Boolean, val value: T?)
+
+    fun <T> admitWithDecision(action: () -> T): Admission<T> = synchronized(gate) {
+        if (fence != null) Admission(true, null) else Admission(false, action())
     }
+
+    fun <T> admit(action: () -> T): T? = admitWithDecision(action).value
 
     fun requireOpen() = synchronized(gate) {
         check(fence == null) { "android: legacy system start 已被受管迁移屏障阻断" }

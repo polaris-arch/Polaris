@@ -946,6 +946,8 @@ internal object LegacySystemStartFence {
     )
 
     fun <T> admit(action: () -> T): T? = gate.admit(action)
+    fun <T> admitWithDecision(action: () -> T): LegacyAdmissionFence.Admission<T> =
+        gate.admitWithDecision(action)
     fun requireOpen() = gate.requireOpen()
 
     /** Internal primitive; a future coordinator must call this before publishing Preparing. */

@@ -9,6 +9,13 @@ enum class ServiceState {
     Stopping,
 }
 
+/** A fenced, unowned startForegroundService request still needs prompt Service teardown. */
+internal fun shouldStopSelfAfterFenceRejection(
+    rejectedByFence: Boolean,
+    state: ServiceState,
+    hasAttempt: Boolean,
+): Boolean = rejectedByFence && state == ServiceState.Stopped && !hasAttempt
+
 /**
  * 进程内广播的 action 名。
  *

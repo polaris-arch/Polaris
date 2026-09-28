@@ -12,6 +12,38 @@ import org.junit.Test
 class LegacyAdmissionFenceTest {
     private fun waitFor(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
 
+    @Test fun onlyFenceRejectedUnownedServiceStopsItself() {
+        val registry = MainKernelAttemptLedger()
+        val gate = LegacyAdmissionFence<String>(
+            detachPending = { null },
+            bridgeIdle = { true },
+            currentOwner = registry::ownerForDrain,
+        )
+        // An open gate can still yield no attempt (for example, another owner
+        // occupies the registry); that is not a fence rejection.
+        val ordinaryMiss = gate.admitWithDecision<Any?> { null }
+        assertFalse(ordinaryMiss.rejectedByFence)
+        assertFalse(shouldStopSelfAfterFenceRejection(
+            ordinaryMiss.rejectedByFence, ServiceState.Stopped, hasAttempt = false,
+        ))
+
+        gate.begin("fgs-fence")
+        val fenced = gate.admitWithDecision { error("fenced action must not run") }
+        assertTrue(fenced.rejectedByFence)
+        assertTrue(shouldStopSelfAfterFenceRejection(
+            fenced.rejectedByFence, ServiceState.Stopped, hasAttempt = false,
+        ))
+        assertFalse(shouldStopSelfAfterFenceRejection(
+            fenced.rejectedByFence, ServiceState.Started, hasAttempt = true,
+        ))
+        assertFalse(shouldStopSelfAfterFenceRejection(
+            fenced.rejectedByFence, ServiceState.Starting, hasAttempt = true,
+        ))
+        assertFalse(shouldStopSelfAfterFenceRejection(
+            fenced.rejectedByFence, ServiceState.Stopped, hasAttempt = true,
+        ))
+    }
+
     @Test fun pendingBridgeRequestBeforeServiceIsDetachedBeforeVacant() {
         val registry = MainKernelAttemptLedger()
         var pending: String? = "bridge-run"

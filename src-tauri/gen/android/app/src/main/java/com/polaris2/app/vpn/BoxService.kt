@@ -88,12 +88,12 @@ class BoxService(
     }
 
     fun onStartCommand(): Int {
-        val attempt = synchronized(this) {
-            if (state != ServiceState.Stopped || mainAttempt != null) null
+        val (attempt, stopUnowned) = synchronized(this) {
+            if (state != ServiceState.Stopped || mainAttempt != null) Pair(null, false)
             else {
                 val generation = SystemStart.generation()
                 val systemRunId = java.util.UUID.randomUUID().toString()
-                LegacySystemStartFence.admit {
+                val admission = LegacySystemStartFence.admitWithDecision {
                     val request = VpnBridge.currentStartRequest()
                     val next = MainKernelAttempt<CommandServer>(
                         generation,
@@ -110,9 +110,19 @@ class BoxService(
                         next
                     }
                 }
+                Pair(admission.value, shouldStopSelfAfterFenceRejection(
+                    admission.rejectedByFence, state, mainAttempt != null,
+                ))
             }
         }
         if (attempt == null) {
+            if (stopUnowned) {
+                // startForegroundService already committed the 5s FGS deadline.
+                // This instance owns no attempt, so stop it before that deadline.
+                Log.i(TAG, "迁移屏障拒绝起核意图，停止无主前台服务")
+                service.stopSelf()
+                return Service.START_NOT_STICKY
+            }
             // An existing attempt owns its bridge reply. A duplicate system intent
             // cannot reject that pending Start or clear its config.
             Log.i(TAG, "忽略重复起核意图，服务处于 $state 状态")
