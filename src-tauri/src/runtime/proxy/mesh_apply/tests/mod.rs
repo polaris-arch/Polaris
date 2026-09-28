@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 fn fixture() -> (MeshRouteState, ManagedMeshRoutePlan) {
     let raw: Value = serde_json::from_str(include_str!(
-        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+        "../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
     ))
     .unwrap();
     let mut state: MeshRouteState = serde_json::from_value(raw["meshRouteState"].clone()).unwrap();
@@ -43,7 +43,7 @@ fn fixture() -> (MeshRouteState, ManagedMeshRoutePlan) {
 
 fn compiled_plan(state: MeshRouteState, with_endpoint: bool) -> ManagedMeshRoutePlan {
     let raw: Value = serde_json::from_str(include_str!(
-        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+        "../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
     ))
     .unwrap();
     let policy: MeshRoutePolicy = serde_json::from_value(raw["meshRoutePolicy"].clone()).unwrap();
