@@ -808,6 +808,52 @@ fn endpoint_force_route_skipped_if_not_in_pending() {
 }
 
 #[test]
+fn diagnostic_budget_does_not_prune_a_valid_endpoint_route() {
+    let mut config = UserConfig::default();
+    config.proxy_mode = ProxyMode::Global;
+    let allowed_ips: Vec<String> = (0..=MAX_MESH_ROUTE_REPORT_CIDRS)
+        .map(|i| format!("10.{}.{}.1/32", i / 256, i % 256))
+        .collect();
+    config
+        .servers
+        .push(crate::user_config::server_config::ServerConfig {
+            id: "many-routes".into(),
+            name: "WG".into(),
+            protocol: Protocol::Wireguard,
+            address: "1.2.3.4".into(),
+            port: 443,
+            wireguard_settings: Some(Box::new(
+                crate::user_config::server_config::WireGuardSettings {
+                    allowed_ips: allowed_ips.clone(),
+                    allow_internet: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        });
+    let id_map = BTreeMap::from([("many-routes".into(), "WG".into())]);
+    let pending = [Endpoint {
+        type_field: "wireguard".into(),
+        tag: "WG".into(),
+        ..Default::default()
+    }];
+    let outcome = build_route_config_with_report(&config, &id_map, &deps_default(&pending));
+    assert!(outcome.mesh_route_diagnostics_limited);
+    assert_eq!(outcome.mesh_route_total_candidate_count, 1);
+    assert!(outcome.mesh_route_candidates.is_empty());
+    let emitted = outcome
+        .route
+        .rules
+        .iter()
+        .find(|rule| rule.outbound.as_deref() == Some("WG") && rule.ip_cidr.is_some())
+        .and_then(|rule| rule.ip_cidr.as_ref())
+        .expect("diagnostic limit must not remove the production route");
+    assert_eq!(emitted.len(), allowed_ips.len());
+    assert_eq!(emitted.first(), allowed_ips.first());
+    assert_eq!(emitted.last(), allowed_ips.last());
+}
+
+#[test]
 fn local_geo_rule_set_injected_when_srs_valid() {
     let mut config = UserConfig::default();
     config.proxy_mode = ProxyMode::Smart;

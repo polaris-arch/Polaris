@@ -139,6 +139,28 @@ pub(super) fn observed_addresses_of_event(event: &TailscaleStatusEvent) -> Vec<S
 }
 
 impl ProxyRuntime {
+    /// 诊断写代在实际文件写入前进入奇数、结束后回偶数；锁使并发写者不能互相抵消奇数窗口。
+    /// 这只影响报告证据，不改变文件内容或运行路由。
+    pub(super) fn write_tailnet_file_with_epoch(
+        &self,
+        path: &std::path::Path,
+        content: &str,
+        remove_on_error: bool,
+    ) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let _guard = self
+            .tailnet_file_write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.tailnet_file_write_epoch.fetch_add(1, Ordering::SeqCst);
+        let result = atomic_write_custom_rule(path, content);
+        if result.is_err() && remove_on_error {
+            let _ = std::fs::remove_file(path);
+        }
+        self.tailnet_file_write_epoch.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+
     /// tailnet rule-set 目录（`<configDir>/tailnet-rules`）。
     ///
     /// 落盘侧与 `generate_deps` 注入给 config-engine 的 `tailnet_rules_dir` **同源**（单一真值，
@@ -254,8 +276,7 @@ impl ProxyRuntime {
             if std::fs::read_to_string(&path).ok().as_deref() == Some(content.as_str()) {
                 continue;
             }
-            if let Err(e) = atomic_write_custom_rule(&path, &content) {
-                let _ = std::fs::remove_file(&path);
+            if let Err(e) = self.write_tailnet_file_with_epoch(&path, &content, true) {
                 log::warn!(
                     "tailnet 规则文件写失败，已删旧副本回退 inline：{}（{e}）",
                     path.display()
@@ -312,7 +333,7 @@ impl ProxyRuntime {
                 continue; // 值没变 → 不 rename，别白白惊动 fswatch。
             }
             let content = tailnet_rule_file_json(&merged);
-            if let Err(e) = atomic_write_custom_rule(&path, &content) {
+            if let Err(e) = self.write_tailnet_file_with_epoch(&path, &content, false) {
                 log::warn!(
                     "热更 tailnet 规则文件失败（本帧观测未生效，下一帧重试）：{}（{e}）",
                     path.display()

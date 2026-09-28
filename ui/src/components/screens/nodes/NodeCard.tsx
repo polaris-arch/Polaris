@@ -31,6 +31,7 @@ import { useLatencyStore } from '@/store/use-latency-store';
 import { useAppStore } from '@/store/app-store';
 import { latLevel } from '@/components/screens/shared/format';
 import { isMeshNode, isAccountBasedProtocol } from '@/domain/endpoint-routes';
+import type { MeshNodeRouteBadge } from '@/domain/mesh-route-badges';
 import { tsAccountLabel } from '@/domain/tailscale-conn-state';
 import { invalidNodeReasonText } from '@/domain/invalid-node-reason';
 import { useHoverCard, HoverCardPanel } from '@/components/hover-cards/HoverCard';
@@ -113,15 +114,10 @@ export interface NodeCardProps {
   speedTestable?: boolean;
   /** 不可测时的原因说明（已本地化）：置灰不给理由等于没说话，用户只会反复点。 */
   speedTestBlockedHint?: string;
-  /**
-   * 本节点中**被更早组网节点抢占**、因而不会实际生效的网段（抢占者 id 已解析成显示名）。
-   * 一条 ip_cidr 只能指向一个 outbound，后来者静默失效——不显式标出来，用户会以为两个节点都在路由这段。
-   *
-   * 真值源是后端**本次实际结算**（`endpoint_force_route_report` → `nodes-logic.shadowedCidrNamed`），
-   * 不是渲染端重算。故「未传」的含义是**报告还没到 / 读不到**，与「报告说没冲突」在这一层已经
-   * 合流成同一件事：两种情形都不画角标，卡片也不画任何「无冲突」字样 —— 节点卡没有表达
-   * 「我确认过没问题」的位置，那句话的归宿是设置页的「组网网段结算」块。
-   */
+  /** S2 同代报告的本层证据；未知与未见覆盖不能合并。 */
+  meshRouteBadge?: MeshNodeRouteBadge;
+  serverNameById?: ReadonlyMap<string, string>;
+  /** 旧结算测试的兼容属性；生产节点屏只传 meshRouteBadge。 */
   shadowedCidrs?: { cidr: string; by: string }[];
   /** 选中态（多选批选）。 */
   selected?: boolean;
@@ -193,6 +189,8 @@ function NodeCardView({
   lanOnly,
   speedTestable,
   speedTestBlockedHint,
+  meshRouteBadge,
+  serverNameById,
   shadowedCidrs,
   selected,
   batchMode,
@@ -258,6 +256,10 @@ function NodeCardView({
   // 「被覆盖」角标：cidr 全列（用户要据此去重/调序），抢占者去重后列出（同一节点可能抢多段）。
   const shadowText = shadowedCidrs?.map((s) => s.cidr).join(', ') ?? '';
   const shadowBy = [...new Set(shadowedCidrs?.map((s) => s.by) ?? [])].join(', ');
+  const knownBlocks = meshRouteBadge?.kind === 'blocked' ? meshRouteBadge.blocks : [];
+  const knownBlockCidrs = knownBlocks.map((block) => block.cidr).join(', ');
+  const knownBlockOwners = [...new Set(knownBlocks.map((block) =>
+    serverNameById?.get(block.byServerId) ?? t('settings.tun.meshEvidence.unknownNode')))].join(', ');
   // 国旗水印：仅代理协议节点（非组网/端点协议）按名称猜中国家才显示，原型注释「mesh/globe get none」。
   const flagCode = isExit ? null : flagCodeForName(server.name);
 
@@ -340,7 +342,19 @@ function NodeCardView({
             {t('nodes.lanOnly')}
           </span>
         )}
-        {shadowedCidrs && shadowedCidrs.length > 0 && (
+        {meshRouteBadge?.kind === 'blocked' && (
+          <span className="nd-cap shadow" data-tip={`${t('nodes.meshRouteBlockedHint', {
+            cidrs: knownBlockCidrs, by: knownBlockOwners,
+          })}${meshRouteBadge.incomplete ? ` ${t('nodes.meshRouteIncomplete')}` : ''}`}>
+            {t('nodes.meshRouteBlocked')}
+          </span>
+        )}
+        {meshRouteBadge?.kind === 'unknown' && (
+          <span className="nd-cap" data-tip={t('nodes.meshRouteUnknownHint')}>
+            {t('nodes.meshRouteUnknown')}
+          </span>
+        )}
+        {meshRouteBadge === undefined && shadowedCidrs && shadowedCidrs.length > 0 && (
           <span
             className="nd-cap shadow"
             data-tip={t('nodes.shadowedHint', {

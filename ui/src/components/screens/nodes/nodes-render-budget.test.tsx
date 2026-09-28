@@ -301,12 +301,9 @@ describe('门 1 · NodeCard = memo + 调用点零分配', () => {
     }
   });
 
-  it('`shadowedCidrs` 走一次算好的索引，不在 map 里就地造新数组', () => {
-    // 就地 `shadowedIndex.get(id)?.map(...)`（原状）每次父渲染都造新数组 ⇒ 冲突节点的卡恒不 bail-out。
-    // 就地取用的那一行随 `<NodeCard>` 调用点一起搬进了 `NodesGrid.tsx`；`shadowedNamed` 本体的
-    // useMemo 仍留在 NodesScreen（作为 prop 传下去），两处取材面各按落点分开断言。
-    expect(GRID).toContain('const shadowed = shadowedNamed.get(server.id);');
-    expect(NODES).toMatch(/const shadowedNamed = useMemo\(/);
+  it('路由证据走一次算好的索引，不在 map 里就地造新数组', () => {
+    expect(GRID).toContain('const meshRouteBadge = meshRouteBadges.get(server.id);');
+    expect(NODES).toMatch(/const meshRouteBadges = useMemo\(/);
   });
 });
 

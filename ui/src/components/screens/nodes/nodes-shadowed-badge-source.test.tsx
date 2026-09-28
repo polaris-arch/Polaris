@@ -258,6 +258,7 @@ const NODES = code(NODES_RAW);
 const LOGIC = code(LOGIC_RAW);
 const GRID = code(read('./NodesGrid.tsx'));
 const CARD = code(read('./NodeCard.tsx'));
+const BADGES = code(read('../../../domain/mesh-route-badges.ts'));
 const ROUTES = code(ROUTES_RAW);
 /** 节点屏的负向断言必须扫全部拆出的视图块，否则缺陷换个文件出现就检测不到。 */
 const SCREEN_ALL = [NODES, LOGIC, GRID, CARD].join('\n');
@@ -272,18 +273,22 @@ describe('接线 · 角标的真值源是后端报告，渲染端不得再重算
     expect(ROUTES).toContain('export function meshForceRoutedServers');
   });
 
-  it('NodesScreen 拉 `endpoint_force_route_report`，并把它原样喂给角标', () => {
+  it('NodesScreen 拉 S2 报告并逐卡投影，旧估算不再接生产角标', () => {
     expect(NODES).toContain('api.config');
-    expect(NODES).toContain('.endpointForceRouteReport()');
-    expect(NODES).toMatch(/const shadowedNamed = useMemo\(/);
-    expect(NODES).toContain('shadowedCidrNamed(forceRouteReport, serverNameById)');
+    expect(NODES).toContain('.meshRouteReport()');
+    expect(NODES).toMatch(/const meshRouteBadges = useMemo\(/);
+    expect(NODES).toContain('meshNodeRouteBadge(reportForDisplayedMeshNode(meshRouteState.report, savedConfig, server), server.id)');
+    expect(NODES).not.toContain('.endpointForceRouteReport()');
+    expect(GRID).toContain('meshRouteBadge={meshRouteBadge}');
+    expect(BADGES).toContain("if (report === null || !applied(report)) return { kind: 'unknown' }");
   });
 
-  it('角标读的是报告的 `absorbed`，不是任何本地推算', () => {
+  it('旧结算兼容投影仍读 `absorbed`，不供生产节点屏调用', () => {
     expect(LOGIC).toContain('report.servers');
     expect(LOGIC).toContain('s.absorbed');
     // 拿不到报告时**返回空表**，不是退回重算 —— 这一行就是空态纪律本身。
     expect(LOGIC).toMatch(/if \(report === null\) return named;/);
+    expect(NODES).not.toContain('shadowedCidrNamed(');
   });
 
   it('节点屏一行本地重算都不剩（判据 4 的常驻形态）', () => {

@@ -237,7 +237,9 @@ export interface RuleItemProps {
    * （**fail-closed**：生成配置时该条件会被整条跳过 → 规则静默失效）。
    */
   hasMissingResource?: boolean;
-  /** 角标②：本规则的 ipCidr 与组网 force-route 段重叠（判据 `domain/mesh-rule-overlap.meshOverlapRuleIds`）。 */
+  /** S2 运行证据的规则 CIDR 重叠状态；unknown 不得折成无冲突。 */
+  meshRouteEvidence?: 'overlap' | 'unknown' | 'none';
+  /** 旧组件测试兼容属性；生产规则屏使用 meshRouteEvidence。 */
   hasMeshOverlap?: boolean;
   /**
    * 角标③：`action==='proxy'` 且指定了 `targetServerId`，但该节点已被删除 → 运行时回退为跟随全局。
@@ -296,6 +298,7 @@ export function RuleItem({
   targetNodeName,
   dnsActionName,
   hasMissingResource,
+  meshRouteEvidence,
   hasMeshOverlap,
   targetMissing,
   stagedOnly,
@@ -412,7 +415,17 @@ export function RuleItem({
               {t('home.stagedOnlyBadge')}
             </span>
           )}
-          {hasMeshOverlap && (
+          {meshRouteEvidence === 'overlap' && (
+            <span className="pill region" data-tip={t('rules.meshEvidenceOverlapTip')}>
+              {t('rules.meshEvidenceOverlap')}
+            </span>
+          )}
+          {meshRouteEvidence === 'unknown' && (
+            <span className="pill" data-tip={t('rules.meshEvidenceUnknownTip')}>
+              {t('rules.meshEvidenceUnknown')}
+            </span>
+          )}
+          {meshRouteEvidence === undefined && hasMeshOverlap && (
             <span className="pill region" data-tip={t('rules.meshOverlapTip')}>
               {t('rules.meshOverlap')}
             </span>

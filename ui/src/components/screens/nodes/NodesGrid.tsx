@@ -5,6 +5,7 @@ import { isMeshNode, meshAllowsInternet, type SpeedTestCaps } from '@/domain/end
 import { willRestartOnSelect } from '@/components/screens/home/pending-select-hint';
 import { speedTestBlockReason } from './nodes-logic';
 import { NodeCard } from './NodeCard';
+import type { MeshNodeRouteBadge } from '@/domain/mesh-route-badges';
 import type { NodeUseVia } from './nodes-logic';
 
 interface Props {
@@ -18,7 +19,8 @@ interface Props {
   activeGroup: ServerGroup | undefined;
   speedTestCaps: SpeedTestCaps;
   stagedOnly: ReadonlySet<string>;
-  shadowedNamed: Map<string, { cidr: string; by: string }[]>;
+  meshRouteBadges: ReadonlyMap<string, MeshNodeRouteBadge>;
+  serverNameById: ReadonlyMap<string, string>;
   selectedServerId: string | null | undefined;
   selectedIds: ReadonlySet<string>;
   batchMode: boolean;
@@ -47,7 +49,8 @@ export function NodesGrid({
   activeGroup,
   speedTestCaps,
   stagedOnly,
-  shadowedNamed,
+  meshRouteBadges,
+  serverNameById,
   selectedServerId,
   selectedIds,
   batchMode,
@@ -82,7 +85,7 @@ export function NodesGrid({
           const isMesh = activeGroup?.isMesh || isMeshNode(server);
           const lanOnly = isMesh && !meshAllowsInternet(server);
           const blockReason = speedTestBlockReason(server, speedTestCaps, stagedOnly.has(server.id));
-          const shadowed = shadowedNamed.get(server.id);
+          const meshRouteBadge = meshRouteBadges.get(server.id);
           return (
             <NodeCard
               key={server.id}
@@ -92,7 +95,8 @@ export function NodesGrid({
               lanOnly={lanOnly}
               speedTestable={blockReason === null}
               speedTestBlockedHint={blockReason ? blockedHint(blockReason) : undefined}
-              shadowedCidrs={shadowed}
+              meshRouteBadge={meshRouteBadge}
+              serverNameById={serverNameById}
               selected={selectedIds.has(server.id)}
               batchMode={batchMode}
               invalidReason={invalidIndex[server.id]}

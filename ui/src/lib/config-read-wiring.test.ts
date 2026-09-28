@@ -256,6 +256,18 @@ const SITES: readonly Site[] = [
     route: 'disk',
     why: '对账类：网段结算命令读已保存配置；刷新键与节点名必须使用同一磁盘快照，不能混入设置页的暂存回显',
   },
+  {
+    file: 'components/screens/nodes/NodesScreen.tsx',
+    shape: 'useAppStore((s)=>s.config)',
+    route: 'disk',
+    why: '对账类：仅以已保存配置变化刷新运行期组网报告；节点列表仍用 useEffectiveServers 展示暂存编辑',
+  },
+  {
+    file: 'components/screens/rules/RulesScreen.tsx',
+    shape: 'useAppStore((s)=>s.config)',
+    route: 'disk',
+    why: '对账类：以已保存配置变化刷新运行期组网报告；规则及节点展示仍读 effective，角标另与磁盘规则 CIDR 对账',
+  },
 
   {
     file: 'components/screens/rules/RulesScreen.tsx',

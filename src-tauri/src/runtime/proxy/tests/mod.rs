@@ -39,6 +39,7 @@ mod core_log;
 mod hot_switch;
 mod lifecycle;
 mod login_fallback;
+mod mesh_route_report;
 mod module_boundary;
 mod network_monitor;
 mod network_profile;

@@ -36,6 +36,7 @@ mod hot_switch;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
+mod mesh_route_report;
 mod network_canary;
 mod network_monitor;
 mod network_settle;
@@ -86,6 +87,7 @@ use hot_switch::{PendingSwitch, SwitchSnapshot};
 // 进 `startup.rs`，façade 侧已如期下线。
 pub use lifecycle::ProxyLifecycleEvent;
 use login_fallback::LoginFallbackState;
+use mesh_route_report::MeshRouteRunEvidence;
 use network_settle::NetworkSettleGate;
 pub use pending_changes::PendingChangesSummary;
 #[cfg(test)]
@@ -1292,6 +1294,11 @@ pub struct ProxyRuntime {
     /// 下次起核的 TUN 排除面（`builder::inbounds` 的 `engaged_mesh` 只吃这个 map，不读文件）
     /// 看不见观测地址 —— 那正是 2026-09-11 那次事故里用户的原始症状。
     observed_tailnet: RwLock<std::collections::BTreeMap<String, Vec<String>>>,
+    /// 只读路由审计：仅存本轮实际生成的 CIDR/文件基线，不存凭据或整份 sing-box config。
+    mesh_route_run: RwLock<Option<MeshRouteRunEvidence>>,
+    /// 本进程 tailnet 文件成功写入/失败尝试的单调代；变更后不再宣称 startupReady。
+    tailnet_file_write_epoch: AtomicU64,
+    tailnet_file_write_lock: Mutex<()>,
     /// 系统代理 controller + marker 生命周期 + residual 会话门闩的唯一 owner。
     /// 同步 OS 操作的 blocking 隔离与幂等门控全部收敛在 `proxy/system_takeover.rs`。
     system_proxy: SystemProxyTakeover,
@@ -1488,6 +1495,9 @@ impl ProxyRuntime {
             stale_sweep_runs: AtomicUsize::new(0),
             custom_rule_files_degraded: AtomicBool::new(false),
             observed_tailnet: RwLock::new(std::collections::BTreeMap::new()),
+            mesh_route_run: RwLock::new(None),
+            tailnet_file_write_epoch: AtomicU64::new(0),
+            tailnet_file_write_lock: Mutex::new(()),
             system_proxy: SystemProxyTakeover::new(proxy_clearer),
             tunnel_conflicts: RwLock::new(tunnel_conflict::TunnelConflictSnapshot::NotProbed),
             error_emitter: std::sync::OnceLock::new(),

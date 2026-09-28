@@ -51,15 +51,19 @@ describe('接线 · 「覆盖组网」角标的真值源是后端报告', () => 
     expect(OVERLAP).toContain('export function forceRoutedCidrsFromReport');
   });
 
-  it('规则屏拉 `endpoint_force_route_report`，并把它原样喂给角标判据', () => {
+  it('规则屏拉 S2 报告并保留三态，旧估算不再接生产角标', () => {
     expect(SCREEN).toContain('api.config');
-    expect(SCREEN).toContain('.endpointForceRouteReport()');
-    expect(SCREEN).toContain('forceRoutedCidrsFromReport(forceRouteReport)');
-    expect(SCREEN).toContain('meshOverlapRuleIds(rules, forceRoutedCidrsFromReport(forceRouteReport))');
+    expect(SCREEN).toContain('.meshRouteReport()');
+    expect(SCREEN).toContain('reportForSavedConfig(meshRouteState.report, savedConfig)');
+    expect(SCREEN).toContain('ruleMeshRouteEvidence(savedReport, rule, savedById.get(rule.id))');
+    expect(SCREEN).toContain('meshRouteEvidence={meshEvidenceByRule.get(rule.id)');
+    expect(SCREEN).not.toContain('.endpointForceRouteReport()');
   });
 
-  it('拉不到报告时留在 null（= 空段集 = 不标），不退回本地重算', () => {
-    expect(SCREEN).toMatch(/catch\(\(\)\s*=>\s*\{[^}]*setForceRouteReport\(null\)/);
+  it('无报告经过 latest-loader 与 unknown 投影，不退回本地重算', () => {
+    const BADGES = code(read('../../../domain/mesh-route-badges.ts'));
+    expect(SCREEN).toContain('createLatestReportLoader(');
+    expect(BADGES).toContain("if (report === null || !applied(report)) return 'unknown'");
   });
 
   it('规则屏一行本地重算都不剩', () => {

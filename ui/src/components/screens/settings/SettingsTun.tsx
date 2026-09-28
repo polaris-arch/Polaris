@@ -38,9 +38,9 @@ import { api } from '@/ipc';
 import { useAppStore } from '@/store/app-store';
 import type { TunExclusionPreview } from '@/contracts/tun-exclusion-preview';
 import type { TunnelConflictReport } from '@/contracts/tunnel-conflict-report';
-import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
+import type { MeshRouteReport } from '@/contracts/mesh-route-report';
 import { TunnelConflictBlock } from './TunnelConflictBlock';
-import { EndpointForceRouteBlock } from './EndpointForceRouteBlock';
+import { MeshRouteEvidenceBlock } from './MeshRouteEvidenceBlock';
 import { createLatestReportLoader, type ReportLoadState } from './latest-report-loader';
 import { ListEditor } from './ListEditor';
 import { bypassLanState, shellPlatformFromDataOs } from './settings-logic';
@@ -138,9 +138,10 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
    *
    * 拉取时机：
    *  - 外来隧道冲突：探测是**起核之后**的后台腿 ⇒ 跟着 `proxyRunning` 翻转重拉（同 DNS 接管报告）。
-   *  - 组网段结算：后端按已保存配置 + 可用运行期地址观测重算；相关配置或核起停改变时重拉，
+   *  - 组网路由证据：后端读取当前运行/持久化快照；已保存配置或核起停改变时重拉，
    *    不跟随每一帧 Tailscale 状态轮询，用户也可手动刷新。 */
   const proxyRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
+  const proxyStartTime = useAppStore((s) => s.proxyStatus?.startTime);
   const [tunnelConflicts, setTunnelConflicts] = useState<TunnelConflictReport | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -158,34 +159,25 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
     };
   }, [proxyRunning]);
 
-  // SettingsPage's `config` includes staged replay. The command reads disk config, so the
-  // refresh trigger and displayed node names must come from the unmodified saved snapshot.
+  // SettingsPage's `config` includes staged replay. Saved config only triggers refreshes and
+  // resolves displayed names; the report's own R version and load evidence determine its scope.
   const savedConfig = useAppStore((s) => s.config);
-  const forceRouteKey = useMemo(() => JSON.stringify(savedConfig && [
-    savedConfig.servers,
-    savedConfig.selectedServerId,
-    savedConfig.proxyMode,
-    savedConfig.configSchemaVersion,
-    savedConfig.trafficRules,
-    savedConfig.policyRules,
-    savedConfig.customRules,
-    savedConfig.routeRuleOrder,
-    savedConfig.appRoutingEnabled,
-    savedConfig.appRules,
-  ]), [savedConfig]);
-  const [forceRouteState, setForceRouteState] = useState<ReportLoadState<EndpointForceRouteReport>>({
+  // This command returns one backend-produced running/persisted evidence snapshot. Refresh only
+  // when the saved config or core generation changes, plus explicit user refresh; never derive
+  // ownership from the staged SettingsPage draft or poll each mesh status frame.
+  const [meshRouteState, setMeshRouteState] = useState<ReportLoadState<MeshRouteReport>>({
     report: null,
     loading: true,
     error: false,
   });
-  const forceRouteLoader = useMemo(() => createLatestReportLoader(
-    () => api.config.endpointForceRouteReport(),
-    setForceRouteState,
+  const meshRouteLoader = useMemo(() => createLatestReportLoader(
+    () => api.config.meshRouteReport(),
+    setMeshRouteState,
   ), []);
   useEffect(() => {
-    forceRouteLoader.refresh();
-    return () => forceRouteLoader.invalidate();
-  }, [forceRouteLoader, forceRouteKey, proxyRunning]);
+    meshRouteLoader.refresh();
+    return () => meshRouteLoader.invalidate();
+  }, [meshRouteLoader, savedConfig, proxyRunning, proxyStartTime]);
 
   const [mtuDraft, setMtuDraft] = useState(tun.mtu === undefined ? '' : String(tun.mtu));
   const [mtuInvalid, setMtuInvalid] = useState(false);
@@ -527,17 +519,16 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
         )}
       </SetBlock>
 
-      {/* 3.6 / 3.7 「谁在和我争同一网段」成对的两条只读报告。
-          前者是**别人的**隧道（独立 Tailscale 客户端 / 公司 VPN / ZeroTier），后者是**我自己的**
-          几个组网节点。两条的成因与自救动作都不一样，故各占一块、不合并。
+      {/* 外来隧道与当前组网路由证据分别由后端报告；新报告保留运行代/加载证据及
+          unknown，不能从前端配置推断实际承载。旧 endpoint 报告仅保留兼容 API。
           ⚠️ force-route 规则并不只在 TUN 模式发射（route.rules 对任何入站都生效），它落在本页
           是因为形态与「生效排除面」同源（后端跑真判据读回来），不是因为它属于 TUN。 */}
       <TunnelConflictBlock report={tunnelConflicts} />
-      <EndpointForceRouteBlock
-        report={forceRouteState.report}
-        loading={forceRouteState.loading}
-        error={forceRouteState.error}
-        onRefresh={() => forceRouteLoader.refresh()}
+      <MeshRouteEvidenceBlock
+        report={meshRouteState.report}
+        loading={meshRouteState.loading}
+        error={meshRouteState.error}
+        onRefresh={() => meshRouteLoader.refresh()}
         servers={savedConfig?.servers ?? []}
       />
 

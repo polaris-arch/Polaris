@@ -269,6 +269,12 @@ pub struct InvalidNode {
 pub struct GenerateOutcome {
     /// 生成的 sing-box config（与 [`generate_sing_box_config`] 返回值逐字节相同）。
     pub config: SingBoxConfig,
+    /// 本次最终 route builder 块 0c 的只读发射审计。
+    pub mesh_route_candidates: Vec<crate::builder::endpoint_routes::MeshRouteEmissionCandidate>,
+    pub mesh_route_total_candidate_count: usize,
+    pub mesh_route_diagnostics_limited: bool,
+    /// 最终 DNS 产物中的单个 tailscale owner；与 force-route claimant 是否参与无关。
+    pub mesh_route_dns_owner_server_id: Option<String>,
     /// 本次生成被 gate 剔除的节点。**空 Vec 是有意义的值**（= 本次无非法节点 → 渲染端据此清陈旧标灰），
     /// 调用方不得因「空就跳过」而吞掉它。
     pub invalid_nodes: Vec<InvalidNode>,
@@ -596,6 +602,27 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         &id_to_tag_map,
         &mut singbox,
     )?;
+    let mesh_route_dns_owner_server_id = singbox
+        .dns
+        .as_ref()
+        .and_then(|dns| {
+            dns.servers
+                .iter()
+                .find(|server| server.tag == "dns-tailscale")
+        })
+        .and_then(|server| server.endpoint.as_deref())
+        .filter(|tag| {
+            singbox
+                .endpoints
+                .as_ref()
+                .is_some_and(|items| items.iter().any(|endpoint| endpoint.tag == *tag))
+        })
+        .and_then(|tag| {
+            id_to_tag_map
+                .iter()
+                .find(|(_, actual_tag)| actual_tag.as_str() == tag)
+                .map(|(id, _)| id.clone())
+        });
 
     // ── 13. 调试日志（L3631-3634）───────────────────────────────────────────────
     let rule_set_count = singbox
@@ -636,6 +663,10 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
 
     Ok(GenerateOutcome {
         config: singbox,
+        mesh_route_candidates: route_outcome.mesh_route_candidates,
+        mesh_route_total_candidate_count: route_outcome.mesh_route_total_candidate_count,
+        mesh_route_diagnostics_limited: route_outcome.mesh_route_diagnostics_limited,
+        mesh_route_dns_owner_server_id,
         invalid_nodes,
         pruned_rule_set_tags: route_outcome
             .pruned_rule_set_tags

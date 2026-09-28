@@ -63,9 +63,10 @@ export function MeshJoinDialog({ onTsLogout, onWarpReregister, onWarpDeregister 
      就在这张卡上**（`kind:'taildrop'` 全仓只此一处 go），把它绑在第一个节点上 = 多节点用户永远
      进不去别的账号的收件箱。
 
-     形态按节点数分两支，刻意不新开弹窗、不造选择器：
-      - 0 / 1 个 ⇒ 与此前**逐像素相同**的单块 tile（零回归，由 MeshJoinDialog.ts-nodes.test.tsx 钉住）；
-      - ≥2 个   ⇒ 每个节点一行，各自带自己的 taildrop / 切换账号 / 登出，标题用节点名、副标题用
+     形态按节点数分两支，不新开弹窗、不造选择器：
+      - 0 个     ⇒ Tailscale tile 是新增入口；
+      - 1 个     ⇒ 保留原节点 tile 与三颗动作，另给独立新增入口；
+      - ≥2 个   ⇒ 每个节点一行，各自带自己的 taildrop / 切换账号 / 登出，另给新增入口；标题用节点名、副标题用
                   `tsAccountLabel`（登录名 · tailnet）区分是哪个账号 —— 同为「已登录」时，
                   节点名可能都叫 Tailscale，账号段才是能区分的那一维。 */
   const tsNodes = servers.filter((server) => server.protocol === 'tailscale');
@@ -174,17 +175,21 @@ export function MeshJoinDialog({ onTsLogout, onWarpReregister, onWarpDeregister 
               actions={tsActions(node)}
             />
           ))
-        ) : (
+        ) : singleTsNode ? (
           <Choice
             title="Tailscale"
-            description={singleTsNode
-              ? t('meshJoin.tsConfigured')
-              : t('meshJoin.tsNew')}
+            description={t('meshJoin.tsConfigured')}
             icon={<JoinIcon />}
-            onClick={() => go(singleTsNode ? { kind: 'ts-settings', serverId: singleTsNode.id } : { kind: 'ts-login' })}
-            actions={singleTsNode && tsActions(singleTsNode)}
+            onClick={() => go({ kind: 'ts-settings', serverId: singleTsNode.id })}
+            actions={tsActions(singleTsNode)}
           />
-        )}
+        ) : null}
+        <Choice
+          title={tsNodes.length === 0 ? 'Tailscale' : t('meshJoin.tsAdd')}
+          description={t('meshJoin.tsNew')}
+          icon={<JoinIcon />}
+          onClick={() => go({ kind: 'ts-login' })}
+        />
       </div>
 
       <div className="field-lbl field-lbl-info">

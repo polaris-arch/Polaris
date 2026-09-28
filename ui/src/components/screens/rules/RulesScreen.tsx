@@ -25,16 +25,14 @@ import {
 } from '@/store/app-store';
 import { api } from '@/ipc';
 import type { Rule, RegionRoutingConfig } from '@/contracts/types';
-import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
+import type { MeshRouteReport } from '@/contracts/mesh-route-report';
 import { effectiveRegionRouting } from '@/domain/region-routing';
 import {
   availableResourceTagSet,
   missingResourceRuleIds,
 } from '@/domain/rule-resource-refs';
-import {
-  forceRoutedCidrsFromReport,
-  meshOverlapRuleIds,
-} from '@/domain/mesh-rule-overlap';
+import { reportForSavedConfig, ruleMeshRouteEvidence } from '@/domain/mesh-route-badges';
+import { createLatestReportLoader, type ReportLoadState } from '@/components/screens/settings/latest-report-loader';
 import { duplicateRulePayload } from '@/domain/rule-duplicate';
 import { ruleDnsEffect, ruleRouteEffect } from '@/domain/rules';
 import { BUILTIN_NETENV_DHCP_ID, ruleProfileBadge } from '@/domain/network-profile';
@@ -183,46 +181,30 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
     return missingResourceRuleIds(planeRules, availableResTags);
   }, [planeRules, availableResTags]);
 
-  // 组网 force-route 段：真值源是后端**本次结算**（`endpoint_force_route_report`），渲染端不再
-  // 自己算一份。重算那份对 Tailscale 恒发两条硬编码 tailnet 常量，看不见自建控制面的真实前缀
-  // （实测 `32.0.0.0/24`），也看不见走外化 rule-set 腿的段 —— 而那正是自建 tailnet 唯一的腿。
-  // 完整理由见 `domain/mesh-rule-overlap.forceRoutedCidrsFromReport` 的头注。
-  //
-  // 拉取时机比节点屏那份**多一条规则面**：后端的 engaged 判定（`should_force_route_subnets`）
-  // 把「被规则显式指向的节点」也算 engaged，故规则改了段集就可能变。依赖数组沿用改动前那一份
-  // 的取材面（trafficRules / policyRules / customRules / appRules），不因换了真值源就悄悄收窄。
-  // 拉不到一律留在 `null` ⇒ 空段集 ⇒ **一个角标都不标**，与 `missingResIds` 那段同一条纪律：
-  // 宁可漏标，不可假警报。
+  // S2 实际报告给出本层已确认的有效段；无法取证时角标为 unknown，不能当无重叠。
+  // 规则列表可能含未保存编辑，比较前逐条核已保存规则的 CIDR，避免跨 D/R 拼接结论。
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
-  const [forceRouteReport, setForceRouteReport] =
-    useState<EndpointForceRouteReport | null>(null);
+  const proxyStartTime = useAppStore((s) => s.proxyStatus?.startTime);
+  const savedConfig = useAppStore((s) => s.config);
+  const [meshRouteState, setMeshRouteState] = useState<ReportLoadState<MeshRouteReport>>({
+    report: null, loading: true, error: false,
+  });
+  const meshRouteLoader = useMemo(() => createLatestReportLoader(
+    () => api.config.meshRouteReport(), setMeshRouteState,
+  ), []);
   useEffect(() => {
-    let cancelled = false;
-    api.config
-      .endpointForceRouteReport()
-      .then((next) => {
-        if (!cancelled) setForceRouteReport(next);
-      })
-      .catch(() => {
-        if (!cancelled) setForceRouteReport(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    config?.servers,
-    config?.selectedServerId,
-    config?.trafficRules,
-    config?.policyRules,
-    config?.customRules,
-    config?.appRules,
-    proxyRunning,
-  ]);
+    meshRouteLoader.refresh();
+    return () => meshRouteLoader.invalidate();
+  }, [meshRouteLoader, savedConfig, proxyRunning, proxyStartTime]);
 
-  const meshOverlapIds = useMemo(() => {
-    if (plane !== 'route' || !isSmartMode) return new Set<string>();
-    return meshOverlapRuleIds(rules, forceRoutedCidrsFromReport(forceRouteReport));
-  }, [plane, isSmartMode, rules, forceRouteReport]);
+  const meshEvidenceByRule = useMemo(() => {
+    if (plane !== 'route' || !isSmartMode) return new Map<string, 'none'>();
+    const savedReport = reportForSavedConfig(meshRouteState.report, savedConfig);
+    const savedById = new Map(diskRules.map((rule) => [rule.id, rule]));
+    return new Map(rules.map((rule) => [
+      rule.id, ruleMeshRouteEvidence(savedReport, rule, savedById.get(rule.id)),
+    ] as const));
+  }, [plane, isSmartMode, rules, diskRules, savedConfig, meshRouteState.report]);
 
   // 拖拽重排（原型 L5161 getAfter 算法）：落到 target 前插入。
   const [dragId, setDragId] = useState<string | null>(null);
@@ -770,7 +752,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
                   }
                   stagedOnly={stagedOnlyRuleIds.has(rule.id)}
                   hasMissingResource={missingResIds.has(rule.id)}
-                  hasMeshOverlap={meshOverlapIds.has(rule.id)}
+                  meshRouteEvidence={meshEvidenceByRule.get(rule.id) ?? 'none'}
                   networkProfileBadge={ruleProfileBadge(rule, networkProfiles, resolvedProbes)}
                   routeInactive={plane === 'route' && modeInactive && route !== null}
                   onToggle={handleToggle}

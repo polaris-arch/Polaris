@@ -855,6 +855,9 @@ impl ProxyRuntime {
             log::info!("起核入口即被接管（世代 {my_gen}）→ 让位");
             return Ok(self.status());
         }
+        if let Ok(mut route) = self.mesh_route_run.write() {
+            *route = None;
+        }
 
         // 分段耗时测量（仅测量，不影响任何判定/控制流）：入口墙钟 + 各段累加器。
         // 重试轮内的段按**所有尝试累计**，否则总计在发生重试时会漏掉前腿的真实成本。
@@ -1038,6 +1041,7 @@ impl ProxyRuntime {
             network_canary,
             binary,
             effective_user_config,
+            mesh_route_prepared,
         ) = loop {
             attempt += 1;
             // 轮首让位：退避已可中断，但被唤醒的腿仍会走到这里 —— 在**重新生成配置 / 写盘 / 重解析端口**
@@ -1147,8 +1151,21 @@ impl ProxyRuntime {
             let pruned_env_rules = gate.pruned_env_rules;
             // 本次写进配置的 canary 表（同上：随**这一次**的配置带出，探测对的是运行核）。
             let network_canary = gate.network_canary;
+            let gate_config_json = gate.config_json;
             let singbox_config = gate.config;
             let effective_user_config = gate.effective_user_config;
+            let mesh_route_prepared = self.prepare_mesh_route_run(
+                gate.mesh_route_candidates,
+                gate.mesh_route_total_candidate_count,
+                gate.mesh_route_diagnostics_limited,
+                gate.mesh_route_dns_owner_server_id,
+                &gate.invalid_nodes,
+                &user_config,
+                &singbox_config,
+                &config_path,
+                &gate_config_json,
+                my_gen,
+            );
             let config_gen_attempt_ms = t_config_gen.elapsed().as_millis();
             config_gen_ms += config_gen_attempt_ms;
             log::info!(
@@ -1404,6 +1421,7 @@ impl ProxyRuntime {
                             // 循环外紧接着就用它遮蔽 `user_config`，让出口自证 / 热切快照 / TS 逆表
                             // 三处按 id 反算 tag 时，算的是运行核里真实存在的那套 tag。
                             effective_user_config,
+                            mesh_route_prepared,
                         );
                     }
                     // 探测最长 3s，期间可能被接管 → 与 Dead/Timeout 两腿同款复查：世代变了就静默让位
@@ -1617,6 +1635,9 @@ impl ProxyRuntime {
         self.restart_deferred.store(false, Ordering::SeqCst);
         if let Ok(mut g) = self.status.write() {
             *g = new_status.clone();
+        }
+        if let Some(ready_at_ms) = new_status.start_time {
+            self.publish_mesh_route_run(mesh_route_prepared, ready_at_ms);
         }
         // A1：systemProxy 模式把 OS 系统代理指向本地 mixed 入站（127.0.0.1:mixedPort），否则流量不经核
         // = 表现「选直连也没启动」。放在**核已就绪之后**：核未就绪就设代理会把流量导向尚未服务的端口。
@@ -2895,7 +2916,7 @@ impl ProxyRuntime {
     ///
     /// 外层起核重试（端口重分配自愈）会重跑本函数。内核对某个节点的拒收是**确定性**的（同一个节点、
     /// 同一个核，判定不会变），故第 2 腿起无需重新发现，直接沿用 ⇒ 重试腿恒只付 1 次 check。
-    async fn generate_and_gate_with_runtime_bindings(
+    pub(super) async fn generate_and_gate_with_runtime_bindings(
         &self,
         user_config: &UserConfig,
         deps: &GenerateConfigDeps,
@@ -2925,7 +2946,7 @@ impl ProxyRuntime {
             // 核解析不到（首启未落核 / 单测未注入）→ 闸门无从判定，照原样下发（failOpen）。
             let Some(bin) = binary else {
                 return Ok(GateOutcome::assemble(
-                    gen_out, effective, peeled, checks_run, None,
+                    gen_out, effective, json, peeled, checks_run, None,
                 ));
             };
             let cache_record = kernel_gate_cache_record(bin, &gen_out.config);
@@ -2935,7 +2956,7 @@ impl ProxyRuntime {
             {
                 log::info!("起核内核闸门命中已接受的核/配置身份，跳过重复 sing-box check");
                 return Ok(GateOutcome::assemble(
-                    gen_out, effective, peeled, checks_run, None,
+                    gen_out, effective, json, peeled, checks_run, None,
                 ));
             }
             checks_run += 1;
@@ -2946,13 +2967,13 @@ impl ProxyRuntime {
                         self.remember_kernel_gate_cache(record);
                     }
                     return Ok(GateOutcome::assemble(
-                        gen_out, effective, peeled, checks_run, None,
+                        gen_out, effective, json, peeled, checks_run, None,
                     ));
                 }
                 PeelStep::Stop(why) => {
                     log::warn!("起核内核闸门停止剥离（放行到 spawn，由内核自己报错）：{why}");
                     return Ok(GateOutcome::assemble(
-                        gen_out, effective, peeled, checks_run, None,
+                        gen_out, effective, json, peeled, checks_run, None,
                     ));
                 }
                 PeelStep::Peel(r) => r,
@@ -2984,7 +3005,7 @@ impl ProxyRuntime {
                         rejection.detail
                     );
                     return Ok(GateOutcome::assemble(
-                        gen_out, effective, peeled, checks_run, None,
+                        gen_out, effective, json, peeled, checks_run, None,
                     ));
                 }
                 PeelTarget::Stalled { tag } => {
@@ -2993,7 +3014,7 @@ impl ProxyRuntime {
                         rejection.detail
                     );
                     return Ok(GateOutcome::assemble(
-                        gen_out, effective, peeled, checks_run, None,
+                        gen_out, effective, json, peeled, checks_run, None,
                     ));
                 }
                 PeelTarget::Blocked { id, tag } => {
@@ -3009,6 +3030,7 @@ impl ProxyRuntime {
                     return Ok(GateOutcome::assemble(
                         gen_out,
                         effective,
+                        json,
                         peeled,
                         checks_run,
                         Some((blocked, rejection.detail)),
@@ -3069,6 +3091,13 @@ impl ProxyRuntime {
 /// `ProxyRuntime::generate_and_gate` 的产物：**已落盘**的那份配置 + 本次全部剔除报告。
 pub(super) struct GateOutcome {
     pub(super) config: SingBoxConfig,
+    /// 与本轮闸门写入 runtime config 的字节完全相同，用于只读诊断核对。
+    pub(super) config_json: String,
+    pub(super) mesh_route_candidates:
+        Vec<polaris_config_engine::builder::endpoint_routes::MeshRouteEmissionCandidate>,
+    pub(super) mesh_route_total_candidate_count: usize,
+    pub(super) mesh_route_diagnostics_limited: bool,
+    pub(super) mesh_route_dns_owner_server_id: Option<String>,
     pub(super) pruned_rule_set_tags: Vec<String>,
     /// 网络场景规则报告（`GenerateOutcome::pruned_env_rules` 原样带出）。
     pub(super) pruned_env_rules: Vec<PrunedEnvRule>,
@@ -3116,12 +3145,18 @@ impl GateOutcome {
     fn assemble(
         outcome: GenerateOutcome,
         effective_user_config: UserConfig,
+        config_json: String,
         peeled: &BTreeMap<String, InvalidNode>,
         checks_run: u32,
         blocked: Option<(InvalidNode, String)>,
     ) -> Self {
         Self {
             config: outcome.config,
+            config_json,
+            mesh_route_candidates: outcome.mesh_route_candidates,
+            mesh_route_total_candidate_count: outcome.mesh_route_total_candidate_count,
+            mesh_route_diagnostics_limited: outcome.mesh_route_diagnostics_limited,
+            mesh_route_dns_owner_server_id: outcome.mesh_route_dns_owner_server_id,
             pruned_rule_set_tags: outcome.pruned_rule_set_tags,
             pruned_env_rules: outcome.pruned_env_rules,
             network_canary: outcome.network_canary,

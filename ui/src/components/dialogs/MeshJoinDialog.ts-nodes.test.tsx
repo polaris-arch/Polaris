@@ -9,9 +9,10 @@
  * **永远进不去自己的收件箱**，而且界面上看不出少了什么 —— 静默失效。
  *
  * 两条判据成对，缺一条都能被绕过：
- *  - **判据 1（零回归）**：恰好 1 个 TS 节点时，这张卡的结构与此前逐项相同（单块 tile、标题恒为
- *    `Tailscale`、三颗动作按钮同序同类名）。
- *  - **判据 2（各自寻址）**：≥2 个时每节点一行，**第 N 行的每颗按钮都携第 N 个节点的 id**。
+ *  - **判据 1（既有节点不变）**：恰好 1 个 TS 节点时，原 tile 标题仍为 `Tailscale`、三颗动作
+ *    按钮同序同类名；另有独立新增 tile。
+ *  - **判据 2（各自寻址）**：≥2 个时每节点一行，**第 N 行的每颗按钮都携第 N 个节点的 id**，
+ *    而新增 tile 永远不携既有 id。
  *    反向对照写在同一组断言里：第 1 行必须是 ts-a、第 2 行必须是 ts-b —— 改回 `.find()` 时
  *    整张卡只剩一行，「两行」那条当场转红。
  *
@@ -167,11 +168,11 @@ const tree = () => MeshJoinDialog(props) as unknown;
 const html = () => renderToStaticMarkup(<MeshJoinDialog {...props} />);
 
 // ════════════════════════════════════════════════════════════════════════════
-// 判据 1：恰好 1 个 TS 节点 ⇒ 与改动前结构逐项相同
+// 判据 1：恰好 1 个 TS 节点 ⇒ 保留原节点动作，另有独立新增入口
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('判据 1 —— 单个 Tailscale 节点：结构零回归', () => {
-  it('仍是单块 tile，标题恒为 `Tailscale`（不带节点名后缀）', () => {
+describe('判据 1 —— 单个 Tailscale 节点：既有动作和新增入口分离', () => {
+  it('原节点 tile 标题恒为 `Tailscale`，新增 tile 独立出现', () => {
     h.servers = [tsNode('ts-a', '家里')];
     const all = tiles(tree());
     const titles = all.map((el) => el.props.title);
@@ -179,6 +180,7 @@ describe('判据 1 —— 单个 Tailscale 节点：结构零回归', () => {
     expect(titles).toEqual([
       'Cloudflare WARP',
       'Tailscale',
+      'meshJoin.tsAdd',
       'OpenConnect',
       'OpenVPN',
       'WireGuard',
@@ -216,6 +218,15 @@ describe('判据 1 —— 单个 Tailscale 节点：结构零回归', () => {
     ]);
     buttons(ts.props.actions)[2].click();
     expect(logouts.map((n) => n.id)).toEqual(['ts-a']);
+  });
+
+  it('已有节点时新增 tile 始终走无 serverId 的新建路径', () => {
+    h.servers = [tsNode('ts-a', '家里')];
+    const add = tiles(tree()).find((el) => el.props.title === 'meshJoin.tsAdd')!;
+    expect(add.props.description).toBe('meshJoin.tsNew');
+    expect(buttons(add.props.actions)).toEqual([]);
+    (add.props.onClick as () => void)();
+    expect(h.opened).toEqual([{ kind: 'ts-login' }]);
   });
 
   it('0 个 TS 节点：仍是单块 tile、描述回 `meshJoin.tsNew`、无动作、点击去登录', () => {
@@ -259,6 +270,7 @@ describe('判据 2 —— 多个 Tailscale 节点：逐行各自寻址', () => {
       'Cloudflare WARP',
       'Tailscale · 家里',
       'Tailscale · 公司',
+      'meshJoin.tsAdd',
       'OpenConnect',
       'OpenVPN',
       'WireGuard',
@@ -315,6 +327,19 @@ describe('判据 2 —— 多个 Tailscale 节点：逐行各自寻址', () => {
     const rows = tiles(tree()).filter((el) => String(el.props.title).startsWith('Tailscale'));
     buttons(rows[1].props.actions)[0].click();
     expect(h.closes).toBe(1);
+  });
+
+  it('相同控制面仍列出两个既有节点，另可显式新建第三个身份', () => {
+    h.servers = [
+      { ...tsNode('ts-a', '家里'), tailscaleSettings: { controlUrl: 'https://control.example' } },
+      { ...tsNode('ts-b', '公司'), tailscaleSettings: { controlUrl: 'https://control.example' } },
+    ];
+    const all = tiles(tree());
+    expect(all.map((el) => el.props.title)).toEqual(expect.arrayContaining([
+      'Tailscale · 家里', 'Tailscale · 公司', 'meshJoin.tsAdd',
+    ]));
+    (all.find((el) => el.props.title === 'meshJoin.tsAdd')!.props.onClick as () => void)();
+    expect(h.opened).toEqual([{ kind: 'ts-login' }]);
   });
 
   it('三个节点也各自成行（不是「只放宽到两个」）', () => {

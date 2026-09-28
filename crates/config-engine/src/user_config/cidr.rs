@@ -6,6 +6,44 @@
 #![forbid(unsafe_code)]
 
 use crate::user_config::ip::is_ipv4;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+/// 诊断/归属报告的严格 CIDR 归一化入口。裸 IP 变主机段，主机位归零。
+/// 与旧配置兼容 parser 分开：报告不能把含混 IPv4（如 010.0.0.1）当成确定地址。
+pub fn normalize_cidr(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    let (address, prefix) = match text.split_once('/') {
+        Some((address, prefix)) if !prefix.is_empty() && !prefix.contains('/') => {
+            (address, Some(prefix.parse::<u8>().ok()?))
+        }
+        Some(_) => return None,
+        None => (text, None),
+    };
+    if let Ok(ip) = address.parse::<Ipv4Addr>() {
+        let bits = prefix.unwrap_or(32);
+        if bits > 32 {
+            return None;
+        }
+        let mask = if bits == 0 {
+            0
+        } else {
+            u32::MAX << (32 - bits)
+        };
+        return Some(format!("{}/{}", Ipv4Addr::from(u32::from(ip) & mask), bits));
+    }
+    let ip = address.parse::<Ipv6Addr>().ok()?;
+    let bits = prefix.unwrap_or(128);
+    if bits > 128 {
+        return None;
+    }
+    let mask = if bits == 0 {
+        0
+    } else {
+        u128::MAX << (128 - bits)
+    };
+    // fmt_v6 只输出十六进制组，保证 IPv4-mapped IPv6 仍可由旧差集 parser 读取。
+    Some(fmt_v6(u128::from(ip) & mask, u32::from(bits)))
+}
 
 /// IPv4 CIDR → (网络地址, 前缀)。非法 → None。无 /n 视 /32。上游 `parseIpv4Cidr`。
 fn parse_ipv4_cidr(cidr: &str) -> Option<(u32, u32)> {
