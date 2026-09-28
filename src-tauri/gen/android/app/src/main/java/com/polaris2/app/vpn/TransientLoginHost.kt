@@ -33,6 +33,7 @@ internal object TransientLoginHost {
     private val entries = mutableMapOf<String, Entry>()
     private val ownershipLock = Any()
     private val mainClaims = mutableMapOf<Any, Set<String>>()
+    private val mainClaimRevisions = mutableMapOf<Any, Long>()
 
     private fun stateDirectories(config: String): Set<String> {
         val endpoints = JSONObject(config).optJSONArray("endpoints") ?: return emptySet()
@@ -46,24 +47,37 @@ internal object TransientLoginHost {
     }
 
     /** Claims precede core startup and survive failures until its actual close succeeds. */
-    fun <T> withMainConfig(owner: Any, config: String, allowed: () -> Boolean = { true }, action: () -> T): T = synchronized(ownershipLock) {
-        check(allowed()) { "Android 主核生命周期已变化" }
+    fun <T> withMainConfig(owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean = { true }, action: () -> T): T = synchronized(owner.operationLock) {
         val directories = stateDirectories(config)
-        mainClaims[owner] = mainClaims[owner].orEmpty() + directories
-        val conflicts = synchronized(entries) { entries.values.filter { it.stateDirectories.any(directories::contains) } }
-        for (entry in conflicts) {
-            entry.cancelled = true
-            check(dispose(entry) == null) { "Android 旧登录实例尚未关闭" }
-            synchronized(entries) { if (entries[entry.id] === entry) entries.remove(entry.id) }
+        val revision = synchronized(ownershipLock) {
+            check(allowed()) { "Android 主核生命周期已变化" }
+            val next = (mainClaimRevisions[owner] ?: 0L) + 1L
+            mainClaimRevisions[owner] = next
+            mainClaims[owner] = mainClaims[owner].orEmpty() + directories
+            val conflicts = synchronized(entries) { entries.values.filter { it.stateDirectories.any(directories::contains) } }
+            for (entry in conflicts) {
+                entry.cancelled = true
+                check(dispose(entry) == null) { "Android 旧登录实例尚未关闭" }
+                synchronized(entries) { if (entries[entry.id] === entry) entries.remove(entry.id) }
+            }
+            next
         }
+        // The claim is visible to login instances. Stop does not take operationLock,
+        // so its terminal native Close can join this in-flight Start/Reload.
         val result = action()
-        mainClaims[owner] = directories
+        synchronized(ownershipLock) {
+            check(allowed() && mainClaims.containsKey(owner)) { "Android 主核生命周期已变化" }
+            if (mainClaimRevisions[owner] == revision) mainClaims[owner] = directories
+        }
         result
     }
 
-    fun closeMain(owner: Any, action: () -> Unit) = synchronized(ownershipLock) {
+    fun closeMain(owner: Any, action: () -> Unit) {
         action()
-        mainClaims.remove(owner)
+        synchronized(ownershipLock) {
+            mainClaims.remove(owner)
+            mainClaimRevisions.remove(owner)
+        }
     }
 
     fun start(id: String, config: String, done: (StartFailure?) -> Unit) {

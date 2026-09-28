@@ -102,8 +102,7 @@ class PolarisVpnService :
         }
 
         val pfd = builder.establish() ?: error("android: VPN 未授权或已被撤销")
-        boxService.fileDescriptor = pfd
-        return pfd.fd
+        return boxService.installTun(pfd)
     }
 
     private fun applyRoutes(builder: Builder, options: TunOptions) {

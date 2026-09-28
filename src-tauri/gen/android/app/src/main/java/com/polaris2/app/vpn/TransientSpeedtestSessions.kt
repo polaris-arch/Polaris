@@ -1,7 +1,8 @@
 package com.polaris2.app.vpn
 
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -22,6 +23,7 @@ internal class TransientSpeedtestSessions(
         var revoked = false
         var prepared = false
         var closeLaunched = false
+        var expiry: ScheduledFuture<*>? = null
         var state = "starting"
         val closed = CompletableFuture<Unit>()
     }
@@ -36,9 +38,9 @@ internal class TransientSpeedtestSessions(
     private var closedThrough = zeroSequence
     private val mainOwners = mutableSetOf<Any>()
     private var active: Entry? = null
-    private val timer = Executors.newSingleThreadScheduledExecutor {
+    private val timer = ScheduledThreadPoolExecutor(1) {
         Thread(it, "polaris-speedtest-timer").apply { isDaemon = true }
-    }
+    }.apply { removeOnCancelPolicy = true }
 
     fun start(id: String, engine: Engine, done: (String?) -> Unit) {
         val identity = parseIdentity(id)
@@ -81,7 +83,11 @@ internal class TransientSpeedtestSessions(
                 synchronized(lock) { entry.prepared = true; lock.notifyAll() }
             }
             if (failure != null) requestClose(entry)
-            else timer.schedule({ requestClose(entry) }, expiryMillis, TimeUnit.MILLISECONDS)
+            else synchronized(lock) {
+                if (active === entry && !entry.revoked) {
+                    entry.expiry = timer.schedule({ requestClose(entry) }, expiryMillis, TimeUnit.MILLISECONDS)
+                }
+            }
             done(failure)
         }, "polaris-speedtest-start").start()
     }
@@ -134,10 +140,11 @@ internal class TransientSpeedtestSessions(
 
     /** Claim first, revoke token second, wait boundedly, then enter main JNI. */
     fun <T> withMainStart(owner: Any, allowed: () -> Boolean, action: () -> T): T {
-        val previous = synchronized(lock) {
+        val (previous, createdClaim) = synchronized(lock) {
             check(allowed()) { "Android 主核生命周期已变化" }
-            mainOwners.add(owner)
-            active?.also { it.revoked = true; it.state = "closing" }
+            check(mainOwners.none { it !== owner }) { "Android 旧主核实例尚未确认关闭" }
+            val created = mainOwners.add(owner)
+            Pair(active?.also { it.revoked = true; it.state = "closing" }, created)
         }
         if (previous != null) {
             requestClose(previous)
@@ -146,13 +153,13 @@ internal class TransientSpeedtestSessions(
             } catch (_: Exception) {
                 synchronized(lock) {
                     if (active === previous) previous.state = "cleanupUnknown"
-                    mainOwners.remove(owner)
+                    if (createdClaim) mainOwners.remove(owner)
                 }
                 throw IllegalStateException("Android 临时测速 cleanupUnknown：主核启动已拒绝")
             }
         }
         if (!allowed()) {
-            synchronized(lock) { mainOwners.remove(owner) }
+            synchronized(lock) { if (createdClaim) mainOwners.remove(owner) }
             error("Android 主核生命周期已变化")
         }
         // If action constructs a native main server and fails, BoxService.closeMain retains
@@ -186,6 +193,8 @@ internal class TransientSpeedtestSessions(
                 entry.revoked = true
                 entry.state = "closing"
                 entry.closeLaunched = true
+                entry.expiry?.cancel(false)
+                entry.expiry = null
                 true
             }
         }

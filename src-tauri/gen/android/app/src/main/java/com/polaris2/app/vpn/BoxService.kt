@@ -30,10 +30,12 @@ import com.polaris2.app.MainActivity
 import com.polaris2.app.R
 import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
+import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.Notification
 import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.SystemProxyStatus
+import java.util.concurrent.TimeUnit
 
 /**
  * 内核生命周期：把 Android 的 Service 回调翻译成 libbox 的 CommandServer 生命周期。
@@ -46,8 +48,24 @@ class BoxService(
     private val service: Service,
     private val platformInterface: PlatformInterface,
 ) : CommandServerHandler {
-    /** VPN 载体在 openTun 成功后写进来。停服务时必须关它，否则系统认为隧道还在。 */
-    var fileDescriptor: ParcelFileDescriptor? = null
+    /** A late openTun after Stop must close its fd before returning to native code. */
+    fun installTun(descriptor: ParcelFileDescriptor): Int {
+        val previous = try {
+            synchronized(this) {
+                val attempt = mainAttempt
+                check(attempt != null && !attempt.revoked &&
+                    (state == ServiceState.Starting || state == ServiceState.Started)) {
+                    "旧主核已撤销，拒收迟到的 VPN fd"
+                }
+                attempt.installTun(descriptor)
+            }
+        } catch (error: Throwable) {
+            runCatching { descriptor.close() }
+            throw error
+        }
+        runCatching { previous?.close() }
+        return descriptor.fd
+    }
 
     @Volatile
     var state: ServiceState = ServiceState.Stopped
@@ -55,7 +73,8 @@ class BoxService(
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val notification = ServiceNotification(service)
-    private var commandServer: CommandServer? = null
+    @Volatile private var commandServer: CommandServer? = null
+    @Volatile private var mainAttempt: MainKernelAttempt<CommandServer>? = null
     private var receiverRegistered = false
 
     private val stopReceiver = object : BroadcastReceiver() {
@@ -69,23 +88,52 @@ class BoxService(
     }
 
     fun onStartCommand(): Int {
-        if (state != ServiceState.Stopped) {
-            // 桥若欠着一个起核回执而这一路走不下去了 —— 必须当场结账。静默返回等于让 Rust
-            // 侧一直等到桥超时，而「超时」与「服务拒绝重复起核」在那一侧完全不可区分。
-            // 没人欠回执（系统在隧道已在跑时重申 always-on）⇒ 只记日志，**不动**桥的 running 位。
-            VpnBridge.rejectPendingStart("android: 服务处于 $state 状态，拒绝重复起核")
+        val attempt = synchronized(this) {
+            if (state != ServiceState.Stopped || mainAttempt != null) null
+            else MainKernelAttempt<CommandServer>(SystemStart.generation()).also {
+                mainAttempt = it
+                state = ServiceState.Starting
+            }
+        }
+        if (attempt == null) {
+            // An existing attempt owns its bridge reply. A duplicate system intent
+            // cannot reject that pending Start or clear its config.
+            Log.i(TAG, "忽略重复起核意图，服务处于 $state 状态")
             return Service.START_NOT_STICKY
         }
         // 没有桥交来的配置 ⇒ 这是系统发起的起核（always-on / 开机接收器 / 进程被回收后重拉）。
         // 先在桥上记账（挡住并发的 `start`），配置在工作线程里由 SystemStart.load 读。
         if (VpnBridge.currentConfig() == null && !VpnBridge.beginSystemStart()) {
-            Log.w(TAG, "系统发起的起核撞上桥正忙，仍按系统起核处理")
+            Log.w(TAG, "系统发起的起核撞上桥正忙，拒绝本次起核")
+            attempt.skipPreparation()
+            if (VpnBridge.isStopping()) stopService(attempt)
+            else synchronized(this) {
+                if (mainAttempt === attempt) {
+                    mainAttempt = null
+                    state = ServiceState.Stopped
+                }
+            }
+            return Service.START_NOT_STICKY
         }
-        state = ServiceState.Starting
         // 先立前台通知：startForeground 的 5 秒窗口从 onStartCommand 起算，而内核起来要秒级。
-        notification.show(ServiceState.Starting, PROFILE_NAME)
-        registerStopReceiver()
-        Thread({ startKernel() }, "polaris-box-start").start()
+        try {
+            notification.show(ServiceState.Starting, PROFILE_NAME)
+            registerStopReceiver()
+            // A Stop broadcast sent before receiver registration has no target.
+            // Recheck the bridge after registration and take over that pending Stop.
+            if (VpnBridge.isStopping()) {
+                attempt.skipPreparation()
+                stopService(attempt)
+                return Service.START_NOT_STICKY
+            }
+            Thread({ startKernel(attempt) }, "polaris-box-start").start()
+        } catch (error: Throwable) {
+            attempt.skipPreparation()
+            synchronized(this) {
+                if (mainAttempt === attempt) VpnBridge.finishStart(error.message ?: "Android 起核线程创建失败")
+            }
+            stopService(attempt)
+        }
         return Service.START_NOT_STICKY
     }
 
@@ -101,84 +149,140 @@ class BoxService(
         stopService()
     }
 
-    private fun startKernel() {
+    private fun isStarting(attempt: MainKernelAttempt<CommandServer>): Boolean = synchronized(this) {
+        mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting
+    }
+
+    private fun startKernel(attempt: MainKernelAttempt<CommandServer>) {
         // 桥交来的那一份（经桥起核）；`null` = 系统发起的起核，配置读 Rust 落盘的同一份文件。
         val bridgeConfig = VpnBridge.currentConfig()
         try {
+            check(isStarting(attempt)) { "旧起核尝试已撤销" }
             val config = bridgeConfig ?: SystemStart.load(service)
             SystemEndpointGuard.requireSupported(config)
             PolarisApplication.ensureSetup()
-            TransientSpeedtestHost.withMainStart(this, { state == ServiceState.Starting }) {
-                TransientLoginHost.withMainConfig(this, config, { state == ServiceState.Starting }) {
-                    check(state == ServiceState.Starting) { "起核已被停核接管" }
+            TransientSpeedtestHost.withMainStart(attempt, { isStarting(attempt) }) {
+                TransientLoginHost.withMainConfig(attempt, config, { isStarting(attempt) }) {
+                    check(isStarting(attempt)) { "起核已被停核接管" }
                     DefaultNetworkMonitor.start()
-                    val server = CommandServer(this, platformInterface)
-                    commandServer = server
+                    check(isStarting(attempt)) { "起核已被停核接管" }
+                    val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), platformInterface)
+                    attempt.publish(server)
+                    synchronized(this) { if (mainAttempt === attempt) commandServer = server }
+                    check(isStarting(attempt)) { "起核已被停核接管" }
                     server.start()
                     // No login instance may hold this Tailscale state directory during main startup.
+                    check(isStarting(attempt)) { "起核已被停核接管" }
                     server.startOrReloadService(config, OverrideOptions())
                 }
             }
             synchronized(this) {
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
-                check(state == ServiceState.Starting) { "起核已被停核接管" }
+                check(mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting) { "起核已被停核接管" }
                 state = ServiceState.Started
                 StatsBridge.activateAll()
+                // The token check and bridge acknowledgement share Stop's lock.
+                VpnBridge.finishStart(null)
             }
-            mainHandler.post { notification.onStarted() }
+            mainHandler.post {
+                synchronized(this) {
+                    if (mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started) {
+                        notification.onStarted()
+                    }
+                }
+            }
             Log.i(TAG, "内核已启动")
-            // 结账必须排在 state=Started 之后：Rust 侧收到 resolve 就会立刻开始就绪门探测。
-            VpnBridge.finishStart(null)
             // 经桥起核成功 ⇒ 记下这一份，此后系统发起的起核才有配置可用。排在结账之后：它要读一次
             // 盘并算摘要，不该拖慢 Rust 侧的就绪门。失败只影响「系统起核可用性」，不影响本次连接。
             if (bridgeConfig != null) {
-                runCatching { SystemStart.remember(service, bridgeConfig) }
+                runCatching { SystemStart.remember(service, bridgeConfig, attempt.systemStartGeneration) {
+                    mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started
+                } }
                     .onFailure { Log.e(TAG, "记录起核配置失败，系统发起的起核将不可用", it) }
             }
         } catch (e: Throwable) {
+            attempt.skipPreparation()
             // 🔴 这条 catch 此前只 Log.e + stopService()，Rust 侧什么都收不到 —— 那正是
             // 「静默没起来」的现场。先结账（把内核原话带回去），再拆自己。
             Log.e(TAG, "内核启动失败", e)
             // 经桥起核失败：盘上那份已是这次失败的尝试，旧摘要作废。系统起核失败**不撤**准入：
             // 用户的意图没变（仍是「连着」），下一次系统重试 / 用户手动连接自然会覆盖。
-            if (bridgeConfig != null) SystemStart.forget(service, "经桥起核失败")
-            VpnBridge.finishStart(
-                e.message ?: e.toString(),
-                if (e is SystemEndpointGuard.Unsupported) SystemEndpointGuard.ERROR else PolarisVpnPlugin.ERR_STARTUP_FAILED,
-            )
-            stopService()
+            val current = synchronized(this) {
+                if (mainAttempt !== attempt || attempt.revoked || state != ServiceState.Starting) false
+                else {
+                    if (bridgeConfig != null) SystemStart.forget(service, "经桥起核失败")
+                    VpnBridge.finishStart(
+                        e.message ?: e.toString(),
+                        if (e is SystemEndpointGuard.Unsupported) SystemEndpointGuard.ERROR else PolarisVpnPlugin.ERR_STARTUP_FAILED,
+                    )
+                    true
+                }
+            }
+            if (current) stopService(attempt)
         }
     }
 
     // ── CommandServerHandler ────────────────────────────────────────────────────
 
+    private inner class AttemptHandler(
+        private val attempt: MainKernelAttempt<CommandServer>,
+        delegate: CommandServerHandler,
+    ) : CommandServerHandler by delegate {
+        override fun serviceStop() {
+            stopService(attempt)
+        }
+
+        override fun serviceReload() {
+            this@BoxService.serviceReload(attempt)
+        }
+    }
+
     override fun serviceStop() {
         stopService()
     }
 
-    override fun serviceReload() {
-        val server = commandServer ?: return
+    override fun serviceReload() { serviceReload(null) }
+
+    private fun serviceReload(expectedAttempt: MainKernelAttempt<CommandServer>?) {
+        val (attempt, server) = synchronized(this) {
+            val current = mainAttempt?.takeIf {
+                (expectedAttempt == null || it === expectedAttempt) && !it.revoked && state == ServiceState.Started
+            } ?: return
+            Pair(current, commandServer ?: return)
+        }
         // 系统发起的核没有桥配置 ⇒ 与起核同源，读 Rust 落盘的那一份。
         val config = VpnBridge.currentConfig()
             ?: runCatching { SystemStart.load(service) }.getOrElse {
-                server.setError("android: reload: ${it.message}")
+                setReloadError(attempt, server, it)
                 return
             }
         try {
             SystemEndpointGuard.requireSupported(config)
         } catch (error: Exception) {
-            server.setError("android: reload: ${error.message}")
+            setReloadError(attempt, server, error)
             return
         }
-        runCatching { TransientSpeedtestHost.withMainStart(this, { state == ServiceState.Started && commandServer === server }) {
-            TransientLoginHost.withMainConfig(this, config, { state == ServiceState.Started && commandServer === server }) {
+        runCatching { TransientSpeedtestHost.withMainStart(attempt, { synchronized(this) {
+            mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
+        } }) {
+            TransientLoginHost.withMainConfig(attempt, config, { synchronized(this) {
+                mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
+            } }) {
                 server.startOrReloadService(config, OverrideOptions())
             }
         } }
             .onFailure {
                 Log.e(TAG, "重载失败", it)
-                server.setError("android: reload: ${it.message}")
+                setReloadError(attempt, server, it)
             }
+    }
+
+    private fun setReloadError(attempt: MainKernelAttempt<CommandServer>, server: CommandServer, error: Throwable) {
+        synchronized(this) {
+            if (mainAttempt === attempt && !attempt.revoked && commandServer === server) {
+                runCatching { server.setError("android: reload: ${error.message}") }
+            }
+        }
     }
 
     // Android 没有「系统 HTTP 代理开关」这一层：VpnService.Builder.setHttpProxy 是随隧道一起
@@ -261,52 +365,91 @@ class BoxService(
     @Volatile private var closeFailed = false
 
     @Synchronized
-    private fun stopService() {
-        // 已有一条停机在飞：它自己会在末尾结账，这里再结一次会让 Rust 在 tun 还没拆完时就收到「已停」。
-        if (state == ServiceState.Stopping && !closeFailed) return
-        if (state == ServiceState.Stopped) {
-            // 服务早就没了（被系统回收 / 起核失败时已自行停过），但桥可能仍欠着一个停核回执。
-            // 结账才能让「本就没在跑」与「停不掉」在 Rust 侧区分开。
-            VpnBridge.finishStop()
+    private fun stopService(expectedAttempt: MainKernelAttempt<CommandServer>? = null) {
+        val attempt = mainAttempt
+        if (expectedAttempt != null && attempt !== expectedAttempt) return
+        if (state == ServiceState.Stopped && attempt == null) {
             return
         }
+        // A pending close owns this attempt. A second stop cannot start another native
+        // close or release its claims while the first job is still running.
+        if (state == ServiceState.Stopping && !closeFailed) return
+        if (attempt == null) {
+            return
+        }
+        if (attempt.closed.isDone) {
+            val failure = attempt.closed.getNow(null)
+            if (failure != null) VpnBridge.finishStop("android: 内核关闭失败")
+            return
+        }
+        val firstStop = state != ServiceState.Stopping
         closeFailed = false
         state = ServiceState.Stopping
-        // 当场封住新 CommandClient：Rust 的 running 位要等停核回执才清，
-        // 若收流延迟到工作线程，relay 能在间隙重开并读到拆核尾帧。
+        val detachedTun = attempt.revokeAndDetachTun()
         StatsBridge.closeAll()
         unregisterStopReceiver()
-        mainHandler.post { notification.close() }
-        Thread({
-            // 关 fd 必须排在关内核之前：内核的 tun 读写循环还持有它，先关服务会让那个循环
-            // 拿着一个已经无效的 fd 空转到超时。
-            runCatching { fileDescriptor?.close() }
-            fileDescriptor = null
-            DefaultNetworkMonitor.stop()
-            val closed = runCatching {
-                TransientSpeedtestHost.closeMain(this) {
-                    TransientLoginHost.closeMain(this) {
-                        commandServer?.let { server ->
-                            server.closeService()
-                            server.close()
-                        }
-                        commandServer = null
+        if (firstStop) {
+            mainHandler.post {
+                synchronized(this) {
+                    if (mainAttempt === attempt || (mainAttempt == null && state == ServiceState.Stopped)) {
+                        notification.close()
                     }
                 }
             }
-            if (closed.isFailure) {
-                commandServer?.setError("android: close service failed")
-                // Keep the ownership claim: an unconfirmed close cannot permit a second state writer.
+            attempt.closed.whenComplete { failure, error ->
+                onAttemptClosed(attempt, error ?: failure)
+            }
+            attempt.closeOnce { server ->
+                DefaultNetworkMonitor.stop()
+                TransientSpeedtestHost.closeMain(attempt) {
+                    TransientLoginHost.closeMain(attempt) {
+                        // Go's strict terminal close joins Start/OpenTun before this Java
+                        // descriptor can be released; OpenInterface duplicates it afterwards.
+                        try { server?.closeService() }
+                        finally { runCatching { detachedTun?.close() } }
+                        server?.close()
+                    }
+                }
+            }
+        }
+        Thread({
+            try {
+                attempt.closed.get(8, TimeUnit.SECONDS)
+            } catch (_: java.util.concurrent.TimeoutException) {
+                synchronized(this) {
+                    if (mainAttempt === attempt && state == ServiceState.Stopping && !attempt.closed.isDone) {
+                        closeFailed = true
+                        VpnBridge.finishStop("android: 主核 cleanupUnknown，关闭仍在进行")
+                    }
+                }
+            } catch (_: Exception) {
+                // onAttemptClosed reports confirmed native errors.
+            }
+        }, "polaris-main-close-timeout").start()
+    }
+
+    private fun onAttemptClosed(attempt: MainKernelAttempt<CommandServer>, failure: Throwable?) {
+        synchronized(this) {
+            if (mainAttempt !== attempt) return
+            if (failure != null) {
+                runCatching { commandServer?.setError("android: close service failed") }
                 closeFailed = true
                 VpnBridge.finishStop("android: 内核关闭失败")
-                return@Thread
+                return
             }
-            state = ServiceState.Stopped
-            // 结账排在 fd 关闭 + 内核关停**之后**：桥的回执语义是「隧道确实拆干净了」，
-            // 提前结账会让 Rust 侧在 tun 还在的时候就去起第二个核。
+            // The old attempt cannot settle a later bridge: new admission remains
+            // forbidden until this exact close result is acknowledged and cleared.
             VpnBridge.finishStop()
-            mainHandler.post { service.stopSelf() }
-        }, "polaris-box-stop").start()
+            commandServer = null
+            mainAttempt = null
+            state = ServiceState.Stopped
+            closeFailed = false
+        }
+        mainHandler.post {
+            synchronized(this) {
+                if (mainAttempt == null && state == ServiceState.Stopped) service.stopSelf()
+            }
+        }
     }
 
     private fun registerStopReceiver() {

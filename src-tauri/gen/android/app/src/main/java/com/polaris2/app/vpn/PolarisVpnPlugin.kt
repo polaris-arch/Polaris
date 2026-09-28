@@ -347,10 +347,17 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun stop(invoke: Invoke) {
         cancelVpnPermission()
         SystemStart.forget(activity, "应用请求停核")
-        if (!VpnBridge.beginStop(invoke)) {
-            // 本就没在跑 ⇒ 幂等成功。停核腿必须是幂等的：起核失败/重试腿都会先停一次。
-            invoke.resolve()
-            return
+        when (VpnBridge.beginStop(invoke)) {
+            VpnBridge.StopAdmission.AlreadyStopped -> {
+                // 本就没在跑 ⇒ 幂等成功。停核腿必须是幂等的。
+                invoke.resolve()
+                return
+            }
+            VpnBridge.StopAdmission.Busy -> {
+                invoke.reject("android: 主核关闭仍在进行，结果未知", "ANDROID_CORE_STOP_FAILED")
+                return
+            }
+            VpnBridge.StopAdmission.Started -> Unit
         }
         BoxService.requestStop(activity)
     }
@@ -971,6 +978,9 @@ internal object VpnBridge {
     @Synchronized
     fun currentConfig(): String? = config
 
+    @Synchronized
+    fun isStopping(): Boolean = stopping
+
     /** 结账起核：`error == null` 即成功。幂等（重复调用只记日志）。 */
     @Synchronized
     fun finishStart(error: String?, code: String = PolarisVpnPlugin.ERR_STARTUP_FAILED) {
@@ -991,13 +1001,16 @@ internal object VpnBridge {
         }
     }
 
-    /** `false` = 此刻本就没有在跑的核，调用方直接判幂等成功，不必真去停。 */
+    enum class StopAdmission { Started, AlreadyStopped, Busy }
+
+    /** A second request must not replace the first pending Stop acknowledgement. */
     @Synchronized
-    fun beginStop(invoke: Invoke): Boolean {
-        if (!running && !starting && !stopping) return false
+    fun beginStop(invoke: Invoke): StopAdmission {
+        if (stopping) return StopAdmission.Busy
+        if (!running && !starting) return StopAdmission.AlreadyStopped
         stopping = true
         pendingStop = invoke
-        return true
+        return StopAdmission.Started
     }
 
     /** 结账停核。服务无论因何停下（用户撤销授权 / 系统回收 / 我方请求）都必须走到这里。 */
@@ -1010,6 +1023,10 @@ internal object VpnBridge {
             // The core is not usable, but its ownership remains reserved until a later confirmed close.
             running = false
             stopping = true
+            val startInvoke = pendingStart
+            pendingStart = null
+            starting = false
+            startInvoke?.reject(error, PolarisVpnPlugin.ERR_STARTUP_FAILED)
             invoke?.reject(error, "ANDROID_CORE_STOP_FAILED")
             return
         }

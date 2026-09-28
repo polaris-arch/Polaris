@@ -52,6 +52,10 @@ internal object SystemStart {
 
     /** 「开机自动连接」开关（存在 ⇔ 开）。 */
     private const val BOOT_AUTO_CONNECT_FILE = "boot-auto-connect"
+    private var disconnectGeneration = 0L
+
+    @Synchronized
+    fun generation(): Long = disconnectGeneration
 
     private fun runtimeConfig(context: Context): File =
         File(File(context.dataDir, RUST_CONFIG_SUBDIR), RUST_RUNTIME_CONFIG_FILE)
@@ -71,7 +75,10 @@ internal object SystemStart {
      * 并**当场**报错日志 —— 这一形在「用户主动连接」这条最常走的路上就会自曝，不必等到开机那一刻。
      */
     @Synchronized
-    fun remember(context: Context, bridgeConfig: String) {
+    fun remember(context: Context, bridgeConfig: String, expectedGeneration: Long, allowed: () -> Boolean) {
+        // This check shares forget's monitor with the write. A late success from an
+        // attempt that predates user disconnect can never restore auto-start admission.
+        if (disconnectGeneration != expectedGeneration || !allowed()) return
         val file = runtimeConfig(context)
         val onDisk = runCatching { file.readBytes() }.getOrNull()
         val expected = sha256(bridgeConfig.toByteArray(Charsets.UTF_8))
@@ -92,6 +99,7 @@ internal object SystemStart {
     /** 用户主动断开（或其它「不应再自启」的时刻）：删摘要。幂等。 */
     @Synchronized
     fun forget(context: Context, why: String) {
+        disconnectGeneration++
         if (digestFile(context).delete()) Log.i(TAG, "已撤销系统发起起核的准入：$why")
     }
 

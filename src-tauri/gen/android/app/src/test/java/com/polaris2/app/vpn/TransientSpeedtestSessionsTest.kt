@@ -227,8 +227,10 @@ class TransientSpeedtestSessionsTest {
     @Test fun failedMainCloseRetainsClaimUntilConfirmedRetry() {
         val sessions = TransientSpeedtestSessions()
         val owner = Any()
+        val anotherOwner = Any()
         sessions.withMainStart(owner, { true }) {}
         assertTrue(runCatching { sessions.closeMain(owner) { error("native main close failed") } }.isFailure)
+        assertTrue(runCatching { sessions.withMainStart(anotherOwner, { true }) {} }.isFailure)
         val untouched = AtomicInteger()
         val engine = object : TransientSpeedtestSessions.Engine {
             override fun prepare() { untouched.incrementAndGet() }
@@ -239,6 +241,8 @@ class TransientSpeedtestSessionsTest {
         await(blocked)
         assertEquals(0, untouched.get())
         sessions.closeMain(owner) {}
+        sessions.withMainStart(anotherOwner, { true }) {}
+        sessions.closeMain(anotherOwner) {}
         val (admitted, _) = start(sessions, id(2), engine)
         await(admitted)
         assertEquals("running", sessions.status(id(2)))
@@ -333,5 +337,32 @@ class TransientSpeedtestSessionsTest {
         await(end)
         assertEquals(2_051, starts.get())
         assertEquals(2_051, closes.get())
+    }
+
+    @Test fun reloadLosesStartRaceButCannotReleaseExistingMainClaim() {
+        val sessions = TransientSpeedtestSessions()
+        val owner = Any()
+        sessions.withMainStart(owner, { true }) {}
+        val checks = AtomicInteger()
+        assertTrue(runCatching {
+            sessions.withMainStart(owner, { checks.getAndIncrement() == 0 }) {}
+        }.isFailure)
+        assertEquals(2, checks.get())
+        assertTrue(runCatching { sessions.withMainStart(Any(), { true }) {} }.isFailure)
+        val untouched = AtomicInteger()
+        val engine = object : TransientSpeedtestSessions.Engine {
+            override fun prepare() { untouched.incrementAndGet() }
+            override fun start() { untouched.incrementAndGet() }
+            override fun close() { untouched.incrementAndGet() }
+        }
+        val (blocked, _) = start(sessions, id(1), engine)
+        await(blocked)
+        assertEquals(0, untouched.get())
+        sessions.closeMain(owner) {}
+        val (admitted, result) = start(sessions, id(2), engine)
+        await(admitted)
+        assertEquals(null, result.get())
+        val (closed, _) = close(sessions, id(2))
+        await(closed)
     }
 }
