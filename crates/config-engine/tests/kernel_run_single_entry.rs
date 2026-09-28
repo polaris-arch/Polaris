@@ -137,7 +137,7 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
         ("crates/config-engine/tests/mesh_inbound_runtime.rs", 3, 2),
         (
             "crates/config-engine/tests/subscription_update_guard_runtime.rs",
-            1,
+            2,
             1,
         ),
     ];
@@ -219,6 +219,51 @@ fn only_the_local_gate_sets_the_no_kernel_run_switch() {
             "{rel} 出现了 POLARIS_NO_KERNEL_RUN —— CI 必须照常起核（覆盖交给 CI 的前提）"
         );
     }
+}
+
+/// 本机跳过的订阅安全真运行门必须在两条已拉核的 CI 腿上强制执行。
+#[test]
+fn subscription_guard_runtime_is_a_required_ci_kernel_gate() {
+    const COMMAND: &str =
+        "cargo test -p polaris-config-engine --test subscription_update_guard_runtime";
+    const NETWORK: &str = "cargo test -p polaris-config-engine --test network_profile_runtime";
+    const MESH: &str = "cargo test -p polaris-config-engine --test mesh_inbound_runtime";
+
+    let package = read_repo(".github/workflows/package.yml");
+    let fetch = package
+        .find("run: node scripts/fetch-core.mjs")
+        .expect("Package 未拉取随包核");
+    let network = package
+        .find(NETWORK)
+        .expect("Package 缺 network runtime 门");
+    let gate = package.find(COMMAND).expect("Package 缺订阅安全真运行门");
+    let mesh = package.find(MESH).expect("Package 缺 mesh runtime 门");
+    assert!(fetch < network && network < gate && gate < mesh);
+    assert!(
+        package.contains(&format!(
+            "- name: Subscription update guard rejects unsafe targets at runtime\n        if: env.POLARIS_RUN_KERNEL_GATES == '1'\n        env:\n          POLARIS_REQUIRE_KERNEL_GATE: '1'\n        run: {COMMAND}"
+        )),
+        "Package 订阅安全门必须受 run_kernel_gates 控制，且缺核时硬失败"
+    );
+
+    let risk = read_repo(".github/workflows/release-risk.yml");
+    let fetch = risk
+        .find("run: node scripts/fetch-core.mjs")
+        .expect("ReleaseRisk 未拉取随包核");
+    let mandatory = risk
+        .find("- name: Run mandatory bundled-core gates")
+        .expect("ReleaseRisk 缺强制核门步骤");
+    let network = risk
+        .find(NETWORK)
+        .expect("ReleaseRisk 缺 network runtime 门");
+    let gate = risk.find(COMMAND).expect("ReleaseRisk 缺订阅安全真运行门");
+    let mesh = risk.find(MESH).expect("ReleaseRisk 缺 mesh runtime 门");
+    assert!(fetch < mandatory && mandatory < network && network < gate && gate < mesh);
+    assert!(
+        risk[mandatory..network].contains("if: needs.classify.outputs.kernel == 'true'")
+            && risk[mandatory..network].contains("POLARIS_REQUIRE_KERNEL_GATE: '1'"),
+        "ReleaseRisk 订阅安全门必须位于 kernel 影响分支，且缺核时硬失败"
+    );
 }
 
 /// 切点自检：注释 / 字符串 / 原始字符串里的 `.arg("run")` 不命中；真调用（单参与数组）命中；
