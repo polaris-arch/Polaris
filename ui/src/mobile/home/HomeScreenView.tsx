@@ -892,7 +892,6 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                       **必须视觉可分** —— 那是检测引擎产出的唯一可行动差异。 */}
                   <i className={`h-stdot st-${s.result.status}`} aria-hidden="true" />
                 </span>
-                <span className="h-unlockname">{s.name}</span>
               </button>
             ))}
           </div>

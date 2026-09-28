@@ -46,8 +46,8 @@ const META: readonly UnlockServiceMeta[] = [
 /**
  * 上线集，按组序。
  *
- * **服务条数是数据，不是版式**（`unlock-detection.md`）：七项排两列会让最后一行只剩一个，
- * 那是对的，不是要设计掉的 bug。grok 哪天上线就是八项，网格必须容得下任意条数。
+ * **服务条数是数据，不是版式**（`unlock-detection.md`）：手机窄卡自动换行，
+ * 宽卡一行显示七项；若上线集改变，网格仍按实际服务数排布。
  */
 export const UNLOCK_SERVICES: readonly UnlockServiceMeta[] = META.filter((m) =>
   ENABLED_SERVICE_IDS.includes(m.id),

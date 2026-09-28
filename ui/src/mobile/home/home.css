@@ -926,15 +926,12 @@
   column-gap: 8px;
 }
 
-/* 条目是一颗真控件（点开服务详情）⇒ 走本文件既有的裸按钮基线：清掉 UA 外观、给触控下限、
-   关掉双击缩放延迟。`min-height` 取 `--tap-min`（48）而不是徽章的 28 —— 网格行距 13 之下
-   28 的行高够不到触控下限，那正是「看得见但按不准」。 */
+/* 条目是一颗真控件（点开服务详情）：徽章与圆点可见，服务名和状态留在可访问名称及详情。 */
 .h-unlock {
   display: flex;
   align-items: center;
-  gap: 6px; /* 徽章 → 名字 */
   min-width: 0;
-  min-height: var(--tap-min);
+  min-height: var(--mobile-tap, 44px);
   margin: 0;
   padding: 0;
   border: 0;
@@ -1043,16 +1040,6 @@
 
 .h-stdot.st-idle {
   opacity: 0.5;
-}
-
-.h-unlockname {
-  /* `type.label` compact 13.5（原型 `.ub`）。13.5/16 —— 这一档破了本仓 1/16rem 的取整惯例，
-     但 core.json 明写这批字号是从原型量出来的，以原型为准。 */
-  font-size: 0.84375rem;
-  color: hsl(var(--fg-dim));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* 服务详情弹层的两行。状态那一行是**文字**，不再画一颗彩色点：详情层就是为了把颜色通道

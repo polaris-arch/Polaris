@@ -3,6 +3,8 @@
   /* Mobile role-based density: the hit box stays separate from the painted control. */
   --mobile-control-font: .8125rem;
   --mobile-tap: 44px;
+  --mobile-action-hit: var(--mobile-tap);
+  --mobile-action-inset: 4px;
   --mobile-field: 40px;
   --mobile-tab: 40px;
   --mobile-tool: 38px;
@@ -32,7 +34,8 @@
 .m-form-layer .m-form-seg > button.on:active::before { background: hsl(var(--surface-2)); }
 .m-shell button.m-pending-btn:not(:disabled):active { opacity: 1; }
 .m-shell .m-pending-primary:active::before { border-color: hsl(var(--fg) / .35); }
-.m-shell button.h-sheetsubmit:not(:disabled):active { opacity: 1; box-shadow: inset 0 0 0 2px hsl(var(--fg) / .35); }
+.m-shell button.h-sheetsubmit:not(:disabled):active { opacity: 1; }
+.m-shell button.h-sheetsubmit:not(:disabled):active::before { border-color: hsl(var(--fg) / .35); }
 
 /* Header and panels use short visual paint; interactive boxes retain the production touch minimum. */
 .h-header { min-height: 48px; flex-wrap: wrap; gap: 4px 8px; padding-block: 4px; }
@@ -41,11 +44,11 @@
 .h-header > .h-werr { flex: 1 0 100%; min-width: 0; max-height: 4.5em; margin: 0; padding-bottom: 4px; overflow-wrap: anywhere; overflow-y: auto; }
 .h-connect-action {
   position: relative; isolation: isolate; display: inline-flex; align-items: center; justify-content: center;
-  gap: 5px; flex: none; min-height: var(--mobile-tap); padding: 0 10px;
+  gap: 5px; flex: none; min-height: var(--mobile-action-hit); padding: 10px 10px;
   border: 0; background: transparent; color: #00141d; font: 600 var(--mobile-control-font)/1.2 var(--sans);
   white-space: nowrap; cursor: pointer;
 }
-.h-connect-action::before { content: ''; position: absolute; z-index: -1; inset: 4px 0; border: 1px solid transparent; border-radius: 8px; background: hsl(var(--flow)); }
+.h-connect-action::before { content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0; border: 1px solid transparent; border-radius: 8px; background: hsl(var(--flow)); }
 .h-connect-action .h-acticon { width: 17px; height: 17px; }
 .h-connect-action.is-disconnect { color: hsl(var(--err)); }
 .h-connect-action.is-disconnect::before { border-color: hsl(var(--err) / .38); background: hsl(var(--surface)); }
@@ -99,10 +102,9 @@
 .h-check-meta { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px 4px; }
 .h-check-time { margin: 0; color: hsl(var(--fg-dim)); font-size: .75rem; font-weight: 400; white-space: normal; }
 .h-card[data-home-card='unlock-detection'] { container: unlockcard / inline-size; }
-.h-unlockgrid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; }
-.h-unlock { display: grid; grid-template-rows: 28px max-content; justify-items: center; align-content: start; gap: 1px; text-align: center; }
-.h-badge { grid-row: 1; width: 28px; height: 28px; padding: 2px; box-shadow: none; }
-.h-unlockname { grid-row: 2; align-self: start; max-width: 100%; font-size: .6875rem; line-height: 1.1; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+.h-unlockgrid { grid-template-columns: repeat(4, minmax(44px, 1fr)); gap: 2px; }
+.h-unlock { display: grid; place-items: center; min-height: var(--mobile-tap); text-align: center; }
+.h-badge { width: 28px; height: 28px; padding: 2px; box-shadow: none; }
 .h-stdot { width: 7px; height: 7px; }
 .h-rings { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(10.5rem, 56%); grid-template-columns: none; gap: 8px; overflow-x: auto; scroll-snap-type: x proximity; padding: 2px 0 6px; box-sizing: border-box; }
 .h-ringcell { display: grid; grid-template-columns: 44px minmax(0,1fr); grid-template-rows: auto auto; align-content: center; gap: 1px 8px; min-height: 64px; padding: 8px; border: 1px solid hsl(var(--hair)); border-radius: 8px; box-sizing: border-box; scroll-snap-align: start; background: hsl(var(--surface)); color: hsl(var(--fg)); font: inherit; text-align: start; cursor: pointer; }
@@ -122,16 +124,15 @@
 .h-rulehits-scope { margin: 0 0 8px; font-size: .75rem; color: hsl(var(--fg-dim)); }
 .h-rulehits-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .h-rulehits-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
-/* Narrow cards keep one shared set of tracks; wrapping never shifts a badge
-   away from the icon row. Larger cards can show all seven on one row. */
-@container unlockcard (max-width: 16em) {
-  .h-unlockgrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+/* Seven 44px targets fit a 320px card; narrower cards wrap 4+3 without shrinking icons. */
+@container unlockcard (max-width: 181px) {
+  .h-unlockgrid { grid-template-columns: repeat(3, minmax(44px, 1fr)); }
 }
-@container unlockcard (max-width: 11em) {
-  .h-unlockgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@container unlockcard (max-width: 135px) {
+  .h-unlockgrid { grid-template-columns: repeat(2, minmax(44px, 1fr)); }
 }
-@container unlockcard (min-width: 25em) {
-  .h-unlockgrid { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+@container unlockcard (min-width: 320px) {
+  .h-unlockgrid { grid-template-columns: repeat(7, minmax(44px, 1fr)); }
 }
 @container mscreen (min-width: 37.5em) {
   .h-rings { grid-auto-flow: row; grid-auto-columns: auto; grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr)); max-height: 152px; overflow-x: hidden; overflow-y: auto; }
@@ -193,9 +194,9 @@
 .mn { width: 100%; max-width: 800px; margin-inline: auto; }
 .mn-title { font-size: 1.375rem; }
 .mn-head { padding-top: 4px; }
-.mn-act { position: relative; isolation: isolate; min-height: var(--mobile-tap); border-radius: 8px; font-size: var(--mobile-control-font); }
-.mn-act.primary { background: transparent; }
-.mn-act.primary::before { content: ''; position: absolute; z-index: -1; inset: 5px 0; border-radius: 7px; background: hsl(var(--flow-weak)); }
+.mn .mn-act:not(.more) { position: relative; isolation: isolate; box-sizing: border-box; min-height: var(--mobile-action-hit); padding-block: 10px; border: 0; border-radius: 8px; font-size: var(--mobile-control-font); font-weight: 500; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; }
+.mn .mn-act.primary { background: transparent; font-weight: 600; }
+.mn-act.primary::before { content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0; box-sizing: border-box; border-radius: 7px; background: hsl(var(--flow-weak)); }
 .mn-act:not(.primary) { background: transparent; border-color: transparent; }
 .mn-segs { gap: 4px; padding-top: 4px; }
 .mn-seg { min-height: var(--mobile-tab); padding-inline: 9px; font-size: var(--mobile-control-font); }
@@ -285,9 +286,42 @@
 .m-form-head { min-height: 52px; padding: 0; }
 .m-form-title { font-size: 1.125rem; }
 .m-form-body { padding: 12px 0 20px; gap: 12px; }
-.m-form-foot { min-height: 58px; padding: 6px 0 calc(6px + var(--m-overlay-safe-b, var(--safe-b))); }
-.m-form-btn { position: relative; isolation: isolate; border-color: transparent; background: transparent; min-height: var(--mobile-tap); font-size: var(--mobile-control-font); }
-.m-form-btn::before { content: ''; position: absolute; z-index: -1; inset: 5px 0; border: 1px solid hsl(var(--line)); border-radius: 8px; background: hsl(var(--surface-2)); }
+.m-form-foot { min-height: 58px; align-items: center; padding: 6px 0 calc(6px + var(--m-overlay-safe-b, var(--safe-b))); }
+/* Text actions share one 44px hit area and a 36px painted surface. Multiline labels
+   grow with their text; the 10px padding keeps every line inside that surface. */
+.m-settings-btn, .m-form-btn, .h-sheetsubmit, .h-emptyact {
+  position: relative; isolation: isolate; box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: var(--mobile-action-hit); padding: 10px 12px;
+  border: 0; border-radius: 8px; background: transparent;
+  font-family: inherit; font-size: var(--mobile-control-font); font-weight: 500; line-height: 1.2;
+  text-align: center; white-space: normal; overflow-wrap: anywhere;
+  cursor: pointer; touch-action: manipulation;
+}
+.m-settings-btn::before, .m-form-btn::before, .h-sheetsubmit::before, .h-emptyact::before {
+  content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0;
+  box-sizing: border-box; border: 1px solid hsl(var(--line)); border-radius: 8px;
+  background: hsl(var(--surface-2));
+}
+.m-settings-btn { max-width: 100%; color: hsl(var(--fg)); }
+.m-settings-btn.primary, .m-form-btn.primary, .h-sheetsubmit { font-weight: 600; }
+.m-settings-btn.primary { color: #00141d; }
+.m-settings-btn.primary::before, .h-sheetsubmit::before { border-color: transparent; background: hsl(var(--flow)); }
+.m-settings-btn:disabled { opacity: .5; cursor: default; }
+.m-settings-btn:focus-visible, .m-settings-list-remove:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+.h-emptyact::before { background: transparent; }
+.m-settings-list-remove {
+  position: relative; isolation: isolate; box-sizing: border-box;
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: var(--mobile-action-hit); min-height: var(--mobile-action-hit); padding: 0;
+  border: 0; border-radius: 8px; background: transparent; color: hsl(var(--fg-dim));
+  cursor: pointer; touch-action: manipulation;
+}
+.m-settings-list-remove::before {
+  content: ''; position: absolute; z-index: -1; inset: 6px 0;
+  box-sizing: border-box; border: 1px solid hsl(var(--line)); border-radius: 8px;
+  background: hsl(var(--surface-2));
+}
 .m-form-btn.primary { background: transparent; color: #00141d; box-shadow: none; }
 .m-form-btn.primary::before { border-color: transparent; background: hsl(var(--flow)); }
 .m-form-btn.danger { background: transparent; color: hsl(var(--bg)); }

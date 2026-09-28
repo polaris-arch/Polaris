@@ -42,7 +42,7 @@ import {
   type RuleAppendTarget,
 } from './view-model';
 import { createRunWrite, writeFailureText } from './write-errors';
-import { UNLOCK_SERVICES } from './unlock-services';
+import { UNLOCK_SERVICES, unlockBadgeSrc } from './unlock-services';
 import { ENABLED_SERVICE_IDS } from '@/contracts/unlock-detection';
 import {
   EMPTY_TRAFFIC_BUFFER,
@@ -985,6 +985,9 @@ describe('⑧ 解锁服务表：登记表与上线集对得上（桌面改了上
   it('id 集合恰等于 `ENABLED_SERVICE_IDS`（七项，grok 不在其中）', () => {
     expect(UNLOCK_SERVICES.map((s) => s.id).sort()).toEqual([...ENABLED_SERVICE_IDS].sort());
     expect(UNLOCK_SERVICES.map((s) => s.id)).not.toContain('grok');
+    for (const service of UNLOCK_SERVICES) {
+      expect(unlockBadgeSrc(service.id), `${service.id} 的图标缺失会留下只有圆点的空按钮`).not.toBeNull();
+    }
   });
 
   it('保留桌面的组序（AI 三个在前，流媒体四个在后）', () => {
@@ -1236,11 +1239,11 @@ describe('⑨–⑫ 出口控制、检测与规则统计的当前呈现契约', 
     for (const key of ['home.routingSmart', 'home.routingGlobal', 'home.routingDirect']) expect(route).toContain(key);
   });
 
-  it('七项能力只显示图标、圆点与名称；状态留在可访问名称和点击详情', () => {
+  it('七项能力只显示图标与圆点；名称和状态留在可访问名称及点击详情', () => {
     const html = cardSegments(render()).get('unlock-detection') ?? '';
     expect((html.match(/class="h-unlock"/g) ?? [])).toHaveLength(7);
     expect((html.match(/class="h-badge /g) ?? [])).toHaveLength(7);
-    expect((html.match(/class="h-unlockname"/g) ?? [])).toHaveLength(7);
+    expect(html).not.toContain('class="h-unlockname"');
     expect((html.match(/class="h-stdot /g) ?? [])).toHaveLength(7);
     expect(html).not.toContain('class="h-unlockstatus"');
     for (const svc of baseProps().unlock) {

@@ -102,6 +102,16 @@
   color: var(--activity-ink);
   font-size: 0.8125rem;
 }
+.mc .mc-btn:not(.icon) {
+  min-height: var(--mobile-action-hit);
+  padding-block: 10px;
+  border: 0;
+  font-size: var(--mobile-control-font);
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .mc .mc-btn::before {
   content: '';
   position: absolute;
@@ -111,6 +121,9 @@
   border-radius: 8px;
   background: var(--activity-paper);
 }
+.mc .mc-btn:not(.icon)::before { inset: var(--mobile-action-inset) 0; box-sizing: border-box; }
+.mc .mc-choice .mc-btn { padding-block: 0; border: 1px solid transparent; font-weight: 400; line-height: normal; white-space: nowrap; }
+.mc .mc-choice .mc-btn::before { inset: 5px 0; }
 .mc .mc-btn.icon::before { border: 0; background: transparent; }
 .mc .mc-btn:not(.icon):not(:disabled):active::before { background: hsl(var(--surface-2)); }
 .mc .mc-btn.icon:not(:disabled):active { color: var(--activity-accent); opacity: 0.75; }

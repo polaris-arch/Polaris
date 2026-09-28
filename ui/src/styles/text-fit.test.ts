@@ -3287,8 +3287,15 @@ describe('S17 移动端导入预览（compact 390px 参考视口，五语种）'
 // 键从源码现场核对「真的在那一处渲染」，不是只信槽位表。
 
 const subPanel = () => src('../mobile/forms/SubFormPanel.tsx');
-const mfBtnPadX = padX(resolveShell(decl(FORMS_CSS, '.m-form-btn', 'padding'))); // horizontal padding remains 24
-const mfBtnBorder = 2; // 1px solid 两侧
+// The mobile action layer owns the final button box. Read the winning values
+// across the actual entry chain rather than the earlier forms.css declaration.
+const mobileFormButton = (prop: string): string => {
+  const winner = resolve({ sel: '.m-form-btn', prop, ctx: 'mobile', where: UNCONDITIONAL }).winner;
+  if (winner === null) throw new Error(`mobile .m-form-btn 缺 ${prop} 最终声明`);
+  return resolveShell(winner.value);
+};
+const mfBtnPadX = 2 * px(mobileFormButton('padding-left'));
+const mfBtnBorder = 2 * px(mobileFormButton('border-left-width'));
 const mfFootGap = px(resolveShell(decl(FORMS_CSS, '.m-form-foot', 'column-gap'))); // var(--sp-2) = 8
 /** 独占一排的按钮文字轨。 */
 const MF_BTN_FULL = MF_CONTENT - mfBtnPadX - mfBtnBorder;
@@ -3316,8 +3323,8 @@ describe('S18 移动端表单 ζ 批新文案（compact 390px 参考视口，五
   it('几何链从 CSS 现场解出', () => {
     expect(mfBtnPadX).toBe(24);
     expect(mfFootGap).toBe(8);
-    expect(MF_BTN_FULL).toBeCloseTo(M_PAGE_CONTENT - 26, 5);
-    expect(MF_BTN_HALF).toBeCloseTo((M_PAGE_CONTENT - 8) / 2 - 26, 5);
+    expect(MF_BTN_FULL).toBeCloseTo(M_PAGE_CONTENT - 24, 5);
+    expect(MF_BTN_HALF).toBeCloseTo((M_PAGE_CONTENT - 8) / 2 - 24, 5);
     for (const sel of ['.m-form-btn', '.m-form-hint'])
       expect(formFont(sel), `${sel} 字号读不到`).toBeGreaterThan(0);
   });

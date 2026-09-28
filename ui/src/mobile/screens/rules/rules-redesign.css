@@ -203,6 +203,17 @@
   color: var(--rule-ink);
   font-size: 0.8125rem;
 }
+.mr-screen .mr-btn:not(.icon) {
+  min-height: var(--mobile-action-hit);
+  padding-block: 10px;
+  border: 0;
+  font-size: var(--mobile-control-font);
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.mr-screen .mr-btn.flow:not(.icon) { font-weight: 600; }
 
 .mr-screen .mr-btn::before {
   content: '';
@@ -213,6 +224,7 @@
   border-radius: 8px;
   background: var(--rule-paper);
 }
+.mr-screen .mr-btn:not(.icon)::before { inset: var(--mobile-action-inset) 0; box-sizing: border-box; }
 
 .mr-screen .mr-btn.flow {
   background: transparent;
@@ -231,7 +243,8 @@
   background: hsl(var(--surface-2));
 }
 .mr-screen .mr-geo-regions { background: hsl(var(--surface-3)); border-color: var(--rule-line); }
-.mr-screen .mr-geo-regions .mr-btn::before { background: transparent; border-color: transparent; }
+.mr-screen .mr-geo-regions .mr-btn { padding-block: 0; border: 1px solid transparent; font-weight: 600; line-height: normal; white-space: normal; }
+.mr-screen .mr-geo-regions .mr-btn::before { inset: 5px 0; background: transparent; border-color: transparent; }
 .mr-screen .mr-geo-regions .mr-btn[aria-pressed='true'] { background: transparent; color: var(--rule-accent); }
 .mr-screen .mr-geo-regions .mr-btn[aria-pressed='true']::before { background: var(--rule-paper); }
 .mr-screen .mr-geo-regions .mr-btn:not(:disabled):active::before { background: var(--rule-soft); }

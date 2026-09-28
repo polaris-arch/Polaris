@@ -6,8 +6,8 @@ import { MobileSelect as AppSelect } from '../MobileSelect';
  * # 样式分工
  *
  * 设置行的布局与阅读间距在这里用内联常量维护；`settings.css` 负责根页分栏，
- * 共享按钮/选择面的按压与焦点态在 `mobile.css`。内联属性不进入 CSS 特性测试的取材面，
- * 因此本文件只使用 Chromium ≤105 已支持的基础布局属性。
+ * 文字动作和图标动作的几何/焦点态由移动专属 `redesign.css` 统一。
+ * 内联属性不进入 CSS 特性测试的取材面，因此本文件只使用 Chromium ≤105 已支持的基础布局属性。
  *
  * # `data-tip` 债在这里还（IA §4.12）
  *
@@ -48,6 +48,7 @@ const CARD_HEADER: CSSProperties = {
 const ROW: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
+  flexWrap: 'wrap',
   gap: '12px',
   minHeight: 'var(--tap-min)',
   boxSizing: 'border-box',
@@ -78,7 +79,7 @@ const ROW_DESC: CSSProperties = {
   color: 'hsl(var(--fg-dim))',
 };
 
-const CONTROL_SLOT: CSSProperties = { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: '8px' };
+const CONTROL_SLOT: CSSProperties = { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: '8px', maxWidth: '100%' };
 
 /** 控件放不进标题行时的整行堆叠（spec「compact」第二条）。 */
 const ROW_STACKED: CSSProperties = { ...ROW, flexDirection: 'column', alignItems: 'stretch' };
@@ -392,20 +393,6 @@ export function MobileTextInput({
   );
 }
 
-const BUTTON: CSSProperties = {
-  minHeight: 'var(--tap-min)',
-  padding: '0 14px',
-  border: '1px solid hsl(var(--line))',
-  borderRadius: 'var(--r-sm)',
-  background: 'hsl(var(--surface-2))',
-  color: 'hsl(var(--fg))',
-  fontFamily: 'inherit',
-  fontSize: '0.875rem',
-  fontWeight: 500,
-  cursor: 'pointer',
-  touchAction: 'manipulation',
-};
-
 export function MobileButton({
   onClick,
   children,
@@ -420,16 +407,9 @@ export function MobileButton({
   return (
     <button
       type="button"
+      className={`m-settings-btn${tone === 'primary' ? ' primary' : ''}`}
       onClick={onClick}
       disabled={disabled}
-      style={{
-        ...BUTTON,
-        opacity: disabled ? 0.5 : 1,
-        cursor: disabled ? 'default' : 'pointer',
-        background: tone === 'primary' ? 'hsl(var(--flow))' : 'hsl(var(--surface-2))',
-        color: tone === 'primary' ? 'hsl(var(--bg))' : 'hsl(var(--fg))',
-        borderColor: tone === 'primary' ? 'hsl(var(--flow))' : 'hsl(var(--line))',
-      }}
     >
       {children}
     </button>
@@ -514,23 +494,9 @@ export function MobileListEditor({
           />
           <button
             type="button"
+            className="m-settings-list-remove"
             aria-label={removeLabel}
             onClick={() => commit(draft.filter((_, i) => i !== index))}
-            style={{
-              flex: '0 0 auto',
-              width: 'var(--tap-min)',
-              height: 'var(--tap-min)',
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: 0,
-              border: '1px solid hsl(var(--line))',
-              borderRadius: 'var(--r-sm)',
-              background: 'hsl(var(--surface-2))',
-              color: 'hsl(var(--fg-dim))',
-              cursor: 'pointer',
-              touchAction: 'manipulation',
-            }}
           >
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
               <path d="M5 5l14 14M19 5L5 19" />
