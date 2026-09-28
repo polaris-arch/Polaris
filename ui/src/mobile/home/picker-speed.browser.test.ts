@@ -107,16 +107,50 @@ function App(){
 }
 createRoot(document.getElementById('root')).render(<App/>);
 `;
+const sentinelEntry = `
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { MobileHomeScreen } from '/src/mobile/home/MobileHomeScreen';
+import { useAppStore } from '/src/store/app-store';
+import { api } from '/src/ipc';
+import { configApi } from '/src/ipc/api/config';
+import { windowApi } from '/src/ipc/api/system';
+import { setToastImpl } from '/src/lib/error-handler';
+import i18n, { i18nReady } from '/src/i18n';
+import zhCN from '/src/i18n/locales/zh-CN.json';
+import '/src/styles/tokens.resolved.css';
+import '/src/mobile/theme.css';
+import '/src/mobile/mobile.css';
+import '/src/mobile/home/home.css';
+import '/src/mobile/redesign.css';
+await i18nReady;
+i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); await i18n.changeLanguage('zh-CN');
+const config={selectedServerId:'node-a',proxyMode:'smart',servers:[{id:'node-a',name:'Fixture node',protocol:'socks',address:'fixture.invalid',port:1}],subscriptions:[]};
+const fixture=window.__sentinelTest={calls:[],messages:[],setRouting(mode){useAppStore.setState(s=>({config:{...s.config,proxyMode:mode}}));}};
+api.stats.onStatsUpdated=()=>()=>{};
+api.stats.onConnectionsDetail=()=>()=>{};
+api.stats.subscribe=async()=>{};
+api.stats.unsubscribe=async()=>{};
+configApi.get=async()=>useAppStore.getState().config;
+configApi.onChanged=()=>()=>{};
+windowApi.startupConfigFlags=async()=>({});
+setToastImpl({success:text=>fixture.messages.push(['success',text]),info:text=>fixture.messages.push(['info',text]),warning:text=>fixture.messages.push(['warning',text])});
+useAppStore.setState({config,servers:config.servers,selectedServerId:'node-a',switchServer:async id=>{
+ fixture.calls.push(id);useAppStore.setState(s=>({selectedServerId:id,config:{...s.config,selectedServerId:id}}));return {status:'pending'};
+}});
+createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);
+`;
 let server: ViteDevServer; let browser: Browser; let origin: string;
 describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and measured task consumers', () => {
   beforeAll(async () => {
     server=await createServer({root,cacheDir:path.join(tmpdir(),'polaris-picker-speed-vite-'+process.pid),server:{host:'127.0.0.1',port:0,watch:null},plugins:[{
-      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx'||id==='/full-home-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;if(id==='/full-home-fixture.tsx')return fullHomeEntry;},
+      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx'||id==='/full-home-fixture.tsx'||id==='/sentinel-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;if(id==='/full-home-fixture.tsx')return fullHomeEntry;if(id==='/sentinel-fixture.tsx')return sentinelEntry;},
       configureServer(vite){vite.middlewares.use(async(req,res,next)=>{
-        if(req.url!=='/__picker-speed'&&req.url!=='/__full-home')return next();
+        if(req.url!=='/__picker-speed'&&req.url!=='/__full-home'&&req.url!=='/__sentinel')return next();
         const full=req.url?.includes('full-home');
-        const html=await vite.transformIndexHtml(full?'/__full-home':'/__picker-speed',
-          '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/'+(full?'full-home-fixture':'picker-speed-fixture')+'.tsx"></script></html>');
+        const sentinel=req.url?.includes('sentinel');
+        const html=await vite.transformIndexHtml(full?'/__full-home':sentinel?'/__sentinel':'/__picker-speed',
+          '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/'+(full?'full-home-fixture':sentinel?'sentinel-fixture':'picker-speed-fixture')+'.tsx"></script></html>');
         res.setHeader('Content-Type','text/html');res.end(html);
       });},
     }]});await server.listen();const address=server.httpServer!.address();if(!address||typeof address!=='object')throw new Error('Vite did not bind');origin='http://127.0.0.1:'+address.port;
@@ -275,6 +309,29 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     expect(await page.evaluate(()=>(window as any).__pickerTest.store.getState().task.phase)).toBe('completed');
     await page.evaluate(()=>{(window as any).__pickerTest.store.getState().begin(['b'],'current');});
     await page.getByText('准备测速…',{exact:true}).waitFor();
+    await page.close();
+  },30_000);
+  it('the live Home picker switches both sentinel exits through the receipt path and keeps its guards',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});await page.goto(origin+'/__sentinel');
+    const open=async()=>{await page.locator('.h-nodelead').click();await page.locator('.h-picker-sheet').waitFor();};
+    const direct=page.locator('[data-exit-write="home-sentinel-direct"]');
+    const block=page.locator('[data-exit-write="home-sentinel-block"]');
+    await open();await direct.click();
+    await page.waitForFunction(()=>(window as any).__sentinelTest.calls.length===1);
+    await page.locator('.h-picker-sheet').waitFor({state:'detached'});
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toEqual(['__direct__']);
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.messages.at(-1))).toEqual(['info','直连 · 已保存，正在应用连接更改']);
+    await open();await direct.click();await page.locator('.h-picker-sheet').waitFor({state:'detached'});
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toEqual(['__direct__']);
+    await open();await block.click();
+    await page.waitForFunction(()=>(window as any).__sentinelTest.calls.length===2);
+    await page.locator('.h-picker-sheet').waitFor({state:'detached'});
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toEqual(['__direct__','__block__']);
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.messages.at(-1))).toEqual(['info','阻断 · 已保存，正在应用连接更改']);
+    await page.evaluate(()=>(window as any).__sentinelTest.setRouting('direct'));
+    await open();expect(await block.isDisabled()).toBe(true);
+    expect(await block.innerText()).toContain('当前为直连模式：全部流量都不经过代理出口，阻断不会生效');
+    expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toHaveLength(2);
     await page.close();
   },30_000);
 });

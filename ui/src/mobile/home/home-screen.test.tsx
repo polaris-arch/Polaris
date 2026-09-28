@@ -1372,14 +1372,17 @@ describe('⑬ 哨兵出口 / 空态入口 / 主机行规则面板：能力真的
     expect(openTag).not.toContain('home.blockExitUnavailableInDirect');
   });
 
-  it('接线层：直连走权威切换收据，阻断仍走配置更新', () => {
+  it('接线层：直连与阻断都走权威切换收据，沿用各自名称反馈', () => {
     expect(WIRING_RAW, '没有 onPickSentinel 这条腿').toContain('onPickSentinel');
     expect(WIRING_RAW).toContain('DIRECT_SERVER_ID');
     expect(WIRING_RAW).toContain('BLOCK_SERVER_ID');
     const at = WIRING_RAW.indexOf('const onPickSentinel');
     const body = WIRING_RAW.slice(at, WIRING_RAW.indexOf('const onSetRouting', at));
-    expect(body).toContain('switchServer(DIRECT_SERVER_ID)');
-    expect(body).toContain("if (kind === 'block') return update({ selectedServerId: id })");
+    expect(body).toContain("if (kind === 'block' && blockDisabledReason !== null) return");
+    expect(body).toContain('if (id === selectedServerId)');
+    expect(body).toContain('switchServer(id)');
+    expect(body).toContain("kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock'");
+    expect(body).not.toContain('update({ selectedServerId: id })');
   });
 
   /* ── 空态两颗直达入口（`HomeScreen.tsx|k:home.addServer` / `addSubscription`）── */

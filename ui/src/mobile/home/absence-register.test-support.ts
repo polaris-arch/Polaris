@@ -159,7 +159,7 @@ export const HOME_PARITY: ScreenParityRegister = {
         kind: 'ported',
         mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: 'data-exit-write="home-sentinel-direct"' },
       },
-      note: '把出口设成「直连」（`DIRECT_SERVER_ID` 哨兵）。移动端在节点选择面顶上，与桌面出口下拉的 `.mi` 同一个位置语义。写腿走 `update({ selectedServerId })` 而不是 `switchServer` —— 后端 `server_switch` 只收真实节点 id，哨兵会被拒，这一条逐字同桌面 `onPickDirectExit`。',
+      note: '把出口设成「直连」（`DIRECT_SERVER_ID` 哨兵）。移动端在节点选择面顶上，与桌面出口下拉的 `.mi` 同一个位置语义；写腿走 `switchServer`，按权威切换收据反馈。',
     },
     {
       id: 'NodeMenu.tsx|k:home.routingBlock',
@@ -167,7 +167,7 @@ export const HOME_PARITY: ScreenParityRegister = {
         kind: 'ported',
         mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: 'data-exit-write="home-sentinel-block"' },
       },
-      note: '把出口设成「阻断」（`BLOCK_SERVER_ID` 哨兵）。与上一条同一条写腿。直连模式下**在场置灰 + 写出原因**（`home.blockExitUnavailableInDirect`），判据与桌面 `blockDisabledReason` 同源：那时 route.final 恒为 direct，选中它是一次静默 no-op。',
+      note: '把出口设成「阻断」（`BLOCK_SERVER_ID` 哨兵）。与上一条同走 `switchServer` 及权威切换收据。直连模式下**在场置灰 + 写出原因**（`home.blockExitUnavailableInDirect`），判据与桌面 `blockDisabledReason` 同源：那时 route.final 恒为 direct，选中它是一次静默 no-op。',
     },
     {
       id: 'NodeMenu.tsx|c:ns-grp',

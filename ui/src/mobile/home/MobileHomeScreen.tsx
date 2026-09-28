@@ -545,7 +545,7 @@ export function MobileHomeScreen(): ReactElement {
     [runWrite, switchServer, selectedServerId, t],
   );
 
-  /** Direct uses the same authoritative switch receipt as real nodes. Block still uses config patch. */
+  /** Sentinel exits use the same authoritative switch receipt as real nodes. */
   const onPickSentinel = useCallback(
     (kind: 'direct' | 'block') => {
       if (kind === 'block' && blockDisabledReason !== null) return;
@@ -555,9 +555,9 @@ export function MobileHomeScreen(): ReactElement {
         return;
       }
       void runWrite('switch-node', async () => {
-        if (kind === 'block') return update({ selectedServerId: id });
-        const receipt = await switchServer(DIRECT_SERVER_ID);
-        const feedback = mobileSwitchReceiptFeedback(receipt, t('home.routingDirect'), t);
+        const receipt = await switchServer(id);
+        const label = t(kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock');
+        const feedback = mobileSwitchReceiptFeedback(receipt, label, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);
         else if (feedback) toast.info(feedback.text);
@@ -566,7 +566,7 @@ export function MobileHomeScreen(): ReactElement {
         setPickerOpen(false);
       });
     },
-    [blockDisabledReason, selectedServerId, runWrite, switchServer, t, update],
+    [blockDisabledReason, selectedServerId, runWrite, switchServer, t],
   );
 
   const onSetRouting = useCallback(
