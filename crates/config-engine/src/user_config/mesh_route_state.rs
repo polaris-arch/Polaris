@@ -2,7 +2,7 @@
 //! Managed documents are parsed strictly before the legacy sanitizer can discard fields.
 
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
 pub const MESH_ROUTE_SCHEMA_VERSION: u32 = 1;
@@ -14,8 +14,8 @@ pub struct MeshOwnerRef {
     pub identity_epoch: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MeshTarget {
     Owner {
         #[serde(rename = "serverId")]
@@ -25,6 +25,67 @@ pub enum MeshTarget {
     },
     Reject,
     Unmanaged,
+}
+
+fn tagged_fields<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<(String, Map<String, Value>), D::Error> {
+    let Value::Object(mut fields) = Value::deserialize(deserializer)? else {
+        return Err(serde::de::Error::custom("mesh target must be an object"));
+    };
+    let Some(Value::String(kind)) = fields.remove("kind") else {
+        return Err(serde::de::Error::custom("mesh target kind is missing"));
+    };
+    Ok((kind, fields))
+}
+
+fn unit_fields<E: serde::de::Error>(fields: Map<String, Value>) -> Result<(), E> {
+    if fields.is_empty() {
+        Ok(())
+    } else {
+        Err(E::custom("unit mesh target has unexpected fields"))
+    }
+}
+
+fn owner_fields<E: serde::de::Error>(
+    mut fields: Map<String, Value>,
+) -> Result<(String, String), E> {
+    if fields.len() != 2 {
+        return Err(E::custom(
+            "mesh owner target fields are incomplete or unknown",
+        ));
+    }
+    let Some(Value::String(server_id)) = fields.remove("serverId") else {
+        return Err(E::custom("mesh owner serverId is missing"));
+    };
+    let Some(Value::String(identity_epoch)) = fields.remove("identityEpoch") else {
+        return Err(E::custom("mesh owner identityEpoch is missing"));
+    };
+    Ok((server_id, identity_epoch))
+}
+
+impl<'de> Deserialize<'de> for MeshTarget {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (kind, fields) = tagged_fields(deserializer)?;
+        match kind.as_str() {
+            "owner" => {
+                let (server_id, identity_epoch) = owner_fields(fields)?;
+                Ok(Self::Owner {
+                    server_id,
+                    identity_epoch,
+                })
+            }
+            "reject" => {
+                unit_fields(fields)?;
+                Ok(Self::Reject)
+            }
+            "unmanaged" => {
+                unit_fields(fields)?;
+                Ok(Self::Unmanaged)
+            }
+            _ => Err(serde::de::Error::custom("unknown mesh target kind")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,8 +148,8 @@ fn strict_optional_dns<'de, D: Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MeshDnsOwnerTarget {
     Owner {
         #[serde(rename = "serverId")]
@@ -99,8 +160,28 @@ pub enum MeshDnsOwnerTarget {
     Reject,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+impl<'de> Deserialize<'de> for MeshDnsOwnerTarget {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (kind, fields) = tagged_fields(deserializer)?;
+        match kind.as_str() {
+            "owner" => {
+                let (server_id, identity_epoch) = owner_fields(fields)?;
+                Ok(Self::Owner {
+                    server_id,
+                    identity_epoch,
+                })
+            }
+            "reject" => {
+                unit_fields(fields)?;
+                Ok(Self::Reject)
+            }
+            _ => Err(serde::de::Error::custom("unknown DNS owner target kind")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MeshDnsShortNamePolicy {
     System,
     Owner {
@@ -110,6 +191,30 @@ pub enum MeshDnsShortNamePolicy {
         identity_epoch: String,
     },
     Reject,
+}
+
+impl<'de> Deserialize<'de> for MeshDnsShortNamePolicy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (kind, fields) = tagged_fields(deserializer)?;
+        match kind.as_str() {
+            "owner" => {
+                let (server_id, identity_epoch) = owner_fields(fields)?;
+                Ok(Self::Owner {
+                    server_id,
+                    identity_epoch,
+                })
+            }
+            "system" => {
+                unit_fields(fields)?;
+                Ok(Self::System)
+            }
+            "reject" => {
+                unit_fields(fields)?;
+                Ok(Self::Reject)
+            }
+            _ => Err(serde::de::Error::custom("unknown DNS short-name kind")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,8 +268,8 @@ pub struct MeshObservation {
     pub last_valid_evidence: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MeshReservationOwner {
     Owner {
         #[serde(rename = "serverId")]
@@ -173,6 +278,26 @@ pub enum MeshReservationOwner {
         identity_epoch: String,
     },
     Deny,
+}
+
+impl<'de> Deserialize<'de> for MeshReservationOwner {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (kind, fields) = tagged_fields(deserializer)?;
+        match kind.as_str() {
+            "owner" => {
+                let (server_id, identity_epoch) = owner_fields(fields)?;
+                Ok(Self::Owner {
+                    server_id,
+                    identity_epoch,
+                })
+            }
+            "deny" => {
+                unit_fields(fields)?;
+                Ok(Self::Deny)
+            }
+            _ => Err(serde::de::Error::custom("unknown reservation owner kind")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +435,9 @@ impl MeshRoutePolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != MESH_ROUTE_SCHEMA_VERSION {
             return Err("unsupported meshRoutePolicy schemaVersion".into());
+        }
+        if self.migration.builtin_exceptions_version != 1 {
+            return Err("unsupported builtinExceptionsVersion".into());
         }
         unique_nonempty(self.candidate_order.iter().map(String::as_str))?;
         unique_nonempty(self.overrides.iter().map(|rule| rule.rule_id.as_str()))?;

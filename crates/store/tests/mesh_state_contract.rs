@@ -72,7 +72,73 @@ fn invalid_or_incomplete_managed_disk_never_falls_back_to_writable_default() {
         },
         {
             let mut v = managed_config();
+            v[POLICY_KEY]["migration"]["builtinExceptionsVersion"] = json!(0);
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["migration"]["builtinExceptionsVersion"] = json!(999);
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["assignments"][1]["target"]["unexpected"] = json!(true);
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["assignments"][1]["target"] =
+                json!({"kind":"unmanaged","unexpected":true});
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[STATE_KEY]["reservations"][0]["ownerRef"] = json!({"kind":"deny","unexpected":true});
+            v
+        },
+        {
+            let mut v = managed_config();
             v[POLICY_KEY]["dnsPolicy"] = Value::Null;
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["dnsPolicy"] = json!({
+                "schemaVersion":1,
+                "suffixAssignments":[{"suffix":"tail.example.invalid","target":{"kind":"reject","unexpected":true}}],
+                "shortNamePolicy":{"kind":"system"},
+                "serviceOwner":{"kind":"reject"}
+            });
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["dnsPolicy"] = json!({
+                "schemaVersion":1,
+                "suffixAssignments":[],
+                "shortNamePolicy":{"kind":"system","unexpected":true},
+                "serviceOwner":{"kind":"reject"}
+            });
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["dnsPolicy"] = json!({
+                "schemaVersion":1,
+                "suffixAssignments":[],
+                "shortNamePolicy":{"kind":"reject","unexpected":true},
+                "serviceOwner":{"kind":"reject"}
+            });
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["dnsPolicy"] = json!({
+                "schemaVersion":1,
+                "suffixAssignments":[],
+                "shortNamePolicy":{"kind":"system"},
+                "serviceOwner":{"kind":"reject","unexpected":true}
+            });
             v
         },
         {
