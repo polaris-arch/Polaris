@@ -108,14 +108,16 @@ class BoxService(
             val config = bridgeConfig ?: SystemStart.load(service)
             SystemEndpointGuard.requireSupported(config)
             PolarisApplication.ensureSetup()
-            TransientLoginHost.withMainConfig(this, config, { state == ServiceState.Starting }) {
-                check(state == ServiceState.Starting) { "起核已被停核接管" }
-                DefaultNetworkMonitor.start()
-                val server = CommandServer(this, platformInterface)
-                commandServer = server
-                server.start()
-                // No login instance may hold this Tailscale state directory during main startup.
-                server.startOrReloadService(config, OverrideOptions())
+            TransientSpeedtestHost.withMainStart(this, { state == ServiceState.Starting }) {
+                TransientLoginHost.withMainConfig(this, config, { state == ServiceState.Starting }) {
+                    check(state == ServiceState.Starting) { "起核已被停核接管" }
+                    DefaultNetworkMonitor.start()
+                    val server = CommandServer(this, platformInterface)
+                    commandServer = server
+                    server.start()
+                    // No login instance may hold this Tailscale state directory during main startup.
+                    server.startOrReloadService(config, OverrideOptions())
+                }
             }
             synchronized(this) {
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
@@ -168,7 +170,11 @@ class BoxService(
             server.setError("android: reload: ${error.message}")
             return
         }
-        runCatching { TransientLoginHost.withMainConfig(this, config, { state == ServiceState.Started && commandServer === server }) { server.startOrReloadService(config, OverrideOptions()) } }
+        runCatching { TransientSpeedtestHost.withMainStart(this, { state == ServiceState.Started && commandServer === server }) {
+            TransientLoginHost.withMainConfig(this, config, { state == ServiceState.Started && commandServer === server }) {
+                server.startOrReloadService(config, OverrideOptions())
+            }
+        } }
             .onFailure {
                 Log.e(TAG, "重载失败", it)
                 server.setError("android: reload: ${it.message}")
@@ -278,12 +284,14 @@ class BoxService(
             fileDescriptor = null
             DefaultNetworkMonitor.stop()
             val closed = runCatching {
-                TransientLoginHost.closeMain(this) {
-                    commandServer?.let { server ->
-                        server.closeService()
-                        server.close()
+                TransientSpeedtestHost.closeMain(this) {
+                    TransientLoginHost.closeMain(this) {
+                        commandServer?.let { server ->
+                            server.closeService()
+                            server.close()
+                        }
+                        commandServer = null
                     }
-                    commandServer = null
                 }
             }
             if (closed.isFailure) {

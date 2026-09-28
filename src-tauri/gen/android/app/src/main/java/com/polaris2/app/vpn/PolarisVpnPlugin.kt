@@ -62,6 +62,17 @@ class TransientLoginInstanceArgs {
 }
 
 @InvokeArg
+class TransientSpeedtestStartArgs {
+    lateinit var instanceId: String
+    lateinit var configContent: String
+}
+
+@InvokeArg
+class TransientSpeedtestInstanceArgs {
+    lateinit var instanceId: String
+}
+
+@InvokeArg
 class BootAutoConnectArgs {
     var enabled: Boolean = false
 }
@@ -156,6 +167,30 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun transientLoginStatus(invoke: Invoke) {
         val args = invoke.parseArgs(TransientLoginInstanceArgs::class.java)
         invoke.resolve(JSObject().put("running", TransientLoginHost.running(args.instanceId)))
+    }
+
+    @Command
+    fun startTransientSpeedtest(invoke: Invoke) {
+        val args = invoke.parseArgs(TransientSpeedtestStartArgs::class.java)
+        TransientSpeedtestHost.start(args.instanceId, args.configContent) { failure ->
+            if (failure == null) invoke.resolve()
+            else invoke.reject(failure, "TRANSIENT_SPEEDTEST_FAILED")
+        }
+    }
+
+    @Command
+    fun closeTransientSpeedtest(invoke: Invoke) {
+        val args = invoke.parseArgs(TransientSpeedtestInstanceArgs::class.java)
+        TransientSpeedtestHost.close(args.instanceId) { failure ->
+            if (failure == null) invoke.resolve()
+            else invoke.reject(failure, "TRANSIENT_SPEEDTEST_CLEANUP_UNKNOWN")
+        }
+    }
+
+    @Command
+    fun transientSpeedtestStatus(invoke: Invoke) {
+        val args = invoke.parseArgs(TransientSpeedtestInstanceArgs::class.java)
+        invoke.resolve(JSObject().put("state", TransientSpeedtestHost.status(args.instanceId)))
     }
 
     @Command
