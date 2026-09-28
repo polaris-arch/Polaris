@@ -1,5 +1,7 @@
 use super::*;
 
+mod restore_integration;
+
 #[test]
 fn backup_failure_exposes_only_the_stable_error_code() {
     let payload = backup_failure("writeFailed");

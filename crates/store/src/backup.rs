@@ -196,6 +196,16 @@ fn traffic_rule_len(config: &Value) -> usize {
     }
 }
 
+/// 旧共享规则文件还没有 trafficRules 平面；预览和摘要按导入时同一迁移结果计数，
+/// 否则 DNS-only 旧规则会被误报成可导入的流量规则。
+fn backup_traffic_rule_len(config: &Value) -> usize {
+    if config.get("trafficRules").is_some_and(Value::is_array) {
+        traffic_rule_len(config)
+    } else {
+        traffic_rule_len(&normalize_policy_backup(config))
+    }
+}
+
 fn dns_rule_len(config: &Value) -> usize {
     arr_len(config, "dnsRules")
 }
@@ -264,8 +274,18 @@ pub fn count_category(config: &Value, cat: BackupCategory) -> usize {
         BackupCategory::ManualNodes => count_nodes(config, NodeCategory::Manual),
         BackupCategory::MeshNodes => count_nodes(config, NodeCategory::Mesh),
         BackupCategory::Subscriptions => arr_len(config, "subscriptions"),
-        BackupCategory::CustomRules => traffic_rule_len(config) + arr_len(config, "customRuleSets"),
-        BackupCategory::DnsRules => dns_rule_len(config),
+        BackupCategory::CustomRules => {
+            backup_traffic_rule_len(config) + arr_len(config, "customRuleSets")
+        }
+        BackupCategory::DnsRules => {
+            if config.get("dnsRules").is_some_and(Value::is_array) {
+                dns_rule_len(config)
+            } else {
+                // 1.0/1.1 shared policy backups have no dnsRules field. Preview must expose
+                // the same DNS plane that merge_categories can actually import from them.
+                dns_rule_len(&normalize_policy_backup(config))
+            }
+        }
         BackupCategory::DnsResources => {
             let resources = arr_len(config, "dnsServers") + arr_len(config, "dnsServerGroups");
             if resources == 0 && config.get("dnsDefaults").is_some_and(Value::is_object) {
@@ -552,36 +572,6 @@ pub fn merge_categories(
         }
     }
 
-    // 自定义规则集与下载资源是两个规则平面共享的匹配依赖。流量规则保持旧导入语义
-    // （字段缺失按空数组处理）；DNS-only 导入只在备份显式携带时替换，避免旧备份误清空。
-    if sel(BackupCategory::CustomRules) {
-        set(
-            &mut result,
-            "customRuleSets",
-            arr_or_empty(backup, "customRuleSets"),
-        );
-        set(
-            &mut result,
-            "ruleResources",
-            arr_or_empty(backup, "ruleResources"),
-        );
-    } else if sel(BackupCategory::DnsRules) {
-        if backup.get("customRuleSets").is_some_and(Value::is_array) {
-            set(
-                &mut result,
-                "customRuleSets",
-                arr_or_empty(backup, "customRuleSets"),
-            );
-        }
-        if backup.get("ruleResources").is_some_and(Value::is_array) {
-            set(
-                &mut result,
-                "ruleResources",
-                arr_or_empty(backup, "ruleResources"),
-            );
-        }
-    }
-
     // DNS 规则拥有独立生命周期；旧共享备份先在内存中拆分再导入。
     if sel(BackupCategory::DnsRules) {
         let normalized = normalize_policy_backup(backup);
@@ -601,10 +591,45 @@ pub fn merge_categories(
         }
     }
 
+    // 依赖只随真正导入的规则走。空类别已记 skipped，不能继续清空本机规则集/资源，
+    // 也不能让同次选中的另一规则平面失去自己的显式依赖。
+    let custom_applied =
+        sel(BackupCategory::CustomRules) && !skipped.contains(&BackupCategory::CustomRules);
+    let dns_applied = sel(BackupCategory::DnsRules) && !skipped.contains(&BackupCategory::DnsRules);
+    if custom_applied {
+        // 流量规则保持旧导入语义：字段缺失按空数组处理。
+        set(
+            &mut result,
+            "customRuleSets",
+            arr_or_empty(backup, "customRuleSets"),
+        );
+        set(
+            &mut result,
+            "ruleResources",
+            arr_or_empty(backup, "ruleResources"),
+        );
+    } else if dns_applied {
+        // DNS-only 导入仅在备份显式带来依赖时替换，避免旧备份误清空。
+        if backup.get("customRuleSets").is_some_and(Value::is_array) {
+            set(
+                &mut result,
+                "customRuleSets",
+                arr_or_empty(backup, "customRuleSets"),
+            );
+        }
+        if backup.get("ruleResources").is_some_and(Value::is_array) {
+            set(
+                &mut result,
+                "ruleResources",
+                arr_or_empty(backup, "ruleResources"),
+            );
+        }
+    }
+
     // 网络场景随任一规则类导入：**按 id 合并**（同 id 以备份为准，其余保留 current）。备份里没带某条规则
     // 引用的场景 ⇒ 规则照常导入、`networkProfileId` 原样保留，生成侧按「引用失效」不生成（fail-closed，
     // spec §3.4-2）——**绝不**删掉引用把它变成无条件规则。
-    if sel(BackupCategory::CustomRules) || sel(BackupCategory::DnsRules) {
+    if custom_applied || dns_applied {
         if let Some(incoming) = backup.get("networkProfiles").and_then(Value::as_array) {
             let mut merged = arr_or_empty(&result, "networkProfiles")
                 .as_array()
@@ -627,8 +652,8 @@ pub fn merge_categories(
     }
 
     // DNS Server / Group / 默认解析策略独立成类；策略规则选中且备份显式带资源时自动闭包导入。
-    let dns_selected = sel(BackupCategory::DnsResources)
-        || (sel(BackupCategory::DnsRules) && has_dns_resources(backup));
+    let dns_selected =
+        sel(BackupCategory::DnsResources) || (dns_applied && has_dns_resources(backup));
     if dns_selected {
         if has_dns_resources(backup) {
             set(
@@ -933,7 +958,7 @@ pub fn build_backup_info(config: &Value, cross_platform_disabled_rules: usize) -
         manual_server_count: count_nodes(config, NodeCategory::Manual),
         mesh_server_count: count_nodes(config, NodeCategory::Mesh),
         subscription_count: arr_len(config, "subscriptions"),
-        rule_count: traffic_rule_len(config),
+        rule_count: backup_traffic_rule_len(config),
         rule_set_count: arr_len(config, "customRuleSets"),
         app_rule_count: arr_len(config, "appRules"),
         cross_platform_disabled_rules: (cross_platform_disabled_rules > 0)

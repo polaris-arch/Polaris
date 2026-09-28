@@ -567,6 +567,98 @@ fn merge_custom_rules_empty_is_skipped() {
         json!("r1"),
         "current 规则保留"
     );
+    assert_eq!(
+        out.config["customRuleSets"], current["customRuleSets"],
+        "空跳过须连同当前规则依赖保留"
+    );
+    assert_eq!(out.config["ruleResources"], current["ruleResources"]);
+}
+
+#[test]
+fn skipped_rules_do_not_import_profiles_or_dns_resource_closure() {
+    let mut current = cfg();
+    current["networkProfiles"] = json!([{"id":"local-profile"}]);
+    let empty_rules_with_other_data = json!({
+        "trafficRules": [], "dnsRules": [],
+        "customRuleSets": [], "ruleResources": [],
+        "networkProfiles": [{"id":"foreign-profile"}],
+        "dnsServers": [{"id":"foreign-dns"}],
+        "dnsDefaults": {"directServerId":"foreign-dns"}
+    });
+    let out = merge_categories(
+        &current,
+        &empty_rules_with_other_data,
+        &[C::CustomRules, C::DnsRules],
+    );
+    assert_eq!(out.skipped, vec![C::CustomRules, C::DnsRules]);
+    assert_eq!(out.config["customRuleSets"], current["customRuleSets"]);
+    assert_eq!(out.config["ruleResources"], current["ruleResources"]);
+    assert_eq!(out.config["networkProfiles"], current["networkProfiles"]);
+    assert_eq!(out.config["dnsServers"], current["dnsServers"]);
+    assert_eq!(out.config["dnsDefaults"], current["dnsDefaults"]);
+}
+
+#[test]
+fn skipped_traffic_rules_still_import_explicit_dns_rule_dependencies() {
+    let current = cfg();
+    let backup = json!({
+        "trafficRules": [], "customRuleSets": [],
+        "dnsRules": [{
+            "id":"dns-imported", "type":"domain", "values":["dns.example"],
+            "action":"direct", "enabled":true,
+            "effects":{"dns":{"enabled":true,"resolver":"direct","answerMode":"real"}}
+        }],
+        "ruleResources": [{"id":"dns-resource"}]
+    });
+    let out = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
+    assert_eq!(out.skipped, vec![C::CustomRules]);
+    assert_eq!(out.config["trafficRules"], current["trafficRules"]);
+    assert_eq!(out.config["dnsRules"][0]["id"], json!("dns-imported"));
+    assert_eq!(out.config["ruleResources"][0]["id"], json!("dns-resource"));
+}
+
+#[test]
+fn preview_of_legacy_shared_rule_offers_both_rule_planes() {
+    let legacy = json!({
+        "servers": [], "configSchemaVersion": 2,
+        "policyRules": [{
+            "id":"legacy-both", "type":"domain", "values":["legacy.example"],
+            "action":"direct", "enabled":true,
+            "effects": {
+                "route":{"enabled":true,"action":"direct"},
+                "dns":{"enabled":true,"resolver":"direct","answerMode":"real"}
+            }
+        }]
+    });
+    let parsed = parse_backup_content(&legacy.to_string()).unwrap();
+    assert_eq!(
+        detect_categories(&parsed.config),
+        vec![C::CustomRules, C::DnsRules],
+        "预览可勾的类别必须与旧共享规则的实际拆分结果一致"
+    );
+    assert_eq!(count_category(&parsed.config, C::CustomRules), 1);
+    assert_eq!(count_category(&parsed.config, C::DnsRules), 1);
+    let current = cfg();
+    let dns_only = merge_categories(&current, &parsed.config, &[C::DnsRules]);
+    assert_eq!(dns_only.config["trafficRules"], current["trafficRules"]);
+    assert_eq!(dns_only.config["dnsRules"][0]["id"], json!("legacy-both"));
+}
+
+#[test]
+fn preview_of_legacy_dns_only_rule_does_not_offer_empty_traffic_plane() {
+    let legacy = json!({
+        "servers": [], "configSchemaVersion": 2,
+        "policyRules": [{
+            "id":"legacy-dns-only", "type":"domain", "values":["legacy.example"],
+            "action":"direct", "enabled":true,
+            "effects":{"dns":{"enabled":true,"resolver":"direct","answerMode":"real"}}
+        }]
+    });
+    let parsed = parse_backup_content(&legacy.to_string()).unwrap();
+    assert_eq!(detect_categories(&parsed.config), vec![C::DnsRules]);
+    assert_eq!(count_category(&parsed.config, C::CustomRules), 0);
+    assert_eq!(count_category(&parsed.config, C::DnsRules), 1);
+    assert_eq!(build_backup_info(&parsed.config, 0).rule_count, 0);
 }
 
 #[test]

@@ -12,9 +12,14 @@
 //!
 //! F29：config_get 绝不下发隐私密码（privacyPassword 字段剥除）——对齐 Polaris。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use polaris_store::backup::{
+    merge_categories, sanitize_cross_platform_rules, sanitize_unavailable_interface_bindings,
+    BackupCategory,
+};
 use polaris_store::fs::StdFs;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -750,60 +755,66 @@ fn sync_traffic_rules_projection(config: &mut Value) {
 /// 备份导入本身就是一次整类 Apply，但广播触发的旧核退出发生在保存之后。因此资源文件、应用图标、
 /// Tailscale state 与 WARP 注销不能在这里立即执行；先写持久 journal，由 restart/start 在旧核消失后消费。
 ///
-/// `current` = 打开备份导入时的本机基准，只用来算“本次选中类别真改了哪些顶层字段”。
-/// 等待文件/网卡枚举期间可能已有后台写入；真正的字段所有权、UA 验证器失效与旧选中出口都必须以
-/// `update_deferred_cleanup` 闭包里的 `latest` 为准。
-pub(crate) fn backup_import_save_core(
-    config: &ConfigManager,
-    current: &Value,
-    restored: &mut Value,
-) -> Result<Option<String>, polaris_store::StoreError> {
-    let submitted = restored.clone();
-    let (old_selected, saved) = config.update_deferred_cleanup(|latest| {
-        // `restored` 是基于命令开始时的 `current` 合并出的整类结果。等待文件选择/接口枚举期间若后台
-        // 写了别的类别，直接整份覆盖会丢更新；这里只把 base→restored 真正变化的顶层类别重放到
-        // 最新盘值上。同一被导入类别并发变化仍由显式导入覆盖，未选类别则完整保留最新值。
-        let old_selected = latest
-            .get("selectedServerId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let mut next = latest.clone();
-        replay_top_level_delta(current, &submitted, &mut next);
-        preserve_server_owned_secrets_from(latest, &mut next);
-        enforce_backend_authoritative_fields_from(latest, &mut next);
-        log_invalidated_validators(invalidate_validators_on_global_ua_change(latest, &mut next));
-        *latest = next;
-        crate::runtime::config::Decision::Write(old_selected)
-    })?;
-    *restored = saved.expect("Decision::Write 必须返回已落盘配置");
-    Ok(old_selected)
+/// 文件读取/网卡枚举发生在锁外；按类别合并必须在此事务内以最新配置为基准。
+/// 三类节点共用 `servers` 顶层数组，按旧快照的顶层差异重放会覆盖未选节点的并发修改；而备份与
+/// 旧快照相同时差异为空，又会漏掉用户明确勾选的恢复。
+pub(crate) struct BackupImportSaved {
+    pub config: Value,
+    pub old_selected: Option<String>,
+    pub skipped: Vec<BackupCategory>,
+    pub cross_platform_disabled_rules: usize,
+    pub unavailable_interface_bindings: usize,
 }
 
-/// 把 `base → changed` 的顶层替换差集重放到 `target`。UserConfig 的备份类别本来就是顶层字段集合；
-/// 这里不做递归 merge，避免把“清空数组/删除键”误解释成“保留旧成员”。
-fn replay_top_level_delta(base: &Value, changed: &Value, target: &mut Value) {
-    let (Some(base), Some(changed), Some(target)) = (
-        base.as_object(),
-        changed.as_object(),
-        target.as_object_mut(),
-    ) else {
-        *target = changed.clone();
-        return;
-    };
-    let keys: std::collections::HashSet<&String> = base.keys().chain(changed.keys()).collect();
-    for key in keys {
-        if base.get(key) == changed.get(key) {
-            continue;
-        }
-        match changed.get(key) {
-            Some(value) => {
-                target.insert(key.clone(), value.clone());
-            }
-            None => {
-                target.remove(key);
-            }
-        }
-    }
+pub(crate) fn backup_import_save_core(
+    config: &ConfigManager,
+    backup: &Value,
+    selected: &[BackupCategory],
+    backup_platform: Option<&str>,
+    current_platform: &str,
+    available_interfaces: Option<&BTreeSet<String>>,
+) -> Result<BackupImportSaved, polaris_store::StoreError> {
+    let ((old_selected, skipped, cross_disabled, unavailable), saved) = config
+        .update_deferred_cleanup(|latest| {
+            let old_selected = latest
+                .get("selectedServerId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let outcome = merge_categories(latest, backup, selected);
+            let mut next = outcome.config;
+            let effective_selected: Vec<BackupCategory> = selected
+                .iter()
+                .copied()
+                .filter(|category| !outcome.skipped.contains(category))
+                .collect();
+            let cross_disabled = if effective_selected.contains(&BackupCategory::CustomRules) {
+                sanitize_cross_platform_rules(&mut next, backup_platform, current_platform)
+            } else {
+                0
+            };
+            let unavailable = available_interfaces.map_or(0, |names| {
+                sanitize_unavailable_interface_bindings(&mut next, names, &effective_selected)
+            });
+            preserve_server_owned_secrets_from(latest, &mut next);
+            enforce_backend_authoritative_fields_from(latest, &mut next);
+            log_invalidated_validators(invalidate_validators_on_global_ua_change(
+                latest, &mut next,
+            ));
+            *latest = next;
+            crate::runtime::config::Decision::Write((
+                old_selected,
+                outcome.skipped,
+                cross_disabled,
+                unavailable,
+            ))
+        })?;
+    Ok(BackupImportSaved {
+        config: saved.expect("Decision::Write 必须返回已落盘配置"),
+        old_selected,
+        skipped,
+        cross_platform_disabled_rules: cross_disabled,
+        unavailable_interface_bindings: unavailable,
+    })
 }
 
 /// 作废条数的统一日志（三条写腿共用；0 条不出声，避免每次保存都刷一行）。

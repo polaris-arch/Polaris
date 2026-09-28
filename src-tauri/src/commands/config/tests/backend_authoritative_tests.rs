@@ -201,7 +201,7 @@ fn whitelist_membership_is_pinned() {
 /// MRU 装进本机。与 `preserve_server_owned_secrets` 在同一处、同一理由。
 ///
 /// 牙：把 `misc/backup.rs` 里 `backup_import_apply` **函数体内**的
-/// `backup_import_save_core(...)` 换回裸 `save_full(&restored)` → 转红。
+/// `backup_import_save_core(...)` 换回裸 `save_full(...)` → 转红。
 ///
 /// # 切片必须封顶（本守卫此前的洞）
 ///
@@ -217,8 +217,8 @@ fn backup_import_routes_through_the_shared_save_core() {
     assert!(
         body.contains("backup_import_save_core(")
             && body.contains("state.config(),")
-            && body.contains("&current,")
-            && body.contains("&mut restored,"),
+            && body.contains("&parsed.config,")
+            && body.contains("&selected,"),
         "备份导入必须经共用落盘腿（三条策略 + save_full 的顺序与配对由它单一收口）"
     );
     let broadcast = body
@@ -252,14 +252,16 @@ fn backup_import_save_core_runs_all_three_policies_before_the_write() {
         "pub(crate) fn backup_import_save_core(",
     );
     let transaction = body
-        .find("config.update_deferred_cleanup(|latest|")
+        .find(".update_deferred_cleanup(|latest|")
         .expect("落盘事务被删了 —— 导入不再原子合并/落盘");
     let write = body.find("*latest = next").expect("事务提交腿被删了");
     for needle in [
-        "replay_top_level_delta(current, &submitted, &mut next)",
+        "merge_categories(latest, backup, selected)",
+        "sanitize_cross_platform_rules(",
+        "sanitize_unavailable_interface_bindings(&mut next, names, &effective_selected)",
         "preserve_server_owned_secrets_from(latest, &mut next)",
         "enforce_backend_authoritative_fields_from(latest, &mut next)",
-        "invalidate_validators_on_global_ua_change(latest, &mut next)",
+        "invalidate_validators_on_global_ua_change(",
     ] {
         let at = body
             .find(needle)

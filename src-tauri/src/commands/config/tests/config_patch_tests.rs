@@ -250,11 +250,11 @@ fn full_save_returns_the_old_exit_from_the_same_locked_transaction() {
 
 #[test]
 fn backup_import_returns_latest_locked_exit_not_its_stale_merge_base() {
+    use polaris_store::backup::BackupCategory;
+
     let dir = temp_dir("backup-old-exit");
     let manager = ConfigManager::new(dir.clone());
     let base = manager.load_full().unwrap();
-    let mut restored = base.clone();
-    restored["selectedServerId"] = json!("__block__");
 
     // 导入预览后、真提交前，另一 writer 把出口切到 node-a。旧出口必须取这一刻，
     // 不能继续用打开导入时的 base。
@@ -263,9 +263,88 @@ fn backup_import_returns_latest_locked_exit_not_its_stale_merge_base() {
     latest["selectedServerId"] = json!("node-a");
     manager.save_full(&latest).unwrap();
 
-    let old_selected =
-        backup_import_save_core(&manager, &base, &mut restored).expect("导入事务应成功");
-    assert_eq!(old_selected.as_deref(), Some("node-a"));
-    assert_eq!(restored["selectedServerId"], json!("__block__"));
-    assert_eq!(restored["servers"], json!([valid_node("node-a")]));
+    let backup = json!({"servers": [valid_node("node-b")]});
+    let saved = backup_import_save_core(
+        &manager,
+        &backup,
+        &[BackupCategory::ManualNodes],
+        None,
+        "linux",
+        None,
+    )
+    .expect("导入事务应成功");
+    assert_eq!(saved.old_selected.as_deref(), Some("node-a"));
+    assert_eq!(saved.config["selectedServerId"], Value::Null);
+    assert_eq!(saved.config["servers"], json!([valid_node("node-b")]));
+}
+
+#[test]
+fn backup_import_of_manual_nodes_keeps_concurrent_unselected_node_classes() {
+    use polaris_store::backup::BackupCategory;
+
+    let dir = temp_dir("backup-preserves-other-node-classes");
+    let manager = ConfigManager::new(dir.clone());
+    let mut base = manager.load_full().unwrap();
+    let mut subscription_node = valid_node("sub-original");
+    subscription_node["subscriptionId"] = json!("sub-1");
+    base["servers"] = json!([
+        valid_node("manual-original"),
+        {"id":"mesh-original","name":"mesh-original","protocol":"tailscale"},
+        subscription_node
+    ]);
+    base["subscriptions"] =
+        json!([{"id":"sub-1","name":"subscription","url":"https://example.invalid/sub"}]);
+    manager.save_full(&base).unwrap();
+    let base = manager.load_full().unwrap();
+
+    let backup = json!({"servers": [valid_node("manual-imported")]});
+    // 文件读取/网卡枚举期间后台改了未选择的 mesh 与订阅节点。
+    let mut latest = base.clone();
+    latest["servers"][1]["name"] = json!("mesh-newer");
+    latest["servers"][2]["name"] = json!("sub-newer");
+    manager.save_full(&latest).unwrap();
+
+    backup_import_save_core(
+        &manager,
+        &backup,
+        &[BackupCategory::ManualNodes],
+        None,
+        "linux",
+        None,
+    )
+    .unwrap();
+    let reopened = ConfigManager::new(dir.clone()).load_full().unwrap();
+    assert_eq!(reopened["servers"][0]["id"], json!("manual-imported"));
+    assert_eq!(reopened["servers"][1]["name"], json!("mesh-newer"));
+    assert_eq!(reopened["servers"][2]["name"], json!("sub-newer"));
+}
+
+#[test]
+fn backup_import_of_unchanged_class_still_overrides_concurrent_same_class_edit() {
+    use polaris_store::backup::BackupCategory;
+
+    let dir = temp_dir("backup-explicit-unchanged-class");
+    let manager = ConfigManager::new(dir.clone());
+    let mut base = manager.load_full().unwrap();
+    base["servers"] = json!([valid_node("manual-original")]);
+    manager.save_full(&base).unwrap();
+    let base = manager.load_full().unwrap();
+
+    // 用户明确勾选了手动节点；备份恰与打开预览时的手动类相同。
+    let backup = json!({"servers": [valid_node("manual-original")]});
+    let mut latest = base.clone();
+    latest["servers"] = json!([valid_node("manual-concurrent")]);
+    manager.save_full(&latest).unwrap();
+
+    backup_import_save_core(
+        &manager,
+        &backup,
+        &[BackupCategory::ManualNodes],
+        None,
+        "linux",
+        None,
+    )
+    .unwrap();
+    let reopened = ConfigManager::new(dir.clone()).load_full().unwrap();
+    assert_eq!(reopened["servers"][0]["id"], json!("manual-original"));
 }

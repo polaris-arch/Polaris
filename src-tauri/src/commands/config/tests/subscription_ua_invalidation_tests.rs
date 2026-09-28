@@ -107,8 +107,8 @@ fn full_save_without_ua_change_keeps_validators() {
 /// 而**不勾订阅类**时本机订阅的 `etag`/`lastModified` 原样留着 ⇒ 换 UA 后恒 304、新格式永远拿不到。
 /// 上面两条用例（`config:save` / `config:setValue`）对这条腿是**恒绿**的。
 ///
-/// 驱动方式与命令层逐字同形：`merge_categories(current, backup, [GeneralSettings])`
-/// → [`backup_import_save_core`]。
+/// 驱动方式与命令层同形：`backup_import_save_core` 在配置写事务内以盘上最新值合并
+/// `[GeneralSettings]`，再落盘。
 ///
 /// 牙：删掉 `backup_import_save_core` 里的 `invalidate_validators_on_global_ua_change(...)`
 /// → 前两条断言转红。
@@ -122,13 +122,15 @@ fn backup_import_of_general_settings_drops_validators_of_affected_subs() {
     // 外机备份：只有通用设置被勾，且它带着**不同**的全局 UA。
     let mut backup = current.clone();
     backup["subscriptionUserAgent"] = json!("sing-box/1.9");
-    let outcome = polaris_store::backup::merge_categories(
-        &current,
+    backup_import_save_core(
+        &mgr,
         &backup,
         &[polaris_store::backup::BackupCategory::GeneralSettings],
-    );
-    let mut restored = outcome.config;
-    backup_import_save_core(&mgr, &current, &mut restored).expect("导入落盘应成功");
+        None,
+        "linux",
+        None,
+    )
+    .expect("导入落盘应成功");
 
     let on_disk = ConfigManager::new(dir.clone()).load_full().unwrap();
     assert_eq!(
@@ -160,13 +162,15 @@ fn backup_import_with_same_ua_keeps_validators() {
 
     let mut backup = current.clone();
     backup["logLevel"] = json!("debug"); // 通用设置有变化，但 UA 没变
-    let outcome = polaris_store::backup::merge_categories(
-        &current,
+    backup_import_save_core(
+        &mgr,
         &backup,
         &[polaris_store::backup::BackupCategory::GeneralSettings],
-    );
-    let mut restored = outcome.config;
-    backup_import_save_core(&mgr, &current, &mut restored).expect("导入落盘应成功");
+        None,
+        "linux",
+        None,
+    )
+    .expect("导入落盘应成功");
 
     let on_disk = ConfigManager::new(dir.clone()).load_full().unwrap();
     assert_eq!(on_disk["logLevel"], json!("debug"), "通用设置照常导入");

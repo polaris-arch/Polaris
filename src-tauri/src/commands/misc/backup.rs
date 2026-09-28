@@ -10,9 +10,9 @@ use crate::i18n::{key, t};
 use crate::response::ApiResponse;
 use crate::runtime::AppRuntime;
 use polaris_store::backup::{
-    build_backup_info, count_category, detect_categories, merge_categories, parse_backup_content,
-    pick_categories, sanitize_cross_platform_rules, sanitize_unavailable_interface_bindings,
-    BackupCategory, BACKUP_CATEGORIES, BACKUP_FILE_VERSION,
+    build_backup_info, count_category, detect_categories, parse_backup_content, pick_categories,
+    sanitize_unavailable_interface_bindings, BackupCategory, BACKUP_CATEGORIES,
+    BACKUP_FILE_VERSION,
 };
 
 /// 把前端传来的类别串解析成枚举；空 / None → 全选。
@@ -69,7 +69,7 @@ async fn ask_open_path(app: &AppHandle) -> Option<PathBuf> {
 
 /// 上游 `BACKUP_EXPORT`：选择性导出（按 categories）。
 ///
-/// `categories` 缺省 / 空 → 全 7 类。1.1 新增 DNS 资源类别，仍兼容导入 1.0 / 裸配置。
+/// `categories` 缺省 / 空 → 全 8 类。1.2 新增独立 DNS 规则类别，仍兼容导入 1.0/1.1 / 裸配置。
 /// **clashApiSecret / privacyPassword 恒不入备份**（由 `pick_categories` 的排除表保证，见 store::backup）。
 #[tauri::command]
 pub async fn backup_export(
@@ -203,93 +203,75 @@ pub async fn backup_import_apply(
         }
     };
 
-    let current = match state.config().load_full() {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[backup] import failed to load config: {e}");
-            return Ok(ApiResponse::ok(backup_failure("configLoadFailed")));
-        }
-    };
-    let mut outcome = merge_categories(&current, &parsed.config, &selected);
-
-    // 仅当导入了自定义规则才需 sanitize（其余类无进程规则）。
-    let mut cross_disabled = 0usize;
-    if selected.contains(&BackupCategory::CustomRules) {
-        cross_disabled = sanitize_cross_platform_rules(
-            &mut outcome.config,
-            parsed.platform.as_deref(),
-            node_platform(),
-        );
-        if cross_disabled > 0 {
-            log::info!(
-                "[backup] 跨平台导入（{:?}→{}）：禁用 {cross_disabled} 条进程规则（保留供重映射）",
-                parsed.platform,
-                node_platform()
-            );
-        }
+    // 保留 configLoadFailed 语义；事务内会以最新盘值再次读取并按类别合并。
+    if let Err(e) = state.config().load_full() {
+        log::warn!("[backup] import failed to load config: {e}");
+        return Ok(ApiResponse::ok(backup_failure("configLoadFailed")));
     }
 
     // 网卡名属于设备本地资源。跨设备恢复时若目标机不存在同名接口，保留该名字会让代理核启动失败；
-    // 静默改走其它网卡又可能造成出口泄漏。因此导入预览先明确告知，应用时只把本次真正导入的失效绑定
-    // 回退为自动 / 继承，并把数量回传给 UI 做完成提醒。接口枚举失败（空集）时不改配置，避免误清。
-    let effective_selected: Vec<BackupCategory> = selected
-        .iter()
-        .copied()
-        .filter(|category| !outcome.skipped.contains(category))
-        .collect();
+    // 静默改走其它网卡又可能造成出口泄漏。因此导入预览先明确告知，应用时只处理本次真正导入的绑定。
+    // 接口枚举沿用 PC 现有实现；空集时 sanitizer 不改配置。
     let interface_names: BTreeSet<String> =
         crate::commands::system::list_network_interfaces_blocking()
             .into_iter()
             .map(|interface| interface.name)
             .collect();
-    let unavailable_interface_bindings = sanitize_unavailable_interface_bindings(
-        &mut outcome.config,
-        &interface_names,
-        &effective_selected,
-    );
-    if unavailable_interface_bindings > 0 {
-        log::warn!(
-            "[backup] 导入配置引用了本机不存在的网卡：已将 {unavailable_interface_bindings} 处绑定回退为自动/继承"
-        );
-    }
 
-    // 落盘前的三条策略 + 保存全部收口在 [`config::backup_import_save_core`]（见该函数文档）：
+    // 合并、清洗及落盘前的三条策略收口在 [`config::backup_import_save_core`] 的同一事务中：
     // 回填隐私 hash（备份导出侧脱敏，不回填 = 导入即拆锁）、以本机磁盘回正后端权威字段（外机 MRU /
     // geo 元数据不得灌进本机）、全局 UA 变更时作废受影响订阅的条件 GET 验证器（不清 = 换 UA 后恒 304）。
-    let mut restored = outcome.config.clone();
-    let old_selected = match crate::commands::config::backup_import_save_core(
+    let platform = node_platform();
+    let saved = match crate::commands::config::backup_import_save_core(
         state.config(),
-        &current,
-        &mut restored,
+        &parsed.config,
+        &selected,
+        parsed.platform.as_deref(),
+        platform,
+        Some(&interface_names),
     ) {
-        Ok(old_selected) => old_selected,
+        Ok(saved) => saved,
         Err(e) => {
             log::warn!("[backup] import save failed: {e}");
             return Ok(ApiResponse::ok(backup_failure("saveFailed")));
         }
     };
+    if saved.cross_platform_disabled_rules > 0 {
+        log::info!(
+            "[backup] 跨平台导入（{:?}→{}）：禁用 {} 条进程规则（保留供重映射）",
+            parsed.platform,
+            platform,
+            saved.cross_platform_disabled_rules
+        );
+    }
+    if saved.unavailable_interface_bindings > 0 {
+        log::warn!(
+            "[backup] 导入配置引用了本机不存在的网卡：已将 {} 处绑定回退为自动/继承",
+            saved.unavailable_interface_bindings
+        );
+    }
     // 恢复后二次 load_full 重走完整迁移链（migrate_all）再广播：备份可能来自旧版本（上游/旧 Polaris），含旧 shape
     // 字段（legacy DomainRule / subscriptionUpdateViaProxy / 遗留 tunConfig.stack 等）。`save_full` 只 sanitize+validate、
-    // **不跑迁移链**，直接广播 restored 会让旧 shape 未迁移即入核/下发前端。二次 load_full 触发 migrate_all，
-    // 广播迁移后配置。load 异常（刚存的合法配置几乎不可能）→ 回落广播 restored（仍带回填后的私密字段，不裸奔）。
-    // 广播**回填后**（restored / 其迁移形）而非 outcome.config：后者 server 私密字段已被导出侧脱敏抹平，入核 = 缺密钥热切换。
-    let broadcast_cfg = state.config().load_full().unwrap_or(restored);
+    // **不跑迁移链**，直接广播已保存配置会让旧 shape 未迁移即入核/下发前端。二次 load_full 触发 migrate_all，
+    // 广播迁移后配置。load 异常（刚存的合法配置几乎不可能）→ 回落广播保存结果（仍带回填后的私密字段）。
+    // 广播**回填后**（saved.config / 其迁移形）配置；导出侧脱敏的配置不可直接入核。
+    let broadcast_cfg = state.config().load_full().unwrap_or(saved.config);
     crate::commands::config::broadcast_config_changed(&app, &broadcast_cfg);
     crate::commands::config::invalidate_unlock_on_exit_change(
         state.unlock(),
         &crate::runtime::unlock::BroadcastSink::new(&app),
         state.proxy().status().running,
-        old_selected.as_deref(),
+        saved.old_selected.as_deref(),
         broadcast_cfg
             .get("selectedServerId")
             .and_then(Value::as_str),
     );
 
-    let info = build_backup_info(&outcome.config, cross_disabled);
-    let skipped: Vec<&str> = outcome.skipped.iter().map(|c| c.as_str()).collect();
+    let info = build_backup_info(&broadcast_cfg, saved.cross_platform_disabled_rules);
+    let skipped: Vec<&str> = saved.skipped.iter().map(|c| c.as_str()).collect();
     let mut out = json!({ "success": true, "info": info });
-    if unavailable_interface_bindings > 0 {
-        out["unavailableInterfaceBindings"] = json!(unavailable_interface_bindings);
+    if saved.unavailable_interface_bindings > 0 {
+        out["unavailableInterfaceBindings"] = json!(saved.unavailable_interface_bindings);
     }
     if !skipped.is_empty() {
         out["skipped"] = json!(skipped);
