@@ -98,6 +98,11 @@ pub struct RouteRule {
     pub process_name_not: Option<OneOrMany<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound: Option<OneOrMany<String>>,
+    /// Negate the default rule matcher. Managed mesh uses this to exclude the
+    /// subscription inbound from its generic resolve action; that inbound has
+    /// a dedicated resolve/reject pair and must not be resolved twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invert: Option<bool>,
     /// logical 子规则为纯 matcher 无 action；default/logical 外层显式设 'route'。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,

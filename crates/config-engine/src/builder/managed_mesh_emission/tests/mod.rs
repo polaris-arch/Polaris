@@ -103,7 +103,6 @@ fn legacy() -> SingBoxConfig {
         "route":{
             "rules":[
                 {"action":"sniff"},
-                {"inbound":["probe-direct-in"],"action":"route","outbound":"direct"},
                 {"process_name":["sing-box","sing-box.exe"],"action":"route","outbound":"direct"},
                 {"ip_cidr":["223.5.5.5/32","100.100.100.100/32"],"port":[53,443],"action":"route","outbound":"direct"},
                 {"port":[53],"action":"hijack-dns"},
@@ -119,7 +118,7 @@ fn first_match<'a>(rules: &'a [RouteRule], ip: &str, network: &str, port: u32) -
     rules
         .iter()
         .find(|rule| {
-            if rule.action.as_deref() == Some("sniff")
+            if matches!(rule.action.as_deref(), Some("sniff" | "resolve"))
                 || rule.process_name.is_some()
                 || rule.inbound.is_some()
             {
@@ -136,6 +135,77 @@ fn first_match<'a>(rules: &'a [RouteRule], ip: &str, network: &str, port: u32) -
             ip_matches && net_matches && rule.port.as_ref().is_none_or(|_| has_port(rule, port))
         })
         .unwrap()
+}
+
+/// Independent first-match model for the fixed core's non-terminal resolve:
+/// after resolve, ip_cidr sees DestinationAddresses; failure terminates.
+fn trace_domain<'a>(
+    rules: &'a [RouteRule],
+    answers: &[&str],
+    inbound: Option<&str>,
+    port: u32,
+) -> Result<(Option<&'a RouteRule>, usize), &'static str> {
+    trace_destination(rules, answers, inbound, port, true)
+}
+
+fn trace_ip<'a>(
+    rules: &'a [RouteRule],
+    ip: &str,
+    inbound: Option<&str>,
+    port: u32,
+) -> Result<(Option<&'a RouteRule>, usize), &'static str> {
+    trace_destination(rules, &[ip], inbound, port, false)
+}
+
+fn trace_destination<'a>(
+    rules: &'a [RouteRule],
+    answers: &[&str],
+    inbound: Option<&str>,
+    port: u32,
+    is_domain: bool,
+) -> Result<(Option<&'a RouteRule>, usize), &'static str> {
+    let mut resolved = !is_domain;
+    let mut resolve_count = 0;
+    for rule in rules {
+        if rule.action.as_deref() == Some("sniff") || rule.process_name.is_some() {
+            continue;
+        }
+        let inbound_matches = match &rule.inbound {
+            Some(OneOrMany::One(tag)) => inbound == Some(tag.as_str()),
+            Some(OneOrMany::Many(tags)) => {
+                inbound.is_some_and(|value| tags.iter().any(|tag| tag == value))
+            }
+            None => true,
+        };
+        if inbound_matches == rule.invert.unwrap_or(false) {
+            continue;
+        }
+        if rule.port.is_some() && !has_port(rule, port) {
+            continue;
+        }
+        if rule.ip_cidr.as_ref().is_some_and(|cidrs| {
+            !resolved
+                || !answers
+                    .iter()
+                    .any(|ip| cidrs.iter().any(|cidr| cidr_contains(cidr, ip)))
+        }) {
+            continue;
+        }
+        match rule.action.as_deref() {
+            Some("resolve") => {
+                if is_domain {
+                    resolve_count += 1;
+                    if answers.is_empty() {
+                        return Err("resolve failed");
+                    }
+                    resolved = true;
+                }
+            }
+            Some("route" | "reject" | "hijack-dns") => return Ok((Some(rule), resolve_count)),
+            _ => {}
+        }
+    }
+    Ok((None, resolve_count))
 }
 
 #[test]
@@ -207,6 +277,129 @@ fn final_rules_protect_both_magic_dns_ips_before_bootstrap_and_hijack() {
             .count(),
         2
     );
+}
+
+#[test]
+fn resolved_domain_ipv6_and_fakeip_name_reach_q_before_legacy_final() {
+    let input = input();
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let mut config = legacy();
+    // The old general resolve is later in route.rs; managed emission must
+    // remove it rather than let a second DNS lookup alter the Q decision.
+    config.route.as_mut().unwrap().rules.push(RouteRule {
+        action: Some("resolve".into()),
+        ..Default::default()
+    });
+    let built = emit_managed_mesh_config(&config, &input, &plan).unwrap();
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    assert_eq!(
+        rules
+            .iter()
+            .filter(|rule| rule.action.as_deref() == Some("resolve"))
+            .count(),
+        1
+    );
+    for (answers, target) in [
+        (vec!["100.80.2.3/32"], Some("ep-a")),
+        (vec!["100.81.2.3/32"], Some("ep-b")),
+    ] {
+        let (rule, count) = trace_domain(rules, &answers, None, 443).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rule.unwrap().outbound.as_deref(), target);
+    }
+    // IPv6 and a domain restored from FakeIP with an unassigned Q answer reject.
+    for answers in [vec!["fd7a:115c:a1e0:1::9/128"], vec!["100.90.2.3/32"]] {
+        let (rule, count) = trace_domain(rules, &answers, None, 443).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rule.unwrap().action.as_deref(), Some("reject"));
+    }
+    assert_eq!(trace_domain(rules, &[], None, 443), Err("resolve failed"));
+}
+
+#[test]
+fn subscription_guard_precedes_q_and_pin_cannot_preempt_q() {
+    let input = input();
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let mut config = legacy();
+    config.route.as_mut().unwrap().rules.splice(
+        1..1,
+        crate::builder::subscription_guard::subscription_update_route_rules("direct"),
+    );
+    let built = emit_managed_mesh_config(&config, &input, &plan).unwrap();
+    let rules = &built.config.route.as_ref().unwrap().rules;
+    let sub: Vec<_> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| has_subscription_inbound(rule))
+        .collect();
+    assert_eq!(sub.len(), 4); // dedicated three plus inverted generic resolve
+    assert_eq!(sub[0].1.action.as_deref(), Some("resolve"));
+    assert_eq!(sub[1].1.action.as_deref(), Some("reject"));
+    assert_eq!(sub[2].1.invert, Some(true));
+    assert_eq!(sub[3].1.outbound.as_deref(), Some("direct"));
+    let owner_at = rules
+        .iter()
+        .position(|rule| rule.outbound.as_deref() == Some("ep-a"))
+        .unwrap();
+    assert!(sub[0].0 < sub[1].0 && sub[1].0 < owner_at && owner_at < sub[3].0);
+    let (private, private_resolves) = trace_domain(
+        rules,
+        &["100.80.2.3/32"],
+        Some("subscription-update-in"),
+        443,
+    )
+    .unwrap();
+    assert_eq!(private_resolves, 1);
+    assert_eq!(private.unwrap().action.as_deref(), Some("reject"));
+    let (known_private, known_private_resolves) =
+        trace_ip(rules, "100.80.2.3/32", Some("subscription-update-in"), 443).unwrap();
+    assert_eq!(known_private_resolves, 0);
+    assert_eq!(known_private.unwrap().action.as_deref(), Some("reject"));
+    let (public, public_resolves) = trace_domain(
+        rules,
+        &["203.0.113.5/32"],
+        Some("subscription-update-in"),
+        443,
+    )
+    .unwrap();
+    assert_eq!(public_resolves, 1);
+    assert_eq!(public.unwrap().outbound.as_deref(), Some("direct"));
+}
+
+#[test]
+fn unproved_legacy_resolution_or_internal_pin_blocks_managed_emission() {
+    let input = input();
+    let plan = compile_managed_mesh_plan(input.clone()).unwrap();
+    let mut config = legacy();
+    config.route.as_mut().unwrap().rules.insert(
+        1,
+        RouteRule {
+            inbound: Some(OneOrMany::Many(vec!["probe-direct-in".into()])),
+            action: Some("route".into()),
+            outbound: Some("direct".into()),
+            ..Default::default()
+        },
+    );
+    assert!(emit_managed_mesh_config(&config, &input, &plan)
+        .unwrap_err()
+        .contains("inbound pin"));
+    let mut config = legacy();
+    config.route.as_mut().unwrap().rules.push(RouteRule {
+        inbound: Some(OneOrMany::Many(vec!["custom-in".into()])),
+        action: Some("resolve".into()),
+        ..Default::default()
+    });
+    assert!(emit_managed_mesh_config(&config, &input, &plan).is_err());
+    let mut config = legacy();
+    config.route.as_mut().unwrap().rules.push(RouteRule {
+        domain_suffix: Some(vec!["bank.example".into()]),
+        action: Some("route".into()),
+        outbound: Some("direct".into()),
+        ..Default::default()
+    });
+    assert!(emit_managed_mesh_config(&config, &input, &plan)
+        .unwrap_err()
+        .contains("domain-pinned"));
 }
 
 #[test]
@@ -291,7 +484,7 @@ fn service_reject_and_bootstrap_overlap_fail_closed() {
     );
 
     let mut config = legacy();
-    config.route.as_mut().unwrap().rules[3]
+    config.route.as_mut().unwrap().rules[2]
         .ip_cidr
         .as_mut()
         .unwrap()
@@ -409,11 +602,16 @@ fn fixed_b609_core_accepts_managed_dns_and_route_shape() {
         },
     );
     let plan = compile_managed_mesh_plan(input.clone()).unwrap();
-    let built = emit_managed_mesh_config(&legacy(), &input, &plan).unwrap();
+    let mut source = legacy();
+    source.route.as_mut().unwrap().rules.splice(
+        1..1,
+        crate::builder::subscription_guard::subscription_update_route_rules("direct"),
+    );
+    let built = emit_managed_mesh_config(&source, &input, &plan).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("managed-dns.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&built.config).unwrap()).unwrap();
-    let result = std::process::Command::new(core)
+    let result = std::process::Command::new(&core)
         .args(["--disable-color", "check", "-c"])
         .arg(&path)
         .output()
@@ -423,4 +621,20 @@ fn fixed_b609_core_accepts_managed_dns_and_route_shape() {
         "fixed core rejected emitted config: {}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let formatted = std::process::Command::new(&core)
+        .args(["format", "-c"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(formatted.status.success());
+    let wire: Value = serde_json::from_slice(&formatted.stdout).unwrap();
+    assert!(wire["route"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|rule| {
+            rule["action"] == "resolve"
+                && rule["invert"] == true
+                && rule["inbound"] == "subscription-update-in"
+        }));
 }

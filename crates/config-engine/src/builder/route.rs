@@ -1846,6 +1846,7 @@ fn empty_matcher() -> RouteRule {
         package_name: None,
         process_name_not: None,
         inbound: None,
+        invert: None,
         action: None,
         outbound: None,
         server: None,

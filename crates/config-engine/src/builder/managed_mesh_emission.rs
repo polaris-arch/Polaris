@@ -8,6 +8,9 @@ use crate::builder::mesh_dns::{
     build_mesh_dns_overlay, MeshDnsBuild, MeshDnsEmittedEndpoint, MeshDnsTargetDecision,
     MAGIC_DNS_SERVICE_CIDRS, MAGIC_DNS_SERVICE_PORT, MAGIC_DNS_SERVICE_TRANSPORTS,
 };
+use crate::builder::subscription_guard::{
+    subscription_update_route_rules, SUBSCRIPTION_UPDATE_INBOUND_TAG,
+};
 use crate::singbox::{OneOrMany, RouteRule, SingBoxConfig};
 use crate::user_config::cidr::cidrs_overlap;
 
@@ -85,10 +88,9 @@ pub fn emit_managed_mesh_config(
         .as_mut()
         .ok_or("generated config has no route section")?;
 
-    // Take exactly the three baseline rules whose order matters. In managed
-    // mode they form the prelude before probe/update/custom routes, so none of
-    // those older direct rules can preempt Q. A changed baseline must fail:
-    // approximate insertion could put service behind bootstrap or hijack.
+    // Reorder only rules whose exact baseline shape is known. Internal
+    // probe/update inbounds would otherwise either resolve before their pin
+    // or bypass Q unresolved, so they block this managed emitter for now.
     let hijack_index = route
         .rules
         .iter()
@@ -123,10 +125,75 @@ pub fn emit_managed_mesh_config(
                     Some(OneOrMany::Many(names)) if names.iter().any(|name| name == "sing-box"))
         })
         .ok_or("core process anti-loop rule is missing")?;
-    let hijack = route.rules.remove(hijack_index);
-    let bootstrap = route.rules.remove(bootstrap_index);
-    let core = route.rules.remove(core_index);
+    let subscription_indices: Vec<_> = route
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| has_subscription_inbound(rule).then_some(index))
+        .collect();
+    let subscription = if subscription_indices.is_empty() {
+        None
+    } else {
+        if subscription_indices.len() != 3
+            || subscription_indices[1] != subscription_indices[0] + 1
+            || subscription_indices[2] != subscription_indices[1] + 1
+        {
+            return Err("subscription update guard is incomplete".into());
+        }
+        let start = subscription_indices[0];
+        let pin = &route.rules[start + 2];
+        let outbound = pin
+            .outbound
+            .as_deref()
+            .ok_or("subscription update pin has no outbound")?;
+        let expected = subscription_update_route_rules(outbound);
+        if route.rules[start..start + 3] != expected {
+            return Err("subscription update guard changed shape".into());
+        }
+        Some(expected)
+    };
+    let bare_resolve = RouteRule {
+        action: Some("resolve".into()),
+        ..Default::default()
+    };
+    let mut legacy_resolve_index = None;
+    for (index, rule) in route.rules.iter().enumerate() {
+        if rule.inbound.is_some() && !subscription_indices.contains(&index) {
+            return Err("managed mesh cannot preserve a probe or update inbound pin".into());
+        }
+        if rule.action.as_deref() == Some("resolve") && !subscription_indices.contains(&index) {
+            if rule != &bare_resolve || legacy_resolve_index.replace(index).is_some() {
+                return Err("managed mesh cannot place a scoped legacy resolve after Q".into());
+            }
+        }
+        if rule.action.as_deref() == Some("route")
+            && (rule.domain.is_some()
+                || rule.domain_suffix.is_some()
+                || rule.domain_keyword.is_some()
+                || rule.domain_regex.is_some())
+        {
+            return Err(
+                "managed mesh needs an explicit exception for a domain-pinned route".into(),
+            );
+        }
+    }
+    let core = route.rules[core_index].clone();
+    let bootstrap = route.rules[bootstrap_index].clone();
+    let hijack = route.rules[hijack_index].clone();
+    let mut removed = vec![core_index, bootstrap_index, hijack_index];
+    removed.extend(subscription_indices);
+    if let Some(index) = legacy_resolve_index {
+        removed.push(index);
+    }
+    removed.sort_unstable();
+    removed.dedup();
+    for index in removed.into_iter().rev() {
+        route.rules.remove(index);
+    }
     let mut managed = vec![core];
+    if let Some(sub) = &subscription {
+        managed.extend(sub[..2].iter().cloned());
+    }
     if let Some(service) = &dns.service {
         let mut rule = RouteRule {
             ip_cidr: Some(MAGIC_DNS_SERVICE_CIDRS.map(str::to_owned).to_vec()),
@@ -139,6 +206,15 @@ pub fn emit_managed_mesh_config(
     }
     managed.push(bootstrap);
     managed.push(hijack);
+    let mut managed_resolve = bare_resolve;
+    if subscription.is_some() {
+        managed_resolve.inbound =
+            Some(OneOrMany::Many(
+                vec![SUBSCRIPTION_UPDATE_INBOUND_TAG.into()],
+            ));
+        managed_resolve.invert = Some(true);
+    }
+    managed.push(managed_resolve);
 
     for override_rule in &plan.overrides {
         if override_rule.scope_cidrs.is_empty() {
@@ -176,6 +252,9 @@ pub fn emit_managed_mesh_config(
         reject(&mut rule);
         managed.push(rule);
     }
+    if let Some(sub) = subscription {
+        managed.push(sub[2].clone());
+    }
 
     let sniff_end = route
         .rules
@@ -191,6 +270,16 @@ pub fn emit_managed_mesh_config(
         dns,
         ordinary_port53_hijack_cidrs: plan.protected_cidrs.clone(),
     })
+}
+
+fn has_subscription_inbound(rule: &RouteRule) -> bool {
+    match &rule.inbound {
+        Some(OneOrMany::One(tag)) => tag == SUBSCRIPTION_UPDATE_INBOUND_TAG,
+        Some(OneOrMany::Many(tags)) => tags
+            .iter()
+            .any(|tag| tag == SUBSCRIPTION_UPDATE_INBOUND_TAG),
+        None => false,
+    }
 }
 
 fn has_port(rule: &RouteRule, port: u32) -> bool {
