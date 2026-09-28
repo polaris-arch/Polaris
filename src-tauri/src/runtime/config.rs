@@ -829,6 +829,14 @@ impl ConfigManager {
         let canonical = self.canonicalize_untrusted_under_write_lock(config)?;
         let mut additions = derive_deferred_deletions(current, &canonical);
         additions.extend_from_slice(explicit);
+        if mesh_guard::has_managed_fields(&canonical) {
+            // The legacy deletion record contains only serverId. A managed
+            // identity is (serverId, epoch); deleting by the old journal can
+            // erase a newly bound epoch after replacement/recovery. S3c owns
+            // exact-epoch effects, so this path must not stage TS state work.
+            additions
+                .retain(|entry| !matches!(entry, DeferredConfigDeletion::TailscaleState { .. }));
+        }
         self.stage_deferred_deletion_entries_locked(additions)?;
         self.save_canonical_with_icon_reconcile(canonical, false)
     }
@@ -1008,6 +1016,15 @@ impl ConfigManager {
         let mut summary = DeferredDeletionSummary::default();
         let mut remaining = Vec::new();
         for entry in journal.entries {
+            if mesh_guard::has_managed_fields(&current)
+                && matches!(&entry, DeferredConfigDeletion::TailscaleState { .. })
+            {
+                // A pre-opt-in journal may still contain old serverId-only
+                // entries. Retain, but never execute them under managed mode.
+                summary.retrying += 1;
+                remaining.push(entry);
+                continue;
+            }
             if deferred_deletion_is_cancelled(&entry, &current) {
                 summary.cancelled += 1;
                 continue;

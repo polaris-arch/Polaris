@@ -229,6 +229,58 @@ fn marked_corruption_and_unmarked_managed_document_never_fall_back_or_overwrite(
 }
 
 #[test]
+fn managed_mode_never_executes_legacy_server_id_only_ts_deletion() {
+    let dir = temp_dir("mesh-old-ts-delete-journal");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut legacy = mgr.load_full().unwrap();
+    legacy["servers"] = deletion_fixture()["servers"].clone();
+    mgr.save_full(&legacy).unwrap();
+    let wire = mesh_wire_fixture();
+    let policy: MeshRoutePolicy =
+        serde_json::from_value(wire[mesh_guard::POLICY_KEY].clone()).unwrap();
+    let state: MeshRouteState =
+        serde_json::from_value(wire[mesh_guard::STATE_KEY].clone()).unwrap();
+    mgr.prepare_mesh_route_enable(&state.local_id).unwrap();
+    mgr.commit_prepared_mesh_route(policy, state).unwrap();
+
+    let current = mgr.load_full().unwrap();
+    let mut removed = current.clone();
+    removed["servers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|server| server.get("id").and_then(Value::as_str) != Some("ts-1"));
+    mgr.save_full_deferred_cleanup(&current, &removed).unwrap();
+    assert!(
+        !mgr.deferred_deletions_path().exists(),
+        "managed 删除 TS 节点不得写入只含 serverId 的旧清理日志"
+    );
+
+    // A pre-opt-in journal might survive into managed mode. Its old identity
+    // cannot be upgraded to an epoch merely by reading the current serverId.
+    let journal = DeferredDeletionJournal {
+        version: DEFERRED_DELETIONS_VERSION,
+        entries: vec![DeferredConfigDeletion::TailscaleState {
+            server_id: "ts-1".into(),
+        }],
+    };
+    std::fs::write(
+        mgr.deferred_deletions_path(),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    let mut calls = 0;
+    let summary = mgr
+        .process_deferred_deletions(|_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls, 0);
+    assert_eq!(summary.retrying, 1);
+    assert!(mgr.deferred_deletions_path().exists());
+}
+
+#[test]
 fn staged_pending_marker_survives_restart_and_clears_explicitly() {
     let dir = temp_dir("staged-pending");
     let marker = dir.join(STAGED_PENDING_FILE);
