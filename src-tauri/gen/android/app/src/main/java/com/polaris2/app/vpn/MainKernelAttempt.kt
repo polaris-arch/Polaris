@@ -27,6 +27,8 @@ internal class MainKernelAttempt<Server>(
         private set
     val prepared = CompletableFuture<Server?>()
     val closed = CompletableFuture<Throwable?>()
+    /** Completed only after this exact owner has been removed from the process registry. */
+    val released = CompletableFuture<Unit>()
     private var tun: Closeable? = null
     private var tunScope: TunScope? = null
     @Volatile private var startAcknowledged = false
@@ -80,15 +82,25 @@ internal class MainKernelAttempt<Server>(
 /** A Service can be recreated while the previous instance's native close is unresolved. */
 internal val MainKernelAttemptRegistry = MainKernelAttemptLedger()
 
+internal class MainKernelOwner(
+    val attempt: MainKernelAttempt<*>,
+    val requestClose: (() -> Unit)?,
+)
+
 internal class MainKernelAttemptLedger {
     private var owner: MainKernelAttempt<*>? = null
+    private var ownerClose: (() -> Unit)? = null
 
     @Synchronized
-    fun claim(attempt: MainKernelAttempt<*>): Boolean {
+    fun claim(attempt: MainKernelAttempt<*>, requestClose: (() -> Unit)? = null): Boolean {
         if (owner != null) return false
         owner = attempt
+        ownerClose = requestClose
         return true
     }
+
+    @Synchronized
+    fun ownerForDrain(): MainKernelOwner? = owner?.let { MainKernelOwner(it, ownerClose) }
 
     @Synchronized
     fun isCurrent(attempt: MainKernelAttempt<*>): Boolean = owner === attempt
@@ -108,19 +120,31 @@ internal class MainKernelAttemptLedger {
     }
 
     /** No factory was started, so this rejected system intent owns no native server. */
-    @Synchronized
     fun abandon(attempt: MainKernelAttempt<*>): Boolean {
-        if (owner !== attempt || !attempt.prepared.isDone || attempt.prepared.getNow(null) != null) return false
-        owner = null
-        return true
+        val abandoned = synchronized(this) {
+            if (owner !== attempt || !attempt.prepared.isDone || attempt.prepared.getNow(null) != null) false
+            else {
+                owner = null
+                ownerClose = null
+                true
+            }
+        }
+        if (abandoned) attempt.released.complete(Unit)
+        return abandoned
     }
 
     /** Keep the bridge acknowledgement and owner release atomic against a new Service claim. */
-    @Synchronized
     fun completeAfterClose(attempt: MainKernelAttempt<*>, action: () -> Unit): Boolean {
-        if (owner !== attempt || !attempt.closed.isDone || attempt.closed.getNow(null) != null) return false
-        action()
-        owner = null
-        return true
+        val completed = synchronized(this) {
+            if (owner !== attempt || !attempt.closed.isDone || attempt.closed.getNow(null) != null) false
+            else {
+                action()
+                owner = null
+                ownerClose = null
+                true
+            }
+        }
+        if (completed) attempt.released.complete(Unit)
+        return completed
     }
 }

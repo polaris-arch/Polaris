@@ -71,6 +71,7 @@ internal object SystemStart {
 
     /** Only ENOENT proves legacy admission. Any other stat failure remains unknown and blocks. */
     fun requireLegacyAllowed(context: Context) {
+        LegacySystemStartFence.requireOpen()
         val marker = managedMarker(context)
         try {
             Os.stat(marker.path)
@@ -80,6 +81,7 @@ internal object SystemStart {
                 throw IllegalStateException("android: 无法核实受管路由标记，旧摘要自启被拒", error)
             }
         }
+        LegacySystemStartFence.requireOpen()
     }
 
     private fun digestFile(context: Context): File = File(context.noBackupFilesDir, STARTED_DIGEST_FILE)

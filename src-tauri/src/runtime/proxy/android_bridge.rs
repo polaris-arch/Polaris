@@ -323,6 +323,84 @@ pub(super) async fn main_core_ownership() -> Result<AndroidMainCoreOwnership, St
     }
 }
 
+/// Process-local fence status only. This does not acquire the fence, publish a
+/// Preparing marker, or establish a global NoOldCore receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AndroidLegacyDrainStatus {
+    pub fence_id: String,
+    pub process_nonce: String,
+    pub state: String,
+    pub run_id: Option<String>,
+    pub closed_run_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl AndroidLegacyDrainStatus {
+    fn matches_request(&self, fence_id: &str) -> bool {
+        if self.fence_id != fence_id || self.process_nonce.is_empty() {
+            return false;
+        }
+        match self.state.as_str() {
+            "vacant" => {
+                self.run_id.is_none()
+                    && self.reason.is_none()
+                    && self.closed_run_id.as_ref().is_none_or(|id| !id.is_empty())
+            }
+            "owned" => {
+                self.run_id.as_ref().is_some_and(|id| !id.is_empty())
+                    && self.closed_run_id.is_none()
+                    && self.reason.is_none()
+            }
+            "unknown" => self
+                .reason
+                .as_ref()
+                .is_some_and(|reason| !reason.is_empty()),
+            _ => false,
+        }
+    }
+}
+
+pub(super) async fn legacy_drain_status(
+    fence_id: &str,
+) -> Result<AndroidLegacyDrainStatus, String> {
+    if fence_id.is_empty() || fence_id.trim() != fence_id {
+        return Err("Android legacy fence ID 无效".into());
+    }
+    #[cfg(target_os = "android")]
+    {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct FenceArgs {
+            fence_id: String,
+        }
+        let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+        let status = call_with_budget::<AndroidLegacyDrainStatus, _>(
+            plugin,
+            "legacyDrainStatus",
+            FenceArgs {
+                fence_id: fence_id.to_owned(),
+            },
+            LOCAL_STATE_TIMEOUT,
+        )
+        .await
+        .map_err(|error| match error {
+            BridgeCallError::Invoke(e) => format!("Android legacy fence 读取失败：{e}"),
+            BridgeCallError::TimedOut => "Android legacy fence 读取超时，旧核未知".into(),
+            BridgeCallError::TaskFailed(e) => format!("Android legacy fence 投递失败：{e}"),
+        })?;
+        if status.matches_request(fence_id) {
+            Ok(status)
+        } else {
+            Err("Android legacy fence 回执身份或形状无效，旧核未知".into())
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("本平台没有 Android legacy fence 来源".into())
+    }
+}
+
 /// Kotlin 侧 `reject(msg, code)` 的 code → 本仓码的**白名单**映射。
 ///
 /// **必须是白名单而不是原样透传**：`code` 模块的头注写死了「只收录控制流位置能诚实断言的码」，

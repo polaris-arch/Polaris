@@ -33,6 +33,7 @@ import io.nekohasekai.libbox.Libbox
 import java.io.File
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 
 @InvokeArg
@@ -46,6 +47,11 @@ class MainStartArgs {
     lateinit var runId: String
     lateinit var configDigest: String
     var claim: String? = null
+}
+
+@InvokeArg
+class LegacyFenceArgs {
+    lateinit var fenceId: String
 }
 
 internal data class MainStartRequest(
@@ -466,6 +472,13 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         val result = JSObject().put("state", state)
         if (runId != null) result.put("runId", runId)
         invoke.resolve(result)
+    }
+
+    /** Read-only status. Neither a missing ACK nor a timeout changes the gate or owner. */
+    @Command
+    fun legacyDrainStatus(invoke: Invoke) {
+        val id = invoke.parseArgs(LegacyFenceArgs::class.java).fenceId
+        invoke.resolve(LegacySystemStartFence.response(id))
     }
 
     /**
@@ -924,8 +937,55 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
  * 桥必须自己记一份，否则「起核请求还没送到服务」这一小段窗口里 `BoxService` 还是 `Stopped`，
  * 第二次 `start` 会被放行、于是两个 `Invoke` 抢同一条链路。
  */
+internal object LegacySystemStartFence {
+    private val processNonce = UUID.randomUUID().toString()
+    private val gate = LegacyAdmissionFence(
+        detachPending = { VpnBridge.detachPendingForFence() },
+        bridgeIdle = { VpnBridge.idleForFence() },
+        currentOwner = { MainKernelAttemptRegistry.ownerForDrain() },
+    )
+
+    fun <T> admit(action: () -> T): T? = gate.admit(action)
+    fun requireOpen() = gate.requireOpen()
+
+    /** Internal primitive; a future coordinator must call this before publishing Preparing. */
+    fun beginAndDrain(id: String) {
+        val begun = gate.begin(id)
+        begun.pendingToReject?.let { pending ->
+            runCatching { pending.reject("android: legacy 起核被受管迁移屏障接管", PolarisVpnPlugin.ERR_STARTUP_FAILED) }
+                .onFailure { Log.e("PolarisLegacyFence", "旧桥请求回执投递失败", it) }
+        }
+        begun.ownerToClose?.let { owner ->
+            Thread({
+                runCatching { owner.requestClose?.invoke() ?: error("exact close unavailable") }
+                    .onFailure { Log.e("PolarisLegacyFence", "确切主核关闭失败：${owner.attempt.runId}", it) }
+            }, "polaris-legacy-drain").start()
+        }
+    }
+
+    fun response(id: String, waitSeconds: Long = 0): JSObject {
+        val status = if (waitSeconds == 0L) gate.status(id)
+        else gate.await(id, waitSeconds, TimeUnit.SECONDS)
+        val result = JSObject()
+            .put("fenceId", status.fenceId)
+            .put("processNonce", processNonce)
+            .put("state", status.state)
+        status.runId?.let { result.put("runId", it) }
+        status.closedRunId?.let { result.put("closedRunId", it) }
+        status.reason?.let { result.put("reason", it) }
+        return result
+    }
+}
+
 internal object VpnBridge {
     private const val TAG = "PolarisVpnBridge"
+
+    private data class StartSettlement(
+        val invoke: Invoke?,
+        val request: MainStartRequest?,
+        val failure: String?,
+        val systemStarted: Boolean,
+    )
 
     private var pendingStart: Invoke? = null
     private var pendingStop: Invoke? = null
@@ -957,27 +1017,49 @@ internal object VpnBridge {
      */
     private var systemStarted = false
 
-    @Synchronized
-    fun beginStart(startRequest: MainStartRequest, invoke: Invoke): Boolean {
-        if (running || starting || stopping) return false
-        starting = true
-        systemStarted = false
-        request = startRequest
-        pendingStart = invoke
-        return true
-    }
+    fun beginStart(startRequest: MainStartRequest, invoke: Invoke): Boolean =
+        LegacySystemStartFence.admit {
+            synchronized(this) {
+                if (running || starting || stopping) false
+                else {
+                    starting = true
+                    systemStarted = false
+                    request = startRequest
+                    pendingStart = invoke
+                    true
+                }
+            }
+        } ?: false
 
     /**
      * 服务在**没有桥调用**的情况下被拉起（always-on / 开机接收器 / 系统重拉）。只做记账：让桥知道
      * 此刻有一个起核在飞（挡住并发的 `start`），且这个核不是本桥起的。`false` = 桥此刻不空闲。
      */
+    fun beginSystemStart(): Boolean = LegacySystemStartFence.admit {
+        synchronized(this) {
+            if (running || starting || stopping) false
+            else {
+                starting = true
+                systemStarted = true
+                true
+            }
+        }
+    } ?: false
+
+    /** Called only under the fence's A lock. The Invoke is delivered after A is released. */
     @Synchronized
-    fun beginSystemStart(): Boolean {
-        if (running || starting || stopping) return false
-        starting = true
-        systemStarted = true
-        return true
+    fun detachPendingForFence(): Invoke? {
+        val pending = pendingStart
+        if (pending != null) {
+            pendingStart = null
+            starting = false
+            request = null
+        }
+        return pending
     }
+
+    @Synchronized
+    fun idleForFence(): Boolean = !starting && !stopping && !running && pendingStart == null
 
     @Synchronized
     fun systemStartedRunning(): Boolean = running && systemStarted
@@ -989,15 +1071,19 @@ internal object VpnBridge {
      * 起服务意图（always-on 重申）是常态，没有任何人欠回执 —— 那时把 `running` 清掉，之后 Rust 的
      * `stop` 会被判成「本就没在跑」而幂等早退，隧道却还在。
      */
-    @Synchronized
     fun rejectPendingStart(error: String) {
-        val invoke = pendingStart
+        val invoke = synchronized(this) {
+            val pending = pendingStart
+            if (pending != null) {
+                pendingStart = null
+                starting = false
+            }
+            pending
+        }
         if (invoke == null) {
             Log.i(TAG, "服务已在运行/起停中，忽略一次无人等待的起核意图（$error）")
             return
         }
-        pendingStart = null
-        starting = false
         invoke.reject(error, PolarisVpnPlugin.ERR_STARTUP_FAILED)
     }
 
@@ -1012,26 +1098,29 @@ internal object VpnBridge {
     fun isStopping(): Boolean = stopping
 
     /** 结账起核：`error == null` 即成功。幂等（重复调用只记日志）。 */
-    @Synchronized
     fun finishStart(
         error: String?,
         code: String = PolarisVpnPlugin.ERR_STARTUP_FAILED,
         attempt: MainKernelAttempt<*>? = null,
     ): Boolean {
-        val invoke = pendingStart
-        val startRequest = request
-        val receiptError = if (error == null && invoke != null &&
-            (attempt == null || startRequest == null || attempt.runId != startRequest.runId)) {
-            "android: 起核回执与当前主核身份不一致"
-        } else null
-        val failure = error ?: receiptError
-        pendingStart = null
-        starting = false
-        running = failure == null
-        if (failure != null) systemStarted = false
+        val settlement = synchronized(this) {
+            val pending = pendingStart
+            val currentRequest = request
+            val receiptError = if (error == null && pending != null &&
+                (attempt == null || currentRequest == null || attempt.runId != currentRequest.runId)) {
+                "android: 起核回执与当前主核身份不一致"
+            } else null
+            val failed = error ?: receiptError
+            pendingStart = null
+            starting = false
+            running = failed == null
+            if (failed != null) systemStarted = false
+            StartSettlement(pending, currentRequest, failed, systemStarted)
+        }
+        val (invoke, startRequest, failure, wasSystemStarted) = settlement
         if (invoke == null) {
             // 系统发起的起核本就没有人欠回执（error=null 时属正常）；桥发起的起核走到这里才是异常。
-            Log.i(TAG, "起核结账时没有待决的 Invoke（systemStarted=$systemStarted, error=$failure）")
+            Log.i(TAG, "起核结账时没有待决的 Invoke（systemStarted=$wasSystemStarted, error=$failure）")
             return failure == null
         }
         if (failure == null) {
@@ -1054,7 +1143,7 @@ internal object VpnBridge {
                 invoke.resolve(response)
             }
             if (delivered.isFailure) {
-                running = false
+                synchronized(this) { running = false }
                 Log.e(TAG, "主核回执投递失败，关闭该 attempt", delivered.exceptionOrNull())
             }
             return delivered.isSuccess
@@ -1077,31 +1166,37 @@ internal object VpnBridge {
         return StopAdmission.Started
     }
 
-    /** 结账停核。服务无论因何停下（用户撤销授权 / 系统回收 / 我方请求）都必须走到这里。 */
-    @Synchronized
-    fun finishStop(error: String? = null) {
-        val invoke = pendingStop
+    /** Take all bridge callbacks under B, then deliver them outside B and registry R. */
+    fun takeFinishStop(error: String? = null): () -> Unit = synchronized(this) {
+        val stopInvoke = pendingStop
         pendingStop = null
         stopping = false
+        val startInvoke = pendingStart
+        pendingStart = null
+        starting = false
         if (error != null) {
             // The core is not usable, but its ownership remains reserved until a later confirmed close.
             running = false
             stopping = true
-            val startInvoke = pendingStart
-            pendingStart = null
-            starting = false
-            startInvoke?.reject(error, PolarisVpnPlugin.ERR_STARTUP_FAILED)
-            invoke?.reject(error, "ANDROID_CORE_STOP_FAILED")
-            return
+            return@synchronized {
+                runCatching { startInvoke?.reject(error, PolarisVpnPlugin.ERR_STARTUP_FAILED) }
+                    .onFailure { Log.e(TAG, "起核失败回执投递失败", it) }
+                runCatching { stopInvoke?.reject(error, "ANDROID_CORE_STOP_FAILED") }
+                    .onFailure { Log.e(TAG, "停核失败回执投递失败", it) }
+            }
         }
         running = false
         systemStarted = false
         request = null
         // 服务在起核途中被停掉：起核那条 Invoke 也要有回执，否则 Rust 侧只能等超时。
-        val startInvoke = pendingStart
-        pendingStart = null
-        starting = false
-        startInvoke?.reject("Android 隧道在起核途中被停止", PolarisVpnPlugin.ERR_STARTUP_FAILED)
-        invoke?.resolve()
+        return@synchronized {
+            runCatching { startInvoke?.reject("Android 隧道在起核途中被停止", PolarisVpnPlugin.ERR_STARTUP_FAILED) }
+                .onFailure { Log.e(TAG, "起核停机回执投递失败", it) }
+            runCatching { stopInvoke?.resolve() }
+                .onFailure { Log.e(TAG, "停核回执投递失败", it) }
+        }
     }
+
+    /** 服务无论因何停下都结账；调用者不可持 registry R。 */
+    fun finishStop(error: String? = null) { takeFinishStop(error).invoke() }
 }

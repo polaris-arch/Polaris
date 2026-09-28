@@ -108,6 +108,56 @@ async fn non_android_main_owner_query_is_unknown() {
     assert!(main_core_ownership().await.is_err());
 }
 
+#[test]
+fn legacy_fence_status_requires_exact_id_and_three_known_shapes() {
+    let vacant: AndroidLegacyDrainStatus = serde_json::from_value(serde_json::json!({
+        "fenceId": "fence-7", "processNonce": "process-3", "state": "vacant",
+        "closedRunId": "old-run"
+    }))
+    .unwrap();
+    assert!(vacant.matches_request("fence-7"));
+    assert!(!vacant.matches_request("fence-8"));
+    assert!(!AndroidLegacyDrainStatus {
+        closed_run_id: Some(String::new()),
+        ..vacant.clone()
+    }
+    .matches_request("fence-7"));
+
+    let owned: AndroidLegacyDrainStatus = serde_json::from_value(serde_json::json!({
+        "fenceId": "fence-7", "processNonce": "process-3", "state": "owned",
+        "runId": "old-run"
+    }))
+    .unwrap();
+    assert!(owned.matches_request("fence-7"));
+
+    let unknown: AndroidLegacyDrainStatus = serde_json::from_value(serde_json::json!({
+        "fenceId": "fence-7", "processNonce": "process-3", "state": "unknown",
+        "runId": "old-run", "reason": "cleanup-unknown"
+    }))
+    .unwrap();
+    assert!(unknown.matches_request("fence-7"));
+    assert!(!AndroidLegacyDrainStatus {
+        state: "vacant".into(),
+        reason: Some("timeout".into()),
+        ..vacant
+    }
+    .matches_request("fence-7"));
+    assert!(!AndroidLegacyDrainStatus {
+        state: "owned".into(),
+        run_id: None,
+        ..owned
+    }
+    .matches_request("fence-7"));
+}
+
+#[tokio::test]
+async fn non_android_legacy_fence_status_is_unknown() {
+    if cfg!(target_os = "android") {
+        return;
+    }
+    assert!(legacy_drain_status("fence-7").await.is_err());
+}
+
 /// 🔴 **变异锁：Kotlin 侧的 code 必须过白名单，不得原样透传。**
 ///
 /// 变异：把 `map_rejected_code` 改成 `code.unwrap_or(STARTUP_FAILED)` 之类的透传 ⇒ 第三条断。

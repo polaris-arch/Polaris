@@ -90,35 +90,32 @@ class BoxService(
     fun onStartCommand(): Int {
         val attempt = synchronized(this) {
             if (state != ServiceState.Stopped || mainAttempt != null) null
-            else MainKernelAttempt<CommandServer>(
-                SystemStart.generation(),
-                VpnBridge.currentStartRequest()?.runId ?: java.util.UUID.randomUUID().toString(),
-            )
-                .takeIf { MainKernelAttemptRegistry.claim(it) }
-                ?.also {
-                    mainAttempt = it
-                    state = ServiceState.Starting
+            else {
+                val generation = SystemStart.generation()
+                val systemRunId = java.util.UUID.randomUUID().toString()
+                LegacySystemStartFence.admit {
+                    val request = VpnBridge.currentStartRequest()
+                    val next = MainKernelAttempt<CommandServer>(
+                        generation,
+                        request?.runId ?: systemRunId,
+                    )
+                    if (!MainKernelAttemptRegistry.isVacant() ||
+                        (request == null && !VpnBridge.beginSystemStart())) null
+                    else {
+                        check(MainKernelAttemptRegistry.claim(next) { stopService(next) }) {
+                            "主核准入锁内 registry 归属发生变化"
+                        }
+                        mainAttempt = next
+                        state = ServiceState.Starting
+                        next
+                    }
                 }
+            }
         }
         if (attempt == null) {
             // An existing attempt owns its bridge reply. A duplicate system intent
             // cannot reject that pending Start or clear its config.
             Log.i(TAG, "忽略重复起核意图，服务处于 $state 状态")
-            return Service.START_NOT_STICKY
-        }
-        // 没有桥交来的配置 ⇒ 这是系统发起的起核（always-on / 开机接收器 / 进程被回收后重拉）。
-        // 先在桥上记账（挡住并发的 `start`），配置在工作线程里由 SystemStart.load 读。
-        if (VpnBridge.currentConfig() == null && !VpnBridge.beginSystemStart()) {
-            Log.w(TAG, "系统发起的起核撞上桥正忙，拒绝本次起核")
-            attempt.skipPreparation()
-            if (VpnBridge.isStopping()) stopService(attempt)
-            else synchronized(this) {
-                if (mainAttempt === attempt && state == ServiceState.Starting && !attempt.revoked) {
-                    mainAttempt = null
-                    state = ServiceState.Stopped
-                    check(MainKernelAttemptRegistry.abandon(attempt)) { "无原生内核的主核预占释放失败" }
-                }
-            }
             return Service.START_NOT_STICKY
         }
         // 先立前台通知：startForeground 的 5 秒窗口从 onStartCommand 起算，而内核起来要秒级。
@@ -127,8 +124,11 @@ class BoxService(
             registerStopReceiver()
             // A Stop broadcast sent before receiver registration has no target.
             // Recheck the bridge after registration and take over that pending Stop.
-            if (VpnBridge.isStopping()) {
+            if (VpnBridge.isStopping() || !isStarting(attempt)) {
                 attempt.skipPreparation()
+                // An exact barrier close may have run before registration. Its
+                // first Stop could not unregister a receiver that did not exist.
+                unregisterStopReceiver()
                 stopService(attempt)
                 return Service.START_NOT_STICKY
             }
@@ -299,7 +299,9 @@ class BoxService(
             TransientLoginHost.withMainConfig(attempt, config, { synchronized(this) {
                 mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
             } }) {
+                SystemStart.requireLegacyAllowed(service)
                 server.startOrReloadService(config, OverrideOptions())
+                SystemStart.requireLegacyAllowed(service)
             }
         } }
             .onFailure {
@@ -435,12 +437,17 @@ class BoxService(
             attempt.closeOnce { server ->
                 DefaultNetworkMonitor.stop()
                 TransientSpeedtestHost.closeMain(attempt) {
-                    TransientLoginHost.closeMain(attempt) {
-                        // Go's strict terminal close joins Start/OpenTun before this Java
-                        // descriptor can be released; OpenInterface duplicates it afterwards.
-                        try { server?.closeService() }
-                        finally { runCatching { detachedTun?.close() } }
-                        server?.close()
+                    // Start/Reload holds this exact attempt's operationLock. A
+                    // pre-fence call already past the final admission check must
+                    // leave native code before terminal Close can release owner.
+                    synchronized(attempt.operationLock) {
+                        TransientLoginHost.closeMain(attempt) {
+                            // Go's strict terminal close joins Start/OpenTun before this Java
+                            // descriptor can be released; OpenInterface duplicates it afterwards.
+                            try { server?.closeService() }
+                            finally { runCatching { detachedTun?.close() } }
+                            server?.close()
+                        }
                     }
                 }
             }
@@ -462,6 +469,7 @@ class BoxService(
     }
 
     private fun onAttemptClosed(attempt: MainKernelAttempt<CommandServer>, failure: Throwable?) {
+        var deliverStop: (() -> Unit)? = null
         synchronized(this) {
             if (mainAttempt !== attempt || !MainKernelAttemptRegistry.isCurrent(attempt)) return
             if (failure != null) {
@@ -473,13 +481,14 @@ class BoxService(
             // The old attempt cannot settle a later bridge: new admission remains
             // forbidden until this exact close result is acknowledged and cleared.
             check(MainKernelAttemptRegistry.completeAfterClose(attempt) {
-                VpnBridge.finishStop()
+                deliverStop = VpnBridge.takeFinishStop()
                 commandServer = null
                 mainAttempt = null
                 state = ServiceState.Stopped
                 closeFailed = false
             }) { "主核关闭回执与进程所有权不一致" }
         }
+        deliverStop?.invoke()
         mainHandler.post {
             synchronized(this) {
                 if (mainAttempt == null && state == ServiceState.Stopped && MainKernelAttemptRegistry.isVacant()) {
