@@ -3,6 +3,7 @@ package com.polaris2.app.vpn
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -38,8 +39,8 @@ internal class TransientSpeedtestSessions(
     private var closedThrough = zeroSequence
     private val mainOwners = mutableSetOf<Any>()
     private var active: Entry? = null
-    private val timer = ScheduledThreadPoolExecutor(1) {
-        Thread(it, "polaris-speedtest-timer").apply { isDaemon = true }
+    private val timer = ScheduledThreadPoolExecutor(1, ThreadFactory { runnable ->
+        Thread(runnable, "polaris-speedtest-timer").apply { isDaemon = true }
     }.apply { removeOnCancelPolicy = true }
 
     fun start(id: String, engine: Engine, done: (String?) -> Unit) {
