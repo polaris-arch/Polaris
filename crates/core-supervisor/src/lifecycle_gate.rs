@@ -190,7 +190,10 @@ impl LifecycleGate {
             return None;
         }
         g.generation = g.generation.wrapping_add(1);
-        g.generation_owner = Some(LifecycleKind::Stop);
+        // This is an owned restart, even though its first leg stops the old core. Only a
+        // separate explicit Stop claim may turn its final receipt into NotRunning and discard
+        // pending work; the transient stop leg remains nested under this outer restart.
+        g.generation_owner = Some(LifecycleKind::Restart);
         g.depth = 1;
         Some(g.generation)
     }

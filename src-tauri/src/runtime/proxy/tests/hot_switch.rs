@@ -591,6 +591,57 @@ fn explicit_selection_receipt_rejects_old_pending_and_old_success() {
 }
 
 #[tokio::test]
+async fn claimed_selected_restart_receipt_is_pending_until_explicit_stop_takes_over() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    rt.config.save_full(&disk).unwrap();
+    // The PUT succeeds, but the running selector readback disagrees, so this selected-only
+    // request schedules an exact R-projection restart instead of claiming it has applied.
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]);
+    let intent = rt.register_selector_intent();
+    let starting_generation = rt.gate.generation();
+    let outcome = rt
+        .switch_selected_server_if_current("node-b", intent)
+        .await
+        .unwrap();
+    assert_eq!(outcome, Some(SwitchOutcome::Restarting));
+    let force_id = rt.gate.pending().force_restart_id.unwrap();
+
+    // Use the actual debounced decision and runtime claim, stopping before the real core
+    // stop/start side effect. The receipt can now race this claimed restart in production.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |decision, ticket| {
+            let _ = tx.send((decision, ticket));
+        });
+    let (decision, ticket) = rx.await.unwrap();
+    assert!(matches!(
+        decision,
+        polaris_switch_engine::DebouncedOutcome::Proceed(Some(id)) if id == force_id
+    ));
+    let (_, claimed_generation) = rt
+        .claim_debounced_restart(Some(force_id), starting_generation, ticket)
+        .expect("selected projection must be claimed by its exact force id");
+    assert_eq!(
+        rt.settle_selected_switch_receipt(outcome, starting_generation, intent),
+        Some(SwitchOutcome::Pending),
+        "transient restart stop is still applying, not a terminal disconnection"
+    );
+
+    rt.gate.claim_generation(None, LifecycleKind::Stop);
+    assert_eq!(
+        rt.settle_selected_switch_receipt(outcome, starting_generation, intent),
+        Some(SwitchOutcome::NotRunning),
+        "a newer explicit Stop must retain priority over the claimed restart"
+    );
+    assert!(matches!(
+        rt.gate.end_restart_after(Some(claimed_generation)),
+        LifecycleEndResult::Stopped(_)
+    ));
+}
+
+#[tokio::test]
 async fn explicit_selection_dirty_target_is_deferred_without_put_and_pending_bar_tracks_it() {
     let (rt, _dir, sink, running) = explicit_selection_fixture();
     let mut disk = running.clone();

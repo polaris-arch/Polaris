@@ -163,13 +163,30 @@ fn debounced_restart_claim_requeues_exact_force_id_when_busy() {
     assert_eq!(gate.depth(), 1);
     assert_eq!(
         gate.generation_state(),
-        (generation + 1, Some(LifecycleKind::Stop))
+        (generation + 1, Some(LifecycleKind::Restart))
     );
     assert!(matches!(
         gate.end_restart_after(Some(generation + 1)),
         LifecycleEndResult::Drained(_)
     ));
     assert_eq!(gate.depth(), 0);
+}
+
+#[test]
+fn explicit_stop_supersedes_claimed_restart_and_discards_pending() {
+    let gate = LifecycleGate::default();
+    let claimed = gate
+        .try_begin_restart(gate.generation(), None)
+        .expect("idle restart claims the outer lifecycle");
+    gate.set_switch_pending(23);
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    assert!(stop > claimed);
+    assert_eq!(gate.generation_state(), (stop, Some(LifecycleKind::Stop)));
+    assert!(matches!(
+        gate.end_restart_after(Some(claimed)),
+        LifecycleEndResult::Stopped(_)
+    ));
+    assert!(gate.pending().is_empty());
 }
 
 #[test]
