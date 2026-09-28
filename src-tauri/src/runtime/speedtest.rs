@@ -1273,7 +1273,7 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
     cfg
 }
 
-/// Android never writes the temporary HTTP credentials to `speedtest-core.json`.
+/// Android never writes this round's HTTP inbound credential to `speedtest-core.json`.
 /// Both libbox check and start receive this in-memory derivative of the same
 /// generated file. It is deliberately strict: a raw custom endpoint cannot
 /// smuggle a second Tailscale state directory into the transient host.

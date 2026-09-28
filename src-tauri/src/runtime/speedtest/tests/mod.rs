@@ -58,7 +58,7 @@ fn android_auth_stays_in_memory_and_rejects_identity_escape() {
     let bridged = authenticated_android_temp_config(&raw, &auth).unwrap();
     assert!(
         !raw.contains("users"),
-        "disk input must remain credential-free"
+        "disk input must omit this round's HTTP inbound credential"
     );
     assert!(!raw.contains(&auth.password));
     let parsed: Value = serde_json::from_str(&bridged).unwrap();

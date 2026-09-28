@@ -1,6 +1,7 @@
 //! Android's independent libbox host for stopped-state speed tests.
-//! The on-disk config is credential-free; check and start get the same
-//! authenticated in-memory derivative. This host never enters ProxyRuntime.
+//! The on-disk config omits this round's HTTP inbound credential; it can still
+//! contain node credentials. Check and start get the same authenticated
+//! in-memory derivative. This host never enters ProxyRuntime.
 
 use super::{authenticated_android_temp_config, TempCoreCleanupUnknown, TempCoreDeps};
 use crate::runtime::proxy::android_bridge::{self, SpeedtestStartError, TransientSpeedtestState};
