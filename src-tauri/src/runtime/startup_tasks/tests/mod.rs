@@ -6,7 +6,7 @@ use serde_json::json;
 fn auto_connect_enabled_with_selected_server() {
     let cfg = json!({ "autoConnect": true, "selectedServerId": "srv-1" });
     assert_eq!(
-        decide_auto_connect(&cfg),
+        decide_auto_connect(&cfg, false),
         AutoConnectDecision::Connect {
             server_id: "srv-1".to_string()
         }
@@ -17,16 +17,22 @@ fn auto_connect_enabled_with_selected_server() {
 fn auto_connect_enabled_without_server_is_warn_branch() {
     // 开关开但没选 → NoServerSelected（对齐 上游 warn 日志分支，不静默当 Disabled）。
     assert_eq!(
-        decide_auto_connect(&json!({ "autoConnect": true })),
+        decide_auto_connect(&json!({ "autoConnect": true }), false),
         AutoConnectDecision::NoServerSelected
     );
     assert_eq!(
-        decide_auto_connect(&json!({ "autoConnect": true, "selectedServerId": "" })),
+        decide_auto_connect(
+            &json!({ "autoConnect": true, "selectedServerId": "" }),
+            false
+        ),
         AutoConnectDecision::NoServerSelected,
         "空串视同未选"
     );
     assert_eq!(
-        decide_auto_connect(&json!({ "autoConnect": true, "selectedServerId": 42 })),
+        decide_auto_connect(
+            &json!({ "autoConnect": true, "selectedServerId": 42 }),
+            false
+        ),
         AutoConnectDecision::NoServerSelected,
         "非字符串视同未选"
     );
@@ -35,18 +41,57 @@ fn auto_connect_enabled_without_server_is_warn_branch() {
 #[test]
 fn auto_connect_disabled_by_default_and_on_bad_types() {
     assert_eq!(
-        decide_auto_connect(&json!({})),
+        decide_auto_connect(&json!({}), false),
         AutoConnectDecision::Disabled,
         "缺字段 → 关"
     );
     assert_eq!(
-        decide_auto_connect(&json!({ "autoConnect": false, "selectedServerId": "s" })),
+        decide_auto_connect(
+            &json!({ "autoConnect": false, "selectedServerId": "s" }),
+            false
+        ),
         AutoConnectDecision::Disabled
     );
     assert_eq!(
-        decide_auto_connect(&json!({ "autoConnect": "true", "selectedServerId": "s" })),
+        decide_auto_connect(
+            &json!({ "autoConnect": "true", "selectedServerId": "s" }),
+            false
+        ),
         AutoConnectDecision::Disabled,
         "非 bool → 关（不做字符串 truthy 推断）"
+    );
+}
+
+/// 系统拉起的核在跑（Android always-on / 开机自动连接）⇒ 不论 `autoConnect`，都收编。
+/// 反向对照：同一份配置、`system_core_running=false` 时 `autoConnect:false` 仍是 `Disabled` ——
+/// 证明是这一位、而不是配置本身把决策翻过来的。
+#[test]
+fn system_started_core_is_adopted_regardless_of_auto_connect() {
+    let off = json!({ "autoConnect": false, "selectedServerId": "srv-1" });
+    assert_eq!(
+        decide_auto_connect(&off, true),
+        AutoConnectDecision::AdoptSystemCore {
+            server_id: "srv-1".to_string()
+        }
+    );
+    assert_eq!(
+        decide_auto_connect(&off, false),
+        AutoConnectDecision::Disabled
+    );
+    assert_eq!(
+        decide_auto_connect(&json!({ "selectedServerId": "srv-1" }), true),
+        AutoConnectDecision::AdoptSystemCore {
+            server_id: "srv-1".to_string()
+        },
+        "缺 autoConnect 字段同样收编"
+    );
+    assert_eq!(
+        decide_auto_connect(
+            &json!({ "autoConnect": false, "selectedServerId": "" }),
+            true
+        ),
+        AutoConnectDecision::NoServerSelected,
+        "没有选中节点就无从按当前配置起核 —— 落 warn 分支，不静默"
     );
 }
 

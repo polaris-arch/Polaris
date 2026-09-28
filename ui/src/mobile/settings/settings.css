@@ -1,0 +1,65 @@
+/*
+ * 设置屏的**两列列流**（K5-02）。
+ *
+ * # 为什么是屏级 CSS，而不是继续走内联
+ *
+ * 本屏的其余样式全部是内联的，理由写在 `SettingsChrome.tsx` 头注：外壳 `mobile.css` 定稿不许动，
+ * 而 `mobile-entry.test.ts` 的契约 A1 当时断言入口链路上的 CSS 集合恰等于三份 ⇒ 新增任何 `.css`
+ * 当场红。那条契约今天仍是**集合恰等**（一格没放宽），只是「屏级样式各自成文件、逐个登记」
+ * 已经是它自己的口径 —— 四个屏都在那张表里。本文件按同一条口径登记进去。
+ *
+ * 非走 CSS 不可的是这一条：`column-count` 与 `@container` **内联表达不了**。
+ * 「平板上设置项排两列」是一条断点行为，不是一个静态值。
+ *
+ * # 为什么是列流（multicol），不是 grid
+ *
+ * 分组卡高度天差地别（「通用」六行 / 「关于」两行），grid 的两列会被最高的那张卡撑出一片空白；
+ * 列流按内容自然分配，两列的底边参差但没有空洞。代价是**顺序按列走**（左列读完再读右列），
+ * 而设置项之间没有阅读顺序依赖 —— 这一格可以接受。
+ *
+ * # 为什么是后代选择器 `.ms-flow .ms-card`，不是 `>`
+ *
+ * `core.json` 的组件规格里那层容器是 `display: contents`（它只提供语义分组、不产生盒），
+ * 直接子选择器会在那种结构上**整条落空**。后代选择器对两种结构都成立。
+ *
+ * # compact 一格不变
+ *
+ * compact 档 `.ms-flow` 仍是 flex 纵列 + `--section-gap`，与它没出现之前（卡片直接当
+ * `.m-page` 的 flex 子项）逐像素相同 —— 它只是把同一份纵向节奏搬进了自己这一层。
+ */
+
+.ms-flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+}
+
+/*
+ * 一张卡不许被列断开：跨两列的卡读起来是两张残卡，而这里的每张卡都是一个语义分组。
+ * 写在断点块**之前**：同名同特异度的规则按源码顺序决胜，写在后面会把断点块里那条盖回去
+ * （`styles/cascade-dead-rules.test.ts` 全仓守着这件事）。
+ */
+.ms-flow .ms-card {
+  break-inside: avoid;
+}
+
+/* 断点：medium ≥ 37.5em（`core.json#breakpoints`），与外壳 `.m-page` 的档位同源。 */
+@container mscreen (min-width: 37.5em) {
+  .ms-flow {
+    /* 列流要求块级容器：flex 容器上的 `column-count` 无效。 */
+    display: block;
+    column-count: 2;
+    column-gap: var(--sp-6); /* 24 —— 两列中缝比纵向段距宽半档，免得两列读成一列 */
+  }
+
+  /*
+   * 块布局下 flex 的 `gap` 不再生效 ⇒ 纵向节奏改由卡片自己的下外边距承担。
+   * 用**物理** `margin-bottom` 而不是 `margin-block-end`：这一格是块轴，与书写方向无关
+   * （本仓没有任何 `writing-mode` 声明，`css-cascade.test-support.ts` 的族模型对此有自曝）；
+   * 而 `margin-block-end` 不在 `styles/css-feature-floor.test.ts` 的 ≤105 基线名单里，
+   * 为一条与方向无关的边距去动那张名单不划算。
+   */
+  .ms-flow .ms-card {
+    margin-bottom: var(--section-gap);
+  }
+}

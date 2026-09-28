@@ -1,0 +1,574 @@
+/*
+ * 移动端表单宿主的样式面（`m-form-*`）。
+ *
+ * 单独一份文件而不是塞进 `mobile.css`：外壳那份已定稿，且新增一份 CSS 必须在
+ * `mobile/mobile-entry.test.ts` 的契约 A1 允许集里**显式登记一笔** —— 那道门是集合恰等，
+ * 加一份就要显式记，不许悄悄进链路。同一批还要在
+ * `styles/css-oracle.test.ts` / `styles/css-cascade.test.ts` / `styles/text-fit.test.ts`
+ * 的移动端清单里各记一笔（那三处也是恰等快照）。
+ *
+ * ── 停靠与键盘 ─────────────────────────────────────────────────────────────
+ * `.m-form-layer` 是全视口 fixed 层，内容用 `justify-content: flex-end` **贴底**。
+ * 移动根把 visualViewport 几何发布给这一层：新版 WebView 的 IME 可以只缩可见视口，
+ * 不缩布局视口。百分比高度在这份可见边界内解析；API 缺席时仍按布局视口回退。
+ *
+ * 三段式里只有中间那段滚（`.m-form-body`）。脚（`.m-form-foot`）是 sticky 且吃掉手势条安全区：
+ * 一张 30 个字段的节点表单，提交键跟着内容滚到看不见的地方等于没有提交键。
+ */
+
+/*
+ * 一层。**同一个 `z-index`**，叠序交给 DOM 顺序（后出现的画在上面）——
+ * 逐层递增的 z 值等于再引进一个必须与栈序保持一致的数，漂了也没人会红。
+ * 值取 40：高于节点屏那张 action-sheet（`.mn-sheet-layer` 是 30），表单叠在它上面。
+ */
+.m-form-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  box-sizing: border-box;
+  padding-top: var(--safe-t);
+  padding-right: var(--safe-r);
+  padding-left: var(--safe-l);
+  top: var(--m-vv-top, 0px);
+  left: var(--m-vv-left, 0px);
+  right: auto;
+  bottom: auto;
+  width: var(--m-vv-width, 100%);
+  height: var(--m-vv-height, 100%);
+}
+
+.m-form-scrim {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: hsl(var(--bg)/0.6);
+  cursor: pointer;
+}
+
+.m-form-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 720px;
+  align-self: center;
+  max-height: 92%;
+  min-height: 0;
+  padding: 6px var(--page-inset) 0;
+  border-top-left-radius: var(--r-lg);
+  border-top-right-radius: var(--r-lg);
+  background: hsl(var(--surface));
+  box-shadow: var(--shadow-pop);
+  overflow-wrap: anywhere;
+}
+
+/* 移动端没有桌面的全局 reset；100% 宽字段必须把边框与内边距计入宽度。 */
+.m-form-panel,
+.m-form-panel * {
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+/* 拖拽把手：触屏没有「点遮罩关闭」的肌肉记忆，这条是关闭手势的可见承诺（同节点屏那张 sheet）。 */
+.m-form-grip {
+  width: 36px;
+  height: 4px;
+  margin: 0 auto var(--sp-2);
+  border-radius: 2px;
+  background: hsl(var(--hair));
+  flex: none;
+}
+
+.m-form-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid hsl(var(--hair));
+  flex: none;
+}
+
+.m-form-title {
+  flex: 1;
+  margin: 0;
+  color: hsl(var(--fg));
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.35;
+  max-height: 2.7em;
+  overflow-y: auto;
+}
+
+.m-form-x {
+  flex: none;
+  width: var(--tap-min);
+  height: var(--tap-min);
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: hsl(var(--fg-dim));
+  cursor: pointer;
+}
+
+.m-form-x svg {
+  width: 20px;
+  height: 20px;
+}
+
+.m-form-x:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.m-form-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-2) 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.m-form-foot {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0 calc(var(--sp-2) + var(--safe-b));
+  border-top: 1px solid hsl(var(--hair));
+  background: hsl(var(--surface));
+  flex: none;
+}
+
+.m-form-btn {
+  flex: 1;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.9375rem;
+  cursor: pointer;
+}
+
+/* Only footer action rows divide available width; body actions keep their content height. */
+.m-form-body > .m-form-btn {
+  flex: 0 0 auto;
+}
+
+/* Explanations keep an explicit summary; the 18px i has an independent 44px touch target.
+   Four-pixel margins fit the smallest form hint gap without overlapping the neighboring input. */
+.m-info { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.m-info-summary { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.m-info.warn > .m-info-summary { color: hsl(var(--warn)); }
+.m-info-trigger { flex: none; display: grid; place-items: center; width: var(--mobile-tap, 44px); min-height: var(--mobile-tap, 44px); margin: -4px 0; padding: 0; border: 0; border-radius: var(--r-sm); background: none; color: hsl(var(--fg-dim)); cursor: pointer; touch-action: manipulation; }
+.m-info-trigger svg { width: 18px; height: 18px; }
+.m-info-trigger:active { color: hsl(var(--flow)); background: hsl(var(--flow-weak)); }
+.m-info-trigger:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+.m-info-icon-only > .m-info-trigger { margin: 0; }
+.m-info-layer { z-index: 70; }
+.m-info-layer .m-info-body { padding-bottom: calc(16px + var(--safe-b)); font-size: .875rem; line-height: 1.5; }
+.m-info-body p { margin: 0; overflow-wrap: anywhere; }
+.m-info-body section { display: flex; flex-direction: column; gap: 4px; }
+.m-info-body h3 { margin: 0; font-size: .875rem; line-height: 1.4; font-weight: 600; }
+
+.m-form-hint.m-form-auto-update-notice {
+  color: hsl(var(--warn));
+}
+
+.m-form-btn.primary {
+  border-color: transparent;
+  background: hsl(var(--flow));
+  color: hsl(var(--bg));
+  font-weight: 600;
+}
+
+.m-form-btn.danger {
+  background: hsl(var(--err));
+  color: hsl(var(--bg));
+}
+
+.m-form-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.m-form-btn:focus-visible,
+.m-form-x:focus-visible,
+.m-form-swt:focus-visible,
+.m-form-choice-btn:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+/* ── 字段 ─────────────────────────────────────────────────────────────────── */
+
+.m-form-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.m-form-label {
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+}
+
+.m-form-req {
+  margin-inline-start: 2px;
+  color: hsl(var(--err));
+}
+
+.m-form-opt {
+  margin-inline-start: var(--sp-1);
+  color: hsl(var(--fg-faint));
+}
+
+.m-form-input,
+.m-form-select {
+  width: 100%;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.9375rem;
+}
+
+.m-form-input.mono,
+.m-form-area.mono {
+  font-family: var(--mono);
+}
+
+.m-form-area {
+  min-height: calc(var(--tap-min) * 2);
+  padding: var(--sp-2);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+/* 密文遮罩：`textarea` 没有 `type=password`，用字形替换表达同一件事。 */
+.m-form-area.masked {
+  -webkit-text-security: disc;
+}
+
+.m-form-input:focus-visible,
+.m-form-select:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  /* Keep the ring inside the field: the scrolling body clips outward outlines. */
+  outline-offset: -2px;
+}
+
+/* Critical constraints stay visible; reviewed explanations keep a summary and a touch-accessible i. */
+.m-form-hint {
+  margin: 0;
+  color: hsl(var(--fg-faint));
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.m-form-err {
+  margin: 0;
+  color: hsl(var(--err));
+  font-size: 0.75rem;
+}
+
+.m-form-msg {
+  margin: 0;
+  color: hsl(var(--fg));
+  font-size: 0.9375rem;
+  line-height: 1.6;
+}
+
+.m-form-notice {
+  margin: 0;
+  padding: var(--sp-2);
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg));
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  flex: none;
+}
+
+.m-form-notice.err {
+  background: hsl(var(--err-weak));
+  color: hsl(var(--err));
+}
+
+.m-form-notice.ok {
+  background: hsl(var(--ok-weak));
+  color: hsl(var(--ok));
+}
+
+.m-form-reveal {
+  align-self: flex-start;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: none;
+  color: hsl(var(--fg-dim));
+  font-family: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+/* ── 开关 ─────────────────────────────────────────────────────────────────── */
+
+.m-form-switch {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.m-form-switch-tx {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.m-form-swt {
+  flex: none;
+  width: 48px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: 999px;
+  background: hsl(var(--surface-3));
+  cursor: pointer;
+  position: relative;
+}
+
+.m-form-swt::after {
+  content: '';
+  position: absolute;
+  inset-inline-start: 3px;
+  top: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: hsl(var(--fg-faint));
+  transition: inset-inline-start 140ms ease, background 140ms ease;
+}
+
+.m-form-swt.on {
+  background: hsl(var(--flow-weak));
+  border-color: hsl(var(--flow));
+}
+
+.m-form-swt.on::after {
+  inset-inline-start: 23px;
+  background: hsl(var(--flow));
+}
+
+.m-form-swt:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ── 可折叠分组（取代桌面那套页签，理由见 NodeFormPanel 头注） ───────────────── */
+
+.m-form-group {
+  border: 1px solid hsl(var(--hair));
+  border-radius: var(--r-sm);
+}
+
+.m-form-group-h {
+  width: 100%;
+  min-height: var(--tap-min);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2);
+  border: 0;
+  background: none;
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.m-form-group-h svg {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  color: hsl(var(--fg-faint));
+}
+
+.m-form-group-h > span {
+  flex: 1;
+  min-width: 0;
+  text-align: start;
+}
+
+/* The policy editor alone gains paired wide-screen fields; short or enlarged type
+   returns to one column without narrowing CIDRs or the target selector. */
+.m-mesh-policy-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
+  gap: var(--sp-2) var(--sp-3);
+}
+
+.m-mesh-policy-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.m-mesh-policy-field.full { grid-column: 1 / -1; }
+.m-mesh-policy-field > .m-form-input,
+.m-mesh-policy-field > .m-form-select { width: 100%; }
+.m-mesh-policy-action { align-self: flex-start; flex: 0 0 auto; }
+
+.m-form-group-b {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-2);
+  border-top: 1px solid hsl(var(--hair));
+}
+
+/* ── 组网接入的五个选择 ───────────────────────────────────────────────────── */
+
+.m-form-choice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+.m-form-choice-btn {
+  width: 100%;
+  min-height: var(--tap-min);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: var(--sp-1) 0;
+  border: 0;
+  background: none;
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.9375rem;
+  text-align: start;
+  cursor: pointer;
+}
+
+.m-form-choice-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── 导入预览清单 ─────────────────────────────────────────────────────────── */
+
+.m-form-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.m-form-list li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-size: 0.875rem;
+}
+
+/* 地址 + 端口并排：端口那格固定宽，地址吃掉剩下的（同桌面那条 grid）。 */
+.m-form-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(96px, 28%);
+  gap: var(--sp-2);
+}
+
+.m-form-pair > * {
+  min-width: 0;
+}
+
+/* ── 二选一分段（批 3）─────────────────────────────────────────────────────────
+   三处用它：WARP 计费档（Free / WARP+）、Tailscale 登录方式（浏览器 / Auth Key）、
+   WireGuard 来源（手动填写 / 粘贴 .conf）。桌面那三处是 `.seg2`（住在 `components.css`
+   = 桌面层叠链，契约 A1 禁入），故这里另画一份。
+
+   **不用原生 `<select>` 代替**：这三处都是「两个并列的入口」而不是「从一列值里挑一个」——
+   两支各自会换掉下面整块表单（换的是**表单形态**，不是某个字段的值）。原生 select 在 Android 上
+   会弹出一个全屏选择器，把「切一下看看另一种填法」变成两跳。
+
+   每一格自带 `min-height: var(--tap-min)`（44px 触控目标），与 `.m-form-btn` 同一个数。 */
+.m-form-seg {
+  display: flex;
+  gap: 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+
+.m-form-seg > button {
+  flex: 1;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  border: 0;
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+  font-family: inherit;
+  font-size: 0.9375rem;
+  cursor: pointer;
+}
+
+.m-form-seg > button.on {
+  background: hsl(var(--flow));
+  color: hsl(var(--bg));
+  font-weight: 600;
+}
+
+.m-form-seg > button:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+/* 只读串（Tailscale 的登录地址）：可选中复制，等宽，长 URL 换行不撑破面板。 */
+.m-form-code {
+  margin: 0;
+  padding: var(--sp-2);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg));
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+/* 一行里并排的两颗次动作（复制 / 打开），与 `.m-form-btn` 同高。 */
+.m-form-inline {
+  display: flex;
+  gap: var(--sp-2);
+}

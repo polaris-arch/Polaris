@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use tauri::State;
 
 use crate::response::{ok_void, ApiResponse};
+use crate::runtime::proxy::android_bridge::{auth_status, VpnAuthState};
 use crate::runtime::AppRuntime;
 
 const ERR_UNAVAILABLE: &str = "VPN_ENDPOINT_UNAVAILABLE";
@@ -65,6 +66,20 @@ pub fn vpn_get_status(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
         serde_json::to_value(snapshot)
             .unwrap_or_else(|_| json!({ "connected": false, "openConnect": [], "openVpn": [] })),
     )
+}
+
+/// `vpn_auth_status`：**系统** VPN 授权状态（移动端设置页那一行的后端）。
+///
+/// 与 [`vpn_get_status`] 同住一个文件但不是一回事：那个报的是 OpenConnect / OpenVPN **出站协议**的
+/// 会话状态，这个报的是「操作系统给没给本应用建隧道的权限」。同名前缀是巧合，不是同一族。
+///
+/// 无参、无副作用、恒返回 `success:true` —— 读不到就是 `unknown`（见
+/// [`VpnAuthState`]）。**刻意不返 `Err`**：
+/// 调用点是设置页的一行状态芯片，把「读不到」做成 IPC 失败只会让它落进另一条错误通道，
+/// 而那条通道要说的话与这里要说的完全一样。
+#[tauri::command]
+pub async fn vpn_auth_status() -> ApiResponse<VpnAuthState> {
+    ApiResponse::ok(auth_status().await)
 }
 
 #[tauri::command]

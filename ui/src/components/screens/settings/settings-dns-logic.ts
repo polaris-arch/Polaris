@@ -176,3 +176,56 @@ export const DNS_FALLBACK = {
   domesticDns: 'https://223.5.5.5/dns-query',
   foreignDns: 'https://1.1.1.1/dns-query',
 } as const;
+
+/* ─────────────────── 国内 / 国外 DNS 的上游预设 ─────────────────── */
+
+/**
+ * 一条上游预设：`value` 是要落进 `dnsConfig.foreignDns` / `.domesticDns` 的那串字面量，
+ * `label` 是拼装好的可读名。
+ */
+export interface DnsUpstreamPreset {
+  value: string;
+  label: string;
+}
+
+/**
+ * 「自定义」那一档的哨兵值。**只存在于控件里**（`<select>` 的 value 表达不了「不在表内」），
+ * 落库时永远不写它 —— 两个消费点都在 `onChange` 里显式挡掉。
+ */
+export const DNS_PRESET_CUSTOM = '__custom__';
+
+/**
+ * 上游预设。标签只有「按 IP / 按域名的 DoH」与「阿里 / 腾讯」两类词需要翻译，服务商域名与 IP
+ * 跨语种同形（Cloudflare / Google / DNSPod 亦然），故按 `<类型> · <厂商> <地址>` 拼装而非整句入库。
+ *
+ * 走函数而非模块级常量：常量在 import 期求值，那时 i18n 语言尚未被 `syncLanguageChoice` 校正，
+ * 切语言也不会重算（同 SettingsSidebar 分组表的理由）。
+ *
+ * 🔴 **2026-09-06 从 `SettingsDns.tsx` 搬到这里**，因为移动端 DNS 页要用同一张表。
+ * 上一版这两个函数是那个**组件文件里的私有函数**，于是移动端只有两条路：抄一份（第二份真值源，
+ * 且没有任何门守着它们相等），或者 import 一个桌面屏组件（把整条桌面层叠链拖进移动入口，
+ * 契约 A1 违约）。搬到这个**已经被两端共用**的纯逻辑模块里，两条路都不用走。
+ * ⚠️ 它现在是**共享面**：改这两张表要同时跑桌面与移动端两侧的门。
+ */
+export function remotePresets(t: (key: string) => string): DnsUpstreamPreset[] {
+  const ip = t('settings.dns.dohByIp');
+  const dom = t('settings.dns.dohByDomain');
+  return [
+    { value: 'https://1.1.1.1/dns-query', label: `${ip} · Cloudflare 1.1.1.1` },
+    { value: 'https://8.8.8.8/dns-query', label: `${ip} · Google 8.8.8.8` },
+    { value: 'https://cloudflare-dns.com/dns-query', label: `${dom} · cloudflare-dns.com` },
+    { value: 'https://dns.google/dns-query', label: `${dom} · dns.google` },
+  ];
+}
+
+export function domesticPresets(t: (key: string) => string): DnsUpstreamPreset[] {
+  const ip = t('settings.dns.dohByIp');
+  const dom = t('settings.dns.dohByDomain');
+  const ali = t('settings.dns.brandAli');
+  return [
+    { value: 'https://223.5.5.5/dns-query', label: `${ip} · ${ali} 223.5.5.5` },
+    { value: 'https://1.12.12.12/dns-query', label: `${ip} · ${t('settings.dns.brandTencent')} 1.12.12.12` },
+    { value: 'https://doh.pub/dns-query', label: `${dom} · DNSPod doh.pub` },
+    { value: 'https://dns.alidns.com/dns-query', label: `${dom} · ${ali} dns.alidns.com` },
+  ];
+}

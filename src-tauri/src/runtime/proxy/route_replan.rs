@@ -36,13 +36,51 @@ const TUN_ROUTE_GRACE_POLLS: usize = 8;
 /// TUN 出口夺取 post-flight 相邻两次探测间隔。8 × 500ms ≈ 3.5s grace（末次不 sleep）。
 const TUN_ROUTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// TUN 出口夺取硬闸是否适用于本模式。
+/// TUN 出口夺取硬闸是否适用于本次起核。
 ///
 /// **仅 TUN 模式适用**：TUN 装内核 tun + `auto_route` 捕获全部流量 → 成功接管必然把「应走代理的公网
 /// 目的」的出口切到我方 utun；systemProxy/manual **不接管 tun**，出口恒在物理网卡 → baseline 差分永不
 /// 成立，设闸必误判（假阳性拦掉正常起核）。故这两类列 caveat 不闸（设计 §4.7 分流行）。
-pub(super) fn tun_route_gate_applies(mode: ProxyModeType) -> bool {
-    mode.is_tun()
+///
+/// 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）而不是磁盘上存的那个：Android 上
+/// 「接管方式」不是用户偏好而是平台事实，而存盘缺省值是 `systemProxy`。
+///
+/// # 第二个合取项：本平台有没有「逐目的出口」这条观测腿
+///
+/// 判据本体是 baseline 差分，它要求同一条探测通道**前后两次都读得出出口接口**。
+/// `SystemRouteOps::exit_interface_for`
+/// 的 Android 臂恒 `Ok(None)` 且不 spawn 任何命令（那条腿由
+/// `crates/system-integration/src/route_ops/tests` 的
+/// `impl_android_returns_none_and_never_spawns_ip` 钉住）—— 非 root 应用在那里读不到路由表，
+/// 而 `VpnService` 本就独占 tun fd、不存在「他方 VPN 占着默认路由」这个被判据物。
+///
+/// 于是在 Android 上开着这道闸，结果**恒为** [`ExitCaptureOutcome::Indeterminate`] 的放行，
+/// 代价却是每次起核在主链上白付一整个 grace 窗口
+/// （[`TUN_ROUTE_GRACE_POLLS`] × [`TUN_ROUTE_POLL_INTERVAL`] ≈ 3.5s）。**这不是假设**：今天
+/// 存盘值恰为 `tun` 的 Android 客户端已经在付这笔钱；把接管方式改读生效值之后，全部 Android
+/// 客户端都会付。故本函数把平台也收成合取项。
+///
+/// 写成穷举 `match` 而不是 `!matches!(platform, Android)`：新增平台变体时编译器强制在这里
+/// 答一次「你这个平台读得出逐目的出口吗」，而不是默默继承「读得出」（同
+/// [`crate::runtime::route_binding::runtime_binding_planning_supported`] 的理由，它拦的是
+/// **同一条**观测腿缺席带来的另一半后果）。
+pub(super) fn tun_route_gate_applies(mode: ProxyModeType, platform: Platform) -> bool {
+    if !mode.effective_on(platform).is_tun() {
+        return false;
+    }
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => true,
+        // Android：见上方「第二个合取项」。
+        Platform::Android => false,
+        // iOS：同答 false，理由与 Android 同构但来源不同 —— 本闸要观测的是「他方 VPN 是否还
+        // 占着默认路由」，而 iOS 上 `NEPacketTunnelProvider` 与 Android 的 `VpnService` 一样
+        // 独占隧道槽位（系统同时只让一条 packet tunnel 生效），被判据物不存在；且
+        // `exit_interface_for` 的 `Ios` 臂恒 `Ok(None)`，闸连取材面都没有。
+        // 开着它的代价与 Android 逐字相同：每次起核白付一整个 grace 窗口（≈3.5s）。
+        Platform::Ios => false,
+        // 未知平台：`exit_interface_for` 的 `Other` 臂同样恒 `Ok(None)` ⇒ 同上，闸没有取材面。
+        Platform::Other => false,
+    }
 }
 
 /// 一张网卡的身份。
@@ -204,7 +242,9 @@ pub(super) fn managed_tun_interface_for_network_watcher(
     config: &UserConfig,
     platform: Platform,
 ) -> Option<String> {
-    if !config.proxy_mode_type.is_tun() {
+    // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。本函数对 Android 零行为差
+    // （下方 Android 臂恒 `None`），接上仍是为了不留「今天还成立吗」需要人工复核的例外。
+    if !config.proxy_mode_type.effective_on(platform).is_tun() {
         return None;
     }
     match platform {
@@ -217,6 +257,21 @@ pub(super) fn managed_tun_interface_for_network_watcher(
         Platform::Linux => Some(polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME.to_owned()),
         // macOS utunN 由内核动态分配，本层没有可靠名字；其 watcher 在核完成路由安装后才订阅。
         Platform::Mac | Platform::Other => None,
+        // Android：**这条腿曾是 K6b 那次起停循环的另一半**（2026-09-04）。返 None ⇒ 判据拿不到
+        // 「把我方 TUN 从网卡比对里剔掉」的名字 ⇒ 每代都换 link-local 的 tun0 被读成外部网络变化。
+        //
+        // 仍返 None 而不是补一个名字，理由是**这个平台上没有可信的名字可给**：tun 接口由
+        // `VpnService.establish()` 创建、名字（`tun0`/`tun1`…）由系统按当前 VPN 槽位分配，配置里
+        // 的 `interface_name` 在 Android 上不被 libbox 消费。真正的修复在取材口 ——
+        // `route_binding::runtime_binding_planning_supported(Android) == false` 让整条逐目的绑定
+        // 规划在本平台早退，判据不再需要这个名字（K6b §3）。本臂保持诚实的「没有名字」。
+        Platform::Android => None,
+        // iOS：同返 None。与 Android 同构但来源不同：tun 由 `NEPacketTunnelProvider` 在扩展
+        // 沙箱内建立，接口名（utunN）由内核动态分配，应用侧与配置里的 `interface_name` 都不
+        // 决定它 —— 这一点其实更接近上面 macOS 那条臂的处境，而不是 Android 的。
+        // 但**后果侧跟 Android 同侧**：`runtime_binding_planning_supported(Ios) == false` 让整条
+        // 逐目的绑定规划早退，判据不需要这个名字，故返 None 不会重演 K6b。
+        Platform::Ios => None,
     }
 }
 
@@ -259,7 +314,9 @@ pub(super) fn managed_tun_interface_for_session(
     platform: Platform,
     captured: Option<ExitInterfaceId>,
 ) -> Option<ExitInterfaceId> {
-    if !config.proxy_mode_type.is_tun() {
+    // 同上，取本平台生效值。Android 上 `captured` 恒 `None`（`tun_route_gate_applies` 在该平台
+    // 不闸 ⇒ `verify_tun_route_captured` 恒 `Ok(None)`），故本函数在那里仍恒 `None`。
+    if !config.proxy_mode_type.effective_on(platform).is_tun() {
         return None;
     }
     match managed_tun_interface_for_network_watcher(config, platform) {
@@ -423,9 +480,14 @@ pub(super) fn runtime_binding_roots_covered(
 ///
 /// 平台从 [`platform_tag`] 取（`win32`，Node 约定）而非 `cfg!(windows)`：让判定在**任何 host 上都可测**，
 /// 而不是变成本机永远跑不到的 cfg 死代码（同 `resolve_start_retry_budget` 收平台入参的手法）。
+///
+/// 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]，字符串轴经 [`Platform::parse`]
+/// 这座唯一的桥换到枚举轴）。这一格今天**零行为差** —— 合取项写死 `win32`，Android 永远走不到 ——
+/// 接上是为了让「runtime 里每一处按接管方式分流的判据都读生效值」没有例外：留例外就要靠人逐处
+/// 复核「这个例外今天还成立吗」。
 #[must_use]
 pub(super) fn should_probe_wintun_adapter(mode: ProxyModeType, platform: &str) -> bool {
-    mode.is_tun() && platform == "win32"
+    mode.effective_on(Platform::parse(platform)).is_tun() && platform == "win32"
 }
 
 /// **#327**：一条起核腿对「TUN 适配器是否已建出」的观测结果（判定的**唯一输入**，不含运行期状态）。
@@ -494,22 +556,34 @@ pub(super) fn classify_tun_adapter_leg(
     }
 }
 
-impl ProxyRuntime {
-    /// 读取系统接口事实。观测失败返回 `None`，调用方必须 fail-open：它不能被解释成“所有接口都消失”。
-    pub(super) async fn observe_network_interfaces(&self) -> Option<InterfaceFingerprint> {
-        match tokio::task::spawn_blocking(crate::commands::system::list_network_interfaces_blocking)
-            .await
-        {
-            Ok(observed) if !observed.is_empty() => Some(interface_fingerprint(&observed)),
-            Ok(_) => {
-                log::warn!("网卡事实观测未取得任何接口 → 不据此改变绑定状态");
-                None
-            }
-            Err(error) => {
-                log::warn!("网卡事实观测任务失败: {error} → 不据此改变绑定状态");
-                None
-            }
+/// Android's native bridge distinguishes a successful empty physical-network snapshot from
+/// failure. Desktop empty enumeration retains the existing conservative fail-open policy.
+pub(super) fn observed_interface_fingerprint(
+    observed: Result<Vec<crate::commands::system::NetworkInterfaceInfo>, String>,
+    platform: Platform,
+) -> Option<InterfaceFingerprint> {
+    match observed {
+        Ok(rows) if platform == Platform::Android || !rows.is_empty() => {
+            Some(interface_fingerprint(&rows))
         }
+        Ok(_) => {
+            log::warn!("网卡事实观测未取得任何接口 → 不据此改变绑定状态");
+            None
+        }
+        Err(_) => {
+            log::warn!("网卡事实观测失败 → 不据此改变绑定状态");
+            None
+        }
+    }
+}
+
+impl ProxyRuntime {
+    /// 读取系统接口事实。失败返回 `None`，成功空 Android 快照表示没有可绑定物理网络。
+    pub(super) async fn observe_network_interfaces(&self) -> Option<InterfaceFingerprint> {
+        observed_interface_fingerprint(
+            crate::commands::system::list_network_interfaces().await,
+            Platform::current(),
+        )
     }
 
     /// 重启的 helper stop 回包只保证旧核已收割；TUN 路由从内核表退场仍可能晚几十毫秒。若立刻规划，
@@ -556,27 +630,37 @@ impl ProxyRuntime {
         &self,
         user_config: &UserConfig,
     ) -> Result<(), String> {
-        let required = required_bind_interfaces(user_config);
-        if required.is_empty() {
-            return Ok(());
+        #[cfg(target_os = "android")]
+        {
+            // This selector transaction holds synchronous locks. Never block_on the native bridge:
+            // the async runtime observation and the per-socket native hook enforce availability.
+            let _ = user_config;
+            Ok(())
         }
-        let observed = crate::commands::system::list_network_interfaces_blocking();
-        if observed.is_empty() {
-            log::warn!("网卡事实观测未取得任何接口 → 不据此拒绝 selector 持久化");
-            return Ok(());
+        #[cfg(not(target_os = "android"))]
+        {
+            let required = required_bind_interfaces(user_config);
+            if required.is_empty() {
+                return Ok(());
+            }
+            let observed = crate::commands::system::list_network_interfaces_blocking();
+            if observed.is_empty() {
+                log::warn!("网卡事实观测未取得任何接口 → 不据此拒绝 selector 持久化");
+                return Ok(());
+            }
+            let fingerprint = interface_fingerprint(&observed);
+            let unavailable = required_interfaces_unavailable(&required, &fingerprint);
+            unavailable
+                .is_empty()
+                .then_some(())
+                .ok_or_else(|| unavailable.diagnostic())
         }
-        let fingerprint = interface_fingerprint(&observed);
-        let unavailable = required_interfaces_unavailable(&required, &fingerprint);
-        unavailable
-            .is_empty()
-            .then_some(())
-            .ok_or_else(|| unavailable.diagnostic())
     }
 
     /// 校验 config-engine 本次生成实际会引用的 `bind_interface`。
     ///
     /// 生成侧优先级由 [`required_bind_interfaces`] 单点给出；本层只对照系统事实，不复制策略。接口枚举
-    /// 失败（空结果 / task join 失败）时跳过前置门，让 sing-box 自己 fail-closed，绝不能因为观测失败
+    /// 失败时跳过前置门（Android 成功空快照仍会拒绝实际引用的接口），让 sing-box 自己 fail-closed，绝不能因为观测失败
     /// 就把用户配置清空或改走系统默认出口。
     pub(super) async fn validate_required_bind_interfaces(
         &self,
@@ -607,7 +691,7 @@ impl ProxyRuntime {
         &self,
         mode: ProxyModeType,
     ) -> Option<ExitInterfaceId> {
-        if !tun_route_gate_applies(mode) {
+        if !tun_route_gate_applies(mode, self.helper.platform()) {
             return None;
         }
         let iface = tokio::task::spawn_blocking(|| tun_exit_interface_for_probe().ok().flatten())
@@ -633,7 +717,7 @@ impl ProxyRuntime {
         mode: ProxyModeType,
         baseline: Option<ExitInterfaceId>,
     ) -> Result<Option<ExitInterfaceId>, String> {
-        if !tun_route_gate_applies(mode) {
+        if !tun_route_gate_applies(mode, self.helper.platform()) {
             return Ok(None);
         }
         let outcome = tokio::task::spawn_blocking(move || {

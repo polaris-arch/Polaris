@@ -31,7 +31,7 @@ const MISC_MARKERS: [(&str, &str); 7] = [
         "misc.rs",
         "pub use autostart::{auto_start_get_status, auto_start_set}",
     ),
-    ("autostart.rs", "pub fn auto_start_set"),
+    ("autostart.rs", "pub async fn auto_start_set"),
     ("backup.rs", "pub async fn backup_export"),
     ("dashboard.rs", "pub async fn open_singbox_dashboard"),
     ("ipinfo.rs", "pub(crate) fn ipinfo_probe_is_current"),

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { planTsLoginSubmit } from './ts-login-server';
+import { planTsLoginSubmit, tsLoginMainCoreView, tsLoginFailureKey } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -85,6 +85,15 @@ describe('planTsLoginSubmit —— 既有节点路径', () => {
     expect(existing.tailscaleSettings?.authKey).toBe('old');
     expect(server.tailscaleSettings).not.toBe(existing.tailscaleSettings);
   });
+
+  it('多 TS 节点换授权方式仍保留该节点的来源标识与其他设置', () => {
+    const existing = tsNode({ tailscaleSettings: { sourceTag: 'subscription-a', hostname: 'phone-a', authKey: 'old' } });
+    const { server, persist } = planTsLoginSubmit(base({ existing, mode: 'authkey', authKey: 'new-key' }));
+    expect(persist).toBe('update');
+    expect(server.id).toBe(existing.id);
+    expect(server.tailscaleSettings).toMatchObject({ sourceTag: 'subscription-a', hostname: 'phone-a', authKey: 'new-key' });
+    expect(existing.tailscaleSettings?.authKey).toBe('old');
+  });
 });
 
 describe('planTsLoginSubmit —— 自建控制面（controlUrl）', () => {
@@ -146,5 +155,43 @@ describe('planTsLoginSubmit —— 切 auth_key 必须先退出登录', () => {
       base({ existing: tsNode(), mode: 'browser', hasState: true })
     );
     expect(requiresLogout).toBe(false);
+  });
+});
+
+
+describe('移动登录：保存后的重试与安全授权状态', () => {
+  it('保存后的节点即使刷新或登录失败，重试也不新增；自定义和官方控制面复用同 id', () => {
+    const first = planTsLoginSubmit(base({ controlUrl: 'https://control.example.test' }));
+    const retry = planTsLoginSubmit(base({ existing: first.server, controlUrl: 'https://control.example.test', mintId: () => { throw new Error('must not mint'); } }));
+    expect(retry.persist).toBe('none');
+    expect(retry.server.id).toBe(first.server.id);
+    const official = planTsLoginSubmit(base({ existing: retry.server, controlUrl: '' }));
+    expect(official.persist).toBe('update');
+    expect(official.server.id).toBe(first.server.id);
+    expect(official.server.tailscaleSettings?.controlUrl).toBeUndefined();
+    expect(first.server.tailscaleSettings?.controlUrl).toBe('https://control.example.test');
+  });
+  const frame = (serverId: string, backendState = 'Running', loggedIn = true, expired = false, authURL?: string) => ({
+    serverId, backendState, loggedIn, expired, authURL, tailscaleIPs: [], peers: [], canShareFiles: false,
+    waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0,
+  });
+  it('陈旧 STATUS、其它节点、启动过渡不能宣称授权；当前 Running 才可确认主核身份', () => {
+    expect(tsLoginMainCoreView('a', { connected: false, statuses: [frame('a')] }, null).state).toBe('unknown');
+    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('b')] }, null).state).toBe('unknown');
+    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'NoState', false)] }, null).state).toBe('unknown');
+    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'Starting')] }, null).state).toBe('unknown');
+    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a')] }, null).state).toBe('authorized');
+    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'Running', true, true)] }, null).state).toBe('needs-login');
+  });
+  it('主核 NeedsLogin 的 URL 可显示；授权后的新鲜帧压过旧 URL', () => {
+    const url = 'https://login.example.test/authorize';
+    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'NeedsLogin', false, false, url)] }, null)).toEqual({ state: 'url', authUrl: url });
+    expect(tsLoginMainCoreView('a', null, url)).toEqual({ state: 'url', authUrl: url });
+    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a')] }, url)).toEqual({ state: 'authorized', authUrl: null });
+  });
+  it('只按稳定错误码分类，秘密/URL/path 的原始错误不进入展示键', () => {
+    expect(tsLoginFailureKey({ code: 'TAILSCALE_LOGIN_FAILED', message: 'tskey-secret https://private /data/user' })).toBe('ts.loginStartFailed');
+    expect(tsLoginFailureKey(new Error('tskey-secret https://private /data/user'))).toBe('ts.loginAttemptFailed');
+    expect(tsLoginFailureKey({ code: 'https://private' })).toBe('ts.loginAttemptFailed');
   });
 });

@@ -17,103 +17,35 @@ import { isIpLiteral } from '@/domain/ip-literal';
 import { useDialogStore } from './dialog-store';
 import { Modal } from './Modal';
 import { dnsServerDescription, dnsServerDisplayName } from './dns-action-options';
+import {
+  formatHostsPredefined,
+  isProtectedDnsServer,
+  moveDnsGroupMember,
+  parseHostsPredefined,
+  validateDnsGroupForm,
+  validateDnsServerForm,
+  type DnsGroupFormError,
+  type DnsServerFormError,
+} from './dns-resource-logic';
 import { useConfig, type UseConfigResult } from '../screens/settings/use-config';
 import { Select, Spinner, TextInput } from '../screens/settings/Primitives';
 
-const PROTECTED_DNS_SERVER_IDS = new Set([
-  'builtin-domestic',
-  'builtin-remote',
-  'builtin-bootstrap',
-]);
-
-export function isProtectedDnsServer(serverId: string): boolean {
-  return PROTECTED_DNS_SERVER_IDS.has(serverId);
-}
-
-/** Hosts 内联记录编辑格式：每行 `domain = value1, value2`；坏行跳过。 */
-export function parseHostsPredefined(raw: string): Record<string, string[]> {
-  const records: Record<string, string[]> = {};
-  for (const line of raw.split(/\r?\n/)) {
-    const separator = line.indexOf('=');
-    if (separator <= 0) continue;
-    const domain = line.slice(0, separator).trim();
-    const values = line
-      .slice(separator + 1)
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean);
-    if (domain && values.length > 0) records[domain] = [...new Set(values)];
-  }
-  return records;
-}
-
-export function formatHostsPredefined(records: Record<string, string[]> | undefined): string {
-  return Object.entries(records ?? {})
-    .map(([domain, values]) => `${domain} = ${values.join(', ')}`)
-    .join('\n');
-}
-
-export function moveDnsGroupMember(
-  members: readonly string[],
-  from: number,
-  to: number,
-): string[] {
-  if (from < 0 || from >= members.length || to < 0 || to >= members.length || from === to) {
-    return [...members];
-  }
-  const next = [...members];
-  const [moved] = next.splice(from, 1);
-  next.splice(to, 0, moved);
-  return next;
-}
-
-export type DnsServerFormError =
-  | 'name'
-  | 'host'
-  | 'port'
-  | 'bootstrapIp'
-  | 'bootstrapMissing';
-
-export function validateDnsServerForm(input: {
-  name: string;
-  type: DnsServerKind;
-  host: string;
-  port: string;
-  isBootstrap: boolean;
-  bootstrapServerId: string;
-  validBootstrapServerIds: ReadonlySet<string>;
-}): DnsServerFormError | null {
-  if (!input.name.trim()) return 'name';
-  if (input.type === 'local' || input.type === 'hosts') return null;
-  const host = input.host.trim();
-  if (!host) return 'host';
-  if (input.port.trim()) {
-    const port = Number(input.port);
-    if (!/^\d+$/.test(input.port.trim()) || !Number.isInteger(port) || port < 1 || port > 65535) {
-      return 'port';
-    }
-  }
-  if (input.isBootstrap && !isIpLiteral(host)) return 'bootstrapIp';
-  if (
-    !input.isBootstrap
-    && !isIpLiteral(host)
-    && !input.validBootstrapServerIds.has(input.bootstrapServerId)
-  ) {
-    return 'bootstrapMissing';
-  }
-  return null;
-}
-
-export type DnsGroupFormError = 'name' | 'members';
-
-export function validateDnsGroupForm(input: {
-  name: string;
-  members: readonly string[];
-}): DnsGroupFormError | null {
-  if (!input.name.trim()) return 'name';
-  if (input.members.length === 0) return 'members';
-  return null;
-}
+/*
+ * 🔴 本表单的**判据**全部住在 `./dns-resource-logic`（纯 `.ts`），这里只原样再导出。
+ *
+ * 搬出去的理由是依赖边而不是整洁：移动端的 DNS 资源表单要复用同一份校验/往返/重排，
+ * 而从 `.tsx` 取一个纯函数会把整棵桌面弹窗组件树拖进移动端闭包。桌面调用点一行未改。
+ */
+export {
+  isProtectedDnsServer,
+  parseHostsPredefined,
+  formatHostsPredefined,
+  moveDnsGroupMember,
+  validateDnsServerForm,
+  validateDnsGroupForm,
+  type DnsServerFormError,
+  type DnsGroupFormError,
+} from './dns-resource-logic';
 
 function ServerIcon() {
   return (

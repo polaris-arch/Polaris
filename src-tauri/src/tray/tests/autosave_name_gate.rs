@@ -13,7 +13,7 @@
 
 use std::sync::LazyLock;
 
-use crate::test_support::{crate_code, crate_file, expect_marker, module_code};
+use crate::test_support::{crate_file, crate_root_code, expect_marker, module_code};
 
 /// 取材面 = **模块** `tray`（`tray.rs` + `tray/**` 递归，剔除 `tests/`）的**剥注释面**，
 /// 不是单文件 `tray.rs`、也不是全文。
@@ -37,13 +37,17 @@ static TRAY_RS: LazyLock<String> = LazyLock::new(|| {
 ///
 /// 下面 [`wired_once_at_boot`] 的三条针（`pin_tray_autosave_name(` 的**计数**、它与
 /// `reconcile_tray(handle);` 的**先后**）全是单行代码文本，写进任何一行注释就够替生产接线作证。
-/// 实测（批 D 复验）：把 `main.rs:964` 那行接线整行注释掉，全套件仍然全绿 —— 计数照旧是 1，
+/// 实测（批 D 复验）：把装配里那行接线整行注释掉，全套件仍然全绿 —— 计数照旧是 1，
 /// 顺序照旧成立，而 autosaveName 已经没人钉了。这是「注释喂饱正面断言」的教科书形态。
+///
+/// 取材面是 **crate 根**（`main.rs` + `lib.rs`，见 [`crate_root_code`]）：装配已下沉进 `lib.rs`，
+/// 哨兵随之从 `fn main() {` 换成装配入口 `pub fn run() {`。哨兵仍**独立于被测对象**
+/// （本文件三条断言一条都不碰 `run` 这个名字），与上面 `TRAY_LABEL` 那条同一取向。
 static MAIN_RS: LazyLock<String> = LazyLock::new(|| {
     expect_marker(
-        crate_code("main.rs"),
-        "src-tauri/src/main.rs",
-        "\nfn main() {",
+        crate_root_code(),
+        "src-tauri/src/{main,lib}.rs",
+        "\npub fn run() {",
     )
 });
 static CARGO_TOML: LazyLock<String> = LazyLock::new(|| {
@@ -91,11 +95,11 @@ fn wired_once_at_boot() {
     let calls = MAIN_RS.matches("pin_tray_autosave_name(").count();
     assert_eq!(
         calls, 1,
-        "main.rs 里 pin_tray_autosave_name 的调用点有 {calls} 处，应恰好 1 处（启动时一次）"
+        "crate 根里 pin_tray_autosave_name 的调用点有 {calls} 处，应恰好 1 处（启动时一次）"
     );
     let i = MAIN_RS
         .find("pin_tray_autosave_name(")
-        .expect("main.rs 没有调用 pin_tray_autosave_name —— 实现写了但没接线");
+        .expect("crate 根没有调用 pin_tray_autosave_name —— 实现写了但没接线");
     let j = MAIN_RS
         .find("reconcile_tray(handle);")
         .expect("找不到托盘启动汇流点 —— 启动流程改过了，先确认再动本门");

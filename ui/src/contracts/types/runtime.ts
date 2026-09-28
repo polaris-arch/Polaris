@@ -83,6 +83,7 @@ export enum ProxyErrorCode {
   TUN_ROUTE_NOT_CAPTURED = 'TUN_ROUTE_NOT_CAPTURED', // TUN 模式起核就绪后 post-flight 判定「应走代理的公网目的」出口 grace 内始终未从 baseline 切走（其他 VPN 占默认路由 / 我方路由装失败）→ 硬闸拒绝标 connected，避免「假报已连接、连接数 0」（见 runtime/proxy::verify_tun_route_captured）
   TUN_ADDRESS_UNAVAILABLE = 'TUN_ADDRESS_UNAVAILABLE', // #332 核 stderr 的 FATAL 行指明失败发生在「给 TUN 网卡装地址」这一步（地址被残留网卡/其他 VPN 占用）→ 专属真因上屏，替代「起核超时/启动期退出」这种与现场无关的通用失败（判据是 sing-box/sing-tun 源码字面量，不是 errno 文案；见 runtime/proxy::classify_core_fatal_line）
   TUN_ADAPTER_MISSING = 'TUN_ADAPTER_MISSING', // #327 TUN@Windows 起核就绪后逐腿正向验证：整个重试预算内一次都没枚举到本次配置的 wintun 适配器（网卡压根没建出来）→ 硬闸拒绝标 connected。与 TUN_ROUTE_NOT_CAPTURED 分工：那条是「建出来了但路由被别的 VPN 占」（去断开对方），本条是「根本没建出来」（去查 wintun 驱动/安全软件拦截），指引相反不得合并（见 runtime/proxy::probe_tun_adapter_present）
+  VPN_PERMISSION_DENIED = 'VPN_PERMISSION_DENIED', // Android 起核前 `VpnService.prepare()` 返回非 null（用户没给 VPN 授权）→ 引导去系统里授权。与 STARTUP_FAILED 分开的理由是用户的下一步动作完全相反：这条要去授权，那条要去查节点/网络（见 runtime/proxy::code 与 gen/android 的 PolarisVpnPlugin.start）
   ROOT_ORPHAN_BLOCKED = 'ROOT_ORPHAN_BLOCKED', // 上次遗留的 root 孤儿核用户态杀不动、独占 cache.db，任何模式都起不来 → 阻断起核并落终态；message 携带的 pid 仅进脱敏日志，UI 显示稳定码对应的 i18n 指引
   // 进程生命周期类 → ErrorCategory.Process
   STARTUP_FAILED = 'STARTUP_FAILED', // 退出码 1
@@ -137,6 +138,9 @@ export interface ConnectionEntry {
   id: string;
   chains: string[];
   rule: string;
+  /** 起核快照从实际 route 产物证明的用户规则身份；缺席时按出站类别展示。 */
+  ruleId?: string;
+  ruleName?: string;
   /**
    * 规则载荷。**当前无生产者**：上游 gRPC `Connection`（`stats-engine/src/types.rs` 的
    * `SingBoxConnection`）只有 `rule` 一个字段，没有 payload。声明成必填是当年照抄 clash HTTP API
@@ -145,14 +149,15 @@ export interface ConnectionEntry {
    */
   rulePayload?: string;
   metadata?: {
-    host?: string;
-    destinationIP?: string;
-    network?: string; // tcp/udp
-    type?: string; // 入站类型（如 Tun/HTTP/Socks）
-    sourceIP?: string;
-    sourcePort?: string;
-    destinationPort?: string;
-    processPath?: string; // 发起连接的进程路径（隐私字段）
+    // Rust ConnectionMetadata 的 Option 字段缺值时序列化为 null。
+    host?: string | null;
+    destinationIP?: string | null;
+    network?: string | null; // tcp/udp
+    type?: string | null; // 入站类型（如 Tun/HTTP/Socks）
+    sourceIP?: string | null;
+    sourcePort?: string | null;
+    destinationPort?: string | null;
+    processPath?: string | null; // 发起连接的进程路径（隐私字段）
   };
   upload?: number; // 累计上行字节
   download?: number; // 累计下行字节
@@ -369,6 +374,8 @@ export type ProxyReachability =
   | 'unknown';
 
 export interface IpInfoSnapshot {
+  /** 后端权威可见帧的单调版本；事件、peek、手动 get 对同一帧复用该值。 */
+  revision: number;
   /** 本地直连出口（auto_detect_interface 物理网卡），代理未连时也可测。 */
   direct: IpInfo | null;
   /** 代理出口（当前选中节点），代理未连时为 null。 */

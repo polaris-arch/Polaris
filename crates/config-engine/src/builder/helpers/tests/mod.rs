@@ -138,6 +138,7 @@ fn geo_categories_from_custom_app_preset() {
         geosite_tags: vec!["mytube".into()],
         geoip_tags: vec!["mytube".into()],
         process_names: None,
+        package_names: vec![],
         category: None,
     };
     let (geosite, geoip) = get_required_geo_categories(&[], &[app_rule], &[preset]);
@@ -185,6 +186,7 @@ fn geo_categories_builtin_wins_over_custom_same_id() {
         geosite_tags: vec!["evil".into()],
         geoip_tags: vec!["evil".into()],
         process_names: None,
+        package_names: vec![],
         category: None,
     };
     let (geosite, geoip) = get_required_geo_categories(&[], &[app_rule], &[shadow]);

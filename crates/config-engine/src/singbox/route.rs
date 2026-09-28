@@ -87,6 +87,13 @@ pub struct RouteRule {
     pub process_name: Option<OneOrMany<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_path: Option<OneOrMany<String>>,
+    /// Android applicationId 匹配（上游 `option/rule.go:165` `PackageName`，
+    /// 命中逻辑 `route/rule/rule_item_package_name.go:27-37`：读连接属主回填的
+    /// `ProcessInfo.PackageNames`，本仓由 `PlatformInterfaceWrapper.kt` 的 `findConnectionOwner`
+    /// 经 `setAndroidPackageNames` 填）。桌面恒不发 —— 发射点只有 `builder::route` 的应用规则
+    /// Android 腿，平台判据见那里的 `app_owner_leg`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<OneOrMany<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_name_not: Option<OneOrMany<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

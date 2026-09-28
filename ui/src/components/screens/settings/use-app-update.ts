@@ -17,10 +17,15 @@ import { useDialogStore } from '../../dialogs/dialog-store';
 import { markAppVersionSkipped } from '../../layout/app-update-banner';
 import {
   appDownloadIntegrity,
+  appUpdateErrText,
   isPortableZipUpdate,
   wireUpdateProgress,
   type AppDownloadIntegrity,
 } from './settings-logic';
+
+/* U1 取文腿 2026-09-13 搬进 `settings-logic`：移动端更新页是同一批码的第二个消费点，
+   各写一份必然漂（措辞与兜底规则），而漂了两侧都只是「显示了一句话」，不会红。 */
+const updateErrText = appUpdateErrText;
 
 export type AppUpdateState =
   | 'idle'
@@ -35,19 +40,6 @@ interface InstallSubject {
   path: string;
   info: UpdateProgressManifest | null;
   integrity: AppDownloadIntegrity;
-}
-
-/** U1：失败机器码映射到本地化正文；技术诊断只保留在 IPC 和日志。 */
-function updateErrText(
-  rawCode: string | null | undefined,
-  _detail: string | null | undefined,
-  t: (k: string) => string,
-): string {
-  const code = rawCode === 'HTTP_BACKEND_UNAVAILABLE' ? 'backendUnavailable' : rawCode;
-  const body = code ? t(`settings.update.err.${code}`) : '';
-  return body && body !== `settings.update.err.${code}`
-    ? body
-    : t('settings.update.downloadInterrupted');
 }
 
 export function useAppUpdate(includePrerelease: boolean) {

@@ -41,7 +41,10 @@
     "quit": "Quit Polaris",
     "manageInMain": "Manage in main window…",
     "actionFailed": "\"{{action}}\" failed: {{detail}}",
-    "actionFailedDetail": "The operation could not be completed"
+    "actionFailedDetail": "The operation could not be completed",
+    "switchPending": "{{node}} saved; applying connection change",
+    "switchSavedForNextStart": "{{node}} saved for the next connection",
+    "switchRequiresApply": "{{node}} saved; apply pending changes before use"
   },
   "updatePopup": {
     "newVersion": "New version {{version}}",
@@ -109,6 +112,11 @@
     "speedTestComplete": "Speed test complete. Open Polaris to view results.",
     "fatalPageTitle": "Interface failed to initialize",
     "fatalPageBody": "The interface failed to load. Try reloading it. Your proxy connection is unaffected.",
-    "fatalPageReload": "Reload"
+    "fatalPageReload": "Reload",
+    "debugReport": "Export bug report (Debug)",
+    "debugReportBusy": "Preparing report…",
+    "debugReportHint": "Includes device details, recent logs, and redacted configuration. Review before sharing.",
+    "debugReportDone": "Share sheet opened. Choose a recipient.",
+    "debugReportFailed": "Could not prepare or share the report. Retry or collect logs via ADB."
   }
 }

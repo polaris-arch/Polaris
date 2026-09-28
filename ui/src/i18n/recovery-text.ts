@@ -14,7 +14,12 @@ import { native as fa } from './locales/auxiliary/fa.json';
 type FatalPageKey =
   | 'native.fatalPageTitle'
   | 'native.fatalPageBody'
-  | 'native.fatalPageReload';
+  | 'native.fatalPageReload'
+  | 'native.debugReport'
+  | 'native.debugReportBusy'
+  | 'native.debugReportHint'
+  | 'native.debugReportDone'
+  | 'native.debugReportFailed';
 
 const recoveryI18n = createAuxI18n<FatalPageKey>('native', {
   'zh-CN': zhCN,
@@ -28,10 +33,16 @@ const RECOVERY_KEY = {
   title: 'native.fatalPageTitle',
   body: 'native.fatalPageBody',
   reload: 'native.fatalPageReload',
+  report: 'native.debugReport',
+  reportBusy: 'native.debugReportBusy',
+  reportHint: 'native.debugReportHint',
+  reportDone: 'native.debugReportDone',
+  reportFailed: 'native.debugReportFailed',
 } as const satisfies Readonly<Record<string, FatalPageKey>>;
 
 export type RecoveryTextId = keyof typeof RECOVERY_KEY;
 
 export function recoveryText(id: RecoveryTextId): string {
+  recoveryI18n.refresh();
   return recoveryI18n.t(RECOVERY_KEY[id]);
 }

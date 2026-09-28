@@ -82,10 +82,11 @@ struct BuildSite {
 /// 里给它配一条入口线程纪律断言**。
 const REGISTRY: [BuildSite; 4] = [
     BuildSite {
-        file: "main.rs",
+        // 移动端分支把入口从 `main.rs::main` 搬进了 `lib.rs::run`（`main.rs` 只剩一行转调）。
+        file: "lib.rs",
         needle: "WebviewWindowBuilder::from_config(",
         enclosing: "fn create_main_window(",
-        callers: &["fn main(", "fn show_main_window_on_main_thread("],
+        callers: &["fn show_main_window_on_main_thread(", "pub fn run("],
         discipline: "首建在 setup；重建由 `show_main_window` 先 spawn 脱帧再 run_on_main_thread（W18，\
                      守卫 `tests::main_window_rebuild_is_dispatched_to_main_thread`）",
     },

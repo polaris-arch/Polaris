@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { TFunction } from 'i18next';
 import type { DnsServerGroup, DnsServerResource } from '@/contracts/types';
 import {
@@ -102,6 +105,62 @@ describe('DNS action choice codec', () => {
       hostsServerId: 'hosts-a',
       fallback: { type: 'reject', method: 'default' },
     });
+  });
+});
+
+/**
+ * 移动端把组标题当**折叠键**用（`mobile/settings/DnsPage.tsx#collapsibleGroups`：
+ * `id: group.label`）。那条取舍本身是对的 —— 给 `buildDnsActionGroups` 塞 id 会让桌面那三处
+ * 下拉一起变成可折叠的，而「折不折」是屏宽决定的呈现取舍，不是候选表的性质。
+ *
+ * 🔴 但「标题唯一」在那之前是**数据决定的、不是结构保证的**：四条标题今天五语下逐条不同，
+ * 哪天某个语种把其中两条译成同一句，那两组会共用一个折叠键 —— 一起展开、一起收起，
+ * 而没有任何门会红。本组把那个前提变成机器判据，取材面是**五份 locale 的真文案**，
+ * 不是英文一份（真正会撞的恰恰是译文：中文「服务器组」/「服务器」只差一个字）。
+ */
+describe('DNS 动作分组的标题在五语下两两不同（移动端拿它当折叠键）', () => {
+  const HEADING_KEYS = [
+    'rules.dnsActionGroupHeading',
+    'rules.dnsActionServerHeading',
+    'rules.dnsActionHostsHeading',
+    'rules.dnsActionResponseHeading',
+  ] as const;
+
+  const LOCALES = ['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'] as const;
+  /* 从**本文件**位置派生，不从 cwd 派生：cwd 取决于谁在哪儿敲的 vitest。 */
+  const LOCALES_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'i18n', 'locales');
+
+  for (const locale of LOCALES) {
+    it(`${locale}：四条组标题两两不同`, () => {
+      /* 用 `readFileSync` 而不是动态 `import()`：后者拼模板串时解析不了 `@/` 别名，
+         换一个 cwd 就抛 `Cannot find package` —— 那种红看起来像「门抓到了东西」，
+         实际是门自己读不动语料（2026-09-13 做变异时当场撞上）。路径从本文件位置派生。 */
+      const dict = JSON.parse(
+        readFileSync(join(LOCALES_DIR, `${locale}.json`), 'utf8'),
+      ) as Record<string, unknown>;
+      const read = (key: string): string => {
+        const hit = key
+          .split('.')
+          .reduce<unknown>((cur, seg) => (cur as Record<string, unknown>)?.[seg], dict);
+        expect(typeof hit, `${locale} 缺 ${key} —— 组标题本身没了，下面的唯一性无从谈起`).toBe(
+          'string',
+        );
+        return hit as string;
+      };
+      const labels = HEADING_KEYS.map(read);
+      // 正面断言：四条都取到了（只写「不许重复」会被「一条都没读到」骗过）。
+      expect(labels.filter((s) => s.trim() !== '')).toHaveLength(HEADING_KEYS.length);
+      expect(
+        new Set(labels).size,
+        `${locale} 下有两条组标题撞了：${labels.join(' / ')} —— ` +
+          '移动端 `collapsibleGroups` 用标题当折叠键，撞了会让两组一起展开一起收起',
+      ).toBe(HEADING_KEYS.length);
+    });
+  }
+
+  it('谓词自检：两条标题真撞上时这条会红', () => {
+    const collide = ['A', 'B', 'A', 'C'];
+    expect(new Set(collide).size).not.toBe(collide.length);
   });
 });
 

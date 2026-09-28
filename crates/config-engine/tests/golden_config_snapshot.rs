@@ -125,7 +125,24 @@
 //!   生成侧由 `builder::inbounds::tests::tun_inbound_never_emits_stack_on_any_platform`（三平台正向）
 //!   与 `tun_inbound_violations_has_teeth`（反向对照）钉住。`fixtures/inbounds.json` 同批同规则变换（6 处）。
 //!
-//! **第九次例外（2026-09-28，userspace mesh 本机 IPv6 回环）**：五种 userspace mesh endpoint
+//! **第九次例外（2026-09-24，`appRoutingEnabled` 缺省视为开）**：引擎五处读点由 `== Some(true)` 改为
+//! `!= Some(false)`，与两端界面（`!== false`）及 `store::sanitize` 已声明的「读取侧视为开」同侧。
+//! 上游 TS builder 把缺省读成关，本夹具冻结的正是那个口径 ⇒ **刻意与上游分叉**，同第二次例外。
+//!
+//! - **射程**：全夹具 `input` 里 `appRules` 非空的 case 恰好 1 个（`smart+appRules+customAppPresets`，
+//!   linux / smart / systemProxy，输入**不含** `appRoutingEnabled` 键 = 存量配置形态）；
+//!   含 `appRoutingEnabled` 键的 case：0。其余 36 个 case 输入里没有应用规则，门的口径对它们零 delta。
+//! - **变换**：只在该 case 的 `expected.config` 里**新增** 2 项，不删不改：
+//!   ① `outbounds[2]` 插入 `{type:"selector", tag:"rule-sel-app-custom-app1", outbounds:["HK","proxy-selector"],
+//!   default:"proxy-selector", interrupt_exist_connections:false}` —— `outbounds.rs` 为 proxy 档应用规则
+//!   生成的规则选择器（无 `targetServerId` ⇒ default 跟随 proxy-selector）；
+//!   ② `route.rules[8]` 插入 `{rule_set:["geosite-youtube"], action:"route", outbound:"rule-sel-app-custom-app1"}`
+//!   —— `route.rs` 为该应用发射的路由规则（预设只有 `geositeTags:["YouTube"]`，无进程名）。
+//!   `geosite-youtube` 这个 rule_set 定义本来就在（内置 geo 全量注入），故 `route.rule_set` 零变化；
+//!   DNS / inbounds 零变化。`expected.ruleTargetMap` / `idToTagMap` 不参与对拍且该规则无 `targetServerId`，未动。
+//! - **验收**：变换前 1/37 红、仅此 case、差异恰好上述 2 项（语义递归对差，无第三项）；变换后 37/37 diff=0。
+//!   行级 diff = 17 行纯新增。三态 × 全平台的行为级回归面在 `tests/app_routing_gate_tristate.rs`。
+//! **第十次例外（2026-09-28，userspace mesh 本机 IPv6 回环）**：五种 userspace mesh endpoint
 //! 的内核都把自身分配地址映射到 `127.0.0.1` / `::1`。旧默认旁路表含 `127/8`，却不含 `::1`；
 //! 当 endpoint 同时是默认出口时，`::1` 会被拨回自身。新生成器仅在已发射的 userspace endpoint
 //! 且 `meshInboundPolicy=None` 时在 DNS hijack 和用户 traffic/app 规则之后、mesh force-route
@@ -282,6 +299,7 @@ fn generate_config_matches_polaris_snapshot() {
             probe_proxy_port,
             update_in_port,
             subscription_update_in_port: None,
+            loopback_auth: None,
             probe_pool_ports: vec![],
             lan_resolver_for_dns,
             race_upstream_ips: vec![],
@@ -435,6 +453,7 @@ fn resource_missing_world_never_falls_back_to_plaintext_direct() {
             probe_proxy_port,
             update_in_port,
             subscription_update_in_port: None,
+            loopback_auth: None,
             probe_pool_ports: vec![],
             lan_resolver_for_dns,
             race_upstream_ips: vec![],
@@ -809,6 +828,7 @@ fn scenario_deps_base() -> GenerateConfigDeps {
         probe_proxy_port: None,
         update_in_port: None,
         subscription_update_in_port: None,
+        loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
         race_upstream_ips: vec![],
@@ -971,6 +991,7 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
             probe_proxy_port,
             update_in_port,
             subscription_update_in_port: None,
+            loopback_auth: None,
             probe_pool_ports: vec![],
             lan_resolver_for_dns,
             race_upstream_ips: vec![],

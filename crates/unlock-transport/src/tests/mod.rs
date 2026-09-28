@@ -546,3 +546,72 @@ async fn browser_headers_reach_the_wire() {
              对端会看到两个自相矛盾的值（比不发更强的 bot 信号）。实收:\n{wire}"
     );
 }
+
+// ── α 批：经本机 http 代理入站的凭据（Android 上 probe-proxy-in 要求本次起核的一次性凭据）─────────
+
+/// 起一个极小 http 代理：收首个请求并原样回传，然后回 200。
+fn spawn_capturing_proxy() -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 回环端口");
+    let addr = listener.local_addr().expect("取端口");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 16384];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = sock.write_all(&http_response("200 OK", &[], b"ok"));
+            let _ = sock.flush();
+        }
+    });
+    (addr, rx)
+}
+
+fn proxy_authorization_of(request: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("proxy-authorization")
+            .then(|| value.trim().to_string())
+    })
+}
+
+/// 带凭据 ⇒ 发 `Proxy-Authorization: Basic base64(user:pass)`；不带 ⇒ 不发（桌面零认证形态不变）。
+///
+/// 变异锁：删掉 `via_local_proxy` 里的 `basic_auth` → 正面断言转红。
+#[tokio::test]
+async fn via_local_proxy_presents_the_loopback_credential() {
+    let (addr, rx) = spawn_capturing_proxy();
+    let c = UnlockClient::via_local_proxy(addr.port(), Some(("polaris", "s3cret-0123456789")))
+        .expect("建 client");
+    let resp = c
+        .request(&UnlockRequest::get("http://example.invalid/probe"))
+        .await;
+    assert_eq!(
+        resp.status, 200,
+        "经 http 代理的请求应成功：{:?}",
+        resp.error
+    );
+    let request = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("代理应收到请求");
+    // base64("polaris:s3cret-0123456789")
+    assert_eq!(
+        proxy_authorization_of(&request).as_deref(),
+        Some("Basic cG9sYXJpczpzM2NyZXQtMDEyMzQ1Njc4OQ=="),
+        "带凭据的 client 必须发 Proxy-Authorization，实得请求头：{request}"
+    );
+
+    let (addr, rx) = spawn_capturing_proxy();
+    let c = UnlockClient::via_local_proxy(addr.port(), None).expect("建 client");
+    let _ = c
+        .request(&UnlockRequest::get("http://example.invalid/probe"))
+        .await;
+    let request = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("代理应收到请求");
+    assert_eq!(
+        proxy_authorization_of(&request),
+        None,
+        "无凭据时不许发该头：{request}"
+    );
+}

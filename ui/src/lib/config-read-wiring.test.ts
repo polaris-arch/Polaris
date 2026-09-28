@@ -27,6 +27,7 @@
  * 新增/挪走一个读点则必然转红。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -51,7 +52,10 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
     if (e.isDirectory()) sourceFiles(p, out);
-    else if (/\.tsx?$/.test(e.name) && !/\.(test|spec)\.tsx?$/.test(e.name)) out.push(p);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (/\.tsx?$/.test(e.name) && !IS_TEST_ONLY_MODULE.test(e.name)) out.push(p);
   }
   return out;
 }
@@ -233,10 +237,22 @@ const SITES: readonly Site[] = [
     why: '对账类：节点与订阅派生缓存的所有权必须跟随后端已落盘的权威配置；暂存编辑尚未应用，不能提前驱逐其对应缓存',
   },
   {
+    file: 'mobile/app-wiring.ts',
+    shape: 'useAppStore((s)=>s.config)',
+    route: 'disk',
+    why: '对账类：与 App.tsx 那条同一件事的移动端一侧（reconcileEntityCaches）。上一版读的是 useEffectiveConfig，暂存里一条尚未保存的节点删除就会清掉它那份持久 Tailscale 登录缓存 —— 用户点「重置」后节点回来了、角标却显示未登录',
+  },
+  {
     file: 'components/screens/logs/LogsScreen.tsx',
     shape: 'useAppStore((s)=>s.config)',
     route: 'disk',
     why: '入参类：saveConfig（改日志级别）的基准必须是盘，拿暂存合成值当基准会把未应用的暂存值一并落盘',
+  },
+  {
+    file: 'mobile/connections/MobileConnectionsScreen.tsx',
+    shape: 'useAppStore((s)=>s.config)',
+    route: 'disk',
+    why: '与桌面日志屏逐条同形：日志级别的落盘基准必须是盘；另一路给 runtimeLevelView 当第三参，用来区分「暂存未应用」与「核没重启」——拿暂存合成值会让这两个成因分不开',
   },
   {
     file: 'components/screens/home/HomeScreen.tsx',
@@ -264,6 +280,12 @@ const SITES: readonly Site[] = [
     why: '基准类：handleRegionChange 的地区/反向变化提示要与已持久化值比较；提交本身只发 regionRouting 顶层 patch',
   },
   {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    shape: 'useAppStore.getState().config',
+    route: 'disk',
+    why: '基准类：与桌面 RulesScreen 同一条腿 —— handleRegionChange 的地区/反向变化提示要与已持久化值比较，且它同时是 saveConfig 的入参基准，两处必须同源',
+  },
+  {
     file: 'components/screens/settings/use-config.ts',
     shape: 'useAppStore.getState().config',
     route: 'disk',
@@ -280,6 +302,12 @@ const SITES: readonly Site[] = [
     shape: 'useAppStore.getState().config?.subscriptions?.some',
     route: 'disk',
     why: '对账类：renderer 重附任务同样只在 force load 已发布后才消费 terminal success，不能把旧镜像当完成',
+  },
+  {
+    file: 'mobile/forms/SubFormPanel.tsx',
+    shape: 'useAppStore.getState().config?.subscriptions?.some',
+    route: 'disk',
+    why: '对账类：与桌面 `use-subscription-create-dialog-operation.ts` **同一条**判据（移动端订阅表单自持终态处置，见那份文件头注的射程自曝）。create operation succeeded 后必须确认 force load 已把原子 commit 发布到盘镜像，才可以关表、回调切 tab、清 terminal；读合成值会把一条只存在于暂存层的订阅当成已发布',
   },
 ];
 
@@ -322,6 +350,13 @@ interface MirrorSite {
 }
 
 const MIRROR_SITES: readonly MirrorSite[] = [
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    shape: 'useAppStore.getState().servers',
+    count: 1,
+    surface: 'operation',
+    why: '与后端对账：WARP 新增写入确认后的读回凭据与稳定 id，只认 loadConfig 更新的磁盘镜像；暂存节点不能作为保存成功收据',
+  },
   // ── 派生层自身 ──
   {
     file: 'store/app-store.ts',
@@ -345,6 +380,13 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     count: 1,
     surface: 'operation',
     why: '按 id 下发：喂 api.server.tailscaleStateExists(ids)，后端按 id 去磁盘 state 目录查「登录过没」，盘上没有的 id 无从查起',
+  },
+  {
+    file: 'mobile/app-wiring.ts',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: '按 id 下发（与 App.tsx 那条同一件事的移动端一侧）：喂 api.server.tailscaleStateExists(ids)，后端按 id 去磁盘 state 目录查「登录过没」，盘上没有的 id 无从查起',
   },
   {
     file: 'components/dialogs/TsLoginDialog.tsx',
@@ -410,6 +452,62 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: '与后端对账：**只**用来算 staged-only 差集的磁盘侧（stagedOnlyIds 的第二个入参），不参与渲染集合本身',
   },
   {
+    file: 'mobile/nodes/MobileNodesScreen.tsx',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: '与后端对账：**只**用来算 staged-only 差集的磁盘侧（stagedOnlyIds 的第二个入参），与桌面节点屏同一条腿',
+  },
+  {
+    file: 'mobile/home/MobileHomeScreen.tsx',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: '与后端对账：**只**用来算 staged-only 差集的磁盘侧（stagedOnlyIds 的第二个入参），与移动端节点屏逐字同一条腿',
+  },
+  {
+    file: 'mobile/nodes/node-deletion.ts',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: '删除腿的**磁盘侧**：喂 partitionNodeDeleteRoutes（后端按 id 查盘）与 fallbackExitAfterDelete（兜底出口必须存在于盘上），与桌面 use-node-deletion 的 diskServers 逐字同一条',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    shape: 'useAppStore((s)=>s.rules)',
+    count: 1,
+    surface: 'operation',
+    why: '与后端对账：流量平面的磁盘镜像，算 staged-only 差集（stagedOnlyIds 的第二个入参）。DNS 平面另有一处同职读点（s.dnsRules），不在本扫描器的形态集内',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    shape: 'useAppStore.getState().rules',
+    count: 1,
+    surface: 'operation',
+    why: '镜像自身：平面开关乐观更新的回滚基准（与桌面同形）',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    shape: "useEffectiveRules('route')",
+    count: 1,
+    surface: 'display',
+    why: '流量分段的规则列表本体',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    shape: "useEffectiveRules('dns')",
+    count: 1,
+    surface: 'display',
+    why: 'DNS 分段的规则列表本体',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '规则目标节点名与应用策略节点名的映射（纯渲染，不喂任何按 id 查盘的调用）',
+  },
+  {
     file: 'components/screens/rules/RulesScreen.tsx',
     shape: "useAppStore((s)=>(plane==='dns'?s.dnsRules:s.rules))",
     count: 1,
@@ -460,6 +558,22 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     surface: 'display',
     why: '外层取编辑基准（暂存过的规则再打开必须显示暂存后的值）；差集那处已随删除腿抽进 lib/use-rule-delete.ts',
   },
+  // 2026-09-13（批 10）：移动端规则表单。与上面那条桌面弹窗**同一件事的另一端** ——
+  // 同一个编辑基准、同一条理由，只是呈现层重写。两条各自登记是因为登记粒度是「文件 + 形态」。
+  {
+    file: 'mobile/forms/RuleFormPanel.tsx',
+    shape: 'useEffectiveRules(plane)',
+    count: 1,
+    surface: 'display',
+    why: '取编辑基准：暂存过的规则再打开必须显示暂存后的值（同桌面 RuleDialog），读盘会把用户刚改的那一版显示成旧的',
+  },
+  {
+    file: 'mobile/forms/RuleFormPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '「目标出站」候选与 DNS 出口候选的节点集合：这是一份给用户**挑**的列表，必须含暂存里新增的节点，否则刚加的节点在规则表单里选不到',
+  },
   // 2026-07-30：删除腿抽成 `useRuleDelete`（列表行内垃圾桶 + 规则弹窗 footer 共用），
   // staged-only 差集的两个入参跟着搬过来 —— 它们是那条腿自己的判据，不是调用方的关切。
   {
@@ -482,6 +596,22 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     count: 1,
     surface: 'display',
     why: '菜单排序判据（谁会先命中该域名）+ 追加腿的编辑基准；基准不同源会让追加从盘上旧值起算，把暂存中的编辑吞掉',
+  },
+  {
+    // 移动端连接屏（批 13）：上面那两条（`RulePickDialog` 的候选枚举 + `RuleSubjectMenuItems` 的
+    // 排序判据与编辑基准）在触屏上是同一个屏里的两张面板，故只有一处读点。
+    file: 'mobile/connections/MobileConnectionsScreen.tsx',
+    shape: 'useEffectiveRules()',
+    count: 1,
+    surface: 'display',
+    why: '「加入规则」那条链的候选枚举 + 菜单排序判据 + 追加腿的编辑基准；基准不同源会让追加从盘上旧值起算，把暂存中的编辑吞掉',
+  },
+  {
+    file: 'mobile/home/MobileHomeScreen.tsx',
+    shape: 'useEffectiveRules()',
+    count: 1,
+    surface: 'display',
+    why: '首页「给这个主机加一条规则」面板：与桌面 RuleSubjectMenuItems 同一条依据 —— 覆盖提示与追加候选都要列用户现在这套规则（暂存中新建的也必须能当追加目标），追加腿的编辑基准同源，否则会从盘上旧值起算、把暂存中的编辑吞掉',
   },
   {
     file: 'lib/use-rule-delete.ts',
@@ -545,6 +675,106 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     count: 1,
     surface: 'display',
     why: '节点列表本体 —— 「列表不回显 staged 编辑」这条缺口在本屏的落点',
+  },
+  {
+    file: 'mobile/nodes/MobileNodesScreen.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '移动端节点列表本体：与桌面同一条口径 —— staged-only 节点在列表里可见并带「待保存」角标，但不进出口',
+  },
+  {
+    file: 'mobile/home/MobileHomeScreen.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '移动端首页的节点身份与节点选择器：与移动端节点屏同一条口径（staged-only 可见且带「待保存」角标），两屏读同一个基准才不会对「有哪些节点」给出两种答案',
+  },
+  // ── 移动端表单宿主（2026-09-06 批 2）。四处都取 effective，理由逐条与桌面同形腿一致 ──
+  {
+    file: 'mobile/forms/NodeFormPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '编辑基准 + 前置代理候选 + 组网单例闸门的判据面：单例槽必须含暂存节点（否则暂存了一个 WARP 还能再建第二个，重放后配置非法），与 NodeDialog 的 useEffectiveServers 同一条',
+  },
+  {
+    file: 'mobile/forms/ImportFormPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '单例槽判据必须含暂存节点（admitMeshSingletons 的第二个入参），与 ImportDialog 逐字同一条',
+  },
+  {
+    file: 'mobile/forms/TsExitPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '按 id 取那个 tailscale 节点作编辑基准：staged 里改过的 tailscaleSettings 必须回显，否则一次「选出口」会把上一次未保存的编辑覆盖掉（与 TsSettingsDialog 的 effectiveServers 同一条）',
+  },
+  /* ── 移动端组网三张表（2026-09-06 批 3）。读点的选择逐条与桌面同形腿一致 ── */
+  {
+    file: 'mobile/forms/MeshJoinPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '入口分流的**判据**面：两个托管服务按「槽位占没占」映射到编辑/设置或注册/登录。必须含暂存节点：暂存了一个 WARP 却仍显示「新建」，用户点进去会撞上提交侧的单例闸，而入口刚刚告诉他这里是空的（与桌面 MeshJoinDialog 的 useEffectiveServers 逐字同一条）',
+  },
+  {
+    file: 'mobile/forms/WgPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '编辑基准 + 前置代理候选 + 组网单例闸门的判据面（粘贴 Cloudflare .conf 是那道闸最真实的旁路腿）；与桌面 WgDialog 的 useEffectiveServers 逐字同一条',
+  },
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '编辑基准（findWarpNode）+ 前置代理候选 + registerWarpIfSlotFree 的判据面：单例槽必须含暂存节点，否则暂存了一个 WARP 还会去 Cloudflare 再注册一台（远端副作用，本地拦不回来）',
+  },
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: 'staged-only 差集的**磁盘镜像**一侧（stagedOnlyIds 的第二个入参）：applyWarpLicense 与 update 都是后端**按 id** 去改一台已注册设备/远端账户等级，盘上没有这个 id 就没有作用对象（与桌面 WarpDialog 的 diskServers 逐字同一条）',
+  },
+  {
+    file: 'mobile/forms/TsSettingsPanel.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '按协议取那个 tailscale 节点作编辑基准：staged 里改过的 tailscaleSettings 必须回显，否则一次保存会把上一次未保存的编辑覆盖掉（与 TsSettingsDialog 的 effectiveServers 同一条）',
+  },
+  {
+    file: 'mobile/forms/TsSettingsPanel.tsx',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: 'staged-only 差集的磁盘镜像一侧：tailscaleLogout 是后端**按 id** 去清磁盘上的 TS state 目录，盘上没有这个 id 就没有对象（与 TsSettingsDialog 的 diskServers 逐字同一条）',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    shape: 'useAppStore((s)=>s.servers)',
+    count: 1,
+    surface: 'operation',
+    why: 'planTsLoginSubmit 的入参问的是「后端此刻按 id 找不找得到这个节点」——那是磁盘镜像的问题，不是展示面的问题。读 effective 会让一个只在暂存里的 TS 节点被判成「已落盘」，于是 persist 取 none，登录产物落在一个后端不认识的 id 下（与桌面 TsLoginDialog 的 useAppStore(s=>s.servers) 逐字同一条）',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    shape: 'useAppStore.getState().servers.find',
+    count: 1,
+    surface: 'operation',
+    why: '登录前刷新对账：loadConfig 吸收读取失败，按 id 核对磁盘镜像里的认证设置后才调用 tailscaleLogin；staged 展示集合不能证明后端配置已成功回读。失败仍保留本面板已保存 id 供重试，不回滚节点。',
+  },
+  {
+    file: 'mobile/nodes/node-deletion.ts',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '删除腿的**展示侧基准**：算 staged-only 差集的 effective 一侧，并作 fallbackExitAfterDelete 的候选池（与桌面同一条口径）',
   },
   {
     file: 'components/screens/resources/ResourcesScreen.tsx',

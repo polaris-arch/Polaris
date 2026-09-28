@@ -153,6 +153,24 @@ pub mod build_identity {
 ///
 /// [`Platform`] 决定帧结构差异（mac/win 有 token 行，linux 经 SO_PEERCRED 无 token 行）——
 /// 见 [`codec::encode_frame`]。
+///
+/// # 为什么 Android 是**具名变体**而不是继续落在 [`Other`](Platform::Other)（2026-09-04）
+///
+/// 这个类型早已不只回答「helper 谱系」：system DNS / 系统代理 / route 查询 / 托盘 / 进程枚举 /
+/// 网络事件解析 / mesh 出口路由都按它分派。`Other` 的语义是**「没有 helper 实现」**（那是 helper
+/// 谱系轴上的答案），而各分派点在自己的轴上把它读成了「未知平台，做保守的那件事」——保守的定义
+/// 逐处不同，且没有一处是照着 Android 想的。
+///
+/// 真实代价（K6b，2026-09-04 模拟器实测）：`exit_interface_for` 在 `Other` 上恒 `Ok(None)`、
+/// `managed_tun_interface_for_network_watcher` 在 `Other` 上恒 `None`，两条腿同时缺席让「起核前后
+/// 网卡事实是否变了」这条判据恒真 ⇒ **300 秒内起核 69 次**。两条腿各自都写着自洽的理由，
+/// 错的是它们被同一个 `Other` 串在一起、而没有人在 Android 这个轴上答过题。
+///
+/// 具名变体把「答题」搬到编译期：每一个穷举 `match` 都会因缺臂而**编译不过**，作者必须逐处写下
+/// Android 的答案（哪怕答案是「与 Other 相同」——那也是写下来的决定，不是继承来的默认）。
+///
+/// **编译器只覆盖 `match` 那一半**：`== / != / matches!` 形态的分派点它一个都不报。那一半由
+/// `src-tauri/tests/platform_dispatch_exhaustive.rs` 的登记表守（新增即红、腐烂即红）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     /// macOS：root LaunchDaemon + 0666 unix socket + token 行协议。
@@ -161,19 +179,81 @@ pub enum Platform {
     Win,
     /// Linux：root systemd + 0666 unix socket + SO_PEERCRED（无 token 行）。
     Linux,
+    /// Android：`VpnService` + **进程内** libbox（`.so`）。无 helper、无核子进程、无提权命令面；
+    /// tun fd 由系统仲裁，路由/DNS 由核在 fd 内自理。
+    ///
+    /// 与 [`Other`](Platform::Other) 的区别不是「更具体一点」，而是**这条腿有人负责回答**：
+    /// `Other` 是「不知道」，`Android` 是「知道，且答案写在各分派点的 Android 臂里」。
+    Android,
+    /// iOS：`NEPacketTunnelProvider` + **扩展进程内** libbox（`.xcframework`）。无 helper、
+    /// 无核子进程、无提权命令面；tun fd 由系统在 NE 沙箱内授予，路由/DNS 由核在 fd 内自理。
+    ///
+    /// 与 [`Android`](Platform::Android) 的区别不是「同一条腿的第二个名字」：两者在**多数**
+    /// 分派点上答案确实相同（都没有 helper、都没有可指的本地端口、都没有系统代理承载物），
+    /// 但**理由不同**，且至少两处理由不同到答案的依据也不同（见 `ProxyModeType::effective_on`
+    /// 与 `mesh::mesh_system_supported_on_platform` 各自的 `Ios` 臂）。合并成一条 `Android | Ios`
+    /// 臂就是在断言「同一个理由」——那个断言在下一个人改 Android 臂时会连带把 iOS 改错。
+    ///
+    /// 与 [`Other`](Platform::Other) 的区别同 Android：`Other` 是「不知道」，`Ios` 是
+    /// 「知道，且答案写在各分派点的 Ios 臂里」——**哪怕本仓今天一个 iOS 产物都构不出来**。
+    /// 具名的意义正在于此：等到构得出的那天，答题已经发生过了，而不是靠 `Other` 顺带兜住。
+    Ios,
     /// 未知平台兜底（freebsd/openbsd/…）。无对应 helper 实现，按 Linux 语义保守处理
     /// （无 token 行、走 Unix 路径），避免对未鉴权对端误发 token 行。
+    ///
+    /// **不再兼任 Android**（2026-09-04，见枚举头注）：它现在只表示「本仓没有为这个平台答过题」。
     Other,
 }
 
 impl Platform {
+    /// 全部变体。门与穷举断言的取材面。
+    ///
+    /// **新增变体必须同步这里**：`src-tauri/tests/platform_dispatch_exhaustive.rs` 直接从本文件的
+    /// `enum Platform` 声明里抠变体名，与本数组逐名对拍 —— 漏改即红。写成数组而不是靠 `strum`
+    /// 之类派生：本仓不为一条门引依赖，而对拍门给的强制力与派生等价（且它连「枚举加了、
+    /// 数组没加」这一种漂移都盖得住，派生宏盖不住数组本身不存在的情形）。
+    pub const ALL: &'static [Self] = &[
+        Self::Mac,
+        Self::Win,
+        Self::Linux,
+        Self::Android,
+        Self::Ios,
+        Self::Other,
+    ];
+
     /// 当前平台是否在 wire 头部带 token 行（mac/win = true，linux/other = false）。
     ///
     /// 移植自：linux `helper-linux/main.go` 经 SO_PEERCRED 取对端 uid，`handle()` 首个 `readLine` 读的是
     /// command 而非 token（对照 mac `helper.go:403-404` 的 token+command 两行）。
     ///
-    /// [`Platform::Other`] 视同 Linux（无 token 行）：未知平台无对应 helper 实现，保守按 SO_PEERCRED
-    /// 类语义处理，避免对未鉴权对端误发 token 行。
+    /// [`Platform::Other`] / [`Platform::Android`] / [`Platform::Ios`] 视同 Linux（无 token 行）：
+    /// 三者都无对应 helper 实现，保守按 SO_PEERCRED 类语义处理，避免对未鉴权对端误发 token 行。
+    ///
+    /// # 本判据曾在两张登记表的射程之外，**2026-09-06 已收进去**
+    ///
+    /// 它写成 `matches!(self, Self::Mac | Self::Win)` —— `Self::` 而不是 `Platform::`。
+    /// `src-tauri/tests/platform_dispatch_exhaustive.rs` 的比较型扫描器按 `Platform::<Variant>`
+    /// 取材（`find_variant`），此前**扫不到这一处**：25 次比较型分派里没有它，登记表里也没有它。
+    /// 于是新增平台变体时，这里既不会编译错（`matches!` 不是穷举 match），也不会有门变红 ——
+    /// 与 K6b 的成因形态同类，只是这一格的答案恰好是安全的。
+    ///
+    /// iOS 落 `false`（不发 token 行）**是对的**：token 行是给 mac/win 那两种 helper 传送凭据用的，
+    /// iOS 上根本没有 helper（`runtime::helper::platform_supported(Ios) == false`），
+    /// 这条 wire 路径整个不可达；且判错的方向不对称 —— 多发是把凭据发给未鉴权对端，少发只是被拒。
+    ///
+    /// 上一批不改扫描器的理由是「会引入真实的假阳性」，**那条理由复核成立**：
+    /// `crates/updater/src/github.rs`（`AssetPlatform`）、`crates/helper-proto/src/error.rs`、
+    /// `crates/system-integration/src/error.rs`、`src-tauri/src/commands/server.rs` 四处都有
+    /// **别的枚举**的 `Self::Linux` / `Self::Other`，扫描器无法从裸文本判断 `Self` 是谁。
+    /// 故收法不是一刀切，而是**按所在 `impl` 块的自身类型限定**：只有块头 self 类型逐字为
+    /// `Platform` 时，块体里的 `Self::` 才被读成 `Platform::`（`resolve_self_in_platform_impls`）。
+    /// 那四处分别在 `impl AssetPlatform` / `impl ErrorKind` 等块里，一处都不会被改写 ——
+    /// 由该门的 `self_alias_does_not_leak_into_other_enums` 拿这四处**真实源码**正反双向钉住。
+    /// 本函数因此已在 `COMPARISON_REGISTRY` 里有一条自己的登记：判据一改，那条当场腐烂变红。
+    ///
+    /// **这是 token 行的唯一判据**：[`codec::encode_frame`] 曾另写一份 `platform != Platform::Linux`
+    /// —— 同一个问题的第二份答案，且**已经漂了**（那份对 `Other` 判「发 token 行」，与本函数
+    /// 及本注释所述的安全意图正相反，2026-09-04 K10 发现）。现已改为调用本函数。
     #[must_use]
     pub const fn has_token_line(self) -> bool {
         matches!(self, Self::Mac | Self::Win)
@@ -181,13 +261,37 @@ impl Platform {
 
     /// 编译目标平台（下沉自 system-integration/dns_flush.rs 三分 cfg!）。运行期决定本机谱系。
     ///
-    /// 未知 target（非 mac/win/linux）→ [`Platform::Other`]。
+    /// `target_os = "android"` → [`Platform::Android`]。Rust 的 `target_os` 对 Android 就是
+    /// `"android"`（**不是** `"linux"`），两条互斥，故分支顺序在此无语义。写成独立分支而不是
+    /// `any(linux, android)`，正是为了让「Android 与 Linux 是两个答案」在这个唯一的产地就成立。
+    ///
+    /// `target_os = "ios"` → [`Platform::Ios`]，同理：Rust 对 iOS 就是 `"ios"`（**不是**
+    /// `"macos"`，两条同样互斥），故它与上面的 macos 分支谁先谁后也无语义。
+    ///
+    /// **本函数是整条链的第一块多米诺**：40 处穷举 `match` 都可以为 `Ios` 写满答案、
+    /// `platform_variants_stay_in_sync_with_all` 也可以照绿，但只要这里少一条 ios 分支，
+    /// iOS 上就恒取 [`Platform::Other`]，那 40 个答案一处都走不到 —— 那正是 K6b 的成因形态
+    /// （代价见 `src-tauri/tests/platform_dispatch_exhaustive.rs` 头注：300 秒内起核 69 次）。
+    /// 这条缺失**不会被任何门抓到**（本仓在 Linux 上构不出 iOS 产物，见下方 §射程），
+    /// 所以它写在这里而不是靠断言。
+    ///
+    /// # 射程：本仓今天构不出 iOS 产物，这条分支现在一次都不会被求值
+    ///
+    /// `cfg!` 是编译期常量折叠，Linux/macOS/Windows 三种宿主构建下这一支恒 false。它现在的
+    /// 价值不是运行，而是**让 `Ios` 有一个唯一的产地**——等哪天真在 `--target aarch64-apple-ios`
+    /// 上编译时，答案已经在那里，而不是届时才发现全仓落 `Other`。
+    ///
+    /// 其余未知 target（freebsd/openbsd/…）→ [`Platform::Other`]。
     #[must_use]
     pub fn current() -> Self {
         if cfg!(target_os = "macos") {
             Self::Mac
         } else if cfg!(target_os = "windows") {
             Self::Win
+        } else if cfg!(target_os = "android") {
+            Self::Android
+        } else if cfg!(target_os = "ios") {
+            Self::Ios
         } else if cfg!(target_os = "linux") {
             Self::Linux
         } else {
@@ -198,13 +302,28 @@ impl Platform {
     /// 平台字符串解析（下沉自 mesh/exit_route.rs，对齐 上游 `process.platform` 口径）。
     ///
     /// 非 std `FromStr`：未知串不报错，返 [`Platform::Other`]。兼容 "darwin"/"macos" 与
-    /// "win32"/"windows" 两套写法（各历史调用点传参不一，合并后仍受支持）。
+    /// "win32"/"windows" 两套写法（各历史调用点传参不一，合并后仍受支持）。iOS 只有一个写法：
+    /// Rust 的 `std::env::consts::OS` 与 Node 的 `process.platform` 在 iOS 上都是 `"ios"`，
+    /// 没有 darwin/win32 那种双词汇问题。
+    ///
+    /// **加 `"ios"` 这一行不是无代价的**：`src-tauri/tests/platform_dispatch_exhaustive.rs` 的
+    /// 字符串轴取材面正是从本函数体抠字面量派生的，加一个名字就把整个字符串分派面的扫描口径
+    /// 变宽一档，并让本函数自己那条登记（语句原文含全部臂）当场腐烂变红。那是它该有的行为：
+    /// 新平台进字符串轴的入口只有这一处，门在这里逼人重新答一次「未知平台在各分派点得到什么」。
+    ///
+    /// **生产唯一调用点是 `config-engine/builder/generate.rs`**（把 `deps.platform` 解析给 log
+    /// builder），入参是 `std::env::consts::OS` 的直传值 —— Android 上就是 `"android"`，故这里
+    /// 必须认它，否则 Android 的日志落盘判据会在**加了变体之后**反而退化（`Other` 那条腿曾经
+    /// 顺带盖住它）。[`Platform`] 本身不带 `Serialize`/`Deserialize`，从不跨进程序列化，
+    /// 故本函数的入参面只有上述一处 + 测试，加变体没有线上兼容代价。
     #[must_use]
     pub fn parse(s: &str) -> Self {
         match s {
             "darwin" | "macos" => Self::Mac,
             "win32" | "windows" => Self::Win,
             "linux" => Self::Linux,
+            "android" => Self::Android,
+            "ios" => Self::Ios,
             _ => Self::Other,
         }
     }

@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod android_bridge;
 mod auto_switch;
 mod connection_flush;
 mod core_binary;
@@ -46,6 +47,7 @@ pub(crate) mod platform_contracts;
 mod process_supervision;
 mod recovery;
 mod route_replan;
+mod rule_names;
 mod selector_reconcile;
 mod startup;
 pub(crate) mod system_takeover;
@@ -75,10 +77,10 @@ use dns_takeover::dns_takeover_enabled;
 // `commands::config` 经 `crate::runtime::proxy::StagedClassification` 取用的公开契约面（§B.3 零
 // 调用方改动），`SwitchSnapshot` / `TestPutSink` 是 `ProxyRuntime` 的字段类型（结构体定义按
 // §A.5 钉死在 façade）。
-pub use hot_switch::StagedClassification;
-use hot_switch::SwitchSnapshot;
 #[cfg(test)]
 use hot_switch::TestPutSink;
+use hot_switch::{PendingSwitch, SwitchSnapshot};
+pub use hot_switch::{StagedClassification, SwitchOutcome};
 // B8：`ProxyLifecycleEvent` 是 `ProxyErrorEmitter::emit_lifecycle` 的载荷类型（trait 定义按
 // §C 例外② 钉死在 façade），按 §A.3 由 façade `pub use` 再导出。
 // B9：同批注释里的 `now_ms` / `sleep_unless_superseded_on` 随 `start_inner` / `wait_ready`
@@ -138,6 +140,7 @@ use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
 #[cfg(test)]
 use polaris_config_engine::builder::orchestration::config_generation_norm;
 use polaris_config_engine::builder::InvalidNode;
+use polaris_config_engine::singbox::InboundUser;
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
 use polaris_config_engine::singbox::SingBoxConfig;
@@ -177,6 +180,7 @@ use polaris_dns_race::DohPost;
 #[cfg(test)]
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 use polaris_stats_engine::DiagnosticCounters;
+use polaris_stats_engine::RuleIdentity;
 use polaris_switch_engine::DebouncedRestart;
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
@@ -313,6 +317,8 @@ pub mod code {
     pub const MESH_INBOUND_SYSTEM_INTERFACE: &str = "MESH_INBOUND_SYSTEM_INTERFACE";
     /// Final generated endpoints request system interfaces without the managed helper runtime.
     pub const SYSTEM_INTERFACE_REQUIRES_HELPER: &str = "SYSTEM_INTERFACE_REQUIRES_HELPER";
+    /// Android's in-process VPN core cannot own a second endpoint system interface.
+    pub const SYSTEM_INTERFACE_UNSUPPORTED: &str = "SYSTEM_INTERFACE_UNSUPPORTED";
     /// 起核腿失败（就绪门判定核已死 / 就绪超时）——「启动失败」轴。
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
     /// 核**意外**退出且无法自愈（无可用配置重启）——「运行中崩了」轴。
@@ -322,6 +328,15 @@ pub mod code {
     /// TUN 经提权 helper 起核，但 helper 未安装（起核前置校验拦截）——「权限/环境」轴。控制流位置可
     /// 诚实断言（判定点直接读到 helper 未装），非猜 message；渲染端据此引导去「设置 › Helper」安装。
     pub const HELPER_NOT_INSTALLED: &str = "HELPER_NOT_INSTALLED";
+    /// **Android**：起核被拒是因为用户没给 VPN 授权（`VpnService.prepare()` 返回非 null）
+    /// ——「权限/环境」轴。控制流位置可诚实断言：判定点是 Kotlin 侧起核前的那次 `prepare()`，
+    /// 不是猜 message；码经 `invoke.reject(msg, code)` 原样过桥，再经
+    /// `android_bridge::map_rejected_code` 的**白名单**落到本常量。
+    ///
+    /// **为什么不压成 [`STARTUP_FAILED`]**：这是 Android 首次运行最高频的失败路径，而用户的下一步
+    /// 动作与「起核失败」完全相反 —— 前者要再次点击连接完成系统授权，后者要去查节点/网络。压成一个码，
+    /// 渲染端给出的引导文案就是错的，用户会在网络排查上白花时间。
+    pub const VPN_PERMISSION_DENIED: &str = "VPN_PERMISSION_DENIED";
     /// **T3 终态**：上个会话遗留的 **root 孤儿核清不掉**（用户态 EPERM 杀不动，且 helper 不可用/清扫失败）
     /// ——「权限/环境」轴。对齐 上游 `ROOT_ORPHAN_BLOCKED` 语义。
     ///
@@ -552,8 +567,8 @@ impl From<StartError> for String {
 /// **为什么是 trait 而非直接持 `AppHandle`**：崩溃自愈跑在后台 task（无 command 上下文、无人 await），
 /// 而 `AppHandle` 只在 Tauri `setup` 之后才有 → 运行时必须能「先构造、后接线」。trait 同时让单测能
 /// 捕获发射记录断言「这条失败腿真发了事件」——§K7.1 的教训：光测函数、光测失败都不够，要测**组合路径**。
-/// **名字为何仍是 `...ErrorEmitter` 而不含后加的两个通道**：接线点在 `main.rs`
-/// （`set_error_emitter(Box::new(AppHandleProxyErrorEmitter{..}))`），改名要动 `main.rs`——本批次
+/// **名字为何仍是 `...ErrorEmitter` 而不含后加的两个通道**：接线点在 `lib.rs`
+/// （`set_error_emitter(Box::new(AppHandleProxyErrorEmitter{..}))`），改名要动 `lib.rs`——本批次
 /// 不碰它。语义上它已是「ProxyRuntime 的事件出口」，重命名留作纯机械的后续项。
 pub trait ProxyErrorEmitter: Send + Sync {
     /// 发射一条代理错误事件（payload 对齐前端 `ProxyErrorEvent`）。
@@ -572,8 +587,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 前端 `TailscaleStatusEvent`）。由 STATUS relay 每收一帧对每个在册端点各发一次。
     ///
     /// 未接线（单测 / setup 前）→ relay 侧 `error_emitter.get()` 取不到即静默跳过；本方法只负责「有 emitter
-    /// 时怎么发」。之所以复用本 trait（而非新加一个 emitter + main.rs 接线点）：`AppHandleProxyErrorEmitter`
-    /// 已持 `AppHandle`、已在 `main.rs` setup 期 `set_error_emitter` 一次接线，扩一个方法**无需动 main.rs**
+    /// 时怎么发」。之所以复用本 trait（而非新加一个 emitter + lib.rs 接线点）：`AppHandleProxyErrorEmitter`
+    /// 已持 `AppHandle`、已在 `lib.rs` setup 期 `set_error_emitter` 一次接线，扩一个方法**无需动 lib.rs**
     /// （本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
     fn emit_tailscale_status(&self, event: &TailscaleStatusEvent);
 
@@ -585,15 +600,15 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `{engaged, serverName?}`）。engage（进入让位）/ disengage（就绪切回 / 关开关 / 停核复位）各发一次。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) 的理由：`AppHandleProxyErrorEmitter` 已持 `AppHandle`、
-    /// 已在 `main.rs` setup 一次接线，扩方法**无需动 main.rs**（本批禁区）。
+    /// 已在 `lib.rs` setup 一次接线，扩方法**无需动 lib.rs**（本批禁区）。
     fn emit_mesh_login_fallback(&self, engaged: bool, server_name: Option<&str>);
 
     /// **C3**：发射「自动换节点成功」通知（`event:autoNodeSwitched`，payload = 前端
     /// `{ reason, newServerName, latency }`）。由自动换节点心跳在 selector 热切并回读自证后发一次。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) / [`emit_mesh_login_fallback`](Self::emit_mesh_login_fallback) 的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动
-    /// main.rs**（本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动
+    /// lib.rs**（本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
     fn emit_auto_node_switched(&self, payload: &AutoNodeSwitchedPayload);
 
     /// 只发“磁盘配置/运行投影需重拉”信号，不再次进入普通 config switch 流水线。用于 selector
@@ -607,8 +622,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 带核真态（start=true / stop=false）供渲染端决定「显检测中 vs 复位 idle」。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) / [`emit_auto_node_switched`](Self::emit_auto_node_switched) 的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动
-    /// main.rs**（本批禁区）。`UnlockRuntime` 经 `AppHandle` 的 `State<AppRuntime>` 取（生产接线点，
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动
+    /// lib.rs**（本批禁区）。`UnlockRuntime` 经 `AppHandle` 的 `State<AppRuntime>` 取（生产接线点，
     /// 单测 emitter 记录参数即可、不触 Tauri）。
     fn invalidate_unlock(&self, running: bool, exit_blocked: bool);
 
@@ -622,7 +637,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 都不同；合成一个方法会让日后任一侧改触发条件时误伤另一侧。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) 等的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动 main.rs**。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动 lib.rs**。
     fn schedule_exit_ip_refresh(&self, running: bool);
 
     /// OS 网络变化后的恢复探测：先跑出口探测，成功后再由 command 层按旧快照/能力置信度决定是否补跑
@@ -643,7 +658,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `exit_ip_wiring_guard` 因此把两者都算作合法的「出口 IP 腿」。
     ///
     /// 复用本 trait 的理由同 [`invalidate_unlock`](Self::invalidate_unlock)（emitter 已持 `AppHandle`，
-    /// 扩方法无需动 `main.rs`）。
+    /// 扩方法无需动 `lib.rs`）。
     fn mark_exit_blocked(&self, reason: &str);
 
     /// **R2 待应用差集 PUSH**：发一条差集摘要（`event:proxyPendingChanges`，payload = 前端 `{added, modified}`）。
@@ -651,7 +666,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// +「立即应用」）。契约适配依据见 [`PendingChangesSummary`]。
     ///
     /// 复用本 trait 同 [`emit_auto_node_switched`](Self::emit_auto_node_switched) 等的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动 main.rs**
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动 lib.rs**
     /// （本批禁区）。
     fn emit_pending_changes(&self, summary: &PendingChangesSummary);
 
@@ -662,7 +677,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `startup_snapshot` 同样是 `None`、差集同样为空，拿「差集变空」当成功信号会把失败误报成成功。
     ///
     /// 复用本 trait 的理由同 [`emit_pending_changes`](Self::emit_pending_changes)：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法无需动 main.rs。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法无需动 lib.rs。
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent);
 
     /// **网络场景命中态变更信号**（`event:networkProfileMatchChanged`，**无载荷** `{}`）。
@@ -688,8 +703,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 也绝不在 Tauri 主线程上调（`blocking_show` 在主线程会死锁）。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) 等的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动
-    /// main.rs**（本批禁区）。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动
+    /// lib.rs**（本批禁区）。
     ///
     /// `status` = 弹框时刻的 helper 快照（供文案分流「安装」vs「修复」）。
     fn prompt_helper_gate(&self, status: &HelperStatusSnapshot) -> HelperGateDecision;
@@ -723,8 +738,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `config:setPrivacyMode` 翻转 + emit `EVENT_ENTER/EXIT_PRIVACY_MODE`）。若在 runtime 侧再存一份
     /// 镜像（哪怕靠事件同步），就有了两个真相源 —— 而这条轴的失效方式恰恰是**静默**的：镜像漏更新时
     /// 隐私模式看起来开着、核却继续按用户级别把域名写进 helper stderr，没有任何可见症状。故读取一律
-    /// 回到那一份 flag。`AppHandleProxyErrorEmitter` 已持 `AppHandle`（`main.rs` setup 一次接线，扩方法
-    /// **无需动 main.rs** —— 同 [`invalidate_unlock`](Self::invalidate_unlock) 的既定手法）。
+    /// 回到那一份 flag。`AppHandleProxyErrorEmitter` 已持 `AppHandle`（`lib.rs` setup 一次接线，扩方法
+    /// **无需动 lib.rs** —— 同 [`invalidate_unlock`](Self::invalidate_unlock) 的既定手法）。
     ///
     /// 未接线（单测 / setup 前极早期）→ 实现方返 `false`：**保守方向正确**——不抬级 = 与本方法接线前
     /// 的行为逐字节一致，绝不会因为「读不到 flag」就误把用户的 debug 日志静默降级掉。
@@ -1068,6 +1083,46 @@ pub struct CoreBuildEnv {
     pub has_cronet: bool,
 }
 
+/// 经本机 http 代理入站出网的目标（[`ProxyRuntime::local_http_proxy`] 产出）。
+///
+/// `Debug` 不泄凭据：`InboundUser` 的 `Debug` 已抹掉口令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHttpProxy {
+    /// 本机 http 代理入站端口（`mixed-in` 或 `probe-proxy-in`）。
+    pub port: u16,
+    /// 该入站要求的凭据；`mixed-in` 恒零认证 ⇒ 恒 `None`。
+    pub auth: Option<InboundUser>,
+}
+
+/// 选「经本机 http 代理入站出网」用哪个口（**纯函数**，单测与对拍门的取材点）。
+///
+/// - `mixed_port != 0`：本平台发射了 `mixed-in`（`ProxyStatus.mixed_port` 只在
+///   `emits_mixed_inbound` 为真时非 0，见起核处的赋值）→ 用它；它零认证，凭据不带。
+/// - 否则用 `probe-proxy-in`（固定走 `proxy-selector`，Android 上带本次起核的凭据）。
+/// - 两者都没有 → `None`：调用方按「本层无从经代理出网」处理，**不**连一个不存在的口。
+///
+/// 修的缺陷（2026-09-25 α 批）：此前四条腿无条件读 `mixed_port`，而 Android 不发 mixed 入站 ⇒
+/// 解锁检测全超时、首页代理出口 IP 为空、测速回退超时，全程无报错。
+#[must_use]
+pub fn select_local_http_proxy(
+    mixed_port: u16,
+    probe_proxy_port: Option<u16>,
+    loopback_auth: Option<InboundUser>,
+) -> Option<LocalHttpProxy> {
+    if mixed_port != 0 {
+        return Some(LocalHttpProxy {
+            port: mixed_port,
+            auth: None,
+        });
+    }
+    probe_proxy_port
+        .filter(|port| *port != 0)
+        .map(|port| LocalHttpProxy {
+            port,
+            auth: loopback_auth,
+        })
+}
+
 /// **§15**：主核测速探测池目标（[`ProxyRuntime::speed_probe_targets`] 产出，`server_speed_test` 消费）。
 ///
 /// = 上游 `MainCoreProbe` 的 Polaris 最小投影。`pool_ports[k]`（`probe-in-k` 的 http 代理口）与
@@ -1077,6 +1132,8 @@ pub struct CoreBuildEnv {
 pub struct SpeedProbeTargets {
     /// K 个 `probe-in-k` 的 http 代理端口（`pool_ports[k] ↔ probe-selector-k`）。
     pub pool_ports: Vec<u16>,
+    /// `probe-in-k` 要求的凭据（Android：本次起核的一次性凭据；桌面：`None`）。与端口同源同刻。
+    pub auth: Option<InboundUser>,
     /// 运行核 id → outbound tag（`probe-selector-k` 成员）。
     pub id_to_tag: BTreeMap<String, String>,
     /// **起核那一刻**运行核各节点的 **5 维** dirty 判据指纹
@@ -1164,12 +1221,12 @@ pub struct ProxyRuntime {
     /// 起核时刻的热切换基准（id→tag / rule-sel / 节点指纹）。None = 核未起或快照不可信 → 全部退回重启。
     switch_snapshot: RwLock<Option<SwitchSnapshot>>,
     /// lifecycle 在飞时暂存的 switchMode 配置（上游 `pendingSwitchConfig`，:1753）。
-    /// `(id, config, defer_restart)`：id 与 `LifecycleGate::set_switch_pending` 对齐，排空时按 id 认领。
+    /// id 与 `LifecycleGate::set_switch_pending` 对齐，排空时按 id 认领。
     ///
     /// **`defer_restart` 必须跟着一起暂存**：它是「本次落盘由谁触发」的意图，不是配置内容的一部分。
     /// 若排空重放时丢掉它，用户在核重启窗口内点的那次「保存」会在几秒后自己触发一次重启 ——
     /// 恰是「保存不重启」承诺的反面，且现象是延迟的、极难归因。
-    pending_switch: RwLock<Option<(u64, Value, bool)>>,
+    pending_switch: RwLock<Option<(u64, PendingSwitch)>>,
     /// switch 快照 id 发号器（与 force_restart_seq 同构，各自独立编号）。
     switch_seq: AtomicU64,
     /// 配置入核单飞锁。正常热切换含管理 API I/O；没有这把锁时，快速连续切节点会让多个
@@ -1304,7 +1361,7 @@ pub struct ProxyRuntime {
     /// `event:proxyError` 发射器（[`set_error`](Self::set_error) 的出口）。
     ///
     /// **`OnceLock` 而非构造参数**：`AppHandle` 要到 Tauri `setup` 才存在，而本运行时在
-    /// `AppRuntime::new(config_dir)` 里就得造出来 → 只能「先构造、后接线」（`main.rs` setup 内
+    /// `AppRuntime::new(config_dir)` 里就得造出来 → 只能「先构造、后接线」（`lib.rs` setup 内
     /// [`set_error_emitter`](Self::set_error_emitter)）。未接线（单测 / setup 前的极早期失败）→
     /// `set_error` 只记日志 + 落状态码，不 panic：**发不出事件绝不能反过来打断错误处理本身**。
     error_emitter: std::sync::OnceLock<Box<dyn ProxyErrorEmitter>>,
@@ -1410,6 +1467,15 @@ impl DohPost for NoNetworkDoh {
 type UnlockInvalidationProbe = Arc<Mutex<Vec<(bool, bool)>>>;
 
 impl ProxyRuntime {
+    /// 只读起核时刻的名称映射；与当前磁盘配置隔离。
+    pub(crate) fn running_rule_names(&self) -> BTreeMap<String, RuleIdentity> {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|snapshot| snapshot.as_ref().map(|s| s.named_rule_by_raw.clone()))
+            .unwrap_or_default()
+    }
+
     /// 新建（注入 config / helper / mesh 运行时 + 系统代理清理收口器）。
     ///
     /// `proxy_clearer` 生产传 `production_proxy_controller(...)`（见 `runtime.rs`），测试传 mock。
@@ -1522,7 +1588,7 @@ impl ProxyRuntime {
     // 物理网卡的 DHCP DNS → DNS 逃逸绕过 TUN（劫持/污染重现）。故长驻 `route -n monitor` 监听链路变化，
     // 去抖后把「新出现 / 仍未受控」的服务重新接管为受控 IP（`reconcile_dns` 幂等，只补未受控项）。
 
-    /// 接线 `event:proxyError` 发射器（`main.rs` setup 内调用一次，见 [`error_emitter`](Self::error_emitter) 字段文档）。
+    /// 接线 `event:proxyError` 发射器（`lib.rs` setup 内调用一次，见 [`error_emitter`](Self::error_emitter) 字段文档）。
     ///
     /// 幂等：已接线则忽略重复接线（`OnceLock::set` 的 Err 腿）——重复接线是编程错误而非运行期状况，
     /// 记 warn 让它可见，但不 panic（不为一个诊断通道搭上 App 启动）。
@@ -1547,12 +1613,41 @@ impl ProxyRuntime {
         }
         Some(SpeedProbeTargets {
             pool_ports: snap.probe_pool_ports,
+            auth: snap.loopback_auth,
             id_to_tag: snap.id_to_tag,
             // dirty 波前预筛的唯一诚实判据（见字段文档）：起核那刻的 **5 维**指纹表，与 id_to_tag 同源同刻。
             // **必须是 dirty_fingerprints 而非 fingerprints** —— 后者是全维表（喂重启判据 + pending
             // modified），与测速「新」一侧的 5 维公式不同 ⇒ 恒不等 ⇒ 全员恒 dirty、整个波前恒被免测。
             fingerprints: snap.dirty_fingerprints,
         })
+    }
+
+    /// 运行核回环探针/更新入站的一次性凭据（Android：本次起核生成；桌面 / 未运行：`None`）。
+    ///
+    /// 消费方：经 `update-in` / `subscription-update-in`（socks）出网的更新与订阅链路。与
+    /// `ProxyStatus` 里的端口是同一次起核的产物，停核随快照一起清掉。
+    #[must_use]
+    pub fn loopback_auth(&self) -> Option<InboundUser> {
+        self.switch_snapshot
+            .read()
+            .ok()?
+            .as_ref()
+            .and_then(|snap| snap.loopback_auth.clone())
+    }
+
+    /// 进程内「经本机 **http** 代理入站走当前代理出口」的目标（端口 + 该入站要求的凭据）。
+    ///
+    /// 解锁检测 / 出口 IP / 测速回退腿 / warm RTT 伴测四条腿的**唯一**取址处。判据在纯函数
+    /// [`select_local_http_proxy`]：有 `mixed-in` 用它，没有（Android / iOS）用 `probe-proxy-in`。
+    /// 核未运行 → `None`。
+    #[must_use]
+    pub fn local_http_proxy(&self) -> Option<LocalHttpProxy> {
+        let status = self.status();
+        if !status.running {
+            return None;
+        }
+        let snap = self.switch_snapshot.read().ok()?.clone()?;
+        select_local_http_proxy(status.mixed_port, snap.probe_proxy_port, snap.loopback_auth)
     }
 
     /// **临时测速核**的构建环境快照（platform / arch / cronet 可用性）。

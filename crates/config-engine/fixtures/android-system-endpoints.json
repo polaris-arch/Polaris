@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {"name":"typed-system","config":"{\"endpoints\":[{\"type\":\"wireguard\",\"tag\":\"wg\",\"system\":true}]}","outcome":"unsupported"},
+    {"name":"typed-system-interface","config":"{\"endpoints\":[{\"type\":\"tailscale\",\"tag\":\"ts\",\"system_interface\":true}]}","outcome":"unsupported"},
+    {"name":"false-flags","config":"{\"endpoints\":[{\"type\":\"wireguard\",\"tag\":\"wg\",\"system\":false,\"system_interface\":false}]}","outcome":"allowed"},
+    {"name":"no-endpoints","config":"{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}]}","outcome":"allowed"},
+    {"name":"multiple-endpoints","config":"{\"endpoints\":[{\"type\":\"wireguard\",\"tag\":\"first\",\"system\":false},{\"type\":\"tailscale\",\"tag\":\"second\",\"system_interface\":true}]}","outcome":"unsupported"},
+    {"name":"openconnect-extra","config":"{\"endpoints\":[{\"type\":\"openconnect\",\"tag\":\"oc\",\"server\":\"example.invalid\",\"system\":true}]}","outcome":"unsupported"},
+    {"name":"openvpn-extra","config":"{\"endpoints\":[{\"type\":\"openvpn-client\",\"tag\":\"ov\",\"ovpn_file\":\"synthetic.ovpn\",\"system_interface\":true}]}","outcome":"unsupported"},
+    {"name":"raw-extra","config":"{\"endpoints\":[{\"type\":\"custom\",\"tag\":\"raw\",\"system\":true}]}","outcome":"unsupported"},
+    {"name":"malformed-json","config":"{\"endpoints\":[{\"system\":true}],\"auth_key\":\"synthetic-secret\"","outcome":"invalid"},
+    {"name":"wrong-flag-type","config":"{\"endpoints\":[{\"type\":\"tailscale\",\"tag\":\"wrong\",\"system\":\"true\",\"auth_key\":\"synthetic-secret\"}]}","outcome":"invalid"},
+    {"name":"wrong-endpoints-type","config":"{\"endpoints\":{\"system\":true,\"auth_key\":\"synthetic-secret\"}}","outcome":"invalid"},
+    {"name":"wrong-endpoint-type","config":"{\"endpoints\":[\"synthetic-secret\"]}","outcome":"invalid"}
+  ]
+}

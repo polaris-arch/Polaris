@@ -29,7 +29,7 @@ pub(crate) fn exit_requested_action(app: &tauri::AppHandle) -> ExitRequestedActi
         .0
         .swap(false, Ordering::SeqCst);
     let quitting = app.state::<QuitState>().0.load(Ordering::SeqCst);
-    if lightweight && !quitting && app.tray_by_id("main").is_some() {
+    if lightweight && !quitting && crate::tray::tray_present(app) {
         ExitRequestedAction::PreserveLightweight
     } else {
         ExitRequestedAction::Exit

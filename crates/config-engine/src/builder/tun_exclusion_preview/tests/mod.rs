@@ -77,6 +77,7 @@ fn real_build(
             probe_proxy_port: None,
             update_in_port: None,
             subscription_update_in_port: None,
+            loopback_auth: None,
             probe_pool_ports: vec![],
             platform: platform.to_string(),
             own_lan_cidrs: own_lan,

@@ -66,10 +66,37 @@ pub fn build_log_config(input: &LogConfigInput, deps: &LogBuildDeps) -> LogConfi
     // Polaris 谓词：isTunMode && (darwin || win32 || linux)。三平台全覆盖 → 实质 = isTunMode，
     // 但保留平台枚举检查忠实移植（防未来平台分支差异）。
     // Platform::Other 视同 Linux（未知平台按 Unix 路径保守写文件，TUN 下 stdout 不可捕获）。
-    let writes_log_to_file = input.proxy_mode_type.is_tun()
+    //
+    // Platform::Android **必须在列**（2026-09-04 K10）：Android 上核是进程内 libbox，stdout 更加
+    // 不可捕获（没有子进程可接管道），日志落盘是导出诊断报告拿到核原文的唯一途径。它此前是靠
+    // `Platform::parse("android") == Other` 顺带盖住的 —— 那条腿在本次给 Android 具名之后就断了，
+    // 不在这里补上就是一次由本次改动**引入**的回归（而不是原有缺陷）。
+    // 全变体皆 true 仍保留枚举检查：忠实移植 + 让未来的平台差异有地方落。
+    //
+    // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）而不是磁盘上存的那个：Android 的
+    // `proxy_mode_type` 缺省是 `SystemProxy`，照裸值判会让「全新安装 / 备份恢复的 Android 客户端
+    // 一条核日志都不落盘」，而上一段刚说过落盘是那里拿到核原文的**唯一**途径 —— 两条合起来正好
+    // 抵消，且症状是「导出诊断里核日志是空的」，离成因很远。
+    //
+    // Platform::Ios **同样必须在列**（2026-09-06，加 `Platform::Ios` 变体时补）：这一格与上面
+    // Android 那一段是**逐字同一条回归**，且成因形态更隐蔽 —— `matches!` 漏一个变体只是求值
+    // `false`，**编译器一句话都不说**（本批 40 处穷举 match 里一处都拦不住它）。
+    // iOS 的依据比 Android 更强一档：核跑在 NE 扩展进程里，app 进程连它的 stdout 都不在同一个
+    // 进程树上，落盘（写进 App Group 共享容器）是导出诊断拿到核原文的唯一途径。
+    // 漏掉它的症状与 Android 那次相同：导出诊断里核日志是空的，离成因很远。
+    //
+    // 本行由 `crates/config-engine/src/builder/tests/log.rs` 的
+    // `log_output_allowlist_covers_every_platform_variant` 逐变体钉死（变异 B：删掉这里的
+    // `Platform::Ios` 即红）。
+    let writes_log_to_file = input.proxy_mode_type.effective_on(deps.platform).is_tun()
         && matches!(
             deps.platform,
-            Platform::Mac | Platform::Win | Platform::Linux | Platform::Other
+            Platform::Mac
+                | Platform::Win
+                | Platform::Linux
+                | Platform::Android
+                | Platform::Ios
+                | Platform::Other
         );
 
     if writes_log_to_file {

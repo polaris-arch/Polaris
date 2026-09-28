@@ -46,6 +46,9 @@ export type SpeedTestInterruptReason = 'superseded' | 'core_exited' | 'core_unre
  *  探针池已接线（`run_pool_speed_test` 分波批量是常规路径）；仅当起核时池端口分配失败回退，才降级到
  *  「只测当前活跃出口」并返 `SPEEDTEST_PROBE_POOL_UNWIRED`（码名是历史遗留，语义是**本次不可用**）。 */
 export interface SpeedTestInvokeResult {
+  /** Process-local monotonic decimal identity; optional for older backends. */
+  runId?: string;
+  dirty?: string[];
   results: Record<string, number>;
   outcome: SpeedTestOutcome;
   notInPool: string[];
@@ -68,6 +71,7 @@ export interface SpeedTestInvokeResult {
  * 前端只在自己发起时才知道请求集。波前预筛掉的 notInPool/dirty/tsNotReady **不在**其中。
  */
 export interface SpeedTestDonePayload {
+  runId?: string;
   outcome: SpeedTestOutcome;
   /** 已出值的节点数（含真实 -1）。 */
   tested: number;

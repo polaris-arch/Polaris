@@ -1,5 +1,5 @@
 use crate::commands::guard_scan::top_level_fn_body;
-use crate::test_support::crate_code;
+use crate::test_support::{crate_code, crate_root_code};
 
 /// **只扫生产正文的剥注释面**。
 ///
@@ -260,7 +260,7 @@ fn production_parsers_are_executor_isolated_and_legacy_add_is_unreachable() {
     assert!(local.contains("submit_weighted(input_bytes, move ||"));
     assert!(!local.contains("parse_subscription"));
 
-    let main = crate_code("main.rs");
+    let main = crate_root_code();
     assert!(
         !main.contains("subscription_add,"),
         "legacy subscription_add must not be registered in Tauri invoke"
@@ -284,6 +284,30 @@ fn local_file_picker_never_blocks_a_tokio_worker_on_std_fs() {
         "metadata 只是预检；实际读取须流式多读一个字节来防 TOCTOU 超限"
     );
     assert!(!picker.contains("std::fs::"));
+
+    // W-18 起本 command 多了一支 content URI（Android SAF）。那一支拿句柄只能走插件的**同步**
+    // API（Android 上是一次 JNI 往返去要 fd）—— 同一条「不许挂住 tokio worker」的不变量在那一支
+    // 上的落地形态是 `spawn_blocking`。不补这两条，新增的那一支就是本门射程外的一条同步 open：
+    // 上面第一条只看得见桌面那一支的字面量，加一支同步 open 它一声不吭。
+    assert!(
+        picker.contains("tokio::task::spawn_blocking(move || {"),
+        "content URI 那一支的同步 open 必须派到阻塞线程池，不能在 async command 里直接调"
+    );
+    assert!(
+        picker.contains("tokio::fs::File::from_std(opened)"),
+        "两支必须汇合成同一种 tokio 句柄，下游那段异步读腿才是同一条"
+    );
+    let uri_arm = picker
+        .find("PickedTarget::Uri(uri) => {")
+        .expect("content URI 那一支必须在场（少了它 SAF 目标会重新掉回同步 open）");
+    let blocking = picker
+        .find("tokio::task::spawn_blocking(move || {")
+        .expect("已在上面断言过");
+    assert!(
+        blocking > uri_arm,
+        "`spawn_blocking` 必须落在 URI 那一支里 —— 只断言它在函数里某处出现过，\
+         等于允许 open 写在支外而 spawn_blocking 用在别处"
+    );
 }
 
 #[test]

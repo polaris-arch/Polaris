@@ -126,6 +126,33 @@ impl<R: CommandRunner> SystemRouteOps for SystemRouteOpsImpl<R> {
                 );
                 Ok(parse_win_find_netroute_alias(&self.run(&cmd)?.stdout))
             }
+            // Android：**没有可用的逐目的路由查询**，且这条腿曾经是一次阻断级缺陷的一半。
+            //
+            // 事实面：非 root 应用读不到内核路由表的有效答案（`ip route get` 在应用沙箱里拿不到
+            // 跨网络的真实出口），而「到这个目的会走哪张网卡」在 Android 上本就由系统持有 ——
+            // 对应物是 libbox `PlatformInterface.autoDetectInterfaceControl` +
+            // `DefaultNetworkMonitor.updateDefaultInterface`（K2 已接线），不经本 trait。
+            //
+            // 血证（K6b，2026-09-04 模拟器实测）：本臂恒 `Ok(None)` ⇒ 逐目的绑定规划恒产出
+            // 「0 绑定 / 全部候选未决」⇒ 重规划判据退回整份网卡指纹比对 ⇒ 比到起核自己建出来的
+            // tun0（link-local 每代都换）⇒ 判据恒真 ⇒ **300 秒内起核 69 次**。修在取材口
+            // （`runtime/route_binding.rs::runtime_binding_planning_supported`），本臂保持诚实的
+            // 「查不到」不变 —— 它没有说谎，说谎的是把「查不到」读成「事实变了」的那条判据。
+            Platform::Android => Ok(None),
+            // iOS：同答 `Ok(None)`，**独立成臂**——与 Android 同答不同因，且 K6b 那条血证在 iOS 上
+            // 的传导路径不同，值得单独写一次。
+            //
+            // 事实面：iOS 应用与 NE 扩展都没有逐目的路由查询面（无 `route`/`ip` 可执行、
+            // `sysctl` 路由表读取对第三方应用不开放）。对应物同样由系统持有：NE 侧是
+            // `NWPathMonitor` / `NEPacketTunnelProvider` 的 `reasserting` 与系统自动把扩展自身
+            // 出站排除出隧道 —— 后者意味着 iOS 上连「核出站要不要 protect」这个问题都不存在。
+            //
+            // K6b 传导路径的差别：那次事故的下半程是「网卡指纹比对比到核自建的 tun0」。iOS 上核
+            // 在 NE 扩展进程内，`list_network_interfaces` 这条腿本身在该平台的形态尚未落地，
+            // 故本臂今天连**不可达**都算不上——它是「等着被接线时答案已经在这里」。
+            //
+            // **未验证**：上述为平台 API 面推论，本仓构不出 iOS 产物，未经真机取证。
+            Platform::Ios => Ok(None),
             // 未知平台：无对应路由工具 → 查不到（判定层按「不可断言」不闸）。
             Platform::Other => Ok(None),
         }

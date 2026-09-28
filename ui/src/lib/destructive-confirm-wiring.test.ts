@@ -16,6 +16,7 @@
  * 结构事实，改注释与文案不会误伤，把某处换回弹窗则必然转红。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,7 +29,10 @@ function collectSources(dir: string, acc: string[] = []): string[] {
     if (e === 'node_modules' || e === 'dist') continue;
     const full = join(dir, e);
     if (statSync(full).isDirectory()) collectSources(full, acc);
-    else if (/\.tsx?$/.test(e) && !/\.(test|spec)\.tsx?$/.test(e)) acc.push(full);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (/\.tsx?$/.test(e) && !IS_TEST_ONLY_MODULE.test(e)) acc.push(full);
   }
   return acc;
 }
@@ -310,6 +314,52 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     'components/screens/settings/use-app-update.ts': 1,
     'components/screens/settings/use-core-update.ts': 2,
     'components/screens/settings/use-config.ts': 1,
+    /*
+     * ── 移动端（2026-09-06 批 2：表单宿主 + 节点面）──────────────────────────────
+     *
+     * 移动端**整体**用弹层确认取代原地二次确认，理由是形态而非偷懒：触屏没有 hover 状态，
+     * 「按钮翻红 + 再点一次」那一下在拇指底下被自己的手指挡住，而第二击极易被读成误触重复。
+     * 一层带标题与正文的面板把「要删的是哪一个、删了会怎样」说清楚（判据本体见
+     * `mobile/forms/ConfirmPanel.tsx` 与 `mobile/nodes/node-deletion.ts` 的头注）。
+     */
+    'mobile/forms/form-store.ts': 1, // union 的类型声明，非调用点（同 dialog-store.ts 那条）
+    'mobile/forms/NodeFormPanel.tsx': 1, // 脏表单放弃
+    // 批 3 的三张组网表：脏表单放弃各一处，TS 设置表另有一处「退出登录」（破坏性 ⇒ 叠一层确认，
+    // 触屏没有 hover，桌面那种「按钮翻红再点一次」在这里不成立）。
+    'mobile/forms/WgPanel.tsx': 1, // 脏表单放弃
+    // WARP 表：脏表单放弃 + **设备级动作那两颗**（重新注册 / 注销，批 16 接上）——
+    // 后者走 `node-deletion#removeWarpNode`，确认由本面板经 `confirm:` 那个 deps 开，
+    // 故两颗共用**一处** `open({ kind: 'confirm' …})`（它就是那个 deps 的实现）。
+    'mobile/forms/WarpPanel.tsx': 2,
+    'mobile/forms/TsLoginPanel.tsx': 1, // 脏表单放弃
+    'mobile/forms/TsSettingsPanel.tsx': 2, // 脏表单放弃 + 退出登录
+    'mobile/forms/SubFormPanel.tsx': 2, // 脏表单放弃 + 恢复面「取消添加」（ζ 批 A8，同桌面 SubscriptionCreateTaskDialog 那一处）
+    // Taildrop 收件箱（批 16）：删一个待处理文件 —— 破坏性，叠一层确认面板。
+    // 本面板**没有**脏表单放弃那一处：它不是一张表单，关掉不丢任何草稿。
+    'mobile/forms/TaildropPanel.tsx': 1,
+    'mobile/forms/ImportFormPanel.tsx': 1, // 脏表单放弃
+    // 批 10（规则屏）落地的五张表。四处是「脏表单放弃」那一档（与上面几张同形），
+    // 规则表另有一处是**删除这条规则**的二次确认（编辑态 footer 那颗）。
+    'mobile/forms/RuleFormPanel.tsx': 2, // 脏表单放弃 + 删除规则
+    'mobile/forms/DnsResourceFormPanel.tsx': 2, // 服务器表 / 分组表各一处脏表单放弃
+    'mobile/forms/AppAddPanel.tsx': 1, // 脏表单放弃
+    'mobile/forms/ResourceAddPanel.tsx': 1, // 按 URL 下载那支的脏表单放弃（目录多选那支无草稿可丢）
+    // 网络场景（2026-09-25）：表单的脏表单放弃一处（同桌面 `NetworkProfilePanel` 那一处）；
+    // 删除场景在规则屏二级页上叠一层确认（下面 `RulesScreen.tsx` 那一处），正文说清「N 条规则将停止生效」——
+    // 桌面把这句放在原地二次点击的武装态里，触屏上那一行在拇指底下被手指自己挡住（本表移动端段头注同一条理由）。
+    'mobile/forms/NetworkProfileFormPanel.tsx': 1,
+    'mobile/screens/rules/RulesScreen.tsx': 1,
+    // 删节点 / 批删 / 删订阅三条共用一个 `confirm` 闭包（`useMobileNodeDeletion` 的入参）。
+    'mobile/nodes/MobileNodesScreen.tsx': 1,
+    /*
+     * 批 13：删除 W26 前遗留的无界 `singbox.log`。
+     *
+     * 本屏另外四颗破坏性动作（全部关闭 / 关闭筛选项 / 清空已关闭历史 / 清空日志）走的是原地
+     * `confirmTwice`，**这一颗刻意不同**：它删的是用户的历史资产，不可逆且不可重来，而那四颗
+     * 删掉的是可以再攒出来的连接与日志缓冲。一层写明「删的是哪一个、有多大」的面板配得上这个
+     * 后果；触屏上「再点一次」的第二击与误触只差 40 ms。
+     */
+    'mobile/connections/MobileConnectionsScreen.tsx': 1,
   };
 
   it('清册与磁盘现状逐文件相等（多一处 / 少一处都说话）', () => {

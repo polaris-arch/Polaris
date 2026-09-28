@@ -138,11 +138,22 @@ impl ProxyRuntime {
         added.sort();
         modified.sort();
         removed.sort();
+        // 显式选择只改磁盘 D 而目标不在当前核时，没有节点增/改/删也可能留下
+        // selectedServerId 债。直接比 D/R 真值，切回运行出口后自然清掉，不污染“保存未应用”
+        // 的独立 restart_deferred 标记。
+        let selected_pending = self
+            .current_config
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+            .is_some_and(|runtime| {
+                runtime.get("selectedServerId") != current.get("selectedServerId")
+            });
         PendingChangesSummary {
             added,
             modified,
             removed,
-            restart_deferred: self.restart_deferred.load(Ordering::SeqCst),
+            restart_deferred: self.restart_deferred.load(Ordering::SeqCst) || selected_pending,
         }
     }
 

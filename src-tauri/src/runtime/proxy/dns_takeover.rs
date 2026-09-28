@@ -169,10 +169,13 @@ impl ProxyRuntime {
     /// 门控（[`Self::dns_reconcile_should_run`]）：当前配置 TUN + 接管 marker 在。锁中毒 / 门未过 → 跳过。
     pub(crate) fn reconcile_system_dns_locked(&self) -> bool {
         let raw = self.config.current().ok();
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。Android 上零行为差，
+        // 且整条腿在那里不可达：唯一调用链是通用网络变化 watcher，而 `spawn_network_watcher`
+        // 在非 mac/linux/windows 上直接早退。
         let is_tun = raw
             .clone()
             .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
-            .is_some_and(|c| c.proxy_mode_type.is_tun());
+            .is_some_and(|c| c.proxy_mode_type.effective_on(Platform::current()).is_tun());
         // 用户开关活态（从**原始 JSON** 读：`dnsConfig.takeoverSystemDns` 不在 `DnsConfig` 结构体里，
         // 同 `restartOnNodeChange` / `autoSwitchNode` / `meshLoginFallbackDirect` 的既定手法）。
         let takeover = raw.as_ref().and_then(dns_takeover_enabled);

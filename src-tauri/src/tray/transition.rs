@@ -43,7 +43,7 @@ pub(crate) fn enter_lightweight_transition(app: AppHandle) {
         // 陈旧守卫。CAS 成功才归本调用者所有，失败回滚也只能撤销自己亲手武装的那一位。
         let armed = should_arm_last_webview_exit_guard(
             app.webview_windows().len(),
-            app.tray_by_id("main").is_some(),
+            crate::tray::tray_present(&app),
         ) && app
             .state::<crate::LightweightState>()
             .0

@@ -369,9 +369,9 @@ fn load_no_rule_backup_for_modern_rules() {
 ///
 /// 此前按平台写 mac 1400 / 其余 1350。一旦落盘成具体数，此后默认值再怎么改都追不上这台机器——
 /// 存量 1350/1400 正因此需要 `migrate_tun_mtu` 清一遍。本轮默认值从「栈 × 平台」改成单一
-/// `DEFAULT_TUN_MTU`，正是这条不变量让存量配置无需再迁移一次。
+/// `DEFAULT_TUN_MTU`（2026-09-25 起缺席即不下发、交内核取默认），正是这条不变量让存量配置无需再迁移一次。
 ///
-/// 缺席 = 自动，由 config-engine 在生成期取 `tun_config::DEFAULT_TUN_MTU`。
+/// 缺席 = 自动，生成期不下发 `mtu` 键，由 sing-box 内核取默认（见 config-engine `TunModeConfig::mtu`）。
 #[test]
 fn default_config_leaves_mtu_absent() {
     let cfg = default_config();

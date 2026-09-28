@@ -6,6 +6,7 @@
  * 负责让新增/搬走任一全局先转红并要求裁定，二者缺一不可。
  */
 import { describe, expect, it } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,7 +46,7 @@ const BOOT_GLOBALS = [
       needles: ['window.__POLARIS_INITIAL_THEME__ ='],
     },
     attachment: {
-      file: 'src-tauri/src/main.rs',
+      file: 'src-tauri/src/lib.rs',
       item: 'fn create_main_window(',
       needles: ['.initialization_script(tray::theme_boot_script(dark))'],
     },
@@ -59,7 +60,7 @@ const BOOT_GLOBALS = [
       needles: ['window.__POLARIS_TRAY_SCREEN__ ='],
     },
     attachment: {
-      file: 'src-tauri/src/main.rs',
+      file: 'src-tauri/src/lib.rs',
       item: 'fn create_main_window(',
       needles: ['.initialization_script(tray::tray_screen_boot_script(screen))'],
     },
@@ -132,7 +133,10 @@ function collectTs(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir).sort()) {
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) collectTs(full, out);
-    else if (/\.tsx?$/.test(entry) && !/\.(test|spec)\.tsx?$/.test(entry)) out.push(full);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (/\.tsx?$/.test(entry) && !IS_TEST_ONLY_MODULE.test(entry)) out.push(full);
   }
   return out;
 }

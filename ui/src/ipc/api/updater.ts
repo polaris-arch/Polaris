@@ -3,6 +3,7 @@ import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { CoreBuildKind } from '../../domain/core-build';
 
 export interface VersionInfo {
+  debugReportAvailable?: boolean;
   appVersion: string;
   appName: string;
   buildDate: string;
@@ -88,6 +89,21 @@ export interface UpdateProgressManifest extends Omit<UpdateInfo, 'releaseNotes' 
  */
 export type InstallAdvisory = 'macosGatekeeper' | 'windowsSmartScreen' | 'debElevation';
 
+/**
+ * Android 交系统安装器那条腿的失败原因码（后端原样转述 Kotlin 侧的 `REASON_*` 常量）。
+ *
+ * 🔴 **一个码一句话，不许折成「安装失败」**：这五个的「用户下一步」完全不同 ——
+ * 前两个是「按一下开关就能继续」（而且应用已经把用户送到那一页了），第三个是「本机装不了」，
+ * 后两个是接线错误 / 包不见了。折叠等于对前两种情形的用户说一句做不到的话。
+ * 取文在 `mobile/settings/app-update-install.ts`，逐码对拍在它的测试里。
+ */
+export type AndroidInstallReason =
+  | 'unknown-sources-denied'
+  | 'unknown-sources-settings-unavailable'
+  | 'no-installer-activity'
+  | 'package-not-app-private'
+  | 'package-missing';
+
 /** `updateApi.install` 的返回：需确认 / 已交系统 / 已起安装脚本。 */
 export interface UpdateInstallResult {
   ok: boolean;
@@ -97,6 +113,17 @@ export interface UpdateInstallResult {
   advisory?: InstallAdvisory;
   /** 形态错配 → 已回退交系统打开（**不强制 root 安装**）。 */
   handedToSystem?: boolean;
+  /**
+   * **Android 专有**：包已交给系统安装器，本进程还活着在等用户在系统 UI 上确认。
+   *
+   * 🔴 **刻意不与 `handedToSystem` 共用一个键**（后端 `app_update.rs` 的 Android 分支有一段
+   * 专门写这件事，并有断言钉着）：`handedToSystem` 在本仓只有一个产地 —— 形态错配那条
+   * **失败**路径，前端唯一的消费点据此报「更新失败 / 形态错配」。Android **成功**回包若也标它，
+   * 用户会在系统安装器弹出来的同时看到一句「安装失败」。
+   *
+   * `false` = 交不出去，`reason` 里是那五个码之一。
+   */
+  awaitingSystemInstaller?: boolean;
   reason?: string;
   detail?: string;
 }

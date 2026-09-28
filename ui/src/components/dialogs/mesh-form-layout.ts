@@ -1,4 +1,4 @@
-import type { FieldSpec, FormValues } from './FieldSpec';
+import type { FieldSpec, FormValues } from './field-spec';
 import type { NodeProto } from './node-spec';
 
 export type WgFormGroup = 'basic' | 'routing' | 'advanced';

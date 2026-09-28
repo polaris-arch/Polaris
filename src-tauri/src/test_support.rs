@@ -158,6 +158,34 @@ pub(crate) fn crate_code(rel: &str) -> String {
     literal_face(&crate_source(rel))
 }
 
+/// **crate 根**的取材面：`main.rs` + `lib.rs` 两份拼接（各自已剥注释）。
+///
+/// # 为什么取材面是「两个文件」而不是其中某一个
+///
+/// 应用装配（18 个 `mod`、插件注册、`setup`、command 注册表、`RunEvent` 循环）已从 `main.rs`
+/// 下沉进 `lib.rs`（移动端加载的是 cdylib、根本没有 `main()`，理由见 `lib.rs` 模块文档），
+/// `main.rs` 收成薄壳。把取材写死成其中任何**一个**文件，都会在下一次同类搬迁时静默失效 ——
+/// 这正是本仓吃过一次的亏，[`module_source`] 的文档记着原话：「测试实体从 `foo.rs` 搬进
+/// `foo/tests/mod.rs` 的那一刻，143 处锚点全部平移一层，失败模式是**解析到另一个真实存在的
+/// 文件** ⇒ 编译通过、门继续绿、扫的却是别的东西」。crate 根横跨 `main.rs` 与 `lib.rs`，
+/// 与「模块横跨 `foo.rs` 与 `foo/`」是同一件事的另一个面，修法也同款：取整个面。
+///
+/// [不选「逐处改成 `crate_code("lib.rs")`」：改动确实更小，但那是把「装配住在哪个文件」这个
+///  **实现细节**重新焊进十来处判据里，下一次搬迁再来一遍；而且负面断言（「不许出现 X」）
+///  取到空文件时恒真 —— 失效方向是静默的]
+///
+/// # 顺序断言为什么仍然成立
+///
+/// 拼接序固定 `main.rs` 在前。薄壳里只剩 `windows_subsystem` 属性与一句 `run()`，不含任何
+/// 判据锚点 ⇒ 全部 `find(A) < find(B)` 的相对位置与只取 `lib.rs` 时逐字节相同。哪天薄壳里
+/// 真长出与锚点同名的文本，[`crate::commands::guard_scan::top_level_fn_body`] 的「恰好命中
+/// 一次」是硬断言（不是取第一处），会当场把这件事报出来。
+pub(crate) fn crate_root_code() -> String {
+    // 中间垫一个换行：`crate_source` 返回的是文件全文、末尾未必带换行，首尾直接相接会把薄壳
+    // 最后一行与 `lib.rs` 第一行粘成同一行 —— 按行工作的取材器（整行注释剥离）会跟着错一行。
+    format!("{}\n{}", crate_code("main.rs"), crate_code("lib.rs"))
+}
+
 /// 逐文件形态，用于让失败信息说得出「哪个文件」。
 pub(crate) fn module_files(dir_rel: &str) -> Vec<(String, String)> {
     polaris_source_probe::module_files_in(env!("CARGO_MANIFEST_DIR"), dir_rel)

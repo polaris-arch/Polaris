@@ -14,6 +14,7 @@
  * 断言的是关系：bottom 必须**从状态栏高度推导**、中性暗色覆盖必须**两份都在**、开关文案必须**同句式**。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -953,6 +954,23 @@ describe('「阻断」配色两轴：动作标签轴恒 --err 且常驻，流量
       'components/screens/home/HomeScreen.tsx', //    动作标签轴 · .act-block-txt（#cur-node）
       'components/screens/home/NodeMenu.tsx', //      动作标签轴 · .mi.danger
       'components/screens/rules/RuleItem.tsx', //     动作标签轴 · .act-block pill
+      // F1 移动首页的动作标签轴覆盖三处：
+      //  · 节点卡的哨兵出口标签「阻断」= 动作标签轴 · `.h-nodename.blk`（--err，常驻）；
+      //  · 出口选择面里的哨兵行「阻断」= 同一轴 · `.h-pickname.blk`（批 12 接线，--err 常驻）；
+      //  · 主机行规则面板「新建规则」的动作三选一里那一档 = 同一轴 · `.h-opt.blk`
+      //    （批 12；写在 `.h-opt.cur` 之后，选中时红仍压过 --flow —— 「常驻」说的正是这个）；
+      // 移动端连接行的出站链那一格，与桌面连接表同一处、同一轴、同一 token：
+      // 「这条连接的出站是阻断」是**动作标签**，不是「流量到此被丢弃」的流量表达。
+      'mobile/connections/ConnectionsView.tsx', //   动作标签轴 · .mc-row-chain.block（--err）
+      // 移动端规则表单的「目标出站」选择器。与桌面 `RuleRouteEffect.tsx` 同一处、同一轴、
+      // 同一条通道：`danger: true` 落成 `.mr-sel-opt.danger`（--err），不在本页另刷一层红。
+      'mobile/forms/RuleFormPanel.tsx', //           动作标签轴 · select-sheet danger 通道
+      'mobile/home/HomeScreenView.tsx',
+      // 首页与全部列表共享流量表达轴：p-block 环为 --warn，策略文字保持中性。
+      'mobile/home/RuleHitButton.tsx',
+      'mobile/screens/rules/AppsSegment.tsx', //     动作标签轴 · 汇总行「阻断 N」.mr-block-n（--err）
+      'mobile/screens/rules/RuleRow.tsx', //         动作标签轴 · .mr-pill.act-block（--err）
+      'mobile/screens/rules/RulesScreen.tsx', //     动作标签轴 · 应用行策略文案（只读 pill 走 .act-block）
     ];
 
     const root = fileURLToPath(new URL('..', import.meta.url));
@@ -961,7 +979,10 @@ describe('「阻断」配色两轴：动作标签轴恒 --err 且常驻，流量
         e.isDirectory() ? walk(`${dir}/${e.name}`) : [`${dir}/${e.name}`]
       );
     const found = walk(root)
-      .filter((p) => /\.tsx?$/.test(p) && !/\.test\.tsx?$/.test(p))
+      // `IS_TEST_ONLY_MODULE`（共享谓词）而不是就地的 `/\.test\./`：`.test-support.` 模块同样不进产物。
+      // 四屏对差登记表里出现 `home.routingBlock` 是在**登记这颗控件在移动端不可选**，不是渲染它 ——
+      // 花名册数的是渲染点，把一张登记表算进去等于要求它也去定一档颜色。
+      .filter((p) => /\.tsx?$/.test(p) && !IS_TEST_ONLY_MODULE.test(p))
       .filter((p) => {
         const src = readFileSync(p, 'utf8');
         return BLOCK_LABEL_KEYS.some((k) => src.includes(k));

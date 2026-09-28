@@ -233,13 +233,32 @@ fn platform_tag_uses_node_convention() {
     assert_ne!(t, "windows");
 }
 
-/// `cronet_available` 四象限：naive 可用性判定。累积式断言（不短路）便于变异验证——删掉
-/// 「|| platform=="darwin"」半式后，mac-arm64 与 mac-x64 两条**同时**列入失败（两架构都靠这半式；
-/// linux 两条不依赖，恒绿）。
+/// `cronet_available` 逐核形态：naive 可用性判定。**三种核形态各占一行**（不是「四象限」——
+/// 那个名字在 Android 进来之后就是句谎话，覆盖面从 6 条长到 8 条、平台从 3 个长到 4 个）：
+/// 独立可执行 + 静态编入（darwin）、进程内 `.so` + 静态编入（android）、独立可执行 + 动态库（linux/win32）。
+///
+/// 累积式断言（不短路）便于变异验证——把 `core_has_builtin_cronet` 改回 `platform == "darwin"`，
+/// android 两条**同时**列入失败而 darwin/linux/win32 六条恒绿，失败清单直接指出丢的是哪一支。
 #[test]
-fn cronet_available_four_quadrants() {
+fn cronet_available_across_core_forms() {
     // (lib_exists, platform, arch, expected, label)
     let cases = [
+        // Android：核是进程内 libbox.so（**没有核二进制** ⇒ lib_exists 恒 false），cronet 静态在里面。
+        // 这两条是本批修的真机缺陷本体：漏了它们 → has_cronet=false → 全部 naive 节点被静默剔除。
+        (
+            false,
+            "android",
+            "aarch64",
+            true,
+            "android/arm64 静态编入 libbox.so → 无落盘动态库也须 true",
+        ),
+        (
+            false,
+            "android",
+            "x86_64",
+            true,
+            "android/x86_64 同一份 aar → 无落盘动态库也须 true",
+        ),
         // macOS 两架构 cronet 静态编入内核 → 无 dylib 也可用（真机 bug 修复的核心断言）。
         (
             false,
@@ -272,6 +291,28 @@ fn cronet_available_four_quadrants() {
             false,
             "Windows 无 libcronet → false",
         ),
+        // iOS：本仓今天构不出 iOS 产物 ⇒ 核里有没有 cronet 没有事实可查 ⇒ 谓词答 false。
+        // 这两条钉的是**「这个 false 是答过的」**：把 `core_has_builtin_cronet` 的 `"ios"` 臂
+        // 翻成 true（或并进 darwin/android 那条），两条同时红。
+        //
+        // 第二条（lib_exists=true）不是凑数：它证明 `cronet_available` 的**并集语义**在 iOS 上
+        // 仍然成立 —— 将来若 iOS 改走动态库形态，探测到库就该 true，那时该改的是探测腿而不是
+        // 本谓词。少了它，「把 cronet_available 写成 `core_has_builtin_cronet(platform)` 单条」
+        // 这种退化在 iOS 这一格上不会被抓到。
+        (
+            false,
+            "ios",
+            "aarch64",
+            false,
+            "iOS 无核产物 + 无落盘动态库 → false（具名的 false，见 core_has_builtin_cronet §ios）",
+        ),
+        (
+            true,
+            "ios",
+            "aarch64",
+            true,
+            "iOS 若探测到落盘 cronet 动态库 → true（并集语义不因平台而失效）",
+        ),
     ];
     let mut fails = Vec::new();
     for (lib, plat, arch, want, label) in cases {
@@ -282,7 +323,7 @@ fn cronet_available_four_quadrants() {
     }
     assert!(
         fails.is_empty(),
-        "cronet_available 四象限失败:\n  {}",
+        "cronet_available 逐核形态失败:\n  {}",
         fails.join("\n  ")
     );
 }
@@ -357,4 +398,104 @@ fn enumerate_own_lan_cidrs_yields_valid_non_loopback_cidrs() {
         // 去重生效（dedupe_own_lan）。
         assert!(seen.insert(c.clone()), "枚举结果须去重，实得重复项: {c}");
     }
+}
+
+/// **产物级**断言：Android 上 naive 节点确实被构进生成出的 config，而不只是 `has_cronet` 为真。
+///
+/// 为什么不判中间变量：`has_cronet=true` 只是**必要条件**。它与「配置里真有一个 naive 出站」之间
+/// 还隔着两道各自独立的门 —— `generate::is_node_usable`（选中节点校验，不过就整次生成 Err）与
+/// `outbounds.rs:331` 的 `!deps.has_cronet_lib` 跳过腿。任一处另有平台判据，谓词改对了照样剔。
+/// 故判据取**生成出来的 JSON**：`outbounds[].type == "naive"` 在场。
+///
+/// 反向对照同批跑（`has_cronet=false`）：同一份输入必须**生成失败**（选中的就是那个 naive 节点）。
+/// 没有这一半，本门会被「naive 恒在场」之类的恒真实现骗过。
+#[test]
+fn android_config_actually_contains_the_naive_outbound() {
+    use polaris_config_engine::builder::{generate_sing_box_config, GenerateConfigDeps};
+    use polaris_config_engine::user_config::app_config::UserConfig;
+
+    fn deps_for(platform: &str, has_cronet: bool) -> GenerateConfigDeps {
+        GenerateConfigDeps {
+            platform: platform.to_string(),
+            arch: "aarch64".into(),
+            race_server_port: 0,
+            probe_direct_port: None,
+            probe_proxy_port: None,
+            update_in_port: None,
+            subscription_update_in_port: None,
+            loopback_auth: None,
+            network_canary_port: None,
+            probe_pool_ports: vec![],
+            lan_resolver_for_dns: None,
+            race_upstream_ips: vec![],
+            race_upstream_ports: vec![],
+            has_cronet,
+            cronet_copy_failed: false,
+            has_management_api: true,
+            privacy_mode: false,
+            log_level: polaris_config_engine::user_config::LogLevel::Info,
+            disable_log_file: false,
+            dashboard_serve_dir: None,
+            tailscale_api_port: 0,
+            cache_path: "/fake/userData/cache.db".into(),
+            log_file_path: None,
+            runtime_rules_dir: "/fake/userData/rules".into(),
+            rule_resources_path: "/fake/userData/rule-resource".into(),
+            custom_rules_dir: "/fake/userData/custom-rules".into(),
+            tailscale_state_dir_prefix: "/fake/userData/tailscale".into(),
+            is_valid_srs_fn: |p| p.ends_with(".srs"),
+            own_lan_cidrs: vec![],
+            system_dns_takeover_active: false,
+            netenv_dhcp_suppressed: false,
+            // 本门问的是「Android 的配置里真有那个 naive 出站没有」，与组网段结算无关：
+            // 两条新入参都显式给空值，目录指一个不存在的路径（免得结果取决于跑它那台机器上有什么文件）。
+            tailnet_rules_dir: "/nonexistent/polaris-tailnet-rules".into(),
+            observed_tailnet_addresses: Default::default(),
+            log: |_, _| {},
+            on_degraded: || {},
+        }
+    }
+
+    let raw = serde_json::json!({
+        "servers": [
+            { "id": "nv", "name": "NAIVE", "protocol": "naive",
+              "address": "nv.example.com", "port": 443,
+              "naiveSettings": { "username": "u", "password": "p" } }
+        ],
+        "selectedServerId": "nv",
+        "proxyMode": "smart",
+        "proxyModeType": "tun"
+    });
+    let config: UserConfig = serde_json::from_value(raw).expect("UserConfig 反序列化");
+    let resolved = std::collections::BTreeMap::new();
+
+    // 正面：Android 的 has_cronet 必须由**真实谓词**算出（不是硬编码 true），且产物里有 naive 出站。
+    // `cronet_lib_exists_for_start()` 在 Android 上恒 false（没有核二进制可解析），故第一参传 false。
+    let android_has_cronet = cronet_available(false, "android", "aarch64");
+    assert!(
+        android_has_cronet,
+        "Android 的核（libbox.so）静态编入 cronet，谓词必须判 true"
+    );
+    let cfg =
+        generate_sing_box_config(&config, &resolved, &deps_for("android", android_has_cronet))
+            .expect("Android + naive 选中节点必须生成成功");
+    let v = serde_json::to_value(&cfg).expect("序列化");
+    let naive_count = v["outbounds"]
+        .as_array()
+        .expect("outbounds 必须是数组")
+        .iter()
+        .filter(|o| o.get("type").and_then(serde_json::Value::as_str) == Some("naive"))
+        .count();
+    assert_eq!(
+        naive_count, 1,
+        "Android 生成出的 config 必须含恰好一个 naive 出站，实得 {naive_count}；outbounds={}",
+        v["outbounds"]
+    );
+
+    // 反向对照：谓词若判 false，同一份输入必须**生成失败**——证明上面那条绿不是恒真。
+    let neg = generate_sing_box_config(&config, &resolved, &deps_for("android", false));
+    assert!(
+        neg.is_err(),
+        "has_cronet=false 时选中的 naive 节点必须不可用（否则本门无杀伤力）"
+    );
 }

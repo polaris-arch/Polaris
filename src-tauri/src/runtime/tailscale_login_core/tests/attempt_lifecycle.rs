@@ -28,10 +28,11 @@ struct SlowSpawner {
     terminating: Arc<Semaphore>,
     release: Arc<Semaphore>,
 }
+#[async_trait]
 impl LoginCoreSpawner for SlowSpawner {
-    fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+    async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
         Ok(Box::new(SlowChild {
-            child: self.base.spawn(req)?,
+            child: self.base.spawn(req).await?,
             terminating: self.terminating.clone(),
             release: self.release.clone(),
         }))
@@ -178,7 +179,7 @@ async fn relogin_waits_for_old_writer_reap_before_spawn() {
     assert!(matches!(second.await.unwrap(), StartLoginOutcome::Started));
     assert_eq!(spawner.base.count.load(Ordering::SeqCst), 2);
     spawner.release.add_permits(1);
-    reg.cancel_and_wait("ts1").await;
+    reg.cancel_and_wait("ts1").await.unwrap();
     std::fs::remove_dir_all(ud).unwrap();
 }
 
@@ -191,7 +192,7 @@ async fn main_reservation_waits_for_reap_and_uses_generated_endpoint_set() {
     let (reg2, ud2) = (reg.clone(), ud.clone());
     let reservation = tokio::spawn(async move {
         let _gate = reg2.state_gate().await;
-        reg2.reserve_main_states(&json!({"endpoints": [{"type": "tailscale", "tag":"myts", "state_directory": ud2.join("tailscale/ts1")}, {"type": "wireguard", "tag": "ts2"}]}), &ud2).await;
+        reg2.reserve_main_states(&json!({"endpoints": [{"type": "tailscale", "tag":"myts", "state_directory": ud2.join("tailscale/ts1")}, {"type": "wireguard", "tag": "ts2"}]}), &ud2).await.unwrap();
     });
     acquire(&spawner.terminating).await;
     assert!(!reservation.is_finished());
@@ -224,6 +225,45 @@ async fn main_reservation_waits_for_reap_and_uses_generated_endpoint_set() {
     let (_, outcome) = tokio::join!(fresh, start);
     assert!(matches!(outcome, StartLoginOutcome::InMainCore));
     assert_eq!(spawner.base.count.load(Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn failed_transient_close_blocks_main_reservation_until_retry_confirms_reap() {
+    let spawner = fake_spawner(vec![], false, false);
+    let reg = reg_with(
+        spawner.clone(),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let ud = temp_ud();
+    started(&reg, &ud, &ts_server("ts1", "myts")).await;
+    let old = spawner.spawned.lock().unwrap()[0].clone();
+    old.close_failures.store(1, Ordering::SeqCst);
+    let final_config = json!({"endpoints": [{
+        "type": "tailscale", "tag": "myts", "state_directory": ud.join("tailscale/ts1")
+    }]});
+    {
+        let _gate = reg.state_gate().await;
+        assert!(reg.reserve_main_states(&final_config, &ud).await.is_err());
+    }
+    assert!(
+        reg.shared.contains("ts1"),
+        "failed close retains transient claim"
+    );
+    assert!(!old.terminated.load(Ordering::SeqCst));
+    assert!(
+        !reg.main_owns("ts1", true),
+        "failed reservation cannot claim main ownership"
+    );
+    {
+        let _gate = reg.state_gate().await;
+        reg.reserve_main_states(&final_config, &ud).await.unwrap();
+    }
+    assert!(old.terminated.load(Ordering::SeqCst));
+    assert!(!reg.shared.contains("ts1"));
+    assert!(reg.main_owns("ts1", true));
     std::fs::remove_dir_all(ud).unwrap();
 }
 
@@ -399,7 +439,8 @@ async fn logout_refuses_a_live_main_owner_without_deleting_state() {
             &json!({"endpoints": [{"type":"tailscale", "state_directory":state}]}),
             &ud,
         )
-        .await;
+        .await
+        .unwrap();
     }
     assert!(!reg
         .logout("ts1", &|| true, None, |_| panic!(
@@ -566,7 +607,7 @@ async fn main_owner_does_not_authorize_new_credentials_from_old_endpoint() {
     let ud = temp_ud();
     {
         let _gate = reg.state_gate().await;
-        reg.reserve_main_states(&json!({"endpoints":[{"type":"tailscale", "state_directory":ud.join("tailscale/ts1"), "auth_key":"old-key"}]}), &ud).await;
+        reg.reserve_main_states(&json!({"endpoints":[{"type":"tailscale", "state_directory":ud.join("tailscale/ts1"), "auth_key":"old-key"}]}), &ud).await.unwrap();
     }
     let mut server = ts_server("ts1", "myts");
     server.tailscale_settings = Some(Box::new(
@@ -727,7 +768,7 @@ async fn owned_main_registry(
     ));
     let ud = temp_ud();
     let _gate = reg.state_gate().await;
-    reg.reserve_main_states(&json!({"endpoints":[{"type":"tailscale", "tag":"actual-generated-tag", "state_directory":ud.join("tailscale/ts1")}]}), &ud).await;
+    reg.reserve_main_states(&json!({"endpoints":[{"type":"tailscale", "tag":"actual-generated-tag", "state_directory":ud.join("tailscale/ts1")}]}), &ud).await.unwrap();
     drop(_gate);
     (reg, sub, ud)
 }

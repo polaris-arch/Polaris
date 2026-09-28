@@ -44,6 +44,25 @@ pub const CORE_UPDATE_REPO: (&str, &str) = ("SagerNet", "sing-box");
 /// 大小写敏感：`package.yml` 产的是字面小写名，三侧同口径才守得住真正会被选中的那个资产。
 pub const PORTABLE_ZIP_PREFIX: &str = "polaris-portable-";
 
+/// Android release APK 资产名的**尾缀契约**（完整形态 `polaris-<版本>-android-arm64.apk`）。
+///
+/// **跨文件命名契约的单点定义**，两处必须一致，改一处就要改另一处：
+///  1. 产出侧 `.github/workflows/android.yml` 的 `release-apk` job（它把 gradle 出的
+///     `app-arm64-release.apk` 改名成这个形态再作为 release 资产上传）；
+///  2. 选包侧 [`find_suitable_update_asset`] 的 Android 分支（本模块）。
+///
+/// 两侧由 `tests::the_ci_asset_name_is_exactly_what_the_selector_picks` 逐字对拍（写成纯代码体
+/// 而**不是** intra-doc 链接：那个模块挂 `#[cfg(test)]`，rustdoc 不编译它 ⇒ 链接解析不到，
+/// 而 ci.yml 的 doc 门带 `-D rustdoc::broken-intra-doc-links`，写成链接会让整条 doc 门红）：
+/// 那条测试从 workflow 原文里把资产名表达式取出来，展开成一个真实文件名，喂进本函数 ——
+/// 命名契约漂一个字符，选包器就选不中，而**故障形态是「Android 上永远查不到更新」**
+/// （`AppUpdateCheck::NoUpdate`，一句话都不说），正是本仓反复在抓的那种静默。
+///
+/// 为什么**只有 arm64**：`.github/workflows/android.yml` 只交叉编译 `aarch64-linux-android`
+/// 一个 target（`assembleArm64*`）。x86_64 是模拟器形态，不发资产 —— 故本模块对
+/// 非 [`AssetArch::Arm64`] 的 Android 恒返 `None`，而不是回落到一个不存在的包。
+pub const ANDROID_APK_SUFFIX: &str = "-android-arm64.apk";
+
 /// 构造 GitHub releases API URL（= 上游 `https://api.github.com/repos/${owner}/${repo}/releases`）。
 #[must_use]
 pub fn github_releases_api_url(owner: &str, repo: &str) -> String {
@@ -52,12 +71,20 @@ pub fn github_releases_api_url(owner: &str, repo: &str) -> String {
 
 // ── 目标平台 / 架构（对齐 NodeJS.Platform / process.arch 的分支面）──────────────────
 
-/// 目标平台（对齐 上游 `process.platform` 的三分支 `win32`/`darwin`/`linux`）。
+/// 目标平台（上游三分支 `win32`/`darwin`/`linux`，本仓多一态 [`Android`](AssetPlatform::Android)）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetPlatform {
     Windows,
     Macos,
     Linux,
+    /// Android（上游没有这一态：上游 是桌面 Electron 应用）。
+    ///
+    /// 它与三个桌面态有两处**结构性**差别，两处都在本模块里落成了分支，别按对称性「顺手统一」：
+    ///  · **只有 arm64 有资产**（见 [`ANDROID_APK_SUFFIX`]）：x86_64 是模拟器形态，不发包；
+    ///  · **没有可换的内核**：核是随 APK 打进去的进程内 `libbox.aar`，故
+    ///    [`find_suitable_singbox_asset`] 在这一态上恒 `None`（那条腿真正的闸在
+    ///    `commands/updater/core_update.rs` 的 Android 早退，本模块这一格是第二道）。
+    Android,
 }
 
 /// 目标架构（对齐 上游 `process.arch` 关心的 `x64`/`arm64`；其余归 [`Other`](AssetArch::Other)）。
@@ -69,13 +96,15 @@ pub enum AssetArch {
 }
 
 impl AssetPlatform {
-    /// 从 `std::env::consts::OS` 映射（宿主注入真实平台）。`None` = 非三大目标平台（无适配包）。
+    /// 从 `std::env::consts::OS` 映射（宿主注入真实平台）。`None` = 本仓不为它发包的平台
+    /// （iOS、各 BSD……）—— 那些平台上整条自更新腿没有对象。
     #[must_use]
     pub fn from_os(os: &str) -> Option<Self> {
         match os {
             "windows" => Some(Self::Windows),
             "macos" => Some(Self::Macos),
             "linux" => Some(Self::Linux),
+            "android" => Some(Self::Android),
             _ => None,
         }
     }
@@ -232,6 +261,12 @@ fn select_update_release(
 ///  5. [`find_suitable_update_asset`] 挑平台/架构/形态资产；无适配 → 无更新。
 ///  6. 组装 [`AppUpdateInfo`]（`version` 保留原始 tag，对齐 上游）。
 ///
+/// 第 5 步在**该 release 没发适配资产**时返 `None` ⇒ 本函数返 [`AppUpdateCheck::NoUpdate`]，
+/// 即「有新版本，但没有你这台设备能装的包」与「已经是最新」在本函数的出口上**不可分辨**。
+/// 调用方若需要分辨（Android 就需要：APK 资产是 2026-09-13 才开始发的，旧 release 一个都没有），
+/// 在拿到 `NoUpdate` 之后再问一次 [`check_app_update_release_only`] —— 前四道闸两条腿共用，
+/// 故「它说有、这条说没有」只可能是资产那一步的差别，不会是版本比对漂了。
+///
 /// # Errors
 ///
 /// - [`ManifestError::ParseJson`]：releases JSON 解析失败（= 上游 `解析 GitHub API 响应失败`）。
@@ -243,6 +278,67 @@ pub fn check_app_update(
     platform: AssetPlatform,
     arch: AssetArch,
     loose_form: bool,
+) -> Result<AppUpdateCheck, ManifestError> {
+    newer_release_then(
+        releases_json,
+        current_version,
+        include_prerelease,
+        skipped_version,
+        |release| app_update_info_for_release(release, platform, arch, loose_form),
+    )
+}
+
+/// 检查 App 更新，但**跳过资产选择**：只回答「有没有比当前新的 release」。
+///
+/// # 为什么必须有第二条检查腿（不是「顺手加的通用性」）
+///
+/// [`check_app_update`] 的第 5 步（挑平台资产）选不到时返 [`AppUpdateCheck::NoUpdate`]，
+/// 于是「有新版本但这个 release 没发你这台设备能装的包」会被说成「已是最新」——
+/// 那正是 `commands/updater/app_update.rs` 头注写着「绝不」犯的错（把失败/未知伪装成已是最新）。
+///
+/// 这一档今天**真的会发生**在 Android 上：APK 资产是 2026-09-13 才开始发的
+/// （`.github/workflows/android.yml` 的 `release-apk` job），在那之前的每一个 release 都没有
+/// `*-android-arm64.apk`。所以 `update_check` 的 Android 腿在拿到 `NoUpdate` 之后会再问一次本函数：
+/// 它说有 ⇒ 如实报「有新版本」，只是没有可下载的资产，用户出口退回**打开发布页**。
+///
+/// # 产出的 [`AppUpdateInfo`] 三个资产字段是**空的，且必须如实为空**
+///
+/// `download_url` / `file_name` 空串、`file_size` 为 0 —— 这一档没有选中的资产，
+/// 编一个 URL 出来会让下载腿去下一个不存在（或错形态）的东西。调用方据此**不得**发起下载：
+/// 这一档的用户出口是发布页链接（移动端 `UpdatePage` 的「打开发布页」——
+/// 前端的「下载」按钮按 `downloadUrl` 非空才渲染，正是靠这三个字段如实为空才关得掉）。
+///
+/// 前四道闸（通道过滤 / 取最新 / 比版本 / 跳过此版本）与 [`check_app_update`] **共用同一段实现**
+/// （`newer_release_then`），故两条腿不可能在这四件事上漂。
+///
+/// # Errors
+///
+/// - [`ManifestError::ParseJson`]：releases JSON 解析失败（同 [`check_app_update`]）。
+pub fn check_app_update_release_only(
+    releases_json: &str,
+    current_version: &str,
+    include_prerelease: bool,
+    skipped_version: Option<&str>,
+) -> Result<AppUpdateCheck, ManifestError> {
+    newer_release_then(
+        releases_json,
+        current_version,
+        include_prerelease,
+        skipped_version,
+        |release| AppUpdateCheck::Available(release_only_update_info(release)),
+    )
+}
+
+/// 两条检查腿共用的前四道闸：解析 → 取通道内最新 → 比版本 → 跳过此版本。
+///
+/// 抽出来是**为了让两条腿不可能漂**：这四件事里任何一件在某一条腿上写歪，
+/// 表现都是「一个平台提示更新、另一个平台不提示」，而两侧各自的单测都绿。
+fn newer_release_then(
+    releases_json: &str,
+    current_version: &str,
+    include_prerelease: bool,
+    skipped_version: Option<&str>,
+    to_check: impl FnOnce(&GithubRelease) -> AppUpdateCheck,
 ) -> Result<AppUpdateCheck, ManifestError> {
     let releases: Vec<GithubRelease> =
         serde_json::from_str(releases_json).map_err(|e| ManifestError::ParseJson(e.to_string()))?;
@@ -267,9 +363,29 @@ pub fn check_app_update(
         return Ok(AppUpdateCheck::NoUpdate);
     }
 
-    Ok(app_update_info_for_release(
-        release, platform, arch, loose_form,
-    ))
+    Ok(to_check(release))
+}
+
+/// 「只比版本」那条腿的 [`AppUpdateInfo`]：版本/标题/说明/时间照抄，三个资产字段留空。
+///
+/// 留空是**判据的一部分**（`check_app_update_release_only_has_no_asset_fields`）：
+/// 一个非空的 `download_url` 会让下游误以为这一档可以直接下载。
+fn release_only_update_info(release: &GithubRelease) -> AppUpdateInfo {
+    AppUpdateInfo {
+        version: release.tag_name.clone(),
+        title: release
+            .name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| release.tag_name.clone()),
+        release_notes: release.body.clone().unwrap_or_default(),
+        download_url: String::new(),
+        file_size: 0,
+        published_at: release.published_at.clone().unwrap_or_default(),
+        is_prerelease: release.prerelease,
+        file_name: String::new(),
+        sha256: None,
+    }
 }
 
 /// 解析所选通道的最新 release，并且仅在它与当前安装版本**完全相同**时返回安装清单。
@@ -343,6 +459,8 @@ fn app_update_info_for_release(
 ///  - macOS：按架构 `mac-arm64`/`mac-x64` 的 `.dmg`；**无则 `None`，不回落任意 `.dmg`**
 ///    （分架构单出后回落 = 发错架构包，见 macOS 分支注释；`.app` 恒 loose，不分形态）。
 ///  - Linux：loose→`.AppImage`（无则 `.deb`）/ installed→`.deb`（无则 `.AppImage`）。
+///  - Android：**仅 arm64**，名字以 [`ANDROID_APK_SUFFIX`] 结尾的 `.apk`；其余架构与无命中一律 `None`
+///    （不回落，理由同 macOS：资产名带架构判别位，选错就是发一个装不上的包）。
 ///
 /// ## Windows 为什么按形态分成两条**独立**规则（2026-07-22 修 #72 形态错配本体）
 ///
@@ -433,6 +551,18 @@ pub fn find_suitable_update_asset(
                 .iter()
                 .find(|a| a.name.contains(arch_pattern) && a.name.ends_with(".dmg"))
         }
+        AssetPlatform::Android => {
+            // **无回落**，理由与 macOS 那条同源：资产名里带着架构判别位，选错就是发一个
+            // 装不上的包。且这里比 macOS 更严 —— 非 arm64 的 Android（x86_64 模拟器）
+            // release 上**根本没有**对应资产，回落任意 `.apk` 会把 arm64 包发给模拟器。
+            //
+            // `loose_form` 在这一态上**不参与**：Android 应用只有一种形态（由系统包管理器装的），
+            // 没有「便携 vs 安装态」这个轴（同 `runtime::update_install::detect_run_form` 的 Android 那条）。
+            if arch != AssetArch::Arm64 {
+                return None;
+            }
+            assets.iter().find(|a| a.name.ends_with(ANDROID_APK_SUFFIX))
+        }
         AssetPlatform::Linux => {
             let app_image: Vec<&GithubAsset> = assets
                 .iter()
@@ -471,6 +601,18 @@ pub fn find_suitable_singbox_asset(
         AssetPlatform::Windows => ("windows", ".zip"),
         AssetPlatform::Macos => ("darwin", ".tar.gz"),
         AssetPlatform::Linux => ("linux", ".tar.gz"),
+        // Android：**这一态没有可选的内核资产，且这不是「今天还没发」**。
+        //
+        // 核在 Android 上是随 APK 打进去的进程内 `libbox.aar`（`build.gradle.kts` 的
+        // `implementation(files("libs/libbox.aar"))`），不是一个可替换的可执行文件 ——
+        // 桌面那套 `core_swap`（`<core>.bak` 原子替换）在这个形态下没有对象：换内核 = 装新版应用。
+        // SagerNet 确实发 android 构建，但那是给命令行用的裸二进制，本仓一个字节都不消费它；
+        // 真选中一个反而会让「下载 → 换核 → 重启」那条腿去替换一个不存在的文件。
+        //
+        // 🔴 这一格是**第二道**闸，不是唯一那道：真正该早退的地方是
+        // `commands/updater/core_update.rs` 的 Android 分支（零网络就答完）。留这一格是因为
+        // 本函数是 `pub`，将来任何新调用方不经那条早退也拿不到错的资产。
+        AssetPlatform::Android => return None,
     };
     let arch_keyword = match arch {
         AssetArch::X64 => "amd64",

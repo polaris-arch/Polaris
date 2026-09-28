@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -706,14 +707,21 @@ async fn redownload_with_mode(
     let result =
         download_with_progress(&sink, http.as_ref(), &SystemDnsLookup, &plan, &res_dir).await;
     if let DownloadOutcome::Stored { ref resource, .. } = result {
-        persist_resources(app, state, std::slice::from_ref(resource), broadcast);
+        if let Err(e) = persist_resources(app, state, std::slice::from_ref(resource), broadcast) {
+            return Ok(ApiResponse::ok(err_result(
+                Some(&plan.id),
+                Some(&plan.name),
+                &e,
+                ERR_RESOURCE_WRITE_FAILED,
+            )));
+        }
     }
     Ok(ApiResponse::ok(result.into_value(&plan)))
 }
 
-/// `RULE_RESOURCES_UPDATE_ALL`：更新全部已登记外置资源与内置注册表资源（**真下载**）。
+/// 上游 `RULE_RESOURCES_UPDATE_ALL`：更新已登记资源与随包内置 geo（**真下载**）。
 ///
-/// 逐个更新外置资源和真实注册表里的全部内置项，逐项容错并返回结果；整批只广播一次。
+/// 逐项独立容错，成功项落盘；整批只广播一次配置变更，避免给运行中的核逐项触发切换判定。
 #[tauri::command]
 pub async fn rule_resources_update_all(
     app: AppHandle,
@@ -732,7 +740,7 @@ pub async fn rule_resources_update_all(
     let http = state.http().clone();
     let gh_prefix = gh_proxy_prefix(&state);
 
-    let builtins = builtin_geo_rulesets();
+    let (raw_entries, builtins) = manual_update_targets(raw_entries);
     let mut results: Vec<Value> = Vec::with_capacity(raw_entries.len() + builtins.len());
     let mut stored: Vec<RuleResource> = Vec::new();
     for entry in &raw_entries {
@@ -756,39 +764,84 @@ pub async fn rule_resources_update_all(
         }
         results.push(outcome.into_value(&plan));
     }
+    let mut changed = false;
     if !stored.is_empty() {
-        persist_resources(&app, &state, &stored, BroadcastMode::Deferred);
+        match persist_resources(&app, &state, &stored, BroadcastMode::Deferred) {
+            Ok(()) => changed = true,
+            Err(e) => {
+                // 下载后的登记失败不能让调用者收到假成功。保留原有逐项失败结果。
+                for result in &mut results {
+                    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                        let id = result.get("id").and_then(Value::as_str).map(str::to_string);
+                        let name = result
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        *result = err_result(
+                            id.as_deref(),
+                            name.as_deref(),
+                            &e,
+                            ERR_RESOURCE_WRITE_FAILED,
+                        );
+                    }
+                }
+            }
+        }
     }
-    let mut builtin_ok = false;
     for builtin in builtins {
-        let result = update_builtin_with_mode(
+        let tag = builtin.tag;
+        let result = match update_builtin_with_mode(
             &app,
             &state,
-            builtin.tag.clone(),
+            tag.clone(),
             ProgressMode::Live,
             BroadcastMode::Deferred,
         )
         .await
-        .ok()
-        .and_then(|response| response.data)
-        .unwrap_or_else(|| {
-            err_result(
-                Some(&builtin_id_for(&builtin.tag)),
-                Some(&builtin.tag),
-                "内置规则集更新失败",
-                ERR_RESOURCE_WRITE_FAILED,
-            )
-        });
-        builtin_ok |= result.get("ok").and_then(Value::as_bool) == Some(true);
+        {
+            Ok(response) => response.data.unwrap_or_else(|| {
+                err_result(
+                    Some(&builtin_id_for(&tag)),
+                    Some(&tag),
+                    "内置资源未返回更新结果",
+                    ERR_RESOURCE_DOWNLOAD_FAILED,
+                )
+            }),
+            Err(()) => err_result(
+                Some(&builtin_id_for(&tag)),
+                Some(&tag),
+                "内置资源更新失败",
+                ERR_RESOURCE_DOWNLOAD_FAILED,
+            ),
+        };
+        changed |= result.get("ok").and_then(Value::as_bool) == Some(true);
         results.push(result);
     }
-    if !stored.is_empty() || builtin_ok {
+    if changed {
         match state.config().current() {
             Ok(latest) => broadcast_config_changed(&app, &latest),
-            Err(error) => log::warn!("规则资源整批更新已落盘，但读回配置广播失败: {error}"),
+            Err(e) => log::warn!("手动批量资源更新已落盘，但读回配置广播失败: {e}"),
         }
     }
     Ok(ApiResponse::ok(results))
+}
+
+/// 已登记资源可能含旧版误登记的 `builtin:*` 或重复 id；同一个实际资源只更新一次。
+/// 内置目标来自完整表，故即使外置登记为空，手动“全部更新”仍有完整内置下载计划。
+fn manual_update_targets(raw_entries: Vec<Value>) -> (Vec<Value>, Vec<BuiltinGeoRuleSet>) {
+    let builtins = builtin_geo_rulesets();
+    let builtin_ids: HashSet<String> = builtins.iter().map(|b| builtin_id_for(&b.tag)).collect();
+    let mut seen = HashSet::new();
+    let external = raw_entries
+        .into_iter()
+        .filter(|entry| {
+            let Some(id) = entry.get("id").and_then(Value::as_str) else {
+                return true;
+            };
+            !builtin_ids.contains(id) && seen.insert(id.to_string())
+        })
+        .collect();
+    (external, builtins)
 }
 
 // ── 在线图标库（icon_galleries）── 迁移自 上游 `RuleResourceManager.fetchIconGalleries` ──
@@ -835,7 +888,23 @@ pub async fn rule_resources_download(
         results.push(outcome.into_value(&plan));
     }
     if !stored.is_empty() {
-        persist_resources(&app, &state, &stored, BroadcastMode::Immediate);
+        if let Err(e) = persist_resources(&app, &state, &stored, BroadcastMode::Immediate) {
+            for result in &mut results {
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    let id = result.get("id").and_then(Value::as_str).map(str::to_string);
+                    let name = result
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    *result = err_result(
+                        id.as_deref(),
+                        name.as_deref(),
+                        &e,
+                        ERR_RESOURCE_WRITE_FAILED,
+                    );
+                }
+            }
+        }
     }
     Ok(ApiResponse::ok(results))
 }
@@ -1056,8 +1125,8 @@ fn plan_from_builtin(b: &BuiltinGeoRuleSet) -> ResourcePlan {
 ///    `config.builtinGeoMeta[tag].updatedAt` 作「已网络更新」标记 —— 该标记正是 `geo_seed`
 ///    判「出厂态」的读侧判据，写上之后启动时的出厂版重种不会再覆盖这份新副本。
 ///
-/// **生效时机如实回报**：本命令只换文件，不重启内核。运行中的 sing-box 仍持有旧规则集，
-/// 下次起核才生效 —— 与既有的 [`rule_resources_reset_builtin`] 同一契约，不在这里偷偷重启。
+/// 本命令只确认本地文件与更新标记落盘，不主动重启内核。运行中的 sing-box 对本地规则集
+/// 有 fswatch 热重载路径，但本 IPC 不提供 watcher 已成功加载的收据，故不承诺本次连接已采用新规则。
 #[tauri::command]
 pub async fn rule_resources_update_builtin(
     app: AppHandle,
@@ -1253,12 +1322,10 @@ fn persist_builtin_geo_updated(
             }
             Ok(())
         }
-        Ok((false, None)) => Err(format!(
-            "内置 geo `{tag}` 更新标记未保存：config 根不是对象"
-        )),
+        Ok((false, None)) => Err(format!("内置 geo `{tag}` 已更新到盘上，但更新标记未落盘")),
         Ok(_) => Err(format!("内置 geo `{tag}` 更新标记事务返回非法状态")),
         Err(e) => Err(format!(
-            "内置 geo `{tag}` 生效文件已替换，但更新标记保存失败，可重试: {e}"
+            "内置 geo `{tag}` 已更新到盘上，但保存 config 失败（更新标记未落）: {e}"
         )),
     }
 }
@@ -2009,9 +2076,9 @@ fn persist_resources(
     state: &AppRuntime,
     downloaded: &[RuleResource],
     broadcast: BroadcastMode,
-) {
+) -> Result<(), String> {
     if downloaded.is_empty() {
-        return;
+        return Ok(());
     }
     match state.config().update(|cfg| {
         upsert_rule_resources(cfg, downloaded);
@@ -2022,9 +2089,10 @@ fn persist_resources(
             if broadcast == BroadcastMode::Immediate {
                 broadcast_config_changed(app, &cfg);
             }
+            Ok(())
         }
-        Ok(_) => log::error!("规则资源登记事务返回非法状态"),
-        Err(e) => log::error!("规则资源已下载但保存 config 失败（未登记）: {e}"),
+        Ok(_) => Err("规则资源登记事务返回非法状态".to_string()),
+        Err(e) => Err(format!("规则资源已下载但保存 config 失败（未登记）: {e}")),
     }
 }
 

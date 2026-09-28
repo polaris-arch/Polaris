@@ -36,14 +36,14 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const setTailscaleLoginInitiated = useAppStore((s) => s.setTailscaleLoginInitiated);
 
   // serverId 是本弹窗身兼「新建」与「编辑既有节点」的判据：带 id = 给该节点换 key / 换控制面，
-  // 不带 = 新建（Tailscale 不再是单例，没有 id 时不猜、直接走新建路径——不回落 `.find(protocol===...)`，
+  // 不带 = 新建（Tailscale 不再是单例，没有 id 时不猜、直接走新建路径——不回落 `.find(协议)`，
   // 否则多节点时会把登录写进任意一个既有节点，重犯 node-edit-routing 那条缺陷）。
   const savedServer = useRef<ServerConfig | undefined>(undefined);
   const activeRequest = useRef<{ serverId: string; attemptId: string } | null>(null);
   const [saved, setSaved] = useState(Boolean(serverId));
   const existingTs = servers.find((s) => s.id === (serverId ?? savedServer.current?.id)) ?? savedServer.current;
 
-  // 回显既有控制面地址（再次进入本弹窗时不该看起来像"没配过"）。
+  // 回显既有控制面地址（再次进入本弹窗时不该看起来像「没配过」）。
   useEffect(() => {
     setControlUrl(existingTs?.tailscaleSettings?.controlUrl ?? '');
   }, [existingTs?.id, existingTs?.tailscaleSettings?.controlUrl]);
@@ -91,7 +91,6 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const authUrl = validatedTailscaleAuthUrl( progress?.phase === 'awaitingAuth' ? progress.url :
     progress?.phase === 'mainCore' && !progress.reason ? cachedAuthUrl : null);
   const loginTimedOut = progress?.phase === 'timedOut' || progress?.phase === 'failed';
-  const awaitingUrl = progress?.phase === 'starting';
 
   const discardPendingLogin = () => {
     const request = activeRequest.current;
@@ -324,7 +323,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
               {t('ts.retryLogin')}
             </button>
           </div>
-        ) : awaitingUrl ? (
+        ) : progress?.phase === 'starting' ? (
           <div className="card-sub" style={{ lineHeight: 1.6, display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className="spinner spin-inline" />
             {t('ts.awaitingUrl')}

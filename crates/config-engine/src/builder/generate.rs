@@ -43,7 +43,6 @@ use crate::singbox::{
 use crate::user_config::app_config::UserConfig;
 use crate::user_config::dns_constants::is_sentinel_selection;
 use crate::user_config::log_level::LogLevel;
-use crate::user_config::proxy_mode::ProxyModeType;
 use crate::user_config::server_config::Protocol;
 
 /// cache_id 品牌归一化值（§D.2）：上游 用 上游的 dns cache_id，Polaris 改 'polaris-dns-v2'。
@@ -161,6 +160,9 @@ pub struct GenerateConfigDeps {
     pub probe_proxy_port: Option<u16>,
     pub update_in_port: Option<u16>,
     pub subscription_update_in_port: Option<u16>,
+    /// 回环探针/更新入站的一次性凭据（见 [`InboundsDeps::loopback_auth`]）。
+    /// 只在 `loopback_inbounds_require_auth(platform)` 为真的平台被读；那种平台上传 `None` ⇒ 这批入站不发射。
+    pub loopback_auth: Option<crate::singbox::InboundUser>,
     /// §15 主核测速探测池：K 个 probe-selector-k 端口。空 = 不注入池。
     pub probe_pool_ports: Vec<u16>,
     pub lan_resolver_for_dns: Option<String>,
@@ -362,7 +364,18 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
 
     // ── 4. buildOutbounds（L3501-3515，先行）────────────────────────────────────
     // 产 pendingEndpoints / pendingRuleSelectors，供 route/dns 消费。
-    let system_interface_available = matches!(config.proxy_mode_type, ProxyModeType::Tun)
+    // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。
+    //
+    // 今天这一格接不接入结果逐字相同：合取项 `mesh_system_supported_on_platform` 的允许清单只有
+    // darwin/macos/linux ⇒ 本条在 Android 上恒 false。**仍然接**，理由是那个守卫是一个**会变的
+    // 函数**（不是写死在同一行里的字面量）：哪天有人给 Android 开了组网 System，这一格会立刻退回
+    // 「照存盘档位分流」，而 Android 上存的缺省是 `SystemProxy` ⇒ 同一台设备上「UI 选 TUN」与
+    // 「存量 systemProxy」会得到两份不同的出站，且没有任何一处代码为那个差异答过题。
+    // 接上之后，这条腿的正确性不再依赖另一个函数的当前取值。
+    let system_interface_available = config
+        .proxy_mode_type
+        .effective_on(Platform::parse(&deps.platform))
+        .is_tun()
         && mesh_system_supported_on_platform(&deps.platform);
     let mut outbounds_deps = OutboundsDeps {
         platform: deps.platform.clone(),
@@ -447,7 +460,13 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         &cfg.network_profiles,
         &ProbeFacts {
             platform: Platform::parse(deps.platform.as_str()),
-            tun: matches!(cfg.proxy_mode_type, ProxyModeType::Tun),
+            // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]，config-engine 全仓无例外的规则）。
+            // 对本字段零行为差：`tun` 只在 Linux/Other 的 dhcp 特权判据里起作用（生效值只对移动端分叉，
+            // 移动端那一臂在 `dhcp_privileged` 里不看 `tun`）。
+            tun: cfg
+                .proxy_mode_type
+                .effective_on(Platform::parse(deps.platform.as_str()))
+                .is_tun(),
             takeover_active: deps.system_dns_takeover_active,
             dhcp_suppressed: deps.netenv_dhcp_suppressed,
         },
@@ -465,6 +484,7 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
         own_lan_cidrs: deps.own_lan_cidrs.clone(),
         log: deps.log,
         observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
+        loopback_auth: deps.loopback_auth.clone(),
     };
     let inbounds = build_inbounds(config, Some(resolved_ips), &inbounds_deps);
 

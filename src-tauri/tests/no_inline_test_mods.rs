@@ -165,7 +165,10 @@ const WHITELIST: &[Exempt] = &[
 /// 作用是**反向对照**：判据若退化成「见 `cfg(test)` + `mod` 就红」，这三条立刻变假阳性。
 /// 它们必须被扫到（作为声明式记录），且必须**不**出现在命中集里。
 const DECL_CONTROLS: &[(&str, &str)] = &[
-    ("src-tauri/src/main.rs", "test_support"),
+    // 装配下沉后 crate 根是 `lib.rs`（`main.rs` 只剩薄壳），`#[cfg(test)] mod test_support;`
+    // 随之落在这里。本表的每条都必须真被扫到（见 [`decl_controls_are_all_present`]），
+    // 故它跟随搬迁，不是可选的同步。
+    ("src-tauri/src/lib.rs", "test_support"),
     ("src-tauri/src/commands/updater.rs", "tests"),
     ("crates/net-stack/src/share_link.rs", "tests"),
 ];

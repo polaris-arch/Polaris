@@ -10,17 +10,23 @@ import type {
   DnsPolicyAction,
   DnsServerGroup,
   DnsServerResource,
-  UserConfig,
 } from '@/contracts/types';
 import { toast } from '@/lib/error-handler';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { Csel } from '@/components/dialogs/Csel';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
-import { isProtectedDnsServer } from '@/components/dialogs/DnsResourceDialog';
+import {
+  dnsGroupReferences,
+  dnsResourceReferenceText,
+  dnsServerReferences,
+  isProtectedDnsServer,
+  type DnsResourceReference,
+} from '@/components/dialogs/dns-resource-logic';
 import {
   buildDnsActionGroups,
-  dnsActionChoice,
   dnsActionFromChoice,
+  dnsDefaultActionChoice,
+  dnsDefaultFallbackChoice,
   dnsServerDescription,
   dnsServerDisplayName,
 } from '@/components/dialogs/dns-action-options';
@@ -30,75 +36,18 @@ import { Spinner, Switch } from '../settings/Primitives';
 
 export type DnsWorkspaceView = 'rules' | 'servers' | 'groups' | 'system';
 
-export interface DnsResourceReference {
-  scope: 'policy' | 'group' | 'server' | 'defaults';
-  name: string;
-}
-
-function actionReferencesServer(action: DnsPolicyAction | undefined, serverId: string): boolean {
-  if (!action) return false;
-  if (action.type === 'server') return action.serverId === serverId;
-  if (action.type !== 'hostsFirst') return false;
-  if (action.hostsServerId === serverId) return true;
-  return actionReferencesServer(action.fallback, serverId);
-}
-
-function actionReferencesGroup(action: DnsPolicyAction | undefined, groupId: string): boolean {
-  if (!action) return false;
-  if (action.type === 'group') return action.groupId === groupId;
-  return action.type === 'hostsFirst' && actionReferencesGroup(action.fallback, groupId);
-}
-
-function uniqueReferences(references: DnsResourceReference[]): DnsResourceReference[] {
-  const seen = new Set<string>();
-  return references.filter((reference) => {
-    const key = `${reference.scope}:${reference.name}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-/** 删除 DNS Server 前的完整引用图；停用规则同样计入。 */
-export function dnsServerReferences(config: UserConfig, serverId: string): DnsResourceReference[] {
-  const references: DnsResourceReference[] = [];
-  for (const rule of config.dnsRules ?? []) {
-    if (actionReferencesServer(rule.effects?.dns?.action, serverId)) {
-      references.push({ scope: 'policy', name: rule.remarks?.trim() || rule.id });
-    }
-  }
-  for (const group of config.dnsServerGroups ?? []) {
-    if (group.members.includes(serverId) || group.fallbackServerId === serverId) {
-      references.push({ scope: 'group', name: group.name.trim() || group.id });
-    }
-  }
-  for (const server of config.dnsServers ?? []) {
-    if (server.id !== serverId && server.bootstrapServerId === serverId) {
-      references.push({ scope: 'server', name: server.name.trim() || server.id });
-    }
-  }
-  const defaults = config.dnsDefaults;
-  if (defaults?.directServerId === serverId) references.push({ scope: 'defaults', name: 'direct' });
-  if (defaults?.proxyServerId === serverId) references.push({ scope: 'defaults', name: 'proxy' });
-  if (actionReferencesServer(defaults?.unmatchedAction, serverId)) {
-    references.push({ scope: 'defaults', name: 'unmatched' });
-  }
-  return uniqueReferences(references);
-}
-
-/** 删除 DNS Group 前的完整引用图。 */
-export function dnsGroupReferences(config: UserConfig, groupId: string): DnsResourceReference[] {
-  const references: DnsResourceReference[] = [];
-  for (const rule of config.dnsRules ?? []) {
-    if (actionReferencesGroup(rule.effects?.dns?.action, groupId)) {
-      references.push({ scope: 'policy', name: rule.remarks?.trim() || rule.id });
-    }
-  }
-  if (actionReferencesGroup(config.dnsDefaults?.unmatchedAction, groupId)) {
-    references.push({ scope: 'defaults', name: 'unmatched' });
-  }
-  return uniqueReferences(references);
-}
+/*
+ * 🔴 引用图与内置保护判据住在 `@/components/dialogs/dns-resource-logic`（纯 `.ts`），这里只再导出。
+ *
+ * 搬出去的是依赖边不是代码风格：移动端的 DNS 二级页要用**同一张**引用图做删除护栏，
+ * 而从本 `.tsx` 取它会把整棵桌面工作区（连带 `SettingsDns` / `Csel`）拖进移动端闭包。
+ * 既有消费点（`../settings/SettingsDns.test.ts` 从本文件 import 它们）一行未改。
+ */
+export {
+  dnsServerReferences,
+  dnsGroupReferences,
+  type DnsResourceReference,
+} from '@/components/dialogs/dns-resource-logic';
 
 function viewError(t: (key: string) => string) {
   return <div className="stub"><p>{t('common.configLoadFail')}</p></div>;
@@ -140,24 +89,12 @@ export function DnsPolicyWorkspace({ view }: { view: DnsWorkspaceView }) {
     });
   }
 
-  function formatResourceReference(reference: DnsResourceReference): string {
-    if (reference.scope === 'policy') return t('settings.dns.resourceRefPolicy', { name: reference.name });
-    if (reference.scope === 'group') return t('settings.dns.resourceRefGroup', { name: reference.name });
-    if (reference.scope === 'server') return t('settings.dns.resourceRefServer', { name: reference.name });
-    const name = reference.name === 'direct'
-      ? t('settings.dns.defaultDirect')
-      : reference.name === 'proxy'
-        ? t('settings.dns.defaultProxy')
-        : t('settings.dns.defaultUnmatched');
-    return t('settings.dns.resourceRefDefault', { name });
-  }
-
   function rejectReferencedDelete(references: DnsResourceReference[]): boolean {
     if (references.length === 0) return false;
     toast.error(
       t('settings.dns.resourceInUse'),
       t('settings.dns.resourceInUseDesc', {
-        refs: references.map(formatResourceReference).join(t('common.listSeparator')),
+        refs: references.map((reference) => dnsResourceReferenceText(reference, t)).join(t('common.listSeparator')),
       }),
     );
     return true;
@@ -184,7 +121,7 @@ export function DnsPolicyWorkspace({ view }: { view: DnsWorkspaceView }) {
     });
   }
 
-  const defaultActionValue = dnsActionChoice(dnsDefaults.unmatchedAction) ?? 'fakeIp';
+  const defaultActionValue = dnsDefaultActionChoice(dnsDefaults);
   const defaultActionGroups = buildDnsActionGroups({
     servers: dnsServers,
     groups: dnsGroups,
@@ -195,9 +132,7 @@ export function DnsPolicyWorkspace({ view }: { view: DnsWorkspaceView }) {
     responses: ['fakeIp', 'reject'],
   });
 
-  const defaultFallbackValue = dnsDefaults.unmatchedAction?.type === 'hostsFirst'
-    ? dnsActionChoice(dnsDefaults.unmatchedAction.fallback) ?? `server:${dnsDefaults.directServerId || 'builtin-domestic'}`
-    : `server:${dnsDefaults.directServerId || 'builtin-domestic'}`;
+  const defaultFallbackValue = dnsDefaultFallbackChoice(dnsDefaults);
   const defaultFallbackGroups = buildDnsActionGroups({
     servers: dnsServers,
     groups: dnsGroups,

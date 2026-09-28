@@ -17,6 +17,7 @@ fn deps_default() -> GenerateConfigDeps {
         probe_proxy_port: None,
         update_in_port: None,
         subscription_update_in_port: None,
+        loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
         race_upstream_ips: vec![],
@@ -1720,6 +1721,25 @@ fn mesh_system_supported_excludes_win32() {
     assert!(mesh_system_supported_on_platform("darwin"));
     assert!(mesh_system_supported_on_platform("linux"));
     assert!(!mesh_system_supported_on_platform("WIN32")); // 大小写不敏感
+                                                          // Android 禁（2026-09-04 K10）：与枚举版 `polaris_mesh::mesh_system_supported_on_platform`
+                                                          // 是同一条判据的两份实现，必须同答 —— 一边禁一边准会造出「config 生成认为 System 可用、
+                                                          // 出口路由状态机认为不可用」的半开状态。入参是 `std::env::consts::OS` 直传值。
+    assert!(!mesh_system_supported_on_platform("android"));
+    assert!(!mesh_system_supported_on_platform("ANDROID")); // 大小写不敏感，与 win32 同口径
+
+    // 2026-09-05：禁止清单 → 允许清单。未知串一律 false（枚举版 `Platform::Other` 同批改）。
+    assert!(
+        !mesh_system_supported_on_platform("freebsd"),
+        "未知平台串不得默认支持：那是枚举版 `Platform::Other => true` 在字符串轴上的同一个缺陷"
+    );
+    assert!(!mesh_system_supported_on_platform(""), "空串同属未知");
+    // 别名洞的正面钉子：`std::env::consts::OS` 的原值是 `windows`/`macos`，而本函数收的是
+    // 上游 `process.platform` 风格串。旧的禁止清单只点名 `win32`，对漏映射直传的 `"windows"`
+    // 答 true —— 那正是它想禁的平台。允许清单把这个形态一并封死。
+    assert!(!mesh_system_supported_on_platform("windows"));
+    // 与 `Platform::parse` 的别名表对齐：`macos` 与 `darwin` 同指 macOS，两个都得支持。
+    assert!(mesh_system_supported_on_platform("macos"));
+    assert!(mesh_system_supported_on_platform("DARWIN"));
 }
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -47,9 +47,76 @@ pub struct MeshExitRoutePlan {
     pub cidrs: Vec<String>,
 }
 
-/// System 模式是否在该平台支持（Windows 禁）。上游 `meshSystemSupportedOnPlatform`。
+/// System 模式是否在该平台支持（Windows / Android 禁）。上游 `meshSystemSupportedOnPlatform`。
+///
+/// # 为什么 Android 也禁（2026-09-04 K10，本次审计判为「静默失效且要紧」）
+///
+/// `system_interface`（reverseMesh）的含义是**让核再建一张内核 TUN**，把组网节点挂到真接口上。
+/// Android 上这件事做不到，且失败形态是起核 FATAL 而不是降级：
+///
+/// - 应用进程没有 `CAP_NET_ADMIN`；能拿到的唯一 tun fd 由 `VpnService.establish()` 授予、**只有
+///   一个**，已经被主 TUN 占用。第二张内核接口没有任何来源。
+/// - 与 Windows 那条禁令是**同一句话的另一半**：Windows 禁是因为 tsnet 自装的 exit 0/0 会抢直连，
+///   Android 禁是因为压根建不出接口。两者的下游处置相同 —— `system_interface_available == false`
+///   ⇒ `build_outbounds` 把该 endpoint 降级成 `system: Some(false)`（gVisor 用户态栈），核起得来。
+///
+/// 修在这里（而不是在 `run_route` 那一层挡）的理由：本谓词是**取材口**，`MeshExitRouteManager` 的
+/// reconcile / reassert / clear 三个入口都读它；在末端挡只能拦住 OS 手术那一半，config 生成侧
+/// （`system_interface_available`）与起核重试预算（`resolve_start_retry_budget` 的 10×3s）那两半
+/// 拦不住 —— 那正是「门在但没牙」。
+///
+/// **穷举 `match` 而非 `!=`**：新增平台变体时编译器在此强制做一次决定。
+///
+/// # 为什么 [`Platform::Other`] 从 `true` 改成 `false`（2026-09-05）
+///
+/// `Other` 的语义是**「本仓没有为这个平台答过题」**（见该变体的定义）。让它答 `true`，就是把
+/// 「没答过题」读成「答案是支持」—— 那正是 K6b 那条阻断级缺陷的形状本身：桌面写代码时的一个
+/// 默认值，在新平台上恰好不成立，而且不报错。Android 曾经就落在 `Other` 上，靠的正是这条 `true`
+/// 去申请一张它永远建不出来的内核 TUN。
+///
+/// 这里的「保守」有具体判据，不是口号：本谓词答 `true` 授予的是一项**特权能力** —— 让核再建一张
+/// 内核 TUN（`system_interface`）。它要求本平台允许应用创建网络接口（Linux 的 `CAP_NET_ADMIN`、
+/// macOS 的 utun + root helper）。这件事在一个**本仓从未构建过**的平台上成不成立，没有任何人
+/// 验证过；而「未验证」的默认值只能是「没有」。
+///
+/// 决定性的一条是**代价不对称**：
+///
+/// | 判错方向 | 后果 |
+/// |---|---|
+/// | 该 `true` 判成 `false` | 组网出口退 gVisor 用户态栈（`system: Some(false)`）：核起得来、功能在，只少一层内核栈优化 —— 与 Windows 今天的处境逐字相同 |
+/// | 该 `false` 判成 `true` | 核拿 `system: true` 去开一张开不出来的接口，失败形态是**起核 FATAL 而不是降级**（Android 真机实证）；且上层会照着「支持」去跑出口路由 OS 手术（`runtime/mesh.rs::run_route`） |
+///
+/// 一侧是少一层优化，另一侧是整个内核起不来。在没有证据的那一格上只能选前者。
+///
+/// **净效果不是「关掉了一个平台」**：下一个变体接进来时，编译器仍旧在这里强制它显式答题（穷举
+/// `match`）；改的只是它**在答题之前**继承到哪一侧 —— 现在继承的是安全的那一侧。
+///
+/// 今天的实际代价为零：`Other` 只由 `Platform::current()` 在 macos/windows/android/linux **四个
+/// target 之外**产生，而本仓的构建矩阵里没有第五个 target（`scripts/gate-rust.sh` 的三目标
+/// cross-clippy 与 CI 打包面均止于此）。
 pub fn mesh_system_supported_on_platform(platform: Platform) -> bool {
-    platform != Platform::Win
+    match platform {
+        Platform::Mac | Platform::Linux => true,
+        // iOS 写成**独立臂**（2026-09-06）：答案与 Win/Android/Other 同为 false，但理由与三者
+        // 都不同，而这一格的代价不对称表（见上文）要求「判 false 的依据」逐平台可查。
+        //
+        // iOS 的依据是**唯一 tun fd 已被占用且没有第二个来源**：应用进程能拿到的网络接口只有
+        // `NEPacketTunnelProvider` 在扩展沙箱内授予的那一个 fd，它已经是主 TUN；iOS 不向第三方
+        // 应用开放创建 utun/内核接口的路子（无 `SYSPROTO_CONTROL` 等价的可用面，也无
+        // CAP_NET_ADMIN 等价物）。⇒ 「让核再建一张内核 TUN」这项特权能力在 iOS 上无来源。
+        //
+        // 与 Android 的差别在**约束的位置**：Android 是应用进程无权建接口（VpnService 之外没有
+        // 第二个 fd 来源）；iOS 是**扩展进程**里同样没有第二个来源，而主 app 进程连第一个都拿不到
+        // ——核根本不在那个进程里。与 Win 的差别更远：Win 是 tsnet 抢直连，不是接口建不出来。
+        //
+        // **本仓今天构不出 iOS 产物**，故这条 false 是「按物理事实写下的答案」而非实测结论；
+        // 但它落在代价不对称表的安全侧（判错成 false 只退 gVisor，判错成 true 是起核 FATAL），
+        // 与 `Other` 同侧不同因。
+        Platform::Ios => false,
+        // 三者同答 false，理由**不同**但方向同一：Win/Android 是「知道做不到」（tsnet 抢直连 /
+        // 建不出第二张接口），`Other` 是「没验证过能不能」—— 见上文的代价不对称表。
+        Platform::Win | Platform::Android | Platform::Other => false,
+    }
 }
 
 /// 出口托管决策（纯函数）：当前选中的全局出口节点是否需要 Polaris 自装出口路由、装到哪张内核接口。

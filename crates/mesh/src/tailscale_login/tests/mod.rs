@@ -1,8 +1,8 @@
 use super::*;
+use polaris_config_engine::user_config::server_config::TailscaleSettings;
 use polaris_config_engine::user_config::server_config::{
-    MeshInboundGrant, MeshInboundNetwork, MeshInboundPolicy, MeshInboundTarget, TailscaleSettings,
+    MeshInboundGrant, MeshInboundNetwork, MeshInboundPolicy, MeshInboundTarget,
 };
-use serde_json::json;
 
 fn ts_server(over: TailscaleSettings) -> ServerConfig {
     ServerConfig {
@@ -39,7 +39,7 @@ fn login_config_minimal_endpoint_state_dir_and_direct() {
         ep["state_directory"].as_str().unwrap(),
         want.to_string_lossy().as_ref()
     );
-    // 未指定 auth_key 时不写入；预授权登录会保留它。
+    // 未提供 key 时走交互登录。
     assert!(ep.get("auth_key").is_none());
     // 无 control_url/hostname/ephemeral 时不写入。
     assert!(ep.get("control_url").is_none());
@@ -51,28 +51,24 @@ fn login_config_minimal_endpoint_state_dir_and_direct() {
     assert_eq!(ob["tag"], "direct");
     // 管理 api service 恒注入（登录 URL / 登录成功的唯一真值源，见模块头）。
     assert_eq!(cfg.services.len(), 1);
+    assert_eq!(cfg.services[0]["type"], "api");
+    assert_eq!(cfg.services[0]["listen"], "127.0.0.1");
+    assert_eq!(cfg.services[0]["listen_port"], 51234);
+    assert_eq!(cfg.services[0]["secret"], "rand-secret");
     assert_eq!(
         cfg.route["rules"],
-        json!([{
-            "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject", "no_drop": true
-        }])
+        json!([{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject","no_drop":true}])
     );
     assert_eq!(cfg.route["final"], "direct");
     assert_eq!(
         cfg.dns["rules"],
-        json!([{
-            "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject",
-            "method": "default", "no_drop": true
-        }])
+        json!([{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject","method":"default","no_drop":true}])
     );
-    assert!(
-        cfg.dns.get("final").is_none(),
-        "普通控制面 DNS 保留内核默认解析器"
-    );
+    assert!(cfg.dns.get("final").is_none());
 }
 
 #[test]
-fn login_ingress_reject_is_independent_of_name_and_user_policy() {
+fn transient_ingress_reject_survives_renames_and_user_policy() {
     let allow = MeshInboundPolicy::Allowlist {
         rules: vec![MeshInboundGrant {
             source_cidrs: vec!["100.64.0.2/32".into()],
@@ -85,42 +81,39 @@ fn login_ingress_reject_is_independent_of_name_and_user_policy() {
     for name in ["", "renamed-node"] {
         for policy in [None, Some(allow.clone()), Some(MeshInboundPolicy::Block)] {
             let mut server = ts_server(TailscaleSettings {
-                auth_key: Some("preauthorized-private-key".into()),
+                auth_key: Some("fixture-key".into()),
                 control_url: Some("https://headscale.example".into()),
                 ..Default::default()
             });
             server.name = name.into();
             server.mesh_inbound_policy = policy;
-            let config = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
-            let value = login_config_to_json(&config);
-            assert_eq!(value["endpoints"][0]["tag"], TAILSCALE_LOGIN_ENDPOINT_TAG);
-            assert_eq!(
-                value["endpoints"][0]["auth_key"],
-                "preauthorized-private-key"
+            let value = login_config_to_json(
+                &build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap(),
             );
+            assert_eq!(value["endpoints"][0]["tag"], TAILSCALE_LOGIN_ENDPOINT_TAG);
+            assert_eq!(value["endpoints"][0]["auth_key"], "fixture-key");
             assert_eq!(
                 value["endpoints"][0]["control_url"],
                 "https://headscale.example"
             );
             assert_eq!(
                 value["route"]["rules"],
-                json!([{
-                    "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject", "no_drop": true
-                }])
+                json!([{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject","no_drop":true}])
             );
-            assert_eq!(value["route"]["final"], "direct");
             assert_eq!(
                 value["dns"]["rules"],
-                json!([{
-                    "inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject",
-                    "method": "default", "no_drop": true
-                }])
+                json!([{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject","method":"default","no_drop":true}])
             );
+            assert_eq!(value["route"]["final"], "direct");
             assert!(value["dns"].get("final").is_none());
             assert_eq!(
                 value["outbounds"],
-                json!([{"type": "direct", "tag": "direct"}])
+                json!([{"type":"direct","tag":"direct"}])
             );
+            assert!(value["experimental"]["cache_file"]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("login-cache-51234.db"));
             assert_eq!(value["services"][0]["type"], "api");
             assert_eq!(value["services"][0]["listen"], "127.0.0.1");
             assert_eq!(value["services"][0]["listen_port"], 51234);
@@ -296,13 +289,53 @@ fn state_machine_reset_returns_idle() {
 }
 
 #[test]
-fn preauthorized_login_keeps_key_and_headscale_control_url() {
+fn login_config_passes_nonempty_auth_key_for_official_and_custom_control() {
+    for control in [None, Some("https://headscale.example".to_owned())] {
+        let server = ts_server(TailscaleSettings {
+            auth_key: Some("  tskey-auth-fixture  ".to_owned()),
+            control_url: control.clone(),
+            ..Default::default()
+        });
+        let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+        assert_eq!(cfg.endpoints[0]["auth_key"], "tskey-auth-fixture");
+        assert_eq!(
+            cfg.endpoints[0].get("control_url").and_then(Value::as_str),
+            control.as_deref()
+        );
+    }
     let server = ts_server(TailscaleSettings {
-        auth_key: Some("  preauthorized-private-key  ".into()),
-        control_url: Some("https://headscale.example".into()),
+        auth_key: Some(" ".into()),
         ..Default::default()
     });
-    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
-    assert_eq!(cfg.endpoints[0]["auth_key"], "preauthorized-private-key");
-    assert_eq!(cfg.endpoints[0]["control_url"], "https://headscale.example");
+    assert!(
+        build_tailscale_login_config(&server, Path::new("/ud"), &api())
+            .unwrap()
+            .endpoints[0]
+            .get("auth_key")
+            .is_none()
+    );
+}
+
+#[test]
+fn login_cache_is_separate_from_main_cache_and_other_attempts() {
+    let server = ts_server(TailscaleSettings::default());
+    let a = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+    let b = build_tailscale_login_config(
+        &server,
+        Path::new("/ud"),
+        &TailscaleLoginApiService {
+            port: 51235,
+            ..api()
+        },
+    )
+    .unwrap();
+    assert_ne!(
+        a.experimental["cache_file"]["path"],
+        b.experimental["cache_file"]["path"]
+    );
+    let expected = Path::new("/ud").join("tailscale/ts1/login-cache-51234.db");
+    assert_eq!(
+        login_config_to_json(&a)["experimental"]["cache_file"]["path"],
+        expected.to_string_lossy().as_ref()
+    );
 }

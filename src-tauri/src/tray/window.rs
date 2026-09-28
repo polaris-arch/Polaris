@@ -203,15 +203,34 @@ fn build_overlay(app: &AppHandle, generation: u64) -> Option<tauri::WebviewWindo
         .initialization_script(initialization_script)
         .inner_size(TRAY_WIDTH, 420.0)
         .resizable(false)
-        .minimizable(false)
-        .maximizable(false)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
         .visible(false);
     // WebView2 启动参数（图形逃生门 `--disable-gpu`）：四个建窗点同值，唯一真值在 graphics_compat。
     if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
         builder = builder.additional_browser_args(args);
+    }
+
+    // ── 桌面独有的窗口装饰/层级属性，整组收进一个 `cfg(desktop)` ──
+    //
+    // 这五个方法**全部**来自 Tauri 的 `#[cfg(desktop)] impl WebviewWindowBuilder`
+    // （tauri 2.11.5 `src/webview/webview_window.rs:445`，同块还有 menu / fullscreen / icon /
+    // shadow / parent 等）—— 移动端没有窗口装饰、任务栏与 z-order 这些概念，整组在 mobile 上不存在。
+    // 逐个撞着修会一个一个来（rustc 对同一条链只报第一个未知方法：本批就先只看见 `minimizable`，
+    // 修完才露出 `maximizable`），故按**那个 impl 块**一次性划线。
+    //
+    // 挪到链尾而不是逐个 `#[cfg]`：属性宏加不进方法链中段；这几个方法各设一个独立字段，
+    // 调用先后不影响结果，桌面行为逐字节不变。
+    //
+    // TODO(mobile) 运行期语义仍待做：Tauri 2 在 mobile 上**不支持多窗口**，这两个次级窗
+    // （托盘浮层 / 更新弹窗）在移动端根本不该被创建。本批只做编译隔离；建窗调用点的门控随
+    // 移动端触发面（前台服务通知 / 商店更新通道）一起定，见 `app_tray` 模块文档的裁定表。
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .minimizable(false)
+            .maximizable(false)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true);
     }
 
     // non-activating 浮层会在 Polaris 不是前台 app 时接收用户的第一次点击。Wry 的 WKWebView 默认
@@ -262,7 +281,7 @@ fn build_overlay(app: &AppHandle, generation: u64) -> Option<tauri::WebviewWindo
 
     // 失焦即收起（点窗外 / 切到别的 app）：菜单语义。走 hide_overlay 统一拆 mac 全局监听器（defect#3）。
     // （W13 的明暗信号源不挂这里：本窗限时存活——轻量转场与 120s 空闲回收都会销毁它；
-    // Win 直读注册表真值、Linux 留窗口探测链，均见 main.rs 的 system_dark_bg。）
+    // Win 直读注册表真值、Linux 留窗口探测链，均见 lib.rs 的 system_dark_bg。）
     let app_handle = app.clone();
     win.on_window_event(move |event| match event {
         WindowEvent::Focused(false) => hide_overlay(&app_handle),
@@ -398,7 +417,7 @@ pub(super) fn show_ready_overlay(app: &AppHandle, win: &tauri::WebviewWindow) {
     log_open_probe(app, "shown", true);
 }
 
-/// macOS/Windows 托盘左/右键入口（由 `main.rs` 的 `on_tray_icon_event` 调）。
+/// macOS/Windows 托盘左/右键入口（由 `lib.rs` 的 `on_tray_icon_event` 调）。
 ///
 /// 可见 → 隐藏（toggle off）；不可见 → 定位到托盘所在屏角 + 显示 + 聚焦。
 /// 浮层创建失败 → 本次点击 no-op；不把「托盘菜单」意图突然放大成主窗。
@@ -468,7 +487,7 @@ pub(crate) fn prewarm_overlay_if_enabled(app: &AppHandle) {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        if !overlay_keeps_warm(app) || app.tray_by_id("main").is_none() {
+        if !overlay_keeps_warm(app) || !crate::tray::tray_present(app) {
             return;
         }
         let window_exists = app.get_webview_window(TRAY_LABEL).is_some();
@@ -586,7 +605,7 @@ fn destroy_overlay_preserving_tray_residency(
 ) -> tauri::Result<()> {
     let armed = should_arm_last_webview_exit_guard(
         app.webview_windows().len(),
-        app.tray_by_id("main").is_some(),
+        crate::tray::tray_present(app),
     ) && app
         .state::<crate::LightweightState>()
         .0

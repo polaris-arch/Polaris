@@ -136,8 +136,17 @@ fn start_leg_dns_takeover_gate_reads_the_switch() {
         "start_inner 必须在 config 被 move 进 startup_snapshot 之前取一次 takeoverSystemDns 活态"
     );
     // 连续片段：门的合取形态 + 接管 + else 还原，一个字都不能少。通用 watcher 必须在门外统一启动。
+    // 接管方式读的必须是**本平台生效值**（`ProxyModeType::effective_on`）：存盘缺省值是
+    // `systemProxy`，Android 上照读裸值会让这道门在一个「只有 VpnService 一种接管形态」的平台上
+    // 走 else 腿。今天两条腿在那里都是诚实 no-op（`SystemDnsOpsImpl` 的 Android 臂
+    // `takeover_supported()` 恒 false），接上是为了不留需要人工复核的例外。
     const GATE: &str = "\
-        if user_config.proxy_mode_type.is_tun() && dns_takeover != Some(false) {
+        if user_config
+            .proxy_mode_type
+            .effective_on(self.helper.platform())
+            .is_tun()
+            && dns_takeover != Some(false)
+        {
             self.set_system_dns_best_effort().await;";
     const ELSE_LEG: &str = "\
         } else {

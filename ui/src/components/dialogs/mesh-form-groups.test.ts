@@ -299,9 +299,11 @@ describe('统一接入表单的信息架构', () => {
       );
     }
 
-    const fieldSources = ['WgDialog.tsx', 'WarpDialog.tsx', 'TsSettingsDialog.tsx']
-      .map(readDialog)
-      .join('\n');
+    /* 🔴 取材面 2026-09-06 随字段表搬家一起挪：三张 FieldSpec 表从弹窗 `.tsx` 拆进了零 React 的
+       `.ts`（`wg-spec` / `warp-spec` / `ts-spec`，两端共用）。读回弹窗会扫到 0 个键 ——
+       下面那条「防空转」自检抓的正是这个形态，它报的是判据量错了地方，不是文案回退了。
+       弹窗仍留在上面那个 `formNames` 循环里（那一条查的是 `t(key, 内联默认值)`，与表无关）。 */
+    const fieldSources = ['wg-spec.ts', 'warp-spec.ts', 'ts-spec.ts'].map(readDialog).join('\n');
     expect(fieldSources, 'FieldSpec 不得保留中文 fallback 属性').not.toMatch(
       /\b(?:zh|hintZh|disabledHintZh)\s*:/,
     );

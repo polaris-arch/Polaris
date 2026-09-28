@@ -109,6 +109,12 @@ export interface ConfirmTwice {
  */
 const CONFIRMING_CLASS = '.confirming';
 
+/** capture 阶段的触点判据；与各触发按钮的独立 `.confirming` 类共用同一契约。 */
+export function pointerOutsideConfirmation(target: EventTarget | null): boolean {
+  const el = target as Element | null;
+  return !el?.closest?.(CONFIRMING_CLASS);
+}
+
 /** React 侧的薄封装：state 存 armed，卸载时 `dispose()` 清定时器。 */
 export function useConfirmTwice(): ConfirmTwice {
   const [armed, setArmed] = useState<string | null>(null);
@@ -132,8 +138,7 @@ export function useConfirmTwice(): ConfirmTwice {
   useEffect(() => {
     if (armed === null) return;
     const onPointerDown = (e: PointerEvent) => {
-      const el = e.target as Element | null;
-      if (el?.closest?.(CONFIRMING_CLASS)) return;
+      if (!pointerOutsideConfirmation(e.target)) return;
       coreRef.current?.reset();
     };
     document.addEventListener('pointerdown', onPointerDown, true);

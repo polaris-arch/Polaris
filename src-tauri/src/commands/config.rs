@@ -1675,7 +1675,7 @@ pub(crate) fn broadcast_config_changed_with(
     // **无载荷信号**。四个消费方一个都不读 payload，收到即各自重拉：`App.tsx` → `loadConfig(true)`、
     // `TrayMenu.tsx` → `hydrate()`、`settings/use-config.ts` → `load(true)`（该处还专门注明「payload 的
     // newValue 不能直接用」——它经脱敏、且没走 `config_get` 那侧的 bypassLANList 补齐，与其契约不同源）、
-    // `main.rs` 的 `listen_any` → `reconcile_tray`（回调签名 `|_|` 直接丢弃）。
+    // `lib.rs` 的 `listen_any` → `reconcile_tray`（回调签名 `|_|` 直接丢弃）。
     //
     // 而 `cfg` 在这行之后仍要用（logLevel / uiTheme / move 进 `switch_mode_with`）⇒ 载荷里写 `cfg`
     // 只能借用 ⇒ `json!` 展开成 `to_value(&cfg)`，在上面那次 clone 之外**再深拷贝一整棵配置树**，

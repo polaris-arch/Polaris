@@ -401,7 +401,11 @@ impl DnsConfigDeps {
     fn probe_facts(&self, config: &UserConfig) -> ProbeFacts {
         ProbeFacts {
             platform: Platform::parse(&self.platform),
-            tun: matches!(config.proxy_mode_type, ProxyModeType::Tun),
+            // 与 generate 步骤 6 同源：Android/iOS 只走 TUN，即使磁盘仍存 systemProxy 缺省值。
+            tun: config
+                .proxy_mode_type
+                .effective_on(Platform::parse(&self.platform))
+                .is_tun(),
             takeover_active: self.system_dns_takeover_active,
             dhcp_suppressed: self.netenv_dhcp_suppressed,
         }
@@ -978,9 +982,17 @@ pub fn build_dns_config(
 
     // Q1 死循环防护（仅 Windows）：Win TUN strict_route(WFP) 把所有 :53 逼进 TUN；type:local 经 svchost → 进 TUN → ∞。
     // winLoopRisk 解耦（T2）：死环源于 Win strict_route(WFP) + type:local 本身 → 改为「Win + TUN」恒判。
-    let win_loop_risk =
-        deps.platform == "win32" && matches!(config.proxy_mode_type, ProxyModeType::Tun);
-    // Captive 是公网连通性域名，保持原有解析器选择，与 LAN 的失败关闭分开。
+    //
+    // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。这一格今天接不接入结果逐字
+    // 相同（合取项写死 `platform == "win32"`，而生效值只对 Android 分叉），接上是为了让
+    // 「config-engine 里每一处平台相关的 `proxy_mode_type` 判据都读生效值」成为**没有例外的规则**
+    // —— 有例外的规则要靠人逐处复核「这个例外今天还成立吗」，而那正是本批修的那类缺陷的成因。
+    let win_loop_risk = deps.platform == "win32"
+        && config
+            .proxy_mode_type
+            .effective_on(Platform::parse(&deps.platform))
+            .is_tun();
+    // LAN 与 captive 的解析器选择分开，保留 captive 原有公网连通性策略。
     let internal_resolver_tag = if lan_resolver.is_some() {
         "dns-lan"
     } else if win_loop_risk {
@@ -1105,7 +1117,15 @@ pub fn build_dns_config(
             .dns_config
             .as_ref()
             .and_then(|d| d.node_domain_resolver.as_deref());
-        let proxy_mode_type_str = match config.proxy_mode_type {
+        // 取**本平台生效值**（[`ProxyModeType::effective_on`]）：这个串唯一的消费者是
+        // `get_node_resolver_tag` 里的 INV-1 —— `node_resolver_single == "system"` 且 ctx=Rule 时，
+        // TUN 下必须强制 `dns-node`（IP-DoH）防递归。Android 上隧道恒在，递归风险与 TUN 档一模一样，
+        // 但那里的 `proxy_mode_type` 缺省是 `SystemProxy` ⇒ 照裸值判会退回 `dns-local`，
+        // 把防递归那条腿在唯一需要它的平台上关掉。
+        let proxy_mode_type_str = match config
+            .proxy_mode_type
+            .effective_on(Platform::parse(&deps.platform))
+        {
             ProxyModeType::Tun => "tun",
             ProxyModeType::SystemProxy => "systemProxy",
             ProxyModeType::Manual => "manual",

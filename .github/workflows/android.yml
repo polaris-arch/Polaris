@@ -1,0 +1,1055 @@
+name: Android
+
+# Android APK 腿 —— 本仓**唯一**在产物级别问「包里到底有什么」的门。
+#
+# ── 为什么是独立 workflow，而不是 package.yml 的第五条矩阵腿 / 一个 job ──
+#
+# 面 A（本机实测的构建面，见 `polaris-android-first-apk-2026-09-04.md`）：
+#   NDK 交叉编译 aarch64-linux-android → JDK 21 跑 AGP 8.11 → gradle assemble；
+#   `libbox.aar` 117 MiB 且 **gitignored**，须现建（JDK 17 + NDK ≥ 28 + gomobile + sing-box 源码）；
+#   `tauri android build` 一条命令跑不通，必须拆成两步（仓根无 package.json 与 mobile 模板的结构性不匹配）。
+# 面 B（GitHub runner 能给什么）：
+#   预装 Android SDK / cmdline-tools / 多版本 JDK / Go；NDK 预装但版本随镜像漂；
+#   `actions/cache` 可以把那份 117 MiB 的 aar 按「内核版本 × 构建脚本哈希」缓存下来。
+#
+# 两个面的对差落在**步骤序列**上，不落在 runner 或 tauri_args 上：package.yml 的 `package` job 有 40 个
+# step，全是桌面形态（fetch 桌面内核归档 / cronet / dashboard、编 helper、tauri-action 出 NSIS+dmg+deb、
+# mac ad-hoc seal、便携 zip、update-asset 命名契约）。Android 一个都用不上，塞进那条矩阵等于给几乎每个
+# step 挂 `if: matrix.label != 'android'`。
+#   [不选 package.yml 矩阵腿：见上；且 `setup.outputs.full` = 选中腿数 == 总腿数，加第五条会连带改写
+#    release job「绝不发半套」的判据，射程远超本腿]
+#   [不选 package.yml 里的独立 job：package.yml 只在 tag push / 手动 dispatch / 被 release-risk 调用时
+#    触发，PR 上根本不跑 ⇒ 这道门会迟到到发布那天才说话]
+#   [不选带 `paths:` 过滤的独立 workflow：本仓已实测过「带路径过滤的 workflow 在某些推送形态下一次都不跑」，
+#    release-risk.yml 顶部注释也明写「workflow 永远触发，路径分类发生在 job 内」。本腿跟随同一条纪律：
+#    自己不带任何路径过滤，由 release-risk 的 classify job 按 `scripts/classify-ci-impact.mjs` 的
+#    ANDROID_IMPACT_SCOPES 登记表决定要不要调用]
+#   [选独立可复用 workflow：步骤面不相交、触发面对（PR/merge_group/push main 都覆盖）、
+#    将来 release 要出 APK 时 package.yml 一行 `uses:` 就能接上]
+#
+# ── 触发 ──
+# 只有 `workflow_call`（release-risk 按影响面调用）与 `workflow_dispatch`（手动复跑）。
+# 没有 push/pull_request 直接触发：本腿要现建 libbox + 全量交叉编译，冷跑昂贵，不该挂在每个 PR 上。
+#
+# ── 不上传 APK artifact ──
+# debug APK 实测 219011984 字节（208.9 MiB，2026-09-05）。此前是 606871040，多出来的 388 MB 是
+# `libpolaris_lib.so` 里的 DWARF —— **那不是「debug 形态的固有代价」**（本文件此前就是这么写的）：
+# `.cargo/config.toml` 的四段 android `rustflags = ["-C", "strip=debuginfo"]` 一加就没了，
+# 而 `debug-assertions` / `overflow-checks` 照旧开着，debug 语义一点没丢。
+# 这件事由 verify-apk 的判据 ⑥ 守（节表里 `.debug_*` 必须为 0），不靠本注释自觉。
+#
+# 不上传的理由与体积无关：本腿的全部信息量在开箱验的判定里，已经在日志上；debug 产物没有下游
+# 消费者 —— 真要发给用户的那个包由下面的 `release-apk` job 产出（release 构建 + 真签名 + 开箱验
+# + 上传成 release 资产），**它今天还缺四个仓外的签名 secret**，逐条前置见那个 job 的头注。
+
+# `release_smoke` 默认 false：release 冒烟腿要在 debug 那条已经很贵的构建面上再跑一遍
+# （交叉编译 release profile + R8），不该挂在每次调用上。判据见下方 `release-smoke` job 的头注。
+#
+# `publish_release` 默认 false，且**今天没有任何调用方传过 true**（release-risk.yml 那句
+# `uses:` 不带 `with:`，package.yml 也还没接）。它要的四个签名 secret 今天在本仓一个都没有 ——
+# 逐条前置见下方 `release-apk` job 的头注。别把这条腿的存在读成「已经能发版了」。
+on:
+  workflow_call:
+    inputs:
+      release_smoke:
+        description: 同时跑 release 冒烟腿（R8 实证 + mapping 留存 + 体积测量）
+        type: boolean
+        default: false
+      publish_release:
+        description: 把**签名的** release APK 发成 GitHub release 资产（需要四个签名 secret）
+        type: boolean
+        default: false
+      release_tag:
+        description: 资产挂到哪个 release tag；留空 = 取当前 ref（那时 ref 必须是 tag）
+        type: string
+        default: ''
+    secrets:
+      POLARIS_KEYSTORE_BASE64:
+        description: base64 编码的 release 密钥库（仓外 ~/.polaris/android/release.jks 的内容）
+        required: false
+      POLARIS_KEYSTORE_PASSWORD:
+        description: 密钥库口令
+        required: false
+      POLARIS_KEY_PASSWORD:
+        description: 私钥口令
+        required: false
+      POLARIS_KEY_ALIAS:
+        description: 私钥别名
+        required: false
+  workflow_dispatch:
+    inputs:
+      release_smoke:
+        description: 同时跑 release 冒烟腿（R8 实证 + mapping 留存 + 体积测量）
+        type: boolean
+        default: false
+      publish_release:
+        description: 把**签名的** release APK 发成 GitHub release 资产（需要四个签名 secret）
+        type: boolean
+        default: false
+      release_tag:
+        description: 资产挂到哪个 release tag；留空 = 取当前 ref（那时 ref 必须是 tag）
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# 判据与 ci.yml / ui.yml 一致：调用方名称进并发组，Android 与 Release Risk 内的复用互不取消。
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+
+jobs:
+  apk:
+    name: build APK + 产物开箱验
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm 11 要求 Node 22.13+，且版本必须与 ui.yml / package.yml 一致（同一套前端产物）。
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Setup pnpm (pinned)
+        id: pnpm
+        shell: bash
+        env:
+          PNPM_VERSION: '11.24.0'
+        run: |
+          set -euo pipefail
+          npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
+          got="$("$RUNNER_TEMP/pnpm/bin/pnpm" --version)"
+          [ "$got" = "$PNPM_VERSION" ] || {
+            echo "::error::pnpm is '$got', expected '$PNPM_VERSION'"; exit 1; }
+          echo "$RUNNER_TEMP/pnpm/bin" >> "$GITHUB_PATH"
+          echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm.outputs.store_path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust stable + android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android
+          rustup default stable
+          echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      # key 用固定串而不是 matrix：本 workflow 只有这一个 job、一个 target，
+      # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: android-aarch64
+
+      # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
+      # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      # ══ 工具链解析：JDK / SDK / NDK 全部**现选**，不写死版本号 ══
+      #
+      # 为什么不写死：镜像里的 JDK/NDK 版本会漂，写死的后果是某天 sdkmanager 说「找不到这个包」
+      # 而没人知道该换成哪个；而这里每一条约束都能从**代码或脚本注释**里读出来，现选即可。
+      # 为什么不 fallback：每条约束不满足时都当场硬失败并点名，不静默回落到 runner 默认 java / 默认 NDK
+      # （静默回落会让「镜像换了」这个事实永远不被观测到，报错点漂到 gradle 或 lld 里，离真因两跳远）。
+      - name: Resolve JDK / Android SDK / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ── JDK：两个用途、两个版本，都取镜像预装的那份（以 JAVA_HOME_<主版本>_X64 暴露）──
+          #   · Gradle / AGP 8.11 → JDK 21（AGP 支持 17–21，本机实测面就是 21）
+          #   · scripts/build-libbox.sh → **必须 openjdk 17**（其坑①：上游 build_libbox 的 main.go
+          #     逐串匹配 "openjdk 17"，21 会 FATAL；那个版本约束管的是 gomobile 生成 Java 源后的
+          #     class 文件版本，绕过去会在 d8/AGP 那侧炸）
+          : "${JAVA_HOME_21_X64:?镜像未暴露 JDK 21（JAVA_HOME_21_X64）—— runner 镜像变了，先确认再改本步}"
+          : "${JAVA_HOME_17_X64:?镜像未暴露 JDK 17（JAVA_HOME_17_X64）—— build-libbox.sh 坑① 要求 openjdk 17}"
+          {
+            echo "JAVA_HOME=$JAVA_HOME_21_X64"
+            echo "JDK17=$JAVA_HOME_17_X64"
+          } >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+
+          # ── SDK：平台与 build-tools 跟着 gen/android 的 compileSdk 走（判据从代码里读，不抄）──
+          : "${ANDROID_HOME:?镜像未暴露 ANDROID_HOME}"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sdkmanager" ] || { echo "::error::找不到 sdkmanager：$sdkmanager"; exit 1; }
+          compile_sdk="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+' \
+            src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
+          [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
+          echo "compileSdk=$compile_sdk"
+          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0"
+
+          # ── NDK：两个用途、两条不同约束 ──
+          #   · Rust 交叉编译：镜像预装那份即可（本机实测面 r27.3.13750724）。
+          #   · libbox：**major 必须 ≥ 28** —— gomobile 会链进 cronet-go 的**预编译** libcronet.a，
+          #     该 .a 用比 NDK 27 新的工具链编的，r27 的 lld 报 `unknown relocation (315)`
+          #     （build-libbox.sh 坑②；上游 CI 钉 r28）。这条**不能靠摘掉 with_naive_outbound 绕过**。
+          : "${ANDROID_NDK_LATEST_HOME:?镜像未暴露预装 NDK（ANDROID_NDK_LATEST_HOME）}"
+          echo "NDK_RUST=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+          # 已装 NDK 里 major ≥ 28 的最高一版（目录名即版本号，如 28.1.13356709）。
+          pick28() {
+            local latest
+            latest="$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+              | awk -F. '$1 >= 28' | sort -V | tail -1)"
+            [ -n "$latest" ] && printf '%s\n' "$ANDROID_HOME/ndk/$latest"
+          }
+          ndk28="$(pick28 || true)"
+          if [ -z "$ndk28" ]; then
+            want="$("$sdkmanager" --list 2>/dev/null \
+              | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -u -V \
+              | awk -F'[;.]' '$2 >= 28' | tail -1)"
+            [ -n "$want" ] || {
+              echo "::error::sdkmanager 的稳定包列表里没有 major ≥ 28 的 NDK —— build-libbox.sh 坑② 无法满足"
+              exit 1; }
+            echo "预装 NDK 均 < 28，现装：$want"
+            "$sdkmanager" "$want"
+            ndk28="$(pick28 || true)"
+          fi
+          [ -n "$ndk28" ] || { echo "::error::装完仍找不到 major ≥ 28 的 NDK"; exit 1; }
+          echo "NDK_LIBBOX=$ndk28" >> "$GITHUB_ENV"
+          echo "NDK(rust)=$ANDROID_NDK_LATEST_HOME  NDK(libbox)=$ndk28"
+
+      - name: Resolve bundled core version
+        id: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
+          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
+          echo "内核版本真值：v$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
+      #
+      # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
+      #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
+      # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
+      # [选「cache 在前、未命中就现建」：缓存只是省时间，**不是来源**。缓存不在 / 键变了 / 缓存服务挂了，
+      #  下一步照样从 sing-box 源码现建；建失败就红。缓存键含内核版本与构建脚本哈希，
+      #  改 build-libbox.sh 或换内核版本 = 换键 = 必然重建重验]
+      - name: Cache libbox.aar
+        id: libbox
+        uses: actions/cache@v6
+        with:
+          path: src-tauri/gen/android/app/libs/libbox.aar
+          key: libbox-${{ runner.os }}-v${{ steps.core.outputs.version }}-${{ hashFiles('scripts/build-libbox.sh') }}
+
+      - name: Build libbox.aar (缓存未命中)
+        if: steps.libbox.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          # build-libbox.sh 自己会校 major ≥ 28 并在不满足时硬失败；这里显式指给它，
+          # 免得它按「$ANDROID_HOME/ndk 下版本号最大的那个」自选到别的东西。
+          ANDROID_NDK_HOME: ${{ env.NDK_LIBBOX }}
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/sing-box"
+          # 浅克隆到 tag：脚本随后用 `git describe --tags` 与 core-manifest 对拍，不符即拒绝构建。
+          git clone --depth 1 --branch "v${{ steps.core.outputs.version }}" \
+            https://github.com/SagerNet/sing-box "$src"
+          df -h / | tail -1
+          bash scripts/build-libbox.sh "$src"
+
+          # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
+          # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与一个
+          # 600 MB 的 debug APK。GitHub runner 的系统盘余量有限，且爆盘的报错形态（链接器
+          # 中途 ENOSPC）离真因很远。这里的缓存对本 job 之后的步骤零价值 —— 要的是那个 aar，
+          # 它已经落在 app/libs/ 下并会被 actions/cache 保存。
+          go clean -cache -modcache || true
+          rm -rf "$src" /var/tmp/gomobile-tmp
+          df -h / | tail -1
+
+      # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
+      # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
+      - name: libbox.aar 必须在位
+        shell: bash
+        run: |
+          set -euo pipefail
+          aar=src-tauri/gen/android/app/libs/libbox.aar
+          [ -s "$aar" ] || {
+            echo "::error::$aar 缺失或为 0 字节 —— 这条腿的内核来源没拿到（缓存命中=${{ steps.libbox.outputs.cache-hit }}）"
+            exit 1; }
+          echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
+
+      # ══ 两步走（第一步预期 exit 1，成因见 first-apk 文档 §2.4）══
+      #
+      # `tauri android build` 会依次做四件事：跑 beforeBuildCommand（前端）→ 交叉编译 Rust →
+      # 把 `.so` symlink 进 jniLibs → 把 bundle.resources 铺成 assets/_up_/。
+      # 做完这四件之后它把活交给 gradle，而 gradle 的 `rustBuild<Arch><Profile>` 任务在本仓结构下
+      # 必然失败（模板写死 `workingDir = src-tauri`，那里没有 package.json）⇒ CLI 以 1 退出。
+      #
+      # 🔴 **不拿退出码当判据**：退出码 1 对「按预期在 gradle 那一跳失败」与「前端根本没构出来 /
+      #    交叉编译挂了」完全不可分。改为断言它该做完的四件事**真的做完了**（正面断言）。
+      #
+      # `--config` 显式传（不吃 Tauri 的按平台名自动合并）：与 package.yml 四条桌面腿同一条判据 ——
+      # 隐式合并只认固定文件名，文件一改名就**静默**停止合并、包里少掉全部资源而构建照绿；
+      # 显式传则改名即 `failed to read configuration file` 硬失败。
+      # `scripts/verify-packaging.mjs` 的 NON_CORE_CONFS[...].ciLeg 断言本文件里有这一行。
+      - name: Stage frontend + cross-compiled .so（两步走第一步）
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.NDK_RUST }}
+          NDK_HOME: ${{ env.NDK_RUST }}
+        run: |
+          set -uo pipefail
+          # 🔴 `shell: bash` 的默认标志是 `bash --noprofile --norc -eo pipefail {0}` —— **`-e` 已经开着**。
+          #    这一步预期非零退出，不显式 `set +e` 的话它会在 `rc=$?` 之前就把整步判失败，
+          #    下面那四条正面断言一条都跑不到。本机实测（同一脚本喂给
+          #    `bash --noprofile --norc -eo pipefail`）：无 `set +e` ⇒ 退出码 1 且不到 `rc=$?` 那行；
+          #    有 `set +e` ⇒ 打印 `rc=1` 并以 0 结束。
+          set +e
+          ./ui/node_modules/.bin/tauri android build --debug --apk --target aarch64 --ci \
+            --config src-tauri/tauri.android.conf.json
+          rc=$?
+          set -e
+          echo "tauri android build 退出码 = $rc（预期 1，见 polaris-android-first-apk-2026-09-04.md §2.4）"
+
+          jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
+          up=src-tauri/gen/android/app/src/main/assets/_up_
+          for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
+            [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了，不是预期中的 gradle 退出"; exit 1; }
+          done
+          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
+            [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
+          done
+          [ -d "$up/resources/data" ] || { echo "::error::$up/resources/data 没铺出来"; exit 1; }
+          echo "第一步的四件事都做完了：jniLibs 两份 .so + assets/_up_ 资源树"
+
+      # ══ RustWebView 的 keep 规则与它的事实源对拍 ══
+      #
+      # `proguard-rules.pro` 有一条按方法签名写死的 keep，盯的是上一步刚生成出来的
+      # `generated/RustWebView.kt`。那份文件 gitignored ⇒ 裸 checkout 上不存在 ⇒ `cargo test`
+      # 那条腿读不到它。取材点**只有此刻**在树上，所以判据挂在这里。
+      # wry 升级把方法改名或改签名 ⇒ 规则不再匹配任何成员 ⇒ R8 静默剪掉 ⇒ release 包
+      # NoSuchMethodError，而 debug 包与全部源码门都是绿的。
+      # 脚本自己在取材点缺席时以 1 退出（不静默跳过）；它还在不在这条 workflow 里，
+      # 由 src-tauri/tests/android_release_signing_wiring.rs 的 ⑥ 守。
+      - name: wry keep 规则与生成物对拍
+        run: node scripts/verify-wry-keep-rules.mjs
+
+      # ── release 路径的**行为**裁判：跑一次 gradle 配置期，问 Gradle 自己 ──
+      #
+      # 为什么挂在这条腿：判据要 Android SDK，`ci.yml` 的 lint-and-test 腿只有 Rust 工具链，
+      # 跑不了；而三份 R8 规则文件里有两份是上一步 `tauri android build` 现场铺出来的生成物，
+      # 裁判的取材面恰好要求它们在场 —— 这条腿是今天唯一两样都齐的地方。
+      # 为什么不挂 `release-smoke`：那条腿默认不跑（`if: inputs.release_smoke`），
+      # 而这些判据守的恰恰是「release 路径被改坏而没人发现」，必须每次调用都说话。
+      # 全部 `--dry-run` / 只读任务，不编译一个字节；本机实测一轮 gradle 配置期约 12 秒。
+      - name: release 构建行为裁判（gradle 配置期实证）
+        run: bash scripts/gate-android-release-behavior.sh
+
+      # gradle 只负责打包；`-x rustBuildArm64Debug` 跳过它那份重复且必然失败的 rust 任务
+      # （`.so` 上一步已经在 jniLibs 里）。
+      - name: Assemble APK（两步走第二步）
+        working-directory: src-tauri/gen/android
+        run: ./gradlew assembleArm64Debug -x rustBuildArm64Debug
+
+      # ══ 这条腿存在的理由：构建成功 ≠ 包里有东西 ══
+      # 判据在 scripts/verify-apk.mjs（它的头注记着四条已实证的「全绿但产物是垃圾」通路：
+      # 资源静默逃逸 / AGP 增量打包的死字节 / 构建 tag 掉了 / 原生库的 debug 信息回来了）。
+      - name: 开箱验（产物级判据）
+        run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk --abi arm64-v8a
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # release 冒烟腿 —— 本仓**唯一**能对 R8 出产物级证据的地方
+  # ══════════════════════════════════════════════════════════════════════════════
+  #
+  # ── 为什么必须有它（三件今天完全没有观测面的事）──
+  #
+  # ① **R8 到底吃进了哪些规则**。本工程的 keep 规则来自五个互不相干的源：入库的
+  #    `proguard-rules.pro`、Tauri CLI 现场生成的 `proguard-tauri.pro` 与
+  #    `generated/proguard-wry.pro`、`libbox.aar` 内的 `proguard.txt`（consumer 规则）、
+  #    以及各 AAR 依赖的 consumer 规则。前三份有源码级门守着「文件在不在、内容对不对」，
+  #    但**「consumer 规则到底进没进 R8」这一跳没有任何门** —— 它发生在 AGP 内部，
+  #    源码上看不见。`mapping/<variant>/configuration.txt` 是 R8 自己吐出来的**实际生效规则全文**，
+  #    是这一跳今天唯一能拿到的产物级证据。
+  # ② **mapping.txt 的保全**。`-keepattributes SourceFile,LineNumberTable` 只开了取证入口的
+  #    一半：拿到 logcat 里的 `at f.a.b(SourceFile:118)` 之后，要把它翻回真实类名/方法名，
+  #    靠的是 mapping.txt。而它今天只存在于构建机的 `app/build/` 下 —— clean 一次、换台机器，
+  #    那条崩溃就**永远还原不出来**（重构一版也没用：R8 输入一变，映射就对不上）。
+  #    所以它必须离开构建机，成为 artifact。
+  # ③ **体积**。至今没量过。debug 包 219011984 字节里绝大部分是未 minify 的 dex 与四个 ABI 的
+  #    原生库；R8 之后是多少，只有真跑一次才知道。
+  #
+  # ── 为什么默认不跑（`inputs.release_smoke` 默认 false）──
+  # 它是 debug 那条腿的**全部**成本再来一遍（交叉编译 + gradle），而且加上 R8。
+  # debug 腿已经贵到「不挂在每个 PR 上」了（见本文件头注），这条更贵。
+  #
+  # 🔴 今天只能**手动** `workflow_dispatch` 勾上，而本仓从未这么触发过。
+  #    上一版这里写着「或由 release-risk 在发版类改动上显式传 true」—— 那描述的是一个
+  #    **不存在的能力**（2026-09-06 终止轮 R6）：release-risk.yml 的 android job 是一句裸
+  #    `uses: ./.github/workflows/android.yml`，不带 `with:`，`release_smoke` 恒取默认值
+  #    false。全仓没有任何调用方传过它。要让它自动跑，得先去 release-risk.yml 加 `with:`。
+  #
+  # ── 为什么走逃生门出**未签名**包 ──
+  # 签名要的三个秘密按裁定只经环境变量、密钥库在仓外（`~/.polaris/android/release.jks`），
+  # CI 上都没有，也**不该**为了量体积而往 CI 里塞一把真钥匙。
+  # `-PpolarisAllowUnsigned=true` 是为这件事准备的显式逃生门：它换来
+  # `app-arm64-release-unsigned.apk`，文件名本身就写着没签名。
+  # 它只认命令行实参（见 build.gradle.kts 的 `gradle.startParameter.projectProperties`），
+  # 所以这一行不会把逃生门留给后面任何一次构建。
+  #
+  # 🔴 代价要说清（2026-09-06 终止轮 R5）：这条腿因此对**签名**零信息量。它出的就是未签名包，
+  #    全仓也没有 `apksigner` / `jarsigner`。别处写「签名那一层归 release-smoke 守」是不实之词 ——
+  #    它守的是 R8 那一层（configuration.txt / seeds.txt）。签名的接线与有效性今天没有门，
+  #    唯一的观察面是本机手签一次。边界表在 scripts/gate-android-release-behavior.sh 头注。
+  #
+  # ── 前置步骤与 `apk` job 逐字相同 ──
+  # GitHub Actions 没有 job 内的 step 复用，只能复制。两份会漂 ⇒ 由
+  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑦ 逐字对拍
+  # （射程：`- uses: actions/checkout@v7` 起，到 `libbox.aar 必须在位` 步止）。
+  release-smoke:
+    name: release 冒烟（R8 实证 + mapping 留存 + 体积）
+    if: inputs.release_smoke
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm 11 要求 Node 22.13+，且版本必须与 ui.yml / package.yml 一致（同一套前端产物）。
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Setup pnpm (pinned)
+        id: pnpm
+        shell: bash
+        env:
+          PNPM_VERSION: '11.24.0'
+        run: |
+          set -euo pipefail
+          npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
+          got="$("$RUNNER_TEMP/pnpm/bin/pnpm" --version)"
+          [ "$got" = "$PNPM_VERSION" ] || {
+            echo "::error::pnpm is '$got', expected '$PNPM_VERSION'"; exit 1; }
+          echo "$RUNNER_TEMP/pnpm/bin" >> "$GITHUB_PATH"
+          echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm.outputs.store_path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust stable + android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android
+          rustup default stable
+          echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      # key 用固定串而不是 matrix：本 workflow 只有这一个 job、一个 target，
+      # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: android-aarch64
+
+      # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
+      # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      # ══ 工具链解析：JDK / SDK / NDK 全部**现选**，不写死版本号 ══
+      #
+      # 为什么不写死：镜像里的 JDK/NDK 版本会漂，写死的后果是某天 sdkmanager 说「找不到这个包」
+      # 而没人知道该换成哪个；而这里每一条约束都能从**代码或脚本注释**里读出来，现选即可。
+      # 为什么不 fallback：每条约束不满足时都当场硬失败并点名，不静默回落到 runner 默认 java / 默认 NDK
+      # （静默回落会让「镜像换了」这个事实永远不被观测到，报错点漂到 gradle 或 lld 里，离真因两跳远）。
+      - name: Resolve JDK / Android SDK / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ── JDK：两个用途、两个版本，都取镜像预装的那份（以 JAVA_HOME_<主版本>_X64 暴露）──
+          #   · Gradle / AGP 8.11 → JDK 21（AGP 支持 17–21，本机实测面就是 21）
+          #   · scripts/build-libbox.sh → **必须 openjdk 17**（其坑①：上游 build_libbox 的 main.go
+          #     逐串匹配 "openjdk 17"，21 会 FATAL；那个版本约束管的是 gomobile 生成 Java 源后的
+          #     class 文件版本，绕过去会在 d8/AGP 那侧炸）
+          : "${JAVA_HOME_21_X64:?镜像未暴露 JDK 21（JAVA_HOME_21_X64）—— runner 镜像变了，先确认再改本步}"
+          : "${JAVA_HOME_17_X64:?镜像未暴露 JDK 17（JAVA_HOME_17_X64）—— build-libbox.sh 坑① 要求 openjdk 17}"
+          {
+            echo "JAVA_HOME=$JAVA_HOME_21_X64"
+            echo "JDK17=$JAVA_HOME_17_X64"
+          } >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+
+          # ── SDK：平台与 build-tools 跟着 gen/android 的 compileSdk 走（判据从代码里读，不抄）──
+          : "${ANDROID_HOME:?镜像未暴露 ANDROID_HOME}"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sdkmanager" ] || { echo "::error::找不到 sdkmanager：$sdkmanager"; exit 1; }
+          compile_sdk="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+' \
+            src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
+          [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
+          echo "compileSdk=$compile_sdk"
+          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0"
+
+          # ── NDK：两个用途、两条不同约束 ──
+          #   · Rust 交叉编译：镜像预装那份即可（本机实测面 r27.3.13750724）。
+          #   · libbox：**major 必须 ≥ 28** —— gomobile 会链进 cronet-go 的**预编译** libcronet.a，
+          #     该 .a 用比 NDK 27 新的工具链编的，r27 的 lld 报 `unknown relocation (315)`
+          #     （build-libbox.sh 坑②；上游 CI 钉 r28）。这条**不能靠摘掉 with_naive_outbound 绕过**。
+          : "${ANDROID_NDK_LATEST_HOME:?镜像未暴露预装 NDK（ANDROID_NDK_LATEST_HOME）}"
+          echo "NDK_RUST=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+          # 已装 NDK 里 major ≥ 28 的最高一版（目录名即版本号，如 28.1.13356709）。
+          pick28() {
+            local latest
+            latest="$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+              | awk -F. '$1 >= 28' | sort -V | tail -1)"
+            [ -n "$latest" ] && printf '%s\n' "$ANDROID_HOME/ndk/$latest"
+          }
+          ndk28="$(pick28 || true)"
+          if [ -z "$ndk28" ]; then
+            want="$("$sdkmanager" --list 2>/dev/null \
+              | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -u -V \
+              | awk -F'[;.]' '$2 >= 28' | tail -1)"
+            [ -n "$want" ] || {
+              echo "::error::sdkmanager 的稳定包列表里没有 major ≥ 28 的 NDK —— build-libbox.sh 坑② 无法满足"
+              exit 1; }
+            echo "预装 NDK 均 < 28，现装：$want"
+            "$sdkmanager" "$want"
+            ndk28="$(pick28 || true)"
+          fi
+          [ -n "$ndk28" ] || { echo "::error::装完仍找不到 major ≥ 28 的 NDK"; exit 1; }
+          echo "NDK_LIBBOX=$ndk28" >> "$GITHUB_ENV"
+          echo "NDK(rust)=$ANDROID_NDK_LATEST_HOME  NDK(libbox)=$ndk28"
+
+      - name: Resolve bundled core version
+        id: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
+          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
+          echo "内核版本真值：v$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
+      #
+      # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
+      #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
+      # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
+      # [选「cache 在前、未命中就现建」：缓存只是省时间，**不是来源**。缓存不在 / 键变了 / 缓存服务挂了，
+      #  下一步照样从 sing-box 源码现建；建失败就红。缓存键含内核版本与构建脚本哈希，
+      #  改 build-libbox.sh 或换内核版本 = 换键 = 必然重建重验]
+      - name: Cache libbox.aar
+        id: libbox
+        uses: actions/cache@v6
+        with:
+          path: src-tauri/gen/android/app/libs/libbox.aar
+          key: libbox-${{ runner.os }}-v${{ steps.core.outputs.version }}-${{ hashFiles('scripts/build-libbox.sh') }}
+
+      - name: Build libbox.aar (缓存未命中)
+        if: steps.libbox.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          # build-libbox.sh 自己会校 major ≥ 28 并在不满足时硬失败；这里显式指给它，
+          # 免得它按「$ANDROID_HOME/ndk 下版本号最大的那个」自选到别的东西。
+          ANDROID_NDK_HOME: ${{ env.NDK_LIBBOX }}
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/sing-box"
+          # 浅克隆到 tag：脚本随后用 `git describe --tags` 与 core-manifest 对拍，不符即拒绝构建。
+          git clone --depth 1 --branch "v${{ steps.core.outputs.version }}" \
+            https://github.com/SagerNet/sing-box "$src"
+          df -h / | tail -1
+          bash scripts/build-libbox.sh "$src"
+
+          # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
+          # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与一个
+          # 600 MB 的 debug APK。GitHub runner 的系统盘余量有限，且爆盘的报错形态（链接器
+          # 中途 ENOSPC）离真因很远。这里的缓存对本 job 之后的步骤零价值 —— 要的是那个 aar，
+          # 它已经落在 app/libs/ 下并会被 actions/cache 保存。
+          go clean -cache -modcache || true
+          rm -rf "$src" /var/tmp/gomobile-tmp
+          df -h / | tail -1
+
+      # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
+      # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
+      - name: libbox.aar 必须在位
+        shell: bash
+        run: |
+          set -euo pipefail
+          aar=src-tauri/gen/android/app/libs/libbox.aar
+          [ -s "$aar" ] || {
+            echo "::error::$aar 缺失或为 0 字节 —— 这条腿的内核来源没拿到（缓存命中=${{ steps.libbox.outputs.cache-hit }}）"
+            exit 1; }
+          echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
+
+
+      # 与 debug 那条同一个两步走，只差一个 `--debug`：这里要 release profile 的 `.so`。
+      # 退出码同样不当判据（成因见 debug 腿同名步的 🔴 段），改为断言那四件事真的做完了。
+      - name: Stage frontend + cross-compiled .so（release profile）
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.NDK_RUST }}
+          NDK_HOME: ${{ env.NDK_RUST }}
+        run: |
+          set -uo pipefail
+          set +e
+          ./ui/node_modules/.bin/tauri android build --apk --target aarch64 --ci \
+            --config src-tauri/tauri.android.conf.json
+          rc=$?
+          set -e
+          echo "tauri android build 退出码 = $rc（预期 1，见 polaris-android-first-apk-2026-09-04.md §2.4）"
+
+          jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
+          up=src-tauri/gen/android/app/src/main/assets/_up_
+          for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
+            [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了"; exit 1; }
+          done
+          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
+            [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
+          done
+          [ -d "$up/resources/data" ] || { echo "::error::$up/resources/data 没铺出来"; exit 1; }
+
+      - name: wry keep 规则与生成物对拍
+        run: node scripts/verify-wry-keep-rules.mjs
+
+      # 逃生门只在这一行的实参里生效，不落任何文件、不进任何环境变量。
+      - name: Assemble unsigned release APK（R8 在这里第一次真的跑）
+        working-directory: src-tauri/gen/android
+        run: ./gradlew assembleArm64Release -x rustBuildArm64Release -PpolarisAllowUnsigned=true
+
+      # 先留存再判定：configuration.txt 的断言万一红了，mapping 也已经拿到手，
+      # 不用为了取证再构一版（而重构一版的 R8 输入已经变了，映射对不上）。
+      - name: 留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-release-mapping
+          path: |
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/mapping.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/usage.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/seeds.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/configuration.txt
+          # 一个文件都没命中 = R8 没跑或产物路径变了，那正是本步要抓的事，不许静默绿。
+          if-no-files-found: error
+          retention-days: 90
+
+      # ── R8 吃进了什么、又保住了什么（产物级证据）──
+      #
+      # 判据本体在 `scripts/assert-r8-evidence.mjs`，由 `scripts/assert-r8-evidence.test.mjs`
+      # 的正反用例钉着（含把下面两个洞原样回放）。内联在这里的上一版有两个洞：
+      #   ① 针不剥注释：R8 的 -printconfiguration 会把每份规则文件的**原文**（含 `#` 注释）
+      #      抄进 configuration.txt，而本仓 proguard-rules.pro 的注释里就写着
+      #      「libbox.aar 的 proguard.txt（go.** / io.nekohasekai.**）」—— 于是
+      #      `io.nekohasekai` 那根针永远命中，libbox 的 consumer 规则一条没进 R8 也照绿。
+      #   ② 只问 configuration.txt：它只证明规则**文本**到过 R8，不证明规则**匹配到了任何
+      #      东西**。keep 指向一个不存在的类时，那行文本照样在，而类已被 R8 整包剪掉。
+      #      「保住了什么」的判据是 seeds.txt —— 那份文件早就在上传清单里，却一条断言都没有。
+      - name: R8 吃进了什么 / 保住了什么（产物级证据）
+        run: node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+
+      - name: 体积（与 debug 对比）
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk
+          [ -s "$apk" ] || {
+            echo "::error::$apk 不在 —— 逃生门那条「文件名带 -unsigned 后缀」的契约变了，先确认再改判据"
+            ls -R src-tauri/gen/android/app/build/outputs/apk || true
+            exit 1; }
+          rel=$(stat -c%s "$apk")
+          # debug 基准：219011984 字节，2026-09-05 本机实测（见本文件头注「不上传 APK artifact」段）。
+          dbg=219011984
+          echo "release(unsigned) = $rel 字节"
+          echo "debug             = $dbg 字节（2026-09-05 实测基准）"
+          awk -v r="$rel" -v d="$dbg" 'BEGIN{ printf "release 是 debug 的 %.1f%%，差 %d 字节\n", r*100/d, d-r }'
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # release 资产腿 —— 把**签名的** release APK 发成 GitHub release 资产
+  # ══════════════════════════════════════════════════════════════════════════════
+  #
+  # 🔴 **今天这条腿一次都跑不起来，而这不是缺陷，是一件没做完的外部前置**（如实登记，别读成已能发版）：
+  #    ① 四个 secret（`POLARIS_KEYSTORE_BASE64` / `POLARIS_KEYSTORE_PASSWORD` /
+  #       `POLARIS_KEY_PASSWORD` / `POLARIS_KEY_ALIAS`）今天在本仓一个都没有 —— 密钥库按裁定
+  #       在仓外（`~/.polaris/android/release.jks`），生成它与配 secret 都是仓外的人工动作；
+  #    ② 没有任何调用方传 `publish_release: true`：`release-risk.yml` 那句
+  #       `uses: ./.github/workflows/android.yml` 不带 `with:`，`package.yml` 也还没接上这条腿。
+  #    缺凭据时本腿**当场失败**（下面「取出签名密钥库」那一步逐条点名缺了哪个），
+  #    绝不退化成未签名包 —— 未签名包发出去就是一个所有人都装不上的资产。
+  #
+  # ── 为什么不能复用 `release-smoke` 出的那个包 ──
+  # 那条腿走的是 `-PpolarisAllowUnsigned=true` 逃生门，产物叫 `app-arm64-release-unsigned.apk`，
+  # 文件名本身就写着没签名。Android **只接受与已装应用同一把签名的升级包**：拿一个签名不一致
+  # （或干脆没签名）的 APK 去覆盖安装，系统给的是一句「应用未安装」，而这件事应用内观测不到
+  # （ACTION_VIEW 交出去之后没有回调）。故这条腿与冒烟腿刻意分开，且本腿的 assemble 那一行
+  # **不许**带冒烟腿那个 `-P…` 逃生门实参 —— 由
+  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑧ 逐字守着。
+  #
+  # ⚠️ 本段（连同下面 assemble 那一步的注释）**刻意不写出那个属性名的字面量**：⑧ 的取材面是
+  #    整个 job 的原文、含注释 —— 说明与实参在文本上不可分辨，把判据改成「只扫非注释行」
+  #    等于给「在注释里写、在实参里也写」开一条缝。宁可让说明绕着走。
+  #
+  # ── 资产名是一条跨文件命名契约 ──
+  # 下面 `asset_name=` 那一行的字面形态，与 `crates/updater/src/github.rs` 的
+  # `ANDROID_APK_SUFFIX` 是同一条契约的两端：选包器按后缀选包，漂一个字符的后果不是报错，
+  # 是**「Android 上永远查不到更新」**（`find_suitable_update_asset` 返 `None` ⇒ `NoUpdate`，
+  # 一句话都不说）。两端由 `crates/updater` 的
+  # `the_ci_asset_name_is_exactly_what_the_selector_picks` 逐字对拍：那条测试从本文件原文里
+  # 把这一行取出来、展开成一个真实文件名、喂进真的选包器。
+  #
+  # ── 前置步骤与 `apk` / `release-smoke` 两个 job 逐字相同 ──
+  # GitHub Actions 没有 job 内的 step 复用，只能复制。三份会漂 ⇒ 由
+  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑦ 三方逐字对拍。
+  release-apk:
+    name: 签名 release APK → GitHub release 资产
+    if: inputs.publish_release
+    runs-on: ubuntu-22.04
+    # 上传 release 资产要写权限；workflow 级是 `contents: read`，只给这一个 job 放开。
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm 11 要求 Node 22.13+，且版本必须与 ui.yml / package.yml 一致（同一套前端产物）。
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Setup pnpm (pinned)
+        id: pnpm
+        shell: bash
+        env:
+          PNPM_VERSION: '11.24.0'
+        run: |
+          set -euo pipefail
+          npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
+          got="$("$RUNNER_TEMP/pnpm/bin/pnpm" --version)"
+          [ "$got" = "$PNPM_VERSION" ] || {
+            echo "::error::pnpm is '$got', expected '$PNPM_VERSION'"; exit 1; }
+          echo "$RUNNER_TEMP/pnpm/bin" >> "$GITHUB_PATH"
+          echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm.outputs.store_path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust stable + android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android
+          rustup default stable
+          echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      # key 用固定串而不是 matrix：本 workflow 只有这一个 job、一个 target，
+      # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: android-aarch64
+
+      # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
+      # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      # ══ 工具链解析：JDK / SDK / NDK 全部**现选**，不写死版本号 ══
+      #
+      # 为什么不写死：镜像里的 JDK/NDK 版本会漂，写死的后果是某天 sdkmanager 说「找不到这个包」
+      # 而没人知道该换成哪个；而这里每一条约束都能从**代码或脚本注释**里读出来，现选即可。
+      # 为什么不 fallback：每条约束不满足时都当场硬失败并点名，不静默回落到 runner 默认 java / 默认 NDK
+      # （静默回落会让「镜像换了」这个事实永远不被观测到，报错点漂到 gradle 或 lld 里，离真因两跳远）。
+      - name: Resolve JDK / Android SDK / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ── JDK：两个用途、两个版本，都取镜像预装的那份（以 JAVA_HOME_<主版本>_X64 暴露）──
+          #   · Gradle / AGP 8.11 → JDK 21（AGP 支持 17–21，本机实测面就是 21）
+          #   · scripts/build-libbox.sh → **必须 openjdk 17**（其坑①：上游 build_libbox 的 main.go
+          #     逐串匹配 "openjdk 17"，21 会 FATAL；那个版本约束管的是 gomobile 生成 Java 源后的
+          #     class 文件版本，绕过去会在 d8/AGP 那侧炸）
+          : "${JAVA_HOME_21_X64:?镜像未暴露 JDK 21（JAVA_HOME_21_X64）—— runner 镜像变了，先确认再改本步}"
+          : "${JAVA_HOME_17_X64:?镜像未暴露 JDK 17（JAVA_HOME_17_X64）—— build-libbox.sh 坑① 要求 openjdk 17}"
+          {
+            echo "JAVA_HOME=$JAVA_HOME_21_X64"
+            echo "JDK17=$JAVA_HOME_17_X64"
+          } >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+
+          # ── SDK：平台与 build-tools 跟着 gen/android 的 compileSdk 走（判据从代码里读，不抄）──
+          : "${ANDROID_HOME:?镜像未暴露 ANDROID_HOME}"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sdkmanager" ] || { echo "::error::找不到 sdkmanager：$sdkmanager"; exit 1; }
+          compile_sdk="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+' \
+            src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
+          [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
+          echo "compileSdk=$compile_sdk"
+          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0"
+
+          # ── NDK：两个用途、两条不同约束 ──
+          #   · Rust 交叉编译：镜像预装那份即可（本机实测面 r27.3.13750724）。
+          #   · libbox：**major 必须 ≥ 28** —— gomobile 会链进 cronet-go 的**预编译** libcronet.a，
+          #     该 .a 用比 NDK 27 新的工具链编的，r27 的 lld 报 `unknown relocation (315)`
+          #     （build-libbox.sh 坑②；上游 CI 钉 r28）。这条**不能靠摘掉 with_naive_outbound 绕过**。
+          : "${ANDROID_NDK_LATEST_HOME:?镜像未暴露预装 NDK（ANDROID_NDK_LATEST_HOME）}"
+          echo "NDK_RUST=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+          # 已装 NDK 里 major ≥ 28 的最高一版（目录名即版本号，如 28.1.13356709）。
+          pick28() {
+            local latest
+            latest="$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+              | awk -F. '$1 >= 28' | sort -V | tail -1)"
+            [ -n "$latest" ] && printf '%s\n' "$ANDROID_HOME/ndk/$latest"
+          }
+          ndk28="$(pick28 || true)"
+          if [ -z "$ndk28" ]; then
+            want="$("$sdkmanager" --list 2>/dev/null \
+              | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -u -V \
+              | awk -F'[;.]' '$2 >= 28' | tail -1)"
+            [ -n "$want" ] || {
+              echo "::error::sdkmanager 的稳定包列表里没有 major ≥ 28 的 NDK —— build-libbox.sh 坑② 无法满足"
+              exit 1; }
+            echo "预装 NDK 均 < 28，现装：$want"
+            "$sdkmanager" "$want"
+            ndk28="$(pick28 || true)"
+          fi
+          [ -n "$ndk28" ] || { echo "::error::装完仍找不到 major ≥ 28 的 NDK"; exit 1; }
+          echo "NDK_LIBBOX=$ndk28" >> "$GITHUB_ENV"
+          echo "NDK(rust)=$ANDROID_NDK_LATEST_HOME  NDK(libbox)=$ndk28"
+
+      - name: Resolve bundled core version
+        id: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
+          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
+          echo "内核版本真值：v$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
+      #
+      # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
+      #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
+      # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
+      # [选「cache 在前、未命中就现建」：缓存只是省时间，**不是来源**。缓存不在 / 键变了 / 缓存服务挂了，
+      #  下一步照样从 sing-box 源码现建；建失败就红。缓存键含内核版本与构建脚本哈希，
+      #  改 build-libbox.sh 或换内核版本 = 换键 = 必然重建重验]
+      - name: Cache libbox.aar
+        id: libbox
+        uses: actions/cache@v6
+        with:
+          path: src-tauri/gen/android/app/libs/libbox.aar
+          key: libbox-${{ runner.os }}-v${{ steps.core.outputs.version }}-${{ hashFiles('scripts/build-libbox.sh') }}
+
+      - name: Build libbox.aar (缓存未命中)
+        if: steps.libbox.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          # build-libbox.sh 自己会校 major ≥ 28 并在不满足时硬失败；这里显式指给它，
+          # 免得它按「$ANDROID_HOME/ndk 下版本号最大的那个」自选到别的东西。
+          ANDROID_NDK_HOME: ${{ env.NDK_LIBBOX }}
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/sing-box"
+          # 浅克隆到 tag：脚本随后用 `git describe --tags` 与 core-manifest 对拍，不符即拒绝构建。
+          git clone --depth 1 --branch "v${{ steps.core.outputs.version }}" \
+            https://github.com/SagerNet/sing-box "$src"
+          df -h / | tail -1
+          bash scripts/build-libbox.sh "$src"
+
+          # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
+          # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与一个
+          # 600 MB 的 debug APK。GitHub runner 的系统盘余量有限，且爆盘的报错形态（链接器
+          # 中途 ENOSPC）离真因很远。这里的缓存对本 job 之后的步骤零价值 —— 要的是那个 aar，
+          # 它已经落在 app/libs/ 下并会被 actions/cache 保存。
+          go clean -cache -modcache || true
+          rm -rf "$src" /var/tmp/gomobile-tmp
+          df -h / | tail -1
+
+      # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
+      # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
+      - name: libbox.aar 必须在位
+        shell: bash
+        run: |
+          set -euo pipefail
+          aar=src-tauri/gen/android/app/libs/libbox.aar
+          [ -s "$aar" ] || {
+            echo "::error::$aar 缺失或为 0 字节 —— 这条腿的内核来源没拿到（缓存命中=${{ steps.libbox.outputs.cache-hit }}）"
+            exit 1; }
+          echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
+
+      # 与 `release-smoke` 那条逐字相同（同一条 release profile 的两步走）。
+      - name: Stage frontend + cross-compiled .so（release profile）
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.NDK_RUST }}
+          NDK_HOME: ${{ env.NDK_RUST }}
+        run: |
+          set -uo pipefail
+          set +e
+          ./ui/node_modules/.bin/tauri android build --apk --target aarch64 --ci \
+            --config src-tauri/tauri.android.conf.json
+          rc=$?
+          set -e
+          echo "tauri android build 退出码 = $rc（预期 1，见 polaris-android-first-apk-2026-09-04.md §2.4）"
+
+          jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
+          up=src-tauri/gen/android/app/src/main/assets/_up_
+          for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
+            [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了"; exit 1; }
+          done
+          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
+            [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
+          done
+          [ -d "$up/resources/data" ] || { echo "::error::$up/resources/data 没铺出来"; exit 1; }
+
+      # 这一步在三条腿上都跑：被**发出去**的那个包才是 wry keep 规则真正会伤到用户的地方
+      # （规则漂了 = R8 把 JNI 入口剪掉 = 白屏），在两个不发布的包上守而放过发布包是反的。
+      - name: wry keep 规则与生成物对拍
+        run: node scripts/verify-wry-keep-rules.mjs
+
+      # ── 签名凭据：从 secret 落到 runner 的临时路径，用后即删 ──
+      #
+      # 🔴 缺任何一件**当场失败**，不许继续：gradle 那侧缺凭据时会走 `signingBlockers` 大声失败，
+      #    但那要等到 assemble 才发生，且失败信息里混着一堆构建噪声。这里先问一遍，让「secret 没配」
+      #    这件事在第一秒就自曝（`feedback_silent_absence_must_self_report` 同一条纪律）。
+      #
+      # 🔴 口令与别名**不经这一步**：它们由下一步的 `env:` 直接从 secret 注入 gradle 进程，
+      #    绝不落任何文件、不进 `$GITHUB_ENV`。本步只落密钥库文件本身（它不是明文口令），
+      #    并只把它的**路径**写进 `$GITHUB_ENV`。
+      - name: 取出签名密钥库（缺任何一件当场失败，绝不退化成未签名包）
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.POLARIS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.POLARIS_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.POLARIS_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.POLARIS_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${KEYSTORE_BASE64:-}" ] || missing="$missing POLARIS_KEYSTORE_BASE64"
+          [ -n "${KEYSTORE_PASSWORD:-}" ] || missing="$missing POLARIS_KEYSTORE_PASSWORD"
+          [ -n "${KEY_PASSWORD:-}" ] || missing="$missing POLARIS_KEY_PASSWORD"
+          [ -n "${KEY_ALIAS:-}" ] || missing="$missing POLARIS_KEY_ALIAS"
+          if [ -n "$missing" ]; then
+            echo "::error::签名 secret 缺失：$missing —— 先在仓库 secrets 里配齐四件再跑本腿。"
+            echo "::error::密钥库按裁定在仓外（~/.polaris/android/release.jks），本仓不生成、不存放任何密钥或口令。"
+            exit 1
+          fi
+          jks="$RUNNER_TEMP/polaris-release.jks"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$jks"
+          [ -s "$jks" ] || {
+            echo "::error::密钥库解码后是 0 字节 —— POLARIS_KEYSTORE_BASE64 不是一份有效的 base64 密钥库"
+            exit 1; }
+          echo "密钥库已就位（$(stat -c%s "$jks") 字节）"
+          echo "POLARIS_KEYSTORE_FILE=$jks" >> "$GITHUB_ENV"
+
+      # 🔴 **这一行不许带冒烟腿那个逃生门实参**（`release-smoke` 那条腿才用它；名字见那一步）：
+      #    它换来的是 `app-arm64-release-unsigned.apk`，而未签名 / 签名不一致的包在 Android 上
+      #    装不上。发布腿要的恰恰是「签不上就失败」，不是「签不上就出个别的包」。
+      - name: Assemble signed release APK
+        working-directory: src-tauri/gen/android
+        env:
+          POLARIS_KEYSTORE_PASSWORD: ${{ secrets.POLARIS_KEYSTORE_PASSWORD }}
+          POLARIS_KEY_PASSWORD: ${{ secrets.POLARIS_KEY_PASSWORD }}
+          POLARIS_KEY_ALIAS: ${{ secrets.POLARIS_KEY_ALIAS }}
+        run: ./gradlew assembleArm64Release -x rustBuildArm64Release
+
+      # 用后即删，且**无论成败**：assemble 失败时密钥库同样要走，不能留在 runner 的工作区里。
+      - name: 删掉 runner 上的密钥库
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/polaris-release.jks"
+
+      # ── 改名成资产名（跨文件命名契约的产出侧）──
+      #
+      # 版本取的是**包里那一份**（`.tauri/tauri.properties` 的 `tauri.android.versionName`，
+      # 即 `build.gradle.kts` 自己读的那个文件），不是 `tauri.conf.json`：判据要住在真值所在地，
+      # 否则「conf 改了但 tauri CLI 没重铺 properties」会产出一个名字与内容对不上的资产。
+      - name: 改名成 release 资产名
+        id: asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          built=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk
+          [ -s "$built" ] || {
+            echo "::error::$built 不在。gradle 出的若是 app-arm64-release-unsigned.apk，说明签名根本没接上 —— 那个包装不上，绝不发。"
+            ls -R src-tauri/gen/android/app/build/outputs/apk || true
+            exit 1; }
+          props=src-tauri/gen/android/.tauri/tauri.properties
+          [ -s "$props" ] || { echo "::error::$props 不在 —— 版本号的真值源没铺出来"; exit 1; }
+          version=$(sed -n 's/^tauri\.android\.versionName=//p' "$props" | head -n1)
+          [ -n "$version" ] || { echo "::error::$props 里没有 tauri.android.versionName"; exit 1; }
+          tag="${{ inputs.release_tag }}"
+          [ -n "$tag" ] || tag="$GITHUB_REF_NAME"
+          case "$GITHUB_REF" in refs/tags/*) ;; *)
+            [ -n "${{ inputs.release_tag }}" ] || {
+              echo "::error::当前 ref（$GITHUB_REF）不是 tag，且没传 release_tag —— 资产挂不到任何 release 上"
+              exit 1; }
+          esac
+          [ "$tag" = "v$version" ] || {
+            echo "::error::tag（$tag）与包里的版本（$version）对不上 —— 发出去的资产会与它的名字说两件事"
+            exit 1; }
+          asset_name="polaris-${version}-android-arm64.apk"
+          cp "$built" "$RUNNER_TEMP/$asset_name"
+          echo "asset=$RUNNER_TEMP/$asset_name" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "资产：$asset_name（$(stat -c%s "$RUNNER_TEMP/$asset_name") 字节）"
+
+      # ══ 发之前先开箱：构建成功 ≠ 包里有东西 ══
+      # 与 debug 腿同一份判据（资源有没有静默逃逸 / 死字节 / cronet-naive 在不在 / 符号剥没剥 /
+      # 出厂权限集）。发布包上少这一步，就是把「全绿但产物是垃圾」那四条已实证通路直接送给用户。
+      - name: 开箱验（产物级判据）
+        run: node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a
+
+      - name: 上传成 release 资产
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ steps.asset.outputs.tag }}" "${{ steps.asset.outputs.asset }}" \
+            --clobber --repo "$GITHUB_REPOSITORY"
+          gh release view "${{ steps.asset.outputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep -qx "$(basename "${{ steps.asset.outputs.asset }}")" || {
+            echo "::error::上传报成功，但 release 上没有这个资产 —— 不许把「发了」当成事实"
+            exit 1; }

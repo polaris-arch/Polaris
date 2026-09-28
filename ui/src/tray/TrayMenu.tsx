@@ -551,12 +551,22 @@ export default function TrayMenu() {
 
   const switchNode = async (id: string) => {
     try {
-      const saved = await withConfigWriteLock(async () => {
-        await api.server.switch(id);
-        return api.config.get();
+      const { receipt, saved } = await withConfigWriteLock(async () => {
+        const receipt = await api.server.switch(id);
+        return { receipt, saved: await api.config.get() };
       });
       setConfig(saved);
       setSelectedId(saved.selectedServerId ?? id);
+      if (receipt.status !== 'applied') {
+        if (receipt.status !== 'superseded') setNotice(t(
+          receipt.status === 'pending' ? 'tray.switchPending'
+            : receipt.status === 'notRunning' ? 'tray.switchSavedForNextStart'
+              : 'tray.switchRequiresApply',
+          { node: servers.find((s) => s.id === id)?.name ?? id },
+        ));
+        setView('main');
+        return;
+      }
     } catch (err) {
       noticeActionFailure(servers.find((s) => s.id === id)?.name ?? t('tray.nodes'), err);
       return; // 失败不切视图不关浮层（W14）
@@ -565,21 +575,28 @@ export default function TrayMenu() {
     hide();
   };
 
-  // 直连哨兵走 selectedServerId 顶层 patch 而非 server:switch —— 后者要求 id 命中真实 servers
-  // 列表，哨兵不在其中会被拒绝；config-engine 已对该哨兵放行校验（见 crates/store/validate.rs）。
+  // Direct now follows server:switch so the tray receives the same applied/pending receipt.
   const pickDirect = async () => {
     if (config) {
       try {
-        // **顶层 patch** 而非整份覆盖：本动作只改 `selectedServerId`，而整份写会把浮层这份快照里
-        // **其它所有键**一并按快照回写 —— 浮层的 config 只在它打开时取一次，期间主窗改的任何设置
-        // 都会被这次「切直连」静默回滚。后端在锁内最新配置上打补丁，结构上不可能误伤别的键。
-        // 入核行为不变：该命令同样走 `broadcast_config_changed` → `switch_mode`，也同样做
-        // `invalidate_unlock_on_exit_change`（见 `commands/config.rs::config_patch`）。
-        const saved = await withConfigWriteLock(() =>
-          api.config.patch({ selectedServerId: DIRECT_SERVER_ID })
-        );
+        // The backend updates only selectedServerId against its latest config and
+        // returns the live-core outcome; this tray snapshot never writes a whole config.
+        const { receipt, saved } = await withConfigWriteLock(async () => {
+          const receipt = await api.server.switch(DIRECT_SERVER_ID);
+          return { receipt, saved: await api.config.get() };
+        });
         setConfig(saved);
-        setSelectedId(DIRECT_SERVER_ID);
+        setSelectedId(saved.selectedServerId ?? DIRECT_SERVER_ID);
+        if (receipt.status !== 'applied') {
+          if (receipt.status !== 'superseded') setNotice(t(
+            receipt.status === 'pending' ? 'tray.switchPending'
+              : receipt.status === 'notRunning' ? 'tray.switchSavedForNextStart'
+                : 'tray.switchRequiresApply',
+            { node: t('tray.modeDirect') },
+          ));
+          setView('main');
+          return;
+        }
       } catch (err) {
         noticeActionFailure(t('tray.modeDirect'), err);
         return; // 失败不关浮层（W14）

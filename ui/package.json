@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "vite",
     "check:ipc": "node scripts/check-ipc-args.mjs",
-    "build": "node scripts/check-ipc-args.mjs && tsc && vite build",
+    "build": "node scripts/check-ipc-args.mjs && node ../scripts/check-android-bridge.mjs && tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run"
   },

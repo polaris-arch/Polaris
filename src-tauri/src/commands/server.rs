@@ -15,6 +15,7 @@
 //! 节点 CRUD 经 config 的 load/save（servers 数组原地改 + 原子写）+ 广播 event:configChanged。
 //! DIRECT_SERVER_ID 哨兵 + 删选中节点的兜底出口逻辑对齐 Polaris（D4/F-1）。
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tauri::{AppHandle, State};
 
@@ -22,10 +23,10 @@ use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_mesh::warp_http::RegisterOptions;
 
-use crate::commands::config::broadcast_config_changed;
+use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
-use crate::runtime::proxy::code;
+use crate::runtime::proxy::{code, SwitchOutcome};
 use crate::runtime::tailscale_login_core::StartLoginOutcome;
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
 use crate::runtime::AppRuntime;
@@ -36,7 +37,7 @@ const DIRECT_SERVER_ID: &str = "__direct__";
 /// id 缺失 / 空 → mint uuid（镜像 [`server_add_bulk`] 的 `s["id"]=new_uuid()`）。
 ///
 /// 此前 `server_add` 直接 push 原值不补 id → `store::sanitize` 丢弃 id 缺失/空的节点（要求 id 非空字符串）
-/// → 克隆 / 手动加的节点产出不可用、不持久。非对象由单条新增校验拒绝。
+/// → 克隆 / 手动加的节点产出不可用、不持久。非对象入参不动（随后由新增校验拒绝）。
 fn ensure_server_id(mut server: Value) -> Value {
     if let Some(obj) = server.as_object_mut() {
         let has_id = obj
@@ -50,63 +51,74 @@ fn ensure_server_id(mut server: Value) -> Value {
     server
 }
 
-/// 单条新增先走存储层同一套清洗与模型解码，避免被保存腿过滤后仍返回成功。
-fn validate_server_add(server: Value) -> Result<Value, String> {
-    let mut probe = polaris_store::sanitize_config(&json!({"servers": [server]}).to_string())
-        .map_err(|_| "SERVER_ADD_INVALID".to_string())?;
-    let server = probe["servers"]
-        .as_array_mut()
-        .filter(|servers| servers.len() == 1)
-        .map(|servers| servers.remove(0))
-        .ok_or_else(|| "SERVER_ADD_INVALID".to_string())?;
-    serde_json::from_value::<ServerConfig>(server.clone())
-        .map_err(|_| "SERVER_ADD_INVALID".to_string())?;
-    if !polaris_store::validate::protocol_requirement_ok(
-        &server["protocol"]
-            .as_str()
-            .expect("validated protocol")
-            .to_lowercase(),
-        &server,
-    ) {
-        return Err("SERVER_ADD_INVALID".to_string());
-    }
-    Ok(server)
+/// 用 ConfigStore 同一套规则校验/规范化新增记录，避免被清洗掉却向调用者报成功。
+fn normalized_add_server(server: Value) -> Result<Value, String> {
+    let cleaned = polaris_store::sanitize_config(&json!({"servers": [server]}).to_string())
+        .map_err(|_| "新增节点校验失败".to_string())?;
+    let normalized = cleaned["servers"]
+        .as_array()
+        .and_then(|servers| servers.first())
+        .cloned()
+        .ok_or_else(|| "新增节点缺少必填字段或协议配置无效".to_string())?;
+    // The store deliberately preserves unknown/optional fields. A wrong-typed known field
+    // (for example tlsSettings as a string) must still be rejected before a successful add.
+    serde_json::from_value::<ServerConfig>(normalized.clone())
+        .map_err(|_| "新增节点协议配置字段类型无效".to_string())?;
+    Ok(normalized)
 }
 
-/// `server:add` 核心：校验、补 id、原子落盘并确认存活。同 id 同内容重试幂等，冲突不写。
+/// 补 id + 校验 + 原子落盘。同 id 同规范化内容重试不再写入；冲突不覆盖既有节点。
 fn server_add_core(config: &ConfigManager, server: Value) -> Result<Value, String> {
-    let server = validate_server_add(ensure_server_id(server))?;
-    let id = server["id"].as_str().expect("validated server id");
+    let server = normalized_add_server(ensure_server_id(server))?;
+    let id = server["id"].as_str().expect("sanitize 保证非空 id");
     let (result, saved) = config
         .update(|cfg| {
             let Some(servers) = cfg.get("servers").and_then(Value::as_array) else {
-                return Decision::Skip(Err("SERVER_ADD_INVALID_CONFIG".to_string()));
+                return Decision::Skip(Err("节点列表不可用".to_string()));
             };
-            if let Some(existing) = servers.iter().find(|existing| existing["id"] == id) {
-                return if *existing == server {
-                    Decision::Skip(Ok(Some(cfg.clone())))
+            if let Some(existing) = servers.iter().find(|node| node["id"].as_str() == Some(id)) {
+                return if normalized_add_server(existing.clone()).as_ref() == Ok(&server) {
+                    Decision::Skip(Ok(cfg.clone()))
                 } else {
-                    Decision::Skip(Err("SERVER_ADD_ID_CONFLICT".to_string()))
+                    Decision::Skip(Err("节点标识已存在且内容不同".to_string()))
                 };
             }
+            // 检查集合级清洗约束；仅在副本上验证，不把清洗后的集合写回旧节点。
+            let mut proposed = servers.clone();
+            proposed.push(server.clone());
+            let cleaned =
+                match polaris_store::sanitize_config(&json!({"servers": proposed}).to_string()) {
+                    Ok(cleaned) => cleaned,
+                    Err(_) => return Decision::Skip(Err("新增节点校验失败".to_string())),
+                };
+            if !cleaned["servers"]
+                .as_array()
+                .is_some_and(|nodes| nodes.iter().any(|node| node["id"].as_str() == Some(id)))
+            {
+                return Decision::Skip(Err("新增节点与现有节点配置冲突".to_string()));
+            }
             cfg["servers"].as_array_mut().unwrap().push(server.clone());
-            Decision::Write(Ok(None))
+            Decision::Write(Ok(Value::Null))
         })
         .map_err(|e| format!("{e}"))?;
-    let persisted = saved.or(result?).expect("write or idempotent snapshot");
-    if !persisted["servers"]
-        .as_array()
-        .is_some_and(|servers| servers.contains(&server))
-    {
-        return Err("SERVER_ADD_NOT_PERSISTED".to_string());
-    }
-    Ok(persisted)
+    result.map(|unchanged| saved.unwrap_or(unchanged))
 }
 
 /// 上游 `SERVER_ADD`：新增节点（id 缺失/空则 mint，防 sanitize 丢弃）。
 ///
-/// WARP 单例槽继续由渲染端 `meshSingletonConflict` 在注册前检查。本入口负责单条输入
-/// 校验和持久化确认；Tailscale 可保存多个节点，其状态写入所有权由登录运行时管理。
+/// DESIGN-REVIEW(mesh-singleton-guard-renderer-only)：WARP 的 UI 单例槽判据在渲染端
+/// （`ui/src/domain/endpoint-routes.ts#meshSingletonConflict`）。上游存储允许多个独立的
+/// Tailscale 节点，本命令不得把旧 TS 单例 UX 误写成持久化约束。本命令不另造 WARP 启发式守卫；
+/// 但 `server:add` 会复用 ConfigStore 既有清洗策略，确保新增节点能保留，不能把策略拒绝报成成功。
+/// [`server_add_bulk`] 仍沿用原批量导入路径。UI 判据不在 Rust 侧重写，理由：
+///  1. 判定谓词 `isWarpServer` 在 Rust 侧无对应物（`domain/warp.ts` 头注已登记此边界：输入均在前端
+///     store，漂移后果止于 UI）。在此复刻一份「端点域名兜底 + warpDevice 标记」的启发式 = 造第二真值源，
+///     无 codegen 约束，日后必然与渲染端的 WARP 识别分叉。
+///  2. 误判方向不可接受：本命令同时是备份恢复 / 导入的落盘substrate，Rust 侧启发式误拒一个合法节点，
+///     用户在 UI 上无从修复；而渲染端误拒最多是弹一次错、用户改地址重来。
+///  3. 威胁模型：`server:add` 只被本应用自己的 webview 调用，不接受外部不可信输入。
+///
+/// 若日后新增**非渲染端**的写入方（CLI / 深链接 / 远程配置下发），本决定即失效，须在此补守卫。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -468,9 +480,9 @@ fn server_switch_core<F>(
     server_id: &str,
     validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
     register_intent: F,
-) -> Result<(Value, bool), ServerSwitchError>
+) -> Result<(Value, bool, u64), ServerSwitchError>
 where
-    F: FnOnce(),
+    F: FnOnce() -> u64,
 {
     let mut validate_candidate = Some(validate_candidate);
     let mut register_intent = Some(register_intent);
@@ -483,7 +495,7 @@ where
                     arr.iter()
                         .any(|s| s.get("id").and_then(Value::as_str) == Some(server_id))
                 });
-            if !exists {
+            if !exists && server_id != DIRECT_SERVER_ID {
                 return Decision::Skip(Err(ServerSwitchError::Other(format!(
                     "服务器不存在: {server_id}"
                 ))));
@@ -513,18 +525,45 @@ where
             }
             // 必须在 ConfigManager 的写事务内取得 selector 所有权：若先写 D、解锁后才 bump，auto
             // rollback 可在间隙内看到“D 仍等于候选”并覆盖一次同目标的用户新意图。
-            register_intent
+            let intent_generation = register_intent
                 .take()
-                .expect("server_switch 的 Write 腿只能执行一次")();
+                .expect("server_switch 的 Write 腿只能执行一次")(
+            );
             if let Some(obj) = cfg.as_object_mut() {
-                push_recent_server_id(obj, server_id);
+                if server_id != DIRECT_SERVER_ID {
+                    push_recent_server_id(obj, server_id);
+                }
             }
-            Decision::Write(Ok(exit_changed))
+            Decision::Write(Ok((exit_changed, intent_generation)))
         })
         .map_err(|e| ServerSwitchError::Other(format!("{e}")))?;
-    let exit_changed = exit_changed?;
+    let (exit_changed, intent_generation) = exit_changed?;
     let cfg = saved.expect("server_switch 的 Write 腿必须返回已落盘配置");
-    Ok((cfg, exit_changed))
+    Ok((cfg, exit_changed, intent_generation))
+}
+
+/// 显式选择的运行态回执。磁盘选择已保存不等于活核已切换；只有严格读回才能报 applied。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerSwitchReceipt {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+impl ServerSwitchReceipt {
+    fn from_outcome(outcome: Option<SwitchOutcome>) -> Self {
+        let (status, reason) = match outcome {
+            Some(SwitchOutcome::HotSwitched | SwitchOutcome::NoOp | SwitchOutcome::Unchanged) => {
+                ("applied", None)
+            }
+            Some(SwitchOutcome::Pending | SwitchOutcome::Restarting) => ("pending", None),
+            Some(SwitchOutcome::NotRunning) => ("notRunning", None),
+            Some(SwitchOutcome::Deferred) => ("deferred", Some("nodeRequiresApply")),
+            None => ("superseded", None),
+        };
+        Self { status, reason }
+    }
 }
 
 /// 上游 `SERVER_SWITCH`：切换选中节点。
@@ -533,39 +572,49 @@ where
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn server_switch(
+pub async fn server_switch(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     server_id: String,
-) -> ApiResponse<()> {
+) -> Result<ApiResponse<ServerSwitchReceipt>, ()> {
     match server_switch_core(
         state.config(),
         &server_id,
         |candidate| {
             state
                 .proxy()
-                .validate_required_bind_interfaces_blocking(candidate)
+                .validate_selected_server_candidate_blocking(candidate)
         },
-        || {
-            state.proxy().register_selector_intent();
-        },
+        || state.proxy().register_selector_intent(),
     ) {
-        Ok((cfg, exit_changed)) => {
-            broadcast_config_changed(&app, &cfg);
-            // A7：换节点 = 出口 identity 变 → 作废旧出口的解锁探测缓存（否则解锁角标最长陈旧 30min，
-            // 即缓存 FRESH_TTL）。重选同一节点（identity 未变）不失效，避免白刷探测。
-            // exit_blocked=false：切换瞬间尚未探新出口，交前端按 running 复位「检测中」并重跑（对齐 invalidate 契约）。
-            if exit_changed {
-                let sink = BroadcastSink::new(&app);
-                let running = state.proxy().status().running;
-                state.unlock().invalidate(&sink, running, false);
+        Ok((_cfg, _exit_changed, intent_generation)) => {
+            // 只发磁盘变更信号：显式选择在下方等待受限 R 投影的结果，不能再让普通广播
+            // 后台把完整 D（含此前保存未 Apply 的 DNS/规则）送入运行核。
+            emit_config_changed_signal(&app);
+            let starting_generation = state.proxy().core_generation();
+            match state
+                .proxy
+                .switch_selected_server_if_current(&server_id, intent_generation)
+                .await
+            {
+                Ok(outcome) => {
+                    let outcome = state.proxy().settle_selected_switch_receipt(
+                        outcome,
+                        starting_generation,
+                        intent_generation,
+                    );
+                    // 保存 D 本身未改变出口；热切成功由 runtime 按 R 作废，重启就绪由
+                    // start/reassert 续延作废。Pending/Deferred 时旧核仍跑旧出口，缓存仍有效。
+                    Ok(ApiResponse::ok(ServerSwitchReceipt::from_outcome(outcome)))
+                }
+                Err(error) => Ok(ApiResponse::err(error)),
             }
-            ok_void()
         }
-        Err(ServerSwitchError::InterfaceUnavailable(message)) => {
-            ApiResponse::err_with_code(message, code::OUTBOUND_INTERFACE_UNAVAILABLE)
-        }
-        Err(ServerSwitchError::Other(message)) => ApiResponse::err(message),
+        Err(ServerSwitchError::InterfaceUnavailable(message)) => Ok(ApiResponse::err_with_code(
+            message,
+            code::OUTBOUND_INTERFACE_UNAVAILABLE,
+        )),
+        Err(ServerSwitchError::Other(message)) => Ok(ApiResponse::err(message)),
     }
 }
 

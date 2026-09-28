@@ -146,7 +146,7 @@ impl MeshRuntime {
         let stats = Arc::new(ExitRouteOpStats::default());
         let op = HelperExitRouteOp {
             helper: None,
-            platform: current_platform(),
+            platform: Platform::current(),
             enabled: false,
             stats: stats.clone(),
         };
@@ -161,7 +161,7 @@ impl MeshRuntime {
         let stats = Arc::new(ExitRouteOpStats::default());
         let op = HelperExitRouteOp {
             helper: Some(helper),
-            platform: current_platform(),
+            platform: Platform::current(),
             enabled: true,
             stats: stats.clone(),
         };
@@ -175,7 +175,7 @@ impl MeshRuntime {
         _exit_route_stats: Arc<ExitRouteOpStats>,
     ) -> Self {
         let warp_queue_path = config_dir.join("warp-deregister-queue.json");
-        let manager = MeshExitRouteManager::new(op, LogExitRouteLog, current_platform());
+        let manager = MeshExitRouteManager::new(op, LogExitRouteLog, Platform::current());
         // 取消令牌由状态机自持，此处取同一个 Arc 的锁外句柄（不是第二份状态）。
         let exit_route_cancel = manager.cancel_handle();
         Self {
@@ -542,7 +542,7 @@ impl MeshRuntime {
     }
 
     /// 启动期 drain 一次（清上次退出遗留）+ 定时 drain。经 `tauri::async_runtime::spawn` 常驻后台任务。
-    /// **装配点**：`main.rs` setup 内 `AppRuntime::new` 之后、`manage` 之前调
+    /// **装配点**：`lib.rs` setup 内 `AppRuntime::new` 之后、`manage` 之前调
     /// `app_runtime.mesh.clone().spawn_warp_drain(app_runtime.http.clone());`（见交接说明）。
     pub fn spawn_warp_drain(self: Arc<Self>, http: Arc<HttpRuntime>) {
         tauri::async_runtime::spawn(async move {
@@ -598,10 +598,13 @@ impl MeshRuntime {
         self.login_registry.state_gate().await
     }
 
-    pub async fn reserve_tailscale_main_states(&self, generated: &serde_json::Value) {
+    pub async fn reserve_tailscale_main_states(
+        &self,
+        generated: &serde_json::Value,
+    ) -> Result<(), String> {
         self.login_registry
             .reserve_main_states(generated, &self.config_dir)
-            .await;
+            .await
     }
 
     pub fn release_tailscale_main_states(&self) {
@@ -967,7 +970,7 @@ impl ExitRouteOp for HelperExitRouteOp {
             return false; // 诚实：不假装 OS 路由已装（管理器不标 installed）
         }
         match self.platform {
-            // Linux/其它类 unix：app 自身 CAP_NET_ADMIN，独立表 + oif 规则。
+            // Linux：app 自身 CAP_NET_ADMIN，独立表 + oif 规则。
             //
             // **返回值由 `ip rule add` 的退出码决定，不再无条件 true**：`run_ip_command` 吞掉全部错误
             // （`ip` 不在 PATH / 无 CAP_NET_ADMIN / 内核无 policy routing 全落同一条 best-effort 路径），
@@ -981,11 +984,54 @@ impl ExitRouteOp for HelperExitRouteOp {
             //
             // 判定与执行分离（[`run_linux_route_seq`]）：真 `ip` 调用是真机门（本机绝不 spawn），
             // 而「哪条是门、失败后跳不跳、del 腿返什么」是可测的纯编排 —— 单测注入假 runner 覆盖。
-            Platform::Linux | Platform::Other => {
+            Platform::Linux => {
                 run_linux_route_seq(op, linux_route_argv(op, iface, cidrs), |argv| async move {
                     run_ip_command(&argv).await
                 })
                 .await
+            }
+            // `Other`（未知平台）：与 Android 同答 false，**不 spawn**（2026-09-05 从 Linux 臂里摘出）。
+            //
+            // 原先它并在 Linux 那条上，写作「Linux/其它类 unix」—— 那是一句没有依据的推定：`Other`
+            // 的定义是「本仓没有为这个平台答过题」，其中既不含「它是类 unix」，也不含「它有 iproute2」，
+            // 更不含「应用在它上面拿得到 `CAP_NET_ADMIN`」。推定错了的代价与 Android 臂那条逐字相同：
+            // 一次注定失败的子进程 + 一条把「本平台不支持」写成「路由装失败」的误导性 warn。
+            //
+            // 上一层已经关掉了这条腿（`mesh_system_supported_on_platform(Other) == false`，2026-09-05
+            // 同批），故本臂与 Android 臂一样是**不可达的纵深防御**。仍要写对，理由也同 Android 臂：
+            // 「上层关掉了所以下层写什么都行」正是两扇门之间的那道缝。
+            Platform::Other => {
+                log::debug!(
+                    "出口路由 OS 操作在未知平台上不适用（本仓未为该平台验证过路由手术能力）：route-{op} iface={iface} → no-op"
+                );
+                false
+            }
+            // iOS：**不 spawn 任何东西**，直接诚实返 false。独立成臂而不是并进 Android 或 Other：
+            // 并进 Android 会断言「同一个理由」，而两者的理由不同 —— Android 是 `/system/bin/ip`
+            // **存在**但调用会被拒（注定失败的子进程），iOS 是**连子进程这个概念都没有**
+            // （应用与扩展沙箱里不能 fork/exec 任意可执行文件）。并进 `Other` 则更糟：`Other`
+            // 的语义是「没答过题」，而 iOS 这一格答过了。
+            // 上一层同样已关掉（`mesh_system_supported_on_platform(Ios) == false`），本臂是
+            // 不可达的纵深防御 —— 「上层关掉了所以下层写什么都行」正是两扇门之间的那道缝。
+            Platform::Ios => {
+                log::debug!(
+                    "出口路由 OS 操作在 iOS 上不适用（沙箱内无法 exec 路由工具，路由由系统持有）：route-{op} iface={iface} → no-op"
+                );
+                false
+            }
+            // Android：**不 spawn `ip`**，直接诚实返 false。
+            //
+            // 上一层已经把这条腿关掉了（`mesh_system_supported_on_platform(Android) == false` ⇒
+            // `MeshExitRouteManager` 的 reconcile/reassert/clear 三个入口全早退），本臂是不可达的
+            // 纵深防御。写成独立臂而不是并进 Linux 那条，是因为并进去会**真的去 spawn**：
+            // `/system/bin/ip` 在 Android 上存在，非 root 应用调 `ip rule add` 得到的是
+            // "Operation not permitted"，即一次注定失败的子进程 + 一条误导性的 warn 日志。
+            // 「上层关掉了所以下层写什么都行」正是两扇门之间的那道缝。
+            Platform::Android => {
+                log::debug!(
+                    "出口路由 OS 操作在 Android 上不适用（无 CAP_NET_ADMIN，策略路由由系统持有）：route-{op} iface={iface} → no-op"
+                );
+                false
             }
             // mac/win：经 root/SYSTEM helper（`route -ifscope`）。res.ok 决定是否标 installed（诚实）。
             Platform::Mac | Platform::Win => match &self.helper {
@@ -1270,22 +1316,13 @@ impl ExitRouteLog for LogExitRouteLog {
     }
 }
 
-/// 本机运行平台 → crate `Platform`（供 [`MeshExitRouteManager`] 运行期平台分派）。
-///
-/// 用 `cfg!`（布尔宏，**非** `#[cfg]` 属性）→ 三平台编译同一单元、无 per-平台死代码，仅运行值不同：
-/// 本机（Linux）编到 `Platform::Linux`（mesh_system_supported=true）；macOS/Win 分支为运行值、非编译门控，
-/// 故 exit_route 状态机不含任何 `target_os` 分支 → 无待交叉编译的碰不到分支。
-fn current_platform() -> Platform {
-    if cfg!(target_os = "macos") {
-        Platform::Mac
-    } else if cfg!(target_os = "windows") {
-        Platform::Win
-    } else if cfg!(target_os = "linux") {
-        Platform::Linux
-    } else {
-        Platform::Other
-    }
-}
+// 本机运行平台 → `Platform`：直接用 [`Platform::current`]，本模块**不再自留一份**。
+//
+// 原先这里有一个 `current_platform()`，逐字重复了 `Platform::current()` 的三分 `cfg!` 链 + `else
+// { Other }`。它是一个**影子产地**：给 `Platform` 加变体时，穷举 `match` 会在全仓报缺臂，而这个
+// `else` 分支照样编译通过、把新平台静默吞进 `Other` —— 加变体这件事想守的东西，正好被它绕开。
+// 2026-09-04 K10 删除。删掉不改任何行为：两份实现在 mac/win/linux 上逐值相同，且
+// `Platform::current()` 现在多认一个 `target_os = "android"`（那正是要修的那条）。
 
 #[cfg(test)]
 mod tests;

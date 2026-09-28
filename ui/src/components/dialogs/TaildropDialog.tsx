@@ -32,7 +32,7 @@ import { taildropAvailability, taildropErrorKey, receivingPercent } from '@/doma
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { cn } from '@/lib/utils';
 import { useAppStore } from '@/store/app-store';
-import { useTaildropTaskStore } from '@/store/use-taildrop-task-store';
+import { useTaildropTaskStore, visibleTaildropTasks } from '@/store/use-taildrop-task-store';
 import { Modal } from './Modal';
 import { Csel, type CselOption } from './Csel';
 import { useDialogStore } from './dialog-store';
@@ -53,18 +53,7 @@ export function TaildropDialog({ serverId }: { serverId: string }) {
   const taskMap = useTaildropTaskStore((s) => s.tasks);
   const applyTaskSnapshot = useTaildropTaskStore((s) => s.applySnapshot);
   const hydrateTaskSnapshots = useTaildropTaskStore((s) => s.hydrateSnapshots);
-  const tasks = useMemo(() => {
-    const all = Object.values(taskMap)
-      .filter((task) => task.serverId === serverId)
-      .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-    const active = all.filter(
-      (task) => task.phase !== 'completed' && task.phase !== 'failed' && task.phase !== 'canceled'
-    );
-    const latestTerminal = all.find(
-      (task) => task.phase === 'completed' || task.phase === 'failed' || task.phase === 'canceled'
-    );
-    return latestTerminal ? [...active, latestTerminal] : active;
-  }, [taskMap, serverId]);
+  const tasks = useMemo(() => visibleTaildropTasks(taskMap, serverId), [taskMap, serverId]);
 
   const [inbox, setInbox] = useState<TaildropInbox>(EMPTY);
   const [loading, setLoading] = useState(false);

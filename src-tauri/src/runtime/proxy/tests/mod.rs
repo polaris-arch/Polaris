@@ -1,4 +1,5 @@
 use super::core_log::*;
+use super::lifecycle::StopClaim;
 use super::*;
 // B4：`process_supervision` / `recovery` 的域内项不经 façade 再导出（façade 不消费它们，
 // 导入即 `unused_imports`），故测试 prelude 直接 glob 这两个 owner 模块。
@@ -35,10 +36,12 @@ use super::recovery::*;
 /// 改动者对新触发点做一次显式决定。
 mod exit_ip_wiring_guard;
 
+mod android_takeover;
 mod core_log;
 mod hot_switch;
 mod lifecycle;
 mod login_fallback;
+mod loopback_egress;
 mod module_boundary;
 mod network_monitor;
 mod network_profile;
@@ -219,10 +222,50 @@ impl SystemProxyClearer for EnableRecordingClearer {
 /// 系统代理清理收口器用**真实生产控制器** + 临时目录 marker 路径（无 marker → 门控 1 即返、零系统
 /// 调用 → 本机安全）。不预置 config.json —— 首次 `current()` 自会建默认配置。
 fn test_runtime_in(dir: PathBuf) -> Arc<ProxyRuntime> {
-    let config = Arc::new(ConfigManager::new(dir.clone()));
     // 替身 helper（恒未装）：见 `HelperRuntime::never_installed_for_tests` —— 用 `new` 会让
     // 下面所有 helper 门的绿取决于跑测机器装没装过 Polaris，且装了会真连特权 daemon。
-    let helper = Arc::new(HelperRuntime::never_installed_for_tests(dir.clone()));
+    test_runtime_in_on(dir.clone(), HelperRuntime::never_installed_for_tests(dir))
+}
+
+/// 同 [`test_runtime_in`]，但把 helper 的**平台**钉成给定值。
+///
+/// `ProxyRuntime` 的接管方式判据全部经 `self.helper.platform()` 分流（见
+/// `HelperRuntime::with_platform_for_tests` 的头注）；不注入平台，「Android 上接管方式恒 TUN」
+/// 这条不变式在本机就只有源码级证据。
+fn test_runtime_on(platform: Platform) -> (Arc<ProxyRuntime>, TestDir) {
+    let dir = fresh_test_dir();
+    let rt = test_runtime_in_on(
+        dir.clone(),
+        HelperRuntime::with_platform_for_tests(dir.clone(), platform),
+    );
+    (rt, dir)
+}
+
+/// 同 [`test_runtime_on`]，但同时注入 [`SystemProxyClearer`] 替身（决不触碰宿主系统代理）。
+fn test_runtime_with_clearer_on(
+    platform: Platform,
+    clearer: Box<dyn SystemProxyClearer>,
+) -> (Arc<ProxyRuntime>, TestDir) {
+    let dir = fresh_test_dir();
+    let config = Arc::new(ConfigManager::new(dir.to_path_buf()));
+    let helper = Arc::new(HelperRuntime::with_platform_for_tests(
+        dir.to_path_buf(),
+        platform,
+    ));
+    let mesh = Arc::new(MeshRuntime::new(dir.to_path_buf()));
+    let rt = Arc::new(ProxyRuntime::new(
+        config,
+        helper,
+        mesh,
+        clearer,
+        Arc::new(NoNetworkDoh),
+    ));
+    (rt, dir)
+}
+
+fn test_runtime_in_on(dir: PathBuf, helper: HelperRuntime) -> Arc<ProxyRuntime> {
+    let config = Arc::new(ConfigManager::new(dir.clone()));
+    let helper = Arc::new(helper);
     let mesh = Arc::new(MeshRuntime::new(dir.clone()));
     let clearer: Box<dyn SystemProxyClearer> =
         Box::new(polaris_system_integration::production_proxy_controller(

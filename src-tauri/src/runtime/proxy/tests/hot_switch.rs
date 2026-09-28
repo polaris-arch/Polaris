@@ -1,5 +1,326 @@
 use super::*;
 
+fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
+    let (rt, dir) = test_runtime();
+    let running = two_node_config(7891, "node-a");
+    rt.config.save_full(&running).expect("seed D");
+    mark_running_with_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let sink = Arc::new(TestPutSink::default());
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    (rt, dir, sink, running)
+}
+
+#[tokio::test]
+async fn explicit_selection_requires_runtime_readback_and_keeps_staged_d_out_of_r() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    rt.switch_snapshot
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .named_rule_by_raw
+        .insert(
+            "rule_set=local-rs-a".into(),
+            RuleIdentity {
+                id: "r1".into(),
+                name: "运行规则".into(),
+            },
+        );
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    disk["logLevel"] = serde_json::json!("debug"); // 模拟另一个已保存未 Apply 的生成字段。
+    disk["trafficRules"] = serde_json::json!([{
+        "id": "r1", "remarks": "未应用名称", "type": "ruleSet",
+        "values": ["res:a"], "action": "proxy", "enabled": true
+    }]);
+    rt.config.save_full(&disk).unwrap();
+    assert_eq!(
+        rt.running_rule_names()["rule_set=local-rs-a"].name,
+        "运行规则"
+    );
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+    let intent = rt.register_selector_intent();
+
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched)
+    );
+    assert_eq!(
+        sink.calls(),
+        vec![(PROXY_SELECTOR_TAG.into(), "Node B".into())]
+    );
+    let runtime = rt.current_config.read().unwrap().clone().unwrap();
+    assert_eq!(runtime["selectedServerId"], "node-b");
+    assert_eq!(runtime["logLevel"], running["logLevel"], "不能夹带完整 D");
+    assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+    assert_eq!(
+        rt.running_rule_names()["rule_set=local-rs-a"].name,
+        "运行规则",
+        "热切与磁盘 D 保存均不可改写运行规则名称快照"
+    );
+    assert!(
+        rt.pending_force_restart.read().unwrap().is_none(),
+        "有效热切不得重启"
+    );
+    assert!(
+        !rt.pending_changes().restart_deferred,
+        "选择债已随 R 提交清除"
+    );
+}
+
+#[tokio::test]
+async fn explicit_direct_sentinel_is_a_clean_runtime_member() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running;
+    disk["selectedServerId"] = serde_json::json!(DIRECT_SERVER_ID);
+    rt.config.save_full(&disk).unwrap();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, DIRECT_TAG)]);
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current(DIRECT_SERVER_ID, intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched),
+        "直连哨兵无需节点指纹，也必须经 proxy-selector 严格读回"
+    );
+    assert_eq!(
+        sink.calls(),
+        vec![(PROXY_SELECTOR_TAG.into(), DIRECT_TAG.into())]
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        DIRECT_SERVER_ID
+    );
+}
+
+#[tokio::test]
+async fn explicit_selection_wrong_or_missing_group_falls_back_to_r_only_restart() {
+    for groups in [
+        Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]),
+        Some(vec![]),
+        None,
+    ] {
+        let (rt, _dir, sink, running) = explicit_selection_fixture();
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!("node-b");
+        disk["logLevel"] = serde_json::json!("debug");
+        rt.config.save_full(&disk).unwrap();
+        *sink.groups.lock().unwrap() = groups;
+        let intent = rt.register_selector_intent();
+
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-b", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Restarting),
+            "错值、缺 selector、读回不可用都不能报已应用"
+        );
+        assert_eq!(
+            rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+            "node-a"
+        );
+        let force = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
+        assert_eq!(force["selectedServerId"], "node-b");
+        assert_eq!(
+            force["logLevel"], running["logLevel"],
+            "fallback 不可夹带 D"
+        );
+        assert!(
+            rt.pending_changes().restart_deferred,
+            "等待重启时选择债可见"
+        );
+        rt.gate.bump_generation(); // 让定时器让位，假核不可真正重启。
+    }
+}
+
+#[tokio::test]
+async fn explicit_selection_superseded_during_put_never_acks_or_restarts() {
+    for stop in [false, true] {
+        let (rt, _dir, sink, running) = explicit_selection_fixture();
+        let mut disk = running.clone();
+        disk["selectedServerId"] = serde_json::json!("node-b");
+        rt.config.save_full(&disk).unwrap();
+        *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+        let owner = Arc::clone(&rt);
+        *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+            if stop {
+                owner.gate.bump_generation();
+                owner.status.write().unwrap().running = false;
+            } else {
+                owner.register_selector_intent();
+            }
+        }));
+        let intent = rt.register_selector_intent();
+
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-b", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Pending)
+        );
+        assert_eq!(
+            rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+            "node-a"
+        );
+        assert!(
+            rt.pending_force_restart.read().unwrap().is_none(),
+            "旧腿不得拉起新核"
+        );
+    }
+}
+
+#[test]
+fn explicit_selection_receipt_rejects_old_pending_and_old_success() {
+    let (rt, _dir, _sink, _running) = explicit_selection_fixture();
+    let generation = rt.core_generation();
+    let old_intent = rt.register_selector_intent();
+    rt.register_selector_intent();
+    for old in [SwitchOutcome::Pending, SwitchOutcome::HotSwitched] {
+        assert_eq!(
+            rt.settle_selected_switch_receipt(Some(old), generation, old_intent),
+            None,
+            "新选择已接管时旧请求既不可报 applied，也不可伪报 pending"
+        );
+    }
+
+    let current_intent = rt.register_selector_intent();
+    rt.gate.claim_generation(None, LifecycleKind::Stop);
+    assert_eq!(
+        rt.settle_selected_switch_receipt(Some(SwitchOutcome::Pending), generation, current_intent),
+        Some(SwitchOutcome::NotRunning),
+        "Stop 已接管时旧排队回执应说明下次启动才生效"
+    );
+}
+
+#[tokio::test]
+async fn explicit_selection_dirty_target_is_deferred_without_put_and_pending_bar_tracks_it() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    disk["servers"][1]["port"] = serde_json::json!(29002);
+    rt.config.save_full(&disk).unwrap();
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Deferred)
+    );
+    assert!(sink.calls().is_empty());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(rt.pending_changes().restart_deferred);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a",
+        "未应用 D 选中 node-b 时，检测读取的 R 仍必须是 node-a"
+    );
+
+    // 用户切回当前运行出口后，选择债由 D/R 真值比较自然清掉；不误清别的 Save 债。
+    rt.config.save_full(&running).unwrap();
+    assert!(!rt.pending_changes().restart_deferred);
+}
+
+#[tokio::test]
+async fn explicit_selection_busy_replays_latest_id_but_stop_discards_it() {
+    let (rt, _dir, _sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    rt.config.save_full(&disk).unwrap();
+    rt.gate.begin();
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    assert!(matches!(
+        rt.pending_switch.read().unwrap().as_ref(),
+        Some((_, PendingSwitch::Selected { server_id, .. })) if server_id == "node-b"
+    ));
+    rt.finish_lifecycle(LifecycleKind::Stop);
+    assert!(rt.pending_switch.read().unwrap().is_none());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn explicit_selection_busy_replays_only_latest_selection_after_start_settles() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    rt.gate.begin();
+    let mut first_disk = running.clone();
+    first_disk["selectedServerId"] = serde_json::json!(DIRECT_SERVER_ID);
+    rt.config.save_full(&first_disk).unwrap();
+    let first_intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current(DIRECT_SERVER_ID, first_intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    rt.config.save_full(&disk).unwrap();
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+    let latest_intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", latest_intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    rt.finish_lifecycle(LifecycleKind::Start);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while sink.calls().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("settle 后须执行最终选择");
+    assert_eq!(
+        sink.calls(),
+        vec![(PROXY_SELECTOR_TAG.into(), "Node B".into())]
+    );
+    assert_eq!(
+        rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+        "node-b"
+    );
+}
+
+#[tokio::test]
+async fn explicit_selection_preserves_existing_apply_snapshot_fields() {
+    let (rt, _dir, sink, running) = explicit_selection_fixture();
+    let mut disk = running.clone();
+    disk["selectedServerId"] = serde_json::json!("node-b");
+    disk["logLevel"] = serde_json::json!("debug");
+    rt.config.save_full(&disk).unwrap();
+    let apply_id = rt.force_restart_seq.fetch_add(1, Ordering::SeqCst);
+    *rt.pending_force_restart.write().unwrap() = Some((apply_id, disk.clone()));
+    rt.gate.set_force_restart(apply_id);
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched)
+    );
+    let (retained_id, pending) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+    assert_eq!(retained_id, apply_id);
+    assert_eq!(pending["selectedServerId"], "node-b");
+    assert_eq!(
+        pending["logLevel"], "debug",
+        "显式 Apply 的其它授权字段必须保留"
+    );
+    assert_eq!(
+        rt.current_config.read().unwrap().as_ref().unwrap()["logLevel"],
+        running["logLevel"]
+    );
+}
+
 /// 起一个只统计「被连了几次」的本地 TCP 监听器（不说 SS 协议——核**拨过来**这一事实本身
 /// 就是路由证据；握手成不成功无关紧要）。
 async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
@@ -340,9 +661,12 @@ fn mark_running_with_snapshot(rt: &ProxyRuntime, cfg: &Value) {
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
         id_to_tag,
         rule_target: BTreeMap::new(),
+        named_rule_by_raw: BTreeMap::new(),
         fingerprints: node_fingerprints::modified_table(&uc.servers),
         dirty_fingerprints: node_fingerprints::dirty_table(&uc.servers),
         probe_pool_ports: vec![],
+        probe_proxy_port: None,
+        loopback_auth: None,
     });
     *rt.current_config.write().unwrap() = Some(cfg.clone());
 }
@@ -1276,7 +1600,9 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
     let gate = body
         .find("if self.gate.is_busy()")
         .expect("lifecycle 判定锚点");
-    let execute = body.find("SwitchExecutor.execute").expect("热切换执行锚点");
+    let execute = body
+        .find("self.execute_hot_switch_plan(&plan, interrupt).await")
+        .expect("热切换执行锚点");
     let commit = body
         .find("self.commit_applied(&new_config)")
         .expect("热切换提交锚点");
@@ -1284,6 +1610,11 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
         gate < execute && execute < commit,
         "锁须覆盖判定、PUT 与 commit 全链路"
     );
+    let helper = method_body(
+        &module_code("runtime/proxy"),
+        "    async fn execute_hot_switch_plan(",
+    );
+    assert!(helper.contains("SwitchExecutor.execute(&api, plan, interrupt).await"));
 }
 
 /// 腿 0（顺序门）：lifecycle 在飞 → Pending 暂存，**即使核看起来没在跑**。
@@ -1405,9 +1736,11 @@ async fn switch_mode_node_switch_falls_back_to_restart_when_grpc_unavailable() {
     let (rt, _dir) = test_runtime();
     let cfg = two_node_config(7891, "node-a");
     mark_running_with_snapshot(&rt, &cfg);
+    let next = two_node_config(7891, "node-b");
+    rt.config.save_full(&next).unwrap();
 
     // mark_running 给的是假 apiPort（19090，无核监听）→ 连不上 → ClientNotReady。
-    let out = rt.switch_mode(two_node_config(7891, "node-b")).await;
+    let out = rt.switch_mode(next).await;
     assert_eq!(
         out,
         SwitchOutcome::Restarting,
@@ -1419,9 +1752,10 @@ async fn switch_mode_node_switch_falls_back_to_restart_when_grpc_unavailable() {
             .unwrap()
             .as_ref()
             .and_then(|c| c.get("selectedServerId").and_then(Value::as_str))
-            == Some("node-b"),
-        "回退重启腿也必须把 current_config 对账到新配置"
+            == Some("node-a"),
+        "重启等待期间 R 必须仍是旧核的选择，不能先把 D 冒充已运行出口"
     );
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-b");
 }
 
 /// 腿 3-重启：改 norm 内字段（mixedPort）→ 结构性变更 → 去抖重启，**不**热切。
@@ -1430,10 +1764,14 @@ async fn switch_mode_norm_field_change_takes_restart_leg() {
     let (rt, _dir) = test_runtime();
     let cfg = two_node_config(7891, "node-a");
     mark_running_with_snapshot(&rt, &cfg);
+    let next = two_node_config(7899, "node-a");
+    rt.config.save_full(&next).unwrap();
 
     // 只改端口（norm 内字段）→ plan_hot_switch 的 norm 前提失败 → kind=None → Restart。
-    let out = rt.switch_mode(two_node_config(7899, "node-a")).await;
+    let out = rt.switch_mode(next).await;
     assert_eq!(out, SwitchOutcome::Restarting, "norm 内字段变更必须走重启");
+    assert_eq!(rt.current_config_snapshot().unwrap()["mixedPort"], 7891);
+    assert_eq!(rt.config.current().unwrap()["mixedPort"], 7899);
 }
 
 // ── P4「保存不重启」（spec §2.5 Q4）：defer_restart 的射程与记账 ──────────────────────
@@ -1541,11 +1879,17 @@ async fn pending_switch_carries_the_defer_restart_intent_across_replay() {
         .read()
         .unwrap()
         .as_ref()
-        .map(|(id, _, _)| *id)
+        .map(|(id, _)| *id)
         .expect("在飞时必须暂存");
-    let (replayed, defer) = rt
+    let PendingSwitch::Config {
+        config: replayed,
+        defer_restart: defer,
+    } = rt
         .take_pending_switch(Some(id))
-        .expect("按 id 认领应取得载荷");
+        .expect("按 id 认领应取得载荷")
+    else {
+        panic!("普通配置广播必须重放 Config 意图");
+    };
     assert_eq!(replayed, cfg, "重放的配置必须逐字节是暂存那份");
     assert!(defer, "「保存不重启」的意图必须跟着载荷一起被取回");
 }
@@ -1558,10 +1902,10 @@ async fn pending_switch_carries_the_defer_restart_intent_across_replay() {
 fn replay_leg_feeds_the_defer_restart_intent_back_into_the_decision() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub(super) fn finish_lifecycle(self: &Arc<Self>, kind: LifecycleKind) {",
+        "    fn apply_lifecycle_end(self: &Arc<Self>, result: LifecycleEndResult, kind: LifecycleKind) {",
     );
     assert!(
-        body.contains("me.switch_mode_with(cfg, defer_restart).await"),
+        body.contains("me.switch_mode_with(config, defer_restart).await"),
         "排空重放必须把取回的意图喂回去；调 switch_mode(cfg) 会静默降级成「保存后仍重启」"
     );
 }
@@ -1580,10 +1924,7 @@ fn deferred_debt_is_cleared_where_the_startup_snapshot_is_written_and_cleared() 
             && started.contains("restart_deferred.store(false"),
         "起核就绪腿必须与写 startup_snapshot 同刻清账 —— 否则核已按新配置起来了，条上还挂着「待应用」"
     );
-    let stopped = method_body(
-        &src,
-        "    pub(super) async fn stop_inner(self: &Arc<Self>) -> Result<bool, String> {",
-    );
+    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
     assert!(
         stopped.contains("restart_deferred.store(false"),
         "停核腿必须复位欠账 —— 否则停核期间挂着一条谈不上「待应用」的提示，且下次起核前无人清"
@@ -1612,18 +1953,12 @@ fn pending_changes_push_is_wired_on_both_sides_of_the_diff() {
         "分子侧（落盘/切节点）必须推 —— 否则改完配置条根本不出现"
     );
     // 分母侧（运行核换了）：start 成功终态 / stop 拆除终态。
-    let started = method_body(
-        &src,
-        "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
-    );
+    let started = method_body(&src, "    pub(super) async fn start_guarded(");
     assert!(
         started.contains("self.push_pending_changes();"),
         "起核就绪腿必须推 —— 否则「立即应用」引发的重启落地后没人告诉 UI 差集已清，条停在「立即应用」"
     );
-    let stopped = method_body(
-        &src,
-        "    pub(super) async fn stop_inner(self: &Arc<Self>) -> Result<bool, String> {",
-    );
+    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
     assert!(
         stopped.contains("self.push_pending_changes();"),
         "停核腿必须推 —— 重启内嵌的这次停核不经命令层，只靠前端 proxyStopped 的 pull 是漏的一半"
@@ -2166,6 +2501,30 @@ async fn real_core_hot_switch_keeps_pid() {
     );
     println!("[③b] 核未重启（pid={pid1}）且流量已改走 Node B → 热切换真的改变了实际路由 ✓");
 
+    // 显式节点命令的新路径：D 保存后只投影 selectedServerId 到 R，必须经真实
+    // GroupsSnapshot 读回才回 HotSwitched，且新连接确实回到 A，PID 仍不变。
+    rt.config.save_full(&cfg_a).expect("显式选 A 落盘");
+    let intent = rt.register_selector_intent();
+    let explicit = rt
+        .switch_selected_server_if_current("node-a", intent)
+        .await
+        .expect("显式选择执行")
+        .expect("本次选择未被接管");
+    assert_eq!(
+        explicit,
+        SwitchOutcome::HotSwitched,
+        "真核严格读回必须确认 A"
+    );
+    assert_eq!(rt.status().pid, pid1, "显式热切不应重启核");
+    hits_a.store(0, Ordering::SeqCst);
+    hits_b.store(0, Ordering::SeqCst);
+    drive_traffic_through_proxy(mixed).await;
+    assert!(
+        hits_a.load(Ordering::SeqCst) > 0,
+        "显式热切后真实流量须回到 A"
+    );
+    assert_eq!(hits_b.load(Ordering::SeqCst), 0, "旧出口 B 不得承接新连接");
+
     // ── ④ norm 内字段（端口）变更 → 走重启，PID 必须变 ──────────────────────
     let mixed2 = free_port();
     let cfg_port = two_node_config_ports(mixed2, "node-b", pa, pb);
@@ -2176,6 +2535,11 @@ async fn real_core_hot_switch_keeps_pid() {
         out,
         SwitchOutcome::Restarting,
         "[④] norm 内字段变更必须走重启腿（热切换切不了端口）"
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["mixedPort"],
+        mixed,
+        "去抖等待期间运行态 R 仍须指向旧核端口"
     );
     let pid2 = wait_pid_change(&rt, pid1, 20)
         .await
@@ -2188,6 +2552,11 @@ async fn real_core_hot_switch_keeps_pid() {
         rt.status().mixed_port,
         mixed2,
         "[④] 重启后必须真的起在新端口上（否则重启是空转）"
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["mixedPort"],
+        mixed2,
+        "timer 须从最新 D 取配置，并在新核 ready 后才提交 R"
     );
     println!("[④] 旧核已退、新核监听 {mixed2} → 重启路径完好 ✓");
 
@@ -3477,7 +3846,8 @@ async fn deferred_tailscale_state_waits_for_main_and_transient_writers_then_retr
             .reserve_tailscale_main_states(
                 &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
             )
-            .await;
+            .await
+            .unwrap();
         mark_running(&rt);
         rt.process_deferred_config_deletions_under_gate(&gate);
         assert!(

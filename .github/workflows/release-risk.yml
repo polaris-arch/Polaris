@@ -27,6 +27,7 @@ jobs:
       platforms: ${{ steps.impact.outputs.platforms }}
       preflight: ${{ steps.impact.outputs.preflight }}
       has_package: ${{ steps.impact.outputs.has_package }}
+      android: ${{ steps.impact.outputs.android }}
       unregistered: ${{ steps.impact.outputs.unregistered }}
     steps:
       - uses: actions/checkout@v7
@@ -84,6 +85,7 @@ jobs:
             echo "platforms=$(jq -c '.platforms' "$result")"
             echo "preflight=$(jq -r '.preflight' "$result")"
             echo "has_package=$(jq -r '.hasPackage' "$result")"
+            echo "android=$(jq -r '.android' "$result")"
             echo "unregistered=$(jq -r '.unregisteredScopes | join(" ")' "$result")"
           } >> "$GITHUB_OUTPUT"
 
@@ -174,9 +176,22 @@ jobs:
       upload_artifacts: false
     secrets: inherit
 
+  # ══ Android APK 腿 ══
+  # 与 preflight / package 并列的第三条选择性腿，判据同源（scripts/classify-ci-impact.mjs 的
+  # ANDROID_IMPACT_SCOPES）。它守的是桌面三条腿结构性看不见的东西：**APK 里到底有什么**
+  # （三份许可文本 / libbox.so 里的 naive+cronet / geo .srs 份数）。
+  #
+  # 不与 package job 合并、也不进 package.yml 的矩阵：步骤面完全不相交，理由写在 android.yml 顶部。
+  # 不给 preflight 加依赖：本腿不读随包桌面内核，preflight 的 fetch/内核门对它零信息。
+  android:
+    name: android apk gate
+    needs: classify
+    if: needs.classify.outputs.android == 'true'
+    uses: ./.github/workflows/android.yml
+
   gate:
     name: release risk gate
-    needs: [classify, preflight, package]
+    needs: [classify, preflight, package, android]
     if: always()
     runs-on: ubuntu-22.04
     env:
@@ -185,6 +200,8 @@ jobs:
       PREFLIGHT_RESULT: ${{ needs.preflight.result }}
       PACKAGE_REQUIRED: ${{ needs.classify.outputs.has_package }}
       PACKAGE_RESULT: ${{ needs.package.result }}
+      ANDROID_REQUIRED: ${{ needs.classify.outputs.android }}
+      ANDROID_RESULT: ${{ needs.android.result }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
     steps:
       - name: Require every selected release-risk leg
@@ -210,4 +227,10 @@ jobs:
             echo "::error::选中的安装包腿未全部通过：$PACKAGE_RESULT"
             exit 1
           fi
-          echo "发布风险门通过：preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT"
+          # Android 腿与上面两条同形：被选中就必须 success，skipped/failure/cancelled 一律红。
+          # 「没被选中」由分类器的登记表负责，而登记根内的未登记 scope 已 fail-closed 成 android=true。
+          if [ "$ANDROID_REQUIRED" = true ] && [ "$ANDROID_RESULT" != success ]; then
+            echo "::error::Android APK 腿未通过：$ANDROID_RESULT"
+            exit 1
+          fi
+          echo "发布风险门通过：preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT"

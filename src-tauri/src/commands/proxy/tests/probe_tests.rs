@@ -155,3 +155,51 @@ fn start_err_response_preserves_structured_code() {
     assert_eq!(r.code.as_deref(), Some(code::HELPER_GATE_ABORTED));
     assert_eq!(r.error.as_deref(), Some("已取消"));
 }
+
+// ── Android 腿：libbox `CheckConfig` 判定 → 探测三态（`probe_check_from_gate`）──
+
+#[test]
+fn gate_verdict_maps_to_probe_tristate() {
+    use polaris_core_supervisor::config_gate::{
+        ConfigCheckVerdict, KernelRejection, RejectedArray,
+    };
+    assert!(matches!(
+        probe_check_from_gate(ConfigCheckVerdict::Accepted),
+        ProbeCheck::Supported
+    ));
+    // 桥不可用 / 超时 ⇒ 无法判定（failOpen），绝不谎报「不支持」。
+    let unavailable = probe_check_from_gate(ConfigCheckVerdict::Unavailable("bridge down".into()));
+    assert!(matches!(unavailable, ProbeCheck::Indeterminate));
+    assert_eq!(probe_verdict(unavailable)["indeterminate"], true);
+
+    // 内核点名了某一项 ⇒ 键路径从那一段拆出来。
+    let rejected = probe_check_from_gate(ConfigCheckVerdict::Rejected(KernelRejection {
+        array: RejectedArray::Outbounds,
+        index: 0,
+        detail: "outbounds[0].obfs: unknown obfs type: bogus".into(),
+    }));
+    match rejected {
+        ProbeCheck::Unsupported(d) => {
+            assert_eq!(d.path.as_deref(), Some("outbounds[0].obfs"));
+            assert_eq!(d.message, "unknown obfs type: bogus");
+        }
+        _ => panic!("Rejected 必须映射成 Unsupported"),
+    }
+
+    // 拆不出下标的原话：带 CLI marker 的走同一个解析器；裸句子不编造键路径。
+    match probe_check_from_gate(ConfigCheckVerdict::Unattributable(
+        "initialize outbound[0]: uTLS is required by reality client".into(),
+    )) {
+        ProbeCheck::Unsupported(d) => assert_eq!(d.path.as_deref(), Some("outbound[0]")),
+        _ => panic!("Unattributable 必须映射成 Unsupported"),
+    }
+    match probe_check_from_gate(ConfigCheckVerdict::Unattributable(
+        "duplicate outbound/endpoint tag: probe".into(),
+    )) {
+        ProbeCheck::Unsupported(d) => {
+            assert_eq!(d.path, None, "非键路径的前缀不得被编成键路径");
+            assert_eq!(d.message, "duplicate outbound/endpoint tag: probe");
+        }
+        _ => panic!("Unattributable 必须映射成 Unsupported"),
+    }
+}

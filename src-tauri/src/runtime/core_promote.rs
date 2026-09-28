@@ -228,18 +228,34 @@ pub fn sidecar_payload_matches(src_dir: &Path, dest_dir: &Path) -> bool {
 
 /// 本平台是否有「受保护核目录」这个概念（= `install-core` 是否可用）。
 ///
-/// **P4 起三平台恒真**：Windows helper 已实现 `install-core`，安装脚本把服务 ImagePath 的
-/// `--singbox` 改指 `C:\ProgramData\Polaris\core\sing-box.exe`（`InstallPaths::win().core_dir`
-/// 派生），核不再走 app 侧用户可写路径。此前 Win 返 `false` 是如实反映「那时确实没有受保护目录」，
-/// 不是保守取舍。
+/// Windows **有**（P4 起）：helper 已实现 `install-core`，安装脚本把服务 ImagePath 的 `--singbox`
+/// 改指 `C:\ProgramData\Polaris\core\sing-box.exe`（`InstallPaths::win().core_dir` 派生），核不再走
+/// app 侧用户可写路径。此前 Win 返 `false` 是如实反映「那时确实没有受保护目录」，不是保守取舍。
 ///
-/// 留着这个恒真谓词而不是删掉调用点：它是「本平台有没有受保护核目录」这个问题的**唯一提问处**，
-/// 新增平台（[`Platform::Other`] 当前按 linux 取路径）时只需在此回答一次；下游
-/// [`reconcile_protected_core`](crate::runtime::proxy) 不必各自 `match` 平台。
+/// Android **无**：核不是磁盘上的文件而是进程内 `.so`，`core_binary_for_start()` 恒 Err、
+/// 整条 helper 起核腿（本谓词唯一的消费者 `startup.rs::reconcile_protected_core`）在该平台不可达。
+/// 写 `true` 会让「有一个 root 锁定的核文件要对账」这句话在一个连核文件都没有的平台上成立。
+///
+/// `Other`（未知平台）**无**（2026-09-05 由 `true` 改）：受保护核目录是 **helper 的产物** —— 它由
+/// root 安装脚本创建、由 helper 的 `install-core` 写入。而 `runtime/helper.rs::platform_supported`
+/// 对 `Other` 恒 `false`（该平台没有 helper 实现），于是 `true` 是一句自相矛盾的话：
+/// 「这个平台没有 helper，但它有一个由 helper 锁定的核目录」。判 `true` 的后果是本谓词唯一的消费者
+/// （`startup.rs::reconcile_protected_core`）在一个连 daemon 都不存在的平台上排一轮 `install-core`
+/// 提升作业。这与 [`polaris_mesh::mesh_system_supported_on_platform`] 那条是同一形状的乐观兜底：
+/// 把「没答过题」读成「答案是有」。
+///
+/// 本谓词与 helper 入口闸严格同向：**`platform_has_protected_core(p)` 蕴含 `platform_supported(p)`**。
+/// P4 之后两者在全部变体上相等；蕴含由 `runtime/helper/tests/mod.rs` 逐变体钉死，防止两处再各自漂。
+///
+/// **穷举 `match` 而非 `matches!`**（2026-09-04 K10）：通配形态下新增平台变体会静默拿到某一边的答案。
 #[must_use]
 pub const fn platform_has_protected_core(platform: Platform) -> bool {
     match platform {
-        Platform::Mac | Platform::Linux | Platform::Win | Platform::Other => true,
+        Platform::Mac | Platform::Linux | Platform::Win => true,
+        // iOS 与 Android/Other 同答 false。本处特有的那半句：iOS 上不存在「受保护核目录」
+        // 的两个前提 —— 既没有 root daemon 去锁定一个目录，也没有独立的核**二进制**可放进去
+        // （核是静态链入 NE 扩展的 `Libbox.xcframework`，随 .ipa 签名分发，不可替换、也无需提升）。
+        Platform::Android | Platform::Ios | Platform::Other => false,
     }
 }
 

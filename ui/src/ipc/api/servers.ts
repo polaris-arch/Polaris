@@ -5,6 +5,7 @@ import type { WarpWireGuardDraft } from '../../domain/warp';
 import type { TailscaleStatusSnapshot } from '../../contracts/tailscale-status';
 import type { TaildropInbox, TaildropSaveResult, TaildropSendResult, TaildropTaskSnapshot } from '../../contracts/taildrop';
 import type { SpeedTestDonePayload, SpeedTestInvokeResult } from '../../contracts/speed-test';
+import type { ServerSwitchReceipt } from '../../contracts/server-switch';
 
 // ============================================================================
 // serverApi
@@ -133,7 +134,7 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILDROP_SAVE, { serverId, name });
   },
 
-  async switch(serverId: string): Promise<void> {
+  async switch(serverId: string): Promise<ServerSwitchReceipt> {
     return invoke(IPC_CHANNELS.SERVER_SWITCH, { serverId });
   },
 
@@ -169,14 +170,14 @@ export const serverApi = {
 
   /** 订阅测速单个节点完成事件（流式增量显示，不等队列）。 */
   onSpeedTestResult(
-    listener: (data: { serverId: string; latency: number }) => void
+    listener: (data: { serverId: string; latency: number; runId?: string }) => void
   ): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT, listener);
   },
 
   /** 订阅测速进度事件（已测/成功/总数）。 */
   onSpeedTestProgress(
-    listener: (data: { tested: number; ok: number; total: number }) => void
+    listener: (data: { tested: number; ok: number; total: number; runId?: string }) => void
   ): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_PROGRESS, listener);
   },

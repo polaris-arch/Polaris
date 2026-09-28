@@ -13,11 +13,10 @@
  * canary 探针的结果，变化时后端发无载荷信号，`useResolvedProbes` 收到即重拉。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import type { NetworkProbeSource, NetworkProfile, ResolvedProbe } from '@/contracts/types';
-import { api } from '@/ipc';
+import type { NetworkProbeSource, NetworkProfile } from '@/contracts/types';
 import { useEffectiveRules } from '@/store/app-store';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import {
@@ -27,7 +26,6 @@ import {
   probeInputsDiffer,
   probeWarningKey,
   profileRowStatus,
-  PROFILE_MATCH_DOT_CLASS,
   PROFILE_MATCH_KEYS,
   profileRefCounts,
   validateNetworkProfileDraft,
@@ -41,6 +39,9 @@ import { InfoIcon } from '@/components/InfoIcon';
 import { useConfig, type UseConfigResult } from '../settings/use-config';
 import { ListEditor } from '../settings/ListEditor';
 import { Segmented, Spinner, Switch, TextInput } from '../settings/Primitives';
+// 取数 hook 与「本机将使用」文案住在零 DOM 依赖的 `.ts` 里，移动端规则屏 import 同一份（见那份文件头注）。
+import { probeDisplayText, useResolvedProbes } from './network-profile-probes';
+import { MatchDot } from './MatchDot';
 
 function ProfileIcon() {
   return (
@@ -50,37 +51,7 @@ function ProfileIcon() {
   );
 }
 
-/**
- * 后端解析后的探测源 + 命中态。`dep` 变了就重拉（场景、代理模式、TUN 配置都会改变解析结果）；
- * 命中态变更信号（`onMatchChanged`，N4）到达时也重拉。
- * 拉不到（IPC 失败 / 后端还没有这条命令 / 返回不是数组）⇒ `null` ⇒ 显示「暂时无法获取」，不猜。
- */
-export function useResolvedProbes(dep: unknown): ResolvedProbe[] | null {
-  const [resolved, setResolved] = useState<ResolvedProbe[] | null>(null);
-  const [matchTick, setMatchTick] = useState(0);
-  useEffect(() => api.networkProfile.onMatchChanged(() => setMatchTick((n) => n + 1)), []);
-  useEffect(() => {
-    let active = true;
-    api.networkProfile
-      .resolvedSources()
-      .then((list) => {
-        if (active) setResolved(Array.isArray(list) ? list : null);
-      })
-      .catch(() => {
-        if (active) setResolved(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [dep, matchTick]);
-  return resolved;
-}
-
-/** 命中态圆点（场景列表行与规则徽标共用）：形状 + 颜色 + 文案三路区分命中 / 未命中 / 未知。 */
-export function MatchDot({ match, label }: { match: ProfileMatch; label: string }) {
-  return <span className={PROFILE_MATCH_DOT_CLASS[match]} role="img" aria-label={label} />;
-}
-
+/** 场景列表行的命中态一行（桌面专用排版；圆点本身与移动端共用 `MatchDot`）。 */
 function MatchLine({ match, t }: { match: ProfileMatch; t: TFunction }) {
   const text = t(PROFILE_MATCH_KEYS[match]);
   return (
@@ -89,25 +60,6 @@ function MatchLine({ match, t }: { match: ProfileMatch; t: TFunction }) {
       {text}
     </div>
   );
-}
-
-const SOURCE_KEY = {
-  system: 'rules.networkProfile.sourceSystem',
-  dhcp: 'rules.networkProfile.sourceDhcp',
-} as const;
-
-/** 「本机将使用：…」一行（表单）与列表行尾的短标签共用的文案。 */
-export function probeDisplayText(display: ProbeDisplay, t: TFunction): string {
-  switch (display.kind) {
-    case 'pending':
-      return t('rules.networkProfile.probePending');
-    case 'unknown':
-      return t('rules.networkProfile.probeUnknown');
-    case 'ok':
-      return t('rules.networkProfile.probeUses', { source: t(SOURCE_KEY[display.source]) });
-    case 'unavailable':
-      return t('rules.networkProfile.probeUnavailable', { reason: t(display.reasonKey) });
-  }
 }
 
 function ProbeLine({ display, t }: { display: ProbeDisplay; t: TFunction }) {

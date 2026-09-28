@@ -284,7 +284,7 @@ async fn via_local_socks_proxy_really_speaks_socks5_to_a_socks_inbound() {
     // 'C'(CONNECT) 而非 0x05 → 上面的 server 直接 return → 请求失败 → 本测试转红。
     // 摘掉 Cargo.toml 的 reqwest `socks` feature → `Proxy::all` 直接 Err → 同样转红。
     let (addr, _targets) = spawn_socks5_server("OK-VIA-SOCKS");
-    let rt = HttpRuntime::via_local_socks_proxy(addr.port())
+    let rt = HttpRuntime::via_local_socks_proxy(addr.port(), None)
         .expect("建经本机 socks 代理 client 不得失败（socks feature 未启用时会在此 Err）");
     // 目标用回环地址：本地解析无需真 DNS，且请求真正落到上面的 socks server 上。
     let r = rt
@@ -304,7 +304,8 @@ async fn via_local_socks_proxy_really_speaks_socks5_to_a_socks_inbound() {
 #[tokio::test]
 async fn via_local_socks_proxy_hands_the_hostname_to_the_proxy_not_the_local_resolver() {
     let (addr, targets) = spawn_socks5_server("OK-REMOTE-DNS");
-    let rt = HttpRuntime::via_local_socks_proxy(addr.port()).expect("建经本机 socks 代理 client");
+    let rt =
+        HttpRuntime::via_local_socks_proxy(addr.port(), None).expect("建经本机 socks 代理 client");
     // `.invalid` 是 RFC 2606 保留 TLD：本机**永远解析不出来**（不碰宿主 DNS、不出网）。
     // 本地解析变体会在这里直接失败；代理端解析变体则把域名原样发给上面的 mock server。
     let r = rt
@@ -374,7 +375,7 @@ async fn direct_guarded_fetch_pins_socket_but_preserves_hostname_header() {
 #[tokio::test]
 async fn proxied_hostname_fake_ip_still_uses_remote_domain_resolution() {
     let (addr, targets) = spawn_socks5_server("OK-FAKEIP-REMOTE");
-    let runtime = HttpRuntime::via_local_socks_proxy(addr.port()).unwrap();
+    let runtime = HttpRuntime::via_local_socks_proxy(addr.port(), None).unwrap();
     let response = safe_redirect_fetch(SafeRedirectFetchOptions {
         fetch_impl: &runtime,
         url: "http://fake-sub.invalid/list",
@@ -450,7 +451,7 @@ async fn via_local_proxy_still_speaks_plain_http_to_an_http_inbound() {
         }
     });
 
-    let rt = HttpRuntime::via_local_proxy(addr.port()).expect("建经本机 http 代理 client");
+    let rt = HttpRuntime::via_local_proxy(addr.port(), None).expect("建经本机 http 代理 client");
     let r = rt
         .fetch("http://example.invalid/probe", &FetchInit::default())
         .await
@@ -465,6 +466,230 @@ async fn via_local_proxy_still_speaks_plain_http_to_an_http_inbound() {
         "http 入站要求绝对 URI 的明文 HTTP 请求行（socks5 会先发 0x05 二进制握手），实得: {:?}",
         first_request.lines().next()
     );
+}
+
+// ── α 批：回环入站凭据（Android 上除 mixed 外的本机入站都要求本次起核的一次性凭据）──────────
+//
+// 构建成功同样说明不了什么（与上面 scheme 配对门同一个理由）：凭据挂没挂上、挂在哪一层，只有
+// 线上字节说得清。两个构造器各起一个真回环服务器，**只认带对凭据的请求**。
+
+fn test_loopback_user() -> InboundUser {
+    InboundUser {
+        username: "polaris".into(),
+        password: "0123456789abcdef0123456789abcdef".into(),
+    }
+}
+
+/// 起一个极小 http 代理：把收到的首个请求头原样回传，然后回 200。
+fn spawn_http_proxy_capturing_request() -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 回环端口");
+    let addr = listener.local_addr().expect("取端口");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = sock.flush();
+        }
+    });
+    (addr, rx)
+}
+
+fn proxy_authorization_of(request: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("proxy-authorization")
+            .then(|| value.trim().to_string())
+    })
+}
+
+/// http 构造器：带凭据 ⇒ 请求里有 `Proxy-Authorization: Basic base64(user:pass)`；不带 ⇒ 一个字都没有。
+///
+/// 变异锁：删掉 `with_local_proxy_url` 里的 `basic_auth` → 正面断言转红。
+#[tokio::test]
+async fn via_local_proxy_presents_the_loopback_credential() {
+    let user = test_loopback_user();
+    let (addr, rx) = spawn_http_proxy_capturing_request();
+    let rt = HttpRuntime::via_local_proxy(addr.port(), Some(&user)).expect("建 client");
+    let r = rt
+        .fetch("http://example.invalid/probe", &FetchInit::default())
+        .await
+        .expect("经 http 代理的请求应成功");
+    assert_eq!(r.status, 200);
+    let request = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("代理应收到请求");
+    let expected = format!(
+        "Basic {}",
+        crate::runtime::mesh::base64_encode(b"polaris:0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(
+        proxy_authorization_of(&request).as_deref(),
+        Some(expected.as_str()),
+        "带凭据的 client 必须发 Proxy-Authorization，实得请求头：{request}"
+    );
+
+    // 反向对照：不带凭据 ⇒ 不发该头（桌面零认证形态不变）。
+    let (addr, rx) = spawn_http_proxy_capturing_request();
+    let rt = HttpRuntime::via_local_proxy(addr.port(), None).expect("建 client");
+    let _ = rt
+        .fetch("http://example.invalid/probe", &FetchInit::default())
+        .await;
+    let request = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("代理应收到请求");
+    assert_eq!(
+        proxy_authorization_of(&request),
+        None,
+        "无凭据时不许发该头：{request}"
+    );
+}
+
+/// 极小 SOCKS5 服务器：**只接受** RFC 1929 用户名/密码（方法 0x02），把收到的方法表与凭据回传；
+/// 客户端不提供 0x02 ⇒ 回 0xFF（无可接受方法）并断开。认证通过后照常 CONNECT 并回 `ok`。
+/// 回传 (客户端提供的方法表, RFC 1929 交出的凭据)。
+type SocksAuthObservation = (Vec<u8>, Option<(String, String)>);
+
+fn spawn_socks5_server_requiring_auth(
+) -> (SocketAddr, std::sync::mpsc::Receiver<SocksAuthObservation>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 回环端口");
+    let addr = listener.local_addr().expect("取端口");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let mut head = [0u8; 2];
+        if sock.read_exact(&mut head).is_err() || head[0] != 0x05 {
+            return;
+        }
+        let mut methods = vec![0u8; head[1] as usize];
+        if sock.read_exact(&mut methods).is_err() {
+            return;
+        }
+        if !methods.contains(&0x02) {
+            let _ = sock.write_all(&[0x05, 0xFF]);
+            let _ = tx.send((methods, None));
+            return;
+        }
+        if sock.write_all(&[0x05, 0x02]).is_err() {
+            return;
+        }
+        // RFC 1929：VER=1, ULEN, UNAME, PLEN, PASSWD。
+        let mut ver_ulen = [0u8; 2];
+        if sock.read_exact(&mut ver_ulen).is_err() || ver_ulen[0] != 0x01 {
+            return;
+        }
+        let mut uname = vec![0u8; ver_ulen[1] as usize];
+        let mut plen = [0u8; 1];
+        if sock.read_exact(&mut uname).is_err() || sock.read_exact(&mut plen).is_err() {
+            return;
+        }
+        let mut passwd = vec![0u8; plen[0] as usize];
+        if sock.read_exact(&mut passwd).is_err() {
+            return;
+        }
+        let creds = (
+            String::from_utf8_lossy(&uname).into_owned(),
+            String::from_utf8_lossy(&passwd).into_owned(),
+        );
+        let _ = tx.send((methods, Some(creds)));
+        if sock.write_all(&[0x01, 0x00]).is_err() {
+            return;
+        }
+        let mut req = [0u8; 4];
+        if sock.read_exact(&mut req).is_err() {
+            return;
+        }
+        let addr_len = match req[3] {
+            0x01 => 4,
+            0x04 => 16,
+            0x03 => {
+                let mut n = [0u8; 1];
+                if sock.read_exact(&mut n).is_err() {
+                    return;
+                }
+                n[0] as usize
+            }
+            _ => return,
+        };
+        let mut rest = vec![0u8; addr_len + 2];
+        if sock.read_exact(&mut rest).is_err() {
+            return;
+        }
+        if sock
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .is_err()
+        {
+            return;
+        }
+        let mut buf = [0u8; 8192];
+        let _ = sock.read(&mut buf);
+        let _ =
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        let _ = sock.flush();
+    });
+    (addr, rx)
+}
+
+/// socks 构造器：带凭据 ⇒ 走 RFC 1929 子协商、交出的正是注入的那一份，请求打通；
+/// 不带 ⇒ 被只收认证的服务器拒掉（订阅/图标经 update-in 在 Android 上就是这个形态）。
+///
+/// 变异锁：删掉 `with_local_proxy_url` 里的 `basic_auth` → 正面断言转红（方法表里没有 0x02）。
+#[tokio::test]
+async fn via_local_socks_proxy_authenticates_with_the_loopback_credential() {
+    let user = test_loopback_user();
+    let (addr, rx) = spawn_socks5_server_requiring_auth();
+    let rt = HttpRuntime::via_local_socks_proxy(addr.port(), Some(&user)).expect("建 client");
+    let r = rt
+        .fetch("http://127.0.0.1:9/sub", &FetchInit::default())
+        .await
+        .expect("带凭据经 socks5 的请求应成功");
+    assert_eq!(r.status, 200);
+    let (methods, creds) = rx.recv_timeout(Duration::from_secs(5)).expect("应收到握手");
+    assert!(
+        methods.contains(&0x02),
+        "必须提供用户名/密码方法，实得 {methods:?}"
+    );
+    assert_eq!(
+        creds,
+        Some((user.username.clone(), user.password.clone())),
+        "交出的凭据必须是注入的那一份"
+    );
+
+    // 反向对照：不带凭据 ⇒ 服务器拒绝，请求失败（证明上面的绿依赖凭据，不是服务器放水）。
+    let (addr, rx) = spawn_socks5_server_requiring_auth();
+    let rt = HttpRuntime::via_local_socks_proxy(addr.port(), None).expect("建 client");
+    let result = rt
+        .fetch("http://127.0.0.1:9/sub", &FetchInit::default())
+        .await;
+    assert!(result.is_err(), "无凭据打要求认证的 socks 入站必须失败");
+    let (methods, creds) = rx.recv_timeout(Duration::from_secs(5)).expect("应收到握手");
+    assert!(
+        !methods.contains(&0x02) && creds.is_none(),
+        "无凭据时不该提供 0x02：{methods:?}"
+    );
+}
+
+/// `Debug` 不泄口令：凭据会随 `LocalHttpProxy` / `SwitchSnapshot` / `GenerateConfigDeps` 的派生
+/// `Debug` 走进任何一条 `{:?}` 日志。正面：用户名在（可定位）；反面：口令不在。
+#[test]
+fn loopback_credential_debug_redacts_the_password() {
+    let user = test_loopback_user();
+    let proxy = crate::runtime::proxy::LocalHttpProxy {
+        port: 31002,
+        auth: Some(user.clone()),
+    };
+    let dbg = format!("{proxy:?}");
+    assert!(
+        dbg.contains("polaris") && dbg.contains("31002"),
+        "Debug 应保留可定位信息：{dbg}"
+    );
+    assert!(!dbg.contains(&user.password), "Debug 泄露了口令：{dbg}");
 }
 
 // ── 下载适配器：纯函数门 ─────────────────────────────────────────────────
@@ -1420,7 +1645,7 @@ async fn warp_json_request_maps_non_2xx_to_err_with_status_and_body() {
 /// **变异锁**：把三个构造器里的 `OnceLock::new()` 换回 `build_warp_client()?` → 第一条断言转红。
 #[test]
 fn warp_client_is_not_built_until_a_warp_request_needs_it() {
-    let rt = HttpRuntime::via_local_proxy(1080).expect("建经代理 client 不得失败");
+    let rt = HttpRuntime::via_local_proxy(1080, None).expect("建经代理 client 不得失败");
     assert!(
         rt.warp_client.get().is_none(),
         "测速热路径的构造器不得顺带建 WARP client"

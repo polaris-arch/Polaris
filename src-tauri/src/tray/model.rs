@@ -61,7 +61,7 @@ pub enum TrayState {
 // 主窗状态栏琥珀点 + 首页降级横幅 + 托盘浮层琥珀点三处都已如实呈现，独缺不接受输入的原生图标那一格。
 // 真要补，前置条件是**后端自己有一份低成本的活态**（例如系统代理接管腿在写侧维护一个带 TTL 的
 // `points_to_us` 缓存，由已有的接管/重申动作顺带刷新），那时本枚举加第五态才只是「加一个分支」。
-// 在那之前，`reconcile_tray_icon` 的无 IO 不变式由 `main.rs` 的
+// 在那之前，`reconcile_tray_icon` 的无 IO 不变式由 `lib.rs` 的
 // `tray_icon_reconcile_stays_io_free` 守住 —— 防的就是有人为了补这一格把 exec 塞进图标腿。
 
 /// 由 proxy 状态快照的三个位折出托盘状态（纯函数，可单测）。

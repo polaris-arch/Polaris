@@ -113,6 +113,11 @@ pub struct ConnectionEntry {
     pub id: String,
     pub chains: Vec<String>,
     pub rule: String,
+    /// 运行核起核快照可证明的用户规则身份；缺席时只展示实际出站类别。
+    #[serde(rename = "ruleId", default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(rename = "ruleName", default, skip_serializing_if = "Option::is_none")]
+    pub rule_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConnectionMetadata>,
     /// 累计上行字节（Connection.uplinkTotal）。
@@ -124,6 +129,12 @@ pub struct ConnectionEntry {
     /// 连接建立时刻（RFC3339，由 createdAt 转换）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleIdentity {
+    pub id: String,
+    pub name: String,
 }
 
 /// 既有活动连接的累计计数。静态字段仍由 [`ConnectionEntry`] 基线/upsert 承载，常态 UPDATE

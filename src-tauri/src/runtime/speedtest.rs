@@ -2323,7 +2323,7 @@ impl TempCoreSession {
         // 理由同主核 spawner（GUI 从 launchd 拉起时父进程 CWD=`/` 只读）。
         req.extra_args = vec!["--disable-color".to_string()];
         req.working_dir = Some(deps.config_dir.clone());
-        let child = match deps.spawner.spawn(req) {
+        let child = match deps.spawner.spawn(req).await {
             Ok(c) => c,
             Err(e) => {
                 retire_temp_config(&config_path, keep_config);

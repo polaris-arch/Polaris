@@ -32,6 +32,7 @@
 //! | macOS | `buildMacUpdateScript`（`hdiutil attach` → `ditto` 暂存 → mv-swap 原子替换 → `xattr -dr`） | 同上 |
 //! | Linux AppImage | `buildLinuxAppImageScript`（覆盖 `$APPIMAGE` + chmod +x） | 同上 |
 //! | Linux deb | `buildLinuxDebScript`（`pkexec apt-get install`） | 同上 |
+//! | Android | **上游没有这一腿**（ 上游 是桌面 Electron 应用） | [`InstallPlatform::Android`]：不生成脚本，经 FileProvider 交系统安装器（`android_bridge::hand_apk_to_system_installer`） |
 //! | 形态错配 | 不强制 root，回退 `shell.openPath` 交系统（`UpdateService.ts:427-436`） | [`InstallReject::FormMismatch`]，command 层回退 `shell.open` |
 
 use std::path::{Path, PathBuf};
@@ -58,6 +59,8 @@ pub enum InstallerKind {
     AppImage,
     /// Linux Debian 包。
     Deb,
+    /// Android 安装包。**它不走脚本腿** —— 落地方式是交系统安装器，见 [`InstallPlatform::Android`]。
+    Apk,
 }
 
 /// 由资产文件名判定形态（**纯函数**）。无法识别 → `None`。
@@ -74,6 +77,8 @@ pub fn classify_installer(file_name: &str) -> Option<InstallerKind> {
         Some(InstallerKind::AppImage)
     } else if lower.ends_with(".deb") {
         Some(InstallerKind::Deb)
+    } else if lower.ends_with(".apk") {
+        Some(InstallerKind::Apk)
     } else {
         None
     }
@@ -89,6 +94,11 @@ pub fn classify_installer(file_name: &str) -> Option<InstallerKind> {
 ///   判据**不是** electron-builder 的 `PORTABLE_EXECUTABLE_FILE`（那是它自解压 stub 注入的，
 ///   Polaris 的便携版是纯 zip、无 stub ⇒ 该 env 恒不存在，成因详见 `is_portable_layout` 文档）。
 /// - macOS：`.app` 恒 Loose（不分形态）。
+/// - **Android：不写具名臂，落 `_ => Installed`，且那个值在 Android 上一次都不会被读**。
+///   Android 应用只有一种形态（由系统包管理器装的），没有「便携 vs 安装态」这个轴；而
+///   [`decide_install_plan`] 的 Android 臂根本不看 `run_form`（交系统安装器与运行形态无关）。
+///   为一个不被消费的值新开一条具名臂，只会让 `platform_dispatch_exhaustive` 的字符串轴登记表
+///   多一条没有信息量的记录。**这不是「忘了答」，这就是答案。**
 ///
 /// ⚠️ **已知边界（未解决，如实登记）**：用户手动删掉 `portable.marker` 后判定退回 Installed，
 /// 该用户会重新被推 NSIS 安装器。方向是失败安全的那一侧（安装器能装、不会砸掉便携副本），
@@ -134,6 +144,16 @@ pub enum InstallPlatform {
     LinuxAppImage,
     /// Linux deb：`pkexec apt-get install` 原位升级。
     LinuxDeb,
+    /// Android：**不生成脚本、不停代理、不退出应用** —— 经 FileProvider 把 APK 交给系统安装器，
+    /// 之后由用户在系统 UI 里决定装不装。
+    ///
+    /// 与另外五种的结构性差别有三条，每条都能单独毁掉一次更新：
+    ///  1. **没有脚本**（[`build_install_script`] 对它返 `None`）：Android 上没有 shell 腿可以
+    ///     替换自己的 APK，替换是系统包管理器的事；
+    ///  2. **不能先停代理**：停代理是为了让替换文件不被占用，而这里根本不替换文件；提前停了，
+    ///     用户在系统确认框上按「取消」之后就只剩一条断掉的隧道；
+    ///  3. **不能退出应用**：交出去 ≠ 装成了。退出等于把「用户还没决定」当成「已经装完」。
+    Android,
 }
 
 /// 安装计划（[`build_install_script`] 的唯一输入）。
@@ -267,6 +287,10 @@ pub fn decide_install_plan(
             }
             Ok(base(InstallPlatform::LinuxDeb))
         }
+        // Android：`run_form` **不参与**（见 `detect_run_form` 文档的 Android 那一条）。
+        // 交系统安装器与应用是怎么装上来的无关，而另外四条腿的 run_form 判据都在回答
+        // 「该原位覆盖还是该跑安装器」——那个问题在 Android 上不存在。
+        ("android", InstallerKind::Apk) => Ok(base(InstallPlatform::Android)),
         _ => Err(mismatch()),
     }
 }
@@ -313,6 +337,19 @@ pub fn install_advisory(plan: &InstallPlan) -> Option<InstallAdvisory> {
         InstallPlatform::Macos => Some(InstallAdvisory::MacosGatekeeper),
         // AppImage 原位覆盖：无签名校验、无提权，装完直接跑 → 无需额外告知。
         InstallPlatform::LinuxAppImage => None,
+        // 🔴 Android **刻意不出 advisory**，而它恰恰是最需要「告知用户下一步」的那个平台 ——
+        // 理由是**判据的分辨率**，不是懒。
+        //
+        // advisory 是一次**预告**：它在动手之前猜「接下来 OS 会拦你」。Windows/macOS 上那个猜
+        // 恒真（没有证书就一定被拦），所以预告是诚实的。Android 上不是：「安装未知应用」是
+        // **按应用**授权且**可能早就给过了**（用户上次更新时授的）。给一个恒定的预告等于对
+        // 一半用户说一句不成立的话，而那正是 `install_advisory` 这个机制最容易腐烂的方向。
+        //
+        // Android 有一个 advisory 拿不到的东西：`canRequestPackageInstalls()` —— 一个**当场可读的
+        // 系统事实**。故这条腿把「要不要引导」推迟到真正交付的那一刻，由 Kotlin 侧按事实决定，
+        // 并把结果作为 `ApkHandoff.reason` 带回来（没授权时它已经把用户送到那一页了）。
+        // 「有真值可读就别猜」——这与本仓「没有登记来源的数据位不许编」是同一条口径。
+        InstallPlatform::Android => None,
     }
 }
 
@@ -400,36 +437,48 @@ impl Default for InstallTexts {
 }
 
 /// 按计划生成安装脚本（**纯函数**：同一 plan 恒得同一字节序列，可快照断言）。
+///
+/// # 为什么返回 `Option`
+///
+/// [`InstallPlatform::Android`] 上**没有脚本这个东西**：落地方式是把 APK 交给系统安装器
+/// （`android_bridge::hand_apk_to_system_installer`），一行 shell 都不跑。
+///
+/// 三种写法里选了 `Option`：`unreachable!()` 会把一个「本该在上游被分流掉」的接线错误变成
+/// 安装路径上的 panic；造一个假的空 `ScriptSpec` 会让调用方 `spawn` 一个空脚本、拿到 rc=0、
+/// 然后如实汇报「安装脚本已起」——一次**静默的**假成功。`None` 是唯一一种让调用方**必须**
+/// 写下「那这里怎么办」的形状。
 #[must_use]
-pub fn build_install_script(plan: &InstallPlan, texts: &InstallTexts) -> ScriptSpec {
+pub fn build_install_script(plan: &InstallPlan, texts: &InstallTexts) -> Option<ScriptSpec> {
     match plan.platform {
+        // 交系统安装器那条腿在 command 层就早退了，走不到这里。真走到了也不许瞎造一个脚本。
+        InstallPlatform::Android => None,
         InstallPlatform::WindowsPortable | InstallPlatform::WindowsSetup => {
             let text = build_windows_vbs(plan, texts);
-            ScriptSpec {
+            Some(ScriptSpec {
                 file_name: "polaris-update.vbs".to_string(),
                 bytes: utf16le_with_bom(&text),
                 program: "wscript.exe".to_string(),
                 leading_args: vec![],
-            }
+            })
         }
-        InstallPlatform::Macos => ScriptSpec {
+        InstallPlatform::Macos => Some(ScriptSpec {
             file_name: "polaris-update.sh".to_string(),
             bytes: build_mac_script(plan).into_bytes(),
             program: "/bin/bash".to_string(),
             leading_args: vec![],
-        },
-        InstallPlatform::LinuxAppImage => ScriptSpec {
+        }),
+        InstallPlatform::LinuxAppImage => Some(ScriptSpec {
             file_name: "polaris-update.sh".to_string(),
             bytes: build_linux_appimage_script(plan).into_bytes(),
             program: "/bin/bash".to_string(),
             leading_args: vec![],
-        },
-        InstallPlatform::LinuxDeb => ScriptSpec {
+        }),
+        InstallPlatform::LinuxDeb => Some(ScriptSpec {
             file_name: "polaris-update.sh".to_string(),
             bytes: build_linux_deb_script(plan).into_bytes(),
             program: "/bin/bash".to_string(),
             leading_args: vec![],
-        },
+        }),
     }
 }
 

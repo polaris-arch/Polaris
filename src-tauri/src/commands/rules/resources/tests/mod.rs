@@ -6,4 +6,4 @@ mod resource_download_tests;
 
 mod catalog_tests;
 
-mod builtin_update_tests;
+mod manual_update_tests;

@@ -36,10 +36,7 @@ fn lifecycle_push_is_paired_with_the_diff_push() {
     let src = module_code("runtime/proxy");
     const DIFF: &str = "self.push_pending_changes();";
 
-    let started = method_body(
-        &src,
-        "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
-    );
+    let started = method_body(&src, "    pub(super) async fn start_guarded(");
     assert!(
         line_immediately_followed_by(
             &started,
@@ -49,10 +46,7 @@ fn lifecycle_push_is_paired_with_the_diff_push() {
         "起核就绪腿：`ready` 必须紧跟差集 PUSH —— 两者描述同一次跃迁，拆开即引入可分叉的第二个时点"
     );
 
-    let stopped = method_body(
-        &src,
-        "    pub(super) async fn stop_inner(self: &Arc<Self>) -> Result<bool, String> {",
-    );
+    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
     assert!(
         line_immediately_followed_by(
             &stopped,
@@ -62,10 +56,7 @@ fn lifecycle_push_is_paired_with_the_diff_push() {
         "停核拆除腿：`stopped` 必须紧跟差集 PUSH（与起核腿严格对偶）"
     );
 
-    let start_wrap = method_body(
-        &src,
-        "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
-    );
+    let start_wrap = method_body(&src, "    pub(super) async fn start_guarded(");
     assert!(
         start_wrap.contains("if let Err(e) = &r {")
             && start_wrap.contains("self.push_lifecycle(&ProxyLifecycleEvent::failed(e));"),
@@ -94,10 +85,7 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
         !inner.contains("self.push_lifecycle(&ProxyLifecycleEvent::ready());"),
         "start_inner 尚未归还 starting 计数，不得提前发布 ready"
     );
-    let started = method_body(
-        &src,
-        "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
-    );
+    let started = method_body(&src, "    pub(super) async fn start_guarded(");
     let inner_return = started
         .find("let r = self.start_inner(config, my_gen).await;")
         .expect("start 包装必须等待 start_inner 完整事务");
@@ -113,10 +101,10 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
     );
 }
 
-/// 活态查询的模式必须取 `startup_snapshot` 这份**运行核快照**，不能取结构重启去抖前已被
-/// `apply_restart` 前推的新 `current_config`。
+/// 活态查询的模式必须取 `startup_snapshot` 这份**运行核快照**。即使出现其它来源造成的
+/// current_config 与已启动核分叉，也不能让磁盘/待应用的新模式覆盖实际运行模式。
 #[test]
-fn running_proxy_mode_type_tracks_the_running_snapshot_only() {
+fn running_effective_proxy_mode_type_tracks_the_running_snapshot_only() {
     let (rt, _dir) = test_runtime();
     mark_running(&rt);
     for (mode, expected) in [
@@ -130,24 +118,24 @@ fn running_proxy_mode_type_tracks_the_running_snapshot_only() {
             "proxyMode": "smart",
             "proxyModeType": mode,
         }));
-        // 精确复现结构切换窗口：current_config 已提交成相反的新模式，旧核仍按 startup snapshot 跑。
+        // 注入运行态账本意外分叉，确认活态模式仍由起核快照提供。
         *rt.current_config.write().unwrap() = Some(serde_json::json!({
             "servers": [],
             "selectedServerId": "__direct__",
             "proxyMode": "smart",
             "proxyModeType": if mode == "systemProxy" { "tun" } else { "systemProxy" },
         }));
-        assert_eq!(rt.running_proxy_mode_type(), Some(expected));
+        assert_eq!(rt.running_effective_proxy_mode_type(), Some(expected));
     }
     *rt.startup_snapshot.write().unwrap() = None;
     assert_eq!(
-        rt.running_proxy_mode_type(),
+        rt.running_effective_proxy_mode_type(),
         None,
-        "核在跑但无起核快照时必须返回 unknown，不能回落到已前推的 current_config"
+        "核在跑但无起核快照时必须返回 unknown，不能回落到 current_config"
     );
     *rt.status.write().unwrap() = ProxyStatus::default();
     assert_eq!(
-        rt.running_proxy_mode_type(),
+        rt.running_effective_proxy_mode_type(),
         None,
         "核未运行时不得把残留 current_config 冒充运行模式"
     );
@@ -278,7 +266,13 @@ async fn restart_replays_pending_switch_via_outer_lifecycle_wrapper() {
     // 暂存一条 switch（核未运行 → 重放的 switch_mode 走 NotRunning 分支落 current_config，无真核、可观测）。
     let switch_cfg = serde_json::json!({ "servers": [], "selectedServerId": "__direct__", "marker": "replayed" });
     let id = rt.switch_seq.fetch_add(1, Ordering::SeqCst);
-    *rt.pending_switch.write().unwrap() = Some((id, switch_cfg.clone(), false));
+    *rt.pending_switch.write().unwrap() = Some((
+        id,
+        PendingSwitch::Config {
+            config: switch_cfg.clone(),
+            defer_restart: false,
+        },
+    ));
     rt.gate.set_switch_pending(id);
 
     let _ = rt.restart(bad_config()).await; // start 腿坏配置快速失败，不 spawn。
@@ -661,10 +655,7 @@ async fn unsuperseded_stop_completes_the_whole_teardown() {
 #[test]
 fn stop_teardown_yields_after_every_await() {
     let src = module_code("runtime/proxy");
-    let body = method_body(
-        &src,
-        "    pub(super) async fn stop_inner(self: &Arc<Self>) -> Result<bool, String> {",
-    );
+    let body = method_body(&src, "    pub(super) async fn stop_inner(");
     let mut marks: Vec<(usize, &str)> = body
         .match_indices(".await")
         .map(|(i, _)| (i, "await"))
@@ -701,6 +692,202 @@ async fn restart_stop_leg_does_not_clear_system_proxy() {
         1,
         "无旧运行快照的 restart 全程恰一次清（来自 start 失败腿）；共用 stop_inner 不得无条件清"
     );
+    assert_eq!(rt.gate.depth(), 0, "正常重启失败腿也必须归还外层门深度");
+}
+
+#[tokio::test]
+async fn restart_stop_leg_taken_over_by_user_stop_never_starts() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let (acquired, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let holder = {
+        let (mesh, acquired, release) = (
+            Arc::clone(&rt.mesh),
+            Arc::clone(&acquired),
+            Arc::clone(&release),
+        );
+        tokio::spawn(async move {
+            mesh.occupy_exit_route_lock_for_test(acquired, release)
+                .await;
+        })
+    };
+    acquired.notified().await;
+    let initial = rt.gate.generation();
+    let restart = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.restart(bad_config()).await })
+    };
+    let mut spins = 0;
+    while rt.gate.generation() == initial {
+        tokio::task::yield_now().await;
+        spins += 1;
+        assert!(spins < 10_000, "旧 restart 未进入停核腿");
+    }
+    let restart_stop = rt.gate.generation();
+    let user_stop = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.stop().await })
+    };
+    while rt.gate.generation() == restart_stop {
+        tokio::task::yield_now().await;
+        spins += 1;
+        assert!(spins < 20_000, "用户 stop 未接管旧 restart");
+    }
+    let user_stop_generation = rt.gate.generation();
+    release.notify_one();
+    holder.await.unwrap();
+    user_stop.await.unwrap().unwrap();
+    let result = restart.await.unwrap().unwrap();
+    assert!(!result.running);
+    assert_eq!(
+        rt.gate.generation(),
+        user_stop_generation,
+        "旧 restart 不得再领 start 世代"
+    );
+    assert_eq!(rt.gate.depth(), 0);
+}
+
+#[tokio::test]
+async fn stop_between_restart_legs_rejects_guarded_start() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let stop_generation = rt
+        .stop_inner(StopClaim::Request(None))
+        .await
+        .unwrap()
+        .unwrap();
+    rt.stop().await.unwrap();
+    let newer_stop = rt.gate.generation();
+    assert!(matches!(
+        rt.start_guarded(bad_config(), Some(stop_generation)).await,
+        StartLeg::Superseded
+    ));
+    assert_eq!(rt.gate.generation(), newer_stop);
+    assert_eq!(rt.gate.depth(), 0);
+}
+
+#[tokio::test]
+async fn obsolete_restart_waiting_for_tailscale_gate_does_not_enter_start_leg() {
+    for newer in [LifecycleKind::Stop, LifecycleKind::Start] {
+        let (rt, _dir) = test_runtime();
+        // The fixture does not need a real process sweep; the outcome and lexical gate below
+        // together prove the obsolete request returns before that side-effecting call.
+        rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+        let expected = rt.gate.generation();
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let old = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move { rt.start_guarded(bad_config(), Some(expected)).await })
+        };
+        for _ in 0..1000 {
+            if rt.start_inflight.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rt.start_inflight.load(Ordering::SeqCst), 1);
+        assert!(rt.gate.claim_generation(None, newer).is_some());
+        drop(gate);
+        assert!(matches!(old.await.unwrap(), StartLeg::Superseded));
+        assert_eq!(rt.gate.depth(), 0);
+    }
+}
+
+#[tokio::test]
+async fn explicit_start_waiting_for_tailscale_gate_yields_to_later_user_stop() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let old_start = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.start(bad_config()).await })
+    };
+    for _ in 0..1000 {
+        if rt.start_inflight.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(rt.start_inflight.load(Ordering::SeqCst), 1);
+    let start_generation = rt.gate.generation();
+    let new_stop = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.stop().await })
+    };
+    for _ in 0..1000 {
+        if rt.gate.generation() > start_generation {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let stop_generation = rt.gate.generation();
+    assert!(
+        stop_generation > start_generation,
+        "stop must claim before waiting"
+    );
+    drop(gate);
+    new_stop.await.unwrap().unwrap();
+    assert!(!old_start.await.unwrap().unwrap().running);
+    assert_eq!(rt.gate.generation(), stop_generation);
+    assert!(!rt.status().running);
+}
+
+#[tokio::test]
+async fn later_explicit_start_owns_generation_while_earlier_start_waits() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let first = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.start(bad_config()).await })
+    };
+    for _ in 0..1000 {
+        if rt.start_inflight.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let first_generation = rt.gate.generation();
+    let second = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.start(bad_config()).await })
+    };
+    for _ in 0..1000 {
+        if rt.gate.generation() > first_generation {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let second_generation = rt.gate.generation();
+    assert!(second_generation > first_generation);
+    drop(gate);
+    assert!(
+        first.await.unwrap().is_ok(),
+        "old request yields current status"
+    );
+    assert!(
+        second.await.unwrap().is_err(),
+        "latest request must reach its bad-config validation"
+    );
+    assert_eq!(rt.gate.generation(), second_generation);
+}
+
+#[tokio::test]
+async fn delayed_debounced_restart_cannot_start_after_stop() {
+    let (rt, _dir) = test_runtime();
+    let scheduled_generation = rt.gate.generation();
+    rt.stop().await.unwrap();
+    let stopped_generation = rt.gate.generation();
+    let result = rt
+        .restart_guarded(bad_config(), Some(scheduled_generation))
+        .await
+        .unwrap();
+    assert!(!result.running);
+    assert_eq!(rt.gate.generation(), stopped_generation);
+    assert_eq!(rt.gate.depth(), 0);
 }
 
 /// 接线门：纯真值表必须落在 `stop_inner` 之后、`start` 之前，并与 stop 的所有权返回值合取。
@@ -708,23 +895,26 @@ async fn restart_stop_leg_does_not_clear_system_proxy() {
 /// 仍带着旧 OS 代理。行为逻辑由 `restart_system_proxy_cleanup_truth_table` 覆盖，这里只钉调用位置。
 #[test]
 fn restart_cross_mode_proxy_cleanup_is_owned_and_between_legs() {
-    let body = method_body(
-        &module_code("runtime/proxy"),
-        "    async fn restart_inner(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
-    );
-    let stop = body
-        .find("let stop_completed = self.stop_inner().await?;")
+    let body = method_body(&module_code("runtime/proxy"), "    async fn restart_inner(");
+    let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let stop = compact
+        .find("letstop_generation=matchself.stop_inner(StopClaim::Request(expected_generation)).await{")
         .unwrap();
-    let clear = body
-        .find("if stop_completed && should_clear_system_proxy_between_restart(old_mode, new_mode)")
+    let clear = compact
+        .find("ifshould_clear_system_proxy_between_restart(old_mode,new_mode,platform)")
+        .expect(
+            "跨模式代理收口必须调 `should_clear_system_proxy_between_restart`，\
+             且把**平台**一并喂进去（该谓词按本平台生效值判断，见其文档）",
+        );
+    let start = compact
+        .find("self.start_guarded(config,Some(stop_generation)).await")
         .unwrap();
-    let start = body.find("self.start(config).await").unwrap();
     assert!(
         stop < clear && clear < start,
         "跨模式代理收口必须位于 owned stop 与新 start 之间；实际方法体：\n{body}"
     );
     assert!(
-        body[clear..start].contains("self.clear_system_proxy().await;"),
+        compact[clear..start].contains("self.clear_system_proxy().await;"),
         "判定命中后必须复用 marker 门控的统一清理点；实际方法体：\n{body}"
     );
 }
@@ -799,6 +989,8 @@ async fn real_core_full_lifecycle() {
                             id: conn.id.clone(),
                             chains: conn.chain_list.clone(),
                             rule: conn.rule.clone(),
+                            rule_id: None,
+                            rule_name: None,
                             metadata: None,
                             upload: Some(conn.uplink_total as u64),
                             download: Some(conn.downlink_total as u64),
@@ -1614,7 +1806,7 @@ async fn old_stop_waiting_for_tailscale_gate_preserves_new_generation_owner() {
     let gate = rt.mesh.tailscale_state_gate().await;
     let old_generation = rt.gate.generation();
     let rt2 = rt.clone();
-    let stop = tokio::spawn(async move { rt2.stop_inner().await });
+    let stop = tokio::spawn(async move { rt2.stop_inner(StopClaim::Request(None)).await });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while rt.gate.generation() == old_generation {
             tokio::task::yield_now().await;
@@ -1623,10 +1815,10 @@ async fn old_stop_waiting_for_tailscale_gate_preserves_new_generation_owner() {
     .await
     .unwrap();
     rt.bump_generation();
-    rt.mesh.reserve_tailscale_main_states(&serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":dir.join("tailscale/new-session")}]})).await;
+    rt.mesh.reserve_tailscale_main_states(&serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":dir.join("tailscale/new-session")}]})).await.unwrap();
     mark_running(&rt);
     drop(gate);
-    assert!(!stop.await.unwrap().unwrap());
+    assert!(stop.await.unwrap().unwrap().is_none());
     assert!(rt.status().running);
     assert!(rt.mesh.main_owns_tailscale("new-session", true));
 }
@@ -1646,21 +1838,28 @@ fn tailscale_state_remains_owned_during_helper_start_before_pid_publication() {
 #[test]
 fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
     let src = module_code("runtime/proxy");
-    let start = method_body(&src, "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {");
-    let gate = start
+    let start = method_body(&src, "    pub(super) async fn start_guarded(");
+    let compact: String = start.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let gate = compact
         .find("self.mesh.tailscale_state_gate().await")
         .unwrap();
-    let sweep = start.find("self.cleanup_stale_cores().await").unwrap();
-    let inner = start
-        .find("self.start_inner(config, my_gen).await")
+    let sweep = compact.find("self.cleanup_stale_cores().await").unwrap();
+    let early_fence = compact
+        .find("self.gate.generation()!=requested_generation")
+        .unwrap();
+    let inner = compact
+        .find("self.start_inner(config,my_gen).await")
         .unwrap();
     assert!(
-        gate < sweep && sweep < inner,
+        gate < early_fence && early_fence < sweep && sweep < inner,
         "primary start must hold the shared gate across cleanup and spawn"
     );
+    let claim = compact
+        .find("self.claim_generation(Some(requested_generation),LifecycleKind::Start)")
+        .unwrap();
     assert!(
-        start[gate..sweep].contains("self.gate.generation() != my_gen"),
-        "old start may not clean up a newer generation after waiting"
+        sweep < claim && claim < inner,
+        "restart must claim its generation after slow cleanup and before spawn"
     );
     let inner = method_body(&src, "    pub(super) async fn start_inner(");
     let reservation = inner.find("reserve_tailscale_main_states").unwrap();

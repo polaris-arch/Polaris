@@ -353,6 +353,23 @@ export interface RuleSubject extends RulePreset {
   readonly detail?: string;
 }
 
+/**
+ * 把一个**显示名**（拓扑图的图元名 / 主机 Top 的行名 —— 两处都是「host > destinationIP > rule」
+ * 那条回落链的产物）判成一个可写进规则的观测对象。判不出来返回 `null`（那一行没有规则入口）。
+ *
+ * **先判 IP 再判域名**，顺序是判据的一部分而不是风格：`DOMAIN_RE` 接受 `1.2.3.4`
+ * （它确实可能是 `1.2.3.4.nip.io` 那类真实域名的前缀形状，故有意不拒），反过来判会把一个
+ * 纯 IP 字面量写成 `domain` 规则 —— 界面上显示的是 IP，落进配置的却是一条永不命中的域名规则。
+ *
+ * 抽在这里而不是各调用点各写一遍：桌面首页拓扑图与移动端首页主机 Top 是同一条判据的两个消费方，
+ * 两份同义实现会各自漂移，且漂了不会红。
+ */
+export function ruleSubjectForValue(value: string): RuleSubject | null {
+  if (validateRuleValue('ipCidr', value)) return { kind: 'ip', type: 'ipCidr', value };
+  if (validateRuleValue('domain', value)) return { kind: 'domain', type: 'domain', value };
+  return null;
+}
+
 /** 类型 → 分类（**派生自描述符表**，勿另立第二张表）。 */
 export const RULE_TYPE_CATEGORY: Record<RuleType, RuleCategory> = Object.fromEntries(
   RULE_TYPE_IDS.map((id) => [id, RULE_TYPES[id].category])

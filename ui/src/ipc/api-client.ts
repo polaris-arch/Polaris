@@ -32,7 +32,7 @@ import { vpnApi } from './api/vpn';
 import { rulesApi, ruleResourcesApi, iconApi } from './api/rules';
 import { logsApi, diagnosticApi } from './api/logs';
 import { statsApi, connectionsApi } from './api/stats';
-import { autoStartApi, systemApi, windowApi, helperApi, appApi } from './api/system';
+import { autoStartApi, systemApi, systemBackupApi, windowApi, helperApi, appApi } from './api/system';
 import { versionApi, updateApi, coreUpdateApi } from './api/updater';
 import { subscriptionApi, localImportApi, backupApi } from './api/subscriptions';
 import { ipInfoApi } from './api/ip-info';
@@ -66,6 +66,7 @@ export const api = {
   networkProfile: networkProfileApi,
   logs: logsApi,
   autoStart: autoStartApi,
+  systemBackup: systemBackupApi,
   stats: statsApi,
   connections: connectionsApi,
   system: systemApi,

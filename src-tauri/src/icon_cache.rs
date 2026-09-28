@@ -557,7 +557,7 @@ fn status_response(code: u16, msg: &str) -> tauri::http::Response<Vec<u8>> {
         .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
 }
 
-/// `polaris-icon` scheme 处理入口（main.rs 的 `register_asynchronous_uri_scheme_protocol` 委托到此）。
+/// `polaris-icon` scheme 处理入口（lib.rs 的 `register_asynchronous_uri_scheme_protocol` 委托到此）。
 ///
 /// 缓存路由同步读盘即应答；远端路由 spawn 到 tauri async runtime 拉取后应答（不阻塞 webview）。
 pub fn handle_scheme_request<R: Runtime>(
@@ -615,6 +615,8 @@ pub fn handle_scheme_request<R: Runtime>(
                 .and_then(|c| c.get("mainSessionViaProxy").and_then(Value::as_bool));
             let (via_proxy, port) =
                 resolve_update_proxy_target(status.running, msvp, status.update_in_port);
+            // Android 上 update-in 要求本次起核的一次性凭据（桌面 `None`）；与端口同一次起核的产物。
+            let loopback_auth = rt.proxy().loopback_auth();
             let direct = rt.http().clone();
             // async 闭包仅捕获 owned 值（client/remote_url/responder），不借用 rt/app → 无生命周期冲突。
             tauri::async_runtime::spawn(async move {
@@ -623,7 +625,7 @@ pub fn handle_scheme_request<R: Runtime>(
                 // 此前误用 `via_local_proxy`（`http://`）→ 首字节对不上必断连 → 经代理取图标恒失败
                 // （被下面的 502 分支吞成「图标取不到」，看不出是 scheme 错）。
                 let proxied: Option<Arc<HttpRuntime>> = if via_proxy {
-                    match HttpRuntime::via_local_socks_proxy(port) {
+                    match HttpRuntime::via_local_socks_proxy(port, loopback_auth.as_ref()) {
                         Ok(c) => Some(Arc::new(c)),
                         Err(e) => {
                             // warn 而非 debug：默认级别是 INFO ⇒ 用户看到的是「一片空白图标」，

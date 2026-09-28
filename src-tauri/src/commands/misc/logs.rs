@@ -11,6 +11,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_shell::ShellExt;
 
+use crate::commands::picked_file::{
+    classify, display_of, with_picked_gateway, write_picked, FileGateway, FilePath, PickedTarget,
+};
 use crate::i18n::{key, t};
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::AppRuntime;
@@ -683,10 +686,24 @@ pub async fn logs_archive_legacy(
         .save_file(move |path| {
             let _ = tx.send(path);
         });
-    let Some(destination) = rx.await.ok().flatten().and_then(|p| p.into_path().ok()) else {
+    // 本条腿要的不是「那个文件」，而是**那个文件所在的目录**：归档事务是同目录临时文件 +
+    // `sync_all` + 复核源文件未变 + 同目录 `rename` 提交（见 `archive_legacy_log`）。
+    // content URI 上没有目录、没有 rename，这个事务结构性地表达不出来 ⇒ 本批**不**给它接
+    // URI 腿，但也**不再**让它掉进 `.ok()` 那条静默路：URI 目标当场报错，与真取消分得开。
+    //
+    // 射程如实登记：这不是「Android 上归档旧日志已支持」。今天它在 Android 上够不着 ——
+    // `LEGACY_SINGBOX_LOG` 是 W26 之前的桌面遗留文件，移动端从来没有产生过它，
+    // 上面那个 `source.is_file()` 早退在真机上恒成立，保存框根本不会弹。
+    let Some(destination) = rx.await.ok().flatten() else {
         return Ok(ApiResponse::ok(
             json!({ "success": false, "error": "cancelled" }),
         ));
+    };
+    let PickedTarget::Path(destination) = classify(&destination) else {
+        return Ok(ApiResponse::ok(json!({
+            "success": false,
+            "error": "archive destination must be a local path (content URI has no directory to commit into)",
+        })));
     };
     let destination_for_task = destination.clone();
     let archived =
@@ -811,6 +828,28 @@ fn archive_legacy_log(source: &Path, destination: &Path) -> Result<u64, String> 
     Ok(copied)
 }
 
+/// 导出腿的**落盘段** —— 保存框回话之后的全部逻辑，`diagnostic_export` 与 `logs_export` 共用。
+///
+/// 抽出来的唯一理由是**可测**：整条命令带 `AppHandle` / `State<AppRuntime>`，本仓未在 lib 单测里
+/// 引 `tauri::test`，单测一行都调不动。有了这道缝，content-URI 往返门才能把
+/// `FilePath::Url("content://…")` 真的喂进导出路径，断言它**不落 `cancelled`**、并且字节真的写出去了；
+/// 负侧同理喂 `file:` 目标，断言网关一次都没被碰过（桌面仍走 `std::fs`）。
+///
+/// `picked` 为 `None` **只在用户真的按了取消时出现** —— 那正是本批修掉的那条歧义：
+/// 改动前 `content:` 目标会被 `into_path().ok()` 吃成 `None`，与真取消不可分。
+fn finish_export(gateway: &dyn FileGateway, picked: Option<FilePath>, body: &str) -> Value {
+    let Some(target) = picked else {
+        return json!({ "success": false, "error": "cancelled" });
+    };
+    if let Err(e) = write_picked(gateway, &target, body.as_bytes()) {
+        return json!({ "success": false, "error": format!("{e}") });
+    }
+    json!({
+        "success": true,
+        "filePath": display_of(&target),
+    })
+}
+
 // ── sing-box 官方面板 ── Polaris helper-handlers dashboard 部分 ──
 
 #[tauri::command]
@@ -833,6 +872,17 @@ pub async fn diagnostic_export(
 
     let dir = state.config().dir().to_path_buf();
     let app_log_tail = read_managed_tail(&dir.join("logs").join("polaris.log"), LOG_TAIL_BYTES);
+    #[cfg(all(target_os = "android", debug_assertions))]
+    let app_log_tail = {
+        let native = crate::runtime::proxy::android_bridge::collect_debug_diagnostics()
+            .await
+            .unwrap_or_else(|error| error);
+        // 原生日志与已有应用日志走同一份凭据/节点身份脱敏，不能在最终报告外追加原文。
+        format!(
+            "{app_log_tail}\n\n--- Android Debug diagnostics ---\n{}",
+            polaris_stats_engine::redact::redact_log_secrets(&native)
+        )
+    };
     let singbox_log_tail = read_core_log_tail(&dir, LOG_TAIL_BYTES);
 
     let status = state.proxy().status();
@@ -924,33 +974,61 @@ pub async fn diagnostic_export(
     };
     let markdown = polaris_stats_engine::assemble_diagnostic_report(&source);
 
-    let default_name = format!("polaris-diagnostic-{}.md", today_yyyy_mm_dd());
-    let lang = crate::i18n::app_lang(&app);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .set_title(t(lang, key::NATIVE_DIAGNOSTIC_EXPORT_TITLE))
-        .set_file_name(&default_name)
-        // "Markdown" 是格式名不是文案（五语种同名），刻意不进 locale。
-        .add_filter("Markdown", &["md"])
-        .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"])
-        .save_file(move |p| {
-            let _ = tx.send(p);
-        });
-    let Some(path) = rx.await.ok().flatten().and_then(|p| p.into_path().ok()) else {
+    #[cfg(all(target_os = "android", debug_assertions))]
+    {
         return Ok(ApiResponse::ok(
-            json!({ "success": false, "error": "cancelled" }),
-        ));
-    };
-    if let Err(e) = std::fs::write(&path, markdown) {
-        return Ok(ApiResponse::ok(
-            json!({ "success": false, "error": format!("{e}") }),
+            match crate::runtime::proxy::android_bridge::share_debug_report(markdown).await {
+                Ok(()) => json!({ "success": true, "shared": true }),
+                Err(error) => json!({ "success": false, "error": error }),
+            },
         ));
     }
-    Ok(ApiResponse::ok(json!({
-        "success": true,
-        "filePath": path.to_string_lossy(),
-    })))
+
+    #[cfg(not(all(target_os = "android", debug_assertions)))]
+    {
+        let default_name = format!("polaris-diagnostic-{}.md", today_yyyy_mm_dd());
+        let lang = crate::i18n::app_lang(&app);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .file()
+            .set_title(t(lang, key::NATIVE_DIAGNOSTIC_EXPORT_TITLE))
+            .set_file_name(&default_name)
+            // "Markdown" 是格式名不是文案（五语种同名），刻意不进 locale。
+            .add_filter("Markdown", &["md"])
+            .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"])
+            .save_file(move |p| {
+                let _ = tx.send(p);
+            });
+        // 不再 `.and_then(|p| p.into_path().ok())`：Android SAF 交回的是 `FilePath::Url(content://…)`，
+        // `into_path()` 对它恒 Err，`.ok()` 会把它吃成 None ⇒ 与「用户按了取消」不可分（W-18）。
+        let picked = rx.await.ok().flatten();
+        // URI 支的插件 I/O 是同步阻塞的，且上游拿不到 fd 时会 panic ⇒ 必须经
+        // `with_picked_gateway`（桌面那一支仍原地跑，见该函数文档）。
+        Ok(ApiResponse::ok(
+            export_off_thread(&app, picked, markdown).await,
+        ))
+    }
+}
+
+/// 把 [`finish_export`] 交给 [`with_picked_gateway`] 跑，并把「阻塞线程里炸了」翻成一条回得去的
+/// 失败信封。`diagnostic_export` 与 `logs_export` 共用。
+///
+/// `JoinError` 不许被 `unwrap()` 掉：那正好把上游 `unimplemented!()` 的 panic 变回一个永不
+/// settle 的 promise（`picked_file` 模块文档射程自曝 6），而那是本批要消灭的静默形态本身。
+async fn export_off_thread(app: &AppHandle, picked: Option<FilePath>, body: String) -> Value {
+    match with_picked_gateway(app, picked, move |gateway, picked| {
+        finish_export(gateway, picked, &body)
+    })
+    .await
+    {
+        Ok(payload) => payload,
+        Err(e) => {
+            log::warn!("[logs] export task join failed: {e}");
+            // 前端只按 `success` 分支、拿 `t('logs.exportFailed')` 出话（`LogsScreen.tsx:590/594`），
+            // 这个英文串不进 UI；但它必须**不是** "cancelled"，否则又回到「与取消同形」那条老路。
+            json!({ "success": false, "error": "export task failed" })
+        }
+    }
 }
 
 /// 上游 `LOGS_EXPORT`：导出**纯日志**（非诊断报告）。
@@ -1010,20 +1088,11 @@ pub async fn logs_export(
         .save_file(move |p| {
             let _ = tx.send(p);
         });
-    let Some(path) = rx.await.ok().flatten().and_then(|p| p.into_path().ok()) else {
-        return Ok(ApiResponse::ok(
-            json!({ "success": false, "error": "cancelled" }),
-        ));
-    };
-    if let Err(e) = std::fs::write(&path, redacted) {
-        return Ok(ApiResponse::ok(
-            json!({ "success": false, "error": format!("{e}") }),
-        ));
-    }
-    Ok(ApiResponse::ok(json!({
-        "success": true,
-        "filePath": path.to_string_lossy(),
-    })))
+    // 同 `diagnostic_export`：content URI 目标不再被吃成「取消」（W-18），落盘同样派线程。
+    let picked = rx.await.ok().flatten();
+    Ok(ApiResponse::ok(
+        export_off_thread(&app, picked, redacted).await,
+    ))
 }
 
 #[cfg(test)]

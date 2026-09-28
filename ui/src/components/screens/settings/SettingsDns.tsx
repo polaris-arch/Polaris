@@ -35,6 +35,8 @@ import { useAppStore } from '@/store/app-store';
 import { ListEditor } from './ListEditor';
 import {
   DNS_FALLBACK,
+  DNS_PRESET_CUSTOM,
+  domesticPresets,
   isIpDoh,
   isPureIpDnsSpec,
   MAX_DOH_RACE_UPSTREAMS,
@@ -42,6 +44,7 @@ import {
   normalizeDnsTimeoutInput,
   parseDnsServerSpec,
   reconcileCustomUpstreams,
+  remotePresets,
   fakeIpTogglePatch,
   needsFakeIpOffConfirm,
 } from './settings-dns-logic';
@@ -67,35 +70,10 @@ export interface SettingsDnsProps {
 
 type RaceStrategy = 'race' | 'single';
 
-/**
- * 上游预设。标签只有「按 IP / 按域名的 DoH」与「阿里 / 腾讯」两类词需要翻译，服务商域名与 IP
- * 跨语种同形（Cloudflare / Google / DNSPod 亦然），故按 `<类型> · <厂商> <地址>` 拼装而非整句入库。
- *
- * 走函数而非模块级常量：常量在 import 期求值，那时 i18n 语言尚未被 `syncLanguageChoice` 校正，
- * 切语言也不会重算（同 SettingsSidebar 分组表的理由）。
+/*
+ * 上游预设表 2026-09-06 搬进 `./settings-dns-logic`（移动端 DNS 页要用同一张表）——
+ * 搬家的完整理由写在那边的头注上。这里只 import，不留第二份。
  */
-function remotePresets(t: (key: string) => string) {
-  const ip = t('settings.dns.dohByIp');
-  const dom = t('settings.dns.dohByDomain');
-  return [
-    { value: 'https://1.1.1.1/dns-query', label: `${ip} · Cloudflare 1.1.1.1` },
-    { value: 'https://8.8.8.8/dns-query', label: `${ip} · Google 8.8.8.8` },
-    { value: 'https://cloudflare-dns.com/dns-query', label: `${dom} · cloudflare-dns.com` },
-    { value: 'https://dns.google/dns-query', label: `${dom} · dns.google` },
-  ];
-}
-
-function domesticPresets(t: (key: string) => string) {
-  const ip = t('settings.dns.dohByIp');
-  const dom = t('settings.dns.dohByDomain');
-  const ali = t('settings.dns.brandAli');
-  return [
-    { value: 'https://223.5.5.5/dns-query', label: `${ip} · ${ali} 223.5.5.5` },
-    { value: 'https://1.12.12.12/dns-query', label: `${ip} · ${t('settings.dns.brandTencent')} 1.12.12.12` },
-    { value: 'https://doh.pub/dns-query', label: `${dom} · DNSPod doh.pub` },
-    { value: 'https://dns.alidns.com/dns-query', label: `${dom} · ${ali} dns.alidns.com` },
-  ];
-}
 
 
 export default function SettingsDns({
@@ -384,10 +362,10 @@ export default function SettingsDns({
         >
           <Select
             id="dns-preset-remote"
-            value={REMOTE_PRESETS.some((p) => p.value === remoteDraft) ? remoteDraft : '__custom__'}
+            value={REMOTE_PRESETS.some((p) => p.value === remoteDraft) ? remoteDraft : DNS_PRESET_CUSTOM}
             onChange={(e) => {
               const v = e.target.value;
-              if (v !== '__custom__') pickPreset('foreignDns', v);
+              if (v !== DNS_PRESET_CUSTOM) pickPreset('foreignDns', v);
             }}
             aria-label={t('settings.dns.remoteDns')}
           >
@@ -396,7 +374,7 @@ export default function SettingsDns({
                 {p.label}
               </option>
             ))}
-            <option value="__custom__">{t('common.customEllipsis')}</option>
+            <option value={DNS_PRESET_CUSTOM}>{t('common.customEllipsis')}</option>
           </Select>
           {/* onBlur 提交（契约 L94）：onChange 只动草稿，Enter 触发 blur 即提交。 */}
           <TextInput
@@ -428,10 +406,12 @@ export default function SettingsDns({
         >
           <Select
             id="dns-preset-domestic"
-            value={DOMESTIC_PRESETS.some((p) => p.value === domesticDraft) ? domesticDraft : '__custom__'}
+            value={
+              DOMESTIC_PRESETS.some((p) => p.value === domesticDraft) ? domesticDraft : DNS_PRESET_CUSTOM
+            }
             onChange={(e) => {
               const v = e.target.value;
-              if (v !== '__custom__') pickPreset('domesticDns', v);
+              if (v !== DNS_PRESET_CUSTOM) pickPreset('domesticDns', v);
             }}
             aria-label={t('settings.dns.domesticDns')}
           >
@@ -440,7 +420,7 @@ export default function SettingsDns({
                 {p.label}
               </option>
             ))}
-            <option value="__custom__">{t('common.customEllipsis')}</option>
+            <option value={DNS_PRESET_CUSTOM}>{t('common.customEllipsis')}</option>
           </Select>
           <TextInput
             id="dns-input-domestic"

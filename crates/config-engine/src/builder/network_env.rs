@@ -149,8 +149,20 @@ impl From<ProbeUnavailable> for ProbeReason {
 
 /// dhcp 需要绑 UDP 68：Windows 普通用户 / SYSTEM 都能绑（N0 207 实测）；macOS 非特权可绑 <1024；
 /// Linux 只有 TUN（helper 给了 CAP_NET_BIND_SERVICE/RAW）才行。未知平台按 Linux 保守处理。
+///
+/// 写成穷举 `match`（而不是 `matches!(..) || tun`）：加平台变体时编译器逼着答题，不会静默落进某一侧。
+/// - **Android → 恒 false**：核是应用进程内的 libbox，应用沙箱没有 CAP_NET_BIND_SERVICE；
+///   `VpnService` 给的是一个 tun fd，**不附带任何 capability** —— 与 Linux 桌面「TUN 腿由 helper
+///   提权」不是一回事，故不能沿用 `|| tun`（沿用的话生效值恒 TUN ⇒ 判成可用 ⇒ 核绑 68 拿 EACCES，
+///   且按上面 Linux 的实测是失败粘滞）。
+/// - **iOS → 恒 false**（fail-closed，**未经真机核验**）：NE 扩展同为沙箱进程；是否可绑 <1024 未实测，
+///   先按不可用处理，宁可置灰也不让核在起核后粘滞失败。
 fn dhcp_privileged(platform: Platform, tun: bool) -> bool {
-    matches!(platform, Platform::Win | Platform::Mac) || tun
+    match platform {
+        Platform::Win | Platform::Mac => true,
+        Platform::Linux | Platform::Other => tun,
+        Platform::Android | Platform::Ios => false,
+    }
 }
 
 /// 探测源在本机不可用的原因（UI「本机将使用：不可用（原因）」由后端给出，渲染端不重算）。

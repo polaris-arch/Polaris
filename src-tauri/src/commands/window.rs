@@ -39,7 +39,16 @@ pub(crate) fn emit_window_maximize_changed(app: &AppHandle, maximized: bool) {
 )]
 #[tauri::command]
 pub fn window_minimize(window: WebviewWindow) -> ApiResponse<()> {
+    // 移动端没有「最小化」这个窗口状态（Activity 的可见性由系统与返回键决定），Tauri 也不提供
+    // 该方法。命令仍注册、仍返回 ok：IPC 契约面只留一份。
+    // [不选「整条 command `cfg(desktop)` 掉」：那要同时分叉 `generate_handler![]`、前端 invoke 面
+    //  与 `check-ipc-args` 的三方对拍；而移动端一旦调到它，拿到的是不可诊断的 command not found]
+    // [不选「像 autostart 那样显式报错」：这条命令只由桌面自绘标题栏的按钮触发，移动端不渲染
+    //  标题栏 ⇒ 没有会被误导的调用方；而 autostart 是设置页的持久开关，静默成功会点亮一个假状态]
+    #[cfg(desktop)]
     let _ = window.minimize();
+    #[cfg(mobile)]
+    let _ = window;
     ok_void()
 }
 
@@ -50,15 +59,23 @@ pub fn window_minimize(window: WebviewWindow) -> ApiResponse<()> {
 )]
 #[tauri::command]
 pub fn window_maximize_toggle(app: AppHandle, window: WebviewWindow) -> ApiResponse<()> {
-    let maximized = window.is_maximized().unwrap_or(false);
-    if maximized {
-        let _ = window.unmaximize();
-    } else {
-        let _ = window.maximize();
+    // 移动端 Activity 恒占满可用区，没有可切换的最大化状态 —— 既不调窗口 API（Tauri 在 mobile
+    // 上就没有这两个方法），**也不广播**一个必然为假的 `maximized=true`：那条事件会让标题栏
+    // 图标与真实窗口状态对不上。命令保留注册的理由同 [`window_minimize`]。
+    #[cfg(desktop)]
+    {
+        let maximized = window.is_maximized().unwrap_or(false);
+        if maximized {
+            let _ = window.unmaximize();
+        } else {
+            let _ = window.maximize();
+        }
+        // 广播新最大化态（标题栏图标跟随）。
+        let new_max = !maximized;
+        emit_window_maximize_changed(&app, new_max);
     }
-    // 广播新最大化态（标题栏图标跟随）。
-    let new_max = !maximized;
-    emit_window_maximize_changed(&app, new_max);
+    #[cfg(mobile)]
+    let _ = (app, window);
     ok_void()
 }
 
@@ -98,7 +115,7 @@ pub fn window_is_maximized(window: WebviewWindow) -> ApiResponse<bool> {
 ///
 /// # 为什么必须先置 `QuitState`
 ///
-/// `main.rs` 的 `ExitRequested` arm 有 C16 轻量模式守卫：`lightweight && !quitting && 托盘在`
+/// `lib.rs` 的 `ExitRequested` arm 有 C16 轻量模式守卫：`lightweight && !quitting && 托盘在`
 /// → `api.prevent_exit()` + **早退，不跑停核清理**。而 tauri 对 `RESTART_EXIT_CODE` 的
 /// `prevent_exit` 是**空操作**（`app.rs:89-93`：`if self.code != Some(RESTART_EXIT_CODE)`）
 /// ⇒ 走到那条早退分支时，应用照样重启、核却没停 = 上面那个孤儿态。置 `QuitState` 让 `!quitting`
@@ -136,7 +153,7 @@ pub fn app_restart(app: AppHandle) -> ApiResponse<()> {
 /// `app:startupConfigFlags`：本次进程**启动时**读到的「需重启 App 才生效」三键的生效值（U-7 判据基线）。
 ///
 /// 只读、无副作用。渲染端拿它当基线判「重启到底会不会改变什么」——拿磁盘现值当基线会在
-/// 「改走又改回」时误报一次重启（而重启会断代理），详见 `main.rs` 的 [`crate::StartupConfigFlags`]。
+/// 「改走又改回」时误报一次重启（而重启会断代理），详见 `lib.rs` 的 [`crate::StartupConfigFlags`]。
 ///
 /// 值在 `setup` 里定格，进程生命周期内不变；webview 自愈重载后重新拉取拿到的仍是同一份，
 /// 这正是**不能**在渲染端自行快照的原因（重载会让渲染端的"启动值"漂移到重载那一刻的磁盘值）。

@@ -126,6 +126,10 @@ impl ProxyRuntime {
     pub(crate) fn register_selector_intent(&self) -> u64 {
         self.selector_reconcile.register_intent()
     }
+
+    pub(crate) fn selector_intent_is_current(&self, intent_generation: u64) -> bool {
+        self.selector_reconcile.intent_generation() == intent_generation
+    }
 }
 
 #[cfg(test)]

@@ -1897,6 +1897,19 @@ impl<R: CommandRunner> ForeignTunnelProbe for ForeignTunnelProbeImpl<R> {
             // 未知平台（freebsd/openbsd/…）：没有任何真机抓取，也就没有解析器。
             // 一条命令都不跑 —— 跑了也只是拿到一份读不懂的输出。
             Platform::Other => Ok(TunnelProbeOutcome::Unsupported(self.platform)),
+            // Android / iOS：**判定未进行**，不是「看过了没冲突」。两条理由各不相同，故分开写：
+            //
+            //  · Android —— 应用非 root，`ip`/`/proc/net/route` 读得到的只是本应用沙箱视角，
+            //    别的 VpnService 持有的隧道在这个视角里根本不出现 ⇒ 跑一遍只会拿到一份
+            //    「什么都没有」的假阴性。而系统本身对这件事已有更强的保证：同一时刻只有一个
+            //    VpnService 能持 tun，起我们的就会顶掉对方 —— 那是一次**用户可见的系统授权弹窗**，
+            //    不需要本模块再去猜。
+            //  · iOS —— 沙箱里压根没有路由表这个对象，连命令都不存在。
+            //
+            // 两者都落 `Unsupported`：UI 那一侧（`TunnelConflictBlock`）会如实说「本平台没有探测
+            // 实现，判定未进行」。**绝不可以**合进 `Platform::Other` 的兜底之外的任何「已探过」分支 ——
+            // 把「没探成」画成一句自信的「无冲突」，比什么都不显示更坏。
+            Platform::Android | Platform::Ios => Ok(TunnelProbeOutcome::Unsupported(self.platform)),
         }
     }
 }

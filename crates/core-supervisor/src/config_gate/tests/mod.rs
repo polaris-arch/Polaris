@@ -203,3 +203,132 @@ fn budget_exhaustion_stops_peeling_but_never_blocks_a_healthy_config() {
         PeelStep::Proceed
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// libbox（Android）腿：9 条真实文本 + 三态映射
+//
+// 样本逐字取自「自己造坏配置、真跑 `libbox.CheckConfig` 取回」的输出（取证跑法见
+// ~/docs/polaris/design/polaris-android-rust-kotlin-bridge-design-2026-09-04.md 附录 A），
+// 不是从桌面文本推出来的 —— 两侧 decode 前缀不同正是本组用例存在的全部理由。
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 🔴 **变异锁：libbox 的 decode 前缀（`decode config: `）必须解出下标**。
+///
+/// 变异（文档 §6 ②，已实测）：把判据退回只认 ` at ` / 只留 `DECODE_MARKER_DESKTOP`
+/// ⇒ 本条的 4 个用例全断，而桌面 12 条与下面的 initialize 2 条全绿。那正是本变异该有的形状。
+#[test]
+fn libbox_decode_phase_rejection_carries_index() {
+    for (raw, array, idx) in [
+        (
+            "decode config: outbounds[7]: unknown outbound type: nonexistent-proto",
+            RejectedArray::Outbounds,
+            7,
+        ),
+        (
+            r#"decode config: outbounds[0].obfs: json: unknown field "obfs""#,
+            RejectedArray::Outbounds,
+            0,
+        ),
+        (
+            r#"decode config: outbounds[0].unknown_key: json: unknown field "unknown_key""#,
+            RejectedArray::Outbounds,
+            0,
+        ),
+        (
+            "decode config: endpoints[1]: unknown endpoint type: nope",
+            RejectedArray::Endpoints,
+            1,
+        ),
+    ] {
+        let r = rej(raw).unwrap_or_else(|| panic!("libbox decode 必须归因：{raw}"));
+        assert_eq!(r.array, array, "{raw}");
+        assert_eq!(r.index, idx, "{raw}");
+    }
+}
+
+/// 🔴 **变异锁：libbox 的 initialize 半边与桌面逐字相同，共用同一个 marker**。
+///
+/// 差别只在桌面外面多包了一层 `FATAL[0000] `，而 `INIT_MARKER` 用的是 `find` 不是 `strip_prefix`
+/// ⇒ 那半边一个字节都不用改。变异：把 `find` 换成 `strip_prefix` ⇒ 桌面 6 条断、libbox 这 2 条仍绿
+/// （它没有前缀）—— 两组用例的方向相反，正好互为对照。
+#[test]
+fn libbox_initialize_phase_shares_the_desktop_marker() {
+    let r = rej("initialize outbound[3]: unknown method: bad-a").expect("libbox initialize 出站");
+    assert_eq!((r.array, r.index), (RejectedArray::Outbounds, 3));
+    let r = rej(
+        "initialize endpoint[0]: WireGuard is not included in this build, rebuild with -tags with_wireguard",
+    )
+    .expect("libbox initialize 端点");
+    assert_eq!((r.array, r.index), (RejectedArray::Endpoints, 0));
+}
+
+/// 🔴 **变异锁：libbox 的三条不可归因文本必须仍返 `None`**（放宽 marker 的第一受害者）。
+///
+/// 第三条尤其承重：规则集路径里那个 `outbounds[1].srs` 是**用户可控的文件名**，松匹配会把它
+/// 读成下标 1 而静默剥掉一个本来能用的节点。桌面侧有同形用例，两侧必须同时守住。
+#[test]
+fn libbox_unattributable_lines_stay_none() {
+    for raw in [
+        "decode config: duplicate outbound/endpoint tag: d",
+        "decode config: route.rules[0]: unknown rule action: nope",
+        "initialize router: parse rule-set[0]: open /nonexistent/outbounds[1].srs: no such file or directory",
+    ] {
+        assert!(rej(raw).is_none(), "必须归因不到（fail-open）：{raw}");
+    }
+}
+
+/// 🔴 **变异锁：桌面那条判据没有被改窄，也没有被改宽**。
+///
+/// 加 libbox 分支时最容易犯的两个错各有一条对照：
+///   - 改窄（删掉 `DECODE_MARKER_DESKTOP` 那一支）⇒ 第一条断；
+///   - 改宽（把两个 marker 合并成 `"decode config"`）⇒ 第二条断 —— 那是上游另外三个调用点的形状，
+///     本仓**没有**为它们取过证，认下来就是无依据的错误归因。
+#[test]
+fn desktop_decode_marker_is_neither_narrowed_nor_widened() {
+    assert_eq!(
+        rej("FATAL[0000] decode config at t.json: outbounds[7]: unknown outbound type: nonexistent-proto")
+            .map(|r| r.index),
+        Some(7),
+        "桌面 decode 判据被改窄了"
+    );
+    assert!(
+        rej("FATAL[0000] decode config exceeds limit: outbounds[7]: whatever").is_none(),
+        "`decode config` 后面不是 ` at ` 也不是 `: ` 时不得归因（marker 被改宽了）"
+    );
+}
+
+/// 🔴 **变异锁：三态映射必须把「桥挂了」与「配置坏了」分开**。
+///
+/// 变异：把 `Err(_)` 那一支也走 `parse_kernel_rejection` ⇒ 桥失败被判成 `Unattributable`
+/// （日志写「内核拒收但归因不到」= 一句与事实相反、且把排查方向指向配置的话）⇒ 第一条断。
+#[test]
+fn libbox_verdict_separates_bridge_failure_from_kernel_rejection() {
+    assert!(matches!(
+        verdict_from_libbox_check(Err("30s 无回应".into())),
+        ConfigCheckVerdict::Unavailable(_)
+    ));
+    assert_eq!(
+        verdict_from_libbox_check(Ok(None)),
+        ConfigCheckVerdict::Accepted
+    );
+    let v = verdict_from_libbox_check(Ok(Some(
+        "decode config: outbounds[7]: unknown outbound type: nonexistent-proto".into(),
+    )));
+    match v {
+        ConfigCheckVerdict::Rejected(r) => {
+            assert_eq!((r.array, r.index), (RejectedArray::Outbounds, 7));
+        }
+        other => panic!("应判 Rejected，实得 {other:?}"),
+    }
+    assert!(matches!(
+        verdict_from_libbox_check(Ok(Some(
+            "decode config: duplicate outbound/endpoint tag: d".into()
+        ))),
+        ConfigCheckVerdict::Unattributable(_)
+    ));
+    // 病态腿：抛了异常但消息是空串 —— 不能把空串当诊断原文报出去。
+    match verdict_from_libbox_check(Ok(Some("   ".into()))) {
+        ConfigCheckVerdict::Unattributable(why) => assert!(!why.trim().is_empty()),
+        other => panic!("空消息应判 Unattributable，实得 {other:?}"),
+    }
+}

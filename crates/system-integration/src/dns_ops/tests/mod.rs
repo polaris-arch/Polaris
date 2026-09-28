@@ -530,6 +530,33 @@ fn impl_takeover_only_on_mac() {
     assert!(!dns_ops_for(Platform::Win, MockRunner::default()).takeover_supported());
     assert!(!dns_ops_for(Platform::Linux, MockRunner::default()).takeover_supported());
     assert!(!dns_ops_for(Platform::Other, MockRunner::default()).takeover_supported());
+    // Android：系统解析器不在链路上（DNS 由核在 tun fd 内自理），且非 root 无权改别的网卡。
+    assert!(!dns_ops_for(Platform::Android, MockRunner::default()).takeover_supported());
+
+    // 全变体穷举 + 正对照：接管的**只有** mac。
+    let takeover: Vec<Platform> = Platform::ALL
+        .iter()
+        .copied()
+        .filter(|p| dns_ops_for(*p, MockRunner::default()).takeover_supported())
+        .collect();
+    assert_eq!(takeover, vec![Platform::Mac]);
+}
+
+/// Android 上四个读写方法全部诚实 no-op，且**一条命令都不跑**。
+///
+/// 正对照：同一份 MockRunner 在 mac 上会记到 `networksetup` 调用（见本文件的 mac 各测），
+/// 故「零调用」不是记账坏了。
+#[test]
+fn android_dns_ops_are_silent_noops_without_commands() {
+    let ops = dns_ops_for(Platform::Android, MockRunner::default());
+    assert!(ops.list_targets().unwrap().is_empty());
+    assert!(ops.read_dns("wlan0").unwrap().is_empty());
+    assert!(ops.apply_dns("wlan0", &["1.1.1.1".to_owned()]).is_ok());
+    assert!(ops.read_effective_resolvers().unwrap().is_empty());
+    assert!(
+        ops.runner.snapshot().is_empty(),
+        "Android 上不得 spawn 任何 DNS 命令（`networksetup`/`netsh`/`scutil` 一个都没有）"
+    );
 }
 
 #[test]

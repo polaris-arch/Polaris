@@ -191,6 +191,24 @@ fn impl_other_platform_returns_none_no_command() {
     assert!(ops.runner.snapshot().is_empty(), "未知平台不得跑任何命令");
 }
 
+/// Android：恒 `Ok(None)`，且**不 spawn `ip`**。
+///
+/// 这一格是 K6b 那次「300 秒起核 69 次」的一半（另一半是
+/// `managed_tun_interface_for_network_watcher` 的 Android 臂）。它本身**不是缺陷** —— 诚实地
+/// 说「查不到」是对的；缺陷在于上层把「查不到」读成了「网络事实变了」。修在上层
+/// （`runtime/route_binding::runtime_binding_planning_supported(Android) == false`），本臂钉住
+/// 现状：既不许偷偷开始跑命令（非 root 应用跑 `ip route get` 拿不到有效答案，只会多一次
+/// 子进程 + 一条误导日志），也不许开始返 `Some(...)`（那会让上层判据重新活过来）。
+#[test]
+fn impl_android_returns_none_and_never_spawns_ip() {
+    let ops = route_ops_for(Platform::Android, MockRunner::default());
+    assert_eq!(ops.exit_interface_for(PROBE_IP).unwrap(), None);
+    assert!(
+        ops.runner.snapshot().is_empty(),
+        "Android 上不得 spawn 任何路由查询命令"
+    );
+}
+
 #[test]
 fn impl_command_failure_propagates_err() {
     let runner = MockRunner {

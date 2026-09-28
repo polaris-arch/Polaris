@@ -245,8 +245,23 @@ fn snapshot_from(status: &HelperStatus, supported: bool) -> HelperStatusSnapshot
 ///
 /// 抽为自由 `const fn` 是为让**全 `Platform` 变体**在单一平台 gate 上可断言——给 mac/win 值以变异
 /// 牙齿（`supported()` 读 `Platform::current()`，本机 gate 只走 Linux 一路，测不到 mac/win 逃逸面）。
+///
+/// **穷举 `match` 而非 `matches!`**（2026-09-04 K10）：这是整个 helper 子系统的入口闸 —— 它答
+/// false 的平台，`HelperManager` / 安装脚本 / 提权 / `LinuxStart` 帧全部不可达。`matches!` 形态下
+/// 新增一个平台变体会**静默**得到 false（碰巧对），下一个变体则可能碰巧错；穷举 match 让编译器
+/// 在这里强制问一次「这个平台有没有 helper」。Android = false：核跑在应用进程内的 libbox 里，
+/// 没有 daemon、没有提权通道、也没有需要提权的动作（tun fd 由 `VpnService` 授予）。
 const fn platform_supported(platform: Platform) -> bool {
-    matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => true,
+        // iOS = false，与 Android 同答不同因（这里是整个 helper 子系统的入口闸，值得写清）：
+        // Android 的依据是「核跑在应用进程内的 libbox 里，没有 daemon 也没有需要提权的动作」；
+        // iOS 的依据更靠前 —— **平台不允许存在常驻 root daemon**（无 launchd 可注册面、无提权
+        // 通道），而 tun fd 由系统按 packet-tunnel-provider entitlement 授予 NE 扩展，同样没有
+        // 需要提权的动作。⇒ false 之后，`HelperManager` / 安装脚本 / 提权 / `LinuxStart` 帧
+        // 在 iOS 上全部不可达（helper-client 那 7 处 `Ios` 臂的不可达性就源自这一行）。
+        Platform::Android | Platform::Ios | Platform::Other => false,
+    }
 }
 
 /// 卸载 helper 之前该不该先停核（纯判定，可穷举单测）。
@@ -552,6 +567,30 @@ impl HelperRuntime {
         }
     }
 
+    /// **测试专用**构造：在 [`Self::never_installed_for_tests`] 的全部隔离之上，把
+    /// [`Self::platform`] 钉成给定平台。
+    ///
+    /// # 为什么必须有这个
+    ///
+    /// [`super::proxy::ProxyRuntime`] 的一批判据经 `self.helper.platform()` 分流 ——
+    /// 「Android 上接管方式恒 TUN」这条不变式的**全部**运行期落点都在那里（起核后要不要去设
+    /// 系统代理、要不要开那一枪连接 flush、要不要挂 TUN 出口夺取硬闸……）。生产构造把平台钉成
+    /// `Platform::current()`，于是那些腿在本机（Linux）永远只跑得到桌面那一侧：
+    /// **Android 分叉一行都没有运行期证据**，只剩源码级断言。
+    ///
+    /// 本仓已经为这种形态付过账（`with_forced_status_for_tests` 的头注记着同一件事）。
+    ///
+    /// **只钉平台这一个字段，不放开任何写入面**：`sys_ops` 仍是 `NeverInstalled`、
+    /// `never_connect` 仍为 true ⇒ `install` / `uninstall` / `start_core` 一律触不到真实系统。
+    /// 平台钉成 Android 反而**收紧**了逃逸面（`platform_supported(Android) == false`）。
+    #[cfg(test)]
+    pub(crate) fn with_platform_for_tests(dir: PathBuf, platform: Platform) -> Self {
+        Self {
+            platform,
+            ..Self::never_installed_for_tests(dir)
+        }
+    }
+
     /// 当前平台。
     #[must_use]
     pub const fn platform(&self) -> Platform {
@@ -828,15 +867,23 @@ impl HelperRuntime {
         let req = match self.platform {
             Platform::Mac | Platform::Win => Request::Start(common),
             // linux/未知谱系：带核路径行，且**只能**是 helper 锁定的 coreBin（它会逐字比对）。
-            Platform::Linux | Platform::Other => Request::LinuxStart(LinuxStartParams {
-                singbox_path: crate::runtime::core_promote::protected_core_path_in(
-                    &self.protected_core_dir_path(),
-                    std::env::consts::OS,
-                )
-                .to_string_lossy()
-                .into_owned(),
-                common,
-            }),
+            // Android 同臂但不可达：`should_start_via_helper` 对它恒 false（`platform_supported`
+            // 同源），Android 起核走的是进程内 libbox（`android_bridge`），根本不建 helper client。
+            // iOS 同 Android/Other 落 `LinuxStart` 臂，且同样**不可达**：`should_start_via_helper`
+            // 与 `platform_supported` 同源，对 iOS 恒 false ⇒ 根本走不到 `build_client()`。
+            // 本处特有的那半句：iOS 起核连「起一个核进程」这件事都不存在 —— 核是 NE 扩展进程
+            // 自己 `startTunnel` 时在进程内拉起的 libbox，没有可传路径的 exec 面。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
+                Request::LinuxStart(LinuxStartParams {
+                    singbox_path: crate::runtime::core_promote::protected_core_path_in(
+                        &self.protected_core_dir_path(),
+                        std::env::consts::OS,
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
+                    common,
+                })
+            }
         };
         let resp = client
             .send_with_timeout(&req, HELPER_START_TIMEOUT)

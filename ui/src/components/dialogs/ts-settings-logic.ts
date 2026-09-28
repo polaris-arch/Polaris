@@ -33,7 +33,7 @@
 
 import type { ServerConfig, TailscaleSettings } from '@/contracts/types';
 import type { TailscaleStatusPeer, TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
-import type { FormValues, SelectOption } from './FieldSpec';
+import type { FormValues, SelectOption } from './field-spec';
 import { splitCsv } from './wg-logic';
 import { detourDraftValue } from './detour-options';
 import { isValidIpCidr } from '@/domain/rules';
@@ -42,7 +42,7 @@ import { controlUrlReject, type ControlUrlReject } from '@/domain/control-url';
 /** 「自定义…」哨兵（与 `TsSettingsDialog` 的 `when` 谓词、`buildTsSettings` 的分支同一常量）。 */
 export const EXIT_CUSTOM = '__custom__';
 
-/** 出口候选只来自当前 TS 节点的 tailnet；快照中无该节点时不借用别的控制面。 */
+/** Exit candidates belong only to the current TS node's tailnet. */
 export function peersForTsNode(snapshot: TailscaleStatusSnapshot, serverId: string | undefined): TailscaleStatusPeer[] {
   if (!serverId) return [];
   return snapshot.statuses.find((status) => status.serverId === serverId)?.peers ?? [];

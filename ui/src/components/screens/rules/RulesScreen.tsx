@@ -50,7 +50,7 @@ import { toast } from '@/lib/error-handler';
 import { RuleItem } from './RuleItem';
 import { GeoCard } from './GeoCard';
 import { PriorityFlow } from './PriorityFlow';
-import { useResolvedProbes } from './NetworkProfilePanel';
+import { useResolvedProbes } from './network-profile-probes';
 import {
   DnsPolicyWorkspace,
   type DnsWorkspaceView,

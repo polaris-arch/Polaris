@@ -39,33 +39,33 @@
  *
  * # 成员逐条证据（2026-07-28 于磁盘核实）
  *
- * - **`hardwareAcceleration`** —— `src-tauri/src/main.rs:1196-1202` 在 setup 里、**首个 webview 创建之前**
+ * - **`hardwareAcceleration`** —— `src-tauri/src/lib.rs:1196-1202` 在 setup 里、**首个 webview 创建之前**
  *   调 `graphics_compat::apply_hardware_acceleration_escape()` 关 GPU：Linux 设环境变量
  *   `WEBKIT_DISABLE_DMABUF_RENDERER` / `WEBKIT_DISABLE_COMPOSITING_MODE`，Windows 经 WebView2 API
  *   下发 `--disable-gpu`（`graphics_compat.rs:92-123`）。各平台都只在建 webview 那一刻应用 ⇒ 之后改无效。
- * - **`windowEffects`** —— `main.rs:887-888` + `:932-951` + `:982-1010`：`transparent` / `background_color`
+ * - **`windowEffects`** —— `lib.rs:887-888` + `:932-951` + `:982-1010`：`transparent` / `background_color`
  *   是 **builder-only 参数**（运行期不可改），vibrancy/Mica 也只在 `builder.build()` 之后挂一次。
  *   更糟的是前端 `resolveWindowEffectsState`（`components/layout/window-effects.ts:42`）是**实时**读这两个键的：
  *   运行期把它从关拨到开 → 前端立刻让位（`.stage`/`.win` 转透明）而原生窗仍是不透明 `#0B0F14`
  *   ⇒ 浅色主题下透出深底浅字。即「不重启」不是「没变化」，是**看得见的坏**。
- * - **`rememberWindowSize`** —— `main.rs:1302-1322`：`tauri-plugin-window-state` 是**按本键 gate 注册**的，
+ * - **`rememberWindowSize`** —— `lib.rs:1302-1322`：`tauri-plugin-window-state` 是**按本键 gate 注册**的，
  *   且必须早于 `create_main_window`（插件靠 `on_window_ready` 恢复几何）。运行期拨开 → 插件没注册 ⇒
  *   本次会话的几何压根不会被记录，下次启动无从还原；运行期拨关 → 插件仍在 ⇒ 照样记录并还原。
  *   两个方向都是**静默无效**。
  *
  * # 刻意排除（同样在启动期读原文本，但不满足第二个合取项）
  *
- * - **`silentStart`**（`main.rs:88-92` / `:1330`）—— 它的语义本就是「**下次**启动时隐藏主窗」，
+ * - **`silentStart`**（`lib.rs:88-92` / `:1330`）—— 它的语义本就是「**下次**启动时隐藏主窗」，
  *   本次运行不该有任何变化。为它弹「立即重启」会让应用重启后自己藏起来，是伤害不是修复。
  * - **`autoStart` / `autoConnect` / `autoCheckUpdate`** —— 同上，语义即「下次启动/启动期做什么」；
  *   且 `autoStart` 经 `autoStartApi` 立即写 OS launch agent，不存在延迟生效。
- * - **`builtinGeoMeta`**（`main.rs:1217-1227`）—— 迁移/播种元数据，不由设置页编辑，无 UI 入口。
+ * - **`builtinGeoMeta`**（`lib.rs:1217-1227`）—— 迁移/播种元数据，不由设置页编辑，无 UI 入口。
  *
  * # 反面对照（都在启动期被读过，但**有**运行期消费者，故不属本集合）
  *
  * `uiTheme`（`tray/model.rs` 播种 + `AppShell` 运行期接管）、`language`（`i18n.rs::app_lang()` 读 `config.language`，托盘 tooltip / 原生菜单 live 重建）、
  * `logLevel`（`logging.rs:301` 启动读一次，运行期 `set_level` 改）、
- * `minimizeToTray`（`main.rs:143` 每次关窗**现读**）。
+ * `minimizeToTray`（`lib.rs:143` 每次关窗**现读**）。
  */
 
 import type { UserConfig } from '@/contracts/types';
@@ -86,7 +86,7 @@ export type AppRestartRequiredKey = (typeof APP_RESTART_REQUIRED_KEYS)[number];
  * 归一到**后端启动期真正读到的判定值**。
  *
  * 三个成员在 Rust 侧是同一口径的「缺省为开、仅显式 `false` 才关」
- * （`graphics_compat.rs:72-82` 的 `field_is_explicit_false` / `main.rs:102-109` 的 `unwrap_or(true)`），
+ * （`graphics_compat.rs:72-82` 的 `field_is_explicit_false` / `lib.rs:102-109` 的 `unwrap_or(true)`），
  * 故 `undefined` 与 `true` 是**同一个判定结果**，二者互换不触发弹窗（它确实什么也没改变）。
  *
  * ⚠️ 新增**非 bool 或缺省为关**的成员时必须先改这里，否则会漏报/误报。

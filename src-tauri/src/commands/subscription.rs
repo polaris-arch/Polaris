@@ -31,6 +31,9 @@ use polaris_net_stack::subscription::{Conditional, ProviderFetchError, Subscript
 use polaris_net_stack::subscription_error::SubscriptionErrorKind;
 
 use crate::commands::config::broadcast_config_changed;
+use crate::commands::picked_file::{
+    classify, file_name_of, open_picked_for_read, PickedTarget, PluginFiles,
+};
 use crate::events::{broadcast, channel::EVENT_SUBSCRIPTION_UPDATE_PROGRESS};
 use crate::i18n::{key, t};
 use crate::response::{ok_void, ApiResponse};
@@ -486,7 +489,11 @@ fn select_fetch_client(
     if want_proxy && backend_subscription_route_uses_proxy(cfg) {
         let st = state.proxy().status();
         if st.running && st.subscription_update_in_port != 0 {
-            if let Ok(c) = HttpRuntime::via_local_socks_proxy(st.subscription_update_in_port) {
+            // Android 上该入站要求本次起核的一次性凭据（桌面 `None`）；缺了 socks 认证失败 ⇒ 订阅恒失败。
+            let auth = state.proxy().loopback_auth();
+            if let Ok(c) =
+                HttpRuntime::via_local_socks_proxy(st.subscription_update_in_port, auth.as_ref())
+            {
                 return (Arc::new(c), true);
             }
         }
@@ -1528,14 +1535,35 @@ pub async fn local_import_pick_file(window: WebviewWindow) -> ApiResponse<Value>
         .pick_file(move |p| {
             let _ = tx.send(p);
         });
-    let Some(path) = rx.await.ok().flatten().and_then(|p| p.into_path().ok()) else {
+    // 不再 `.and_then(|p| p.into_path().ok())`（W-18）：Android SAF 交回 `FilePath::Url(content://…)`，
+    // `into_path()` 对它恒 Err ⇒ 被吃成 None ⇒ 与「用户取消」不可分。句柄怎么开由
+    // `commands::picked_file` 按目标形态分派，桌面那条仍是同一个文件的同一个句柄。
+    let Some(target) = rx.await.ok().flatten() else {
         return ApiResponse::ok(json!({ "canceled": true }));
     };
 
     let read = async {
-        let file = tokio::fs::File::open(&path)
-            .await
-            .map_err(|_| ReadError::Failed)?;
+        // 「不许在 async command 里同步 open/read 挂住 tokio worker」这条不变量两支各自成立
+        //（`wiring_gate::local_file_picker_never_blocks_a_tokio_worker_on_std_fs` 逐条钉着）：
+        //  · 桌面：**逐字不变**的 `tokio::fs::File::open`，它自己就把 open 派到阻塞线程池；
+        //  · content URI：插件那侧只有同步 API（Android 上是一次 JNI 往返去要 fd），
+        //    故显式放进 `spawn_blocking`，再 `from_std` 包回同一种 tokio 句柄。
+        // 两支汇合之后，下面「不信 metadata、多读一个字节判超限」的异步读腿一字未改。
+        let file = match classify(&target) {
+            PickedTarget::Path(path) => tokio::fs::File::open(&path)
+                .await
+                .map_err(|_| ReadError::Failed)?,
+            PickedTarget::Uri(uri) => {
+                let app = window.app_handle().clone();
+                let opened = tokio::task::spawn_blocking(move || {
+                    open_picked_for_read(&PluginFiles::new(&app), &uri)
+                })
+                .await
+                .map_err(|_| ReadError::Failed)?
+                .map_err(|_| ReadError::Failed)?;
+                tokio::fs::File::from_std(opened)
+            }
+        };
         let metadata = file.metadata().await.map_err(|_| ReadError::Failed)?;
         if metadata.len() > MAX_BODY_BYTES {
             return Err(ReadError::TooLarge);
@@ -1554,10 +1582,9 @@ pub async fn local_import_pick_file(window: WebviewWindow) -> ApiResponse<Value>
     };
     match tokio::time::timeout(LOCAL_IMPORT_FILE_READ_TIMEOUT, read).await {
         Ok(Ok(content)) => {
-            let file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // basename 仍只当展示用（不回传全路径，避免向渲染端泄漏本机目录结构）；
+            // content URI 上取的是最后一节 document id，取不到就空串。
+            let file_name = file_name_of(&target);
             ApiResponse::ok(json!({
                 "canceled": false,
                 "content": content,

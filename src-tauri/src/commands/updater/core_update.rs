@@ -93,11 +93,28 @@ pub(super) async fn core_update_check_inner(
         ));
     }
 
-    let Some(platform) = AssetPlatform::from_os(std::env::consts::OS) else {
-        return Ok(ApiResponse::ok(json!({
-            "hasUpdate": false,
-            "currentVersion": current,
-        })));
+    // ── 没有「独立于应用的内核」这个对象的平台：零网络早退 ──────────────────────
+    //
+    // 两档合一，但成因不同，都写在这里免得下一个人以为是同一件事：
+    //  · `None` = 本仓不为它发包的平台（iOS、各 BSD……）—— 连应用包都没有，更没有内核包；
+    //  · `Android` = **核随 APK 打进去**（`build.gradle.kts` 的
+    //    `implementation(files("libs/libbox.aar"))`，进程内 `.so` 而非可执行文件）⇒
+    //    桌面那套 `core_swap`（`<core>.bak` 原子替换）没有对象：换内核 = 装一个新版本的应用。
+    //
+    // 🔴 这一条 2026-09-13 从**隐式**变成**显式**：在那之前 Android 是靠
+    //    `AssetPlatform::from_os("android")` 返 `None` 才走到这里的，而那一批给
+    //    `AssetPlatform` 加了 Android 变体（App 更新要选 APK 资产）。若只改那边不改这里，
+    //    Android 上「检查内核更新」会开始真的去打 SagerNet 的 releases API ——
+    //    一次纯浪费的网络请求，且结果恒为「没有适配资产」。
+    //    `find_suitable_singbox_asset` 那侧另有一道同语义的 `return None`（第二道闸）。
+    let platform = match AssetPlatform::from_os(std::env::consts::OS) {
+        Some(AssetPlatform::Android) | None => {
+            return Ok(ApiResponse::ok(json!({
+                "hasUpdate": false,
+                "currentVersion": current,
+            })));
+        }
+        Some(p) => p,
     };
     let arch = AssetArch::from_arch(std::env::consts::ARCH);
 

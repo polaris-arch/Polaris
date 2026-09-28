@@ -218,11 +218,8 @@ impl ProxyRuntime {
     /// [`derive_ts_exit_warning`] 是单一真值（两侧都调它），此处多出的只是「从 runtime 自身取三源」这段
     /// 装配 —— 拉侧从 `State<AppRuntime>` 取、推侧从 `self` 取，无法共用同一个签名。
     ///
-    /// **配置源刻意取 `ConfigManager` 的落盘态（此处经 `with_current` 投影）而非 `current_config`
-    /// （运行核那份）**，这一点偏离
-    /// 上游（它读 `this.currentConfig`）：Polaris 的拉侧读的就是落盘态，两侧若各读一份，会出现
-    /// 「推侧广播了出口无效终态、拉侧的 gate 却判有效（或反过来）」的自相矛盾 —— 用户看到的是角标与
-    /// 检测结果打架。宁可与**同一子系统的另一侧**对齐，也不为形式上贴近上游而制造两个真相源。
+    /// 配置源与解锁检测拉侧同取运行核 R。磁盘 D 的新选择可能仍待 Apply；推侧若
+    /// 先按 D 发“出口无效”，就会把当前仍由旧 R 提供的出口误判为失效。
     pub(super) fn selected_ts_exit_block(&self) -> Option<&'static str> {
         // 廉价前置（**只跳过工作、不改结论**）：STATUS 缓存里一个在册端点都没有（无 TS 节点 / 核未跑 /
         // 首帧未到）⇒ `logged_in` 恒 false ⇒ [`derive_ts_exit_warning`] 必在第一道守卫返 None。
@@ -232,8 +229,8 @@ impl ProxyRuntime {
         if !self.mesh.has_ts_status() {
             return None;
         }
-        // **零深拷贝 + 只投影三个字段**：走 [`ConfigManager::with_current`]（持读锁投影，不产 owned
-        // `Value`）而非 `current()`（恒 clone 整份）；闭包内也不 `from_value::<UserConfig>(整份)` ——
+        // **零深拷贝 + 只投影三个字段**：在 `current_config` 读锁内借用 R，不产 owned
+        // `Value`；闭包内也不 `from_value::<UserConfig>(整份)` ——
         // 那会把 200 节点级的 `servers` 全量建成 typed 结构（每个 `ServerConfig` 又带若干
         // `Option<...Settings>` / `Vec<String>`），而谓词只要 `selectedServerId` + **被选中的那一个**
         // server + `proxyMode` 三样。两半浪费（整份 clone、整份反序列化）在此一并消掉。
@@ -242,14 +239,14 @@ impl ProxyRuntime {
         // 用同一份配置双路对拍钉住）：三个键的 serde 表示都是平凡的（`Option<String>` / 数组 /
         // `rename_all = "lowercase"` 的枚举），且谓词对其余字段一概不看。
         // 唯一的行为差异在退化输入上——某个**无关**字段坏掉时，投影不再连带把整个判定短路成 None。
-        // 方向是 fail-safe 的（坏字段不再静默吞掉出口告警），且配置在 `ConfigStore::load` 已过校验。
+        // 方向是 fail-safe 的（坏字段不再静默吞掉出口告警），运行态在起核前已过配置校验。
         //
-        // ⚠️ 闭包内**只做纯投影**：`ConfigManager` 的读锁正持着，回调进 `self.mesh` / `self.status()`
+        // ⚠️ 闭包内**只做纯投影**：R 的读锁正持着，回调进 `self.mesh` / `self.status()`
         // 之类的子系统是禁忌（见 `with_current` 文档）。故 `ts_status_event` / `status()` 一律留到
         // 闭包**外**再取。
-        let (sel_id, selected, proxy_mode_direct) = self
-            .config
-            .with_current(|raw| {
+        let (sel_id, selected, proxy_mode_direct) =
+            self.current_config.read().ok().and_then(|runtime| {
+                let raw = runtime.as_ref()?;
                 let sel_id = raw.get("selectedServerId")?.as_str()?.to_string();
                 let selected: Option<ServerConfig> = raw
                     .get("servers")?
@@ -260,9 +257,7 @@ impl ProxyRuntime {
                 let proxy_mode_direct = raw.get("proxyMode").and_then(Value::as_str)
                     == Some(ProxyMode::Direct.as_str());
                 Some((sel_id, selected, proxy_mode_direct))
-            })
-            .ok()
-            .flatten()?;
+            })?;
         let event = self.mesh.ts_status_event(&sel_id);
         let (logged_in, peers, definitive_logged_out) =
             event.as_ref().map_or((false, &[][..], false), |e| {

@@ -138,6 +138,10 @@ pub const DNS_CMD_TIMEOUT: Duration = Duration::from_secs(5);
 /// - **win**：**写路径 no-op**（`takeover_supported=false`，判据见该方法）；读路径真实现
 ///   （`netsh interface ipv4 show ...`，非提权可跑）供方案B 用。
 /// - **linux**：写路径 no-op；生效解析器读 resolvectl / resolv.conf，接管另走 [`crate::linux_resolved`]。
+/// - **android**（2026-09-04 K10 具名）：与 linux 同为全 no-op，但**理由不同**，别读成「继承 linux」：
+///   linux 是「这层抽象不合适、真接管在别处」，android 是「这件事整个不存在」——系统解析器不在
+///   链路上（DNS 由核在 tun fd 内自理），且非 root 应用无权读写别的网卡的 DNS。因此 android 上
+///   `takeover_supported()` 恒 false、控制器在写 marker 前就早退，四个方法的返回值只是纵深防御。
 pub struct SystemDnsOpsImpl<R: CommandRunner> {
     runner: R,
     platform: Platform,
@@ -200,7 +204,10 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
                 ))?;
                 Ok(parse_win_interfaces(&out.stdout))
             }
-            Platform::Linux | Platform::Other => Ok(vec![]),
+            // list_targets。iOS → 空集：没有「网络服务」这个可枚举面（`networksetup`
+            // 的对应物不存在，NEHotspot/NetworkExtension 也不暴露服务清单给普通应用）。
+            // 空集让上层的逐目标循环一次都不进，与 `takeover_supported=false` 同向。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => Ok(vec![]),
         }
     }
 
@@ -213,7 +220,10 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
             Platform::Win => Ok(parse_win_show_dns_servers(
                 &self.win_show_dnsservers(target)?,
             )),
-            Platform::Linux | Platform::Other => Ok(vec![]),
+            // read_dns。iOS → 空集：没有读某个网络接口 DNS 配置的公开 API。空集在这里是
+            // 「读不到」而不是「没有配」——但两者在本函数的唯一消费方（接管前的原值快照）
+            // 上等价，因为接管本身已被 `takeover_supported=false` 挡在更前面。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => Ok(vec![]),
         }
     }
 
@@ -228,7 +238,14 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
             // 在写 marker 前早退。此处是纵深防御（万一有人绕过控制器直调 ops）。
             // 上游 `winSetDnsCommands` 纯函数保留在 `dns::win_set_dns_commands`（移植真值 + 待
             // Windows 接管解禁时复用），故意不接线。
-            Platform::Win | Platform::Linux | Platform::Other => Ok(()),
+            // apply_dns。iOS → no-op，与 Win/Linux 同臂且同为**正常不可达**：写系统 DNS 在
+            // iOS 上没有任何 API 面（NE 侧的 `NEDNSSettings` 只作用于本隧道，属于配置生成的
+            // 领域而不是「接管系统解析器」）。
+            Platform::Win
+            | Platform::Linux
+            | Platform::Other
+            | Platform::Android
+            | Platform::Ios => Ok(()),
         }
     }
 
@@ -283,7 +300,8 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
                 }
                 Ok(ips)
             }
-            Platform::Other => Ok(vec![]),
+            // iOS 第三方应用没有公开的系统生效 DNS 读取接口。
+            Platform::Other | Platform::Android | Platform::Ios => Ok(vec![]),
         }
     }
 }

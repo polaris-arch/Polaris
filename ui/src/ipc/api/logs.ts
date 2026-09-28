@@ -97,8 +97,8 @@ export const logsApi = {
 // ============================================================================
 
 export const diagnosticApi = {
-  /** 导出诊断报告（弹出系统文件保存对话框，单 Markdown，密钥已脱敏）。 */
-  async export(): Promise<{ success: boolean; filePath?: string; error?: string }> {
+  /** 导出脱敏诊断报告；Android Debug 打开系统分享，其余平台选择保存位置。 */
+  async export(): Promise<{ success: boolean; shared?: boolean; filePath?: string; error?: string }> {
     return invoke(IPC_CHANNELS.DIAGNOSTIC_EXPORT);
   },
 

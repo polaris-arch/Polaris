@@ -33,16 +33,24 @@ export function meshSingletonMessage(slot: MeshSingletonSlot, t: TFunction): str
 /**
  * 提交前闸门：候选撞上已占的单例槽即弹错并返回 true（调用方据此中止提交）。
  * `editingId` 传当前编辑对象的 id——编辑现有 WARP/TS 节点不算「再加一个」，必须放行。
+ *
+ * `onMessage` 是**同一句话的第二条通道**（2026-09-06 批 3 复审 major 补）：移动端的表单是一个
+ * `z-index:40` 的全屏层，而 toast 宿主贴在停靠区上沿——层叠已修（`mobile.css#.m-toast-host`
+ * 取 50），但「用户按下主按钮之后屏幕上什么都不发生」这一档不该只由一条跨层的全局通道兜着。
+ * 文案仍只有 [`meshSingletonMessage`] 一份，调用方拿到的就是 toast 上那一句，不另写。
  */
 export function blockedByMeshSingleton(
   candidate: MeshSlotServer,
   servers: MeshSlotServer[],
   t: TFunction,
-  editingId?: string
+  editingId?: string,
+  onMessage?: (message: string) => void
 ): boolean {
   const slot = meshSingletonConflict(candidate, servers, editingId);
   if (!slot) return false;
-  toast.error(meshSingletonMessage(slot, t));
+  const message = meshSingletonMessage(slot, t);
+  toast.error(message);
+  onMessage?.(message);
   return true;
 }
 
@@ -77,8 +85,11 @@ const WARP_REGISTRATION_CANDIDATE: MeshSlotServer = {
 export async function registerWarpIfSlotFree<T>(
   servers: MeshSlotServer[],
   t: TFunction,
-  register: () => Promise<T>
+  register: () => Promise<T>,
+  onBlocked?: (message: string) => void
 ): Promise<T | null> {
-  if (blockedByMeshSingleton(WARP_REGISTRATION_CANDIDATE, servers, t)) return null;
+  if (blockedByMeshSingleton(WARP_REGISTRATION_CANDIDATE, servers, t, undefined, onBlocked)) {
+    return null;
+  }
   return register();
 }

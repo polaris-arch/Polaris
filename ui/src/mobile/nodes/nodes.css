@@ -1,0 +1,827 @@
+/*
+ * 移动端「节点」屏样式。**唯一** token 来源仍是 `../../styles/tokens.resolved.css`（契约 A1）——
+ * 本文件一个 `@import` 都不写；外壳 `mobile.css` 已解析好的三个响应标量
+ * （`--page-inset` / `--section-gap` / `--card-padding`）在这里**只消费不重定义**。
+ * 节点连续行的纵向内距按触控与文字实际需要单独控制，不随页宽机械增大。
+ *
+ * ── 只用 Chromium ≤105 的特性 ─────────────────────────────────────────────────
+ * 本文件自动进 `../../styles/css-feature-floor.test.ts` 的取材面（它走目录树发现 `ui/src` 下全部
+ * .css）。`@container` / `:has()` 是下限本体；`dvh` 不用。宽屏列表用 CSS Grid
+ * 按 DOM 行序分栏，始终保留相同的节点顺序与键盘顺序。
+ *
+ * ── 几何 px、排版 rem ────────────────────────────────────────────────────────
+ * 与外壳同一条口径：字号 / 行高走 rem ⇒ 跟随 Dynamic Type；padding / gap / 触控目标走 px ⇒ 框不动。
+ */
+
+/* ═══════════ 屏根 ═══════════ */
+
+/*
+ * 本屏自己就是一个 section，**没有**卡片外观：页头要满幅吸顶，一层卡片边框会把吸顶那块框起来，
+ * 读作「一张会动的卡」而不是「屏的头」。
+ *
+ * ⚠️ 2026-09-05：此前这里靠 `background:none;border:0;border-radius:0;padding:0` **取消**
+ * 外壳的 `.m-section`，而根元素同时挂着 `m-section mn` 两个类。那是无效的 —— 两者同特异度，
+ * 胜负只由进包顺序决定，而屏 CSS 先于 `mobile.css` 进包，于是取消不掉。真机上整个节点屏被套进
+ * 一张卡（内容顶到状态栏根下、吸顶块抵不掉卡内边距）。修法是把 `m-section` 从根元素上摘掉、
+ * 连同那条死规则一起删（见 `mobile.css` 同日注释），而不是把这四行升级成 `!important`：
+ * **靠特异度赢一场级联，赢的是这一次，不是这一类。**
+ */
+.mn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+}
+
+/* ═══════════ ①② 页头 + 分组段（一块 sticky）═══════════ */
+
+/*
+ * 满幅底：`.m-page` 左右有页边距，sticky 块若只在内容宽度内画底，滚动时内容会从两侧缝里透出来。
+ * 负外边距把它拉到滚动区边沿，再用等量内边距把内容推回原位 —— 不引入任何新的数。
+ */
+.mn-top {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: hsl(var(--bg));
+  margin-left: calc(-1 * (var(--page-inset) + var(--safe-l)));
+  margin-right: calc(-1 * (var(--page-inset) + var(--safe-r)));
+  padding-left: calc(var(--page-inset) + var(--safe-l));
+  padding-right: calc(var(--page-inset) + var(--safe-r));
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+/*
+ * 标题与短动作共一行，统计独占下一行；大字时动作可自然换行，统计不会被挤窄。
+ */
+.mn-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px var(--sp-2);
+  padding-top: var(--sp-2);
+}
+
+.mn-head-title { display: contents; }
+.mn-title { grid-column: 1; grid-row: 1; }
+.mn-count { grid-column: 1 / -1; grid-row: 2; }
+.mn-head-acts { grid-column: 2; grid-row: 1; }
+
+.mn-title {
+  margin: 0;
+  font-family: var(--disp);
+  font-size: 1.3125rem; /* type.nodeTitle compact 21 */
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+.mn-count {
+  margin: 2px 0 0;
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.mn-head-acts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/*
+ * 通用动作按钮。48 的最小触控目标是 `layout.touchTargetMin` 的硬要求 ——
+ * 它是手指尺寸，不随 Dynamic Type 缩放（缩放它只会把屏幕花在空白上）。
+ */
+.mn-act {
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.875rem;
+  line-height: 1.2;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mn-act.primary {
+  background: hsl(var(--flow-weak));
+  color: hsl(var(--flow-hi));
+}
+
+.mn-act.more {
+  width: var(--tap-min);
+  padding: 0;
+  font-size: 1.375rem;
+  line-height: 1;
+}
+
+.mn-act:active {
+  opacity: 0.7;
+}
+
+.mn-act:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mn-act:focus-visible,
+.mn-seg:focus-visible,
+.mn-search-clear:focus-visible,
+.mn-row-main:focus-visible,
+.mn-row-more:focus-visible,
+.mn-sheet-btn:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+.mn-act.danger {
+  color: hsl(var(--err));
+  border-color: hsl(var(--err-weak));
+}
+
+/* 分组段：横向滚动，每项 ≥48 高（§3.1 第 6 条 segmented-tabs）。 */
+.mn-segs {
+  display: flex;
+  gap: var(--sp-2);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding-top: var(--sp-2);
+}
+
+.mn-seg {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: 0 0 auto;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  margin: 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: hsl(var(--fg-dim));
+  font-family: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+  touch-action: manipulation;
+  white-space: nowrap;
+}
+
+.mn-seg[aria-current='true'] {
+  color: hsl(var(--fg));
+  border-bottom-color: hsl(var(--flow));
+}
+
+.mn-seg-count {
+  color: hsl(var(--fg-faint));
+  font-size: 0.75rem;
+}
+
+/* ═══════════ ③ 订阅摘要 ═══════════ */
+
+.mn-sub,
+.mn-empty {
+  background: hsl(var(--surface));
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r);
+}
+
+.mn-empty { padding: var(--card-padding); }
+.mn-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+}
+.mn-sub .mn-note { margin: 0; }
+
+.mn-sub-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 8px;
+  flex-wrap: wrap;
+}
+
+.mn-sub-status,
+.mn-sub-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.mn-sub-status {
+  min-width: 0;
+}
+
+.mn-sub-actions {
+  margin-inline-start: auto;
+}
+
+.mn-sub-last {
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+/* ═══════════ ④ 工具栏 ═══════════ */
+
+.mn-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.mn-toolbar-reason {
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * `search-field`（§3.1 第 9 条 touch-adapted）：48 高、**前导字形不变**，外加一颗清除键。
+ * 清除键那半条 spec 自己写了理由 —— 触屏没有 Esc；而 `type="search"` 并不兑现它：
+ * Android WebView 默认不渲染 `::-webkit-search-cancel-button`，靠属性等于什么都没有。
+ *
+ * 三段式（容器 flex / 字形 / 裸 input）与 `connections.css` 的 `.mc-search` 同一份：
+ * 边框、圆角、背景留在容器上，input 自己不再有框，否则前导字形会被画进一个框中框。
+ */
+.mn-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 1 1 12rem;
+  min-width: 0;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.875rem;
+}
+
+/* 焦点环挂在容器上：input 的原生框被去掉了，不补这条等于键盘用户看不到自己在哪
+   （桌面 `.search-box:focus-within` 同一处置）。 */
+.mn-search:focus-within {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+/* `action.search`（icon-registry 已登记）：一排同样圆角边框的控件里，这颗字形是搜索框的身份标识。 */
+.mn-search svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: hsl(var(--fg-faint));
+}
+
+.mn-search input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--sp-2) 0;
+  border: 0;
+  background: none;
+  outline: none;
+  font: inherit;
+  color: inherit;
+}
+
+/* 清除键：`layout.touchTargetMin` 的 48，负外边距把它顶到容器边沿 —— 不然右侧会多出 12 的死区。 */
+.mn-search-clear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--tap-min);
+  min-height: var(--tap-min);
+  margin-inline-end: calc(-1 * var(--sp-3));
+  padding: 0;
+  border: 0;
+  background: none;
+  color: hsl(var(--fg-dim));
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mn-select {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  min-width: 7rem;
+  max-width: 12rem;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.875rem;
+}
+
+/*
+ * 三档的**排布**差异（content parity：控件在三档都在 DOM 里，变的只是哪一份可见）。
+ *  compact  搜索 + 「筛选/排序」一颗
+ *  medium   搜索 + 排序内联 + 「筛选/排序」（协议筛选仍在 sheet 里）
+ *  expanded 搜索 + 协议筛选 + 排序全内联 + 「测可见」
+ */
+.mn-from-medium,
+.mn-only-expanded {
+  display: none;
+}
+
+@container mscreen (min-width: 37.5em) {
+  .mn-from-medium {
+    display: flex;
+  }
+}
+
+@container mscreen (min-width: 52.5em) {
+  .mn-only-expanded {
+    display: flex;
+  }
+
+  .mn-until-expanded {
+    display: none;
+  }
+}
+
+/* ═══════════ ⑤ 注脚（TsExitWarning / 组网隧道健康 / 行内反馈）═══════════ */
+
+/*
+ * `notice-banner`（§3.1 第 1 条）：满幅的「图标 + 文字（+ 动作）」条。
+ * 三档语气保持三档 —— 合并会丢掉「未生效」「此处不适用」「已关掉」之间的区别。
+ */
+.mn-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+}
+
+.mn-notice.warn {
+  border-color: hsl(var(--warn-weak));
+}
+
+.mn-notice.err {
+  border-color: hsl(var(--err-weak));
+}
+
+.mn-notice.ok {
+  border-color: hsl(var(--ok-weak));
+}
+
+.mn-notice-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: hsl(var(--warn));
+}
+
+.mn-notice-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.mn-notice-text {
+  margin: 0;
+  min-width: 0;
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* 注脚里的动作：不是按钮外形，是句子里的一段可点文字（与桌面同形）。 */
+.mn-notice-act {
+  margin-inline-start: var(--sp-2);
+  padding: 0;
+  border: 0;
+  background: none;
+  color: hsl(var(--warn));
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/*
+ * Actionable configuration errors stay visible here. Background explanations share the row's i layer.
+ */
+.mn-note {
+  margin: var(--sp-1) 0 0;
+  color: hsl(var(--fg-faint));
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.mn-note.err {
+  color: hsl(var(--err));
+}
+
+/* ═══════════ ⑥ 列表 ═══════════ */
+
+/* 连贯分隔行减少 116 节点列表的重复卡框。只在每列足够读完名称、协议、延迟及更多时分栏；
+ * Grid 按 DOM 顺序先行后列排布，键盘顺序与视觉阅读顺序相同。52.5em 阈值随大字上移。 */
+.mn-list {
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r);
+  background: hsl(var(--surface));
+  overflow: hidden;
+}
+
+.mn-row {
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-1);
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+.mn-row-actions { display: flex; flex: none; align-items: center; }
+
+@container mscreen (min-width: 52.5em) {
+  .mn-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 24px;
+  }
+}
+
+.mn-row.cur {
+  background: hsl(var(--flow-weak));
+  border-inline-start: 3px solid hsl(var(--flow));
+}
+
+.mn-row.sel {
+  background: hsl(var(--surface-3));
+  border-inline-start: 3px solid hsl(var(--flow-hi));
+}
+
+/* 整行即主动作（批选态 = 勾选，否则 = 设为出口）。 */
+.mn-row-main {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-1);
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--tap-min);
+  padding: 8px 10px;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  text-align: start;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mn-row-main:active {
+  opacity: 0.7;
+}
+
+.mn-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.mn-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.9375rem;
+  font-weight: 500;
+}
+
+/* 被启动 gate 剔除的节点：名称降透明（桌面 `.nd-invalid` 同口径），理由另起常驻一行。 */
+.mn-name.invalid {
+  opacity: 0.55;
+}
+
+/*
+ * 行尾延迟位。**分档语义色是本位的全部信息量**（§3.1 第 18 条：行尾数值与每一个颜色角色原样过来）：
+ * 挑快节点在四十行等宽数字里靠的就是这条扫视通道，全档同色等于把它关掉，只剩逐个读数或改排序。
+ * 分档口径复用桌面那条腿（`screens/shared/format.ts#latLevel`，fast<80 / mid<150 / slow<300 / dead），
+ * 颜色角色逐条对齐桌面 `.nd-top .nd-lat.*`（screens.css:135-139）。
+ */
+.mn-lat {
+  flex: none;
+  color: hsl(var(--fg-dim));
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+
+.mn-lat.fast {
+  color: hsl(var(--ok));
+}
+
+.mn-lat.mid {
+  color: hsl(var(--flow-hi));
+}
+
+.mn-lat.slow {
+  color: hsl(var(--warn));
+}
+
+.mn-lat.dead {
+  color: hsl(var(--err));
+}
+
+/* `none` = 没测过 / 陈旧 / 结构上不可测。这一档**不许**染成任何语义色：那三种情况说的都是
+   「这里没有一个可信的数」，给它一个绿或红就是替用户断言一件我们并不知道的事。 */
+.mn-lat.none {
+  color: hsl(var(--fg-faint));
+}
+
+.mn-pills {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+}
+
+/*
+ * 行内角标。§3.1 第 18 条：entity-row 的**角标胶囊**与每一个颜色角色原样过来，变的只有
+ * 「动作从铺开改为可达」。原型同向（`mobile-home-breakpoints.html:45-46`：`.pill{border-radius:999px}`、
+ * `.pill.proto{background:hsl(var(--flow-weak));color:hsl(var(--flow-hi))}`），kit 与原型不冲突。
+ * 此前这里是中性描边 + 6px 圆角，协议与「可作出口」两颗被降成同一颗灰标签，扫视时分不出来。
+ *
+ * ⚠️ `padding: 2px 6px` 与 `border: 1px` 两条**不许改数**：`styles/text-fit.test.ts:2927-2929`
+ * 现场读它们推算角标可用宽（`MN_PILL_AVAIL` 钉死 258），那道门不在本批射程里。
+ * 故边框保留 1px 占位、改成 `transparent`：几何链不动，视觉上与桌面 `.nd-cap` 的填充胶囊一致。
+ */
+.mn-pill {
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 999px; /* radius.pill */
+  background: hsl(var(--surface-3));
+  color: hsl(var(--fg-dim));
+  font-size: 0.6875rem;
+  line-height: 1.4;
+}
+
+/* 协议角标 —— 桌面 `.pill.proto`（components.css:67）。 */
+.mn-pill.proto {
+  background: hsl(var(--flow-weak));
+  color: hsl(var(--flow-hi));
+}
+
+/* 「可作出口」—— 桌面 `.nd-cap.exit`（screens.css:144）。 */
+.mn-pill.exit {
+  background: hsl(var(--aurora-weak));
+  color: hsl(var(--aurora-hi));
+}
+
+/*
+ * 本行来自已保存选择，热切收据可能仍为 pending/deferred；它不能声称实时出口已生效。
+ * 因此移动端用 interactive 色表示「已选择」，不复用桌面代表成功的 `.nd-cur` 状态色。
+ * 桌面那颗 `::before` 圆点**不跟**：text-fit 的角标宽度模型只算 padding/border/文字，
+ * 加一个伪元素会让模型低估实际宽度，而重算那道门不在本批射程里。
+ */
+.mn-pill.cur {
+  background: hsl(var(--flow-weak));
+  color: hsl(var(--flow-hi));
+}
+
+.mn-pill.warn {
+  background: hsl(var(--warn-weak));
+  color: hsl(var(--warn));
+}
+
+.mn-pill.err {
+  background: hsl(var(--err-weak));
+  color: hsl(var(--err));
+}
+
+.mn-xfer {
+  color: hsl(var(--fg-faint));
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+}
+
+/* 行尾那颗打开动作面（§3.1 第 18 条：动作从「铺开」改为「可达」）。 */
+.mn-row-more {
+  flex: none;
+  width: var(--tap-min);
+  min-height: var(--tap-min);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: hsl(var(--fg-dim));
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mn-row-more svg {
+  width: 20px;
+  height: 20px;
+}
+
+.mn-empty {
+  text-align: center;
+  color: hsl(var(--fg-dim));
+  font-size: 0.875rem;
+}
+
+.mn-empty p {
+  margin: 0;
+}
+
+/* ═══════════ ⑦ 批量条：停在滚动区底沿（= 底部导航正上方）═══════════ */
+
+/*
+ * `position: sticky; bottom: 0` 而不是 `fixed` + 「导航高 + 安全区」的魔法数：
+ * 那个数住在外壳里、会随外壳变，且待应用条一旦进槽位就会与它重叠。
+ * sticky 让排版自己说出这个位置，外壳改高度时这里零改动。
+ */
+.mn-batch {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  padding: var(--sp-2);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r);
+  background: hsl(var(--surface-2));
+  /* `--shadow` 是一组裸 HSL 分量（`216 45% 20%`），不是 shadow 值：直接塞进 box-shadow
+     整条声明会被丢弃且不报错。成品阴影只有 `--shadow-pop` 一个。 */
+  box-shadow: var(--shadow-pop);
+}
+
+.mn-batch-count {
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+}
+
+/* ═══════════ bottom-sheet ═══════════ */
+
+/*
+ * fixed 的包含块是外壳不滚动的 `.m-screen-viewport`，其显式 layout containment
+ * 不依赖浏览器对 container-type 的隐含行为，也不会让面板随正文滚动。
+ * 于是这张表停在**滚动区**的边界内，也就是底部导航之上、状态栏安全区之下。
+ * 这不是将就：底部导航在移动端是常驻 chrome，一张盖住它的表会让「退出这一屏」这件事没有出口。
+ * 底部停靠区在这个包含块之外。
+ */
+.mn-sheet-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.mn-sheet-scrim {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: hsl(var(--bg)/0.55);
+  cursor: pointer;
+}
+
+.mn-sheet {
+  position: relative;
+  box-sizing: border-box;
+  max-height: 80%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-2) calc(var(--card-padding) + var(--safe-r)) calc(var(--card-padding) + var(--safe-b)) calc(var(--card-padding) + var(--safe-l));
+  border-top-left-radius: var(--r-lg);
+  border-top-right-radius: var(--r-lg);
+  background: hsl(var(--surface));
+  /* `--shadow-sheet` 只在契约 C 的白名单注释里出现过，token 入口并没有定义它 —— 用未定义的
+     变量会让整条 box-shadow 静默失效。取已定义的 `--shadow-pop`（同一族的大柔影）。 */
+  box-shadow: var(--shadow-pop);
+}
+
+/* 拖拽把手：触屏没有「点遮罩关闭」的肌肉记忆，这条是关闭手势的可见承诺。 */
+.mn-sheet-grip {
+  width: 36px;
+  height: 4px;
+  margin: 0 auto var(--sp-3);
+  border-radius: 2px;
+  background: hsl(var(--hair));
+}
+
+.mn-sheet-head {
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid hsl(var(--hair));
+  color: hsl(var(--fg-dim));
+  font-size: 0.9375rem;
+}
+
+.mn-sheet-head h2 { font-size: inherit; font-weight: 600; line-height: 1.35; max-height: 2.7em; overflow-y: auto; }
+.mn-sheet-close {
+  display: grid; place-items: center; flex: none;
+  width: var(--tap-min); min-height: var(--tap-min); padding: 0;
+  border: 0; border-radius: var(--r-sm); background: transparent; color: inherit;
+}
+.mn-sheet-close svg { width: 18px; height: 18px; }
+.mn-sheet-close:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+
+.mn-sheet-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.mn-sheet-row {
+  padding: var(--sp-1) 0;
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+.mn-sheet-btn {
+  width: 100%;
+  min-height: var(--tap-min);
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.9375rem;
+  text-align: start;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mn-sheet-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mn-sheet-row.danger .mn-sheet-btn {
+  color: hsl(var(--err));
+}
+
+.mn-sheet-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid hsl(var(--hair));
+  color: hsl(var(--fg-dim));
+  font-size: 0.875rem;
+}
+
+/*
+ * 订阅摘要的用量条（W-06，2026-09-06）。
+ *
+ * 桌面 `SubInfoBar` 把 `已用 / 总量` 与一根进度条并排放在一行（`.sub-usage` + `.bar`）；
+ * 这里保持同一形态，只是宽度吃满一行 —— 手机上把数字与条挤成一行会让条短到读不出比例。
+ * 告警档（`subUsage` 的 `warn`，阈值住在 `nodes-logic`，不在这里重定）换色而不是加图标：
+ * 同一条信息在一个位置上用两种符号说两遍是噪声。
+ */
+.mn-sub-usage {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+}
+
+.mn-sub-usage.warn {
+  color: hsl(var(--warn));
+}
+
+.mn-sub-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: hsl(var(--surface-3));
+  overflow: hidden;
+}
+
+.mn-sub-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: currentcolor;
+}

@@ -92,6 +92,9 @@ pub struct UserConfig {
     // 而 config.json 里是 `appRules` → `default` 静默给空 Vec → 应用分流整条在运行期不存在。
     #[serde(rename = "appRules", default)]
     pub app_rules: Vec<AppRule>,
+    /// 应用分流总开关。**缺省（`None`，存量配置从没写过这个键）视为开，只有显式 `false` 才关**，
+    /// 与两端界面（`!== false`）及 `store::sanitize`（非 boolean 删键、不回填）同口径。
+    /// 引擎读点一律写 `!= Some(false)`，回归面见 `tests/app_routing_gate_tristate.rs`。
     #[serde(rename = "appRoutingEnabled")]
     pub app_routing_enabled: Option<bool>,
     #[serde(rename = "customAppPresets", default)]

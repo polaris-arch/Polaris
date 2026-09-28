@@ -1,26 +1,13 @@
 /**
- * TUN 默认 MTU —— Rust 侧 `crates/config-engine/src/user_config/tun_config.rs` 的 `DEFAULT_TUN_MTU`
- * 的渲染端副本。
+ * TUN MTU 输入的渲染端纯逻辑（区间 + 解析）。
  *
- * # 为什么渲染端需要一份
+ * # 这里**没有**默认 MTU（2026-09-25 起）
  *
- * MTU 设置项的「自动」态要**当场告诉用户自动是多少**（占位符里的那个数），不算出来就只能写一句
- * 「自动」让用户去猜。
- *
- * # 为什么是一个常量，不再是「栈 × 平台」的函数
- *
- * sing-box 1.15.0-alpha.3 起 TUN `stack` 弃用，Polaris 已整体移除栈的概念（不下发、无设置项），
- * 一律走 sing-tun 新栈。此前按栈与平台分三档（65535 / 9000 / 4064）的依据全是旧栈上的实测，
- * 自变量没了，默认值收敛成上游桌面默认 65535，与平台无关。判据（2026-09-13 两平台实测）见 Rust 侧常量的文档注释。
- *
- * # 两侧同值怎么保证
- *
- * 生成期的真值**始终在 Rust**（本文件只影响显示，改坏了也不会让内核拿到别的 MTU）。
- * `tun-mtu.test.ts` 直接读 Rust 源码里的常量字面量与本常量对拍 —— 任一侧改值而另一侧没跟即红。
+ * 用户留空 = 生成期**不下发** `mtu` 键，由 sing-box 内核按运行环境取默认（上游
+ * `protocol/tun/inbound.go` 的 `options.MTU == 0` 分支）。Polaris 不持有平台 → MTU 表：
+ * 抄一份只会在上游改值时静默分叉，且渲染端看到的平台与内核看到的运行环境未必同一口径。
+ * 故设置页占位符只写「自动（内核默认）」、不写数字。Rust 侧依据见 `TunModeConfig::mtu` 的文档注释。
  */
-
-/** 用户未填 MTU 时内核实际拿到的值（= Rust `DEFAULT_TUN_MTU`）。 */
-export const DEFAULT_TUN_MTU = 65535;
 
 /** 内核接受的 MTU 区间（与 `polaris-store` 的 `validate_config` 同值）。 */
 export const MTU_MIN = 1280;

@@ -1,24 +1,42 @@
 use super::*;
 
 #[test]
-fn draft_uses_renderer_camel_case_and_accepts_legacy_keys() {
-    let raw = json!({
-        "address": "engage.cloudflareclient.com", "port": 2408,
-        "private_key": "private", "peer_public_key": "peer", "local_address": ["172.16.0.2/32"],
-        "meta": {"deviceId": "device", "accountId": "account", "license": "", "warpPlus": false},
-        "warp_device": {"deviceId": "device", "token": "token"}
-    });
-    let draft: WarpWireGuardDraft = serde_json::from_value(raw).unwrap();
-    let wire = serde_json::to_value(&draft).unwrap();
-    assert_eq!(wire["privateKey"], "private");
-    assert_eq!(wire["peerPublicKey"], "peer");
-    assert_eq!(wire["localAddress"], json!(["172.16.0.2/32"]));
-    assert!(wire.get("private_key").is_none());
-    assert!(wire.get("peer_public_key").is_none());
-    assert_eq!(
-        serde_json::from_value::<WarpWireGuardDraft>(wire).unwrap(),
-        draft
-    );
+fn registration_draft_serializes_the_renderer_camel_case_contract() {
+    let draft = WarpWireGuardDraft {
+        address: WARP_DEFAULT_ENDPOINT_HOST.into(),
+        port: WARP_DEFAULT_ENDPOINT_PORT,
+        private_key: b64(&[0; 32]),
+        peer_public_key: b64(&[1; 32]),
+        local_address: vec!["172.16.0.2/32".into(), "2606:4700:110::2/128".into()],
+        reserved: Some(vec![1, 2, 3]),
+        meta: WarpDraftMeta {
+            device_id: "synthetic-device".into(),
+            account_id: "synthetic-account".into(),
+            license: String::new(),
+            warp_plus: false,
+        },
+        warp_device: WarpDeviceCreds {
+            device_id: "synthetic-device".into(),
+            token: "synthetic-test-token-not-a-real-credential".into(),
+        },
+    };
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("registration-draft.json")).unwrap();
+    assert_eq!(serde_json::to_value(draft).unwrap(), expected);
+}
+
+#[test]
+fn registration_draft_accepts_legacy_key_names_but_emits_camel_case() {
+    let canonical: serde_json::Value =
+        serde_json::from_str(include_str!("registration-draft.json")).unwrap();
+    let mut legacy = canonical.clone();
+    let object = legacy.as_object_mut().unwrap();
+    let private_key = object.remove("privateKey").unwrap();
+    let peer_key = object.remove("peerPublicKey").unwrap();
+    object.insert("private_key".into(), private_key);
+    object.insert("peer_public_key".into(), peer_key);
+    let draft: WarpWireGuardDraft = serde_json::from_value(legacy).unwrap();
+    assert_eq!(serde_json::to_value(draft).unwrap(), canonical);
 }
 
 fn b64(bytes: &[u8]) -> String {

@@ -137,11 +137,33 @@ impl InstallPaths {
     }
 
     /// 按平台取路径。
+    ///
+    /// # `Platform::Android` / `Platform::Ios` 与 `Platform::Other` 同臂的理由（2026-09-04 K10、2026-09-06）
+    ///
+    /// 本 crate 整条链的入口是 `runtime/helper.rs::platform_supported`，它对这三个变体都恒 `false`
+    /// ⇒ 生产路径上 `HelperManager` 在这些平台上**不会被构造**，本函数也就不会被调到。臂里给
+    /// linux 路径是**类型完整性占位**，不是「Android 用 linux helper」——Android 上根本没有 helper
+    /// 二进制、没有 systemd、没有 pkexec。
+    ///
+    /// **iOS 的理由更硬一档，且与 Android 不是同一句话**（本 crate 全部 7 处 `Ios` 臂共用本段，
+    /// 各站点只写该处特有的那半句）：Android 上「没有 helper」是本仓的构建与分发选择——理论上
+    /// 一台 root 过的设备上存在别的形态；iOS 上则是**平台不允许存在这样的东西**——沙箱里没有
+    /// 常驻 root 守护进程这个概念，没有 launchd/systemd/SCM 等价的用户可注册面，也没有任何
+    /// 应用可用的提权通道（iOS 的「提权」对应物是系统按 entitlement 授予 NE 扩展的隧道权限，
+    /// 那条链整个不经过本 crate）。⇒ 本臂在 iOS 上不是「暂未实现」，是**结构性不可达**。
+    ///
+    /// 为什么不 `unreachable!()`：本函数是 `const`-friendly 的纯路径映射，被单测按全变体扫过；
+    /// 一个 panic 臂会把「谁不小心在 Android 上构造了 manager」从一条静默的无用路径变成一次崩溃，
+    /// 而那条路径的正确处置是在**入口**（`platform_supported`）拦，不是在末端炸。入口那条判据由
+    /// `runtime/helper/tests/mod.rs` 的全变体断言钉死。
     #[must_use]
     pub fn for_platform(platform: Platform) -> Self {
         match platform {
             Platform::Mac => Self::mac(),
-            Platform::Linux | Platform::Other => Self::linux(),
+            // 路径映射：iOS 同 Android/Other 取 linux 占位路径。本处特有的那半句 —— iOS 上
+            // `/Library/...`、`/etc/systemd/...` 这类绝对路径在应用沙箱里连命名空间都不存在，
+            // 占位值取哪一套都等价，取 linux 只为与既有臂同形。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => Self::linux(),
             Platform::Win => Self::win(),
         }
     }
@@ -262,7 +284,19 @@ impl HelperManager {
             // 服务在而二进制被手删判已装（ping 挂 → needs_repair 可修复，优于误报未装）。
             Platform::Win => self.sysops.service_exists(self.paths.service_label),
             // mac/linux：support 目录无此 ACL 锁（plist/unit 可 stat），binary+描述符双证据。
-            _ => {
+            // Other/Android/Ios 同臂且不可达（`platform_supported` 恒 false，见
+            // `InstallPaths::for_platform` 头注）。**具名而非裸 `_`**（2026-09-04 K10）：裸通配臂
+            // 会让「新增平台变体」这件事在编译期无声通过，而这里恰好是 Windows 与其余平台
+            // 取证策略不同的那一处 —— 新平台该走哪种证据是必须现场答的题。
+            //
+            // iOS 现场答题（2026-09-06）：走双证据臂而不是 SCM 单证据臂。本处特有的那半句 ——
+            // 选 SCM 那一侧的前提是「存在一个服务注册表可查」，iOS 上没有任何这样的面；而双证据
+            // 臂退化成两次 `exists()` 假查询，恒 false = 「没装」，正是诚实答案。
+            Platform::Mac
+            | Platform::Linux
+            | Platform::Other
+            | Platform::Android
+            | Platform::Ios => {
                 if !self.sysops.exists(&self.paths.binary) {
                     return false;
                 }
@@ -705,7 +739,10 @@ impl HelperManager {
     ) -> Result<String, ManagerError> {
         match self.platform {
             Platform::Mac => Ok(build_mac_install_script(&self.paths, params, token)),
-            Platform::Linux | Platform::Other => {
+            // Android/iOS 同 Other：无 helper 可装，本臂不可达（理由见 `InstallPaths::for_platform`）。
+            // iOS 本处特有的那半句：脚本这个概念本身在 iOS 上没有承载物 —— 应用沙箱里没有可执行
+            // 的 shell，写出来的 .sh 没有任何东西能跑它。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
                 Ok(build_linux_install_script(&self.paths, params))
             }
             Platform::Win => Ok(build_win_install_script(&self.paths, params, token)),
@@ -716,7 +753,11 @@ impl HelperManager {
     fn build_uninstall_script(&self) -> String {
         match self.platform {
             Platform::Mac => build_mac_uninstall_script(&self.paths),
-            Platform::Linux | Platform::Other => build_linux_uninstall_script(&self.paths),
+            // Android/iOS 同 Other：不可达，理由见 `InstallPaths::for_platform`。
+            // iOS 本处特有的那半句：同上——没有 shell 可跑，且没有装过的东西可卸。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
+                build_linux_uninstall_script(&self.paths)
+            }
             Platform::Win => build_win_uninstall_script(),
         }
     }
@@ -725,14 +766,28 @@ impl HelperManager {
     const fn install_script_name(&self) -> &'static str {
         match self.platform {
             Platform::Win => "polaris-helper-install.ps1",
-            _ => "polaris-helper-install.sh",
+            // 具名而非裸 `_`（2026-09-04 K10）：扩展名跟的是脚本语言（PowerShell vs bash），
+            // 新平台未必是这两种之一。
+            // iOS 现场答题（2026-09-06）：既然两种脚本语言在 iOS 上都不存在，这个名字纯粹是
+            // 不可达路径上的占位；跟 bash 那一侧只为与 `build_install_script` 的臂同形——两处
+            // 若分叉，将来真有人误在 iOS 上走到这条路时会拿到「名字是 .ps1、内容是 bash」。
+            Platform::Mac
+            | Platform::Linux
+            | Platform::Other
+            | Platform::Android
+            | Platform::Ios => "polaris-helper-install.sh",
         }
     }
 
     const fn uninstall_script_name(&self) -> &'static str {
         match self.platform {
             Platform::Win => "polaris-helper-uninstall.ps1",
-            _ => "polaris-helper-uninstall.sh",
+            // iOS 同上一函数：不可达占位，与 `build_uninstall_script` 的臂逐值同形。
+            Platform::Mac
+            | Platform::Linux
+            | Platform::Other
+            | Platform::Android
+            | Platform::Ios => "polaris-helper-uninstall.sh",
         }
     }
 
@@ -760,7 +815,14 @@ impl HelperManager {
     fn build_escalation(&self, script_path: &str) -> Result<Escalation, ManagerError> {
         Ok(match self.platform {
             Platform::Mac => osascript_escalation(script_path),
-            Platform::Linux | Platform::Other => pkexec_escalation(script_path),
+            // Android 同 Other：不可达。Android 上既没有 pkexec 也没有任何应用可用的提权通道
+            // （提权在那个平台的对应物是系统授予的 `VpnService` 权限，不经本 crate）。
+            // iOS 本处特有的那半句：同为不可达，但对应物换成「系统按 packet-tunnel-provider
+            // entitlement 授予 NE 扩展的隧道权限」——它在**安装期**由描述文件决定，运行期没有
+            // 任何「向用户求一次权」的交互面，故 `Escalation` 这个概念在 iOS 上没有对应物。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
+                pkexec_escalation(script_path)
+            }
             Platform::Win => uac_escalation(script_path)?,
         })
     }

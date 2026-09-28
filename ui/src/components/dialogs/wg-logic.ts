@@ -30,8 +30,9 @@
 
 import type { ServerConfig } from '@/contracts/types';
 import type { WireGuardSettings } from '@/contracts/types';
-import type { FormValues } from './FieldSpec';
-import { parseNumberField } from './FieldSpec';
+/* 同 `proto-codec.ts`：取规格纯数据层，不取渲染器（后者会把整条桌面组件链拖进包）。 */
+import type { FormValues } from './field-spec';
+import { parseNumberField } from './field-spec';
 import { parseWgQuickConf, type ParsedWgQuick } from '@/domain/wg-quick';
 import { isWarpServer } from '@/domain/warp';
 import { applyDetour, detourDraftValue, DETOUR_NONE } from './detour-options';

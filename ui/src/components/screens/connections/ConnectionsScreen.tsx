@@ -137,12 +137,12 @@ interface ConnStaticProjection {
 }
 
 interface ConnStaticCacheEntry {
-  host?: string;
-  destinationIP?: string;
-  destinationPort?: string;
-  network?: string;
-  inboundType?: string;
-  processPath?: string;
+  host?: string | null;
+  destinationIP?: string | null;
+  destinationPort?: string | null;
+  network?: string | null;
+  inboundType?: string | null;
+  processPath?: string | null;
   rule: string;
   rulePayload?: string;
   chain?: string;

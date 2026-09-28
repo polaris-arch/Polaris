@@ -94,6 +94,39 @@ describe('submitRule · networkProfileId', () => {
   });
 });
 
+describe('submitRule · validation location', () => {
+  it('reports one deterministic destination when both name and conditions are empty', async () => {
+    const onValidationError = vi.fn();
+    const setErrName = vi.fn();
+    const x = args({ name: '', conds: [{ t: 'domainSuffix', v: '' }], onValidationError, setErrName });
+    await submitRule(x.a);
+    expect(setErrName).toHaveBeenCalledWith(true);
+    expect(onValidationError).toHaveBeenCalledOnce();
+    expect(onValidationError).toHaveBeenCalledWith('basic');
+    expect(x.staged).toHaveLength(0);
+  });
+
+  it('sends missing or malformed conditions to the condition group without staging a rule', async () => {
+    for (const conds of [
+      [{ t: 'domainSuffix' as const, v: '' }],
+      [{ t: 'ipCidr' as const, v: '10.0.0.0/40' }],
+    ]) {
+      const onValidationError = vi.fn();
+      const x = args({ conds, onValidationError });
+      await submitRule(x.a);
+      expect(onValidationError).toHaveBeenCalledOnce();
+      expect(onValidationError).toHaveBeenCalledWith('cond');
+      expect(x.staged).toHaveLength(0);
+    }
+  });
+
+  it('does not invoke presentation callback on successful submission', async () => {
+    const onValidationError = vi.fn();
+    await submitRule(args({ onValidationError }).a);
+    expect(onValidationError).not.toHaveBeenCalled();
+  });
+});
+
 describe('新建带场景的规则插到最前（spec §3.4-4，不改排序协议）', () => {
   const planeOrder = { ruleIds: ['a', 'b', 'c'], persistedOrder: ['c', 'a', 'b'] };
   beforeEach(() => {

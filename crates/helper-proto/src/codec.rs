@@ -45,8 +45,14 @@ pub const READ_TIMEOUT_SECS: u64 = 5;
 #[must_use]
 pub fn encode_frame(platform: Platform, token: &str, req: &Request) -> Vec<String> {
     let mut lines = Vec::new();
-    // mac/win：行1 = token（Go handle() 首个 readLine；linux 经 SO_PEERCRED 鉴权，无此行）
-    if platform != Platform::Linux {
+    // mac/win：行1 = token（Go handle() 首个 readLine；linux 经 SO_PEERCRED 鉴权，无此行）。
+    //
+    // 判据取 [`Platform::has_token_line`]，**不再在这里另写一份**：原先是 `platform != Platform::Linux`
+    // —— 同一个问题的第二份答案，且已经与第一份漂开（2026-09-04 K10 发现）。`Other` 上
+    // `has_token_line()==false` 而 `!= Linux` 为 true，即那份注释与单测都写着「未知平台不发 token 行，
+    // 避免对未鉴权对端泄露凭据」，而生产**照发**。mac/win/linux 三平台两份判据答案逐值相同，
+    // 故本次收口对桌面是恒等变换（见 codec/tests 的三平台逐值对拍）。
+    if platform.has_token_line() {
         lines.push(token.to_owned());
     }
     // 命令行

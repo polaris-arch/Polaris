@@ -1,0 +1,701 @@
+/* This stylesheet belongs only to the mobile document (including body portals).
+   Hide scrollbar chrome without changing overflow, input or scroll behavior.
+   WebKit is the fallback for supported WebViews before scrollbar-width. */
+html { scrollbar-width: none; }
+body { scrollbar-width: none; }
+body * { scrollbar-width: none; }
+html::-webkit-scrollbar { display: none; }
+body::-webkit-scrollbar { display: none; }
+body *::-webkit-scrollbar { display: none; }
+
+/*
+ * 移动端外壳样式。共享 token 基线来自 `../styles/tokens.resolved.css`，移动暗色由
+ * `theme.css` 独立覆盖；`MobileMain.tsx` 显式加载，本文件不写 `@import`，桌面入口不加载它。
+ *
+ * 规格：`~/docs/polaris/design/mobile-kit/component-specs/mobile-screen-shell.md`
+ *      + `component-specs/bottom-navigation.md`；数值真值源 `mobile-kit/tokens/core.json`。
+ * 设计文档：`~/docs/polaris/design/polaris-mobile-shell-2026-09-04.md`。
+ *
+ * ── 只用 Chromium ≤105 的特性 ───────────────────────────────────────────────
+ * 本文件在 `../styles/css-feature-floor.test.ts` 的取材面内（它走目录树发现 `ui/src` 下全部 .css）。
+ * `@container` / `:has()` 是下限本体（105），`dvh`（108）/ `column-count` 之类**不在名单里**，
+ * 用了会红。分发走 APK、用户 WebView 停在出厂版，运行期不会报错 —— 那道构建期的门是唯一防线。
+ */
+
+/* ═══════════ 根：Dynamic Type 接缝 + 响应标量缺省 ═══════════ */
+
+:root {
+  /*
+   * Dynamic Type 的**消费端**（D-10）。生产端在原生层：Android 读 `Configuration.fontScale`、
+   * iOS 映射 `preferredContentSizeCategory`，把真值写成根元素的**内联** `--font-scale`
+   * （内联样式压过本条声明，无需改 CSS）。这里给的是缺省值 1 —— 生产端缺席时外壳按 1x 正常工作。
+   *
+   * Android 的生产端 **2026-09-05 已落地**（`MainActivity.kt` 的 `publishFontScale`，与四条
+   * `--safe-*` 同一条接缝、同两条投递通道）。此前这里记着「生产端属 Kotlin 面、刻意不立门」——
+   * 那句话的前提（没人能修）已经不成立，两侧的门分别在
+   * `mobile-entry.test.ts` ⑧（原生生产端）与 `dynamic-type.test.ts`（CSS 消费端 + 竖排回退）。
+   * iOS 侧仍无生产端，缺省 1 继续兜底。
+   *
+   * ⚠️ 为什么不能把 `--font-scale` 写进 `tokens.resolved.css`：它不匹配契约 C 的白名单前缀
+   *    （`--tap-*` / `--safe-*` / `--shadow-sheet`），写进入口 `mobile-token-parity` 当场红。
+   *    那是**刻意留的红** —— 扩白名单该是一次有记录的决策。故它住在这里，不住在 token 入口。
+   */
+  --font-scale: 1;
+
+  /*
+   * 三个响应标量的 compact 缺省（`core.json` 的 `layout.responsive`）。
+   * 外壳解析一次，卡片继承；**卡片不得自己写死 16**（spec「Breakpoints」第三条）。
+   */
+  --page-inset: var(--sp-4); /* 16 */
+  --section-gap: var(--sp-3); /* 12 */
+  --card-padding: var(--sp-4); /* 16 */
+
+  /*
+   * 底部导航几何。**不随 Dynamic Type 缩放**。
+   *
+   * ⚠️ 图标尺寸与指示条宽度**不取 `bottom-navigation.md`**：那份 md 写「Icon visual: 24」与
+   * 「Active indicator: … approximately 40 wide」，与原型 `mobile-home-breakpoints.html:163`
+   * 的 `.nav svg{width:23px}`、`:162` 的 `.nav a.on::before{width:28px}` 直接冲突。
+   * 按 kit `README.md`「Source of truth」：**原型与 kit 分歧时原型胜、kit 是错的**。
+   *
+   * 23 这一侧另有两个旁证（`core.json` 的 `layout.iconVisualSize`、`ui-manifest.json` 的
+   * bottom-navigation `dimensions.icon`），md 的 24 是 kit 里唯一的孤证；28 那一侧则连旁证都
+   * 不需要 —— manifest 的 `dimensions` 只登记了 `indicatorHeight: 2`，**没有登记宽度**，
+   * 故指示条宽度的唯一真值源就是原型。
+   *
+   * 这段注释**不是**判据：md 那两行仍旧写着 24 与 40（已在 kit 里就地标注为错，但 kit 在
+   * `~/docs` 的 vault 里、不进本仓版本控制）。承重的那半是
+   * `bottom-navigation-kit-conflict.test.ts` —— 把下面两个值改回 md 那一版会当场转红。
+   */
+  --nav-h: 64px;
+  --nav-icon: 23px;
+  --nav-item-min: 64px;
+  --nav-item-max: 132px;
+  --nav-indicator-w: 28px;
+  --nav-indicator-h: 2px;
+
+  /*
+   * `color-scheme` 是**外壳的待办**，不是 token 入口的缺口（入口只含自定义属性）。
+   * 不设它，深色主题下原生表单控件与滚动条仍是浅色的 —— 那种不一致没有任何门看得见。
+   * 三条腿与 tokens.resolved.css 的主题腿逐字同构（跟随系统 / 显式深 / 隐含浅）。
+   */
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']):not([data-theme='dark']) {
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+/*
+ * 根字号 = 16 × 缩放。**只有它带单位是 px**，其余排版一律 rem ⇒ 字随缩放走。
+ * 几何（padding / gap / inset / radius / border / icon / 触控目标）一律 px ⇒ **框不动**。
+ * 一个 24 的内边距在 2x 下变 48，是把屏幕花在空白上、恰好在字最需要地方的时候；48 是手指，不是字母。
+ */
+html {
+  font-size: calc(16px * var(--font-scale));
+}
+
+/*
+ * Android WebView 的"字体放大"（font boosting）会**自作主张**放大它认为是正文的段落。
+ * 那是第二套与 `--font-scale` 打架的缩放系统，且不受应用控制：关掉它，缩放只有一个来源。
+ *
+ * ⚠️ **同一条理由下还有第三套**，且它不在 CSS 这一侧：`WebSettings.textZoom` 缺省由 WebView
+ *    从 `Configuration.fontScale` 初始化 ⇒ 不管它的话，本文件下面那条 `calc(16px * --font-scale)`
+ *    会与它**相乘**（2026-09-05 实测：1.3x 下根字号 27.04px = 16 × 1.3 × 1.3）。
+ *    `MainActivity.kt` 的 `publishFontScale` 用 `textZoom = 100` 把它钉成 1.0 倍，
+ *    与这里关 font boosting 是同一件事的两半，缺哪半都会让缩放重新有两个来源。
+ */
+html,
+body {
+  height: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: hsl(var(--bg));
+  color: hsl(var(--fg));
+  font-family: var(--sans);
+  /* 与桌面同口径：随包的 Space Grotesk 是可变字重（300–700），开合成会把 500/600/640 糊成一档。 */
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  /* 触控高亮由各控件的 :active 自绘，系统那层灰块会盖住自绘反馈。 */
+  -webkit-tap-highlight-color: transparent;
+}
+
+#root {
+  height: 100%;
+}
+
+/* ═══════════ 外壳骨架 ═══════════ */
+
+/*
+ * 竖向三段：状态栏安全区（padding-top）/ 滚动区（吸收剩余高度）/ 停靠区。
+ * 100% 是无 VisualViewport 时的回退；移动根监听器用可见视口几何约束键盘后的区域。
+ * `dvh` 是 Chrome 108，越过本仓 CSS 下限，而且不能替代 visual viewport 的偏移。
+ */
+.m-shell {
+  position: relative;
+  top: var(--m-vv-top, 0px);
+  left: var(--m-vv-left, 0px);
+  width: var(--m-vv-width, 100%);
+  display: flex;
+  flex-direction: column;
+  height: var(--m-vv-height, 100%);
+  padding-top: var(--safe-t);
+  box-sizing: border-box;
+}
+
+/*
+ * 不滚动的屏边界 = **断点容器**。阈值用 em：em 在容器查询里按容器自己的字号解析，字放大 ⇒ 有效宽度变窄 ⇒
+ * 容器自己降列。故这里**绝不能**写死 font-size —— 写死会静默关掉整条"大字自动降列"的机制。
+ * 显式 layout containment 让各屏 fixed 弹层有稳定包含块，不依赖不同 WebView 对
+ * container-type 的隐含 containment；包含块本身不滚动，弹层不会跟正文滑走。
+ */
+.m-screen-viewport {
+  container: mscreen / inline-size;
+  contain: layout;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.m-scroll {
+  height: 100%;
+  /* flex 子项的默认 min-height:auto 会让它被内容撑高、overflow 永不生效。 */
+  min-height: 0;
+  overflow-y: auto;
+  /* 滚到头时不把滚动交给宿主（Android 上表现为整页橡皮筋/下拉刷新错觉）。 */
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .m-scroll {
+    scroll-behavior: auto;
+  }
+}
+
+/*
+ * 内容页：section 节奏 + 页边距。左右各再加一份横向安全区 —— 横屏下刘海在侧边，
+ * 只给 `--page-inset` 会让首字母压在挖孔底下。
+ */
+.m-page {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 1120px;
+  margin-inline: auto;
+  gap: var(--section-gap);
+  padding-top: var(--sp-3); /* 头 → 第一个 section：12 */
+  padding-bottom: var(--sp-4); /* 导航停靠在滚动区**之外**，故这里只需要一段收尾留白 */
+  padding-left: calc(var(--page-inset) + var(--safe-l));
+  padding-right: calc(var(--page-inset) + var(--safe-r));
+  box-sizing: border-box;
+}
+
+/* 断点：medium ≥ 37.5em、expanded ≥ 52.5em（`core.json#breakpoints`）。
+ * 外壳只解析三个响应标量；多列列流（column-count / break-inside）本批不做，理由见设计文档 §6。 */
+@container mscreen (min-width: 37.5em) {
+  .m-page {
+    --page-inset: var(--sp-6); /* 24 */
+    --section-gap: var(--sp-5); /* 20 */
+    --card-padding: var(--sp-5); /* 20 */
+  }
+
+  /* 停靠区也要解析一次 `--page-inset`，理由见下面 `.m-dock` 那条注释。 */
+  .m-dock {
+    --page-inset: var(--sp-6); /* 24 */
+  }
+}
+
+@container mscreen (min-width: 52.5em) {
+  .m-page {
+    --page-inset: var(--sp-7); /* 32 */
+    --section-gap: 18px; /* 阶梯里没有 18；expanded 的 sectionGap 比 medium 略收，见 core.json */
+    --card-padding: var(--sp-6); /* 24 */
+  }
+
+  .m-dock {
+    --page-inset: var(--sp-7); /* 32 */
+  }
+}
+
+/* ═══════════ 停靠区：待应用条槽位 + 底部导航 ═══════════ */
+
+.m-dock {
+  flex: 0 0 auto;
+  background: hsl(var(--surface));
+  /* 顶分隔取 `border.subtle`(`--line`)，**不是** `divider.default`(`--hair`)：原型
+   * `mobile-home-breakpoints.html:156` 写的是 `border-top:1px solid hsl(var(--line))`，
+   * 与 `bottom-navigation.md` 的 Colors/tokens →「Top divider: `divider.default`」冲突
+   * ⇒ 原型胜（kit README）；那一行已在 kit 里就地标注为错，判据在
+   * `bottom-navigation-kit-conflict.test.ts`。
+   * 取 `--hair` 会让这条线重一档（深色 L 28% vs 23%、浅色 L 83% vs 87%），
+   * 导航区与内容区之间的切分显得比设计稿更硬。 */
+  border-top: 1px solid hsl(var(--line));
+  /* 底部安全区（手势条）在导航内容高度**之下**：导航本体仍是 64，不被安全区撑变形。
+   * `--safe-b` 的真值由原生侧写进根元素内联样式（`MainActivity.kt`，与 `--font-scale` 同一条
+   * 接缝）—— Android WebView 的 `env(safe-area-inset-bottom)` 只看 cutout、看不见手势条，
+   * 光靠 `tokens.resolved.css` 那条 `env()` 这里恒 0，导航就压在手势条底下。 */
+  padding-bottom: var(--safe-b);
+  padding-left: var(--safe-l);
+  padding-right: var(--safe-r);
+  /* toast 宿主的定位基准（它是 `absolute; bottom:100%` 的子元素，见下）。 */
+  position: relative;
+
+  /*
+   * 🔴 `--page-inset` 必须**在这里再解析一遍**（2026-09-06 复审 minor，已修）。
+   *
+   * 停靠区里的两件 chrome（`.m-toast-host` / `.m-pending`）都用 `var(--page-inset)` 表达
+   * 「跟着页面边距走」，但那两条断点覆写只写在 `.m-page` 上，而 `.m-dock` 是 `.m-scroll` 的
+   * **兄弟**、拿不到那次覆写 ⇒ 它们在 ≥37.5em 的容器上只能继承 `:root` 的 compact 缺省 16，
+   * 而同一竖线上的卡片已经是 24 / 32 —— 8~16px 的可见错位，且没有任何运行期报错。
+   * 缺省值仍由 `:root` 给（compact 档两边同为 16），这里只补断点那两档；判据在
+   * `mobile-chrome.test.tsx` ⑤（断言覆写规则的选择器集合同时覆盖 `.m-page` 与 `.m-dock`）。
+   * 同停靠区的 `.m-nav` 不用 `--page-inset`（走 `justify-content:center`），故这不是
+   * 「停靠区一律不响应」的既定口径。
+   */
+}
+
+/* 空槽零高度零 DOM 影响，与桌面"差集为空即 return null"同口径。 */
+.m-pending-slot:empty {
+  display: none;
+}
+
+/* ═══════════ toast 宿主：停靠区上沿，**不占布局** ═══════════
+ *
+ * `absolute` + `bottom:100%` 贴在停靠区上沿向上生长。两条后果都是要的：
+ *  · 不参与 flex 排布 ⇒ toast 进出场不会把滚动区挤得跳一下；
+ *  · 压栈的二级页上导航不渲染、停靠区本体仍在 ⇒ 宿主跟着留下，此时贴的是手势条上沿。
+ * 定位基准由 `.m-dock` 的 `position:relative` 给（见上）。
+ *
+ * 🔴 `z-index` 必须**高于全部弹层**（2026-09-06 批 3 复审 major，已修）。
+ *
+ * 此前这条规则没有 `z-index`（即 `auto`），而 `.m-form-layer`（`forms/forms.css`）是
+ * `position:fixed; z-index:40` 的兄弟层，两者同处根层叠上下文（`.m-shell` / `.m-dock` 都不建
+ * 层叠上下文）。按 CSS 绘制顺序，正 `z-index` 的定位元素（第 9 步）画在 `z-index:auto` 的定位
+ * 元素（第 8 步）之上，而 `.m-form-scrim` 是 `inset:0` 的半透明面、`.m-form-panel` 最高占
+ * 92% 屏高 —— toast 的落点（停靠区上沿）恰好被压在下面。
+ *
+ * 后果不是「不好看」：批 3 的 WARP 注册腿把「单例槽被占」这一档的**唯一**用户反馈押在
+ * `domain/mesh-singleton-guard` 的全局 toast 上（面板停留期间槽位被抢 ⇒ 零远端请求 + toast），
+ * 表单还开着的那一刻 toast 就发出，于是用户按下「注册」之后屏幕上什么都不发生。
+ * `half-truth-facts.test.ts` 里 `SILENT_TOAST_WITHOUT_HOST` 那段注释当初就写着「哪天有人让某条
+ * toast 在表单还开着时发出，先解决那个层叠问题」—— 这里就是解决它。
+ *
+ * 取 80：高于嵌套说明层 70；隐私锁 90 仍覆盖所有内容与提示。
+ * 判据在 `mobile-chrome.test.tsx` ⑥（宿主的 z 值 > 移动端 CSS 里任何一个 z 值）。
+ */
+.m-toast-host {
+  position: absolute;
+  z-index: 80;
+  bottom: 100%;
+  left: var(--safe-l);
+  right: var(--safe-r);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: 0 var(--page-inset) var(--sp-2);
+  box-sizing: border-box;
+  /* 栈整体不挡操作（同桌面原型语义）；带动作/关闭的那一条自己收回来。 */
+  pointer-events: none;
+}
+
+.m-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--r);
+  border: 1px solid hsl(var(--line));
+  background: hsl(var(--surface));
+  box-shadow: var(--shadow-pop);
+  color: hsl(var(--fg));
+  /* 进场：一次性播完，不靠「下一帧加 .show」那套两帧语义（判据环境里没有 rAF 可依赖）。 */
+  animation: m-toast-in 160ms ease-out;
+}
+
+.m-toast-ok {
+  border-color: hsl(var(--ok) / 0.45);
+  background: hsl(var(--ok-weak));
+  color: hsl(var(--ok));
+}
+
+.m-toast-err {
+  border-color: hsl(var(--err) / 0.45);
+  background: hsl(var(--err-weak));
+  color: hsl(var(--err));
+}
+
+.m-toast-leaving {
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+
+.m-toast-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.m-toast-msg {
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.35;
+  /* 反馈整句可读，不给省略号：一条被截断的失败原因等于没说。 */
+  overflow-wrap: anywhere;
+}
+
+.m-toast-desc {
+  margin-top: var(--sp-1);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+
+.m-toast-actions {
+  display: flex;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+  pointer-events: auto;
+}
+
+.m-toast-action,
+.m-toast-close {
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+  pointer-events: auto;
+}
+
+.m-toast-action:active,
+.m-toast-close:active {
+  opacity: 0.7;
+}
+
+.m-toast-action:focus-visible,
+.m-toast-close:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+@keyframes m-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .m-toast {
+    animation: none;
+  }
+
+  .m-toast-leaving {
+    transition: none;
+  }
+}
+
+/* ═══════════ 待应用 / 待保存操作条 ═══════════
+ *
+ * 文字与动作优先同行，窄屏或大字时自然换行；高度由实际内容决定。
+ */
+.m-pending {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px var(--sp-2);
+  padding: 2px var(--page-inset);
+  border-bottom: 1px solid hsl(var(--line));
+  background: hsl(var(--surface-2));
+  box-sizing: border-box;
+}
+
+.m-pending-err {
+  border-bottom-color: hsl(var(--err) / 0.45);
+  background: hsl(var(--err-weak));
+}
+
+.m-pending-text {
+  flex: 1 1 8rem;
+  min-width: min(100%, 8rem);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: hsl(var(--fg));
+}
+
+.m-pending-text b { color: hsl(var(--warn)); }
+.m-pending-err .m-pending-text b { color: hsl(var(--err)); }
+
+.m-pending-detail {
+  display: block;
+  margin-top: 2px;
+  color: hsl(var(--fg-dim));
+  overflow-wrap: anywhere;
+}
+
+.m-pending-acts {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0 2px;
+  min-width: 0;
+  max-width: 100%;
+  margin-inline-start: auto;
+}
+
+.m-pending-btn {
+  position: relative;
+  isolation: isolate;
+  min-height: var(--tap-min);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: hsl(var(--fg));
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+.m-pending-btn::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 5px 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+}
+
+.m-pending-primary {
+  color: #00141d;
+}
+.m-pending-primary::before { border-color: transparent; background: hsl(var(--flow)); }
+
+/* 武装态：翻实心红 + 换文案（同桌面 `.btn.confirming` 的两条动作）。 */
+.m-pending-confirming {
+  color: hsl(var(--bg));
+}
+.m-pending-confirming::before { border-color: transparent; background: hsl(var(--err)); }
+
+.m-pending-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.m-pending-btn:active:not(:disabled) {
+  opacity: 0.7;
+}
+
+.m-pending-btn:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+.m-nav {
+  display: flex;
+  /* 宽容器上五项**居中**而不是拉伸：1024 宽拉满会把两侧目的地推出拇指范围（spec 明文）。 */
+  justify-content: center;
+  /*
+   * 高度是**下限**，不是定值。`bottom-navigation.md`：「scaling may wrap to two lines only as a
+   * last resort」—— 大字下标签换行时导航必须让出那一行，写死 64 会让第二行画到手势条上。
+   * 几何本身仍**不随缩放**（64 不乘 `--font-scale`），它只在内容真的要不下时才长高。
+   */
+  min-height: var(--nav-h);
+}
+
+.m-nav-item {
+  position: relative;
+  flex: 1 1 0;
+  min-width: var(--nav-item-min);
+  max-width: var(--nav-item-max);
+  min-height: var(--tap-min);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1); /* 图标 → 文字：4 */
+  /* 按钮复位（本入口不引 Tailwind preflight，浏览器默认样式要自己收）。 */
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  /* 未选中取 `text.tertiary`(`--fg-faint`)，**不是** `text.secondary`(`--fg-dim`)：原型
+   * `mobile-home-breakpoints.html:160` 的 `.nav a{…color:hsl(var(--fg-faint))}` 压过
+   * `bottom-navigation.md` 的 Colors/tokens →「Inactive: `text.secondary`」（原型胜，见 kit
+   * README）；那一行已在 kit 里就地标注为错，判据在 `bottom-navigation-kit-conflict.test.ts`。
+   * 取 `--fg-dim` 会把四个未选中项抬亮一档（深色 L 66% vs 48%），选中项那抹 `--flow`
+   * 与其余四项的明度差被压窄 ——「现在在哪一屏」正是靠这个差一眼读出来的。 */
+  color: hsl(var(--fg-faint));
+  font-family: inherit;
+  /* 竖向滑动交给滚动区，避免导航吞掉手势后 300ms 才落点。 */
+  touch-action: manipulation;
+  transition: color 120ms ease;
+}
+
+/* 活动指示条 2×28，画在项的顶边中点。用 ::before 而不是真实元素：它不进 flex 排布，
+ * 故不挤压图标与文字的垂直居中（那正是"多一根条就整排下沉"的成因）。 */
+.m-nav-item::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: var(--nav-indicator-w);
+  height: var(--nav-indicator-h);
+  transform: translateX(-50%);
+  border-radius: 0 0 var(--nav-indicator-h) var(--nav-indicator-h);
+  background: none;
+}
+
+.m-nav-item[aria-current='page'] {
+  color: hsl(var(--flow)); /* interactive.primary：图标、文字、指示条同色 */
+}
+
+.m-nav-item[aria-current='page']::before {
+  background: hsl(var(--flow));
+}
+
+.m-nav-item:active {
+  opacity: 0.7;
+}
+
+.m-nav-item:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+.m-nav-icon {
+  width: var(--nav-icon);
+  height: var(--nav-icon);
+  flex-shrink: 0;
+}
+
+.m-nav-label {
+  /* type.navigation：11.5 / 500。除以 16 走 rem ⇒ 跟随 Dynamic Type；上面的几何不跟。 */
+  font-size: 0.71875rem;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  /*
+   * 大字下必须**断得动词**。`bottom-navigation.md` 有两条硬话：「labels never scroll
+   * horizontally」与「scaling may wrap to two lines only as a last resort」。
+   *
+   * 关键是选 `anywhere` 而不是 `break-word`：两者都能断超宽的词，但只有 `anywhere` 把
+   * **min-content 尺寸**一并压下去。标签是 `.m-nav-item`（`flex:1 1 0`）的 flex 子项，
+   * 交叉轴按 fit-content 取宽，而 fit-content 的下限就是 min-content ⇒ 用 `break-word`
+   * 的话格子仍然按 max-content 互相挤，一个字都没救到。
+   *
+   * 2026-09-05 模拟器实测（412 CSS px / en-US）：不加这条时 2.0x 下 `Settings` 单格要 85px、
+   * 格子只有 82.4px，`Rules` / `Connections` / `Settings` 三格互相压字，且文档 scrollWidth
+   * 413 > 视口 412 —— 整页可以横向滚动，正是 spec 第一条明文禁止的形态。
+   */
+  overflow-wrap: anywhere;
+}
+
+/*
+ * ═══════════ 这里曾住着占位屏的 `.m-section`（2026-09-05 删）═══════════
+ *
+ * 五个屏全部落地后占位屏被删（`5ca9805` 只带走了 `.m-placeholder-*`），`.m-section` 留了下来
+ * —— 成为一条**没有任何 .tsx 消费、却仍在生效**的外壳规则，而节点屏的根元素恰好还挂着它。
+ * 后果不是"多几行死 CSS"：
+ *
+ *   · 外壳 CSS 与屏 CSS 同为单类选择器 ⇒ 同特异度 ⇒ **谁在包里靠后谁赢**；
+ *   · `MobileMain.tsx` 里 `./MobileApp`（连带各屏 CSS）先于 `./mobile.css` 求值 ⇒ 屏 CSS 先进包
+ *     ⇒ `.m-section` 压过 `nodes.css` 那条"取消卡片外观"的 `.mn`；
+ *   · 于是整个节点屏被套进一张卡：多出的 16 内边距把内容顶到状态栏根下，满幅吸顶块的负外边距
+ *     只抵掉页边距、抵不掉卡内边距。2026-09-05 首轮真机验收的缺陷②就是这条，
+ *     而它在 8/8 静态门下一路全绿。
+ *
+ * 判据侧对应 `mobile-entry.test.ts` ⑥：外壳 CSS 不得留下没有任何 `.tsx` 消费的类。
+ * 死规则不会自己变成噪声，它会安静地赢下级联。
+ */
+
+/* Every mobile action acknowledges touch, including actions in nested sheets. */
+.m-shell button:not(:disabled):active {
+  box-shadow: inset 0 0 0 9999px hsl(var(--flow) / 0.15);
+  filter: brightness(0.9);
+}
+.m-menu-heading { display: flex; align-items: center; gap: 12px; }
+.m-menu-heading h2 { flex: 1; margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.m-menu-back {
+  min-height: var(--tap-min); padding: 8px; border: 0; border-radius: var(--r-sm);
+  background: transparent; color: hsl(var(--flow)); font: inherit;
+}
+.m-action-status { color: hsl(var(--flow)); font-size: 0.875rem; overflow-wrap: anywhere; }
+
+:where(.m-select-trigger) { display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: start; }
+.m-select-trigger > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.m-select-layer {
+  position: fixed; inset: 0; z-index: 45; display: flex; align-items: flex-end;
+  justify-content: center; background: hsl(0 0% 0% / 0.4); color: hsl(var(--fg));
+  box-sizing: border-box; padding-top: var(--safe-t);
+  top: var(--m-vv-top, 0px); left: var(--m-vv-left, 0px); right: auto; bottom: auto;
+  width: var(--m-vv-width, 100%); height: var(--m-vv-height, 100%);
+}
+
+/* The opaque lock scrim remains full size; only its input content follows the visible area. */
+.m-lock-viewport {
+  position: absolute; top: var(--m-vv-top, 0px); left: var(--m-vv-left, 0px);
+  width: var(--m-vv-width, 100%); height: var(--m-vv-height, 100%); overflow-y: auto;
+}
+.m-lock-content {
+  min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; box-sizing: border-box; text-align: center;
+  padding: calc(var(--safe-t) + 24px) calc(var(--safe-r) + 24px) calc(var(--safe-b) + 24px) calc(var(--safe-l) + 24px);
+}
+.m-select-panel {
+  box-sizing: border-box; width: 100%; max-width: 640px; max-height: 82%; overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px calc(16px + var(--safe-r)) calc(12px + var(--safe-b)) calc(16px + var(--safe-l));
+  border-radius: 16px 16px 0 0;
+  background: hsl(var(--surface)); box-shadow: var(--shadow-sheet); overflow-wrap: anywhere;
+}
+.m-select-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.m-select-head h2 { margin: 0; min-width: 0; font-size: 1rem; line-height: 1.35; max-height: 2.7em; overflow-y: auto; overflow-wrap: anywhere; }
+.m-select-panel button {
+  box-sizing: border-box; width: 100%; min-height: var(--tap-min); display: flex;
+  align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px;
+  border: 0; border-radius: var(--r-sm); background: transparent; color: inherit; font: inherit; text-align: start;
+}
+.m-select-panel button[aria-selected="true"] { background: hsl(var(--flow-weak)); color: hsl(var(--flow-hi)); }
+.m-select-panel button:disabled { opacity: 0.45; }
+.m-select-panel button:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+.m-select-panel button:not(:disabled):active { background: hsl(var(--flow) / 0.22); }
+.m-select-head .m-select-x { flex: none; width: var(--tap-min); min-height: var(--tap-min); padding: 0; justify-content: center; color: hsl(var(--fg-dim)); cursor: pointer; }
+.m-select-x svg { width: 20px; height: 20px; }
+.m-select-group { margin: 12px 12px 4px; color: hsl(var(--fg-dim)); font-size: 0.8125rem; }

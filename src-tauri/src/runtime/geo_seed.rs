@@ -190,6 +190,7 @@ fn seed_one(src: &Path, dest: &Path, overwrite_valid_dest: bool) -> bool {
 /// 再把 `.app` 装进同机 `/Applications`」，于是源码仓候选在**打包机上真实存在**。留着它，即便随包
 /// `.app` 里一个 `.srs` 都没有，播种也会经这条腿从源码仓成功 —— 验证者看到 28 个 `.srs` 判「打包态 OK」，
 /// 而没有仓库的终端用户拿到零 `.srs`。这正是「打包态验证假绿」的产地，故只在 debug（开发态）保留。
+#[cfg(not(target_os = "android"))]
 fn bundled_data_candidates() -> Vec<PathBuf> {
     let exe = std::env::current_exe().ok();
     let manifest = crate::runtime::proxy::dev_manifest_dir();
@@ -208,7 +209,23 @@ fn bundled_data_candidates() -> Vec<PathBuf> {
     filter_repo_candidate(candidates, manifest, !cfg!(debug_assertions))
 }
 
+#[cfg(any(target_os = "android", test))]
+fn android_bundled_data_dir(config_dir: &Path) -> Option<PathBuf> {
+    // Tauri app_config_dir = Context.dataDir; config_dir adds "polaris".
+    // BundledRules.prepare materializes the APK assets before the Rust entry point.
+    Some(config_dir.parent()?.join("bundled-geo"))
+}
+
+#[cfg(target_os = "android")]
+fn bundled_data_candidates() -> Vec<PathBuf> {
+    crate::runtime::core_paths::base_dir()
+        .and_then(android_bundled_data_dir)
+        .into_iter()
+        .collect()
+}
+
 /// release 构建剔除源码仓候选（见 [`bundled_data_candidates`] 上方的「打包态验证假绿」说明）。
+#[cfg(not(target_os = "android"))]
 fn filter_repo_candidate(
     mut candidates: Vec<PathBuf>,
     dev_manifest_dir: Option<&Path>,

@@ -27,6 +27,7 @@ use polaris_config_engine::builder::endpoint_routes::{
 use polaris_config_engine::builder::outbounds::effective_proxy_bind_interface;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
+use polaris_helper_proto::Platform;
 #[cfg(not(windows))]
 use polaris_system_integration::route_ops::SystemRouteOps;
 use tokio::sync::Semaphore;
@@ -52,11 +53,60 @@ fn group_candidates_by_host(candidates: Vec<Candidate>) -> BTreeMap<String, Vec<
     grouped
 }
 
+/// 本平台**有没有**逐目的绑定规划所需的那一条事实腿。
+///
+/// # 判据（不是保守取舍，是能力事实）
+///
+/// 本模块只有一个事实来源：`query_route_interface` → `SystemRouteOps::exit_interface_for`
+/// （「到这个目的会走哪张网卡」）。它按 [`Platform`] 分派，而 `Platform::Other` 那条腿的实现就是
+/// `Ok(None)`（`crates/system-integration/src/route_ops.rs`，原文「未知平台：无对应路由工具 →
+/// 查不到」）。**Android 落在 `Other`**：`Platform::current()` 只认 `macos`/`windows`/`linux`，
+/// 而 `target_os = "android"` 三个都不是。
+///
+/// 于是在 Android 上这份规划的结局是**恒定**的：每个候选都拿不到接口名 ⇒
+/// `bindings` 恒空、`native_roots` 恒空、全部候选留在 `unresolved_roots`。规划一次不产出任何
+/// `bind_interface`，重新规划一次也不会。
+///
+/// # 为什么这不是「少跑一段没用的探测」，而是一条起停循环的根因
+///
+/// `unresolved_roots` 非空正是 `proxy::route_replan::inferred_binding_replan_needed` 里**最激进**的
+/// 那条腿：它会退回「整份网卡指纹逐项对比」。而起核就绪后跑的那次对比，前后两份指纹之间必然多出**我们自己刚建出来
+/// 的 TUN**（Android 由 `VpnService.establish()` 建 `tun0`，连 link-local 每次都换）。desktop 靠
+/// `managed_tun_interface_for_network_watcher` 把自家 TUN 从对比里剔掉，而那个函数在 `Other` 上
+/// 同样返回 `None` ⇒ 剔不掉 ⇒ 判据恒真 ⇒ 每次起核收尾都排一次去抖重启 ⇒ 起停循环
+///（真机实测 300s / 69 次 spawn，见
+/// `~/docs/polaris/design/polaris-android-core-respawn-2026-09-04.md`）。
+///
+/// 所以这里关掉的不是「一段耗时」，而是「一条在本平台上永远给不出答案、却被下游当成『情况有变』
+/// 来消费的判据输入」。Android 上跟随默认网卡的机制另有其人且已接线：libbox
+/// `PlatformInterface.autoDetectInterfaceControl` + `DefaultNetworkMonitor.updateDefaultInterface`
+///（K2 落地），它不需要、也不应该用整核重启来表达网络变化。
+///
+/// **穷举 match 而非 `!matches!(Other)`**：将来加平台变体时编译器强制在这里做一次决定，
+/// 而不是默默继承「支持」。
+#[must_use]
+pub fn runtime_binding_planning_supported(platform: Platform) -> bool {
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => true,
+        // Android 与 Other 同答 false，但**理由是具体的、不是兜底**：本平台没有可用的逐目的
+        // 路由查询腿（`SystemRouteOps::exit_interface_for` 的 Android 臂恒 `Ok(None)`，见该处
+        // 血证注释），规划再跑一次也只会得到同一份「全部未决」。K6b 的修复就锚在这一行。
+        Platform::Android => false,
+        // iOS = false，理由具体：`SystemRouteOps::exit_interface_for` 的 `Ios` 臂恒 `Ok(None)`
+        // （沙箱内没有逐目的路由查询面），规划再跑一次也只会得到同一份「全部未决」。
+        // 这一行同时是 K6b 那条链在 iOS 上的**预先切断**：`managed_tun_interface_for_network_watcher`
+        // 在 iOS 上同样返 None（拿不到自家 tun 名字），若这里判 true，「整份网卡指纹逐项对比」
+        // 就会重新变成恒真判据 —— 与 Android 上那 300s/69 次是同一条链。
+        Platform::Ios => false,
+        Platform::Other => false,
+    }
+}
+
 /// 当前配置是否含至少一个需要在起核前判定“原生默认出口 / 特殊逐目的绑定”的物理拨号根。
 /// 网络变化 watcher 用同一候选口径；是否真要重启再由本次 plan 的特殊绑定/未解析状态决定。
 #[must_use]
 pub fn needs_runtime_binding_plan(config: &UserConfig) -> bool {
-    !hot_switch_runtime_binding_candidates(config).is_empty()
+    !hot_switch_runtime_binding_candidates(Platform::current(), config).is_empty()
 }
 
 /// 当前配置里**正在承流**且需要自动逐目的规划的物理根。
@@ -66,16 +116,20 @@ pub fn needs_runtime_binding_plan(config: &UserConfig) -> bool {
 /// 显式策略根不进入本集合；非 TUN 模式由 OS 原生路由接管。
 #[must_use]
 pub fn automatic_runtime_binding_root_ids(config: &UserConfig) -> BTreeSet<String> {
-    runtime_binding_candidates_for_roots(config, active_physical_root_ids(config))
-        .into_iter()
-        .map(|candidate| candidate.server_id)
-        .collect()
+    runtime_binding_candidates_for_roots(
+        Platform::current(),
+        config,
+        active_physical_root_ids(config),
+    )
+    .into_iter()
+    .map(|candidate| candidate.server_id)
+    .collect()
 }
 
 /// 在 TUN 接管系统路由之前生成会话级绑定。任何单目标失败都 fail-open：该节点继续使用 sing-box
 /// `auto_detect_interface`；其余成功节点不受影响。整轮有硬预算，不能把坏 DNS/路由工具拖进冷启动关键路径。
 pub async fn plan_runtime_bindings(config: &UserConfig) -> RuntimeBindingPlan {
-    let candidates = hot_switch_runtime_binding_candidates(config);
+    let candidates = hot_switch_runtime_binding_candidates(Platform::current(), config);
     let covered_roots: BTreeSet<String> = candidates
         .iter()
         .map(|candidate| candidate.server_id.clone())
@@ -240,15 +294,28 @@ fn classify_runtime_binding(
     }
 }
 
-fn hot_switch_runtime_binding_candidates(config: &UserConfig) -> Vec<Candidate> {
-    runtime_binding_candidates_for_roots(config, hot_switch_physical_root_ids(config))
+fn hot_switch_runtime_binding_candidates(
+    platform: Platform,
+    config: &UserConfig,
+) -> Vec<Candidate> {
+    runtime_binding_candidates_for_roots(platform, config, hot_switch_physical_root_ids(config))
 }
 
+/// **`platform` 是入参而不是 `cfg!`**：判定要在任何 host 上都跑得到（同
+/// `should_probe_wintun_adapter` 的手法）。写成 `cfg!` 就只能在一台永远不编 Android 的机器上
+/// 装装样子 —— 而本条判据的全部意义正是「Android 上它必须是空的」。
 fn runtime_binding_candidates_for_roots(
+    platform: Platform,
     config: &UserConfig,
     roots: BTreeSet<String>,
 ) -> Vec<Candidate> {
-    if !config.proxy_mode_type.is_tun() {
+    if !runtime_binding_planning_supported(platform) {
+        return Vec::new();
+    }
+    // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。Android 上零行为差 ——
+    // 上面那道平台闸已经先返空集 —— 接上是为了不留需要人工复核的例外：两道闸的存续期不同，
+    // 上面那条将来若因别的理由放开，这条不能跟着一起失守。
+    if !config.proxy_mode_type.effective_on(platform).is_tun() {
         return Vec::new();
     }
     let by_id: BTreeMap<&str, &ServerConfig> = config

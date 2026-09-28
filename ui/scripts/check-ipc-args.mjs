@@ -40,7 +40,14 @@ const IPC_DIR = join(UI_SRC, 'ipc');
 const CHANNELS = join(ROOT, 'ui', 'src', 'domain', 'ipc-channels.ts');
 const RUST_SRC = join(ROOT, 'src-tauri', 'src');
 const COMMANDS_DIR = join(RUST_SRC, 'commands');
-const MAIN_RS = join(ROOT, 'src-tauri', 'src', 'main.rs');
+/**
+ * crate 根的候选文件。`generate_handler![]` 住在哪个文件是**实现细节**，不是本门的判据：
+ * 应用装配 2026-09-04 从 `main.rs` 下沉进 `lib.rs`（移动端加载 cdylib、没有 `main()`），
+ * 写死 `main.rs` 的旧写法当场 `throw`。故这里枚举两个候选、由 marker 自己认领，
+ * 恰好一个命中才放行 —— 0 个 = 注册表没了（判据塌），2 个 = 有人拷了第二份注册表
+ * （两侧漂移无人发现，正是本门该报的事）。
+ */
+const CRATE_ROOT_FILES = ['main.rs', 'lib.rs'].map((f) => join(RUST_SRC, f));
 
 /** snake/underscore → lowerCamelCase（对齐 tauri-macros `to_lower_camel_case`）。 */
 function camel(name) {
@@ -105,7 +112,7 @@ function commandOwnerFiles(modules) {
     }
     if (!found) {
       throw new Error(
-        `main.rs generate_handler![] 注册了 \`${mod.join('::')}::*\`，但 src-tauri/src/${mod.join('/')}` +
+        `generate_handler![] 注册了 \`${mod.join('::')}::*\`，但 src-tauri/src/${mod.join('/')}` +
           `{.rs,/} 都不存在 —— 定义扫描面无法覆盖该模块，本门此刻没有判据`
       );
     }
@@ -165,14 +172,28 @@ function parseChannels() {
  * 任何**非空且不匹配这两种形态**的行直接抛：语料塌了不许当成「没有注册项」放过。
  */
 function parseRegisteredCommands() {
-  const src = readFileSync(MAIN_RS, 'utf8');
   const marker = 'invoke_handler(tauri::generate_handler![';
+  const hits = CRATE_ROOT_FILES.filter((f) => existsSync(f) && readFileSync(f, 'utf8').includes(marker));
+  if (hits.length !== 1) {
+    throw new Error(
+      `crate 根（${CRATE_ROOT_FILES.join(' / ')}）里含 \`${marker}\` 的文件有 ${hits.length} 个（应为 1）：` +
+        '0 个 = command 注册表消失或换了写法，本门失去判据；' +
+        '>1 个 = 存在第二份注册表，两份之间的漂移不会被任何东西发现。'
+    );
+  }
+  const src = readFileSync(hits[0], 'utf8');
   const start = src.indexOf(marker);
-  if (start < 0) throw new Error(`main.rs 缺少 ${marker}`);
   const rest = src.slice(start + marker.length);
   const end = rest.indexOf('])');
-  if (end < 0) throw new Error('main.rs 的 generate_handler![] 未闭合');
-  const body = rest.slice(0, end).replace(/\/\/.*$/gm, '');
+  if (end < 0) throw new Error(`${hits[0]} 的 generate_handler![] 未闭合`);
+  // 两种注释都剥：被注释掉的注册项不是注册项，这一点对 `//` 与 `/* */` 同样成立。
+  // 只剥前者会让一条合法的 Rust 块注释把本门**整个掐掉**（抛 "无法解析的注册项"），
+  // 而那不是判据发现了问题，是判据自己读不动 —— 2026-09-13 真踩过一次。
+  // 先剥块注释再剥行注释：反过来会让 `// … /*` 这种行内残留把后面的代码吃掉。
+  const body = rest
+    .slice(0, end)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
   const names = new Set();
   const modules = new Map(); // 'tray' → ['tray']（去重用）
   const entry = /^([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)$/;
@@ -182,7 +203,7 @@ function parseRegisteredCommands() {
     const m = entry.exec(line);
     if (!m) {
       throw new Error(
-        `main.rs generate_handler![] 里有无法解析的注册项：\`${line}\` —— ` +
+        `generate_handler![] 里有无法解析的注册项：\`${line}\` —— ` +
           `本门只认裸标识符与 \`mod::path::fn\` 两种形态，其余形态会静默逃过注册对拍`
       );
     }
@@ -295,12 +316,12 @@ function main() {
 
   for (const cmd of rust.keys()) {
     if (!registered.has(cmd)) {
-      errors.push(`Rust command "${cmd}" 有 #[tauri::command] 定义，但未进入 main.rs generate_handler![]`);
+      errors.push(`Rust command "${cmd}" 有 #[tauri::command] 定义，但未进入 generate_handler![]`);
     }
   }
   for (const cmd of registered) {
     if (!rust.has(cmd)) {
-      errors.push(`main.rs generate_handler![] 注册了 "${cmd}"，但递归 command owner 中没有对应定义`);
+      errors.push(`generate_handler![] 注册了 "${cmd}"，但递归 command owner 中没有对应定义`);
     }
   }
 
@@ -320,7 +341,7 @@ function main() {
     }
     if (!registered.has(cmd)) {
       errors.push(
-        `${c.file}:${c.line}  invoke("${cmd}") 有 #[tauri::command] 定义，但未进入 main.rs generate_handler![]`
+        `${c.file}:${c.line}  invoke("${cmd}") 有 #[tauri::command] 定义，但未进入 generate_handler![]`
       );
       continue;
     }

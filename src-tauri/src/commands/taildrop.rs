@@ -28,6 +28,10 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use tokio::io::AsyncReadExt;
 
+use crate::commands::picked_file::{
+    classify, display_of, file_name_of, open_picked_for_read, stream_into_picked,
+    with_picked_gateway, PickedTarget,
+};
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::taildrop::{
     BroadcastTaildropTaskSink, TaildropRuntime, TaildropTaskEventSink, TaildropTaskSnapshot,
@@ -282,6 +286,129 @@ async fn open_selected_files(
     Ok(selected)
 }
 
+/// 打开一批**选中目标**（本机路径 + SAF content URI 两种形态）供发送。
+///
+/// # 这条腿 2026-09-13（批 16）才接上 URI 那一支
+///
+/// 此前这里写的是 `p.into_path().map_err(…)` —— content URI 上恒 `Err`，于是「Android 上发件
+/// 不支持」。那是「还没接」而不是平台做不到：`commands/picked_file` 批 4 就把机器造好了
+/// （`open_picked_for_read` 拿 fd、`file_name_of` 取名），这条腿从没用过它。
+///
+/// # 两处**真实的**射程边界（不是省事，是形态冲突，逐条写清）
+///
+/// 1. **文件名在 SAF 目标上会退化。** Taildrop 把名字发给对端，对端按它落盘。路径侧取的是
+///    真 basename；URI 侧取的是 URI 最后一节（`file_name_of` 的既定口径，它明说这个值只当展示用、
+///    且刻意不做百分号解码）。`ACTION_GET_CONTENT` 的 URI 末节**常常**就是文件名，但也可能是
+///    document id（`…/document/msf%3A42`）⇒ 对端可能收到一个不像文件名的名字。
+///    拿真名要 `ContentResolver.query(DISPLAY_NAME)`，`tauri-plugin-fs` 不暴露它，本仓也不为此
+///    自建一条 JNI 腿。**文件内容一个字节都不受影响**，降的只是名字的可读性。
+/// 2. **非 regular-file 的 fd 发不了，且必须当场说。** Taildrop 协议要求**先声明每个文件的长度**
+///    （`TaildropOutgoingFile.size`），而云盘类 DocumentsProvider 交回的常常是
+///    `openPipeHelper` 造的**管道**：`metadata().len()` 在管道上没有意义。声明一个错的长度会让
+///    对端收到一个「传完了却损坏」的文件 —— 那比拒绝发送坏得多。故这一档保留 `ERR_READ`，
+///    报的是「这个目标给不出确定长度」，不是「Android 不支持发件」。
+async fn open_selected_targets<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    picked: Vec<crate::commands::picked_file::FilePath>,
+) -> Result<Vec<SelectedFile>, SendFailure> {
+    // 路径形态整批走原来那条腿：桌面**一行不变**（连它跑在哪个线程上都不改）。
+    if picked
+        .iter()
+        .all(|p| matches!(classify(p), PickedTarget::Path(_)))
+    {
+        let paths = picked
+            .into_iter()
+            .map(|p| match classify(&p) {
+                PickedTarget::Path(path) => path,
+                PickedTarget::Uri(_) => unreachable!("上面刚判过全是路径"),
+            })
+            .collect();
+        return open_selected_files(paths).await;
+    }
+
+    let mut selected = Vec::with_capacity(picked.len());
+    for target in picked {
+        match classify(&target) {
+            PickedTarget::Path(path) => {
+                selected.extend(open_selected_files(vec![path]).await?);
+            }
+            PickedTarget::Uri(uri) => {
+                // URI 支的插件 I/O 是同步阻塞的、且上游拿不到 fd 时会 panic ⇒ 经
+                // `with_picked_gateway` 派线程（`picked_file` 模块文档射程自曝 5 / 6）。
+                let opened = with_picked_gateway(app, Some(uri.clone()), move |gateway, picked| {
+                    let picked = picked.expect("with_picked_gateway 收到的目标不会为 None");
+                    open_uri_for_send(gateway, &picked)
+                })
+                .await
+                .map_err(|e| {
+                    (
+                        format!("open {:?} worker failed: {e}", file_name_of(&uri)),
+                        ERR_READ,
+                    )
+                })??;
+                selected.push(opened);
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// 发件 URI 支的同步一段：经网关开只读句柄、定长度、**定发给对端的名字**。
+///
+/// 从 [`open_selected_targets`] 里拆出来的理由只有一个：可测。那边要真 `AppHandle`
+/// （`with_picked_gateway`），这里只要一个 [`FileGateway`](crate::commands::picked_file::FileGateway) —— 于是「对端收到的名字从哪来」
+/// 能拿记账网关在**生产函数本体**上驱动，而不是在一份复制出来的逻辑上。
+/// 跑在 `with_picked_gateway` 派出的阻塞线程上，故 `metadata` 用同步的 `std` 版。
+///
+/// 名字的口径（射程边界 1，见 [`open_selected_targets`]）：**只取 [`file_name_of`]**，
+/// 它取 URI 路径段里最后一个非空段、不做百分号解码；取不到（空串）落 `taildrop-file` 占位 ——
+/// 空名字会让对端落一个无名文件。
+fn open_uri_for_send(
+    gateway: &dyn crate::commands::picked_file::FileGateway,
+    uri: &crate::commands::picked_file::FilePath,
+) -> Result<SelectedFile, SendFailure> {
+    let label = file_name_of(uri);
+    let opened = open_picked_for_read(gateway, uri).map_err(|e| {
+        (
+            format!("open selected document {label:?} failed: {e}"),
+            ERR_READ,
+        )
+    })?;
+    let metadata = opened.metadata().map_err(|e| {
+        (
+            format!("stat selected document {label:?} failed: {e}"),
+            ERR_READ,
+        )
+    })?;
+    // 射程边界 2：管道 / 非 regular file 给不出确定长度，而协议要先声明它。
+    if !metadata.is_file() {
+        return Err((
+            format!(
+                "selected document {label:?} has no fixed length (not a regular file) \
+                 — Taildrop must declare each file's size up front"
+            ),
+            ERR_READ,
+        ));
+    }
+    if metadata.len() > i64::MAX as u64 {
+        return Err((
+            format!("selected document {label:?} is too large for Taildrop"),
+            ERR_READ,
+        ));
+    }
+    // 射程边界 1：名字退化成 URI 末节。空串会让对端落一个无名文件 ⇒ 兜一个占位。
+    let name = if label.is_empty() {
+        "taildrop-file".to_owned()
+    } else {
+        label
+    };
+    Ok(SelectedFile {
+        file: tokio::fs::File::from_std(opened),
+        name,
+        size: metadata.len(),
+    })
+}
+
 async fn write_taildrop_input(
     input: TaildropSendInput,
     files: Vec<SelectedFile>,
@@ -516,18 +643,7 @@ pub async fn taildrop_send(
             ERR_TOO_MANY_FILES,
         ));
     }
-    let paths = match picked
-        .into_iter()
-        .map(|p| {
-            p.into_path()
-                .map_err(|e| (format!("selected file is not a local path: {e}"), ERR_READ))
-        })
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(paths) => paths,
-        Err((msg, code)) => return Ok(ApiResponse::err_with_code(msg, code)),
-    };
-    let files = match open_selected_files(paths).await {
+    let files = match open_selected_targets(window.app_handle(), picked).await {
         Ok(files) => files,
         Err((msg, code)) => return Ok(ApiResponse::err_with_code(msg, code)),
     };
@@ -732,13 +848,12 @@ pub async fn taildrop_save(
         .save_file(move |p| {
             let _ = tx.send(p);
         });
-    let Some(dest) = rx.await.ok().flatten().and_then(|p| p.into_path().ok()) else {
+    let Some(picked) = rx.await.ok().flatten() else {
         return Ok(ApiResponse::ok(TaildropSaveResult {
             canceled: true,
             ..Default::default()
         }));
     };
-
     let stream = match client.download_taildrop_file(tag, &name).await {
         Ok(s) => s,
         Err(e) => {
@@ -748,19 +863,169 @@ pub async fn taildrop_save(
             ))
         }
     };
-    match write_stream_to(stream, &dest).await {
-        Ok(n) => Ok(ApiResponse::ok(TaildropSaveResult {
+
+    /* ── 两支落盘（2026-09-13 批 16 接上 URI 那一支）──────────────────────────────────
+     *
+     * 本条腿要的不是「那个文件」，而是**那个文件所在的目录**：`write_stream_to` 先写同目录
+     * `.part`、`flush` 之后才 `rename` 提交。SAF 的 content URI 上既没有目录也没有 rename，
+     * 此前的处置是**显式报错** ——「Android 上取件不支持」。那是「还没接」，不是平台做不到：
+     * 批 4 已经把这套机器造好了（`commands/picked_file`），只是这条腿从没用过它。
+     *
+     * 🔴 **原子性：形态换了，而且有一条保证真的拿不回来 —— 逐条写清，不许默默换掉。**
+     *
+     * | 保证 | 路径支（桌面，逐字不变） | URI 支（SAF） |
+     * |---|---|---|
+     * | 下载中断不留半截 | ✅ `.part` 删掉，目标名从未出现 | ✅ 私有临时文件删掉，用户选的文档**一个字节没写过** |
+     * | 提交是原子的 | ✅ 同卷 `rename` | ❌ **拿不回来**：`write` 中途失败会在用户选的文档上留下半截 |
+     * | 失败时目标不存在 | ✅ | ❌ `ACTION_CREATE_DOCUMENT` 在交回 URI **之前**就已经把（空）文档建好了 |
+     *
+     * 拿不回来的是**提交那一跳的原子性**：SAF 没有 rename，`tauri-plugin-fs` 也不暴露
+     * `DocumentsContract.deleteDocument` ⇒ 没有任何办法把一次半截写回滚掉。
+     * 能做的是把**窗口缩到最小**：先把整份内容流式落进应用私有目录（那里有真正的文件系统），
+     * **完整之后**再一次性灌进用户选的文档 —— 于是「网络中断」这个主要风险不再碰得到目标，
+     * 剩下的只有「本地 fd 写到一半失败」。这不是等价替换，是一条**更小但仍非零**的窗口。
+     * 这一跳失败时怎么报（错误不被吃成成功、诊断报**真灌进目标的**字节数）有判据：
+     * `taildrop/tests` 用 `RecordingGateway::failing_write_after` 在第 N 字节注入失败，
+     * 驱动的是 `commit_staged_into_picked` 本体。
+     *
+     * 临时文件落**应用私有缓存目录**而不是目标旁边：URI 上根本没有「旁边」这个位置，
+     * 而私有目录在 Android 上一定可写、不需要任何权限，且失败路径上必删。
+     */
+    match classify(&picked) {
+        // 桌面原路：与接 URI 支之前**逐字相同**（同目录 `.part` → `rename`）。
+        PickedTarget::Path(dest) => match write_stream_to(stream, &dest).await {
+            Ok(n) => Ok(ApiResponse::ok(TaildropSaveResult {
+                canceled: false,
+                path: Some(dest.to_string_lossy().into_owned()),
+                bytes: Some(n),
+            })),
+            Err(e) => Ok(ApiResponse::err_with_code(
+                format!(
+                    "write selected file {:?} failed: {e}",
+                    selected_file_label(&dest)
+                ),
+                ERR_WRITE,
+            )),
+        },
+        PickedTarget::Uri(uri) => save_stream_to_uri(window.app_handle(), stream, uri, &name).await,
+    }
+}
+
+/// 取件的 **URI 支**：先完整落到应用私有临时文件，再一次性灌进用户选中的文档。
+///
+/// 两段刻意分开（原子性的取舍逐字写在调用点那张表里）：
+///  ① 下载 → 私有临时文件。中断即删，用户选的文档这一步**一个字节都没碰**；
+///  ② 临时文件 → 文档。`stream_into_picked` 流式拷（不吞内存），经 `with_picked_gateway`
+///     派到阻塞线程池 —— URI 支的插件 I/O 是同步 JNI 往返，且上游拿不到 fd 时会 panic
+///     （`picked_file` 模块文档射程自曝 5 / 6）。在 async command 自己的 task 上直接跑，
+///     轻则占住一个 worker 到远端收完，重则让前端那个 `await` 永不 settle。
+///
+/// 临时文件**两条路径上都删**：成功后删（它已经没有用了）、失败后删（不许在缓存里留下一份
+/// 用户以为没保存成的文件）。删不掉只 warn —— 那不该让一次已经成功的取件报成失败。
+async fn save_stream_to_uri<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    stream: TaildropDownload,
+    uri: crate::commands::picked_file::FilePath,
+    name: &str,
+) -> Result<ApiResponse<TaildropSaveResult>, ()> {
+    let dir = match app.path().app_cache_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Ok(ApiResponse::err_with_code(
+                format!("no app cache dir for Taildrop staging: {e}"),
+                ERR_WRITE,
+            ))
+        }
+    };
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return Ok(ApiResponse::err_with_code(
+            format!("create Taildrop staging dir failed: {e}"),
+            ERR_WRITE,
+        ));
+    }
+    // 文件名不进临时名（它来自对端，可能含路径分隔符 / 非法字符）—— 用进程内单调计数。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = dir.join(format!(
+        "taildrop-save-{}.part",
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+
+    // ① 完整落地。失败 ⇒ 删掉临时文件并报错，用户选的文档一个字节没写过。
+    let written = match write_stream_to(stream, &staged).await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&staged).await;
+            return Ok(ApiResponse::err_with_code(
+                format!("stage Taildrop file {name:?} failed: {e}"),
+                ERR_WRITE,
+            ));
+        }
+    };
+
+    // ② 灌进用户选的文档（连同删临时文件、出回执，收在 `commit_staged_into_picked` 里）。
+    let source = staged.clone();
+    let name_owned = name.to_owned();
+    match with_picked_gateway(app, Some(uri), move |gateway, picked| {
+        let picked = picked.expect("with_picked_gateway 收到的目标不会为 None");
+        commit_staged_into_picked(gateway, &picked, &source, written, &name_owned)
+    })
+    .await
+    {
+        Ok(response) => Ok(response),
+        // 阻塞线程里炸了（上游 `unimplemented!()`）⇒ 翻成稳定错误码，命令照常回话。
+        // 线程没跑完 ⇒ 临时文件那一步可能没轮到，在这里补删。
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&staged).await;
+            Ok(ApiResponse::err_with_code(
+                format!("Taildrop save worker failed: {e}"),
+                ERR_WRITE,
+            ))
+        }
+    }
+}
+
+/// 取件 URI 支的第 ② 段（同步，跑在 `with_picked_gateway` 派出的阻塞线程上）：
+/// 私有临时文件 → 用户选的文档，删临时文件，出回执。
+///
+/// 从 [`save_stream_to_uri`] 拆出来只为可测（那边要真 `AppHandle` 与真下载流）：
+/// 「写到一半失败时回执报什么」这条降级要在**生产函数本体**上用注入失败的网关驱动。
+///
+/// 回执口径（这一跳拿不回原子性，回执不许替它圆场）：
+///  · 成功：`bytes` = **灌进目标的**字节数，不是下载下来的 `staged_bytes`；
+///  · 失败：报错（`ERR_WRITE`），诊断里写明**失败前已灌进目标多少字节**、共应灌多少 ——
+///    目标上此刻就留着那么长的半截，没有任何接口能删掉它（SAF 无 rename、插件不暴露
+///    `deleteDocument`），这个数是用户唯一能拿到的事实。
+///
+/// 临时文件两条路径上都删（理由见 [`save_stream_to_uri`]）。
+fn commit_staged_into_picked(
+    gateway: &dyn crate::commands::picked_file::FileGateway,
+    uri: &crate::commands::picked_file::FilePath,
+    staged: &std::path::Path,
+    staged_bytes: u64,
+    name: &str,
+) -> ApiResponse<TaildropSaveResult> {
+    let copied = std::fs::File::open(staged)
+        .map_err(|error| crate::commands::picked_file::StreamIntoPickedError { written: 0, error })
+        .and_then(|mut file| stream_into_picked(gateway, uri, &mut file));
+    if let Err(e) = std::fs::remove_file(staged) {
+        log::warn!("remove Taildrop staging file failed: {e}");
+    }
+
+    match copied {
+        Ok(n) => ApiResponse::ok(TaildropSaveResult {
             canceled: false,
-            path: Some(dest.to_string_lossy().into_owned()),
+            path: Some(display_of(uri)),
+            // 报**灌进去的**字节数，不是下载下来的。
             bytes: Some(n),
-        })),
-        Err(e) => Ok(ApiResponse::err_with_code(
+        }),
+        Err(e) => ApiResponse::err_with_code(
             format!(
-                "write selected file {:?} failed: {e}",
-                selected_file_label(&dest)
+                "write Taildrop file {name:?} to picked document failed: wrote {} of {staged_bytes} \
+                 staged bytes into the document (left partial): {}",
+                e.written, e.error
             ),
             ERR_WRITE,
-        )),
+        ),
     }
 }
 

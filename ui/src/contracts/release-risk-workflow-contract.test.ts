@@ -98,6 +98,70 @@ describe('合入前发布风险门', () => {
     expect(risk).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
   });
 
+  it('每条选择性腿都必须被 gate 要求，且它的选择开关必须真的接出来', () => {
+    // 缺口形态（2026-09-04 加 Android 腿时发现）：本文件此前逐条点名 preflight / package，
+    // 对「**新增**一条腿」结构性失明 —— 新腿可以不进 gate 的 needs、gate 可以不判它的 result，
+    // 全程零转红。那正是本仓「门在但没牙」的形状，只是这次门是本文件自己。
+    // 改成**类**断言：从文件里枚举 job 与 selector，逐个要求接线成立。
+    const lines = risk.split('\n');
+    // 先收射程到 `jobs:` 之后：两空格缩进的键在 `on:` 下面也有（pull_request / merge_group / push），
+    // 不收射程的话枚举面里会混进触发器名，本门会为一个不存在的 job 要求 gate 接线（假红）。
+    const jobsAt = lines.indexOf('jobs:');
+    expect(jobsAt, 'release-risk.yml 里找不到 `jobs:`').toBeGreaterThanOrEqual(0);
+    const jobsBlock = lines.slice(jobsAt).join('\n');
+    const jobNames = [...jobsBlock.matchAll(/^ {2}([A-Za-z_][\w-]*):$/gm)].map((m) => m[1]);
+    // 切片自检：射程真的收住了（`on:` 下的触发器名不该出现在 job 枚举面里）。
+    expect(jobNames, '射程没收住：`on:` 下的触发器名混进了 job 枚举面').not.toContain('pull_request');
+    // 取材面自曝：枚举器变哑时下面两个 for 会恒真。
+    expect(jobNames, 'release-risk.yml 的 job 枚举面塌了').toContain('classify');
+    expect(jobNames, 'release-risk.yml 的 job 枚举面塌了').toContain('gate');
+    expect(jobNames.length, `只枚举到 ${jobNames.length} 个 job —— 枚举器坏了`).toBeGreaterThan(4);
+
+    // gate 是最后一个 job，jobSection 的「必须有同级后继」自检对它不成立，故单独切到文件尾。
+    const gateStart = lines.findIndex((l) => l === '  gate:');
+    expect(gateStart, 'release-risk.yml 里找不到 gate job').toBeGreaterThanOrEqual(0);
+    const gate = lines.slice(gateStart).join('\n');
+
+    for (const job of jobNames.filter((n) => n !== 'classify' && n !== 'gate')) {
+      // ① gate 必须 needs 它 —— 不 needs 的话 `needs.<job>.result` 求值为空串，
+      //    「非 success 就红」那条断言恒不成立，等于**恒绿**。
+      expect(
+        gate,
+        `gate 的 needs 里没有 ${job} —— 它的 result 会是空串，下面那条断言恒绿`,
+      ).toMatch(new RegExp(`needs: \\[[^\\]]*\\b${job}\\b`));
+
+      // ② result 必须被读进 env。
+      const envMatch = gate.match(
+        new RegExp(`^\\s+([A-Z_]+): \\$\\{\\{ needs\\.${job}\\.result \\}\\}$`, 'm'),
+      );
+      expect(envMatch, `gate 没有读取 needs.${job}.result —— 这条腿挂了也不会拦住合入`).not.toBeNull();
+
+      // ③ 必须有一条「非 success 就 exit 1」的断言。
+      expect(
+        gate,
+        `gate 读了 ${job} 的 result 却没有据它判红 —— 读进来不等于判据`,
+      ).toMatch(new RegExp(`\\$${envMatch![1]}" != success[\\s\\S]{0,240}?exit 1`));
+    }
+
+    // ④ 每个「选哪条腿」的开关都必须在 classify 的 outputs 与 impact step 里真的接出来。
+    //    少接一处 ⇒ `needs.classify.outputs.<X>` 恒为空串 ⇒ 那条腿**永远不跑**，且没有任何东西会说。
+    const classify = jobSection(risk, 'classify', 'release-risk.yml');
+    const selectors = [
+      ...new Set([...risk.matchAll(/needs\.classify\.outputs\.([a-z_]+)/g)].map((m) => m[1])),
+    ].sort();
+    expect(selectors.length, '一个 classify 选择开关都没枚举到 —— 取材面塌了').toBeGreaterThan(3);
+    for (const selector of selectors) {
+      expect(
+        classify,
+        `classify job 没有声明 output \`${selector}\` —— 引用它的地方恒为空串`,
+      ).toMatch(new RegExp(`^\\s+${selector}: \\$\\{\\{ steps\\.impact\\.outputs\\.${selector} \\}\\}$`, 'm'));
+      expect(
+        classify,
+        `impact step 没有写出 \`${selector}\` —— output 声明了但没人赋值`,
+      ).toContain(`echo "${selector}=`);
+    }
+  });
+
   it('CI 与 UI 都覆盖 merge_group，避免 merge queue 等不到 required check', () => {
     expect(read('ci.yml')).toContain('merge_group:');
     expect(read('ui.yml')).toContain('merge_group:');

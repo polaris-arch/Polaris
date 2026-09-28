@@ -126,6 +126,7 @@ fn tun_exclude_with(
         probe_proxy_port: None,
         update_in_port: None,
         subscription_update_in_port: None,
+        loopback_auth: None,
         probe_pool_ports: vec![],
         platform: "darwin".into(),
         own_lan_cidrs: vec![],

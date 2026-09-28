@@ -34,7 +34,7 @@ fn schedule_ipinfo_refresh_inner_uses_tauri_async_runtime_not_bare_tokio_spawn()
 fn guard_scan_actually_captured_the_scheduler_body() {
     let body = scheduler_body();
     assert!(
-        body.contains("next_ipinfo_epoch") && body.contains("probe_publish_ipinfo"),
+        body.contains("begin_scheduled_probe") && body.contains("probe_publish_ipinfo"),
         "扫到的片段缺少排程腿的标志性内容 ⇒ 锚点漂了，守卫失去判据：{body}"
     );
 }

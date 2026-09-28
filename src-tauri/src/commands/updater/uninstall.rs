@@ -46,8 +46,13 @@ use crate::runtime::{uninstall, AppRuntime};
 /// `AutoLaunchManager`。**只做转接，不加判定** —— 判定在纯函数侧。
 struct PluginAutostart(AppHandle);
 
+// 移动端两个方法都回「本来就没开」/「无事可做」：应用商店的卸载由系统执行，应用无从参与，
+// 也没有需要在卸载前撤销的开机自启项（那项能力在系统手里，见 `lib.rs` 的插件注册点注释）。
 impl uninstall::AutostartOps for PluginAutostart {
     fn is_enabled(&self) -> bool {
+        #[cfg(mobile)]
+        return false;
+        #[cfg(desktop)]
         self.0
             .state::<tauri_plugin_autostart::AutoLaunchManager>()
             .is_enabled()
@@ -55,6 +60,9 @@ impl uninstall::AutostartOps for PluginAutostart {
     }
 
     fn disable(&self) -> Result<(), String> {
+        #[cfg(mobile)]
+        return Ok(());
+        #[cfg(desktop)]
         self.0
             .state::<tauri_plugin_autostart::AutoLaunchManager>()
             .disable()

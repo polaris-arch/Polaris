@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { moduleSource } from '@/contracts/rust-source.test-support';
+import { crateRootSource, moduleSource } from '@/contracts/rust-source.test-support';
 
 function source(relative: string): string {
   return readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
@@ -61,7 +61,7 @@ describe('长期内存所有权接线', () => {
   });
 
   it('窗口 reload 与销毁都兜底清理日志订阅', () => {
-    const main = source('../../src-tauri/src/main.rs');
+    const main = crateRootSource('src-tauri/src');
     // 取材面按**模块**（`tray.rs` + `tray/**`，剔除 `tests/`），不是写死那一个 `.rs`：
     // 被断言的这条调用在 `enter_lightweight_transition`，按拆分设计要进 `tray/transition.rs`。
     const tray = moduleSource('src-tauri/src/tray');
@@ -70,7 +70,7 @@ describe('长期内存所有权接线', () => {
   });
 
   it('主窗重建、销毁和后台可见性探针共用跨平台生命周期边界', () => {
-    const main = source('../../src-tauri/src/main.rs');
+    const main = crateRootSource('src-tauri/src');
     // 同上：`mark_main_window_destroying()` 在 `enter_lightweight_transition`（→ `tray/transition.rs`），
     // `window_alive: AtomicBool` 在 `VisibilityCache`（→ `runtime/stats/gate.rs`）。
     const tray = moduleSource('src-tauri/src/tray');
@@ -108,7 +108,7 @@ describe('长期内存所有权接线', () => {
   it('日志 API 的 get/search/unsubscribe 跨层通道成对存在', () => {
     const channels = source('./domain/ipc-channels.ts');
     const client = apiClientSource();
-    const main = source('../../src-tauri/src/main.rs');
+    const main = crateRootSource('src-tauri/src');
     expect(channels).toContain("LOGS_UNSUBSCRIBE: 'logs_unsubscribe'");
     expect(channels).toContain("LOGS_SEARCH: 'logs_search'");
     expect(client).toContain('invoke(IPC_CHANNELS.LOGS_UNSUBSCRIBE, { subscriptionId })');

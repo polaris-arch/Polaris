@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use polaris_config_engine::builder::endpoint_routes::mesh_node_carries_full_tunnel;
 use polaris_config_engine::builder::hotswitch::HotSwitchPlan;
+use polaris_config_engine::singbox::InboundUser;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::is_mesh_node;
 use polaris_switch_engine::{HotSwitchOutcome, SwitchDecision, SwitchExecutor};
@@ -525,6 +526,7 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         my_gen: u64,
         probe_proxy_port: Option<u16>,
+        loopback_auth: Option<InboundUser>,
         generation_blocked: bool,
     ) {
         let me = Arc::clone(self);
@@ -574,7 +576,9 @@ impl ProxyRuntime {
                     TickAction::Probe { probe_proxy_port } => probe_proxy_port,
                 };
                 // 应用层连通性探测（真机门：真起核 + 碰网络）。
-                let alive = probe_proxy_connectivity(probe_proxy_port).await;
+                // `loopback_auth` 与端口同为世代常量（本次起核生成、随本心跳任务一起退场）。
+                let alive =
+                    probe_proxy_connectivity(probe_proxy_port, loopback_auth.as_ref()).await;
                 // 探测耗时窗口内可能已被接管 → 复查世代。
                 if me.gate.generation() != my_gen {
                     return;
@@ -879,30 +883,48 @@ impl ProxyRuntime {
 /// **C3**：应用层连通性检测：只经钉死到 `proxy-selector` 的专用 HTTP 入站，以绝对 URI GET
 /// generate_204，任一端点返回 2xx/3xx → 判通。该入口不经过用户路由规则，因此结果只描述当前代理出口，
 /// 不会被一条 direct 分流伪装成“节点健康”。**真机门**：需真起核 + 碰网络。
-async fn probe_proxy_connectivity(probe_proxy_port: u16) -> bool {
+async fn probe_proxy_connectivity(probe_proxy_port: u16, auth: Option<&InboundUser>) -> bool {
     for url in CONNECTIVITY_URLS {
-        if probe_through_proxy(probe_proxy_port, url).await {
+        if probe_through_proxy(probe_proxy_port, auth, url).await {
             return true;
         }
     }
     false
 }
 
-/// 经指定的本地 HTTP 探针入口以绝对 URI GET 目标，判是否拿到 2xx/3xx。调用方负责保证该入口
-/// 固定路由到待测出口；这里仅实现通用 HTTP 代理握手。**真机门**：需真起核 + 碰网络，禁本机单测。
-async fn probe_through_proxy(proxy_port: u16, target_url: &str) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// 连通性探针发给本机 http 入站的请求报文（absolute-form GET；`auth` 非空时带 `Proxy-Authorization`）。
+///
+/// 纯函数，抽出来只为让报文形状可单测（[`probe_through_proxy`] 本身要真起核 + 碰网络）。
+/// 目标不是 `http://<host>/…` 形态 → `None`（取不到 Host 头）。
+pub(super) fn connectivity_probe_request(
+    target_url: &str,
+    auth: Option<&InboundUser>,
+) -> Option<String> {
     // 取 Host 头（`http://<host>/path` → `<host>`）。
     let host = target_url
         .strip_prefix("http://")
         .and_then(|rest| rest.split('/').next())
-        .unwrap_or("");
-    if host.is_empty() {
+        .filter(|h| !h.is_empty())?;
+    let proxy_auth = crate::runtime::http::proxy_authorization_line(auth);
+    Some(format!(
+        "GET {target_url} HTTP/1.1\r\nHost: {host}\r\n{proxy_auth}Proxy-Connection: close\r\nConnection: close\r\n\r\n"
+    ))
+}
+
+/// 经指定的本地 HTTP 探针入口以绝对 URI GET 目标，判是否拿到 2xx/3xx。调用方负责保证该入口
+/// 固定路由到待测出口；这里仅实现通用 HTTP 代理握手。**真机门**：需真起核 + 碰网络，禁本机单测。
+///
+/// `auth`：Android 上 `probe-proxy-in` 要求本次起核的一次性凭据；缺了内核回 407 ⇒ 每拍都判「不通」
+/// ⇒ 连续失败后**自动换走一个好好的节点**。这是比「探针失效」更坏的失效形态，故凭据是必填参数。
+async fn probe_through_proxy(
+    proxy_port: u16,
+    auth: Option<&InboundUser>,
+    target_url: &str,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(request) = connectivity_probe_request(target_url, auth) else {
         return false;
-    }
-    let request = format!(
-        "GET {target_url} HTTP/1.1\r\nHost: {host}\r\nProxy-Connection: close\r\nConnection: close\r\n\r\n"
-    );
+    };
     let addr = format!("127.0.0.1:{proxy_port}");
     let probe = async {
         let mut stream = tokio::net::TcpStream::connect(&addr).await.ok()?;

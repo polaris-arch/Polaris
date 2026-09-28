@@ -46,6 +46,7 @@ import { withProxyStartClaim } from '@/lib/proxy-start-claim';
 import { ProxyErrorCode, type UserConfig } from '@/contracts/types';
 import { ConnectionTopology } from './ConnectionTopology';
 import { useSwitchNode } from '@/components/screens/shared/use-switch-node';
+import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';
 import { NodeMenu } from './NodeMenu';
 import { TsExitWarning } from './TsExitWarning';
 import { MeshTunnelHealth } from './MeshTunnelHealth';
@@ -238,6 +239,7 @@ export function HomeScreen() {
   const beginUnlockCheck = useAppStore((s) => s.beginUnlockCheck);
   const applyUnlockSnapshot = useAppStore((s) => s.applyUnlockSnapshot);
   const saveConfig = useAppStore((s) => s.saveConfig);
+  const switchServer = useAppStore((s) => s.switchServer);
   const switchNode = useSwitchNode();
   const openDialog = useDialogStore((s) => s.open);
   const closeDialog = useDialogStore((s) => s.close);
@@ -681,28 +683,24 @@ export function HomeScreen() {
     [switchNode]
   );
 
-  /* ── 出口选单：拾取「直连」哨兵（DIRECT_SERVER_ID 写 selectedServerId，走顶层 patch 而非
-   * switchServer —— server_switch 要求 id 命中真实 servers 列表，哨兵不在其中会被拒绝；patch 在
-   * 后端最新配置上只替换该字段，config-engine 已对哨兵放行，见 crates/store/validate.rs）── */
+  /* ── 出口选单：直连也经 server_switch 收据，不能把保存选择当作活核已切换。 ── */
   const onPickDirectExit = useCallback(async () => {
     setNodeMenuOpen(false);
     if (!diskConfig) return;
     try {
-      await saveConfig({ selectedServerId: DIRECT_SERVER_ID });
-      // 同 onPickNode：选「直连」也是一次出口切换，原型 setNode :4439 一视同仁 notify。
-      toast.success(
-        t('home.switchedToast', {
-          node: t('home.directConnection'),
-        })
-      );
+      const receipt = await switchServer(DIRECT_SERVER_ID);
+      const feedback = switchReceiptFeedback(receipt, t('home.directConnection'), t);
+      if (feedback?.tone === 'success') toast.success(feedback.text);
+      else if (feedback?.tone === 'warning') toast.warning(feedback.text);
+      else if (feedback) toast.info(feedback.text);
       // 原型 `pickDirectExit:3514` 同样冒浮标，同 `onPickNode` 一并不移植（见那处理由）。
     } catch (err) {
       console.error('[home] switch to direct failed:', err);
       toast.error(t('home.switchError'));
     }
-  }, [diskConfig, saveConfig, t]);
+  }, [diskConfig, switchServer, t]);
 
-  /* ── 出口选单：拾取「阻断」哨兵。与 onPickDirectExit 同款走 saveConfig（server_switch 只收真实节点 id）。
+  /* ── 出口选单：拾取「阻断」哨兵，仍走配置保存（server_switch 不处理此哨兵）。
    * 直连模式下该项在选单里已 disabled，此处二次守门：走到这里说明渲染态与配置态脱节（如刚被托盘改掉
    * proxyMode），静默返回胜过写入一个不会生效的出口。 */
   const onPickBlockExit = useCallback(async () => {

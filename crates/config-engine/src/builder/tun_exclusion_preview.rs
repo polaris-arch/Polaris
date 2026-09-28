@@ -121,6 +121,8 @@ pub fn preview_tun_exclusion(
         // 门还在、牙没了（测试环境比生产宽容 ⇒ 绿无信息量）。现在它由参数决定，且那道门带
         // 反向对照：只喂一侧观测必须分叉。
         observed_tailnet_addresses,
+        // 端口全空 ⇒ 回环入站一个都不发，凭据无处可用（只关心 TUN 排除面）。
+        loopback_auth: None,
     };
     let inbounds = build_inbounds(config, None, &deps);
     let tun = inbounds.iter().find(|i| i.type_field == "tun");

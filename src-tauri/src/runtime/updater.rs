@@ -33,7 +33,7 @@
 //! 2. **核二进制路径解析的单一真值是 [`crate::runtime::proxy::resolve_core_binary`]**（`pub(crate)`）。
 //!    本模块**刻意不复制第二份**（§A3 教训：`RuleResourceManager` 曾有 2 域的 `GITHUB_HOSTS` 本地副本
 //!    与 `gh-proxy.ts` 的 5 域漂移，令三级兜底自相矛盾）。走**注入**：[`UpdaterRuntime::with_core_binary`]，
-//!    注入点 `main.rs:1293`（此前本条记「待编排者提为 `pub(crate)` 并注入」，该待办**已完成**）。
+//!    注入点 `lib.rs:1293`（此前本条记「待编排者提为 `pub(crate)` 并注入」，该待办**已完成**）。
 //!    未注入时（异常启动路径）版本读取如实返回「未知」/空串，**不猜、不谎报**。
 
 use std::path::{Path, PathBuf};

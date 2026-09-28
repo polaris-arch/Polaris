@@ -36,6 +36,22 @@ struct PresetRaw {
     geosite_tags: &'static [&'static str],
     geoip_tags: &'static [&'static str],
     process_names: &'static [&'static str],
+    /// Android applicationId（包名）。与 `process_names` 是**同一件事的两个平台形态** —— 桌面按
+    /// 进程名/路径认应用，Android 按包名认，故同列同行、不切表（切表就是本文件头部要消灭的漂移形态）。
+    ///
+    /// **只填能核实的**，其余留空。空 = 该预设在 Android 上不进 `exclude_package`，退回 geosite/geoip
+    /// 那条腿（`builder::route` 的 b. 腿，与桌面同源）—— 失效方向是「少排除」而不是「排错应用」，
+    /// 且用户可见行为仍是直连。反过来填错一个包名会把**别的**应用踢出隧道，那才是不可接受的一侧。
+    ///
+    /// 取证（2026-09-04）：逐条拉 `play.google.com/store/apps/details?id=<包名>&hl=en&gl=US`，
+    /// 按 **HTTP 200 + `og:title` + JSON-LD `author.name`** 三项同时对上才收；404 或开发者对不上
+    /// 一律留空。留空的两条（`epic` / `riot`）各自写了为什么，那是结论不是待办。
+    ///
+    /// **本列与 `process_names` 的空/非空不必对齐**：两者列的是「该平台上真实存在的那个应用」。
+    /// `youtube`/`gemini`/`google` 在桌面是网页（无进程可认）、在 Android 是独立 app，故桌面空、
+    /// Android 非空 —— 这是平台事实，不是漏填。由此这三条在 Android 上的排除范围**宽于**桌面
+    /// （整个 app vs 仅该预设的域名），那正是两边各自的用户预期。
+    package_names: &'static [&'static str],
     category: &'static str,
 }
 
@@ -49,6 +65,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["youtube"],
         geoip_tags: &[],
         process_names: &[],
+        package_names: &["com.google.android.youtube"],
         category: "video",
     },
     PresetRaw {
@@ -60,6 +77,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         // geoip-netflix 覆盖 Netflix 的 CDN 直连 IP（如 AWS/Akamai 上的 Netflix 专属 IP 段）
         geoip_tags: &["netflix"],
         process_names: &["Netflix", "Netflix.exe"],
+        package_names: &["com.netflix.mediaclient"],
         category: "video",
     },
     PresetRaw {
@@ -70,6 +88,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["tiktok"],
         geoip_tags: &[],
         process_names: &["TikTok", "TikTok.exe"],
+        package_names: &["com.zhiliaoapp.musically"],
         category: "video",
     },
     // ── 社交 ──────────────────────────────────────────
@@ -82,6 +101,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         // geoip-telegram 覆盖 Telegram DC（数据中心）的 IP 段，确保 DC IP 直连也走代理
         geoip_tags: &["telegram"],
         process_names: &["Telegram", "Telegram.exe", "Telegram Desktop"],
+        package_names: &["org.telegram.messenger"],
         category: "social",
     },
     PresetRaw {
@@ -94,6 +114,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         // 这是修复 Twitter 在系统代理模式下 UDP 流量不走代理的关键
         geoip_tags: &["twitter"],
         process_names: &["Twitter", "X", "Twitter.exe"],
+        package_names: &["com.twitter.android"],
         category: "social",
     },
     PresetRaw {
@@ -104,6 +125,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["instagram"],
         geoip_tags: &[],
         process_names: &["Instagram", "Instagram.exe"],
+        package_names: &["com.instagram.android"],
         category: "social",
     },
     // ── AI ────────────────────────────────────────────
@@ -115,6 +137,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["openai"],
         geoip_tags: &[],
         process_names: &["ChatGPT", "ChatGPT.exe"],
+        package_names: &["com.openai.chatgpt"],
         category: "ai",
     },
     PresetRaw {
@@ -130,6 +153,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["anthropic", "category-ai"],
         geoip_tags: &[],
         process_names: &["Claude", "Claude.exe"],
+        package_names: &["com.anthropic.claude"],
         category: "ai",
     },
     PresetRaw {
@@ -145,6 +169,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["google"],
         geoip_tags: &[],
         process_names: &[],
+        package_names: &["com.google.android.apps.bard"],
         category: "ai",
     },
     // ── 工具 ──────────────────────────────────────────
@@ -156,6 +181,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["github"],
         geoip_tags: &[],
         process_names: &["GitHub Desktop", "GitHubDesktop.exe", "git", "git.exe", "GitHub"],
+        package_names: &["com.github.android"],
         category: "tools",
     },
     PresetRaw {
@@ -166,6 +192,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["google"],
         geoip_tags: &[],
         process_names: &[],
+        package_names: &["com.google.android.googlequicksearchbox"],
         category: "tools",
     },
     PresetRaw {
@@ -176,6 +203,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["spotify"],
         geoip_tags: &[],
         process_names: &["Spotify", "Spotify.exe"],
+        package_names: &["com.spotify.music"],
         category: "tools",
     },
     // ── 游戏 ──────────────────────────────────────────
@@ -202,6 +230,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
             // 生存 / 沙盒（Valheim / Rust / 幻兽帕鲁）
             "valheim.exe", "valheim", "RustClient.exe", "Palworld-Win64-Shipping.exe",
         ],
+        package_names: &["com.valvesoftware.android.steam.community"],
         category: "game",
     },
     PresetRaw {
@@ -217,6 +246,10 @@ const PRESETS_RAW: &[PresetRaw] = &[
             "EpicGamesLauncher", "EpicGamesLauncher.exe", "EpicWebHelper.exe",
             "FortniteClient-Win64-Shipping.exe", "UnrealEngineLauncher.exe",
         ],
+        // 空是**核实结论**不是待办：Epic Games Store 为规避 Play 抽成，Android 版自 2024-08-16 起
+        // 绕开 Play 独立分发，`com.epicgames.portal` 在 Play 上 404。Play 里那个 Epic 官方的
+        // `com.epicgames.ega` 是账号/2FA/聊天配套 app，不是商店本体，不能当等价物。
+        package_names: &[],
         category: "game",
     },
     PresetRaw {
@@ -235,6 +268,11 @@ const PRESETS_RAW: &[PresetRaw] = &[
             "League of Legends.exe", "League of Legends",
             "VALORANT-Win64-Shipping.exe", "LoR.exe",
         ],
+        // 空是**核实结论**：Riot 在 Play 上没有单一官方客户端，只有逐游戏包名
+        // （`com.riotgames.league.wildrift` / `...teamfighttactics` / `...legendsofruneterra`）
+        // 加一个资讯类配套 app `com.riotgames.mobile.leagueconnect`。桌面那串进程名对应的
+        // 端游在 Android 上不存在，硬凑一个包名等于把「排除 Riot」实现成「排除某一款手游」。
+        package_names: &[],
         category: "game",
     },
     PresetRaw {
@@ -245,6 +283,7 @@ const PRESETS_RAW: &[PresetRaw] = &[
         geosite_tags: &["disney"],
         geoip_tags: &[],
         process_names: &["Disney+"],
+        package_names: &["com.disney.disneyplus"],
         category: "video",
     },
 ];
@@ -258,12 +297,17 @@ pub(crate) fn all_presets() -> Vec<AppPreset> {
             geosite_tags: r.geosite_tags.iter().map(|s| s.to_string()).collect(),
             geoip_tags: r.geoip_tags.iter().map(|s| s.to_string()).collect(),
             process_names: r.process_names.iter().map(|s| s.to_string()).collect(),
+            package_names: r.package_names.iter().map(|s| s.to_string()).collect(),
             category: r.category.to_string(),
         })
         .collect()
 }
 
 /// 全列投影：`Vec<AppPresetDto>`（含 UI 列）—— `app_presets_list` command 下发前端。
+///
+/// **刻意不带 `package_names`**：DTO 的键集是与前端 `AppPreset` interface 的逐字契约
+/// （`tests/frontend_sot_guard.rs` 锁死），而包名当前无任何渲染消费方。加一个前端不读的键
+/// 只会让那道契约门变松（多出的键谁都不看，漂了也没人知道）。
 pub fn all_presets_dto() -> Vec<AppPresetDto> {
     PRESETS_RAW
         .iter()

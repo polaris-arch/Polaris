@@ -133,14 +133,30 @@ fn every_declared_key_resolves_in_all_five_locales() {
     );
 }
 
-/// 反向对差：`native.*` 命名空间里的每一条都必须被 `mod key` 声明。
-///
-/// `native.*` 的**唯一**消费方是 Rust（前端不加载它，`i18n-coverage.test.ts` 的 G4 还禁止
-/// TS 侧消费）⇒ 没有 Rust 常量指向它 = 死翻译，会一直被翻译者维护却没人显示。
+/// 反向对差：`native.*` 命名空间里的每一条都必须被 Rust `mod key` 或渲染器
+/// 逃生页的 `FatalPageKey` 声明。后者在主 i18n 初始化失败时直接读取辅助词表；
+/// 其消费映射由 UI 的 recovery-text 测试覆盖，不能误删 Debug 报告文案。
 /// `tray.*` 不在本条射程内：它归浮层所有，Rust 只是共用其中一部分。
 #[test]
 fn every_native_key_in_locale_is_declared_here() {
-    let declared = declared_keys();
+    let mut declared = declared_keys();
+    let recovery_source = include_str!("../../../../ui/src/i18n/recovery-text.ts");
+    let recovery_type = recovery_source
+        .split_once("type FatalPageKey =")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .map(|(body, _)| body)
+        .expect("渲染器逃生页的 FatalPageKey 契约不可静默消失");
+    for key in recovery_type
+        .lines()
+        .filter_map(|line| line.split('\'').nth(1))
+        .filter(|key| key.starts_with("native."))
+    {
+        assert!(
+            recovery_source.matches(&format!("'{key}'")).count() >= 2,
+            "逃生页键 {key} 必须有类型声明和实际映射"
+        );
+        declared.push(key.to_owned());
+    }
     let dead: Vec<_> = catalog(Lang::EnUS)
         .keys()
         .filter(|k| k.starts_with("native.") && !declared.contains(*k))

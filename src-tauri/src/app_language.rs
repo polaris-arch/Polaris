@@ -18,7 +18,7 @@
 //! AppKit / CFBundle 在进程内**只解析一次**本地化并缓存，NSOpenPanel 的按钮、边栏、
 //! 「新建文件夹」等全部取自它。故改语言当场不可能变，必须重启 App。
 //!
-//! 本模块把写入放在 [`crate::main`] 的**最早**位置（`tauri::Builder` 之前）而不是 `setup`，
+//! 本模块把写入放在应用装配入口 [`crate::run`] 的**最早**位置（`tauri::Builder` 之前）而不是 `setup`，
 //! 理由是**重启次数**：Tauri 2 的 `setup` 由 `Builder::build()` 在 `R::new(runtime_args)`
 //! **之后**调用（`tauri-2.11.5/src/app.rs:2344` 建 runtime、`:2531` 才 `(setup)(app)`），
 //! 那时 tao 已经建过 `NSApplication`。若在 `setup` 写：
@@ -148,7 +148,7 @@ fn user_config_path(home: &Path, identifier: &str) -> std::path::PathBuf {
 static STARTUP_OUTCOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// 按 `config.language` 对账进程的 `AppleLanguages`。**必须在 `tauri::Builder` 之前调用**
-/// （理由见模块文档「生效语义」一节；`main.rs` 的顺序守卫钉着这一点）。
+/// （理由见模块文档「生效语义」一节；`lib.rs` 的顺序守卫钉着这一点）。
 ///
 /// 幂等、best-effort：任何一步取不到就什么都不做（保持上次的值，而不是清成系统语言 ——
 /// 读不出配置时把用户已选好的语言抹掉，比不动更糟）。

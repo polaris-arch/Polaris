@@ -9,6 +9,12 @@ use std::path::Path;
 const EXPECTED_SRS_COUNT: usize = 28;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        // NDK r27 still defaults Rust cdylibs to 4 KB. Keep every PT_LOAD segment
+        // compatible with 16 KB devices, for both debug and release builds.
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-z,max-page-size=16384");
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-z,common-page-size=16384");
+    }
     export_product_name();
     assert_bundled_geo_data();
     assert_bundled_dashboard();

@@ -6605,6 +6605,16 @@
               "interrupt_exist_connections": false
             },
             {
+              "type": "selector",
+              "tag": "rule-sel-app-custom-app1",
+              "outbounds": [
+                "HK",
+                "proxy-selector"
+              ],
+              "default": "proxy-selector",
+              "interrupt_exist_connections": false
+            },
+            {
               "type": "direct",
               "tag": "direct",
               "domain_resolver": "dns-domestic"
@@ -6718,6 +6728,13 @@
                 ],
                 "action": "route",
                 "outbound": "direct"
+              },
+              {
+                "rule_set": [
+                  "geosite-youtube"
+                ],
+                "action": "route",
+                "outbound": "rule-sel-app-custom-app1"
               },
               {
                 "ip_cidr": [

@@ -77,7 +77,7 @@ impl Attempts {
             .is_ok_and(|a| !a.claimed.load(Ordering::SeqCst) && !a.is_finished() && !a.cancelled())
     }
 
-    pub async fn cancel_node_except(&self, server_id: &str, keep: Option<&str>) {
+    pub fn cancel_node_except(&self, server_id: &str, keep: Option<&str>) -> Vec<Arc<Attempt>> {
         let attempts: Vec<_> = self
             .0
             .lock()
@@ -92,9 +92,7 @@ impl Attempts {
                 attempt.finish();
             }
         }
-        for attempt in attempts {
-            attempt.finished().await;
-        }
+        attempts
     }
 
     pub fn get(&self, server_id: &str, id: &str) -> Result<Arc<Attempt>, String> {

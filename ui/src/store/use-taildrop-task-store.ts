@@ -51,6 +51,19 @@ export function mergeTaildropTaskSnapshots(
   return snapshots.reduce(reduceTaildropTaskSnapshot, tasks);
 }
 
+/**
+ * 一个节点的发件任务**呈现视图**：在跑的全部 + 最近一条终态，按更新时间倒序。
+ * 桌面 `TaildropDialog` 与移动端 `TaildropPanel` 读同一份（此前两端各写一遍同一条判据）。
+ */
+export function visibleTaildropTasks(tasks: TaildropTaskMap, serverId: string): TaildropTaskSnapshot[] {
+  const all = Object.values(tasks)
+    .filter((task) => task.serverId === serverId)
+    .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+  const active = all.filter((task) => !isTaildropTaskTerminal(task));
+  const latestTerminal = all.find(isTaildropTaskTerminal);
+  return latestTerminal ? [...active, latestTerminal] : active;
+}
+
 interface TaildropTaskState {
   tasks: TaildropTaskMap;
   applySnapshot: (snapshot: TaildropTaskSnapshot) => void;

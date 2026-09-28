@@ -2,12 +2,20 @@
 
 use super::{CODE_CORE_DIR_UNAVAILABLE, GITHUB_FETCH_TIMEOUT_MS, MAX_GITHUB_JSON_BYTES};
 use crate::response::ApiResponse;
+#[cfg(not(target_os = "android"))]
+use crate::runtime::core_paths;
 use crate::runtime::http::{app_user_agent, CoreDownloader, SystemDnsLookup};
-use crate::runtime::{core_paths, AppRuntime};
+use crate::runtime::AppRuntime;
 use polaris_net_stack::safe_redirect::{safe_redirect_fetch, SafeRedirectFetchOptions};
 use polaris_updater::github::github_releases_api_url;
 
 pub(crate) fn core_base_dir<T>() -> Result<&'static std::path::Path, ApiResponse<T>> {
+    #[cfg(target_os = "android")]
+    return Err(ApiResponse::err(
+        "Android 内核随 APK 更新，没有可替换的独立内核文件",
+    ));
+
+    #[cfg(not(target_os = "android"))]
     core_paths::base_dir().ok_or_else(|| {
         ApiResponse::err_with_code(
             "内核可写目录未初始化（应用启动期 core_paths::init_base_dir 未执行）",

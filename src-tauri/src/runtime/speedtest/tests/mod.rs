@@ -1524,8 +1524,9 @@ struct FakeSpawner {
     stderr_written: tokio::sync::watch::Sender<usize>,
 }
 
+#[async_trait]
 impl LoginCoreSpawner for FakeSpawner {
-    fn spawn(
+    async fn spawn(
         &self,
         req: SpawnRequest,
     ) -> Result<Box<dyn LoginCoreChild>, polaris_core_supervisor::SpawnError> {

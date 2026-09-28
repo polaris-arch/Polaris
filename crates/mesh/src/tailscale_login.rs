@@ -25,7 +25,7 @@ use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use serde_json::{json, Map, Value};
 
-/// 瞬态核唯一的 Tailscale endpoint tag；路由/DNS 入站拒绝与 STATUS 映射共用。
+/// Stable tag shared by the transient endpoint, ingress reject rules, and STATUS mapping.
 pub const TAILSCALE_LOGIN_ENDPOINT_TAG: &str = "tailscale-login";
 
 /// 瞬态登录核管理 API（1.14 services[]）入参：独立空闲端口 + 随机 secret，使瞬态核暴露 STATUS 流。
@@ -38,7 +38,7 @@ pub struct TailscaleLoginApiService {
     pub secret: String,
 }
 
-/// 登录专用 config 的最小形状（无代理 inbound；仅 TS endpoint + 入站拒绝 + direct + 管理 API）。
+/// 登录专用 config：无代理 inbound，TS endpoint 入站拒绝，direct 控制面与管理 API。
 /// 上游 `TailscaleLoginConfig`。以 serde_json::Value 输出（与 sing-box check 输入一致；builder 由上层序列化）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TailscaleLoginConfig {
@@ -48,21 +48,23 @@ pub struct TailscaleLoginConfig {
     pub endpoints: Vec<Value>,
     /// 单个 direct outbound。
     pub outbounds: Vec<Value>,
-    /// 只拒绝该 endpoint 的新入站连接；控制面仍走 direct。
+    /// 只拒绝 TS endpoint 的新入站流量，控制面拨号仍走 direct。
     pub route: Value,
-    /// 独立拒绝该 endpoint 的 DNS 入站；未匹配的控制面解析继续使用内核默认本地解析器。
+    /// 独立拒绝该 endpoint 的 DNS 入站，普通控制面解析不受影响。
     pub dns: Value,
     /// 1.14 管理 API（恒一条）：瞬态核据此暴露 `SubscribeTailscaleStatus` —— 登录 URL 与登录成功
     /// 判据的**唯一**来源（见模块头）。
     pub services: Vec<Value>,
+    /// libbox always creates a cache with its platform logger; isolate it from the main cache.db.
+    pub experimental: Value,
 }
 
-/// 生成登录专用 config：仅含该节点的 tailscale endpoint（state_directory 复用 tailscale-state）、
-/// endpoint 入站拒绝、一个 direct outbound 和管理 API service。预授权请求保留 auth_key。
+/// 生成登录专用 config：仅含该节点的 tailscale endpoint（state_directory 复用 tailscale-state）+ 一个 direct
+/// outbound + 管理 api service。非空 auth_key 透传；无 key 时使用交互登录。
 ///
 /// log.level 强制 info + timestamp:true → 核侧诊断行不受日志等级摆布（**不再**是 URL 来源，只是日志）。
-/// 无代理 inbound；route/DNS 仅按固定 endpoint tag 拒绝新入站，避免已授权重试到收核前直通本机。
-/// 控制面拨号与普通 DNS 无该入站 tag，分别仍走 direct 与内核默认本地解析器；TS 内置服务不经此规则。
+/// 无代理 inbound；固定 tag 的 route/DNS 规则拒绝新入站，API/控制面维持 direct。
+/// Tailscale 内建服务不经这些规则，不宣称瞬态核已隔离所有原生服务。
 ///
 /// controlUrl/hostname 等身份字段从 tailscaleSettings 透传（与 buildTailscaleEndpoint 同语义），但只透传
 /// 登录相关的少量字段——瞬态核只为拿 URL + 落 state，不承载路由/出口。
@@ -85,15 +87,14 @@ pub fn build_tailscale_login_config(
         "state_directory".to_string(),
         Value::String(state_dir.to_string_lossy().to_string()),
     );
-    // The caller clears auth_key for browser requests; preauthorized requests need it here.
     if let Some(ts) = ts {
         if let Some(key) = ts
             .auth_key
             .as_deref()
             .map(str::trim)
-            .filter(|k| !k.is_empty())
+            .filter(|key| !key.is_empty())
         {
-            endpoint.insert("auth_key".into(), Value::String(key.into()));
+            endpoint.insert("auth_key".to_string(), Value::String(key.to_string()));
         }
         if let Some(control_url) = ts.control_url.as_deref() {
             let trimmed = control_url.trim();
@@ -133,12 +134,12 @@ pub fn build_tailscale_login_config(
     }
     let services = vec![Value::Object(svc)];
     let route = json!({
-        "rules":[{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject","no_drop":true}],
-        "final":"direct"
+        "rules": [{"inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject", "no_drop": true}],
+        "final": "direct"
     });
     let dns = json!({
-        "rules":[{"inbound":[TAILSCALE_LOGIN_ENDPOINT_TAG],"action":"reject",
-            "method":"default","no_drop":true}]
+        "rules": [{"inbound": [TAILSCALE_LOGIN_ENDPOINT_TAG], "action": "reject",
+            "method": "default", "no_drop": true}]
     });
 
     Ok(TailscaleLoginConfig {
@@ -148,6 +149,9 @@ pub fn build_tailscale_login_config(
         route,
         dns,
         services,
+        experimental: serde_json::json!({
+            "cache_file": { "enabled": true, "path": state_dir.join(format!("login-cache-{}.db", api.port)).to_string_lossy() }
+        }),
     })
 }
 
@@ -163,6 +167,7 @@ pub fn login_config_to_json(cfg: &TailscaleLoginConfig) -> Value {
     root.insert("route".to_string(), cfg.route.clone());
     root.insert("dns".to_string(), cfg.dns.clone());
     root.insert("services".to_string(), Value::Array(cfg.services.clone()));
+    root.insert("experimental".to_string(), cfg.experimental.clone());
     Value::Object(root)
 }
 

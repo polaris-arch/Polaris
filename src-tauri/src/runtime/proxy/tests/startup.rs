@@ -199,6 +199,7 @@ async fn race_off_starts_no_sidecar_and_keeps_generate_deps_at_zero() {
             })),
             rt.config.dir(),
             rt.gate.generation(),
+            Platform::Linux,
         )
         .await;
     assert_eq!(rt.race_server_port(), 0, "竞速关 → 端口恒 0");
@@ -232,6 +233,7 @@ async fn race_on_starts_sidecar_and_feeds_port_and_custom_upstream_ips() {
             })),
             rt.config.dir(),
             rt.gate.generation(),
+            Platform::Linux,
         )
         .await;
     let port = rt.race_server_port();
@@ -281,13 +283,16 @@ fn should_start_via_helper_truth_table() {
         !should_start_via_helper(Tun, Platform::Other),
         "无 helper 平台的 TUN 不应经 helper（退回直起 best-effort）"
     );
+    // TUN@Android → 同样不经 helper，但**这一条是起核走对腿的前提**而不是 best-effort 降级：
+    // Android 的 TUN 由 `VpnService` 建、核跑在进程内 libbox，`start_inner` 的 android 腿
+    // （`android_bridge::start_core`）挂在 `!via_helper` 那一侧。这里若判 true，Android 会去
+    // 连一个根本不存在的 helper socket。
+    assert!(
+        !should_start_via_helper(Tun, Platform::Android),
+        "Android 无 helper：起核走进程内 libbox，绝不建 helper client"
+    );
     // 非 TUN（systemProxy/manual 不接管 TUN）→ 恒直起，绝不弹提权。
-    for p in [
-        Platform::Mac,
-        Platform::Win,
-        Platform::Linux,
-        Platform::Other,
-    ] {
+    for p in Platform::ALL.iter().copied() {
         assert!(
             !should_start_via_helper(SystemProxy, p),
             "systemProxy@{p:?} 不应经 helper"
@@ -1220,7 +1225,7 @@ async fn start_lands_custom_rule_files_before_generate() {
 fn public_start_arms_network_settle_before_any_await() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
+        "    pub(super) async fn start_guarded(",
     );
     let arm = body
         .find("let _network_settle = self.network_settle.begin(\"proxy-start\")")

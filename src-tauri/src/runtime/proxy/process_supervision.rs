@@ -127,6 +127,15 @@ impl ProxyRuntime {
     /// 无在跑核 = no-op。退出/崩溃/重启后不留孤儿：child 句柄被 take 后必 `wait()` 收割。
     /// helper 腿未确认停止时返回错误，调用方不得继续清运行态或启动第二个核。
     pub(super) async fn kill_core(&self) -> Result<(), String> {
+        // Android：核在**本进程内**（libbox），没有 child 可杀、没有 pid 可发信号 —— 停核 = 请
+        // `VpnService` 拆隧道。与 `kill_core_via_helper` 同构：**要确定回执**，停不掉就返 Err，
+        // 调用方不得据此继续清运行态或起第二个核（tun fd 由 `VpnService.prepare()` 仲裁，
+        // 同一时刻只授权一个应用，前一条没拆干净就起第二个必然打架）。
+        //
+        // `if cfg!` 而非 `#[cfg]` 早退：后者会让下面整段在 Android 编译单元里变成不可达代码。
+        if cfg!(target_os = "android") {
+            return super::android_bridge::stop_core().await;
+        }
         // C6-5：经 helper 起的核 → 经 helper stop（对称）。daemon 摘其受管 child → SIGTERM→宽限→SIGKILL
         // 收割（app 无本地 child 句柄）。阻塞 IPC 挪出 async worker。
         if self.core_via_helper.load(Ordering::SeqCst) {
@@ -252,6 +261,10 @@ impl ProxyRuntime {
     pub(super) async fn cleanup_stale_cores(&self) -> Result<(), StartError> {
         // 实跑计数：置于所有早退腿之前 —— 计的是「清扫这条腿被走到几次」，而非「杀掉几个孤儿」。
         self.stale_sweep_runs.fetch_add(1, Ordering::SeqCst);
+        // ── Android 腿：孤儿的形态是「系统拉起的核」，不是进程（见 [`Self::stop_system_started_core`]）──
+        if cfg!(target_os = "android") {
+            return self.stop_system_started_core().await;
+        }
         let binary = match resolve_core_binary() {
             Ok(b) => b,
             Err(e) => {
@@ -295,6 +308,25 @@ impl ProxyRuntime {
         self.escalate_root_orphans(&survivors).await
     }
 
+    /// [`Self::cleanup_stale_cores`] 的 Android 腿。
+    ///
+    /// 核在本进程内（libbox），没有二进制可解析、没有 cmdline 可扫；但「上次会话留下、本运行时不认识
+    /// 的核」这件事照样存在：always-on / 开机自动连接在**没有 Rust** 时由系统拉起的那个（配置是上次
+    /// 落盘的）。同一个处置：起核前先停掉它，再由本次 start 按当前配置起 —— 不停的话 Kotlin 桥判
+    /// 「已在运行」直接拒收这次起核，用户点连接永远连不上。本运行时自己起的核（`core_started`）
+    /// 不是孤儿，不碰。停不掉 ⇒ 有码失败（隧道还在，不许在它上面起第二个）。
+    async fn stop_system_started_core(&self) -> Result<(), StartError> {
+        if super::android_bridge::core_started()
+            || !super::android_bridge::system_started_core_running().await
+        {
+            return Ok(());
+        }
+        log::warn!("起核前发现系统拉起的核（本运行时未持有）→ 先停掉，再按当前配置起核");
+        super::android_bridge::stop_core()
+            .await
+            .map_err(|e| StartError::coded(e, code::STARTUP_FAILED))
+    }
+
     /// 清扫的**排除表** = 当前受管主核 pid + 此刻在飞的**测速临时核** pid + 此刻在飞的
     /// **Tailscale 瞬态登录核** pid。
     ///
@@ -322,21 +354,20 @@ impl ProxyRuntime {
     ///
     /// - 扫描之后才起的瞬态核 ⇒ 不在候选集里 ⇒ 本就杀不到它；
     /// - 扫描之前起的瞬态核 ⇒ 此刻要么仍在表里（被排除），要么已经退出并注销
-    ///   （`TempCorePidGuard` 的 Drop 跑在 `terminate()` 收割**之后** ⇒ 出表时进程已死）。
+    ///   （测速的 `TempCorePidGuard` 在收割后出表；登录核在确认 close/reap 后出表）。
     ///
     /// 反过来「先读表再扫描」就漏了一格：读表 → 瞬态核 spawn → 扫描，该 pid 既在候选集又不在表快照里。
-    /// 故这里**不需要**加锁扩大临界区（那要求 `INFLIGHT_TEMP_CORES` 罩住整条含 `await` 的清扫腿），
-    /// 只需要保持这个顺序。
+    /// 测速腿仍依赖此读取顺序；登录腿另由 `start_guarded` 持有同一 TS state gate 覆盖
+    /// 扫描到主核 spawn，登录 spawn/登记和旧实例关闭不会与清扫并发。
     ///
     /// # 两条腿各自的残余窗口（如实登记，别当成全覆盖）
     ///
     /// - **测速临时核**：spawn 返回到登记入表之间那一小段**同步**代码（起点其实是 fork），与主核
     ///   「spawn 完再记 `self.pid`」的窗口同构，是本仓既有的取舍。
-    /// - **登录核**：spawn 与登记之间隔着一次**真 `await`**（STATUS 流的 gRPC 订阅），窗口比上面那条
-    ///   宽得多；且 `cancel_login` 是先出表再收核，出表时进程还活着。两格都未关，详见
-    ///   [`LoginCoreRegistry::inflight_login_pids`](crate::runtime::tailscale_login_core::LoginCoreRegistry::inflight_login_pids)。
-    /// - **两条腿共有**：`victims` 在两段 1500 ms 宽限**之前**就冻结了，排除表管不到「孤儿被杀 →
-    ///   pid 被 init 回收 → 该 pid 号在 1.5 s 内被新起的瞬态核复用」这一格（需 pid 回绕，概率极低）。
+    /// - **登录核**：已改为 spawn 后先登记、再 await STATUS；cancel 先确认 close/reap，后出表。
+    ///   与起核前持有的 TS state gate 合起来封住本腿的扫描/登记窗口。
+    /// - **测速腿**：`victims` 在两段 1500 ms 宽限**之前**冻结；孤儿 pid 若被 init 回收并在
+    ///   宽限内由新测速临时核复用，排除表无从追踪该复用（需 pid 回绕，概率极低）。
     pub(super) fn sweep_exclusions(&self) -> Vec<u32> {
         let mut exclude: Vec<u32> = self.pid.lock().ok().and_then(|g| *g).into_iter().collect();
         let temp: Vec<u32> = crate::runtime::speedtest::inflight_temp_core_pids();

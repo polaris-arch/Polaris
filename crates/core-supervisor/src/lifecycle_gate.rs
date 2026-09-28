@@ -83,6 +83,8 @@ struct Inner {
     depth: u32,
     /// 生命周期世代（start/stop 入口 +1，:364）。u64 单调递增，不回绕（实际场景远不达上限）。
     generation: u64,
+    /// 最后一次起停世代认领者；旧 restart 收尾须沿用最新意图。
+    generation_owner: Option<LifecycleKind>,
     pending: PendingSnapshot,
 }
 
@@ -102,6 +104,23 @@ impl LifecycleGate {
     /// depth>0（仍在更外层操作内）→ 返回 `StillBusy`，留给最外层。
     pub fn end(&self, kind: LifecycleKind) -> LifecycleEndResult {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
+        Self::end_locked(&mut g, kind)
+    }
+
+    /// 被新起停接管的旧 restart 退出时，以最新世代的 Stop 意图决定是否丢弃 pending。
+    /// 判定与 depth 归零同锁，不能让新 start 插在「读 owner → end」之间。
+    pub fn end_restart_after(&self, owned_generation: Option<u64>) -> LifecycleEndResult {
+        let mut g = self.inner.lock().expect("lifecycle lock poisoned");
+        let superseded = owned_generation.is_none_or(|owned| owned != g.generation);
+        let kind = if superseded && g.generation_owner == Some(LifecycleKind::Stop) {
+            LifecycleKind::Stop
+        } else {
+            LifecycleKind::Restart
+        };
+        Self::end_locked(&mut g, kind)
+    }
+
+    fn end_locked(g: &mut Inner, kind: LifecycleKind) -> LifecycleEndResult {
         g.depth = g.depth.saturating_sub(1);
         if g.depth > 0 {
             return LifecycleEndResult::StillBusy(g.depth);
@@ -134,7 +153,19 @@ impl LifecycleGate {
     pub fn bump_generation(&self) -> u64 {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
         g.generation = g.generation.wrapping_add(1);
+        g.generation_owner = None;
         g.generation
+    }
+
+    /// 同锁认领新世代。`expected` 有值时，旧 restart 只能在旧 stop 世代仍当权时接续 start。
+    pub fn claim_generation(&self, expected: Option<u64>, owner: LifecycleKind) -> Option<u64> {
+        let mut g = self.inner.lock().expect("lifecycle lock poisoned");
+        if expected.is_some_and(|expected| expected != g.generation) {
+            return None;
+        }
+        g.generation = g.generation.wrapping_add(1);
+        g.generation_owner = Some(owner);
+        Some(g.generation)
     }
 
     /// 当前世代（供 readiness/recovery 比对让位，:4522/5960）。
@@ -143,6 +174,12 @@ impl LifecycleGate {
             .lock()
             .expect("lifecycle lock poisoned")
             .generation
+    }
+
+    /// 世代与最后认领者须同锁读取，供异步选择回执判断是否被主动停止接管。
+    pub fn generation_state(&self) -> (u64, Option<LifecycleKind>) {
+        let g = self.inner.lock().expect("lifecycle lock poisoned");
+        (g.generation, g.generation_owner)
     }
 
     /// 是否有 lifecycle 操作在飞（isLifecycleBusy，:1561）。
@@ -172,6 +209,17 @@ impl LifecycleGate {
             .expect("lifecycle lock poisoned")
             .pending
             .force_restart_id = Some(config_id);
+    }
+
+    /// 仅当前起停世代仍当权且没有 lifecycle 操作在飞时认领尾随重启。
+    /// selector PUT 失败可能与用户 Stop 交错，不能在旧腿失败后无条件给新世代挂重启。
+    pub fn set_force_restart_if_current(&self, expected_generation: u64, config_id: u64) -> bool {
+        let mut g = self.inner.lock().expect("lifecycle lock poisoned");
+        if g.generation != expected_generation || g.depth != 0 {
+            return false;
+        }
+        g.pending.force_restart_id = Some(config_id);
+        true
     }
 
     /// 清强制重启快照（结构性重启腿：newer 胜，:1894-1895）。

@@ -54,7 +54,7 @@ fn temp_dir(tag: &str) -> TestDir {
 async fn disabled_exit_route_op_is_honest_noop() {
     let op = HelperExitRouteOp {
         helper: None,
-        platform: current_platform(),
+        platform: Platform::current(),
         enabled: false,
         stats: Arc::new(ExitRouteOpStats::default()),
     };

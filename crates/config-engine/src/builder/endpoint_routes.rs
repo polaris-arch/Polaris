@@ -398,9 +398,36 @@ pub fn is_mesh_node_unroutable(server: &ServerConfig) -> bool {
     }
 }
 
-/// 平台是否支持组网 System 内核接口（Windows 禁）。上游 `meshSystemSupportedOnPlatform`。
+/// 平台是否支持组网 System 内核接口（**允许清单**：只有 mac / linux 支持）。
+/// 上游 `meshSystemSupportedOnPlatform`。
+///
+/// **本函数与 `polaris_mesh::mesh_system_supported_on_platform` 是同一条判据的两份实现**（入参一个
+/// 是 `std::env::consts::OS` 直传串、一个是 `Platform` 枚举），两份必须同答，否则会出现「config
+/// 生成侧认为 System 可用、出口路由状态机认为不可用」这种半开状态。2026-09-04 K10 给 Android 补
+/// 禁令时两份一起改，理由（无 `CAP_NET_ADMIN`、只有一个由 `VpnService` 授予的 tun fd）见枚举版
+/// 的函数文档，此处不复述。**两份同答由 `src-tauri/tests/platform_dispatch_exhaustive.rs` 的
+/// `mesh_system_support_agrees_across_enum_and_string_faces` 逐名对拍钉死**，不再靠人记。
+///
+/// # 为什么从「禁止清单」改成「允许清单」（2026-09-05）
+///
+/// 旧写法是 `!= "win32" && != "android"` —— 一条禁止清单，于是**任何没被点名的串都得到 `true`**。
+/// 那是枚举版 `Platform::Other => true` 在字符串轴上的同一个缺陷：不认识的平台默认被当成支持，
+/// 而这条路在 Android 上导致过整个内核起不来。取舍与代价不对称的完整论证见枚举版函数文档，
+/// 此处只记两条本轴独有的事实：
+///
+/// 1. **禁止清单在这里还多一个别名洞**：本函数收的是 上游 `process.platform` 风格串
+///    （`win32` / `darwin` / `linux`），而 `std::env::consts::OS` 的原值是 `windows` / `macos`。
+///    生产入参全部经 `runtime/proxy/platform_contracts.rs::platform_tag()` 映射过（故线上未触发），
+///    但只要有一处忘了映射直传 `"windows"`，旧写法就会对 **Windows** 答 `true` —— 而 Windows 正是
+///    它想禁的那个平台。允许清单没有这个形态的洞：漏映射的结果是 `false`（安全侧）。
+/// 2. 允许清单里同时收 `"darwin"` 与 `"macos"`（以及不收 `"windows"`）不是冗余，是与
+///    [`Platform::parse`](polaris_helper_proto::Platform::parse) 的别名表对齐 —— 上面那条对拍门
+///    正是按 `parse` 的全部字面量逐名比对两份实现的。
 pub fn mesh_system_supported_on_platform(platform: &str) -> bool {
-    !platform.eq_ignore_ascii_case("win32")
+    matches!(
+        platform.to_ascii_lowercase().as_str(),
+        "darwin" | "macos" | "linux"
+    )
 }
 
 /// 该组网节点的 force-route 段本轮是否应发射。上游 `shouldForceRouteSubnets`。
@@ -501,7 +528,7 @@ pub fn engaged_rule_targeted_server_ids(config: &UserConfig) -> BTreeSet<String>
         .collect();
     let custom_eff = crate::builder::helpers::effective_custom_rules(proxy_mode, &ordered);
     let app_eff = crate::builder::helpers::effective_app_rules(
-        config.app_routing_enabled == Some(true),
+        config.app_routing_enabled != Some(false),
         proxy_mode,
         &config.app_rules,
     );
@@ -946,7 +973,7 @@ pub fn referenced_server_ids(config: &UserConfig) -> BTreeSet<String> {
             }
         }
     }
-    if smart && config.app_routing_enabled == Some(true) {
+    if smart && config.app_routing_enabled != Some(false) {
         for a in &config.app_rules {
             if a.enabled && a.action == RuleAction::Proxy {
                 seed(a.target_server_id.as_deref(), &mut stack);

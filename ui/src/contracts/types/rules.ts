@@ -229,6 +229,23 @@ export interface SystemProcessInfo {
   count: number;
 }
 
+/**
+ * 已安装应用（Android 的包名选择器用）—— Rust `runtime/proxy/android_bridge.rs#InstalledApp`
+ * 的 1:1 镜像（serde camelCase 已对齐），数据源 ⇄ Kotlin `PolarisVpnPlugin.listInstalledApps`。
+ *
+ * 它与 [`SystemProcessInfo`] 是**同一件事的两个平台形态**：桌面按进程名匹配、Android 按
+ * applicationId 匹配。两条腿各有各的 command（`system_list_processes` / `system_list_installed_apps`），
+ * 因为两侧的标识、枚举方式与失败模式都不一样。
+ */
+export interface InstalledApp {
+  /** 显示名（`ResolveInfo.loadLabel`）。同一个包在不同语言下不同，**不能**当标识用。 */
+  label: string;
+  /** applicationId —— 这才是标识，也是 `CustomAppPreset.packageNames` 要存的那一列。 */
+  packageName: string;
+  /** 是否系统应用（`FLAG_SYSTEM`）。只给渲染端分组/排序用。 */
+  system: boolean;
+}
+
 // 自定义规则集（从 URL 导入）
 export interface CustomRuleSet {
   id: string;
@@ -366,8 +383,23 @@ export interface CustomAppPreset {
    */
   processNames?: string[];
   /**
+   * Android applicationId —— 与 `processNames` 是**同一件事的两个平台形态**，不是同一个值的
+   * 两种写法：桌面按进程名走 sing-box 的 `process_name` 路由规则，Android 按 applicationId 走
+   * `VpnService.Builder.addDisallowedApplication`（把进程名喂给它一条都命不中，且是静默的）。
+   *
+   * 消费点在 Rust：`user_config::app_rules_preset::get_app_preset` 转发 →
+   * `builder::inbounds::android_exclude_packages` → `tun.exclude_package`。
+   * **只有 `action === 'direct'` 那一档发射**（排除 = 该应用整个不进隧道）；
+   * 「指定某个应用走某个节点」在这台设备上做不到，`RouteRule` 没有 `package_name` 这一列。
+   *
+   * 缺省 / 空数组等价（Rust 侧 `#[serde(default, skip_serializing_if = "Vec::is_empty")]`）：
+   * 没挑包名的预设退回 geosite/geoip 腿，在磁盘上一个字节都不变。
+   * 来源：`AppAddPanel` 从 `api.system.listInstalledApps()` 拉的已装应用清单。
+   */
+  packageNames?: string[];
+  /**
    * 分类归属（纯 UI：应用卡按分类分组展示，可为内置 5 类之一或用户自建分类名）。
-   * 配置生成不消费 category（后端只读 geositeTags/geoipTags/processNames），故仅影响卡片分组呈现。
+   * 配置生成不消费 category（后端只读 geositeTags/geoipTags/processNames/packageNames），故仅影响卡片分组呈现。
    */
   category?: string;
 }

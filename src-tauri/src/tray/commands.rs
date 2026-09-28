@@ -5,7 +5,7 @@
 //! **只做壳，不持有事务**：`tray_enter_lightweight` 只把转场排回主线程事件循环帧外，转场本体
 //! 由兄弟模块 `transition.rs` 独家持有（设计 SoT §A.4 T5：「转场只由一个 owner 持有」）。
 //!
-//! `main.rs` 的 `generate_handler![tray::tray_*]` 按**路径**取 `tray::__cmd__*` /
+//! `lib.rs` 的 `generate_handler![tray::tray_*]` 按**路径**取 `tray::__cmd__*` /
 //! `tray::__tauri_command_name_*` 两个包装宏（`tauri-macros` 的 `Handler::parse` 只替换路径末段），
 //! 故 façade 必须整体 `pub use commands::*;` 把它们一并再导出——invoke_handler 里的路径因此零改动。
 
@@ -262,7 +262,7 @@ pub async fn tray_check_update(app: AppHandle) -> ApiResponse<bool> {
 }
 
 /// 退出 Polaris：置 `QuitState`（放行 `CloseRequested`，不被 close-to-tray 卡）+ `app.exit(0)`。
-/// 与 `main.rs` 托盘原生菜单「退出」/ 应用菜单 ⌘Q 逐字节相同的退出路径。
+/// 与 `lib.rs` 托盘原生菜单「退出」/ 应用菜单 ⌘Q 逐字节相同的退出路径。
 #[tauri::command]
 pub fn tray_quit(app: AppHandle) -> ApiResponse<()> {
     app.state::<crate::QuitState>()
