@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "snapshot": {
+    "scope": "preview",
+    "configSource": "draft",
+    "configVersion": "fixture-draft-version",
+    "runGeneration": null,
+    "sampledAtMs": 1,
+    "loadEvidence": "unknown",
+    "snapshotStale": false,
+    "dnsOwnerServerId": "a",
+    "precedingExceptions": ["customRuleMayOverride", "appRuleMayOverride"],
+    "candidates": [
+      {
+        "serverId": "a",
+        "tag": "endpoint-a",
+        "leg": "externalRuleSet",
+        "generated": true,
+        "generationReason": null,
+        "engagedReason": "alwaysRouteSubnets",
+        "configuredCidrs": [],
+        "observedHosts": ["10.20.0.5"],
+        "referencedFile": {
+          "cidrs": ["10.20.0.0/16"],
+          "readError": null,
+          "sampledAtMs": 1
+        },
+        "matchCidrs": [{ "cidr": "10.20.0.0/16", "source": "retained" }],
+        "unknownReasons": []
+      },
+      {
+        "serverId": "b",
+        "tag": "endpoint-b",
+        "leg": "inline",
+        "generated": true,
+        "generationReason": null,
+        "engagedReason": "selected",
+        "configuredCidrs": ["10.20.1.0/24"],
+        "observedHosts": [],
+        "referencedFile": null,
+        "matchCidrs": [{ "cidr": "10.20.1.0/24", "source": "declared" }],
+        "unknownReasons": []
+      },
+      {
+        "serverId": "c",
+        "tag": "endpoint-c",
+        "leg": "preferredBy",
+        "generated": true,
+        "generationReason": null,
+        "engagedReason": "ruleTargeted",
+        "configuredCidrs": ["172.16.0.0/16"],
+        "observedHosts": [],
+        "referencedFile": null,
+        "matchCidrs": null,
+        "unknownReasons": []
+      }
+    ]
+  },
+  "results": [
+    {
+      "serverId": "a",
+      "requested": [{ "cidr": "10.20.0.0/16", "source": "retained" }],
+      "effective": ["10.20.0.0/16"],
+      "blockedBy": [],
+      "coverage": "full",
+      "invalid": [],
+      "excludedCatchAll": [],
+      "unknownReasons": []
+    },
+    {
+      "serverId": "b",
+      "requested": [{ "cidr": "10.20.1.0/24", "source": "declared" }],
+      "effective": [],
+      "blockedBy": [{
+        "serverId": "a",
+        "cidr": "10.20.1.0/24",
+        "relation": "requestedWithinEarlier",
+        "confirmed": true
+      }],
+      "coverage": "none",
+      "invalid": [],
+      "excludedCatchAll": [],
+      "unknownReasons": []
+    },
+    {
+      "serverId": "c",
+      "requested": [],
+      "effective": null,
+      "blockedBy": [],
+      "coverage": "unknown",
+      "invalid": [],
+      "excludedCatchAll": [],
+      "unknownReasons": ["opaqueMatchSet"]
+    }
+  ]
+}
