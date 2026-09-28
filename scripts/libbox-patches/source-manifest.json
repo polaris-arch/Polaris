@@ -44,6 +44,10 @@
     {
       "file": "android-interface-binding.patch",
       "sha256": "ca12eef0f94fb4592b4653dabf903711c52bdb8d14658ab6163534eb5098b879"
+    },
+    {
+      "file": "stopped-speed-strict-cleanup.patch",
+      "sha256": "a5df75b73448c20a27f9f7b4bcce7459356e062ca5d557b13f6011b43648a442"
     }
   ],
   "ndkSelectionReason": "NDK 27.3.13750724 arm64 linker rejects the pinned Cronet static archive with unknown relocation (315); cached NDK 30 preserves upstream dependencies and all feature tags.",

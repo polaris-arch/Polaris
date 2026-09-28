@@ -1,0 +1,1194 @@
+diff --git a/adapter/endpoint/manager.go b/adapter/endpoint/manager.go
+index 535c31b..ff1889a 100644
+--- a/adapter/endpoint/manager.go
++++ b/adapter/endpoint/manager.go
+@@ -78,7 +78,7 @@ func (m *Manager) Close() error {
+ 		monitor.Finish()
+ 		done()
+ 	}
+-	return nil
++	return err
+ }
+ 
+ func (m *Manager) Endpoints() []adapter.Endpoint {
+diff --git a/adapter/endpoint/manager_close_test.go b/adapter/endpoint/manager_close_test.go
+new file mode 100644
+index 0000000..2513e7b
+--- /dev/null
++++ b/adapter/endpoint/manager_close_test.go
+@@ -0,0 +1,27 @@
++package endpoint
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++)
++
++type failingEndpoint struct {
++	adapter.Endpoint
++	err error
++}
++
++func (f failingEndpoint) Type() string { return "test" }
++func (f failingEndpoint) Tag() string  { return "failing" }
++func (f failingEndpoint) Close() error { return f.err }
++
++func TestClosePropagatesEndpointFailure(t *testing.T) {
++	failure := errors.New("endpoint identity close failed")
++	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
++		endpoints: []adapter.Endpoint{failingEndpoint{err: failure}}}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v, want endpoint failure", err)
++	}
++}
+diff --git a/adapter/inbound/manager.go b/adapter/inbound/manager.go
+index d6567cd..075e410 100644
+--- a/adapter/inbound/manager.go
++++ b/adapter/inbound/manager.go
+@@ -77,7 +77,7 @@ func (m *Manager) Close() error {
+ 		monitor.Finish()
+ 		done()
+ 	}
+-	return nil
++	return err
+ }
+ 
+ func (m *Manager) Inbounds() []adapter.Inbound {
+diff --git a/adapter/inbound/manager_close_test.go b/adapter/inbound/manager_close_test.go
+new file mode 100644
+index 0000000..117d977
+--- /dev/null
++++ b/adapter/inbound/manager_close_test.go
+@@ -0,0 +1,27 @@
++package inbound
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++)
++
++type failingInbound struct {
++	adapter.Inbound
++	err error
++}
++
++func (f failingInbound) Type() string { return "test" }
++func (f failingInbound) Tag() string  { return "failing" }
++func (f failingInbound) Close() error { return f.err }
++
++func TestClosePropagatesInboundFailure(t *testing.T) {
++	failure := errors.New("inbound close failed")
++	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
++		inbounds: []adapter.Inbound{failingInbound{err: failure}}}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v, want inbound failure", err)
++	}
++}
+diff --git a/adapter/outbound/manager.go b/adapter/outbound/manager.go
+index 5314549..e4abba6 100644
+--- a/adapter/outbound/manager.go
++++ b/adapter/outbound/manager.go
+@@ -188,7 +188,7 @@ func (m *Manager) Close() error {
+ 			done()
+ 		}
+ 	}
+-	return nil
++	return err
+ }
+ 
+ func (m *Manager) Outbounds() []adapter.Outbound {
+diff --git a/adapter/outbound/manager_close_test.go b/adapter/outbound/manager_close_test.go
+new file mode 100644
+index 0000000..b90928c
+--- /dev/null
++++ b/adapter/outbound/manager_close_test.go
+@@ -0,0 +1,27 @@
++package outbound
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++)
++
++type failingOutbound struct {
++	adapter.Outbound
++	err error
++}
++
++func (f failingOutbound) Type() string { return "test" }
++func (f failingOutbound) Tag() string  { return "failing" }
++func (f failingOutbound) Close() error { return f.err }
++
++func TestClosePropagatesOutboundFailure(t *testing.T) {
++	failure := errors.New("outbound close failed")
++	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
++		outbounds: []adapter.Outbound{failingOutbound{err: failure}}}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v, want outbound failure", err)
++	}
++}
+diff --git a/adapter/service/manager.go b/adapter/service/manager.go
+index 1a83c50..9db1585 100644
+--- a/adapter/service/manager.go
++++ b/adapter/service/manager.go
+@@ -75,7 +75,7 @@ func (m *Manager) Close() error {
+ 		monitor.Finish()
+ 		done()
+ 	}
+-	return nil
++	return err
+ }
+ 
+ func (m *Manager) Services() []adapter.Service {
+diff --git a/adapter/service/manager_close_test.go b/adapter/service/manager_close_test.go
+new file mode 100644
+index 0000000..167565e
+--- /dev/null
++++ b/adapter/service/manager_close_test.go
+@@ -0,0 +1,27 @@
++package service
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++)
++
++type failingService struct {
++	adapter.Service
++	err error
++}
++
++func (f failingService) Type() string { return "test" }
++func (f failingService) Tag() string  { return "failing" }
++func (f failingService) Close() error { return f.err }
++
++func TestClosePropagatesServiceFailure(t *testing.T) {
++	failure := errors.New("service close failed")
++	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
++		services: []adapter.Service{failingService{err: failure}}}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v, want service failure", err)
++	}
++}
+diff --git a/box.go b/box.go
+index f11c96f..13e86d6 100644
+--- a/box.go
++++ b/box.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"runtime/debug"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -64,6 +65,9 @@ type Box struct {
+ 	httpClientService   adapter.LifecycleService
+ 	internalService     []adapter.LifecycleService
+ 	done                chan struct{}
++	closeStarted        atomic.Bool
++	closeFinished       chan struct{}
++	closeResult         error
+ }
+ 
+ type Options struct {
+@@ -490,6 +494,7 @@ func New(options Options) (*Box, error) {
+ 		logger:              logFactory.Logger(),
+ 		internalService:     internalServices,
+ 		done:                make(chan struct{}),
++		closeFinished:       make(chan struct{}),
+ 	}, nil
+ }
+ 
+@@ -608,12 +613,32 @@ func (s *Box) start() error {
+ }
+ 
+ func (s *Box) Close() error {
+-	select {
+-	case <-s.done:
++	if !s.closeStarted.CompareAndSwap(false, true) {
+ 		return os.ErrClosed
+-	default:
+-		close(s.done)
+ 	}
++	return s.finishClose()
++}
++
++// CloseWithResult preserves the first close outcome even when Start/PreStart
++// already performed their automatic cleanup. A second ordinary Close keeps
++// its historical ErrClosed result; strict transient cleanup needs the original.
++func (s *Box) CloseWithResult() error {
++	if s.closeStarted.CompareAndSwap(false, true) {
++		return s.finishClose()
++	}
++	<-s.closeFinished
++	return s.closeResult
++}
++
++func (s *Box) finishClose() error {
++	s.closeResult = E.New("box close did not complete")
++	defer close(s.closeFinished)
++	s.closeResult = s.close()
++	return s.closeResult
++}
++
++func (s *Box) close() error {
++	close(s.done)
+ 	var err error
+ 	if s.debugHTTPServer != nil {
+ 		err = E.Append(err, s.debugHTTPServer.Close(), func(err error) error {
+diff --git a/box_close_result_test.go b/box_close_result_test.go
+new file mode 100644
+index 0000000..8d2c529
+--- /dev/null
++++ b/box_close_result_test.go
+@@ -0,0 +1,83 @@
++package box
++
++import (
++	"context"
++	"errors"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	boxCertificate "github.com/sagernet/sing-box/adapter/certificate"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing-box/option"
++)
++
++type failingCloseService struct {
++	startErr error
++	closeErr error
++	entered  chan struct{}
++	release  chan struct{}
++}
++
++func (s *failingCloseService) Name() string                     { return "failing-close" }
++func (s *failingCloseService) Start(_ adapter.StartStage) error { return s.startErr }
++func (s *failingCloseService) Close() error {
++	if s.entered != nil {
++		close(s.entered)
++		<-s.release
++	}
++	return s.closeErr
++}
++
++func testBoxWithService(t *testing.T, extra *failingCloseService) *Box {
++	t.Helper()
++	ctx := Context(context.Background(), inbound.NewRegistry(), outbound.NewRegistry(), endpoint.NewRegistry(), dns.NewTransportRegistry(), boxService.NewRegistry(), boxCertificate.NewRegistry())
++	instance, err := New(Options{Context: ctx, Options: option.Options{}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	instance.internalService = append(instance.internalService, extra)
++	return instance
++}
++
++func TestEarlyStartFailureRetainsFirstCloseFailure(t *testing.T) {
++	startFailure := errors.New("synthetic initialize failure")
++	closeFailure := errors.New("synthetic endpoint cleanup failure")
++	instance := testBoxWithService(t, &failingCloseService{startErr: startFailure, closeErr: closeFailure})
++	if err := instance.Start(); !errors.Is(err, startFailure) {
++		t.Fatalf("Start = %v, want injected start failure", err)
++	}
++	if err := instance.CloseWithResult(); !errors.Is(err, closeFailure) {
++		t.Fatalf("CloseWithResult after automatic close = %v, want original cleanup failure", err)
++	}
++	if err := instance.Close(); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("duplicate public Close = %v, want ErrClosed", err)
++	}
++}
++
++func TestDuplicatePublicCloseReturnsBeforeStrictCloseCompletes(t *testing.T) {
++	service := &failingCloseService{entered: make(chan struct{}), release: make(chan struct{})}
++	instance := testBoxWithService(t, service)
++	first := make(chan error, 1)
++	go func() { first <- instance.Close() }()
++	<-service.entered
++	quick := make(chan error, 1)
++	go func() { quick <- instance.Close() }()
++	select {
++	case err := <-quick:
++		if !errors.Is(err, os.ErrClosed) {
++			t.Fatalf("duplicate public Close = %v, want ErrClosed", err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("duplicate public Close waited for the first close")
++	}
++	close(service.release)
++	if err := <-first; err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/daemon/instance.go b/daemon/instance.go
+index c55e4ae..4406279 100644
+--- a/daemon/instance.go
++++ b/daemon/instance.go
+@@ -3,6 +3,8 @@ package daemon
+ import (
+ 	"bytes"
+ 	"context"
++	"os"
++	"sync/atomic"
+ 
+ 	"github.com/sagernet/sing-box"
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -37,6 +39,9 @@ type Instance struct {
+ 	outboundManager       adapter.OutboundManager
+ 	endpointManager       adapter.EndpointManager
+ 	logFactory            log.Factory
++	closeStarted          atomic.Bool
++	closeFinished         chan struct{}
++	closeResult           error
+ }
+ 
+ func (s *StartedService) CheckConfig(ctx context.Context, configContent string) error {
+@@ -123,6 +128,7 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
+ 		ctx:                   ctx,
+ 		cancel:                cancel,
+ 		urlTestHistoryStorage: urlTestHistoryStorage,
++		closeFinished:         make(chan struct{}),
+ 	}
+ 	boxInstance, err := box.New(box.Options{
+ 		Context:           ctx,
+@@ -152,6 +158,7 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
+ func attachInstance(ctx context.Context) *Instance {
+ 	return &Instance{
+ 		ctx:                   ctx,
++		closeFinished:         make(chan struct{}),
+ 		connectionManager:     service.FromContext[adapter.ConnectionManager](ctx),
+ 		clashMode:             service.PtrFromContext[clashmode.Manager](ctx),
+ 		trafficManager:        service.PtrFromContext[trafficcontrol.Manager](ctx),
+@@ -169,13 +176,37 @@ func (i *Instance) Start() error {
+ }
+ 
+ func (i *Instance) Close() error {
+-	i.cancel()
++	if !i.closeStarted.CompareAndSwap(false, true) {
++		return os.ErrClosed
++	}
++	i.finishClose()
++	return i.closeResult
++}
++
++// CloseWithResult lets strict transient cleanup read the original result even
++// if Box.Start already triggered automatic close before the daemon catches up.
++func (i *Instance) CloseWithResult() error {
++	if i.closeStarted.CompareAndSwap(false, true) {
++		i.finishClose()
++	}
++	<-i.closeFinished
++	return i.closeResult
++}
++
++func (i *Instance) finishClose() {
++	i.closeResult = E.New("instance close did not complete")
++	defer close(i.closeFinished)
++	if i.cancel != nil {
++		i.cancel()
++	}
+ 	if i.pauseCallback != nil {
+ 		i.pauseManager.UnregisterCallback(i.pauseCallback)
+ 		i.pauseCallback = nil
+ 	}
+-	i.urlTestHistoryStorage.Close()
+-	return i.instance.Close()
++	if i.urlTestHistoryStorage != nil {
++		i.urlTestHistoryStorage.Close()
++	}
++	i.closeResult = i.instance.CloseWithResult()
+ }
+ 
+ func (i *Instance) registerPowerReport(ctx context.Context, reloading bool) {
+diff --git a/daemon/started_service.go b/daemon/started_service.go
+index 13651ed..6255026 100644
+--- a/daemon/started_service.go
++++ b/daemon/started_service.go
+@@ -22,6 +22,7 @@ import (
+ 	"github.com/sagernet/sing-box/protocol/group"
+ 	"github.com/sagernet/sing-box/service/oomkiller"
+ 	"github.com/sagernet/sing/common"
++	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/memory"
+ 	N "github.com/sagernet/sing/common/network"
+ 	"github.com/sagernet/sing/common/observable"
+@@ -60,6 +61,9 @@ type StartedService struct {
+ 	lifecycleAccess         sync.Mutex
+ 	serviceAccess           sync.RWMutex
+ 	closed                  bool
++	strictCleanup           bool
++	shutdownRequested       bool
++	cleanupErr              error // protected by lifecycleAccess; sticky for strict transient hosts
+ 	startInterrupted        bool
+ 	serviceStatus           *ServiceStatus
+ 	serviceStatusSubscriber *observable.Subscriber[*ServiceStatus]
+@@ -83,6 +87,7 @@ type ServiceOptions struct {
+ 	// Platform           adapter.PlatformInterface
+ 	Handler           PlatformHandler
+ 	KeepDefaultLogger bool
++	StrictCleanup     bool
+ 	Debug             bool
+ 	LogMaxLines       int
+ 	OOMKillerEnabled  bool
+@@ -101,6 +106,7 @@ func NewStartedService(options ServiceOptions) *StartedService {
+ 		// platform:                options.Platform,
+ 		handler:           options.Handler,
+ 		keepDefaultLogger: options.KeepDefaultLogger,
++		strictCleanup:     options.StrictCleanup,
+ 		debug:             options.Debug,
+ 		logLines:          logRing{maxLines: options.LogMaxLines},
+ 		oomKillerEnabled:  options.OOMKillerEnabled,
+@@ -250,12 +256,47 @@ func (s *StartedService) followInstance(ctx context.Context, run func(ctx contex
+ 	}
+ }
+ 
++// closeInstance runs under lifecycleAccess. Strict transient hosts retain any
++// ambiguous cleanup result; an IDLE status or a second close cannot clear it.
++func (s *StartedService) closeInstance(instance *Instance) error {
++	var err error
++	if s.strictCleanup {
++		err = instance.CloseWithResult()
++		if err != nil && s.cleanupErr == nil {
++			s.cleanupErr = err
++		}
++	} else {
++		err = instance.Close()
++	}
++	return err
++}
++
+ func (s *StartedService) StartOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) error {
++	return s.StartOrReloadServiceWithBeforeStart(ctx, profileContent, options, nil)
++}
++
++// StartOrReloadServiceWithBeforeStart runs the caller's snapshot preparation
++// under the same lifecycle lock as the terminal check. A closed old host must
++// never write shared configuration after its CloseService acknowledged.
++func (s *StartedService) StartOrReloadServiceWithBeforeStart(ctx context.Context, profileContent string, options *OverrideOptions, beforeStart func()) error {
+ 	s.interruptStart()
+ 	s.lifecycleAccess.Lock()
+ 	defer s.lifecycleAccess.Unlock()
+ 	s.serviceAccess.Lock()
+-	if s.closed {
++	if s.closed || (s.strictCleanup && s.shutdownRequested) {
++		s.serviceAccess.Unlock()
++		return os.ErrClosed
++	}
++	if s.strictCleanup && s.cleanupErr != nil {
++		s.serviceAccess.Unlock()
++		return s.cleanupErr
++	}
++	s.serviceAccess.Unlock()
++	if beforeStart != nil {
++		beforeStart()
++	}
++	s.serviceAccess.Lock()
++	if s.closed || (s.strictCleanup && s.shutdownRequested) {
+ 		s.serviceAccess.Unlock()
+ 		return os.ErrClosed
+ 	}
+@@ -269,8 +310,14 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
+ 			oomRecorder.BeginReload()
+ 			defer oomRecorder.EndReload()
+ 		}
+-		_ = oldInstance.Close()
++		closeErr := s.closeInstance(oldInstance)
+ 		runtimeDebug.FreeOSMemory()
++		if s.strictCleanup && closeErr != nil {
++			s.serviceAccess.Lock()
++			s.updateStatusError(closeErr)
++			s.serviceAccess.Unlock()
++			return closeErr
++		}
+ 		s.serviceAccess.Lock()
+ 	}
+ 	s.startInterrupted = false
+@@ -299,16 +346,24 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
+ 		s.startInterrupted = false
+ 		s.instance = nil
+ 		s.serviceAccess.Unlock()
+-		_ = instance.Close()
++		closeErr := s.closeInstance(instance)
+ 		runtimeDebug.FreeOSMemory()
++		if s.strictCleanup && closeErr != nil {
++			return closeErr
++		}
+ 		return nil
+ 	}
+ 	if err != nil {
+ 		s.instance = nil
+ 		s.updateStatusError(err)
+ 		s.serviceAccess.Unlock()
+-		_ = instance.Close()
++		closeErr := s.closeInstance(instance)
+ 		runtimeDebug.FreeOSMemory()
++		if s.strictCleanup && closeErr != nil {
++			return E.Append(err, closeErr, func(closeErr error) error {
++				return E.Cause(closeErr, "cleanup after failed start")
++			})
++		}
+ 		return err
+ 	}
+ 	s.startedAt = time.Now()
+@@ -330,6 +385,13 @@ func (s *StartedService) Close() {
+ }
+ 
+ func (s *StartedService) CloseService() error {
++	if s.strictCleanup {
++		// Close may beat Start into the Go lifecycle lock. Mark the host terminal
++		// first so a late Start cannot initialize it after Close returned.
++		s.serviceAccess.Lock()
++		s.shutdownRequested = true
++		s.serviceAccess.Unlock()
++	}
+ 	s.interruptStart()
+ 	s.lifecycleAccess.Lock()
+ 	defer s.lifecycleAccess.Unlock()
+@@ -337,19 +399,25 @@ func (s *StartedService) CloseService() error {
+ 	instance := s.instance
+ 	if instance == nil && s.serviceStatus.Status != ServiceStatus_STARTING && s.serviceStatus.Status != ServiceStatus_STARTED {
+ 		s.serviceAccess.Unlock()
++		if s.strictCleanup {
++			return s.cleanupErr
++		}
+ 		return nil
+ 	}
+ 	s.instance = nil
+ 	s.updateStatus(ServiceStatus_STOPPING)
+ 	s.serviceAccess.Unlock()
+ 	if instance != nil {
+-		_ = instance.Close()
++		_ = s.closeInstance(instance)
+ 	}
+ 	s.serviceAccess.Lock()
+ 	s.startedAt = time.Time{}
+ 	s.updateStatus(ServiceStatus_IDLE)
+ 	s.serviceAccess.Unlock()
+ 	runtimeDebug.FreeOSMemory()
++	if s.strictCleanup {
++		return s.cleanupErr
++	}
+ 	return nil
+ }
+ 
+diff --git a/daemon/started_service_strict_cleanup_test.go b/daemon/started_service_strict_cleanup_test.go
+new file mode 100644
+index 0000000..ac73309
+--- /dev/null
++++ b/daemon/started_service_strict_cleanup_test.go
+@@ -0,0 +1,88 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"os"
++	"testing"
++
++	box "github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	boxCertificate "github.com/sagernet/sing-box/adapter/certificate"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing-box/dns/transport/local"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing/service"
++)
++
++type failingTransientService struct {
++	startErr error
++	closeErr error
++}
++
++func (s *failingTransientService) Type() string { return "test-failing-close" }
++func (s *failingTransientService) Tag() string  { return "probe" }
++func (s *failingTransientService) Start(stage adapter.StartStage) error {
++	if stage == adapter.StartStateStart {
++		return s.startErr
++	}
++	return nil
++}
++func (s *failingTransientService) Close() error { return s.closeErr }
++
++func TestStrictTransientEarlyStartCleanupFailureBecomesSticky(t *testing.T) {
++	t.Chdir(t.TempDir())
++	dnsRegistry := dns.NewTransportRegistry()
++	local.RegisterTransport(dnsRegistry)
++	ctx := box.Context(context.Background(), inbound.NewRegistry(), outbound.NewRegistry(), endpoint.NewRegistry(), dnsRegistry, boxService.NewRegistry(), boxCertificate.NewRegistry())
++	registry := service.FromContext[adapter.ServiceRegistry](ctx).(*boxService.Registry)
++	startFailure := errors.New("synthetic transient service start failed")
++	closeFailure := errors.New("synthetic transient service close failed")
++	boxService.Register[struct{}](registry, "test-failing-close", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++		return &failingTransientService{startErr: startFailure, closeErr: closeFailure}, nil
++	})
++	host := NewStartedService(ServiceOptions{Context: ctx, StrictCleanup: true, KeepDefaultLogger: true})
++	defer host.Close()
++	err := host.StartOrReloadService(context.Background(), `{"services":[{"type":"test-failing-close","tag":"probe"}]}`, &OverrideOptions{})
++	if !errors.Is(err, startFailure) || !errors.Is(err, closeFailure) {
++		t.Fatalf("failed start did not propagate both original errors: %v", err)
++	}
++	for range 2 {
++		if err := host.CloseService(); !errors.Is(err, closeFailure) {
++			t.Fatalf("repeated close cleared real cleanup failure: %v", err)
++		}
++	}
++	if err := host.StartOrReloadService(context.Background(), `{}`, &OverrideOptions{}); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late start after CloseService = %v, want terminal ErrClosed", err)
++	}
++}
++
++func TestStrictTransientCloseIsTerminalBeforeStart(t *testing.T) {
++	service := NewStartedService(ServiceOptions{Context: context.Background(), StrictCleanup: true})
++	defer service.Close()
++	if err := service.CloseService(); err != nil {
++		t.Fatal(err)
++	}
++	if err := service.StartOrReloadService(context.Background(), `{}`, &OverrideOptions{}); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late start after close = %v, want ErrClosed", err)
++	}
++}
++
++func TestStrictTransientCleanupFailureStaysStickyAfterIdle(t *testing.T) {
++	service := NewStartedService(ServiceOptions{Context: context.Background(), StrictCleanup: true})
++	defer service.Close()
++	failed := errors.New("synthetic endpoint close failure")
++	service.cleanupErr = failed
++	if err := service.StartOrReloadService(context.Background(), `{}`, &OverrideOptions{}); !errors.Is(err, failed) {
++		t.Fatalf("start after cleanup failure = %v", err)
++	}
++	for range 2 {
++		if err := service.CloseService(); !errors.Is(err, failed) {
++			t.Fatalf("repeated close cleared cleanup failure: %v", err)
++		}
++	}
++}
+diff --git a/dns/transport_manager.go b/dns/transport_manager.go
+index 873cae8..e822231 100644
+--- a/dns/transport_manager.go
++++ b/dns/transport_manager.go
+@@ -165,7 +165,7 @@ func (m *TransportManager) Close() error {
+ 			monitor.Finish()
+ 		}
+ 	}
+-	return nil
++	return err
+ }
+ 
+ func (m *TransportManager) Transports() []adapter.DNSTransport {
+diff --git a/dns/transport_manager_close_test.go b/dns/transport_manager_close_test.go
+new file mode 100644
+index 0000000..3247e00
+--- /dev/null
++++ b/dns/transport_manager_close_test.go
+@@ -0,0 +1,27 @@
++package dns
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++)
++
++type failingTransport struct {
++	adapter.DNSTransport
++	err error
++}
++
++func (f failingTransport) Type() string { return "test" }
++func (f failingTransport) Tag() string  { return "failing" }
++func (f failingTransport) Close() error { return f.err }
++
++func TestClosePropagatesTransportFailure(t *testing.T) {
++	failure := errors.New("DNS transport close failed")
++	m := &TransportManager{logger: log.NewNOPFactory().Logger(), started: true,
++		transports: []adapter.DNSTransport{failingTransport{err: failure}}}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v, want transport failure", err)
++	}
++}
+diff --git a/experimental/libbox/command_server.go b/experimental/libbox/command_server.go
+index 770016a..6f6954a 100644
+--- a/experimental/libbox/command_server.go
++++ b/experimental/libbox/command_server.go
+@@ -7,6 +7,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
++	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -31,15 +32,22 @@ import (
+ type CommandServer struct {
+ 	transient bool
+ 	*daemon.StartedService
+-	ctx               context.Context
+-	managedService    *daemon.ManagedService
+-	handler           CommandServerHandler
+-	platformInterface PlatformInterface
+-	platformWrapper   *platformInterfaceWrapper
+-	powerManager      *powerreport.Manager
+-	oomRecorder       *oomkiller.Recorder
+-	grpcServer        *grpc.Server
+-	listener          net.Listener
++	ctx                  context.Context
++	managedService       *daemon.ManagedService
++	handler              CommandServerHandler
++	platformInterface    PlatformInterface
++	platformWrapper      *platformInterfaceWrapper
++	powerManager         *powerreport.Manager
++	oomRecorder          *oomkiller.Recorder
++	grpcServer           *grpc.Server
++	listener             net.Listener
++	commandAccess        sync.Mutex
++	commandStartDone     chan struct{}
++	commandCloseOnce     sync.Once
++	commandCloseDone     chan struct{}
++	commandClosing       chan struct{}
++	commandIsClosing     bool
++	beforeCommandPublish func() // deterministic lifecycle test seam; nil in production
+ }
+ 
+ type CommandServerHandler interface {
+@@ -53,17 +61,24 @@ type CommandServerHandler interface {
+ }
+ 
+ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformInterface) (*CommandServer, error) {
+-	return newCommandServer(handler, platformInterface, false)
++	return newCommandServer(handler, platformInterface, false, false)
++}
++
++// NewStrictCommandServer has the normal primary service's listener and
++// diagnostics, but returns a real close acknowledgement for endpoint identity
++// ownership. Reload stays available until the final CloseService request.
++func NewStrictCommandServer(handler CommandServerHandler, platformInterface PlatformInterface) (*CommandServer, error) {
++	return newCommandServer(handler, platformInterface, false, true)
+ }
+ 
+ // NewTransientCommandServer creates an independent service host without a command
+ // listener or shared configuration, OOM, and power-report diagnostics.
+ // StartOrReloadService starts its service; call CloseService before Close.
+ func NewTransientCommandServer(handler CommandServerHandler, platformInterface PlatformInterface) (*CommandServer, error) {
+-	return newCommandServer(handler, platformInterface, true)
++	return newCommandServer(handler, platformInterface, true, true)
+ }
+ 
+-func newCommandServer(handler CommandServerHandler, platformInterface PlatformInterface, transient bool) (*CommandServer, error) {
++func newCommandServer(handler CommandServerHandler, platformInterface PlatformInterface, transient, strictCleanup bool) (*CommandServer, error) {
+ 	ctx := baseContext(platformInterface)
+ 	powerManager := powerreport.NewManager()
+ 	service.MustRegister[*powerreport.Manager](ctx, powerManager)
+@@ -80,12 +95,15 @@ func newCommandServer(handler CommandServerHandler, platformInterface PlatformIn
+ 		platformInterface: platformInterface,
+ 		platformWrapper:   platformWrapper,
+ 		powerManager:      powerManager,
++		commandCloseDone:  make(chan struct{}),
++		commandClosing:    make(chan struct{}),
+ 	}
+ 	server.StartedService = daemon.NewStartedService(daemon.ServiceOptions{
+ 		Context: ctx,
+ 		// Platform:         platformWrapper,
+ 		Handler:           (*platformHandler)(server),
+ 		KeepDefaultLogger: transient,
++		StrictCleanup:     strictCleanup,
+ 		Debug:             sDebug,
+ 		LogMaxLines:       sLogMaxLines,
+ 		OOMKillerEnabled:  sOOMKillerEnabled,
+@@ -157,6 +175,24 @@ func (s *CommandServer) Start() error {
+ 	if s.transient {
+ 		return E.New("transient command server cannot start a command listener")
+ 	}
++	s.commandAccess.Lock()
++	if s.commandIsClosing {
++		s.commandAccess.Unlock()
++		return os.ErrClosed
++	}
++	if s.commandStartDone != nil {
++		s.commandAccess.Unlock()
++		return os.ErrExist
++	}
++	startDone := make(chan struct{})
++	s.commandStartDone = startDone
++	s.commandAccess.Unlock()
++	defer close(startDone)
++	select {
++	case <-s.commandClosing:
++		return os.ErrClosed
++	default:
++	}
+ 	var (
+ 		listener net.Listener
+ 		err      error
+@@ -175,7 +211,11 @@ func (s *CommandServer) Start() error {
+ 			if !errors.Is(err, syscall.EROFS) {
+ 				break
+ 			}
+-			time.Sleep(time.Second)
++			select {
++			case <-s.commandClosing:
++				return os.ErrClosed
++			case <-time.After(time.Second):
++			}
+ 		}
+ 		if err != nil {
+ 			return E.Cause(err, "listen command server")
+@@ -194,32 +234,60 @@ func (s *CommandServer) Start() error {
+ 			return E.Cause(err, "listen command server")
+ 		}
+ 	}
+-	s.listener = listener
+ 	serverOptions := []grpc.ServerOption{
+ 		grpc.ChainUnaryInterceptor(unaryAuthInterceptor, daemon.UnaryLocaleInterceptor),
+ 		grpc.ChainStreamInterceptor(streamAuthInterceptor, daemon.StreamLocaleInterceptor),
+ 	}
+-	s.grpcServer = grpc.NewServer(serverOptions...)
+-	daemon.RegisterStartedServiceServer(s.grpcServer, s.StartedService)
+-	daemon.RegisterManagedServiceServer(s.grpcServer, s.managedService)
++	grpcServer := grpc.NewServer(serverOptions...)
++	daemon.RegisterStartedServiceServer(grpcServer, s.StartedService)
++	daemon.RegisterManagedServiceServer(grpcServer, s.managedService)
+ 	healthServer := health.NewServer()
+ 	healthServer.SetServingStatus(daemon.StartedService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+ 	healthServer.SetServingStatus(daemon.ManagedService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+-	grpc_health_v1.RegisterHealthServer(s.grpcServer, healthServer)
+-	go s.grpcServer.Serve(listener)
++	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
++	if s.beforeCommandPublish != nil {
++		s.beforeCommandPublish()
++	}
++	s.commandAccess.Lock()
++	if s.commandIsClosing {
++		s.commandAccess.Unlock()
++		listener.Close()
++		grpcServer.Stop()
++		return os.ErrClosed
++	}
++	s.listener = listener
++	s.grpcServer = grpcServer
++	s.commandAccess.Unlock()
++	go grpcServer.Serve(listener)
+ 	return nil
+ }
+ 
+ func (s *CommandServer) Close() {
+-	if s.grpcServer != nil {
+-		s.grpcServer.Stop()
+-	}
+-	common.Close(s.listener)
+-	s.StartedService.Close()
+-	if s.oomRecorder != nil {
+-		s.oomRecorder.Close()
+-	}
+-	s.powerManager.Close()
++	s.commandCloseOnce.Do(func() {
++		s.commandAccess.Lock()
++		s.commandIsClosing = true
++		close(s.commandClosing)
++		startDone := s.commandStartDone
++		s.commandAccess.Unlock()
++		if startDone != nil {
++			<-startDone
++		}
++		s.commandAccess.Lock()
++		grpcServer, listener := s.grpcServer, s.listener
++		s.grpcServer, s.listener = nil, nil
++		s.commandAccess.Unlock()
++		if grpcServer != nil {
++			grpcServer.Stop()
++		}
++		common.Close(listener)
++		s.StartedService.Close()
++		if s.oomRecorder != nil {
++			s.oomRecorder.Close()
++		}
++		s.powerManager.Close()
++		close(s.commandCloseDone)
++	})
++	<-s.commandCloseDone
+ }
+ 
+ type OverrideOptions struct {
+@@ -229,17 +297,20 @@ type OverrideOptions struct {
+ }
+ 
+ func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
++	var beforeStart func()
+ 	if !s.transient {
+-		saveConfigSnapshot(configContent)
+-		if s.powerManager.Recorder() != nil {
+-			copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
++		beforeStart = func() {
++			saveConfigSnapshot(configContent)
++			if s.powerManager.Recorder() != nil {
++				copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
++			}
+ 		}
+ 	}
+-	err := s.StartedService.StartOrReloadService(s.ctx, configContent, &daemon.OverrideOptions{
++	err := s.StartedService.StartOrReloadServiceWithBeforeStart(s.ctx, configContent, &daemon.OverrideOptions{
+ 		AutoRedirect:   options.AutoRedirect,
+ 		IncludePackage: iteratorToArray(options.IncludePackage),
+ 		ExcludePackage: iteratorToArray(options.ExcludePackage),
+-	})
++	}, beforeStart)
+ 	if err != nil {
+ 		return E.Cause(err, "start or reload service")
+ 	}
+diff --git a/experimental/libbox/command_server_transient_test.go b/experimental/libbox/command_server_transient_test.go
+index 7a9af75..2dbeb04 100644
+--- a/experimental/libbox/command_server_transient_test.go
++++ b/experimental/libbox/command_server_transient_test.go
+@@ -1,12 +1,20 @@
+ package libbox
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"context"
++	"errors"
++	"fmt"
++	"net"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
++	"time"
+ 
++	"github.com/sagernet/sing-box/adapter"
++	boxService "github.com/sagernet/sing-box/adapter/service"
+ 	"github.com/sagernet/sing-box/log"
+ 	"github.com/sagernet/sing-box/service/oomkiller"
+ 	"github.com/sagernet/sing-box/service/powerreport"
+@@ -16,6 +24,187 @@ import (
+ 	"google.golang.org/protobuf/types/known/emptypb"
+ )
+ 
++type failingPrimaryCloseService struct{ failure error }
++
++func (s *failingPrimaryCloseService) Type() string                   { return "test-primary-close" }
++func (s *failingPrimaryCloseService) Tag() string                    { return "probe" }
++func (s *failingPrimaryCloseService) Start(adapter.StartStage) error { return nil }
++func (s *failingPrimaryCloseService) Close() error                   { return s.failure }
++
++func TestStrictPrimaryReloadThenFinalCloseIsTerminal(t *testing.T) {
++	transientTestSetup(t)
++	server, err := NewStrictCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	if server.transient || server.oomRecorder == nil {
++		t.Fatal("strict primary lost the normal host listener/diagnostics shape")
++	}
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); err != nil {
++		t.Fatalf("ordinary primary reload was blocked: %v", err)
++	}
++	if err := server.CloseService(); err != nil {
++		t.Fatal(err)
++	}
++	marker := []byte("new-primary-snapshot")
++	if err := os.WriteFile(configSnapshotPath(), marker, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late reload after final close = %v, want ErrClosed", err)
++	}
++	if after, err := os.ReadFile(configSnapshotPath()); err != nil || !bytes.Equal(after, marker) {
++		t.Fatalf("closed old host rewrote the newer primary snapshot: %v", err)
++	}
++}
++
++func TestStrictPrimaryCommandListenerCannotStartAfterClose(t *testing.T) {
++	transientTestSetup(t)
++	server, err := NewStrictCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	server.Close()
++	if err := server.Start(); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("Start after Close = %v, want ErrClosed", err)
++	}
++	if server.listener != nil || server.grpcServer != nil {
++		t.Fatal("late Start published a command listener")
++	}
++}
++
++func TestStrictPrimaryCloseWaitsForInFlightCommandStartBeforeAcknowledging(t *testing.T) {
++	transientTestSetup(t)
++	server, err := NewStrictCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	server.beforeCommandPublish = func() {
++		close(entered)
++		<-release
++	}
++	started := make(chan error, 1)
++	go func() { started <- server.Start() }()
++	select {
++	case <-entered:
++	case err := <-started:
++		t.Fatalf("Start failed before publish gate: %v", err)
++	case <-time.After(2 * time.Second):
++		t.Fatal("Start did not reach publish gate")
++	}
++	closed := make(chan struct{})
++	secondClosed := make(chan struct{})
++	go func() { server.Close(); close(closed) }()
++	go func() { server.Close(); close(secondClosed) }()
++	select {
++	case <-server.commandClosing:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Close did not publish its terminal gate")
++	}
++	select {
++	case <-closed:
++		t.Fatal("Close acknowledged while Start still held a local listener")
++	case <-secondClosed:
++		t.Fatal("concurrent Close acknowledged while Start still held a local listener")
++	default:
++	}
++	close(release)
++	if err := <-started; !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("Start after close request = %v, want ErrClosed", err)
++	}
++	<-closed
++	<-secondClosed
++	if server.listener != nil || server.grpcServer != nil {
++		t.Fatal("in-flight Start published a command listener after Close")
++	}
++	newPrimary, err := NewStrictCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer newPrimary.Close()
++	if err := newPrimary.Start(); err != nil {
++		t.Fatalf("new primary could not claim the listener: %v", err)
++	}
++	server.Close()
++	if newPrimary.listener == nil || newPrimary.grpcServer == nil {
++		t.Fatal("old repeated Close detached the newer primary listener")
++	}
++}
++
++func TestStrictPrimaryFailedOldCloseBlocksReloadAndRepeatsStickyFailure(t *testing.T) {
++	transientTestSetup(t)
++	server, err := NewStrictCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	failure := errors.New("synthetic primary endpoint close failure")
++	registry := service.FromContext[adapter.ServiceRegistry](server.ctx).(*boxService.Registry)
++	boxService.Register[struct{}](registry, "test-primary-close", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++		return &failingPrimaryCloseService{failure: failure}, nil
++	})
++	if err := server.StartOrReloadService(`{"services":[{"type":"test-primary-close","tag":"probe"}]}`, &OverrideOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); !errors.Is(err, failure) {
++		t.Fatalf("reload did not surface old identity close failure: %v", err)
++	}
++	for range 2 {
++		if err := server.CloseService(); !errors.Is(err, failure) {
++			t.Fatalf("repeated final close cleared primary cleanup failure: %v", err)
++		}
++	}
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late start after final close = %v, want terminal ErrClosed", err)
++	}
++}
++
++func TestTransientHTTPInboundRejectsMissingAndWrongSpeedtestCredentials(t *testing.T) {
++	transientTestSetup(t)
++	reserve, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := reserve.Addr().(*net.TCPAddr).Port
++	reserve.Close()
++	server, err := NewTransientCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	config := fmt.Sprintf(`{"inbounds":[{"type":"http","tag":"probe","listen":"127.0.0.1","listen_port":%d,"users":[{"username":"polaris-temp","password":"0123456789abcdef0123456789abcdef"}]}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`, port)
++	if err := server.StartOrReloadService(config, &OverrideOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	defer server.CloseService()
++	for _, auth := range []string{"", "Proxy-Authorization: Basic cG9sYXJpcy10ZW1wOndyb25n\r\n"} {
++		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
++			conn.Close()
++			t.Fatal(err)
++		}
++		_, err = fmt.Fprintf(conn, "CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n%s\r\n", auth)
++		if err != nil {
++			conn.Close()
++			t.Fatal(err)
++		}
++		status, err := bufio.NewReader(conn).ReadString('\n')
++		conn.Close()
++		if err != nil || !strings.Contains(status, " 407 ") {
++			t.Fatalf("unauthorized CONNECT = %q, err=%v; want 407", status, err)
++		}
++	}
++}
++
+ type transientTestPlatform struct{ PlatformInterface }
+ 
+ func (transientTestPlatform) LocalDNSTransport() LocalDNSTransport        { return nil }
+@@ -165,3 +354,21 @@ func TestTransientCommandServerCloseKeepsPrimaryService(t *testing.T) {
+ 		t.Fatal("transient lifecycle changed the primary default logger")
+ 	}
+ }
++
++func TestTransientCloseAfterCleanFailedStartBlocksLateStart(t *testing.T) {
++	transientTestSetup(t)
++	server, err := NewTransientCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	if err := server.StartOrReloadService("invalid json", &OverrideOptions{}); err == nil {
++		t.Fatal("invalid config unexpectedly started")
++	}
++	if err := server.CloseService(); err != nil {
++		t.Fatalf("failed start with clean teardown must close normally: %v", err)
++	}
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late start after close = %v, want ErrClosed", err)
++	}
++}

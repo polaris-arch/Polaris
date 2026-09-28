@@ -106,8 +106,12 @@ def main():
             patch_path = str(PATCH_DIR / patch['file'])
             run(['git', 'apply', '--check', patch_path], cwd=checkout)
             run(['git', 'apply', patch_path], cwd=checkout)
-        # Test only our stdlib-based regression cases; unrelated upstream tests need
-        # testify, which is not required to build libbox and may not be cached.
+        # Test the patched close chain as real package behavior before binding.
+        # The libbox tests remain explicit because unrelated upstream tests may
+        # require extra modules outside this pinned offline build.
+        run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', '.', './daemon',
+             './adapter/endpoint', './adapter/inbound', './adapter/outbound',
+             './adapter/service', './dns'], cwd=checkout, env=env)
         files = run([str(go), 'list', '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
         run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', *files,
              str(checkout / 'experimental/libbox/command_server_transient_test.go'),
@@ -129,7 +133,7 @@ def main():
                    'toolchain': {'go': go_version, 'java': java_version, 'ndk': manifest['ndkVersion'], **mobile_tools},
                    'buildTags': manifest['buildTags'], 'androidAPI': manifest['androidAPI'], 'ndkSelectionReason': manifest['ndkSelectionReason'],
                    'linkerFlags': linker_flags, 'buildVCS': False,
-                   'tests': 'transient and normal CommandServer lifecycle, named interface TCP/UDP binding and failures, non-Android and automatic dialers, constructor wiring, libbox forwarding and CheckConfig stub regression cases passed',
+                   'tests': 'Box early-close result, five manager close errors, strict transient and primary terminal/sticky lifecycle, concurrent listener close barrier, transient HTTP CONNECT rejects missing/wrong auth, normal CommandServer lifecycle, named interface TCP/UDP binding and failures, dialer regressions passed',
                    'nativeLibraries': {}}
         readelf = ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf'
         with zipfile.ZipFile(aar) as archive:
@@ -161,6 +165,7 @@ def main():
             for name in ['Libbox', 'CommandServer', 'PlatformInterface']:
                 signatures[name] = run([str(jdk / 'bin/javap'), '-classpath', str(classes), f'io.nekohasekai.libbox.{name}'], capture=True)
             require('newTransientCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Transient Java factory is missing')
+            require('newStrictCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Strict primary Java factory is missing')
             require('startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions)' in signatures['CommandServer'], 'Service Java signature changed')
             require('void bindInterfaceControl(int, java.lang.String) throws java.lang.Exception' in signatures['PlatformInterface'], 'Named interface Java platform contract is missing')
             receipt['javaInterfaces'] = signatures
