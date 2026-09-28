@@ -69,4 +69,52 @@ class MainKernelAttemptTest {
         new.revokeAndDetachTun()?.close()
         assertEquals(1, newCloses.get())
     }
+
+    @Test fun secondServiceCannotClaimWhileFirstCloseIsUnknownOrFailed() {
+        val registry = MainKernelAttemptLedger()
+        val first = MainKernelAttempt<Any>()
+        val second = MainKernelAttempt<Any>()
+        assertTrue(registry.claim(first))
+        assertFalse(registry.claim(second))
+        first.publish(Any())
+        first.closeOnce { throw IllegalStateException("native close failed") }
+        assertEquals("native close failed", first.closed.get(2, TimeUnit.SECONDS)?.message)
+        assertFalse(registry.completeAfterClose(first) { error("false bridge ACK") })
+        assertFalse(registry.abandon(first))
+        assertFalse(registry.claim(second))
+        assertTrue(registry.isCurrent(first))
+        // A process with failed native cleanup deliberately keeps this global owner.
+        // A fresh process is required; no later nil-server Stop may turn it into success.
+    }
+
+    @Test fun confirmedCloseAtomicallySettlesOldBridgeBeforeNewServiceCanClaim() {
+        val registry = MainKernelAttemptLedger()
+        val first = MainKernelAttempt<Any>()
+        val second = MainKernelAttempt<Any>()
+        assertTrue(registry.claim(first))
+        first.publish(Any())
+        first.closeOnce { }
+        assertEquals(null, first.closed.get(2, TimeUnit.SECONDS))
+        val ack = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        Thread {
+            assertTrue(registry.completeAfterClose(first) {
+                ack.countDown()
+                await(release)
+            })
+            done.countDown()
+        }.start()
+        await(ack)
+        val claimed = CountDownLatch(1)
+        val result = java.util.concurrent.atomic.AtomicReference<Boolean>()
+        Thread { result.set(registry.claim(second)); claimed.countDown() }.start()
+        assertFalse(claimed.await(30, TimeUnit.MILLISECONDS))
+        release.countDown()
+        await(done)
+        await(claimed)
+        assertEquals(true, result.get())
+        assertFalse(registry.completeAfterClose(first) { error("old callback reached new bridge") })
+        assertTrue(registry.isCurrent(second))
+    }
 }

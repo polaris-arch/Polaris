@@ -90,10 +90,12 @@ class BoxService(
     fun onStartCommand(): Int {
         val attempt = synchronized(this) {
             if (state != ServiceState.Stopped || mainAttempt != null) null
-            else MainKernelAttempt<CommandServer>(SystemStart.generation()).also {
-                mainAttempt = it
-                state = ServiceState.Starting
-            }
+            else MainKernelAttempt<CommandServer>(SystemStart.generation())
+                .takeIf { MainKernelAttemptRegistry.claim(it) }
+                ?.also {
+                    mainAttempt = it
+                    state = ServiceState.Starting
+                }
         }
         if (attempt == null) {
             // An existing attempt owns its bridge reply. A duplicate system intent
@@ -108,9 +110,10 @@ class BoxService(
             attempt.skipPreparation()
             if (VpnBridge.isStopping()) stopService(attempt)
             else synchronized(this) {
-                if (mainAttempt === attempt) {
+                if (mainAttempt === attempt && state == ServiceState.Starting && !attempt.revoked) {
                     mainAttempt = null
                     state = ServiceState.Stopped
+                    check(MainKernelAttemptRegistry.abandon(attempt)) { "无原生内核的主核预占释放失败" }
                 }
             }
             return Service.START_NOT_STICKY
@@ -186,7 +189,8 @@ class BoxService(
             }
             mainHandler.post {
                 synchronized(this) {
-                    if (mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started) {
+                    if (mainAttempt === attempt && MainKernelAttemptRegistry.isCurrent(attempt) &&
+                        !attempt.revoked && state == ServiceState.Started) {
                         notification.onStarted()
                     }
                 }
@@ -196,7 +200,8 @@ class BoxService(
             // 盘并算摘要，不该拖慢 Rust 侧的就绪门。失败只影响「系统起核可用性」，不影响本次连接。
             if (bridgeConfig != null) {
                 runCatching { SystemStart.remember(service, bridgeConfig, attempt.systemStartGeneration) {
-                    mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started
+                    mainAttempt === attempt && MainKernelAttemptRegistry.isCurrent(attempt) &&
+                        !attempt.revoked && state == ServiceState.Started
                 } }
                     .onFailure { Log.e(TAG, "记录起核配置失败，系统发起的起核将不可用", it) }
             }
@@ -368,6 +373,7 @@ class BoxService(
     private fun stopService(expectedAttempt: MainKernelAttempt<CommandServer>? = null) {
         val attempt = mainAttempt
         if (expectedAttempt != null && attempt !== expectedAttempt) return
+        if (attempt != null && !MainKernelAttemptRegistry.isCurrent(attempt)) return
         if (state == ServiceState.Stopped && attempt == null) {
             return
         }
@@ -391,7 +397,8 @@ class BoxService(
         if (firstStop) {
             mainHandler.post {
                 synchronized(this) {
-                    if (mainAttempt === attempt || (mainAttempt == null && state == ServiceState.Stopped)) {
+                    if (MainKernelAttemptRegistry.isCurrent(attempt) ||
+                        (mainAttempt == null && state == ServiceState.Stopped && MainKernelAttemptRegistry.isVacant())) {
                         notification.close()
                     }
                 }
@@ -430,7 +437,7 @@ class BoxService(
 
     private fun onAttemptClosed(attempt: MainKernelAttempt<CommandServer>, failure: Throwable?) {
         synchronized(this) {
-            if (mainAttempt !== attempt) return
+            if (mainAttempt !== attempt || !MainKernelAttemptRegistry.isCurrent(attempt)) return
             if (failure != null) {
                 runCatching { commandServer?.setError("android: close service failed") }
                 closeFailed = true
@@ -439,15 +446,19 @@ class BoxService(
             }
             // The old attempt cannot settle a later bridge: new admission remains
             // forbidden until this exact close result is acknowledged and cleared.
-            VpnBridge.finishStop()
-            commandServer = null
-            mainAttempt = null
-            state = ServiceState.Stopped
-            closeFailed = false
+            check(MainKernelAttemptRegistry.completeAfterClose(attempt) {
+                VpnBridge.finishStop()
+                commandServer = null
+                mainAttempt = null
+                state = ServiceState.Stopped
+                closeFailed = false
+            }) { "主核关闭回执与进程所有权不一致" }
         }
         mainHandler.post {
             synchronized(this) {
-                if (mainAttempt == null && state == ServiceState.Stopped) service.stopSelf()
+                if (mainAttempt == null && state == ServiceState.Stopped && MainKernelAttemptRegistry.isVacant()) {
+                    service.stopSelf()
+                }
             }
         }
     }

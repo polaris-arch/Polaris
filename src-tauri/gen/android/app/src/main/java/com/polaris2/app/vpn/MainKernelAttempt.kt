@@ -42,3 +42,40 @@ internal class MainKernelAttempt<Server>(val systemStartGeneration: Long = 0L) {
         }, "polaris-main-close").start()
     }
 }
+
+/** A Service can be recreated while the previous instance's native close is unresolved. */
+internal val MainKernelAttemptRegistry = MainKernelAttemptLedger()
+
+internal class MainKernelAttemptLedger {
+    private var owner: MainKernelAttempt<*>? = null
+
+    @Synchronized
+    fun claim(attempt: MainKernelAttempt<*>): Boolean {
+        if (owner != null) return false
+        owner = attempt
+        return true
+    }
+
+    @Synchronized
+    fun isCurrent(attempt: MainKernelAttempt<*>): Boolean = owner === attempt
+
+    @Synchronized
+    fun isVacant(): Boolean = owner == null
+
+    /** No factory was started, so this rejected system intent owns no native server. */
+    @Synchronized
+    fun abandon(attempt: MainKernelAttempt<*>): Boolean {
+        if (owner !== attempt || !attempt.prepared.isDone || attempt.prepared.getNow(null) != null) return false
+        owner = null
+        return true
+    }
+
+    /** Keep the bridge acknowledgement and owner release atomic against a new Service claim. */
+    @Synchronized
+    fun completeAfterClose(attempt: MainKernelAttempt<*>, action: () -> Unit): Boolean {
+        if (owner !== attempt || !attempt.closed.isDone || attempt.closed.getNow(null) != null) return false
+        action()
+        owner = null
+        return true
+    }
+}
