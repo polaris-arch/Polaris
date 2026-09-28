@@ -44,7 +44,7 @@ import { closeMobileForm, openMobileForm, useMobileFormStore } from '../forms/fo
 import { MobileButton, MobileSwitch, SettingsGroup, SettingsRow } from './SettingsChrome';
 import { failureText, type CommitWrite } from './write-feedback';
 
-/** 8 类标签 → i18n 键。与桌面同一张表（文案逐字相同，不另造重复键）。 */
+/** 备份类别标签 → i18n 键。与桌面同一张表（文案逐字相同，不另造重复键）。 */
 const CATEGORY_LABEL_KEYS: Readonly<Record<BackupCategory, string>> = {
   manualNodes: 'settings.advanced.backup.manualNodes',
   meshNodes: 'settings.advanced.backup.meshNodes',
@@ -53,6 +53,7 @@ const CATEGORY_LABEL_KEYS: Readonly<Record<BackupCategory, string>> = {
   dnsRules: 'settings.backup.catDnsRules',
   dnsResources: 'settings.backup.catDnsResources',
   appRules: 'settings.advanced.backup.appRules',
+  meshRouting: 'settings.backup.catMeshRouting',
   generalSettings: 'settings.advanced.backup.generalSettings',
 };
 
@@ -66,6 +67,8 @@ interface PendingImport {
   readonly filePath: string;
   readonly fileName: string;
   readonly available: readonly BackupCategory[];
+  readonly blockedCategories: readonly BackupCategory[];
+  readonly meshRoutingOwnerServerIds: readonly string[];
   readonly counts: Partial<Record<BackupCategory, number>>;
   readonly unavailableInterfaceBindings: Partial<Record<BackupCategory, number>>;
 }
@@ -138,15 +141,19 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
             throw new Error(backupErrorText(res.errorCode, t));
           }
           const available = res.available ?? [];
+          const blockedCategories = res.blockedCategories ?? [];
           setPending({
             filePath: res.filePath,
             fileName: displayName(res.filePath),
             available,
+            blockedCategories,
+            meshRoutingOwnerServerIds: res.meshRoutingOwnerServerIds ?? [],
             counts: res.counts ?? {},
             unavailableInterfaceBindings: res.unavailableInterfaceBindings ?? {},
           });
           // 默认全选备份里真的有的那些类；依赖闭包（规则 ⇒ DNS 资源）交给同一份真值源维持。
-          setImportPick(normalizeBackupSelection(available, available));
+          const selectable = available.filter((cat) => !blockedCategories.includes(cat));
+          setImportPick(normalizeBackupSelection(selectable, selectable));
         } finally {
           setBusy(false);
         }
@@ -283,6 +290,12 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
               key={cat}
               id={`backup-import-${cat}`}
               label={t(CATEGORY_LABEL_KEYS[cat])}
+              desc={cat === 'meshRouting' && pending.blockedCategories.includes(cat)
+                ? t('backupImport.meshRoutingBlocked')
+                : undefined}
+              hint={cat === 'meshRouting' && pending.meshRoutingOwnerServerIds.length > 0
+                ? t('backupImport.meshRoutingOwners', { ids: pending.meshRoutingOwnerServerIds.join(', ') })
+                : undefined}
               control={
                 <>
                   <span style={{ fontFamily: 'var(--mono)', color: 'hsl(var(--fg-dim))' }}>
@@ -290,6 +303,7 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
                   </span>
                   <MobileSwitch
                     checked={importPick.has(cat)}
+                    disabled={pending.blockedCategories.includes(cat)}
                     ariaLabel={t(CATEGORY_LABEL_KEYS[cat])}
                     onChange={() =>
                       setImportPick((prev) =>

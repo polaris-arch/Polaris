@@ -1633,6 +1633,8 @@ describe('⑨ 能力缺席：该缺的块整块不画，不画成禁用（§4.2 
 
   it('备份：类目选择在，导出/导入两颗按钮真的可点（W-18 已接线）', () => {
     expect(switchRows(MARKUP.backup)).toEqual([...EXPECTED_SWITCHES.backup]);
+    expect(switchRows(MARKUP.backup)).toContain('backup-meshRouting');
+    expect(MARKUP.backup).toContain(copy('settings.backup.catMeshRouting'));
     // 说明那句话改成了实话：说的是「走哪个系统面板」，不再是「这条腿没接」。
     expect(MARKUP.backup).toContain(copy('mobileSettings.backup.pickerNote'));
     expect(MARKUP.backup).toContain(copy('settings.backup.exportSelected'));

@@ -869,6 +869,7 @@
       "catCustomRules": "路由規則（含規則集資源）",
       "catDnsRules": "DNS 規則",
       "catDnsResources": "DNS 伺服器、伺服器群組與預設解析策略",
+      "catMeshRouting": "組網路由策略",
       "exportSelected": "匯出所選",
       "import": "匯入…"
     },
@@ -1626,6 +1627,8 @@
     "interfaceFallbackWarn": "所選類別中有 {{n}} 處網卡綁定在本機不存在。還原時將改為自動或繼承，原備份檔案不會變更。",
     "pickHint": "點擊選擇備份檔案",
     "replaceWarn": "選中類別將被備份內容整體取代；未選類別維持不變。",
+    "meshRoutingBlocked": "組網路由策略缺少可信舊範圍證明，目前無法還原。若選取它，整次匯入都會拒絕；取消該類後可還原其他類別。",
+    "meshRoutingOwners": "策略引用的節點：{{ids}}",
     "restoreSelected": "復原所選",
     "title": "匯入備份",
     "error": {
@@ -1637,6 +1640,8 @@
       "invalidFormat": "這不是有效的 Polaris 備份檔案",
       "invalidArgs": "請至少選擇一個要復原的類別",
       "saveFailed": "無法儲存復原後的設定",
+      "meshRoutingRequiresTrustedRestore": "組網路由策略還原需要可信舊範圍證明，目前已阻止寫入。",
+      "meshRoutingInvalidPolicy": "組網路由策略驗證失敗，備份未匯出。",
       "unknown": "備份操作未能完成"
     }
   },

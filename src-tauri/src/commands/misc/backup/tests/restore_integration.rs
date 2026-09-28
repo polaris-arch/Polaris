@@ -93,13 +93,158 @@ fn has_dns_server(config: &Value, id: &str) -> bool {
 }
 
 #[test]
-fn all_eight_categories_survive_export_preview_apply_and_reopen() {
+fn mesh_routing_restore_is_blocked_without_trusted_scope_and_old_backup_skips_it() {
+    let dir = TestDir::new("polaris-backup-mesh-routing-blocked");
+    let manager = ConfigManager::new(dir.clone());
+    let current = seeded_config(&manager, "target");
+    let before = std::fs::read(dir.path().join("config.json")).unwrap();
+    let portable = json!({
+        "meshRouting": {
+            "schemaVersion":1, "candidateOrder":["foreign-ts"],
+            "assignments":[], "overrides":[],
+            "migration":{"unknownPublicPool":"reject","builtinExceptionsVersion":1}
+        },
+        "meshRouteState":{"foreign":"ledger"},
+        "logLevel":"debug"
+    });
+    let error = crate::commands::config::backup_import_save_core(
+        &manager,
+        &portable,
+        &[BackupCategory::MeshRouting, BackupCategory::GeneralSettings],
+        None,
+        "linux",
+        None,
+    )
+    .err()
+    .expect("meshRouting must be blocked before any category is saved");
+    assert!(error
+        .to_string()
+        .contains("trusted owner-scope transaction"));
+    assert_eq!(
+        std::fs::read(dir.path().join("config.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        manager.load_full().unwrap()["logLevel"],
+        current["logLevel"]
+    );
+
+    let foreign_legacy = json!({
+        "meshRoutePolicy": {
+            "schemaVersion": 999,
+            "assignments": [{"cidr":"203.0.113.0/24", "target": {
+                "kind":"owner", "serverId":"foreign-ts", "identityEpoch":"foreign-epoch"
+            }}]
+        },
+        "logLevel":"debug"
+    });
+    assert!(crate::commands::config::backup_import_save_core(
+        &manager,
+        &foreign_legacy,
+        &[BackupCategory::MeshRouting, BackupCategory::GeneralSettings],
+        None,
+        "linux",
+        None,
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("config.json")).unwrap(),
+        before
+    );
+
+    let old_backup = json!({"logLevel":"debug"});
+    let saved = crate::commands::config::backup_import_save_core(
+        &manager,
+        &old_backup,
+        &[BackupCategory::MeshRouting, BackupCategory::GeneralSettings],
+        None,
+        "linux",
+        None,
+    )
+    .unwrap();
+    assert!(saved.skipped.contains(&BackupCategory::MeshRouting));
+    assert_eq!(saved.config["logLevel"], "debug");
+    assert!(saved.config.get("meshRoutePolicy").is_none());
+    assert!(saved.config.get("meshRouteState").is_none());
+}
+
+#[test]
+fn unselected_mesh_routing_restore_keeps_latest_disk_policy_and_ledger() {
+    let dir = TestDir::new("polaris-backup-mesh-routing-local-truth");
+    let wire: Value = serde_json::from_str(include_str!(
+        "../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    ))
+    .unwrap();
+    let mut local = polaris_store::store::default_config();
+    local["meshRoutePolicy"] = wire["meshRoutePolicy"].clone();
+    local["meshRouteState"] = wire["meshRouteState"].clone();
+    local["meshRouteState"]["revision"] = json!("4");
+    local["servers"] = json!([{
+        "id":"ts-a", "name":"Local TS", "protocol":"tailscale",
+        "tailscaleSettings":{"controlUrl":"https://control.example.test/path"}
+    }]);
+    std::fs::write(
+        dir.path().join("config.json"),
+        serde_json::to_vec(&local).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("mesh-route-state.required"),
+        json!({
+            "phase":"enabled", "localId":local["meshRouteState"]["localId"],
+            "legacyConfigDigest":"0".repeat(64)
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let manager = ConfigManager::new(dir.clone());
+    let stale_cache = manager.load_full().unwrap();
+    assert_eq!(stale_cache["meshRouteState"]["revision"], "4");
+    let mut latest = stale_cache.clone();
+    latest["meshRouteState"]["revision"] = json!("5");
+    latest["meshRoutePolicy"]["candidateOrder"] = json!(["ts-a", "ts-b", "ts-c"]);
+    std::fs::write(
+        dir.path().join("config.json"),
+        serde_json::to_vec(&latest).unwrap(),
+    )
+    .unwrap();
+
+    let foreign = json!({
+        "logLevel":"debug",
+        "meshRouting":{"schemaVersion":1,"candidateOrder":["foreign-ts"]},
+        "meshRoutePolicy":{"schemaVersion":999},
+        "meshRouteState":{"foreign":"ledger"}
+    });
+    let saved = crate::commands::config::backup_import_save_core(
+        &manager,
+        &foreign,
+        &[BackupCategory::GeneralSettings],
+        None,
+        "linux",
+        None,
+    )
+    .unwrap();
+    assert_eq!(saved.config["logLevel"], "debug");
+    assert_eq!(saved.config["meshRoutePolicy"], latest["meshRoutePolicy"]);
+    assert_eq!(saved.config["meshRouteState"], latest["meshRouteState"]);
+    assert!(saved.config.get("meshRouting").is_none());
+    let reopened = ConfigManager::new(dir.clone()).load_full().unwrap();
+    assert_eq!(reopened["meshRoutePolicy"], latest["meshRoutePolicy"]);
+    assert_eq!(reopened["meshRouteState"], latest["meshRouteState"]);
+}
+
+#[test]
+fn all_legacy_categories_survive_export_preview_apply_and_reopen() {
     let source_dir = TestDir::new("polaris-backup-all-source");
     let target_dir = TestDir::new("polaris-backup-all-target");
     let source = seeded_config(&ConfigManager::new(source_dir.clone()), "source");
     let target_manager = ConfigManager::new(target_dir.clone());
     let target = seeded_config(&target_manager, "target");
-    let backup_config = pick_categories(&source, &BACKUP_CATEGORIES);
+    let legacy_categories: Vec<BackupCategory> = BACKUP_CATEGORIES
+        .into_iter()
+        .filter(|category| *category != BackupCategory::MeshRouting)
+        .collect();
+    let backup_config = pick_categories(&source, &legacy_categories);
     for excluded in [
         "clashApiSecret",
         "privacyPassword",
@@ -128,10 +273,10 @@ fn all_eight_categories_survive_export_preview_apply_and_reopen() {
         panic!("exported document must be readable for preview");
     };
     let preview = parse_backup_content(&raw).unwrap();
-    assert_eq!(detect_categories(&preview.config), BACKUP_CATEGORIES);
-    for category in BACKUP_CATEGORIES {
+    assert_eq!(detect_categories(&preview.config), legacy_categories);
+    for category in &legacy_categories {
         assert!(
-            count_category(&preview.config, category) > 0,
+            count_category(&preview.config, *category) > 0,
             "{category:?}"
         );
     }
@@ -140,7 +285,7 @@ fn all_eight_categories_survive_export_preview_apply_and_reopen() {
     let saved = crate::commands::config::backup_import_save_core(
         &target_manager,
         &parsed.config,
-        &BACKUP_CATEGORIES,
+        &legacy_categories,
         parsed.platform.as_deref(),
         "linux",
         None,

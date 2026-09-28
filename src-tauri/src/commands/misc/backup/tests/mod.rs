@@ -9,6 +9,26 @@ fn backup_failure_exposes_only_the_stable_error_code() {
     assert!(payload.get("diagnostic").is_none());
 }
 
+#[test]
+fn selected_invalid_mesh_policy_fails_export_before_file_picker() {
+    let mut config = polaris_store::store::default_config();
+    config["meshRoutePolicy"] = json!({
+        "schemaVersion": 1,
+        "candidateOrder": ["ts-a"],
+        "authKey": "must-not-export"
+    });
+    assert_eq!(
+        pick_checked_categories(&config, &[BackupCategory::MeshRouting]),
+        Err("meshRoutingInvalidPolicy")
+    );
+    assert!(
+        pick_checked_categories(&config, &[BackupCategory::GeneralSettings])
+            .unwrap()
+            .get("meshRoutePolicy")
+            .is_none()
+    );
+}
+
 /* ══════════════ content-URI 往返门（备份导出 / 导入这一组）══════════════ */
 //
 // 门的本体与射程自曝在 `commands::picked_file::tests` 的头注里。这里驱动的是**备份腿自己的

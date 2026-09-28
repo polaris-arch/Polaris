@@ -13,9 +13,9 @@ use crate::i18n::{key, t};
 use crate::response::ApiResponse;
 use crate::runtime::AppRuntime;
 use polaris_store::backup::{
-    build_backup_info, count_category, detect_categories, parse_backup_content, pick_categories,
-    sanitize_unavailable_interface_bindings, BackupCategory, BACKUP_CATEGORIES,
-    BACKUP_FILE_VERSION,
+    build_backup_info, count_category, detect_categories, mesh_routing_owner_dependencies,
+    parse_backup_content, pick_categories, sanitize_unavailable_interface_bindings, BackupCategory,
+    BACKUP_CATEGORIES, BACKUP_FILE_VERSION,
 };
 
 /// 把前端传来的类别串解析成枚举；空 / None → 全选。
@@ -31,6 +31,22 @@ fn parse_categories(raw: Option<Vec<String>>) -> Vec<BackupCategory> {
     } else {
         picked
     }
+}
+
+/// Refuse an invalid local managed policy before opening a save dialog or
+/// reporting a successful backup that silently omits the selected category.
+fn pick_checked_categories(
+    config: &Value,
+    selected: &[BackupCategory],
+) -> Result<Value, &'static str> {
+    let picked = pick_categories(config, selected);
+    if selected.contains(&BackupCategory::MeshRouting)
+        && config.get("meshRoutePolicy").is_some()
+        && picked.get("meshRouting").is_none()
+    {
+        return Err("meshRoutingInvalidPolicy");
+    }
+    Ok(picked)
 }
 
 // ── 数据备份 / 恢复 ── 上游 `backup-handlers.ts` ──
@@ -155,7 +171,8 @@ fn read_apply_source(gateway: &dyn FileGateway, file_path: &str) -> Result<Strin
 
 /// 上游 `BACKUP_EXPORT`：选择性导出（按 categories）。
 ///
-/// `categories` 缺省 / 空 → 全 8 类。1.2 新增独立 DNS 规则类别，仍兼容导入 1.0/1.1 / 裸配置。
+/// `categories` 缺省 / 空 → 全部类别。meshRouting 只导出 portable policy，
+/// 仍兼容导入 1.0/1.1 / 裸配置。
 /// **clashApiSecret / privacyPassword 恒不入备份**（由 `pick_categories` 的排除表保证，见 store::backup）。
 #[tauri::command]
 pub async fn backup_export(
@@ -171,7 +188,13 @@ pub async fn backup_export(
         }
     };
     let selected = parse_categories(categories);
-    let picked = pick_categories(&config, &selected);
+    let picked = match pick_checked_categories(&config, &selected) {
+        Ok(picked) => picked,
+        Err(code) => {
+            log::warn!("[backup] managed policy failed portable export validation");
+            return Ok(ApiResponse::ok(backup_failure(code)));
+        }
+    };
 
     let backup = json!({
         "version": BACKUP_FILE_VERSION,
@@ -267,6 +290,12 @@ pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()
         }
     };
     let available = detect_categories(&parsed.config);
+    let blocked_categories: Vec<BackupCategory> = available
+        .iter()
+        .copied()
+        .filter(|category| *category == BackupCategory::MeshRouting)
+        .collect();
+    let mesh_routing_owner_server_ids = mesh_routing_owner_dependencies(&parsed.config);
     let interface_names = import_interface_names().await;
     let mut counts = serde_json::Map::new();
     let mut unavailable_interface_bindings = serde_json::Map::new();
@@ -289,6 +318,8 @@ pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()
         // 它是那个文档唯一能被二次打开的句柄，`backup_import_apply` 拿的就是它。
         "filePath": file_path,
         "available": available,
+        "blockedCategories": blocked_categories,
+        "meshRoutingOwnerServerIds": mesh_routing_owner_server_ids,
         "counts": counts,
         "unavailableInterfaceBindings": unavailable_interface_bindings,
     })))
@@ -339,6 +370,14 @@ pub async fn backup_import_apply(
             return Ok(ApiResponse::ok(backup_failure("invalidFormat")));
         }
     };
+    if selected.contains(&BackupCategory::MeshRouting)
+        && (parsed.config.get("meshRouting").is_some()
+            || parsed.config.get("meshRoutePolicy").is_some())
+    {
+        return Ok(ApiResponse::ok(backup_failure(
+            "meshRoutingRequiresTrustedRestore",
+        )));
+    }
 
     // 保留 configLoadFailed 语义；事务内会以最新盘值再次读取并按类别合并。
     if let Err(e) = state.config().load_full() {

@@ -18,6 +18,8 @@ export type BackupErrorCode =
   | 'invalidFormat'
   | 'invalidArgs'
   | 'saveFailed'
+  | 'meshRoutingRequiresTrustedRestore'
+  | 'meshRoutingInvalidPolicy'
   | 'unknown';
 
 // ============================================================================
@@ -189,6 +191,8 @@ export const backupApi = {
     canceled: boolean;
     filePath?: string;
     available?: BackupCategory[];
+    blockedCategories?: BackupCategory[];
+    meshRoutingOwnerServerIds?: string[];
     counts?: Partial<Record<BackupCategory, number>>;
     unavailableInterfaceBindings?: Partial<Record<BackupCategory, number>>;
     errorCode?: BackupErrorCode;

@@ -869,6 +869,7 @@
       "catCustomRules": "Routing rules (with rule-set resources)",
       "catDnsRules": "DNS rules",
       "catDnsResources": "DNS servers, server groups, and resolution defaults",
+      "catMeshRouting": "Mesh routing policy",
       "exportSelected": "Export selected",
       "import": "Import…"
     },
@@ -1626,6 +1627,8 @@
     "interfaceFallbackWarn": "{{n}} interface binding(s) in the selected categories are unavailable on this device. They will be reset to Automatic or Inherit; the backup file will remain unchanged.",
     "pickHint": "Click to choose a backup file",
     "replaceWarn": "Selected categories will be fully replaced by the backup's contents; unselected categories stay unchanged.",
+    "meshRoutingBlocked": "Mesh routing policy cannot be restored without a trusted snapshot of the old ranges. Selecting it rejects the entire import; deselect it to restore other categories.",
+    "meshRoutingOwners": "Referenced nodes: {{ids}}",
     "restoreSelected": "Restore selected",
     "title": "Import Backup",
     "error": {
@@ -1637,6 +1640,8 @@
       "invalidFormat": "This is not a valid Polaris backup file",
       "invalidArgs": "Choose at least one category to restore",
       "saveFailed": "Could not save the restored configuration",
+      "meshRoutingRequiresTrustedRestore": "Mesh routing policy restore needs trusted proof of the old ranges; no changes were saved.",
+      "meshRoutingInvalidPolicy": "Mesh routing policy validation failed; the backup was not exported.",
       "unknown": "The backup operation could not be completed"
     }
   },

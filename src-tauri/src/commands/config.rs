@@ -816,40 +816,52 @@ pub(crate) fn backup_import_save_core(
     current_platform: &str,
     available_interfaces: Option<&BTreeSet<String>>,
 ) -> Result<BackupImportSaved, polaris_store::StoreError> {
-    let ((old_selected, skipped, cross_disabled, unavailable), saved) = config
-        .update_deferred_cleanup(|latest| {
-            let old_selected = latest
-                .get("selectedServerId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let outcome = merge_categories(latest, backup, selected);
-            let mut next = outcome.config;
-            let effective_selected: Vec<BackupCategory> = selected
-                .iter()
-                .copied()
-                .filter(|category| !outcome.skipped.contains(category))
-                .collect();
-            let cross_disabled = if effective_selected.contains(&BackupCategory::CustomRules) {
-                sanitize_cross_platform_rules(&mut next, backup_platform, current_platform)
-            } else {
-                0
-            };
-            let unavailable = available_interfaces.map_or(0, |names| {
-                sanitize_unavailable_interface_bindings(&mut next, names, &effective_selected)
-            });
-            preserve_server_owned_secrets_from(latest, &mut next);
-            enforce_backend_authoritative_fields_from(latest, &mut next);
-            log_invalidated_validators(invalidate_validators_on_global_ua_change(
-                latest, &mut next,
+    let (outcome, saved) = config.update_deferred_cleanup(|latest| {
+        // A portable policy has serverId references but no local epoch.
+        // Restoring it needs a trusted old-owner scope snapshot and S4
+        // lifecycle/state receipt. Keep every category unchanged until
+        // that transaction exists; never bind foreign intent in this
+        // ordinary merge or let a selected policy silently skip.
+        if selected.contains(&BackupCategory::MeshRouting)
+            && (backup.get("meshRouting").is_some() || backup.get("meshRoutePolicy").is_some())
+        {
+            return crate::runtime::config::Decision::Skip(Err(
+                polaris_store::StoreError::validation(
+                    "meshRouting restore requires a trusted owner-scope transaction",
+                ),
             ));
-            *latest = next;
-            crate::runtime::config::Decision::Write((
-                old_selected,
-                outcome.skipped,
-                cross_disabled,
-                unavailable,
-            ))
-        })?;
+        }
+        let old_selected = latest
+            .get("selectedServerId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let outcome = merge_categories(latest, backup, selected);
+        let mut next = outcome.config;
+        let effective_selected: Vec<BackupCategory> = selected
+            .iter()
+            .copied()
+            .filter(|category| !outcome.skipped.contains(category))
+            .collect();
+        let cross_disabled = if effective_selected.contains(&BackupCategory::CustomRules) {
+            sanitize_cross_platform_rules(&mut next, backup_platform, current_platform)
+        } else {
+            0
+        };
+        let unavailable = available_interfaces.map_or(0, |names| {
+            sanitize_unavailable_interface_bindings(&mut next, names, &effective_selected)
+        });
+        preserve_server_owned_secrets_from(latest, &mut next);
+        enforce_backend_authoritative_fields_from(latest, &mut next);
+        log_invalidated_validators(invalidate_validators_on_global_ua_change(latest, &mut next));
+        *latest = next;
+        crate::runtime::config::Decision::Write(Ok((
+            old_selected,
+            outcome.skipped,
+            cross_disabled,
+            unavailable,
+        )))
+    })?;
+    let (old_selected, skipped, cross_disabled, unavailable) = outcome?;
     Ok(BackupImportSaved {
         config: saved.expect("Decision::Write 必须返回已落盘配置"),
         old_selected,
