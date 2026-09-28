@@ -41,7 +41,7 @@ internal class TransientSpeedtestSessions(
     private var active: Entry? = null
     private val timer = ScheduledThreadPoolExecutor(1, ThreadFactory { runnable ->
         Thread(runnable, "polaris-speedtest-timer").apply { isDaemon = true }
-    }.apply { removeOnCancelPolicy = true }
+    }).apply { removeOnCancelPolicy = true }
 
     fun start(id: String, engine: Engine, done: (String?) -> Unit) {
         val identity = parseIdentity(id)
