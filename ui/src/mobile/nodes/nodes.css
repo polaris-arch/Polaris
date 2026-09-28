@@ -712,7 +712,7 @@
   max-height: 80%;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: var(--sp-2) calc(var(--card-padding) + var(--safe-r)) calc(var(--card-padding) + var(--safe-b)) calc(var(--card-padding) + var(--safe-l));
+  padding: var(--sp-2) calc(var(--card-padding) + var(--safe-r)) calc(var(--card-padding) + var(--m-overlay-safe-b, var(--safe-b))) calc(var(--card-padding) + var(--safe-l));
   border-top-left-radius: var(--r-lg);
   border-top-right-radius: var(--r-lg);
   background: hsl(var(--surface));

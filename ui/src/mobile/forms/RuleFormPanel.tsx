@@ -84,7 +84,7 @@ import {
 } from '@/components/dialogs/rule-effect-state';
 import { submitRule } from '@/components/dialogs/rule-submit';
 import { NEW_PROFILE_CHOICE, networkProfileOptions } from '@/components/dialogs/network-profile-options';
-import { BUILTIN_NETENV_DHCP_ID, probeReasonKey } from '@/domain/network-profile';
+import { BUILTIN_NETENV_DHCP_ID } from '@/domain/network-profile';
 import { mobileReasonKey } from '../screens/rules/network-profile-copy';
 import { useRuleDelete } from '@/lib/use-rule-delete';
 import { revealElement, useRevealAfterCommit } from '@/components/reveal';
@@ -335,6 +335,20 @@ export function RuleFormPanel({
     /* 内置 DHCP 解析器不可用原因换成手机上的那一句（原因码不变，见 `network-profile-copy`）。 */
     mobileReasonKey,
   );
+  // This mobile entry runs on Android/iOS, where `dhcp_privileged` is always false.
+  // Filter before the first async status frame; retain an imported/current value so
+  // the user can see and replace it without silently changing the saved rule.
+  const dhcpAction = `server:${BUILTIN_NETENV_DHCP_ID}`;
+  const dnsActionGroups: readonly CselGroup[] = dns.dnsActionGroups
+    .map((group) => ({
+      ...group,
+      options: group.options.flatMap((option) => option.value !== dhcpAction
+        ? [option]
+        : dns.dnsAction === dhcpAction
+          ? [{ ...option, disabled: true, description: tr('mobileRules.networkProfile.reasonDhcpNoPermission') }]
+          : []),
+    }))
+    .filter((group) => group.options.length > 0);
   const labelOfGroups = (groups: readonly CselGroup[], value: string): string => {
     for (const group of groups) {
       const hit = group.options.find((option) => option.value === value);
@@ -589,17 +603,14 @@ export function RuleFormPanel({
                 label={tr('rules.dnsAction')}
                 options={[]}
                 value={dns.dnsAction}
-                valueLabel={labelOfGroups(dns.dnsActionGroups, dns.dnsAction)}
+                valueLabel={labelOfGroups(dnsActionGroups, dns.dnsAction)}
                 open={sheet === 'dns-action'}
                 onOpen={() => setSheet('dns-action')}
               />
-              {/* 已选中内置 DHCP 解析器、而它在本机不可用（Android 恒如此）：值照常回显，原因写在下面，
-                  不悄悄清空（同桌面 `RuleDnsEffect`）。 */}
-              {dns.dnsAction === `server:${BUILTIN_NETENV_DHCP_ID}` && dns.netenvStatus?.available === false && (
+              {/* Android/iOS 的旧 DHCP 值照常回显、可改离；无须等异步状态才说不可用。 */}
+              {dns.dnsAction === dhcpAction && (
                 <p className="m-form-err">
-                  {tr('rules.networkProfile.probeUnavailable', {
-                    reason: tr(mobileReasonKey(probeReasonKey(dns.netenvStatus.reason))),
-                  })}
+                  {tr('mobileRules.networkProfile.reasonDhcpNoPermission')}
                 </p>
               )}
             </div>
@@ -747,7 +758,7 @@ export function RuleFormPanel({
       />
       <SelectSheetPanel
         label={tr('rules.dnsAction')}
-        groups={dns.dnsActionGroups}
+        groups={dnsActionGroups}
         value={dns.dnsAction}
         open={sheet === 'dns-action'}
         onClose={() => setSheet(null)}

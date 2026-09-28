@@ -17,8 +17,8 @@ import { MobileInfo } from '../MobileInfo';
  *
  * # 三处与桌面不同的形态（都是触屏事实，不是排版偏好）
  *
- *  1. 三格说明（地址段 / 搜索域 / 探测方式）桌面挂在 `InfoIcon` 的悬浮提示上 ⇒ 这里是常驻 `m-form-hint`（§4.12）；
- *  2. 探测方式是 `m-form-seg` 三段（同 WARP / WG 表单），不是原生 select：三档一眼看全，切一下不必进全屏选择器；
+ *  1. 地址段 / 搜索域 / 探测方式保留短摘要，完整说明由共用 MobileInfo 展开；
+ *  2. 探测方式是 `m-form-seg`（同 WARP / WG 表单），不是原生 select；Android/iOS 不列恒不可用的 DHCP 新选项，旧值仍回显；
  *  3. 不可用原因的**措辞**换成手机上的那一句（`network-profile-copy#mobileReasonKey`，原因码不变）。
  */
 
@@ -29,14 +29,12 @@ import {
   buildNetworkProfile,
   probeDisplay,
   probeInputsDiffer,
-  probeReasonKey,
   probeWarningKey,
   validateNetworkProfileDraft,
   type NetworkProfileFormError,
 } from '@/domain/network-profile';
 import { useConfig, type UseConfigResult } from '@/components/screens/settings/use-config';
 import { probeDisplayText, useResolvedProbes } from '@/components/screens/rules/network-profile-probes';
-import { useBuiltinDhcpStatus } from '@/components/dialogs/rule-effect-state';
 import { MobileListEditor } from '../settings/SettingsChrome';
 import { mobileReasonKey } from '../screens/rules/network-profile-copy';
 import { FormSheet } from './FormSheet';
@@ -139,13 +137,9 @@ function ProfileForm({
   const [submitting, setSubmitting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | undefined>();
   const resolved = useResolvedProbes(config);
-  /**
-   * DHCP 这一档在本机能不能用 —— 后端判据 `ProbeFacts::dhcp_unavailable`（dhcp 源场景与内置 DHCP 解析器
-   * 同一个 transport）。Android / iOS 恒不可用（应用沙箱绑不了 UDP 68）。不可用 ⇒ 这一档置灰、下面一行写原因，
-   * 不留一个点了也永远不生效的选项；**已经选着它**的存量场景（桌面备份导进来的）照常回显、原因同样写出来。
-   */
-  const dhcpStatus = useBuiltinDhcpStatus();
-  const dhcpBlocked = dhcpStatus !== null && !dhcpStatus.available;
+  // Android/iOS cannot bind DHCP's UDP 68 (`network_env.rs::dhcp_privileged`).
+  // Keep a cross-platform saved value visible until the user chooses another source.
+  const legacyDhcp = probe === 'dhcp';
 
   const touch = (): void => {
     setDirty(true);
@@ -291,15 +285,14 @@ function ProfileForm({
         <span className="m-form-label" id="mnp-probe">
           {tr('rules.networkProfile.probe')}
         </span>
-        <div className="m-form-hint"><MobileInfo title={tr('rules.networkProfile.probe')} summary={tr('mobileHelp.profileProbe')} details={tr('rules.networkProfile.probeHint')} /></div>
+        <div className="m-form-hint"><MobileInfo title={tr('rules.networkProfile.probe')} summary={tr('mobileHelp.profileProbe')} details={tr('mobileHelp.profileProbeDetails')} /></div>
         <div className="m-form-seg" role="group" aria-labelledby="mnp-probe">
-          {PROBE_CHOICES.map((choice) => (
+          {PROBE_CHOICES.filter((choice) => choice.id !== 'dhcp' || legacyDhcp).map((choice) => (
             <button
               key={choice.id}
               type="button"
               className={probe === choice.id ? 'on' : ''}
               aria-pressed={probe === choice.id}
-              disabled={choice.id === 'dhcp' && dhcpBlocked && probe !== 'dhcp'}
               onClick={() => {
                 setProbe(choice.id);
                 touch();
@@ -309,16 +302,12 @@ function ProfileForm({
             </button>
           ))}
         </div>
-        {dhcpBlocked && dhcpStatus !== null && (
+        {legacyDhcp && display.kind !== 'unavailable' && (
           <p className="m-form-hint">
-            {tr('rules.networkProfile.probeDhcp')} ·{' '}
-            {tr('rules.networkProfile.probeUnavailable', {
-              reason: tr(mobileReasonKey(probeReasonKey(dhcpStatus.reason))),
-            })}
+            {tr('mobileRules.networkProfile.reasonDhcpNoPermission')}
           </p>
         )}
-        {/* 「本机将使用：…」由后端算（同生成器一个函数）；不可用 ⇒ 红字带原因。
-            Android 上手选 DHCP 恒落这一档（应用沙箱绑不了 UDP 68），原因如实写出来，不藏选项。 */}
+        {/* 「本机将使用：…」由后端算（同生成器一个函数）；旧DHCP值仍可回显并改离。 */}
         <p className={display.kind === 'unavailable' ? 'm-form-err' : 'm-form-hint'}>
           {probeDisplayText(display, t, mobileReasonKey)}
         </p>

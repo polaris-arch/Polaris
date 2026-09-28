@@ -190,7 +190,9 @@ export function MobilePendingBar(): ReactElement | null {
     }
     const outcome = applyOutcome(r.status);
     setApply({ phase: outcome.phase, reason: null });
-    if (outcome.toast !== null) toast[outcome.toast.kind](t(outcome.toast.key));
+    // A stop racing Apply leaves nothing to restart. The saved configuration is already
+    // reflected by the controls; a "next start" success notice adds no action here.
+    if (outcome.toast !== null && r.status !== 'skipped') toast[outcome.toast.kind](t(outcome.toast.key));
   };
 
   const runAction = (id: BarActionId): void => {

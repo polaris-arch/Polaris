@@ -49,7 +49,6 @@ import { useEffect, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TunModeConfig, UdpNatType } from '@/contracts/types';
 import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
-import type { TunnelConflictReport } from '@/contracts/tunnel-conflict-report';
 import { MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
 import { injectedList, injectedRecord } from '@/domain/effective-config';
 import { bypassLanState } from '@/components/screens/settings/settings-logic';
@@ -62,7 +61,7 @@ import {
   SettingsGroup,
   SettingsRow,
 } from './SettingsChrome';
-import { MobileEndpointForceRouteBlock, MobileTunnelConflictBlock } from './TunReports';
+import { MobileEndpointForceRouteBlock } from './TunReports';
 import type { MobileSettingsPageProps } from './settings-pages';
 
 /** `'default'` 是只存在于控件里的哨兵，落库时删键（Select 的 value 表达不了 undefined）。 */
@@ -149,27 +148,18 @@ export function TunPage({ config, update, commit }: MobileSettingsPageProps): Re
    * 它 ⇒ 照读那个字段会让这条提示**永远不出现**，正好在唯一需要它的平台上失声。
    */
   /*
-   * 两块只读报告的拉取（呈现在 `TunReports.tsx`，理由见那份文件头注）。
+   * 自己的组网网段结算报告拉取（呈现在 `TunReports.tsx`）。
    *
-   * 拉不到一律停在 `null` —— 那一档两块都自己说「读取失败，暂时拿不到这份报告」，
+   * 拉不到停在 `null` —— 报告自己说「读取失败，暂时拿不到这份报告」，
    * **不折成任何一种结论**。这与节点屏 `MobileNodesScreen.tsx:217-231` 消费同一条
    * force-route 命令时的取向逐字一致：报告答不出来是允许的，编一个答案不是。
    *
-   * 只在挂载时拉一次：两份报告都是「起核那一刻」的快照（见 Rust `ConflictCriteria` 头注），
+   * 只在挂载时拉一次：报告按当前保存配置和观测计算，
    * 页面停留期间不会自己变新。
    */
-  const [tunnelConflicts, setTunnelConflicts] = useState<TunnelConflictReport | null>(null);
   const [forceRoute, setForceRoute] = useState<EndpointForceRouteReport | null>(null);
   useEffect(() => {
     let cancelled = false;
-    api.config
-      .tunnelConflictReport()
-      .then((next) => {
-        if (!cancelled) setTunnelConflicts(next);
-      })
-      .catch(() => {
-        if (!cancelled) setTunnelConflicts(null);
-      });
     api.config
       .endpointForceRouteReport()
       .then((next) => {
@@ -337,12 +327,7 @@ export function TunPage({ config, update, commit }: MobileSettingsPageProps): Re
           }
         />
       </SettingsGroup>
-      {/*
-        两块只读报告（桌面 `SettingsTun.tsx:550-551` 同一对）。成对出现是有理由的：
-        第一块问「**别人的**隧道与我撞不撞」，第二块问「**我自己的**几个组网节点之间撞不撞」。
-        两条都是「后端跑真判据、把结果读回来」，界面这一侧一条判据都不重算。
-      */}
-      <MobileTunnelConflictBlock report={tunnelConflicts} />
+      {/* Android/iOS 无法完整探测其他应用的 VPN 路由；这里只保留自己的组网结算。 */}
       <MobileEndpointForceRouteBlock report={forceRoute} servers={config.servers ?? []} />
     </>
   );

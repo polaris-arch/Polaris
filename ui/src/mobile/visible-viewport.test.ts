@@ -26,15 +26,22 @@ describe('mobile visible viewport', () => {
   it('follows an IME visual resize while the layout viewport and focused input remain unchanged', () => {
     const { style, viewport, input, win, start } = environment();
     const stop = start();
+    expect(style.getPropertyValue('--m-vv-occluded-bottom')).toBe('0px');
     viewport.height = 360;
     viewport.offsetTop = 40;
     viewport.dispatchEvent(new Event('resize'));
     expect(style.getPropertyValue('--m-vv-height')).toBe('360px');
     expect(style.getPropertyValue('--m-vv-top')).toBe('40px');
+    expect(style.getPropertyValue('--m-vv-occluded-bottom')).toBe('444px');
     expect([win.innerWidth, win.innerHeight]).toEqual([390, 844]);
     expect(win.document.activeElement).toBe(input);
     expect(input.focus).not.toHaveBeenCalled();
     expect(input.blur).not.toHaveBeenCalled();
+    viewport.height = 844.33;
+    viewport.offsetTop = 0;
+    viewport.dispatchEvent(new Event('resize'));
+    expect(style.getPropertyValue('--m-vv-occluded-bottom')).toBe('0px');
+    expect(style.getPropertyValue('--m-vv-height')).toBe('844.33px');
     stop();
   });
 
@@ -51,6 +58,7 @@ describe('mobile visible viewport', () => {
     win.dispatchEvent(new Event('resize'));
     expect(style.getPropertyValue('--m-vv-width')).toBe('320px');
     expect(style.getPropertyValue('--m-vv-top')).toBe('0px');
+    expect(style.getPropertyValue('--m-vv-occluded-bottom')).toBe('0px');
     stop();
   });
 
@@ -60,6 +68,7 @@ describe('mobile visible viewport', () => {
     viewport.scale = 2;
     viewport.dispatchEvent(new Event('resize'));
     expect(style.getPropertyValue('--m-vv-height')).toBe('');
+    expect(style.getPropertyValue('--m-vv-occluded-bottom')).toBe('');
     viewport.scale = 1;
     viewport.height = Number.NaN;
     viewport.dispatchEvent(new Event('resize'));
@@ -67,6 +76,7 @@ describe('mobile visible viewport', () => {
     viewport.height = 400;
     viewport.dispatchEvent(new Event('resize'));
     expect(style.getPropertyValue('--m-vv-height')).toBe('400px');
+    expect(style.getPropertyValue('--m-vv-occluded-bottom')).toBe('444px');
     stop();
   });
 
@@ -78,6 +88,7 @@ describe('mobile visible viewport', () => {
     expect(style.getPropertyValue('--m-vv-height')).toBe('77px');
     expect(style.getPropertyPriority('--m-vv-height')).toBe('important');
     expect(style.getPropertyValue('--m-vv-width')).toBe('');
+    expect(style.getPropertyValue('--m-vv-occluded-bottom')).toBe('');
     viewport.height = 300;
     viewport.dispatchEvent(new Event('resize'));
     viewport.dispatchEvent(new Event('scroll'));

@@ -41,6 +41,9 @@ body *::-webkit-scrollbar { display: none; }
    *    那是**刻意留的红** —— 扩白名单该是一次有记录的决策。故它住在这里，不住在 token 入口。
    */
   --font-scale: 1;
+  /* Overlay bottoms follow the visible viewport. Keep only the portion of
+     the native gesture inset still visible when IME covers the layout bottom. */
+  --m-overlay-safe-b: max(0px, calc(var(--safe-b) - var(--m-vv-occluded-bottom, 0px)));
 
   /*
    * 三个响应标量的 compact 缺省（`core.json` 的 `layout.responsive`）。
@@ -676,12 +679,12 @@ body {
 .m-lock-content {
   min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 14px; box-sizing: border-box; text-align: center;
-  padding: calc(var(--safe-t) + 24px) calc(var(--safe-r) + 24px) calc(var(--safe-b) + 24px) calc(var(--safe-l) + 24px);
+  padding: calc(var(--safe-t) + 24px) calc(var(--safe-r) + 24px) calc(var(--m-overlay-safe-b, var(--safe-b)) + 24px) calc(var(--safe-l) + 24px);
 }
 .m-select-panel {
   box-sizing: border-box; width: 100%; max-width: 640px; max-height: 82%; overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 12px calc(16px + var(--safe-r)) calc(12px + var(--safe-b)) calc(16px + var(--safe-l));
+  padding: 12px calc(16px + var(--safe-r)) calc(12px + var(--m-overlay-safe-b, var(--safe-b))) calc(16px + var(--safe-l));
   border-radius: 16px 16px 0 0;
   background: hsl(var(--surface)); box-shadow: var(--shadow-sheet); overflow-wrap: anywhere;
 }

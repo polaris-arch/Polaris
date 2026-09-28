@@ -96,7 +96,7 @@ import {
   speedTestErrorMessage,
 } from '@/components/screens/shared/speedtest-feedback';
 import { serverSwitchErrorText } from '@/domain/action-error-text';
-import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';
+import { mobileSwitchReceiptFeedback } from '../mobile-switch-feedback';
 import { IpcError } from '@/ipc';
 import { initialNodesTab } from '@/components/screens/nodes/initial-tab';
 import { meshSingletonConflict } from '@/domain/endpoint-routes';
@@ -247,8 +247,9 @@ export function MobileNodesScreen(): ReactElement {
       void runWrite(
         async () => {
           const receipt = await switchServer(row.server.id);
-          const feedback = switchReceiptFeedback(receipt, row.server.name, t);
+          const feedback = mobileSwitchReceiptFeedback(receipt, row.server.name, t);
           if (feedback) setNotice({ tone: feedback.tone === 'success' ? 'ok' : feedback.tone === 'warning' ? 'warn' : 'info', text: feedback.text });
+          else if (receipt.status === 'notRunning') setNotice(undefined);
         },
         (err) => serverSwitchErrorText(err instanceof IpcError ? err.code : undefined, t),
       );

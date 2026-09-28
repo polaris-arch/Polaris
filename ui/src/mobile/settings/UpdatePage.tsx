@@ -1,10 +1,10 @@
 /**
  * 设置 → 更新（移动端）。桌面对照：`components/screens/settings/SettingsUpdate.tsx`。
  *
- * # 两张更新卡按平台分叉（IA §4.5）
+ * # 应用更新卡按平台分叉（IA §4.5）
  *
  * 桌面有两张独立的卡：应用（`AppUpdateCard`）与内核（`CoreUpdateCard`，带分级更新、回滚、恢复出厂）。
- * 移动端两张都**不移植成可操作卡**，各有各的理由：
+ * 移动端只显示应用更新。内核更新没有独立于 APK 的对象：
  *
  *  · **内核**：移动端内核不是 sidecar 子进程，而是随应用进程载入的 libbox。
  *
@@ -14,19 +14,8 @@
  *    `runtime/proxy/process_supervision.rs:128 if cfg!(target_os = "android")`），
  *    `runtime/proxy/android_bridge.rs` 整模块 `#[cfg(target_os = "android")]`。
  *    ⇒ 桌面那套 `core_swap`（`<core>.bak` 原子替换可执行文件）在这个形态下**没有对象**：
- *    换内核 = 装一个新版本的应用。故这里不显示版本、不显示进度，也不该显示 —— 不是等一条腿，
- *    是这条腿在这个形态下不存在。文案 `mobileSettings.update.coreDesc` 已按这条改写。
- *
- *    🔴 **同批第二处改正：这一行的状态芯片原是 `mobileSettings.pending`（「待接线」/「Not wired」），
- *    与紧挨它的 desc 直接对撞。** 「待接线」读作「还没做、以后会有」，而 desc 说的是「这条腿在这个
- *    形态下不存在」。一行里两句互斥的话，比原来那句「形态未定」更坏 —— 后者至少与「待接线」并存。
- *    换成 `settings.dns.builtinTag`（「内置」/「Built-in」）：它是既有键、五语种齐，语义正是
- *    「随包提供、没有独立生命周期」，与本行形态逐字对应。**不新造键**的先例见
- *    `screens/rules/DnsSegment.tsx:107`（同一颗徽标跨命名空间借用）。
- *    另一条走不通的路记在这里免得下一个人再试：`versionApi.getInfo()` 的 `VersionInfo`
- *    （`ipc/api/updater.ts:5-15`）是 Electron 遗留形状，**没有 `coreVersion` 字段** ——
- *    想在这里显示内核版本要先像 `AboutPage.tsx:119 narrowVersionInfo` 那样自建窄化守卫，
- *    那是接线不是改文案，不在本批射程。
+ *    换内核 = 装一个新版本的应用。独立内核更新行即使只显示“内置”，也在可操作的更新卡里
+ *    暗示另一条能力；移动端直接不显示它，应用 APK 更新保持原样。
  *  · **应用**：Android 走 GitHub Releases 的 APK 分发。**2026-09-06（W-19）接上检查 + 显示 +
  *    打开发布页；2026-09-13（批 15）接上下载 → 交系统安装器那一跳**，四件事齐：
  *    检查 / 下载 / 交系统安装器 / 重装当前版本，外加「自动下载新版本」那一格。
@@ -97,7 +86,6 @@ import {
   SettingsGroup,
   SettingsNote,
   SettingsRow,
-  SettingsStatusRow,
 } from './SettingsChrome';
 import {
   appUpdateHint,
@@ -582,14 +570,6 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
               <option value="prerelease">{t('settings.update.appChannelPrerelease')}</option>
             </MobileSelect>
           }
-        />
-        {/* 状态芯片不是「待接线」：内核没有独立的更新腿可等（见头注）。「内置」说的是它的形态。 */}
-        <SettingsStatusRow
-          id="core-update"
-          label={t('mobileSettings.update.coreTitle')}
-          desc={t('mobileHelp.coreUpdate')}
-          descDetails={t('mobileSettings.update.coreDesc')}
-          status={t('settings.dns.builtinTag')}
         />
       </SettingsGroup>
 

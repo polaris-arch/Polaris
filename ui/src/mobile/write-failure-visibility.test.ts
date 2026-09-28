@@ -198,15 +198,6 @@ const READ_CALLS: readonly string[] = [
    */
   'api.config.endpointForceRouteReport',
   /*
-   * 外来隧道冲突报告（设置 → TUN 页那块只读报告，本批接线）。
-   *
-   * 与上一条同族、同理由：只读命令，挂载时拉一次，**没有用户在等回执**。拉不到的正确表现是
-   * 那一块自己说「读取失败，暂时拿不到这份报告」（`TunReports.tsx` 的 `report === null` 那一支），
-   * 而不是弹一条错误 —— 报告答不出来是这四态判别联合本来就允许的一档。
-   * 🔴 要紧的是它**不许**被折成「无冲突」：那一支只属于 `status === 'probed'` 且 `conflicts` 为空。
-   */
-  'api.config.tunnelConflictReport',
-  /*
    * 已装应用枚举（自定义应用表单的包名选择器，批 16）。只读命令，挂载时拉一次，
    * **没有用户在等回执**：它不是按下某颗控件触发的。读不到的正确表现是那一格自己说
    * 「读不到这台设备的已安装应用清单」（`AppAddPanel` 的 `appsFailed` 那一支）+ 表照样能提交

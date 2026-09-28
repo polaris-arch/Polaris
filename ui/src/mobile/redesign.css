@@ -285,7 +285,7 @@
 .m-form-head { min-height: 52px; padding: 0; }
 .m-form-title { font-size: 1.125rem; }
 .m-form-body { padding: 12px 0 20px; gap: 12px; }
-.m-form-foot { min-height: 58px; padding: 6px 0 calc(6px + var(--safe-b)); }
+.m-form-foot { min-height: 58px; padding: 6px 0 calc(6px + var(--m-overlay-safe-b, var(--safe-b))); }
 .m-form-btn { position: relative; isolation: isolate; border-color: transparent; background: transparent; min-height: var(--mobile-tap); font-size: var(--mobile-control-font); }
 .m-form-btn::before { content: ''; position: absolute; z-index: -1; inset: 5px 0; border: 1px solid hsl(var(--line)); border-radius: 8px; background: hsl(var(--surface-2)); }
 .m-form-btn.primary { background: transparent; color: #00141d; box-shadow: none; }

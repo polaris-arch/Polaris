@@ -1571,9 +1571,9 @@ describe('⑨ 能力缺席：该缺的块整块不画，不画成禁用（§4.2 
     expect(SOURCE_TEXT).toContain('autoConnect');
   });
 
-  it('更新：不显示假版本、假进度，内核那一行说明它随包内置（§4.5）', () => {
-    expect(MARKUP.update).toContain(copy('mobileSettings.update.coreTitle'));
-    expect(MARKUP.update).toContain(copy('mobileHelp.coreUpdate'));
+  it('更新：只保留真实 APK 更新入口，不显示独立内核更新或假版本', () => {
+    expect(rows(MARKUP.update).some((r) => r.id === 'core-update')).toBe(false);
+    expect(MARKUP.update).not.toContain(copy('settings.dns.builtinTag'));
     expect(switchRows(MARKUP.update)).toEqual([...EXPECTED_SWITCHES.update]);
     /*
      * 版本不是编的：fixture 下 `versionApi` 的 effect 不跑 ⇒ 应用那一行的芯片只能是 `—`。
@@ -1586,9 +1586,6 @@ describe('⑨ 能力缺席：该缺的块整块不画，不画成禁用（§4.2 
     const chip = rows(MARKUP.update).filter((r) => r.id === 'app-update');
     expect(chip.length, '应用更新那一行不见了').toBeGreaterThan(0);
     expect(chip.map((r) => r.chunk).join(''), '应用版本那一格冒出了一个假版本号').toContain('—');
-    expect(MARKUP.update, '内核那一行的状态芯片应说明它随包内置').toContain(
-      copy('settings.dns.builtinTag'),
-    );
     /*
      * 🔴 **下载 / 安装那一跳 2026-09-13（批 15）接上了**，这一条因此换了对象：
      * 从「不许画那两个阶段」换成「画出来的必须是 Android 真有的那条腿」。

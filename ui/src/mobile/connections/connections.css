@@ -781,7 +781,7 @@
   display: flex;
   flex-direction: column;
   gap: var(--sp-1);
-  padding: var(--sp-2) calc(var(--page-inset) + var(--safe-r)) calc(var(--sp-4) + var(--safe-b)) calc(var(--page-inset) + var(--safe-l));
+  padding: var(--sp-2) calc(var(--page-inset) + var(--safe-r)) calc(var(--sp-4) + var(--m-overlay-safe-b, var(--safe-b))) calc(var(--page-inset) + var(--safe-l));
   border-radius: var(--r-lg) var(--r-lg) 0 0;
   background: hsl(var(--surface));
   box-shadow: var(--shadow-pop);

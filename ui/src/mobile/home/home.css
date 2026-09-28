@@ -656,7 +656,7 @@
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: var(--sp-4);
-  padding-bottom: calc(var(--sp-4) + var(--safe-b));
+  padding-bottom: calc(var(--sp-4) + var(--m-overlay-safe-b, var(--safe-b)));
   padding-left: calc(var(--sp-4) + var(--safe-l));
   padding-right: calc(var(--sp-4) + var(--safe-r));
   box-sizing: border-box;

@@ -103,7 +103,7 @@ import { openMobileForm } from '../forms/form-store';
 import { protocolLabel } from '@/components/screens/nodes/nodes-logic';
 import { HomeScreenView, RULE_ACTION_KEY } from './HomeScreenView';
 import { useHomeSpeedTest } from './use-home-speed-test';
-import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';
+import { mobileSwitchReceiptFeedback } from '../mobile-switch-feedback';
 import { toast } from '@/lib/error-handler';
 import { navigateMobile } from '../navigate';
 import type {
@@ -527,7 +527,7 @@ export function MobileHomeScreen(): ReactElement {
       }
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(server.id);
-        const feedback = switchReceiptFeedback(receipt, server.name, t);
+        const feedback = mobileSwitchReceiptFeedback(receipt, server.name, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);
         else if (feedback) toast.info(feedback.text);
@@ -552,7 +552,7 @@ export function MobileHomeScreen(): ReactElement {
       void runWrite('switch-node', async () => {
         if (kind === 'block') return update({ selectedServerId: id });
         const receipt = await switchServer(DIRECT_SERVER_ID);
-        const feedback = switchReceiptFeedback(receipt, t('home.routingDirect'), t);
+        const feedback = mobileSwitchReceiptFeedback(receipt, t('home.routingDirect'), t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);
         else if (feedback) toast.info(feedback.text);

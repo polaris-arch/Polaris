@@ -12,7 +12,7 @@
  * 移动根把 visualViewport 几何发布给这一层：新版 WebView 的 IME 可以只缩可见视口，
  * 不缩布局视口。百分比高度在这份可见边界内解析；API 缺席时仍按布局视口回退。
  *
- * 三段式里只有中间那段滚（`.m-form-body`）。脚（`.m-form-foot`）是 sticky 且吃掉手势条安全区：
+ * 三段式里只有中间那段滚（`.m-form-body`）。脚（`.m-form-foot`）是 sticky 且保留可见的手势条安全区：
  * 一张 30 个字段的节点表单，提交键跟着内容滚到看不见的地方等于没有提交键。
  */
 
@@ -144,9 +144,10 @@
   bottom: 0;
   display: flex;
   gap: var(--sp-2);
-  padding: var(--sp-2) 0 calc(var(--sp-2) + var(--safe-b));
+  padding: var(--sp-2) 0 calc(var(--sp-2) + var(--m-overlay-safe-b, var(--safe-b)));
   border-top: 1px solid hsl(var(--hair));
-  background: hsl(var(--surface));
+  /* Match the actual panel surface, including the bottom safe-area fill in dark mode. */
+  background: hsl(var(--mobile-sheet, var(--surface)));
   flex: none;
 }
 
@@ -179,7 +180,7 @@
 .m-info-trigger:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
 .m-info-icon-only > .m-info-trigger { margin: 0; }
 .m-info-layer { z-index: 70; }
-.m-info-layer .m-info-body { padding-bottom: calc(16px + var(--safe-b)); font-size: .875rem; line-height: 1.5; }
+.m-info-layer .m-info-body { padding-bottom: calc(16px + var(--m-overlay-safe-b, var(--safe-b))); font-size: .875rem; line-height: 1.5; }
 .m-info-body p { margin: 0; overflow-wrap: anywhere; }
 .m-info-body section { display: flex; flex-direction: column; gap: 4px; }
 .m-info-body h3 { margin: 0; font-size: .875rem; line-height: 1.4; font-weight: 600; }

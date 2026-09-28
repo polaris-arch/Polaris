@@ -931,6 +931,19 @@ const REPO_DIR = fileURLToPath(new URL('../../../', import.meta.url));
  */
 const DISPOSITIONS: readonly DispositionEntry[] = [
   {
+    id: 'control:mobile/forms/RuleFormPanel.tsx:const-true-disabled:4a3a57b1#1',
+    face: 'control',
+    kind: 'platform-absent',
+    evidence:
+      'Android/iOS 不能运行提权 DHCP 探测。仅为从其它平台导入的存量 DHCP 规则保留当前选项回显和纠正路径；' +
+      '该选项禁选，新建首帧已过滤，用户可改选受支持的动作。',
+    anchors: [
+      { file: 'crates/config-engine/src/builder/network_env.rs', mustContain: 'Platform::Android | Platform::Ios => false,' },
+      { file: 'ui/src/mobile/forms/RuleFormPanel.tsx', mustContain: "? [{ ...option, disabled: true, description: tr('mobileRules.networkProfile.reasonDhcpNoPermission') }]" },
+    ],
+    reviewed: '2026-09-28',
+  },
+  {
     id: 'register:batch:move-to-group',
     face: 'register',
     // 2026-09-25 从 `platform-absent` 改判（盘点 §4.4「标签不准」）：缺的是数据模型，不是平台 —— 理由自己就这么写。
@@ -1145,11 +1158,8 @@ const DEBT: readonly FaceItem[] = ALL_FACE_ITEMS.filter((item) => !DISPOSITION_I
  *   `privacyMode` 当年也从那一档改判回 `absent`（Android 上隐私锁并非不可实现），批 5 真的接上了。
  *
  *   **A. 真的接上了（10 条，能力 + 接在哪）**
- *   ① `block:TunnelConflictBlock` + ② `block:Warn` —— 「本机其它隧道与 Polaris 争不争同一网段」
- *      四态报告移植进 TUN 页：`mobile/settings/TunReports.tsx#MobileTunnelConflictBlock`，
- *      拉取在 `TunPage.tsx` 的 `api.config.tunnelConflictReport()`。
- *      🔴 Android 上 `probe_foreign_tunnels` 答 `Unsupported` ⇒ 界面恒显「判定未进行」而**不是**
- *      「无冲突」—— 那一句谎正是这块要终结的东西，逐态由 `TunReports.test.tsx ①` 钉着。
+ *   ① `block:TunnelConflictBlock` 在 Android/iOS 恒 Unsupported，按用户裁定不再显示或拉取；
+ *      不把 Unsupported 解释为无冲突。② `block:Warn` 仍由真实 endpoint 结算告警消费。
  *   ③ `block:EndpointForceRouteBlock` + ④ `block:Block` —— 「谁把谁的组网网段吃掉了」结算块
  *      （含被吃干净时点名到节点）：`TunReports.tsx#MobileEndpointForceRouteBlock`，
  *      拉取同上一条（`endpoint_force_route_report`，节点屏与规则屏早就在消费同一份）。

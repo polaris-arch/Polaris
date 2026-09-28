@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { chromium, type Browser } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -29,7 +30,8 @@ const defaults=new Set(['items']);
 const groups=[{id:'items',label:'Choices',options:options.map(option=>({value:option.id,label:option.label}))}];
 function App(){
  const [open,setOpen]=useState(false),[value,setValue]=useState('32'),[formClosed,setFormClosed]=useState(false);
- return <><MobileShell active="home" onSelect={()=>{}} toastHost={<MobileToaster/>}><p>Screen fixture</p></MobileShell>{formClosed?<p>Form closed</p>:<FormSheet title="Editing fixture" closeLabel="Close form" cancelLabel="Cancel edit" onRequestClose={()=>setFormClosed(true)}>
+ return <><MobileShell active="home" onSelect={()=>{}} toastHost={<MobileToaster/>}><p>Screen fixture</p></MobileShell>{formClosed?<p>Form closed</p>:<FormSheet title="Editing fixture" closeLabel="Close form" cancelLabel="Cancel edit" submitLabel="Save" onSubmit={()=>{}} onRequestClose={()=>setFormClosed(true)}>
+  <input aria-label="Fixture text" />
   <MobileSelect aria-label="Simple choice" value={value} onChange={event=>setValue(event.currentTarget.value)}>{options.map(option=><option key={option.id} value={option.id}>{option.label}</option>)}</MobileSelect>
   <SelectSheetTrigger label="Grouped choice" value={value} options={options} open={open} onOpen={()=>setOpen(true)}/>
   <SelectSheetPanel label="Grouped choice" value={value} groups={groups} openGroupIds={defaults} open={open} onClose={()=>setOpen(false)} onSelect={id=>{setValue(id);setOpen(false);}} closeLabel="Close choice" note={<MobileInfo title="Choice explanation" summary="Short explanation" details={<p>Complete explanation</p>}/>}/>
@@ -76,7 +78,14 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('shared sheet focus in
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } }); await page.goto(origin + '/__sheet-focus');
     const trigger = page.getByRole('button', { name: 'Grouped choice', exact: true }); await trigger.click();
     await page.waitForFunction(() => document.activeElement?.getAttribute('aria-selected') === 'true');
-    const panel = page.locator('.mr-sheet'), info = panel.locator('.m-info-trigger'); await info.click();
+    const panel = page.locator('.mr-sheet'), info = panel.locator('.m-info-trigger');
+    const output = path.resolve(root, '../output/playwright'); mkdirSync(output, { recursive: true });
+    await panel.evaluate(el => { el.scrollTop = 0; });
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
+    await page.screenshot({ path: path.join(output, 'mobile-info-light-390.png') });
+    await page.evaluate(() => { document.documentElement.dataset.theme = 'dark'; });
+    await page.screenshot({ path: path.join(output, 'mobile-info-dark-390.png') });
+    await info.click();
     const detail = page.locator('.m-info-layer'); await detail.waitFor();
     await page.evaluate(() => (window as any).__sheetToast());
     const message = page.locator('.m-toast-close'); await message.waitFor();
@@ -95,5 +104,50 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('shared sheet focus in
     await trigger.click(); await page.waitForFunction(() => document.activeElement?.getAttribute('aria-selected') === 'true');
     await page.evaluate(() => (window as any).__sheetBack()); await panel.waitFor({ state: 'detached' });
     expect(await trigger.evaluate(el => el === document.activeElement)).toBe(true); await page.close();
+  }, 30_000);
+  it('keeps the footer within the visible viewport, with only the remaining gesture inset above IME', async () => {
+    const output = path.resolve(root, '../output/playwright'); mkdirSync(output, { recursive: true });
+    for (const [width, height, fontScale] of [[390, 844, 1], [320, 400, 2], [768, 700, 1]] as const) {
+      const page = await browser.newPage({ viewport: { width, height }, deviceScaleFactor: 2 });
+      await page.goto(origin + '/__sheet-focus');
+      await page.locator('.m-form-foot').waitFor();
+      await page.evaluate(({ height, fontScale }) => {
+        const root = document.documentElement;
+        root.dataset.theme = 'dark'; root.style.setProperty('--safe-t', '32px');
+        root.style.setProperty('--safe-b', '20px'); root.style.setProperty('--font-scale', String(fontScale));
+        root.style.setProperty('--m-vv-height', `${height}px`);
+        root.style.setProperty('--m-vv-occluded-bottom', '0px');
+      }, { height, fontScale });
+      const geometry = async () => page.evaluate(() => {
+        const panel = document.querySelector<HTMLElement>('.m-form-panel')!;
+        const foot = document.querySelector<HTMLElement>('.m-form-foot')!;
+        const body = document.querySelector<HTMLElement>('.m-form-body')!;
+        return {
+          panel: panel.getBoundingClientRect().toJSON(), foot: foot.getBoundingClientRect().toJSON(),
+          body: body.getBoundingClientRect().toJSON(), paddingBottom: parseFloat(getComputedStyle(foot).paddingBottom),
+          panelBg: getComputedStyle(panel).backgroundColor, footBg: getComputedStyle(foot).backgroundColor,
+          docWidth: document.documentElement.scrollWidth,
+        };
+      });
+      const normal = await geometry();
+      expect(normal.panelBg, `${width} panel/footer background`).toBe(normal.footBg);
+      expect(normal.paddingBottom, `${width} gesture inset`).toBe(26);
+      expect(normal.foot.bottom, `${width} footer within panel`).toBeLessThanOrEqual(normal.panel.bottom + 0.5);
+      expect(normal.docWidth, `${width} horizontal overflow`).toBeLessThanOrEqual(width);
+      if (width === 390) await page.screenshot({ path: path.join(output, 'mobile-footer-dark-before-ime-390.png') });
+      await page.getByRole('textbox', { name: 'Fixture text' }).focus();
+      await page.evaluate(({ height }) => {
+        document.documentElement.style.setProperty('--m-vv-height', `${height}px`);
+        document.documentElement.style.setProperty('--m-vv-occluded-bottom', '362px');
+      }, { height: Math.max(240, Math.round(height * .6)) });
+      const ime = await geometry();
+      expect(ime.paddingBottom, `${width} covered inset`).toBe(6);
+      expect(ime.foot.bottom, `${width} footer in visible panel`).toBeLessThanOrEqual(ime.panel.bottom + 0.5);
+      expect(ime.body.height, `${width} scrollable form body`).toBeGreaterThan(0);
+      expect(await page.getByRole('textbox', { name: 'Fixture text' }).evaluate(el => el === document.activeElement)).toBe(true);
+      if (width === 390) await page.screenshot({ path: path.join(output, 'mobile-footer-dark-ime-390.png') });
+      if (width === 320) await page.screenshot({ path: path.join(output, 'mobile-footer-dark-font2-320.png') });
+      await page.close();
+    }
   }, 30_000);
 });

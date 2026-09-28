@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 
-const PROPERTIES = ['--m-vv-height', '--m-vv-width', '--m-vv-top', '--m-vv-left'] as const;
+const PROPERTIES = ['--m-vv-height', '--m-vv-width', '--m-vv-top', '--m-vv-left', '--m-vv-occluded-bottom'] as const;
 
 /** IME can resize only the visual viewport. Publish geometry once, without touching focus or state. */
 export function installMobileVisibleViewport(win: Window, root: HTMLElement): () => void {
@@ -27,7 +27,14 @@ export function installMobileVisibleViewport(win: Window, root: HTMLElement): ()
       restore();
       return;
     }
-    const values = [height, width, Math.max(0, offsetTop), Math.max(0, offsetLeft)];
+    // Native --safe-b describes the layout viewport's gesture area. When IME
+    // obscures its bottom, an overlay docked to the visual viewport must not
+    // reserve that same area above the keyboard a second time.
+    const visibleTop = Math.max(0, offsetTop);
+    const layoutBottom = Number.isFinite(win.innerHeight) && win.innerHeight > 0
+      ? win.innerHeight : visibleTop + height;
+    const occludedBottom = Math.max(0, layoutBottom - (visibleTop + height));
+    const values = [height, width, visibleTop, Math.max(0, offsetLeft), occludedBottom];
     PROPERTIES.forEach((name, index) => {
       const value = `${values[index]}px`;
       if (root.style.getPropertyValue(name) !== value) root.style.setProperty(name, value);

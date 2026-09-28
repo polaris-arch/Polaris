@@ -950,16 +950,15 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     {
       id: 'TunnelConflictBlock',
       disposition: {
-        kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'export function MobileTunnelConflictBlock(' },
+        kind: 'platform-absent',
+        evidence: {
+          file: 'crates/system-integration/src/route_probe.rs',
+          mustContain: 'Platform::Android | Platform::Ios => Ok(TunnelProbeOutcome::Unsupported(self.platform))',
+        },
       },
       note:
-        '「本机其它隧道与 Polaris 争不争同一网段」报告块。2026-09-13 移植进 TUN 页，四态一支不折：' +
-        '后端命令 `tunnel_conflict_report` 早就在移动端注册（`lib.rs:1136`），Android 侧 ' +
-        '`probe_foreign_tunnels` 今天答 `Unsupported` ⇒ 手机上恒走「本平台没有探测实现，判定未进行」那一支。' +
-        '🔴 **这正是要移植它的理由**：把「没探成」画成一句自信的「无冲突」，比什么都不显示更坏 ——' +
-        '用户会据此排除掉真正的病因（2026-09-08 报障那台 macOS 的原样形态）。' +
-        '故这一块在 Android 上今天只说一句「判定未进行」，而它恰恰是这句话第一次对用户可见。',
+        'Android/iOS 的外来隧道路由探测恒返回 Unsupported。用户裁定移动端不显示恒无能力报告；' +
+        '不是 Probed/无冲突，也不再发这笔无意义请求。桌面保留完整四态。',
     },
     {
       id: 'Warn',

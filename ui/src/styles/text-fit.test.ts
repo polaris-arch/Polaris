@@ -1281,19 +1281,18 @@ describe('⓪ 取材面：移动端每一份 CSS 都必须在面内（新增一�
    *
    * ⚠️ **2026-09-05：设置屏长出了第一份 `.css`**（`settings/settings.css`，K5-02 的两列列流）。
    * 上面那条恰等断言当场红了 —— 记号如期过期，已连同 `CSS_FILES` 一起登记。
-   * 但那份 CSS **只装列流那一条**（`column-count` 与 `@container` 内联表达不了），
-   * 行几何仍然全部在内联常量里 ⇒ 上面那段「≈162px 没人量」的登记原样有效，一个字都不改。
-   * 下面那条断言随之改判：从「设置屏没有 .css」改成「设置屏那份 .css 的射程只到列流」，
-   * 哪天有人把行几何搬进去，它当场红，逼人把上面那段登记重写成真判据。
+   * 这份 CSS 如今还装独立的网段报告展开明细；它不改设置行本身的几何。
+   * 下面将两族选择器分开核对，设置行几何一旦搬进 CSS，≈162px 的登记仍会红。
    */
-  it('自曝：设置屏的**行几何**仍走内联样式（`settings.css` 的射程只到两列列流）', () => {
+  it('自曝：设置行几何仍走内联；网段明细独立于设置行', () => {
     expect(
       mobileCssOnDisk().filter((f) => f.startsWith('../mobile/settings/')),
       '设置屏的 CSS 不止一份 —— 下面那段射程声明要重写',
     ).toEqual(['../mobile/settings/settings.css']);
-    const props = [
-      ...new Set(ctxOf('../mobile/settings/settings.css').decls.map((d) => d.prop)),
-    ].sort();
+    const declarations = ctxOf('../mobile/settings/settings.css').decls;
+    const details = declarations.filter((d) => d.sels.every((sel) => sel.startsWith('.ms-force-')));
+    expect(details.length, '网段明细 CSS 不在本面，选择器分组失效').toBeGreaterThan(0);
+    const props = [...new Set(declarations.filter((d) => !details.includes(d)).map((d) => d.prop))].sort();
     expect(
       props,
       '`settings.css` 声明的属性集变了 —— 它一旦开始装行几何（padding / min-height / font-size…），' +
@@ -3524,7 +3523,7 @@ const npSources = () =>
 const NPM = 'rules.networkProfile.';
 const NP_FORM_LABELS = ['name', 'cidrs', 'domains', 'probe', 'enabled', 'ruleField'].map((k) => NPM + k);
 const NP_FORM_HINTS = [
-  ...['criteriaHint', 'cidrsHint', 'domainsHint', 'probeHint', 'enabledHint', 'ruleFieldHint', 'probePending', 'probeUnknown'].map(
+  ...['criteriaHint', 'cidrsHint', 'domainsHint', 'enabledHint', 'ruleFieldHint', 'probePending', 'probeUnknown'].map(
     (k) => NPM + k,
   ),
 ];
@@ -3560,12 +3559,12 @@ describe('S19 移动端网络场景（compact 390px 参考视口，五语种）'
 
   it('本节量的键真的在移动端源码里被消费、且五语齐备', () => {
     const all = npSources();
-    for (const k of [...NP_FORM_LABELS, ...NP_FORM_HINTS, ...NP_FORM_ERRS, ...NP_SEG, ...NP_MOBILE_REASONS, NPM + 'probeUses', NPM + 'probeUnavailable', NPM + 'refs', 'mobileRules.networkProfile.intro'])
+    for (const k of [...NP_FORM_LABELS, ...NP_FORM_HINTS, ...NP_FORM_ERRS, ...NP_SEG, ...NP_MOBILE_REASONS, NPM + 'probeUses', NPM + 'probeUnavailable', NPM + 'refs', 'mobileRules.networkProfile.intro', 'mobileHelp.profileProbeDetails'])
       expect(all.includes(`'${k}'`), `移动端已不再消费 ${k} —— 本节在量死键`).toBe(true);
     // 正面：探测方式三段真的是 `.m-form-seg`（换成别的控件，本节的几何链就量错了对象）。
     expect(npForm()).toContain('className="m-form-seg"');
     for (const loc of LOCALES)
-      for (const k of [...NP_FORM_LABELS, ...NP_FORM_HINTS, ...NP_FORM_ERRS, ...NP_SEG, ...NP_MOBILE_REASONS, 'mobileRules.networkProfile.intro', 'mobileRules.networkProfile.listEmpty'])
+      for (const k of [...NP_FORM_LABELS, ...NP_FORM_HINTS, ...NP_FORM_ERRS, ...NP_SEG, ...NP_MOBILE_REASONS, 'mobileRules.networkProfile.intro', 'mobileRules.networkProfile.listEmpty', 'mobileHelp.profileProbeDetails'])
         expect(DICT[loc][k], `${loc} 缺键 ${k}`).toBeTruthy();
   });
 
