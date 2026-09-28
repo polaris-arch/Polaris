@@ -63,15 +63,21 @@ async fn ask_save_path(app: &AppHandle, default_name: &str) -> Option<FilePath> 
 async fn ask_open_path(app: &AppHandle) -> Option<FilePath> {
     let lang = crate::i18n::app_lang(app);
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
+    let picker = app
+        .dialog()
         .file()
-        .set_title(t(lang, key::NATIVE_BACKUP_IMPORT_TITLE))
+        .set_title(t(lang, key::NATIVE_BACKUP_IMPORT_TITLE));
+    // Android dialog 把已知扩展转成 MIME、丢弃未知扩展和 "*"；保留 json
+    // filter 会把本应用导出的 .polaris-backup 从系统选择器里隐藏。无 filter
+    // 时插件明确使用 */*；文件正文仍由 parse_backup_content 校验。
+    #[cfg(not(target_os = "android"))]
+    let picker = picker
         .add_filter(t(lang, key::NATIVE_BACKUP_FILE_TYPE), &["polaris-backup"])
         .add_filter(t(lang, key::NATIVE_JSON_FILE_TYPE), &["json"])
-        .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"])
-        .pick_file(move |p| {
-            let _ = tx.send(p);
-        });
+        .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"]);
+    picker.pick_file(move |p| {
+        let _ = tx.send(p);
+    });
     rx.await.ok().flatten()
 }
 

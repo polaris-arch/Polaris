@@ -1523,18 +1523,23 @@ pub async fn local_import_pick_file(window: WebviewWindow) -> ApiResponse<Value>
 
     let lang = crate::i18n::app_lang(window.app_handle());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    window
+    let picker = window
         .dialog()
         .file()
-        .set_title(t(lang, key::NATIVE_CONFIG_PICK_TITLE))
+        .set_title(t(lang, key::NATIVE_CONFIG_PICK_TITLE));
+    // Android dialog 将可识别扩展转成 MIME 后会丢弃 "*"：未知 MIME 的
+    // .conf 等合法配置会在系统选择器里不可见。无 filter 时为 */*；
+    // 读取仍受下方 10MB 上限约束，格式仍由 local_import_parse 校验。
+    #[cfg(not(target_os = "android"))]
+    let picker = picker
         .add_filter(
             t(lang, key::NATIVE_CONFIG_FILE_TYPE),
             &["json", "yaml", "yml", "txt", "conf"],
         )
-        .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"])
-        .pick_file(move |p| {
-            let _ = tx.send(p);
-        });
+        .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"]);
+    picker.pick_file(move |p| {
+        let _ = tx.send(p);
+    });
     // 不再 `.and_then(|p| p.into_path().ok())`（W-18）：Android SAF 交回 `FilePath::Url(content://…)`，
     // `into_path()` 对它恒 Err ⇒ 被吃成 None ⇒ 与「用户取消」不可分。句柄怎么开由
     // `commands::picked_file` 按目标形态分派，桌面那条仍是同一个文件的同一个句柄。
