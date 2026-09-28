@@ -36,7 +36,6 @@ import { subAutoUpdateNoticeKey, subAutoUpdateNoticeMode, subEffectiveIntervalHo
 import { useAppStore, useEffectiveConfig } from '@/store/app-store';
 import { toast } from '@/lib/error-handler';
 import {
-  subscriptionCreateTerminalNeedsAnnouncement,
   useSubscriptionCreateOperationStore,
 } from '@/store/subscription-create-operation-store';
 import { isSubscriptionUrl } from '@/components/dialogs/sub-url';
@@ -92,7 +91,7 @@ export function SubFormPanel({
   const loadConfig = useAppStore((s) => s.loadConfig);
   const startCreate = useSubscriptionCreateOperationStore((s) => s.start);
   const clearTerminal = useSubscriptionCreateOperationStore((s) => s.clearTerminal);
-  const markTerminalHandled = useSubscriptionCreateOperationStore((s) => s.markTerminalHandled);
+  const claimTerminalAnnouncement = useSubscriptionCreateOperationStore((s) => s.claimTerminalAnnouncement);
 
   const base = subId === undefined ? undefined : config?.subscriptions?.find((s) => s.id === subId);
   const isEdit = base !== undefined;
@@ -163,19 +162,16 @@ export function SubFormPanel({
          水合时这次成功的创建才捞得回来。清在 `hasInstance` 之前等于把它永久丢掉（桌面
          同一处的注释逐字写着这条）。 */
       if (!hasInstance(instanceId)) return;
-      const shouldToast = subscriptionCreateTerminalNeedsAnnouncement(
-        useSubscriptionCreateOperationStore.getState().handledTerminalRevisions[snapshot.operationId], snapshot,
-      );
-      if (shouldToast) markTerminalHandled(snapshot.operationId, snapshot.revision);
-      clearTerminal(snapshot.operationId);
       onAdded?.(createdId);
+      const shouldToast = claimTerminalAnnouncement(snapshot.operationId, snapshot.revision);
+      clearTerminal(snapshot.operationId);
       closeInstance(instanceId);
       if (shouldToast) toast.success(t(partial ? 'sub.addedPartial' : 'sub.added'));
     })().catch((err: unknown) => {
       console.error('[mobile-sub-form] completion refresh failed:', err);
       setNotice({ tone: 'err', text: t('common.configLoadFail') });
     });
-  }, [snapshot, clearTerminal, markTerminalHandled, loadConfig, hasInstance, instanceId, onAdded, closeInstance, t]);
+  }, [snapshot, clearTerminal, claimTerminalAnnouncement, loadConfig, hasInstance, instanceId, onAdded, closeInstance, t]);
 
   const requestClose = (): void => {
     /* 创建进行中不许关：终态之后的发布（强刷 + 切 tab）要回到这一层来做。 */
@@ -488,10 +484,7 @@ export function SubCreateTaskPanel({
   const snapshot = useSubscriptionCreateOperationStore((s) => s.snapshots[operationId] ?? null);
   const cancel = useSubscriptionCreateOperationStore((s) => s.cancel);
   const clearTerminal = useSubscriptionCreateOperationStore((s) => s.clearTerminal);
-  const markTerminalHandled = useSubscriptionCreateOperationStore((s) => s.markTerminalHandled);
-  const terminalHandledRevision = useSubscriptionCreateOperationStore(
-    (s) => s.handledTerminalRevisions[operationId],
-  );
+  const claimTerminalAnnouncement = useSubscriptionCreateOperationStore((s) => s.claimTerminalAnnouncement);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const [cancelling, setCancelling] = useState(false);
   const [settling, setSettling] = useState(false);
@@ -521,7 +514,6 @@ export function SubCreateTaskPanel({
     if (snapshot.phase !== 'succeeded' || !snapshot.result) return; // failed：原因常驻在面板里
     const createdId = snapshot.result.subscription.id;
     const partial = snapshot.result.partial === true;
-    const shouldToast = subscriptionCreateTerminalNeedsAnnouncement(terminalHandledRevision, snapshot);
     setSettling(true);
     void (async () => {
       await loadConfig(true);
@@ -540,7 +532,7 @@ export function SubCreateTaskPanel({
       /* 面板已经不在了 ⇒ **不清终态**：留给下一次水合重试发布（同桌面
          `subscriptionCreatePublicationCanFinalize`）。少一条成功回执可以接受，少一次发布不行。 */
       if (!hasInstance(instanceId)) return;
-      if (shouldToast) markTerminalHandled(operationId, snapshot.revision);
+      const shouldToast = claimTerminalAnnouncement(operationId, snapshot.revision);
       clearTerminal(operationId);
       closeInstance(instanceId);
       if (shouldToast) toast.success(t(partial ? 'sub.addedPartial' : 'sub.added'));
@@ -555,13 +547,12 @@ export function SubCreateTaskPanel({
   }, [
     snapshot,
     publishAttempt,
-    terminalHandledRevision,
     clearTerminal,
     closeInstance,
     hasInstance,
     instanceId,
     loadConfig,
-    markTerminalHandled,
+    claimTerminalAnnouncement,
     operationId,
     t,
   ]);

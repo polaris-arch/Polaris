@@ -136,6 +136,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useAppStore.dnsRules', role: 'state', disposition: fed(CONFIG_FED), note: 'DNS 规则扁平镜像。' },
   { id: 'useAppStore.selectedServerId', role: 'state', disposition: fed(CONFIG_FED), note: '当前出口 id。' },
   { id: 'useEffectiveConfig.*', role: 'state', disposition: fed(CONFIG_FED), note: '磁盘配置叠加暂存差集后的**生效**视图。两个上游（配置镜像 + 暂存表）各自的写入方都在本表里。' },
+  { id: 'useEffectiveConfig.subscriptions', role: 'state', disposition: fed(CONFIG_FED), note: '订阅表单读取生效视图中的订阅列表，配置加载及暂存差集负责更新。' },
   { id: 'useEffectiveConfig.desktopNotifications', role: 'state', disposition: fed(CONFIG_FED), note: '通知总开关的生效值（`app-wiring` 拿它同步给通知出口）。' },
   { id: 'useEffectiveServers.*', role: 'state', disposition: fed(CONFIG_FED), note: '节点的生效视图，同上。' },
 
@@ -151,8 +152,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useStagedConfigStore.revert', role: 'action', disposition: fed({ file: 'ui/src/mobile/nodes/node-deletion.ts', mustContain: 'splitStagedOnly' }), note: '删除编排里的暂存回退那一段（复用桌面同一条腿）。' },
   { id: 'useSubscriptionCreateOperationStore.start', role: 'action', disposition: fed({ file: 'ui/src/mobile/forms/SubFormPanel.tsx', mustContain: 'startCreate(' }), note: '发起订阅创建。' },
   { id: 'useSubscriptionCreateOperationStore.snapshots', role: 'state', disposition: fed({ file: 'ui/src/mobile/app-wiring.ts', mustContain: 'void subscribeAndHydrateSubscriptionCreateOperations()' }), note: '创建进度快照。2026-09-25 ζ 批 A8 起写入方是**应用级**订阅 + list 水合（此前表单在自己生命期内订阅，表单关掉 / 进程被回收之后就没人写了）；表单与恢复面 SubCreateTaskPanel 都只读。' },
-  { id: 'useSubscriptionCreateOperationStore.handledTerminalRevisions', role: 'state', disposition: fed({ file: 'ui/src/mobile/forms/SubFormPanel.tsx', mustContain: 'markTerminalHandled(operationId, snapshot.revision)' }), note: '终态回执已播报到哪一版（跨 WebView 重建持久化）。恢复面据此决定成功 toast 只播一次（ζ 批 A8）。' },
-  { id: 'useSubscriptionCreateOperationStore.markTerminalHandled', role: 'action', disposition: fed({ file: 'ui/src/store/subscription-create-operation-store.ts', mustContain: 'markTerminalHandled:' }), note: '记下某次终态已播报。恢复面在发布确认之后才记（面板没了就不记，留给下次水合）。' },
+  { id: 'useSubscriptionCreateOperationStore.claimTerminalAnnouncement', role: 'action', disposition: fed({ file: 'ui/src/store/subscription-create-operation-store.ts', mustContain: 'claimTerminalAnnouncement:' }), note: '发布确认后原子认领终态回执；并发的普通表单和恢复面只有一方能显示 Toast，清终态后不能重播。' },
   { id: 'useSubscriptionCreateOperationStore.cancel', role: 'action', disposition: fed({ file: 'ui/src/store/subscription-create-operation-store.ts', mustContain: 'cancel: async' }), note: '恢复面的「取消添加」（叠确认）。只有终态 cancelled 帧才关面板。' },
   { id: 'useTaildropTaskStore.tasks', role: 'state', disposition: fed({ file: 'ui/src/mobile/app-wiring.ts', mustContain: 'offs.push(subscribeTaildropTaskEvents())' }), note: 'Taildrop 发件任务（ζ 批 A12）。写入方是应用级事件订阅 + 冷启动水合，TaildropPanel 只是视图 —— 面板关掉再打开进度仍是当下那一帧。' },
   { id: 'useTaildropTaskStore.applySnapshot', role: 'action', disposition: fed({ file: 'ui/src/store/use-taildrop-task-store.ts', mustContain: 'applySnapshot:' }), note: '取消发件的回执本身就是一帧快照，当场并进 store。' },

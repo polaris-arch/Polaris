@@ -5,7 +5,7 @@ import type { SubscriptionCreateInput } from '@/contracts/subscription-create-op
 import { subscriptionCreateIsCancellable } from '@/contracts/subscription-create-operation';
 import { subscriptionErrorDetail } from '@/domain/subscription-error-text';
 import { useAppStore } from '@/store/app-store';
-import { subscriptionCreateTerminalNeedsAnnouncement, useSubscriptionCreateOperationStore } from '@/store/subscription-create-operation-store';
+import { useSubscriptionCreateOperationStore } from '@/store/subscription-create-operation-store';
 import { useDialogStore } from './dialog-store';
 import {
   clearSubscriptionCreateOperationIdAfterTerminal,
@@ -59,10 +59,7 @@ export function useSubscriptionCreateDialogOperation({
   const createStart = useSubscriptionCreateOperationStore((s) => s.start);
   const createCancel = useSubscriptionCreateOperationStore((s) => s.cancel);
   const clearTerminal = useSubscriptionCreateOperationStore((s) => s.clearTerminal);
-  const markTerminalHandled = useSubscriptionCreateOperationStore((s) => s.markTerminalHandled);
-  const terminalHandledRevision = useSubscriptionCreateOperationStore((s) =>
-    operationId ? s.handledTerminalRevisions[operationId] : undefined,
-  );
+  const claimTerminalAnnouncement = useSubscriptionCreateOperationStore((s) => s.claimTerminalAnnouncement);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -92,17 +89,17 @@ export function useSubscriptionCreateDialogOperation({
       return;
     }
     if (activeOperation.phase === 'failed') {
+      const shouldToast = claimTerminalAnnouncement(activeOperation.operationId, activeOperation.revision);
       clearTerminal(activeOperation.operationId);
       // Terminal attempts are not idempotency candidates. A later form submit must own a new id;
       // only an explicitly uncertain start response keeps its id for status/list reattachment.
       if (clearSubscriptionCreateOperationIdAfterTerminal(activeOperation.phase)) setOperationId(null);
       setCancelling(false);
       cancelInFlight.current = false;
-      toast.error(subscriptionErrorDetail(activeOperation.error ?? {}, t, 'sub.previewFail'));
+      if (shouldToast) toast.error(subscriptionErrorDetail(activeOperation.error ?? {}, t, 'sub.previewFail'));
       return;
     }
     if (activeOperation.phase !== 'succeeded' || !activeOperation.result) return;
-    const shouldToast = subscriptionCreateTerminalNeedsAnnouncement(terminalHandledRevision, activeOperation);
     void (async () => {
       await loadConfig(true);
       const published = useAppStore.getState().config?.subscriptions?.some(
@@ -119,8 +116,8 @@ export function useSubscriptionCreateDialogOperation({
       // A vanished form must leave the terminal available to the next renderer hydrate. Marking
       // handled before this point would make a successful backend commit invisible forever.
       if (!hasInstance(instanceId)) return;
-      if (shouldToast) markTerminalHandled(activeOperation.operationId, activeOperation.revision);
       onAdded?.(activeOperation.result!.subscription.id);
+      const shouldToast = claimTerminalAnnouncement(activeOperation.operationId, activeOperation.revision);
       clearTerminal(activeOperation.operationId);
       closeInstance(instanceId);
       if (shouldToast) toast.success(t('sub.added'));
@@ -128,7 +125,7 @@ export function useSubscriptionCreateDialogOperation({
       console.error('[subscription-create] completion refresh failed:', error);
       setCompletionFailed(true);
     });
-  }, [activeOperation, clearTerminal, closeInstance, hasInstance, instanceId, loadConfig, markTerminalHandled, onAdded, t, terminalHandledRevision]);
+  }, [activeOperation, claimTerminalAnnouncement, clearTerminal, closeInstance, hasInstance, instanceId, loadConfig, onAdded, t]);
 
   const start = async (subscription: SubscriptionCreateInput) => {
     if (starting || cancelling || operationBusy || startInFlight.current) return;

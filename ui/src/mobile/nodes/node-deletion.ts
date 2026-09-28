@@ -147,17 +147,20 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
 
   /**
    * 删掉一个节点。`opts` 是**三条成功支共用**的差异面（WARP 那两颗次动作换文案用），缺省
-   * 即原来的「删除成功」。`afterDelete` 只在**真的删成**之后跑：三条成功支各调一次，
+   * 即原来的「删除成功」。`afterDelete` 只在本地撤销或直写真正完成后跑；暂存删除仍待应用，
+   * 不得先开重新注册表，否则旧 WARP 仍在盘上占用单例槽。
    * 失败那条（`runWrite` 的 catch）自然跑不到 —— 「重新注册」不许在删失败之后还把注册表打开，
    * 那会让用户对着一台**还在**的 WARP 再注册一台。
    */
   const runDeleteOne = useCallback(
     async (server: ServerConfig, opts?: MobileWarpRemovalOptions): Promise<void> => {
       const okText = opts?.okText ?? t('nodes.deleteSuccess');
-      const done = (showToast: boolean): void => {
+      const done = (completed: boolean): void => {
         clearNotice();
-        if (showToast) toast.success(okText);
-        opts?.afterDelete?.();
+        if (completed) {
+          toast.success(okText);
+          opts?.afterDelete?.();
+        }
       };
       const split = splitStagedOnly('server.delete', [server.id], stagedOnly, stagedEntries, 'servers');
       if (split.backend.length === 0) {

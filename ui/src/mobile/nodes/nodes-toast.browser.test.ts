@@ -10,23 +10,48 @@ import { createRoot } from 'react-dom/client';
 import { api } from '/src/ipc';
 import { useAppStore } from '/src/store/app-store';
 import { MobileNodesScreen } from '/src/mobile/nodes/MobileNodesScreen';
+import { useMobileNodeDeletion } from '/src/mobile/nodes/node-deletion';
 import { MobileToaster } from '/src/mobile/MobileToaster';
+import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { i18nReady } from '/src/i18n';
 import '/src/styles/tokens.resolved.css';
 import '/src/mobile/theme.css';
 import '/src/mobile/mobile.css';
 import '/src/mobile/nodes/nodes.css';
 await i18nReady;
+const mode = new URLSearchParams(location.search).get('mode');
 const node = { id: 'node-a', name: '测试节点', protocol: 'vless', address: '198.51.100.7', port: 443 };
-const test = window.__nodeToastTest = { failCopy: true, writes: [] };
+const warp = { id: 'warp-1', name: 'WARP', protocol: 'wireguard', address: 'engage.cloudflareclient.com', port: 2408 };
+const test = window.__nodeToastTest = { failCopy: true, writes: [], opened: 0, deleted: 0 };
+test.entries = () => useStagedConfigStore.getState().entries;
 Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
   writeText: async text => { if (test.failCopy) throw Error('clipboard denied'); test.writes.push(text); },
 } });
 api.server.generateUrl = async () => 'vless://example';
+api.server.delete = async () => { test.deleted++; };
 api.config.meshRouteReport = async () => null;
-useAppStore.setState({ servers: [node], config: { servers: [node], subscriptions: [] },
-  selectedServerId: '', invalidNodes: [], proxyStatus: { running: false } });
-createRoot(document.getElementById('root')).render(<main className="mobile-root"><MobileNodesScreen /><MobileToaster /></main>);
+const server = mode?.startsWith('warp') ? warp : node;
+useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
+  selectedServerId: '', invalidNodes: [], proxyStatus: { running: mode?.startsWith('warp') === true } });
+useStagedConfigStore.setState({ enabled: mode === 'warp-staged', entries: [] });
+function WarpDeleteHarness() {
+  const deletion = useMobileNodeDeletion({
+    t: key => key,
+    clearNotice: () => {},
+    runWrite: async op => { await op(); },
+    confirm: payload => { queueMicrotask(payload.onConfirm); return 'confirm'; },
+    dismiss: () => {},
+    exitBatch: () => {},
+  });
+  return <button onClick={() => deletion.removeWarpNode(warp, {
+    title: '重新注册', message: '先删除', okText: '已注销',
+    afterDelete: () => { test.opened++; },
+  })}>重新注册 WARP</button>;
+}
+createRoot(document.getElementById('root')).render(<main className="mobile-root">
+  {mode?.startsWith('warp') ? <WarpDeleteHarness /> : <MobileNodesScreen />}
+  <MobileToaster />
+</main>);
 `;
 
 let server: ViteDevServer;
@@ -67,6 +92,38 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile node copy comp
       expect(await page.locator('.m-toast-ok').filter({ hasText: '已复制分享链接' }).count()).toBe(1);
       expect(await page.locator('.mn-notice').count()).toBe(0);
       expect(await page.evaluate(() => (window as any).__nodeToastTest.writes)).toEqual(['vless://example']);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('staging a persisted WARP deletion leaves the pending entry without reopening registration or reporting completion', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__nodes-toast?mode=warp-staged`);
+      await page.getByRole('button', { name: '重新注册 WARP' }).click();
+      await page.waitForFunction(() => (window as any).__nodeToastTest.entries?.().length === 1);
+      const result = await page.evaluate(() => {
+        const test = (window as any).__nodeToastTest;
+        return { opened: test.opened, deleted: test.deleted, entries: test.entries() };
+      });
+      expect(result.opened).toBe(0);
+      expect(result.deleted).toBe(0);
+      expect(result.entries).toMatchObject([{ id: 'server:warp-1', nextValue: null }]);
+      expect(await page.locator('.m-toast-ok').count()).toBe(0);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('direct WARP deletion completes before opening registration and showing one Toast', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__nodes-toast?mode=warp-direct`);
+      await page.getByRole('button', { name: '重新注册 WARP' }).click();
+      await page.locator('.m-toast-ok').filter({ hasText: '已注销' }).waitFor();
+      const result = await page.evaluate(() => {
+        const test = (window as any).__nodeToastTest;
+        return { opened: test.opened, deleted: test.deleted, entries: test.entries() };
+      });
+      expect(result).toEqual({ opened: 1, deleted: 1, entries: [] });
+      expect(await page.locator('.m-toast-ok').filter({ hasText: '已注销' }).count()).toBe(1);
     } finally { await page.close(); }
   }, 30_000);
 });
