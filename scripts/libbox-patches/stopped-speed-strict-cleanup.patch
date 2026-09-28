@@ -958,7 +958,7 @@ index 770016a..6f6954a 100644
  		return E.Cause(err, "start or reload service")
  	}
 diff --git a/experimental/libbox/command_server_transient_test.go b/experimental/libbox/command_server_transient_test.go
-index 7a9af75..2dbeb04 100644
+index 7a9af75..07f6bb0 100644
 --- a/experimental/libbox/command_server_transient_test.go
 +++ b/experimental/libbox/command_server_transient_test.go
 @@ -1,12 +1,20 @@
@@ -1170,7 +1170,30 @@ index 7a9af75..2dbeb04 100644
  type transientTestPlatform struct{ PlatformInterface }
  
  func (transientTestPlatform) LocalDNSTransport() LocalDNSTransport        { return nil }
-@@ -165,3 +354,21 @@ func TestTransientCommandServerCloseKeepsPrimaryService(t *testing.T) {
+@@ -31,7 +220,13 @@ func (transientTestPlatform) CloseDefaultInterfaceMonitor(InterfaceUpdateListene
+ func transientTestSetup(t *testing.T) {
+ 	t.Helper()
+ 	base, work, temp, power, maxLines, uid, gid := sBasePath, sWorkingPath, sTempPath, sPowerReportEnabled, sLogMaxLines, sUserID, sGroupID
+-	sBasePath = t.TempDir()
++	// The AAR builder's checkout path plus t.TempDir's test-name suffix can
++	// exceed Unix's 108-byte socket path limit before CommandServer.Start runs.
++	shortDir, err := os.MkdirTemp("", "lb-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	sBasePath = shortDir
+ 	sWorkingPath = sBasePath
+ 	sTempPath = sBasePath
+ 	sPowerReportEnabled = true
+@@ -39,6 +234,7 @@ func transientTestSetup(t *testing.T) {
+ 	sUserID, sGroupID = os.Getuid(), os.Getgid()
+ 	t.Cleanup(func() {
+ 		sBasePath, sWorkingPath, sTempPath, sPowerReportEnabled, sLogMaxLines, sUserID, sGroupID = base, work, temp, power, maxLines, uid, gid
++		os.RemoveAll(shortDir)
+ 	})
+ }
+ 
+@@ -165,3 +361,21 @@ func TestTransientCommandServerCloseKeepsPrimaryService(t *testing.T) {
  		t.Fatal("transient lifecycle changed the primary default logger")
  	}
  }
