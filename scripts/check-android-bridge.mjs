@@ -21,7 +21,7 @@
  * | A2 | Rust 载荷结构体的 serde 字段名 ⊇ 对应 `@InvokeArg` 类的**非空**字段 | 少传必需键 ⇒ Jackson 反序列化炸 |
  * | A2b | 每个**有载荷**的 `@Command` 必须走 `invoke.parseArgs(<X>::class.java)`，不得用无类型的 `getArgs()`/`getRawArgs()` | 无类型取参 ⇒ A2 无从可查，等于在门上开个洞 |
  * | A3 | Kotlin 每个 `@Command` 都被 Rust 调到（反向） | Rust 侧断掉调用 ⇒ 门红 |
- * | A4 | Kotlin 源码树里**不得存在第二份配置真值**：任何 `.kt` 同时含 `"inbounds"` 与 `"outbounds"` 字面量即红 | `BootstrapConfig` 复活 / 有人又硬编一份 |
+ * | A4 | Kotlin 源码树里**不得存在第二份配置真值**：任何 `.kt` 同时含 `"inbounds"` 与 `"outbounds"` 字面量即红；临时核的固定读侧校验表达式单独剔除，新增写侧字面量仍红 | `BootstrapConfig` 复活 / 有人又硬编一份 |
  * | A5 | FLOOR：命令数 ≥ 10、Kotlin 语料非空 | 正则塌了 ⇒ 空集合恒绿 |
  * | A10 | **回包**字段面：Kotlin 就地 `put("k")` 的键集 ⇄ Rust 回包类型的 serde 字段（多发/少必填都红）+ FLOOR ≥ 2 | 无载荷命令此前只被「名字」这一条守着 —— Kotlin 把回包键改个名、Rust 照旧读旧名，两侧都编得过，真机上「状态永远读不到」 |
  * | A12 | **回包元素**字段面：Kotlin 的 JSObject 工厂（函数名 ⇄ 同名 Rust 结构体，不维护映射表）的 `put(` 键集 ⇄ 该结构体 serde 字段（多发/少必填都红）+ FLOOR ≥ 1 | A10 只看回包顶层。回包里装数组时，元素的键在别处造 —— 改名两侧都编得过、A1/A3/A10 全绿，真机上「那一列整列是空的」 |
@@ -361,13 +361,33 @@ const kotlinCommands = new Map();
 /** `@InvokeArg` 类名 → { requiredFields: string[], file } */
 const kotlinArgClasses = new Map();
 
+// This file validates a Rust-generated temporary config before constructing
+// libbox. Only these three exact read expressions are exempt from A4; any
+// additional `"inbounds"` or `"outbounds"` literal in that file still fails.
+const transientValidator = join(KOTLIN_SRC, 'com', 'polaris2', 'app', 'vpn', 'TransientSpeedtestHost.kt');
+const transientReadExpressions = [
+  'root.getJSONArray("inbounds")',
+  'root.optJSONArray("outbounds")',
+  'root.has("outbounds")',
+];
+
 for (const file of kotlinFiles) {
   const raw = readFileSync(file, 'utf8');
   const src = stripComments(raw);
 
   // A4：第二份配置真值。判据取**原文**（含注释）：一份被注释掉的整配置同样是「留在树里的第二份
   // 真值」，下一个人取消注释就复活了。
-  if (raw.includes('"inbounds"') && raw.includes('"outbounds"')) {
+  let configSource = raw;
+  if (file === transientValidator) {
+    for (const expression of transientReadExpressions) {
+      if (!configSource.includes(expression)) fail(`A4 临时核校验读侧表达式消失：${expression}`);
+      configSource = configSource.replace(expression, '');
+    }
+    if (configSource.includes('"inbounds"') || configSource.includes('"outbounds"')) {
+      fail(`A4 ${file.slice(ROOT.length + 1)}：临时核校验之外出现了配置字段字面量`);
+    }
+  }
+  if (configSource.includes('"inbounds"') && configSource.includes('"outbounds"')) {
     fail(
       `A4 ${file.slice(ROOT.length + 1)}：Kotlin 树里出现了第二份配置真值（同时含 "inbounds" 与 ` +
         `"outbounds" 字面量）。配置的唯一来源必须是 Rust 侧 config-engine 的产出，经 start 命令的 ` +
