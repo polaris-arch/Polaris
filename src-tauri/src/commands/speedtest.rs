@@ -885,6 +885,22 @@ async fn run_temp_core_speed_test(
     let privacy_mode = crate::commands::config::config_get_privacy_mode(State::clone(state))
         .data
         .unwrap_or(false);
+    #[cfg(target_os = "android")]
+    let temp_auth = match crate::commands::config::generate_local_api_secret() {
+        Ok(password) => InboundUser {
+            username: "polaris-temp".to_owned(),
+            password,
+        },
+        Err(error) => return ApiResponse::err_with_code(error, CODE_TEMP_CORE_FAILED),
+    };
+    #[cfg(target_os = "android")]
+    let deps = TempCoreDeps::production_android(
+        state.config().dir().to_path_buf(),
+        exclusions,
+        temp_core_log_level(config, privacy_mode),
+        temp_auth.clone(),
+    );
+    #[cfg(not(target_os = "android"))]
     let deps = TempCoreDeps::production(
         state.config().dir().to_path_buf(),
         exclusions,
@@ -897,9 +913,18 @@ async fn run_temp_core_speed_test(
         &superseded,
         |port| {
             let url = url.clone();
-            // 临时核自建的 `in-<tag>` 入站零认证（`runtime::speedtest::build_temp_core_config`）：
-            // 它只在桌面跑（Android 核在进程内，没有可 spawn 的临时核二进制），凭据恒 `None`。
-            async move { measure_via_local_proxy(port, None, &url).await }
+            #[cfg(target_os = "android")]
+            let auth = temp_auth.clone();
+            async move {
+                #[cfg(target_os = "android")]
+                {
+                    measure_via_local_proxy(port, Some(&auth), &url).await
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    measure_via_local_proxy(port, None, &url).await
+                }
+            }
         },
         &mut |event, payload| {
             let _ = app.emit(event, speed_test_run_payload(payload, run_id));
@@ -930,6 +955,7 @@ async fn run_temp_core_speed_test(
             CODE_TEMP_CORE_FAILED,
         ),
         TempCoreOutcome::Failed(e) => ApiResponse::err_with_code(e, CODE_TEMP_CORE_FAILED),
+        TempCoreOutcome::CleanupUnknown(e) => ApiResponse::err_with_code(e, CODE_TEMP_CORE_FAILED),
         TempCoreOutcome::SystemInterfaceRequired(e) => {
             #[cfg(target_os = "android")]
             {

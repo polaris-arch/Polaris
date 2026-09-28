@@ -1007,6 +1007,113 @@ fn invoke_error(e: &tauri::plugin::mobile::PluginInvokeError) -> BridgeError {
 #[cfg(test)]
 mod tests;
 
+/// A speedtest host is identified by its own ID. A bridge timeout is not a
+/// native close acknowledgement: Kotlin retains the ID until cleanup finishes.
+#[cfg(target_os = "android")]
+#[derive(Debug)]
+pub(crate) enum SpeedtestStartError {
+    Failed(String),
+    CleanupUnknown(String),
+}
+
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum TransientSpeedtestState {
+    Starting,
+    Running,
+    Closing,
+    CleanupUnknown,
+    Closed,
+    Unknown,
+}
+
+#[cfg(target_os = "android")]
+pub(crate) async fn start_transient_speedtest(
+    instance_id: &str,
+    config_content: &str,
+) -> Result<(), SpeedtestStartError> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StartArgs {
+        instance_id: String,
+        config_content: String,
+    }
+    let plugin = plugin_handle()
+        .map_err(|_| SpeedtestStartError::Failed("Android 测速桥不可用".to_owned()))?;
+    let result = call_with_budget::<(), _>(
+        plugin,
+        "startTransientSpeedtest",
+        StartArgs {
+            instance_id: instance_id.to_owned(),
+            config_content: config_content.to_owned(),
+        },
+        START_TIMEOUT,
+    )
+    .await;
+    if result.is_ok() {
+        return Ok(());
+    }
+    // Even if start has not reached Kotlin yet, close records a permanent
+    // tombstone for this ID and prevents a late callback from starting it.
+    match close_transient_speedtest(instance_id).await {
+        Ok(()) => Err(SpeedtestStartError::Failed(
+            "Android 测速临时核启动失败或超时".to_owned(),
+        )),
+        Err(_) => Err(SpeedtestStartError::CleanupUnknown(
+            "Android 测速临时核关闭结果未知；本轮已停止".to_owned(),
+        )),
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) async fn close_transient_speedtest(instance_id: &str) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CloseArgs {
+        instance_id: String,
+    }
+    let plugin = plugin_handle().map_err(|_| "Android 测速桥不可用".to_owned())?;
+    call_with_budget::<(), _>(
+        plugin,
+        "closeTransientSpeedtest",
+        CloseArgs {
+            instance_id: instance_id.to_owned(),
+        },
+        STOP_TIMEOUT,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|_| "Android 测速临时核关闭未确认".to_owned())
+}
+
+#[cfg(target_os = "android")]
+pub(crate) async fn transient_speedtest_status(
+    instance_id: &str,
+) -> Result<TransientSpeedtestState, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StatusArgs {
+        instance_id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct StatusResponse {
+        state: TransientSpeedtestState,
+    }
+    let plugin = plugin_handle().map_err(|_| "Android 测速桥不可用".to_owned())?;
+    call_with_budget::<StatusResponse, _>(
+        plugin,
+        "transientSpeedtestStatus",
+        StatusArgs {
+            instance_id: instance_id.to_owned(),
+        },
+        LOCAL_STATE_TIMEOUT,
+    )
+    .await
+    .map(|status| status.state)
+    .map_err(|_| "Android 测速临时核状态不可用".to_owned())
+}
+
 /// Independent, non-VPN Tailscale login instances. The native host owns only the supplied attempt.
 #[cfg(target_os = "android")]
 pub(crate) async fn start_transient_login(
