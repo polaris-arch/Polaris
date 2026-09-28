@@ -188,10 +188,10 @@ export const HOME_PARITY: ScreenParityRegister = {
     {
       id: 'NodeMenu.tsx|k:home.sortByLatency',
       disposition: {
-        kind: 'reachable-elsewhere',
-        mobile: { file: 'ui/src/mobile/nodes/NodesScreenView.tsx', mustContain: "t('nodes.mobileSortLatency')" },
+        kind: 'ported',
+        mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: "t('home.sortByLatency')" },
       },
-      note: '出口下拉工具条上的「按延迟排序」开关（`role="switch"` 的 `<span>`，不是 `<button>` —— 上一版的动作面只认字面 `<button` 时它整条不可见）。移动端首页的选择面是平铺 + 搜索，排序这一维与分组一样住在节点屏的排序下拉里（`nodes.mobileSortLatency` 那一档）。',
+      note: '出口选择 sheet 的搜索框旁提供同一持久化开关，组内排序共用 sortServersByLatency；组次序和折叠态保持原样。',
     },
     {
       id: 'NodeMenu.tsx|k:nodes.testAll',

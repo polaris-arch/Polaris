@@ -286,6 +286,24 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '⚠️ 检查那条腿的重试仍是同一颗检查按钮再点一次（`k:settings.about.checkUpdate#2`，失败态不禁用）。',
     },
 
+    /* ── TUN 组网网段报告：手动刷新与加载反馈 ─────────────────────────────── */
+    {
+      id: 'EndpointForceRouteBlock.tsx|k:common.refresh+settings.tun.forceRouteBlock+settings.tun.forceRouteHint+settings.tun.forceRouteLoading',
+      disposition: {
+        kind: 'ported',
+        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'className="ms-force-refresh" onClick={onRefresh} disabled={loading}' },
+      },
+      note: '桌面报告标题中的刷新动作；移动端同一报告块在加载时禁用按钮，刷新失败保留上一份报告并显式报错。',
+    },
+    {
+      id: 'EndpointForceRouteBlock.tsx|k:common.refresh+settings.tun.forceRouteLoading',
+      disposition: {
+        kind: 'ported',
+        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: "t('settings.tun.forceRouteLoading')" },
+      },
+      note: '报告读取中的可见文案：初次加载占位、已有结果刷新时的行内状态共用此键。',
+    },
+
     /* ── 内核更新卡 / 版本横幅（核随 APK 打包，整族没有对象）────────────────── */
     {
       id: 'CoreUpdateCard.tsx|k:settings.coreManagement.checkCoreUpdate',

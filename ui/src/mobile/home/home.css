@@ -687,6 +687,50 @@
 
 .h-picker-search { display: flex; margin-bottom: 8px; }
 
+/* The picker alone keeps its controls outside the clipped list viewport. */
+.h-picker-sheet { display: flex; flex-direction: column; overflow: hidden; }
+.h-picker-sheet .h-sheethead, .h-picker-search { flex: none; }
+.h-picker-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.h-picker-search { align-items: center; gap: 8px; }
+.h-picker-sort {
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: none;
+  min-height: var(--mobile-action-hit);
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: hsl(var(--fg-dim));
+  font: inherit;
+  font-size: var(--mobile-control-font);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.h-picker-sort::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: var(--mobile-action-inset) 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--mobile-action-neutral));
+}
+.h-picker-sort[aria-checked='true'] {
+  color: hsl(var(--flow-hi));
+}
+.h-picker-sort[aria-checked='true']::before {
+  border-color: hsl(var(--flow) / .45);
+  background: hsl(var(--flow-weak));
+}
+.m-shell .h-picker-sort:active { opacity: 1; }
+.m-shell .h-picker-sort:active::before { border-color: hsl(var(--fg) / .35); }
+.h-picker-sort:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+
 .h-search {
   flex: 1 1 auto;
   min-width: 0;

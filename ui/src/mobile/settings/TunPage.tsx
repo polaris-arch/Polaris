@@ -45,7 +45,7 @@
  *  ✘ **三平台机制说明的 `<details>`**：说的是 macOS/Windows/Linux 三家的路由机制，移动端一条都不适用。
  */
 
-import { useEffect, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TunModeConfig, UdpNatType } from '@/contracts/types';
 import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
@@ -147,31 +147,34 @@ export function TunPage({ config, update, commit }: MobileSettingsPageProps): Re
    * `MOBILE_TAKEOVER`），而盘上的 `proxyModeType` 默认值是 `systemProxy` 且移动端已经没有控件能改
    * 它 ⇒ 照读那个字段会让这条提示**永远不出现**，正好在唯一需要它的平台上失声。
    */
-  /*
-   * 自己的组网网段结算报告拉取（呈现在 `TunReports.tsx`）。
-   *
-   * 拉不到停在 `null` —— 报告自己说「读取失败，暂时拿不到这份报告」，
-   * **不折成任何一种结论**。这与节点屏 `MobileNodesScreen.tsx:217-231` 消费同一条
-   * force-route 命令时的取向逐字一致：报告答不出来是允许的，编一个答案不是。
-   *
-   * 只在挂载时拉一次：报告按当前保存配置和观测计算，
-   * 页面停留期间不会自己变新。
-   */
-  const [forceRoute, setForceRoute] = useState<EndpointForceRouteReport | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    api.config
-      .endpointForceRouteReport()
-      .then((next) => {
-        if (!cancelled) setForceRoute(next);
-      })
-      .catch(() => {
-        if (!cancelled) setForceRoute(null);
-      });
-    return () => {
-      cancelled = true;
-    };
+  /* A failed manual refresh leaves the last valid report visible and marks it stale. */
+  const [forceRoute, setForceRoute] = useState<{
+    report: EndpointForceRouteReport | null; loading: boolean; error: boolean;
+  }>({ report: null, loading: true, error: false });
+  const forceRouteVersion = useRef(0);
+  const forceRouteBusy = useRef(false);
+  const refreshForceRoute = useCallback(() => {
+    if (forceRouteBusy.current) return;
+    forceRouteBusy.current = true;
+    const version = ++forceRouteVersion.current;
+    setForceRoute(previous => ({ ...previous, loading: true, error: false }));
+    void Promise.resolve().then(() => api.config.endpointForceRouteReport()).then(
+      report => {
+        if (version !== forceRouteVersion.current) return;
+        forceRouteBusy.current = false;
+        setForceRoute({ report, loading: false, error: false });
+      },
+      () => {
+        if (version !== forceRouteVersion.current) return;
+        forceRouteBusy.current = false;
+        setForceRoute(previous => ({ ...previous, loading: false, error: true }));
+      },
+    );
   }, []);
+  useEffect(() => {
+    refreshForceRoute();
+    return () => { forceRouteVersion.current += 1; forceRouteBusy.current = false; };
+  }, [refreshForceRoute]);
 
   const fakeIpEnabled =
     (config.configSchemaVersion ?? 0) >= 2 && config.dnsDefaults
@@ -328,7 +331,8 @@ export function TunPage({ config, update, commit }: MobileSettingsPageProps): Re
         />
       </SettingsGroup>
       {/* Android/iOS 无法完整探测其他应用的 VPN 路由；这里只保留自己的组网结算。 */}
-      <MobileEndpointForceRouteBlock report={forceRoute} servers={config.servers ?? []} />
+      <MobileEndpointForceRouteBlock report={forceRoute.report} loading={forceRoute.loading}
+        error={forceRoute.error} onRefresh={refreshForceRoute} servers={config.servers ?? []} />
     </>
   );
 }

@@ -17,6 +17,7 @@ import type {
 } from './view-model';
 import { HOME_CARD_ORDER } from './view-model';
 import { fmtBytes, fmtRate, latLevel } from '@/components/screens/shared/format';
+import { useNodeSortStore } from '@/store/use-node-sort-store';
 import { splinePath, scaleMax } from './traffic-buffer';
 
 /* ═══════════ 小原语（全部 code-rendered；本屏不引任何位图）═══════════ */
@@ -161,7 +162,7 @@ function HomePickerSheet({ title, closeLabel, onClose, children }: {
 }): ReactElement {
   const panel = useRef<HTMLDivElement>(null);
   useSheetFocus(panel, true, onClose, { initialFocus: '.h-pickrow.cur:not(:disabled)' });
-  return <div ref={panel} className="h-sheet" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
+  return <div ref={panel} className="h-sheet h-picker-sheet" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
     <SheetHeading title={title} onClose={onClose} closeLabel={closeLabel} className="h-sheethead" titleClassName="h-sheettitle" />
     {children}
   </div>;
@@ -529,6 +530,8 @@ const catClass = (i: number): string => `c${i % CAT_SLOTS} ${i >= CAT_SLOTS ? 'd
 
 export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
   const { t, writeErrors: err } = props;
+  const sortByLatency = useNodeSortStore(state => state.sortByLatency);
+  const toggleSortByLatency = useNodeSortStore(state => state.toggleSortByLatency);
   const ruleTrack = useRef<HTMLDivElement>(null);
   const [allRuleHitsOpen, setAllRuleHitsOpen] = useState(false);
   const ruleHitIdentity = props.ruleHits.map(hit => hit.key).join('\u0000');
@@ -767,9 +770,19 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                   type="search"
                   value={props.pickerQuery}
                   placeholder={t('home.searchNodesPlaceholder')}
+                  aria-label={t('home.searchNodesPlaceholder')}
                   onChange={(e) => props.onPickerQuery(e.currentTarget.value)}
                 />
+                <button type="button" className="h-picker-sort" role="switch" aria-checked={sortByLatency}
+                  aria-label={t('home.sortByLatency')} onClick={toggleSortByLatency}>
+                  <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor"
+                    strokeWidth="1.7" strokeLinecap="round" aria-hidden>
+                    <path d="M3 5h14M3 10h10M3 15h6" />
+                  </svg>
+                  <span>{t('home.latencyShort')}</span>
+                </button>
               </div>
+              <div className="h-picker-scroll">
               {/*
                 哨兵出口（直连 / 阻断）—— 桌面出口下拉顶上那两行（`NodeMenu.tsx` 的 `.mi`）。
 
@@ -810,7 +823,8 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                 </li>
               </ul>
               <HomeNodePickerList rows={props.pickRows} subscriptions={props.pickerSubscriptions}
-                query={props.pickerQuery} t={t} onUseAsExit={props.onUseAsExit} />
+                query={props.pickerQuery} sortByLatency={sortByLatency} t={t} onUseAsExit={props.onUseAsExit} />
+              </div>
             </HomePickerSheet>
           )}
         </Card>

@@ -95,6 +95,7 @@ const STAGED_FED: Anchor = { file: 'ui/src/mobile/MobilePendingBar.tsx', mustCon
 
 const STORE_APP: Anchor = { file: 'ui/src/store/app-store.ts', mustContain: 'export const useAppStore' };
 const STORE_SPEED: Anchor = { file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: 'export const useMobileSpeedTestStore' };
+const STORE_NODE_SORT: Anchor = { file: 'ui/src/store/use-node-sort-store.ts', mustContain: 'export const useNodeSortStore' };
 const SPEED_FED: Anchor = { file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: '.progress(event)' };
 const STORE_LATENCY: Anchor = { file: 'ui/src/store/use-latency-store.ts', mustContain: 'export const useLatencyStore' };
 const STORE_STAGED: Anchor = { file: 'ui/src/store/staged-config-store.ts', mustContain: 'export const useStagedConfigStore' };
@@ -109,6 +110,8 @@ const act = (declaredIn: Anchor): ParityDisposition => ({ kind: 'ported', mobile
 const fed = (writer: Anchor): ParityDisposition => ({ kind: 'ported', mobile: writer });
 
 export const MOBILE_FEEDS: readonly FeedEntry[] = [
+  { id: 'useNodeSortStore.sortByLatency', role: 'state', disposition: fed({ file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: 'onClick={toggleSortByLatency}' }), note: '首页排序开关更新同一份持久偏好，节点页和托盘也读它。' },
+  { id: 'useNodeSortStore.toggleSortByLatency', role: 'action', disposition: act(STORE_NODE_SORT), note: '首页选择 sheet 的按延迟排序动作；组内排序复用既有比较器。' },
   /* 测速轮次为窗口级内存状态；真实事件/回执写入，静默只切 waiting。 */
   { id: 'useMobileSpeedTestStore.task', role: 'state', disposition: fed(SPEED_FED), note: '真实轮次与本地请求锁由窗口事件 feed 和 invoke 回执更新；跨屏读同一状态。' },
   { id: 'useMobileSpeedTestStore.request', role: 'state', disposition: fed({ file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: '.begin(ids, kind, acceptLatency)' }), note: '真实轮次与本地请求锁由窗口事件 feed 和 invoke 回执更新；跨屏读同一状态。' },

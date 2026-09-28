@@ -11,10 +11,11 @@ export function MobileSpeedTestProgress(): ReactElement | null {
   if (!task && !preparing) return null;
   const pendingStart = preparing && (!task || task.runId === request?.lastRunId);
   const running = pendingStart || task?.phase === 'running' || task?.phase === 'waiting';
+  if (!running) return null;
   return <div className="m-speedtest-progress" role="status" aria-live="polite" aria-busy={running}>
     <div className="m-speedtest-line">
-      {running && <span className="m-speedtest-spinner" aria-hidden />}
-      <span>{pendingStart ? t('mobileSpeedTest.preparing') : task?.phase === 'waiting' ? t('mobileSpeedTest.waiting') : task?.phase === 'interrupted' ? t('nodes.speedTestInterruptedSummary', { tested: task.tested, total: task.total ?? task.tested }) : task?.phase === 'completed' ? t('mobileHome.speedTestReturned', { count: task.tested }) : task?.total === null ? t('mobileHome.latencyChecking') : t('nodes.speedTestingNodes', { tested: task?.tested ?? 0, total: task?.total })}</span>
+      <span className="m-speedtest-spinner" aria-hidden />
+      <span>{pendingStart ? t('mobileSpeedTest.preparing') : task?.phase === 'waiting' ? t('mobileSpeedTest.waiting') : task?.total === null ? t('mobileHome.latencyChecking') : t('nodes.speedTestingNodes', { tested: task?.tested ?? 0, total: task?.total })}</span>
     </div>
     {!pendingStart && task?.total !== null && task?.total !== undefined && task.total > 0 &&
       <progress className="m-speedtest-bar" value={task.tested} max={task.total} aria-label={t('mobileSpeedTest.progress')} />}

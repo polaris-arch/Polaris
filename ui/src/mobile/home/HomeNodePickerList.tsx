@@ -3,13 +3,15 @@ import type { SubscriptionConfig } from '@/contracts/types';
 import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
 import { revealSiblingGroup, useRevealAfterCommit } from '@/components/reveal';
 import { latLevel } from '@/components/screens/shared/format';
+import { sortServersByLatency } from '@/domain/server-latency-sort';
 import type { NodePickRow, HomeScreenViewProps } from './view-model';
 
 /** Same provenance/order/defaults as PC NodeMenu. Search never mutates the manual collapse set. */
-export function HomeNodePickerList({ rows, subscriptions = [], query, t, onUseAsExit }: {
+export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLatency, t, onUseAsExit }: {
   rows: readonly NodePickRow[];
   subscriptions?: readonly SubscriptionConfig[];
   query: string;
+  sortByLatency: boolean;
   t: HomeScreenViewProps['t'];
   onUseAsExit: HomeScreenViewProps['onUseAsExit'];
 }): ReactElement {
@@ -21,8 +23,14 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, t, onUseAs
   useEffect(() => { setOpenGroups(new Set(defaultKey ? defaultKey.split('\u0000') : [])); }, [defaultKey]);
   const byId = new Map(rows.map(row => [row.server.id, row]));
   const needle = query.trim().toLowerCase();
-  const shown = groups.map(group => ({ ...group, servers: group.servers.filter(server => !needle ||
-    server.name.toLowerCase().includes(needle) || server.address.toLowerCase().includes(needle) || server.protocol.toLowerCase().includes(needle)) })).filter(group => group.servers.length > 0);
+  const shown = groups.map(group => {
+    const filtered = group.servers.filter(server => !needle || server.name.toLowerCase().includes(needle) ||
+      server.address.toLowerCase().includes(needle) || server.protocol.toLowerCase().includes(needle));
+    return { ...group, servers: sortByLatency ? sortServersByLatency(filtered, id => {
+      const row = byId.get(id);
+      return row && !row.latencyStale ? row.latencyMs : null;
+    }) : filtered };
+  }).filter(group => group.servers.length > 0);
   const scheduleReveal = useRevealAfterCommit();
   if (shown.length === 0) return <p className="h-empty">{t('mobileHome.noMatchingNode')}</p>;
   return <ul className="h-picklist">

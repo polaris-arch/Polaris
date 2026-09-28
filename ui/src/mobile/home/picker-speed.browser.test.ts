@@ -10,7 +10,9 @@ import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { HomeNodePickerList } from '/src/mobile/home/HomeNodePickerList';
 import { MobileSpeedTestProgress } from '/src/mobile/MobileSpeedTestProgress';
+import { SheetHeading } from '/src/mobile/SheetHeading';
 import { useMobileSpeedTestStore as store } from '/src/mobile/use-mobile-speed-test';
+import { useNodeSortStore as sortStore } from '/src/store/use-node-sort-store';
 import zhCN from '/src/i18n/locales/zh-CN.json';
 import i18n, { i18nReady } from '/src/i18n';
 import '/src/styles/index.css';
@@ -27,18 +29,81 @@ const servers=[
  {id:'sub-b',name:'Other fixture',protocol:'trojan',address:'other.invalid',port:4,subscriptionId:'second'},
 ];
 const subscriptions=[{id:'first',name:'First subscription'},{id:'second',name:'Second subscription'},{id:'empty',name:'Empty subscription'}];
-const test=window.__pickerTest={picked:null,store};
+const extra=[
+ {id:'slow',name:'Slow fixture',protocol:'socks',address:'slow.invalid',port:5},
+ {id:'fast',name:'Fast fixture',protocol:'socks',address:'fast.invalid',port:6},
+ {id:'zero',name:'Zero fixture',protocol:'socks',address:'zero.invalid',port:7},
+ {id:'stale',name:'Stale fixture',protocol:'socks',address:'stale.invalid',port:8},
+ {id:'fail',name:'Failed fixture',protocol:'socks',address:'fail.invalid',port:9},
+ {id:'unknown',name:'Unknown fixture',protocol:'socks',address:'unknown.invalid',port:10},
+ ...Array.from({length:14},(_,i)=>({id:'filler-'+i,name:'Filler '+i,protocol:'socks',address:'filler.invalid',port:20+i})),
+];
+const latencies={manual:80,orphan:20,slow:400,fast:3,zero:0,stale:1,fail:-1};
+const test=window.__pickerTest={picked:null,store,sortStore,showExtra:()=>{}};
 function App(){
- const [query,setQuery]=useState('');const [selected,setSelected]=useState('sub-a');const [open,setOpen]=useState(true);const [screen,setScreen]=useState('home');
- const rows=servers.map(server=>({server,isCurrent:server.id===selected,protocolLabel:server.protocol,stagedOnly:false,latencyMs:undefined,latencyStale:false}));
- return <main className="mobile-root">
-  <input aria-label="搜索节点" value={query} onChange={e=>setQuery(e.target.value)}/>
+ const [query,setQuery]=useState('');const [selected,setSelected]=useState('sub-a');const [open,setOpen]=useState(true);const [screen,setScreen]=useState('home');const [rich,setRich]=useState(false);
+ const sortByLatency=sortStore(state=>state.sortByLatency);test.showExtra=()=>setRich(true);
+ const rows=[...servers,...(rich?extra:[])].map(server=>({server,isCurrent:server.id===selected,protocolLabel:server.protocol,stagedOnly:false,latencyMs:latencies[server.id],latencyStale:server.id==='stale'}));
+ return <main className="mobile-root m-shell">
   <button onClick={()=>setOpen(value=>!value)}>开关列表</button>
   <button onClick={()=>setSelected(null)}>无当前节点</button>
   <button onClick={()=>setScreen(value=>value==='home'?'nodes':'home')}>切换页面</button>
-  {open&&<HomeNodePickerList rows={rows} subscriptions={subscriptions} query={query} t={t} onUseAsExit={server=>test.picked=server.id}/>}
+  {open&&<div className="h-sheet h-picker-sheet" role="dialog" aria-label="选择节点">
+   <SheetHeading title="选择节点" closeLabel="关闭" onClose={()=>setOpen(false)} className="h-sheethead" titleClassName="h-sheettitle"/>
+   <div className="h-picker-search">
+    <input className="h-search" aria-label="搜索节点" value={query} onChange={e=>setQuery(e.target.value)}/>
+    <button type="button" className="h-picker-sort" role="switch" aria-checked={sortByLatency} aria-label={t('home.sortByLatency')} onClick={()=>sortStore.getState().toggleSortByLatency()}>
+     <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="M3 5h14M3 10h10M3 15h6"/></svg><span>{t('home.latencyShort')}</span>
+    </button>
+   </div>
+   <div className="h-picker-scroll">
+    <ul className="h-picklist"><li><button className="h-pickrow">直连</button></li><li><button className="h-pickrow">阻断</button></li></ul>
+    <HomeNodePickerList rows={rows} subscriptions={subscriptions} query={query} sortByLatency={sortByLatency} t={t} onUseAsExit={server=>test.picked=server.id}/>
+   </div>
+  </div>}
   <div data-speed-screen={screen} key={screen}><MobileSpeedTestProgress/></div>
  </main>;
+}
+createRoot(document.getElementById('root')).render(<App/>);
+`;
+const fullHomeEntry = `
+import React, { useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { MobileShell } from '/src/mobile/MobileShell';
+import { HomeScreenView } from '/src/mobile/home/HomeScreenView';
+import zhCN from '/src/i18n/locales/zh-CN.json';
+import i18n, { i18nReady } from '/src/i18n';
+import '/src/styles/tokens.resolved.css';
+import '/src/mobile/theme.css';
+import '/src/mobile/mobile.css';
+import '/src/mobile/home/home.css';
+import '/src/mobile/redesign.css';
+await i18nReady; i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); await i18n.changeLanguage('zh-CN');
+const t=(key,opts)=>i18n.t(key,opts);
+const noop=()=>{};
+const servers=[
+ ...Array.from({length:22},(_,i)=>({id:'manual-'+i,name:'Manual node '+i,protocol:'socks',address:'manual.invalid',port:100+i})),
+ {id:'sub-a',name:'Selected fixture',protocol:'vmess',address:'selected.invalid',port:443,subscriptionId:'first'},
+];
+function App(){
+ const [query,setQuery]=useState('');const [open,setOpen]=useState(true);
+ const props={t,writeErrors:{},core:'running',connState:'connected',
+  node:{kind:'node',name:'Selected fixture',protocolLabel:'VMess',flagSrc:null,latencyMs:24,latencyStale:false},
+  onToggleConnect:noop,onNetworkCheck:noop,
+  latencyCheck:{busyKind:null,error:null,feedback:null,blocked:null,blockedStatus:'mobileHome.notApplicable',allUnavailable:null,onRunCurrent:noop,onRunAll:noop},
+  tsExitWarning:'none',onTsExitAction:noop,pickerOpen:open,onOpenPicker:()=>setOpen(true),onClosePicker:()=>setOpen(false),
+  pickerQuery:query,onPickerQuery:setQuery,
+  pickRows:servers.map(server=>({server,isCurrent:server.id==='sub-a',stagedOnly:false,latencyMs:server.id==='sub-a'?24:undefined,latencyStale:false,protocolLabel:server.protocol})),
+  pickerSubscriptions:[{id:'first',name:'First subscription'}],onUseAsExit:noop,onPickSentinel:noop,blockDisabledReason:null,
+  noServers:false,onAddServer:noop,onAddSubscription:noop,routing:'smart',reverseRouting:false,
+  exitRegion:{kind:'flag',code:'hk'},exitFlagSrc:null,exitIsDirect:false,exitProbing:false,onSetRouting:noop,exitIp:null,
+  unlock:[],unlockCheckedLabel:'mobileHome.checkedJustNow',unlockRunning:false,unlockDetailId:null,onOpenUnlockDetail:noop,onCloseUnlockDetail:noop,
+  samples:[],composition:[],ruleHits:[],hosts:[],hostsMasked:false,hostQuery:'',onHostQuery:noop,
+  ruleSubject:null,ruleSubjectView:'menu',onOpenRuleSubject:noop,onCloseRuleSubject:noop,onRuleSubjectView:noop,onQuickRule:noop,
+  newRuleAction:'proxy',onNewRuleAction:noop,newRuleRemarks:'',onNewRuleRemarks:noop,ruleRemarksHint:'home.ruleRemarks',onCreateRule:noop,
+  appendQuery:'',onAppendQuery:noop,appendTargets:[],onAppendToRule:noop,
+  windowBytes:0,windowConnections:0,kernelConnections:0};
+ return <MobileShell active="home" onSelect={noop}><HomeScreenView {...props}/></MobileShell>;
 }
 createRoot(document.getElementById('root')).render(<App/>);
 `;
@@ -46,9 +111,12 @@ let server: ViteDevServer; let browser: Browser; let origin: string;
 describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and measured task consumers', () => {
   beforeAll(async () => {
     server=await createServer({root,cacheDir:path.join(tmpdir(),'polaris-picker-speed-vite-'+process.pid),server:{host:'127.0.0.1',port:0,watch:null},plugins:[{
-      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;},
-      configureServer(vite){vite.middlewares.use('/__picker-speed',async(_req,res)=>{
-        const html=await vite.transformIndexHtml('/__picker-speed','<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/picker-speed-fixture.tsx"></script></html>');
+      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx'||id==='/full-home-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;if(id==='/full-home-fixture.tsx')return fullHomeEntry;},
+      configureServer(vite){vite.middlewares.use(async(req,res,next)=>{
+        if(req.url!=='/__picker-speed'&&req.url!=='/__full-home')return next();
+        const full=req.url?.includes('full-home');
+        const html=await vite.transformIndexHtml(full?'/__full-home':'/__picker-speed',
+          '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/'+(full?'full-home-fixture':'picker-speed-fixture')+'.tsx"></script></html>');
         res.setHeader('Content-Type','text/html');res.end(html);
       });},
     }]});await server.listen();const address=server.httpServer!.address();if(!address||typeof address!=='object')throw new Error('Vite did not bind');origin='http://127.0.0.1:'+address.port;
@@ -81,7 +149,108 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     await page.waitForFunction(()=>document.querySelectorAll('[data-picker-node]').length===0);
     await page.close();
   },30_000);
-  it('real counters persist across screen remount; preparation hides previous results and silence is not an interruption',async()=>{
+  it('sorts only within each group, preserves folding, and restores config order when switched off',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});await page.goto(origin+'/__picker-speed');
+    await page.locator('.h-pick-group').first().waitFor();
+    await page.evaluate(()=>(window as any).__pickerTest.showExtra());
+    await page.locator('[data-group-id="manual"]').click();
+    const ids=()=>page.locator('[data-picker-node]').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-picker-node')));
+    const groups=()=>page.locator('.h-pick-group').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-group-id')));
+    expect((await ids()).slice(0,8)).toEqual(['manual','orphan','slow','fast','zero','stale','fail','unknown']);
+    expect(await groups()).toEqual(['manual','mesh','first','second']);
+    const sort=page.getByRole('switch',{name:'按延迟排序'});
+    expect(await sort.getAttribute('aria-checked')).toBe('false');
+    await sort.click();
+    expect(await sort.getAttribute('aria-checked')).toBe('true');
+    expect((await ids()).slice(0,6)).toEqual(['zero','fast','orphan','manual','slow','fail']);
+    expect((await ids()).indexOf('stale')).toBeGreaterThan((await ids()).indexOf('fail'));
+    expect((await ids()).indexOf('unknown')).toBeGreaterThan((await ids()).indexOf('stale'));
+    expect(await groups()).toEqual(['manual','mesh','first','second']);
+    expect(await page.locator('[data-group-id="manual"]').getAttribute('aria-expanded')).toBe('true');
+    expect(await page.evaluate(()=>localStorage.getItem('polaris.nodeSortByLatency'))).toBe('true');
+    await sort.click();
+    expect((await ids()).slice(0,8)).toEqual(['manual','orphan','slow','fast','zero','stale','fail','unknown']);
+    await page.close();
+  },30_000);
+  it('keeps the heading and search reachable while a long picker list scrolls on all mobile widths and themes',async()=>{
+    for (const width of [320,390,768]) for (const theme of ['light','dark']) {
+      const page=await browser.newPage({viewport:{width,height:740}});await page.goto(origin+'/__picker-speed');
+      await page.locator('.h-pick-group').first().waitFor();
+      await page.evaluate((value)=>{document.documentElement.dataset.theme=value;(window as any).__pickerTest.showExtra();},theme);
+      await page.locator('[data-group-id="manual"]').click();
+      await page.locator('.h-picker-scroll').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+      const geometry=await page.evaluate(()=>{
+        const sheet=document.querySelector('.h-picker-sheet')!;
+        const heading=sheet.querySelector('.h-sheethead')!;
+        const search=sheet.querySelector('.h-picker-search')!;
+        const scroll=sheet.querySelector('.h-picker-scroll')!;
+        const h=heading.getBoundingClientRect(),s=search.getBoundingClientRect(),b=scroll.getBoundingClientRect();
+        return {sheetTop:sheet.getBoundingClientRect().top,headingTop:h.top,headingBottom:h.bottom,searchTop:s.top,searchBottom:s.bottom,
+          bodyTop:b.top,scrollTop:scroll.scrollTop,scrollMax:scroll.scrollHeight-scroll.clientHeight,sheetScrollTop:sheet.scrollTop,
+          headingHit:heading.contains(document.elementFromPoint(h.left+h.width/2,h.top+h.height/2)),
+          sortHeight:sheet.querySelector('.h-picker-sort')!.getBoundingClientRect().height,
+          sortPaint:parseFloat(getComputedStyle(sheet.querySelector('.h-picker-sort')!,'::before').top)*2};
+      });
+      expect(geometry.scrollMax).toBeGreaterThan(100);
+      expect(geometry.scrollTop).toBeGreaterThan(100);
+      expect(geometry.sheetScrollTop).toBe(0);
+      expect(geometry.headingTop).toBeGreaterThanOrEqual(geometry.sheetTop);
+      expect(geometry.searchTop).toBeGreaterThanOrEqual(geometry.headingBottom);
+      expect(geometry.bodyTop).toBeGreaterThanOrEqual(geometry.searchBottom);
+      expect(geometry.headingHit).toBe(true);
+      expect(geometry.sortHeight).toBe(44);
+      expect(geometry.sortHeight-geometry.sortPaint).toBe(36);
+      await page.screenshot({path:path.join(tmpdir(),`polaris-picker-scroll-${width}-${theme}.png`)});
+      await page.close();
+    }
+    const page=await browser.newPage({viewport:{width:320,height:420}});await page.goto(origin+'/__picker-speed');
+    await page.locator('.h-pick-group').first().waitFor();
+    await page.evaluate(()=>{document.documentElement.style.fontSize='32px';(window as any).__pickerTest.showExtra();});
+    await page.locator('[data-group-id="manual"]').click();
+    const geometry=await page.evaluate(()=>{
+      const sheet=document.querySelector('.h-picker-sheet')!,search=sheet.querySelector('.h-picker-search')!,scroll=sheet.querySelector('.h-picker-scroll')!;
+      return {sheetTop:sheet.getBoundingClientRect().top,searchBottom:search.getBoundingClientRect().bottom,bodyTop:scroll.getBoundingClientRect().top,bodyHeight:scroll.getBoundingClientRect().height,
+        searchWidth:search.getBoundingClientRect().width,inputWidth:search.querySelector('input')!.getBoundingClientRect().width,
+        closeVisible:sheet.querySelector('.m-sheet-close')!.getBoundingClientRect().bottom<=scroll.getBoundingClientRect().top};
+    });
+    expect(geometry.bodyTop).toBeGreaterThanOrEqual(geometry.searchBottom);
+    expect(geometry.bodyHeight).toBeGreaterThan(44);
+    expect(geometry.inputWidth).toBeGreaterThan(80);
+    expect(geometry.closeVisible).toBe(true);
+    await page.locator('.h-picker-scroll').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+    expect(await page.locator('[data-picker-node="sub-a"]').isVisible()).toBe(true);
+    await page.screenshot({path:path.join(tmpdir(),'polaris-picker-scroll-320-2x-short.png')});
+    await page.close();
+  },60_000);
+  it('renders and scrolls the production HomeScreenView inside MobileShell with the mobile CSS chain',async()=>{
+    for (const variant of [{width:390,height:844,scale:1},{width:320,height:420,scale:2}]) {
+      const page=await browser.newPage({viewport:{width:variant.width,height:variant.height}});
+      await page.goto(origin+'/__full-home');
+      await page.evaluate(scale=>{document.documentElement.dataset.theme='dark';document.documentElement.style.setProperty('--font-scale',String(scale));},variant.scale);
+      const sheet=page.locator('.h-picker-sheet');await sheet.waitFor();
+      await sheet.locator('[data-group-id="manual"]').click();
+      await sheet.locator('.h-picker-scroll').evaluate(node=>{node.scrollTop=node.scrollHeight;});
+      const result=await sheet.evaluate(node=>{
+        const head=node.querySelector('.h-sheethead')!,search=node.querySelector('.h-picker-search')!,body=node.querySelector('.h-picker-scroll')!;
+        const h=head.getBoundingClientRect(),s=search.getBoundingClientRect(),b=body.getBoundingClientRect();
+        const close=node.querySelector('.m-sheet-close')!;
+        return {sheetScrollTop:node.scrollTop,bodyScrollTop:body.scrollTop,bodyMax:body.scrollHeight-body.clientHeight,
+          headerHit:head.contains(document.elementFromPoint(h.left+h.width/2,h.top+h.height/2)),
+          closeVisible:close.getBoundingClientRect().bottom<=b.top,searchVisible:s.bottom<=b.top,
+          finalRowVisible:node.querySelector('[data-picker-node="sub-a"]')!.getBoundingClientRect().bottom<=b.bottom+1};
+      });
+      expect(result.sheetScrollTop).toBe(0);
+      expect(result.bodyScrollTop).toBeGreaterThan(0);
+      expect(result.bodyMax).toBeGreaterThan(0);
+      expect(result.headerHit).toBe(true);
+      expect(result.closeVisible).toBe(true);
+      expect(result.searchVisible).toBe(true);
+      expect(result.finalRowVisible).toBe(true);
+      await page.screenshot({path:path.join(tmpdir(),`polaris-full-home-picker-${variant.width}-${variant.scale}x-dark.png`)});
+      await page.close();
+    }
+  },60_000);
+  it('terminal progress disappears immediately; late frames do not revive it and new work can start',async()=>{
     const page=await browser.newPage({viewport:{width:390,height:844}});await page.goto(origin+'/__picker-speed');await page.locator('.h-pick-group').first().waitFor();
     await page.evaluate(()=>{const store=(window as any).__pickerTest.store;store.getState().begin(['a','b','c'],'all');});
     await page.getByText('准备测速…',{exact:true}).waitFor();expect(await page.locator('progress').count()).toBe(0);
@@ -89,12 +258,23 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     await page.locator('progress').waitFor();expect(await page.locator('progress').getAttribute('value')).toBe('1');expect(await page.locator('progress').getAttribute('max')).toBe('3');
     expect(await page.locator('.m-speedtest-counts').innerText()).toContain('成功 0 · 失败 1');
     await page.getByRole('button',{name:'切换页面'}).click();expect(await page.locator('[data-speed-screen="nodes"] progress').getAttribute('value')).toBe('1');
-    await page.evaluate(()=>{const s=(window as any).__pickerTest.store.getState();s.done({runId:'1',outcome:'interrupted',tested:1,total:3,serverIds:['a','b','c'],pending:['b','c']});s.settle(s.request.token,{runId:'1',results:{a:-1},outcome:'interrupted',notInPool:[],tsNotReady:[]});s.begin(['a'],'current');});
+    await page.evaluate(()=>{(window as any).__pickerTest.store.getState().done({runId:'1',outcome:'interrupted',tested:1,total:3,serverIds:['a','b','c'],pending:['b','c']});});
+    await page.locator('.m-speedtest-progress').waitFor({state:'detached'});
+    await page.evaluate(()=>{const s=(window as any).__pickerTest.store.getState();s.settle(s.request.token,{runId:'1',results:{a:-1},outcome:'interrupted',notInPool:[],tsNotReady:[]});s.progress({runId:'1',tested:1,ok:0,total:3});});
+    expect(await page.locator('.m-speedtest-progress').count()).toBe(0);
+    await page.evaluate(()=>{(window as any).__pickerTest.store.getState().begin(['a'],'current');});
     await page.getByText('准备测速…',{exact:true}).waitFor();expect(await page.locator('progress').count()).toBe(0);expect(await page.locator('.m-speedtest-counts').count()).toBe(0);
     await page.evaluate(()=>{const s=(window as any).__pickerTest.store.getState();s.progress({runId:'2',tested:0,ok:0,total:1});s.waiting('2');});
     await page.getByText('暂未收到新进度，状态待确认',{exact:true}).waitFor();expect(await page.locator('.m-speedtest-progress').innerText()).not.toContain('中断');
     await page.evaluate(()=>{(window as any).__pickerTest.store.getState().done({runId:'1',outcome:'completed',tested:3,total:3,serverIds:['a','b','c'],pending:[]});});
     expect(await page.locator('progress').getAttribute('max')).toBe('1');expect(await page.locator('progress').getAttribute('value')).toBe('0');
+    await page.evaluate(()=>{(window as any).__pickerTest.store.getState().done({runId:'2',outcome:'completed',tested:1,total:1,serverIds:['a'],pending:[]});});
+    await page.locator('.m-speedtest-progress').waitFor({state:'detached'});
+    await page.evaluate(()=>{const s=(window as any).__pickerTest.store.getState();s.settle(s.request.token,{runId:'2',results:{a:27},outcome:'completed',notInPool:[],tsNotReady:[]});s.progress({runId:'2',tested:1,ok:1,total:1});});
+    expect(await page.locator('.m-speedtest-progress').count()).toBe(0);
+    expect(await page.evaluate(()=>(window as any).__pickerTest.store.getState().task.phase)).toBe('completed');
+    await page.evaluate(()=>{(window as any).__pickerTest.store.getState().begin(['b'],'current');});
+    await page.getByText('准备测速…',{exact:true}).waitFor();
     await page.close();
   },30_000);
 });

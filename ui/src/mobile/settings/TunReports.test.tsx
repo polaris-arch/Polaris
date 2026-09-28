@@ -85,10 +85,10 @@ function node(
   };
 }
 
-const forceMarkup = (report: EndpointForceRouteReport | null, lang: string): string => {
+const forceMarkup = (report: EndpointForceRouteReport | null, lang: string, loading = false, error = false): string => {
   h.lang = lang;
   return renderToStaticMarkup(
-    <MobileEndpointForceRouteBlock report={report} servers={SERVERS} />,
+    <MobileEndpointForceRouteBlock report={report} loading={loading} error={error} onRefresh={() => {}} servers={SERVERS} />,
   );
 };
 
@@ -153,6 +153,19 @@ const EXTERNAL_AND_PREFERRED: EndpointForceRouteReport = {
 
 describe('② 组网网段结算：四条腿各说各的，被吃干净的点名到节点', () => {
   for (const lang of LANGS) {
+    it(`[${lang}] 刷新期间禁用操作并保留已有报告，失败后可重试且旧结论带错误提示`, () => {
+      const pending = forceMarkup(CLEAN, lang, true);
+      expect(pending).toContain('class="ms-force-refresh"');
+      expect(pending).toContain('disabled');
+      expect(pending).toContain(translate(lang, 'settings.tun.forceRouteLoading'));
+      expect(pending).toContain(translate(lang, 'mobileSettings.forceRouteNone', { count: 2 }));
+      const failed = forceMarkup(CLEAN, lang, false, true);
+      expect(failed).toContain('role="alert"');
+      expect(failed).toContain(translate(lang, 'settings.tun.forceRouteUnavailable'));
+      expect(failed).toContain(translate(lang, 'mobileSettings.forceRouteNone', { count: 2 }));
+      expect(failed).not.toContain('disabled');
+      expect(forceMarkup(null, lang, true)).toContain(translate(lang, 'settings.tun.forceRouteLoading'));
+    });
     it(`[${lang}] 拉不到（null）：说读不到，不说「没有节点被抢」`, () => {
       const markup = forceMarkup(null, lang);
       expect(markup).toContain(translate(lang, 'settings.tun.forceRouteUnavailable'));

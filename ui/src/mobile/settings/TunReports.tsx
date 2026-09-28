@@ -22,6 +22,7 @@ import { useTranslation } from 'react-i18next';
 import type { ServerConfig } from '@/contracts/types';
 import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
 import { isAccountBasedProtocol } from '@/domain/endpoint-routes';
+import { RefreshIcon } from '../screens/rules/Primitives';
 import { SettingsGroup, SettingsNote } from './SettingsChrome';
 
 /** 逐条清单的排版。移动端没有桌面的 `.cidr-eff-list`，同族样式就地给。 */
@@ -56,10 +57,16 @@ function Warn({ id, children }: { id: string; children: ReactNode }): ReactEleme
  */
 export function MobileEndpointForceRouteBlock({
   report,
+  loading,
+  error,
+  onRefresh,
   servers,
 }: {
-  /** `null` = 还没拉到 / 拉取失败。 */
+  /** `null` = 还没有成功读取过。 */
   report: EndpointForceRouteReport | null;
+  loading: boolean;
+  error: boolean;
+  onRefresh: () => void;
   /** 把报告里的 serverId 换成用户看得懂的节点名，并判断败方是不是 Tailscale。 */
   servers: readonly ServerConfig[];
 }): ReactElement {
@@ -76,9 +83,11 @@ export function MobileEndpointForceRouteBlock({
   let body: ReactNode;
   if (report === null) {
     body = (
-      <SettingsNote id="force-route-unavailable">
-        {t('settings.tun.forceRouteUnavailable')}
-      </SettingsNote>
+      <div role={error ? 'alert' : 'status'}>
+        <SettingsNote id="force-route-unavailable">
+          {t(loading ? 'settings.tun.forceRouteLoading' : 'settings.tun.forceRouteUnavailable')}
+        </SettingsNote>
+      </div>
     );
   } else if (report.servers.length === 0) {
     body = <SettingsNote id="force-route-empty">{t('mobileSettings.forceRouteEmpty')}</SettingsNote>;
@@ -160,8 +169,17 @@ export function MobileEndpointForceRouteBlock({
   }
 
   return (
-    <SettingsGroup header={t('settings.tun.forceRouteBlock')}>
+    <SettingsGroup header={<div className="ms-force-head">
+      <span>{t('settings.tun.forceRouteBlock')}</span>
+      <button type="button" className="ms-force-refresh" onClick={onRefresh} disabled={loading}
+        aria-label={`${t('common.refresh')} · ${t('settings.tun.forceRouteBlock')}`}
+        title={`${t('common.refresh')} · ${t('settings.tun.forceRouteBlock')}`}>
+        <RefreshIcon />
+      </button>
+    </div>}>
       <SettingsNote id="force-route-hint" title={t('settings.tun.forceRouteBlock')} summary={t('mobileHelp.forceRoute')}>{t('mobileSettings.forceRouteCalculationHint')}</SettingsNote>
+      {loading && report !== null && <p className="ms-force-feedback" role="status">{t('settings.tun.forceRouteLoading')}</p>}
+      {error && report !== null && <p className="ms-force-feedback error" role="alert">{t('settings.tun.forceRouteUnavailable')}</p>}
       {body}
     </SettingsGroup>
   );
