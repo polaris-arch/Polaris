@@ -4,6 +4,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub const MESH_ROUTE_SCHEMA_VERSION: u32 = 1;
 
@@ -323,6 +324,139 @@ fn decimal_revision<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String
     Ok(value)
 }
 
+fn canonical_cidr(raw: &str) -> Result<String, String> {
+    let (address, prefix) = raw
+        .split_once('/')
+        .map_or((raw, None), |(address, prefix)| (address, Some(prefix)));
+    let ip: IpAddr = address.parse().map_err(|_| "invalid mesh IP address")?;
+    match ip {
+        IpAddr::V4(ip) => {
+            let prefix = prefix
+                .map_or(Ok(32), str::parse::<u8>)
+                .map_err(|_| "invalid IPv4 prefix")?;
+            if prefix > 32 {
+                return Err("invalid IPv4 prefix".into());
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            Ok(format!(
+                "{}/{}",
+                Ipv4Addr::from(u32::from(ip) & mask),
+                prefix
+            ))
+        }
+        IpAddr::V6(ip) => {
+            let prefix = prefix
+                .map_or(Ok(128), str::parse::<u8>)
+                .map_err(|_| "invalid IPv6 prefix")?;
+            if prefix > 128 {
+                return Err("invalid IPv6 prefix".into());
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            Ok(format!(
+                "{}/{}",
+                Ipv6Addr::from(u128::from(ip) & mask),
+                prefix
+            ))
+        }
+    }
+}
+
+fn canonical_cidr_set(values: &mut Vec<String>) -> Result<(), String> {
+    let normalized: BTreeSet<String> = values
+        .iter()
+        .map(|value| canonical_cidr(value))
+        .collect::<Result<_, _>>()?;
+    *values = normalized.into_iter().collect();
+    Ok(())
+}
+
+fn canonical_host(raw: &str) -> Result<String, String> {
+    let address = raw.split_once('/').map_or(raw, |(address, _)| address);
+    let ip: IpAddr = address.parse().map_err(|_| "invalid mesh host address")?;
+    let canonical = canonical_cidr(raw)?;
+    let host_prefix = match ip {
+        IpAddr::V4(_) => "/32",
+        IpAddr::V6(_) => "/128",
+    };
+    if !canonical.ends_with(host_prefix) {
+        return Err("mesh raw host must be a single IP".into());
+    }
+    Ok(canonical)
+}
+
+fn canonical_host_set(values: &mut Vec<String>) -> Result<(), String> {
+    let normalized: BTreeSet<String> = values
+        .iter()
+        .map(|value| canonical_host(value))
+        .collect::<Result<_, _>>()?;
+    *values = normalized.into_iter().collect();
+    Ok(())
+}
+
+/// One compare-and-swap step for semantic ledger changes. Sampling timestamps are
+/// excluded from the comparison; reordered/equivalent IP evidence cannot invalidate
+/// a preview. A no-op does not write or advance the independent state revision.
+pub fn revise_semantic(
+    previous: &MeshRouteState,
+    expected_revision: &str,
+    mut next: MeshRouteState,
+) -> Result<Option<MeshRouteState>, String> {
+    previous.validate()?;
+    next.validate()?;
+    if previous.revision != expected_revision || next.revision != previous.revision {
+        return Err("mesh state revision conflict".into());
+    }
+    // Historical MagicDNS scope survives missing/empty frames and retirement.
+    // The resolver may only gain this evidence; a later release is a separate
+    // explicit policy transaction, never an observation overwrite.
+    for prior in &previous.observations {
+        if let Some(current) = next.observations.iter_mut().find(|observation| {
+            observation.owner_ref == prior.owner_ref && observation.source == prior.source
+        }) {
+            current
+                .magic_dns_suffixes
+                .extend(prior.magic_dns_suffixes.iter().cloned());
+            if current.raw_hosts.is_empty() && current.advertised_routes.is_empty() {
+                current.raw_hosts = prior.raw_hosts.clone();
+                current.advertised_routes = prior.advertised_routes.clone();
+            }
+        } else {
+            next.observations.push(prior.clone());
+        }
+    }
+    let mut old = previous.clone();
+    old.normalize_semantic()?;
+    next.normalize_semantic()?;
+    let mut new_compare = next.clone();
+    old.revision.clear();
+    new_compare.revision.clear();
+    for observation in &mut old.observations {
+        observation.last_valid_evidence = None;
+    }
+    for observation in &mut new_compare.observations {
+        observation.last_valid_evidence = None;
+    }
+    if old == new_compare {
+        return Ok(None);
+    }
+    let revision = previous
+        .revision
+        .parse::<u64>()
+        .map_err(|_| "invalid mesh state revision")?
+        .checked_add(1)
+        .ok_or("mesh state revision exhausted")?;
+    next.revision = revision.to_string();
+    Ok(Some(next))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MeshDesiredRun {
@@ -497,6 +631,67 @@ impl MeshRoutePolicy {
 }
 
 impl MeshRouteState {
+    fn normalize_semantic(&mut self) -> Result<(), String> {
+        for observation in &mut self.observations {
+            canonical_host_set(&mut observation.raw_hosts)?;
+            canonical_cidr_set(&mut observation.advertised_routes)?;
+            let suffixes: BTreeSet<String> = observation
+                .magic_dns_suffixes
+                .iter()
+                .map(|suffix| {
+                    if suffix.trim() != suffix {
+                        return Err("invalid MagicDNS suffix".into());
+                    }
+                    let normalized = suffix.trim_end_matches('.').to_ascii_lowercase();
+                    if normalized.is_empty() {
+                        return Err("invalid MagicDNS suffix".into());
+                    }
+                    Ok(normalized)
+                })
+                .collect::<Result<_, String>>()?;
+            observation.magic_dns_suffixes = suffixes.into_iter().collect();
+        }
+        self.identities.sort_by(|a, b| {
+            (&a.server_id, &a.identity_epoch).cmp(&(&b.server_id, &b.identity_epoch))
+        });
+        self.observations.sort_by(|a, b| {
+            (
+                &a.owner_ref.server_id,
+                &a.owner_ref.identity_epoch,
+                &a.source,
+                &a.raw_hosts,
+                &a.advertised_routes,
+                &a.magic_dns_suffixes,
+            )
+                .cmp(&(
+                    &b.owner_ref.server_id,
+                    &b.owner_ref.identity_epoch,
+                    &b.source,
+                    &b.raw_hosts,
+                    &b.advertised_routes,
+                    &b.magic_dns_suffixes,
+                ))
+        });
+        for reservation in &mut self.reservations {
+            reservation.cidr = canonical_cidr(&reservation.cidr)?;
+        }
+        self.reservations.sort_by(|a, b| {
+            (&a.cidr, &a.origin, format!("{:?}", a.owner_ref)).cmp(&(
+                &b.cidr,
+                &b.origin,
+                format!("{:?}", b.owner_ref),
+            ))
+        });
+        self.identity_effects
+            .sort_by(|a, b| a.effect_id.cmp(&b.effect_id));
+        if let Some(transaction) = &mut self.transaction {
+            transaction.identity_bindings.sort_by(|a, b| {
+                (&a.server_id, &a.identity_epoch).cmp(&(&b.server_id, &b.identity_epoch))
+            });
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != MESH_ROUTE_SCHEMA_VERSION || self.local_id.trim().is_empty() {
             return Err("unsupported or incomplete meshRouteState".into());
@@ -521,6 +716,32 @@ impl MeshRouteState {
                 || identity.evidence_source.is_empty()
             {
                 return Err("incomplete mesh identity evidence".into());
+            }
+        }
+        for observation in &self.observations {
+            if observation.owner_ref.server_id.is_empty()
+                || observation.owner_ref.identity_epoch.is_empty()
+            {
+                return Err("incomplete mesh observation owner".into());
+            }
+            for raw_host in &observation.raw_hosts {
+                canonical_host(raw_host)?;
+            }
+            for route in &observation.advertised_routes {
+                canonical_cidr(route)?;
+            }
+            unique_nonempty(observation.magic_dns_suffixes.iter().map(String::as_str))?;
+        }
+        for reservation in &self.reservations {
+            canonical_cidr(&reservation.cidr)?;
+            if let MeshReservationOwner::Owner {
+                server_id,
+                identity_epoch,
+            } = &reservation.owner_ref
+            {
+                if server_id.is_empty() || identity_epoch.is_empty() {
+                    return Err("incomplete mesh reservation owner".into());
+                }
             }
         }
         Ok(())

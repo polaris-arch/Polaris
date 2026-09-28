@@ -1,4 +1,6 @@
-use polaris_config_engine::user_config::mesh_route_state::{MeshRoutePolicy, MeshRouteState};
+use polaris_config_engine::user_config::mesh_route_state::{
+    revise_semantic, MeshRoutePolicy, MeshRouteState,
+};
 use polaris_store::backup::{merge_categories, pick_categories, BackupCategory};
 use polaris_store::mesh_guard::{reconcile_untrusted, validate_raw, POLICY_KEY, STATE_KEY};
 use polaris_store::store::default_config;
@@ -156,6 +158,11 @@ fn invalid_or_incomplete_managed_disk_never_falls_back_to_writable_default() {
             v[STATE_KEY]["identities"][0]["identityEpoch"] = json!("");
             v
         },
+        {
+            let mut v = managed_config();
+            v[STATE_KEY]["observations"][0]["rawHosts"] = json!(["100.80.1.2/24"]);
+            v
+        },
     ] {
         let bytes = serde_json::to_string(&bad).unwrap();
         std::fs::write(&path, &bytes).unwrap();
@@ -232,4 +239,45 @@ fn legacy_backup_categories_never_export_or_import_mesh_evidence() {
     let merged = merge_categories(&current, &foreign, &selected).config;
     assert_eq!(merged[POLICY_KEY], current[POLICY_KEY]);
     assert_eq!(merged[STATE_KEY], current[STATE_KEY]);
+}
+
+#[test]
+fn semantic_revision_cas_ignores_clock_order_and_equivalent_ip_but_detects_new_scope() {
+    let mut previous: MeshRouteState =
+        serde_json::from_value(fixture()[STATE_KEY].clone()).unwrap();
+    previous.revision = "4".into();
+    previous.observations[0].raw_hosts = vec!["100.80.1.3/32".into(), "100.80.1.2".into()];
+    previous.observations[0]
+        .raw_hosts
+        .push("fd7a:115c:a1e0:0:0:0:0:53/128".into());
+    previous.observations[0].magic_dns_suffixes = vec!["Tail.Example.Invalid.".into()];
+    let mut same = previous.clone();
+    same.observations[0].raw_hosts.reverse();
+    same.observations[0].raw_hosts[0] = "fd7a:115c:a1e0::53".into();
+    same.observations[0].raw_hosts[1] = "100.80.1.2/32".into();
+    same.observations[0].raw_hosts[2] = "100.80.1.3".into();
+    same.observations[0].last_valid_evidence = Some("later-sample".into());
+    same.observations[0].magic_dns_suffixes.clear();
+    assert!(revise_semantic(&previous, "4", same).unwrap().is_none());
+
+    let mut changed = previous.clone();
+    changed.observations[0]
+        .advertised_routes
+        .push("100.81.0.42/16".into());
+    let committed = revise_semantic(&previous, "4", changed).unwrap().unwrap();
+    assert_eq!(committed.revision, "5");
+    assert!(committed.observations[0]
+        .advertised_routes
+        .contains(&"100.81.0.0/16".into()));
+    assert_eq!(
+        committed.observations[0].magic_dns_suffixes,
+        ["tail.example.invalid"]
+    );
+    assert!(revise_semantic(&committed, "4", committed.clone()).is_err());
+
+    let mut exhausted = previous.clone();
+    exhausted.revision = u64::MAX.to_string();
+    let mut next = exhausted.clone();
+    next.observations[0].raw_hosts.push("100.80.1.4".into());
+    assert!(revise_semantic(&exhausted, &u64::MAX.to_string(), next).is_err());
 }
