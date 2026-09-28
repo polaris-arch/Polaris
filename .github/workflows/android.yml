@@ -589,11 +589,44 @@ jobs:
           NDK_HOME: ${{ env.NDK_RUST }}
         run: |
           set -euo pipefail
-          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \
-            --config src-tauri/tauri.android.conf.json -- -PpolarisAllowUnsigned=true
-
+          # Tauri 2 passes trailing runner args to Cargo, not Gradle. Passing -P here aborts
+          # before Rust release or R8. Force this package to rebuild, then accept only the
+          # explicit missing-signing guard after Tauri has emitted this checkout's release SO.
+          cargo clean -p polaris --target aarch64-linux-android --release
+          marker="$RUNNER_TEMP/release-stage1-start"
+          touch "$marker"
+          stage1_log="$RUNNER_TEMP/release-stage1.log"
+          if bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \
+              --config src-tauri/tauri.android.conf.json >"$stage1_log" 2>&1; then
+            echo '::error::unsigned smoke stage1 unexpectedly bypassed the release signing guard'
+            exit 1
+          fi
+          if ! grep -Fq 'Android release 签名凭据缺失 —— 拒绝静默产出未签名包。' "$stage1_log" \
+              || ! grep -q 'Finished.*release.*profile' "$stage1_log"; then
+            tail -80 "$stage1_log"
+            echo '::error::release Rust build did not reach the expected signing-only refusal'
+            exit 1
+          fi
+          so=target/aarch64-linux-android/release/libpolaris_lib.so
           jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
           up=src-tauri/gen/android/app/src/main/assets/_up_
+          [ -s "$so" ] && [ "$so" -nt "$marker" ] \
+            || { echo '::error::fresh release Rust SO missing'; exit 1; }
+          [ "$(readlink -f "$jni/libpolaris_lib.so")" = "$(realpath "$so")" ] \
+            || { echo '::error::jniLibs does not point to this release SO'; exit 1; }
+          [ -s "$jni/libc++_shared.so" ] || { echo '::error::libc++_shared.so missing'; exit 1; }
+          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
+            [ -s "$up/$f" ] || { echo "::error::$up/$f missing"; exit 1; }
+          done
+          [ -d "$up/resources/data" ] || { echo '::error::bundled data missing'; exit 1; }
+          echo "source=$(git rev-parse HEAD) release_so=$(sha256sum "$so" | cut -d' ' -f1)"
+
+          # The exact Rust task above is already complete. Run Gradle itself so -P is a
+          # command-line project property; never put the unsigned hatch in env/properties.
+          bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android \
+            :app:assembleArm64Release -PpolarisAllowUnsigned=true \
+            -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
+
           for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
             [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了"; exit 1; }
           done

@@ -1182,8 +1182,15 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
         ANDROID_WORKFLOW,
     );
     assert!(
-        smoke_job.contains("--config src-tauri/tauri.android.conf.json -- -PpolarisAllowUnsigned=true"),
-        "{ANDROID_WORKFLOW}：release 冒烟腿没有把仅本次有效的 unsigned 逃生门交给 Tauri runner"
+        smoke_job.contains(":app:assembleArm64Release -PpolarisAllowUnsigned=true")
+            && smoke_job.contains("-x :app:rustBuildArm64Release")
+            && smoke_job.contains("cargo clean -p polaris --target aarch64-linux-android --release")
+            && smoke_job.contains("Android release 签名凭据缺失 —— 拒绝静默产出未签名包。")
+            && smoke_job.contains("[ -s \"$so\" ] && [ \"$so\" -nt \"$marker\" ]")
+            && smoke_job.contains("readlink -f \"$jni/libpolaris_lib.so\"")
+            && smoke_job.contains("source=$(git rev-parse HEAD)")
+            && !smoke_job.contains("--config src-tauri/tauri.android.conf.json -- -PpolarisAllowUnsigned=true"),
+        "{ANDROID_WORKFLOW}：release 冒烟腿必须先新建 Rust SO、仅接受签名守卫拒绝，再由 Gradle 本次命令行显式开启 unsigned；Tauri 尾参会误传给 Cargo"
     );
     // 正面对照：这个词在别处（`release-smoke` 那条腿）**必须**还在，否则上面那条否定断言
     // 可能只是因为整份 workflow 里它已经消失了（那时逃生门的判据本身塌了，不是发布腿干净）。
@@ -1394,9 +1401,18 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
     ),
     (
         "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
-        2,
-        "让 R8 真的跑一次。逃生门通过 Tauri runner 实参只对本次 Gradle 生效，\
-         不落文件、不进环境变量，所以不会留给后面任何一次构建。",
+        1,
+        "发布腿必须走未带 unsigned 逃生门的正常 Tauri release 构建。",
+    ),
+    (
+        "          if bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
+        1,
+        "冒烟腿先强制产出本次源码的 Release SO，只允许明确的签名守卫拒绝。",
+    ),
+    (
+        "          bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android \\",
+        1,
+        "冒烟腿随后由 Gradle 本次命令行显式开启 unsigned，并只跳过已完成的 Rust task。",
     ),
 ];
 
@@ -1405,8 +1421,13 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
 /// 2026-09-05 收官轮 A10：上一版的承重行是一张手挑的表，表外还有同形的行
 /// （`verify-apk.mjs` 那条、`gradlew assembleArm64Debug` 那条），接 `|| true` 照绿。
 /// 手挑的表守不住「同形的下一条」，因为下一条不在表里。
-const LOAD_BEARING_INVOCATIONS: &[&str] =
-    &["node scripts/", "bash scripts/", "sh scripts/", "./gradlew"];
+const LOAD_BEARING_INVOCATIONS: &[&str] = &[
+    "node scripts/",
+    "bash scripts/",
+    "sh scripts/",
+    "./gradlew",
+    "src-tauri/gen/android/gradlew",
+];
 
 /// 把一条命令的退出码中和掉的写法。命中任一即红。
 ///
