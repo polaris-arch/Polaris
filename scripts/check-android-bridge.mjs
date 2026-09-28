@@ -4,8 +4,8 @@
  *
  * # 这道门守的是什么
  *
- * **不是**配置 JSON 的形状 —— Kotlin 侧根本不解析配置，它只是把字符串转手给 libbox。
- * 真正会静默漂的是**命令面**：改个 Kotlin 方法名、少个 `@InvokeArg` 字段，两侧都编得过
+ * 主核桥把 Rust 配置字符串交给 libbox；临时测速桥会先在 Kotlin 做一次最终能力校验。
+ * 本门主要守**命令面**：改个 Kotlin 方法名、少个 `@InvokeArg` 字段，两侧都编得过
  * （Rust 传的是 JSON、Kotlin 靠反射查方法），**只在真机运行到那一行时才炸**
  * （`InvalidPluginMethodException` / Jackson 反序列化异常）。这与 `ui/scripts/check-ipc-args.mjs`
  * 守的 `generate_handler![]` ⇄ 前端 `invoke` 面是同一类缺陷、同一个手法：
@@ -44,7 +44,8 @@
  *
  * A4 是本门里**最便宜、最值**的一条：`BootstrapConfig.kt` 是 K2 留的临时最小配置，用完即删，
  * 而「删掉了」这件事此前没有任何东西守着。一条 grep 断言就把「第二份真值」这一整类挡在门外
- * ——配置的唯一来源必须是 Rust 侧 config-engine 的产出，经 `start` 命令的 `configContent` 进来。
+ * ——配置的唯一来源必须是 Rust 侧 config-engine 的产出，经桥命令的 `configContent` 进来。
+ * 临时测速的固定读侧校验表达式在 A4 下方精确剔除；其余字面量仍须被拦。
  *
  * # 已知盲区（写出来，不假装覆盖）
  *
@@ -390,7 +391,7 @@ for (const file of kotlinFiles) {
   if (configSource.includes('"inbounds"') && configSource.includes('"outbounds"')) {
     fail(
       `A4 ${file.slice(ROOT.length + 1)}：Kotlin 树里出现了第二份配置真值（同时含 "inbounds" 与 ` +
-        `"outbounds" 字面量）。配置的唯一来源必须是 Rust 侧 config-engine 的产出，经 start 命令的 ` +
+        `"outbounds" 字面量）。配置的唯一来源必须是 Rust 侧 config-engine 的产出，经桥命令的 ` +
         `configContent 进来 —— 硬编一份在这里，诊断包里那份与内核实际吃的那份就会漂。`
     );
   }
