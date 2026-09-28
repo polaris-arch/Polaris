@@ -252,6 +252,68 @@ describe('subscription create operation recovery', () => {
     expect(subscriptionCreateTerminalNeedsAnnouncement(7, failed)).toBe(false);
     expect(subscriptionCreateTerminalNeedsAnnouncement(undefined, failed)).toBe(true);
   });
+
+  it('two publication continuations claiming the same terminal revision announce exactly once', async () => {
+    const store = useSubscriptionCreateOperationStore.getState();
+    store.track('shared-success');
+    store.accept({
+      ...snapshot('shared-success', 8, 'succeeded'),
+      result: {
+        subscription: { id: 'sub-1', name: 'Example', url: 'https://example.test/sub', autoUpdate: false, createdAt: '2026-09-29' },
+        nodeCount: 1,
+        addedServers: 1,
+      },
+    });
+    const announcements: string[] = [];
+    const finish = async (panel: string): Promise<void> => {
+      // Both panels complete their asynchronous publication check from the same old snapshot.
+      expect(useSubscriptionCreateOperationStore.getState().handledTerminalRevisions['shared-success']).toBeUndefined();
+      await Promise.resolve();
+      if (store.claimTerminalAnnouncement('shared-success', 8)) announcements.push(panel);
+      store.clearTerminal('shared-success');
+    };
+    await Promise.all([finish('form'), finish('recovery')]);
+    expect(announcements).toHaveLength(1);
+    expect(store.claimTerminalAnnouncement('shared-success', 8)).toBe(false);
+    expect(useSubscriptionCreateOperationStore.getState().trackedOperationIds).toEqual([]);
+    // A late event can repopulate the snapshot; terminal clearing also revoked its local owner.
+    store.accept({
+      ...snapshot('shared-success', 8, 'succeeded'),
+      result: {
+        subscription: { id: 'sub-1', name: 'Example', url: 'https://example.test/sub', autoUpdate: false, createdAt: '2026-09-29' },
+        nodeCount: 1,
+        addedServers: 1,
+      },
+    });
+    expect(store.claimTerminalAnnouncement('shared-success', 8)).toBe(false);
+  });
+
+  it('two failed-receipt continuations also announce once, including after terminal clear', async () => {
+    const store = useSubscriptionCreateOperationStore.getState();
+    store.track('shared-failure');
+    store.accept(snapshot('shared-failure', 6, 'failed'));
+    const announcements: string[] = [];
+    const finish = async (panel: string): Promise<void> => {
+      await Promise.resolve();
+      if (store.claimTerminalAnnouncement('shared-failure', 6)) announcements.push(panel);
+      store.clearTerminal('shared-failure');
+    };
+    await Promise.all([finish('form'), finish('recovery')]);
+    expect(announcements).toHaveLength(1);
+    store.accept(snapshot('shared-failure', 6, 'failed'));
+    expect(store.claimTerminalAnnouncement('shared-failure', 6)).toBe(false);
+  });
+
+  it('cannot claim an incomplete, cancelled, or wrong-revision operation', () => {
+    const store = useSubscriptionCreateOperationStore.getState();
+    store.track('no-result');
+    store.track('cancelled');
+    store.accept(snapshot('no-result', 4, 'succeeded'));
+    store.accept(snapshot('cancelled', 4, 'cancelled'));
+    expect(store.claimTerminalAnnouncement('no-result', 4)).toBe(false);
+    expect(store.claimTerminalAnnouncement('no-result', 5)).toBe(false);
+    expect(store.claimTerminalAnnouncement('cancelled', 4)).toBe(false);
+  });
 });
 
 describe('subscription create status reconcile fallback', () => {

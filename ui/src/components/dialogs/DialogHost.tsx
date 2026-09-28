@@ -91,7 +91,7 @@ function renderDialog(desc: DialogEntry) {
     case 'res-catalog':
       return <ResCatalogDialog />;
     case 'backup-import':
-      return <BackupImportDialog />;
+      return <BackupImportDialog instanceId={desc.instanceId} />;
     default: {
       // 穷尽性守卫：新增 kind 未补 case → 编译期报错。
       const _exhaustive: never = desc;

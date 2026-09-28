@@ -58,7 +58,7 @@ describe('统一接入表单的信息架构', () => {
 
   it('Tailscale 使用基础 / 路由 / 高级三组规格', () => {
     expect(TS_FORM_GROUP_KEYS).toEqual({
-      basic: ['hostname', 'exitNode', 'exitNodeCustom'],
+      basic: ['name', 'hostname', 'exitNode', 'exitNodeCustom'],
       routing: [
         'reverseMesh', 'alwaysRouteSubnets', 'acceptRoutes', 'routes',
         'exitNodeAllowLanAccess', 'advertiseRoutes',

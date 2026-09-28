@@ -6,12 +6,13 @@ import type { ServerConfig } from '@/contracts/types';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
 import { copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
 import { useTranslation } from 'react-i18next';
-import { useAppStore } from '@/store/app-store';
+import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
-import { executeTsLogin, planTsLoginSubmit } from './ts-login-server';
+import { executeTsLogin, nextTsNodeName, planTsLoginSubmit } from './ts-login-server';
+import { groupServersBySubscription } from '@/domain/server-grouping';
 import { TsLoginModeSwitch } from './TsLoginModeSwitch';
 import { controlUrlReject } from '@/domain/control-url';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
@@ -31,6 +32,8 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const open = useDialogStore((s) => s.open);
   const close = useDialogStore((s) => s.close);
   const servers = useAppStore((s) => s.servers);
+  const visibleServers = useEffectiveServers();
+  const subscriptions = useEffectiveConfig((config) => config?.subscriptions);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const setTailscaleAuthUrl = useAppStore((s) => s.setTailscaleAuthUrl);
   const setTailscaleLoginInitiated = useAppStore((s) => s.setTailscaleLoginInitiated);
@@ -42,6 +45,11 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const activeRequest = useRef<{ serverId: string; attemptId: string } | null>(null);
   const [saved, setSaved] = useState(Boolean(serverId));
   const existingTs = servers.find((s) => s.id === (serverId ?? savedServer.current?.id)) ?? savedServer.current;
+  const meshNames = groupServersBySubscription(visibleServers, subscriptions)
+    .find((group) => group.id === 'mesh')?.servers.map((server) => server.name) ?? [];
+  const [name, setName] = useState(() => existingTs?.name ?? nextTsNodeName(meshNames));
+  const [nameEdited, setNameEdited] = useState(false);
+  const [errName, setErrName] = useState(false);
 
   // 回显既有控制面地址（再次进入本弹窗时不该看起来像"没配过"）。
   useEffect(() => {
@@ -143,6 +151,12 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   };
 
   const handleSubmit = async () => {
+    const submittedName = !nameEdited && !existingTs ? nextTsNodeName(meshNames) : name.trim();
+    if (!submittedName) {
+      setErrName(true);
+      return;
+    }
+    setName(submittedName);
     if (mode === 'authkey' && !authKey.trim()) {
       setErrKey(true);
       return;
@@ -157,6 +171,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
     setErrControl(null);
     const { server, persist } = planTsLoginSubmit({
       existing: existingTs,
+      name: submittedName,
       mode,
       authKey,
       controlUrl,
@@ -190,7 +205,12 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
         savedServer.current = server;
         if (stillActive()) { setSaved(true); setDirty(false); }
       },
-      refresh: () => persist !== 'none' ? loadConfig(true) : Promise.resolve(),
+      refresh: async () => {
+        if (persist === 'none') return;
+        await loadConfig(true);
+        const mirrored = useAppStore.getState().servers.find((item) => item.id === server.id);
+        if (mirrored?.name !== server.name) throw new Error('TS_NAME_REFRESH_FAILED');
+      },
       start: () => api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode }),
       cancel: () => api.server.tailscaleLoginCancel(server.id, request.attemptId),
     });
@@ -237,6 +257,23 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
         </>
       }
     >
+      <div className="fld">
+        <label className="fld-l" htmlFor="ts-login-name">{t('ts.nodeName')}</label>
+        <input
+          id="ts-login-name"
+          className="input"
+          value={name}
+          disabled={submitting}
+          onChange={(e) => {
+            setName(e.target.value);
+            setNameEdited(true);
+            setErrName(false);
+            setDirty(true);
+          }}
+        />
+        {errName && <div className="err-line">{t('ts.errName')}</div>}
+      </div>
+
       <div className="fld">
         <label className="fld-l fld-l-info" htmlFor="ts-login-control-url">
           <span>{t('ts.controlUrl')}</span>

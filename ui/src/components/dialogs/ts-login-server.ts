@@ -37,6 +37,8 @@ export interface TsLoginSubmitPlan {
 export interface TsLoginSubmitInput {
   /** 既有的 Tailscale 节点（首次接入时缺席）。 */
   existing?: ServerConfig;
+  /** 用户填写的节点名称；桌面旧调用方未传时保留原名称或默认名称。 */
+  name?: string;
   mode: TsLoginMode;
   authKey: string;
   /**
@@ -53,18 +55,27 @@ export interface TsLoginSubmitInput {
   mintId: () => string;
 }
 
+/** 为组网 TAB 中的新 Tailscale 节点找一个未占用的默认显示名。 */
+export function nextTsNodeName(names: readonly string[]): string {
+  const used = new Set(names.map((name) => name.trim().toLowerCase()));
+  if (!used.has('tailscale')) return 'Tailscale';
+  let suffix = 2;
+  while (used.has(`tailscale ${suffix}`)) suffix++;
+  return `Tailscale ${suffix}`;
+}
+
 /**
  * 依「有无既有 TS 节点 + 登录方式 + 控制面地址」算出提交计划。
  */
 export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan {
-  const { existing, mode, authKey, controlUrl, hasState, mintId } = input;
+  const { existing, name, mode, authKey, controlUrl, hasState, mintId } = input;
   // 绝不 mutate existing（它是 app-store.servers 里的 live 引用）——克隆基础对象 + 克隆 tailscaleSettings，
   // 提交失败不得把 authKey 写脏内存态。
   const server: ServerConfig = existing
     ? { ...existing, tailscaleSettings: { ...(existing.tailscaleSettings ?? {}) } }
     : ({
         id: mintId(),
-        name: 'Tailscale',
+        name: name?.trim() || 'Tailscale',
         protocol: 'tailscale',
         // tailscale 是账号制协议，后端 sanitize 豁免 address/port 校验（crates/store/src/sanitize.rs:250）。
         address: '',
@@ -73,6 +84,7 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
         // 显式重写一遍只会制造第二个默认值真值源。
         tailscaleSettings: {},
       } as ServerConfig);
+  if (existing && name !== undefined) server.name = name.trim();
 
   if (mode === 'authkey') {
     server.tailscaleSettings = {
@@ -102,7 +114,7 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
     server.tailscaleSettings?.controlUrl !== existing.tailscaleSettings?.controlUrl;
   return {
     server,
-    persist: keyChanged || controlChanged ? 'update' : 'none',
+    persist: keyChanged || controlChanged || server.name !== existing.name ? 'update' : 'none',
     requiresLogout,
   };
 }

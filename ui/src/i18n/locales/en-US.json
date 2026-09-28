@@ -1657,6 +1657,8 @@
   },
   "backupImport": {
     "categories": "Categories in this file",
+    "confirmTitle": "Restore selected categories?",
+    "confirmMsg": "Your current data in these categories will be replaced by the backup. This cannot be undone. Empty backup categories will be skipped; unselected categories stay unchanged:\n• {{categories}}",
     "discardMsg": "The selected backup file and categories won't be restored.",
     "discardTitle": "Discard this import?",
     "errApply": "Restore failed",
@@ -1667,6 +1669,7 @@
     "pickHint": "Click to choose a backup file",
     "replaceWarn": "Selected categories will be fully replaced by the backup's contents; unselected categories stay unchanged.",
     "restoreSelected": "Restore selected",
+    "restoreSuccess": "Backup restored",
     "title": "Import Backup",
     "error": {
       "cancelled": "The operation was cancelled",
@@ -2313,6 +2316,7 @@
     "discardTitle": "Discard changes?",
     "errCidr": "Invalid subnet format, please check: {{list}}",
     "errKey": "Please enter an Auth Key",
+    "errName": "Please enter a node name first",
     "ephemeral": "Ephemeral node",
     "ephemeralHint": "Remove this device from the tailnet automatically after it goes offline.",
     "exitEmptyHint": "Not connected or no exit node available — choose \"Custom…\" to enter one manually.",
@@ -2353,6 +2357,7 @@
     "logout": "Log out",
     "method": "Login method",
     "noNode": "No Tailscale node yet — please log in to Tailscale first.",
+    "nodeName": "Node name",
     "openLogin": "Open Login Page",
     "openUrl": "Open",
     "relayPort": "Peer relay port",

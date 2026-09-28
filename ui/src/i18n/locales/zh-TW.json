@@ -1657,6 +1657,8 @@
   },
   "backupImport": {
     "categories": "檔案內的類別",
+    "confirmTitle": "確認復原所選類別？",
+    "confirmMsg": "以下類別的目前內容將由備份整體取代，無法復原；備份中為空的類別會略過，未選類別維持不變：\n• {{categories}}",
     "discardMsg": "已選擇的備份檔案與類別將不會復原。",
     "discardTitle": "放棄匯入？",
     "errApply": "復原失敗",
@@ -1667,6 +1669,7 @@
     "pickHint": "點擊選擇備份檔案",
     "replaceWarn": "選中類別將被備份內容整體取代；未選類別維持不變。",
     "restoreSelected": "復原所選",
+    "restoreSuccess": "備份復原完成",
     "title": "匯入備份",
     "error": {
       "cancelled": "操作已取消",
@@ -2313,6 +2316,7 @@
     "discardTitle": "放棄變更？",
     "errCidr": "網段格式非法，請檢查：{{list}}",
     "errKey": "請填寫 Auth Key",
+    "errName": "請先填寫節點名稱",
     "ephemeral": "臨時節點",
     "ephemeralHint": "離線後自動從 tailnet 移除",
     "exitEmptyHint": "未連線或無可用出口節點，可選「自訂…」手動填寫。",
@@ -2353,6 +2357,7 @@
     "logout": "登出",
     "method": "登入方式",
     "noNode": "尚無 Tailscale 節點，請先登入 Tailscale。",
+    "nodeName": "節點名稱",
     "openLogin": "開啟登入頁",
     "openUrl": "開啟",
     "relayPort": "Peer relay 連接埠",

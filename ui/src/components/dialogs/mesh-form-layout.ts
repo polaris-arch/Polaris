@@ -22,7 +22,7 @@ export function groupWgFields(fields: FieldSpec[]): Record<WgFormGroup, FieldSpe
 export type TsFormGroup = 'basic' | 'routing' | 'advanced';
 
 export const TS_FORM_GROUP_KEYS: Record<TsFormGroup, readonly string[]> = {
-  basic: ['hostname', 'exitNode', 'exitNodeCustom'],
+  basic: ['name', 'hostname', 'exitNode', 'exitNodeCustom'],
   routing: [
     'reverseMesh',
     'alwaysRouteSubnets',

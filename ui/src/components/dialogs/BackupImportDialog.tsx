@@ -3,13 +3,13 @@
  *
  * UX 升级，非新增流程：`SettingsBackup.tsx` 原 `doImport()` 盲恢复全部类别（importPick 后直接拿
  * `available` 整份 importApply，无选择、无预览）。本弹窗插入一步：importPick 拿到的 `available` + `counts`
- * 先渲染成逐类目勾选预览，用户确认所选类别后才 importApply——两步都是**真后端**（backupApi.importPick /
- * importApply），无 stub 需要降级。
+ * 先渲染成逐类目勾选预览，用户二次确认覆盖后才 importApply；两次后端调用（backupApi.importPick /
+ * importApply）均为真后端，无 stub 需要降级。
  *
  * 由 SettingsBackup「导入…」按钮 `open({kind:'backup-import'})` 触发（替换原直调 doImport）。
  */
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { backupErrorText } from '@/domain/action-error-text';
@@ -50,19 +50,23 @@ function ImportIcon() {
   );
 }
 
-export function BackupImportDialog() {
+export function BackupImportDialog({ instanceId }: { instanceId: string }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const hasInstance = useDialogStore((s) => s.hasInstance);
 
   const [picked, setPicked] = useState<Picked | null>(null);
   const [selected, setSelected] = useState<Set<BackupCategory>>(new Set());
   const [busy, setBusy] = useState(false);
+  const pendingConfirmId = useRef<string | null>(null);
+  const applying = useRef(false);
 
   const doPick = async () => {
     setBusy(true);
     try {
       const r = await api.backup.importPick();
+      if (!hasInstance(instanceId)) return;
       if (r.canceled) return;
       if (!r.filePath || !r.available) {
         toast.error(t('backupImport.errParse'), backupErrorText(r.errorCode, t));
@@ -76,10 +80,11 @@ export function BackupImportDialog() {
       });
       setSelected(normalizeBackupSelection(r.available, r.available));
     } catch (e) {
+      if (!hasInstance(instanceId)) return;
       console.error('[BackupImportDialog] import pick failed:', e);
       toast.error(t('backupImport.errParse'), backupErrorText(undefined, t));
     } finally {
-      setBusy(false);
+      if (hasInstance(instanceId)) setBusy(false);
     }
   };
 
@@ -88,30 +93,37 @@ export function BackupImportDialog() {
   };
 
   const requestClose = () => {
+    if (applying.current || pendingConfirmId.current || !hasInstance(instanceId)) return;
     if (picked) {
-      open({
+      const confirmId = open({
         kind: 'confirm',
         payload: {
           title: t('backupImport.discardTitle'),
           message: t('backupImport.discardMsg'),
           confirmLabel: t('node.discard'),
           danger: true,
+          onCancel: () => {
+            if (pendingConfirmId.current === confirmId) pendingConfirmId.current = null;
+          },
           onConfirm: () => {
-            close();
-            close();
+            if (pendingConfirmId.current !== confirmId || !hasInstance(confirmId)) return;
+            pendingConfirmId.current = null;
+            closeInstance(confirmId);
+            if (hasInstance(instanceId)) closeInstance(instanceId);
           },
         },
       });
+      pendingConfirmId.current = confirmId;
     } else {
-      close();
+      closeInstance(instanceId);
     }
   };
 
-  const handleApply = async () => {
-    if (!picked || selected.size === 0) return;
+  const applySelection = async (filePath: string, categories: BackupCategory[]) => {
     setBusy(true);
     try {
-      const r = await api.backup.importApply(picked.filePath, [...selected]);
+      const r = await api.backup.importApply(filePath, categories);
+      if (!hasInstance(instanceId)) return;
       if (!r.success) {
         toast.error(t('backupImport.errApply'), backupErrorText(r.errorCode, t));
         return;
@@ -120,14 +132,47 @@ export function BackupImportDialog() {
         toast.warning(
           t('backupImport.interfaceFallbackDone', { n: r.unavailableInterfaceBindings }),
         );
+      } else {
+        toast.success(t('backupImport.restoreSuccess'));
       }
-      close();
+      closeInstance(instanceId);
     } catch (e) {
+      if (!hasInstance(instanceId)) return;
       console.error('[BackupImportDialog] import apply failed:', e);
       toast.error(t('backupImport.errApply'), backupErrorText(undefined, t));
     } finally {
-      setBusy(false);
+      applying.current = false;
+      if (hasInstance(instanceId)) setBusy(false);
     }
+  };
+
+  const handleApply = () => {
+    if (!picked || selected.size === 0 || busy || pendingConfirmId.current || applying.current || !hasInstance(instanceId)) return;
+    const categories = BACKUP_CATEGORIES.filter((cat) => selected.has(cat));
+    const filePath = picked.filePath;
+    const confirmId = open({
+      kind: 'confirm',
+      payload: {
+        title: t('backupImport.confirmTitle'),
+        message: t('backupImport.confirmMsg', {
+          categories: categories.map((cat) => t(CATEGORY_LABEL_KEYS[cat])).join('\n• '),
+        }),
+        confirmLabel: t('backupImport.restoreSelected'),
+        danger: true,
+        onCancel: () => {
+          if (pendingConfirmId.current === confirmId) pendingConfirmId.current = null;
+        },
+        onConfirm: () => {
+          if (pendingConfirmId.current !== confirmId || !hasInstance(confirmId)) return;
+          pendingConfirmId.current = null;
+          closeInstance(confirmId);
+          if (applying.current || !hasInstance(instanceId)) return;
+          applying.current = true;
+          return applySelection(filePath, categories);
+        },
+      },
+    });
+    pendingConfirmId.current = confirmId;
   };
 
   const fileName = picked ? picked.filePath.split(/[\\/]/).pop() ?? picked.filePath : '';
@@ -143,16 +188,17 @@ export function BackupImportDialog() {
       titleId="import-dlg-title"
       title={t('backupImport.title')}
       onClose={requestClose}
+      closeDisabled={busy}
       icon={<ImportIcon />}
       footer={
         <>
-          <button type="button" className="btn ghost" onClick={requestClose}>
+          <button type="button" className="btn ghost" onClick={requestClose} disabled={busy}>
             {t('common.cancel')}
           </button>
           <button
             type="button"
             className="btn flow"
-            onClick={() => void handleApply()}
+            onClick={handleApply}
             disabled={!picked || selected.size === 0 || busy}
           >
             {t('backupImport.restoreSelected')}

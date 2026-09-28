@@ -281,7 +281,9 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
    */
   const CENSUS: Record<string, number> = {
     'components/dialogs/AppAddDialog.tsx': 1,
-    'components/dialogs/BackupImportDialog.tsx': 1,
+    // 恢复会整体覆盖所选类别，用户明确要求先按真实所选类展示后果并二次确认；这段说明
+    // 需要列出类别与空类跳过语义，故沿用确认弹窗。另一处仍是放弃预览的确认。
+    'components/dialogs/BackupImportDialog.tsx': 2,
     // Server / Group 两套本地草稿表单各自只在“关闭脏表单”时确认；删除仍在列表原地二次点击。
     'components/dialogs/DnsResourceDialog.tsx': 2,
     'components/dialogs/ImportDialog.tsx': 1,

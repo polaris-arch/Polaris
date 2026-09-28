@@ -5,7 +5,6 @@ import { subscriptionErrorDetail } from '@/domain/subscription-error-text';
 import { subscriptionCreateIsCancellable, type SubscriptionCreatePhase } from '@/contracts/subscription-create-operation';
 import { useAppStore } from '@/store/app-store';
 import { useSubscriptionCreateOperationStore } from '@/store/subscription-create-operation-store';
-import { subscriptionCreateTerminalNeedsAnnouncement } from '@/store/subscription-create-operation-store';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
 
@@ -64,8 +63,7 @@ export function SubscriptionCreateTaskDialog({ instanceId, operationId }: { inst
   const snapshot = useSubscriptionCreateOperationStore((s) => s.snapshots[operationId] ?? null);
   const cancel = useSubscriptionCreateOperationStore((s) => s.cancel);
   const clearTerminal = useSubscriptionCreateOperationStore((s) => s.clearTerminal);
-  const markTerminalHandled = useSubscriptionCreateOperationStore((s) => s.markTerminalHandled);
-  const terminalHandledRevision = useSubscriptionCreateOperationStore((s) => s.handledTerminalRevisions[operationId]);
+  const claimTerminalAnnouncement = useSubscriptionCreateOperationStore((s) => s.claimTerminalAnnouncement);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const [cancelling, setCancelling] = useState(false);
   const [settling, setSettling] = useState(false);
@@ -96,15 +94,13 @@ export function SubscriptionCreateTaskDialog({ instanceId, operationId }: { inst
       return;
     }
     if (snapshot.phase === 'failed') {
-      if (subscriptionCreateTerminalNeedsAnnouncement(terminalHandledRevision, snapshot)) {
-        markTerminalHandled(operationId, snapshot.revision);
+      if (claimTerminalAnnouncement(operationId, snapshot.revision)) {
         toast.error(subscriptionErrorDetail(snapshot.error ?? {}, t, 'sub.previewFail'));
       }
       return;
     }
     if (snapshot.phase !== 'succeeded') return;
 
-    const shouldToast = subscriptionCreateTerminalNeedsAnnouncement(terminalHandledRevision, snapshot);
     setSettling(true);
     void (async () => {
       await loadConfig(true);
@@ -121,7 +117,7 @@ export function SubscriptionCreateTaskDialog({ instanceId, operationId }: { inst
       // Destroyed renderer/dialog: leave this terminal unhandled and tracked so hydrate retries
       // publication. A missing success toast is acceptable; a missing config publication is not.
       if (!subscriptionCreatePublicationCanFinalize(published, hasInstance(instanceId))) return;
-      if (shouldToast) markTerminalHandled(operationId, snapshot.revision);
+      const shouldToast = claimTerminalAnnouncement(operationId, snapshot.revision);
       clearTerminal(operationId);
       closeInstance(instanceId);
       if (shouldToast) {
@@ -134,7 +130,7 @@ export function SubscriptionCreateTaskDialog({ instanceId, operationId }: { inst
       setSettling(false);
       setCompletionFailed(true);
     });
-  }, [clearTerminal, closeInstance, hasInstance, instanceId, loadConfig, markTerminalHandled, operationId, publishAttempt, snapshot, t, terminalHandledRevision]);
+  }, [claimTerminalAnnouncement, clearTerminal, closeInstance, hasInstance, instanceId, loadConfig, operationId, publishAttempt, snapshot, t]);
 
   const retryPublication = () => {
     if (snapshot?.phase !== 'succeeded' || settling) return;

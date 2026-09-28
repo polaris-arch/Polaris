@@ -85,6 +85,7 @@ function mainSpec(
   interfaceOpts: readonly SelectOption[],
 ): FieldSpec[] {
   return [
+    { t: 'text', k: 'name', label: 'ts.nodeName' },
     { t: 'text', k: 'hostname', label: 'ts.hostname', ph: 'sway-macbook' },
     { t: 'select', k: 'exitNode', label: 'ts.exitNode', options: exitOpts },
     { t: 'text', k: 'exitNodeCustom', label: 'ts.exitNodeCustom', ph: '100.x.y.z / hostname', mono: true, when: (v) => v.exitNode === EXIT_CUSTOM },
@@ -154,6 +155,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [draft, setDraft] = useState<FormValues>(() => ({
     ...initTsDraft(node),
+    name: node?.name ?? '',
     bindInterface: node?.bindInterface ?? '',
     onDemand: onDemandDraftValue(node),
   }));
@@ -274,6 +276,12 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
 
   const handleSave = async () => {
     if (!node) return;
+    const name = String(draft.name ?? '').trim();
+    if (!name) {
+      setFormTab('basic');
+      toast.error(t('ts.errName'));
+      return;
+    }
     const policy = normalizeMeshInboundPolicy(meshPolicy);
     const policyError = meshInboundPolicyError(policy, 'tailscale');
     if (policyError) {
@@ -302,6 +310,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     try {
       // detour 在顶层，`buildTsSettings` 够不着 —— 单独写回（哨兵 ⇒ 删键）。
       const next = applyDetour({ ...node, tailscaleSettings: buildSettings() }, draft.detour);
+      next.name = name;
       applyMeshInboundPolicy(next, policy);
       applyOnDemand(next, draft.onDemand);
       const bindInterface = String(draft.bindInterface ?? '').trim();

@@ -98,7 +98,7 @@ if (ENTITY_ACTION_TABLE.length === 0) throw new Error('ENTITY_ACTION_TABLE 空�
  * - `ruled` —— 该调用点会拿到 staged-only 的 id，落法已裁定：`op` 必须在 `ENTITY_ACTION_TABLE` 里。
  * - `no-staged-only-id` —— 这个调用点**拿不到** staged-only 的 id。`why` 必须点名机械依据之一：
  *   `staged 分流后不可达`（同一函数里 `editRoute(...)==='staged'` 已先 return）/ `不传实体 id` /
- *   `该族恒不入暂存`。
+ *   `该族恒不入暂存` / `仅取磁盘镜像或本次新建的 id`（有效集合只用于名称候选）。
  *
  * 上一轮的 `pending-ruling`（待裁定）已**清零**：组网单例节点那四条腿统一裁为 `block`。
  * 留着一条「还没定」的路就是守卫里一个公开的洞，故连同那条路一起删掉；日后再有待裁定项，照原样加回来。
@@ -211,6 +211,57 @@ const SITES: readonly ActionSite[] = [
     count: 1,
     route: 'no-staged-only-id',
     why: '不传实体 id（无参调用，拉的是整机 TS 状态快照）',
+  },
+  // TS 登录只用 effective 组网集合收集名称；既有身份来自磁盘 servers.find，
+  // 新建身份由 planTsLoginSubmit mint 并先保存。下列调用不会收到 staged-only id。
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：add 只接收 planTsLoginSubmit 新建的节点，effective 仅用于名称候选',
+  },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：existingTs 从 servers.find(serverId) 取磁盘节点，effective 仅用于名称候选',
+  },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.tailscaleLoginPrepare',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：prepare 使用提交计划的 server.id，不读取 effective 节点身份',
+  },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.tailscaleStateExists',
+    count: 2,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：展示查询用 existingTs.id，提交校验用计划的 server.id',
+  },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.tailscaleLogout',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：退出旧身份使用计划的 server.id，effective 仅用于名称候选',
+  },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.tailscaleLogin',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：登录用既有磁盘节点或本次保存的节点，不传 effective 身份',
+  },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.tailscaleLoginCancel',
+    count: 3,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：取消使用由提交计划生成的 activeRequest 或 server.id',
   },
   {
     // 提交逻辑（含这两个调用点）2026-08-30 随 5C 拆分外提到 rule-submit.ts，登记跟着落点走。
@@ -418,8 +469,16 @@ describe('A2：每条登记说得出因由，且与策略表对得上', () => {
 
   it('no-staged-only-id 必须点名机械依据之一', () => {
     for (const s of SITES.filter((x) => x.route === 'no-staged-only-id')) {
-      expect(s.why, `${key(s)} 没点名依据`).toMatch(/staged 分流后不可达|不传实体 id|恒不入暂存/);
+      expect(s.why, `${key(s)} 没点名依据`).toMatch(/staged 分流后不可达|不传实体 id|恒不入暂存|仅取磁盘镜像或本次新建的 id/);
     }
+  });
+
+  it('TS 登录只从 effective 取名称，不从中取后端操作 id', () => {
+    const src = code(readFileSync(join(SRC, 'components/dialogs/TsLoginDialog.tsx'), 'utf8'));
+    expect(src).toMatch(/const existingTs = servers\.find\([^;]+\) \?\? savedServer\.current;/);
+    expect(src).toMatch(/const meshNames = groupServersBySubscription\(visibleServers, subscriptions\)[\s\S]*?\.servers\.map\(\(server\) => server\.name\)/);
+    expect(src).toMatch(/planTsLoginSubmit\(\{[\s\S]*?existing: existingTs,/);
+    expect(src).toMatch(/savedServer\.current = server;/);
   });
 
   it('组网远端动作的 block 理由必须明示覆盖 staged-only 实体', () => {

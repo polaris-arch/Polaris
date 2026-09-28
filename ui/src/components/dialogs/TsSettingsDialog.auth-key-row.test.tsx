@@ -69,6 +69,15 @@ const render = (servers: ServerConfig[]): string => {
 };
 
 describe('TsSettingsDialog：Auth Key 状态行只渲染布尔事实', () => {
+  it('基础页区分节点显示名和 tailnet 主机名，并回显当前节点名称', () => {
+    const html = render([{ ...tsNode(), name: 'Office Tailscale' }]);
+    expect(html).toContain('ts.nodeName');
+    expect(html).toContain('id="nd-f-name"');
+    expect(html).toContain('value="Office Tailscale"');
+    expect(html).toContain('ts.hostname');
+    expect(html).toContain('id="nd-f-hostname"');
+  });
+
   it('正向对照：哨兵串真的能被 renderToStaticMarkup 渲染出来（否定断言有牙）', () => {
     const leak = renderToStaticMarkup(<div>{tsNode(SENTINEL).tailscaleSettings?.authKey}</div>);
     expect(leak).toContain('SENTINEL');

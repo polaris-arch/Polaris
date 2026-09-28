@@ -33,9 +33,9 @@ describe('subscription create recovery task close gate', () => {
     expect(subscriptionCreatePublicationCanFinalize(true, true)).toBe(true);
     const load = SRC.indexOf('await loadConfig(true)');
     const instance = SRC.indexOf('subscriptionCreatePublicationCanFinalize(published, hasInstance(instanceId))');
-    const mark = SRC.lastIndexOf('markTerminalHandled(operationId, snapshot.revision)');
+    const claim = SRC.lastIndexOf('claimTerminalAnnouncement(operationId, snapshot.revision)');
     expect(load).toBeGreaterThanOrEqual(0);
     expect(instance).toBeGreaterThan(load);
-    expect(mark).toBeGreaterThan(instance);
+    expect(claim).toBeGreaterThan(instance);
   });
 });

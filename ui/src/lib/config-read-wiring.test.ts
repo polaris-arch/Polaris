@@ -366,6 +366,13 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: '按 id 下发：planTsLoginSubmit 判完就直接 api.server.add/update 落盘并起登录核（该腿恒绕过暂存），基准必须是盘上那份',
   },
   {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    shape: 'useAppStore.getState().servers.find',
+    count: 1,
+    surface: 'operation',
+    why: '与后端对账：保存后按 id 从磁盘镜像读回名称，确认它确实落盘；不能用 effective 暂存值冒充保存成功',
+  },
+  {
     file: 'components/dialogs/VpnAuthDialog.tsx',
     shape: 'useAppStore((state)=>state.servers.find((server)=>server.id=…',
     count: 1,
@@ -444,6 +451,13 @@ const MIRROR_SITES: readonly MirrorSite[] = [
   },
 
   // ── 展示面：用户现在编辑出来的那份 ──
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    shape: 'useEffectiveServers()',
+    count: 1,
+    surface: 'display',
+    why: '组网 TAB 默认名称候选判据：包含可见的 staged 节点，仅取 name 判断占用，不提供后端操作 id',
+  },
   {
     file: 'components/dialogs/ImportDialog.tsx',
     shape: 'useEffectiveServers()',

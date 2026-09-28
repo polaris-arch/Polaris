@@ -98,7 +98,10 @@ interface SubscriptionCreateOperationState {
   acceptMany: (snapshots: readonly SubscriptionCreateSnapshot[]) => void;
   track: (operationId: string) => void;
   untrack: (operationId: string) => void;
+  /** Compatibility for non-toast terminal state consumers. Announcements use the atomic claim. */
   markTerminalHandled: (operationId: string, revision: number) => void;
+  /** Atomically reserve a succeeded/failed receipt before another panel clears the terminal. */
+  claimTerminalAnnouncement: (operationId: string, revision: number) => boolean;
   start: (
     operationId: string,
     subscription: SubscriptionCreateInput,
@@ -155,6 +158,22 @@ export const useSubscriptionCreateOperationStore = create<SubscriptionCreateOper
       persistTracking({ operationIds: state.trackedOperationIds, handledTerminalRevisions });
       return { handledTerminalRevisions };
     });
+  },
+  claimTerminalAnnouncement: (operationId, revision) => {
+    let claimed = false;
+    set((state) => {
+      const snapshot = state.snapshots[operationId];
+      if (!state.trackedOperationIds.includes(operationId) || snapshot?.operationId !== operationId
+        || (snapshot.phase !== 'failed' && !(snapshot.phase === 'succeeded' && snapshot.result !== undefined))
+        || snapshot.revision !== revision
+        || !subscriptionCreateTerminalNeedsAnnouncement(state.handledTerminalRevisions[operationId], snapshot))
+        return state;
+      claimed = true;
+      const handledTerminalRevisions = { ...state.handledTerminalRevisions, [operationId]: revision };
+      persistTracking({ operationIds: state.trackedOperationIds, handledTerminalRevisions });
+      return { handledTerminalRevisions };
+    });
+    return claimed;
   },
   start: async (operationId, subscription) => {
     get().track(operationId);
