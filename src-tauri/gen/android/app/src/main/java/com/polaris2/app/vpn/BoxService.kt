@@ -35,6 +35,7 @@ import io.nekohasekai.libbox.Notification
 import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.SystemProxyStatus
+import io.nekohasekai.libbox.TunOptions
 import java.util.concurrent.TimeUnit
 
 /**
@@ -49,15 +50,14 @@ class BoxService(
     private val platformInterface: PlatformInterface,
 ) : CommandServerHandler {
     /** A late openTun after Stop must close its fd before returning to native code. */
-    fun installTun(descriptor: ParcelFileDescriptor): Int {
+    internal fun installTun(attempt: MainKernelAttempt<CommandServer>, descriptor: ParcelFileDescriptor, scope: TunScope): Int {
         val previous = try {
             synchronized(this) {
-                val attempt = mainAttempt
-                check(attempt != null && !attempt.revoked &&
+                check(mainAttempt === attempt && !attempt.revoked &&
                     (state == ServiceState.Starting || state == ServiceState.Started)) {
                     "旧主核已撤销，拒收迟到的 VPN fd"
                 }
-                attempt.installTun(descriptor)
+                MainKernelAttemptRegistry.installTun(attempt, descriptor, scope)
             }
         } catch (error: Throwable) {
             runCatching { descriptor.close() }
@@ -90,7 +90,10 @@ class BoxService(
     fun onStartCommand(): Int {
         val attempt = synchronized(this) {
             if (state != ServiceState.Stopped || mainAttempt != null) null
-            else MainKernelAttempt<CommandServer>(SystemStart.generation())
+            else MainKernelAttempt<CommandServer>(
+                SystemStart.generation(),
+                VpnBridge.currentStartRequest()?.runId ?: java.util.UUID.randomUUID().toString(),
+            )
                 .takeIf { MainKernelAttemptRegistry.claim(it) }
                 ?.also {
                     mainAttempt = it
@@ -162,6 +165,15 @@ class BoxService(
         try {
             check(isStarting(attempt)) { "旧起核尝试已撤销" }
             val config = bridgeConfig ?: SystemStart.load(service)
+            if (bridgeConfig != null) {
+                val request = VpnBridge.currentStartRequest()
+                check(request != null && request.runId == attempt.runId &&
+                    SystemStart.sha256(config.toByteArray(Charsets.UTF_8)) == request.configDigest) {
+                    "android: 起核配置摘要或 runId 与主核 attempt 不一致"
+                }
+            }
+            // This slice has no managed Start admission yet. A marker blocks every legacy bridge start.
+            if (bridgeConfig != null) SystemStart.requireLegacyAllowed(service)
             SystemEndpointGuard.requireSupported(config)
             PolarisApplication.ensureSetup()
             TransientSpeedtestHost.withMainStart(attempt, { isStarting(attempt) }) {
@@ -169,23 +181,37 @@ class BoxService(
                     check(isStarting(attempt)) { "起核已被停核接管" }
                     DefaultNetworkMonitor.start()
                     check(isStarting(attempt)) { "起核已被停核接管" }
-                    val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), platformInterface)
+                    val tunOpener = platformInterface as? PolarisVpnService
+                        ?: error("android: 主核没有绑定 attempt 的 TUN 载体")
+                    val boundPlatform = object : PlatformInterface by platformInterface {
+                        override fun openTun(options: TunOptions): Int = tunOpener.openTun(attempt, options)
+                    }
+                    val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), boundPlatform)
                     attempt.publish(server)
                     synchronized(this) { if (mainAttempt === attempt) commandServer = server }
                     check(isStarting(attempt)) { "起核已被停核接管" }
                     server.start()
                     // No login instance may hold this Tailscale state directory during main startup.
                     check(isStarting(attempt)) { "起核已被停核接管" }
+                    SystemStart.requireLegacyAllowed(service)
                     server.startOrReloadService(config, OverrideOptions())
+                    SystemStart.requireLegacyAllowed(service)
                 }
             }
-            synchronized(this) {
+            val acknowledged = synchronized(this) {
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
                 check(mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting) { "起核已被停核接管" }
+                attempt.acknowledgeStart()
                 state = ServiceState.Started
                 StatsBridge.activateAll()
                 // The token check and bridge acknowledgement share Stop's lock.
-                VpnBridge.finishStart(null)
+                VpnBridge.finishStart(null, attempt = attempt)
+            }
+            if (!acknowledged) {
+                // The native service may already be running. Keep its registry owner
+                // until this exact attempt's close completes; never publish it as ready.
+                stopService(attempt)
+                return
             }
             mainHandler.post {
                 synchronized(this) {

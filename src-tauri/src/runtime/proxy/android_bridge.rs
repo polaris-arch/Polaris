@@ -237,6 +237,92 @@ pub(crate) enum VpnAuthState {
 /// 桥失败的两轴：用户可见消息 + [`code`] 模块里的结构化码。
 pub(super) type BridgeError = (String, &'static str);
 
+/// Builder calls accepted before `establish()` and fd ownership accepted by the exact
+/// main-core attempt. This is observed scope, not a `PlatformReceipt::Complete` verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AndroidTunScope {
+    pub auto_route: bool,
+    pub routes: Vec<String>,
+    pub excluded_routes: Vec<String>,
+    pub skipped_excludes: Vec<String>,
+    pub allowed_packages: Vec<String>,
+    pub excluded_packages: Vec<String>,
+    pub skipped_packages: Vec<String>,
+}
+
+/// Only a successful, same-attempt libbox start can produce this bridge response.
+/// `tun=None` means OS protection is unknown, even when the core started.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AndroidStartReceipt {
+    pub run_id: String,
+    pub config_digest: String,
+    pub claim: Option<String>,
+    pub tun: Option<AndroidTunScope>,
+}
+
+impl AndroidStartReceipt {
+    fn matches_request(&self, run_id: &str, config_digest: &str, claim: Option<&str>) -> bool {
+        !self.run_id.is_empty()
+            && self.run_id == run_id
+            && self.config_digest == config_digest
+            && self.claim.as_deref() == claim
+    }
+
+    /// Necessary observed facts only. The coordinator still has to compare plan Q,
+    /// app scope, excluded routes, claim, and live generation before any Complete.
+    pub(super) fn managed_tun_evidence(&self) -> Option<&AndroidTunScope> {
+        let tun = self.tun.as_ref()?;
+        (self.claim.is_some()
+            && tun.auto_route
+            && !tun.routes.is_empty()
+            && tun.skipped_excludes.is_empty()
+            && tun.skipped_packages.is_empty())
+        .then_some(tun)
+    }
+}
+
+/// A registry snapshot is not a liveness probe, nor a NoOldCore receipt by itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AndroidMainCoreOwnership {
+    pub state: String,
+    pub run_id: Option<String>,
+}
+
+pub(super) async fn main_core_ownership() -> Result<AndroidMainCoreOwnership, String> {
+    #[cfg(target_os = "android")]
+    {
+        let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+        let result = call_with_budget::<AndroidMainCoreOwnership, _>(
+            plugin,
+            "mainCoreOwnership",
+            (),
+            LOCAL_STATE_TIMEOUT,
+        )
+        .await
+        .map_err(|error| match error {
+            BridgeCallError::Invoke(e) => format!("Android 主核归属读取失败：{e}"),
+            BridgeCallError::TimedOut => "Android 主核归属读取超时，归属未知".to_string(),
+            BridgeCallError::TaskFailed(e) => format!("Android 主核归属投递失败：{e}"),
+        })?;
+        match (result.state.as_str(), result.run_id.as_deref()) {
+            ("absent", None) => Ok(result),
+            ("starting" | "acknowledged" | "closing" | "cleanupUnknown", Some(id))
+                if !id.is_empty() =>
+            {
+                Ok(result)
+            }
+            _ => Err("Android 主核归属回执形状无效，归属未知".to_string()),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("本平台没有 Android 主核归属来源".to_string())
+    }
+}
+
 /// Kotlin 侧 `reject(msg, code)` 的 code → 本仓码的**白名单**映射。
 ///
 /// **必须是白名单而不是原样透传**：`code` 模块的头注写死了「只收录控制流位置能诚实断言的码」，
@@ -427,7 +513,27 @@ pub(super) async fn request_vpn_permission() -> Result<(), BridgeError> {
 /// 传的是内存字符串而不是盘上路径，且它与 `std::fs::write(config_path, &json)` 写下去的是
 /// **同一个 `json` 变量**（不是两次序列化）⇒ 诊断包里那份与内核实际吃的那份不可能漂。
 /// 一旦有人改成「从盘上读回来再传给 libbox」，诊断与内核就有了两条路径。
-pub(super) async fn start_core(config_json: &str) -> Result<(), BridgeError> {
+pub(super) async fn start_core(config_json: &str) -> Result<AndroidStartReceipt, BridgeError> {
+    let run_id = format!(
+        "legacy-{}{}",
+        polaris_store::fs::random_tmp_suffix(),
+        polaris_store::fs::random_tmp_suffix()
+    );
+    start_core_with_claim(config_json, &run_id, None).await
+}
+
+/// Managed callers must first persist this run ID in StartRequested and pass the
+/// same serialized claim. This adapter echoes and checks it; it does not mint the
+/// journal's identity or decide that the TUN scope is complete.
+pub(super) async fn start_core_with_claim(
+    config_json: &str,
+    run_id: &str,
+    claim: Option<&str>,
+) -> Result<AndroidStartReceipt, BridgeError> {
+    if run_id.trim().is_empty() || run_id.trim() != run_id || claim.is_some_and(str::is_empty) {
+        return Err(("Android 起核身份无效".to_string(), code::STARTUP_FAILED));
+    }
+    let config_digest = polaris_updater::verify::sha256_hex(config_json.as_bytes());
     #[cfg(target_os = "android")]
     {
         // 载荷持有的是 `String` 而不是 `&str`：调用交给分离 task 持有到底（见
@@ -436,24 +542,34 @@ pub(super) async fn start_core(config_json: &str) -> Result<(), BridgeError> {
         // 第二次序列化），诊断包里那份与内核实际吃的那份依然不可能漂。
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct StartArgs {
+        struct MainStartArgs {
             config_content: String,
+            run_id: String,
+            config_digest: String,
+            claim: Option<String>,
         }
         let plugin = plugin_handle()?;
-        match call_with_budget::<(), _>(
+        match call_with_budget::<AndroidStartReceipt, _>(
             plugin,
             "start",
-            StartArgs {
+            MainStartArgs {
                 config_content: config_json.to_owned(),
+                run_id: run_id.to_owned(),
+                config_digest: config_digest.clone(),
+                claim: claim.map(str::to_owned),
             },
             START_TIMEOUT,
         )
         .await
         {
-            Ok(()) => {
+            Ok(receipt) if receipt.matches_request(run_id, &config_digest, claim) => {
                 handle::set_core_started(true);
-                Ok(())
+                Ok(receipt)
             }
+            Ok(_) => Err((
+                "Android 起核回执身份不符（内核可能仍在，须核实并关闭确切 run）".to_string(),
+                code::STARTUP_FAILED,
+            )),
             Err(BridgeCallError::Invoke(e)) => Err(invoke_error(&e)),
             Err(BridgeCallError::TimedOut) => Err((
                 format!(
@@ -470,7 +586,7 @@ pub(super) async fn start_core(config_json: &str) -> Result<(), BridgeError> {
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = config_json;
+        let _ = (config_json, config_digest, claim);
         Err((
             "Android 起核桥在本平台不存在（调用点应由 cfg! 守住）".to_string(),
             // 走同一个白名单取默认码：这条腿与 Android 腿的「认不出来的码降级到什么」必须是同一个

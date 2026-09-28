@@ -2,6 +2,9 @@
 package com.polaris2.app.vpn
 
 import android.content.Context
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import java.io.File
 import java.security.MessageDigest
@@ -47,6 +50,9 @@ internal object SystemStart {
     /** Rust `ProxyRuntime::runtime_config_path` 的文件名。A13 逐字对拍。 */
     private const val RUST_RUNTIME_CONFIG_FILE = "singbox-runtime.json"
 
+    /** Rust polaris_store::mesh_guard::REQUIRED_MARKER_FILE; present from Preparing onward. */
+    private const val MANAGED_MARKER_FILE = "mesh-route-state.required"
+
     /** 最近一次经桥成功起核的配置摘要（存在 ⇔ 允许不经桥起核）。 */
     private const val STARTED_DIGEST_FILE = "system-start.sha256"
 
@@ -60,11 +66,27 @@ internal object SystemStart {
     private fun runtimeConfig(context: Context): File =
         File(File(context.dataDir, RUST_CONFIG_SUBDIR), RUST_RUNTIME_CONFIG_FILE)
 
+    private fun managedMarker(context: Context): File =
+        File(File(context.dataDir, RUST_CONFIG_SUBDIR), MANAGED_MARKER_FILE)
+
+    /** Only ENOENT proves legacy admission. Any other stat failure remains unknown and blocks. */
+    fun requireLegacyAllowed(context: Context) {
+        val marker = managedMarker(context)
+        try {
+            Os.stat(marker.path)
+            error("android: 受管路由已开始迁移，旧摘要自启被拒")
+        } catch (error: ErrnoException) {
+            if (error.errno != OsConstants.ENOENT) {
+                throw IllegalStateException("android: 无法核实受管路由标记，旧摘要自启被拒", error)
+            }
+        }
+    }
+
     private fun digestFile(context: Context): File = File(context.noBackupFilesDir, STARTED_DIGEST_FILE)
 
     private fun bootFlagFile(context: Context): File = File(context.noBackupFilesDir, BOOT_AUTO_CONNECT_FILE)
 
-    private fun sha256(bytes: ByteArray): String =
+    internal fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
     /**
@@ -79,6 +101,7 @@ internal object SystemStart {
         // This check shares forget's monitor with the write. A late success from an
         // attempt that predates user disconnect can never restore auto-start admission.
         if (disconnectGeneration != expectedGeneration || !allowed()) return
+        requireLegacyAllowed(context)
         val file = runtimeConfig(context)
         val onDisk = runCatching { file.readBytes() }.getOrNull()
         val expected = sha256(bridgeConfig.toByteArray(Charsets.UTF_8))
@@ -93,6 +116,13 @@ internal object SystemStart {
             return
         }
         writeAtomically(digestFile(context), expected)
+        // A marker published while the digest was being written cannot leave old admission behind.
+        try {
+            requireLegacyAllowed(context)
+        } catch (error: Throwable) {
+            digestFile(context).delete()
+            throw error
+        }
         Log.i(TAG, "已记下本次起核配置，系统发起的起核可用")
     }
 
@@ -109,6 +139,7 @@ internal object SystemStart {
      */
     @Synchronized
     fun load(context: Context): String {
+        requireLegacyAllowed(context)
         val digest = runCatching { digestFile(context).readText().trim() }.getOrNull()
             ?: error("android: 不经桥起核被拒：用户上次主动断开，或从未成功起核过")
         val file = runtimeConfig(context)
@@ -117,6 +148,7 @@ internal object SystemStart {
         if (sha256(bytes) != digest) {
             error("android: 不经桥起核被拒：盘上配置已被一次未成功的起核尝试覆盖，不是最近一次成功起核的那份")
         }
+        requireLegacyAllowed(context)
         return String(bytes, Charsets.UTF_8)
     }
 

@@ -3,9 +3,23 @@ package com.polaris2.app.vpn
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicBoolean
 import java.io.Closeable
+import java.util.UUID
 
 /** One main-core generation. Stop owns its close even when the factory has not returned yet. */
-internal class MainKernelAttempt<Server>(val systemStartGeneration: Long = 0L) {
+internal data class TunScope(
+    val autoRoute: Boolean,
+    val routes: List<String>,
+    val excludedRoutes: List<String>,
+    val skippedExcludes: List<String>,
+    val allowedPackages: List<String>,
+    val excludedPackages: List<String>,
+    val skippedPackages: List<String>,
+)
+
+internal class MainKernelAttempt<Server>(
+    val systemStartGeneration: Long = 0L,
+    val runId: String = UUID.randomUUID().toString(),
+) {
     private val closeLaunched = AtomicBoolean(false)
     /** Orders this generation's Start and Reload, without delaying Stop's terminal close. */
     val operationLock = Any()
@@ -14,13 +28,32 @@ internal class MainKernelAttempt<Server>(val systemStartGeneration: Long = 0L) {
     val prepared = CompletableFuture<Server?>()
     val closed = CompletableFuture<Throwable?>()
     private var tun: Closeable? = null
+    private var tunScope: TunScope? = null
+    @Volatile private var startAcknowledged = false
+
+    fun acknowledgeStart() = synchronized(this) {
+        check(!revoked) { "旧主核已撤销，不能登记启动回执" }
+        startAcknowledged = true
+    }
+
+    fun ownershipState(): String = when {
+        revoked && closed.isDone && closed.getNow(null) != null -> "cleanupUnknown"
+        revoked -> "closing"
+        startAcknowledged -> "acknowledged"
+        else -> "starting"
+    }
 
     /** The caller also holds BoxService's short state lock. */
-    fun installTun(value: Closeable): Closeable? = synchronized(this) {
+    fun installTun(value: Closeable, scope: TunScope): Closeable? = synchronized(this) {
         check(!revoked) { "旧主核已撤销，拒收迟到的 VPN fd" }
         val previous = tun
         tun = value
+        tunScope = scope
         previous
+    }
+
+    fun currentTunScope(): TunScope? = synchronized(this) {
+        if (revoked || tun == null) null else tunScope
     }
 
     /** The detached fd is closed by the Stop job outside BoxService's lock. */
@@ -28,6 +61,7 @@ internal class MainKernelAttempt<Server>(val systemStartGeneration: Long = 0L) {
         revoked = true
         val previous = tun
         tun = null
+        tunScope = null
         previous
     }
     fun publish(server: Server) { check(prepared.complete(server)) }
@@ -61,6 +95,17 @@ internal class MainKernelAttemptLedger {
 
     @Synchronized
     fun isVacant(): Boolean = owner == null
+
+    /** "acknowledged" is a start result, not a post-start process liveness probe. */
+    @Synchronized
+    fun snapshot(): Pair<String, String?> = owner?.let { it.ownershipState() to it.runId } ?: ("absent" to null)
+
+    /** Registry identity and fd publication are one decision, including Service recreation. */
+    @Synchronized
+    fun installTun(attempt: MainKernelAttempt<*>, value: Closeable, scope: TunScope): Closeable? {
+        check(owner === attempt) { "旧主核已失去 TUN 所有权" }
+        return attempt.installTun(value, scope)
+    }
 
     /** No factory was started, so this rejected system intent owns no native server. */
     @Synchronized

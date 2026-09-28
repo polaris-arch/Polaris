@@ -41,9 +41,19 @@ class DebugReportArgs {
 }
 
 @InvokeArg
-class StartArgs {
+class MainStartArgs {
     lateinit var configContent: String
+    lateinit var runId: String
+    lateinit var configDigest: String
+    var claim: String? = null
 }
+
+internal data class MainStartRequest(
+    val configContent: String,
+    val runId: String,
+    val configDigest: String,
+    val claim: String?,
+)
 
 @InvokeArg
 class CheckArgs {
@@ -312,12 +322,20 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      */
     @Command
     fun start(invoke: Invoke) {
-        val cfg = invoke.parseArgs(StartArgs::class.java).configContent
+        val args = invoke.parseArgs(MainStartArgs::class.java)
+        val cfg = args.configContent
+        if (args.runId.isBlank() || args.runId.length > 128 || args.runId != args.runId.trim() ||
+            !Regex("[0-9a-f]{64}").matches(args.configDigest) ||
+            SystemStart.sha256(cfg.toByteArray(Charsets.UTF_8)) != args.configDigest ||
+            (args.claim != null && (args.claim!!.isBlank() || args.claim!!.length > 8192))) {
+            invoke.reject("android: 起核身份或配置摘要无效", ERR_STARTUP_FAILED)
+            return
+        }
         if (VpnService.prepare(activity) != null) {
             invoke.reject("Android 未授予 VPN 权限", ERR_VPN_PERMISSION_DENIED)
             return
         }
-        if (!VpnBridge.beginStart(cfg, invoke)) {
+        if (!VpnBridge.beginStart(MainStartRequest(cfg, args.runId, args.configDigest, args.claim), invoke)) {
             invoke.reject("Android 隧道已在运行或正在起停中", ERR_STARTUP_FAILED)
             return
         }
@@ -438,6 +456,15 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun systemStartStatus(invoke: Invoke) {
         val result = JSObject()
         result.put("systemStarted", VpnBridge.systemStartedRunning())
+        invoke.resolve(result)
+    }
+
+    /** Main-core ownership only. Caller must also prove temporary owners absent under its gate. */
+    @Command
+    fun mainCoreOwnership(invoke: Invoke) {
+        val (state, runId) = MainKernelAttemptRegistry.snapshot()
+        val result = JSObject().put("state", state)
+        if (runId != null) result.put("runId", runId)
         invoke.resolve(result)
     }
 
@@ -917,7 +944,7 @@ internal object VpnBridge {
      * 落的**同一个文件**读 —— 仍是同一份字节，不是 Kotlin 自存的第二份（见 [SystemStart] 类文档）。
      */
     @Volatile
-    private var config: String? = null
+    private var request: MainStartRequest? = null
 
     /** 起核是否已经成功过一次（`is_alive` 的桥侧真值；见 Rust `android_bridge::core_started`）。 */
     @Volatile
@@ -931,11 +958,11 @@ internal object VpnBridge {
     private var systemStarted = false
 
     @Synchronized
-    fun beginStart(configContent: String, invoke: Invoke): Boolean {
+    fun beginStart(startRequest: MainStartRequest, invoke: Invoke): Boolean {
         if (running || starting || stopping) return false
         starting = true
         systemStarted = false
-        config = configContent
+        request = startRequest
         pendingStart = invoke
         return true
     }
@@ -976,28 +1003,65 @@ internal object VpnBridge {
 
     /** `BoxService` 起核线程读走本次配置。 */
     @Synchronized
-    fun currentConfig(): String? = config
+    fun currentConfig(): String? = request?.configContent
+
+    @Synchronized
+    fun currentStartRequest(): MainStartRequest? = request
 
     @Synchronized
     fun isStopping(): Boolean = stopping
 
     /** 结账起核：`error == null` 即成功。幂等（重复调用只记日志）。 */
     @Synchronized
-    fun finishStart(error: String?, code: String = PolarisVpnPlugin.ERR_STARTUP_FAILED) {
+    fun finishStart(
+        error: String?,
+        code: String = PolarisVpnPlugin.ERR_STARTUP_FAILED,
+        attempt: MainKernelAttempt<*>? = null,
+    ): Boolean {
         val invoke = pendingStart
+        val startRequest = request
+        val receiptError = if (error == null && invoke != null &&
+            (attempt == null || startRequest == null || attempt.runId != startRequest.runId)) {
+            "android: 起核回执与当前主核身份不一致"
+        } else null
+        val failure = error ?: receiptError
         pendingStart = null
         starting = false
-        running = error == null
-        if (error != null) systemStarted = false
+        running = failure == null
+        if (failure != null) systemStarted = false
         if (invoke == null) {
             // 系统发起的起核本就没有人欠回执（error=null 时属正常）；桥发起的起核走到这里才是异常。
-            Log.i(TAG, "起核结账时没有待决的 Invoke（systemStarted=$systemStarted, error=$error）")
-            return
+            Log.i(TAG, "起核结账时没有待决的 Invoke（systemStarted=$systemStarted, error=$failure）")
+            return failure == null
         }
-        if (error == null) {
-            invoke.resolve()
+        if (failure == null) {
+            val delivered = runCatching {
+                check(attempt != null && startRequest != null)
+                val response = JSObject()
+                    .put("runId", attempt.runId)
+                    .put("configDigest", startRequest.configDigest)
+                startRequest.claim?.let { response.put("claim", it) }
+                attempt.currentTunScope()?.let { scope ->
+                    response.put("tun", JSObject()
+                        .put("autoRoute", scope.autoRoute)
+                        .put("routes", JSONArray(scope.routes))
+                        .put("excludedRoutes", JSONArray(scope.excludedRoutes))
+                        .put("skippedExcludes", JSONArray(scope.skippedExcludes))
+                        .put("allowedPackages", JSONArray(scope.allowedPackages))
+                        .put("excludedPackages", JSONArray(scope.excludedPackages))
+                        .put("skippedPackages", JSONArray(scope.skippedPackages)))
+                }
+                invoke.resolve(response)
+            }
+            if (delivered.isFailure) {
+                running = false
+                Log.e(TAG, "主核回执投递失败，关闭该 attempt", delivered.exceptionOrNull())
+            }
+            return delivered.isSuccess
         } else {
-            invoke.reject(error, code)
+            runCatching { invoke.reject(failure, code) }
+                .onFailure { Log.e(TAG, "主核失败回执投递失败，继续关闭该 attempt", it) }
+            return false
         }
     }
 
@@ -1032,7 +1096,7 @@ internal object VpnBridge {
         }
         running = false
         systemStarted = false
-        config = null
+        request = null
         // 服务在起核途中被停掉：起核那条 Invoke 也要有回执，否则 Rust 侧只能等超时。
         val startInvoke = pendingStart
         pendingStart = null

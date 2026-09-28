@@ -1213,6 +1213,29 @@ a13SelfCheck();
     fail('A13d BoxService.startKernel 里没有 SystemStart.remember( —— 经桥起核成功后从不记下，系统起核恒被拒');
   }
 
+  // A13f: managed marker exists from Preparing; an old digest cannot bypass it.
+  const markerSource = readFileSync(join(ROOT, 'crates', 'store', 'src', 'mesh_guard.rs'), 'utf8');
+  const rustMarker = /REQUIRED_MARKER_FILE:\s*&str\s*=\s*"([^"]+)"/.exec(markerSource)?.[1];
+  const ktMarker = ktConst('MANAGED_MARKER_FILE');
+  if (!rustMarker || !ktMarker || rustMarker !== ktMarker) {
+    fail('A13f Kotlin 受管 marker 文件名与 Rust REQUIRED_MARKER_FILE 不一致');
+  }
+  const markerGate = kotlinFnBody(sys.code, 'requireLegacyAllowed') ?? '';
+  if (!markerGate.includes('Os.stat(') || !markerGate.includes('OsConstants.ENOENT')) {
+    fail('A13f SystemStart 不能证明 marker 不存在（仅 ENOENT 可放行）');
+  }
+  for (const name of ['load', 'remember']) {
+    if (!(kotlinFnBody(sys.code, name) ?? '').includes('requireLegacyAllowed(')) {
+      fail(`A13f SystemStart.${name} 缺少从 Preparing 起的旧摘要阻断`);
+    }
+  }
+  const startCalls = [...(startKernel ?? '').matchAll(/SystemStart\.requireLegacyAllowed\(/g)].map((m) => m.index);
+  const nativeStartAt = (startKernel ?? '').indexOf('server.startOrReloadService(');
+  if (startCalls.length < 2 || nativeStartAt < 0 || !startCalls.some((at) => at < nativeStartAt) ||
+      !startCalls.some((at) => at > nativeStartAt)) {
+    fail('A13f BoxService 系统/legacy 起核没有在 native Start 前后复查 marker');
+  }
+
   // A13e
   const manifest = readFileSync(
     join(ROOT, 'src-tauri', 'gen', 'android', 'app', 'src', 'main', 'AndroidManifest.xml'),

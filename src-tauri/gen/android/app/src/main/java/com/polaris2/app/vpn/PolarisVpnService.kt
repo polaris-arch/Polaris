@@ -15,6 +15,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.annotation.RequiresApi
 import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.Notification
 import io.nekohasekai.libbox.RoutePrefix
 import io.nekohasekai.libbox.TunOptions
@@ -59,11 +60,13 @@ class PolarisVpnService :
     // 数据包绕回 tun 形成回环。症状是「隧道建起来了、状态显示已连接、但一个字节都不通」，
     // 且两侧都不报错 —— 只有抓包才看得出来。
     override fun autoDetectInterfaceControl(fd: Int) {
-        protect(fd)
+        check(protect(fd)) { "android: 无法保护内核出站 socket" }
     }
 
+    /** A shared PlatformInterface cannot prove which CommandServer opened this TUN. */
+    override fun openTun(options: TunOptions): Int = error("android: TUN 回调缺少主核 attempt")
 
-    override fun openTun(options: TunOptions): Int {
+    internal fun openTun(attempt: MainKernelAttempt<CommandServer>, options: TunOptions): Int {
         if (prepare(this) != null) error("android: 缺少 VPN 授权")
 
         val builder = Builder()
@@ -79,16 +82,20 @@ class PolarisVpnService :
         // 不调 allowBypass()：那会允许任意应用用 Network.bindSocket 绕开隧道。它在上游是一个
         // 用户可见开关；本仓尚无该设置面，缺省取"不可绕过"这一侧 —— 默认值应当偏向不漏流量。
 
-        options.inet4Address.forEach { builder.addAddress(it.address(), it.prefix()) }
-        options.inet6Address.forEach { builder.addAddress(it.address(), it.prefix()) }
+        val inet4Addresses = options.inet4Address.toList()
+        val inet6Addresses = options.inet6Address.toList()
+        inet4Addresses.forEach { builder.addAddress(it.address(), it.prefix()) }
+        inet6Addresses.forEach { builder.addAddress(it.address(), it.prefix()) }
+
+        val scope = TunScopeCollector()
 
         if (options.autoRoute) {
             if (options.dnsMode.value != Libbox.DNSModeDisabled) {
                 val dnsServers = options.dnsServerAddress
                 while (dnsServers.hasNext()) builder.addDnsServer(dnsServers.next())
             }
-            applyRoutes(builder, options)
-            applyPackageFilter(builder, options)
+            applyRoutes(builder, options, inet4Addresses.isNotEmpty(), inet6Addresses.isNotEmpty(), scope)
+            applyPackageFilter(builder, options, scope)
         }
 
         if (options.isHTTPProxyEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -102,40 +109,68 @@ class PolarisVpnService :
         }
 
         val pfd = builder.establish() ?: error("android: VPN 未授权或已被撤销")
-        return boxService.installTun(pfd)
+        return boxService.installTun(attempt, pfd, scope.snapshot(options.autoRoute))
     }
 
-    private fun applyRoutes(builder: Builder, options: TunOptions) {
+    private class TunScopeCollector {
+        val routes = mutableListOf<String>()
+        val excludedRoutes = mutableListOf<String>()
+        val skippedExcludes = mutableListOf<String>()
+        val allowedPackages = mutableListOf<String>()
+        val excludedPackages = mutableListOf<String>()
+        val skippedPackages = mutableListOf<String>()
+
+        fun snapshot(autoRoute: Boolean) = TunScope(
+            autoRoute, routes.toList(), excludedRoutes.toList(), skippedExcludes.toList(),
+            allowedPackages.toList(), excludedPackages.toList(), skippedPackages.toList(),
+        )
+    }
+
+    private fun applyRoutes(builder: Builder, options: TunOptions, hasInet4: Boolean, hasInet6: Boolean, scope: TunScopeCollector) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            applyRoutesTiramisu(builder, options)
+            applyRoutesTiramisu(builder, options, hasInet4, hasInet6, scope)
             return
         }
         // TIRAMISU 之前没有 excludeRoute：内核把「全量路由减去排除项」预先算成一组range 交过来
         // （Go 侧 `tun.Options.BuildAutoRouteRanges`），这里只能整组加进去。
-        options.inet4RouteRange.forEach { builder.addRoute(it.address(), it.prefix()) }
-        options.inet6RouteRange.forEach { builder.addRoute(it.address(), it.prefix()) }
+        options.inet4RouteRange.forEach {
+            builder.addRoute(it.address(), it.prefix())
+            scope.routes.add("${it.address()}/${it.prefix()}")
+        }
+        options.inet6RouteRange.forEach {
+            builder.addRoute(it.address(), it.prefix())
+            scope.routes.add("${it.address()}/${it.prefix()}")
+        }
     }
 
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    private fun applyRoutesTiramisu(builder: Builder, options: TunOptions) {
+    private fun applyRoutesTiramisu(builder: Builder, options: TunOptions, hasInet4: Boolean, hasInet6: Boolean, scope: TunScopeCollector) {
         // 一条 route 都不给 = 隧道装不上任何路由 = 什么都不走它。所以「内核没指定具体路由」
         // 必须回落成默认路由，而不是留空。这一分支上游同款。
         val inet4Routes = options.inet4RouteAddress.toList()
         if (inet4Routes.isNotEmpty()) {
-            inet4Routes.forEach { builder.addRoute(it.toIpPrefix()) }
-        } else if (options.inet4Address.hasNext()) {
+            inet4Routes.forEach {
+                builder.addRoute(it.toIpPrefix())
+                scope.routes.add("${it.address()}/${it.prefix()}")
+            }
+        } else if (hasInet4) {
             builder.addRoute("0.0.0.0", 0)
+            scope.routes.add("0.0.0.0/0")
         }
 
         val inet6Routes = options.inet6RouteAddress.toList()
         if (inet6Routes.isNotEmpty()) {
-            inet6Routes.forEach { builder.addRoute(it.toIpPrefix()) }
-        } else if (options.inet6Address.hasNext()) {
+            inet6Routes.forEach {
+                builder.addRoute(it.toIpPrefix())
+                scope.routes.add("${it.address()}/${it.prefix()}")
+            }
+        } else if (hasInet6) {
             builder.addRoute("::", 0)
+            scope.routes.add("::/0")
         }
 
-        options.inet4RouteExcludeAddress.forEach { excludeRouteTolerantly(builder, it) }
-        options.inet6RouteExcludeAddress.forEach { excludeRouteTolerantly(builder, it) }
+        options.inet4RouteExcludeAddress.forEach { excludeRouteTolerantly(builder, it, scope) }
+        options.inet6RouteExcludeAddress.forEach { excludeRouteTolerantly(builder, it, scope) }
     }
 
     /**
@@ -163,27 +198,42 @@ class PolarisVpnService :
      * （一条失败不该让整个隧道建不起来），同一种处置（跳过 + 点名警告，绝不静默）。
      */
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    private fun excludeRouteTolerantly(builder: Builder, prefix: RoutePrefix) {
+    private fun excludeRouteTolerantly(builder: Builder, prefix: RoutePrefix, scope: TunScopeCollector) {
+        val cidr = "${prefix.address()}/${prefix.prefix()}"
         runCatching { builder.excludeRoute(prefix.toIpPrefix()) }
+            .onSuccess { scope.excludedRoutes.add(cidr) }
             .onFailure {
+                scope.skippedExcludes.add(cidr)
                 Log.w(TAG, "排除路由 ${prefix.address()}/${prefix.prefix()} 被系统拒收，已跳过：${it.message}")
             }
     }
 
-    private fun applyPackageFilter(builder: Builder, options: TunOptions) {
+    private fun applyPackageFilter(builder: Builder, options: TunOptions, scope: TunScopeCollector) {
         // 按应用分流：Android 上取代桌面的 process_name / process_path 规则。
         // 包名可能已经卸载（配置里留着旧条目），逐条容错 —— 一条失败不该让整个隧道建不起来。
         val includePackage = options.includePackage
         while (includePackage.hasNext()) {
             val name = includePackage.next()
             runCatching { builder.addAllowedApplication(name) }
-                .onFailure { if (it is NameNotFoundException) Log.w(TAG, "包不存在，跳过 include: $name") else throw it }
+                .onSuccess { scope.allowedPackages.add(name) }
+                .onFailure {
+                    if (it is NameNotFoundException) {
+                        scope.skippedPackages.add("include:$name")
+                        Log.w(TAG, "包不存在，跳过 include: $name")
+                    } else throw it
+                }
         }
         val excludePackage = options.excludePackage
         while (excludePackage.hasNext()) {
             val name = excludePackage.next()
             runCatching { builder.addDisallowedApplication(name) }
-                .onFailure { if (it is NameNotFoundException) Log.w(TAG, "包不存在，跳过 exclude: $name") else throw it }
+                .onSuccess { scope.excludedPackages.add(name) }
+                .onFailure {
+                    if (it is NameNotFoundException) {
+                        scope.skippedPackages.add("exclude:$name")
+                        Log.w(TAG, "包不存在，跳过 exclude: $name")
+                    } else throw it
+                }
         }
     }
 

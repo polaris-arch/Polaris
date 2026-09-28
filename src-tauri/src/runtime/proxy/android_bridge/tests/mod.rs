@@ -44,6 +44,70 @@ async fn non_android_never_reports_a_system_started_core() {
     assert!(!system_started_core_running().await);
 }
 
+#[test]
+fn android_receipt_requires_exact_run_config_and_claim() {
+    let receipt: AndroidStartReceipt = serde_json::from_value(serde_json::json!({
+        "runId": "candidate-7",
+        "configDigest": "a".repeat(64),
+        "claim": "claim-7",
+        "tun": {
+            "autoRoute": true,
+            "routes": ["0.0.0.0/0"],
+            "excludedRoutes": [],
+            "skippedExcludes": [],
+            "allowedPackages": [],
+            "excludedPackages": [],
+            "skippedPackages": []
+        }
+    }))
+    .unwrap();
+    assert!(receipt.matches_request("candidate-7", &"a".repeat(64), Some("claim-7")));
+    assert!(!receipt.matches_request("candidate-8", &"a".repeat(64), Some("claim-7")));
+    assert!(!receipt.matches_request("candidate-7", &"b".repeat(64), Some("claim-7")));
+    assert!(!receipt.matches_request("candidate-7", &"a".repeat(64), None));
+    assert!(receipt.managed_tun_evidence().is_some());
+
+    let mut unknown = receipt.clone();
+    unknown.claim = None; // legacy UUID is never a managed claim
+    assert!(unknown.managed_tun_evidence().is_none());
+    unknown.claim = Some("claim-7".into());
+    unknown.tun = None; // no fd was observed
+    assert!(unknown.managed_tun_evidence().is_none());
+    unknown.tun = receipt.tun;
+    unknown.tun.as_mut().unwrap().auto_route = false;
+    assert!(unknown.managed_tun_evidence().is_none());
+    unknown.tun.as_mut().unwrap().auto_route = true;
+    unknown
+        .tun
+        .as_mut()
+        .unwrap()
+        .skipped_excludes
+        .push("127.0.0.0/8".into());
+    assert!(unknown.managed_tun_evidence().is_none());
+    unknown.tun.as_mut().unwrap().skipped_excludes.clear();
+    unknown
+        .tun
+        .as_mut()
+        .unwrap()
+        .skipped_packages
+        .push("include:missing.app".into());
+    assert!(unknown.managed_tun_evidence().is_none());
+    assert!(
+        serde_json::from_value::<AndroidStartReceipt>(serde_json::json!({
+            "configDigest": "a".repeat(64)
+        }))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn non_android_main_owner_query_is_unknown() {
+    if cfg!(target_os = "android") {
+        return;
+    }
+    assert!(main_core_ownership().await.is_err());
+}
+
 /// 🔴 **变异锁：Kotlin 侧的 code 必须过白名单，不得原样透传。**
 ///
 /// 变异：把 `map_rejected_code` 改成 `code.unwrap_or(STARTUP_FAILED)` 之类的透传 ⇒ 第三条断。

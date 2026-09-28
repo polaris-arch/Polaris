@@ -12,6 +12,15 @@ import org.junit.Test
 
 class MainKernelAttemptTest {
     private fun await(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
+    private val observedScope = TunScope(
+        autoRoute = true,
+        routes = listOf("0.0.0.0/0"),
+        excludedRoutes = listOf("192.168.0.0/16"),
+        skippedExcludes = emptyList(),
+        allowedPackages = emptyList(),
+        excludedPackages = listOf("com.example.bypass"),
+        skippedPackages = emptyList(),
+    )
 
     @Test fun stopBeforeFactoryPublishesWaitsForThatServerAndClosesExactlyOnce() {
         val attempt = MainKernelAttempt<Any>()
@@ -55,10 +64,12 @@ class MainKernelAttemptTest {
         val oldFd = Closeable { oldCloses.incrementAndGet() }
         val newFd = Closeable { newCloses.incrementAndGet() }
         val lateFd = Closeable { lateCloses.incrementAndGet() }
-        old.installTun(oldFd)
+        old.installTun(oldFd, observedScope)
+        assertEquals(observedScope, old.currentTunScope())
         val detached = old.revokeAndDetachTun()
-        new.installTun(newFd)
-        val rejected = runCatching { old.installTun(lateFd) }
+        assertEquals(null, old.currentTunScope())
+        new.installTun(newFd, observedScope)
+        val rejected = runCatching { old.installTun(lateFd, observedScope) }
         if (rejected.isFailure) lateFd.close() // BoxService closes rejected establish results.
         assertTrue(rejected.isFailure)
         assertSame(oldFd, detached)
@@ -68,6 +79,51 @@ class MainKernelAttemptTest {
         assertEquals(0, newCloses.get())
         new.revokeAndDetachTun()?.close()
         assertEquals(1, newCloses.get())
+    }
+
+    @Test fun lateOldTunCannotBePublishedToNewRegistryOwner() {
+        val registry = MainKernelAttemptLedger()
+        val old = MainKernelAttempt<Any>(runId = "old-run")
+        val next = MainKernelAttempt<Any>(runId = "next-run")
+        assertTrue(registry.claim(old))
+        old.publish(Any())
+        old.revokeAndDetachTun()
+        old.closeOnce { }
+        assertEquals(null, old.closed.get(2, TimeUnit.SECONDS))
+        assertTrue(registry.completeAfterClose(old) { })
+        assertTrue(registry.claim(next))
+        val late = Closeable { }
+        assertTrue(runCatching { registry.installTun(old, late, observedScope) }.isFailure)
+        assertEquals(null, next.currentTunScope())
+        val current = Closeable { }
+        registry.installTun(next, current, observedScope)
+        assertEquals(observedScope, next.currentTunScope())
+    }
+
+    @Test fun missingFdNeverProducesTunScope() {
+        val attempt = MainKernelAttempt<Any>()
+        assertEquals(null, attempt.currentTunScope())
+        attempt.installTun(Closeable { }, observedScope)
+        attempt.revokeAndDetachTun()
+        assertEquals(null, attempt.currentTunScope())
+    }
+
+    @Test fun registryKeepsRunOwnedUntilConfirmedClose() {
+        val registry = MainKernelAttemptLedger()
+        val attempt = MainKernelAttempt<Any>(runId = "candidate-9")
+        assertEquals("absent" to null, registry.snapshot())
+        assertTrue(registry.claim(attempt))
+        assertEquals("starting" to "candidate-9", registry.snapshot())
+        attempt.acknowledgeStart()
+        assertEquals("acknowledged" to "candidate-9", registry.snapshot())
+        attempt.revokeAndDetachTun()
+        assertEquals("closing" to "candidate-9", registry.snapshot())
+        attempt.publish(Any())
+        attempt.closeOnce { throw IllegalStateException("native close failed") }
+        attempt.closed.get(2, TimeUnit.SECONDS)
+        assertEquals("cleanupUnknown" to "candidate-9", registry.snapshot())
+        assertFalse(registry.completeAfterClose(attempt) { })
+        assertEquals("cleanupUnknown" to "candidate-9", registry.snapshot())
     }
 
     @Test fun secondServiceCannotClaimWhileFirstCloseIsUnknownOrFailed() {

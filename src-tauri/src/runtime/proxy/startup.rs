@@ -1397,7 +1397,7 @@ impl ProxyRuntime {
                 // 用户可见的十几秒空等。真正的瞬态（端口占用）在 Android 上不存在——管理口是进程内
                 // 回环，且每腿都会重解析。
                 match super::android_bridge::start_core(&gate_config_json).await {
-                    Ok(()) => 0,
+                    Ok(_receipt) => 0,
                     Err((msg, error_code)) => {
                         self.set_error(&msg, error_code);
                         return Err(StartError::coded(msg, error_code));
