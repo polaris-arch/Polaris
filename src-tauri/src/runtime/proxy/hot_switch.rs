@@ -260,6 +260,8 @@ pub(crate) struct TestPutSink {
     pub(super) groups: Mutex<Option<Vec<GroupSelection>>>,
     /// 在 PUT 边界制造新用户意图或 stop 世代跃迁，验证旧回执不会提交/起核。
     pub(super) on_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 在运行期 group 读回边界制造 Full restart claim 或更新意图。
+    pub(super) on_groups: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(test)]
@@ -294,6 +296,9 @@ impl TestPutSink {
 
     /// 预置的运行期 group 快照（见 `groups` 字段）。
     fn groups(&self) -> Option<Vec<GroupSelection>> {
+        if let Some(callback) = self.on_groups.lock().unwrap().take() {
+            callback();
+        }
         self.groups.lock().unwrap().clone()
     }
 }
@@ -771,6 +776,18 @@ impl ProxyRuntime {
             {
                 Some(SwitchOutcome::Pending)
             }
+            Some(LifecycleKind::Start | LifecycleKind::Restart)
+                if matches!(outcome, Some(SwitchOutcome::Pending))
+                    && self.pending_switch.read().ok().is_some_and(|pending| {
+                        pending.as_ref().is_some_and(|(id, switch)| {
+                            self.gate.pending().switch_id == Some(*id)
+                                && matches!(switch, PendingSwitch::Selected { intent_generation: queued, .. }
+                                    if *queued == intent_generation)
+                        })
+                    }) =>
+            {
+                Some(SwitchOutcome::Pending)
+            }
             _ => None,
         }
     }
@@ -1006,8 +1023,12 @@ impl ProxyRuntime {
             ClassifiedSwitch::Unchanged => {
                 if scope == SwitchApplyScope::SelectedOnly {
                     if !self.strict_confirm_selected(&new_config).await {
-                        if !self.selector_operation_is_current(switch_generation, intent_generation)
-                        {
+                        if !self.with_selected_projection_claim(
+                            &new_config,
+                            switch_generation,
+                            intent_generation,
+                            || {},
+                        ) {
                             return SwitchOutcome::Pending;
                         }
                         return self.restart_selected_projection(
@@ -1196,8 +1217,12 @@ impl ProxyRuntime {
                 log::info!("switchMode：生成无关变更（norm 等价 + 节点未变）→ 零重启");
                 if scope == SwitchApplyScope::SelectedOnly {
                     if !self.strict_confirm_selected(&new_config).await {
-                        if !self.selector_operation_is_current(switch_generation, intent_generation)
-                        {
+                        if !self.with_selected_projection_claim(
+                            &new_config,
+                            switch_generation,
+                            intent_generation,
+                            || {},
+                        ) {
                             return SwitchOutcome::Pending;
                         }
                         return self.restart_selected_projection(
@@ -1240,7 +1265,12 @@ impl ProxyRuntime {
             }
             SwitchDecision::Restart => {
                 if scope == SwitchApplyScope::SelectedOnly {
-                    if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || {},
+                    ) {
                         return SwitchOutcome::Pending;
                     }
                     return self.restart_selected_projection(
@@ -1271,7 +1301,12 @@ impl ProxyRuntime {
             };
             if needs_rule_file_restart {
                 if scope == SwitchApplyScope::SelectedOnly {
-                    if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || {},
+                    ) {
                         return SwitchOutcome::Pending;
                     }
                     return self.restart_selected_projection(

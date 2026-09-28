@@ -682,6 +682,75 @@ async fn full_restart_claim_during_selected_put_queues_current_selection_for_dra
     assert_eq!(sink.calls().len(), 2);
 }
 
+#[tokio::test]
+async fn full_restart_claim_during_unchanged_readback_queues_only_current_selection() {
+    for newer_intent in [false, true] {
+        let (rt, _dir, sink, running) = explicit_selection_fixture();
+        rt.config.save_full(&running).unwrap();
+        *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node B")]);
+        let intent = rt.register_selector_intent();
+        let starting_generation = rt.core_generation();
+        let owner = Arc::clone(&rt);
+        *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
+            if newer_intent {
+                owner.register_selector_intent();
+            } else {
+                let generation = owner.gate.generation();
+                assert!(owner.gate.try_begin_restart(generation, None).is_some());
+            }
+        }));
+
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-a", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Pending)
+        );
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectedServerId"],
+            "node-a"
+        );
+        let queued = rt.pending_switch.read().unwrap().clone();
+        if newer_intent {
+            assert!(queued.is_none(), "superseded intent must never be replayed");
+            assert_eq!(
+                rt.settle_selected_switch_receipt(
+                    Some(SwitchOutcome::Pending),
+                    starting_generation,
+                    intent,
+                ),
+                None,
+                "newer intent must silence the obsolete receipt"
+            );
+        } else {
+            assert!(matches!(
+                queued.as_ref(),
+                Some((_, PendingSwitch::Selected { server_id, intent_generation }))
+                    if server_id == "node-a" && *intent_generation == intent
+            ));
+            assert_eq!(
+                rt.settle_selected_switch_receipt(
+                    Some(SwitchOutcome::Pending),
+                    starting_generation,
+                    intent,
+                ),
+                Some(SwitchOutcome::Pending),
+                "queued same-intent selection must remain visible as pending"
+            );
+            *rt.pending_switch.write().unwrap() = None;
+            assert_eq!(
+                rt.settle_selected_switch_receipt(
+                    Some(SwitchOutcome::Pending),
+                    starting_generation,
+                    intent,
+                ),
+                None,
+                "generation change without an owned replay may not claim pending"
+            );
+        }
+    }
+}
+
 #[test]
 fn explicit_selection_receipt_rejects_old_pending_and_old_success() {
     let (rt, _dir, _sink, _running) = explicit_selection_fixture();
