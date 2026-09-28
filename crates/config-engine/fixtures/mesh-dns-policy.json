@@ -1,0 +1,28 @@
+{
+  "policy": {
+    "schemaVersion": 1,
+    "suffixAssignments": [
+      { "suffix": "Corp.TS.NET.", "target": { "kind": "owner", "serverId": "alpha", "identityEpoch": "epoch-a" } },
+      { "suffix": "nested.corp.ts.net", "target": { "kind": "owner", "serverId": "beta", "identityEpoch": "epoch-b" } },
+      { "suffix": "lab.ts.net", "target": { "kind": "owner", "serverId": "beta", "identityEpoch": "epoch-b" } }
+    ],
+    "shortNamePolicy": { "kind": "owner", "serverId": "alpha", "identityEpoch": "epoch-a" },
+    "serviceOwner": { "kind": "owner", "serverId": "beta", "identityEpoch": "epoch-b" }
+  },
+  "state": {
+    "schemaVersion": 1,
+    "localId": "synthetic-d1",
+    "revision": "1",
+    "identities": [
+      { "serverId": "alpha", "identityEpoch": "epoch-a", "controlAuthority": "https://control.invalid/a", "bindingState": "bound", "evidenceSource": "synthetic" },
+      { "serverId": "beta", "identityEpoch": "epoch-b", "controlAuthority": "https://control.invalid/b", "bindingState": "bound", "evidenceSource": "synthetic" }
+    ],
+    "observations": [
+      { "ownerRef": { "serverId": "alpha", "identityEpoch": "epoch-a" }, "rawHosts": [], "advertisedRoutes": [], "magicDnsSuffixes": ["corp.ts.net"], "source": "synthetic", "lastValidEvidence": "status-a" },
+      { "ownerRef": { "serverId": "beta", "identityEpoch": "epoch-b" }, "rawHosts": [], "advertisedRoutes": [], "magicDnsSuffixes": ["nested.corp.ts.net", "lab.ts.net", "orphan.corp.ts.net"], "source": "synthetic", "lastValidEvidence": "status-b" }
+    ],
+    "reservations": [],
+    "intent": { "revision": "1", "desiredRun": "stopped" },
+    "identityEffects": []
+  }
+}
