@@ -4,17 +4,23 @@
 
 use super::{plan_digest, safe_plan_id};
 use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
+use polaris_config_engine::user_config::mesh_route_state::MeshActivePlan;
 use polaris_store::fs::DurableWriteGuarantee;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 const ARTIFACT_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_FILES: usize = 512;
 pub(super) const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PLAN_BYTES: u64 = 32 * 1024 * 1024;
 const MANIFEST_NAME: &str = "manifest.json";
 const CONFIG_NAME: &str = "config.json";
 const PLAN_NAME: &str = "plan.json";
@@ -59,6 +65,25 @@ pub(crate) struct StagedArtifacts {
     pub manifest: ArtifactManifest,
     pub manifest_ref: String,
     pub durability: DurableWriteGuarantee,
+}
+
+/// Owned, fully verified bytes of the plan named by the durable activePlan.
+/// This is evidence of historical route scope only. It says nothing about
+/// whether a process or Tailscale state-directory owner is still alive.
+#[derive(Debug)]
+pub(crate) struct VerifiedActivePlan {
+    active: MeshActivePlan,
+    plan: ManagedMeshRoutePlan,
+}
+
+impl VerifiedActivePlan {
+    pub(super) fn active(&self) -> &MeshActivePlan {
+        &self.active
+    }
+
+    pub(super) fn plan(&self) -> &ManagedMeshRoutePlan {
+        &self.plan
+    }
 }
 
 pub(super) fn validate_relative(path: &str) -> Result<(), ArtifactError> {
@@ -221,7 +246,65 @@ fn write_new_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), Artif
     Ok(())
 }
 
+fn same_file_identity(before: &Metadata, after: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        return before.dev() == after.dev() && before.ino() == after.ino();
+    }
+    #[cfg(windows)]
+    {
+        return matches!(
+            (
+                before.volume_serial_number(),
+                after.volume_serial_number(),
+                before.file_index(),
+                after.file_index(),
+            ),
+            (Some(a_volume), Some(b_volume), Some(a_index), Some(b_index))
+                if a_volume == b_volume && a_index == b_index
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (before, after);
+        false
+    }
+}
+
+fn same_file_snapshot(before: &Metadata, after: &Metadata) -> bool {
+    same_file_identity(before, after)
+        && before.len() == after.len()
+        && matches!((before.modified(), after.modified()), (Ok(a), Ok(b)) if a == b)
+        && {
+            #[cfg(unix)]
+            {
+                before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+}
+
+fn open_checked_file(path: &Path) -> Result<File, ArtifactError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    Ok(options.open(path)?)
+}
+
 fn read_checked(root: &Path, relative: &str, max_bytes: u64) -> Result<Vec<u8>, ArtifactError> {
+    read_checked_after_lstat(root, relative, max_bytes, || {})
+}
+
+fn read_checked_after_lstat(
+    root: &Path,
+    relative: &str,
+    max_bytes: u64,
+    after_lstat: impl FnOnce(),
+) -> Result<Vec<u8>, ArtifactError> {
     validate_relative(relative)?;
     inspect_directory(root)?;
     let path = root.join(relative);
@@ -230,6 +313,29 @@ fn read_checked(root: &Path, relative: &str, max_bytes: u64) -> Result<Vec<u8>, 
     for component in &components[..components.len() - 1] {
         parent.push(component);
         inspect_directory(&parent)?;
+    }
+    // A trusted plan is an owned byte snapshot, not just a pathname. Require
+    // the plan root to be private and ancestors to be real directories; detect
+    // ordinary concurrent replacement of any
+    // path component. This is not an atomic openat walk: an adversary able to
+    // swap an ancestor away and back between checks remains a production
+    // boundary; source/artifact roots must stay private to the application.
+    let mut directories = Vec::new();
+    for ancestor in path
+        .parent()
+        .ok_or(ArtifactError::Invalid("artifact has no parent"))?
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let before = fs::symlink_metadata(ancestor)?;
+        if before.file_type().is_symlink() || !before.is_dir() {
+            return Err(ArtifactError::Invalid(
+                "artifact parent is not a real directory",
+            ));
+        }
+        directories.push((ancestor.to_path_buf(), before));
     }
     let metadata = fs::symlink_metadata(&path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -247,9 +353,43 @@ fn read_checked(root: &Path, relative: &str, max_bytes: u64) -> Result<Vec<u8>, 
             ));
         }
     }
-    let bytes = fs::read(path)?;
+    after_lstat();
+    let mut file = open_checked_file(&path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || !same_file_snapshot(&metadata, &opened) {
+        return Err(ArtifactError::Invalid("artifact changed before read"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
         return Err(ArtifactError::Invalid("artifact size budget exceeded"));
+    }
+    let end_file = file.metadata()?;
+    let end_path = fs::symlink_metadata(&path)?;
+    if end_path.file_type().is_symlink()
+        || !end_path.is_file()
+        || bytes.len() as u64 != metadata.len()
+        || !same_file_snapshot(&metadata, &end_file)
+        || !same_file_snapshot(&metadata, &end_path)
+    {
+        return Err(ArtifactError::Invalid("artifact changed during read"));
+    }
+    #[cfg(unix)]
+    if end_path.permissions().mode() & 0o077 != 0 {
+        return Err(ArtifactError::Invalid(
+            "artifact permissions changed during read",
+        ));
+    }
+    for (directory, before) in directories {
+        let after = fs::symlink_metadata(&directory)?;
+        if after.file_type().is_symlink() || !after.is_dir() || !same_file_identity(&before, &after)
+        {
+            return Err(ArtifactError::Invalid(
+                "artifact parent changed during read",
+            ));
+        }
     }
     Ok(bytes)
 }
@@ -316,6 +456,50 @@ pub(crate) fn verify_artifacts(
         verify_entry(&root, entry)?;
     }
     Ok(manifest)
+}
+
+/// Recover a committed plan only through the durable ledger's exact identity.
+/// The compact typed serialization must round-trip byte-for-byte; arbitrary
+/// JSON fields, duplicate/reshuffled fields, or a different plan version are
+/// never treated as historical owner-scope evidence.
+pub(crate) fn load_verified_active_plan(
+    data_dir: &Path,
+    active: &MeshActivePlan,
+) -> Result<VerifiedActivePlan, ArtifactError> {
+    if active.digest.len() != 64
+        || !active
+            .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ArtifactError::Invalid("invalid active plan digest"));
+    }
+    let (root, _) = artifact_paths(data_dir, &active.plan_id)?;
+    inspect_real_directory(data_dir)?;
+    inspect_directory(&data_dir.join("mesh-routes"))?;
+    inspect_directory(&data_dir.join("mesh-routes/plans"))?;
+    inspect_directory(&root)?;
+    let plan_bytes = read_checked(&root, PLAN_NAME, MAX_PLAN_BYTES)?;
+    if polaris_updater::verify::sha256_hex(&plan_bytes) != active.digest {
+        return Err(ArtifactError::Invalid("active plan digest mismatch"));
+    }
+    let plan: ManagedMeshRoutePlan = serde_json::from_slice(&plan_bytes)
+        .map_err(|_| ArtifactError::Invalid("invalid active plan"))?;
+    if plan.schema_version != 1
+        || plan.plan_id != active.plan_id
+        || plan.config_version != active.config_version
+        || plan.input_state_revision != active.input_state_revision
+        || serde_json::to_vec(&plan)
+            .map_err(|_| ArtifactError::Invalid("active plan serialization"))?
+            != plan_bytes
+    {
+        return Err(ArtifactError::Invalid("active plan binding mismatch"));
+    }
+    verify_artifacts(data_dir, &plan)?;
+    Ok(VerifiedActivePlan {
+        active: active.clone(),
+        plan,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

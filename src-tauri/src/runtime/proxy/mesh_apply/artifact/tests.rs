@@ -1,9 +1,14 @@
+use super::super::owner_scope::verified_owner_scope;
 use super::*;
 use crate::test_support::TestDir;
 use polaris_config_engine::builder::managed_mesh_plan::{
-    compile_managed_mesh_plan, ManagedMeshPlanInput,
+    compile_managed_mesh_plan, ManagedMeshPlanInput, ManagedOwnerRoute, ManagedPlanTarget,
+    ManagedScopedOverride,
 };
-use polaris_config_engine::user_config::mesh_route_state::{MeshRoutePolicy, MeshRouteState};
+use polaris_config_engine::singbox::RouteRule;
+use polaris_config_engine::user_config::mesh_route_state::{
+    MeshOwnerRef, MeshRoutePolicy, MeshRouteState,
+};
 use std::collections::BTreeMap;
 
 fn tempdir() -> TestDir {
@@ -34,6 +39,153 @@ fn files() -> Vec<(String, Vec<u8>)> {
         ("rules/b.json".into(), b"{\"version\":2}".to_vec()),
         ("rules/a.json".into(), b"{\"version\":1}".to_vec()),
     ]
+}
+
+fn active(plan: &ManagedMeshRoutePlan) -> MeshActivePlan {
+    MeshActivePlan {
+        plan_id: plan.plan_id.clone(),
+        digest: plan_digest(plan).unwrap(),
+        config_version: plan.config_version.clone(),
+        input_state_revision: plan.input_state_revision.clone(),
+    }
+}
+
+#[test]
+fn active_plan_loader_validates_manifest_and_extracts_only_exact_owner_scope() {
+    let dir = tempdir();
+    let mut plan = plan("trusted-old-plan");
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    let other = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-b".into(),
+    };
+    let historical = MeshOwnerRef {
+        server_id: "ts-missing".into(),
+        identity_epoch: "old".into(),
+    };
+    plan.identity_bindings = vec![owner.clone(), other.clone(), historical.clone()];
+    plan.owner_routes = vec![
+        ManagedOwnerRoute {
+            cidr: "100.80.0.0/16".into(),
+            owner_ref: owner.clone(),
+            endpoint_tag: "ep-a".into(),
+        },
+        ManagedOwnerRoute {
+            cidr: "100.90.0.0/16".into(),
+            owner_ref: other.clone(),
+            endpoint_tag: "ep-b".into(),
+        },
+    ];
+    plan.overrides = vec![
+        ManagedScopedOverride {
+            rule_id: "rule-a".into(),
+            scope_cidrs: vec!["100.81.0.0/16".into(), "100.80.0.0/16".into()],
+            matcher: RouteRule::default(),
+            target: ManagedPlanTarget::Owner {
+                owner_ref: owner.clone(),
+                endpoint_tag: "ep-a".into(),
+            },
+        },
+        ManagedScopedOverride {
+            rule_id: "rule-b".into(),
+            scope_cidrs: vec!["100.91.0.0/16".into()],
+            matcher: RouteRule::default(),
+            target: ManagedPlanTarget::Owner {
+                owner_ref: other.clone(),
+                endpoint_tag: "ep-b".into(),
+            },
+        },
+    ];
+    stage_artifacts(dir.path(), &plan, b"{}", &files(), "generator-1").unwrap();
+    let verified = load_verified_active_plan(dir.path(), &active(&plan)).unwrap();
+    let scope = verified_owner_scope(&verified, &owner).unwrap();
+    assert_eq!(scope.active(), &active(&plan));
+    assert_eq!(scope.owner_ref(), &owner);
+    assert_eq!(
+        scope.cidrs(),
+        &["100.80.0.0/16".to_string(), "100.81.0.0/16".to_string()]
+    );
+    assert_eq!(
+        verified_owner_scope(&verified, &historical)
+            .unwrap()
+            .cidrs(),
+        &[] as &[String],
+    );
+    // identityBindings may name a historical owner, but empty route scope is
+    // never evidence that its process or state-directory owner has exited.
+}
+
+#[test]
+fn active_plan_loader_rejects_missing_tampered_or_mismatched_artifacts() {
+    let dir = tempdir();
+    let plan = plan("trusted-old-plan-errors");
+    let active = active(&plan);
+    assert!(load_verified_active_plan(dir.path(), &active).is_err());
+    stage_artifacts(dir.path(), &plan, b"{}", &files(), "generator-1").unwrap();
+    let mut wrong = active.clone();
+    wrong.digest = "0".repeat(64);
+    assert!(load_verified_active_plan(dir.path(), &wrong).is_err());
+    wrong = active.clone();
+    wrong.config_version = "new-version".into();
+    assert!(load_verified_active_plan(dir.path(), &wrong).is_err());
+    wrong = active.clone();
+    wrong.input_state_revision = "2".into();
+    assert!(load_verified_active_plan(dir.path(), &wrong).is_err());
+    wrong = active.clone();
+    wrong.plan_id = "some-other-plan".into();
+    assert!(load_verified_active_plan(dir.path(), &wrong).is_err());
+    let root = dir.path().join("mesh-routes/plans/trusted-old-plan-errors");
+    fs::write(root.join("rules/a.json"), b"tampered").unwrap();
+    assert!(load_verified_active_plan(dir.path(), &active).is_err());
+    fs::write(root.join("rules/a.json"), b"{\"version\":1}").unwrap();
+    fs::write(root.join("config.json"), b"tampered").unwrap();
+    assert!(load_verified_active_plan(dir.path(), &active).is_err());
+    fs::write(root.join("config.json"), b"{}").unwrap();
+    fs::remove_file(root.join("manifest.json")).unwrap();
+    assert!(load_verified_active_plan(dir.path(), &active).is_err());
+}
+
+#[test]
+fn typed_old_plan_refuses_extra_fields_and_invalid_owner_cidr() {
+    let mut extra = serde_json::to_value(plan("old-plan-unknown-field")).unwrap();
+    extra["unreviewedField"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<ManagedMeshRoutePlan>(extra).is_err());
+
+    let dir = tempdir();
+    let mut plan = plan("old-plan-invalid-owner-cidr");
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    plan.owner_routes.push(ManagedOwnerRoute {
+        cidr: "not-a-cidr".into(),
+        owner_ref: owner.clone(),
+        endpoint_tag: "ep-a".into(),
+    });
+    stage_artifacts(dir.path(), &plan, b"{}", &files(), "generator-1").unwrap();
+    let verified = load_verified_active_plan(dir.path(), &active(&plan)).unwrap();
+    assert!(verified_owner_scope(&verified, &owner).is_err());
+}
+
+#[test]
+fn active_plan_reader_rejects_same_length_inode_swap_between_lstat_and_open() {
+    let dir = tempdir();
+    let plan = plan("trusted-old-plan-race");
+    stage_artifacts(dir.path(), &plan, b"{}", &files(), "generator-1").unwrap();
+    let root = dir.path().join("mesh-routes/plans/trusted-old-plan-race");
+    let path = root.join("plan.json");
+    let replacement = root.join("replacement.json");
+    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+    assert!(matches!(
+        read_checked_after_lstat(&root, PLAN_NAME, MAX_PLAN_BYTES, || {
+            fs::remove_file(&path).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        }),
+        Err(ArtifactError::Invalid("artifact changed before read"))
+    ));
 }
 
 #[test]

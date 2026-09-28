@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::builder::endpoint_routes::{
     TAILNET_CGNAT, TAILNET_MAGICDNS_V4, TAILNET_MAGICDNS_V6, TAILNET_ULA_V6,
@@ -45,16 +45,16 @@ pub struct ManagedMeshPlanInput {
     pub scopeable_rule_matchers: BTreeMap<String, RouteRule>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedOwnerRoute {
     pub cidr: String,
     pub owner_ref: MeshOwnerRef,
     pub endpoint_tag: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ManagedPlanTarget {
     Owner {
         #[serde(rename = "ownerRef")]
@@ -66,8 +66,8 @@ pub enum ManagedPlanTarget {
     Unmanaged,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedScopedOverride {
     pub rule_id: String,
     pub scope_cidrs: Vec<String>,
@@ -76,8 +76,8 @@ pub struct ManagedScopedOverride {
     pub target: ManagedPlanTarget,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedMeshRoutePlan {
     pub schema_version: u32,
     pub plan_id: String,
