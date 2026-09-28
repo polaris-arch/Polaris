@@ -1615,6 +1615,8 @@
   },
   "backupImport": {
     "categories": "Categories in this file",
+    "confirmScope": "About to replace: {{categories}}.",
+    "confirmTitle": "Restore selected categories?",
     "discardMsg": "The selected backup file and categories won't be restored.",
     "discardTitle": "Discard this import?",
     "errApply": "Restore failed",

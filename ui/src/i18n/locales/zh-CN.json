@@ -1615,6 +1615,8 @@
   },
   "backupImport": {
     "categories": "文件内的类别",
+    "confirmScope": "即将替换：{{categories}}。",
+    "confirmTitle": "确认恢复所选类别？",
     "discardMsg": "已选择的备份文件与类别将不会恢复。",
     "discardTitle": "放弃导入？",
     "errApply": "恢复失败",

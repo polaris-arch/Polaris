@@ -1615,6 +1615,8 @@
   },
   "backupImport": {
     "categories": "檔案內的類別",
+    "confirmScope": "即將取代：{{categories}}。",
+    "confirmTitle": "確認復原所選類別？",
     "discardMsg": "已選擇的備份檔案與類別將不會復原。",
     "discardTitle": "放棄匯入？",
     "errApply": "復原失敗",

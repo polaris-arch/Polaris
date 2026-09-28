@@ -1,7 +1,7 @@
 /**
  * 设置 → 备份（移动端）。桌面对照：`components/screens/settings/SettingsBackup.tsx`。
  *
- * 类目选择整块原样保留（7 类 + 全选，`domain/backup-categories` 是同一份真值源）。
+ * 类目选择整块原样保留（8 类 + 全选，`domain/backup-categories` 是同一份真值源）。
  *
  * # 导出/导入两条腿（W-18 起是**真的接上了**，不再是禁用 + 理由）
  *
@@ -16,23 +16,20 @@
  * `Intent.ACTION_CREATE_DOCUMENT`（tauri-plugin-dialog 的 `DialogPlugin.kt:204 saveFileDialog`）＝
  * 文件保存器；导入走 `Intent.ACTION_GET_CONTENT`（`:57 showFilePicker`）＝文件选择器。
  *
- * # 导入是**两步**，与桌面同一条链，只是没有弹窗宿主
+ * # 导入预览与覆盖确认
  *
- * 桌面把 `importPick → 逐类目预览勾选 → importApply` 放进 `BackupImportDialog`。移动端没有弹窗
- * 宿主（`DialogHost` 只挂在桌面外壳上），故那一步就地展开成本页下半截的一个组：选中文件之后
- * 露出「备份里有哪些类 + 各类数量」，用户勾完再按「恢复所选」。
+ * 桌面把 `importPick → 逐类目预览勾选 → importApply` 放进 `BackupImportDialog`。移动端把预览
+ * 就地展开成本页下半截的一个组；「恢复所选」再经移动表单宿主的确认面板，确认后才 apply。
  * **不做「一步到位直接 apply」**：整类替换是破坏性的，看不见要替换什么就按下去，与桌面同一个
  * 动作在两端的风险等级会不一样。
  *
  * # 失败/成功都必须看得见
  *
- * 移动端没有 toast 宿主（`lib/error-handler` 的门面在未注入实现时落 console），故两条腿的失败
- * 一律走本屏那套 `commit(行 id, promise, 取文)`：错误挂在行 id 上、由 `SettingsRow` 从 context
- * 自取，渲染成紧贴按钮的红字。成功则落同一行的 `hint`（非错误色）——
- * 「点了导出，系统保存器弹了又关了，界面上一个字都没有」与静默失败在用户那里是同一件事。
+ * 两条腿的失败走 `commit(行 id, promise, 取文)`，错误紧贴按钮。导出成功留行内回执；导入
+ * 成功收起预览后走 `MobileToaster`，因为导入操作行随预览消失，行内回执会离视口很远。
  */
 
-import { useEffect, useMemo, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   BACKUP_CATEGORIES,
@@ -42,10 +39,12 @@ import {
 } from '@/domain/backup-categories';
 import { backupErrorText } from '@/domain/action-error-text';
 import { api } from '@/ipc';
+import { toast } from '@/lib/error-handler';
+import { closeMobileForm, openMobileForm, useMobileFormStore } from '../forms/form-store';
 import { MobileButton, MobileSwitch, SettingsGroup, SettingsRow } from './SettingsChrome';
 import { failureText, type CommitWrite } from './write-feedback';
 
-/** 7 类标签 → i18n 键。与桌面同一张表（文案逐字相同，不另造重复键）。 */
+/** 8 类标签 → i18n 键。与桌面同一张表（文案逐字相同，不另造重复键）。 */
 const CATEGORY_LABEL_KEYS: Readonly<Record<BackupCategory, string>> = {
   manualNodes: 'settings.advanced.backup.manualNodes',
   meshNodes: 'settings.advanced.backup.meshNodes',
@@ -85,10 +84,13 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
   const { t } = useTranslation();
   const [selected, setSelected] = useState<Set<BackupCategory>>(() => new Set(BACKUP_CATEGORIES));
   const [busy, setBusy] = useState(false);
-  /** 成功回执（非错误色，落在按钮那一行的 `hint` 上）。失败走 `commit`，不进这里。 */
+  /** 导出成功回执；导入成功由 toast 承接。失败都走 `commit`。 */
   const [done, setDone] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingImport | null>(null);
   const [importPick, setImportPick] = useState<Set<BackupCategory>>(() => new Set());
+  const previewRef = useRef({ pending, importPick });
+  previewRef.current = { pending, importPick };
+  const confirmIdRef = useRef<string | null>(null);
 
   const allOn = selected.size === BACKUP_CATEGORIES.length;
   const selectedArr = useMemo(() => Array.from(selected), [selected]);
@@ -161,22 +163,22 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
     );
   }
 
-  function doImportApply(source: PendingImport): void {
+  function doImportApply(source: PendingImport, categories: readonly BackupCategory[]): void {
     setDone(null);
     setBusy(true);
     commit(
       IMPORT_ROW,
       (async () => {
         try {
-          const res = await api.backup.importApply(source.filePath, Array.from(importPick));
+          const res = await api.backup.importApply(source.filePath, [...categories]);
           if (!res.success) throw new Error(backupErrorText(res.errorCode, t));
           const fallback = res.unavailableInterfaceBindings ?? 0;
-          setDone(
+          setPending(null);
+          toast.success(
             fallback > 0
               ? t('backupImport.interfaceFallbackDone', { n: fallback })
               : t('mobileSettings.backup.importDone'),
           );
-          setPending(null);
         } finally {
           setBusy(false);
         }
@@ -187,6 +189,36 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
           plain: 'backupImport.errApply',
         }),
     );
+  }
+
+  function confirmImport(source: PendingImport): void {
+    if (busy) return;
+    if (confirmIdRef.current !== null && useMobileFormStore.getState().hasInstance(confirmIdRef.current)) return;
+    const categories = BACKUP_CATEGORIES.filter((cat) => importPick.has(cat));
+    if (categories.length === 0) return;
+    let submitted = false;
+    const confirmId = openMobileForm({
+      kind: 'confirm',
+      payload: {
+        title: t('backupImport.confirmTitle'),
+        message: `${t('backupImport.replaceWarn')} ${t('backupImport.confirmScope', {
+          categories: categories.map((cat) => t(CATEGORY_LABEL_KEYS[cat])).join(' · '),
+        })}`,
+        confirmLabel: t('backupImport.restoreSelected'),
+        danger: true,
+        onConfirm: () => {
+          if (submitted || !useMobileFormStore.getState().hasInstance(confirmId)) return;
+          const current = previewRef.current;
+          closeMobileForm(confirmId);
+          confirmIdRef.current = null;
+          if (current.pending !== source || current.importPick.size !== categories.length ||
+              categories.some((cat) => !current.importPick.has(cat))) return;
+          submitted = true;
+          doImportApply(source, categories);
+        },
+      },
+    });
+    confirmIdRef.current = confirmId;
   }
 
   return (
@@ -284,7 +316,7 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
                 <MobileButton
                   tone="primary"
                   disabled={busy || importPick.size === 0}
-                  onClick={() => doImportApply(pending)}
+                  onClick={() => confirmImport(pending)}
                 >
                   {t('backupImport.restoreSelected')}
                 </MobileButton>
