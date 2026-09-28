@@ -83,4 +83,6 @@ export interface MeshRouteReport {
   schemaVersion: 1;
   snapshot: MeshRouteSnapshot;
   results: MeshRouteResolution[];
+  unknownReasons: MeshRouteUnknownReason[];
+  totalCandidateCount: number;
 }

@@ -4,7 +4,10 @@
 use super::ForceRouteLeg;
 use crate::user_config::cidr::{cidr_contains, cidrs_overlap, normalize_cidr, subtract_cidrs};
 
-const MAX_REPORT_CIDRS: usize = 4096;
+pub const MAX_MESH_ROUTE_REPORT_CANDIDATES: usize = 256;
+pub const MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES: usize = 2048;
+pub const MAX_MESH_ROUTE_REPORT_CIDRS: usize = 4096;
+const MAX_REPORT_CIDRS: usize = MAX_MESH_ROUTE_REPORT_CIDRS;
 const MAX_REPORT_WORK: usize = 262_144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -93,6 +96,14 @@ pub struct MeshRouteCandidate {
     pub unknown_reasons: Vec<MeshRouteUnknownReason>,
 }
 
+/// 生成器块 0c 同轮交给宿主的窄审计；路径仅在本地进程内使用，不进入 wire。
+#[derive(Debug, Clone)]
+pub struct MeshRouteEmissionCandidate {
+    pub candidate: MeshRouteCandidate,
+    pub external_path: Option<String>,
+    pub emitted_inline: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeshRouteSnapshot {
@@ -160,6 +171,9 @@ pub struct MeshRouteReport {
     pub schema_version: u8,
     pub snapshot: MeshRouteSnapshot,
     pub results: Vec<MeshRouteResolution>,
+    /// 全局不完整原因；非空时 UI 不得把未列出的候选读成零冲突。
+    pub unknown_reasons: Vec<MeshRouteUnknownReason>,
+    pub total_candidate_count: usize,
 }
 
 fn subtract_limited(
@@ -212,6 +226,17 @@ fn intersection(requested: &str, earlier: &str) -> Option<(String, MeshRouteRela
 /// 纯 resolver：只解释已提供的实际候选，不重新推断文件值、候选顺序或内核运行状态。
 #[must_use]
 pub fn resolve_mesh_route_snapshot(mut snapshot: MeshRouteSnapshot) -> MeshRouteReport {
+    if snapshot.candidates.len() > MAX_MESH_ROUTE_REPORT_CANDIDATES {
+        let total_candidate_count = snapshot.candidates.len();
+        snapshot.candidates.clear();
+        return MeshRouteReport {
+            schema_version: 1,
+            snapshot,
+            results: Vec::new(),
+            unknown_reasons: vec![MeshRouteUnknownReason::ResourceLimitExceeded],
+            total_candidate_count,
+        };
+    }
     // 磁盘写入及运行代存在都不等于内核加载。非法 scope 组合安全降级。
     if snapshot.scope == MeshRouteScope::Applied
         && (snapshot.run_generation.is_none()
@@ -225,6 +250,9 @@ pub fn resolve_mesh_route_snapshot(mut snapshot: MeshRouteSnapshot) -> MeshRoute
     {
         snapshot.scope = MeshRouteScope::PersistedUnknown;
     }
+    // 当前磁盘文件可能尚未被运行核 reload。保留其 requested 证据，但不能给它
+    // effective/confirmed owner；preview 是明确的假设计算，只有它允许离线求差。
+    let unacknowledged = snapshot.scope == MeshRouteScope::PersistedUnknown;
 
     let mut results = Vec::with_capacity(snapshot.candidates.len());
     let mut confirmed_owners: Vec<(String, Vec<String>)> = Vec::new();
@@ -290,6 +318,11 @@ pub fn resolve_mesh_route_snapshot(mut snapshot: MeshRouteSnapshot) -> MeshRoute
             result
                 .unknown_reasons
                 .push(MeshRouteUnknownReason::SnapshotStale);
+        }
+        if unacknowledged {
+            result
+                .unknown_reasons
+                .push(MeshRouteUnknownReason::FileLoadUnacknowledged);
         }
         if opaque_predecessor {
             result
@@ -377,234 +410,12 @@ pub fn resolve_mesh_route_snapshot(mut snapshot: MeshRouteSnapshot) -> MeshRoute
     }
     MeshRouteReport {
         schema_version: 1,
+        total_candidate_count: snapshot.candidates.len(),
         snapshot,
         results,
+        unknown_reasons: Vec::new(),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
-
-    fn claim(id: &str, leg: ForceRouteLeg, cidrs: Option<&[&str]>) -> MeshRouteCandidate {
-        MeshRouteCandidate {
-            server_id: id.into(),
-            tag: format!("endpoint-{id}"),
-            leg,
-            generated: true,
-            generation_reason: None,
-            engaged_reason: "alwaysRouteSubnets".into(),
-            configured_cidrs: vec![],
-            observed_hosts: vec![],
-            referenced_file: None,
-            match_cidrs: cidrs.map(|xs| {
-                xs.iter()
-                    .map(|x| SourcedCidr {
-                        cidr: (*x).into(),
-                        source: MeshRouteSource::Declared,
-                    })
-                    .collect()
-            }),
-            unknown_reasons: vec![],
-        }
-    }
-
-    fn snapshot(candidates: Vec<MeshRouteCandidate>) -> MeshRouteSnapshot {
-        MeshRouteSnapshot {
-            scope: MeshRouteScope::Preview,
-            config_source: MeshRouteConfigSource::Draft,
-            config_version: Some("test-version".into()),
-            run_generation: None,
-            sampled_at_ms: 1,
-            load_evidence: MeshRouteLoadEvidence::Unknown,
-            snapshot_stale: false,
-            dns_owner_server_id: None,
-            preceding_exceptions: vec!["customRuleMayOverride".into()],
-            candidates,
-        }
-    }
-
-    // 独立 oracle：逐地址按原始规则顺序 first-match，不调用 CIDR 差集/包含实现。
-    fn first_match_v4(candidates: &[MeshRouteCandidate], addr: Ipv4Addr) -> Option<&str> {
-        let ip = u32::from(addr);
-        for candidate in candidates {
-            if !candidate.generated {
-                continue;
-            }
-            for entry in candidate.match_cidrs.as_ref()? {
-                let (raw, bits) = entry.cidr.split_once('/')?;
-                let bits: u32 = bits.parse().ok()?;
-                let network = u32::from(raw.parse::<Ipv4Addr>().ok()?);
-                let mask = if bits == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - bits)
-                };
-                if ip & mask == network & mask {
-                    return Some(&candidate.server_id);
-                }
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn nested_and_partial_overlap_match_independent_first_match() {
-        let candidates = vec![
-            claim("a", ForceRouteLeg::ExternalRuleSet, Some(&["10.20.0.1/16"])),
-            claim(
-                "b",
-                ForceRouteLeg::Inline,
-                Some(&["10.20.1.99/24", "10.21.0.0/16"]),
-            ),
-        ];
-        let report = resolve_mesh_route_snapshot(snapshot(candidates.clone()));
-        assert_eq!(report.results[0].requested[0].cidr, "10.20.0.0/16");
-        assert_eq!(report.results[1].coverage, MeshRouteCoverage::Partial);
-        assert_eq!(
-            report.results[1].effective,
-            Some(vec!["10.21.0.0/16".into()])
-        );
-        assert_eq!(report.results[1].blocked_by[0].server_id, "a");
-        assert_eq!(report.results[1].blocked_by[0].cidr, "10.20.1.0/24");
-        for (ip, expected) in [("10.20.1.5", "a"), ("10.20.9.1", "a"), ("10.21.1.1", "b")] {
-            let ip = ip.parse().unwrap();
-            assert_eq!(first_match_v4(&candidates, ip), Some(expected));
-            let resolved_owner = report.results.iter().find(|r| {
-                r.effective.as_ref().is_some_and(|xs| {
-                    xs.iter().any(|x| {
-                        let (network, bits) = x.split_once('/').unwrap();
-                        let bits: u32 = bits.parse().unwrap();
-                        let mask = if bits == 0 {
-                            0
-                        } else {
-                            u32::MAX << (32 - bits)
-                        };
-                        u32::from(ip) & mask
-                            == u32::from(network.parse::<Ipv4Addr>().unwrap()) & mask
-                    })
-                })
-            });
-            assert_eq!(resolved_owner.map(|r| r.server_id.as_str()), Some(expected));
-        }
-    }
-
-    #[test]
-    fn external_and_inline_have_identical_conflict_semantics() {
-        for legs in [
-            [ForceRouteLeg::ExternalRuleSet, ForceRouteLeg::Inline],
-            [ForceRouteLeg::Inline, ForceRouteLeg::ExternalRuleSet],
-            [
-                ForceRouteLeg::ExternalRuleSet,
-                ForceRouteLeg::ExternalRuleSet,
-            ],
-        ] {
-            let report = resolve_mesh_route_snapshot(snapshot(vec![
-                claim("a", legs[0], Some(&["fd7a:115c:a1e0:0::1/64"])),
-                claim("b", legs[1], Some(&["fd7a:115c:a1e0::2/128"])),
-            ]));
-            assert_eq!(report.results[1].coverage, MeshRouteCoverage::None);
-            assert_eq!(report.results[1].effective, Some(vec![]));
-            assert_eq!(
-                report.results[1].blocked_by[0].cidr,
-                "fd7a:115c:a1e0::2/128"
-            );
-        }
-    }
-
-    #[test]
-    fn opaque_predecessor_keeps_later_effective_null_without_false_owner() {
-        let report = resolve_mesh_route_snapshot(snapshot(vec![
-            claim("unknown", ForceRouteLeg::PreferredBy, None),
-            claim("b", ForceRouteLeg::Inline, Some(&["10.0.0.0/8"])),
-            claim("c", ForceRouteLeg::ExternalRuleSet, Some(&["10.1.0.0/16"])),
-        ]));
-        assert_eq!(report.results[1].effective, None);
-        assert_eq!(report.results[2].effective, None);
-        assert!(report.results[2].blocked_by.is_empty());
-    }
-
-    #[test]
-    fn bad_input_and_catch_all_are_not_reported_as_full_coverage() {
-        let report = resolve_mesh_route_snapshot(snapshot(vec![
-            claim(
-                "a",
-                ForceRouteLeg::Inline,
-                Some(&["0.0.0.1/0", "010.0.0.1/8", "10.0.0.0/8"]),
-            ),
-            claim("b", ForceRouteLeg::Inline, Some(&["192.168.0.0/16"])),
-        ]));
-        assert_eq!(report.results[0].excluded_catch_all, vec!["0.0.0.0/0"]);
-        assert_eq!(report.results[0].invalid, vec!["010.0.0.1/8"]);
-        assert_eq!(report.results[0].effective, None);
-        assert_eq!(report.results[1].coverage, MeshRouteCoverage::Unknown);
-    }
-
-    #[test]
-    fn failed_generation_does_not_claim_or_poison_following_candidate() {
-        let mut failed = claim("a", ForceRouteLeg::Inline, Some(&["10.0.0.0/8"]));
-        failed.generated = false;
-        failed.generation_reason = Some("endpointBuildFailed".into());
-        let report = resolve_mesh_route_snapshot(snapshot(vec![
-            failed,
-            claim("b", ForceRouteLeg::Inline, Some(&["10.0.0.0/8"])),
-        ]));
-        assert_eq!(report.results[0].coverage, MeshRouteCoverage::Unknown);
-        assert_eq!(report.results[1].coverage, MeshRouteCoverage::Full);
-    }
-
-    #[test]
-    fn applied_requires_running_generation_and_ack() {
-        let mut input = snapshot(vec![claim(
-            "a",
-            ForceRouteLeg::Inline,
-            Some(&["10.0.0.0/8"]),
-        )]);
-        input.scope = MeshRouteScope::Applied;
-        input.config_source = MeshRouteConfigSource::Running;
-        input.run_generation = Some(12);
-        input.load_evidence = MeshRouteLoadEvidence::FileWrittenUnacknowledged;
-        assert_eq!(
-            resolve_mesh_route_snapshot(input).snapshot.scope,
-            MeshRouteScope::PersistedUnknown
-        );
-    }
-
-    #[test]
-    fn stale_or_unversioned_running_snapshot_never_confirms_owner() {
-        let mut input = snapshot(vec![claim(
-            "a",
-            ForceRouteLeg::Inline,
-            Some(&["10.0.0.0/8"]),
-        )]);
-        input.scope = MeshRouteScope::Applied;
-        input.config_source = MeshRouteConfigSource::Running;
-        input.run_generation = Some(12);
-        input.load_evidence = MeshRouteLoadEvidence::StartupReady;
-        input.snapshot_stale = true;
-        let stale = resolve_mesh_route_snapshot(input.clone());
-        assert_eq!(stale.snapshot.scope, MeshRouteScope::PersistedUnknown);
-        assert_eq!(stale.results[0].effective, None);
-        assert_eq!(stale.results[0].coverage, MeshRouteCoverage::Unknown);
-        input.snapshot_stale = false;
-        input.config_version = None;
-        assert_eq!(
-            resolve_mesh_route_snapshot(input).snapshot.scope,
-            MeshRouteScope::PersistedUnknown
-        );
-    }
-
-    #[test]
-    fn cross_platform_wire_fixture_matches_resolver() {
-        let fixture: MeshRouteReport = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../ui/src/contracts/mesh-route-report.fixture.json"
-        )))
-        .unwrap();
-        assert_eq!(
-            resolve_mesh_route_snapshot(fixture.snapshot.clone()),
-            fixture
-        );
-    }
-}
+mod tests;

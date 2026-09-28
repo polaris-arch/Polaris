@@ -21,9 +21,10 @@ use crate::user_config::server_config::{
 mod mesh_route_report;
 pub use mesh_route_report::{
     resolve_mesh_route_snapshot, MeshRouteBlockedBy, MeshRouteCandidate, MeshRouteConfigSource,
-    MeshRouteCoverage, MeshRouteFileSnapshot, MeshRouteLoadEvidence, MeshRouteRelation,
-    MeshRouteReport, MeshRouteResolution, MeshRouteScope, MeshRouteSnapshot, MeshRouteSource,
-    MeshRouteUnknownReason, SourcedCidr,
+    MeshRouteCoverage, MeshRouteEmissionCandidate, MeshRouteFileSnapshot, MeshRouteLoadEvidence,
+    MeshRouteRelation, MeshRouteReport, MeshRouteResolution, MeshRouteScope, MeshRouteSnapshot,
+    MeshRouteSource, MeshRouteUnknownReason, SourcedCidr, MAX_MESH_ROUTE_REPORT_CANDIDATES,
+    MAX_MESH_ROUTE_REPORT_CIDRS, MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES,
 };
 
 /// 全网段（catch-all）。上游 `FULL_TUNNEL_CIDRS`。
