@@ -262,6 +262,43 @@ pub fn endpoint_force_route_report(state: State<'_, AppRuntime>) -> ApiResponse<
     }
 }
 
+/// 本轮实际生成的 mesh force-route 候选与所引用文件的只读诊断。
+/// 没有同代 ready+文件加载证据时返回 persistedUnknown；文件写入不等于内核 reload ACK。
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri IPC command owns its deserialized payload across the call"
+)]
+#[tauri::command]
+pub fn mesh_route_report(
+    state: State<'_, AppRuntime>,
+) -> ApiResponse<polaris_config_engine::builder::endpoint_routes::MeshRouteReport> {
+    use polaris_config_engine::builder::endpoint_routes::resolve_mesh_route_snapshot;
+    let before = state.proxy().running_config_snapshot();
+    let status_before = state.proxy().status();
+    let generation_before = state.proxy().core_generation();
+    let mut report = state
+        .proxy()
+        .mesh_route_report(before.as_ref().map(config_version));
+    let after = state.proxy().running_config_snapshot();
+    let status_after = state.proxy().status();
+    let generation_after = state.proxy().core_generation();
+    if before != after
+        || generation_before != generation_after
+        || status_before.start_time != status_after.start_time
+        || (before.is_none()
+            && report.snapshot.config_source
+                == polaris_config_engine::builder::endpoint_routes::MeshRouteConfigSource::Running)
+    {
+        let total = report.total_candidate_count;
+        let reasons = report.unknown_reasons;
+        report.snapshot.snapshot_stale = true;
+        report = resolve_mesh_route_snapshot(report.snapshot);
+        report.total_candidate_count = total;
+        report.unknown_reasons = reasons;
+    }
+    ApiResponse::ok(report)
+}
+
 /// 配置的**内容版本**（spec §2.3.3）：渲染端投影经 `stable_stringify` 后取 FNV-1a 32 位短 hash。
 ///
 /// 不用 mtime（同秒两次写可能相等），不用自增计数（进程重启即失忆）。

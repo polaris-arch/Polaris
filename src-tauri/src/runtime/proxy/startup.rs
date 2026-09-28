@@ -931,6 +931,9 @@ impl ProxyRuntime {
             log::info!("起核入口即被接管（世代 {my_gen}）→ 让位");
             return Ok(self.status());
         }
+        if let Ok(mut route) = self.mesh_route_run.write() {
+            *route = None;
+        }
 
         // 分段耗时测量（仅测量，不影响任何判定/控制流）：入口墙钟 + 各段累加器。
         // 重试轮内的段按**所有尝试累计**，否则总计在发生重试时会漏掉前腿的真实成本。
@@ -1142,6 +1145,7 @@ impl ProxyRuntime {
             network_canary,
             binary,
             effective_user_config,
+            mesh_route_prepared,
         ) = loop {
             attempt += 1;
             // 轮首让位：退避已可中断，但被唤醒的腿仍会走到这里 —— 在**重新生成配置 / 写盘 / 重解析端口**
@@ -1256,6 +1260,18 @@ impl ProxyRuntime {
             let gate_config_json = gate.config_json;
             let singbox_config = gate.config;
             let effective_user_config = gate.effective_user_config;
+            let mesh_route_prepared = self.prepare_mesh_route_run(
+                gate.mesh_route_candidates,
+                gate.mesh_route_total_candidate_count,
+                gate.mesh_route_diagnostics_limited,
+                gate.mesh_route_dns_owner_server_id,
+                &gate.invalid_nodes,
+                &user_config,
+                &singbox_config,
+                &config_path,
+                &gate_config_json,
+                my_gen,
+            );
             let config_gen_attempt_ms = t_config_gen.elapsed().as_millis();
             config_gen_ms += config_gen_attempt_ms;
             log::info!(
@@ -1557,6 +1573,7 @@ impl ProxyRuntime {
                             // 循环外紧接着就用它遮蔽 `user_config`，让出口自证 / 热切快照 / TS 逆表
                             // 三处按 id 反算 tag 时，算的是运行核里真实存在的那套 tag。
                             effective_user_config,
+                            mesh_route_prepared,
                         );
                     }
                     // 探测最长 3s，期间可能被接管 → 与 Dead/Timeout 两腿同款复查：世代变了就静默让位
@@ -1769,6 +1786,9 @@ impl ProxyRuntime {
         self.restart_deferred.store(false, Ordering::SeqCst);
         if let Ok(mut g) = self.status.write() {
             *g = new_status.clone();
+        }
+        if let Some(ready_at_ms) = new_status.start_time {
+            self.publish_mesh_route_run(mesh_route_prepared, ready_at_ms);
         }
         // A1：systemProxy 模式把 OS 系统代理指向本地 mixed 入站（127.0.0.1:mixedPort），否则流量不经核
         // = 表现「选直连也没启动」。放在**核已就绪之后**：核未就绪就设代理会把流量导向尚未服务的端口。
@@ -3261,6 +3281,11 @@ impl ProxyRuntime {
 /// `ProxyRuntime::generate_and_gate` 的产物：**已落盘**的那份配置 + 本次全部剔除报告。
 pub(super) struct GateOutcome {
     pub(super) config: SingBoxConfig,
+    pub(super) mesh_route_candidates:
+        Vec<polaris_config_engine::builder::endpoint_routes::MeshRouteEmissionCandidate>,
+    pub(super) mesh_route_total_candidate_count: usize,
+    pub(super) mesh_route_diagnostics_limited: bool,
+    pub(super) mesh_route_dns_owner_server_id: Option<String>,
     /// 🔴 **已落盘的那一份配置的字节，逐字**（不是把 `config` 再序列化一次）。
     ///
     /// 存在的唯一理由是 Android：核是进程内 `.so`，起核 = 把这串交给 `libbox`。它与
@@ -3325,6 +3350,10 @@ impl GateOutcome {
     ) -> Self {
         Self {
             config: outcome.config,
+            mesh_route_candidates: outcome.mesh_route_candidates,
+            mesh_route_total_candidate_count: outcome.mesh_route_total_candidate_count,
+            mesh_route_diagnostics_limited: outcome.mesh_route_diagnostics_limited,
+            mesh_route_dns_owner_server_id: outcome.mesh_route_dns_owner_server_id,
             config_json,
             pruned_rule_set_tags: outcome.pruned_rule_set_tags,
             pruned_env_rules: outcome.pruned_env_rules,

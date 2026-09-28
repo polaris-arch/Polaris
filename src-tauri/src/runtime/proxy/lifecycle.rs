@@ -621,6 +621,9 @@ impl ProxyRuntime {
         if let Ok(mut snap) = self.startup_snapshot.write() {
             *snap = None;
         }
+        if let Ok(mut route) = self.mesh_route_run.write() {
+            *route = None;
+        }
         // 核停 ⇒ 没有「运行核」这个分母，待应用差集恒空（见 `pending_changes`）→ 欠账标记一并复位，
         // 否则停核期间条上会挂着一条谈不上「待应用」的提示，且下次起核前无人清。
         self.restart_deferred.store(false, Ordering::SeqCst);
@@ -961,6 +964,9 @@ impl ProxyRuntime {
     ///
     /// 事件发不出（emitter 未接线 / 无窗口）绝不打断状态落值 —— 诊断通道不该反噬它诊断的东西。
     pub(super) fn set_error(&self, msg: &str, error_code: &str) {
+        if let Ok(mut route) = self.mesh_route_run.write() {
+            *route = None;
+        }
         log::error!("{msg}");
         if let Ok(mut g) = self.status.write() {
             *g = ProxyStatus {

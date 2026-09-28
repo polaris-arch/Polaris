@@ -18,7 +18,10 @@ use crate::builder::endpoint_routes::{
     collect_targeted_mixed, force_route_emission_order_key, force_route_leg,
     mesh_force_routed_servers, mesh_forced_route_cidrs, mesh_node_carries_full_tunnel,
     settle_force_route_claims, settled_force_route_cidrs, should_force_route_subnets,
-    tailnet_rule_file_base, ForceRouteLeg, ObservedTailnetAddresses,
+    tailnet_rule_file_base, ForceRouteLeg, MeshRouteCandidate, MeshRouteEmissionCandidate,
+    MeshRouteSource, ObservedTailnetAddresses, SourcedCidr, MAX_MESH_ROUTE_REPORT_CANDIDATES,
+    MAX_MESH_ROUTE_REPORT_CIDRS, MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES, TAILNET_CGNAT,
+    TAILNET_ULA_V6,
 };
 use crate::builder::helpers::{
     apply_rule_set_prune, effective_app_rules, effective_custom_rules,
@@ -32,7 +35,7 @@ use crate::user_config::app_rules_preset::get_app_preset;
 use crate::user_config::builtin_geo_rulesets::{
     builtin_geo_rulesets, find_builtin, PRIVATE_DOMAIN_DIRECT_TAG,
 };
-use crate::user_config::cidr::{cidr_overlaps_any, partition_cidrs_by_overlap};
+use crate::user_config::cidr::{cidr_overlaps_any, normalize_cidr, partition_cidrs_by_overlap};
 use crate::user_config::collections::dedupe;
 use crate::user_config::dns_constants::{
     is_block_selection, is_direct_selection, BOOTSTRAP_DIRECT_DNS_IPS, PROXY_SELECTOR_TAG,
@@ -255,6 +258,10 @@ pub struct RouteConfigOutcome {
     /// 这是「规则被剪枝」的**唯一诚实来源**：只有剪枝点本身知道哪些 tag 悬空。运行时层据此
     /// 决定要不要给用户发可见信号（资源齐全时恒空 → 零噪音）。
     pub pruned_rule_set_tags: Vec<String>,
+    /// 块 0c 在本轮生成时的原始候选及实际发射结果；报告只读，不参与路由。
+    pub mesh_route_candidates: Vec<MeshRouteEmissionCandidate>,
+    pub mesh_route_total_candidate_count: usize,
+    pub mesh_route_diagnostics_limited: bool,
 }
 
 /// buildRouteConfig 入口。上游 `buildRouteConfig`（904 行）。
@@ -958,6 +965,9 @@ pub fn build_route_config_with_report(
     // 不给初值：块 0c 无条件执行、必定赋值，编译器的定值分析会替我们守住这一点。给个
     // `Vec::new()` 占位反而会把「块 0c 哪天被加上条件、carve 静默退化成空集」变成一条不红的路。
     let block_0c_forced_cidrs: Vec<String>;
+    let mesh_route_candidates: Vec<MeshRouteEmissionCandidate>;
+    let mesh_route_total_candidate_count: usize;
+    let mesh_route_diagnostics_limited: bool;
     // 0c. endpoint 节点（WireGuard/Tailscale）的「配置路由段」强制路由到该节点自身 tag。
     {
         let emitted_endpoint_tags: BTreeSet<String> = deps
@@ -1074,6 +1084,169 @@ pub fn build_route_config_with_report(
             &deps.observed_tailnet_addresses,
         );
         block_0c_forced_cidrs = settled_force_route_cidrs(&settled);
+        mesh_route_total_candidate_count = claimants.len();
+        // 纯诊断副本共享总预算；结算已计算 desired，绝不为报告再次重算大数组。
+        // 预算不足只让报告 unknown，下面的原路由发射照常执行。
+        const MAX_REPORT_AUDIT_BYTES: usize = 2 * 1024 * 1024;
+        let mut diagnostic_limited = claimants.len() > MAX_MESH_ROUTE_REPORT_CANDIDATES;
+        let mut remaining_cidrs = MAX_MESH_ROUTE_REPORT_CIDRS;
+        let mut remaining_bytes = MAX_REPORT_AUDIT_BYTES;
+        let mut audit = Vec::new();
+        if !diagnostic_limited {
+            for (c, entry) in claimants.iter().zip(settled.servers.iter()) {
+                let configured_ref: &[String] = match c.server.protocol {
+                    Protocol::Tailscale => c
+                        .server
+                        .tailscale_settings
+                        .as_ref()
+                        .map(|t| t.routes.as_slice())
+                        .unwrap_or_default(),
+                    Protocol::Wireguard => c
+                        .server
+                        .wireguard_settings
+                        .as_ref()
+                        .map(|w| w.allowed_ips.as_slice())
+                        .unwrap_or_default(),
+                    _ => &c.server.mesh_routes,
+                };
+                let observed_ref = deps
+                    .observed_tailnet_addresses
+                    .get(&c.server.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let desired_len = match c.leg {
+                    ForceRouteLeg::Inline => entry.emitted.len() + entry.absorbed.len(),
+                    ForceRouteLeg::ExternalRuleSet => entry.external_rule_set_cidrs.len(),
+                    ForceRouteLeg::PreferredBy => 0,
+                };
+                let item_count = desired_len
+                    .saturating_add(configured_ref.len())
+                    .saturating_add(observed_ref.len())
+                    .saturating_add(entry.emitted.len());
+                let external_path = c
+                    .tailnet_path
+                    .as_ref()
+                    .filter(|_| c.leg == ForceRouteLeg::ExternalRuleSet);
+                let strings = configured_ref
+                    .iter()
+                    .map(String::as_str)
+                    .chain(observed_ref.iter().map(String::as_str))
+                    .chain(entry.emitted.iter().map(String::as_str))
+                    .chain(entry.absorbed.iter().map(|a| a.cidr.as_str()))
+                    .chain(entry.external_rule_set_cidrs.iter().map(String::as_str));
+                let mut item_bytes = c.server.id.len().saturating_add(c.tag.len());
+                let mut oversized = false;
+                for value in strings.chain(external_path.map(String::as_str)) {
+                    if value.len() > MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES {
+                        oversized = true;
+                        break;
+                    }
+                    item_bytes = item_bytes.saturating_add(value.len());
+                }
+                // emitted 同时保留实际发射审计和请求集，计两份内存。
+                item_bytes = item_bytes.saturating_add(
+                    entry
+                        .emitted
+                        .iter()
+                        .fold(0usize, |total, value| total.saturating_add(value.len())),
+                );
+                if oversized
+                    || c.server.id.len() > MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES
+                    || c.tag.len() > MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES
+                    || item_count > remaining_cidrs
+                    || item_bytes > remaining_bytes
+                {
+                    diagnostic_limited = true;
+                    break;
+                }
+                remaining_cidrs -= item_count;
+                remaining_bytes -= item_bytes;
+                let desired: Vec<&str> = match c.leg {
+                    ForceRouteLeg::Inline => entry
+                        .emitted
+                        .iter()
+                        .map(String::as_str)
+                        .chain(entry.absorbed.iter().map(|a| a.cidr.as_str()))
+                        .collect(),
+                    ForceRouteLeg::ExternalRuleSet => entry
+                        .external_rule_set_cidrs
+                        .iter()
+                        .map(String::as_str)
+                        .collect(),
+                    ForceRouteLeg::PreferredBy => Vec::new(),
+                };
+                let configured_cidrs = configured_ref.to_vec();
+                let observed_hosts = observed_ref.to_vec();
+                let configured_normalized: BTreeSet<String> = configured_ref
+                    .iter()
+                    .filter_map(|value| normalize_cidr(value))
+                    .collect();
+                let observed_normalized: BTreeSet<String> = observed_ref
+                    .iter()
+                    .filter_map(|value| host_to_exclude_cidr(value))
+                    .collect();
+                let has_observation = crate::builder::endpoint_routes::has_observed_tailnet_cidrs(
+                    c.server,
+                    &deps.observed_tailnet_addresses,
+                );
+                let match_cidrs = if c.leg == ForceRouteLeg::PreferredBy {
+                    None
+                } else {
+                    Some(
+                        desired
+                            .into_iter()
+                            .map(|cidr| {
+                                let source = if configured_normalized.contains(cidr) {
+                                    MeshRouteSource::Declared
+                                } else if observed_normalized.contains(cidr) {
+                                    MeshRouteSource::Observed
+                                } else if !has_observation
+                                    && (cidr == TAILNET_CGNAT || cidr == TAILNET_ULA_V6)
+                                {
+                                    MeshRouteSource::Bootstrap
+                                } else {
+                                    MeshRouteSource::Declared
+                                };
+                                SourcedCidr {
+                                    cidr: cidr.to_owned(),
+                                    source,
+                                }
+                            })
+                            .collect(),
+                    )
+                };
+                let engaged_reason =
+                    if crate::builder::endpoint_routes::mesh_always_routes_subnets(c.server) {
+                        "alwaysRouteSubnets"
+                    } else if config.selected_server_id.as_deref() == Some(c.server.id.as_str()) {
+                        "selected"
+                    } else {
+                        "ruleTargeted"
+                    };
+                audit.push(MeshRouteEmissionCandidate {
+                    candidate: MeshRouteCandidate {
+                        server_id: c.server.id.clone(),
+                        tag: c.tag.clone(),
+                        leg: c.leg,
+                        generated: true,
+                        generation_reason: None,
+                        engaged_reason: engaged_reason.into(),
+                        configured_cidrs,
+                        observed_hosts,
+                        referenced_file: None,
+                        match_cidrs,
+                        unknown_reasons: Vec::new(),
+                    },
+                    external_path: external_path.cloned(),
+                    emitted_inline: entry.emitted.clone(),
+                });
+            }
+        }
+        mesh_route_diagnostics_limited = diagnostic_limited;
+        if diagnostic_limited {
+            audit.clear();
+        }
+        mesh_route_candidates = audit;
 
         // ── 第三步：按结算结果发射（顺序 = claimant 顺序，与结算逐项一一对应）──────────
         for (c, entry) in claimants.iter().zip(settled.servers.iter()) {
@@ -1590,6 +1763,9 @@ pub fn build_route_config_with_report(
     RouteConfigOutcome {
         route: route_config,
         pruned_rule_set_tags,
+        mesh_route_candidates,
+        mesh_route_total_candidate_count,
+        mesh_route_diagnostics_limited,
     }
 }
 

@@ -4,6 +4,7 @@ import type { UserConfig, StagedClassification, SaveOutcome } from '../../contra
 import type { TunExclusionPreview } from '../../contracts/tun-exclusion-preview';
 import type { TunnelConflictReport } from '../../contracts/tunnel-conflict-report';
 import type { EndpointForceRouteReport } from '../../contracts/endpoint-force-route-report';
+import type { MeshRouteReport } from '../../contracts/mesh-route-report';
 
 // ============================================================================
 // configApi
@@ -52,6 +53,11 @@ export const configApi = {
    */
   async endpointForceRouteReport(): Promise<EndpointForceRouteReport> {
     return invoke(IPC_CHANNELS.ENDPOINT_FORCE_ROUTE_REPORT);
+  },
+
+  /** 实际运行代的 mesh 层范围诊断；未获文件加载证据时以 unknown 返回。 */
+  async meshRouteReport(): Promise<MeshRouteReport> {
+    return invoke(IPC_CHANNELS.MESH_ROUTE_REPORT);
   },
 
   /**
