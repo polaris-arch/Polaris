@@ -12,10 +12,15 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
+use polaris_config_engine::user_config::mesh_identity_reconcile::{
+    canonical_control_authority, reconcile_controlled_identity, ControlledIdentityChange,
+    ReplacementIdentity, RetirementScopeSnapshot,
+};
 use polaris_config_engine::user_config::mesh_route_state::{
-    revise_semantic, MeshRoutePolicy, MeshRouteState,
+    revise_semantic, MeshOwnerRef, MeshRoutePolicy, MeshRouteState,
 };
 use polaris_store::fs::{durable_atomic_write, durable_remove, random_tmp_suffix, ConfigFs, StdFs};
 use polaris_store::mesh_guard::{self, REQUIRED_MARKER_FILE};
@@ -47,6 +52,44 @@ struct MeshRequiredMarker {
 pub(crate) enum MeshPrepareRecovery {
     AwaitingCommit,
     Enabled,
+}
+
+/// S4 must mint this only while it holds lifecycle + TS state gates and has
+/// proved that neither the main nor a temporary owner uses this server's state.
+/// Those guards must stay held through the config write, with their live
+/// generation rechecked immediately before publish; this must never survive
+/// an await. S4 must advance the atomic for every owner transition. The
+/// recheck is a lock-free load under config write_lock, never an attempt to
+/// reacquire lifecycle/state gates (lock order is lifecycle -> state -> config).
+/// There is intentionally no production constructor before S4 enforces this.
+#[allow(dead_code)]
+pub(crate) struct MeshNoOwnerReceipt<'a> {
+    owner_ref: MeshOwnerRef,
+    local_id: String,
+    state_revision: String,
+    /// S4 binds this to the still-held lifecycle/state guards' live generation.
+    live_generation: &'a AtomicU64,
+    expected_generation: u64,
+}
+
+#[allow(dead_code)]
+pub(crate) enum MeshServerIdentityEdit {
+    Replace(Value),
+    Delete,
+}
+
+fn ts_control_authority(server: &Value) -> Result<String, StoreError> {
+    let settings = server.get("tailscaleSettings");
+    if settings.is_some_and(|value| !value.is_object()) {
+        return Err(StoreError::validation("TS settings are unavailable"));
+    }
+    let url = match settings.and_then(|value| value.get("controlUrl")) {
+        None | Some(Value::Null) => "https://controlplane.tailscale.com",
+        Some(Value::String(url)) if url.is_empty() => "https://controlplane.tailscale.com",
+        Some(Value::String(url)) => url,
+        Some(_) => return Err(StoreError::validation("invalid TS control authority")),
+    };
+    canonical_control_authority(url).map_err(StoreError::validation)
 }
 
 /// 未保存草稿对运行态节点选择的最小投影。正文仍只在渲染端；这里不复制配置，只携带自动故障切换
@@ -672,6 +715,215 @@ impl ConfigManager {
             *guard = Some(canonical);
         }
         Ok(Some(next))
+    }
+
+    /// S3c's narrow trusted identity write. It reads old config and ledger
+    /// under one write lock, retains the old configured scope, then publishes
+    /// server edit + retired ledger in one durable config.json rename.
+    ///
+    /// The activePlan currently stores only a digest, not owner slices. Until
+    /// S4 supplies a verified old-plan manifest, any activePlan blocks this
+    /// transaction. A no-owner receipt must be minted under the future S4
+    /// lifecycle/state gate and remain held throughout this synchronous call.
+    #[allow(dead_code)]
+    pub(crate) fn update_mesh_identity_server_if_revision(
+        &self,
+        owner: &MeshOwnerRef,
+        expected_revision: &str,
+        edit: MeshServerIdentityEdit,
+        no_owner: Option<&MeshNoOwnerReceipt<'_>>,
+    ) -> Result<MeshRouteState, StoreError> {
+        deny_inside_projection("update_mesh_identity_server_if_revision");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut raw = self.raw_disk_for_mesh_under_write_lock()?;
+        let policy: MeshRoutePolicy = serde_json::from_value(raw[mesh_guard::POLICY_KEY].clone())
+            .map_err(StoreError::from_parse)?;
+        let previous: MeshRouteState = serde_json::from_value(raw[mesh_guard::STATE_KEY].clone())
+            .map_err(StoreError::from_parse)?;
+        if previous.revision != expected_revision {
+            return Err(StoreError::validation("mesh state revision conflict"));
+        }
+        if previous.active_plan.is_some() || previous.transaction.is_some() {
+            return Err(StoreError::validation(
+                "old active mesh owner scope is unavailable without an S4 plan manifest",
+            ));
+        }
+        let receipt = no_owner.ok_or_else(|| {
+            StoreError::validation("mesh identity edit requires lifecycle/state no-owner proof")
+        })?;
+        if receipt.owner_ref != *owner
+            || receipt.local_id != previous.local_id
+            || receipt.state_revision != previous.revision
+        {
+            return Err(StoreError::validation(
+                "mesh no-owner proof is stale or mismatched",
+            ));
+        }
+        let servers = raw
+            .get("servers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| StoreError::validation("managed servers are unavailable"))?;
+        let matching: Vec<usize> = servers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, server)| {
+                (server["id"].as_str() == Some(owner.server_id.as_str())).then_some(index)
+            })
+            .collect();
+        let &[old_index] = matching.as_slice() else {
+            return Err(StoreError::validation(
+                "old managed mesh server is absent or duplicated",
+            ));
+        };
+        let old_server = &servers[old_index];
+        if old_server["protocol"] != "tailscale" {
+            return Err(StoreError::validation(
+                "old managed identity is not a TS server",
+            ));
+        }
+        let old_authority = ts_control_authority(old_server)?;
+        let ledger_authority = previous
+            .identities
+            .iter()
+            .find(|identity| {
+                identity.server_id == owner.server_id
+                    && identity.identity_epoch == owner.identity_epoch
+            })
+            .map(|identity| canonical_control_authority(&identity.control_authority))
+            .transpose()
+            .map_err(StoreError::validation)?;
+        if ledger_authority.as_deref() != Some(old_authority.as_str()) {
+            return Err(StoreError::validation(
+                "old TS config and identity authority disagree",
+            ));
+        }
+        let mut configured = Vec::new();
+        for source in [
+            old_server
+                .get("tailscaleSettings")
+                .and_then(|settings| settings.get("routes")),
+            old_server
+                .get("tailscaleSettings")
+                .and_then(|settings| settings.get("advertiseRoutes")),
+            old_server.get("meshRoutes"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let entries = source.as_array().ok_or_else(|| {
+                StoreError::validation("old configured mesh routes are not a complete CIDR array")
+            })?;
+            for entry in entries {
+                configured.push(
+                    entry
+                        .as_str()
+                        .ok_or_else(|| {
+                            StoreError::validation("old configured mesh route is not a CIDR string")
+                        })?
+                        .to_string(),
+                );
+            }
+        }
+        let mut replaced_server = false;
+        match edit {
+            MeshServerIdentityEdit::Replace(mut server) => {
+                if server["id"].as_str() != Some(owner.server_id.as_str()) {
+                    return Err(StoreError::validation("replacement mesh serverId changed"));
+                }
+                let new_authority = (server["protocol"] == "tailscale")
+                    .then(|| ts_control_authority(&server))
+                    .transpose()?;
+                // Partial edit/restore payloads must not silently discard the
+                // local auth key when only the same authority and state source
+                // are edited. Never send an old authority's key to a new one.
+                if new_authority.as_deref() == Some(old_authority.as_str())
+                    && server["tailscaleSettings"].get("sourceTag")
+                        == old_server["tailscaleSettings"].get("sourceTag")
+                    && server["tailscaleSettings"].get("authKey").is_none()
+                {
+                    if let Some(old_key) = old_server["tailscaleSettings"].get("authKey") {
+                        server["tailscaleSettings"]["authKey"] = old_key.clone();
+                    }
+                }
+                let identity_changed = new_authority.as_deref() != Some(old_authority.as_str())
+                    || ["sourceTag", "authKey", "ephemeral"].iter().any(|key| {
+                        old_server["tailscaleSettings"].get(key)
+                            != server["tailscaleSettings"].get(key)
+                    });
+                if !identity_changed {
+                    return Err(StoreError::validation(
+                        "mesh identity is unchanged; use ordinary config write",
+                    ));
+                }
+                raw["servers"][old_index] = server;
+                replaced_server = true;
+            }
+            MeshServerIdentityEdit::Delete => {
+                raw["servers"].as_array_mut().unwrap().remove(old_index);
+                if raw["selectedServerId"].as_str() == Some(owner.server_id.as_str()) {
+                    raw["selectedServerId"] = Value::Null;
+                }
+            }
+        }
+        let mut canonical = ConfigStore::canonicalize_for_save(&raw)?;
+        let new_epoch = format!("{}{}", random_tmp_suffix(), random_tmp_suffix());
+        let canonical_servers = canonical["servers"]
+            .as_array()
+            .ok_or_else(|| StoreError::validation("canonical managed servers are unavailable"))?;
+        let canonical_matches: Vec<&Value> = canonical_servers
+            .iter()
+            .filter(|server| server["id"].as_str() == Some(owner.server_id.as_str()))
+            .collect();
+        let replacement = if replaced_server {
+            let &[server] = canonical_matches.as_slice() else {
+                return Err(StoreError::validation(
+                    "replacement mesh server was not preserved",
+                ));
+            };
+            (server["protocol"] == "tailscale").then_some(server)
+        } else {
+            None
+        };
+        let authority = replacement.map(ts_control_authority).transpose()?;
+        let new_identity = authority
+            .as_deref()
+            .map(|control_authority| ReplacementIdentity {
+                epoch: &new_epoch,
+                control_authority,
+                self_stable_id: None,
+            });
+        let next = reconcile_controlled_identity(
+            &previous,
+            &policy,
+            owner,
+            new_identity,
+            ControlledIdentityChange::ConfigReplacement,
+            None,
+            RetirementScopeSnapshot {
+                owner_ref: owner.clone(),
+                state_revision: &previous.revision,
+                active_plan_id: None,
+                configured_cidrs: Some(&configured),
+                // Only the strict no-activePlan branch above may assert empty.
+                // A digest-bearing activePlan cannot prove an empty owner slice.
+                active_plan_owner_cidrs: Some(&[]),
+            },
+        )
+        .map_err(StoreError::validation)?;
+        canonical[mesh_guard::STATE_KEY] = serde_json::to_value(&next).map_err(StoreError::from)?;
+        if receipt.live_generation.load(Ordering::Acquire) != receipt.expected_generation {
+            return Err(StoreError::validation(
+                "mesh no-owner proof expired before config publish",
+            ));
+        }
+        self.persist_canonical_under_write_lock(&canonical)?;
+        if let Ok(mut cache) = self.cache.write() {
+            *cache = Some(canonical);
+        }
+        Ok(next)
     }
 
     /// Reads the disk truth while write_lock is held. Legacy malformed files keep

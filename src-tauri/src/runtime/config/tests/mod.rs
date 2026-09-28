@@ -89,6 +89,326 @@ fn mesh_wire_fixture() -> Value {
 }
 
 #[test]
+fn trusted_mesh_identity_write_requires_no_owner_receipt_and_commits_old_scope_with_edit() {
+    let dir = temp_dir("mesh-identity-transaction");
+    let wire = mesh_wire_fixture();
+    let mut raw = polaris_store::store::default_config();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("4");
+    raw["servers"] = serde_json::json!([{
+        "id":"ts-a", "name":"Old name", "protocol":"tailscale",
+        "tailscaleSettings": {
+            "controlUrl":"https://control.example.test/path",
+            "routes":["203.0.113.0/24"],
+            "advertiseRoutes":["198.51.100.0/24"],
+            "authKey":"old-local-secret"
+        }
+    }]);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    let old = mgr.load_full().unwrap();
+    let mut renamed = old.clone();
+    renamed["servers"][0]["name"] = serde_json::json!("Display only");
+    mgr.save_full(&renamed).unwrap();
+    let after_rename = mgr.load_full().unwrap();
+    assert_eq!(
+        after_rename[mesh_guard::STATE_KEY],
+        old[mesh_guard::STATE_KEY]
+    );
+    let old_bytes = std::fs::read(dir.join("config.json")).unwrap();
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    let replacement = serde_json::json!({
+        "id":"ts-a", "name":"New name", "protocol":"tailscale",
+        "tailscaleSettings": {"controlUrl":"https://new.example.test/path"}
+    });
+    assert!(mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(replacement.clone()),
+            None,
+        )
+        .is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+    let live = AtomicU64::new(1);
+    let receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let name_only = serde_json::json!({
+        "id":"ts-a", "name":"Another display name", "protocol":"tailscale",
+        "tailscaleSettings": {
+            "controlUrl":"https://control.example.test/path",
+            "routes":["203.0.113.0/24"],
+            "advertiseRoutes":["198.51.100.0/24"]
+        }
+    });
+    let name_error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(name_only),
+            Some(&receipt),
+        )
+        .unwrap_err();
+    assert!(name_error.to_string().contains("identity is unchanged"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+    let expired = AtomicU64::new(2);
+    let expired_receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &expired,
+        expected_generation: 1,
+    };
+    let expired_error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(replacement.clone()),
+            Some(&expired_receipt),
+        )
+        .unwrap_err();
+    assert!(expired_error
+        .to_string()
+        .contains("expired before config publish"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+    assert!(mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "3",
+            MeshServerIdentityEdit::Replace(replacement.clone()),
+            Some(&receipt),
+        )
+        .is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+
+    let next = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(replacement),
+            Some(&receipt),
+        )
+        .unwrap();
+    assert_eq!(next.revision, "5");
+    assert!(next.identity_effects.is_empty());
+    assert!(next.reservations.iter().any(|reservation| {
+        reservation.cidr == "203.0.113.0/24"
+            && matches!(&reservation.owner_ref,
+                polaris_config_engine::user_config::mesh_route_state::MeshReservationOwner::Owner {
+                    server_id, identity_epoch
+                } if server_id == "ts-a" && identity_epoch == "epoch-a")
+    }));
+    assert!(next.reservations.iter().any(|reservation| {
+        reservation.cidr == "198.51.100.0/24"
+            && matches!(&reservation.owner_ref,
+                polaris_config_engine::user_config::mesh_route_state::MeshReservationOwner::Owner {
+                    server_id, identity_epoch
+                } if server_id == "ts-a" && identity_epoch == "epoch-a")
+    }));
+    let saved = mgr.load_full().unwrap();
+    assert_eq!(saved["servers"][0]["name"], "New name");
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert!(!saved.to_string().contains("old-local-secret"));
+    assert_eq!(saved[mesh_guard::STATE_KEY]["revision"], "5");
+    assert_eq!(
+        saved[mesh_guard::STATE_KEY]["identities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(old[mesh_guard::STATE_KEY]["revision"], "4");
+    assert!(mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Delete,
+            Some(&receipt),
+        )
+        .is_err());
+    let new_epoch = next
+        .identities
+        .iter()
+        .find(|identity| identity.server_id == "ts-a" && identity.identity_epoch != "epoch-a")
+        .unwrap()
+        .identity_epoch
+        .clone();
+    let new_owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: new_epoch,
+    };
+    let delete_receipt = MeshNoOwnerReceipt {
+        owner_ref: new_owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "5".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let deleted = mgr
+        .update_mesh_identity_server_if_revision(
+            &new_owner,
+            "5",
+            MeshServerIdentityEdit::Delete,
+            Some(&delete_receipt),
+        )
+        .unwrap();
+    assert_eq!(deleted.revision, "6");
+    assert!(deleted.identity_effects.is_empty());
+    assert!(deleted
+        .reservations
+        .iter()
+        .any(|reservation| reservation.cidr == "203.0.113.0/24"));
+    assert!(mgr.load_full().unwrap()["servers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn trusted_mesh_identity_write_rejects_active_plan_without_owner_slices() {
+    let dir = temp_dir("mesh-active-plan-no-slices");
+    let wire = mesh_wire_fixture();
+    let mut raw = polaris_store::store::default_config();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("4");
+    raw[mesh_guard::STATE_KEY]["activePlan"] = serde_json::json!({
+        "planId":"old-plan", "digest":"old-digest", "configVersion":"old-config",
+        "inputStateRevision":"3"
+    });
+    raw["servers"] = serde_json::json!([{
+        "id":"ts-a", "name":"Old name", "protocol":"tailscale",
+        "tailscaleSettings": {"routes":["203.0.113.0/24"]}
+    }]);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(dir.join("config.json")).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    let live = AtomicU64::new(1);
+    let receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Delete,
+            Some(&receipt),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("S4 plan manifest"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), before);
+}
+
+#[test]
+fn trusted_mesh_identity_write_rejects_invalid_old_configured_scope_without_publishing() {
+    let dir = temp_dir("mesh-invalid-old-scope");
+    let wire = mesh_wire_fixture();
+    let mut raw = polaris_store::store::default_config();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("4");
+    raw["servers"] = serde_json::json!([{
+        "id":"ts-a", "name":"Old name", "protocol":"tailscale",
+        "tailscaleSettings": {
+            "controlUrl":"https://control.example.test/path",
+            "routes":["not-a-cidr"]
+        }
+    }]);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: raw[mesh_guard::STATE_KEY]["localId"]
+                .as_str()
+                .unwrap()
+                .into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(dir.join("config.json")).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    let live = AtomicU64::new(1);
+    let receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Delete,
+            Some(&receipt),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("invalid old mesh scope CIDR"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), before);
+}
+
+#[test]
 fn preparing_marker_blocks_ordinary_writes_and_only_proven_legacy_can_cancel() {
     let dir = temp_dir("mesh-prepare-cancel");
     let mgr = ConfigManager::new(dir.clone());
