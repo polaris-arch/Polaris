@@ -25,6 +25,8 @@ import { fileURLToPath } from 'node:url';
 import { join, relative, resolve as resolvePath } from 'node:path';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import { nodeExplanationSections, NodesScreenView } from './NodesScreenView';
+import meshRouteFixture from '@/contracts/mesh-route-report.fixture.json';
+import { asMeshRouteReport } from '../MobileMeshRouteEvidence';
 import { protocolLabel, transferSummary } from '@/components/screens/nodes/nodes-logic';
 import {
   ADD_ACTIONS,
@@ -197,6 +199,8 @@ const row = (id: string, over: Partial<NodeRowVM> = {}): NodeRowVM => ({
   protocolLabel: 'VLESS',
   ...over,
 });
+const meshReport = asMeshRouteReport(meshRouteFixture);
+if (meshReport === null) throw new Error('mesh report fixture is invalid');
 
 const baseProps = (over: Partial<NodesScreenViewProps> = {}): NodesScreenViewProps => ({
   t,
@@ -1386,6 +1390,8 @@ const TIP_DISPOSITION: Record<string, string> = {
     '正在更新的状态与阶段直接写在订阅摘要的状态徽标；重复解释后台进程的 tooltip 没有额外决策信息。',
   'nodes.subAutoUpdateActiveHint':
     '订阅摘要用短的自动更新状态与上次更新时间说明当前状态；具体间隔在可达的订阅编辑设置里。',
+  'nodes.shadowedHint':
+    '旧句只覆盖字面 CIDR 去重，移动端改用来源与有效网段报告，在同一颗 i 解释作用层、前置例外和未知范围。',
 };
 
 /*
@@ -1449,11 +1455,11 @@ describe('⑦ IA §4.12：桌面 data-tip 的每一条解释都有移动端落�
           speedTestBlockedHint: 'why.blocked',
           lanOnly: true,
           stagedOnly: true,
-          shadowed: [{ cidr: '10.0.0.0/24', by: 'peer-1' }],
+          meshRouteReport: meshReport,
         }),
       ],
     });
-    for (const expected of ['why.invalid', 'mobileHelp.stagedSpeedTest', 'nodes.lanOnly', 'mobileHelp.stagedNode', 'mobileHelp.shadowedNode']) expect(html).toContain(expected);
+    for (const expected of ['why.invalid', 'mobileHelp.stagedSpeedTest', 'nodes.lanOnly', 'mobileHelp.stagedNode', 'mobileMeshRouteEvidence.summary.preview']) expect(html).toContain(expected);
     for (const explanation of ['why.blocked', 'nodes.lanOnlyHint', 'home.stagedOnlyHint', 'nodes.shadowedHint']) expect(html).not.toContain(explanation);
     expect((html.match(/class="mn-note"/g) ?? []).length).toBe(1);
     expect((html.match(/class="m-info-trigger"/g) ?? []).length).toBe(1);
@@ -1464,11 +1470,11 @@ describe('⑦ IA §4.12：桌面 data-tip 的每一条解释都有移动端落�
 
   it('同一卡片的 i 保留全部适用解释，待保存文案区分保存与应用，错误仍只在卡面', () => {
     const node = row('info', { invalidReason: 'invalid visible', speedTestable: false,
-      speedTestBlockedHint: 'why.blocked', lanOnly: true, shadowed: [{ cidr: '10.0.0.0/24', by: 'peer-1' }] });
+      speedTestBlockedHint: 'why.blocked', lanOnly: true, meshRouteReport: meshReport });
     const sections = nodeExplanationSections(node, baseProps().t);
     const html = renderToStaticMarkup(<>{sections.map((section, index) => <section key={index}><h3>{section.title}</h3><p>{section.text}</p></section>)}</>);
-    expect(sections).toHaveLength(3);
-    for (const text of ['why.blocked', 'nodes.lanOnlyHint', 'nodes.shadowedHint']) expect(html).toContain(text);
+    expect(sections).toHaveLength(2);
+    for (const text of ['why.blocked', 'nodes.lanOnlyHint']) expect(html).toContain(text);
     expect(html).not.toContain('invalid visible');
     const staged = nodeExplanationSections(row('staged-info', { stagedOnly: true, speedTestable: false, speedTestBlockedHint: 'old save-only wording' }), baseProps().t);
     expect(staged).toEqual([{ title: 'home.stagedOnlyBadge', text: 'mobileHelp.stagedNodeDetails' }]);
@@ -1683,7 +1689,7 @@ describe('⑩ 写操作失败必有可见回显（IA 裁定 #14）', () => {
 
   const writeSites = WRITE_CALLS.flatMap((re) =>
     [...wiringSrc.matchAll(re)].map((m) => ({ text: m[0], index: m.index })),
-  );
+  ).filter((site) => site.text !== 'api.config.meshRouteReport('); // read-only diagnostic query
 
   it('自检：本屏真的有一批写调用，且 `runWrite` 真的被调过（扫 0 处会让下面两条恒绿）', () => {
     expect(writeSites.length, `只扫到 ${writeSites.length} 处写调用 —— 判据面塌了`).toBeGreaterThan(4);
@@ -3044,10 +3050,10 @@ describe('mobile consequence badges with the real two-action row width', () => {
         return typeof value === 'string' ? value : key;
       };
       const html = render({ t: translated, rows: [row('help-status', {
-        stagedOnly: true, speedTestable: false, shadowed: [{ cidr: '10.0.0.0/24', by: 'peer-1' }],
+        stagedOnly: true, speedTestable: false, meshRouteReport: meshReport,
       })] });
       expect(html).toContain(translated('mobileHelp.stagedNode'));
-      expect(html).toContain(translated('mobileHelp.shadowedNode'));
+      expect(html).toContain(translated('mobileMeshRouteEvidence.summary.preview'));
       const m = await measure({ ctx: 'mobile', html: inMobileShell(html, 'nodes'), viewport: { width: 390, height: 844 } }, [
         { select: '.mn-row-main', props: ['width'] },
         { select: '.mn-row-actions', props: ['width'] },

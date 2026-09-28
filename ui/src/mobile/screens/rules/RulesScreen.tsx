@@ -32,7 +32,7 @@
  * 便于对差。
  */
 
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { useDismissableLayer } from '../../back-stack';
 import { setPushedPage, usePushedPage } from '../../MobileShell';
 import { useTranslation } from 'react-i18next';
@@ -59,8 +59,10 @@ import {
 } from '@/domain/network-profile';
 import { netenvDnsDisplayName } from '@/components/dialogs/dns-action-options';
 import { probeDisplayText, useResolvedProbes } from '@/components/screens/rules/network-profile-probes';
-import { forceRoutedCidrsFromReport } from '@/domain/mesh-rule-overlap';
-import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
+import type { MeshRouteReport } from '@/contracts/mesh-route-report';
+import { asMeshRouteReport, meshRouteIsApplied, meshRouteSummaryKey, MobileMeshRouteEvidence } from '../../MobileMeshRouteEvidence';
+import { MobileInfo } from '../../MobileInfo';
+import { isMeshNode } from '@/domain/endpoint-routes';
 import { mergeAppPresets, type AppPreset } from '@/domain/app-rules-preset';
 import { categoryLabel } from '@/domain/rule-resource-catalog';
 import { resourceUpdateFeedback, resourceUpdateOutcome } from '@/domain/resource-update-outcome';
@@ -351,46 +353,40 @@ export function MobileRulesScreen(): ReactElement {
     [dnsOrdered, availableResTags],
   );
 
-  /**
-   * 组网 force-route 覆盖：段集**只由引擎给**（只读命令 `endpoint_force_route_report`），
-   * 渲染端一行都不重算。
-   *
-   * 为什么不能再在这里算：Tailscale 的 tailnet 前缀是**运行期由控制面下发的**，自建 headscale
-   * 可以把 `prefixes.v4` 配成任何段（实测见过 `32.0.0.28`）。渲染端手上没有那个值，只能拿
-   * `100.64.0.0/10` 这个硬编码常量去猜 —— 猜错时角标指着一条根本不重叠的规则说重叠。
-   * 桌面侧 `components/screens/rules/RulesScreen.tsx:190-216` 同一条腿、同一个判据。
-   *
-   * 拉不到报告就停在 `null`（= 空段集 = 不标），**不退回本地重算** —— 退回去就是把刚拆掉的
-   * 那个错判据又接上，而且只在"后端不可用"这个最不容易复现的路径上接上。
-   */
-  const [forceRouteReport, setForceRouteReport] = useState<EndpointForceRouteReport | null>(null);
+  /* Use backend candidates, never the old report's ExactInline absorbed/covered claim. */
+  const [meshRoute, setMeshRoute] = useState<{ report: MeshRouteReport | null; previous: boolean; legacy: boolean }>({
+    report: null, previous: false, legacy: false,
+  });
+  const meshRouteEpoch = useRef(0);
   useEffect(() => {
-    let cancelled = false;
-    api.config
-      .endpointForceRouteReport()
-      .then((next) => {
-        if (!cancelled) setForceRouteReport(next);
-      })
-      .catch(() => {
-        if (!cancelled) setForceRouteReport(null);
-      });
+    const epoch = ++meshRouteEpoch.current;
+    setMeshRoute(previous => ({ ...previous, previous: previous.report !== null }));
+    void api.config.meshRouteReport().then((raw: unknown) => {
+      if (epoch !== meshRouteEpoch.current) return;
+      const report = asMeshRouteReport(raw);
+      setMeshRoute({ report, previous: false, legacy: report === null });
+    }, () => {
+      if (epoch !== meshRouteEpoch.current) return;
+      setMeshRoute(previous => ({ ...previous, previous: true }));
+    });
     return () => {
-      cancelled = true;
+      meshRouteEpoch.current += 1;
     };
-  }, [
-    config?.servers,
-    config?.selectedServerId,
-    config?.trafficRules,
-    config?.policyRules,
-    config?.customRules,
-    config?.appRules,
-    proxyRunning,
-  ]);
+  }, [config, routeRules, proxyRunning]);
 
-  const meshOverlapIds = useMemo(() => {
-    if (!isSmartMode) return new Set<string>();
-    return meshOverlapRuleIds(routeRules, forceRoutedCidrsFromReport(forceRouteReport));
-  }, [isSmartMode, routeRules, forceRouteReport]);
+  const meshRuleHints = useMemo(() => {
+    const report = meshRoute.report;
+    const meshExists = (config?.servers ?? []).some(isMeshNode);
+    if (!isSmartMode || !meshExists) return { ids: new Set<string>(), unknown: false };
+    const known = report?.results.flatMap((result) => result.requested.map((range) => range.cidr)) ?? [];
+    const ids = meshOverlapRuleIds(routeRules, known);
+    const unknown = report === null || meshRoute.previous || !meshRouteIsApplied(report) ||
+      report.unknownReasons.length > 0 || report.totalCandidateCount > report.snapshot.candidates.length ||
+      report.results.length !== report.snapshot.candidates.length ||
+      report.results.some((result) => result.effective === null) ||
+      report.snapshot.candidates.some((candidate) => candidate.matchCidrs === null);
+    return { ids, unknown };
+  }, [isSmartMode, routeRules, meshRoute, config?.servers]);
 
   const stagedOnlyRoute = useMemo(
     () => stagedOnlyIds(routeRules, diskRouteRules),
@@ -1529,7 +1525,9 @@ export function MobileRulesScreen(): ReactElement {
           targetMissing: !!targetServerId && !serverNameById.has(targetServerId),
           stagedOnly: (plane === 'dns' ? stagedOnlyDns : stagedOnlyRoute).has(rule.id),
           hasMissingResource: (plane === 'dns' ? missingResDns : missingResRoute).has(rule.id),
-          hasMeshOverlap: plane === 'route' && meshOverlapIds.has(rule.id),
+          hasMeshOverlap: plane === 'route' && meshRuleHints.ids.has(rule.id),
+          meshOverlapUnknown: plane === 'route' && meshRuleHints.unknown,
+          meshOverlapPrevious: plane === 'route' && meshRoute.previous,
           routeInactive: plane === 'route' && modeInactive && route !== null,
           networkProfileBadge: ruleProfileBadge(rule, badgeProfiles, resolvedProbes),
           deleteConfirming: armed === `${RULE_DEL_PREFIX}${rule.id}`,
@@ -1553,7 +1551,7 @@ export function MobileRulesScreen(): ReactElement {
       stagedOnlyDns,
       missingResRoute,
       missingResDns,
-      meshOverlapIds,
+      meshRuleHints,
       modeInactive,
       badgeProfiles,
       resolvedProbes,
@@ -1771,6 +1769,12 @@ export function MobileRulesScreen(): ReactElement {
           isSmartMode={isSmartMode}
           onBackToSmart={() => void handleBackToSmart()}
           rows={trafficRows}
+          meshInfo={(config?.servers ?? []).some(isMeshNode) ? <MobileInfo
+            title={tr('mobileMeshRouteEvidence.title')}
+            summary={tr(meshRouteSummaryKey(meshRoute.report, undefined, meshRoute.previous, meshRoute.legacy))}
+            details={<MobileMeshRouteEvidence report={meshRoute.report} previous={meshRoute.previous}
+              legacy={meshRoute.legacy} nameOf={(id) => serverNameById.get(id) ?? id} />}
+          /> : null}
           errorOf={errorOf}
         />
       )}

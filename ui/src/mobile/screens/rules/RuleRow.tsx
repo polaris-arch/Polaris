@@ -80,6 +80,8 @@ export interface RuleRowProps extends RuleRowStrings {
   hasMissingResource?: boolean;
   /** 角标②：ipCidr 与组网 force-route 段重叠（中性，不是错误）。 */
   hasMeshOverlap?: boolean;
+  meshOverlapUnknown?: boolean;
+  meshOverlapPrevious?: boolean;
   /** 角标③：指定出口节点已删除 ⇒ 运行时回退跟随全局。 */
   targetMissing?: boolean;
   /** 角标④：只在暂存里、磁盘上还没有。 */
@@ -180,6 +182,8 @@ export function RuleRow(props: RuleRowProps): ReactElement {
     dnsActionName,
     hasMissingResource,
     hasMeshOverlap,
+    meshOverlapUnknown,
+    meshOverlapPrevious,
     targetMissing,
     stagedOnly,
     routeInactive,
@@ -338,7 +342,11 @@ export function RuleRow(props: RuleRowProps): ReactElement {
   const notes: Array<{ id: string; text: string; warn?: boolean }> = [];
   if (routeInactive) notes.push({ id: 'route-inactive', text: t('rules.routeInactiveHint') });
   if (stagedOnly) notes.push({ id: 'staged', text: t('home.stagedOnlyHint') });
-  if (hasMeshOverlap) notes.push({ id: 'mesh', text: t('rules.meshOverlapTip') });
+  if (hasMeshOverlap) notes.push({ id: 'mesh', text: t(meshOverlapPrevious
+    ? 'mobileMeshRouteEvidence.possibleRuleOverlapPrevious'
+    : meshOverlapUnknown
+      ? 'mobileMeshRouteEvidence.possibleRuleOverlapUnknown'
+      : 'mobileMeshRouteEvidence.possibleRuleOverlapKnown') });
   if (hasMissingResource)
     notes.push({ id: 'res-missing', text: t('rules.resourceMissingTip'), warn: true });
   if (targetMissing && route?.action === 'proxy')
@@ -503,7 +511,7 @@ export function RuleRow(props: RuleRowProps): ReactElement {
             </span>
           )}
           {stagedOnly && <span className="mr-pill">{t('home.stagedOnlyBadge')}</span>}
-          {hasMeshOverlap && <span className="mr-pill">{t('rules.meshOverlap')}</span>}
+          {hasMeshOverlap && <span className="mr-pill">{t('mobileMeshRouteEvidence.possibleRuleOverlap')}</span>}
           {hasMissingResource && <span className="mr-pill warn">{t('rules.resourceMissing')}</span>}
           {/* 角标③与 `→ 节点名` 互斥：节点还在就显示名字，删了就显示角标，绝不显示空箭头。 */}
           {route?.action === 'proxy' &&

@@ -48,7 +48,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TunModeConfig, UdpNatType } from '@/contracts/types';
-import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
+import type { MeshRouteReport } from '@/contracts/mesh-route-report';
+import { asMeshRouteReport } from '../MobileMeshRouteEvidence';
 import { MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
 import { injectedList, injectedRecord } from '@/domain/effective-config';
 import { bypassLanState } from '@/components/screens/settings/settings-logic';
@@ -61,7 +62,7 @@ import {
   SettingsGroup,
   SettingsRow,
 } from './SettingsChrome';
-import { MobileEndpointForceRouteBlock } from './TunReports';
+import { MobileMeshRouteBlock } from './TunReports';
 import type { MobileSettingsPageProps } from './settings-pages';
 
 /** `'default'` 是只存在于控件里的哨兵，落库时删键（Select 的 value 表达不了 undefined）。 */
@@ -149,32 +150,33 @@ export function TunPage({ config, update, commit }: MobileSettingsPageProps): Re
    */
   /* A failed manual refresh leaves the last valid report visible and marks it stale. */
   const [forceRoute, setForceRoute] = useState<{
-    report: EndpointForceRouteReport | null; loading: boolean; error: boolean;
-  }>({ report: null, loading: true, error: false });
+    report: MeshRouteReport | null; loading: boolean; error: boolean; previous: boolean; legacy: boolean;
+  }>({ report: null, loading: true, error: false, previous: false, legacy: false });
   const forceRouteVersion = useRef(0);
   const forceRouteBusy = useRef(false);
   const refreshForceRoute = useCallback(() => {
     if (forceRouteBusy.current) return;
     forceRouteBusy.current = true;
     const version = ++forceRouteVersion.current;
-    setForceRoute(previous => ({ ...previous, loading: true, error: false }));
-    void Promise.resolve().then(() => api.config.endpointForceRouteReport()).then(
-      report => {
+    setForceRoute(previous => ({ ...previous, loading: true, error: false, previous: previous.report !== null }));
+    void Promise.resolve().then(() => api.config.meshRouteReport()).then(
+      (raw: unknown) => {
         if (version !== forceRouteVersion.current) return;
         forceRouteBusy.current = false;
-        setForceRoute({ report, loading: false, error: false });
+        const report = asMeshRouteReport(raw);
+        setForceRoute({ report, loading: false, error: false, previous: false, legacy: report === null });
       },
       () => {
         if (version !== forceRouteVersion.current) return;
         forceRouteBusy.current = false;
-        setForceRoute(previous => ({ ...previous, loading: false, error: true }));
+        setForceRoute(previous => ({ ...previous, loading: false, error: true, previous: previous.report !== null }));
       },
     );
   }, []);
   useEffect(() => {
     refreshForceRoute();
     return () => { forceRouteVersion.current += 1; forceRouteBusy.current = false; };
-  }, [refreshForceRoute]);
+  }, [config, refreshForceRoute]);
 
   const fakeIpEnabled =
     (config.configSchemaVersion ?? 0) >= 2 && config.dnsDefaults
@@ -331,8 +333,9 @@ export function TunPage({ config, update, commit }: MobileSettingsPageProps): Re
         />
       </SettingsGroup>
       {/* Android/iOS 无法完整探测其他应用的 VPN 路由；这里只保留自己的组网结算。 */}
-      <MobileEndpointForceRouteBlock report={forceRoute.report} loading={forceRoute.loading}
-        error={forceRoute.error} onRefresh={refreshForceRoute} servers={config.servers ?? []} />
+      <MobileMeshRouteBlock report={forceRoute.report} loading={forceRoute.loading}
+        error={forceRoute.error} previous={forceRoute.previous} legacy={forceRoute.legacy}
+        onRefresh={refreshForceRoute} servers={config.servers ?? []} />
     </>
   );
 }

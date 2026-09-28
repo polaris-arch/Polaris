@@ -86,12 +86,12 @@ import { useVpnStatusStore } from '@/store/use-vpn-status-store';
 import {
   invalidNodeIndex,
   protocolLabel,
-  shadowedCidrNamed,
   speedTestBlockReason,
   speedTestIdsForSelection,
   transferSummary,
 } from '@/components/screens/nodes/nodes-logic';
-import type { EndpointForceRouteReport } from '@/contracts/endpoint-force-route-report';
+import type { MeshRouteReport } from '@/contracts/mesh-route-report';
+import { asMeshRouteReport } from '../MobileMeshRouteEvidence';
 import { projectVisibleServers } from '@/components/screens/nodes/nodes-list-projection';
 import {
   notInPoolMessage,
@@ -186,32 +186,29 @@ export function MobileNodesScreen(): ReactElement {
   const stagedOnly = useMemo(() => stagedOnlyIds(servers, diskServers), [servers, diskServers]);
   const speedTestCaps = useMemo<SpeedTestCaps>(() => ({ mainCorePool: proxyRunning }), [proxyRunning]);
   const invalidIndex = useMemo(() => invalidNodeIndex(invalidNodes), [invalidNodes]);
-  /* 被覆盖网段的段集**只由引擎给**（只读命令 `endpoint_force_route_report`），渲染端不重算。
-     渲染端手上没有 tailnet 前缀 —— 那是控制面运行期下发的，自建 headscale 可以配成任何段 ——
-     旧写法只能拿硬编码的 `100.64.0.0/10` 去猜。拉不到一律留在 `null`（= 不画角标），
-     **不折成任何一种结论**、也不退回本地重算。桌面同一条腿见 `NodesScreen.tsx:371-395`。 */
-  const [forceRouteReport, setForceRouteReport] = useState<EndpointForceRouteReport | null>(null);
+  /* 新报告带运行代和加载证据；旧 absorbed 仅精确字串去重，不能充当本层归属。 */
+  const [meshRoute, setMeshRoute] = useState<{
+    report: MeshRouteReport | null; previous: boolean; legacy: boolean;
+  }>({ report: null, previous: false, legacy: false });
+  const meshRouteEpoch = useRef(0);
   useEffect(() => {
-    let cancelled = false;
-    api.config
-      .endpointForceRouteReport()
-      .then((next) => {
-        if (!cancelled) setForceRouteReport(next);
-      })
-      .catch(() => {
-        if (!cancelled) setForceRouteReport(null);
-      });
+    const epoch = ++meshRouteEpoch.current;
+    setMeshRoute(previous => ({ ...previous, previous: previous.report !== null }));
+    void api.config.meshRouteReport().then((raw: unknown) => {
+      if (epoch !== meshRouteEpoch.current) return;
+      const report = asMeshRouteReport(raw);
+      setMeshRoute({ report, previous: false, legacy: report === null });
+    }, () => {
+      if (epoch !== meshRouteEpoch.current) return;
+      setMeshRoute(previous => ({ ...previous, previous: previous.report !== null }));
+    });
     return () => {
-      cancelled = true;
+      meshRouteEpoch.current += 1;
     };
-  }, [servers, selectedServerId, proxyRunning]);
+  }, [config, servers, selectedServerId, proxyRunning]);
   const serverNameById = useMemo(
     () => new Map(servers.map((s) => [s.id, s.name])),
     [servers],
-  );
-  const shadowedNamed = useMemo(
-    () => shadowedCidrNamed(forceRouteReport, serverNameById),
-    [forceRouteReport, serverNameById],
   );
 
   // ── 写操作：唯一出口 `runWrite`（IA 裁定 #14）─────────────────────────────
@@ -537,7 +534,10 @@ export function MobileNodesScreen(): ReactElement {
             invalidNodeReasonText(invalidIndex[server.id], (k, f) => (f === undefined ? t(k) : t(k, f))) ??
             undefined,
           stagedOnly: stagedOnly.has(server.id),
-          shadowed: shadowedNamed.get(server.id),
+          meshRouteReport: mesh ? meshRoute.report : undefined,
+          meshRoutePrevious: meshRoute.previous,
+          meshRouteLegacy: meshRoute.legacy,
+          meshRouteNames: serverNameById,
           deletable: server.subscriptionId === undefined,
           transport: transferSummary(server),
           protocolLabel: protocolLabel(server.protocol),
@@ -552,7 +552,8 @@ export function MobileNodesScreen(): ReactElement {
       latencyMap,
       testedAt,
       invalidIndex,
-      shadowedNamed,
+      meshRoute,
+      serverNameById,
       t,
     ],
   );

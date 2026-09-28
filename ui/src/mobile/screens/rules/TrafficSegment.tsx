@@ -12,7 +12,7 @@
  * 不必先把整个 store / IPC 立起来 —— 「测方法体」与「测接线」是两件事，这里被测的是前者。
  */
 
-import type { ReactElement } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import type { RegionRoutingConfig } from '@/contracts/types';
 import {
   Card,
@@ -40,6 +40,7 @@ export interface TrafficSegmentProps {
   onBackToSmart: () => void;
   /** 已按优先级排好序的规则；序号即数组下标 + 1。 */
   rows: readonly RuleRowBinding[];
+  meshInfo?: ReactNode;
   /** 写失败的行内回显查询（为什么是行内而不是全局 toast，见 `Primitives.InlineError` 头注）。 */
   errorOf: (key: string) => string | undefined;
 }
@@ -52,6 +53,7 @@ export function TrafficSegment({
   isSmartMode,
   onBackToSmart,
   rows,
+  meshInfo,
   errorOf,
 }: TrafficSegmentProps): ReactElement {
   const { enabled, region, reverse } = regionRouting;
@@ -160,6 +162,7 @@ export function TrafficSegment({
           <span className="mr-cnt">{rows.length}</span>
         </div>
         <div className="mr-note">{t('rules.priorityTip')}</div>
+        {meshInfo && <div className="mr-note">{meshInfo}</div>}
         <InlineError text={errorOf('order:route')} />
       </div>
 

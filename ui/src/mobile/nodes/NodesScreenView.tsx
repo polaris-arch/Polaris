@@ -42,6 +42,7 @@ import { useEffect, useRef, useState, type ReactElement, type ReactNode } from '
 import { latLevel, type LatLevel } from '@/components/screens/shared/format';
 import { useDismissableLayer } from '../back-stack';
 import { MobileInfo } from '../MobileInfo';
+import { MobileMeshRouteEvidence, meshRouteSummaryKey } from '../MobileMeshRouteEvidence';
 import { TS_EXIT_SUMMARY_KEY } from '../ts-exit-help';
 import { SheetHeading } from '../SheetHeading';
 import { buildNodeMoreItems, speedTestBlockedReason } from './view-model';
@@ -225,12 +226,6 @@ export function nodeExplanationSections(row: NodeRowVM, t: NodesScreenViewProps[
   }
   if (row.lanOnly) sections.push({ title: t('nodes.lanOnly'), text: t('nodes.lanOnlyHint') });
   if (row.stagedOnly) sections.push({ title: t('home.stagedOnlyBadge'), text: t('mobileHelp.stagedNodeDetails') });
-  if (row.shadowed !== undefined && row.shadowed.length > 0) {
-    sections.push({ title: t('nodes.shadowed'), text: t('nodes.shadowedHint', {
-      cidrs: row.shadowed.map((s) => s.cidr).join(', '),
-      by: [...new Set(row.shadowed.map((s) => s.by))].join(', '),
-    }) });
-  }
   return sections;
 }
 
@@ -271,6 +266,7 @@ function NodeRow({
             { text: t('nodes.mobileLatencyStale'), level: 'none' }
           : { text: `${row.latencyMs} ms`, level: latLevel(row.latencyMs) };
   const explanations = nodeExplanationSections(row, t);
+  const hasMeshRoute = row.meshRouteReport !== undefined;
 
   return (
     <div role="listitem" className={`mn-row${row.isCurrent ? ' cur' : ''}${selected ? ' sel' : ''}`}>
@@ -301,19 +297,24 @@ function NodeRow({
           )}
           {row.lanOnly && <span className="mn-pill warn">{t('nodes.lanOnly')}</span>}
           {row.stagedOnly && <span className="mn-pill warn">{t('mobileHelp.stagedNode')}</span>}
-          {row.shadowed !== undefined && row.shadowed.length > 0 && (
-            <span className="mn-pill warn">{t('mobileHelp.shadowedNode')}</span>
-          )}
         </span>
+        {hasMeshRoute && <span className="mn-route-summary">{t(meshRouteSummaryKey(
+          row.meshRouteReport ?? null, row.server.id, row.meshRoutePrevious, row.meshRouteLegacy,
+        ))}</span>}
         {/* Invalid configuration remains directly visible and actionable, rather than hidden in help. */}
         {row.invalidReason !== undefined && <p className="mn-note">{row.invalidReason}</p>}
       </button>
       {/* Both secondary controls are outside the exit-selection button. Opening help never selects a node. */}
-      {(explanations.length > 0 || !batchMode) && <span className="mn-row-actions">
-      {explanations.length > 0 && <MobileInfo
+      {(explanations.length > 0 || hasMeshRoute || !batchMode) && <span className="mn-row-actions">
+      {(explanations.length > 0 || hasMeshRoute) && <MobileInfo
         title={t('mobileHelp.nodeDetails', { name: row.server.name })}
         triggerLabel={t('mobileHelp.viewDetails', { title: row.server.name })}
-        details={explanations.map((section, index) => <section key={index}><h3>{section.title}</h3><p>{section.text}</p></section>)}
+        details={<>
+          {hasMeshRoute && <MobileMeshRouteEvidence report={row.meshRouteReport ?? null}
+            serverId={row.server.id} previous={row.meshRoutePrevious} legacy={row.meshRouteLegacy}
+            nameOf={(id) => row.meshRouteNames?.get(id) ?? id} />}
+          {explanations.map((section, index) => <section key={index}><h3>{section.title}</h3><p>{section.text}</p></section>)}
+        </>}
       />}
       {!batchMode && (
         <button

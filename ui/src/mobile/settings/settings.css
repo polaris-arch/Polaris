@@ -62,16 +62,6 @@
 .ms-force-feedback { margin: 4px 0 0; color: hsl(var(--fg-dim)); font-size: .75rem; }
 .ms-force-feedback.error { color: hsl(var(--err)); }
 
-/* The route calculation stays compact until requested; the disclosure remains keyboard/touch reachable. */
-.ms-force-details { min-width: 0; margin-top: 8px; border-top: 1px solid hsl(var(--hair)); color: hsl(var(--fg-dim)); font-size: .75rem; line-height: 1.5; }
-.ms-force-details summary { box-sizing: border-box; min-height: var(--mobile-tap, 44px); display: list-item; padding: 10px 0; color: hsl(var(--flow)); cursor: pointer; }
-.ms-force-details summary:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
-.ms-force-details p { margin: 0 0 8px; overflow-wrap: anywhere; }
-.ms-force-list { display: grid; gap: 10px; margin: 0; padding: 0 0 0 18px; }
-.ms-force-list li { min-width: 0; overflow-wrap: anywhere; }
-.ms-force-list li > span { display: block; }
-.ms-force-list li > b { color: hsl(var(--fg)); }
-
 /* 断点：medium ≥ 37.5em（`core.json#breakpoints`），与外壳 `.m-page` 的档位同源。 */
 @container mscreen (min-width: 37.5em) {
   .ms-flow {

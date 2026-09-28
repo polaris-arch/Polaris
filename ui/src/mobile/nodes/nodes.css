@@ -557,6 +557,13 @@
   flex-wrap: wrap;
 }
 
+.mn-route-summary {
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 /*
  * 行内角标。§3.1 第 18 条：entity-row 的**角标胶囊**与每一个颜色角色原样过来，变的只有
  * 「动作从铺开改为可达」。原型同向（`mobile-home-breakpoints.html:45-46`：`.pill{border-radius:999px}`、

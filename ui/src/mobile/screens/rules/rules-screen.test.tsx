@@ -199,6 +199,17 @@ const trafficMarkup = (
     />,
   );
 
+describe('mesh report rule hints', () => {
+  it('marks only a known intersecting row and identifies a previous report as historical', () => {
+    const known = bindingOf(ruleOf('known'), { hasMeshOverlap: true, meshOverlapPrevious: true });
+    const unproved = bindingOf(ruleOf('unproved'));
+    const markup = trafficMarkup([known, unproved]);
+    expect(markup).toContain('mobileMeshRouteEvidence.possibleRuleOverlapPrevious');
+    expect((markup.match(/mobileMeshRouteEvidence.possibleRuleOverlap</g) ?? []).length).toBe(1);
+    expect(markup).not.toContain('mobileMeshRouteEvidence.possibleRuleOverlapUnknown');
+  });
+});
+
 /**
  * 四档**各占一行**：策略选择器的调色、当前值、以及「阻断也点得开」这三件事都要有对象可判。
  * `nodeName` 那一行的 `policyText` 刻意是**运行期数据**（节点名），不是 i18n key ——
@@ -966,7 +977,7 @@ describe('③ §4.12：没有一处解释只挂在 `data-tip` 上', () => {
   const RESIDENT: ReadonlyArray<readonly [string, string, () => string]> = [
     ['RuleItem.tsx:307 路由效果未生效', 'rules.routeInactiveHint', () => trafficMarkup()],
     ['RuleItem.tsx:340 待保存', 'home.stagedOnlyHint', () => trafficMarkup()],
-    ['RuleItem.tsx:346 覆盖组网', 'rules.meshOverlapTip', () => trafficMarkup()],
+    ['RuleItem.tsx:346 覆盖组网', 'mobileMeshRouteEvidence.possibleRuleOverlapKnown', () => trafficMarkup()],
     ['RuleItem.tsx:352 资源缺失', 'rules.resourceMissingTip', () => trafficMarkup()],
     ['RuleItem.tsx:361 节点已失效', 'rules.targetMissingTip', () => trafficMarkup()],
     ['RuleItem.tsx:389 置顶', 'rules.moveTop', () => trafficMarkup()],

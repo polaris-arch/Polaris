@@ -378,6 +378,7 @@ const MOBILE_NAMESPACES: ReadonlySet<string> = new Set([
   'mobileSettings',
   'mobileHelp',
   'mobileMeshInbound',
+  'mobileMeshRouteEvidence',
   'mobileSpeedTest',
 ]);
 

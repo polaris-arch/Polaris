@@ -982,37 +982,30 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'Warn',
       disposition: {
         kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'function Warn({ id, children }' },
+        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'className="ms-force-feedback error" role="alert"' },
       },
       note:
-        '告警行原语。移动端对位在 `TunReports.tsx`，包的是本屏既有的 `SettingsNote tone="warn"` ——' +
-        '桌面那份用 `.plat-warn`（该类默认 `display:none`，只在 Linux 由 CSS 放出来，' +
-        '故桌面那边必须显式覆盖 display），移动端不背这条 CSS 债。',
+        '告警行原语。移动端在报告手动刷新失败后用 role=alert 的行内错误说明；' +
+        '桌面平台告警仍只在桌面显示，移动端不把不支持的路由探测说成无冲突。',
     },
     {
       id: 'EndpointForceRouteBlock',
       disposition: {
         kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'export function MobileEndpointForceRouteBlock(' },
+        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'export function MobileMeshRouteBlock(' },
       },
       note:
-        '「Polaris 自己的组网节点之间谁把谁的网段吃掉了」结算块。2026-09-13 移植进 TUN 页，' +
-        '四条腿（拉不到 / 没有会发段的节点 / 有节点被吃干净 / 只是部分被吸收）与证据强度那句' +
-        '（败方是没有运行期观测地址的 Tailscale 节点 ⇒ 这次重合可能只是两份默认常量）一条不少。' +
-        '报告本身移动端早就在拉（节点屏角标与规则屏角标消费同一条命令的同一份 `absorbed`），' +
-        '2026-09-13 补的是「谁被吃干净了」这一层 —— 静默失效（节点活着、engaged，流量一条都不到）' +
-        '唯一的可见出口。',
+        'TUN 组网网段报告使用共享的快照作用域、来源、有效集合和先行遮盖证据；' +
+        '空集合与未知分开，草稿和加载未确认时不宣称当前生效。节点卡片和规则页复用同一详情。',
     },
     {
       id: 'Block',
       disposition: {
         kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: "summary={t('mobileHelp.forceRoute')}" },
+        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'summary={t(meshRouteSummaryKey(report, undefined, previous, legacy))}' },
       },
       note:
-        '上一块的块壳 + 说明行（桌面抽出来是为了「改了一处、另外三处还是旧话」不再发生）。' +
-        '移动端由 `SettingsGroup` 的 header 加一条常驻 `force-route-hint` 说明承担，' +
-        '四条腿共用同一份 —— 同一条「说明只写一遍」的取向。',
+        '移动端块壳由 SettingsGroup 承载，概要随证据状态而变，详细限定语与来源由同一枚 i 展开。',
     },
     {
       id: 'AboutExternalAction',

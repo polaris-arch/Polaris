@@ -21,6 +21,7 @@ import {
 } from '@/domain/subscription-auto-update';
 import type { TsExitWarning } from '@/domain/tailscale-exit-warning';
 import type { MeshTunnelHealth } from '@/domain/mesh-tunnel-health';
+import type { MeshRouteReport } from '@/contracts/mesh-route-report';
 import type { NodesListSortKey } from '@/components/screens/nodes/nodes-list-projection';
 /* 处置码**取登记表那一份**，不在这里重新声明一遍：本文件重声明会让全仓多出一张长得像
    登记表的东西（`wiring-completeness.test.ts` 的「登记表唯一性」当场红，而它红得对 ——
@@ -50,8 +51,11 @@ export interface NodeRowVM {
   readonly invalidReason?: string;
   /** 只在暂存里、盘上还没有。 */
   readonly stagedOnly: boolean;
-  /** 被更早节点抢占的网段（已把抢占者解析成显示名）。 */
-  readonly shadowed?: readonly { readonly cidr: string; readonly by: string }[];
+  /** Backend evidence for this mesh route layer; null means no verifiable report. */
+  readonly meshRouteReport?: MeshRouteReport | null;
+  readonly meshRoutePrevious?: boolean;
+  readonly meshRouteLegacy?: boolean;
+  readonly meshRouteNames?: ReadonlyMap<string, string>;
   /** 是否渲染删除入口（订阅节点为 false —— 删了下次对账会拉回来）。 */
   readonly deletable: boolean;
   /** 传输摘要（`reality · tcp` 之类）。IA §2.1 记它是标签不是测量，可安全展示。 */

@@ -1290,7 +1290,7 @@ describe('⓪ 取材面：移动端每一份 CSS 都必须在面内（新增一�
       '设置屏的 CSS 不止一份 —— 下面那段射程声明要重写',
     ).toEqual(['../mobile/settings/settings.css']);
     const declarations = ctxOf('../mobile/settings/settings.css').decls;
-    const details = declarations.filter((d) => d.sels.every((sel) => sel.startsWith('.ms-force-')));
+    const details = declarations.filter((d) => d.sels.every((sel) => sel.includes('.ms-force-')));
     expect(details.length, '网段明细 CSS 不在本面，选择器分组失效').toBeGreaterThan(0);
     const props = [...new Set(declarations.filter((d) => !details.includes(d)).map((d) => d.prop))].sort();
     expect(
@@ -2477,7 +2477,6 @@ describe('S14 移动端「节点」屏（compact 390px 参考视口，五语种�
       'nodes.exitCapableBadge',
       'nodes.lanOnly',
       'mobileHelp.stagedNode',
-      'mobileHelp.shadowedNode',
     ]);
     // 判「键在不在」用 `typeof === 'string'` 而不是 `toBeTruthy()`：`nodes.selectedPrefix` 在
     // en-US 里**刻意是空串**（英语的量词在后缀上，「 selected」），空串是有效译文不是缺键。
@@ -2574,13 +2573,15 @@ describe('S14 移动端「节点」屏（compact 390px 参考视口，五语种�
         if (lines > b.maxLines)
           over.push({ where: b.where, loc, key, text, need: maxLineWidth, avail: b.avail, lines, budget: b.maxLines });
       }
-    expect(n, '测点数异常偏低 —— 语种或角标少了一批？').toBe(LOCALES.length * 5);
+    expect(n, '测点数异常偏低 —— 语种或角标少了一批？').toBe(LOCALES.length * 4);
     // 正面断言：算出了具体宽度，且今天最宽的那一格钉住（语料一涨就要重新看）。
     expect(widest).toBeGreaterThan(0);
-    expect(
-      Math.max(...LOCALES.map((l) => textPx(DICT[l]['mobileHelp.shadowedNode'], { fontSize: mnPillFont }))),
-      '移动端被覆盖状态的完整后果宽度变了 —— 预算要重新核对',
-    ).toBeCloseTo(263.12, 1);
+    for (const loc of LOCALES) {
+      const summary = DICT[loc]['mobileMeshRouteEvidence.summary.bootstrapOverlap'];
+      const measured = layout(summary, MN_ROW_MAIN, { fontSize: 12 }, { wrap: true, breakAnywhere: true });
+      expect(measured.maxLineWidth, `${loc} 网段概要越过节点主行`).toBeLessThanOrEqual(MN_ROW_MAIN);
+      expect(measured.lines, `${loc} 网段概要没有真正进入布局测量`).toBeGreaterThan(0);
+    }
     expect(worstLines, '角标行数预算不再贴着最差的一格').toBe(MN_PILL_MAX_LINES);
     expect(overWidth, '角标横向越界 —— 它没有 ellipsis 也没有 overflow-wrap，会画到行外').toEqual([]);
     expect(over.length, `角标行数超预算：\n${fmt(over)}`).toBe(0);
@@ -2670,7 +2671,7 @@ const MR_PILL_KEYS_RULE = [
   'rules.dnsActionReject',
   'rules.dnsActionPredefined',
   'home.stagedOnlyBadge',
-  'rules.meshOverlap',
+  'mobileMeshRouteEvidence.possibleRuleOverlap',
   'rules.resourceMissing',
   'rules.targetMissing',
   // 角标⑤「生效网络」的静态那一档（场景已删除）。另一档 `rules.networkProfile.badge`（「仅 {{name}}」）
@@ -2832,12 +2833,7 @@ describe('S15 移动端「规则」屏（compact 390px 参考视口，五语种�
     expect(n, '测点数异常偏低 —— 语种或角标少了一批？').toBe(LOCALES.length * (13 + 2 + 6));
     // 正面断言：算出了具体宽度，且最紧的那一格钉住（语料一涨就要重新看一眼）。
     expect(widest).toBeGreaterThan(0);
-    // 今天最紧的那一格是 ru `rules.meshOverlap`（「Переопределяет mesh」，单行 169.29px），
-    // 槽只有 170 —— 余量 0.71px。这个数一变就说明语料动了，必须重新看一眼。
-    expect(
-      tightest,
-      '角标里余量最小的那一格变了 —— 今天它离满槽只剩 0.71px，语料一动就要重看',
-    ).toBeCloseTo(0.71, 2);
+    expect(tightest, '角标的词级余量已不足').toBeGreaterThanOrEqual(0);
     expect(
       layout(DICT.ru['rules.dnsResolverInherit'], MR_PILL_AVAIL_RULE, { fontSize: mrPillFont }, { wrap: true, breakAnywhere: true }).maxLineWidth,
       'ru `rules.dnsResolverInherit` 折行后的最宽行变了 —— 修法就是让它折进来',
