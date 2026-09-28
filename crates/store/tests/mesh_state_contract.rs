@@ -281,3 +281,59 @@ fn semantic_revision_cas_ignores_clock_order_and_equivalent_ip_but_detects_new_s
     next.observations[0].raw_hosts.push("100.80.1.4".into());
     assert!(revise_semantic(&exhausted, &u64::MAX.to_string(), next).is_err());
 }
+
+#[test]
+fn managed_ordinary_writes_block_identity_changes_without_scope_transaction() {
+    let mut previous = managed_config();
+    previous["servers"] = json!([{
+        "id": "ts-a", "name": "Old display name", "protocol": "tailscale",
+        "tailscaleSettings": {
+            "controlUrl": "https://control.example.test/path",
+            "sourceTag": "source-a", "authKey": "secret-a"
+        }
+    }]);
+    let mut renamed = previous.clone();
+    renamed["servers"][0]["name"] = json!("New display name");
+    reconcile_untrusted(&previous, &mut renamed).unwrap();
+
+    for mut changed in [
+        {
+            let mut next = previous.clone();
+            next["servers"] = json!([]);
+            next
+        },
+        {
+            let mut next = previous.clone();
+            next["servers"][0]["tailscaleSettings"]["controlUrl"] =
+                json!("https://other.example.test/path");
+            next
+        },
+        {
+            let mut next = previous.clone();
+            next["servers"][0]["protocol"] = json!("wireguard");
+            next
+        },
+        {
+            let mut next = previous.clone();
+            next["servers"][0]["tailscaleSettings"]["sourceTag"] = json!("source-b");
+            next
+        },
+        {
+            let mut next = previous.clone();
+            next["servers"][0]["tailscaleSettings"]["authKey"] = json!("secret-b");
+            next
+        },
+    ] {
+        let error = reconcile_untrusted(&previous, &mut changed).unwrap_err();
+        assert!(error.to_string().contains("trusted retirement transaction"));
+        assert!(!error.to_string().contains("secret-a"));
+        assert!(!error.to_string().contains("secret-b"));
+    }
+
+    let mut legacy = previous.clone();
+    legacy.as_object_mut().unwrap().remove(POLICY_KEY);
+    legacy.as_object_mut().unwrap().remove(STATE_KEY);
+    let mut deleted = legacy.clone();
+    deleted["servers"] = json!([]);
+    reconcile_untrusted(&legacy, &mut deleted).unwrap();
+}

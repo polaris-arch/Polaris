@@ -163,6 +163,15 @@ fn prepared_commit_and_state_only_cas_preserve_policy_and_reject_stale_revision(
         .update_mesh_state_if_revision("2", |_| {})
         .unwrap()
         .is_none());
+    assert!(mgr
+        .update_mesh_state_if_revision("2", |next| {
+            next.identities[0].binding_state =
+                polaris_config_engine::user_config::mesh_route_state::MeshBindingState::Retired;
+        })
+        .is_err());
+    assert!(mgr
+        .update_mesh_state_if_revision("2", |next| next.reservations.clear())
+        .is_err());
     let after = mgr.load_full().unwrap();
     assert_eq!(
         after[mesh_guard::POLICY_KEY],

@@ -649,6 +649,17 @@ impl ConfigManager {
         if next.local_id != previous.local_id {
             return Err(StoreError::validation("mesh localId is immutable"));
         }
+        // This generic state CAS has no old-config/active-plan scope proof and
+        // no lifecycle gate. Identity retirement and effects require the S3c/S4
+        // trusted document transaction; a closure cannot invent that proof.
+        if next.identities != previous.identities
+            || next.reservations != previous.reservations
+            || next.identity_effects != previous.identity_effects
+        {
+            return Err(StoreError::validation(
+                "mesh identity mutation needs a trusted complete-scope transaction",
+            ));
+        }
         let Some(next) =
             revise_semantic(&previous, expected_revision, next).map_err(StoreError::validation)?
         else {

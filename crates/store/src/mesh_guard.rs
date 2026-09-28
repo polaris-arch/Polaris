@@ -1,7 +1,9 @@
 //! Strict managed-state boundary. The legacy sanitizer is intentionally permissive;
 //! policy and local ledger must be checked on the *raw* JSON before it can run.
 
-use polaris_config_engine::user_config::mesh_route_state::{MeshRoutePolicy, MeshRouteState};
+use polaris_config_engine::user_config::mesh_route_state::{
+    MeshBindingState, MeshRoutePolicy, MeshRouteState,
+};
 use serde_json::Value;
 
 use crate::StoreError;
@@ -9,6 +11,57 @@ use crate::StoreError;
 pub const POLICY_KEY: &str = "meshRoutePolicy";
 pub const STATE_KEY: &str = "meshRouteState";
 pub const REQUIRED_MARKER_FILE: &str = "mesh-route-state.required";
+
+fn server_by_id<'a>(config: &'a Value, id: &str) -> Result<Option<&'a Value>, StoreError> {
+    let mut matches = config
+        .get("servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|server| server.get("id").and_then(Value::as_str) == Some(id));
+    let found = matches.next();
+    if matches.next().is_some() {
+        return Err(StoreError::validation("duplicate managed mesh serverId"));
+    }
+    Ok(found)
+}
+
+/// Until S4 can prove the complete old owner plan under the config write lock,
+/// ordinary writes must not change an active TS identity ahead of reservations.
+/// No credential value is included in the diagnostic.
+fn reject_unreconciled_identity_change(
+    previous: &Value,
+    incoming: &Value,
+    state: &MeshRouteState,
+) -> Result<(), StoreError> {
+    const IDENTITY_SETTINGS: [&str; 4] = ["controlUrl", "sourceTag", "authKey", "ephemeral"];
+    for identity in state.identities.iter().filter(|identity| {
+        matches!(
+            identity.binding_state,
+            MeshBindingState::Bound | MeshBindingState::Unbound
+        )
+    }) {
+        let old = server_by_id(previous, &identity.server_id)?;
+        let new = server_by_id(incoming, &identity.server_id)?;
+        if old.is_some() != new.is_some()
+            || old.zip(new).is_some_and(|(old, new)| {
+                old.get("protocol") != new.get("protocol")
+                    || IDENTITY_SETTINGS.iter().any(|key| {
+                        old.get("tailscaleSettings")
+                            .and_then(|settings| settings.get(key))
+                            != new
+                                .get("tailscaleSettings")
+                                .and_then(|settings| settings.get(key))
+                    })
+            })
+        {
+            return Err(StoreError::validation(
+                "managed mesh identity edit needs a trusted retirement transaction with complete old scope",
+            ));
+        }
+    }
+    Ok(())
+}
 
 pub fn has_managed_fields(raw: &Value) -> bool {
     raw.get(POLICY_KEY).is_some() || raw.get(STATE_KEY).is_some()
@@ -62,5 +115,8 @@ pub fn reconcile_untrusted(previous: &Value, incoming: &mut Value) -> Result<(),
         object.insert(key.into(), old.clone());
     }
     validate_raw(incoming)?;
+    let state: MeshRouteState =
+        serde_json::from_value(previous[STATE_KEY].clone()).map_err(StoreError::from_parse)?;
+    reject_unreconciled_identity_change(previous, incoming, &state)?;
     Ok(())
 }
