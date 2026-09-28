@@ -285,10 +285,9 @@ function NodeCardView({
             而它恰恰是唯一说明「为什么」的那半句。空串 / 未登记 token → 只渲染通用句。 */}
         <div
           className={cn('nd-name', invalidReason !== undefined && 'nd-invalid')}
-          data-tip={
-            invalidNodeReasonText(invalidReason, (k, f) => (f === undefined ? t(k) : t(k, f))) ??
-            undefined
-          }
+          tabIndex={0}
+          data-tip={[server.name, invalidNodeReasonText(invalidReason, (k, f) => (f === undefined ? t(k) : t(k, f)))]
+            .filter(Boolean).join('\n')}
         >
           {server.name}
         </div>

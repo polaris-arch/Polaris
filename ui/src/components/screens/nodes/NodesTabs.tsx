@@ -1,3 +1,4 @@
+import { HorizontalScrollArrow, useHorizontalScroll } from '@/components/HorizontalScroll';
 import type { TFunction } from 'i18next';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import type { ServerGroup } from '@/domain/server-grouping';
@@ -41,40 +42,47 @@ export function NodesTabs({
   openDialog,
   subscriptionActions,
 }: Props) {
+  const navigation = useHorizontalScroll(':scope > button');
   return (
     <>
-      <div className="nd-tabs-scroll" id="node-tabs-scroll">
-        <div className="sub-tabs" data-tabgroup="">
-          {groups.map((g) => {
-            const label = g.isManual
-              ? t('nodes.tab.manual')
-              : g.isMesh
-                ? t('nodes.tab.mesh')
-                : g.name;
-            const progress = subscriptionProgress[g.id];
-            const failureDetail =
-              progress?.phase === 'failed'
-                ? subscriptionErrorDetail(progress, t)
-                : null;
-            return (
-              <button
-                key={g.id}
-                type="button"
-                className={cn(activeTab === g.id && 'on')}
-                data-act="sub-tab"
-                data-v={g.id}
-                data-tip={failureDetail ?? undefined}
-                onClick={() => setActiveTab(g.id)}
-              >
-                <span>{label}</span>
-                {failureDetail && (
-                  <span className="pill err sub-tab-failure">{t('nodes.subUpdateFailed')}</span>
-                )}
-                {g.servers.length > 0 && <span className="cnt">{g.servers.length}</span>}
-              </button>
-            );
-          })}
+      <div ref={navigation.containerRef} className={cn('nd-tabs-bar', navigation.overflow && 'has-overflow')}>
+        <HorizontalScrollArrow navigation={navigation} direction={-1}
+          label={t('nodes.previousSubscriptions')} controls="node-tabs-scroll" />
+        <div ref={navigation.scrollRef} className="nd-tabs-scroll" id="node-tabs-scroll" onScroll={navigation.measure}>
+          <div ref={navigation.contentRef} className="sub-tabs" data-tabgroup="">
+            {groups.map((g) => {
+              const label = g.isManual
+                ? t('nodes.tab.manual')
+                : g.isMesh
+                  ? t('nodes.tab.mesh')
+                  : g.name;
+              const progress = subscriptionProgress[g.id];
+              const failureDetail =
+                progress?.phase === 'failed'
+                  ? subscriptionErrorDetail(progress, t)
+                  : null;
+              return (
+                <button
+                  key={g.id}
+                  type="button"
+                  className={cn(activeTab === g.id && 'on')}
+                  data-act="sub-tab"
+                  data-v={g.id}
+                  data-tip={failureDetail ?? undefined}
+                  onClick={() => setActiveTab(g.id)}
+                >
+                  <span>{label}</span>
+                  {failureDetail && (
+                    <span className="pill err sub-tab-failure">{t('nodes.subUpdateFailed')}</span>
+                  )}
+                  {g.servers.length > 0 && <span className="cnt">{g.servers.length}</span>}
+                </button>
+              );
+            })}
+          </div>
         </div>
+        <HorizontalScrollArrow navigation={navigation} direction={1}
+          label={t('nodes.nextSubscriptions')} controls="node-tabs-scroll" />
       </div>
 
       {activeSub && (

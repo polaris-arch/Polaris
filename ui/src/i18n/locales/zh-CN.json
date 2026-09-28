@@ -238,6 +238,8 @@
     }
   },
   "connections": {
+    "previousColumns": "向左查看列",
+    "nextColumns": "向右查看列",
     "pageTitle": "连接",
     "topologyTab": "拓扑",
     "active": "活跃连接",
@@ -1881,6 +1883,8 @@
     "onDemandHint": "只有被当前选中的出口或路由规则引用时才连接；未被引用时断开。Tailscale 会交出 tailnet 地址并停用 MagicDNS，登录状态保留。挂起期间收不到 Taildrop 文件。"
   },
   "nodes": {
+    "previousSubscriptions": "查看前面的订阅",
+    "nextSubscriptions": "查看后面的订阅",
     "add": "添加",
     "addSubscription": "添加订阅",
     "batch": "多选",

@@ -238,6 +238,8 @@
     }
   },
   "connections": {
+    "previousColumns": "نمایش ستون‌های قبلی",
+    "nextColumns": "نمایش ستون‌های بعدی",
     "pageTitle": "اتصالات",
     "topologyTab": "توپولوژی",
     "active": "فعال",
@@ -1593,6 +1595,8 @@
     }
   },
   "nodes": {
+    "previousSubscriptions": "نمایش اشتراک‌های قبلی",
+    "nextSubscriptions": "نمایش اشتراک‌های بعدی",
     "batchDeleteConfirmAgain": "گره‌های انتخاب‌شده حذف شوند؟",
     "batchDeleteOk": "{{count}} نود حذف شد",
     "batchExit": "خروج",

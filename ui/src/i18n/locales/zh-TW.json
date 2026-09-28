@@ -238,6 +238,8 @@
     }
   },
   "connections": {
+    "previousColumns": "向左查看欄",
+    "nextColumns": "向右查看欄",
     "pageTitle": "連線",
     "topologyTab": "拓撲",
     "active": "活躍連線",
@@ -1881,6 +1883,8 @@
     "onDemandHint": "只有被目前選取的出口或路由規則引用時才連線；未被引用時中斷。Tailscale 會交出 tailnet 位址並停用 MagicDNS，登入狀態保留。掛起期間收不到 Taildrop 檔案。"
   },
   "nodes": {
+    "previousSubscriptions": "查看前面的訂閱",
+    "nextSubscriptions": "查看後面的訂閱",
     "add": "新增",
     "addSubscription": "新增訂閱",
     "batch": "多選",

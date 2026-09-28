@@ -32,6 +32,7 @@ import { toast } from '@/lib/error-handler';
 import { useAppStore } from '@/store/app-store';
 import { RuleSubjectMenuItems } from '@/components/RuleSubjectMenuItems';
 import { ListPager, pageWindow } from '@/components/ListPager';
+import { HorizontalScrollArrow, useHorizontalScroll } from '@/components/HorizontalScroll';
 import { clampToWrap } from '@/lib/overlay-position';
 import { createTopicSubscription } from '@/lib/topic-subscription';
 import { useConfirmTwice } from '@/lib/confirm-twice';
@@ -259,7 +260,8 @@ export function ConnectionsScreen() {
   const [closedLoaded, setClosedLoaded] = useState(false);
   const [aggregate, setAggregate] = useState<ConnectionsAggregate | null>(null);
   const [topN, setTopN] = useState<number>(10);
-  const tableScrollRef = useRef<HTMLDivElement>(null);
+  const tableNavigation = useHorizontalScroll('thead th', view !== 'top');
+  const tableScrollRef = tableNavigation.scrollRef;
 
   // 上一帧字节记账（算速率）：id → {up, dn, at(ms)}
   const prevRef = useRef<Map<string, { up: number; dn: number; at: number }>>(
@@ -929,13 +931,21 @@ export function ConnectionsScreen() {
             )}
           </>
         )}
+        {view !== 'top' && tableNavigation.overflow && (
+          <div className="conn-horizontal-nav">
+            <HorizontalScrollArrow navigation={tableNavigation} direction={-1}
+              label={t('connections.previousColumns')} controls="conn-scroll" />
+            <HorizontalScrollArrow navigation={tableNavigation} direction={1}
+              label={t('connections.nextColumns')} controls="conn-scroll" />
+          </div>
+        )}
       </div>
 
       {/* 活动 / 已结束列表只在当前视图挂载；分页避免超长滚动面留住 graphics surface。 */}
       {(view === 'active' || view === 'closed') && (
       <div id="conn-table-view">
-        <div className="conn-scroll" ref={tableScrollRef}>
-          <div className="conn-list-wrap">
+        <div className="conn-scroll" id="conn-scroll" ref={tableScrollRef} onScroll={tableNavigation.measure}>
+          <div className="conn-list-wrap" ref={tableNavigation.contentRef}>
             <table className={`conn-table conn-table-${view}`}>
               <colgroup>
                 {view === 'active' && <col className="c-close" />}
