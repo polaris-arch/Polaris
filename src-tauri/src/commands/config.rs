@@ -82,6 +82,11 @@ pub fn config_get(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
 fn apply_frontend_view(cfg: &mut Value) {
     // F29：绝不下发隐私密码（历史残留明文 `privacyPassword` + salted hash `privacyPasswordHash`）。
     strip_privacy_secrets(cfg);
+    // 本机 mesh 账本是后端权威状态；排除于前端快照和 configVersion。
+    // 策略意图仍可见，供专用预览 UI 读取，但普通保存没有修改权。
+    if let Some(object) = cfg.as_object_mut() {
+        object.remove(polaris_store::mesh_guard::STATE_KEY);
+    }
     // 生效值注入：前端因此一条默认都不必（也不许）自己兜底。根因与机制见该模块头注。
     polaris_config_engine::user_config::effective_view::ensure_effective_config(cfg);
 }
@@ -1127,11 +1132,14 @@ fn preserve_server_owned_secrets_from(current: &Value, incoming: &mut Value) {
 ///
 /// `appRulesSeeded` 同样**不收**：它在 `polaris_store::backup` 的 `DATA_FIELDS` 里，随 appRules 类
 /// 被备份导入合法写入 ⇒ 所有权有争议，不满足「零写入权」。
-const BACKEND_AUTHORITATIVE_KEYS: [&str; 2] = [
+const BACKEND_AUTHORITATIVE_KEYS: [&str; 4] = [
     // 托盘「节点·最近」MRU。只由 `server_switch` 写；ui 全仓仅 TrayMenu 读。
     "recentServerIds",
     // 内置 geo 元数据（随包）。只由 geo seed 写；ui 全仓零读零写。
     "builtinGeoMeta",
+    // 仅专用后端 revision-CAS mutation 可以修改；普通全量保存/patch/导入按盘上真值镜像。
+    polaris_store::mesh_guard::POLICY_KEY,
+    polaris_store::mesh_guard::STATE_KEY,
     // 曾有第三项 `diagnosticCapture`（诊断采集态）。整条机制已删除（核日志改由 `SubscribeLog` 全级别
     // 送达、级别筛在客户端，不再需要「临时把核提级到 debug」的会话），故该键不再是任何人的权威字段。
     // 旧配置里的残留由 `polaris_store::migrate::migrate_diagnostic_capture` 还原级别后清除。

@@ -14,7 +14,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
-use polaris_store::fs::{random_tmp_suffix, ConfigFs, StdFs};
+use polaris_config_engine::user_config::mesh_route_state::{
+    revise_semantic, MeshRoutePolicy, MeshRouteState,
+};
+use polaris_store::fs::{durable_atomic_write, durable_remove, random_tmp_suffix, ConfigFs, StdFs};
+use polaris_store::mesh_guard::{self, REQUIRED_MARKER_FILE};
 use polaris_store::{ConfigStore, LoadResult, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +27,27 @@ const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
 const DEFERRED_DELETIONS_VERSION: u8 = 1;
 const STAGED_PENDING_FILE: &str = "staged-config.pending";
 const STAGED_PENDING_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MeshMarkerPhase {
+    Preparing,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MeshRequiredMarker {
+    phase: MeshMarkerPhase,
+    local_id: String,
+    legacy_config_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeshPrepareRecovery {
+    AwaitingCommit,
+    Enabled,
+}
 
 /// 未保存草稿对运行态节点选择的最小投影。正文仍只在渲染端；这里不复制配置，只携带自动故障切换
 /// 必须知道的节点 id。`scope_known=false` 只会来自升级前的空 marker：此时调用方必须保守地把整个
@@ -325,13 +350,46 @@ impl ConfigManager {
     /// 调用方已持有 [`Self::write_lock`] 的加载腿。加载本身可能因首装或迁移而写盘，所以不能当成
     /// 普通只读操作从事务锁旁路执行。
     fn load_full_under_write_lock(&self) -> Result<Value, StoreError> {
+        let marker = self.mesh_required_marker()?;
+        if marker
+            .as_ref()
+            .is_some_and(|marker| marker.phase == MeshMarkerPhase::Preparing)
+        {
+            return Err(StoreError::validation(
+                "mesh route migration is preparing; explicit recovery is required",
+            ));
+        }
         let LoadResult {
-            config,
+            mut config,
             loaded_from_disk,
             migration_delta,
             was_missing,
             error,
+            protected_error,
         } = ConfigStore::load(&StdFs, &self.path);
+        if let Some(error) = protected_error {
+            return Err(error);
+        }
+        match marker.as_ref() {
+            Some(marker) => {
+                if was_missing || error.is_some() || !mesh_guard::validate_raw(&config)? {
+                    return Err(StoreError::validation(
+                        "mesh route marker exists but the managed config is unavailable",
+                    ));
+                }
+                if config[mesh_guard::STATE_KEY]["localId"] != marker.local_id {
+                    return Err(StoreError::validation(
+                        "mesh route marker localId does not match ledger",
+                    ));
+                }
+            }
+            None if mesh_guard::has_managed_fields(&config) => {
+                return Err(StoreError::validation(
+                    "managed mesh route config has no required marker; recovery is required",
+                ));
+            }
+            None => {}
+        }
         // 加载或校验失败 → 回落默认（LoadResult 已处理），但记日志保留 error 上下文。
         if let Some(e) = &error {
             log::warn!("config load fallback (loaded_from_disk={loaded_from_disk}): {e}");
@@ -346,7 +404,12 @@ impl ConfigManager {
         // `debug_assert` **首启即崩**（本行正是 P0 的触发点：config.json 不存在才走到）；
         // release 下则静默产出永不被清扫的 `config.json.polaris.tmp`。
         if was_missing || migration_delta.changed {
-            if let Err(e) = ConfigStore::save(&StdFs, &self.path, &config, &random_tmp_suffix()) {
+            let previous = self.raw_disk_for_mesh_under_write_lock()?;
+            mesh_guard::reconcile_untrusted(&previous, &mut config)?;
+            let persist = self.persist_canonical_under_write_lock(&config);
+            if mesh_guard::has_managed_fields(&config) {
+                persist?;
+            } else if let Err(e) = persist {
                 log::warn!(
                     "config load persist failed (was_missing={was_missing}, migrated={}): {e}",
                     migration_delta.changed
@@ -358,6 +421,277 @@ impl ConfigManager {
             *guard = Some(config.clone());
         }
         Ok(config)
+    }
+
+    fn mesh_required_marker(&self) -> Result<Option<MeshRequiredMarker>, StoreError> {
+        let path = self.dir.join(REQUIRED_MARKER_FILE);
+        if !StdFs.exists(&path) {
+            return Ok(None);
+        }
+        let raw = StdFs.read_to_string(&path)?;
+        let marker: MeshRequiredMarker =
+            serde_json::from_str(&raw).map_err(StoreError::from_parse)?;
+        if marker.local_id.trim().is_empty()
+            || marker.legacy_config_digest.len() != 64
+            || !marker
+                .legacy_config_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(StoreError::validation(
+                "invalid mesh-route-state.required marker",
+            ));
+        }
+        Ok(Some(marker))
+    }
+
+    fn clear_cached_config(&self) {
+        if let Ok(mut guard) = self.cache.write() {
+            *guard = None;
+        }
+    }
+
+    fn mesh_marker_path(&self) -> PathBuf {
+        self.dir.join(REQUIRED_MARKER_FILE)
+    }
+
+    fn write_mesh_marker(&self, marker: &MeshRequiredMarker) -> Result<(), StoreError> {
+        let content = serde_json::to_string(marker).map_err(StoreError::from)?;
+        let result = durable_atomic_write(&self.mesh_marker_path(), &content, &random_tmp_suffix());
+        if matches!(&result, Err(StoreError::CommitUncertain(_))) {
+            self.clear_cached_config();
+        }
+        result.map(|_| ())
+    }
+
+    fn read_mesh_document(&self) -> Result<Value, StoreError> {
+        let content = StdFs.read_to_string(&self.path)?;
+        let raw: Value = serde_json::from_str(&content).map_err(StoreError::from_parse)?;
+        mesh_guard::validate_raw(&raw)?;
+        Ok(raw)
+    }
+
+    fn legacy_mesh_digest(config: &Value) -> Result<String, StoreError> {
+        if mesh_guard::has_managed_fields(config) {
+            return Err(StoreError::validation(
+                "legacy digest requires legacy config",
+            ));
+        }
+        let canonical = ConfigStore::canonicalize_for_save(config)?;
+        let bytes = serde_json::to_vec(&canonical).map_err(StoreError::from)?;
+        Ok(polaris_updater::sha256_hex(&bytes))
+    }
+
+    /// Step 1 of opt-in. The marker is durable before any managed document can
+    /// be published. There is deliberately no UI/product entry point in S3a.
+    #[allow(dead_code)]
+    pub(crate) fn prepare_mesh_route_enable(&self, local_id: &str) -> Result<(), StoreError> {
+        deny_inside_projection("prepare_mesh_route_enable");
+        if local_id.trim().is_empty() {
+            return Err(StoreError::validation("mesh localId is empty"));
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.mesh_required_marker()?.is_some() {
+            return Err(StoreError::validation("mesh route marker already exists"));
+        }
+        let legacy = self.load_full_under_write_lock()?;
+        let marker = MeshRequiredMarker {
+            phase: MeshMarkerPhase::Preparing,
+            local_id: local_id.into(),
+            legacy_config_digest: Self::legacy_mesh_digest(&legacy)?,
+        };
+        let result = self.write_mesh_marker(&marker);
+        self.clear_cached_config();
+        result
+    }
+
+    /// Step 2: only the exact prepared legacy document can become managed.
+    /// A crash after config rename leaves Preparing intact, and recovery can
+    /// finish marker promotion without trusting an old UI snapshot.
+    #[allow(dead_code)]
+    pub(crate) fn commit_prepared_mesh_route(
+        &self,
+        policy: MeshRoutePolicy,
+        state: MeshRouteState,
+    ) -> Result<(), StoreError> {
+        deny_inside_projection("commit_prepared_mesh_route");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut marker = self
+            .mesh_required_marker()?
+            .ok_or_else(|| StoreError::validation("mesh route marker is missing"))?;
+        if marker.phase != MeshMarkerPhase::Preparing || marker.local_id != state.local_id {
+            return Err(StoreError::validation(
+                "mesh route preparation identity changed",
+            ));
+        }
+        let mut raw = self.read_mesh_document()?;
+        if mesh_guard::has_managed_fields(&raw) {
+            return Err(StoreError::validation(
+                "managed document already published; recover marker",
+            ));
+        }
+        if Self::legacy_mesh_digest(&raw)? != marker.legacy_config_digest {
+            return Err(StoreError::validation(
+                "legacy config changed since mesh preparation",
+            ));
+        }
+        raw[mesh_guard::POLICY_KEY] = serde_json::to_value(policy).map_err(StoreError::from)?;
+        raw[mesh_guard::STATE_KEY] = serde_json::to_value(state).map_err(StoreError::from)?;
+        let canonical = ConfigStore::canonicalize_for_save(&raw)?;
+        let content = serde_json::to_string_pretty(&canonical).map_err(StoreError::from)?;
+        let publish = durable_atomic_write(&self.path, &content, &random_tmp_suffix());
+        self.clear_cached_config();
+        publish?;
+        marker.phase = MeshMarkerPhase::Enabled;
+        self.write_mesh_marker(&marker)
+    }
+
+    /// Step 3 after an interrupted opt-in. A managed document with the same
+    /// local identity is completed; a still-legacy document stays blocked so
+    /// the caller can explicitly retry or prove cancellation safe.
+    #[allow(dead_code)]
+    pub(crate) fn recover_preparing_mesh_route(&self) -> Result<MeshPrepareRecovery, StoreError> {
+        deny_inside_projection("recover_preparing_mesh_route");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut marker = self
+            .mesh_required_marker()?
+            .ok_or_else(|| StoreError::validation("mesh route marker is missing"))?;
+        if marker.phase == MeshMarkerPhase::Enabled {
+            self.raw_disk_for_mesh_under_write_lock()?;
+            return Ok(MeshPrepareRecovery::Enabled);
+        }
+        let raw = self.read_mesh_document()?;
+        if !mesh_guard::has_managed_fields(&raw) {
+            if Self::legacy_mesh_digest(&raw)? != marker.legacy_config_digest {
+                return Err(StoreError::validation(
+                    "legacy config changed during mesh preparation",
+                ));
+            }
+            return Ok(MeshPrepareRecovery::AwaitingCommit);
+        }
+        if raw[mesh_guard::STATE_KEY]["localId"] != marker.local_id {
+            return Err(StoreError::validation(
+                "published mesh localId differs from marker",
+            ));
+        }
+        marker.phase = MeshMarkerPhase::Enabled;
+        self.write_mesh_marker(&marker)?;
+        self.clear_cached_config();
+        Ok(MeshPrepareRecovery::Enabled)
+    }
+
+    /// Explicit cancellation is possible only while disk still proves that
+    /// no managed document was published and the original legacy semantics
+    /// have not changed. This is not a normal route-policy release operation.
+    #[allow(dead_code)]
+    pub(crate) fn cancel_preparing_mesh_route(&self) -> Result<(), StoreError> {
+        deny_inside_projection("cancel_preparing_mesh_route");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let marker = self
+            .mesh_required_marker()?
+            .ok_or_else(|| StoreError::validation("mesh route marker is missing"))?;
+        if marker.phase != MeshMarkerPhase::Preparing {
+            return Err(StoreError::validation(
+                "enabled mesh route cannot be cancelled",
+            ));
+        }
+        let raw = self.read_mesh_document()?;
+        if Self::legacy_mesh_digest(&raw)? != marker.legacy_config_digest {
+            return Err(StoreError::validation(
+                "mesh route cancellation proof failed",
+            ));
+        }
+        let result = durable_remove(&self.mesh_marker_path());
+        self.clear_cached_config();
+        result.map(|_| ())
+    }
+
+    /// Trusted state-only CAS. Ordinary config writes cannot submit this
+    /// ledger, and a no-op observation does not touch disk or bump revision.
+    #[allow(dead_code)]
+    pub(crate) fn update_mesh_state_if_revision(
+        &self,
+        expected_revision: &str,
+        mutate: impl FnOnce(&mut MeshRouteState),
+    ) -> Result<Option<MeshRouteState>, StoreError> {
+        deny_inside_projection("update_mesh_state_if_revision");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut raw = self.raw_disk_for_mesh_under_write_lock()?;
+        let previous: MeshRouteState = serde_json::from_value(raw[mesh_guard::STATE_KEY].clone())
+            .map_err(StoreError::from_parse)?;
+        let mut next = previous.clone();
+        mutate(&mut next);
+        if next.local_id != previous.local_id {
+            return Err(StoreError::validation("mesh localId is immutable"));
+        }
+        let Some(next) =
+            revise_semantic(&previous, expected_revision, next).map_err(StoreError::validation)?
+        else {
+            return Ok(None);
+        };
+        raw[mesh_guard::STATE_KEY] = serde_json::to_value(&next).map_err(StoreError::from)?;
+        let canonical = ConfigStore::canonicalize_for_save(&raw)?;
+        self.persist_canonical_under_write_lock(&canonical)?;
+        if let Ok(mut guard) = self.cache.write() {
+            *guard = Some(canonical);
+        }
+        Ok(Some(next))
+    }
+
+    /// Reads the disk truth while write_lock is held. Legacy malformed files keep
+    /// their historical fallback; a marker makes every read/parse error fatal.
+    fn raw_disk_for_mesh_under_write_lock(&self) -> Result<Value, StoreError> {
+        let marker = self.mesh_required_marker()?;
+        if marker
+            .as_ref()
+            .is_some_and(|marker| marker.phase == MeshMarkerPhase::Preparing)
+        {
+            return Err(StoreError::validation("mesh route migration is preparing"));
+        }
+        if !StdFs.exists(&self.path) {
+            if marker.is_some() {
+                return Err(StoreError::validation("managed config is missing"));
+            }
+            return Ok(polaris_store::store::default_config());
+        }
+        let content = StdFs.read_to_string(&self.path)?;
+        let raw: Value = match serde_json::from_str(&content) {
+            Ok(value) => value,
+            Err(error) if marker.is_none() => {
+                log::warn!("legacy config parse fallback during save: {error}");
+                return Ok(polaris_store::store::default_config());
+            }
+            Err(error) => return Err(StoreError::from_parse(error)),
+        };
+        let managed = mesh_guard::validate_raw(&raw)?;
+        match marker {
+            Some(marker)
+                if !managed || raw[mesh_guard::STATE_KEY]["localId"] != marker.local_id =>
+            {
+                Err(StoreError::validation(
+                    "mesh route marker and config do not match",
+                ))
+            }
+            None if managed => Err(StoreError::validation(
+                "managed config has no required marker",
+            )),
+            _ => Ok(raw),
+        }
     }
 
     /// 读 currentConfig 缓存（不触盘）。缓存未暖 → 触发一次 load_full（Polaris getCurrentConfig 懒加载）。
@@ -482,7 +816,7 @@ impl ConfigManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // 删除意图必须按**实际会写盘**的规范形求差集。若 sanitize 会剔除一个坏实体，而这里仍拿
         // 清洗前入参求差集，就会出现“磁盘实体没了、删除 journal 却从未记录”的永久资产泄漏。
-        let canonical = ConfigStore::canonicalize_for_save(config)?;
+        let canonical = self.canonicalize_untrusted_under_write_lock(config)?;
         let mut additions = derive_deferred_deletions(current, &canonical);
         additions.extend_from_slice(explicit);
         self.stage_deferred_deletion_entries_locked(additions)?;
@@ -495,8 +829,19 @@ impl ConfigManager {
         reconcile_icons: bool,
     ) -> Result<Value, StoreError> {
         deny_inside_projection("save_full");
-        let canonical = ConfigStore::canonicalize_for_save(config)?;
+        let canonical = self.canonicalize_untrusted_under_write_lock(config)?;
         self.save_canonical_with_icon_reconcile(canonical, reconcile_icons)
+    }
+
+    /// All ordinary config writers, including full snapshots, patch, setValue,
+    /// backup merge and load-time migration, must preserve the disk ledger.
+    /// In particular, an old policy snapshot cannot omit an already enabled
+    /// dnsPolicy and thereby silently return managed DNS to legacy behavior.
+    fn canonicalize_untrusted_under_write_lock(&self, config: &Value) -> Result<Value, StoreError> {
+        let previous = self.raw_disk_for_mesh_under_write_lock()?;
+        let mut incoming = config.clone();
+        mesh_guard::reconcile_untrusted(&previous, &mut incoming)?;
+        ConfigStore::canonicalize_for_save(&incoming)
     }
 
     fn save_canonical_with_icon_reconcile(
@@ -512,7 +857,7 @@ impl ConfigManager {
             .and_then(|g| g.as_ref().map(crate::icon_cache::custom_app_ids));
         // 同上：第 4 参是随机 12hex tmp 后缀，非品牌名。每次保存都须取新值——
         // 恒定后缀会让并发 saveConfig 撞同一个 tmp 路径，原子写的隔离性即失效。
-        ConfigStore::save(&StdFs, &self.path, &canonical, &random_tmp_suffix())?;
+        self.persist_canonical_under_write_lock(&canonical)?;
         // LOW-4：只有 `customAppPresets` 的 id 集**实际变化**才跑 read_dir + unlink reconcile。
         // `set_value` 走此汇流点保存**任何**键（mixedPort / 开关 / 规则…），绝大多数与自定义应用无关；
         // 无条件 reconcile 会让每次保存都白遍历一遍 `<userData>/icons/`。先比 id 集，未变即跳过整个
@@ -533,6 +878,30 @@ impl ConfigManager {
             *guard = Some(canonical.clone());
         }
         Ok(canonical)
+    }
+
+    /// The managed branch has stronger durability than legacy atomic saves.
+    /// An uncertain directory sync invalidates the old cache even though this
+    /// method returns Err and callers must not continue Apply side effects.
+    fn persist_canonical_under_write_lock(&self, canonical: &Value) -> Result<(), StoreError> {
+        if !mesh_guard::has_managed_fields(canonical) {
+            return ConfigStore::save(&StdFs, &self.path, canonical, &random_tmp_suffix());
+        }
+        let content = serde_json::to_string_pretty(canonical).map_err(StoreError::from)?;
+        match durable_atomic_write(&self.path, &content, &random_tmp_suffix()) {
+            Ok(_) => Ok(()),
+            Err(error @ StoreError::CommitUncertain(_)) => {
+                let actual = self
+                    .raw_disk_for_mesh_under_write_lock()
+                    .ok()
+                    .filter(|raw| matches!(mesh_guard::validate_raw(raw), Ok(true)));
+                if let Ok(mut guard) = self.cache.write() {
+                    *guard = actual;
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn deferred_deletions_path(&self) -> PathBuf {

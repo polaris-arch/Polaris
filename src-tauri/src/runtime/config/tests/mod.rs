@@ -6,6 +6,218 @@ fn temp_dir(tag: &str) -> TestDir {
 }
 
 #[test]
+fn ordinary_config_writes_preserve_managed_ledger_and_cannot_drop_dns_policy() {
+    let dir = temp_dir("mesh-protected-writes");
+    let wire: Value = serde_json::from_str(include_str!(
+        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    ))
+    .unwrap();
+    let mut config = polaris_store::store::default_config();
+    config[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    config[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    config[mesh_guard::POLICY_KEY]["dnsPolicy"] = serde_json::json!({
+        "schemaVersion": 1,
+        "suffixAssignments": [{"suffix": "tail.example.invalid", "target": {"kind": "reject"}}],
+        "shortNamePolicy": {"kind": "system"},
+        "serviceOwner": {"kind": "reject"}
+    });
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: config[mesh_guard::STATE_KEY]["localId"]
+                .as_str()
+                .unwrap()
+                .into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mgr = ConfigManager::new(dir.clone());
+    let current = mgr.load_full().unwrap();
+    let mut old_frontend = current.clone();
+    old_frontend
+        .as_object_mut()
+        .unwrap()
+        .remove(mesh_guard::POLICY_KEY);
+    old_frontend
+        .as_object_mut()
+        .unwrap()
+        .remove(mesh_guard::STATE_KEY);
+    old_frontend["logLevel"] = serde_json::json!("debug");
+    mgr.save_full(&old_frontend).unwrap();
+    let saved = mgr.set_value("mixedPort", serde_json::json!(7891)).unwrap();
+    assert_eq!(
+        saved[mesh_guard::POLICY_KEY],
+        config[mesh_guard::POLICY_KEY]
+    );
+    assert_eq!(saved[mesh_guard::STATE_KEY], config[mesh_guard::STATE_KEY]);
+
+    let mut nested_omission = saved.clone();
+    nested_omission[mesh_guard::POLICY_KEY]
+        .as_object_mut()
+        .unwrap()
+        .remove("dnsPolicy");
+    assert!(mgr.save_full(&nested_omission).is_err());
+    assert!(mgr
+        .save_full_deferred_cleanup(&saved, &nested_omission)
+        .is_err());
+    assert!(mgr
+        .set_value(mesh_guard::STATE_KEY, serde_json::json!({}))
+        .is_err());
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(
+        after[mesh_guard::POLICY_KEY],
+        config[mesh_guard::POLICY_KEY]
+    );
+    assert_eq!(after[mesh_guard::STATE_KEY], config[mesh_guard::STATE_KEY]);
+}
+
+fn mesh_wire_fixture() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn preparing_marker_blocks_ordinary_writes_and_only_proven_legacy_can_cancel() {
+    let dir = temp_dir("mesh-prepare-cancel");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    mgr.prepare_mesh_route_enable("local-test-1").unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr.set_value("mixedPort", serde_json::json!(7891)).is_err());
+    assert_eq!(
+        mgr.recover_preparing_mesh_route().unwrap(),
+        MeshPrepareRecovery::AwaitingCommit
+    );
+    mgr.cancel_preparing_mesh_route().unwrap();
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    mgr.load_full().unwrap();
+
+    mgr.prepare_mesh_route_enable("local-test-1").unwrap();
+    let mut changed: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    changed["logLevel"] = serde_json::json!("debug");
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&changed).unwrap(),
+    )
+    .unwrap();
+    assert!(mgr.cancel_preparing_mesh_route().is_err());
+    assert!(dir.join(REQUIRED_MARKER_FILE).exists());
+}
+
+#[test]
+fn prepared_commit_and_state_only_cas_preserve_policy_and_reject_stale_revision() {
+    let dir = temp_dir("mesh-prepare-commit");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let wire = mesh_wire_fixture();
+    let policy: MeshRoutePolicy =
+        serde_json::from_value(wire[mesh_guard::POLICY_KEY].clone()).unwrap();
+    let mut state: MeshRouteState =
+        serde_json::from_value(wire[mesh_guard::STATE_KEY].clone()).unwrap();
+    state.revision = "1".into();
+    mgr.prepare_mesh_route_enable(&state.local_id).unwrap();
+    mgr.commit_prepared_mesh_route(policy.clone(), state.clone())
+        .unwrap();
+    let marker = mgr.mesh_required_marker().unwrap().unwrap();
+    assert_eq!(marker.phase, MeshMarkerPhase::Enabled);
+    let before = mgr.load_full().unwrap();
+    assert_eq!(
+        before[mesh_guard::POLICY_KEY],
+        serde_json::to_value(policy).unwrap()
+    );
+
+    let updated = mgr
+        .update_mesh_state_if_revision("1", |next| {
+            next.intent.desired_run =
+                polaris_config_engine::user_config::mesh_route_state::MeshDesiredRun::Running;
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.revision, "2");
+    assert!(mgr.update_mesh_state_if_revision("1", |_| {}).is_err());
+    assert!(mgr
+        .update_mesh_state_if_revision("2", |_| {})
+        .unwrap()
+        .is_none());
+    let after = mgr.load_full().unwrap();
+    assert_eq!(
+        after[mesh_guard::POLICY_KEY],
+        before[mesh_guard::POLICY_KEY]
+    );
+    assert_eq!(after[mesh_guard::STATE_KEY]["revision"], "2");
+}
+
+#[test]
+fn interrupted_prepare_recovers_only_exact_published_identity() {
+    let dir = temp_dir("mesh-prepare-recover");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    mgr.prepare_mesh_route_enable("local-test-1").unwrap();
+    let wire = mesh_wire_fixture();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr.cancel_preparing_mesh_route().is_err());
+    assert_eq!(
+        mgr.recover_preparing_mesh_route().unwrap(),
+        MeshPrepareRecovery::Enabled
+    );
+    assert_eq!(
+        mgr.load_full().unwrap()[mesh_guard::STATE_KEY],
+        wire[mesh_guard::STATE_KEY]
+    );
+    assert!(mgr.cancel_preparing_mesh_route().is_err());
+}
+
+#[test]
+fn marked_corruption_and_unmarked_managed_document_never_fall_back_or_overwrite() {
+    let dir = temp_dir("mesh-strict-load");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let wire = mesh_wire_fixture();
+    let policy: MeshRoutePolicy =
+        serde_json::from_value(wire[mesh_guard::POLICY_KEY].clone()).unwrap();
+    let state: MeshRouteState =
+        serde_json::from_value(wire[mesh_guard::STATE_KEY].clone()).unwrap();
+    mgr.prepare_mesh_route_enable(&state.local_id).unwrap();
+    mgr.commit_prepared_mesh_route(policy, state).unwrap();
+
+    let corrupt = b"{not-json";
+    std::fs::write(dir.join("config.json"), corrupt).unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr
+        .save_full(&polaris_store::store::default_config())
+        .is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), corrupt);
+
+    std::fs::remove_file(dir.join(REQUIRED_MARKER_FILE)).unwrap();
+    let mut managed = polaris_store::store::default_config();
+    managed[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    managed[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    let raw = serde_json::to_vec(&managed).unwrap();
+    std::fs::write(dir.join("config.json"), &raw).unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr.save_full(&managed).is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), raw);
+}
+
+#[test]
 fn staged_pending_marker_survives_restart_and_clears_explicitly() {
     let dir = temp_dir("staged-pending");
     let marker = dir.join(STAGED_PENDING_FILE);

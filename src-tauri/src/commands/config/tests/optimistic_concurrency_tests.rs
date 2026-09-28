@@ -171,6 +171,19 @@ fn config_version_is_computed_over_the_frontend_view() {
         config_version(&filled),
         "bypassLANList 由 config_get 补齐 ⇒ 补前补后必须同版本"
     );
+
+    let mut with_mesh_ledger = base.clone();
+    with_mesh_ledger[polaris_store::mesh_guard::STATE_KEY] =
+        json!({"revision":"18446744073709551614"});
+    assert_eq!(
+        config_version(&with_mesh_ledger),
+        config_version(&base),
+        "本机 mesh ledger 不下发前端，也不得制造配置保存冲突"
+    );
+    apply_frontend_view(&mut with_mesh_ledger);
+    assert!(with_mesh_ledger
+        .get(polaris_store::mesh_guard::STATE_KEY)
+        .is_none());
 }
 
 /// **跨语言值锁**：同一组 fixture，Rust `config_content_hash` 与前端 `configBaseVersion`
