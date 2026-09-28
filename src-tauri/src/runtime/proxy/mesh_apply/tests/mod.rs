@@ -113,6 +113,115 @@ fn prepared() -> (MeshRouteState, ManagedMeshRoutePlan, ApplyClaim) {
     (state, plan, claim)
 }
 
+#[test]
+fn stop_reservation_records_generation_but_not_old_exit() {
+    let (state, plan) = fixture();
+    let prepared = persist(
+        &state,
+        record_prepared(
+            &state,
+            "1",
+            "config-2",
+            &plan,
+            "boot-a",
+            "7",
+            "mesh-routes/plans/plan-2/manifest.json",
+        )
+        .unwrap(),
+    );
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    assert_eq!(
+        request_stop_reserved(
+            &prepared,
+            &prepared.revision,
+            "config-2",
+            "boot-a",
+            9,
+            &claim,
+            &plan,
+            7,
+            9,
+        )
+        .unwrap_err(),
+        ApplyError::Superseded
+    );
+    assert_eq!(
+        request_stop_reserved(
+            &prepared,
+            &prepared.revision,
+            "config-2",
+            "boot-b",
+            8,
+            &claim,
+            &plan,
+            7,
+            8,
+        )
+        .unwrap_err(),
+        ApplyError::Superseded
+    );
+    let reserved = persist(
+        &prepared,
+        request_stop_reserved(
+            &prepared,
+            &prepared.revision,
+            "config-2",
+            "boot-a",
+            8,
+            &claim,
+            &plan,
+            7,
+            8,
+        )
+        .unwrap(),
+    );
+    let tx = reserved.transaction.as_ref().unwrap();
+    assert_eq!(tx.phase, MeshTransactionPhase::StopRequested);
+    assert_eq!(tx.lifecycle_generation, "8");
+    assert_eq!(tx.previous_plan_id.as_deref(), Some("old-plan"));
+    assert_eq!(reserved.active_plan, prepared.active_plan);
+    let stop_claim = ApplyClaim::from(tx);
+    assert_eq!(
+        advance(
+            &reserved,
+            &reserved.revision,
+            "config-2",
+            "boot-a",
+            "8",
+            &stop_claim,
+            &plan,
+            PhaseEvent::OldStopped {
+                exited: true,
+                owners_released: false,
+            },
+        )
+        .unwrap_err(),
+        ApplyError::Invalid("illegal Apply phase transition")
+    );
+    assert_eq!(
+        reserved.transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::StopRequested
+    );
+    let stopped = advance(
+        &reserved,
+        &reserved.revision,
+        "config-2",
+        "boot-a",
+        "8",
+        &stop_claim,
+        &plan,
+        PhaseEvent::OldStopped {
+            exited: true,
+            owners_released: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        stopped.transaction.unwrap().phase,
+        MeshTransactionPhase::OldStopped
+    );
+}
+
 fn step(state: &MeshRouteState, claim: &ApplyClaim, event: PhaseEvent<'_>) -> MeshRouteState {
     let plan = fixture().1;
     persist(

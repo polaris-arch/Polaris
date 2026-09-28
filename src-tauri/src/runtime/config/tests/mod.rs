@@ -560,6 +560,283 @@ fn reserved_start_must_bind_old_claim_to_the_live_new_generation_before_spawn() 
 }
 
 #[test]
+fn reserved_stop_persists_handoff_under_live_gate_without_claiming_exit() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (_dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = LifecycleGate::default();
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    assert!(matches!(
+        gate.with_current_generation(old, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::RequestStop,
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(_)))
+    ));
+
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let reserved = gate
+        .with_current_generation(stop, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                "boot-stop",
+                live,
+                ApplyStep::RequestStopReserved {
+                    plan: &plan,
+                    claim: &claim,
+                    old_generation: old,
+                    stop_generation: stop,
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let tx = reserved.transaction.as_ref().unwrap();
+    assert_eq!(tx.phase, MeshTransactionPhase::StopRequested);
+    assert_eq!(tx.lifecycle_generation, stop.to_string());
+    assert!(tx.candidate_run_id.is_none());
+    assert_eq!(reserved.active_plan, prepared.active_plan);
+    assert_eq!(reserved.intent, prepared.intent);
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+
+    let stop_claim = ApplyClaim::from(tx);
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &reserved.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &stop_claim,
+                event: PhaseEvent::OldStopped {
+                    exited: true,
+                    owners_released: false,
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(_)))
+    ));
+    assert_eq!(
+        mgr.read_mesh_apply_snapshot()
+            .unwrap()
+            .state()
+            .transaction
+            .as_ref()
+            .unwrap()
+            .phase,
+        MeshTransactionPhase::StopRequested
+    );
+}
+
+#[test]
+fn failed_stop_reservation_keeps_ledger_unchanged_and_marks_old_owner_unknown() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (_dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = LifecycleGate::default();
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    mgr.set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let rejected = gate
+        .with_current_generation(stop, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                "boot-stop",
+                live,
+                ApplyStep::RequestStopReserved {
+                    plan: &plan,
+                    claim: &claim,
+                    old_generation: old,
+                    stop_generation: stop,
+                },
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::ConfigChanged)
+    ));
+    let after = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(after.state().revision, prepared.revision);
+    assert_eq!(after.state().reservations, prepared.reservations);
+    assert_eq!(after.state().active_plan, prepared.active_plan);
+    assert_eq!(
+        after.state().transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Prepared
+    );
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::OldStopped {
+                    exited: true,
+                    owners_released: true,
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::ConfigChanged)
+    ));
+}
+
+#[test]
+fn newer_stop_intent_supersedes_reserved_apply_stop_even_at_current_state_revision() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep};
+    use polaris_config_engine::user_config::mesh_route_state::{
+        MeshDesiredRun, MeshTransactionPhase,
+    };
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (_dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = LifecycleGate::default();
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let stopped = gate
+        .with_current_generation(stop, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                "boot-stop",
+                live,
+                ApplyStep::StopIntent,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &stopped.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::RequestStopReserved {
+                plan: &plan,
+                claim: &claim,
+                old_generation: old,
+                stop_generation: stop,
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::Step(ApplyError::Superseded))
+    ));
+    let after = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(after.state().revision, stopped.revision);
+    assert_eq!(after.state().intent.desired_run, MeshDesiredRun::Stopped);
+    assert_eq!(
+        after.state().transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Interrupted
+    );
+}
+
+#[test]
 fn trusted_mesh_identity_write_requires_no_owner_receipt_and_commits_old_scope_with_edit() {
     let dir = temp_dir("mesh-identity-transaction");
     let wire = mesh_wire_fixture();

@@ -112,6 +112,10 @@ pub(crate) enum ApplyPersistError {
     Store(StoreError),
     ConfigChanged,
     Step(ApplyError),
+    /// Stop reservation did not return success. Keep old owner resources;
+    /// its process and supervision outcome are unknown until independently
+    /// proved, regardless of whether this was a CAS miss or a write error.
+    StopReservationUncertain(Box<ApplyPersistError>),
 }
 
 impl From<StoreError> for ApplyPersistError {
@@ -1088,6 +1092,22 @@ impl ConfigManager {
         step: ApplyStep<'_>,
     ) -> Result<MeshRouteState, ApplyPersistError> {
         deny_inside_projection("apply_mesh_step_if_current");
+        let stop_reservation = matches!(&step, ApplyStep::RequestStopReserved { .. });
+        let result = self.apply_mesh_step_if_current_inner(expected, current_boot_id, live, step);
+        if stop_reservation {
+            result.map_err(|cause| ApplyPersistError::StopReservationUncertain(Box::new(cause)))
+        } else {
+            result
+        }
+    }
+
+    fn apply_mesh_step_if_current_inner(
+        &self,
+        expected: ApplyCasExpected<'_>,
+        current_boot_id: &str,
+        live: &LiveClaimGuard<'_>,
+        step: ApplyStep<'_>,
+    ) -> Result<MeshRouteState, ApplyPersistError> {
         let _guard = self
             .write_lock
             .lock()
@@ -1140,9 +1160,12 @@ impl ConfigManager {
                 )
             }
             ApplyStep::Advance { plan, claim, event } => {
-                if matches!(&event, PhaseEvent::RequestStart { .. }) {
+                if matches!(
+                    &event,
+                    PhaseEvent::RequestStart { .. } | PhaseEvent::RequestStop
+                ) {
                     return Err(ApplyPersistError::Step(ApplyError::Invalid(
-                        "requestStart requires a reserved generation",
+                        "stop/start request requires a reserved generation",
                     )));
                 }
                 mesh_apply::advance(
@@ -1177,6 +1200,27 @@ impl ConfigManager {
                     run_id,
                     old_generation,
                     new_generation,
+                )
+            }
+            ApplyStep::RequestStopReserved {
+                plan,
+                claim,
+                old_generation,
+                stop_generation,
+            } => {
+                if live.owner() != Some(LifecycleKind::Stop) {
+                    return Err(ApplyPersistError::Step(ApplyError::Superseded));
+                }
+                mesh_apply::request_stop_reserved(
+                    &previous,
+                    expected.state_revision,
+                    &actual_config_version,
+                    current_boot_id,
+                    live_generation,
+                    claim,
+                    plan,
+                    old_generation,
+                    stop_generation,
                 )
             }
             ApplyStep::StopIntent => {

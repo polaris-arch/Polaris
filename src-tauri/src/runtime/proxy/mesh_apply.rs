@@ -163,6 +163,16 @@ pub(crate) enum ApplyStep<'a> {
         old_generation: u64,
         new_generation: u64,
     },
+    /// The gate has already claimed the next Stop generation. Persist that
+    /// handoff before touching the old process. A failed CAS leaves its
+    /// process and supervision status unknown to this journal. A `None` from
+    /// `with_current_generation` has the same conservative outcome.
+    RequestStopReserved {
+        plan: &'a ManagedMeshRoutePlan,
+        claim: &'a ApplyClaim,
+        old_generation: u64,
+        stop_generation: u64,
+    },
     StopIntent,
 }
 
@@ -489,8 +499,50 @@ pub(crate) fn advance(
     Ok(next)
 }
 
-/// The sole old→new generation transition. `advance` normally requires the
-/// old claim to be live and must not be called with a fabricated old live
+/// Reserve the old→Stop lifecycle handoff after the gate claim and before any
+/// actual stop. This checks journal ownership, not the old process identity or
+/// its monitor attachment. `StopRequested` is only intent; process exit and
+/// both owner releases still require independent evidence for `OldStopped`.
+pub(crate) fn request_stop_reserved(
+    state: &MeshRouteState,
+    expected_state_revision: &str,
+    current_config_version: &str,
+    current_boot_id: &str,
+    live_stop_generation: u64,
+    claim: &ApplyClaim,
+    plan: &ManagedMeshRoutePlan,
+    old_generation: u64,
+    stop_generation: u64,
+) -> Result<MeshRouteState, ApplyError> {
+    if claim.lifecycle_generation != old_generation.to_string()
+        || live_stop_generation != stop_generation
+        || old_generation.checked_add(1) != Some(stop_generation)
+    {
+        return Err(ApplyError::Superseded);
+    }
+    check_stored_claim(
+        state,
+        expected_state_revision,
+        current_config_version,
+        claim,
+        plan,
+    )?;
+    if claim.boot_id != current_boot_id {
+        return Err(ApplyError::Superseded);
+    }
+    let tx = state.transaction.as_ref().ok_or(ApplyError::Superseded)?;
+    if tx.phase != MeshTransactionPhase::Prepared {
+        return Err(ApplyError::Invalid("stop reservation requires prepared"));
+    }
+    let mut next = state.clone();
+    let tx = next.transaction.as_mut().ok_or(ApplyError::Superseded)?;
+    tx.lifecycle_generation = stop_generation.to_string();
+    tx.phase = MeshTransactionPhase::StopRequested;
+    Ok(next)
+}
+
+/// The old Stop→new Start generation transition. `advance` normally requires
+/// the old claim to be live and must not be called with a fabricated old live
 /// generation after the gate has already reserved a new Start generation.
 pub(crate) fn request_start_reserved(
     state: &MeshRouteState,
