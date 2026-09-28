@@ -751,8 +751,9 @@ impl LoginCoreRegistry {
     }
 
     /// A registry-local fact while the caller continuously holds this exact registry's gate.
-    /// The gate prevents new prepare/reserve/spawn admissions; a supervisor may only clear an
-    /// existing entry while it is held. Each std mutex is read and released separately.
+    /// The gate prevents new prepare/reserve/spawn admissions. A supervisor can remove an entry
+    /// outside the gate after confirmed close or after_exit; that only clears local ownership.
+    /// Each std mutex is read and released separately.
     pub(crate) fn owner_state_under_gate(
         &self,
         server_id: &str,
