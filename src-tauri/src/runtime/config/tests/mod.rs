@@ -759,6 +759,138 @@ fn failed_stop_reservation_keeps_ledger_unchanged_and_marks_old_owner_unknown() 
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn stop_reservation_pre_rename_io_failure_preserves_disk_cache_and_old_owner() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions<'a> {
+        dir: &'a std::path::Path,
+        original: std::fs::Permissions,
+    }
+    impl Drop for RestorePermissions<'_> {
+        fn drop(&mut self) {
+            std::fs::set_permissions(self.dir, self.original.clone())
+                .expect("test directory permissions must be restored");
+        }
+    }
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = LifecycleGate::default();
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    let disk_before = std::fs::read(dir.join("config.json")).unwrap();
+    let cache_before = mgr.cache.read().unwrap().clone();
+    assert!(cache_before.is_some());
+
+    // The managed writer reads config.json first, then creates a private tmp
+    // beside it. Remove directory write permission only after Prepared, so
+    // the actual durable_atomic_write path fails before rename.
+    let original = std::fs::metadata(dir.path()).unwrap().permissions();
+    let mut denied = original.clone();
+    denied.set_mode(original.mode() & !0o222);
+    std::fs::set_permissions(dir.path(), denied).unwrap();
+    let restore = RestorePermissions {
+        dir: dir.path(),
+        original,
+    };
+    let probe = dir.join("permission-probe");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            std::fs::remove_file(probe).unwrap();
+            eprintln!("SKIPPED: this process can create files in a non-writable test directory");
+            return;
+        }
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+    }
+
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let rejected = gate
+        .with_current_generation(stop, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                "boot-stop",
+                live,
+                ApplyStep::RequestStopReserved {
+                    plan: &plan,
+                    claim: &claim,
+                    old_generation: old,
+                    stop_generation: stop,
+                },
+            )
+        })
+        .unwrap();
+    drop(restore);
+    assert!(matches!(
+        rejected,
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::Store(StoreError::Io(_)))
+    ));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), disk_before);
+    assert_eq!(*mgr.cache.read().unwrap(), cache_before);
+    let after = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(after.state().revision, prepared.revision);
+    assert_eq!(after.state().reservations, prepared.reservations);
+    assert_eq!(
+        after.state().transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Prepared
+    );
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::OldStopped {
+                    exited: true,
+                    owners_released: true,
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Superseded))
+    ));
+}
+
 #[test]
 fn newer_stop_intent_supersedes_reserved_apply_stop_even_at_current_state_revision() {
     use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep};

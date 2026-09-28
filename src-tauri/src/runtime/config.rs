@@ -112,9 +112,12 @@ pub(crate) enum ApplyPersistError {
     Store(StoreError),
     ConfigChanged,
     Step(ApplyError),
-    /// Stop reservation did not return success. Keep old owner resources;
-    /// its process and supervision outcome are unknown until independently
-    /// proved, regardless of whether this was a CAS miss or a write error.
+    /// Stop reservation did not return success after a lifecycle claim may
+    /// have retired the old monitor. Keep old owner resources and treat their
+    /// supervision status as unknown until independently proved, even for an
+    /// inner Step(Invalid). The inner cause separately describes disk truth:
+    /// a pre-rename Io error did not commit, while CommitUncertain requires a
+    /// strict reread before another action.
     StopReservationUncertain(Box<ApplyPersistError>),
 }
 
