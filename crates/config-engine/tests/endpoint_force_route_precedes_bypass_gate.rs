@@ -343,14 +343,18 @@ fn ip_cidr_entries(rules: &[RouteRule]) -> Vec<(usize, String, Option<String>)> 
 
 /// 块 1 那条私网直连表的 `ip_cidr`（不在场 ⇒ `None`，那是 `bypassLAN` 关掉时的合法态）。
 ///
-/// 定位判据：`outbound=="direct"` + 带 `ip_cidr` + **不带 `port`**。那个 `port` 是必要的：
+/// 定位判据：`outbound=="direct"` + 带 `ip_cidr` + **不带 `port`/`inbound`**。`inbound`
+/// 排除 userspace mesh endpoint 自己的本机回环映射，它不是全局旁路表。那个 `port` 也是必要的：
 /// 同为 direct 的 DNS 上游直连规则也带一串 `ip_cidr`，只靠前两条会认到它头上，而那张表与
 /// 旁路清单毫无关系 —— 命中多于一条直接 panic，夹具不许有歧义。
 fn bypass_rule_cidrs(rules: &[RouteRule]) -> Option<Vec<String>> {
     let hits: Vec<&RouteRule> = rules
         .iter()
         .filter(|r| {
-            r.outbound.as_deref() == Some("direct") && r.ip_cidr.is_some() && r.port.is_none()
+            r.outbound.as_deref() == Some("direct")
+                && r.ip_cidr.is_some()
+                && r.port.is_none()
+                && r.inbound.is_none()
         })
         .collect();
     assert!(

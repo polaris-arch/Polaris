@@ -5,12 +5,12 @@
 use std::collections::BTreeMap;
 
 use crate::builder::system_interfaces::endpoint_requests_system_interface;
-use crate::singbox::{DnsRule, OneOrMany, RouteRule, SingBoxConfig};
+use crate::singbox::{DnsRule, Endpoint, OneOrMany, RouteRule, SingBoxConfig};
 use crate::user_config::app_config::UserConfig;
 use crate::user_config::rules::parse_port_values;
 use crate::user_config::server_config::{
-    validate_mesh_inbound_policy, MeshInboundGrant, MeshInboundNetwork, MeshInboundPolicy,
-    MeshInboundTarget,
+    lands_in_endpoints, validate_mesh_inbound_policy, MeshInboundGrant, MeshInboundNetwork,
+    MeshInboundPolicy, MeshInboundTarget,
 };
 
 /// 上层只据此固定生成错误分类，绝不解析自由文本或内核 stderr。
@@ -29,6 +29,41 @@ fn reject(tag: &str, destinations: Option<Vec<String>>) -> RouteRule {
         no_drop: Some(true),
         ..RouteRule::default()
     }
+}
+
+fn legacy_local_direct(tag: &str) -> RouteRule {
+    // 五种 userspace endpoint 的内核实现都会把「本机分配地址」映射到双栈回环。
+    // 这条只作用于该 endpoint 入站，避免选中全隧道节点时把 ::1 再拨回自身。
+    RouteRule {
+        inbound: Some(ingress(tag)),
+        ip_cidr: Some(vec!["127.0.0.1/32".into(), "::1/128".into()]),
+        action: Some("route".into()),
+        outbound: Some("direct".into()),
+        ..RouteRule::default()
+    }
+}
+
+/// 原有 DNS sniff/hijack 与用户 traffic/app 规则之后、通用出口与 mesh force-route 之前插入。
+/// 只依据 outbounds builder 已发射的 endpoint；未发射/system/WARP 都没有可承接的用户态入站。
+pub(crate) fn legacy_userspace_local_routes(
+    config: &UserConfig,
+    id_to_tag: &BTreeMap<String, String>,
+    emitted: &[Endpoint],
+) -> Vec<RouteRule> {
+    config
+        .servers
+        .iter()
+        .filter(|server| {
+            server.mesh_inbound_policy.is_none()
+                && lands_in_endpoints(server.protocol)
+                && !crate::warp::is_warp_server(server)
+        })
+        .filter_map(|server| {
+            let tag = id_to_tag.get(&server.id)?;
+            let endpoint = emitted.iter().find(|endpoint| &endpoint.tag == tag)?;
+            (!endpoint_requests_system_interface(endpoint)).then(|| legacy_local_direct(tag))
+        })
+        .collect()
 }
 
 fn grants(tag: &str, rule: &MeshInboundGrant) -> Vec<RouteRule> {
@@ -79,7 +114,7 @@ pub fn apply_mesh_inbound_policies(
     let mut route_head = Vec::new();
     let mut dns_head = Vec::new();
     for server in &config.servers {
-        let Some(policy) = &server.mesh_inbound_policy else {
+        let Some(policy) = server.mesh_inbound_policy.as_ref() else {
             continue;
         };
         validate_mesh_inbound_policy(server).map_err(str::to_owned)?;
@@ -136,9 +171,11 @@ pub fn apply_mesh_inbound_policies(
     }
     if !route_head.is_empty() {
         let route = singbox.route.as_mut().ok_or("mesh-inbound-route-missing")?;
-        let dns = singbox.dns.as_mut().ok_or("mesh-inbound-dns-missing")?;
         route_head.append(&mut route.rules);
         route.rules = route_head;
+    }
+    if !dns_head.is_empty() {
+        let dns = singbox.dns.as_mut().ok_or("mesh-inbound-dns-missing")?;
         dns_head.extend(dns.rules.take().unwrap_or_default());
         dns.rules = Some(dns_head);
     }

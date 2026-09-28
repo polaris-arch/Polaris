@@ -630,11 +630,11 @@ jobs:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test network_profile_runtime
 
-      - name: Userspace WG IPv4 IPv6 and MASQUE H3 inbound TCP UDP DNS runtime gate
+      - name: Userspace WG IPv4 IPv6 and MASQUE H3 inner IPv4 IPv6 inbound TCP UDP DNS runtime gate
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture
+        run: cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture --test-threads=1
 
       - name: Fetch sing-box dashboard
         run: node scripts/fetch-dashboard.mjs

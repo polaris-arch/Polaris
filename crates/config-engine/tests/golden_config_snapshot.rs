@@ -125,6 +125,18 @@
 //!   生成侧由 `builder::inbounds::tests::tun_inbound_never_emits_stack_on_any_platform`（三平台正向）
 //!   与 `tun_inbound_violations_has_teeth`（反向对照）钉住。`fixtures/inbounds.json` 同批同规则变换（6 处）。
 //!
+//! **第九次例外（2026-09-28，userspace mesh 本机 IPv6 回环）**：五种 userspace mesh endpoint
+//! 的内核都把自身分配地址映射到 `127.0.0.1` / `::1`。旧默认旁路表含 `127/8`，却不含 `::1`；
+//! 当 endpoint 同时是默认出口时，`::1` 会被拨回自身。新生成器仅在已发射的 userspace endpoint
+//! 且 `meshInboundPolicy=None` 时在 DNS hijack 和用户 traffic/app 规则之后、mesh force-route
+//! 与通用旁路之前插入按该 inbound 限定的双栈本机 direct 兜底。
+//! - **定向变换**：37 个冻结场景只有 `WireGuard endpoint（mesh）` 一个发射上述 endpoint；
+//!   只在其 `expected.config.route.rules` 的原有用户规则之后、私网旁路表之前加入
+//!   `inbound:["WG-US"], ip_cidr:["127.0.0.1/32","::1/128"], action:route, outbound:direct`。
+//!   原有 18 条 route 规则及 DNS 全部保持原顺序和内容，其余 36 个场景不变。
+//! - **验收**：变换前仅此 1/37 case 红（route.rules 期望 18、实际 19）；变换后 37/37 diff=0。
+//!   完整生成行为回归见 `builder::generate::tests::legacy_userspace_mesh_local_mapping_is_inbound_scoped_and_independent_of_lan_bypass`。
+//!
 //! # 重生方式（不要在本仓手搓）
 //!
 //! 导出器在 **上游仓**：`scripts/export-config-snapshot-fixtures.test.ts`。重生要求 上游 主工作树

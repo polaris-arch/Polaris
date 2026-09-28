@@ -909,6 +909,15 @@ pub fn build_route_config_with_report(
         }
     }
 
+    // 缺省 userspace mesh 的本机映射只作兜底：通用 DNS hijack、用户自定义流量规则和
+    // 应用分流均先匹配；随后才把该 endpoint 入站的 127/::1 送 direct，避免选中全
+    // 隧道出口时再拨回自己。显式 meshInboundPolicy 仍在最终生成阶段绝对置顶。
+    rules.extend(crate::builder::mesh_inbound::legacy_userspace_local_routes(
+        config,
+        id_to_tag_map,
+        deps.pending_endpoints,
+    ));
+
     // ===== 用户规则之后的功能性强制路由（reorder：原在用户规则之上，现下移）=====
     // 本轮块 0c 真正接管的段（结算之后；Inline 的 emitted ∪ ExternalRuleSet 会落盘的那份）。
     // 块 1 的 bypass 表要按它 carve，故提到块外声明 —— 块内那次结算是它的**唯一**来源，

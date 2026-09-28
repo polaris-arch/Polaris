@@ -1,4 +1,5 @@
-//! 用户态 WG/MASQUE endpoint 的真实入站门。探针与服务只绑定回环，不创建 TUN/System 接口。
+//! 用户态 WG/MASQUE endpoint 的真实入站门。MASQUE 外层 H3 使用 IPv4 回环，
+//! 内层分别验证 IPv4 和 IPv6；探针与服务只绑定回环，不创建 TUN/System 接口。
 //! 本机 POLARIS_NO_KERNEL_RUN=1 跳过；打包 CI 用随包核执行。
 
 mod support;
@@ -56,9 +57,6 @@ struct Listener {
     worker: Option<JoinHandle<()>>,
 }
 impl Listener {
-    fn tcp() -> Self {
-        Self::tcp_on(false)
-    }
     fn tcp_on(ipv6: bool) -> Self {
         let socket = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).unwrap();
         socket.set_nonblocking(true).unwrap();
@@ -291,7 +289,8 @@ fn runtime_config(
         assert_eq!(value["dns"]["rules"][0]["inbound"], json!([endpoint]));
         assert_eq!(value["dns"]["rules"][0]["action"], "reject");
     }
-    value["log"] = json!({"level":"warn", "timestamp":false});
+    // 失败时完整打印双核 stderr，保留入站选择与路由路径证据；成功时日志留在临时目录。
+    value["log"] = json!({"level":"debug", "timestamp":false});
     value["inbounds"] = Value::Array(
         probes
             .iter()
@@ -523,13 +522,15 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
         assert!(
             eventually(|| tcp(a_out_tcp)),
-            "{family}/{label}: A→B TCP unavailable: {}",
-            a_core.log()
+            "{family}/{label}: A→B TCP unavailable: A={} / B={}",
+            a_core.log(),
+            b_core.log()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x48]) == Some(vec![0x48])),
-            "{family}/{label}: A→B UDP unavailable: {}",
-            a_core.log()
+            "{family}/{label}: A→B UDP unavailable: A={} / B={}",
+            a_core.log(),
+            b_core.log()
         );
         assert!(
             b_tcp.count() > 0 && b_udp.count() > 0,
@@ -626,13 +627,15 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         let before_forward_udp = b_udp.count();
         assert!(
             eventually(|| tcp(a_out_tcp)),
-            "{family}/{label}: A→B TCP died after ingress checks: {}",
-            a_core.log()
+            "{family}/{label}: A→B TCP died after ingress checks: A={} / B={}",
+            a_core.log(),
+            b_core.log()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x49]) == Some(vec![0x49])),
-            "{family}/{label}: A→B UDP died after ingress checks: {}",
-            a_core.log()
+            "{family}/{label}: A→B UDP died after ingress checks: A={} / B={}",
+            a_core.log(),
+            b_core.log()
         );
         assert!(
             b_tcp.count() > before_forward_tcp && b_udp.count() > before_forward_udp,
@@ -649,17 +652,26 @@ fn wireguard_family(core: &Path, ipv6: bool) {
 const MASQUE_SERVER_IP: &str = "10.78.0.1";
 const MASQUE_A_IP: &str = "10.78.0.2";
 const MASQUE_B_IP: &str = "10.78.0.3";
+const MASQUE_SERVER_IP6: &str = "fd78::1";
+const MASQUE_A_IP6: &str = "fd78::2";
+const MASQUE_B_IP6: &str = "fd78::3";
 
-fn masque_client_config(own_a: bool, server_port: u16, policy: Option<Value>) -> UserConfig {
+fn masque_client_config(
+    own_a: bool,
+    ipv6: bool,
+    server_port: u16,
+    policy: Option<Value>,
+) -> UserConfig {
     let (id, username) = if own_a {
         ("mq-a", "mesh-a")
     } else {
         ("mq-b", "mesh-b")
     };
+    let mesh_route = if ipv6 { "fd78::/125" } else { "10.78.0.0/29" };
     let mut server = json!({
         "id":id, "name":id, "protocol":"masque-client", "address":"127.0.0.1",
         "port":server_port, "username":username, "password":"fixture-only-password",
-        "meshRoutes":["10.78.0.0/29"],
+        "meshRoutes":[mesh_route],
         "tlsSettings":{"serverName":"localhost","allowInsecure":true},
         "masqueClientSettings":{"version":3,"disable_version_fallback":true}
     });
@@ -673,14 +685,19 @@ fn masque_client_config(own_a: bool, server_port: u16, policy: Option<Value>) ->
     .unwrap()
 }
 
-fn masque_server_config(server_port: u16) -> Value {
+fn masque_server_config(server_port: u16, ipv6: bool) -> Value {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mesh-masque");
+    let pool = if ipv6 {
+        format!("{MASQUE_SERVER_IP6}/125")
+    } else {
+        format!("{MASQUE_SERVER_IP}/29")
+    };
     json!({
         "log":{"level":"info","output":"stderr","timestamp":false},
         "inbounds":[], "outbounds":[{"type":"direct","tag":"direct"}],
         "endpoints":[{
             "type":"masque-server", "tag":"mesh-server", "listen":"127.0.0.1",
-            "listen_port":server_port, "address":[format!("{MASQUE_SERVER_IP}/29")],
+            "listen_port":server_port, "address":[pool],
             "version":[3],
             "users":[
                 {"username":"mesh-a","password":"fixture-only-password"},
@@ -699,13 +716,16 @@ fn server_assigned(log: &str, user: &str, ip: &str) -> bool {
         line.contains(&format!("[{user}] inbound tunnel from "))
             && line
                 .split_once(" assigned ")
-                .and_then(|(_, addresses)| addresses.split_whitespace().next())
-                == Some(ip)
+                .is_some_and(|(_, addresses)| addresses.split_whitespace().any(|token| token == ip))
     })
 }
 
 #[test]
 fn userspace_mesh_ipv6_and_masque_configs_check_with_bundled_core() {
+    let dual_stack_log = "[mesh-a] inbound tunnel from 127.0.0.1 assigned 10.78.0.2 fd78::2";
+    assert!(server_assigned(dual_stack_log, "mesh-a", "fd78::2"));
+    assert!(!server_assigned(dual_stack_log, "mesh-b", "fd78::2"));
+    assert!(!server_assigned(dual_stack_log, "mesh-a", "fd78::20"));
     let Some(core) = core_or_skip("mesh IPv6/MASQUE config check") else {
         return;
     };
@@ -715,8 +735,12 @@ fn userspace_mesh_ipv6_and_masque_configs_check_with_bundled_core() {
             wg_config(true, true, free_udp_port(), Some(json!({"mode":"block"}))),
         ),
         (
-            "MASQUE H3",
-            masque_client_config(true, free_udp_port(), Some(json!({"mode":"block"}))),
+            "MASQUE H3 IPv4",
+            masque_client_config(true, false, free_udp_port(), Some(json!({"mode":"block"}))),
+        ),
+        (
+            "MASQUE H3 IPv6",
+            masque_client_config(true, true, free_udp_port(), Some(json!({"mode":"block"}))),
         ),
     ] {
         let temp = tempfile::tempdir().unwrap();
@@ -725,25 +749,54 @@ fn userspace_mesh_ipv6_and_masque_configs_check_with_bundled_core() {
         let (ok, diag) = check(&core, &path);
         assert!(ok, "{name} generated config rejected: {diag}");
     }
-    let temp = tempfile::tempdir().unwrap();
-    let path = write_config(&temp, &masque_server_config(free_udp_port()));
-    let (ok, diag) = check(&core, &path);
-    assert!(ok, "MASQUE loopback server config rejected: {diag}");
+    for ipv6 in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_config(&temp, &masque_server_config(free_udp_port(), ipv6));
+        let (ok, diag) = check(&core, &path);
+        assert!(
+            ok,
+            "MASQUE loopback server IPv6={ipv6} config rejected: {diag}"
+        );
+    }
 }
 
 #[test]
 fn userspace_masque_h3_ingress_enforces_real_tcp_udp_and_cached_dns() {
-    if !kernel_run_or_skip("mesh MASQUE H3 inbound TCP/UDP/DNS runtime") {
+    if !kernel_run_or_skip("mesh MASQUE H3 IPv4/IPv6 inbound TCP/UDP/DNS runtime") {
         return;
     }
-    let Some(core) = core_or_skip("mesh MASQUE H3 inbound TCP/UDP/DNS runtime") else {
+    let Some(core) = core_or_skip("mesh MASQUE H3 IPv4/IPv6 inbound TCP/UDP/DNS runtime") else {
         return;
     };
-    let a_tcp = Listener::tcp();
-    let a_denied_tcp = Listener::tcp();
-    let a_udp = Listener::udp(false);
-    let b_tcp = Listener::tcp();
-    let b_udp = Listener::udp(false);
+    for ipv6 in [false, true] {
+        masque_family(&core, ipv6);
+    }
+}
+
+fn masque_family(core: &Path, ipv6: bool) {
+    let (a_ip, b_ip, source, wrong_source, wide_target) = if ipv6 {
+        (
+            MASQUE_A_IP6,
+            MASQUE_B_IP6,
+            "fd78::3/128",
+            "fd78::2/128",
+            "::/0",
+        )
+    } else {
+        (
+            MASQUE_A_IP,
+            MASQUE_B_IP,
+            "10.78.0.3/32",
+            "10.78.0.2/32",
+            "0.0.0.0/0",
+        )
+    };
+    let family = if ipv6 { "IPv6" } else { "IPv4" };
+    let a_tcp = Listener::tcp_on(ipv6);
+    let a_denied_tcp = Listener::tcp_on(ipv6);
+    let a_udp = Listener::udp_on(false, ipv6);
+    let b_tcp = Listener::tcp_on(ipv6);
+    let b_udp = Listener::udp_on(false, ipv6);
     let upstream = Listener::udp(true);
     let a_out_tcp = free_tcp_port();
     let a_out_udp = free_udp_port();
@@ -756,14 +809,14 @@ fn userspace_masque_h3_ingress_enforces_real_tcp_udp_and_cached_dns() {
         Probe {
             tag: "a-to-b-tcp",
             listen: a_out_tcp,
-            target: MASQUE_B_IP,
+            target: b_ip,
             port: b_tcp.port,
             udp: false,
         },
         Probe {
             tag: "a-to-b-udp",
             listen: a_out_udp,
-            target: MASQUE_B_IP,
+            target: b_ip,
             port: b_udp.port,
             udp: true,
         },
@@ -779,39 +832,35 @@ fn userspace_masque_h3_ingress_enforces_real_tcp_udp_and_cached_dns() {
         Probe {
             tag: "b-to-a-tcp",
             listen: b_in_tcp,
-            target: MASQUE_A_IP,
+            target: a_ip,
             port: a_tcp.port,
             udp: false,
         },
         Probe {
             tag: "b-to-a-denied",
             listen: b_in_denied_tcp,
-            target: MASQUE_A_IP,
+            target: a_ip,
             port: a_denied_tcp.port,
             udp: false,
         },
         Probe {
             tag: "b-to-a-udp",
             listen: b_in_udp,
-            target: MASQUE_A_IP,
+            target: a_ip,
             port: a_udp.port,
             udp: true,
         },
         Probe {
             tag: "b-to-a-dns",
             listen: b_in_dns,
-            target: MASQUE_A_IP,
+            target: a_ip,
             port: 53,
             udp: true,
         },
     ];
-    for (label, policy, should_allow) in policy_cases(
-        "10.78.0.3/32",
-        "10.78.0.2/32",
-        "0.0.0.0/0",
-        a_tcp.port,
-        a_udp.port,
-    ) {
+    for (label, policy, should_allow) in
+        policy_cases(source, wrong_source, wide_target, a_tcp.port, a_udp.port)
+    {
         let has_policy = policy.is_some();
         // 每轮独立 server 地址池。固定顺序仅用于此夹具，必须观测当轮实际分配；
         // MASQUE 没有按设备身份持久租约，不能从这里推导重连地址稳定。
@@ -819,72 +868,82 @@ fn userspace_masque_h3_ingress_enforces_real_tcp_udp_and_cached_dns() {
         let a_temp = tempfile::tempdir().unwrap();
         let b_temp = tempfile::tempdir().unwrap();
         let server_port = free_udp_port();
-        let server_path = write_config(&server_temp, &masque_server_config(server_port));
-        let mut server_core = run(&core, &server_path, &server_temp);
-        let a = runtime_config(
-            masque_client_config(true, server_port, policy),
+        let mut server = masque_server_config(server_port, ipv6);
+        if ipv6 {
+            server["log"]["level"] = json!("debug");
+        }
+        let server_path = write_config(&server_temp, &server);
+        let mut server_core = run(core, &server_path, &server_temp);
+        let mut a = runtime_config(
+            masque_client_config(true, ipv6, server_port, policy),
             &a_temp,
             None,
             &a_probes,
             Some(upstream.port),
         );
+        if ipv6 {
+            a["log"]["level"] = json!("debug");
+        }
         assert_eq!(a["endpoints"][0]["version"], 3);
         assert_eq!(a["endpoints"][0]["disable_version_fallback"], true);
         let a_path = write_config(&a_temp, &a);
-        let mut a_core = run(&core, &a_path, &a_temp);
+        let mut a_core = run(core, &a_path, &a_temp);
         assert!(
-            eventually(|| server_assigned(&server_core.log(), "mesh-a", MASQUE_A_IP)),
-            "{label}: A was not assigned the expected in-session address: {} / {}",
+            eventually(|| server_assigned(&server_core.log(), "mesh-a", a_ip)),
+            "{family}/{label}: A was not assigned the expected in-session address: {} / {}",
             server_core.log(),
             a_core.log()
         );
-        let b = runtime_config(
-            masque_client_config(false, server_port, None),
+        let mut b = runtime_config(
+            masque_client_config(false, ipv6, server_port, None),
             &b_temp,
             None,
             &b_probes,
             None,
         );
+        if ipv6 {
+            b["log"]["level"] = json!("debug");
+        }
         assert_eq!(b["endpoints"][0]["version"], 3);
         assert_eq!(b["endpoints"][0]["disable_version_fallback"], true);
         let b_path = write_config(&b_temp, &b);
-        let mut b_core = run(&core, &b_path, &b_temp);
+        let mut b_core = run(core, &b_path, &b_temp);
         assert!(
-            eventually(|| server_assigned(&server_core.log(), "mesh-b", MASQUE_B_IP)),
-            "{label}: B was not assigned the expected in-session address: {} / {}",
+            eventually(|| server_assigned(&server_core.log(), "mesh-b", b_ip)),
+            "{family}/{label}: B was not assigned the expected in-session address: {} / {}",
             server_core.log(),
             b_core.log()
         );
         // A→B 正向 TCP/UDP 每轮都成功；它们的回包同时证明 A 策略没有切断已建流。
         assert!(
             eventually(|| tcp(a_out_tcp)),
-            "{label}: A→B TCP unavailable: {} / {} / {}",
+            "{family}/{label}: A→B TCP unavailable: {} / {} / {}",
             server_core.log(),
             a_core.log(),
             b_core.log()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x48]) == Some(vec![0x48])),
-            "{label}: A→B UDP unavailable: {} / {} / {}",
+            "{family}/{label}: A→B UDP unavailable: {} / {} / {}",
             server_core.log(),
             a_core.log(),
             b_core.log()
         );
         assert!(
             b_tcp.count() > 0 && b_udp.count() > 0,
-            "{label}: forward MASQUE probes missed live services"
+            "{family}/{label}: forward MASQUE probes missed live services"
         );
         let before_tcp = a_tcp.count();
         let before_udp = a_udp.count();
         if should_allow {
             assert!(
                 eventually(|| tcp(b_in_tcp)),
-                "{label}: B→A TCP unavailable: {}",
+                "{family}/{label}: B→A TCP unavailable: {}",
                 a_core.log()
             );
             assert!(
                 eventually(|| udp(b_in_udp, &[0x55]) == Some(vec![0x55])),
-                "{label}: B→A UDP unavailable: {}",
+                "{family}/{label}: B→A UDP unavailable: {}",
                 a_core.log()
             );
             assert!(a_tcp.count() > before_tcp && a_udp.count() > before_udp);
@@ -892,38 +951,38 @@ fn userspace_masque_h3_ingress_enforces_real_tcp_udp_and_cached_dns() {
                 let denied_before = a_denied_tcp.count();
                 assert!(
                     !tcp(b_in_denied_tcp),
-                    "{label}: wrong TCP port returned service echo"
+                    "{family}/{label}: wrong TCP port returned service echo"
                 );
                 thread::sleep(Duration::from_millis(150));
                 assert_eq!(
                     a_denied_tcp.count(),
                     denied_before,
-                    "{label}: wrong TCP port reached listener"
+                    "{family}/{label}: wrong TCP port reached listener"
                 );
             }
             let upstream_before_warm = upstream.count();
             assert!(
                 eventually(|| udp(a_warm_dns, &dns_query()).is_some_and(|p| dns_answers(&p) > 0)),
-                "{label}: local DNS warmup failed: {}",
+                "{family}/{label}: local DNS warmup failed: {}",
                 a_core.log()
             );
             let upstream_before = upstream.count();
             assert!(
                 upstream_before > upstream_before_warm,
-                "{label}: warm DNS missed real upstream"
+                "{family}/{label}: warm DNS missed real upstream"
             );
             assert!(udp(a_warm_dns, &dns_query()).is_some_and(|p| dns_answers(&p) > 0));
             thread::sleep(Duration::from_millis(150));
             assert_eq!(
                 upstream.count(),
                 upstream_before,
-                "{label}: second local DNS query missed cache"
+                "{family}/{label}: second local DNS query missed cache"
             );
             let protected = udp(b_in_dns, &dns_query());
             if has_policy {
                 assert!(
                     protected.as_deref().is_none_or(|p| dns_answers(p) == 0),
-                    "{label}: protected endpoint returned cached DNS answer"
+                    "{family}/{label}: protected endpoint returned cached DNS answer"
                 );
             } else {
                 assert!(
@@ -936,48 +995,51 @@ fn userspace_masque_h3_ingress_enforces_real_tcp_udp_and_cached_dns() {
             assert_eq!(
                 upstream.count(),
                 upstream_before,
-                "{label}: protected DNS query reached upstream"
+                "{family}/{label}: protected DNS query reached upstream"
             );
         } else {
-            assert!(!tcp(b_in_tcp), "{label}: denied TCP returned service echo");
+            assert!(
+                !tcp(b_in_tcp),
+                "{family}/{label}: denied TCP returned service echo"
+            );
             assert_ne!(
                 udp(b_in_udp, &[0x55]),
                 Some(vec![0x55]),
-                "{label}: denied UDP returned service echo"
+                "{family}/{label}: denied UDP returned service echo"
             );
             thread::sleep(Duration::from_millis(150));
             assert_eq!(
                 a_tcp.count(),
                 before_tcp,
-                "{label}: denied TCP contacted listener"
+                "{family}/{label}: denied TCP contacted listener"
             );
             assert_eq!(
                 a_udp.count(),
                 before_udp,
-                "{label}: denied UDP contacted listener"
+                "{family}/{label}: denied UDP contacted listener"
             );
         }
         let before_forward_tcp = b_tcp.count();
         let before_forward_udp = b_udp.count();
         assert!(
             eventually(|| tcp(a_out_tcp)),
-            "{label}: A→B TCP died after MASQUE ingress checks: {} / {}",
+            "{family}/{label}: A→B TCP died after MASQUE ingress checks: {} / {}",
             server_core.log(),
             a_core.log()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x49]) == Some(vec![0x49])),
-            "{label}: A→B UDP died after MASQUE ingress checks: {} / {}",
+            "{family}/{label}: A→B UDP died after MASQUE ingress checks: {} / {}",
             server_core.log(),
             a_core.log()
         );
         assert!(
             b_tcp.count() > before_forward_tcp && b_udp.count() > before_forward_udp,
-            "{label}: post-check MASQUE probes missed live services"
+            "{family}/{label}: post-check MASQUE probes missed live services"
         );
         a_core.assert_alive();
         b_core.assert_alive();
         server_core.assert_alive();
-        eprintln!("mesh runtime passed: MASQUE H3/{label}, A={MASQUE_A_IP}, B={MASQUE_B_IP}");
+        eprintln!("mesh runtime passed: MASQUE H3/{family}/{label}, A={a_ip}, B={b_ip}");
     }
 }

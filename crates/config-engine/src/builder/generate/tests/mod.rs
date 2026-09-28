@@ -806,6 +806,228 @@ fn mesh_policy_config() -> UserConfig {
     cfg
 }
 
+/// 无显式入站策略时，五种会由内核映射本机地址到 loopback 的 userspace endpoint
+/// 必须在完整生成产物中得到 *仅限该 inbound* 的双栈本机出口。
+#[test]
+fn legacy_userspace_mesh_local_mapping_is_inbound_scoped_and_independent_of_lan_bypass() {
+    use crate::user_config::protocol_settings::{
+        OpenconnectSettings, OpenvpnClientSettings, OpenvpnTlsSettings,
+    };
+    use crate::user_config::server_config::{TailscaleSettings, WireGuardSettings};
+
+    for protocol in [
+        Protocol::Wireguard,
+        Protocol::Tailscale,
+        Protocol::Openconnect,
+        Protocol::OpenvpnClient,
+        Protocol::MasqueClient,
+    ] {
+        for bypass_lan in [false, true] {
+            let mut cfg = base_config();
+            cfg.bypass_lan = Some(bypass_lan);
+            cfg.bypass_lan_list = Some(vec!["10.42.0.0/16".into()]);
+            let mut mesh = ServerConfig {
+                id: "mesh1".into(),
+                name: "Mesh".into(),
+                protocol,
+                address: "mesh.example.com".into(),
+                port: 443,
+                ..Default::default()
+            };
+            match protocol {
+                Protocol::Wireguard => {
+                    mesh.wireguard_settings = Some(Box::new(WireGuardSettings {
+                        private_key: Some("priv".into()),
+                        peer_public_key: Some("pub".into()),
+                        local_address: vec!["10.8.0.1/32".into()],
+                        ..Default::default()
+                    }));
+                }
+                Protocol::Tailscale => {
+                    mesh.tailscale_settings = Some(Box::new(TailscaleSettings::default()));
+                }
+                Protocol::Openconnect => {
+                    mesh.openconnect_settings = Some(Box::new(OpenconnectSettings {
+                        server: Some("mesh.example.com:443".into()),
+                        ..Default::default()
+                    }));
+                }
+                Protocol::OpenvpnClient => {
+                    mesh.openvpn_client_settings = Some(Box::new(OpenvpnClientSettings {
+                        server: Some("mesh.example.com".into()),
+                        server_port: Some(443),
+                        tls: Some(OpenvpnTlsSettings::default()),
+                        ..Default::default()
+                    }));
+                }
+                Protocol::MasqueClient => {}
+                _ => unreachable!(),
+            }
+            cfg.servers.push(mesh);
+            let output = serde_json::to_value(
+                generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap(),
+            )
+            .unwrap();
+            let endpoints = output["endpoints"].as_array().expect("emitted endpoints");
+            assert_eq!(endpoints.len(), 1, "{protocol:?}, bypass_lan={bypass_lan}");
+            let tag = endpoints[0]["tag"].as_str().unwrap();
+            let route = output["route"]["rules"].as_array().unwrap();
+            assert_eq!(route[0]["action"], "sniff");
+            let hijack = route
+                .iter()
+                .position(|rule| {
+                    rule["action"] == "hijack-dns" && rule["port"] == serde_json::json!([53])
+                })
+                .expect("generic DNS hijack must remain before legacy local route");
+            let local_index = route
+                .iter()
+                .position(|rule| rule["inbound"] == serde_json::json!([tag]))
+                .expect("legacy local fallback must be emitted for this endpoint");
+            assert!(
+                hijack < local_index,
+                "DNS hijack must precede local fallback"
+            );
+            let local = &route[local_index];
+            assert_eq!(local["inbound"], serde_json::json!([tag]));
+            assert_eq!(
+                local["ip_cidr"],
+                serde_json::json!(["127.0.0.1/32", "::1/128"])
+            );
+            assert_eq!(local["action"], "route");
+            assert_eq!(local["outbound"], "direct");
+            assert!(local.get("source_ip_cidr").is_none());
+            assert_eq!(
+                route
+                    .iter()
+                    .filter(|rule| rule["inbound"] == serde_json::json!([tag]))
+                    .count(),
+                1,
+                "{protocol:?}: local mapping must not turn into a broad fallback"
+            );
+            assert!(
+                output["dns"]["rules"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .all(|rule| rule["inbound"] != serde_json::json!([tag])),
+                "{protocol:?}: legacy DNS routing must remain unchanged"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_mesh_local_fallback_preserves_user_destination_reject_precedence() {
+    let mut cfg = mesh_policy_config();
+    cfg.custom_rules.push(Rule {
+        id: "deny-local-v6".into(),
+        type_field: RuleType::IpCidr,
+        values: vec!["::1/128".into()],
+        conditions: None,
+        combine_mode: None,
+        effects: None,
+        action: RuleAction::Block,
+        enabled: true,
+        bypass_fakeip: None,
+        target_server_id: None,
+        remarks: None,
+        tls_spoof: None,
+        tls_spoof_method: None,
+        network_profile_id: None,
+    });
+    let output = serde_json::to_value(
+        generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap(),
+    )
+    .unwrap();
+    let tag = output["endpoints"][0]["tag"].as_str().unwrap();
+    let route = output["route"]["rules"].as_array().unwrap();
+    let hijack = route
+        .iter()
+        .position(|rule| rule["action"] == "hijack-dns" && rule["port"] == serde_json::json!([53]))
+        .unwrap();
+    let deny = route
+        .iter()
+        .position(|rule| {
+            rule["action"] == "reject" && rule["ip_cidr"] == serde_json::json!(["::1/128"])
+        })
+        .expect("user ::1 reject must be generated");
+    let local = route
+        .iter()
+        .position(|rule| rule["inbound"] == serde_json::json!([tag]))
+        .expect("legacy endpoint fallback must be generated");
+    assert!(
+        hijack < deny && deny < local,
+        "DNS and user deny must win before fallback"
+    );
+    assert_eq!(
+        route[local]["ip_cidr"],
+        serde_json::json!(["127.0.0.1/32", "::1/128"])
+    );
+    assert_eq!(route[local]["outbound"], "direct");
+}
+
+#[test]
+fn legacy_mesh_local_mapping_is_absent_for_system_warp_and_unemitted_endpoints() {
+    // system 接口由 OS 承流，不可把它误判为 userspace 入站。
+    let mut system = mesh_policy_config();
+    system.proxy_mode_type = ProxyModeType::Tun;
+    system.servers[0]
+        .wireguard_settings
+        .as_mut()
+        .unwrap()
+        .reverse_mesh = Some(true);
+    let system = serde_json::to_value(
+        generate_sing_box_config(&system, &BTreeMap::new(), &deps_default()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(system["endpoints"][0]["system"], true);
+    let system_tag = system["endpoints"][0]["tag"].as_str().unwrap();
+    assert!(system["route"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|rule| { rule["inbound"] != serde_json::json!([system_tag]) }));
+
+    // WARP 虽同为 WG endpoint，却是全隧道出口，不是可反向访问的 mesh 节点。
+    let mut warp = mesh_policy_config();
+    warp.servers[0].address = "engage.cloudflareclient.com".into();
+    let warp = serde_json::to_value(
+        generate_sing_box_config(&warp, &BTreeMap::new(), &deps_default()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(warp["endpoints"][0]["type"], "wireguard");
+    let warp_tag = warp["endpoints"][0]["tag"].as_str().unwrap();
+    assert!(warp["route"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|rule| { rule["inbound"] != serde_json::json!([warp_tag]) }));
+
+    // MASQUE path 非法时节点被剪枝，不能为未发射 tag 留下孤儿直连规则。
+    let mut invalid = base_config();
+    invalid.servers.push(ServerConfig {
+        id: "mq1".into(),
+        name: "MQ".into(),
+        protocol: Protocol::MasqueClient,
+        address: "mq.example.com".into(),
+        port: 443,
+        masque_client_settings: Some(Box::new(
+            serde_json::from_value(serde_json::json!({"path":"invalid"})).unwrap(),
+        )),
+        ..Default::default()
+    });
+    let invalid = serde_json::to_value(
+        generate_sing_box_config(&invalid, &BTreeMap::new(), &deps_default()).unwrap(),
+    )
+    .unwrap();
+    assert!(invalid["endpoints"].is_null());
+    assert!(invalid["route"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|rule| { rule["inbound"] != serde_json::json!(["MQ"]) }));
+}
+
 #[test]
 fn mesh_policy_heads_generated_route_and_dns_with_scope_separation() {
     use crate::user_config::server_config::MeshInboundPolicy;
@@ -851,6 +1073,14 @@ fn mesh_policy_heads_generated_route_and_dns_with_scope_separation() {
     assert_eq!(route[2]["ip_cidr"][0], "0.0.0.0/0");
     assert_eq!(route[3]["action"], "reject");
     assert!(route[3].get("ip_cidr").is_none());
+    assert_eq!(
+        route
+            .iter()
+            .filter(|rule| rule["inbound"] == serde_json::json!([tag]))
+            .count(),
+        4,
+        "显式 allowlist 不得额外落入无 source/port 的 legacy 回环放行"
+    );
     assert_eq!(output["dns"]["rules"][0]["inbound"][0], tag);
     assert_eq!(output["dns"]["rules"][0]["action"], "reject");
     assert_eq!(output["dns"]["rules"][0]["method"], "default");
@@ -863,6 +1093,17 @@ fn mesh_policy_heads_generated_route_and_dns_with_scope_separation() {
     .unwrap();
     assert_eq!(blocked["route"]["rules"][0]["action"], "reject");
     assert!(blocked["route"]["rules"][0].get("ip_cidr").is_none());
+    let blocked_tag = blocked["endpoints"][0]["tag"].as_str().unwrap();
+    assert_eq!(
+        blocked["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rule| rule["inbound"] == serde_json::json!([blocked_tag]))
+            .count(),
+        1,
+        "显式 block 后不得再有 legacy 回环放行"
+    );
 }
 
 #[test]
