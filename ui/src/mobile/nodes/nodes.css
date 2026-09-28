@@ -472,9 +472,8 @@
 /* 整行即主动作（批选态 = 勾选，否则 = 设为出口）。 */
 .mn-row-main {
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: var(--sp-1);
+  align-items: center;
+  gap: var(--sp-2);
   flex: 1 1 auto;
   min-width: 0;
   min-height: var(--tap-min);
@@ -496,9 +495,25 @@
 
 .mn-row-head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.mn-row-copy {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+/* Expanded mode used to align pills in their own grid cell. They now share the
+   node's copy column, so keep them under the name at every width. */
+.mn-row-copy > .mn-pills {
+  justify-content: flex-start;
+}
+
+.mn-row-copy > .mn-note {
+  display: block;
 }
 
 .mn-name {
@@ -522,10 +537,25 @@
  * 颜色角色逐条对齐桌面 `.nd-top .nd-lat.*`（screens.css:135-139）。
  */
 .mn-lat {
-  flex: none;
+  flex: 0 1 20%;
+  min-width: 0;
   color: hsl(var(--fg-dim));
   font-family: var(--mono);
   font-size: 0.75rem;
+  line-height: 1.4;
+  overflow-wrap: break-word;
+  text-align: end;
+}
+
+.mn-lat[data-numeric] {
+  flex: none;
+  white-space: nowrap;
+}
+
+.mn-lat:not([data-numeric]) {
+  min-width: 5.5em;
+  font-family: var(--sans);
+  letter-spacing: -0.025em;
 }
 
 .mn-lat.fast {

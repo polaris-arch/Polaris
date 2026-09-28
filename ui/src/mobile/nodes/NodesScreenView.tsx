@@ -265,6 +265,7 @@ function NodeRow({
                等于用颜色把刚才那句话收回去。 */
             { text: t('nodes.mobileLatencyStale'), level: 'none' }
           : { text: `${row.latencyMs} ms`, level: latLevel(row.latencyMs) };
+  const numericLatency = row.speedTestable && typeof row.latencyMs === 'number' && !row.latencyStale;
   const explanations = nodeExplanationSections(row, t);
   const hasMeshRoute = row.meshRouteReport !== undefined;
 
@@ -282,28 +283,30 @@ function NodeRow({
         aria-current={!batchMode && row.isCurrent ? 'true' : undefined}
         onClick={() => (batchMode ? onToggleSelect(row) : onUseAsExit(row))}
       >
-        <span className="mn-row-head">
-          <span className={`mn-name${row.invalidReason !== undefined ? ' invalid' : ''}`}>
-            {row.server.name}
+        <span className="mn-row-copy">
+          <span className="mn-row-head">
+            <span className={`mn-name${row.invalidReason !== undefined ? ' invalid' : ''}`}>
+              {row.server.name}
+            </span>
           </span>
-          {lat.text !== '' && <span className={`mn-lat ${lat.level}`}>{lat.text}</span>}
+          <span className="mn-pills">
+            <span className="mn-pill proto">{row.protocolLabel}</span>
+            {row.transport !== '' && <span className="mn-xfer">{row.transport}</span>}
+            {row.isCurrent && <span className="mn-pill cur">{t('nodes.selectedChoice')}</span>}
+            {row.isExit && !row.isCurrent && (
+              <span className="mn-pill exit">{t('nodes.exitCapableBadge')}</span>
+            )}
+            {row.lanOnly && <span className="mn-pill warn">{t('nodes.lanOnly')}</span>}
+            {row.stagedOnly && <span className="mn-pill warn">{t('mobileHelp.stagedNode')}</span>}
+          </span>
+          {hasMeshRoute && <span className="mn-route-summary">{t(meshRouteSummaryKey(
+            row.meshRouteReport ?? null, row.server.id, row.meshRoutePrevious, row.meshRouteLegacy,
+            row.meshRouteContextMismatch,
+          ))}</span>}
+          {/* Invalid configuration remains directly visible and actionable, rather than hidden in help. */}
+          {row.invalidReason !== undefined && <span className="mn-note">{row.invalidReason}</span>}
         </span>
-        <span className="mn-pills">
-          <span className="mn-pill proto">{row.protocolLabel}</span>
-          {row.transport !== '' && <span className="mn-xfer">{row.transport}</span>}
-          {row.isCurrent && <span className="mn-pill cur">{t('nodes.selectedChoice')}</span>}
-          {row.isExit && !row.isCurrent && (
-            <span className="mn-pill exit">{t('nodes.exitCapableBadge')}</span>
-          )}
-          {row.lanOnly && <span className="mn-pill warn">{t('nodes.lanOnly')}</span>}
-          {row.stagedOnly && <span className="mn-pill warn">{t('mobileHelp.stagedNode')}</span>}
-        </span>
-        {hasMeshRoute && <span className="mn-route-summary">{t(meshRouteSummaryKey(
-          row.meshRouteReport ?? null, row.server.id, row.meshRoutePrevious, row.meshRouteLegacy,
-          row.meshRouteContextMismatch,
-        ))}</span>}
-        {/* Invalid configuration remains directly visible and actionable, rather than hidden in help. */}
-        {row.invalidReason !== undefined && <p className="mn-note">{row.invalidReason}</p>}
+        {lat.text !== '' && <span className={`mn-lat ${lat.level}`} data-numeric={numericLatency ? '' : undefined}>{lat.text}</span>}
       </button>
       {/* Both secondary controls are outside the exit-selection button. Opening help never selects a node. */}
       {(explanations.length > 0 || hasMeshRoute || !batchMode) && <span className="mn-row-actions">
