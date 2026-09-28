@@ -524,6 +524,9 @@ export function ImportDialog({ instanceId, onAdded }: { instanceId: string; onAd
               ))}
             </ul>
           )}
+          {preview.nodes.some((node) => node.protocol === 'tailscale') && (
+            <p className="imp-warn">{t('import.tailscaleJoinHint')}</p>
+          )}
 
           <div className="card-sub" style={{ marginBottom: 5 }}>
             {t('import.nodesTitle')}

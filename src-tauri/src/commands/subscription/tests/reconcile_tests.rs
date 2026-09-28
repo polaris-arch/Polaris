@@ -2,6 +2,180 @@ use super::super::*;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 
 #[test]
+fn tailscale_source_identity_preserves_local_authorization_only_on_exact_control_match() {
+    let old = json!({
+        "id":"old-state-id", "name":"Locally renamed", "protocol":"tailscale",
+        "subscriptionId":"sub", "providerName":"provider-a", "createdAt":"before",
+        "tailscaleSettings":{
+            "sourceTag":"source-tag", "controlUrl":"https://head.example.com/",
+            "authKey":"tskey-local-secret", "sshServer":true,
+            "advertiseRoutes":["10.40.0.0/16"], "advertiseTags":["tag:router"],
+            "allowInternet":false, "alwaysRouteSubnets":false, "routes":["10.50.0.0/16"],
+            "reverseMesh":true, "resolveByName":true, "acceptDefaultResolvers":false,
+            "listenPort":12345, "relayServerPort":23456
+        },
+        "meshInboundPolicy":{"mode":"block"}
+    });
+    let incoming = |control: &str, id: &str| -> ServerConfig {
+        serde_json::from_value(json!({
+            "id":id, "name":"source-tag", "protocol":"tailscale", "subscriptionId":"sub",
+            "providerName":"provider-a", "tailscaleSettings":{
+                "sourceTag":"source-tag", "controlUrl":control, "exitNode":"remote-peer",
+                "hostname":"remote-host", "ephemeral":true
+            }
+        }))
+        .unwrap()
+    };
+    let mut cfg = json!({"servers":[old], "selectedServerId":"__direct__"});
+    let matching = incoming("https://head.example.com", "new-generated");
+    let typed = polaris_net_stack::subscription::server_fingerprint(&matching);
+    assert_eq!(
+        typed,
+        node_fingerprint(&cfg["servers"][0]),
+        "typed/JSON canonical URL and sourceTag identity"
+    );
+    reconcile_subscription_servers(&mut cfg, "sub", vec![matching], false, &[]);
+    let matched = &cfg["servers"][0];
+    assert_eq!(
+        matched["id"], "old-state-id",
+        "local display rename must not churn account state"
+    );
+    assert_eq!(
+        matched["tailscaleSettings"]["authKey"],
+        "tskey-local-secret"
+    );
+    assert_eq!(matched["tailscaleSettings"]["reverseMesh"], true);
+    assert_eq!(
+        matched["tailscaleSettings"]["advertiseTags"],
+        json!(["tag:router"])
+    );
+    assert_eq!(matched["tailscaleSettings"]["alwaysRouteSubnets"], false);
+    assert_eq!(
+        matched["tailscaleSettings"]["routes"],
+        json!(["10.50.0.0/16"])
+    );
+    assert_eq!(matched["tailscaleSettings"]["exitNode"], "remote-peer");
+    assert_eq!(matched["tailscaleSettings"]["hostname"], "remote-host");
+    assert_eq!(matched["meshInboundPolicy"]["mode"], "block");
+
+    reconcile_subscription_servers(
+        &mut cfg,
+        "sub",
+        vec![incoming("https://other.example.com", "new-control-id")],
+        false,
+        &[],
+    );
+    let changed = &cfg["servers"][0];
+    assert_eq!(changed["id"], "new-control-id");
+    assert!(changed["tailscaleSettings"].get("authKey").is_none());
+    assert!(changed.get("meshInboundPolicy").is_none());
+    assert!(changed["tailscaleSettings"].get("reverseMesh").is_none());
+    assert_eq!(
+        changed["tailscaleSettings"]["controlUrl"],
+        "https://other.example.com"
+    );
+}
+
+#[test]
+fn duplicate_old_tailscale_identity_never_selects_an_arbitrary_state_directory() {
+    let old = |id: &str| {
+        json!({"id":id,"name":"source","protocol":"tailscale",
+        "subscriptionId":"sub","tailscaleSettings":{"sourceTag":"source","authKey":"old-secret"}})
+    };
+    let mut cfg = json!({"servers":[old("a"),old("b")],"selectedServerId":"__direct__"});
+    let fresh: ServerConfig = serde_json::from_value(json!({"id":"fresh","name":"source",
+        "protocol":"tailscale","subscriptionId":"sub",
+        "tailscaleSettings":{"sourceTag":"source"}}))
+    .unwrap();
+    reconcile_subscription_servers(&mut cfg, "sub", vec![fresh], false, &[]);
+    assert_eq!(cfg["servers"][0]["id"], "fresh");
+    assert!(cfg["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+}
+
+#[test]
+fn local_tailscale_import_survives_real_config_store_save_load() {
+    use polaris_store::{ConfigStore, StdFs};
+    use std::path::PathBuf;
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp = TempDir(
+        std::env::temp_dir().join(format!("polaris-ts-import-{}-{suffix}", std::process::id())),
+    );
+    std::fs::create_dir_all(&temp.0).unwrap();
+    let path = temp.0.join("config.json");
+    let source = r#"{"endpoints":[
+        {"type":"tailscale","tag":"source-a","control_url":"https://a.example.com",
+         "auth_key":"tskey-local-a","state_directory":"/other/a"},
+        {"type":"tailscale","tag":"source-b","control_url":"https://b.example.com",
+         "auth_key":"tskey-local-b","taildrop_directory":"/other/b"}
+    ]}"#;
+    let mut seq = 0;
+    let parsed = polaris_net_stack::subscription::parse_subscription(
+        source,
+        "",
+        "now",
+        &mut || {
+            seq += 1;
+            format!("ts-{seq}")
+        },
+        polaris_net_stack::singbox_import::ImportOrigin::LocalFile,
+    );
+    assert_eq!(parsed.servers.len(), 2, "{:?}", parsed.warnings);
+    let mut config = polaris_store::default_config();
+    config["servers"] = serde_json::to_value(&parsed.servers).unwrap();
+    config["selectedServerId"] = json!("__direct__");
+    ConfigStore::save(&StdFs, &path, &config, "abcdef012345").unwrap();
+    let loaded = ConfigStore::load(&StdFs, &path);
+    assert!(
+        loaded.error.is_none() && loaded.loaded_from_disk,
+        "{:?}",
+        loaded.error
+    );
+    let nodes = loaded.config["servers"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_ne!(nodes[0]["id"], nodes[1]["id"]);
+    assert_eq!(nodes[0]["tailscaleSettings"]["sourceTag"], "source-a");
+    assert_eq!(nodes[1]["tailscaleSettings"]["sourceTag"], "source-b");
+    assert_eq!(nodes[0]["tailscaleSettings"]["authKey"], "tskey-local-a");
+    assert_eq!(nodes[1]["tailscaleSettings"]["authKey"], "tskey-local-b");
+    let typed: Vec<ServerConfig> =
+        serde_json::from_value(loaded.config["servers"].clone()).unwrap();
+    let first = polaris_config_engine::builder::endpoints::build_tailscale_endpoint(
+        &typed[0],
+        "ts-a",
+        "/managed/tailscale/ts-1",
+        "linux",
+        None,
+    );
+    let second = polaris_config_engine::builder::endpoints::build_tailscale_endpoint(
+        &typed[1],
+        "ts-b",
+        "/managed/tailscale/ts-2",
+        "linux",
+        None,
+    );
+    assert_eq!(
+        first.state_directory.as_deref(),
+        Some("/managed/tailscale/ts-1")
+    );
+    assert_eq!(
+        second.state_directory.as_deref(),
+        Some("/managed/tailscale/ts-2")
+    );
+    assert_ne!(first.state_directory, second.state_directory);
+}
+
+#[test]
 fn primary_fetch_retries_only_transient_transport_once() {
     use SubscriptionErrorKind as K;
 

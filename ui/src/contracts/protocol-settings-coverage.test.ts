@@ -356,6 +356,9 @@ const MESH_TARGETS = [
  */
 const EXEMPT: Record<string, Record<string, string>> = {
   TailscaleSettings: {
+    sourceTag:
+      '导入来源 tag 是订阅对账身份元数据，不是用户可编辑设置；TsSettingsDialog 经 buildTsSettings 的 base spread 保留，' +
+      '导入解析器写入该值，生成器不下发。显示名本地可改，来源身份仍稳定。',
     allowInternet:
       'Tailscale 的「是否允许作外网出口」两侧谓词都由 exitNode 派生，存量字段被明确忽略：' +
       'TS 侧 domain/endpoint-routes.ts 是 `!!exitNode`、Rust 侧 builder/endpoint_routes.rs 是 ' +
@@ -371,6 +374,10 @@ const EXEMPT: Record<string, Record<string, string>> = {
  * ⚠️ 理由串本身**不许再写字面行号**（`xx.rs:153`）——那正是 G2 拆掉的东西，锁 3 里有断言拦新增。
  */
 const EXEMPT_CITES: Record<string, readonly Cite[]> = {
+  'TailscaleSettings.sourceTag': [
+    { at: 'crates/net-stack/src/tailscale_import.rs', needle: 'source_tag: Some(source_tag.clone())' },
+    { at: 'ui/src/components/dialogs/ts-settings-logic.ts', needle: 'const next: TailscaleSettings = { ...(base ?? {}) };' },
+  ],
   'TailscaleSettings.allowInternet': [
     {
       at: 'ui/src/domain/endpoint-routes.ts',

@@ -1632,6 +1632,7 @@
     "parsing": "解析中…",
     "parsed": "已解析 {{nodes}} 个节点、{{subs}} 个订阅",
     "nodesTitle": "将导入节点",
+    "tailscaleJoinHint": "应用配置或启动代理后，导入的 Tailscale 节点会连接其控制面；如含授权密钥，将自动加入网络。原配置的登录状态和本机目录不会迁移。",
     "unsupportedBadge": "不支持",
     "unsupportedTip": "当前内核不支持此协议，导入后置灰，但可编辑 / 删除",
     "skippedTitle": "已跳过 {{count}} 项（协议不支持或解析失败）",

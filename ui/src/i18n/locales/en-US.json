@@ -1632,6 +1632,7 @@
     "parsing": "Parsing…",
     "parsed": "Parsed {{nodes}} node(s), {{subs}} subscription(s)",
     "nodesTitle": "Nodes to import",
+    "tailscaleJoinHint": "Applying the config or starting the proxy connects imported Tailscale nodes to their control servers; an included auth key automatically joins the network. Existing login state and local directories are not migrated.",
     "unsupportedBadge": "Unsupported",
     "unsupportedTip": "Protocol not supported by the current core; dimmed after import, but editable/deletable",
     "skippedTitle": "{{count}} item(s) skipped (unsupported protocol or parse error)",

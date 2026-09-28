@@ -209,7 +209,7 @@ fn parse_provider_text(
     id_gen: &mut impl FnMut() -> String,
 ) -> Result<ClashParseResult, ProviderFetchError> {
     let trimmed = text.trim();
-    let mut parsed = clash_parser::parse_clash_proxies(
+    let mut parsed = clash_parser::parse_clash_proxies_with_origin(
         &clash_parser::try_load_clash_doc(trimmed)
             .map_err(ProviderFetchError::transient)?
             .get(serde_yaml::Value::String("proxies".to_string()))
@@ -218,6 +218,7 @@ fn parse_provider_text(
         subscription_id,
         now,
         id_gen,
+        crate::singbox_import::ImportOrigin::RemoteSubscription,
     );
 
     if filter.is_some() || exclude_filter.is_some() {
@@ -269,8 +270,13 @@ pub fn parse_provider_request(
         .unwrap_or(serde_yaml::Value::Null);
     enforce_declared_nodes(&proxies, Some(request.limits))
         .map_err(ProviderFetchError::fatal_limit)?;
-    let mut parsed =
-        clash_parser::parse_clash_proxies(&proxies, &request.subscription_id, &request.now, id_gen);
+    let mut parsed = clash_parser::parse_clash_proxies_with_origin(
+        &proxies,
+        &request.subscription_id,
+        &request.now,
+        id_gen,
+        crate::singbox_import::ImportOrigin::RemoteSubscription,
+    );
     if request.filter.is_some() || request.exclude_filter.is_some() {
         let mut warns = Vec::new();
         parsed.servers = clash_parser::apply_provider_filters(
@@ -779,6 +785,20 @@ where
                     // 同一现象两套方向，保守的那套才对（误删不可逆，滞留可手删）。
                     out.any_failed = true;
                     out.failed_providers.push(name.clone());
+                    // A fully rejected provider still owes the user its bounded parser diagnostics
+                    // (e.g. the name of an unsupported Tailscale field). Keep the existing
+                    // merge-only deletion guard, and account for retained warning bytes.
+                    for warning in parsed.warnings.drain(..) {
+                        if let Err(error) = append_retained_warning(
+                            &mut out,
+                            &mut operation_output_metrics,
+                            warning,
+                            limits,
+                        ) {
+                            out.fatal_error = Some(error);
+                            return out;
+                        }
+                    }
                     failures.push(format!("{name}(0 节点，存量保留不作下架)"));
                     continue;
                 }

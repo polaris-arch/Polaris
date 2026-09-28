@@ -1632,6 +1632,7 @@
     "parsing": "解析中…",
     "parsed": "已解析 {{nodes}} 個節點、{{subs}} 個訂閱",
     "nodesTitle": "將匯入節點",
+    "tailscaleJoinHint": "套用設定或啟動代理後，匯入的 Tailscale 節點會連線至其控制面；若含授權金鑰，將自動加入網路。原設定的登入狀態和本機目錄不會遷移。",
     "unsupportedBadge": "不支援",
     "unsupportedTip": "目前核心不支援此協定，匯入後變灰，但可編輯 / 刪除",
     "skippedTitle": "已略過 {{count}} 項（協定不支援或解析失敗）",

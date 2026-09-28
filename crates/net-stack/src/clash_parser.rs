@@ -267,6 +267,7 @@ fn is_supported_clash_type(p: Protocol) -> bool {
             | Protocol::Hysteria2
             | Protocol::Hysteria
             | Protocol::Wireguard
+            | Protocol::Tailscale
             | Protocol::OpenvpnClient
             | Protocol::Tuic
             | Protocol::Anytls
@@ -285,6 +286,7 @@ fn normalize_clash_type(raw: &Value) -> Option<Protocol> {
         "hysteria2" | "hy2" => Protocol::Hysteria2,
         "hysteria" | "hy" => Protocol::Hysteria,
         "wireguard" | "wg" => Protocol::Wireguard,
+        "tailscale" => Protocol::Tailscale,
         "openvpn" => Protocol::OpenvpnClient,
         "socks5" | "socks" => Protocol::Socks,
         "http" | "https" => Protocol::Http,
@@ -1008,7 +1010,7 @@ fn apply_ss_plugin(
 #[derive(Debug)]
 enum NodeOutcome {
     // Box 缩小 enum 体积（ServerConfig ~2KB vs Skip/Fail 几十字节，clippy::large_enum_variant）。
-    Server(Box<ServerConfig>),
+    Server(Box<ServerConfig>, Vec<String>),
     Skip { reason: String },
     Fail { reason: String },
 }
@@ -1087,6 +1089,7 @@ fn map_node(
     subscription_id: &str,
     now: &str,
     id_gen: &mut impl FnMut() -> String,
+    origin: crate::singbox_import::ImportOrigin,
 ) -> NodeOutcome {
     let m = match raw_proxy {
         Value::Mapping(_) => raw_proxy,
@@ -1119,9 +1122,35 @@ fn map_node(
 
     if protocol == Protocol::Wireguard {
         return match wireguard_import::parse_wireguard_proxy(m, subscription_id, now, id_gen()) {
-            Ok(server) => NodeOutcome::Server(Box::new(server)),
+            Ok(server) => NodeOutcome::Server(Box::new(server), Vec::new()),
             Err(reason) if reason.contains("多 peer") => NodeOutcome::Skip { reason },
             Err(reason) => NodeOutcome::Fail { reason },
+        };
+    }
+
+    if protocol == Protocol::Tailscale {
+        return match crate::tailscale_import::parse_mihomo_tailscale(m, origin) {
+            Ok(imported) => NodeOutcome::Server(
+                Box::new(ServerConfig {
+                    id: id_gen(),
+                    name: imported.source_tag,
+                    protocol,
+                    subscription_id: Some(subscription_id.to_string()),
+                    created_at: Some(now.to_string()),
+                    updated_at: Some(now.to_string()),
+                    on_demand: imported.on_demand,
+                    bind_interface: imported.bind_interface,
+                    tailscale_settings: Some(Box::new(imported.settings)),
+                    ..Default::default()
+                }),
+                imported.warnings,
+            ),
+            Err(field) => NodeOutcome::Fail {
+                reason: format!(
+                    "Tailscale 字段 {field}：{}",
+                    crate::tailscale_import::rejection_reason(&field, origin)
+                ),
+            },
         };
     }
 
@@ -1543,7 +1572,7 @@ fn map_node(
             }
         }
 
-        Ok(NodeOutcome::Server(Box::new(config)))
+        Ok(NodeOutcome::Server(Box::new(config), Vec::new()))
     })();
 
     match result {
@@ -1585,6 +1614,22 @@ pub fn parse_clash_proxies(
     now: &str,
     id_gen: &mut impl FnMut() -> String,
 ) -> ClashParseResult {
+    parse_clash_proxies_with_origin(
+        proxies,
+        subscription_id,
+        now,
+        id_gen,
+        crate::singbox_import::ImportOrigin::RemoteSubscription,
+    )
+}
+
+pub fn parse_clash_proxies_with_origin(
+    proxies: &Value,
+    subscription_id: &str,
+    now: &str,
+    id_gen: &mut impl FnMut() -> String,
+    origin: crate::singbox_import::ImportOrigin,
+) -> ClashParseResult {
     let mut result = ClashParseResult::default();
     let seq = match proxies {
         Value::Sequence(s) => s,
@@ -1596,8 +1641,11 @@ pub fn parse_clash_proxies(
     let mut fail_reasons: Vec<String> = Vec::new();
 
     for proxy in seq {
-        match map_node(proxy, subscription_id, now, id_gen) {
-            NodeOutcome::Server(s) => result.servers.push(*s),
+        match map_node(proxy, subscription_id, now, id_gen, origin) {
+            NodeOutcome::Server(s, warnings) => {
+                result.servers.push(*s);
+                result.warnings.extend(warnings);
+            }
             NodeOutcome::Skip { reason } => {
                 result.skipped += 1;
                 *skip_by_reason.entry(reason).or_insert(0) += 1;

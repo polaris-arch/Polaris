@@ -24,4 +24,5 @@ pub mod singbox_import;
 pub mod ssrf;
 pub mod subscription;
 pub mod subscription_error;
+pub mod tailscale_import;
 pub mod xray_import;

@@ -368,7 +368,8 @@ fn parse_subscription_singbox_merges_outbounds_and_endpoints() {
           "endpoints":[
             {"type":"wireguard","tag":"WG","address":["10.0.0.2/32"],"private_key":"pk",
              "peers":[{"address":"1.2.3.4","port":51820,"public_key":"pub","allowed_ips":["10.0.0.0/24"]}]},
-            {"type":"tailscale","tag":"TS","auth_key":"tskey-auth-SECRET"}
+            {"type":"tailscale","tag":"TS-unsafe","auth_key":"tskey-auth-SECRET"},
+            {"type":"tailscale","tag":"TS-safe","control_url":"https://head.example.com","hostname":"portable"}
           ]
         }"#;
     let mut n = 0;
@@ -386,12 +387,21 @@ fn parse_subscription_singbox_merges_outbounds_and_endpoints() {
     let protos: Vec<Protocol> = r.servers.iter().map(|s| s.protocol).collect();
     assert_eq!(
         protos,
-        vec![Protocol::Trojan, Protocol::Wireguard],
-        "outbounds 的节点在前、endpoints 的在后；direct 忽略、tailscale 跳过"
+        vec![Protocol::Trojan, Protocol::Wireguard, Protocol::Tailscale],
+        "outbounds 的节点在前、endpoints 的在后；direct 忽略、安全 tailscale 接受"
     );
-    assert_eq!(r.skipped, 1, "tailscale endpoint");
-    assert_eq!(r.failed, 0);
-    assert!(r.warnings.iter().any(|w| w.contains("tailscale endpoint")));
+    assert_eq!(r.skipped, 0);
+    assert_eq!(r.failed, 1, "远端 auth_key 应按字段拒绝单节点");
+    let ts = r.servers[2].tailscale_settings.as_deref().unwrap();
+    assert_eq!(ts.source_tag.as_deref(), Some("TS-safe"));
+    assert_eq!(ts.control_url.as_deref(), Some("https://head.example.com"));
+    assert_eq!(ts.hostname.as_deref(), Some("portable"));
+    assert_eq!(r.servers[2].subscription_id.as_deref(), Some("sub-mix"));
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("auth_key") && w.contains("本机登录")));
+    assert!(r.warnings.iter().all(|w| !w.contains("tskey-auth-SECRET")));
 }
 
 #[test]

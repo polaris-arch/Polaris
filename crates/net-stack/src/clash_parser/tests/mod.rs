@@ -8,6 +8,54 @@ fn new_uuid() -> impl FnMut() -> String {
     }
 }
 
+#[test]
+fn mihomo_tailscale_requires_udp_and_preserves_local_path_warning() {
+    use crate::singbox_import::ImportOrigin;
+    let doc = try_load_clash_doc("proxies:\n  - name: TS\n    type: tailscale\n    udp: true\n    control-url: https://ctl.example.com\n    auth-key: tskey-secret\n    state-dir: /source/private\n").unwrap();
+    let proxies = doc.get("proxies").unwrap();
+    let local = parse_clash_proxies_with_origin(
+        proxies,
+        "sub",
+        "now",
+        &mut new_uuid(),
+        ImportOrigin::LocalFile,
+    );
+    assert_eq!(local.servers.len(), 1, "{:?}", local.warnings);
+    let ts = local.servers[0].tailscale_settings.as_deref().unwrap();
+    assert_eq!(ts.source_tag.as_deref(), Some("TS"));
+    assert_eq!(ts.auth_key.as_deref(), Some("tskey-secret"));
+    assert!(local.warnings.iter().any(|w| w.contains("state_directory")));
+    assert!(local
+        .warnings
+        .iter()
+        .all(|w| !w.contains("/source/private") && !w.contains("tskey-secret")));
+
+    let remote = parse_clash_proxies(proxies, "sub", "now", &mut new_uuid());
+    assert!(
+        remote.servers.is_empty(),
+        "old public API must default remote"
+    );
+    assert!(remote
+        .warnings
+        .iter()
+        .any(|w| w.contains("state_directory")));
+
+    let no_udp = try_load_clash_doc(
+        "proxies:\n  - {name: TS, type: tailscale, control-url: https://ctl.example.com}\n",
+    )
+    .unwrap();
+    let out = parse_clash_proxies_with_origin(
+        no_udp.get("proxies").unwrap(),
+        "sub",
+        "now",
+        &mut new_uuid(),
+        ImportOrigin::LocalFile,
+    );
+    assert!(out.servers.is_empty());
+    assert!(out.warnings.iter().any(|w| w.contains("udp")));
+    assert!(out.warnings.iter().any(|w| w.contains("仅支持显式")));
+}
+
 // ── 文档加载 ──────────────────────────────────────────────────────────────
 #[test]
 fn load_valid_clash_doc() {

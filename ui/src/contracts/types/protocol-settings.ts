@@ -286,6 +286,7 @@ export interface WireGuardSettings {
 
 // Tailscale（sing-box endpoint，账号制 mesh，无 server address/port——连控制面）。Phase 1 userspace。
 export interface TailscaleSettings {
+  sourceTag?: string; // 导入源 tag；本机显示名可修改，刷新对账仍使用原 tag
   authKey?: string; // pre-auth key（可选；无则核日志出 `Waiting for authentication: <url>` 交互登录）
   // 是否允许此节点作外网出口（缺省 true=向后兼容+新建默认开）。WG 等价物：true→可下发 exit_node（全隧道）；
   // false→即便填了 exitNode 也不下发，仅承载 tailnet/routes 段（不当默认出网）。

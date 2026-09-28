@@ -841,25 +841,150 @@ fn wireguard_multiple_peers_are_rejected_without_truncation() {
 }
 
 #[test]
-fn tailscale_endpoint_always_skipped_never_custom() {
-    for origin in [ImportOrigin::RemoteSubscription, ImportOrigin::LocalFile] {
-        let out = parse_eps(
-            json!({ "endpoints": [{
-                    "type": "tailscale", "tag": "TS", "auth_key": "tskey-auth-SECRET",
-                    "hostname": "victim", "control_url": "https://ctl.example.com"
-                }] }),
-            origin,
-        );
-        assert_eq!(out.servers.len(), 0, "{origin:?}：账号制凭据不导入");
+fn tailscale_local_auth_key_imports_but_remote_auth_key_is_rejected() {
+    let doc = json!({ "endpoints": [{
+        "type": "tailscale", "tag": "TS", "auth_key": "tskey-auth-SECRET",
+        "hostname": "victim", "control_url": "https://ctl.example.com"
+    }] });
+    let local = parse_eps(doc.clone(), ImportOrigin::LocalFile);
+    assert_eq!(local.servers.len(), 1);
+    assert_eq!(local.servers[0].protocol, Protocol::Tailscale);
+    assert_eq!(
+        local.servers[0]
+            .tailscale_settings
+            .as_ref()
+            .unwrap()
+            .auth_key
+            .as_deref(),
+        Some("tskey-auth-SECRET")
+    );
+    let remote = parse_eps(doc, ImportOrigin::RemoteSubscription);
+    assert!(remote.servers.is_empty());
+    assert_eq!(remote.failed, 1);
+    assert!(remote.warnings.iter().any(|w| w.contains("auth_key")));
+    assert!(remote.warnings.iter().any(|w| w.contains("本机登录")));
+    assert!(remote
+        .warnings
+        .iter()
+        .all(|w| !w.contains("tskey-auth-SECRET")));
+}
+
+#[test]
+fn tailscale_safe_remote_subset_and_local_managed_paths() {
+    let safe = json!({ "endpoints": [{
+        "type":"tailscale", "tag":"source-a", "control_url":"https://ctl.example.com/",
+        "hostname":"device-a", "ephemeral":true, "accept_routes":true,
+        "exit_node":"exit-a", "exit_node_allow_lan_access":true,
+        "on_demand":true, "ssh_server":{"enabled":false,"disable_pty":false}
+    }] });
+    let remote = parse_eps(safe, ImportOrigin::RemoteSubscription);
+    assert_eq!(remote.servers.len(), 1, "{:?}", remote.warnings);
+    let server = &remote.servers[0];
+    let ts = server.tailscale_settings.as_deref().unwrap();
+    assert_eq!(ts.source_tag.as_deref(), Some("source-a"));
+    assert_eq!(ts.control_url.as_deref(), Some("https://ctl.example.com/"));
+    assert_eq!(
+        ts.allow_internet, None,
+        "TS full-tunnel policy is derived from exit_node"
+    );
+    assert_eq!(ts.exit_node.as_deref(), Some("exit-a"));
+    assert_eq!(ts.accept_routes, Some(true));
+    assert_eq!(ts.ephemeral, Some(true));
+    assert_eq!(server.on_demand, Some(true));
+
+    let local = parse_eps(
+        json!({"endpoints":[{
+            "type":"tailscale", "tag":"local", "state_directory":"/other/state",
+            "taildrop_directory":"/other/drop", "system_interface":true,
+            "system_interface_name":"other-ts", "advertise_routes":["10.10.0.0/16"],
+            "ssh_server":{"enabled":true,"disable_forwarding":false}
+        }]}),
+        ImportOrigin::LocalFile,
+    );
+    assert_eq!(local.servers.len(), 1, "{:?}", local.warnings);
+    assert_eq!(
+        local.servers[0]
+            .tailscale_settings
+            .as_deref()
+            .unwrap()
+            .reverse_mesh,
+        Some(true)
+    );
+    assert_eq!(
+        local.servers[0]
+            .tailscale_settings
+            .as_deref()
+            .unwrap()
+            .ssh_server,
+        Some(true)
+    );
+    assert_eq!(local.warnings.len(), 3);
+    assert!(local.warnings.iter().all(|w| !w.contains("/other/")));
+}
+
+#[test]
+fn tailscale_rejects_unrepresentable_and_unsafe_fields_by_name_only() {
+    for (key, value, origin) in [
+        ("relay_server_port", json!(0), ImportOrigin::LocalFile),
+        (
+            "advertise_routes",
+            json!("10.0.0.0/8"),
+            ImportOrigin::LocalFile,
+        ),
+        (
+            "advertise_routes",
+            json!(["0.0.0.0/0"]),
+            ImportOrigin::LocalFile,
+        ),
+        (
+            "advertise_routes",
+            json!(["0:0:0:0:0:0:0:0/0"]),
+            ImportOrigin::LocalFile,
+        ),
+        ("advertise_routes", json!(["bad"]), ImportOrigin::LocalFile),
+        ("advertise_exit_node", json!(true), ImportOrigin::LocalFile),
+        ("exit_node", json!("auto:any"), ImportOrigin::LocalFile),
+        ("exit_node", json!("auto:other"), ImportOrigin::LocalFile),
+        (
+            "ssh_server",
+            json!({"enabled":true,"disable_sftp":true}),
+            ImportOrigin::LocalFile,
+        ),
+        ("detour", json!(false), ImportOrigin::LocalFile),
+        ("unknown_effect", json!(true), ImportOrigin::LocalFile),
+        (
+            "state_directory",
+            json!("/private/path"),
+            ImportOrigin::RemoteSubscription,
+        ),
+        (
+            "system_interface",
+            json!(true),
+            ImportOrigin::RemoteSubscription,
+        ),
+        ("ssh_server", json!(true), ImportOrigin::RemoteSubscription),
+    ] {
+        let mut ep = json!({"type":"tailscale", "tag":"safe"});
+        ep.as_object_mut().unwrap().insert(key.into(), value);
+        let out = parse_eps(json!({"endpoints":[ep]}), origin);
+        assert!(out.servers.is_empty(), "{key} {origin:?}");
+        assert_eq!(out.failed, 1, "{key} {origin:?}");
         assert!(
-            out.servers.iter().all(|s| s.protocol != Protocol::Custom),
-            "{origin:?}：也不得包成 custom（会绕过本机账号/状态目录授权）"
+            out.warnings.iter().any(|w| w.contains(key)),
+            "{key} {origin:?}"
         );
-        assert_eq!(out.skipped, 1);
-        assert!(out
-            .warnings
-            .iter()
-            .any(|w| w.contains("tailscale endpoint")));
+        assert!(out.warnings.iter().all(|w| !w.contains("/private/path")));
+        match key {
+            "relay_server_port" => assert!(out.warnings.iter().any(|w| w.contains("随机中继端口"))),
+            "exit_node" => assert!(out
+                .warnings
+                .iter()
+                .any(|w| w.contains("不支持自动选择出口"))),
+            "ssh_server" if origin == ImportOrigin::LocalFile => {
+                assert!(out.warnings.iter().any(|w| w.contains("细粒度限制")))
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1508,8 +1633,15 @@ fn generate_import(
 /// `POLARIS_REQUIRE_KERNEL_GATE=1` 下硬红（同 config-engine 真核门的定位器）。
 #[test]
 fn local_import_round_trips_through_the_bundled_core() {
-    let r = parse_doc(&masque_tailcat_doc(), ImportOrigin::LocalFile);
-    assert_eq!(r.servers.len(), 4);
+    let mut doc = masque_tailcat_doc();
+    doc["endpoints"].as_array_mut().unwrap().extend([
+        json!({"type":"tailscale", "tag":"TS-A", "control_url":"https://ctl-a.example.com",
+            "auth_key":"tskey-auth-fixture-a", "state_directory":"/source/ignored-a"}),
+        json!({"type":"tailscale", "tag":"TS-B", "control_url":"https://ctl-b.example.com",
+            "auth_key":"tskey-auth-fixture-b", "taildrop_directory":"/source/ignored-b"}),
+    ]);
+    let r = parse_doc(&doc, ImportOrigin::LocalFile);
+    assert_eq!(r.servers.len(), 6);
     let outcome = generate_local_import(&r.servers);
     assert!(
         outcome.invalid_nodes.is_empty(),
@@ -1517,6 +1649,7 @@ fn local_import_round_trips_through_the_bundled_core() {
         outcome.invalid_nodes
     );
     let cfg = serde_json::to_value(&outcome.config).unwrap();
+    assert!(cfg["route"]["default_domain_resolver"].is_string());
     let find = |arr: &str, ty: &str, key: &str, val: Value| -> Value {
         cfg[arr]
             .as_array()
@@ -1528,6 +1661,23 @@ fn local_import_round_trips_through_the_bundled_core() {
     };
     let mq3 = find("endpoints", "masque-client", "server_port", json!(18443));
     let mq2 = find("endpoints", "masque-client", "server_port", json!(18444));
+    let ts: Vec<&Value> = cfg["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|ep| ep["type"] == "tailscale")
+        .collect();
+    assert_eq!(ts.len(), 2, "两个本地 Tailscale endpoint 必须保留独立身份");
+    assert_ne!(ts[0]["state_directory"], ts[1]["state_directory"]);
+    for endpoint in &ts {
+        let dir = endpoint["state_directory"].as_str().unwrap();
+        assert!(dir.starts_with("/fake/userData/tailscale/"));
+        assert!(endpoint["taildrop_directory"]
+            .as_str()
+            .unwrap()
+            .starts_with(dir));
+        assert!(!dir.contains("/source/"), "源配置本机路径不得迁移");
+    }
     let tcr = find("outbounds", "tailcat", "derp_region", json!(900));
     let tcs = cfg["outbounds"]
         .as_array()
@@ -1569,6 +1719,9 @@ fn local_import_round_trips_through_the_bundled_core() {
         "log": { "disabled": true },
         "outbounds": cfg["outbounds"],
         "endpoints": cfg["endpoints"],
+        // Tailscale control_url is a domain dial. Production route always supplies this resolver;
+        // the earlier outbound-only test surface omitted it and was not a valid TS config.
+        "route": { "default_domain_resolver": cfg["route"]["default_domain_resolver"] },
     });
     if let Some(servers) = cfg.get("dns").and_then(|d| d.get("servers")) {
         surface["dns"] = json!({ "servers": servers });
@@ -1625,7 +1778,8 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
         {{"type":"masque-client","tag":"MQ","server":"mq.example","server_port":443,"path":"/","tls":{{"enabled":true,"certificate_sha256":["{PIN_HEX}"]}}}},
         {{"type":"openconnect","tag":"OC","server":"vpn.example:443","username":"u","password":"p","tcp_keep_alive":"1m","network_type":["wifi"],"dtls_local_port":4444,"form_entries":[{{"form_id":"login","name":"group","value":"office","promote":false}}],"token":{{"mode":"totp","secret":"JBSWY3DPEHPK3PXP"}}}},
         {{"type":"openvpn-client","tag":"OV","server":"ov.example","server_port":1194,"tls":{{"peer_fingerprint":"{PIN_HEX}"}},"mss_fix":1360,"explicit_exit_notify":1,"udp_timeout":60,"renegotiate_bytes":4294967296,"renegotiate_packets":4294967297,"fallback_network_type":["ethernet"],"static_challenge":"OTP","static_challenge_echo":false,"routes":["10.30.0.0/16"],"pull_filters":[{{"action":"ignore","text":"route-ipv6"}}]}},
-        {{"type":"openvpn-client","tag":"OV-STATIC","server":"192.0.2.1","server_port":1194,"mode":"static_key","address":"10.0.0.2/24","peer_address":"10.0.0.1","cipher":"AES-128-CBC","auth":"SHA256","static_key":["abcdef"]}}
+        {{"type":"openvpn-client","tag":"OV-STATIC","server":"192.0.2.1","server_port":1194,"mode":"static_key","address":"10.0.0.2/24","peer_address":"10.0.0.1","cipher":"AES-128-CBC","auth":"SHA256","static_key":["abcdef"]}},
+        {{"type":"tailscale","tag":"TS-JSON","control_url":"https://control.example.com","hostname":"ts-json","ephemeral":true,"accept_routes":true,"exit_node":"peer-exit"}}
     ]}}"#
     );
     let ca = polaris_source_probe::crate_file!("tests/fixtures/assets/openvpn-test-ca.txt");
@@ -1639,6 +1793,7 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
         port: 1194
         username: test-user
         ca: {}
+      - {{name: TS-MIHOMO, type: tailscale, udp: true, control-url: https://control.example.com, hostname: ts-mihomo, accept-routes: true}}
     "#,
         serde_json::to_string(&ca).unwrap()
     );
@@ -1660,7 +1815,7 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
         );
         servers.extend(parsed.servers);
     }
-    assert_eq!(servers.len(), 8, "生产订阅入口未接全八条协议映射");
+    assert_eq!(servers.len(), 10, "生产订阅入口未接全十条协议映射");
     let outcome = generate_remote_import(&servers, "sub-parity");
     assert!(
         outcome.invalid_nodes.is_empty(),
@@ -1668,6 +1823,7 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
         outcome.invalid_nodes
     );
     let cfg = serde_json::to_value(&outcome.config).unwrap();
+    assert!(cfg["route"]["default_domain_resolver"].is_string());
     let eps = cfg["endpoints"].as_array().unwrap();
     let outs = cfg["outbounds"].as_array().unwrap();
     for ty in [
@@ -1675,6 +1831,7 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
         "openconnect",
         "openvpn-client",
         "wireguard",
+        "tailscale",
     ] {
         assert!(eps.iter().any(|ep| ep["type"] == ty), "缺 {ty} endpoint");
     }
@@ -1691,6 +1848,16 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
             .count(),
         3
     );
+    let tailscale: Vec<&Value> = eps.iter().filter(|ep| ep["type"] == "tailscale").collect();
+    assert_eq!(tailscale.len(), 2);
+    assert_ne!(
+        tailscale[0]["state_directory"],
+        tailscale[1]["state_directory"]
+    );
+    assert!(
+        tailscale.iter().any(|ep| ep["exit_node"] == "peer-exit"),
+        "imported exit_node must reach emitted endpoint"
+    );
     let mq = eps.iter().find(|ep| ep["type"] == "masque-client").unwrap();
     assert_eq!(mq["tls"]["certificate_sha256"], json!([PIN_B64]));
     assert_eq!(
@@ -1705,7 +1872,8 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
     let dir = std::env::temp_dir().join(format!("polaris-import-parity-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("remote-import.json");
-    let mut surface = json!({"log":{"disabled":true},"outbounds":outs,"endpoints":eps});
+    let mut surface = json!({"log":{"disabled":true},"outbounds":outs,"endpoints":eps,
+        "route":{"default_domain_resolver":cfg["route"]["default_domain_resolver"]}});
     if let Some(servers) = cfg.get("dns").and_then(|dns| dns.get("servers")) {
         surface["dns"] = json!({"servers": servers});
     }

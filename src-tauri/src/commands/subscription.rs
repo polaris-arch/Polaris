@@ -935,6 +935,19 @@ fn node_fingerprint(v: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
+    if protocol == "tailscale" {
+        let ts = v.get("tailscaleSettings");
+        let source_tag = ts
+            .and_then(|s| s.get("sourceTag"))
+            .and_then(Value::as_str)
+            .or_else(|| v.get("name").and_then(Value::as_str))
+            .unwrap_or("");
+        return polaris_net_stack::subscription::tailscale_fingerprint(
+            v.get("providerName").and_then(Value::as_str),
+            source_tag,
+            ts.and_then(|s| s.get("controlUrl")).and_then(Value::as_str),
+        );
+    }
     let address = v.get("address").and_then(Value::as_str).unwrap_or("");
     let port = v.get("port").and_then(Value::as_u64).unwrap_or(0);
     let network = v
@@ -944,6 +957,46 @@ fn node_fingerprint(v: &Value) -> String {
         .to_ascii_lowercase();
     let cred = node_cred(v);
     format!("{protocol}|{address}|{port}|{cred}|{network}")
+}
+
+/// Only a matched Tailscale source can inherit local account authorization and runtime policy.
+/// The source tag and control URL remain fresh subscription data; changing either creates a new ID.
+fn preserve_tailscale_local_settings(new: &mut Value, old: &Value) {
+    if new.get("protocol").and_then(Value::as_str) != Some("tailscale") {
+        return;
+    }
+    const LOCAL_KEYS: &[&str] = &[
+        "authKey",
+        "allowInternet",
+        "alwaysRouteSubnets",
+        "routes",
+        "reverseMesh",
+        "resolveByName",
+        "acceptDefaultResolvers",
+        "advertiseRoutes",
+        "advertiseTags",
+        "sshServer",
+        "relayServerPort",
+        "listenPort",
+    ];
+    let Some(new_obj) = new.as_object_mut() else {
+        return;
+    };
+    if let Some(old_settings) = old.get("tailscaleSettings").and_then(Value::as_object) {
+        let settings = new_obj
+            .entry("tailscaleSettings")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(settings) = settings.as_object_mut() {
+            for key in LOCAL_KEYS {
+                if let Some(value) = old_settings.get(*key) {
+                    settings.insert((*key).into(), value.clone());
+                }
+            }
+        }
+    }
+    if let Some(value) = old.get("bindInterface") {
+        new_obj.insert("bindInterface".into(), value.clone());
+    }
 }
 
 /// 凭据落点（上游 `cred` 链）：uuid → password → shadowsocksSettings.password → username →
@@ -1108,7 +1161,16 @@ fn reconcile_subscription_servers(
     for mut nv in new_vals {
         let key = node_fingerprint(&nv);
         // 1:1 消费：pop 掉一个已匹配的旧节点，防第二个同指纹新节点复用同一 id。
-        let matched = existing_by_key.get_mut(&key).and_then(VecDeque::pop_front);
+        // An old duplicate TS identity is ambiguous: never guess which account state to reuse.
+        let matched = if key.starts_with("tailscale:")
+            && existing_by_key
+                .get(&key)
+                .is_some_and(|queue| queue.len() > 1)
+        {
+            None
+        } else {
+            existing_by_key.get_mut(&key).and_then(VecDeque::pop_front)
+        };
         if let Some(old) = matched {
             // 命中 → 保留稳定 id + 原 createdAt。
             if let Some(nobj) = nv.as_object_mut() {
@@ -1122,6 +1184,7 @@ fn reconcile_subscription_servers(
                     nobj.insert("meshInboundPolicy".to_string(), policy);
                 }
             }
+            preserve_tailscale_local_settings(&mut nv, &old);
             if !node_content_eq(&nv, &old) {
                 updated += 1;
             }

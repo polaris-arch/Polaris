@@ -98,6 +98,9 @@ fn aggregate_provider_output(
     inline.warnings.extend(providers.warnings);
     let mut merged = std::mem::take(&mut inline.servers);
     merged.extend(providers.servers);
+    let before_tailscale = merged.len();
+    polaris_net_stack::subscription::reject_ambiguous_tailscale(&mut merged, &mut inline.warnings);
+    inline.skipped += before_tailscale - merged.len();
     inline.servers = dedupe_by_fingerprint(merged);
     enforce_parse_output_budget_typed(&inline, limits)?;
     Ok(ProviderAggregation {

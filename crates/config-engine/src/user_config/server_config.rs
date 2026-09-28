@@ -212,6 +212,9 @@ pub struct WireGuardSettings {
 /// Tailscale 设置（上游 `TailscaleSettings`）。账号制 mesh，sing-box endpoint。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailscaleSettings {
+    /// Imported source tag, independent of the locally editable display name. Never sent to core.
+    #[serde(rename = "sourceTag", skip_serializing_if = "Option::is_none")]
+    pub source_tag: Option<String>,
     #[serde(rename = "authKey", skip_serializing_if = "Option::is_none")]
     pub auth_key: Option<String>,
     #[serde(rename = "allowInternet", skip_serializing_if = "Option::is_none")]

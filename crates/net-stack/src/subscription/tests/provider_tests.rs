@@ -28,6 +28,108 @@ fn clash_body(nodes: &[(&str, &str)]) -> String {
     format!("proxies:\n{proxies}")
 }
 
+#[tokio::test]
+async fn mihomo_tailscale_provider_uses_remote_origin_and_provider_namespace() {
+    let body = "proxies:\n  - {name: TS, type: tailscale, udp: true, control-url: https://ctl.example.com}\n";
+    let unsafe_body =
+        "proxies:\n  - {name: TS-secret, type: tailscale, udp: true, auth-key: tskey-secret}\n";
+    let fetch = mock_fetch(HashMap::from([
+        ("https://safe.example/sub".into(), Ok(body.into())),
+        ("https://unsafe.example/sub".into(), Ok(unsafe_body.into())),
+    ]));
+    let providers = providers_yaml("safe:\n  type: http\n  url: https://safe.example/sub\nunsafe:\n  type: http\n  url: https://unsafe.example/sub\n");
+    let result = resolve_proxy_providers(&providers, "sub", "now", 8, &fetch, &mut id_gen()).await;
+    assert_eq!(result.servers.len(), 1, "{:?}", result.warnings);
+    assert_eq!(result.servers[0].provider_name.as_deref(), Some("safe"));
+    assert_eq!(result.servers[0].protocol, Protocol::Tailscale);
+    assert!(
+        result.warnings.iter().any(|w| w.contains("auth_key")),
+        "{:?}",
+        result.warnings
+    );
+    assert!(result.warnings.iter().all(|w| !w.contains("tskey-secret")));
+    let inline = ServerConfig {
+        provider_name: None,
+        ..result.servers[0].clone()
+    };
+    assert_ne!(
+        server_fingerprint(&inline),
+        server_fingerprint(&result.servers[0])
+    );
+}
+
+#[test]
+fn duplicate_tailscale_source_identity_is_rejected_before_dedupe() {
+    let body = r#"{"endpoints":[
+        {"type":"tailscale","tag":"same","control_url":"https://ctl.example.com"},
+        {"type":"tailscale","tag":"same","control_url":"https://ctl.example.com/"}
+    ]}"#;
+    let parsed = parse_subscription(
+        body,
+        "sub",
+        "now",
+        &mut id_gen(),
+        ImportOrigin::RemoteSubscription,
+    );
+    assert!(parsed.servers.is_empty());
+    assert_eq!(parsed.skipped, 2);
+    assert!(parsed.warnings.iter().any(|w| w.contains("来源身份重复")));
+    assert!(parsed
+        .warnings
+        .iter()
+        .all(|w| !w.contains("https://ctl.example.com")));
+}
+
+#[test]
+fn mihomo_tailscale_json_encoding_uses_the_production_origin_gate() {
+    let text = r#"{"proxies":[{"name":"TS-JSON","type":"tailscale","udp":true,
+        "control-url":"https://ctl.example.com","hostname":"portable","ephemeral":true}]}"#;
+    let remote = parse_subscription(
+        text,
+        "sub",
+        "now",
+        &mut id_gen(),
+        ImportOrigin::RemoteSubscription,
+    );
+    assert_eq!(remote.servers.len(), 1, "{:?}", remote.warnings);
+    let ts = remote.servers[0].tailscale_settings.as_deref().unwrap();
+    assert_eq!(ts.source_tag.as_deref(), Some("TS-JSON"));
+    assert_eq!(ts.hostname.as_deref(), Some("portable"));
+    assert_eq!(ts.ephemeral, Some(true));
+
+    let with_auth = text.replace("\"hostname\"", "\"auth-key\":\"tskey-secret\",\"hostname\"");
+    let rejected = parse_subscription(
+        &with_auth,
+        "sub",
+        "now",
+        &mut id_gen(),
+        ImportOrigin::RemoteSubscription,
+    );
+    assert!(rejected.servers.is_empty());
+    assert!(rejected.warnings.iter().any(|w| w.contains("本机登录")));
+    assert!(rejected
+        .warnings
+        .iter()
+        .all(|w| !w.contains("tskey-secret")));
+    let local = parse_subscription(
+        &with_auth,
+        "",
+        "now",
+        &mut id_gen(),
+        ImportOrigin::LocalFile,
+    );
+    assert_eq!(local.servers.len(), 1, "{:?}", local.warnings);
+    assert_eq!(
+        local.servers[0]
+            .tailscale_settings
+            .as_deref()
+            .unwrap()
+            .auth_key
+            .as_deref(),
+        Some("tskey-secret")
+    );
+}
+
 /// mock fetch_text：url → `Ok(body)` / `Err(ProviderFetchError)`。
 /// 未登记的 URL 一律 **transient**（= 「没桩」不该被当成「远端确认没了」）。
 fn mock_fetch(

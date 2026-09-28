@@ -1010,7 +1010,13 @@ fn parse_subscription_bundle_inner(
                 .cloned();
             ParsedSubscriptionBundle {
                 format,
-                parsed: clash_parser::parse_clash_proxies(&proxies, subscription_id, now, id_gen),
+                parsed: clash_parser::parse_clash_proxies_with_origin(
+                    &proxies,
+                    subscription_id,
+                    now,
+                    id_gen,
+                    origin,
+                ),
                 proxy_providers,
                 output_metrics: None,
             }
@@ -1115,6 +1121,9 @@ fn parse_subscription_bundle_inner(
         },
     };
     let mut bundle = bundle;
+    let before_tailscale = bundle.parsed.servers.len();
+    reject_ambiguous_tailscale(&mut bundle.parsed.servers, &mut bundle.parsed.warnings);
+    bundle.parsed.skipped += before_tailscale - bundle.parsed.servers.len();
     // 在量体积之前剔：量的应是真正落盘的那份。
     polaris_config_engine::user_config::tls_pin::drop_unemitted_cert_pins(
         &mut bundle.parsed.servers,
@@ -1252,6 +1261,18 @@ pub use provider_resolver::{
 /// **与命令层 `node_fingerprint(&Value)` 是同一公式的两侧**（typed / json），由跨类型等价单测锁定同步。
 #[must_use]
 pub fn server_fingerprint(s: &ServerConfig) -> String {
+    if s.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale {
+        let source_tag = s
+            .tailscale_settings
+            .as_deref()
+            .and_then(|ts| ts.source_tag.as_deref())
+            .unwrap_or(&s.name);
+        let control_url = s
+            .tailscale_settings
+            .as_deref()
+            .and_then(|ts| ts.control_url.as_deref());
+        return tailscale_fingerprint(s.provider_name.as_deref(), source_tag, control_url);
+    }
     let protocol = serde_json::to_value(s.protocol)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -1286,6 +1307,49 @@ pub fn server_fingerprint(s: &ServerConfig) -> String {
         .unwrap_or_default();
     let network = s.network.as_deref().unwrap_or("tcp").to_ascii_lowercase();
     format!("{protocol}|{}|{}|{cred}|{network}", s.address, s.port)
+}
+
+/// Private reconciliation key; never place it in warnings/logs because a control URL can be private.
+/// A source tag is persisted separately so editing a node's display name cannot change its identity.
+#[must_use]
+pub fn tailscale_fingerprint(
+    provider: Option<&str>,
+    source_tag: &str,
+    control_url: Option<&str>,
+) -> String {
+    let raw = control_url
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or("https://controlplane.tailscale.com/");
+    let canonical = url::Url::parse(raw.trim())
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| raw.trim().to_string());
+    // JSON tuple framing avoids collisions between provider/tag/URL containing delimiters.
+    format!(
+        "tailscale:{}",
+        serde_json::to_string(&(provider, source_tag, canonical)).expect("string tuple serializes")
+    )
+}
+
+/// Ambiguous Tailscale source identities cannot safely inherit an existing state directory.
+/// Remove *all* conflicting nodes before the general first-seen dedupe step.
+pub fn reject_ambiguous_tailscale(servers: &mut Vec<ServerConfig>, warnings: &mut Vec<String>) {
+    let mut counts = std::collections::HashMap::new();
+    for server in servers.iter().filter(|s| {
+        s.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale
+    }) {
+        *counts.entry(server_fingerprint(server)).or_insert(0usize) += 1;
+    }
+    let before = servers.len();
+    servers.retain(|server| {
+        server.protocol != polaris_config_engine::user_config::server_config::Protocol::Tailscale
+            || counts.get(&server_fingerprint(server)) == Some(&1)
+    });
+    let rejected = before - servers.len();
+    if rejected > 0 {
+        warnings.push(format!(
+            "{rejected} 个 Tailscale 节点来源身份重复，均已跳过；请给每个来源使用唯一 tag 和控制面"
+        ));
+    }
 }
 
 /// `Option<String>` 里的空串归 `None`（对齐 上游 `x || ...` 的 falsy 空串语义）。

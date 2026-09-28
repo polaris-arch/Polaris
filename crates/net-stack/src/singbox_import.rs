@@ -927,7 +927,7 @@ pub fn parse_singbox_outbounds(
 /// # 分流
 ///
 /// - `wireguard` → [`Protocol::Wireguard`] 建模映射（见 `map_wireguard_endpoint`）。
-/// - `tailscale` → **恒 skipped**（不建模、也不透传 custom），原因见函数体内该 match 臂的注释。
+/// - `tailscale` → 严格映射可表达字段；本机路径不搬迁，远端仅接受无本机授权的安全子集。
 /// - `masque-client` / `openconnect` / `openvpn-client` → 建模映射；远端逐字段筛选本地依赖。
 /// - 其余类型 → 按 `origin` 走 custom 逃生舱（`isEndpoint = true`）/ skipped，
 ///   与 [`parse_singbox_outbounds`] 同一条信任级判据。
@@ -945,7 +945,6 @@ pub fn parse_singbox_endpoints(
 
     let mut skip_by_type: Vec<(String, usize)> = Vec::new();
     let mut unsafe_rejections = Vec::new();
-    let mut tailscale_skipped = 0usize;
     let mut missing_fields = 0usize;
     let mut multi_peer_skipped = 0usize;
     let mut multi_remote_skipped = 0usize;
@@ -1013,18 +1012,32 @@ pub fn parse_singbox_endpoints(
                     r.failed += 1;
                 }
             },
-            // ── tailscale endpoint 恒不导入（账号授权须由本机发起）─────────────────────────
-            // 1. **账号加入须明确授权**：`auth_key` 会让本机加入对应 tailnet；目前导入流程没有
-            //    提供账号加入确认或本机状态初始化。即使文件来自用户本人，也不能仅凭节点列表代做此事。
-            // 2. **状态目录不可移植**：`state_directory` 由 Polaris 生成时注入本机路径
-            //    （`builder/endpoints.rs` 的 `build_tailscale_endpoint`），文件里那份对本机无意义。
-            // 3. **实测无内容可导**：`{"type":"tailscale","tag":"x"}`（零字段）`sing-box check`
-            //    rc=0 —— 没有任何必填的、可移植的、非凭据字段。
-            // **也不走 custom 逃生舱**：这会绕过本机账号与状态目录的授权流程。
-            "tailscale" => {
-                tailscale_skipped += 1;
-                r.skipped += 1;
-            }
+            "tailscale" => match crate::tailscale_import::parse_singbox_tailscale(ep, origin) {
+                Ok(imported) => {
+                    let mut server = new_server(
+                        id_gen,
+                        ep,
+                        Protocol::Tailscale,
+                        String::new(),
+                        0,
+                        sub_id,
+                        now,
+                    );
+                    server.name = imported.source_tag;
+                    server.on_demand = imported.on_demand;
+                    server.bind_interface = imported.bind_interface;
+                    server.tailscale_settings = Some(Box::new(imported.settings));
+                    r.warnings.extend(imported.warnings);
+                    r.servers.push(server);
+                }
+                Err(field) => {
+                    r.failed += 1;
+                    r.warnings.push(format!(
+                        "Tailscale endpoint 字段 {field}：{}，已跳过",
+                        crate::tailscale_import::rejection_reason(&field, origin)
+                    ));
+                }
+            },
             // ── 端点族 VPN 客户端（2026-08-11）──
             // 它们的凭据用于本机主动连远端服务器，故可按远端字段安全策略导入。
             // 未建模的键原样进透传袋 —— 表单是精选子集（openconnect 61 键 / openvpn 78 键，
@@ -1078,12 +1091,6 @@ pub fn parse_singbox_endpoints(
         r.warnings.push(format!(
             "远程订阅节点含本地依赖或不可安全转换的字段，已跳过: {}",
             unsafe_rejections.join(", ")
-        ));
-    }
-    if tailscale_skipped > 0 {
-        r.warnings.push(format!(
-            "跳过 {tailscale_skipped} 个 tailscale endpoint：账号加入与本机状态目录目前须经本机配置流程，\
-             导入流程尚未实现该授权和状态初始化"
         ));
     }
     if multi_peer_skipped > 0 {
