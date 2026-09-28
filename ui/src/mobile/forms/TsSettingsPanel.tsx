@@ -327,6 +327,11 @@ export function TsSettingsPanel({
                     else if (result.kind === 'stopFailed') setNotice({ tone: 'err', text: t('ts.logoutStopFailed') });
                     else setNotice({ tone: 'err', text: t(result.code === 'TAILSCALE_LOGOUT_MAIN_CORE'
                       ? 'ts.reasonMainCoreInUse' : 'nodes.meshTsLogoutFail') });
+                  } catch (error) {
+                    // Delegate or local-state failures are not one of the helper's structured outcomes.
+                    // Keep this form open and surface them instead of dropping an async confirmation rejection.
+                    console.error('[mobile-ts-settings] confirmed logout failed:', error);
+                    if (hasInstance(instanceId)) setNotice({ tone: 'err', text: t('nodes.meshTsLogoutFail') });
                   } finally {
                     if (hasInstance(instanceId)) setBusy(false);
                   }
