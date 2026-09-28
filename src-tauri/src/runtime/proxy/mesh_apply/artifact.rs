@@ -61,7 +61,7 @@ pub(crate) struct StagedArtifacts {
     pub durability: DurableWriteGuarantee,
 }
 
-fn validate_relative(path: &str) -> Result<(), ArtifactError> {
+pub(super) fn validate_relative(path: &str) -> Result<(), ArtifactError> {
     let safe_segment = |part: &str| {
         let device = part.split('.').next().unwrap_or("").to_ascii_uppercase();
         let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -100,7 +100,10 @@ fn artifact_file(path: &str, bytes: &[u8]) -> ArtifactFile {
     }
 }
 
-fn artifact_paths(data_dir: &Path, plan_id: &str) -> Result<(PathBuf, String), ArtifactError> {
+pub(super) fn artifact_paths(
+    data_dir: &Path,
+    plan_id: &str,
+) -> Result<(PathBuf, String), ArtifactError> {
     if !data_dir.is_absolute() || !safe_plan_id(plan_id) {
         return Err(ArtifactError::Invalid("invalid data directory or planId"));
     }
