@@ -157,7 +157,7 @@ const DATA_FIELDS: [&str; 20] = [
 /// 曾有第七项 `diagnosticCapture`（临时诊断态）。整条机制已删除，且旧配置里的残留在 `load` 的
 /// 迁移链里就被 [`crate::migrate::migrate_diagnostic_capture`] 清掉 ⇒ 走到备份这一层时该键已不存在，
 /// 再留一个排除位就是为一个不可能出现的键守门。**旧备份文件里带着它也无妨**：导入侧同样过迁移链。
-const EXCLUDED_FROM_BACKUP: [&str; 5] = [
+const EXCLUDED_FROM_BACKUP: [&str; 7] = [
     "clashApiSecret",      // clash_api 明文密钥，不跨机
     "privacyPassword",     // 隐私解锁密码（legacy 明文残留），绝不入备份
     "privacyPasswordHash", // 隐私解锁密码 salted hash，本机凭据，绝不入备份
@@ -166,6 +166,10 @@ const EXCLUDED_FROM_BACKUP: [&str; 5] = [
     // 白占 3 个槽位之一）；且它是「后端权威」字段（前端零写入权，见 `commands/config.rs`
     // 的 `BACKEND_AUTHORITATIVE_KEYS`），不该经备份这条前端全量提交路径被改写。
     "recentServerIds",
+    // S3a 尚无可导入的 meshRouting 类别：普通类别不得搬运策略或本机账本。
+    // 将来显式策略导出只取 policy 意图，仍永不导出本机 ledger/epoch。
+    "meshRoutePolicy",
+    "meshRouteState",
 ];
 
 /// 是否通用设置键（排除法）。上游 `isGeneralKey`。

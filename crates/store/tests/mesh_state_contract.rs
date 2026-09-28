@@ -1,0 +1,169 @@
+use polaris_config_engine::user_config::mesh_route_state::{MeshRoutePolicy, MeshRouteState};
+use polaris_store::backup::{merge_categories, pick_categories, BackupCategory};
+use polaris_store::mesh_guard::{reconcile_untrusted, validate_raw, POLICY_KEY, STATE_KEY};
+use polaris_store::store::default_config;
+use polaris_store::{ConfigStore, StdFs};
+use serde_json::{json, Value};
+use tempfile::TempDir;
+
+fn fixture() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../ui/src/contracts/mesh-route-state.fixture.json"
+    ))
+    .unwrap()
+}
+
+fn managed_config() -> Value {
+    let mut config = default_config();
+    let wire = fixture();
+    config[POLICY_KEY] = wire[POLICY_KEY].clone();
+    config[STATE_KEY] = wire[STATE_KEY].clone();
+    config
+}
+
+#[test]
+fn shared_wire_fixture_is_strict_and_revision_is_decimal_string() {
+    let fixture = fixture();
+    let policy: MeshRoutePolicy = serde_json::from_value(fixture[POLICY_KEY].clone()).unwrap();
+    let state: MeshRouteState = serde_json::from_value(fixture[STATE_KEY].clone()).unwrap();
+    policy.validate().unwrap();
+    state.validate().unwrap();
+    assert_eq!(state.revision, "18446744073709551614");
+    assert_eq!(serde_json::to_value(state).unwrap(), fixture[STATE_KEY]);
+    assert_eq!(serde_json::to_value(policy).unwrap(), fixture[POLICY_KEY]);
+}
+
+#[test]
+fn managed_disk_load_preserves_policy_and_ledger_exactly() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.json");
+    let config = managed_config();
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let loaded = ConfigStore::load(&StdFs, &path);
+    assert!(loaded.protected_error.is_none());
+    assert_eq!(loaded.config[POLICY_KEY], config[POLICY_KEY]);
+    assert_eq!(loaded.config[STATE_KEY], config[STATE_KEY]);
+}
+
+#[test]
+fn invalid_or_incomplete_managed_disk_never_falls_back_to_writable_default() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("config.json");
+    for bad in [
+        {
+            let mut v = managed_config();
+            v.as_object_mut().unwrap().remove(STATE_KEY);
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[STATE_KEY]["schemaVersion"] = json!(2);
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[STATE_KEY]["revision"] = json!(9007199254740993u64);
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["unexpected"] = json!(true);
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["dnsPolicy"] = Value::Null;
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["dnsPolicy"] = json!({"schemaVersion":2,"suffixAssignments":[],"shortNamePolicy":{"kind":"system"},"serviceOwner":{"kind":"reject"}});
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[POLICY_KEY]["dnsPolicy"] = json!({"schemaVersion":1,"suffixAssignments":[],"shortNamePolicy":{"kind":"system"}});
+            v
+        },
+        {
+            let mut v = managed_config();
+            v[STATE_KEY]["identities"][0]["identityEpoch"] = json!("");
+            v
+        },
+    ] {
+        let bytes = serde_json::to_string(&bad).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let load = ConfigStore::load(&StdFs, &path);
+        assert!(
+            load.protected_error.is_some(),
+            "bad managed disk must block: {bad}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        assert!(ConfigStore::canonicalize_for_save(&bad).is_err());
+    }
+}
+
+#[test]
+fn old_frontend_snapshot_preserves_exact_ledger_but_forged_edit_is_rejected() {
+    let previous = managed_config();
+    let mut old_snapshot = default_config();
+    old_snapshot["mixedPort"] = json!(9000);
+    reconcile_untrusted(&previous, &mut old_snapshot).unwrap();
+    assert_eq!(old_snapshot[STATE_KEY], previous[STATE_KEY]);
+    assert_eq!(old_snapshot[POLICY_KEY], previous[POLICY_KEY]);
+    assert_eq!(old_snapshot["mixedPort"], json!(9000));
+
+    old_snapshot[STATE_KEY]["revision"] = json!("18446744073709551615");
+    assert!(reconcile_untrusted(&previous, &mut old_snapshot).is_err());
+    assert!(validate_raw(&default_config()).is_ok());
+    let mut forged = default_config();
+    forged[POLICY_KEY] = previous[POLICY_KEY].clone();
+    assert!(reconcile_untrusted(&default_config(), &mut forged).is_err());
+}
+
+#[test]
+fn old_policy_snapshot_cannot_implicitly_disable_managed_dns() {
+    let mut previous = managed_config();
+    previous[POLICY_KEY]["dnsPolicy"] = json!({
+        "schemaVersion": 1,
+        "suffixAssignments": [{
+            "suffix": "tail.example.invalid",
+            "target": {"kind": "reject"}
+        }],
+        "shortNamePolicy": {"kind": "system"},
+        "serviceOwner": {"kind": "reject"}
+    });
+    validate_raw(&previous).unwrap();
+
+    let mut omitted_parent = default_config();
+    reconcile_untrusted(&previous, &mut omitted_parent).unwrap();
+    assert_eq!(omitted_parent[POLICY_KEY], previous[POLICY_KEY]);
+
+    let mut old_parent = previous.clone();
+    old_parent[POLICY_KEY]
+        .as_object_mut()
+        .unwrap()
+        .remove("dnsPolicy");
+    assert!(reconcile_untrusted(&previous, &mut old_parent).is_err());
+    assert_eq!(
+        previous[POLICY_KEY]["dnsPolicy"]["suffixAssignments"][0]["target"]["kind"],
+        "reject"
+    );
+}
+
+#[test]
+fn legacy_backup_categories_never_export_or_import_mesh_evidence() {
+    let current = managed_config();
+    let selected = [BackupCategory::GeneralSettings, BackupCategory::MeshNodes];
+    let backup = pick_categories(&current, &selected);
+    assert!(backup.get(POLICY_KEY).is_none());
+    assert!(backup.get(STATE_KEY).is_none());
+
+    let mut foreign = backup;
+    foreign[POLICY_KEY] = current[POLICY_KEY].clone();
+    foreign[STATE_KEY] = current[STATE_KEY].clone();
+    foreign[STATE_KEY]["localId"] = json!("foreign-device");
+    let merged = merge_categories(&current, &foreign, &selected).config;
+    assert_eq!(merged[POLICY_KEY], current[POLICY_KEY]);
+    assert_eq!(merged[STATE_KEY], current[STATE_KEY]);
+}
