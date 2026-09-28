@@ -371,6 +371,8 @@ describe('② 真渲染：三张表的字段在移动端画得出来', () => {
     expect(warpAdvancedSpec([], 'ph', []).map((f) => f.k)).toContain('endpoint');
 
     const login = html(<TsLoginPanel instanceId="i2" />);
+    expect(login, 'TS 新建登录没有节点名称输入').toContain('id="mts-name"');
+    expect(login, '第一个 TS 节点未预填默认名').toContain('value="Tailscale"');
     expect(login, 'TS 登录少了方式分段').toContain(tr('ts.method'));
     expect(login, 'TS 登录少了浏览器登录那一支').toContain(tr('ts.browserLogin'));
     expect(login, 'TS 登录少了 Auth Key 那一支').toContain(tr('ts.authKey'));
@@ -389,6 +391,14 @@ describe('② 真渲染：三张表的字段在移动端画得出来', () => {
     );
     // 反向对照：同一次渲染里「取消」不该被置灰（否则上一条只证明了「有个 disabled 字样」）。
     expect(settings, '取消键被一起锁掉了').toMatch(/class="m-form-btn">/);
+  });
+
+  it('TS 新建名称按组网 TAB 中所有节点占用编号，切换账号回填目标名称', () => {
+    const existing = tsNode();
+    useAppStore.setState({ servers: [existing, wgNode({ name: 'tailscale 2' })] });
+    mirrorLiveStateIntoSsrSnapshot();
+    expect(html(<TsLoginPanel instanceId="i-new" />)).toContain('value="Tailscale 3"');
+    expect(html(<TsLoginPanel instanceId="i-existing" serverId={existing.id} />)).toContain('value="Tailscale"');
   });
 
   /**
@@ -553,6 +563,8 @@ describe('② 真渲染：三张表的字段在移动端画得出来', () => {
     mirrorLiveStateIntoSsrSnapshot();
     const tsEdit = html(<TsSettingsPanel instanceId="i3" serverId="ts-1" />);
     expect(tsEdit, '有 TS 节点却仍画空态 —— 面板没找到它').not.toContain(tr('ts.noNode'));
+    expect(tsEdit, 'TS 编辑设置没有节点名称输入').toContain('id="mts-settings-name"');
+    expect(tsEdit, 'TS 编辑设置没有回填现有名称').toContain('value="Tailscale"');
     expect(tsEdit, 'TS 设置表没回填主机名').toContain('value="sway-phone"');
     expect(tsEdit, '有节点时保存键仍被置灰').not.toMatch(/class="m-form-btn primary"[^>]*disabled/);
     /* 🔴 `authKey` 是登录腿写进去的凭据：整张表（不只是那一格）都不许回显它。

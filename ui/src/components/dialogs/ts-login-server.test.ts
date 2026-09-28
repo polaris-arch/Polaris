@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { planTsLoginSubmit, tsLoginMainCoreView, tsLoginFailureKey } from './ts-login-server';
+import { nextTsNodeName, planTsLoginSubmit, tsLoginMainCoreView, tsLoginFailureKey } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -29,6 +29,17 @@ function base(
 }
 
 describe('planTsLoginSubmit —— 新建路径', () => {
+  it('组网 TAB 中的默认名跳过已占用序号，大小写与首尾空格视为同名', () => {
+    expect(nextTsNodeName(['WireGuard', 'tailscale ', 'TAILSCALE 3'])).toBe('Tailscale 2');
+    expect(nextTsNodeName(['Tailscale', 'Tailscale 2'])).toBe('Tailscale 3');
+    expect(nextTsNodeName(['WireGuard'])).toBe('Tailscale');
+  });
+
+  it('手填名称只裁剪首尾空格，不自动改写', () => {
+    const { server } = planTsLoginSubmit(base({ name: '  办公室 TS  ' }));
+    expect(server.name).toBe('办公室 TS');
+  });
+
   it('无既有节点 → 带 mint 的真实 id，persist=add（绝不发空串 id）', () => {
     const { server, persist } = planTsLoginSubmit(base({ mode: 'browser' }));
     expect(server.id).toBe(MINTED);
@@ -50,6 +61,14 @@ describe('planTsLoginSubmit —— 新建路径', () => {
 });
 
 describe('planTsLoginSubmit —— 既有节点路径', () => {
+  it('只改名称也要更新，保留既有 id 和登录设置', () => {
+    const existing = tsNode({ name: 'Tailscale 2', tailscaleSettings: { sourceTag: 'mesh-a', authKey: 'old' } });
+    const { server, persist } = planTsLoginSubmit(base({ existing, name: '  办公室 TS  ', mode: 'authkey', authKey: 'old' }));
+    expect(persist).toBe('update');
+    expect(server).toMatchObject({ id: existing.id, name: '办公室 TS', tailscaleSettings: existing.tailscaleSettings });
+    expect(existing.name).toBe('Tailscale 2');
+  });
+
   it('browser 模式 → 复用既有 id，persist=none（不写盘、不触发 CONFIG_CHANGED）', () => {
     const { server, persist } = planTsLoginSubmit(base({ existing: tsNode(), mode: 'browser' }));
     expect(server.id).toBe('ts-existing');

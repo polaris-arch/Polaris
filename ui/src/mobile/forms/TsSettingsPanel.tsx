@@ -101,6 +101,8 @@ export function TsSettingsPanel({
     ...initTsDraft(node),
     bindInterface: node?.bindInterface ?? '',
   }));
+  const [name, setName] = useState(node?.name ?? '');
+  const [errName, setErrName] = useState(false);
   const [meshPolicy, setMeshPolicy] = useState<MeshInboundPolicy | undefined>(node?.meshInboundPolicy);
   const [meshPolicyError, setMeshPolicyError] = useState<string | null>(null);
   const [meshPolicyErrorVersion, setMeshPolicyErrorVersion] = useState(0);
@@ -185,6 +187,11 @@ export function TsSettingsPanel({
 
   const save = async (): Promise<void> => {
     if (node === undefined) return;
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setErrName(true);
+      return;
+    }
     const policy = normalizeMeshInboundPolicy(meshPolicy);
     const policyError = meshInboundPolicyError(policy, 'tailscale');
     setMeshPolicyError(policyError);
@@ -215,7 +222,7 @@ export function TsSettingsPanel({
     try {
       // detour 在顶层，`buildTsSettings` 够不着 —— 单独写回（哨兵 ⇒ 删键）。
       const next = applyDetour(
-        { ...node, tailscaleSettings: buildTsSettings(node.tailscaleSettings, draft) },
+        { ...node, name: trimmedName, tailscaleSettings: buildTsSettings(node.tailscaleSettings, draft) },
         draft.detour,
       );
       const bindInterface = String(draft.bindInterface ?? '').trim();
@@ -227,7 +234,7 @@ export function TsSettingsPanel({
         stage({
           id: `server:${node.id}`,
           kind: 'server',
-          label: `${t('ts.settingsTitle')} ${node.name}`,
+          label: `${t('ts.settingsTitle')} ${next.name}`,
           entityPath: ['servers', node.id],
           nextValue: next,
         });
@@ -362,6 +369,15 @@ export function TsSettingsPanel({
         <p className="m-form-hint">{t('ts.noNode')}</p>
       ) : (
         <>
+          <div className="m-form-row">
+            <label className="m-form-label" htmlFor="mts-settings-name">
+              {t('ts.nodeName')}<span className="m-form-req" aria-hidden>*</span>
+            </label>
+            <input id="mts-settings-name" className="m-form-input" value={name} disabled={busy}
+              onChange={(e) => { setName(e.target.value); setErrName(false); setDirty(true); }} />
+            {errName && <p className="m-form-err">{t('ts.errName')}</p>}
+          </div>
+
           {/* 核没跑 ⇒ 出口候选恒空，只剩「无 / 自定义…」。如实说明而不是留一个空下拉让人猜。 */}
           {connected === false && <p className="m-form-hint">{t('ts.exitEmptyHint')}</p>}
 

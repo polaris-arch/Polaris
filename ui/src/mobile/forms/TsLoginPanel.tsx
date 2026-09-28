@@ -10,6 +10,7 @@ import { api } from '@/ipc';
 import {
   TS_LOGIN_TIMEOUT_MS,
   executeTsLogin,
+  nextTsNodeName,
   planTsLoginSubmit,
   tsLoginMainCoreView,
   type TsLoginMode,
@@ -17,11 +18,12 @@ import {
 import type { ServerConfig } from '@/contracts/types';
 import type { TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
 import { controlUrlReject } from '@/domain/control-url';
+import { groupServersBySubscription } from '@/domain/server-grouping';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
 import { authorizeFromMainFrame, copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
 import { toast } from '@/lib/error-handler';
-import { useAppStore } from '@/store/app-store';
+import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
 import { FormSheet } from './FormSheet';
 import { useMobileFormStore } from './form-store';
@@ -40,6 +42,8 @@ export function TsLoginPanel({
   /* 落盘决策读**磁盘镜像**（同桌面）：`planTsLoginSubmit` 要回答的是「后端此刻按 id 找不找得到
      这个节点」，那一栏读 disk，不读 effective。 */
   const servers = useAppStore((s) => s.servers);
+  const visibleServers = useEffectiveServers();
+  const subscriptions = useEffectiveConfig((config) => config?.subscriptions);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const setTailscaleAuthUrl = useAppStore((s) => s.setTailscaleAuthUrl);
   const setTailscaleLoginInitiated = useAppStore((s) => s.setTailscaleLoginInitiated);
@@ -50,8 +54,13 @@ export function TsLoginPanel({
      （`meshSingletonConflict` 只剩 WARP 支），按协议取「任意一个」会把这次登录写进任意一个
      既有节点，正是 `node-edit-routing.ts` 记的那条缺陷。 */
   const existingTs = serverId ? servers.find((s) => s.id === serverId) : undefined;
+  const meshNames = groupServersBySubscription(visibleServers, subscriptions)
+    .find((group) => group.id === 'mesh')?.servers.map((server) => server.name) ?? [];
 
   const [savedServer, setSavedServer] = useState<ServerConfig>();
+  const [name, setName] = useState(() => existingTs?.name ?? nextTsNodeName(meshNames));
+  const [nameEdited, setNameEdited] = useState(false);
+  const [errName, setErrName] = useState(false);
   const [mode, setMode] = useState<TsLoginMode>('browser');
   const [authKey, setAuthKey] = useState('');
   const [errKey, setErrKey] = useState(false);
@@ -287,6 +296,13 @@ export function TsLoginPanel({
 
   const submit = async (): Promise<void> => {
     if (submitting) return;
+    const submissionBase = savedServer ?? existingTs;
+    const submittedName = !nameEdited && !submissionBase ? nextTsNodeName(meshNames) : name.trim();
+    if (!submittedName) {
+      setErrName(true);
+      return;
+    }
+    setName(submittedName);
     if (mode === 'authkey' && authKey.trim() === '') {
       setErrKey(true);
       return;
@@ -299,7 +315,6 @@ export function TsLoginPanel({
       return;
     }
     setErrControl(null);
-    const submissionBase = savedServer ?? existingTs;
     const submissionRevision = editRevisionRef.current;
     setSubmitting(true);
     setNotice(undefined);
@@ -309,7 +324,7 @@ export function TsLoginPanel({
       const { server, persist } = planTsLoginSubmit({
         // The fresh state query occurs after prepare and before save. This preview flag does
         // not decide logout; executeTsLogin consumes only the fresh result below.
-        existing: submissionBase, mode, authKey, controlUrl, hasState: false,
+        existing: submissionBase, name: submittedName, mode, authKey, controlUrl, hasState: false,
         mintId: () => crypto.randomUUID(),
       });
       persisted = persist === 'none';
@@ -356,7 +371,8 @@ export function TsLoginPanel({
           if (persist === 'none') return;
           await loadConfig(true);
           const mirrored = useAppStore.getState().servers.find((s) => s.id === server.id);
-          if (!mirrored || mirrored.tailscaleSettings?.controlUrl !== server.tailscaleSettings?.controlUrl
+          if (!mirrored || mirrored.name !== server.name
+            || mirrored.tailscaleSettings?.controlUrl !== server.tailscaleSettings?.controlUrl
             || mirrored.tailscaleSettings?.authKey !== server.tailscaleSettings?.authKey
             || mirrored.tailscaleSettings?.sourceTag !== server.tailscaleSettings?.sourceTag) {
             throw new Error('TS_CONFIG_REFRESH_FAILED');
@@ -429,6 +445,27 @@ export function TsLoginPanel({
       onSubmit={() => void submit()}
       notice={notice}
     >
+      <div className="m-form-row">
+        <label className="m-form-label" htmlFor="mts-name">
+          {t('ts.nodeName')}<span className="m-form-req" aria-hidden>*</span>
+        </label>
+        <input
+          id="mts-name"
+          className="m-form-input"
+          value={name}
+          disabled={submitting}
+          onChange={(e) => {
+            setName(e.target.value);
+            setNameEdited(true);
+            setErrName(false);
+            setDirty(true);
+            editedAfterSaveRef.current = true;
+            editRevisionRef.current++;
+          }}
+        />
+        {errName && <p className="m-form-err">{t('ts.errName')}</p>}
+      </div>
+
       <div className="m-form-row">
         <label className="m-form-label" htmlFor="mts-control-url">
           {t('ts.controlUrl')}
