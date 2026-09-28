@@ -251,23 +251,6 @@ fn map_rejected_code(code: Option<&str>) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod rejected_code_tests {
-    use crate::runtime::proxy::code;
-
-    #[test]
-    fn native_system_endpoint_guard_code_survives_the_bridge_whitelist() {
-        assert_eq!(
-            super::map_rejected_code(Some(code::SYSTEM_INTERFACE_UNSUPPORTED)),
-            code::SYSTEM_INTERFACE_UNSUPPORTED
-        );
-        assert_eq!(
-            super::map_rejected_code(Some("unrecognized")),
-            code::STARTUP_FAILED
-        );
-    }
-}
-
 #[cfg(target_os = "android")]
 mod handle {
     use std::sync::atomic::{AtomicBool, Ordering};

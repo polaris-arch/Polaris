@@ -1,5 +1,17 @@
 use super::*;
 
+#[test]
+fn native_system_endpoint_guard_code_survives_the_bridge_whitelist() {
+    assert_eq!(
+        map_rejected_code(Some(code::SYSTEM_INTERFACE_UNSUPPORTED)),
+        code::SYSTEM_INTERFACE_UNSUPPORTED
+    );
+    assert_eq!(
+        map_rejected_code(Some("unrecognized")),
+        code::STARTUP_FAILED
+    );
+}
+
 /// 🔴 **变异锁：非 Android 上三条腿都必须是「诚实失败 / fail-open」，绝不静默成功。**
 ///
 /// 变异：把 `start_core` 的非 Android 腿改成 `Ok(())` ⇒ 第一条断。这条腿看着不可达，
