@@ -24,8 +24,14 @@ import '/src/mobile/redesign.css';
 await i18nReady;
 i18n.addResourceBundle('zh-CN', 'translation', zhCN, true, true);
 await i18n.changeLanguage('zh-CN');
-const control = window.__backupRestoreTest = { calls: [], result: { success: true } };
+const control = window.__backupRestoreTest = {
+  calls: [], result: { success: true }, exportCalls: [], exportResult: { success: true },
+};
 api.systemBackup.getStatus = async () => false;
+api.backup.export = async (categories) => {
+  control.exportCalls.push(categories);
+  return control.exportResult;
+};
 api.backup.importPick = async () => ({ canceled: false, filePath: '/tmp/test.polaris',
   available: ['manualNodes', 'subscriptions'], counts: { manualNodes: 2, subscriptions: 3 } });
 api.backup.importApply = async (filePath, categories) => {
@@ -46,7 +52,7 @@ let server: ViteDevServer;
 let browser: Browser;
 let origin: string;
 
-describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile backup restore confirmation', () => {
+describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile backup feedback and restore confirmation', () => {
   beforeAll(async () => {
     server = await createServer({ root, cacheDir: path.join(tmpdir(), 'polaris-backup-restore-vite-' + process.pid),
       server: { host: '127.0.0.1', port: 0, watch: null }, plugins: [{
@@ -66,6 +72,33 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile backup restore
     browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
+
+  it('shows export success briefly at the bottom and stays silent when the system picker is canceled', async () => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 740 } });
+    try {
+      await page.goto(origin + '/__backup-restore');
+      const exportButton = page.getByRole('button', { name: '导出所选' });
+      await exportButton.click();
+      const success = page.locator('.m-dock .m-toast-ok').getByText('备份已导出');
+      await success.waitFor();
+      expect(await page.locator('[data-hint="backup-actions"]').count()).toBe(0);
+      expect(await page.evaluate(() => (window as any).__backupRestoreTest.exportCalls)).toHaveLength(1);
+      await success.waitFor({ state: 'detached', timeout: 6_000 });
+
+      await page.evaluate(() => { (window as any).__backupRestoreTest.exportResult = { success: false, errorCode: 'cancelled' }; });
+      await exportButton.click();
+      await page.waitForFunction(() => (window as any).__backupRestoreTest.exportCalls.length === 2 &&
+        !document.querySelector('[data-setting="backup-actions"] button')?.hasAttribute('disabled'));
+      expect(await page.locator('.m-toast').count()).toBe(0);
+      expect(await page.locator('[data-write-error="backup-actions"]').count()).toBe(0);
+      expect(await page.locator('[data-hint="backup-actions"]').count()).toBe(0);
+
+      await page.evaluate(() => { (window as any).__backupRestoreTest.exportResult = { success: false, errorCode: 'writeFailed' }; });
+      await exportButton.click();
+      await page.locator('[data-write-error="backup-actions"]').waitFor();
+      expect(await page.locator('.m-toast').count()).toBe(0);
+    } finally { await page.close(); }
+  }, 45_000);
 
   it('requires confirmation, preserves preview on cancel/failure, rejects stale scope, then reports success', async () => {
     const page = await browser.newPage({ viewport: { width: 320, height: 740 } });

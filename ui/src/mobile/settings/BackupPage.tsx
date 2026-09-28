@@ -25,8 +25,8 @@
  *
  * # 失败/成功都必须看得见
  *
- * 两条腿的失败走 `commit(行 id, promise, 取文)`，错误紧贴按钮。导出成功留行内回执；导入
- * 成功收起预览后走 `MobileToaster`，因为导入操作行随预览消失，行内回执会离视口很远。
+ * 两条腿的失败走 `commit(行 id, promise, 取文)`，错误紧贴按钮；一次性成功回执走
+ * `MobileToaster` 的短 toast，不常驻占设置行。导入成功时预览会一并收起。
  */
 
 import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
@@ -84,8 +84,6 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
   const { t } = useTranslation();
   const [selected, setSelected] = useState<Set<BackupCategory>>(() => new Set(BACKUP_CATEGORIES));
   const [busy, setBusy] = useState(false);
-  /** 导出成功回执；导入成功由 toast 承接。失败都走 `commit`。 */
-  const [done, setDone] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingImport | null>(null);
   const [importPick, setImportPick] = useState<Set<BackupCategory>>(() => new Set());
   const previewRef = useRef({ pending, importPick });
@@ -105,7 +103,6 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
   }, [pending, importPick]);
 
   function doExport(): void {
-    setDone(null);
     setBusy(true);
     commit(
       ACTIONS_ROW,
@@ -116,7 +113,7 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
           // （W-18 之前，Android 上「选好了位置」也会走到这一支，那才是要修的静默。）
           if (res.errorCode === 'cancelled') return;
           if (!res.success) throw new Error(backupErrorText(res.errorCode, t));
-          setDone(t('settings.advanced.backup.exportSuccess'));
+          toast.success(t('settings.advanced.backup.exportSuccess'));
         } finally {
           setBusy(false);
         }
@@ -130,7 +127,6 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
   }
 
   function doImportPick(): void {
-    setDone(null);
     setBusy(true);
     commit(
       ACTIONS_ROW,
@@ -164,7 +160,6 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
   }
 
   function doImportApply(source: PendingImport, categories: readonly BackupCategory[]): void {
-    setDone(null);
     setBusy(true);
     commit(
       IMPORT_ROW,
@@ -257,7 +252,6 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
           id={ACTIONS_ROW}
           label={t('settings.nav.backup')}
           desc={t('mobileSettings.backup.pickerNote')}
-          hint={done ?? undefined}
           control={
             <div style={{ display: 'flex', gap: '8px' }}>
               <MobileButton disabled={busy || selectedArr.length === 0} onClick={doExport}>
