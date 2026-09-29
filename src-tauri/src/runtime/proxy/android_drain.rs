@@ -71,10 +71,16 @@ pub(super) fn verify(
     expected_process: &str,
     expected_fence: &str,
 ) -> Result<(), &'static str> {
-    if expected_process.is_empty() || receipt.process_nonce != expected_process {
+    if !valid_id(expected_process, 128)
+        || !valid_id(&receipt.process_nonce, 128)
+        || receipt.process_nonce != expected_process
+    {
         return Err("Android native drain process nonce mismatch");
     }
-    if expected_fence.is_empty() || receipt.fence_id != expected_fence {
+    if !valid_id(expected_fence, 128)
+        || !valid_id(&receipt.fence_id, 128)
+        || receipt.fence_id != expected_fence
+    {
         return Err("Android native drain fence mismatch");
     }
     if receipt.marker_proof != MarkerProof::Absent {
@@ -87,15 +93,25 @@ pub(super) fn verify(
     let mut owners = HashSet::new();
     for entry in &receipt.captured {
         let ticket = &entry.ticket;
-        if ticket.id.is_empty() || ticket.logical_id.is_empty() || !tickets.insert(&ticket.id) {
+        if !valid_id(&ticket.id, 128)
+            || !valid_id(&ticket.logical_id, 256)
+            || !tickets.insert(&ticket.id)
+        {
             return Err("Android native drain ticket absent or duplicated");
         }
         if ticket.kind.is_owner() && !owners.insert((ticket.kind, &ticket.logical_id)) {
             return Err("Android native drain owner identity duplicated");
         }
-        match (ticket.kind.is_owner(), entry.state) {
-            (true, State::CancelledBeforeBirth | State::ClosedExact)
-            | (false, State::CancelledBeforeBirth | State::Completed) => {}
+        match (ticket.kind, entry.state) {
+            (
+                Kind::Main | Kind::Login | Kind::Speedtest,
+                State::CancelledBeforeBirth | State::ClosedExact,
+            )
+            | (Kind::CheckConfig, State::CancelledBeforeBirth)
+            | (
+                Kind::TargetlessStop | Kind::TargetlessReload,
+                State::CancelledBeforeBirth | State::Completed,
+            ) => {}
             (_, State::Reserved | State::BirthEntered) => {
                 return Err("Android native drain operation or owner unsettled");
             }
@@ -106,6 +122,12 @@ pub(super) fn verify(
         }
     }
     Ok(())
+}
+
+fn valid_id(value: &str, max_utf16_units: usize) -> bool {
+    !value.trim().is_empty()
+        && value == value.trim()
+        && value.encode_utf16().count() <= max_utf16_units
 }
 
 #[cfg(test)]
@@ -180,5 +202,70 @@ mod tests {
         validation["captured"][0]["ticket"]["kind"] = json!("CheckConfig");
         validation["captured"][0]["state"] = json!("ValidationCleanupUnknown");
         assert!(check(validation).is_err());
+        let mut validation = receipt();
+        validation["captured"][0]["ticket"]["kind"] = json!("CheckConfig");
+        validation["captured"][0]["state"] = json!("Completed");
+        assert!(check(validation).is_err());
+    }
+
+    #[test]
+    fn strict_id_domain_matches_kotlin_utf16_limits() {
+        let long_non_bmp = "😀".repeat(65);
+        for invalid in ["", " ", " leading", "trailing ", long_non_bmp.as_str()] {
+            let mut value = receipt();
+            value["processNonce"] = json!(invalid);
+            assert!(verify(&serde_json::from_value(value).unwrap(), invalid, "fence-1").is_err());
+            let mut value = receipt();
+            value["fenceId"] = json!(invalid);
+            assert!(verify(
+                &serde_json::from_value(value).unwrap(),
+                "process-1",
+                invalid
+            )
+            .is_err());
+            let mut value = receipt();
+            value["captured"][0]["ticket"]["id"] = json!(invalid);
+            assert!(check(value).is_err());
+            let mut value = receipt();
+            let logical_invalid = if invalid == long_non_bmp {
+                "😀".repeat(129)
+            } else {
+                invalid.to_owned()
+            };
+            value["captured"][0]["ticket"]["logicalId"] = json!(logical_invalid);
+            assert!(check(value).is_err());
+        }
+    }
+
+    #[test]
+    fn kind_and_terminal_matrix_never_promotes_validation_or_owner_as_control() {
+        for (kind, allowed) in [
+            ("Main", vec!["CancelledBeforeBirth", "ClosedExact"]),
+            ("Login", vec!["CancelledBeforeBirth", "ClosedExact"]),
+            ("Speedtest", vec!["CancelledBeforeBirth", "ClosedExact"]),
+            ("CheckConfig", vec!["CancelledBeforeBirth"]),
+            ("TargetlessStop", vec!["CancelledBeforeBirth", "Completed"]),
+            (
+                "TargetlessReload",
+                vec!["CancelledBeforeBirth", "Completed"],
+            ),
+        ] {
+            for state in [
+                "CancelledBeforeBirth",
+                "ClosedExact",
+                "Completed",
+                "Unknown",
+                "ValidationCleanupUnknown",
+            ] {
+                let mut value = receipt();
+                value["captured"][0]["ticket"]["kind"] = json!(kind);
+                value["captured"][0]["state"] = json!(state);
+                assert_eq!(
+                    check(value).is_ok(),
+                    allowed.contains(&state),
+                    "{kind}→{state}"
+                );
+            }
+        }
     }
 }

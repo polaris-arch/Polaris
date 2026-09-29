@@ -24,6 +24,7 @@ internal data class AndroidDrainReceipt(
 internal class AndroidNativeAdmission(
     val processNonce: String = UUID.randomUUID().toString(),
 ) {
+    init { require(validId(processNonce, 128)) { "invalid native process nonce" } }
     enum class Kind { Main, Login, Speedtest, CheckConfig, TargetlessStop, TargetlessReload }
     enum class State { Reserved, BirthEntered, CancelledBeforeBirth, ClosedExact, Completed, Unknown, ValidationCleanupUnknown }
     data class Ticket(val id: String, val kind: Kind, val logicalId: String)
@@ -55,15 +56,18 @@ internal class AndroidNativeAdmission(
         return reserve(kind, UUID.randomUUID().toString(), owner = false)
     }
 
-    private fun reserve(kind: Kind, logicalId: String, owner: Boolean): Ticket = synchronized(lock) {
-        if (fenceId != null || bootstrap != RequiredMarkerProof.Absent) throw AdmissionClosed()
-        require(logicalId.isNotBlank()) { "native owner identity is empty" }
-        if (owner) check(!usedOwners.containsKey(kind to logicalId)) { "native owner identity was already consumed" }
+    private fun reserve(kind: Kind, logicalId: String, owner: Boolean): Ticket {
         val ticket = Ticket(UUID.randomUUID().toString(), kind, logicalId)
-        if (owner) usedOwners[kind to logicalId] = ticket
-        check(entries.put(ticket.id, Entry(ticket, State.Reserved)) == null)
-        revision++
-        ticket
+        return synchronized(lock) {
+            if (fenceId != null || bootstrap != RequiredMarkerProof.Absent) throw AdmissionClosed()
+            require(validId(logicalId, 256)) { "invalid native owner identity" }
+            check(!entries.containsKey(ticket.id)) { "native ticket collision" }
+            if (owner) check(!usedOwners.containsKey(kind to logicalId)) { "native owner identity was already consumed" }
+            if (owner) usedOwners[kind to logicalId] = ticket
+            entries[ticket.id] = Entry(ticket, State.Reserved)
+            revision++
+            ticket
+        }
     }
 
     /** A worker must call this immediately before crossing a native factory/JNI boundary. */
@@ -80,7 +84,7 @@ internal class AndroidNativeAdmission(
 
     /** Close-before-start consumes the external identity and cancels an unstarted reservation. */
     fun retireOwner(kind: Kind, logicalId: String) = synchronized(lock) {
-        require(kind in OWNER_KINDS && logicalId.isNotBlank())
+        require(kind in OWNER_KINDS && validId(logicalId, 256))
         val key = kind to logicalId
         if (!usedOwners.containsKey(key)) {
             usedOwners[key] = null
@@ -101,16 +105,24 @@ internal class AndroidNativeAdmission(
     }
 
     /** Only an exact native close that returned successfully may call this. */
-    fun closedExact(ticket: Ticket): Boolean = settle(ticket, setOf(State.BirthEntered), State.ClosedExact)
+    fun closedExact(ticket: Ticket): Boolean {
+        require(ticket.kind in OWNER_KINDS)
+        return settle(ticket, setOf(State.BirthEntered), State.ClosedExact)
+    }
 
     /** A control operation returns only after its own work has left native code. */
-    fun completeOperation(ticket: Ticket): Boolean = settle(ticket, setOf(State.Reserved, State.BirthEntered), State.Completed)
+    fun completeOperation(ticket: Ticket): Boolean {
+        require(ticket.kind in CONTROL_KINDS)
+        return settle(ticket, setOf(State.Reserved, State.BirthEntered), State.Completed)
+    }
 
     fun unknown(ticket: Ticket): Boolean = settle(ticket, setOf(State.Reserved, State.BirthEntered), State.Unknown)
 
     /** Go checkConfig currently ignores box.Close's result; a captured call cannot prove cleanup. */
-    fun validationCleanupUnknown(ticket: Ticket): Boolean =
-        settle(ticket, setOf(State.BirthEntered), State.ValidationCleanupUnknown)
+    fun validationCleanupUnknown(ticket: Ticket): Boolean {
+        require(ticket.kind == Kind.CheckConfig)
+        return settle(ticket, setOf(State.BirthEntered), State.ValidationCleanupUnknown)
+    }
 
     private fun settle(ticket: Ticket, from: Set<State>, to: State): Boolean = synchronized(lock) {
         val current = entries[ticket.id] ?: return@synchronized false
@@ -122,7 +134,7 @@ internal class AndroidNativeAdmission(
 
     /** Sealing is permanent. Repeating the same fence is idempotent; a second fence is rejected. */
     fun seal(id: String): AndroidDrainReceipt = synchronized(lock) {
-        require(id.isNotBlank() && id == id.trim() && id.length <= 128) { "invalid native fence ID" }
+        require(validId(id, 128)) { "invalid native fence ID" }
         val existing = fenceId
         check(existing == null || existing == id) { "a different native fence already sealed this process" }
         if (existing == null) {
@@ -147,7 +159,10 @@ internal class AndroidNativeAdmission(
     )
 
     companion object {
+        private fun validId(value: String, maxUtf16Units: Int): Boolean =
+            value.isNotBlank() && value == value.trim() && value.length <= maxUtf16Units
         private val OWNER_KINDS = setOf(Kind.Main, Kind.Login, Kind.Speedtest)
+        private val CONTROL_KINDS = setOf(Kind.TargetlessStop, Kind.TargetlessReload)
         private val TERMINAL = setOf(State.CancelledBeforeBirth, State.ClosedExact, State.Completed,
             State.Unknown, State.ValidationCleanupUnknown)
     }
