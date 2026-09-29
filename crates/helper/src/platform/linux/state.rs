@@ -10,16 +10,34 @@
 //!   raise ambient CAP_NET_ADMIN/RAW/BIND_SERVICE → execve coreDir/sing-box。这是 Linux 安全模型的核心地雷。
 //! - 测试 mock：返回固定 pid，记录 spawn/terminate/kill 调用。
 //!
-//! 本 crate 不实现真实 AmbientCaps fork 链（B3 真机复验项），仅提供 trait + mock；
-//! 真实实现见后续集成（`AmbientCapsSpawner` 占位，todo!()）。
+//! 真实 AmbientCaps fork 链由 `server::AmbientCapsSpawner` 实现；降权与能力传递仍须真机复验。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 已 spawn 的 sing-box 子进程句柄（对应 Go `child *exec.Cmd`）。
 #[derive(Debug, Clone)]
 pub struct CoreHandle {
     /// 子进程 pid（Go `child.Process.Pid`）。
     pub pid: u32,
+    birth: Arc<()>,
+}
+
+impl CoreHandle {
+    /// One opaque physical spawn identity. A reused numeric PID never becomes
+    /// the same child merely because it occupies the old number.
+    #[must_use]
+    pub fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            birth: Arc::new(()),
+        }
+    }
+
+    #[must_use]
+    pub fn same_birth(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.birth, &other.birth)
+    }
 }
 
 /// Linux helper 已创建的核心及其可归因关键路径耗时。

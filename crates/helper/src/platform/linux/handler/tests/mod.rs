@@ -68,7 +68,7 @@ impl CoreSpawner for MockSpawner {
         }
         let pid = self.next_pid;
         Ok(SpawnedCore {
-            handle: CoreHandle { pid },
+            handle: CoreHandle::new(pid),
             process_ms: 0,
             log_handoff_ms: 0,
         })
@@ -365,7 +365,7 @@ fn status_running_when_child_present() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle { pid: 4242 });
+    state.child = Some(CoreHandle::new(4242));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["status"]);
     handle(&state, &deps, &mut conn);
@@ -403,7 +403,7 @@ fn stop_terminates_child_and_reports_pid() {
     };
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle { pid: 555 });
+    state.child = Some(CoreHandle::new(555));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["stop"]);
     handle(&state, &deps, &mut conn);
@@ -445,7 +445,7 @@ fn stop_refuses_to_kill_when_managed_pid_is_another_session() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
     // daemon 手里的是**新会话**的核。
-    state.child = Some(CoreHandle { pid: 9001 });
+    state.child = Some(CoreHandle::new(9001));
     let state = Mutex::new(state);
     // 老 stop 腿声明它要停的是 555。
     let mut conn = MockConn::new(vec!["stop", "555"]);
@@ -487,7 +487,7 @@ fn stop_proceeds_when_managed_pid_matches_request() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle { pid: 555 });
+    state.child = Some(CoreHandle::new(555));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["stop", "555"]);
     handle(&state, &deps, &mut conn);
@@ -528,7 +528,7 @@ fn stop_without_identity_line_keeps_legacy_semantics() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle { pid: 777 });
+    state.child = Some(CoreHandle::new(777));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["stop"]); // 无身份行（read_line 在耗尽后返 ""）
     handle(&state, &deps, &mut conn);
@@ -954,7 +954,7 @@ fn start_already_when_child_present() {
         &fwd,
     );
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle { pid: 8888 });
+    state.child = Some(CoreHandle::new(8888));
     let state = Mutex::new(state);
     let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
     let mut conn = MockConn::new(vec!["start", &sb, "/tmp/c.json", "", "0", ""]);
@@ -1027,7 +1027,7 @@ fn cleanup_kills_child_and_reports_cleaned() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle { pid: 333 });
+    state.child = Some(CoreHandle::new(333));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["cleanup"]);
     handle(&state, &deps, &mut conn);

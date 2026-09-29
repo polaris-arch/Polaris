@@ -323,7 +323,14 @@ fn child_slot_signal_if_live_delivers_only_before_reap() {
     // 正向：未收割 → 投递，且拿到的是本 slot 的 pid。
     let slot = ChildSlot::new(4242);
     let mut got = None;
-    assert!(slot.signal_if_live(|pid| got = Some(pid)), "未收割应投递");
+    assert!(
+        slot.signal_if_live(|pid| {
+            got = Some(pid);
+            Ok(())
+        })
+        .unwrap(),
+        "未收割应投递"
+    );
     assert_eq!(got, Some(4242));
 
     // 反向：已收割（wait 已返回 ⇒ pid 随时可能被系统复用）→ 一律不投递。
@@ -331,7 +338,12 @@ fn child_slot_signal_if_live_delivers_only_before_reap() {
     reaped.mark_exited();
     let mut delivered = false;
     assert!(
-        !reaped.signal_if_live(|_| delivered = true),
+        !reaped
+            .signal_if_live(|_| {
+                delivered = true;
+                Ok(())
+            })
+            .unwrap(),
         "已收割应返回未投递"
     );
     assert!(!delivered, "已收割的 pid 不得再收到任何信号");
@@ -352,8 +364,9 @@ fn kill_skips_reaped_slot_but_still_kills_live_child() {
     let victim_pid = victim.id();
     let victim_slot = ChildSlot::new(victim_pid);
     victim_slot.mark_exited();
+    let victim_handle = victim_slot.handle.clone();
     spawner.slots.lock().unwrap().push(victim_slot);
-    spawner.kill(&CoreHandle { pid: victim_pid });
+    spawner.kill(&victim_handle);
     assert!(
         !exited_within(&mut victim, Duration::from_millis(300)),
         "已收割 slot 的 pid 收到了 SIGKILL —— 正是 pid 复用误杀"
@@ -364,8 +377,10 @@ fn kill_skips_reaped_slot_but_still_kills_live_child() {
     // ② 正向对照：同一条 kill 路径，未收割的 slot 必须真杀掉。
     let mut live = spawn_sleeper();
     let live_pid = live.id();
-    spawner.slots.lock().unwrap().push(ChildSlot::new(live_pid));
-    spawner.kill(&CoreHandle { pid: live_pid });
+    let live_slot = ChildSlot::new(live_pid);
+    let live_handle = live_slot.handle.clone();
+    spawner.slots.lock().unwrap().push(live_slot);
+    spawner.kill(&live_handle);
     assert!(
         exited_within(&mut live, Duration::from_secs(3)),
         "未收割的 child 必须被 SIGKILL（否则上一条的绿无信息量）"
@@ -390,6 +405,222 @@ fn terminate_slot_sends_nothing_to_a_reaped_slot() {
     );
     let _ = sleeper.kill();
     let _ = sleeper.wait();
+}
+
+struct ScriptedWaiter {
+    steps: std::collections::VecDeque<std::io::Result<Option<ExitStatus>>>,
+}
+
+impl ChildWaiter for ScriptedWaiter {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.steps.pop_front().unwrap_or(Ok(None))
+    }
+}
+
+fn scripted_slot(pid: u32, steps: Vec<std::io::Result<Option<ExitStatus>>>) -> Arc<ChildSlot> {
+    ChildSlot::with_waiter(
+        CoreHandle::new(pid),
+        Box::new(ScriptedWaiter {
+            steps: steps.into(),
+        }),
+    )
+}
+
+#[test]
+fn native_wait_error_retains_unknown_custody_and_blocks_signal() {
+    let slot = scripted_slot(421, vec![Err(std::io::Error::other("fake wait failure"))]);
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+    let mut signals = 0;
+    assert!(!slot
+        .signal_if_live(|_| {
+            signals += 1;
+            Ok(())
+        })
+        .unwrap());
+    assert_eq!(signals, 0);
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+    assert!(!slot.wait_exited(Duration::from_millis(1)));
+}
+
+#[test]
+fn failed_native_wait_cannot_clear_handler_or_registry_when_reaper_finishes() {
+    let slot = scripted_slot(425, vec![Err(std::io::Error::other("fake wait failure"))]);
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(slot.handle.clone());
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
+    run_reaper(&slot.handle, &state, &slot, &slots);
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.same_birth(&slot.handle)));
+    assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+}
+
+#[test]
+fn unknown_native_wait_stops_parent_watcher_without_probe_or_clear() {
+    let slot = scripted_slot(427, vec![Err(std::io::Error::other("fake wait failure"))]);
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(slot.handle.clone());
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+    assert_eq!(
+        slot.wait_outcome(Duration::from_secs(1)),
+        ChildWaitOutcome::Unknown
+    );
+    watch_parent_loop(123, &slot.handle, &state, &slot, |_| {
+        panic!("Unknown watcher must exit before probing parent")
+    });
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.same_birth(&slot.handle)));
+    assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
+}
+
+#[test]
+fn signal_success_or_error_never_mints_reaped_fact() {
+    let slot = scripted_slot(422, vec![Ok(None), Ok(None), Ok(None)]);
+    assert!(slot.signal_if_live(|_| Ok(())).unwrap());
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+    assert!(slot.signal_if_live(|_| Err(nix::Error::EIO)).is_err());
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+}
+
+#[test]
+fn late_old_birth_reaper_cannot_clear_successor_with_reused_pid() {
+    let old = ChildSlot::new(423);
+    let successor = ChildSlot::new(423);
+    assert!(!old.handle.same_birth(&successor.handle));
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(successor.handle.clone());
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&old), Arc::clone(&successor)]));
+    old.mark_exited();
+    let LocalReapFact::Reaped(old_proof) = old.reap_fact() else {
+        panic!("old native wait must produce a same-birth fact");
+    };
+    clear_reaped_birth(&old_proof, &state, &slots);
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.same_birth(&successor.handle)));
+    let remaining = slots.lock().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].handle.same_birth(&successor.handle));
+}
+
+#[test]
+fn mismatched_reaper_handle_cannot_clear_reaped_slot() {
+    let slot = ChildSlot::new(428);
+    slot.mark_exited();
+    let wrong = CoreHandle::new(428);
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(slot.handle.clone());
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
+    run_reaper(&wrong, &state, &slot, &slots);
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.same_birth(&slot.handle)));
+    assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
+}
+
+#[test]
+fn stale_handle_cannot_find_successor_slot_with_same_pid() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let old = CoreHandle::new(426);
+    let successor = ChildSlot::new(426);
+    spawner.slots.lock().unwrap().push(Arc::clone(&successor));
+    assert!(spawner.find_slot(&old).is_none());
+    assert!(spawner.find_slot(&successor.handle).is_some());
+    assert!(matches!(
+        spawner.local_reap_fact(&old),
+        LocalReapFact::Unknown
+    ));
+}
+
+#[test]
+fn native_wait_and_signal_serialize_at_birth_lock() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::mpsc;
+
+    struct HeldWaiter {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl ChildWaiter for HeldWaiter {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(Some(ExitStatus::from_raw(0)))
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let slot = ChildSlot::with_waiter(
+        CoreHandle::new(424),
+        Box::new(HeldWaiter {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+    );
+    let for_reaper = Arc::clone(&slot);
+    let reaper = std::thread::spawn(move || for_reaper.reap_fact());
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let for_signal = Arc::clone(&slot);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (signal_tx, signal_rx) = mpsc::channel();
+    let signal = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let mut sent = false;
+        let result = for_signal.signal_if_live(|_| {
+            sent = true;
+            Ok(())
+        });
+        signal_tx.send((result, sent)).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(signal_rx.recv_timeout(Duration::from_millis(30)).is_err());
+    release_tx.send(()).unwrap();
+    assert!(matches!(reaper.join().unwrap(), LocalReapFact::Reaped(_)));
+    let (result, sent) = signal_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    signal.join().unwrap();
+    assert!(!result.unwrap());
+    assert!(!sent, "wait reaped before signal obtained the birth lock");
+}
+
+#[test]
+fn real_local_child_yields_reaped_only_after_native_wait() {
+    let child = spawn_sleeper();
+    let handle = CoreHandle::new(child.id());
+    let slot = ChildSlot::from_child(child, handle.clone());
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+    assert!(slot
+        .signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL))
+        .unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match slot.reap_fact() {
+            LocalReapFact::Pending if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            LocalReapFact::Reaped(proof) => {
+                assert!(proof.birth.same_birth(&handle));
+                assert!(!proof.status.success());
+                break;
+            }
+            _ => panic!("real child must be reaped by its owned Child handle"),
+        }
+    }
 }
 
 // ===== 连接并发闸的接线（复审 Medium：spawn_blocking 在鉴权之前，且此前无上限）=====
