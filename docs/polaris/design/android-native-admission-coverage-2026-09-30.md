@@ -1,3 +1,9 @@
+---
+status: active
+updated: 2026-09-30
+area: polaris
+---
+
 # Android native admission coverage (protocol 1)
 
 `AndroidNativeAdmission` is a process-local safety ledger. It is not a migration
