@@ -2182,6 +2182,7 @@
     "mobileMoreActions": "更多",
     "mobileProtocolFilter": "協定",
     "mobileRowMore": "更多操作",
+    "tsAccountUnknown": "登入 / 切換帳號",
     "mobileSortLatency": "延遲",
     "mobileSortName": "名稱",
     "mobileSortProtocol": "協定",
@@ -2455,7 +2456,8 @@
     "loginMainCoreUnknown": "尚無法確認主連線中該節點的授權狀態，可重試讀取。",
     "loginUrlTimeout": "取得登入頁位址逾時。請重試。",
     "loginSessionReadFailed": "無法讀取舊登入工作階段，未發起新的授權。請重試。",
-    "loginProgressReadFailed": "暫時無法核對這次授權結果。授權可能仍在進行；返回應用程式時會重試。"
+    "loginProgressReadFailed": "暫時無法核對這次授權結果。授權可能仍在進行；返回應用程式時會重試。",
+    "loginStateUnknown": "暫時無法確認舊登入狀態；提交 Auth Key 前會重新讀取，讀取失敗就不會切換帳號。"
   },
   "warp": {
     "addTitle": "接入 Cloudflare WARP",

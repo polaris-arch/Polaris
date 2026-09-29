@@ -44,8 +44,11 @@ unlockApi.get = async () => null;
 api.subscription.onCreateProgressReady = async fn => on('onCreateProgressReady')(fn);
 api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
-api.server.tailscaleStateExists = async () => ({ 'ts-1': false });
-const test = window.__tsTest = { opens: [], cancels: [], starts: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode };
+api.server.tailscaleStateExists = async () => {
+  if (mode === 'state-read-fail') throw Error('state unavailable');
+  return { 'ts-1': mode === 'state-true' };
+};
+const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
   if (test.failProgress) throw new Error('RECEIPT_READ_FAILED');
@@ -73,6 +76,7 @@ const server = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: 
 useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
   refreshProxyStatus: async () => {}, loadConfig: async () => {} });
 api.server.update = async next => {
+  test.saves++;
   if (mode === 'delayed-save') await new Promise(resolve => { test.releaseSave = resolve; });
   useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [] } });
 };
@@ -153,6 +157,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       await page.evaluate(() => (window as any).__tsTest.releasePrepare());
       await page.waitForFunction(() => (window as any).__tsTest.cancels.length >= 2);
       expect(await page.evaluate(() => (window as any).__tsTest.starts)).toBe(0);
+      expect(await page.evaluate(() => (window as any).__tsTest.saves)).toBe(0);
       expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('cancelled');
     } finally { await page.close(); }
   }, 30_000);
@@ -257,6 +262,33 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
           phase: 'authorized' });
       });
       await page.getByRole('dialog').waitFor({ state: 'detached' });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('an unknown old session stays visible and Auth Key submission fails closed when the re-read fails', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=state-read-fail`);
+      await page.getByRole('button', { name: 'Auth Key' }).click();
+      await page.getByText('旧登录状态暂无法确认；提交 Auth Key 前会重新读取，读取失败则不会更换账号。').waitFor();
+      await page.locator('#mts-authkey').fill('synthetic-test-key');
+      await page.locator('.m-form-foot .primary').click();
+      await page.locator('.m-form-notice.err').waitFor();
+      expect(await page.locator('.m-form-notice.err').textContent()).toMatch(
+        /无法读取旧登录会话|无法核对已有授权状态/,
+      );
+      expect(await page.evaluate(() => (window as any).__tsTest.starts)).toBe(0);
+      expect(await page.getByRole('dialog').count()).toBe(1);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('a confirmed old session shows the account replacement warning', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=state-true`);
+      await page.getByRole('button', { name: 'Auth Key' }).click();
+      await page.getByText('提交将退出当前登录并使用新 Auth Key。').waitFor();
+      expect(await page.getByText('旧登录状态暂无法确认；提交 Auth Key 前会重新读取，读取失败则不会更换账号。').count()).toBe(0);
     } finally { await page.close(); }
   }, 30_000);
 

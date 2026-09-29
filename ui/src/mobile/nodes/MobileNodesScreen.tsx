@@ -172,6 +172,20 @@ export function MobileNodesScreen(): ReactElement {
   const [notice, setNotice] = useState<
     { tone: 'ok' | 'info' | 'warn' | 'err'; text: string } | undefined
   >();
+  const [tsState, setTsState] = useState<{ id: string; exists: boolean | null }>({ id: '', exists: null });
+  const tsStateRequest = useRef(0);
+  const onRowActionsOpen = useCallback((row: NodeRowVM) => {
+    const request = ++tsStateRequest.current;
+    if (row.server.protocol.toLowerCase() !== 'tailscale' || row.stagedOnly) return;
+    const id = row.server.id;
+    setTsState({ id, exists: null });
+    void api.server.tailscaleStateExists([id]).then((states) => {
+      if (request !== tsStateRequest.current) return;
+      setTsState({ id, exists: typeof states[id] === 'boolean' ? states[id] : null });
+    }, () => {
+      if (request === tsStateRequest.current) setTsState({ id, exists: null });
+    });
+  }, []);
 
   const visibleServers = useMemo(
     () => projectVisibleServers(activeGroup, search, protoFilter, sortKey, latencyMap),
@@ -701,11 +715,13 @@ export function MobileNodesScreen(): ReactElement {
         t,
         row,
         coreRunning: proxyRunning,
+        tsLoginState: tsState.id === row.server.id ? tsState.exists : null,
         disposition: (id) => ROW_ACTIONS.find((a) => a.id === id)?.disposition,
         handlers: {
           onSpeedTest: () => runSpeedTest([row.server.id]),
           onConnect: connectFromRow,
           onCopyLink: () => copyLink(row),
+          onTsLogin: () => openMobileForm({ kind: 'ts-login', serverId: row.server.id }),
           onClone: () => cloneNode(row.server),
           /* 该开哪张表由**两端共用**的分流函数决定（`node-edit-routing#nodeEditForm` 的移动端
              名字翻译层）。批 3 起它对每一个协议都给得出一张表，不再有「编辑不动」那一档。 */
@@ -713,7 +729,7 @@ export function MobileNodesScreen(): ReactElement {
           onDelete: () => deleteNode(row.server),
         },
       }),
-    [t, proxyRunning, runSpeedTest, copyLink, connectFromRow, cloneNode, deleteNode],
+    [t, proxyRunning, tsState, runSpeedTest, copyLink, connectFromRow, cloneNode, deleteNode],
   );
 
   return (
@@ -756,6 +772,7 @@ export function MobileNodesScreen(): ReactElement {
       addItems={addItems}
       onUseAsExit={(row) => void onUseAsExit(row)}
       rowItems={rowItems}
+      onRowActionsOpen={onRowActionsOpen}
       testableTotal={testableTotal}
       batchMode={batchMode}
       onToggleBatchMode={() => {

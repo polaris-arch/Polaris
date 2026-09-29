@@ -600,7 +600,10 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
               selected={props.selectedIds.has(row.server.id)}
               onUseAsExit={props.onUseAsExit}
               onToggleSelect={props.onToggleSelect}
-              onOpenActions={(r) => setSheet({ kind: 'row', row: r })}
+              onOpenActions={(r) => {
+                props.onRowActionsOpen(r);
+                setSheet({ kind: 'row', row: r });
+              }}
             />
           ))}
         </div>

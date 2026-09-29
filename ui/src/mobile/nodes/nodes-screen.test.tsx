@@ -234,6 +234,7 @@ const baseProps = (over: Partial<NodesScreenViewProps> = {}): NodesScreenViewPro
   subItems: [{ id: 'rename', label: 'nodes.subRename', onSelect: () => {} }],
   onUseAsExit: () => {},
   rowItems: () => [],
+  onRowActionsOpen: () => {},
   batchMode: false,
   onToggleBatchMode: () => {},
   selectedIds: new Set<string>(),
@@ -308,6 +309,41 @@ describe('① IA §2.1 内容序：五个块按重要性序出现，且卡片/�
     // 正面：只有一种连续分隔行列表；宽屏可按 DOM 顺序逐行分两列，无视图切换控件。
     expect(read(join(MOBILE, 'nodes', 'nodes.css'))).toContain('grid-template-columns: repeat(2, minmax(0, 1fr))');
   });
+});
+
+it('Tailscale 行账号入口只按 native state 证据换文案，其他节点没有该入口', () => {
+  const opened: string[] = [];
+  const tsRow = row('ts-account', { server: server('ts-account', { protocol: 'tailscale' }) });
+  const itemsFor = (target: NodeRowVM, state: boolean | null) => buildRowItems({
+    t: (key) => key,
+    row: target,
+    coreRunning: true,
+    tsLoginState: state,
+    disposition: (id) => ROW_ACTIONS.find((entry) => entry.id === id)?.disposition,
+    handlers: {
+      onSpeedTest: () => {}, onConnect: () => {}, onCopyLink: () => {},
+      onTsLogin: () => opened.push(target.server.id),
+      onClone: () => {}, onEdit: () => {}, onDelete: () => {},
+    },
+  });
+  for (const [state, label] of [
+    [false, 'ts.signIn'], [true, 'meshJoin.switchAccount'], [null, 'nodes.tsAccountUnknown'],
+  ] as const) {
+    const item = itemsFor(tsRow, state).find((entry) => entry.id === 'ts-login');
+    expect(item?.label).toBe(label);
+    item?.onSelect?.();
+  }
+  expect(opened).toEqual(['ts-account', 'ts-account', 'ts-account']);
+  expect(itemsFor(tsRow, true).some((entry) => entry.id === 'ts-logout')).toBe(false);
+  expect(itemsFor(row('ordinary'), true).some((entry) => entry.id === 'ts-login')).toBe(false);
+  const staged = itemsFor({ ...tsRow, stagedOnly: true }, true).find((entry) => entry.id === 'ts-login');
+  expect(staged?.label).toBe('nodes.tsAccountUnknown');
+  expect(staged?.disabledReason).toBe('home.stagedOnlyBlocked');
+  expect(staged?.onSelect).toBeUndefined();
+
+  const wiring = strip(read(join(MOBILE, 'nodes', 'MobileNodesScreen.tsx')));
+  expect(wiring).toContain('api.server.tailscaleStateExists([id])');
+  expect(wiring).toContain("openMobileForm({ kind: 'ts-login', serverId: row.server.id })");
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -725,11 +761,13 @@ describe('⑥ 能力缺席登记表对得上桌面（登记表变僵尸 / 桌面
       t: (k: string) => k,
       row: target,
       coreRunning: true,
+      tsLoginState: null,
       disposition: (id: string) => ROW_ACTIONS.find((a) => a.id === id)?.disposition,
       handlers: {
         onSpeedTest: () => {},
         onConnect: () => {},
         onCopyLink: () => {},
+        onTsLogin: () => {},
         onClone: () => {},
         onEdit: () => {},
         onDelete: () => {},
@@ -820,12 +858,14 @@ describe('⑥ 能力缺席登记表对得上桌面（登记表变僵尸 / 桌面
       t: (k: string) => k,
       row: target,
       coreRunning: true,
+      tsLoginState: null,
       disposition: (id: string) =>
         id === 'clone' ? { kind: 'absent', reasonKey: 'synthetic.reason' } : { kind: 'ported' },
       handlers: {
         onSpeedTest: () => {},
         onConnect: () => {},
         onCopyLink: () => {},
+        onTsLogin: () => {},
         onClone: () => {},
         onEdit: () => {},
         onDelete: () => {},
@@ -851,11 +891,13 @@ describe('⑥ 能力缺席登记表对得上桌面（登记表变僵尸 / 桌面
         t: (k: string) => k,
         row: target,
         coreRunning: true,
+        tsLoginState: null,
         disposition: (id: string) => ROW_ACTIONS.find((a) => a.id === id)?.disposition,
         handlers: {
           onSpeedTest: () => {},
           onConnect: () => {},
           onCopyLink: () => {},
+          onTsLogin: () => {},
           onClone: () => {},
           onEdit: () => {},
           onDelete: () => {},
@@ -1707,7 +1749,10 @@ describe('⑩ 写操作失败必有可见回显（IA 裁定 #14）', () => {
 
   const writeSites = WRITE_CALLS.flatMap((re) =>
     [...wiringSrc.matchAll(re)].map((m) => ({ text: m[0], index: m.index })),
-  ).filter((site) => site.text !== 'api.config.meshRouteReport('); // read-only diagnostic query
+  ).filter((site) => site.text !== 'api.config.meshRouteReport('
+    // Native state-directory query only chooses the account action's wording. Unknown stays
+    // neutral, and Auth Key submission re-reads the state before any logout or save.
+    && site.text !== 'api.server.tailscaleStateExists(');
 
   it('自检：本屏真的有一批写调用，且 `runWrite` 真的被调过（扫 0 处会让下面两条恒绿）', () => {
     expect(writeSites.length, `只扫到 ${writeSites.length} 处写调用 —— 判据面塌了`).toBeGreaterThan(4);

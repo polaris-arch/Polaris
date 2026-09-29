@@ -2182,6 +2182,7 @@
     "mobileMoreActions": "More",
     "mobileProtocolFilter": "Protocol",
     "mobileRowMore": "More actions",
+    "tsAccountUnknown": "Log in / switch account",
     "mobileSortLatency": "Latency",
     "mobileSortName": "Name",
     "mobileSortProtocol": "Protocol",
@@ -2455,7 +2456,8 @@
     "loginMainCoreUnknown": "This node’s authorization status in the main connection is not yet confirmed. Retry to read it.",
     "loginUrlTimeout": "Timed out getting the login URL. Try again.",
     "loginSessionReadFailed": "Could not read the previous login session. New authorization was not started. Try again.",
-    "loginProgressReadFailed": "Could not check this authorization result yet. Authorization may still be in progress; returning to the app will retry."
+    "loginProgressReadFailed": "Could not check this authorization result yet. Authorization may still be in progress; returning to the app will retry.",
+    "loginStateUnknown": "The previous login state is unverified. It will be checked again before submitting an auth key; a failed check will not switch accounts."
   },
   "warp": {
     "addTitle": "Connect Cloudflare WARP",

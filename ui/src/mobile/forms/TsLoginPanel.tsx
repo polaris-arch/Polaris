@@ -71,7 +71,7 @@ export function TsLoginPanel({
   const [errControl, setErrControl] = useState<string | null>(null);
   /* 该节点是否已有登录 state。切 auth_key 时必须先清掉它 —— tsnet 手上只要有有效 node key
      就不会去用 `auth_key`，于是「填了新 key、提交成功、身份一动不动」。 */
-  const [hasState, setHasState] = useState(false);
+  const [hasState, setHasState] = useState<boolean | null>(existingTs ? null : false);
   const [submitting, setSubmitting] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | undefined>();
@@ -102,13 +102,14 @@ export function TsLoginPanel({
       return;
     }
     let cancelled = false;
+    setHasState(null);
     api.server
       .tailscaleStateExists([id])
       .then((map) => {
-        if (!cancelled) setHasState(map[id] === true);
+        if (!cancelled) setHasState(typeof map[id] === 'boolean' ? map[id] : null);
       })
       .catch(() => {
-        if (!cancelled) setHasState(false);
+        if (!cancelled) setHasState(null);
       });
     return () => {
       cancelled = true;
@@ -596,7 +597,8 @@ export function TsLoginPanel({
           />
           <p className="m-form-hint">{t('ts.authkeyHint')}</p>
           {errKey && <p className="m-form-err">{t('ts.errKey')}</p>}
-          {hasState && <div className="m-form-hint"><MobileInfo title={t('ts.authKeyLabel')} summary={t('mobileHelp.tsAuthKeySwitch')} details={t('ts.authKeySwitchLogoutNote')} /></div>}
+          {hasState === true && <div className="m-form-hint"><MobileInfo title={t('ts.authKeyLabel')} summary={t('mobileHelp.tsAuthKeySwitch')} details={t('ts.authKeySwitchLogoutNote')} /></div>}
+          {hasState === null && <p className="m-form-hint">{t('ts.loginStateUnknown')}</p>}
         </div>
       )}
 

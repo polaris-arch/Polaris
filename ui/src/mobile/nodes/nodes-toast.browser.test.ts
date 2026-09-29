@@ -13,6 +13,7 @@ import { MobileNodesScreen } from '/src/mobile/nodes/MobileNodesScreen';
 import { useMobileNodeDeletion } from '/src/mobile/nodes/node-deletion';
 import { MobileToaster } from '/src/mobile/MobileToaster';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
+import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { i18nReady } from '/src/i18n';
 import '/src/styles/tokens.resolved.css';
 import '/src/mobile/theme.css';
@@ -25,12 +26,18 @@ const warp = { id: 'warp-1', name: 'WARP', protocol: 'wireguard', address: 'enga
 const tailscale = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: {} };
 const test = window.__nodeToastTest = { failCopy: true, writes: [], opened: 0, deleted: 0 };
 test.entries = () => useStagedConfigStore.getState().entries;
+test.forms = () => useMobileFormStore.getState().stack.map(form => ({kind: form.kind, serverId: form.serverId}));
+test.selected = () => useAppStore.getState().selectedServerId;
 Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
   writeText: async text => { if (test.failCopy) throw Error('clipboard denied'); test.writes.push(text); },
 } });
 api.server.generateUrl = async () => 'vless://example';
 api.server.delete = async () => { test.deleted++; };
 api.config.meshRouteReport = async () => null;
+api.server.tailscaleStateExists = async ids => {
+  if (mode === 'ts-account-unknown') throw Error('state unavailable');
+  return { [ids[0]]: mode === 'ts-account-existing' };
+};
 const server = mode?.startsWith('warp') ? warp : mode?.startsWith('ts-') ? tailscale : node;
 useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
   selectedServerId: '', invalidNodes: [], proxyStatus: { running: mode?.startsWith('warp') === true || mode?.startsWith('ts-') === true },
@@ -147,6 +154,24 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile node copy comp
         await page.locator('.m-toast-ok').filter({ hasText: expected }).waitFor();
         expect(await page.locator('.mn-notice').count()).toBe(0);
       }
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each([
+    ['ts-account-empty', '登录'],
+    ['ts-account-existing', '切换账号'],
+    ['ts-account-unknown', '登录 / 切换账号'],
+  ])('unselected Tailscale node %s opens its own login form from the action sheet', async (mode, label) => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__nodes-toast?mode=${mode}`);
+      await page.locator('.mn-seg').filter({ hasText: '组网' }).click();
+      await page.getByRole('button', { name: /Tailscale.*更多/ }).click();
+      await page.getByRole('dialog').getByRole('button', { name: label, exact: true }).click();
+      expect(await page.evaluate(() => (window as any).__nodeToastTest.forms())).toEqual([
+        { kind: 'ts-login', serverId: 'ts-1' },
+      ]);
+      expect(await page.evaluate(() => (window as any).__nodeToastTest.selected())).toBe('');
     } finally { await page.close(); }
   }, 30_000);
 });

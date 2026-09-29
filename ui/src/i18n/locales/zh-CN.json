@@ -2182,6 +2182,7 @@
     "mobileMoreActions": "更多",
     "mobileProtocolFilter": "协议",
     "mobileRowMore": "更多操作",
+    "tsAccountUnknown": "登录 / 切换账号",
     "mobileSortLatency": "延迟",
     "mobileSortName": "名称",
     "mobileSortProtocol": "协议",
@@ -2455,7 +2456,8 @@
     "loginMainCoreUnknown": "尚无法确认主连接中该节点的授权状态，可重试读取。",
     "loginUrlTimeout": "获取登录页地址超时。请重试。",
     "loginSessionReadFailed": "无法读取旧登录会话，未发起新的授权。请重试。",
-    "loginProgressReadFailed": "暂时无法核对本次授权结果。授权可能仍在进行；返回应用时会重试。"
+    "loginProgressReadFailed": "暂时无法核对本次授权结果。授权可能仍在进行；返回应用时会重试。",
+    "loginStateUnknown": "旧登录状态暂无法确认；提交 Auth Key 前会重新读取，读取失败则不会更换账号。"
   },
   "warp": {
     "addTitle": "接入 Cloudflare WARP",

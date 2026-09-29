@@ -239,6 +239,8 @@ export interface NodesScreenViewProps {
   readonly onUseAsExit: (row: NodeRowVM) => void;
   /** 行的次级动作（测速 / 复制链接 / 删除 / 未移植项）。 */
   readonly rowItems: (row: NodeRowVM) => readonly SheetItem[];
+  /** Opening a row action sheet refreshes that node's native account state. */
+  readonly onRowActionsOpen: (row: NodeRowVM) => void;
 
   // ── 批选（block 5：停靠条） ───────────────────────────────────────────────
   readonly batchMode: boolean;
@@ -336,6 +338,7 @@ export interface RowActionHandlers {
   readonly onSpeedTest: () => void;
   readonly onConnect: () => void;
   readonly onCopyLink: () => void;
+  readonly onTsLogin: () => void;
   readonly onClone: () => void;
   readonly onEdit: () => void;
   readonly onDelete: () => void;
@@ -349,6 +352,8 @@ export interface RowItemsArgs {
   readonly row: NodeRowVM;
   /** 主核在跑没有（§4.10 的能力位）。 */
   readonly coreRunning: boolean;
+  /** Native state directory evidence for this Tailscale node; null means unverified. */
+  readonly tsLoginState: boolean | null;
   /* 🔴 **`editable` 2026-09-06（批 3）摘除。** 它此前表达的是「这一行是 wireguard / tailscale
      （含 WARP），那三张表还没移植」，而三张表本批落地 ⇒ `mobileEditFormFor` 不再返回 `null`，
      这一档在生产里恒为真。留着一个恒真的入参会留下一条**没有牙的**判据：门测得到那个分支，
@@ -364,7 +369,7 @@ export interface RowItemsArgs {
  * 「连接」紧挨着「测速为什么是灰的」那句话 —— 理由与补救相邻，用户不必去别的屏找（§4.10）。
  */
 export function buildRowItems(args: RowItemsArgs): SheetItem[] {
-  const { t, row, coreRunning, disposition, handlers } = args;
+  const { t, row, coreRunning, tsLoginState, disposition, handlers } = args;
   const items: SheetItem[] = [
     {
       id: 'speed-test',
@@ -379,6 +384,16 @@ export function buildRowItems(args: RowItemsArgs): SheetItem[] {
       : [{ id: 'connect', label: t('mobileHome.connect'), onSelect: handlers.onConnect }]),
     { id: 'copy-link', label: t('nodes.copyLink'), onSelect: handlers.onCopyLink },
   ];
+  if (row.server.protocol.toLowerCase() === 'tailscale') {
+    items.push({
+      id: 'ts-login',
+      label: t(row.stagedOnly ? 'nodes.tsAccountUnknown'
+        : tsLoginState === true ? 'meshJoin.switchAccount'
+        : tsLoginState === false ? 'ts.signIn' : 'nodes.tsAccountUnknown'),
+      disabledReason: row.stagedOnly ? t('home.stagedOnlyBlocked') : undefined,
+      onSelect: row.stagedOnly ? undefined : handlers.onTsLogin,
+    });
+  }
   const run: Record<'clone' | 'edit' | 'delete', () => void> = {
     clone: handlers.onClone,
     edit: handlers.onEdit,

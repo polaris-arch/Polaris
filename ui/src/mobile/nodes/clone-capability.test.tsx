@@ -67,11 +67,13 @@ function mobileHasClone(server: ServerConfig): boolean {
     t: (key) => key,
     row: row(server),
     coreRunning: false,
+    tsLoginState: null,
     disposition: () => ({ kind: 'ported' }),
     handlers: {
       onSpeedTest: () => {},
       onConnect: () => {},
       onCopyLink: () => {},
+      onTsLogin: () => {},
       onClone: () => {},
       onEdit: () => {},
       onDelete: () => {},
