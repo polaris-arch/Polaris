@@ -348,7 +348,10 @@ export const APK_DECLARED_PERMISSIONS = Object.freeze([
  */
 export function parseAapt2Permissions(text) {
   const lines = String(text).split('\n').map((l) => l.trimEnd());
-  if (!lines.some((l) => l.startsWith('package: '))) return null;
+  const packageLine = lines.find((l) => l.startsWith('package: '));
+  if (!packageLine) return null;
+  const packageName = packageLine.slice('package: '.length).trim();
+  if (!packageName) return null;
   const uses = [];
   const declared = [];
   for (const line of lines) {
@@ -361,7 +364,22 @@ export function parseAapt2Permissions(text) {
       declared.push(line.slice('permission: '.length).trim());
     }
   }
-  return { uses, declared };
+  return { packageName, uses, declared };
+}
+
+const RELEASE_APP_ID = 'com.polaris2.app';
+const DEBUG_APP_ID = `${RELEASE_APP_ID}.debug`;
+const DYNAMIC_RECEIVER_PERMISSION = `${RELEASE_APP_ID}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`;
+
+/** AndroidX names its signature-only receiver permission after the final applicationId. */
+export function permissionRegistriesForPackage(packageName) {
+  if (packageName !== RELEASE_APP_ID && packageName !== DEBUG_APP_ID) return null;
+  const adapt = (entries) => entries.map((entry) => ({
+    ...entry,
+    name: entry.name === DYNAMIC_RECEIVER_PERMISSION
+      ? `${packageName}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` : entry.name,
+  }));
+  return { uses: adapt(APK_PERMISSION_REGISTRY), declared: adapt(APK_DECLARED_PERMISSIONS) };
 }
 
 /** 集合恰等的差集报文（两个方向都报，且把登记表里的理由带上去）。 */
@@ -402,10 +420,14 @@ export function permissionViolations(parsed) {
         '  aapt2 在 $ANDROID_HOME/build-tools/<版本>/aapt2；CI 上由 android.yml 的 SDK 步骤按 compileSdk 装。',
     ];
   }
+  const registries = permissionRegistriesForPackage(parsed.packageName ?? RELEASE_APP_ID);
+  if (registries === null) {
+    return [`APK applicationId 不是本工程的 Release/Debug 身份：${parsed.packageName}`];
+  }
   const errors = [];
   // 正面断言（FLOOR）：一个真实 APK 至少要有本仓自己那 8 条。扫到远少于此 ⇒ 解析口径塌了，
   // 而「集合恰等」在一份被截断的输入上会报成一串「少了什么」，指向的地方离真因两跳远。
-  const floor = APK_PERMISSION_REGISTRY.filter((e) => e.from === 'self').length;
+  const floor = registries.uses.filter((e) => e.from === 'self').length;
   if (parsed.uses.length < floor) {
     errors.push(
       `只从 APK 上读出 ${parsed.uses.length} 条 uses-permission（下限 ${floor}，即本仓自有那批）——\n` +
@@ -413,8 +435,8 @@ export function permissionViolations(parsed) {
     );
     return errors;
   }
-  errors.push(...permissionSetViolations('uses-permission', parsed.uses, APK_PERMISSION_REGISTRY));
-  errors.push(...permissionSetViolations('自建 permission', parsed.declared, APK_DECLARED_PERMISSIONS));
+  errors.push(...permissionSetViolations('uses-permission', parsed.uses, registries.uses));
+  errors.push(...permissionSetViolations('自建 permission', parsed.declared, registries.declared));
   return errors;
 }
 
@@ -1026,15 +1048,17 @@ function main() {
   if (permissions === null) {
     console.log('  ✘ 出厂权限集：读不到（aapt2 缺席，或 dump 输出里没有 package: 行）');
   } else {
-    const want = new Set(APK_PERMISSION_REGISTRY.map((e) => e.name));
+    const registries = permissionRegistriesForPackage(permissions.packageName);
+    const expectedUses = registries?.uses ?? [];
+    const want = new Set(expectedUses.map((e) => e.name));
     const okPerm = permissions.uses.length === want.size && permissions.uses.every((n) => want.has(n));
     console.log(
-      `  ${okPerm ? '✔' : '✘'} 出厂权限集：uses-permission ${permissions.uses.length} 条 / ` +
+      `  ${okPerm ? '✔' : '✘'} ${permissions.packageName} 出厂权限集：uses-permission ${permissions.uses.length} 条 / ` +
         `登记 ${want.size} 条；自建 permission ${permissions.declared.length} 条 / ` +
-        `登记 ${APK_DECLARED_PERMISSIONS.length} 条`,
+        `登记 ${registries?.declared.length ?? 0} 条`,
     );
     for (const name of [...permissions.uses].sort()) {
-      const entry = APK_PERMISSION_REGISTRY.find((e) => e.name === name);
+      const entry = expectedUses.find((e) => e.name === name);
       console.log(`      ${entry ? '✔' : '✘'} ${name.padEnd(56)} ${entry ? entry.from : '**没登记**'}`);
     }
   }

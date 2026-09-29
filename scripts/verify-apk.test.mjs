@@ -774,9 +774,24 @@ const AAPT2_DUMP = [
 
 test('反向对照：真 aapt2 输出解析出 11 条请求 + 1 条声明，且判据全绿', () => {
   const parsed = parseAapt2Permissions(AAPT2_DUMP);
+  assert.equal(parsed.packageName, 'com.polaris2.app');
   assert.equal(parsed.uses.length, 11);
   assert.equal(parsed.declared.length, 1);
   assert.deepEqual(permissionViolations(parsed), []);
+});
+
+test('Debug 包只重基 applicationId 权限，Release 身份与其余权限仍严格验收', () => {
+  const debug = parseAapt2Permissions(AAPT2_DUMP.replaceAll('com.polaris2.app', 'com.polaris2.app.debug'));
+  assert.equal(debug.packageName, 'com.polaris2.app.debug');
+  assert.deepEqual(permissionViolations(debug), []);
+  const wrongPermission = parseAapt2Permissions(
+    AAPT2_DUMP.replace('package: com.polaris2.app', 'package: com.polaris2.app.debug'),
+  );
+  assert.ok(permissionViolations(wrongPermission).some((v) => v.includes('DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION')));
+  const unexpectedId = parseAapt2Permissions(
+    AAPT2_DUMP.replace('package: com.polaris2.app', 'package: com.polaris2.app.other'),
+  );
+  assert.match(permissionViolations(unexpectedId)[0], /applicationId/);
 });
 
 test('解析器按行首锚定：`permission:` 那一行不许被算成一次请求', () => {
