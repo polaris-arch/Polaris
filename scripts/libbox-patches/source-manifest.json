@@ -59,7 +59,7 @@
     },
     {
       "file": "construction-validation.patch",
-      "sha256": "8753619a2e8992990e7cc0107978b8111bbbec2553b09efb7e455213ff38f930"
+      "sha256": "e28b6e99e7f1a1637c0fb8847ff65e226fbf21942aa86100e706e19ef44730cf"
     }
   ],
   "ndkSelectionReason": "NDK 27.3.13750724 arm64 linker rejects the pinned Cronet static archive with unknown relocation (315); cached NDK 30 preserves upstream dependencies and all feature tags.",

@@ -1,8 +1,14 @@
 diff --git a/adapter/certificate/manager.go b/adapter/certificate/manager.go
-index e4b9b53..afad1f1 100644
+index e4b9b53..d3e9381 100644
 --- a/adapter/certificate/manager.go
 +++ b/adapter/certificate/manager.go
-@@ -7,6 +7,7 @@ import (
+@@ -2,11 +2,13 @@ package certificate
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"os"
+ 	"sync"
  	"time"
  
  	"github.com/sagernet/sing-box/adapter"
@@ -10,7 +16,7 @@ index e4b9b53..afad1f1 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -22,6 +23,7 @@ type Manager struct {
+@@ -22,6 +24,7 @@ type Manager struct {
  	registry      adapter.CertificateProviderRegistry
  	access        sync.Mutex
  	started       bool
@@ -18,7 +24,7 @@ index e4b9b53..afad1f1 100644
  	stage         adapter.StartStage
  	providers     []adapter.CertificateProviderService
  	providerByTag map[string]adapter.CertificateProviderService
-@@ -53,19 +55,22 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -53,19 +56,22 @@ func (m *Manager) Start(stage adapter.StartStage) error {
  			return E.Cause(err, stage, " ", name)
  		}
  		m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
@@ -45,7 +51,7 @@ index e4b9b53..afad1f1 100644
  	monitor := taskmonitor.New(m.logger, C.StopTimeout)
  	var err error
  	for _, provider := range providers {
-@@ -73,7 +78,7 @@ func (m *Manager) Close() error {
+@@ -73,7 +79,7 @@ func (m *Manager) Close() error {
  		m.logger.Trace("close ", name)
  		startTime := time.Now()
  		monitor.Start("close ", name)
@@ -54,7 +60,7 @@ index e4b9b53..afad1f1 100644
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -110,16 +115,21 @@ func (m *Manager) Remove(tag string) error {
+@@ -110,16 +116,27 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid certificate provider index")
  	}
  	m.providers = append(m.providers[:index], m.providers[index+1:]...)
@@ -69,9 +75,16 @@ index e4b9b53..afad1f1 100644
 +	return construction.Dispose("removed provider", provider, runtimeOwned)
  }
  
- func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) error {
- 	provider, err := m.registry.Create(ctx, logger, tag, providerType, options)
+-func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) error {
++func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) (err error) {
 +	owned := false
++	ctx, complete := construction.Begin(ctx)
++	defer func() {
++		if cleanupErr := complete(owned); cleanupErr != nil {
++			err = errors.Join(err, cleanupErr)
++		}
++	}()
+ 	provider, err := m.registry.Create(ctx, logger, tag, providerType, options)
 +	runtimeOwned := false
 +	defer func() {
 +		if !owned && provider != nil {
@@ -81,7 +94,7 @@ index e4b9b53..afad1f1 100644
  	if err != nil {
  		return err
  	}
-@@ -135,14 +145,19 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -135,15 +152,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  				return E.Cause(err, stage, " ", name)
  			}
  			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
@@ -95,18 +108,19 @@ index e4b9b53..afad1f1 100644
 -			err = existsProvider.Close()
 -			if err != nil {
 -				return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
--			}
 +		err = construction.Replace(ctx, "replaced provider", existsProvider, m.runtimeOwners[tag])
 +		if !m.runtimeOwners[tag] {
-+			construction.RecordError(ctx, err)
-+			err = nil
-+		}
++			if err == nil || construction.RecordError(ctx, err) {
++				err = nil
+ 			}
+ 		}
 +		if err != nil {
 +			return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
- 		}
++		}
  		existsIndex := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
  			return it == existsProvider
-@@ -153,6 +168,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 		})
+@@ -153,6 +176,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
  	}
  	m.providers = append(m.providers, provider)
@@ -312,11 +326,102 @@ index 0000000..758a333
 +		})
 +	}
 +}
+diff --git a/adapter/certificate/manager_terminal_scope_test.go b/adapter/certificate/manager_terminal_scope_test.go
+new file mode 100644
+index 0000000..de74207
+--- /dev/null
++++ b/adapter/certificate/manager_terminal_scope_test.go
+@@ -0,0 +1,80 @@
++package certificate
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++func TestTerminalContextFactoryCleanupAndSuccessfulPublication(t *testing.T) {
++	for _, transfer := range []bool{false, true} {
++		for _, result := range []string{"object-error", "internal-error", "published"} {
++			t.Run(map[bool]string{false: "closed", true: "transferred"}[transfer]+"/"+result, func(t *testing.T) {
++				var parent construction.Scope
++				ctx := construction.WithScope(context.Background(), &parent)
++				if transfer {
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				} else if err := parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("late factory failed")
++				cleanupFailure := errors.New("late cleanup failed")
++				disposed, internal := 0, 0
++				registry := NewRegistry()
++				Register[struct{}](registry, "terminal-factory", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.CertificateProviderService, error) {
++					if result == "internal-error" {
++						token := construction.Register(ctx, "internal late acquire", func() error { internal++; return cleanupFailure })
++						if token.Err() != nil {
++							t.Fatalf("current factory has no live scope: %v", token.Err())
++						}
++						return nil, failure
++					}
++					child := constructionProbe{tag: tag, closed: &disposed}
++					if result == "object-error" {
++						child.failure = cleanupFailure
++						return child, failure
++					}
++					return child, nil
++				})
++				m := NewManager(logger, registry)
++				err := m.Create(ctx, logger, "probe", "terminal-factory", nil)
++				if result == "published" {
++					if err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 0 {
++						t.Fatal("scope destroyed a successfully published child")
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 1 {
++						t.Fatalf("published child disposal count = %d", disposed)
++					}
++				} else {
++					if !errors.Is(err, failure) || !errors.Is(err, cleanupFailure) {
++						t.Fatalf("current operation lost constructor or cleanup error: %v", err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatalf("late cleanup was stranded: object/internal = %d/%d", disposed, internal)
++					}
++					if err = parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatal("terminated parent reclaimed current operation's resource twice")
++					}
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/endpoint/manager.go b/adapter/endpoint/manager.go
-index ff1889a..74863f9 100644
+index ff1889a..bf68f08 100644
 --- a/adapter/endpoint/manager.go
 +++ b/adapter/endpoint/manager.go
-@@ -6,6 +6,7 @@ import (
+@@ -2,10 +2,12 @@ package endpoint
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"os"
  	"sync"
  
  	"github.com/sagernet/sing-box/adapter"
@@ -324,7 +429,7 @@ index ff1889a..74863f9 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -20,6 +21,7 @@ type Manager struct {
+@@ -20,6 +22,7 @@ type Manager struct {
  	registry      adapter.EndpointRegistry
  	access        sync.Mutex
  	started       bool
@@ -332,7 +437,7 @@ index ff1889a..74863f9 100644
  	stage         adapter.StartStage
  	endpoints     []adapter.Endpoint
  	endpointByTag map[string]adapter.Endpoint
-@@ -59,20 +61,20 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -59,20 +62,20 @@ func (m *Manager) Start(stage adapter.StartStage) error {
  
  func (m *Manager) Close() error {
  	m.access.Lock()
@@ -358,7 +463,7 @@ index ff1889a..74863f9 100644
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -109,16 +111,21 @@ func (m *Manager) Remove(tag string) error {
+@@ -109,16 +112,27 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid endpoint index")
  	}
  	m.endpoints = append(m.endpoints[:index], m.endpoints[index+1:]...)
@@ -373,9 +478,16 @@ index ff1889a..74863f9 100644
 +	return construction.Dispose("removed endpoint", endpoint, runtimeOwned)
  }
  
- func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
- 	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
+-func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
++func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) (err error) {
 +	owned := false
++	ctx, complete := construction.Begin(ctx)
++	defer func() {
++		if cleanupErr := complete(owned); cleanupErr != nil {
++			err = errors.Join(err, cleanupErr)
++		}
++	}()
+ 	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
 +	runtimeOwned := false
 +	defer func() {
 +		if !owned && endpoint != nil {
@@ -385,7 +497,7 @@ index ff1889a..74863f9 100644
  	if err != nil {
  		return err
  	}
-@@ -133,14 +140,19 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -133,15 +147,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -399,18 +511,19 @@ index ff1889a..74863f9 100644
 -			err = existsEndpoint.Close()
 -			if err != nil {
 -				return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
--			}
 +		err = construction.Replace(ctx, "replaced endpoint", existsEndpoint, m.runtimeOwners[tag])
 +		if !m.runtimeOwners[tag] {
-+			construction.RecordError(ctx, err)
-+			err = nil
-+		}
++			if err == nil || construction.RecordError(ctx, err) {
++				err = nil
+ 			}
+ 		}
 +		if err != nil {
 +			return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
- 		}
++		}
  		existsIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
  			return it == existsEndpoint
-@@ -151,6 +163,24 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		})
+@@ -151,6 +171,24 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.endpoints = append(m.endpoints[:existsIndex], m.endpoints[existsIndex+1:]...)
  	}
  	m.endpoints = append(m.endpoints, endpoint)
@@ -649,11 +762,102 @@ index 0000000..f31356a
 +		})
 +	}
 +}
+diff --git a/adapter/endpoint/manager_terminal_scope_test.go b/adapter/endpoint/manager_terminal_scope_test.go
+new file mode 100644
+index 0000000..ee38f57
+--- /dev/null
++++ b/adapter/endpoint/manager_terminal_scope_test.go
+@@ -0,0 +1,80 @@
++package endpoint
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++func TestTerminalContextFactoryCleanupAndSuccessfulPublication(t *testing.T) {
++	for _, transfer := range []bool{false, true} {
++		for _, result := range []string{"object-error", "internal-error", "published"} {
++			t.Run(map[bool]string{false: "closed", true: "transferred"}[transfer]+"/"+result, func(t *testing.T) {
++				var parent construction.Scope
++				ctx := construction.WithScope(context.Background(), &parent)
++				if transfer {
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				} else if err := parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("late factory failed")
++				cleanupFailure := errors.New("late cleanup failed")
++				disposed, internal := 0, 0
++				registry := NewRegistry()
++				Register[struct{}](registry, "terminal-factory", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Endpoint, error) {
++					if result == "internal-error" {
++						token := construction.Register(ctx, "internal late acquire", func() error { internal++; return cleanupFailure })
++						if token.Err() != nil {
++							t.Fatalf("current factory has no live scope: %v", token.Err())
++						}
++						return nil, failure
++					}
++					child := constructionProbe{tag: tag, closed: &disposed}
++					if result == "object-error" {
++						child.failure = cleanupFailure
++						return child, failure
++					}
++					return child, nil
++				})
++				m := NewManager(logger, registry)
++				err := m.Create(ctx, nil, logger, "probe", "terminal-factory", nil)
++				if result == "published" {
++					if err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 0 {
++						t.Fatal("scope destroyed a successfully published child")
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 1 {
++						t.Fatalf("published child disposal count = %d", disposed)
++					}
++				} else {
++					if !errors.Is(err, failure) || !errors.Is(err, cleanupFailure) {
++						t.Fatalf("current operation lost constructor or cleanup error: %v", err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatalf("late cleanup was stranded: object/internal = %d/%d", disposed, internal)
++					}
++					if err = parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatal("terminated parent reclaimed current operation's resource twice")
++					}
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/inbound/manager.go b/adapter/inbound/manager.go
-index 075e410..66155be 100644
+index 075e410..d2bd533 100644
 --- a/adapter/inbound/manager.go
 +++ b/adapter/inbound/manager.go
-@@ -6,6 +6,7 @@ import (
+@@ -2,10 +2,12 @@ package inbound
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"os"
  	"sync"
  
  	"github.com/sagernet/sing-box/adapter"
@@ -661,7 +865,7 @@ index 075e410..66155be 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -16,14 +17,15 @@ import (
+@@ -16,14 +18,15 @@ import (
  var _ adapter.InboundManager = (*Manager)(nil)
  
  type Manager struct {
@@ -685,7 +889,7 @@ index 075e410..66155be 100644
  }
  
  func NewManager(logger log.ContextLogger, registry adapter.InboundRegistry, endpoint adapter.EndpointManager) *Manager {
-@@ -52,26 +54,29 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -52,26 +55,29 @@ func (m *Manager) Start(stage adapter.StartStage) error {
  		if err != nil {
  			return E.Cause(err, stage, " ", name)
  		}
@@ -720,7 +924,7 @@ index 075e410..66155be 100644
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -111,16 +116,21 @@ func (m *Manager) Remove(tag string) error {
+@@ -111,16 +117,27 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid inbound index")
  	}
  	m.inbounds = append(m.inbounds[:index], m.inbounds[index+1:]...)
@@ -735,9 +939,16 @@ index 075e410..66155be 100644
 +	return construction.Dispose("removed inbound", inbound, runtimeOwned)
  }
  
- func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
- 	inbound, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
+-func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
++func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) (err error) {
 +	owned := false
++	ctx, complete := construction.Begin(ctx)
++	defer func() {
++		if cleanupErr := complete(owned); cleanupErr != nil {
++			err = errors.Join(err, cleanupErr)
++		}
++	}()
+ 	inbound, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
 +	runtimeOwned := false
 +	defer func() {
 +		if !owned && inbound != nil {
@@ -747,7 +958,7 @@ index 075e410..66155be 100644
  	if err != nil {
  		return err
  	}
-@@ -135,14 +145,19 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -135,15 +152,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -761,18 +972,19 @@ index 075e410..66155be 100644
 -			err = existsInbound.Close()
 -			if err != nil {
 -				return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
--			}
 +		err = construction.Replace(ctx, "replaced inbound", existsInbound, m.runtimeOwners[tag])
 +		if !m.runtimeOwners[tag] {
-+			construction.RecordError(ctx, err)
-+			err = nil
-+		}
++			if err == nil || construction.RecordError(ctx, err) {
++				err = nil
+ 			}
+ 		}
 +		if err != nil {
 +			return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
- 		}
++		}
  		existsIndex := common.Index(m.inbounds, func(it adapter.Inbound) bool {
  			return it == existsInbound
-@@ -153,6 +168,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		})
+@@ -153,6 +176,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.inbounds = append(m.inbounds[:existsIndex], m.inbounds[existsIndex+1:]...)
  	}
  	m.inbounds = append(m.inbounds, inbound)
@@ -1005,15 +1217,102 @@ index 0000000..7cd8497
 +		})
 +	}
 +}
+diff --git a/adapter/inbound/manager_terminal_scope_test.go b/adapter/inbound/manager_terminal_scope_test.go
+new file mode 100644
+index 0000000..9184bd4
+--- /dev/null
++++ b/adapter/inbound/manager_terminal_scope_test.go
+@@ -0,0 +1,80 @@
++package inbound
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++func TestTerminalContextFactoryCleanupAndSuccessfulPublication(t *testing.T) {
++	for _, transfer := range []bool{false, true} {
++		for _, result := range []string{"object-error", "internal-error", "published"} {
++			t.Run(map[bool]string{false: "closed", true: "transferred"}[transfer]+"/"+result, func(t *testing.T) {
++				var parent construction.Scope
++				ctx := construction.WithScope(context.Background(), &parent)
++				if transfer {
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				} else if err := parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("late factory failed")
++				cleanupFailure := errors.New("late cleanup failed")
++				disposed, internal := 0, 0
++				registry := NewRegistry()
++				Register[struct{}](registry, "terminal-factory", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
++					if result == "internal-error" {
++						token := construction.Register(ctx, "internal late acquire", func() error { internal++; return cleanupFailure })
++						if token.Err() != nil {
++							t.Fatalf("current factory has no live scope: %v", token.Err())
++						}
++						return nil, failure
++					}
++					child := constructionProbe{tag: tag, closed: &disposed}
++					if result == "object-error" {
++						child.failure = cleanupFailure
++						return child, failure
++					}
++					return child, nil
++				})
++				m := NewManager(logger, registry, nil)
++				err := m.Create(ctx, nil, logger, "probe", "terminal-factory", nil)
++				if result == "published" {
++					if err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 0 {
++						t.Fatal("scope destroyed a successfully published child")
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 1 {
++						t.Fatalf("published child disposal count = %d", disposed)
++					}
++				} else {
++					if !errors.Is(err, failure) || !errors.Is(err, cleanupFailure) {
++						t.Fatalf("current operation lost constructor or cleanup error: %v", err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatalf("late cleanup was stranded: object/internal = %d/%d", disposed, internal)
++					}
++					if err = parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatal("terminated parent reclaimed current operation's resource twice")
++					}
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/outbound/manager.go b/adapter/outbound/manager.go
-index e4abba6..31f9893 100644
+index e4abba6..4fdfbca 100644
 --- a/adapter/outbound/manager.go
 +++ b/adapter/outbound/manager.go
-@@ -2,12 +2,12 @@ package outbound
+@@ -2,12 +2,13 @@ package outbound
  
  import (
  	"context"
 -	"io"
++	"errors"
  	"os"
  	"strings"
  	"sync"
@@ -1023,7 +1322,7 @@ index e4abba6..31f9893 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -25,6 +25,7 @@ type Manager struct {
+@@ -25,6 +26,7 @@ type Manager struct {
  	defaultTag              string
  	access                  sync.RWMutex
  	started                 bool
@@ -1031,7 +1330,7 @@ index e4abba6..31f9893 100644
  	stage                   adapter.StartStage
  	outbounds               []adapter.Outbound
  	outboundByTag           map[string]adapter.Outbound
-@@ -133,6 +134,12 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
+@@ -133,6 +135,12 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
  					return E.Cause(err, "start ", name)
  				}
  			}
@@ -1044,7 +1343,7 @@ index e4abba6..31f9893 100644
  		}
  		if len(started) == len(outbounds) {
  			break
-@@ -167,26 +174,23 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
+@@ -167,26 +175,23 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
  func (m *Manager) Close() error {
  	monitor := taskmonitor.New(m.logger, C.StopTimeout)
  	m.access.Lock()
@@ -1082,7 +1381,7 @@ index e4abba6..31f9893 100644
  	}
  	return err
  }
-@@ -228,7 +232,6 @@ func (m *Manager) Remove(tag string) error {
+@@ -228,7 +233,6 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid inbound index")
  	}
  	m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
@@ -1090,7 +1389,7 @@ index e4abba6..31f9893 100644
  	if m.defaultOutbound == outbound {
  		if len(m.outbounds) > 0 {
  			m.defaultOutbound = m.outbounds[0]
-@@ -251,10 +254,9 @@ func (m *Manager) Remove(tag string) error {
+@@ -251,17 +255,29 @@ func (m *Manager) Remove(tag string) error {
  			})
  		}
  	}
@@ -1103,12 +1402,19 @@ index e4abba6..31f9893 100644
 +	return construction.Dispose("removed outbound", outbound, runtimeOwned)
  }
  
- func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
-@@ -262,6 +264,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+-func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
++func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) (err error) {
++	owned := false
++	ctx, complete := construction.Begin(ctx)
++	defer func() {
++		if cleanupErr := complete(owned); cleanupErr != nil {
++			err = errors.Join(err, cleanupErr)
++		}
++	}()
+ 	if tag == "" {
  		return os.ErrInvalid
  	}
  	outbound, err := m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
-+	owned := false
 +	runtimeOwned := false
 +	defer func() {
 +		if !owned && outbound != nil {
@@ -1118,7 +1424,7 @@ index e4abba6..31f9893 100644
  	if err != nil {
  		return err
  	}
-@@ -274,16 +283,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -274,17 +290,23 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -1134,18 +1440,19 @@ index e4abba6..31f9893 100644
 -			err = common.Close(existsOutbound)
 -			if err != nil {
 -				return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
--			}
 +		err = construction.Replace(ctx, "replaced outbound", existsOutbound, m.runtimeOwners[tag])
 +		if !m.runtimeOwners[tag] {
-+			construction.RecordError(ctx, err)
-+			err = nil
-+		}
++			if err == nil || construction.RecordError(ctx, err) {
++				err = nil
+ 			}
+ 		}
 +		if err != nil {
 +			return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
- 		}
++		}
  		existsIndex := common.Index(m.outbounds, func(it adapter.Outbound) bool {
  			return it == existsOutbound
-@@ -294,7 +308,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		})
+@@ -294,7 +316,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
  	}
  	m.outbounds = append(m.outbounds, outbound)
@@ -1158,7 +1465,7 @@ index e4abba6..31f9893 100644
  	dependencies := outbound.Dependencies()
  	for _, dependency := range dependencies {
  		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
-@@ -307,3 +326,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -307,3 +334,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  	}
  	return nil
  }
@@ -1388,11 +1695,106 @@ index 0000000..f83d7b4
 +		})
 +	}
 +}
+diff --git a/adapter/outbound/manager_terminal_scope_test.go b/adapter/outbound/manager_terminal_scope_test.go
+new file mode 100644
+index 0000000..e6463a0
+--- /dev/null
++++ b/adapter/outbound/manager_terminal_scope_test.go
+@@ -0,0 +1,84 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type terminalFactoryProbe struct{ constructionProbe }
++
++func (terminalFactoryProbe) Dependencies() []string { return nil }
++
++func TestTerminalContextFactoryCleanupAndSuccessfulPublication(t *testing.T) {
++	for _, transfer := range []bool{false, true} {
++		for _, result := range []string{"object-error", "internal-error", "published"} {
++			t.Run(map[bool]string{false: "closed", true: "transferred"}[transfer]+"/"+result, func(t *testing.T) {
++				var parent construction.Scope
++				ctx := construction.WithScope(context.Background(), &parent)
++				if transfer {
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				} else if err := parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("late factory failed")
++				cleanupFailure := errors.New("late cleanup failed")
++				disposed, internal := 0, 0
++				registry := NewRegistry()
++				Register[struct{}](registry, "terminal-factory", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Outbound, error) {
++					if result == "internal-error" {
++						token := construction.Register(ctx, "internal late acquire", func() error { internal++; return cleanupFailure })
++						if token.Err() != nil {
++							t.Fatalf("current factory has no live scope: %v", token.Err())
++						}
++						return nil, failure
++					}
++					child := terminalFactoryProbe{constructionProbe{tag: tag, closed: &disposed}}
++					if result == "object-error" {
++						child.failure = cleanupFailure
++						return child, failure
++					}
++					return child, nil
++				})
++				m := NewManager(logger, registry, noEndpoints{}, "")
++				err := m.Create(ctx, nil, logger, "probe", "terminal-factory", nil)
++				if result == "published" {
++					if err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 0 {
++						t.Fatal("scope destroyed a successfully published child")
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 1 {
++						t.Fatalf("published child disposal count = %d", disposed)
++					}
++				} else {
++					if !errors.Is(err, failure) || !errors.Is(err, cleanupFailure) {
++						t.Fatalf("current operation lost constructor or cleanup error: %v", err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatalf("late cleanup was stranded: object/internal = %d/%d", disposed, internal)
++					}
++					if err = parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatal("terminated parent reclaimed current operation's resource twice")
++					}
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/service/manager.go b/adapter/service/manager.go
-index 9db1585..91afd18 100644
+index 9db1585..25c39d5 100644
 --- a/adapter/service/manager.go
 +++ b/adapter/service/manager.go
-@@ -6,6 +6,7 @@ import (
+@@ -2,10 +2,12 @@ package service
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"os"
  	"sync"
  
  	"github.com/sagernet/sing-box/adapter"
@@ -1400,7 +1802,7 @@ index 9db1585..91afd18 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -16,13 +17,14 @@ import (
+@@ -16,13 +18,14 @@ import (
  var _ adapter.ServiceManager = (*Manager)(nil)
  
  type Manager struct {
@@ -1422,7 +1824,7 @@ index 9db1585..91afd18 100644
  }
  
  func NewManager(logger log.ContextLogger, registry adapter.ServiceRegistry) *Manager {
-@@ -50,26 +52,29 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -50,26 +53,29 @@ func (m *Manager) Start(stage adapter.StartStage) error {
  		if err != nil {
  			return E.Cause(err, stage, " ", name)
  		}
@@ -1457,7 +1859,7 @@ index 9db1585..91afd18 100644
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -106,16 +111,21 @@ func (m *Manager) Remove(tag string) error {
+@@ -106,16 +112,27 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid service index")
  	}
  	m.services = append(m.services[:index], m.services[index+1:]...)
@@ -1472,9 +1874,16 @@ index 9db1585..91afd18 100644
 +	return construction.Dispose("removed service", service, runtimeOwned)
  }
  
- func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
- 	service, err := m.registry.Create(ctx, logger, tag, serviceType, options)
+-func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
++func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) (err error) {
 +	owned := false
++	ctx, complete := construction.Begin(ctx)
++	defer func() {
++		if cleanupErr := complete(owned); cleanupErr != nil {
++			err = errors.Join(err, cleanupErr)
++		}
++	}()
+ 	service, err := m.registry.Create(ctx, logger, tag, serviceType, options)
 +	runtimeOwned := false
 +	defer func() {
 +		if !owned && service != nil {
@@ -1484,7 +1893,7 @@ index 9db1585..91afd18 100644
  	if err != nil {
  		return err
  	}
-@@ -130,14 +140,19 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -130,15 +147,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -1498,18 +1907,19 @@ index 9db1585..91afd18 100644
 -			err = existsService.Close()
 -			if err != nil {
 -				return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
--			}
 +		err = construction.Replace(ctx, "replaced service", existsService, m.runtimeOwners[tag])
 +		if !m.runtimeOwners[tag] {
-+			construction.RecordError(ctx, err)
-+			err = nil
-+		}
++			if err == nil || construction.RecordError(ctx, err) {
++				err = nil
+ 			}
+ 		}
 +		if err != nil {
 +			return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
- 		}
++		}
  		existsIndex := common.Index(m.services, func(it adapter.Service) bool {
  			return it == existsService
-@@ -148,6 +163,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 		})
+@@ -148,6 +171,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  		m.services = append(m.services[:existsIndex], m.services[existsIndex+1:]...)
  	}
  	m.services = append(m.services, service)
@@ -1742,19 +2152,114 @@ index 0000000..3e8a19f
 +		})
 +	}
 +}
+diff --git a/adapter/service/manager_terminal_scope_test.go b/adapter/service/manager_terminal_scope_test.go
+new file mode 100644
+index 0000000..1787098
+--- /dev/null
++++ b/adapter/service/manager_terminal_scope_test.go
+@@ -0,0 +1,97 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type publishedHandleProbe struct {
++	constructionProbe
++	internal *int
++}
++
++func (p publishedHandleProbe) DisposeConstruction() error {
++	*p.internal++
++	return p.constructionProbe.DisposeConstruction()
++}
++
++func TestTerminalContextFactoryCleanupAndSuccessfulPublication(t *testing.T) {
++	for _, transfer := range []bool{false, true} {
++		for _, result := range []string{"object-error", "internal-error", "published"} {
++			t.Run(map[bool]string{false: "closed", true: "transferred"}[transfer]+"/"+result, func(t *testing.T) {
++				var parent construction.Scope
++				ctx := construction.WithScope(context.Background(), &parent)
++				if transfer {
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				} else if err := parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("late factory failed")
++				cleanupFailure := errors.New("late cleanup failed")
++				disposed, internal := 0, 0
++				registry := NewRegistry()
++				Register[struct{}](registry, "terminal-factory", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.Service, error) {
++					if result == "internal-error" {
++						token := construction.Register(ctx, "internal late acquire", func() error { internal++; return cleanupFailure })
++						if token.Err() != nil {
++							t.Fatalf("current factory has no live scope: %v", token.Err())
++						}
++						return nil, failure
++					}
++					child := constructionProbe{tag: tag, closed: &disposed}
++					if result == "object-error" {
++						child.failure = cleanupFailure
++						return child, failure
++					}
++					token := construction.Register(ctx, "published internal handle", func() error { internal++; return nil })
++					if token.Err() != nil {
++						t.Fatal(token.Err())
++					}
++					if err := token.Transfer(); err != nil {
++						t.Fatal(err)
++					}
++					return publishedHandleProbe{child, &internal}, nil
++				})
++				m := NewManager(logger, registry)
++				err := m.Create(ctx, logger, "probe", "terminal-factory", nil)
++				if result == "published" {
++					if err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 0 || internal != 0 {
++						t.Fatal("scope destroyed a successfully published child")
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 1 || internal != 1 {
++						t.Fatalf("published child disposal count = %d", disposed)
++					}
++				} else {
++					if !errors.Is(err, failure) || !errors.Is(err, cleanupFailure) {
++						t.Fatalf("current operation lost constructor or cleanup error: %v", err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatalf("late cleanup was stranded: object/internal = %d/%d", disposed, internal)
++					}
++					if err = parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatal("terminated parent reclaimed current operation's resource twice")
++					}
++				}
++			})
++		}
++	}
++}
 diff --git a/box.go b/box.go
-index 13e86d6..da9e5fa 100644
+index 13e86d6..60989a9 100644
 --- a/box.go
 +++ b/box.go
-@@ -2,6 +2,7 @@ package box
- 
- import (
- 	"context"
-+	"errors"
- 	"fmt"
- 	"io"
- 	"net/http"
-@@ -17,6 +18,7 @@ import (
+@@ -17,6 +17,7 @@ import (
  	"github.com/sagernet/sing-box/adapter/outbound"
  	boxService "github.com/sagernet/sing-box/adapter/service"
  	"github.com/sagernet/sing-box/common/certificate"
@@ -1762,7 +2267,7 @@ index 13e86d6..da9e5fa 100644
  	"github.com/sagernet/sing-box/common/dialer"
  	"github.com/sagernet/sing-box/common/httpclient"
  	"github.com/sagernet/sing-box/common/netns"
-@@ -68,6 +70,7 @@ type Box struct {
+@@ -68,6 +69,7 @@ type Box struct {
  	closeStarted        atomic.Bool
  	closeFinished       chan struct{}
  	closeResult         error
@@ -1770,7 +2275,7 @@ index 13e86d6..da9e5fa 100644
  }
  
  type Options struct {
-@@ -116,12 +119,67 @@ func Context(
+@@ -116,12 +118,66 @@ func Context(
  	return ctx
  }
  
@@ -1813,13 +2318,12 @@ index 13e86d6..da9e5fa 100644
 +			}
 +		} else {
 +			instance.constructionCancel = cancel
-+			report.CleanupError = scope.Errors()
++			cleanup := scope.TransferAll()
 +			if awaitRollback {
-+				report.CleanupError = errors.Join(report.CleanupError, scope.DisposePending())
++				report.CleanupError = cleanup.Close()
 +			} else {
-+				go scope.DisposePending()
++				go cleanup.Close()
 +			}
-+			scope.TransferAll()
 +		}
 +	}()
 +	instance, err = newBox(options, &scope, &report)
@@ -1838,7 +2342,7 @@ index 13e86d6..da9e5fa 100644
  	ctx = service.ContextWithDefaultRegistry(ctx)
  
  	endpointRegistry := service.FromContext[adapter.EndpointRegistry](ctx)
-@@ -180,6 +238,7 @@ func New(options Options) (*Box, error) {
+@@ -180,6 +236,7 @@ func New(options Options) (*Box, error) {
  	if platformInterface != nil {
  		defaultLogWriter = io.Discard
  	}
@@ -1846,7 +2350,7 @@ index 13e86d6..da9e5fa 100644
  	logFactory, err := log.New(log.Options{
  		Context:        ctx,
  		Options:        common.PtrValueOrDefault(options.Log),
-@@ -191,6 +250,7 @@ func New(options Options) (*Box, error) {
+@@ -191,6 +248,7 @@ func New(options Options) (*Box, error) {
  	if err != nil {
  		return nil, E.Cause(err, "create log factory")
  	}
@@ -1854,7 +2358,7 @@ index 13e86d6..da9e5fa 100644
  	service.MustRegister[log.Factory](ctx, logFactory)
  
  	var internalServices []adapter.LifecycleService
-@@ -204,6 +264,7 @@ func New(options Options) (*Box, error) {
+@@ -204,6 +262,7 @@ func New(options Options) (*Box, error) {
  		if err != nil {
  			return nil, err
  		}
@@ -1862,7 +2366,7 @@ index 13e86d6..da9e5fa 100644
  		service.MustRegister[adapter.CertificateStore](ctx, certificateStore)
  		internalServices = append(internalServices, certificateStore)
  	}
-@@ -211,6 +272,7 @@ func New(options Options) (*Box, error) {
+@@ -211,6 +270,7 @@ func New(options Options) (*Box, error) {
  	if err != nil {
  		return nil, err
  	}
@@ -1870,7 +2374,7 @@ index 13e86d6..da9e5fa 100644
  	service.MustRegister[adapter.NetworkNamespaceManager](ctx, netnsManager)
  	internalServices = append(internalServices, netnsManager)
  	dnsOptions := common.PtrValueOrDefault(options.DNS)
-@@ -220,6 +282,12 @@ func New(options Options) (*Box, error) {
+@@ -220,6 +280,12 @@ func New(options Options) (*Box, error) {
  	dnsTransportManager := dns.NewTransportManager(logFactory.NewLogger("dns/transport"), dnsTransportRegistry, outboundManager, dnsOptions.Final)
  	serviceManager := boxService.NewManager(logFactory.NewLogger("service"), serviceRegistry)
  	certificateProviderManager := boxCertificate.NewManager(logFactory.NewLogger("certificate-provider"), certificateProviderRegistry)
@@ -1883,7 +2387,7 @@ index 13e86d6..da9e5fa 100644
  	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
  	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
  	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
-@@ -230,20 +298,25 @@ func New(options Options) (*Box, error) {
+@@ -230,20 +296,25 @@ func New(options Options) (*Box, error) {
  	if err != nil {
  		return nil, E.Cause(err, "initialize DNS router")
  	}
@@ -1909,7 +2413,7 @@ index 13e86d6..da9e5fa 100644
  	service.MustRegister[adapter.Router](ctx, router)
  	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
  	if err != nil {
-@@ -251,6 +324,7 @@ func New(options Options) (*Box, error) {
+@@ -251,6 +322,7 @@ func New(options Options) (*Box, error) {
  	}
  	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
  		trafficManager := trafficcontrol.NewManager()
@@ -1917,7 +2421,7 @@ index 13e86d6..da9e5fa 100644
  		service.MustRegisterPtr(ctx, trafficManager)
  		router.AppendTracker(trafficManager)
  		internalServices = append(internalServices, trafficManager)
-@@ -259,10 +333,12 @@ func New(options Options) (*Box, error) {
+@@ -259,10 +331,12 @@ func New(options Options) (*Box, error) {
  			clashDefaultMode = experimentalOptions.ClashAPI.DefaultMode
  		}
  		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
@@ -1930,7 +2434,7 @@ index 13e86d6..da9e5fa 100644
  	internalServices = append(internalServices, referenceManager)
  	ntpOptions := common.PtrValueOrDefault(options.NTP)
  	var timeService *tls.TimeServiceWrapper
-@@ -271,6 +347,9 @@ func New(options Options) (*Box, error) {
+@@ -271,6 +345,9 @@ func New(options Options) (*Box, error) {
  		service.MustRegister[ntp.TimeService](ctx, timeService)
  	}
  	for i, transportOptions := range dnsOptions.Servers {
@@ -1940,7 +2444,7 @@ index 13e86d6..da9e5fa 100644
  		var tag string
  		if transportOptions.Tag != "" {
  			tag = transportOptions.Tag
-@@ -293,6 +372,9 @@ func New(options Options) (*Box, error) {
+@@ -293,6 +370,9 @@ func New(options Options) (*Box, error) {
  		return nil, E.Cause(err, "initialize dns router")
  	}
  	for i, endpointOptions := range options.Endpoints {
@@ -1950,7 +2454,7 @@ index 13e86d6..da9e5fa 100644
  		var tag string
  		if endpointOptions.Tag != "" {
  			tag = endpointOptions.Tag
-@@ -319,6 +401,9 @@ func New(options Options) (*Box, error) {
+@@ -319,6 +399,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, inboundOptions := range options.Inbounds {
@@ -1960,7 +2464,7 @@ index 13e86d6..da9e5fa 100644
  		var tag string
  		if inboundOptions.Tag != "" {
  			tag = inboundOptions.Tag
-@@ -338,6 +423,9 @@ func New(options Options) (*Box, error) {
+@@ -338,6 +421,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, serviceOptions := range options.Services {
@@ -1970,7 +2474,7 @@ index 13e86d6..da9e5fa 100644
  		var tag string
  		if serviceOptions.Tag != "" {
  			tag = serviceOptions.Tag
-@@ -356,6 +444,9 @@ func New(options Options) (*Box, error) {
+@@ -356,6 +442,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, outboundOptions := range options.Outbounds {
@@ -1980,7 +2484,7 @@ index 13e86d6..da9e5fa 100644
  		var tag string
  		if outboundOptions.Tag != "" {
  			tag = outboundOptions.Tag
-@@ -382,6 +473,9 @@ func New(options Options) (*Box, error) {
+@@ -382,6 +471,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, certificateProviderOptions := range options.CertificateProviders {
@@ -1990,7 +2494,7 @@ index 13e86d6..da9e5fa 100644
  		var tag string
  		if certificateProviderOptions.Tag != "" {
  			tag = certificateProviderOptions.Tag
-@@ -431,6 +525,7 @@ func New(options Options) (*Box, error) {
+@@ -431,6 +523,7 @@ func New(options Options) (*Box, error) {
  	}
  	if needCacheFile {
  		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
@@ -1998,7 +2502,7 @@ index 13e86d6..da9e5fa 100644
  		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
  		internalServices = append(internalServices, cacheFile)
  	}
-@@ -439,6 +534,7 @@ func New(options Options) (*Box, error) {
+@@ -439,6 +532,7 @@ func New(options Options) (*Box, error) {
  		if err != nil {
  			return nil, E.Cause(err, "create clash-server")
  		}
@@ -2006,7 +2510,7 @@ index 13e86d6..da9e5fa 100644
  		internalServices = append(internalServices, clashServer)
  	}
  	if needV2RayAPI {
-@@ -446,6 +542,7 @@ func New(options Options) (*Box, error) {
+@@ -446,6 +540,7 @@ func New(options Options) (*Box, error) {
  		if err != nil {
  			return nil, E.Cause(err, "create v2ray-server")
  		}
@@ -2014,7 +2518,7 @@ index 13e86d6..da9e5fa 100644
  		if v2rayServer.StatsService() != nil {
  			router.AppendTracker(v2rayServer.StatsService())
  			internalServices = append(internalServices, v2rayServer)
-@@ -471,9 +568,13 @@ func New(options Options) (*Box, error) {
+@@ -471,9 +566,13 @@ func New(options Options) (*Box, error) {
  			Interval:      time.Duration(ntpOptions.Interval),
  			WriteToSystem: ntpOptions.WriteToSystem,
  		})
@@ -2028,7 +2532,7 @@ index 13e86d6..da9e5fa 100644
  	return &Box{
  		ctx:                 ctx,
  		network:             networkManager,
-@@ -638,6 +739,9 @@ func (s *Box) finishClose() error {
+@@ -638,6 +737,9 @@ func (s *Box) finishClose() error {
  }
  
  func (s *Box) close() error {
@@ -2038,7 +2542,7 @@ index 13e86d6..da9e5fa 100644
  	close(s.done)
  	var err error
  	if s.debugHTTPServer != nil {
-@@ -662,7 +766,7 @@ func (s *Box) close() error {
+@@ -662,7 +764,7 @@ func (s *Box) close() error {
  		{"network", s.network},
  	} {
  		done := adapter.LogElapsed(s.logger, "close ", closeItem.name)
@@ -2047,7 +2551,7 @@ index 13e86d6..da9e5fa 100644
  			return E.Cause(err, "close ", closeItem.name)
  		})
  		done()
-@@ -670,20 +774,20 @@ func (s *Box) close() error {
+@@ -670,20 +772,20 @@ func (s *Box) close() error {
  	if s.httpClientService != nil {
  		s.logger.Trace("close ", s.httpClientService.Name())
  		startTime := time.Now()
@@ -2327,10 +2831,10 @@ index 34871a6..5f34090 100644
  
 diff --git a/common/construction/scope.go b/common/construction/scope.go
 new file mode 100644
-index 0000000..3ca671b
+index 0000000..5cfa53e
 --- /dev/null
 +++ b/common/construction/scope.go
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,306 @@
 +// Package construction tracks resources acquired before a lifecycle owner exists.
 +// Completing this stack is cleanup evidence, not proof of a complete resource audit.
 +package construction
@@ -2344,15 +2848,73 @@ index 0000000..3ca671b
 +)
 +
 +type Scope struct {
-+	access  sync.Mutex
-+	entries []*Ownership
-+	pending []*Ownership
-+	errors  []error
++	access   sync.Mutex
++	entries  []*Ownership
++	errors   []error
++	terminal bool
 +}
 +
 +type Ownership struct {
-+	name    string
-+	cleanup func() error
++	name      string
++	cleanup   func() error
++	owner     *Scope
++	access    *sync.Mutex
++	rejection error
++	residual  bool
++}
++
++// Cleanup owns detached residual disposal, never the published runtime child.
++type Cleanup struct {
++	entries []*Ownership
++	errors  []error
++	once    sync.Once
++	result  error
++}
++
++func (c *Cleanup) Close() error {
++	if c == nil {
++		return nil
++	}
++	c.once.Do(func() {
++		errs := c.errors
++		for i := len(c.entries) - 1; i >= 0; i-- {
++			errs = append(errs, c.entries[i].Close())
++		}
++		c.entries, c.errors = nil, nil
++		c.result = errors.Join(errs...)
++	})
++	return c.result
++}
++
++var ErrScopeTerminated = errors.New("construction scope has terminated")
++var ErrScopeUnavailable = errors.New("no active construction scope")
++var ErrOwnershipReleased = errors.New("construction ownership has been released")
++
++// Begin gives the current factory operation its own scope. Failed operations
++// and residual replacement cleanup can defer to an active construction parent;
++// after that parent terminates, the current operation drains them itself.
++func Begin(ctx context.Context) (context.Context, func(published bool) error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	parent, _ := ctx.Value(contextKey{}).(*Scope)
++	scope := new(Scope)
++	return WithScope(ctx, scope), func(published bool) error {
++		if published {
++			cleanup := scope.TransferAll()
++			if cleanup == nil {
++				return nil
++			}
++			if parent != nil && parent.appendPending("factory residual cleanup", cleanup.Close) {
++				return nil
++			}
++			return cleanup.Close()
++		}
++		if parent != nil && parent.appendPending("failed factory operation", scope.Close) {
++			return nil
++		}
++		return scope.Close()
++	}
 +}
 +
 +type contextKey struct{}
@@ -2382,18 +2944,19 @@ index 0000000..3ca671b
 +
 +// DeferCleanup keeps a failed constructor's disposal on the construction
 +// owner, so ordinary New can preserve prompt error/panic propagation.
-+func DeferCleanup(ctx context.Context, name string, cleanup func() error) {
++func DeferCleanup(ctx context.Context, name string, cleanup func() error) error {
 +	if ctx != nil {
 +		if scope, _ := ctx.Value(contextKey{}).(*Scope); scope != nil {
-+			scope.Add(name, cleanup)
-+			return
++			if scope.appendPending(name, cleanup) {
++				return nil
++			}
 +		}
 +	}
-+	RecordError(ctx, Close(name, cleanup))
++	return Close(name, cleanup)
 +}
 +
-+func DisposeOrDefer(ctx context.Context, name string, value any, runtimeOwner bool) {
-+	DeferCleanup(ctx, name, func() error { return Dispose(name, value, runtimeOwner) })
++func DisposeOrDefer(ctx context.Context, name string, value any, runtimeOwner bool) error {
++	return DeferCleanup(ctx, name, func() error { return Dispose(name, value, runtimeOwner) })
 +}
 +
 +// Replace defers construction disposal separately from the resources transferred
@@ -2401,10 +2964,9 @@ index 0000000..3ca671b
 +func Replace(ctx context.Context, name string, value any, runtimeOwner bool) error {
 +	if !runtimeOwner && ctx != nil {
 +		if scope, _ := ctx.Value(contextKey{}).(*Scope); scope != nil {
-+			scope.access.Lock()
-+			scope.pending = append(scope.pending, &Ownership{name: name, cleanup: func() error { return Dispose(name, value, false) }})
-+			scope.access.Unlock()
-+			return nil
++			if scope.appendPending(name, func() error { return Dispose(name, value, false) }) {
++				return nil
++			}
 +		}
 +	}
 +	return Dispose(name, value, runtimeOwner)
@@ -2417,69 +2979,149 @@ index 0000000..3ca671b
 +// Register must follow the first successful acquire, before another operation
 +// can fail. Transfer when a parent assumes responsibility for that resource.
 +func Register(ctx context.Context, name string, cleanup func() error) *Ownership {
-+	scope, _ := ctx.Value(contextKey{}).(*Scope)
++	var scope *Scope
++	if ctx != nil {
++		scope, _ = ctx.Value(contextKey{}).(*Scope)
++	}
 +	if scope == nil {
-+		return &Ownership{}
++		return &Ownership{name: name, cleanup: cleanup, access: new(sync.Mutex), rejection: ErrScopeUnavailable}
 +	}
 +	return scope.Add(name, cleanup)
 +}
 +
 +func (s *Scope) Add(name string, cleanup func() error) *Ownership {
-+	entry := &Ownership{name: name, cleanup: cleanup}
++	if entry := s.appendEntry(name, cleanup); entry != nil {
++		return entry
++	}
++	// Rejected registration stays caller-owned. Inspect Err and dispose it; it
++	// is never closed eagerly, queued on a terminal scope, or transferable.
++	return &Ownership{name: name, cleanup: cleanup, owner: s, access: &s.access, rejection: ErrScopeTerminated}
++}
++
++func (s *Scope) appendEntry(name string, cleanup func() error) *Ownership {
 +	s.access.Lock()
++	defer s.access.Unlock()
++	if s.terminal {
++		return nil
++	}
++	entry := &Ownership{name: name, cleanup: cleanup, owner: s, access: &s.access}
 +	s.entries = append(s.entries, entry)
-+	s.access.Unlock()
 +	return entry
 +}
 +
-+// Transfer is only called by the synchronous construction owner, before Close.
-+func (o *Ownership) Transfer() { o.cleanup = nil }
++func (s *Scope) appendPending(name string, cleanup func() error) bool {
++	s.access.Lock()
++	defer s.access.Unlock()
++	if s.terminal {
++		return false
++	}
++	s.entries = append(s.entries, &Ownership{name: name, cleanup: cleanup, owner: s, access: &s.access, residual: true})
++	return true
++}
 +
-+func RecordError(ctx context.Context, err error) {
++// Err reports admission rejection. The caller retains a rejected resource and
++// must Close it before returning the rejection, rather than continuing to use it.
++func (o *Ownership) Err() error { return o.rejection }
++
++// Transfer relinquishes an admitted cleanup only before scope termination. The
++// shared scope lock linearizes it with terminal detach and Close.
++func (o *Ownership) Transfer() error {
++	o.access.Lock()
++	defer o.access.Unlock()
++	if o.rejection != nil {
++		return o.rejection
++	}
++	if o.owner.terminal {
++		return ErrScopeTerminated
++	}
++	if o.cleanup == nil {
++		return ErrOwnershipReleased
++	}
++	o.cleanup = nil
++	return nil
++}
++
++func (o *Ownership) Close() error {
++	o.access.Lock()
++	cleanup := o.cleanup
++	o.cleanup = nil
++	o.access.Unlock()
++	if cleanup == nil {
++		return nil
++	}
++	return Close(o.name, cleanup)
++}
++
++func RecordError(ctx context.Context, err error) bool {
 +	if err == nil || ctx == nil {
-+		return
++		return false
 +	}
 +	if scope, _ := ctx.Value(contextKey{}).(*Scope); scope != nil {
 +		scope.access.Lock()
++		defer scope.access.Unlock()
++		if scope.terminal {
++			return false
++		}
 +		scope.errors = append(scope.errors, err)
-+		scope.access.Unlock()
++		return true
 +	}
++	return false
 +}
 +
 +// Close keeps draining the stack after an error or a cleanup panic. A blocking
 +// callback still owns the stack; cancellation alone never proves quiescence.
 +func (s *Scope) Close() error {
 +	s.access.Lock()
-+	entries, errs, pending := s.entries, s.errors, s.pending
-+	s.entries, s.errors, s.pending = nil, nil, nil
-+	s.access.Unlock()
-+	// Replaced objects precede their replacement's parent in acquisition order.
-+	entries = append(pending, entries...)
-+	for i := len(entries) - 1; i >= 0; i-- {
-+		if entries[i].cleanup != nil {
-+			errs = append(errs, Close(entries[i].name, entries[i].cleanup))
-+		}
++	if s.terminal {
++		s.access.Unlock()
++		return nil
 +	}
-+	return errors.Join(errs...)
++	s.terminal = true
++	entries, errs := s.entries, s.errors
++	s.entries, s.errors = nil, nil
++	s.access.Unlock()
++	return (&Cleanup{entries: entries, errors: errs}).Close()
 +}
 +
 +func (s *Scope) DisposePending() error {
 +	s.access.Lock()
-+	entries := s.pending
-+	s.pending = nil
-+	s.access.Unlock()
-+	var errs []error
-+	for i := len(entries) - 1; i >= 0; i-- {
-+		errs = append(errs, Close(entries[i].name, entries[i].cleanup))
++	var entries, retained []*Ownership
++	for _, entry := range s.entries {
++		if entry.residual {
++			entries = append(entries, entry)
++		} else {
++			retained = append(retained, entry)
++		}
 +	}
-+	return errors.Join(errs...)
++	s.entries = retained
++	s.access.Unlock()
++	return (&Cleanup{entries: entries}).Close()
 +}
 +
-+// TransferAll hands the registered top-level resources to the completed Box.
-+func (s *Scope) TransferAll() {
++// TransferAll atomically terminates admission and hands admitted resources to
++// their published runtime owner. It returns residual cleanup to the current
++// operation; that batch must actually be drained and is never owned by Box.
++func (s *Scope) TransferAll() *Cleanup {
 +	s.access.Lock()
++	defer s.access.Unlock()
++	if s.terminal {
++		return &Cleanup{errors: []error{ErrScopeTerminated}}
++	}
++	s.terminal = true
++	cleanup := &Cleanup{errors: s.errors}
++	for _, entry := range s.entries {
++		if entry.residual {
++			cleanup.entries = append(cleanup.entries, entry)
++		} else {
++			entry.cleanup = nil
++		}
++	}
 +	s.entries = nil
-+	s.access.Unlock()
++	s.errors = nil
++	if len(cleanup.entries) == 0 && len(cleanup.errors) == 0 {
++		return nil
++	}
++	return cleanup
 +}
 +
 +func (s *Scope) Errors() error {
@@ -2499,9 +3141,297 @@ index 0000000..3ca671b
 +	}
 +	return nil
 +}
+diff --git a/common/construction/scope_terminal_test.go b/common/construction/scope_terminal_test.go
+new file mode 100644
+index 0000000..dac1482
+--- /dev/null
++++ b/common/construction/scope_terminal_test.go
+@@ -0,0 +1,282 @@
++package construction
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func assertDetached(t *testing.T, scope *Scope) {
++	t.Helper()
++	scope.access.Lock()
++	defer scope.access.Unlock()
++	if !scope.terminal || len(scope.entries) != 0 || len(scope.errors) != 0 {
++		t.Fatal("terminated scope retained admission or unconsumed work")
++	}
++}
++
++func TestHandledFactoryFailureStaysResidualAfterParentPublication(t *testing.T) {
++	var parent Scope
++	ctx := WithScope(context.Background(), &parent)
++	child, complete := Begin(ctx)
++	closed := 0
++	failure := errors.New("handled constructor cleanup failed")
++	if err := DeferCleanup(child, "failed constructor", func() error { closed++; return failure }); err != nil {
++		t.Fatal(err)
++	}
++	if err := complete(false); err != nil {
++		t.Fatal("active parent should retain failed-operation cleanup", err)
++	}
++	if closed != 0 {
++		t.Fatal("active parent cleanup was forced synchronous")
++	}
++	cleanup := parent.TransferAll()
++	if err := cleanup.Close(); !errors.Is(err, failure) {
++		t.Fatalf("failed operation was incorrectly transferred as a published resource: %v", err)
++	}
++	if closed != 1 {
++		t.Fatalf("residual cleanup count = %d", closed)
++	}
++	assertDetached(t, &parent)
++}
++
++type failedDisposal struct {
++	disposed, runtime *atomic.Int32
++	failure           error
++}
++
++func (p failedDisposal) DisposeConstruction() error { p.disposed.Add(1); return p.failure }
++func (p failedDisposal) Close() error               { p.runtime.Add(1); return nil }
++
++func TestTerminatedContextRetainsCleanupAtCurrentOperation(t *testing.T) {
++	for _, transfer := range []bool{false, true} {
++		t.Run(map[bool]string{false: "closed", true: "transferred"}[transfer], func(t *testing.T) {
++			var scope Scope
++			ctx := WithScope(context.Background(), &scope)
++			if transfer {
++				if err := scope.TransferAll().Close(); err != nil {
++					t.Fatal(err)
++				}
++			} else if err := scope.Close(); err != nil {
++				t.Fatal(err)
++			}
++			failure := errors.New("current operation cleanup failure")
++			var disposed, runtime atomic.Int32
++			if err := Replace(ctx, "late replacement", failedDisposal{&disposed, &runtime, failure}, false); !errors.Is(err, failure) {
++				t.Fatalf("replacement error was lost: %v", err)
++			}
++			if disposed.Load() != 1 || runtime.Load() != 0 {
++				t.Fatal("late construction disposal used runtime Close or was lost")
++			}
++			entered, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
++			go func() {
++				done <- DeferCleanup(ctx, "late failed constructor", func() error { close(entered); <-release; return failure })
++			}()
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				t.Fatal("late callback has no active owner")
++			}
++			select {
++			case err := <-done:
++				t.Fatalf("current operation returned before its cleanup: %v", err)
++			default:
++			}
++			assertDetached(t, &scope)
++			if RecordError(ctx, failure) {
++				t.Fatal("terminal scope accepted orphaned error")
++			}
++			close(release)
++			if err := <-done; !errors.Is(err, failure) {
++				t.Fatalf("late cleanup failure was lost: %v", err)
++			}
++			assertDetached(t, &scope)
++		})
++	}
++}
++
++func TestRejectedRegistrationRemainsCallerOwnedAndCannotTransfer(t *testing.T) {
++	var scope Scope
++	ctx := WithScope(context.Background(), &scope)
++	if err := scope.Close(); err != nil {
++		t.Fatal(err)
++	}
++	var closed atomic.Int32
++	token := Register(ctx, "late acquire", func() error { closed.Add(1); return nil })
++	if !errors.Is(token.Err(), ErrScopeTerminated) || closed.Load() != 0 {
++		t.Fatal("late registration was accepted or eagerly destroyed a resource")
++	}
++	if !errors.Is(token.Transfer(), ErrScopeTerminated) {
++		t.Fatal("rejected token abandoned its cleanup")
++	}
++	if err := token.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := token.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if closed.Load() != 1 {
++		t.Fatal("caller did not dispose rejected resource exactly once")
++	}
++	assertDetached(t, &scope)
++}
++
++func TestCloseInterleavedLateRegistrationAndCleanupHaveSeparateLiveOwners(t *testing.T) {
++	var scope Scope
++	ctx := WithScope(context.Background(), &scope)
++	entered, release, closed := make(chan struct{}), make(chan struct{}), make(chan error, 1)
++	Register(ctx, "first acquired", func() error { close(entered); <-release; return nil })
++	go func() { closed <- scope.Close() }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("rollback did not enter")
++	}
++	lateEntered, lateRelease, lateDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
++	go func() {
++		lateDone <- DeferCleanup(ctx, "late acquired", func() error { close(lateEntered); <-lateRelease; return nil })
++	}()
++	select {
++	case <-lateEntered:
++	case <-time.After(time.Second):
++		t.Fatal("late operation cleanup was stranded")
++	}
++	assertDetached(t, &scope)
++	select {
++	case <-closed:
++		t.Fatal("rollback returned while its callback was blocked")
++	default:
++	}
++	select {
++	case <-lateDone:
++		t.Fatal("late operation returned while its own callback was blocked")
++	default:
++	}
++	close(release)
++	if err := <-closed; err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-lateDone:
++		t.Fatal("scope completion impersonated late operation completion")
++	default:
++	}
++	close(lateRelease)
++	if err := <-lateDone; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestRegisterTransferAndCloseRaceNeverLoseCleanup(t *testing.T) {
++	for i := 0; i < 300; i++ {
++		var scope Scope
++		ctx := WithScope(context.Background(), &scope)
++		var closed atomic.Int32
++		start := make(chan struct{})
++		registered := make(chan *Ownership, 1)
++		var tasks sync.WaitGroup
++		tasks.Add(3)
++		go func() {
++			defer tasks.Done()
++			<-start
++			registered <- Register(ctx, "raced acquire", func() error { closed.Add(1); return nil })
++		}()
++		go func() {
++			defer tasks.Done()
++			<-start
++			token := <-registered
++			if token.Err() != nil {
++				if err := token.Close(); err != nil {
++					t.Error(err)
++				}
++				return
++			}
++			if err := token.Transfer(); err == nil {
++				closed.Add(1)
++			} else if !errors.Is(err, ErrScopeTerminated) {
++				t.Error(err)
++			}
++		}()
++		go func() {
++			defer tasks.Done()
++			<-start
++			if err := scope.Close(); err != nil {
++				t.Error(err)
++			}
++		}()
++		close(start)
++		tasks.Wait()
++		if closed.Load() != 1 {
++			t.Fatalf("race %d released resource %d times", i, closed.Load())
++		}
++		assertDetached(t, &scope)
++	}
++}
++
++func TestDetachedReplacementBatchRetainsAnActualOwner(t *testing.T) {
++	var scope Scope
++	ctx := WithScope(context.Background(), &scope)
++	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
++	if !scope.appendPending("replacement", func() error { close(entered); <-release; return nil }) {
++		t.Fatal("admission rejected")
++	}
++	Register(ctx, "published child", func() error { t.Error("published child was reclaimed by its former scope"); return nil })
++	cleanup := scope.TransferAll()
++	assertDetached(t, &scope)
++	go func() { done <- cleanup.Close() }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("detached batch was dropped")
++	}
++	if err := DeferCleanup(ctx, "later constructor", func() error { return nil }); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-done:
++		t.Fatal("detached owner returned before replacement cleanup")
++	default:
++	}
++	close(release)
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestOwnershipCloseAndTransferRaceCannotPublishDisposedResource(t *testing.T) {
++	for i := 0; i < 300; i++ {
++		var scope Scope
++		var closed atomic.Int32
++		token := scope.Add("raced owner", func() error { closed.Add(1); return nil })
++		start := make(chan struct{})
++		var tasks sync.WaitGroup
++		tasks.Add(2)
++		go func() {
++			defer tasks.Done()
++			<-start
++			if err := token.Close(); err != nil {
++				t.Error(err)
++			}
++		}()
++		go func() {
++			defer tasks.Done()
++			<-start
++			if err := token.Transfer(); err == nil {
++				closed.Add(1)
++			} else if !errors.Is(err, ErrOwnershipReleased) {
++				t.Error(err)
++			}
++		}()
++		close(start)
++		tasks.Wait()
++		if err := scope.Close(); err != nil {
++			t.Fatal(err)
++		}
++		if closed.Load() != 1 {
++			t.Fatalf("disposed resource was also published in race %d: closes=%d", i, closed.Load())
++		}
++	}
++}
 diff --git a/common/construction/scope_test.go b/common/construction/scope_test.go
 new file mode 100644
-index 0000000..6b13133
+index 0000000..16874de
 --- /dev/null
 +++ b/common/construction/scope_test.go
 @@ -0,0 +1,75 @@
@@ -2547,8 +3477,8 @@ index 0000000..6b13133
 +		t.Fatal(err)
 +	}
 +	Register(ctx, "completed parent", func() error { t.Fatal("parent ownership was transferred"); return nil })
-+	scope.TransferAll()
-+	if err := scope.DisposePending(); err != nil {
++	cleanup := scope.TransferAll()
++	if err := cleanup.Close(); err != nil {
 +		t.Fatal(err)
 +	}
 +	if disposed != 1 || runtimeClosed != 0 {
@@ -2721,14 +3651,15 @@ index 0000000..6ed742f
 +
 +func (p constructionProbe) DisposeConstruction() error { return p.Close() }
 diff --git a/dns/transport_manager.go b/dns/transport_manager.go
-index e822231..17ffb01 100644
+index e822231..2742a20 100644
 --- a/dns/transport_manager.go
 +++ b/dns/transport_manager.go
-@@ -2,12 +2,12 @@ package dns
+@@ -2,12 +2,13 @@ package dns
  
  import (
  	"context"
 -	"io"
++	"errors"
  	"os"
  	"strings"
  	"sync"
@@ -2738,7 +3669,7 @@ index e822231..17ffb01 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -25,6 +25,7 @@ type TransportManager struct {
+@@ -25,6 +26,7 @@ type TransportManager struct {
  	defaultTag               string
  	access                   sync.RWMutex
  	started                  bool
@@ -2746,7 +3677,7 @@ index e822231..17ffb01 100644
  	stage                    adapter.StartStage
  	transports               []adapter.DNSTransport
  	transportByTag           map[string]adapter.DNSTransport
-@@ -113,6 +114,7 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
+@@ -113,6 +115,7 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
  					return E.Cause(err, "start dns/", transportToStart.Type(), "[", transportTag, "]")
  				}
  			}
@@ -2754,7 +3685,7 @@ index e822231..17ffb01 100644
  		}
  		if len(started) == len(transports) {
  			break
-@@ -147,23 +149,20 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
+@@ -147,23 +150,20 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
  func (m *TransportManager) Close() error {
  	monitor := taskmonitor.New(m.logger, C.StopTimeout)
  	m.access.Lock()
@@ -2786,7 +3717,7 @@ index e822231..17ffb01 100644
  	}
  	return err
  }
-@@ -208,7 +207,6 @@ func (m *TransportManager) Remove(tag string) error {
+@@ -208,7 +208,6 @@ func (m *TransportManager) Remove(tag string) error {
  		panic("invalid inbound index")
  	}
  	m.transports = append(m.transports[:index], m.transports[index+1:]...)
@@ -2794,7 +3725,7 @@ index e822231..17ffb01 100644
  	if m.defaultTransport == transport {
  		if len(m.transports) > 0 {
  			nextTransport := m.transports[0]
-@@ -235,10 +233,9 @@ func (m *TransportManager) Remove(tag string) error {
+@@ -235,17 +234,29 @@ func (m *TransportManager) Remove(tag string) error {
  			})
  		}
  	}
@@ -2807,12 +3738,19 @@ index e822231..17ffb01 100644
 +	return construction.Dispose("removed transport", transport, runtimeOwned)
  }
  
- func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger, tag string, transportType string, options any) error {
-@@ -246,6 +243,13 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+-func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger, tag string, transportType string, options any) error {
++func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger, tag string, transportType string, options any) (err error) {
++	owned := false
++	ctx, complete := construction.Begin(ctx)
++	defer func() {
++		if cleanupErr := complete(owned); cleanupErr != nil {
++			err = errors.Join(err, cleanupErr)
++		}
++	}()
+ 	if tag == "" {
  		return os.ErrInvalid
  	}
  	transport, err := m.registry.CreateDNSTransport(ctx, logger, tag, transportType, options)
-+	owned := false
 +	runtimeOwned := false
 +	defer func() {
 +		if !owned && transport != nil {
@@ -2822,7 +3760,7 @@ index e822231..17ffb01 100644
  	if err != nil {
  		return err
  	}
-@@ -257,14 +261,19 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -257,15 +268,21 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  			if err != nil {
  				return E.Cause(err, stage, " dns/", transport.Type(), "[", transport.Tag(), "]")
  			}
@@ -2836,18 +3774,19 @@ index e822231..17ffb01 100644
 -			err = common.Close(existsTransport)
 -			if err != nil {
 -				return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
--			}
 +		err = construction.Replace(ctx, "replaced transport", existsTransport, m.runtimeOwners[tag])
 +		if !m.runtimeOwners[tag] {
-+			construction.RecordError(ctx, err)
-+			err = nil
-+		}
++			if err == nil || construction.RecordError(ctx, err) {
++				err = nil
+ 			}
+ 		}
 +		if err != nil {
 +			return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
- 		}
++		}
  		existsIndex := common.Index(m.transports, func(it adapter.DNSTransport) bool {
  			return it == existsTransport
-@@ -275,7 +284,12 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+ 		})
+@@ -275,7 +292,12 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  		m.transports = append(m.transports[:existsIndex], m.transports[existsIndex+1:]...)
  	}
  	m.transports = append(m.transports, transport)
@@ -2860,7 +3799,7 @@ index e822231..17ffb01 100644
  	dependencies := transport.Dependencies()
  	for _, dependency := range dependencies {
  		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
-@@ -297,3 +311,13 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -297,3 +319,13 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  	}
  	return nil
  }
@@ -3018,6 +3957,96 @@ index 0000000..a3f5a2f
 +				t.Fatalf("unowned object runtime-closed %d times", closed)
 +			}
 +		})
++	}
++}
+diff --git a/dns/transport_manager_terminal_scope_test.go b/dns/transport_manager_terminal_scope_test.go
+new file mode 100644
+index 0000000..8510005
+--- /dev/null
++++ b/dns/transport_manager_terminal_scope_test.go
+@@ -0,0 +1,84 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type terminalFactoryProbe struct{ constructionProbe }
++
++func (terminalFactoryProbe) Dependencies() []string { return nil }
++
++func TestTerminalContextFactoryCleanupAndSuccessfulPublication(t *testing.T) {
++	for _, transfer := range []bool{false, true} {
++		for _, result := range []string{"object-error", "internal-error", "published"} {
++			t.Run(map[bool]string{false: "closed", true: "transferred"}[transfer]+"/"+result, func(t *testing.T) {
++				var parent construction.Scope
++				ctx := construction.WithScope(context.Background(), &parent)
++				if transfer {
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				} else if err := parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("late factory failed")
++				cleanupFailure := errors.New("late cleanup failed")
++				disposed, internal := 0, 0
++				registry := NewTransportRegistry()
++				RegisterTransport[struct{}](registry, "terminal-factory", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.DNSTransport, error) {
++					if result == "internal-error" {
++						token := construction.Register(ctx, "internal late acquire", func() error { internal++; return cleanupFailure })
++						if token.Err() != nil {
++							t.Fatalf("current factory has no live scope: %v", token.Err())
++						}
++						return nil, failure
++					}
++					child := terminalFactoryProbe{constructionProbe{tag: tag, closed: &disposed}}
++					if result == "object-error" {
++						child.failure = cleanupFailure
++						return child, failure
++					}
++					return child, nil
++				})
++				m := NewTransportManager(logger, registry, nil, "")
++				err := m.Create(ctx, logger, "probe", "terminal-factory", nil)
++				if result == "published" {
++					if err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 0 {
++						t.Fatal("scope destroyed a successfully published child")
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if err = m.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if disposed != 1 {
++						t.Fatalf("published child disposal count = %d", disposed)
++					}
++				} else {
++					if !errors.Is(err, failure) || !errors.Is(err, cleanupFailure) {
++						t.Fatalf("current operation lost constructor or cleanup error: %v", err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatalf("late cleanup was stranded: object/internal = %d/%d", disposed, internal)
++					}
++					if err = parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++					if result == "object-error" && disposed != 1 || result == "internal-error" && internal != 1 {
++						t.Fatal("terminated parent reclaimed current operation's resource twice")
++					}
++				}
++			})
++		}
 +	}
 +}
 diff --git a/experimental/libbox/config.go b/experimental/libbox/config.go
@@ -3785,6 +4814,139 @@ index 0000000..d9eeb19
 +		})
 +	}
 +}
+diff --git a/service/ccm/construction_save_latch_test.go b/service/ccm/construction_save_latch_test.go
+new file mode 100644
+index 0000000..92cbff1
+--- /dev/null
++++ b/service/ccm/construction_save_latch_test.go
+@@ -0,0 +1,127 @@
++package ccm
++
++import (
++	"bytes"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/service"
++	"github.com/sagernet/sing/service/filemanager"
++	"net"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// This blocks the real WriteFile path immediately before opening/truncating a
++// real temporary fixture, rather than replacing Save with a mocked callback.
++type saveOpenLatch struct {
++	filemanager.Manager
++	entered    chan struct{}
++	release    chan struct{}
++	writes     atomic.Int32
++	returned   atomic.Bool
++	lateWrites atomic.Int32
++}
++
++func (m *saveOpenLatch) BasePath(path string) string                  { return path }
++func (m *saveOpenLatch) MkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }
++func (m *saveOpenLatch) Remove(path string) error                     { return os.Remove(path) }
++func (m *saveOpenLatch) Rename(from, to string) error                 { return os.Rename(from, to) }
++func (m *saveOpenLatch) OpenFile(path string, flag int, perm os.FileMode) (*os.File, error) {
++	if flag&os.O_WRONLY != 0 {
++		if m.writes.Add(1) == 1 {
++			close(m.entered)
++			<-m.release
++		}
++		if m.returned.Load() {
++			m.lateWrites.Add(1)
++		}
++	}
++	return os.OpenFile(path, flag, perm)
++}
++
++func TestRealSaveInFlightBlocksCloseAndConstructionDisposal(t *testing.T) {
++	for _, persist := range []bool{true, false} {
++		t.Run(map[bool]string{true: "close", false: "construction-disposal"}[persist], func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "state.json")
++			before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			s := usageTestService(t, path)
++			latch := &saveOpenLatch{entered: make(chan struct{}), release: make(chan struct{})}
++			s.usageTracker.ctx = service.ContextWith[filemanager.Manager](s.usageTracker.ctx, latch)
++			if err := s.Start(adapter.StartStateStart); err != nil {
++				t.Fatal(err)
++			}
++			s.usageTracker.mutex.Lock()
++			s.usageTracker.Combinations[0].Total.InputTokens = 42
++			s.usageTracker.mutex.Unlock()
++			saved := make(chan error, 1)
++			go func() { saved <- s.usageTracker.Save() }()
++			select {
++			case <-latch.entered:
++			case <-time.After(time.Second):
++				t.Fatal("real Save did not enter file acquire")
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(after, before) {
++				t.Fatalf("latched Save unexpectedly wrote: %s / %v", after, err)
++			}
++			closed := make(chan error, 1)
++			closing := make(chan struct{})
++			go func() {
++				close(closing)
++				var err error
++				if persist {
++					err = s.Close()
++				} else {
++					err = s.DisposeConstruction()
++				}
++				latch.returned.Store(true)
++				closed <- err
++			}()
++			<-closing
++			select {
++			case err := <-closed:
++				close(latch.release)
++				<-saved
++				t.Fatalf("disposal returned while real Save was still in flight: %v", err)
++			case <-time.After(40 * time.Millisecond):
++			}
++			close(latch.release)
++			select {
++			case err := <-saved:
++				if err != nil {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("Save failed to leave acquire after release")
++			}
++			select {
++			case err := <-closed:
++				// Runtime double-close can report net.ErrClosed; the Save barrier
++				// still must drain before returning, and exact cleanup stays disabled.
++				if err != nil && !errors.Is(err, net.ErrClosed) {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("disposal did not drain in-flight Save")
++			}
++			final, err := os.ReadFile(path)
++			if err != nil || !bytes.Contains(final, []byte(`"input_tokens": 42`)) {
++				t.Fatalf("in-flight Save did not commit before disposal: %s / %v", final, err)
++			}
++			writes := latch.writes.Load()
++			if err = s.usageTracker.Save(); err != nil {
++				t.Fatal(err)
++			}
++			late, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(late, final) || latch.writes.Load() != writes || latch.lateWrites.Load() != 0 {
++				t.Fatal("late Save wrote after disposal returned")
++			}
++		})
++	}
++}
 diff --git a/service/ccm/service.go b/service/ccm/service.go
 index a211a3e..8c3ecbc 100644
 --- a/service/ccm/service.go
@@ -4136,6 +5298,139 @@ index 0000000..a2978f7
 +		})
 +	}
 +}
+diff --git a/service/ocm/construction_save_latch_test.go b/service/ocm/construction_save_latch_test.go
+new file mode 100644
+index 0000000..e07df64
+--- /dev/null
++++ b/service/ocm/construction_save_latch_test.go
+@@ -0,0 +1,127 @@
++package ocm
++
++import (
++	"bytes"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/service"
++	"github.com/sagernet/sing/service/filemanager"
++	"net"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// This blocks the real WriteFile path immediately before opening/truncating a
++// real temporary fixture, rather than replacing Save with a mocked callback.
++type saveOpenLatch struct {
++	filemanager.Manager
++	entered    chan struct{}
++	release    chan struct{}
++	writes     atomic.Int32
++	returned   atomic.Bool
++	lateWrites atomic.Int32
++}
++
++func (m *saveOpenLatch) BasePath(path string) string                  { return path }
++func (m *saveOpenLatch) MkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }
++func (m *saveOpenLatch) Remove(path string) error                     { return os.Remove(path) }
++func (m *saveOpenLatch) Rename(from, to string) error                 { return os.Rename(from, to) }
++func (m *saveOpenLatch) OpenFile(path string, flag int, perm os.FileMode) (*os.File, error) {
++	if flag&os.O_WRONLY != 0 {
++		if m.writes.Add(1) == 1 {
++			close(m.entered)
++			<-m.release
++		}
++		if m.returned.Load() {
++			m.lateWrites.Add(1)
++		}
++	}
++	return os.OpenFile(path, flag, perm)
++}
++
++func TestRealSaveInFlightBlocksCloseAndConstructionDisposal(t *testing.T) {
++	for _, persist := range []bool{true, false} {
++		t.Run(map[bool]string{true: "close", false: "construction-disposal"}[persist], func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "state.json")
++			before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			s := usageTestService(t, path)
++			latch := &saveOpenLatch{entered: make(chan struct{}), release: make(chan struct{})}
++			s.usageTracker.ctx = service.ContextWith[filemanager.Manager](s.usageTracker.ctx, latch)
++			if err := s.Start(adapter.StartStateStart); err != nil {
++				t.Fatal(err)
++			}
++			s.usageTracker.mutex.Lock()
++			s.usageTracker.Combinations[0].Total.InputTokens = 42
++			s.usageTracker.mutex.Unlock()
++			saved := make(chan error, 1)
++			go func() { saved <- s.usageTracker.Save() }()
++			select {
++			case <-latch.entered:
++			case <-time.After(time.Second):
++				t.Fatal("real Save did not enter file acquire")
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(after, before) {
++				t.Fatalf("latched Save unexpectedly wrote: %s / %v", after, err)
++			}
++			closed := make(chan error, 1)
++			closing := make(chan struct{})
++			go func() {
++				close(closing)
++				var err error
++				if persist {
++					err = s.Close()
++				} else {
++					err = s.DisposeConstruction()
++				}
++				latch.returned.Store(true)
++				closed <- err
++			}()
++			<-closing
++			select {
++			case err := <-closed:
++				close(latch.release)
++				<-saved
++				t.Fatalf("disposal returned while real Save was still in flight: %v", err)
++			case <-time.After(40 * time.Millisecond):
++			}
++			close(latch.release)
++			select {
++			case err := <-saved:
++				if err != nil {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("Save failed to leave acquire after release")
++			}
++			select {
++			case err := <-closed:
++				// Runtime double-close can report net.ErrClosed; the Save barrier
++				// still must drain before returning, and exact cleanup stays disabled.
++				if err != nil && !errors.Is(err, net.ErrClosed) {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("disposal did not drain in-flight Save")
++			}
++			final, err := os.ReadFile(path)
++			if err != nil || !bytes.Contains(final, []byte(`"input_tokens": 42`)) {
++				t.Fatalf("in-flight Save did not commit before disposal: %s / %v", final, err)
++			}
++			writes := latch.writes.Load()
++			if err = s.usageTracker.Save(); err != nil {
++				t.Fatal(err)
++			}
++			late, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(late, final) || latch.writes.Load() != writes || latch.lateWrites.Load() != 0 {
++				t.Fatal("late Save wrote after disposal returned")
++			}
++		})
++	}
++}
 diff --git a/service/ocm/service.go b/service/ocm/service.go
 index 5b213e2..f2c0bfc 100644
 --- a/service/ocm/service.go
@@ -4300,17 +5595,32 @@ index d16f3f4..36ef6ea 100644
  
  	u.saveMutex.Lock()
 diff --git a/service/ssmapi/cache.go b/service/ssmapi/cache.go
-index 38552f1..18f092f 100644
+index 38552f1..a262016 100644
 --- a/service/ssmapi/cache.go
 +++ b/service/ssmapi/cache.go
-@@ -56,6 +56,9 @@ func (s *Service) loadCache() error {
+@@ -56,6 +56,15 @@ func (s *Service) loadCache() error {
  }
  
  func (s *Service) saveCache() error {
++	s.cacheMutex.Lock()
++	defer s.cacheMutex.Unlock()
++	return s.saveCacheLocked()
++}
++
++func (s *Service) saveCacheLocked() error {
 +	if !s.cacheLoaded.Load() || !s.running.Load() {
 +		return nil
 +	}
  	if s.cachePath == "" {
+ 		return nil
+ 	}
+@@ -63,8 +72,6 @@ func (s *Service) saveCache() error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	s.cacheMutex.Lock()
+-	defer s.cacheMutex.Unlock()
+ 	if bytes.Equal(s.lastSavedCache, cacheBinary) {
  		return nil
  	}
 diff --git a/service/ssmapi/construction_disposal_test.go b/service/ssmapi/construction_disposal_test.go
@@ -4477,8 +5787,139 @@ index 0000000..80d09a3
 +		})
 +	}
 +}
+diff --git a/service/ssmapi/construction_save_latch_test.go b/service/ssmapi/construction_save_latch_test.go
+new file mode 100644
+index 0000000..0b93543
+--- /dev/null
++++ b/service/ssmapi/construction_save_latch_test.go
+@@ -0,0 +1,125 @@
++package ssmapi
++
++import (
++	"bytes"
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/service"
++	"github.com/sagernet/sing/service/filemanager"
++	"net"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// This blocks the real WriteFile path immediately before opening/truncating a
++// real temporary fixture, rather than replacing Save with a mocked callback.
++type saveOpenLatch struct {
++	filemanager.Manager
++	entered    chan struct{}
++	release    chan struct{}
++	writes     atomic.Int32
++	returned   atomic.Bool
++	lateWrites atomic.Int32
++}
++
++func (m *saveOpenLatch) BasePath(path string) string                  { return path }
++func (m *saveOpenLatch) MkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }
++func (m *saveOpenLatch) Remove(path string) error                     { return os.Remove(path) }
++func (m *saveOpenLatch) Rename(from, to string) error                 { return os.Rename(from, to) }
++func (m *saveOpenLatch) OpenFile(path string, flag int, perm os.FileMode) (*os.File, error) {
++	if flag&os.O_WRONLY != 0 {
++		if m.writes.Add(1) == 1 {
++			close(m.entered)
++			<-m.release
++		}
++		if m.returned.Load() {
++			m.lateWrites.Add(1)
++		}
++	}
++	return os.OpenFile(path, flag, perm)
++}
++
++func TestRealSaveInFlightBlocksCloseAndConstructionDisposal(t *testing.T) {
++	for _, persist := range []bool{true, false} {
++		t.Run(map[bool]string{true: "close", false: "construction-disposal"}[persist], func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "state.json")
++			before := []byte(`{"endpoints":{"/probe":{"global_uplink":123}}}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			s := cacheTestService(t, path, 0)
++			latch := &saveOpenLatch{entered: make(chan struct{}), release: make(chan struct{})}
++			s.ctx = service.ContextWith[filemanager.Manager](s.ctx, latch)
++			if err := s.Start(adapter.StartStateStart); err != nil {
++				t.Fatal(err)
++			}
++			s.traffics["/probe"].globalUplink.Add(5)
++			saved := make(chan error, 1)
++			go func() { saved <- s.saveCache() }()
++			select {
++			case <-latch.entered:
++			case <-time.After(time.Second):
++				t.Fatal("real Save did not enter file acquire")
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(after, before) {
++				t.Fatalf("latched Save unexpectedly wrote: %s / %v", after, err)
++			}
++			closed := make(chan error, 1)
++			closing := make(chan struct{})
++			go func() {
++				close(closing)
++				var err error
++				if persist {
++					err = s.Close()
++				} else {
++					err = s.DisposeConstruction()
++				}
++				latch.returned.Store(true)
++				closed <- err
++			}()
++			<-closing
++			select {
++			case err := <-closed:
++				close(latch.release)
++				<-saved
++				t.Fatalf("disposal returned while real Save was still in flight: %v", err)
++			case <-time.After(40 * time.Millisecond):
++			}
++			close(latch.release)
++			select {
++			case err := <-saved:
++				if err != nil {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("Save failed to leave acquire after release")
++			}
++			select {
++			case err := <-closed:
++				// Runtime double-close can report net.ErrClosed; the Save barrier
++				// still must drain before returning, and exact cleanup stays disabled.
++				if err != nil && !errors.Is(err, net.ErrClosed) {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("disposal did not drain in-flight Save")
++			}
++			final, err := os.ReadFile(path)
++			if err != nil || !bytes.Contains(final, []byte(`"global_uplink": 128`)) {
++				t.Fatalf("in-flight Save did not commit before disposal: %s / %v", final, err)
++			}
++			writes := latch.writes.Load()
++			if err = s.saveCache(); err != nil {
++				t.Fatal(err)
++			}
++			late, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(late, final) || latch.writes.Load() != writes || latch.lateWrites.Load() != 0 {
++				t.Fatal("late Save wrote after disposal returned")
++			}
++		})
++	}
++}
 diff --git a/service/ssmapi/server.go b/service/ssmapi/server.go
-index 157ea15..c90a2a0 100644
+index 157ea15..19296c7 100644
 --- a/service/ssmapi/server.go
 +++ b/service/ssmapi/server.go
 @@ -5,10 +5,12 @@ import (
@@ -4553,7 +5994,7 @@ index 157ea15..c90a2a0 100644
  		if err != nil && !errors.Is(err, http.ErrServerClosed) {
  			s.logger.Error("serve error: ", err)
  		}
-@@ -144,20 +163,24 @@ func (s *Service) loopSaveCache() {
+@@ -144,20 +163,26 @@ func (s *Service) loopSaveCache() {
  	}
  }
  
@@ -4574,8 +6015,10 @@ index 157ea15..c90a2a0 100644
 -		s.logger.Error(E.Cause(err, "save cache"))
 +	closeErr := common.Close(common.PtrOrNil(s.httpServer), common.PtrOrNil(s.listener), s.tlsConfig)
 +	s.background.Wait()
++	s.cacheMutex.Lock()
++	defer s.cacheMutex.Unlock()
 +	if persist && s.cacheLoaded.Load() && s.running.Load() {
-+		if err := s.saveCache(); err != nil {
++		if err := s.saveCacheLocked(); err != nil {
 +			s.logger.Error(E.Cause(err, "save cache"))
 +		}
  	}
