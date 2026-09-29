@@ -69,7 +69,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 mod attempts;
 use attempts::{Attempt, AttemptGuard, Attempts};
-pub use attempts::{LoginMode, LoginRequest};
+pub use attempts::{LoginMode, LoginProgressReceipt, LoginRequest};
 
 #[cfg(test)]
 use polaris_config_engine::user_config::app_config::UserConfig;
@@ -182,6 +182,64 @@ pub trait AuthUrlEmitter: Send + Sync {
         _reason: Option<&str>,
         _url: Option<&str>,
     ) {
+    }
+}
+
+/// Save the receipt before broadcasting. Android may suspend the WebView while Chrome owns the
+/// foreground; the panel can read this exact attempt after focus even when an event was missed.
+struct AttemptReceiptEmitter {
+    inner: Arc<dyn AuthUrlEmitter>,
+    attempt: Arc<Attempt>,
+    attempt_id: String,
+}
+
+impl AuthUrlEmitter for AttemptReceiptEmitter {
+    fn emit_auth_url(&self, server_id: &str, node_name: &str, url: &str) {
+        self.inner.emit_auth_url(server_id, node_name, url);
+    }
+
+    fn progress(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+        phase: &str,
+        reason: Option<&str>,
+        url: Option<&str>,
+    ) {
+        if server_id == self.attempt.server_id && attempt_id == self.attempt_id {
+            self.attempt.record_progress(LoginProgressReceipt {
+                server_id: server_id.to_owned(),
+                attempt_id: attempt_id.to_owned(),
+                phase: phase.to_owned(),
+                // Only stable UI reason codes cross this read API. Native error text could
+                // contain a URL or secret and the UI already maps unknown codes to a generic
+                // authorization error.
+                reason: reason
+                    .filter(|reason| {
+                        matches!(
+                            *reason,
+                            "coreUnavailable"
+                                | "configurationCheckFailed"
+                                | "configWriteFailed"
+                                | "processStartFailed"
+                                | "statusSubscriptionFailed"
+                                | "statusStreamEnded"
+                                | "processExited"
+                                | "authorizationTimedOut"
+                                | "mainCoreChanged"
+                                | "mainCoreInUse"
+                                | "stateQueryFailed"
+                                | "saveFailed"
+                                | "configurationRefreshFailed"
+                                | "tooManyLogins"
+                                | "invalidAuthUrl"
+                        )
+                    })
+                    .map(str::to_owned),
+            });
+        }
+        self.inner
+            .progress(server_id, attempt_id, phase, reason, url);
     }
 }
 
@@ -782,6 +840,16 @@ impl LoginCoreRegistry {
         self.attempts.prepare(server_id, attempt_id).map(|_| ())
     }
 
+    /// Read-only, attempt-scoped recovery of a missed renderer event. Native running status and
+    /// state-directory existence cannot establish a successful authorization for this request.
+    pub fn login_progress(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+    ) -> Option<LoginProgressReceipt> {
+        self.attempts.progress(server_id, attempt_id)
+    }
+
     /// Fence every request already prepared for this state directory. The caller keeps the
     /// state gate through its identity commit; a later prepare cannot register until then.
     /// A failed native close leaves its registry entry in place and fails this retirement.
@@ -1184,6 +1252,11 @@ impl LoginCoreRegistry {
             return StartLoginOutcome::Failed("attemptAlreadyUsed".into());
         }
         let mut request_guard = AttemptGuard(attempt.clone(), false);
+        let emitter: Arc<dyn AuthUrlEmitter> = Arc::new(AttemptReceiptEmitter {
+            inner: emitter,
+            attempt: attempt.clone(),
+            attempt_id: request.attempt_id.clone(),
+        });
         emitter.progress(&requested.id, &request.attempt_id, "starting", None, None);
         let outcome = self
             .launch_attempt(

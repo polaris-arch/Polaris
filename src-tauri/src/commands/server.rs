@@ -837,6 +837,21 @@ pub async fn tailscale_login_prepare(
     )
 }
 
+/// Recover the last native receipt for this exact request after the renderer resumes.
+/// Absence is unknown, never evidence that a TS state directory means authorization succeeded.
+#[tauri::command]
+pub async fn tailscale_login_progress(
+    state: State<'_, AppRuntime>,
+    server_id: String,
+    attempt_id: String,
+) -> Result<ApiResponse<Option<crate::runtime::tailscale_login_core::LoginProgressReceipt>>, ()> {
+    Ok(ApiResponse::ok(
+        state
+            .mesh()
+            .tailscale_login_progress(&server_id, &attempt_id),
+    ))
+}
+
 /// Authorize the persisted node with an explicit browser/AuthKey mode and prepared attempt identity.
 /// `started` denotes process startup only; request-scoped STATUS progress confirms Running after reap.
 /// A matching primary owner is queried once for fresh STATUS; a changed configuration remains pending.

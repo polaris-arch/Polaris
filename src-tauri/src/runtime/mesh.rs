@@ -568,6 +568,14 @@ impl MeshRuntime {
         self.login_registry.prepare(server_id, attempt_id).await
     }
 
+    pub fn tailscale_login_progress(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+    ) -> Option<crate::runtime::tailscale_login_core::LoginProgressReceipt> {
+        self.login_registry.login_progress(server_id, attempt_id)
+    }
+
     pub async fn start_tailscale_login(
         &self,
         app: AppHandle,

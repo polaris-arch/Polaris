@@ -134,6 +134,40 @@ export function TsLoginPanel({
       ? `${t('ts.loginSavedAttemptIncomplete')} ${reason}` : reason });
   }, [pending?.attemptId, pending?.persisted, progress?.phase, progress?.reason, t]);
 
+  // Chrome can own the foreground while native login finishes. An event sent during WebView
+  // suspension is not a durable receipt, so reconcile this exact request on return. A missing
+  // receipt stays unknown; old or cancelled requests cannot complete a successor's panel.
+  useEffect(() => {
+    if (!pending) return;
+    const { serverId, attemptId } = pending;
+    let disposed = false;
+    const reconcile = async (): Promise<void> => {
+      try {
+        const receipt = await api.server.tailscaleLoginProgress(serverId, attemptId);
+        if (disposed || !receipt || !['authorized', 'failed', 'timedOut'].includes(receipt.phase)
+          || pendingRef.current?.attemptId !== attemptId || !hasInstance(instanceId)) return;
+        const current = useTailscaleLoginProgressStore.getState().attempts[serverId];
+        if (current?.attemptId !== attemptId) return;
+        if (!useTailscaleLoginProgressStore.getState().apply(receipt)) return;
+        setTailscaleAuthUrl(serverId, null);
+        setTailscaleLoginInitiated(serverId, false);
+        if (receipt.phase === 'authorized') setTailscaleLoginState(serverId, true);
+      } catch {
+        // Event delivery remains live; a failed read proves nothing about authorization.
+      }
+    };
+    const onVisible = (): void => { if (!document.hidden) void reconcile(); };
+    window.addEventListener('focus', reconcile);
+    document.addEventListener('visibilitychange', onVisible);
+    void reconcile();
+    return () => {
+      disposed = true;
+      window.removeEventListener('focus', reconcile);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [pending?.serverId, pending?.attemptId, hasInstance, instanceId,
+    setTailscaleAuthUrl, setTailscaleLoginInitiated, setTailscaleLoginState]);
+
   // 主核分支独立读取同 server 的活态。push 优先于较早开始的 pull；停止后立即丢弃快照。
   useEffect(() => {
     setMainSnapshot(null);

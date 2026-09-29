@@ -28,12 +28,25 @@ pub struct LoginRequest {
     pub mode: LoginMode,
 }
 
+/// Last native progress for one renderer-minted request. A read cannot infer authorization
+/// from a state directory or another node's login; only this exact attempt's receipt counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginProgressReceipt {
+    pub server_id: String,
+    pub attempt_id: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 pub(super) struct Attempt {
     pub server_id: String,
     pub claimed: AtomicBool,
     pub process_owned: AtomicBool,
     cancel: watch::Sender<bool>,
     done: watch::Sender<bool>,
+    progress: Mutex<Option<LoginProgressReceipt>>,
 }
 
 impl Attempt {
@@ -63,6 +76,26 @@ impl Attempt {
         let mut rx = self.done.subscribe();
         let _ = rx.wait_for(|v| *v).await;
     }
+
+    pub fn record_progress(&self, receipt: LoginProgressReceipt) {
+        let mut current = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        if current.as_ref().is_some_and(|last| {
+            matches!(
+                last.phase.as_str(),
+                "authorized" | "failed" | "timedOut" | "cancelled"
+            )
+        }) {
+            return;
+        }
+        *current = Some(receipt);
+    }
+
+    pub fn progress_receipt(&self) -> Option<LoginProgressReceipt> {
+        self.progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[derive(Default)]
@@ -76,6 +109,15 @@ struct AttemptState {
 pub(super) struct Attempts(Mutex<AttemptState>);
 
 impl Attempts {
+    pub fn progress(&self, server_id: &str, id: &str) -> Option<LoginProgressReceipt> {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .entries
+            .get(id)
+            .filter(|attempt| attempt.server_id == server_id)
+            .and_then(|attempt| attempt.progress_receipt())
+    }
+
     /// Inspect all admissions for one node, including prepared requests that have not claimed
     /// the state yet. `Err` means this table cannot certify a local absence.
     #[allow(dead_code, reason = "reserved for cross-registry owner reconciliation")]
@@ -210,6 +252,7 @@ impl Attempts {
             process_owned: AtomicBool::new(false),
             cancel,
             done,
+            progress: Mutex::new(None),
         });
         state.entries.insert(id.into(), attempt.clone());
         Ok(attempt)
@@ -246,6 +289,7 @@ impl Attempts {
                 process_owned: AtomicBool::new(false),
                 cancel,
                 done,
+                progress: Mutex::new(None),
             });
             state.entries.insert(id.into(), attempt.clone());
             attempt

@@ -62,6 +62,11 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PREPARE, { serverId, attemptId });
   },
 
+  /** Read the last native result for this request after a browser foreground transition. */
+  async tailscaleLoginProgress(serverId: string, attemptId: string): Promise<import('@/domain/tailscale-login-progress').TailscaleLoginProgress | null> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PROGRESS, { serverId, attemptId });
+  },
+
   async tailscaleLogin(server: ServerConfig, request: { attemptId: string; mode: 'browser' | 'authkey' }): Promise<{
     started: boolean;
     reason?: 'inMainCore' | 'cancelled';

@@ -1389,6 +1389,12 @@ async fn executable_auth_url_terminates_and_reaps_before_failure() {
             .any(|p| p.2 == "failed" && p.3.as_deref() == Some("invalidAuthUrl"))
     })
     .await;
+    let attempt_id = emitter.progress.lock().unwrap()[0].1.clone();
+    let receipt = reg.login_progress("ts1", &attempt_id).unwrap();
+    assert_eq!(receipt.phase, "failed");
+    assert_eq!(receipt.reason.as_deref(), Some("invalidAuthUrl"));
+    assert!(reg.login_progress("ts2", &attempt_id).is_none());
+    assert!(reg.login_progress("ts1", "another-attempt").is_none());
     assert!(login_configs(&ud).is_empty());
     std::fs::remove_dir_all(ud).unwrap();
 }
@@ -1698,6 +1704,11 @@ async fn transient_running_success_ignores_a_residual_invalid_auth_url() {
             .any(|p| p.2 == "authorized")
     })
     .await;
+    let attempt_id = emitter.progress.lock().unwrap()[0].1.clone();
+    let receipt = reg.login_progress("ts1", &attempt_id).unwrap();
+    assert_eq!(receipt.phase, "authorized");
+    assert_eq!(receipt.reason, None);
+    assert!(serde_json::to_value(&receipt).unwrap().get("url").is_none());
     assert!(emitter
         .progress
         .lock()

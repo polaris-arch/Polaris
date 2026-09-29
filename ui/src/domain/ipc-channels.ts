@@ -71,6 +71,7 @@ export const IPC_CHANNELS = {
   WARP_APPLY_LICENSE: 'warp_apply_license', // 对已注册 WARP 节点原地应用 WARP+ license（升级免重建）
   TAILSCALE_LOGIN: 'tailscale_login', // 按需瞬态登录核：拉起登录专用 sing-box 取交互登录 URL（Phase 2）
   TAILSCALE_LOGIN_PREPARE: 'tailscale_login_prepare',
+  TAILSCALE_LOGIN_PROGRESS: 'tailscale_login_progress',
   TAILSCALE_LOGIN_CANCEL: 'tailscale_login_cancel', // 取消某节点在飞的瞬态登录核（用户手动取消）
   TAILSCALE_LOGOUT: 'tailscale_logout', // 退出登录：清该节点 state 目录（持久会话）；保留节点配置/authKey
   TAILSCALE_STATE_EXISTS: 'tailscale_state_exists', // 批量查 TS 节点 state 目录存在性（不起核判「登录过没」）：代理关时登录态缓存未命中的兜底

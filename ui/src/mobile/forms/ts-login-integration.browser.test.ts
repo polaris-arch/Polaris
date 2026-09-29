@@ -45,7 +45,11 @@ api.subscription.onCreateProgressReady = async fn => on('onCreateProgressReady')
 api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
 api.server.tailscaleStateExists = async () => ({ 'ts-1': false });
-const test = window.__tsTest = { opens: [], cancels: [], starts: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, mode };
+const test = window.__tsTest = { opens: [], cancels: [], starts: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, receipt: null, mode };
+api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
+  if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
+  return test.receipt?.serverId === serverId && test.receipt?.attemptId === attemptId ? test.receipt : null;
+};
 api.server.tailscaleGetStatus = async () => mode?.startsWith('main') && test.starts > 0
   ? { connected: true, statuses: [{ serverId: 'ts-1', backendState: 'Running', loggedIn: true,
       expired: false, peers: [], tailscaleIPs: [], canShareFiles: false,
@@ -211,6 +215,83 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       await page.waitForTimeout(50);
       expect(await page.getByRole('dialog').count()).toBe(0);
       expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('returning from the browser reconciles an authorized receipt when its event was missed', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipt = { serverId: 'ts-1', attemptId: test.attempt().attemptId, phase: 'authorized' };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.getByRole('dialog').waitFor({ state: 'detached', timeout: 1500 });
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('a missed native failure is shown on return without closing the saved login form', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipt = { serverId: 'ts-1', attemptId: test.attempt().attemptId,
+          phase: 'failed', reason: 'invalidAuthUrl' };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.waitForFunction(() => (window as any).__tsTest.attempt().phase === 'failed');
+      expect(await page.getByRole('dialog').count()).toBe(1);
+      await page.getByText('节点已保存；本次授权尚未完成。 控制面返回了无效登录地址，请检查控制面配置。').waitFor();
+      expect(await page.getByText('invalidAuthUrl').count()).toBe(0);
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('an old authorized receipt cannot complete a newer request', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipt = { serverId: 'ts-1', attemptId: test.attempt().attemptId, phase: 'authorized' };
+        test.begin('attempt-b');
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.waitForTimeout(100);
+      expect(await page.getByRole('dialog').count()).toBe(1);
+      expect(await page.evaluate(() => (window as any).__tsTest.attempt())).toMatchObject({ attemptId: 'attempt-b', phase: 'starting' });
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('a receipt arriving after the panel was cancelled cannot restore authorization', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login`);
+      await page.locator('.m-form-foot .primary').waitFor();
+      await page.evaluate(() => { (window as any).__tsTest.holdProgress = true; });
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseProgress);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipt = { serverId: 'ts-1', attemptId: test.attempt().attemptId, phase: 'authorized' };
+      });
+      await page.locator('.m-form-head .m-form-x').click();
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
+      await page.evaluate(() => (window as any).__tsTest.releaseProgress());
+      await page.waitForTimeout(50);
+      expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('cancelled');
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels.length)).toBeGreaterThan(0);
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(0);
     } finally { await page.close(); }
   }, 30_000);
 

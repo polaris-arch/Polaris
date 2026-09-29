@@ -196,6 +196,29 @@ struct FakeEmitter {
     captured: Mutex<Vec<(String, String, String)>>,
     progress: Mutex<Vec<CapturedLoginProgress>>,
 }
+
+#[test]
+fn progress_receipt_never_returns_an_auth_url_or_native_diagnostic() {
+    let attempts = Attempts::default();
+    let attempt = attempts.prepare("ts1", "request-a").unwrap();
+    let emitter = AttemptReceiptEmitter {
+        inner: Arc::new(FakeEmitter::default()),
+        attempt,
+        attempt_id: "request-a".into(),
+    };
+    emitter.progress(
+        "ts1",
+        "request-a",
+        "failed",
+        Some("https://secret.example/token"),
+        Some("https://login.example/auth"),
+    );
+    let receipt = attempts.progress("ts1", "request-a").unwrap();
+    assert_eq!(receipt.reason, None);
+    let serialized = serde_json::to_string(&receipt).unwrap();
+    assert!(!serialized.contains("https://"));
+    assert!(!serialized.contains("token"));
+}
 impl AuthUrlEmitter for FakeEmitter {
     fn progress(
         &self,
