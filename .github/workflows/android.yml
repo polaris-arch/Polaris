@@ -50,6 +50,13 @@ on:
         description: 资产挂到哪个 release tag；留空 = 取当前 ref（那时 ref 必须是 tag）
         type: string
         default: ''
+    outputs:
+      signed_apk_name:
+        description: 已验签且远端 digest 对拍成功的 Release APK 资产名
+        value: ${{ jobs.release-apk.outputs.signed_apk_name }}
+      signed_apk_sha256:
+        description: 已验签且远端 digest 对拍成功的 Release APK SHA-256
+        value: ${{ jobs.release-apk.outputs.signed_apk_sha256 }}
     secrets:
       POLARIS_KEYSTORE_BASE64:
         description: base64 编码的 release 密钥库（仓外 ~/.polaris/android/release.jks 的内容）
@@ -63,16 +70,9 @@ on:
       POLARIS_KEY_ALIAS:
         description: 私钥别名
         required: false
+  # 手动入口只跑非发布 release-profile 验证。发布参数只声明在 workflow_call，故只有 Package DAG
+  # 能传 publish_release=true；避免直接 Android dispatch 与 Package 对同一 tag 草稿并发 --clobber。
   workflow_dispatch:
-    inputs:
-      publish_release:
-        description: 把**签名的** release APK 发成 GitHub release 资产（需要四个签名 secret）
-        type: boolean
-        default: false
-      release_tag:
-        description: 资产挂到哪个 release tag；留空 = 取当前 ref（那时 ref 必须是 tag）
-        type: string
-        default: ''
 
 permissions:
   contents: read
@@ -454,12 +454,15 @@ jobs:
     # 上传 release 资产要写权限；workflow 级是 `contents: read`，只给这一个 job 放开。
     permissions:
       contents: write
+    outputs:
+      signed_apk_name: ${{ steps.asset.outputs.name }}
+      signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}
 
     steps:
       - uses: actions/checkout@v7
 
       # 先验发布身份，后续所有资产写入只认这一组 tag / commit / draft。
-      # package.yml 创建草稿后才调用本 job；直接手动调用也必须满足同一条件。
+      # publish_release 输入只存在于 workflow_call；package.yml 创建草稿后才可调用本 job。
       - name: Verify target tag and draft release
         id: release_identity
         shell: bash
@@ -478,8 +481,8 @@ jobs:
             exit 1
           fi
 
-          # workflow_dispatch 可从分支触发并另传旧 tag；显式抓 tag 后对拍，拒绝跨 commit 发包。
-          git fetch --force --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          # workflow_call 可显式传 tag；显式抓远端 tag 后对拍，拒绝跨 commit 发包。
+          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
           head_sha="$(git rev-parse HEAD)"
           tag_sha="$(git rev-list -n 1 "$tag")"
           if [ "$head_sha" != "$GITHUB_SHA" ] || [ "$tag_sha" != "$GITHUB_SHA" ]; then
@@ -491,11 +494,11 @@ jobs:
           actual_tag="$(jq -r .tagName <<<"$release_json")"
           is_draft="$(jq -r .isDraft <<<"$release_json")"
           target_commitish="$(jq -r .targetCommitish <<<"$release_json")"
-          if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ] || \
-             [ "$target_commitish" != "$GITHUB_SHA" ]; then
-            echo "::error::Android 只允许写入同 tag/SHA 草稿（tagName=$actual_tag isDraft=$is_draft target=$target_commitish）"
+          if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ]; then
+            echo "::error::Android 只允许写入同 tag 草稿（tagName=$actual_tag isDraft=$is_draft）"
             exit 1
           fi
+          echo "::notice::release targetCommitish=$target_commitish（仅诊断；SHA 由远端 peeled tag 对拍）"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
@@ -874,9 +877,16 @@ jobs:
           name="${{ steps.asset.outputs.name }}"
           expected_sha="${{ steps.asset.outputs.sha256 }}"
 
-          # 构建很久，期间 release 状态可能被别的流程改变；mutation 紧前再验一次草稿态。
-          [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "true" ] || {
-            echo "::error::release $tag 已不再是草稿，拒绝上传 APK"; exit 1; }
+          # 构建很久，mutation 紧前重新抓远端 peeled tag，并复核 release tag/draft。
+          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+          remote_tag_sha="$(git rev-list -n 1 "$tag")"
+          release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
+          if [ "$remote_tag_sha" != "$GITHUB_SHA" ] || \
+             [ "$(jq -r .tagName <<<"$release_json")" != "$tag" ] || \
+             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
+            echo "::error::tag/release 身份漂移，拒绝上传 APK（tagSha=$remote_tag_sha）"; exit 1
+          fi
+          echo "::notice::release targetCommitish=$(jq -r .targetCommitish <<<"$release_json")（仅诊断）"
           gh release upload "$tag" "$asset" \
             --clobber --repo "$GITHUB_REPOSITORY"
 

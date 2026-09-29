@@ -1388,7 +1388,13 @@ jobs:
 
           # 发布身份必须由同一个 tag、同一个 commit 贯穿三段 DAG。只验 tag 名不够：
           # workflow_dispatch 可以从另一 commit 启动，却仍拿一个旧 tag 当资产目标。
-          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+          verify_remote_tag() {
+            git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+            remote_tag_sha="$(git rev-list -n 1 "$tag")"
+            [ "$remote_tag_sha" = "$GITHUB_SHA" ] || {
+              echo "::error::远端 tag $tag 已漂移：remote=$remote_tag_sha expected=$GITHUB_SHA"; exit 1; }
+          }
+          verify_remote_tag
           head_sha="$(git rev-parse HEAD)"
           tag_sha="$(git rev-list -n 1 "$tag")"
           if [ "$head_sha" != "$GITHUB_SHA" ] || [ "$tag_sha" != "$GITHUB_SHA" ]; then
@@ -1424,35 +1430,43 @@ jobs:
             actual_tag="$(jq -r .tagName <<<"$release_json")"
             is_draft="$(jq -r .isDraft <<<"$release_json")"
             target_commitish="$(jq -r .targetCommitish <<<"$release_json")"
-            if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ] || \
-               [ "$target_commitish" != "$GITHUB_SHA" ]; then
-              echo "::error::release $tag 已存在但身份不符（tagName=$actual_tag isDraft=$is_draft target=$target_commitish）—— 拒绝改写"
+            if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ]; then
+              echo "::error::release $tag 已存在但不是同 tag 草稿（tagName=$actual_tag isDraft=$is_draft）—— 拒绝改写"
               exit 1
             fi
+            echo "::notice::release targetCommitish=$target_commitish（诊断信息；发布身份由远端 peeled tag SHA 裁决）"
             echo "release $tag 已是草稿 —— 续跑并覆盖同名桌面资产"
           else
             echo "release $tag 不存在 —— 创建（草稿态，验过再公开）"
+            verify_remote_tag
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$tag" \
               --generate-notes \
               --verify-tag \
-              --target "$GITHUB_SHA" \
               --draft
           fi
 
-          # create 后也从服务端回读：只给命令传 --target 不是证据，目标 SHA 必须真的落在 release 上。
+          # create 后也从服务端回读。既有 tag 的 targetCommitish 可能仍是默认分支；只作诊断，
+          # 发布身份的硬门是 mutation 紧前重新抓取的远端 peeled tag commit。
           release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
           [ "$(jq -r .tagName <<<"$release_json")" = "$tag" ] && \
-            [ "$(jq -r .isDraft <<<"$release_json")" = "true" ] && \
-            [ "$(jq -r .targetCommitish <<<"$release_json")" = "$GITHUB_SHA" ] || {
-              echo "::error::服务端 release 身份没有落到本次 tag/draft/SHA"; exit 1; }
+            [ "$(jq -r .isDraft <<<"$release_json")" = "true" ] || {
+              echo "::error::服务端 release 没有落到本次 tag 草稿"; exit 1; }
+          echo "::notice::release targetCommitish=$(jq -r .targetCommitish <<<"$release_json")（仅诊断）"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
           # --clobber：同名资产覆盖而非追加 `.1` 后缀。追加会让 release 里出现
           # `*-mac-arm64.dmg` 与 `*-mac-arm64.dmg.1` 两个命中，updater 选谁看顺序。
+          verify_remote_tag
+          release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft)"
+          if [ "$(jq -r .tagName <<<"$release_json")" != "$tag" ] || \
+             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
+            echo "::error::release $tag 已不再是同 tag 草稿，拒绝上传桌面资产"
+            exit 1
+          fi
           gh release upload "$tag" "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
@@ -1642,11 +1656,11 @@ jobs:
           actual_tag="$(jq -r .tagName <<<"$release_json")"
           is_draft="$(jq -r .isDraft <<<"$release_json")"
           target_commitish="$(jq -r .targetCommitish <<<"$release_json")"
-          if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ] || \
-             [ "$target_commitish" != "$GITHUB_SHA" ]; then
-            echo "::error::最终汇总前 release 身份漂移（tagName=$actual_tag isDraft=$is_draft target=$target_commitish）"
+          if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ]; then
+            echo "::error::最终汇总前 release 身份漂移（tagName=$actual_tag isDraft=$is_draft）"
             exit 1
           fi
+          echo "::notice::release targetCommitish=$target_commitish（仅诊断；SHA 由远端 peeled tag 对拍）"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "android_asset=polaris-${tag#v}-android-arm64.apk" >> "$GITHUB_OUTPUT"
 
@@ -1658,15 +1672,20 @@ jobs:
           merge-multiple: true
 
       # APK 来自上一段已验签名/开箱/远端 digest 的 job。再从 draft 下载一次，确保最终清单按
-      # GitHub 实际保存的字节生成；下载失败、重名或 0 字节都在这里硬失败。
+      # GitHub 实际保存的字节生成；同时必须与 Android job 回传的**固定已验签 SHA**一致，不能把
+      # 下载时才看到的新字节现算进清单，否则并发 --clobber 能把另一只 APK 偷换成新的“期望”。
       - name: Download signed APK from draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release_identity.outputs.tag }}
           ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}
+          VERIFIED_ANDROID_ASSET: ${{ needs.android_release.outputs.signed_apk_name }}
+          VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}
         run: |
           set -euo pipefail
+          [ -n "$VERIFIED_ANDROID_SHA256" ] && [ "$ANDROID_ASSET" = "$VERIFIED_ANDROID_ASSET" ] || {
+            echo "::error::Android reusable workflow 没回传预期的已验签 APK 身份"; exit 1; }
           mkdir -p dist-release/android
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern "$ANDROID_ASSET" --dir dist-release/android
@@ -1674,6 +1693,9 @@ jobs:
           [ -s "$apk" ] || { echo "::error::草稿里没有非空签名 APK：$ANDROID_ASSET"; exit 1; }
           [ "$(find dist-release -type f -name "$ANDROID_ASSET" | wc -l)" -eq 1 ] || {
             echo "::error::签名 APK 在汇总目录里不是恰好一份：$ANDROID_ASSET"; exit 1; }
+          downloaded_sha="$(sha256sum "$apk" | cut -d' ' -f1)"
+          [ "$downloaded_sha" = "$VERIFIED_ANDROID_SHA256" ] || {
+            echo "::error::草稿 APK 已被替换：downloaded=$downloaded_sha verified=$VERIFIED_ANDROID_SHA256"; exit 1; }
 
       - name: Generate combined SHA256SUMS
         shell: bash
@@ -1698,9 +1720,16 @@ jobs:
           TAG: ${{ steps.release_identity.outputs.tag }}
         run: |
           set -euo pipefail
-          # 写入前再查一次：若并发流程已公开，必须停在 mutation 之前。
-          [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "true" ] || {
-            echo "::error::release $TAG 已不再是草稿，拒绝覆盖 SHA256SUMS"; exit 1; }
+          # mutation 紧前同时重查远端 peeled tag 与 release tag/draft；targetCommitish 只作诊断。
+          git fetch --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          remote_tag_sha="$(git rev-list -n 1 "$TAG")"
+          release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
+          if [ "$remote_tag_sha" != "$GITHUB_SHA" ] || \
+             [ "$(jq -r .tagName <<<"$release_json")" != "$TAG" ] || \
+             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
+            echo "::error::tag/release 身份漂移，拒绝覆盖 SHA256SUMS（tagSha=$remote_tag_sha）"; exit 1
+          fi
+          echo "::notice::release targetCommitish=$(jq -r .targetCommitish <<<"$release_json")（仅诊断）"
           gh release upload "$TAG" dist-release/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --clobber
 
@@ -1748,17 +1777,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release_identity.outputs.tag }}
+          ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}
+          VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}
         run: |
           set -euo pipefail
           # 长构建期间 tag 可能被强推；mutation 紧前重新抓远端 ref，不能信 checkout 里的旧 tag。
           git fetch --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
           remote_tag_sha="$(git rev-list -n 1 "$TAG")"
-          release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish)"
+          release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
           if [ "$remote_tag_sha" != "$GITHUB_SHA" ] || \
-             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ] || \
-             [ "$(jq -r .targetCommitish <<<"$release_json")" != "$GITHUB_SHA" ]; then
+             [ "$(jq -r .tagName <<<"$release_json")" != "$TAG" ] || \
+             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
             echo "::error::公开前 tag/release 身份漂移，拒绝继续（tagSha=$remote_tag_sha）"
             exit 1
           fi
+          echo "::notice::release targetCommitish=$(jq -r .targetCommitish <<<"$release_json")（仅诊断）"
+
+          # 公开 mutation 紧前再次读取**远端**完整集合与 digest。期望侧沿用已生成且验过的清单；
+          # APK 那一行还必须等于 Android job 回传的固定已验签 SHA，绝不现场信任新 APK 重算期望。
+          sums="$GITHUB_WORKSPACE/dist-release/SHA256SUMS"
+          [ -s "$sums" ] || { echo "::error::公开前本地 SHA256SUMS 丢失"; exit 1; }
+          manifest_rows="$(awk -v name="$ANDROID_ASSET" '$2 == name {print $1}' "$sums")"
+          if [ "$(printf '%s\n' "$manifest_rows" | sed '/^$/d' | wc -l)" -ne 1 ] || \
+             [ "$manifest_rows" != "$VERIFIED_ANDROID_SHA256" ]; then
+            echo "::error::最终清单里的 APK SHA 不是 Android job 已验签的固定 SHA"; exit 1
+          fi
+          expected="$(mktemp)"
+          {
+            cat "$sums"
+            printf '%s  %s\n' "$(sha256sum "$sums" | cut -d' ' -f1)" 'SHA256SUMS'
+          } | LC_ALL=C sort -k2 > "$expected"
+          api_url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
+          [ -n "$api_url" ] || { echo "::error::公开紧前取不到 release $TAG 的 apiUrl"; exit 1; }
+          raw="$(mktemp)"
+          actual="$(mktemp)"
+          gh api "$api_url" --jq '.assets[] | "\(.digest // "MISSING")\t\(.state // "unknown")\t\(.name)"' > "$raw"
+          pending="$(awk -F'\t' '$1 == "MISSING" || $2 != "uploaded"' "$raw")"
+          [ -z "$pending" ] || {
+            echo "::error::公开紧前远端资产未落定或 digest 缺失"; printf '%s\n' "$pending"; exit 1; }
+          awk -F'\t' '{ print $1 "  " $3 }' "$raw" | sed 's/^sha256://' | LC_ALL=C sort -k2 > "$actual"
+          diff -u "$expected" "$actual" || {
+            echo "::error::公开紧前远端资产已被替换，拒绝公开"; exit 1; }
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           echo "release $TAG 已转为公开"

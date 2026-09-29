@@ -33,6 +33,15 @@ function jobBlock(src: string, name: string): string {
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
 
+/** 取出 job 内一个具名 step，避免跨 step 的同名环境变量让接线断言假绿。 */
+function stepBlock(src: string, name: string): string {
+  const start = src.indexOf(`\n      - name: ${name}\n`);
+  if (start < 0) throw new Error(`job 里找不到 step '${name}' —— 取材面塌了，本门此刻没有判据`);
+  const rest = src.slice(start + 1);
+  const next = rest.slice(1).search(/\n {6}- (?:name:|uses:)/);
+  return next < 0 ? rest : rest.slice(0, next + 1);
+}
+
 /**
  * 剥掉整行注释，只留 job 的可执行部分。
  *
@@ -187,16 +196,28 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(desktop).toContain('[ "$tag" != "v$version" ]');
     expect(desktop).toContain('[ "$tag_sha" != "$GITHUB_SHA" ]');
     expect(desktop).toContain('[ "$is_draft" != "true" ]');
-    expect(desktop).toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
-    expect(desktop).toContain('--target "$GITHUB_SHA"');
+    expect(desktop).not.toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
+    expect(desktop).not.toContain('--target "$GITHUB_SHA"');
+    expect(desktop).toContain('targetCommitish=$target_commitish（诊断信息');
+    expect(desktop.match(/^\s*verify_remote_tag$/gm) ?? []).toHaveLength(3);
     expect(desktop.indexOf('[ "$is_draft" != "true" ]')).toBeLessThan(
       desktop.indexOf('gh release upload "$tag" "${files[@]}"'),
     );
+    expect(desktop).toContain('已不再是同 tag 草稿，拒绝上传桌面资产');
+    const desktopUploadAt = desktop.indexOf('gh release upload "$tag" "${files[@]}"');
+    const lastDraftReadBeforeUpload = desktop.lastIndexOf(
+      'gh release view "$tag"',
+      desktopUploadAt,
+    );
+    expect(lastDraftReadBeforeUpload).toBeGreaterThan(0);
+    expect(lastDraftReadBeforeUpload).toBeLessThan(desktopUploadAt);
     expect(release).toContain('EXPECTED_SHA: ${{ needs.release_desktop.outputs.release_sha }}');
     expect(release).toContain('[ "$tag_sha" != "$GITHUB_SHA" ]');
-    expect(release.match(/git fetch --force/g) ?? []).toHaveLength(2);
+    expect(release.match(/git fetch --force/g) ?? []).toHaveLength(3);
     expect(release).toContain('[ "$remote_tag_sha" != "$GITHUB_SHA" ]');
     expect(release).toContain('.targetCommitish');
+    expect(release).not.toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
+    expect(release).not.toContain('targetCommitish <<<"$release_json")" != "$GITHUB_SHA"');
     expect(release).toContain('拒绝覆盖 SHA256SUMS');
   });
 
@@ -205,8 +226,28 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const allExecutable = executable(androidWorkflow);
     const releaseCheck = executable(jobBlock(androidWorkflow, 'release_check'));
     const publish = executable(jobBlock(androidWorkflow, 'release-apk'));
+    const dispatch = androidWorkflow.slice(
+      androidWorkflow.indexOf('  workflow_dispatch:'),
+      androidWorkflow.indexOf('\npermissions:'),
+    );
 
     expect(publish).toContain('if: inputs.publish_release');
+    expect(dispatch).not.toContain('publish_release:');
+    expect(dispatch).not.toContain('release_tag:');
+    expect(androidWorkflow).toContain(
+      'value: ${{ jobs.release-apk.outputs.signed_apk_sha256 }}',
+    );
+    expect(
+      [androidWorkflow, workflow('package.yml'), workflow('release-risk.yml')]
+        .join('\n')
+        .match(/publish_release:\s*true/g) ?? [],
+    ).toHaveLength(1);
+    expect(androidWorkflow).toContain(
+      'group: android-${{ github.workflow }}-${{ github.ref }}',
+    );
+    expect(workflow('package.yml')).toContain(
+      "group: package-${{ github.ref }}-${{ inputs.platforms || inputs.platform || github.event.inputs.platform || 'all' }}",
+    );
     expect(releaseCheck).toContain('if: inputs.publish_release != true');
     expect(androidWorkflow).not.toContain('\n  apk:\n');
     expect(allExecutable).not.toContain('--debug');
@@ -230,12 +271,15 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(releaseCheck).not.toContain('actions/upload-artifact@v7\n        with:\n          name: android-apk');
 
     expect(publish).toContain(
-      'git fetch --force --depth=1 origin "refs/tags/$tag:refs/tags/$tag"',
+      'git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"',
     );
+    expect(publish.match(/git fetch --force/g) ?? []).toHaveLength(2);
     expect(publish).toContain('tag_sha="$(git rev-list -n 1 "$tag")"');
     expect(publish).toContain('[ "$tag_sha" != "$GITHUB_SHA" ]');
     expect(publish).toContain('[ "$is_draft" != "true" ]');
-    expect(publish).toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
+    expect(publish).not.toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
+    expect(publish).toContain('targetCommitish=$target_commitish（仅诊断');
+    expect(publish).toContain('[ "$remote_tag_sha" != "$GITHUB_SHA" ]');
     expect(publish.indexOf('[ "$is_draft" != "true" ]')).toBeLessThan(
       publish.indexOf('gh release upload "$tag" "$asset"'),
     );
@@ -262,11 +306,15 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
     expect(publish).toContain('expected_sha="${{ steps.asset.outputs.sha256 }}"');
     expect(publish).toContain('[ "$actual_sha" != "sha256:$expected_sha" ]');
+    expect(publish).toContain(
+      'signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}',
+    );
     expect(publish).not.toContain('--draft=false');
   });
 
   it('最终清单包含从草稿回读的 APK，并与远端完整资产集合双向对账后才公开', () => {
     const release = executable(jobBlock(workflow('package.yml'), 'release'));
+    const promote = stepBlock(release, 'Promote release to public');
     const downloadAt = release.indexOf('gh release download "$TAG"');
     const sumsAt = release.indexOf('- name: Generate combined SHA256SUMS');
     const uploadSumsAt = release.indexOf('- name: Upload combined SHA256SUMS');
@@ -285,6 +333,14 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(remoteTagRefetchAt).toBeGreaterThan(verifyAt);
     expect(remoteTagRefetchAt).toBeLessThan(publishCommandAt);
     expect(release).toContain('android_asset=polaris-${tag#v}-android-arm64.apk');
+    expect(promote).toContain(
+      'VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}',
+    );
+    expect(promote).toContain(
+      'ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}',
+    );
+    expect(release).toContain('[ "$downloaded_sha" = "$VERIFIED_ANDROID_SHA256" ]');
+    expect(release).toContain('[ "$manifest_rows" != "$VERIFIED_ANDROID_SHA256" ]');
     expect(release).toContain('find . -type f ! -name SHA256SUMS');
     expect(release).toContain("cat \"$sums\"");
     expect(release).toContain(
@@ -295,7 +351,16 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
     expect(release).toContain("'SHA256SUMS'");
     expect(release).toContain('diff -u "$expected" "$actual"');
+    expect(release.match(/gh api "\$api_url" --jq/g) ?? []).toHaveLength(2);
+    expect(release.match(/diff -u "\$expected" "\$actual"/g) ?? []).toHaveLength(2);
     expect(release).toContain('拒绝覆盖 SHA256SUMS');
+    expect(release).toContain('公开紧前远端资产已被替换，拒绝公开');
     expect(release).toContain('公开前 tag/release 身份漂移，拒绝继续');
+    expect(promote.indexOf('gh api "$api_url" --jq')).toBeLessThan(
+      promote.indexOf('diff -u "$expected" "$actual"'),
+    );
+    expect(promote.indexOf('diff -u "$expected" "$actual"')).toBeLessThan(
+      promote.indexOf('gh release edit "$TAG"'),
+    );
   });
 });
