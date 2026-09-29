@@ -1,8 +1,9 @@
 ---
 title: Android batch QA prepared-only evidence foundation
+area: polaris
 created: 2026-09-30
 updated: 2026-09-30
-status: prepared-only-not-ready
+status: active
 type: runbook
 ---
 
