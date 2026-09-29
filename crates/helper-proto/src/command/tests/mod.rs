@@ -41,9 +41,13 @@ fn win_specific_commands_match_polaris_go_source() {
 }
 
 #[test]
-fn linux_specific_commands_match_polaris_go_source() {
-    // helper-linux/helper.go:396-399（install-core v1）
+fn linux_specific_commands_are_pinned() {
+    // 旧命令对照 helper-linux/helper.go；reap-safe 是 Rust helper 的原子能力门。
     assert_eq!(linux::INSTALL_CORE, "install-core");
     assert_eq!(linux::RESOLVED_DNS_SET, "resolved-dns-set");
     assert_eq!(linux::RESOLVED_DNS_REVERT, "resolved-dns-revert");
+    assert_eq!(linux::START_REAP_SAFE, "start-reap-safe");
+    assert_eq!(linux::STOP_REAP_SAFE, "stop-reap-safe");
+    assert_ne!(linux::START_REAP_SAFE, common::START);
+    assert_ne!(linux::STOP_REAP_SAFE, common::STOP);
 }

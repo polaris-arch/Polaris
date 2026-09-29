@@ -436,7 +436,7 @@ fn stop_terminates_child_and_reports_pid() {
 }
 
 #[test]
-fn stop_retains_stopping_birth_until_exact_reap() {
+fn reap_safe_stop_retains_stopping_birth_until_exact_reap() {
     let (_dir, auth, _core) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
     let spawner = MockSpawner::succeeding(555);
@@ -458,7 +458,7 @@ fn stop_retains_stopping_birth_until_exact_reap() {
         child: Some(ManagedChild::Running(CoreHandle::new(555))),
     });
 
-    let mut pending = MockConn::new(vec!["stop", "555"]);
+    let mut pending = MockConn::new(vec![lcmd::STOP_REAP_SAFE, "555"]);
     handle(&state, &deps, &mut pending);
     assert_eq!(pending.writes(), ["OK stop-pending 555"]);
     assert!(matches!(
@@ -467,7 +467,7 @@ fn stop_retains_stopping_birth_until_exact_reap() {
     ));
     assert!(fwd_called.lock().unwrap().is_empty());
 
-    let mut reaped = MockConn::new(vec!["stop", "555"]);
+    let mut reaped = MockConn::new(vec![lcmd::STOP_REAP_SAFE, "555"]);
     handle(&state, &deps, &mut reaped);
     assert_eq!(reaped.writes(), ["OK stopped 555"]);
     assert!(state.lock().unwrap().child.is_none());
@@ -1090,7 +1090,7 @@ fn start_blocker_precedes_already_validation_forwarding_and_spawn() {
         child: Some(ManagedChild::Running(CoreHandle::new(8888))),
     });
     // Deliberately invalid arguments: admission must run before validation too.
-    let mut conn = MockConn::new(vec!["start", "/wrong", "", "", "1", ""]);
+    let mut conn = MockConn::new(vec![lcmd::START_REAP_SAFE, "/wrong", "", "", "1", ""]);
     handle(&state, &deps, &mut conn);
     assert_eq!(conn.writes(), ["OK start-not-admitted unknown 7007"]);
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
@@ -1103,6 +1103,43 @@ fn start_blocker_precedes_already_validation_forwarding_and_spawn() {
             .as_ref()
             .map(|child| child.handle().pid),
         Some(8888)
+    );
+}
+
+#[test]
+fn unknown_command_is_rejected_before_arguments_or_child_mutation() {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let spawner = MockSpawner::succeeding(9001);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd_called = Arc::new(StdMutex::new(Vec::new()));
+    let fwd = {
+        let calls = Arc::clone(&fwd_called);
+        move |on| calls.lock().unwrap().push(on)
+    };
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let state = Mutex::new(HandlerState {
+        child: Some(ManagedChild::Running(CoreHandle::new(9001))),
+    });
+    let mut conn = MockConn::new(vec!["future-mutating-command", "9001"]);
+
+    handle(&state, &deps, &mut conn);
+
+    assert_eq!(conn.writes(), ["ERR unknown"]);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(spawner.terminate_calls.lock().unwrap().is_empty());
+    assert!(spawner.kill_calls.lock().unwrap().is_empty());
+    assert!(fwd_called.lock().unwrap().is_empty());
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .child
+            .as_ref()
+            .map(|child| child.handle().pid),
+        Some(9001)
     );
 }
 

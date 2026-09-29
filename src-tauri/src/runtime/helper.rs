@@ -995,7 +995,7 @@ impl HelperRuntime {
                 Ok(HelperStartResult::NotAdmitted(blocker))
             }
             Response::Ok(other) => Err(format!("helper 起核返回非预期响应：{other:?}")),
-            Response::Err(e) => Err(format!("helper 起核失败：{e}")),
+            Response::Err(e) => Err(format_helper_mutation_error(self.platform, "起核", &e)),
         }
     }
 
@@ -1456,6 +1456,10 @@ fn stop_core_with_client_budget(
     let started = std::time::Instant::now();
     let mut transport_retries = 0;
     let mut pending_pid = None;
+    let request = match client.platform() {
+        Platform::Linux => Request::LinuxStop { pid: want_pid },
+        _ => Request::Stop { pid: want_pid },
+    };
     loop {
         let remaining = total_timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -1466,7 +1470,7 @@ fn stop_core_with_client_budget(
                 None => format!("helper 停核通信超时：总预算 {total_timeout:?}"),
             });
         }
-        let response = match client.send_with_timeout(&Request::Stop { pid: want_pid }, remaining) {
+        let response = match client.send_with_timeout(&request, remaining) {
             Ok(response) => response,
             Err(_error) if transport_retries < HELPER_STOP_MAX_RETRIES => {
                 transport_retries += 1;
@@ -1504,9 +1508,28 @@ fn stop_core_with_client_budget(
             Response::Ok(other) => {
                 return Err(format!("helper 停核返回非预期响应：{other:?}"));
             }
-            Response::Err(error) => return Err(format!("helper 停核失败：{error}")),
+            Response::Err(error) => {
+                return Err(format_helper_mutation_error(
+                    client.platform(),
+                    "停核",
+                    &error,
+                ));
+            }
         }
     }
+}
+
+fn format_helper_mutation_error(
+    platform: Platform,
+    operation: &str,
+    error: &polaris_helper_proto::Error,
+) -> String {
+    if platform == Platform::Linux && error.code == polaris_helper_proto::ErrorCode::Unknown {
+        return format!(
+            "已安装的 Linux helper 不支持物理 reap 安全协议，已拒绝{operation}；请升级或修复 helper"
+        );
+    }
+    format!("helper {operation}失败：{error}")
 }
 
 fn sleep_within_stop_budget(

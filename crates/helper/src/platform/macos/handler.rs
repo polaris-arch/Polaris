@@ -354,6 +354,7 @@ pub fn dispatch(
         }
         // 以下命令不属于 mac helper 谱系（LinuxStart/IfaceMetric/Uninstall）
         Request::LinuxStart(_)
+        | Request::LinuxStop { .. }
         | Request::LinuxDnsSet(_)
         | Request::LinuxDnsRevert { .. }
         | Request::IfaceMetric { .. }

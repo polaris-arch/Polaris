@@ -51,6 +51,11 @@ fn stop_omits_identity_line_when_unspecified() {
         "不声明身份 → 帧与旧客户端逐字节一致（旧 helper 照常停核）"
     );
     assert_eq!(Request::Stop { pid: Some(4242) }.args_lines(), vec!["4242"]);
+    assert!(Request::LinuxStop { pid: None }.args_lines().is_empty());
+    assert_eq!(
+        Request::LinuxStop { pid: Some(4242) }.args_lines(),
+        vec!["4242"]
+    );
 }
 
 /// 整帧形态（含平台差异）：stop 的身份行紧跟 command 行。
@@ -67,10 +72,10 @@ fn stop_frame_shape_carries_identity_line() {
     let linux = String::from_utf8(codec::encode(
         Platform::Linux,
         "",
-        &Request::Stop { pid: None },
+        &Request::LinuxStop { pid: Some(7) },
     ))
     .unwrap();
-    assert_eq!(linux, "stop\n", "旧语义帧不变");
+    assert_eq!(linux, "stop-reap-safe\n7\n");
 }
 
 #[test]
@@ -121,6 +126,7 @@ fn linux_start_writes_singbox_first() {
             "0",
         ]
     );
+    assert_eq!(r.command_name(), "start-reap-safe");
 }
 
 #[test]
@@ -210,6 +216,10 @@ fn command_name_mapping() {
     // 锁住 wire 命令名 ↔ Request 变体映射
     assert_eq!(Request::Ping.command_name(), "ping");
     assert_eq!(Request::Stop { pid: None }.command_name(), "stop");
+    assert_eq!(
+        Request::LinuxStop { pid: None }.command_name(),
+        "stop-reap-safe"
+    );
     assert_eq!(Request::FreePort { port: 1 }.command_name(), "freeport");
     assert_eq!(
         Request::Start(StartParams {

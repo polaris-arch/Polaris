@@ -74,6 +74,12 @@ pub mod win {
 
 /// Linux 专属命令（移植自 `helper-linux/helper.go`）。
 pub mod linux {
+    /// Atomic capability command for Linux Start under native-reap custody.
+    /// A v1 helper does not recognize this token and rejects before mutation.
+    pub const START_REAP_SAFE: &str = "start-reap-safe";
+    /// Atomic capability command for Linux Stop whose success requires native
+    /// reap. A v1 helper rejects it instead of returning an early `stopped`.
+    pub const STOP_REAP_SAFE: &str = "stop-reap-safe";
     /// `OK installed` / `ERR ...`（与 mac 同构：临时核 sha256 校验后 root 写锁定 coreDir，逐文件 .new+rename 原子就位；
     /// linux proto v1）。
     pub const INSTALL_CORE: &str = "install-core";

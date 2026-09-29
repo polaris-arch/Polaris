@@ -362,6 +362,7 @@ where
             Request::InstallCore(p) => self.handle_install_core(&p),
             // 以下命令 Windows helper 不支持（mac/linux 专属）—— Go default 分支回 ERR unknown。
             Request::LinuxStart(_)
+            | Request::LinuxStop { .. }
             | Request::LinuxDnsSet(_)
             | Request::LinuxDnsRevert { .. }
             | Request::MacProxyTransaction { .. }

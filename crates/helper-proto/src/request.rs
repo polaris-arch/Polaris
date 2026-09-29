@@ -51,7 +51,7 @@ pub struct StartParams {
     pub parent_pid: Option<u32>,
 }
 
-/// Linux `start` 多一个核路径行（客户端传的 sing-box 路径，必须 == 锁定的 coreDir/sing-box，
+/// Linux `start-reap-safe` 多一个核路径行（客户端传的 sing-box 路径，必须 == 锁定的 coreDir/sing-box，
 /// `helper-linux/helper.go:401,417-420`）。封装为独立字段以便 mac/win 不带它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxStartParams {
@@ -110,13 +110,16 @@ pub enum Request {
     /// `pid: Some(p)` = 「只停 p 这个受管核」；`pid: None` = 旧语义「停你当前受管的那个」
     /// （不发身份行，帧与旧客户端逐字节一致）。
     Stop { pid: Option<u32> },
+    /// Linux native-reap Stop capability. The distinct command token makes
+    /// old helpers reject before mutating their child state.
+    LinuxStop { pid: Option<u32> },
     /// `cleanup`（无参数行）。
     Cleanup,
     /// `freeport <port>`（行3/行2 = 端口字符串）。
     FreePort { port: u16 },
     /// mac/win：`start <cfg> <log> <fwd> <ppid?>`。
     Start(StartParams),
-    /// linux：`start <singbox> <cfg> <log> <fwd> <ppid?>`（多核路径行）。
+    /// linux：`start-reap-safe <singbox> <cfg> <log> <fwd> <ppid?>`。
     LinuxStart(LinuxStartParams),
     /// `route-add <iface> <cidrs>`（mac/win）。
     RouteAdd(RouteParams),
@@ -155,9 +158,11 @@ impl Request {
             Self::Version => command::common::VERSION,
             Self::Status => command::common::STATUS,
             Self::Stop { .. } => command::common::STOP,
+            Self::LinuxStop { .. } => command::linux::STOP_REAP_SAFE,
             Self::Cleanup => command::common::CLEANUP,
             Self::FreePort { .. } => command::common::FREEPORT,
-            Self::Start(_) | Self::LinuxStart(_) => command::common::START,
+            Self::Start(_) => command::common::START,
+            Self::LinuxStart(_) => command::linux::START_REAP_SAFE,
             Self::RouteAdd(_) => command::common::ROUTE_ADD,
             Self::RouteDel(_) => command::common::ROUTE_DEL,
             Self::InstallCore(_) => command::mac::INSTALL_CORE, // linux 同名（command::linux::INSTALL_CORE == "install-core"）
@@ -196,6 +201,13 @@ impl Request {
                 // - `Some(p)` → 多发一行 `<pid>`。旧 helper 读完 command 就应答、这一行留在缓冲区里随连接关闭
                 //   丢弃（每请求一连接 + 写完 shutdown），故新客户端 + 旧 helper **仍能正常停核**，只是退化成
                 //   旧的「停当前受管核」语义 —— 绝不会变成「永远停不掉核」。
+                if let Some(p) = pid {
+                    out.push(p.to_string());
+                }
+            }
+            Self::LinuxStop { pid } => {
+                // Argument shape matches Stop, while the command token is intentionally
+                // incompatible: an old Linux helper must reject before it can mutate a child.
                 if let Some(p) = pid {
                     out.push(p.to_string());
                 }
@@ -266,8 +278,8 @@ pub fn parse_stop_pid(line: &str) -> Option<u32> {
 
 /// **停核的受管 pid 身份判据**（三平台 helper 的 `stop` 分支共用的唯一真值）。
 ///
-/// `want` = 客户端在 [`Request::Stop`] 里声明的「我要停的那个 pid」，`current` = helper 此刻手里
-/// 受管 child 的 pid。返回 `true` 才允许动手杀。
+/// `want` = 客户端在 [`Request::Stop`] / [`Request::LinuxStop`] 里声明的「我要停的那个 pid」，
+/// `current` = helper 此刻手里受管 child 的 pid。返回 `true` 才允许动手杀。
 ///
 /// **为什么必须有**（根因）：客户端的停核腿是异步的 —— 从它发出 `stop` 到 helper 真执行之间，
 /// 可能夹进「用户重装 helper / 重新起核」的一整个新会话。此时 helper 手里的受管 pid 已经换成

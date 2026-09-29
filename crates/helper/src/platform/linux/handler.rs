@@ -196,12 +196,12 @@ fn dispatch_locked<P, S, D, SD>(
 {
     match command {
         cmd::STATUS => handle_status(state, conn),
-        cmd::STOP => handle_stop(state, deps, conn),
+        cmd::STOP | lcmd::STOP_REAP_SAFE => handle_stop(state, deps, conn),
         cmd::CLEANUP => handle_cleanup(state, deps, cred, conn),
         cmd::FREEPORT => handle_freeport(deps, cred, conn),
         // install-core 是 linux 专属命令名（lcmd::INSTALL_CORE == "install-core"）。
         lcmd::INSTALL_CORE => handle_install_core(deps, conn),
-        cmd::START => handle_start(state, deps, cred, conn),
+        cmd::START | lcmd::START_REAP_SAFE => handle_start(state, deps, cred, conn),
         _ => {
             let _ = conn.write_line("ERR unknown");
         }

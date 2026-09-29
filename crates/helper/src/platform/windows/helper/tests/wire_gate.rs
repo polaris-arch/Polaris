@@ -34,6 +34,7 @@ request_samples! {
     Version => Request::Version,
     Status => Request::Status,
     Stop => Request::Stop { pid: Some(4242) },
+    LinuxStop => Request::LinuxStop { pid: Some(4242) },
     Cleanup => Request::Cleanup,
     FreePort => Request::FreePort { port: 9090 },
     Start => Request::Start(StartParams {
@@ -105,8 +106,8 @@ fn is_unknown(out: &HandleOutcome) -> bool {
 /// `ErrorCode::Unknown`」。两个方向都红：分派了但解不出（批一/批三），解得出但分派回 unknown。
 ///
 /// 「解得出」取**无损往返**（`parse_request(..) == Some(原请求)`），不取 `is_some()`：
-/// `LinuxStart` 的 wire 命令也是 `start`，Windows 解码器会把它解成（字段错位的）`Start` ——
-/// 那不叫认识 `LinuxStart`；而一个本该支持的变体若往返有损（丢行、错位），同样应当红。
+/// Linux capability commands use distinct wire tokens and must stay unsupported on Windows;
+/// while any supported variant must round-trip without losing lines or shifting fields.
 ///
 /// 第三条腿：同一份字节喂生产入口 [`WinHelper::handle_frame`]，其是否回 `ERR unknown` 必须与
 /// 「解码结果 + 分派」的结论一致 —— 证明门测的切行/解码就是 `handle_frame` 用的那一份。

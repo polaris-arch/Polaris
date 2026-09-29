@@ -141,6 +141,25 @@ fn physical_reap_and_start_admission_states_round_trip() {
 }
 
 #[test]
+fn malformed_start_admission_never_publishes_typed_custody() {
+    for line in [
+        "OK start-not-admitted pending",
+        "OK start-not-admitted pending 0",
+        "OK start-not-admitted pending nope",
+        "OK start-not-admitted pending +42",
+        "OK start-not-admitted pending -1",
+        "OK start-not-admitted pending 42 trailing",
+        "OK start-not-admitted unknown 0",
+        "OK start-not-admitted unknown 42 trailing",
+    ] {
+        assert!(
+            matches!(Response::parse(line), Response::Ok(ResponseKind::OkRaw { token, .. }) if token == "start-not-admitted"),
+            "malformed custody response must stay untyped: {line}"
+        );
+    }
+}
+
+#[test]
 fn parse_start_started_already() {
     // helper.go:522,579
     let r = Response::parse("OK started 12345");

@@ -218,6 +218,6 @@ fn end_to_end_start_roundtrip() {
     let linux_bytes = codec::encode(Platform::Linux, "", &lreq);
     assert_eq!(
         String::from_utf8(linux_bytes).unwrap(),
-        "start\n/core/sing-box\n/tmp/c.json\n\n0\n"
+        "start-reap-safe\n/core/sing-box\n/tmp/c.json\n\n0\n"
     );
 }

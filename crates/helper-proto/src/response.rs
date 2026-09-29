@@ -460,13 +460,13 @@ fn parse_ok(rest: &str) -> ResponseKind {
         }),
         "start-not-admitted" => {
             let (state, pid) = parse_first_token(tail);
-            match state {
-                "pending" => ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Pending {
-                    pid: parse_pid(pid),
-                })),
-                "unknown" => ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Unknown {
-                    pid: parse_pid(pid),
-                })),
+            match (state, parse_exact_nonzero_pid(pid)) {
+                ("pending", Some(pid)) => {
+                    ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Pending { pid }))
+                }
+                ("unknown", Some(pid)) => {
+                    ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Unknown { pid }))
+                }
                 _ => ResponseKind::OkRaw {
                     token: "start-not-admitted".to_owned(),
                     rest: tail.to_owned(),
@@ -541,6 +541,19 @@ fn parse_pong(tail: &str) -> Pong {
 fn parse_pid(tail: &str) -> u32 {
     let (tok, _) = parse_first_token(tail);
     tok.parse().unwrap_or(0)
+}
+
+/// Parse a safety-critical custody target. Unlike the compatibility parsers
+/// above, this accepts exactly one non-zero PID token: publishing a typed
+/// blocker without an exact Stop target would strand recovery bookkeeping.
+fn parse_exact_nonzero_pid(tail: &str) -> Option<u32> {
+    let mut tokens = tail.split_whitespace();
+    let token = tokens.next()?;
+    if !token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let pid = token.parse::<u32>().ok()?;
+    (pid != 0 && tokens.next().is_none()).then_some(pid)
 }
 
 /// 解析 Windows helper 追加的完整 timing token 集。

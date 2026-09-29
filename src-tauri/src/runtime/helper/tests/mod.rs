@@ -8,6 +8,7 @@ use std::sync::Mutex;
 struct SequenceConnector {
     streams: Mutex<Vec<polaris_helper_client::MockStream>>,
     connects: Arc<std::sync::atomic::AtomicUsize>,
+    frames: Arc<Mutex<Vec<String>>>,
 }
 
 impl Connector for SequenceConnector {
@@ -17,21 +18,39 @@ impl Connector for SequenceConnector {
         if streams.is_empty() {
             return Err(ClientError::Connect("测试连接已耗尽".to_owned()));
         }
-        Ok(Box::new(streams.remove(0)))
+        Ok(Box::new(RecordingStream {
+            inner: streams.remove(0),
+            frames: Arc::clone(&self.frames),
+        }))
     }
 }
 
 fn stop_test_client(
     streams: Vec<polaris_helper_client::MockStream>,
 ) -> (HelperClient, Arc<std::sync::atomic::AtomicUsize>) {
+    let (client, connects, _frames) = stop_test_client_with_frames(Platform::Win, streams);
+    (client, connects)
+}
+
+fn stop_test_client_with_frames(
+    platform: Platform,
+    streams: Vec<polaris_helper_client::MockStream>,
+) -> (
+    HelperClient,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frames = Arc::new(Mutex::new(Vec::new()));
     let connector = SequenceConnector {
         streams: Mutex::new(streams),
         connects: Arc::clone(&connects),
+        frames: Arc::clone(&frames),
     };
     (
-        HelperClient::new(Box::new(connector), Platform::Win, "TOK"),
+        HelperClient::new(Box::new(connector), platform, "TOK"),
         connects,
+        frames,
     )
 }
 
@@ -56,11 +75,14 @@ fn stop_retries_once_when_the_first_roundtrip_loses_its_response() {
 
 #[test]
 fn stop_polls_pending_until_exact_reap_receipt() {
-    let (client, connects) = stop_test_client(vec![
-        polaris_helper_client::MockStream::with_response(b"OK stop-pending 4242\n".to_vec()),
-        polaris_helper_client::MockStream::with_response(b"OK stop-pending 4242\n".to_vec()),
-        polaris_helper_client::MockStream::with_response(b"OK stopped 4242\n".to_vec()),
-    ]);
+    let (client, connects, frames) = stop_test_client_with_frames(
+        Platform::Linux,
+        vec![
+            polaris_helper_client::MockStream::with_response(b"OK stop-pending 4242\n".to_vec()),
+            polaris_helper_client::MockStream::with_response(b"OK stop-pending 4242\n".to_vec()),
+            polaris_helper_client::MockStream::with_response(b"OK stopped 4242\n".to_vec()),
+        ],
+    );
     stop_core_with_client_budget(
         &client,
         Some(4242),
@@ -69,6 +91,11 @@ fn stop_polls_pending_until_exact_reap_receipt() {
     )
     .expect("Pending is retryable within the same top-level Stop");
     assert_eq!(connects.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *frames.lock().unwrap(),
+        vec!["stop-reap-safe\n4242\n".to_owned(); 3],
+        "every Linux Pending retry must retain the atomic capability command"
+    );
 }
 
 #[test]
@@ -86,6 +113,42 @@ fn stop_unknown_fails_closed_without_retry() {
     .unwrap_err();
     assert!(error.contains("未知") && error.contains("4242"));
     assert_eq!(connects.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn old_linux_helper_refusal_does_not_fall_back_or_claim_reap() {
+    let (client, connects, frames) = stop_test_client_with_frames(
+        Platform::Linux,
+        vec![polaris_helper_client::MockStream::with_response(
+            b"ERR unknown\n".to_vec(),
+        )],
+    );
+
+    let error = stop_core_with_client(&client, Some(4242)).unwrap_err();
+
+    assert!(error.contains("物理 reap 安全协议"), "{error}");
+    assert!(error.contains("升级或修复"), "{error}");
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        1,
+        "unknown is a capability refusal, not a retry/fallback trigger"
+    );
+    assert_eq!(
+        *frames.lock().unwrap(),
+        ["stop-reap-safe\n4242\n".to_owned()],
+        "Linux must not fall back to the legacy stop token"
+    );
+}
+
+#[test]
+fn old_linux_helper_start_refusal_has_an_upgrade_path() {
+    let error = format_helper_mutation_error(
+        Platform::Linux,
+        "起核",
+        &polaris_helper_proto::Error::new(polaris_helper_proto::ErrorCode::Unknown),
+    );
+    assert!(error.contains("已拒绝起核"), "{error}");
+    assert!(error.contains("升级或修复"), "{error}");
 }
 
 #[test]
@@ -774,7 +837,7 @@ fn a_successful_install_clears_the_install_core_capability_note() {
 
 // ===== install-core：Windows 上「写出了、0 字节就断开」的归类 =====
 
-/// 把写出的帧记下来的流（验复核帧是**无副作用**的空参 install-core）。
+/// 把 client 写出的帧记下来，供 Stop capability 与 install-core 复核帧断言共用。
 struct RecordingStream {
     inner: polaris_helper_client::MockStream,
     frames: Arc<Mutex<Vec<String>>>,
