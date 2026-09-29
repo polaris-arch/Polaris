@@ -230,7 +230,8 @@ fn spawn_dns() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
             response.extend_from_slice(&0x8180u16.to_be_bytes());
             response.extend_from_slice(&1u16.to_be_bytes());
             response.extend_from_slice(&(answers.len() as u16).to_be_bytes());
-            response.extend_from_slice(&[0; 6]);
+            // DNS header has only NSCOUNT and ARCOUNT after ANCOUNT.
+            response.extend_from_slice(&[0; 4]);
             response.extend_from_slice(&data[12..question_end]);
             for answer in answers {
                 response.extend_from_slice(&[0xc0, 0x0c]);
@@ -244,6 +245,64 @@ fn spawn_dns() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
         }
     });
     (addr, query_rx, stop)
+}
+
+#[test]
+fn dns_stub_emits_parseable_multi_answer_a_and_empty_aaaa() {
+    let (server, queries, stop) = spawn_dns();
+    let _stop = StopOnDrop(vec![stop]);
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    for (qtype, expected) in [
+        (1u16, vec![[100, 80, 4, 1], [100, 80, 5, 1]]),
+        (28u16, vec![]),
+    ] {
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["same-owner", "test"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&qtype.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        client.send_to(&query, server).unwrap();
+
+        let mut packet = [0u8; 512];
+        let (len, source) = client.recv_from(&mut packet).unwrap();
+        assert_eq!(source, server);
+        let response = &packet[..len];
+        let mut header = [0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+        header[7] = expected.len() as u8;
+        assert_eq!(response.get(..12), Some(header.as_slice()));
+        assert_eq!(
+            response.get(12..query.len()),
+            Some(&query[12..]),
+            "DNS question must begin immediately after the 12-byte header"
+        );
+        let mut offset = query.len();
+        for address in expected {
+            let end = offset + 16;
+            assert_eq!(
+                response.get(offset..end),
+                Some(
+                    [
+                        0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, address[0], address[1],
+                        address[2], address[3],
+                    ]
+                    .as_slice()
+                ),
+                "DNS A record must have a valid owner pointer, type, class and RDATA"
+            );
+            offset = end;
+        }
+        assert_eq!(offset, response.len(), "unexpected bytes after DNS answers");
+        assert_eq!(
+            queries.recv_timeout(Duration::from_secs(2)).unwrap(),
+            format!("same-owner.test type={qtype} answers={}", header[7])
+        );
+    }
 }
 
 fn spawn_observer() -> (
