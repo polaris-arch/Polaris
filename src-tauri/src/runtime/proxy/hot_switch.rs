@@ -774,7 +774,9 @@ impl ProxyRuntime {
             Some(LifecycleKind::Start | LifecycleKind::Restart)
                 if matches!(outcome, Some(SwitchOutcome::Restarting)) =>
             {
-                Some(SwitchOutcome::Pending)
+                // The scheduled restart has claimed the core. Keep its typed receipt
+                // even if the generation advances before the IPC response is sent.
+                Some(SwitchOutcome::Restarting)
             }
             Some(LifecycleKind::Start | LifecycleKind::Restart)
                 if matches!(outcome, Some(SwitchOutcome::Pending))
@@ -1761,7 +1763,10 @@ impl ProxyRuntime {
             return SwitchOutcome::Deferred;
         }
         self.schedule_restart_for_generation(expected_generation);
-        self.push_pending_changes();
+        // This selection is already being applied by the automatic restart. Emitting
+        // D/R debt here briefly presents an actionable "Apply pending" bar even though
+        // tapping it would queue a redundant full-config restart. Stop/ready publish
+        // the authoritative pending snapshot; deferred selections still push above.
         SwitchOutcome::Restarting
     }
 

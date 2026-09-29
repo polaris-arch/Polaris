@@ -369,6 +369,92 @@ async fn registered_warp_full_tunnel_keeps_the_normal_hot_switch_path() {
     assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
+/// A tailnet without an exit device changes the generated public route and DNS
+/// detour in both directions. An exit-capable TS with resolveByName disabled and
+/// WARP remain selector-only in this matrix; selected-dependent MagicDNS changes
+/// are a separate structural boundary.
+/// Exercise the production selected-only command path, including strict group
+/// readback, so a missing tag or an unavailable gRPC stub cannot fake the result.
+#[tokio::test]
+async fn ts_and_warp_selection_matrix_preserves_route_rebuild_boundary() {
+    let mesh_only = mesh_only_ts_node("ts-mesh", "TS Mesh");
+    let mut exit_ts = mesh_only_ts_node("ts-exit", "TS Exit");
+    exit_ts["tailscaleSettings"]["exitNode"] = serde_json::json!("peer-exit");
+    let mut warp = valid_force_route_wg_node("warp-test", "WARP Test");
+    warp["address"] = serde_json::json!("engage.cloudflareclient.com");
+    warp["port"] = serde_json::json!(2408);
+    warp["wireguardSettings"]["allowedIPs"] = serde_json::json!(["0.0.0.0/0", "::/0"]);
+    warp["wireguardSettings"]["alwaysRouteSubnets"] = serde_json::json!(true);
+    warp["wireguardSettings"]["warpDevice"] =
+        serde_json::json!({ "deviceId": "synthetic-device", "token": "synthetic-token" });
+
+    for (label, node, requires_restart) in [
+        ("TS without exit", mesh_only, true),
+        ("TS with exit", exit_ts, false),
+        ("WARP full tunnel", warp, false),
+    ] {
+        let id = node["id"].as_str().unwrap().to_string();
+        let tag = node["name"].as_str().unwrap().to_string();
+        for (old, new, target_tag) in [
+            ("node-a", id.as_str(), tag.as_str()),
+            (id.as_str(), "node-a", "Node A"),
+        ] {
+            let (rt, _dir) = test_runtime();
+            let running = config_with_nodes(old, &[node.clone()]);
+            rt.config.save_full(&running).unwrap();
+            let running = rt.config.current().unwrap();
+            mark_running_with_named_snapshot(&rt, &running);
+            cover_running_binding_roots(&rt, &running);
+            *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+            let pending_events: PendingChangesEvents = Arc::new(Mutex::new(Vec::new()));
+            rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+                pending_changes: Arc::clone(&pending_events),
+                ..Default::default()
+            }));
+            let sink = Arc::new(TestPutSink::default());
+            *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, target_tag)]);
+            *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+
+            let mut saved = running;
+            saved["selectedServerId"] = serde_json::json!(new);
+            rt.config.save_full(&saved).unwrap();
+            let intent = rt.register_selector_intent();
+            let outcome = rt
+                .switch_selected_server_if_current(new, intent)
+                .await
+                .unwrap();
+            if requires_restart {
+                assert_eq!(
+                    outcome,
+                    Some(SwitchOutcome::Restarting),
+                    "{label}: {old}->{new}"
+                );
+                assert!(
+                    sink.calls().is_empty(),
+                    "{label}: route changes cannot be selector PUT"
+                );
+                assert!(rt.pending_force_restart.read().unwrap().is_some());
+                assert!(
+                    pending_events.lock().unwrap().is_empty(),
+                    "{label}: scheduled automatic restart must not flash an Apply-pending bar"
+                );
+                rt.gate.bump_generation(); // Fake core must not execute the scheduled restart.
+            } else {
+                assert_eq!(
+                    outcome,
+                    Some(SwitchOutcome::HotSwitched),
+                    "{label}: {old}->{new}"
+                );
+                assert_eq!(
+                    sink.calls(),
+                    vec![(PROXY_SELECTOR_TAG.into(), target_tag.into())]
+                );
+                assert!(rt.pending_force_restart.read().unwrap().is_none());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn structural_selection_rejects_an_intent_superseded_before_entry() {
     let (rt, _dir) = test_runtime();
@@ -834,7 +920,7 @@ fn explicit_selection_receipt_rejects_old_pending_and_old_success() {
 }
 
 #[tokio::test]
-async fn claimed_selected_restart_receipt_is_pending_until_explicit_stop_takes_over() {
+async fn claimed_selected_restart_receipt_remains_typed_until_explicit_stop_takes_over() {
     let (rt, _dir, sink, running) = explicit_selection_fixture();
     let mut disk = running.clone();
     disk["selectedServerId"] = serde_json::json!("node-b");
@@ -868,8 +954,8 @@ async fn claimed_selected_restart_receipt_is_pending_until_explicit_stop_takes_o
         .expect("selected projection must be claimed by its exact force id");
     assert_eq!(
         rt.settle_selected_switch_receipt(outcome, starting_generation, intent),
-        Some(SwitchOutcome::Pending),
-        "transient restart stop is still applying, not a terminal disconnection"
+        Some(SwitchOutcome::Restarting),
+        "a claimed restart must retain its typed receipt, not become generic pending"
     );
 
     rt.gate.claim_generation(None, LifecycleKind::Stop);

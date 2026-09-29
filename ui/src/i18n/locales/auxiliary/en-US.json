@@ -43,6 +43,7 @@
     "actionFailed": "\"{{action}}\" failed: {{detail}}",
     "actionFailedDetail": "The operation could not be completed",
     "switchPending": "{{node}} saved; applying connection change",
+    "switchRestarting": "{{node}} saved; restarting",
     "switchSavedForNextStart": "{{node}} saved for the next connection",
     "switchRequiresApply": "{{node}} saved; apply pending changes before use"
   },

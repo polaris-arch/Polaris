@@ -13,7 +13,7 @@ describe('mobile switch receipt when the core is stopped', () => {
     expect(switchReceiptFeedback(receipt, 'node', t)).toEqual({ tone: 'info', text: 'home.switchSavedForNextStart' });
   });
 
-  it.each(['applied', 'pending', 'deferred', 'superseded'] as const)(
+  it.each(['applied', 'pending', 'restarting', 'deferred', 'superseded'] as const)(
     'preserves the shared %s outcome', (status) => {
       const receipt: ServerSwitchReceipt = { status };
       expect(mobileSwitchReceiptFeedback(receipt, 'node', t)).toEqual(switchReceiptFeedback(receipt, 'node', t));

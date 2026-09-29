@@ -20,6 +20,22 @@ fn seed_switch_nodes(mgr: &ConfigManager) {
 }
 
 #[test]
+fn switch_receipt_distinguishes_scheduled_restart_from_pending_and_applied() {
+    assert_eq!(
+        ServerSwitchReceipt::from_outcome(Some(SwitchOutcome::Restarting)).status(),
+        "restarting"
+    );
+    assert_eq!(
+        ServerSwitchReceipt::from_outcome(Some(SwitchOutcome::Pending)).status(),
+        "pending"
+    );
+    assert_eq!(
+        ServerSwitchReceipt::from_outcome(Some(SwitchOutcome::HotSwitched)).status(),
+        "applied"
+    );
+}
+
+#[test]
 fn server_switch_core_updates_selection_and_mru_in_one_write() {
     let dir = temp_dir("switch-core");
     let mgr = ConfigManager::new(dir.clone());

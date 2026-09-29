@@ -434,6 +434,7 @@
     "switchNodeTip": "Сменить узел",
     "switchedToast": "{{node}} · переключено",
     "switchPending": "{{node}} · сохранено, изменение соединения применяется",
+    "switchRestarting": "{{node}} · сохранено; соединение перезапускается для завершения переключения",
     "switchSavedForNextStart": "{{node}} · сохранено для следующего подключения",
     "switchRequiresApply": "{{node}} · сохранено; примените ожидающие изменения",
     "takeoverManual": "Локально",
@@ -476,6 +477,7 @@
     "pendingResetDone": "Несохранённые изменения отменены",
     "pendingSavedStillNeedsApply": "Сохранённые изменения всё ещё ожидают применения",
     "switchPending": "{{node}} · сохранено, изменение соединения применяется",
+    "switchRestarting": "{{node}} · сохранено; соединение перезапускается для завершения переключения",
     "switchSavedForNextStart": "{{node}} · сохранено для следующего подключения",
     "switchRequiresApply": "{{node}} · сохранено; примените ожидающие изменения"
   },

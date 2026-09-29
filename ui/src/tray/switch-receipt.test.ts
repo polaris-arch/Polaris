@@ -7,6 +7,7 @@ describe('tray switch receipt', () => {
   it.each([
     ['applied', true, null],
     ['pending', false, 'tray.switchPending:HK'],
+    ['restarting', false, 'tray.switchRestarting:HK'],
     ['notRunning', false, 'tray.switchSavedForNextStart:HK'],
     ['deferred', false, 'tray.switchRequiresApply:HK'],
     ['superseded', false, null],

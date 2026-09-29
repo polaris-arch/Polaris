@@ -412,6 +412,7 @@
     "switchNodeTip": "切換節點",
     "switchedToast": "{{node}} · 已切換",
     "switchPending": "{{node}} · 已儲存，正在套用連線變更",
+    "switchRestarting": "{{node}} · 已儲存，正在重新啟動連線以完成切換",
     "switchSavedForNextStart": "{{node}} · 已儲存，下次連線時生效",
     "switchRequiresApply": "{{node}} · 已儲存，請套用待處理變更後使用",
     "takeoverManual": "本地",
@@ -454,6 +455,7 @@
     "pendingResetDone": "已放棄未儲存變更",
     "pendingSavedStillNeedsApply": "已儲存的變更仍待套用",
     "switchPending": "{{node}} · 已儲存，正在套用連線變更",
+    "switchRestarting": "{{node}} · 已儲存，正在重新啟動連線以完成切換",
     "switchSavedForNextStart": "{{node}} · 已儲存，下次連線時生效",
     "switchRequiresApply": "{{node}} · 已儲存，請套用待處理變更後使用"
   },

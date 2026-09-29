@@ -43,6 +43,7 @@
     "actionFailed": "«{{action}}» не удалось: {{detail}}",
     "actionFailedDetail": "Не удалось выполнить действие",
     "switchPending": "{{node}} сохранено, изменение соединения применяется",
+    "switchRestarting": "{{node}}: перезапуск",
     "switchSavedForNextStart": "{{node}} сохранено для следующего подключения",
     "switchRequiresApply": "{{node}} сохранено; примените ожидающие изменения"
   },

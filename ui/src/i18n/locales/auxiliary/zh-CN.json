@@ -43,6 +43,7 @@
     "actionFailed": "「{{action}}」失败：{{detail}}",
     "actionFailedDetail": "操作未完成",
     "switchPending": "{{node}} 已保存，正在应用连接更改",
+    "switchRestarting": "{{node}} 已保存，正在重启",
     "switchSavedForNextStart": "{{node}} 已保存，下次连接时生效",
     "switchRequiresApply": "{{node}} 已保存，请应用待处理更改后使用"
   },

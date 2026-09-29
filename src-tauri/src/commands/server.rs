@@ -570,7 +570,10 @@ impl ServerSwitchReceipt {
             Some(SwitchOutcome::HotSwitched | SwitchOutcome::NoOp | SwitchOutcome::Unchanged) => {
                 ("applied", None)
             }
-            Some(SwitchOutcome::Pending | SwitchOutcome::Restarting) => ("pending", None),
+            Some(SwitchOutcome::Pending) => ("pending", None),
+            // The selector cannot express a route/DNS projection change. A restart is
+            // already scheduled; the user does not need to apply this selection again.
+            Some(SwitchOutcome::Restarting) => ("restarting", None),
             Some(SwitchOutcome::NotRunning) => ("notRunning", None),
             Some(SwitchOutcome::Deferred) => ("deferred", Some("nodeRequiresApply")),
             None => ("superseded", None),
