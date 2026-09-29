@@ -34,9 +34,9 @@ use polaris_helper_client::{
     READY_POLL_DELAY,
 };
 use polaris_helper_proto::{
-    FlushDns, InstallCoreParams, LinuxDns, LinuxDnsSetParams, LinuxStartParams, Platform, Request,
-    Response, ResponseKind, RouteParams, Start, StartNotAdmitted, StartParams,
-    Status as CoreStatus, Stop,
+    FlushDns, HelperBirthTarget, InstallCoreParams, LinuxBirthStart, LinuxBirthStatus,
+    LinuxBirthStop, LinuxDns, LinuxDnsSetParams, LinuxStartParams, Platform, Request, Response,
+    ResponseKind, RouteParams, Start, StartNotAdmitted, StartParams, Status as CoreStatus, Stop,
 };
 use polaris_system_integration::dns_flush::HelperFlushResult;
 use polaris_system_integration::linux_resolved::LinuxResolvedOps;
@@ -66,6 +66,27 @@ const HELPER_STOP_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(crate) enum HelperStartResult {
     Started(u32),
     NotAdmitted(StartNotAdmitted),
+    BirthStarted(HelperBirthTarget),
+    BirthAlready(HelperBirthTarget),
+    BirthNotAdmitted {
+        target: Option<HelperBirthTarget>,
+        pending: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperStopTarget {
+    Legacy(u32),
+    Birth(HelperBirthTarget),
+}
+
+impl HelperStopTarget {
+    pub(crate) fn pid(self) -> u32 {
+        match self {
+            Self::Legacy(pid) => pid,
+            Self::Birth(target) => target.pid.get(),
+        }
+    }
 }
 
 /// helper flush-dns 通信超时（对齐 上游 `HelperManager.flushDns` 的 5000ms；flush 为瞬时操作）。
@@ -389,12 +410,12 @@ impl PreflightStopResult {
 /// （`/var/run/...`），单测既起不了真 daemon、也不许往系统路径写 —— 没有替身就等于起核收口腿
 /// 完全无法被断言（「stop 有没有被调」只能靠读代码推理）。抽成窄 trait 后可注入可观测替身，
 /// 把它变成有牙的门。
-pub trait HelperStopOps: Send + Sync {
+pub(crate) trait HelperStopOps: Send + Sync {
     /// 请 daemon 终止其受管 sing-box child。
     ///
-    /// `want_pid` = **本腿意图停的那个 pid**（身份判据，见 [`HelperRuntime::stop_core`]）。
-    /// `None` = 尚不知 pid（起核 IPC 在飞）→ 旧语义「停当前受管核」。
-    fn stop_managed_core(&self, want_pid: Option<u32>) -> Result<(), String>;
+    /// Linux requires the exact birth target; macOS/Windows retain their
+    /// legacy PID target. An unconfirmed birth cannot issue Stop.
+    fn stop_managed_core(&self, target: HelperStopTarget) -> Result<(), String>;
 }
 
 /// helper 对其受管 sing-box 的权威运行视图。
@@ -413,11 +434,21 @@ pub(crate) enum ManagedCoreStatus {
         image: Option<String>,
     },
     Stopped,
+    BirthRunning {
+        target: HelperBirthTarget,
+    },
+    BirthStopping {
+        target: HelperBirthTarget,
+    },
+    BirthUnknown {
+        target: HelperBirthTarget,
+    },
+    BirthEmpty,
 }
 
 impl HelperStopOps for HelperRuntime {
-    fn stop_managed_core(&self, want_pid: Option<u32>) -> Result<(), String> {
-        self.stop_core(want_pid)
+    fn stop_managed_core(&self, target: HelperStopTarget) -> Result<(), String> {
+        self.stop_core(target)
     }
 }
 
@@ -907,7 +938,7 @@ impl HelperRuntime {
 
     /// 经就绪 helper 提权起核（TUN 模式，proxy.rs 决策路由后调）。返回 root/SYSTEM 受管核 pid。
     ///
-    /// - linux：`Request::LinuxStart`（多带核路径行，helper 校验 == 锁定 coreBin + setuid 回登录用户 +
+    /// - linux：`Request::LinuxStartBirth`（多带核路径行，helper 校验 == 锁定 coreBin + setuid 回登录用户 +
     ///   AmbientCaps 拉核）。
     /// - mac/win：`Request::Start`（helper 用锁定的 `--singbox` 核）。
     ///
@@ -952,7 +983,7 @@ impl HelperRuntime {
             // 本处特有的那半句：iOS 起核连「起一个核进程」这件事都不存在 —— 核是 NE 扩展进程
             // 自己 `startTunnel` 时在进程内拉起的 libbox，没有可传路径的 exec 面。
             Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
-                Request::LinuxStart(LinuxStartParams {
+                let params = LinuxStartParams {
                     singbox_path: crate::runtime::core_promote::protected_core_path_in(
                         &self.protected_core_dir_path(),
                         std::env::consts::OS,
@@ -960,12 +991,20 @@ impl HelperRuntime {
                     .to_string_lossy()
                     .into_owned(),
                     common,
-                })
+                };
+                if self.platform == Platform::Linux {
+                    Request::LinuxStartBirth(params)
+                } else {
+                    Request::LinuxStart(params)
+                }
             }
         };
         let resp = client
             .send_with_timeout(&req, HELPER_START_TIMEOUT)
             .map_err(|e| format!("helper 起核通信失败：{e}"))?;
+        if self.platform == Platform::Linux {
+            return classify_linux_birth_start_response(resp);
+        }
         match resp {
             Response::Ok(ResponseKind::Start(Start::StartedTimed {
                 pid,
@@ -1098,6 +1137,17 @@ impl HelperRuntime {
         managed_core_status_with_client(&client)
     }
 
+    /// Probe support before any Linux helper Start reservation is armed. This
+    /// status request is read-only; an old helper's ERR unknown must remain a
+    /// recoverable upgrade error, not an unconfirmed possible child birth.
+    pub(crate) fn require_linux_birth_capability(&self) -> Result<(), String> {
+        if self.platform != Platform::Linux {
+            return Ok(());
+        }
+        let client = self.build_client()?;
+        require_linux_birth_capability_with_client(&client)
+    }
+
     /// **受保护核目录**（三平台的 root/SYSTEM 锁定核目录）。
     ///
     /// 与 helper 安装期烧进描述符的路径同源（[`InstallPaths::for_platform`]）：mac/linux 是
@@ -1161,23 +1211,45 @@ impl HelperRuntime {
     /// 经 helper 停核（对称：经 helper 起的核经 helper stop）。daemon `stop` 摘其受管 child → 终止 →
     /// 收割。
     ///
-    /// **`want_pid` 是身份判据，不是可选诊断字段**（根因）：这条腿是同步阻塞 IPC —— 从发出 `stop`
+    /// **`target` 是身份判据，不是可选诊断字段**（根因）：这条腿是同步阻塞 IPC —— 从发出 `stop`
     /// 到 daemon 真动手之间可以隔很久（socket 已删/daemon 无响应时更久）。这期间用户完全可能重装
     /// helper 并起了新核，daemon 手里的「受管 pid」此刻已经换成**新核**。若不带身份，daemon 按
     /// 「停当前受管的」执行 = 杀掉用户刚连上的核（表现为「刚连上就被静默断开」，且酷似核自己崩了）。
     /// app 侧的世代守卫够不着这一层：杀进程发生在 helper 进程里，故判据必须随请求下发。
     ///
-    /// ProxyRuntime only supplies a known pid. An unconfirmed Start must not
-    /// use `None`, which would authorize stopping an unrelated current core.
+    /// Linux only supplies a known exact birth target. An unconfirmed Start
+    /// cannot authorize a PID-only or targetless Stop.
     ///
     /// 身份不匹配 → daemon 回 `stop-mismatch` 且**一个进程都不杀**；本方法把它落成 `Err`（连同两个
     /// pid），因为「本腿意图停的核」确实没被停 —— 报 `Ok` 会让调用方的日志说谎。
     ///
     /// **真机门**：真停 root/SYSTEM 受管核。
-    pub fn stop_core(&self, want_pid: Option<u32>) -> Result<(), String> {
+    pub(crate) fn stop_core(&self, target: HelperStopTarget) -> Result<(), String> {
+        if target.pid() == 0 {
+            return Err("helper Stop requires a nonzero PID".to_owned());
+        }
+        match (self.platform, target) {
+            (Platform::Linux, HelperStopTarget::Legacy(_)) => {
+                return Err("Linux helper Stop requires an exact birth target".to_owned());
+            }
+            (Platform::Linux, HelperStopTarget::Birth(_)) | (_, HelperStopTarget::Legacy(_)) => {}
+            (_, HelperStopTarget::Birth(_)) => {
+                return Err("exact birth Stop is only available on Linux".to_owned());
+            }
+        }
         self.register_core_mutation()?;
         let client = self.build_client()?;
-        stop_core_with_client(&client, want_pid)
+        match (self.platform, target) {
+            (Platform::Linux, HelperStopTarget::Birth(target)) => stop_birth_with_client_budget(
+                &client,
+                target,
+                HELPER_STOP_TIMEOUT,
+                HELPER_STOP_RETRY_DELAY,
+            ),
+            (Platform::Linux, HelperStopTarget::Legacy(_)) => unreachable!("validated above"),
+            (_, HelperStopTarget::Legacy(pid)) => stop_core_with_client(&client, Some(pid)),
+            (_, HelperStopTarget::Birth(_)) => unreachable!("validated above"),
+        }
     }
 
     /// **T3 提权清扫**：经 helper 清掉 root 起的孤儿核（用户态 `kill` 收 EPERM 杀不动的那些）。
@@ -1332,6 +1404,48 @@ impl HelperRuntime {
                 error: Some(format!("helper flush-dns 通信失败：{e}")),
             },
         }
+    }
+}
+
+fn classify_linux_birth_start_response(response: Response) -> Result<HelperStartResult, String> {
+    match response {
+        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
+            target,
+            timing,
+        })) => {
+            if let Some(timing) = timing {
+                log::info!(
+                    "helper exact birth start timing: forwarding={}ms process={}ms job={}ms log_handoff={}ms total={}ms",
+                    timing.forwarding_ms,
+                    timing.process_ms,
+                    timing.job_ms,
+                    timing.log_handoff_ms,
+                    timing.total_ms
+                );
+            }
+            Ok(HelperStartResult::BirthStarted(target))
+        }
+        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Already { target })) => {
+            Ok(HelperStartResult::BirthAlready(target))
+        }
+        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedPending {
+            target,
+        })) => Ok(HelperStartResult::BirthNotAdmitted {
+            target: Some(target),
+            pending: true,
+        }),
+        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown {
+            target,
+        })) => Ok(HelperStartResult::BirthNotAdmitted {
+            target,
+            pending: false,
+        }),
+        Response::Ok(other) => Err(format!("helper exact birth 起核返回非预期响应：{other:?}")),
+        Response::Err(error) => Err(format_helper_mutation_error(
+            Platform::Linux,
+            "起核",
+            &error,
+        )),
     }
 }
 
@@ -1519,6 +1633,75 @@ fn stop_core_with_client_budget(
     }
 }
 
+fn stop_birth_with_client_budget(
+    client: &HelperClient,
+    target: HelperBirthTarget,
+    total_timeout: Duration,
+    retry_delay: Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let mut transport_retries = 0;
+    let mut pending = false;
+    let request = Request::LinuxStopBirth { target };
+    loop {
+        let remaining = total_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(if pending {
+                format!("helper exact birth 停核超时：target={target:?} 未取得 native reap 回执")
+            } else {
+                format!("helper exact birth 停核通信超时：总预算 {total_timeout:?}")
+            });
+        }
+        let response = match client.send_with_timeout(&request, remaining) {
+            Ok(response) => response,
+            Err(_) if transport_retries < HELPER_STOP_MAX_RETRIES => {
+                transport_retries += 1;
+                sleep_within_stop_budget(started, total_timeout, retry_delay)?;
+                continue;
+            }
+            Err(error) => return Err(format!("helper exact birth 停核通信失败：{error}")),
+        };
+        match response {
+            Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
+                target: receipt,
+            })) if receipt == target => return Ok(()),
+            Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Pending {
+                target: receipt,
+            })) if receipt == target => {
+                pending = true;
+                sleep_within_stop_budget(started, total_timeout, retry_delay)?;
+            }
+            Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Unknown {
+                target: receipt,
+            })) if receipt == target => {
+                return Err(format!(
+                    "helper exact birth 停核结果未知：target={target:?}，保留 custody"
+                ));
+            }
+            Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Mismatch {
+                requested,
+                current,
+            })) if requested == target => {
+                return Err(format!(
+                    "helper exact birth 停核身份失配：requested={requested:?} current={current:?}"
+                ));
+            }
+            Response::Ok(other) => {
+                return Err(format!(
+                    "helper exact birth 停核回执身份或类型失配：{other:?}"
+                ));
+            }
+            Response::Err(error) => {
+                return Err(format_helper_mutation_error(
+                    client.platform(),
+                    "停核",
+                    &error,
+                ));
+            }
+        }
+    }
+}
+
 fn format_helper_mutation_error(
     platform: Platform,
     operation: &str,
@@ -1545,10 +1728,52 @@ fn sleep_within_stop_budget(
     Ok(())
 }
 
+fn require_linux_birth_capability_with_client(client: &HelperClient) -> Result<(), String> {
+    if client.platform() != Platform::Linux {
+        return Err("exact birth capability probe requires Linux".to_owned());
+    }
+    match client.send_with_timeout(&Request::LinuxStatusBirth, Duration::from_millis(1500)) {
+        Ok(Response::Ok(ResponseKind::LinuxBirthStatus(_))) => Ok(()),
+        Ok(Response::Err(error)) if error.code == polaris_helper_proto::ErrorCode::Unknown => Err(
+            "已安装的 Linux helper 不支持 exact birth 安全协议；请升级或修复 helper 后重试"
+                .to_owned(),
+        ),
+        Ok(Response::Err(error)) => Err(format!("Linux helper exact birth 能力探测失败：{error}")),
+        Ok(Response::Ok(other)) => Err(format!(
+            "Linux helper exact birth 能力探测返回非预期响应：{other:?}"
+        )),
+        Err(error) => Err(format!(
+            "Linux helper exact birth 能力探测通信失败：{error}"
+        )),
+    }
+}
+
 fn managed_core_status_with_client(client: &HelperClient) -> Result<ManagedCoreStatus, String> {
     let response = client
-        .send(&Request::Status)
+        .send(&if client.platform() == Platform::Linux {
+            Request::LinuxStatusBirth
+        } else {
+            Request::Status
+        })
         .map_err(|error| format!("helper 受管核状态通信失败：{error}"))?;
+    if client.platform() == Platform::Linux {
+        return match response {
+            Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running { target })) => {
+                Ok(ManagedCoreStatus::BirthRunning { target })
+            }
+            Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Stopping { target })) => {
+                Ok(ManagedCoreStatus::BirthStopping { target })
+            }
+            Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Unknown { target })) => {
+                Ok(ManagedCoreStatus::BirthUnknown { target })
+            }
+            Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Empty)) => {
+                Ok(ManagedCoreStatus::BirthEmpty)
+            }
+            Response::Ok(other) => Err(format!("helper exact birth 状态返回非预期响应：{other:?}")),
+            Response::Err(error) => Err(format!("helper exact birth 状态查询失败：{error}")),
+        };
+    }
     match response {
         Response::Ok(ResponseKind::Status(CoreStatus::Running {
             pid,

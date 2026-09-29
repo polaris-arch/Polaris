@@ -87,8 +87,8 @@ use serde_json::Value;
 
 use crate::logging::SING_BOX_TARGET;
 use crate::runtime::helper::{
-    HelperBuildProbe, HelperStartResult, HelperStatusSnapshot, HelperStopOps, InstallCoreError,
-    InstallCoreUnsupportedRecord,
+    HelperBuildProbe, HelperStartResult, HelperStatusSnapshot, HelperStopOps, HelperStopTarget,
+    InstallCoreError, InstallCoreUnsupportedRecord,
 };
 use crate::runtime::route_binding::plan_runtime_bindings;
 
@@ -128,7 +128,13 @@ impl HelperStartCompletion {
         }
         let known = match result {
             Ok(HelperStartResult::Started(pid)) => Some(*pid),
-            Ok(HelperStartResult::NotAdmitted(_)) | Err(_) => None,
+            Ok(HelperStartResult::BirthStarted(target)) => Some(target.pid.get()),
+            Ok(
+                HelperStartResult::NotAdmitted(_)
+                | HelperStartResult::BirthAlready(_)
+                | HelperStartResult::BirthNotAdmitted { .. },
+            )
+            | Err(_) => None,
         };
         let mut pid_guard = if known.is_some() {
             Some(
@@ -142,6 +148,15 @@ impl HelperStartCompletion {
         let published = match result {
             Ok(HelperStartResult::NotAdmitted(blocker)) => {
                 child.finish_helper_start_not_admitted(&self.token, *blocker)
+            }
+            Ok(HelperStartResult::BirthNotAdmitted { target, .. }) => {
+                child.finish_helper_birth_not_admitted(&self.token, *target)
+            }
+            Ok(HelperStartResult::BirthAlready(target)) => {
+                child.finish_helper_birth_not_admitted(&self.token, Some(*target))
+            }
+            Ok(HelperStartResult::BirthStarted(target)) => {
+                child.finish_helper_birth_start(&self.token, *target)
             }
             Ok(HelperStartResult::Started(_)) => child.finish_helper_start(&self.token, known),
             Err(_) => child.finish_helper_start(&self.token, None),
@@ -1138,6 +1153,27 @@ impl ProxyRuntime {
         // start 腿撞上无人值守的 preflight 直接 bail。
         let t_helper_gate = std::time::Instant::now();
         self.run_helper_gate(user_config.proxy_mode_type).await?;
+        if self.helper.platform() == Platform::Linux
+            && should_start_via_helper(user_config.proxy_mode_type, self.helper.platform())
+        {
+            let helper = Arc::clone(&self.helper);
+            let capability =
+                tokio::task::spawn_blocking(move || helper.require_linux_birth_capability())
+                    .await
+                    .map_err(|error| {
+                        StartError::coded(
+                            format!("Linux helper exact birth 能力探测任务失败：{error}"),
+                            code::STARTUP_FAILED,
+                        )
+                    })?;
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
+            }
+            if let Err(message) = capability {
+                self.set_error(&message, code::STARTUP_FAILED);
+                return Err(StartError::coded(message, code::STARTUP_FAILED));
+            }
+        }
         let helper_gate_ms = t_helper_gate.elapsed().as_millis();
         log::info!("起核耗时：helper提权门={helper_gate_ms}ms");
 
@@ -2393,16 +2429,28 @@ impl ProxyRuntime {
         })
         .await
         .map_err(|e| format!("helper 起核任务 join 失败：{e}"))?;
-        let pid = match started {
-            Ok(HelperStartResult::Started(pid)) => pid,
+        let target = match started {
+            Ok(HelperStartResult::Started(pid)) => HelperStopTarget::Legacy(pid),
+            Ok(HelperStartResult::BirthStarted(target)) => HelperStopTarget::Birth(target),
+            Ok(HelperStartResult::BirthAlready(target)) => {
+                return Err(format!(
+                    "helper exact birth 已有受管核 {target:?}；本次配置未获启动证明，保留既有 custody"
+                ));
+            }
             Ok(HelperStartResult::NotAdmitted(blocker)) => {
                 return Err(format!(
                     "helper 起核未获准：此前受管核 pid={} 仍处于 {blocker:?} custody",
                     blocker.pid()
                 ));
             }
+            Ok(HelperStartResult::BirthNotAdmitted { target, pending }) => {
+                return Err(format!(
+                    "helper exact birth 起核未获准：既有 custody={target:?} pending={pending}"
+                ));
+            }
             Err(e) => return Err(e),
         };
+        let pid = target.pid();
         // The blocking worker already published pid under Child→pid, even if
         // this async waiter was cancelled before observing its response.
         // 上游：helper 报告已启动但进程不存在 → 判失败。
@@ -2415,9 +2463,12 @@ impl ProxyRuntime {
                 .reject_helper_start_with_result(
                     Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
                     &attempt,
-                    pid,
+                    target,
                 )
                 .await;
+            // This same-attempt exact Stop proves the external child is gone;
+            // reservation Drop only compare-removes this MainBirthToken. It
+            // does not open the runtime's sticky helper/no-owner gate.
             if confirmed_stopped {
                 main_reservation.confirmed_no_external_writer();
             }
@@ -2872,17 +2923,18 @@ impl ProxyRuntime {
         attempt: &HelperStartToken,
         pid: u32,
     ) -> String {
-        self.reject_helper_start_with_result(ops, attempt, pid)
+        self.reject_helper_start_with_result(ops, attempt, HelperStopTarget::Legacy(pid))
             .await
             .0
     }
 
-    async fn reject_helper_start_with_result(
+    pub(super) async fn reject_helper_start_with_result(
         &self,
         ops: Arc<dyn HelperStopOps>,
         attempt: &HelperStartToken,
-        pid: u32,
+        target: HelperStopTarget,
     ) -> (String, bool) {
+        let pid = target.pid();
         if let Err(error) = self.register_helper_backend() {
             return (format!(
                 "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: Child custody blocked Stop（{error}）"
@@ -2892,46 +2944,47 @@ impl ProxyRuntime {
             .child
             .lock()
             .ok()
-            .and_then(|mut child| child.begin_exact_helper_stop(attempt, pid));
+            .and_then(|mut child| child.begin_exact_helper_stop(attempt, target));
         let Some(nonce) = reservation else {
             return (format!(
                 "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: attempt changed or Stop in flight"
             ), false);
         };
-        let permit = HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), nonce);
+        let permit = HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), target, nonce);
         // stop 是同步阻塞 IPC → 挪出 async worker 线程（同 start_core/stop_core/cleanup_cores）。
         // **带上 pid**：本腿要收口的是 daemon 刚报给我们的这一个（helper 报活但探活判死的那个），
         // 不是「daemon 此刻手里的随便哪个」——本方法整段可能与新会话并发。
-        let (cleanup, confirmed_stopped) =
-            match tokio::task::spawn_blocking(move || (ops.stop_managed_core(Some(pid)), permit))
-                .await
-            {
-                Ok((Ok(()), permit)) => {
-                    if self.clear_helper_core_bookkeeping(&permit, pid) {
-                        log::info!("起核收口：已请 daemon 停掉其受管 child（pid={pid}）");
-                        (String::new(), true)
-                    } else {
-                        (
-                            "；cleanup-unconfirmed: Stop 已确认，但 attempt 已改变".to_owned(),
-                            false,
-                        )
-                    }
-                }
-                Ok((Err(e), _permit)) => {
-                    log::warn!("起核收口：请 daemon 停核失败（pid={pid}）：{e}");
+        let (cleanup, confirmed_stopped) = match tokio::task::spawn_blocking(move || {
+            (ops.stop_managed_core(target), permit)
+        })
+        .await
+        {
+            Ok((Ok(()), permit)) => {
+                if self.clear_helper_core_bookkeeping(&permit) {
+                    log::info!("起核收口：已请 daemon 停掉其受管 child（pid={pid}）");
+                    (String::new(), true)
+                } else {
                     (
-                        format!("；cleanup-unconfirmed: helper Stop 未确认（{e}）"),
+                        "；cleanup-unconfirmed: Stop 已确认，但 attempt 已改变".to_owned(),
                         false,
                     )
                 }
-                Err(e) => {
-                    log::error!("起核收口：停核任务 join 失败（pid={pid}）：{e}");
-                    (
-                        format!("；cleanup-unconfirmed: helper Stop join 失败（{e}）"),
-                        false,
-                    )
-                }
-            };
+            }
+            Ok((Err(e), _permit)) => {
+                log::warn!("起核收口：请 daemon 停核失败（pid={pid}）：{e}");
+                (
+                    format!("；cleanup-unconfirmed: helper Stop 未确认（{e}）"),
+                    false,
+                )
+            }
+            Err(e) => {
+                log::error!("起核收口：停核任务 join 失败（pid={pid}）：{e}");
+                (
+                    format!("；cleanup-unconfirmed: helper Stop join 失败（{e}）"),
+                    false,
+                )
+            }
+        };
         (
             format!("helper 报告已启动但进程不存在（pid={pid}）{cleanup}"),
             confirmed_stopped,

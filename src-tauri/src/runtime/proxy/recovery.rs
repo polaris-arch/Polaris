@@ -255,6 +255,30 @@ impl ProxyRuntime {
                                             );
                                             ChildObservation::Exited
                                         }
+                                        Ok(Ok(ManagedCoreStatus::BirthRunning { target })) => {
+                                            let same_birth = match me.child.lock() {
+                                                Ok(child) => child.helper_stop_target().is_some_and(
+                                                    |(_, recorded)| {
+                                                        recorded
+                                                            == crate::runtime::helper::HelperStopTarget::Birth(target)
+                                                    },
+                                                ),
+                                                Err(_) => true,
+                                            };
+                                            if same_birth {
+                                                ChildObservation::Alive
+                                            } else {
+                                                log::warn!(
+                                                    "崩溃监测：Linux helper exact birth 与本代 custody 失配（pid={p}）"
+                                                );
+                                                ChildObservation::Exited
+                                            }
+                                        }
+                                        Ok(Ok(
+                                            ManagedCoreStatus::BirthStopping { .. }
+                                            | ManagedCoreStatus::BirthUnknown { .. }
+                                            | ManagedCoreStatus::BirthEmpty,
+                                        )) => ChildObservation::Alive,
                                         Ok(Err(error)) => {
                                             if ticks == 1
                                                 || ticks.is_multiple_of(PID_IDENTITY_RECHECK_TICKS)

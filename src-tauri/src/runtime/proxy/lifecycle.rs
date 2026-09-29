@@ -228,6 +228,18 @@ impl ProxyRuntime {
         }
     }
 
+    fn admit_helper_slot(&self) -> Result<(), StartError> {
+        let slot = self
+            .child
+            .lock()
+            .map_err(StartError::direct_slot_poisoned)?;
+        if slot.is_empty() && !slot.has_helper_start() {
+            Ok(())
+        } else {
+            Err(StartError::direct_slot_occupied())
+        }
+    }
+
     pub(super) fn admit_android_global_custody(&self) -> Result<(), StartError> {
         let custody = self
             .android_main_token
@@ -426,6 +438,18 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
     ) -> StartLeg {
+        // A reaped exact helper birth may start another helper birth in this
+        // runtime. The sticky helper route still forbids a direct/no-owner
+        // transition. Invalid configs receive their normal later error unless
+        // a touched helper makes the conservative direct admission fail first.
+        let via_helper = serde_json::from_value::<UserConfig>(config.clone())
+            .ok()
+            .is_some_and(|parsed| {
+                super::startup::should_start_via_helper(
+                    parsed.proxy_mode_type,
+                    self.helper.platform(),
+                )
+            });
         // Reject legacy requests before claiming a generation or sweeping old
         // processes. Claiming first would retire the live core's crash monitor
         // even though this request is not allowed to start a replacement.
@@ -460,7 +484,7 @@ impl ProxyRuntime {
                 };
                 if !direct_slot.is_empty()
                     || direct_slot.has_helper_start()
-                    || self.core_via_helper.load(Ordering::SeqCst)
+                    || (self.core_via_helper.load(Ordering::SeqCst) && !via_helper)
                 {
                     return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
                 }
@@ -472,7 +496,12 @@ impl ProxyRuntime {
                 Some(generation)
             }
         } else {
-            if let Err(error) = self.admit_direct_slot() {
+            let admission = if via_helper {
+                self.admit_helper_slot()
+            } else {
+                self.admit_direct_slot()
+            };
+            if let Err(error) = admission {
                 return StartLeg::Finished(Err(error), None);
             }
             None
@@ -503,7 +532,12 @@ impl ProxyRuntime {
         // Another start can install a Child while this request awaits the TS
         // gate. Recheck custody before stale sweeping, deferred deletion, or
         // start_inner's sidecar preflight. The gate stays held through spawn.
-        if let Err(error) = self.admit_direct_slot() {
+        let admission = if via_helper {
+            self.admit_helper_slot()
+        } else {
+            self.admit_direct_slot()
+        };
+        if let Err(error) = admission {
             return StartLeg::Finished(Err(error), None);
         }
         // **每次** start 都清扫孤儿核（对齐 上游 :700），只杀「本 app 二进制起的」核——见

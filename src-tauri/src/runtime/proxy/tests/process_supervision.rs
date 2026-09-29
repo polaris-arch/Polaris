@@ -982,6 +982,7 @@ async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_rep
 struct RecordingStop {
     calls: Arc<AtomicUsize>,
     wants: Arc<Mutex<Vec<Option<u32>>>>,
+    targets: Arc<Mutex<Vec<crate::runtime::helper::HelperStopTarget>>>,
     result: Result<(), String>,
     during_call: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -1000,9 +1001,11 @@ impl RecordingStop {
     ) -> StopProbe {
         let calls = Arc::new(AtomicUsize::new(0));
         let wants = Arc::new(Mutex::new(Vec::new()));
+        let targets = Arc::new(Mutex::new(Vec::new()));
         let ops = Arc::new(Self {
             calls: Arc::clone(&calls),
             wants: Arc::clone(&wants),
+            targets,
             result,
             during_call,
         });
@@ -1010,9 +1013,13 @@ impl RecordingStop {
     }
 }
 impl HelperStopOps for RecordingStop {
-    fn stop_managed_core(&self, want_pid: Option<u32>) -> Result<(), String> {
+    fn stop_managed_core(
+        &self,
+        target: crate::runtime::helper::HelperStopTarget,
+    ) -> Result<(), String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.wants.lock().unwrap().push(want_pid);
+        self.wants.lock().unwrap().push(Some(target.pid()));
+        self.targets.lock().unwrap().push(target);
         if let Some(f) = self.during_call.as_ref() {
             f();
         }
@@ -1025,6 +1032,204 @@ fn known_helper_attempt(rt: &Arc<ProxyRuntime>, pid: u32) -> HelperStartToken {
     *rt.pid.lock().unwrap() = Some(pid);
     rt.core_via_helper.store(true, Ordering::SeqCst);
     token
+}
+
+fn exact_helper_target(pid: u32, birth: &str) -> polaris_helper_proto::HelperBirthTarget {
+    polaris_helper_proto::HelperBirthTarget::parse_wire(&pid.to_string(), birth).unwrap()
+}
+
+fn known_exact_helper_attempt(
+    rt: &Arc<ProxyRuntime>,
+    target: polaris_helper_proto::HelperBirthTarget,
+) -> HelperStartToken {
+    use super::super::startup::HelperStartCompletion;
+    let attempt = rt.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(rt, attempt.clone())
+        .publish(&Ok(
+            crate::runtime::helper::HelperStartResult::BirthStarted(target),
+        ))
+        .unwrap();
+    attempt
+}
+
+#[tokio::test]
+async fn exact_stop_permit_binds_birth_and_keeps_managed_gate() {
+    use crate::runtime::helper::HelperStopTarget;
+    let (rt, _dir) = test_runtime();
+    let a = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    let b = exact_helper_target(4242, "11112222333344445555666677778888");
+    let attempt = known_exact_helper_attempt(&rt, a);
+    let (_, reserved, nonce) = rt.child.lock().unwrap().begin_helper_stop().unwrap();
+    assert_eq!(reserved, HelperStopTarget::Birth(a));
+    let forged = HelperStopPermit::new(
+        Arc::clone(&rt.child),
+        attempt.clone(),
+        HelperStopTarget::Birth(b),
+        nonce,
+    );
+    assert!(!rt.clear_helper_core_bookkeeping(&forged));
+    assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    drop(forged);
+
+    let (ops, _, _) = RecordingStop::new(Ok(()));
+    let stopped_attempt = rt
+        .kill_core_via_helper(Arc::clone(&ops) as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert!(stopped_attempt.same(&attempt));
+    assert_eq!(*ops.targets.lock().unwrap(), [HelperStopTarget::Birth(a)]);
+    assert!(rt.pid.lock().unwrap().is_none());
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.start(local_only_config(free_port())).await.is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reaped_exact_birth_allows_same_helper_start_leg_but_not_direct_start() {
+    use super::super::lifecycle::StartLeg;
+
+    let (rt, _dir, _prompts) = test_runtime_installed_helper(false, false);
+    let old = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    known_exact_helper_attempt(&rt, old);
+    let (ops, _, _) = RecordingStop::new(Ok(()));
+    rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+
+    let before = rt.gate.generation();
+    assert!(rt.start(local_only_config(free_port())).await.is_err());
+    assert_eq!(
+        rt.gate.generation(),
+        before,
+        "direct admission stays closed"
+    );
+
+    // Both explicit Stop→Start and the restart/Apply start leg pass this same
+    // admission. The test helper has no daemon socket, so the subsequent
+    // read-only capability probe fails before a new helper attempt is booked.
+    let error = rt.start(tun_config()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("exact birth 能力探测"),
+        "helper Start reached a different failure: {error}"
+    );
+    assert!(rt.gate.generation() > before);
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    let guarded = rt
+        .start_guarded(tun_config(), Some(rt.gate.generation()))
+        .await;
+    assert!(matches!(guarded, StartLeg::Finished(Err(_), _)));
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+}
+
+#[tokio::test]
+async fn reaped_exact_start_releases_only_its_reserved_main_claim() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-reaped-exact").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token))
+        .unwrap();
+    reservation.arm_external_start();
+    let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    HelperStartCompletion::for_test(&rt, attempt.clone())
+        .publish(&Ok(HelperStartResult::BirthStarted(target)))
+        .unwrap();
+    assert!(rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
+
+    let (ops, calls, _) = RecordingStop::new(Ok(()));
+    let (message, confirmed) = rt
+        .reject_helper_start_with_result(ops.clone(), &attempt, HelperStopTarget::Birth(target))
+        .await;
+    assert!(confirmed, "same-attempt native Stop ACK: {message}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    reservation.confirmed_no_external_writer();
+    drop(reservation);
+    assert!(!rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+}
+
+#[tokio::test]
+async fn exact_not_admitted_target_can_stop_but_unknown_without_target_cannot() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+    let target = exact_helper_target(7331, "00112233445566778899aabbccddeeff");
+    let (rt, _dir) = test_runtime();
+    let attempt = rt.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&rt, attempt)
+        .publish(&Ok(HelperStartResult::BirthNotAdmitted {
+            target: Some(target),
+            pending: true,
+        }))
+        .unwrap();
+    assert!(rt.pid.lock().unwrap().is_none());
+    let (ops, _, _) = RecordingStop::new(Ok(()));
+    rt.kill_core_via_helper(Arc::clone(&ops) as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert_eq!(
+        *ops.targets.lock().unwrap(),
+        [HelperStopTarget::Birth(target)]
+    );
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+
+    let (unknown, _dir) = test_runtime();
+    let attempt = unknown.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&unknown, attempt)
+        .publish(&Ok(HelperStartResult::BirthNotAdmitted {
+            target: None,
+            pending: false,
+        }))
+        .unwrap();
+    let (ops, calls, _) = RecordingStop::new(Ok(()));
+    assert!(unknown
+        .kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap_err()
+        .contains("cleanup-unknown"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(unknown.child.lock().unwrap().has_helper_start());
+    assert!(unknown.core_via_helper.load(Ordering::SeqCst));
+
+    let (already, _dir) = test_runtime();
+    let attempt = already.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&already, attempt)
+        .publish(&Ok(HelperStartResult::BirthAlready(target)))
+        .unwrap();
+    assert!(
+        already.pid.lock().unwrap().is_none(),
+        "Already did not start this config"
+    );
+    assert_eq!(
+        already
+            .child
+            .lock()
+            .unwrap()
+            .helper_stop_target()
+            .unwrap()
+            .1,
+        HelperStopTarget::Birth(target)
+    );
 }
 
 #[tokio::test]
@@ -1065,7 +1270,7 @@ async fn unknown_helper_start_refuses_stop_and_stale_sweep_without_ipc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cancelled_helper_start_worker_publishes_late_known_pid() {
+async fn cancelled_helper_start_worker_publishes_late_exact_birth() {
     use super::super::startup::HelperStartCompletion;
 
     let (rt, _dir) = test_runtime();
@@ -1088,6 +1293,7 @@ async fn cancelled_helper_start_worker_publishes_late_known_pid() {
     drop(reservation);
     drop(gate);
     let mut completion = HelperStartCompletion::for_test(&rt, attempt.clone());
+    let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let held = Arc::clone(&release);
@@ -1099,9 +1305,9 @@ async fn cancelled_helper_start_worker_publishes_late_known_pid() {
             released = wake.wait(released).unwrap();
         }
         completion
-            .publish(&Ok(crate::runtime::helper::HelperStartResult::Started(
-                4242,
-            )))
+            .publish(&Ok(
+                crate::runtime::helper::HelperStartResult::BirthStarted(target),
+            ))
             .unwrap();
     });
     entered_rx.await.unwrap();
@@ -1118,13 +1324,54 @@ async fn cancelled_helper_start_worker_publishes_late_known_pid() {
     .unwrap();
     let (current, known) = rt.child.lock().unwrap().helper_stop_target().unwrap();
     assert!(current.same(&attempt));
-    assert_eq!(known, 4242);
+    assert_eq!(
+        known,
+        crate::runtime::helper::HelperStopTarget::Birth(target)
+    );
+    let (claim_attempt, claim_main) = rt
+        .child
+        .lock()
+        .unwrap()
+        .helper_main_claim_for_stop()
+        .unwrap();
+    assert!(claim_attempt.same(&attempt));
+    assert!(claim_main.is_some_and(|found| found.same(&token)));
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
     assert!(rt
         .main_token_for_stop()
         .unwrap()
         .is_some_and(|found| found.same(&token)));
     assert!(rt.mesh.main_owns_tailscale("ts-late-helper", true));
+}
+
+#[test]
+fn late_old_attempt_ack_cannot_replace_same_pid_new_birth() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+    let (rt, _dir) = test_runtime();
+    let a = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    let b = exact_helper_target(4242, "11112222333344445555666677778888");
+    let old = rt.register_helper_start_backend().unwrap();
+    let mut late = HelperStartCompletion::for_test(&rt, old.clone());
+    {
+        let mut child = rt.child.lock().unwrap();
+        assert!(child.finish_helper_birth_start(&old, a));
+        let (_, target, nonce) = child.begin_helper_stop().unwrap();
+        assert!(child.confirm_helper_stop(&old, target, &nonce));
+    }
+    // A same-backend successor may start after exact Stop. Its receipt must
+    // not be overwritten by the prior attempt's delayed Start completion.
+    let new = rt.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&rt, new.clone())
+        .publish(&Ok(HelperStartResult::BirthStarted(b)))
+        .unwrap();
+    assert!(late
+        .publish(&Ok(HelperStartResult::BirthStarted(a)))
+        .is_err());
+    let (current, target) = rt.child.lock().unwrap().helper_stop_target().unwrap();
+    assert!(current.same(&new));
+    assert_eq!(target, HelperStopTarget::Birth(b));
+    assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
 }
 
 #[tokio::test]
@@ -1163,7 +1410,7 @@ async fn start_not_admitted_preserves_prior_helper_and_main_custody() {
         assert!(child.helper_start_not_admitted_for_test());
         let (blocker_attempt, blocker_pid) = child.helper_stop_target().unwrap();
         assert!(blocker_attempt.same(&attempt));
-        assert_eq!(blocker_pid, 7331);
+        assert_eq!(blocker_pid.pid(), 7331);
     }
     assert!(rt.pid.lock().unwrap().is_none(), "no new core was spawned");
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
@@ -1200,9 +1447,9 @@ async fn acknowledged_stop_keeps_exclusive_permit_through_final_clear() {
     let (rt, _dir) = test_runtime();
     known_helper_attempt(&rt, 4242);
     let (token, pid, nonce) = rt.child.lock().unwrap().begin_helper_stop().unwrap();
-    let permit = HelperStopPermit::new(Arc::clone(&rt.child), token.clone(), nonce);
+    let permit = HelperStopPermit::new(Arc::clone(&rt.child), token.clone(), pid, nonce);
     let (ops, calls, _) = RecordingStop::new(Ok(()));
-    ops.stop_managed_core(Some(pid)).unwrap(); // ACK arrived; async caller has not cleared yet.
+    ops.stop_managed_core(pid).unwrap(); // ACK arrived; async caller has not cleared yet.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(rt.child.lock().unwrap().helper_stop_inflight_for_test());
 
@@ -1217,7 +1464,7 @@ async fn acknowledged_stop_keeps_exclusive_permit_through_final_clear() {
     assert!(rt.start(local_only_config(free_port())).await.is_err());
     assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
 
-    assert!(rt.clear_helper_core_bookkeeping(&permit, pid));
+    assert!(rt.clear_helper_core_bookkeeping(&permit));
     drop(permit);
     assert!(rt.pid.lock().unwrap().is_none());
     assert!(!rt.core_via_helper.load(Ordering::SeqCst));

@@ -5,9 +5,10 @@ use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
+use crate::runtime::helper::HelperStopTarget;
 use crate::runtime::proxy::process_supervision::{DirectCoreRun, DirectRunOrigin, RunIdentity};
 use polaris_core_supervisor::ChildObservation;
-use polaris_helper_proto::StartNotAdmitted;
+use polaris_helper_proto::{HelperBirthTarget, StartNotAdmitted};
 use tokio::process::Child;
 
 pub(crate) struct DirectCoreSlot {
@@ -38,7 +39,7 @@ pub(super) enum BackendFence {
 
 /// A helper Start remains owned even when its async waiter disappears. Only
 /// an exact acknowledged Stop may retire the same opaque attempt.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(in crate::runtime::proxy) struct HelperStartToken(Arc<()>);
 
 impl HelperStartToken {
@@ -74,21 +75,19 @@ impl HelperStopNonce {
 
 enum HelperStartPhase {
     Inflight,
-    Known(u32),
+    Known(HelperStopTarget),
     /// The current Start spawned nothing, but adopted exact custody of an
     /// earlier Linux helper birth that still blocks admission.
-    NotAdmitted(StartNotAdmitted),
+    NotAdmitted(HelperStopTarget),
     Unconfirmed,
 }
 
 impl HelperStartPhase {
-    fn exact_stop_pid(&self) -> Option<u32> {
+    fn exact_stop_target(&self) -> Option<HelperStopTarget> {
         match self {
-            Self::Known(pid) => Some(*pid),
-            Self::NotAdmitted(blocker) => {
-                let pid = blocker.pid();
-                (pid != 0).then_some(pid)
-            }
+            Self::Known(HelperStopTarget::Legacy(0))
+            | Self::NotAdmitted(HelperStopTarget::Legacy(0)) => None,
+            Self::Known(target) | Self::NotAdmitted(target) => Some(*target),
             Self::Inflight | Self::Unconfirmed => None,
         }
     }
@@ -313,6 +312,16 @@ impl DirectCoreSlot {
         }
     }
 
+    pub(in crate::runtime::proxy) fn helper_main_claim_for_stop(
+        &self,
+    ) -> Option<(
+        HelperStartToken,
+        Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    )> {
+        let attempt = self.helper_start.as_ref()?;
+        Some((attempt.token.clone(), attempt.main_token.clone()))
+    }
+
     /// Called from the blocking Start worker, including after its async
     /// caller was cancelled. The caller holds Child then pid while publishing.
     pub(in crate::runtime::proxy) fn finish_helper_start(
@@ -327,9 +336,24 @@ impl DirectCoreSlot {
             return false;
         }
         attempt.phase = match pid {
-            Some(pid) => HelperStartPhase::Known(pid),
+            Some(pid) => HelperStartPhase::Known(HelperStopTarget::Legacy(pid)),
             None => HelperStartPhase::Unconfirmed,
         };
+        true
+    }
+
+    pub(in crate::runtime::proxy) fn finish_helper_birth_start(
+        &mut self,
+        token: &HelperStartToken,
+        target: HelperBirthTarget,
+    ) -> bool {
+        let Some(attempt) = &mut self.helper_start else {
+            return false;
+        };
+        if !attempt.token.same(token) || !matches!(attempt.phase, HelperStartPhase::Inflight) {
+            return false;
+        }
+        attempt.phase = HelperStartPhase::Known(HelperStopTarget::Birth(target));
         true
     }
 
@@ -344,7 +368,24 @@ impl DirectCoreSlot {
         if !attempt.token.same(token) || !matches!(attempt.phase, HelperStartPhase::Inflight) {
             return false;
         }
-        attempt.phase = HelperStartPhase::NotAdmitted(blocker);
+        attempt.phase = HelperStartPhase::NotAdmitted(HelperStopTarget::Legacy(blocker.pid()));
+        true
+    }
+
+    pub(in crate::runtime::proxy) fn finish_helper_birth_not_admitted(
+        &mut self,
+        token: &HelperStartToken,
+        target: Option<HelperBirthTarget>,
+    ) -> bool {
+        let Some(attempt) = &mut self.helper_start else {
+            return false;
+        };
+        if !attempt.token.same(token) || !matches!(attempt.phase, HelperStartPhase::Inflight) {
+            return false;
+        }
+        attempt.phase = target.map_or(HelperStartPhase::Unconfirmed, |target| {
+            HelperStartPhase::NotAdmitted(HelperStopTarget::Birth(target))
+        });
         true
     }
 
@@ -357,10 +398,12 @@ impl DirectCoreSlot {
         })
     }
 
-    pub(in crate::runtime::proxy) fn helper_stop_target(&self) -> Option<(HelperStartToken, u32)> {
+    pub(in crate::runtime::proxy) fn helper_stop_target(
+        &self,
+    ) -> Option<(HelperStartToken, HelperStopTarget)> {
         let attempt = self.helper_start.as_ref()?;
-        let pid = attempt.phase.exact_stop_pid()?;
-        Some((attempt.token.clone(), pid))
+        let target = attempt.phase.exact_stop_target()?;
+        Some((attempt.token.clone(), target))
     }
 
     /// Reserve the only helper Stop IPC for this attempt before queuing its
@@ -368,27 +411,27 @@ impl DirectCoreSlot {
     /// while the first request could still reach the daemon.
     pub(in crate::runtime::proxy) fn begin_helper_stop(
         &mut self,
-    ) -> Option<(HelperStartToken, u32, HelperStopNonce)> {
+    ) -> Option<(HelperStartToken, HelperStopTarget, HelperStopNonce)> {
         let attempt = self.helper_start.as_mut()?;
-        let pid = attempt.phase.exact_stop_pid()?;
+        let target = attempt.phase.exact_stop_target()?;
         if attempt.stop_inflight.is_some() {
             return None;
         }
         let nonce = HelperStopNonce::new();
         attempt.stop_inflight = Some(HelperStopNonce(Arc::clone(&nonce.0)));
-        Some((attempt.token.clone(), pid, nonce))
+        Some((attempt.token.clone(), target, nonce))
     }
 
     pub(in crate::runtime::proxy) fn begin_exact_helper_stop(
         &mut self,
         token: &HelperStartToken,
-        pid: u32,
+        target: HelperStopTarget,
     ) -> Option<HelperStopNonce> {
         let Some(attempt) = &mut self.helper_start else {
             return None;
         };
         if !attempt.token.same(token)
-            || attempt.phase.exact_stop_pid() != Some(pid)
+            || attempt.phase.exact_stop_target() != Some(target)
             || attempt.stop_inflight.is_some()
         {
             return None;
@@ -418,14 +461,14 @@ impl DirectCoreSlot {
     pub(in crate::runtime::proxy) fn confirm_helper_stop(
         &mut self,
         token: &HelperStartToken,
-        pid: u32,
+        target: HelperStopTarget,
         nonce: &HelperStopNonce,
     ) -> bool {
         let Some(attempt) = &self.helper_start else {
             return false;
         };
         if !attempt.token.same(token)
-            || attempt.phase.exact_stop_pid() != Some(pid)
+            || attempt.phase.exact_stop_target() != Some(target)
             || !attempt
                 .stop_inflight
                 .as_ref()
@@ -440,7 +483,7 @@ impl DirectCoreSlot {
     pub(in crate::runtime::proxy) fn helper_pid_bookkeeping_matches(
         &self,
         token: &HelperStartToken,
-        pid: u32,
+        target: HelperStopTarget,
         recorded_pid: Option<u32>,
     ) -> bool {
         let Some(attempt) = &self.helper_start else {
@@ -450,10 +493,8 @@ impl DirectCoreSlot {
             return false;
         }
         match attempt.phase {
-            HelperStartPhase::Known(known) => known == pid && recorded_pid == Some(pid),
-            HelperStartPhase::NotAdmitted(blocker) => {
-                blocker.pid() == pid && recorded_pid.is_none()
-            }
+            HelperStartPhase::Known(known) => known == target && recorded_pid == Some(target.pid()),
+            HelperStartPhase::NotAdmitted(blocker) => blocker == target && recorded_pid.is_none(),
             HelperStartPhase::Inflight | HelperStartPhase::Unconfirmed => false,
         }
     }

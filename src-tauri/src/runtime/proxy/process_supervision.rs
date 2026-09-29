@@ -29,7 +29,7 @@ use std::time::Duration;
 use polaris_core_supervisor::{scan_running_cores, stale_pids, ProcessKiller, Signal};
 use tokio::process::Child;
 
-use crate::runtime::helper::HelperStopOps;
+use crate::runtime::helper::{HelperStopOps, HelperStopTarget};
 use crate::runtime::win_console::no_console_window;
 
 use super::core_binary::resolve_core_binary;
@@ -149,6 +149,7 @@ impl Drop for AndroidStopBooking<'_> {
 pub(super) struct HelperStopPermit {
     child: Arc<std::sync::Mutex<DirectCoreSlot>>,
     attempt: HelperStartToken,
+    target: HelperStopTarget,
     nonce: HelperStopNonce,
 }
 
@@ -156,11 +157,13 @@ impl HelperStopPermit {
     pub(super) fn new(
         child: Arc<std::sync::Mutex<DirectCoreSlot>>,
         attempt: HelperStartToken,
+        target: HelperStopTarget,
         nonce: HelperStopNonce,
     ) -> Self {
         Self {
             child,
             attempt,
+            target,
             nonce,
         }
     }
@@ -171,6 +174,10 @@ impl HelperStopPermit {
 
     fn attempt(&self) -> &HelperStartToken {
         &self.attempt
+    }
+
+    fn target(&self) -> HelperStopTarget {
+        self.target
     }
 }
 
@@ -405,6 +412,27 @@ impl ProxyRuntime {
             let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
             return booking.finish_with_gate(result, &self.mesh, ts_gate);
         }
+        if self.core_via_helper.load(Ordering::SeqCst) {
+            let (expected_attempt, token) = self
+                .child
+                .lock()
+                .map_err(|_| "helper Child custody poisoned".to_owned())?
+                .helper_main_claim_for_stop()
+                .ok_or_else(|| {
+                    "helper cleanup-unknown: no Start attempt for main claim".to_owned()
+                })?;
+            let stopped_attempt = self
+                .kill_core_via_helper(Arc::clone(&self.helper) as Arc<dyn HelperStopOps>)
+                .await?;
+            if !stopped_attempt.same(&expected_attempt) {
+                return Err("helper Stop attempt changed before main claim release".to_owned());
+            }
+            if let Some(token) = token {
+                self.mesh
+                    .release_tailscale_main_states_if_token(&token, ts_gate)?;
+            }
+            return Ok(());
+        }
         let token = self.main_token_for_stop()?;
         self.kill_core().await?;
         if let Some(token) = token {
@@ -590,7 +618,8 @@ impl ProxyRuntime {
         if self.core_via_helper.load(Ordering::SeqCst) {
             return self
                 .kill_core_via_helper(Arc::clone(&self.helper) as Arc<dyn HelperStopOps>)
-                .await;
+                .await
+                .map(|_| ());
         }
         let child_opt = match self.child.lock() {
             Ok(mut g) => g
@@ -654,7 +683,7 @@ impl ProxyRuntime {
     pub(super) async fn kill_core_via_helper(
         &self,
         ops: Arc<dyn HelperStopOps>,
-    ) -> Result<(), String> {
+    ) -> Result<HelperStartToken, String> {
         self.register_helper_backend()?;
         let (attempt, intended, nonce) = self
             .child
@@ -664,7 +693,9 @@ impl ProxyRuntime {
             .ok_or_else(|| {
                 "helper cleanup-unknown: no confirmed idle Start attempt; refusing Stop(None) or concurrent Stop".to_string()
             })?;
-        let permit = HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), nonce);
+        let permit =
+            HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), intended, nonce);
+        let intended_pid = intended.pid();
         // 阻塞 IPC 挪出 async worker。
         // An updater/restart may be cancelled while this blocking stop still
         // runs. Retain its existing legacy lease in the closure; a normal Stop
@@ -672,7 +703,7 @@ impl ProxyRuntime {
         let blocking_lease = self.config.retain_active_legacy_start_lease();
         let (result, permit) = match tokio::task::spawn_blocking(move || {
             let _blocking_lease = blocking_lease;
-            (ops.stop_managed_core(Some(intended)), permit)
+            (ops.stop_managed_core(intended), permit)
         })
         .await
         {
@@ -685,9 +716,9 @@ impl ProxyRuntime {
         };
         // The permit remains booked while the ACK is checked and consumed.
         let outcome = match result {
-            Ok(()) if self.clear_helper_core_bookkeeping(&permit, intended) => {
-                log::info!("经 helper 停核完成（pid={intended}）");
-                Ok(())
+            Ok(()) if self.clear_helper_core_bookkeeping(&permit) => {
+                log::info!("经 helper 停核完成（pid={intended_pid}）");
+                Ok(attempt.clone())
             }
             Ok(()) => {
                 Err("helper cleanup-unconfirmed: Stop acknowledged but attempt changed".into())
@@ -711,11 +742,7 @@ impl ProxyRuntime {
     /// 本方法只会在 helper 已确认 `stopped/notrunning` 后调用；必须仍持有
     /// 同一 Child 的唯一 Stop permit，且 attempt、pid、nonce 全相同才清账。
     /// 通信失败、取消或任何身份变动均保留 helper route。
-    pub(super) fn clear_helper_core_bookkeeping(
-        &self,
-        permit: &HelperStopPermit,
-        intended: u32,
-    ) -> bool {
+    pub(super) fn clear_helper_core_bookkeeping(&self, permit: &HelperStopPermit) -> bool {
         if !Arc::ptr_eq(&permit.child, &self.child) {
             return false;
         }
@@ -728,17 +755,23 @@ impl ProxyRuntime {
             return false;
         };
         let current = *g;
-        if !child.helper_pid_bookkeeping_matches(permit.attempt(), intended, current)
-            || !child.confirm_helper_stop(permit.attempt(), intended, permit.nonce())
+        if !child.helper_pid_bookkeeping_matches(permit.attempt(), permit.target(), current)
+            || !child.confirm_helper_stop(permit.attempt(), permit.target(), permit.nonce())
         {
             log::warn!(
-                "helper 停核腿收口时发现受管 attempt/pid 记账已换人（{intended}→{current:?}）→ \
-                 整段记账属新会话，不动它（清它等于让新核在 status/诊断/孤儿清扫排除表里集体失联）"
+                "helper 停核腿收口时发现受管 attempt/birth 记账已换人（{:?}→{current:?}）→ \
+                 整段记账属新会话，不动它（清它等于让新核在 status/诊断/孤儿清扫排除表里集体失联）",
+                permit.target()
             );
             return false;
         }
         *g = None;
-        self.core_via_helper.store(false, Ordering::SeqCst);
+        // The exact ACK proves only that this helper birth was natively
+        // reaped. It does not prove that helper-owned side effects or other
+        // births are absent, so it cannot open the managed/no-owner gate.
+        if matches!(permit.target(), HelperStopTarget::Legacy(_)) {
+            self.core_via_helper.store(false, Ordering::SeqCst);
+        }
         true
     }
 

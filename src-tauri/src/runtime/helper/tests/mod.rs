@@ -61,6 +61,182 @@ fn runtime() -> (HelperRuntime, TestDir) {
     (HelperRuntime::never_installed_for_tests(dir.clone()), dir)
 }
 
+fn birth_target(pid: u32, wire: &str) -> HelperBirthTarget {
+    HelperBirthTarget::parse_wire(&pid.to_string(), wire).unwrap()
+}
+
+#[test]
+fn exact_start_accepts_only_birth_receipts_and_never_promotes_already() {
+    let target = birth_target(4242, "00112233445566778899aabbccddeeff");
+    assert_eq!(
+        classify_linux_birth_start_response(Response::parse(
+            "OK birth-started 4242 00112233445566778899aabbccddeeff"
+        )),
+        Ok(HelperStartResult::BirthStarted(target))
+    );
+    assert_eq!(
+        classify_linux_birth_start_response(Response::parse(
+            "OK birth-already 4242 00112233445566778899aabbccddeeff"
+        )),
+        Ok(HelperStartResult::BirthAlready(target))
+    );
+    assert_eq!(
+        classify_linux_birth_start_response(Response::parse(
+            "OK birth-start-not-admitted pending 4242 00112233445566778899aabbccddeeff"
+        )),
+        Ok(HelperStartResult::BirthNotAdmitted {
+            target: Some(target),
+            pending: true
+        })
+    );
+    assert_eq!(
+        classify_linux_birth_start_response(Response::parse("OK birth-start-not-admitted unknown")),
+        Ok(HelperStartResult::BirthNotAdmitted {
+            target: None,
+            pending: false
+        })
+    );
+    for wire in [
+        "OK started 4242",
+        "OK birth-started 4242 11112222333344445555666677778888 extra=identity",
+        "ERR unknown",
+    ] {
+        assert!(classify_linux_birth_start_response(Response::parse(wire)).is_err());
+    }
+}
+
+#[test]
+fn exact_stop_retries_the_same_birth_after_lost_ack_and_pending() {
+    let target = birth_target(4242, "00112233445566778899aabbccddeeff");
+    let (client, connects, frames) = stop_test_client_with_frames(
+        Platform::Linux,
+        vec![
+            polaris_helper_client::MockStream::with_response(Vec::new()),
+            polaris_helper_client::MockStream::with_response(
+                b"OK birth-stop-pending 4242 00112233445566778899aabbccddeeff\n".to_vec(),
+            ),
+            polaris_helper_client::MockStream::with_response(
+                b"OK birth-stopped 4242 00112233445566778899aabbccddeeff\n".to_vec(),
+            ),
+        ],
+    );
+    stop_birth_with_client_budget(
+        &client,
+        target,
+        Duration::from_millis(200),
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    assert_eq!(connects.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *frames.lock().unwrap(),
+        vec!["stop-birth-safe\n4242\n00112233445566778899aabbccddeeff\n".to_owned(); 3]
+    );
+}
+
+#[test]
+fn exact_stop_rejects_same_pid_other_birth_and_legacy_ack() {
+    let target = birth_target(4242, "00112233445566778899aabbccddeeff");
+    for wire in [
+        b"OK birth-stopped 4242 11112222333344445555666677778888\n".to_vec(),
+        b"OK stopped 4242\n".to_vec(),
+        b"OK birth-stop-unknown 4242 00112233445566778899aabbccddeeff\n".to_vec(),
+        b"OK birth-stop-mismatch 4242 00112233445566778899aabbccddeeff 4242 11112222333344445555666677778888\n".to_vec(),
+        b"ERR unknown\n".to_vec(),
+    ] {
+        let (client, connects, _) = stop_test_client_with_frames(
+            Platform::Linux,
+            vec![polaris_helper_client::MockStream::with_response(wire)],
+        );
+        assert!(stop_birth_with_client_budget(
+            &client,
+            target,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+        )
+        .is_err());
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn exact_pending_exhausts_one_budget_without_releasing_birth() {
+    let target = birth_target(4242, "00112233445566778899aabbccddeeff");
+    let streams = (0..32)
+        .map(|_| {
+            polaris_helper_client::MockStream::with_response(
+                b"OK birth-stop-pending 4242 00112233445566778899aabbccddeeff\n".to_vec(),
+            )
+        })
+        .collect();
+    let (client, _, _) = stop_test_client_with_frames(Platform::Linux, streams);
+    let started = std::time::Instant::now();
+    let error = stop_birth_with_client_budget(
+        &client,
+        target,
+        Duration::from_millis(20),
+        Duration::from_millis(5),
+    )
+    .unwrap_err();
+    assert!(error.contains("未取得 native reap"), "{error}");
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+#[test]
+fn exact_status_does_not_accept_legacy_or_invent_no_owner() {
+    let (client, _, frames) = stop_test_client_with_frames(
+        Platform::Linux,
+        vec![polaris_helper_client::MockStream::with_response(
+            b"OK birth-status running 4242 00112233445566778899aabbccddeeff\n".to_vec(),
+        )],
+    );
+    assert_eq!(
+        managed_core_status_with_client(&client),
+        Ok(ManagedCoreStatus::BirthRunning {
+            target: birth_target(4242, "00112233445566778899aabbccddeeff")
+        })
+    );
+    assert_eq!(*frames.lock().unwrap(), ["status-birth-safe\n".to_owned()]);
+    let (client, _, _) = stop_test_client_with_frames(
+        Platform::Linux,
+        vec![polaris_helper_client::MockStream::with_response(
+            b"OK birth-status empty\n".to_vec(),
+        )],
+    );
+    assert_eq!(
+        managed_core_status_with_client(&client),
+        Ok(ManagedCoreStatus::BirthEmpty),
+        "an empty daemon-local status is not a no-owner proof"
+    );
+    for wire in [b"OK running 4242\n".to_vec(), b"ERR unknown\n".to_vec()] {
+        let (client, _, _) = stop_test_client_with_frames(
+            Platform::Linux,
+            vec![polaris_helper_client::MockStream::with_response(wire)],
+        );
+        assert!(managed_core_status_with_client(&client).is_err());
+    }
+}
+
+#[test]
+fn linux_exact_capability_probe_is_read_only_and_old_helper_fails_before_start() {
+    for (wire, capable) in [
+        (b"OK birth-status empty\n".to_vec(), true),
+        (b"ERR unknown\n".to_vec(), false),
+        (b"OK stopped\n".to_vec(), false),
+    ] {
+        let (client, connects, frames) = stop_test_client_with_frames(
+            Platform::Linux,
+            vec![polaris_helper_client::MockStream::with_response(wire)],
+        );
+        assert_eq!(
+            require_linux_birth_capability_with_client(&client).is_ok(),
+            capable
+        );
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(*frames.lock().unwrap(), ["status-birth-safe\n".to_owned()]);
+    }
+}
+
 #[test]
 fn stop_retries_once_when_the_first_roundtrip_loses_its_response() {
     let (client, connects) = stop_test_client(vec![
@@ -710,6 +886,26 @@ fn start_core_records_the_identity_baseline_on_both_response_legs() {
         body.contains(concat!("remember_start_identity", "(pid, None)")),
         "无 timing 腿没清基线 —— 上一次 start 的陈值会被拿去比同号新核"
     );
+}
+
+#[test]
+fn production_start_selects_exact_linux_wire_and_legacy_desktop_wire() {
+    let body = impl_method_body(
+        &crate_code("runtime/helper.rs"),
+        concat!(
+            "    pub fn start_core(\n",
+            "        &self,\n",
+            "        cfg: &Path,\n",
+            "        log: &Path,\n",
+            "        fwd: bool,\n",
+            "        ppid: Option<u32>,\n",
+            "    ) -> Result<HelperStartResult, String> {"
+        ),
+    );
+    assert!(body.contains("Platform::Mac | Platform::Win => Request::Start(common)"));
+    assert!(body.contains("if self.platform == Platform::Linux"));
+    assert!(body.contains("Request::LinuxStartBirth(params)"));
+    assert!(body.contains("return classify_linux_birth_start_response(resp)"));
 }
 
 /// **S-2 记号语义**：失效键取「探到的那次身份」，`Unreachable` 一律不记（也不留旧值）。
