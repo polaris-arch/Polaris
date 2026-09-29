@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# gate-node-test.sh —— 跑 scripts/ 下的 node --test 用例并自证「确有其事」。
+# gate-node-test.sh —— 跑 scripts/*.test.mjs 合同用例并自证「确有其事」。
 #
 # 起因（2026-08-31 全量门规格三修 F3）：`node --test scripts/` 指向空目录、或目标文件
 # 被改名/移走、或在错误 cwd 执行时，Node 的 test runner 都是 rc=0（0 tests / 0 pass / 0
 # fail），与「全部用例真的跑过且通过」在 shell 层完全不可区分——门会静默判绿。
 # 实测：`node --test /空目录/` → rc=0，tests 0 / pass 0 / fail 0。
 #
-# 分类器与 Cronet 合同是 release-risk 的独立承重面，故先固定要求这些文件存在：目录自动发现不能守住
-# 「某一承重文件被删/改名」的情况。执行仍传整个 scripts/ 目录，未来新增 *.test.mjs 也会自动纳入。
+# 分类器与 Cronet 合同是 release-risk 的独立承重面，故先固定要求这些文件存在：文件枚举不能守住
+# 「某一承重文件被删/改名」的情况。只枚举 *.test.mjs，未来新增同名合同仍自动纳入；目录自动发现
+# 还会把 test-android-*.mjs 当作测试执行，但那些是真机脚本，必须由显式设备序列号的入口单独运行。
 #
 # AppImage 后处理合同同列必需（2026-09-04）：`appImageRuntimeViolations` 既是**修复方**
 # （postprocess-appimage.mjs 重封前自检）又是**判分方**（verify-packaging.mjs payload 门 import
@@ -24,7 +25,7 @@ required_tests=(
   scripts/fetch-cronet.test.mjs
   scripts/postprocess-appimage.test.mjs
   # Android APK 腿的产物级判据本体（scripts/verify-apk.mjs）的变异测试：它被删/改名时
-  # `node --test scripts/` 只会少 pass 几条，下面的下限未必抓得到，故显式列出。
+  # `node --test scripts/*.test.mjs` 只会少 pass 几条，下面的下限未必抓得到，故显式列出。
   scripts/verify-apk.test.mjs
   # release 冒烟腿的产物级判据本体（scripts/assert-r8-evidence.mjs）的变异测试：它守的是
   # 「针被本仓自己的注释喂绿」与「configuration.txt 证明不了 keep 命中没命中」这两条真缺陷。
@@ -46,7 +47,7 @@ done
 #    以为是脚本坏了或 cwd 不对，去查一个不存在的问题。
 #    `|| rc=$?` 让这次赋值成为 `||` 列表的左支，errexit 按定义不介入，于是输出先落地、再据 rc 退出。
 rc=0
-out="$(node --test --test-reporter=tap scripts/ 2>&1)" || rc=$?
+out="$(node --test --test-reporter=tap scripts/*.test.mjs 2>&1)" || rc=$?
 printf '%s\n' "$out"
 if [ "$rc" -ne 0 ]; then
   echo "::error::gate-node-test: node --test 退出码 $rc —— 失败用例见上面 TAP 输出里的 'not ok' 行" >&2
