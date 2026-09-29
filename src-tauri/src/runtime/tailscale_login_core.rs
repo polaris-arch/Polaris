@@ -1053,6 +1053,16 @@ impl LoginCoreRegistry {
         Ok(false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn poison_main_claim_lock_for_test(&self) {
+        let shared = Arc::clone(&self.shared);
+        let _ = std::thread::spawn(move || {
+            let _guard = shared.main.lock().unwrap();
+            panic!("poison main claim registry for test");
+        })
+        .join();
+    }
+
     fn main_matches_request(&self, server: &ServerConfig, mode: LoginMode) -> bool {
         let endpoints = self
             .shared

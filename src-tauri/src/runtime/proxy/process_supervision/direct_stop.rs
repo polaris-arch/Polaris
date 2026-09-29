@@ -12,7 +12,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::direct_custody::{
-    BackendFence, DirectCoreSlot, SlotAdmissionError, SlotInstance, StopPoll, StopView, WorkerNonce,
+    BackendFence, DirectBirthCloseError, DirectCoreSlot, SlotAdmissionError, SlotInstance,
+    StopPoll, StopView, WorkerNonce,
 };
 use crate::runtime::config::{StopReservationCheck, StopReservationReceipt, StopRuntimeDomain};
 use crate::runtime::mesh::MeshRuntime;
@@ -107,11 +108,22 @@ impl PreparedDirectStop {
 
 /// Read-only view. Dropping it has no effect on the detached worker or Child.
 pub(in crate::runtime::proxy) struct DirectStopObservation {
+    domain: Arc<StopRuntimeDomain>,
     slot: Arc<Mutex<DirectCoreSlot>>,
     instance: Arc<SlotInstance>,
     identity: RunIdentity,
     nonce: WorkerNonce,
     alive: Arc<AtomicBool>,
+}
+
+/// Runtime-bound local terminal proof for one reaped direct Child. The Child
+/// stays in Stopping; this is not a global owner or lifecycle receipt.
+pub(in crate::runtime::proxy) struct DirectBirthClosed {
+    domain: Arc<StopRuntimeDomain>,
+    slot: Arc<Mutex<DirectCoreSlot>>,
+    instance: Arc<SlotInstance>,
+    identity: RunIdentity,
+    nonce: WorkerNonce,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +141,61 @@ pub(in crate::runtime::proxy) enum StopWaitOutcome {
 }
 
 impl DirectStopObservation {
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn clone_for_test(&self) -> Self {
+        Self {
+            domain: Arc::clone(&self.domain),
+            slot: Arc::clone(&self.slot),
+            instance: Arc::clone(&self.instance),
+            identity: self.identity.clone(),
+            nonce: self.nonce.clone(),
+            alive: Arc::clone(&self.alive),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn identity_for_test(&self) -> RunIdentity {
+        self.identity.clone()
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn rebind_slot_for_test(
+        &mut self,
+        slot: Arc<Mutex<DirectCoreSlot>>,
+    ) {
+        self.slot = slot;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn rebind_domain_for_test(
+        &mut self,
+        domain: Arc<StopRuntimeDomain>,
+    ) {
+        self.domain = domain;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn rebind_identity_for_test(&mut self, identity: RunIdentity) {
+        self.identity = identity;
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn corrupt_nonce_for_test(&mut self) {
+        self.nonce = WorkerNonce::new();
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn matches_closed_for_test(
+        &self,
+        closed: &DirectBirthClosed,
+    ) -> bool {
+        Arc::ptr_eq(&self.domain, &closed.domain)
+            && Arc::ptr_eq(&self.slot, &closed.slot)
+            && Arc::ptr_eq(&self.instance, &closed.instance)
+            && self.identity.same_run(&closed.identity)
+            && self.nonce.same(&closed.nonce)
+    }
+
     pub(in crate::runtime::proxy) fn provenance(&self) -> DirectStopProvenance {
         DirectStopProvenance::LegacyExact
     }
@@ -149,7 +216,7 @@ impl DirectStopObservation {
         let wait = async {
             loop {
                 match self.view() {
-                    StopView::Reaped => return StopWaitOutcome::Reaped,
+                    StopView::Reaped | StopView::BirthClosed => return StopWaitOutcome::Reaped,
                     StopView::RetainedFailure => return StopWaitOutcome::RetainedFailure,
                     StopView::Obsolete => return StopWaitOutcome::Obsolete,
                     StopView::Armed | StopView::KillRequested if !self.worker_alive() => {
@@ -350,6 +417,48 @@ pub(in crate::runtime::proxy) enum CommitDirectStopError {
 }
 
 impl ProxyRuntime {
+    /// Hand off only a reaped, same-birth direct Child to a local terminal
+    /// proof. This dormant entry has no normal Stop/Apply caller. It does not
+    /// attest global ownership or finish the lifecycle/config transaction.
+    pub(in crate::runtime::proxy) async fn close_reaped_direct_birth(
+        self: &Arc<Self>,
+        observation: &DirectStopObservation,
+    ) -> Result<DirectBirthClosed, DirectBirthCloseError> {
+        if cfg!(target_os = "android") {
+            return Err(DirectBirthCloseError::Unsupported);
+        }
+        if !Arc::ptr_eq(&observation.domain, &self.stop_domain)
+            || !Arc::ptr_eq(&observation.slot, &self.child)
+        {
+            return Err(DirectBirthCloseError::WrongRuntime);
+        }
+        let ts_gate = self.mesh.tailscale_state_gate().await;
+        let mut slot = self
+            .child
+            .lock()
+            .map_err(|_| DirectBirthCloseError::LockPoisoned)?;
+        if self.core_via_helper.load(Ordering::SeqCst) {
+            return Err(DirectBirthCloseError::HelperTouched);
+        }
+        let proof = DirectBirthClosed {
+            domain: Arc::clone(&self.stop_domain),
+            slot: Arc::clone(&self.child),
+            instance: Arc::clone(&observation.instance),
+            identity: observation.identity.clone(),
+            nonce: observation.nonce.clone(),
+        };
+        slot.close_reaped_birth(
+            &observation.instance,
+            &observation.identity,
+            &observation.nonce,
+            |token| {
+                self.mesh
+                    .release_tailscale_main_states_if_token(token, &ts_gate)
+            },
+        )?;
+        Ok(proof)
+    }
+
     /// The dormant production bridge for one exact local Legacy Child. This
     /// deliberately has no normal Stop/Start/Apply call site. The runtime owns
     /// all authority; callers supply only the typed CAS result and worker.
@@ -402,6 +511,7 @@ impl ProxyRuntime {
                         }
                         slot.commit_armed_unchecked(prepared.nonce.clone());
                         let observation = DirectStopObservation {
+                            domain: Arc::clone(&self.stop_domain),
                             slot: Arc::clone(&prepared.slot),
                             instance: Arc::clone(&prepared.instance),
                             identity: prepared.identity.clone(),
@@ -454,6 +564,7 @@ pub(in crate::runtime::proxy) fn commit_for_test(
     }
     slot.commit_armed_unchecked(prepared.nonce.clone());
     let observation = DirectStopObservation {
+        domain: Arc::clone(&prepared.domain),
         slot: Arc::clone(&prepared.slot),
         instance: Arc::clone(&prepared.instance),
         identity: prepared.identity.clone(),

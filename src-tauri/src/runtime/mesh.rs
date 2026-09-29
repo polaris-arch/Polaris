@@ -631,6 +631,11 @@ impl MeshRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn poison_tailscale_main_claim_lock_for_test(&self) {
+        self.login_registry.poison_main_claim_lock_for_test();
+    }
+
+    #[cfg(test)]
     pub fn main_owns_tailscale(&self, id: &str, alive: bool) -> bool {
         self.login_registry.main_owns(id, alive)
     }

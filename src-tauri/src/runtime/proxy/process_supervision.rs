@@ -9,11 +9,11 @@ mod direct_custody;
 #[allow(dead_code)] // No production commit bridge exists in this slice.
 mod direct_stop;
 pub(crate) use direct_custody::DirectCoreSlot;
-pub(super) use direct_custody::{HelperStartToken, HelperStopNonce};
 #[cfg(test)]
 pub(super) use direct_custody::{
-    ReserveStoppingError, SlotAdmissionError, StopView, TakeRunningError,
+    DirectBirthCloseError, ReserveStoppingError, SlotAdmissionError, StopView, TakeRunningError,
 };
+pub(super) use direct_custody::{HelperStartToken, HelperStopNonce};
 #[cfg(test)]
 pub(super) use direct_stop::{
     commit_for_test, prepare_direct_stop, prepare_with_io_for_test, CommitDirectStopError,

@@ -204,6 +204,58 @@ async fn reap_running_child(rt: &Arc<ProxyRuntime>) {
     run.child.kill().await.unwrap();
 }
 
+async fn attach_main_claim(
+    rt: &Arc<ProxyRuntime>,
+    server_id: &str,
+) -> crate::runtime::tailscale_login_core::MainBirthToken {
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir(server_id).unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    rt.child
+        .lock()
+        .unwrap()
+        .running_for_test()
+        .expect("real Running Child")
+        .main_token = Some(token.clone());
+    reservation.arm_external_start();
+    drop(reservation);
+    token
+}
+
+async fn committed_reaped_with_main(
+    server_id: &str,
+) -> (
+    Arc<ProxyRuntime>,
+    crate::test_support::TestDir,
+    DirectStopObservation,
+    crate::runtime::tailscale_login_core::MainBirthToken,
+) {
+    let fixture = reserved_direct_fixture().await;
+    let token = attach_main_claim(&fixture.rt, server_id).await;
+    let prepared = prepare_direct_stop(&fixture.rt, &fixture.identity)
+        .await
+        .unwrap();
+    let observation = fixture
+        .rt
+        .commit_reserved_direct_stop(fixture.receipt, &fixture.plan, prepared)
+        .await
+        .unwrap_or_else(|_| panic!("real CAS must commit same-birth Child"));
+    assert_eq!(
+        observation.wait_for(Duration::from_secs(5)).await,
+        StopWaitOutcome::Reaped
+    );
+    (fixture.rt, fixture.dir, observation, token)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn real_cas_bridge_reaps_legacy_child_and_keeps_stop_requested() {
     use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
@@ -240,6 +292,363 @@ async fn real_cas_bridge_reaps_legacy_child_and_keeps_stop_requested() {
         MeshTransactionPhase::StopRequested
     );
     assert!(rt.register_helper_backend().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reaped_direct_birth_closes_only_its_main_claim_and_keeps_terminal_child() {
+    let (rt, _dir, observation, token) = committed_reaped_with_main("ts-direct-close").await;
+    assert!(rt.mesh.main_owns_tailscale("ts-direct-close", true));
+    let old_generation = rt.gate.generation();
+    rt.gate
+        .claim_generation(None, LifecycleKind::Start)
+        .expect("later generation");
+    assert_ne!(rt.gate.generation(), old_generation);
+
+    let closed = rt.close_reaped_direct_birth(&observation).await.unwrap();
+    assert!(observation.matches_closed_for_test(&closed));
+    assert_eq!(observation.view(), StopView::BirthClosed);
+    assert!(!rt.mesh.main_owns_tailscale("ts-direct-close", true));
+    let gate = rt.mesh.tailscale_state_gate().await;
+    assert!(!rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+    drop(gate);
+    drop(closed);
+
+    assert!(rt.child.lock().unwrap().is_stopping_for_test());
+    assert!(!rt.child.lock().unwrap().is_empty());
+    assert!(rt.register_helper_backend().is_err());
+    assert!(matches!(
+        prepare_direct_stop(&rt, &observation.identity_for_test()).await,
+        Err(PrepareError::Slot(SlotAdmissionError::Busy))
+    ));
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::AlreadyClosed)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_birth_close_waits_for_real_ts_gate_even_without_a_main_claim() {
+    let fixture = reserved_direct_fixture().await;
+    let prepared = prepare_direct_stop(&fixture.rt, &fixture.identity)
+        .await
+        .unwrap();
+    let observation = fixture
+        .rt
+        .commit_reserved_direct_stop(fixture.receipt, &fixture.plan, prepared)
+        .await
+        .unwrap_or_else(|_| panic!("real CAS must commit no-TS Child"));
+    assert_eq!(
+        observation.wait_for(Duration::from_secs(5)).await,
+        StopWaitOutcome::Reaped
+    );
+    let gate = fixture.rt.mesh.tailscale_state_gate().await;
+    let observation = Arc::new(observation);
+    let rt = Arc::clone(&fixture.rt);
+    let observed = Arc::clone(&observation);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let close = tokio::spawn(async move {
+        let _ = entered_tx.send(());
+        rt.close_reaped_direct_birth(&observed).await
+    });
+    entered_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(!close.is_finished(), "even no-TS close needs the real gate");
+    assert_eq!(observation.view(), StopView::Reaped);
+    drop(gate);
+    assert!(close.await.unwrap().is_ok());
+    assert_eq!(observation.view(), StopView::BirthClosed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_birth_close_rejects_missing_or_successor_registry_claim() {
+    let (rt, _dir, observation, token) = committed_reaped_with_main("ts-old").await;
+    let gate = rt.mesh.tailscale_state_gate().await;
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+    drop(gate);
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::ClaimMismatch)
+    ));
+    assert_eq!(observation.view(), StopView::Reaped);
+
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let successor = rt.mesh.mint_tailscale_main_birth();
+    let state = rt.mesh.tailscale_state_dir("ts-successor").unwrap();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            successor.clone(),
+        )
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    drop(gate);
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::ClaimMismatch)
+    ));
+    assert_eq!(observation.view(), StopView::Reaped);
+    assert!(rt.mesh.main_owns_tailscale("ts-successor", true));
+    let gate = rt.mesh.tailscale_state_gate().await;
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&successor, &gate)
+        .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn poisoned_main_registry_leaves_reaped_direct_birth_unclosed() {
+    let (rt, _dir, observation, _) = committed_reaped_with_main("ts-poison").await;
+    rt.mesh.poison_tailscale_main_claim_lock_for_test();
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::Registry(_))
+    ));
+    assert_eq!(observation.view(), StopView::Reaped);
+    assert!(rt.child.lock().unwrap().is_stopping_for_test());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_birth_close_rejects_a_token_from_another_registry() {
+    let fixture = reserved_direct_fixture().await;
+    let (foreign, _foreign_dir) = test_runtime();
+    let gate = foreign.mesh.tailscale_state_gate().await;
+    let token = foreign.mesh.mint_tailscale_main_birth();
+    let state = foreign.mesh.tailscale_state_dir("ts-foreign").unwrap();
+    let mut reservation = foreign
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .rt
+        .child
+        .lock()
+        .unwrap()
+        .running_for_test()
+        .unwrap()
+        .main_token = Some(token.clone());
+    reservation.arm_external_start();
+    drop(reservation);
+    drop(gate);
+
+    let prepared = prepare_direct_stop(&fixture.rt, &fixture.identity)
+        .await
+        .unwrap();
+    let observation = fixture
+        .rt
+        .commit_reserved_direct_stop(fixture.receipt, &fixture.plan, prepared)
+        .await
+        .unwrap_or_else(|_| panic!("real CAS must commit local Child"));
+    assert_eq!(
+        observation.wait_for(Duration::from_secs(5)).await,
+        StopWaitOutcome::Reaped
+    );
+    assert!(matches!(
+        fixture.rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::Registry(_))
+    ));
+    assert_eq!(observation.view(), StopView::Reaped);
+    assert!(foreign.mesh.main_owns_tailscale("ts-foreign", true));
+    let gate = foreign.mesh.tailscale_state_gate().await;
+    assert!(foreign
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_birth_close_rejects_foreign_runtime_run_nonce_and_slot() {
+    let (rt, _dir, observation, token) = committed_reaped_with_main("ts-identity").await;
+    let (foreign, _foreign_dir) = test_runtime();
+    assert!(matches!(
+        foreign.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::WrongRuntime)
+    ));
+    let mut wrong_domain = observation.clone_for_test();
+    wrong_domain.rebind_domain_for_test(Arc::clone(&foreign.stop_domain));
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&wrong_domain).await,
+        Err(DirectBirthCloseError::WrongRuntime)
+    ));
+    let mut wrong_run = observation.clone_for_test();
+    wrong_run.rebind_identity_for_test(RunIdentity::new());
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&wrong_run).await,
+        Err(DirectBirthCloseError::WrongRun)
+    ));
+    let mut wrong_nonce = observation.clone_for_test();
+    wrong_nonce.corrupt_nonce_for_test();
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&wrong_nonce).await,
+        Err(DirectBirthCloseError::WrongRun)
+    ));
+    let mut wrong_slot = observation.clone_for_test();
+    wrong_slot.rebind_slot_for_test(Arc::clone(&foreign.child));
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&wrong_slot).await,
+        Err(DirectBirthCloseError::WrongRuntime)
+    ));
+    rt.core_via_helper.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::HelperTouched)
+    ));
+    rt.core_via_helper.store(false, Ordering::SeqCst);
+    assert_eq!(observation.view(), StopView::Reaped);
+    assert!(rt.mesh.main_owns_tailscale("ts-identity", true));
+    let closed = rt.close_reaped_direct_birth(&observation).await.unwrap();
+    assert!(observation.matches_closed_for_test(&closed));
+    let gate = rt.mesh.tailscale_state_gate().await;
+    assert!(!rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_slot_instance_rejects_direct_birth_close_without_releasing_claim() {
+    let (rt, _dir, observation, _) = committed_reaped_with_main("ts-instance").await;
+    rt.child.lock().unwrap().replace_instance_for_test();
+    assert!(matches!(
+        rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::WrongSlot)
+    ));
+    assert!(rt.mesh.main_owns_tailscale("ts-instance", true));
+    assert!(rt.child.lock().unwrap().is_reaped_for_test());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_gone_without_reap_cannot_close_or_release_direct_birth() {
+    let fixture = reserved_direct_fixture().await;
+    let _token = attach_main_claim(&fixture.rt, "ts-not-reaped").await;
+    let (io, _) = ScriptedIo::new(Fault::TryWait);
+    let prepared = prepare_with_io_for_test(
+        &fixture.rt,
+        &fixture.identity,
+        io,
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .unwrap();
+    let observation = fixture
+        .rt
+        .commit_reserved_direct_stop(fixture.receipt, &fixture.plan, prepared)
+        .await
+        .unwrap_or_else(|_| panic!("real CAS must commit local Child"));
+    assert_eq!(
+        observation.wait_for(Duration::from_secs(5)).await,
+        StopWaitOutcome::RetainedFailure
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observation.worker_alive() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        fixture.rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::NotReaped)
+    ));
+    assert!(fixture.rt.mesh.main_owns_tailscale("ts-not-reaped", true));
+    assert_eq!(observation.view(), StopView::RetainedFailure);
+    reap_test_stopping_child(&fixture.rt).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_observer_can_close_later_reaped_direct_birth() {
+    let fixture = reserved_direct_fixture().await;
+    let _token = attach_main_claim(&fixture.rt, "ts-late-reap").await;
+    let pause = Arc::new(tokio::sync::Notify::new());
+    let (io, _) = ScriptedIo::new(Fault::None);
+    let prepared = prepare_with_io_for_test(
+        &fixture.rt,
+        &fixture.identity,
+        io,
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+        Some(Arc::clone(&pause)),
+    )
+    .await
+    .unwrap();
+    let observation = fixture
+        .rt
+        .commit_reserved_direct_stop(fixture.receipt, &fixture.plan, prepared)
+        .await
+        .unwrap_or_else(|_| panic!("real CAS must commit local Child"));
+    wait_view(&observation, StopView::KillRequested).await;
+    assert!(tokio::time::timeout(
+        Duration::from_millis(10),
+        observation.wait_for(Duration::from_secs(5))
+    )
+    .await
+    .is_err());
+    assert!(matches!(
+        fixture.rt.close_reaped_direct_birth(&observation).await,
+        Err(DirectBirthCloseError::NotReaped)
+    ));
+    assert!(fixture.rt.mesh.main_owns_tailscale("ts-late-reap", true));
+    pause.notify_one();
+    assert_eq!(
+        observation.wait_for(Duration::from_secs(5)).await,
+        StopWaitOutcome::Reaped
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observation.worker_alive() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture
+        .rt
+        .close_reaped_direct_birth(&observation)
+        .await
+        .unwrap();
+    assert_eq!(observation.view(), StopView::BirthClosed);
+    assert!(!fixture.rt.mesh.main_owns_tailscale("ts-late-reap", true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_direct_birth_close_consumes_one_reaped_proof() {
+    let (rt, _dir, observation, _) = committed_reaped_with_main("ts-concurrent").await;
+    let observation = Arc::new(observation);
+    let first_rt = Arc::clone(&rt);
+    let first_observation = Arc::clone(&observation);
+    let first =
+        tokio::spawn(async move { first_rt.close_reaped_direct_birth(&first_observation).await });
+    let second_rt = Arc::clone(&rt);
+    let second_observation = Arc::clone(&observation);
+    let second = tokio::spawn(async move {
+        second_rt
+            .close_reaped_direct_birth(&second_observation)
+            .await
+    });
+    let a = first.await.unwrap();
+    let b = second.await.unwrap();
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert!(
+        matches!(a, Err(DirectBirthCloseError::AlreadyClosed))
+            || matches!(b, Err(DirectBirthCloseError::AlreadyClosed))
+    );
+    assert_eq!(observation.view(), StopView::BirthClosed);
+    assert!(rt.child.lock().unwrap().is_stopping_for_test());
 }
 
 #[tokio::test(flavor = "multi_thread")]

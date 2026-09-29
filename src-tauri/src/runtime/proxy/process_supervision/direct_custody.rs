@@ -85,7 +85,7 @@ impl WorkerNonce {
         Self(Arc::new(()))
     }
 
-    fn same(&self, other: &Self) -> bool {
+    pub(super) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -123,6 +123,7 @@ enum StopPhase {
         nonce: WorkerNonce,
     },
     Reaped(DirectChildReaped),
+    BirthClosed(DirectChildReaped),
     RetainedFailure {
         nonce: WorkerNonce,
         reason: StopFailure,
@@ -135,7 +136,7 @@ impl StopPhase {
             Self::Armed { nonce }
             | Self::KillRequested { nonce }
             | Self::RetainedFailure { nonce, .. } => nonce,
-            Self::Reaped(proof) => &proof.nonce,
+            Self::Reaped(proof) | Self::BirthClosed(proof) => &proof.nonce,
         }
     }
 }
@@ -182,8 +183,24 @@ pub(in crate::runtime::proxy) enum StopView {
     Armed,
     KillRequested,
     Reaped,
+    BirthClosed,
     RetainedFailure,
     Obsolete,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::runtime::proxy) enum DirectBirthCloseError {
+    Unsupported,
+    WrongRuntime,
+    WrongSlot,
+    WrongRun,
+    HelperTouched,
+    ManagedOrigin,
+    NotReaped,
+    AlreadyClosed,
+    ClaimMismatch,
+    Registry(String),
+    LockPoisoned,
 }
 
 /// This is only an observation of the reservation. Dropping it cannot release
@@ -458,6 +475,60 @@ impl DirectCoreSlot {
         });
     }
 
+    /// Called with the real TS gate and this Child lock held. Registry
+    /// compare-remove is the last fallible step; only then is the exact
+    /// Reaped proof advanced to a permanent non-Empty local terminal state.
+    pub(super) fn close_reaped_birth(
+        &mut self,
+        instance: &Arc<SlotInstance>,
+        expected: &RunIdentity,
+        nonce: &WorkerNonce,
+        release: impl FnOnce(
+            &crate::runtime::tailscale_login_core::MainBirthToken,
+        ) -> Result<bool, String>,
+    ) -> Result<(), DirectBirthCloseError> {
+        if !Arc::ptr_eq(&self.instance, instance) {
+            return Err(DirectBirthCloseError::WrongSlot);
+        }
+        if self.backend != BackendFence::DirectOnly || self.helper_start.is_some() {
+            return Err(DirectBirthCloseError::HelperTouched);
+        }
+        let SlotState::Stopping(custody) = &mut self.state else {
+            return Err(DirectBirthCloseError::NotReaped);
+        };
+        if !custody.run.identity.same_run(expected) || !custody.phase.nonce().same(nonce) {
+            return Err(DirectBirthCloseError::WrongRun);
+        }
+        if !matches!(custody.run.origin, DirectRunOrigin::Legacy) {
+            return Err(DirectBirthCloseError::ManagedOrigin);
+        }
+        let proof = match &custody.phase {
+            StopPhase::Reaped(proof)
+                if proof.identity.same_run(expected) && proof.nonce.same(nonce) =>
+            {
+                proof
+            }
+            StopPhase::BirthClosed(_) => return Err(DirectBirthCloseError::AlreadyClosed),
+            StopPhase::Armed { .. }
+            | StopPhase::KillRequested { .. }
+            | StopPhase::Reaped(_)
+            | StopPhase::RetainedFailure { .. } => return Err(DirectBirthCloseError::NotReaped),
+        };
+        let closed_phase = StopPhase::BirthClosed(DirectChildReaped {
+            identity: proof.identity.clone(),
+            nonce: proof.nonce.clone(),
+            status: proof.status,
+        });
+        if let Some(token) = &custody.run.main_token {
+            if !release(token).map_err(DirectBirthCloseError::Registry)? {
+                return Err(DirectBirthCloseError::ClaimMismatch);
+            }
+        }
+        custody.phase = closed_phase;
+        custody.run.main_token = None;
+        Ok(())
+    }
+
     /// One nonblocking exact attempt, always under the worker's TS→Child
     /// lock order. Neither closure may identify a process by PID.
     pub(super) fn poll_exact_stop<F, G>(
@@ -492,7 +563,7 @@ impl DirectCoreSlot {
         let armed = match &custody.phase {
             StopPhase::Armed { .. } => true,
             StopPhase::KillRequested { .. } => false,
-            StopPhase::Reaped(proof) => {
+            StopPhase::Reaped(proof) | StopPhase::BirthClosed(proof) => {
                 debug_assert!(proof.identity.same_run(expected));
                 let _ = proof.status;
                 return StopPoll::Reaped;
@@ -563,6 +634,7 @@ impl DirectCoreSlot {
             StopPhase::Armed { .. } => StopView::Armed,
             StopPhase::KillRequested { .. } => StopView::KillRequested,
             StopPhase::Reaped(_) => StopView::Reaped,
+            StopPhase::BirthClosed(_) => StopView::BirthClosed,
             StopPhase::RetainedFailure { .. } => StopView::RetainedFailure,
         }
     }
@@ -705,7 +777,7 @@ impl DirectCoreSlot {
 
     #[cfg(test)]
     pub(in crate::runtime::proxy) fn is_reaped_for_test(&self) -> bool {
-        matches!(&self.state, SlotState::Stopping(custody) if matches!(&custody.phase, StopPhase::Reaped(_)))
+        matches!(&self.state, SlotState::Stopping(custody) if matches!(&custody.phase, StopPhase::Reaped(_) | StopPhase::BirthClosed(_)))
     }
 
     #[cfg(test)]
