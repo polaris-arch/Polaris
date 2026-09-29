@@ -734,6 +734,95 @@ async fn residual_mode_or_selector_drift_cannot_claim_an_ordinary_hot_switch() {
 }
 
 #[tokio::test]
+async fn saved_full_config_with_mesh_control_drift_waits_for_explicit_apply() {
+    for (mode, dashboard, proxy) in [
+        ("mesh-direct", PROXY_SELECTOR_TAG, "Node A"),
+        ("normal", PROXY_SELECTOR_TAG, "TS Mesh"),
+        ("normal", "direct", "Node A"),
+    ] {
+        let (rt, _dir) = test_runtime();
+        let mut running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
+        running["proxyMode"] = serde_json::json!("smart");
+        running["singboxDashboard"] = serde_json::json!(true);
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_named_snapshot(&rt, &running);
+        cover_running_binding_roots(&rt, &running);
+        if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+            snapshot.mesh_mode_ready = true;
+            snapshot.dashboard_mode_selector = true;
+        }
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let sink = Arc::new(TestPutSink::default());
+        *sink.mode.lock().unwrap() = Some(mode.into());
+        *sink.groups.lock().unwrap() = Some(vec![
+            group(PROXY_SELECTOR_TAG, proxy),
+            group(DASHBOARD_SELECTOR, dashboard),
+        ]);
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+        let generation = rt.gate.generation();
+
+        let mut saved = running.clone();
+        saved["selectedServerId"] = serde_json::json!("ts-mesh");
+        saved["dnsConfig"]["enableFakeIp"] = serde_json::json!(false);
+        saved["tunConfig"]["mtu"] = serde_json::json!(1300);
+        saved["trafficRules"] = serde_json::json!([{
+            "id": "saved-rule", "type": "domain", "values": ["saved.example.test"],
+            "action": "direct", "enabled": true
+        }]);
+        rt.config.save_full(&saved).unwrap();
+        let saved = rt.config.current().unwrap();
+        assert_eq!(
+            rt.switch_mode_with(saved.clone(), true).await,
+            SwitchOutcome::Deferred,
+            "mode={mode} dashboard={dashboard} proxy={proxy}"
+        );
+        assert_eq!(rt.gate.generation(), generation);
+        assert!(!rt.gate.pending().restart_pending);
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        assert!(sink.calls().is_empty());
+        assert!(sink.operations.lock().unwrap().is_empty());
+        assert!(rt.selector_reconcile.is_required());
+        assert!(rt.restart_deferred.load(Ordering::SeqCst));
+        assert!(rt.pending_changes().restart_deferred);
+        assert_eq!(rt.current_config_snapshot().unwrap(), running);
+        assert_eq!(rt.startup_snapshot.read().unwrap().as_ref(), Some(&running));
+        assert_ne!(saved["dnsConfig"], running["dnsConfig"]);
+        assert_ne!(saved["tunConfig"], running["tunConfig"]);
+        assert_ne!(saved["trafficRules"], running["trafficRules"]);
+
+        assert_eq!(rt.apply_pending().await, "applied");
+        let (id, pending, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+        assert_eq!(source, ForceRestartSource::Full);
+        assert_eq!(
+            pending, saved,
+            "Apply must carry the exact saved DNS/TUN/rules"
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        rt.debounced
+            .schedule_with_ticket(true, move |outcome, ticket| {
+                let _ = tx.send((outcome, ticket));
+            });
+        let (outcome, ticket) = rx.await.unwrap();
+        assert!(matches!(
+            outcome,
+            polaris_switch_engine::DebouncedOutcome::Proceed(Some(force_id)) if force_id == id
+        ));
+        let (claimed, _, _lease) = rt
+            .claim_debounced_restart(Some(id), generation, ticket)
+            .expect("explicit Apply must claim the saved full snapshot");
+        let landed = claimed.expect("Apply carries D into the replacement core");
+        assert_eq!(landed, saved);
+        install_startup_snapshot(&rt, &landed);
+        *rt.current_config.write().unwrap() = Some(landed);
+        rt.restart_deferred.store(false, Ordering::SeqCst);
+        rt.selector_reconcile.clear_required();
+        rt.finish_lifecycle(LifecycleKind::Restart);
+        assert!(!rt.pending_changes().restart_deferred);
+    }
+}
+
+#[tokio::test]
 async fn core_generation_change_during_mode_rpc_stops_old_selector_writes() {
     let (rt, _dir) = test_runtime();
     let mut running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
@@ -777,6 +866,154 @@ async fn core_generation_change_during_mode_rpc_stops_old_selector_writes() {
         rt.current_config_snapshot().unwrap()["selectedServerId"],
         "node-a"
     );
+}
+
+#[tokio::test]
+async fn mode_get_to_set_and_set_to_readback_obey_generation_and_intent() {
+    for supersede_intent in [false, true] {
+        let (rt, _dir) = test_runtime();
+        mark_running(&rt);
+        let sink = Arc::new(TestPutSink::default());
+        *sink.mode.lock().unwrap() = Some("normal".into());
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+        let generation = rt.gate.generation();
+        let intent = rt.register_selector_intent();
+        let owner = Arc::clone(&rt);
+        *sink.on_mode_status.lock().unwrap() = Some(Box::new(move || {
+            if supersede_intent {
+                owner.register_selector_intent();
+            } else {
+                owner.gate.bump_generation();
+            }
+        }));
+        assert!(
+            !rt.set_clash_mode_strict(generation, Some(intent), "mesh-direct")
+                .await
+        );
+        assert!(sink.operations.lock().unwrap().is_empty());
+        assert_eq!(sink.mode.lock().unwrap().as_deref(), Some("normal"));
+    }
+
+    let (rt, _dir) = test_runtime();
+    mark_running(&rt);
+    let sink = Arc::new(TestPutSink::default());
+    *sink.mode.lock().unwrap() = Some("normal".into());
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    let generation = rt.gate.generation();
+    let intent = rt.register_selector_intent();
+    let owner = Arc::clone(&rt);
+    *sink.on_mode.lock().unwrap() = Some(Box::new(move || {
+        owner.gate.bump_generation();
+    }));
+    assert!(
+        !rt.set_clash_mode_strict(generation, Some(intent), "mesh-direct")
+            .await
+    );
+    assert_eq!(
+        sink.operations.lock().unwrap().as_slice(),
+        ["mode:mesh-direct"]
+    );
+}
+
+#[tokio::test]
+async fn supersession_between_selector_puts_never_sends_the_next_target() {
+    for generation_change in [false, true] {
+        let (rt, _dir) = test_runtime();
+        let mut running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
+        running["proxyMode"] = serde_json::json!("smart");
+        running["singboxDashboard"] = serde_json::json!(true);
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_named_snapshot(&rt, &running);
+        cover_running_binding_roots(&rt, &running);
+        if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+            snapshot.mesh_mode_ready = true;
+            snapshot.dashboard_mode_selector = true;
+        }
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let old_sink = Arc::new(TestPutSink::default());
+        *old_sink.mode.lock().unwrap() = Some("normal".into());
+        *old_sink.groups.lock().unwrap() = Some(vec![
+            group(PROXY_SELECTOR_TAG, "Node A"),
+            group(DASHBOARD_SELECTOR, PROXY_SELECTOR_TAG),
+        ]);
+        old_sink.follow_puts.store(true, Ordering::SeqCst);
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&old_sink));
+        let replacement = Arc::new(TestPutSink::default());
+        let replacement_probe = Arc::clone(&replacement);
+        let owner = Arc::clone(&rt);
+        *old_sink.on_put.lock().unwrap() = Some(Box::new(move || {
+            if generation_change {
+                owner.gate.bump_generation();
+                *owner.management_api_stub.lock().unwrap() = Some(replacement);
+            } else {
+                owner.register_selector_intent();
+            }
+        }));
+        let mut selected = running;
+        selected["selectedServerId"] = serde_json::json!("ts-mesh");
+        rt.config.save_full(&selected).unwrap();
+        let intent = rt.register_selector_intent();
+        assert_eq!(
+            rt.switch_selected_server_if_current("ts-mesh", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Pending)
+        );
+        let calls = old_sink.calls();
+        assert_eq!(calls[0], (PROXY_SELECTOR_TAG.into(), "TS Mesh".into()));
+        assert!(
+            !calls
+                .iter()
+                .any(|(selector, member)| { selector == DASHBOARD_SELECTOR && member == "direct" }),
+            "a superseded transaction must not issue its second target PUT"
+        );
+        assert!(
+            replacement_probe.calls().is_empty(),
+            "replacement core was mutated"
+        );
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectedServerId"],
+            "node-a"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replacement_during_mode_rollback_cannot_receive_selector_rollback() {
+    let (rt, _dir) = test_runtime();
+    mark_running(&rt);
+    let old_sink = Arc::new(TestPutSink::default());
+    *old_sink.mode.lock().unwrap() = Some("normal".into());
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&old_sink));
+    let replacement = Arc::new(TestPutSink::default());
+    let replacement_probe = Arc::clone(&replacement);
+    let owner = Arc::clone(&rt);
+    let readback_sink = Arc::clone(&old_sink);
+    *old_sink.on_mode.lock().unwrap() = Some(Box::new(move || {
+        // The rollback Set succeeded, but its Get readback races a same-port replacement.
+        *readback_sink.on_mode_status.lock().unwrap() = Some(Box::new(move || {
+            owner.gate.bump_generation();
+            *owner.management_api_stub.lock().unwrap() = Some(replacement);
+        }));
+    }));
+    let plan = polaris_config_engine::builder::hotswitch::HotSwitchPlan {
+        puts: vec![polaris_config_engine::builder::hotswitch::HotSwitchPut {
+            selector_tag: PROXY_SELECTOR_TAG.into(),
+            member_tag: "Node B".into(),
+            old_member_tag: Some("Node A".into()),
+        }],
+        ..Default::default()
+    };
+    let generation = rt.gate.generation();
+    rt.rollback_mode_transition(&plan, "mesh-direct", generation)
+        .await;
+    assert_eq!(
+        old_sink.operations.lock().unwrap().as_slice(),
+        ["mode:mesh-direct"]
+    );
+    assert!(old_sink.calls().is_empty());
+    assert!(replacement_probe.calls().is_empty());
 }
 
 #[tokio::test]
@@ -2915,7 +3152,7 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
         .find("if self.gate.is_busy()")
         .expect("lifecycle 判定锚点");
     let execute = body
-        .find(".execute_hot_switch_plan(&plan, interrupt, switch_generation)")
+        .find(".execute_hot_switch_plan(")
         .expect("热切换执行锚点");
     let commit = body
         .find("self.commit_applied(&new_config)")
