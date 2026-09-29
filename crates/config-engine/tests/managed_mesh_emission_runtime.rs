@@ -185,12 +185,13 @@ fn dns_answers(name: &str, qtype: u16) -> Vec<Vec<u8>> {
     }
 }
 
-fn spawn_dns() -> (SocketAddr, Arc<AtomicBool>) {
+fn spawn_dns() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     let addr = socket.local_addr().unwrap();
+    let (query_tx, query_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     thread::spawn(move || {
@@ -221,7 +222,9 @@ fn spawn_dns() -> (SocketAddr, Arc<AtomicBool>) {
                 continue;
             }
             let qtype = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-            let answers = dns_answers(&labels.join("."), qtype);
+            let name = labels.join(".");
+            let answers = dns_answers(&name, qtype);
+            let _ = query_tx.send(format!("{name} type={qtype} answers={}", answers.len()));
             let mut response = Vec::new();
             response.extend_from_slice(&data[0..2]);
             response.extend_from_slice(&0x8180u16.to_be_bytes());
@@ -240,20 +243,27 @@ fn spawn_dns() -> (SocketAddr, Arc<AtomicBool>) {
             let _ = socket.send_to(&response, peer);
         }
     });
-    (addr, stop)
+    (addr, query_rx, stop)
 }
 
-fn spawn_observer() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
+fn spawn_observer() -> (
+    SocketAddr,
+    mpsc::Receiver<String>,
+    mpsc::Receiver<&'static str>,
+    Arc<AtomicBool>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     thread::spawn(move || {
         while !stop_thread.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    let _ = event_tx.send("accepted");
                     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                     let mut greeting = [0u8; 2];
                     if stream.read_exact(&mut greeting).is_err() {
@@ -266,10 +276,12 @@ fn spawn_observer() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
                     if stream.write_all(&[5, 0]).is_err() {
                         continue;
                     }
+                    let _ = event_tx.send("greeted");
                     let mut header = [0u8; 4];
                     if stream.read_exact(&mut header).is_err() {
                         continue;
                     }
+                    let _ = event_tx.send("request header received");
                     let target = match header[3] {
                         1 => {
                             let mut ip = [0u8; 4];
@@ -302,6 +314,7 @@ fn spawn_observer() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
                     if stream.read_exact(&mut port).is_err() {
                         continue;
                     }
+                    let _ = event_tx.send("target received");
                     let _ = tx.send(target);
                     let _ = stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
                 }
@@ -312,29 +325,54 @@ fn spawn_observer() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
             }
         }
     });
-    (addr, rx, stop)
+    (addr, rx, event_rx, stop)
 }
 
-fn connect(proxy: SocketAddr, host: &str) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&proxy, Duration::from_secs(2)) else {
-        return false;
-    };
+fn connect(proxy: SocketAddr, host: &str) -> Result<u8, String> {
+    let mut stream = TcpStream::connect_timeout(&proxy, Duration::from_secs(2))
+        .map_err(|error| format!("connect: {error}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    if stream.write_all(&[5, 1, 0]).is_err() {
-        return false;
-    }
+    stream
+        .write_all(&[5, 1, 0])
+        .map_err(|error| format!("greeting write: {error}"))?;
     let mut method = [0u8; 2];
-    if stream.read_exact(&mut method).is_err() || method != [5, 0] {
-        return false;
+    stream
+        .read_exact(&mut method)
+        .map_err(|error| format!("greeting read: {error}"))?;
+    if method != [5, 0] {
+        return Err(format!("unexpected SOCKS method reply: {method:?}"));
     }
+    assert!(host.len() <= u8::MAX as usize);
     let mut request = vec![5, 1, 0, 3, host.len() as u8];
     request.extend_from_slice(host.as_bytes());
     request.extend_from_slice(&80u16.to_be_bytes());
-    if stream.write_all(&request).is_err() {
-        return false;
-    }
+    stream
+        .write_all(&request)
+        .map_err(|error| format!("request write: {error}"))?;
     let mut reply = [0u8; 4];
-    stream.read_exact(&mut reply).is_ok() && reply[1] == 0
+    stream
+        .read_exact(&mut reply)
+        .map_err(|error| format!("reply header read: {error}"))?;
+    if reply[0] != 5 || reply[2] != 0 {
+        return Err(format!("invalid SOCKS reply header: {reply:?}"));
+    }
+    let address_len = match reply[3] {
+        1 => 4,
+        4 => 16,
+        3 => {
+            let mut len = [0u8; 1];
+            stream
+                .read_exact(&mut len)
+                .map_err(|error| format!("reply domain length read: {error}"))?;
+            len[0] as usize
+        }
+        atyp => return Err(format!("invalid SOCKS reply address type: {atyp}")),
+    };
+    let mut bound = vec![0u8; address_len + 2];
+    stream
+        .read_exact(&mut bound)
+        .map_err(|error| format!("reply bound address read: {error}"))?;
+    Ok(reply[1])
 }
 
 fn wait_listening(addr: SocketAddr) {
@@ -387,6 +425,112 @@ fn connect_fixture(
     wire
 }
 
+fn route_summary(wire: &Value) -> String {
+    let rules = wire["route"]["rules"].as_array().unwrap();
+    let interesting: Vec<_> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            rule["action"] == "resolve" || rule["outbound"] == "ep-a" || rule["outbound"] == "ep-b"
+        })
+        .map(|(index, rule)| {
+            format!(
+                "{index}:{}:{}:ip_cidr={}",
+                rule["action"].as_str().unwrap_or("match"),
+                rule["outbound"].as_str().unwrap_or("-"),
+                rule["ip_cidr"].as_array().map_or(0, Vec::len)
+            )
+        })
+        .collect();
+    format!("{} rules; {}", rules.len(), interesting.join(", "))
+}
+
+fn core_route_logs(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            [
+                "same-owner.test",
+                "outbound/",
+                "dns/",
+                "route/",
+                "inbound/socks",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle))
+        })
+        .take(32)
+        .map(|line| line.chars().take(240).collect())
+        .collect()
+}
+
+#[test]
+fn connect_fixture_keeps_dns_stub_and_resolve_before_owner_routes() {
+    let dns = SocketAddr::from(([127, 0, 0, 1], 53001));
+    let peer = SocketAddr::from(([127, 0, 0, 1], 53002));
+    let wire = connect_fixture(dns, peer, peer, peer);
+    let servers = wire["dns"]["servers"].as_array().unwrap();
+    assert!(servers.iter().any(|server| {
+        server["tag"] == "dns-remote"
+            && server["type"] == "udp"
+            && server["server"] == "127.0.0.1"
+            && server["server_port"] == dns.port()
+    }));
+    let rules = wire["route"]["rules"].as_array().unwrap();
+    let resolve = rules
+        .iter()
+        .position(|rule| rule["action"] == "resolve")
+        .unwrap();
+    let owner_a = rules
+        .iter()
+        .position(|rule| rule["outbound"] == "ep-a" && rule["ip_cidr"].is_array())
+        .unwrap();
+    let owner_b = rules
+        .iter()
+        .position(|rule| rule["outbound"] == "ep-b" && rule["ip_cidr"].is_array())
+        .unwrap();
+    assert!(
+        resolve < owner_a && resolve < owner_b,
+        "{}",
+        route_summary(&wire)
+    );
+    assert!(rules[owner_a]["ip_cidr"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cidr| cidr == "100.80.0.0/16"));
+}
+
+#[test]
+fn socks_connect_requires_complete_reply() {
+    for (reply, expected) in [
+        (vec![5, 0, 0, 1], false),
+        (vec![5, 0, 0, 1, 127, 0, 0, 1, 0, 80], true),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let mut request = [0u8; 5];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 3]);
+            let mut target = vec![0u8; request[4] as usize + 2];
+            stream.read_exact(&mut target).unwrap();
+            stream.write_all(&reply).unwrap();
+        });
+        assert_eq!(connect(addr, "example.test") == Ok(0), expected);
+        server.join().unwrap();
+    }
+}
+
 fn fixed_core_or_skip(what: &str) -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("POLARIS_TEST_CORE") {
         let path = std::path::PathBuf::from(path);
@@ -409,19 +553,27 @@ fn b609_accepts_emitted_connect_fixture_without_starting_core() {
     let wire = connect_fixture(loopback, loopback, loopback, loopback);
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("d1-connect-check.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&wire).unwrap()).unwrap();
-    for subcommand in ["check", "format"] {
-        let result = command_for_core(&core)
-            .arg(subcommand)
-            .arg("-c")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "b609 {subcommand}: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+    for logging in [false, true] {
+        let mut candidate = wire.clone();
+        if logging {
+            candidate["log"]["disabled"] = json!(false);
+            candidate["log"]["level"] = json!("debug");
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&candidate).unwrap()).unwrap();
+        for subcommand in ["check", "format"] {
+            let result = command_for_core(&core)
+                .arg(subcommand)
+                .arg("-c")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "b609 {subcommand} (debug logging={}): {}",
+                logging,
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
     }
 }
 
@@ -457,14 +609,20 @@ fn b609_connect_observes_managed_multi_answer_guards() {
     let Some(core) = fixed_core_or_skip("D1 managed multi-answer CONNECT") else {
         return;
     };
-    let (dns_addr, dns_stop) = spawn_dns();
-    let (a_addr, a_rx, a_stop) = spawn_observer();
-    let (b_addr, b_rx, b_stop) = spawn_observer();
+    let (dns_addr, dns_rx, dns_stop) = spawn_dns();
+    let (a_addr, a_rx, a_events, a_stop) = spawn_observer();
+    let (b_addr, b_rx, b_events, b_stop) = spawn_observer();
     let _stop = StopOnDrop(vec![dns_stop, a_stop, b_stop]);
     let inbound = SocketAddr::from(([127, 0, 0, 1], free_port()));
-    let wire = connect_fixture(dns_addr, inbound, a_addr, b_addr);
+    let mut wire = connect_fixture(dns_addr, inbound, a_addr, b_addr);
+    let routes = route_summary(&wire);
+    // Only this loopback fixture enables core logging. Failure output below
+    // selects route/DNS lines and never dumps the config or endpoint material.
+    wire["log"]["disabled"] = json!(false);
+    wire["log"]["level"] = json!("debug");
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("d1-connect.json");
+    let log_path = temp.path().join("d1-core.log");
     std::fs::write(&path, serde_json::to_vec_pretty(&wire).unwrap()).unwrap();
     let check = command_for_core(&core)
         .args(["check", "-c"])
@@ -476,22 +634,34 @@ fn b609_connect_observes_managed_multi_answer_guards() {
         "{}",
         String::from_utf8_lossy(&check.stderr)
     );
+    let log = std::fs::File::create(&log_path).unwrap();
     let _child = KillOnDrop(
         with_run(command_for_core(&core))
             .arg("-c")
             .arg(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
             .spawn()
             .unwrap(),
     );
     wait_listening(inbound);
 
-    assert!(connect(inbound, "same-owner.test"));
-    assert!(a_rx
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap()
-        .starts_with("100.80."));
+    let reply = connect(inbound, "same-owner.test");
+    let observed_a = a_rx.recv_timeout(Duration::from_secs(2));
+    if reply != Ok(0)
+        || !matches!(&observed_a, Ok(target) if ["100.80.4.1", "100.80.5.1"].contains(&target.as_str()))
+    {
+        panic!(
+            "same-owner CONNECT reply={reply:?}, observer-a={observed_a:?}, \
+             observer-b={:?}, dns-queries={:?}, a-events={:?}, b-events={:?}, \
+             wire-route={routes}, core-route-logs={:?}",
+            b_rx.try_iter().collect::<Vec<_>>(),
+            dns_rx.try_iter().collect::<Vec<_>>(),
+            a_events.try_iter().collect::<Vec<_>>(),
+            b_events.try_iter().collect::<Vec<_>>(),
+            core_route_logs(&log_path),
+        );
+    }
     for name in [
         "cross-owner.test",
         "cross-reject.test",
@@ -501,7 +671,11 @@ fn b609_connect_observes_managed_multi_answer_guards() {
         "override-domain-fail.test",
         "ipv6-cross.test",
     ] {
-        assert!(!connect(inbound, name), "{name} must reject before dialing");
+        assert_ne!(
+            connect(inbound, name),
+            Ok(0),
+            "{name} must reject before dialing"
+        );
         assert!(
             a_rx.recv_timeout(Duration::from_millis(100)).is_err(),
             "{name} reached owner A"
@@ -513,7 +687,7 @@ fn b609_connect_observes_managed_multi_answer_guards() {
     }
     for name in ["override-atoms.test", "override-domain.test"] {
         assert!(
-            connect(inbound, name),
+            connect(inbound, name) == Ok(0),
             "{name} must keep its valid override"
         );
         assert!(b_rx
@@ -521,7 +695,7 @@ fn b609_connect_observes_managed_multi_answer_guards() {
             .unwrap()
             .starts_with("100.80."));
     }
-    assert!(connect(inbound, "ipv6-owner.test"));
+    assert_eq!(connect(inbound, "ipv6-owner.test"), Ok(0));
     assert_eq!(
         a_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         "fd7a:115c:a1e0:1::9"
