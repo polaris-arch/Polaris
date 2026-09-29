@@ -37,8 +37,10 @@
 //! backend 启动重叠；macOS/Windows 未提供同等级 native reap 证明。后续若要消费证明放行
 //! 新启动，须同时解决 helper-client 对未投递拒绝/等待调度的区分，不能复用普通 `ERR start`。
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read};
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
@@ -49,9 +51,12 @@ use crate::platform::accept_retry::{LogThrottle, ACCEPT_LOG_INTERVAL};
 use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
 use crate::platform::linux::ops::set_forward_prod;
 use crate::platform::linux::state::{
-    CoreHandle, CoreSpawner, HandlerState, ManagedChild, ReapBlockerState, SpawnCoreRequest,
-    SpawnError, SpawnedCore, StartAdmission, StopReap,
+    BirthAdmission, CoreHandle, CoreSpawner, HandlerState, ManagedChild, ReapBlockerState,
+    SpawnCoreRequest, SpawnError, SpawnedCore, StartAdmission, StopReap,
 };
+use polaris_helper_proto::HelperBirthTarget;
+
+const REAP_TOMBSTONES: usize = 64;
 
 /// 默认 socket 路径（移植自 Go flag default `/run/polaris/helper.sock`，:18）。
 pub const DEFAULT_SOCK_PATH: &str = "/run/polaris/helper.sock";
@@ -496,6 +501,8 @@ pub struct AmbientCapsSpawner {
     state: Arc<Mutex<HandlerState>>,
     /// 在途 child 槽。Start 会扫描全部槽；只有 native reap 后才移除对应 birth。
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    /// Published under the slots lock, so removal and proof are atomic to readers.
+    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
     /// 在途后台 terminate 计数（SIGTERM 退出前 waitReaps 等它归零）。
     reaps: Arc<ReapGroup>,
 }
@@ -552,6 +559,7 @@ impl AmbientCapsSpawner {
         Self {
             state,
             slots: Arc::new(Mutex::new(Vec::new())),
+            tombstones: Arc::new(Mutex::new(VecDeque::new())),
             reaps: ReapGroup::new(),
         }
     }
@@ -625,6 +633,52 @@ impl AmbientCapsSpawner {
         }
     }
 
+    fn scan_birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        let Ok(slots) = self.slots.lock() else {
+            return BirthAdmission::Blocked {
+                target: current_running.and_then(CoreHandle::target),
+                state: ReapBlockerState::Unknown,
+            };
+        };
+        let mut current_pending = None;
+        let mut blocker = None;
+        for slot in slots.iter() {
+            let fact = slot.reap_fact();
+            if matches!(fact, LocalReapFact::Reaped(_)) {
+                continue;
+            }
+            let target = slot.handle.target();
+            let state = if matches!(fact, LocalReapFact::Unknown) {
+                ReapBlockerState::Unknown
+            } else {
+                ReapBlockerState::Pending
+            };
+            if target.is_some()
+                && current_running.is_some_and(|current| slot.handle.same_birth(current))
+                && state == ReapBlockerState::Pending
+            {
+                current_pending = target;
+            } else if blocker.is_none() || state == ReapBlockerState::Unknown {
+                blocker = Some((target, state));
+            }
+        }
+        if let Some((target, state)) = blocker {
+            return BirthAdmission::Blocked { target, state };
+        }
+        if let Some(target) = current_pending {
+            return BirthAdmission::Already(target);
+        }
+        if let Some(current) = current_running {
+            if !slots.iter().any(|slot| slot.handle.same_birth(current)) {
+                return BirthAdmission::Blocked {
+                    target: current.target(),
+                    state: ReapBlockerState::Unknown,
+                };
+            }
+        }
+        BirthAdmission::Admitted
+    }
+
     /// 等在途后台 terminate 归零（对照 Go `waitReaps`）。SIGTERM 退出兜底用。
     pub fn wait_reaps(&self, timeout: Duration) {
         self.reaps.wait(timeout);
@@ -641,6 +695,65 @@ impl AmbientCapsSpawner {
 impl CoreSpawner for AmbientCapsSpawner {
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         self.scan_start_admission(current_running)
+    }
+
+    fn birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        self.scan_birth_admission(current_running)
+    }
+
+    fn has_exact_birth(&self) -> bool {
+        self.slots.lock().map_or(true, |slots| {
+            slots.iter().any(|slot| {
+                slot.handle.target().is_some()
+                    && !matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+            })
+        })
+    }
+
+    fn stop_birth(&self, target: &HelperBirthTarget) -> StopReap {
+        let Ok(slots) = self.slots.lock() else {
+            return StopReap::Unknown;
+        };
+        let slot = slots
+            .iter()
+            .find(|slot| slot.handle.target().as_ref() == Some(target))
+            .cloned();
+        if slot.is_none() {
+            return self.tombstones.lock().map_or(StopReap::Unknown, |proofs| {
+                if proofs.contains(target) {
+                    StopReap::Reaped
+                } else {
+                    StopReap::Unknown
+                }
+            });
+        }
+        drop(slots);
+        let slot = slot.expect("checked above");
+        let (outcome, start_worker) = slot.begin_or_poll_termination();
+        if start_worker {
+            let reaps = Arc::clone(&self.reaps);
+            reaps.add();
+            std::thread::spawn(move || {
+                terminate_slot(&slot);
+                reaps.done();
+            });
+        }
+        outcome
+    }
+
+    fn reaped_birth(&self, target: &HelperBirthTarget) -> bool {
+        let Ok(slots) = self.slots.lock() else {
+            return false;
+        };
+        if slots.iter().any(|slot| {
+            slot.handle.target().as_ref() == Some(target)
+                && matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+        }) {
+            return true;
+        }
+        self.tombstones
+            .lock()
+            .is_ok_and(|proofs| proofs.contains(target))
     }
 
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
@@ -719,7 +832,15 @@ impl CoreSpawner for AmbientCapsSpawner {
         }
         let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
 
-        let handle = CoreHandle::new(pid);
+        let handle = match req.birth {
+            Some(token) => CoreHandle::exact(
+                NonZeroU32::new(pid).ok_or_else(|| SpawnError::Spawn {
+                    detail: "spawn returned PID 0".into(),
+                })?,
+                token,
+            ),
+            None => CoreHandle::new(pid),
+        };
         let slot = ChildSlot::from_child(child, handle.clone());
         self.slots
             .lock()
@@ -732,6 +853,7 @@ impl CoreSpawner for AmbientCapsSpawner {
             Arc::clone(&self.state),
             Arc::clone(&slot),
             Arc::clone(&self.slots),
+            Arc::clone(&self.tombstones),
         );
 
         // Go :475-477：if ppid>0 { go watchParent(ppid, c, done) }。
@@ -835,6 +957,7 @@ fn clear_reaped_birth(
     proof: &HelperBirthReaped,
     state: &Arc<Mutex<HandlerState>>,
     slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
 ) {
     {
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -845,10 +968,18 @@ fn clear_reaped_birth(
             g.child = None;
         }
     }
-    slots
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .retain(|s| !s.handle.same_birth(&proof.birth));
+    let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = slots.len();
+    slots.retain(|s| !s.handle.same_birth(&proof.birth));
+    if slots.len() != before {
+        if let Some(target) = proof.birth.target() {
+            let mut tombstones = tombstones.lock().unwrap_or_else(PoisonError::into_inner);
+            if tombstones.len() == REAP_TOMBSTONES {
+                tombstones.pop_front();
+            }
+            tombstones.push_back(target);
+        }
+    }
 }
 
 /// 收割线程：仅真实 `Child::try_wait()` 成功才清本 birth；Err 留 Unknown custody。
@@ -857,8 +988,9 @@ fn spawn_reaper(
     state: Arc<Mutex<HandlerState>>,
     slot: Arc<ChildSlot>,
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
 ) {
-    std::thread::spawn(move || run_reaper(&handle, &state, &slot, &slots));
+    std::thread::spawn(move || run_reaper(&handle, &state, &slot, &slots, &tombstones));
 }
 
 fn run_reaper(
@@ -866,6 +998,7 @@ fn run_reaper(
     state: &Arc<Mutex<HandlerState>>,
     slot: &Arc<ChildSlot>,
     slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
 ) {
     let proof = loop {
         match slot.reap_fact() {
@@ -880,7 +1013,7 @@ fn run_reaper(
             }
         }
     };
-    clear_reaped_birth(&proof, state, slots);
+    clear_reaped_birth(&proof, state, slots, tombstones);
 }
 
 /// 父死看护线程（Go `watchParent`，:258-285）。每 1s tick：child 退出→停；非当前 child→停；父死→摘+terminate。

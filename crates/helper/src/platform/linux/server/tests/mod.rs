@@ -426,6 +426,198 @@ fn scripted_slot(pid: u32, steps: Vec<std::io::Result<Option<ExitStatus>>>) -> A
     )
 }
 
+fn exact_scripted_slot(
+    pid: u32,
+    byte: u8,
+    steps: Vec<std::io::Result<Option<ExitStatus>>>,
+) -> Arc<ChildSlot> {
+    ChildSlot::with_waiter(
+        CoreHandle::exact(
+            NonZeroU32::new(pid).unwrap(),
+            polaris_helper_proto::HelperBirthToken::from_bytes([byte; 16]),
+        ),
+        Box::new(ScriptedWaiter {
+            steps: steps.into(),
+        }),
+    )
+}
+
+#[test]
+fn hidden_birth_blocks_exact_admission_without_inventing_empty_or_already() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let hidden = exact_scripted_slot(4242, 1, vec![Ok(None)]);
+    let target = hidden.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(hidden);
+    assert_eq!(
+        spawner.scan_birth_admission(None),
+        BirthAdmission::Blocked {
+            target: Some(target),
+            state: ReapBlockerState::Pending,
+        }
+    );
+    assert!(spawner.has_exact_birth());
+
+    let legacy = ChildSlot::new(4243);
+    spawner.slots.lock().unwrap().push(legacy);
+    assert!(matches!(
+        spawner.scan_birth_admission(None),
+        BirthAdmission::Blocked { .. }
+    ));
+}
+
+#[test]
+fn state_held_birth_without_native_slot_is_unknown_not_empty() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let missing = CoreHandle::exact(
+        NonZeroU32::new(5151).unwrap(),
+        polaris_helper_proto::HelperBirthToken::from_bytes([3; 16]),
+    );
+    assert_eq!(
+        spawner.scan_birth_admission(Some(&missing)),
+        BirthAdmission::Blocked {
+            target: missing.target(),
+            state: ReapBlockerState::Unknown,
+        }
+    );
+}
+
+#[test]
+fn native_reap_tombstone_serves_late_stop_but_not_restarted_helper() {
+    use std::os::unix::process::ExitStatusExt;
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    let old = exact_scripted_slot(4242, 1, vec![Ok(Some(ExitStatus::from_raw(0)))]);
+    let old_target = old.handle.target().unwrap();
+    state.lock().unwrap().child = Some(ManagedChild::Running(old.handle.clone()));
+    spawner.slots.lock().unwrap().push(Arc::clone(&old));
+    run_reaper(
+        &old.handle,
+        &state,
+        &old,
+        &spawner.slots,
+        &spawner.tombstones,
+    );
+    assert!(state.lock().unwrap().child.is_none());
+    assert!(spawner.slots.lock().unwrap().is_empty());
+    assert_eq!(spawner.stop_birth(&old_target), StopReap::Reaped);
+
+    let successor = exact_scripted_slot(4242, 2, vec![Ok(None)]);
+    let successor_target = successor.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(Arc::clone(&successor));
+    assert_eq!(
+        spawner.stop_birth(&old_target),
+        StopReap::Reaped,
+        "late old Stop must not signal a successor with a reused PID"
+    );
+    assert!(matches!(successor.reap_fact(), LocalReapFact::Pending));
+    assert!(!successor.custody.lock().unwrap().termination_started);
+    assert_ne!(old_target, successor_target);
+
+    let restarted = AmbientCapsSpawner::new(Arc::new(Mutex::new(HandlerState::new())));
+    assert_eq!(
+        restarted.stop_birth(&old_target),
+        StopReap::Unknown,
+        "a daemon restart has no proof of the previous birth"
+    );
+}
+
+#[test]
+fn tombstones_are_bounded_and_only_native_reap_populates_them() {
+    use std::os::unix::process::ExitStatusExt;
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    let mut first = None;
+    let mut last = None;
+    for byte in 0..=REAP_TOMBSTONES as u8 {
+        let slot = exact_scripted_slot(
+            u32::from(byte) + 1,
+            byte,
+            vec![Ok(Some(ExitStatus::from_raw(0)))],
+        );
+        let target = slot.handle.target().unwrap();
+        first.get_or_insert(target);
+        last = Some(target);
+        spawner.slots.lock().unwrap().push(Arc::clone(&slot));
+        run_reaper(
+            &slot.handle,
+            &state,
+            &slot,
+            &spawner.slots,
+            &spawner.tombstones,
+        );
+    }
+    assert_eq!(spawner.tombstones.lock().unwrap().len(), REAP_TOMBSTONES);
+    assert_eq!(spawner.stop_birth(&first.unwrap()), StopReap::Unknown);
+    assert_eq!(spawner.stop_birth(&last.unwrap()), StopReap::Reaped);
+
+    let unknown = exact_scripted_slot(
+        9999,
+        99,
+        vec![Err(std::io::Error::other("native wait failed"))],
+    );
+    let unknown_target = unknown.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(Arc::clone(&unknown));
+    run_reaper(
+        &unknown.handle,
+        &state,
+        &unknown,
+        &spawner.slots,
+        &spawner.tombstones,
+    );
+    assert_eq!(spawner.stop_birth(&unknown_target), StopReap::Unknown);
+    assert!(spawner
+        .slots
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|slot| slot.handle.same_birth(&unknown.handle)));
+}
+
+#[test]
+fn slot_removal_and_tombstone_publish_share_one_registry_lock_domain() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::mpsc;
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = Arc::new(AmbientCapsSpawner::new(Arc::clone(&state)));
+    let slot = exact_scripted_slot(5252, 5, vec![Ok(Some(ExitStatus::from_raw(0)))]);
+    let target = slot.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(Arc::clone(&slot));
+    let LocalReapFact::Reaped(proof) = slot.reap_fact() else {
+        panic!("native wait must reap")
+    };
+    let tombstone_lock = spawner.tombstones.lock().unwrap();
+    let clear_slots = Arc::clone(&spawner.slots);
+    let clear_tombstones = Arc::clone(&spawner.tombstones);
+    let clear_state = Arc::clone(&state);
+    let clear = std::thread::spawn(move || {
+        clear_reaped_birth(&proof, &clear_state, &clear_slots, &clear_tombstones)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while spawner.slots.try_lock().is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clear never acquired registry lock"
+        );
+        std::thread::yield_now();
+    }
+    let query_spawner = Arc::clone(&spawner);
+    let (tx, rx) = mpsc::channel();
+    let query = std::thread::spawn(move || tx.send(query_spawner.stop_birth(&target)).unwrap());
+    assert!(
+        rx.recv_timeout(Duration::from_millis(30)).is_err(),
+        "Stop must not observe slot deletion before tombstone publication"
+    );
+    drop(tombstone_lock);
+    clear.join().unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        StopReap::Reaped
+    );
+    query.join().unwrap();
+}
+
 #[test]
 fn native_wait_error_retains_unknown_custody_and_blocks_signal() {
     let slot = scripted_slot(421, vec![Err(std::io::Error::other("fake wait failure"))]);
@@ -486,7 +678,13 @@ fn failed_native_wait_cannot_clear_handler_or_registry_when_reaper_finishes() {
     let state = Arc::new(Mutex::new(HandlerState::new()));
     state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
     let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
-    run_reaper(&slot.handle, &state, &slot, &slots);
+    run_reaper(
+        &slot.handle,
+        &state,
+        &slot,
+        &slots,
+        &Arc::new(Mutex::new(VecDeque::new())),
+    );
     assert!(state
         .lock()
         .unwrap()
@@ -541,7 +739,12 @@ fn late_old_birth_reaper_cannot_clear_successor_with_reused_pid() {
     let LocalReapFact::Reaped(old_proof) = old.reap_fact() else {
         panic!("old native wait must produce a same-birth fact");
     };
-    clear_reaped_birth(&old_proof, &state, &slots);
+    clear_reaped_birth(
+        &old_proof,
+        &state,
+        &slots,
+        &Arc::new(Mutex::new(VecDeque::new())),
+    );
     assert!(state
         .lock()
         .unwrap()
@@ -561,7 +764,13 @@ fn mismatched_reaper_handle_cannot_clear_reaped_slot() {
     let state = Arc::new(Mutex::new(HandlerState::new()));
     state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
     let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
-    run_reaper(&wrong, &state, &slot, &slots);
+    run_reaper(
+        &wrong,
+        &state,
+        &slot,
+        &slots,
+        &Arc::new(Mutex::new(VecDeque::new())),
+    );
     assert!(state
         .lock()
         .unwrap()
@@ -676,6 +885,7 @@ fn production_stop_poll_is_pending_until_native_reaper_clears_birth() {
         Arc::clone(&state),
         Arc::clone(&slot),
         Arc::clone(&spawner.slots),
+        Arc::clone(&spawner.tombstones),
     );
 
     assert_eq!(

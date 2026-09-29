@@ -12,8 +12,17 @@
 //!
 //! 真实 AmbientCaps fork 链由 `server::AmbientCapsSpawner` 实现；降权与能力传递仍须真机复验。
 
+use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Wire-visible identity is present only for a new exact-birth Start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BirthMode {
+    Legacy,
+    Exact(HelperBirthToken),
+}
 
 /// 已 spawn 的 sing-box 子进程句柄（对应 Go `child *exec.Cmd`）。
 #[derive(Debug, Clone)]
@@ -21,6 +30,7 @@ pub struct CoreHandle {
     /// 子进程 pid（Go `child.Process.Pid`）。
     pub pid: u32,
     birth: Arc<()>,
+    mode: BirthMode,
 }
 
 impl CoreHandle {
@@ -31,6 +41,27 @@ impl CoreHandle {
         Self {
             pid,
             birth: Arc::new(()),
+            mode: BirthMode::Legacy,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn exact(pid: NonZeroU32, token: HelperBirthToken) -> Self {
+        Self {
+            pid: pid.get(),
+            birth: Arc::new(()),
+            mode: BirthMode::Exact(token),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn target(&self) -> Option<HelperBirthTarget> {
+        match self.mode {
+            BirthMode::Legacy => None,
+            BirthMode::Exact(birth) => Some(HelperBirthTarget {
+                pid: NonZeroU32::new(self.pid)?,
+                birth,
+            }),
         }
     }
 
@@ -54,6 +85,8 @@ pub struct SpawnedCore {
 /// start 命令的 spawn 请求（对照 Go `exec.Command(coreBin(), "run", "-c", cfg)` + Credential + AmbientCaps，:431-442）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCoreRequest {
+    /// Exact start supplies a token minted before any forwarding or spawn.
+    pub birth: Option<HelperBirthToken>,
     /// sing-box 二进制路径（已校验 == coreDir/sing-box）。
     pub binary: PathBuf,
     /// 配置文件路径（已校验属主 == 对端 uid）。
@@ -102,6 +135,18 @@ pub enum StartAdmission {
     Blocked { pid: u32, state: ReapBlockerState },
 }
 
+/// Exact Start scans all physical slots. A Legacy/hidden or unobservable slot
+/// cannot produce an exact identity, and therefore cannot be `Already`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BirthAdmission {
+    Admitted,
+    Already(HelperBirthTarget),
+    Blocked {
+        target: Option<HelperBirthTarget>,
+        state: ReapBlockerState,
+    },
+}
+
 /// One bounded Stop poll. Only `Reaped` authorizes a successful Stop ACK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReap {
@@ -119,6 +164,32 @@ pub trait CoreSpawner: Send + Sync {
         current_running.map_or(StartAdmission::Admitted, |handle| StartAdmission::Already {
             pid: handle.pid,
         })
+    }
+    fn birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        match current_running {
+            Some(handle) => handle.target().map_or(
+                BirthAdmission::Blocked {
+                    target: None,
+                    state: ReapBlockerState::Unknown,
+                },
+                BirthAdmission::Already,
+            ),
+            None => BirthAdmission::Admitted,
+        }
+    }
+    /// Exact Stop checks the physical slot first, then a bounded native-reap
+    /// tombstone. A missing target is Unknown, never no-owner success.
+    fn stop_birth(&self, _target: &HelperBirthTarget) -> StopReap {
+        StopReap::Unknown
+    }
+    /// A late Stop may acknowledge an earlier birth after a successor starts,
+    /// but only when the old native Child has actually been reaped.
+    fn reaped_birth(&self, _target: &HelperBirthTarget) -> bool {
+        false
+    }
+    /// Legacy mutating commands cannot act while an exact birth is retained.
+    fn has_exact_birth(&self) -> bool {
+        false
     }
     /// spawn sing-box 子进程（AmbientCaps 拉核）。
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError>;

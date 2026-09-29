@@ -4,7 +4,8 @@ use super::*;
 use crate::platform::linux::auth::{NoPeerCred, StaticPeerCred};
 use crate::platform::linux::ops::{SystemdAction, SystemdOps, SystemdResult};
 use crate::platform::linux::state::{
-    CoreHandle, CoreSpawner, ManagedChild, ReapBlockerState, SpawnedCore, StartAdmission, StopReap,
+    BirthAdmission, CoreHandle, CoreSpawner, ManagedChild, ReapBlockerState, SpawnedCore,
+    StartAdmission, StopReap,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
@@ -32,6 +33,9 @@ impl Conn for MockConn {
     fn read_line(&mut self) -> String {
         self.reads.lock().unwrap().pop_front().unwrap_or_default()
     }
+    fn read_line_strict(&mut self) -> Result<Option<String>, StrictReadError> {
+        Ok(self.reads.lock().unwrap().pop_front())
+    }
     fn write_line(&mut self, line: &str) -> bool {
         self.writes.lock().unwrap().push(line.to_string());
         true
@@ -47,7 +51,11 @@ struct MockSpawner {
     terminate_calls: StdMutex<Vec<u32>>,
     kill_calls: StdMutex<Vec<u32>>,
     start_admission: StdMutex<Option<StartAdmission>>,
+    birth_admission: StdMutex<Option<BirthAdmission>>,
     terminate_results: StdMutex<std::collections::VecDeque<StopReap>>,
+    birth_stop_results: StdMutex<std::collections::VecDeque<StopReap>>,
+    birth_stop_calls: StdMutex<Vec<polaris_helper_proto::HelperBirthTarget>>,
+    reaped_births: StdMutex<Vec<polaris_helper_proto::HelperBirthTarget>>,
 }
 
 impl MockSpawner {
@@ -59,7 +67,11 @@ impl MockSpawner {
             terminate_calls: StdMutex::new(Vec::new()),
             kill_calls: StdMutex::new(Vec::new()),
             start_admission: StdMutex::new(None),
+            birth_admission: StdMutex::new(None),
             terminate_results: StdMutex::new(std::collections::VecDeque::new()),
+            birth_stop_results: StdMutex::new(std::collections::VecDeque::new()),
+            birth_stop_calls: StdMutex::new(Vec::new()),
+            reaped_births: StdMutex::new(Vec::new()),
         }
     }
 }
@@ -73,6 +85,31 @@ impl CoreSpawner for MockSpawner {
         })
     }
 
+    fn birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        self.birth_admission.lock().unwrap().unwrap_or_else(|| {
+            current_running.map_or(BirthAdmission::Admitted, |handle| {
+                handle.target().map_or(
+                    BirthAdmission::Blocked {
+                        target: None,
+                        state: ReapBlockerState::Unknown,
+                    },
+                    BirthAdmission::Already,
+                )
+            })
+        })
+    }
+    fn stop_birth(&self, target: &polaris_helper_proto::HelperBirthTarget) -> StopReap {
+        self.birth_stop_calls.lock().unwrap().push(*target);
+        self.birth_stop_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(StopReap::Unknown)
+    }
+    fn reaped_birth(&self, target: &polaris_helper_proto::HelperBirthTarget) -> bool {
+        self.reaped_births.lock().unwrap().contains(target)
+    }
+
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
         self.spawn_calls.lock().unwrap().push(req.clone());
         if self.fail {
@@ -82,7 +119,10 @@ impl CoreSpawner for MockSpawner {
         }
         let pid = self.next_pid;
         Ok(SpawnedCore {
-            handle: CoreHandle::new(pid),
+            handle: req.birth.map_or_else(
+                || CoreHandle::new(pid),
+                |birth| CoreHandle::exact(std::num::NonZeroU32::new(pid).unwrap(), birth),
+            ),
             process_ms: 0,
             log_handoff_ms: 0,
         })
@@ -258,6 +298,334 @@ fn no_op_fwd() -> impl Fn(bool) {
 
 fn no_op_ss() -> impl Fn(&str) -> Option<String> {
     move |_: &str| None
+}
+
+fn exact_handle(pid: u32, hex: &str) -> CoreHandle {
+    CoreHandle::exact(
+        std::num::NonZeroU32::new(pid).unwrap(),
+        HelperBirthToken::parse_wire(hex).unwrap(),
+    )
+}
+
+const BIRTH_ONE: &str = "00112233445566778899aabbccddeeff";
+const BIRTH_TWO: &str = "ffeeddccbbaa99887766554433221100";
+
+#[test]
+fn exact_start_status_and_stop_keep_a_single_birth_identity() {
+    let (dir, auth, core_dir) = setup_env();
+    let cfg = dir.path().join("cfg.json");
+    std::fs::write(&cfg, b"{}").unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let peer = StaticPeerCred::new(uid, uid);
+    let cred = PeerCred { uid, gid: uid };
+    let spawner = MockSpawner::succeeding(7777);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let mut state = HandlerState::new();
+    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
+    let cfg = cfg.to_string_lossy().into_owned();
+    let mut start = MockConn::new(vec![&sb, &cfg, "", "1", ""]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
+    let Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started { target, .. })) =
+        Response::parse(&start.writes()[0])
+    else {
+        panic!("exact start did not return target")
+    };
+    assert_eq!(target.pid.get(), 7777);
+    assert_eq!(
+        spawner.spawn_calls.lock().unwrap()[0].birth,
+        Some(target.birth)
+    );
+    assert_eq!(
+        state.child.as_ref().unwrap().handle().target(),
+        Some(target)
+    );
+
+    let mut already = MockConn::new(vec![&sb, &cfg, "", "1", ""]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_BIRTH_SAFE,
+        &mut already,
+    );
+    assert_eq!(
+        Response::parse(&already.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Already {
+            target
+        }))
+    );
+    assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
+
+    let mut status = MockConn::new(vec![]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::STATUS_BIRTH_SAFE,
+        &mut status,
+    );
+    assert_eq!(
+        Response::parse(&status.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running {
+            target
+        }))
+    );
+
+    spawner
+        .birth_stop_results
+        .lock()
+        .unwrap()
+        .extend([StopReap::Pending, StopReap::Reaped]);
+    let pid = target.pid.to_string();
+    let token = target.birth.to_wire();
+    let mut pending = MockConn::new(vec![&pid, &token]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::STOP_BIRTH_SAFE,
+        &mut pending,
+    );
+    assert_eq!(
+        Response::parse(&pending.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Pending {
+            target
+        }))
+    );
+    assert!(matches!(state.child, Some(ManagedChild::Stopping(_))));
+    assert_eq!(*forwards.lock().unwrap(), [true]);
+    let mut stopping = MockConn::new(vec![]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::STATUS_BIRTH_SAFE,
+        &mut stopping,
+    );
+    assert_eq!(
+        Response::parse(&stopping.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Stopping {
+            target
+        }))
+    );
+    let mut reaped = MockConn::new(vec![&pid, &token]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::STOP_BIRTH_SAFE, &mut reaped);
+    assert_eq!(
+        Response::parse(&reaped.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
+            target
+        }))
+    );
+    assert!(state.child.is_none());
+    assert_eq!(*forwards.lock().unwrap(), [true, false]);
+}
+
+#[test]
+fn exact_stop_rejects_mismatch_and_bad_frames_without_mutation() {
+    let (_dir, auth, _core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd = no_op_fwd();
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let current = exact_handle(42, BIRTH_ONE);
+    let mut state = HandlerState {
+        child: Some(ManagedChild::Running(current.clone())),
+    };
+    for args in [
+        vec!["0", BIRTH_ONE],
+        vec!["42", BIRTH_TWO, BIRTH_TWO],
+        vec!["42", "00112233445566778899AABBCCDDEEFF"],
+        vec!["42"],
+    ] {
+        let mut conn = MockConn::new(args);
+        dispatch_locked(&mut state, &deps, &cred, lcmd::STOP_BIRTH_SAFE, &mut conn);
+        assert_eq!(conn.writes(), ["ERR bad-args"]);
+    }
+    let mut wrong = MockConn::new(vec!["42", BIRTH_TWO]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::STOP_BIRTH_SAFE, &mut wrong);
+    assert!(matches!(
+        Response::parse(&wrong.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStop(
+            LinuxBirthStop::Mismatch { .. }
+        ))
+    ));
+    assert!(state.child.as_ref().unwrap().handle().same_birth(&current));
+    assert!(spawner.birth_stop_calls.lock().unwrap().is_empty());
+
+    let old = exact_handle(42, BIRTH_TWO).target().unwrap();
+    spawner.reaped_births.lock().unwrap().push(old);
+    let mut late = MockConn::new(vec!["42", BIRTH_TWO]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::STOP_BIRTH_SAFE, &mut late);
+    assert_eq!(
+        Response::parse(&late.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
+            target: old
+        }))
+    );
+    assert!(state.child.as_ref().unwrap().handle().same_birth(&current));
+    assert!(spawner.birth_stop_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
+    let (_dir, auth, _core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let old = exact_handle(42, BIRTH_ONE);
+    let target = old.target().unwrap();
+    let mut state = HandlerState {
+        child: Some(ManagedChild::Stopping(old)),
+    };
+    let mut conn = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut conn);
+    assert_eq!(
+        Response::parse(&conn.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStart(
+            LinuxBirthStart::NotAdmittedPending { target }
+        ))
+    );
+    assert!(matches!(state.child, Some(ManagedChild::Stopping(_))));
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+}
+
+#[test]
+fn hidden_legacy_custody_never_reports_exact_empty_or_spawns() {
+    let (_dir, auth, _core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    *spawner.birth_admission.lock().unwrap() = Some(BirthAdmission::Blocked {
+        target: None,
+        state: ReapBlockerState::Pending,
+    });
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let mut state = HandlerState::new();
+    let mut status = MockConn::new(vec![]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::STATUS_BIRTH_SAFE,
+        &mut status,
+    );
+    assert_eq!(status.writes(), ["ERR unknown"]);
+    let mut start = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
+    assert_eq!(
+        Response::parse(&start.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStart(
+            LinuxBirthStart::NotAdmittedUnknown { target: None }
+        ))
+    );
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+}
+
+#[test]
+fn exact_commands_reject_extra_lines_before_custody_changes() {
+    let (_dir, auth, _core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let mut state = HandlerState::new();
+    let mut status = MockConn::new(vec!["unexpected"]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::STATUS_BIRTH_SAFE,
+        &mut status,
+    );
+    assert_eq!(status.writes(), ["ERR bad-args"]);
+    let mut start = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", "", "extra"]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
+    assert_eq!(start.writes(), ["ERR bad-args"]);
+    assert!(state.child.is_none());
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+}
+
+#[test]
+fn legacy_mutating_commands_cannot_touch_exact_birth() {
+    let (_dir, auth, _core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss_calls = StdMutex::new(0);
+    let ss = |_: &str| {
+        *ss_calls.lock().unwrap() += 1;
+        None
+    };
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let current = exact_handle(42, BIRTH_ONE);
+    let mut state = HandlerState {
+        child: Some(ManagedChild::Running(current.clone())),
+    };
+    for command in [
+        cmd::START,
+        lcmd::START_REAP_SAFE,
+        cmd::STOP,
+        lcmd::STOP_REAP_SAFE,
+        cmd::STATUS,
+        cmd::CLEANUP,
+        cmd::FREEPORT,
+        lcmd::INSTALL_CORE,
+    ] {
+        assert!(legacy_command_rejected(command, &state, &spawner));
+    }
+    // These dispatched paths use only mocks if the guard regresses; cleanup's
+    // external pkill is covered by the same pure predicate above.
+    for command in [cmd::STOP, cmd::FREEPORT, cmd::START] {
+        let mut conn = MockConn::new(vec!["9090"]);
+        dispatch_locked(&mut state, &deps, &cred, command, &mut conn);
+        assert_eq!(conn.writes(), ["ERR unknown"]);
+    }
+    assert!(state.child.as_ref().unwrap().handle().same_birth(&current));
+    assert!(spawner.terminate_calls.lock().unwrap().is_empty());
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert_eq!(*ss_calls.lock().unwrap(), 0);
+    assert!(forwards.lock().unwrap().is_empty());
 }
 
 // ===== ping / version（鉴权前）=====
@@ -1155,7 +1523,11 @@ fn start_failure_reports_err_start_and_resets_forward() {
         terminate_calls: StdMutex::new(Vec::new()),
         kill_calls: StdMutex::new(Vec::new()),
         start_admission: StdMutex::new(None),
+        birth_admission: StdMutex::new(None),
         terminate_results: StdMutex::new(std::collections::VecDeque::new()),
+        birth_stop_results: StdMutex::new(std::collections::VecDeque::new()),
+        birth_stop_calls: StdMutex::new(Vec::new()),
+        reaped_births: StdMutex::new(Vec::new()),
     };
     let fp = MockFreePort::empty();
     let systemd = MockSystemd::default();
