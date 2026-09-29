@@ -1,213 +1,84 @@
 ---
-title: Android data-plane batch QA operator procedure
+title: Android batch QA prepared-only evidence foundation
 created: 2026-09-30
 updated: 2026-09-30
-status: prepared-not-device-tested
+status: prepared-only-not-ready
 type: runbook
 ---
 
-本脚本只准备下一次用户在场的**单批次**验收。本次实现没有执行 ADB、连接设备、创建 socket、切换 VPN、网络、策略或 PC peer。Mock 通过和 Java/dex 编译通过不代表真机通过。
+此版本是 **prepared-only，不能执行真机批次或签收 P5/P8**。受限 runtime-policy、per-app VPN、VPN underlying netId/transport、MIUI run-as/app_process、独立进程/listener/forward 清理观察器尚未完成。即使所有输入 fixture 完整且一致，`assess` 也只返回 `NOT_READY`、`claims:[]`、退出码 `2`；没有 PASS 分支。用户在场或填写批准记录均不能解除该限制。
 
-入口：`scripts/android-batch-qa.mjs` 管理不可覆盖的计划、逐阶段回执和失败后恢复回执；`scripts/android-batch-witness.mjs` 提供 PC loopback witness、PC→Android 探测，以及经批准的 Android companion 参数；`scripts/qa/MeshWitness.java` 是可重新编译的 Android witness。Node 使用仓库当前 Debug/Release 包常量，不读取旧 `/tmp` interop 脚本的身份、序列号或私有会话。
+`scripts/android-batch-witness.mjs` 不包含 socket 实现。`--execute`、`serve/probe/androidArgs` 和 `requireNextStage` 从代码层拒绝执行；不会生成可执行 Android argv。Java companion 已收口为**无 socket 的私有 artifact verifier**，没有 echo server/probe/VPN/policy 操作，拒绝 `--execute`。当前只有本地编译、文件 hash、离线 receipt 检查和受限包/进程观察入口。
 
-## 现场前置：任一缺失即停止，先补准备条件
+本轮未执行真实 ADB、app_process、设备或网络操作。Mock 检查与 Java/dex 编译只证明此准备代码的局部性质，不证明 Android、MIUI 或 mesh 数据面。
 
-- 用户已批准本次具体设备和单批次范围，用户持有手机，能恢复 Wi-Fi。采用 USB ADB；经 Wi-Fi 的 ADB 会在 P8 中断。显式传序列号，不执行 `adb connect`、配对或安装 APK。
-- 安装的包与本次唯一 APK 的 SHA-256、构建 source HEAD 已比对。本批次中途不换 APK。默认包为 `com.polaris2.app.debug`；Release 只支持计划和包预检，当前 companion 依赖 `run-as`，无法给 Release 真机作证。
-- 手机已有 Headscale 登录身份、现有节点和分配的 IPv4，**已选中待测 Headscale 节点**，VPN 已停止、无 pending changes；Wi-Fi 已连接，移动数据已开启，飞行模式已关闭。身份缺失时不登录、不注册、不新建节点；交由另一个明确授权的准备步骤。
-- PC 已有可用的同一 Headscale peer 和现有系统/TUN 路由；PC 端 loopback 服务可由其现有 mesh endpoint 的 `target:local` 入站访问。PC→Android 的普通 Node socket 必须确实通过既有 mesh 路径。只有 userspace SOCKS5 的 PC 不满足此 v1 witness 前置；不得使用直连物理地址替代，不得把 SOCKS 会话启动/改路由藏在脚本里。该情况先停止，另行实现/批准 TCP+UDP transport adapter。
-- 两端拟用的高位 TCP/UDP 端口空闲，PC 已有入站授权允许本手机访问这两个端口；本流程不改 PC 策略、防火墙、peer、身份或 VPN。
-- 能从 Android 本机 `dumpsys connectivity` 或已审核的 native network witness 中明确取得 **VPN 正在使用的 underlying 非 VPN 网络**的 transport 与 network handle/netId。VPN interface、通知栏图标、单纯 `wifi_on` 都不够。存在多个活跃物理网络而无法确定 underlying network 时，P8 停止并记录缺证；不得自行填入期望值。
-- 本地 Node ≥24、JDK21、Android SDK d8；输入与回执在一个新建、权限 `0700` 的本地目录中。原始 config、authKey、state file、identity/key 只存在内存，禁止写入计划、事件、报告或分享内容。
-- 只允许一个 operator，期间不并发编辑配置或刷新订阅。现有 `server_update` 没有 CAS/base-version 参数，读回检查不能消除两次 IPC 间的并发覆盖风险；若无法保证独占编辑，停止批次。
+## 已保留的安全基础
 
-`server_switch` 会写后端 MRU history；因此本计划要求基线已选中待测节点，**批次内不调用它**。否则“只还原 selectedServerId”无法保证还原整个原始配置。手机号、Headscale URL、设备序列号和 node id 不写入示例或仓库。
+- 每个 phase 必须有 `beforeSnapshot` 和 `afterSnapshot`。两次观察除 host `observedAtMs` 外完全相等，覆盖配置、实际 runtime policy、per-app VPN、物理 transport/handle、identity、PC baseline、selection、pending changes、开关和 app PID。任一漂移拒绝记录。
+- 四组探测按顺序执行；时间关系必须是 `phase.before < receiver.before < probe.start <= probe.end < receiver.after < phase.after`。不能用结束时的好状态替代发包前证据。所有时间必须由将来的同一个受限 host observer 记录，caller 自填时间不具有观察权威。
+- 双向 TCP/UDP 独立 nonce challenge、发送端精确回显、接收端 unique counters、跨 phase 连续性。负例还需要已生效的 block policy、同期本地健康、出站正例，以及前后入站正例；路由/权限/解析错误不能算拒绝成功。
+- immutable plan 固定 source/编译工具/platform/class jar/DEX hash 和 build receipt hash。每个 receipt/counter 固定 DEX、private manifest、build receipt 三个 hash。复制后的 manifest/DEX 必须用 app UID 的 run-as hash 对拍。
+- private manifest 是**不含外层 planSha256 的 canonical plan body 原始字节**，无换行；它的 SHA 就是 `planSha256`。Java verifier 从 app-owned `0700` nonce cache 读取两个 app-owned 只读文件，自核完整 manifest hash、nonce、Debug package、build receipt hash 和实际 jar hash，不能仅回显传入 digest。
+- 批准 scope 分为 read-only、mutation、Wi-Fi、cleanup；含独立 presence checkpoint，超过 60 秒拒绝。该记录仍是 operator 自述，不证明连续用户在场，因此相关 observer 仍在 missing 列表中。
+- PC counter 路径只能是当前 operator 拥有的真实 `0700` QA root 内、新的 `pc-counters-NONCE.json`；拒绝 symlink root、任意路径和旧计数文件。当前没有创建 counter/socket 的运行实现。
+- 清理不接受 `witnessesStopped/forwardsRemoved/artifactsRemoved` 这类 caller 布尔值。缺少独立 nonce-owned PID/start token、listener、counter、artifact 和本次 ADB forward 观察时，`cleanupEvidence` 只能为 `NOT_OBSERVED`；`abort` 不会声明 restored。
 
-## 1. 只读包/进程预检，随后批准基线采集
+## 本地静态构建与 artifact binding
 
-```bash
-node scripts/android-batch-qa.mjs preflight "$QA_SERIAL" --read-device
-```
-
-该入口仅 `get-state`、`pm list packages`、`pidof`，不会起 Activity 或做 CDP forward，未运行的 app 将失败。需要现有 ADB daemon/授权连接；此命令不验证 VPN/Headscale、WARP、DNS 或网络数据面。
-
-`connectAndroidWebView` 会 `am start` 和创建 ADB forward；`config_get` 首次可能执行 startup maintenance。因此应先取得用户对 attach/维护的明确授权，使用既有 `scripts/android-cdp.mjs` 连接当前 Debug 包，等待维护结束后再冻结基线，不能把这一段描述为只读原始磁盘取证。保存这次 helper 返回的 `close()`，最后只删除自己的 forward。
-
-操作会话使用下列现有 API；每个响应都必须先验证 `success === true`，不得把错误响应投影成默认空配置。保留 `originalNode` 的完整内存副本用于最后恢复，**不落盘**。
-
-```js
-import { connectAndroidWebView, until } from './scripts/android-cdp.mjs';
-import { digest, projectSnapshot, hasPendingChanges, requireNextStage,
-  requireApproval, appendEvent, assessBatch, writePrivateJson } from './scripts/android-batch-qa.mjs';
-const session = await connectAndroidWebView(QA_SERIAL, 'com.polaris2.app.debug');
-const data = async (command, args = {}) => {
-  const r = await session.invoke(command, args);
-  if (r.success !== true) throw new Error(`IPC failed: ${command}`);
-  return r.data;
-};
-const originalConfig = await data('config_get'); // stays in memory
-const originalNode = structuredClone(originalConfig.servers.find(n => n.id === TARGET_ID));
-if (!originalNode || originalNode.protocol !== 'tailscale' || originalConfig.selectedServerId !== TARGET_ID) {
-  throw new Error('Existing selected Headscale endpoint required');
-}
-const capture = async () => projectSnapshot({
-  config: await data('config_get'), targetId: TARGET_ID,
-  identity: await readExistingIdentityInMemory(), // stable existing node ID/key/IP evidence, not backend running state
-  pcState: await readExistingPcStateInMemory(), // existing config/peer/runtime/route snapshot; no witness counters
-  status: await data('proxy_get_status'),
-  pendingChanges: hasPendingChanges(await data('proxy_get_pending_changes')),
-  appPid: Number(session.adb('shell', 'pidof', 'com.polaris2.app.debug').trim()),
-  ...await readUnderlyingNetworkInMemory(),
-  // returns actual physicalTransport, networkHandle, wifiEnabled, cellularEnabled, airplaneEnabled
-});
-```
-
-`readExistingIdentityInMemory`、`readExistingPcStateInMemory` 和 `readUnderlyingNetworkInMemory` 是现场的**证据适配点**：来自用户当前已有状态，必须先完成它们，不能用常量/期望值填充。仓库没有跨 PC 系统和 OEM 的可靠现有通用接口；本脚本不声称自动发现这些事实。底层网络观察可只读执行 `adb -s SERIAL shell dumpsys connectivity`，在本地内存筛出 VPN underlying 的有效非 VPN network record；另外只读观察 `settings get global wifi_on/mobile_data/airplane_mode_on`。不把完整 dumpsys 输出写入回执。
-
-用 `capture()` 创建 `baseline`。manifest 字段固定如下；SHA 一律通过代码算，`targetServerSha256 = digest(TARGET_ID)`、`serialSha256 = sha256(QA_SERIAL)`。现有 config fingerprint、身份和 PC 状态的 SHA 来自 `projectSnapshot`。
-
-```json
-{
-  "schemaVersion": 1,
-  "package": "com.polaris2.app.debug",
-  "serialSha256": "<computed 64 lowercase hex>",
-  "sourceHead": "<verified 40 lowercase hex>",
-  "apkSha256": "<verified installed base APK hash>",
-  "targetServerSha256": "<digest of existing selected server id>",
-  "pcMeshIp": "<observed PC IPv4>",
-  "androidMeshIp": "<observed Android IPv4>",
-  "tcpPort": 40101,
-  "udpPort": 40102,
-  "attempts": 3,
-  "timeoutMs": 1500,
-  "baseline": "<capture() object, not a string in the real file>"
-}
-```
-
-IP 和端口必须来自本次准备，例中的端口只是示例；v1 只支持 IPv4。`plan` 生成随机 192-bit nonce，并绑定完整基线和精确 allowlist。不可覆盖旧文件、复用旧 nonce 或手改计划。
-
-```bash
-node scripts/android-batch-qa.mjs plan "$QA_DIR/manifest.json" "$QA_DIR/plan.json"
-```
-
-## 2. 审批具体计划，准备 witness
-
-用户看过 plan 中动作、两个端口、包和恢复范围并明确批准后，operator 本地写入 `approval.json`（0600），固定字段为 `schemaVersion:1`、`planSha256`、`approvedByOperator:true`、`scopes:plan.scopes`、实际 `issuedAtMs` 与 `expiresAtMs`。最长一小时，不允许未来签发时间。这个记录是操作闸门，不是签名/身份认证，也不能替代用户批准。脚本不自动生成“已批准”记录。
-
-纯本地编译 companion，可在现场前完成；输出目录必须是新的本次目录，不构建/安装 APK：
+在新建、权限 `0700` 的本次 QA root 中编译。显式指定已审核的 JDK21、Android platform jar 和 d8；不构建或安装 APK。
 
 ```bash
 mkdir -p "$QA_DIR/classes"
-"$QA_JAVA_HOME/bin/javac" --release 8 -d "$QA_DIR/classes" scripts/qa/MeshWitness.java
+"$QA_JAVA_HOME/bin/javac" --release 8 -classpath "$QA_ANDROID_JAR" -d "$QA_DIR/classes" scripts/qa/MeshWitness.java
 "$QA_JAVA_HOME/bin/jar" --create --file "$QA_DIR/witness-classes.jar" -C "$QA_DIR/classes" polaris
-JAVA_HOME="$QA_JAVA_HOME" "$QA_D8" --min-api 24 --output "$QA_DIR/witness.dex.jar" "$QA_DIR/witness-classes.jar"
-sha256sum "$QA_DIR/witness.dex.jar"
+JAVA_HOME="$QA_JAVA_HOME" "$QA_D8" --min-api 24 --lib "$QA_ANDROID_JAR" --output "$QA_DIR/witness.dex.jar" "$QA_DIR/witness-classes.jar"
+node scripts/android-batch-qa.mjs build-receipt scripts/qa/MeshWitness.java "$QA_JAVA_HOME/bin/javac" "$QA_D8" "$QA_ANDROID_JAR" "$QA_DIR/witness-classes.jar" "$QA_DIR/witness.dex.jar" "$QA_DIR/witness-build.json"
 ```
 
-先 `requireApproval(plan, approval, 'witness')`。再推送**本次已审核、SHA 一致**的 jar 到新的 `/data/local/tmp/polaris-qa-NONCE/witness.dex.jar`；shell-owned 暂存目录 `0755`、jar `0444`，使 Debug app UID 只读。`run-as com.polaris2.app.debug` 新建 `cache/polaris-qa-NONCE`，权限 `0700`，复制 jar 进去；严禁覆盖先前已有目录。companion 的 counter file 在 app 私有 cache 内。
+build receipt 是具体文件的 hash 记录，不是可重复/密闭构建的认证。本轮本机静态编译的 hash 收据保存在同目录 `android-batch-witness-static-build-2026-09-30.json`；它不包含真机执行证据。所有输出不得覆盖；只保留审核需要的小产物和 receipt。本准备脚本不上传源码、jar、配置或身份。
 
-Android witness 必须以 **Debug app UID** 的 `run-as` 执行，保证其出站实际受此 app 的 VPN 路由控制；shell UID 的 socket 可能被 per-app VPN 排除，不能作证。先记录当前 per-app VPN 是否包含该 app UID，若绕过或无法确认则停止。
-
-所有 helper 命令默认 dry-run，无批准文件也不建 socket、不调用 ADB：
+plan input 固定为 `schemaVersion:1`、明确 Debug/Release package、serial SHA、已核 APK SHA/source HEAD、既有 selected target 的 ID SHA、两端观察到的 IPv4、两个高位 TCP/UDP 端口、`attempts`、`timeoutMs`、absolute `qaRoot`、完整 `witnessBuild` receipt 和基线 snapshot。不存在可用的现场基线适配器，因此当前 plan 只能由明确标识的离线 fixture 准备；不得把 fixture 当现场状态。
 
 ```bash
-node scripts/android-batch-witness.mjs serve "$QA_DIR/plan.json" "$QA_DIR/approval.json" "$QA_DIR/pc-counters.json"
-node scripts/android-batch-witness.mjs android-serve "$QA_DIR/plan.json" "$QA_DIR/approval.json"
+node scripts/android-batch-qa.mjs plan "$QA_DIR/offline-input.json" "$QA_DIR/plan.json"
+node scripts/android-batch-qa.mjs private-manifest "$QA_DIR/plan.json" "$QA_DIR/manifest.json"
+node scripts/android-batch-witness.mjs verify-artifacts "$QA_DIR/plan.json" "$QA_DIR/manifest.json" "$QA_DIR/witness.dex.jar"
 ```
 
-获得批准后才加 `--execute`。PC `serve` 才绑定两个 `127.0.0.1` listener；Android `android-serve` 返回 `APPROVED_COMMAND_ONLY` 的 `argv`，**它不会执行 ADB**。以下函数在 operator 会话中执行已批准的 Android argv，避免字符串插值和 shell 注入；其中 `QA_DIR`、`plan`、`approval` 与显式设备序列号来自本次会话：
+private manifest 输出为 `0444`，无换行；修改 whitespace 也会破坏 hash。`verify-artifacts` 在本地比对精确字节与 DEX，只返回 `NOT_READY`，不使真机执行可用。
 
-```js
-import { execFile, execFileSync } from 'node:child_process';
-import { androidArgs } from './scripts/android-batch-witness.mjs';
-import { sha256 } from './scripts/android-batch-qa.mjs';
-const shellQuote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
-if (sha256(QA_SERIAL) !== plan.serialSha256) throw new Error('Wrong device');
-const jar = `cache/polaris-qa-${plan.nonce}/witness.dex.jar`;
-const androidCommand = (mode, options) => {
-  const argv = androidArgs(plan, approval, mode, options); // rechecks scope/time/plan immediately
-  return ['-s', QA_SERIAL, 'shell', 'run-as', plan.package, 'sh', '-c',
-    shellQuote(`CLASSPATH=${shellQuote(jar)} exec app_process /system/bin polaris.qa.MeshWitness ${argv.map(shellQuote).join(' ')}`)];
-};
-// Foreground child: hold this handle; never kill by an unverified recycled PID.
-const androidWitness = execFile(QA_ADB, androidCommand('serve', []), { timeout: 950000 });
-// For each short probe/health call:
-const androidProbe = (phase, protocol) => JSON.parse(execFileSync(QA_ADB,
-  androidCommand('probe', [phase, protocol]), { encoding: 'utf8', timeout: 90000 }));
-const androidHealth = protocol => JSON.parse(execFileSync(QA_ADB,
-  androidCommand('health', [protocol]), { encoding: 'utf8', timeout: 15000 })).loopbackHealth;
-```
+未来复制适配器必须在批准的 artifact-copy scope 内，将二者复制到 `run-as com.polaris2.app.debug` 的 `cache/polaris-qa-NONCE/{manifest.json,witness.dex.jar}`，root `0700`、文件无写权限；从**同一 app UID**读取两条 SHA 后调用 `verifyCopiedHashOutput`。该函数要求精确两个 nonce 路径和两个 pinned hash。Java `verify NONCE PLAN_SHA MANIFEST_PATH JAR_PATH` 只核 artifact；它不证明 per-app VPN/MIUI/socket 能力。当前没有执行它的 device adapter/命令生成入口，不能靠手工绕过 prepared-only 闸门。
 
-ADB remote shell quoting must be retained exactly; `execFile` alone does not remove Android shell parsing. The helper array above passes one quoted command to `sh -c`. Verify `READY` with the matching plan SHA and both fresh counter objects before traffic. Read Android counters via `adb -s SERIAL exec-out run-as PACKAGE cat cache/polaris-qa-NONCE/counters.json`; read PC counters from its local private file. A partially written JSON is an observation error: retry boundedly, never replace it with zeros. Each server has a maximum 15-minute lease, additionally capped by approval expiry. Expired lease stops the batch; do not restart witness mid-batch.
+## 当前可用的受限只读观察
 
-## 3. 单次启动，按五个 phase 顺序执行
-
-首先记录 `{stage:'baseline', snapshot:await capture()}`；它必须与 plan 完全相等。initial receipt 为 `{schemaVersion:1, planSha256:plan.planSha256, events:[]}`。每次修改前调用 `requireNextStage(plan, receipt, phase, approval, scope)`；任何失败都只允许进入恢复，不能继续测另一个 phase 或刷新基线掩盖失败。
-
-策略修改使用当前 `config_get` 读回的 node，只改 `meshInboundPolicy`，先用 `projectSnapshot` 验证 `invariantsSha256`/identity/PC 状态仍匹配。`server_update({server: {...liveNode, meshInboundPolicy:plan.allowPolicy}})` 成功后，`requireApproval(...,'android-vpn')` 再 `proxy_start`。只启动现有选中节点；不 enroll、不切账号、不换节点。等待 `proxy_get_status` 为 running、不 starting，pending summary 四项全部为空/false。后续策略变更后若仍 pending，在同一批准窗口执行 `proxy_apply_pending_changes`，等待它实际 `applied` 且 pending 为空；`deferred/skipped` 不算 applied。
-
-| phase | 策略 / 实际底层网络 | 必须执行的探测 |
-|---|---|---|
-| `wifi-positive` | 精确端口 allowlist / Wi-Fi | PC→Android 与 Android→PC，各 TCP、UDP，3 个独立 nonce challenge |
-| `policy-negative` | `{mode:'block'}` 真正生效 / Wi-Fi | PC→Android TCP、UDP 拒绝/超时，接收端两个计数均零增长；同期 Android `health` 两协议本地回显成功；Android→PC 两协议继续正常回显 |
-| `policy-restored` | 恢复 plan.allowPolicy / Wi-Fi | 四组合重新正常；与负例前的正例共同排除 listener 故障和单向断路 |
-| `cellular-positive` | allowlist / 关闭 Wi-Fi 后真实 cellular underlying 网络 | 用户手动关 Wi-Fi，保持已开启的移动数据；确认新的 physical handle，再执行四组合新 nonce |
-| `wifi-return` | allowlist / 重开 Wi-Fi 后真实 Wi-Fi underlying 网络 | 用户手动重开 Wi-Fi并等到实际切回；确认 handle 不再是 cellular，再执行四组合新 nonce |
-
-每个 phase 的每个方向/协议**顺序执行**：保存 receiver `before` → 发完整 N 个 challenge → 等 settle → 保存 receiver `after`。健康探测用不同 wire token，不计入 mesh counters。四组探测都完成后重新 `capture()`；若策略/底层网络发生中途漂移，保留失败证据并停止。不能并发造成 counter 混读。
-
-PC→Android：
+如另有用户对具体设备观察的授权，批准文件必须绑定本计划，`scopes:['device-observe']`，实际 `issuedAtMs/expiresAtMs/presenceConfirmedAtMs` 与 `approvedByOperator:true`。最长一小时，presence checkpoint 最长 60 秒；不自动生成批准记录。
 
 ```bash
-node scripts/android-batch-witness.mjs probe "$QA_DIR/plan.json" "$QA_DIR/approval.json" wifi-positive tcp --execute
-node scripts/android-batch-witness.mjs probe "$QA_DIR/plan.json" "$QA_DIR/approval.json" wifi-positive udp --execute
+node scripts/android-batch-qa.mjs preflight "$QA_DIR/plan.json" "$QA_DIR/read-only-approval.json" "$QA_SERIAL" --read-device
 ```
 
-其余 phase 替换固定 phase 名。Android→PC 使用 `androidProbe(phase, protocol)`。assemble 每个 probe 为下列结构，来自真实 probe 输出和真实 receiver 计数；`phase` 不写入 probe 结构，event 的 `stage` 持有它：
+该入口只允许 `get-state`、`pm list packages`、`pidof`，要求 app 已在运行；不连接/配对、不起 Activity、不 forward、不 `config_get`、不创建 socket。它始终返回 `NOT_READY`，只能证明包和进程存在。`config_get` 的 startup maintenance 与现有 CDP helper 的 Activity/forward 副作用不属于这个只读入口。
 
-```js
-const probeReceipt = {
-  direction: client.direction, protocol: client.protocol, attempted: client.attempted,
-  outcomes: client.outcomes, ackSha256s: client.ackSha256s,
-  before: receiverBefore[client.protocol], after: receiverAfter[client.protocol],
-  loopbackHealth: phase === 'policy-negative' && client.direction === 'pc-to-android'
-    ? androidHealth(client.protocol) === true : false,
-};
-const event = { stage: phase, snapshot: await capture(), probes: fourProbeReceipts };
-receipt = appendEvent(plan, receipt, event); // throws before moving to next phase on any mismatch
-writePrivateJson(newReceiptPath, receipt); // use a new file for every checkpoint
-```
+不能用通知栏图标、`wifi_on`、活跃的某条 WIFI network 或 VPN interface 推断 VPN 实际 underlying network。不能用保存的 policy hash推断实际 runtime policy，也不能用 app UID 的预期值代替实际 per-app VPN 作用域。对应受限观察器完成、真机无 socket preflight验证并独立复审之前，不增加 `executable:true` 配置开关。
 
-也可离线录入已经投影的 event，执行一次 receipt gate：
+## 离线 receipt 格式与未来单批次顺序
+
+顺序固定为 `baseline → wifi-positive → policy-negative → policy-restored → cellular-positive → wifi-return → cleanup`。每个 phase 的 `beforeSnapshot/afterSnapshot` 含相同事实字段和各自 host `observedAtMs`；每个 probe 包含 receiver `before/after`、`startedAtMs/finishedAtMs`、四组方向/协议之一的 ACK/outcomes。完整 receipt 顶层还必须含 `{dexSha256,manifestSha256,buildReceiptSha256}` 的 `witness` 对象。
+
+`baseline` 与 plan 的不可变事实一致。活动 phase 的 actual runtime policy 必须与对应 allow/block policy一致，per-app VPN/identity/PC/selection/pending等保持基线；cellular phase 必须是不同 physical handle，Wi-Fi return 不再使用 cellular handle。任何双快照漂移、计数越界、counter重置、旧nonce、缺失或重复阶段会拒绝。
+
+每个 counter 必须记录 pinned 三个 artifact hash和由未来同一 host observer捕获的 `observedAtMs`。时间戳和 hash本身不认证数据来源；目前 `WitnessLedger` 明确只用于离线 mock，不能承担 receiver实测。
+
+`cleanup` 只接受结构化 `cleanupEvidence:{verdict:'NOT_OBSERVED',missingObservers:plan.readiness.missingObservers}`。即使 snapshot 的配置/身份/hash与基线一致，也不会认证 PID/listener/forward 清理。未来的清理观察必须区分 nonce-owned PID与PID复用，独立核实进程退出、端口listener、counter状态、精确artifact缺席和本次forward缺席，不依赖caller填布尔值。
 
 ```bash
-node scripts/android-batch-qa.mjs record "$QA_DIR/plan.json" "$QA_DIR/last-accepted.json" "$QA_DIR/event.json" "$QA_DIR/new-receipt.json"
+node scripts/android-batch-qa.mjs assess "$QA_DIR/plan.json" "$QA_DIR/offline-receipt.json"
+node scripts/android-batch-qa.mjs record "$QA_DIR/plan.json" "$QA_DIR/prior-offline-receipt.json" "$QA_DIR/offline-event.json" "$QA_DIR/new-offline-receipt.json"
+node scripts/android-batch-qa.mjs abort "$QA_DIR/plan.json" "$QA_DIR/last-accepted-offline.json" "$QA_DIR/offline-cleanup.json" "$QA_DIR/offline-abort.json"
 ```
 
-退出码 `2` 是有效但尚未完成的 `INCOMPLETE`，不是测试失败；不要用无区分的 `set -e` 将它误当完整 batch 失败。`1` 表示字段/计数/顺序/恢复证据无效。超时只有在 block policy applied、listener alive、同期本地健康与出站正例都在、前后入站正例完整时才构成 policy 负例。
+结构合法也只返回 `NOT_READY`/退出 `2`；结构/hash/顺序错误退出 `1`。不能将 `2` 当实际通过，不能在 receipt/report 中写 P5/P8、WARP、DNS、IPv6 或 restored 通过。
 
-## 4. 成功与失败都执行恢复，只恢复本次拥有的内容
+后续真实批次仍需用户持有手机、USB ADB、已登录且已选中的现有 Headscale 节点、手机初始VPN停止、Wi-Fi已连接/移动数据已开、现有可观察 PC mesh route/入站授权、两个空闲端口和独占配置编辑。现有 `server_switch`会改MRU，`server_update`无CAS，userspace-only SOCKS PC不能用普通Node direct socket作证；这些条件需真实adapter验证，当前不处理身份、PC route/policy或账号变更。
 
-`finally` 恢复顺序：恢复原 Wi-Fi 状态并确认实际 underlying Wi-Fi → `proxy_stop` 并确认 stopped/not starting → 再次检查 node 除 policy 外仍等于内存 `originalNode` → 只恢复其原有 policy（原先缺席则删除字段；原先存在则原样恢复）→ 验证选中节点、完整 config hash、身份、PC baseline、app PID 和网络开关仍匹配。发现用户并发修改或身份变化时，不用原始整个 config 覆盖它；停止恢复写入，标 `RESTORE_FAILED`，保留具体差异的**字段名**和 hash 交给用户处置。
-
-关闭自己持有的 PC server/process，Android companion 等自身 lease/expiry退出或用已验证 cmdline+nonce 的 app UID PID终止；仅中断宿主 `adb` 进程不证明远端 listener 已停。证实两个 witness 的 counter `alive:false`、进程消失、两个本次 listener 均关闭后再清理。只删除准确 nonce 路径下列已知文件和空目录，不执行广泛 rm/glob/forward --remove-all：
-
-- app 私有 cache 内本次 `witness.dex.jar`、`counters.json`；之后 `rmdir cache/polaris-qa-NONCE`。
-- 本次 shell 暂存的 `witness.dex.jar`；之后 `rmdir /data/local/tmp/polaris-qa-NONCE`。
-- 在上述恢复和 witness/artifact 清理完成后，先 `const restoredSnapshot = await capture()`，再调用本次 CDP session 的 `close()`，删除它创建的单个 forward。baseline capture 时 app 已运行，因此无需停止 app。
-
-最终 event 固定为 `{stage:'cleanup', snapshot:restoredSnapshot, witnessesStopped:true, forwardsRemoved:true, artifactsRemoved:true}`，三个布尔值只在实际观察满足后填写；CDP 关闭后不再调用 `capture()`。手机复连原 Wi-Fi可得到新的 handle，因此 cleanup 比对允许 handle 改变，但 transport、所有开关与其余基线必须完全恢复。
-
-```bash
-node scripts/android-batch-qa.mjs assess "$QA_DIR/plan.json" "$QA_DIR/final-receipt.json"
-```
-
-完整所有阶段并恢复才返回 `PASS`/退出 `0`。未完成 `INCOMPLETE`/退出 `2`。某 phase 失败后不要伪造跳过它的完整 receipt；用最后接受的 checkpoint 和真实 cleanup 输出失败后的恢复证据：
-
-```bash
-node scripts/android-batch-qa.mjs abort "$QA_DIR/plan.json" "$QA_DIR/last-accepted.json" "$QA_DIR/cleanup-event.json" "$QA_DIR/abort-receipt.json"
-```
-
-`ABORTED_RESTORED` 退出 `2`、不作通过声明；`RESTORE_FAILED` 退出 `1`。operator 正常完成审批窗口外的恢复必须具有此前用户授权的 cleanup 范围；不要为了继续测试自行延长审批。
-
-这一批回执只证明受控 IPv4 TCP/UDP mesh 数据面、策略入站负例和 Wi-Fi/cellular/Wi-Fi 切换后的 fresh echo。WARP、DNS、IPv6、直连/DERP 路径只能记录“readiness / 未验证”；没有独立受控出口和 DNS witness 时不能声称它们数据面通过。当前提供的是准备完成的操作工具与证据闸门，现场适配点和实际设备结果尚未完成。
+下一步是独立的可信观察器与设备无 socket readiness任务；完成后重新设计执行runner、cleanup receipt和用户在场控制，并再次审查。当前准备提交不能因为用户到场而自动升级。
