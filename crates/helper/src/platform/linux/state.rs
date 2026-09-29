@@ -83,23 +83,82 @@ pub enum SpawnError {
     Spawn { detail: String },
 }
 
+/// Native reap state that can block a new Linux helper Start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapBlockerState {
+    /// The exact owned Child has not exited yet.
+    Pending,
+    /// `Child::try_wait` failed, so neither exit nor liveness is known.
+    Unknown,
+}
+
+/// Start admission is decided from every native Child slot before `already`,
+/// forwarding changes, or spawn. `Already` is only valid when the sole
+/// unreaped slot is the exact Running birth held by [`HandlerState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAdmission {
+    Admitted,
+    Already { pid: u32 },
+    Blocked { pid: u32, state: ReapBlockerState },
+}
+
+/// One bounded Stop poll. Only `Reaped` authorizes a successful Stop ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReap {
+    Reaped,
+    Pending,
+    Unknown,
+}
+
 /// Core spawn 抽象（trait 便于测试 mock；生产用 AmbientCaps fork+setuid+execve）。
 ///
 /// 对照 Go 源 start 分支的 `c.Start()`（:452）+ stop 的 `terminateChild`（:246-256）+ cleanup 的 `Kill`（:383）。
 pub trait CoreSpawner: Send + Sync {
+    /// Inspect every physical birth before a Start can reuse or spawn.
+    fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
+        current_running.map_or(StartAdmission::Admitted, |handle| StartAdmission::Already {
+            pid: handle.pid,
+        })
+    }
     /// spawn sing-box 子进程（AmbientCaps 拉核）。
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError>;
-    /// 优雅终止：SIGTERM → ≤5s → SIGKILL（Go `terminateChild`，:246-256）。
-    fn terminate(&self, h: &CoreHandle);
+    /// Start or poll graceful termination. This call itself is bounded; the
+    /// background worker owns TERM → ≤5s → KILL and native reap.
+    fn terminate(&self, h: &CoreHandle) -> StopReap;
     /// 强杀 SIGKILL（Go `child.Process.Kill()`，:383）。
     fn kill(&self, h: &CoreHandle);
+}
+
+/// Handler-visible custody for the exact physical birth. A Stop never removes
+/// `Stopping`; only a successful native reap may clear it.
+#[derive(Debug, Clone)]
+pub enum ManagedChild {
+    Running(CoreHandle),
+    Stopping(CoreHandle),
+}
+
+impl ManagedChild {
+    #[must_use]
+    pub fn handle(&self) -> &CoreHandle {
+        match self {
+            Self::Running(handle) | Self::Stopping(handle) => handle,
+        }
+    }
+
+    #[must_use]
+    pub fn running(&self) -> Option<&CoreHandle> {
+        match self {
+            Self::Running(handle) => Some(handle),
+            Self::Stopping(_) => None,
+        }
+    }
 }
 
 /// Handler 进程状态（对应 Go 全局 `child`/`childDone`，实例化可测）。
 #[derive(Debug)]
 pub struct HandlerState {
-    /// 当前 sing-box 子进程（None = stopped）。
-    pub child: Option<CoreHandle>,
+    /// Exact current birth. `Stopping` remains present through Pending/Unknown.
+    pub child: Option<ManagedChild>,
 }
 
 impl HandlerState {

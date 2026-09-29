@@ -728,7 +728,7 @@ impl ProxyRuntime {
             return false;
         };
         let current = *g;
-        if current != Some(intended)
+        if !child.helper_pid_bookkeeping_matches(permit.attempt(), intended, current)
             || !child.confirm_helper_stop(permit.attempt(), intended, permit.nonce())
         {
             log::warn!(

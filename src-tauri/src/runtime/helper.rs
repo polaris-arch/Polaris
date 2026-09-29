@@ -35,7 +35,8 @@ use polaris_helper_client::{
 };
 use polaris_helper_proto::{
     FlushDns, InstallCoreParams, LinuxDns, LinuxDnsSetParams, LinuxStartParams, Platform, Request,
-    Response, ResponseKind, RouteParams, Start, StartParams, Status as CoreStatus, Stop,
+    Response, ResponseKind, RouteParams, Start, StartNotAdmitted, StartParams,
+    Status as CoreStatus, Stop,
 };
 use polaris_system_integration::dns_flush::HelperFlushResult;
 use polaris_system_integration::linux_resolved::LinuxResolvedOps;
@@ -48,15 +49,24 @@ const HELPER_TOKEN_FILE: &str = "helper-client.token";
 /// 故留 15s 余量覆盖偶发慢盘/大 config 校验足矣。
 const HELPER_START_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// helper 停核单次通信预算 + 一次有界重试。
+/// helper 停核整次调用的总预算。Linux 的物理 Child 尚未 reap 时会在同一个上层
+/// Stop permit 内轮询；通信错误仍最多补发一次，但所有尝试共用这 1.5 秒截止时间。
 ///
-/// stop 携带受管 pid，daemon 侧在同一把 child 锁内做身份校验并摘除，因此同一 pid 的重复请求是
-/// 幂等的：首请求若已生效但回包丢失，第二次只会得到 `notrunning`；若 helper 已换成新核，则得到
-/// `stop-mismatch` 且不杀。Windows 真机出现过一次 1.5s 默认预算刚过即丢回执，故复用 client
-/// 既有重试能力给这条安全关键路径一次恢复机会，不把所有 helper 命令一并放宽。
+/// stop 携带受管 pid，daemon 侧按 exact child 身份校验，因此同一 pid 的重复请求是幂等的：Linux
+/// 在 native reap 前回 `pending`，之后才回 `stopped/notrunning`；若 helper 已换成新核，则得到
+/// `stop-mismatch` 且不杀。Windows 真机出现过一次 1.5s 默认预算刚过即丢回执，因此保留一次
+/// 通信恢复机会，同时不把所有 helper 命令一并放宽。
 const HELPER_STOP_TIMEOUT: Duration = Duration::from_millis(1_500);
 const HELPER_STOP_MAX_RETRIES: u32 = 1;
 const HELPER_STOP_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// A typed helper Start result. `NotAdmitted` is a proven no-spawn outcome
+/// that still carries custody of the earlier Linux helper birth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperStartResult {
+    Started(u32),
+    NotAdmitted(StartNotAdmitted),
+}
 
 /// helper flush-dns 通信超时（对齐 上游 `HelperManager.flushDns` 的 5000ms；flush 为瞬时操作）。
 const HELPER_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -923,7 +933,7 @@ impl HelperRuntime {
         log: &Path,
         fwd: bool,
         ppid: Option<u32>,
-    ) -> Result<u32, String> {
+    ) -> Result<HelperStartResult, String> {
         self.register_core_mutation()?;
         let client = self.build_client()?;
         let common = StartParams {
@@ -973,13 +983,16 @@ impl HelperRuntime {
                 // D2/D3(4) 的「start 拿初值」：Windows 新 helper 会带回受管核的进程创建时间，
                 // 存成崩溃监测的**初始**身份基线（消费点见 `proxy::recovery::spawn_crash_monitor`）。
                 self.remember_start_identity(pid, created);
-                Ok(pid)
+                Ok(HelperStartResult::Started(pid))
             }
             Response::Ok(ResponseKind::Start(Start::Started { pid } | Start::Already { pid })) => {
                 // 无 timing 形态 ⇒ 没有 created 可存。**必须显式落 None**：留着上一次 start 的值，
                 // 万一新核拿到同一个 pid，基线就会拿旧进程的创建时间去比新进程，判出一次假复用。
                 self.remember_start_identity(pid, None);
-                Ok(pid)
+                Ok(HelperStartResult::Started(pid))
+            }
+            Response::Ok(ResponseKind::Start(Start::NotAdmitted(blocker))) => {
+                Ok(HelperStartResult::NotAdmitted(blocker))
             }
             Response::Ok(other) => Err(format!("helper 起核返回非预期响应：{other:?}")),
             Response::Err(e) => Err(format!("helper 起核失败：{e}")),
@@ -1423,30 +1436,90 @@ fn confirm_install_core_unsupported(client: &HelperClient) -> Result<(), Install
     }
 }
 
-/// 停核请求的可测试通信核：只在**通信错误**时重试；helper 的结构化响应（含 mismatch）不会重发。
+/// 停核请求的可测试通信核。Linux `Pending` 在同一次调用内轮询，直到 exact-birth
+/// reap ACK 或总截止时间；`Unknown` 立即 fail closed。通信错误最多补发一次。
 fn stop_core_with_client(client: &HelperClient, want_pid: Option<u32>) -> Result<(), String> {
-    let resp = client
-        .send_with_retry(
-            &Request::Stop { pid: want_pid },
-            HELPER_STOP_TIMEOUT,
-            HELPER_STOP_MAX_RETRIES,
-            HELPER_STOP_RETRY_DELAY,
-        )
-        .map_err(|e| format!("helper 停核通信失败：{e}"))?;
-    match resp {
-        Response::Ok(ResponseKind::Stop(Stop::Mismatch { want, current })) => Err(format!(
-            "helper 未停核：其受管核已是 pid={current}（本腿意图停 pid={want}）\
-             → 判定为已被新会话接管，让位不动它"
-        )),
-        Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }))
-            if want_pid.is_none_or(|want| want == pid) =>
-        {
-            Ok(())
+    stop_core_with_client_budget(
+        client,
+        want_pid,
+        HELPER_STOP_TIMEOUT,
+        HELPER_STOP_RETRY_DELAY,
+    )
+}
+
+fn stop_core_with_client_budget(
+    client: &HelperClient,
+    want_pid: Option<u32>,
+    total_timeout: Duration,
+    retry_delay: Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let mut transport_retries = 0;
+    let mut pending_pid = None;
+    loop {
+        let remaining = total_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(match pending_pid {
+                Some(pid) => format!(
+                    "helper 停核超时：pid={pid} 在 {total_timeout:?} 内未取得物理 reap 回执"
+                ),
+                None => format!("helper 停核通信超时：总预算 {total_timeout:?}"),
+            });
         }
-        Response::Ok(ResponseKind::Stop(Stop::NotRunning)) => Ok(()),
-        Response::Ok(other) => Err(format!("helper 停核返回非预期响应：{other:?}")),
-        Response::Err(e) => Err(format!("helper 停核失败：{e}")),
+        let response = match client.send_with_timeout(&Request::Stop { pid: want_pid }, remaining) {
+            Ok(response) => response,
+            Err(_error) if transport_retries < HELPER_STOP_MAX_RETRIES => {
+                transport_retries += 1;
+                sleep_within_stop_budget(started, total_timeout, retry_delay)?;
+                continue;
+            }
+            Err(error) => return Err(format!("helper 停核通信失败：{error}")),
+        };
+        match response {
+            Response::Ok(ResponseKind::Stop(Stop::Mismatch { want, current })) => {
+                return Err(format!(
+                    "helper 未停核：其受管核已是 pid={current}（本腿意图停 pid={want}）\
+                     → 判定为已被新会话接管，让位不动它"
+                ));
+            }
+            Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }))
+                if want_pid.is_none_or(|want| want == pid) =>
+            {
+                return Ok(());
+            }
+            Response::Ok(ResponseKind::Stop(Stop::NotRunning)) => return Ok(()),
+            Response::Ok(ResponseKind::Stop(Stop::Pending { pid }))
+                if want_pid.is_none_or(|want| want == pid) =>
+            {
+                pending_pid = Some(pid);
+                sleep_within_stop_budget(started, total_timeout, retry_delay)?;
+            }
+            Response::Ok(ResponseKind::Stop(Stop::Unknown { pid }))
+                if want_pid.is_none_or(|want| want == pid) =>
+            {
+                return Err(format!(
+                    "helper 停核结果未知：pid={pid} 的物理 Child reap 失败，保留 custody"
+                ));
+            }
+            Response::Ok(other) => {
+                return Err(format!("helper 停核返回非预期响应：{other:?}"));
+            }
+            Response::Err(error) => return Err(format!("helper 停核失败：{error}")),
+        }
     }
+}
+
+fn sleep_within_stop_budget(
+    started: std::time::Instant,
+    total_timeout: Duration,
+    delay: Duration,
+) -> Result<(), String> {
+    let remaining = total_timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(format!("helper 停核通信超时：总预算 {total_timeout:?}"));
+    }
+    std::thread::sleep(delay.min(remaining));
+    Ok(())
 }
 
 fn managed_core_status_with_client(client: &HelperClient) -> Result<ManagedCoreStatus, String> {

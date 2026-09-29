@@ -1098,7 +1098,11 @@ async fn cancelled_helper_start_worker_publishes_late_known_pid() {
         while !*released {
             released = wake.wait(released).unwrap();
         }
-        completion.publish(&Ok(4242)).unwrap();
+        completion
+            .publish(&Ok(crate::runtime::helper::HelperStartResult::Started(
+                4242,
+            )))
+            .unwrap();
     });
     entered_rx.await.unwrap();
     late.abort();
@@ -1121,6 +1125,74 @@ async fn cancelled_helper_start_worker_publishes_late_known_pid() {
         .unwrap()
         .is_some_and(|found| found.same(&token)));
     assert!(rt.mesh.main_owns_tailscale("ts-late-helper", true));
+}
+
+#[tokio::test]
+async fn start_not_admitted_preserves_prior_helper_and_main_custody() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::HelperStartResult;
+    use polaris_helper_proto::StartNotAdmitted;
+
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-helper-blocker").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token.clone()))
+        .unwrap();
+    reservation.arm_external_start();
+    let mut completion = HelperStartCompletion::for_test(&rt, attempt.clone());
+    completion
+        .publish(&Ok(HelperStartResult::NotAdmitted(
+            StartNotAdmitted::Pending { pid: 7331 },
+        )))
+        .unwrap();
+    drop(reservation);
+
+    {
+        let child = rt.child.lock().unwrap();
+        assert!(child.helper_start_not_admitted_for_test());
+        let (blocker_attempt, blocker_pid) = child.helper_stop_target().unwrap();
+        assert!(blocker_attempt.same(&attempt));
+        assert_eq!(blocker_pid, 7331);
+    }
+    assert!(rt.pid.lock().unwrap().is_none(), "no new core was spawned");
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.mesh.main_owns_tailscale("ts-helper-blocker", true));
+
+    let (failed, failed_calls, wants) = RecordingStop::new(Err("still pending".into()));
+    assert!(rt
+        .kill_core_via_helper(failed as Arc<dyn HelperStopOps>)
+        .await
+        .is_err());
+    assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*wants.lock().unwrap(), [Some(7331)]);
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .helper_start_not_admitted_for_test());
+    assert!(rt.mesh.main_owns_tailscale("ts-helper-blocker", true));
+
+    let (reaped, _, _) = RecordingStop::new(Ok(()));
+    rt.kill_core_via_helper(reaped as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
 }
 
 #[tokio::test]

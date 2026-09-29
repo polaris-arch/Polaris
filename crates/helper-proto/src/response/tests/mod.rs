@@ -120,6 +120,27 @@ fn stop_mismatch_round_trips_with_both_pids() {
 }
 
 #[test]
+fn physical_reap_and_start_admission_states_round_trip() {
+    let cases = [
+        Response::Ok(ResponseKind::Stop(Stop::Pending { pid: 41 })),
+        Response::Ok(ResponseKind::Stop(Stop::Unknown { pid: 42 })),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Pending { pid: 43 },
+        ))),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Unknown { pid: 44 },
+        ))),
+    ];
+    for response in cases {
+        assert_eq!(Response::parse(&response.to_wire_line()), response);
+    }
+    assert!(matches!(
+        Response::parse("OK start-not-admitted future 45"),
+        Response::Ok(ResponseKind::OkRaw { .. })
+    ));
+}
+
+#[test]
 fn parse_start_started_already() {
     // helper.go:522,579
     let r = Response::parse("OK started 12345");
@@ -500,6 +521,8 @@ fn to_wire_line_round_trips_through_parse() {
             want: 4242,
             current: 9001,
         })),
+        Response::Ok(ResponseKind::Stop(Stop::Pending { pid: 4242 })),
+        Response::Ok(ResponseKind::Stop(Stop::Unknown { pid: 4242 })),
         Response::Ok(ResponseKind::Start(Start::Started { pid: 2 })),
         Response::Ok(ResponseKind::Start(Start::StartedTimed {
             pid: 4,
@@ -524,6 +547,12 @@ fn to_wire_line_round_trips_through_parse() {
             created: Some(133_600_000_000_000_000),
         })),
         Response::Ok(ResponseKind::Start(Start::Already { pid: 3 })),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Pending { pid: 31 },
+        ))),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Unknown { pid: 32 },
+        ))),
         Response::Ok(ResponseKind::Cleaned),
         Response::Ok(ResponseKind::Route),
         Response::Ok(ResponseKind::FreePort(FreePort::Free)),

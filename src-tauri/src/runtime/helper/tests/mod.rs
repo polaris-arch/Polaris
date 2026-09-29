@@ -55,6 +55,63 @@ fn stop_retries_once_when_the_first_roundtrip_loses_its_response() {
 }
 
 #[test]
+fn stop_polls_pending_until_exact_reap_receipt() {
+    let (client, connects) = stop_test_client(vec![
+        polaris_helper_client::MockStream::with_response(b"OK stop-pending 4242\n".to_vec()),
+        polaris_helper_client::MockStream::with_response(b"OK stop-pending 4242\n".to_vec()),
+        polaris_helper_client::MockStream::with_response(b"OK stopped 4242\n".to_vec()),
+    ]);
+    stop_core_with_client_budget(
+        &client,
+        Some(4242),
+        Duration::from_millis(200),
+        Duration::from_millis(1),
+    )
+    .expect("Pending is retryable within the same top-level Stop");
+    assert_eq!(connects.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn stop_unknown_fails_closed_without_retry() {
+    let (client, connects) =
+        stop_test_client(vec![polaris_helper_client::MockStream::with_response(
+            b"OK stop-unknown 4242\n".to_vec(),
+        )]);
+    let error = stop_core_with_client_budget(
+        &client,
+        Some(4242),
+        Duration::from_millis(200),
+        Duration::from_millis(1),
+    )
+    .unwrap_err();
+    assert!(error.contains("未知") && error.contains("4242"));
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn pending_stop_respects_one_total_budget() {
+    let streams = (0..32)
+        .map(|_| {
+            polaris_helper_client::MockStream::with_response(b"OK stop-pending 4242\n".to_vec())
+        })
+        .collect();
+    let (client, _) = stop_test_client(streams);
+    let started = std::time::Instant::now();
+    let error = stop_core_with_client_budget(
+        &client,
+        Some(4242),
+        Duration::from_millis(20),
+        Duration::from_millis(5),
+    )
+    .unwrap_err();
+    assert!(error.contains("物理 reap"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "each Pending response must not receive a fresh timeout budget"
+    );
+}
+
+#[test]
 fn stop_does_not_retry_a_structured_pid_mismatch() {
     let (client, connects) =
         stop_test_client(vec![polaris_helper_client::MockStream::with_response(
@@ -579,7 +636,7 @@ fn start_core_records_the_identity_baseline_on_both_response_legs() {
         "        log: &Path,\n",
         "        fwd: bool,\n",
         "        ppid: Option<u32>,\n",
-        "    ) -> Result<u32, String> {"
+        "    ) -> Result<HelperStartResult, String> {"
     );
     let body = impl_method_body(&crate_code("runtime/helper.rs"), HEAD);
     assert!(

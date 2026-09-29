@@ -25,7 +25,7 @@ use crate::line_io;
 use polaris_helper_proto::command::{common as cmd, linux as lcmd};
 use polaris_helper_proto::{
     parse_stop_pid, stop_pid_matches, Error as ProtoError, ErrorCode, LinuxDns, Response,
-    ResponseKind, Start, StartTiming, Stop,
+    ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
 };
 
 use crate::core_install::InstallResult;
@@ -36,7 +36,10 @@ use crate::platform::linux::core_installer::install_core;
 use crate::platform::linux::freeport::{free_port, parse_ss_pids, FreePortDeps};
 use crate::platform::linux::ops::SystemdOps;
 use crate::platform::linux::resolved_dns::ResolvedDnsOps;
-use crate::platform::linux::state::{CoreSpawner, HandlerState, SpawnCoreRequest, SpawnError};
+use crate::platform::linux::state::{
+    CoreSpawner, HandlerState, ManagedChild, ReapBlockerState, SpawnCoreRequest, SpawnError,
+    StartAdmission, StopReap,
+};
 
 /// Linux helper protoVersion（三平台统一演进，见 `polaris_helper_proto` crate 文档）。
 pub const PROTO_VERSION: u32 = polaris_helper_proto::proto_version::CURRENT;
@@ -239,14 +242,14 @@ fn single_line_wire_detail(detail: &str) -> String {
 
 /// status（:363-368）：running `<pid>` 或 stopped。
 fn handle_status(state: &HandlerState, conn: &mut impl Conn) {
-    if let Some(h) = state.child.as_ref() {
+    if let Some(h) = state.child.as_ref().map(ManagedChild::handle) {
         let _ = conn.write_line(&format!("OK running {}", h.pid));
     } else {
         let _ = conn.write_line("OK stopped");
     }
 }
 
-/// stop（:369-380）：**受管 pid 身份校验** → 摘除 child + 后台收割 + 复位转发态。
+/// stop（:369-380）：**受管 pid 身份校验** → 启动/轮询后台终止 → 仅在 native reap 后复位转发态。
 ///
 /// 身份行（可选，本协议新增）：客户端声明它意图停的那个 pid。判据走
 /// [`stop_pid_matches`] —— 不匹配 = 手里这个核属**另一个会话**（客户端的老 stop 腿在 IPC 上挂住
@@ -268,7 +271,7 @@ fn handle_stop<P, S, D, SD>(
 {
     // 旧客户端不发这一行 → read_line 在 EOF 返 "" → None → 沿用「停当前受管核」旧语义。
     let want = parse_stop_pid(&conn.read_line());
-    if let Some(h) = state.child.as_ref() {
+    if let Some(h) = state.child.as_ref().map(ManagedChild::handle) {
         if !stop_pid_matches(want, h.pid) {
             let resp = Response::Ok(ResponseKind::Stop(Stop::Mismatch {
                 want: want.unwrap_or(0),
@@ -278,17 +281,50 @@ fn handle_stop<P, S, D, SD>(
             return;
         }
     }
-    if let Some(h) = state.child.take() {
-        let pid = h.pid;
-        // 复位转发态（:374，跟随运行中的核）。
-        (deps.set_forward)(false);
-        // 后台收割：TERM → ≤5s → KILL（Go: go func() { terminateChild(c, done) }()）。
-        // 本实现同步等待 spawner.terminate（trait 抽象，测试可控；生产 spawn task）。
-        deps.spawner.terminate(&h);
-        let _ = conn.write_line(&format!("OK stopped {pid}"));
-    } else {
-        let _ = conn.write_line("OK notrunning");
+    let Some(handle) = state.child.as_ref().map(ManagedChild::handle).cloned() else {
+        // `child == None` alone is not a reap proof: cleanup/older state may
+        // still leave a native slot. Reuse the all-slot admission scan before
+        // emitting the idempotent success response.
+        match deps.spawner.start_admission(None) {
+            StartAdmission::Admitted => {
+                let _ = conn.write_line("OK notrunning");
+            }
+            StartAdmission::Blocked { pid, state } => write_stop_blocked(conn, pid, state),
+            StartAdmission::Already { pid } => {
+                write_stop_blocked(conn, pid, ReapBlockerState::Unknown);
+            }
+        }
+        return;
+    };
+
+    let pid = handle.pid;
+    state.child = Some(ManagedChild::Stopping(handle.clone()));
+    match deps.spawner.terminate(&handle) {
+        StopReap::Reaped => {
+            // The exact native Child has been reaped. Only this branch may
+            // clear custody, reset forwarding, and acknowledge Stop success.
+            if state
+                .child
+                .as_ref()
+                .is_some_and(|child| child.handle().same_birth(&handle))
+            {
+                state.child = None;
+            }
+            (deps.set_forward)(false);
+            let response = Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }));
+            let _ = conn.write_line(&response.to_wire_line());
+        }
+        StopReap::Pending => write_stop_blocked(conn, pid, ReapBlockerState::Pending),
+        StopReap::Unknown => write_stop_blocked(conn, pid, ReapBlockerState::Unknown),
     }
+}
+
+fn write_stop_blocked(conn: &mut impl Conn, pid: u32, state: ReapBlockerState) {
+    let outcome = match state {
+        ReapBlockerState::Pending => Stop::Pending { pid },
+        ReapBlockerState::Unknown => Stop::Unknown { pid },
+    };
+    let _ = conn.write_line(&Response::Ok(ResponseKind::Stop(outcome)).to_wire_line());
 }
 
 /// cleanup（:381-388）：kill child + pkill sing-box + 复位转发态。
@@ -303,9 +339,10 @@ fn handle_cleanup<P, S, D, SD>(
     D: FreePortDeps,
     SD: SystemdOps,
 {
-    if let Some(h) = state.child.take() {
+    if let Some(h) = state.child.as_ref().map(ManagedChild::handle).cloned() {
         // :383: kill child。
         deps.spawner.kill(&h);
+        state.child = Some(ManagedChild::Stopping(h));
     }
     (deps.set_forward)(false);
     // :387: pkill -9 -U <uid> -f "sing-box run"（兜底清对端 uid 的所有 sing-box 实例）。
@@ -383,10 +420,30 @@ fn handle_start<P, S, D, SD>(
     let ppid_str = conn.read_line();
     let ppid: u32 = ppid_str.trim().parse().unwrap_or(0);
 
-    // :407-410: 已有 child → already。
-    if let Some(h) = state.child.as_ref() {
-        let _ = conn.write_line(&format!("OK already {}", h.pid));
-        return;
+    // Admission precedes `already`, validation, forwarding, and spawn. The
+    // production spawner inspects every retained native slot, including births
+    // no longer represented by this handler state.
+    let current_running = state.child.as_ref().and_then(ManagedChild::running);
+    match deps.spawner.start_admission(current_running) {
+        StartAdmission::Admitted => {
+            // A stale Running/Stopping state can be cleared only because the
+            // admission scan observed its exact slot as Reaped.
+            state.child = None;
+        }
+        StartAdmission::Already { pid } => {
+            let response = Response::Ok(ResponseKind::Start(Start::Already { pid }));
+            let _ = conn.write_line(&response.to_wire_line());
+            return;
+        }
+        StartAdmission::Blocked { pid, state } => {
+            let blocked = match state {
+                ReapBlockerState::Pending => StartNotAdmitted::Pending { pid },
+                ReapBlockerState::Unknown => StartNotAdmitted::Unknown { pid },
+            };
+            let response = Response::Ok(ResponseKind::Start(Start::NotAdmitted(blocked)));
+            let _ = conn.write_line(&response.to_wire_line());
+            return;
+        }
     }
     // :411-413: cfg 空 → bad-args。
     let cfg = cfg.trim();
@@ -474,7 +531,7 @@ fn handle_start<P, S, D, SD>(
     match deps.spawner.spawn(&req) {
         Ok(started) => {
             let pid = started.handle.pid;
-            state.child = Some(started.handle);
+            state.child = Some(ManagedChild::Running(started.handle));
             let process_ms = started.process_ms.saturating_add(process_prepare_ms);
             let response = Response::Ok(ResponseKind::Start(Start::StartedTimed {
                 pid,

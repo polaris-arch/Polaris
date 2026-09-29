@@ -85,7 +85,7 @@ use serde_json::Value;
 
 use crate::logging::SING_BOX_TARGET;
 use crate::runtime::helper::{
-    HelperBuildProbe, HelperStatusSnapshot, HelperStopOps, InstallCoreError,
+    HelperBuildProbe, HelperStartResult, HelperStatusSnapshot, HelperStopOps, InstallCoreError,
     InstallCoreUnsupportedRecord,
 };
 use crate::runtime::route_binding::plan_runtime_bindings;
@@ -115,7 +115,7 @@ impl HelperStartCompletion {
 
     pub(in crate::runtime::proxy) fn publish(
         &mut self,
-        result: &Result<u32, String>,
+        result: &Result<HelperStartResult, String>,
     ) -> Result<(), String> {
         let mut child = self
             .child
@@ -124,7 +124,11 @@ impl HelperStartCompletion {
         if !child.helper_start_inflight(&self.token) {
             return Err("helper Start attempt was replaced before completion".to_string());
         }
-        let mut pid_guard = if result.is_ok() {
+        let known = match result {
+            Ok(HelperStartResult::Started(pid)) => Some(*pid),
+            Ok(HelperStartResult::NotAdmitted(_)) | Err(_) => None,
+        };
+        let mut pid_guard = if known.is_some() {
             Some(
                 self.pid
                     .lock()
@@ -133,8 +137,14 @@ impl HelperStartCompletion {
         } else {
             None
         };
-        let known = result.as_ref().ok().copied();
-        if !child.finish_helper_start(&self.token, known) {
+        let published = match result {
+            Ok(HelperStartResult::NotAdmitted(blocker)) => {
+                child.finish_helper_start_not_admitted(&self.token, *blocker)
+            }
+            Ok(HelperStartResult::Started(_)) => child.finish_helper_start(&self.token, known),
+            Err(_) => child.finish_helper_start(&self.token, None),
+        };
+        if !published {
             return Err("helper Start attempt changed during completion".to_string());
         }
         if let (Some(pid), Some(slot)) = (known, pid_guard.as_mut()) {
@@ -2287,7 +2297,13 @@ impl ProxyRuntime {
         .await
         .map_err(|e| format!("helper 起核任务 join 失败：{e}"))?;
         let pid = match started {
-            Ok(pid) => pid,
+            Ok(HelperStartResult::Started(pid)) => pid,
+            Ok(HelperStartResult::NotAdmitted(blocker)) => {
+                return Err(format!(
+                    "helper 起核未获准：此前受管核 pid={} 仍处于 {blocker:?} custody",
+                    blocker.pid()
+                ));
+            }
             Err(e) => return Err(e),
         };
         // The blocking worker already published pid under Child→pid, even if

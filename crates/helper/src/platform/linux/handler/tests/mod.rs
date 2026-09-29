@@ -3,7 +3,9 @@
 use super::*;
 use crate::platform::linux::auth::{NoPeerCred, StaticPeerCred};
 use crate::platform::linux::ops::{SystemdAction, SystemdOps, SystemdResult};
-use crate::platform::linux::state::{CoreHandle, CoreSpawner, SpawnedCore};
+use crate::platform::linux::state::{
+    CoreHandle, CoreSpawner, ManagedChild, ReapBlockerState, SpawnedCore, StartAdmission, StopReap,
+};
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 
@@ -44,6 +46,8 @@ struct MockSpawner {
     spawn_calls: StdMutex<Vec<SpawnCoreRequest>>,
     terminate_calls: StdMutex<Vec<u32>>,
     kill_calls: StdMutex<Vec<u32>>,
+    start_admission: StdMutex<Option<StartAdmission>>,
+    terminate_results: StdMutex<std::collections::VecDeque<StopReap>>,
 }
 
 impl MockSpawner {
@@ -54,11 +58,21 @@ impl MockSpawner {
             spawn_calls: StdMutex::new(Vec::new()),
             terminate_calls: StdMutex::new(Vec::new()),
             kill_calls: StdMutex::new(Vec::new()),
+            start_admission: StdMutex::new(None),
+            terminate_results: StdMutex::new(std::collections::VecDeque::new()),
         }
     }
 }
 
 impl CoreSpawner for MockSpawner {
+    fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
+        self.start_admission.lock().unwrap().unwrap_or_else(|| {
+            current_running.map_or(StartAdmission::Admitted, |handle| StartAdmission::Already {
+                pid: handle.pid,
+            })
+        })
+    }
+
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
         self.spawn_calls.lock().unwrap().push(req.clone());
         if self.fail {
@@ -73,8 +87,13 @@ impl CoreSpawner for MockSpawner {
             log_handoff_ms: 0,
         })
     }
-    fn terminate(&self, h: &CoreHandle) {
+    fn terminate(&self, h: &CoreHandle) -> StopReap {
         self.terminate_calls.lock().unwrap().push(h.pid);
+        self.terminate_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(StopReap::Reaped)
     }
     fn kill(&self, h: &CoreHandle) {
         self.kill_calls.lock().unwrap().push(h.pid);
@@ -365,7 +384,7 @@ fn status_running_when_child_present() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle::new(4242));
+    state.child = Some(ManagedChild::Running(CoreHandle::new(4242)));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["status"]);
     handle(&state, &deps, &mut conn);
@@ -403,7 +422,7 @@ fn stop_terminates_child_and_reports_pid() {
     };
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle::new(555));
+    state.child = Some(ManagedChild::Running(CoreHandle::new(555)));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["stop"]);
     handle(&state, &deps, &mut conn);
@@ -414,6 +433,77 @@ fn stop_terminates_child_and_reports_pid() {
         vec![false],
         "stop 应复位转发态"
     );
+}
+
+#[test]
+fn stop_retains_stopping_birth_until_exact_reap() {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let spawner = MockSpawner::succeeding(555);
+    spawner
+        .terminate_results
+        .lock()
+        .unwrap()
+        .extend([StopReap::Pending, StopReap::Reaped]);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd_called = Arc::new(StdMutex::new(Vec::new()));
+    let fwd = {
+        let calls = Arc::clone(&fwd_called);
+        move |on| calls.lock().unwrap().push(on)
+    };
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let state = Mutex::new(HandlerState {
+        child: Some(ManagedChild::Running(CoreHandle::new(555))),
+    });
+
+    let mut pending = MockConn::new(vec!["stop", "555"]);
+    handle(&state, &deps, &mut pending);
+    assert_eq!(pending.writes(), ["OK stop-pending 555"]);
+    assert!(matches!(
+        state.lock().unwrap().child.as_ref(),
+        Some(ManagedChild::Stopping(_))
+    ));
+    assert!(fwd_called.lock().unwrap().is_empty());
+
+    let mut reaped = MockConn::new(vec!["stop", "555"]);
+    handle(&state, &deps, &mut reaped);
+    assert_eq!(reaped.writes(), ["OK stopped 555"]);
+    assert!(state.lock().unwrap().child.is_none());
+    assert_eq!(*fwd_called.lock().unwrap(), [false]);
+}
+
+#[test]
+fn stop_unknown_retains_custody_and_never_claims_success() {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let spawner = MockSpawner::succeeding(556);
+    spawner
+        .terminate_results
+        .lock()
+        .unwrap()
+        .push_back(StopReap::Unknown);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd_called = Arc::new(StdMutex::new(Vec::new()));
+    let fwd = {
+        let calls = Arc::clone(&fwd_called);
+        move |on| calls.lock().unwrap().push(on)
+    };
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let state = Mutex::new(HandlerState {
+        child: Some(ManagedChild::Running(CoreHandle::new(556))),
+    });
+    let mut conn = MockConn::new(vec!["stop", "556"]);
+    handle(&state, &deps, &mut conn);
+    assert_eq!(conn.writes(), ["OK stop-unknown 556"]);
+    assert!(matches!(
+        state.lock().unwrap().child.as_ref(),
+        Some(ManagedChild::Stopping(_))
+    ));
+    assert!(fwd_called.lock().unwrap().is_empty());
 }
 
 // ===== stop 的受管 pid 身份判据（杀错进程的防线）=====
@@ -445,7 +535,7 @@ fn stop_refuses_to_kill_when_managed_pid_is_another_session() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
     // daemon 手里的是**新会话**的核。
-    state.child = Some(CoreHandle::new(9001));
+    state.child = Some(ManagedChild::Running(CoreHandle::new(9001)));
     let state = Mutex::new(state);
     // 老 stop 腿声明它要停的是 555。
     let mut conn = MockConn::new(vec!["stop", "555"]);
@@ -465,7 +555,12 @@ fn stop_refuses_to_kill_when_managed_pid_is_another_session() {
         "也不许走 kill 腿"
     );
     assert_eq!(
-        state.lock().unwrap().child.as_ref().map(|h| h.pid),
+        state
+            .lock()
+            .unwrap()
+            .child
+            .as_ref()
+            .map(|child| child.handle().pid),
         Some(9001),
         "child 记账必须原样留给新会话（摘掉 = 新核失联，daemon 再也停不掉它）"
     );
@@ -487,7 +582,7 @@ fn stop_proceeds_when_managed_pid_matches_request() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle::new(555));
+    state.child = Some(ManagedChild::Running(CoreHandle::new(555)));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["stop", "555"]);
     handle(&state, &deps, &mut conn);
@@ -528,7 +623,7 @@ fn stop_without_identity_line_keeps_legacy_semantics() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle::new(777));
+    state.child = Some(ManagedChild::Running(CoreHandle::new(777)));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["stop"]); // 无身份行（read_line 在耗尽后返 ""）
     handle(&state, &deps, &mut conn);
@@ -954,7 +1049,7 @@ fn start_already_when_child_present() {
         &fwd,
     );
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle::new(8888));
+    state.child = Some(ManagedChild::Running(CoreHandle::new(8888)));
     let state = Mutex::new(state);
     let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
     let mut conn = MockConn::new(vec!["start", &sb, "/tmp/c.json", "", "0", ""]);
@@ -962,6 +1057,53 @@ fn start_already_when_child_present() {
     assert_eq!(conn.writes(), vec!["OK already 8888"]);
     // 已有 child → 不再 spawn。
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn start_blocker_precedes_already_validation_forwarding_and_spawn() {
+    let (_dir, auth, core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let spawner = MockSpawner::succeeding(100);
+    *spawner.start_admission.lock().unwrap() = Some(StartAdmission::Blocked {
+        pid: 7007,
+        state: ReapBlockerState::Unknown,
+    });
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd_called = Arc::new(StdMutex::new(Vec::new()));
+    let fwd = {
+        let calls = Arc::clone(&fwd_called);
+        move |on| calls.lock().unwrap().push(on)
+    };
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let state = Mutex::new(HandlerState {
+        child: Some(ManagedChild::Running(CoreHandle::new(8888))),
+    });
+    // Deliberately invalid arguments: admission must run before validation too.
+    let mut conn = MockConn::new(vec!["start", "/wrong", "", "", "1", ""]);
+    handle(&state, &deps, &mut conn);
+    assert_eq!(conn.writes(), ["OK start-not-admitted unknown 7007"]);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(fwd_called.lock().unwrap().is_empty());
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .child
+            .as_ref()
+            .map(|child| child.handle().pid),
+        Some(8888)
+    );
 }
 
 #[test]
@@ -975,6 +1117,8 @@ fn start_failure_reports_err_start_and_resets_forward() {
         spawn_calls: StdMutex::new(Vec::new()),
         terminate_calls: StdMutex::new(Vec::new()),
         kill_calls: StdMutex::new(Vec::new()),
+        start_admission: StdMutex::new(None),
+        terminate_results: StdMutex::new(std::collections::VecDeque::new()),
     };
     let fp = MockFreePort::empty();
     let systemd = MockSystemd::default();
@@ -1027,12 +1171,16 @@ fn cleanup_kills_child_and_reports_cleaned() {
     let fwd = no_op_fwd();
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let mut state = HandlerState::new();
-    state.child = Some(CoreHandle::new(333));
+    state.child = Some(ManagedChild::Running(CoreHandle::new(333)));
     let state = Mutex::new(state);
     let mut conn = MockConn::new(vec!["cleanup"]);
     handle(&state, &deps, &mut conn);
     assert_eq!(conn.writes(), vec!["OK cleaned"]);
     assert_eq!(*spawner.kill_calls.lock().unwrap(), vec![333]);
+    assert!(matches!(
+        state.lock().unwrap().child.as_ref(),
+        Some(ManagedChild::Stopping(_))
+    ));
 }
 
 #[test]

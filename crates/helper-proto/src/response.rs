@@ -79,7 +79,7 @@ pub enum Status {
 /// `stop` 响应载荷（三平台，`helper.go:440-442` 等）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    /// `OK stopped <pid>` —— 摘除并后台收割了一个在跑的 child。
+    /// `OK stopped <pid>` —— helper 确认停核；Linux 仅在 exact Child 已 native reap 后发送。
     Stopped { pid: u32 },
     /// `OK notrunning` —— 本来就没 child（幂等）。
     NotRunning,
@@ -89,6 +89,30 @@ pub enum Stop {
     /// 判据见 [`stop_pid_matches`](crate::request::stop_pid_matches)。旧客户端不发身份行 ⇒
     /// `want` 恒 `None` ⇒ 永不产生本响应，故新 helper + 旧客户端不受影响。
     Mismatch { want: u32, current: u32 },
+    /// `OK stop-pending <pid>` — termination was dispatched, but the exact
+    /// owned Child has not yet produced a successful native reap.
+    Pending { pid: u32 },
+    /// `OK stop-unknown <pid>` — native wait failed. Custody is retained and
+    /// callers must fail closed rather than treating this as stopped.
+    Unknown { pid: u32 },
+}
+
+/// A Linux Start that provably did not spawn because an earlier helper birth
+/// still owns native custody. The PID is diagnostic and permits an exact Stop;
+/// neither variant is a no-owner receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartNotAdmitted {
+    Pending { pid: u32 },
+    Unknown { pid: u32 },
+}
+
+impl StartNotAdmitted {
+    #[must_use]
+    pub const fn pid(self) -> u32 {
+        match self {
+            Self::Pending { pid } | Self::Unknown { pid } => pid,
+        }
+    }
 }
 
 /// helper 起核关键路径耗时（毫秒，三平台共用）。
@@ -133,6 +157,9 @@ pub enum Start {
     },
     /// `OK already <pid>` —— 已有 child 在跑，复用（不重启）。
     Already { pid: u32 },
+    /// `OK start-not-admitted pending|unknown <pid>` — no forwarding mutation
+    /// and no spawn occurred; an earlier native birth still blocks admission.
+    NotAdmitted(StartNotAdmitted),
 }
 
 /// `freeport` 响应载荷（三平台，`helper.go:370-394` 等）。`foreign` 的 names 由 ` | ` 分隔（Go `strings.Join(foreign, " | ")`）。
@@ -283,6 +310,8 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
         ResponseKind::Stop(Stop::Mismatch { want, current }) => {
             format!("OK stop-mismatch {want} {current}")
         }
+        ResponseKind::Stop(Stop::Pending { pid }) => format!("OK stop-pending {pid}"),
+        ResponseKind::Stop(Stop::Unknown { pid }) => format!("OK stop-unknown {pid}"),
         ResponseKind::Start(Start::Started { pid }) => format!("OK started {pid}"),
         ResponseKind::Start(Start::StartedTimed {
             pid,
@@ -301,6 +330,12 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
             created.map_or_else(|| base.clone(), |c| format!("{base} created={c}"))
         }
         ResponseKind::Start(Start::Already { pid }) => format!("OK already {pid}"),
+        ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Pending { pid })) => {
+            format!("OK start-not-admitted pending {pid}")
+        }
+        ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Unknown { pid })) => {
+            format!("OK start-not-admitted unknown {pid}")
+        }
         ResponseKind::Cleaned => "OK cleaned".to_owned(),
         ResponseKind::Route => "OK route".to_owned(),
         ResponseKind::FreePort(fp) => free_port_to_wire(fp),
@@ -402,6 +437,12 @@ fn parse_ok(rest: &str) -> ResponseKind {
                 current: parse_pid(rest),
             })
         }
+        "stop-pending" => ResponseKind::Stop(Stop::Pending {
+            pid: parse_pid(tail),
+        }),
+        "stop-unknown" => ResponseKind::Stop(Stop::Unknown {
+            pid: parse_pid(tail),
+        }),
         "started" => {
             let (pid_token, metrics) = parse_first_token(tail);
             let pid = pid_token.parse().unwrap_or(0);
@@ -417,6 +458,21 @@ fn parse_ok(rest: &str) -> ResponseKind {
         "already" => ResponseKind::Start(Start::Already {
             pid: parse_pid(tail),
         }),
+        "start-not-admitted" => {
+            let (state, pid) = parse_first_token(tail);
+            match state {
+                "pending" => ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Pending {
+                    pid: parse_pid(pid),
+                })),
+                "unknown" => ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Unknown {
+                    pid: parse_pid(pid),
+                })),
+                _ => ResponseKind::OkRaw {
+                    token: "start-not-admitted".to_owned(),
+                    rest: tail.to_owned(),
+                },
+            }
+        }
         "cleaned" => ResponseKind::Cleaned,
         "route" => ResponseKind::Route,
         "free" => ResponseKind::FreePort(FreePort::Free),

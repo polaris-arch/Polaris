@@ -443,10 +443,48 @@ fn native_wait_error_retains_unknown_custody_and_blocks_signal() {
 }
 
 #[test]
+fn start_admission_scans_every_slot_and_unknown_wins() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let current = ChildSlot::new(610);
+    let earlier_pending = ChildSlot::new(611);
+    let earlier_unknown = scripted_slot(
+        612,
+        vec![Err(std::io::Error::other("unrecoverable native wait"))],
+    );
+    spawner
+        .slots
+        .lock()
+        .unwrap()
+        .extend([Arc::clone(&current), earlier_pending, earlier_unknown]);
+
+    assert_eq!(
+        spawner.scan_start_admission(Some(&current.handle)),
+        StartAdmission::Blocked {
+            pid: 612,
+            state: ReapBlockerState::Unknown,
+        },
+        "an exact Running slot cannot hide an earlier unreaped birth"
+    );
+}
+
+#[test]
+fn termination_booking_is_single_worker_and_never_mints_reap() {
+    let slot = ChildSlot::new(613);
+    assert_eq!(slot.begin_or_poll_termination(), (StopReap::Pending, true));
+    assert_eq!(
+        slot.begin_or_poll_termination(),
+        (StopReap::Pending, false),
+        "a retry may poll but must not dispatch a second TERM/KILL worker"
+    );
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+}
+
+#[test]
 fn failed_native_wait_cannot_clear_handler_or_registry_when_reaper_finishes() {
     let slot = scripted_slot(425, vec![Err(std::io::Error::other("fake wait failure"))]);
     let state = Arc::new(Mutex::new(HandlerState::new()));
-    state.lock().unwrap().child = Some(slot.handle.clone());
+    state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
     let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
     run_reaper(&slot.handle, &state, &slot, &slots);
     assert!(state
@@ -454,7 +492,7 @@ fn failed_native_wait_cannot_clear_handler_or_registry_when_reaper_finishes() {
         .unwrap()
         .child
         .as_ref()
-        .is_some_and(|h| h.same_birth(&slot.handle)));
+        .is_some_and(|h| h.handle().same_birth(&slot.handle)));
     assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
     assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
 }
@@ -463,7 +501,7 @@ fn failed_native_wait_cannot_clear_handler_or_registry_when_reaper_finishes() {
 fn unknown_native_wait_stops_parent_watcher_without_probe_or_clear() {
     let slot = scripted_slot(427, vec![Err(std::io::Error::other("fake wait failure"))]);
     let state = Arc::new(Mutex::new(HandlerState::new()));
-    state.lock().unwrap().child = Some(slot.handle.clone());
+    state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
     let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
     assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
     assert_eq!(
@@ -478,7 +516,7 @@ fn unknown_native_wait_stops_parent_watcher_without_probe_or_clear() {
         .unwrap()
         .child
         .as_ref()
-        .is_some_and(|h| h.same_birth(&slot.handle)));
+        .is_some_and(|h| h.handle().same_birth(&slot.handle)));
     assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
 }
 
@@ -497,7 +535,7 @@ fn late_old_birth_reaper_cannot_clear_successor_with_reused_pid() {
     let successor = ChildSlot::new(423);
     assert!(!old.handle.same_birth(&successor.handle));
     let state = Arc::new(Mutex::new(HandlerState::new()));
-    state.lock().unwrap().child = Some(successor.handle.clone());
+    state.lock().unwrap().child = Some(ManagedChild::Running(successor.handle.clone()));
     let slots = Arc::new(Mutex::new(vec![Arc::clone(&old), Arc::clone(&successor)]));
     old.mark_exited();
     let LocalReapFact::Reaped(old_proof) = old.reap_fact() else {
@@ -509,7 +547,7 @@ fn late_old_birth_reaper_cannot_clear_successor_with_reused_pid() {
         .unwrap()
         .child
         .as_ref()
-        .is_some_and(|h| h.same_birth(&successor.handle)));
+        .is_some_and(|h| h.handle().same_birth(&successor.handle)));
     let remaining = slots.lock().unwrap();
     assert_eq!(remaining.len(), 1);
     assert!(remaining[0].handle.same_birth(&successor.handle));
@@ -521,7 +559,7 @@ fn mismatched_reaper_handle_cannot_clear_reaped_slot() {
     slot.mark_exited();
     let wrong = CoreHandle::new(428);
     let state = Arc::new(Mutex::new(HandlerState::new()));
-    state.lock().unwrap().child = Some(slot.handle.clone());
+    state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
     let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
     run_reaper(&wrong, &state, &slot, &slots);
     assert!(state
@@ -529,7 +567,7 @@ fn mismatched_reaper_handle_cannot_clear_reaped_slot() {
         .unwrap()
         .child
         .as_ref()
-        .is_some_and(|h| h.same_birth(&slot.handle)));
+        .is_some_and(|h| h.handle().same_birth(&slot.handle)));
     assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
 }
 
@@ -621,6 +659,39 @@ fn real_local_child_yields_reaped_only_after_native_wait() {
             _ => panic!("real child must be reaped by its owned Child handle"),
         }
     }
+}
+
+#[test]
+fn production_stop_poll_is_pending_until_native_reaper_clears_birth() {
+    let child = spawn_sleeper();
+    let handle = CoreHandle::new(child.id());
+    let slot = ChildSlot::from_child(child, handle.clone());
+    let state = Arc::new(Mutex::new(HandlerState {
+        child: Some(ManagedChild::Stopping(handle.clone())),
+    }));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    spawner.slots.lock().unwrap().push(Arc::clone(&slot));
+    spawn_reaper(
+        handle.clone(),
+        Arc::clone(&state),
+        Arc::clone(&slot),
+        Arc::clone(&spawner.slots),
+    );
+
+    assert_eq!(
+        spawner.terminate(&handle),
+        StopReap::Pending,
+        "dispatching TERM is not a successful Stop receipt"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if state.lock().unwrap().child.is_none() && spawner.slots.lock().unwrap().is_empty() {
+            spawner.wait_reaps(Duration::from_secs(1));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("native Child::try_wait never produced the reap proof");
 }
 
 // ===== 连接并发闸的接线（复审 Medium：spawn_blocking 在鉴权之前，且此前无上限）=====

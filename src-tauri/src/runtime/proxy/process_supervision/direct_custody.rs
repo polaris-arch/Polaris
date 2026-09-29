@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::runtime::proxy::process_supervision::{DirectCoreRun, DirectRunOrigin, RunIdentity};
 use polaris_core_supervisor::ChildObservation;
+use polaris_helper_proto::StartNotAdmitted;
 use tokio::process::Child;
 
 pub(crate) struct DirectCoreSlot {
@@ -74,7 +75,23 @@ impl HelperStopNonce {
 enum HelperStartPhase {
     Inflight,
     Known(u32),
+    /// The current Start spawned nothing, but adopted exact custody of an
+    /// earlier Linux helper birth that still blocks admission.
+    NotAdmitted(StartNotAdmitted),
     Unconfirmed,
+}
+
+impl HelperStartPhase {
+    fn exact_stop_pid(&self) -> Option<u32> {
+        match self {
+            Self::Known(pid) => Some(*pid),
+            Self::NotAdmitted(blocker) => {
+                let pid = blocker.pid();
+                (pid != 0).then_some(pid)
+            }
+            Self::Inflight | Self::Unconfirmed => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -316,6 +333,21 @@ impl DirectCoreSlot {
         true
     }
 
+    pub(in crate::runtime::proxy) fn finish_helper_start_not_admitted(
+        &mut self,
+        token: &HelperStartToken,
+        blocker: StartNotAdmitted,
+    ) -> bool {
+        let Some(attempt) = &mut self.helper_start else {
+            return false;
+        };
+        if !attempt.token.same(token) || !matches!(attempt.phase, HelperStartPhase::Inflight) {
+            return false;
+        }
+        attempt.phase = HelperStartPhase::NotAdmitted(blocker);
+        true
+    }
+
     pub(in crate::runtime::proxy) fn helper_start_inflight(
         &self,
         token: &HelperStartToken,
@@ -327,9 +359,7 @@ impl DirectCoreSlot {
 
     pub(in crate::runtime::proxy) fn helper_stop_target(&self) -> Option<(HelperStartToken, u32)> {
         let attempt = self.helper_start.as_ref()?;
-        let HelperStartPhase::Known(pid) = attempt.phase else {
-            return None;
-        };
+        let pid = attempt.phase.exact_stop_pid()?;
         Some((attempt.token.clone(), pid))
     }
 
@@ -340,9 +370,7 @@ impl DirectCoreSlot {
         &mut self,
     ) -> Option<(HelperStartToken, u32, HelperStopNonce)> {
         let attempt = self.helper_start.as_mut()?;
-        let HelperStartPhase::Known(pid) = attempt.phase else {
-            return None;
-        };
+        let pid = attempt.phase.exact_stop_pid()?;
         if attempt.stop_inflight.is_some() {
             return None;
         }
@@ -360,7 +388,7 @@ impl DirectCoreSlot {
             return None;
         };
         if !attempt.token.same(token)
-            || !matches!(attempt.phase, HelperStartPhase::Known(known) if known == pid)
+            || attempt.phase.exact_stop_pid() != Some(pid)
             || attempt.stop_inflight.is_some()
         {
             return None;
@@ -397,7 +425,7 @@ impl DirectCoreSlot {
             return false;
         };
         if !attempt.token.same(token)
-            || !matches!(attempt.phase, HelperStartPhase::Known(known) if known == pid)
+            || attempt.phase.exact_stop_pid() != Some(pid)
             || !attempt
                 .stop_inflight
                 .as_ref()
@@ -409,6 +437,27 @@ impl DirectCoreSlot {
         true
     }
 
+    pub(in crate::runtime::proxy) fn helper_pid_bookkeeping_matches(
+        &self,
+        token: &HelperStartToken,
+        pid: u32,
+        recorded_pid: Option<u32>,
+    ) -> bool {
+        let Some(attempt) = &self.helper_start else {
+            return false;
+        };
+        if !attempt.token.same(token) {
+            return false;
+        }
+        match attempt.phase {
+            HelperStartPhase::Known(known) => known == pid && recorded_pid == Some(pid),
+            HelperStartPhase::NotAdmitted(blocker) => {
+                blocker.pid() == pid && recorded_pid.is_none()
+            }
+            HelperStartPhase::Inflight | HelperStartPhase::Unconfirmed => false,
+        }
+    }
+
     pub(in crate::runtime::proxy) fn has_helper_start(&self) -> bool {
         self.helper_start.is_some()
     }
@@ -418,6 +467,13 @@ impl DirectCoreSlot {
         self.helper_start
             .as_ref()
             .is_some_and(|attempt| attempt.stop_inflight.is_some())
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn helper_start_not_admitted_for_test(&self) -> bool {
+        self.helper_start
+            .as_ref()
+            .is_some_and(|attempt| matches!(attempt.phase, HelperStartPhase::NotAdmitted(_)))
     }
 
     #[cfg(test)]

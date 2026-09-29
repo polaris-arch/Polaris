@@ -56,7 +56,8 @@ pub use request::{
     Request, RouteParams, StartParams,
 };
 pub use response::{
-    FlushDns, FreePort, LinuxDns, Pong, Response, ResponseKind, Start, StartTiming, Status, Stop,
+    FlushDns, FreePort, LinuxDns, Pong, Response, ResponseKind, Start, StartNotAdmitted,
+    StartTiming, Status, Stop,
 };
 
 /// Linux resolved 接管跨 crate 契约。
