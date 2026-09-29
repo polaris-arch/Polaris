@@ -25,6 +25,7 @@ internal class MainKernelAttempt<Server>(
     private val closeLaunched = AtomicBoolean(false)
     /** Orders this generation's Start and Reload, without delaying Stop's terminal close. */
     val operationLock = Any()
+    @Volatile var dualModeApiPort: Int? = null
     @Volatile var revoked = false
         private set
     val prepared = CompletableFuture<Server?>()

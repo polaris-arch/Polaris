@@ -10,6 +10,10 @@ fn native_system_endpoint_guard_code_survives_the_bridge_whitelist() {
         map_rejected_code(Some("unrecognized")),
         code::STARTUP_FAILED
     );
+    assert_eq!(
+        map_rejected_code(Some(ENDPOINT_RETIRED_NO_BIRTH)),
+        ENDPOINT_RETIRED_NO_BIRTH
+    );
 }
 
 /// 🔴 **变异锁：非 Android 上三条腿都必须是「诚实失败 / fail-open」，绝不静默成功。**

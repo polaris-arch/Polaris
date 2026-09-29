@@ -349,6 +349,17 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Android 未授予 VPN 权限", ERR_VPN_PERMISSION_DENIED)
             return
         }
+        try {
+            MainDualModeEndpointTombstone.requireFreshBridgeEndpoint(cfg)
+        } catch (error: DualModeEndpointTombstone.Retired) {
+            // No VpnBridge request or native attempt exists yet. Rust may safely
+            // allocate a new port and retry this same Start intent.
+            invoke.reject(error.message, ERR_ENDPOINT_RETIRED)
+            return
+        } catch (error: DualModeEndpointTombstone.Invalid) {
+            invoke.reject(error.message, ERR_STARTUP_FAILED)
+            return
+        }
         if (!VpnBridge.beginStart(MainStartRequest(cfg, args.runId, args.configDigest, args.claim), invoke)) {
             invoke.reject("Android 隧道已在运行或正在起停中", ERR_STARTUP_FAILED)
             return
@@ -916,6 +927,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
         /** 与 Rust `runtime/proxy::code::STARTUP_FAILED` 逐字对齐。 */
         const val ERR_STARTUP_FAILED = "STARTUP_FAILED"
+        const val ERR_ENDPOINT_RETIRED = "API_ENDPOINT_RETIRED"
 
         /**
          * 包可见性路线（Android 11 / API 30 起的 package visibility filtering）——

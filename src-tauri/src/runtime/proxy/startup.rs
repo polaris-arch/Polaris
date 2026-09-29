@@ -31,6 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(target_os = "android")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -71,6 +73,8 @@ use polaris_config_engine::user_config::proxy_ports::{control_api_port, local_pr
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_config_engine::user_config::tun_config::resolve_win_tun_interface_name;
 use polaris_config_engine::user_config::ProxyModeType;
+#[cfg(target_os = "android")]
+use polaris_core_supervisor::port_bookkeeping::PrimaryApiPortLedger;
 use polaris_core_supervisor::port_bookkeeping::{FreePortProvider, TokioPortProvider};
 use polaris_core_supervisor::{
     core_ready_budget_ms, core_startup_estimate_ms, decide_peel, run_config_check,
@@ -1255,6 +1259,7 @@ impl ProxyRuntime {
             platform_tag(),
         );
         let mut attempt: u32 = 0;
+        let mut retired_endpoint_retries: u32 = 0;
         // 内核闸门累计剥掉的节点 id。**必须在重试循环之外**：内核对某个节点的拒收是确定性的
         //（同一节点、同一个核，判定不会变），第 2 腿起沿用即可；再叠加已接受配置缓存后，
         // 同一核/配置的就绪重试腿连确认 check 也无需重复起进程。
@@ -1364,7 +1369,9 @@ impl ProxyRuntime {
                 subscription_update_in_port,
                 probe_proxy_port,
                 pool_ports,
-            ) = self.resolve_start_ports(&user_config, control_port);
+            ) = self
+                .resolve_start_ports(&user_config, control_port)
+                .map_err(|error| StartError::coded(error, code::STARTUP_FAILED))?;
             let mut deps = self.generate_deps(
                 api_port,
                 update_in_port,
@@ -1623,6 +1630,19 @@ impl ProxyRuntime {
                         0
                     }
                     Err((msg, error_code)) => {
+                        if error_code == super::android_bridge::ENDPOINT_RETIRED_NO_BIRTH {
+                            self.abandon_android_global_start_without_birth(&android_birth)
+                                .map_err(|e| StartError::coded(e, code::STARTUP_FAILED))?;
+                            main_reservation.confirmed_no_external_writer();
+                            retired_endpoint_retries += 1;
+                            if retired_endpoint_retries <= 8 {
+                                log::warn!("Android 旧管理端点预检拒绝；重分配新端口再试（第 {retired_endpoint_retries} 次）");
+                                continue;
+                            }
+                            let exhausted = "Android 管理端点重分配预算耗尽；请完全退出应用后重试";
+                            self.set_error(exhausted, code::STARTUP_FAILED);
+                            return Err(StartError::coded(exhausted, code::STARTUP_FAILED));
+                        }
                         self.set_error(&msg, error_code);
                         return Err(StartError::coded(msg, error_code));
                     }
@@ -2027,6 +2047,7 @@ impl ProxyRuntime {
             running: true,
             // 读时投影字段，存储态恒 false（真值 = `start_inflight` 计数，见字段文档）。
             starting: false,
+            reconnect_required: false,
             pid,
             // 起核就绪时刻 = 运行时长的零点。**取就绪后而非 spawn 时**：就绪前核还没在服务，
             // 把 12s 就绪门算进「已运行」是虚报。与 running 同生共死（stop/set_error 经 Default 清回 None）。
@@ -3025,7 +3046,7 @@ impl ProxyRuntime {
         &self,
         user_config: &UserConfig,
         control_port: u16,
-    ) -> (u16, u16, u16, Option<u16>, Vec<u16>) {
+    ) -> Result<(u16, u16, u16, Option<u16>, Vec<u16>), String> {
         // 管理 API 端口（上游 resolveTailscaleApiPort，:3006）。
         let exclusions = PortExclusions::for_primary_api(
             Some(control_port),
@@ -3033,8 +3054,17 @@ impl ProxyRuntime {
             None, // UserConfig 增量子集无 socksPort 字段 → 不排除（与 config-engine 现状一致）
             user_config.mixed_port,
         );
-        let resolved =
-            PortAllocator::new(TokioPortProvider).resolve_tailscale_api_port(&exclusions);
+        let allocator = PortAllocator::new(TokioPortProvider);
+        #[cfg(target_os = "android")]
+        let resolved = {
+            static USED_PRIMARY_API_PORTS: OnceLock<PrimaryApiPortLedger> = OnceLock::new();
+            USED_PRIMARY_API_PORTS
+                .get_or_init(PrimaryApiPortLedger::default)
+                .allocate(&allocator, &exclusions)
+                .map_err(|_| "Android 管理 API 端口已耗尽；请完全退出应用后重试".to_string())?
+        };
+        #[cfg(not(target_os = "android"))]
+        let resolved = allocator.resolve_tailscale_api_port(&exclusions);
         let api_port = resolved.port;
         if resolved.used_fallback {
             log::warn!("管理 API 端口 5 次解析均撞排除集 → 回落 {api_port}");
@@ -3092,13 +3122,13 @@ impl ProxyRuntime {
                 PROBE_POOL_SIZE + 1
             );
         }
-        (
+        Ok((
             api_port,
             update_in_port,
             subscription_update_in_port,
             probe_proxy_port,
             pool_ports,
-        )
+        ))
     }
 
     /// 网络场景 canary 探针的回环 UDP 口（spec §6.3 方案 2）。沿用 update-in 的分配路径

@@ -325,6 +325,7 @@
     "noServerConfig": "暫無伺服器設定",
     "others": "其他",
     "pageTitle": "主頁",
+    "nativeReconnectRequired": "連線變更需要重連。請在主頁點選連線；若仍顯示已連線，先中斷再連線。",
     "pendingApplyBtn": "立即套用",
     "pendingApplyFailed": "套用失敗",
     "pendingApplyFailedReason": "套用失敗：{{reason}}",

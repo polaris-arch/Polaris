@@ -347,6 +347,7 @@
     "noServerConfig": "هیچ سروری پیکربندی نشده",
     "others": "سایر",
     "pageTitle": "خانه",
+    "nativeReconnectRequired": "تغییرات اتصال به اتصال دوباره نیاز دارد. در صفحهٔ خانه وصل شوید؛ اگر هنوز متصل هستید، ابتدا قطع کنید.",
     "pendingApplyBtn": "همین حالا اعمال کن",
     "pendingApplyFailed": "اعمال ناموفق بود",
     "pendingApplyFailedReason": "اعمال ناموفق بود: {{reason}}",

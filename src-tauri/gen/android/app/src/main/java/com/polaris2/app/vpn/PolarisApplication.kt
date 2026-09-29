@@ -31,6 +31,9 @@ class PolarisApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // The native tombstone is process-local; a new process may safely take
+        // the persisted always-on endpoint as its first birth.
+        NativeReconnectNotice.clear(this)
         DebugDiagnostics.install(this)
         // Assets live inside the APK, not next to /system/bin/app_process64.
         // Finish the small local copy before Rust's startup seeding can run.

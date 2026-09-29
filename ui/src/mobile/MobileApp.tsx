@@ -73,6 +73,7 @@ import { MobileLockOverlay } from './MobileLockOverlay';
 import { useMobileConfigSync } from './config-sync';
 import { installMobileNavigator } from './navigate';
 import { MobilePendingBar } from './MobilePendingBar';
+import { MobileReconnectNotice } from './MobileReconnectNotice';
 import { MobileToaster } from './MobileToaster';
 import { DEFAULT_DESTINATION, type DestinationId } from './destinations';
 import { MobileShell } from './MobileShell';
@@ -234,7 +235,7 @@ export function MobileApp(): ReactElement {
         /* 两件停靠区 chrome 在这里装配、由外壳只管摆位：外壳不认识 store / `api` / `error-handler`。
            `MobileToaster` 一挂上，移动端生产源码里那 24 处早就写好的 `toast.*` 调用当场从静音变成
            可见（此前 `setToastImpl` 全仓唯一注入点在桌面 `Toaster.tsx`）。 */
-        pendingBar={<MobilePendingBar />}
+        pendingBar={<><MobileReconnectNotice /><MobilePendingBar /></>}
         toastHost={<MobileToaster />}
       >
         <Screen />

@@ -307,6 +307,124 @@ async fn android_exact_receipt_stays_with_its_request_birth() {
 }
 
 #[tokio::test]
+async fn typed_pre_dispatch_retirement_releases_only_exact_android_custody_and_ts_claim() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-endpoint-retired").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let first = rt.book_android_global_start(Some(token)).unwrap();
+    reservation.arm_external_start();
+    assert!(rt.mesh.main_owns_tailscale("ts-endpoint-retired", true));
+    rt.abandon_android_global_start_without_birth(&first)
+        .unwrap();
+    reservation.confirmed_no_external_writer();
+    drop(reservation);
+    assert!(!rt.mesh.main_owns_tailscale("ts-endpoint-retired", true));
+
+    let second = rt.book_android_global_start(None).unwrap();
+    assert!(rt
+        .abandon_android_global_start_without_birth(&first)
+        .is_err());
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .birth
+        .same(&second));
+    rt.confirm_android_global_start(&second, android_target("new-core"))
+        .unwrap();
+    assert!(rt
+        .abandon_android_global_start_without_birth(&second)
+        .is_err());
+}
+
+#[test]
+fn no_birth_retirement_never_erases_unknown_android_custody() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    rt.android_main_token
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .historic_unknown = true;
+    assert!(rt
+        .abandon_android_global_start_without_birth(&birth)
+        .is_err());
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .birth
+        .same(&birth));
+}
+
+#[test]
+fn retired_system_start_port_retries_with_fresh_port_and_stop_supersedes_old_birth() {
+    use polaris_core_supervisor::port_bookkeeping::{
+        FreePortProvider, PortAllocator, PortExclusions, PrimaryApiPortLedger,
+    };
+    use std::collections::VecDeque;
+
+    struct Ports(Mutex<VecDeque<u16>>);
+    impl FreePortProvider for Ports {
+        fn try_allocate(&self) -> Option<u16> {
+            self.0.lock().unwrap().pop_front()
+        }
+    }
+
+    let (rt, _dir) = test_runtime();
+    let ledger = PrimaryApiPortLedger::default();
+    let allocator = PortAllocator::new(Ports(Mutex::new(VecDeque::from([20_001, 20_001, 20_002]))))
+        .with_max_attempts(2);
+    let exclusions = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let generation = rt.gate.generation();
+
+    // A previous SystemStart used P before Rust's ledger existed. Rust first
+    // proposes P; Kotlin rejects it before VpnBridge.beginStart/native birth.
+    let first_port = ledger.allocate(&allocator, &exclusions).unwrap().port;
+    assert_eq!(first_port, 20_001);
+    let first = rt
+        .book_android_global_start_for_generation(generation, None)
+        .unwrap()
+        .unwrap();
+    rt.abandon_android_global_start_without_birth(&first)
+        .unwrap();
+
+    // A Stop/successor generation at this point must prevent the old request
+    // from booking or dispatching another native birth.
+    rt.gate.bump_generation();
+    assert!(rt
+        .book_android_global_start_for_generation(generation, None)
+        .unwrap()
+        .is_none());
+    assert!(rt.android_main_token.lock().unwrap().is_none());
+
+    // A fresh bridge Start remains possible. Even if the provider offers P
+    // again, the process ledger keeps it retired and picks Q.
+    let fresh_port = ledger.allocate(&allocator, &exclusions).unwrap().port;
+    assert_eq!(fresh_port, 20_002);
+    let second = rt
+        .book_android_global_start_for_generation(rt.gate.generation(), None)
+        .unwrap()
+        .unwrap();
+    assert!(!first.same(&second));
+}
+
+#[tokio::test]
 async fn cancelled_detached_android_stop_keeps_s2_ack_from_releasing_birth() {
     let (rt, _dir) = test_runtime();
     let gate = rt.mesh.tailscale_state_gate().await;

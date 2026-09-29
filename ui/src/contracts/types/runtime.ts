@@ -39,6 +39,8 @@ export interface ProxyStatus {
    *  不共享主窗 store，只能靠它得知「此刻正在启动」，从而把「连接」换成「取消」；缺了它就会在
    *  已有起核腿之上再叠一次 start。 */
   starting?: boolean;
+  /** Android native dual-mode reload was refused; connect again through Polaris. */
+  reconnectRequired?: boolean;
 }
 
 // ============================================================================

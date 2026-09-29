@@ -307,6 +307,33 @@ describe('① 首帧水合：冷启动时核可能已经在跑，初值必须自
     off();
   });
 
+  it('回前台重拉连接态，通知权限关闭仍能看到原生重连原因', async () => {
+    const listeners = new Map<string, EventListener>();
+    const fakeDocument = {
+      visibilityState: 'hidden',
+      addEventListener: (name: string, listener: EventListener) => listeners.set(name, listener),
+      removeEventListener: (name: string, listener: EventListener) => {
+        if (listeners.get(name) === listener) listeners.delete(name);
+      },
+    };
+    vi.stubGlobal('document', fakeDocument);
+    try {
+      const off = startMobileAppWiring(t);
+      await settle();
+      const before = getStatusMock.mock.calls.length;
+      proxyStatus = { running: true, reconnectRequired: true } as ProxyStatus;
+      fakeDocument.visibilityState = 'visible';
+      listeners.get('visibilitychange')?.(new Event('visibilitychange'));
+      await settle();
+      expect(getStatusMock.mock.calls.length).toBeGreaterThan(before);
+      expect(useAppStore.getState().proxyStatus?.reconnectRequired).toBe(true);
+      off();
+      expect(listeners.has('visibilitychange')).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('畸形差集载荷按空集降级、绝不抛（核未运行 / IPC 降级）', async () => {
     pendingRaw = {};
     const off = startMobileAppWiring(t);

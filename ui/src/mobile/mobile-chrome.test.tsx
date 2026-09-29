@@ -417,6 +417,17 @@ describe('④ 装配面：两件 chrome 真的被摆进了停靠区（不是「�
     const slot = html.indexOf('data-slot="pending-changes"');
     expect(html.slice(slot, slot + 400)).not.toContain('class="m-pending"');
   });
+
+  it('通知不可见时仍由后端状态在前台常驻显示双态重连原因', () => {
+    useAppStore.setState({
+      proxyStatus: { running: true, reconnectRequired: true } as never,
+    });
+    mirrorLiveStateIntoSsrSnapshot();
+    const html = renderToStaticMarkup(<MobileApp />);
+    const slot = html.indexOf('data-slot="pending-changes"');
+    expect(html.slice(slot, slot + 600)).toContain('home.nativeReconnectRequired');
+    expect(html.slice(slot, slot + 600)).toContain('role="alert"');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

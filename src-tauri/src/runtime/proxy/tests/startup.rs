@@ -122,7 +122,7 @@ fn race_server_default_is_off_zero_port() {
 fn subscription_update_port_is_independent_and_flows_into_generate_deps() {
     let (rt, _dir) = test_runtime();
     let config = UserConfig::default();
-    let (api, update, subscription, probe, pool) = rt.resolve_start_ports(&config, 9090);
+    let (api, update, subscription, probe, pool) = rt.resolve_start_ports(&config, 9090).unwrap();
     assert_ne!(subscription, 0);
     assert_ne!(subscription, api);
     assert_ne!(subscription, update);

@@ -325,6 +325,7 @@
     "noServerConfig": "No server configured",
     "others": "Others",
     "pageTitle": "Home",
+    "nativeReconnectRequired": "Connection changes need a reconnect. Connect on Home; if still connected, disconnect first.",
     "pendingApplyBtn": "Apply now",
     "pendingApplyFailed": "Failed to apply",
     "pendingApplyFailedReason": "Failed to apply: {{reason}}",

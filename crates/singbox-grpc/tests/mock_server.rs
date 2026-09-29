@@ -1025,6 +1025,37 @@ async fn endpoint_target_ipv6_bracketing() {
 }
 
 #[tokio::test]
+async fn lazy_old_h2c_request_cannot_reach_new_core_on_fresh_port() {
+    // Keep the old address reserved while binding the replacement so the
+    // endpoint identities are deterministically different. The client is a real
+    // tonic lazy Channel: its connector has not run before the new core starts.
+    let old_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old_port = old_listener.local_addr().unwrap().port();
+    let old_client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", old_port), SECRET)
+        .await
+        .unwrap();
+    let old_call = tokio::spawn(async move { old_client.set_clash_mode("mesh-direct").await });
+    // The real tonic connector has established TCP and queued the h2/RPC work,
+    // but this old endpoint deliberately never serves HTTP/2.
+    let (old_socket, _) = tokio::time::timeout(Duration::from_secs(2), old_listener.accept())
+        .await
+        .expect("old lazy connector reached TCP barrier")
+        .unwrap();
+    let (new_addr, new_state, _server) = spawn_server(SECRET, 0).await;
+    assert_ne!(old_port, new_addr.port());
+    drop(old_socket);
+    drop(old_listener);
+
+    assert!(old_call.await.unwrap().is_err());
+    assert!(new_state.clash_mode.lock().unwrap().is_empty());
+    let new_client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", new_addr.port()), SECRET)
+        .await
+        .unwrap();
+    new_client.set_clash_mode("normal").await.unwrap();
+    assert_eq!(*new_state.clash_mode.lock().unwrap(), "normal");
+}
+
+#[tokio::test]
 async fn subscribe_tailscale_status_delivers_frames() {
     // server 每次连接推 2 帧全量端点快照。断言首帧真到达且字段解码正确（endpointTag/backendState/self IP）。
     let (addr, _h) = spawn_ts_server(SECRET, 2).await;

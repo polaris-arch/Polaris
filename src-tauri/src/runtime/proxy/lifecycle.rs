@@ -9,6 +9,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(any(target_os = "android", test))]
+pub(super) const NATIVE_RECONNECT_MARKER: &str = "native-reconnect-required";
+
+#[cfg(any(target_os = "android", test))]
+pub(super) fn native_reconnect_required(config_dir: &std::path::Path) -> bool {
+    config_dir.join(NATIVE_RECONNECT_MARKER).is_file()
+}
+
 use serde_json::Value;
 use tokio::sync::{MutexGuard, Notify};
 
@@ -320,6 +328,10 @@ impl ProxyRuntime {
             .map(|t0| now_ms().saturating_sub(t0) / 1_000);
         // 读时投影（同 uptime）：起核腿在飞 ⇒ starting=true。存储态恒 false，故读这一处即全部真值。
         snap.starting = self.start_inflight.load(Ordering::SeqCst) > 0;
+        #[cfg(target_os = "android")]
+        {
+            snap.reconnect_required = native_reconnect_required(self.config.dir());
+        }
         snap
     }
 

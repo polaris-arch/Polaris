@@ -325,6 +325,7 @@
     "noServerConfig": "暂无服务器配置",
     "others": "其他",
     "pageTitle": "主页",
+    "nativeReconnectRequired": "连接更改需要重连。请在首页点击连接；若仍显示已连接，先断开再连接。",
     "pendingApplyBtn": "立即应用",
     "pendingApplyFailed": "应用失败",
     "pendingApplyFailedReason": "应用失败：{{reason}}",

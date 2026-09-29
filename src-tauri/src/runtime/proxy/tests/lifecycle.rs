@@ -1,5 +1,16 @@
 use super::*;
 
+#[test]
+fn native_reconnect_marker_is_a_read_only_status_projection() {
+    let (_rt, dir) = test_runtime();
+    let marker = dir.join(super::super::lifecycle::NATIVE_RECONNECT_MARKER);
+    assert!(!super::super::lifecycle::native_reconnect_required(&dir));
+    std::fs::write(&marker, b"dual-mode-reload-requires-reconnect").unwrap();
+    assert!(super::super::lifecycle::native_reconnect_required(&dir));
+    std::fs::remove_file(marker).unwrap();
+    assert!(!super::super::lifecycle::native_reconnect_required(&dir));
+}
+
 #[cfg(not(target_os = "android"))]
 #[tokio::test]
 async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sweep() {
@@ -1263,6 +1274,7 @@ fn proxy_status_serializes_camel_case_contract() {
         update_in_port: 45678,
         subscription_update_in_port: 45679,
         starting: false,
+        reconnect_required: true,
     };
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["running"], true);
@@ -1277,6 +1289,7 @@ fn proxy_status_serializes_camel_case_contract() {
     assert_eq!(v["uptime"], 90);
     assert_eq!(v["error"], "boom");
     assert_eq!(v["errorCode"], "STARTUP_FAILED");
+    assert_eq!(v["reconnectRequired"], true);
 
     // pid=0 / 未运行时省略（对齐 上游 `pid?` / `startTime?` / `uptime?` / `errorCode?`）。
     let z = ProxyStatus::default();
@@ -1284,6 +1297,7 @@ fn proxy_status_serializes_camel_case_contract() {
     assert!(zv.get("pid").is_none());
     assert!(zv.get("startTime").is_none());
     assert!(zv.get("uptime").is_none());
+    assert!(zv.get("reconnectRequired").is_none());
     assert!(zv.get("errorCode").is_none());
     // starting 同样是「false 即省略」的可选字段（渲染端 `starting?: boolean`）。
     assert!(zv.get("starting").is_none());

@@ -357,6 +357,33 @@ impl ProxyRuntime {
         Ok(())
     }
 
+    /// Only the typed Kotlin pre-dispatch rejection proves no native owner was
+    /// created. Release this exact request's booking so its next allocation can
+    /// retry; all unknown/late failures retain custody for safety.
+    pub(super) fn abandon_android_global_start_without_birth(
+        &self,
+        birth: &super::AndroidRequestBirth,
+    ) -> Result<(), String> {
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned after no-birth rejection".to_string())?;
+        match custody.as_ref() {
+            Some(attempt)
+                if attempt.birth.same(birth)
+                    && !attempt.start_confirmed
+                    && attempt.exact_target.is_none()
+                    && !attempt.stop_only
+                    && !attempt.historic_unknown
+                    && attempt.stop_inflight.is_none() =>
+            {
+                *custody = None;
+                Ok(())
+            }
+            _ => Err("Android no-birth rejection changed custody; refusing port retry".into()),
+        }
+    }
+
     pub(super) fn begin_android_stop_booking(
         &self,
         allow_main: bool,

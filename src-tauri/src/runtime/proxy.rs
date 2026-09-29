@@ -271,6 +271,10 @@ pub struct ProxyStatus {
     /// **再叠一次启动**（TrayMenu.tsx 原 :219-236 的缺陷）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub starting: bool,
+    /// Android native dual-mode reload was rejected; the live core remains up,
+    /// but the user must reconnect through the app for a fresh API endpoint.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reconnect_required: bool,
     /// sing-box 进程 pid（未运行=0）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub pid: u32,

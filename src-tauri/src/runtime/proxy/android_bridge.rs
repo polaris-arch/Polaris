@@ -570,9 +570,14 @@ fn map_rejected_code(code: Option<&str>) -> &'static str {
     match code {
         Some(c) if c == code::VPN_PERMISSION_DENIED => code::VPN_PERMISSION_DENIED,
         Some(c) if c == code::SYSTEM_INTERFACE_UNSUPPORTED => code::SYSTEM_INTERFACE_UNSUPPORTED,
+        Some(c) if c == ENDPOINT_RETIRED_NO_BIRTH => ENDPOINT_RETIRED_NO_BIRTH,
         _ => code::STARTUP_FAILED,
     }
 }
+
+/// Kotlin emits this only before VpnBridge.beginStart/native attempt creation.
+/// It is an internal retry receipt, never exposed as a ProxyStatus error code.
+pub(super) const ENDPOINT_RETIRED_NO_BIRTH: &str = "API_ENDPOINT_RETIRED";
 
 #[cfg(target_os = "android")]
 mod handle {

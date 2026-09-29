@@ -486,10 +486,15 @@ export function startMobileAppWiring(t: WiringT): () => void {
 
   /* ── ③ 30s 兜底轮询 ──────────────────────────────────────────────────────── */
   const poll = setInterval(() => void store().refreshProxyStatus(), MOBILE_STATUS_POLL_MS);
+  const onForeground = () => {
+    if (document.visibilityState === 'visible') void store().refreshProxyStatus();
+  };
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onForeground);
 
   return () => {
     live = false;
     clearInterval(poll);
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onForeground);
     for (const off of offs) off();
   };
 }

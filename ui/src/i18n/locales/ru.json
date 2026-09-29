@@ -347,6 +347,7 @@
     "noServerConfig": "Серверы не настроены",
     "others": "Прочее",
     "pageTitle": "Главная",
+    "nativeReconnectRequired": "Для изменений нужно переподключение. Подключитесь на главном экране; если соединение ещё активно, сначала отключитесь.",
     "pendingApplyBtn": "Применить сейчас",
     "pendingApplyFailed": "Не удалось применить",
     "pendingApplyFailedReason": "Не удалось применить: {{reason}}",

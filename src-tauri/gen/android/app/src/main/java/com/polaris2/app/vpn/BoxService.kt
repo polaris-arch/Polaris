@@ -196,6 +196,9 @@ class BoxService(
             if (bridgeConfig != null) SystemStart.requireLegacyAllowed(service)
             SystemEndpointGuard.requireSupported(config)
             PolarisApplication.ensureSetup()
+            // Reserve before native birth. A failed/cancelled birth can still leave a
+            // tonic connector carrying requests for this exact endpoint.
+            attempt.dualModeApiPort = MainDualModeEndpointTombstone.claimBirth(config)
             TransientSpeedtestHost.withMainStart(attempt, { isStarting(attempt) }) {
                 TransientLoginHost.withMainConfig(attempt, config, { isStarting(attempt) }) {
                     check(isStarting(attempt)) { "起核已被停核接管" }
@@ -222,6 +225,7 @@ class BoxService(
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
                 check(mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting) { "起核已被停核接管" }
                 attempt.acknowledgeStart()
+                if (bridgeConfig != null) NativeReconnectNotice.clear(service)
                 state = ServiceState.Started
                 StatsBridge.activateAll()
                 // The token check and bridge acknowledgement share Stop's lock.
@@ -264,10 +268,17 @@ class BoxService(
                     if (bridgeConfig != null) SystemStart.forget(service, "经桥起核失败")
                     VpnBridge.finishStart(
                         e.message ?: e.toString(),
-                        if (e is SystemEndpointGuard.Unsupported) SystemEndpointGuard.ERROR else PolarisVpnPlugin.ERR_STARTUP_FAILED,
+                        when (e) {
+                            is SystemEndpointGuard.Unsupported -> SystemEndpointGuard.ERROR
+                            else -> PolarisVpnPlugin.ERR_STARTUP_FAILED
+                        },
                     )
                     true
                 }
+            }
+            if (current && bridgeConfig == null && e is DualModeEndpointTombstone.Retired) {
+                runCatching { showReconnectNotice() }
+                    .onFailure { Log.e(TAG, "重连提醒失败，仍需关闭拒收的旧端点", it) }
             }
             if (current) stopService(attempt)
         }
@@ -309,6 +320,14 @@ class BoxService(
             }
         try {
             SystemEndpointGuard.requireSupported(config)
+            MainDualModeEndpointTombstone.requireReloadAllowed(attempt.dualModeApiPort != null, config)
+        } catch (_: DualModeEndpointTombstone.ReloadRequiresReconnect) {
+            // Native reload would create a new core at the old management endpoint.
+            // Keep the current core alive; a bridge Start must allocate a fresh port.
+            Log.w(TAG, "双态内核重载被拒；保持现有连接，请通过应用重新连接")
+            runCatching { showReconnectNotice() }
+                .onFailure { Log.e(TAG, "重连提醒失败，保持现有连接", it) }
+            return
         } catch (error: Exception) {
             setReloadError(attempt, server, error)
             return
@@ -336,6 +355,28 @@ class BoxService(
                 runCatching { server.setError("android: reload: ${error.message}") }
             }
         }
+    }
+
+    private fun showReconnectNotice() {
+        NativeReconnectNotice.require(service)
+        val channel = "polaris-endpoint-reconnect"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PolarisApplication.notification.createNotificationChannel(
+                NotificationChannel(channel, "Polaris 连接提醒", NotificationManager.IMPORTANCE_DEFAULT),
+            )
+        }
+        val notice = NotificationCompat.Builder(service, channel)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("需要重新连接")
+            .setContentText("请回到 Polaris；若仍显示已连接，先断开再连接")
+            .setAutoCancel(true)
+            .setContentIntent(PendingIntent.getActivity(
+                service, 0,
+                Intent(service, MainActivity::class.java).setFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            ))
+            .build()
+        PolarisApplication.notification.notify(ENDPOINT_RECONNECT_NOTICE_ID, notice)
     }
 
     // Android 没有「系统 HTTP 代理开关」这一层：VpnService.Builder.setHttpProxy 是随隧道一起
@@ -520,6 +561,10 @@ class BoxService(
                 closeFailed = false
             }) { "主核关闭回执与进程所有权不一致" }
         }
+        // Only an exact successful native close resolves the pending reconnect
+        // reason. A Stop timeout/cleanupUnknown leaves it visible and blocks reuse.
+        runCatching { NativeReconnectNotice.clear(service) }
+            .onFailure { Log.e(TAG, "清理重连提醒失败", it) }
         deliverStop?.invoke()
         mainHandler.post {
             synchronized(this) {
@@ -550,6 +595,7 @@ class BoxService(
     companion object {
         private const val TAG = "PolarisBoxService"
         private const val PROFILE_NAME = "Polaris"
+        private const val ENDPOINT_RECONNECT_NOTICE_ID = 39091
 
         /** 外部（通知按钮、将来的 UI/命令面）请求停机的唯一入口。 */
         fun requestStop(context: Context) {
