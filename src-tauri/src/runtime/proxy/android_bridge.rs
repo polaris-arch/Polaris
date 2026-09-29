@@ -115,6 +115,7 @@ pub(crate) async fn bindable_interfaces() -> Result<Vec<BindableInterface>, Stri
         "listBindableInterfaces",
         (),
         LOCAL_STATE_TIMEOUT,
+        None,
     )
     .await
     .map(|response| response.interfaces)
@@ -394,6 +395,7 @@ pub(super) async fn main_core_exact_status(
                 birth_nonce: target.birth_nonce.clone(),
             },
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await;
         exact_main_core_result(result, target)
@@ -423,6 +425,7 @@ pub(super) async fn stop_core_exact(
                 birth_nonce: target.birth_nonce.clone(),
             },
             STOP_TIMEOUT,
+            None,
         )
         .await;
         exact_main_core_result(result, target)
@@ -452,6 +455,7 @@ pub(super) async fn main_core_ownership() -> Result<AndroidMainCoreOwnership, St
             "mainCoreOwnership",
             (),
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await
         .map_err(|error| match error {
@@ -537,6 +541,7 @@ pub(super) async fn legacy_drain_status(
                 fence_id: fence_id.to_owned(),
             },
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await
         .map_err(|error| match error {
@@ -666,13 +671,18 @@ async fn call_with_budget<T, P>(
     command: &'static str,
     payload: P,
     budget: Duration,
+    request_birth: Option<super::AndroidRequestBirth>,
 ) -> Result<T, BridgeCallError>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
     P: serde::Serialize + Send + 'static,
 {
-    let task =
-        tokio::spawn(async move { plugin.run_mobile_plugin_async::<T>(command, payload).await });
+    let task = tokio::spawn(async move {
+        // The detached task, not its cancellable waiter, keeps the birth
+        // alive through a delayed Kotlin callback or Rust-side timeout.
+        let _request_birth = request_birth;
+        plugin.run_mobile_plugin_async::<T>(command, payload).await
+    });
     match tokio::time::timeout(budget, task).await {
         Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(e))) => Err(BridgeCallError::Invoke(e)),
@@ -694,6 +704,7 @@ pub(crate) async fn collect_debug_diagnostics() -> Result<String, String> {
         "collectDebugDiagnostics",
         (),
         Duration::from_secs(10),
+        None,
     )
     .await
     {
@@ -714,6 +725,7 @@ pub(crate) async fn share_debug_report(report: String) -> Result<(), String> {
         "shareDebugReport",
         Report { report },
         Duration::from_secs(10),
+        None,
     )
     .await
     {
@@ -726,7 +738,14 @@ pub(crate) async fn share_debug_report(report: String) -> Result<(), String> {
 #[cfg(target_os = "android")]
 pub(super) async fn request_vpn_permission() -> Result<(), BridgeError> {
     let plugin = plugin_handle()?;
-    match call_with_budget::<(), _>(plugin, "requestVpnPermission", (), AUTH_REQUEST_TIMEOUT).await
+    match call_with_budget::<(), _>(
+        plugin,
+        "requestVpnPermission",
+        (),
+        AUTH_REQUEST_TIMEOUT,
+        None,
+    )
+    .await
     {
         Ok(()) => Ok(()),
         Err(BridgeCallError::Invoke(e)) => Err(invoke_error(&e)),
@@ -746,22 +765,44 @@ pub(super) async fn request_vpn_permission() -> Result<(), BridgeError> {
 /// 传的是内存字符串而不是盘上路径，且它与 `std::fs::write(config_path, &json)` 写下去的是
 /// **同一个 `json` 变量**（不是两次序列化）⇒ 诊断包里那份与内核实际吃的那份不可能漂。
 /// 一旦有人改成「从盘上读回来再传给 libbox」，诊断与内核就有了两条路径。
+pub(super) fn main_start_dispatch_available() -> Result<(), BridgeError> {
+    #[cfg(target_os = "android")]
+    {
+        plugin_handle().map(|_| ())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err(("Android 起核桥在本平台不存在".into(), code::STARTUP_FAILED))
+    }
+}
+
+#[cfg(test)]
 pub(super) async fn start_core(config_json: &str) -> Result<AndroidStartReceipt, BridgeError> {
     let run_id = format!(
         "legacy-{}{}",
         polaris_store::fs::random_tmp_suffix(),
         polaris_store::fs::random_tmp_suffix()
     );
-    start_core_with_claim(config_json, &run_id, None).await
+    start_core_with_claim_and_birth(config_json, &run_id, None, None).await
 }
 
-/// Managed callers must first persist this run ID in StartRequested and pass the
-/// same serialized claim. This adapter echoes and checks it; it does not mint the
-/// journal's identity or decide that the TUN scope is complete.
-pub(super) async fn start_core_with_claim(
+pub(super) async fn start_core_with_birth(
+    config_json: &str,
+    request_birth: super::AndroidRequestBirth,
+) -> Result<AndroidStartReceipt, BridgeError> {
+    let run_id = format!(
+        "legacy-{}{}",
+        polaris_store::fs::random_tmp_suffix(),
+        polaris_store::fs::random_tmp_suffix()
+    );
+    start_core_with_claim_and_birth(config_json, &run_id, None, Some(request_birth)).await
+}
+
+async fn start_core_with_claim_and_birth(
     config_json: &str,
     run_id: &str,
     claim: Option<&str>,
+    request_birth: Option<super::AndroidRequestBirth>,
 ) -> Result<AndroidStartReceipt, BridgeError> {
     if run_id.trim().is_empty() || run_id.trim() != run_id || claim.is_some_and(str::is_empty) {
         return Err(("Android 起核身份无效".to_string(), code::STARTUP_FAILED));
@@ -792,6 +833,7 @@ pub(super) async fn start_core_with_claim(
                 claim: claim.map(str::to_owned),
             },
             START_TIMEOUT,
+            request_birth,
         )
         .await
         {
@@ -819,7 +861,7 @@ pub(super) async fn start_core_with_claim(
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (config_json, config_digest, claim);
+        let _ = (config_json, config_digest, claim, request_birth);
         Err((
             "Android 起核桥在本平台不存在（调用点应由 cfg! 守住）".to_string(),
             // 走同一个白名单取默认码：这条腿与 Android 腿的「认不出来的码降级到什么」必须是同一个
@@ -833,21 +875,35 @@ pub(super) async fn start_core_with_claim(
 ///
 /// 停不掉就返 `Err`，调用方不得据此继续清运行态或起第二个核 —— Android 上 tun fd 由
 /// `VpnService.prepare()` 仲裁，同一时刻只授权一个应用，前一条隧道没拆干净就起第二个必然打架。
+#[cfg(test)]
 pub(super) async fn stop_core() -> Result<(), String> {
+    stop_core_with_birth(super::AndroidRequestBirth {
+        identity: std::sync::Arc::new(()),
+        main_token: None,
+    })
+    .await
+}
+
+pub(super) async fn stop_core_with_birth(
+    request_birth: super::AndroidRequestBirth,
+) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
         let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
-        let r = match call_with_budget::<(), _>(plugin, "stop", (), STOP_TIMEOUT).await {
-            Ok(()) => Ok(()),
-            Err(BridgeCallError::Invoke(e)) => Err(format!("Android 停核桥失败：{e}")),
-            Err(BridgeCallError::TimedOut) => Err(format!(
-                "Android 停核桥 {}s 无回应（隧道可能仍在）",
-                STOP_TIMEOUT.as_secs()
-            )),
-            Err(BridgeCallError::TaskFailed(e)) => {
-                Err(format!("Android 停核桥投递腿异常：{e}（隧道可能仍在）"))
-            }
-        };
+        let r =
+            match call_with_budget::<(), _>(plugin, "stop", (), STOP_TIMEOUT, Some(request_birth))
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(BridgeCallError::Invoke(e)) => Err(format!("Android 停核桥失败：{e}")),
+                Err(BridgeCallError::TimedOut) => Err(format!(
+                    "Android 停核桥 {}s 无回应（隧道可能仍在）",
+                    STOP_TIMEOUT.as_secs()
+                )),
+                Err(BridgeCallError::TaskFailed(e)) => {
+                    Err(format!("Android 停核桥投递腿异常：{e}（隧道可能仍在）"))
+                }
+            };
         // 记账只在**确认停下**时清：桥失败时隧道可能还在，把记账清成「没核」会让下一次起核
         // 以为现场是干净的。
         if r.is_ok() {
@@ -857,6 +913,7 @@ pub(super) async fn stop_core() -> Result<(), String> {
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _ = request_birth;
         Err("Android 停核桥在本平台不存在（调用点应由 cfg! 守住）".to_string())
     }
 }
@@ -897,6 +954,7 @@ pub(crate) async fn check_config(config_json: &str) -> ConfigCheckVerdict {
                 config_content: config_json.to_owned(),
             },
             CHECK_TIMEOUT,
+            None,
         )
         .await
         {
@@ -954,6 +1012,7 @@ pub(crate) async fn auth_status() -> VpnAuthState {
             "vpnAuthStatus",
             (),
             AUTH_STATUS_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1018,6 +1077,7 @@ pub(crate) async fn system_started_core_running() -> bool {
             "systemStartStatus",
             (),
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1060,6 +1120,7 @@ pub(crate) async fn set_boot_auto_connect(enabled: bool) -> Result<(), String> {
             "setBootAutoConnect",
             BootAutoConnectArgs { enabled },
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1091,6 +1152,7 @@ pub(crate) async fn boot_auto_connect() -> Result<bool, String> {
             "bootAutoConnectStatus",
             (),
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1124,6 +1186,7 @@ pub(crate) async fn set_system_backup(enabled: bool) -> Result<(), String> {
             "setSystemBackup",
             SystemBackupArgs { enabled },
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1159,6 +1222,7 @@ pub(crate) async fn system_backup() -> Result<bool, String> {
             "systemBackupStatus",
             (),
             LOCAL_STATE_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1208,6 +1272,7 @@ pub(crate) async fn installed_apps() -> Result<Vec<InstalledApp>, String> {
             "listInstalledApps",
             (),
             INSTALLED_APPS_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1271,6 +1336,7 @@ pub(crate) async fn hand_apk_to_system_installer(apk_path: &str) -> Result<ApkHa
                 apk_path: apk_path.to_owned(),
             },
             INSTALL_APK_TIMEOUT,
+            None,
         )
         .await
         {
@@ -1398,6 +1464,7 @@ pub(crate) async fn start_transient_speedtest(
             config_content: config_content.to_owned(),
         },
         START_TIMEOUT,
+        None,
     )
     .await;
     if result.is_ok() {
@@ -1430,6 +1497,7 @@ pub(crate) async fn close_transient_speedtest(instance_id: &str) -> Result<(), S
             instance_id: instance_id.to_owned(),
         },
         STOP_TIMEOUT,
+        None,
     )
     .await
     .map(|_| ())
@@ -1457,6 +1525,7 @@ pub(crate) async fn transient_speedtest_status(
             instance_id: instance_id.to_owned(),
         },
         LOCAL_STATE_TIMEOUT,
+        None,
     )
     .await
     .map(|status| status.state)
@@ -1484,6 +1553,7 @@ pub(crate) async fn start_transient_login(
             config_content: config_content.to_owned(),
         },
         START_TIMEOUT,
+        None,
     )
     .await
     .map_err(|error| match error {
@@ -1515,6 +1585,7 @@ pub(crate) async fn close_transient_login(instance_id: &str) -> Result<(), Strin
             instance_id: instance_id.to_owned(),
         },
         STOP_TIMEOUT,
+        None,
     )
     .await
     .map(|_| ())
@@ -1540,6 +1611,7 @@ pub(crate) async fn transient_login_running(instance_id: &str) -> Result<bool, S
             instance_id: instance_id.to_owned(),
         },
         LOCAL_STATE_TIMEOUT,
+        None,
     )
     .await
     .map(|status| status.running)

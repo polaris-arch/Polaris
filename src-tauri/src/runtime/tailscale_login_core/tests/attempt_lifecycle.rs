@@ -79,6 +79,254 @@ async fn acquire(signal: &Semaphore) {
         .forget();
 }
 
+async fn claim_main_for_test(
+    reg: &LoginCoreRegistry,
+    generated: &serde_json::Value,
+    root: &Path,
+    gate: &tokio::sync::MutexGuard<'_, ()>,
+) -> MainBirthToken {
+    let token = reg.mint_main_birth();
+    let mut reservation = reg
+        .reserve_main_states(generated, root, gate, token.clone())
+        .await
+        .unwrap();
+    // Simulate an external start: the claim must outlive this fixture scope.
+    reservation.arm_external_start();
+    token
+}
+
+#[tokio::test]
+async fn main_birth_token_only_retires_its_own_complete_claim() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let gate = reg.state_gate().await;
+    let first = json!({"endpoints":[{"type":"tailscale", "tag":"first", "state_directory":root.join("tailscale/ts1")}]});
+    let second = json!({"endpoints":[{"type":"tailscale", "tag":"second", "state_directory":root.join("tailscale/ts2")}]});
+    let old = claim_main_for_test(&reg, &first, &root, &gate).await;
+    assert!(reg.main_owns("ts1", true));
+    assert!(
+        reg.reserve_main_states(&second, &root, &gate, reg.mint_main_birth())
+            .await
+            .is_err(),
+        "overlap or changed range cannot replace a live physical attempt"
+    );
+    assert!(reg.release_main_states_if_token(&old, &gate).unwrap());
+    let new = claim_main_for_test(&reg, &second, &root, &gate).await;
+    assert!(!reg.release_main_states_if_token(&old, &gate).unwrap());
+    assert!(!reg.main_owns("ts1", true));
+    assert!(reg.main_owns("ts2", true));
+    assert!(reg.release_main_states_if_token(&new, &gate).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn main_birth_requires_actual_registry_and_gate() {
+    let make = || {
+        reg_with(
+            fake_spawner(vec![], false, false),
+            fake_subscriber(false),
+            true,
+            Duration::from_secs(60),
+        )
+    };
+    let a = make();
+    let b = make();
+    let root = temp_ud();
+    let generated =
+        json!({"endpoints":[{"type":"tailscale", "state_directory":root.join("tailscale/ts1")}]});
+    let a_gate = a.state_gate().await;
+    let b_gate = b.state_gate().await;
+    let a_token = a.mint_main_birth();
+    assert!(a
+        .reserve_main_states(&generated, &root, &b_gate, a_token.clone())
+        .await
+        .is_err());
+    assert!(b
+        .reserve_main_states(&generated, &root, &b_gate, a_token.clone())
+        .await
+        .is_err());
+    let mut reservation = a
+        .reserve_main_states(&generated, &root, &a_gate, a_token.clone())
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    assert!(a.release_main_states_if_token(&a_token, &b_gate).is_err());
+    assert!(b.release_main_states_if_token(&a_token, &b_gate).is_err());
+    assert!(a.main_owns("ts1", true));
+    assert!(a.release_main_states_if_token(&a_token, &a_gate).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn main_reservation_rejects_any_invalid_ts_directory_but_no_ts_is_noop() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let gate = reg.state_gate().await;
+    let invalid = json!({"endpoints":[
+        {"type":"tailscale", "state_directory":root.join("tailscale/ts1")},
+        {"type":"tailscale", "state_directory":root.join("other/ts2")}
+    ]});
+    assert!(reg
+        .reserve_main_states(&invalid, &root, &gate, reg.mint_main_birth())
+        .await
+        .is_err());
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    let missing = json!({"endpoints":[{"type":"tailscale", "tag":"missing"}]});
+    assert!(reg
+        .reserve_main_states(&missing, &root, &gate, reg.mint_main_birth())
+        .await
+        .is_err());
+    let empty = json!({"endpoints":[{"type":"wireguard", "tag":"not-ts"}]});
+    let mut no_ts = reg
+        .reserve_main_states(&empty, &root, &gate, reg.mint_main_birth())
+        .await
+        .unwrap();
+    assert!(no_ts.claim_token().is_none());
+    no_ts.arm_external_start();
+    drop(no_ts);
+    let new = claim_main_for_test(
+        &reg,
+        &json!({"endpoints":[{"type":"tailscale", "state_directory":root.join("tailscale/ts1")}] }),
+        &root,
+        &gate,
+    )
+    .await;
+    assert!(reg.release_main_states_if_token(&new, &gate).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn pre_spawn_drop_rolls_back_only_its_token_but_armed_drop_retains_it() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let generated =
+        json!({"endpoints":[{"type":"tailscale", "state_directory":root.join("tailscale/ts1")}]});
+    let gate = reg.state_gate().await;
+    let early = reg.mint_main_birth();
+    drop(
+        reg.reserve_main_states(&generated, &root, &gate, early.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    let mut late = reg
+        .reserve_main_states(&generated, &root, &gate, reg.mint_main_birth())
+        .await
+        .unwrap();
+    let token = late.claim_token().unwrap();
+    late.arm_external_start();
+    drop(late);
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Busy
+    );
+    assert!(!reg.release_main_states_if_token(&early, &gate).unwrap());
+    assert!(reg.release_main_states_if_token(&token, &gate).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn unknown_main_claim_blocks_logout_even_when_alive_probe_is_false() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let state = root.join("tailscale/ts1");
+    std::fs::create_dir_all(&state).unwrap();
+    let token = {
+        let gate = reg.state_gate().await;
+        claim_main_for_test(
+            &reg,
+            &json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &root,
+            &gate,
+        )
+        .await
+    };
+    let deleted = std::sync::atomic::AtomicBool::new(false);
+    assert!(!reg
+        .logout("ts1", &|| false, None, |_| {
+            deleted.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap());
+    assert!(!deleted.load(Ordering::SeqCst));
+    assert!(reg.state_in_use("ts1", false));
+    assert!(
+        reg.logout("ts2", &|| false, None, |_| Ok(()))
+            .await
+            .unwrap(),
+        "unrelated ID is not blocked"
+    );
+    {
+        let gate = reg.state_gate().await;
+        assert!(reg.release_main_states_if_token(&token, &gate).unwrap());
+    }
+    assert!(reg
+        .logout("ts1", &|| false, None, |_| {
+            deleted.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap());
+    assert!(deleted.load(Ordering::SeqCst));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn poisoned_main_registry_never_authorizes_state_deletion() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let shared = Arc::clone(&reg.shared);
+    assert!(std::thread::spawn(move || {
+        let _guard = shared.main.lock().unwrap();
+        panic!("poison main registry");
+    })
+    .join()
+    .is_err());
+
+    let deleted = std::sync::atomic::AtomicBool::new(false);
+    assert!(reg.state_in_use("ts1", false));
+    assert!(!reg
+        .logout("ts1", &|| false, None, |_| {
+            deleted.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap());
+    assert!(!deleted.load(Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn cancellation_before_prepare_fences_delayed_start() {
     let spawner = fake_spawner(vec![], false, false);
@@ -164,7 +412,7 @@ async fn local_owner_fact_counts_unspawned_main_reservation_and_prepared_attempt
         "tag": "myts",
         "state_directory": ud.join("tailscale/ts1")
     }]});
-    reg.reserve_main_states(&generated, &ud).await.unwrap();
+    let token = claim_main_for_test(&reg, &generated, &ud, &gate).await;
     assert!(!reg.main_owns("ts1", false));
     assert_eq!(
         reg.owner_state_under_gate("ts1", &gate),
@@ -175,7 +423,7 @@ async fn local_owner_fact_counts_unspawned_main_reservation_and_prepared_attempt
         reg.owner_state_under_gate("ts2", &gate),
         TsRegistryOwnerState::Vacant
     );
-    reg.release_main_states();
+    assert!(reg.release_main_states_if_token(&token, &gate).unwrap());
     assert_eq!(
         reg.owner_state_under_gate("ts1", &gate),
         TsRegistryOwnerState::Vacant
@@ -280,7 +528,7 @@ async fn local_owner_fact_rejects_lost_cleanup_channel_and_poisoned_reservation_
 
     let shared = reg.shared.clone();
     assert!(std::thread::spawn(move || {
-        let _held = shared.main_ids.lock().unwrap();
+        let _held = shared.main.lock().unwrap();
         panic!("poison reservation table");
     })
     .join()
@@ -608,8 +856,8 @@ async fn main_reservation_waits_for_reap_and_uses_generated_endpoint_set() {
     started(&reg, &ud, &ts_server("ts1", "myts")).await;
     let (reg2, ud2) = (reg.clone(), ud.clone());
     let reservation = tokio::spawn(async move {
-        let _gate = reg2.state_gate().await;
-        reg2.reserve_main_states(&json!({"endpoints": [{"type": "tailscale", "tag":"myts", "state_directory": ud2.join("tailscale/ts1")}, {"type": "wireguard", "tag": "ts2"}]}), &ud2).await.unwrap();
+        let gate = reg2.state_gate().await;
+        claim_main_for_test(&reg2, &json!({"endpoints": [{"type": "tailscale", "tag":"myts", "state_directory": ud2.join("tailscale/ts1")}, {"type": "wireguard", "tag": "ts2"}]}), &ud2, &gate).await;
     });
     acquire(&spawner.terminating).await;
     assert!(!reservation.is_finished());
@@ -662,8 +910,11 @@ async fn failed_transient_close_blocks_main_reservation_until_retry_confirms_rea
         "type": "tailscale", "tag": "myts", "state_directory": ud.join("tailscale/ts1")
     }]});
     {
-        let _gate = reg.state_gate().await;
-        assert!(reg.reserve_main_states(&final_config, &ud).await.is_err());
+        let gate = reg.state_gate().await;
+        assert!(reg
+            .reserve_main_states(&final_config, &ud, &gate, reg.mint_main_birth())
+            .await
+            .is_err());
     }
     assert!(
         reg.shared.contains("ts1"),
@@ -675,8 +926,8 @@ async fn failed_transient_close_blocks_main_reservation_until_retry_confirms_rea
         "failed reservation cannot claim main ownership"
     );
     {
-        let _gate = reg.state_gate().await;
-        reg.reserve_main_states(&final_config, &ud).await.unwrap();
+        let gate = reg.state_gate().await;
+        claim_main_for_test(&reg, &final_config, &ud, &gate).await;
     }
     assert!(old.terminated.load(Ordering::SeqCst));
     assert!(!reg.shared.contains("ts1"));
@@ -851,13 +1102,14 @@ async fn logout_refuses_a_live_main_owner_without_deleting_state() {
     let state = ud.join("tailscale/ts1");
     std::fs::create_dir_all(&state).unwrap();
     {
-        let _gate = reg.state_gate().await;
-        reg.reserve_main_states(
+        let gate = reg.state_gate().await;
+        claim_main_for_test(
+            &reg,
             &json!({"endpoints": [{"type":"tailscale", "state_directory":state}]}),
             &ud,
+            &gate,
         )
-        .await
-        .unwrap();
+        .await;
     }
     assert!(!reg
         .logout("ts1", &|| true, None, |_| panic!(
@@ -1023,8 +1275,8 @@ async fn main_owner_does_not_authorize_new_credentials_from_old_endpoint() {
     );
     let ud = temp_ud();
     {
-        let _gate = reg.state_gate().await;
-        reg.reserve_main_states(&json!({"endpoints":[{"type":"tailscale", "state_directory":ud.join("tailscale/ts1"), "auth_key":"old-key"}]}), &ud).await.unwrap();
+        let gate = reg.state_gate().await;
+        claim_main_for_test(&reg, &json!({"endpoints":[{"type":"tailscale", "state_directory":ud.join("tailscale/ts1"), "auth_key":"old-key"}]}), &ud, &gate).await;
     }
     let mut server = ts_server("ts1", "myts");
     server.tailscale_settings = Some(Box::new(
@@ -1059,6 +1311,49 @@ async fn main_owner_does_not_authorize_new_credentials_from_old_endpoint() {
         .iter()
         .any(|p| p.2 == "mainCore" && p.3.as_deref() == Some("configurationPending")));
     assert_eq!(spawner.count.load(Ordering::SeqCst), 0);
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn unknown_main_start_blocks_real_transient_launch_even_when_alive_is_false() {
+    let spawner = fake_spawner(vec![], false, false);
+    let reg = reg_with(
+        spawner.clone(),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let ud = temp_ud();
+    let token = {
+        let gate = reg.state_gate().await;
+        claim_main_for_test(
+            &reg,
+            &json!({"endpoints":[{"type":"tailscale", "state_directory":ud.join("tailscale/ts1")}] }),
+            &ud,
+            &gate,
+        )
+        .await
+    };
+    let server = ts_server("ts1", "myts");
+    reg.prepare("ts1", "unknown-main").await.unwrap();
+    assert!(matches!(
+        reg.start_attempt(
+            &server,
+            &ud,
+            request("unknown-main"),
+            &|| MainLoginSnapshot {
+                alive: false,
+                ..Default::default()
+            },
+            Arc::new(FakeEmitter::default()),
+        )
+        .await,
+        StartLoginOutcome::InMainCorePending
+    ));
+    assert_eq!(spawner.count.load(Ordering::SeqCst), 0);
+    let gate = reg.state_gate().await;
+    assert!(reg.release_main_states_if_token(&token, &gate).unwrap());
+    drop(gate);
     std::fs::remove_dir_all(ud).unwrap();
 }
 
@@ -1184,9 +1479,9 @@ async fn owned_main_registry(
         timeout,
     ));
     let ud = temp_ud();
-    let _gate = reg.state_gate().await;
-    reg.reserve_main_states(&json!({"endpoints":[{"type":"tailscale", "tag":"actual-generated-tag", "state_directory":ud.join("tailscale/ts1")}]}), &ud).await.unwrap();
-    drop(_gate);
+    let gate = reg.state_gate().await;
+    claim_main_for_test(&reg, &json!({"endpoints":[{"type":"tailscale", "tag":"actual-generated-tag", "state_directory":ud.join("tailscale/ts1")}]}), &ud, &gate).await;
+    drop(gate);
     (reg, sub, ud)
 }
 fn main_snapshot(generation: u64) -> MainLoginSnapshot {

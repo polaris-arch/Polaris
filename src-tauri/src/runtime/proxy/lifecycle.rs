@@ -48,6 +48,15 @@ enum StopStateGate<'a> {
     Borrowed(&'a MutexGuard<'a, ()>),
 }
 
+impl StopStateGate<'_> {
+    fn guard(&self) -> &MutexGuard<'_, ()> {
+        match self {
+            Self::Acquired(guard) => guard,
+            Self::Borrowed(guard) => guard,
+        }
+    }
+}
+
 impl Drop for StopStateGate<'_> {
     fn drop(&mut self) {
         match self {
@@ -203,7 +212,7 @@ pub(super) fn monotonic_now_ms() -> u64 {
 impl ProxyRuntime {
     fn admit_direct_slot(&self) -> Result<(), StartError> {
         if cfg!(target_os = "android") {
-            return Ok(());
+            return self.admit_android_global_custody();
         }
         let slot = self
             .child
@@ -217,6 +226,38 @@ impl ProxyRuntime {
         } else {
             Err(StartError::direct_slot_occupied())
         }
+    }
+
+    pub(super) fn admit_android_global_custody(&self) -> Result<(), StartError> {
+        let custody = self
+            .android_main_token
+            .lock()
+            .map_err(StartError::android_global_custody_poisoned)?;
+        if custody.is_none() {
+            Ok(())
+        } else {
+            Err(StartError::android_global_custody_occupied())
+        }
+    }
+
+    /// Explicit Android admission and generation publication share one
+    /// custody critical section. A concurrent older Start cannot book between
+    /// the empty check and this claim, and a newer Start cannot claim after an
+    /// older attempt has booked its physical request.
+    pub(super) fn claim_android_global_start_generation(&self) -> Result<u64, StartError> {
+        let mut crash = self.crash_lock();
+        let custody = self
+            .android_main_token
+            .lock()
+            .map_err(StartError::android_global_custody_poisoned)?;
+        if custody.is_some() {
+            return Err(StartError::android_global_custody_occupied());
+        }
+        let generation = self
+            .claim_generation(None, LifecycleKind::Start)
+            .expect("unconditional Android start claim");
+        crash.reset_user_aborted();
+        Ok(generation)
     }
 
     /// Transitional desktop fence. No managed claim is accepted by this API;
@@ -397,37 +438,39 @@ impl ProxyRuntime {
         // start while it waits for the TS gate. Keep abort reset and claim under the same short
         // crash lock used by the explicit stop entry; no mutex is held across await.
         let explicit_generation = if expected_generation.is_none() {
-            let mut crash = self.crash_lock();
-            // Keep crash→Child lock order (also used by recovery). The Child
-            // guard spans admission and publication: an older start either
-            // installs first and we reject, or sees our new generation before
-            // it can install. No await occurs while either lock is held.
-            let direct_slot = if cfg!(target_os = "android") {
-                None
+            if cfg!(target_os = "android") {
+                match self.claim_android_global_start_generation() {
+                    Ok(generation) => Some(generation),
+                    Err(error) => return StartLeg::Finished(Err(error), None),
+                }
             } else {
-                match self.child.lock() {
-                    Ok(slot) => Some(slot),
+                let mut crash = self.crash_lock();
+                // Keep crash→Child lock order (also used by recovery). The Child
+                // guard spans admission and publication: an older start either
+                // installs first and we reject, or sees our new generation before
+                // it can install. No await occurs while either lock is held.
+                let direct_slot = match self.child.lock() {
+                    Ok(slot) => slot,
                     Err(error) => {
                         return StartLeg::Finished(
                             Err(StartError::direct_slot_poisoned(error)),
                             None,
                         );
                     }
-                }
-            };
-            if direct_slot.as_ref().is_some_and(|slot| {
-                !slot.is_empty()
-                    || slot.has_helper_start()
+                };
+                if !direct_slot.is_empty()
+                    || direct_slot.has_helper_start()
                     || self.core_via_helper.load(Ordering::SeqCst)
-            }) {
-                return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
+                {
+                    return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
+                }
+                let generation = self
+                    .claim_generation(None, LifecycleKind::Start)
+                    .expect("unconditional start claim");
+                crash.reset_user_aborted();
+                drop(direct_slot);
+                Some(generation)
             }
-            let generation = self
-                .claim_generation(None, LifecycleKind::Start)
-                .expect("unconditional start claim");
-            crash.reset_user_aborted();
-            drop(direct_slot);
-            Some(generation)
         } else {
             if let Err(error) = self.admit_direct_slot() {
                 return StartLeg::Finished(Err(error), None);
@@ -504,10 +547,7 @@ impl ProxyRuntime {
         }
         self.gate.begin();
         let t_start_inner = std::time::Instant::now();
-        let r = self.start_inner(config, my_gen).await;
-        if !self.tailscale_writer_alive() {
-            self.mesh.release_tailscale_main_states();
-        }
+        let r = self.start_inner(config, my_gen, &_tailscale_gate).await;
         let start_inner_ms = t_start_inner.elapsed().as_millis();
         let t_terminal_settle = std::time::Instant::now();
         // end 恒执行（成功/失败/让位三路），否则 depth 永不归零 → 后续 apply 全被误判 deferred。
@@ -690,10 +730,9 @@ impl ProxyRuntime {
             self.finish_lifecycle(LifecycleKind::Stop);
             return Ok(None);
         }
-        let kill_result = self.kill_core().await;
-        if kill_result.is_ok() {
-            self.mesh.release_tailscale_main_states();
-        }
+        let kill_result = self
+            .kill_core_and_release_main(_tailscale_gate.guard())
+            .await;
         // 请求在飞期间若已被新 start/stop 接管，结果属于旧腿，不能覆盖接管方终态。
         if self.stop_superseded(my_gen, "kill_core") {
             self.finish_lifecycle(LifecycleKind::Stop);

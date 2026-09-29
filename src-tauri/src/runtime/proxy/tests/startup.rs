@@ -1032,8 +1032,18 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     let binary = PathBuf::from("/nonexistent/sing-box");
     let user_config: UserConfig = serde_json::from_value(polaris_store::default_config()).unwrap();
     let my_gen = rt.gate.generation();
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let mut main = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &ts_gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
     let r = rt
-        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen)
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
         .await;
     assert!(
         r.is_err(),
@@ -1058,8 +1068,18 @@ async fn helper_start_superseded_before_ipc_yields_none() {
     let user_config: UserConfig = serde_json::from_value(polaris_store::default_config()).unwrap();
     let stale_gen = rt.gate.generation();
     rt.gate.bump_generation(); // 模拟被接管
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let mut main = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &ts_gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
     let r = rt
-        .spawn_core_via_helper(&binary, &cfg_path, &user_config, stale_gen)
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, stale_gen, &mut main)
         .await
         .expect("让位是正常返回，非 Err");
     assert!(r.is_none(), "起核前世代已变 → 让位 Ok(None)");
@@ -1079,7 +1099,8 @@ async fn start_yields_without_spawning_when_superseded_before_spawn() {
 
     // 直接调 start_inner 并传入已过期的世代 → 应让位返回、不 spawn。
     let cfg = serde_json::json!({ "servers": [], "selectedServerId": "__direct__" });
-    let r = rt.start_inner(cfg, stale_gen).await;
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let r = rt.start_inner(cfg, stale_gen, &ts_gate).await;
     assert!(r.is_ok(), "让位是正常返回，不是错误");
     assert!(!rt.status().running, "让位腿不得置 running");
     assert!(

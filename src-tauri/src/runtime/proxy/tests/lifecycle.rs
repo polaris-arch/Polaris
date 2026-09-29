@@ -168,7 +168,7 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
     );
     let started = method_body(&src, "    pub(super) async fn start_guarded(");
     let inner_return = started
-        .find("let r = self.start_inner(config, my_gen).await;")
+        .find("let r = self.start_inner(config, my_gen, &_tailscale_gate).await;")
         .expect("start 包装必须等待 start_inner 完整事务");
     let drop_inflight = started
         .find("drop(inflight);")
@@ -1897,7 +1897,10 @@ async fn old_stop_waiting_for_tailscale_gate_preserves_new_generation_owner() {
     .await
     .unwrap();
     rt.bump_generation();
-    rt.mesh.reserve_tailscale_main_states(&serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":dir.join("tailscale/new-session")}]})).await.unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt.mesh.reserve_tailscale_main_states(&serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":dir.join("tailscale/new-session")}]}), &gate, token).await.unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
     mark_running(&rt);
     drop(gate);
     assert!(stop.await.unwrap().unwrap().is_none());
@@ -2023,7 +2026,7 @@ fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
         .find("self.gate.generation()!=requested_generation")
         .unwrap();
     let inner = compact
-        .find("self.start_inner(config,my_gen).await")
+        .find("self.start_inner(config,my_gen,&_tailscale_gate).await")
         .unwrap();
     assert!(
         gate < early_fence && early_fence < sweep && sweep < inner,
@@ -2042,4 +2045,36 @@ fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
     let final_reservation = inner.rfind("reserve_tailscale_main_states").unwrap();
     let ready_snapshot = inner.find("self.startup_snapshot.write()").unwrap();
     assert!(reservation < spawn && final_reservation < ready_snapshot);
+}
+
+#[test]
+fn android_global_custody_is_checked_before_claim_and_stale_sweep() {
+    let src = module_code("runtime/proxy");
+    let claim_body = method_body(
+        &src,
+        "    pub(super) fn claim_android_global_start_generation(",
+    );
+    let claim_compact: String = claim_body
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let custody_lock = claim_compact
+        .find("self.android_main_token.lock()")
+        .expect("claim must hold Android custody");
+    let claim_generation = claim_compact
+        .find("self.claim_generation(None,LifecycleKind::Start)")
+        .expect("claim must publish generation under custody");
+    assert!(custody_lock < claim_generation);
+    let started = method_body(&src, "    pub(super) async fn start_guarded(");
+    let compact: String = started.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let custody = compact
+        .find("self.claim_android_global_start_generation()")
+        .expect("explicit Android Start must claim under global custody");
+    let sweep = compact
+        .find("self.cleanup_stale_cores().await")
+        .expect("stale cleanup entry");
+    let gate_recheck = compact[..sweep]
+        .rfind("self.admit_direct_slot()")
+        .expect("Start must recheck admission under the TS gate");
+    assert!(custody < gate_recheck && gate_recheck < sweep);
 }

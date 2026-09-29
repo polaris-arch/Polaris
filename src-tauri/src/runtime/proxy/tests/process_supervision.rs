@@ -18,6 +18,432 @@ fn spawn_custody_stand_in() -> tokio::process::Child {
         .expect("spawn local custody stand-in")
 }
 
+#[tokio::test]
+async fn main_birth_follows_real_direct_child_through_confirmed_stop() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-main").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    let run =
+        DirectCoreRun::with_main_token(spawn_custody_stand_in(), RunIdentity::new(), token.clone());
+    rt.child.lock().unwrap().install_running_for_test(run);
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-main", true));
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    assert!(!rt.mesh.main_owns_tailscale("ts-main", true));
+    assert!(!rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn helper_attempt_keeps_main_birth_until_exact_confirmed_stop() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-helper").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token.clone()))
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .finish_helper_start(&attempt, Some(7123)));
+    *rt.pid.lock().unwrap() = Some(7123);
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    let (failed, _, _) = RecordingStop::new(Err("no helper ACK".into()));
+    assert!(rt
+        .kill_core_via_helper(failed as Arc<dyn HelperStopOps>)
+        .await
+        .is_err());
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-helper", true));
+    let (retry, calls, wants) = RecordingStop::new(Ok(()));
+    rt.kill_core_via_helper(retry as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*wants.lock().unwrap(), vec![Some(7123)]);
+    assert!(rt.main_token_for_stop().unwrap().is_none());
+    assert!(
+        rt.mesh.main_owns_tailscale("ts-helper", true),
+        "local registry is not itself a helper ACK"
+    );
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn cancelled_detached_android_start_retains_unknown_birth_after_late_reply() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    rt.book_android_global_start(Some(token.clone())).unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    // Same topology as call_with_budget: dropping the waiter does not cancel
+    // the queued bridge task. A late Start success cannot confirm that waiter.
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let reached = Arc::new(tokio::sync::Semaphore::new(0));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let late = tokio::spawn({
+        let release = release.clone();
+        let reached = reached.clone();
+        async move {
+            reached.add_permits(1);
+            release.acquire().await.unwrap().forget();
+            let _ = done_tx.send(());
+        }
+    });
+    reached.acquire().await.unwrap().forget();
+    drop(late);
+    release.add_permits(1);
+    done_rx.await.unwrap();
+    assert!(
+        !rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .start_confirmed
+    );
+    assert!(rt.begin_android_stop_booking(true).is_err());
+    assert!(rt.mesh.main_owns_tailscale("ts-android", true));
+}
+
+#[tokio::test]
+async fn cancelled_detached_android_stop_keeps_s2_ack_from_releasing_birth() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android-stop").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let birth = rt.book_android_global_start(Some(token.clone())).unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    rt.confirm_android_global_start(&birth).unwrap();
+    let queued = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let s1_waiter = tokio::spawn({
+        let rt = rt.clone();
+        let queued = queued.clone();
+        let release = release.clone();
+        async move {
+            let booking = rt.begin_android_stop_booking(true).unwrap();
+            let detached = tokio::spawn(async move {
+                queued.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                let _ = done_tx.send(());
+            });
+            detached.await.unwrap();
+            drop(booking);
+        }
+    });
+    queued.acquire().await.unwrap().forget();
+    s1_waiter.abort();
+    assert!(s1_waiter.await.is_err());
+    // A second global Stop may ACK; S1 may still be delivered afterwards.
+    let s2 = rt.begin_android_stop_booking(true).unwrap();
+    assert!(s2.finish_with_gate(Ok(()), &rt.mesh, &gate).is_err());
+    release.add_permits(1);
+    done_rx.await.unwrap();
+    assert!(
+        rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .historic_unknown
+    );
+    assert!(rt.mesh.main_owns_tailscale("ts-android-stop", true));
+}
+
+#[tokio::test]
+async fn certain_android_stop_ack_removes_matching_ts_and_global_birth_together() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android-certain").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    let birth = rt.book_android_global_start(Some(token.clone())).unwrap();
+    rt.confirm_android_global_start(&birth).unwrap();
+    let booking = rt.begin_android_stop_booking(true).unwrap();
+    assert!(rt.admit_android_global_custody().is_err());
+    booking.finish_with_gate(Ok(()), &rt.mesh, &gate).unwrap();
+    assert!(!rt.mesh.main_owns_tailscale("ts-android-certain", true));
+    assert!(rt.android_main_token.lock().unwrap().is_none());
+    assert!(!rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn android_stop_ack_cannot_clear_a_successor_registry_birth() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android-successor").unwrap();
+    let generated =
+        serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]});
+    let old = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, old.clone())
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    let birth = rt.book_android_global_start(Some(old.clone())).unwrap();
+    rt.confirm_android_global_start(&birth).unwrap();
+    let old_stop = rt.begin_android_stop_booking(true).unwrap();
+
+    // Deliberately bypass admission in this fixture to model a successor
+    // registry claim that an old asynchronous ACK must never erase.
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&old, &gate)
+        .unwrap());
+    let new = rt.mesh.mint_tailscale_main_birth();
+    let mut successor = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, new.clone())
+        .await
+        .unwrap();
+    successor.arm_external_start();
+    drop(successor);
+    assert!(old_stop.finish_with_gate(Ok(()), &rt.mesh, &gate).is_err());
+    assert!(rt.mesh.main_owns_tailscale("ts-android-successor", true));
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&new, &gate)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn no_ts_android_start_and_stop_still_hold_global_birth() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(rt.begin_android_stop_booking(true).is_err());
+    rt.confirm_android_global_start(&birth).unwrap();
+    let stop = rt.begin_android_stop_booking(true).unwrap();
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(stop.finish_without_main(Ok(())).is_ok());
+    assert!(rt.admit_android_global_custody().is_ok());
+    assert!(rt.book_android_global_start(None).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_android_claim_preempts_an_older_preflight_before_booking() {
+    let (rt, _dir) = test_runtime();
+    let a_preflight = Arc::new(tokio::sync::Semaphore::new(0));
+    let b_claimed = Arc::new(tokio::sync::Semaphore::new(0));
+    let a = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        let a_preflight = Arc::clone(&a_preflight);
+        let b_claimed = Arc::clone(&b_claimed);
+        async move {
+            let _ts_gate = rt.mesh.tailscale_state_gate().await;
+            let generation = rt.claim_android_global_start_generation().unwrap();
+            a_preflight.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(3), b_claimed.acquire())
+                .await
+                .expect("B must claim while A is in preflight")
+                .unwrap()
+                .forget();
+            rt.book_android_global_start_for_generation(generation, None)
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), a_preflight.acquire())
+        .await
+        .expect("A must reach preflight")
+        .unwrap()
+        .forget();
+    let b_generation = rt.claim_android_global_start_generation().unwrap();
+    b_claimed.add_permits(1);
+    assert!(
+        a.await.unwrap().is_none(),
+        "obsolete A must dispatch no IPC"
+    );
+    assert!(rt.android_main_token.lock().unwrap().is_none());
+    let _ts_gate = rt.mesh.tailscale_state_gate().await;
+    assert!(rt
+        .book_android_global_start_for_generation(b_generation, None)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn booked_android_birth_blocks_a_new_claim_before_generation_changes() {
+    let (rt, _dir) = test_runtime();
+    let a_booked = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_a = Arc::new(tokio::sync::Semaphore::new(0));
+    let a = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        let a_booked = Arc::clone(&a_booked);
+        let release_a = Arc::clone(&release_a);
+        async move {
+            let _ts_gate = rt.mesh.tailscale_state_gate().await;
+            let generation = rt.claim_android_global_start_generation().unwrap();
+            let birth = rt
+                .book_android_global_start_for_generation(generation, None)
+                .unwrap()
+                .unwrap();
+            a_booked.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(3), release_a.acquire())
+                .await
+                .expect("B must inspect A's booked birth")
+                .unwrap()
+                .forget();
+            birth
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), a_booked.acquire())
+        .await
+        .expect("A must book before B claims")
+        .unwrap()
+        .forget();
+    let owned_generation = rt.gate.generation();
+    assert!(rt.claim_android_global_start_generation().is_err());
+    assert_eq!(rt.gate.generation(), owned_generation);
+    release_a.add_permits(1);
+    let booked = a.await.unwrap();
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .birth
+        .same(&booked));
+}
+
+#[tokio::test]
+async fn no_ts_android_detached_stop_and_cold_sweep_remain_sticky() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    rt.confirm_android_global_start(&birth).unwrap();
+    let s1 = rt.begin_android_stop_booking(true).unwrap();
+    drop(s1);
+    let s2 = rt.begin_android_stop_booking(true).unwrap();
+    assert!(s2.finish_without_main(Ok(())).is_err());
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(rt.book_android_global_start(None).is_err());
+
+    let (fresh, _dir) = test_runtime();
+    let cold = fresh.begin_android_stop_booking(false).unwrap();
+    assert!(fresh.admit_android_global_custody().is_err());
+    drop(cold);
+    let retry = fresh.begin_android_stop_booking(false).unwrap();
+    assert!(retry.finish_without_main(Ok(())).is_err());
+    assert!(fresh.admit_android_global_custody().is_err());
+}
+
+#[tokio::test]
+async fn stale_android_stop_nonce_cannot_clear_a_later_booking() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    rt.confirm_android_global_start(&birth).unwrap();
+    let stale = rt.begin_android_stop_booking(true).unwrap();
+    {
+        // Force the state a cancelled S1 would leave while retaining a stale
+        // test handle, so a late old ACK exercises the nonce comparison.
+        let mut guard = rt.android_main_token.lock().unwrap();
+        let attempt = guard.as_mut().unwrap();
+        attempt.stop_inflight = None;
+        attempt.historic_unknown = true;
+    }
+    let current = rt.begin_android_stop_booking(true).unwrap();
+    let current_nonce = rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .stop_inflight
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(stale.finish_without_main(Ok(())).is_err());
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .stop_inflight
+        .as_ref()
+        .is_some_and(|nonce| Arc::ptr_eq(nonce, &current_nonce)));
+    assert!(current.finish_without_main(Ok(())).is_err());
+    assert!(rt.admit_android_global_custody().is_err());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers() {
     let (rt, _dir) = test_runtime();
@@ -267,7 +693,7 @@ async fn newly_claimed_start_supersedes_an_old_direct_spawn() {
         assert_ne!(rt.gate.generation(), old_generation);
     }
     let old_result = rt
-        .start_inner(local_only_config(free_port()), old_generation)
+        .start_inner(local_only_config(free_port()), old_generation, &held_gate)
         .await
         .expect("superseded start yields without a Child");
     assert!(!old_result.running);
@@ -643,7 +1069,24 @@ async fn cancelled_helper_start_worker_publishes_late_known_pid() {
     use super::super::startup::HelperStartCompletion;
 
     let (rt, _dir) = test_runtime();
-    let attempt = rt.register_helper_start_backend().unwrap();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-late-helper").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token.clone()))
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    drop(gate);
     let mut completion = HelperStartCompletion::for_test(&rt, attempt.clone());
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -673,6 +1116,11 @@ async fn cancelled_helper_start_worker_publishes_late_known_pid() {
     assert!(current.same(&attempt));
     assert_eq!(known, 4242);
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-late-helper", true));
 }
 
 #[tokio::test]

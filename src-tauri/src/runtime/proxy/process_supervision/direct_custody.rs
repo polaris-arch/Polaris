@@ -52,6 +52,7 @@ impl HelperStartToken {
 
 struct HelperStartAttempt {
     token: HelperStartToken,
+    main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
     phase: HelperStartPhase,
     stop_inflight: Option<HelperStopNonce>,
 }
@@ -241,6 +242,13 @@ impl DirectCoreSlot {
     pub(in crate::runtime::proxy) fn begin_helper_start(
         &mut self,
     ) -> Result<HelperStartToken, SlotAdmissionError> {
+        self.begin_helper_start_with_main(None)
+    }
+
+    pub(in crate::runtime::proxy) fn begin_helper_start_with_main(
+        &mut self,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<HelperStartToken, SlotAdmissionError> {
         self.touch_helper()?;
         if self.helper_start.is_some() {
             return Err(SlotAdmissionError::Busy);
@@ -248,10 +256,27 @@ impl DirectCoreSlot {
         let token = HelperStartToken::new();
         self.helper_start = Some(HelperStartAttempt {
             token: token.clone(),
+            main_token,
             phase: HelperStartPhase::Inflight,
             stop_inflight: None,
         });
         Ok(token)
+    }
+
+    /// Freeze the token from the actual backend custody before Stop takes or
+    /// retires that custody. An empty slot provides no authority to release.
+    pub(in crate::runtime::proxy) fn main_token_for_stop(
+        &self,
+        via_helper: bool,
+    ) -> Option<crate::runtime::tailscale_login_core::MainBirthToken> {
+        if via_helper {
+            self.helper_start.as_ref()?.main_token.clone()
+        } else {
+            match &self.state {
+                SlotState::Running(run) => run.main_token.clone(),
+                SlotState::Stopping(_) | SlotState::Empty => None,
+            }
+        }
     }
 
     /// Called from the blocking Start worker, including after its async

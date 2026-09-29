@@ -989,6 +989,7 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         config: Value,
         my_gen: u64,
+        ts_gate: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<ProxyStatus, StartError> {
         // 早退让位（#176）：入口即被更新的 start/stop 接管 → 别白做 config 生成/写盘/端口解析。
         // 这只是省功，**不是**孤儿防线——真正的防线是下方 spawn 临界区内的持锁判世代。
@@ -1440,12 +1441,15 @@ impl ProxyRuntime {
             // 与长度，失败时才能只扫本腿，不把上一次会话的 FATAL 误当本次真因。
             let startup_log_cursor = self.startup_log_cursor(via_helper);
 
-            self.mesh
-                .reserve_tailscale_main_states(&serde_json::to_value(&singbox_config).map_err(
-                    |_| {
+            let mut main_reservation = self
+                .mesh
+                .reserve_tailscale_main_states(
+                    &serde_json::to_value(&singbox_config).map_err(|_| {
                         StartError::from("Cannot identify Tailscale endpoint ownership".to_string())
-                    },
-                )?)
+                    })?,
+                    ts_gate,
+                    self.mesh.mint_tailscale_main_birth(),
+                )
                 .await
                 .map_err(|_| {
                     StartError::coded(
@@ -1460,6 +1464,7 @@ impl ProxyRuntime {
             // after observing a managed document.
             self.admit_legacy_start()?;
             let t_spawn = std::time::Instant::now();
+            let main_claim_token = main_reservation.claim_token();
             let pid = if cfg!(target_os = "android") {
                 // ── Android 腿（既有 `via_helper` seam 的**第三条腿**）──
                 // 不 spawn、无 child、无 pid：核跑在**本进程内**的 libbox 里，由 `VpnService` 承载
@@ -1469,8 +1474,27 @@ impl ProxyRuntime {
                 // 内核拒收这份配置 / 前台没有 Activity」，三者都不是重试能治的竞态；而重试要付的是
                 // 用户可见的十几秒空等。真正的瞬态（端口占用）在 Android 上不存在——管理口是进程内
                 // 回环，且每腿都会重解析。
-                match super::android_bridge::start_core(&gate_config_json).await {
-                    Ok(_receipt) => 0,
+                // A bridge that cannot dispatch is still a pre-start failure:
+                // the unarmed reservation guard may roll it back under TS gate.
+                super::android_bridge::main_start_dispatch_available()
+                    .map_err(|(message, error_code)| StartError::coded(message, error_code))?;
+                let Some(android_birth) = self
+                    .book_android_global_start_for_generation(my_gen, main_claim_token.clone())?
+                else {
+                    drop(main_reservation);
+                    return Ok(self.status());
+                };
+                main_reservation.arm_external_start();
+                match super::android_bridge::start_core_with_birth(
+                    &gate_config_json,
+                    android_birth.clone(),
+                )
+                .await
+                {
+                    Ok(_receipt) => {
+                        self.confirm_android_global_start(&android_birth)?;
+                        0
+                    }
                     Err((msg, error_code)) => {
                         self.set_error(&msg, error_code);
                         return Err(StartError::coded(msg, error_code));
@@ -1480,7 +1504,13 @@ impl ProxyRuntime {
                 // 经 helper 起（阻塞 IPC 挪 spawn_blocking；helper 核无本地 child 句柄）。
                 // 让位 → Ok(None) → 静默返回（接管方拥有已提交 pid + core_via_helper 标记，负责收口）。
                 match self
-                    .spawn_core_via_helper(&binary, &config_path, &user_config, my_gen)
+                    .spawn_core_via_helper(
+                        &binary,
+                        &config_path,
+                        &user_config,
+                        my_gen,
+                        &mut main_reservation,
+                    )
                     .await
                 {
                     Ok(Some(pid)) => pid,
@@ -1552,20 +1582,32 @@ impl ProxyRuntime {
                     // Mint before spawn: even a failed OS random source must not
                     // leave a successfully spawned Child without its run token.
                     let run_identity = super::process_supervision::RunIdentity::new();
+                    main_reservation.arm_external_start();
                     match TokioSpawner::new().spawn(req) {
                         Ok(spawned) => {
                             let pid = spawned.pid().unwrap_or(0);
-                            let run = super::process_supervision::DirectCoreRun::with_identity(
-                                spawned.child,
-                                run_identity,
-                            );
+                            let run = if let Some(token) = main_claim_token.clone() {
+                                super::process_supervision::DirectCoreRun::with_main_token(
+                                    spawned.child,
+                                    run_identity,
+                                    token,
+                                )
+                            } else {
+                                super::process_supervision::DirectCoreRun::with_identity(
+                                    spawned.child,
+                                    run_identity,
+                                )
+                            };
                             let identity = run.identity.clone();
                             // The empty-slot permit retains this mutex guard
                             // through spawn, so this cannot discard a Child.
                             empty_slot.install_running(run);
                             Ok((pid, handoff, identity))
                         }
-                        Err(e) => Err(format!("{e}")),
+                        Err(e) => {
+                            main_reservation.confirmed_no_external_writer();
+                            Err(format!("{e}"))
+                        }
                     }
                 };
                 match direct_spawn {
@@ -1680,7 +1722,7 @@ impl ProxyRuntime {
                         return Ok(self.status());
                     }
                     // 核确实活着（就绪门刚判过），但它没有 TUN ⇒ 标 connected 是虚报，先拆掉再谈重试。
-                    self.kill_core().await?;
+                    self.kill_core_and_release_main(ts_gate).await?;
                     if verdict == TunAdapterVerdict::RetryLeg {
                         log::warn!(
                             "TUN 适配器未建出（第 {attempt} 次，iface={tun_adapter_name}）→ 预算内自动重试"
@@ -1728,7 +1770,7 @@ impl ProxyRuntime {
                         log::info!("起核就绪期被接管（世代 {my_gen}，判定 Dead 系接管方拆核所致）→ 静默让位");
                         return Ok(self.status());
                     }
-                    self.kill_core().await?;
+                    self.kill_core_and_release_main(ts_gate).await?;
                     let msg = "sing-box 启动期退出".to_string();
                     // #332：核自己吐的 FATAL 才知道**为什么**退出（就绪门只看得到「没了」）。
                     let fatal =
@@ -1761,7 +1803,7 @@ impl ProxyRuntime {
                         log::info!("起核就绪期被接管（世代 {my_gen}，判定 Timeout 系接管方拆核所致）→ 静默让位");
                         return Ok(self.status());
                     }
-                    self.kill_core().await?;
+                    self.kill_core_and_release_main(ts_gate).await?;
                     // 文案必须说得清「是不是规模导致的」：门已经按规模放宽过，只报「管理 API 未就绪」
                     // 会把用户导向端口/网络这条错误的下一步（见 `main_core_ready_timeout_message`）。
                     let msg =
@@ -1813,7 +1855,7 @@ impl ProxyRuntime {
                     log::info!("TUN 出口 post-flight 期被接管（世代 {my_gen}）→ 让位，不闸");
                     return Ok(self.status());
                 }
-                self.kill_core().await?;
+                self.kill_core_and_release_main(ts_gate).await?;
                 self.set_error(&msg, code::TUN_ROUTE_NOT_CAPTURED);
                 return Err(StartError::coded(msg, code::TUN_ROUTE_NOT_CAPTURED));
             }
@@ -2199,6 +2241,7 @@ impl ProxyRuntime {
         config_path: &Path,
         user_config: &UserConfig,
         my_gen: u64,
+        main_reservation: &mut crate::runtime::tailscale_login_core::MainReservation<'_, '_>,
     ) -> Result<Option<u32>, String> {
         // 让位早退（与直起临界区的「持锁判世代」同义；helper 核无本地 child 锁可持，靠世代 + 标记守）。
         if self.gate.generation() != my_gen {
@@ -2212,7 +2255,8 @@ impl ProxyRuntime {
         // The lease can reject before any helper operation is queued.
         let helper_call_lease = self.lease_legacy_start().map_err(|error| error.message)?;
         // Fence and helper flag publish under the same Child mutex.
-        let attempt = self.register_helper_start_backend()?;
+        let attempt =
+            self.register_helper_start_backend_with_main(main_reservation.claim_token())?;
         let log_path = self.config.join(SINGBOX_STARTUP_LOG);
         // fwd = allowLan（helper 侧开 IP 转发；上游 `forward = !!currentConfig.allowLan`）。
         let fwd = user_config.allow_lan.unwrap_or(false);
@@ -2232,6 +2276,7 @@ impl ProxyRuntime {
         // HelperClient::send 是同步阻塞 IPC → 挪出 async worker 线程。
         // **不传 bin**：helper 单方面决定跑哪个二进制（见 `HelperRuntime::start_core` 文档），
         // 传了也只会被丢掉——正是本缺陷的成因。
+        main_reservation.arm_external_start();
         let started = tokio::task::spawn_blocking(move || {
             let _helper_call_lease = helper_call_lease;
             let mut completion = completion;
@@ -2253,13 +2298,17 @@ impl ProxyRuntime {
         let pid_probe_us = pid_probe_started.elapsed().as_micros();
         log::info!("起核耗时：helper回包后存活探测={pid_probe_us}us");
         if !alive {
-            return Err(self
-                .reject_helper_start(
+            let (message, confirmed_stopped) = self
+                .reject_helper_start_with_result(
                     Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
                     &attempt,
                     pid,
                 )
-                .await);
+                .await;
+            if confirmed_stopped {
+                main_reservation.confirmed_no_external_writer();
+            }
+            return Err(message);
         }
         log::info!("helper 已起 sing-box：pid={pid}（TUN 提权路径）");
         Ok(Some(pid))
@@ -2703,16 +2752,28 @@ impl ProxyRuntime {
     /// 让 daemon 收口它自己的 child，把「不会漏下孤儿」从**对探活正确性的推理**降格成**结构保证**：
     /// 探活对不对，这条腿都不留残留。与 T1 的探活修复是两道独立防线，将来任何探活缺陷都不会
     /// 再复制这次事故。stop 失败不改判（核确实可能真死了）——照实记日志，错误消息原样返回。
+    #[cfg(test)]
     pub(super) async fn reject_helper_start(
         &self,
         ops: Arc<dyn HelperStopOps>,
         attempt: &HelperStartToken,
         pid: u32,
     ) -> String {
+        self.reject_helper_start_with_result(ops, attempt, pid)
+            .await
+            .0
+    }
+
+    async fn reject_helper_start_with_result(
+        &self,
+        ops: Arc<dyn HelperStopOps>,
+        attempt: &HelperStartToken,
+        pid: u32,
+    ) -> (String, bool) {
         if let Err(error) = self.register_helper_backend() {
-            return format!(
+            return (format!(
                 "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: Child custody blocked Stop（{error}）"
-            );
+            ), false);
         }
         let reservation = self
             .child
@@ -2720,36 +2781,48 @@ impl ProxyRuntime {
             .ok()
             .and_then(|mut child| child.begin_exact_helper_stop(attempt, pid));
         let Some(nonce) = reservation else {
-            return format!(
+            return (format!(
                 "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: attempt changed or Stop in flight"
-            );
+            ), false);
         };
         let permit = HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), nonce);
         // stop 是同步阻塞 IPC → 挪出 async worker 线程（同 start_core/stop_core/cleanup_cores）。
         // **带上 pid**：本腿要收口的是 daemon 刚报给我们的这一个（helper 报活但探活判死的那个），
         // 不是「daemon 此刻手里的随便哪个」——本方法整段可能与新会话并发。
-        let cleanup =
+        let (cleanup, confirmed_stopped) =
             match tokio::task::spawn_blocking(move || (ops.stop_managed_core(Some(pid)), permit))
                 .await
             {
                 Ok((Ok(()), permit)) => {
                     if self.clear_helper_core_bookkeeping(&permit, pid) {
                         log::info!("起核收口：已请 daemon 停掉其受管 child（pid={pid}）");
-                        String::new()
+                        (String::new(), true)
                     } else {
-                        "；cleanup-unconfirmed: Stop 已确认，但 attempt 已改变".to_owned()
+                        (
+                            "；cleanup-unconfirmed: Stop 已确认，但 attempt 已改变".to_owned(),
+                            false,
+                        )
                     }
                 }
                 Ok((Err(e), _permit)) => {
                     log::warn!("起核收口：请 daemon 停核失败（pid={pid}）：{e}");
-                    format!("；cleanup-unconfirmed: helper Stop 未确认（{e}）")
+                    (
+                        format!("；cleanup-unconfirmed: helper Stop 未确认（{e}）"),
+                        false,
+                    )
                 }
                 Err(e) => {
                     log::error!("起核收口：停核任务 join 失败（pid={pid}）：{e}");
-                    format!("；cleanup-unconfirmed: helper Stop join 失败（{e}）")
+                    (
+                        format!("；cleanup-unconfirmed: helper Stop join 失败（{e}）"),
+                        false,
+                    )
                 }
             };
-        format!("helper 报告已启动但进程不存在（pid={pid}）{cleanup}")
+        (
+            format!("helper 报告已启动但进程不存在（pid={pid}）{cleanup}"),
+            confirmed_stopped,
+        )
     }
 
     /// sing-box 临时配置文件路径（写 generate_sing_box_config 输出，供 spawner 读）。

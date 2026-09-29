@@ -604,17 +604,30 @@ impl MeshRuntime {
         self.login_registry.state_gate().await
     }
 
-    pub async fn reserve_tailscale_main_states(
+    pub(crate) fn mint_tailscale_main_birth(
         &self,
+    ) -> crate::runtime::tailscale_login_core::MainBirthToken {
+        self.login_registry.mint_main_birth()
+    }
+
+    pub(crate) async fn reserve_tailscale_main_states<'a, 'g>(
+        &'a self,
         generated: &serde_json::Value,
-    ) -> Result<(), String> {
+        gate: &'g tokio::sync::MutexGuard<'a, ()>,
+        token: crate::runtime::tailscale_login_core::MainBirthToken,
+    ) -> Result<crate::runtime::tailscale_login_core::MainReservation<'a, 'g>, String> {
         self.login_registry
-            .reserve_main_states(generated, &self.config_dir)
+            .reserve_main_states(generated, &self.config_dir, gate, token)
             .await
     }
 
-    pub fn release_tailscale_main_states(&self) {
-        self.login_registry.release_main_states();
+    pub(crate) fn release_tailscale_main_states_if_token(
+        &self,
+        token: &crate::runtime::tailscale_login_core::MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, String> {
+        self.login_registry
+            .release_main_states_if_token(token, gate)
     }
 
     #[cfg(test)]

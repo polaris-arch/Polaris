@@ -4652,14 +4652,19 @@ async fn deferred_tailscale_state_waits_for_main_and_transient_writers_then_retr
     rt.config
         .save_full_deferred_cleanup(&current, &incoming)
         .unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
     {
         let gate = rt.mesh.tailscale_state_gate().await;
-        rt.mesh
+        let mut reservation = rt
+            .mesh
             .reserve_tailscale_main_states(
                 &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+                &gate,
+                token.clone(),
             )
             .await
             .unwrap();
+        reservation.arm_external_start();
         mark_running(&rt);
         rt.process_deferred_config_deletions_under_gate(&gate);
         assert!(
@@ -4667,7 +4672,12 @@ async fn deferred_tailscale_state_waits_for_main_and_transient_writers_then_retr
             "main owner preserves deferred state and journal"
         );
     }
-    rt.mesh.release_tailscale_main_states();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+    drop(gate);
     *rt.status.write().unwrap() = ProxyStatus::default();
     rt.mesh
         .login_registry_for_test()

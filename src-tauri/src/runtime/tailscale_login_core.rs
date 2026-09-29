@@ -56,7 +56,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -509,8 +509,71 @@ struct LoginEntry {
 struct Shared {
     /// serverId → 在飞登录核条目。
     entries: Mutex<HashMap<String, LoginEntry>>,
-    main_ids: Mutex<HashSet<String>>,
-    main_endpoints: Mutex<HashMap<String, serde_json::Value>>,
+    /// One physical main-core attempt owns the entire peeled endpoint set.
+    /// A single lock prevents a cancelled reservation from publishing half a set.
+    main: Mutex<Option<MainClaim>>,
+}
+
+/// Opaque, registry-bound birth identity. Clones are only handed to the
+/// physical direct Child, helper attempt, or Android request for custody.
+#[derive(Clone)]
+pub(crate) struct MainBirthToken {
+    registry: Arc<RegistryIdentity>,
+    birth: Arc<()>,
+}
+
+struct RegistryIdentity;
+
+impl MainBirthToken {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.registry, &other.registry) && Arc::ptr_eq(&self.birth, &other.birth)
+    }
+}
+
+struct MainClaim {
+    token: MainBirthToken,
+    directories: HashMap<String, PathBuf>,
+    endpoints: HashMap<String, serde_json::Value>,
+}
+
+/// Before an external start can occur, cancellation may roll back the exact
+/// reservation while the real TS gate remains held by the caller. Once armed,
+/// Drop deliberately retains the claim even if the waiter disappears.
+pub(crate) struct MainReservation<'a, 'g> {
+    registry: &'a LoginCoreRegistry,
+    gate: &'g tokio::sync::MutexGuard<'a, ()>,
+    token: MainBirthToken,
+    registered: bool,
+    external_possible: bool,
+}
+
+impl MainReservation<'_, '_> {
+    pub(crate) fn claim_token(&self) -> Option<MainBirthToken> {
+        self.registered.then(|| self.token.clone())
+    }
+
+    pub(crate) fn arm_external_start(&mut self) {
+        self.external_possible = true;
+    }
+
+    /// A synchronous spawn error or strict same-attempt helper Stop confirms
+    /// no external writer remains. IPC errors and cancelled waiters cannot.
+    pub(crate) fn confirmed_no_external_writer(&mut self) {
+        self.external_possible = false;
+    }
+}
+
+impl Drop for MainReservation<'_, '_> {
+    fn drop(&mut self) {
+        if self.registered && !self.external_possible {
+            if let Err(error) = self
+                .registry
+                .release_main_states_if_token(&self.token, self.gate)
+            {
+                log::error!("Tailscale main reservation rollback failed: {error}");
+            }
+        }
+    }
 }
 
 impl Shared {
@@ -579,6 +642,7 @@ pub(crate) enum TsRegistryOwnerState {
 /// 支撑：kill-on-relogin、超时自动杀、取消、自然退出 reap。与 `ProxyRuntime` 的常驻代理核隔离。
 pub struct LoginCoreRegistry {
     shared: Arc<Shared>,
+    identity: Arc<RegistryIdentity>,
     spawner: Arc<dyn LoginCoreSpawner>,
     checker: Arc<dyn ConfigChecker>,
     subscriber: Arc<dyn LoginStatusSubscriber>,
@@ -625,6 +689,7 @@ impl LoginCoreRegistry {
     ) -> Self {
         Self {
             shared: Arc::new(Shared::default()),
+            identity: Arc::new(RegistryIdentity),
             spawner,
             checker,
             subscriber,
@@ -766,8 +831,10 @@ impl LoginCoreRegistry {
         {
             return TsRegistryOwnerState::Unknown;
         }
-        let main_reserved = match self.shared.main_ids.lock() {
-            Ok(ids) => ids.contains(server_id),
+        let main_reserved = match self.shared.main.lock() {
+            Ok(main) => main
+                .as_ref()
+                .is_some_and(|claim| claim.directories.contains_key(server_id)),
             Err(_) => return TsRegistryOwnerState::Unknown,
         };
         let attempt_busy = match self.attempts.local_owner_in_use(server_id) {
@@ -807,7 +874,7 @@ impl LoginCoreRegistry {
         F: FnOnce(&tokio::sync::MutexGuard<'_, ()>) -> std::io::Result<()> + Send,
     {
         let _gate = self.state_gate().await;
-        if self.main_owns(server_id, main_alive()) {
+        if self.main_claims(server_id) || self.main_owns(server_id, main_alive()) {
             return Ok(false);
         }
         if keep_attempt.is_some_and(|id| !self.attempts.can_preserve(server_id, id)) {
@@ -838,98 +905,164 @@ impl LoginCoreRegistry {
 
     /// Called while holding state_gate; includes check/subscription and process reap windows.
     pub fn state_in_use(&self, server_id: &str, main_alive: bool) -> bool {
-        self.main_owns(server_id, main_alive)
+        self.main_claims(server_id)
+            || self.main_owns(server_id, main_alive)
             || self.shared.contains(server_id)
             || self.attempts.owns_state(server_id)
+    }
+
+    fn main_claims(&self, server_id: &str) -> bool {
+        // A poisoned registry is unknown ownership, not permission to delete.
+        self.shared.main.lock().map_or(true, |main| {
+            main.as_ref()
+                .is_some_and(|claim| claim.directories.contains_key(server_id))
+        })
     }
 
     pub fn main_owns(&self, server_id: &str, main_alive: bool) -> bool {
         main_alive
             && self
                 .shared
-                .main_ids
+                .main
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .contains(server_id)
+                .as_ref()
+                .is_some_and(|claim| claim.directories.contains_key(server_id))
     }
 
-    /// Called under the gate with the final, peeled generated endpoint set, before spawn.
-    pub async fn reserve_main_states(
-        &self,
+    pub(crate) fn mint_main_birth(&self) -> MainBirthToken {
+        MainBirthToken {
+            registry: Arc::clone(&self.identity),
+            birth: Arc::new(()),
+        }
+    }
+
+    fn valid_main_gate(&self, gate: &tokio::sync::MutexGuard<'_, ()>) -> bool {
+        std::ptr::eq(tokio::sync::MutexGuard::mutex(gate), &self.start_gate)
+    }
+
+    /// Reserve the entire final peeled TS set under this registry's real gate.
+    /// No subset may silently survive an invalid state_directory or duplicate ID.
+    pub(crate) async fn reserve_main_states<'a, 'g>(
+        &'a self,
         generated: &serde_json::Value,
         root: &Path,
-    ) -> Result<(), String> {
+        gate: &'g tokio::sync::MutexGuard<'a, ()>,
+        token: MainBirthToken,
+    ) -> Result<MainReservation<'a, 'g>, String> {
+        if !self.valid_main_gate(gate) || !Arc::ptr_eq(&token.registry, &self.identity) {
+            return Err("Tailscale main reservation has wrong registry or gate".into());
+        }
         let state_root = root.join("tailscale");
-        let ids: HashSet<String> = generated
+        let mut directories = HashMap::new();
+        let mut endpoints = HashMap::new();
+        for ep in generated
             .get("endpoints")
             .and_then(serde_json::Value::as_array)
             .into_iter()
             .flatten()
             .filter(|ep| ep.get("type").and_then(serde_json::Value::as_str) == Some("tailscale"))
-            .filter_map(|ep| {
-                ep.get("state_directory")
-                    .and_then(serde_json::Value::as_str)
-            })
-            .filter_map(|dir| {
-                let path = Path::new(dir);
-                (path.parent() == Some(state_root.as_path()))
-                    .then(|| path.file_name()?.to_str().map(str::to_owned))
-                    .flatten()
-            })
-            .collect();
-        let endpoints: HashMap<String, serde_json::Value> = generated
-            .get("endpoints")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|ep| {
-                let path = Path::new(ep.get("state_directory")?.as_str()?);
-                let id = path.file_name()?.to_str()?;
-                ids.contains(id).then(|| {
-                    let relevant = ["tag", "auth_key", "control_url", "hostname", "ephemeral"]
-                        .into_iter()
-                        .filter_map(|key| ep.get(key).map(|value| (key.to_owned(), value.clone())))
-                        .collect::<serde_json::Map<_, _>>();
-                    (id.to_owned(), serde_json::Value::Object(relevant))
-                })
-            })
-            .collect();
-        for id in &ids {
+        {
+            let dir = ep
+                .get("state_directory")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Tailscale endpoint lacks a state_directory")?;
+            let path = Path::new(dir);
+            if path.parent() != Some(state_root.as_path()) {
+                return Err("Tailscale endpoint state_directory is outside its state root".into());
+            }
+            let id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+                .ok_or("Tailscale endpoint has an invalid state_directory ID")?
+                .to_owned();
+            if directories.insert(id.clone(), path.to_path_buf()).is_some() {
+                return Err("Tailscale endpoint state_directory is duplicated".into());
+            }
+            let relevant = ["tag", "auth_key", "control_url", "hostname", "ephemeral"]
+                .into_iter()
+                .filter_map(|key| ep.get(key).map(|value| (key.to_owned(), value.clone())))
+                .collect::<serde_json::Map<_, _>>();
+            endpoints.insert(id, serde_json::Value::Object(relevant));
+        }
+        if self
+            .shared
+            .main
+            .lock()
+            .map_err(|_| "Tailscale main registry lock poisoned")?
+            .is_some()
+        {
+            return Err("Tailscale main reservation already owns a physical attempt".into());
+        }
+        if directories.is_empty() {
+            // A valid config with no TS endpoints has no TS state owner.
+            // Keep ordinary no-TS retry/cancellation behavior unchanged.
+            return Ok(MainReservation {
+                registry: self,
+                gate,
+                token,
+                registered: false,
+                external_possible: false,
+            });
+        }
+        for id in directories.keys() {
             self.cancel_and_wait(id).await?;
         }
-        self.shared
-            .main_endpoints
+        let mut main = self
+            .shared
+            .main
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(endpoints);
-        self.shared
-            .main_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(ids);
-        Ok(())
+            .map_err(|_| "Tailscale main registry lock poisoned")?;
+        if main.is_some() {
+            return Err("Tailscale main reservation changed during transient close".into());
+        }
+        *main = Some(MainClaim {
+            token: token.clone(),
+            directories,
+            endpoints,
+        });
+        Ok(MainReservation {
+            registry: self,
+            gate,
+            token,
+            registered: true,
+            external_possible: false,
+        })
     }
 
-    pub fn release_main_states(&self) {
-        self.shared
-            .main_ids
+    /// Registry-local compare-and-remove only. This does not prove that an OS,
+    /// helper, or Android core stopped; callers need their existing stop ACK.
+    pub(crate) fn release_main_states_if_token(
+        &self,
+        token: &MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<bool, String> {
+        if !self.valid_main_gate(gate) || !Arc::ptr_eq(&token.registry, &self.identity) {
+            return Err("Tailscale main release has wrong registry or gate".into());
+        }
+        let mut main = self
+            .shared
+            .main
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        self.shared
-            .main_endpoints
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+            .map_err(|_| "Tailscale main registry lock poisoned")?;
+        if main.as_ref().is_some_and(|claim| claim.token.same(token)) {
+            *main = None;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn main_matches_request(&self, server: &ServerConfig, mode: LoginMode) -> bool {
         let endpoints = self
             .shared
-            .main_endpoints
+            .main
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let Some(endpoint) = endpoints.get(&server.id) else {
+        let Some(endpoint) = endpoints
+            .as_ref()
+            .and_then(|claim| claim.endpoints.get(&server.id))
+        else {
             return false;
         };
         let settings = server.tailscale_settings.as_ref();
@@ -1103,10 +1236,11 @@ impl LoginCoreRegistry {
     ) -> StartLoginOutcome {
         let tag = self
             .shared
-            .main_endpoints
+            .main
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&server.id)
+            .as_ref()
+            .and_then(|claim| claim.endpoints.get(&server.id))
             .and_then(|ep| ep.get("tag"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
@@ -1224,7 +1358,13 @@ impl LoginCoreRegistry {
             _ => return StartLoginOutcome::Failed("savedTailscaleIdentityChanged".into()),
         };
         let main = main_core();
-        if self.main_owns(&server.id, main.alive) {
+        // A delivered main Start can outlive its waiter while the alive probe
+        // is still false. The persistent claim, not that probe, fences a
+        // transient writer of the same state directory under this gate.
+        if self.main_claims(&server.id) {
+            if !main.alive {
+                return StartLoginOutcome::InMainCorePending;
+            }
             return if self.main_matches_request(&server, request.mode) {
                 self.confirm_main_request(&server, request, attempt, &main, main_core, emitter)
                     .await

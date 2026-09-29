@@ -36,6 +36,114 @@ use super::core_binary::resolve_core_binary;
 use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
 
+/// A detached Android Stop can finish after its waiter is cancelled. Drop
+/// ends only the local booking; uncertainty remains sticky across retries.
+pub(super) struct AndroidStopBooking<'a> {
+    custody: &'a std::sync::Mutex<Option<super::AndroidGlobalCustody>>,
+    birth: super::AndroidRequestBirth,
+    nonce: Arc<()>,
+    was_certain: bool,
+    completed: bool,
+}
+
+impl AndroidStopBooking<'_> {
+    fn birth(&self) -> super::AndroidRequestBirth {
+        self.birth.clone()
+    }
+
+    pub(super) fn finish_with_gate(
+        self,
+        result: Result<(), String>,
+        mesh: &crate::runtime::mesh::MeshRuntime,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        self.finish(result, |token| {
+            mesh.release_tailscale_main_states_if_token(token, gate)
+        })
+    }
+
+    pub(super) fn finish_without_main(self, result: Result<(), String>) -> Result<(), String> {
+        self.finish(result, |_| {
+            Err("Android global Stop lacks the TS gate for a main claim".into())
+        })
+    }
+
+    fn finish(
+        mut self,
+        result: Result<(), String>,
+        release_main: impl FnOnce(
+            &crate::runtime::tailscale_login_core::MainBirthToken,
+        ) -> Result<bool, String>,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .custody
+            .lock()
+            .map_err(|_| "Android global custody poisoned after Stop".to_string())?;
+        let attempt = guard
+            .as_mut()
+            .filter(|attempt| {
+                attempt.birth.same(&self.birth)
+                    && attempt
+                        .stop_inflight
+                        .as_ref()
+                        .is_some_and(|nonce| Arc::ptr_eq(nonce, &self.nonce))
+            })
+            .ok_or("Android global Stop custody changed")?;
+        if !self.was_certain || attempt.historic_unknown || result.is_err() {
+            attempt.stop_inflight = None;
+            attempt.historic_unknown = true;
+            self.completed = true;
+            return result.and_then(|()| {
+                Err(
+                    "Android global cleanup-unknown: earlier detached Stop may still complete"
+                        .into(),
+                )
+            });
+        }
+        if let Some(token) = &self.birth.main_token {
+            match release_main(token) {
+                Ok(true) => {}
+                Ok(false) => {
+                    attempt.stop_inflight = None;
+                    attempt.historic_unknown = true;
+                    self.completed = true;
+                    return Err("Android main Stop ACK did not match its registry birth".into());
+                }
+                Err(error) => {
+                    attempt.stop_inflight = None;
+                    attempt.historic_unknown = true;
+                    self.completed = true;
+                    return Err(error);
+                }
+            }
+        }
+        // This is the same mutex critical section as nonce validation and
+        // registry compare-remove. No new Start can observe an unbooked gap.
+        *guard = None;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for AndroidStopBooking<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Ok(mut guard) = self.custody.lock() {
+                if let Some(attempt) = guard.as_mut().filter(|attempt| {
+                    attempt.birth.same(&self.birth)
+                        && attempt
+                            .stop_inflight
+                            .as_ref()
+                            .is_some_and(|nonce| Arc::ptr_eq(nonce, &self.nonce))
+                }) {
+                    attempt.stop_inflight = None;
+                    attempt.historic_unknown = true;
+                }
+            }
+        }
+    }
+}
+
 /// The blocking Stop returns this non-cloneable permit with its ACK. It stays
 /// booked through final Child→pid validation; Drop only releases booking.
 pub(super) struct HelperStopPermit {
@@ -108,6 +216,7 @@ pub(super) struct DirectCoreRun {
     pub(super) identity: RunIdentity,
     #[allow(dead_code)] // Read when the managed coordinator's exact stop gate is wired.
     pub(super) origin: DirectRunOrigin,
+    pub(super) main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
 }
 
 /// The legacy constructor records Legacy. A future managed coordinator must
@@ -139,7 +248,18 @@ impl DirectCoreRun {
             child,
             identity,
             origin: DirectRunOrigin::Legacy,
+            main_token: None,
         }
+    }
+
+    pub(super) fn with_main_token(
+        child: Child,
+        identity: RunIdentity,
+        token: crate::runtime::tailscale_login_core::MainBirthToken,
+    ) -> Self {
+        let mut run = Self::with_identity(child, identity);
+        run.main_token = Some(token);
+        run
     }
 }
 
@@ -150,20 +270,199 @@ pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
 pub(super) const STALE_KILL_GRACE: Duration = Duration::from_millis(1_500);
 
 impl ProxyRuntime {
+    fn book_android_global_start_locked(
+        custody: &mut Option<super::AndroidGlobalCustody>,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<super::AndroidRequestBirth, String> {
+        if custody.is_some() {
+            return Err("Android global Start/Stop request is still owned".into());
+        }
+        let birth = super::AndroidRequestBirth {
+            identity: Arc::new(()),
+            main_token,
+        };
+        *custody = Some(super::AndroidGlobalCustody {
+            birth: birth.clone(),
+            stop_only: false,
+            start_confirmed: false,
+            historic_unknown: false,
+            stop_inflight: None,
+        });
+        Ok(birth)
+    }
+
+    /// The TS gate is held by start_inner. Read the real generation while
+    /// holding the same Android custody mutex that explicit Start holds across
+    /// its generation claim; an older attempt cannot book after being replaced.
+    pub(super) fn book_android_global_start_for_generation(
+        &self,
+        my_gen: u64,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<Option<super::AndroidRequestBirth>, String> {
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned".to_string())?;
+        if self.gate.generation() != my_gen {
+            return Ok(None);
+        }
+        Self::book_android_global_start_locked(&mut custody, main_token).map(Some)
+    }
+
+    #[cfg(test)]
+    pub(super) fn book_android_global_start(
+        &self,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<super::AndroidRequestBirth, String> {
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned".to_string())?;
+        Self::book_android_global_start_locked(&mut custody, main_token)
+    }
+
+    pub(super) fn confirm_android_global_start(
+        &self,
+        birth: &super::AndroidRequestBirth,
+    ) -> Result<(), String> {
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned after Start".to_string())?;
+        let attempt = custody
+            .as_mut()
+            .filter(|attempt| attempt.birth.same(birth) && !attempt.stop_only)
+            .ok_or("Android global Start custody changed")?;
+        attempt.start_confirmed = true;
+        Ok(())
+    }
+
+    pub(super) fn begin_android_stop_booking(
+        &self,
+        allow_main: bool,
+    ) -> Result<AndroidStopBooking<'_>, String> {
+        let mut guard = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned".to_string())?;
+        let nonce = Arc::new(());
+        match guard.as_mut() {
+            Some(attempt)
+                if (allow_main || attempt.birth.main_token.is_none())
+                    && (attempt.start_confirmed || attempt.stop_only)
+                    && attempt.stop_inflight.is_none() =>
+            {
+                let was_certain = !attempt.historic_unknown;
+                attempt.stop_inflight = Some(Arc::clone(&nonce));
+                Ok(AndroidStopBooking {
+                    custody: &self.android_main_token,
+                    birth: attempt.birth.clone(),
+                    nonce,
+                    was_certain,
+                    completed: false,
+                })
+            }
+            Some(_) => Err(
+                "Android global cleanup-unknown: a Start or Stop request may still complete".into(),
+            ),
+            None => {
+                // Cold system-started core cleanup is also a global Stop.
+                // It must book an independent birth before delivery.
+                let birth = super::AndroidRequestBirth {
+                    identity: Arc::new(()),
+                    main_token: None,
+                };
+                *guard = Some(super::AndroidGlobalCustody {
+                    birth: birth.clone(),
+                    stop_only: true,
+                    start_confirmed: false,
+                    historic_unknown: false,
+                    stop_inflight: Some(Arc::clone(&nonce)),
+                });
+                Ok(AndroidStopBooking {
+                    custody: &self.android_main_token,
+                    birth,
+                    nonce,
+                    was_certain: true,
+                    completed: false,
+                })
+            }
+        }
+    }
+
+    /// The caller holds the real TS gate across this entire existing stop leg.
+    /// Registry removal is only a local bookkeeping consequence of its ACK.
+    pub(super) async fn kill_core_and_release_main(
+        &self,
+        ts_gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        if cfg!(target_os = "android") {
+            // Stop booking spans the detached request, registry compare-remove,
+            // and global custody removal. The latter two share one short
+            // Android-custody→registry critical section under the TS gate.
+            super::android_bridge::main_start_dispatch_available().map_err(|(msg, _)| msg)?;
+            let booking = self.begin_android_stop_booking(true)?;
+            let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
+            return booking.finish_with_gate(result, &self.mesh, ts_gate);
+        }
+        let token = self.main_token_for_stop()?;
+        self.kill_core().await?;
+        if let Some(token) = token {
+            self.mesh
+                .release_tailscale_main_states_if_token(&token, ts_gate)?;
+        }
+        Ok(())
+    }
+
+    /// Called only while the caller holds the real TS state gate. Freeze the
+    /// birth token before kill_core can take a direct Child or retire a helper
+    /// attempt; no empty-slot inference may clear a registry entry.
+    pub(super) fn main_token_for_stop(
+        &self,
+    ) -> Result<Option<crate::runtime::tailscale_login_core::MainBirthToken>, String> {
+        if cfg!(target_os = "android") {
+            return self
+                .android_main_token
+                .lock()
+                .map(|custody| {
+                    custody.as_ref().and_then(|attempt| {
+                        (attempt.start_confirmed
+                            && !attempt.historic_unknown
+                            && attempt.stop_inflight.is_none())
+                        .then(|| attempt.birth.main_token.clone())
+                        .flatten()
+                    })
+                })
+                .map_err(|_| "Android global custody poisoned".into());
+        }
+        self.child
+            .lock()
+            .map(|child| child.main_token_for_stop(self.core_via_helper.load(Ordering::SeqCst)))
+            .map_err(|_| "direct Child token custody poisoned".into())
+    }
+
     /// Register every helper start/stop/cleanup before its blocking IPC is
     /// queued. Child is the serialization point for the direct-stop bridge.
     pub(crate) fn register_helper_backend(&self) -> Result<(), String> {
         self.helper.register_core_mutation()
     }
 
+    #[cfg(test)]
     pub(super) fn register_helper_start_backend(&self) -> Result<HelperStartToken, String> {
+        self.register_helper_start_backend_with_main(None)
+    }
+
+    pub(super) fn register_helper_start_backend_with_main(
+        &self,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<HelperStartToken, String> {
         self.register_helper_backend()?;
         let mut child = self
             .child
             .lock()
             .map_err(|_| "child lock poisoned".to_string())?;
         let token = child
-            .begin_helper_start()
+            .begin_helper_start_with_main(main_token)
             .map_err(|error| format!("helper IPC rejected by direct Child custody: {error:?}"))?;
         self.core_via_helper.store(true, Ordering::SeqCst);
         Ok(token)
@@ -279,7 +578,12 @@ impl ProxyRuntime {
         //
         // `if cfg!` 而非 `#[cfg]` 早退：后者会让下面整段在 Android 编译单元里变成不可达代码。
         if cfg!(target_os = "android") {
-            return super::android_bridge::stop_core().await;
+            // Stale/system-core cleanup has no TS claim to retire, but its
+            // global Stop still needs a nonce and sticky detached-task fence.
+            super::android_bridge::main_start_dispatch_available().map_err(|(msg, _)| msg)?;
+            let booking = self.begin_android_stop_booking(false)?;
+            let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
+            return booking.finish_without_main(result);
         }
         // C6-5：经 helper 起的核 → 经 helper stop（对称）。daemon 摘其受管 child → SIGTERM→宽限→SIGKILL
         // 收割（app 无本地 child 句柄）。阻塞 IPC 挪出 async worker。
@@ -510,7 +814,7 @@ impl ProxyRuntime {
             return Ok(());
         }
         log::warn!("起核前发现系统拉起的核（本运行时未持有）→ 先停掉，再按当前配置起核");
-        super::android_bridge::stop_core()
+        self.kill_core()
             .await
             .map_err(|e| StartError::coded(e, code::STARTUP_FAILED))
     }

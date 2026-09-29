@@ -564,6 +564,23 @@ impl StartError {
             admission_denied: true,
         }
     }
+
+    fn android_global_custody_occupied() -> Self {
+        let mut error = Self::coded(
+            "Android core request still owns global Start/Stop custody",
+            code::STARTUP_FAILED,
+        );
+        error.admission_denied = true;
+        error
+    }
+
+    fn android_global_custody_poisoned(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!("Android global core custody lock poisoned: {error}"),
+            code: Some(code::STARTUP_FAILED),
+            admission_denied: true,
+        }
+    }
 }
 
 impl std::fmt::Display for StartError {
@@ -1241,6 +1258,9 @@ pub struct ProxyRuntime {
     /// Desktop 直起 Child 的 Empty/Running/Stopping custody。Stopping 保留真实句柄，
     /// 不能被下一次启动覆盖；就绪门的同步 `is_alive` 只观察 Running，guard 绝不跨 await。
     child: Arc<Mutex<DirectCoreSlot>>,
+    /// Android has no Child/PID; its TS birth stays here while a bridge request
+    /// can outlive the async waiter. An unknown request must retain custody.
+    android_main_token: Mutex<Option<AndroidGlobalCustody>>,
     /// spawn 出的 pid（child 被 stop 取走后仍可用于日志/诊断；helper 起核时 = daemon 报告的受管核 pid）。
     pid: Arc<Mutex<Option<u32>>>,
     /// **C6-5**：当前运行核是否经 helper 提权起（TUN 路由）。运行期内部真值源（≠ 面向前端的
@@ -1493,6 +1513,30 @@ pub struct ProxyRuntime {
     runtime_binding_state: Mutex<RuntimeBindingState>,
 }
 
+/// The old Android bridge starts and stops through detached tasks. A dropped
+/// waiter or timeout leaves a request that may still mutate the service; no
+/// later global `stop: ()` ACK can clear that uncertainty for this registry.
+#[derive(Clone)]
+struct AndroidRequestBirth {
+    identity: Arc<()>,
+    main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+}
+
+impl AndroidRequestBirth {
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+struct AndroidGlobalCustody {
+    birth: AndroidRequestBirth,
+    stop_only: bool,
+    start_confirmed: bool,
+    /// Monotone until this entire birth is removed after a certain ACK.
+    historic_unknown: bool,
+    stop_inflight: Option<Arc<()>>,
+}
+
 /// 单测用 DoH 桩：**永远 FAIL**。
 ///
 /// 单测绝不许碰宿主网络（禁向真实 DoH 上游发查询），故这里不是「假成功」而是「明确失败」——
@@ -1575,6 +1619,7 @@ impl ProxyRuntime {
             start_inflight: Arc::new(AtomicU32::new(0)),
             network_settle: Arc::new(NetworkSettleGate::default()),
             child,
+            android_main_token: Mutex::new(None),
             pid: Arc::new(Mutex::new(None)),
             core_via_helper: Arc::new(AtomicBool::new(false)),
             pending_force_restart: RwLock::new(None),

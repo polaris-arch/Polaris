@@ -139,6 +139,7 @@ impl ManagedDirectBirth {
             child,
             identity: self.identity,
             origin: DirectRunOrigin::Managed(self.facts),
+            main_token: None,
         }
     }
 }
