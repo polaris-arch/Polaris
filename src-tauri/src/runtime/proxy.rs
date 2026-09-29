@@ -194,6 +194,31 @@ use polaris_switch_engine::{ManagementApi, ManagementError};
 use serde_json::Value;
 use tokio::process::Child;
 
+/// Identity of one locally spawned core. The token is created with its Child handle,
+/// so neither a reused PID nor a later lifecycle request can impersonate that run.
+#[derive(Clone)]
+struct RunIdentity(Arc<()>);
+
+impl RunIdentity {
+    fn same_run(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+struct DirectCoreRun {
+    child: Child,
+    identity: RunIdentity,
+}
+
+impl DirectCoreRun {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            identity: RunIdentity(Arc::new(())),
+        }
+    }
+}
+
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
 use crate::commands::speedtest::current_server_fingerprints;
@@ -1218,7 +1243,7 @@ pub struct ProxyRuntime {
     debounced: DebouncedRestart,
     /// sing-box 子进程句柄。std `Mutex`：就绪门的 `is_alive` 是**同步**闭包（`Fn()->bool`），
     /// 必须能在其中即时 `try_wait`；guard 绝不跨 await 持有（否则 !Send 编译即拒）。
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<DirectCoreRun>>>,
     /// spawn 出的 pid（child 被 stop 取走后仍可用于日志/诊断；helper 起核时 = daemon 报告的受管核 pid）。
     pid: Arc<Mutex<Option<u32>>>,
     /// **C6-5**：当前运行核是否经 helper 提权起（TUN 路由）。运行期内部真值源（≠ 面向前端的

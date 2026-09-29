@@ -1099,6 +1099,9 @@ impl ProxyRuntime {
         // 之外。`via_helper` 在进循环前就定了（上方），故不存在「某腿直起、某腿 helper 起」的混合形态；
         // 直起时每腿都会覆写成本腿的新闸（上一腿的核已被 kill，其管道任务随之结束）。
         let mut log_pipe_handoff: Option<CoreLogHandoff> = None;
+        // Captured from the same Child slot as the actual spawn, then carried to
+        // its monitor. A later start cannot make the old monitor adopt its Child.
+        let mut direct_run_identity = None;
 
         // C11 节点域名解析多源竞速（对齐 上游 start 步骤 3.9 `startNodeDnsRaceServer`）：
         // 节点 outbound.server 恒是域名，由内核运行期解析多 A → DialSerial 逐 IP 重试；这里给内核
@@ -1499,7 +1502,9 @@ impl ProxyRuntime {
                 };
                 let pid = spawned.pid().unwrap_or(0);
                 log_pipe_handoff = Some(handoff);
-                *guard = Some(spawned.child);
+                let run = super::DirectCoreRun::new(spawned.child);
+                direct_run_identity = Some(run.identity.clone());
+                *guard = Some(run);
                 pid
             };
             let spawn_attempt_ms = t_spawn.elapsed().as_millis();
@@ -1823,8 +1828,9 @@ impl ProxyRuntime {
         //     三条都必须等校正落定（各自的具体理由见 `after_selector_reasserted`）。
         self.spawn_reassert_selector_selection(user_config.clone(), my_gen, api_port);
         // 核就绪 → 挂后台崩溃监测（**唯一**接线点：只在真正 running 后起，让位/失败腿不挂）。
-        // 监测「核意外退出」并触发崩溃自愈；主动 stop/restart 由世代区分不误触（见 `spawn_crash_monitor`）。
-        self.spawn_crash_monitor(my_gen);
+        // 监测「核意外退出」并触发崩溃自愈；直起腿由 Child 绑定的 run 身份区分物理核，
+        // helper 腿仍走既有请求世代与进程身份观察（见 `spawn_crash_monitor`）。
+        self.spawn_crash_monitor(my_gen, direct_run_identity);
         // 核就绪 → 挂核日志 relay（`SubscribeLog`，同世代范式）。**无条件挂**：这是 TUN/helper 腿上
         // 日志页唯一的核日志来源，也是「改级别立刻生效、不必重启核」的承载（见方法文档）。
         // `log_pipe_handoff` 区分直起（有 stderr 管道，需交接 + 丢首帧历史）与 helper 起（无管道，收历史）。
@@ -2513,7 +2519,7 @@ impl ProxyRuntime {
                         helper_pid.is_some_and(pid_alive)
                     } else if let Ok(mut g) = child.lock() {
                         match g.as_mut() {
-                            Some(c) => matches!(c.try_wait(), Ok(None)),
+                            Some(run) => matches!(run.child.try_wait(), Ok(None)),
                             None => false,
                         }
                     } else {

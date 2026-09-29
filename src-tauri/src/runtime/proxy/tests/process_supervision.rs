@@ -88,6 +88,169 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
 
 use std::sync::atomic::AtomicUsize;
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_replacement() {
+    use crate::runtime::config::{ApplyCasExpected, ApplyPersistError};
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyStep};
+    use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
+    use polaris_store::mesh_guard::{POLICY_KEY, REQUIRED_MARKER_FILE, STATE_KEY};
+
+    let (rt, dir) = test_runtime();
+    let wire: Value = serde_json::from_str(include_str!(
+        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    ))
+    .unwrap();
+    let mut raw = polaris_store::store::default_config();
+    raw[POLICY_KEY] = wire[POLICY_KEY].clone();
+    raw[STATE_KEY] = wire[STATE_KEY].clone();
+    raw[STATE_KEY]["revision"] = serde_json::json!("1");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&serde_json::json!({
+            "phase": "enabled",
+            "localId": raw[STATE_KEY]["localId"],
+            "legacyConfigDigest": "0".repeat(64),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let version = crate::commands::config::config_version(&raw);
+    let plan = ManagedMeshRoutePlan {
+        schema_version: 1,
+        plan_id: "run-identity-cas".into(),
+        config_version: version.clone(),
+        input_state_revision: "1".into(),
+        identity_bindings: vec![],
+        protected_cidrs: vec![],
+        owner_routes: vec![],
+        reject_cidrs: vec![],
+        unassigned_cidrs: vec![],
+        released_cidrs: vec![],
+        overrides: vec![],
+        dns_managed: false,
+    };
+    let old_generation = rt
+        .gate
+        .claim_generation(None, LifecycleKind::Start)
+        .unwrap();
+    let snapshot = rt.config.read_mesh_apply_snapshot().unwrap();
+    let prepared = rt
+        .gate
+        .with_current_generation(old_generation, |live| {
+            rt.config.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-run-identity",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-run-identity",
+                    manifest_ref: "mesh-routes/plans/run-identity-cas/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn real local child");
+    let run = DirectCoreRun::new(child);
+    let identity = run.identity.clone();
+    *rt.child.lock().unwrap() = Some(run);
+    rt.spawn_crash_monitor(old_generation, Some(identity.clone()));
+    tokio::time::sleep(Duration::from_millis(CRASH_MONITOR_POLL_MS + 100)).await;
+    assert_eq!(
+        Arc::strong_count(&identity.0),
+        3,
+        "child, test and monitor own the run"
+    );
+
+    // A real persistent CAS rejection occurs after Stop claims a request generation.
+    // No teardown ran; the old Child remains the physical owner.
+    rt.config
+        .set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    let stop_generation = rt
+        .gate
+        .claim_generation(Some(old_generation), LifecycleKind::Stop)
+        .unwrap();
+    let rejected = rt
+        .gate
+        .with_current_generation(stop_generation, |live| {
+            rt.config.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                "boot-run-identity",
+                live,
+                ApplyStep::RequestStopReserved {
+                    plan: &plan,
+                    claim: &claim,
+                    old_generation,
+                    stop_generation,
+                },
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::ConfigChanged)
+    ));
+    tokio::time::sleep(Duration::from_millis(CRASH_MONITOR_POLL_MS + 100)).await;
+    assert_eq!(
+        Arc::strong_count(&identity.0),
+        3,
+        "failed Stop CAS must not retire the old child's live monitor"
+    );
+    assert!(matches!(
+        rt.child.lock().unwrap().as_mut().unwrap().child.try_wait(),
+        Ok(None)
+    ));
+
+    // Replace the slot while the old monitor is alive. It must release only
+    // its own token and never inspect or classify the newer live child.
+    let next = DirectCoreRun::new(
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn replacement child"),
+    );
+    let next_identity = next.identity.clone();
+    let mut old = rt.child.lock().unwrap().replace(next).unwrap();
+    old.child.kill().await.unwrap();
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(CRASH_MONITOR_POLL_MS + 100)).await;
+    assert_eq!(Arc::strong_count(&identity.0), 1, "old monitor retired");
+    assert_eq!(
+        rt.crash_lock().restart_count(),
+        0,
+        "old monitor must not classify the replacement as its own crash"
+    );
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .identity
+        .same_run(&next_identity));
+    assert!(matches!(
+        rt.child.lock().unwrap().as_mut().unwrap().child.try_wait(),
+        Ok(None)
+    ));
+    rt.kill_core().await.unwrap();
+}
+
 /// 可观测的 [`HelperStopOps`] 替身：记调用次数 + 每次带的身份 pid，并可被指定成失败腿。
 ///
 /// `during_call` 在「IPC 往返中」执行 —— 用来**确定性**地复现「停核请求在飞、期间新会话起了新核」
@@ -777,7 +940,7 @@ fn active_stop_during_helper_observation_retires_instead_of_recovering() {
 /// `gen_now`。纯函数测试只能证明判据会算，守不住调用点重新喂陈旧快照的回归，故这里对方法体锁序。
 #[test]
 fn crash_monitor_classification_is_wired_after_observation() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let body = method_body(&module_code("runtime/proxy"), HEAD);
     let observation_at = body
         .find("let observation =")
@@ -835,7 +998,7 @@ async fn public_stop_marks_recovery_aborted_and_next_start_resets_it() {
 /// 打断（把复核那段删掉、只留 `pid_alive`）→ 本地腿那几条全红。
 #[test]
 fn crash_monitor_actually_consults_the_pid_identity() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let src = module_code("runtime/proxy");
     // 切在「锚点之后的第一个顶层 `#[cfg(test)]`」：本文件里生产码与测试模块**交替**出现
     // （实测顶层 cfg(test) 有 5 处，最后一处还在本测试之后）⇒ 切第一处会把待验方法切掉、
@@ -1014,7 +1177,7 @@ fn attestation_consults_the_helper_reported_image() {
 /// `ChildObservation::Alive` → 后三条转红；把那段整体换回只比 `pid == p` → 前两条也转红。
 #[test]
 fn crash_monitor_consults_the_helper_reported_created_token() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let src = module_code("runtime/proxy");
     let at = src
         .find(HEAD)
@@ -1076,7 +1239,7 @@ fn crash_monitor_consults_the_helper_reported_created_token() {
 /// `runtime::helper::tests::start_identity_baseline_is_remembered_and_never_goes_stale` 覆盖。
 #[test]
 fn crash_monitor_seeds_the_helper_baseline_from_the_start_response() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let src = module_code("runtime/proxy");
     let at = src
         .find(HEAD)

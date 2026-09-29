@@ -150,10 +150,10 @@ impl ProxyRuntime {
                 return Err(format!("child lock poisoned: {e}"));
             }
         };
-        let Some(mut child) = child_opt else {
+        let Some(mut run) = child_opt else {
             return Ok(());
         };
-        let pid = child.id().unwrap_or(0);
+        let pid = run.child.id().unwrap_or(0);
         if pid == 0 {
             // 已退出且被收割 → 仅 reap 残句柄。
             //
@@ -161,7 +161,7 @@ impl ProxyRuntime {
             // 罕见角落 —— 核「起来就死」时就绪门的 `try_wait` 会先一步收割它，`child.id()` 随即变 None ⇒
             // 每一次起核失败都从这里走。留下的陈旧 pid 会被 `status()`、诊断、以及 stale 清扫的「受管
             // pid 排除表」当成活的受管核继续引用（排除表里挂个死 pid，等于给同号新进程发免死金牌）。
-            let _ = child.wait().await;
+            let _ = run.child.wait().await;
             if let Ok(mut g) = self.pid.lock() {
                 *g = None;
             }
@@ -181,7 +181,7 @@ impl ProxyRuntime {
         )
         .await;
         // 等进程退出（reap，防僵尸）。进程若拒 SIGTERM，升级 task 到点补 SIGKILL 解开此处。
-        let _ = child.wait().await;
+        let _ = run.child.wait().await;
         // 进程已退出 → 取消挂起的 SIGKILL 升级（防 timer 泄漏 + 防 pid 复用误杀）。
         escalation.wait().await;
         if let Ok(mut g) = self.pid.lock() {

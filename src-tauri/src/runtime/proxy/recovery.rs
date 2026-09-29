@@ -1,4 +1,4 @@
-//! 崩溃自愈 owner：后台崩溃监测腿（世代 + pid 身份双判据）、退避重启执行体、GiveUp 终态播报，
+//! 崩溃自愈 owner：后台崩溃监测腿（直起 Child 身份；helper 既有世代 + pid 身份判据）、退避重启执行体、GiveUp 终态播报，
 //! 以及「观察之后才读世代」的分类 seam 与「不可恢复重启错误」谓词。
 
 use std::sync::atomic::Ordering;
@@ -17,7 +17,7 @@ use super::lifecycle::monotonic_now_ms;
 use super::process_supervision::{pid_alive, pid_identity_verdict, process_identity, PidIdentity};
 use super::route_replan::RuntimeBindingState;
 use super::startup::with_helper_gate_suppressed;
-use super::{ProxyRuntime, StartError};
+use super::{ProxyRuntime, RunIdentity, StartError};
 
 /// 崩溃监测轮询间隔（ms）。tokio `Child::wait()` 单持有者 → 监测只能轮询 `try_wait`（见
 /// `spawn_crash_monitor`）；1s 与健康检查同量级，CPU 可忽略，崩溃检出延迟 ≤1s。
@@ -60,10 +60,15 @@ impl ProxyRuntime {
     /// 路径（`kill_core`）已经持有并 `wait()` 那个句柄 → 崩溃监测不能也去 `wait()`，只能短暂持锁
     /// `try_wait` 观察。轮询绝不跨 await 持 `child` 锁（否则 !Send 编译即拒 + 与 `kill_core` 抢锁）。
     ///
-    /// **主动 vs 意外的区分**（本任务最易出 bug 处）：完全靠 `LifecycleGate` 世代。
-    /// `stop`/`restart` 入口必先 `bump_generation()` 再杀核 → 世代一变本监测即 `Retire`，
-    /// 主动杀核的 SIGTERM/SIGKILL 绝不会被误判成崩溃。判据见 [`classify_child_exit`]。
-    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {
+    /// The direct child is tracked by its spawn-bound identity. A request claim
+    /// alone cannot retire that monitor: persistent Stop reservation may fail
+    /// while the same child keeps running. Helper identity remains on its
+    /// existing protocol path and is not promoted to this guarantee.
+    pub(super) fn spawn_crash_monitor(
+        self: &Arc<Self>,
+        my_gen: u64,
+        direct_run_identity: Option<RunIdentity>,
+    ) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             // helper 腿的 pid 身份基线：`(基线取自哪个 pid, 令牌)`。见 [`process_identity`]。
@@ -94,7 +99,9 @@ impl ProxyRuntime {
                 // **pid 探活只回答「这个号码上有进程吗」**，不回答「是不是我那个」⇒ 核死后号码被复用
                 // 时它恒真、崩溃自愈永不触发。故每 `PID_IDENTITY_RECHECK_TICKS` 个 tick 复核一次
                 // 进程身份令牌（[`process_identity`]），换人即判退出。
-                let observation = if me.core_via_helper.load(Ordering::SeqCst) {
+                let observation = if direct_run_identity.is_none()
+                    && me.core_via_helper.load(Ordering::SeqCst)
+                {
                     match me.pid.lock().ok().and_then(|g| *g) {
                         Some(p) => {
                             if !pid_alive(p) {
@@ -204,7 +211,7 @@ impl ProxyRuntime {
                         // pid 已被清（停核/让位收口）→ 视作退场，非崩溃。
                         None => ChildObservation::Absent,
                     }
-                } else {
+                } else if let Some(expected) = direct_run_identity.as_ref() {
                     let mut guard = match me.child.lock() {
                         Ok(g) => g,
                         Err(e) => {
@@ -213,23 +220,51 @@ impl ProxyRuntime {
                         }
                     };
                     match guard.as_mut() {
-                        None => ChildObservation::Absent,
-                        Some(c) => match c.try_wait() {
-                            Ok(None) => ChildObservation::Alive,
-                            // 已退出（收割）或探活出错 → 保守当已退出。
-                            Ok(Some(_)) | Err(_) => ChildObservation::Exited,
-                        },
+                        Some(run) if run.identity.same_run(expected) => {
+                            match run.child.try_wait() {
+                                Ok(None) => ChildObservation::Alive,
+                                // 已退出（收割）或探活出错 → 保守当已退出。
+                                Ok(Some(_)) | Err(_) => ChildObservation::Exited,
+                            }
+                        }
+                        // The old handle was taken by Stop or replaced by a later
+                        // run. Never observe the replacement on this monitor.
+                        _ => ChildObservation::Absent,
                     }
+                } else {
+                    ChildObservation::Absent
                 };
-                // 世代必须在观察**之后**读取：Windows 的进程身份查询可能与另一 worker 上的 stop 并行；
-                // 查询前缓存会把主动停核后的 Exited 配上旧世代，误判 Crash 并自动拉回 TUN。
-                match classify_observed_child_exit(&me.gate, my_gen, observation) {
+                // helper 腿仍在观察**之后**读请求世代，避免 Windows 的同步身份查询与
+                // 主动 stop 并行时误判。直起腿只看它实际持有的 Child 身份：Stop
+                // claim 后若持久 CAS 失败，旧 Child 仍运行，监测也必须继续。
+                let classification = if direct_run_identity.is_some() {
+                    match observation {
+                        ChildObservation::Alive => ExitClassification::KeepWatching,
+                        ChildObservation::Absent => ExitClassification::Retire,
+                        ChildObservation::Exited => ExitClassification::Crash,
+                    }
+                } else {
+                    classify_observed_child_exit(&me.gate, my_gen, observation)
+                };
+                match classification {
                     ExitClassification::KeepWatching => {}
                     // 主动 stop/restart 接管（世代变 / 句柄被取）→ 退场，不触发自愈。
                     ExitClassification::Retire => return,
                     ExitClassification::Crash => {
+                        // A replacement may land after try_wait released the
+                        // child lock. Do not reset shared runtime state for a
+                        // run that no longer owns that slot.
+                        if direct_run_identity.as_ref().is_some_and(|expected| {
+                            !me.child.lock().ok().is_some_and(|slot| {
+                                slot.as_ref()
+                                    .is_some_and(|run| run.identity.same_run(expected))
+                            })
+                        }) {
+                            return;
+                        }
                         log::warn!(
-                            "检测到 sing-box 意外退出（世代 {my_gen} 未变、非主动停止）→ 触发崩溃自愈"
+                            "检测到 sing-box 意外退出（启动请求世代 {my_gen}，当前请求世代 {}）→ 触发崩溃自愈",
+                            me.gate.generation()
                         );
                         // C5：核意外退出 → TS 内核接口已随进程消失、其 ifscope 路由自动失效 → 同步复位内存态
                         // （不发删命令，防对已消失接口误删主表）。自愈重启后由 start_inner 就绪后 reconcile 重建。

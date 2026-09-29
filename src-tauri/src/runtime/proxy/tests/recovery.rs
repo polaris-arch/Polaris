@@ -171,7 +171,7 @@ async fn diagnostic_slow_start_axis_fed_and_rendered() {
         c
     };
     let child = cmd.spawn().expect("spawn 占位核");
-    *rt.child.lock().unwrap() = Some(child);
+    *rt.child.lock().unwrap() = Some(DirectCoreRun::new(child));
 
     // 管理 API 端口：先取空闲口但不监听。把 wait_ready 放到独立任务中，等其 `on_retry` 屏障
     // 明确证明首探已经失败后才 bind。固定 700ms 在 Windows hosted runner 上并不构成先后关系：
