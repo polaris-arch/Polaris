@@ -2580,6 +2580,81 @@ index 0000000..6b13133
 +		t.Fatalf("internal close count = %d", closed)
 +	}
 +}
+diff --git a/daemon/started_service_strict_cleanup_test.go b/daemon/started_service_strict_cleanup_test.go
+index ac73309..e483043 100644
+--- a/daemon/started_service_strict_cleanup_test.go
++++ b/daemon/started_service_strict_cleanup_test.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+ 	"github.com/sagernet/sing-box/adapter/outbound"
+ 	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/dns"
+ 	"github.com/sagernet/sing-box/dns/transport/local"
+ 	"github.com/sagernet/sing-box/log"
+@@ -20,8 +21,9 @@ import (
+ )
+ 
+ type failingTransientService struct {
+-	startErr error
+-	closeErr error
++	startErr   error
++	closeErr   error
++	closeCalls *int
+ }
+ 
+ func (s *failingTransientService) Type() string { return "test-failing-close" }
+@@ -32,7 +34,13 @@ func (s *failingTransientService) Start(stage adapter.StartStage) error {
+ 	}
+ 	return nil
+ }
+-func (s *failingTransientService) Close() error { return s.closeErr }
++func (s *failingTransientService) Close() error {
++	if s.closeCalls != nil {
++		*s.closeCalls++
++	}
++	return s.closeErr
++}
++func (s *failingTransientService) DisposeConstruction() error { return s.Close() }
+ 
+ func TestStrictTransientEarlyStartCleanupFailureBecomesSticky(t *testing.T) {
+ 	t.Chdir(t.TempDir())
+@@ -61,6 +69,35 @@ func TestStrictTransientEarlyStartCleanupFailureBecomesSticky(t *testing.T) {
+ 	}
+ }
+ 
++func TestStrictTransientUnownedUnknownCleanupRemainsStickyWithoutRuntimeClose(t *testing.T) {
++	t.Chdir(t.TempDir())
++	dnsRegistry := dns.NewTransportRegistry()
++	local.RegisterTransport(dnsRegistry)
++	registry := boxService.NewRegistry()
++	ctx := box.Context(context.Background(), inbound.NewRegistry(), outbound.NewRegistry(), endpoint.NewRegistry(), dnsRegistry, registry, boxCertificate.NewRegistry())
++	startFailure := errors.New("synthetic partial Start failure")
++	closed := 0
++	boxService.Register[struct{}](registry, "unknown-partial-start", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++		// Embedding only the lifecycle interface deliberately hides construction
++		// capability, modeling an unaudited implementation with unsafe Close.
++		return &struct{ adapter.Service }{&failingTransientService{startErr: startFailure, closeCalls: &closed}}, nil
++	})
++	host := NewStartedService(ServiceOptions{Context: ctx, StrictCleanup: true, KeepDefaultLogger: true})
++	defer host.Close()
++	err := host.StartOrReloadService(context.Background(), `{"services":[{"type":"unknown-partial-start","tag":"probe"}]}`, &OverrideOptions{})
++	if !errors.Is(err, startFailure) || !errors.Is(err, construction.ErrUnknownDisposal) {
++		t.Fatalf("partial Start lost original failure or unknown cleanup: %v", err)
++	}
++	for range 2 {
++		if err = host.CloseService(); !errors.Is(err, construction.ErrUnknownDisposal) {
++			t.Fatalf("unknown cleanup was cleared: %v", err)
++		}
++	}
++	if closed != 0 {
++		t.Fatalf("unowned unknown child invoked runtime Close %d times", closed)
++	}
++}
++
+ func TestStrictTransientCloseIsTerminalBeforeStart(t *testing.T) {
+ 	service := NewStartedService(ServiceOptions{Context: context.Background(), StrictCleanup: true})
+ 	defer service.Close()
 diff --git a/dns/manager_construction_test.go b/dns/manager_construction_test.go
 new file mode 100644
 index 0000000..6ed742f
