@@ -48,6 +48,7 @@ async fn non_android_never_reports_a_system_started_core() {
 fn android_receipt_requires_exact_run_config_and_claim() {
     let receipt: AndroidStartReceipt = serde_json::from_value(serde_json::json!({
         "runId": "candidate-7",
+        "birthNonce": "birth-7",
         "configDigest": "a".repeat(64),
         "claim": "claim-7",
         "tun": {
@@ -62,6 +63,7 @@ fn android_receipt_requires_exact_run_config_and_claim() {
     }))
     .unwrap();
     assert!(receipt.matches_request("candidate-7", &"a".repeat(64), Some("claim-7")));
+    assert_eq!(receipt.exact_target().birth_nonce, "birth-7");
     assert!(!receipt.matches_request("candidate-8", &"a".repeat(64), Some("claim-7")));
     assert!(!receipt.matches_request("candidate-7", &"b".repeat(64), Some("claim-7")));
     assert!(!receipt.matches_request("candidate-7", &"a".repeat(64), None));
@@ -98,6 +100,71 @@ fn android_receipt_requires_exact_run_config_and_claim() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn exact_stop_requires_the_birth_nonce_and_confirmed_release_state() {
+    let target = AndroidExactTarget {
+        run_id: "same-run".into(),
+        birth_nonce: "first-birth".into(),
+    };
+    let closed: AndroidExactStopReceipt = serde_json::from_value(serde_json::json!({
+        "runId": "same-run", "birthNonce": "first-birth", "state": "Closed"
+    }))
+    .unwrap();
+    assert!(closed.matches_target(&target));
+    assert!(closed.confirms_closed());
+    let gone: AndroidExactStopReceipt = serde_json::from_value(serde_json::json!({
+        "runId": "same-run", "birthNonce": "first-birth", "state": "AlreadyGone"
+    }))
+    .unwrap();
+    assert!(gone.matches_target(&target));
+    assert!(gone.confirms_closed());
+    let busy: AndroidExactStopReceipt = serde_json::from_value(serde_json::json!({
+        "runId": "same-run", "birthNonce": "first-birth", "state": "Busy"
+    }))
+    .unwrap();
+    assert!(!busy.confirms_closed());
+    let unknown: AndroidExactStopReceipt = serde_json::from_value(serde_json::json!({
+        "runId": "same-run", "birthNonce": "first-birth", "state": "Unknown",
+        "reason": "different-owner"
+    }))
+    .unwrap();
+    assert!(!unknown.confirms_closed());
+    assert!(!AndroidExactStopReceipt {
+        birth_nonce: "second-birth".into(),
+        ..closed.clone()
+    }
+    .matches_target(&target));
+    assert!(!AndroidExactStopReceipt {
+        reason: Some("timeout".into()),
+        ..closed
+    }
+    .matches_target(&target));
+    assert!(!AndroidExactStopReceipt {
+        reason: None,
+        ..unknown
+    }
+    .matches_target(&target));
+    assert!(
+        serde_json::from_value::<AndroidStartReceipt>(serde_json::json!({
+            "runId": "same-run", "configDigest": "a".repeat(64), "claim": null
+        }))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn non_android_exact_stop_and_query_cannot_claim_a_release() {
+    if cfg!(target_os = "android") {
+        return;
+    }
+    let target = AndroidExactTarget {
+        run_id: "old".into(),
+        birth_nonce: "birth".into(),
+    };
+    assert!(main_core_exact_status(&target).await.is_err());
+    assert!(stop_core_exact(&target).await.is_err());
 }
 
 #[tokio::test]

@@ -54,6 +54,14 @@ class LegacyFenceArgs {
     lateinit var fenceId: String
 }
 
+@InvokeArg
+class MainExactTargetArgs {
+    lateinit var runId: String
+    lateinit var birthNonce: String
+
+    internal fun target() = MainKernelExactTarget(runId, birthNonce)
+}
+
 internal data class MainStartRequest(
     val configContent: String,
     val runId: String,
@@ -473,6 +481,47 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         if (runId != null) result.put("runId", runId)
         invoke.resolve(result)
     }
+
+    /** Exact-attempt fact only. A missing registry owner is not evidence that an old run exited. */
+    @Command
+    fun mainCoreExactStatus(invoke: Invoke) {
+        val target = invoke.parseArgs(MainExactTargetArgs::class.java).target()
+        invoke.resolve(exactResult(MainKernelAttemptRegistry.exactStatus(target)))
+    }
+
+    /** Future managed coordinator seam; never routes a mismatched target to the ordinary Stop path. */
+    @Command
+    fun stopMainCoreExact(invoke: Invoke) {
+        val target = invoke.parseArgs(MainExactTargetArgs::class.java).target()
+        val selected = MainKernelAttemptRegistry.exactCloseTarget(target)
+        val owner = selected.owner
+        if (owner == null) {
+            invoke.resolve(exactResult(selected.result))
+            return
+        }
+        val worker = Thread({
+            val closeRequest = runCatching { owner.requestClose!!.invoke() }
+            if (closeRequest.isFailure) {
+                invoke.resolve(exactResult(MainKernelExactResult(target, "Unknown", "request-close-failed")))
+            } else {
+                runCatching { owner.attempt.released.get(8, TimeUnit.SECONDS) }
+                val observed = MainKernelAttemptRegistry.exactStatus(target)
+                // Native close and registry release, not the request itself, establish Closed.
+                val result = if (observed.state == "AlreadyGone" && owner.attempt.released.isDone)
+                    observed.copy(state = "Closed") else observed
+                invoke.resolve(exactResult(result))
+            }
+        }, "polaris-exact-main-stop")
+        runCatching { worker.start() }.onFailure {
+            invoke.resolve(exactResult(MainKernelExactResult(target, "Unknown", "close-worker-unavailable")))
+        }
+    }
+
+    private fun exactResult(result: MainKernelExactResult): JSObject = JSObject()
+        .put("runId", result.target.runId)
+        .put("birthNonce", result.target.birthNonce)
+        .put("state", result.state)
+        .also { response -> result.reason?.let { response.put("reason", it) } }
 
     /** Read-only status. Neither a missing ACK nor a timeout changes the gate or owner. */
     @Command
@@ -1130,6 +1179,7 @@ internal object VpnBridge {
                 check(attempt != null && startRequest != null)
                 val response = JSObject()
                     .put("runId", attempt.runId)
+                    .put("birthNonce", attempt.birthNonce)
                     .put("configDigest", startRequest.configDigest)
                 startRequest.claim?.let { response.put("claim", it) }
                 attempt.currentTunScope()?.let { scope ->

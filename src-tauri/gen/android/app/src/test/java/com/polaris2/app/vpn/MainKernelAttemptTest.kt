@@ -173,4 +173,87 @@ class MainKernelAttemptTest {
         assertFalse(registry.completeAfterClose(first) { error("old callback reached new bridge") })
         assertTrue(registry.isCurrent(second))
     }
+
+    @Test fun exactStopRejectsSameRunWithWrongBirthAndNeverCallsNewOwner() {
+        val registry = MainKernelAttemptLedger()
+        val old = MainKernelAttempt<Any>(runId = "reused-run")
+        val next = MainKernelAttempt<Any>(runId = "reused-run")
+        assertFalse(old.birthNonce == next.birthNonce)
+        val oldCalls = AtomicInteger()
+        val newCalls = AtomicInteger()
+        assertTrue(registry.claim(old) { oldCalls.incrementAndGet() })
+        val oldTarget = MainKernelExactTarget(old.runId, old.birthNonce)
+        val wrong = MainKernelExactTarget(old.runId, next.birthNonce)
+        val selectedBeforeRecreation = registry.exactCloseTarget(oldTarget).owner!!
+        assertEquals("Unknown", registry.exactCloseTarget(wrong).result.state)
+        assertEquals(null, registry.exactCloseTarget(wrong).owner)
+        assertEquals(0, oldCalls.get())
+        old.publish(Any())
+        old.revokeAndDetachTun()
+        old.closeOnce { }
+        assertEquals(null, old.closed.get(2, TimeUnit.SECONDS))
+        assertTrue(registry.completeAfterClose(old) { })
+        assertTrue(registry.claim(next) { newCalls.incrementAndGet() })
+        assertEquals("AlreadyGone", registry.exactStatus(oldTarget).state)
+        assertEquals(null, registry.exactCloseTarget(oldTarget).owner)
+        selectedBeforeRecreation.requestClose!!.invoke()
+        assertEquals(1, oldCalls.get())
+        assertEquals("Busy", registry.exactCloseTarget(wrong).result.state)
+        assertEquals(0, newCalls.get())
+    }
+
+    @Test fun exactStopKeepsFactoryAndNativeCloseInCustodyUntilRelease() {
+        val registry = MainKernelAttemptLedger()
+        val attempt = MainKernelAttempt<Any>(runId = "candidate")
+        val next = MainKernelAttempt<Any>(runId = "next")
+        val target = MainKernelExactTarget(attempt.runId, attempt.birthNonce)
+        val nativeEntered = CountDownLatch(1)
+        val allowNativeClose = CountDownLatch(1)
+        val closeRequests = AtomicInteger()
+        val fdCloses = AtomicInteger()
+        assertTrue(registry.claim(attempt) {
+            closeRequests.incrementAndGet()
+            val detached = attempt.revokeAndDetachTun()
+            attempt.closeOnce {
+                nativeEntered.countDown()
+                await(allowNativeClose)
+                detached?.close()
+            }
+        })
+        attempt.installTun(Closeable { fdCloses.incrementAndGet() }, observedScope)
+        val selected = registry.exactCloseTarget(target)
+        assertEquals("Busy", selected.result.state)
+        selected.owner!!.requestClose!!.invoke()
+        assertEquals(1, closeRequests.get())
+        assertEquals("Busy", registry.exactStatus(target).state)
+        assertFalse(registry.claim(next))
+        attempt.publish(Any()) // factory returned after Stop was selected
+        await(nativeEntered)
+        assertEquals("Busy", registry.exactStatus(target).state)
+        assertFalse(registry.claim(next))
+        assertEquals(0, fdCloses.get())
+        allowNativeClose.countDown()
+        assertEquals(null, attempt.closed.get(2, TimeUnit.SECONDS))
+        assertTrue(registry.completeAfterClose(attempt) { })
+        assertEquals("AlreadyGone", registry.exactStatus(target).state)
+        assertEquals(1, fdCloses.get())
+        assertTrue(registry.claim(next))
+    }
+
+    @Test fun absentAndFailedCloseNeverBecomeAlreadyGone() {
+        val registry = MainKernelAttemptLedger()
+        val attempt = MainKernelAttempt<Any>(runId = "candidate")
+        val target = MainKernelExactTarget(attempt.runId, attempt.birthNonce)
+        assertEquals("Unknown", registry.exactStatus(target).state)
+        assertEquals("target-not-observed", registry.exactStatus(target).reason)
+        assertTrue(registry.claim(attempt) { })
+        attempt.publish(Any())
+        attempt.revokeAndDetachTun()
+        attempt.closeOnce { error("native close failed") }
+        attempt.closed.get(2, TimeUnit.SECONDS)
+        assertEquals("Unknown", registry.exactStatus(target).state)
+        assertEquals("cleanup-unknown", registry.exactStatus(target).reason)
+        assertEquals(null, registry.exactCloseTarget(target).owner)
+        assertFalse(registry.claim(MainKernelAttempt<Any>()))
+    }
 }

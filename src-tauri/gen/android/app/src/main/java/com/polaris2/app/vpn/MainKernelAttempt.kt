@@ -20,6 +20,8 @@ internal class MainKernelAttempt<Server>(
     val systemStartGeneration: Long = 0L,
     val runId: String = UUID.randomUUID().toString(),
 ) {
+    /** Created by this attempt, never supplied by a bridge caller or reused after Service recreation. */
+    val birthNonce: String = UUID.randomUUID().toString()
     private val closeLaunched = AtomicBoolean(false)
     /** Orders this generation's Start and Reload, without delaying Stop's terminal close. */
     val operationLock = Any()
@@ -87,9 +89,52 @@ internal class MainKernelOwner(
     val requestClose: (() -> Unit)?,
 )
 
+internal data class MainKernelExactTarget(val runId: String, val birthNonce: String) {
+    fun isValid(): Boolean = runId.isNotBlank() && runId == runId.trim() && runId.length <= 128 &&
+        birthNonce.isNotBlank() && birthNonce == birthNonce.trim() && birthNonce.length <= 128
+}
+
+internal data class MainKernelExactResult(
+    val target: MainKernelExactTarget,
+    val state: String,
+    val reason: String? = null,
+)
+
+internal data class MainKernelExactClose(
+    val result: MainKernelExactResult,
+    val owner: MainKernelOwner? = null,
+)
+
 internal class MainKernelAttemptLedger {
     private var owner: MainKernelAttempt<*>? = null
     private var ownerClose: (() -> Unit)? = null
+    /** Only this process's confirmed native close may establish an AlreadyGone fact. */
+    private var lastReleased: MainKernelExactTarget? = null
+
+    private fun MainKernelAttempt<*>.exactTarget() = MainKernelExactTarget(runId, birthNonce)
+
+    @Synchronized
+    fun exactStatus(target: MainKernelExactTarget): MainKernelExactResult {
+        if (!target.isValid()) return MainKernelExactResult(target, "Unknown", "invalid-target")
+        val current = owner
+        if (current?.exactTarget() == target) {
+            return if (current.closed.isDone && current.closed.getNow(null) != null)
+                MainKernelExactResult(target, "Unknown", "cleanup-unknown")
+            else MainKernelExactResult(target, "Busy")
+        }
+        if (lastReleased == target) return MainKernelExactResult(target, "AlreadyGone")
+        return MainKernelExactResult(target, "Unknown", if (current == null) "target-not-observed" else "different-owner")
+    }
+
+    /** Choose the exact attempt under the registry lock; invoke its callback only after releasing it. */
+    @Synchronized
+    fun exactCloseTarget(target: MainKernelExactTarget): MainKernelExactClose {
+        val status = exactStatus(target)
+        if (status.state != "Busy") return MainKernelExactClose(status)
+        val current = owner ?: return MainKernelExactClose(MainKernelExactResult(target, "Unknown", "owner-lost"))
+        val close = ownerClose ?: return MainKernelExactClose(MainKernelExactResult(target, "Unknown", "exact-close-unavailable"))
+        return MainKernelExactClose(status, MainKernelOwner(current, close))
+    }
 
     @Synchronized
     fun claim(attempt: MainKernelAttempt<*>, requestClose: (() -> Unit)? = null): Boolean {
@@ -139,6 +184,7 @@ internal class MainKernelAttemptLedger {
             if (owner !== attempt || !attempt.closed.isDone || attempt.closed.getNow(null) != null) false
             else {
                 action()
+                lastReleased = attempt.exactTarget()
                 owner = null
                 ownerClose = null
                 true

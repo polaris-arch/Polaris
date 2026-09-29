@@ -257,6 +257,7 @@ pub(super) struct AndroidTunScope {
 #[serde(rename_all = "camelCase")]
 pub(super) struct AndroidStartReceipt {
     pub run_id: String,
+    pub birth_nonce: String,
     pub config_digest: String,
     pub claim: Option<String>,
     pub tun: Option<AndroidTunScope>,
@@ -264,10 +265,17 @@ pub(super) struct AndroidStartReceipt {
 
 impl AndroidStartReceipt {
     fn matches_request(&self, run_id: &str, config_digest: &str, claim: Option<&str>) -> bool {
-        !self.run_id.is_empty()
+        self.exact_target().is_valid()
             && self.run_id == run_id
             && self.config_digest == config_digest
             && self.claim.as_deref() == claim
+    }
+
+    pub(super) fn exact_target(&self) -> AndroidExactTarget {
+        AndroidExactTarget {
+            run_id: self.run_id.clone(),
+            birth_nonce: self.birth_nonce.clone(),
+        }
     }
 
     /// Necessary observed facts only. The coordinator still has to compare plan Q,
@@ -280,6 +288,140 @@ impl AndroidStartReceipt {
             && tun.skipped_excludes.is_empty()
             && tun.skipped_packages.is_empty())
         .then_some(tun)
+    }
+}
+
+/// The attempt's birth nonce comes from Kotlin, not from the request or Service instance.
+/// A run ID alone may be reused after Service recreation and is not a stop authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AndroidExactTarget {
+    pub run_id: String,
+    pub birth_nonce: String,
+}
+
+impl AndroidExactTarget {
+    fn is_valid(&self) -> bool {
+        !self.run_id.is_empty()
+            && self.run_id.trim() == self.run_id
+            && self.run_id.encode_utf16().count() <= 128
+            && !self.birth_nonce.is_empty()
+            && self.birth_nonce.trim() == self.birth_nonce
+            && self.birth_nonce.encode_utf16().count() <= 128
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub(super) enum AndroidExactStopState {
+    Closed,
+    AlreadyGone,
+    Busy,
+    Unknown,
+}
+
+/// Closed/AlreadyGone require the Kotlin registry's exact native-close tombstone.
+/// Busy is custody only; Unknown never authorizes a replacement start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AndroidExactStopReceipt {
+    pub run_id: String,
+    pub birth_nonce: String,
+    pub state: AndroidExactStopState,
+    pub reason: Option<String>,
+}
+
+impl AndroidExactStopReceipt {
+    fn matches_target(&self, target: &AndroidExactTarget) -> bool {
+        self.run_id == target.run_id
+            && self.birth_nonce == target.birth_nonce
+            && match self.state {
+                AndroidExactStopState::Unknown => self
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| !reason.is_empty()),
+                _ => self.reason.is_none(),
+            }
+    }
+
+    pub(super) fn confirms_closed(&self) -> bool {
+        // Target-local native close only: not registry vacancy or Android OS Complete.
+        matches!(
+            self.state,
+            AndroidExactStopState::Closed | AndroidExactStopState::AlreadyGone
+        )
+    }
+}
+
+#[cfg(target_os = "android")]
+fn exact_main_core_result(
+    result: Result<AndroidExactStopReceipt, BridgeCallError>,
+    target: &AndroidExactTarget,
+) -> Result<AndroidExactStopReceipt, String> {
+    let receipt = result.map_err(|error| match error {
+        BridgeCallError::Invoke(e) => format!("Android 确切主核桥失败：{e}"),
+        BridgeCallError::TimedOut => "Android 确切主核桥超时，目标状态未知".to_string(),
+        BridgeCallError::TaskFailed(e) => format!("Android 确切主核桥投递失败：{e}"),
+    })?;
+    if receipt.matches_target(target) {
+        Ok(receipt)
+    } else {
+        Err("Android 确切主核回执身份或形状无效，目标状态未知".into())
+    }
+}
+
+/** Read only: absent registry state, a lost process, and a different owner remain Unknown. */
+pub(super) async fn main_core_exact_status(
+    target: &AndroidExactTarget,
+) -> Result<AndroidExactStopReceipt, String> {
+    if !target.is_valid() {
+        return Err("Android 确切主核目标无效".into());
+    }
+    #[cfg(target_os = "android")]
+    {
+        let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+        let result = call_with_budget::<AndroidExactStopReceipt, _>(
+            plugin,
+            "mainCoreExactStatus",
+            AndroidExactTarget {
+                run_id: target.run_id.clone(),
+                birth_nonce: target.birth_nonce.clone(),
+            },
+            LOCAL_STATE_TIMEOUT,
+        )
+        .await;
+        exact_main_core_result(result, target)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("本平台没有 Android 确切主核状态来源".into())
+    }
+}
+
+/** Request close of only this exact attempt; request delivery is never an exit receipt. */
+pub(super) async fn stop_core_exact(
+    target: &AndroidExactTarget,
+) -> Result<AndroidExactStopReceipt, String> {
+    if !target.is_valid() {
+        return Err("Android 确切主核目标无效".into());
+    }
+    #[cfg(target_os = "android")]
+    {
+        let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+        let result = call_with_budget::<AndroidExactStopReceipt, _>(
+            plugin,
+            "stopMainCoreExact",
+            AndroidExactTarget {
+                run_id: target.run_id.clone(),
+                birth_nonce: target.birth_nonce.clone(),
+            },
+            STOP_TIMEOUT,
+        )
+        .await;
+        exact_main_core_result(result, target)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("本平台没有 Android 确切主核停机来源".into())
     }
 }
 
