@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { assertInstalledAndroidPackage, parseAndroidQaTarget } from './android-cdp.mjs';
+import { assertInstalledAndroidPackage, MAIN_ACTIVITY, parseAndroidQaTarget } from './android-cdp.mjs';
 
 const { serial, app } = parseAndroidQaTarget(process.argv.slice(2));
 assert.match(serial ?? '', /^emulator-\d+$/, '必须显式指定 Android 模拟器序列号');
@@ -14,7 +14,7 @@ const adbPath = `${process.env.ANDROID_HOME ?? `${process.env.HOME}/Android/Sdk`
 const adb = (...args) => execFileSync(adbPath, ['-s', serial, ...args], { encoding: 'utf8', timeout: 20_000 });
 assertInstalledAndroidPackage(adb, app);
 const priorOp = /ACTIVATE_VPN: (\w+)/.exec(adb('shell', 'appops', 'get', app, 'ACTIVATE_VPN'))?.[1] ?? 'default';
-adb('shell', 'am', 'start', '-W', '-n', `${app}/.MainActivity`);
+adb('shell', 'am', 'start', '-W', '-n', `${app}/${MAIN_ACTIVITY}`);
 const pid = await until(() => {
   try { return adb('shell', 'pidof', app).trim(); } catch { return ''; }
 }, value => value.length > 0);

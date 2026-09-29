@@ -43,13 +43,15 @@ test('installed-package preflight checks exact IDs before an Activity can launch
     /Unknown Android QA package/);
 });
 
-test('every Android QA entrypoint rejects the wrong installed variant before device mutation', () => {
+test('Android QA entrypoints reject the wrong variant and launch the native Activity class', () => {
   const sdk = mkdtempSync(join(tmpdir(), 'polaris-qa-adb-'));
   const calls = join(sdk, 'calls');
   try {
     mkdirSync(join(sdk, 'platform-tools'));
     writeFileSync(join(sdk, 'platform-tools', 'adb'),
-      '#!/bin/sh\nprintf "%s\\n" "$*" >> "$ANDROID_QA_CALLS"\nprintf "%s\\n" "$ANDROID_QA_PACKAGES"\n',
+      '#!/bin/sh\nprintf "%s\\n" "$*" >> "$ANDROID_QA_CALLS"\n'
+      + 'if [ "$4" = "am" ] && [ "$5" = "start" ]; then exit 66; fi\n'
+      + 'printf "%s\\n" "$ANDROID_QA_PACKAGES"\n',
       { mode: 0o755 });
     for (const script of ['test-android-mobile.mjs', 'test-android-mobile-layout.mjs',
       'test-android-vpn-permission.mjs']) {
@@ -68,6 +70,23 @@ test('every Android QA entrypoint rejects the wrong installed variant before dev
         assert.ok(result.stderr.includes(`${missing} is not installed`), `${script}: ${result.stderr}`);
         assert.equal(readFileSync(calls, 'utf8'),
           '-s emulator-5554 shell pm list packages com.polaris2.app\n');
+
+        const selected = option.length ? RELEASE_APP : DEBUG_APP;
+        writeFileSync(calls, '');
+        const launch = spawnSync(process.execPath,
+          [fileURLToPath(new URL(script, import.meta.url)), 'emulator-5554', ...option], {
+            encoding: 'utf8',
+            env: { ...process.env, ANDROID_HOME: sdk, ANDROID_QA_CALLS: calls,
+              ANDROID_QA_PACKAGES: `package:${selected}` },
+          });
+        assert.equal(launch.status, 1, `${script}: ${launch.stderr}`);
+        const observed = readFileSync(calls, 'utf8').trim().split('\n');
+        assert.deepEqual(observed, [
+          '-s emulator-5554 shell pm list packages com.polaris2.app',
+          ...(script === 'test-android-vpn-permission.mjs'
+            ? [`-s emulator-5554 shell appops get ${selected} ACTIVATE_VPN`] : []),
+          `-s emulator-5554 shell am start -W -n ${selected}/com.polaris2.app.MainActivity`,
+        ]);
       }
     }
   } finally {

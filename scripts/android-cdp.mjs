@@ -4,6 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 export const DEBUG_APP = 'com.polaris2.app.debug';
 export const RELEASE_APP = 'com.polaris2.app';
+export const MAIN_ACTIVITY = 'com.polaris2.app.MainActivity';
 
 export function parseAndroidQaTarget(args) {
   const [serial, ...options] = args;
@@ -41,7 +42,7 @@ export async function connectAndroidWebView(serial, app = DEBUG_APP) {
   const adbPath = `${process.env.ANDROID_HOME ?? `${process.env.HOME}/Android/Sdk`}/platform-tools/adb`;
   const adb = (...args) => execFileSync(adbPath, ['-s', serial, ...args], { encoding: 'utf8', timeout: 20_000 });
   assertInstalledAndroidPackage(adb, app);
-  adb('shell', 'am', 'start', '-W', '-n', `${app}/.MainActivity`);
+  adb('shell', 'am', 'start', '-W', '-n', `${app}/${MAIN_ACTIVITY}`);
   const pid = await until(() => { try { return adb('shell', 'pidof', app).trim(); } catch { return ''; } }, Boolean);
   const port = adb('forward', 'tcp:0', `localabstract:webview_devtools_remote_${pid}`).trim();
   let ws;

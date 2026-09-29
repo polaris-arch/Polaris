@@ -4,7 +4,7 @@
 // ANDROID_HOME=... node scripts/test-android-mobile.mjs 192.168.x.x:port [--release]
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { connectAndroidWebView, parseAndroidQaTarget, until } from './android-cdp.mjs';
+import { connectAndroidWebView, MAIN_ACTIVITY, parseAndroidQaTarget, until } from './android-cdp.mjs';
 const { serial, app } = parseAndroidQaTarget(process.argv.slice(2));
 const { adb, pid, call, evaluate, invoke, close } = await connectAndroidWebView(serial, app);
 
@@ -132,7 +132,7 @@ try {
   console.log('PASS native debug report generated and system share chooser opened');
   // Some Xiaomi builds block injected keys; bringing our own Activity forward
   // avoids requesting broad input permissions just to leave the share chooser.
-  adb('shell', 'am', 'start', '-n', `${app}/.MainActivity`);
+  adb('shell', 'am', 'start', '-n', `${app}/${MAIN_ACTIVITY}`);
   alive();
 } finally {
   try {
