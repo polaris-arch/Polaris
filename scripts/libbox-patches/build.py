@@ -112,6 +112,7 @@ def main():
         run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', '.', './daemon',
              './adapter/endpoint', './adapter/inbound', './adapter/outbound',
              './adapter/service', './dns', './service/api'], cwd=checkout, env=env)
+        run([str(go), 'test', '-race', '-count=1', './experimental/clashmode'], cwd=checkout, env=env)
         files = run([str(go), 'list', '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
         run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', *files,
              str(checkout / 'experimental/libbox/command_server_transient_test.go'),
@@ -133,7 +134,7 @@ def main():
                    'toolchain': {'go': go_version, 'java': java_version, 'ndk': manifest['ndkVersion'], **mobile_tools},
                    'buildTags': manifest['buildTags'], 'androidAPI': manifest['androidAPI'], 'ndkSelectionReason': manifest['ndkSelectionReason'],
                    'linkerFlags': linker_flags, 'buildVCS': False,
-                   'tests': 'Box early-close result, five manager close errors, API listener close ownership, strict transient and primary terminal/sticky lifecycle, concurrent listener close barrier, transient HTTP CONNECT rejects missing/wrong auth, normal CommandServer lifecycle, named interface TCP/UDP binding and failures, dialer regressions passed',
+                   'tests': 'Box early-close result, five manager close errors, API listener close ownership, strict transient and primary terminal/sticky lifecycle, concurrent listener close barrier, transient HTTP CONNECT rejects missing/wrong auth, normal CommandServer lifecycle, named interface TCP/UDP binding and failures, dialer regressions, explicit clash default versus stale cache, and concurrent clash mode switching under Go race detector passed',
                    'nativeLibraries': {}}
         readelf = ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf'
         with zipfile.ZipFile(aar) as archive:
