@@ -50,13 +50,31 @@ pub(super) struct Entry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct AndroidDrainReceipt {
+    pub protocol_version: u32,
+    pub covered_producers: Vec<String>,
+    pub coverage_complete: bool,
     pub process_nonce: String,
     pub fence_id: String,
     pub marker_proof: MarkerProof,
     pub sealed_revision: u64,
     pub revision: u64,
+    pub captured_count: usize,
     pub captured: Vec<Entry>,
 }
+
+const REQUIRED_PRODUCERS: &[&str] = &[
+    "main.bridge",
+    "main.system",
+    "main.close",
+    "main.reload",
+    "login.start",
+    "login.close",
+    "speedtest.start",
+    "speedtest.close",
+    "validation.checkConfig",
+    "control.targetlessStop",
+    "control.targetlessReload",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub(super) enum MarkerProof {
@@ -71,6 +89,18 @@ pub(super) fn verify(
     expected_process: &str,
     expected_fence: &str,
 ) -> Result<(), &'static str> {
+    if receipt.protocol_version != 1 || !receipt.coverage_complete {
+        return Err("Android native drain producer coverage incomplete");
+    }
+    let reported: HashSet<&str> = receipt
+        .covered_producers
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let required: HashSet<&str> = REQUIRED_PRODUCERS.iter().copied().collect();
+    if reported != required || reported.len() != receipt.covered_producers.len() {
+        return Err("Android native drain producer manifest mismatch");
+    }
     if !valid_id(expected_process, 128)
         || !valid_id(&receipt.process_nonce, 128)
         || receipt.process_nonce != expected_process
@@ -88,6 +118,9 @@ pub(super) fn verify(
     }
     if receipt.sealed_revision == 0 || receipt.revision < receipt.sealed_revision {
         return Err("Android native drain revision invalid");
+    }
+    if receipt.captured_count != receipt.captured.len() {
+        return Err("Android native drain frozen ticket count mismatch");
     }
     let mut tickets = HashSet::new();
     let mut owners = HashSet::new();
@@ -138,8 +171,10 @@ mod tests {
     use serde_json::{json, Value};
 
     fn receipt() -> Value {
-        json!({"processNonce":"process-1","fenceId":"fence-1","markerProof":"Absent","sealedRevision":3,
-            "revision":5,"captured":[{"ticket":{"id":"ticket-1","kind":"Main",
+        json!({"protocolVersion":1,"coveredProducers":REQUIRED_PRODUCERS,
+            "coverageComplete":true,"processNonce":"process-1","fenceId":"fence-1",
+            "markerProof":"Absent","sealedRevision":3,"revision":5,"capturedCount":1,
+            "captured":[{"ticket":{"id":"ticket-1","kind":"Main",
                 "logicalId":"run-1"},"state":"ClosedExact"}]})
     }
 
@@ -184,6 +219,31 @@ mod tests {
         let mut duplicate = value["captured"][0].clone();
         duplicate["ticket"]["id"] = json!("ticket-2");
         value["captured"].as_array_mut().unwrap().push(duplicate);
+        assert!(check(value).is_err());
+    }
+
+    #[test]
+    fn partial_empty_or_forged_coverage_never_passes() {
+        let mut value = receipt();
+        value["coveredProducers"] = json!([]);
+        value["coverageComplete"] = json!(false);
+        value["captured"] = json!([]);
+        value["capturedCount"] = json!(0);
+        assert!(check(value).is_err());
+        let mut value = receipt();
+        value["coveredProducers"] = json!(["main.bridge"]);
+        assert!(check(value).is_err());
+        let mut value = receipt();
+        value["protocolVersion"] = json!(2);
+        assert!(check(value).is_err());
+        let mut value = receipt();
+        value["capturedCount"] = json!(0);
+        assert!(check(value).is_err());
+        let mut value = receipt();
+        value["coveredProducers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("main.bridge"));
         assert!(check(value).is_err());
     }
 

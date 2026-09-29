@@ -14,6 +14,15 @@ class AndroidNativeAdmissionTest {
         it.bootstrap(RequiredMarkerProof.Absent)
     }
 
+    @Test fun partialProductionManifestNeverClaimsCompleteCoverage() {
+        val receipt = open().seal("fence-1")
+        assertEquals(1, receipt.protocolVersion)
+        assertTrue(receipt.coveredProducers.isEmpty())
+        assertFalse(receipt.coverageComplete)
+        assertEquals(0, receipt.capturedCount)
+        assertTrue(receipt.captured.isEmpty())
+    }
+
     @Test fun coldMarkerMustBeProvedAbsentAndCannotBeReopened() {
         for (proof in listOf(RequiredMarkerProof.PresentOrUnknown)) {
             val ledger = AndroidNativeAdmission("process-blocked")

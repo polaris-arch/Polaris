@@ -10,21 +10,41 @@ import java.util.UUID
 /** The result of one cold-process stat. Only ENOENT opens native admission. */
 internal enum class RequiredMarkerProof { Absent, PresentOrUnknown }
 
+/** Build-time wiring manifest. A producer is listed only after all its entry and close paths are tested. */
+internal object AndroidNativeCoverage {
+    const val PROTOCOL_VERSION = 1
+    val requiredProducers = setOf(
+        "main.bridge", "main.system", "main.close", "main.reload",
+        "login.start", "login.close", "speedtest.start", "speedtest.close",
+        "validation.checkConfig", "control.targetlessStop", "control.targetlessReload",
+    )
+    // This foundation has no production owner wiring yet. The verifier rejects it.
+    val wiredProducers: Set<String> = emptySet()
+}
+
 /** Frozen membership plus live terminal facts; no field on its own asserts NoOldCore. */
 internal data class AndroidDrainReceipt(
+    val protocolVersion: Int,
+    val coveredProducers: List<String>,
+    val coverageComplete: Boolean,
     val processNonce: String,
     val fenceId: String,
     val markerProof: RequiredMarkerProof?,
     val sealedRevision: Long,
     val revision: Long,
+    val capturedCount: Int,
     val captured: List<AndroidNativeAdmission.Entry>,
 )
 
 /** Pure process ledger. Its monitor protects only state; callers do all I/O and JNI outside it. */
 internal class AndroidNativeAdmission(
     val processNonce: String = UUID.randomUUID().toString(),
+    private val coveredProducers: Set<String> = AndroidNativeCoverage.wiredProducers,
 ) {
-    init { require(validId(processNonce, 128)) { "invalid native process nonce" } }
+    init {
+        require(validId(processNonce, 128)) { "invalid native process nonce" }
+        require(AndroidNativeCoverage.requiredProducers.containsAll(coveredProducers)) { "invalid native coverage manifest" }
+    }
     enum class Kind { Main, Login, Speedtest, CheckConfig, TargetlessStop, TargetlessReload }
     enum class State { Reserved, BirthEntered, CancelledBeforeBirth, ClosedExact, Completed, Unknown, ValidationCleanupUnknown }
     data class Ticket(val id: String, val kind: Kind, val logicalId: String)
@@ -154,7 +174,11 @@ internal class AndroidNativeAdmission(
     }
 
     private fun receiptLocked(id: String) = AndroidDrainReceipt(
+        AndroidNativeCoverage.PROTOCOL_VERSION,
+        coveredProducers.sorted(),
+        coveredProducers == AndroidNativeCoverage.requiredProducers,
         processNonce, id, bootstrap, sealedRevision, revision,
+        captured.size,
         captured.map { ticket -> checkNotNull(entries[ticket]) },
     )
 
