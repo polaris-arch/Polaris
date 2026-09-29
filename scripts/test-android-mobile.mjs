@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 // Authorized-device regression. Explicit serial required; preserves selection and requires VPN stopped.
-// Uses the installed Debug APK; does not upload reports or save test nodes/subscriptions.
-// ANDROID_HOME=... node scripts/test-android-mobile.mjs 192.168.x.x:port
+// Uses the installed Debug APK by default; does not upload reports or save test nodes/subscriptions.
+// ANDROID_HOME=... node scripts/test-android-mobile.mjs 192.168.x.x:port [--release]
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { connectAndroidWebView, until } from './android-cdp.mjs';
-const serial = process.argv[2];
-const app = 'com.polaris2.app';
-const { adb, pid, call, evaluate, invoke, close } = await connectAndroidWebView(serial);
+import { connectAndroidWebView, parseAndroidQaTarget, until } from './android-cdp.mjs';
+const { serial, app } = parseAndroidQaTarget(process.argv.slice(2));
+const { adb, pid, call, evaluate, invoke, close } = await connectAndroidWebView(serial, app);
 
 const status = async () => (await invoke('proxy_get_status')).data;
 const click = async (text, selector = 'button') => {

@@ -1,17 +1,18 @@
 #!/usr/bin/env node
-// 真 Android 系统弹窗回归：先安装当前 debug APK，再运行
-// node scripts/test-android-vpn-permission.mjs emulator-5554
+// 真 Android 系统弹窗回归：默认使用已安装的 Debug APK；Release 须显式传 --release。
+// node scripts/test-android-vpn-permission.mjs emulator-5554 [--release]
 // 仅接受模拟器。临时选内置直连节点，结束后还原选中项和 VPN app-op；不清应用数据。
 // Node >= 22（内置 WebSocket），ANDROID_HOME 指向 SDK，无额外依赖。
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { assertInstalledAndroidPackage, parseAndroidQaTarget } from './android-cdp.mjs';
 
-const serial = process.argv[2];
+const { serial, app } = parseAndroidQaTarget(process.argv.slice(2));
 assert.match(serial ?? '', /^emulator-\d+$/, '必须显式指定 Android 模拟器序列号');
 const adbPath = `${process.env.ANDROID_HOME ?? `${process.env.HOME}/Android/Sdk`}/platform-tools/adb`;
 const adb = (...args) => execFileSync(adbPath, ['-s', serial, ...args], { encoding: 'utf8', timeout: 20_000 });
-const app = 'com.polaris2.app';
+assertInstalledAndroidPackage(adb, app);
 const priorOp = /ACTIVATE_VPN: (\w+)/.exec(adb('shell', 'appops', 'get', app, 'ACTIVATE_VPN'))?.[1] ?? 'default';
 adb('shell', 'am', 'start', '-W', '-n', `${app}/.MainActivity`);
 const pid = await until(() => {
@@ -68,7 +69,7 @@ async function until(read, test, timeout = 15_000) {
 }
 async function foreground() {
   await until(() => adb('shell', 'dumpsys', 'activity', 'activities'),
-    value => /topResumedActivity=.*com\.polaris2\.app\//.test(value));
+    value => value.split('\n').some(line => line.includes('topResumedActivity=') && line.includes(`${app}/`)));
   await delay(350);
 }
 async function start(key = 'start') {

@@ -1,16 +1,16 @@
 #!/usr/bin/env node
-// Read-only WebView layout matrix on the installed Debug APK. No system display/font settings change.
-// ANDROID_HOME=... node scripts/test-android-mobile-layout.mjs 192.168.x.x:port
+// Read-only WebView layout matrix on the installed Debug APK by default. No system display/font settings change.
+// ANDROID_HOME=... node scripts/test-android-mobile-layout.mjs 192.168.x.x:port [--release]
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { connectAndroidWebView, until } from './android-cdp.mjs';
+import { connectAndroidWebView, parseAndroidQaTarget, until } from './android-cdp.mjs';
 
-const serial = process.argv[2];
+const { serial, app } = parseAndroidQaTarget(process.argv.slice(2));
 const output = '/tmp/polaris-device-20260925/final-ui';
 const viewports = [[320, 740], [400, 869], [600, 960], [840, 900], [1024, 768], [869, 400]];
-const { call, evaluate, close } = await connectAndroidWebView(serial);
+const { call, evaluate, close } = await connectAndroidWebView(serial, app);
 let originalFont;
 let originalNav;
 let overrideSet = false;
