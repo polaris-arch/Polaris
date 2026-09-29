@@ -47,6 +47,23 @@ describe('mobile Tailscale logout with a main-core owner', () => {
       expect(f.logout).not.toHaveBeenCalled();
     }
     expect(sameRunningCore({ running: true }, { running: true })).toBe(false);
+    // The native status normally includes startTime. A missing receipt must not fall back to
+    // PID: the OS can reuse it for a replacement core after the first confirmation.
+    expect(sameRunningCore({ running: true, pid: 123 }, { running: true, pid: 123 })).toBe(false);
+    expect(sameRunningCore(running, { running: true, pid: 123 })).toBe(false);
+  });
+
+  it('rechecks the target node after an asynchronous status read before stopping the core', async () => {
+    const f = fixture();
+    const status = f.io.status;
+    f.io.status = async () => {
+      const result = await status();
+      f.setPresent(false);
+      return result;
+    };
+    expect(await stopOwnedCoreThenLogout(owner, f.io)).toEqual({ kind: 'changed' });
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(f.logout).not.toHaveBeenCalled();
   });
 
   it('never logs out when stop fails, a new core appears, or the native writer still refuses', async () => {
