@@ -18,8 +18,8 @@ the shape verifier's `Ok(())` into `NoOldCore` or custody release.
 | `main.system` | `BoxService.onStartCommand` for Boot, always-on, system relaunch, and duplicate foreground intents | same main owner proof | fence, request replacement, or occupied registry rejects an ownerless Service; `stopSelfResult(startId)` tears down only that Android request |
 | `main.close` | exact attempt close after Stop/onDestroy/onRevoke | construction completed normally, native `CloseService` and `Close` succeeded, then registry released the same attempt, then `ClosedExact` | native construction failure/revoked completion is sticky `Unknown` under `operationLock`; timeout, failed close, or exceptional future cannot become exact |
 | `main.reload` | Service reload callback, including targetless callback | control operation leaves JNI; same main ticket stays owned | retired endpoint declines before native reload; late callback cannot start after seal |
-| `login.start` | reserve before login worker queue, state-directory claim, validation, native factory/start | exact login owner close | cancelled or failed factory cannot be silently removed; stale worker cannot enter native after seal |
-| `login.close` | explicit close, Rust Drop, serviceStop, 300 s expiry, retry | `CloseService`, `Close`, network and cache cleanup on the same entry | close-before-start tombstones the ID; timeout/late callback keeps the ticket observable |
+| `login.start` | owner reserve at invocation, independent validation reserve before worker queue, owner birth before setup/JNI | capability absent; born owners remain `Unknown` after ordinary cleanup | consumed ID cannot replay; cancelled/sealed worker cannot enter native; construction failure/revoked return is sticky `Unknown` under ownership lock |
+| `login.close` | explicit close and Rust Drop use original ID; serviceStop, 300 s expiry, retry and main preemption retain exact Entry | worker exit, native close, network/DNS and original cache/TS ownership proof remain pending | close-before-start tombstones ID; successful map removal is operational cleanup only and cannot prove TS release |
 | `speedtest.start` | ticket installed before pure config-validation thread and session queue; `enterBirth` before prepare's first resource | exact speedtest owner close; capability still absent pending resolver drain | its epoch:sequence ID cannot be replayed; cancelled/sealed queue cannot enter native; native construction failure or revoked completion stays ledger `Unknown` |
 | `speedtest.close` | same ticket for explicit close, serviceStop, expiry, main-start preemption | native close, original prepare/Start worker exit, network notifications/thread cleanup, and unused resolver shutdown | 8 s timeout leaves owner observable; used DNS resolver stays ledger `Unknown`; operational Close success preserves ordinary retry/main admission |
 | `validation.checkConfig` | common enqueue adapter reserves before plugin thread, login worker queue, and speedtest validation thread/session queue | `CancelledBeforeBirth`; otherwise `ValidationCleanupUnknown` until Go returns an observable construction/disposal proof | failed queue dispatch cancels before birth; Rust timeout/detached callback does not end the Kotlin JNI operation |
@@ -46,8 +46,8 @@ close, or registry-release futures also remain `Unknown` without throwing from
 the settlement callback.
 
 Current wiring remains **4/11**: `main.bridge`, `main.system`, `main.close`, and
-`validation.checkConfig`. Speedtest owner tickets are installed, but its
-capabilities remain empty until queried resolver cleanup can be proved. Other
+`validation.checkConfig`. Speedtest and Login owner tickets are installed, but
+their capabilities remain empty until their remaining cleanup gates are proved. Other
 rows describe required contracts. Deterministic JVM seam tests cover both Stop/construction
 failure orders, revoked JNI completion, old-A/new-B settlement, prequeue seal
 and queue failure at all three validation ingress paths, request replacement
@@ -101,3 +101,51 @@ failure blocking retries. Foreign-family and foreign-ID ticket rejection
 replies without retiring another owner. Android DNS/framework behavior has no
 APK or device validation; queried resolver disposal remains the pending P1 gate
 above, and coverage stays 4/11.
+
+Login identity follow-up: `TransientLoginNativeOwner` holds one original ticket
+from invocation through queue dispatch and Entry disposal. The independent
+Validation ticket is reserved before the same queue. Config rejection, occupied
+admission, rejected queue, close-before-start and seal may settle only a ticket
+that never entered native birth. `construct` records failure or revoked return
+before releasing the host ownership lock. ServiceStop, expiry, retry and main
+preemption operate on the captured Entry; delayed callbacks never resolve a
+successor from an ID lookup. Rust timeout, Drop and confirmed close preserve the
+same config-file-stem instance ID; no identity was replaced with a new ticket.
+
+This slice retains the previous operational cleanup and state-directory claim
+behavior. Born tickets remain `Unknown` even when native/network/cache cleanup
+succeeds and the operational map removes the Entry. Worker completion, strict
+network cleanup, the queried resolver drain gate above, and ownership of cache
+deletion versus Tailscale state-directory claims require subsequent proof.
+Neither map removal nor main preemption is a Tailscale custody-release receipt.
+
+ID tombstones and ticket metadata live for this Android process. Every observed
+or explicitly closed ID remains consumed across later Rust attempt epochs, even
+after operational disposal. A never-observed, never-tombstoned older epoch has
+no cross-ID ordering proof here; its string alone cannot establish staleness.
+A Rust-authorized generation protocol is needed for that boundary. No TTL or
+recent-ID eviction window may silently reopen a consumed identity.
+
+**P2 candidate for review: process-ledger metadata has no cardinality bound.**
+The live operational map remains limited to eight Entries. Successful disposal
+clears native/network/cache references; a captured expiry may still retain that
+disposed Entry's ID and directory metadata until its scheduled callback/worker
+drains. The ledger permanently retains ticket/state/ASCII-ID metadata, not Entry,
+config, authorization URL, File or cache contents, and its count grows with
+attempts. A conservative admission limit or epoch rotation needs an explicit
+Rust-authorized protocol and should be assessed separately. This slice neither
+evicts tombstones nor claims a bound or cleanup proof that does not exist.
+
+Validation of the Login identity follow-up (2026-09-30): targeted owner,
+validation and admission suites passed 27 tests; full
+`:app:testUniversalDebugUnitTest` passed 110 tests in 12 suites with no failures,
+errors or skipped tests. Latches cover close-before-start, queued validation
+failure followed by old retry/expiry/Stop after successor birth, main preemption
+before the old worker runs, both construction-failure/close orders and revoked
+late success. A 2,050-attempt history does not reopen consumed epoch IDs. Kotlin
+source checks cover exact Entry captures and original Rust ID propagation.
+The unchanged `android_transient_login_wiring.rs` passed all six source-contract
+tests using the real std-only `polaris-source-probe` library and a standalone
+`rustc --test` invocation; this is not a full Cargo/runtime test. Bridge checking
+passed 31 commands and `git diff --check` passed. No APK/device testing or Go
+changes were performed, and coverage remains 4/11.

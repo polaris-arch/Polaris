@@ -22,8 +22,8 @@ internal object TransientLoginHost {
     class SystemInterfaceFailure : StartFailure(SystemEndpointGuard.ERROR)
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "polaris-login-host") }
     private val timer = Executors.newSingleThreadScheduledExecutor { Thread(it, "polaris-login-expiry") }
-    private class Entry(val id: String, val stateDirectories: Set<String>) {
-        @Volatile var cancelled = false
+    private class Entry(val id: String, val stateDirectories: Set<String>, val nativeOwner: TransientLoginNativeOwner) {
+        val cancelled: Boolean get() = nativeOwner.cancelled
         @Volatile var running = false
         var server: CommandServer? = null
         var network: TransientLoginNetwork? = null
@@ -56,7 +56,7 @@ internal object TransientLoginHost {
             mainClaims[owner] = mainClaims[owner].orEmpty() + directories
             val conflicts = synchronized(entries) { entries.values.filter { it.stateDirectories.any(directories::contains) } }
             for (entry in conflicts) {
-                entry.cancelled = true
+                entry.nativeOwner.cancel()
                 check(dispose(entry) == null) { "Android 旧登录实例尚未关闭" }
                 synchronized(entries) { if (entries[entry.id] === entry) entries.remove(entry.id) }
             }
@@ -81,10 +81,17 @@ internal object TransientLoginHost {
     }
 
     fun start(id: String, config: String, done: (StartFailure?) -> Unit) {
+        val nativeOwner = try {
+            TransientLoginNativeOwner.reserve(AndroidNativeAdmissionGate.ledger, id)
+        } catch (_: Throwable) {
+            done(GeneralFailure("Android 独立登录失败 [admission/UNAVAILABLE]"))
+            return
+        }
         val directories = try {
             SystemEndpointGuard.requireSupported(config)
             stateDirectories(config)
         } catch (error: Exception) {
+            nativeOwner.cancel()
             done(if (error is SystemEndpointGuard.Unsupported) {
                 SystemInterfaceFailure()
             } else {
@@ -93,13 +100,14 @@ internal object TransientLoginHost {
             return
         }
         val entry = synchronized(entries) {
-            if (id.isBlank() || id.length > 256 || entries.containsKey(id) || entries.size >= MAX_INSTANCES) {
+            if (nativeOwner.cancelled || entries.containsKey(id) || entries.size >= MAX_INSTANCES) {
+                nativeOwner.cancel()
                 done(GeneralFailure("Android 登录实例标识重复或并发上限已到")); return
             }
-            Entry(id, directories).also { entries[id] = it }
+            Entry(id, directories, nativeOwner).also { entries[id] = it }
         }
         try {
-            AndroidNativeValidation.enqueue({ worker.execute(it) }) { validationTicket ->
+            nativeOwner.enqueue({ worker.execute(it) }) { validationTicket ->
                 var stage = "ownership"
                 val failure = synchronized(ownershipLock) { runCatching {
                     check(!entry.cancelled) { "Android 登录请求已取消" }
@@ -108,44 +116,46 @@ internal object TransientLoginHost {
                         entries.values.filter { it !== entry && !it.disposed && it.stateDirectories.any(entry.stateDirectories::contains) }
                     }
                     for (previous in predecessors) {
-                        previous.cancelled = true
+                        previous.nativeOwner.cancel()
                         check(dispose(previous) == null) { "Android 旧登录实例尚未关闭" }
                         synchronized(entries) { if (entries[previous.id] === previous) entries.remove(previous.id) }
                     }
-                    stage = "setup"
-                    PolarisApplication.ensureSetup()
-                    check(!Libbox.hasTunInbound(config)) { "Android 独立登录不允许创建 VPN 隧道" }
-                    stage = "check"
-                    AndroidNativeValidation.check(validationTicket, config)
-                    stage = "cache"
-                    val cachePath = JSONObject(config).optJSONObject("experimental")?.optJSONObject("cache_file")?.optString("path").orEmpty()
-                    val cache = File(cachePath).canonicalFile
-                    check(cache.parent in entry.stateDirectories && cache.name.matches(Regex("login-cache-[0-9]+\\.db"))) { "Android 登录缓存路径未隔离" }
-                    // Cache Initialize precedes endpoint Initialize; a first login has no TS directory yet.
-                    ensurePrivateDirectory(requireNotNull(cache.parentFile))
-                    entry.cache = cache
-                    val network = TransientLoginNetwork()
-                    entry.network = network
-                    stage = "network"
-                    network.start()
-                    check(!entry.cancelled) { "Android 登录请求已取消" }
-                    // The factory disables global command socket/snapshot/power reports inside libbox.
-                    stage = "factory"
-                    val server = Libbox.newTransientCommandServer(LoginHandler(entry), network)
-                    entry.server = server
-                    stage = "start"
-                    server.startOrReloadService(config, OverrideOptions())
-                    check(!entry.cancelled) { "Android 登录请求已取消" }
-                    entry.running = true
-                    // Rust owns normal cancellation/Running/timeout. This bounds a detached late bridge invocation too.
-                    timer.schedule({ close(id) {} }, 300, TimeUnit.SECONDS)
+                    entry.nativeOwner.construct {
+                        stage = "setup"
+                        PolarisApplication.ensureSetup()
+                        check(!Libbox.hasTunInbound(config)) { "Android 独立登录不允许创建 VPN 隧道" }
+                        stage = "check"
+                        AndroidNativeValidation.check(validationTicket, config)
+                        stage = "cache"
+                        val cachePath = JSONObject(config).optJSONObject("experimental")?.optJSONObject("cache_file")?.optString("path").orEmpty()
+                        val cache = File(cachePath).canonicalFile
+                        check(cache.parent in entry.stateDirectories && cache.name.matches(Regex("login-cache-[0-9]+\\.db"))) { "Android 登录缓存路径未隔离" }
+                        // Cache Initialize precedes endpoint Initialize; a first login has no TS directory yet.
+                        ensurePrivateDirectory(requireNotNull(cache.parentFile))
+                        entry.cache = cache
+                        val network = TransientLoginNetwork()
+                        entry.network = network
+                        stage = "network"
+                        network.start()
+                        check(!entry.cancelled) { "Android 登录请求已取消" }
+                        // The factory disables global command socket/snapshot/power reports inside libbox.
+                        stage = "factory"
+                        val server = Libbox.newTransientCommandServer(LoginHandler(entry), network)
+                        entry.server = server
+                        stage = "start"
+                        server.startOrReloadService(config, OverrideOptions())
+                        check(!entry.cancelled) { "Android 登录请求已取消" }
+                        entry.running = true
+                        // Rust owns normal cancellation/Running/timeout. This bounds a detached late bridge invocation too.
+                        timer.schedule({ close(entry) {} }, 300, TimeUnit.SECONDS)
+                    }
                 }.exceptionOrNull() }
                 // A rejected/cancelled worker that never reached validation is terminal before birth.
                 AndroidNativeValidation.cancelBeforeBirth(validationTicket)
                 if (failure != null) {
                     val cleanup = synchronized(ownershipLock) { dispose(entry) }
                     if (cleanup == null) synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
-                    if (cleanup != null) timer.schedule({ close(id) {} }, 5, TimeUnit.SECONDS)
+                    if (cleanup != null) timer.schedule({ close(entry) {} }, 5, TimeUnit.SECONDS)
                     val message = failure.message.orEmpty().lowercase()
                     val reason = when {
                         "no such file" in message -> "PATH_NOT_FOUND"
@@ -160,19 +170,35 @@ internal object TransientLoginHost {
                 } else done(null)
             }
         } catch (_: Throwable) {
+            nativeOwner.cancel()
             synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
             done(GeneralFailure("Android 独立登录失败 [admission/UNAVAILABLE]"))
         }
     }
 
     fun close(id: String, done: (String?) -> Unit) {
-        val entry = synchronized(entries) { entries[id]?.also { it.cancelled = true } }
+        val entry = try { synchronized(entries) {
+            TransientLoginNativeOwner.retireBeforeStart(AndroidNativeAdmissionGate.ledger, id)
+            entries[id]?.also { it.nativeOwner.cancel() }
+        } } catch (_: IllegalArgumentException) {
+            done("Android 登录实例标识无效")
+            return
+        }
         if (entry == null) { done(null); return }
-        worker.execute {
+        close(entry, done)
+    }
+
+    /** Timers, retries and native callbacks retain this exact entry, never a later ID lookup. */
+    private fun close(entry: Entry, done: (String?) -> Unit) {
+        entry.nativeOwner.cancel()
+        try { worker.execute {
             val failure = synchronized(ownershipLock) { dispose(entry) }
-            if (failure == null) synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
-            if (failure != null) timer.schedule({ close(id) {} }, 5, TimeUnit.SECONDS)
+            if (failure == null) synchronized(entries) { if (entries[entry.id] === entry) entries.remove(entry.id) }
+            if (failure != null) timer.schedule({ close(entry) {} }, 5, TimeUnit.SECONDS)
             done(failure)
+        } } catch (_: Throwable) {
+            entry.nativeOwner.constructionFailed()
+            done("Android 登录实例关闭未确认")
         }
     }
 
@@ -196,8 +222,10 @@ internal object TransientLoginHost {
                 entry.running = false
                 entry.disposed = true
                 entry.cache = null
+                entry.nativeOwner.closedWithoutProof()
             }
         }
+        if (failure != null) entry.nativeOwner.constructionFailed()
         return failure?.let { it.message ?: "Android 登录实例关闭失败" }
     }
 
@@ -212,7 +240,7 @@ internal object TransientLoginHost {
     }
 
     private class LoginHandler(private val entry: Entry) : CommandServerHandler {
-        override fun serviceStop() { close(entry.id) {} }
+        override fun serviceStop() { close(entry) {} }
         override fun serviceReload() { error("Android 独立登录实例不能重载主代理") }
         override fun getSystemProxyStatus() = SystemProxyStatus().apply { available = false; enabled = false }
         override fun setSystemProxyEnabled(enabled: Boolean) { error("Android 独立登录不允许设置系统代理") }
