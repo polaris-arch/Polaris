@@ -305,6 +305,20 @@ pub fn try_compile(
     {
         return false;
     }
+    // DNS Group emits paired evaluate(tag=...) and respond(match_response=tag) actions.
+    // Duplicating either action under two clash modes is rejected by sing-box's static
+    // duplicate-tag validator, even when each mode would run only one branch. Keep the
+    // original single-policy configuration until those tags can be mode-namespaced.
+    if normal_dns
+        .rules
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .chain(mesh_dns.rules.as_deref().unwrap_or_default())
+        .any(|rule| rule.action.as_deref() == Some("evaluate") || rule.match_response.is_some())
+    {
+        return false;
+    }
 
     let mut route_common_a = normal_route.clone();
     let mut route_common_b = mesh_route.clone();

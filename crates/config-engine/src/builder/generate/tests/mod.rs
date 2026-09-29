@@ -1,5 +1,6 @@
 use super::*;
 use crate::builder::outbounds::INVALID_REASON_DETOUR_CASCADE;
+use crate::user_config::dns_policy::{DnsPolicyAction, DnsServerGroup, DnsServerGroupMode};
 use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use crate::user_config::rule::{
     Rule, RuleAction, RuleDnsAnswerMode, RuleDnsEffect, RuleDnsResolver, RuleEffects, RuleResource,
@@ -165,6 +166,57 @@ fn existing_third_clash_mode_rejects_compilation_without_mutating_config() {
         "normal"
     ));
     assert_eq!(normal, before);
+}
+
+#[test]
+fn android_dns_group_keeps_valid_single_policy_when_dual_mode_cannot_namespace_evaluate() {
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::new(Default::default())),
+        ..Default::default()
+    });
+    config.config_schema_version = Some(2);
+    config.dns_server_groups = vec![DnsServerGroup {
+        id: "race".into(),
+        name: "Race".into(),
+        enabled: true,
+        mode: DnsServerGroupMode::Race,
+        members: vec!["builtin-domestic".into(), "builtin-remote".into()],
+        fallback_server_id: Some("builtin-domestic".into()),
+    }];
+    let mut rule = dns_rule_set_rule("group", "unused");
+    rule.type_field = RuleType::Domain;
+    rule.values = vec!["race.example".into()];
+    rule.effects.as_mut().unwrap().dns.as_mut().unwrap().action = Some(DnsPolicyAction::Group {
+        group_id: "race".into(),
+    });
+    config.policy_rules = Some(vec![rule]);
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let generated = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    assert!(generated
+        .dns
+        .as_ref()
+        .unwrap()
+        .rules
+        .as_deref()
+        .unwrap()
+        .iter()
+        .any(|rule| rule.action.as_deref() == Some("evaluate")));
+    assert!(generated.experimental.as_ref().unwrap().clash_api.is_none());
+    assert_eq!(
+        generated,
+        generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+            .unwrap()
+            .config
+    );
+    if let Ok(path) = std::env::var("POLARIS_DNS_GROUP_TEST_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&generated).unwrap()).unwrap();
+    }
 }
 
 fn compiled_projection_matches_base(

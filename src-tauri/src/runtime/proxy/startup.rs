@@ -2111,16 +2111,21 @@ impl ProxyRuntime {
         // 动态判（对齐 上游 运行期 enable/disable）。与崩溃监测解耦：崩溃原地重启同节点，本腿只对「核活着
         // 但代理链不通」换节点。世代守卫退场同 relay。
         //
-        // **停摆判据在此求值、作为世代常量传下去**（不是每 tick 读配置）：`user_config` 就是核实际
-        // 启动的那份，`route.final` 由它烘死，同世代内不可能变；而这条判据一旦翻转，`hotswitch.rs`
-        // 的 route 投影 guard 就返回 none ⇒ 整核重启 ⇒ 世代 +1 ⇒ 旧心跳退场。
-        // 完整理由（含「per-tick 读 D 反而会错」与 `ts_exit.rs` 那道禁 `.current()` 的门）见
-        // [`auto_switch_blocked_for_generation`](crate::runtime::auto_switch::auto_switch_blocked_for_generation)。
+        // 单态核的停摆判据在此求值；Android 双态核另传无出口 TS id，让心跳从已提交 R
+        // 动态判断当前 mode 对应的出口。不能读磁盘 D（保存未 Apply 时与运行核不同）。
         self.spawn_auto_switch_heartbeat(
             my_gen,
             deps.probe_proxy_port,
             deps.loopback_auth.clone(),
             crate::runtime::auto_switch::auto_switch_blocked_for_generation(&user_config),
+            singbox_config
+                .experimental
+                .as_ref()
+                .and_then(|experimental| experimental.clash_api.as_ref())
+                .and_then(|_| {
+                    polaris_config_engine::builder::mesh_mode::mode_candidates(&user_config)
+                        .map(|(_, mesh_id)| mesh_id)
+                }),
         );
         // A3：核就绪 → 挂 Tailscale STATUS relay（同世代范式）。tag→id 从**核实际启动的这份配置**构建
         // （核发的 endpointTag 恒是它启动时的 tag）。仅当配置含 tailscale 节点时才起（无 TS 节点 = 无端点帧，

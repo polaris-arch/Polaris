@@ -620,6 +620,166 @@ async fn android_dual_mode_reuses_one_core_across_ordinary_warp_ts_and_another_o
 }
 
 #[tokio::test]
+async fn superseding_a_mode_rpc_reconciles_before_a_later_ordinary_hot_switch() {
+    let (rt, _dir) = test_runtime();
+    let mut running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
+    running["proxyMode"] = serde_json::json!("smart");
+    running["singboxDashboard"] = serde_json::json!(true);
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    cover_running_binding_roots(&rt, &running);
+    if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+        snapshot.mesh_mode_ready = true;
+        snapshot.dashboard_mode_selector = true;
+    }
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let sink = Arc::new(TestPutSink::default());
+    *sink.mode.lock().unwrap() = Some("normal".into());
+    *sink.groups.lock().unwrap() = Some(vec![
+        group(PROXY_SELECTOR_TAG, "Node A"),
+        group(DASHBOARD_SELECTOR, PROXY_SELECTOR_TAG),
+    ]);
+    sink.follow_puts.store(true, Ordering::SeqCst);
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    let generation = rt.gate.generation();
+    let mut selected_ts = running.clone();
+    selected_ts["selectedServerId"] = serde_json::json!("ts-mesh");
+    rt.config.save_full(&selected_ts).unwrap();
+    let first_intent = rt.register_selector_intent();
+    let next_intent = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&next_intent);
+    let next_runtime = Arc::clone(&rt);
+    *sink.on_mode.lock().unwrap() = Some(Box::new(move || {
+        let mut selected_b = next_runtime.config.current().unwrap();
+        selected_b["selectedServerId"] = serde_json::json!("node-b");
+        next_runtime.config.save_full(&selected_b).unwrap();
+        *captured.lock().unwrap() = Some(next_runtime.register_selector_intent());
+    }));
+    assert_eq!(
+        rt.switch_selected_server_if_current("ts-mesh", first_intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
+    );
+    assert_eq!(
+        sink.mode.lock().unwrap().as_deref(),
+        Some("normal"),
+        "stale mode was rolled back"
+    );
+    assert!(rt.selector_reconcile.is_required());
+    let second_intent = next_intent.lock().unwrap().unwrap();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", second_intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::HotSwitched)
+    );
+    assert_eq!(rt.gate.generation(), generation);
+    assert_eq!(sink.mode.lock().unwrap().as_deref(), Some("normal"));
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-b"
+    );
+    assert!(!rt.selector_reconcile.is_required());
+}
+
+#[tokio::test]
+async fn residual_mode_or_selector_drift_cannot_claim_an_ordinary_hot_switch() {
+    for (mode, dashboard, proxy) in [
+        ("mesh-direct", "direct", "Node A"),
+        ("normal", "direct", "Node A"),
+        ("normal", PROXY_SELECTOR_TAG, "TS Mesh"),
+    ] {
+        let (rt, _dir) = test_runtime();
+        let mut running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
+        running["proxyMode"] = serde_json::json!("smart");
+        running["singboxDashboard"] = serde_json::json!(true);
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_named_snapshot(&rt, &running);
+        cover_running_binding_roots(&rt, &running);
+        if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+            snapshot.mesh_mode_ready = true;
+            snapshot.dashboard_mode_selector = true;
+        }
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let sink = Arc::new(TestPutSink::default());
+        *sink.mode.lock().unwrap() = Some(mode.into());
+        *sink.groups.lock().unwrap() = Some(vec![
+            group(PROXY_SELECTOR_TAG, proxy),
+            group(DASHBOARD_SELECTOR, dashboard),
+        ]);
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+        let mut selected_b = running;
+        selected_b["selectedServerId"] = serde_json::json!("node-b");
+        rt.config.save_full(&selected_b).unwrap();
+        let intent = rt.register_selector_intent();
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-b", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Restarting),
+            "mode={mode} dashboard={dashboard} proxy={proxy}"
+        );
+        assert!(sink.calls().is_empty());
+        assert!(rt.selector_reconcile.is_required());
+        assert!(rt.pending_force_restart.read().unwrap().is_some());
+        rt.gate.bump_generation();
+    }
+}
+
+#[tokio::test]
+async fn core_generation_change_during_mode_rpc_stops_old_selector_writes() {
+    let (rt, _dir) = test_runtime();
+    let mut running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
+    running["proxyMode"] = serde_json::json!("smart");
+    running["singboxDashboard"] = serde_json::json!(true);
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    cover_running_binding_roots(&rt, &running);
+    if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+        snapshot.mesh_mode_ready = true;
+        snapshot.dashboard_mode_selector = true;
+    }
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let sink = Arc::new(TestPutSink::default());
+    *sink.mode.lock().unwrap() = Some("normal".into());
+    *sink.groups.lock().unwrap() = Some(vec![
+        group(PROXY_SELECTOR_TAG, "Node A"),
+        group(DASHBOARD_SELECTOR, PROXY_SELECTOR_TAG),
+    ]);
+    let changed = Arc::clone(&rt);
+    *sink.on_mode.lock().unwrap() = Some(Box::new(move || {
+        changed.gate.bump_generation();
+    }));
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    let mut selected_ts = running;
+    selected_ts["selectedServerId"] = serde_json::json!("ts-mesh");
+    rt.config.save_full(&selected_ts).unwrap();
+    let intent = rt.register_selector_intent();
+    assert_eq!(
+        rt.switch_selected_server_if_current("ts-mesh", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    assert!(
+        sink.calls().is_empty(),
+        "old transaction must not PUT into a replacement core"
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
+    );
+}
+
+#[tokio::test]
 async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_receipt() {
     let ts = mesh_only_ts_node("ts-mesh", "TS Mesh");
     for (old, new, old_tag, old_mode) in [
@@ -1894,6 +2054,74 @@ async fn auto_failover_hot_switch_preserves_saved_but_unapplied_config() {
     );
 }
 
+#[test]
+fn dual_mode_heartbeat_guard_tracks_committed_exit_within_one_generation() {
+    use super::super::auto_switch::heartbeat_mode_blocked;
+    assert!(heartbeat_mode_blocked(
+        false,
+        Some("ts-mesh"),
+        Some("ts-mesh"),
+        false
+    ));
+    assert!(!heartbeat_mode_blocked(
+        true,
+        Some("ts-mesh"),
+        Some("node-a"),
+        false
+    ));
+    assert!(heartbeat_mode_blocked(
+        false,
+        Some("ts-mesh"),
+        Some("node-a"),
+        true
+    ));
+    assert!(heartbeat_mode_blocked(false, Some("ts-mesh"), None, false));
+}
+
+#[tokio::test]
+async fn auto_failover_cannot_commit_a_split_ts_to_ordinary_selector_only() {
+    let (rt, _dir) = test_runtime();
+    let mut running = config_with_nodes("ts-mesh", &[mesh_only_ts_node("ts-mesh", "TS Mesh")]);
+    running["proxyMode"] = serde_json::json!("smart");
+    running["singboxDashboard"] = serde_json::json!(true);
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+        snapshot.mesh_mode_ready = true;
+        snapshot.dashboard_mode_selector = true;
+    }
+    let candidate = RuntimeCandidate {
+        id: "node-a".into(),
+        name: "Node A".into(),
+        tag: "Node A".into(),
+    };
+    assert!(matches!(
+        rt.candidate_switch_plan(&running, &candidate),
+        CandidateSwitchPlan::NeedsRestart
+    ));
+    let fingerprint = current_server_fingerprints(&running)
+        .remove("node-a")
+        .unwrap();
+    let api = AttestingManagementApi::new("TS Mesh");
+    let outcome = rt
+        .auto_hot_switch_transaction_with_api(
+            rt.core_generation(),
+            "ts-mesh",
+            &candidate,
+            &fingerprint,
+            &api,
+        )
+        .await;
+    assert_eq!(outcome, AutoHotSwitchOutcome::NotEligible);
+    assert!(api.puts.lock().unwrap().is_empty());
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "ts-mesh");
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "ts-mesh"
+    );
+}
+
 /// 管理面拒绝目标成员时，事务必须恢复 D/R 的旧选择并返回失败；结果类型没有 Restarting，后台治理
 /// 因而不可能借失败兜底把整份磁盘配置重启入核。
 #[tokio::test]
@@ -2687,7 +2915,7 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
         .find("if self.gate.is_busy()")
         .expect("lifecycle 判定锚点");
     let execute = body
-        .find("self.execute_hot_switch_plan(&plan, interrupt).await")
+        .find(".execute_hot_switch_plan(&plan, interrupt, switch_generation)")
         .expect("热切换执行锚点");
     let commit = body
         .find("self.commit_applied(&new_config)")
@@ -2700,7 +2928,7 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
         &module_code("runtime/proxy"),
         "    async fn execute_hot_switch_plan(",
     );
-    assert!(helper.contains("SwitchExecutor.execute(&api, plan, interrupt).await"));
+    assert!(helper.contains("SwitchExecutor.execute(&guarded, plan, interrupt).await"));
 }
 
 /// 腿 0（顺序门）：lifecycle 在飞 → Pending 暂存，**即使核看起来没在跑**。
