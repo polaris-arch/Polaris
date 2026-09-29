@@ -125,9 +125,11 @@ pub(super) fn verify(
 }
 
 fn valid_id(value: &str, max_utf16_units: usize) -> bool {
-    !value.trim().is_empty()
-        && value == value.trim()
+    !value.is_empty()
         && value.encode_utf16().count() <= max_utf16_units
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 #[cfg(test)]
@@ -209,9 +211,18 @@ mod tests {
     }
 
     #[test]
-    fn strict_id_domain_matches_kotlin_utf16_limits() {
+    fn strict_ascii_id_domain_matches_kotlin_and_rejects_unicode_gaps() {
         let long_non_bmp = "😀".repeat(65);
-        for invalid in ["", " ", " leading", "trailing ", long_non_bmp.as_str()] {
+        for invalid in [
+            "",
+            " ",
+            " leading",
+            "trailing ",
+            "\u{001c}",
+            "\u{0085}",
+            "😀",
+            long_non_bmp.as_str(),
+        ] {
             let mut value = receipt();
             value["processNonce"] = json!(invalid);
             assert!(verify(&serde_json::from_value(value).unwrap(), invalid, "fence-1").is_err());
@@ -235,6 +246,9 @@ mod tests {
             value["captured"][0]["ticket"]["logicalId"] = json!(logical_invalid);
             assert!(check(value).is_err());
         }
+        // Rust strings cannot contain an isolated UTF-16 surrogate. A hostile JSON
+        // escape is rejected at deserialization, before the verifier sees an ID.
+        assert!(serde_json::from_str::<String>(r#""\ud800""#).is_err());
     }
 
     #[test]

@@ -26,17 +26,18 @@ class AndroidNativeAdmissionTest {
         }
     }
 
-    @Test fun idsUseOneNonBlankTrimmedUtf16Domain() {
-        for (invalid in listOf("", " ", " process", "process ", "x".repeat(129))) {
+    @Test fun idsUseOneExplicitAsciiDomain() {
+        val invalidCharacters = listOf("\u001c", "\u0085", "\uD800", "😀")
+        for (invalid in listOf("", " ", " process", "process ", "x".repeat(129)) + invalidCharacters) {
             try { AndroidNativeAdmission(invalid); fail("invalid process nonce") }
             catch (_: IllegalArgumentException) {}
         }
         val ledger = open()
-        for (invalid in listOf("", " ", " fence", "fence ", "😀".repeat(65))) {
+        for (invalid in listOf("", " ", " fence", "fence ", "😀".repeat(65)) + invalidCharacters) {
             try { ledger.seal(invalid); fail("invalid fence ID") }
             catch (_: IllegalArgumentException) {}
         }
-        for (invalid in listOf("", " ", " login", "login ", "a".repeat(257))) {
+        for (invalid in listOf("", " ", " login", "login ", "a".repeat(257)) + invalidCharacters) {
             try { ledger.reserveOwner(AndroidNativeAdmission.Kind.Login, invalid); fail("invalid owner ID") }
             catch (_: IllegalArgumentException) {}
         }

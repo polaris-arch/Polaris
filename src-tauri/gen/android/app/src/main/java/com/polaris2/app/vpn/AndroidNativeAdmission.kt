@@ -159,8 +159,12 @@ internal class AndroidNativeAdmission(
     )
 
     companion object {
+        // Every producer uses UUID, hex, or a sanitized ASCII file stem. An explicit
+        // shared alphabet avoids JVM/Rust Unicode whitespace and surrogate differences.
         private fun validId(value: String, maxUtf16Units: Int): Boolean =
-            value.isNotBlank() && value == value.trim() && value.length <= maxUtf16Units
+            value.isNotEmpty() && value.length <= maxUtf16Units && value.all {
+                it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it in "._:-"
+            }
         private val OWNER_KINDS = setOf(Kind.Main, Kind.Login, Kind.Speedtest)
         private val CONTROL_KINDS = setOf(Kind.TargetlessStop, Kind.TargetlessReload)
         private val TERMINAL = setOf(State.CancelledBeforeBirth, State.ClosedExact, State.Completed,
