@@ -374,7 +374,14 @@ fn handle_birth_stop<P, S, D, SD>(
                 return;
             }
             None => {
-                let response = LinuxBirthStop::Unknown { target };
+                // A newer Legacy child cannot hide native reap proof for an
+                // older exact birth whose Stop ACK was lost. Never pass this
+                // request to the spawner while the Legacy child is current.
+                let response = if deps.spawner.reaped_birth(&target) {
+                    LinuxBirthStop::Stopped { target }
+                } else {
+                    LinuxBirthStop::Unknown { target }
+                };
                 let _ = conn.write_line(
                     &Response::Ok(ResponseKind::LinuxBirthStop(response)).to_wire_line(),
                 );

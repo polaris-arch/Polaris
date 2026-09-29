@@ -485,6 +485,59 @@ fn exact_stop_rejects_mismatch_and_bad_frames_without_mutation() {
 }
 
 #[test]
+fn reaped_exact_birth_ack_survives_a_legacy_successor() {
+    let (_dir, auth, _core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwarding = StdMutex::new(Vec::new());
+    let fwd = |value| forwarding.lock().unwrap().push(value);
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let legacy = CoreHandle::new(42);
+    let mut state = HandlerState {
+        child: Some(ManagedChild::Running(legacy.clone())),
+    };
+    let old = exact_handle(42, BIRTH_ONE).target().unwrap();
+    spawner.reaped_births.lock().unwrap().push(old);
+
+    let mut late = MockConn::new(vec!["42", BIRTH_ONE]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::STOP_BIRTH_SAFE, &mut late);
+    assert_eq!(
+        Response::parse(&late.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
+            target: old
+        }))
+    );
+    assert!(state.child.as_ref().unwrap().handle().same_birth(&legacy));
+    assert!(spawner.birth_stop_calls.lock().unwrap().is_empty());
+    assert!(
+        forwarding.lock().unwrap().is_empty(),
+        "old A must not reset B forwarding"
+    );
+
+    let mut unknown = MockConn::new(vec!["42", BIRTH_TWO]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::STOP_BIRTH_SAFE,
+        &mut unknown,
+    );
+    assert_eq!(
+        Response::parse(&unknown.writes()[0]),
+        Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Unknown {
+            target: exact_handle(42, BIRTH_TWO).target().unwrap()
+        }))
+    );
+    assert!(state.child.as_ref().unwrap().handle().same_birth(&legacy));
+    assert!(spawner.birth_stop_calls.lock().unwrap().is_empty());
+    assert!(forwarding.lock().unwrap().is_empty());
+}
+
+#[test]
 fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
     let (_dir, auth, _core_dir) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
