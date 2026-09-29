@@ -7,7 +7,8 @@
       视口收缩到安全区之内，四个 inset 一律解析成 0px —— `tokens.resolved.css` 里那四个 `--safe-*`
       会**静默**退化成常量 0，刘海/手势条下的裁切照样发生，而 CSS 里一个字都不用改就能"看起来对"。
     -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- WKWebView honours these limits; Android also disables its native zoom gestures in MainActivity. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <!-- 与 index.html 同一份 CSP 兜底（浏览器直开/dev）；打包态的权威策略在 tauri.conf.json。 -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws:; img-src 'self' data: https: polaris-icon: http://polaris-icon.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'" />
     <title>Polaris</title>

@@ -325,6 +325,12 @@ class MainActivity : TauriActivity() {
     val host = insetHost()
     insetTarget = host
     webViewTarget = webView
+    // The app has its own responsive layout and system-font-scale path. Disable only WebView page
+    // gestures (pinch / double tap); do not intercept touch events, scrolling, or input focus.
+    webView.settings.apply {
+      setSupportZoom(false)
+      setBuiltInZoomControls(false)
+    }
     // 字号：这里报的是**冷启动**那一次。`evaluateJavascript` 此刻多半打空（URL 还没开始加载，
     // 见头注「两条投递通道」①），真正兑现冷启动的是同一次调用里注册的文档起始脚本。
     publishFontScale(webView)

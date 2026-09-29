@@ -228,6 +228,22 @@ describe('① 入口文件在，且 Vite 真的在构建它', () => {
     expect(viewport?.[1]).toContain('viewport-fit=cover');
   });
 
+  it('移动 WebView 固定页面倍率，同时保留设备宽度和安全区', () => {
+    const tags = [...read(ENTRY_HTML).matchAll(/<meta\s+name=['"]viewport['"][^>]*content=['"]([^'"]*)['"]/g)];
+    expect(tags, '页面必须只有一个 viewport meta，否则 WebView 的实际倍率取决于解析顺序').toHaveLength(1);
+    const directives = Object.fromEntries(tags[0][1].split(',').map((part) => {
+      const [key, value] = part.trim().split('=');
+      return [key, value];
+    }));
+    expect(directives).toMatchObject({
+      width: 'device-width',
+      'initial-scale': '1.0',
+      'maximum-scale': '1.0',
+      'user-scalable': 'no',
+      'viewport-fit': 'cover',
+    });
+  });
+
   it('`vite.config.ts` 把它登记成了构建入口（不登记 = 打包产物里根本没有这份文档）', () => {
     const input = /input:\s*\{([\s\S]*?)\}/.exec(strip(read('vite.config.ts')));
     expect(input, 'vite.config.ts 的 rollupOptions.input 块找不到了 —— 判据面塌了').not.toBeNull();
@@ -689,6 +705,25 @@ describe('⑧ Android 把系统字号缩放送进了 web 层（`--font-scale` �
 
   it('CSS 侧的缺省仍在（iOS / 浏览器直开没有原生生产端，缺了它那边根字号会算不出来）', () => {
     expect(read('src/mobile/mobile.css')).toMatch(/--font-scale:\s*1\s*;/);
+    expect(read('src/mobile/mobile.css')).toMatch(/font-size:\s*calc\(\s*16px\s*\*\s*var\(--font-scale\)\s*\)/);
+  });
+});
+
+describe('⑨ Android WebView 页面缩放与系统字号分离', () => {
+  const path = resolvePath(REPO_ROOT, 'src-tauri/gen/android/app/src/main/java/com/polaris2/app/MainActivity.kt');
+  const activity = strip(readFileSync(path, 'utf8'));
+  const start = activity.indexOf('override fun onWebViewCreate(webView: WebView)');
+  const hook = start < 0 ? '' : activity.slice(start).split(/\n\s*override fun /)[0];
+
+  it('在 WebView 创建时关闭手势及内建缩放，不拦截触摸、滚动和输入', () => {
+    expect(activity).toMatch(/class\s+MainActivity\s*:\s*TauriActivity\s*\(\s*\)/);
+    expect(start, 'onWebViewCreate 不存在，原生 WebView 缩放设置无处生效').toBeGreaterThan(-1);
+    expect(hook).toMatch(/webView\.settings\.apply\s*\{\s*setSupportZoom\(false\)\s*setBuiltInZoomControls\(false\)\s*\}/);
+    expect(hook).not.toMatch(/setOnTouchListener|onTouchEvent|requestDisallowInterceptTouchEvent/);
+  });
+
+  it('仍由原有的字号通道消费系统大字体', () => {
+    expect(hook).toContain('publishFontScale(webView)');
     expect(read('src/mobile/mobile.css')).toMatch(/font-size:\s*calc\(\s*16px\s*\*\s*var\(--font-scale\)\s*\)/);
   });
 });
