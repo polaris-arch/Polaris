@@ -173,6 +173,15 @@ esac
     expect(pkg).toContain("if: env.POLARIS_UPLOAD_ARTIFACTS == '1'");
   });
 
+  it('Android 复用调用 job 满足嵌套发布 job 的权限上限', () => {
+    const androidJob = jobSection(risk, 'android', 'release-risk.yml');
+    expect(androidJob).toContain('uses: ./.github/workflows/android.yml');
+    expect(androidJob).toMatch(/permissions:\n\s+contents: write/);
+    const android = read('android.yml');
+    expect(android).toMatch(/\n  release-apk:[\s\S]*?\n    permissions:\n      contents: write/);
+    expect(risk).toMatch(/\npermissions:\n  contents: read/);
+  });
+
   it('Package 的 tag 与直接手动入口保留强制门，Release Risk 复用尊重 false 输入', () => {
     const packageJob = jobSection(pkg, 'package', 'package.yml');
     for (const key of ['POLARIS_RUN_KERNEL_GATES', 'POLARIS_UPLOAD_ARTIFACTS']) {

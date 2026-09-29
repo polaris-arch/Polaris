@@ -213,6 +213,10 @@ jobs:
     name: android apk gate
     needs: classify
     if: needs.classify.outputs.android == 'true'
+    # 被调 workflow 的 release-apk 子 job 声明 contents: write；GitHub 在启动前校验
+    # 整张复用图，即使本次 publish_release=false，也要求调用 job 给足权限上限。
+    permissions:
+      contents: write
     uses: ./.github/workflows/android.yml
 
   gate:
