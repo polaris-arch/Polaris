@@ -19,12 +19,13 @@ class AndroidNativeValidationTest {
         val speed = File(directory, "TransientSpeedtestHost.kt").readText()
         val adapter = File(directory, "AndroidNativeValidation.kt").readText()
         val command = plugin.substringAfter("fun checkConfig(invoke: Invoke)").substringBefore("fun vpnAuthStatus(")
-        val reserve = command.indexOf("AndroidNativeValidation.reserve()")
-        val queue = command.indexOf("val worker = Thread(")
-        assertTrue(reserve >= 0 && reserve < queue)
+        assertTrue(command.contains("AndroidNativeValidation.enqueue("))
         assertTrue(command.contains("AndroidNativeValidation.check(ticket, cfg)"))
-        assertTrue(login.contains("AndroidNativeValidation.check(config)"))
-        assertTrue(speed.contains("AndroidNativeValidation.check(config)"))
+        assertTrue(login.contains("AndroidNativeValidation.enqueue({ worker.execute(it) })"))
+        assertTrue(login.contains("AndroidNativeValidation.check(validationTicket, config)"))
+        assertTrue(speed.contains("AndroidNativeValidation.enqueue({ Thread(it,"))
+        assertTrue(speed.contains("AndroidNativeValidation.check(validationTicket, config)"))
+        assertFalse(adapter.contains("fun check(config: String)"))
         assertFalse(plugin.contains("Libbox.checkConfig("))
         assertFalse(login.contains("Libbox.checkConfig("))
         assertFalse(speed.contains("Libbox.checkConfig("))
@@ -83,5 +84,58 @@ class AndroidNativeValidationTest {
         assertFalse(invoked)
         assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth,
             ledger.receipt("fence-1").captured.single().state)
+    }
+
+    @Test fun allThreeIngressQueuesReserveBeforeDispatchAndRecheckBeforeNative() {
+        for (ingress in listOf("plugin", "login", "speedtest")) {
+            val ledger = AndroidNativeAdmission("process-1").also { it.bootstrap(RequiredMarkerProof.Absent) }
+            val queued = CountDownLatch(1)
+            val run = CountDownLatch(1)
+            val done = CountDownLatch(1)
+            val failure = AtomicReference<Throwable?>()
+            var nativeCalls = 0
+            AndroidNativeValidation.enqueue(ledger, queue = { action ->
+                Thread({
+                    queued.countDown()
+                    await(run)
+                    failure.set(runCatching { action() }.exceptionOrNull())
+                    done.countDown()
+                }, ingress).start()
+            }) { ticket ->
+                AndroidNativeValidation.run(ledger, ticket, setup = {}, nativeCheck = { nativeCalls++ })
+            }
+            await(queued)
+            val receipt = ledger.seal("fence-1")
+            assertEquals(AndroidNativeAdmission.State.Reserved, receipt.captured.single().state)
+            run.countDown()
+            await(done)
+            assertTrue(failure.get() is AndroidNativeAdmission.AdmissionClosed)
+            assertEquals(0, nativeCalls)
+            assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth,
+                ledger.receipt("fence-1").captured.single().state)
+        }
+    }
+
+    @Test fun sealBeforeIngressNeverQueuesAndFailedDispatchCancelsReservation() {
+        for (ingress in listOf("plugin", "login", "speedtest")) {
+            val sealed = AndroidNativeAdmission("process-1").also { it.bootstrap(RequiredMarkerProof.Absent) }
+            sealed.seal("fence-1")
+            val rejection = runCatching {
+                AndroidNativeValidation.enqueue(sealed, queue = { error("$ingress must not queue") }) { }
+            }.exceptionOrNull()
+            assertTrue(rejection is AndroidNativeAdmission.AdmissionClosed)
+            assertEquals(0, sealed.receipt("fence-1").capturedCount)
+
+            val ledger = AndroidNativeAdmission("process-2").also { it.bootstrap(RequiredMarkerProof.Absent) }
+            var captured: AndroidNativeAdmission.Ticket? = null
+            val unavailable = runCatching {
+                AndroidNativeValidation.enqueue(ledger, queue = {
+                    captured = ledger.seal("fence-2").captured.single().ticket
+                    error("$ingress queue unavailable")
+                }) { error("must not run") }
+            }.exceptionOrNull()
+            assertTrue(unavailable is IllegalStateException)
+            assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth, ledger.state(requireNotNull(captured)))
+        }
     }
 }

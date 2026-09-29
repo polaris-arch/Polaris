@@ -37,7 +37,7 @@ class PolarisVpnService :
         socketProtector = this
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = boxService.onStartCommand()
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = boxService.onStartCommand(startId)
 
     override fun onBind(intent: Intent): IBinder? {
         // super.onBind 只在 action 是 SERVICE_INTERFACE 时返回系统 binder（系统用它探测 VPN 组件）；

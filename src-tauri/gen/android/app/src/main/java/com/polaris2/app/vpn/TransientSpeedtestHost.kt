@@ -60,13 +60,22 @@ internal object TransientSpeedtestHost {
     }
 
     fun start(id: String, config: String, done: (String?) -> Unit) {
-        Thread({
-            try { validateConfig(config) } catch (_: Exception) {
-                done("Android 临时测速配置被拒绝")
-                return@Thread
+        try {
+            AndroidNativeValidation.enqueue({ Thread(it, "polaris-speedtest-check").start() }) { validationTicket ->
+                try { validateConfig(config) } catch (_: Exception) {
+                    AndroidNativeValidation.cancelBeforeBirth(validationTicket)
+                    done("Android 临时测速配置被拒绝")
+                    return@enqueue
+                }
+                try { sessions.start(id, LibboxEngine(id, config, validationTicket)) { failure ->
+                    AndroidNativeValidation.cancelBeforeBirth(validationTicket)
+                    done(failure)
+                } } catch (_: Throwable) {
+                    AndroidNativeValidation.cancelBeforeBirth(validationTicket)
+                    done("Android 临时测速启动失败")
+                }
             }
-            sessions.start(id, LibboxEngine(id, config), done)
-        }, "polaris-speedtest-check").start()
+        } catch (_: Throwable) { done("Android 临时测速原生准入已关闭") }
     }
 
     fun close(id: String, done: (String?) -> Unit) = sessions.close(id, done)
@@ -75,13 +84,14 @@ internal object TransientSpeedtestHost {
         sessions.withMainStart(owner, allowed, action)
     fun closeMain(owner: Any, action: () -> Unit) = sessions.closeMain(owner, action)
 
-    private class LibboxEngine(private val id: String, private val config: String) : TransientSpeedtestSessions.Engine {
+    private class LibboxEngine(private val id: String, private val config: String,
+        private val validationTicket: AndroidNativeAdmission.Ticket) : TransientSpeedtestSessions.Engine {
         private var network: TransientLoginNetwork? = null
         private var server: CommandServer? = null
 
         override fun prepare() {
             PolarisApplication.ensureSetup()
-            AndroidNativeValidation.check(config)
+            AndroidNativeValidation.check(validationTicket, config)
             val created = TransientLoginNetwork()
             network = created
             created.start()

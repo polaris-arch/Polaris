@@ -29,13 +29,32 @@ internal object AndroidNativeMain {
         attempt.nativeTicket?.let(AndroidNativeAdmissionGate.ledger::unknown)
     }
 
+    /** Record failure/cancellation before Stop can acquire the same operation lock. */
+    fun <T> construct(attempt: MainKernelAttempt<*>, action: () -> T): T =
+        construct(AndroidNativeAdmissionGate.ledger, attempt, action)
+
+    internal fun <T> construct(ledger: AndroidNativeAdmission, attempt: MainKernelAttempt<*>, action: () -> T): T =
+        synchronized(attempt.operationLock) {
+            try {
+                val result = action()
+                check(!attempt.revoked) { "android: native construction completion was revoked" }
+                result
+            } catch (failure: Throwable) {
+                attempt.markConstructionUnknown()
+                attempt.nativeTicket?.let(ledger::unknown)
+                throw failure
+            }
+        }
+
     /** Caller first confirms native CloseService/Close, then releases this exact registry owner. */
     fun settleAfterExactRelease(attempt: MainKernelAttempt<*>) =
         settleAfterExactRelease(AndroidNativeAdmissionGate.ledger, attempt)
 
     internal fun settleAfterExactRelease(ledger: AndroidNativeAdmission, attempt: MainKernelAttempt<*>) {
         val ticket = attempt.nativeTicket ?: return
-        if (!attempt.closed.isDone || attempt.closed.getNow(null) != null || !attempt.released.isDone) {
+        if (attempt.constructionUnknown || !attempt.closeSucceeded() ||
+            !attempt.released.isDone || attempt.released.isCompletedExceptionally ||
+            !attempt.prepared.isDone || attempt.prepared.isCompletedExceptionally) {
             ledger.unknown(ticket)
             return
         }

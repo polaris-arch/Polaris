@@ -62,8 +62,8 @@ internal object TransientLoginHost {
             }
             next
         }
-        // The claim is visible to login instances. Stop does not take operationLock,
-        // so its terminal native Close can join this in-flight Start/Reload.
+        // The claim is visible to login instances. Stop revokes immediately; its
+        // close worker joins operationLock before closing this Start/Reload.
         val result = action()
         synchronized(ownershipLock) {
             check(allowed() && mainClaims.containsKey(owner)) { "Android 主核生命周期已变化" }
@@ -98,63 +98,70 @@ internal object TransientLoginHost {
             }
             Entry(id, directories).also { entries[id] = it }
         }
-        worker.execute {
-            var stage = "ownership"
-            val failure = synchronized(ownershipLock) { runCatching {
-                check(!entry.cancelled) { "Android 登录请求已取消" }
-                check(mainClaims.values.none { claim -> entry.stateDirectories.any(claim::contains) }) { "Android Tailscale 端点已被主核持有" }
-                val predecessors = synchronized(entries) {
-                    entries.values.filter { it !== entry && !it.disposed && it.stateDirectories.any(entry.stateDirectories::contains) }
-                }
-                for (previous in predecessors) {
-                    previous.cancelled = true
-                    check(dispose(previous) == null) { "Android 旧登录实例尚未关闭" }
-                    synchronized(entries) { if (entries[previous.id] === previous) entries.remove(previous.id) }
-                }
-                stage = "setup"
-                PolarisApplication.ensureSetup()
-                check(!Libbox.hasTunInbound(config)) { "Android 独立登录不允许创建 VPN 隧道" }
-                stage = "check"
-                AndroidNativeValidation.check(config)
-                stage = "cache"
-                val cachePath = JSONObject(config).optJSONObject("experimental")?.optJSONObject("cache_file")?.optString("path").orEmpty()
-                val cache = File(cachePath).canonicalFile
-                check(cache.parent in entry.stateDirectories && cache.name.matches(Regex("login-cache-[0-9]+\\.db"))) { "Android 登录缓存路径未隔离" }
-                // Cache Initialize precedes endpoint Initialize; a first login has no TS directory yet.
-                ensurePrivateDirectory(requireNotNull(cache.parentFile))
-                entry.cache = cache
-                val network = TransientLoginNetwork()
-                entry.network = network
-                stage = "network"
-                network.start()
-                check(!entry.cancelled) { "Android 登录请求已取消" }
-                // The factory disables global command socket/snapshot/power reports inside libbox.
-                stage = "factory"
-                val server = Libbox.newTransientCommandServer(LoginHandler(entry), network)
-                entry.server = server
-                stage = "start"
-                server.startOrReloadService(config, OverrideOptions())
-                check(!entry.cancelled) { "Android 登录请求已取消" }
-                entry.running = true
-                // Rust owns normal cancellation/Running/timeout. This bounds a detached late bridge invocation too.
-                timer.schedule({ close(id) {} }, 300, TimeUnit.SECONDS)
-            }.exceptionOrNull() }
-            if (failure != null) {
-                val cleanup = synchronized(ownershipLock) { dispose(entry) }
-                if (cleanup == null) synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
-                if (cleanup != null) timer.schedule({ close(id) {} }, 5, TimeUnit.SECONDS)
-                val message = failure.message.orEmpty().lowercase()
-                val reason = when {
-                    "no such file" in message -> "PATH_NOT_FOUND"
-                    "permission" in message || "denied" in message -> "PERMISSION_DENIED"
-                    "unknown" in message -> "UNSUPPORTED"
-                    "timeout" in message -> "TIMEOUT"
-                    "可用的物理网络" in message -> "NO_PHYSICAL_NETWORK"
-                    else -> "FAILED"
-                }
-                Log.w("PolarisLogin", "transient failure stage=$stage type=${failure.javaClass.simpleName} reason=$reason")
-                done(GeneralFailure("Android 独立登录失败 [$stage/$reason]"))
-            } else done(null)
+        try {
+            AndroidNativeValidation.enqueue({ worker.execute(it) }) { validationTicket ->
+                var stage = "ownership"
+                val failure = synchronized(ownershipLock) { runCatching {
+                    check(!entry.cancelled) { "Android 登录请求已取消" }
+                    check(mainClaims.values.none { claim -> entry.stateDirectories.any(claim::contains) }) { "Android Tailscale 端点已被主核持有" }
+                    val predecessors = synchronized(entries) {
+                        entries.values.filter { it !== entry && !it.disposed && it.stateDirectories.any(entry.stateDirectories::contains) }
+                    }
+                    for (previous in predecessors) {
+                        previous.cancelled = true
+                        check(dispose(previous) == null) { "Android 旧登录实例尚未关闭" }
+                        synchronized(entries) { if (entries[previous.id] === previous) entries.remove(previous.id) }
+                    }
+                    stage = "setup"
+                    PolarisApplication.ensureSetup()
+                    check(!Libbox.hasTunInbound(config)) { "Android 独立登录不允许创建 VPN 隧道" }
+                    stage = "check"
+                    AndroidNativeValidation.check(validationTicket, config)
+                    stage = "cache"
+                    val cachePath = JSONObject(config).optJSONObject("experimental")?.optJSONObject("cache_file")?.optString("path").orEmpty()
+                    val cache = File(cachePath).canonicalFile
+                    check(cache.parent in entry.stateDirectories && cache.name.matches(Regex("login-cache-[0-9]+\\.db"))) { "Android 登录缓存路径未隔离" }
+                    // Cache Initialize precedes endpoint Initialize; a first login has no TS directory yet.
+                    ensurePrivateDirectory(requireNotNull(cache.parentFile))
+                    entry.cache = cache
+                    val network = TransientLoginNetwork()
+                    entry.network = network
+                    stage = "network"
+                    network.start()
+                    check(!entry.cancelled) { "Android 登录请求已取消" }
+                    // The factory disables global command socket/snapshot/power reports inside libbox.
+                    stage = "factory"
+                    val server = Libbox.newTransientCommandServer(LoginHandler(entry), network)
+                    entry.server = server
+                    stage = "start"
+                    server.startOrReloadService(config, OverrideOptions())
+                    check(!entry.cancelled) { "Android 登录请求已取消" }
+                    entry.running = true
+                    // Rust owns normal cancellation/Running/timeout. This bounds a detached late bridge invocation too.
+                    timer.schedule({ close(id) {} }, 300, TimeUnit.SECONDS)
+                }.exceptionOrNull() }
+                // A rejected/cancelled worker that never reached validation is terminal before birth.
+                AndroidNativeValidation.cancelBeforeBirth(validationTicket)
+                if (failure != null) {
+                    val cleanup = synchronized(ownershipLock) { dispose(entry) }
+                    if (cleanup == null) synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
+                    if (cleanup != null) timer.schedule({ close(id) {} }, 5, TimeUnit.SECONDS)
+                    val message = failure.message.orEmpty().lowercase()
+                    val reason = when {
+                        "no such file" in message -> "PATH_NOT_FOUND"
+                        "permission" in message || "denied" in message -> "PERMISSION_DENIED"
+                        "unknown" in message -> "UNSUPPORTED"
+                        "timeout" in message -> "TIMEOUT"
+                        "可用的物理网络" in message -> "NO_PHYSICAL_NETWORK"
+                        else -> "FAILED"
+                    }
+                    Log.w("PolarisLogin", "transient failure stage=$stage type=${failure.javaClass.simpleName} reason=$reason")
+                    done(GeneralFailure("Android 独立登录失败 [$stage/$reason]"))
+                } else done(null)
+            }
+        } catch (_: Throwable) {
+            synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
+            done(GeneralFailure("Android 独立登录失败 [admission/UNAVAILABLE]"))
         }
     }
 

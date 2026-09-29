@@ -432,9 +432,9 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     /**
      * 起核前的内核闸门（`config_gate`）在 Android 上的取证腿。
      *
-     * `Libbox.checkConfig` 只做 decode + initialize（`box.New`，不 `Start`）⇒ 不绑端口、不开
-     * `cache.db`，可以安全地插在真核起来之前。但它仍不能放主线程：生产规模配置带二十余个
-     * `.srs`，解析是毫秒到几十毫秒级。
+     * `Libbox.checkConfig` 做 decode + initialize（`box.New`，不 `Start`）；部分构造失败
+     * 和 unstarted resource 的释放目前没有完整证明，因此 JNI 返回后仍保留 cleanupUnknown。
+     * 生产配置的 `.srs` 解析不能放主线程；原生准入票在入队前保留。
      *
      * 返回约定：`{}`（无 `error` 键）= 内核收下；`{"error": "<e.message>"}` = 拒收。
      * **异常消息原样回传，绝不翻译或加前缀** —— Rust 侧 `parse_kernel_rejection` 的
@@ -443,24 +443,18 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun checkConfig(invoke: Invoke) {
         val cfg = invoke.parseArgs(CheckArgs::class.java).configContent
-        val ticket = try {
-            AndroidNativeValidation.reserve()
-        } catch (error: AndroidNativeAdmission.AdmissionClosed) {
-            invoke.resolve(JSObject().put("error", error.message))
-            return
-        }
-        val worker = Thread({
-            val err = runCatching {
-                AndroidNativeValidation.check(ticket, cfg)
-            }.exceptionOrNull()
-            val result = JSObject()
-            if (err != null) {
-                result.put("error", err.message ?: err.toString())
+        try {
+            AndroidNativeValidation.enqueue({ Thread(it, "polaris-check-config").start() }) { ticket ->
+                val err = runCatching {
+                    AndroidNativeValidation.check(ticket, cfg)
+                }.exceptionOrNull()
+                val result = JSObject()
+                if (err != null) {
+                    result.put("error", err.message ?: err.toString())
+                }
+                invoke.resolve(result)
             }
-            invoke.resolve(result)
-        }, "polaris-check-config")
-        runCatching { worker.start() }.onFailure { error ->
-            AndroidNativeValidation.cancelBeforeBirth(ticket)
+        } catch (error: Throwable) {
             invoke.resolve(JSObject().put("error", error.message ?: "android: checkConfig worker unavailable"))
         }
     }
@@ -1043,6 +1037,9 @@ internal object LegacySystemStartFence {
     fun <T> admit(action: () -> T): T? = gate.admit(action)
     fun <T> admitWithDecision(action: () -> T): LegacyAdmissionFence.Admission<T> =
         gate.admitWithDecision(action)
+
+    fun <Request, T> admitCurrentRequest(request: Request?, currentRequest: () -> Request?, action: () -> T): LegacyAdmissionFence.Admission<T?> =
+        gate.admitCurrentRequest(request, currentRequest, action)
     fun requireOpen() = gate.requireOpen()
 
     /** Internal primitive; a future coordinator must call this before publishing Preparing. */

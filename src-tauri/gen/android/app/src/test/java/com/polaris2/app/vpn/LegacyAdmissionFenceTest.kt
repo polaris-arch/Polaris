@@ -12,36 +12,131 @@ import org.junit.Test
 class LegacyAdmissionFenceTest {
     private fun waitFor(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
 
-    @Test fun onlyFenceRejectedUnownedServiceStopsItself() {
-        val registry = MainKernelAttemptLedger()
-        val gate = LegacyAdmissionFence<String>(
-            detachPending = { null },
-            bridgeIdle = { true },
-            currentOwner = registry::ownerForDrain,
-        )
-        // An open gate can still yield no attempt (for example, another owner
-        // occupies the registry); that is not a fence rejection.
-        val ordinaryMiss = gate.admitWithDecision<Any?> { null }
-        assertFalse(ordinaryMiss.rejectedByFence)
-        assertFalse(shouldStopSelfAfterFenceRejection(
-            ordinaryMiss.rejectedByFence, ServiceState.Stopped, hasAttempt = false,
-        ))
+    @Test fun everyOwnerlessRejectedStartNeedsTeardown() {
+        assertTrue(shouldStopUnownedServiceStart(ServiceState.Stopped, hasAttempt = false))
+        for (state in ServiceState.entries) {
+            assertFalse(shouldStopUnownedServiceStart(state, hasAttempt = true))
+        }
+        assertFalse(shouldStopUnownedServiceStart(ServiceState.Starting, hasAttempt = false))
+    }
 
-        gate.begin("fgs-fence")
-        val fenced = gate.admitWithDecision { error("fenced action must not run") }
-        assertTrue(fenced.rejectedByFence)
-        assertTrue(shouldStopSelfAfterFenceRejection(
-            fenced.rejectedByFence, ServiceState.Stopped, hasAttempt = false,
-        ))
-        assertFalse(shouldStopSelfAfterFenceRejection(
-            fenced.rejectedByFence, ServiceState.Started, hasAttempt = true,
-        ))
-        assertFalse(shouldStopSelfAfterFenceRejection(
-            fenced.rejectedByFence, ServiceState.Starting, hasAttempt = true,
-        ))
-        assertFalse(shouldStopSelfAfterFenceRejection(
-            fenced.rejectedByFence, ServiceState.Stopped, hasAttempt = true,
-        ))
+    @Test fun replacedRequestBeforeGateIsRejectedAndOwnerlessIntentStops() {
+        val registry = MainKernelAttemptLedger()
+        val requestA = Any()
+        val requestB = Any()
+        val pending = AtomicReference(requestA)
+        val gate = LegacyAdmissionFence<Any>(
+            detachPending = { pending.getAndSet(null) },
+            bridgeIdle = { pending.get() == null }, currentOwner = registry::ownerForDrain,
+        )
+        val read = CountDownLatch(1)
+        val enterGate = CountDownLatch(1)
+        val decision = AtomicReference<LegacyAdmissionFence.Admission<MainKernelAttempt<Any>?>>()
+        val worker = Thread {
+            val snapshot = pending.get()
+            read.countDown()
+            waitFor(enterGate)
+            decision.set(gate.admitCurrentRequest(snapshot, pending::get) {
+                MainKernelAttempt<Any>().also { assertTrue(registry.claim(it)) }
+            })
+        }
+        worker.start()
+        waitFor(read)
+        gate.admit { pending.set(requestB) }
+        enterGate.countDown()
+        worker.join(2_000)
+        assertFalse(worker.isAlive)
+        assertFalse(decision.get().rejectedByFence)
+        assertNull(decision.get().value)
+        assertTrue(registry.isVacant())
+        assertTrue(shouldStopUnownedServiceStart(ServiceState.Stopped, hasAttempt = false))
+        assertTrue(pending.get() === requestB) // rejecting A never detaches B's bridge reply.
+    }
+
+    @Test fun admittedRequestCannotBeReplacedUntilItsOwnerIsPublished() {
+        val registry = MainKernelAttemptLedger()
+        val request = Any()
+        val pending = AtomicReference(request)
+        val gate = LegacyAdmissionFence<Any>(
+            detachPending = { pending.getAndSet(null) },
+            bridgeIdle = { false }, currentOwner = registry::ownerForDrain,
+        )
+        val entered = CountDownLatch(1)
+        val leave = CountDownLatch(1)
+        val replacementStarted = CountDownLatch(1)
+        val replacementFailure = AtomicReference<Throwable?>()
+        val attempt = MainKernelAttempt<Any>(runId = "run-a")
+        val claiming = Thread {
+            gate.admitCurrentRequest(request, pending::get) {
+                entered.countDown()
+                waitFor(leave)
+                assertTrue(registry.claim(attempt))
+                attempt
+            }
+        }
+        claiming.start()
+        waitFor(entered)
+        val replacement = Thread {
+            replacementStarted.countDown()
+            replacementFailure.set(runCatching { gate.admit {
+                assertTrue(registry.isCurrent(attempt))
+                pending.set(Any())
+            } }.exceptionOrNull())
+        }
+        replacement.start()
+        waitFor(replacementStarted)
+        assertTrue(pending.get() === request)
+        leave.countDown()
+        claiming.join(2_000)
+        replacement.join(2_000)
+        assertFalse(claiming.isAlive)
+        assertFalse(replacement.isAlive)
+        assertNull(replacementFailure.get())
+        assertFalse(pending.get() === request)
+        assertTrue(registry.isCurrent(attempt))
+        assertFalse(shouldStopUnownedServiceStart(ServiceState.Starting, hasAttempt = true))
+    }
+
+    @Test fun oldIntentTeardownOutsideLocksCannotStopNewerServiceStart() {
+        val registry = MainKernelAttemptLedger()
+        val stateLock = Any()
+        var state = ServiceState.Stopped
+        var localOwner: MainKernelAttempt<Any>? = null
+        var latestAndroidStartId = 41
+        var serviceStopped = false
+        val decided = CountDownLatch(1)
+        val dispatch = CountDownLatch(1)
+        val teardownFailure = AtomicReference<Throwable?>()
+        val old = Thread {
+            teardownFailure.set(runCatching {
+                val stopId = synchronized(stateLock) { synchronized(registry) {
+                    if (shouldStopUnownedServiceStart(state, localOwner != null)) 41 else null
+                } }
+                decided.countDown()
+                waitFor(dispatch)
+                // Same seam as Android stopSelfResult: only the latest request may stop the component.
+                assertFalse(Thread.holdsLock(stateLock))
+                assertFalse(Thread.holdsLock(registry))
+                synchronized(stateLock) {
+                    if (stopId == latestAndroidStartId) serviceStopped = true
+                }
+            }.exceptionOrNull())
+        }
+        old.start()
+        waitFor(decided)
+        val successor = MainKernelAttempt<Any>(runId = "run-b")
+        synchronized(stateLock) { synchronized(registry) {
+            latestAndroidStartId = 42
+            assertTrue(registry.claim(successor))
+            localOwner = successor
+            state = ServiceState.Starting
+        } }
+        dispatch.countDown()
+        old.join(2_000)
+        assertFalse(old.isAlive)
+        assertNull(teardownFailure.get())
+        assertFalse(serviceStopped)
+        assertTrue(registry.isCurrent(successor))
     }
 
     @Test fun pendingBridgeRequestBeforeServiceIsDetachedBeforeVacant() {

@@ -41,6 +41,10 @@ internal class LegacyAdmissionFence<Pending>(
 
     fun <T> admit(action: () -> T): T? = admitWithDecision(action).value
 
+    /** A pre-gate request snapshot may have been replaced while the Service was queued. */
+    fun <Request, T> admitCurrentRequest(request: Request?, currentRequest: () -> Request?, action: () -> T): Admission<T?> =
+        admitWithDecision { if (currentRequest() !== request) null else action() }
+
     fun requireOpen() = synchronized(gate) {
         check(fence == null) { "android: legacy system start 已被受管迁移屏障阻断" }
     }
@@ -77,7 +81,7 @@ internal class LegacyAdmissionFence<Pending>(
         if (ownerNow != null && ownerNow.attempt !== prior.attempt) {
             return@synchronized Status(id, "unknown", runId, reason = "owner-identity-changed")
         }
-        if (prior.attempt.closed.isDone && prior.attempt.closed.getNow(null) != null) {
+        if (prior.attempt.closeFailure() != null) {
             return@synchronized Status(id, "unknown", runId, reason = "cleanup-unknown")
         }
         if (ownerNow == null && prior.attempt.released.isDone && idle) {

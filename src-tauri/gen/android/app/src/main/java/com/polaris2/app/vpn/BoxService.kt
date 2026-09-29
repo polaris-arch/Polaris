@@ -97,7 +97,7 @@ class BoxService(
         }
     }
 
-    fun onStartCommand(): Int {
+    fun onStartCommand(startId: Int): Int {
         val (attempt, stopUnowned) = synchronized(this) {
             if (state != ServiceState.Stopped || mainAttempt != null) Pair(null, false)
             else {
@@ -111,10 +111,8 @@ class BoxService(
                 } catch (_: IllegalStateException) {
                     return@synchronized Pair(null, true)
                 }
-                val admission = LegacySystemStartFence.admitWithDecision {
-                    // The bridge can settle or replace a request between our first
-                    // read and the legacy fence. Never attach a stale ticket.
-                    if (VpnBridge.currentStartRequest() !== request) return@admitWithDecision null
+                // The bridge may replace the request between the snapshot and the gate.
+                val admission = LegacySystemStartFence.admitCurrentRequest(request, VpnBridge::currentStartRequest) {
                     val next = MainKernelAttempt<CommandServer>(
                         generation,
                         request?.runId ?: systemRunId,
@@ -134,17 +132,19 @@ class BoxService(
                 if (admission.value == null && request == null) {
                     AndroidNativeMain.cancelBeforeBirth(nativeTicket)
                 }
-                Pair(admission.value, shouldStopSelfAfterFenceRejection(
-                    admission.rejectedByFence, state, mainAttempt != null,
-                ))
+                Pair(admission.value, synchronized(MainKernelAttemptRegistry) {
+                    admission.value == null && shouldStopUnownedServiceStart(state, mainAttempt != null)
+                })
             }
         }
         if (attempt == null) {
             if (stopUnowned) {
                 // startForegroundService already committed the 5s FGS deadline.
                 // This instance owns no attempt, so stop it before that deadline.
-                Log.i(TAG, "迁移屏障拒绝起核意图，停止无主前台服务")
-                service.stopSelf()
+                Log.i(TAG, "起核意图已失效，停止无主前台服务")
+                // Android compares startId atomically. A newer intent/owner may
+                // have arrived since the short decision locks were released.
+                service.stopSelfResult(startId)
                 return Service.START_NOT_STICKY
             }
             // An existing attempt owns its bridge reply. A duplicate system intent
@@ -216,25 +216,27 @@ class BoxService(
             // tonic connector carrying requests for this exact endpoint.
             attempt.dualModeApiPort = MainDualModeEndpointTombstone.claimBirth(config)
             TransientSpeedtestHost.withMainStart(attempt, { isStarting(attempt) }) {
-                TransientLoginHost.withMainConfig(attempt, config, { isStarting(attempt) }) {
-                    check(isStarting(attempt)) { "起核已被停核接管" }
-                    DefaultNetworkMonitor.start()
-                    check(isStarting(attempt)) { "起核已被停核接管" }
-                    val tunOpener = platformInterface as? PolarisVpnService
-                        ?: error("android: 主核没有绑定 attempt 的 TUN 载体")
-                    val boundPlatform = object : PlatformInterface by platformInterface {
-                        override fun openTun(options: TunOptions): Int = tunOpener.openTun(attempt, options)
+                AndroidNativeMain.construct(attempt) {
+                    TransientLoginHost.withMainConfig(attempt, config, { isStarting(attempt) }) {
+                        check(isStarting(attempt)) { "起核已被停核接管" }
+                        DefaultNetworkMonitor.start()
+                        check(isStarting(attempt)) { "起核已被停核接管" }
+                        val tunOpener = platformInterface as? PolarisVpnService
+                            ?: error("android: 主核没有绑定 attempt 的 TUN 载体")
+                        val boundPlatform = object : PlatformInterface by platformInterface {
+                            override fun openTun(options: TunOptions): Int = tunOpener.openTun(attempt, options)
+                        }
+                        val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), boundPlatform)
+                        attempt.publish(server)
+                        synchronized(this) { if (mainAttempt === attempt) commandServer = server }
+                        check(isStarting(attempt)) { "起核已被停核接管" }
+                        server.start()
+                        // No login instance may hold this Tailscale state directory during main startup.
+                        check(isStarting(attempt)) { "起核已被停核接管" }
+                        SystemStart.requireLegacyAllowed(service)
+                        server.startOrReloadService(config, OverrideOptions())
+                        SystemStart.requireLegacyAllowed(service)
                     }
-                    val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), boundPlatform)
-                    attempt.publish(server)
-                    synchronized(this) { if (mainAttempt === attempt) commandServer = server }
-                    check(isStarting(attempt)) { "起核已被停核接管" }
-                    server.start()
-                    // No login instance may hold this Tailscale state directory during main startup.
-                    check(isStarting(attempt)) { "起核已被停核接管" }
-                    SystemStart.requireLegacyAllowed(service)
-                    server.startOrReloadService(config, OverrideOptions())
-                    SystemStart.requireLegacyAllowed(service)
                 }
             }
             val acknowledged = synchronized(this) {
@@ -352,12 +354,14 @@ class BoxService(
         runCatching { TransientSpeedtestHost.withMainStart(attempt, { synchronized(this) {
             mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
         } }) {
-            TransientLoginHost.withMainConfig(attempt, config, { synchronized(this) {
-                mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
-            } }) {
-                SystemStart.requireLegacyAllowed(service)
-                server.startOrReloadService(config, OverrideOptions())
-                SystemStart.requireLegacyAllowed(service)
+            AndroidNativeMain.construct(attempt) {
+                TransientLoginHost.withMainConfig(attempt, config, { synchronized(this) {
+                    mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
+                } }) {
+                    SystemStart.requireLegacyAllowed(service)
+                    server.startOrReloadService(config, OverrideOptions())
+                    SystemStart.requireLegacyAllowed(service)
+                }
             }
         } }
             .onFailure {
@@ -508,7 +512,7 @@ class BoxService(
             return
         }
         if (attempt.closed.isDone) {
-            val failure = attempt.closed.getNow(null)
+            val failure = attempt.closeFailure()
             if (failure != null) VpnBridge.finishStop("android: 内核关闭失败")
             return
         }

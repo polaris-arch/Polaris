@@ -24,8 +24,11 @@ internal class MainKernelAttempt<Server>(
     /** Created by this attempt, never supplied by a bridge caller or reused after Service recreation. */
     val birthNonce: String = UUID.randomUUID().toString()
     private val closeLaunched = AtomicBoolean(false)
-    /** Orders this generation's Start and Reload, without delaying Stop's terminal close. */
+    /** Native Close joins this generation's Start/Reload before it can release ownership. */
     val operationLock = Any()
+    /** Sticky: ordinary CommandServer close cannot prove rollback of failed box.New. */
+    @Volatile var constructionUnknown = false
+        private set
     @Volatile var dualModeApiPort: Int? = null
     /** Set only by an explicit disconnect, never by failed-start cleanup. */
     @Volatile var clearReconnectNoticeOnClose = false
@@ -39,13 +42,26 @@ internal class MainKernelAttempt<Server>(
     private var tunScope: TunScope? = null
     @Volatile private var startAcknowledged = false
 
+    fun markConstructionUnknown() {
+        check(Thread.holdsLock(operationLock))
+        constructionUnknown = true
+    }
+
+    fun closeFailure(): Throwable? = if (!closed.isDone) null else
+        runCatching { closed.getNow(null) }.fold({ it }, { it })
+
+    fun closeSucceeded(): Boolean = closed.isDone && closeFailure() == null
+
+    fun preparationSkipped(): Boolean = prepared.isDone &&
+        !prepared.isCompletedExceptionally && prepared.getNow(null) == null
+
     fun acknowledgeStart() = synchronized(this) {
         check(!revoked) { "旧主核已撤销，不能登记启动回执" }
         startAcknowledged = true
     }
 
     fun ownershipState(): String = when {
-        revoked && closed.isDone && closed.getNow(null) != null -> "cleanupUnknown"
+        revoked && closeFailure() != null -> "cleanupUnknown"
         revoked -> "closing"
         startAcknowledged -> "acknowledged"
         else -> "starting"
@@ -122,7 +138,7 @@ internal class MainKernelAttemptLedger {
         if (!target.isValid()) return MainKernelExactResult(target, "Unknown", "invalid-target")
         val current = owner
         if (current?.exactTarget() == target) {
-            return if (current.closed.isDone && current.closed.getNow(null) != null)
+            return if (current.closeFailure() != null)
                 MainKernelExactResult(target, "Unknown", "cleanup-unknown")
             else MainKernelExactResult(target, "Busy")
         }
@@ -189,7 +205,7 @@ internal class MainKernelAttemptLedger {
     /** No factory was started, so this rejected system intent owns no native server. */
     fun abandon(attempt: MainKernelAttempt<*>): Boolean {
         val abandoned = synchronized(this) {
-            if (owner !== attempt || !attempt.prepared.isDone || attempt.prepared.getNow(null) != null) false
+            if (owner !== attempt || !attempt.preparationSkipped()) false
             else {
                 owner = null
                 ownerClose = null
@@ -203,7 +219,7 @@ internal class MainKernelAttemptLedger {
     /** Keep the bridge acknowledgement and owner release atomic against a new Service claim. */
     fun completeAfterClose(attempt: MainKernelAttempt<*>, action: () -> Unit): Boolean {
         val completed = synchronized(this) {
-            if (owner !== attempt || !attempt.closed.isDone || attempt.closed.getNow(null) != null) false
+            if (owner !== attempt || !attempt.closeSucceeded()) false
             else {
                 action()
                 lastReleased = attempt.exactTarget()

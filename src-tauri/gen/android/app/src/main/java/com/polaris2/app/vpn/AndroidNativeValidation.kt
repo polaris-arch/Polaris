@@ -5,15 +5,24 @@ import io.nekohasekai.libbox.Libbox
 /** Every checkConfig call must keep its ticket until JNI actually returns. */
 internal object AndroidNativeValidation {
     val capabilities = setOf(AndroidNativeProducer.ValidationCheckConfig)
-    fun reserve(): AndroidNativeAdmission.Ticket =
-        AndroidNativeAdmissionGate.ledger.reserveOperation(AndroidNativeAdmission.Kind.CheckConfig)
-
     fun cancelBeforeBirth(ticket: AndroidNativeAdmission.Ticket) {
         require(ticket.kind == AndroidNativeAdmission.Kind.CheckConfig)
         AndroidNativeAdmissionGate.ledger.cancelBeforeBirth(ticket)
     }
 
-    fun check(config: String) = check(reserve(), config)
+    /** All three ingress paths reserve before their first asynchronous queue. */
+    fun enqueue(queue: (() -> Unit) -> Unit, action: (AndroidNativeAdmission.Ticket) -> Unit) =
+        enqueue(AndroidNativeAdmissionGate.ledger, queue, action)
+
+    internal fun enqueue(ledger: AndroidNativeAdmission, queue: (() -> Unit) -> Unit,
+        action: (AndroidNativeAdmission.Ticket) -> Unit) {
+        val ticket = ledger.reserveOperation(AndroidNativeAdmission.Kind.CheckConfig)
+        try { queue { action(ticket) } }
+        catch (failure: Throwable) {
+            ledger.cancelBeforeBirth(ticket)
+            throw failure
+        }
+    }
 
     fun check(ticket: AndroidNativeAdmission.Ticket, config: String) {
         run(AndroidNativeAdmissionGate.ledger, ticket,
