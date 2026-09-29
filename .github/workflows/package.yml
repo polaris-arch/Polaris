@@ -281,9 +281,10 @@ jobs:
       POLARIS_BUILD_ID: ${{ github.sha }}
       # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
       POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
-      # 直接 tag / Package dispatch 保持原行为；release-risk 的 workflow_call 可关闭重复内核门与上传。
-      POLARIS_RUN_KERNEL_GATES: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || inputs.run_kernel_gates) && '1' || '0' }}
-      POLARIS_UPLOAD_ARTIFACTS: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || inputs.upload_artifacts) && '1' || '0' }}
+      # 直接 tag / Package dispatch 保持原行为；release-risk 手动 dispatch 复用本 workflow 时
+      # event_name 仍是 workflow_dispatch，须用它显式传入的 skip_quality_gates 区分调用侧。
+      POLARIS_RUN_KERNEL_GATES: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.run_kernel_gates) && '1' || '0' }}
+      POLARIS_UPLOAD_ARTIFACTS: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.upload_artifacts) && '1' || '0' }}
     runs-on: ${{ matrix.os }}
     strategy:
       # fail-fast: false 保留（2026-07-31 复核，判据同 ci.yml 那条，别单独优化掉一个）：

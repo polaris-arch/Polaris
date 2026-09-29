@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
@@ -35,11 +37,52 @@ describe('合入前发布风险门', () => {
   const risk = read('release-risk.yml');
   const pkg = read('package.yml');
 
-  it('PR、merge queue 与 main push 均触发，且 workflow 本身不做路径过滤', () => {
+  it('PR、merge queue、main push 与手动分支验证均触发，且 workflow 本身不做路径过滤', () => {
     expect(risk).toContain('pull_request:');
     expect(risk).toContain('merge_group:');
     expect(risk).toContain('push:');
+    expect(risk).toContain('workflow_dispatch:');
     expect(risk).not.toMatch(/^\s+paths(?:-ignore)?:/m);
+  });
+
+  it('手动验证只接受 branch ref，取其 head 与最新 origin/main 的 merge-base；取证失败走全量门', () => {
+    const classify = jobSection(risk, 'classify', 'release-risk.yml');
+    const start = classify.indexOf('            workflow_dispatch)');
+    const end = classify.indexOf('              fi ;;', start);
+    expect(start, 'classify 缺手动事件分支').toBeGreaterThanOrEqual(0);
+    expect(end, '手动事件分支缺结束边界').toBeGreaterThan(start);
+    const dispatch = classify.slice(start, end);
+
+    expect(classify).toContain('DISPATCH_REF: ${{ github.ref }}');
+    expect(classify).toContain('DISPATCH_SHA: ${{ github.sha }}');
+    expect(dispatch).toContain('[[ "$DISPATCH_REF" == refs/heads/* ]]');
+    expect(dispatch).toContain('echo "::error::手动发布风险门只接受 branch ref：$DISPATCH_REF"; exit 1; }');
+    expect(dispatch).toContain('git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main');
+    expect(dispatch).toContain('dispatch_head=$(git rev-parse --verify "${DISPATCH_REF}^{commit}" 2>/dev/null)');
+    expect(dispatch).toContain('[ "$dispatch_head" = "$DISPATCH_SHA" ]');
+    expect(dispatch).toContain('base=$(git merge-base refs/remotes/origin/main "$dispatch_head")');
+    expect(dispatch).toContain('head="$dispatch_head"');
+    expect(classify).toContain('if [ -n "$base" ] && [ -n "$head" ] \\');
+    expect(classify).toContain('git diff --name-only -z "$base" "$head" | node scripts/classify-ci-impact.mjs > "$result"');
+    expect(classify).toMatch(/else\n\s+echo "无法取得可靠 diff，故障关闭为内核门 \+ 四平台。"\n\s+node scripts\/classify-ci-impact\.mjs --full > "\$result"/);
+  });
+
+  it('手动选 tag 当场失败，不会到全量分类和 Package 发布路径', () => {
+    const classify = jobSection(risk, 'classify', 'release-risk.yml');
+    const lines = classify.split('\n');
+    const classifyStep = lines.indexOf('      - name: Classify changed paths');
+    expect(classifyStep, 'classify 缺路径分类步骤').toBeGreaterThanOrEqual(0);
+    const start = lines.indexOf('        run: |', classifyStep);
+    expect(start, 'classify 缺 shell 脚本').toBeGreaterThanOrEqual(0);
+    const script = lines.slice(start + 1).map((line) => line.slice(10)).join('\n');
+    const result = spawnSync('bash', ['-c', script], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, EVENT_NAME: 'workflow_dispatch', DISPATCH_REF: 'refs/tags/v1.0.0' },
+      encoding: 'utf8',
+    });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stdout).toContain('::error::手动发布风险门只接受 branch ref：refs/tags/v1.0.0');
+    expect(result.stdout).not.toContain('无法取得可靠 diff');
   });
 
   it('路径判据由仓库脚本持有，最终 required check 始终运行', () => {
@@ -78,6 +121,27 @@ describe('合入前发布风险门', () => {
     expect(pkg).toContain("if: env.POLARIS_UPLOAD_ARTIFACTS == '1'");
   });
 
+  it('Package 的 tag/直接手动入口保留强制门；Release Risk 手动复用尊重两个 false 输入', () => {
+    const packageJob = jobSection(pkg, 'package', 'package.yml');
+    const expressions = ['POLARIS_RUN_KERNEL_GATES', 'POLARIS_UPLOAD_ARTIFACTS'].map((key) => {
+      const match = packageJob.match(new RegExp(`^      ${key}: \\$\\{\\{ (.+) \\}\\}$`, 'm'));
+      expect(match, `package job 缺 ${key} 表达式`).not.toBeNull();
+      return match![1];
+    });
+    const evaluate = (expression: string, ref: string, event_name: string, skip_quality_gates: boolean) =>
+      runInNewContext(expression, {
+        github: { ref, event_name },
+        inputs: { skip_quality_gates, run_kernel_gates: false, upload_artifacts: false },
+        startsWith: (value: string, prefix: string) => value.startsWith(prefix),
+      });
+
+    for (const expression of expressions) {
+      expect(evaluate(expression, 'refs/tags/v1.0.0', 'push', false)).toBe('1');
+      expect(evaluate(expression, 'refs/heads/feature', 'workflow_dispatch', false)).toBe('1');
+      expect(evaluate(expression, 'refs/heads/feature', 'workflow_dispatch', true)).toBe('0');
+    }
+  });
+
   it('四道随包内核门在 package.yml 与 release-risk.yml 两份定义之间逐条对拍', () => {
     // Rust 侧四条 `ci_step_still_wired`（crates/config-engine/tests/*.rs）只 grep package.yml。
     // 但**合入前路径上真正在跑的是 release-risk.yml 这一份**：删掉它 129-132 里任意一行，
@@ -96,6 +160,17 @@ describe('合入前发布风险门', () => {
     // 强制腿也是双份定义：少了它「核没拉到」会静默跳过而不是红。
     expect(pkg).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
     expect(risk).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
+  });
+
+  it('手动分支分类命中内核时，仍保持 b609 随包核和现有 REQUIRE 硬化', () => {
+    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
+    expect(manifest.windowsBuild.sourceCommit).toBe('b609f959f57ce34416c51c7b87ce4a76f2e1df56');
+    const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
+    const mandatory = preflight.slice(preflight.indexOf('      - name: Run mandatory bundled-core gates'));
+    expect(preflight).toContain('run: node scripts/fetch-core.mjs');
+    expect(mandatory).toContain("if: needs.classify.outputs.kernel == 'true'");
+    expect(mandatory).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
+    expect(mandatory).toContain('cargo test -p polaris-config-engine --test kernel_accepts_outbounds');
   });
 
   it('CI 与 UI 都覆盖 merge_group，避免 merge queue 等不到 required check', () => {
