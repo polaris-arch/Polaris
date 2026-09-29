@@ -56,6 +56,10 @@
     {
       "file": "clashmode-hot-switch.patch",
       "sha256": "e65b52666212ab142f310decde3369258827d9b36520922acf03a74313a82994"
+    },
+    {
+      "file": "construction-validation.patch",
+      "sha256": "7c4c14970ce1702fa142e29ed2c7d05fb1340b7da548147aaba6b0ee99162a31"
     }
   ],
   "ndkSelectionReason": "NDK 27.3.13750724 arm64 linker rejects the pinned Cronet static archive with unknown relocation (315); cached NDK 30 preserves upstream dependencies and all feature tags.",

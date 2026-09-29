@@ -109,14 +109,16 @@ def main():
         # Test the patched close chain as real package behavior before binding.
         # The libbox tests remain explicit because unrelated upstream tests may
         # require extra modules outside this pinned offline build.
-        run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', '.', './daemon',
+        run([str(go), 'test', '-race', '-ldflags=-checklinkname=0', '-count=1', '.', './daemon',
              './adapter/endpoint', './adapter/inbound', './adapter/outbound',
-             './adapter/service', './dns', './service/api'], cwd=checkout, env=env)
+             './adapter/service', './adapter/certificate', './common/construction',
+             './common/certificate', './log', './route', './dns', './service/api'], cwd=checkout, env=env)
         run([str(go), 'test', '-race', '-count=1', './experimental/clashmode'], cwd=checkout, env=env)
         files = run([str(go), 'list', '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
-        run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', *files,
+        run([str(go), 'test', '-race', '-ldflags=-checklinkname=0', '-count=1', *files,
              str(checkout / 'experimental/libbox/command_server_transient_test.go'),
-             str(checkout / 'experimental/libbox/interface_binding_test.go')], cwd=checkout, env=env)
+             str(checkout / 'experimental/libbox/interface_binding_test.go'),
+             str(checkout / 'experimental/libbox/config_validation_test.go')], cwd=checkout, env=env)
         run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', './common/dialer'], cwd=checkout, env=env)
         linker_flags = (f'-X github.com/sagernet/sing-box/constant.Version={version} '
                         '-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 '
@@ -134,7 +136,8 @@ def main():
                    'toolchain': {'go': go_version, 'java': java_version, 'ndk': manifest['ndkVersion'], **mobile_tools},
                    'buildTags': manifest['buildTags'], 'androidAPI': manifest['androidAPI'], 'ndkSelectionReason': manifest['ndkSelectionReason'],
                    'linkerFlags': linker_flags, 'buildVCS': False,
-                   'tests': 'Box early-close result, five manager close errors, API listener close ownership, strict transient and primary terminal/sticky lifecycle, concurrent listener close barrier, transient HTTP CONNECT rejects missing/wrong auth, normal CommandServer lifecycle, named interface TCP/UDP binding and failures, dialer regressions, explicit clash default versus stale cache, and concurrent clash mode switching under Go race detector passed',
+                   'validationCleanupContract': {'version': 'polaris-validation-v1', 'constructedBoxCleanup': 'CleanupUnknown', 'exactCleanupEnabled': False},
+                   'tests': 'Construction rollback at each service constructor, constructor error+object/internal acquire, cancellation and panic, six unstarted manager child close/error/panic chains, parse rejection NoConstruction, bound validation/cleanup result, cleanup timeout/late completion with immutable receipt, and these under race detector; Box early-close result, five manager close errors, API listener close ownership, strict transient and primary terminal/sticky lifecycle, concurrent listener close barrier, transient HTTP CONNECT rejects missing/wrong auth, normal CommandServer lifecycle, named interface TCP/UDP binding and failures, dialer regressions, explicit clash default versus stale cache, and concurrent clash mode switching under Go race detector passed',
                    'nativeLibraries': {}}
         readelf = ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf'
         with zipfile.ZipFile(aar) as archive:
@@ -163,12 +166,17 @@ def main():
             classes = checkout / 'classes.jar'
             classes.write_bytes(archive.read('classes.jar'))
             signatures = {}
-            for name in ['Libbox', 'CommandServer', 'PlatformInterface']:
-                signatures[name] = run([str(jdk / 'bin/javap'), '-classpath', str(classes), f'io.nekohasekai.libbox.{name}'], capture=True)
+            for name in ['Libbox', 'CommandServer', 'PlatformInterface', 'ConfigValidationResult']:
+                signatures[name] = run([str(jdk / 'bin/javap'), '-constants', '-classpath', str(classes), f'io.nekohasekai.libbox.{name}'], capture=True)
             require('newTransientCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Transient Java factory is missing')
             require('newStrictCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Strict primary Java factory is missing')
             require('startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions)' in signatures['CommandServer'], 'Service Java signature changed')
             require('void bindInterfaceControl(int, java.lang.String) throws java.lang.Exception' in signatures['PlatformInterface'], 'Named interface Java platform contract is missing')
+            require('checkConfigWithResult(java.lang.String, java.lang.String, long)' in signatures['Libbox'], 'Bound config validation Java API is missing')
+            require('ConfigValidationContractVersion = "polaris-validation-v1"' in signatures['Libbox'], 'Config validation contract version differs')
+            for getter in ['RequestID', 'ConfigDigest', 'ContractVersion', 'Validation', 'Cleanup', 'ValidationError', 'CleanupError']:
+                require(f'java.lang.String get{getter}()' in signatures['ConfigValidationResult'], f'Config validation getter {getter} is missing')
+                require(f'set{getter}(' not in signatures['ConfigValidationResult'], f'Config validation field {getter} must be read-only')
             receipt['javaInterfaces'] = signatures
         output = ROOT / 'src-tauri/gen/android/app/libs/libbox.aar'
         output.parent.mkdir(parents=True, exist_ok=True)

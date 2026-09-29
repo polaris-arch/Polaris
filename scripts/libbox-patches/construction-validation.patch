@@ -1,0 +1,1877 @@
+diff --git a/adapter/certificate/manager.go b/adapter/certificate/manager.go
+index e4b9b53..b80127f 100644
+--- a/adapter/certificate/manager.go
++++ b/adapter/certificate/manager.go
+@@ -7,6 +7,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -59,13 +60,11 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 
+ func (m *Manager) Close() error {
+ 	m.access.Lock()
+-	defer m.access.Unlock()
+-	if !m.started {
+-		return nil
+-	}
+ 	m.started = false
+ 	providers := m.providers
+ 	m.providers = nil
++	clear(m.providerByTag)
++	m.access.Unlock()
+ 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+ 	var err error
+ 	for _, provider := range providers {
+@@ -73,7 +72,7 @@ func (m *Manager) Close() error {
+ 		m.logger.Trace("close ", name)
+ 		startTime := time.Now()
+ 		monitor.Start("close ", name)
+-		err = E.Append(err, provider.Close(), func(err error) error {
++		err = E.Append(err, construction.Close(name, provider.Close), func(err error) error {
+ 			return E.Cause(err, "close ", name)
+ 		})
+ 		monitor.Finish()
+@@ -110,16 +109,18 @@ func (m *Manager) Remove(tag string) error {
+ 		panic("invalid certificate provider index")
+ 	}
+ 	m.providers = append(m.providers[:index], m.providers[index+1:]...)
+-	started := m.started
+ 	m.access.Unlock()
+-	if started {
+-		return provider.Close()
+-	}
+-	return nil
++	return construction.Close("removed provider", provider.Close)
+ }
+ 
+ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) error {
+ 	provider, err := m.registry.Create(ctx, logger, tag, providerType, options)
++	owned := false
++	defer func() {
++		if !owned && provider != nil {
++			construction.RecordError(ctx, construction.Close("unowned provider", func() error { return common.Close(provider) }))
++		}
++	}()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -138,11 +139,9 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 		}
+ 	}
+ 	if existsProvider, loaded := m.providerByTag[tag]; loaded {
+-		if m.started {
+-			err = existsProvider.Close()
+-			if err != nil {
+-				return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
+-			}
++		err = existsProvider.Close()
++		if err != nil {
++			return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
+ 		}
+ 		existsIndex := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
+ 			return it == existsProvider
+@@ -153,6 +152,7 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
+ 	}
+ 	m.providers = append(m.providers, provider)
++	owned = true
+ 	m.providerByTag[tag] = provider
+ 	return nil
+ }
+diff --git a/adapter/certificate/manager_construction_test.go b/adapter/certificate/manager_construction_test.go
+new file mode 100644
+index 0000000..292778e
+--- /dev/null
++++ b/adapter/certificate/manager_construction_test.go
+@@ -0,0 +1,57 @@
++package certificate
++
++import (
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type constructionProbe struct {
++	adapter.CertificateProviderService
++	tag          string
++	closed       *int
++	panicOnClose bool
++	failure      error
++}
++
++func (p constructionProbe) Type() string { return "probe" }
++func (p constructionProbe) Tag() string  { return p.tag }
++func (p constructionProbe) Close() error {
++	*p.closed++
++	if p.panicOnClose {
++		panic("injected cleanup panic")
++	}
++	return p.failure
++}
++func TestConstructionCloseDrainsUnstartedChildrenAfterFailure(t *testing.T) {
++	failure := errors.New("injected cleanup failure")
++	counts := []int{0, 0, 0}
++	children := []adapter.CertificateProviderService{
++		constructionProbe{tag: "panic", closed: &counts[0], panicOnClose: true},
++		constructionProbe{tag: "error", closed: &counts[1], failure: failure},
++		constructionProbe{tag: "ok", closed: &counts[2]},
++	}
++	m := &Manager{logger: log.NewNOPFactory().Logger(), providers: children,
++		providerByTag: map[string]adapter.CertificateProviderService{"panic": children[0], "error": children[1], "ok": children[2]},
++	}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d close count = %d", i, count)
++		}
++	}
++	if len(m.providers) != 0 || len(m.providerByTag) != 0 {
++		t.Fatal("closed children retained")
++	}
++	if err := m.Close(); err != nil {
++		t.Fatalf("second close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d disposed twice", i)
++		}
++	}
++}
+diff --git a/adapter/endpoint/manager.go b/adapter/endpoint/manager.go
+index ff1889a..c9b1142 100644
+--- a/adapter/endpoint/manager.go
++++ b/adapter/endpoint/manager.go
+@@ -6,6 +6,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -59,20 +60,18 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 
+ func (m *Manager) Close() error {
+ 	m.access.Lock()
+-	defer m.access.Unlock()
+-	if !m.started {
+-		return nil
+-	}
+ 	m.started = false
+ 	endpoints := m.endpoints
+ 	m.endpoints = nil
++	clear(m.endpointByTag)
++	m.access.Unlock()
+ 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+ 	var err error
+ 	for _, endpoint := range endpoints {
+ 		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
+ 		done := adapter.LogElapsed(m.logger, "close ", name)
+ 		monitor.Start("close ", name)
+-		err = E.Append(err, endpoint.Close(), func(err error) error {
++		err = E.Append(err, construction.Close(name, endpoint.Close), func(err error) error {
+ 			return E.Cause(err, "close ", name)
+ 		})
+ 		monitor.Finish()
+@@ -109,16 +108,18 @@ func (m *Manager) Remove(tag string) error {
+ 		panic("invalid endpoint index")
+ 	}
+ 	m.endpoints = append(m.endpoints[:index], m.endpoints[index+1:]...)
+-	started := m.started
+ 	m.access.Unlock()
+-	if started {
+-		return endpoint.Close()
+-	}
+-	return nil
++	return construction.Close("removed endpoint", endpoint.Close)
+ }
+ 
+ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
+ 	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
++	owned := false
++	defer func() {
++		if !owned && endpoint != nil {
++			construction.RecordError(ctx, construction.Close("unowned endpoint", func() error { return common.Close(endpoint) }))
++		}
++	}()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -136,11 +137,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		}
+ 	}
+ 	if existsEndpoint, loaded := m.endpointByTag[tag]; loaded {
+-		if m.started {
+-			err = existsEndpoint.Close()
+-			if err != nil {
+-				return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
+-			}
++		err = existsEndpoint.Close()
++		if err != nil {
++			return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
+ 		}
+ 		existsIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
+ 			return it == existsEndpoint
+@@ -151,6 +150,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		m.endpoints = append(m.endpoints[:existsIndex], m.endpoints[existsIndex+1:]...)
+ 	}
+ 	m.endpoints = append(m.endpoints, endpoint)
++	owned = true
+ 	m.endpointByTag[tag] = endpoint
+ 	return nil
+ }
+diff --git a/adapter/endpoint/manager_construction_test.go b/adapter/endpoint/manager_construction_test.go
+new file mode 100644
+index 0000000..67ec4be
+--- /dev/null
++++ b/adapter/endpoint/manager_construction_test.go
+@@ -0,0 +1,57 @@
++package endpoint
++
++import (
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type constructionProbe struct {
++	adapter.Endpoint
++	tag          string
++	closed       *int
++	panicOnClose bool
++	failure      error
++}
++
++func (p constructionProbe) Type() string { return "probe" }
++func (p constructionProbe) Tag() string  { return p.tag }
++func (p constructionProbe) Close() error {
++	*p.closed++
++	if p.panicOnClose {
++		panic("injected cleanup panic")
++	}
++	return p.failure
++}
++func TestConstructionCloseDrainsUnstartedChildrenAfterFailure(t *testing.T) {
++	failure := errors.New("injected cleanup failure")
++	counts := []int{0, 0, 0}
++	children := []adapter.Endpoint{
++		constructionProbe{tag: "panic", closed: &counts[0], panicOnClose: true},
++		constructionProbe{tag: "error", closed: &counts[1], failure: failure},
++		constructionProbe{tag: "ok", closed: &counts[2]},
++	}
++	m := &Manager{logger: log.NewNOPFactory().Logger(), endpoints: children,
++		endpointByTag: map[string]adapter.Endpoint{"panic": children[0], "error": children[1], "ok": children[2]},
++	}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d close count = %d", i, count)
++		}
++	}
++	if len(m.endpoints) != 0 || len(m.endpointByTag) != 0 {
++		t.Fatal("closed children retained")
++	}
++	if err := m.Close(); err != nil {
++		t.Fatalf("second close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d disposed twice", i)
++		}
++	}
++}
+diff --git a/adapter/inbound/manager.go b/adapter/inbound/manager.go
+index 075e410..cb58489 100644
+--- a/adapter/inbound/manager.go
++++ b/adapter/inbound/manager.go
+@@ -6,6 +6,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -58,20 +59,18 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 
+ func (m *Manager) Close() error {
+ 	m.access.Lock()
+-	defer m.access.Unlock()
+-	if !m.started {
+-		return nil
+-	}
+ 	m.started = false
+ 	inbounds := m.inbounds
+ 	m.inbounds = nil
++	clear(m.inboundByTag)
++	m.access.Unlock()
+ 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+ 	var err error
+ 	for _, inbound := range inbounds {
+ 		name := "inbound/" + inbound.Type() + "[" + inbound.Tag() + "]"
+ 		done := adapter.LogElapsed(m.logger, "close ", name)
+ 		monitor.Start("close ", name)
+-		err = E.Append(err, inbound.Close(), func(err error) error {
++		err = E.Append(err, construction.Close(name, inbound.Close), func(err error) error {
+ 			return E.Cause(err, "close ", name)
+ 		})
+ 		monitor.Finish()
+@@ -111,16 +110,18 @@ func (m *Manager) Remove(tag string) error {
+ 		panic("invalid inbound index")
+ 	}
+ 	m.inbounds = append(m.inbounds[:index], m.inbounds[index+1:]...)
+-	started := m.started
+ 	m.access.Unlock()
+-	if started {
+-		return inbound.Close()
+-	}
+-	return nil
++	return construction.Close("removed inbound", inbound.Close)
+ }
+ 
+ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
+ 	inbound, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
++	owned := false
++	defer func() {
++		if !owned && inbound != nil {
++			construction.RecordError(ctx, construction.Close("unowned inbound", func() error { return common.Close(inbound) }))
++		}
++	}()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -138,11 +139,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		}
+ 	}
+ 	if existsInbound, loaded := m.inboundByTag[tag]; loaded {
+-		if m.started {
+-			err = existsInbound.Close()
+-			if err != nil {
+-				return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
+-			}
++		err = existsInbound.Close()
++		if err != nil {
++			return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
+ 		}
+ 		existsIndex := common.Index(m.inbounds, func(it adapter.Inbound) bool {
+ 			return it == existsInbound
+@@ -153,6 +152,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		m.inbounds = append(m.inbounds[:existsIndex], m.inbounds[existsIndex+1:]...)
+ 	}
+ 	m.inbounds = append(m.inbounds, inbound)
++	owned = true
+ 	m.inboundByTag[tag] = inbound
+ 	return nil
+ }
+diff --git a/adapter/inbound/manager_construction_test.go b/adapter/inbound/manager_construction_test.go
+new file mode 100644
+index 0000000..3422fd4
+--- /dev/null
++++ b/adapter/inbound/manager_construction_test.go
+@@ -0,0 +1,57 @@
++package inbound
++
++import (
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type constructionProbe struct {
++	adapter.Inbound
++	tag          string
++	closed       *int
++	panicOnClose bool
++	failure      error
++}
++
++func (p constructionProbe) Type() string { return "probe" }
++func (p constructionProbe) Tag() string  { return p.tag }
++func (p constructionProbe) Close() error {
++	*p.closed++
++	if p.panicOnClose {
++		panic("injected cleanup panic")
++	}
++	return p.failure
++}
++func TestConstructionCloseDrainsUnstartedChildrenAfterFailure(t *testing.T) {
++	failure := errors.New("injected cleanup failure")
++	counts := []int{0, 0, 0}
++	children := []adapter.Inbound{
++		constructionProbe{tag: "panic", closed: &counts[0], panicOnClose: true},
++		constructionProbe{tag: "error", closed: &counts[1], failure: failure},
++		constructionProbe{tag: "ok", closed: &counts[2]},
++	}
++	m := &Manager{logger: log.NewNOPFactory().Logger(), inbounds: children,
++		inboundByTag: map[string]adapter.Inbound{"panic": children[0], "error": children[1], "ok": children[2]},
++	}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d close count = %d", i, count)
++		}
++	}
++	if len(m.inbounds) != 0 || len(m.inboundByTag) != 0 {
++		t.Fatal("closed children retained")
++	}
++	if err := m.Close(); err != nil {
++		t.Fatalf("second close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d disposed twice", i)
++		}
++	}
++}
+diff --git a/adapter/outbound/manager.go b/adapter/outbound/manager.go
+index e4abba6..67715ef 100644
+--- a/adapter/outbound/manager.go
++++ b/adapter/outbound/manager.go
+@@ -8,6 +8,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -167,13 +168,10 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
+ func (m *Manager) Close() error {
+ 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+ 	m.access.Lock()
+-	if !m.started {
+-		m.access.Unlock()
+-		return nil
+-	}
+ 	m.started = false
+ 	outbounds := m.outbounds
+ 	m.outbounds = nil
++	clear(m.outboundByTag)
+ 	m.access.Unlock()
+ 	var err error
+ 	for _, outbound := range outbounds {
+@@ -181,7 +179,7 @@ func (m *Manager) Close() error {
+ 			name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+ 			done := adapter.LogElapsed(m.logger, "close ", name)
+ 			monitor.Start("close ", name)
+-			err = E.Append(err, closer.Close(), func(err error) error {
++			err = E.Append(err, construction.Close(name, closer.Close), func(err error) error {
+ 				return E.Cause(err, "close ", name)
+ 			})
+ 			monitor.Finish()
+@@ -228,7 +226,6 @@ func (m *Manager) Remove(tag string) error {
+ 		panic("invalid inbound index")
+ 	}
+ 	m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
+-	started := m.started
+ 	if m.defaultOutbound == outbound {
+ 		if len(m.outbounds) > 0 {
+ 			m.defaultOutbound = m.outbounds[0]
+@@ -251,10 +248,7 @@ func (m *Manager) Remove(tag string) error {
+ 			})
+ 		}
+ 	}
+-	if started {
+-		return common.Close(outbound)
+-	}
+-	return nil
++	return construction.Close("removed outbound", func() error { return common.Close(outbound) })
+ }
+ 
+ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
+@@ -262,6 +256,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		return os.ErrInvalid
+ 	}
+ 	outbound, err := m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
++	owned := false
++	defer func() {
++		if !owned && outbound != nil {
++			construction.RecordError(ctx, construction.Close("unowned outbound", func() error { return common.Close(outbound) }))
++		}
++	}()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -279,11 +279,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 	m.access.Lock()
+ 	defer m.access.Unlock()
+ 	if existsOutbound, loaded := m.outboundByTag[tag]; loaded {
+-		if m.started {
+-			err = common.Close(existsOutbound)
+-			if err != nil {
+-				return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
+-			}
++		err = common.Close(existsOutbound)
++		if err != nil {
++			return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
+ 		}
+ 		existsIndex := common.Index(m.outbounds, func(it adapter.Outbound) bool {
+ 			return it == existsOutbound
+@@ -294,6 +292,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
+ 	}
+ 	m.outbounds = append(m.outbounds, outbound)
++	owned = true
+ 	m.outboundByTag[tag] = outbound
+ 	dependencies := outbound.Dependencies()
+ 	for _, dependency := range dependencies {
+diff --git a/adapter/outbound/manager_construction_test.go b/adapter/outbound/manager_construction_test.go
+new file mode 100644
+index 0000000..7ec2acf
+--- /dev/null
++++ b/adapter/outbound/manager_construction_test.go
+@@ -0,0 +1,57 @@
++package outbound
++
++import (
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type constructionProbe struct {
++	adapter.Outbound
++	tag          string
++	closed       *int
++	panicOnClose bool
++	failure      error
++}
++
++func (p constructionProbe) Type() string { return "probe" }
++func (p constructionProbe) Tag() string  { return p.tag }
++func (p constructionProbe) Close() error {
++	*p.closed++
++	if p.panicOnClose {
++		panic("injected cleanup panic")
++	}
++	return p.failure
++}
++func TestConstructionCloseDrainsUnstartedChildrenAfterFailure(t *testing.T) {
++	failure := errors.New("injected cleanup failure")
++	counts := []int{0, 0, 0}
++	children := []adapter.Outbound{
++		constructionProbe{tag: "panic", closed: &counts[0], panicOnClose: true},
++		constructionProbe{tag: "error", closed: &counts[1], failure: failure},
++		constructionProbe{tag: "ok", closed: &counts[2]},
++	}
++	m := &Manager{logger: log.NewNOPFactory().Logger(), outbounds: children,
++		outboundByTag: map[string]adapter.Outbound{"panic": children[0], "error": children[1], "ok": children[2]},
++	}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d close count = %d", i, count)
++		}
++	}
++	if len(m.outbounds) != 0 || len(m.outboundByTag) != 0 {
++		t.Fatal("closed children retained")
++	}
++	if err := m.Close(); err != nil {
++		t.Fatalf("second close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d disposed twice", i)
++		}
++	}
++}
+diff --git a/adapter/service/manager.go b/adapter/service/manager.go
+index 9db1585..943dbad 100644
+--- a/adapter/service/manager.go
++++ b/adapter/service/manager.go
+@@ -6,6 +6,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -56,20 +57,18 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 
+ func (m *Manager) Close() error {
+ 	m.access.Lock()
+-	defer m.access.Unlock()
+-	if !m.started {
+-		return nil
+-	}
+ 	m.started = false
+ 	services := m.services
+ 	m.services = nil
++	clear(m.serviceByTag)
++	m.access.Unlock()
+ 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+ 	var err error
+ 	for _, service := range services {
+ 		name := "service/" + service.Type() + "[" + service.Tag() + "]"
+ 		done := adapter.LogElapsed(m.logger, "close ", name)
+ 		monitor.Start("close ", name)
+-		err = E.Append(err, service.Close(), func(err error) error {
++		err = E.Append(err, construction.Close(name, service.Close), func(err error) error {
+ 			return E.Cause(err, "close ", name)
+ 		})
+ 		monitor.Finish()
+@@ -106,16 +105,18 @@ func (m *Manager) Remove(tag string) error {
+ 		panic("invalid service index")
+ 	}
+ 	m.services = append(m.services[:index], m.services[index+1:]...)
+-	started := m.started
+ 	m.access.Unlock()
+-	if started {
+-		return service.Close()
+-	}
+-	return nil
++	return construction.Close("removed service", service.Close)
+ }
+ 
+ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
+ 	service, err := m.registry.Create(ctx, logger, tag, serviceType, options)
++	owned := false
++	defer func() {
++		if !owned && service != nil {
++			construction.RecordError(ctx, construction.Close("unowned service", func() error { return common.Close(service) }))
++		}
++	}()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -133,11 +134,9 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 		}
+ 	}
+ 	if existsService, loaded := m.serviceByTag[tag]; loaded {
+-		if m.started {
+-			err = existsService.Close()
+-			if err != nil {
+-				return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
+-			}
++		err = existsService.Close()
++		if err != nil {
++			return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
+ 		}
+ 		existsIndex := common.Index(m.services, func(it adapter.Service) bool {
+ 			return it == existsService
+@@ -148,6 +147,7 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 		m.services = append(m.services[:existsIndex], m.services[existsIndex+1:]...)
+ 	}
+ 	m.services = append(m.services, service)
++	owned = true
+ 	m.serviceByTag[tag] = service
+ 	return nil
+ }
+diff --git a/adapter/service/manager_construction_test.go b/adapter/service/manager_construction_test.go
+new file mode 100644
+index 0000000..356dcbe
+--- /dev/null
++++ b/adapter/service/manager_construction_test.go
+@@ -0,0 +1,57 @@
++package service
++
++import (
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type constructionProbe struct {
++	adapter.Service
++	tag          string
++	closed       *int
++	panicOnClose bool
++	failure      error
++}
++
++func (p constructionProbe) Type() string { return "probe" }
++func (p constructionProbe) Tag() string  { return p.tag }
++func (p constructionProbe) Close() error {
++	*p.closed++
++	if p.panicOnClose {
++		panic("injected cleanup panic")
++	}
++	return p.failure
++}
++func TestConstructionCloseDrainsUnstartedChildrenAfterFailure(t *testing.T) {
++	failure := errors.New("injected cleanup failure")
++	counts := []int{0, 0, 0}
++	children := []adapter.Service{
++		constructionProbe{tag: "panic", closed: &counts[0], panicOnClose: true},
++		constructionProbe{tag: "error", closed: &counts[1], failure: failure},
++		constructionProbe{tag: "ok", closed: &counts[2]},
++	}
++	m := &Manager{logger: log.NewNOPFactory().Logger(), services: children,
++		serviceByTag: map[string]adapter.Service{"panic": children[0], "error": children[1], "ok": children[2]},
++	}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d close count = %d", i, count)
++		}
++	}
++	if len(m.services) != 0 || len(m.serviceByTag) != 0 {
++		t.Fatal("closed children retained")
++	}
++	if err := m.Close(); err != nil {
++		t.Fatalf("second close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d disposed twice", i)
++		}
++	}
++}
+diff --git a/box.go b/box.go
+index 13e86d6..8c611b3 100644
+--- a/box.go
++++ b/box.go
+@@ -17,6 +17,7 @@ import (
+ 	"github.com/sagernet/sing-box/adapter/outbound"
+ 	boxService "github.com/sagernet/sing-box/adapter/service"
+ 	"github.com/sagernet/sing-box/common/certificate"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/dialer"
+ 	"github.com/sagernet/sing-box/common/httpclient"
+ 	"github.com/sagernet/sing-box/common/netns"
+@@ -68,6 +69,7 @@ type Box struct {
+ 	closeStarted        atomic.Bool
+ 	closeFinished       chan struct{}
+ 	closeResult         error
++	constructionCancel  context.CancelFunc
+ }
+ 
+ type Options struct {
+@@ -116,12 +118,49 @@ func Context(
+ 	return ctx
+ }
+ 
++// ConstructionReport reports observed rollback only. It deliberately carries no
++// exact-disposal assertion: registry constructors and background tasks remain
++// outside a complete, reviewed construction audit.
++type ConstructionReport struct {
++	Attempted    bool
++	CleanupError error
++}
++
+ func New(options Options) (*Box, error) {
++	instance, err, _ := NewWithConstructionReport(options)
++	return instance, err
++}
++
++func NewWithConstructionReport(options Options) (instance *Box, err error, report ConstructionReport) {
++	var scope construction.Scope
++	ctx := options.Context
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	ctx, cancel := context.WithCancel(ctx)
++	options.Context = construction.WithScope(ctx, &scope)
++	defer func() {
++		if instance == nil {
++			cancel()
++			report.CleanupError = scope.Close()
++		} else {
++			instance.constructionCancel = cancel
++			scope.TransferAll()
++		}
++	}()
++	instance, err = newBox(options, &scope, &report)
++	return
++}
++
++func newBox(options Options, scope *construction.Scope, report *ConstructionReport) (*Box, error) {
+ 	createdAt := time.Now()
+ 	ctx := options.Context
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	ctx = service.ContextWithDefaultRegistry(ctx)
+ 
+ 	endpointRegistry := service.FromContext[adapter.EndpointRegistry](ctx)
+@@ -180,6 +219,7 @@ func New(options Options) (*Box, error) {
+ 	if platformInterface != nil {
+ 		defaultLogWriter = io.Discard
+ 	}
++	report.Attempted = true
+ 	logFactory, err := log.New(log.Options{
+ 		Context:        ctx,
+ 		Options:        common.PtrValueOrDefault(options.Log),
+@@ -191,6 +231,7 @@ func New(options Options) (*Box, error) {
+ 	if err != nil {
+ 		return nil, E.Cause(err, "create log factory")
+ 	}
++	scope.Add("logger", logFactory.Close)
+ 	service.MustRegister[log.Factory](ctx, logFactory)
+ 
+ 	var internalServices []adapter.LifecycleService
+@@ -204,6 +245,7 @@ func New(options Options) (*Box, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		scope.Add("certificate store", certificateStore.Close)
+ 		service.MustRegister[adapter.CertificateStore](ctx, certificateStore)
+ 		internalServices = append(internalServices, certificateStore)
+ 	}
+@@ -211,6 +253,7 @@ func New(options Options) (*Box, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	scope.Add("network namespace manager", netnsManager.Close)
+ 	service.MustRegister[adapter.NetworkNamespaceManager](ctx, netnsManager)
+ 	internalServices = append(internalServices, netnsManager)
+ 	dnsOptions := common.PtrValueOrDefault(options.DNS)
+@@ -220,6 +263,12 @@ func New(options Options) (*Box, error) {
+ 	dnsTransportManager := dns.NewTransportManager(logFactory.NewLogger("dns/transport"), dnsTransportRegistry, outboundManager, dnsOptions.Final)
+ 	serviceManager := boxService.NewManager(logFactory.NewLogger("service"), serviceRegistry)
+ 	certificateProviderManager := boxCertificate.NewManager(logFactory.NewLogger("certificate-provider"), certificateProviderRegistry)
++	scope.Add("endpoint manager", endpointManager.Close)
++	scope.Add("inbound manager", inboundManager.Close)
++	scope.Add("outbound manager", outboundManager.Close)
++	scope.Add("DNS transport manager", dnsTransportManager.Close)
++	scope.Add("service manager", serviceManager.Close)
++	scope.Add("certificate provider manager", certificateProviderManager.Close)
+ 	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
+ 	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
+ 	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
+@@ -230,20 +279,25 @@ func New(options Options) (*Box, error) {
+ 	if err != nil {
+ 		return nil, E.Cause(err, "initialize DNS router")
+ 	}
++	scope.Add("DNS router", dnsRouter.Close)
+ 	service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
+ 	service.MustRegister[adapter.DNSRuleSetUpdateValidator](ctx, dnsRouter)
+ 	connectionManager := route.NewConnectionManager(logFactory.NewLogger("connection"))
++	scope.Add("connection manager", connectionManager.Close)
+ 	service.MustRegister[adapter.ConnectionManager](ctx, connectionManager)
+ 	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions, dnsOptions)
+ 	if err != nil {
+ 		return nil, E.Cause(err, "initialize network manager")
+ 	}
++	scope.Add("network manager", networkManager.Close)
+ 	service.MustRegister[adapter.NetworkManager](ctx, networkManager)
+ 	// Must register after ConnectionManager: the Apple HTTP engine's proxy bridge reads it from the context when Manager.Start resolves the default client.
+ 	httpClientManager := httpclient.NewManager(ctx, logFactory.NewLogger("httpclient"), options.HTTPClients, routeOptions.DefaultHTTPClient)
++	scope.Add("HTTP client manager", httpClientManager.Close)
+ 	service.MustRegister[adapter.HTTPClientManager](ctx, httpClientManager)
+ 	httpClientService := adapter.LifecycleService(httpClientManager)
+ 	router := route.NewRouter(ctx, logFactory, routeOptions, dnsOptions)
++	scope.Add("router", router.Close)
+ 	service.MustRegister[adapter.Router](ctx, router)
+ 	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
+ 	if err != nil {
+@@ -251,6 +305,7 @@ func New(options Options) (*Box, error) {
+ 	}
+ 	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
+ 		trafficManager := trafficcontrol.NewManager()
++		scope.Add("traffic manager", trafficManager.Close)
+ 		service.MustRegisterPtr(ctx, trafficManager)
+ 		router.AppendTracker(trafficManager)
+ 		internalServices = append(internalServices, trafficManager)
+@@ -259,10 +314,12 @@ func New(options Options) (*Box, error) {
+ 			clashDefaultMode = experimentalOptions.ClashAPI.DefaultMode
+ 		}
+ 		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
++		scope.Add("clash mode", clashMode.Close)
+ 		service.MustRegisterPtr(ctx, clashMode)
+ 		internalServices = append(internalServices, clashMode)
+ 	}
+ 	referenceManager := route.NewReferenceManager(ctx, logFactory.NewLogger("reference"), options.Options)
++	scope.Add("reference manager", referenceManager.Close)
+ 	internalServices = append(internalServices, referenceManager)
+ 	ntpOptions := common.PtrValueOrDefault(options.NTP)
+ 	var timeService *tls.TimeServiceWrapper
+@@ -271,6 +328,9 @@ func New(options Options) (*Box, error) {
+ 		service.MustRegister[ntp.TimeService](ctx, timeService)
+ 	}
+ 	for i, transportOptions := range dnsOptions.Servers {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		var tag string
+ 		if transportOptions.Tag != "" {
+ 			tag = transportOptions.Tag
+@@ -293,6 +353,9 @@ func New(options Options) (*Box, error) {
+ 		return nil, E.Cause(err, "initialize dns router")
+ 	}
+ 	for i, endpointOptions := range options.Endpoints {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		var tag string
+ 		if endpointOptions.Tag != "" {
+ 			tag = endpointOptions.Tag
+@@ -319,6 +382,9 @@ func New(options Options) (*Box, error) {
+ 		}
+ 	}
+ 	for i, inboundOptions := range options.Inbounds {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		var tag string
+ 		if inboundOptions.Tag != "" {
+ 			tag = inboundOptions.Tag
+@@ -338,6 +404,9 @@ func New(options Options) (*Box, error) {
+ 		}
+ 	}
+ 	for i, serviceOptions := range options.Services {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		var tag string
+ 		if serviceOptions.Tag != "" {
+ 			tag = serviceOptions.Tag
+@@ -356,6 +425,9 @@ func New(options Options) (*Box, error) {
+ 		}
+ 	}
+ 	for i, outboundOptions := range options.Outbounds {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		var tag string
+ 		if outboundOptions.Tag != "" {
+ 			tag = outboundOptions.Tag
+@@ -382,6 +454,9 @@ func New(options Options) (*Box, error) {
+ 		}
+ 	}
+ 	for i, certificateProviderOptions := range options.CertificateProviders {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		var tag string
+ 		if certificateProviderOptions.Tag != "" {
+ 			tag = certificateProviderOptions.Tag
+@@ -431,6 +506,7 @@ func New(options Options) (*Box, error) {
+ 	}
+ 	if needCacheFile {
+ 		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
++		scope.Add("cache file", cacheFile.Close)
+ 		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
+ 		internalServices = append(internalServices, cacheFile)
+ 	}
+@@ -439,6 +515,7 @@ func New(options Options) (*Box, error) {
+ 		if err != nil {
+ 			return nil, E.Cause(err, "create clash-server")
+ 		}
++		scope.Add("clash server", clashServer.Close)
+ 		internalServices = append(internalServices, clashServer)
+ 	}
+ 	if needV2RayAPI {
+@@ -446,6 +523,7 @@ func New(options Options) (*Box, error) {
+ 		if err != nil {
+ 			return nil, E.Cause(err, "create v2ray-server")
+ 		}
++		scope.Add("v2ray server", v2rayServer.Close)
+ 		if v2rayServer.StatsService() != nil {
+ 			router.AppendTracker(v2rayServer.StatsService())
+ 			internalServices = append(internalServices, v2rayServer)
+@@ -471,9 +549,13 @@ func New(options Options) (*Box, error) {
+ 			Interval:      time.Duration(ntpOptions.Interval),
+ 			WriteToSystem: ntpOptions.WriteToSystem,
+ 		})
++		scope.Add("NTP service", ntpService.Close)
+ 		timeService.TimeService = ntpService
+ 		internalServices = append(internalServices, adapter.NewLifecycleService(ntpService, "ntp service"))
+ 	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	return &Box{
+ 		ctx:                 ctx,
+ 		network:             networkManager,
+@@ -638,6 +720,9 @@ func (s *Box) finishClose() error {
+ }
+ 
+ func (s *Box) close() error {
++	if s.constructionCancel != nil {
++		s.constructionCancel()
++	}
+ 	close(s.done)
+ 	var err error
+ 	if s.debugHTTPServer != nil {
+@@ -662,7 +747,7 @@ func (s *Box) close() error {
+ 		{"network", s.network},
+ 	} {
+ 		done := adapter.LogElapsed(s.logger, "close ", closeItem.name)
+-		err = E.Append(err, closeItem.service.Close(), func(err error) error {
++		err = E.Append(err, construction.Close(closeItem.name, closeItem.service.Close), func(err error) error {
+ 			return E.Cause(err, "close ", closeItem.name)
+ 		})
+ 		done()
+@@ -670,20 +755,20 @@ func (s *Box) close() error {
+ 	if s.httpClientService != nil {
+ 		s.logger.Trace("close ", s.httpClientService.Name())
+ 		startTime := time.Now()
+-		err = E.Append(err, s.httpClientService.Close(), func(err error) error {
++		err = E.Append(err, construction.Close(s.httpClientService.Name(), s.httpClientService.Close), func(err error) error {
+ 			return E.Cause(err, "close ", s.httpClientService.Name())
+ 		})
+ 		s.logger.Trace("close ", s.httpClientService.Name(), " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
+ 	}
+ 	for _, lifecycleService := range s.internalService {
+ 		done := adapter.LogElapsed(s.logger, "close ", lifecycleService.Name())
+-		err = E.Append(err, lifecycleService.Close(), func(err error) error {
++		err = E.Append(err, construction.Close(lifecycleService.Name(), lifecycleService.Close), func(err error) error {
+ 			return E.Cause(err, "close ", lifecycleService.Name())
+ 		})
+ 		done()
+ 	}
+ 	done := adapter.LogElapsed(s.logger, "close logger")
+-	err = E.Append(err, s.logFactory.Close(), func(err error) error {
++	err = E.Append(err, construction.Close("logger", s.logFactory.Close), func(err error) error {
+ 		return E.Cause(err, "close logger")
+ 	})
+ 	done()
+diff --git a/box_construction_test.go b/box_construction_test.go
+new file mode 100644
+index 0000000..1916f83
+--- /dev/null
++++ b/box_construction_test.go
+@@ -0,0 +1,155 @@
++package box
++
++import (
++	"context"
++	"errors"
++	"strconv"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	boxCertificate "github.com/sagernet/sing-box/adapter/certificate"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++)
++
++type constructedService struct {
++	adapter.Service
++	tag          string
++	closed       *int
++	cleanupError error
++}
++
++func (s *constructedService) Type() string { return "construction-probe" }
++func (s *constructedService) Tag() string  { return s.tag }
++func (s *constructedService) Close() error { *s.closed++; return s.cleanupError }
++
++func TestNewRollbackAtEveryServiceConstructor(t *testing.T) {
++	for nth := 0; nth < 4; nth++ {
++		t.Run(strconv.Itoa(nth), func(t *testing.T) {
++			failure := errors.New("injected constructor failure")
++			cleanupFailure := errors.New("injected internal cleanup failure")
++			closed := make([]int, 4)
++			internalClosed := 0
++			registry := boxService.NewRegistry()
++			index := 0
++			boxService.Register[struct{}](registry, "construction-probe", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.Service, error) {
++				current := index
++				index++
++				child := &constructedService{tag: tag, closed: &closed[current]}
++				if current == nth {
++					// Model an internal acquire followed by nil/error, and a
++					// constructor returning both its partial object and error.
++					construction.Register(ctx, "internal probe", func() error { internalClosed++; return cleanupFailure })
++					return child, failure
++				}
++				return child, nil
++			})
++			ctx := Context(context.Background(), inbound.NewRegistry(), outbound.NewRegistry(), endpoint.NewRegistry(), dns.NewTransportRegistry(), registry, boxCertificate.NewRegistry())
++			options := option.Options{Log: &option.LogOptions{Disabled: true}}
++			for i := 0; i < 4; i++ {
++				options.Services = append(options.Services, option.Service{Type: "construction-probe", Tag: strconv.Itoa(i)})
++			}
++			instance, err, report := NewWithConstructionReport(Options{Context: ctx, Options: options})
++			if instance != nil || !errors.Is(err, failure) {
++				t.Fatalf("New = %v, %v", instance, err)
++			}
++			if err.Error() != "initialize service["+strconv.Itoa(nth)+"]: injected constructor failure" {
++				t.Fatalf("config error changed: %v", err)
++			}
++			if !report.Attempted || !errors.Is(report.CleanupError, cleanupFailure) {
++				t.Fatalf("report = %+v", report)
++			}
++			for i := 0; i < 4; i++ {
++				want := 0
++				if i <= nth {
++					want = 1
++				}
++				if closed[i] != want {
++					t.Fatalf("child %d close = %d, want %d", i, closed[i], want)
++				}
++			}
++			if internalClosed != 1 {
++				t.Fatalf("internal close = %d", internalClosed)
++			}
++		})
++	}
++}
++
++func TestNewTransfersCompleteUnstartedConstruction(t *testing.T) {
++	closed := 0
++	registry := boxService.NewRegistry()
++	boxService.Register[struct{}](registry, "construction-probe", func(_ context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.Service, error) {
++		return &constructedService{tag: tag, closed: &closed}, nil
++	})
++	ctx := Context(context.Background(), inbound.NewRegistry(), outbound.NewRegistry(), endpoint.NewRegistry(), dns.NewTransportRegistry(), registry, boxCertificate.NewRegistry())
++	instance, err := New(Options{Context: ctx, Options: option.Options{Log: &option.LogOptions{Disabled: true}, Services: []option.Service{{Type: "construction-probe", Tag: "one"}}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if closed != 0 {
++		t.Fatal("resource closed before ownership transfer")
++	}
++	if err = instance.CloseWithResult(); err != nil {
++		t.Fatal(err)
++	}
++	if closed != 1 {
++		t.Fatalf("unstarted child close = %d", closed)
++	}
++	if err = instance.CloseWithResult(); err != nil {
++		t.Fatal(err)
++	}
++	if closed != 1 {
++		t.Fatal("resource closed twice")
++	}
++}
++
++func TestNewRollbackAfterCancellationOrConstructorPanic(t *testing.T) {
++	for _, panicConstructor := range []bool{false, true} {
++		t.Run(strconv.FormatBool(panicConstructor), func(t *testing.T) {
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			closed := 0
++			registry := boxService.NewRegistry()
++			index := 0
++			boxService.Register[struct{}](registry, "construction-probe", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.Service, error) {
++				index++
++				if index == 2 {
++					if panicConstructor {
++						panic("injected construction panic")
++					}
++					cancel()
++				}
++				return &constructedService{tag: tag, closed: &closed}, nil
++			})
++			ctx = Context(ctx, inbound.NewRegistry(), outbound.NewRegistry(), endpoint.NewRegistry(), dns.NewTransportRegistry(), registry, boxCertificate.NewRegistry())
++			options := Options{Context: ctx, Options: option.Options{Log: &option.LogOptions{Disabled: true}, Services: []option.Service{{Type: "construction-probe", Tag: "first"}, {Type: "construction-probe", Tag: "second"}, {Type: "construction-probe", Tag: "never"}}}}
++			if panicConstructor {
++				func() {
++					defer func() {
++						if recover() == nil {
++							t.Fatal("constructor panic disappeared")
++						}
++					}()
++					New(options)
++				}()
++				if closed != 1 {
++					t.Fatalf("panic rollback closed %d children", closed)
++				}
++			} else {
++				instance, err := New(options)
++				if instance != nil || !errors.Is(err, context.Canceled) {
++					t.Fatalf("canceled New = %v, %v", instance, err)
++				}
++				if closed != 2 || index != 2 {
++					t.Fatalf("cancellation closed %d children, entered %d constructors", closed, index)
++				}
++			}
++		})
++	}
++}
+diff --git a/common/certificate/store.go b/common/certificate/store.go
+index 34871a6..7ff2f7b 100644
+--- a/common/certificate/store.go
++++ b/common/certificate/store.go
+@@ -12,6 +12,7 @@ import (
+ 
+ 	"github.com/sagernet/fswatch"
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -69,6 +70,12 @@ func NewStore(ctx context.Context, logger logger.Logger, options option.Certific
+ 		certificatePaths:          options.CertificatePath,
+ 		certificateDirectoryPaths: options.CertificateDirectoryPath,
+ 	}
++	owned := false
++	defer func() {
++		if !owned {
++			construction.RecordError(ctx, construction.Close("partial certificate store", store.Close))
++		}
++	}()
+ 	var watchPaths []string
+ 	for _, target := range options.CertificatePath {
+ 		watchPaths = append(watchPaths, target)
+@@ -96,6 +103,7 @@ func NewStore(ctx context.Context, logger logger.Logger, options option.Certific
+ 	if err != nil {
+ 		return nil, E.Cause(err, "initializing certificate store")
+ 	}
++	owned = true
+ 	return store, nil
+ }
+ 
+diff --git a/common/construction/scope.go b/common/construction/scope.go
+new file mode 100644
+index 0000000..5f08bab
+--- /dev/null
++++ b/common/construction/scope.go
+@@ -0,0 +1,93 @@
++// Package construction tracks resources acquired before a lifecycle owner exists.
++// Completing this stack is cleanup evidence, not proof of a complete resource audit.
++package construction
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++)
++
++type Scope struct {
++	access  sync.Mutex
++	entries []*Ownership
++	errors  []error
++}
++
++type Ownership struct {
++	name    string
++	cleanup func() error
++}
++
++type contextKey struct{}
++
++func WithScope(ctx context.Context, scope *Scope) context.Context {
++	return context.WithValue(ctx, contextKey{}, scope)
++}
++
++// Register must follow the first successful acquire, before another operation
++// can fail. Transfer when a parent assumes responsibility for that resource.
++func Register(ctx context.Context, name string, cleanup func() error) *Ownership {
++	scope, _ := ctx.Value(contextKey{}).(*Scope)
++	if scope == nil {
++		return &Ownership{}
++	}
++	return scope.Add(name, cleanup)
++}
++
++func (s *Scope) Add(name string, cleanup func() error) *Ownership {
++	entry := &Ownership{name: name, cleanup: cleanup}
++	s.access.Lock()
++	s.entries = append(s.entries, entry)
++	s.access.Unlock()
++	return entry
++}
++
++// Transfer is only called by the synchronous construction owner, before Close.
++func (o *Ownership) Transfer() { o.cleanup = nil }
++
++func RecordError(ctx context.Context, err error) {
++	if err == nil || ctx == nil {
++		return
++	}
++	if scope, _ := ctx.Value(contextKey{}).(*Scope); scope != nil {
++		scope.access.Lock()
++		scope.errors = append(scope.errors, err)
++		scope.access.Unlock()
++	}
++}
++
++// Close keeps draining the stack after an error or a cleanup panic. A blocking
++// callback still owns the stack; cancellation alone never proves quiescence.
++func (s *Scope) Close() error {
++	s.access.Lock()
++	entries, errs := s.entries, s.errors
++	s.entries, s.errors = nil, nil
++	s.access.Unlock()
++	for i := len(entries) - 1; i >= 0; i-- {
++		if entries[i].cleanup != nil {
++			errs = append(errs, Close(entries[i].name, entries[i].cleanup))
++		}
++	}
++	return errors.Join(errs...)
++}
++
++// TransferAll hands the registered top-level resources to the completed Box.
++func (s *Scope) TransferAll() {
++	s.access.Lock()
++	s.entries = nil
++	s.access.Unlock()
++}
++
++func Close(name string, cleanup func() error) (err error) {
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			err = fmt.Errorf("close %s panicked: %v", name, recovered)
++		}
++	}()
++	if err = cleanup(); err != nil {
++		return fmt.Errorf("close %s: %w", name, err)
++	}
++	return nil
++}
+diff --git a/common/construction/scope_test.go b/common/construction/scope_test.go
+new file mode 100644
+index 0000000..8479a29
+--- /dev/null
++++ b/common/construction/scope_test.go
+@@ -0,0 +1,47 @@
++package construction
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"testing"
++)
++
++func TestRollbackOrderTransferAndErrorContinuation(t *testing.T) {
++	var scope Scope
++	ctx := WithScope(context.Background(), &scope)
++	var closed []string
++	failure := errors.New("injected close error")
++	Register(ctx, "first", func() error { closed = append(closed, "first"); return nil })
++	Register(ctx, "parent-owned", func() error { t.Fatal("transferred resource closed"); return nil }).Transfer()
++	Register(ctx, "error", func() error { closed = append(closed, "error"); return failure })
++	Register(ctx, "panic", func() error { closed = append(closed, "panic"); panic("injected") })
++	if err := scope.Close(); !errors.Is(err, failure) {
++		t.Fatalf("rollback = %v", err)
++	}
++	if !reflect.DeepEqual(closed, []string{"panic", "error", "first"}) {
++		t.Fatal(closed)
++	}
++	if err := scope.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestPartialConstructorInternalAcquisition(t *testing.T) {
++	var scope Scope
++	ctx := WithScope(context.Background(), &scope)
++	closed := 0
++	constructor := func() error {
++		Register(ctx, "internal handle", func() error { closed++; return nil })
++		return errors.New("failure after first acquire")
++	}
++	if err := constructor(); err == nil {
++		t.Fatal("fault missing")
++	}
++	if err := scope.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if closed != 1 {
++		t.Fatalf("internal close count = %d", closed)
++	}
++}
+diff --git a/dns/manager_construction_test.go b/dns/manager_construction_test.go
+new file mode 100644
+index 0000000..ded53c5
+--- /dev/null
++++ b/dns/manager_construction_test.go
+@@ -0,0 +1,57 @@
++package dns
++
++import (
++	"errors"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++)
++
++type constructionProbe struct {
++	adapter.DNSTransport
++	tag          string
++	closed       *int
++	panicOnClose bool
++	failure      error
++}
++
++func (p constructionProbe) Type() string { return "probe" }
++func (p constructionProbe) Tag() string  { return p.tag }
++func (p constructionProbe) Close() error {
++	*p.closed++
++	if p.panicOnClose {
++		panic("injected cleanup panic")
++	}
++	return p.failure
++}
++func TestConstructionCloseDrainsUnstartedChildrenAfterFailure(t *testing.T) {
++	failure := errors.New("injected cleanup failure")
++	counts := []int{0, 0, 0}
++	children := []adapter.DNSTransport{
++		constructionProbe{tag: "panic", closed: &counts[0], panicOnClose: true},
++		constructionProbe{tag: "error", closed: &counts[1], failure: failure},
++		constructionProbe{tag: "ok", closed: &counts[2]},
++	}
++	m := &TransportManager{logger: log.NewNOPFactory().Logger(), transports: children,
++		transportByTag: map[string]adapter.DNSTransport{"panic": children[0], "error": children[1], "ok": children[2]},
++	}
++	if err := m.Close(); !errors.Is(err, failure) {
++		t.Fatalf("close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d close count = %d", i, count)
++		}
++	}
++	if len(m.transports) != 0 || len(m.transportByTag) != 0 {
++		t.Fatal("closed children retained")
++	}
++	if err := m.Close(); err != nil {
++		t.Fatalf("second close = %v", err)
++	}
++	for i, count := range counts {
++		if count != 1 {
++			t.Fatalf("child %d disposed twice", i)
++		}
++	}
++}
+diff --git a/dns/transport_manager.go b/dns/transport_manager.go
+index e822231..ce872b5 100644
+--- a/dns/transport_manager.go
++++ b/dns/transport_manager.go
+@@ -8,6 +8,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/log"
+@@ -147,19 +148,16 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
+ func (m *TransportManager) Close() error {
+ 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
+ 	m.access.Lock()
+-	if !m.started {
+-		m.access.Unlock()
+-		return nil
+-	}
+ 	m.started = false
+ 	transports := m.transports
+ 	m.transports = nil
++	clear(m.transportByTag)
+ 	m.access.Unlock()
+ 	var err error
+ 	for _, transport := range transports {
+ 		if closer, isCloser := transport.(io.Closer); isCloser {
+ 			monitor.Start("close server/", transport.Type(), "[", transport.Tag(), "]")
+-			err = E.Append(err, closer.Close(), func(err error) error {
++			err = E.Append(err, construction.Close("dns transport", closer.Close), func(err error) error {
+ 				return E.Cause(err, "close server/", transport.Type(), "[", transport.Tag(), "]")
+ 			})
+ 			monitor.Finish()
+@@ -208,7 +206,6 @@ func (m *TransportManager) Remove(tag string) error {
+ 		panic("invalid inbound index")
+ 	}
+ 	m.transports = append(m.transports[:index], m.transports[index+1:]...)
+-	started := m.started
+ 	if m.defaultTransport == transport {
+ 		if len(m.transports) > 0 {
+ 			nextTransport := m.transports[0]
+@@ -235,10 +232,7 @@ func (m *TransportManager) Remove(tag string) error {
+ 			})
+ 		}
+ 	}
+-	if started {
+-		transport.Close()
+-	}
+-	return nil
++	return construction.Close("removed transport", transport.Close)
+ }
+ 
+ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger, tag string, transportType string, options any) error {
+@@ -246,6 +240,12 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+ 		return os.ErrInvalid
+ 	}
+ 	transport, err := m.registry.CreateDNSTransport(ctx, logger, tag, transportType, options)
++	owned := false
++	defer func() {
++		if !owned && transport != nil {
++			construction.RecordError(ctx, construction.Close("unowned transport", func() error { return common.Close(transport) }))
++		}
++	}()
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -260,11 +260,9 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+ 		}
+ 	}
+ 	if existsTransport, loaded := m.transportByTag[tag]; loaded {
+-		if m.started {
+-			err = common.Close(existsTransport)
+-			if err != nil {
+-				return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
+-			}
++		err = common.Close(existsTransport)
++		if err != nil {
++			return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
+ 		}
+ 		existsIndex := common.Index(m.transports, func(it adapter.DNSTransport) bool {
+ 			return it == existsTransport
+@@ -275,6 +273,7 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+ 		m.transports = append(m.transports[:existsIndex], m.transports[existsIndex+1:]...)
+ 	}
+ 	m.transports = append(m.transports, transport)
++	owned = true
+ 	m.transportByTag[tag] = transport
+ 	dependencies := transport.Dependencies()
+ 	for _, dependency := range dependencies {
+diff --git a/experimental/libbox/config.go b/experimental/libbox/config.go
+index 14c693e..4dca5bd 100644
+--- a/experimental/libbox/config.go
++++ b/experimental/libbox/config.go
+@@ -22,7 +22,6 @@ import (
+ 	"github.com/sagernet/sing/common/json"
+ 	"github.com/sagernet/sing/common/logger"
+ 	"github.com/sagernet/sing/common/x/list"
+-	"github.com/sagernet/sing/service"
+ 	"github.com/sagernet/sing/service/filemanager"
+ )
+ 
+@@ -54,17 +53,11 @@ func CheckConfig(configContent string) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	ctx, cancel := context.WithCancel(ctx)
+-	defer cancel()
+-	ctx = service.ContextWith[adapter.PlatformInterface](ctx, (*platformInterfaceStub)(nil))
+-	instance, err := box.New(box.Options{
+-		Context: ctx,
+-		Options: options,
+-	})
+-	if err == nil {
+-		instance.Close()
++	validationErr, cleanupErr := constructAndDisposeConfig(ctx, options)
++	if validationErr != nil {
++		return validationErr
+ 	}
+-	return err
++	return cleanupErr
+ }
+ 
+ type platformInterfaceStub struct{}
+diff --git a/experimental/libbox/config_validation.go b/experimental/libbox/config_validation.go
+new file mode 100644
+index 0000000..3f8c4a7
+--- /dev/null
++++ b/experimental/libbox/config_validation.go
+@@ -0,0 +1,127 @@
++package libbox
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"time"
++
++	box "github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service"
++)
++
++const ConfigValidationContractVersion = "polaris-validation-v1"
++
++// ConfigValidationResult separates config admission from cleanup evidence.
++// SHA-256 covers the exact UTF-8 config bytes passed to this call. A caller must
++// match all binding fields and recognized enums before consuming any evidence.
++// DisposedExact is reserved; this version never emits it for constructed boxes.
++type ConfigValidationResult struct {
++	requestID       string
++	configDigest    string
++	contractVersion string
++	validation      string
++	cleanup         string
++	validationError string
++	cleanupError    string
++}
++
++func (r *ConfigValidationResult) GetRequestID() string       { return r.requestID }
++func (r *ConfigValidationResult) GetConfigDigest() string    { return r.configDigest }
++func (r *ConfigValidationResult) GetContractVersion() string { return r.contractVersion }
++func (r *ConfigValidationResult) GetValidation() string      { return r.validation }
++func (r *ConfigValidationResult) GetCleanup() string         { return r.cleanup }
++func (r *ConfigValidationResult) GetValidationError() string { return r.validationError }
++func (r *ConfigValidationResult) GetCleanupError() string    { return r.cleanupError }
++
++// CheckConfigWithResult constructs and disposes without PreStart or Start.
++// timeoutMillis must be in [1, 60000]. Timeout cancels construction but returns
++// CleanupUnknown while its worker continues rollback/close. This API has no late
++// callback and never upgrades the returned receipt; late work retains its own
++// original request binding. Native completion alone is not a disposal proof.
++func CheckConfigWithResult(configContent string, requestID string, timeoutMillis int64) *ConfigValidationResult {
++	return checkConfigWithResult(configContent, requestID, timeoutMillis, constructAndDisposeConfig)
++}
++
++type configConstructor func(context.Context, option.Options) (error, error)
++
++func checkConfigWithResult(configContent string, requestID string, timeoutMillis int64, construct configConstructor) *ConfigValidationResult {
++	digest := sha256.Sum256([]byte(configContent))
++	binding := ConfigValidationResult{
++		requestID:       requestID,
++		configDigest:    hex.EncodeToString(digest[:]),
++		contractVersion: ConfigValidationContractVersion,
++		validation:      "InternalFailure",
++		cleanup:         "NoConstruction",
++	}
++	if requestID == "" || timeoutMillis < 1 || timeoutMillis > 60000 {
++		binding.validationError = "invalid validation request binding or timeout"
++		return &binding
++	}
++	ctx, cancel := context.WithTimeout(baseContext(nil), time.Duration(timeoutMillis)*time.Millisecond)
++	defer cancel()
++	completed := make(chan ConfigValidationResult, 1)
++	go func(result ConfigValidationResult) {
++		defer func() {
++			if recovered := recover(); recovered != nil {
++				result.validation = "InternalFailure"
++				result.cleanup = "CleanupUnknown"
++				result.validationError = fmt.Sprintf("validation panicked: %v", recovered)
++			}
++			completed <- result
++		}()
++		options, err := parseConfig(ctx, configContent)
++		if err != nil {
++			result.validation = "Rejected"
++			result.validationError = err.Error()
++			return
++		}
++		if ctx.Err() != nil {
++			result.validationError = ctx.Err().Error()
++			return
++		}
++		// All construction branches remain unknown until acquire/error/async
++		// paths of every enabled constructor have a reviewed disposal proof.
++		result.cleanup = "CleanupUnknown"
++		validationErr, cleanupErr := construct(ctx, options)
++		if validationErr != nil {
++			result.validation = "Rejected"
++			result.validationError = validationErr.Error()
++		} else {
++			result.validation = "Accepted"
++		}
++		if cleanupErr != nil {
++			result.cleanupError = cleanupErr.Error()
++		}
++		if ctx.Err() != nil {
++			result.validation = "InternalFailure"
++			result.validationError = ctx.Err().Error()
++		}
++	}(binding)
++	select {
++	case result := <-completed:
++		return &result
++	case <-ctx.Done():
++		// Do not read the worker's mutable state, infer quiescence from cancel,
++		// or let its eventual completion mutate this immutable receipt.
++		binding.cleanup = "CleanupUnknown"
++		binding.validationError = ctx.Err().Error()
++		binding.cleanupError = "construction or disposal completion is unobserved"
++		return &binding
++	}
++}
++
++func constructAndDisposeConfig(ctx context.Context, options option.Options) (error, error) {
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	ctx = service.ContextWith[adapter.PlatformInterface](ctx, (*platformInterfaceStub)(nil))
++	instance, validationErr, report := box.NewWithConstructionReport(box.Options{Context: ctx, Options: options})
++	cancel()
++	if validationErr != nil {
++		return validationErr, report.CleanupError
++	}
++	return nil, instance.CloseWithResult()
++}
+diff --git a/experimental/libbox/config_validation_test.go b/experimental/libbox/config_validation_test.go
+new file mode 100644
+index 0000000..29dad87
+--- /dev/null
++++ b/experimental/libbox/config_validation_test.go
+@@ -0,0 +1,109 @@
++package libbox
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++)
++
++func TestValidationParseRejectHasNoConstruction(t *testing.T) {
++	config := "{ malformed 中文"
++	result := checkConfigWithResult(config, "request-parse", 1000, func(context.Context, option.Options) (error, error) {
++		t.Error("constructor entered after parse rejection")
++		return nil, nil
++	})
++	digest := sha256.Sum256([]byte(config))
++	if result.requestID != "request-parse" || result.configDigest != hex.EncodeToString(digest[:]) || result.contractVersion != ConfigValidationContractVersion {
++		t.Fatalf("binding = %+v", result)
++	}
++	if result.validation != "Rejected" || result.cleanup != "NoConstruction" || !strings.HasPrefix(result.validationError, "decode config:") {
++		t.Fatalf("result = %+v", result)
++	}
++	if err := CheckConfig(config); err == nil || err.Error() != result.validationError {
++		t.Fatalf("legacy error changed: %v / %s", err, result.validationError)
++	}
++}
++
++func TestValidationNeverPromotesUnreviewedConstruction(t *testing.T) {
++	for _, test := range []struct {
++		name                string
++		validation, cleanup error
++		want                string
++	}{
++		{"accepted", nil, nil, "Accepted"},
++		{"rejected", errors.New("initialize endpoint[0]: injected"), nil, "Rejected"},
++		{"close-error", nil, errors.New("injected close failure"), "Accepted"},
++		{"rejected-close-error", errors.New("initialize endpoint[0]: injected"), errors.New("injected close failure"), "Rejected"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			result := checkConfigWithResult("{}", "request-"+test.name, 1000, func(context.Context, option.Options) (error, error) { return test.validation, test.cleanup })
++			if result.validation != test.want || result.cleanup != "CleanupUnknown" {
++				t.Fatalf("result = %+v", result)
++			}
++			if test.validation != nil && result.validationError != test.validation.Error() {
++				t.Fatal("validation error attribution changed")
++			}
++			if test.cleanup != nil && result.cleanupError != test.cleanup.Error() {
++				t.Fatal("cleanup error discarded")
++			}
++		})
++	}
++	result := CheckConfigWithResult(`{"log":{"disabled":true}}`, "complete-build", 1000)
++	if result.validation != "Accepted" || result.cleanup != "CleanupUnknown" {
++		t.Fatalf("complete unstarted build = %+v", result)
++	}
++}
++
++func TestValidationBlockingCleanupAndLateCompletionKeepOriginalBinding(t *testing.T) {
++	entered, release, disposed := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	result := checkConfigWithResult("{}", "request-original", 100, func(ctx context.Context, _ option.Options) (error, error) {
++		close(entered)
++		<-release // model a cleanup callback that ignores cancellation
++		if ctx.Err() == nil {
++			return errors.New("timeout did not cancel"), nil
++		}
++		close(disposed)
++		return nil, nil
++	})
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("worker did not enter")
++	}
++	if result.validation != "InternalFailure" || result.cleanup != "CleanupUnknown" {
++		t.Fatalf("timeout = %+v", result)
++	}
++	snapshot := *result
++	next := checkConfigWithResult("{", "request-next", 1000, func(context.Context, option.Options) (error, error) {
++		t.Error("parse reject constructed")
++		return nil, nil
++	})
++	if next.requestID != "request-next" || next.cleanup != "NoConstruction" {
++		t.Fatalf("next = %+v", next)
++	}
++	close(release)
++	select {
++	case <-disposed:
++	case <-time.After(time.Second):
++		t.Fatal("late cleanup worker did not complete")
++	}
++	if *result != snapshot {
++		t.Fatal("late completion mutated an old receipt")
++	}
++	if result.requestID == next.requestID || result.configDigest == next.configDigest {
++		t.Fatal("late work acquired new binding")
++	}
++}
++
++func TestValidationPanicRemainsUnknown(t *testing.T) {
++	result := checkConfigWithResult("{}", "panic", 1000, func(context.Context, option.Options) (error, error) { panic("injected constructor panic") })
++	if result.validation != "InternalFailure" || result.cleanup != "CleanupUnknown" {
++		t.Fatalf("panic = %+v", result)
++	}
++}
+diff --git a/log/log.go b/log/log.go
+index 3a1c653..e3fab51 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -6,6 +6,7 @@ import (
+ 	"os"
+ 	"time"
+ 
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/option"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ )
+@@ -61,6 +62,7 @@ func New(options Options) (Factory, error) {
+ 	if logOptions.Level != "" {
+ 		logLevel, err := ParseLevel(logOptions.Level)
+ 		if err != nil {
++			construction.RecordError(options.Context, construction.Close("partial log factory", factory.Close))
+ 			return nil, E.Cause(err, "parse log level")
+ 		}
+ 		factory.SetLevel(logLevel)
+diff --git a/route/network.go b/route/network.go
+index 0eccd25..dc1f37d 100644
+--- a/route/network.go
++++ b/route/network.go
+@@ -13,6 +13,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/settings"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+@@ -114,6 +115,12 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
+ 		outbound:          service.FromContext[adapter.OutboundManager](ctx),
+ 		needWIFIState:     hasRule(options.Rules, isWIFIRule) || hasDNSRule(dnsOptions.Rules, isWIFIDNSRule),
+ 	}
++	owned := false
++	defer func() {
++		if !owned {
++			construction.RecordError(ctx, construction.Close("partial network manager", nm.Close))
++		}
++	}()
+ 	if options.DefaultNetworkStrategy != nil {
+ 		if options.DefaultInterface != "" {
+ 			return nil, E.New("`default_network_strategy` is conflict with `default_interface`")
+@@ -145,6 +152,7 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
+ 	} else {
+ 		nm.interfaceMonitor = nm.platformInterface.CreateDefaultInterfaceMonitor(logger)
+ 	}
++	owned = true
+ 	return nm, nil
+ }
+ 
