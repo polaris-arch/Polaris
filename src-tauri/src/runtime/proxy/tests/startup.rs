@@ -122,24 +122,27 @@ fn race_server_default_is_off_zero_port() {
 fn subscription_update_port_is_independent_and_flows_into_generate_deps() {
     let (rt, _dir) = test_runtime();
     let config = UserConfig::default();
-    let (api, update, subscription, probe, pool) = rt.resolve_start_ports(&config, 9090).unwrap();
-    assert_ne!(subscription, 0);
-    assert_ne!(subscription, api);
-    assert_ne!(subscription, update);
-    assert_ne!(Some(subscription), probe);
-    assert!(!pool.contains(&subscription));
+    let ports = rt.resolve_start_ports(&config, 9090).unwrap();
+    assert_ne!(ports.subscription_update_in, 0);
+    assert_ne!(ports.subscription_update_in, ports.api);
+    assert_ne!(ports.subscription_update_in, ports.update_in);
+    assert_ne!(Some(ports.subscription_update_in), ports.probe_proxy);
+    assert!(!ports.probe_pool.contains(&ports.subscription_update_in));
 
     let deps = rt.generate_deps(
-        api,
-        update,
-        subscription,
-        probe,
-        &pool,
+        ports.api,
+        ports.update_in,
+        ports.subscription_update_in,
+        ports.probe_proxy,
+        &ports.probe_pool,
         &serde_json::json!({}),
         false,
     );
-    assert_eq!(deps.update_in_port, Some(update));
-    assert_eq!(deps.subscription_update_in_port, Some(subscription));
+    assert_eq!(deps.update_in_port, Some(ports.update_in));
+    assert_eq!(
+        deps.subscription_update_in_port,
+        Some(ports.subscription_update_in)
+    );
 }
 
 #[test]

@@ -337,15 +337,15 @@ pub(crate) fn generate_direct_vless_candidate(
     }
     let control_port =
         polaris_config_engine::user_config::proxy_ports::control_api_port(&user_config);
-    let (api_port, update_port, subscription_port, probe_port, pool_ports) = runtime
+    let ports = runtime
         .resolve_start_ports(&user_config, control_port)
         .map_err(|_| CandidateError::Unsupported)?;
     let mut deps = runtime.generate_deps(
-        api_port,
-        update_port,
-        subscription_port,
-        probe_port,
-        &pool_ports,
+        ports.api,
+        ports.update_in,
+        ports.subscription_update_in,
+        ports.probe_proxy,
+        &ports.probe_pool,
         snapshot.raw(),
         false,
     );

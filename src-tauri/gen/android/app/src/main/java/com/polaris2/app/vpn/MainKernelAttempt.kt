@@ -26,6 +26,8 @@ internal class MainKernelAttempt<Server>(
     /** Orders this generation's Start and Reload, without delaying Stop's terminal close. */
     val operationLock = Any()
     @Volatile var dualModeApiPort: Int? = null
+    /** Set only by an explicit disconnect, never by failed-start cleanup. */
+    @Volatile var clearReconnectNoticeOnClose = false
     @Volatile var revoked = false
         private set
     val prepared = CompletableFuture<Server?>()

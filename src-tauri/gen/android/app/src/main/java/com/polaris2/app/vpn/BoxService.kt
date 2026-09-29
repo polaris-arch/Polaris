@@ -93,7 +93,7 @@ class BoxService(
             // 这条广播只有两个发送方：通知栏「断开」与 `PolarisVpnPlugin.stop`（经 requestStop）——
             // 两者都是「用户要它断开」。撤销准入，否则系统下次拉起服务会违背用户意图把它连回去。
             SystemStart.forget(context, "用户断开")
-            stopService()
+            stopService(userRequested = true)
         }
     }
 
@@ -277,7 +277,7 @@ class BoxService(
                 }
             }
             if (current && bridgeConfig == null && e is DualModeEndpointTombstone.Retired) {
-                runCatching { showReconnectNotice() }
+                runCatching { showReconnectNotice(attempt) }
                     .onFailure { Log.e(TAG, "重连提醒失败，仍需关闭拒收的旧端点", it) }
             }
             if (current) stopService(attempt)
@@ -325,7 +325,7 @@ class BoxService(
             // Native reload would create a new core at the old management endpoint.
             // Keep the current core alive; a bridge Start must allocate a fresh port.
             Log.w(TAG, "双态内核重载被拒；保持现有连接，请通过应用重新连接")
-            runCatching { showReconnectNotice() }
+            runCatching { showReconnectNotice(attempt) }
                 .onFailure { Log.e(TAG, "重连提醒失败，保持现有连接", it) }
             return
         } catch (error: Exception) {
@@ -357,8 +357,12 @@ class BoxService(
         }
     }
 
-    private fun showReconnectNotice() {
-        NativeReconnectNotice.require(service)
+    private fun showReconnectNotice(attempt: MainKernelAttempt<CommandServer>) {
+        synchronized(this) {
+            if (mainAttempt !== attempt || attempt.revoked ||
+                (state != ServiceState.Starting && state != ServiceState.Started)) return
+            NativeReconnectNotice.require(service, attempt.birthNonce)
+        }
         val channel = "polaris-endpoint-reconnect"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             PolarisApplication.notification.createNotificationChannel(
@@ -376,7 +380,7 @@ class BoxService(
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             ))
             .build()
-        PolarisApplication.notification.notify(ENDPOINT_RECONNECT_NOTICE_ID, notice)
+        PolarisApplication.notification.notify(NativeReconnectNotice.NOTIFICATION_ID, notice)
     }
 
     // Android 没有「系统 HTTP 代理开关」这一层：VpnService.Builder.setHttpProxy 是随隧道一起
@@ -459,11 +463,22 @@ class BoxService(
     @Volatile private var closeFailed = false
 
     @Synchronized
-    private fun stopService(expectedAttempt: MainKernelAttempt<CommandServer>? = null) {
+    private fun stopService(
+        expectedAttempt: MainKernelAttempt<CommandServer>? = null,
+        userRequested: Boolean = false,
+    ) {
         val attempt = mainAttempt
         if (expectedAttempt != null && attempt !== expectedAttempt) return
         if (attempt != null && !MainKernelAttemptRegistry.isCurrent(attempt)) return
+        // An explicit Stop can arrive after automatic cleanup started. Mark it
+        // before the in-flight-close early return so its exact callback sees it.
+        if (userRequested && attempt != null) attempt.clearReconnectNoticeOnClose = true
         if (state == ServiceState.Stopped && attempt == null) {
+            if (userRequested && MainKernelAttemptRegistry.isVacant()) {
+                runCatching {
+                    NativeReconnectNotice.owner(service)?.let { NativeReconnectNotice.clearIfOwner(service, it) }
+                }.onFailure { Log.e(TAG, "清理已断开连接的重连提醒失败", it) }
+            }
             return
         }
         // A pending close owns this attempt. A second stop cannot start another native
@@ -561,10 +576,13 @@ class BoxService(
                 closeFailed = false
             }) { "主核关闭回执与进程所有权不一致" }
         }
-        // Only an exact successful native close resolves the pending reconnect
-        // reason. A Stop timeout/cleanupUnknown leaves it visible and blocks reuse.
-        runCatching { NativeReconnectNotice.clear(service) }
-            .onFailure { Log.e(TAG, "清理重连提醒失败", it) }
+        // Failed SystemStart cleanup is automatic and must leave its reason
+        // visible. Explicit disconnect may clear only this attempt's notice;
+        // a successor can already have written a different owner after release.
+        if (attempt.clearReconnectNoticeOnClose) {
+            runCatching { NativeReconnectNotice.clearIfOwner(service, attempt.birthNonce) }
+                .onFailure { Log.e(TAG, "清理重连提醒失败", it) }
+        }
         deliverStop?.invoke()
         mainHandler.post {
             synchronized(this) {
@@ -595,7 +613,6 @@ class BoxService(
     companion object {
         private const val TAG = "PolarisBoxService"
         private const val PROFILE_NAME = "Polaris"
-        private const val ENDPOINT_RECONNECT_NOTICE_ID = 39091
 
         /** 外部（通知按钮、将来的 UI/命令面）请求停机的唯一入口。 */
         fun requestStop(context: Context) {

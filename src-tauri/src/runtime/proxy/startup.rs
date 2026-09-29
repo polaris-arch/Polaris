@@ -395,6 +395,17 @@ pub(super) fn main_core_ready_timeout_message(
     )
 }
 
+/// One retry leg's independently allocated loopback listeners. Keeping the
+/// names here prevents the API/update/probe ports from being transposed by a
+/// positional return value when a retry regenerates the core configuration.
+pub(super) struct StartPorts {
+    pub(super) api: u16,
+    pub(super) update_in: u16,
+    pub(super) subscription_update_in: u16,
+    pub(super) probe_proxy: Option<u16>,
+    pub(super) probe_pool: Vec<u16>,
+}
+
 /// Adds one exclusion to the fixed-size core-supervisor port book without
 /// changing its public contract. Used only for the optional probe pool after
 /// the essential subscription port has already been allocated.
@@ -1363,13 +1374,13 @@ impl ProxyRuntime {
 
             // 每次尝试重解析空闲端口（端口重分配自愈）+ 重生成配置（端口嵌入 config，必须同刷写盘）。
             let t_config_gen = std::time::Instant::now();
-            let (
-                api_port,
-                update_in_port,
-                subscription_update_in_port,
-                probe_proxy_port,
-                pool_ports,
-            ) = self
+            let StartPorts {
+                api: api_port,
+                update_in: update_in_port,
+                subscription_update_in: subscription_update_in_port,
+                probe_proxy: probe_proxy_port,
+                probe_pool: pool_ports,
+            } = self
                 .resolve_start_ports(&user_config, control_port)
                 .map_err(|error| StartError::coded(error, code::STARTUP_FAILED))?;
             let mut deps = self.generate_deps(
@@ -3041,12 +3052,12 @@ impl ProxyRuntime {
     ///
     /// **§15**：额外分配 K 个测速探测池端口（`probe-in-k`）——排除 api/update-in/control/http/mixed 及池内互异；
     /// 专用代理出口探针与 K 个测速槽一次性分配，确保彼此不撞；整批原子失败则两项能力都不注入，
-    /// 但不阻断代理本身启动。返回 `(api, update_in, subscription_update_in, probe_proxy, pool_ports)`。
+    /// 但不阻断代理本身启动。返回命名的 [`StartPorts`]，防止五个位置相近的端口被调换。
     pub(super) fn resolve_start_ports(
         &self,
         user_config: &UserConfig,
         control_port: u16,
-    ) -> Result<(u16, u16, u16, Option<u16>, Vec<u16>), String> {
+    ) -> Result<StartPorts, String> {
         // 管理 API 端口（上游 resolveTailscaleApiPort，:3006）。
         let exclusions = PortExclusions::for_primary_api(
             Some(control_port),
@@ -3122,13 +3133,13 @@ impl ProxyRuntime {
                 PROBE_POOL_SIZE + 1
             );
         }
-        Ok((
-            api_port,
-            update_in_port,
-            subscription_update_in_port,
-            probe_proxy_port,
-            pool_ports,
-        ))
+        Ok(StartPorts {
+            api: api_port,
+            update_in: update_in_port,
+            subscription_update_in: subscription_update_in_port,
+            probe_proxy: probe_proxy_port,
+            probe_pool: pool_ports,
+        })
     }
 
     /// 网络场景 canary 探针的回环 UDP 口（spec §6.3 方案 2）。沿用 update-in 的分配路径

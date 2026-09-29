@@ -393,6 +393,16 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         when (VpnBridge.beginStop(invoke)) {
             VpnBridge.StopAdmission.AlreadyStopped -> {
                 // 本就没在跑 ⇒ 幂等成功。停核腿必须是幂等的。
+                // A rejected SystemStart may have left a reconnect reason after
+                // its automatic close; only an explicit Stop with no native owner
+                // dismisses it. Compare the owner to avoid erasing a later notice.
+                if (MainKernelAttemptRegistry.isVacant()) {
+                    runCatching {
+                        NativeReconnectNotice.owner(activity)?.let {
+                            NativeReconnectNotice.clearIfOwner(activity, it)
+                        }
+                    }.onFailure { Log.e(TAG, "清理已断开连接的重连提醒失败", it) }
+                }
                 invoke.resolve()
                 return
             }
