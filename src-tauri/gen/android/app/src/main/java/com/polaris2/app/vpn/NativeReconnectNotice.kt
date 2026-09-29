@@ -1,5 +1,6 @@
 package com.polaris2.app.vpn
 
+import android.app.Notification
 import android.content.Context
 import java.io.File
 
@@ -39,4 +40,16 @@ internal object NativeReconnectNotice {
 
     @Synchronized internal fun clearIfOwner(file: File, expectedOwner: String): Boolean =
         expectedOwner.isNotBlank() && owner(file) == expectedOwner && file.delete()
+
+    /** Serialize the final owner check and publish with clear/cancel. */
+    @Synchronized fun notifyIfOwner(context: Context, expectedOwner: String, notice: Notification): Boolean =
+        publishIfOwner(marker(context), expectedOwner) {
+            PolarisApplication.notification.notify(NOTIFICATION_ID, notice)
+        }
+
+    @Synchronized internal fun publishIfOwner(file: File, expectedOwner: String, publish: () -> Unit): Boolean {
+        if (expectedOwner.isBlank() || owner(file) != expectedOwner) return false
+        publish()
+        return true
+    }
 }

@@ -380,7 +380,7 @@ class BoxService(
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             ))
             .build()
-        PolarisApplication.notification.notify(NativeReconnectNotice.NOTIFICATION_ID, notice)
+        NativeReconnectNotice.notifyIfOwner(service, attempt.birthNonce, notice)
     }
 
     // Android 没有「系统 HTTP 代理开关」这一层：VpnService.Builder.setHttpProxy 是随隧道一起
@@ -474,9 +474,12 @@ class BoxService(
         // before the in-flight-close early return so its exact callback sees it.
         if (userRequested && attempt != null) attempt.clearReconnectNoticeOnClose = true
         if (state == ServiceState.Stopped && attempt == null) {
-            if (userRequested && MainKernelAttemptRegistry.isVacant()) {
+            if (userRequested) {
                 runCatching {
-                    NativeReconnectNotice.owner(service)?.let { NativeReconnectNotice.clearIfOwner(service, it) }
+                    MainKernelAttemptRegistry.requestReconnectNoticeDismissal(
+                        { NativeReconnectNotice.owner(service) },
+                        { NativeReconnectNotice.clearIfOwner(service, it) },
+                    )
                 }.onFailure { Log.e(TAG, "清理已断开连接的重连提醒失败", it) }
             }
             return

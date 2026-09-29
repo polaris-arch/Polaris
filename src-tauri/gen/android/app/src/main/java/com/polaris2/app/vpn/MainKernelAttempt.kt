@@ -150,6 +150,24 @@ internal class MainKernelAttemptLedger {
     @Synchronized
     fun ownerForDrain(): MainKernelOwner? = owner?.let { MainKernelOwner(it, ownerClose) }
 
+    /** Bridge Stop was already settled, but native close may still own this exact
+     * attempt. Record only a notice owned by that attempt; a vacant registry may
+     * remove only the marker observed under this same registry decision. */
+    @Synchronized
+    fun requestReconnectNoticeDismissal(
+        readNoticeOwner: () -> String?,
+        clearIfOwner: (String) -> Boolean,
+    ): Boolean {
+        val markerOwner = readNoticeOwner() ?: return false
+        val current = owner
+        if (current != null) {
+            if (current.birthNonce != markerOwner) return false
+            current.clearReconnectNoticeOnClose = true
+            return true
+        }
+        return clearIfOwner(markerOwner)
+    }
+
     @Synchronized
     fun isCurrent(attempt: MainKernelAttempt<*>): Boolean = owner === attempt
 

@@ -39,7 +39,7 @@ class DualModeEndpointWiringTest {
     @Test fun rejectedSystemStartKeepsOwnedReasonUntilExplicitRecovery() {
         val notice = service.substringAfter("private fun showReconnectNotice(").substringBefore("// Android 没有")
         val marker = notice.indexOf("NativeReconnectNotice.require(service, attempt.birthNonce)")
-        val notification = notice.indexOf("PolarisApplication.notification.notify(")
+        val notification = notice.indexOf("NativeReconnectNotice.notifyIfOwner(service, attempt.birthNonce, notice)")
         assertTrue(marker >= 0 && marker < notification)
         val start = service.substringAfter("private fun startKernel(").substringBefore("// ── CommandServerHandler")
         assertTrue(start.contains("runCatching { showReconnectNotice(attempt) }"))
@@ -60,7 +60,8 @@ class DualModeEndpointWiringTest {
         assertTrue(explicit >= 0 && explicit < inFlight)
         val alreadyStopped = plugin.substringAfter("VpnBridge.StopAdmission.AlreadyStopped ->")
             .substringBefore("VpnBridge.StopAdmission.Busy ->")
-        assertTrue(alreadyStopped.contains("MainKernelAttemptRegistry.isVacant()"))
+        assertTrue(alreadyStopped.contains("MainKernelAttemptRegistry.requestReconnectNoticeDismissal("))
+        assertTrue(alreadyStopped.contains("NativeReconnectNotice.owner(activity)"))
         assertTrue(alreadyStopped.contains("NativeReconnectNotice.clearIfOwner(activity, it)"))
     }
 }
