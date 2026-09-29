@@ -40,8 +40,8 @@ fn owner(server_id: &str, identity_epoch: &str) -> MeshOwnerRef {
 
 fn plan_input() -> ManagedMeshPlanInput {
     assert!(!cidrs_overlap("100.80.8.0/24", "100.80.9.0/24"));
-    let mut wire: Value = serde_json::from_str(include_str!(
-        "../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let mut wire: Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "ui/src/contracts/mesh-route-state.fixture.json"
     ))
     .unwrap();
     wire["meshRoutePolicy"]["assignments"] = json!([
@@ -203,8 +203,7 @@ fn spawn_dns() -> (SocketAddr, mpsc::Receiver<String>, Arc<AtomicBool>) {
             let data = &packet[..len];
             let mut cursor = 12;
             let mut labels = Vec::new();
-            loop {
-                let Some(&size) = data.get(cursor) else { break };
+            while let Some(&size) = data.get(cursor) {
                 cursor += 1;
                 if size == 0 {
                     break;
@@ -813,7 +812,7 @@ fn release_risk_mandatory_core_job_runs_both_managed_tests() {
         "cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture"
     ));
     assert!(!mandatory.contains("POLARIS_NO_KERNEL_RUN"));
-    let source = include_str!("managed_mesh_emission_runtime.rs");
+    let source = polaris_source_probe::crate_file!("tests/managed_mesh_emission_runtime.rs");
     assert!(source.contains("fn b609_accepts_emitted_connect_fixture_without_starting_core"));
     assert!(source.contains("fn b609_connect_observes_managed_multi_answer_guards"));
 }

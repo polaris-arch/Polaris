@@ -174,6 +174,10 @@ fn actual_rule_present(config: &SingBoxConfig, emitted: &MeshRouteEmissionCandid
 
 impl ProxyRuntime {
     /// 最终 gate 产物确定后、spawn 前冻结；只读诊断失败不妨碍原代理启动。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "run evidence depends on independently validated inputs"
+    )]
     pub(super) fn prepare_mesh_route_run(
         &self,
         mut candidates: Vec<MeshRouteEmissionCandidate>,
@@ -338,7 +342,7 @@ impl ProxyRuntime {
             candidates.clear();
         }
         let epoch_after = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        if epoch_before != epoch_after || epoch_after % 2 != 0 {
+        if epoch_before != epoch_after || !epoch_after.is_multiple_of(2) {
             load_evidence = MeshRouteLoadEvidence::FileWrittenUnacknowledged;
         }
         MeshRouteRunEvidence {
@@ -383,7 +387,7 @@ impl ProxyRuntime {
             && self.gate.generation() == evidence.run_generation
             && epoch == epoch_after
             && epoch == evidence.write_epoch
-            && epoch % 2 == 0
+            && epoch.is_multiple_of(2)
             && evidence.load_evidence == MeshRouteLoadEvidence::Unknown
             && core_config_matches
             && files_match
@@ -391,7 +395,7 @@ impl ProxyRuntime {
             evidence.load_evidence = MeshRouteLoadEvidence::StartupReady;
         } else if epoch != epoch_after
             || epoch != evidence.write_epoch
-            || epoch % 2 != 0
+            || !epoch.is_multiple_of(2)
             || (evidence.core_config_sha256.is_some() && !core_config_matches)
             || !files_match
         {
@@ -539,7 +543,7 @@ impl ProxyRuntime {
         } else if file_changed
             || core_config_read == Some(Ok(false))
             || before != after
-            || before % 2 != 0
+            || !before.is_multiple_of(2)
             || before != evidence.write_epoch
         {
             Some(MeshRouteLoadEvidence::FileWrittenUnacknowledged)

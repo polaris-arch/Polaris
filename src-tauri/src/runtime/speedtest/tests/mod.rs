@@ -1619,10 +1619,9 @@ impl LoginCoreSpawner for UnknownCleanupSpawner {
         if self.fail_during_spawn {
             return Err(polaris_core_supervisor::SpawnError::Spawn {
                 bin: PathBuf::from("android-libbox"),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    TempCoreCleanupUnknown("native cleanup unconfirmed".to_string()),
-                ),
+                source: std::io::Error::other(TempCoreCleanupUnknown(
+                    "native cleanup unconfirmed".to_string(),
+                )),
             });
         }
         Ok(Box::new(UnknownCleanupChild))

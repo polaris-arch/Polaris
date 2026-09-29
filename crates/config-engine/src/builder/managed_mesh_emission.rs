@@ -190,21 +190,21 @@ pub fn emit_managed_mesh_config(
             }
             internal_pins.push((index, tag, resolver));
         }
-        if rule.action.as_deref() == Some("resolve") && !subscription_indices.contains(&index) {
-            if rule != &bare_resolve || legacy_resolve_index.replace(index).is_some() {
-                return Err("managed mesh cannot place a scoped legacy resolve after Q".into());
-            }
+        if rule.action.as_deref() == Some("resolve")
+            && !subscription_indices.contains(&index)
+            && (rule != &bare_resolve || legacy_resolve_index.replace(index).is_some())
+        {
+            return Err("managed mesh cannot place a scoped legacy resolve after Q".into());
         }
-        if rule.override_address.is_some() {
-            if !is_exact_microdone_local_override(rule)
+        if rule.override_address.is_some()
+            && (!is_exact_microdone_local_override(rule)
                 || local_override_index.replace(index).is_some()
                 || plan
                     .protected_cidrs
                     .iter()
-                    .any(|q| cidrs_overlap(q, "127.0.0.1/32"))
-            {
-                return Err("managed mesh local override changed shape or overlaps Q".into());
-            }
+                    .any(|q| cidrs_overlap(q, "127.0.0.1/32")))
+        {
+            return Err("managed mesh local override changed shape or overlaps Q".into());
         }
     }
     let core = route.rules[core_index].clone();

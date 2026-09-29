@@ -424,6 +424,14 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         1,
         "`system_dns_takeover_active`（网络场景 auto 探测源用的「macOS + TUN + 接管系统 DNS 生效」事实）。         Android/iOS → false，正确：与 `dns_ops.rs::takeover_supported`（Android → false）同一个事实 ——         移动端没有可接管的系统解析器（DNS 由核在 tun fd 内自理）。调用方传入的 `is_tun` 已取本平台         生效值（`effective_on`，移动端恒 Tun），但平台合取项先把移动端排除，故生效值不改变这里的答案。",
     ),
+    (
+        "src-tauri/src/commands/misc/backup.rs",
+        "if platform == polaris_helper_proto::Platform::Android",
+        1,
+        "`import_interface_names_from` 在 Android 上返回 None：备份导入时不向系统枚举网卡，\
+         因而保留原有接口绑定；其他平台仍尝试枚举。Android 分支是独立平台行为，新增平台\
+         不能默默继承枚举一侧，须在这里重新核对。",
+    ),
 ];
 
 // ===================== 判据本体 =====================
@@ -2048,6 +2056,8 @@ const CFG_SITE_FLOOR: usize = 80;
 #[derive(Clone, Copy)]
 struct CfgEnv {
     target_os: &'static str,
+    /// `debug_assertions` 是构建构型轴，独立于移动平台轴。
+    debug_assertions: bool,
     /// Tauri 的 `mobile` cfg（`tauri-build` 按 `target_os == "ios" || target_os == "android"` 发出）。
     mobile: bool,
     /// Tauri 的 `desktop` cfg（`mobile` 的反面）。
@@ -2056,13 +2066,23 @@ struct CfgEnv {
 
 const IOS_ENV: CfgEnv = CfgEnv {
     target_os: "ios",
+    debug_assertions: false,
     mobile: true,
     desktop: false,
 };
 const ANDROID_ENV: CfgEnv = CfgEnv {
     target_os: "android",
+    debug_assertions: false,
     mobile: true,
     desktop: false,
+};
+const IOS_DEBUG_ENV: CfgEnv = CfgEnv {
+    debug_assertions: true,
+    ..IOS_ENV
+};
+const ANDROID_DEBUG_ENV: CfgEnv = CfgEnv {
+    debug_assertions: true,
+    ..ANDROID_ENV
 };
 
 /// iOS 在这一格落哪一侧、那一侧对不对。**前半由本门算，后半由人写。**
@@ -2070,6 +2090,8 @@ const ANDROID_ENV: CfgEnv = CfgEnv {
 enum IosSide {
     /// iOS 与 Android 落在**同一侧**。本轴上不产生分叉。
     WithAndroid,
+    /// release 同侧；debug 构型里仅 Android 编译此分支。
+    DiffersOnlyInDebug,
     /// iOS 与 Android 落在**相反侧**，且相反是**对的**（两个平台在这一格本就该不同答）。
     DiffersRight,
     /// iOS 与 Android 落在**相反侧**，而 iOS 那一侧对它是**错的** —— 与枚举轴上写下的答案矛盾。
@@ -2176,6 +2198,30 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "上一条的孪生支（原先的 `mobile` 支收窄而来）：iOS 写侧显式报「本平台不支持」、读侧回 `false`\
          —— 诚实降级。iOS 落这一侧是**对的**：今天它确实没有开机自动连接的执行者。",
+    ),
+    (
+        "src-tauri/src/commands/misc/logs.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        2,
+        IosSide::DiffersOnlyInDebug,
+        "Android debug 构建采集并分享 libbox 原生日志；iOS debug 没有 Android 插件桥，\
+         不编译这两处。release 构建两平台都不进入此分支。",
+    ),
+    (
+        "src-tauri/src/commands/misc/logs.rs",
+        "not(all(target_os = \"android\", debug_assertions))",
+        1,
+        IosSide::DiffersOnlyInDebug,
+        "上一条的互补导出路径：仅 Android debug 使用原生分享；iOS 与全部 release\
+         构建走文件导出。debug 时两平台反侧，release 时同侧。",
+    ),
+    (
+        "src-tauri/src/commands/updater/app_update.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        1,
+        IosSide::DiffersOnlyInDebug,
+        "debugReportAvailable 只表示 Android debug 的原生报告能力；iOS 没有这条桥，\
+         release 两平台都返回 false。",
     ),
     (
         "src-tauri/src/commands/updater/uninstall.rs",
@@ -2311,6 +2357,14 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        2,
+        IosSide::DiffersOnlyInDebug,
+        "collect_debug_diagnostics/share_debug_report 是 Android 插件的调试专用桥；\
+         iOS debug 没有这些 JNI 入口，release 两平台都不编译。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
         "not(target_os = \"android\")",
         13,
         IosSide::DiffersRight,
@@ -2422,6 +2476,231 @@ const CFG_REGISTRY: &[CfgSite] = &[
         1,
         IosSide::DiffersUndecided,
         "❓ 上一条的孪生侧（真的去问 `w.is_visible()` / `w.is_minimized()`）。同上，判不了。",
+    ),
+    // ── 2026-09-29：debug 原子可求值后，旧的提前失败不再遮住这些未登记站点 ──
+    (
+        "src-tauri/src/commands/misc/backup.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersUndecided,
+        "Android 文件选择器不加扩展名过滤，否则 .polaris-backup 会被 MIME 转换隐藏。\
+         iOS 选择器如何处理这两档过滤尚无平台事实；保留当前过滤但登记为待验证。",
+    ),
+    (
+        "src-tauri/src/commands/speedtest.rs",
+        "not(target_os = \"android\")",
+        4,
+        IosSide::DiffersWrongToday,
+        "四处非 Android 腿使用桌面子进程测速、无认证本地代理与 helper 错误码。\
+         iOS 核在扩展进程内，不能直接继承桌面起子进程的实现；需 iOS 原生测速宿主。",
+    ),
+    (
+        "src-tauri/src/commands/speedtest.rs",
+        "target_os = \"android\"",
+        6,
+        IosSide::DiffersWrongToday,
+        "六处 Android 腿装配 libbox 测速、内存凭据和系统接口不支持的错误码。\
+         iOS 不可使用 Android 插件，但落到桌面测速腿同样不成立；需要自己的原生桥。",
+    ),
+    (
+        "src-tauri/src/commands/subscription.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersUndecided,
+        "Android 文件选择器过滤会隐藏合法 .conf；iOS 系统选择器的 MIME/扩展名\
+         映射尚未验证，当前沿用桌面过滤，须真机确认。",
+    ),
+    (
+        "src-tauri/src/commands/system.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersUndecided,
+        "iOS 的 getifaddrs 系统调用可用，故共用非 Android 枚举在 API 层有依据；\
+         沙箱下实际返回哪些物理网卡未真机确认（源码原注释已标明），故保留待验证。",
+    ),
+    (
+        "src-tauri/src/commands/system.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Android 从 ConnectivityManager 桥取可绑定接口；iOS 没有该 Android 插件，\
+         不编译此腿是对的。iOS 当前改走 getifaddrs，覆盖范围另列待验证。",
+    ),
+    (
+        "src-tauri/src/commands/updater/core_update.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersWrongToday,
+        "换核事务拿桌面 legacy lease；Android 无可替换核文件故跳过。iOS 核同样在\
+         扩展进程内，没有可由应用替换的独立核二进制，现有非 Android 换核链不适用。",
+    ),
+    (
+        "src-tauri/src/commands/updater/shared.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersWrongToday,
+        "导入 core_paths 并解析可写核目录；iOS 随 app 扩展分发 libbox，\
+         同样没有桌面可换的独立核文件，当前落桌面侧不成立。",
+    ),
+    (
+        "src-tauri/src/commands/updater/shared.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersWrongToday,
+        "Android 诚实拒绝独立核文件替换；iOS 也应拒绝，但当前落入非 Android\
+         的磁盘内核路径，需接 iOS 原生发行模型。",
+    ),
+    (
+        "src-tauri/src/lib.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersWrongToday,
+        "启动时播种/更新桌面核二进制的两处；iOS 核是扩展内 libbox，\
+         不能把 app bundle 内的库当可写独立核替换。",
+    ),
+    (
+        "src-tauri/src/runtime/geo_seed.rs",
+        "any(target_os = \"android\", test)",
+        1,
+        IosSide::DiffersRight,
+        "Android 预置资源经 APK BundledRules 落到 app data 的 bundled-geo；\
+         iOS 不经过 Android Kotlin 资产物化函数，此分支不编译是对的。",
+    ),
+    (
+        "src-tauri/src/runtime/geo_seed.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersUndecided,
+        "非 Android 候选从 exe 目录找随包 resources/data 并在 release 剔除源码仓；\
+         iOS app bundle 的真实资源布局尚无构建产物验证，当前沿用此路径待核。",
+    ),
+    (
+        "src-tauri/src/runtime/geo_seed.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersRight,
+        "Android 专属 APK bundled-geo 候选函数及其别名；iOS 不含 APK/Kotlin\
+         BundledRules，必须走另一种随包资源布局。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "any(target_os = \"android\", test)",
+        13,
+        IosSide::DiffersRight,
+        "确切主核回执/归属/legacy fence 的 Android 数据结构和校验器仅供\
+         Kotlin 插件桥与跨平台单测；生产 iOS 不调用 Android 插件。iOS 须另建桥与回执。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "not(target_os = \"android\")",
+        4,
+        IosSide::DiffersRight,
+        "确切停核、主核状态、归属、legacy fence 的非 Android 桩明确返 Err；\
+         iOS 无 Android Kotlin 状态来源，不能把未知伪装成已关闭。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "target_os = \"android\"",
+        17,
+        IosSide::DiffersRight,
+        "新增的接口枚举、确切主核状态/停核、归属与 legacy fence、瞬态测速/登录\
+         都通过 Android Kotlin 插件；iOS 不存在这些 JNI 符号，需独立原生桥。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersUndecided,
+        "非 Android 生产 lease 阻止旧路径与受管启动重叠；iOS 将来如何接入\
+         受管起核尚未确定，当前沿用此准入闸，不能推断其最终归属。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersUndecided,
+        "Android 此处不持桌面 config lease，归属在原生桥；iOS 扩展进程\
+         将来应由谁持 lease 尚无实现，不能照搬 Android 的 Ok(None)。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/route_replan.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersRight,
+        "非 Android 同步网卡判据读取 getifaddrs；iOS 有该系统调用且此处\
+         不持 Android JNI 桥。沙箱返回的网卡集合仍由 system.rs 条目待验证。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/route_replan.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Android selector 写事务持同步锁，不能 block_on 原生桥，故跳过此处\
+         的同步枚举，由运行时异步观测和 socket hook 兜底；iOS 没有该桥。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(target_os = \"android\")",
+        3,
+        IosSide::DiffersWrongToday,
+        "新增桌面核二进制解析与就绪后的磁盘文件自证；iOS 核为扩展进程内库，\
+         没有这些文件/PID 对账的对象，延续本文件既有 iOS 债。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "target_os = \"android\"",
+        4,
+        IosSide::DiffersWrongToday,
+        "新增 in-process 占位、managed 启动收据与自证旁路；iOS 不能用\
+         Android 桥，但落桌面子进程侧也错误，延续既有 iOS 起核债。",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "any(target_os = \"android\", test)",
+        2,
+        IosSide::DiffersRight,
+        "Android 入站凭据类型和只在内存中注入凭据的 helper；生产 iOS\
+         没有 Android transient host，不能直接复用此 Android 凭据协议。",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Android libbox 测速子模块的声明；iOS 不可编译 Android JNI 宿主，\
+         应新增 iOS 平台实现而非共用此模块。",
+    ),
+    (
+        "src-tauri/src/runtime/startup_tasks.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersUndecided,
+        "Android auto-connect 准入改由系统拉起主核/桥持有；iOS Connect On Demand\
+         与 app 启动期的 lease 归属尚无实现，保留非 Android 两次检查并列待验证。",
+    ),
+    (
+        "src-tauri/src/runtime/stats/source.rs",
+        "any(target_os = \"android\", test)",
+        1,
+        IosSide::DiffersWrongToday,
+        "新增 native stream detached_open 防 future 被丢弃；iOS 核同样不是\
+         桌面 gRPC 子进程，现有非 Android 数据面无法提供统计，延续既有债。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersWrongToday,
+        "非 Android 解析独立 sing-box 可执行文件并装配 TokioSpawner；\
+         iOS 扩展进程内 libbox 无可执行子进程，不能沿用此登录核。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        8,
+        IosSide::DiffersWrongToday,
+        "Android 瞬态登录用 JNI/libbox instance；iOS 不能编译 Android 桥，\
+         但当前又落到桌面可执行文件路径，需独立进程内登录宿主。",
     ),
 ];
 
@@ -2544,6 +2823,7 @@ fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
     }
     match p {
         "test" => Some(false),
+        "debug_assertions" => Some(env.debug_assertions),
         "desktop" => Some(env.desktop),
         "mobile" => Some(env.mobile),
         _ => p
@@ -2555,6 +2835,14 @@ fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
             .and_then(|r| r.strip_suffix('"'))
             .map(|os| os == env.target_os),
     }
+}
+
+/// 两种构型各自比较 iOS/Android 是否同侧，避免把 debug 的答案误推广到 release。
+fn cfg_side_profile(pred: &str) -> Option<(bool, bool)> {
+    Some((
+        eval_cfg(pred, IOS_ENV)? == eval_cfg(pred, ANDROID_ENV)?,
+        eval_cfg(pred, IOS_DEBUG_ENV)? == eval_cfg(pred, ANDROID_DEBUG_ENV)?,
+    ))
 }
 
 /// 求值器自身的正反双向自检 —— 它是本门第四列强制力的全部来源，坏掉就等于第四列没人看。
@@ -2579,6 +2867,14 @@ fn cfg_evaluator_answers_both_ways() {
     );
     assert_eq!(eval_cfg("mobile", IOS_ENV), Some(true));
     assert_eq!(eval_cfg("desktop", IOS_ENV), Some(false));
+    assert_eq!(eval_cfg("debug_assertions", IOS_ENV), Some(false));
+    assert_eq!(eval_cfg("debug_assertions", IOS_DEBUG_ENV), Some(true));
+    assert_eq!(eval_cfg("debug_assertions", ANDROID_ENV), Some(false));
+    assert_eq!(eval_cfg("debug_assertions", ANDROID_DEBUG_ENV), Some(true));
+    assert_eq!(
+        cfg_side_profile("all(target_os = \"android\", debug_assertions)"),
+        Some((true, false))
+    );
     assert_eq!(
         eval_cfg("all(desktop, not(target_os = \"macos\"))", IOS_ENV),
         Some(false)
@@ -2594,7 +2890,7 @@ fn cfg_evaluator_answers_both_ways() {
         "windows",
         "unix",
         "any(target_os = \"ios\", feature = \"x\")",
-        "not(debug_assertions)",
+        "not(unknown_build_mode)",
     ] {
         assert_eq!(
             eval_cfg(unknown, IOS_ENV),
@@ -2625,7 +2921,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
                 continue;
             }
             // fail-closed：认不出来的原子一律让门红，不猜。
-            if eval_cfg(&pred, IOS_ENV).is_none() || eval_cfg(&pred, ANDROID_ENV).is_none() {
+            if cfg_side_profile(&pred).is_none() {
                 unknown_atoms.push(format!("{rel}\n      {pred}"));
                 continue;
             }
@@ -2637,7 +2933,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
         unknown_atoms.is_empty(),
         "以下 cfg 谓词里出现了本门词表之外的原子：\n    {}\n\n\
          本门**不猜**：`eval_cfg` 的词表是封闭的（`target_os = \"…\"` / `desktop` / `mobile` / \
-         `test` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
+         `test` / `debug_assertions` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
          `cfg_evaluator_answers_both_ways` 里正反各钉一条，要么这条谓词根本不该落在移动轴上。",
         unknown_atoms.join("\n    ")
     );
@@ -2662,10 +2958,8 @@ fn cfg_axis_platform_dispatch_is_registered() {
         .filter(|(k, n)| reg_count(k) < **n)
         .map(|((p, s), n)| {
             let r = reg_count(&(p.clone(), s.clone()));
-            let ios = eval_cfg(s, IOS_ENV).unwrap();
-            let android = eval_cfg(s, ANDROID_ENV).unwrap();
-            let side = if ios == android { "同侧" } else { "**反侧**" };
-            format!("{p}  （实到 {n} 次，登记 {r} 次；iOS={ios} / Android={android} ⇒ {side}）\n      {s}")
+            let (release_same, debug_same) = cfg_side_profile(s).unwrap();
+            format!("{p}  （实到 {n} 次，登记 {r} 次；release 同侧={release_same} / debug 同侧={debug_same}）\n      {s}")
         })
         .collect();
     let rotten: Vec<String> = registered
@@ -2682,14 +2976,17 @@ fn cfg_axis_platform_dispatch_is_registered() {
         .iter()
         .filter(|(k, _)| found.contains_key(*k))
         .filter_map(|((p, s), (_, side, _))| {
-            let ios = eval_cfg(s, IOS_ENV).unwrap();
-            let android = eval_cfg(s, ANDROID_ENV).unwrap();
-            let same = ios == android;
-            let claims_same = *side == IosSide::WithAndroid;
-            (same != claims_same).then(|| {
+            let actual = cfg_side_profile(s).unwrap();
+            let claimed = match side {
+                IosSide::WithAndroid => (true, true),
+                IosSide::DiffersOnlyInDebug => (true, false),
+                IosSide::DiffersRight
+                | IosSide::DiffersWrongToday
+                | IosSide::DiffersUndecided => (false, false),
+            };
+            (actual != claimed).then(|| {
                 format!(
-                    "{p}  （登记 {side:?}，实算 iOS={ios} / Android={android} ⇒ {}）\n      {s}",
-                    if same { "同侧" } else { "反侧" }
+                    "{p}  （登记 {side:?}={claimed:?}，实算 release/debug 同侧={actual:?}）\n      {s}"
                 )
             })
         })
@@ -2777,10 +3074,14 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// （iOS 落进程表扫描那一侧，与同文件既有那一处同族）。**没有**任何既有债被重判成「对的」。
 /// 2026-09-25（系统备份开关）：`DiffersRight` 49→53 —— `android_bridge.rs` 新增读/写两条 android 腿 +
 /// 两处非 android 桩。三条债的格子一个都没动。
+/// 2026-09-29：识别 `debug_assertions` 后，旧的未知原子提前失败不再遮住随后一批 cfg 点。
+/// 按源码逐项登记后的总账是 227 处：debug 专属反侧 6、已核对反侧 96、待验证 12、
+/// iOS 现状已知不适用 73、同侧 40；下表与具名债清单分别防数量和位置漂移。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
-    ("DiffersRight", 53),
-    ("DiffersUndecided", 2),
-    ("DiffersWrongToday", 39),
+    ("DiffersOnlyInDebug", 6),
+    ("DiffersRight", 96),
+    ("DiffersUndecided", 12),
+    ("DiffersWrongToday", 73),
     ("WithAndroid", 40),
 ];
 
@@ -2796,7 +3097,63 @@ const IOS_DEBT_VERDICTS: [&str; 2] = ["DiffersWrongToday", "DiffersUndecided"];
 /// `DiffersWrongToday`，两个计数都不变 ⇒ 总账那条判据平凡通过。具名清单堵的正是这个等量对换。
 const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
+        "src-tauri/src/commands/misc/backup.rs",
+        "not(target_os = \"android\")",
+        1,
+    ),
+    (
         "src-tauri/src/commands/proxy.rs",
+        "target_os = \"android\"",
+        1,
+    ),
+    (
+        "src-tauri/src/commands/speedtest.rs",
+        "not(target_os = \"android\")",
+        4,
+    ),
+    (
+        "src-tauri/src/commands/speedtest.rs",
+        "target_os = \"android\"",
+        6,
+    ),
+    (
+        "src-tauri/src/commands/subscription.rs",
+        "not(target_os = \"android\")",
+        1,
+    ),
+    (
+        "src-tauri/src/commands/system.rs",
+        "not(target_os = \"android\")",
+        2,
+    ),
+    (
+        "src-tauri/src/commands/updater/core_update.rs",
+        "not(target_os = \"android\")",
+        1,
+    ),
+    (
+        "src-tauri/src/commands/updater/shared.rs",
+        "not(target_os = \"android\")",
+        2,
+    ),
+    (
+        "src-tauri/src/commands/updater/shared.rs",
+        "target_os = \"android\"",
+        1,
+    ),
+    ("src-tauri/src/lib.rs", "not(target_os = \"android\")", 2),
+    (
+        "src-tauri/src/runtime/geo_seed.rs",
+        "not(target_os = \"android\")",
+        2,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "not(target_os = \"android\")",
+        1,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
         "target_os = \"android\"",
         1,
     ),
@@ -2812,8 +3169,23 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",
+        "not(target_os = \"android\")",
+        3,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "target_os = \"android\"",
+        4,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
         "target_os = \"android\"",
         7,
+    ),
+    (
+        "src-tauri/src/runtime/startup_tasks.rs",
+        "not(target_os = \"android\")",
+        2,
     ),
     (
         "src-tauri/src/runtime/stats/gate.rs",
@@ -2823,6 +3195,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/stats/gate.rs",
         "target_os = \"android\"",
+        1,
+    ),
+    (
+        "src-tauri/src/runtime/stats/source.rs",
+        "any(target_os = \"android\", test)",
         1,
     ),
     (
@@ -2839,6 +3216,16 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/runtime/stats/source.rs",
         "target_os = \"android\"",
         11,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
+        2,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        8,
     ),
 ];
 

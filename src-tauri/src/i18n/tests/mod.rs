@@ -140,7 +140,7 @@ fn every_declared_key_resolves_in_all_five_locales() {
 #[test]
 fn every_native_key_in_locale_is_declared_here() {
     let mut declared = declared_keys();
-    let recovery_source = include_str!("../../../../ui/src/i18n/recovery-text.ts");
+    let recovery_source = crate::test_support::repo_file("ui/src/i18n/recovery-text.ts");
     let recovery_type = recovery_source
         .split_once("type FatalPageKey =")
         .and_then(|(_, rest)| rest.split_once(';'))

@@ -1502,7 +1502,7 @@ impl ProxyRuntime {
                 };
                 let pid = spawned.pid().unwrap_or(0);
                 log_pipe_handoff = Some(handoff);
-                let run = super::DirectCoreRun::new(spawned.child);
+                let run = super::process_supervision::DirectCoreRun::new(spawned.child);
                 direct_run_identity = Some(run.identity.clone());
                 *guard = Some(run);
                 pid

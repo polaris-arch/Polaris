@@ -8,7 +8,7 @@ use super::artifact::{
     StagedArtifacts,
 };
 use super::closure::ValidatedClosure;
-use super::plan_digest;
+use crate::runtime::proxy::mesh_apply::plan_digest;
 use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
 use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_core_supervisor::{run_config_check, ConfigCheckVerdict};

@@ -9,7 +9,9 @@ use serde_json::json;
 use std::fs;
 
 use super::super::materialize::{materialize_local_rule_sets, MaterializeError};
-use super::super::preflight::{checked_stage_with, stage_checked_with_core, PreflightError};
+#[cfg(target_os = "linux")]
+use super::super::preflight::stage_checked_with_core;
+use super::super::preflight::{checked_stage_with, PreflightError};
 
 fn fixture() -> (
     TestDir,
@@ -20,8 +22,8 @@ fn fixture() -> (
     Vec<RulePayload>,
 ) {
     let dir = TestDir::new("polaris-mesh-closure-test-");
-    let raw: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let raw: serde_json::Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
     ))
     .unwrap();
     let policy: MeshRoutePolicy = serde_json::from_value(raw["meshRoutePolicy"].clone()).unwrap();
@@ -222,15 +224,27 @@ fn materializer_rejects_stale_plan_remote_missing_and_untrusted_sources_without_
     let mut stale = input.clone();
     stale.config_version = "config-3".into();
     assert_eq!(
-        materialize_local_rule_sets(dir.path(), &plan, &stale, &legacy, &[source_root.clone()])
-            .unwrap_err(),
+        materialize_local_rule_sets(
+            dir.path(),
+            &plan,
+            &stale,
+            &legacy,
+            std::slice::from_ref(&source_root)
+        )
+        .unwrap_err(),
         MaterializeError::SnapshotMismatch
     );
 
     legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].type_field = "remote".into();
     assert_eq!(
-        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root.clone()])
-            .unwrap_err(),
+        materialize_local_rule_sets(
+            dir.path(),
+            &plan,
+            &input,
+            &legacy,
+            std::slice::from_ref(&source_root)
+        )
+        .unwrap_err(),
         MaterializeError::UnsupportedRuleSet
     );
     legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].type_field = "local".into();
@@ -241,8 +255,14 @@ fn materializer_rejects_stale_plan_remote_missing_and_untrusted_sources_without_
             .into_owned(),
     );
     assert_eq!(
-        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root.clone()])
-            .unwrap_err(),
+        materialize_local_rule_sets(
+            dir.path(),
+            &plan,
+            &input,
+            &legacy,
+            std::slice::from_ref(&source_root)
+        )
+        .unwrap_err(),
         MaterializeError::MissingRuleSource
     );
     legacy.route.as_mut().unwrap().rule_set.as_mut().unwrap()[0].path = Some(
@@ -252,8 +272,14 @@ fn materializer_rejects_stale_plan_remote_missing_and_untrusted_sources_without_
             .into_owned(),
     );
     assert_eq!(
-        materialize_local_rule_sets(dir.path(), &plan, &input, &legacy, &[source_root.clone()])
-            .unwrap_err(),
+        materialize_local_rule_sets(
+            dir.path(),
+            &plan,
+            &input,
+            &legacy,
+            std::slice::from_ref(&source_root)
+        )
+        .unwrap_err(),
         MaterializeError::UntrustedRuleSource
     );
     assert!(source.exists());

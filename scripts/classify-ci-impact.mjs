@@ -424,6 +424,7 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
     + '由 ci.yml 三平台 `cargo test` 覆盖。',
   'src-tauri/src/tray.rs': APP_LOGIC('托盘窗口'),
   'src-tauri/src/window_health.rs': APP_LOGIC('主窗白屏自愈'),
+  'src-tauri/src/windows_file_id.rs': APP_LOGIC('Windows 文件句柄身份读取（FileIdInfo；运行期文件可信性判据）'),
   'src-tauri/src/windows_single_instance.rs': APP_LOGIC('Windows 单实例'),
 
   'resources/.gitkeep':

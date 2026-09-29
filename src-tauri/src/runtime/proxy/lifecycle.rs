@@ -36,6 +36,7 @@ pub(super) enum StartLeg {
 pub(super) enum StopClaim<'a> {
     Request(Option<u64>),
     AlreadyClaimed(u64),
+    #[allow(dead_code, reason = "reserved for the state-gated stop path")]
     AlreadyClaimedUnderGate(u64, &'a MutexGuard<'a, ()>),
 }
 
@@ -562,6 +563,7 @@ impl ProxyRuntime {
 
     /// Enter the shared stop teardown while the caller still holds the Tailscale state gate.
     /// Its generation was claimed before entry; this leg neither reclaims nor reacquires.
+    #[allow(dead_code, reason = "reserved for the state-gated stop path")]
     pub(super) async fn stop_inner_under_gate<'a>(
         self: &Arc<Self>,
         preclaimed_generation: u64,

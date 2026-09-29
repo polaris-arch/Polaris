@@ -16,6 +16,7 @@ pub const MAGIC_DNS_SERVICE_TRANSPORTS: [&str; 2] = ["tcp", "udp"];
 const LEGACY_TS_DNS_TAG: &str = "dns-tailscale";
 const SHORT_NAME_REGEX: &str = r"^[^.]+\.?$";
 const MAX_SUFFIXES: usize = 4096;
+type CandidateEpochs = BTreeMap<String, BTreeSet<(String, String)>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshDnsBuildError {
@@ -150,7 +151,7 @@ pub fn build_mesh_dns_overlay(
     for identity in &state.identities {
         identities.insert((&identity.server_id, &identity.identity_epoch), identity);
     }
-    let mut candidates: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut candidates: CandidateEpochs = BTreeMap::new();
     let mut evidence_count = 0usize;
     for observation in &state.observations {
         for raw in &observation.magic_dns_suffixes {
@@ -408,7 +409,7 @@ fn normalize_suffix(raw: &str) -> Result<String, MeshDnsBuildError> {
 fn resolve_owner(
     server_id: &str,
     identity_epoch: &str,
-    candidate: Option<(&str, &BTreeMap<String, BTreeSet<(String, String)>>)>,
+    candidate: Option<(&str, &CandidateEpochs)>,
     identities: &BTreeMap<(&str, &str), &MeshIdentity>,
     emitted: &BTreeMap<(&str, &str), &str>,
 ) -> MeshDnsTargetDecision {

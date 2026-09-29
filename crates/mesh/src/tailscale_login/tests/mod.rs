@@ -333,9 +333,16 @@ fn login_cache_is_separate_from_main_cache_and_other_attempts() {
         a.experimental["cache_file"]["path"],
         b.experimental["cache_file"]["path"]
     );
-    let expected = Path::new("/ud").join("tailscale/ts1/login-cache-51234.db");
+    let expected = Path::new("/ud")
+        .join("tailscale")
+        .join("ts1")
+        .join("login-cache-51234.db");
     assert_eq!(
-        login_config_to_json(&a)["experimental"]["cache_file"]["path"],
-        expected.to_string_lossy().as_ref()
+        Path::new(
+            login_config_to_json(&a)["experimental"]["cache_file"]["path"]
+                .as_str()
+                .unwrap()
+        ),
+        expected.as_path()
     );
 }

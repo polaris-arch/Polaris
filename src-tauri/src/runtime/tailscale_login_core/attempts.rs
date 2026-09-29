@@ -78,6 +78,7 @@ pub(super) struct Attempts(Mutex<AttemptState>);
 impl Attempts {
     /// Inspect all admissions for one node, including prepared requests that have not claimed
     /// the state yet. `Err` means this table cannot certify a local absence.
+    #[allow(dead_code, reason = "reserved for cross-registry owner reconciliation")]
     pub fn local_owner_in_use(&self, server_id: &str) -> Result<bool, ()> {
         let state = self.0.lock().map_err(|_| ())?;
         if state.retired_exhausted {

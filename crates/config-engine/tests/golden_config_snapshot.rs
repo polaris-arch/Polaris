@@ -142,6 +142,7 @@
 //!   DNS / inbounds 零变化。`expected.ruleTargetMap` / `idToTagMap` 不参与对拍且该规则无 `targetServerId`，未动。
 //! - **验收**：变换前 1/37 红、仅此 case、差异恰好上述 2 项（语义递归对差，无第三项）；变换后 37/37 diff=0。
 //!   行级 diff = 17 行纯新增。三态 × 全平台的行为级回归面在 `tests/app_routing_gate_tristate.rs`。
+//!
 //! **第十次例外（2026-09-28，userspace mesh 本机 IPv6 回环）**：五种 userspace mesh endpoint
 //! 的内核都把自身分配地址映射到 `127.0.0.1` / `::1`。旧默认旁路表含 `127/8`，却不含 `::1`；
 //! 当 endpoint 同时是默认出口时，`::1` 会被拨回自身。新生成器仅在已发射的 userspace endpoint

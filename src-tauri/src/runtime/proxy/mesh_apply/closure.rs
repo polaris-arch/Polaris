@@ -4,7 +4,7 @@
 //! cannot prove either was emitted from this plan. No production caller yet.
 
 use super::artifact::{artifact_paths, validate_relative};
-use super::plan_digest;
+use crate::runtime::proxy::mesh_apply::plan_digest;
 use polaris_config_engine::builder::managed_mesh_emission::emit_managed_mesh_config;
 use polaris_config_engine::builder::managed_mesh_plan::{
     compile_managed_mesh_plan, ManagedMeshPlanInput, ManagedMeshRoutePlan, ManagedPlanTarget,

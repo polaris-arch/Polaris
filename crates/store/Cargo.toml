@@ -16,4 +16,5 @@ serde_json = { workspace = true }
 thiserror = "2"
 
 [dev-dependencies]
+polaris-source-probe = { version = "1.0.0", path = "../source-probe" }
 tempfile = "3"

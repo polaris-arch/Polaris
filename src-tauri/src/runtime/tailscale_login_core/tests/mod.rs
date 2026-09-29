@@ -429,12 +429,13 @@ async fn status_auth_url_emits_event() {
     let emitter = started(&reg, &ud, &server).await;
     sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
     wait_until(|| !emitter.captured.lock().unwrap().is_empty()).await;
-    let cap = emitter.captured.lock().unwrap();
-    assert_eq!(cap.len(), 1);
-    assert_eq!(cap[0].0, "ts1");
-    assert_eq!(cap[0].1, "myts");
-    assert_eq!(cap[0].2, URL_1);
-    drop(cap);
+    {
+        let cap = emitter.captured.lock().unwrap();
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0].0, "ts1");
+        assert_eq!(cap[0].1, "myts");
+        assert_eq!(cap[0].2, URL_1);
+    }
     reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }

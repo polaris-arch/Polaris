@@ -2,18 +2,17 @@
 //! existing plan directory is reused, including a crash-left incomplete one.
 //! This module does not start a core or claim platform protection.
 
-use super::{plan_digest, safe_plan_id};
+use super::file_snapshot::FileSnapshot;
+use crate::runtime::proxy::mesh_apply::{plan_digest, safe_plan_id};
 use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
 use polaris_config_engine::user_config::mesh_route_state::MeshActivePlan;
 use polaris_store::fs::DurableWriteGuarantee;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const ARTIFACT_SCHEMA_VERSION: u32 = 1;
@@ -175,6 +174,7 @@ fn inspect_directory(path: &Path) -> Result<(), ArtifactError> {
 }
 
 fn create_private_dir(path: &Path) -> Result<(), ArtifactError> {
+    #[allow(unused_mut, reason = "DirBuilder is configured only on Unix")]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -255,53 +255,17 @@ fn write_new_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), Artif
     Ok(())
 }
 
-fn same_file_identity(before: &Metadata, after: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        return before.dev() == after.dev() && before.ino() == after.ino();
-    }
-    #[cfg(windows)]
-    {
-        return matches!(
-            (
-                before.volume_serial_number(),
-                after.volume_serial_number(),
-                before.file_index(),
-                after.file_index(),
-            ),
-            (Some(a_volume), Some(b_volume), Some(a_index), Some(b_index))
-                if a_volume == b_volume && a_index == b_index
-        );
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (before, after);
-        false
-    }
-}
-
-fn same_file_snapshot(before: &Metadata, after: &Metadata) -> bool {
-    same_file_identity(before, after)
-        && before.len() == after.len()
-        && matches!((before.modified(), after.modified()), (Ok(a), Ok(b)) if a == b)
-        && {
-            #[cfg(unix)]
-            {
-                before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
-            }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        }
-}
-
 fn open_checked_file(path: &Path) -> Result<File, ArtifactError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(nix::libc::O_NOFOLLOW);
-    Ok(options.open(path)?)
+    #[cfg(windows)]
+    return Ok(FileSnapshot::open_path(path)?);
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+        Ok(options.open(path)?)
+    }
 }
 
 fn read_checked(root: &Path, relative: &str, max_bytes: u64) -> Result<Vec<u8>, ArtifactError> {
@@ -338,16 +302,16 @@ fn read_checked_after_lstat(
         .into_iter()
         .rev()
     {
-        let before = fs::symlink_metadata(ancestor)?;
-        if before.file_type().is_symlink() || !before.is_dir() {
+        let before = FileSnapshot::path(ancestor)?;
+        if before.is_reparse() || !before.is_dir() {
             return Err(ArtifactError::Invalid(
                 "artifact parent is not a real directory",
             ));
         }
         directories.push((ancestor.to_path_buf(), before));
     }
-    let metadata = fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let metadata = FileSnapshot::path(&path)?;
+    if metadata.is_reparse() || !metadata.is_file() {
         return Err(ArtifactError::Invalid("artifact is not a regular file"));
     }
     if metadata.len() > max_bytes {
@@ -356,7 +320,7 @@ fn read_checked_after_lstat(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+        if metadata.metadata().permissions().mode() & 0o077 != 0 {
             return Err(ArtifactError::Invalid(
                 "artifact file permissions are too broad",
             ));
@@ -364,8 +328,8 @@ fn read_checked_after_lstat(
     }
     after_lstat();
     let mut file = open_checked_file(&path)?;
-    let opened = file.metadata()?;
-    if !opened.is_file() || !same_file_snapshot(&metadata, &opened) {
+    let opened = FileSnapshot::opened(&file)?;
+    if opened.is_reparse() || !opened.is_file() || !metadata.same_snapshot(&opened) {
         return Err(ArtifactError::Invalid("artifact changed before read"));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -375,26 +339,25 @@ fn read_checked_after_lstat(
     if bytes.len() as u64 > max_bytes {
         return Err(ArtifactError::Invalid("artifact size budget exceeded"));
     }
-    let end_file = file.metadata()?;
-    let end_path = fs::symlink_metadata(&path)?;
-    if end_path.file_type().is_symlink()
+    let end_file = FileSnapshot::opened(&file)?;
+    let end_path = FileSnapshot::path(&path)?;
+    if end_path.is_reparse()
         || !end_path.is_file()
         || bytes.len() as u64 != metadata.len()
-        || !same_file_snapshot(&metadata, &end_file)
-        || !same_file_snapshot(&metadata, &end_path)
+        || !metadata.same_snapshot(&end_file)
+        || !metadata.same_snapshot(&end_path)
     {
         return Err(ArtifactError::Invalid("artifact changed during read"));
     }
     #[cfg(unix)]
-    if end_path.permissions().mode() & 0o077 != 0 {
+    if end_path.metadata().permissions().mode() & 0o077 != 0 {
         return Err(ArtifactError::Invalid(
             "artifact permissions changed during read",
         ));
     }
     for (directory, before) in directories {
-        let after = fs::symlink_metadata(&directory)?;
-        if after.file_type().is_symlink() || !after.is_dir() || !same_file_identity(&before, &after)
-        {
+        let after = FileSnapshot::path(&directory)?;
+        if after.is_reparse() || !after.is_dir() || !before.same_identity(&after) {
             return Err(ArtifactError::Invalid(
                 "artifact parent changed during read",
             ));

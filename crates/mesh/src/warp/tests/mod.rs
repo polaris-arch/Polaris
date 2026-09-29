@@ -20,15 +20,19 @@ fn registration_draft_serializes_the_renderer_camel_case_contract() {
             token: "synthetic-test-token-not-a-real-credential".into(),
         },
     };
-    let expected: serde_json::Value =
-        serde_json::from_str(include_str!("registration-draft.json")).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&polaris_source_probe::crate_source!(
+        "warp/tests/registration-draft.json"
+    ))
+    .unwrap();
     assert_eq!(serde_json::to_value(draft).unwrap(), expected);
 }
 
 #[test]
 fn registration_draft_accepts_legacy_key_names_but_emits_camel_case() {
-    let canonical: serde_json::Value =
-        serde_json::from_str(include_str!("registration-draft.json")).unwrap();
+    let canonical: serde_json::Value = serde_json::from_str(&polaris_source_probe::crate_source!(
+        "warp/tests/registration-draft.json"
+    ))
+    .unwrap();
     let mut legacy = canonical.clone();
     let object = legacy.as_object_mut().unwrap();
     let private_key = object.remove("privateKey").unwrap();

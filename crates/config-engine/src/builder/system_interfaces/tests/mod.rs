@@ -57,8 +57,8 @@ fn unmanaged_errors_identify_only_actual_system_endpoints() {
 
 #[test]
 fn android_final_json_guard_matches_native_fixture_cases() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../../fixtures/android-system-endpoints.json"
+    let fixture: Value = serde_json::from_str(&polaris_source_probe::crate_file!(
+        "fixtures/android-system-endpoints.json"
     ))
     .unwrap();
     for case in fixture["cases"].as_array().unwrap() {

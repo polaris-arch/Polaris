@@ -52,12 +52,12 @@ fn mock_runner_fails_listed_program() {
         .is_err());
 }
 
-// ── StdCommandRunner：只验「执行器」本身（不碰网络/代理/DNS，仅无害的 true/false/sleep）──
+// ── StdCommandRunner：只验「执行器」本身（不碰网络/代理/DNS，仅无害的本地命令）──
 //
 // 真进程 smoke 按宿主用 `#[cfg]` 选择可执行文件；紧邻的 system32 纯函数仍保持全平台可测。
 
-// Windows hosted runner 在整仓并行 test 的峰值期，PowerShell 冷启动实测可越过 5s；这里验证的是
-// stdout/stderr/exit-code 契约，不是启动时延。把平台差异收在一个测试常量，避免两条烟测各漂一份。
+// 这些烟测只验证 runner 的 stdout/stderr/exit-code 契约。Windows 用 System32 的 cmd.exe
+// 避免 PowerShell 在并行 CI 中偶发地超过整个命令预算；不改变 runner 的超时契约。
 #[cfg(unix)]
 const COMMAND_SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
@@ -94,23 +94,23 @@ fn system32_builds_backslash_absolute_path() {
 
 #[test]
 fn std_runner_ok_on_zero_exit() {
-    // Windows 用 PowerShell 而非 cmd：`[Console]::Out.Write` 输出字节可精确控制
-    // （cmd 的 echo 会带 CRLF 和多余空格，无法与下面的精确相等断言对齐）。
     #[cfg(unix)]
     let cmd = Command::new("/bin/sh", ["-c", "printf out; printf err >&2"]);
     #[cfg(windows)]
     let cmd = Command::new(
-        "powershell",
-        [
-            "-NoProfile",
-            "-Command",
-            "[Console]::Out.Write('out'); [Console]::Error.Write('err')",
-        ],
+        system32_from_env("cmd.exe"),
+        ["/D", "/Q", "/C", "echo out&echo err>&2"],
     );
     let out = StdCommandRunner.run(&cmd, COMMAND_SMOKE_TIMEOUT);
     let out = out.expect("zero exit → Ok");
+    #[cfg(unix)]
     assert_eq!(out.stdout, "out");
+    #[cfg(unix)]
     assert_eq!(out.stderr, "err");
+    #[cfg(windows)]
+    assert_eq!(out.stdout, "out\r\n");
+    #[cfg(windows)]
+    assert_eq!(out.stderr, "err\r\n");
 }
 
 #[test]
@@ -119,12 +119,8 @@ fn std_runner_err_on_nonzero_exit_carries_stderr() {
     let cmd = Command::new("/bin/sh", ["-c", "echo boom >&2; exit 3"]);
     #[cfg(windows)]
     let cmd = Command::new(
-        "powershell",
-        [
-            "-NoProfile",
-            "-Command",
-            "[Console]::Error.Write('boom'); exit 3",
-        ],
+        system32_from_env("cmd.exe"),
+        ["/D", "/Q", "/C", "echo boom>&2&exit /b 3"],
     );
     let e = StdCommandRunner
         .run(&cmd, COMMAND_SMOKE_TIMEOUT)
@@ -151,13 +147,23 @@ fn std_runner_kills_on_timeout() {
     #[cfg(unix)]
     let cmd = Command::new("/bin/sh", ["-c", "sleep 30"]);
     #[cfg(windows)]
-    let cmd = Command::new(
-        "powershell",
-        ["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],
+    let marker_dir = tempfile::Builder::new()
+        .prefix("polaris-exec-")
+        .tempdir_in(".")
+        .expect("创建启动标记目录");
+    #[cfg(windows)]
+    let marker = marker_dir.path().join("started");
+    #[cfg(windows)]
+    let script = format!(
+        "echo started>{}\\started&for /L %i in (1,1,2147483647) do @rem",
+        marker_dir.path().file_name().unwrap().to_string_lossy()
     );
-    // unix 150ms 够 /bin/sh 进 sleep；Windows 上 PowerShell 冷启动约 200–400ms，
-    // 沿用 150ms 会「还没开始 sleep 就超时」→ 测的变成「杀启动中的进程」而非
-    // 「杀已在运行的挂起命令」。放宽到 2s（仍 ≪ 被杀命令的 30s，故断言语义不变）。
+    #[cfg(windows)]
+    let cmd = Command::new(
+        system32_from_env("cmd.exe"),
+        ["/D", "/Q", "/C", script.as_str()],
+    );
+    // Windows 的 cmd 内部循环不启动后代进程；标记证明命令体已执行，避免把冷启动超时当作杀进程通过。
     #[cfg(unix)]
     let timeout = Duration::from_millis(150);
     #[cfg(windows)]
@@ -165,6 +171,12 @@ fn std_runner_kills_on_timeout() {
     let started = Instant::now();
     let e = StdCommandRunner.run(&cmd, timeout).expect_err("超时 → Err");
     assert!(e.contains("超时"), "{e}");
+    #[cfg(windows)]
+    assert!(
+        marker.exists(),
+        "超时前命令体须已执行: {}",
+        marker.display()
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "须在超时后即刻返回，实际 {:?}",
@@ -177,17 +189,17 @@ fn std_runner_drains_large_output_without_deadlock() {
     #[cfg(unix)]
     let cmd = Command::new("/bin/sh", ["-c", "yes polaris | head -c 300000"]);
     #[cfg(windows)]
+    let script = format!(
+        "(for /L %i in (1,1,300) do @<nul set /p ={})&exit /b 0",
+        "x".repeat(1000)
+    );
+    #[cfg(windows)]
     let cmd = Command::new(
-        "powershell",
-        [
-            "-NoProfile",
-            "-Command",
-            "[Console]::Out.Write('x' * 300000)",
-        ],
+        system32_from_env("cmd.exe"),
+        ["/D", "/Q", "/C", script.as_str()],
     );
     // 远超管道缓冲（64KB）：若不起排空线程，此处会与 try_wait 轮询互等 → 超时失败。
-    // 复用平台烟测预算：Windows hosted runner 在整仓并行测试峰值期启动 PowerShell + 写出
-    // 300KB 曾超过固定 10s；此测试验证「能排空并退出」，不把共享 runner 负载误判成死锁。
+    // 复用平台烟测预算；此测试验证「能排空并退出」。
     let out = StdCommandRunner
         .run(&cmd, COMMAND_SMOKE_TIMEOUT)
         .expect("大输出须正常收完");

@@ -1,8 +1,8 @@
 use super::*;
 
 fn warp_node() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../../crates/mesh/src/warp/tests/registration-server.json"
+    serde_json::from_str(&crate::test_support::repo_file(
+        "crates/mesh/src/warp/tests/registration-server.json",
     ))
     .unwrap()
 }
@@ -11,9 +11,9 @@ fn warp_node() -> Value {
 fn add_registration_warp_renderer_payload_survives_disk_readback() {
     let dir = temp_dir("warp-contract");
     let node = warp_node();
-    let registered: polaris_mesh::warp::WarpWireGuardDraft = serde_json::from_str(include_str!(
-        "../../../../../crates/mesh/src/warp/tests/registration-draft.json"
-    ))
+    let registered: polaris_mesh::warp::WarpWireGuardDraft = serde_json::from_str(
+        &crate::test_support::repo_file("crates/mesh/src/warp/tests/registration-draft.json"),
+    )
     .unwrap();
     let ipc = serde_json::to_value(registered).unwrap();
     assert_eq!(node["wireguardSettings"]["privateKey"], ipc["privateKey"]);

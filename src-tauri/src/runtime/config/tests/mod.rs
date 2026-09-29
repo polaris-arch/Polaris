@@ -111,8 +111,8 @@ fn legacy_start_lease_excludes_marker_publication_until_last_operation_finishes(
 #[test]
 fn ordinary_config_writes_preserve_managed_ledger_and_cannot_drop_dns_policy() {
     let dir = temp_dir("mesh-protected-writes");
-    let wire: Value = serde_json::from_str(include_str!(
-        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let wire: Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
     ))
     .unwrap();
     let mut config = polaris_store::store::default_config();
@@ -185,8 +185,8 @@ fn ordinary_config_writes_preserve_managed_ledger_and_cannot_drop_dns_policy() {
 }
 
 fn mesh_wire_fixture() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
     ))
     .unwrap()
 }

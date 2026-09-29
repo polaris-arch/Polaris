@@ -169,22 +169,23 @@ async fn clean_mesh_selection_that_changes_routes_restarts_only_the_running_proj
             .save_full(&disk)
             .expect("save selected id with unrelated D debt");
         let persisted = rt.config.current().expect("read saved selection");
-        let snap = rt.switch_snapshot.read().unwrap();
-        let snapshot = snap.as_ref().expect("running selector snapshot");
-        assert!(
-            snapshot.id_to_tag.contains_key(&target),
-            "{label}: target must survive persistence"
-        );
-        assert!(
-            snapshot.fingerprints.contains_key(&target),
-            "{label}: target has a running fingerprint"
-        );
-        assert_eq!(
-            node_fingerprints::modified_table_json(&persisted).get(&target),
-            snapshot.fingerprints.get(&target),
-            "{label}: target must remain a clean running member"
-        );
-        drop(snap);
+        {
+            let snap = rt.switch_snapshot.read().unwrap();
+            let snapshot = snap.as_ref().expect("running selector snapshot");
+            assert!(
+                snapshot.id_to_tag.contains_key(&target),
+                "{label}: target must survive persistence"
+            );
+            assert!(
+                snapshot.fingerprints.contains_key(&target),
+                "{label}: target has a running fingerprint"
+            );
+            assert_eq!(
+                node_fingerprints::modified_table_json(&persisted).get(&target),
+                snapshot.fingerprints.get(&target),
+                "{label}: target must remain a clean running member"
+            );
+        }
         assert!(
             !rt.config.staged_node_mask().pending,
             "{label}: no unsaved draft"

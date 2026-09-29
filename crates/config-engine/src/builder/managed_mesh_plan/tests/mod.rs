@@ -3,8 +3,8 @@ use crate::user_config::mesh_route_state::{MeshAssignment, MeshOverride};
 use serde_json::json;
 
 fn fixture() -> (MeshRoutePolicy, MeshRouteState) {
-    let wire: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let wire: serde_json::Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "ui/src/contracts/mesh-route-state.fixture.json"
     ))
     .unwrap();
     (

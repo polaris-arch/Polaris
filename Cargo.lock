@@ -3291,6 +3291,7 @@ dependencies = [
  "async-trait",
  "polaris-config-engine",
  "polaris-helper-proto",
+ "polaris-source-probe",
  "serde",
  "serde_json",
  "tokio",
@@ -3358,6 +3359,7 @@ name = "polaris-store"
 version = "1.0.0"
 dependencies = [
  "polaris-config-engine",
+ "polaris-source-probe",
  "scrypt",
  "serde",
  "serde_json",

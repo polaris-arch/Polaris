@@ -52,8 +52,8 @@ fn cfg() -> Value {
 
 fn managed_cfg() -> Value {
     let mut config = cfg();
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let fixture: Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "ui/src/contracts/mesh-route-state.fixture.json"
     ))
     .unwrap();
     config["meshRoutePolicy"] = fixture["meshRoutePolicy"].clone();

@@ -1164,7 +1164,9 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     // 它自己在头注里写清了这一点（2026-09-13 落地时实测撞过一次，故留此记录）。
     let publish_job = slice_between(&workflow_raw, "\n  release-apk:\n", "", ANDROID_WORKFLOW);
     assert!(
-        publish_job.contains("bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\\n"),
+        publish_job.contains(
+            "bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\\n"
+        ),
         "{ANDROID_WORKFLOW}：`release-apk` 里没有那条**不带逃生门**的 Tauri 构建行 —— \
          发布腿要么没在构建 release，要么已经改成了别的形态，先来这里说清楚。"
     );

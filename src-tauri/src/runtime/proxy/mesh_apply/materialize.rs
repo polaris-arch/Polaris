@@ -7,7 +7,8 @@ use super::artifact::{artifact_paths, MAX_FILES, MAX_TOTAL_BYTES};
 use super::closure::{
     validate_closure, ClosureError, ExpectedEmission, RulePayload, ValidatedClosure,
 };
-use super::plan_digest;
+use super::file_snapshot::FileSnapshot;
+use crate::runtime::proxy::mesh_apply::plan_digest;
 use polaris_config_engine::builder::managed_mesh_emission::{
     emit_managed_mesh_config, ManagedMeshEmission,
 };
@@ -16,12 +17,14 @@ use polaris_config_engine::builder::managed_mesh_plan::{
 };
 use polaris_config_engine::singbox::SingBoxConfig;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, Metadata, OpenOptions};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::io::Read;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,53 +58,12 @@ fn sha256(bytes: &[u8]) -> String {
     polaris_updater::verify::sha256_hex(bytes)
 }
 
-fn same_identity(before: &Metadata, after: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        return before.dev() == after.dev() && before.ino() == after.ino();
-    }
-    #[cfg(windows)]
-    {
-        return matches!(
-            (
-                before.volume_serial_number(),
-                after.volume_serial_number(),
-                before.file_index(),
-                after.file_index(),
-            ),
-            (Some(before_volume), Some(after_volume), Some(before_index), Some(after_index))
-                if before_volume == after_volume && before_index == after_index
-        );
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (before, after);
-        false // A platform without a stable file identity cannot establish trust.
-    }
-}
-
-fn same_snapshot(before: &Metadata, after: &Metadata) -> bool {
-    same_identity(before, after)
-        && before.len() == after.len()
-        && matches!((before.modified(), after.modified()), (Ok(a), Ok(b)) if a == b)
-        && {
-            #[cfg(unix)]
-            {
-                before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
-            }
-            #[cfg(not(unix))]
-            {
-                true
-            }
-        }
-}
-
-fn checked_directory_chain(path: &Path) -> Result<Vec<(PathBuf, Metadata)>, MaterializeError> {
+fn checked_directory_chain(path: &Path) -> Result<Vec<(PathBuf, FileSnapshot)>, MaterializeError> {
     let mut chain = Vec::new();
     for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
         let metadata =
-            fs::symlink_metadata(ancestor).map_err(|_| MaterializeError::MissingRuleSource)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            FileSnapshot::path(ancestor).map_err(|_| MaterializeError::MissingRuleSource)?;
+        if metadata.is_reparse() || !metadata.is_dir() {
             return Err(MaterializeError::UntrustedRuleSource);
         }
         chain.push((ancestor.to_path_buf(), metadata));
@@ -127,11 +89,16 @@ fn validate_source_roots(roots: &[PathBuf]) -> Result<(), MaterializeError> {
 }
 
 fn open_source(path: &Path) -> Result<File, MaterializeError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(nix::libc::O_NOFOLLOW);
-    options.open(path).map_err(|_| MaterializeError::SourceIo)
+    #[cfg(windows)]
+    return FileSnapshot::open_path(path).map_err(|_| MaterializeError::SourceIo);
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+        options.open(path).map_err(|_| MaterializeError::SourceIo)
+    }
 }
 
 fn read_trusted_source(path: &Path, roots: &[PathBuf]) -> Result<Vec<u8>, MaterializeError> {
@@ -170,8 +137,8 @@ fn read_trusted_source_after_lstat(
                 .ok_or(MaterializeError::UntrustedRuleSource)?,
         )?;
         let metadata =
-            fs::symlink_metadata(&current).map_err(|_| MaterializeError::MissingRuleSource)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            FileSnapshot::path(&current).map_err(|_| MaterializeError::MissingRuleSource)?;
+        if metadata.is_reparse() || !metadata.is_file() {
             return Err(MaterializeError::UntrustedRuleSource);
         }
         if metadata.len() > MAX_TOTAL_BYTES as u64 {
@@ -179,8 +146,8 @@ fn read_trusted_source_after_lstat(
         }
         after_lstat();
         let mut file = open_source(&current)?;
-        let opened = file.metadata().map_err(|_| MaterializeError::SourceIo)?;
-        if !opened.is_file() || !same_snapshot(&metadata, &opened) {
+        let opened = FileSnapshot::opened(&file).map_err(|_| MaterializeError::SourceIo)?;
+        if opened.is_reparse() || !opened.is_file() || !metadata.same_snapshot(&opened) {
             return Err(MaterializeError::SourceChanged);
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -191,21 +158,19 @@ fn read_trusted_source_after_lstat(
         if bytes.len() > MAX_TOTAL_BYTES {
             return Err(MaterializeError::ResourceBudget);
         }
-        let end_opened = file.metadata().map_err(|_| MaterializeError::SourceIo)?;
-        let end_path =
-            fs::symlink_metadata(&current).map_err(|_| MaterializeError::SourceChanged)?;
-        if end_path.file_type().is_symlink()
+        let end_opened = FileSnapshot::opened(&file).map_err(|_| MaterializeError::SourceIo)?;
+        let end_path = FileSnapshot::path(&current).map_err(|_| MaterializeError::SourceChanged)?;
+        if end_path.is_reparse()
             || !end_path.is_file()
             || bytes.len() as u64 != metadata.len()
-            || !same_snapshot(&metadata, &end_opened)
-            || !same_snapshot(&metadata, &end_path)
+            || !metadata.same_snapshot(&end_opened)
+            || !metadata.same_snapshot(&end_path)
         {
             return Err(MaterializeError::SourceChanged);
         }
         for (dir, before) in directories {
-            let after = fs::symlink_metadata(&dir).map_err(|_| MaterializeError::SourceChanged)?;
-            if after.file_type().is_symlink() || !after.is_dir() || !same_identity(&before, &after)
-            {
+            let after = FileSnapshot::path(&dir).map_err(|_| MaterializeError::SourceChanged)?;
+            if after.is_reparse() || !after.is_dir() || !before.same_identity(&after) {
                 return Err(MaterializeError::SourceChanged);
             }
         }
@@ -326,24 +291,4 @@ pub(crate) fn materialize_local_rule_sets(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestDir;
-
-    #[test]
-    fn same_length_source_replaced_between_lstat_and_open_is_rejected() {
-        let dir = TestDir::new("polaris-rule-source-race-");
-        let source = dir.path().join("source.json");
-        let replacement = dir.path().join("replacement.json");
-        fs::write(&source, b"first").unwrap();
-        fs::write(&replacement, b"other").unwrap();
-        assert_eq!(
-            read_trusted_source_after_lstat(&source, &[dir.path().to_path_buf()], || {
-                fs::remove_file(&source).unwrap();
-                fs::rename(&replacement, &source).unwrap();
-            })
-            .unwrap_err(),
-            MaterializeError::SourceChanged
-        );
-    }
-}
+mod tests;

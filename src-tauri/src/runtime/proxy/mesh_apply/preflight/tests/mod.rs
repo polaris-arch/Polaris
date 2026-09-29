@@ -167,10 +167,9 @@ fn frozen_full_generator_configs_survive_the_exact_start_typed_roundtrip() {
     // These are the repository's exported full builder outputs, not a hand
     // assembled empty config. The config-engine golden gate separately checks
     // current Rust generation against this corpus and its documented deltas.
-    let cases: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../crates/config-engine/fixtures/config-snapshot.json"
-    )))
+    let cases: serde_json::Value = serde_json::from_str(&crate::test_support::repo_file(
+        "crates/config-engine/fixtures/config-snapshot.json",
+    ))
     .unwrap();
     let cases = cases["cases"].as_array().unwrap();
     assert!(cases.len() >= 30);

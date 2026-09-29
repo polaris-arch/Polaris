@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use polaris_core_supervisor::{scan_running_cores, stale_pids, ProcessKiller, Signal};
+use tokio::process::Child;
 
 use crate::runtime::helper::HelperStopOps;
 use crate::runtime::win_console::no_console_window;
@@ -17,6 +18,31 @@ use crate::runtime::win_console::no_console_window;
 use super::core_binary::resolve_core_binary;
 use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
+
+/// Identity of one locally spawned core. The token is created with its Child handle,
+/// so neither a reused PID nor a later lifecycle request can impersonate that run.
+#[derive(Clone)]
+pub(super) struct RunIdentity(pub(super) Arc<()>);
+
+impl RunIdentity {
+    pub(super) fn same_run(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+pub(super) struct DirectCoreRun {
+    pub(super) child: Child,
+    pub(super) identity: RunIdentity,
+}
+
+impl DirectCoreRun {
+    pub(super) fn new(child: Child) -> Self {
+        Self {
+            child,
+            identity: RunIdentity(Arc::new(())),
+        }
+    }
+}
 
 /// SIGTERM→SIGKILL 宽限期（上游 `stopSingBoxProcess` 的 5s 优雅窗口，:5230）。
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);

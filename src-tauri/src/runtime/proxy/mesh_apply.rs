@@ -5,6 +5,7 @@
 
 pub(crate) mod artifact;
 pub(crate) mod closure;
+mod file_snapshot;
 pub(crate) mod materialize;
 pub(crate) mod owner_scope;
 pub(crate) mod preflight;
@@ -397,6 +398,10 @@ fn check_core(tx: &MeshTransaction, receipt: &CoreReceipt) -> Result<(), ApplyEr
 
 /// One journal step. Its returned state must be written by a short CAS before
 /// any next await/action; a CAS miss means the caller has lost ownership.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "state transition inputs remain explicit for review"
+)]
 pub(crate) fn advance(
     state: &MeshRouteState,
     expected_state_revision: &str,
@@ -503,6 +508,10 @@ pub(crate) fn advance(
 /// actual stop. This checks journal ownership, not the old process identity or
 /// its monitor attachment. `StopRequested` is only intent; process exit and
 /// both owner releases still require independent evidence for `OldStopped`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "state transition inputs remain explicit for review"
+)]
 pub(crate) fn request_stop_reserved(
     state: &MeshRouteState,
     expected_state_revision: &str,
@@ -544,6 +553,10 @@ pub(crate) fn request_stop_reserved(
 /// The old Stop→new Start generation transition. `advance` normally requires
 /// the old claim to be live and must not be called with a fabricated old live
 /// generation after the gate has already reserved a new Start generation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "state transition inputs remain explicit for review"
+)]
 pub(crate) fn request_start_reserved(
     state: &MeshRouteState,
     expected_state_revision: &str,
@@ -767,6 +780,10 @@ pub(super) fn recovery_decision(
 /// crash. Reclaim it in the new boot through CAS, demoting `coreReady` so both
 /// core evidence and the platform ACK must be collected again. No start or
 /// commit is authorized by this function itself.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "state transition inputs remain explicit for review"
+)]
 pub(super) fn reclaim_ready_candidate(
     state: &MeshRouteState,
     expected_state_revision: &str,

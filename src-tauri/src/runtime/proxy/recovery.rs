@@ -14,10 +14,12 @@ use crate::runtime::helper::ManagedCoreStatus;
 
 use super::code;
 use super::lifecycle::monotonic_now_ms;
-use super::process_supervision::{pid_alive, pid_identity_verdict, process_identity, PidIdentity};
+use super::process_supervision::{
+    pid_alive, pid_identity_verdict, process_identity, PidIdentity, RunIdentity,
+};
 use super::route_replan::RuntimeBindingState;
 use super::startup::with_helper_gate_suppressed;
-use super::{ProxyRuntime, RunIdentity, StartError};
+use super::{ProxyRuntime, StartError};
 
 /// 崩溃监测轮询间隔（ms）。tokio `Child::wait()` 单持有者 → 监测只能轮询 `try_wait`（见
 /// `spawn_crash_monitor`）；1s 与健康检查同量级，CPU 可忽略，崩溃检出延迟 ≤1s。

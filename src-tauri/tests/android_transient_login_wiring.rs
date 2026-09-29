@@ -1,11 +1,22 @@
 //! Host contract checks complement the real Registry close/timeout/STATUS behavioral tests.
-const HOST: &str =
-    include_str!("../gen/android/app/src/main/java/com/polaris2/app/vpn/TransientLoginHost.kt");
-const NETWORK: &str =
-    include_str!("../gen/android/app/src/main/java/com/polaris2/app/vpn/TransientLoginNetwork.kt");
-const MAIN: &str =
-    include_str!("../gen/android/app/src/main/java/com/polaris2/app/vpn/BoxService.kt");
-const REGISTRY: &str = include_str!("../src/runtime/tailscale_login_core.rs");
+static HOST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    polaris_source_probe::crate_file!(
+        "gen/android/app/src/main/java/com/polaris2/app/vpn/TransientLoginHost.kt"
+    )
+});
+static NETWORK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    polaris_source_probe::crate_file!(
+        "gen/android/app/src/main/java/com/polaris2/app/vpn/TransientLoginNetwork.kt"
+    )
+});
+static MAIN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    polaris_source_probe::crate_file!(
+        "gen/android/app/src/main/java/com/polaris2/app/vpn/BoxService.kt"
+    )
+});
+static REGISTRY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    polaris_source_probe::crate_source!("runtime/tailscale_login_core.rs")
+});
 
 #[test]
 fn android_login_uses_instance_factory_and_status_not_global_command_socket() {
@@ -36,11 +47,11 @@ fn orphaned_transient_state_claim_is_closed_before_retry_start() {
 #[test]
 fn main_start_reload_and_stop_share_state_ownership_boundary() {
     assert_eq!(
-        MAIN.matches("TransientLoginHost.withMainConfig(this, config")
+        MAIN.matches("TransientLoginHost.withMainConfig(attempt, config")
             .count(),
         2
     );
-    assert!(MAIN.contains("TransientLoginHost.closeMain(this)"));
+    assert!(MAIN.contains("TransientLoginHost.closeMain(attempt)"));
     let reserve = HOST
         .find("mainClaims[owner] = mainClaims[owner].orEmpty() + directories")
         .unwrap();

@@ -171,8 +171,8 @@ fn mesh_routing_restore_is_blocked_without_trusted_scope_and_old_backup_skips_it
 #[test]
 fn unselected_mesh_routing_restore_keeps_latest_disk_policy_and_ledger() {
     let dir = TestDir::new("polaris-backup-mesh-routing-local-truth");
-    let wire: Value = serde_json::from_str(include_str!(
-        "../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let wire: Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
     ))
     .unwrap();
     let mut local = polaris_store::store::default_config();

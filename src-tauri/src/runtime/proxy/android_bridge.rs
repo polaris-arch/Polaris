@@ -263,6 +263,7 @@ pub(super) struct AndroidStartReceipt {
     pub tun: Option<AndroidTunScope>,
 }
 
+#[cfg(any(target_os = "android", test))]
 impl AndroidStartReceipt {
     fn matches_request(&self, run_id: &str, config_digest: &str, claim: Option<&str>) -> bool {
         self.exact_target().is_valid()
@@ -293,6 +294,7 @@ impl AndroidStartReceipt {
 
 /// The attempt's birth nonce comes from Kotlin, not from the request or Service instance.
 /// A run ID alone may be reused after Service recreation and is not a stop authority.
+#[cfg(any(target_os = "android", test))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AndroidExactTarget {
@@ -300,6 +302,7 @@ pub(super) struct AndroidExactTarget {
     pub birth_nonce: String,
 }
 
+#[cfg(any(target_os = "android", test))]
 impl AndroidExactTarget {
     fn is_valid(&self) -> bool {
         !self.run_id.is_empty()
@@ -312,6 +315,7 @@ impl AndroidExactTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[cfg(any(target_os = "android", test))]
 pub(super) enum AndroidExactStopState {
     Closed,
     AlreadyGone,
@@ -321,6 +325,7 @@ pub(super) enum AndroidExactStopState {
 
 /// Closed/AlreadyGone require the Kotlin registry's exact native-close tombstone.
 /// Busy is custody only; Unknown never authorizes a replacement start.
+#[cfg(any(target_os = "android", test))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AndroidExactStopReceipt {
@@ -330,6 +335,7 @@ pub(super) struct AndroidExactStopReceipt {
     pub reason: Option<String>,
 }
 
+#[cfg(any(target_os = "android", test))]
 impl AndroidExactStopReceipt {
     fn matches_target(&self, target: &AndroidExactTarget) -> bool {
         self.run_id == target.run_id
@@ -370,6 +376,7 @@ fn exact_main_core_result(
 }
 
 /** Read only: absent registry state, a lost process, and a different owner remain Unknown. */
+#[cfg(any(target_os = "android", test))]
 pub(super) async fn main_core_exact_status(
     target: &AndroidExactTarget,
 ) -> Result<AndroidExactStopReceipt, String> {
@@ -398,6 +405,7 @@ pub(super) async fn main_core_exact_status(
 }
 
 /** Request close of only this exact attempt; request delivery is never an exit receipt. */
+#[cfg(any(target_os = "android", test))]
 pub(super) async fn stop_core_exact(
     target: &AndroidExactTarget,
 ) -> Result<AndroidExactStopReceipt, String> {
@@ -426,6 +434,7 @@ pub(super) async fn stop_core_exact(
 }
 
 /// A registry snapshot is not a liveness probe, nor a NoOldCore receipt by itself.
+#[cfg(any(target_os = "android", test))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AndroidMainCoreOwnership {
@@ -433,6 +442,7 @@ pub(super) struct AndroidMainCoreOwnership {
     pub run_id: Option<String>,
 }
 
+#[cfg(any(target_os = "android", test))]
 pub(super) async fn main_core_ownership() -> Result<AndroidMainCoreOwnership, String> {
     #[cfg(target_os = "android")]
     {
@@ -467,6 +477,7 @@ pub(super) async fn main_core_ownership() -> Result<AndroidMainCoreOwnership, St
 
 /// Process-local fence status only. This does not acquire the fence, publish a
 /// Preparing marker, or establish a global NoOldCore receipt.
+#[cfg(any(target_os = "android", test))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AndroidLegacyDrainStatus {
@@ -478,6 +489,7 @@ pub(super) struct AndroidLegacyDrainStatus {
     pub reason: Option<String>,
 }
 
+#[cfg(any(target_os = "android", test))]
 impl AndroidLegacyDrainStatus {
     fn matches_request(&self, fence_id: &str) -> bool {
         if self.fence_id != fence_id || self.process_nonce.is_empty() {
@@ -503,6 +515,7 @@ impl AndroidLegacyDrainStatus {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
 pub(super) async fn legacy_drain_status(
     fence_id: &str,
 ) -> Result<AndroidLegacyDrainStatus, String> {

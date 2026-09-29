@@ -217,12 +217,15 @@ fn android_bundled_data_dir(config_dir: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "android")]
-fn bundled_data_candidates() -> Vec<PathBuf> {
+fn android_bundled_data_candidates() -> Vec<PathBuf> {
     crate::runtime::core_paths::base_dir()
         .and_then(android_bundled_data_dir)
         .into_iter()
         .collect()
 }
+
+#[cfg(target_os = "android")]
+use self::android_bundled_data_candidates as bundled_data_candidates;
 
 /// release 构建剔除源码仓候选（见 [`bundled_data_candidates`] 上方的「打包态验证假绿」说明）。
 #[cfg(not(target_os = "android"))]

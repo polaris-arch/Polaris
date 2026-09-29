@@ -566,6 +566,7 @@ pub enum StartLoginOutcome {
 
 /// Facts from this process's Tailscale login registry only. `Vacant` says nothing about an OS,
 /// Android, or helper-owned process and must not by itself authorize identity retirement.
+#[allow(dead_code, reason = "reserved for cross-registry owner reconciliation")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TsRegistryOwnerState {
     Busy,
@@ -754,6 +755,7 @@ impl LoginCoreRegistry {
     /// The gate prevents new prepare/reserve/spawn admissions. A supervisor can remove an entry
     /// outside the gate after confirmed close or after_exit; that only clears local ownership.
     /// Each std mutex is read and released separately.
+    #[allow(dead_code, reason = "reserved for cross-registry owner reconciliation")]
     pub(crate) fn owner_state_under_gate(
         &self,
         server_id: &str,
@@ -1186,6 +1188,10 @@ impl LoginCoreRegistry {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "login attempt inputs carry independent lifetime-bound authorities"
+    )]
     async fn launch_attempt(
         &self,
         requested: &ServerConfig,

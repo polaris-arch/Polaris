@@ -15,8 +15,8 @@ fn owner(server_id: &str, epoch: &str) -> MeshOwnerRef {
 }
 
 fn input() -> ManagedMeshPlanInput {
-    let mut wire: Value = serde_json::from_str(include_str!(
-        "../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let mut wire: Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "ui/src/contracts/mesh-route-state.fixture.json"
     ))
     .unwrap();
     wire["meshRoutePolicy"]["dnsPolicy"] = json!({

@@ -98,6 +98,7 @@ pub use pending_changes::PendingChangesSummary;
 #[cfg(test)]
 use platform_contracts::enumerate_own_lan_cidrs;
 use platform_contracts::platform_tag;
+use process_supervision::DirectCoreRun;
 pub(crate) use process_supervision::{pid_alive, send_signal};
 use route_replan::RuntimeBindingState;
 // B7 跟随面：生产消费点随本批搬进 `hot_switch`/`auto_switch`，façade 只剩 `proxy/tests/` 用它
@@ -192,33 +193,6 @@ use polaris_switch_engine::DebouncedRestart;
 #[cfg(test)]
 use polaris_switch_engine::{ManagementApi, ManagementError};
 use serde_json::Value;
-use tokio::process::Child;
-
-/// Identity of one locally spawned core. The token is created with its Child handle,
-/// so neither a reused PID nor a later lifecycle request can impersonate that run.
-#[derive(Clone)]
-struct RunIdentity(Arc<()>);
-
-impl RunIdentity {
-    fn same_run(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-struct DirectCoreRun {
-    child: Child,
-    identity: RunIdentity,
-}
-
-impl DirectCoreRun {
-    fn new(child: Child) -> Self {
-        Self {
-            child,
-            identity: RunIdentity(Arc::new(())),
-        }
-    }
-}
-
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
 use crate::commands::speedtest::current_server_fingerprints;
@@ -1248,7 +1222,7 @@ pub struct ProxyRuntime {
     pid: Arc<Mutex<Option<u32>>>,
     /// **C6-5**：当前运行核是否经 helper 提权起（TUN 路由）。运行期内部真值源（≠ 面向前端的
     /// `ProxyStatus.started_via_helper`，后者仅就绪成功后落）——驱动 [`kill_core`](Self::kill_core) 走
-    /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`Child`] 句柄）。
+    /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`tokio::process::Child`] 句柄）。
     /// 起核提交时置、停核/直起时清。
     core_via_helper: Arc<AtomicBool>,
     /// H-1 强制重启专用配置快照（`(id, config, source)`）。

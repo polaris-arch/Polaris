@@ -1339,9 +1339,9 @@ impl ConfigManager {
         }
         let next = revise_semantic(&previous, expected.state_revision, next)
             .map_err(|error| ApplyPersistError::Store(StoreError::validation(error)))?
-            .ok_or_else(|| {
-                ApplyPersistError::Step(ApplyError::Invalid("Apply step made no change"))
-            })?;
+            .ok_or(ApplyPersistError::Step(ApplyError::Invalid(
+                "Apply step made no change",
+            )))?;
         raw[mesh_guard::STATE_KEY] = serde_json::to_value(&next).map_err(StoreError::from)?;
         let canonical = ConfigStore::canonicalize_for_save(&raw)?;
         self.persist_canonical_under_write_lock(&canonical)?;

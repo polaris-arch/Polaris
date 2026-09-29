@@ -97,8 +97,8 @@ async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_rep
     use polaris_store::mesh_guard::{POLICY_KEY, REQUIRED_MARKER_FILE, STATE_KEY};
 
     let (rt, dir) = test_runtime();
-    let wire: Value = serde_json::from_str(include_str!(
-        "../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let wire: Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
     ))
     .unwrap();
     let mut raw = polaris_store::store::default_config();

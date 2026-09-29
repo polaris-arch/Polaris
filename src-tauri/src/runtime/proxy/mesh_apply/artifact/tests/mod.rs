@@ -16,8 +16,8 @@ fn tempdir() -> TestDir {
 }
 
 fn plan(id: &str) -> ManagedMeshRoutePlan {
-    let raw: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../../../ui/src/contracts/mesh-route-state.fixture.json"
+    let raw: serde_json::Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
     ))
     .unwrap();
     let policy: MeshRoutePolicy = serde_json::from_value(raw["meshRoutePolicy"].clone()).unwrap();

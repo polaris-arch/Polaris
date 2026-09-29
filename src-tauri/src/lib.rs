@@ -43,6 +43,8 @@ mod startup;
 mod test_support;
 mod tray;
 mod window_health;
+#[cfg(windows)]
+mod windows_file_id;
 #[cfg(target_os = "windows")]
 mod windows_single_instance;
 

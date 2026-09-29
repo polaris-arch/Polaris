@@ -7,8 +7,8 @@ fn android_uses_extracted_apk_assets_under_app_data() {
         super::super::android_bundled_data_dir(config).unwrap(),
         std::path::PathBuf::from("/data/user/10/com.polaris2.app/bundled-geo")
     );
-    let kotlin = include_str!(
-        "../../../../gen/android/app/src/main/java/com/polaris2/app/vpn/BundledRules.kt"
+    let kotlin = crate::test_support::crate_file(
+        "gen/android/app/src/main/java/com/polaris2/app/vpn/BundledRules.kt",
     );
     assert!(kotlin.contains("File(context.dataDir, EXTRACTED_DIR)"));
     assert!(kotlin.contains("EXTRACTED_DIR = \"bundled-geo\""));
