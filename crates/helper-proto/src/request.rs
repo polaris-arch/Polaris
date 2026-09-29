@@ -23,6 +23,92 @@
 //! `crate::codec` 的编帧函数按 [`crate::Platform`] 决定是否加 token 行）。
 
 use crate::command;
+use std::num::NonZeroU32;
+
+/// Opaque identity minted once per Linux helper-owned child birth.
+///
+/// This type only carries bytes. The helper must mint them from an OS random source;
+/// PID, clocks, addresses, and `Arc` identity are not birth tokens.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HelperBirthToken([u8; 16]);
+
+impl HelperBirthToken {
+    /// Wrap bytes obtained from the helper's OS random source.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Parse exactly 32 lowercase hex digits. No trimming or aliases are accepted.
+    #[must_use]
+    pub fn parse_wire(wire: &str) -> Option<Self> {
+        if wire.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0; 16];
+        for (index, pair) in wire.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            bytes[index] = (digit(pair[0])? << 4) | digit(pair[1])?;
+        }
+        Some(Self(bytes))
+    }
+
+    /// Canonical 32-character lowercase hex wire token.
+    #[must_use]
+    pub fn to_wire(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(32);
+        for byte in self.0 {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+}
+
+impl std::fmt::Debug for HelperBirthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HelperBirthToken(..)")
+    }
+}
+
+/// A PID alone is insufficient to name a helper-owned child across PID reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HelperBirthTarget {
+    pub pid: NonZeroU32,
+    pub birth: HelperBirthToken,
+}
+
+impl HelperBirthTarget {
+    /// Parse exactly one canonical decimal PID and one birth token.
+    #[must_use]
+    pub fn parse_wire(pid: &str, birth: &str) -> Option<Self> {
+        if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let parsed = pid.parse::<NonZeroU32>().ok()?;
+        (parsed.to_string() == pid).then_some(Self {
+            pid: parsed,
+            birth: HelperBirthToken::parse_wire(birth)?,
+        })
+    }
+}
+
+/// Strict decoder for the complete `stop-birth-safe` argument list.
+///
+/// A missing, duplicate, or extra identity line is invalid. In particular it
+/// must never become legacy `Stop(None)` or `LinuxStop { pid: None }`.
+#[must_use]
+pub fn parse_linux_birth_stop_args(lines: &[&str]) -> Option<HelperBirthTarget> {
+    let [pid, birth] = lines else {
+        return None;
+    };
+    HelperBirthTarget::parse_wire(pid, birth)
+}
 
 /// `start` 命令的参数（三平台同构，`helper.go:508-513` 等）。
 ///
@@ -113,6 +199,12 @@ pub enum Request {
     /// Linux native-reap Stop capability. The distinct command token makes
     /// old helpers reject before mutating their child state.
     LinuxStop { pid: Option<u32> },
+    /// Linux exact birth Start; carries the same path/config lines as `LinuxStart`.
+    LinuxStartBirth(LinuxStartParams),
+    /// Linux exact birth Status; no argument lines.
+    LinuxStatusBirth,
+    /// Linux exact birth Stop; both identity lines are required.
+    LinuxStopBirth { target: HelperBirthTarget },
     /// `cleanup`（无参数行）。
     Cleanup,
     /// `freeport <port>`（行3/行2 = 端口字符串）。
@@ -159,6 +251,9 @@ impl Request {
             Self::Status => command::common::STATUS,
             Self::Stop { .. } => command::common::STOP,
             Self::LinuxStop { .. } => command::linux::STOP_REAP_SAFE,
+            Self::LinuxStartBirth(_) => command::linux::START_BIRTH_SAFE,
+            Self::LinuxStatusBirth => command::linux::STATUS_BIRTH_SAFE,
+            Self::LinuxStopBirth { .. } => command::linux::STOP_BIRTH_SAFE,
             Self::Cleanup => command::common::CLEANUP,
             Self::FreePort { .. } => command::common::FREEPORT,
             Self::Start(_) => command::common::START,
@@ -189,6 +284,7 @@ impl Request {
             Self::Ping
             | Self::Version
             | Self::Status
+            | Self::LinuxStatusBirth
             | Self::Cleanup
             | Self::FlushDns
             | Self::MacProxyCompareCapability
@@ -212,6 +308,10 @@ impl Request {
                     out.push(p.to_string());
                 }
             }
+            Self::LinuxStopBirth { target } => {
+                out.push(target.pid.to_string());
+                out.push(target.birth.to_wire());
+            }
             Self::FreePort { port } => {
                 // helper.go:362: port := strings.TrimSpace(readLine(r))
                 out.push(port.to_string());
@@ -220,7 +320,7 @@ impl Request {
                 // mac helper.go:508-513 / win helper-win/helper.go:339-344（无 singbox 行）
                 push_start_args(p, out);
             }
-            Self::LinuxStart(p) => {
+            Self::LinuxStart(p) | Self::LinuxStartBirth(p) => {
                 // linux helper-linux/helper.go:401-405（多 singbox 行）
                 out.push(p.singbox_path.clone());
                 push_start_args(&p.common, out);

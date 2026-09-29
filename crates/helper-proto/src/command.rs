@@ -74,6 +74,12 @@ pub mod win {
 
 /// Linux 专属命令（移植自 `helper-linux/helper.go`）。
 pub mod linux {
+    /// Exact helper-owned birth admission. Old helpers reject before spawning.
+    pub const START_BIRTH_SAFE: &str = "start-birth-safe";
+    /// Read the exact helper-owned birth, including its opaque birth token.
+    pub const STATUS_BIRTH_SAFE: &str = "status-birth-safe";
+    /// Stop only the exact helper-owned birth named by PID and birth token.
+    pub const STOP_BIRTH_SAFE: &str = "stop-birth-safe";
     /// Atomic capability command for Linux Start under native-reap custody.
     /// A v1 helper does not recognize this token and rejects before mutation.
     pub const START_REAP_SAFE: &str = "start-reap-safe";

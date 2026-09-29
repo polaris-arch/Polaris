@@ -52,6 +52,21 @@ request_samples! {
             parent_pid: None,
         },
     }),
+    LinuxStartBirth => Request::LinuxStartBirth(polaris_helper_proto::LinuxStartParams {
+        singbox_path: "/usr/lib/polaris/core/sing-box".to_owned(),
+        common: StartParams {
+            cfg: "/home/u/.config/polaris/config.json".to_owned(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
+    }),
+    LinuxStatusBirth => Request::LinuxStatusBirth,
+    LinuxStopBirth => Request::LinuxStopBirth {
+        target: polaris_helper_proto::HelperBirthTarget::parse_wire(
+            "4242", "00112233445566778899aabbccddeeff"
+        ).unwrap(),
+    },
     RouteAdd => Request::RouteAdd(RouteParams {
         iface: "polaris-tun0".to_owned(),
         cidrs: vec!["10.0.0.0/8".to_owned(), "fd00::/8".to_owned()],

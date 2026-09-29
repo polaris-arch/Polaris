@@ -50,4 +50,9 @@ fn linux_specific_commands_are_pinned() {
     assert_eq!(linux::STOP_REAP_SAFE, "stop-reap-safe");
     assert_ne!(linux::START_REAP_SAFE, common::START);
     assert_ne!(linux::STOP_REAP_SAFE, common::STOP);
+    assert_eq!(linux::START_BIRTH_SAFE, "start-birth-safe");
+    assert_eq!(linux::STATUS_BIRTH_SAFE, "status-birth-safe");
+    assert_eq!(linux::STOP_BIRTH_SAFE, "stop-birth-safe");
+    assert_ne!(linux::START_BIRTH_SAFE, linux::START_REAP_SAFE);
+    assert_ne!(linux::STOP_BIRTH_SAFE, linux::STOP_REAP_SAFE);
 }

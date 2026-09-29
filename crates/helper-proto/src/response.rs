@@ -11,7 +11,7 @@
 //!
 //! [`Response::parse`] 是宽容的：未知 `OK <token>` 归 [`ResponseKind::OkRaw`]（保留原文），不丢消息。
 
-use crate::error::Error;
+use crate::{error::Error, HelperBirthTarget};
 
 /// 拆出字符串首个空白分隔的 token + 余部（已 trim 首尾空白）。
 ///
@@ -162,6 +162,55 @@ pub enum Start {
     NotAdmitted(StartNotAdmitted),
 }
 
+/// Linux exact-birth Start receipts. A typed target is never inferred from a
+/// legacy PID-only response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxBirthStart {
+    Started {
+        target: HelperBirthTarget,
+        timing: Option<StartTiming>,
+    },
+    Already {
+        target: HelperBirthTarget,
+    },
+    NotAdmittedPending {
+        target: HelperBirthTarget,
+    },
+    /// A failed native wait can leave the helper unable to prove custody.
+    /// `None` means there is no exact target the client can safely stop.
+    NotAdmittedUnknown {
+        target: Option<HelperBirthTarget>,
+    },
+}
+
+/// Linux exact-birth status; `Unknown` remains an owned or uncertain birth,
+/// never a no-owner receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxBirthStatus {
+    Running { target: HelperBirthTarget },
+    Stopping { target: HelperBirthTarget },
+    Unknown { target: HelperBirthTarget },
+    Empty,
+}
+
+/// Linux exact-birth Stop receipts. Pending and unknown cannot release custody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxBirthStop {
+    Stopped {
+        target: HelperBirthTarget,
+    },
+    Pending {
+        target: HelperBirthTarget,
+    },
+    Unknown {
+        target: HelperBirthTarget,
+    },
+    Mismatch {
+        requested: HelperBirthTarget,
+        current: HelperBirthTarget,
+    },
+}
+
 /// `freeport` 响应载荷（三平台，`helper.go:370-394` 等）。`foreign` 的 names 由 ` | ` 分隔（Go `strings.Join(foreign, " | ")`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreePort {
@@ -208,6 +257,12 @@ pub enum ResponseKind {
     Stop(Stop),
     /// `OK started <pid>` / `OK already <pid>`（start）。
     Start(Start),
+    /// Linux exact-birth Start receipts use distinct wire tokens.
+    LinuxBirthStart(LinuxBirthStart),
+    /// Linux exact-birth Status receipts use distinct wire tokens.
+    LinuxBirthStatus(LinuxBirthStatus),
+    /// Linux exact-birth Stop receipts use distinct wire tokens.
+    LinuxBirthStop(LinuxBirthStop),
     /// `OK cleaned`（cleanup）。
     Cleaned,
     /// `OK route`（route-add / route-del）。
@@ -268,7 +323,25 @@ impl Response {
                 });
             }
         };
-        Self::Ok(parse_ok(rest))
+        let kind = parse_ok(rest);
+        if matches!(
+            kind,
+            ResponseKind::LinuxBirthStart(_)
+                | ResponseKind::LinuxBirthStatus(_)
+                | ResponseKind::LinuxBirthStop(_)
+        ) && ok_kind_to_wire(&kind) != line
+        {
+            // Exact-birth receipts have one canonical wire spelling. The
+            // legacy parser is deliberately permissive; do not let its "OK"
+            // prefix/whitespace handling turn a malformed birth line into
+            // proof of custody.
+            let (token, rest) = parse_first_token(rest);
+            return Self::Ok(ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: rest.to_owned(),
+            });
+        }
+        Self::Ok(kind)
     }
 
     /// 序列化为 wire 行（不含尾部 `\n`，由帧层加）—— [`Response::parse`] 的反方向。
@@ -336,6 +409,69 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
         ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Unknown { pid })) => {
             format!("OK start-not-admitted unknown {pid}")
         }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::Started { target, timing }) => {
+            let mut line = format!("OK birth-started {} {}", target.pid, target.birth.to_wire());
+            if let Some(timing) = timing {
+                line.push_str(&format!(
+                    " forwarding_ms={} process_ms={} job_ms={} log_handoff_ms={} total_ms={}",
+                    timing.forwarding_ms,
+                    timing.process_ms,
+                    timing.job_ms,
+                    timing.log_handoff_ms,
+                    timing.total_ms
+                ));
+            }
+            line
+        }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::Already { target }) => {
+            format!("OK birth-already {} {}", target.pid, target.birth.to_wire())
+        }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedPending { target }) => {
+            format!(
+                "OK birth-start-not-admitted pending {} {}",
+                target.pid,
+                target.birth.to_wire()
+            )
+        }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown { target }) => target
+            .map_or_else(
+                || "OK birth-start-not-admitted unknown".to_owned(),
+                |target| {
+                    format!(
+                        "OK birth-start-not-admitted unknown {} {}",
+                        target.pid,
+                        target.birth.to_wire()
+                    )
+                },
+            ),
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running { target }) => {
+            birth_status_to_wire("running", *target)
+        }
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Stopping { target }) => {
+            birth_status_to_wire("stopping", *target)
+        }
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Unknown { target }) => {
+            birth_status_to_wire("unknown", *target)
+        }
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Empty) => {
+            "OK birth-status empty".to_owned()
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped { target }) => {
+            birth_stop_to_wire("birth-stopped", *target)
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Pending { target }) => {
+            birth_stop_to_wire("birth-stop-pending", *target)
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Unknown { target }) => {
+            birth_stop_to_wire("birth-stop-unknown", *target)
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Mismatch { requested, current }) => format!(
+            "OK birth-stop-mismatch {} {} {} {}",
+            requested.pid,
+            requested.birth.to_wire(),
+            current.pid,
+            current.birth.to_wire()
+        ),
         ResponseKind::Cleaned => "OK cleaned".to_owned(),
         ResponseKind::Route => "OK route".to_owned(),
         ResponseKind::FreePort(fp) => free_port_to_wire(fp),
@@ -356,6 +492,18 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
             }
         }
     }
+}
+
+fn birth_status_to_wire(state: &str, target: HelperBirthTarget) -> String {
+    format!(
+        "OK birth-status {state} {} {}",
+        target.pid,
+        target.birth.to_wire()
+    )
+}
+
+fn birth_stop_to_wire(token: &str, target: HelperBirthTarget) -> String {
+    format!("OK {token} {} {}", target.pid, target.birth.to_wire())
 }
 
 /// `status` 的 running 载荷 → wire（`OK running <pid> [created=<十进制>] [image=<hex>]`）。
@@ -473,6 +621,19 @@ fn parse_ok(rest: &str) -> ResponseKind {
                 },
             }
         }
+        "birth-started"
+        | "birth-already"
+        | "birth-start-not-admitted"
+        | "birth-status"
+        | "birth-stopped"
+        | "birth-stop-pending"
+        | "birth-stop-unknown"
+        | "birth-stop-mismatch" => {
+            parse_birth_ok(token, tail).unwrap_or_else(|| ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: tail.to_owned(),
+            })
+        }
         "cleaned" => ResponseKind::Cleaned,
         "route" => ResponseKind::Route,
         "free" => ResponseKind::FreePort(FreePort::Free),
@@ -507,6 +668,105 @@ fn parse_ok(rest: &str) -> ResponseKind {
             }
         }
     }
+}
+
+/// Parse the new safety-critical response family as a closed grammar.
+/// Unknown or duplicate identity/timing fields stay untyped (`OkRaw`).
+fn parse_birth_ok(token: &str, tail: &str) -> Option<ResponseKind> {
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let pair = |fields: &[&str]| -> Option<HelperBirthTarget> {
+        let [pid, birth] = fields else {
+            return None;
+        };
+        HelperBirthTarget::parse_wire(pid, birth)
+    };
+    Some(match token {
+        "birth-started" => {
+            let [pid, birth, rest @ ..] = fields.as_slice() else {
+                return None;
+            };
+            let target = HelperBirthTarget::parse_wire(pid, birth)?;
+            let timing = if rest.is_empty() {
+                None
+            } else {
+                Some(parse_birth_start_timing(rest)?)
+            };
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::Started { target, timing })
+        }
+        "birth-already" => ResponseKind::LinuxBirthStart(LinuxBirthStart::Already {
+            target: pair(&fields)?,
+        }),
+        "birth-start-not-admitted" => match fields.as_slice() {
+            ["pending", pid, birth] => {
+                ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedPending {
+                    target: HelperBirthTarget::parse_wire(pid, birth)?,
+                })
+            }
+            ["unknown"] => {
+                ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown { target: None })
+            }
+            ["unknown", pid, birth] => {
+                ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown {
+                    target: Some(HelperBirthTarget::parse_wire(pid, birth)?),
+                })
+            }
+            _ => return None,
+        },
+        "birth-status" => match fields.as_slice() {
+            ["empty"] => ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Empty),
+            ["running", pid, birth] => ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running {
+                target: HelperBirthTarget::parse_wire(pid, birth)?,
+            }),
+            ["stopping", pid, birth] => {
+                ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Stopping {
+                    target: HelperBirthTarget::parse_wire(pid, birth)?,
+                })
+            }
+            ["unknown", pid, birth] => ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Unknown {
+                target: HelperBirthTarget::parse_wire(pid, birth)?,
+            }),
+            _ => return None,
+        },
+        "birth-stopped" => ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
+            target: pair(&fields)?,
+        }),
+        "birth-stop-pending" => ResponseKind::LinuxBirthStop(LinuxBirthStop::Pending {
+            target: pair(&fields)?,
+        }),
+        "birth-stop-unknown" => ResponseKind::LinuxBirthStop(LinuxBirthStop::Unknown {
+            target: pair(&fields)?,
+        }),
+        "birth-stop-mismatch" => {
+            let [want_pid, want_birth, current_pid, current_birth] = fields.as_slice() else {
+                return None;
+            };
+            ResponseKind::LinuxBirthStop(LinuxBirthStop::Mismatch {
+                requested: HelperBirthTarget::parse_wire(want_pid, want_birth)?,
+                current: HelperBirthTarget::parse_wire(current_pid, current_birth)?,
+            })
+        }
+        _ => return None,
+    })
+}
+
+fn parse_birth_start_timing(fields: &[&str]) -> Option<StartTiming> {
+    let [forwarding, process, job, log_handoff, total] = fields else {
+        return None;
+    };
+    let value = |field: &str, key: &str| -> Option<u64> {
+        let digits = field.strip_prefix(key)?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    Some(StartTiming {
+        forwarding_ms: value(forwarding, "forwarding_ms=")?,
+        process_ms: value(process, "process_ms=")?,
+        job_ms: value(job, "job_ms=")?,
+        log_handoff_ms: value(log_handoff, "log_handoff_ms=")?,
+        total_ms: value(total, "total_ms=")?,
+    })
 }
 
 /// 解析 `uid=<n> v<ver>` → [`Pong`]。
