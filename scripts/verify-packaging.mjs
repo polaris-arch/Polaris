@@ -145,8 +145,8 @@ const NON_CORE_CONFS = {
     // 构建照绿；显式传则改名即 `failed to read configuration file` 硬失败。
     //
     // `invocation` 是那条 workflow 里**发起构建的命令**的逐字前缀。判据不是「bind 恰好出现 1 次」，
-    // 而是「**每一次**构建调用都带着 bind」：android.yml 今天有两条腿（debug 开箱验 + release 冒烟），
-    // 将来还会有第三条。写死 1 次的判据在加第二条腿的当天就会红，而它红的理由是错的
+    // 而是「**每一次**构建调用都带着 bind」：android.yml 今天有两条 release-profile 路径
+    // （未分发 unsigned 验证 + 正式 signed 发布）。写死 1 次的判据在加第二条腿的当天就会红，而它红的理由是错的
     // （腿变多了，不是绑定丢了）；更糟的反向：把它改成 `>= 1` 就会让「新加的那条腿忘了传 conf」
     // 静默过门 —— 而那正是本条判据要抓的事。改为按调用次数对拍，覆盖面由判据定，不由当天的腿数定。
     ciLeg: {
@@ -841,8 +841,8 @@ function checkPlatformConfRegistry(workflows) {
       if (spec.ciLeg !== null) {
         const text = workflows.get(spec.ciLeg.workflow) ?? '';
         const hits = text.split(spec.ciLeg.bind).length - 1;
-        // 期望值由**构建调用次数**推导，不写死。腿数会长（android.yml 今天已是 debug + release
-        // 冒烟两条），写死次数的判据会在加腿那天以错误的理由红；而放宽成 `>= 1` 又会让
+        // 期望值由**构建调用次数**推导，不写死。android.yml 今天有 unsigned 验证与 signed 发布
+        // 两条 release-profile 路径；写死次数的判据会在加腿那天以错误的理由红，而放宽成 `>= 1` 又会让
         // 「新腿忘了传 conf」静默过门。两个失败方向都要堵，只能对拍。
         const calls = text.split(spec.ciLeg.invocation).length - 1;
         if (calls < 1) {

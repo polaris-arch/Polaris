@@ -21,9 +21,9 @@ name: Package
 # 直接触发仍是「发布/手动」语义：
 #   · push tags v*       —— 标准发布流；platform 输入不存在 ⇒ 取 all ⇒ 四条腿全打 + 发 release。
 #   · workflow_dispatch  —— 手动验证打包链；**也是「已有 tag 手工补发」的唯一入口**
-#     （在 tag ref 上 dispatch，github.ref = refs/tags/v* ⇒ 下面的 release job 条件为真，走完全程）。
-#     ⚠️ 手工补发**必须把 platform 留在默认 all**：选了单平台则 release job 不跑
-#     （见 jobs.release 的「绝不发半套」条件），补发会静默退化成「只出 artifact、不发布」。
+#     （在 tag ref 上 dispatch，github.ref = refs/tags/v* ⇒ 下面发布 DAG 的条件为真，走完全程）。
+#     ⚠️ 手工补发**必须把 platform 留在默认 all**：选了单平台则 release_desktop 不跑
+#     （见该 job 的「绝不发半套」条件），补发会静默退化成「只出 artifact、不发布」。
 #
 # ── 为什么删掉 `release: types: [published]`（2026-07-31）──
 # 它原本兜「先在 GitHub UI 建 release」的路径，注释里自陈「UI 对新 tag 建 release 会同时产生
@@ -81,7 +81,7 @@ on:
         default: true
 
 # 最小权限：打包 job 只读仓库（tauri-action 未传 tagName ⇒ 不碰 release API）；
-# 建 release / 传资产的写权限只发给下面的 release job（job 级 permissions 覆盖本块）。
+# release 写权限只发给发布 DAG 的三个写入 job（job 级 permissions 覆盖本块）。
 permissions:
   contents: read
 
@@ -109,7 +109,7 @@ jobs:
   #   [选 setup job 输出 include JSON：过滤发生在**派发之前**，没选中的腿根本不存在；
   #    setup 在 ubuntu 上通常数秒完成]
   #
-  # 本 job 同时是 release 的「是否全平台」判据来源（outputs.full），见 jobs.release。
+  # 本 job 同时是 release 的「是否全平台」判据来源（outputs.full），见 jobs.release_desktop。
   setup:
     name: resolve matrix
     runs-on: ubuntu-22.04
@@ -210,7 +210,7 @@ jobs:
             exit 1
           fi
 
-          # full = 「本次跑了全部平台」。release job 用它当「绝不发半套」的判据（见 jobs.release）。
+          # full = 「本次跑了全部平台」。release_desktop 用它当「绝不发半套」的判据。
           # 用 count==total 而不是 platform=='all'：判据取自**实际选中的矩阵**，将来加第五个平台、
           # 或加一个选两条腿的分组选项，这里都不用改，也不会与真实构建面失配。
           if [ "$count" -eq "$total" ]; then full=true; else full=false; fi
@@ -262,8 +262,8 @@ jobs:
     # 门红时四条腿白跑，其中两条 mac 按 10x 计费；本仓是 PUBLIC + 标准 runner，Actions 额度为 0，
     # 该理由不成立。换回的是发布关键路径少一整个 gate 时长（冷跑实测 32.9 → 21.8 min）。
     #
-    # 🔴 质量门没有被删，是**下移到 release job**：同一套 allowlist 判据原样搬过去，语义由
-    #    「未过门不许构建」变成「未过门不许发布」。改这里之前先读 release job 的 if 与其注释。
+    # 🔴 质量门没有被删，是**下移到 release_desktop**：同一套 allowlist 判据原样搬过去，语义由
+    #    「未过门不许构建」变成「未过门不许写 release 草稿」。改这里前先读该 job 的 if 与注释。
     #
     # ⚠️ 并行引入的新事实，如实记：门红时这四条腿照跑、照传 artifact ⇒ **会存在一批未过门的
     #    artifact**。它们进不了 release（release 的 allowlist 拦住），且所在 run 整体是红的；
@@ -1220,7 +1220,7 @@ jobs:
       # 打进该目录，好让本 job 的 assets 门量得到它的体积）；不再上传 nsis/ 下的裸 `*-setup.exe`。
       # 副作用（无害，如实记）：windows 腿命中的文件从此全在 dist-win/ 下，upload-artifact v7 按
       # **实际命中文件的最近公共祖先**建树 ⇒ 该 artifact 由「保留 dist-win/ 一层」变成平铺。
-      # 下游只用 `find -type f` + basename，不假设层级（见 release job 的 Download 注释）。
+      # 下游只用 `find -type f` + basename，不假设层级（见发布 DAG 的 Download 注释）。
       - name: Upload artifacts
         if: env.POLARIS_UPLOAD_ARTIFACTS == '1'
         uses: actions/upload-artifact@v7
@@ -1235,7 +1235,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ══ 发布 ══ 把四个 job 的产物按命名契约汇进**同一个 GitHub release**。
+  # ══ 发布第一段 ══ 把四个桌面 job 的产物按命名契约汇进**同一个 draft release**。
   #
   # 🔴 为什么这一步不可省：`find_suitable_update_asset` 全靠 **release 资产名** 选包，而
   # 本 workflow 此前既没给 tauri-action 传 `tagName`、也没有任何 gh-release 步骤 ⇒ dmg 的架构
@@ -1243,13 +1243,12 @@ jobs:
   # 断言的全部价值都押在资产名上，这一环不自动化等于没闭环。
   #
   # ── 幂等机制：靠**结构**，不靠冲突重试 ──
-  # ① `needs: package` 把发布收成**单个 job**：matrix 的四条腿并行跑完后，这个 job 只被调度一次。
+  # ① `needs: package` 把桌面写入收成**单个 job**：matrix 的四条腿并行跑完后只调度一次。
   #    「四个 job 各建一个 release / 互相覆盖资产」的竞态在拓扑上就不存在——不是靠 create 失败后
   #    重试兜住，而是根本只有一个写入者。（对比方案：在每条 matrix 腿里调 gh-release，四个写入者
   #    抢同一个 tag，create 有 TOCTOU 窗口，且谁先跑完谁定 release 正文，非确定。）
-  # ② 对**同一 tag 重跑 workflow**（第二个写入者来自时间维度）：先 `gh release view` 探在否，
-  #    已存在只传资产、不重建；`gh release upload --clobber` 覆盖同名资产而非追加 `.1` 后缀。
-  #    故重跑收敛到同一状态。
+  # ② 对**同一 tag 重跑 workflow**：只允许续跑 draft；已公开 release 直接失败，避免用户可见状态下
+  #    逐个替换资产。draft 内用 `gh release upload --clobber` 覆盖同名资产，故失败重跑收敛。
   # ③ 要求 package 的**每条腿全部成功**：缺一条（比如 macos-x64 挂了）则本 job 跳过，
   #    绝不发布只有单架构 dmg 的残缺 release —— 与 github.rs 取消跨架构回落是同一条纪律的两端
   #    （那边保证「宁可不更新」，这边保证「压根不会出现半套 release」）。
@@ -1266,12 +1265,12 @@ jobs:
   #     将来加平台、加分组选项都不会与真实构建面失配] /
   #    [不选 inputs.platform == 'all' || event_name != 'workflow_dispatch'：那是「意图」不是「事实」，
   #     过滤逻辑一变就与实际打了几条腿脱节；且 `inputs` 上下文在 tag push 事件下的取值需要跑起来才确认]
-  release:
-    name: publish release
+  release_desktop:
+    name: create draft + upload verified desktop assets
     # setup 进 needs 只为读它的 outputs（`needs` 上下文只含 needs 里列出的 job）；
     # setup 与 ci/ui 并行、ubuntu 1x，不加长关键路径。
     #
-    # 2026-09-04：ci / ui 由 package 的 needs 移到这里 —— 打包与门并行开跑，**发布仍必须等门**。
+    # 2026-09-04：ci / ui 由 package 的 needs 移到这里 —— 打包与门并行开跑，**草稿写入仍必须等门**。
     needs: [setup, ci, ui, package]
     # 五条闸门，缺一不可：
     #   · `always()` —— **必需的，不是保险**：两门在单平台 dispatch、以及 release-risk.yml 以
@@ -1299,6 +1298,9 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    outputs:
+      release_tag: ${{ steps.release_identity.outputs.tag }}
+      release_sha: ${{ steps.release_identity.outputs.sha }}
     steps:
       # 只为拿 scripts/verify-packaging.mjs（断言脚本），不构建。
       - uses: actions/checkout@v7
@@ -1369,13 +1371,30 @@ jobs:
         # `--dir` 按仓库根解析（见下方 publish 步注释），故用 $GITHUB_WORKSPACE 显式锚定。
         run: node "$GITHUB_WORKSPACE/scripts/verify-packaging.mjs" assets --label release --dir "$GITHUB_WORKSPACE/dist-release"
 
-      - name: Publish GitHub release
+      - name: Create or resume draft and upload desktop assets
+        id: release_identity
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+
+          version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
+          if [ -z "$version" ] || [ "$tag" != "v$version" ]; then
+            echo "::error::release tag（$tag）与桌面应用版本（$version）不一致"
+            exit 1
+          fi
+
+          # 发布身份必须由同一个 tag、同一个 commit 贯穿三段 DAG。只验 tag 名不够：
+          # workflow_dispatch 可以从另一 commit 启动，却仍拿一个旧 tag 当资产目标。
+          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+          head_sha="$(git rev-parse HEAD)"
+          tag_sha="$(git rev-list -n 1 "$tag")"
+          if [ "$head_sha" != "$GITHUB_SHA" ] || [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::发布身份不一致：HEAD=$head_sha tag($tag)=$tag_sha GITHUB_SHA=$GITHUB_SHA"
+            exit 1
+          fi
 
           # 显式收集文件列表：`dist-release/*` 会把目录喂给 gh 导致报错，且空目录时
           # 通配符原样传入会静默上传一个名为 `dist-release/*` 的不存在文件。
@@ -1389,7 +1408,8 @@ jobs:
           printf '待上传资产（%d 个）:\n' "${#files[@]}"
           printf '  %s\n' "${files[@]}"
 
-          # 幂等②：存在则复用，不存在才建。
+          # 幂等②：不存在才建；存在只允许续跑**草稿**。
+          # 已公开 release 一律失败，不能在用户可见状态下逐个 --clobber，制造新旧资产混存窗口。
           # `gh release view` 因鉴权/网络失败时也会走 else 分支，但随后的 `gh release create`
           # 会**硬失败**（非静默跳步），故不存在「探测失败被吞掉」的路径。
           #
@@ -1399,9 +1419,17 @@ jobs:
           #    `gh release view` 探到它而只补资产，坏状态不自愈。
           #    「绝不发半套」此前只对「某条腿挂掉」成立（靠 needs: package），对「建完挂了」不成立。
           #    改成先建草稿：草稿对匿名用户不可见、updater 的 GitHub API 也取不到，
-          #    直到下面 Verify published release assets 验过才 `--draft=false` 转公开。
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $tag 已存在 —— 只覆盖资产，不重建（幂等重跑）"
+          #    直到 Android 与最终全量资产/digest 闸门都通过，末段 job 才 `--draft=false` 转公开。
+          if release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish 2>/dev/null)"; then
+            actual_tag="$(jq -r .tagName <<<"$release_json")"
+            is_draft="$(jq -r .isDraft <<<"$release_json")"
+            target_commitish="$(jq -r .targetCommitish <<<"$release_json")"
+            if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ] || \
+               [ "$target_commitish" != "$GITHUB_SHA" ]; then
+              echo "::error::release $tag 已存在但身份不符（tagName=$actual_tag isDraft=$is_draft target=$target_commitish）—— 拒绝改写"
+              exit 1
+            fi
+            echo "release $tag 已是草稿 —— 续跑并覆盖同名桌面资产"
           else
             echo "release $tag 不存在 —— 创建（草稿态，验过再公开）"
             gh release create "$tag" \
@@ -1409,8 +1437,19 @@ jobs:
               --title "$tag" \
               --generate-notes \
               --verify-tag \
+              --target "$GITHUB_SHA" \
               --draft
           fi
+
+          # create 后也从服务端回读：只给命令传 --target 不是证据，目标 SHA 必须真的落在 release 上。
+          release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
+          [ "$(jq -r .tagName <<<"$release_json")" = "$tag" ] && \
+            [ "$(jq -r .isDraft <<<"$release_json")" = "true" ] && \
+            [ "$(jq -r .targetCommitish <<<"$release_json")" = "$GITHUB_SHA" ] || {
+              echo "::error::服务端 release 身份没有落到本次 tag/draft/SHA"; exit 1; }
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
           # --clobber：同名资产覆盖而非追加 `.1` 后缀。追加会让 release 里出现
           # `*-mac-arm64.dmg` 与 `*-mac-arm64.dmg.1` 两个命中，updater 选谁看顺序。
@@ -1429,8 +1468,8 @@ jobs:
       #    不加这个开关的话，本步会拿 0 字节的假文件去比摘要，得到一片与真实状态无关的恒红。
       #    「上传途中被截断 / 被换字节」这一段由**下一步**（拿 GitHub 侧 asset digest 回比）覆盖。
       #
-      # 本步是**转公开前的最后一道闸门**：release 此时仍是草稿，验不过就停在草稿态，不会公开半套。
-      - name: Verify published release assets
+      # 本步只验桌面命名；验不过就停在草稿态，Android job 不会起跑。
+      - name: Verify draft desktop asset names
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1452,7 +1491,7 @@ jobs:
             echo "::error::release $tag 没有任何资产"
             exit 1
           fi
-          echo "release $tag 实际资产："
+          echo "draft release $tag 实际资产："
           cat published-names.txt
           while IFS= read -r name; do
             : > "$outdir/$name"
@@ -1477,13 +1516,14 @@ jobs:
       #    撞见 `verified:false`。这恰好就是那份文档里写的「重开消费侧决定」的触发条件 ——
       #    本步就是它的探测器。红在草稿态，release 不会被公开，处置由人判断（接 SHA256SUMS 消费侧，
       #    或确认属 GitHub 侧临时回归后手工放行）。
-      - name: Verify published asset digests against SHA256SUMS
+      - name: Verify draft desktop asset digests against SHA256SUMS
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          android_asset="polaris-${tag#v}-android-arm64.apk"
           sums="$GITHUB_WORKSPACE/dist-release/SHA256SUMS"
           [ -s "$sums" ] || { echo "::error::$sums 不存在或为空 —— 生成步骤与本步之间有人动过它"; exit 1; }
 
@@ -1497,8 +1537,8 @@ jobs:
           # 🔴 端点必须**先取 release 自己的 apiUrl 再按 id 拉**，不能直接打
           #    `repos/{owner}/{repo}/releases/tags/{tag}`：那个端点的官方措辞是
           #    「Get a **published** release with the specified tag」——**草稿不在它的返回面，返 404**。
-          #    而本步恰好跑在草稿窗口里（上面 `gh release create … --draft` → 本步 → 下面
-          #    `gh release edit --draft=false`）⇒ 用 tags 端点的话**首发路径每次必红**，release 永远
+          #    而本步恰好跑在草稿窗口里（上面 `gh release create … --draft` → 本步 → Android → 最终公开）
+          #    ⇒ 用 tags 端点的话**首发路径每次必红**，release 永远
           #    停在草稿态、每个新版本都要人工兜底；更坏的是**同 tag 重跑（release 已公开）不红**，
           #    于是复跑验证会把它误判成好的。
           #    `gh release view` 对草稿可用（gh 内部对草稿有 list 回落），故用它取 apiUrl 这一跳。
@@ -1516,11 +1556,15 @@ jobs:
           # `starting` → `uploaded` 的状态迁移，若 `digest` 在资产落定之后才算出，紧跟 upload 的这次
           # 读取可能拿到 null。**没有证据说 GitHub 真会延迟**（未实跑），但处置代价不对称：真延迟一次
           # 就是一道硬红且不得放行的门卡住发布，而重试的代价只是最多 10 秒。耗尽仍不落定 ⇒ 判红。
+          raw_all="$(mktemp)"
           raw="$(mktemp)"
           actual="$(mktemp)"
           pending=''
           for attempt in 1 2 3; do
-            gh api "$api_url" --jq '.assets[] | "\(.digest // "MISSING")\t\(.state // "unknown")\t\(.name)"' > "$raw"
+            gh api "$api_url" --jq '.assets[] | "\(.digest // "MISSING")\t\(.state // "unknown")\t\(.name)"' > "$raw_all"
+            # 失败后的草稿重跑可能带着上一轮已上传的 APK。它此刻仍不可见，且下一段 Android job
+            # 会用本次 commit 的签名 APK 覆盖；桌面阶段只校验自己的资产，最终阶段再对全量精确对账。
+            awk -F'\t' -v apk="$android_asset" '$3 != apk' "$raw_all" > "$raw"
             pending="$(awk -F'\t' '$1 == "MISSING" || $2 != "uploaded"' "$raw")"
             [ -z "$pending" ] && break
             [ "$attempt" -eq 3 ] && break
@@ -1542,28 +1586,179 @@ jobs:
           fi
           awk -F'\t' '{ print $1 "  " $3 }' "$raw" | sed 's/^sha256://' | LC_ALL=C sort -k2 > "$actual"
           if ! diff -u "$expected" "$actual"; then
-            echo "::error::已发布资产的 digest 与本地 SHA256SUMS 对不上 —— 上传那一跳出了问题（截断 / 被换 / --clobber 未生效留下陈旧清单）"
+            echo "::error::草稿桌面资产的 digest 与本地 SHA256SUMS 对不上 —— 上传那一跳出了问题（截断 / 被换 / --clobber 未生效留下陈旧清单）"
             exit 1
           fi
-          echo "已发布资产的 digest 与本地 SHA256SUMS 逐条相符（含清单自身，共 $(wc -l < "$expected") 条）"
+          echo "草稿中的桌面资产 digest 与本地 SHA256SUMS 逐条相符（含清单自身，共 $(wc -l < "$expected") 条）"
 
-      # 验过才转公开。
-      #
-      # 覆盖范围要说准：本步只消除**首次发布**那条路径上的「公开且零资产」窗口 ——
-      # 该路径下 release 从 create 到这一步之前一直是草稿（匿名不可见，updater 的 GitHub API
-      # 也取不到），故 create 成功而 upload 挂掉时它停在草稿态，不会被用户看到。
-      # **重跑已存在的 release 时不适用**：那条路径走「已存在」分支不重建，release 本就是公开的，
-      # 重新上传期间它一直公开（资产由 --clobber 逐个覆盖，可能短暂新旧混存）。
-      # 这是有意的取舍——重跑的前提是上一轮已验过，把公开的 release 打回草稿反而会让
-      # 已在分发的下载链接短暂失效。
-      #
-      # 幂等：对已公开的 release 再跑 `--draft=false` 是 no-op。
+  # 第二段：桌面草稿已经落定后，才允许签名 APK job 对**同一个 tag 草稿**写入。
+  # `secrets: inherit` 把仓库已配置的四项发布签名 secret 交给被调用 workflow；值不进入本文件。
+  android_release:
+    name: build + upload signed Android APK
+    needs: release_desktop
+    # reusable workflow 不能把 caller 的 GITHUB_TOKEN 从 read 自行抬到 write；写权限必须在调用点授予。
+    permissions:
+      contents: write
+    uses: ./.github/workflows/android.yml
+    with:
+      publish_release: true
+      release_tag: ${{ needs.release_desktop.outputs.release_tag }}
+    secrets: inherit
+
+  # 第三段：Android 上传成功后重新收集桌面产物与**远端草稿里的 APK**，生成全量清单，
+  # 对真实 release 的资产集合 / state / digest 做双向精确对账。只有本 job 持有公开动作。
+  release:
+    name: verify combined release + promote public
+    needs: [release_desktop, android_release]
+    if: >-
+      always()
+      && needs.release_desktop.result == 'success'
+      && needs.android_release.result == 'success'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify release identity is still the same draft
+        id: release_identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_TAG: ${{ needs.release_desktop.outputs.release_tag }}
+          EXPECTED_SHA: ${{ needs.release_desktop.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          tag="$EXPECTED_TAG"
+          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+          head_sha="$(git rev-parse HEAD)"
+          tag_sha="$(git rev-list -n 1 "$tag")"
+          if [ -z "$tag" ] || [ "$EXPECTED_SHA" != "$GITHUB_SHA" ] || \
+             [ "$head_sha" != "$GITHUB_SHA" ] || [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::发布身份在 DAG 中漂移：tag=$tag expected=$EXPECTED_SHA HEAD=$head_sha tagSha=$tag_sha GITHUB_SHA=$GITHUB_SHA"
+            exit 1
+          fi
+          release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
+          actual_tag="$(jq -r .tagName <<<"$release_json")"
+          is_draft="$(jq -r .isDraft <<<"$release_json")"
+          target_commitish="$(jq -r .targetCommitish <<<"$release_json")"
+          if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ] || \
+             [ "$target_commitish" != "$GITHUB_SHA" ]; then
+            echo "::error::最终汇总前 release 身份漂移（tagName=$actual_tag isDraft=$is_draft target=$target_commitish）"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "android_asset=polaris-${tag#v}-android-arm64.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist-release
+          pattern: polaris-*
+          merge-multiple: true
+
+      # APK 来自上一段已验签名/开箱/远端 digest 的 job。再从 draft 下载一次，确保最终清单按
+      # GitHub 实际保存的字节生成；下载失败、重名或 0 字节都在这里硬失败。
+      - name: Download signed APK from draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
+          ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release/android
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ANDROID_ASSET" --dir dist-release/android
+          apk="dist-release/android/$ANDROID_ASSET"
+          [ -s "$apk" ] || { echo "::error::草稿里没有非空签名 APK：$ANDROID_ASSET"; exit 1; }
+          [ "$(find dist-release -type f -name "$ANDROID_ASSET" | wc -l)" -eq 1 ] || {
+            echo "::error::签名 APK 在汇总目录里不是恰好一份：$ANDROID_ASSET"; exit 1; }
+
+      - name: Generate combined SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist-release"
+          sums="$(mktemp)"
+          find . -type f ! -name SHA256SUMS | sort | while IFS= read -r f; do
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"
+          done | LC_ALL=C sort -k2 > "$sums"
+          [ -s "$sums" ] || { echo "::error::最终汇总目录没有任何资产"; exit 1; }
+          [ "$(awk '{print $2}' "$sums" | sort | uniq -d | wc -l)" -eq 0 ] || {
+            echo "::error::最终资产出现同名 basename，GitHub release 无法无歧义承载"; exit 1; }
+          mv "$sums" SHA256SUMS
+          chmod 644 SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload combined SHA256SUMS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 写入前再查一次：若并发流程已公开，必须停在 mutation 之前。
+          [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "true" ] || {
+            echo "::error::release $TAG 已不再是草稿，拒绝覆盖 SHA256SUMS"; exit 1; }
+          gh release upload "$TAG" dist-release/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Verify combined asset set and digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sums="$GITHUB_WORKSPACE/dist-release/SHA256SUMS"
+          expected="$(mktemp)"
+          {
+            cat "$sums"
+            printf '%s  %s\n' "$(sha256sum "$sums" | cut -d' ' -f1)" 'SHA256SUMS'
+          } | LC_ALL=C sort -k2 > "$expected"
+
+          api_url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
+          [ -n "$api_url" ] || { echo "::error::取不到 release $TAG 的 apiUrl"; exit 1; }
+          raw="$(mktemp)"
+          actual="$(mktemp)"
+          pending=''
+          for attempt in 1 2 3; do
+            gh api "$api_url" --jq '.assets[] | "\(.digest // "MISSING")\t\(.state // "unknown")\t\(.name)"' > "$raw"
+            pending="$(awk -F'\t' '$1 == "MISSING" || $2 != "uploaded"' "$raw")"
+            [ -z "$pending" ] && break
+            [ "$attempt" -eq 3 ] && break
+            sleep 5
+          done
+          if [ -n "$pending" ]; then
+            echo "::error::最终资产尚未全部 uploaded 或 digest 缺失"
+            printf '%s\n' "$pending"
+            exit 1
+          fi
+          awk -F'\t' '{ print $1 "  " $3 }' "$raw" | sed 's/^sha256://' | LC_ALL=C sort -k2 > "$actual"
+          if ! diff -u "$expected" "$actual"; then
+            echo "::error::最终 release 的资产集合或 digest 与桌面 + 签名 APK 全量清单不一致"
+            exit 1
+          fi
+          echo "桌面资产、签名 APK 与 SHA256SUMS 已在草稿上逐项对账"
+
+      # 整个仓库唯一的公开动作。上一步失败、Android job 失败、任何 needs 被取消时，本步都不可达。
       - name: Promote release to public
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_identity.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
-          echo "release $tag 已转为公开"
+          # 长构建期间 tag 可能被强推；mutation 紧前重新抓远端 ref，不能信 checkout 里的旧 tag。
+          git fetch --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          remote_tag_sha="$(git rev-list -n 1 "$TAG")"
+          release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish)"
+          if [ "$remote_tag_sha" != "$GITHUB_SHA" ] || \
+             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ] || \
+             [ "$(jq -r .targetCommitish <<<"$release_json")" != "$GITHUB_SHA" ]; then
+            echo "::error::公开前 tag/release 身份漂移，拒绝继续（tagSha=$remote_tag_sha）"
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "release $TAG 已转为公开"

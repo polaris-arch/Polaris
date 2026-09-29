@@ -2,8 +2,8 @@
 //!
 //! # 守的是什么（根因）
 //!
-//! 这个应用从来没有在 R8 开着的情况下跑过一次：CI 只跑 `assembleArm64Debug`，而 debug 侧
-//! `isMinifyEnabled = false`。于是 release 路径上的**每一条**判据今天都没有任何观测面 ——
+//! 这个应用曾长期没有在 R8 开着的情况下跑过一次。于是 release 路径上的**每一条**判据
+//! 都没有任何观测面 ——
 //! 剪错一个反射符号、少一份 keep 规则文件、口令被写死成默认值、未签名包被静默产出，
 //! 四种事故的共同形状都是「debug 包全绿、release 包坏掉，且两侧都不报错」。
 //!
@@ -19,7 +19,7 @@
 //! | `scripts/gate-android-release-behavior.sh`（**行为裁判**，android.yml 的 apk 腿） | 跑一次 gradle **配置期**：零凭据必红且点名、逃生门**在它枚举得到的四个来源上**只认命令行实参、`minifyArm64ReleaseWithR8` 在 release 图里恰好 1 次而 debug 图里 0 次、AGP 装配好的 `proguardFiles` 在 release **构建类型**那一处与登记的三份**集合恰等**（多一份少一份都红）且 `defaultConfig`/`productFlavor` 两处为空、凭据在场时 `signingConfigs` **容器**里那份配置的 `storeFile` 存在可读且就是本工程认的那一份 | **执行期**发生的一切：`onlyIf`/`enabled=false` 让任务在图里却不跑、`doFirst` 改文件、R8 剪完之后包里还剩什么；以及配置期里它**没枚举到**的两条缝：逃生门换一个新变量名、release 构建类型有没有真把 signingConfig 接上 |
 //! | `android_platform_verifier_wiring.rs` | rustls 校验器那条腿的三侧符号对得上、keep 规则**覆盖得到**那个类全名 | 运行期真的执行了 |
 //! | `scripts/verify-wry-keep-rules.mjs`（CI 上跑） | RustWebView 那条 keep 的成员签名与生成物**同一个类里**对得上 | 裸 checkout 上跑不了（取材点 gitignored） |
-//! | `scripts/assert-r8-evidence.mjs`（release 冒烟腿） | R8 的 configuration.txt（**剥注释后**）里各来源的规则文本都到过、seeds.txt 里那些 keep 真的**命中**了类与成员 | 提交前拦不住任何东西；且默认不跑 |
+//! | `scripts/assert-r8-evidence.mjs`（release-profile 验证腿） | R8 的 configuration.txt（**剥注释后**）里各来源的规则文本都到过、seeds.txt 里那些 keep 真的**命中**了类与成员 | 只能由 CI 的真实 release 构建证明 |
 //!
 //! # 两条教训（本门第二、第三版的由来）
 //!
@@ -43,26 +43,18 @@
 //! 行为裁判跑的是 gradle 的**配置期**。release 构建的另一半在**执行期**，那一层结构上
 //! 看不见：`tasks.matching { … }.configureEach { onlyIf { false } }` 让 minify 留在任务图里
 //! 却不跑；`doFirst { …writeText("") }` 让配置期读到的规则清单全对而 R8 到手的是空文件。
-//! 那三件归 `.github/workflows/android.yml` 的 `release-smoke` job（真跑一次 release 构建，
-//! 判据是 `scripts/assert-r8-evidence.mjs` 读 configuration.txt / seeds.txt）—— 而**它至今
-//! 一次都没跑过**：`if: inputs.release_smoke` 默认 false，且今天**没有任何自动调用方**会传
-//! true（release-risk.yml 的 android job 是一句裸 `uses:`，不带 `with:`），只能手动
-//! `workflow_dispatch` 勾上。
+//! 那三件归 `.github/workflows/android.yml` 的 `release_check` job（真跑一次未签名、不会分发的
+//! release-profile 构建，判据是 `scripts/assert-r8-evidence.mjs` 读 configuration.txt / seeds.txt，
+//! 并由 `verify-apk.mjs` 开箱验证）。release-risk 的普通调用会自动运行它。
 //!
-//! 另外两件**连 release-smoke 都不归**（终止轮 R4 / R5 / R3）：
+//! 另外两件**连 release_check 都不归**（终止轮 R4 / R5 / R3）：
 //!
-//!  · **签名的接线与有效性**。`release-smoke` 那条腿跑的是
+//!  · **签名的接线与有效性**。`release_check` 那条腿跑的是
 //!    `assembleArm64Release … -PpolarisAllowUnsigned=true`，走的正是逃生门、出的就是
-//!    未签名包；全仓 `apksigner` / `jarsigner` 一次都没出现过。所以「storeFile 是不是一个
-//!    合法密钥库、口令对不对」没有任何门，而**接线**（release 构建类型有没有真把那份
-//!    signingConfig 接上）同样没有：本门数的是那行赋值出现几次，行为裁判的 ⑩ 读的是
-//!    `signingConfigs` **容器**——在那行之后补一句 `signingConfig = null`，两侧同时全绿。
-//!
-//!    🔴 2026-09-13 新增的 `release-apk` job（真签名 + 上传成 release 资产）**没有改变这一条**：
-//!    它要的四个 secret 今天在本仓一个都没有，且没有任何调用方传 `publish_release: true`
-//!    ⇒ **它一次都还没跑过**。本门对它只守两件源码级的事（下方 ⑧）：那条 assemble 行在、
-//!    且这条腿上不许出现逃生门。「密钥库合不合法、口令对不对、出的包装不装得上」仍然零观测面，
-//!    唯一的观察面还是本机手签一次。
+//!    未签名包，所以它本身对签名零信息量。`release-apk` job 现在由 package 发布 DAG 自动调用：
+//!    四项仓库 secret 注入正常签名构建，
+//!    `apksigner verify` 验 APK Signature Scheme，上传后再把 GitHub digest 与本地 sha256 对拍。
+//!    本门仍只守源码接线；真实密钥库/口令是否有效要由 tag 发布候选的 CI 执行结果证明。
 //!  · **逃生门换一个新变量名**。本门的形状断言钉死的是 `val allowUnsignedRelease` **那一条
 //!    绑定**；行为裁判的 ④/④b 是一张只试四个名字的枚举表。在守卫体里、逃生门分支之前插一句
 //!    `if (System.getenv("POLARIS_XXX") == "true") return@Action`，绑定一字未动、名字不在
@@ -120,13 +112,13 @@ const GITIGNORE: &str = ".gitignore";
 /// 永久打开（本机实测：gradle 配置期 rc=0、警告行照出）。今天 gradle 侧改成只读命令行实参，
 /// 这条腿是第二重：即使有人把读取点改回 `findProperty`，这里也拦得住持久化那一形。
 const GRADLE_PROPERTIES: &str = "src-tauri/gen/android/gradle.properties";
-/// Android 的 CI workflow —— release 冒烟腿、mapping 留存、wry keep 对拍的落点。
+/// Android 的 CI workflow —— release-profile 验证、mapping 留存、wry keep 对拍的落点。
 const ANDROID_WORKFLOW: &str = ".github/workflows/android.yml";
 /// 从生成物里反推 wry keep 规则的那份脚本（判据的唯一实现）。
 const WRY_KEEP_SCRIPT: &str = "scripts/verify-wry-keep-rules.mjs";
 /// release 路径的**行为**裁判（判据的唯一实现）。本门守它还接在 `android.yml` 上。
 const BEHAVIOR_GATE_SCRIPT: &str = "scripts/gate-android-release-behavior.sh";
-/// release 冒烟腿的产物级判据本体（configuration.txt 剥注释 + seeds.txt 命中）。
+/// release-profile 验证腿的产物级判据本体（configuration.txt 剥注释 + seeds.txt 命中）。
 const R8_EVIDENCE_SCRIPT: &str = "scripts/assert-r8-evidence.mjs";
 
 /// AGP 的 release 构建类型名。
@@ -192,6 +184,10 @@ const SECRET_ENV_VARS: &[&str] = &[
     "POLARIS_KEY_PASSWORD",
     "POLARIS_KEY_ALIAS",
 ];
+
+/// 首次正式发布证书的公开 SHA-256（去冒号、小写）。升级包必须永久保持同一签名身份。
+const OFFICIAL_RELEASE_CERT_SHA256: &str =
+    "22c183cb41d3dcbe6d355ba58d0a012953c5036592b61fb1efacfe3fa36eabd7";
 
 /// AGP `SigningConfig` 上接收那三个值的属性名。集合相等即可，不规定谁配谁。
 const SIGNING_PROPERTIES: &[&str] = &["storePassword", "keyPassword", "keyAlias"];
@@ -989,8 +985,8 @@ fn the_r8_missing_class_suppressions_are_present() {
 ///   让 Rust 门去读它只有两种结局：CI 上必然 panic，或者写成「文件不在就跳过」而变成一条
 ///   静默缺席的假门。出路是把判据放在生成物保证在场的那一刻（`tauri android build` 之后），
 ///   本条守那一步没被删掉。判据本体只有 `scripts/verify-wry-keep-rules.mjs` 一份实现。
-/// - **release 冒烟腿**（⑦）：R8 到底吃进了哪些规则、mapping 有没有留下来、包多大，
-///   三件都只有跑一次 release 构建才知道。本条守那条腿的定义还在、判据还在。
+/// - **release-profile 验证腿**（⑦）：R8 到底吃进了哪些规则、mapping 有没有留下来、
+///   APK 的资源 / 原生库 / 16 KiB 是否合格，都只有跑一次 release 构建才知道。
 ///
 /// # 取材：剥 `#` 注释
 ///
@@ -1060,7 +1056,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     //  · A6：给那个步骤插一行 `continue-on-error: true`（`run:` 一字未动）⇒ 上面那张整行表
     //    全绿，而该步骤失败不再让腿红。整行钉死只守 `run:` 那一行，守不住它周围的步级开关。
     //  · A10：上面那张表是**手挑**的。表外还有同形的行（`verify-apk.mjs` 那条、
-    //    `gradlew assembleArm64Debug` 那条），给它们接 `|| true` 照绿。
+    //    其它 `gradlew` / `verify-apk.mjs` 调用），给它们接 `|| true` 照绿。
     //
     // 下面把承重行改成从 workflow 派生：凡是 `run:` 里调本仓脚本或 `./gradlew` 的行都算承重。
     let derived = load_bearing_lines(&workflow_lines);
@@ -1142,8 +1138,8 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
          真有非判据的步骤要它，就来改这条判据并写明哪一步、为什么。"
     );
 
-    // ── ⑦ release 冒烟腿：定义 + 四条判据 ──
-    for (needle, why) in CI_RELEASE_SMOKE_REQUIREMENTS {
+    // ── ⑦ 未分发 release-profile 验证腿：定义 + 产物判据 ──
+    for (needle, why) in CI_RELEASE_CHECK_REQUIREMENTS {
         let hits = workflow.matches(needle).count();
         assert!(
             hits > 0,
@@ -1163,6 +1159,17 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     // 「注释里写一句、实参里也写一句」开一条缝。代价是那条腿的注释得绕着这个字面量走，
     // 它自己在头注里写清了这一点（2026-09-13 落地时实测撞过一次，故留此记录）。
     let publish_job = slice_between(&workflow_raw, "\n  release-apk:\n", "", ANDROID_WORKFLOW);
+    let cert_pin_line = format!("pinned_cert_sha256='{OFFICIAL_RELEASE_CERT_SHA256}'");
+    assert_eq!(
+        publish_job.matches(&cert_pin_line).count(),
+        1,
+        "{ANDROID_WORKFLOW}：正式发布证书 pin `{OFFICIAL_RELEASE_CERT_SHA256}` 必须在 release-apk \
+         恰好出现一次；缺失会让仓库 secret 被误换新 key 时与 APK 证书一起漂而继续全绿。"
+    );
+    assert!(
+        publish_job.contains("[ \"$cert_sha256\" != \"$pinned_cert_sha256\" ]"),
+        "{ANDROID_WORKFLOW}：只声明证书 pin 不算门，必须把 secret keystore 导出的证书摘要与它硬比较。"
+    );
     assert!(
         publish_job.contains(
             "bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\\n"
@@ -1177,61 +1184,51 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
          签名的升级包 —— 发出去就是一个所有老用户都装不上的资产，且失败发生在系统安装器里，\
          应用内看不见。"
     );
-    let smoke_job = slice_between(
+    let check_job = slice_between(
         &workflow_raw,
-        "\n  release-smoke:\n",
+        "\n  release_check:\n",
         "\n  release-apk:\n",
         ANDROID_WORKFLOW,
     );
     assert!(
-        smoke_job.contains(":app:assembleArm64Release -PpolarisAllowUnsigned=true")
-            && smoke_job.contains("-x :app:rustBuildArm64Release")
-            && smoke_job.contains("cargo clean -p polaris --target aarch64-linux-android --release")
-            && smoke_job.contains("Android release 签名凭据缺失 —— 拒绝静默产出未签名包。")
-            && smoke_job.contains("[ -s \"$so\" ] && [ \"$so\" -nt \"$marker\" ]")
-            && smoke_job.contains("readlink -f \"$jni/libpolaris_lib.so\"")
-            && smoke_job.contains("source=$(git rev-parse HEAD)")
-            && !smoke_job.contains("--config src-tauri/tauri.android.conf.json -- -PpolarisAllowUnsigned=true"),
-        "{ANDROID_WORKFLOW}：release 冒烟腿必须先新建 Rust SO、仅接受签名守卫拒绝，再由 Gradle 本次命令行显式开启 unsigned；Tauri 尾参会误传给 Cargo"
+        check_job.contains(":app:assembleArm64Release -PpolarisAllowUnsigned=true")
+            && check_job.contains("-x :app:rustBuildArm64Release")
+            && check_job.contains("cargo clean -p polaris --target aarch64-linux-android --release")
+            && check_job.contains("Android release 签名凭据缺失 —— 拒绝静默产出未签名包。")
+            && check_job.contains("[ -s \"$so\" ] && [ \"$so\" -nt \"$marker\" ]")
+            && check_job.contains("readlink -f \"$jni/libpolaris_lib.so\"")
+            && check_job.contains("source=$(git rev-parse HEAD)")
+            && !check_job.contains("--config src-tauri/tauri.android.conf.json -- -PpolarisAllowUnsigned=true"),
+        "{ANDROID_WORKFLOW}：release_check 必须先新建 Rust SO、仅接受签名守卫拒绝，再由 Gradle 本次命令行显式开启 unsigned；Tauri 尾参会误传给 Cargo"
     );
-    // 正面对照：这个词在别处（`release-smoke` 那条腿）**必须**还在，否则上面那条否定断言
+    // 正面对照：这个词在别处（`release_check` 那条腿）**必须**还在，否则上面那条否定断言
     // 可能只是因为整份 workflow 里它已经消失了（那时逃生门的判据本身塌了，不是发布腿干净）。
     assert!(
         workflow_raw.contains("-PpolarisAllowUnsigned=true"),
         "{ANDROID_WORKFLOW}：整份 workflow 里已经没有 `-PpolarisAllowUnsigned=true` —— \
-         上面那条「发布腿不许有它」于是变成一条恒真的断言。先确认冒烟腿还在。"
+         上面那条「发布腿不许有它」于是变成一条恒真的断言。先确认验证腿还在。"
     );
 
-    // ── 前置步骤逐字对拍：三个 job 的 prelude 是复制出来的，会漂 ──
+    // ── 前置步骤逐字对拍：两个 job 的 prelude 是复制出来的，会漂 ──
     //
     // GitHub Actions 没有 job 内的 step 复用。复制的代价是三份必然漂，而漂的方向恰好是
     // 最糟的那种：某条腿用着一套旧的 NDK/JDK 解析逻辑，出的产物与另一条腿不可比，
     // 且没有任何东西会说话。这里按**原文**（不剥注释）对拍，注释漂了同样红。
     //
-    // 🔴 切片顺序承重：`release-apk` 排在 `release-smoke` **之后**，故 smoke 的切片终点必须是
+    // 🔴 切片顺序承重：`release-apk` 排在 `release_check` **之后**，故 check 的切片终点必须是
     //    下一个 job 的头，不能再取到文件尾 —— 取到尾会把 `release-apk` 的 prelude 也圈进来，
     //    而 `slice_between` 取的是**第一处** `PRELUDE_END`，于是两条腿比的是同一段文本，
     //    那条相等断言从此恒真。
-    let apk_job = slice_between(
+    let check_job = slice_between(
         &workflow_raw,
-        "\n  apk:\n",
-        "\n  release-smoke:\n",
-        ANDROID_WORKFLOW,
-    );
-    let smoke_job = slice_between(
-        &workflow_raw,
-        "\n  release-smoke:\n",
+        "\n  release_check:\n",
         "\n  release-apk:\n",
         ANDROID_WORKFLOW,
     );
     let preludes = [
         (
-            "apk",
-            slice_between(apk_job, PRELUDE_START, PRELUDE_END, ANDROID_WORKFLOW),
-        ),
-        (
-            "release-smoke",
-            slice_between(smoke_job, PRELUDE_START, PRELUDE_END, ANDROID_WORKFLOW),
+            "release_check",
+            slice_between(check_job, PRELUDE_START, PRELUDE_END, ANDROID_WORKFLOW),
         ),
         (
             "release-apk",
@@ -1249,7 +1246,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     for (job, prelude) in &preludes[1..] {
         assert_eq!(
             preludes[0].1, *prelude,
-            "{ANDROID_WORKFLOW}：`apk` 与 `{job}` 两个 job 的前置步骤已经不一致。\n\
+            "{ANDROID_WORKFLOW}：`release_check` 与 `{job}` 两个 job 的前置步骤已经不一致。\n\
              射程：从 `{PRELUDE_START}` 起，到 `{PRELUDE_END}` 止。\n\
              这段是复制出来的（GHA 没有 job 内 step 复用），改一处就要改另外两处 —— \
              否则某条腿会用着一套旧的工具链解析逻辑，出的产物与别的腿不可比。"
@@ -1260,28 +1257,29 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
 /// prelude 对拍的起止锚点（两个 job 里都逐字存在、且各只出现一次的两个串）。
 ///
 /// 终点刻意落在「libbox.aar 必须在位」那步的最后一行，而不是下一个 step 的 `- name:` ——
-/// 从那里往后两条腿**本来就该不同**（debug 侧 `tauri android build --debug`，release 侧不带
-/// 那个 flag），把差异面圈进对拍只会逼后人把判据改宽 = 门被磨钝。
-const PRELUDE_START: &str = "      - uses: actions/checkout@v7";
+/// 从那里往后两条腿**本来就该不同**（未签名产物验证与正式签名发布），把差异面圈进对拍
+/// 只会逼后人把判据改宽 = 门被磨钝。
+// release-apk 在 checkout 与 setup-node 之间多一道 tag/SHA/draft 身份门；公共工具链从 setup-node 起。
+const PRELUDE_START: &str = "      - uses: actions/setup-node@v7";
 const PRELUDE_END: &str = "sha256=$(sha256sum";
 
-/// release 冒烟腿必须持有的判据：`(在 workflow 里要找到的串, 它守什么)`。
+/// release-profile 验证腿必须持有的判据：`(在 workflow 里要找到的串, 它守什么)`。
 ///
-/// 🔴 这张表只守「这条腿的**结构**还在」：job 名、触发条件、留存清单、体积基准。
+/// 🔴 这张表只守「这条腿的**结构**还在」：job 名、触发条件、开箱验、留存清单。
 /// 「R8 到底吃进了什么、保住了什么」的针**不在这里** —— 它们住在
 /// `scripts/assert-r8-evidence.mjs`，由 `scripts/assert-r8-evidence.test.mjs` 的正反用例钉着。
 /// 上一版把那些针写在 workflow 的内联 shell 里，于是判据既没法单测，取材也没剥注释：
 /// `io.nekohasekai` 命中的是本仓 `proguard-rules.pro` 注释里的同一句话（R8 的
 /// `-printconfiguration` 会把每份规则文件的原文连注释一起抄进 `configuration.txt`），
 /// libbox 的 consumer 规则一条没进 R8 也照绿。
-const CI_RELEASE_SMOKE_REQUIREMENTS: &[(&str, &str)] = &[
+const CI_RELEASE_CHECK_REQUIREMENTS: &[(&str, &str)] = &[
     (
-        "  release-smoke:",
-        "冒烟腿本体。没有它，「R8 到底跑不跑得完」「包多大」两件事至今零观测面。",
+        "  release_check:",
+        "验证腿本体。没有它，普通 CI 对真实 release-profile 产物没有观测面。",
     ),
     (
-        "if: inputs.release_smoke",
-        "它只在显式请求时跑 —— 这条腿是 debug 腿的全部成本再加上 R8，不该挂在每次调用上。",
+        "if: inputs.publish_release != true",
+        "普通调用必须运行；publish_release 的 signed job 已承接同组判据，不许再造一份 unsigned 包。",
     ),
     (
         "mapping/arm64Release/configuration.txt",
@@ -1304,8 +1302,8 @@ const CI_RELEASE_SMOKE_REQUIREMENTS: &[(&str, &str)] = &[
         "留存必须是正面断言。一个文件都没命中 = R8 没跑或产物路径变了，不许静默绿。",
     ),
     (
-        "219011984",
-        "体积对比的 debug 基准（2026-09-05 实测）。没有基准，量出来的数字读不出信息。",
+        "verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a",
+        "未分发 APK 仍须通过 resources、native libraries 与 16 KiB 产物级检查。",
     ),
 ];
 
@@ -1382,24 +1380,22 @@ fn code_face(path: &str, body: &str) -> String {
 const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
     (
         "        run: node scripts/verify-wry-keep-rules.mjs",
-        3,
-        "wry keep 对拍，debug 腿 / release 冒烟腿 / release 资产腿各一次。那条 keep 盯的是 \
-         gitignored 生成物，只有这三处的上一步把它铺出来；删掉任何一处，wry 改名/改签名就再也 \
-         没人说话。2026-09-13 从 2 改成 3：`release-apk` 那条是**真发给用户**的那个包，\
-         在两个不发布的包上守而放过发布包，守的方向是反的。",
+        2,
+        "wry keep 对拍，未分发 release-profile 验证腿与正式发布腿各一次。那条 keep 盯的是 \
+         gitignored 生成物，只有构建现场能验证；删掉任何一处，对应路径就失去观测面。",
     ),
     (
         "        run: bash scripts/gate-android-release-behavior.sh",
-        1,
-        "release 路径的行为裁判。它是 minify 开没开、逃生门认哪几个来源、AGP 手里到底有几份\
-         规则文件这三件事**唯一**的观测面 —— 源码级判据对它们全部是瞎的。",
+        2,
+        "release 路径的行为裁判。普通验证由 release_check 跑，publish_release 由 signed release\
+         job 跑；两条路径各一，任何一次 workflow 调用都不能失去这道配置期观测面。",
     ),
     (
         "        run: node scripts/assert-r8-evidence.mjs \
          src-tauri/gen/android/app/build/outputs/mapping/arm64Release",
-        1,
-        "release 冒烟腿的产物级判据：R8 吃进了什么（剥注释后的 configuration.txt）、\
-         又保住了什么（seeds.txt）。",
+        2,
+        "R8 产物级判据：普通 unsigned release-profile 验证与正式 signed release 各一；发布路径必须以将要上传的\
+         那次构建的 configuration.txt / seeds.txt 为证据，不能借另一只包作保。",
     ),
     (
         "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
@@ -1409,19 +1405,19 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
     (
         "          if bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
         1,
-        "冒烟腿先强制产出本次源码的 Release SO，只允许明确的签名守卫拒绝。",
+        "release_check 先强制产出本次源码的 Release SO，只允许明确的签名守卫拒绝。",
     ),
     (
         "          bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android \\",
         1,
-        "冒烟腿随后由 Gradle 本次命令行显式开启 unsigned，并只跳过已完成的 Rust task。",
+        "release_check 随后由 Gradle 本次命令行显式开启 unsigned，并只跳过已完成的 Rust task。",
     ),
 ];
 
 /// 「这一行调了本仓的判据/构建」的识别串 —— 承重行由此**派生**，不手抄。
 ///
 /// 2026-09-05 收官轮 A10：上一版的承重行是一张手挑的表，表外还有同形的行
-/// （`verify-apk.mjs` 那条、`gradlew assembleArm64Debug` 那条），接 `|| true` 照绿。
+/// （`verify-apk.mjs` 与直接 `gradlew` 调用），接 `|| true` 照绿。
 /// 手挑的表守不住「同形的下一条」，因为下一条不在表里。
 const LOAD_BEARING_INVOCATIONS: &[&str] = &[
     "node scripts/",
@@ -1561,8 +1557,8 @@ const REGISTERED_EXECUTION_HOOKS: &[(&str, &str, usize, &str)] = &[(
 ///     ⇒ 配置期读到的清单与字节数全对，R8 到手的是一份空规则；裁判的 ⑦ 量的是配置期那一刻。
 /// ```
 ///
-/// 真正能判它们的是**真跑一次 release 构建**，即 `android.yml` 的 `release-smoke` job
-/// （`if: inputs.release_smoke`，**至今一次都没跑过**）。本条只是在那之前多要一次人的确认：
+/// 真正能判它们的是**真跑一次 release 构建**，即 `android.yml` 的 `release_check` job。
+/// 本条只是在那之前多要一次人的确认：
 /// 这几个 token 一出现就红，逼作者来登记表里写一行「它在执行期做什么」。
 ///
 /// **它挡不住**（逐条如实登记，不假装）：
@@ -1611,8 +1607,8 @@ fn execution_phase_hooks_must_be_registered() {
                  🔴 本条是**文本判据**：换个拼写（`setEnabled`）、挂到别处（`beforeTask`）、\
                  或写进取材面之外的文件（生成物 `tauri.build.gradle.kts`，以及**入库的** \
                  `buildSrc/`——终止轮实测把同一句写进 RustPlugin.kt，本条 12 项全绿），\
-                 它都看不见。那一层归 android.yml 的 release-smoke 腿，而那条腿至今一次都没跑过\
-                 （2026-09-06 实测：android.yml 根本没在远端注册过）。"
+                 它都看不见。那一层归 android.yml 的 release_check 与 release-apk 两条真实\
+                 release-profile 构建路径。"
             );
         }
     }

@@ -206,15 +206,15 @@ jobs:
       upload_artifacts: false
     secrets: inherit
 
-  # ══ Android APK 腿 ══
+  # ══ Android release-profile 产物腿 ══
   # 与 preflight / package 并列的第三条选择性腿，判据同源（scripts/classify-ci-impact.mjs 的
-  # ANDROID_IMPACT_SCOPES）。它守的是桌面三条腿结构性看不见的东西：**APK 里到底有什么**
-  # （三份许可文本 / libbox.so 里的 naive+cronet / geo .srs 份数）。
+  # ANDROID_IMPACT_SCOPES）。它构建一份未签名 release-profile APK，只在 runner 内守桌面三条腿
+  # 结构性看不见的东西：R8 证据、资源、原生库与 16 KiB alignment。APK 不上传、不分发。
   #
   # 不与 package job 合并、也不进 package.yml 的矩阵：步骤面完全不相交，理由写在 android.yml 顶部。
   # 不给 preflight 加依赖：本腿不读随包桌面内核，preflight 的 fetch/内核门对它零信息。
   android:
-    name: android apk gate
+    name: android release-profile gate
     needs: classify
     if: needs.classify.outputs.android == 'true'
     # 被调 workflow 的 release-apk 子 job 声明 contents: write；GitHub 在启动前校验

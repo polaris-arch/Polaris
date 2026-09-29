@@ -79,7 +79,9 @@ describe('CI 工具链钉扎守门', () => {
     };
     expect(packageJson.engines?.node).toBe('>=24');
 
-    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(6);
+    // package 发布 DAG 的桌面草稿与最终汇总各自需要 checkout：前者跑打包断言脚本，后者对拍
+    // HEAD/tag SHA。故四份 workflow 合计 7 处；少一处会让某段身份或源码判据失去取材面。
+    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(7);
     expect(all.match(/actions\/setup-node@v7/g) ?? []).toHaveLength(5);
     expect(all).not.toMatch(/actions\/(?:checkout|setup-node)@v[1-6]\b/);
     expect(read('package.yml')).toContain('actions/upload-artifact@v7');
