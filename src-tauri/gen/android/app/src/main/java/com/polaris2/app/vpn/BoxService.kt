@@ -38,6 +38,16 @@ import io.nekohasekai.libbox.SystemProxyStatus
 import io.nekohasekai.libbox.TunOptions
 import java.util.concurrent.TimeUnit
 
+/** Keep native error details out of logcat while retaining the failing close component. */
+internal fun safeCloseFailureComponent(failure: Throwable): String {
+    val message = failure.message.orEmpty()
+    val components = listOf(
+        "service", "inbound", "certificate-provider", "endpoint", "outbound", "router",
+        "connection", "dns-router", "dns-transport", "network", "http-client", "logger",
+    ).filter { message.contains("close $it", ignoreCase = true) }
+    return components.joinToString("+").ifEmpty { "unknown" }
+}
+
 /**
  * 内核生命周期：把 Android 的 Service 回调翻译成 libbox 的 CommandServer 生命周期。
  *
@@ -445,20 +455,32 @@ class BoxService(
                 onAttemptClosed(attempt, error ?: failure)
             }
             attempt.closeOnce { server ->
-                DefaultNetworkMonitor.stop()
-                TransientSpeedtestHost.closeMain(attempt) {
-                    // Start/Reload holds this exact attempt's operationLock. A
-                    // pre-fence call already past the final admission check must
-                    // leave native code before terminal Close can release owner.
-                    synchronized(attempt.operationLock) {
-                        TransientLoginHost.closeMain(attempt) {
-                            // Go's strict terminal close joins Start/OpenTun before this Java
-                            // descriptor can be released; OpenInterface duplicates it afterwards.
-                            try { server?.closeService() }
-                            finally { runCatching { detachedTun?.close() } }
-                            server?.close()
+                var closeStage = "network-monitor"
+                try {
+                    DefaultNetworkMonitor.stop()
+                    closeStage = "speedtest-ownership"
+                    TransientSpeedtestHost.closeMain(attempt) {
+                        // Start/Reload holds this exact attempt's operationLock. A
+                        // pre-fence call already past the final admission check must
+                        // leave native code before terminal Close can release owner.
+                        synchronized(attempt.operationLock) {
+                            closeStage = "login-ownership"
+                            TransientLoginHost.closeMain(attempt) {
+                                // Go's strict terminal close joins Start/OpenTun before this Java
+                                // descriptor can be released; OpenInterface duplicates it afterwards.
+                                closeStage = "native-service"
+                                try { server?.closeService() }
+                                finally { runCatching { detachedTun?.close() } }
+                                closeStage = "native-command"
+                                server?.close()
+                            }
                         }
                     }
+                } catch (failure: Throwable) {
+                    // Native errors may contain a node address or config value. Log only
+                    // fixed diagnostic labels; preserve the original failure for ownership.
+                    Log.e(TAG, "主核关闭失败 stage=$closeStage component=${safeCloseFailureComponent(failure)} type=${failure.javaClass.simpleName}")
+                    throw failure
                 }
             }
         }
