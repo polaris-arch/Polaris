@@ -10,6 +10,7 @@ on:
     types: [checks_requested]
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -60,12 +61,25 @@ jobs:
           MERGE_HEAD: ${{ github.event.merge_group.head_sha }}
           PUSH_BASE: ${{ github.event.before }}
           PUSH_HEAD: ${{ github.sha }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          base=''
+          head=''
           case "$EVENT_NAME" in
             pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
             merge_group) base="$MERGE_BASE"; head="$MERGE_HEAD" ;;
             push) base="$PUSH_BASE"; head="$PUSH_HEAD" ;;
+            workflow_dispatch)
+              [[ "$DISPATCH_REF" == refs/heads/* ]] || {
+                echo "::error::手动发布风险门只接受 branch ref：$DISPATCH_REF"; exit 1; }
+              if git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main \
+                && dispatch_head=$(git rev-parse --verify "${DISPATCH_REF}^{commit}" 2>/dev/null) \
+                && [ "$dispatch_head" = "$DISPATCH_SHA" ] \
+                && base=$(git merge-base refs/remotes/origin/main "$dispatch_head"); then
+                head="$dispatch_head"
+              fi ;;
             *) echo "::error::未登记的事件：$EVENT_NAME"; exit 1 ;;
           esac
 
@@ -134,6 +148,17 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustc -Vv
+
+      - name: Fetch pinned protoc for gRPC wire check
+        if: needs.classify.outputs.kernel == 'true'
+        run: node scripts/fetch-protoc.mjs
+
+      # 只读四平台 core descriptor，不启动 sing-box；REQUIRE 仅作用于本步。
+      - name: Bundled core gRPC wire contract (all platforms)
+        if: needs.classify.outputs.kernel == 'true'
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
 
       # release-risk 的真核门只在 Ubuntu 跑：只需 Linux SO；两个 go.mod 依赖仍由脚本交叉校验。
       - name: Fetch cronet library (Linux)

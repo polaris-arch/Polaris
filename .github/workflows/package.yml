@@ -281,9 +281,10 @@ jobs:
       POLARIS_BUILD_ID: ${{ github.sha }}
       # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
       POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
-      # 直接 tag / Package dispatch 保持原行为；release-risk 的 workflow_call 可关闭重复内核门与上传。
-      POLARIS_RUN_KERNEL_GATES: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || inputs.run_kernel_gates) && '1' || '0' }}
-      POLARIS_UPLOAD_ARTIFACTS: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || inputs.upload_artifacts) && '1' || '0' }}
+      # 直接 tag / Package dispatch 保持原行为；release-risk 手动 dispatch 复用本 workflow 时
+      # event_name 仍是 workflow_dispatch，须用它显式传入的 skip_quality_gates 区分调用侧。
+      POLARIS_RUN_KERNEL_GATES: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.run_kernel_gates) && '1' || '0' }}
+      POLARIS_UPLOAD_ARTIFACTS: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.upload_artifacts) && '1' || '0' }}
     runs-on: ${{ matrix.os }}
     strategy:
       # fail-fast: false 保留（2026-07-31 复核，判据同 ci.yml 那条，别单独优化掉一个）：
@@ -514,6 +515,11 @@ jobs:
       - name: Fetch sing-box core (SHA256-pinned)
         run: node scripts/fetch-core.mjs
 
+      # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
+      - name: Bundled core gRPC wire contract (all platforms)
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
 
       # 依赖指纹门：随包核里 sing-tun 的版本一动就红。
       #
@@ -635,6 +641,12 @@ jobs:
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture --test-threads=1
+
+      - name: Managed mesh multi-answer CONNECT runtime gate
+        if: env.POLARIS_RUN_KERNEL_GATES == '1'
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture
 
       - name: Fetch sing-box dashboard
         run: node scripts/fetch-dashboard.mjs

@@ -1,6 +1,9 @@
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
@@ -31,15 +34,107 @@ const jobSection = (src: string, name: string, file: string) => {
   return lines.slice(start, end).join('\n');
 };
 
+const classifyScript = (risk: string) => {
+  const lines = jobSection(risk, 'classify', 'release-risk.yml').split('\n');
+  const classifyStep = lines.indexOf('      - name: Classify changed paths');
+  expect(classifyStep, 'classify 缺路径分类步骤').toBeGreaterThanOrEqual(0);
+  const start = lines.indexOf('        run: |', classifyStep);
+  expect(start, 'classify 缺 shell 脚本').toBeGreaterThanOrEqual(0);
+  return lines.slice(start + 1).map((line) => line.slice(10)).join('\n');
+};
+
 describe('合入前发布风险门', () => {
   const risk = read('release-risk.yml');
   const pkg = read('package.yml');
 
-  it('PR、merge queue 与 main push 均触发，且 workflow 本身不做路径过滤', () => {
+  it('PR、merge queue、main push 与手动分支验证均触发，且 workflow 本身不做路径过滤', () => {
     expect(risk).toContain('pull_request:');
     expect(risk).toContain('merge_group:');
     expect(risk).toContain('push:');
+    expect(risk).toContain('workflow_dispatch:');
     expect(risk).not.toMatch(/^\s+paths(?:-ignore)?:/m);
+  });
+
+  it('手动分支使用对应 head 与最新 main 的 merge-base，取证失败退回全量门', () => {
+    const classify = jobSection(risk, 'classify', 'release-risk.yml');
+    const start = classify.indexOf('            workflow_dispatch)');
+    const end = classify.indexOf('              fi ;;', start);
+    expect(start, 'classify 缺手动事件分支').toBeGreaterThanOrEqual(0);
+    expect(end, '手动事件分支缺结束边界').toBeGreaterThan(start);
+    const dispatch = classify.slice(start, end);
+    expect(classify).toContain('DISPATCH_REF: ${{ github.ref }}');
+    expect(classify).toContain('DISPATCH_SHA: ${{ github.sha }}');
+    expect(dispatch).toContain('[[ "$DISPATCH_REF" == refs/heads/* ]]');
+    expect(dispatch).toContain('git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main');
+    expect(dispatch).toContain('dispatch_head=$(git rev-parse --verify "${DISPATCH_REF}^{commit}" 2>/dev/null)');
+    expect(dispatch).toContain('[ "$dispatch_head" = "$DISPATCH_SHA" ]');
+    expect(dispatch).toContain('base=$(git merge-base refs/remotes/origin/main "$dispatch_head")');
+    expect(dispatch).toContain('head="$dispatch_head"');
+    expect(classify).toContain('node scripts/classify-ci-impact.mjs --full > "$result"');
+  });
+
+  it('手动分类脚本回放分支、tag 拒绝与取证失败', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'polaris-release-risk-contract-'));
+    try {
+      const git = join(temp, 'git');
+      writeFileSync(git, `#!/bin/sh
+case "$1" in
+  fetch) [ "$FAIL_FETCH" != 1 ] ;;
+  rev-parse) printf 'expected-head\\n' ;;
+  merge-base) printf 'expected-base\\n' ;;
+  cat-file) exit 0 ;;
+  diff) printf 'crates/config-engine/src/builder/managed_mesh_emission.rs\\0' ;;
+  *) exit 9 ;;
+esac
+`);
+      chmodSync(git, 0o755);
+      const script = classifyScript(risk);
+      const run = (ref: string, sha: string, failFetch = false) => {
+        const output = join(temp, 'output');
+        writeFileSync(output, '');
+        const result = spawnSync('bash', ['-c', script], {
+          cwd: REPO_ROOT,
+          env: {
+            ...process.env,
+            PATH: `${temp}:${process.env.PATH}`,
+            EVENT_NAME: 'workflow_dispatch',
+            DISPATCH_REF: ref,
+            DISPATCH_SHA: sha,
+            FAIL_FETCH: failFetch ? '1' : '0',
+            RUNNER_TEMP: temp,
+            GITHUB_OUTPUT: output,
+          },
+          encoding: 'utf8',
+        });
+        return { result, outputs: readFileSync(output, 'utf8') };
+      };
+
+      const branch = run('refs/heads/ci/d1-check', 'expected-head');
+      expect(branch.result.status, branch.result.stderr).toBe(0);
+      expect(branch.outputs).toContain('kernel=true');
+      expect(branch.outputs).toContain('preflight=true');
+      expect(branch.outputs).toContain('unregistered=');
+      expect(branch.result.stdout).not.toContain('无法取得可靠 diff');
+
+      const movedHead = run('refs/heads/ci/d1-check', 'stale-head');
+      expect(movedHead.result.status, movedHead.result.stderr).toBe(0);
+      expect(movedHead.result.stdout).toContain('无法取得可靠 diff');
+      expect(movedHead.outputs).toContain('android=true');
+
+      const tag = run('refs/tags/v1.0.0', 'expected-head');
+      expect(tag.result.status).toBe(1);
+      expect(tag.result.stdout).toContain('手动发布风险门只接受 branch ref');
+      expect(tag.result.stdout).not.toContain('无法取得可靠 diff');
+
+      const failure = run('refs/heads/ci/d1-check', 'expected-head', true);
+      expect(failure.result.status, failure.result.stderr).toBe(0);
+      expect(failure.result.stdout).toContain('无法取得可靠 diff');
+      expect(failure.outputs).toContain('kernel=true');
+      expect(failure.outputs).toContain('platforms=["linux","windows","macos-arm64","macos-x64"]');
+      expect(failure.outputs).toContain('android=true');
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
   });
 
   it('路径判据由仓库脚本持有，最终 required check 始终运行', () => {
@@ -76,6 +171,43 @@ describe('合入前发布风险门', () => {
     expect(pkg).toContain('workflow_call:');
     expect(pkg).toContain('PLATFORMS_JSON: ${{ inputs.platforms');
     expect(pkg).toContain("if: env.POLARIS_UPLOAD_ARTIFACTS == '1'");
+  });
+
+  it('Package 的 tag 与直接手动入口保留强制门，Release Risk 复用尊重 false 输入', () => {
+    const packageJob = jobSection(pkg, 'package', 'package.yml');
+    for (const key of ['POLARIS_RUN_KERNEL_GATES', 'POLARIS_UPLOAD_ARTIFACTS']) {
+      const match = packageJob.match(new RegExp(`^      ${key}: \\$\\{\\{ (.+) \\}\\}$`, 'm'));
+      expect(match, `package job 缺 ${key} 表达式`).not.toBeNull();
+      const evaluate = (ref: string, eventName: string, skipQualityGates: boolean) =>
+        runInNewContext(match![1], {
+          github: { ref, event_name: eventName },
+          inputs: { skip_quality_gates: skipQualityGates, run_kernel_gates: false, upload_artifacts: false },
+          startsWith: (value: string, prefix: string) => value.startsWith(prefix),
+        });
+      expect(evaluate('refs/tags/v1.0.0', 'push', false)).toBe('1');
+      expect(evaluate('refs/heads/feature', 'workflow_dispatch', false)).toBe('1');
+      expect(evaluate('refs/heads/feature', 'workflow_dispatch', true)).toBe('0');
+    }
+  });
+
+  it('preflight 用钉扎 protoc 对拍四平台 wire，D1 CONNECT 仍在 REQUIRE 强制腿', () => {
+    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
+    expect(manifest.windowsBuild.sourceCommit).toBe('b609f959f57ce34416c51c7b87ce4a76f2e1df56');
+    const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
+    const fetchCore = preflight.indexOf('      - name: Fetch sing-box core');
+    const fetchProtoc = preflight.indexOf('      - name: Fetch pinned protoc for gRPC wire check');
+    const wire = preflight.indexOf('      - name: Bundled core gRPC wire contract (all platforms)');
+    const mandatory = preflight.indexOf('      - name: Run mandatory bundled-core gates');
+    expect(fetchCore).toBeGreaterThanOrEqual(0);
+    expect(fetchProtoc).toBeGreaterThan(fetchCore);
+    expect(wire).toBeGreaterThan(fetchProtoc);
+    expect(mandatory).toBeGreaterThan(wire);
+    expect(preflight).toContain('node scripts/fetch-protoc.mjs');
+    expect(preflight).toContain('cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact');
+    const mandatoryStep = preflight.slice(mandatory);
+    expect(mandatoryStep).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
+    expect(mandatoryStep).toContain('cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture');
+    expect(mandatoryStep).not.toContain('POLARIS_NO_KERNEL_RUN');
   });
 
   it('四道随包内核门在 package.yml 与 release-risk.yml 两份定义之间逐条对拍', () => {
