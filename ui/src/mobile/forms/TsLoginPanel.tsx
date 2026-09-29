@@ -75,6 +75,7 @@ export function TsLoginPanel({
   const [submitting, setSubmitting] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | undefined>();
+  const [progressReadFailedAttempt, setProgressReadFailedAttempt] = useState<string | null>(null);
   type PendingLogin = { serverId: string; attemptId: string; source: 'transient' | 'main'; persisted: boolean };
   const [pending, setPending] = useState<PendingLogin | null>(null);
   const pendingRef = useRef<PendingLogin | null>(null);
@@ -141,11 +142,15 @@ export function TsLoginPanel({
     if (!pending) return;
     const { serverId, attemptId } = pending;
     let disposed = false;
+    let revision = 0;
     const reconcile = async (): Promise<void> => {
+      const request = ++revision;
       try {
         const receipt = await api.server.tailscaleLoginProgress(serverId, attemptId);
-        if (disposed || !receipt || !['authorized', 'failed', 'timedOut'].includes(receipt.phase)
-          || pendingRef.current?.attemptId !== attemptId || !hasInstance(instanceId)) return;
+        if (disposed || request !== revision || pendingRef.current?.attemptId !== attemptId
+          || !hasInstance(instanceId)) return;
+        setProgressReadFailedAttempt(null);
+        if (!receipt || !['authorized', 'failed', 'timedOut'].includes(receipt.phase)) return;
         const current = useTailscaleLoginProgressStore.getState().attempts[serverId];
         if (current?.attemptId !== attemptId) return;
         if (!useTailscaleLoginProgressStore.getState().apply(receipt)) return;
@@ -153,7 +158,12 @@ export function TsLoginPanel({
         setTailscaleLoginInitiated(serverId, false);
         if (receipt.phase === 'authorized') setTailscaleLoginState(serverId, true);
       } catch {
-        // Event delivery remains live; a failed read proves nothing about authorization.
+        // A failed read proves nothing about authorization. Keep the event path live and
+        // show that this attempt's result could not be checked on return from the browser.
+        const current = useTailscaleLoginProgressStore.getState().attempts[serverId];
+        if (!disposed && request === revision && pendingRef.current?.attemptId === attemptId
+          && hasInstance(instanceId) && current?.attemptId === attemptId
+          && loginAttemptActive(current.phase)) setProgressReadFailedAttempt(attemptId);
       }
     };
     const onVisible = (): void => { if (!document.hidden) void reconcile(); };
@@ -479,7 +489,9 @@ export function TsLoginPanel({
       submitLabel={mode === 'browser' ? t('ts.openLogin') : t('ts.signIn')}
       submitDisabled={submitting}
       onSubmit={() => void submit()}
-      notice={notice}
+      notice={progressReadFailedAttempt === pending?.attemptId && progress
+        && loginAttemptActive(progress.phase)
+        ? { tone: 'err', text: t('ts.loginProgressReadFailed') } : notice}
     >
       <div className="m-form-row">
         <label className="m-form-label" htmlFor="mts-name">

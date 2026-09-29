@@ -2454,7 +2454,8 @@
     "loginMainCoreAwaiting": "该节点需要授权。正在获取登录页地址…",
     "loginMainCoreUnknown": "尚无法确认主连接中该节点的授权状态，可重试读取。",
     "loginUrlTimeout": "获取登录页地址超时。请重试。",
-    "loginSessionReadFailed": "无法读取旧登录会话，未发起新的授权。请重试。"
+    "loginSessionReadFailed": "无法读取旧登录会话，未发起新的授权。请重试。",
+    "loginProgressReadFailed": "暂时无法核对本次授权结果。授权可能仍在进行；返回应用时会重试。"
   },
   "warp": {
     "addTitle": "接入 Cloudflare WARP",

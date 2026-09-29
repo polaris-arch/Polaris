@@ -255,6 +255,12 @@ const READ_CALLS: readonly string[] = [
   'api.proxy.onInvalidNodes',
   'api.server.tailscaleStateExists',
   /*
+   * 按 attempt 读取原生登录终态：浏览器返回前 WebView 可能错过事件。这是只读回执，
+   * 查询失败不能判成登录失败；面板的 catch 展示「结果暂无法核对」，原事件通道继续等。
+   * 下次 focus 成功读取即清提示，真正登录写腿仍在本门的表单辖区内。
+   */
+  'api.server.tailscaleLoginProgress',
+  /*
    * 表单宿主（批 2 / W-00）新纳入的一条**读**，与上面那一类同形：
    *  · `api.server.tailscaleGetStatus` —— 无参调用，拉整机 TS 状态快照喂出口候选下拉
    *    （`forms/TsExitPanel.tsx`）。失败 = 候选为空，面板**如实降级**成手填（`ts.exitEmptyHint`），

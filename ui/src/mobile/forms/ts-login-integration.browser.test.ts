@@ -45,9 +45,10 @@ api.subscription.onCreateProgressReady = async fn => on('onCreateProgressReady')
 api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
 api.server.tailscaleStateExists = async () => ({ 'ts-1': false });
-const test = window.__tsTest = { opens: [], cancels: [], starts: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, receipt: null, mode };
+const test = window.__tsTest = { opens: [], cancels: [], starts: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
+  if (test.failProgress) throw new Error('RECEIPT_READ_FAILED');
   return test.receipt?.serverId === serverId && test.receipt?.attemptId === attemptId ? test.receipt : null;
 };
 api.server.tailscaleGetStatus = async () => mode?.startsWith('main') && test.starts > 0
@@ -231,6 +232,31 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       });
       await page.getByRole('dialog').waitFor({ state: 'detached', timeout: 1500 });
       expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('a failed receipt read reports unknown status and a later read clears it without changing authorization', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login`);
+      await page.locator('.m-form-foot .primary').waitFor();
+      await page.evaluate(() => { (window as any).__tsTest.failProgress = true; });
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      const message = page.getByText('暂时无法核对本次授权结果。授权可能仍在进行；返回应用时会重试。');
+      await message.waitFor();
+      expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('starting');
+      await page.evaluate(() => {
+        (window as any).__tsTest.failProgress = false;
+        window.dispatchEvent(new Event('focus'));
+      });
+      await message.waitFor({ state: 'detached' });
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleLoginProgress', { serverId: 'ts-1', attemptId: test.attempt().attemptId,
+          phase: 'authorized' });
+      });
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
     } finally { await page.close(); }
   }, 30_000);
 

@@ -35,8 +35,9 @@
  *   失败形态是多要求登记一个脚本，而不是漏掉一个。
  */
 import { describe, expect, it } from 'vitest';
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
@@ -76,9 +77,16 @@ const {
 } = classifier;
 
 /** 目录 → `<path>/`，文件 → `<path>`；与分类器 `scopeOf` 的归一形态一致。 */
-function scopeKeys(relDir: string): string[] {
-  return readdirSync(join(REPO_ROOT, relDir), { withFileTypes: true })
-    .map((entry) => (entry.isDirectory() ? `${relDir}/${entry.name}/` : `${relDir}/${entry.name}`))
+function scopeKeys(relDir: string, root = REPO_ROOT): string[] {
+  return readdirSync(join(root, relDir), { withFileTypes: true })
+    .map((entry) => {
+      // Local Tauri builds may leave ignored links to fetched resource directories. Dirent
+      // describes the link itself; classify its directory target as the same scope as CI's
+      // fetched directory. Unknown linked directories still reach the registration gate.
+      const path = join(root, relDir, entry.name);
+      const isDirectory = entry.isDirectory() || (entry.isSymbolicLink() && statSync(path).isDirectory());
+      return isDirectory ? `${relDir}/${entry.name}/` : `${relDir}/${entry.name}`;
+    })
     .sort();
 }
 
@@ -123,6 +131,24 @@ function stripLineComments(source: string, kind: 'js' | 'yaml'): string {
 }
 
 describe('CI 影响分类器的完备性（fail-open 根治）', () => {
+  it('本地资源目录 symlink 按目录 scope 枚举，未知目录仍会触发登记门', () => {
+    const root = mkdtempSync(join(tmpdir(), 'polaris-impact-scopes-'));
+    try {
+      mkdirSync(join(root, 'resources'));
+      mkdirSync(join(root, 'fetched'));
+      for (const name of ['dashboard', 'linux', '__not_registered__']) {
+        symlinkSync(join(root, 'fetched'), join(root, 'resources', name), 'dir');
+      }
+      const scopes = scopeKeys('resources', root);
+      expect(scopes).toEqual([
+        'resources/__not_registered__/', 'resources/dashboard/', 'resources/linux/',
+      ]);
+      expect(scopes.filter((key) => !isScopeRegistered(key))).toEqual(['resources/__not_registered__/']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('每个 crate / 每个 src-tauri 顶层子树都显式落在两张登记表之一', () => {
     const onDisk = scopesOnDisk();
 

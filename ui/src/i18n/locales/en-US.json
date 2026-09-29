@@ -2454,7 +2454,8 @@
     "loginMainCoreAwaiting": "This node needs authorization. Getting the login URL…",
     "loginMainCoreUnknown": "This node’s authorization status in the main connection is not yet confirmed. Retry to read it.",
     "loginUrlTimeout": "Timed out getting the login URL. Try again.",
-    "loginSessionReadFailed": "Could not read the previous login session. New authorization was not started. Try again."
+    "loginSessionReadFailed": "Could not read the previous login session. New authorization was not started. Try again.",
+    "loginProgressReadFailed": "Could not check this authorization result yet. Authorization may still be in progress; returning to the app will retry."
   },
   "warp": {
     "addTitle": "Connect Cloudflare WARP",
