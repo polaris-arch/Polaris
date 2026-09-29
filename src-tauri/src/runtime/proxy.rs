@@ -1530,6 +1530,13 @@ impl AndroidRequestBirth {
 
 struct AndroidGlobalCustody {
     birth: AndroidRequestBirth,
+    /// Verified Start receipt for this request birth. A run ID alone is not
+    /// native-close authority; the Kotlin birth nonce must stay paired with it.
+    #[allow(
+        dead_code,
+        reason = "stored for the later exact Android Stop dispatch slice"
+    )]
+    exact_target: Option<android_bridge::AndroidExactTarget>,
     stop_only: bool,
     start_confirmed: bool,
     /// Monotone until this entire birth is removed after a certain ACK.

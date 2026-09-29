@@ -290,6 +290,7 @@ impl ProxyRuntime {
         };
         *custody = Some(super::AndroidGlobalCustody {
             birth: birth.clone(),
+            exact_target: None,
             stop_only: false,
             start_confirmed: false,
             historic_unknown: false,
@@ -331,7 +332,11 @@ impl ProxyRuntime {
     pub(super) fn confirm_android_global_start(
         &self,
         birth: &super::AndroidRequestBirth,
+        exact_target: super::android_bridge::AndroidExactTarget,
     ) -> Result<(), String> {
+        if !exact_target.is_valid() {
+            return Err("Android global Start receipt has invalid exact target".into());
+        }
         let mut custody = self
             .android_main_token
             .lock()
@@ -340,6 +345,14 @@ impl ProxyRuntime {
             .as_mut()
             .filter(|attempt| attempt.birth.same(birth) && !attempt.stop_only)
             .ok_or("Android global Start custody changed")?;
+        if attempt
+            .exact_target
+            .as_ref()
+            .is_some_and(|current| current != &exact_target)
+        {
+            return Err("Android global Start exact target changed".into());
+        }
+        attempt.exact_target = Some(exact_target);
         attempt.start_confirmed = true;
         Ok(())
     }
@@ -381,6 +394,7 @@ impl ProxyRuntime {
                 };
                 *guard = Some(super::AndroidGlobalCustody {
                     birth: birth.clone(),
+                    exact_target: None,
                     stop_only: true,
                     start_confirmed: false,
                     historic_unknown: false,

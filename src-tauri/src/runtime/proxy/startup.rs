@@ -1618,8 +1618,8 @@ impl ProxyRuntime {
                 )
                 .await
                 {
-                    Ok(_receipt) => {
-                        self.confirm_android_global_start(&android_birth)?;
+                    Ok(receipt) => {
+                        self.confirm_android_global_start(&android_birth, receipt.exact_target())?;
                         0
                     }
                     Err((msg, error_code)) => {

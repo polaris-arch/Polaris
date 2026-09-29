@@ -264,8 +264,8 @@ pub(super) struct AndroidStartReceipt {
     pub tun: Option<AndroidTunScope>,
 }
 
-#[cfg(any(target_os = "android", test))]
 impl AndroidStartReceipt {
+    #[cfg(any(target_os = "android", test))]
     fn matches_request(&self, run_id: &str, config_digest: &str, claim: Option<&str>) -> bool {
         self.exact_target().is_valid()
             && self.run_id == run_id
@@ -282,6 +282,7 @@ impl AndroidStartReceipt {
 
     /// Necessary observed facts only. The coordinator still has to compare plan Q,
     /// app scope, excluded routes, claim, and live generation before any Complete.
+    #[cfg(any(target_os = "android", test))]
     pub(super) fn managed_tun_evidence(&self) -> Option<&AndroidTunScope> {
         let tun = self.tun.as_ref()?;
         (self.claim.is_some()
@@ -295,7 +296,6 @@ impl AndroidStartReceipt {
 
 /// The attempt's birth nonce comes from Kotlin, not from the request or Service instance.
 /// A run ID alone may be reused after Service recreation and is not a stop authority.
-#[cfg(any(target_os = "android", test))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AndroidExactTarget {
@@ -303,9 +303,8 @@ pub(super) struct AndroidExactTarget {
     pub birth_nonce: String,
 }
 
-#[cfg(any(target_os = "android", test))]
 impl AndroidExactTarget {
-    fn is_valid(&self) -> bool {
+    pub(super) fn is_valid(&self) -> bool {
         !self.run_id.is_empty()
             && self.run_id.trim() == self.run_id
             && self.run_id.encode_utf16().count() <= 128

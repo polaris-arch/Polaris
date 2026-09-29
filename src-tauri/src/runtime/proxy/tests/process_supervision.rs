@@ -2,6 +2,13 @@ use super::*;
 
 mod direct_stop;
 
+fn android_target(run_id: &str) -> super::super::android_bridge::AndroidExactTarget {
+    super::super::android_bridge::AndroidExactTarget {
+        run_id: run_id.to_owned(),
+        birth_nonce: format!("nonce-{run_id}"),
+    }
+}
+
 fn spawn_custody_stand_in() -> tokio::process::Child {
     let mut command = if cfg!(windows) {
         let mut command = tokio::process::Command::new("powershell");
@@ -152,8 +159,80 @@ async fn cancelled_detached_android_start_retains_unknown_birth_after_late_reply
             .unwrap()
             .start_confirmed
     );
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .exact_target
+        .is_none());
     assert!(rt.begin_android_stop_booking(true).is_err());
+    assert!(rt.book_android_global_start(None).is_err());
     assert!(rt.mesh.main_owns_tailscale("ts-android", true));
+}
+
+#[tokio::test]
+async fn android_exact_receipt_stays_with_its_request_birth() {
+    let (rt, _dir) = test_runtime();
+    let a = rt.book_android_global_start(None).unwrap();
+    let valid_a = android_target("android-a");
+    let invalid = super::super::android_bridge::AndroidExactTarget {
+        run_id: "android-a".into(),
+        birth_nonce: " ".into(),
+    };
+    assert!(rt.confirm_android_global_start(&a, invalid).is_err());
+    assert!(
+        !rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .start_confirmed
+    );
+    assert!(rt.begin_android_stop_booking(true).is_err());
+
+    rt.confirm_android_global_start(&a, valid_a.clone())
+        .unwrap();
+    rt.confirm_android_global_start(&a, valid_a.clone())
+        .unwrap();
+    assert!(rt
+        .confirm_android_global_start(&a, android_target("android-a-different"))
+        .is_err());
+    assert_eq!(
+        rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exact_target,
+        Some(valid_a.clone())
+    );
+
+    let stop_a = rt.begin_android_stop_booking(true).unwrap();
+    stop_a.finish_without_main(Ok(())).unwrap();
+    let b = rt.book_android_global_start(None).unwrap();
+    assert!(rt.confirm_android_global_start(&a, valid_a).is_err());
+    {
+        let custody = rt.android_main_token.lock().unwrap();
+        let current = custody.as_ref().unwrap();
+        assert!(current.birth.same(&b));
+        assert!(!current.start_confirmed);
+        assert!(current.exact_target.is_none());
+    }
+    assert!(rt.begin_android_stop_booking(true).is_err());
+    let valid_b = android_target("android-b");
+    rt.confirm_android_global_start(&b, valid_b.clone())
+        .unwrap();
+    assert_eq!(
+        rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exact_target,
+        Some(valid_b)
+    );
 }
 
 #[tokio::test]
@@ -174,7 +253,8 @@ async fn cancelled_detached_android_stop_keeps_s2_ack_from_releasing_birth() {
     let birth = rt.book_android_global_start(Some(token.clone())).unwrap();
     reservation.arm_external_start();
     drop(reservation);
-    rt.confirm_android_global_start(&birth).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-stop"))
+        .unwrap();
     let queued = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -230,7 +310,8 @@ async fn certain_android_stop_ack_removes_matching_ts_and_global_birth_together(
     reservation.arm_external_start();
     drop(reservation);
     let birth = rt.book_android_global_start(Some(token.clone())).unwrap();
-    rt.confirm_android_global_start(&birth).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-certain"))
+        .unwrap();
     let booking = rt.begin_android_stop_booking(true).unwrap();
     assert!(rt.admit_android_global_custody().is_err());
     booking.finish_with_gate(Ok(()), &rt.mesh, &gate).unwrap();
@@ -258,7 +339,8 @@ async fn android_stop_ack_cannot_clear_a_successor_registry_birth() {
     reservation.arm_external_start();
     drop(reservation);
     let birth = rt.book_android_global_start(Some(old.clone())).unwrap();
-    rt.confirm_android_global_start(&birth).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-successor"))
+        .unwrap();
     let old_stop = rt.begin_android_stop_booking(true).unwrap();
 
     // Deliberately bypass admission in this fixture to model a successor
@@ -290,7 +372,8 @@ async fn no_ts_android_start_and_stop_still_hold_global_birth() {
     let birth = rt.book_android_global_start(None).unwrap();
     assert!(rt.admit_android_global_custody().is_err());
     assert!(rt.begin_android_stop_booking(true).is_err());
-    rt.confirm_android_global_start(&birth).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-no-ts"))
+        .unwrap();
     let stop = rt.begin_android_stop_booking(true).unwrap();
     assert!(rt.admit_android_global_custody().is_err());
     assert!(stop.finish_without_main(Ok(())).is_ok());
@@ -388,7 +471,8 @@ async fn booked_android_birth_blocks_a_new_claim_before_generation_changes() {
 async fn no_ts_android_detached_stop_and_cold_sweep_remain_sticky() {
     let (rt, _dir) = test_runtime();
     let birth = rt.book_android_global_start(None).unwrap();
-    rt.confirm_android_global_start(&birth).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-sticky"))
+        .unwrap();
     let s1 = rt.begin_android_stop_booking(true).unwrap();
     drop(s1);
     let s2 = rt.begin_android_stop_booking(true).unwrap();
@@ -409,7 +493,8 @@ async fn no_ts_android_detached_stop_and_cold_sweep_remain_sticky() {
 async fn stale_android_stop_nonce_cannot_clear_a_later_booking() {
     let (rt, _dir) = test_runtime();
     let birth = rt.book_android_global_start(None).unwrap();
-    rt.confirm_android_global_start(&birth).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-stale-stop"))
+        .unwrap();
     let stale = rt.begin_android_stop_booking(true).unwrap();
     {
         // Force the state a cancelled S1 would leave while retaining a stale
