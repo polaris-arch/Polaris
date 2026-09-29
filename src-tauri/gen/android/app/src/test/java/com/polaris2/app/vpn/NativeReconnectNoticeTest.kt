@@ -109,7 +109,7 @@ class NativeReconnectNoticeTest {
         assertNull(NativeReconnectNotice.owner(marker))
     }
 
-    @Test fun alreadyStoppedIntentMarksOnlyTheClosingNoticeOwner() = withMarker { marker ->
+    @Test fun alreadyStoppedIntentMarksTheCurrentNativeAttemptOrClearsVacantMarker() = withMarker { marker ->
         val registry = MainKernelAttemptLedger()
         val closing = MainKernelAttempt<Any>()
         assertTrue(registry.claim(closing))
@@ -144,11 +144,44 @@ class NativeReconnectNoticeTest {
         val successor = MainKernelAttempt<Any>()
         assertTrue(registry.claim(successor))
         NativeReconnectNotice.require(marker, closing.birthNonce)
-        assertFalse(registry.requestReconnectNoticeDismissal(
+        assertTrue(registry.requestReconnectNoticeDismissal(
             { NativeReconnectNotice.owner(marker) },
             { NativeReconnectNotice.clearIfOwner(marker, it) },
         ))
-        assertFalse(successor.clearReconnectNoticeOnClose)
+        assertTrue(successor.clearReconnectNoticeOnClose)
+        assertFalse(NativeReconnectNotice.clearIfOwner(marker, successor.birthNonce))
         assertEquals(closing.birthNonce, NativeReconnectNotice.owner(marker))
+    }
+
+    @Test fun stopBeforeRejectedSystemNoticeWriteStillClearsOnExactClose() = withMarker { marker ->
+        val registry = MainKernelAttemptLedger()
+        val rejected = MainKernelAttempt<Any>()
+        assertTrue(registry.claim(rejected))
+        val resumeClose = CountDownLatch(1)
+        val closed = Thread {
+            check(resumeClose.await(2, TimeUnit.SECONDS))
+            rejected.closed.complete(null)
+            check(registry.completeAfterClose(rejected) {})
+            if (rejected.clearReconnectNoticeOnClose) {
+                NativeReconnectNotice.clearIfOwner(marker, rejected.birthNonce)
+            }
+        }
+        closed.start()
+        assertNull(NativeReconnectNotice.owner(marker))
+        assertTrue(registry.requestReconnectNoticeDismissal(
+            { error("the current native owner must be marked before reading a not-yet-written marker") },
+            { NativeReconnectNotice.clearIfOwner(marker, it) },
+        ))
+        assertTrue(rejected.clearReconnectNoticeOnClose)
+        NativeReconnectNotice.require(marker, rejected.birthNonce)
+        resumeClose.countDown()
+        closed.join(2_000)
+        assertFalse(closed.isAlive)
+        assertNull(NativeReconnectNotice.owner(marker))
+        val notifications = AtomicInteger()
+        assertFalse(NativeReconnectNotice.publishIfOwner(marker, rejected.birthNonce) {
+            notifications.incrementAndGet()
+        })
+        assertEquals(0, notifications.get())
     }
 }
