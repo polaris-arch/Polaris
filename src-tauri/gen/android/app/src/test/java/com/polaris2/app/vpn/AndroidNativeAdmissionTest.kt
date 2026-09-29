@@ -17,7 +17,8 @@ class AndroidNativeAdmissionTest {
     @Test fun partialProductionManifestNeverClaimsCompleteCoverage() {
         val receipt = open().seal("fence-1")
         assertEquals(1, receipt.protocolVersion)
-        assertTrue(receipt.coveredProducers.isEmpty())
+        assertEquals(setOf("main.bridge", "main.system", "main.close", "validation.checkConfig"),
+            receipt.coveredProducers.toSet())
         assertFalse(receipt.coverageComplete)
         assertEquals(0, receipt.capturedCount)
         assertTrue(receipt.captured.isEmpty())

@@ -19,6 +19,7 @@ internal data class TunScope(
 internal class MainKernelAttempt<Server>(
     val systemStartGeneration: Long = 0L,
     val runId: String = UUID.randomUUID().toString(),
+    val nativeTicket: AndroidNativeAdmission.Ticket? = null,
 ) {
     /** Created by this attempt, never supplied by a bridge caller or reused after Service recreation. */
     val birthNonce: String = UUID.randomUUID().toString()

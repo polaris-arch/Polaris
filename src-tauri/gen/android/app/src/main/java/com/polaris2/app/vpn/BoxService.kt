@@ -103,11 +103,22 @@ class BoxService(
             else {
                 val generation = SystemStart.generation()
                 val systemRunId = java.util.UUID.randomUUID().toString()
+                val request = VpnBridge.currentStartRequest()
+                val nativeTicket = if (request != null) request.nativeTicket else try {
+                    AndroidNativeMain.reserveSystem(systemRunId)
+                } catch (_: AndroidNativeAdmission.AdmissionClosed) {
+                    return@synchronized Pair(null, true)
+                } catch (_: IllegalStateException) {
+                    return@synchronized Pair(null, true)
+                }
                 val admission = LegacySystemStartFence.admitWithDecision {
-                    val request = VpnBridge.currentStartRequest()
+                    // The bridge can settle or replace a request between our first
+                    // read and the legacy fence. Never attach a stale ticket.
+                    if (VpnBridge.currentStartRequest() !== request) return@admitWithDecision null
                     val next = MainKernelAttempt<CommandServer>(
                         generation,
                         request?.runId ?: systemRunId,
+                        nativeTicket,
                     )
                     if (!MainKernelAttemptRegistry.isVacant() ||
                         (request == null && !VpnBridge.beginSystemStart())) null
@@ -119,6 +130,9 @@ class BoxService(
                         state = ServiceState.Starting
                         next
                     }
+                }
+                if (admission.value == null && request == null) {
+                    AndroidNativeMain.cancelBeforeBirth(nativeTicket)
                 }
                 Pair(admission.value, shouldStopSelfAfterFenceRejection(
                     admission.rejectedByFence, state, mainAttempt != null,
@@ -195,6 +209,8 @@ class BoxService(
             // This slice has no managed Start admission yet. A marker blocks every legacy bridge start.
             if (bridgeConfig != null) SystemStart.requireLegacyAllowed(service)
             SystemEndpointGuard.requireSupported(config)
+            val nativeTicket = checkNotNull(attempt.nativeTicket) { "android: 主核原生准入票缺失" }
+            AndroidNativeMain.enterBirth(nativeTicket)
             PolarisApplication.ensureSetup()
             // Reserve before native birth. A failed/cancelled birth can still leave a
             // tonic connector carrying requests for this exact endpoint.
@@ -270,6 +286,7 @@ class BoxService(
                         e.message ?: e.toString(),
                         when (e) {
                             is SystemEndpointGuard.Unsupported -> SystemEndpointGuard.ERROR
+                            is AndroidNativeAdmission.AdmissionClosed -> PolarisVpnPlugin.ERR_NATIVE_ADMISSION_CLOSED
                             else -> PolarisVpnPlugin.ERR_STARTUP_FAILED
                         },
                     )
@@ -564,6 +581,7 @@ class BoxService(
         synchronized(this) {
             if (mainAttempt !== attempt || !MainKernelAttemptRegistry.isCurrent(attempt)) return
             if (failure != null) {
+                AndroidNativeMain.unknown(attempt)
                 runCatching { commandServer?.setError("android: close service failed") }
                 closeFailed = true
                 VpnBridge.finishStop("android: 内核关闭失败")
@@ -579,6 +597,7 @@ class BoxService(
                 closeFailed = false
             }) { "主核关闭回执与进程所有权不一致" }
         }
+        AndroidNativeMain.settleAfterExactRelease(attempt)
         // Failed SystemStart cleanup is automatic and must leave its reason
         // visible. Explicit disconnect may clear only this attempt's notice;
         // a successor can already have written a different owner after release.

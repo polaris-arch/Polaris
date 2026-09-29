@@ -10,16 +10,23 @@ import java.util.UUID
 /** The result of one cold-process stat. Only ENOENT opens native admission. */
 internal enum class RequiredMarkerProof { Absent, PresentOrUnknown }
 
+internal enum class AndroidNativeProducer(val wireName: String) {
+    MainBridge("main.bridge"), MainSystem("main.system"), MainClose("main.close"),
+    MainReload("main.reload"), LoginStart("login.start"), LoginClose("login.close"),
+    SpeedtestStart("speedtest.start"), SpeedtestClose("speedtest.close"),
+    ValidationCheckConfig("validation.checkConfig"),
+    TargetlessStop("control.targetlessStop"), TargetlessReload("control.targetlessReload"),
+}
+
 /** Build-time wiring manifest. A producer is listed only after all its entry and close paths are tested. */
 internal object AndroidNativeCoverage {
     const val PROTOCOL_VERSION = 1
-    val requiredProducers = setOf(
-        "main.bridge", "main.system", "main.close", "main.reload",
-        "login.start", "login.close", "speedtest.start", "speedtest.close",
-        "validation.checkConfig", "control.targetlessStop", "control.targetlessReload",
-    )
-    // This foundation has no production owner wiring yet. The verifier rejects it.
-    val wiredProducers: Set<String> = emptySet()
+    val requiredProducers = AndroidNativeProducer.entries.map(AndroidNativeProducer::wireName).toSet()
+    // Only installed adapters can declare capabilities. Incomplete families keep
+    // the verifier closed even when the captured ticket list happens to be empty.
+    val wiredProducers: Set<String> get() =
+        (AndroidNativeMain.capabilities + AndroidNativeValidation.capabilities)
+            .map(AndroidNativeProducer::wireName).toSet()
 }
 
 /** Frozen membership plus live terminal facts; no field on its own asserts NoOldCore. */

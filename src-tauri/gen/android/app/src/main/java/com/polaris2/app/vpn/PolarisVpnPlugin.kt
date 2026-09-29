@@ -67,6 +67,7 @@ internal data class MainStartRequest(
     val runId: String,
     val configDigest: String,
     val claim: String?,
+    val nativeTicket: AndroidNativeAdmission.Ticket,
 )
 
 @InvokeArg
@@ -360,7 +361,20 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject(error.message, ERR_STARTUP_FAILED)
             return
         }
-        if (!VpnBridge.beginStart(MainStartRequest(cfg, args.runId, args.configDigest, args.claim), invoke)) {
+        val nativeTicket = try {
+            AndroidNativeMain.reserveBridge(args.runId)
+        } catch (error: AndroidNativeAdmission.AdmissionClosed) {
+            invoke.reject(error.message, ERR_NATIVE_ADMISSION_CLOSED)
+            return
+        } catch (_: IllegalArgumentException) {
+            invoke.reject("android: 主核身份不在原生准入域", ERR_STARTUP_FAILED)
+            return
+        } catch (_: IllegalStateException) {
+            invoke.reject("android: 主核身份已被使用", ERR_STARTUP_FAILED)
+            return
+        }
+        if (!VpnBridge.beginStart(MainStartRequest(cfg, args.runId, args.configDigest, args.claim, nativeTicket), invoke)) {
+            AndroidNativeMain.cancelBeforeBirth(nativeTicket)
             invoke.reject("Android 隧道已在运行或正在起停中", ERR_STARTUP_FAILED)
             return
         }
@@ -429,17 +443,26 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun checkConfig(invoke: Invoke) {
         val cfg = invoke.parseArgs(CheckArgs::class.java).configContent
-        Thread({
+        val ticket = try {
+            AndroidNativeValidation.reserve()
+        } catch (error: AndroidNativeAdmission.AdmissionClosed) {
+            invoke.resolve(JSObject().put("error", error.message))
+            return
+        }
+        val worker = Thread({
             val err = runCatching {
-                PolarisApplication.ensureSetup()
-                Libbox.checkConfig(cfg)
+                AndroidNativeValidation.check(ticket, cfg)
             }.exceptionOrNull()
             val result = JSObject()
             if (err != null) {
                 result.put("error", err.message ?: err.toString())
             }
             invoke.resolve(result)
-        }, "polaris-check-config").start()
+        }, "polaris-check-config")
+        runCatching { worker.start() }.onFailure { error ->
+            AndroidNativeValidation.cancelBeforeBirth(ticket)
+            invoke.resolve(JSObject().put("error", error.message ?: "android: checkConfig worker unavailable"))
+        }
     }
 
     /**
@@ -938,6 +961,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         /** 与 Rust `runtime/proxy::code::STARTUP_FAILED` 逐字对齐。 */
         const val ERR_STARTUP_FAILED = "STARTUP_FAILED"
         const val ERR_ENDPOINT_RETIRED = "API_ENDPOINT_RETIRED"
+        const val ERR_NATIVE_ADMISSION_CLOSED = "ANDROID_NATIVE_ADMISSION_CLOSED"
 
         /**
          * 包可见性路线（Android 11 / API 30 起的 package visibility filtering）——
@@ -1124,6 +1148,7 @@ internal object VpnBridge {
     fun detachPendingForFence(): Invoke? {
         val pending = pendingStart
         if (pending != null) {
+            request?.nativeTicket?.let(AndroidNativeMain::cancelBeforeBirth)
             pendingStart = null
             starting = false
             request = null
@@ -1148,6 +1173,7 @@ internal object VpnBridge {
         val invoke = synchronized(this) {
             val pending = pendingStart
             if (pending != null) {
+                request?.nativeTicket?.let(AndroidNativeMain::cancelBeforeBirth)
                 pendingStart = null
                 starting = false
             }
@@ -1188,6 +1214,7 @@ internal object VpnBridge {
             starting = false
             running = failed == null
             if (failed != null) systemStarted = false
+            if (failed != null) currentRequest?.nativeTicket?.let(AndroidNativeMain::cancelBeforeBirth)
             StartSettlement(pending, currentRequest, failed, systemStarted)
         }
         val (invoke, startRequest, failure, wasSystemStarted) = settlement
@@ -1246,6 +1273,7 @@ internal object VpnBridge {
         pendingStop = null
         stopping = false
         val startInvoke = pendingStart
+        if (startInvoke != null) request?.nativeTicket?.let(AndroidNativeMain::cancelBeforeBirth)
         pendingStart = null
         starting = false
         if (error != null) {

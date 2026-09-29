@@ -81,7 +81,7 @@ internal object TransientSpeedtestHost {
 
         override fun prepare() {
             PolarisApplication.ensureSetup()
-            Libbox.checkConfig(config)
+            AndroidNativeValidation.check(config)
             val created = TransientLoginNetwork()
             network = created
             created.start()

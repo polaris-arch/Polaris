@@ -115,7 +115,7 @@ internal object TransientLoginHost {
                 PolarisApplication.ensureSetup()
                 check(!Libbox.hasTunInbound(config)) { "Android 独立登录不允许创建 VPN 隧道" }
                 stage = "check"
-                Libbox.checkConfig(config)
+                AndroidNativeValidation.check(config)
                 stage = "cache"
                 val cachePath = JSONObject(config).optJSONObject("experimental")?.optJSONObject("cache_file")?.optString("path").orEmpty()
                 val cache = File(cachePath).canonicalFile

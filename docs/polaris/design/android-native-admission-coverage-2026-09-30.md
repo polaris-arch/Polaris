@@ -7,9 +7,9 @@ area: polaris
 # Android native admission coverage (protocol 1)
 
 `AndroidNativeAdmission` is a process-local safety ledger. It is not a migration
-receipt by itself. The Kotlin `wiredProducers` set starts empty; each identifier
-enters it only after the corresponding production path and its late/timeout
-tests are present. Rust rejects every incomplete manifest and never converts
+receipt by itself. The Kotlin `wiredProducers` set derives from installed adapter
+capabilities; each identifier enters it only after the corresponding production
+path and its late/timeout tests are present. Rust rejects every incomplete manifest and never converts
 the shape verifier's `Ok(())` into `NoOldCore` or custody release.
 
 | Producer | Entry and captured work | Terminal proof required | Late, timeout, or cancellation path |
