@@ -513,6 +513,16 @@ struct CoreMutationFences {
     slots: Vec<Weak<Mutex<DirectCoreSlot>>>,
 }
 
+#[cfg(test)]
+struct SharedTestConnector(Arc<dyn Connector + Sync>);
+
+#[cfg(test)]
+impl Connector for SharedTestConnector {
+    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        self.0.connect()
+    }
+}
+
 pub struct HelperRuntime {
     dir: PathBuf,
     platform: Platform,
@@ -534,6 +544,9 @@ pub struct HelperRuntime {
     /// **测试专用**：把 [`Self::status`] 钉成给定快照，见 `Self::with_forced_status_for_tests`。
     #[cfg(test)]
     status_override: Option<HelperStatusSnapshot>,
+    /// Explicit in-memory daemon transport; never resolves a host socket.
+    #[cfg(test)]
+    test_connector: Option<Arc<dyn Connector + Sync>>,
 }
 
 impl HelperRuntime {
@@ -550,6 +563,8 @@ impl HelperRuntime {
             never_connect: false,
             #[cfg(test)]
             status_override: None,
+            #[cfg(test)]
+            test_connector: None,
         }
     }
 
@@ -646,6 +661,7 @@ impl HelperRuntime {
             core_mutation_fences: Mutex::new(CoreMutationFences::default()),
             never_connect: true,
             status_override: None,
+            test_connector: None,
         }
     }
 
@@ -666,6 +682,18 @@ impl HelperRuntime {
         Self {
             status_override: Some(status),
             ..Self::never_installed_for_tests(dir)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_connector_for_tests(
+        dir: PathBuf,
+        status: HelperStatusSnapshot,
+        connector: Arc<dyn Connector + Sync>,
+    ) -> Self {
+        Self {
+            test_connector: Some(connector),
+            ..Self::with_forced_status_for_tests(dir, status)
         }
     }
 
@@ -724,6 +752,14 @@ impl HelperRuntime {
     fn build_client(&self) -> Result<HelperClient, String> {
         let paths = InstallPaths::for_platform(self.platform);
         let token = read_token(&self.token_path());
+        #[cfg(test)]
+        if let Some(connector) = &self.test_connector {
+            return Ok(HelperClient::new(
+                Box::new(SharedTestConnector(Arc::clone(connector))),
+                self.platform,
+                token,
+            ));
+        }
         #[cfg(test)]
         if self.never_connect {
             return Ok(HelperClient::new(

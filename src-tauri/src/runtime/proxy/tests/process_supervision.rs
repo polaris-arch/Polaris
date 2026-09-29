@@ -2,6 +2,77 @@ use super::*;
 
 mod direct_stop;
 
+#[cfg(target_os = "linux")]
+struct BirthDaemonStream {
+    inner: polaris_helper_client::MockStream,
+    frames: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl polaris_helper_client::ConnectionStream for BirthDaemonStream {
+    fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.inner.read_until_timeout(buf)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(data)?;
+        self.frames
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(data).into_owned());
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown()
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct BirthDaemonConnector {
+    replies: Mutex<std::collections::VecDeque<polaris_helper_client::MockStream>>,
+    frames: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl polaris_helper_client::Connector for BirthDaemonConnector {
+    fn connect(
+        &self,
+    ) -> Result<Box<dyn polaris_helper_client::ConnectionStream>, polaris_helper_client::ClientError>
+    {
+        let reply = self.replies.lock().unwrap().pop_front().ok_or_else(|| {
+            polaris_helper_client::ClientError::Connect("mock daemon exhausted".into())
+        })?;
+        Ok(Box::new(BirthDaemonStream {
+            inner: reply,
+            frames: Arc::clone(&self.frames),
+        }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn birth_daemon_runtime(
+    replies: impl IntoIterator<Item = String>,
+) -> (Arc<ProxyRuntime>, TestDir, Arc<Mutex<Vec<String>>>) {
+    let dir = fresh_test_dir();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let connector = BirthDaemonConnector {
+        replies: Mutex::new(
+            replies
+                .into_iter()
+                .map(|line| polaris_helper_client::MockStream::with_response(line.into_bytes()))
+                .collect(),
+        ),
+        frames: Arc::clone(&frames),
+    };
+    let helper = crate::runtime::helper::HelperRuntime::with_test_connector_for_tests(
+        dir.clone(),
+        installed_helper_status(false),
+        Arc::new(connector),
+    );
+    (test_runtime_in_on(dir.clone(), helper), dir, frames)
+}
+
 fn android_target(run_id: &str) -> super::super::android_bridge::AndroidExactTarget {
     super::super::android_bridge::AndroidExactTarget {
         run_id: run_id.to_owned(),
@@ -1252,6 +1323,149 @@ async fn reaped_exact_start_releases_only_its_reserved_main_claim() {
     assert!(!rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custody() {
+    use crate::runtime::helper::HelperStopTarget;
+
+    let mut a_process = spawn_custody_stand_in();
+    let mut b_process = spawn_custody_stand_in();
+    let a_pid = a_process.id().unwrap();
+    let b_pid = b_process.id().unwrap();
+    let a_hex = "00112233445566778899aabbccddeeff";
+    let b_hex = "11112222333344445555666677778888";
+    let (rt, dir, frames) = birth_daemon_runtime([
+        format!("OK birth-started {a_pid} {a_hex}\n"),
+        format!("OK birth-stopped {a_pid} {a_hex}\n"),
+        format!("OK birth-started {b_pid} {b_hex}\n"),
+    ]);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
+    let binary = dir.join("missing-test-core"); // Reconcile is best effort; no host helper.
+    let config_path = dir.join("test-core.json");
+    let mut a_reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.spawn_core_via_helper(
+            &binary,
+            &config_path,
+            &user_config,
+            rt.gate.generation(),
+            &mut a_reservation,
+        )
+        .await
+        .unwrap(),
+        Some(a_pid)
+    );
+    drop(a_reservation);
+    let a_target = exact_helper_target(a_pid, a_hex);
+    assert_eq!(
+        rt.child.lock().unwrap().helper_stop_target().unwrap().1,
+        HelperStopTarget::Birth(a_target)
+    );
+    let a_attempt = rt.child.lock().unwrap().helper_stop_target().unwrap().0;
+    drop(gate);
+    rt.stop().await.unwrap();
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    a_process.start_kill().unwrap();
+    a_process.wait().await.unwrap();
+
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let mut b_reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.spawn_core_via_helper(
+            &binary,
+            &config_path,
+            &user_config,
+            rt.gate.generation(),
+            &mut b_reservation,
+        )
+        .await
+        .unwrap(),
+        Some(b_pid)
+    );
+    drop(b_reservation);
+    let (current, target) = rt.child.lock().unwrap().helper_stop_target().unwrap();
+    assert!(!current.same(&a_attempt));
+    assert_eq!(
+        target,
+        HelperStopTarget::Birth(exact_helper_target(b_pid, b_hex))
+    );
+    {
+        let sent = frames.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            3,
+            "only Start A, Stop A, Start B may reach the daemon"
+        );
+        assert!(sent[0].starts_with("start-birth-safe\n"));
+        assert_eq!(sent[1], format!("stop-birth-safe\n{a_pid}\n{a_hex}\n"));
+        assert!(sent[2].starts_with("start-birth-safe\n"));
+    }
+    b_process.start_kill().unwrap();
+    b_process.wait().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_ack() {
+    let pid = u32::MAX; // checked_pid rejects it without probing any host process.
+    let hex = "00112233445566778899aabbccddeeff";
+    let (rt, dir, frames) = birth_daemon_runtime([
+        format!("OK birth-started {pid} {hex}\n"),
+        format!("OK birth-stopped {pid} {hex}\n"),
+    ]);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-dead-exact-spawn").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token,
+        )
+        .await
+        .unwrap();
+    assert!(rt.mesh.main_owns_tailscale("ts-dead-exact-spawn", true));
+    let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
+    let err = rt
+        .spawn_core_via_helper(
+            &dir.join("missing-test-core"),
+            &dir.join("test-core.json"),
+            &user_config,
+            rt.gate.generation(),
+            &mut reservation,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("进程不存在"), "{err}");
+    drop(reservation);
+    assert!(!rt.mesh.main_owns_tailscale("ts-dead-exact-spawn", true));
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    let sent = frames.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0].starts_with("start-birth-safe\n"));
+    assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{hex}\n"));
 }
 
 #[tokio::test]
