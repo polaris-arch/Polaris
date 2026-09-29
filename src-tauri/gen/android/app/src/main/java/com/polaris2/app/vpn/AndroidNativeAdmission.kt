@@ -25,7 +25,7 @@ internal object AndroidNativeCoverage {
     // Only installed adapters can declare capabilities. Incomplete families keep
     // the verifier closed even when the captured ticket list happens to be empty.
     val wiredProducers: Set<String> get() =
-        (AndroidNativeMain.capabilities + AndroidNativeValidation.capabilities)
+        (AndroidNativeMain.capabilities + AndroidNativeValidation.capabilities + TransientSpeedtestSessions.capabilities)
             .map(AndroidNativeProducer::wireName).toSet()
 }
 

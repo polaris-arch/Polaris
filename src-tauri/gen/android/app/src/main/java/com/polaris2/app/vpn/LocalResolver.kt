@@ -17,7 +17,6 @@ import io.nekohasekai.libbox.LocalDNSTransport
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
 /**
@@ -31,15 +30,24 @@ object LocalResolver : LocalDNSTransport by NetworkLocalResolver({ DefaultNetwor
 
 /** A login instance supplies its own physical-network monitor; the main resolver keeps its existing supplier. */
 internal class NetworkLocalResolver(private val currentNetwork: () -> android.net.Network?) : LocalDNSTransport {
+    private val lifecycle = TransientResolverLifecycle()
     // rawQuery（收发 DNS 报文原文）是 API 29 才有的；29 以下只能退到 InetAddress 级别的 lookup()。
     override fun raw(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
     // 不用 direct executor：DnsResolver 在哪个线程回调是它的实现细节，万一它同步回调到调用线程，
     // 下面的 latch.await() 就会等一个永远不会 countDown 的锁。给一份自己的线程池把这条排除掉。
-    private val executor: Executor = Executors.newCachedThreadPool()
+    private val executor = Executors.newCachedThreadPool()
+
+    /** Queried instances need a future SDK-callback drain contract, not ordinary Go Close. */
+    fun closeUnused() {
+        lifecycle.closeUnused()
+        executor.shutdown()
+        if (!executor.isTerminated) throw TransientResolverLifecycle.CleanupUnknown()
+    }
 
     @RequiresApi(Build.VERSION_CODES.Q)
     override fun exchange(ctx: ExchangeContext, message: ByteArray) {
+        lifecycle.enterQuery()
         val network = currentNetwork() ?: error("android: 没有可用的默认网络")
         val latch = CountDownLatch(1)
         val signal = CancellationSignal()
@@ -56,17 +64,17 @@ internal class NetworkLocalResolver(private val currentNetwork: () -> android.ne
             signal,
             object : DnsResolver.Callback<ByteArray> {
                 override fun onAnswer(answer: ByteArray, rcode: Int) {
-                    if (rcode == 0) ctx.rawSuccess(answer) else ctx.errorCode(rcode)
+                    lifecycle.deliver { if (rcode == 0) ctx.rawSuccess(answer) else ctx.errorCode(rcode) }
                     latch.countDown()
                 }
 
                 override fun onError(error: DnsResolver.DnsException) {
                     // errno 要原样回传：内核靠 ENETUNREACH / EPERM 之类区分「网络没了」与「查询失败」，
                     // 一律翻成异常会让它把可重试的错误当成永久失败。
-                    when (val cause = error.cause) {
+                    lifecycle.deliver { when (val cause = error.cause) {
                         is ErrnoException -> ctx.errnoCode(cause.errno)
                         else -> failure = error
-                    }
+                    } }
                     latch.countDown()
                 }
             },
@@ -76,15 +84,16 @@ internal class NetworkLocalResolver(private val currentNetwork: () -> android.ne
     }
 
     override fun lookup(ctx: ExchangeContext, network: String, domain: String) {
+        lifecycle.enterQuery()
         val defaultNetwork = currentNetwork() ?: error("android: 没有可用的默认网络")
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             val answer = try {
                 defaultNetwork.getAllByName(domain)
             } catch (e: UnknownHostException) {
-                ctx.errorCode(RCODE_NXDOMAIN)
+                lifecycle.deliver { ctx.errorCode(RCODE_NXDOMAIN) }
                 return
             }
-            ctx.success(answer.mapNotNull { it.hostAddress }.joinToString("\n"))
+            lifecycle.deliver { ctx.success(answer.mapNotNull { it.hostAddress }.joinToString("\n")) }
             return
         }
         lookupQ(ctx, network, domain, defaultNetwork)
@@ -101,19 +110,19 @@ internal class NetworkLocalResolver(private val currentNetwork: () -> android.ne
         }
         val callback = object : DnsResolver.Callback<Collection<InetAddress>> {
             override fun onAnswer(answer: Collection<InetAddress>, rcode: Int) {
-                if (rcode == 0) {
+                lifecycle.deliver { if (rcode == 0) {
                     ctx.success(answer.mapNotNull { it.hostAddress }.joinToString("\n"))
                 } else {
                     ctx.errorCode(rcode)
-                }
+                } }
                 latch.countDown()
             }
 
             override fun onError(error: DnsResolver.DnsException) {
-                when (val cause = error.cause) {
+                lifecycle.deliver { when (val cause = error.cause) {
                     is ErrnoException -> ctx.errnoCode(cause.errno)
                     else -> failure = error
-                }
+                } }
                 latch.countDown()
             }
         }
@@ -134,4 +143,23 @@ internal class NetworkLocalResolver(private val currentNetwork: () -> android.ne
     }
 
     private val RCODE_NXDOMAIN = 3
+}
+
+/** A successful unused close is a positive no-callback fact; queried close stays unknown. */
+internal class TransientResolverLifecycle {
+    class CleanupUnknown : IllegalStateException("android: DNS callback cleanup unknown")
+    private val gate = Any()
+    @Volatile private var closed = false
+    private var queried = false
+    fun enterQuery() = synchronized(gate) {
+        check(!closed) { "android: DNS transport is closed" }
+        queried = true
+    }
+    fun closeUnused() = synchronized(gate) {
+        closed = true
+        if (queried) throw CleanupUnknown()
+    }
+    // Racing pre-close JNI writes keep their original ctx. Queried cleanup
+    // stays Unknown until a separate SDK/executor/JNI drain contract exists.
+    fun deliver(action: () -> Unit) { if (!closed) action() }
 }

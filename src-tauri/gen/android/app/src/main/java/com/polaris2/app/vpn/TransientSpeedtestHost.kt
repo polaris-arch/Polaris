@@ -10,7 +10,7 @@ import org.json.JSONObject
 
 /** A stopped-VPN speedtest owns a separate libbox server and never touches the main service. */
 internal object TransientSpeedtestHost {
-    private val sessions = TransientSpeedtestSessions(logFailure = {
+    private val sessions = TransientSpeedtestSessions(nativeAdmission = AndroidNativeAdmissionGate.ledger, logFailure = {
         Log.w("PolarisSpeedtest", "native lifecycle failed: ${it.javaClass.simpleName}")
     })
 
@@ -60,22 +60,31 @@ internal object TransientSpeedtestHost {
     }
 
     fun start(id: String, config: String, done: (String?) -> Unit) {
+        val nativeTicket = try { sessions.reserveOwner(id) } catch (_: Throwable) {
+            done("Android 临时测速原生准入已关闭或标识重复")
+            return
+        }
         try {
             AndroidNativeValidation.enqueue({ Thread(it, "polaris-speedtest-check").start() }) { validationTicket ->
                 try { validateConfig(config) } catch (_: Exception) {
                     AndroidNativeValidation.cancelBeforeBirth(validationTicket)
+                    sessions.cancelBeforeBirth(nativeTicket)
                     done("Android 临时测速配置被拒绝")
                     return@enqueue
                 }
-                try { sessions.start(id, LibboxEngine(id, config, validationTicket)) { failure ->
+                try { sessions.start(id, LibboxEngine(id, config, validationTicket), nativeTicket) { failure ->
                     AndroidNativeValidation.cancelBeforeBirth(validationTicket)
                     done(failure)
                 } } catch (_: Throwable) {
                     AndroidNativeValidation.cancelBeforeBirth(validationTicket)
+                    sessions.cancelBeforeBirth(nativeTicket)
                     done("Android 临时测速启动失败")
                 }
             }
-        } catch (_: Throwable) { done("Android 临时测速原生准入已关闭") }
+        } catch (_: Throwable) {
+            sessions.cancelBeforeBirth(nativeTicket)
+            done("Android 临时测速原生准入已关闭")
+        }
     }
 
     fun close(id: String, done: (String?) -> Unit) = sessions.close(id, done)
@@ -88,11 +97,12 @@ internal object TransientSpeedtestHost {
         private val validationTicket: AndroidNativeAdmission.Ticket) : TransientSpeedtestSessions.Engine {
         private var network: TransientLoginNetwork? = null
         private var server: CommandServer? = null
+        private var cleanupProof = true
 
         override fun prepare() {
             PolarisApplication.ensureSetup()
             AndroidNativeValidation.check(validationTicket, config)
-            val created = TransientLoginNetwork()
+            val created = TransientLoginNetwork(requireExactClose = true)
             network = created
             created.start()
             server = Libbox.newTransientCommandServer(SpeedtestHandler(id), created)
@@ -108,9 +118,14 @@ internal object TransientSpeedtestHost {
                 runCatching { value.closeService() }.onFailure { failure = it }
                 runCatching { value.close() }.onFailure { if (failure == null) failure = it }
             }
-            runCatching { network?.close() }.onFailure { if (failure == null) failure = it }
+            runCatching { network?.close() }.onFailure {
+                if (it is TransientResolverLifecycle.CleanupUnknown) cleanupProof = false
+                else if (failure == null) failure = it
+            }
             failure?.let { throw it }
         }
+
+        override fun cleanupConfirmed(): Boolean = cleanupProof
     }
 
     private class SpeedtestHandler(private val id: String) : CommandServerHandler {

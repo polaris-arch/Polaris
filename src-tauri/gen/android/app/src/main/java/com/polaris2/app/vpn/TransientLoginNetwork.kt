@@ -16,7 +16,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /** Each login owns its monitor/DNS supplier. It never replaces or stops the main VPN's listener. */
-internal class TransientLoginNetwork : PlatformInterfaceWrapper {
+internal class TransientLoginNetwork(private val requireExactClose: Boolean = false) : PlatformInterfaceWrapper {
+    private val callbacks = TransientNetworkCallbacks()
     private val thread = HandlerThread("polaris-login-network").apply { start() }
     private val handler = Handler(thread.looper)
     private val ready = CountDownLatch(1)
@@ -78,8 +79,8 @@ internal class TransientLoginNetwork : PlatformInterfaceWrapper {
     }
 
     fun close() {
-        closed = true
-        listener = null
+        if (requireExactClose) callbacks.close { closed = true; listener = null }
+        else { closed = true; listener = null }
         try {
             if (registered) {
                 try { PolarisApplication.connectivity.unregisterNetworkCallback(callback) }
@@ -89,7 +90,13 @@ internal class TransientLoginNetwork : PlatformInterfaceWrapper {
             registered = false
             network = null
             thread.quitSafely()
+            if (requireExactClose) {
+                check(Thread.currentThread() !== thread) { "android: network callback cannot confirm its own close" }
+                thread.join()
+            }
         }
+        // Proof unavailability must not mask a real network-unregistration failure.
+        if (requireExactClose) resolver.closeUnused()
     }
 
     override fun sendNotification(notification: io.nekohasekai.libbox.Notification) { /* STATUS is the sole login URL source. */ }
@@ -102,10 +109,17 @@ internal class TransientLoginNetwork : PlatformInterfaceWrapper {
         notifyInterface(network)
     }
     override fun closeDefaultInterfaceMonitor(value: InterfaceUpdateListener) {
+        // Go Close calls this while joining its native work. It must not wait
+        // for a callback that may itself still be inside Go; close() drains it later.
         if (listener == value) listener = null
     }
 
     private fun notifyInterface(value: Network?) {
+        if (requireExactClose) callbacks.dispatch { updateInterface(value) }
+        else updateInterface(value)
+    }
+
+    private fun updateInterface(value: Network?) {
         val target = listener ?: return
         if (closed) return
         if (value == null) {
@@ -116,4 +130,12 @@ internal class TransientLoginNetwork : PlatformInterfaceWrapper {
         val index = runCatching { NetworkInterface.getByName(name)?.index }.getOrNull() ?: return
         if (!closed && network == value && listener == target) target.updateDefaultInterface(name, index, false, false)
     }
+}
+
+/** Join in-flight native notifications and refuse queued callbacks after close. */
+internal class TransientNetworkCallbacks {
+    private val gate = Any()
+    private var closed = false
+    fun dispatch(action: () -> Unit) = synchronized(gate) { if (!closed) action() }
+    fun close(action: () -> Unit) = synchronized(gate) { closed = true; action() }
 }
