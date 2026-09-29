@@ -347,15 +347,17 @@ export function watchVpnAuth(
   target: VisibilityTarget,
 ): () => void {
   let alive = true;
+  let revision = 0;
   const pull = (): void => {
+    const request = ++revision;
     void read().then(
       (next) => {
-        if (alive) apply(next === 'authorized' || next === 'denied' ? next : 'unknown');
+        if (alive && request === revision) apply(next === 'authorized' || next === 'denied' ? next : 'unknown');
       },
       // 读不到就是 `unknown`（后端已经把三种桥失败折成它；这里兜的是 IPC 本身不通）。
       // 🔴 绝不回落成 `denied`：那会把用户指去授予一个可能已经给过的权限。
       () => {
-        if (alive) apply('unknown');
+        if (alive && request === revision) apply('unknown');
       },
     );
   };
@@ -472,6 +474,7 @@ export function SettingsRoot({
               label={t('mobileSettings.vpnAuth.title')}
               desc={t('mobileSettings.vpnAuth.desc')}
               status={t(VPN_AUTH_LABEL[vpnAuth])}
+              tone={vpnAuth === 'authorized' ? 'ok' : vpnAuth === 'denied' ? 'warn' : 'neutral'}
             />
           ))}
         </SettingsGroup>

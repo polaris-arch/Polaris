@@ -26,7 +26,7 @@
  * 两者共用同一份 `ts-settings-logic`，不会给「出口选了什么」造两个答案。
  */
 
-import { useEffect, useState, type ReactElement } from 'react';
+import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 /* 「展开即露出」的全仓不变量（`components/reveal.ts`）：`.m-form-body` 是 `overflow-y:auto` 的
    单一滚动容器，底部那个分组展开时新长出来的字段整段落在视区之外。与桌面四个分组菜单**同一形状**，
@@ -81,6 +81,7 @@ export function TsSettingsPanel({
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
+  const isTop = useMobileFormStore((s) => s.stack[s.stack.length - 1]?.instanceId === instanceId);
   const servers = useEffectiveServers();
   const diskServers = useAppStore((s) => s.servers);
   const loadConfig = useAppStore((s) => s.loadConfig);
@@ -98,6 +99,9 @@ export function TsSettingsPanel({
 
   const [peers, setPeers] = useState<readonly TailscaleStatusPeer[]>([]);
   const [connected, setConnected] = useState<boolean | null>(null);
+  // A saved node can exist after logout. Only native state existence may offer Logout.
+  const [hasLoginState, setHasLoginState] = useState<boolean | null>(null);
+  const stateReadRevision = useRef(0);
   const [draft, setDraft] = useState<FormValues>(() => ({
     ...initTsDraft(node),
     bindInterface: node?.bindInterface ?? '',
@@ -134,6 +138,32 @@ export function TsSettingsPanel({
       cancelled = true;
     };
   }, [serverId]);
+
+  // Re-read when this sheet becomes visible again after a login sheet closes, and when
+  // Android returns from system UI. A failed read is unknown, never proof of a session.
+  useEffect(() => {
+    if (!isTop) return;
+    let alive = true;
+    const readState = (): void => {
+      const revision = ++stateReadRevision.current;
+      setHasLoginState(null);
+      void api.server.tailscaleStateExists([serverId]).then(
+        (states) => {
+          if (alive && revision === stateReadRevision.current)
+            setHasLoginState(typeof states[serverId] === 'boolean' ? states[serverId] : null);
+        },
+        () => {
+          if (alive && revision === stateReadRevision.current) setHasLoginState(null);
+        },
+      );
+    };
+    readState();
+    window.addEventListener('focus', readState);
+    return () => {
+      alive = false;
+      window.removeEventListener('focus', readState);
+    };
+  }, [serverId, isTop]);
 
   const setField = (k: string, v: FormValue): void => {
     setDraft((d) => ({ ...d, [k]: v }));
@@ -255,6 +285,9 @@ export function TsSettingsPanel({
   };
 
   const completeLogout = async (serverId: string): Promise<void> => {
+    // Invalidate an older state query issued while the confirmation was closing.
+    ++stateReadRevision.current;
+    setHasLoginState(false);
     const store = useAppStore.getState();
     store.setTailscaleLoginState(serverId, false);
     store.setTailscaleAuthUrl(serverId, null);
@@ -411,7 +444,8 @@ export function TsSettingsPanel({
 
           {/* 账号级动作。桌面把它们摆在组网接入面的 Tailscale 卡片上（`MeshJoinDialog` 的
               `actions`）；移动端那张接入面是一列纵向选择，塞不下三颗次动作，故收进这张表的末尾 ——
-              **三颗**都在场、都能点，处置逐条登记在 `nodes/absence-register.ts#MESH_JOIN_ACTIONS`。
+              Taildrop 与登录入口常驻；只有 native state 存在才给登出动作。
+              处置逐条登记在 `nodes/absence-register.ts#MESH_JOIN_ACTIONS`。
 
               🔴 Taildrop 那颗 2026-09-13（批 16）补进来。它收在这里而不是接入面上，恰恰是因为
               桌面本轮把那张卡改成多节点分行的**那条理由**：收件箱必须按 `serverId` 寻址。
@@ -438,16 +472,16 @@ export function TsSettingsPanel({
                 disabled={busy}
                 onClick={() => open({ kind: 'ts-login', serverId })}
               >
-                {t('meshJoin.switchAccount')}
+                {t(hasLoginState === false ? 'ts.signIn' : 'meshJoin.switchAccount')}
               </button>
-              <button
+              {hasLoginState === true && <button
                 type="button"
                 className="m-form-btn danger"
                 disabled={busy}
                 onClick={requestLogout}
               >
                 {t('ts.logout')}
-              </button>
+              </button>}
             </div>
           </div>
         </>

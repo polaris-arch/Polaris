@@ -23,7 +23,7 @@
  * 登记见 `lib/config-write-wiring.test.ts` 里本文件那行 `api.server.update(`。
  * key 本体在这一层**结构上不可达**：判据是 `hasTsAuthKey(node)` 这个布尔，不是字符串。
  *
- * 无 TS 节点时（未登录）：给 mesh-note 引导先登录，Save/Logout 置灰（无可写目标）。
+ * 无 TS 节点时：给 mesh-note 引导先登录，Save/登录动作置灰（无可写目标）。
  * R1：`key` 绑 TS 节点 id（见导出包装）+ useState 同步初始化。
  */
 
@@ -101,6 +101,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
 
   const [peers, setPeers] = useState<TailscaleStatusPeer[]>([]);
   const [connected, setConnected] = useState<boolean | null>(null);
+  const [hasLoginState, setHasLoginState] = useState<boolean | null>(null);
   const [draft, setDraft] = useState<FormValues>(() => ({
     ...initTsDraft(node),
     name: node?.name ?? '',
@@ -145,6 +146,24 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     return () => {
       cancelled = true;
     };
+  }, [node?.id]);
+
+  useEffect(() => {
+    const id = node?.id;
+    if (!id) return;
+    let alive = true;
+    let revision = 0;
+    const readState = (): void => {
+      const request = ++revision;
+      setHasLoginState(null);
+      void api.server.tailscaleStateExists([id]).then(
+        (states) => { if (alive && request === revision) setHasLoginState(typeof states[id] === 'boolean' ? states[id] : null); },
+        () => { if (alive && request === revision) setHasLoginState(null); },
+      );
+    };
+    readState();
+    window.addEventListener('focus', readState);
+    return () => { alive = false; window.removeEventListener('focus', readState); };
   }, [node?.id]);
 
   // 判据取**已保存值**而非草稿值（禁用豁免须在整个弹窗生命期内稳定，见 exitNodeOptions 头注）。
@@ -314,6 +333,11 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     setBusy(true);
     try {
       await api.server.tailscaleLogout(node.id);
+      const store = useAppStore.getState();
+      store.setTailscaleLoginState(node.id, false);
+      store.setTailscaleAuthUrl(node.id, null);
+      store.setTailscaleLoginInitiated(node.id, false);
+      store.clearTailscaleStatus(node.id);
       void loadConfig(true);
       close();
     } catch (e) {
@@ -329,7 +353,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   /**
    * Auth Key 状态行 —— 归**基础**页而非高级：本行存在的理由就是「用户此前无从知道盘上还躺着一把
    * 长期凭据」（`TsLoginDialog` 的输入框从不回填、退出登录也明说保留 authKey）。把唯一的可见面
-   * 再折进高级页，等于只解决了一半。同族的「退出登录」同样常驻（footer），二者视觉分量相称。
+   * 再折进高级页，等于只解决了一半。footer 账号动作按本机 state 是否存在切换登录/退出。
    *
    * ⚠️ 这里渲染的每一样东西都是**布尔派生**：三档状态文案 + 一颗按钮。key 的明文、前缀、后几位、
    * 长度一概不进 DOM —— 截图/录屏/演示都会把 DOM 里的东西带出去，而 pre-auth key 是长期凭据。
@@ -371,7 +395,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       className="entry-form-dlg"
       footer={
         <>
-          <button
+          {hasLoginState === true ? <button
             type="button"
             className="btn ghost"
             onClick={() => void handleLogout()}
@@ -379,7 +403,15 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
             style={{ marginRight: 'auto', color: 'hsl(var(--err))', borderColor: 'hsl(var(--err)/0.3)' }}
           >
             {t('ts.logout')}
-          </button>
+          </button> : <button
+            type="button"
+            className="btn ghost"
+            disabled={busy || !node}
+            style={{ marginRight: 'auto' }}
+            onClick={() => { if (node) { close(); open({ kind: 'ts-login', serverId: node.id }); } }}
+          >
+            {t(hasLoginState === false ? 'ts.signIn' : 'meshJoin.switchAccount')}
+          </button>}
           {/* 提交中**不锁**「取消」：原型 `:2545` 的 ghost 钮无 disabled，且本仓此前四个弹窗锁、
               两个不锁（NodeDialog/SubDialog）—— 不是与原型的差，是实现自己两套。统一为不锁：
               提交卡住（IPC 无应答）时用户必须还能退出，否则弹窗成了死窗。 */}

@@ -620,6 +620,7 @@ export function SettingsStatusRow({
   desc,
   descDetails,
   status,
+  tone = 'neutral',
   first,
 }: {
   id: string;
@@ -627,6 +628,7 @@ export function SettingsStatusRow({
   desc: ReactNode;
   descDetails?: ReactNode;
   status: ReactNode;
+  tone?: 'ok' | 'warn' | 'neutral';
   first?: boolean;
 }): ReactElement {
   return (
@@ -641,7 +643,7 @@ export function SettingsStatusRow({
           data-status={id}
           style={{
             fontSize: '0.75rem',
-            color: 'hsl(var(--fg-dim))',
+            color: tone === 'neutral' ? 'hsl(var(--fg-dim))' : `hsl(var(--${tone}))`,
             fontWeight: 500,
             whiteSpace: 'nowrap',
           }}

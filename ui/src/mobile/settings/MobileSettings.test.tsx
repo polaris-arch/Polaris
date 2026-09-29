@@ -518,10 +518,15 @@ describe('① 分段构成 = 桌面 9 子页去掉 helper（裁定 #4：代码�
         .map((r) => r.chunk)
         .join('');
     };
-    expect(chipOf('authorized')).toContain(copy('mobileSettings.vpnAuth.granted'));
-    expect(chipOf('denied')).toContain(copy('mobileSettings.vpnAuth.denied'));
+    const granted = chipOf('authorized');
+    expect(granted).toContain(copy('mobileSettings.vpnAuth.granted'));
+    expect(granted).toContain('color:hsl(var(--ok))');
+    const denied = chipOf('denied');
+    expect(denied).toContain(copy('mobileSettings.vpnAuth.denied'));
+    expect(denied).toContain('color:hsl(var(--warn))');
     const unknown = chipOf('unknown');
     expect(unknown).toContain(copy('mobileSettings.vpnAuth.unknown'));
+    expect(unknown).toContain('color:hsl(var(--fg-dim))');
     expect(
       unknown,
       '`unknown`（读不到）被显示成了「已授权」—— 那是编一个事实，且方向有害',
@@ -618,6 +623,22 @@ describe('①b VPN 授权：重读接线 + 状态一路不被折', () => {
     ).toBe(2);
     await flush();
     expect(d.seen, '第二次读回来的新值没有送进界面').toEqual(['authorized', 'denied']);
+  });
+
+  it('较早的授权读取晚返回时，不覆盖回前台读到的撤销结果', async () => {
+    const target = new FakeVisibility();
+    const seen: VpnAuthState[] = [];
+    let finishFirst: (state: VpnAuthState) => void = () => {};
+    let reads = 0;
+    const stop = watchVpnAuth(() => ++reads === 1
+      ? new Promise<VpnAuthState>((resolve) => { finishFirst = resolve; })
+      : Promise.resolve('denied'), (state) => seen.push(state), target);
+    target.fire();
+    await flush();
+    finishFirst('authorized');
+    await flush();
+    expect(seen).toEqual(['denied']);
+    stop();
   });
 
   it('反向对照：**不可见**时的那次事件不读（不是「一有事件就读」，也就不是恒绿）', async () => {
