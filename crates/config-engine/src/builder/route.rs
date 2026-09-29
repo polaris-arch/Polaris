@@ -1825,6 +1825,7 @@ fn app_owner_leg(platform: Platform) -> AppOwnerLeg {
 
 fn empty_matcher() -> RouteRule {
     RouteRule {
+        clash_mode: None,
         protocol: None,
         network: None,
         rule_set: None,

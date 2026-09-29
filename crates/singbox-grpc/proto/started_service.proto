@@ -21,7 +21,18 @@ option go_package = "github.com/sagernet/sing-box/daemon;daemon";
 
 message Empty {}
 
+message ClashMode {
+  string mode = 3;
+}
+message ClashModeStatus {
+  repeated string modeList = 1;
+  string currentMode = 2;
+}
+
 service StartedService {
+  // SetClashMode silently ignores unknown names; callers must strictly read back.
+  rpc GetClashModeStatus(Empty) returns (ClashModeStatus);
+  rpc SetClashMode(ClashMode) returns (Empty);
   // Tailscale 管理。SubscribeTailscaleStatus（A3 STATUS relay）/ SetTailscaleExitNode
   // 由本 crate 暴露；TailscaleLogout 暂不暴露（proto 保留以与服务端 wire 同构）。
   rpc SubscribeTailscaleStatus(Empty) returns (stream TailscaleStatusUpdate);

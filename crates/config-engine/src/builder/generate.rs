@@ -321,6 +321,37 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
     deps: &GenerateConfigDeps,
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<GenerateOutcome, String> {
+    let mut outcome = generate_base_config(config, resolved_ips, deps, runtime_bind_interfaces)?;
+    if deps.platform == "android" && deps.has_management_api {
+        if let Some((normal_id, mesh_id)) = super::mesh_mode::mode_candidates(config) {
+            let mut normal = config.clone();
+            normal.selected_server_id = Some(normal_id);
+            let mut mesh = config.clone();
+            mesh.selected_server_id = Some(mesh_id);
+            // Both projections come from the exact same builder and runtime facts. Only
+            // differences proven expressible by clash_mode/selector are admitted.
+            if let (Ok(normal), Ok(mesh)) = (
+                generate_base_config(&normal, resolved_ips, deps, runtime_bind_interfaces),
+                generate_base_config(&mesh, resolved_ips, deps, runtime_bind_interfaces),
+            ) {
+                super::mesh_mode::try_compile(
+                    &mut outcome.config,
+                    &normal.config,
+                    &mesh.config,
+                    super::mesh_mode::selected_mode(config),
+                );
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn generate_base_config(
+    config: &UserConfig,
+    resolved_ips: &BTreeMap<String, String>,
+    deps: &GenerateConfigDeps,
+    runtime_bind_interfaces: &BTreeMap<String, String>,
+) -> Result<GenerateOutcome, String> {
     // ── 1. withRaceOff（L3473）──────────────────────────────────────────────────
     // race server 就绪（raceServerPort>0）才走 race 解析；否则强制 race off。
     let cfg = if deps.race_server_port > 0 {
@@ -553,6 +584,7 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
                 store_fakeip: Some(true),
                 store_dns: Some(true),
             }),
+            clash_api: None,
         }),
         services: None,
     };

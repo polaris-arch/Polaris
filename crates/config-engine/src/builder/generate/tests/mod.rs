@@ -71,6 +71,249 @@ fn base_config() -> UserConfig {
     }
 }
 
+#[test]
+fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::new(Default::default())),
+        ..Default::default()
+    });
+    config.singbox_dashboard = Some(true);
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let ordinary = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    let ordinary_base = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    assert_eq!(
+        ordinary
+            .experimental
+            .as_ref()
+            .unwrap()
+            .clash_api
+            .as_ref()
+            .map(|x| x.default_mode.as_str()),
+        Some("normal")
+    );
+    assert!(ordinary
+        .outbounds
+        .iter()
+        .any(|o| o.tag == super::super::mesh_mode::DASHBOARD_SELECTOR));
+    let mut mesh_config = config;
+    mesh_config.selected_server_id = Some("ts".into());
+    let mesh = generate_sing_box_config(&mesh_config, &BTreeMap::new(), &deps).unwrap();
+    let mesh_base = generate_base_config(&mesh_config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    assert_eq!(
+        mesh.experimental
+            .as_ref()
+            .unwrap()
+            .clash_api
+            .as_ref()
+            .map(|x| x.default_mode.as_str()),
+        Some("mesh-direct")
+    );
+    assert_eq!(ordinary.route, mesh.route);
+    assert_eq!(ordinary.dns, mesh.dns);
+    assert!(compiled_projection_matches_base(
+        &ordinary,
+        &ordinary_base,
+        "normal"
+    ));
+    assert!(compiled_projection_matches_base(
+        &ordinary,
+        &mesh_base,
+        "mesh-direct"
+    ));
+    if let Ok(path) = std::env::var("POLARIS_MESH_MODE_TEST_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&ordinary).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn existing_third_clash_mode_rejects_compilation_without_mutating_config() {
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::new(Default::default())),
+        ..Default::default()
+    });
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let mut normal = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    let mut mesh_config = config;
+    mesh_config.selected_server_id = Some("ts".into());
+    let mesh = generate_base_config(&mesh_config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    normal.route.as_mut().unwrap().rules[0].clash_mode = Some("custom".into());
+    let before = normal.clone();
+    assert!(!super::super::mesh_mode::try_compile(
+        &mut normal,
+        &before,
+        &mesh,
+        "normal"
+    ));
+    assert_eq!(normal, before);
+}
+
+fn compiled_projection_matches_base(
+    compiled: &SingBoxConfig,
+    original: &SingBoxConfig,
+    mode: &str,
+) -> bool {
+    let (Some(mut route), Some(mut dns), Some(base_route), Some(base_dns)) = (
+        compiled.route.clone(),
+        compiled.dns.clone(),
+        original.route.as_ref(),
+        original.dns.as_ref(),
+    ) else {
+        return false;
+    };
+    let Some(final_route_index) = route.rules.iter().rposition(|r| {
+        r.clash_mode.as_deref() == Some(mode)
+            && r.action.as_deref() == Some("route")
+            && r.outbound.is_some()
+    }) else {
+        return false;
+    };
+    let final_route = route.rules[final_route_index].outbound.clone().unwrap();
+    route.rules.remove(final_route_index);
+    route
+        .rules
+        .retain(|r| r.clash_mode.is_none() || r.clash_mode.as_deref() == Some(mode));
+    for rule in &mut route.rules {
+        rule.clash_mode = None;
+        if mode == "mesh-direct" {
+            for tag in [&mut rule.server, &mut rule.domain_resolver] {
+                if let Some(name) = tag.as_mut() {
+                    if let Some(base) = name.strip_suffix("-mesh-direct") {
+                        *name = base.into();
+                    }
+                }
+            }
+        }
+    }
+    route.final_outbound = Some(final_route);
+    if route != *base_route {
+        return false;
+    }
+
+    let Some(final_dns_index) = dns.rules.as_ref().and_then(|rules| {
+        rules.iter().rposition(|r| {
+            r.clash_mode.as_deref() == Some(mode)
+                && r.server.is_some()
+                && r.domain.is_none()
+                && r.rule_set.is_none()
+        })
+    }) else {
+        return false;
+    };
+    let mut rules = dns.rules.take().unwrap_or_default();
+    let mut final_dns = rules.remove(final_dns_index).server.unwrap();
+    if mode == "mesh-direct" {
+        if let Some(base) = final_dns.strip_suffix("-mesh-direct") {
+            final_dns = base.into();
+        }
+    }
+    rules.retain(|r| r.clash_mode.is_none() || r.clash_mode.as_deref() == Some(mode));
+    for rule in &mut rules {
+        rule.clash_mode = None;
+        if mode == "mesh-direct" {
+            if let Some(server) = rule.server.as_mut() {
+                if let Some(base) = server.strip_suffix("-mesh-direct") {
+                    *server = base.into();
+                }
+            }
+        }
+    }
+    dns.rules = if base_dns.rules.is_none() && rules.is_empty() {
+        None
+    } else {
+        Some(rules)
+    };
+    dns.final_server = Some(final_dns);
+    let mut servers = Vec::with_capacity(base_dns.servers.len());
+    for server in &base_dns.servers {
+        let selected = if mode == "mesh-direct" {
+            dns.servers
+                .iter()
+                .find(|candidate| candidate.tag == format!("{}-mesh-direct", server.tag))
+                .unwrap_or_else(|| {
+                    dns.servers
+                        .iter()
+                        .find(|candidate| candidate.tag == server.tag)
+                        .unwrap()
+                })
+        } else {
+            dns.servers
+                .iter()
+                .find(|candidate| candidate.tag == server.tag)
+                .unwrap()
+        };
+        let mut selected = selected.clone();
+        if mode == "mesh-direct" {
+            selected.tag = server.tag.clone();
+            for tag in [
+                &mut selected.domain_resolver,
+                &mut selected.address_resolver,
+            ] {
+                if let Some(name) = tag.as_mut() {
+                    if let Some(base) = name.strip_suffix("-mesh-direct") {
+                        *name = base.into();
+                    }
+                }
+            }
+        }
+        servers.push(selected);
+    }
+    dns.servers = servers;
+    dns == *base_dns
+}
+
+#[test]
+fn restored_android_config_precompiles_when_fixture_is_available() {
+    let Ok(path) = std::env::var("POLARIS_RESTORED_CONFIG_FIXTURE") else {
+        return;
+    };
+    let input = std::fs::read_to_string(path).unwrap();
+    let config: UserConfig = serde_json::from_str(&input).unwrap();
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let output = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    assert!(
+        output
+            .experimental
+            .as_ref()
+            .and_then(|x| x.clash_api.as_ref())
+            .is_some(),
+        "restored configuration did not pass the dual policy equivalence gate"
+    );
+    let (normal_id, mesh_id) = super::super::mesh_mode::mode_candidates(&config).unwrap();
+    for (id, mode) in [(normal_id, "normal"), (mesh_id, "mesh-direct")] {
+        let mut variant = config.clone();
+        variant.selected_server_id = Some(id);
+        let base = generate_base_config(&variant, &BTreeMap::new(), &deps, &BTreeMap::new())
+            .unwrap()
+            .config;
+        assert!(
+            compiled_projection_matches_base(&output, &base, mode),
+            "restored configuration route/DNS projection differs in mode {mode}"
+        );
+    }
+}
+
 fn rule_resource(id: &str, format: RuleResourceFormat) -> RuleResource {
     RuleResource {
         id: id.into(),

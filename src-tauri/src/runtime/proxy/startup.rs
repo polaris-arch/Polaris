@@ -44,6 +44,7 @@ use polaris_config_engine::builder::helpers::ServerLike;
 use polaris_config_engine::builder::inbounds::{
     emits_mixed_inbound, loopback_inbounds_require_auth,
 };
+use polaris_config_engine::builder::mesh_mode::DASHBOARD_SELECTOR;
 use polaris_config_engine::builder::network_env::{
     builtin_dhcp_status, resolved_probe, BuiltinDhcpStatus, NetworkCanaryPlan, ProbeFacts,
     PrunedEnvRule, ResolvedProbe,
@@ -80,6 +81,7 @@ use polaris_core_supervisor::{
 };
 use polaris_helper_proto::Platform;
 use polaris_platform_events::NetworkChangeImpact;
+use polaris_singbox_grpc::{Endpoint as ManagementEndpoint, SingBoxApiClient};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -994,6 +996,85 @@ impl ProxyRuntime {
         }
     }
 
+    /// Verify the native core's mode before publishing `running=true`. A cached selector may
+    /// also override the dashboard detour; reconcile that control-plane selector synchronously.
+    async fn confirm_startup_mesh_mode(
+        &self,
+        generated: &SingBoxConfig,
+        api_port: u16,
+        secret: &str,
+    ) -> Result<(), String> {
+        let Some(expected) = generated
+            .experimental
+            .as_ref()
+            .and_then(|x| x.clash_api.as_ref())
+            .map(|x| x.default_mode.as_str())
+        else {
+            return Ok(());
+        };
+        let client =
+            SingBoxApiClient::connect(ManagementEndpoint::new("127.0.0.1", api_port), secret)
+                .await
+                .map_err(|e| format!("TS mode 管理 API 连接失败: {e}"))?;
+        let status = client
+            .get_clash_mode_status()
+            .await
+            .map_err(|e| format!("TS mode 状态读取失败: {e}"))?;
+        if status.mode_list.len() != 2
+            || !["normal", "mesh-direct"]
+                .iter()
+                .all(|want| status.mode_list.iter().any(|mode| mode == want))
+        {
+            return Err("TS 内核模式列表并非预编译的双模式".into());
+        }
+        if status.current_mode != expected {
+            client
+                .set_clash_mode(expected)
+                .await
+                .map_err(|e| format!("TS mode 启动校正失败: {e}"))?;
+        }
+        if client
+            .get_clash_mode_status()
+            .await
+            .map_err(|e| format!("TS mode 校正读回失败: {e}"))?
+            .current_mode
+            != expected
+        {
+            return Err("TS mode 启动校正读回不符".into());
+        }
+        if let Some(dashboard) = generated
+            .outbounds
+            .iter()
+            .find(|o| o.tag == DASHBOARD_SELECTOR)
+        {
+            let Some(want) = dashboard.default.as_deref() else {
+                return Err("仪表盘出口 selector 缺少默认成员".into());
+            };
+            let selected = || async {
+                client
+                    .first_groups_snapshot()
+                    .await
+                    .ok()
+                    .and_then(|groups| {
+                        groups
+                            .into_iter()
+                            .find(|group| group.tag == DASHBOARD_SELECTOR)
+                            .map(|group| group.selected)
+                    })
+            };
+            if selected().await.as_deref() != Some(want) {
+                client
+                    .select_outbound(DASHBOARD_SELECTOR, want)
+                    .await
+                    .map_err(|e| format!("仪表盘出口校正失败: {e}"))?;
+            }
+            if selected().await.as_deref() != Some(want) {
+                return Err("仪表盘出口校正读回不符".into());
+            }
+        }
+        Ok(())
+    }
+
     /// start 主体（错误路径统一由 [`Self::start`] 收口 `end`）。
     pub(super) async fn start_inner(
         self: &Arc<Self>,
@@ -1847,6 +1928,22 @@ impl ProxyRuntime {
         if self.gate.generation() != my_gen {
             log::info!("起核就绪后被接管（世代 {my_gen}）→ 让位");
             return Ok(self.status());
+        }
+
+        if let Err(msg) = self
+            .confirm_startup_mesh_mode(
+                &singbox_config,
+                api_port,
+                user_config.clash_api_secret.as_deref().unwrap_or_default(),
+            )
+            .await
+        {
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
+            }
+            self.kill_core_and_release_main(ts_gate).await?;
+            self.set_error(&msg, code::STARTUP_FAILED);
+            return Err(StartError::coded(msg, code::STARTUP_FAILED));
         }
 
         // C-tun-conflict：post-flight 出口归属硬闸（仅 TUN 模式；设计 §4.2 方向①后验，D1/D2）。就绪 ≠ 夺到
@@ -3948,7 +4045,29 @@ impl ExitAttestation {
 /// `route.final` 是第一跳：它要么直接是某个出站 tag，要么指向 selector —— 后者的实际出口是其 `default`
 /// 成员（热切换发生前，`default` 就是核启动时选中的那个）。两级都解开才是真正的出口。
 fn effective_exit_tag(singbox_config: &SingBoxConfig) -> Option<String> {
-    let final_tag = singbox_config.route.as_ref()?.final_outbound.as_deref()?;
+    let route = singbox_config.route.as_ref()?;
+    let final_tag = if let Some(mode) = singbox_config
+        .experimental
+        .as_ref()
+        .and_then(|x| x.clash_api.as_ref())
+        .map(|x| x.default_mode.as_str())
+    {
+        // Dual-policy configs deliberately use a fail-safe static final. The effective
+        // catch-all is the last mode-guarded route rule, not `route.final`.
+        route
+            .rules
+            .iter()
+            .rev()
+            .find(|rule| {
+                rule.clash_mode.as_deref() == Some(mode)
+                    && rule.action.as_deref() == Some("route")
+                    && rule.outbound.is_some()
+            })?
+            .outbound
+            .as_deref()?
+    } else {
+        route.final_outbound.as_deref()?
+    };
     if final_tag == DIRECT_TAG {
         return Some(DIRECT_TAG.to_string());
     }

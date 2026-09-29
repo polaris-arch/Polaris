@@ -44,6 +44,7 @@ const NO_RECONNECT: Duration = Duration::from_secs(3600);
 /// mock server 状态：记录收到的调用 + 可配置的流行为。
 #[derive(Default)]
 struct MockState {
+    clash_mode: Arc<std::sync::Mutex<String>>,
     select_calls: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     close_calls: Arc<std::sync::Mutex<Vec<String>>>,
     close_all_count: Arc<AtomicU64>,
@@ -89,6 +90,28 @@ struct MockService {
 
 #[tonic::async_trait]
 impl StartedService for MockService {
+    async fn get_clash_mode_status(
+        &self,
+        req: Request<Empty>,
+    ) -> Result<Response<daemon::ClashModeStatus>, Status> {
+        check_auth(&req, &self.secret)?;
+        Ok(Response::new(daemon::ClashModeStatus {
+            mode_list: vec!["normal".into(), "mesh-direct".into()],
+            current_mode: self.state.clash_mode.lock().unwrap().clone(),
+        }))
+    }
+
+    async fn set_clash_mode(
+        &self,
+        req: Request<daemon::ClashMode>,
+    ) -> Result<Response<Empty>, Status> {
+        check_auth(&req, &self.secret)?;
+        let mode = req.into_inner().mode;
+        if mode == "normal" || mode == "mesh-direct" {
+            *self.state.clash_mode.lock().unwrap() = mode;
+        }
+        Ok(Response::new(Empty {}))
+    }
     type SubscribeOpenConnectStatusStream =
         ReceiverStream<Result<daemon::OpenConnectStatusUpdate, Status>>;
     async fn subscribe_open_connect_status(
@@ -674,6 +697,23 @@ async fn select_outbound_succeeds_with_bearer_auth() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "🇯🇵-selector");
     assert_eq!(calls[0].1, "jp-tokyo-01");
+}
+
+#[tokio::test]
+async fn clash_mode_roundtrip_exposes_silent_invalid_mode_noop() {
+    let (addr, _state, _h) = spawn_server(SECRET, 0).await;
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    client.set_clash_mode("normal").await.unwrap();
+    assert_eq!(
+        client.get_clash_mode_status().await.unwrap().current_mode,
+        "normal"
+    );
+    client.set_clash_mode("missing").await.unwrap();
+    let after = client.get_clash_mode_status().await.unwrap();
+    assert_eq!(after.current_mode, "normal");
+    assert_eq!(after.mode_list, ["normal", "mesh-direct"]);
 }
 
 /// **首帧一次性读**：`SubscribeGroups` 是 server-stream，但服务端先发一帧当前快照，

@@ -361,6 +361,58 @@ fn plan_full_tunnel_to_off_mesh_endpoint_none() {
 }
 
 #[test]
+fn compiled_ts_mode_requires_same_candidate_set_on_both_sides() {
+    use crate::user_config::server_config::TailscaleSettings;
+    let mut old = base_config();
+    old.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::new(TailscaleSettings::default())),
+        ..Default::default()
+    });
+    let mut deps = deps_with_tags();
+    deps.mesh_mode_ready = true;
+    deps.current_id_to_tag_map
+        .as_mut()
+        .unwrap()
+        .insert("ts".into(), "Tailnet".into());
+
+    let mut selected_ts = old.clone();
+    selected_ts.selected_server_id = Some("ts".into());
+    assert_eq!(
+        plan_hot_switch(&old, &selected_ts, &deps).kind,
+        HotSwitchKind::Global
+    );
+    // A different normal member is allowed: it is already present in the same raw selector.
+    let mut selected_other = selected_ts.clone();
+    selected_other.selected_server_id = Some(NODE_B.into());
+    assert_eq!(
+        plan_hot_switch(&selected_ts, &selected_other, &deps).kind,
+        HotSwitchKind::Global
+    );
+
+    let mut changed_ts = selected_ts.clone();
+    changed_ts
+        .servers
+        .iter_mut()
+        .find(|s| s.id == "ts")
+        .unwrap()
+        .name = "New Tailnet".into();
+    assert_eq!(
+        plan_hot_switch(&old, &changed_ts, &deps).kind,
+        HotSwitchKind::None
+    );
+
+    let mut to_direct = old.clone();
+    to_direct.selected_server_id = Some("__direct__".into());
+    assert_eq!(
+        plan_hot_switch(&selected_ts, &to_direct, &deps).kind,
+        HotSwitchKind::None
+    );
+}
+
+#[test]
 fn plan_full_tunnel_to_another_full_tunnel_global() {
     let list = vec![
         wg("wg-full", Some(true), None),

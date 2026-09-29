@@ -904,6 +904,8 @@ fn reassert_runtime(
     mark_running(&rt);
     let uc: UserConfig = serde_json::from_value(cfg.clone()).expect("parse UserConfig");
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         id_to_tag,
         rule_target,
         fingerprints: node_fingerprints::modified_table(&uc.servers),
@@ -940,6 +942,8 @@ fn reassert_runtime_watching_errors(
     mark_running(&rt);
     let uc: UserConfig = serde_json::from_value(cfg.clone()).expect("parse UserConfig");
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         id_to_tag,
         rule_target,
         fingerprints: node_fingerprints::modified_table(&uc.servers),

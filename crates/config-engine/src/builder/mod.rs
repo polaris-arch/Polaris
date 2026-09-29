@@ -17,6 +17,7 @@ pub mod managed_mesh_emission;
 pub mod managed_mesh_plan;
 pub mod mesh_dns;
 pub mod mesh_inbound;
+pub mod mesh_mode;
 pub mod network_env;
 pub mod orchestration;
 pub mod outbound;

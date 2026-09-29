@@ -12,7 +12,8 @@ pub mod outbound;
 pub mod route;
 
 pub use config::{
-    ApiDashboard, ApiService, CacheFile, Experimental, HttpClient, LogConfig, SingBoxConfig,
+    ApiDashboard, ApiService, CacheFile, ClashApi, Experimental, HttpClient, LogConfig,
+    SingBoxConfig,
 };
 pub use dns::{
     DnsConfig, DnsRule, DnsServer, DomainResolver, DomainStrategy, FakeIpConfig, OneOrMany,

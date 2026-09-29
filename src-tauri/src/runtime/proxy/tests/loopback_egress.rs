@@ -195,6 +195,8 @@ fn runtime_local_http_proxy_follows_the_running_snapshot() {
         password: "00112233445566778899aabbccddeeff".into(),
     };
     *rt.switch_snapshot.write().unwrap() = Some(super::super::hot_switch::SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         probe_proxy_port: Some(31002),
         loopback_auth: Some(auth.clone()),
         ..Default::default()

@@ -51,6 +51,9 @@ pub struct RuleSet {
 /// `route.rules[]`（`singbox-config-types.ts:297`）。logical 规则递归（rules 字段）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RouteRule {
+    /// Runtime-selectable policy branch; sing-box evaluates this against ClashServer.Mode().
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clash_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

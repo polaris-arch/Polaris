@@ -1,4 +1,5 @@
 use super::*;
+use polaris_config_engine::builder::mesh_mode::DASHBOARD_SELECTOR;
 use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 
 fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
@@ -452,6 +453,237 @@ async fn ts_and_warp_selection_matrix_preserves_route_rebuild_boundary() {
                 assert!(rt.pending_force_restart.read().unwrap().is_none());
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn android_dual_mode_ts_switches_both_directions_without_core_generation_change() {
+    let mut warp = valid_force_route_wg_node("warp-test", "WARP Test");
+    warp["address"] = serde_json::json!("engage.cloudflareclient.com");
+    warp["port"] = serde_json::json!(2408);
+    warp["wireguardSettings"]["allowedIPs"] = serde_json::json!(["0.0.0.0/0", "::/0"]);
+    warp["wireguardSettings"]["alwaysRouteSubnets"] = serde_json::json!(true);
+    warp["wireguardSettings"]["warpDevice"] =
+        serde_json::json!({ "deviceId": "synthetic", "token": "synthetic" });
+    let ts = mesh_only_ts_node("ts-mesh", "TS Mesh");
+    for (old, new, old_tag, new_tag, old_mode, new_mode) in [
+        (
+            "node-a",
+            "ts-mesh",
+            "Node A",
+            "TS Mesh",
+            "normal",
+            "mesh-direct",
+        ),
+        (
+            "ts-mesh",
+            "node-a",
+            "TS Mesh",
+            "Node A",
+            "mesh-direct",
+            "normal",
+        ),
+        (
+            "warp-test",
+            "ts-mesh",
+            "WARP Test",
+            "TS Mesh",
+            "normal",
+            "mesh-direct",
+        ),
+        (
+            "ts-mesh",
+            "warp-test",
+            "TS Mesh",
+            "WARP Test",
+            "mesh-direct",
+            "normal",
+        ),
+    ] {
+        let (rt, _dir) = test_runtime();
+        let mut running = config_with_nodes(old, &[ts.clone(), warp.clone()]);
+        running["proxyMode"] = serde_json::json!("smart");
+        running["singboxDashboard"] = serde_json::json!(true);
+        running["subscriptionProxyPolicy"] = serde_json::json!("follow");
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_named_snapshot(&rt, &running);
+        cover_running_binding_roots(&rt, &running);
+        let snapshot = rt.switch_snapshot.write().unwrap().as_mut().map(|s| {
+            s.mesh_mode_ready = true;
+            s.dashboard_mode_selector = true;
+        });
+        assert!(snapshot.is_some());
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let sink = Arc::new(TestPutSink::default());
+        *sink.mode.lock().unwrap() = Some(old_mode.into());
+        *sink.groups.lock().unwrap() = Some(vec![
+            group(PROXY_SELECTOR_TAG, old_tag),
+            group(
+                DASHBOARD_SELECTOR,
+                if old_mode == "mesh-direct" {
+                    "direct"
+                } else {
+                    PROXY_SELECTOR_TAG
+                },
+            ),
+        ]);
+        sink.follow_puts.store(true, Ordering::SeqCst);
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+        let generation = rt.gate.generation();
+        let mut saved = running;
+        saved["selectedServerId"] = serde_json::json!(new);
+        rt.config.save_full(&saved).unwrap();
+        let intent = rt.register_selector_intent();
+        assert_eq!(
+            rt.switch_selected_server_if_current(new, intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::HotSwitched),
+            "{old}->{new}"
+        );
+        assert_eq!(
+            rt.gate.generation(),
+            generation,
+            "{old}->{new} restarted the core"
+        );
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        assert_eq!(sink.mode.lock().unwrap().as_deref(), Some(new_mode));
+        let ops = sink.operations.lock().unwrap().clone();
+        let expected = if new_mode == "mesh-direct" {
+            vec![
+                format!("mode:{new_mode}"),
+                format!("selector:{PROXY_SELECTOR_TAG}:{new_tag}"),
+                format!("selector:{DASHBOARD_SELECTOR}:direct"),
+            ]
+        } else {
+            vec![
+                format!("selector:{PROXY_SELECTOR_TAG}:{new_tag}"),
+                format!("selector:{DASHBOARD_SELECTOR}:{PROXY_SELECTOR_TAG}"),
+                format!("mode:{new_mode}"),
+            ]
+        };
+        assert_eq!(ops, expected, "{old}->{new} operation order");
+    }
+}
+
+#[tokio::test]
+async fn android_dual_mode_reuses_one_core_across_ordinary_warp_ts_and_another_ordinary() {
+    let mut warp = valid_force_route_wg_node("warp-test", "WARP Test");
+    warp["address"] = serde_json::json!("engage.cloudflareclient.com");
+    warp["port"] = serde_json::json!(2408);
+    warp["wireguardSettings"]["allowedIPs"] = serde_json::json!(["0.0.0.0/0", "::/0"]);
+    warp["wireguardSettings"]["alwaysRouteSubnets"] = serde_json::json!(true);
+    let (rt, _dir) = test_runtime();
+    let mut running = config_with_nodes("node-a", &[mesh_only_ts_node("ts-mesh", "TS Mesh"), warp]);
+    running["proxyMode"] = serde_json::json!("smart");
+    running["singboxDashboard"] = serde_json::json!(true);
+    running["subscriptionProxyPolicy"] = serde_json::json!("follow");
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_named_snapshot(&rt, &running);
+    cover_running_binding_roots(&rt, &running);
+    if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+        snapshot.mesh_mode_ready = true;
+        snapshot.dashboard_mode_selector = true;
+    }
+    *rt.startup_snapshot.write().unwrap() = Some(running);
+    let sink = Arc::new(TestPutSink::default());
+    *sink.mode.lock().unwrap() = Some("normal".into());
+    *sink.groups.lock().unwrap() = Some(vec![
+        group(PROXY_SELECTOR_TAG, "Node A"),
+        group(DASHBOARD_SELECTOR, PROXY_SELECTOR_TAG),
+    ]);
+    sink.follow_puts.store(true, Ordering::SeqCst);
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    let generation = rt.gate.generation();
+    for (id, expected_mode) in [
+        ("warp-test", "normal"),
+        ("ts-mesh", "mesh-direct"),
+        ("node-b", "normal"),
+    ] {
+        let mut disk = rt.config.current().unwrap();
+        disk["selectedServerId"] = serde_json::json!(id);
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+        assert_eq!(
+            rt.switch_selected_server_if_current(id, intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::HotSwitched),
+            "selection of {id}"
+        );
+        assert_eq!(rt.gate.generation(), generation, "{id} restarted the core");
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        assert_eq!(sink.mode.lock().unwrap().as_deref(), Some(expected_mode));
+    }
+}
+
+#[tokio::test]
+async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_receipt() {
+    let ts = mesh_only_ts_node("ts-mesh", "TS Mesh");
+    for (old, new, old_tag, old_mode) in [
+        ("node-a", "ts-mesh", "Node A", "normal"),
+        ("ts-mesh", "node-a", "TS Mesh", "mesh-direct"),
+    ] {
+        let (rt, _dir) = test_runtime();
+        let mut running = config_with_nodes(old, &[ts.clone()]);
+        running["proxyMode"] = serde_json::json!("smart");
+        running["singboxDashboard"] = serde_json::json!(true);
+        rt.config.save_full(&running).unwrap();
+        let running = rt.config.current().unwrap();
+        mark_running_with_named_snapshot(&rt, &running);
+        if let Some(snapshot) = rt.switch_snapshot.write().unwrap().as_mut() {
+            snapshot.mesh_mode_ready = true;
+            snapshot.dashboard_mode_selector = true;
+        }
+        *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+        let sink = Arc::new(TestPutSink::default());
+        *sink.mode.lock().unwrap() = Some(old_mode.into());
+        sink.mode_noop.store(true, Ordering::SeqCst);
+        sink.follow_puts.store(true, Ordering::SeqCst);
+        *sink.groups.lock().unwrap() = Some(vec![
+            group(PROXY_SELECTOR_TAG, old_tag),
+            group(
+                DASHBOARD_SELECTOR,
+                if old_mode == "normal" {
+                    PROXY_SELECTOR_TAG
+                } else {
+                    "direct"
+                },
+            ),
+        ]);
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+        let generation = rt.gate.generation();
+        let mut disk = running;
+        disk["selectedServerId"] = serde_json::json!(new);
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+        assert_eq!(
+            rt.switch_selected_server_if_current(new, intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::Restarting),
+            "{old}->{new}"
+        );
+        assert_eq!(
+            rt.gate.generation(),
+            generation,
+            "restart is scheduled, not falsely completed"
+        );
+        assert!(rt.pending_force_restart.read().unwrap().is_some());
+        assert_eq!(sink.mode.lock().unwrap().as_deref(), Some(old_mode));
+        let groups = sink.groups.lock().unwrap();
+        assert!(
+            groups
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|g| g.tag == PROXY_SELECTOR_TAG && g.selected == old_tag),
+            "{old}->{new} must leave or restore the old selector"
+        );
+        drop(groups);
+        rt.gate.bump_generation(); // do not allow a fake core's restart timer to run
     }
 }
 
@@ -1183,6 +1415,8 @@ fn install_startup_snapshot(rt: &ProxyRuntime, cfg: &Value) {
     let uc: UserConfig = serde_json::from_value(cfg.clone()).expect("测试配置应可解析");
     *rt.startup_snapshot.write().unwrap() = Some(cfg.clone());
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         fingerprints: node_fingerprints::modified_table(&uc.servers),
         dirty_fingerprints: node_fingerprints::dirty_table(&uc.servers),
         ..Default::default()
@@ -1477,6 +1711,8 @@ fn mark_running_with_snapshot(rt: &ProxyRuntime, cfg: &Value) {
     // 两张表都装：生产的 build_switch_snapshot 同刻同源置两张，假快照漏一张会让被测腿看到
     // 「有全维表但 dirty 表空」这个生产里不可达的形态。
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         id_to_tag,
         rule_target: BTreeMap::new(),
         named_rule_by_raw: BTreeMap::new(),
@@ -2092,6 +2328,8 @@ fn mark_running_with_named_snapshot(rt: &ProxyRuntime, cfg: &Value) {
         .map(|s| (s.id.clone(), s.name.clone()))
         .collect();
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         id_to_tag,
         fingerprints: node_fingerprints::modified_table(&uc.servers),
         dirty_fingerprints: node_fingerprints::dirty_table(&uc.servers),
@@ -4409,6 +4647,8 @@ async fn spawn_runs_attestation_after_continuation() {
     let cfg = reassert_config("node-a");
     let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         id_to_tag: ab_tags(),
         fingerprints: node_fingerprints::modified_table(&uc.servers),
         dirty_fingerprints: node_fingerprints::dirty_table(&uc.servers),
@@ -4480,6 +4720,8 @@ fn speed_probe_targets_carry_running_core_fingerprints() {
         ..Default::default()
     };
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        mesh_mode_ready: false,
+        dashboard_mode_selector: false,
         id_to_tag: BTreeMap::from([("id-a".to_string(), "东京 03".to_string())]),
         // 全维表（喂重启判据 + pending modified）与 5 维表（喂测速 dirty）刻意填成不同值：
         // 带错哪一张，下面的断言立刻说话。

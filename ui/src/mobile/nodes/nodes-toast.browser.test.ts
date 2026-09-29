@@ -22,6 +22,7 @@ await i18nReady;
 const mode = new URLSearchParams(location.search).get('mode');
 const node = { id: 'node-a', name: '测试节点', protocol: 'vless', address: '198.51.100.7', port: 443 };
 const warp = { id: 'warp-1', name: 'WARP', protocol: 'wireguard', address: 'engage.cloudflareclient.com', port: 2408 };
+const tailscale = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: {} };
 const test = window.__nodeToastTest = { failCopy: true, writes: [], opened: 0, deleted: 0 };
 test.entries = () => useStagedConfigStore.getState().entries;
 Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
@@ -30,9 +31,10 @@ Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
 api.server.generateUrl = async () => 'vless://example';
 api.server.delete = async () => { test.deleted++; };
 api.config.meshRouteReport = async () => null;
-const server = mode?.startsWith('warp') ? warp : node;
+const server = mode?.startsWith('warp') ? warp : mode?.startsWith('ts-') ? tailscale : node;
 useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
-  selectedServerId: '', invalidNodes: [], proxyStatus: { running: mode?.startsWith('warp') === true } });
+  selectedServerId: '', invalidNodes: [], proxyStatus: { running: mode?.startsWith('warp') === true || mode?.startsWith('ts-') === true },
+  switchServer: async () => ({ status: mode === 'ts-restarting' ? 'restarting' : 'applied' }) });
 useStagedConfigStore.setState({ enabled: mode === 'warp-staged', entries: [] });
 function WarpDeleteHarness() {
   const deletion = useMobileNodeDeletion({
@@ -124,6 +126,27 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile node copy comp
       });
       expect(result).toEqual({ opened: 1, deleted: 1, entries: [] });
       expect(await page.locator('.m-toast-ok').filter({ hasText: '已注销' }).count()).toBe(1);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each([
+    ['ts-applied', '已切换', false],
+    ['ts-restarting', '正在重启', true],
+  ])('Tailscale node receipt %s drives the nodes screen feedback', async (mode, expected, notice) => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__nodes-toast?mode=${mode}`);
+      await page.locator('.mn-seg').filter({ hasText: '组网' }).click();
+      expect(await page.locator('[data-exit-write="node-use"]').count()).toBe(1);
+      await page.locator('[data-exit-write="node-use"]').click();
+      if (notice) {
+        await page.locator('.mn-notice').filter({ hasText: expected }).waitFor();
+        expect(await page.locator('.mn-notice').filter({ hasText: '正在应用连接更改' }).count()).toBe(0);
+        expect(await page.locator('.m-toast-ok').count()).toBe(0);
+      } else {
+        await page.locator('.m-toast-ok').filter({ hasText: expected }).waitFor();
+        expect(await page.locator('.mn-notice').count()).toBe(0);
+      }
     } finally { await page.close(); }
   }, 30_000);
 });

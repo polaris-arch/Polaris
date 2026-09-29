@@ -716,6 +716,8 @@ mod proto_wire_check {
     /// 必须与真核 wire 一致的符号表。**新增的消费面必须进表**（理由见 `build.rs` 的
     /// `assert_proto_matches_bundled_core` 文档：立手法优先于铺覆盖面）。
     pub const CHECKED_SYMBOLS: &[(SymbolKind, &str)] = &[
+        (SymbolKind::Message, "ClashMode"),
+        (SymbolKind::Message, "ClashModeStatus"),
         (SymbolKind::Message, "TailscaleEndpointStatus"),
         (SymbolKind::Message, "TailscaleUserGroup"),
         (SymbolKind::Message, "TailscalePeer"),
