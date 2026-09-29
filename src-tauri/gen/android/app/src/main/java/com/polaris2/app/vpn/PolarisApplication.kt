@@ -31,6 +31,9 @@ class PolarisApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // One cold-process proof gates every libbox owner, including always-on starts.
+        // This stat is outside the admission monitor; only ENOENT opens the ledger.
+        AndroidNativeAdmissionGate.bootstrap(this)
         // The native tombstone is process-local; a new process may safely take
         // the persisted always-on endpoint as its first birth.
         NativeReconnectNotice.clear(this)

@@ -25,6 +25,10 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod android_bridge;
+// Read-only proof shape for a future Android managed handoff. It cannot release
+// legacy custody or publish NoOldCore until every native owner is wired.
+#[allow(dead_code)]
+mod android_drain;
 mod auto_switch;
 mod connection_flush;
 mod core_binary;
