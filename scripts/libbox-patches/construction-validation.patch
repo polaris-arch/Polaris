@@ -1,5 +1,5 @@
 diff --git a/adapter/certificate/manager.go b/adapter/certificate/manager.go
-index e4b9b53..b80127f 100644
+index e4b9b53..afad1f1 100644
 --- a/adapter/certificate/manager.go
 +++ b/adapter/certificate/manager.go
 @@ -7,6 +7,7 @@ import (
@@ -10,7 +10,24 @@ index e4b9b53..b80127f 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -59,13 +60,11 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -22,6 +23,7 @@ type Manager struct {
+ 	registry      adapter.CertificateProviderRegistry
+ 	access        sync.Mutex
+ 	started       bool
++	runtimeOwners map[string]bool
+ 	stage         adapter.StartStage
+ 	providers     []adapter.CertificateProviderService
+ 	providerByTag map[string]adapter.CertificateProviderService
+@@ -53,19 +55,22 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 			return E.Cause(err, stage, " ", name)
+ 		}
+ 		m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
++		if stage == adapter.StartStateStart {
++			m.markRuntimeOwner(provider.Tag())
++		}
+ 	}
+ 	return nil
+ }
  
  func (m *Manager) Close() error {
  	m.access.Lock()
@@ -18,6 +35,8 @@ index e4b9b53..b80127f 100644
 -	if !m.started {
 -		return nil
 -	}
++	runtimeOwners := m.runtimeOwners
++	m.runtimeOwners = nil
  	m.started = false
  	providers := m.providers
  	m.providers = nil
@@ -26,40 +45,49 @@ index e4b9b53..b80127f 100644
  	monitor := taskmonitor.New(m.logger, C.StopTimeout)
  	var err error
  	for _, provider := range providers {
-@@ -73,7 +72,7 @@ func (m *Manager) Close() error {
+@@ -73,7 +78,7 @@ func (m *Manager) Close() error {
  		m.logger.Trace("close ", name)
  		startTime := time.Now()
  		monitor.Start("close ", name)
 -		err = E.Append(err, provider.Close(), func(err error) error {
-+		err = E.Append(err, construction.Close(name, provider.Close), func(err error) error {
++		err = E.Append(err, construction.Dispose(name, provider, runtimeOwners[provider.Tag()]), func(err error) error {
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -110,16 +109,18 @@ func (m *Manager) Remove(tag string) error {
+@@ -110,16 +115,21 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid certificate provider index")
  	}
  	m.providers = append(m.providers[:index], m.providers[index+1:]...)
 -	started := m.started
++	runtimeOwned := m.runtimeOwners[tag]
++	delete(m.runtimeOwners, tag)
  	m.access.Unlock()
 -	if started {
 -		return provider.Close()
 -	}
 -	return nil
-+	return construction.Close("removed provider", provider.Close)
++	return construction.Dispose("removed provider", provider, runtimeOwned)
  }
  
  func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) error {
  	provider, err := m.registry.Create(ctx, logger, tag, providerType, options)
 +	owned := false
++	runtimeOwned := false
 +	defer func() {
 +		if !owned && provider != nil {
-+			construction.RecordError(ctx, construction.Close("unowned provider", func() error { return common.Close(provider) }))
++			construction.DisposeOrDefer(ctx, "unowned provider", provider, runtimeOwned)
 +		}
 +	}()
  	if err != nil {
  		return err
  	}
-@@ -138,11 +139,9 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -135,14 +145,19 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 				return E.Cause(err, stage, " ", name)
+ 			}
+ 			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
++			if stage == adapter.StartStateStart {
++				runtimeOwned = true
++			}
  		}
  	}
  	if existsProvider, loaded := m.providerByTag[tag]; loaded {
@@ -68,26 +96,44 @@ index e4b9b53..b80127f 100644
 -			if err != nil {
 -				return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
 -			}
-+		err = existsProvider.Close()
++		err = construction.Replace(ctx, "replaced provider", existsProvider, m.runtimeOwners[tag])
++		if !m.runtimeOwners[tag] {
++			construction.RecordError(ctx, err)
++			err = nil
++		}
 +		if err != nil {
 +			return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
  		}
  		existsIndex := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
  			return it == existsProvider
-@@ -153,6 +152,7 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -153,6 +168,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
  	}
  	m.providers = append(m.providers, provider)
 +	owned = true
  	m.providerByTag[tag] = provider
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = runtimeOwned
  	return nil
  }
++
++// markRuntimeOwner records this child's successful runtime Start, never manager initialization.
++func (m *Manager) markRuntimeOwner(tag string) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = true
++}
 diff --git a/adapter/certificate/manager_construction_test.go b/adapter/certificate/manager_construction_test.go
 new file mode 100644
-index 0000000..292778e
+index 0000000..01e6ba0
 --- /dev/null
 +++ b/adapter/certificate/manager_construction_test.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +package certificate
 +
 +import (
@@ -145,8 +191,129 @@ index 0000000..292778e
 +		}
 +	}
 +}
++
++func (p constructionProbe) DisposeConstruction() error { return p.Close() }
+diff --git a/adapter/certificate/manager_ownership_test.go b/adapter/certificate/manager_ownership_test.go
+new file mode 100644
+index 0000000..758a333
+--- /dev/null
++++ b/adapter/certificate/manager_ownership_test.go
+@@ -0,0 +1,113 @@
++package certificate
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++// No DisposeConstruction method: ordinary Close represents an unsafe runtime effect.
++type unknownOwnerProbe struct {
++	adapter.CertificateProviderService
++	tag       string
++	closed    *int
++	failStart bool
++}
++
++func (p *unknownOwnerProbe) Type() string           { return "unknown-owner" }
++func (p *unknownOwnerProbe) Tag() string            { return p.tag }
++func (p *unknownOwnerProbe) Close() error           { *p.closed++; return nil }
++func (p *unknownOwnerProbe) Dependencies() []string { return nil }
++func (p *unknownOwnerProbe) Start(stage adapter.StartStage) error {
++	if stage == adapter.StartStateStart && p.failStart {
++		return errors.New("injected runtime Start failure")
++	}
++	return nil
++}
++
++func TestOnlySuccessfulChildStartAllowsRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"constructed", "initialize", "partial-start"} {
++		t.Run(mode, func(t *testing.T) {
++			logger := log.NewNOPFactory().Logger()
++			closed := []int{0, 0, 0}
++			children := []adapter.CertificateProviderService{
++				&unknownOwnerProbe{tag: "first", closed: &closed[0]},
++				&unknownOwnerProbe{tag: "failed", closed: &closed[1], failStart: true},
++				&unknownOwnerProbe{tag: "untouched", closed: &closed[2]},
++			}
++			m := &Manager{logger: logger, providers: children, providerByTag: map[string]adapter.CertificateProviderService{"first": children[0], "failed": children[1], "untouched": children[2]}}
++			if mode != "constructed" {
++				if err := m.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "partial-start" {
++				if err := m.Start(adapter.StartStateStart); err == nil {
++					t.Fatal("injected Start failure missing")
++				}
++			}
++			if err := m.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++				t.Fatalf("close = %v", err)
++			}
++			wantFirst := 0
++			if mode == "partial-start" {
++				wantFirst = 1
++			}
++			if closed[0] != wantFirst || closed[1] != 0 || closed[2] != 0 {
++				t.Fatalf("unsafe runtime Close counts: %v", closed)
++			}
++		})
++	}
++}
++
++func TestUnknownConstructionRemoveReplaceAndFactoryErrorNeverRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"remove", "replace", "factory-error"} {
++		t.Run(mode, func(t *testing.T) {
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			logger := log.NewNOPFactory().Logger()
++			closed := 0
++			registry := NewRegistry()
++			failure := errors.New("injected object plus error")
++			Register[struct{}](registry, "unknown-owner", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.CertificateProviderService, error) {
++				child := &unknownOwnerProbe{tag: tag, closed: &closed}
++				if mode == "factory-error" {
++					return child, failure
++				}
++				return child, nil
++			})
++			m := &Manager{logger: logger, registry: registry, providerByTag: make(map[string]adapter.CertificateProviderService)}
++			err := m.Create(ctx, logger, "same", "unknown-owner", nil)
++			if mode == "factory-error" {
++				if !errors.Is(err, failure) {
++					t.Fatal(err)
++				}
++			} else {
++				if err != nil {
++					t.Fatal(err)
++				}
++				if mode == "remove" {
++					if err = m.Remove("same"); !errors.Is(err, construction.ErrUnknownDisposal) {
++						t.Fatal(err)
++					}
++				} else {
++					if err = m.Create(ctx, logger, "same", "unknown-owner", nil); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			if mode != "remove" {
++				if err = scope.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++					t.Fatalf("cleanup = %v", err)
++				}
++			}
++			if closed != 0 {
++				t.Fatalf("unowned object runtime-closed %d times", closed)
++			}
++		})
++	}
++}
 diff --git a/adapter/endpoint/manager.go b/adapter/endpoint/manager.go
-index ff1889a..c9b1142 100644
+index ff1889a..74863f9 100644
 --- a/adapter/endpoint/manager.go
 +++ b/adapter/endpoint/manager.go
 @@ -6,6 +6,7 @@ import (
@@ -157,7 +324,15 @@ index ff1889a..c9b1142 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -59,20 +60,18 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -20,6 +21,7 @@ type Manager struct {
+ 	registry      adapter.EndpointRegistry
+ 	access        sync.Mutex
+ 	started       bool
++	runtimeOwners map[string]bool
+ 	stage         adapter.StartStage
+ 	endpoints     []adapter.Endpoint
+ 	endpointByTag map[string]adapter.Endpoint
+@@ -59,20 +61,20 @@ func (m *Manager) Start(stage adapter.StartStage) error {
  
  func (m *Manager) Close() error {
  	m.access.Lock()
@@ -165,6 +340,8 @@ index ff1889a..c9b1142 100644
 -	if !m.started {
 -		return nil
 -	}
++	runtimeOwners := m.runtimeOwners
++	m.runtimeOwners = nil
  	m.started = false
  	endpoints := m.endpoints
  	m.endpoints = nil
@@ -177,35 +354,44 @@ index ff1889a..c9b1142 100644
  		done := adapter.LogElapsed(m.logger, "close ", name)
  		monitor.Start("close ", name)
 -		err = E.Append(err, endpoint.Close(), func(err error) error {
-+		err = E.Append(err, construction.Close(name, endpoint.Close), func(err error) error {
++		err = E.Append(err, construction.Dispose(name, endpoint, runtimeOwners[endpoint.Tag()]), func(err error) error {
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -109,16 +108,18 @@ func (m *Manager) Remove(tag string) error {
+@@ -109,16 +111,21 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid endpoint index")
  	}
  	m.endpoints = append(m.endpoints[:index], m.endpoints[index+1:]...)
 -	started := m.started
++	runtimeOwned := m.runtimeOwners[tag]
++	delete(m.runtimeOwners, tag)
  	m.access.Unlock()
 -	if started {
 -		return endpoint.Close()
 -	}
 -	return nil
-+	return construction.Close("removed endpoint", endpoint.Close)
++	return construction.Dispose("removed endpoint", endpoint, runtimeOwned)
  }
  
  func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
  	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
 +	owned := false
++	runtimeOwned := false
 +	defer func() {
 +		if !owned && endpoint != nil {
-+			construction.RecordError(ctx, construction.Close("unowned endpoint", func() error { return common.Close(endpoint) }))
++			construction.DisposeOrDefer(ctx, "unowned endpoint", endpoint, runtimeOwned)
 +		}
 +	}()
  	if err != nil {
  		return err
  	}
-@@ -136,11 +137,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -133,14 +140,19 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 			if err != nil {
+ 				return E.Cause(err, stage, " ", name)
+ 			}
++			if stage == adapter.StartStateStart {
++				runtimeOwned = true
++			}
  		}
  	}
  	if existsEndpoint, loaded := m.endpointByTag[tag]; loaded {
@@ -214,26 +400,76 @@ index ff1889a..c9b1142 100644
 -			if err != nil {
 -				return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
 -			}
-+		err = existsEndpoint.Close()
++		err = construction.Replace(ctx, "replaced endpoint", existsEndpoint, m.runtimeOwners[tag])
++		if !m.runtimeOwners[tag] {
++			construction.RecordError(ctx, err)
++			err = nil
++		}
 +		if err != nil {
 +			return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
  		}
  		existsIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
  			return it == existsEndpoint
-@@ -151,6 +150,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -151,6 +163,24 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.endpoints = append(m.endpoints[:existsIndex], m.endpoints[existsIndex+1:]...)
  	}
  	m.endpoints = append(m.endpoints, endpoint)
 +	owned = true
  	m.endpointByTag[tag] = endpoint
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = runtimeOwned
  	return nil
  }
++
++// MarkRuntimeOwner is called by the outbound manager after delegated endpoint Start succeeds.
++func (m *Manager) MarkRuntimeOwner(endpoint adapter.Endpoint) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.endpointByTag[endpoint.Tag()] != endpoint {
++		return
++	}
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[endpoint.Tag()] = true
++}
+diff --git a/adapter/endpoint/manager_close_test.go b/adapter/endpoint/manager_close_test.go
+index 2513e7b..f9e8f0e 100644
+--- a/adapter/endpoint/manager_close_test.go
++++ b/adapter/endpoint/manager_close_test.go
+@@ -13,14 +13,20 @@ type failingEndpoint struct {
+ 	err error
+ }
+ 
+-func (f failingEndpoint) Type() string { return "test" }
+-func (f failingEndpoint) Tag() string  { return "failing" }
+-func (f failingEndpoint) Close() error { return f.err }
++func (f failingEndpoint) Type() string                   { return "test" }
++func (f failingEndpoint) Tag() string                    { return "failing" }
++func (f failingEndpoint) Close() error                   { return f.err }
++func (f failingEndpoint) Start(adapter.StartStage) error { return nil }
++func (f failingEndpoint) Dependencies() []string         { return nil }
+ 
+ func TestClosePropagatesEndpointFailure(t *testing.T) {
+ 	failure := errors.New("endpoint identity close failed")
+ 	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
+-		endpoints: []adapter.Endpoint{failingEndpoint{err: failure}}}
++		endpoints: []adapter.Endpoint{failingEndpoint{err: failure}}, endpointByTag: map[string]adapter.Endpoint{"failing": failingEndpoint{err: failure}}}
++	if err := m.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	m.MarkRuntimeOwner(m.endpoints[0])
+ 	if err := m.Close(); !errors.Is(err, failure) {
+ 		t.Fatalf("Close() = %v, want endpoint failure", err)
+ 	}
 diff --git a/adapter/endpoint/manager_construction_test.go b/adapter/endpoint/manager_construction_test.go
 new file mode 100644
-index 0000000..67ec4be
+index 0000000..b88f1ee
 --- /dev/null
 +++ b/adapter/endpoint/manager_construction_test.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +package endpoint
 +
 +import (
@@ -291,8 +527,130 @@ index 0000000..67ec4be
 +		}
 +	}
 +}
++
++func (p constructionProbe) DisposeConstruction() error { return p.Close() }
+diff --git a/adapter/endpoint/manager_ownership_test.go b/adapter/endpoint/manager_ownership_test.go
+new file mode 100644
+index 0000000..f31356a
+--- /dev/null
++++ b/adapter/endpoint/manager_ownership_test.go
+@@ -0,0 +1,114 @@
++package endpoint
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++// No DisposeConstruction method: ordinary Close represents an unsafe runtime effect.
++type unknownOwnerProbe struct {
++	adapter.Endpoint
++	tag       string
++	closed    *int
++	failStart bool
++}
++
++func (p *unknownOwnerProbe) Type() string           { return "unknown-owner" }
++func (p *unknownOwnerProbe) Tag() string            { return p.tag }
++func (p *unknownOwnerProbe) Close() error           { *p.closed++; return nil }
++func (p *unknownOwnerProbe) Dependencies() []string { return nil }
++func (p *unknownOwnerProbe) Start(stage adapter.StartStage) error {
++	if stage == adapter.StartStateStart && p.failStart {
++		return errors.New("injected runtime Start failure")
++	}
++	return nil
++}
++
++func TestOnlySuccessfulChildStartAllowsRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"constructed", "initialize", "partial-start"} {
++		t.Run(mode, func(t *testing.T) {
++			logger := log.NewNOPFactory().Logger()
++			closed := []int{0, 0, 0}
++			children := []adapter.Endpoint{
++				&unknownOwnerProbe{tag: "first", closed: &closed[0]},
++				&unknownOwnerProbe{tag: "failed", closed: &closed[1], failStart: true},
++				&unknownOwnerProbe{tag: "untouched", closed: &closed[2]},
++			}
++			m := &Manager{logger: logger, endpoints: children, endpointByTag: map[string]adapter.Endpoint{"first": children[0], "failed": children[1], "untouched": children[2]}}
++			if mode != "constructed" {
++				if err := m.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "partial-start" {
++				if err := outbound.NewManager(logger, outbound.NewRegistry(), m, "").Start(adapter.StartStateStart); err == nil {
++					t.Fatal("injected Start failure missing")
++				}
++			}
++			if err := m.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++				t.Fatalf("close = %v", err)
++			}
++			wantFirst := 0
++			if mode == "partial-start" {
++				wantFirst = 1
++			}
++			if closed[0] != wantFirst || closed[1] != 0 || closed[2] != 0 {
++				t.Fatalf("unsafe runtime Close counts: %v", closed)
++			}
++		})
++	}
++}
++
++func TestUnknownConstructionRemoveReplaceAndFactoryErrorNeverRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"remove", "replace", "factory-error"} {
++		t.Run(mode, func(t *testing.T) {
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			logger := log.NewNOPFactory().Logger()
++			closed := 0
++			registry := NewRegistry()
++			failure := errors.New("injected object plus error")
++			Register[struct{}](registry, "unknown-owner", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Endpoint, error) {
++				child := &unknownOwnerProbe{tag: tag, closed: &closed}
++				if mode == "factory-error" {
++					return child, failure
++				}
++				return child, nil
++			})
++			m := &Manager{logger: logger, registry: registry, endpointByTag: make(map[string]adapter.Endpoint)}
++			err := m.Create(ctx, nil, logger, "same", "unknown-owner", nil)
++			if mode == "factory-error" {
++				if !errors.Is(err, failure) {
++					t.Fatal(err)
++				}
++			} else {
++				if err != nil {
++					t.Fatal(err)
++				}
++				if mode == "remove" {
++					if err = m.Remove("same"); !errors.Is(err, construction.ErrUnknownDisposal) {
++						t.Fatal(err)
++					}
++				} else {
++					if err = m.Create(ctx, nil, logger, "same", "unknown-owner", nil); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			if mode != "remove" {
++				if err = scope.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++					t.Fatalf("cleanup = %v", err)
++				}
++			}
++			if closed != 0 {
++				t.Fatalf("unowned object runtime-closed %d times", closed)
++			}
++		})
++	}
++}
 diff --git a/adapter/inbound/manager.go b/adapter/inbound/manager.go
-index 075e410..cb58489 100644
+index 075e410..66155be 100644
 --- a/adapter/inbound/manager.go
 +++ b/adapter/inbound/manager.go
 @@ -6,6 +6,7 @@ import (
@@ -303,7 +661,40 @@ index 075e410..cb58489 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -58,20 +59,18 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -16,14 +17,15 @@ import (
+ var _ adapter.InboundManager = (*Manager)(nil)
+ 
+ type Manager struct {
+-	logger       log.ContextLogger
+-	registry     adapter.InboundRegistry
+-	endpoint     adapter.EndpointManager
+-	access       sync.Mutex
+-	started      bool
+-	stage        adapter.StartStage
+-	inbounds     []adapter.Inbound
+-	inboundByTag map[string]adapter.Inbound
++	logger        log.ContextLogger
++	registry      adapter.InboundRegistry
++	endpoint      adapter.EndpointManager
++	access        sync.Mutex
++	started       bool
++	runtimeOwners map[string]bool
++	stage         adapter.StartStage
++	inbounds      []adapter.Inbound
++	inboundByTag  map[string]adapter.Inbound
+ }
+ 
+ func NewManager(logger log.ContextLogger, registry adapter.InboundRegistry, endpoint adapter.EndpointManager) *Manager {
+@@ -52,26 +54,29 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 		if err != nil {
+ 			return E.Cause(err, stage, " ", name)
+ 		}
++		if stage == adapter.StartStateStart {
++			m.markRuntimeOwner(inbound.Tag())
++		}
+ 	}
+ 	return nil
+ }
  
  func (m *Manager) Close() error {
  	m.access.Lock()
@@ -311,6 +702,8 @@ index 075e410..cb58489 100644
 -	if !m.started {
 -		return nil
 -	}
++	runtimeOwners := m.runtimeOwners
++	m.runtimeOwners = nil
  	m.started = false
  	inbounds := m.inbounds
  	m.inbounds = nil
@@ -323,35 +716,44 @@ index 075e410..cb58489 100644
  		done := adapter.LogElapsed(m.logger, "close ", name)
  		monitor.Start("close ", name)
 -		err = E.Append(err, inbound.Close(), func(err error) error {
-+		err = E.Append(err, construction.Close(name, inbound.Close), func(err error) error {
++		err = E.Append(err, construction.Dispose(name, inbound, runtimeOwners[inbound.Tag()]), func(err error) error {
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -111,16 +110,18 @@ func (m *Manager) Remove(tag string) error {
+@@ -111,16 +116,21 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid inbound index")
  	}
  	m.inbounds = append(m.inbounds[:index], m.inbounds[index+1:]...)
 -	started := m.started
++	runtimeOwned := m.runtimeOwners[tag]
++	delete(m.runtimeOwners, tag)
  	m.access.Unlock()
 -	if started {
 -		return inbound.Close()
 -	}
 -	return nil
-+	return construction.Close("removed inbound", inbound.Close)
++	return construction.Dispose("removed inbound", inbound, runtimeOwned)
  }
  
  func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
  	inbound, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
 +	owned := false
++	runtimeOwned := false
 +	defer func() {
 +		if !owned && inbound != nil {
-+			construction.RecordError(ctx, construction.Close("unowned inbound", func() error { return common.Close(inbound) }))
++			construction.DisposeOrDefer(ctx, "unowned inbound", inbound, runtimeOwned)
 +		}
 +	}()
  	if err != nil {
  		return err
  	}
-@@ -138,11 +139,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -135,14 +145,19 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 			if err != nil {
+ 				return E.Cause(err, stage, " ", name)
+ 			}
++			if stage == adapter.StartStateStart {
++				runtimeOwned = true
++			}
  		}
  	}
  	if existsInbound, loaded := m.inboundByTag[tag]; loaded {
@@ -360,26 +762,71 @@ index 075e410..cb58489 100644
 -			if err != nil {
 -				return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
 -			}
-+		err = existsInbound.Close()
++		err = construction.Replace(ctx, "replaced inbound", existsInbound, m.runtimeOwners[tag])
++		if !m.runtimeOwners[tag] {
++			construction.RecordError(ctx, err)
++			err = nil
++		}
 +		if err != nil {
 +			return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
  		}
  		existsIndex := common.Index(m.inbounds, func(it adapter.Inbound) bool {
  			return it == existsInbound
-@@ -153,6 +152,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -153,6 +168,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.inbounds = append(m.inbounds[:existsIndex], m.inbounds[existsIndex+1:]...)
  	}
  	m.inbounds = append(m.inbounds, inbound)
 +	owned = true
  	m.inboundByTag[tag] = inbound
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = runtimeOwned
  	return nil
  }
++
++// markRuntimeOwner records this child's successful runtime Start, never manager initialization.
++func (m *Manager) markRuntimeOwner(tag string) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = true
++}
+diff --git a/adapter/inbound/manager_close_test.go b/adapter/inbound/manager_close_test.go
+index 117d977..90ed68d 100644
+--- a/adapter/inbound/manager_close_test.go
++++ b/adapter/inbound/manager_close_test.go
+@@ -13,14 +13,19 @@ type failingInbound struct {
+ 	err error
+ }
+ 
+-func (f failingInbound) Type() string { return "test" }
+-func (f failingInbound) Tag() string  { return "failing" }
+-func (f failingInbound) Close() error { return f.err }
++func (f failingInbound) Type() string                   { return "test" }
++func (f failingInbound) Tag() string                    { return "failing" }
++func (f failingInbound) Close() error                   { return f.err }
++func (f failingInbound) Start(adapter.StartStage) error { return nil }
++func (f failingInbound) Dependencies() []string         { return nil }
+ 
+ func TestClosePropagatesInboundFailure(t *testing.T) {
+ 	failure := errors.New("inbound close failed")
+ 	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
+ 		inbounds: []adapter.Inbound{failingInbound{err: failure}}}
++	if err := m.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
+ 	if err := m.Close(); !errors.Is(err, failure) {
+ 		t.Fatalf("Close() = %v, want inbound failure", err)
+ 	}
 diff --git a/adapter/inbound/manager_construction_test.go b/adapter/inbound/manager_construction_test.go
 new file mode 100644
-index 0000000..3422fd4
+index 0000000..051dde9
 --- /dev/null
 +++ b/adapter/inbound/manager_construction_test.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +package inbound
 +
 +import (
@@ -437,11 +884,138 @@ index 0000000..3422fd4
 +		}
 +	}
 +}
++
++func (p constructionProbe) DisposeConstruction() error { return p.Close() }
+diff --git a/adapter/inbound/manager_ownership_test.go b/adapter/inbound/manager_ownership_test.go
+new file mode 100644
+index 0000000..7cd8497
+--- /dev/null
++++ b/adapter/inbound/manager_ownership_test.go
+@@ -0,0 +1,113 @@
++package inbound
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++// No DisposeConstruction method: ordinary Close represents an unsafe runtime effect.
++type unknownOwnerProbe struct {
++	adapter.Inbound
++	tag       string
++	closed    *int
++	failStart bool
++}
++
++func (p *unknownOwnerProbe) Type() string           { return "unknown-owner" }
++func (p *unknownOwnerProbe) Tag() string            { return p.tag }
++func (p *unknownOwnerProbe) Close() error           { *p.closed++; return nil }
++func (p *unknownOwnerProbe) Dependencies() []string { return nil }
++func (p *unknownOwnerProbe) Start(stage adapter.StartStage) error {
++	if stage == adapter.StartStateStart && p.failStart {
++		return errors.New("injected runtime Start failure")
++	}
++	return nil
++}
++
++func TestOnlySuccessfulChildStartAllowsRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"constructed", "initialize", "partial-start"} {
++		t.Run(mode, func(t *testing.T) {
++			logger := log.NewNOPFactory().Logger()
++			closed := []int{0, 0, 0}
++			children := []adapter.Inbound{
++				&unknownOwnerProbe{tag: "first", closed: &closed[0]},
++				&unknownOwnerProbe{tag: "failed", closed: &closed[1], failStart: true},
++				&unknownOwnerProbe{tag: "untouched", closed: &closed[2]},
++			}
++			m := &Manager{logger: logger, inbounds: children, inboundByTag: map[string]adapter.Inbound{"first": children[0], "failed": children[1], "untouched": children[2]}}
++			if mode != "constructed" {
++				if err := m.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "partial-start" {
++				if err := m.Start(adapter.StartStateStart); err == nil {
++					t.Fatal("injected Start failure missing")
++				}
++			}
++			if err := m.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++				t.Fatalf("close = %v", err)
++			}
++			wantFirst := 0
++			if mode == "partial-start" {
++				wantFirst = 1
++			}
++			if closed[0] != wantFirst || closed[1] != 0 || closed[2] != 0 {
++				t.Fatalf("unsafe runtime Close counts: %v", closed)
++			}
++		})
++	}
++}
++
++func TestUnknownConstructionRemoveReplaceAndFactoryErrorNeverRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"remove", "replace", "factory-error"} {
++		t.Run(mode, func(t *testing.T) {
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			logger := log.NewNOPFactory().Logger()
++			closed := 0
++			registry := NewRegistry()
++			failure := errors.New("injected object plus error")
++			Register[struct{}](registry, "unknown-owner", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Inbound, error) {
++				child := &unknownOwnerProbe{tag: tag, closed: &closed}
++				if mode == "factory-error" {
++					return child, failure
++				}
++				return child, nil
++			})
++			m := &Manager{logger: logger, registry: registry, inboundByTag: make(map[string]adapter.Inbound)}
++			err := m.Create(ctx, nil, logger, "same", "unknown-owner", nil)
++			if mode == "factory-error" {
++				if !errors.Is(err, failure) {
++					t.Fatal(err)
++				}
++			} else {
++				if err != nil {
++					t.Fatal(err)
++				}
++				if mode == "remove" {
++					if err = m.Remove("same"); !errors.Is(err, construction.ErrUnknownDisposal) {
++						t.Fatal(err)
++					}
++				} else {
++					if err = m.Create(ctx, nil, logger, "same", "unknown-owner", nil); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			if mode != "remove" {
++				if err = scope.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++					t.Fatalf("cleanup = %v", err)
++				}
++			}
++			if closed != 0 {
++				t.Fatalf("unowned object runtime-closed %d times", closed)
++			}
++		})
++	}
++}
 diff --git a/adapter/outbound/manager.go b/adapter/outbound/manager.go
-index e4abba6..67715ef 100644
+index e4abba6..31f9893 100644
 --- a/adapter/outbound/manager.go
 +++ b/adapter/outbound/manager.go
-@@ -8,6 +8,7 @@ import (
+@@ -2,12 +2,12 @@ package outbound
+ 
+ import (
+ 	"context"
+-	"io"
+ 	"os"
+ 	"strings"
  	"sync"
  
  	"github.com/sagernet/sing-box/adapter"
@@ -449,7 +1023,28 @@ index e4abba6..67715ef 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -167,13 +168,10 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
+@@ -25,6 +25,7 @@ type Manager struct {
+ 	defaultTag              string
+ 	access                  sync.RWMutex
+ 	started                 bool
++	runtimeOwners           map[string]bool
+ 	stage                   adapter.StartStage
+ 	outbounds               []adapter.Outbound
+ 	outboundByTag           map[string]adapter.Outbound
+@@ -133,6 +134,12 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
+ 					return E.Cause(err, "start ", name)
+ 				}
+ 			}
++			m.markRuntimeOwner(outboundTag)
++			if endpoint, ok := outboundToStart.(adapter.Endpoint); ok {
++				if owner, ok := m.endpoint.(interface{ MarkRuntimeOwner(adapter.Endpoint) }); ok {
++					owner.MarkRuntimeOwner(endpoint)
++				}
++			}
+ 		}
+ 		if len(started) == len(outbounds) {
+ 			break
+@@ -167,26 +174,23 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
  func (m *Manager) Close() error {
  	monitor := taskmonitor.New(m.logger, C.StopTimeout)
  	m.access.Lock()
@@ -457,6 +1052,8 @@ index e4abba6..67715ef 100644
 -		m.access.Unlock()
 -		return nil
 -	}
++	runtimeOwners := m.runtimeOwners
++	m.runtimeOwners = nil
  	m.started = false
  	outbounds := m.outbounds
  	m.outbounds = nil
@@ -464,16 +1061,28 @@ index e4abba6..67715ef 100644
  	m.access.Unlock()
  	var err error
  	for _, outbound := range outbounds {
-@@ -181,7 +179,7 @@ func (m *Manager) Close() error {
- 			name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
- 			done := adapter.LogElapsed(m.logger, "close ", name)
- 			monitor.Start("close ", name)
+-		if closer, isCloser := outbound.(io.Closer); isCloser {
+-			name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+-			done := adapter.LogElapsed(m.logger, "close ", name)
+-			monitor.Start("close ", name)
 -			err = E.Append(err, closer.Close(), func(err error) error {
-+			err = E.Append(err, construction.Close(name, closer.Close), func(err error) error {
- 				return E.Cause(err, "close ", name)
- 			})
- 			monitor.Finish()
-@@ -228,7 +226,6 @@ func (m *Manager) Remove(tag string) error {
+-				return E.Cause(err, "close ", name)
+-			})
+-			monitor.Finish()
+-			done()
+-		}
++		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
++		done := adapter.LogElapsed(m.logger, "close ", name)
++		monitor.Start("close ", name)
++		err = E.Append(err, construction.Dispose(name, outbound, runtimeOwners[outbound.Tag()]), func(err error) error {
++			return E.Cause(err, "close ", name)
++		})
++		monitor.Finish()
++		done()
+ 	}
+ 	return err
+ }
+@@ -228,7 +232,6 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid inbound index")
  	}
  	m.outbounds = append(m.outbounds[:index], m.outbounds[index+1:]...)
@@ -481,7 +1090,7 @@ index e4abba6..67715ef 100644
  	if m.defaultOutbound == outbound {
  		if len(m.outbounds) > 0 {
  			m.defaultOutbound = m.outbounds[0]
-@@ -251,10 +248,7 @@ func (m *Manager) Remove(tag string) error {
+@@ -251,10 +254,9 @@ func (m *Manager) Remove(tag string) error {
  			})
  		}
  	}
@@ -489,24 +1098,35 @@ index e4abba6..67715ef 100644
 -		return common.Close(outbound)
 -	}
 -	return nil
-+	return construction.Close("removed outbound", func() error { return common.Close(outbound) })
++	runtimeOwned := m.runtimeOwners[tag]
++	delete(m.runtimeOwners, tag)
++	return construction.Dispose("removed outbound", outbound, runtimeOwned)
  }
  
  func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
-@@ -262,6 +256,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -262,6 +264,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		return os.ErrInvalid
  	}
  	outbound, err := m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
 +	owned := false
++	runtimeOwned := false
 +	defer func() {
 +		if !owned && outbound != nil {
-+			construction.RecordError(ctx, construction.Close("unowned outbound", func() error { return common.Close(outbound) }))
++			construction.DisposeOrDefer(ctx, "unowned outbound", outbound, runtimeOwned)
 +		}
 +	}()
  	if err != nil {
  		return err
  	}
-@@ -279,11 +279,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -274,16 +283,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 			if err != nil {
+ 				return E.Cause(err, stage, " ", name)
+ 			}
++			if stage == adapter.StartStateStart {
++				runtimeOwned = true
++			}
+ 		}
+ 	}
  	m.access.Lock()
  	defer m.access.Unlock()
  	if existsOutbound, loaded := m.outboundByTag[tag]; loaded {
@@ -515,26 +1135,77 @@ index e4abba6..67715ef 100644
 -			if err != nil {
 -				return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
 -			}
-+		err = common.Close(existsOutbound)
++		err = construction.Replace(ctx, "replaced outbound", existsOutbound, m.runtimeOwners[tag])
++		if !m.runtimeOwners[tag] {
++			construction.RecordError(ctx, err)
++			err = nil
++		}
 +		if err != nil {
 +			return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
  		}
  		existsIndex := common.Index(m.outbounds, func(it adapter.Outbound) bool {
  			return it == existsOutbound
-@@ -294,6 +292,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -294,7 +308,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
  	}
  	m.outbounds = append(m.outbounds, outbound)
 +	owned = true
  	m.outboundByTag[tag] = outbound
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = runtimeOwned
  	dependencies := outbound.Dependencies()
  	for _, dependency := range dependencies {
+ 		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
+@@ -307,3 +326,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 	}
+ 	return nil
+ }
++
++// markRuntimeOwner records this child's successful runtime Start, never manager initialization.
++func (m *Manager) markRuntimeOwner(tag string) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = true
++}
+diff --git a/adapter/outbound/manager_close_test.go b/adapter/outbound/manager_close_test.go
+index b90928c..d2c6be4 100644
+--- a/adapter/outbound/manager_close_test.go
++++ b/adapter/outbound/manager_close_test.go
+@@ -13,14 +13,19 @@ type failingOutbound struct {
+ 	err error
+ }
+ 
+-func (f failingOutbound) Type() string { return "test" }
+-func (f failingOutbound) Tag() string  { return "failing" }
+-func (f failingOutbound) Close() error { return f.err }
++func (f failingOutbound) Type() string                   { return "test" }
++func (f failingOutbound) Tag() string                    { return "failing" }
++func (f failingOutbound) Close() error                   { return f.err }
++func (f failingOutbound) Start(adapter.StartStage) error { return nil }
++func (f failingOutbound) Dependencies() []string         { return nil }
+ 
+ func TestClosePropagatesOutboundFailure(t *testing.T) {
+ 	failure := errors.New("outbound close failed")
+-	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
++	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true, endpoint: noEndpoints{},
+ 		outbounds: []adapter.Outbound{failingOutbound{err: failure}}}
++	if err := m.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
+ 	if err := m.Close(); !errors.Is(err, failure) {
+ 		t.Fatalf("Close() = %v, want outbound failure", err)
+ 	}
 diff --git a/adapter/outbound/manager_construction_test.go b/adapter/outbound/manager_construction_test.go
 new file mode 100644
-index 0000000..7ec2acf
+index 0000000..428b571
 --- /dev/null
 +++ b/adapter/outbound/manager_construction_test.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +package outbound
 +
 +import (
@@ -592,8 +1263,133 @@ index 0000000..7ec2acf
 +		}
 +	}
 +}
++
++func (p constructionProbe) DisposeConstruction() error { return p.Close() }
+diff --git a/adapter/outbound/manager_ownership_test.go b/adapter/outbound/manager_ownership_test.go
+new file mode 100644
+index 0000000..f83d7b4
+--- /dev/null
++++ b/adapter/outbound/manager_ownership_test.go
+@@ -0,0 +1,117 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++// No DisposeConstruction method: ordinary Close represents an unsafe runtime effect.
++type unknownOwnerProbe struct {
++	adapter.Outbound
++	tag       string
++	closed    *int
++	failStart bool
++}
++
++type noEndpoints struct{ adapter.EndpointManager }
++
++func (noEndpoints) Endpoints() []adapter.Endpoint { return nil }
++
++func (p *unknownOwnerProbe) Type() string           { return "unknown-owner" }
++func (p *unknownOwnerProbe) Tag() string            { return p.tag }
++func (p *unknownOwnerProbe) Close() error           { *p.closed++; return nil }
++func (p *unknownOwnerProbe) Dependencies() []string { return nil }
++func (p *unknownOwnerProbe) Start(stage adapter.StartStage) error {
++	if stage == adapter.StartStateStart && p.failStart {
++		return errors.New("injected runtime Start failure")
++	}
++	return nil
++}
++
++func TestOnlySuccessfulChildStartAllowsRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"constructed", "initialize", "partial-start"} {
++		t.Run(mode, func(t *testing.T) {
++			logger := log.NewNOPFactory().Logger()
++			closed := []int{0, 0, 0}
++			children := []adapter.Outbound{
++				&unknownOwnerProbe{tag: "first", closed: &closed[0]},
++				&unknownOwnerProbe{tag: "failed", closed: &closed[1], failStart: true},
++				&unknownOwnerProbe{tag: "untouched", closed: &closed[2]},
++			}
++			m := &Manager{logger: logger, endpoint: noEndpoints{}, outbounds: children, outboundByTag: map[string]adapter.Outbound{"first": children[0], "failed": children[1], "untouched": children[2]}, defaultOutbound: children[0]}
++			if mode != "constructed" {
++				if err := m.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "partial-start" {
++				if err := m.Start(adapter.StartStateStart); err == nil {
++					t.Fatal("injected Start failure missing")
++				}
++			}
++			if err := m.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++				t.Fatalf("close = %v", err)
++			}
++			wantFirst := 0
++			if mode == "partial-start" {
++				wantFirst = 1
++			}
++			if closed[0] != wantFirst || closed[1] != 0 || closed[2] != 0 {
++				t.Fatalf("unsafe runtime Close counts: %v", closed)
++			}
++		})
++	}
++}
++
++func TestUnknownConstructionRemoveReplaceAndFactoryErrorNeverRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"remove", "replace", "factory-error"} {
++		t.Run(mode, func(t *testing.T) {
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			logger := log.NewNOPFactory().Logger()
++			closed := 0
++			registry := NewRegistry()
++			failure := errors.New("injected object plus error")
++			Register[struct{}](registry, "unknown-owner", func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Outbound, error) {
++				child := &unknownOwnerProbe{tag: tag, closed: &closed}
++				if mode == "factory-error" {
++					return child, failure
++				}
++				return child, nil
++			})
++			m := &Manager{logger: logger, registry: registry, outboundByTag: make(map[string]adapter.Outbound)}
++			err := m.Create(ctx, nil, logger, "same", "unknown-owner", nil)
++			if mode == "factory-error" {
++				if !errors.Is(err, failure) {
++					t.Fatal(err)
++				}
++			} else {
++				if err != nil {
++					t.Fatal(err)
++				}
++				if mode == "remove" {
++					if err = m.Remove("same"); !errors.Is(err, construction.ErrUnknownDisposal) {
++						t.Fatal(err)
++					}
++				} else {
++					if err = m.Create(ctx, nil, logger, "same", "unknown-owner", nil); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			if mode != "remove" {
++				if err = scope.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++					t.Fatalf("cleanup = %v", err)
++				}
++			}
++			if closed != 0 {
++				t.Fatalf("unowned object runtime-closed %d times", closed)
++			}
++		})
++	}
++}
 diff --git a/adapter/service/manager.go b/adapter/service/manager.go
-index 9db1585..943dbad 100644
+index 9db1585..91afd18 100644
 --- a/adapter/service/manager.go
 +++ b/adapter/service/manager.go
 @@ -6,6 +6,7 @@ import (
@@ -604,7 +1400,38 @@ index 9db1585..943dbad 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -56,20 +57,18 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+@@ -16,13 +17,14 @@ import (
+ var _ adapter.ServiceManager = (*Manager)(nil)
+ 
+ type Manager struct {
+-	logger       log.ContextLogger
+-	registry     adapter.ServiceRegistry
+-	access       sync.Mutex
+-	started      bool
+-	stage        adapter.StartStage
+-	services     []adapter.Service
+-	serviceByTag map[string]adapter.Service
++	logger        log.ContextLogger
++	registry      adapter.ServiceRegistry
++	access        sync.Mutex
++	started       bool
++	runtimeOwners map[string]bool
++	stage         adapter.StartStage
++	services      []adapter.Service
++	serviceByTag  map[string]adapter.Service
+ }
+ 
+ func NewManager(logger log.ContextLogger, registry adapter.ServiceRegistry) *Manager {
+@@ -50,26 +52,29 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 		if err != nil {
+ 			return E.Cause(err, stage, " ", name)
+ 		}
++		if stage == adapter.StartStateStart {
++			m.markRuntimeOwner(service.Tag())
++		}
+ 	}
+ 	return nil
+ }
  
  func (m *Manager) Close() error {
  	m.access.Lock()
@@ -612,6 +1439,8 @@ index 9db1585..943dbad 100644
 -	if !m.started {
 -		return nil
 -	}
++	runtimeOwners := m.runtimeOwners
++	m.runtimeOwners = nil
  	m.started = false
  	services := m.services
  	m.services = nil
@@ -624,35 +1453,44 @@ index 9db1585..943dbad 100644
  		done := adapter.LogElapsed(m.logger, "close ", name)
  		monitor.Start("close ", name)
 -		err = E.Append(err, service.Close(), func(err error) error {
-+		err = E.Append(err, construction.Close(name, service.Close), func(err error) error {
++		err = E.Append(err, construction.Dispose(name, service, runtimeOwners[service.Tag()]), func(err error) error {
  			return E.Cause(err, "close ", name)
  		})
  		monitor.Finish()
-@@ -106,16 +105,18 @@ func (m *Manager) Remove(tag string) error {
+@@ -106,16 +111,21 @@ func (m *Manager) Remove(tag string) error {
  		panic("invalid service index")
  	}
  	m.services = append(m.services[:index], m.services[index+1:]...)
 -	started := m.started
++	runtimeOwned := m.runtimeOwners[tag]
++	delete(m.runtimeOwners, tag)
  	m.access.Unlock()
 -	if started {
 -		return service.Close()
 -	}
 -	return nil
-+	return construction.Close("removed service", service.Close)
++	return construction.Dispose("removed service", service, runtimeOwned)
  }
  
  func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
  	service, err := m.registry.Create(ctx, logger, tag, serviceType, options)
 +	owned := false
++	runtimeOwned := false
 +	defer func() {
 +		if !owned && service != nil {
-+			construction.RecordError(ctx, construction.Close("unowned service", func() error { return common.Close(service) }))
++			construction.DisposeOrDefer(ctx, "unowned service", service, runtimeOwned)
 +		}
 +	}()
  	if err != nil {
  		return err
  	}
-@@ -133,11 +134,9 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -130,14 +140,19 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+ 			if err != nil {
+ 				return E.Cause(err, stage, " ", name)
+ 			}
++			if stage == adapter.StartStateStart {
++				runtimeOwned = true
++			}
  		}
  	}
  	if existsService, loaded := m.serviceByTag[tag]; loaded {
@@ -661,26 +1499,71 @@ index 9db1585..943dbad 100644
 -			if err != nil {
 -				return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
 -			}
-+		err = existsService.Close()
++		err = construction.Replace(ctx, "replaced service", existsService, m.runtimeOwners[tag])
++		if !m.runtimeOwners[tag] {
++			construction.RecordError(ctx, err)
++			err = nil
++		}
 +		if err != nil {
 +			return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
  		}
  		existsIndex := common.Index(m.services, func(it adapter.Service) bool {
  			return it == existsService
-@@ -148,6 +147,7 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -148,6 +163,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  		m.services = append(m.services[:existsIndex], m.services[existsIndex+1:]...)
  	}
  	m.services = append(m.services, service)
 +	owned = true
  	m.serviceByTag[tag] = service
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = runtimeOwned
  	return nil
  }
++
++// markRuntimeOwner records this child's successful runtime Start, never manager initialization.
++func (m *Manager) markRuntimeOwner(tag string) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = true
++}
+diff --git a/adapter/service/manager_close_test.go b/adapter/service/manager_close_test.go
+index 167565e..afab144 100644
+--- a/adapter/service/manager_close_test.go
++++ b/adapter/service/manager_close_test.go
+@@ -13,14 +13,19 @@ type failingService struct {
+ 	err error
+ }
+ 
+-func (f failingService) Type() string { return "test" }
+-func (f failingService) Tag() string  { return "failing" }
+-func (f failingService) Close() error { return f.err }
++func (f failingService) Type() string                   { return "test" }
++func (f failingService) Tag() string                    { return "failing" }
++func (f failingService) Close() error                   { return f.err }
++func (f failingService) Start(adapter.StartStage) error { return nil }
++func (f failingService) Dependencies() []string         { return nil }
+ 
+ func TestClosePropagatesServiceFailure(t *testing.T) {
+ 	failure := errors.New("service close failed")
+ 	m := &Manager{logger: log.NewNOPFactory().Logger(), started: true,
+ 		services: []adapter.Service{failingService{err: failure}}}
++	if err := m.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
+ 	if err := m.Close(); !errors.Is(err, failure) {
+ 		t.Fatalf("Close() = %v, want service failure", err)
+ 	}
 diff --git a/adapter/service/manager_construction_test.go b/adapter/service/manager_construction_test.go
 new file mode 100644
-index 0000000..356dcbe
+index 0000000..55984d3
 --- /dev/null
 +++ b/adapter/service/manager_construction_test.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +package service
 +
 +import (
@@ -738,11 +1621,140 @@ index 0000000..356dcbe
 +		}
 +	}
 +}
++
++func (p constructionProbe) DisposeConstruction() error { return p.Close() }
+diff --git a/adapter/service/manager_ownership_test.go b/adapter/service/manager_ownership_test.go
+new file mode 100644
+index 0000000..3e8a19f
+--- /dev/null
++++ b/adapter/service/manager_ownership_test.go
+@@ -0,0 +1,113 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++// No DisposeConstruction method: ordinary Close represents an unsafe runtime effect.
++type unknownOwnerProbe struct {
++	adapter.Service
++	tag       string
++	closed    *int
++	failStart bool
++}
++
++func (p *unknownOwnerProbe) Type() string           { return "unknown-owner" }
++func (p *unknownOwnerProbe) Tag() string            { return p.tag }
++func (p *unknownOwnerProbe) Close() error           { *p.closed++; return nil }
++func (p *unknownOwnerProbe) Dependencies() []string { return nil }
++func (p *unknownOwnerProbe) Start(stage adapter.StartStage) error {
++	if stage == adapter.StartStateStart && p.failStart {
++		return errors.New("injected runtime Start failure")
++	}
++	return nil
++}
++
++func TestOnlySuccessfulChildStartAllowsRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"constructed", "initialize", "partial-start"} {
++		t.Run(mode, func(t *testing.T) {
++			logger := log.NewNOPFactory().Logger()
++			closed := []int{0, 0, 0}
++			children := []adapter.Service{
++				&unknownOwnerProbe{tag: "first", closed: &closed[0]},
++				&unknownOwnerProbe{tag: "failed", closed: &closed[1], failStart: true},
++				&unknownOwnerProbe{tag: "untouched", closed: &closed[2]},
++			}
++			m := &Manager{logger: logger, services: children, serviceByTag: map[string]adapter.Service{"first": children[0], "failed": children[1], "untouched": children[2]}}
++			if mode != "constructed" {
++				if err := m.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "partial-start" {
++				if err := m.Start(adapter.StartStateStart); err == nil {
++					t.Fatal("injected Start failure missing")
++				}
++			}
++			if err := m.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++				t.Fatalf("close = %v", err)
++			}
++			wantFirst := 0
++			if mode == "partial-start" {
++				wantFirst = 1
++			}
++			if closed[0] != wantFirst || closed[1] != 0 || closed[2] != 0 {
++				t.Fatalf("unsafe runtime Close counts: %v", closed)
++			}
++		})
++	}
++}
++
++func TestUnknownConstructionRemoveReplaceAndFactoryErrorNeverRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"remove", "replace", "factory-error"} {
++		t.Run(mode, func(t *testing.T) {
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			logger := log.NewNOPFactory().Logger()
++			closed := 0
++			registry := NewRegistry()
++			failure := errors.New("injected object plus error")
++			Register[struct{}](registry, "unknown-owner", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.Service, error) {
++				child := &unknownOwnerProbe{tag: tag, closed: &closed}
++				if mode == "factory-error" {
++					return child, failure
++				}
++				return child, nil
++			})
++			m := &Manager{logger: logger, registry: registry, serviceByTag: make(map[string]adapter.Service)}
++			err := m.Create(ctx, logger, "same", "unknown-owner", nil)
++			if mode == "factory-error" {
++				if !errors.Is(err, failure) {
++					t.Fatal(err)
++				}
++			} else {
++				if err != nil {
++					t.Fatal(err)
++				}
++				if mode == "remove" {
++					if err = m.Remove("same"); !errors.Is(err, construction.ErrUnknownDisposal) {
++						t.Fatal(err)
++					}
++				} else {
++					if err = m.Create(ctx, logger, "same", "unknown-owner", nil); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			if mode != "remove" {
++				if err = scope.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++					t.Fatalf("cleanup = %v", err)
++				}
++			}
++			if closed != 0 {
++				t.Fatalf("unowned object runtime-closed %d times", closed)
++			}
++		})
++	}
++}
 diff --git a/box.go b/box.go
-index 13e86d6..8c611b3 100644
+index 13e86d6..da9e5fa 100644
 --- a/box.go
 +++ b/box.go
-@@ -17,6 +17,7 @@ import (
+@@ -2,6 +2,7 @@ package box
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -17,6 +18,7 @@ import (
  	"github.com/sagernet/sing-box/adapter/outbound"
  	boxService "github.com/sagernet/sing-box/adapter/service"
  	"github.com/sagernet/sing-box/common/certificate"
@@ -750,7 +1762,7 @@ index 13e86d6..8c611b3 100644
  	"github.com/sagernet/sing-box/common/dialer"
  	"github.com/sagernet/sing-box/common/httpclient"
  	"github.com/sagernet/sing-box/common/netns"
-@@ -68,6 +69,7 @@ type Box struct {
+@@ -68,6 +70,7 @@ type Box struct {
  	closeStarted        atomic.Bool
  	closeFinished       chan struct{}
  	closeResult         error
@@ -758,7 +1770,7 @@ index 13e86d6..8c611b3 100644
  }
  
  type Options struct {
-@@ -116,12 +118,49 @@ func Context(
+@@ -116,12 +119,67 @@ func Context(
  	return ctx
  }
  
@@ -770,12 +1782,20 @@ index 13e86d6..8c611b3 100644
 +	CleanupError error
 +}
 +
++// New preserves prompt error/panic propagation. A failed construction's scope
++// retains its cleanup work asynchronously; this API provides no disposal receipt.
  func New(options Options) (*Box, error) {
-+	instance, err, _ := NewWithConstructionReport(options)
++	instance, err, _ := newWithConstructionReport(options, false)
 +	return instance, err
 +}
 +
++// NewWithConstructionReport waits for observed rollback, which can block on a
++// cleanup callback. Validation callers need a separate timeout and Unknown state.
 +func NewWithConstructionReport(options Options) (instance *Box, err error, report ConstructionReport) {
++	return newWithConstructionReport(options, true)
++}
++
++func newWithConstructionReport(options Options, awaitRollback bool) (instance *Box, err error, report ConstructionReport) {
 +	var scope construction.Scope
 +	ctx := options.Context
 +	if ctx == nil {
@@ -786,9 +1806,19 @@ index 13e86d6..8c611b3 100644
 +	defer func() {
 +		if instance == nil {
 +			cancel()
-+			report.CleanupError = scope.Close()
++			if awaitRollback {
++				report.CleanupError = scope.Close()
++			} else {
++				go scope.Close()
++			}
 +		} else {
 +			instance.constructionCancel = cancel
++			report.CleanupError = scope.Errors()
++			if awaitRollback {
++				report.CleanupError = errors.Join(report.CleanupError, scope.DisposePending())
++			} else {
++				go scope.DisposePending()
++			}
 +			scope.TransferAll()
 +		}
 +	}()
@@ -808,7 +1838,7 @@ index 13e86d6..8c611b3 100644
  	ctx = service.ContextWithDefaultRegistry(ctx)
  
  	endpointRegistry := service.FromContext[adapter.EndpointRegistry](ctx)
-@@ -180,6 +219,7 @@ func New(options Options) (*Box, error) {
+@@ -180,6 +238,7 @@ func New(options Options) (*Box, error) {
  	if platformInterface != nil {
  		defaultLogWriter = io.Discard
  	}
@@ -816,7 +1846,7 @@ index 13e86d6..8c611b3 100644
  	logFactory, err := log.New(log.Options{
  		Context:        ctx,
  		Options:        common.PtrValueOrDefault(options.Log),
-@@ -191,6 +231,7 @@ func New(options Options) (*Box, error) {
+@@ -191,6 +250,7 @@ func New(options Options) (*Box, error) {
  	if err != nil {
  		return nil, E.Cause(err, "create log factory")
  	}
@@ -824,7 +1854,7 @@ index 13e86d6..8c611b3 100644
  	service.MustRegister[log.Factory](ctx, logFactory)
  
  	var internalServices []adapter.LifecycleService
-@@ -204,6 +245,7 @@ func New(options Options) (*Box, error) {
+@@ -204,6 +264,7 @@ func New(options Options) (*Box, error) {
  		if err != nil {
  			return nil, err
  		}
@@ -832,7 +1862,7 @@ index 13e86d6..8c611b3 100644
  		service.MustRegister[adapter.CertificateStore](ctx, certificateStore)
  		internalServices = append(internalServices, certificateStore)
  	}
-@@ -211,6 +253,7 @@ func New(options Options) (*Box, error) {
+@@ -211,6 +272,7 @@ func New(options Options) (*Box, error) {
  	if err != nil {
  		return nil, err
  	}
@@ -840,7 +1870,7 @@ index 13e86d6..8c611b3 100644
  	service.MustRegister[adapter.NetworkNamespaceManager](ctx, netnsManager)
  	internalServices = append(internalServices, netnsManager)
  	dnsOptions := common.PtrValueOrDefault(options.DNS)
-@@ -220,6 +263,12 @@ func New(options Options) (*Box, error) {
+@@ -220,6 +282,12 @@ func New(options Options) (*Box, error) {
  	dnsTransportManager := dns.NewTransportManager(logFactory.NewLogger("dns/transport"), dnsTransportRegistry, outboundManager, dnsOptions.Final)
  	serviceManager := boxService.NewManager(logFactory.NewLogger("service"), serviceRegistry)
  	certificateProviderManager := boxCertificate.NewManager(logFactory.NewLogger("certificate-provider"), certificateProviderRegistry)
@@ -853,7 +1883,7 @@ index 13e86d6..8c611b3 100644
  	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
  	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
  	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
-@@ -230,20 +279,25 @@ func New(options Options) (*Box, error) {
+@@ -230,20 +298,25 @@ func New(options Options) (*Box, error) {
  	if err != nil {
  		return nil, E.Cause(err, "initialize DNS router")
  	}
@@ -879,7 +1909,7 @@ index 13e86d6..8c611b3 100644
  	service.MustRegister[adapter.Router](ctx, router)
  	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
  	if err != nil {
-@@ -251,6 +305,7 @@ func New(options Options) (*Box, error) {
+@@ -251,6 +324,7 @@ func New(options Options) (*Box, error) {
  	}
  	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
  		trafficManager := trafficcontrol.NewManager()
@@ -887,7 +1917,7 @@ index 13e86d6..8c611b3 100644
  		service.MustRegisterPtr(ctx, trafficManager)
  		router.AppendTracker(trafficManager)
  		internalServices = append(internalServices, trafficManager)
-@@ -259,10 +314,12 @@ func New(options Options) (*Box, error) {
+@@ -259,10 +333,12 @@ func New(options Options) (*Box, error) {
  			clashDefaultMode = experimentalOptions.ClashAPI.DefaultMode
  		}
  		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
@@ -900,7 +1930,7 @@ index 13e86d6..8c611b3 100644
  	internalServices = append(internalServices, referenceManager)
  	ntpOptions := common.PtrValueOrDefault(options.NTP)
  	var timeService *tls.TimeServiceWrapper
-@@ -271,6 +328,9 @@ func New(options Options) (*Box, error) {
+@@ -271,6 +347,9 @@ func New(options Options) (*Box, error) {
  		service.MustRegister[ntp.TimeService](ctx, timeService)
  	}
  	for i, transportOptions := range dnsOptions.Servers {
@@ -910,7 +1940,7 @@ index 13e86d6..8c611b3 100644
  		var tag string
  		if transportOptions.Tag != "" {
  			tag = transportOptions.Tag
-@@ -293,6 +353,9 @@ func New(options Options) (*Box, error) {
+@@ -293,6 +372,9 @@ func New(options Options) (*Box, error) {
  		return nil, E.Cause(err, "initialize dns router")
  	}
  	for i, endpointOptions := range options.Endpoints {
@@ -920,7 +1950,7 @@ index 13e86d6..8c611b3 100644
  		var tag string
  		if endpointOptions.Tag != "" {
  			tag = endpointOptions.Tag
-@@ -319,6 +382,9 @@ func New(options Options) (*Box, error) {
+@@ -319,6 +401,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, inboundOptions := range options.Inbounds {
@@ -930,7 +1960,7 @@ index 13e86d6..8c611b3 100644
  		var tag string
  		if inboundOptions.Tag != "" {
  			tag = inboundOptions.Tag
-@@ -338,6 +404,9 @@ func New(options Options) (*Box, error) {
+@@ -338,6 +423,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, serviceOptions := range options.Services {
@@ -940,7 +1970,7 @@ index 13e86d6..8c611b3 100644
  		var tag string
  		if serviceOptions.Tag != "" {
  			tag = serviceOptions.Tag
-@@ -356,6 +425,9 @@ func New(options Options) (*Box, error) {
+@@ -356,6 +444,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, outboundOptions := range options.Outbounds {
@@ -950,7 +1980,7 @@ index 13e86d6..8c611b3 100644
  		var tag string
  		if outboundOptions.Tag != "" {
  			tag = outboundOptions.Tag
-@@ -382,6 +454,9 @@ func New(options Options) (*Box, error) {
+@@ -382,6 +473,9 @@ func New(options Options) (*Box, error) {
  		}
  	}
  	for i, certificateProviderOptions := range options.CertificateProviders {
@@ -960,7 +1990,7 @@ index 13e86d6..8c611b3 100644
  		var tag string
  		if certificateProviderOptions.Tag != "" {
  			tag = certificateProviderOptions.Tag
-@@ -431,6 +506,7 @@ func New(options Options) (*Box, error) {
+@@ -431,6 +525,7 @@ func New(options Options) (*Box, error) {
  	}
  	if needCacheFile {
  		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
@@ -968,7 +1998,7 @@ index 13e86d6..8c611b3 100644
  		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
  		internalServices = append(internalServices, cacheFile)
  	}
-@@ -439,6 +515,7 @@ func New(options Options) (*Box, error) {
+@@ -439,6 +534,7 @@ func New(options Options) (*Box, error) {
  		if err != nil {
  			return nil, E.Cause(err, "create clash-server")
  		}
@@ -976,7 +2006,7 @@ index 13e86d6..8c611b3 100644
  		internalServices = append(internalServices, clashServer)
  	}
  	if needV2RayAPI {
-@@ -446,6 +523,7 @@ func New(options Options) (*Box, error) {
+@@ -446,6 +542,7 @@ func New(options Options) (*Box, error) {
  		if err != nil {
  			return nil, E.Cause(err, "create v2ray-server")
  		}
@@ -984,7 +2014,7 @@ index 13e86d6..8c611b3 100644
  		if v2rayServer.StatsService() != nil {
  			router.AppendTracker(v2rayServer.StatsService())
  			internalServices = append(internalServices, v2rayServer)
-@@ -471,9 +549,13 @@ func New(options Options) (*Box, error) {
+@@ -471,9 +568,13 @@ func New(options Options) (*Box, error) {
  			Interval:      time.Duration(ntpOptions.Interval),
  			WriteToSystem: ntpOptions.WriteToSystem,
  		})
@@ -998,7 +2028,7 @@ index 13e86d6..8c611b3 100644
  	return &Box{
  		ctx:                 ctx,
  		network:             networkManager,
-@@ -638,6 +720,9 @@ func (s *Box) finishClose() error {
+@@ -638,6 +739,9 @@ func (s *Box) finishClose() error {
  }
  
  func (s *Box) close() error {
@@ -1008,7 +2038,7 @@ index 13e86d6..8c611b3 100644
  	close(s.done)
  	var err error
  	if s.debugHTTPServer != nil {
-@@ -662,7 +747,7 @@ func (s *Box) close() error {
+@@ -662,7 +766,7 @@ func (s *Box) close() error {
  		{"network", s.network},
  	} {
  		done := adapter.LogElapsed(s.logger, "close ", closeItem.name)
@@ -1017,7 +2047,7 @@ index 13e86d6..8c611b3 100644
  			return E.Cause(err, "close ", closeItem.name)
  		})
  		done()
-@@ -670,20 +755,20 @@ func (s *Box) close() error {
+@@ -670,20 +774,20 @@ func (s *Box) close() error {
  	if s.httpClientService != nil {
  		s.logger.Trace("close ", s.httpClientService.Name())
  		startTime := time.Now()
@@ -1043,10 +2073,10 @@ index 13e86d6..8c611b3 100644
  	done()
 diff --git a/box_construction_test.go b/box_construction_test.go
 new file mode 100644
-index 0000000..1916f83
+index 0000000..62f118d
 --- /dev/null
 +++ b/box_construction_test.go
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,215 @@
 +package box
 +
 +import (
@@ -1054,6 +2084,7 @@ index 0000000..1916f83
 +	"errors"
 +	"strconv"
 +	"testing"
++	"time"
 +
 +	"github.com/sagernet/sing-box/adapter"
 +	boxCertificate "github.com/sagernet/sing-box/adapter/certificate"
@@ -1074,9 +2105,68 @@ index 0000000..1916f83
 +	cleanupError error
 +}
 +
-+func (s *constructedService) Type() string { return "construction-probe" }
-+func (s *constructedService) Tag() string  { return s.tag }
-+func (s *constructedService) Close() error { *s.closed++; return s.cleanupError }
++func TestOrdinaryNewPropagatesErrorOrPanicWithoutWaitingForBlockedRollback(t *testing.T) {
++	for _, panicConstructor := range []bool{false, true} {
++		t.Run(strconv.FormatBool(panicConstructor), func(t *testing.T) {
++			entered, release, disposed := make(chan struct{}), make(chan struct{}), make(chan struct{})
++			registry := boxService.NewRegistry()
++			failure := errors.New("ordinary constructor failure")
++			boxService.Register[struct{}](registry, "blocking-rollback", func(ctx context.Context, _ log.ContextLogger, _ string, _ struct{}) (adapter.Service, error) {
++				construction.Register(ctx, "blocked acquired resource", func() error {
++					close(entered)
++					<-release
++					close(disposed)
++					return nil
++				})
++				if panicConstructor {
++					panic("ordinary constructor panic")
++				}
++				return nil, failure
++			})
++			ctx := Context(context.Background(), inbound.NewRegistry(), outbound.NewRegistry(), endpoint.NewRegistry(), dns.NewTransportRegistry(), registry, boxCertificate.NewRegistry())
++			done := make(chan any, 1)
++			go func() {
++				defer func() {
++					if p := recover(); p != nil {
++						done <- p
++					}
++				}()
++				_, err := New(Options{Context: ctx, Options: option.Options{Log: &option.LogOptions{Disabled: true}, Services: []option.Service{{Type: "blocking-rollback"}}}})
++				done <- err
++			}()
++			select {
++			case result := <-done:
++				if panicConstructor {
++					if result != "ordinary constructor panic" {
++						t.Fatalf("panic changed: %v", result)
++					}
++				} else if err, ok := result.(error); !ok || !errors.Is(err, failure) {
++					t.Fatalf("error changed: %v", result)
++				}
++			case <-time.After(time.Second):
++				close(release)
++				t.Fatal("ordinary New waited for blocked cleanup")
++			}
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				close(release)
++				t.Fatal("rollback lost acquired resource")
++			}
++			close(release)
++			select {
++			case <-disposed:
++			case <-time.After(time.Second):
++				t.Fatal("rollback failed to complete after release")
++			}
++		})
++	}
++}
++
++func (s *constructedService) Type() string               { return "construction-probe" }
++func (s *constructedService) Tag() string                { return s.tag }
++func (s *constructedService) Close() error               { *s.closed++; return s.cleanupError }
++func (s *constructedService) DisposeConstruction() error { return s.Close() }
 +
 +func TestNewRollbackAtEveryServiceConstructor(t *testing.T) {
 +	for nth := 0; nth < 4; nth++ {
@@ -1185,13 +2275,13 @@ index 0000000..1916f83
 +							t.Fatal("constructor panic disappeared")
 +						}
 +					}()
-+					New(options)
++					NewWithConstructionReport(options)
 +				}()
 +				if closed != 1 {
 +					t.Fatalf("panic rollback closed %d children", closed)
 +				}
 +			} else {
-+				instance, err := New(options)
++				instance, err, _ := NewWithConstructionReport(options)
 +				if instance != nil || !errors.Is(err, context.Canceled) {
 +					t.Fatalf("canceled New = %v, %v", instance, err)
 +				}
@@ -1203,7 +2293,7 @@ index 0000000..1916f83
 +	}
 +}
 diff --git a/common/certificate/store.go b/common/certificate/store.go
-index 34871a6..7ff2f7b 100644
+index 34871a6..5f34090 100644
 --- a/common/certificate/store.go
 +++ b/common/certificate/store.go
 @@ -12,6 +12,7 @@ import (
@@ -1221,7 +2311,7 @@ index 34871a6..7ff2f7b 100644
 +	owned := false
 +	defer func() {
 +		if !owned {
-+			construction.RecordError(ctx, construction.Close("partial certificate store", store.Close))
++			construction.DeferCleanup(ctx, "partial certificate store", store.Close)
 +		}
 +	}()
  	var watchPaths []string
@@ -1237,10 +2327,10 @@ index 34871a6..7ff2f7b 100644
  
 diff --git a/common/construction/scope.go b/common/construction/scope.go
 new file mode 100644
-index 0000000..5f08bab
+index 0000000..3ca671b
 --- /dev/null
 +++ b/common/construction/scope.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,168 @@
 +// Package construction tracks resources acquired before a lifecycle owner exists.
 +// Completing this stack is cleanup evidence, not proof of a complete resource audit.
 +package construction
@@ -1249,12 +2339,14 @@ index 0000000..5f08bab
 +	"context"
 +	"errors"
 +	"fmt"
++	"io"
 +	"sync"
 +)
 +
 +type Scope struct {
 +	access  sync.Mutex
 +	entries []*Ownership
++	pending []*Ownership
 +	errors  []error
 +}
 +
@@ -1264,6 +2356,59 @@ index 0000000..5f08bab
 +}
 +
 +type contextKey struct{}
++
++// Disposer promises construction-state disposal without persistence, global
++// rule deletion, or other runtime effects owned by a different instance.
++// Implementations must track any resources actually acquired during Start.
++type Disposer interface{ DisposeConstruction() error }
++
++var ErrUnknownDisposal = errors.New("construction disposal capability is unknown")
++
++func Dispose(name string, value any, runtimeOwner bool) error {
++	if value == nil {
++		return nil
++	}
++	if !runtimeOwner {
++		if disposer, ok := value.(Disposer); ok {
++			return Close(name, disposer.DisposeConstruction)
++		}
++		return fmt.Errorf("%s: %w", name, ErrUnknownDisposal)
++	}
++	if closer, ok := value.(io.Closer); ok {
++		return Close(name, closer.Close)
++	}
++	return nil
++}
++
++// DeferCleanup keeps a failed constructor's disposal on the construction
++// owner, so ordinary New can preserve prompt error/panic propagation.
++func DeferCleanup(ctx context.Context, name string, cleanup func() error) {
++	if ctx != nil {
++		if scope, _ := ctx.Value(contextKey{}).(*Scope); scope != nil {
++			scope.Add(name, cleanup)
++			return
++		}
++	}
++	RecordError(ctx, Close(name, cleanup))
++}
++
++func DisposeOrDefer(ctx context.Context, name string, value any, runtimeOwner bool) {
++	DeferCleanup(ctx, name, func() error { return Dispose(name, value, runtimeOwner) })
++}
++
++// Replace defers construction disposal separately from the resources transferred
++// to a completed parent. Runtime replacement retains its synchronous Close.
++func Replace(ctx context.Context, name string, value any, runtimeOwner bool) error {
++	if !runtimeOwner && ctx != nil {
++		if scope, _ := ctx.Value(contextKey{}).(*Scope); scope != nil {
++			scope.access.Lock()
++			scope.pending = append(scope.pending, &Ownership{name: name, cleanup: func() error { return Dispose(name, value, false) }})
++			scope.access.Unlock()
++			return nil
++		}
++	}
++	return Dispose(name, value, runtimeOwner)
++}
 +
 +func WithScope(ctx context.Context, scope *Scope) context.Context {
 +	return context.WithValue(ctx, contextKey{}, scope)
@@ -1305,13 +2450,27 @@ index 0000000..5f08bab
 +// callback still owns the stack; cancellation alone never proves quiescence.
 +func (s *Scope) Close() error {
 +	s.access.Lock()
-+	entries, errs := s.entries, s.errors
-+	s.entries, s.errors = nil, nil
++	entries, errs, pending := s.entries, s.errors, s.pending
++	s.entries, s.errors, s.pending = nil, nil, nil
 +	s.access.Unlock()
++	// Replaced objects precede their replacement's parent in acquisition order.
++	entries = append(pending, entries...)
 +	for i := len(entries) - 1; i >= 0; i-- {
 +		if entries[i].cleanup != nil {
 +			errs = append(errs, Close(entries[i].name, entries[i].cleanup))
 +		}
++	}
++	return errors.Join(errs...)
++}
++
++func (s *Scope) DisposePending() error {
++	s.access.Lock()
++	entries := s.pending
++	s.pending = nil
++	s.access.Unlock()
++	var errs []error
++	for i := len(entries) - 1; i >= 0; i-- {
++		errs = append(errs, Close(entries[i].name, entries[i].cleanup))
 +	}
 +	return errors.Join(errs...)
 +}
@@ -1321,6 +2480,12 @@ index 0000000..5f08bab
 +	s.access.Lock()
 +	s.entries = nil
 +	s.access.Unlock()
++}
++
++func (s *Scope) Errors() error {
++	s.access.Lock()
++	defer s.access.Unlock()
++	return errors.Join(s.errors...)
 +}
 +
 +func Close(name string, cleanup func() error) (err error) {
@@ -1336,10 +2501,10 @@ index 0000000..5f08bab
 +}
 diff --git a/common/construction/scope_test.go b/common/construction/scope_test.go
 new file mode 100644
-index 0000000..8479a29
+index 0000000..6b13133
 --- /dev/null
 +++ b/common/construction/scope_test.go
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,75 @@
 +package construction
 +
 +import (
@@ -1369,6 +2534,34 @@ index 0000000..8479a29
 +	}
 +}
 +
++type disposalProbe struct{ disposed, runtimeClosed *int }
++
++func (p disposalProbe) DisposeConstruction() error { *p.disposed++; return nil }
++func (p disposalProbe) Close() error               { *p.runtimeClosed++; return nil }
++
++func TestReplacementDisposalSurvivesCompletedParentTransfer(t *testing.T) {
++	var scope Scope
++	ctx := WithScope(context.Background(), &scope)
++	disposed, runtimeClosed := 0, 0
++	if err := Replace(ctx, "replaced child", disposalProbe{&disposed, &runtimeClosed}, false); err != nil {
++		t.Fatal(err)
++	}
++	Register(ctx, "completed parent", func() error { t.Fatal("parent ownership was transferred"); return nil })
++	scope.TransferAll()
++	if err := scope.DisposePending(); err != nil {
++		t.Fatal(err)
++	}
++	if disposed != 1 || runtimeClosed != 0 {
++		t.Fatalf("disposal/runtime Close = %d/%d", disposed, runtimeClosed)
++	}
++	if err := scope.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if disposed != 1 {
++		t.Fatal("replacement disposed twice")
++	}
++}
++
 +func TestPartialConstructorInternalAcquisition(t *testing.T) {
 +	var scope Scope
 +	ctx := WithScope(context.Background(), &scope)
@@ -1389,10 +2582,10 @@ index 0000000..8479a29
 +}
 diff --git a/dns/manager_construction_test.go b/dns/manager_construction_test.go
 new file mode 100644
-index 0000000..ded53c5
+index 0000000..6ed742f
 --- /dev/null
 +++ b/dns/manager_construction_test.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +package dns
 +
 +import (
@@ -1450,11 +2643,19 @@ index 0000000..ded53c5
 +		}
 +	}
 +}
++
++func (p constructionProbe) DisposeConstruction() error { return p.Close() }
 diff --git a/dns/transport_manager.go b/dns/transport_manager.go
-index e822231..ce872b5 100644
+index e822231..17ffb01 100644
 --- a/dns/transport_manager.go
 +++ b/dns/transport_manager.go
-@@ -8,6 +8,7 @@ import (
+@@ -2,12 +2,12 @@ package dns
+ 
+ import (
+ 	"context"
+-	"io"
+ 	"os"
+ 	"strings"
  	"sync"
  
  	"github.com/sagernet/sing-box/adapter"
@@ -1462,7 +2663,23 @@ index e822231..ce872b5 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/log"
-@@ -147,19 +148,16 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
+@@ -25,6 +25,7 @@ type TransportManager struct {
+ 	defaultTag               string
+ 	access                   sync.RWMutex
+ 	started                  bool
++	runtimeOwners            map[string]bool
+ 	stage                    adapter.StartStage
+ 	transports               []adapter.DNSTransport
+ 	transportByTag           map[string]adapter.DNSTransport
+@@ -113,6 +114,7 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
+ 					return E.Cause(err, "start dns/", transportToStart.Type(), "[", transportTag, "]")
+ 				}
+ 			}
++			m.markRuntimeOwner(transportTag)
+ 		}
+ 		if len(started) == len(transports) {
+ 			break
+@@ -147,23 +149,20 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
  func (m *TransportManager) Close() error {
  	monitor := taskmonitor.New(m.logger, C.StopTimeout)
  	m.access.Lock()
@@ -1470,6 +2687,8 @@ index e822231..ce872b5 100644
 -		m.access.Unlock()
 -		return nil
 -	}
++	runtimeOwners := m.runtimeOwners
++	m.runtimeOwners = nil
  	m.started = false
  	transports := m.transports
  	m.transports = nil
@@ -1477,14 +2696,22 @@ index e822231..ce872b5 100644
  	m.access.Unlock()
  	var err error
  	for _, transport := range transports {
- 		if closer, isCloser := transport.(io.Closer); isCloser {
- 			monitor.Start("close server/", transport.Type(), "[", transport.Tag(), "]")
+-		if closer, isCloser := transport.(io.Closer); isCloser {
+-			monitor.Start("close server/", transport.Type(), "[", transport.Tag(), "]")
 -			err = E.Append(err, closer.Close(), func(err error) error {
-+			err = E.Append(err, construction.Close("dns transport", closer.Close), func(err error) error {
- 				return E.Cause(err, "close server/", transport.Type(), "[", transport.Tag(), "]")
- 			})
- 			monitor.Finish()
-@@ -208,7 +206,6 @@ func (m *TransportManager) Remove(tag string) error {
+-				return E.Cause(err, "close server/", transport.Type(), "[", transport.Tag(), "]")
+-			})
+-			monitor.Finish()
+-		}
++		monitor.Start("close server/", transport.Type(), "[", transport.Tag(), "]")
++		err = E.Append(err, construction.Dispose("dns transport", transport, runtimeOwners[transport.Tag()]), func(err error) error {
++			return E.Cause(err, "close server/", transport.Type(), "[", transport.Tag(), "]")
++		})
++		monitor.Finish()
+ 	}
+ 	return err
+ }
+@@ -208,7 +207,6 @@ func (m *TransportManager) Remove(tag string) error {
  		panic("invalid inbound index")
  	}
  	m.transports = append(m.transports[:index], m.transports[index+1:]...)
@@ -1492,7 +2719,7 @@ index e822231..ce872b5 100644
  	if m.defaultTransport == transport {
  		if len(m.transports) > 0 {
  			nextTransport := m.transports[0]
-@@ -235,10 +232,7 @@ func (m *TransportManager) Remove(tag string) error {
+@@ -235,10 +233,9 @@ func (m *TransportManager) Remove(tag string) error {
  			})
  		}
  	}
@@ -1500,24 +2727,33 @@ index e822231..ce872b5 100644
 -		transport.Close()
 -	}
 -	return nil
-+	return construction.Close("removed transport", transport.Close)
++	runtimeOwned := m.runtimeOwners[tag]
++	delete(m.runtimeOwners, tag)
++	return construction.Dispose("removed transport", transport, runtimeOwned)
  }
  
  func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger, tag string, transportType string, options any) error {
-@@ -246,6 +240,12 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -246,6 +243,13 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  		return os.ErrInvalid
  	}
  	transport, err := m.registry.CreateDNSTransport(ctx, logger, tag, transportType, options)
 +	owned := false
++	runtimeOwned := false
 +	defer func() {
 +		if !owned && transport != nil {
-+			construction.RecordError(ctx, construction.Close("unowned transport", func() error { return common.Close(transport) }))
++			construction.DisposeOrDefer(ctx, "unowned transport", transport, runtimeOwned)
 +		}
 +	}()
  	if err != nil {
  		return err
  	}
-@@ -260,11 +260,9 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -257,14 +261,19 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+ 			if err != nil {
+ 				return E.Cause(err, stage, " dns/", transport.Type(), "[", transport.Tag(), "]")
+ 			}
++			if stage == adapter.StartStateStart {
++				runtimeOwned = true
++			}
  		}
  	}
  	if existsTransport, loaded := m.transportByTag[tag]; loaded {
@@ -1526,22 +2762,191 @@ index e822231..ce872b5 100644
 -			if err != nil {
 -				return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
 -			}
-+		err = common.Close(existsTransport)
++		err = construction.Replace(ctx, "replaced transport", existsTransport, m.runtimeOwners[tag])
++		if !m.runtimeOwners[tag] {
++			construction.RecordError(ctx, err)
++			err = nil
++		}
 +		if err != nil {
 +			return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
  		}
  		existsIndex := common.Index(m.transports, func(it adapter.DNSTransport) bool {
  			return it == existsTransport
-@@ -275,6 +273,7 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -275,7 +284,12 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  		m.transports = append(m.transports[:existsIndex], m.transports[existsIndex+1:]...)
  	}
  	m.transports = append(m.transports, transport)
 +	owned = true
  	m.transportByTag[tag] = transport
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = runtimeOwned
  	dependencies := transport.Dependencies()
  	for _, dependency := range dependencies {
+ 		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
+@@ -297,3 +311,13 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+ 	}
+ 	return nil
+ }
++
++// markRuntimeOwner records this child's successful runtime Start, never manager initialization.
++func (m *TransportManager) markRuntimeOwner(tag string) {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.runtimeOwners == nil {
++		m.runtimeOwners = make(map[string]bool)
++	}
++	m.runtimeOwners[tag] = true
++}
+diff --git a/dns/transport_manager_close_test.go b/dns/transport_manager_close_test.go
+index 3247e00..a069c99 100644
+--- a/dns/transport_manager_close_test.go
++++ b/dns/transport_manager_close_test.go
+@@ -13,14 +13,19 @@ type failingTransport struct {
+ 	err error
+ }
+ 
+-func (f failingTransport) Type() string { return "test" }
+-func (f failingTransport) Tag() string  { return "failing" }
+-func (f failingTransport) Close() error { return f.err }
++func (f failingTransport) Type() string                   { return "test" }
++func (f failingTransport) Tag() string                    { return "failing" }
++func (f failingTransport) Close() error                   { return f.err }
++func (f failingTransport) Start(adapter.StartStage) error { return nil }
++func (f failingTransport) Dependencies() []string         { return nil }
+ 
+ func TestClosePropagatesTransportFailure(t *testing.T) {
+ 	failure := errors.New("DNS transport close failed")
+ 	m := &TransportManager{logger: log.NewNOPFactory().Logger(), started: true,
+ 		transports: []adapter.DNSTransport{failingTransport{err: failure}}}
++	if err := m.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
+ 	if err := m.Close(); !errors.Is(err, failure) {
+ 		t.Fatalf("Close() = %v, want transport failure", err)
+ 	}
+diff --git a/dns/transport_manager_ownership_test.go b/dns/transport_manager_ownership_test.go
+new file mode 100644
+index 0000000..a3f5a2f
+--- /dev/null
++++ b/dns/transport_manager_ownership_test.go
+@@ -0,0 +1,113 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++// No DisposeConstruction method: ordinary Close represents an unsafe runtime effect.
++type unknownOwnerProbe struct {
++	adapter.DNSTransport
++	tag       string
++	closed    *int
++	failStart bool
++}
++
++func (p *unknownOwnerProbe) Type() string           { return "unknown-owner" }
++func (p *unknownOwnerProbe) Tag() string            { return p.tag }
++func (p *unknownOwnerProbe) Close() error           { *p.closed++; return nil }
++func (p *unknownOwnerProbe) Dependencies() []string { return nil }
++func (p *unknownOwnerProbe) Start(stage adapter.StartStage) error {
++	if stage == adapter.StartStateStart && p.failStart {
++		return errors.New("injected runtime Start failure")
++	}
++	return nil
++}
++
++func TestOnlySuccessfulChildStartAllowsRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"constructed", "initialize", "partial-start"} {
++		t.Run(mode, func(t *testing.T) {
++			logger := log.NewNOPFactory().Logger()
++			closed := []int{0, 0, 0}
++			children := []adapter.DNSTransport{
++				&unknownOwnerProbe{tag: "first", closed: &closed[0]},
++				&unknownOwnerProbe{tag: "failed", closed: &closed[1], failStart: true},
++				&unknownOwnerProbe{tag: "untouched", closed: &closed[2]},
++			}
++			m := &TransportManager{logger: logger, transports: children, transportByTag: map[string]adapter.DNSTransport{"first": children[0], "failed": children[1], "untouched": children[2]}, defaultTransport: children[0]}
++			if mode != "constructed" {
++				if err := m.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "partial-start" {
++				if err := m.Start(adapter.StartStateStart); err == nil {
++					t.Fatal("injected Start failure missing")
++				}
++			}
++			if err := m.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++				t.Fatalf("close = %v", err)
++			}
++			wantFirst := 0
++			if mode == "partial-start" {
++				wantFirst = 1
++			}
++			if closed[0] != wantFirst || closed[1] != 0 || closed[2] != 0 {
++				t.Fatalf("unsafe runtime Close counts: %v", closed)
++			}
++		})
++	}
++}
++
++func TestUnknownConstructionRemoveReplaceAndFactoryErrorNeverRuntimeClose(t *testing.T) {
++	for _, mode := range []string{"remove", "replace", "factory-error"} {
++		t.Run(mode, func(t *testing.T) {
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			logger := log.NewNOPFactory().Logger()
++			closed := 0
++			registry := NewTransportRegistry()
++			failure := errors.New("injected object plus error")
++			RegisterTransport[struct{}](registry, "unknown-owner", func(ctx context.Context, _ log.ContextLogger, tag string, _ struct{}) (adapter.DNSTransport, error) {
++				child := &unknownOwnerProbe{tag: tag, closed: &closed}
++				if mode == "factory-error" {
++					return child, failure
++				}
++				return child, nil
++			})
++			m := &TransportManager{logger: logger, registry: registry, transportByTag: make(map[string]adapter.DNSTransport)}
++			err := m.Create(ctx, logger, "same", "unknown-owner", nil)
++			if mode == "factory-error" {
++				if !errors.Is(err, failure) {
++					t.Fatal(err)
++				}
++			} else {
++				if err != nil {
++					t.Fatal(err)
++				}
++				if mode == "remove" {
++					if err = m.Remove("same"); !errors.Is(err, construction.ErrUnknownDisposal) {
++						t.Fatal(err)
++					}
++				} else {
++					if err = m.Create(ctx, logger, "same", "unknown-owner", nil); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			if mode != "remove" {
++				if err = scope.Close(); !errors.Is(err, construction.ErrUnknownDisposal) {
++					t.Fatalf("cleanup = %v", err)
++				}
++			}
++			if closed != 0 {
++				t.Fatalf("unowned object runtime-closed %d times", closed)
++			}
++		})
++	}
++}
 diff --git a/experimental/libbox/config.go b/experimental/libbox/config.go
-index 14c693e..4dca5bd 100644
+index 14c693e..08f1eda 100644
 --- a/experimental/libbox/config.go
 +++ b/experimental/libbox/config.go
 @@ -22,7 +22,6 @@ import (
@@ -1565,27 +2970,269 @@ index 14c693e..4dca5bd 100644
 -	})
 -	if err == nil {
 -		instance.Close()
-+	validationErr, cleanupErr := constructAndDisposeConfig(ctx, options)
++	validationErr, _ := constructAndDisposeConfig(ctx, options)
 +	if validationErr != nil {
 +		return validationErr
  	}
 -	return err
-+	return cleanupErr
++	return nil
  }
  
  type platformInterfaceStub struct{}
+diff --git a/experimental/libbox/config_construction_persistence_test.go b/experimental/libbox/config_construction_persistence_test.go
+new file mode 100644
+index 0000000..a378bfd
+--- /dev/null
++++ b/experimental/libbox/config_construction_persistence_test.go
+@@ -0,0 +1,148 @@
++package libbox
++
++import (
++	"bytes"
++	"context"
++	stdjson "encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service"
++)
++
++func fixtureConfig(t *testing.T, services []map[string]any) string {
++	t.Helper()
++	data, err := stdjson.Marshal(map[string]any{
++		"log":      map[string]any{"disabled": true},
++		"inbounds": []map[string]any{{"type": "shadowsocks", "tag": "managed", "method": "aes-128-gcm", "managed": true}},
++		"services": services,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(data)
++}
++
++func unchangedFile(t *testing.T, path string, before []byte) {
++	t.Helper()
++	after, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("construction changed file: %s / %v", after, err)
++	}
++}
++
++func TestRealSSMCachePreservedByLegacyTypedFailureReplacementAndCancellation(t *testing.T) {
++	for _, operation := range []string{"complete", "later-constructor-failure", "replace", "cancel"} {
++		t.Run(operation, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "cache.json")
++			before := []byte(`{"endpoints":{"/probe":{"global_uplink":123,"users":{"alice":"persist-me"}}}}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			ssm := map[string]any{"type": "ssm-api", "tag": "cache", "cache_path": path, "servers": map[string]string{"/probe": "managed"}}
++			services := []map[string]any{ssm}
++			if operation == "later-constructor-failure" {
++				services = append(services, map[string]any{"type": "ssm-api", "tag": "failure", "servers": map[string]string{"/bad": "missing-inbound"}})
++			}
++			if operation == "replace" {
++				services = append(services, ssm)
++			}
++			config := fixtureConfig(t, services)
++			if operation != "cancel" {
++				legacyErr := CheckConfig(config)
++				result := CheckConfigWithResult(config, "real-ssm-"+operation, 1000)
++				want := "Accepted"
++				if operation == "later-constructor-failure" {
++					want = "Rejected"
++				}
++				if result.validation != want || result.cleanup != "CleanupUnknown" {
++					t.Fatalf("result = %+v", result)
++				}
++				if want == "Accepted" && legacyErr != nil {
++					t.Fatalf("cleanup changed legacy acceptance: %v", legacyErr)
++				}
++				if want == "Rejected" && (legacyErr == nil || result.validationError != legacyErr.Error()) {
++					t.Fatalf("legacy rejection changed: %v / %s", legacyErr, result.validationError)
++				}
++			} else {
++				result := checkConfigWithResult(config, "real-ssm-cancel", 1000, func(ctx context.Context, options option.Options) (error, error) {
++					ctx, cancel := context.WithCancel(ctx)
++					defer cancel()
++					registry := service.FromContext[adapter.ServiceRegistry](ctx).(*boxService.Registry)
++					boxService.Register[struct{}](registry, "cancel-after-cache", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++						cancel()
++						return nil, context.Canceled
++					})
++					options.Services = append(options.Services, option.Service{Type: "cancel-after-cache", Tag: "cancel"})
++					return constructAndDisposeConfig(ctx, options)
++				})
++				if result.validation != "Rejected" || result.cleanup != "CleanupUnknown" || !strings.Contains(result.validationError, "context canceled") {
++					t.Fatalf("cancel = %+v", result)
++				}
++			}
++			unchangedFile(t, path, before)
++		})
++	}
++}
++
++func TestLegacyAcceptedConfigIgnoresIndependentCleanupUnknown(t *testing.T) {
++	config := `{"log":{"disabled":true},"inbounds":[{"type":"mixed","tag":"unstarted"}]}`
++	result := CheckConfigWithResult(config, "legacy-accepted", 1000)
++	if result.validation != "Accepted" || result.cleanup != "CleanupUnknown" || !strings.Contains(result.cleanupError, "construction disposal capability is unknown") {
++		t.Fatalf("result = %+v", result)
++	}
++	if err := CheckConfig(config); err != nil {
++		t.Fatalf("legacy acceptance changed by cleanup error: %v", err)
++	}
++}
++
++func TestOptionalRegistryTypesRemainConservativeAcrossBuildTags(t *testing.T) {
++	for _, kind := range []string{"ccm", "ocm"} {
++		t.Run(kind, func(t *testing.T) {
++			credentials := filepath.Join(t.TempDir(), "credentials.json")
++			content := `{"claudeAiOauth":{"accessToken":"isolated-test"}}`
++			if kind == "ocm" {
++				content = `{"OPENAI_API_KEY":"isolated-test"}`
++			}
++			if err := os.WriteFile(credentials, []byte(content), 0600); err != nil {
++				t.Fatal(err)
++			}
++			config := fixtureConfig(t, []map[string]any{{"type": kind, "credential_path": credentials, "detour": "unused-isolated-detour"}})
++			result := CheckConfigWithResult(config, "registry-"+kind, 1000)
++			if result.cleanup != "CleanupUnknown" {
++				t.Fatalf("optional constructor promoted cleanup: %+v", result)
++			}
++			if result.validation != "Accepted" && (result.validation != "Rejected" || !strings.Contains(result.validationError, "not included in this build")) {
++				t.Fatalf("unexpected registry result: %+v", result)
++			}
++		})
++	}
++}
++
++func TestUnstartedTUNValidationCannotDeleteOtherInstanceRules(t *testing.T) {
++	dir := t.TempDir()
++	trace := filepath.Join(dir, "unexpected-command")
++	// Any cleanup command would be captured, never sent to the system firewall.
++	if err := os.WriteFile(filepath.Join(dir, "iptables"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$POLARIS_TUN_TRACE\"\n"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", dir)
++	t.Setenv("POLARIS_TUN_TRACE", trace)
++	config := `{"log":{"disabled":true},"inbounds":[{"type":"tun","tag":"validation-B","address":["172.19.0.1/30"],"auto_route":true,"auto_redirect":true}]}`
++	result := CheckConfigWithResult(config, "unstarted-tun-B", 1000)
++	if result.validation != "Accepted" || result.cleanup != "CleanupUnknown" {
++		t.Fatalf("result = %+v", result)
++	}
++	if err := CheckConfig(config); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(trace); !os.IsNotExist(err) {
++		t.Fatalf("unstarted TUN touched another instance's firewall: %v", err)
++	}
++}
+diff --git a/experimental/libbox/config_optional_persistence_test.go b/experimental/libbox/config_optional_persistence_test.go
+new file mode 100644
+index 0000000..d102d66
+--- /dev/null
++++ b/experimental/libbox/config_optional_persistence_test.go
+@@ -0,0 +1,81 @@
++//go:build with_ccm && with_ocm
++
++package libbox
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service"
++)
++
++func TestOptionalRealServicesPreserveUsageAcrossConstructionPaths(t *testing.T) {
++	for _, kind := range []string{"ccm", "ocm"} {
++		for _, operation := range []string{"complete", "replace", "later-constructor-failure", "cancel"} {
++			t.Run(kind+"/"+operation, func(t *testing.T) {
++				path := filepath.Join(t.TempDir(), "usage.json")
++				before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++				if err := os.WriteFile(path, before, 0600); err != nil {
++					t.Fatal(err)
++				}
++				credentials := filepath.Join(t.TempDir(), "credentials.json")
++				content := `{"claudeAiOauth":{"accessToken":"isolated-test"}}`
++				if kind == "ocm" {
++					content = `{"OPENAI_API_KEY":"isolated-test"}`
++				}
++				if err := os.WriteFile(credentials, []byte(content), 0600); err != nil {
++					t.Fatal(err)
++				}
++				settings := map[string]any{"type": kind, "tag": "usage", "credential_path": credentials, "usages_path": path, "detour": "unused-isolated-detour"}
++				services := []map[string]any{settings}
++				if operation == "replace" {
++					services = append(services, settings)
++				}
++				if operation == "later-constructor-failure" {
++					services = append(services, map[string]any{"type": "ssm-api", "tag": "failure", "servers": map[string]string{"/bad": "missing"}})
++				}
++				config := fixtureConfig(t, services)
++				if operation == "cancel" {
++					result := checkConfigWithResult(config, kind+"-cancel", 1000, func(ctx context.Context, options option.Options) (error, error) {
++						ctx, cancel := context.WithCancel(ctx)
++						defer cancel()
++						registry := service.FromContext[adapter.ServiceRegistry](ctx).(*boxService.Registry)
++						boxService.Register[struct{}](registry, "cancel-after-usage", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++							cancel()
++							return nil, context.Canceled
++						})
++						options.Services = append(options.Services, option.Service{Type: "cancel-after-usage", Tag: "cancel"})
++						return constructAndDisposeConfig(ctx, options)
++					})
++					if result.validation != "Rejected" || result.cleanup != "CleanupUnknown" || !strings.Contains(result.validationError, "context canceled") {
++						t.Fatalf("cancel = %+v", result)
++					}
++				} else {
++					legacy := CheckConfig(config)
++					result := CheckConfigWithResult(config, kind+"-"+operation, 1000)
++					want := "Accepted"
++					if operation == "later-constructor-failure" {
++						want = "Rejected"
++					}
++					if result.validation != want || result.cleanup != "CleanupUnknown" {
++						t.Fatalf("result = %+v", result)
++					}
++					if want == "Accepted" && legacy != nil {
++						t.Fatal(legacy)
++					}
++					if want == "Rejected" && (legacy == nil || legacy.Error() != result.validationError) {
++						t.Fatalf("rejection changed: %v / %s", legacy, result.validationError)
++					}
++				}
++				unchangedFile(t, path, before)
++			})
++		}
++	}
++}
 diff --git a/experimental/libbox/config_validation.go b/experimental/libbox/config_validation.go
 new file mode 100644
-index 0000000..3f8c4a7
+index 0000000..4586db0
 --- /dev/null
 +++ b/experimental/libbox/config_validation.go
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,128 @@
 +package libbox
 +
 +import (
 +	"context"
 +	"crypto/sha256"
 +	"encoding/hex"
++	"errors"
 +	"fmt"
 +	"time"
 +
@@ -1705,7 +3352,7 @@ index 0000000..3f8c4a7
 +	if validationErr != nil {
 +		return validationErr, report.CleanupError
 +	}
-+	return nil, instance.CloseWithResult()
++	return nil, errors.Join(report.CleanupError, instance.CloseWithResult())
 +}
 diff --git a/experimental/libbox/config_validation_test.go b/experimental/libbox/config_validation_test.go
 new file mode 100644
@@ -1823,7 +3470,7 @@ index 0000000..29dad87
 +	}
 +}
 diff --git a/log/log.go b/log/log.go
-index 3a1c653..e3fab51 100644
+index 3a1c653..07f9558 100644
 --- a/log/log.go
 +++ b/log/log.go
 @@ -6,6 +6,7 @@ import (
@@ -1838,12 +3485,12 @@ index 3a1c653..e3fab51 100644
  	if logOptions.Level != "" {
  		logLevel, err := ParseLevel(logOptions.Level)
  		if err != nil {
-+			construction.RecordError(options.Context, construction.Close("partial log factory", factory.Close))
++			construction.DeferCleanup(options.Context, "partial log factory", factory.Close)
  			return nil, E.Cause(err, "parse log level")
  		}
  		factory.SetLevel(logLevel)
 diff --git a/route/network.go b/route/network.go
-index 0eccd25..dc1f37d 100644
+index 0eccd25..9cdd13a 100644
 --- a/route/network.go
 +++ b/route/network.go
 @@ -13,6 +13,7 @@ import (
@@ -1861,7 +3508,7 @@ index 0eccd25..dc1f37d 100644
 +	owned := false
 +	defer func() {
 +		if !owned {
-+			construction.RecordError(ctx, construction.Close("partial network manager", nm.Close))
++			construction.DeferCleanup(ctx, "partial network manager", nm.Close)
 +		}
 +	}()
  	if options.DefaultNetworkStrategy != nil {
@@ -1875,3 +3522,993 @@ index 0eccd25..dc1f37d 100644
  	return nm, nil
  }
  
+diff --git a/service/ccm/construction_disposal_test.go b/service/ccm/construction_disposal_test.go
+new file mode 100644
+index 0000000..d9eeb19
+--- /dev/null
++++ b/service/ccm/construction_disposal_test.go
+@@ -0,0 +1,182 @@
++package ccm
++
++import (
++	"bytes"
++	"context"
++	"github.com/sagernet/sing-box/adapter"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++type unusedOutboundManager struct{ adapter.OutboundManager }
++
++func usageTestService(t *testing.T, path string, ports ...uint16) *Service {
++	var port uint16
++	if len(ports) > 0 {
++		port = ports[0]
++	}
++	t.Helper()
++	credentials := filepath.Join(t.TempDir(), "credentials.json")
++	if err := os.WriteFile(credentials, []byte(`{"claudeAiOauth":{"accessToken":"isolated-test"}}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	instance, err := NewService(service.ContextWith[adapter.OutboundManager](context.Background(), &unusedOutboundManager{}), log.NewNOPFactory().Logger(), "probe", option.CCMServiceOptions{ListenOptions: option.ListenOptions{ListenPort: port}, CredentialPath: credentials, UsagesPath: path, Detour: "unused-isolated-detour"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return instance.(*Service)
++}
++
++func TestConstructionDisposalPreservesUsageFile(t *testing.T) {
++	for _, operation := range []string{"close", "dispose", "initialize"} {
++		t.Run(operation, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "usage.json")
++			before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			s := usageTestService(t, path)
++			if operation == "initialize" {
++				if err := s.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			var err error
++			if operation == "dispose" {
++				err = s.DisposeConstruction()
++			} else {
++				err = s.Close()
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(before, after) {
++				t.Fatalf("construction overwrote usage: %s / %v", after, err)
++			}
++		})
++	}
++}
++
++func TestStartedServicePersistsLoadedUsage(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "usage.json")
++	if err := os.WriteFile(path, []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := usageTestService(t, path)
++	if err := s.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	s.usageTracker.mutex.Lock()
++	s.usageTracker.Combinations[0].Total.InputTokens = 42
++	s.usageTracker.mutex.Unlock()
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Contains(after, []byte(`"input_tokens": 42`)) {
++		t.Fatalf("started service failed to persist loaded usage: %s", after)
++	}
++	if err = s.usageTracker.Save(); err != nil {
++		t.Fatal(err)
++	}
++	final, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(final, after) {
++		t.Fatal("late save persisted after shutdown")
++	}
++}
++
++func TestLoadFailureDoesNotReplaceUsageFile(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "usage.json")
++	before := []byte(`malformed existing usage`)
++	if err := os.WriteFile(path, before, 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := usageTestService(t, path)
++	if err := s.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("load failure overwrote usage: %s / %v", after, err)
++	}
++}
++
++func TestListenerStartFailureCannotPersistLoadedUsage(t *testing.T) {
++	blocker, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer blocker.Close()
++	path := filepath.Join(t.TempDir(), "usage.json")
++	before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++	if err = os.WriteFile(path, before, 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := usageTestService(t, path, uint16(blocker.Addr().(*net.TCPAddr).Port))
++	if err = s.Start(adapter.StartStateStart); err == nil {
++		t.Fatal("injected listener failure missing")
++	}
++	if err = s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("failed Start overwrote usage: %s / %v", after, err)
++	}
++}
++
++func TestRealConstructionRemoveAndReplacementCannotPersist(t *testing.T) {
++	for _, operation := range []string{"remove", "replace"} {
++		t.Run(operation, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "state.json")
++			before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			registry := boxService.NewRegistry()
++			boxService.Register[struct{}](registry, "real-service", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++				return usageTestService(t, path), nil
++			})
++			logger := log.NewNOPFactory().Logger()
++			manager := boxService.NewManager(logger, registry)
++			if err := manager.Create(ctx, logger, "same", "real-service", nil); err != nil {
++				t.Fatal(err)
++			}
++			if operation == "remove" {
++				if err := manager.Remove("same"); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				if err := manager.Create(ctx, logger, "same", "real-service", nil); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if err := manager.Close(); err != nil {
++				t.Fatal(err)
++			}
++			if err := scope.DisposePending(); err != nil {
++				t.Fatal(err)
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(before, after) {
++				t.Fatalf("manager construction disposal overwrote state: %s / %v", after, err)
++			}
++		})
++	}
++}
+diff --git a/service/ccm/service.go b/service/ccm/service.go
+index a211a3e..8c3ecbc 100644
+--- a/service/ccm/service.go
++++ b/service/ccm/service.go
+@@ -17,6 +17,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/dialer"
+ 	"github.com/sagernet/sing-box/common/listener"
+ 	"github.com/sagernet/sing-box/common/tls"
+@@ -186,6 +187,12 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
+ 		usageTracker: usageTracker,
+ 	}
+ 
++	owned := false
++	defer func() {
++		if !owned {
++			construction.DeferCleanup(ctx, "partial usage service", service.DisposeConstruction)
++		}
++	}()
+ 	if options.TLS != nil {
+ 		tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
+ 		if err != nil {
+@@ -194,6 +201,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
+ 		service.tlsConfig = tlsConfig
+ 	}
+ 
++	owned = true
+ 	return service, nil
+ }
+ 
+@@ -210,8 +218,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
+ 	}
+ 	s.credentials = credentials
+ 
++	usageLoaded := false
+ 	if s.usageTracker != nil {
+ 		err = s.usageTracker.Load()
++		usageLoaded = err == nil
+ 		if err != nil {
+ 			s.logger.Warn("load usage statistics: ", err)
+ 		}
+@@ -241,6 +251,9 @@ func (s *Service) Start(stage adapter.StartStage) error {
+ 		tcpListener = aTLS.NewListener(tcpListener, s.tlsConfig)
+ 	}
+ 
++	if s.usageTracker != nil {
++		s.usageTracker.persistenceReady.Store(usageLoaded)
++	}
+ 	go func() {
+ 		serveErr := s.httpServer.Serve(tcpListener)
+ 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+@@ -579,7 +592,11 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
+ 	}
+ }
+ 
+-func (s *Service) Close() error {
++func (s *Service) DisposeConstruction() error { return s.close(false) }
++
++func (s *Service) Close() error { return s.close(true) }
++
++func (s *Service) close(persist bool) error {
+ 	err := common.Close(
+ 		common.PtrOrNil(s.httpServer),
+ 		common.PtrOrNil(s.listener),
+@@ -587,13 +604,15 @@ func (s *Service) Close() error {
+ 	)
+ 
+ 	if s.usageTracker != nil {
+-		s.usageTracker.cancelPendingSave()
+-		saveErr := s.usageTracker.Save()
++		saveErr := s.usageTracker.closePersistence(persist)
+ 		if saveErr != nil {
+ 			s.logger.Error("save usage statistics: ", saveErr)
+ 		}
+ 	}
+ 
++	if s.httpClient != nil {
++		s.httpClient.CloseIdleConnections()
++	}
+ 	return err
+ }
+ 
+diff --git a/service/ccm/service_usage.go b/service/ccm/service_usage.go
+index a6d285c..dd16fd0 100644
+--- a/service/ccm/service_usage.go
++++ b/service/ccm/service_usage.go
+@@ -8,6 +8,7 @@ import (
+ 	"os"
+ 	"regexp"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/log"
+@@ -35,16 +36,18 @@ type CostCombination struct {
+ }
+ 
+ type AggregatedUsage struct {
+-	LastUpdated  time.Time         `json:"last_updated"`
+-	Combinations []CostCombination `json:"combinations"`
+-	mutex        sync.Mutex
+-	ctx          context.Context
+-	filePath     string
+-	logger       log.ContextLogger
+-	lastSaveTime time.Time
+-	pendingSave  bool
+-	saveTimer    *time.Timer
+-	saveMutex    sync.Mutex
++	LastUpdated      time.Time         `json:"last_updated"`
++	Combinations     []CostCombination `json:"combinations"`
++	mutex            sync.Mutex
++	ctx              context.Context
++	filePath         string
++	logger           log.ContextLogger
++	persistenceReady atomic.Bool
++	saveAccess       sync.Mutex
++	lastSaveTime     time.Time
++	pendingSave      bool
++	saveTimer        *time.Timer
++	saveMutex        sync.Mutex
+ }
+ 
+ type UsageStatsJSON struct {
+@@ -596,6 +599,26 @@ func (u *AggregatedUsage) Load() error {
+ }
+ 
+ func (u *AggregatedUsage) Save() error {
++	u.saveAccess.Lock()
++	defer u.saveAccess.Unlock()
++	if !u.persistenceReady.Load() {
++		return nil
++	}
++	return u.save()
++}
++
++func (u *AggregatedUsage) closePersistence(persist bool) error {
++	u.cancelPendingSave()
++	u.saveAccess.Lock()
++	defer u.saveAccess.Unlock()
++	defer u.persistenceReady.Store(false)
++	if persist && u.persistenceReady.Load() {
++		return u.save()
++	}
++	return nil
++}
++
++func (u *AggregatedUsage) save() error {
+ 	jsonData := u.ToJSON()
+ 
+ 	data, err := json.MarshalIndent(jsonData, "", "  ")
+@@ -661,6 +684,9 @@ func (u *AggregatedUsage) AddUsageWithCycleHint(
+ }
+ 
+ func (u *AggregatedUsage) scheduleSave() {
++	if !u.persistenceReady.Load() {
++		return
++	}
+ 	const saveInterval = time.Minute
+ 
+ 	u.saveMutex.Lock()
+diff --git a/service/ocm/construction_disposal_test.go b/service/ocm/construction_disposal_test.go
+new file mode 100644
+index 0000000..a2978f7
+--- /dev/null
++++ b/service/ocm/construction_disposal_test.go
+@@ -0,0 +1,182 @@
++package ocm
++
++import (
++	"bytes"
++	"context"
++	"github.com/sagernet/sing-box/adapter"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++type unusedOutboundManager struct{ adapter.OutboundManager }
++
++func usageTestService(t *testing.T, path string, ports ...uint16) *Service {
++	var port uint16
++	if len(ports) > 0 {
++		port = ports[0]
++	}
++	t.Helper()
++	credentials := filepath.Join(t.TempDir(), "credentials.json")
++	if err := os.WriteFile(credentials, []byte(`{"OPENAI_API_KEY":"isolated-test"}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	instance, err := NewService(service.ContextWith[adapter.OutboundManager](context.Background(), &unusedOutboundManager{}), log.NewNOPFactory().Logger(), "probe", option.OCMServiceOptions{ListenOptions: option.ListenOptions{ListenPort: port}, CredentialPath: credentials, UsagesPath: path, Detour: "unused-isolated-detour"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return instance.(*Service)
++}
++
++func TestConstructionDisposalPreservesUsageFile(t *testing.T) {
++	for _, operation := range []string{"close", "dispose", "initialize"} {
++		t.Run(operation, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "usage.json")
++			before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			s := usageTestService(t, path)
++			if operation == "initialize" {
++				if err := s.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			var err error
++			if operation == "dispose" {
++				err = s.DisposeConstruction()
++			} else {
++				err = s.Close()
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(before, after) {
++				t.Fatalf("construction overwrote usage: %s / %v", after, err)
++			}
++		})
++	}
++}
++
++func TestStartedServicePersistsLoadedUsage(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "usage.json")
++	if err := os.WriteFile(path, []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := usageTestService(t, path)
++	if err := s.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	s.usageTracker.mutex.Lock()
++	s.usageTracker.Combinations[0].Total.InputTokens = 42
++	s.usageTracker.mutex.Unlock()
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Contains(after, []byte(`"input_tokens": 42`)) {
++		t.Fatalf("started service failed to persist loaded usage: %s", after)
++	}
++	if err = s.usageTracker.Save(); err != nil {
++		t.Fatal(err)
++	}
++	final, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(final, after) {
++		t.Fatal("late save persisted after shutdown")
++	}
++}
++
++func TestLoadFailureDoesNotReplaceUsageFile(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "usage.json")
++	before := []byte(`malformed existing usage`)
++	if err := os.WriteFile(path, before, 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := usageTestService(t, path)
++	if err := s.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("load failure overwrote usage: %s / %v", after, err)
++	}
++}
++
++func TestListenerStartFailureCannotPersistLoadedUsage(t *testing.T) {
++	blocker, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer blocker.Close()
++	path := filepath.Join(t.TempDir(), "usage.json")
++	before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++	if err = os.WriteFile(path, before, 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := usageTestService(t, path, uint16(blocker.Addr().(*net.TCPAddr).Port))
++	if err = s.Start(adapter.StartStateStart); err == nil {
++		t.Fatal("injected listener failure missing")
++	}
++	if err = s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("failed Start overwrote usage: %s / %v", after, err)
++	}
++}
++
++func TestRealConstructionRemoveAndReplacementCannotPersist(t *testing.T) {
++	for _, operation := range []string{"remove", "replace"} {
++		t.Run(operation, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "state.json")
++			before := []byte(`{"last_updated":"2026-09-30T00:00:00Z","combinations":[{"model":"probe","total":{"input_tokens":41},"by_user":{}}]}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			registry := boxService.NewRegistry()
++			boxService.Register[struct{}](registry, "real-service", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++				return usageTestService(t, path), nil
++			})
++			logger := log.NewNOPFactory().Logger()
++			manager := boxService.NewManager(logger, registry)
++			if err := manager.Create(ctx, logger, "same", "real-service", nil); err != nil {
++				t.Fatal(err)
++			}
++			if operation == "remove" {
++				if err := manager.Remove("same"); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				if err := manager.Create(ctx, logger, "same", "real-service", nil); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if err := manager.Close(); err != nil {
++				t.Fatal(err)
++			}
++			if err := scope.DisposePending(); err != nil {
++				t.Fatal(err)
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(before, after) {
++				t.Fatalf("manager construction disposal overwrote state: %s / %v", after, err)
++			}
++		})
++	}
++}
+diff --git a/service/ocm/service.go b/service/ocm/service.go
+index 5b213e2..f2c0bfc 100644
+--- a/service/ocm/service.go
++++ b/service/ocm/service.go
+@@ -17,6 +17,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/dialer"
+ 	"github.com/sagernet/sing-box/common/listener"
+ 	"github.com/sagernet/sing-box/common/tls"
+@@ -207,6 +208,12 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
+ 		webSocketConns: make(map[*webSocketSession]struct{}),
+ 	}
+ 
++	owned := false
++	defer func() {
++		if !owned {
++			construction.DeferCleanup(ctx, "partial usage service", service.DisposeConstruction)
++		}
++	}()
+ 	if options.TLS != nil {
+ 		tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
+ 		if err != nil {
+@@ -215,6 +222,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
+ 		service.tlsConfig = tlsConfig
+ 	}
+ 
++	owned = true
+ 	return service, nil
+ }
+ 
+@@ -231,8 +239,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
+ 	}
+ 	s.credentials = credentials
+ 
++	usageLoaded := false
+ 	if s.usageTracker != nil {
+ 		err = s.usageTracker.Load()
++		usageLoaded = err == nil
+ 		if err != nil {
+ 			s.logger.Warn("load usage statistics: ", err)
+ 		}
+@@ -262,6 +272,9 @@ func (s *Service) Start(stage adapter.StartStage) error {
+ 		tcpListener = aTLS.NewListener(tcpListener, s.tlsConfig)
+ 	}
+ 
++	if s.usageTracker != nil {
++		s.usageTracker.persistenceReady.Store(usageLoaded)
++	}
+ 	go func() {
+ 		serveErr := s.httpServer.Serve(tcpListener)
+ 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+@@ -640,7 +653,11 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
+ 	}
+ }
+ 
+-func (s *Service) Close() error {
++func (s *Service) DisposeConstruction() error { return s.close(false) }
++
++func (s *Service) Close() error { return s.close(true) }
++
++func (s *Service) close(persist bool) error {
+ 	webSocketSessions := s.startWebSocketShutdown()
+ 
+ 	err := common.Close(
+@@ -654,13 +671,15 @@ func (s *Service) Close() error {
+ 	s.webSocketGroup.Wait()
+ 
+ 	if s.usageTracker != nil {
+-		s.usageTracker.cancelPendingSave()
+-		saveErr := s.usageTracker.Save()
++		saveErr := s.usageTracker.closePersistence(persist)
+ 		if saveErr != nil {
+ 			s.logger.Error("save usage statistics: ", saveErr)
+ 		}
+ 	}
+ 
++	if s.httpClient != nil {
++		s.httpClient.CloseIdleConnections()
++	}
+ 	return err
+ }
+ 
+diff --git a/service/ocm/service_usage.go b/service/ocm/service_usage.go
+index d16f3f4..36ef6ea 100644
+--- a/service/ocm/service_usage.go
++++ b/service/ocm/service_usage.go
+@@ -9,6 +9,7 @@ import (
+ 	"regexp"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/log"
+@@ -55,16 +56,18 @@ type CostCombination struct {
+ }
+ 
+ type AggregatedUsage struct {
+-	LastUpdated  time.Time         `json:"last_updated"`
+-	Combinations []CostCombination `json:"combinations"`
+-	mutex        sync.Mutex
+-	ctx          context.Context
+-	filePath     string
+-	logger       log.ContextLogger
+-	lastSaveTime time.Time
+-	pendingSave  bool
+-	saveTimer    *time.Timer
+-	saveMutex    sync.Mutex
++	LastUpdated      time.Time         `json:"last_updated"`
++	Combinations     []CostCombination `json:"combinations"`
++	mutex            sync.Mutex
++	ctx              context.Context
++	filePath         string
++	logger           log.ContextLogger
++	persistenceReady atomic.Bool
++	saveAccess       sync.Mutex
++	lastSaveTime     time.Time
++	pendingSave      bool
++	saveTimer        *time.Timer
++	saveMutex        sync.Mutex
+ }
+ 
+ type UsageStatsJSON struct {
+@@ -1101,6 +1104,26 @@ func (u *AggregatedUsage) Load() error {
+ }
+ 
+ func (u *AggregatedUsage) Save() error {
++	u.saveAccess.Lock()
++	defer u.saveAccess.Unlock()
++	if !u.persistenceReady.Load() {
++		return nil
++	}
++	return u.save()
++}
++
++func (u *AggregatedUsage) closePersistence(persist bool) error {
++	u.cancelPendingSave()
++	u.saveAccess.Lock()
++	defer u.saveAccess.Unlock()
++	defer u.persistenceReady.Store(false)
++	if persist && u.persistenceReady.Load() {
++		return u.save()
++	}
++	return nil
++}
++
++func (u *AggregatedUsage) save() error {
+ 	jsonData := u.ToJSON()
+ 
+ 	data, err := json.MarshalIndent(jsonData, "", "  ")
+@@ -1154,6 +1177,9 @@ func (u *AggregatedUsage) AddUsageWithCycleHint(model string, contextWindow int,
+ }
+ 
+ func (u *AggregatedUsage) scheduleSave() {
++	if !u.persistenceReady.Load() {
++		return
++	}
+ 	const saveInterval = time.Minute
+ 
+ 	u.saveMutex.Lock()
+diff --git a/service/ssmapi/cache.go b/service/ssmapi/cache.go
+index 38552f1..18f092f 100644
+--- a/service/ssmapi/cache.go
++++ b/service/ssmapi/cache.go
+@@ -56,6 +56,9 @@ func (s *Service) loadCache() error {
+ }
+ 
+ func (s *Service) saveCache() error {
++	if !s.cacheLoaded.Load() || !s.running.Load() {
++		return nil
++	}
+ 	if s.cachePath == "" {
+ 		return nil
+ 	}
+diff --git a/service/ssmapi/construction_disposal_test.go b/service/ssmapi/construction_disposal_test.go
+new file mode 100644
+index 0000000..80d09a3
+--- /dev/null
++++ b/service/ssmapi/construction_disposal_test.go
+@@ -0,0 +1,158 @@
++package ssmapi
++
++import (
++	"bytes"
++	"context"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badjson"
++	"github.com/sagernet/sing/service"
++)
++
++type cacheTestInbound struct{ adapter.ManagedSSMServer }
++
++func (*cacheTestInbound) SetTracker(adapter.SSMTracker)        {}
++func (*cacheTestInbound) UpdateUsers([]string, []string) error { return nil }
++
++type cacheTestManager struct{ adapter.InboundManager }
++
++func (*cacheTestManager) Get(string) (adapter.Inbound, bool) { return &cacheTestInbound{}, true }
++
++func cacheTestService(t *testing.T, path string, port uint16) *Service {
++	t.Helper()
++	ctx := service.ContextWith[adapter.InboundManager](context.Background(), &cacheTestManager{})
++	servers := new(badjson.TypedMap[string, string])
++	servers.Put("/probe", "managed")
++	instance, err := NewService(ctx, log.NewNOPFactory().Logger(), "probe", option.SSMAPIServiceOptions{ListenOptions: option.ListenOptions{ListenPort: port}, Servers: servers, CachePath: path})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return instance.(*Service)
++}
++
++func TestConstructionDisposalPreservesExistingCache(t *testing.T) {
++	for _, operation := range []string{"close", "dispose", "initialize"} {
++		t.Run(operation, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "cache.json")
++			before := []byte(`{"endpoints":{"/probe":{"global_uplink":123,"users":{"alice":"persist-me"}}}}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			s := cacheTestService(t, path, 0)
++			if operation == "initialize" {
++				if err := s.Start(adapter.StartStateInitialize); err != nil {
++					t.Fatal(err)
++				}
++			}
++			var err error
++			if operation == "dispose" {
++				err = s.DisposeConstruction()
++			} else {
++				err = s.Close()
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(before, after) {
++				t.Fatalf("construction overwrote cache: %s / %v", after, err)
++			}
++		})
++	}
++}
++
++func TestStartedServicePersistsLoadedTraffic(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "cache.json")
++	if err := os.WriteFile(path, []byte(`{"endpoints":{"/probe":{"global_uplink":123}}}`), 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := cacheTestService(t, path, 0)
++	if err := s.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	s.traffics["/probe"].globalUplink.Add(5)
++	if err := s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Contains(after, []byte(`"global_uplink": 128`)) {
++		t.Fatalf("started service failed to persist loaded traffic: %s", after)
++	}
++}
++
++func TestFailedStartCannotPersistLoadedCache(t *testing.T) {
++	blocker, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer blocker.Close()
++	path := filepath.Join(t.TempDir(), "cache.json")
++	before := []byte(`{"endpoints":{"/probe":{"global_uplink":123}}}`)
++	if err = os.WriteFile(path, before, 0600); err != nil {
++		t.Fatal(err)
++	}
++	s := cacheTestService(t, path, uint16(blocker.Addr().(*net.TCPAddr).Port))
++	if err = s.Start(adapter.StartStateStart); err == nil {
++		t.Fatal("injected listener failure missing")
++	}
++	if err = s.Close(); err != nil {
++		t.Fatal(err)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(before, after) {
++		t.Fatalf("failed Start overwrote cache: %s / %v", after, err)
++	}
++}
++
++func TestRealConstructionRemoveAndReplacementCannotPersist(t *testing.T) {
++	for _, operation := range []string{"remove", "replace"} {
++		t.Run(operation, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "state.json")
++			before := []byte(`{"endpoints":{"/probe":{"global_uplink":123,"users":{"alice":"persist-me"}}}}`)
++			if err := os.WriteFile(path, before, 0600); err != nil {
++				t.Fatal(err)
++			}
++			var scope construction.Scope
++			ctx := construction.WithScope(context.Background(), &scope)
++			registry := boxService.NewRegistry()
++			boxService.Register[struct{}](registry, "real-service", func(context.Context, log.ContextLogger, string, struct{}) (adapter.Service, error) {
++				return cacheTestService(t, path, 0), nil
++			})
++			logger := log.NewNOPFactory().Logger()
++			manager := boxService.NewManager(logger, registry)
++			if err := manager.Create(ctx, logger, "same", "real-service", nil); err != nil {
++				t.Fatal(err)
++			}
++			if operation == "remove" {
++				if err := manager.Remove("same"); err != nil {
++					t.Fatal(err)
++				}
++			} else {
++				if err := manager.Create(ctx, logger, "same", "real-service", nil); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if err := manager.Close(); err != nil {
++				t.Fatal(err)
++			}
++			if err := scope.DisposePending(); err != nil {
++				t.Fatal(err)
++			}
++			after, err := os.ReadFile(path)
++			if err != nil || !bytes.Equal(before, after) {
++				t.Fatalf("manager construction disposal overwrote state: %s / %v", after, err)
++			}
++		})
++	}
++}
+diff --git a/service/ssmapi/server.go b/service/ssmapi/server.go
+index 157ea15..c90a2a0 100644
+--- a/service/ssmapi/server.go
++++ b/service/ssmapi/server.go
+@@ -5,10 +5,12 @@ import (
+ 	"errors"
+ 	"net/http"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	boxService "github.com/sagernet/sing-box/adapter/service"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/listener"
+ 	"github.com/sagernet/sing-box/common/tls"
+ 	C "github.com/sagernet/sing-box/constant"
+@@ -42,6 +44,9 @@ type Service struct {
+ 	saveTicker     *time.Ticker
+ 	lastSavedCache []byte
+ 	cacheMutex     sync.Mutex
++	cacheLoaded    atomic.Bool
++	running        atomic.Bool
++	background     sync.WaitGroup
+ }
+ 
+ func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.SSMAPIServiceOptions) (adapter.Service, error) {
+@@ -65,6 +70,12 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
+ 		users:     make(map[string]*UserManager),
+ 		cachePath: options.CachePath,
+ 	}
++	owned := false
++	defer func() {
++		if !owned {
++			construction.DeferCleanup(ctx, "partial SSM service", s.DisposeConstruction)
++		}
++	}()
+ 	inboundManager := service.FromContext[adapter.InboundManager](ctx)
+ 	if options.Servers.Size() == 0 {
+ 		return nil, E.New("missing servers")
+@@ -92,6 +103,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
+ 		}
+ 		s.tlsConfig = tlsConfig
+ 	}
++	owned = true
+ 	return s, nil
+ }
+ 
+@@ -103,8 +115,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
+ 	if err != nil {
+ 		s.logger.Error(E.Cause(err, "load cache"))
+ 	}
+-	s.saveTicker = time.NewTicker(1 * time.Minute)
+-	go s.loopSaveCache()
++	s.cacheLoaded.Store(err == nil)
+ 	if s.tlsConfig != nil {
+ 		err = s.tlsConfig.Start()
+ 		if err != nil {
+@@ -121,8 +132,16 @@ func (s *Service) Start(stage adapter.StartStage) error {
+ 		}
+ 		tcpListener = aTLS.NewListener(tcpListener, s.tlsConfig)
+ 	}
++	s.running.Store(true)
++	if s.cacheLoaded.Load() {
++		s.saveTicker = time.NewTicker(time.Minute)
++		s.background.Add(1)
++		go func() { defer s.background.Done(); s.loopSaveCache() }()
++	}
++	s.background.Add(1)
+ 	go func() {
+-		err = s.httpServer.Serve(tcpListener)
++		defer s.background.Done()
++		err := s.httpServer.Serve(tcpListener)
+ 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+ 			s.logger.Error("serve error: ", err)
+ 		}
+@@ -144,20 +163,24 @@ func (s *Service) loopSaveCache() {
+ 	}
+ }
+ 
+-func (s *Service) Close() error {
++func (s *Service) DisposeConstruction() error { return s.close(false) }
++
++func (s *Service) Close() error { return s.close(true) }
++
++func (s *Service) close(persist bool) error {
+ 	if s.cancel != nil {
+ 		s.cancel()
+ 	}
+ 	if s.saveTicker != nil {
+ 		s.saveTicker.Stop()
+ 	}
+-	err := s.saveCache()
+-	if err != nil {
+-		s.logger.Error(E.Cause(err, "save cache"))
++	closeErr := common.Close(common.PtrOrNil(s.httpServer), common.PtrOrNil(s.listener), s.tlsConfig)
++	s.background.Wait()
++	if persist && s.cacheLoaded.Load() && s.running.Load() {
++		if err := s.saveCache(); err != nil {
++			s.logger.Error(E.Cause(err, "save cache"))
++		}
+ 	}
+-	return common.Close(
+-		common.PtrOrNil(s.httpServer),
+-		common.PtrOrNil(s.listener),
+-		s.tlsConfig,
+-	)
++	s.running.Store(false)
++	return closeErr
+ }

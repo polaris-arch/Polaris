@@ -112,13 +112,27 @@ def main():
         run([str(go), 'test', '-race', '-ldflags=-checklinkname=0', '-count=1', '.', './daemon',
              './adapter/endpoint', './adapter/inbound', './adapter/outbound',
              './adapter/service', './adapter/certificate', './common/construction',
-             './common/certificate', './log', './route', './dns', './service/api'], cwd=checkout, env=env)
+             './common/certificate', './log', './route', './dns', './service/api',
+             './service/ssmapi', './service/ccm', './service/ocm'], cwd=checkout, env=env)
         run([str(go), 'test', '-race', '-count=1', './experimental/clashmode'], cwd=checkout, env=env)
         files = run([str(go), 'list', '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
         run([str(go), 'test', '-race', '-ldflags=-checklinkname=0', '-count=1', *files,
              str(checkout / 'experimental/libbox/command_server_transient_test.go'),
              str(checkout / 'experimental/libbox/interface_binding_test.go'),
-             str(checkout / 'experimental/libbox/config_validation_test.go')], cwd=checkout, env=env)
+             str(checkout / 'experimental/libbox/config_validation_test.go'),
+             str(checkout / 'experimental/libbox/config_construction_persistence_test.go')], cwd=checkout, env=env)
+        # Optional registry services must preserve existing usage files with
+        # either tag independently and with both real implementations present.
+        for tags in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
+            tagged_files = run([str(go), 'list', '-tags', tags, '-f',
+                                '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}',
+                                './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
+            tagged_tests = [str(checkout / 'experimental/libbox/config_validation_test.go'),
+                            str(checkout / 'experimental/libbox/config_construction_persistence_test.go')]
+            if tags == 'with_ccm,with_ocm':
+                tagged_tests.append(str(checkout / 'experimental/libbox/config_optional_persistence_test.go'))
+            run([str(go), 'test', '-tags', tags, '-race', '-ldflags=-checklinkname=0',
+                 '-count=1', *tagged_files, *tagged_tests], cwd=checkout, env=env)
         run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', './common/dialer'], cwd=checkout, env=env)
         linker_flags = (f'-X github.com/sagernet/sing-box/constant.Version={version} '
                         '-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 '
