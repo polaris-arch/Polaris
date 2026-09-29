@@ -388,21 +388,21 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      */
     @Command
     fun stop(invoke: Invoke) {
+        // Record the user's disconnect against the current native owner before
+        // bridge admission. Retired SystemStart may settle its bridge Start and
+        // auto-close between beginStop and the Stop broadcast, or before its
+        // reconnect marker is written. All admission results share this intent.
+        runCatching {
+            MainKernelAttemptRegistry.requestReconnectNoticeDismissal(
+                { NativeReconnectNotice.owner(activity) },
+                { NativeReconnectNotice.clearIfOwner(activity, it) },
+            )
+        }.onFailure { Log.e(TAG, "清理已断开连接的重连提醒失败", it) }
         cancelVpnPermission()
         SystemStart.forget(activity, "应用请求停核")
         when (VpnBridge.beginStop(invoke)) {
             VpnBridge.StopAdmission.AlreadyStopped -> {
                 // 本就没在跑 ⇒ 幂等成功。停核腿必须是幂等的。
-                // A rejected SystemStart can have settled its bridge Start while
-                // its exact native attempt is still closing. Do not touch native
-                // Stop admission; mark only that attempt's own notice for its
-                // close callback, or clear an observed notice if registry is vacant.
-                runCatching {
-                    MainKernelAttemptRegistry.requestReconnectNoticeDismissal(
-                        { NativeReconnectNotice.owner(activity) },
-                        { NativeReconnectNotice.clearIfOwner(activity, it) },
-                    )
-                }.onFailure { Log.e(TAG, "清理已断开连接的重连提醒失败", it) }
                 invoke.resolve()
                 return
             }

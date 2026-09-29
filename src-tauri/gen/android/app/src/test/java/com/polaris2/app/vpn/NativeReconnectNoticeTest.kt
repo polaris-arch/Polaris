@@ -153,35 +153,39 @@ class NativeReconnectNoticeTest {
         assertEquals(closing.birthNonce, NativeReconnectNotice.owner(marker))
     }
 
-    @Test fun stopBeforeRejectedSystemNoticeWriteStillClearsOnExactClose() = withMarker { marker ->
-        val registry = MainKernelAttemptLedger()
-        val rejected = MainKernelAttempt<Any>()
-        assertTrue(registry.claim(rejected))
-        val resumeClose = CountDownLatch(1)
-        val closed = Thread {
-            check(resumeClose.await(2, TimeUnit.SECONDS))
-            rejected.closed.complete(null)
-            check(registry.completeAfterClose(rejected) {})
-            if (rejected.clearReconnectNoticeOnClose) {
-                NativeReconnectNotice.clearIfOwner(marker, rejected.birthNonce)
+    @Test fun everyStopAdmissionKeepsDismissalWhenNoticeAndCloseAreLate() = withMarker { marker ->
+        for (admission in VpnBridge.StopAdmission.values()) {
+            val registry = MainKernelAttemptLedger()
+            val rejected = MainKernelAttempt<Any>()
+            assertTrue(registry.claim(rejected))
+            val resumeClose = CountDownLatch(1)
+            val closed = Thread {
+                check(resumeClose.await(2, TimeUnit.SECONDS))
+                rejected.closed.complete(null)
+                check(registry.completeAfterClose(rejected) {})
+                if (rejected.clearReconnectNoticeOnClose) {
+                    NativeReconnectNotice.clearIfOwner(marker, rejected.birthNonce)
+                }
             }
+            closed.start()
+            assertNull(NativeReconnectNotice.owner(marker))
+            assertTrue("Stop intent must precede $admission", registry.requestReconnectNoticeDismissal(
+                { error("the current native owner must be marked before reading a not-yet-written marker") },
+                { NativeReconnectNotice.clearIfOwner(marker, it) },
+            ))
+            assertTrue(rejected.clearReconnectNoticeOnClose)
+            // Started's broadcast may be lost; AlreadyStopped resolves and Busy
+            // rejects, but none of those outcomes may withdraw this user intent.
+            NativeReconnectNotice.require(marker, rejected.birthNonce)
+            resumeClose.countDown()
+            closed.join(2_000)
+            assertFalse(closed.isAlive)
+            assertNull(NativeReconnectNotice.owner(marker))
+            val notifications = AtomicInteger()
+            assertFalse(NativeReconnectNotice.publishIfOwner(marker, rejected.birthNonce) {
+                notifications.incrementAndGet()
+            })
+            assertEquals(0, notifications.get())
         }
-        closed.start()
-        assertNull(NativeReconnectNotice.owner(marker))
-        assertTrue(registry.requestReconnectNoticeDismissal(
-            { error("the current native owner must be marked before reading a not-yet-written marker") },
-            { NativeReconnectNotice.clearIfOwner(marker, it) },
-        ))
-        assertTrue(rejected.clearReconnectNoticeOnClose)
-        NativeReconnectNotice.require(marker, rejected.birthNonce)
-        resumeClose.countDown()
-        closed.join(2_000)
-        assertFalse(closed.isAlive)
-        assertNull(NativeReconnectNotice.owner(marker))
-        val notifications = AtomicInteger()
-        assertFalse(NativeReconnectNotice.publishIfOwner(marker, rejected.birthNonce) {
-            notifications.incrementAndGet()
-        })
-        assertEquals(0, notifications.get())
     }
 }
