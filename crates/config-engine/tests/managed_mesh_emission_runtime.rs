@@ -387,7 +387,12 @@ fn spawn_observer() -> (
     (addr, rx, event_rx, stop)
 }
 
-fn connect(proxy: SocketAddr, host: &str) -> Result<u8, String> {
+struct SocksFlow {
+    status: u8,
+    stream: TcpStream,
+}
+
+fn open_socks_flow(proxy: SocketAddr, host: &str) -> Result<SocksFlow, String> {
     let mut stream = TcpStream::connect_timeout(&proxy, Duration::from_secs(2))
         .map_err(|error| format!("connect: {error}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
@@ -431,7 +436,90 @@ fn connect(proxy: SocketAddr, host: &str) -> Result<u8, String> {
     stream
         .read_exact(&mut bound)
         .map_err(|error| format!("reply bound address read: {error}"))?;
-    Ok(reply[1])
+    Ok(SocksFlow {
+        status: reply[1],
+        stream,
+    })
+}
+
+fn drive_sniff(flow: &mut SocksFlow, host: &str) -> Result<(), String> {
+    if flow.status != 0 {
+        return Err(format!("SOCKS reply rejected with status {}", flow.status));
+    }
+    let payload = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    flow.stream
+        .write_all(payload.as_bytes())
+        .map_err(|error| format!("application payload write: {error}"))
+}
+
+fn terminal_rejected(flow: &mut SocksFlow) -> Result<(), String> {
+    // b609's sniff read can send SOCKS success before route matching. For an
+    // accepted handshake, only a closed application stream proves rejection.
+    if flow.status != 0 {
+        return Ok(());
+    }
+    let mut payload = [0u8; 1];
+    match flow.stream.read(&mut payload) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err("application stream received data after expected reject".into()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("application stream did not reject: {error}")),
+    }
+}
+
+fn observer_steps(events: &mpsc::Receiver<&'static str>) -> Vec<&'static str> {
+    events.try_iter().collect()
+}
+
+fn observer_channel_quiet<T: std::fmt::Debug>(
+    rx: &mpsc::Receiver<T>,
+    label: &str,
+) -> Result<(), String> {
+    match rx.try_recv() {
+        Ok(value) => Err(format!("{label} unexpectedly observed {value:?}")),
+        Err(mpsc::TryRecvError::Empty) => Ok(()),
+        Err(mpsc::TryRecvError::Disconnected) => Err(format!("{label} observer stopped")),
+    }
+}
+
+fn observers_quiet(
+    a_rx: &mpsc::Receiver<String>,
+    b_rx: &mpsc::Receiver<String>,
+    a_events: &mpsc::Receiver<&'static str>,
+    b_events: &mpsc::Receiver<&'static str>,
+    duration: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + duration;
+    loop {
+        observer_channel_quiet(a_rx, "owner A target")?;
+        observer_channel_quiet(b_rx, "owner B target")?;
+        observer_channel_quiet(a_events, "owner A connection")?;
+        observer_channel_quiet(b_events, "owner B connection")?;
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn expect_dns_answer(queries: &mpsc::Receiver<String>, host: &str, qtype: u16, answers: usize) {
+    let wanted = format!("{host} type={qtype} answers={answers}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while let Ok(query) = queries.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if query == wanted {
+            return;
+        }
+    }
+    panic!("controlled DNS answer was not requested: {wanted}");
 }
 
 fn wait_listening(addr: SocketAddr) {
@@ -505,12 +593,15 @@ fn route_summary(wire: &Value) -> String {
 }
 
 fn core_route_logs(path: &std::path::Path) -> Vec<String> {
-    std::fs::read_to_string(path)
+    let selected: Vec<String> = std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter(|line| {
             [
                 "same-owner.test",
+                "match[",
+                "resolved [",
+                "connection closed:",
                 "outbound/",
                 "dns/",
                 "route/",
@@ -519,9 +610,9 @@ fn core_route_logs(path: &std::path::Path) -> Vec<String> {
             .iter()
             .any(|needle| line.contains(needle))
         })
-        .take(32)
         .map(|line| line.chars().take(240).collect())
-        .collect()
+        .collect();
+    selected.into_iter().rev().take(32).rev().collect()
 }
 
 #[test]
@@ -585,9 +676,76 @@ fn socks_connect_requires_complete_reply() {
             stream.read_exact(&mut target).unwrap();
             stream.write_all(&reply).unwrap();
         });
-        assert_eq!(connect(addr, "example.test") == Ok(0), expected);
+        assert_eq!(
+            open_socks_flow(addr, "example.test").map(|flow| flow.status) == Ok(0),
+            expected
+        );
         server.join().unwrap();
     }
+}
+
+#[test]
+fn lazy_socks_success_needs_payload_and_terminal_reject() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (payload_tx, payload_rx) = mpsc::channel();
+    let (close_tx, close_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).unwrap();
+        let mut request = [0u8; 5];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(&request[..4], &[5, 1, 0, 3]);
+        let mut destination = vec![0u8; request[4] as usize + 2];
+        stream.read_exact(&mut destination).unwrap();
+        assert_eq!(&destination, b"example.test\0P");
+        // Model b609's lazy SOCKS success before sniff, DNS or routing.
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+            .unwrap();
+        let expected = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let mut payload = vec![0u8; expected.len()];
+        stream.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, expected);
+        payload_tx.send(()).unwrap();
+        close_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    });
+
+    let mut flow = open_socks_flow(addr, "example.test").unwrap();
+    assert_eq!(flow.status, 0);
+    drive_sniff(&mut flow, "example.test").unwrap();
+    payload_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    flow.stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    assert!(
+        terminal_rejected(&mut flow).is_err(),
+        "lazy SOCKS success and an open application stream are not a reject"
+    );
+    close_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert!(terminal_rejected(&mut flow).is_ok());
+}
+
+#[test]
+fn negative_observer_gate_catches_accept_before_target() {
+    let (_a_tx, a_rx) = mpsc::channel::<String>();
+    let (_b_tx, b_rx) = mpsc::channel::<String>();
+    let (a_event_tx, a_events) = mpsc::channel::<&'static str>();
+    let (_b_event_tx, b_events) = mpsc::channel::<&'static str>();
+    assert!(observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).is_ok());
+    a_event_tx.send("accepted").unwrap();
+    assert!(
+        observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO)
+            .unwrap_err()
+            .contains("owner A connection")
+    );
 }
 
 fn fixed_core_or_skip(what: &str) -> Option<std::path::PathBuf> {
@@ -705,13 +863,17 @@ fn b609_connect_observes_managed_multi_answer_guards() {
     );
     wait_listening(inbound);
 
-    let reply = connect(inbound, "same-owner.test");
+    observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
+    let mut same_owner = open_socks_flow(inbound, "same-owner.test").unwrap();
+    let reply = same_owner.status;
+    let probe = drive_sniff(&mut same_owner, "same-owner.test");
     let observed_a = a_rx.recv_timeout(Duration::from_secs(2));
-    if reply != Ok(0)
+    if reply != 0
+        || probe.is_err()
         || !matches!(&observed_a, Ok(target) if ["100.80.4.1", "100.80.5.1"].contains(&target.as_str()))
     {
         panic!(
-            "same-owner CONNECT reply={reply:?}, observer-a={observed_a:?}, \
+            "same-owner CONNECT reply={reply:?}, probe={probe:?}, observer-a={observed_a:?}, \
              observer-b={:?}, dns-queries={:?}, a-events={:?}, b-events={:?}, \
              wire-route={routes}, core-route-logs={:?}",
             b_rx.try_iter().collect::<Vec<_>>(),
@@ -721,6 +883,25 @@ fn b609_connect_observes_managed_multi_answer_guards() {
             core_route_logs(&log_path),
         );
     }
+    assert_eq!(
+        observer_steps(&a_events),
+        [
+            "accepted",
+            "greeted",
+            "request header received",
+            "target received"
+        ]
+    );
+    observers_quiet(
+        &a_rx,
+        &b_rx,
+        &a_events,
+        &b_events,
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    expect_dns_answer(&dns_rx, "same-owner.test", 1, 2);
+    drop(same_owner);
     for name in [
         "cross-owner.test",
         "cross-reject.test",
@@ -730,33 +911,110 @@ fn b609_connect_observes_managed_multi_answer_guards() {
         "override-domain-fail.test",
         "ipv6-cross.test",
     ] {
-        assert_ne!(
-            connect(inbound, name),
-            Ok(0),
-            "{name} must reject before dialing"
-        );
+        observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
+        let mut flow = open_socks_flow(inbound, name).unwrap();
+        if flow.status == 0 {
+            drive_sniff(&mut flow, name).unwrap();
+        }
+        let terminal = terminal_rejected(&mut flow);
         assert!(
-            a_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "{name} reached owner A"
+            terminal.is_ok(),
+            "{name} did not reject the application stream after SOCKS status {}: \
+             {terminal:?}; dns-queries={:?}; core-route-logs={:?}",
+            flow.status,
+            dns_rx.try_iter().collect::<Vec<_>>(),
+            core_route_logs(&log_path),
         );
-        assert!(
-            b_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "{name} reached owner B"
-        );
+        observers_quiet(
+            &a_rx,
+            &b_rx,
+            &a_events,
+            &b_events,
+            Duration::from_millis(100),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{name} reached an owner despite reject: {error}; core-route-logs={:?}",
+                core_route_logs(&log_path)
+            )
+        });
     }
     for name in ["override-atoms.test", "override-domain.test"] {
-        assert!(
-            connect(inbound, name) == Ok(0),
-            "{name} must keep its valid override"
-        );
-        assert!(b_rx
+        observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
+        let mut flow = open_socks_flow(inbound, name).unwrap();
+        assert_eq!(flow.status, 0, "{name} must keep its valid override");
+        drive_sniff(&mut flow, name).unwrap();
+        let target = b_rx
             .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .starts_with("100.80."));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{name} did not reach owner B: {error}; dns-queries={:?}; \
+                 a-events={:?}; b-events={:?}; core-route-logs={:?}",
+                    dns_rx.try_iter().collect::<Vec<_>>(),
+                    observer_steps(&a_events),
+                    observer_steps(&b_events),
+                    core_route_logs(&log_path)
+                )
+            });
+        let allowed = if name == "override-atoms.test" {
+            ["100.80.2.1", "100.80.3.1"]
+        } else {
+            ["100.80.2.1", "100.80.4.1"]
+        };
+        assert!(allowed.contains(&target.as_str()), "{name} dialed {target}");
+        assert_eq!(
+            observer_steps(&b_events),
+            [
+                "accepted",
+                "greeted",
+                "request header received",
+                "target received"
+            ]
+        );
+        observers_quiet(
+            &a_rx,
+            &b_rx,
+            &a_events,
+            &b_events,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        expect_dns_answer(&dns_rx, name, 1, 2);
+        drop(flow);
     }
-    assert_eq!(connect(inbound, "ipv6-owner.test"), Ok(0));
+    observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
+    let mut ipv6_owner = open_socks_flow(inbound, "ipv6-owner.test").unwrap();
+    assert_eq!(ipv6_owner.status, 0);
+    drive_sniff(&mut ipv6_owner, "ipv6-owner.test").unwrap();
+    let ipv6_target = a_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|error| {
+            panic!(
+                "ipv6-owner.test did not reach owner A: {error}; dns-queries={:?}; \
+             a-events={:?}; b-events={:?}; core-route-logs={:?}",
+                dns_rx.try_iter().collect::<Vec<_>>(),
+                observer_steps(&a_events),
+                observer_steps(&b_events),
+                core_route_logs(&log_path)
+            )
+        });
+    assert_eq!(ipv6_target, "fd7a:115c:a1e0:1::9");
     assert_eq!(
-        a_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        "fd7a:115c:a1e0:1::9"
+        observer_steps(&a_events),
+        [
+            "accepted",
+            "greeted",
+            "request header received",
+            "target received"
+        ]
     );
+    observers_quiet(
+        &a_rx,
+        &b_rx,
+        &a_events,
+        &b_events,
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    expect_dns_answer(&dns_rx, "ipv6-owner.test", 28, 1);
 }
