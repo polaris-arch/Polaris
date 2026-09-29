@@ -322,13 +322,18 @@ const MESH_TARGETS = [
      * 哪天 TsLoginDialog 不再写 authKey，这道门会红。豁免做不到这件事。
      *
      * **有意不列 `ts-settings-logic.ts`**（TsSettingsDialog 的读写纯逻辑）：那里有接线不等于用户有控件。
-     * 只认 `TsSettingsDialog.tsx`，判据就落在「FieldSpec 表里有没有这一项」——即**有没有控件**，
-     * 正是这道门要守的东西。实测：只删掉 ADV_SPEC 里 `k: 'relayServerPort'` 那一行、逻辑原样保留，
-     * 本门转红。代价是日后若把 FieldSpec 表也搬进 logic 文件会误红一次——那是响亮的假警报，
-     * 补一行文件名即可，比静默漏检好。
+     * 只认**字段表所在的那个文件**，判据就落在「FieldSpec 表里有没有这一项」——即**有没有控件**，
+     * 正是这道门要守的东西。实测：只删掉 `TS_ADV_SPEC` 里 `k: 'relayServerPort'` 那一行、
+     * 逻辑原样保留，本门转红。
+     *
+     * 🔴 **2026-09-06：`TsSettingsDialog.tsx` 换成了 `ts-spec.ts`。** 那正是这段注释上一版预告过的
+     * 「日后若把 FieldSpec 表也搬进独立文件会误红一次 —— 补一行文件名即可」。搬运的理由见
+     * `ts-spec.ts` 头注（移动端按契约 A1 不许 import 桌面 `.tsx`，两端要共用同一张表）。
+     * **是换不是加**：留着 `TsSettingsDialog.tsx` 会让它里面的 `draft.xxx` 属性访问把判据放宽回
+     * 「有接线就算覆盖」那一档，也就是上一版从这张表里摘掉 `ts-settings-logic.ts` 的同一个理由。
      */
     editors: [
-      '../components/dialogs/TsSettingsDialog.tsx',
+      '../components/dialogs/ts-spec.ts',
       '../components/dialogs/ts-login-server.ts',
     ],
   },
@@ -340,11 +345,15 @@ const MESH_TARGETS = [
      * 用户有控件。此前它在列表里，WG 侧的锁 2 就比 TS 侧松一档——变异实测：把 `wgSpec` 里
      * `k: 'reverseMesh'` 那一行整行删掉、`wg-logic.ts` 的读写原样保留，门**照绿**（`draft.reverseMesh`
      * 命中「属性访问」判据）。摘掉它之后同一变异转红，判据这才真的落在「FieldSpec 表里有没有这一项」。
-     * 摘除后全部 12 个键仍被覆盖：11 个在 `WgDialog.tsx` 的 `wgSpec`、`reserved` / `warpDevice` 在
-     * `WarpDialog.tsx`。
+     * 全部 12 个键的落点：11 个在 `wgSpec`、`reserved` / `warpDevice` 在 `WarpDialog.tsx` 的注册腿。
+     *
+     * 🔴 **2026-09-06：`WgDialog.tsx` 换成了 `wg-spec.ts`**（`wgSpec` 搬了家，理由见那份文件头注）。
+     * **是换不是加**，理由与 TS 侧那条逐字相同：留着 `WgDialog.tsx` 会让它里面的
+     * `draft.reserved` / `reservedInputInvalid(draft.reserved)` 这类属性访问把判据放宽回
+     * 「有接线就算覆盖」，而那正是上一版把 `wg-logic.ts` 摘掉时修掉的松动。
      */
     editors: [
-      '../components/dialogs/WgDialog.tsx',
+      '../components/dialogs/wg-spec.ts',
       '../components/dialogs/WarpDialog.tsx',
     ],
   },

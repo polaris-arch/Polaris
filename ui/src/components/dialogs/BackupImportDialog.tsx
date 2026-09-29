@@ -32,12 +32,15 @@ const CATEGORY_LABEL_KEYS: Record<BackupCategory, string> = {
   dnsRules: 'settings.backup.catDnsRules',
   dnsResources: 'settings.backup.catDnsResources',
   appRules: 'settings.advanced.backup.appRules',
+  meshRouting: 'settings.backup.catMeshRouting',
   generalSettings: 'settings.advanced.backup.generalSettings',
 };
 
 interface Picked {
   filePath: string;
   available: BackupCategory[];
+  blockedCategories: BackupCategory[];
+  meshRoutingOwnerServerIds: string[];
   counts: Partial<Record<BackupCategory, number>>;
   unavailableInterfaceBindings: Partial<Record<BackupCategory, number>>;
 }
@@ -75,10 +78,13 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
       setPicked({
         filePath: r.filePath,
         available: r.available,
+        blockedCategories: r.blockedCategories ?? [],
+        meshRoutingOwnerServerIds: r.meshRoutingOwnerServerIds ?? [],
         counts: r.counts ?? {},
         unavailableInterfaceBindings: r.unavailableInterfaceBindings ?? {},
       });
-      setSelected(normalizeBackupSelection(r.available, r.available));
+      const selectable = r.available.filter((cat) => !(r.blockedCategories ?? []).includes(cat));
+      setSelected(normalizeBackupSelection(selectable, selectable));
     } catch (e) {
       if (!hasInstance(instanceId)) return;
       console.error('[BackupImportDialog] import pick failed:', e);
@@ -89,6 +95,7 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
   };
 
   const toggle = (cat: BackupCategory) => {
+    if (picked?.blockedCategories.includes(cat)) return;
     setSelected((prev) => toggleBackupCategory(prev, cat, picked?.available));
   };
 
@@ -238,15 +245,16 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
                 <label
                   key={cat}
                   className="pl-row"
-                  style={{ justifyContent: 'space-between', fontFamily: 'var(--sans)' }}
+                  style={{ justifyContent: 'space-between', fontFamily: 'var(--sans)', opacity: picked.blockedCategories.includes(cat) ? 0.55 : 1 }}
                 >
                   <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span
                       className={cn('swt', selected.has(cat) && 'on')}
                       role="switch"
                       aria-checked={selected.has(cat)}
+                      aria-disabled={picked.blockedCategories.includes(cat)}
                       aria-label={t(CATEGORY_LABEL_KEYS[cat])}
-                      tabIndex={0}
+                      tabIndex={picked.blockedCategories.includes(cat) ? -1 : 0}
                       onClick={() => toggle(cat)}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter' || e.key === ' ') {
@@ -264,6 +272,14 @@ export function BackupImportDialog({ instanceId }: { instanceId: string }) {
               ))}
             </div>
           </div>
+          {picked.blockedCategories.includes('meshRouting') ? (
+            <div className="rules-note" style={{ margin: 0 }}>
+              <span>{t('backupImport.meshRoutingBlocked')}</span>
+              {picked.meshRoutingOwnerServerIds.length > 0 ? (
+                <span>{t('backupImport.meshRoutingOwners', { ids: picked.meshRoutingOwnerServerIds.join(', ') })}</span>
+              ) : null}
+            </div>
+          ) : null}
           <div
             className="rules-note"
             style={{

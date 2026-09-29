@@ -1931,3 +1931,60 @@ fn release_profiles_must_not_enable_debug_assertions() {
         offenders.join("\n")
     );
 }
+
+// ============================================================================
+// release 构型必须开 LTO，且不得把 panic 策略改成 abort
+// ============================================================================
+
+/// 发行构型必须开 `lto = "fat"` + `codegen-units = 1`，且 `[profile.release]` 不得出现
+/// `panic = "abort"`。
+///
+/// # 为什么（体积收益 + 不可协商的兜底）
+///
+/// 依据 `~/docs/polaris/design/polaris-mobile-handoff-2026-09-07.md` 约 :136-146 的实测：
+/// Android arm64 `libpolaris_lib.so` 从 release 裸档 46.6 MB 降到 32.9 MB（−73.0% vs debug，
+/// 构建时间 4m46s→7m41s）。这份收益值得拿，但拿它的同一个 `[profile.release]` 段也是最容易
+/// 顺手把 `panic = "abort"` 一起写进去的地方——两者常被当成"release 该有的收紧"一起讨论。
+///
+/// `panic = "abort"` 一旦生效，`std::panic::catch_unwind` 在 unwind 到达之前进程已经终止，
+/// 调用点**不报错、不转红、不改任何测试计数**——本仓两处生产路径正靠它兜畸形输入：
+/// `src-tauri/src/runtime/subscription_parse.rs:274`（订阅解析）与
+/// `src-tauri/src/commands/subscription/create.rs:86`（订阅创建）。这是与
+/// [`release_profiles_must_not_enable_debug_assertions`] 同形的「新配置绕开旧兜底」。
+///
+/// **变异探针**：① 删掉根 `Cargo.toml` `[profile.release]` 里的 `lto = "fat"` 一行 →
+/// 本门转红（也可单独删 `codegen-units = 1`）；② 在该段加一行 `panic = "abort"` → 本门转红。
+#[test]
+fn release_profile_must_enable_lto_without_panic_abort() {
+    let root = workspace_root();
+    let manifest_path = root.join("Cargo.toml");
+    let raw = std::fs::read_to_string(&manifest_path).expect("读不到 workspace 根 Cargo.toml");
+
+    // Cargo 的 profile 段只在 workspace 根生效（成员 manifest 里写了会被 cargo 忽略并警告），
+    // 取材面就是根 Cargo.toml 的 `[profile.release]` 本体。
+    let release_body = toml_sections(&raw)
+        .into_iter()
+        .find(|(name, _)| name == "profile.release")
+        .map(|(_, body)| body)
+        .unwrap_or_else(|| panic!("根 Cargo.toml 没有 [profile.release] 段——取材面为空"));
+
+    let flat: String = release_body
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    assert!(
+        flat.contains("lto=\"fat\""),
+        "[profile.release] 缺 `lto = \"fat\"`，体积收益未生效。当前段内容：\n{release_body}"
+    );
+    assert!(
+        flat.contains("codegen-units=1"),
+        "[profile.release] 缺 `codegen-units = 1`，LTO 收益打折。当前段内容：\n{release_body}"
+    );
+    assert!(
+        !flat.contains("panic=\"abort\""),
+        "[profile.release] 不得设 `panic = \"abort\"`：`subscription_parse.rs:274` 与 \
+         `commands/subscription/create.rs:86` 两处生产 catch_unwind 会被静默废掉，一 panic 直接崩 App。\
+         当前段内容：\n{release_body}"
+    );
+}

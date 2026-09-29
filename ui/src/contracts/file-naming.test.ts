@@ -82,7 +82,11 @@ describe('文件系统命名', () => {
     const invalid = uiSource.filter((path) => {
       const relative = path.slice(UI_SOURCE_PREFIX.length);
       const name = basename(relative);
-      if (!name.endsWith('.tsx') || /\.(?:test|spec)\.tsx$/.test(name)) return false;
+      // `.test-support.tsx` 与 `.test.tsx` / `.spec.tsx` 同类：都不是业务模块。
+      // 上一版这里只写了后两者，而 `contracts/test-only-modules.ts` 的头注早就声明
+      // 「`file-naming.test.ts` accepts the `.test-support.` infix」—— 判据与它自称的契约对不上。
+      // 判据改成直接用那份权威正则（同文件的 kebab 那条本来就是这么写的）。
+      if (!name.endsWith('.tsx') || IS_TEST_ONLY_MODULE.test(name)) return false;
       return !PASCAL_TSX.test(name) && !TSX_ENTRY_EXCEPTIONS.has(relative);
     });
     expect(invalid, `业务 .tsx 文件名须使用 PascalCase：\n${invalid.join('\n')}`).toEqual([]);

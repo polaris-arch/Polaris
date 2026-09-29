@@ -17,7 +17,7 @@
  */
 
 import type { ServerConfig } from '@/contracts/types';
-import type { SelectOption } from './FieldSpec';
+import type { SelectOption } from './field-spec';
 import { landsInEndpoints } from '@/domain/endpoint-routes';
 
 /**

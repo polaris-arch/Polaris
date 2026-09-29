@@ -1,0 +1,17 @@
+{
+  "id": "synthetic-warp-node",
+  "name": "WARP",
+  "protocol": "wireguard",
+  "address": "engage.cloudflareclient.com",
+  "port": 2408,
+  "wireguardSettings": {
+    "privateKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "peerPublicKey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    "localAddress": ["172.16.0.2/32", "2606:4700:110::2/128"],
+    "reserved": [1, 2, 3],
+    "warpDevice": {
+      "deviceId": "synthetic-device",
+      "token": "synthetic-test-token-not-a-real-credential"
+    }
+  }
+}

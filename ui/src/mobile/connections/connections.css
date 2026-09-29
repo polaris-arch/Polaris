@@ -1,0 +1,946 @@
+/*
+ * 移动端「连接」屏样式。**唯一** token 来源仍是 `../../styles/tokens.resolved.css`（契约 A1）——
+ * 本文件一个 `@import` 都不写；外壳 `mobile.css` 已解析好的三个响应标量
+ * （`--page-inset` / `--section-gap` / `--card-padding`）在这里**只消费不重定义**。
+ *
+ * ── 只用 Chromium ≤105 的特性 ─────────────────────────────────────────────────
+ * 本文件自动进 `../../styles/css-feature-floor.test.ts` 的取材面（它走目录树发现 `ui/src` 下
+ * 全部 .css）。`@container` 是下限本体；`dvh` 不用。
+ *
+ * ── 几何 px、排版 rem ────────────────────────────────────────────────────────
+ * 与外壳同一条口径：字号 / 行高走 rem ⇒ 跟随 Dynamic Type；padding / gap / 触控目标走 px ⇒ 框不动。
+ */
+
+/* ═══════════ 屏根 ═══════════ */
+
+/*
+ * 本屏自己就是一个 section，故取消外壳给 `.m-section` 的卡片外观：吸顶块要满幅，
+ * 一层卡片边框会把它框起来，读作「一张会动的卡」而不是「屏的头」。
+ */
+.mc {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+}
+
+/* ═══════════ 吸顶块：页头 + 分段条 + 搜索框 ═══════════ */
+
+/*
+ * **本屏唯一的 sticky 元素。** 分段条是作用域指示，搜索框是持续作用于实时列表的条件 ——
+ * IA §2.3 明文把这两样钉在页头下面。判据（门 ②）按「搜索框的祖先链里必须有本块」写，
+ * 因此吸顶面必须只有这一个入口：多一个入口，判据就漏一条路。
+ *
+ * 满幅底：`.m-page` 左右有页边距，sticky 块若只在内容宽度内画底，滚动时内容会从两侧缝里透出来。
+ * 负外边距把它拉到滚动区边沿，再用等量内边距把内容推回原位 —— 不引入任何新的数。
+ */
+.mc-top {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  background: hsl(var(--bg));
+  margin-left: calc(-1 * (var(--page-inset) + var(--safe-l)));
+  margin-right: calc(-1 * (var(--page-inset) + var(--safe-r)));
+  padding-left: calc(var(--page-inset) + var(--safe-l));
+  padding-right: calc(var(--page-inset) + var(--safe-r));
+  padding-top: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+.mc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.mc-title {
+  margin: 0;
+  font-family: var(--disp);
+  font-size: 1.3125rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+/* `segmented-tabs`（桌面 `.sub-tabs`）：横向可滚，每项 ≥48 高，与 `.mc-choice` 不是同一个控件。 */
+.mc-seg {
+  display: flex;
+  gap: var(--sp-1);
+  overflow-x: auto;
+  /* 触屏惯性滚动收在自己身上，别把手势交回给页面。 */
+  overscroll-behavior-x: contain;
+}
+
+.mc-seg-item {
+  flex: 0 0 auto;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  margin: 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  color: hsl(var(--fg-dim));
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mc-seg-item[aria-selected='true'] {
+  color: hsl(var(--fg));
+  border-bottom-color: hsl(var(--flow));
+}
+
+.mc-seg-item:focus-visible,
+.mc-btn:focus-visible,
+.mc-row-main:focus-visible,
+.mc-sheet-item:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+/* `search-field`（IA §3.1 #9）：48 高、带清除按钮（触屏没有 Esc）、平台搜索键盘。 */
+.mc-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+}
+
+.mc-search svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: hsl(var(--fg-faint));
+}
+
+.mc-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  outline: none;
+  padding: var(--sp-2) 0;
+  font: inherit;
+  color: inherit;
+}
+
+/* ═══════════ 通用原语 ═══════════ */
+
+.mc-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+}
+
+.mc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  padding: 0 var(--sp-3);
+  margin: 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+  appearance: none;
+  -webkit-appearance: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mc-btn.icon {
+  padding: 0;
+  border-color: transparent;
+  background: none;
+}
+
+.mc-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.mc-btn:disabled {
+  opacity: 0.45;
+}
+
+.mc-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--card-padding);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r);
+  background: hsl(var(--surface));
+}
+
+.mc-card-h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  font-weight: 600;
+  font-size: 0.9375rem;
+}
+
+/* 常驻说明行 —— 桌面挂在 `data-tip` / hover 卡上的解释在这里全落到它身上（§4.12）。 */
+.mc-note {
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.mc-empty {
+  padding: var(--sp-6) var(--sp-4);
+  text-align: center;
+  color: hsl(var(--fg-dim));
+  font-size: 0.875rem;
+}
+
+.mc-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid;
+  border-radius: var(--r-sm);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.mc-notice svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 2px;
+}
+
+.mc-notice-tx {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mc-notice.warn {
+  color: hsl(var(--warn));
+  background: hsl(var(--warn-weak));
+  border-color: hsl(var(--warn) / 0.3);
+}
+
+.mc-notice.info {
+  color: hsl(var(--flow-hi));
+  background: hsl(var(--flow-weak));
+  border-color: hsl(var(--flow) / 0.3);
+}
+
+/* 写失败的行内回显（IA 裁定 #14）：贴着控件，红且带图标，不需要任何全局宿主。 */
+.mc-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid hsl(var(--err) / 0.35);
+  border-radius: var(--r-sm);
+  background: hsl(var(--err-weak));
+  color: hsl(var(--err));
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.mc-error svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 2px;
+}
+
+.mc-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--sp-2);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-xs);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+/* tcp 实底 / udp 描边 —— 与桌面同一条区分。 */
+.mc-pill.tcp {
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+}
+
+.mc-pill.udp {
+  background: none;
+  color: hsl(var(--fg-faint));
+}
+
+.mc-pill.region {
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+}
+
+.mc-cnt {
+  display: inline-flex;
+  align-items: center;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: hsl(var(--flow));
+  color: hsl(var(--bg));
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 18px;
+}
+
+/*
+ * `segmented-control`（桌面 `.seg2`）—— 与 `.mc-seg` **不是**同一个控件，别合并。
+ *
+ * IA §3.1 #7 把它划为 touch-adapted：只放大命中面，边框 / 圆角 / 选中填充照搬桌面。
+ * 轨道逐属性同构 `styles/components.css:82-83` 的 `.seg2`；选中态同 `:86-87` 的
+ * `.seg2 button.on`（`--surface` 浮块 + `--flow-hi` 文字 + 投影）。
+ * 少了轨道这一层，5/10/15 就读成三颗独立按钮里有一颗变了色 —— 深色主题下几乎看不出当前档。
+ */
+.mc-choice {
+  display: inline-flex;
+  gap: var(--sp-1);
+  padding: 3px;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+}
+
+/* 轨道内的按钮交出边框与底色；`min-height` 仍来自 `.mc-btn` = `--tap-min`。 */
+.mc-choice .mc-btn {
+  min-width: 40px;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--fg-dim));
+}
+
+/*
+ * 选中态**只在轨道里**成立。刻意不写成裸 `.mc-btn[aria-pressed='true']`（那是这里的旧写法）：
+ * 裸选择器会波及将来任何一颗带按下态的 `.mc-btn`，而分段控件的选中填充与
+ * 「一颗独立按钮被按下」不是同一件事。
+ */
+.mc-choice .mc-btn[aria-pressed='true'] {
+  background: hsl(var(--surface));
+  color: hsl(var(--flow-hi));
+  font-weight: 660;
+  box-shadow: 0 1px 3px hsl(var(--shadow) / 0.16);
+}
+
+/* ═══════════ 概览：排名条 ═══════════ */
+
+.mc-bars {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.mc-bar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 0.8125rem;
+}
+
+.mc-bar-name {
+  flex: 0 0 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-bar {
+  flex: 1 1 auto;
+  height: 8px;
+  border-radius: 4px;
+  background: hsl(var(--surface-2));
+  overflow: hidden;
+}
+
+.mc-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+}
+
+.mc-bar i.aurora {
+  background: hsl(var(--aurora));
+}
+
+.mc-bar i.flow {
+  background: hsl(var(--flow));
+}
+
+.mc-bar i.direct {
+  background: hsl(var(--fg-faint));
+}
+
+.mc-bar-v {
+  flex: 0 0 auto;
+  min-width: 2.5em;
+  text-align: right;
+  font-family: var(--mono);
+  color: hsl(var(--fg-dim));
+}
+
+/* ═══════════ 连接行 ═══════════ */
+
+/*
+ * 实时列表**恒单列**，任何断点都不铺两列：一个行在被实时增删的列表铺成两列后，
+ * 每一帧都会在读者眼下重排。IA §2.3「Breakpoints」写的就是这一条。
+ */
+.mc-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.mc-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+.mc-row-top {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* 行主体 = 展开触发器。整行可点，不是一个小箭头。 */
+.mc-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--tap-min);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mc-row-l1,
+.mc-row-l2 {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 100%;
+  min-width: 0;
+}
+
+.mc-row-host {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.mc-row-l2 {
+  font-size: 0.75rem;
+  color: hsl(var(--fg-dim));
+}
+
+.mc-row-rule,
+.mc-row-chain {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-row-sep {
+  color: hsl(var(--fg-faint));
+}
+
+/* compact / medium 上不占位；expanded 下现身（见文件末尾的断点段）。 */
+.mc-row-proc {
+  display: none;
+}
+
+.mc-row-chain.block {
+  color: hsl(var(--err));
+}
+
+.mc-row-chain.direct {
+  color: hsl(var(--fg-dim));
+}
+
+.mc-row-chain.named {
+  color: hsl(var(--fg));
+  font-weight: 600;
+}
+
+.mc-row-num {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+}
+
+.mc-rate.d {
+  color: hsl(var(--dn));
+}
+
+.mc-rate.u {
+  color: hsl(var(--up));
+}
+
+.mc-row-x,
+.mc-row-more {
+  flex: 0 0 auto;
+  width: var(--tap-min);
+  height: var(--tap-min);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  color: hsl(var(--fg-dim));
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mc-row-x svg,
+.mc-row-more svg {
+  width: 18px;
+  height: 18px;
+}
+
+.mc-row-x {
+  color: hsl(var(--err));
+}
+
+/* 展开区：桌面九列表里塞不下的其余列 + 桌面只靠 hover 承载的全文（§4.12）。 */
+.mc-det {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: var(--sp-3);
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+  font-size: 0.75rem;
+}
+
+.mc-det-row {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: baseline;
+}
+
+/*
+ * 标签列是**定宽**的（`flex: 0 0` ⇒ 既不长也不缩），故它必须自带兜底：一个比 5.5em 还宽的
+ * 标签在 `overflow: visible` 下会横着画到右边的值上（不是挤，是**盖**）。
+ *
+ * 2026-09-05 `text-fit.test.ts` S16 首次量到：**模型口径**下 50 格（10 个标签 × 5 语种）里 9 格越界。
+ * 模型是保守上界，故同日在 Android 模拟器（412 CSS px，栈落到 Roboto）逐个实测了一遍，
+ * 两个数分开写，别混为一谈：
+ *  · **真机真的越界的是 2 格**，都在 ru：`colTime`「Длительность」80.4px、
+ *    `colDest`「Назначение」67.7px，槽 66px。这两格是本条修法的**事实依据**。
+ *  · 其余 7 格是模型过估（en 的「Destination」模型 86.2px / 真机 60.8px，装得下）。
+ * 也就是说：这不是「纯粹的模型噪声」，但也不像模型报的那么宽 —— 缺陷成立，规模比模型小。
+ *
+ * 取 `overflow-wrap: anywhere` 而不是把 `5.5em` 调宽：
+ *  · 调宽是拿值列的宽度换标签列的宽度，而值列装的是域名 / 进程名 / 链路 —— 那才是这一行的主体；
+ *  · 调宽只对**今天这批语料**有效，明天多一个语种照样越界，而这条兜底对所有语料一次到位；
+ *  · `anywhere` 正是同一条规则块里 `dd` 已经在用的那个值（见下），不新造词汇。
+ * 代价写明：越界的那几条长标签会在词内断行（真机实测：ru 那两条各断成 2 行）。
+ * 这是降级，但比盖住值列轻 —— 后者读起来是两个字段串在一起，用户会以为数据错了。
+ */
+.mc-det-row dt {
+  flex: 0 0 5.5em;
+  color: hsl(var(--fg-dim));
+  overflow-wrap: anywhere;
+}
+
+.mc-det-row dd {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  /* 桌面靠横向滚动 + tooltip 看全文；这里**换行**，一条要横向滚的行在 390 宽上读不了。 */
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+}
+
+.mc-sortbar {
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+}
+
+/* ═══════════ 分页 ═══════════ */
+
+.mc-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.mc-pager-status {
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+}
+
+.mc-pager-acts {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* ═══════════ 日志 ═══════════ */
+
+.mc-logwrap {
+  position: relative;
+}
+
+.mc-logview {
+  max-height: 60vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.6;
+}
+
+.mc-log-line {
+  /* 桌面靠横向滚动；390 宽上一条要横向滚的日志行是读不了的 ⇒ 换行（IA §3.1 #16）。 */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.mc-log-ts {
+  color: hsl(var(--fg-faint));
+}
+
+.mc-log-lv {
+  font-weight: 600;
+}
+
+.mc-log-lv.info {
+  color: hsl(var(--flow-hi));
+}
+
+.mc-log-lv.warn {
+  color: hsl(var(--warn));
+}
+
+.mc-log-lv.error,
+.mc-log-lv.fatal {
+  color: hsl(var(--err));
+}
+
+.mc-log-lv.debug {
+  color: hsl(var(--fg-faint));
+}
+
+/*
+ * 空态（IA 裁定 #5）。桌面刻意什么都不画（逐字复现原型）；移动端不能照抄 ——
+ * 固定头与固定底导航之间一片空白读作「屏幕坏了」，不读作「暂时没有日志」。
+ */
+.mc-log-empty {
+  padding: var(--sp-6) var(--sp-4);
+  text-align: center;
+  font-family: var(--sans);
+}
+
+.mc-log-empty-t {
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin-bottom: var(--sp-2);
+}
+
+/* 浮动「回到底部」：向上滚打断跟随后才出现。 */
+.mc-jump {
+  position: absolute;
+  right: var(--sp-3);
+  bottom: var(--sp-3);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: 999px;
+  background: hsl(var(--surface));
+  box-shadow: var(--shadow-pop);
+  appearance: none;
+  -webkit-appearance: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mc-jump svg {
+  width: 16px;
+  height: 16px;
+}
+
+.mc-logfoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+}
+
+.mc-live {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.mc-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.mc-live-dot.on {
+  background: hsl(var(--ok));
+}
+
+.mc-live-dot.off {
+  background: hsl(var(--fg-faint));
+}
+
+.mc-log-count {
+  font-family: var(--mono);
+}
+
+/* ═══════════ 动作面板 ═══════════ */
+
+.mc-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-end;
+  background: hsl(0 0% 0% / 0.45);
+}
+
+.mc-sheet {
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 82%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) calc(var(--page-inset) + var(--safe-r)) calc(var(--sp-4) + var(--m-overlay-safe-b, var(--safe-b))) calc(var(--page-inset) + var(--safe-l));
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  background: hsl(var(--surface));
+  box-shadow: var(--shadow-pop);
+}
+
+/* 拖拽提示 —— 桌面 scrim 关闭在触屏的对应物是「手势不能起自内容」。 */
+.mc-sheet-grip {
+  width: 36px;
+  height: 4px;
+  margin: var(--sp-2) auto var(--sp-3);
+  border-radius: 2px;
+  background: hsl(var(--fg-faint));
+}
+
+.mc-sheet-h {
+  font-weight: 600;
+  font-size: 0.9375rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-sheet-sep {
+  height: 1px;
+  margin: var(--sp-2) 0;
+  background: hsl(var(--hair));
+}
+
+.mc-sheet-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: var(--tap-min);
+  padding: var(--sp-2) 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mc-sheet-item-tx {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* 禁用理由 / 补充说明 —— 桌面的 `data-tip` 在这里是可见的第二行（§4.12）。 */
+.mc-sheet-item-sub {
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.mc-sheet-item.danger {
+  color: hsl(var(--err));
+}
+
+.mc-sheet-item.on {
+  color: hsl(var(--flow));
+}
+
+/*
+ * 武装态。**这不是样式，是跨文件契约**：`lib/confirm-twice.ts` 在武装期间于 document 上挂
+ * capture 阶段的 `pointerdown`，凡是没落在 `.confirming` 里的按下一律复位。
+ */
+.mc-sheet-item.confirming {
+  background: hsl(var(--err-weak));
+  border-radius: var(--r-sm);
+  padding-left: var(--sp-2);
+  padding-right: var(--sp-2);
+}
+
+.mc-sheet-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/*
+ * 面板里的分组组头 —— 桌面 `Csel` 的 `.csel-grp` / `.csel-grp-t` 在触屏上的对应物。
+ *
+ * 两种形态一套外观：不可折叠的那一支是 `<div role="presentation">`（纯视觉分隔），
+ * 可折叠的那一支是 `<button>`，故基础态要把按钮的浏览器默认外观一并复位（同 `.mc-sheet-item`）。
+ */
+.mc-sheet-grp {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: var(--tap-min);
+  padding: var(--sp-2) 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  color: hsl(var(--fg-dim));
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: left;
+  letter-spacing: 0.02em;
+}
+
+.mc-sheet-grp-t {
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+/* 折叠雪佛龙：收起时指右、展开时指下（同 `Csel` 的 `.csel-grp-chev`）。 */
+.mc-sheet-grp-chev {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+.mc-sheet-grp-t.open .mc-sheet-grp-chev {
+  transform: rotate(90deg);
+}
+
+/* 组内条数 —— 折叠态下唯一能看出「这组有多少条」的信号，故不随折叠隐藏。 */
+.mc-sheet-grp-c {
+  margin-left: auto;
+  color: hsl(var(--fg-faint));
+  font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════ 断点 ═══════════ */
+
+/*
+ * medium / expanded 下概览那两张卡并排；**列表与日志恒单列**。
+ * 用 grid 而不是 `column-count` 的列流：这里要的是「两张卡并排」这一件确定的事，
+ * 不是把一堆等价卡片平衡到两列里。
+ */
+@container mscreen (min-width: 37.5em) {
+  .mc-body[data-segment='overview'] {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: start;
+  }
+
+  .mc-det-row dt {
+    flex-basis: 7em;
+  }
+}
+
+@container mscreen (min-width: 52.5em) {
+  /* IA §2.3：expanded 下连接行先长出进程这一格，再谈展开。 */
+  .mc-row-proc {
+    display: inline;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: hsl(var(--fg-faint));
+  }
+}

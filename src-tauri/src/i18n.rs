@@ -238,7 +238,7 @@ pub fn resolve_effective(choice: &str, system: &[String]) -> Lang {
 /// 因为一个语言标签把整份配置（含 200 节点级 `servers`）深拷贝两遍。闭包内只取字段，不回调任何子系统。
 ///
 /// ⚠️ 调用方**不得**把本函数塞进另一个 `with_current` 闭包里：闭包内持着 `ConfigManager` 的读锁，
-/// 而本函数自己还要再读一次，递归读在有写者排队时永久阻塞。`main.rs` 的
+/// 而本函数自己还要再读一次，递归读在有写者排队时永久阻塞。`lib.rs` 的
 /// `tray_reconcile_reads_config_by_projection_not_full_clone` 在源码层面钉着这两条。
 #[must_use]
 pub fn app_lang(app: &AppHandle) -> Lang {

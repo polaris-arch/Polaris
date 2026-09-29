@@ -35,6 +35,7 @@ import type {
 import { fmtBytes } from '@/components/screens/shared/format';
 import { relativeTimeTextIso } from '@/lib/relative-time';
 import { categoryLabel } from '@/domain/rule-resource-catalog';
+import { resourceUpdateFeedback, resourceUpdateOutcome } from '@/domain/resource-update-outcome';
 import { cn } from '@/lib/utils';
 import { toast } from '@/lib/error-handler';
 import { useConfirmTwice } from '@/lib/confirm-twice';
@@ -65,6 +66,8 @@ export function ResourcesScreen() {
   // 诊断只进 console；DOM 只渲染稳定的本地化状态，避免把后端/运行时原文直接暴露给用户。
   const [error, setError] = useState(false);
   const [progress, setProgress] = useState<Record<string, RuleResourceProgress>>({});
+  const [updatingAll, setUpdatingAll] = useState(false);
+  const [updatingIds, setUpdatingIds] = useState<ReadonlySet<string>>(() => new Set());
 
   // 引用徽章 hover 卡（§1.5 refs）用：路由规则 + 应用分流 + 内置预设表，均已在 store，per-row 即时算即可。
   // 防御性兜底（IPC 边界不可信 TS 类型承诺）：即便 store 现状默认已是 []，仍显式 ?? []，避免 store 形态漂移时
@@ -169,35 +172,47 @@ export function ResourcesScreen() {
 
   // 更新族统一 reload：进度事件的 done/error 帧已会触发 reload，但那条路径只覆盖「至少产出了一个
   // 计划」的项——入参非法/不在册的项直接返错、不发进度帧，列表就再也不刷新了。故命令返回后兜一次。
-  // 原型 :4200 res-update-all → notify('开始更新全部资源…')（进行中态）；逐项结果已由每行的
-  // progress/errorState 就地反映，故这里只报「命令本身没能启动」的整体失败（catch），不重复逐项报。
   const handleUpdateAll = useCallback(async () => {
-    toast.info(t('resources.updateAllStarted'));
+    if (updatingAll || updatingIds.size > 0) return;
+    setUpdatingAll(true);
+    toast.info(t('resources.updateAllStarted'), { key: 'resource-update-all', sticky: true });
     try {
-      await api.ruleResources.updateAll();
+      const feedback = resourceUpdateFeedback(
+        resourceUpdateOutcome(await api.ruleResources.updateAll(), new Set(items.map((item) => item.id)).size), t,
+      );
+      if (feedback.tone === 'error') toast.error(feedback.text, undefined, { key: 'resource-update-all' });
+      else toast[feedback.tone](feedback.text, { key: 'resource-update-all' });
     } catch (err) {
       console.error('[ResourcesScreen] updateAll failed:', err);
-      toast.error(t('resources.updateAllFailed'));
+      toast.error(t('resources.updateAllFailed'), undefined, { key: 'resource-update-all' });
     } finally {
+      setUpdatingAll(false);
       void reload();
     }
-  }, [reload, t]);
+  }, [items, reload, t, updatingAll, updatingIds]);
 
   const handleUpdateOne = useCallback(
     async (item: RuleResourceListItem) => {
+      if (updatingAll || updatingIds.has(item.id)) return;
+      setUpdatingIds((prev) => new Set(prev).add(item.id));
       try {
         // 内置 geo 与外置资源是**两条腿**：内置项从不入 `config.ruleResources`，走 `redownload(id)`
         // 恒返 `RULE_RESOURCE_NOT_FOUND`。内置腿按 tag（= `item.name`）取上游地址、原子换
         // `<userData>/rules/` 里的生效副本。
-        if (item.builtin) await api.ruleResources.updateBuiltin(item.name);
-        else await api.ruleResources.redownload(item.id);
+        const result = item.builtin
+          ? await api.ruleResources.updateBuiltin(item.name)
+          : await api.ruleResources.redownload(item.id);
+        const feedback = resourceUpdateFeedback(resourceUpdateOutcome([result], 1), t);
+        toast[feedback.tone](feedback.text);
       } catch (err) {
         console.error('[ResourcesScreen] update failed:', err);
+        toast.error(t('resources.updateFailed'));
       } finally {
+        setUpdatingIds((prev) => { const next = new Set(prev); next.delete(item.id); return next; });
         void reload();
       }
     },
-    [reload],
+    [reload, t, updatingAll, updatingIds],
   );
 
   /**
@@ -369,7 +384,7 @@ export function ResourcesScreen() {
             </button>
           ))}
         </div>
-        <button type="button" className="btn ghost sm" style={{ flex: 'none' }} onClick={handleUpdateAll}>
+        <button type="button" className="btn ghost sm" style={{ flex: 'none' }} disabled={updatingAll || updatingIds.size > 0 || loading || error || items.length === 0} onClick={handleUpdateAll}>
           <svg viewBox="0 0 24 24" width={14} fill="none" stroke="currentColor" strokeWidth={1.8}>
             <path d="M4 4v6h6M20 20v-6h-6" />
             <path d="M4 10a8 8 0 0114-3M20 14a8 8 0 01-14 3" />
@@ -433,6 +448,7 @@ export function ResourcesScreen() {
                   key={item.id}
                   item={item}
                   progress={progress[item.id]}
+                  updateBusy={updatingAll || updatingIds.has(item.id)}
                   deleteConfirming={armed === `${RES_DEL_PREFIX}${item.id}`}
                   onUpdate={() => handleUpdateOne(item)}
                   onCancel={() => handleCancelOne(item)}
@@ -458,6 +474,7 @@ export function ResourcesScreen() {
 function ResRow({
   item,
   progress,
+  updateBusy,
   deleteConfirming,
   onUpdate,
   onCancel,
@@ -466,6 +483,7 @@ function ResRow({
 }: {
   item: RuleResourceListItem;
   progress?: RuleResourceProgress;
+  updateBusy: boolean;
   deleteConfirming: boolean;
   onUpdate: () => void;
   onCancel: () => void;
@@ -544,6 +562,7 @@ function ResRow({
               className="nd-a"
               style={errorState ? { color: 'hsl(var(--warn))' } : undefined}
               onClick={onUpdate}
+              disabled={updateBusy}
               data-tip={errorState ? t('resources.retryNow') : t('resources.update')}
               aria-label={errorState ? t('resources.retryNow') : t('resources.update')}
             >

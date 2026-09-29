@@ -304,34 +304,174 @@ jobs:
       # 工具链」—— 那是**推断，没实测**。实测两个 target 都是秒过（它只依赖纯 Rust 的 windows-sys / nix）。
       # 而 helper 恰恰是全仓平台特定代码最密集的 crate（Windows SCM + 命名管道 + wintun + WFP、
       # macOS launchd + sysctl），排除它等于把最大的一块留在盲区里。
-      - name: Cross-check platform targets (cfg(windows) / cfg(macos) 分支)
+      # ── android 腿的 C 工具链（2026-09-04）──
+      #
+      # 为什么 android 需要 NDK 而 msvc / darwin 不需要（**实测三点，别从「clippy 不链接」推断**）：
+      #   · 只设 ANDROID_NDK_HOME / NDK_HOME ⇒ `zstd-sys` 的 cc-rs 报
+      #     `failed to find tool "aarch64-linux-android-clang"` —— NDK 只提供带 API 号的
+      #     `aarch64-linux-android24-clang`，没有这个不带号的名字 ⇒ rc=101
+      #   · 只把 NDK 的 toolchain bin 放进 PATH ⇒ 过了 zstd-sys，倒在 `btls-sys`
+      #     （BoringSSL 的 CMake 子构建要从 ANDROID_NDK_ROOT 找 toolchain 文件）⇒ rc=101
+      #   · 两者都给 ⇒ rc=0（本机实测 `-p polaris-unlock-transport` 38s）
+      # 成因差别：msvc / darwin 上带 C 依赖的包（polaris / polaris-unlock-transport）本来就在豁免表里，
+      # 剩下的全是纯 Rust；android 这边我们**要**覆盖 wreq 那条 C 依赖链，所以真的需要一套工具链。
+      #
+      # 🔴 **不写 GITHUB_PATH**：NDK 的 bin 目录里有 `clang` / `ld.lld` / `llvm-*`，进了 job 级 PATH
+      #    会影响同 job 后面 Build / Test 两步的**宿主**编译。只导出目录，由用它的两步各自局部前置。
+      - name: Resolve Android NDK
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          rustup target add x86_64-pc-windows-msvc x86_64-apple-darwin
+          ndk="${ANDROID_NDK_LATEST_HOME:-}"
+          [ -n "$ndk" ] || {
+            echo "::error::runner 未暴露预装 NDK（ANDROID_NDK_LATEST_HOME）—— 镜像变了；"
+            echo "::error::Cross-check 的 aarch64-linux-android 腿要它编 zstd-sys / btls-sys，先确认再改本步"
+            exit 1; }
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$bin" ] || { echo "::error::NDK 里没有 toolchain 目录：$bin"; exit 1; }
+          # 🔴 预发布 NDK 当场红（2026-09-04 本机实测的真缺陷）：用 30.0.16138531-**beta3** 跑本腿时
+          #    `btls-sys` 的 bindgen 炸在 NDK 30 的 sysroot —— `sys/cdefs.h:365: error: Unversioned
+          #    target triples are not supported!`（bindgen 传的是不带 API 号的 aarch64-linux-android）。
+          #    镜像目前给的是稳定版，这条是给「哪天镜像换上预发布 NDK」留的自曝，免得报错点漂到 bindgen 里。
+          rev="$(sed -n 's/^Pkg.Revision *= *//p' "$ndk/source.properties" 2>/dev/null || true)"
+          case "$rev" in
+            *-*) echo "::error::runner 的 NDK 是预发布版（$rev）—— 实测 NDK 30 beta 会让 btls-sys 的 bindgen 报 'Unversioned target triples are not supported'。需要在本步显式选一个稳定版 NDK"; exit 1 ;;
+          esac
+          echo "NDK 版本：${rev:-未知}"
+          {
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "NDK_HOME=$ndk"
+            echo "ANDROID_NDK_ROOT=$ndk"
+            echo "ANDROID_NDK_BIN=$bin"
+          } >> "$GITHUB_ENV"
+          echo "NDK: $ndk"
+
+      - name: Cross-check platform targets (cfg(windows) / cfg(macos) / cfg(android) / cfg(ios) 分支)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios
           # 覆盖面从 workspace 成员**推导**，不是手写清单 —— 新建 crate 默认被覆盖。
           # 上一版硬编码 4 个 -p，而实测 19 个包里 17 个双目标可过：门只覆盖了它能覆盖的 4/17，
           # 且新 crate 不会自动进清单、也没有任何东西在守这份清单的完整性。
-          mapfile -t EXEMPT < <(jq -r 'keys[]' scripts/cross-target-exempt.json)
           mapfile -t ALL < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | sort)
-          TARGETS=()
-          for p in "${ALL[@]}"; do
-            skip=0
-            for e in "${EXEMPT[@]}"; do [ "$p" = "$e" ] && skip=1; done
-            [ "$skip" = 0 ] && TARGETS+=("-p" "$p")
+          # 🔴 豁免**按 target** 生效（2026-09-04 改）。此前主循环只读 `keys[]`：一个包只要出现在表里，
+          #    就对**所有** target 一起跳过，`.targets` 那个字段在主循环里是装饰品（只有下面的反腐烂步在读它）。
+          #    加 android 腿后这条不能再将就，两个方向都会出错：
+          #      · `polaris-unlock-transport` 在 msvc/darwin 上是 C 工具链问题，而 android 有 NDK ⇒ 它**能过**，
+          #        沿用旧逻辑会把它一并跳掉，覆盖面凭空少一格且没有任何东西会说；
+          #      · `polaris-helper` 只该在 android 上豁免（它在 msvc/darwin 上是覆盖面里最重要的一个包 ——
+          #        全仓平台特定代码最密集），旧逻辑会把它从那两个 target 上一起摘掉。
+          #
+          # 🔴 豁免还分**两档**（`scope`，2026-09-04）。起因：`polaris-helper` 在 android 上同时撞到两类东西 ——
+          #    「编不过」（`--all-targets` 会连 mac/win 模块一起编，而 `nix` 是 linux/macos target-specific
+          #    依赖 ⇒ 4 条 E0433）与「真·未使用」（lib 侧 `elapsed_ms` 在 android 零消费点 ⇒ dead_code）。
+          #    整包豁免会把后者这条**真信号**一起关掉，此后本包在 android 上的 lib 面再没人看。
+          #    故：前者走豁免（`scope: "tests"` 只摘测试目标），后者在 `crates/helper/src/lib.rs` 里修掉。
+          #      · `scope` 缺省 / "all" ⇒ 整包跳过；
+          #      · `scope: "tests"`     ⇒ 只跳过测试目标：该包仍逐条 `clippy -D warnings`，只是不带 --all-targets。
+          for t in x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios; do
+            mapfile -t EXEMPT < <(jq -r --arg t "$t" \
+              'to_entries[] | select(.value.targets | index($t)) | select((.value.scope // "all") != "tests") | .key' \
+              scripts/cross-target-exempt.json)
+            mapfile -t LIBONLY < <(jq -r --arg t "$t" \
+              'to_entries[] | select(.value.targets | index($t)) | select((.value.scope // "all") == "tests") | .key' \
+              scripts/cross-target-exempt.json)
+            TARGETS=()
+            for p in "${ALL[@]}"; do
+              skip=0
+              for e in "${EXEMPT[@]}" "${LIBONLY[@]}"; do [ "$p" = "$e" ] && skip=1; done
+              [ "$skip" = 0 ] && TARGETS+=("-p" "$p")
+            done
+            echo "--- $t：全目标覆盖 $(( ${#TARGETS[@]} / 2 )) 个包（整包豁免 ${EXEMPT[*]:-无}；仅 lib/bins ${LIBONLY[*]:-无}）"
+            # 「静默零执行」自曝：派生坏掉 / 豁免写宽了 ⇒ 在这里红，而不是循环跑 0 个包也绿。
+            # 下限是**逐 target 实测**的当前派生数（20 个包 − 该 target 的豁免数）；
+            # 新建 crate 只会让它变大，再豁免一个就会红并逼人来这里确认。
+            # 🔴 2026-09-06 加 ios 腿时从「全局一个数」改成**逐 target**：ios 实测要豁免 3 个包
+            #    （polaris / polaris-unlock-transport 的 cc-rs 撞 `xcrun` 缺席，polaris-helper 的
+            #    测试目标撞 `nix` 不覆盖 ios），另三个 target 各 2 个。把全局值降到 17 迁就 ios，
+            #    等于给另外三个 target 白送一格没人会发现的豁免额度 —— 那正是本断言要拦的方向。
+            case "$t" in
+              aarch64-apple-ios) FLOOR=17 ;;
+              *) FLOOR=18 ;;
+            esac
+            test "$(( ${#TARGETS[@]} / 2 ))" -ge "$FLOOR"
+            # 判据是 **clippy -D warnings**，不是 cargo check。
+            # 实测（2026-08-30）：同一份带 `field_reassign_with_default` 的 cfg(windows) 代码，
+            # `cargo check --target x86_64-pc-windows-gnu` rc=0（绿），`cargo clippy` 同 target rc=101。
+            # 也就是说旧的 check 循环对整类 clippy lint 检出力为零 —— 它抓的只是「编不过」，
+            # 而那批缺陷是「编得过但 clippy 拒收」，会一路滑到 windows-2022 腿的 clippy 步才炸。
+            #
+            # PATH 只在 android 那一格前置（成因见上一步的 🔴）。用命令前缀而不是 `export`：
+            # 射程就是这一条命令，读的人不必回头找它在哪里被改回去。
+            extra=""
+            [ "$t" = aarch64-linux-android ] && extra="$ANDROID_NDK_BIN:"
+            PATH="${extra}${PATH}" cargo clippy --target "$t" --all-targets "${TARGETS[@]}" -- -D warnings
+            # `scope: "tests"` 那一档：同样的 `-D warnings`，只是不带 --all-targets。
+            # 不写成「有就跑、没有就算了」的静默形态 —— 空集时打印一行说明，让「这一档这次没执行」可读。
+            if [ "${#LIBONLY[@]}" -gt 0 ]; then
+              LIB_ARGS=()
+              for p in "${LIBONLY[@]}"; do LIB_ARGS+=("-p" "$p"); done
+              echo "    · 仅 lib/bins：${LIBONLY[*]}"
+              PATH="${extra}${PATH}" cargo clippy --target "$t" "${LIB_ARGS[@]}" -- -D warnings
+            else
+              echo "    · 仅 lib/bins：本 target 无此档条目"
+            fi
           done
-          echo "cross-check 覆盖 $(( ${#TARGETS[@]} / 2 )) 个包：${TARGETS[*]}"
-          # 「静默零执行」自曝：派生坏掉 / 豁免写宽了 ⇒ 在这里红，而不是循环跑 0 个包也绿。
-          test "$(( ${#TARGETS[@]} / 2 ))" -ge 16
-          # 判据是 **clippy -D warnings**，不是 cargo check。
-          # 实测（2026-08-30）：同一份带 `field_reassign_with_default` 的 cfg(windows) 代码，
-          # `cargo check --target x86_64-pc-windows-gnu` rc=0（绿），`cargo clippy` 同 target rc=101。
-          # 也就是说旧的 check 循环对整类 clippy lint 检出力为零 —— 它抓的只是「编不过」，
-          # 而那批缺陷是「编得过但 clippy 拒收」，会一路滑到 windows-2022 腿的 clippy 步才炸。
-          for t in x86_64-pc-windows-msvc x86_64-apple-darwin; do
-            cargo clippy --target "$t" --all-targets "${TARGETS[@]}" -- -D warnings
-          done
+          # 🔴 `polaris`(src-tauri) 在 android 上被豁免出上面的 clippy 循环（既有 lint 债，理由在豁免表），
+          #    但**它的编译面不能跟着一起丢**：本门要抓的「一次改坏 Android 交叉编译的 Rust 改动」恰好
+          #    只住在这个包里（K4 的 Rust↔Kotlin 桥在 `src-tauri/src/**`）。丢了它，那类改动会一路绿到
+          #    有人手工打包为止 —— APK 腿（android.yml）虽然真编它，但按登记表只在 Android 专属面被改时才跑。
+          #    `cargo check` 不 deny warnings ⇒ 不受那批 dead_code 影响，仍抓得住「编不过」。本机实测 32s。
+          # 🔴 **ios 上没有这条对应的补救，而且补不了**（2026-09-06 实测）：polaris 在 ios 上不是 lint 债，
+          #    是 `objc2-exception-helper` / `zstd-sys` 两个 build script 直接倒在
+          #    `error occurred in cc-rs: failed to find tool "xcrun"` —— 那是**编译之前**的阶段（cc-rs 要
+          #    Apple SDK），不是链接期，`cargo check` 也绕不过（它照样跑 build script）。
+          #    ⇒ src-tauri 那 12 处穷举 match 的 iOS 臂在非 macOS runner 上一行都编不到。ios 这条腿守住的
+          #    是另外 17 个纯 Rust 包的 iOS 编译面，别把它读成「整仓 iOS 面已验」。
+          PATH="$ANDROID_NDK_BIN:$PATH" cargo check --target aarch64-linux-android -p polaris
+
+      # ── Android 影响面的**产物级**完备性门（2026-09-05）──
+      #
+      # `ANDROID_IMPACT_SCOPES`（scripts/classify-ci-impact.mjs）是 `android.yml` 的**唯一**触发面，
+      # 而那条 workflow 没有 push/PR 触发 ⇒ 新增一个 Android 专属文件而不登记，APK 腿永远不为它跑。
+      # 此前两轮完备性门的取材面都是源码级正则推导，等于在重新实现 rustc 的 `mod` 解析与 cfg 求值：
+      # 每补一种形态，下一轮验收就找出下一种（两层嵌套 / `#[cfg_attr(…, path = …)]` /
+      # `r"android"` / `#[cfg(...)]mod foo;` 零空白 / 内联夹具的 raw string 污染判据）。
+      #
+      # 这里换真值源：`cargo check` 默认下发 `--emit=dep-info`，`.d` 是 rustc **解析完模块图、
+      # 求值完 cfg 之后**写出的源文件清单。Android 专属文件集 = android 编译面 − host 编译面。
+      # 上面五种形态在隔离工程里一次写全，六条全部落在差集里（raw string 夹具两侧都没有它 ——
+      # rustc 解析的是真模块图，字符串里的文本结构上就进不来）。射程与已知上限见那个脚本的头注。
+      #
+      # 🔴 两侧选择器必须**逐字对称**，都是 `cargo check --workspace`（lib + bins）：
+      #  · 不能拿上面的 `cargo clippy --workspace --all-targets` 当 host 侧省钱（那是零额外编译）——
+      #    host 侧一旦更宽，`#[cfg(any(target_os = "android", test))]` 的文件会同时落进 host 的 test
+      #    单元、从差集里掉出去，方向是 **fail-open**（门说全绿而实际漏了）。这个 pattern 仓里真的
+      #    在用：`src-tauri/src/runtime/stats/source.rs` 的三个通道常量就是这么写的。
+      #  · 也不能两侧都上 `--all-targets`：android 侧带它会让 `polaris-helper` 撞 4 条 E0433
+      #    （同上一步注释）。代价是**测试目标里的 android 专属代码不在射程内**，已如实登记。
+      #
+      # 成本：android 侧接近零 —— 上一步的 `cargo check --target aarch64-linux-android -p polaris`
+      # 已把 20 个成员里 19 个的 check 单元编热，本步只多一个 `polaris-source-probe`。host 侧是本
+      # 方案**唯一**的实质代价：check 单元与本 job 已有的 clippy（走 clippy-driver wrapper）、
+      # build（出 rlib）、test（test 构型）指纹都不共享，是一趟真的增量编译。若哪天它进不了每个 PR
+      # 的关键路径，退路是加 `github.event_name != 'pull_request'`（与下一步「豁免反腐烂」同一取舍）：
+      # 代价是延迟到合入后一次 run 才发现，不是漏检。
+      #
+      # JSON 用 `>` 重定向、**不接管道**：管道会让 cargo 自己的 rc 失真。且 dep-info 是类型检查
+      # **之前**产出的（rustc 对有类型错误的代码照样写出正确 `.d`），「.d 是对的」与「代码编得过」
+      # 是两件事 —— 两条 cargo 的 rc 必须真的拦住这一步，故 errexit 全程有效。
+      - name: Android impact face must be registered (dep-info 对差)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATH="$ANDROID_NDK_BIN:$PATH" cargo check --workspace --target aarch64-linux-android --message-format=json-render-diagnostics > "$RUNNER_TEMP/android-units.json"
+          cargo check --workspace --message-format=json-render-diagnostics > "$RUNNER_TEMP/host-units.json"
+          node scripts/check-android-only-face.mjs --android "$RUNNER_TEMP/android-units.json" --host "$RUNNER_TEMP/host-units.json"
 
       # 豁免表的反腐烂：豁免一旦不再必要就必须自己转红，否则它会退化成一张永久白名单。
       # 只在非 PR 事件上跑：两个被豁免的包都在 build script 阶段就失败，成本低但不为零，
@@ -342,6 +482,9 @@ jobs:
         run: |
           set -uo pipefail
           rot=0
+          # NDK 的 bin 同样要前置：少了它，android 上的豁免会因为「找不到 C 工具链」而失败，
+          # 于是本步得出「豁免仍必要」——**理由却是假的**。豁免腐烂检查必须与主循环量同一件事。
+          export PATH="$ANDROID_NDK_BIN:$PATH"
           for e in $(jq -r 'keys[]' scripts/cross-target-exempt.json); do
             for t in $(jq -r --arg e "$e" '.[$e].targets[]' scripts/cross-target-exempt.json); do
               if cargo clippy --target "$t" --all-targets -p "$e" -- -D warnings >/dev/null 2>&1; then

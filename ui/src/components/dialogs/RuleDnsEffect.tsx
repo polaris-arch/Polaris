@@ -1,142 +1,18 @@
-import { useEffect, useMemo, useState } from 'react';
-import type { TFunction } from 'i18next';
-import type {
-  BuiltinDhcpStatus,
-  DnsServerGroup,
-  DnsServerResource,
-  RuleDnsAnswerMode,
-  RuleDnsEffect,
-  RuleDnsResolver,
-  ServerConfig,
-  UserConfig,
-} from '@/contracts/types';
-import { api } from '@/ipc';
-import { BUILTIN_NETENV_DHCP_ID, probeReasonKey } from '@/domain/network-profile';
-import { buildDnsActionGroups, dnsActionChoice } from './dns-action-options';
-import { Csel } from './Csel';
-
-export function splitDnsRecordLines(raw: string): string[] {
-  return raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-}
-
 /**
- * DNS 效果的状态 —— resolver / answerMode / action（+ hosts 兜底 / predefined 三段）+ 目标下拉候选。
- * 从 `RuleForm` 外提，供状态与其消费的 JSX（`RuleDnsEffectFields`）共用同一份计算。
+ * DNS 效果那一格的**桌面呈现**。判据与状态全部住在纯 `.ts` 里，本文件只画字段。
+ *
+ * 两次下沉都不是整洁诉求，是依赖边：移动端规则表单要复用同一份提交腿 / 初值反解 / 候选构造 /
+ * 动作联动，而从 `.tsx` 取它们会把整棵桌面下拉组件树拖进移动端闭包。桌面调用点一行未改
+ * （两个符号在这里原样再导出）。
  */
-export function useRuleDnsEffect(
-  baseDnsEffect: RuleDnsEffect | null,
-  initialPlane: 'route' | 'dns' | undefined,
-  dnsServers: DnsServerResource[],
-  dnsGroups: DnsServerGroup[],
-  servers: ServerConfig[],
-  dnsDefaults: UserConfig['dnsDefaults'],
-  t: TFunction,
-) {
-  const [dnsResolver, setDnsResolver] = useState<RuleDnsResolver>(
-    () => baseDnsEffect?.resolver ?? 'inherit',
-  );
-  const [dnsAnswerMode, setDnsAnswerMode] = useState<RuleDnsAnswerMode>(
-    () => baseDnsEffect?.answerMode ?? 'real',
-  );
-  const [dnsAction, setDnsAction] = useState(() =>
-    dnsActionChoice(baseDnsEffect?.action) ??
-    (baseDnsEffect?.answerMode === 'fakeIp'
-      ? 'fakeIp'
-      : baseDnsEffect?.resolver === 'proxy'
-        ? 'server:builtin-remote'
-          : baseDnsEffect?.resolver === 'direct' || initialPlane === 'dns'
-          ? 'server:builtin-domestic'
-          : 'server:builtin-domestic'),
-  );
-  const [dnsFallbackAction, setDnsFallbackAction] = useState(() => {
-    const fallback = baseDnsEffect?.action?.type === 'hostsFirst'
-      ? baseDnsEffect.action.fallback
-      : undefined;
-    if (fallback?.type === 'server') return `server:${fallback.serverId}`;
-    if (fallback?.type === 'group') return `group:${fallback.groupId}`;
-    if (fallback?.type === 'fakeIp') return 'fakeIp';
-    return `server:${dnsDefaults?.directServerId || 'builtin-domestic'}`;
-  });
-  const basePredefined = baseDnsEffect?.action?.type === 'predefined'
-    ? baseDnsEffect.action
-    : undefined;
-  const [dnsPredefinedRcode, setDnsPredefinedRcode] = useState(
-    () => basePredefined?.rcode ?? 'NOERROR',
-  );
-  const [dnsPredefinedAnswer, setDnsPredefinedAnswer] = useState(
-    () => basePredefined?.answer?.join('\n') ?? '',
-  );
-  const [dnsPredefinedNs, setDnsPredefinedNs] = useState(
-    () => basePredefined?.ns?.join('\n') ?? '',
-  );
-  const [dnsPredefinedExtra, setDnsPredefinedExtra] = useState(
-    () => basePredefined?.extra?.join('\n') ?? '',
-  );
-  /** 内置解析器「当前网络 DHCP 下发的 DNS」在本机是否可用；拿不到 ⇒ null（不置灰，不猜）。 */
-  const [netenvStatus, setNetenvStatus] = useState<BuiltinDhcpStatus | null>(null);
-  useEffect(() => {
-    let active = true;
-    api.networkProfile
-      .builtinDhcpStatus()
-      .then((status) => {
-        if (active) setNetenvStatus(status && typeof status.available === 'boolean' ? status : null);
-      })
-      .catch(() => {
-        if (active) setNetenvStatus(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-  const dnsActionGroups = useMemo(
-    () => buildDnsActionGroups({
-      servers: dnsServers,
-      groups: dnsGroups,
-      nodes: servers,
-      t,
-      currentValue: dnsAction,
-      includeNetenv: true,
-      netenvStatus,
-    }),
-    [dnsServers, dnsGroups, servers, t, dnsAction, netenvStatus],
-  );
-  const dnsFallbackGroups = useMemo(
-    () => buildDnsActionGroups({
-      servers: dnsServers,
-      groups: dnsGroups,
-      nodes: servers,
-      t,
-      currentValue: dnsFallbackAction,
-      includeHosts: false,
-      responses: ['fakeIp'],
-    }),
-    [dnsServers, dnsGroups, servers, t, dnsFallbackAction],
-  );
 
-  return {
-    dnsResolver,
-    setDnsResolver,
-    dnsAnswerMode,
-    setDnsAnswerMode,
-    dnsAction,
-    setDnsAction,
-    dnsFallbackAction,
-    setDnsFallbackAction,
-    dnsPredefinedRcode,
-    setDnsPredefinedRcode,
-    dnsPredefinedAnswer,
-    setDnsPredefinedAnswer,
-    dnsPredefinedNs,
-    setDnsPredefinedNs,
-    dnsPredefinedExtra,
-    setDnsPredefinedExtra,
-    dnsActionGroups,
-    dnsFallbackGroups,
-    netenvStatus,
-  };
-}
+import type { TFunction } from 'i18next';
+import { BUILTIN_NETENV_DHCP_ID, probeReasonKey } from '@/domain/network-profile';
+import { Csel } from './Csel';
+import { dnsEffectLinkage, useRuleDnsEffect, type UseRuleDnsEffect } from './rule-effect-state';
 
-export type UseRuleDnsEffect = ReturnType<typeof useRuleDnsEffect>;
+export { splitDnsRecordLines } from './dns-action-options';
+export { useRuleDnsEffect, type UseRuleDnsEffect };
 
 interface RuleDnsEffectFieldsProps extends UseRuleDnsEffect {
   t: TFunction;
@@ -176,12 +52,11 @@ export function RuleDnsEffectFields({
           value={dnsAction}
           onChange={(value) => {
             setDnsAction(value);
-            setDnsAnswerMode(value === 'fakeIp' ? 'fakeIp' : 'real');
-            setDnsResolver(
-              value === 'server:builtin-remote'
-                ? 'proxy'
-                : 'direct',
-            );
+            /* 联动判据住在 `rule-effect-state.ts#dnsEffectLinkage`，两端共用一份 ——
+               少了它，「动作说返回 FakeIP、答案模式说给真实 IP」这种内部矛盾的效果会被存下去。 */
+            const linked = dnsEffectLinkage(value);
+            setDnsAnswerMode(linked.answerMode);
+            setDnsResolver(linked.resolver);
             touch();
           }}
           options={dnsActionGroups}

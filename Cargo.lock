@@ -3163,6 +3163,7 @@ dependencies = [
  "async-trait",
  "block2",
  "futures",
+ "jni 0.22.4",
  "log",
  "nix",
  "objc2",
@@ -3188,7 +3189,9 @@ dependencies = [
  "polaris-unlock-transport",
  "polaris-updater",
  "reqwest",
+ "rustix",
  "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "tauri",
@@ -3204,6 +3207,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tokio",
  "tokio-rustls",
+ "uuid",
  "window-vibrancy 0.8.0",
  "windows-sys 0.61.2",
 ]
@@ -3289,6 +3293,7 @@ dependencies = [
  "async-trait",
  "polaris-config-engine",
  "polaris-helper-proto",
+ "polaris-source-probe",
  "serde",
  "serde_json",
  "tokio",
@@ -3356,6 +3361,7 @@ name = "polaris-store"
 version = "1.0.0"
 dependencies = [
  "polaris-config-engine",
+ "polaris-source-probe",
  "scrypt",
  "serde",
  "serde_json",

@@ -313,14 +313,47 @@ impl StreamGate {
 ///   `clear_window` 清空，两条腿一致。
 /// - `Err`：平台 getter 报错 —— 由 [`StreamGateState::apply_visibility_probe`] 兜底成「可见」
 ///   并限频告警（**兜底方向失败安全，但不能静默**，否则降流整体失效且零可观测）。
+///
+/// # 🔴 Android：窗口可见性**不可观测**，按能力缺席登记
+///
+/// `tao` 在 Android 上不实现这两个 getter：`is_visible()` **恒返 `false` 且每次调用打一条 warn**，
+/// `is_minimized()` 恒返 `false`（`tao-0.35.3/src/platform_impl/android/mod.rs:781-788`）。
+/// 它们不是「返回真相」，是「没有真相可返」。
+///
+/// 照搬桌面判据的后果是**整个数据面在 Android 上一次都开不起来**（实测：门恒关 ⇒ 两条 relay 永远
+/// 等在 `wait_until(true, ..)` 上 ⇒ 连接列表与流量统计恒空，且没有任何错误），外加用户日志里
+/// 每秒一条 `Window::is_visible is ignored on Android`。
+///
+/// 故 Android 腿恒返 `Ok(true)`，方向与 `Err` 的兜底一致（失败安全 = 按「有人在看」处理）。
+/// **降流并没有整条失效**：它的两条腿里，「无订阅者 ⇒ 不建流」这条主腿在 Android 上照常有效
+/// （而且是省得最多的那条）；失效的只是「窗口被藏起来 ⇒ 断流」这一条。
+///
+/// 这条**登记为能力缺席，不假装成立**：Android 的对应物是 Activity 生命周期
+/// （`onPause`/`onStop`），而那要 Kotlin 侧主动向 Rust 推事件 —— 与 `android_bridge` 里
+/// `CORE_STARTED` 自曝的那条射程缺口同源、同一批解决。缺席只喊一次（这是常驻事实，不是偶发故障，
+/// 每秒一条就是把真信号淹掉）。
 pub(crate) fn probe_main_window_visible(app: &AppHandle) -> Result<bool, String> {
     let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
         return Ok(false);
     };
-    if !w.is_visible().map_err(|e| format!("is_visible: {e}"))? {
-        return Ok(false);
+    #[cfg(target_os = "android")]
+    {
+        let _ = &w;
+        static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "Android：窗口可见性不可观测（tao 的 is_visible/is_minimized 在本平台恒 false），                 降流按「始终有人在看」处理 —— 省电仍由「无订阅者不建流」那条主腿兜住"
+            );
+        }
+        return Ok(true);
     }
-    Ok(!w.is_minimized().map_err(|e| format!("is_minimized: {e}"))?)
+    #[cfg(not(target_os = "android"))]
+    {
+        if !w.is_visible().map_err(|e| format!("is_visible: {e}"))? {
+            return Ok(false);
+        }
+        Ok(!w.is_minimized().map_err(|e| format!("is_minimized: {e}"))?)
+    }
 }
 
 /// 生产用的可见性取值器（喂给 [`StreamGate::wait_until`]）：只读缓存 + 投递一次主线程刷新。

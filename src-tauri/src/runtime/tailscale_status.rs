@@ -24,11 +24,11 @@ use std::collections::BTreeMap;
 
 use polaris_singbox_grpc::daemon;
 
-/// Auth URLs originate from the control server. Custom Headscale hosts are supported.
-pub fn validated_tailscale_auth_url(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    let url = reqwest::Url::parse(trimmed).ok()?;
-    (matches!(url.scheme(), "http" | "https") && url.has_host()).then(|| trimmed.to_owned())
+/// STATUS is authoritative, but an external authorization address must still be a web URL.
+pub(crate) fn validated_tailscale_auth_url(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    let url = reqwest::Url::parse(value).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then(|| value.to_owned())
 }
 
 /// 对端节点 lean 形态（`contracts/tailscale-status.ts` `TailscaleStatusPeer` 镜像）。
@@ -235,6 +235,7 @@ pub fn decode_tailscale_status(
             let server_id = tag_to_id.get(&ep.endpoint_tag)?.clone();
             let expired = ep.self_.as_ref().is_some_and(|s| s.expired);
             let logged_in = matches!(ep.backend_state.as_str(), "Running" | "Starting") && !expired;
+            // Accept official and self-hosted control planes, solely over web browser schemes.
             let auth_url = validated_tailscale_auth_url(&ep.auth_url);
             let tailscale_ips = ep
                 .self_

@@ -102,6 +102,13 @@ const firstFrame = async (): Promise<string> => {
 
 const occurrences = (src: string, needle: string): number => src.split(needle).length - 1;
 
+it('桌面 Tailscale 卡保留协议标签，空传输摘要不留下占位 span', async () => {
+  const html = await firstFrame();
+  expect(occurrences(html, 'Tailscale')).toBeGreaterThanOrEqual(2);
+  expect(html).not.toContain('nd-xfer');
+  expect(html).not.toContain('mesh · wg');
+});
+
 const NAMES: ReadonlyMap<string, string> = new Map(SERVERS.map((s) => [s.id, s.name]));
 
 const leg = (over: Partial<ServerForceRoute> & { serverId: string }): ServerForceRoute => ({

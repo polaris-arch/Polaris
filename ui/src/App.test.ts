@@ -1,9 +1,14 @@
 /**
- * `event:proxyError` 分腿路由单测（对齐 App.tsx 头注「代理错误」小节）。
+ * App 级两条腿的单测：`event:proxyError` 分腿路由 + 「提权助手可升级」提示。
  *
- * 只测导出的 `handleProxyErrorEvent`（不渲染 App —— vitest `environment: 'node'`，全仓无组件渲染测试）。
- * mock 掉 `./lib/error-handler`（toast）与 `./lib/desktop-notify`（notifyDesktop）——两者是本函数
- * 唯一的可观察副作用出口，其余（React/zustand/AppShell 等）只是模块图谱的一部分，无需关心。
+ * ⚠️ `handleProxyErrorEvent` 本体 2026-09-06 已迁到 `domain/proxy-error-routing.ts`
+ * （移动入口引不进 `App.tsx`，迁出理由见该文件头注）。本文件仍从**那个新位置**取它 ——
+ * 判据跟着源码走，不跟着历史位置走。桌面这一侧「订阅真的接着它」由
+ * `contracts/proxy-error-key-coverage.test.ts` 的 G3 正面钉住。
+ *
+ * 只测导出的纯函数（不渲染 App —— vitest `environment: 'node'`，全仓无组件渲染测试）。
+ * mock 掉 `./lib/error-handler`（toast）与 `./lib/desktop-notify`（notifyDesktop）——两者是被测函数
+ * 唯一的可观察副作用出口，其余只是模块图谱的一部分，无需关心。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -48,16 +53,21 @@ import { isProxyErrorCode } from './contracts/types';
 //
 // 认领态是模块级单例、跨用例存活（宽限尾巴会把后一条用例吞成静默），因此每个用例都要一份干净的。
 // 复位**不走生产模块导出的 `reset*()`**：那种钩子进产物、是公开契约、生产零调用点。改成
-// `vi.resetModules()` + 动态 import —— 注意 `./App` 与 `./lib/proxy-start-claim` **必须一起重取**，
-// 只重取后者会让 App 仍持有旧实例，两边不再是同一个闸门，而本组要验的恰恰是它们的合璧。
-let handleProxyErrorEvent: typeof import('./App')['handleProxyErrorEvent'];
+// `vi.resetModules()` + 动态 import —— 注意 `./domain/proxy-error-routing` 与
+// `./lib/proxy-start-claim` **必须一起重取**，只重取后者会让路由模块仍持有旧实例，
+// 两边不再是同一个闸门，而本组要验的恰恰是它们的合璧。
+let handleProxyErrorEvent: typeof import('./domain/proxy-error-routing')['handleProxyErrorEvent'];
 let withProxyStartClaim: typeof import('./lib/proxy-start-claim')['withProxyStartClaim'];
 
 /**
  * 预热：把 `./App` 的**冷转换**成本挪出 `beforeEach`。
  *
+ * 射程说明（2026-09-06）：`handleProxyErrorEvent` 迁走之后，本文件里仍然按用例重取 `./App` 的
+ * 只剩下面 `handleHelperUpgradeable` 那一组（它测的函数还住在 `App.tsx`）。预热因此保留 ——
+ * 那一组的 `beforeEach` 依旧要付第一次冷转换。
+ *
  * `./App` 的静态模块图有 250 个模块 / 3.3MB 源码（AppShell → 全部 screens，含 NodesScreen 一支）。
- * 上面那套 `vi.resetModules()` + 动态 import 是每条用例都跑一遍，但**只有第一遍**要付 Vite 的
+ * 那套 `vi.resetModules()` + 动态 import 是每条用例都跑一遍，但**只有第一遍**要付 Vite 的
  * 冷转换（隔离实测 2.1s；之后每遍只是重执行已缓存的模块，约 30ms）。而 vitest 的 `hookTimeout`
  * 默认 10s ⇒ 这笔一次性冷转换被记在了**第一条用例的 beforeEach 头上**。
  *
@@ -88,7 +98,7 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     t.mockClear();
     refreshProxyStatus = vi.fn(async () => {});
     vi.resetModules();
-    ({ handleProxyErrorEvent } = await import('./App'));
+    ({ handleProxyErrorEvent } = await import('./domain/proxy-error-routing'));
     ({ withProxyStartClaim } = await import('./lib/proxy-start-claim'));
   });
 

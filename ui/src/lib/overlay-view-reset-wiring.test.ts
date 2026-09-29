@@ -30,6 +30,7 @@
  * **真机仍需看一眼**：窗显隐由 Rust 侧控制，`focus` 事件是否每次弹出都触发要设备上确认。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,7 +45,10 @@ function walk(dir: string, acc: string[] = []): string[] {
     if (e === 'node_modules' || e === 'dist') continue;
     const full = join(dir, e);
     if (statSync(full).isDirectory()) walk(full, acc);
-    else if (/\.tsx?$/.test(e) && !/\.(test|spec)\.tsx?$/.test(e)) acc.push(full);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (/\.tsx?$/.test(e) && !IS_TEST_ONLY_MODULE.test(e)) acc.push(full);
   }
   return acc;
 }

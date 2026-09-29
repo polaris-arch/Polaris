@@ -13,5 +13,6 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+polaris-source-probe = { version = "1.0.0", path = "../source-probe" }
 # tokio 仅测试用：驱动 WarpService 的 async 注册/注销流程（macros + 单线程 rt）。
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -36,8 +36,11 @@ import type {
   TlsSettings,
   WebSocketSettings,
 } from '@/contracts/types/protocol-settings';
-import type { FormValue, FormValues } from './FieldSpec';
-import { draftFromSpecs } from './FieldSpec';
+/* 规格纯数据层（`./field-spec`）而不是 `./FieldSpec` —— 后者是**渲染器**，import 它会把
+   `Csel` / `Fold` / `InfoIcon` 连同整条桌面组件链拖进每一个 import 本模块的包（移动端也 import
+   本模块）。两个符号的定义处本来就在 `./field-spec`，`FieldSpec.tsx` 只是把它们再导出一遍。 */
+import type { FormValue, FormValues } from './field-spec';
+import { draftFromSpecs } from './field-spec';
 import {
   allFields,
   whenTls,

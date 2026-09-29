@@ -50,6 +50,26 @@ fn cfg() -> Value {
     })
 }
 
+fn managed_cfg() -> Value {
+    let mut config = cfg();
+    let fixture: Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "ui/src/contracts/mesh-route-state.fixture.json"
+    ))
+    .unwrap();
+    config["meshRoutePolicy"] = fixture["meshRoutePolicy"].clone();
+    config["meshRoutePolicy"]["dnsPolicy"] = json!({
+        "schemaVersion": 1,
+        "suffixAssignments": [{
+            "suffix":"tail.example.invalid",
+            "target":{"kind":"owner","serverId":"ts-a","identityEpoch":"epoch-a"}
+        }],
+        "shortNamePolicy":{"kind":"system"},
+        "serviceOwner":{"kind":"reject"}
+    });
+    config["meshRouteState"] = fixture["meshRouteState"].clone();
+    config
+}
+
 // ── 分类 ──
 
 #[test]
@@ -119,7 +139,7 @@ fn classify_mesh_routes_protocols_by_declared_routes() {
 // ── countCategory ──
 
 #[test]
-fn count_category_all_eight() {
+fn count_category_legacy_classes_and_absent_mesh_routing() {
     let c = cfg();
     assert_eq!(count_category(&c, C::ManualNodes), 2);
     assert_eq!(count_category(&c, C::MeshNodes), 2);
@@ -135,6 +155,7 @@ fn count_category_all_eight() {
     );
     assert_eq!(count_category(&c, C::AppRules), 1);
     assert_eq!(count_category(&c, C::DnsResources), 4);
+    assert_eq!(count_category(&c, C::MeshRouting), 0);
     assert_eq!(count_category(&c, C::GeneralSettings), 1, "恒 1 = 整组");
 }
 
@@ -1031,6 +1052,7 @@ fn backup_categories_order_matches_frontend() {
             "dnsRules",
             "dnsResources",
             "appRules",
+            "meshRouting",
             "generalSettings"
         ]
     );
@@ -1061,6 +1083,97 @@ fn data_fields_and_excluded_are_disjoint() {
             "{f} 同时在两表里，语义冲突"
         );
     }
+}
+
+#[test]
+fn mesh_routing_export_is_portable_policy_only() {
+    let config = managed_cfg();
+    let only_policy = pick_categories(&config, &[C::MeshRouting]);
+    assert_eq!(detect_categories(&only_policy), vec![C::MeshRouting]);
+    assert_eq!(count_category(&only_policy, C::MeshRouting), 1);
+    assert_eq!(mesh_routing_owner_dependencies(&only_policy), vec!["ts-a"]);
+    assert_eq!(
+        only_policy["meshRouting"]["candidateOrder"],
+        json!(["ts-a", "ts-b"])
+    );
+    assert_eq!(
+        only_policy["meshRouting"]["assignments"][0]["target"],
+        json!({"kind":"owner","serverId":"ts-a"})
+    );
+    assert!(!only_policy.to_string().contains("identityEpoch"));
+    for forbidden in [
+        "meshRoutePolicy",
+        "meshRouteState",
+        "authKey",
+        "clashApiSecret",
+        "privacyPasswordHash",
+        "identityEffects",
+    ] {
+        assert!(only_policy.get(forbidden).is_none(), "{forbidden} escaped");
+    }
+    assert!(only_policy.get("servers").is_none());
+    let general = pick_categories(&config, &[C::GeneralSettings]);
+    assert!(general.get("meshRouting").is_none());
+    assert!(general.get("meshRoutePolicy").is_none());
+    assert!(general.get("meshRouteState").is_none());
+}
+
+#[test]
+fn mesh_routing_export_refuses_unknown_policy_fields_instead_of_copying_secrets() {
+    let mut config = managed_cfg();
+    config["meshRoutePolicy"]["authKey"] = json!("foreign-secret");
+    let picked = pick_categories(&config, &[C::MeshRouting]);
+    assert!(picked.get("meshRouting").is_none());
+    assert!(!picked.to_string().contains("foreign-secret"));
+}
+
+#[test]
+fn malicious_legacy_mesh_policy_is_visible_as_blocked_preview_dependency() {
+    let foreign = json!({
+        "meshRoutePolicy": {
+            "schemaVersion": 999,
+            "assignments": [{"cidr":"203.0.113.0/24", "target": {
+                "kind":"owner", "serverId":"foreign-ts", "identityEpoch":"foreign-epoch"
+            }}]
+        },
+        "meshRouteState": {"foreign":"ledger"}
+    });
+    assert_eq!(detect_categories(&foreign), vec![C::MeshRouting]);
+    assert_eq!(
+        mesh_routing_owner_dependencies(&foreign),
+        vec!["foreign-ts"]
+    );
+    assert!(pick_categories(&foreign, &[C::MeshRouting])
+        .get("meshRouting")
+        .is_none());
+}
+
+#[test]
+fn unselected_mesh_routing_keeps_local_policy_when_other_classes_merge() {
+    let current = managed_cfg();
+    let mut backup = pick_categories(&current, &[C::MeshRouting, C::GeneralSettings]);
+    backup["proxyMode"] = json!("global");
+    backup["meshRouting"]["candidateOrder"] = json!(["foreign-ts"]);
+    backup["meshRouteState"] = json!({"foreign":"ledger"});
+    let merged = merge_categories(&current, &backup, &[C::GeneralSettings]).config;
+    assert_eq!(merged["proxyMode"], "global");
+    assert_eq!(merged["meshRoutePolicy"], current["meshRoutePolicy"]);
+    assert_eq!(merged["meshRouteState"], current["meshRouteState"]);
+    assert!(merged.get("meshRouting").is_none());
+}
+
+#[test]
+fn old_backup_missing_mesh_routing_skips_without_clearing_local_policy() {
+    let current = managed_cfg();
+    let backup = json!({"proxyMode":"global"});
+    let outcome = merge_categories(&current, &backup, &[C::MeshRouting, C::GeneralSettings]);
+    assert!(outcome.skipped.contains(&C::MeshRouting));
+    assert_eq!(
+        outcome.config["meshRoutePolicy"],
+        current["meshRoutePolicy"]
+    );
+    assert_eq!(outcome.config["meshRouteState"], current["meshRouteState"]);
+    assert_eq!(outcome.config["proxyMode"], "global");
 }
 
 // ── 网络场景随规则类导出 / 导入（N2，spec §7 D12）──────────────────────────────

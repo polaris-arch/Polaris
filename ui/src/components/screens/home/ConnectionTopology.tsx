@@ -19,7 +19,7 @@ import { useTranslation } from 'react-i18next';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { editRoute } from '@/lib/staged-config';
-import { validateRuleValue, type RuleSubject } from '@/domain/rules';
+import { ruleSubjectForValue, type RuleSubject } from '@/domain/rules';
 import { RuleSubjectMenuItems } from '@/components/RuleSubjectMenuItems';
 import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
@@ -230,16 +230,12 @@ function ConnectionTopologyView({ disconnected }: ConnectionTopologyProps) {
     setMenu({ x: clientX - wrap.left, y: clientY - wrap.top, value });
   }, []);
 
-  const menuSubject = useMemo<RuleSubject | null>(() => {
-    if (!menu) return null;
-    if (validateRuleValue('ipCidr', menu.value)) {
-      return { kind: 'ip', type: 'ipCidr', value: menu.value };
-    }
-    if (validateRuleValue('domain', menu.value)) {
-      return { kind: 'domain', type: 'domain', value: menu.value };
-    }
-    return null;
-  }, [menu]);
+  /* 判据在 `domain/rules.ts#ruleSubjectForValue`（移动端首页主机 Top 是同一条判据的第二个消费方）。
+     先 IP 后域名这个顺序也在那里，连同它为什么是判据的一部分。 */
+  const menuSubject = useMemo<RuleSubject | null>(
+    () => (menu ? ruleSubjectForValue(menu.value) : null),
+    [menu],
+  );
 
   /**
    * 快速代理/直连：类型由当前观测对象决定，与“新建规则”弹窗和“加入已有”共用同一对象。

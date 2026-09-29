@@ -21,8 +21,70 @@ fn system_endpoint_servers(system: bool) -> Vec<ServerConfig> {
         json!({"id":"ov-system", "name":"OV", "protocol":"openvpn-client",
             "openvpnClientSettings":{"server":"vpn.example", "server_port":1194, "tls":{}, "system":system}}),
         json!({"id":"raw-system", "name":"Custom", "protocol":"custom",
-            "customSettings":{"isEndpoint":true,"outbound":{"type":"tailscale", "system_interface":system}}}),
+            "customSettings":{"isEndpoint":true,"outbound":{"type":"wireguard", "system_interface":system}}}),
     ].into_iter().map(|value| serde_json::from_value(value).unwrap()).collect()
+}
+
+#[test]
+fn raw_tailscale_is_partitioned_before_any_endpoint_construction() {
+    let servers: Vec<ServerConfig> = [
+        json!({"id":"typed-ts", "name":"Typed", "protocol":"tailscale"}),
+        json!({"id":"raw-ts", "name":"Raw", "protocol":"custom", "customSettings":{
+            "isEndpoint":true,
+            "outbound":{"type":"tailscale", "state_directory":"/must-not-initialize"}
+        }}),
+    ]
+    .into_iter()
+    .map(|value| serde_json::from_value(value).unwrap())
+    .collect();
+    let plan = plan_temp_core(&servers, &env());
+    assert_eq!(plan.tailscale, ["typed-ts", "raw-ts"]);
+    assert!(plan.testable.is_empty());
+    assert!(plan.unusable.is_empty());
+}
+
+#[test]
+fn android_auth_stays_in_memory_and_rejects_identity_escape() {
+    let auth = InboundUser {
+        username: "polaris-temp".to_owned(),
+        password: "0123456789abcdef0123456789abcdef".to_owned(),
+    };
+    let raw = json!({
+        "log": {"level":"warn"}, "dns": {}, "route": {},
+        "inbounds":[{"type":"http","tag":"in-1","listen":"127.0.0.1","listen_port":43123}],
+        "outbounds":[{"type":"direct","tag":"direct"}]
+    })
+    .to_string();
+    let bridged = authenticated_android_temp_config(&raw, &auth).unwrap();
+    assert!(
+        !raw.contains("users"),
+        "disk input must omit this round's HTTP inbound credential"
+    );
+    assert!(!raw.contains(&auth.password));
+    let parsed: Value = serde_json::from_str(&bridged).unwrap();
+    assert_eq!(parsed["inbounds"][0]["users"][0]["password"], auth.password);
+    let mut invalid: Value = serde_json::from_str(&raw).unwrap();
+    invalid["endpoints"] = json!([{"type":"tailscale","state_directory":"/tmp/identity"}]);
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid.as_object_mut().unwrap().remove("endpoints");
+    invalid["outbounds"] = json!([{"type":"tailscale","tag":"hidden"}]);
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid["outbounds"] = json!([{"type":"direct","tag":"direct"}]);
+    invalid["experimental"] = json!({"cache_file":{"path":"/tmp/identity"}});
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid.as_object_mut().unwrap().remove("experimental");
+    invalid["inbounds"][0]["listen"] = json!("0.0.0.0");
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid["inbounds"][0]["listen"] = json!("127.0.0.1");
+    invalid["inbounds"] = Value::Array(vec![
+        json!({"type":"http","tag":"in-1","listen":"127.0.0.1","listen_port":43123});
+        513
+    ]);
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid["inbounds"] =
+        json!([{"type":"http","tag":"in-1","listen":"127.0.0.1","listen_port":43123}]);
+    invalid["outbounds"] = json!({"type":"direct"});
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
 }
 
 #[test]
@@ -1524,8 +1586,51 @@ struct FakeSpawner {
     stderr_written: tokio::sync::watch::Sender<usize>,
 }
 
+/// Simulates the two Android paths where native ownership cannot be released:
+/// start returns an unresolved cleanup, or a successfully started host cannot close.
+struct UnknownCleanupSpawner {
+    spawns: Arc<AtomicUsize>,
+    fail_during_spawn: bool,
+}
+
+struct UnknownCleanupChild;
+
+#[async_trait]
+impl LoginCoreChild for UnknownCleanupChild {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+    async fn wait(&mut self) {
+        std::future::pending::<()>().await;
+    }
+    async fn terminate(&mut self) {}
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        Err("native cleanup unconfirmed".to_string())
+    }
+}
+
+#[async_trait]
+impl LoginCoreSpawner for UnknownCleanupSpawner {
+    async fn spawn(
+        &self,
+        _req: SpawnRequest,
+    ) -> Result<Box<dyn LoginCoreChild>, polaris_core_supervisor::SpawnError> {
+        self.spawns.fetch_add(1, Ordering::SeqCst);
+        if self.fail_during_spawn {
+            return Err(polaris_core_supervisor::SpawnError::Spawn {
+                bin: PathBuf::from("android-libbox"),
+                source: std::io::Error::other(TempCoreCleanupUnknown(
+                    "native cleanup unconfirmed".to_string(),
+                )),
+            });
+        }
+        Ok(Box::new(UnknownCleanupChild))
+    }
+}
+
+#[async_trait]
 impl LoginCoreSpawner for FakeSpawner {
-    fn spawn(
+    async fn spawn(
         &self,
         req: SpawnRequest,
     ) -> Result<Box<dyn LoginCoreChild>, polaris_core_supervisor::SpawnError> {
@@ -3699,6 +3804,30 @@ fn multi_batch_harness(nodes: usize, spawn_fail_at: Option<usize>) -> Harness {
             ..Default::default()
         },
     )
+}
+
+#[tokio::test]
+async fn unconfirmed_native_cleanup_stops_later_batches_for_both_start_and_close() {
+    let nodes = naive_nodes(300);
+    assert!(plan_temp_core_batches(&nodes).len() > 1);
+    for fail_during_spawn in [true, false] {
+        let mut h = multi_batch_harness(nodes.len(), None);
+        h.deps.spawner = Arc::new(UnknownCleanupSpawner {
+            spawns: Arc::clone(&h.spawns),
+            fail_during_spawn,
+        });
+        let (out, _) = run_round(&h, &nodes).await;
+        assert!(
+            matches!(out, TempCoreOutcome::CleanupUnknown(ref detail) if detail == "native cleanup unconfirmed"),
+            "native cleanup must not degrade into a recoverable failed batch: {out:?}"
+        );
+        assert_eq!(
+            h.spawns.load(Ordering::SeqCst),
+            1,
+            "a second batch started with unresolved native ownership"
+        );
+        cleanup(&h.dir);
+    }
 }
 
 /// 收集一轮里的事件（保序）。

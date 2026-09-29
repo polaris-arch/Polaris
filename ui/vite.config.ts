@@ -62,15 +62,25 @@ export default defineConfig({
     chunkSizeWarningLimit: 700,
 
     rollupOptions: {
-      // 多入口：主窗（index）+ mini 更新弹窗（update-popup）+ 托盘自绘浮层（tray）。
+      // 多入口：主窗（index）+ mini 更新弹窗（update-popup）+ 托盘自绘浮层（tray）+ 移动端外壳（mobile）。
       //
       // 弹窗/浮层**刻意不复用 index.html**：复用主入口会把整个 React 应用（i18n / 路由 / 全部 provider）
       // 塞进小窗——既拖慢首帧，又会让主窗白屏自愈门（`window_health.rs` 只认 label=="main"）对着它们误判。
       // update-popup 是零框架 vanilla TS；tray 浮层需真实接线（连接态/节点/api）故用精简 React 入口。
+      //
+      // `mobile` 走独立入口的理由**与上面那两个不同**（上面那条理由在移动端不成立：移动外壳就是
+      // label=="main" 的整个应用，白屏自愈门正该管它）。真正的判据是 **CSS 契约 A1**：移动端唯一
+      // token 入口是 `src/styles/tokens.resolved.css`，**不得**走桌面那条 `index.css` 五层层叠链。
+      // 而 `index.html` → `src/main.tsx` 里 `import './styles/index.css'` 是**静态**的：同一份文档
+      // 服务两端，移动端必然连带整条桌面层叠。要在同一文档里躲开它，只能把桌面 CSS 改成动态 chunk
+      // ——那等于**为移动端把桌面首帧从"HTML 里的阻塞 <link>"降级成"JS 跑起来才注入"**，把 FOUC
+      // 窗口开给已发布的桌面产品。一份文档一个平台，是这里唯一不拿桌面首帧换的形态。
+      // 装载面（谁在 Android 上打开 mobile.html）见 `src-tauri/src/lib.rs` 的 `create_main_window`。
       input: {
         index: path.resolve(import.meta.dirname, 'index.html'),
         'update-popup': path.resolve(import.meta.dirname, 'update-popup.html'),
         tray: path.resolve(import.meta.dirname, 'tray.html'),
+        mobile: path.resolve(import.meta.dirname, 'mobile.html'),
       },
     },
   },

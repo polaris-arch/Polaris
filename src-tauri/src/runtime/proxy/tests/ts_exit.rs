@@ -1,5 +1,38 @@
 use super::*;
 
+fn save_ts_runtime_fixture(rt: &Arc<ProxyRuntime>, config: &Value) {
+    rt.config.save_full(config).expect("save cfg");
+    *rt.current_config.write().unwrap() = Some(rt.config.current().expect("normalized R"));
+}
+
+#[tokio::test]
+async fn deferred_disk_selection_cannot_change_running_ts_exit_gate() {
+    let (rt, _dir) = test_runtime();
+    let runtime = ts_exit_config(None);
+    save_ts_runtime_fixture(&rt, &runtime);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        ..Default::default()
+    };
+    seed_ts_frame(&rt, vec![]);
+
+    let mut disk = runtime.clone();
+    disk["selectedServerId"] = serde_json::json!("__direct__");
+    rt.config.save_full(&disk).unwrap();
+    assert_eq!(
+        rt.selected_ts_exit_block(),
+        Some("ts-no-exit-device"),
+        "D 已保存直连但旧 R 仍是无效 TS 出口，推侧必须按 R 判定"
+    );
+
+    *rt.current_config.write().unwrap() = Some(disk);
+    assert_eq!(
+        rt.selected_ts_exit_block(),
+        None,
+        "只有 R 真正改为直连后推侧才解除无效出口门"
+    );
+}
+
 /// A3 relay 组合面门：一帧全量端点快照 → 缓存整体更新（幽灵过滤）+ 逐在册端点 `emit_tailscale_status`。
 /// 打断 emit 循环 → 记录空转红；打断解码幽灵过滤 → len 转红；打断 `update_ts_status` → 缓存空转红。
 #[tokio::test]
@@ -468,9 +501,7 @@ fn ts_exit_block_reason_projects_the_frontend_contract_values() {
 #[tokio::test]
 async fn exit_block_is_none_when_status_cache_empty() {
     let (rt, _dir) = test_runtime();
-    rt.config
-        .save_full(&ts_exit_config(None))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(None));
     assert!(
         rt.selected_ts_exit_block().is_none(),
         "无任何 TS STATUS 帧 ⇒ 判定恒 None（廉价前置与全量判定必须同结论）"
@@ -519,7 +550,7 @@ async fn selected_ts_exit_block_projection_matches_typed_parse() {
 
     for mode in ["smart", "direct"] {
         cfg["proxyMode"] = serde_json::json!(mode);
-        rt.config.save_full(&cfg).expect("save cfg");
+        save_ts_runtime_fixture(&rt, &cfg);
         // typed 路：原样重建（这正是被替换掉的那段实现）。
         let canonical = rt.config.current().expect("读取规范化当前配置");
         let typed: UserConfig = serde_json::from_value(canonical).expect("typed 解析");
@@ -571,9 +602,7 @@ async fn selected_ts_exit_block_projection_matches_typed_parse() {
 #[tokio::test]
 async fn ts_exit_none_to_blocked_marks_terminal_state_and_invalidates_with_flag() {
     let (rt, _dir, inval, refreshes, marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(None))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(None));
     seed_ts_frame(&rt, vec![]);
 
     rt.reconcile_ts_exit_block(rt.gate.generation());
@@ -603,9 +632,7 @@ async fn ts_exit_none_to_blocked_marks_terminal_state_and_invalidates_with_flag(
 #[tokio::test]
 async fn ts_exit_same_state_frames_never_re_fire() {
     let (rt, _dir, inval, _refreshes, marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(None))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(None));
     seed_ts_frame(&rt, vec![]);
 
     rt.reconcile_ts_exit_block(rt.gate.generation());
@@ -622,9 +649,7 @@ async fn ts_exit_same_state_frames_never_re_fire() {
 #[tokio::test]
 async fn ts_exit_reason_change_is_a_transition_too() {
     let (rt, _dir, _inval, _refreshes, marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(Some("exit-host")))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(Some("exit-host")));
     *rt.status.write().unwrap() = ProxyStatus {
         running: true,
         ..Default::default()
@@ -658,9 +683,7 @@ async fn ts_exit_reason_change_is_a_transition_too() {
 #[tokio::test]
 async fn ts_exit_blocked_to_none_runs_recovery_leg_not_a_bare_reprobe() {
     let (rt, _dir, inval, refreshes, marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(Some("exit-host")))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(Some("exit-host")));
     *rt.status.write().unwrap() = ProxyStatus {
         running: true,
         ..Default::default()
@@ -739,9 +762,7 @@ async fn ts_exit_recovery_single_flight_records_pending_for_late_comers() {
 #[tokio::test]
 async fn drop_reclaims_the_edge_lost_between_the_loop_check_and_the_guard() {
     let (rt, _dir, _inval, _refreshes, _marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(Some("exit-host")))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(Some("exit-host")));
     *rt.status.write().unwrap() = ProxyStatus {
         running: true,
         ..Default::default()
@@ -825,9 +846,7 @@ async fn drop_reclaims_the_edge_lost_between_the_loop_check_and_the_guard() {
 #[tokio::test]
 async fn superseded_recovery_leg_must_not_reprobe_a_dead_core() {
     let (rt, _dir, _inval, refreshes, _marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(Some("exit-host")))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(Some("exit-host")));
     *rt.current_config.write().unwrap() = Some(ts_exit_config(Some("exit-host")));
     let stale = rt.gate.generation();
     rt.bump_generation(); // 停核 / 新 start 接管
@@ -860,9 +879,7 @@ async fn superseded_recovery_leg_must_not_reprobe_a_dead_core() {
 #[tokio::test]
 async fn a_superseded_frame_must_not_poison_the_next_session_reconcile_cache() {
     let (rt, _dir, _inval, _refreshes, marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(None))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(None));
     seed_ts_frame(&rt, vec![]);
     let stale = rt.gate.generation();
     // 停核：bump 世代 + 复位会话起点缓存。
@@ -922,9 +939,7 @@ fn reconcile_generation_guard_is_inside_the_cache_lock() {
 #[tokio::test]
 async fn ts_exit_recover_once_ends_with_a_reprobe() {
     let (rt, _dir, _inval, refreshes, _marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(Some("exit-host")))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(Some("exit-host")));
     *rt.current_config.write().unwrap() = Some(ts_exit_config(Some("exit-host")));
 
     rt.ts_exit_recover_once(rt.gate.generation()).await;
@@ -951,7 +966,7 @@ async fn ts_exit_recover_once_ends_with_a_reprobe() {
 ///
 /// # 为什么只能是源码型判据
 ///
-/// 这是**纯性能**改动：`current()` 与 `with_current()` 读的是同一份缓存、结论逐字节相同，故把
+/// 这是**纯性能**改动：每帧不可把整份配置深拷贝出来；把
 /// 任何一处改回 `current()`，全部行为断言（`selected_ts_exit_block_projection_matches_typed_parse`
 /// / `exit_block_is_none_when_status_cache_empty` / 心跳那几条）**照样全绿** —— 省下的那次深拷贝
 /// 在单测里根本不可观测。没有这条守卫，「热路径不深拷贝」就只是注释里的一句话。
@@ -959,10 +974,10 @@ async fn ts_exit_recover_once_ends_with_a_reprobe() {
 /// 三条腿的节奏：`selected_ts_exit_block` = TS STATUS relay **每帧（~1Hz）**；
 /// 另两条 = 自动换节点心跳**每 tick**（`HEARTBEAT_INTERVAL_MS`，核在跑就一直跑）。
 ///
-/// **双向断言**（缺一都能被绕过）：禁 `.current()` 挡住回退；要求 `.with_current(` 挡住
-/// 「把配置读整个删掉」这种让负面断言恒真的改法。
+/// **双向断言**（缺一都能被绕过）：禁 `.current()` 挡住回退；TS 推侧必须读 R 的
+/// `current_config` 引用，其余自动换节点腿仍走 D 的 `.with_current(` 投影。
 ///
-/// **变异锁**：任一方法体里把 `.with_current(` 换回 `.current()` ⇒ 逐条转红。
+/// **变异锁**：任一方法体里把借用/投影换回 `.current()` ⇒ 逐条转红。
 #[test]
 fn periodic_legs_read_config_by_projection_not_full_clone() {
     let src = module_code("runtime/proxy");
@@ -977,11 +992,18 @@ fn periodic_legs_read_config_by_projection_not_full_clone() {
             "`{head}` 是常驻周期腿，出现了 `config.current()` —— 那是每帧/每 tick 一次整份配置\
                  深拷贝（含 200 节点级 servers）。改用 `with_current(|v| …)` 只投影要用的字段。"
         );
-        assert!(
-            body.contains(".with_current("),
-            "`{head}` 里连 `with_current` 都没有了 —— 负面断言会因此恒真（门被抽空）。\
-                 若确实不再读配置，请连同本守卫的这一项一起删掉，而不是留个空壳。"
-        );
+        if head.contains("selected_ts_exit_block") {
+            assert!(
+                body.contains(".current_config") && body.contains(".read()"),
+                "TS 推侧须借用运行 R 且不得深拷贝或退回磁盘 D"
+            );
+            assert!(!body.contains("self.config"), "TS 推侧不得读未应用的 D");
+        } else {
+            assert!(
+                body.contains(".with_current("),
+                "自动换节点周期腿必须只投影 D 所需字段，不能删掉配置读取"
+            );
+        }
     }
 }
 
@@ -1079,9 +1101,7 @@ async fn reapply_ts_exit_node_requires_exit_node_and_stable_id() {
 #[tokio::test]
 async fn reset_clears_the_reconcile_cache_but_never_the_single_flight_token() {
     let (rt, _dir, _inval, _refreshes, marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(None))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(None));
     seed_ts_frame(&rt, vec![]);
     rt.reconcile_ts_exit_block(rt.gate.generation());
     assert_eq!(marks.lock().unwrap().len(), 1);
@@ -1121,9 +1141,7 @@ async fn reset_clears_the_reconcile_cache_but_never_the_single_flight_token() {
 async fn ts_status_frame_drives_the_exit_block_reconcile() {
     use polaris_singbox_grpc::daemon;
     let (rt, _dir, _inval, _refreshes, marks) = test_runtime_r2();
-    rt.config
-        .save_full(&ts_exit_config(None))
-        .expect("save cfg");
+    save_ts_runtime_fixture(&rt, &ts_exit_config(None));
     let tag_to_id = BTreeMap::from([("组网出口".to_string(), "ts1".to_string())]);
     let update = daemon::TailscaleStatusUpdate {
         endpoints: vec![daemon::TailscaleEndpointStatus {

@@ -24,6 +24,12 @@ pub enum StoreError {
     /// 文件系统错误（读/写/创建目录）。运行时层填充，纯逻辑测试用 mock。
     #[error("io error: {0}")]
     Io(String),
+
+    /// Rename may already have published a complete managed document, but its
+    /// directory durability could not be confirmed. Callers must re-read disk
+    /// under the write lock and must not continue external Apply side effects.
+    #[error("config commit uncertain: {0}")]
+    CommitUncertain(String),
 }
 
 impl StoreError {

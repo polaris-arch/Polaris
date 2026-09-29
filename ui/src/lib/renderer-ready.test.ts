@@ -48,7 +48,10 @@ describe('renderer-ready 文档级出口', () => {
 describe('W27 首个可交互帧接线', () => {
   const router = read('../components/screens/ScreenRouter.tsx');
   const app = read('../App.tsx');
-  const main = read('../main.tsx');
+  // 同步 mount 失败的兜底路径已从 `main.tsx` 抽进共享模块（两个入口 —— 桌面 `main.tsx` 与移动端
+  // `mobile/MobileMain.tsx` —— 共用同一份）。「两个入口都真的 catch 到这个兜底里」由
+  // `renderer-recovery.test.ts` 逐入口正面钉住；本条只钉「该兜底复用 ready 出口」这一半。
+  const recovery = read('./renderer-recovery.ts');
   const boundary = read('../components/ErrorBoundary.tsx');
 
   it('ready 从 App 外壳下沉到页面提交边界', () => {
@@ -70,7 +73,7 @@ describe('W27 首个可交互帧接线', () => {
   });
 
   it('React 同步失败与根 ErrorBoundary 都复用 ready 出口', () => {
-    expect(main).toContain('reportRendererReady();');
+    expect(recovery).toContain('reportRendererReady();');
     expect(boundary).toContain('reportRendererReady();');
     expect(boundary).not.toContain("reportSafely('renderer_ready')");
   });

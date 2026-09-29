@@ -2,6 +2,10 @@
 //!
 //! 映射 channel：
 //! - `system:listProcesses` → [`system_list_processes`]（路由规则的进程快速选择器）
+//! - `system_backup_set` / `system_backup_get_status`（**Android 专属**：系统自动备份开关，默认关）
+//! - `system:listInstalledApps` → [`system_list_installed_apps`]（**Android 专属**：同一个选择器
+//!   在 Android 上要的是 applicationId 而不是进程名。两条腿并列而不是合并 —— 合并成一个「列出
+//!   可选目标」的命令会让两种 ID 混进同一列，而它们喂的是 sing-box 的两条不同路由判据）
 //!
 //! 进程枚举按平台取**可执行真实路径**（picker 选出的 name/path 会成为 processName/processPath
 //! 路由规则值，必须与 sing-box 的进程匹配口径一致，否则据其建的规则永不命中 → 静默路由失效）：
@@ -23,7 +27,8 @@ use tauri::State;
 use polaris_helper_proto::Platform;
 use polaris_system_integration::{Command, CommandRunner, StdCommandRunner};
 
-use crate::response::ApiResponse;
+use crate::response::{ok_void, ApiResponse};
+use crate::runtime::proxy::android_bridge::{self, InstalledApp};
 use crate::runtime::AppRuntime;
 
 /// 进程枚举命令的硬超时（本机 `ps`/`tasklist` 均在毫秒级返回；5s 仅作挂起兜底）。
@@ -119,10 +124,21 @@ fn macos_interface_display_names() -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn list_network_interfaces_blocking() -> Vec<NetworkInterfaceInfo> {
     match Platform::current() {
         Platform::Mac => enumerate_unix_interfaces(&macos_interface_display_names()),
-        Platform::Linux | Platform::Other => enumerate_unix_interfaces(&BTreeMap::new()),
+        // iOS 与 Linux 同臂，**但依据只对了一半，故在此写明**：`getifaddrs` 在 iOS 上
+        // 确实存在且不需要权限（Darwin 系统调用面），故取材口成立；同样没有 macOS 那种
+        // 「服务名 ↔ 设备名」映射层（`networksetup` 不存在），故传空 map 也成立。
+        //
+        // **未验证**：iOS 上 `getifaddrs` 返回的接口集合是否受沙箱裁剪（尤其 NE 扩展进程内
+        // 与 app 进程内是否同答）未真机取证。Android 的移动界面已接独立 ConnectivityManager 桥，
+        // 不使用本臂的系统枚举。
+        Platform::Linux | Platform::Other | Platform::Ios => {
+            enumerate_unix_interfaces(&BTreeMap::new())
+        }
+        Platform::Android => unreachable!("Android interfaces require the async native bridge"),
         Platform::Win => {
             #[cfg(windows)]
             {
@@ -297,7 +313,34 @@ fn aggregate(rows: impl IntoIterator<Item = (String, Option<String>)>) -> Vec<Sy
 /// `spawn_blocking` 里调——含同步 IO / 子进程等待，不得在 async executor 线程直跑。
 fn list_processes_blocking() -> Result<Vec<SystemProcessInfo>, String> {
     match Platform::current() {
-        Platform::Linux => enumerate_linux_processes(),
+        // Android 与 Linux 同臂 —— 而**原先它落在 `Mac | Other` 那条 `ps` 腿上，那是错的**
+        // （2026-09-04 K10）。那条腿跑的是 `/usr/bin/env LC_ALL=… ps -axo comm=`，它在 Android 上
+        // 有**两个各自独立、都致命**的问题（AVD `polaris-test` / Android 16 逐条实测）：
+        //
+        //   1. `ls /usr/bin/env` → `No such file or directory`（Android 的 env 在 `/system/bin/env`，
+        //      是 toybox 的软链）⇒ 子进程 spawn 当场失败。
+        //   2. 就算改对了路径也没用：`ps -axo comm=` → `ps: Unknown option 'xo'`。Android 的
+        //      `ps` 是 toybox 版，不认 BSD 风格的 `-axo`。
+        //
+        // 两条叠加 ⇒ 该命令在 Android 上恒 `Err`。改走 Linux 腿（读 `/proc`）是这个平台上唯一
+        // 能给出答案的取材口 —— Android 就是 Linux 内核，`/proc` 在。
+        //
+        // 仍要说清它的**天花板**：Android 7 起 `/proc` 有 hidepid，非 root 应用只看得见自己的进程 ⇒
+        // 结果是一条而不是一屏。这仍然比一个恒定的错误诚实（消费方是路由规则的进程选择器，
+        // 移动端目前不接线，见本次审计登记）。
+        // iOS **独立成臂**，且答案与 Android 相反 —— 这一格是本批少数「不能跟随 Android」的
+        // 地方，合并进去会引入一条注定失败的子进程。
+        //
+        // Android 走 `/proc` 是因为它就是 Linux 内核。iOS 是 Darwin，**没有 `/proc`**；而
+        // `Mac | Other` 那条 `ps` 腿在 iOS 上同样不成立（沙箱内无可执行 `ps`，`/usr/bin/env`
+        // 也不存在）。两条现成的腿都是错的，故返 `Err`：本函数的契约就是「拉不到」与「一个
+        // 都没有」必须可分辨（见 `system_list_processes` 头注），返空 Vec 会把前者伪装成后者。
+        //
+        // 顺带说清天花板：即便将来接一条 `sysctl(KERN_PROC)`，iOS 9 起它对第三方应用只返回
+        // 本进程，与 Android 的 hidepid 是同一类限制。消费方是路由规则的进程选择器，
+        // 移动端未接线。
+        Platform::Ios => Err("进程枚举在 iOS 上不可用：无 /proc，且沙箱内无可执行 ps".to_owned()),
+        Platform::Linux | Platform::Android => enumerate_linux_processes(),
         Platform::Win => {
             let out = StdCommandRunner.run(&windows_tasklist_command(), PROCESS_LIST_TIMEOUT)?;
             Ok(parse_tasklist_output(&out.stdout))
@@ -333,16 +376,98 @@ pub async fn system_list_processes(
     }
 }
 
+/// Shared interface source for UI, import and runtime observation. A successful empty Android
+/// snapshot means no physical Network is currently available; bridge failure remains an error.
+pub(crate) async fn list_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, String> {
+    #[cfg(target_os = "android")]
+    {
+        android_bridge::bindable_interfaces().await.map(|rows| {
+            rows.into_iter()
+                .map(|row| NetworkInterfaceInfo {
+                    name: row.name,
+                    display_name: row.display_name,
+                    is_up: row.is_up,
+                    addresses: row.addresses,
+                })
+                .collect()
+        })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        tokio::task::spawn_blocking(list_network_interfaces_blocking)
+            .await
+            .map_err(|error| {
+                log::warn!("网卡枚举任务失败: {error}");
+                "network_interface_list_failed".to_owned()
+            })
+    }
+}
+
 /// 枚举代理内核可绑定的系统网卡。纯只读，不修改路由、DNS 或接口状态。
 #[tauri::command]
 pub async fn system_list_network_interfaces(
     _state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<Vec<NetworkInterfaceInfo>>, ()> {
-    match tokio::task::spawn_blocking(list_network_interfaces_blocking).await {
-        Ok(items) => Ok(ApiResponse::ok(items)),
+    Ok(match list_network_interfaces().await {
+        Ok(items) => ApiResponse::ok(items),
+        Err(_) => ApiResponse::err("network_interface_list_failed"),
+    })
+}
+
+/// `system_list_installed_apps`：Android 已装应用枚举（**「自定义应用」分流表单的包名来源**）。
+///
+/// # 它与 [`system_list_processes`] 是同一件事的两个平台形态
+///
+/// `crates/config-engine/src/user_config/app_rules_preset_data.rs` 自己写着这句话：
+/// `package_names` 与 `process_names` 是同一件事的两个平台形态。桌面按进程名匹配
+/// （sing-box 的 `process_name` 路由规则），Android 按 applicationId 匹配
+/// （`VpnService.Builder.addDisallowedApplication`）。
+///
+/// 今天 `app_rules_preset.rs` 里自定义预设的 `package_names` **恒空**（那里的注释也如实写了
+/// 「正解是给自定义预设开一个从已装应用里选包名的字段，那是另一批」）—— 于是「自定义应用设成
+/// 直连」在 Android 上一条规则都命不中，且是**静默**的。本命令补的就是那一格的数据源。
+///
+/// # 失败**不返空表**
+///
+/// 空表与「这台机器上真的一个第三方应用都没有」在渲染端不可区分，而后者几乎不可能、前者
+/// （包可见性没声明对 / 桥没接线 / 本平台没有这条腿）很可能。故一律 `success:false` + 原因，
+/// 由界面照实说「读不到」。射程与两条路线的取舍见
+/// `PolarisVpnPlugin.PACKAGE_VISIBILITY_ROUTE` 的文档。
+#[tauri::command]
+pub async fn system_list_installed_apps() -> ApiResponse<Vec<InstalledApp>> {
+    match android_bridge::installed_apps().await {
+        Ok(apps) => ApiResponse::ok(apps),
         Err(error) => {
-            log::warn!("网卡枚举任务失败: {error}");
-            Ok(ApiResponse::err("network_interface_list_failed"))
+            log::warn!("已装应用枚举失败: {error}");
+            ApiResponse::err(error)
+        }
+    }
+}
+
+/// `system_backup_set`：「系统备份」开关（**Android 专属**：Auto Backup 的运行期闸门，默认关）。
+///
+/// 执行侧真值住 Kotlin（`PolarisBackupAgent`，开关文件在 `noBackupFilesDir`）；本命令只是经桥写它。
+/// 非 Android 一律 `success:false`（设置页只在移动端画这一行）。
+#[tauri::command]
+pub async fn system_backup_set(enabled: bool) -> ApiResponse<()> {
+    match android_bridge::set_system_backup(enabled).await {
+        Ok(()) => ok_void(),
+        Err(error) => {
+            log::warn!("写系统备份开关失败: {error}");
+            ApiResponse::err(error)
+        }
+    }
+}
+
+/// `system_backup_get_status`：读「系统备份」开关（读执行侧真值，不存配置文件 —— user config 自己会随
+/// 备份走，存那里的副本恢复后会与本机真值不一致）。
+#[tauri::command]
+pub async fn system_backup_get_status() -> ApiResponse<bool> {
+    match android_bridge::system_backup().await {
+        Ok(enabled) => ApiResponse::ok(enabled),
+        Err(error) => {
+            log::warn!("读系统备份开关失败: {error}");
+            ApiResponse::err(error)
         }
     }
 }

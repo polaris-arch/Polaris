@@ -44,7 +44,7 @@ import { useStagingActive } from '@/store/use-staging-active';
 import { editRoute, splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { useSwitchNode } from '@/components/screens/shared/use-switch-node';
-import { willRestartOnSelect } from '@/components/screens/home/pending-select-hint';
+import { needsApplyOnSelect } from '@/components/screens/home/pending-select-hint';
 import { useAnchoredMenu } from '@/lib/use-anchored-menu';
 import {
   invalidNodeIndex,
@@ -304,19 +304,16 @@ export function NodesScreen() {
 
   /* ── 设为出口（整卡点击 + 卡上按钮共用这一条腿）──
    *
-   * 切换本体走 `useSwitchNode`，与首页出口选单同一份实现（先判后切 / 差集走 pull / toast 互斥）。
+   * 切换本体走 `useSwitchNode`，与首页出口选单同一份收据判定与反馈。
    *
-   * **默认单击直切，不套二次确认**：`server_switch` 对运行结构未变的选择可热切；
-   * 结构变化则由后端受控重启或留下待应用。它在暂存层 `BYPASS_TABLE` 里被显式豁免（W-1），
-   * 首页出口框/状态栏节点名即时回显选择；误点可再次选择切回，
+   * **默认单击直切，不套二次确认**：`server_switch` 保存选择并等待有归属的应用结果，
+   * `BYPASS_TABLE` 只保证选中值即时保存，不保证活核已应用。误点的代价是「选中项立刻变更、可再点回」，
    * 用高频动作的确认税去防这个是亏的；更要紧的是全仓 `useConfirmTwice` 现在只服务删除/清空/重置，
    * 掺进一个可逆操作会让「点两次 = 有危险」这个信号失效。
    *
-   * **唯一例外**：选中「待入池/待生效」差集里的节点会让它由未引用变被引用 ⇒ 恒立即整核重启、
-   * 断掉现有连接。那一次确认有信息量，故武装 confirmTwice。
-   * 武装判据读 store 快照即可（它只决定「要不要先确认」这一步，滞后一拍最多是少确认一次）；
-   * 真正的 toast 分支仍由 `useSwitchNode` 内部按 pull 到的**切换前瞬时**真值决定。
-   * 谓词复用 `willRestartOnSelect`（首页预判同一个）—— 在这里另写一份 `added ∪ modified` 就是
+   * **唯一例外**：选中待应用差集里的节点先说明可能仍需 Apply，再由用户确认。
+   * 预提示读 store 快照即可；实际结果只由 `useSwitchNode` 消费后端收据。
+   * 谓词复用 `needsApplyOnSelect` —— 在这里另写一份 `added ∪ modified` 就是
    * 把同一条判据分叉成两份，改一处忘一处时两个入口的确认行为会不一致。
    */
   const switchNode = useSwitchNode();
@@ -326,11 +323,11 @@ export function NodesScreen() {
       const action = nodeUseAction(
         server.id,
         selectedServerId,
-        willRestartOnSelect(pendingChanges, server.id),
+        needsApplyOnSelect(pendingChanges, server.id),
         via
       );
       if (action === 'noop') return;
-      // 显式按钮 + 不重启那档：直切，不收确认税（判据见 nodeUseAction 头注）。
+      // 显式按钮 + 无待应用提示：直切，不收确认税。
       if (action === 'switch') {
         void switchNode(server.id);
         return;
@@ -340,8 +337,8 @@ export function NodesScreen() {
       // `armed` 变了才提醒：第二下（真正执行）不该再弹。
       if (confirmArmed !== `node-use:${server.id}`) {
         toast.info(
-          action === 'confirm-restart'
-            ? t('nodes.useConfirmRestartToast', {
+          action === 'confirm-apply'
+            ? t('nodes.useConfirmApplyToast', {
                 node: server.name,
               })
             : t('nodes.useConfirmToast', {

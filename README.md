@@ -147,8 +147,15 @@ DNS 与路由修改可能暂时影响网络连接；进行重要操作前请备�
 
 ## 许可
 
-MIT（见 `LICENSE`）。sing-box（GPLv3）以 sidecar 子进程形式集成（mere aggregation），
-不影响本项目许可；第三方组件见 `NOTICE`。
+Polaris 自身源码 MIT（见 `LICENSE`）。**但产物的分发条款按平台不同**：
+
+- **桌面（Windows / macOS / Linux）：MIT。** sing-box（GPLv3）以 sidecar 子进程形式集成，
+  按 mere-aggregation 立场不影响本项目许可。**该立场未经法院检验**，见 `NOTICE`。
+- **Android：整体 GPLv3。** 该平台上 sing-box 只能以 libbox 形态载入应用进程
+  （tun 描述符只能经进程内接口获得），mere aggregation 不成立；Kotlin 侧亦移植自 GPLv3 的
+  sing-box-for-android。取用 APK 的人得到 GPLv3，只取本仓 MIT 源文件的人仍得到 MIT。
+
+第三方组件与完整论述见 `NOTICE`。
 
 ## Star 趋势
 

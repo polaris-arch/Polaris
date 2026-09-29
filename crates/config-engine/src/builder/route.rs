@@ -41,7 +41,7 @@ use crate::user_config::dns_constants::{
     is_block_selection, is_direct_selection, BOOTSTRAP_DIRECT_DNS_IPS, PROXY_SELECTOR_TAG,
 };
 use crate::user_config::log_level::LogLevel;
-use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
+use crate::user_config::proxy_mode::ProxyMode;
 use crate::user_config::region_routing::{
     effective_region_routing, region_foreign_geo, region_local_geo,
 };
@@ -50,6 +50,7 @@ use crate::user_config::rules::rule_ip_cidrs;
 use crate::user_config::server_config::{is_mesh_node, Protocol, ServerConfig};
 use crate::user_config::system_proxy_bypass::{bypass_lan_cidrs, effective_bypass_lan};
 use crate::user_config::tun_config::{FAKEIP_INET4_RANGE, FAKEIP_INET6_RANGE};
+use polaris_helper_proto::Platform;
 
 /// DoH 上游 IP 单一真值（上游 `shared/dns#DOH_UPSTREAM_IPS`）。
 /// 223.5.5.5 AliDNS + 1.12.12.12 DNSPod（#57）。
@@ -300,7 +301,7 @@ pub fn build_route_config_with_report(
     // 杜绝对「仅出网且未 engaged」节点虚报。
     let custom_rules_eff = effective_custom_rules(proxy_mode.as_str(), &ordered_route_rules);
     let app_rules_eff = effective_app_rules(
-        config.app_routing_enabled == Some(true),
+        config.app_routing_enabled != Some(false),
         proxy_mode.as_str(),
         &config.app_rules,
     );
@@ -571,7 +572,27 @@ pub fn build_route_config_with_report(
         // 只在 TUN 使用全局自动探测：此时 sing-box 自己控制 TUN 路由并需要避开回环。
         // System/manual 没有 TUN 路由上下文，全局探测会把所有默认拨号器（含 direct/DNS）锁到
         // 单一默认网卡，破坏 OS 已有的逐目的路由选择。
-        auto_detect_interface: matches!(config.proxy_mode_type, ProxyModeType::Tun).then_some(true),
+        //
+        // 🔴 **Android 上这个键是承重的，不是优化项**，且判据必须走本平台生效值
+        // （[`ProxyModeType::effective_on`]，那里有「为什么 Android 只有 TUN 一种形态」的全部因果链）。
+        // 随包核 v1.14.0 的链路，逐跳读源码取证：
+        //   ① `route/network.go:85` 把本键原样存成 `NetworkManager.autoDetectInterface`；
+        //   ② `common/dialer/default.go:105` 只有在 `networkManager.AutoDetectInterface()` 为真时，
+        //      才给出站 socket 追加 `ProtectFunc()` / `AutoDetectInterfaceFunc()` 的 control；
+        //   ③ `route/network.go:369` 那条 func 在 `UsePlatformAutoDetectInterfaceControl()` 为真时
+        //      转调 `platformInterface.AutoDetectInterfaceControl(fd)`；
+        //   ④ 本仓 Android 侧 `PlatformInterfaceWrapper.kt:52` 正是恒 true，而
+        //      `PolarisVpnService.kt:55` 把它实现成 `protect(fd)`。
+        // ⇒ 本键缺席 = 核自己的出站 socket **拿不到 `VpnService.protect()`** ⇒ 它们命中我们刚装上的
+        //   默认路由、回灌 TUN ⇒ 死循环。（`route/network.go:72` 那条「只支持 Linux/Win/macOS」的
+        //   校验放行 Android：`constant/os.go:23` 的 `IsLinux` 把 `goos.IsAndroid` 也算在内。）
+        // 也就是说：只补 tun 入站、不补这一条，得到的是「流量进得去、一个字节也出不来」的隧道 ——
+        // 比今天「没有入站」更难查，因为它看起来更像在工作。
+        auto_detect_interface: config
+            .proxy_mode_type
+            .effective_on(Platform::parse(&deps.platform))
+            .is_tun()
+            .then_some(true),
         final_outbound: Some(final_outbound),
     };
 
@@ -843,7 +864,8 @@ pub fn build_route_config_with_report(
             }
         }
 
-        // 应用分流规则（真·应用分流，基于进程名）。
+        // 应用分流规则（真·应用分流：桌面按进程名，Android 按包名）。
+        let owner_leg = app_owner_leg(Platform::parse(&deps.platform));
         for app_rule in &app_rules_eff {
             if !app_rule.enabled {
                 continue;
@@ -868,22 +890,33 @@ pub fn build_route_config_with_report(
             // 迁移后 Block 已无 outbound，反推会把它误判成代理 ⇒ 给阻断规则白配一条 udp443 reject。
             let app_out_is_proxy = matches!(app_rule.action, RuleAction::Proxy);
 
-            // a. 基于进程名的规则（最精准）。
-            if !preset.process_names.is_empty() {
+            // a. 按应用身份的规则（最精准）。匹配键随平台走，判据唯一产地 [`app_owner_leg`]。
+            let owner_matcher = match owner_leg {
+                AppOwnerLeg::ProcessName => (!preset.process_names.is_empty()).then(|| RouteRule {
+                    process_name: Some(OneOrMany::Many(preset.process_names.clone())),
+                    ..empty_matcher()
+                }),
+                // Direct 档不在这里发：它由 tun `exclude_package`（`inbounds::android_exclude_packages`，
+                // 同一个 `effective_app_rules*` 门）在 `VpnService` 系统边界兑现，流量根本不进核 ——
+                // 再发一条 `package_name → direct` 是永不命中的第二份真值，两处口径一漂就说不清谁在生效。
+                AppOwnerLeg::PackageName => (!matches!(app_rule.action, RuleAction::Direct)
+                    && !preset.package_names.is_empty())
+                .then(|| RouteRule {
+                    package_name: Some(OneOrMany::Many(preset.package_names.clone())),
+                    ..empty_matcher()
+                }),
+            };
+            if let Some(matcher) = owner_matcher {
                 if app_out_is_proxy {
-                    if let Some(r) = proxy_udp_reject_for(RouteRule {
-                        process_name: Some(OneOrMany::Many(preset.process_names.clone())),
-                        ..empty_matcher()
-                    }) {
+                    if let Some(r) = proxy_udp_reject_for(matcher.clone()) {
                         rules.push(r);
                     }
                 }
                 rules.push(RouteRule {
-                    process_name: Some(OneOrMany::Many(preset.process_names.clone())),
                     action: Some(rule_action.to_string()),
                     outbound: outbound.clone(),
                     no_drop: app_no_drop,
-                    ..empty_matcher()
+                    ..matcher
                 });
             }
 
@@ -1755,6 +1788,41 @@ fn uses_dns_connection_resolution(config: &UserConfig) -> bool {
 // ===== 辅助函数 =====
 
 /// 全默认（None）的 RouteRule matcher 骨架，便于 push 时用 `..empty_matcher()`。
+/// 应用规则「按应用身份」那条腿用哪一个 sing-box 匹配键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppOwnerLeg {
+    /// `process_name`：桌面三端由核自己的进程查询（或平台 finder）回填进程路径。
+    ProcessName,
+    /// `package_name`：Android 由 `findConnectionOwner` 回填 applicationId。
+    PackageName,
+}
+
+/// 平台 → 应用身份匹配键。穷举 `match`，新增平台变体编译不过，逼着答题。
+///
+/// # Android 为什么是 `package_name`（上游 v1.15.0-alpha.8 取证）
+///
+/// - 字段：`option/rule.go:165` `PackageName … json:"package_name"`；构造 `route/rule/rule_default.go:203-207`。
+/// - 命中：`route/rule/rule_item_package_name.go:27-37` 只读 `metadata.ProcessInfo.PackageNames`。
+/// - 回填：`route/router.go:171-173` 在 Android + platformInterface 下**无条件**置 `needFindProcess`
+///   （不需要 `route.find_process`），`:176` 走 `newPlatformSearcher` ⇒ libbox
+///   `experimental/libbox/service.go:195-236`：`useProcFS()` 为假时调 Kotlin `findConnectionOwner`
+///   并把 `androidPackageNames` 转进 `PackageNames`；为真时走 procfs **只拿得到 uid、包名恒空**。
+///   本仓 `PlatformInterfaceWrapper.kt` 的 `useProcFS()` = `SDK_INT < Q` ⇒ **Android 9 及以下这条腿
+///   命不中任何连接**（该应用退回 rule_set 那条域名 / IP 腿，方向不反），这是平台给的上界。
+/// - `process_name` 在 Android 上无意义：平台 finder 不回填进程路径（Kotlin 只填 uid / 包名）。
+///
+/// # iOS 与 Other 保持现状（`process_name`）
+///
+/// iOS 上两个键都没有取过证（本仓构不出 iOS 产物）；本批只回答 Android，不借机改 iOS 的产出。
+fn app_owner_leg(platform: Platform) -> AppOwnerLeg {
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => AppOwnerLeg::ProcessName,
+        Platform::Android => AppOwnerLeg::PackageName,
+        Platform::Ios => AppOwnerLeg::ProcessName,
+        Platform::Other => AppOwnerLeg::ProcessName,
+    }
+}
+
 fn empty_matcher() -> RouteRule {
     RouteRule {
         protocol: None,
@@ -1775,8 +1843,10 @@ fn empty_matcher() -> RouteRule {
         source_hostname: None,
         process_name: None,
         process_path: None,
+        package_name: None,
         process_name_not: None,
         inbound: None,
+        invert: None,
         action: None,
         outbound: None,
         server: None,

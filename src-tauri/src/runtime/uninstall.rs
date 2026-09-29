@@ -56,7 +56,7 @@ use serde::Serialize;
 use crate::runtime::helper::UninstallPreflight;
 use crate::runtime::update_install::mac_app_bundle_from_exe;
 
-/// 用户配置目录的**固定叶名**——白名单判定的锚（`<app_config_dir>/polaris`，见 `main.rs::init_base_dir`）。
+/// 用户配置目录的**固定叶名**——白名单判定的锚（`<app_config_dir>/polaris`，见 `lib.rs::init_base_dir`）。
 ///
 /// 删除腿只认这个叶名：路径不是本进程算出来的那一个（比如被改成了 `$HOME`）就直接拒绝，
 /// 而不是「先删了再说」。

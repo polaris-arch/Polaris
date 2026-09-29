@@ -1,0 +1,42 @@
+/*
+ * 随包字体面 —— 桌面（index.css）与移动端（tokens.resolved.css）**共用同一份**。
+ *
+ * 契约 B（`~/docs/polaris/design/polaris-mobile-platform-evaluation-2026-08-29.md` §6.3.3）
+ * 与决策 D-9：`--disp` 的首选族 `Space Grotesk` 必须随包，不靠系统碰运气。
+ *
+ * ── 为什么要随包（§6.3.2①）───────────────────────────────────────────────────
+ * `--disp: "Space Grotesk","Avenir Next","SF Pro Display","Segoe UI",var(--sans)`，此前全仓
+ * 0 个 @font-face、0 个字体文件 ⇒ macOS 落 Avenir Next / SF Pro Display、Windows 落 Segoe UI、
+ * Android WebView 上四个候选**全部缺席**直接掉到 `var(--sans)` 末端的 system-ui（Roboto）。
+ * 这是**既有的桌面缺陷**，移动端只是让它显形，故两端一并修，不各自维护一套字体栈。
+ *
+ * ── 为什么是 variable 而不是几个静态字重（D-9）─────────────────────────────
+ * 设计交接包 `~/Code/polaris/design/mobile/tokens/core.json` 的 `type.cardTitle` /
+ * `type.pill` / `type.ringValue` 用的是 **640**，不是标准静态字重。静态 face 会被**静默**映射到
+ * 600 或 700；单轴 variable 的 wght 能如实渲染，且单文件体积≈两个静态字重。
+ * 又：index.css 的 `:root{font-synthesis:none}` 关掉了合成字重 ⇒ 下面这条 `font-weight: 300 700`
+ * **是承重的**：写成单值（静态 face 的写法）会让 500/600/640 全部塌到同一档，且没有任何报错。
+ *
+ * ── 来源与许可 ──────────────────────────────────────────────────────────────
+ * 上游：https://github.com/floriankarsten/space-grotesk（`fonts/woff2/SpaceGrotesk[wght].woff2`）
+ * 逐字节取回，仅改文件名（去掉方括号，避免 glob/shell 转义坑）。
+ *   sha256  8e085aa438094f11487a836652edd5c054fa6a96f63fc7c282105ee3a4b08c07
+ *   实测    WOFF2 / TrueType flavor，font version 2.000，fvar 单轴 wght min 300 / max 700
+ * 许可：SIL Open Font License 1.1（同目录 `LICENSE.txt` 为上游 `OFL.txt` 逐字节副本），
+ * 登记在 `THIRD-PARTY-LICENSES.md`（由 `scripts/gen-third-party-licenses.mjs` 的 vendored 段生成）。
+ *
+ * ── 为什么单独一个文件 ──────────────────────────────────────────────────────
+ * 桌面入口是 index.css 的 @import 链，移动端入口是 tokens.resolved.css（契约 A1 禁止移动端
+ * 走桌面层叠链）。两端各抄一份 @font-face 迟早漂移，且「移动端那份被删了」在门上不可见
+ * （门只查「全仓有没有随包的 Space Grotesk face」）。共用一个文件让漂移在结构上不可能发生。
+ */
+
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  /* 单轴 variable 的字重区间。实测 fvar：wght min 300 / max 700（详见文件头）。 */
+  font-weight: 300 700;
+  /* 品牌显示字只用在标题/数值，swap 让首帧先用 --sans 出字，不留空白期。 */
+  font-display: swap;
+  src: url('../assets/fonts/space-grotesk/space-grotesk-var.woff2') format('woff2');
+}

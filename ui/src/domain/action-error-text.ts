@@ -31,6 +31,8 @@ export function backupErrorText(
     case 'invalidFormat': return t('backupImport.error.invalidFormat');
     case 'invalidArgs': return t('backupImport.error.invalidArgs');
     case 'saveFailed': return t('backupImport.error.saveFailed');
+    case 'meshRoutingRequiresTrustedRestore': return t('backupImport.error.meshRoutingRequiresTrustedRestore');
+    case 'meshRoutingInvalidPolicy': return t('backupImport.error.meshRoutingInvalidPolicy');
     default: return t('backupImport.error.unknown');
   }
 }

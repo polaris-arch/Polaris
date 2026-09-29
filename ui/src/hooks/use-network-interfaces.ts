@@ -6,9 +6,10 @@ let cached: NetworkInterfaceInfo[] | null = null;
 let inFlight: Promise<NetworkInterfaceInfo[]> | null = null;
 
 async function load(force: boolean): Promise<NetworkInterfaceInfo[]> {
+  if (inFlight) return inFlight;
   if (!force && cached) return cached;
-  if (!force && inFlight) return inFlight;
   inFlight = systemApi.listNetworkInterfaces().then((items) => {
+    if (!Array.isArray(items)) throw new TypeError();
     cached = items;
     return items;
   }).finally(() => {
@@ -36,7 +37,8 @@ export function useNetworkInterfaces() {
   }, []);
 
   useEffect(() => {
-    void refresh(false);
+    // Cache supplies the first frame; a reopened form must observe current OS interfaces.
+    void refresh(true);
   }, [refresh]);
 
   return { items, loading, failed, refresh };

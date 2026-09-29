@@ -127,7 +127,7 @@ export default function AppShell({ children }: AppShellProps) {
   const hardwareAcceleration = useEffectiveConfig((c) => c?.hardwareAcceleration);
   // **一次性快照，之后不再跟随 config 变化** —— 本属性描述的是「**这扇窗当初被建成什么样**」，
   // 不是「配置现在写着什么」。`transparent` 是 `WebviewWindowBuilder` 参数、**运行期不可改**
-  // （src-tauri/src/main.rs:440-458），故建窗那一刻的取值在本窗生命周期内恒定；而 config 会被设置页
+  // （src-tauri/src/lib.rs:440-458），故建窗那一刻的取值在本窗生命周期内恒定；而 config 会被设置页
   // 实时改写，两者一旦分叉，CSS 就会按错误的窗口形态渲染。
   //
   // 具体故障（跟随式实现的真 bug，非假设）：启动时特效关 ⇒ 窗口建成**不透明 + 实色 #0B0F14**；

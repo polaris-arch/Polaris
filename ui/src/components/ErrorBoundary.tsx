@@ -20,6 +20,7 @@ import { recoveryText } from '@/i18n/recovery-text';
 
 interface Props {
   children: ReactNode;
+  recoveryAction?: ReactNode;
 }
 
 interface State {
@@ -99,6 +100,7 @@ export default class ErrorBoundary extends Component<Props, State> {
           >
             {recoveryText('reload')}
           </button>
+          {this.props.recoveryAction}
         </div>
       </div>
     );

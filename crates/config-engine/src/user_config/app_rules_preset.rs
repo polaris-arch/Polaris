@@ -19,6 +19,8 @@ pub struct AppPreset {
     pub geosite_tags: Vec<String>,
     pub geoip_tags: Vec<String>,
     pub process_names: Vec<String>,
+    /// Android applicationId（桌面无消费方）。消费点：`builder::inbounds::android_exclude_packages`。
+    pub package_names: Vec<String>,
     pub category: String,
 }
 
@@ -65,6 +67,21 @@ pub fn get_app_preset(app_id: &str, custom_presets: &[CustomAppPreset]) -> Optio
             geosite_tags: c.geosite_tags.clone(),
             geoip_tags: c.geoip_tags.clone(),
             process_names: c.process_names.clone().unwrap_or_default(),
+            // **包名 2026-09-13（批 16）接通**：自定义预设贡献它自己那张 `packageNames`。
+            //
+            // 转发的是 `package_names` 而**不是** `process_names`：后者是用户按桌面语义填的进程名
+            // （"Netflix" / "chrome.exe"），`addDisallowedApplication` 认的是 applicationId，
+            // 拿进程名喂它一条都命不中（官方客户端 catch 后继续，`VPNService.kt:160`，
+            // 于是「自定义应用设成直连」在 Android 上**静默不生效**）。两者是同一件事的两个
+            // 平台形态，不是同一个值的两种写法 —— 混用就是把这条腿重新变哑。
+            //
+            // 表单那一半：`ui/src/mobile/forms/AppAddPanel.tsx` 从 `system_list_installed_apps`
+            // （⇄ Kotlin `PolarisVpnPlugin.listInstalledApps`，回包带 `packageName`）拉已装应用清单，
+            // 用户勾选，落盘进 `CustomAppPreset.packageNames`。
+            //
+            // 空表仍然合法（用户没挑，或配置来自桌面）⇒ 那条预设退回 geosite/geoip 腿，
+            // 与接通之前逐字相同。
+            package_names: c.package_names.clone(),
             // 后端不消费 category；分组呈现由渲染层直接读 custom.category。
             category: "tools".to_string(),
         })

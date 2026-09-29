@@ -101,6 +101,41 @@ export function moduleSourceWithTests(relModule: string): string {
 }
 
 /**
+ * **crate 根**的取材面：`<relSrcDir>/main.rs` + `<relSrcDir>/lib.rs` 拼接（main 在前）。
+ *
+ * # 为什么不是「其中某一个文件」
+ *
+ * 与本模块开头讲的 `foo.rs` / `foo/` 是同一件事的另一个面：一个 crate 的**根**天然可能分布在
+ * 两个文件上。`polaris` 的应用装配（18 个 `mod`、插件注册、`setup`、`generate_handler![]`、
+ * `RunEvent` 循环）2026-09-04 从 `main.rs` 下沉进 `lib.rs`（移动端加载的是 cdylib，根本没有
+ * `main()`），`main.rs` 只剩薄壳。写死 `main.rs` 的跨语言门当场全红；改写死成 `lib.rs` 则是把
+ * 「装配住在哪个文件」这个实现细节重新焊进判据里，下一次搬迁再来一遍 —— 而**负面**断言
+ * （`.not.toContain`）取到薄壳时会静默恒真，那正是本模块存在的理由。
+ *
+ * 顺序断言（`indexOf(A) < indexOf(B)`）在拼接面上仍成立：薄壳里只有 `windows_subsystem`
+ * 属性与一句 `run()`，不含任何判据锚点。
+ *
+ * **故障关闭**：两个候选一个都不存在、或取材面为空，直接抛。
+ */
+export function crateRootSource(relSrcDir: string): string {
+  const base = join(REPO_ROOT, relSrcDir);
+  const roots = ['main.rs', 'lib.rs']
+    .map((name) => join(base, name))
+    .filter((file) => existsSync(file));
+  if (roots.length === 0) {
+    throw new Error(
+      `crate 根 \`${relSrcDir}\` 解析不到：既没有 main.rs 也没有 lib.rs。` +
+        '路径写错或整个 crate 被搬走了 —— 别把它当成「这个 crate 是空的」。',
+    );
+  }
+  const source = roots.map((file) => readFileSync(file, 'utf8')).join('\n');
+  if (source.trim() === '') {
+    throw new Error(`crate 根 \`${relSrcDir}\` 的取材面是空的 —— 其上的否定型断言会恒真。`);
+  }
+  return source;
+}
+
+/**
  * Rust 源码 → **剥掉注释**的净化面（字符串/字符字面量整段跳过，不剥、也不被当成注释起笔）。
  *
  * # 为什么必须有这一层，而且必须是状态机

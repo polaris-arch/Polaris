@@ -1,5 +1,20 @@
 use super::super::{builtin_geo_rulesets, SeedOptions};
 
+#[test]
+fn android_uses_extracted_apk_assets_under_app_data() {
+    let config = std::path::Path::new("/data/user/10/com.polaris2.app/polaris");
+    assert_eq!(
+        super::super::android_bundled_data_dir(config).unwrap(),
+        std::path::PathBuf::from("/data/user/10/com.polaris2.app/bundled-geo")
+    );
+    let kotlin = crate::test_support::crate_file(
+        "gen/android/app/src/main/java/com/polaris2/app/vpn/BundledRules.kt",
+    );
+    assert!(kotlin.contains("File(context.dataDir, EXTRACTED_DIR)"));
+    assert!(kotlin.contains("EXTRACTED_DIR = \"bundled-geo\""));
+    assert!(kotlin.contains("ASSET_DIR = \"_up_/resources/data\""));
+}
+
 /// 随包目录解析必须在**当前仓库布局**下命中 `resources/data`（开发态第 ④ 候选）。
 /// 这条不测，`seed_builtin_rule_sets_into` 会一路静默 early-return（「解析不到就跳过」），
 /// T1 等于没做——而且日志只有一行 warn，极易被当噪音忽略。

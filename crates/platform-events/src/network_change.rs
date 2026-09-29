@@ -318,6 +318,24 @@ pub fn monitor_line_impact(
                 None => None,
             }
         }
+        // Android：**这条腿在本平台上根本不起**（不是「解析不出」，是没有输入）。
+        // `runtime/proxy/network_monitor.rs::spawn_network_watcher` 首行
+        // `if !cfg!(any(macos, linux, windows)) { return; }` 让 watcher 在 Android 上不 spawn ——
+        // 它的输入是 `ip monitor` / `route monitor` 子进程的 stdout，而 Android 上既没有那个子进程
+        // 的权限，也不需要它：跟随默认网络由 libbox `DefaultNetworkMonitor`（K2）在系统回调上做。
+        // 因此本臂返 None 是「没有事件可解析」的诚实答案，而非静默吞掉了什么。
+        Platform::Android => None,
+        // iOS：同答 None，**独立成臂**——与 Android 同答不同因。
+        //
+        // Android 那条的依据是 `spawn_network_watcher` 首行那个 `cfg!(any(macos, linux, windows))`
+        // 早退（watcher 不 spawn，所以没有输入）。iOS 上那条 cfg 同样把它排除在外，但更靠前的
+        // 事实是：核不在本进程里 —— 它跑在 NE 扩展进程内，而「跟随默认网络」在 iOS 上由系统在
+        // 扩展生命周期里处理（路径变化经 `NWPathMonitor` / provider 的 reasserting 面通知核，
+        // 不经我们的 stdout 解析腿）。⇒ 本臂返 None 同样是「没有事件可解析」，不是吞掉。
+        //
+        // **未验证**：iOS 侧的网络变化通知形态未真机取证；但本臂的答案不依赖那件事——只要
+        // watcher 不 spawn，就没有行可解析。
+        Platform::Ios => None,
         Platform::Win | Platform::Other => None,
     }
 }

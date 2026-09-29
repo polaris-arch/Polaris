@@ -9,11 +9,33 @@ use std::path::Path;
 const EXPECTED_SRS_COUNT: usize = 28;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        // NDK r27 still defaults Rust cdylibs to 4 KB. Keep every PT_LOAD segment
+        // compatible with 16 KB devices, for both debug and release builds.
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-z,max-page-size=16384");
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-z,common-page-size=16384");
+    }
     export_product_name();
     assert_bundled_geo_data();
     assert_bundled_dashboard();
-    embed_test_manifest_on_windows_msvc();
-    tauri_build::build();
+    embed_windows_manifest_for_msvc();
+    if is_windows_msvc() {
+        // The linker input below supplies the same Common Controls manifest to
+        // the app and to the library unit-test executable. Keep winres' icon
+        // and version resources, but do not embed a second app manifest there.
+        tauri_build::try_build(
+            tauri_build::Attributes::new()
+                .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest()),
+        )
+        .unwrap_or_else(|error| panic!("tauri-build failed: {error:#}"));
+    } else {
+        tauri_build::build();
+    }
+}
+
+fn is_windows_msvc() -> bool {
+    std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
 }
 
 /// **把 `productName` 注入编译期** —— Linux deb/AppImage 的 FHS 资源目录名
@@ -62,35 +84,32 @@ fn export_product_name() {
     println!("cargo:rustc-env=POLARIS_PRODUCT_NAME={name}");
 }
 
-/// W9：给**测试目标**嵌入 Common-Controls v6 manifest（仅 windows-msvc）。
+/// W9：给 Windows MSVC 的可执行目标嵌入 Common-Controls v6 manifest。
 ///
 /// 病理（run 32109642349 探针实证）：`tests/remote_webview_cannot_reach_app_commands` 的
 /// 测试二进制导入 `comctl32.dll` 的 `TaskDialogIndirect / SetWindowSubclass /
 /// RemoveWindowSubclass / DefSubclassProc`——这四个是 **v6 专属导出**。应用 exe 由
-/// tauri-build 的 winres 拿到 v6 manifest（依赖声明），**测试 exe 拿不到**（winres 的
-/// link-arg 只打 bins），于是加载器把 comctl32 绑到 System32 的 v5.82 ⇒ 加载期
+/// tauri-build 的 winres 只把默认 manifest 给应用 bin，**测试 exe 拿不到**，
+/// 于是加载器把 comctl32 绑到 System32 的 v5.82 ⇒ 加载期
 /// `STATUS_ENTRYPOINT_NOT_FOUND`（0xC0000139），一条测试都没执行——W9 登记的
 /// 「零结论不是绿」的根因。
 ///
-/// 修法即补齐缺口：`cargo:rustc-link-arg-tests` 把同款 manifest 嵌进本包全部测试目标。
+/// `cargo:rustc-link-arg-tests` 只覆盖独立的 `tests/*.rs` 目标，**不覆盖**
+/// `cargo test --lib` 的 `src/lib.rs --test` 可执行目标；前者全绿、后者加载前退出。
+/// `cargo:rustc-link-arg` 覆盖二者及应用 bin。MSVC 应用 bin 由上方
+/// `new_without_app_manifest` 避免 winres 重复嵌 manifest。
 /// manifest 内容与 tauri-build 2.6.3 自带的 `windows-app-manifest.xml` 等义（多一个可选
 /// XML 声明头，无语义影响；Common-Controls 6.0.0.0 依赖），刻意不引它的私有路径。
-fn embed_test_manifest_on_windows_msvc() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+fn embed_windows_manifest_for_msvc() {
+    if !is_windows_msvc() {
         return;
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("windows-test-manifest.xml");
     // 本 build.rs 已有显式 rerun-if-changed 声明 ⇒ cargo 只按声明路径重跑：manifest 编辑
     // 必须自己声明，否则测试二进制静默沿用旧嵌入内容（复审 F1）。
     println!("cargo:rerun-if-changed={}", manifest.display());
-    println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}",
-        manifest.display()
-    );
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
 }
 
 /// **随包 dashboard 完整性断言（打包期硬门）** —— [`assert_bundled_geo_data`] 的同构对等物。

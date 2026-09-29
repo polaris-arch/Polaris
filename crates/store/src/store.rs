@@ -36,6 +36,8 @@ pub struct LoadResult {
     pub was_missing: bool,
     /// 加载/校验错误（若 loaded_from_disk=false，此处是回落原因；用于日志）。
     pub error: Option<StoreError>,
+    /// Managed evidence cannot fall back to legacy defaults on any parse/validation error.
+    pub protected_error: Option<StoreError>,
 }
 
 /// 配置存储核心（纯逻辑 + trait FS 注入）。
@@ -61,26 +63,38 @@ impl ConfigStore {
                 migration_delta: MigrationDelta::default(),
                 was_missing: true,
                 error: None,
+                protected_error: None,
             };
         }
         // 「存在但加载失败」的公共兜底：备份损坏文件（config.corrupt-<ts>.json，copy 不覆盖原文件）+ 保留最近 2 份，
         // 再回落默认配置。Polaris loadConfig catch 的非-ENOENT 分支——否则损坏配置首次改设置即被默认静默覆盖、永久丢失。
-        let fallback_corrupt = |error: StoreError| -> LoadResult {
-            Self::backup_corrupt(fs, &path_buf, &corrupt_backup_stamp());
-            prune_corrupt_backups(fs, &path_buf);
+        let fallback_corrupt = |error: StoreError, protected: bool| -> LoadResult {
+            if !protected {
+                Self::backup_corrupt(fs, &path_buf, &corrupt_backup_stamp());
+                prune_corrupt_backups(fs, &path_buf);
+            }
             LoadResult {
                 config: default_config(),
                 loaded_from_disk: false,
                 migration_delta: MigrationDelta::default(),
                 was_missing: false,
-                error: Some(error),
+                error: Some(error.clone()),
+                protected_error: protected.then_some(error),
             }
         };
         let content = match fs.read_to_string(&path_buf) {
             Ok(c) => c,
             // 读取失败（权限/IO）→ 备份（best-effort，copy 亦可能失败被吞）+ 回落默认，不覆盖磁盘。
-            Err(e) => return fallback_corrupt(e),
+            Err(e) => return fallback_corrupt(e, false),
         };
+        let raw: Value = match serde_json::from_str(&content) {
+            Ok(value) => value,
+            Err(error) => return fallback_corrupt(StoreError::from(error), false),
+        };
+        let managed = crate::mesh_guard::has_managed_fields(&raw);
+        if let Err(error) = crate::mesh_guard::validate_raw(&raw) {
+            return fallback_corrupt(error, managed);
+        }
         // 旧规则（DomainRule）→ 新规则（Rule）迁移前先备份原配置（仅首次，便于回滚踩边界 bug）。
         // Polaris loadConfig：customRulesNeedMigration && !exists(.pre-rule-migration.bak) → copyFile。best-effort。
         // 判据须看**原始 JSON**（未过 sanitize）——`sanitize_custom_rules` 会丢弃无 `type` 字段的条目（旧
@@ -103,14 +117,14 @@ impl ConfigStore {
         let mut value = match sanitize_config(&content) {
             Ok(v) => v,
             // 坏 JSON / 顶层非对象 → 备份损坏文件 + 回落默认，不覆盖磁盘。
-            Err(e) => return fallback_corrupt(e),
+            Err(e) => return fallback_corrupt(e, managed),
         };
         // 迁移链（全量，幂等，绝不抛）
         let migration_delta = migrate_all(&mut value);
         // validate（语义校验：必填/枚举/范围）+ 填默认
         if let Err(e) = finalize_config(&mut value) {
             // 校验失败 → 备份损坏文件 + 回落默认，不覆盖磁盘。
-            return fallback_corrupt(e);
+            return fallback_corrupt(e, managed);
         }
         LoadResult {
             config: value,
@@ -118,6 +132,7 @@ impl ConfigStore {
             migration_delta,
             was_missing: false,
             error: None,
+            protected_error: None,
         }
     }
 
@@ -126,12 +141,14 @@ impl ConfigStore {
     /// 运行时缓存、乐观并发版本与 API 返回值必须使用这份结果，而不是清洗前入参；否则磁盘已经删除
     /// 坏字段/归一枚举，内存却仍保留旧形，下一次读改写会基于一个磁盘上从未存在过的版本。
     pub fn canonicalize_for_save(config: &Value) -> Result<Value, StoreError> {
+        crate::mesh_guard::validate_raw(config)?;
         // 安全字段不能先 sanitize：显式坏策略若被改成 block 后再校验，写入者会误以为原值已生效。
         crate::validate::validate_raw_mesh_inbound_policies(config)?;
         let mut value = config.clone();
         crate::sanitize::sanitize_value_in_place_pub(&mut value);
         validate_config(&mut value)?;
         crate::validate::validate_for_save(&value)?;
+        crate::mesh_guard::validate_raw(&value)?;
         Ok(value)
     }
 
@@ -276,7 +293,7 @@ pub fn default_config() -> Value {
         // 均合法（global/smart/direct），此处只动出厂默认。
         "proxyMode": "smart",
         "proxyModeType": "systemProxy",
-        // mtu **刻意缺席** = 自动（生成期取 config-engine `tun_config::DEFAULT_TUN_MTU`）。
+        // mtu **刻意缺席** = 自动（生成期不下发 `mtu` 键，由 sing-box 内核取默认，见 config-engine `TunModeConfig::mtu`）。
         // 新装写一个具体数会把「当时的默认」冻在磁盘上，此后默认值再变也追不上——那正是存量
         // 1350/1400 需要 `migrate_tun_mtu` 清一遍的成因。
         // 不写 `stack` / `tunStackMigrated`：TUN stack 随上游弃用已移除（见 `migrate::migrate_tun_stack`）。

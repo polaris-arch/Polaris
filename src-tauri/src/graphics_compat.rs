@@ -29,7 +29,7 @@
 //!   注：上游 因「Electron 在 Linux 无条件禁 HW accel」把该开关在 Linux 整卡隐藏（死开关）。**Polaris 不适用
 //!   该前提** —— Tauri/WebKitGTK 的合成默认是开的，故 Linux 上这个开关是**活的**，不可照搬 上游的隐藏结论。
 //!
-//! - **`windowEffects`**：门控 `main.rs::create_main_window` 的 **macOS vibrancy / Windows Mica**（B6「窗口铬」
+//! - **`windowEffects`**：门控 `lib.rs::create_main_window` 的 **macOS vibrancy / Windows Mica**（B6「窗口铬」
 //!   已落地，走官方 `window-vibrancy` crate）。**本段曾记「无行为消费」，那是 B6 落地前的状态，已过时** ——
 //!   现有真实消费方，判定见 [`should_apply_window_effects`]。
 //!

@@ -30,7 +30,7 @@ import type { ServerConfig } from '@/contracts/types';
 import { useLatencyStore } from '@/store/use-latency-store';
 import { useAppStore } from '@/store/app-store';
 import { latLevel } from '@/components/screens/shared/format';
-import { isMeshNode, isAccountBasedProtocol } from '@/domain/endpoint-routes';
+import { canCloneServer, isMeshNode, isAccountBasedProtocol } from '@/domain/endpoint-routes';
 import type { MeshNodeRouteBadge } from '@/domain/mesh-route-badges';
 import { tsAccountLabel } from '@/domain/tailscale-conn-state';
 import { invalidNodeReasonText } from '@/domain/invalid-node-reason';
@@ -38,63 +38,7 @@ import { useHoverCard, HoverCardPanel } from '@/components/hover-cards/HoverCard
 import { MeshInfoHoverCardContent } from '@/components/hover-cards/MeshInfoHoverCard';
 import { cn } from '@/lib/utils';
 import { NdFlag, flagCodeForName } from './NdFlag';
-import type { NodeUseVia } from './nodes-logic';
-
-/** 协议显示名（小写协议枚举 → 用户可读）。 */
-function protocolLabel(proto: string): string {
-  const map: Record<string, string> = {
-    vless: 'VLESS',
-    vmess: 'VMess',
-    trojan: 'Trojan',
-    hysteria2: 'Hysteria2',
-    shadowsocks: 'Shadowsocks',
-    wireguard: 'WireGuard',
-    tailscale: 'Tailscale',
-    anytls: 'AnyTLS',
-    tuic: 'TUIC',
-    naive: 'Naive',
-    snell: 'Snell',
-    socks: 'SOCKS',
-    http: 'HTTP',
-    ssh: 'SSH',
-    hysteria: 'Hysteria',
-    tor: 'Tor',
-    openconnect: 'OpenConnect',
-    'openvpn-client': 'OpenVPN',
-    'masque-client': 'MASQUE',
-    tailcat: 'Tailcat',
-    custom: 'Custom',
-  };
-  return map[proto.toLowerCase()] ?? proto;
-}
-
-/** 传输/安全摘要（原型 .nd-xfer：reality · tcp / ws · tls / quic 等）。 */
-function transferSummary(server: ServerConfig): string {
-  const proto = server.protocol.toLowerCase();
-  if (proto === 'wireguard') return 'udp · wg';
-  if (proto === 'tailscale') return ''; // Tailscale identity and live status already describe this node.
-  if (proto === 'openconnect') return 'enterprise vpn';
-  if (proto === 'tailcat') return 'derp · wg';
-  if (proto === 'openvpn-client') return server.openvpnClientSettings?.network || 'udp · vpn';
-  if (proto === 'masque-client') {
-    // 缺省 / 0 / 3 都是 HTTP/3（内核可回落，卡片只报用户选的首选档）。
-    const v = server.masqueClientSettings?.version;
-    return `${v === 1 ? 'h1' : v === 2 ? 'h2' : 'h3'} · masque`;
-  }
-  const parts: string[] = [];
-  if (server.network) {
-    const netMap: Record<string, string> = {
-      tcp: 'tcp',
-      ws: 'ws',
-      grpc: 'grpc',
-      http: 'http',
-      httpupgrade: 'httpupgrade',
-    };
-    parts.push(netMap[server.network] ?? server.network);
-  }
-  if (server.security) parts.push(server.security);
-  return parts.length > 0 ? parts.join(' · ') : '';
-}
+import { protocolLabel, transferSummary, type NodeUseVia } from './nodes-logic';
 
 export interface NodeCardProps {
   server: ServerConfig;
@@ -164,7 +108,7 @@ export interface NodeCardProps {
    */
   useConfirming?: boolean;
   /** 待定态属于「会重启内核」那一档 —— 文案要先说清现有连接会断，不是只说「再点一次」。 */
-  useWillRestart?: boolean;
+  useNeedsApply?: boolean;
   onDelete?: (server: ServerConfig) => void;
   /**
    * 是否渲染删除入口。订阅节点传 `false`：删了下次订阅刷新的 reconcile 会照原样拉回来，
@@ -202,7 +146,7 @@ function NodeCardView({
   onEdit,
   onUse,
   useConfirming,
-  useWillRestart,
+  useNeedsApply,
   onDelete,
   deletable = true,
   deleteConfirming,
@@ -248,8 +192,8 @@ function NodeCardView({
   const useTip = isCurrent
     ? t('nodes.useCurrent')
     : useConfirming
-      ? useWillRestart
-        ? t('nodes.useConfirmRestart')
+      ? useNeedsApply
+        ? t('nodes.useConfirmApply')
         : t('nodes.useConfirmAgain')
       : t('nodes.use');
   const xfer = transferSummary(server);
@@ -458,21 +402,23 @@ function NodeCardView({
               <path d="M9 15l6-6M8 8a3 3 0 10-3 3M16 16a3 3 0 103 3" />
             </svg>
           </button>
-          <button
-            type="button"
-            className="nd-a"
-            onClick={(e) => {
-              e.stopPropagation();
-              onClone?.(server);
-            }}
-            data-tip={t('nodes.clone')}
-            aria-label={t('nodes.clone')}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-              <rect x="9" y="9" width="11" height="11" rx="2" />
-              <path d="M5 15V5a2 2 0 012-2h10" />
-            </svg>
-          </button>
+          {canCloneServer(server) && (
+            <button
+              type="button"
+              className="nd-a"
+              onClick={(e) => {
+                e.stopPropagation();
+                onClone?.(server);
+              }}
+              data-tip={t('nodes.clone')}
+              aria-label={t('nodes.clone')}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+                <rect x="9" y="9" width="11" height="11" rx="2" />
+                <path d="M5 15V5a2 2 0 012-2h10" />
+              </svg>
+            </button>
+          )}
           <button
             type="button"
             className="nd-a"

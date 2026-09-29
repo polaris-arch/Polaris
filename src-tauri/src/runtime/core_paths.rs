@@ -63,7 +63,7 @@ pub const CORE_SEED_MARKER: &str = ".core-seed.json";
 /// 单测/子进程等未初始化场景不受影响）。
 static CORE_BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// 注入基目录（`main.rs` setup 里调一次；重复调用忽略后来者）。
+/// 注入基目录（`lib.rs` setup 里调一次；重复调用忽略后来者）。
 pub fn init_base_dir(config_dir: PathBuf) {
     let _ = CORE_BASE_DIR.set(config_dir);
 }

@@ -16,7 +16,9 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+
+use crate::runtime::proxy::DirectCoreSlot;
 
 use polaris_helper_client::ClientError;
 #[cfg(test)]
@@ -245,8 +247,23 @@ fn snapshot_from(status: &HelperStatus, supported: bool) -> HelperStatusSnapshot
 ///
 /// 抽为自由 `const fn` 是为让**全 `Platform` 变体**在单一平台 gate 上可断言——给 mac/win 值以变异
 /// 牙齿（`supported()` 读 `Platform::current()`，本机 gate 只走 Linux 一路，测不到 mac/win 逃逸面）。
+///
+/// **穷举 `match` 而非 `matches!`**（2026-09-04 K10）：这是整个 helper 子系统的入口闸 —— 它答
+/// false 的平台，`HelperManager` / 安装脚本 / 提权 / `LinuxStart` 帧全部不可达。`matches!` 形态下
+/// 新增一个平台变体会**静默**得到 false（碰巧对），下一个变体则可能碰巧错；穷举 match 让编译器
+/// 在这里强制问一次「这个平台有没有 helper」。Android = false：核跑在应用进程内的 libbox 里，
+/// 没有 daemon、没有提权通道、也没有需要提权的动作（tun fd 由 `VpnService` 授予）。
 const fn platform_supported(platform: Platform) -> bool {
-    matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => true,
+        // iOS = false，与 Android 同答不同因（这里是整个 helper 子系统的入口闸，值得写清）：
+        // Android 的依据是「核跑在应用进程内的 libbox 里，没有 daemon 也没有需要提权的动作」；
+        // iOS 的依据更靠前 —— **平台不允许存在常驻 root daemon**（无 launchd 可注册面、无提权
+        // 通道），而 tun fd 由系统按 packet-tunnel-provider entitlement 授予 NE 扩展，同样没有
+        // 需要提权的动作。⇒ false 之后，`HelperManager` / 安装脚本 / 提权 / `LinuxStart` 帧
+        // 在 iOS 上全部不可达（helper-client 那 7 处 `Ios` 臂的不可达性就源自这一行）。
+        Platform::Android | Platform::Ios | Platform::Other => false,
+    }
 }
 
 /// 卸载 helper 之前该不该先停核（纯判定，可穷举单测）。
@@ -449,6 +466,12 @@ impl Connector for NeverConnect {
 }
 
 /// helper 运行时（`State`-managed，单实例）。
+#[derive(Default)]
+struct CoreMutationFences {
+    ever_mutated: bool,
+    slots: Vec<Weak<Mutex<DirectCoreSlot>>>,
+}
+
 pub struct HelperRuntime {
     dir: PathBuf,
     platform: Platform,
@@ -461,6 +484,8 @@ pub struct HelperRuntime {
     /// 「这个 helper 构建不支持 install-core」的进程内记号，见 [`InstallCoreUnsupportedRecord`]。
     /// 失效键 = helper 自报的 `build_identity`；另由 [`Self::install`] 的成功分支主动清除。
     install_core_unsupported: Mutex<Option<InstallCoreUnsupportedRecord>>,
+    /// All runtimes sharing this helper retain their own direct Child fence.
+    core_mutation_fences: Mutex<CoreMutationFences>,
     /// 与 `sys_ops` 同一隔离边界：测试 fixture 不仅要把“已安装”探测钉成 false，直接调用
     /// `start_core` 的测试也必须被结构性禁止连接真实 socket。
     #[cfg(test)]
@@ -479,11 +504,61 @@ impl HelperRuntime {
             sys_ops: Arc::new(|| Box::new(StdSysOps)),
             start_identity: Mutex::new(None),
             install_core_unsupported: Mutex::new(None),
+            core_mutation_fences: Mutex::new(CoreMutationFences::default()),
             #[cfg(test)]
             never_connect: false,
             #[cfg(test)]
             status_override: None,
         }
+    }
+
+    pub(crate) fn bind_core_mutation_fence(
+        &self,
+        slot: Weak<Mutex<DirectCoreSlot>>,
+    ) -> Result<(), String> {
+        let mut registry = self
+            .core_mutation_fences
+            .lock()
+            .map_err(|_| "helper core fence registry poisoned".to_string())?;
+        registry.slots.retain(|slot| slot.strong_count() > 0);
+        if registry.ever_mutated {
+            let live = slot
+                .upgrade()
+                .ok_or_else(|| "new helper fence slot disappeared".to_string())?;
+            live.lock()
+                .map_err(|_| "child lock poisoned".to_string())?
+                .touch_helper_for_registry()?;
+        }
+        registry.slots.push(slot);
+        Ok(())
+    }
+
+    /// Check every live Child slot before an operation that may affect a
+    /// helper-owned core. The registry lock serializes new runtime binding
+    /// with this sweep; no lock is held across the following IPC.
+    pub(crate) fn register_core_mutation(&self) -> Result<(), String> {
+        let mut registry = self
+            .core_mutation_fences
+            .lock()
+            .map_err(|_| "helper core fence registry poisoned".to_string())?;
+        registry.ever_mutated = true;
+        let mut index = 0;
+        while index < registry.slots.len() {
+            let Some(slot) = registry.slots[index].upgrade() else {
+                registry.slots.swap_remove(index);
+                continue;
+            };
+            slot.lock()
+                .map_err(|_| "child lock poisoned".to_string())?
+                .touch_helper_for_registry()?;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core_fence_count_for_test(&self) -> usize {
+        self.core_mutation_fences.lock().unwrap().slots.len()
     }
 
     /// **测试专用**构造：`SysOps` 替身恒报「二进制/描述符/服务都不存在」⇒ [`Self::status`] 稳定判未装。
@@ -527,6 +602,7 @@ impl HelperRuntime {
             sys_ops: Arc::new(|| Box::new(NeverInstalled)),
             start_identity: Mutex::new(None),
             install_core_unsupported: Mutex::new(None),
+            core_mutation_fences: Mutex::new(CoreMutationFences::default()),
             never_connect: true,
             status_override: None,
         }
@@ -548,6 +624,30 @@ impl HelperRuntime {
     pub(crate) fn with_forced_status_for_tests(dir: PathBuf, status: HelperStatusSnapshot) -> Self {
         Self {
             status_override: Some(status),
+            ..Self::never_installed_for_tests(dir)
+        }
+    }
+
+    /// **测试专用**构造：在 [`Self::never_installed_for_tests`] 的全部隔离之上，把
+    /// [`Self::platform`] 钉成给定平台。
+    ///
+    /// # 为什么必须有这个
+    ///
+    /// [`super::proxy::ProxyRuntime`] 的一批判据经 `self.helper.platform()` 分流 ——
+    /// 「Android 上接管方式恒 TUN」这条不变式的**全部**运行期落点都在那里（起核后要不要去设
+    /// 系统代理、要不要开那一枪连接 flush、要不要挂 TUN 出口夺取硬闸……）。生产构造把平台钉成
+    /// `Platform::current()`，于是那些腿在本机（Linux）永远只跑得到桌面那一侧：
+    /// **Android 分叉一行都没有运行期证据**，只剩源码级断言。
+    ///
+    /// 本仓已经为这种形态付过账（`with_forced_status_for_tests` 的头注记着同一件事）。
+    ///
+    /// **只钉平台这一个字段，不放开任何写入面**：`sys_ops` 仍是 `NeverInstalled`、
+    /// `never_connect` 仍为 true ⇒ `install` / `uninstall` / `start_core` 一律触不到真实系统。
+    /// 平台钉成 Android 反而**收紧**了逃逸面（`platform_supported(Android) == false`）。
+    #[cfg(test)]
+    pub(crate) fn with_platform_for_tests(dir: PathBuf, platform: Platform) -> Self {
+        Self {
+            platform,
             ..Self::never_installed_for_tests(dir)
         }
     }
@@ -676,6 +776,9 @@ impl HelperRuntime {
                 );
             }
         };
+        if let Err(error) = self.register_core_mutation() {
+            return self.action_failed(HelperActionErrorCode::Failed, error);
+        }
         let manager = self.manager();
         match manager.install(&params, &StdExecutor) {
             Ok(EscalationOutcome::Success) => {
@@ -742,6 +845,9 @@ impl HelperRuntime {
     pub fn uninstall(&self) -> HelperActionResult {
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
+        }
+        if let Err(error) = self.register_core_mutation() {
+            return self.action_failed(HelperActionErrorCode::Failed, error);
         }
         let manager = self.manager();
         match manager.uninstall(&self.dir, &StdExecutor) {
@@ -818,6 +924,7 @@ impl HelperRuntime {
         fwd: bool,
         ppid: Option<u32>,
     ) -> Result<u32, String> {
+        self.register_core_mutation()?;
         let client = self.build_client()?;
         let common = StartParams {
             cfg: cfg.to_string_lossy().into_owned(),
@@ -828,15 +935,23 @@ impl HelperRuntime {
         let req = match self.platform {
             Platform::Mac | Platform::Win => Request::Start(common),
             // linux/未知谱系：带核路径行，且**只能**是 helper 锁定的 coreBin（它会逐字比对）。
-            Platform::Linux | Platform::Other => Request::LinuxStart(LinuxStartParams {
-                singbox_path: crate::runtime::core_promote::protected_core_path_in(
-                    &self.protected_core_dir_path(),
-                    std::env::consts::OS,
-                )
-                .to_string_lossy()
-                .into_owned(),
-                common,
-            }),
+            // Android 同臂但不可达：`should_start_via_helper` 对它恒 false（`platform_supported`
+            // 同源），Android 起核走的是进程内 libbox（`android_bridge`），根本不建 helper client。
+            // iOS 同 Android/Other 落 `LinuxStart` 臂，且同样**不可达**：`should_start_via_helper`
+            // 与 `platform_supported` 同源，对 iOS 恒 false ⇒ 根本走不到 `build_client()`。
+            // 本处特有的那半句：iOS 起核连「起一个核进程」这件事都不存在 —— 核是 NE 扩展进程
+            // 自己 `startTunnel` 时在进程内拉起的 libbox，没有可传路径的 exec 面。
+            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
+                Request::LinuxStart(LinuxStartParams {
+                    singbox_path: crate::runtime::core_promote::protected_core_path_in(
+                        &self.protected_core_dir_path(),
+                        std::env::consts::OS,
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
+                    common,
+                })
+            }
         };
         let resp = client
             .send_with_timeout(&req, HELPER_START_TIMEOUT)
@@ -1007,6 +1122,8 @@ impl HelperRuntime {
     /// 建客户端失败 / IPC 失败 / helper 返回 `ERR *`（`hash-mismatch` / `coredir-unset` / 写盘失败等）。
     /// `ERR unknown` 单列为 [`InstallCoreError::Unsupported`]，理由见该变体文档。
     pub fn install_core(&self, src_dir: &Path, want_hash: &str) -> Result<(), InstallCoreError> {
+        self.register_core_mutation()
+            .map_err(InstallCoreError::Failed)?;
         let client = self.build_client().map_err(InstallCoreError::Failed)?;
         install_core_with_client(&client, src_dir, want_hash)
     }
@@ -1037,14 +1154,15 @@ impl HelperRuntime {
     /// 「停当前受管的」执行 = 杀掉用户刚连上的核（表现为「刚连上就被静默断开」，且酷似核自己崩了）。
     /// app 侧的世代守卫够不着这一层：杀进程发生在 helper 进程里，故判据必须随请求下发。
     ///
-    /// `None` = 调用点确实还不知道 pid（起核 IPC 在飞、pid 未回传）→ 旧语义「停当前受管核」，这是
-    /// 防 root 孤儿所必需的（见 `runtime/proxy::spawn_core_via_helper` 的孤儿不变式）。
+    /// ProxyRuntime only supplies a known pid. An unconfirmed Start must not
+    /// use `None`, which would authorize stopping an unrelated current core.
     ///
     /// 身份不匹配 → daemon 回 `stop-mismatch` 且**一个进程都不杀**；本方法把它落成 `Err`（连同两个
     /// pid），因为「本腿意图停的核」确实没被停 —— 报 `Ok` 会让调用方的日志说谎。
     ///
     /// **真机门**：真停 root/SYSTEM 受管核。
     pub fn stop_core(&self, want_pid: Option<u32>) -> Result<(), String> {
+        self.register_core_mutation()?;
         let client = self.build_client()?;
         stop_core_with_client(&client, want_pid)
     }
@@ -1060,6 +1178,7 @@ impl HelperRuntime {
     ///
     /// **真机门**：真杀 root 进程需 mac/win 真机 + 已装就绪 helper。
     pub fn cleanup_cores(&self) -> Result<(), String> {
+        self.register_core_mutation()?;
         let client = self.build_client()?;
         let resp = client
             .send(&Request::Cleanup)
@@ -1319,7 +1438,13 @@ fn stop_core_with_client(client: &HelperClient, want_pid: Option<u32>) -> Result
             "helper 未停核：其受管核已是 pid={current}（本腿意图停 pid={want}）\
              → 判定为已被新会话接管，让位不动它"
         )),
-        Response::Ok(_) => Ok(()),
+        Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }))
+            if want_pid.is_none_or(|want| want == pid) =>
+        {
+            Ok(())
+        }
+        Response::Ok(ResponseKind::Stop(Stop::NotRunning)) => Ok(()),
+        Response::Ok(other) => Err(format!("helper 停核返回非预期响应：{other:?}")),
         Response::Err(e) => Err(format!("helper 停核失败：{e}")),
     }
 }

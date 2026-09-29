@@ -314,6 +314,35 @@ pub struct CustomAppPreset {
     pub geoip_tags: Vec<String>,
     #[serde(rename = "processNames", skip_serializing_if = "Option::is_none")]
     pub process_names: Option<Vec<String>>,
+    /// Android applicationId —— 与 [`Self::process_names`] 是**同一件事的两个平台形态**
+    /// （桌面按进程名走 sing-box 的 `process_name` 路由规则，Android 按 applicationId 走
+    /// `VpnService.Builder.addDisallowedApplication`）。消费点：
+    /// `builder::inbounds::android_exclude_packages`，经 `app_rules_preset::get_app_preset` 转发。
+    ///
+    /// # 形态取 `Vec` + `default`，不取 `Option<Vec>`（与 `geoip_tags` 同形，不与 `process_names` 同形）
+    ///
+    /// 「没有包名」是**二态事实**（这条预设贡献不贡献包名），而 `Option<Vec<String>>` 是三态：
+    /// `None` 与 `Some(vec![])` 在每一个消费点上都必须被当成同一件事，那个必须就是一条会漂的约定。
+    /// `AppPresetDto` 的头注已经为 `geoipTags` 写过同一条理由（「空数组与缺省等价，恒发更简单」）。
+    ///
+    /// # 迁移口径：**没有迁移**
+    ///
+    /// 本字段 2026-09-13 新增，`#[serde(default)]` 让**不带这个键的旧配置**原样读进来、
+    /// 得到空表 ⇒ 与新增之前的行为逐字相同（`get_app_preset` 此前把它硬写成 `Vec::new()`）。
+    /// `skip_serializing_if` 让空表不写回磁盘 ⇒ 没填包名的预设在盘上一个字节都不变，
+    /// 降级到旧版本也读得回去。故不需要 `migrate` pass，也不该有 —— 一次性迁移链里多一条
+    /// 无事可做的条目，将来读的人得自己核它到底改了什么。
+    ///
+    /// 坏形态（值不是字符串数组）的处置与同结构体另外三个列表字段**完全一致**：serde 反序列化
+    /// 失败 → `store::sanitize` 的 `ensure_array_or_remove("customAppPresets")` 之外没有逐字段清洗
+    /// ⇒ 整份 `UserConfig` 回落默认（磁盘原样保留）。这是既有形态，本字段不单独开一条宽容腿：
+    /// 四个姊妹字段里只有一个宽容，读代码的人会以为另外三个是故意的。
+    #[serde(
+        default,
+        rename = "packageNames",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub package_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
 }

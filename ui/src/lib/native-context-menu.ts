@@ -35,15 +35,16 @@
  *
  * ## 入口花名册
  *
- * 每个 webview 各是一个 document，**必须各挂一次**（一个窗的监听盖不到别的窗）。本仓四个：
- * 主窗 `main.tsx` / 托盘浮层 `tray/main.tsx` / 更新弹窗 `update-popup/main.ts`，
+ * 每个 webview 各是一个 document，**必须各挂一次**（一个窗的监听盖不到别的窗）。本仓五个：
+ * 主窗 `main.tsx` / 托盘浮层 `tray/main.tsx` / 更新弹窗 `update-popup/main.ts` /
+ * 移动端文档 `mobile/MobileMain.tsx`（Android/iOS 上 `main` 窗加载的那份，长按出的同样是页面菜单），
  * 外加 sing-box 官方面板窗——那是**第三方产物**（`scripts/fetch-dashboard.mjs` 拉的 zip、核 serve，
  * 改不了它的 JS），由 Rust 侧 `commands/misc.rs` 的 `DISABLE_CONTEXT_MENU_SCRIPT` 经
  * `initialization_script` 从外面挂同一条监听、同一套判据。花名册由 `native-context-menu.test.ts`
  * 从 `vite.config.ts` 的入口表**推导**后逐个断言，新增入口不接线即红。
  *
  * @param target 监听宿主，默认 `document`。参数只为在本仓 node 环境的 vitest 里注入假宿主
- *   （全仓无 DOM 测试环境，见 `vite.config.ts` test 段）——生产三个前端入口都按默认调用。
+ *   （全仓无 DOM 测试环境，见 `vite.config.ts` test 段）——生产的前端入口都按默认调用。
  */
 export function disableNativeContextMenu(target: EventTarget = document): void {
   target.addEventListener('contextmenu', (e) => {

@@ -135,6 +135,13 @@ fn plan_includes_v6_when_enabled() {
     assert_eq!(plan.cidrs, vec!["0.0.0.0/0", "::/0"]);
 }
 
+/// System（reverseMesh）内核接口的平台支持面：**只有 mac / linux 支持**。
+///
+/// # 两半各带正对照（缺一就没有牙）
+///
+/// - **禁的那半**：Win / Android / Other 必须 false。只写这半会被「谓词整个坏掉、全平台都
+///   false」骗过 —— 那种情形下 mac/linux 用户的 System 出口会静默降级成 gVisor，没有任何东西会红。
+/// - **准的那半**：Mac/Linux 必须**仍然** true。这是每一轮收紧兜底时的桌面零回归判据。
 #[test]
 fn plan_only_follows_exact_selected_tailscale_node() {
     let mut first = ts_system_exit_server(Some("100.64.0.1"));
@@ -175,11 +182,37 @@ fn plan_yields_when_tailscale_is_not_selected_or_traffic_is_not_tun() {
 }
 
 #[test]
-fn mesh_system_supported_excludes_windows() {
+fn mesh_system_supported_is_mac_and_linux_only() {
+    // 禁：Windows（tsnet 自装 exit 0/0 抢直连）、Android（无 CAP_NET_ADMIN，
+    // 唯一的 tun fd 由 VpnService 授予且已被主 TUN 占用 → 建不出第二张内核接口）。
+    assert!(!mesh_system_supported_on_platform(Platform::Win));
+    assert!(!mesh_system_supported_on_platform(Platform::Android));
+    // `Other` = 未知平台（2026-09-05 由 true 改 false）。这一行就是钉住那个决定的判据：
+    // 它答 true 时，「本仓没为这个平台答过题」会被读成「答案是支持」，而这条路在 Android 上
+    // 导致过整个内核起不来（`system: true` ⇒ 核去开一张开不出来的内核 TUN ⇒ 起核 FATAL）。
+    // 完整的代价不对称论证见 `mesh_system_supported_on_platform` 的函数文档。
+    assert!(
+        !mesh_system_supported_on_platform(Platform::Other),
+        "未知平台不得默认「支持 System 内核接口」：那是一项特权能力（要求应用能创建网络接口），\
+         本仓从未在该平台上验证过。判错成 false 只是退 gVisor（功能在），判错成 true 是起核 FATAL。"
+    );
+    // 正对照：两个仍支持的平台逐值不变。
     assert!(mesh_system_supported_on_platform(Platform::Mac));
     assert!(mesh_system_supported_on_platform(Platform::Linux));
-    assert!(!mesh_system_supported_on_platform(Platform::Win));
-    assert!(mesh_system_supported_on_platform(Platform::Other));
+
+    // 全变体穷举：支持集合就是这两个，多一个少一个都红。
+    let supported: Vec<Platform> = Platform::ALL
+        .iter()
+        .copied()
+        .filter(|p| mesh_system_supported_on_platform(*p))
+        .collect();
+    assert_eq!(
+        supported,
+        vec![Platform::Mac, Platform::Linux],
+        "System 支持面变了。它同时决定三件事：config 生成侧的 `system_interface_available`\
+         （endpoint 降不降级成 gVisor）、起核重试预算（10×3s vs 2 次指数）、以及出口路由\
+         状态机的三个入口是否早退。改它前先确认那三处都想要新答案。"
+    );
 }
 
 #[test]
@@ -187,6 +220,7 @@ fn platform_parse_maps_known() {
     assert_eq!(Platform::parse("darwin"), Platform::Mac);
     assert_eq!(Platform::parse("linux"), Platform::Linux);
     assert_eq!(Platform::parse("win32"), Platform::Win);
+    assert_eq!(Platform::parse("android"), Platform::Android);
     assert_eq!(Platform::parse("freebsd"), Platform::Other);
 }
 

@@ -279,11 +279,35 @@ fn linux_flush_failure_is_observable_without_throwing() {
     assert!(warned.contains("失败（忽略）"));
 }
 
+/// 未知平台：一条命令都不跑，且**返 `false`**（= 「本次没有刷」，2026-09-05 由 true 改）。
+///
+/// 与紧邻的 Android 那条构成对照组：两条都不 spawn，但返回值**必须不同** —— Android 的 `true`
+/// 建立在一条已知事实上（该平台没有应用可刷的系统缓存，故「刷完了」为真），`Other` 拿不到同一条
+/// 事实，返 `true` 就是把「没做」报成「做完了」。只断言「不 spawn」会让这两条无法区分。
 #[test]
-fn other_platform_noop() {
+fn other_platform_is_an_honest_not_flushed_noop() {
     let exec = MockExec::default();
-    flush_os_dns_cache(Platform::Other, &exec, None, false, &mut |_| {});
+    let ok = flush_os_dns_cache(Platform::Other, &exec, None, false, &mut |_| {});
+    assert!(
+        !ok,
+        "未知平台上没跑任何刷缓存命令 ⇒ 只能报「没刷」；报「刷完了」是本轮要拆掉的乐观兜底"
+    );
     assert!(exec.calls.borrow().is_empty());
+}
+
+/// Android：**一条命令都不许跑**，且返 true（本平台上「刷缓存」这件事已完成）。
+///
+/// 正对照在同文件的 mac/win/linux 三条：那三条断言**确实跑了**对应命令。只写「Android 不跑」
+/// 会被「MockExec 记账坏了、谁都记不到」骗过。
+#[test]
+fn android_flush_is_a_true_noop_and_spawns_nothing() {
+    let exec = MockExec::default();
+    let ok = flush_os_dns_cache(Platform::Android, &exec, None, false, &mut |_| {});
+    assert!(ok, "Android 上没有应用可刷的系统 DNS 缓存 ⇒ no-op 即完成");
+    assert!(
+        exec.calls.borrow().is_empty(),
+        "Android 上不得 spawn 任何刷缓存命令（`resolvectl`/`ipconfig`/`dscacheutil` 一个都没有）"
+    );
 }
 
 #[test]
@@ -295,6 +319,8 @@ fn current_platform_matches_target() {
         assert_eq!(cur, Platform::Mac);
     } else if cfg!(target_os = "windows") {
         assert_eq!(cur, Platform::Win);
+    } else if cfg!(target_os = "android") {
+        assert_eq!(cur, Platform::Android);
     } else if cfg!(target_os = "linux") {
         assert_eq!(cur, Platform::Linux);
     } else {

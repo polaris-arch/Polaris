@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use polaris_config_engine::singbox::InboundUser;
 use polaris_mesh::warp_http::{WarpHttp, WarpHttpMethod, WarpHttpRequest, WarpHttpResponse};
 use polaris_updater::traits::{DownloadError, UpdateDownloader};
 
@@ -258,13 +259,19 @@ impl HttpRuntime {
     // `config-engine/builder/inbounds.rs` 建的本机入站有三种，**不是同一种协议**：
     //   | 入站 | type | 消费者 |
     //   |---|---|---|
-    //   | `mixed-in`            | `mixed`（HTTP+SOCKS 同口，按首字节分流） | 测速回退腿 / ipinfo 出口探测 |
-    //   | `probe-in-k` / `probe-{direct,proxy}-in` | **`http`（纯 HTTP）** | 测速探测池（`speedtest.rs`） |
+    //   | `mixed-in`            | `mixed`（HTTP+SOCKS 同口，按首字节分流） | 测速回退腿 / ipinfo 出口探测（桌面） |
+    //   | `probe-in-k` / `probe-{direct,proxy}-in` | **`http`（纯 HTTP）** | 测速探测池（`speedtest.rs`）；Android 上 `probe-proxy-in` 兼任 mixed 那一行的消费方 |
     //   | `update-in`           | **`socks`（纯 SOCKS）**                  | 订阅 viaProxy / icon 远端代理 |
     //
     // 故**不能**用一个 scheme 通吃：socks5 打不通 `probe-in-k`（纯 http），http 打不通 `update-in`
     // （纯 socks）。两个构造器按消费端入站类型分别取用 —— 选错的后果都是真机才可见的静默失效
     // （测速全超时 / 订阅更新恒失败），故这里把对应关系写死在文档里。
+    //
+    // **凭据（`auth`）是两个构造器的必填参数**：Android 上除 mixed 外这批入站都要求本次起核的
+    // 一次性凭据（`config-engine::builder::inbounds::loopback_inbounds_require_auth`），缺了就是
+    // 407 / socks 认证失败 —— 同样是只在真机上才看得见的静默失效。写成必填参数而不是「从全局读」，
+    // 是让每个调用点都在编译期被迫回答「我拿的是哪一份凭据」；桌面上它恒 `None`（入站零认证）。
+    // 凭据从哪来：[`crate::runtime::proxy::ProxyRuntime::loopback_auth`] / `local_http_proxy`。
 
     /// 经本机 **HTTP** 入站的 client（`mixed-in` / `probe-in-k` / `probe-*-in`）。
     ///
@@ -276,8 +283,8 @@ impl HttpRuntime {
     /// # Errors
     ///
     /// 代理 URL 非法或 client 构建失败。
-    pub fn via_local_proxy(port: u16) -> Result<Self, String> {
-        Self::with_local_proxy_url(&format!("http://127.0.0.1:{port}"), port)
+    pub fn via_local_proxy(port: u16, auth: Option<&InboundUser>) -> Result<Self, String> {
+        Self::with_local_proxy_url(&format!("http://127.0.0.1:{port}"), port, auth)
     }
 
     /// 经本机 **SOCKS5** 入站的 client（`update-in`）。
@@ -328,15 +335,27 @@ impl HttpRuntime {
     /// # Errors
     ///
     /// 代理 URL 非法（或 `socks` feature 未启用）或 client 构建失败。
-    pub fn via_local_socks_proxy(port: u16) -> Result<Self, String> {
-        Self::with_local_proxy_url(&format!("socks5h://127.0.0.1:{port}"), port)
+    pub fn via_local_socks_proxy(port: u16, auth: Option<&InboundUser>) -> Result<Self, String> {
+        Self::with_local_proxy_url(&format!("socks5h://127.0.0.1:{port}"), port, auth)
     }
 
     /// 两个 scheme 变体的共同实现（除代理 URL 外配置**逐字相同**，不容许两处漂移）。
-    fn with_local_proxy_url(proxy_url: &str, port: u16) -> Result<Self, String> {
+    ///
+    /// 凭据经 `Proxy::basic_auth` 挂上：http 入站走 `Proxy-Authorization: Basic`，socks 入站走
+    /// RFC 1929 用户名/密码子协商（reqwest 0.13.4 `proxy.rs::url_auth` 把它写进代理 URL 的 userinfo，
+    /// socks 腿从那里取）。**先建无凭据的 `Proxy` 再挂凭据**：`Proxy::all` 的错误信息会带上它拿到的
+    /// URL，凭据若拼在 URL 串里就会跟着错误文本进日志。
+    fn with_local_proxy_url(
+        proxy_url: &str,
+        port: u16,
+        auth: Option<&InboundUser>,
+    ) -> Result<Self, String> {
         install_ring_provider();
-        let proxy = reqwest::Proxy::all(proxy_url)
+        let mut proxy = reqwest::Proxy::all(proxy_url)
             .map_err(|e| format!("本机代理地址非法（port={port}）: {e}"))?;
+        if let Some(user) = auth {
+            proxy = proxy.basic_auth(&user.username, &user.password);
+        }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .proxy(proxy)
@@ -370,6 +389,25 @@ impl HttpRuntime {
         }
         let built = build_warp_client()?;
         Ok(self.warp_client.get_or_init(|| built))
+    }
+}
+
+/// 手写代理报文用的 `Proxy-Authorization` 头**整行**（含结尾 `\r\n`）；无凭据 → 空串。
+///
+/// 给不经 reqwest/wreq、自己往本机 http 入站写报文的两条腿用（测速 CONNECT 隧道
+/// `runtime::speedtest_tunnel::open_tunnel`、自动换节点探针 `runtime::proxy::auto_switch`）——
+/// 那两处拿不到 `Proxy::basic_auth`，而 Android 上它们打的 `probe-in-k` / `probe-proxy-in` 同样要求凭据。
+/// 单点实现：两处各拼一份 Basic 头就是两份会漂的编码。
+#[must_use]
+pub fn proxy_authorization_line(auth: Option<&InboundUser>) -> String {
+    match auth {
+        Some(user) => format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            crate::runtime::mesh::base64_encode(
+                format!("{}:{}", user.username, user.password).as_bytes()
+            )
+        ),
+        None => String::new(),
     }
 }
 

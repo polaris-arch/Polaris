@@ -176,8 +176,20 @@ fn app_presets_list_channel_is_synced_across_three_places() {
     let cmd_src =
         std::fs::read_to_string(format!("{root}/../../src-tauri/src/commands/rules/crud.rs"))
             .expect("读 commands/rules/crud.rs");
-    let main_rs =
-        std::fs::read_to_string(format!("{root}/../../src-tauri/src/main.rs")).expect("读 main.rs");
+    // crate 根横跨 `main.rs`（桌面薄壳）与 `lib.rs`（应用装配）—— `generate_handler![]` 随装配
+    // 下沉进了后者。取**两份拼接**而不是写死其中一个：判据是「这个 command 确实被注册了」，
+    // 注册表住在哪个文件是实现细节，写死一个会在下一次同类搬迁时失效（本门已经因此红过一次）。
+    let crate_root = ["main.rs", "lib.rs"]
+        .iter()
+        .filter_map(|name| {
+            std::fs::read_to_string(format!("{root}/../../src-tauri/src/{name}")).ok()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !crate_root.trim().is_empty(),
+        "crate 根（src-tauri/src/{{main,lib}}.rs）取材面是空的 —— 别把它当成「注册表没了」"
+    );
 
     // ① 前端常量值必须**恰好**是 snake_case fn 名。
     assert!(
@@ -202,8 +214,8 @@ fn app_presets_list_channel_is_synced_across_three_places() {
     );
     // ③ generate_handler! 里确实注册了（声明≠注册）。
     assert!(
-        main_rs.contains(&format!("            {FN},")),
-        "main.rs 的 generate_handler![] 未注册 {FN} —— 声明了没注册，前端一样调不到"
+        crate_root.contains(&format!("            {FN},")),
+        "crate 根的 generate_handler![] 未注册 {FN} —— 声明了没注册，前端一样调不到"
     );
 }
 
@@ -221,6 +233,125 @@ fn frontend_preset_interface_matches_rust_dto_fields() {
              （前端渲染会拿到 undefined，且 tsc 不报）"
         );
     }
+}
+
+/// 切出一段 `export interface <名> { … }` 的**体**（到第一个顶层 `}` 为止）。
+///
+/// 不整文件扫的理由：`contracts/types/rules.ts` 里住着十几个 interface，拿整文件去问
+/// 「有没有声明 `packageNames`」会被**别的**接口上同名的一格满足 —— 那时门还绿着，
+/// 而 `CustomAppPreset` 上其实没有它。
+fn interface_body(code: &str, name: &str) -> String {
+    let head = format!("export interface {name} {{");
+    let at = code
+        .find(&head)
+        .unwrap_or_else(|| panic!("前端没有 `{head}` —— 接口改名请同步本测试"));
+    let rest = &code[at + head.len()..];
+    let mut depth = 1usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[..i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{name}` 的接口体没有闭合")
+}
+
+/// 前端 interface 体里声明的字段名（`foo:` / `foo?:` 两种形态）。
+fn declared_fields(body: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let bytes: Vec<char> = body.chars().collect();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if is_ident_char(bytes[i]) && (i == 0 || !is_ident_char(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && is_ident_char(bytes[i]) {
+                i += 1;
+            }
+            let mut j = i;
+            if j < bytes.len() && bytes[j] == '?' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == ':' {
+                out.insert(bytes[start..i].iter().collect::<String>());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+#[test]
+fn declared_fields_reads_both_optional_and_required_forms() {
+    // 门的自检：提取器塌了（返回空集）会让下面那条**双向**等式恒绿。
+    let got = declared_fields(" id: string; iconUrl?: string; nested: { a: number }; ");
+    assert!(got.contains("id"));
+    assert!(got.contains("iconUrl"), "`?:` 形态应认");
+    assert!(!got.contains("string"), "类型名不是字段名");
+}
+
+/// **`CustomAppPreset` 的跨语言键名契约（双向恰等）。**
+///
+/// 这个结构体是**用户配置**的一部分：前端写进 `customAppPresets[]`、Rust 读它生成配置。
+/// 两侧的键名对不上时**没有任何东西会红** —— TS 那边是自己造的对象字面量（tsc 只管本侧类型），
+/// Rust 这边 serde 对不认识的键默默跳过、对缺席的 `#[serde(default)]` 字段给默认值。
+/// 后果是「界面收下了、盘上也写了，生成配置时那一格恒空」，且全程静默。
+///
+/// 2026-09-13（批 16）新增 `packageNames` 时补上本门：那一格正是这条缝的最新形态 ——
+/// 它决定「自定义应用设成直连」在 Android 上生不生效，而写错名字的表现与没写一模一样。
+///
+/// 夹具**全字段非空**是必须的：`skip_serializing_if` 会让空字段整个不出现在 JSON 里，
+/// 拿一个半空的夹具去取键名集合，等于把没覆盖到的字段偷偷排除出这条等式。
+#[test]
+fn frontend_custom_app_preset_interface_matches_rust_serde_keys() {
+    use polaris_config_engine::user_config::CustomAppPreset;
+    let preset = CustomAppPreset {
+        id: "custom-foo".into(),
+        name: "Foo".into(),
+        emoji: "🚀".into(),
+        icon_url: Some("https://e.com/f.png".into()),
+        geosite_tags: vec!["foo".into()],
+        geoip_tags: vec!["foo".into()],
+        process_names: Some(vec!["FooApp".into()]),
+        package_names: vec!["com.example.foo".into()],
+        category: Some("tools".into()),
+    };
+    let json = serde_json::to_value(&preset).expect("CustomAppPreset 序列化");
+    let rust_keys: std::collections::BTreeSet<String> = json
+        .as_object()
+        .expect("应为对象")
+        .keys()
+        .cloned()
+        .collect();
+    // 自检：夹具真的把每一格都填上了（少一格 ⇒ 那一格悄悄退出这条等式）。
+    assert_eq!(
+        rust_keys.len(),
+        9,
+        "夹具没覆盖全部字段，取到的键只有 {rust_keys:?}"
+    );
+
+    let body = interface_body(
+        &frontend_code("contracts/types/rules.ts"),
+        "CustomAppPreset",
+    );
+    let ts_keys = declared_fields(&body);
+    assert_eq!(
+        ts_keys, rust_keys,
+        "CustomAppPreset 的键名两侧不等 —— 这条缝上 tsc 与 serde 都不会报：\
+         多出来的那一侧写进盘里也没人读，少掉的那一侧恒取默认值。\
+         Rust: {rust_keys:?} / TS: {ts_keys:?}"
+    );
+    // 正面钉住本批那一格（上面那条等式是集合级的，这一条说得出**是哪个键**坏了）。
+    assert!(
+        rust_keys.contains("packageNames") && ts_keys.contains("packageNames"),
+        "`packageNames` 没了 —— 「自定义应用设成直连」在 Android 上会退回静默不生效"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

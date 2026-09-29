@@ -18,7 +18,7 @@ mod overlay_lifecycle_gate;
 // `tray.rs` 正在按域拆成 `tray/{model,lifecycle,window,placement,platform,commands,transition}.rs`，
 // 写死 `crate_source("tray.rs")` 的门在函数搬进子模块的那一刻**只剩半张判据面**——
 // 下面的 `top_level_fn_body` 锚点会 panic（还算体面），而同文件里的否定型断言会恒真。
-use crate::test_support::{crate_code, module_code};
+use crate::test_support::{crate_code, crate_root_code, module_code};
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> PhysicalRect {
     PhysicalRect { x, y, w, h }
@@ -493,7 +493,7 @@ fn native_theme_override_is_the_single_explicit_theme_parser() {
     }
 
     let main = crate::commands::guard_scan::top_level_fn_body(
-        &crate_code("main.rs"),
+        &crate_root_code(),
         "fn create_main_window(",
     );
     let config = crate::commands::guard_scan::top_level_fn_body(

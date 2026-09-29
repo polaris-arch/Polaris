@@ -4,7 +4,7 @@
  * # 两份真值各喂谁
  *
  *  - 工作区 `Cargo.toml` 的 `version` → `env!("CARGO_PKG_VERSION")` → 订阅 User-Agent
- *    （`commands/subscription.rs`）、`--version` 输出（`main.rs`）、启动日志、HTTP UA。
+ *    （`commands/subscription.rs`）、`--version` 输出（`lib.rs`）、启动日志、HTTP UA。
  *  - `src-tauri/tauri.conf.json` 的 `version` → Tauri 的 `package_info().version` → `version_get_info`
  *    回给「关于」页的 appVersion、备份文件里的 appVersion，以及安装包/bundle 版本。
  *

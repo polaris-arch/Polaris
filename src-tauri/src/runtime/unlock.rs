@@ -156,19 +156,24 @@ struct Cached {
 }
 
 /// 解锁 gating 短路判定（**SoT**，命令层唯一入口）。1:1 上游 `UnlockDetectionService.run` 的 gating 段：
-/// - 核未运行 / 无 mixed 入站 → `ProxyNotRunning`（不发起检测、不缓存）；
+/// - 核未运行 / 无本机 http 代理入站（`proxy_port == 0`）→ `ProxyNotRunning`（不发起检测、不缓存）；
 /// - 选中 TS 出口直判无效（`exit_blocked`，见 [`crate::runtime::tailscale_status::selected_ts_exit_blocked`]）
 ///   → `ExitInvalid`（经死出口检测只会空转就绪门数十秒 → 短路，零网络零就绪门）。
 ///
 /// 优先级 `ProxyNotRunning > ExitInvalid`（无代理谈不上出口有效性），对齐 Polaris gate 顺序
 /// （`isRunning` 先于 `getExitBlock`）。返回 `None` = 放行，进真检测。
 #[must_use]
+///
+/// `proxy_port` = 检测要经过的本机 http 代理入站端口，取自
+/// [`ProxyRuntime::local_http_proxy`](crate::runtime::proxy::ProxyRuntime::local_http_proxy)（没有 = 0）。
+/// **不是 `ProxyStatus.mixed_port`**：Android 不发射 mixed 入站、该字段恒 0，按它判会让 Android 上
+/// 解锁检测永远短路成「代理未运行」；而改判前它是非 0 时，连向的口根本没人监听（α 批修）。
 pub fn unlock_gate_reason(
     running: bool,
-    mixed_port: u16,
+    proxy_port: u16,
     exit_blocked: bool,
 ) -> Option<UnlockBlockedReason> {
-    if !running || mixed_port == 0 {
+    if !running || proxy_port == 0 {
         return Some(UnlockBlockedReason::ProxyNotRunning);
     }
     if exit_blocked {

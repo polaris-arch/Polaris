@@ -173,14 +173,23 @@ fn base_builder() -> wreq::ClientBuilder {
 }
 
 impl UnlockClient {
-    /// 经本机 mixed 端口的检测客户端（**生产路径**：走用户当前分流出口）。
+    /// 经本机 http 代理入站的检测客户端（**生产路径**）：桌面是 mixed 口（走用户当前分流出口），
+    /// Android 上没有 mixed 入站，调用方改传 `probe-proxy-in`（固定走 `proxy-selector`）。
+    ///
+    /// `auth` = `(username, password)`：Android 上 `probe-proxy-in` 要求本次起核的一次性凭据
+    /// （缺了内核回 407 ⇒ 六个 checker 全失败且无报错）；桌面恒 `None`。必填参数而非可省：
+    /// 调用点必须在编译期回答「我拿的是哪一份凭据」。凭据**先建无凭据的 `Proxy` 再挂**，
+    /// 不拼进 URL 串 —— `Proxy::all` 的错误文本会带上它拿到的 URL。
     ///
     /// # Errors
     ///
     /// 代理地址非法或 client 构建失败（BoringSSL 初始化）。
-    pub fn via_local_proxy(port: u16) -> Result<Self, String> {
-        let proxy = wreq::Proxy::all(format!("http://127.0.0.1:{port}"))
+    pub fn via_local_proxy(port: u16, auth: Option<(&str, &str)>) -> Result<Self, String> {
+        let mut proxy = wreq::Proxy::all(format!("http://127.0.0.1:{port}"))
             .map_err(|e| format!("本机代理地址非法（port={port}）: {e}"))?;
+        if let Some((username, password)) = auth {
+            proxy = proxy.basic_auth(username, password);
+        }
         let client = base_builder()
             .proxy(proxy)
             .build()

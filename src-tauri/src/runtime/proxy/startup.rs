@@ -17,7 +17,7 @@ use super::core_log::{
 use super::dns_takeover::{dns_takeover_enabled, system_dns_takeover_active};
 use super::lifecycle::{now_ms, sleep_unless_superseded_on};
 use super::platform_contracts::{enumerate_own_lan_cidrs, platform_tag};
-use super::process_supervision::pid_alive;
+use super::process_supervision::{pid_alive, DirectCoreSlot, HelperStartToken, HelperStopPermit};
 use super::route_replan::{
     classify_tun_adapter_leg, inferred_binding_replan_needed, interface_availability,
     managed_tun_interface_for_session, required_interfaces_unavailable, ExitInterfaceId,
@@ -41,20 +41,28 @@ use polaris_config_engine::builder::endpoint_routes::{
     mesh_system_supported_on_platform, mesh_uses_system_interface,
 };
 use polaris_config_engine::builder::helpers::ServerLike;
+use polaris_config_engine::builder::inbounds::{
+    emits_mixed_inbound, loopback_inbounds_require_auth,
+};
 use polaris_config_engine::builder::network_env::{
     builtin_dhcp_status, resolved_probe, BuiltinDhcpStatus, NetworkCanaryPlan, ProbeFacts,
     PrunedEnvRule, ResolvedProbe,
 };
 use polaris_config_engine::builder::outbounds::required_bind_interfaces;
+use polaris_config_engine::builder::system_interfaces::endpoint_requests_system_interface;
+#[cfg(target_os = "android")]
 use polaris_config_engine::builder::system_interfaces::{
-    endpoint_requests_system_interface, ensure_managed_system_interfaces,
-    INVALID_REASON_SYSTEM_INTERFACE_REQUIRES_HELPER,
+    ensure_android_supported_endpoints, INVALID_REASON_SYSTEM_INTERFACE_UNSUPPORTED_PLATFORM,
+};
+#[cfg(not(target_os = "android"))]
+use polaris_config_engine::builder::system_interfaces::{
+    ensure_managed_system_interfaces, INVALID_REASON_SYSTEM_INTERFACE_REQUIRES_HELPER,
 };
 use polaris_config_engine::builder::{
     build_id_to_tag_map, generate_sing_box_config_with_report_and_runtime_bindings,
     GenerateConfigDeps, GenerateOutcome, InvalidNode,
 };
-use polaris_config_engine::singbox::SingBoxConfig;
+use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::dns_constants::{is_direct_selection, DIRECT_TAG};
 use polaris_config_engine::user_config::proxy_mode::ProxyMode;
@@ -81,6 +89,119 @@ use crate::runtime::helper::{
     InstallCoreUnsupportedRecord,
 };
 use crate::runtime::route_binding::plan_runtime_bindings;
+
+/// Lives inside spawn_blocking. If its async waiter is cancelled, the worker
+/// still publishes its exact result; panic leaves an unconfirmed attempt.
+pub(in crate::runtime::proxy) struct HelperStartCompletion {
+    child: Arc<Mutex<DirectCoreSlot>>,
+    pid: Arc<Mutex<Option<u32>>>,
+    token: HelperStartToken,
+    published: bool,
+}
+
+impl HelperStartCompletion {
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn for_test(
+        runtime: &ProxyRuntime,
+        token: HelperStartToken,
+    ) -> Self {
+        Self {
+            child: Arc::clone(&runtime.child),
+            pid: Arc::clone(&runtime.pid),
+            token,
+            published: false,
+        }
+    }
+
+    pub(in crate::runtime::proxy) fn publish(
+        &mut self,
+        result: &Result<u32, String>,
+    ) -> Result<(), String> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| "helper Start child lock poisoned".to_string())?;
+        if !child.helper_start_inflight(&self.token) {
+            return Err("helper Start attempt was replaced before completion".to_string());
+        }
+        let mut pid_guard = if result.is_ok() {
+            Some(
+                self.pid
+                    .lock()
+                    .map_err(|_| "helper Start pid lock poisoned".to_string())?,
+            )
+        } else {
+            None
+        };
+        let known = result.as_ref().ok().copied();
+        if !child.finish_helper_start(&self.token, known) {
+            return Err("helper Start attempt changed during completion".to_string());
+        }
+        if let (Some(pid), Some(slot)) = (known, pid_guard.as_mut()) {
+            **slot = Some(pid);
+        }
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for HelperStartCompletion {
+    fn drop(&mut self) {
+        if !self.published {
+            if let Ok(mut child) = self.child.lock() {
+                child.finish_helper_start(&self.token, None);
+            }
+        }
+    }
+}
+
+/// Android 起核腿的核二进制**占位串**（不指向任何文件）。
+///
+/// 核是进程内 `.so`（libbox），Android 上根本没有核可执行文件，而起核腿的 `binary` 是一个
+/// `PathBuf`。占位串只出现在两处：起核日志的 `bin=` 字段（写明「核在进程内」比写一个假路径诚实），
+/// 以及被带出重试循环的那个元组。**真正会拿它去碰盘的内核自证在 Android 上整条不挂**（见调用点）。
+#[cfg(target_os = "android")]
+pub(super) const IN_PROCESS_CORE_PLACEHOLDER: &str = "<in-process libbox>";
+
+/// 回环探针/更新入站凭据的用户名。**不是秘密**：sing-box 在连接日志里会打出认证用户名，
+/// 凭据的全部强度在口令上（[`loopback_auth_for`]）。
+pub(super) const LOOPBACK_AUTH_USERNAME: &str = "polaris";
+
+/// 为本次起核生成回环探针/更新入站的一次性凭据（只在 [`loopback_inbounds_require_auth`] 为真的平台）。
+///
+/// - 口令 = CSPRNG 16 字节（128 bit）→ 32 位 hex，与 `clashApiSecret` 同一个生成器
+///   （[`crate::commands::config::generate_local_api_secret`]，ring `SecureRandom`，熵源失败即 Err）。
+/// - **只存内存**：经 `GenerateConfigDeps` 写进内核配置（`<configDir>/singbox-runtime.json`，应用私有目录），
+///   经 `SwitchSnapshot` 给进程内消费方；不进 `ProxyStatus`、不进日志（`InboundUser` 的 `Debug` 抹口令）。
+/// - 熵源失败 → `None` + error 日志：生成侧对「要求凭据却没有」**整批不发射**这批入站（fail-closed），
+///   测速池 / 自动换节点 / 经代理更新订阅随之不可用，但绝不开出零认证口。
+pub(super) fn loopback_auth_for(platform: Platform) -> Option<InboundUser> {
+    if !loopback_inbounds_require_auth(platform) {
+        return None;
+    }
+    match crate::commands::config::generate_local_api_secret() {
+        Ok(password) => Some(InboundUser {
+            username: LOOPBACK_AUTH_USERNAME.to_string(),
+            password,
+        }),
+        Err(e) => {
+            log::error!("回环入站凭据生成失败（{e}）→ 探针/更新入站本次整批不发射");
+            None
+        }
+    }
+}
+
+/// `ProxyStatus.mixed_port` 的取值：本平台发射了 `mixed-in` 才报配置的端口，否则报 0。
+///
+/// 纯函数，与生成侧共用 [`emits_mixed_inbound`] —— 「状态里报的口，生成出来的配置里确有监听」
+/// 由 `proxy/tests/loopback_egress.rs` 的逐平台对拍门钉住。
+pub(super) fn exposed_mixed_port(platform: Platform, configured: u16) -> u16 {
+    if emits_mixed_inbound(platform) {
+        configured
+    } else {
+        0
+    }
+}
 
 /// 就绪等待预算的**下限**（ms）——上游 `ProxyManager.CORE_READY_TIMEOUT_MS`（:524）那个固定门的原值。
 ///
@@ -494,12 +615,32 @@ pub enum HelperGateDecision {
 /// - **systemProxy/manual 不接管 TUN**：核只在本地端口截流，app 直接 spawn 即可（无需 root）→ [`TokioSpawner`]。
 /// - **平台无 helper**（`Platform::Other`）：无 daemon 可连 → 退回直起（best-effort；TUN 在未知平台本就无解）。
 ///
+/// 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。这一格今天**零行为差** ——
+/// 合取项是 mac/win/linux 允许清单，Android 永远走不到 —— 接上是为了让「runtime 里每一处按
+/// 接管方式分流的判据都读生效值」没有例外：留例外就要靠人逐处复核「这个例外今天还成立吗」。
+///
+/// # iOS 的显式确认（2026-09-06，加 `Platform::Ios` 变体时逐处答题）
+///
+/// 这里的平台判据是**允许清单**（`matches!(… Mac | Win | Linux)`），`Platform::Ios` 不在列
+/// ⇒ 求值 `false` ⇒ 不建 helper client。**这个答案恰好是对的**（iOS 无 helper：
+/// `runtime::helper::platform_supported(Ios) == false`，两处是同一个平台集合的两份写法，
+/// 两份都必须把 iOS 排除在外）。
+///
+/// **但它是白捡来的，不是有人答过的题** —— 这正是本批要显式记一笔的原因：`matches!` 少一个
+/// 变体只是求值 false，编译器一句话都不说。同一形态在 `builder/log.rs` 那一格上答案是相反的
+/// （那里漏掉 iOS = 导出诊断里核日志为空），两格的差别只在「不在允许清单里」是不是想要的结果。
+/// 故此处的绿必须写下来，否则下一次有人从这一格推广到那一格时没有对照。
+///
+/// 与 `is_tun()` 那半的交互也要说清：`effective_on(Ios)` 恒 `Tun`，所以第一个合取项在 iOS 上
+/// 恒真，整条判据完全由平台允许清单决定 —— 不存在「靠模式判据兜住」的第二层。
+///
 /// 变异锚点：删 `is_tun()` → 全模式经 helper（systemProxy 也弹提权，回归）；删平台判 → Other 平台起核必失败。
 ///
 /// DESIGN-REVIEW(c6-5-src-tauri-helper-wiring)：`Platform::Other` 的 TUN 判 false → 退回直起（无 helper
 /// 可连）；但直起也建不了 TUN——是否该改「Other+TUN→显式报错」由复审裁（R27.1，目标平台仅 mac/win/linux，低风险）。
 pub(super) fn should_start_via_helper(mode: ProxyModeType, platform: Platform) -> bool {
-    mode.is_tun() && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
+    mode.effective_on(platform).is_tun()
+        && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
 }
 
 /// **已装 helper「该不该提示升级」的纯判定**（与 [`should_start_via_helper`] 同层，形态照
@@ -886,7 +1027,10 @@ impl ProxyRuntime {
         // 网络场景 auto 探测源用的「接管生效」事实：与起核尾 C7 接管门同一组输入（平台 + TUN + 开关）。
         let takeover_active = system_dns_takeover_active(
             Platform::parse(platform_tag()),
-            user_config.proxy_mode_type.is_tun(),
+            user_config
+                .proxy_mode_type
+                .effective_on(Platform::parse(platform_tag()))
+                .is_tun(),
             dns_takeover,
         );
         // R4 兜底的会话态每次起核复位：上一次会话剔除过 dhcp，不代表这一次也会失败。
@@ -904,6 +1048,20 @@ impl ProxyRuntime {
         self.run_helper_gate(user_config.proxy_mode_type).await?;
         let helper_gate_ms = t_helper_gate.elapsed().as_millis();
         log::info!("起核耗时：helper提权门={helper_gate_ms}ms");
+
+        // 授权必须早于配置生成与起核，且不持 child 锁：等待系统弹窗时 stop 仍能执行。
+        // Kotlin 回调仅结算授权；这里复核世代，阻止取消/接管后的迟到授权继续起核。
+        #[cfg(target_os = "android")]
+        {
+            let permission = super::android_bridge::request_vpn_permission().await;
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
+            }
+            if let Err((message, code)) = permission {
+                self.set_error(&message, code);
+                return Err(StartError::coded(message, code));
+            }
+        }
 
         // ── 端口两轴常量（单一真值复用 config-engine::proxy_ports）。mixed/control 由 config 决定、
         //    跨重试不变；管理 API / update-in 是动态空闲口，每次尝试重解析（见 resolve_start_ports）──
@@ -957,8 +1115,14 @@ impl ProxyRuntime {
         //   `dependency[X] not found` 的 pruneTagsClosure 幽灵引用修正（需 config-engine gate-invalid-node 内部机制，
         //   属 config-engine 只读禁区）；(b) libcronet 缺库 strong-heal 重拷闭环（需 resourceManager.ensureCronetHealthy
         //   子系统）。二者靠现有「generate 期 invalid-node 剔除 + has_cronet 生成期报错」部分覆盖；完整移植列 review-queue。
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。Android 上零行为差：
+        // 合取项 `mesh_system_supported_on_platform` 是 mac/linux 允许清单，Android 不在其中 ⇒
+        // 两条腿都落默认预算。接上是为了不留需要人工复核的例外。
         let budget = resolve_start_retry_budget(
-            user_config.proxy_mode_type.is_tun(),
+            user_config
+                .proxy_mode_type
+                .effective_on(self.helper.platform())
+                .is_tun(),
             &user_config.servers,
             platform_tag(),
         );
@@ -1000,6 +1164,9 @@ impl ProxyRuntime {
         // 之外。`via_helper` 在进循环前就定了（上方），故不存在「某腿直起、某腿 helper 起」的混合形态；
         // 直起时每腿都会覆写成本腿的新闸（上一腿的核已被 kill，其管道任务随之结束）。
         let mut log_pipe_handoff: Option<CoreLogHandoff> = None;
+        // Captured from the same Child slot as the actual spawn, then carried to
+        // its monitor. A later start cannot make the old monitor adopt its Child.
+        let mut direct_run_identity = None;
 
         // C11 节点域名解析多源竞速（对齐 上游 start 步骤 3.9 `startNodeDnsRaceServer`）：
         // 节点 outbound.server 恒是域名，由内核运行期解析多 A → DialSerial 逐 IP 重试；这里给内核
@@ -1012,7 +1179,12 @@ impl ProxyRuntime {
         let dns_race = async {
             let started = std::time::Instant::now();
             self.dns_race
-                .start(&user_config, self.config.dir(), my_gen)
+                .start(
+                    &user_config,
+                    self.config.dir(),
+                    my_gen,
+                    self.helper.platform(),
+                )
                 .await;
             started.elapsed().as_millis()
         };
@@ -1151,6 +1323,8 @@ impl ProxyRuntime {
             let pruned_env_rules = gate.pruned_env_rules;
             // 本次写进配置的 canary 表（同上：随**这一次**的配置带出，探测对的是运行核）。
             let network_canary = gate.network_canary;
+            // Android 起核腿要把**这一份字节**交给进程内的 libbox（与刚写下去的盘上那份同源）。
+            // 桌面腿不消费它（核自己去读 `config_path`）。
             let gate_config_json = gate.config_json;
             let singbox_config = gate.config;
             let effective_user_config = gate.effective_user_config;
@@ -1194,10 +1368,27 @@ impl ProxyRuntime {
 
             // Check the final post-gate endpoints before any mesh ownership or core spawn. An
             // invalid-node report alone must never turn this into a silently running direct exit.
-            if let Err(msg) = ensure_managed_system_interfaces(
+            #[cfg(target_os = "android")]
+            let system_guard = ensure_android_supported_endpoints(
+                singbox_config.endpoints.as_deref().unwrap_or_default(),
+            )
+            .map_err(str::to_owned);
+            #[cfg(not(target_os = "android"))]
+            let system_guard = ensure_managed_system_interfaces(
                 singbox_config.endpoints.as_deref().unwrap_or_default(),
                 via_helper,
-            ) {
+            );
+            #[cfg(target_os = "android")]
+            let (system_code, system_reason) = (
+                code::SYSTEM_INTERFACE_UNSUPPORTED,
+                INVALID_REASON_SYSTEM_INTERFACE_UNSUPPORTED_PLATFORM,
+            );
+            #[cfg(not(target_os = "android"))]
+            let (system_code, system_reason) = (
+                code::SYSTEM_INTERFACE_REQUIRES_HELPER,
+                INVALID_REASON_SYSTEM_INTERFACE_REQUIRES_HELPER,
+            );
+            if let Err(msg) = system_guard {
                 let wrappers: Vec<ServerLikeRef<'_>> = effective_user_config
                     .servers
                     .iter()
@@ -1215,18 +1406,21 @@ impl ProxyRuntime {
                         invalid_nodes.push(InvalidNode {
                             id: id.clone(),
                             tag: endpoint.tag.clone(),
-                            reason: INVALID_REASON_SYSTEM_INTERFACE_REQUIRES_HELPER.into(),
+                            reason: system_reason.into(),
                         });
                     }
                 }
                 self.emit_invalid_nodes(&invalid_nodes);
-                self.set_error(&msg, code::SYSTEM_INTERFACE_REQUIRES_HELPER);
-                return Err(StartError::coded(
-                    msg,
-                    code::SYSTEM_INTERFACE_REQUIRES_HELPER,
-                ));
+                self.set_error(&msg, system_code);
+                return Err(StartError::coded(msg, system_code));
             }
 
+            // Android 上 `core_binary_for_start()` **恒 Err**：核是进程内 `.so`，盘上根本没有可执行
+            // 文件（`resolve_core_binary` 按平台目录找 `sing-box`，Android 不在那张表里）。桌面三平台
+            // 解析不到核仍是终态 Err —— 这里的分叉是**平台事实**，不是把桌面那条判据放宽。
+            #[cfg(target_os = "android")]
+            let binary = std::path::PathBuf::from(IN_PROCESS_CORE_PLACEHOLDER);
+            #[cfg(not(target_os = "android"))]
             let binary = binary_res?;
             // C5：起核前快照 utun 基线（每尝试；macOS 时序 diff 锚点）——须在核创建 TS 内核接口**前**。
             let t_mesh_baseline = std::time::Instant::now();
@@ -1252,9 +1446,37 @@ impl ProxyRuntime {
                         StartError::from("Cannot identify Tailscale endpoint ownership".to_string())
                     },
                 )?)
-                .await;
+                .await
+                .map_err(|_| {
+                    StartError::coded(
+                        "Cannot close transient Tailscale login before starting the main core"
+                            .to_string(),
+                        code::STARTUP_FAILED,
+                    )
+                })?;
+            // A marker may have appeared during the async preflight. The final
+            // shared claim/Stop-to-spawn exclusion is still unsupported; this
+            // late fence ensures the legacy path does not intentionally spawn
+            // after observing a managed document.
+            self.admit_legacy_start()?;
             let t_spawn = std::time::Instant::now();
-            let pid = if via_helper {
+            let pid = if cfg!(target_os = "android") {
+                // ── Android 腿（既有 `via_helper` seam 的**第三条腿**）──
+                // 不 spawn、无 child、无 pid：核跑在**本进程内**的 libbox 里，由 `VpnService` 承载
+                // （tun fd 只能由它 `establish()`，且那个 fd 是进程内才有意义的 int）。
+                //
+                // **失败是终态、不进重试预算**（与 helper 腿同口径）：桥的失败面是「无 VPN 授权 /
+                // 内核拒收这份配置 / 前台没有 Activity」，三者都不是重试能治的竞态；而重试要付的是
+                // 用户可见的十几秒空等。真正的瞬态（端口占用）在 Android 上不存在——管理口是进程内
+                // 回环，且每腿都会重解析。
+                match super::android_bridge::start_core(&gate_config_json).await {
+                    Ok(_receipt) => 0,
+                    Err((msg, error_code)) => {
+                        self.set_error(&msg, error_code);
+                        return Err(StartError::coded(msg, error_code));
+                    }
+                }
+            } else if via_helper {
                 // 经 helper 起（阻塞 IPC 挪 spawn_blocking；helper 核无本地 child 句柄）。
                 // 让位 → Ok(None) → 静默返回（接管方拥有已提交 pid + core_via_helper 标记，负责收口）。
                 match self
@@ -1274,59 +1496,87 @@ impl ProxyRuntime {
                 // 竞态不变式：stop() 先 bump 世代、再取 child 锁；本处在**持锁期间**判世代。
                 //   · 本判定先于 stop 的 bump → 本腿 spawn 并存 child；stop 随后取到 child 并杀 → 无孤儿。
                 //   · stop 的 bump 先于本判定 → 本腿直接让位、**根本不 spawn** → 无孤儿。
-                self.core_via_helper.store(false, Ordering::SeqCst);
-                let mut guard = self
-                    .child
-                    .lock()
-                    .map_err(|e| format!("child lock poisoned: {e}"))?;
-                if self.gate.generation() != my_gen {
-                    log::info!(
-                        "起核在 spawn 前被接管（世代 {my_gen} → {}）→ 让位",
-                        self.gate.generation()
+                let direct_spawn = {
+                    let mut guard = self
+                        .child
+                        .lock()
+                        .map_err(|e| format!("child lock poisoned: {e}"))?;
+                    if self.gate.generation() != my_gen {
+                        log::info!(
+                            "起核在 spawn 前被接管（世代 {my_gen} → {}）→ 让位",
+                            self.gate.generation()
+                        );
+                        return Ok(self.status());
+                    }
+                    if guard.has_helper_start() || self.core_via_helper.load(Ordering::SeqCst) {
+                        return Err(StartError::direct_slot_occupied());
+                    }
+                    let empty_slot = guard
+                        .empty_for_install()
+                        .ok_or_else(StartError::direct_slot_occupied)?;
+                    self.core_via_helper.store(false, Ordering::SeqCst);
+                    // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
+                    // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
+                    // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
+                    // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
+                    // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
+                    // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
+                    // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
+                    // FATAL 分类（见 `pipe_to_log` 文档）。
+                    let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
+                    let sink_handoff = Arc::clone(&handoff);
+                    let sink_fatal = Arc::clone(&fatal_slot);
+                    let mut req = SpawnRequest::new(
+                        &binary,
+                        &config_path,
+                        StdioPolicy::drain(move |stdout, stderr| {
+                            pipe_to_log(
+                                stdout,
+                                SING_BOX_TARGET,
+                                None,
+                                Some(Arc::clone(&sink_handoff)),
+                            );
+                            pipe_to_log(
+                                stderr,
+                                SING_BOX_TARGET,
+                                Some(sink_fatal),
+                                Some(sink_handoff),
+                            );
+                        }),
                     );
-                    return Ok(self.status());
-                }
-                // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
-                // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
-                // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
-                // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
-                // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
-                // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
-                // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
-                // FATAL 分类（见 `pipe_to_log` 文档）。
-                let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
-                let sink_handoff = Arc::clone(&handoff);
-                let sink_fatal = Arc::clone(&fatal_slot);
-                let mut req = SpawnRequest::new(
-                    &binary,
-                    &config_path,
-                    StdioPolicy::drain(move |stdout, stderr| {
-                        pipe_to_log(
-                            stdout,
-                            SING_BOX_TARGET,
-                            None,
-                            Some(Arc::clone(&sink_handoff)),
-                        );
-                        pipe_to_log(
-                            stderr,
-                            SING_BOX_TARGET,
-                            Some(sink_fatal),
-                            Some(sink_handoff),
-                        );
-                    }),
-                );
-                // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
-                req.extra_args = vec!["--disable-color".to_string()];
-                // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
-                // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
-                req.working_dir = Some(self.config.dir().to_path_buf());
-                let spawned = match TokioSpawner::new().spawn(req) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // spawn launch 失败：释放 child 锁再判重试。端口/资源竞态可重试；权限/enoent/配置无效
-                        // 等确定失败 → 终态（is_retryable_start_error）。已在锁前置 core_via_helper=false，无核可孤。
-                        drop(guard);
-                        let msg = format!("{e}");
+                    // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
+                    req.extra_args = vec!["--disable-color".to_string()];
+                    // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
+                    // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
+                    req.working_dir = Some(self.config.dir().to_path_buf());
+                    // Mint before spawn: even a failed OS random source must not
+                    // leave a successfully spawned Child without its run token.
+                    let run_identity = super::process_supervision::RunIdentity::new();
+                    match TokioSpawner::new().spawn(req) {
+                        Ok(spawned) => {
+                            let pid = spawned.pid().unwrap_or(0);
+                            let run = super::process_supervision::DirectCoreRun::with_identity(
+                                spawned.child,
+                                run_identity,
+                            );
+                            let identity = run.identity.clone();
+                            // The empty-slot permit retains this mutex guard
+                            // through spawn, so this cannot discard a Child.
+                            empty_slot.install_running(run);
+                            Ok((pid, handoff, identity))
+                        }
+                        Err(e) => Err(format!("{e}")),
+                    }
+                };
+                match direct_spawn {
+                    Ok((pid, handoff, identity)) => {
+                        log_pipe_handoff = Some(handoff);
+                        direct_run_identity = Some(identity);
+                        pid
+                    }
+                    Err(msg) => {
+                        // Spawn failure releases the child lock before any
+                        // retry sleep. No Child was installed on this path.
                         if attempt <= budget.max_retries && is_retryable_start_error(&msg) {
                             log::warn!("sing-box spawn 失败（第 {attempt} 次，可重试）→ 预算内自动重试：{msg}");
                             // 退避期被接管 → 让位（本腿 spawn 就没成，无核可孤；不 set_error、不重试）。
@@ -1342,18 +1592,17 @@ impl ProxyRuntime {
                         self.set_error(&msg, code::STARTUP_FAILED);
                         return Err(StartError::coded(msg, code::STARTUP_FAILED));
                     }
-                };
-                let pid = spawned.pid().unwrap_or(0);
-                log_pipe_handoff = Some(handoff);
-                *guard = Some(spawned.child);
-                pid
+                }
             };
             let spawn_attempt_ms = t_spawn.elapsed().as_millis();
             spawn_ms += spawn_attempt_ms;
             log::info!("起核耗时：spawn子进程={spawn_attempt_ms}ms（viaHelper={via_helper}）");
             // helper 腿已经在 IPC 回包后立即提交 pid 并完成存活探测；这里只提交直起腿，避免同一 pid
             // 连续写两次同一把锁。该微段单独记账，验证它是否值得继续优化，而不是凭感觉删安全检查。
-            if !via_helper {
+            // Android 腿**不提交 pid**：核在本进程内，没有号码可记。写 `Some(0)` 会被
+            // `status()`、诊断以及 stale 清扫的「受管 pid 排除表」当成一个真实号码引用
+            // ——那等于给 0 号发一张免死金牌。
+            if !via_helper && !cfg!(target_os = "android") {
                 let pid_commit_started = std::time::Instant::now();
                 if let Ok(mut g) = self.pid.lock() {
                     *g = Some(pid);
@@ -1599,7 +1848,10 @@ impl ProxyRuntime {
             start_time: Some(now_ms()),
             // 读时投影，存储态恒 None（见 ProxyStatus 文档）。
             uptime: None,
-            mixed_port,
+            // 本平台没发射 `mixed-in`（Android / iOS）→ 记 0（「不存在」），不报一个没人监听的口。
+            // 判据与生成侧同一个函数、同一个平台串（`deps.platform`），两边不可能漂开。
+            // 消费方经 `ProxyRuntime::local_http_proxy` 取址，那里在 0 时改走 `probe-proxy-in`。
+            mixed_port: exposed_mixed_port(Platform::parse(&deps.platform), mixed_port),
             clash_api_port: api_port,
             // C19：暴露给更新链路消费方（resolve_update_proxy_target 据此选走 update-in 口 vs 直连）。
             update_in_port,
@@ -1621,12 +1873,8 @@ impl ProxyRuntime {
         if let Ok(mut g) = self.current_config.write() {
             *g = Some(config.clone());
         }
-        self.mesh.release_tailscale_main_states();
-        self.mesh
-            .reserve_tailscale_main_states(&serde_json::to_value(&singbox_config).map_err(
-                |_| StartError::from("Cannot identify Tailscale endpoint ownership".to_string()),
-            )?)
-            .await;
+        // The final endpoint set was claimed before native/libbox startup. Keep that claim
+        // continuously through readiness; releasing and re-reserving here opens a takeover gap.
         if let Ok(mut snap) = self.startup_snapshot.write() {
             *snap = Some(config);
         }
@@ -1667,8 +1915,9 @@ impl ProxyRuntime {
         //     三条都必须等校正落定（各自的具体理由见 `after_selector_reasserted`）。
         self.spawn_reassert_selector_selection(user_config.clone(), my_gen, api_port);
         // 核就绪 → 挂后台崩溃监测（**唯一**接线点：只在真正 running 后起，让位/失败腿不挂）。
-        // 监测「核意外退出」并触发崩溃自愈；主动 stop/restart 由世代区分不误触（见 `spawn_crash_monitor`）。
-        self.spawn_crash_monitor(my_gen);
+        // 监测「核意外退出」并触发崩溃自愈；直起腿由 Child 绑定的 run 身份区分物理核，
+        // helper 腿仍走既有请求世代与进程身份观察（见 `spawn_crash_monitor`）。
+        self.spawn_crash_monitor(my_gen, direct_run_identity);
         // 核就绪 → 挂核日志 relay（`SubscribeLog`，同世代范式）。**无条件挂**：这是 TUN/helper 腿上
         // 日志页唯一的核日志来源，也是「改级别立刻生效、不必重启核」的承载（见方法文档）。
         // `log_pipe_handoff` 区分直起（有 stderr 管道，需交接 + 丢首帧历史）与 helper 起（无管道，收历史）。
@@ -1685,6 +1934,7 @@ impl ProxyRuntime {
         self.spawn_auto_switch_heartbeat(
             my_gen,
             deps.probe_proxy_port,
+            deps.loopback_auth.clone(),
             crate::runtime::auto_switch::auto_switch_blocked_for_generation(&user_config),
         );
         // A3：核就绪 → 挂 Tailscale STATUS relay（同世代范式）。tag→id 从**核实际启动的这份配置**构建
@@ -1751,7 +2001,13 @@ impl ProxyRuntime {
         // 与本次期望的核对账，不一致即告警。与上面的出口自证是两条正交轴，且**判据形态刻意不同**：
         // 出口自证纯静态（意图 vs 意图），本条只吃事实（内核记账 + 真跑一次 version）——
         // 因为「app 请求 bin=A / helper 实跑 bin=B」这类分叉，静态对账天然看不见（见方法文档血证）。
+        // Android 上没有核二进制可对账（`binary` 是 `IN_PROCESS_CORE_PLACEHOLDER` 占位串，
+        // 不指向任何文件）⇒ 整条自证不挂。挂了只会得到一条恒 `Unobservable` 的噪音，而
+        // 「换核没生效」在 Android 上是换 aar 的事，不由这条链回答。
+        #[cfg(not(target_os = "android"))]
         self.spawn_running_core_binary_attestation(pid, binary.clone(), my_gen);
+        #[cfg(target_os = "android")]
+        let _ = &binary;
         // TUN 起来了 → 后台查一次「别人设的系统代理」并提示（只读不动手，见下方方法文档）。
         // 这只是 advisory、不是起核成立条件；Windows 真机首次 `reg query` 曾因系统冷态/安全软件扫描
         // 阻塞约 12s，把它 await 在主链会让网卡与路由早已就绪却仍显示「连接中」。后台腿带世代 +
@@ -1809,7 +2065,17 @@ impl ProxyRuntime {
         // else 腿（非 TUN / 用户关了）只还原可能残留的受控 DNS（对齐 上游 同处 else 分支）：覆盖
         // 「TUN→其它模式」与「开→关」两种切换。通用网络 watcher 不归 DNS 开关管，见分支后的统一启动。
         let t_dns = std::time::Instant::now();
-        if user_config.proxy_mode_type.is_tun() && dns_takeover != Some(false) {
+        //
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。Android 上零行为差：
+        // 两条腿最终都落在 `SystemDnsOpsImpl` 的 Android 臂上，而那里 `takeover_supported()`
+        // 恒 false ⇒ 控制器在写 marker 之前就早退 ⇒ set/restore 都是诚实的 no-op（该平台的
+        // 系统解析器不在链路上，DNS 由核在 tun fd 内自理）。
+        if user_config
+            .proxy_mode_type
+            .effective_on(self.helper.platform())
+            .is_tun()
+            && dns_takeover != Some(false)
+        {
             self.set_system_dns_best_effort().await;
         } else {
             self.restore_system_dns_best_effort().await;
@@ -1916,6 +2182,8 @@ impl ProxyRuntime {
     ///
     /// 返回 `Ok(Some(pid))` = 已起（daemon 报告受管核 pid）；`Ok(None)` = 起核前被接管 → 让位；
     /// `Err` = 通信/起核失败。
+    /// This is a legacy-only result: helper Started/Already both collapse to a
+    /// PID without plan/run identity, so neither is a managed CoreReceipt.
     ///
     /// DESIGN-REVIEW(c6-5-src-tauri-helper-wiring)：(R27.3) 不实现 上游 #159「helper 起核失败→回退
     /// UAC/osascript 直起重试」增强腿——失败直接报错（前端 SettingsHelper 引导先装 helper）。
@@ -1941,8 +2209,10 @@ impl ProxyRuntime {
         // 路径，故必须先把现役核的**内容**推进去。幂等——hash 相同即零动作、零 IPC。
         // 放在置 `core_via_helper` 标记与 IPC 之前：此刻还没有受管核，失败也不产生孤儿。
         self.reconcile_protected_core(binary).await;
-        // 先于 IPC 置标记：racing stop 的 kill_core 据此走 helper stop（child 恒 None）。
-        self.core_via_helper.store(true, Ordering::SeqCst);
+        // The lease can reject before any helper operation is queued.
+        let helper_call_lease = self.lease_legacy_start().map_err(|error| error.message)?;
+        // Fence and helper flag publish under the same Child mutex.
+        let attempt = self.register_helper_start_backend()?;
         let log_path = self.config.join(SINGBOX_STARTUP_LOG);
         // fwd = allowLan（helper 侧开 IP 转发；上游 `forward = !!currentConfig.allowLan`）。
         let fwd = user_config.allow_lan.unwrap_or(false);
@@ -1950,42 +2220,46 @@ impl ProxyRuntime {
         let ppid = Some(std::process::id());
         let helper = Arc::clone(&self.helper);
         let config_path = config_path.to_path_buf();
+        let completion = HelperStartCompletion {
+            child: Arc::clone(&self.child),
+            pid: Arc::clone(&self.pid),
+            token: attempt.clone(),
+            published: false,
+        };
+        // spawn_blocking continues after its async caller is cancelled. Give
+        // the blocking IPC its own lease so opt-in cannot publish a marker
+        // while an abandoned helper call is still able to start the old core.
         // HelperClient::send 是同步阻塞 IPC → 挪出 async worker 线程。
         // **不传 bin**：helper 单方面决定跑哪个二进制（见 `HelperRuntime::start_core` 文档），
         // 传了也只会被丢掉——正是本缺陷的成因。
         let started = tokio::task::spawn_blocking(move || {
-            helper.start_core(&config_path, &log_path, fwd, ppid)
+            let _helper_call_lease = helper_call_lease;
+            let mut completion = completion;
+            let result = helper.start_core(&config_path, &log_path, fwd, ppid);
+            completion.publish(&result)?;
+            result
         })
         .await
         .map_err(|e| format!("helper 起核任务 join 失败：{e}"))?;
         let pid = match started {
             Ok(pid) => pid,
-            Err(e) => {
-                self.core_via_helper.store(false, Ordering::SeqCst);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
-        // 提交 pid（先于就绪等待——接管方/崩溃监测/就绪门据此探活；上游 singboxPid 于 startCore 返回即置）。
-        let pid_commit_started = std::time::Instant::now();
-        if let Ok(mut g) = self.pid.lock() {
-            *g = Some(pid);
-        }
-        let pid_commit_us = pid_commit_started.elapsed().as_micros();
+        // The blocking worker already published pid under Child→pid, even if
+        // this async waiter was cancelled before observing its response.
         // 上游：helper 报告已启动但进程不存在 → 判失败。
         let pid_probe_started = std::time::Instant::now();
         let alive = pid_alive(pid);
         let pid_probe_us = pid_probe_started.elapsed().as_micros();
-        log::info!("起核耗时：helper回包后pid提交={pid_commit_us}us，存活探测={pid_probe_us}us");
+        log::info!("起核耗时：helper回包后存活探测={pid_probe_us}us");
         if !alive {
-            self.core_via_helper.store(false, Ordering::SeqCst);
-            if let Ok(mut g) = self.pid.lock() {
-                *g = None;
-            }
-            return Err(Self::reject_helper_start(
-                Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
-                pid,
-            )
-            .await);
+            return Err(self
+                .reject_helper_start(
+                    Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
+                    &attempt,
+                    pid,
+                )
+                .await);
         }
         log::info!("helper 已起 sing-box：pid={pid}（TUN 提权路径）");
         Ok(Some(pid))
@@ -2044,8 +2318,18 @@ impl ProxyRuntime {
         let cache = Arc::clone(&self.protected_core_cache);
         let started = std::time::Instant::now();
 
+        // install_core can replace the executable selected by a later helper
+        // start. Register before queuing the blocking task, including a task
+        // whose async caller is cancelled before the IPC returns.
+        if let Err(error) = self.register_helper_backend() {
+            log::warn!("受保护核对账被 Child custody 拒绝：{error}");
+            return;
+        }
+
         // 全程同步 FS + 阻塞 IPC（sha256 两个 80MB 量级文件 + 可能的 30s install-core）→ spawn_blocking。
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
         let outcome = tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
             // 能力缓存：这个 helper 构建已经回过 `ERR unknown` 就不必再走整条重路。放在**最前**
             // ——放在 stage 之后等于白省，两个 80MB 的 sha256 才是这条腿的主要开销。
             // 探测本身是一次微秒级 ping；探不到（Unreachable）判不命中，宁可白跑一轮。
@@ -2321,13 +2605,16 @@ impl ProxyRuntime {
                 let alive_probe_elapsed_us = Arc::clone(&alive_probe_elapsed_us);
                 move || {
                     let started = std::time::Instant::now();
-                    let alive = if via_helper {
+                    // Android：核在**本进程内**，既无 child 可 `try_wait` 也无 pid 可 `kill(0)`。
+                    // 桥的起核回执就是这条腿的真值（语义与射程见 `android_bridge::core_started`）。
+                    // 不能问桥要 `BoxService.state`：本闭包是**同步**的（`Fn()->bool`），跨桥往返是
+                    // 异步的，塞进来只能 `block_on`，而它本就跑在 async 上下文里 ⇒ 必 panic。
+                    let alive = if cfg!(target_os = "android") {
+                        super::android_bridge::core_started()
+                    } else if via_helper {
                         helper_pid.is_some_and(pid_alive)
                     } else if let Ok(mut g) = child.lock() {
-                        match g.as_mut() {
-                            Some(c) => matches!(c.try_wait(), Ok(None)),
-                            None => false,
-                        }
+                        g.is_running_alive()
                     } else {
                         false
                     };
@@ -2416,16 +2703,53 @@ impl ProxyRuntime {
     /// 让 daemon 收口它自己的 child，把「不会漏下孤儿」从**对探活正确性的推理**降格成**结构保证**：
     /// 探活对不对，这条腿都不留残留。与 T1 的探活修复是两道独立防线，将来任何探活缺陷都不会
     /// 再复制这次事故。stop 失败不改判（核确实可能真死了）——照实记日志，错误消息原样返回。
-    pub(super) async fn reject_helper_start(ops: Arc<dyn HelperStopOps>, pid: u32) -> String {
+    pub(super) async fn reject_helper_start(
+        &self,
+        ops: Arc<dyn HelperStopOps>,
+        attempt: &HelperStartToken,
+        pid: u32,
+    ) -> String {
+        if let Err(error) = self.register_helper_backend() {
+            return format!(
+                "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: Child custody blocked Stop（{error}）"
+            );
+        }
+        let reservation = self
+            .child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.begin_exact_helper_stop(attempt, pid));
+        let Some(nonce) = reservation else {
+            return format!(
+                "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: attempt changed or Stop in flight"
+            );
+        };
+        let permit = HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), nonce);
         // stop 是同步阻塞 IPC → 挪出 async worker 线程（同 start_core/stop_core/cleanup_cores）。
         // **带上 pid**：本腿要收口的是 daemon 刚报给我们的这一个（helper 报活但探活判死的那个），
         // 不是「daemon 此刻手里的随便哪个」——本方法整段可能与新会话并发。
-        match tokio::task::spawn_blocking(move || ops.stop_managed_core(Some(pid))).await {
-            Ok(Ok(())) => log::info!("起核收口：已请 daemon 停掉其受管 child（pid={pid}）"),
-            Ok(Err(e)) => log::warn!("起核收口：请 daemon 停核失败（pid={pid}）：{e}"),
-            Err(e) => log::error!("起核收口：停核任务 join 失败（pid={pid}）：{e}"),
-        }
-        format!("helper 报告已启动但进程不存在（pid={pid}）")
+        let cleanup =
+            match tokio::task::spawn_blocking(move || (ops.stop_managed_core(Some(pid)), permit))
+                .await
+            {
+                Ok((Ok(()), permit)) => {
+                    if self.clear_helper_core_bookkeeping(&permit, pid) {
+                        log::info!("起核收口：已请 daemon 停掉其受管 child（pid={pid}）");
+                        String::new()
+                    } else {
+                        "；cleanup-unconfirmed: Stop 已确认，但 attempt 已改变".to_owned()
+                    }
+                }
+                Ok((Err(e), _permit)) => {
+                    log::warn!("起核收口：请 daemon 停核失败（pid={pid}）：{e}");
+                    format!("；cleanup-unconfirmed: helper Stop 未确认（{e}）")
+                }
+                Err(e) => {
+                    log::error!("起核收口：停核任务 join 失败（pid={pid}）：{e}");
+                    format!("；cleanup-unconfirmed: helper Stop join 失败（{e}）")
+                }
+            };
+        format!("helper 报告已启动但进程不存在（pid={pid}）{cleanup}")
     }
 
     /// sing-box 临时配置文件路径（写 generate_sing_box_config 输出，供 spawner 读）。
@@ -2657,8 +2981,8 @@ impl ProxyRuntime {
 
     /// 运行中外化规则「值」热更：仅原子替换内容变化的文件（rename-over 触发 sing-box fswatch 热重载），
     /// **绝不删文件**（运行中删被挂载文件会致 sing-box reload 报错；删除只在起核 `write_custom_rule_files`
-    /// 清扫）。移植 上游 `syncCustomRuleFiles`（:1688）。返回写入是否成功，由调用方
-    /// 按 Full/SelectedOnly 范围选择重启快照，不能在这里偷偷回读完整磁盘 D。
+    /// 清扫）。移植 上游 `syncCustomRuleFiles`（:1688）。返回是否全部成功，由调用方按
+    /// Full/SelectedOnly 范围选择重启配置；此处不能自行从磁盘 D 排程。
     pub(super) async fn sync_custom_rule_files(self: &Arc<Self>, config: &UserConfig) -> bool {
         let dir = self.custom_rules_dir();
         let expected = build_custom_rule_files(config);
@@ -2723,6 +3047,9 @@ impl ProxyRuntime {
             update_in_port: (update_in_port > 0).then_some(update_in_port),
             subscription_update_in_port: (subscription_update_in_port > 0)
                 .then_some(subscription_update_in_port),
+            // α：回环探针/更新入站的一次性凭据。**每次调用现生成**（`generate_deps` 每个起核尝试调一次）
+            // ⇒ 每次起核、每条重试腿都是新凭据；桌面上恒 `None`（生成侧也不会发射）。
+            loopback_auth: loopback_auth_for(Platform::parse(platform_tag())),
             // §15：起核分配的 K 个测速探测池端口（空 = 分配失败/回滚 → 池不注入，测速回退活跃出口）。
             probe_pool_ports: pool_ports.to_vec(),
             lan_resolver_for_dns: match self.dns_controller.lock() {
@@ -2858,7 +3185,7 @@ impl ProxyRuntime {
         let user_config: UserConfig = serde_json::from_value(raw.clone())
             .map_err(|e| format!("配置解析失败（UserConfig）: {e}"))?;
         let platform = Platform::parse(platform_tag());
-        let tun = user_config.proxy_mode_type.is_tun();
+        let tun = user_config.proxy_mode_type.effective_on(platform).is_tun();
         let facts = ProbeFacts {
             platform,
             tun,
@@ -2944,12 +3271,20 @@ impl ProxyRuntime {
                 .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
 
             // 核解析不到（首启未落核 / 单测未注入）→ 闸门无从判定，照原样下发（failOpen）。
-            let Some(bin) = binary else {
+            //
+            // **Android 例外**：核是**进程内 `.so`**（libbox），压根没有二进制可解析 ⇒ `binary`
+            // 恒 `None`。照旧早退的话闸门在 Android 上**永不运行**（不是「运行了但归因不到」），
+            // 「坏节点被剥掉」这项能力就静默消失了。那条腿改问桥要 `Libbox.checkConfig`。
+            if binary.is_none() && !cfg!(target_os = "android") {
                 return Ok(GateOutcome::assemble(
                     gen_out, effective, json, peeled, checks_run, None,
                 ));
-            };
-            let cache_record = kernel_gate_cache_record(bin, &gen_out.config);
+            }
+            // 已接受身份缓存以「哪个核 + 哪份配置」为键。Android 上没有核文件可取身份（mtime/size）
+            // ⇒ 不进缓存、每次真跑一次 check。这比伪造一个身份诚实：伪造出来的键会在换核（换 aar）
+            // 之后仍然命中，等于把闸门静默关掉。
+            let cache_record =
+                binary.and_then(|bin| kernel_gate_cache_record(bin, &gen_out.config));
             if cache_record
                 .as_ref()
                 .is_some_and(|record| self.kernel_gate_cache_hit(record))
@@ -2960,7 +3295,12 @@ impl ProxyRuntime {
                 ));
             }
             checks_run += 1;
-            let verdict = run_config_check(bin, config_path).await;
+            let verdict = match binary {
+                Some(bin) => run_config_check(bin, config_path).await,
+                // 只有 Android 走得到这里（上面的 failOpen 早退挡住了其余平台）。传的是**内存里
+                // 那一份字符串**，与刚写下去的盘上那份是同一个 `json` 变量 —— 两者不可能漂。
+                None => super::android_bridge::check_config(&json).await,
+            };
             let rejection = match decide_peel(&verdict, started.elapsed(), PEEL_TIME_BUDGET) {
                 PeelStep::Proceed => {
                     if let Some(record) = cache_record {
@@ -3091,13 +3431,21 @@ impl ProxyRuntime {
 /// `ProxyRuntime::generate_and_gate` 的产物：**已落盘**的那份配置 + 本次全部剔除报告。
 pub(super) struct GateOutcome {
     pub(super) config: SingBoxConfig,
-    /// 与本轮闸门写入 runtime config 的字节完全相同，用于只读诊断核对。
-    pub(super) config_json: String,
     pub(super) mesh_route_candidates:
         Vec<polaris_config_engine::builder::endpoint_routes::MeshRouteEmissionCandidate>,
     pub(super) mesh_route_total_candidate_count: usize,
     pub(super) mesh_route_diagnostics_limited: bool,
     pub(super) mesh_route_dns_owner_server_id: Option<String>,
+    /// 🔴 **已落盘的那一份配置的字节，逐字**（不是把 `config` 再序列化一次）。
+    ///
+    /// 存在的唯一理由是 Android：核是进程内 `.so`，起核 = 把这串交给 `libbox`。它与
+    /// `std::fs::write(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
+    /// `runtime_config_path()` 与内核实际吃的那份不可能漂。
+    ///
+    /// **不可改成「从盘上读回来再交给 libbox」**：那样诊断与内核就有了两条路径，而这条链上唯一
+    /// 值得信的性质恰恰是「两者同源」。桌面侧不消费本字段（核自己去读盘），保留它是为了让
+    /// 「同源」这件事写在类型里，而不是靠每个后来者都记得。
+    pub(super) config_json: String,
     pub(super) pruned_rule_set_tags: Vec<String>,
     /// 网络场景规则报告（`GenerateOutcome::pruned_env_rules` 原样带出）。
     pub(super) pruned_env_rules: Vec<PrunedEnvRule>,
@@ -3152,11 +3500,11 @@ impl GateOutcome {
     ) -> Self {
         Self {
             config: outcome.config,
-            config_json,
             mesh_route_candidates: outcome.mesh_route_candidates,
             mesh_route_total_candidate_count: outcome.mesh_route_total_candidate_count,
             mesh_route_diagnostics_limited: outcome.mesh_route_diagnostics_limited,
             mesh_route_dns_owner_server_id: outcome.mesh_route_dns_owner_server_id,
+            config_json,
             pruned_rule_set_tags: outcome.pruned_rule_set_tags,
             pruned_env_rules: outcome.pruned_env_rules,
             network_canary: outcome.network_canary,
@@ -3283,24 +3631,73 @@ pub(super) fn is_valid_srs_file(path: &str) -> bool {
     f.read_exact(&mut buf).is_ok() && &buf == b"SRS"
 }
 
+/// 随包核**自身是否已把 cronet 静态编入**（与「核旁有没有动态库」互补的另一条证据）。
+///
+/// 谓词名刻意问「核里有没有」而不是「平台叫什么」：平台串只是当前唯一可得的观测量 —— 打包矩阵
+/// 是我们自己定的，每个平台的核用哪套 build tag 是已知事实，故按平台查表即可回答。逐平台取证：
+///
+/// | 平台 | 核的形态 | cronet | 取证 |
+/// |---|---|---|---|
+/// | `darwin` | 独立可执行文件（arm64 / x64 两份） | **静态编入** | 二进制 strings：tags 含 `with_naive_outbound`，cronet 符号计数均 1588，体积 73/78MB 远大于走动态库的 linux 70 / win 71MB |
+/// | `android` | **进程内 `.so`**（`libbox.aar` 的 `jni/<abi>/libbox.so`） | **静态编入** | 用上游 `cmd/internal/build_libbox` 从 v1.14.0 tag 自建：四 ABI 齐全，`arm64-v8a/libbox.so` strings 命中 `cronet` 1641 / `naive` 245，sharedTags 默认含 `with_naive_outbound` |
+/// | `linux` / `win32` | 独立可执行文件 | 走动态库 | 随包 `libcronet.so` / `libcronet.dll`，版本由 `core-manifest.json` 的 `cronetLibrarySha256` 钉 |
+///
+/// **`cronetLibrarySha256` 不描述 Android 产物**：那条钉的是桌面那份动态库；Android 是第三种形态
+/// （静态在 `.so` 里），拿它当 Android 判据只会得到一个恒假的答案。
+///
+/// [不选 B：`platform == "darwin" || platform == "android"` 直接串在调用处]
+/// 两个平台的核形态完全不同（独立可执行 vs 进程内库），压成一串平台串比较，读者无从知道它们
+/// 为什么在一起；下一个平台进来时只会继续接 `||`，取证也没地方写。
+///
+/// [不选 C：从核的形态推断（「进程内库 ⇒ 静态编入」）]
+/// 形态与 cronet 编不编进去**没有因果关系** —— linux 的核也是独立可执行文件却走动态库，macOS
+/// 同样是独立可执行文件却静态编入。用形态推是伪相关，第一个反例就静默判错。
+///
+/// # `ios` 是**具名的 false**，不是兜底落进去的 false（2026-09-06）
+///
+/// 加 `Platform::Ios` 变体时逐处答题走到这里。答案是 `false`，与不写它时求值的结果相同 ——
+/// 所以必须写出来，否则没有人知道这个 false 是答过的还是漏掉的。
+///
+/// 依据：**本仓今天构不出任何 iOS 产物**，所以「那个核里有没有 cronet」今天没有事实可查；
+/// 而将来有了也不是白送的 —— iOS 的 cronet 是一份预编译静态库，链接面要另外接十几个 Apple
+/// framework，与 Android 那份「`build_libbox` 默认 sharedTags 就含 `with_naive_outbound`」
+/// 完全不同形。故在那件事真的做完并取到证之前，这里只能答 `false`。
+///
+/// ⚠️ **这个诚实的 false 带着一个已知的坏形态**：`cronet_available` 随之为 false ⇒
+/// `generate.rs` 的 `is_node_usable` 丢弃**全部** naive/H3 节点，而用户看到的是「节点无效」
+/// 而不是「本构建不含 naive」（下方 `cronet_available` 注释里记着的那两个真机 bug 是同一根因）。
+/// iOS 腿真正接上核之后，这一格必须连同归因提示一起重答；在那之前它由
+/// `runtime/proxy/tests/platform_contracts.rs` 的 `cronet_available_across_core_forms` 钉住
+/// （翻成 `true` 即红），确保它不会被当成「随便填的」而悄悄改掉。
+///
+/// **未验证**：上述 iOS 链接面结论来自上游构建脚本与 cronet 发布物的形态，本仓未实际构建过。
+pub(super) fn core_has_builtin_cronet(platform: &str) -> bool {
+    match platform {
+        "darwin" | "android" => true,
+        // 见上方 §`ios` 是具名的 false。
+        "ios" => false,
+        _ => false,
+    }
+}
+
 /// NaiveProxy 可用性判定（抽纯函数便于单测 + 变异验证）。`generate_deps` 的 `has_cronet` 经此。
 ///
-/// **为什么不能只看 libcronet 落盘**（真机 bug 根因）：macOS 的 sing-box 二进制已把 cronet **静态编入**
-/// （CGO + `with_naive_outbound`），naive 内核原生支持、**不需要动态库文件**。strings 二进制坐实
-/// **mac-arm64 与 mac-x64 两架构都编入**：tags 逐字同含 `with_naive_outbound`，cronet 符号计数均 1588，
-/// 二进制体积 73/78MB（远大于走动态库的 linux 70/win 71MB）。故 macOS 无 `libcronet.dylib` 时
-/// `lib_exists=false`，但 naive 仍可用 —— 若只看文件会误判 `has_cronet=false` → `generate.rs` 的
-/// `is_node_usable` 丢弃所有 naive 节点 + 报「macOS 核心未内置 cronet」。这是 上游 时代「naive 靠外部
-/// libcronet」前提，换核后前提变了，判定必须跟上。
+/// 判的是**「本次要跑的那个核里有没有 cronet」**，两条证据取并集：核旁有动态库（`lib_exists`），
+/// 或核自身静态编入（[`core_has_builtin_cronet`]）。
 ///
-/// - macOS（`darwin`，arm64 与 x64 皆然）：静态编入 → true（不看文件；arch 不参与判定）。
-/// - linux/win：看 libcronet 动态库落盘 `lib_exists`。
+/// **为什么不能只看 libcronet 落盘**（两个真机 bug 的同一个根因）：
+/// - macOS：核静态编入、盘上没有 `libcronet.dylib` ⇒ `lib_exists=false`。
+/// - Android：核是进程内 `.so`，**根本没有核二进制** ⇒ `core_binary_for_start()` 解析失败，
+///   `cronet_lib_exists_for_start()` 也恒 false。
 ///
-/// `arch` 目前不参与判定（macOS 两架构一致），保留入参把「(platform, arch)」两轴显式带进单测四象限，
-/// 并为将来若某架构的核回退动态库时收窄留 seam。
+/// 两者都会让 `has_cronet=false` → `generate.rs` 的 `is_node_usable` 丢弃**全部** naive 节点，
+/// 用户看到的是「节点无效」而不是「本构建不含 naive」—— 静默且归因错误。
+///
+/// `arch` 目前不参与判定（macOS 两架构一致、Android 四 ABI 同一份 aar），保留入参把
+/// 「(platform, arch)」两轴显式带进单测矩阵，并为将来若某架构的核回退动态库时收窄留 seam。
 pub(super) fn cronet_available(lib_exists: bool, platform: &str, arch: &str) -> bool {
     let _ = arch;
-    lib_exists || platform == "darwin"
+    lib_exists || core_has_builtin_cronet(platform)
 }
 
 /// 指定核心旁是否存在本平台的 cronet 动态库（路径纯函数在 `core_paths`，这里仅做 FS 探测）。

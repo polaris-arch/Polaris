@@ -25,11 +25,98 @@ fn get_custom_preset() {
         geosite_tags: vec!["foo".into()],
         geoip_tags: vec![],
         process_names: Some(vec!["FooApp".into()]),
+        package_names: vec!["com.example.foo".into()],
         category: Some("tools".into()),
     }];
     let p = get_app_preset("custom-foo", &custom).unwrap();
     assert!(p.geosite_tags.contains(&"foo".to_string()));
     assert!(p.process_names.contains(&"FooApp".to_string()));
+
+    // 🔴 **2026-09-13（批 16）：缺口棘轮在这里被换成了正面断言。**
+    //
+    // 它此前钉的是「自定义预设**恒不贡献包名**」（`assert!(p.package_names.is_empty())`）——
+    // 一条如实的缺口记账：Android 侧 `addDisallowedApplication` 认 applicationId，而
+    // `processNames`（用户按桌面语义填的 "Netflix" / "chrome.exe"）对它一条都命不中，
+    // 于是「自定义应用设成直连」在 Android 上**静默不生效**。
+    //
+    // 本批把 `CustomAppPreset.packageNames`（配置 schema）与挑包名的那张表单
+    // （`ui/src/mobile/forms/AppAddPanel.tsx`，数据源 `system_list_installed_apps`）一起接上，
+    // 那条棘轮当场红了。按它自己留的话，接上的人要回来确认消费点拿到的是不是真的 applicationId
+    // —— 下面这三条就是那次确认，且**量的是产物不是字段**：
+    // 「`p.package_names` 非空」只证明本函数的转发，证明不了那些串走完
+    // `android_exclude_packages` 之后真的落进了 `tun-in.exclude_package`
+    // （门控、action 过滤、去重三跳里任何一跳把它吃掉，字段仍然非空）。
+    assert_eq!(
+        android_exclude_packages_of(&custom),
+        vec!["com.example.foo".to_string()],
+        "自定义预设的包名没有走到 tun-in.exclude_package —— 「自定义应用设成直连」在 Android 上\
+         又变回静默不生效了"
+    );
+
+    // 反向对照 ①：**进程名不许出现在产物里**。转发时把 `process_names` 误当包名传下去，
+    // 上面那条仍会绿（产物非空、条数也可能对得上），而 `addDisallowedApplication` 一条都命不中。
+    assert!(
+        !android_exclude_packages_of(&custom).contains(&"FooApp".to_string()),
+        "进程名进了 exclude_package —— 那是桌面那条腿的值，Android 上一条都命不中"
+    );
+
+    // 反向对照 ②：**包名清空 ⇒ 产物必须消失**。没有这一条，上面那条会被「产物里的包名其实来自
+    // 内置预设 / 夹具别处」骗过（恒真断言在这条腿上出现过一次，见本文件头的历史）。
+    let without = vec![CustomAppPreset {
+        package_names: vec![],
+        ..custom[0].clone()
+    }];
+    assert!(
+        android_exclude_packages_of(&without).is_empty(),
+        "包名清空之后 exclude_package 还有东西 —— 上一条断言量到的不是这条预设贡献的"
+    );
+}
+
+/// 把一批自定义预设**各挂一条 `direct` 应用规则**，跑一次 **Android** 入站生成，
+/// 取回 `tun-in.exclude_package`（缺席 = 空表）。
+///
+/// # 为什么走完整生成，而不是直接读 `AppPreset.package_names`
+///
+/// 「字段非空」与「包名真的被发射」之间隔着三跳，每一跳都能静默吃掉它：
+/// `effective_app_rules_proxy` 的门控（`app_routing_enabled` + 模式）、`action == Direct` 的过滤、
+/// 以及 `dedupe`。本 helper 让断言落在**产物**上，那三跳任何一跳坏了都红。
+///
+/// 平台固定 `"android"`：`exclude_package` 只有 android 臂会发射（桌面那侧由
+/// `tests/golden_inbounds_android.rs#desktop_never_gets_package_keys` 反向守着）。
+fn android_exclude_packages_of(custom: &[CustomAppPreset]) -> Vec<String> {
+    use crate::builder::inbounds::{build_inbounds, InboundsDeps};
+    let config = crate::user_config::UserConfig {
+        app_routing_enabled: Some(true),
+        proxy_mode: crate::user_config::ProxyMode::Smart,
+        app_rules: custom
+            .iter()
+            .map(|c| AppRule {
+                app_id: c.id.clone(),
+                action: RuleAction::Direct,
+                enabled: true,
+                target_server_id: None,
+            })
+            .collect(),
+        custom_app_presets: custom.to_vec(),
+        ..Default::default()
+    };
+    let deps = InboundsDeps {
+        probe_direct_port: None,
+        probe_proxy_port: None,
+        update_in_port: None,
+        subscription_update_in_port: None,
+        loopback_auth: None,
+        probe_pool_ports: vec![],
+        platform: "android".into(),
+        own_lan_cidrs: vec![],
+        observed_tailnet_addresses: Default::default(),
+        log: |_, _| {},
+    };
+    build_inbounds(&config, None, &deps)
+        .into_iter()
+        .find(|i| i.tag == "tun-in")
+        .and_then(|i| i.exclude_package)
+        .unwrap_or_default()
 }
 
 #[test]
@@ -177,6 +264,7 @@ fn dto_lookup_builtin_wins_and_custom_keeps_real_category() {
         geosite_tags: vec!["evil".into()],
         geoip_tags: vec![],
         process_names: None,
+        package_names: vec![],
         category: Some("game".into()),
     }];
     let p = get_app_preset_dto("youtube", &shadow).unwrap();
@@ -192,6 +280,7 @@ fn dto_lookup_builtin_wins_and_custom_keeps_real_category() {
         geosite_tags: vec!["foo".into()],
         geoip_tags: vec![],
         process_names: Some(vec!["FooApp".into()]),
+        package_names: vec![],
         category: Some("game".into()),
     }];
     let p = get_app_preset_dto("custom-foo", &custom).unwrap();

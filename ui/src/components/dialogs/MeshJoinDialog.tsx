@@ -5,6 +5,7 @@ import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { taildropBadgeCount } from '@/domain/taildrop';
 import { tsAccountLabel } from '@/domain/tailscale-conn-state';
 import { findWarpNode } from '@/domain/warp';
+import { isAccountBasedProtocol } from '@/domain/endpoint-routes';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
 import { InfoIcon } from '@/components/InfoIcon';
@@ -69,7 +70,7 @@ export function MeshJoinDialog({ onTsLogout, onWarpReregister, onWarpDeregister 
       - ≥2 个   ⇒ 每个节点一行，各自带自己的 taildrop / 切换账号 / 登出，另给新增入口；标题用节点名、副标题用
                   `tsAccountLabel`（登录名 · tailnet）区分是哪个账号 —— 同为「已登录」时，
                   节点名可能都叫 Tailscale，账号段才是能区分的那一维。 */
-  const tsNodes = servers.filter((server) => server.protocol === 'tailscale');
+  const tsNodes = servers.filter((server) => isAccountBasedProtocol(server.protocol));
   const singleTsNode = tsNodes.length === 1 ? tsNodes[0] : undefined;
   const warpNode = findWarpNode(servers);
   // 入口只跟「配置里有 TS 节点」绑定；离线 / tailnet 未授权时也必须能打开，弹窗会给出可行动的原因。

@@ -14,8 +14,8 @@ use crate::runtime::update_popup::{close_update_popup, show_update_popup};
 use crate::runtime::{update_install, AppRuntime};
 use crate::startup::QuitState;
 use polaris_updater::github::{
-    check_app_update, resolve_current_app_release, strip_v, AppUpdateCheck, AssetArch,
-    AssetPlatform, APP_UPDATE_REPO,
+    check_app_update, check_app_update_release_only, resolve_current_app_release, strip_v,
+    AppUpdateCheck, AssetArch, AssetPlatform, APP_UPDATE_REPO,
 };
 use polaris_updater::popup::{
     PopupAction, UpdateErr, UpdateErrCode, UpdatePopupState, DONE_AUTO_CLOSE_MS,
@@ -431,6 +431,7 @@ pub fn version_get_info(app: AppHandle, state: State<'_, AppRuntime>) -> ApiResp
         "appVersion": app.package_info().version.to_string(),
         "coreVersion": u.read_core_version(),
         "coreBaseline": u.bundled_core_version(),
+        "debugReportAvailable": cfg!(all(target_os = "android", debug_assertions)),
     }))
 }
 
@@ -493,6 +494,26 @@ fn exit_after_detached_update(app: &AppHandle) {
     app.exit(0);
 }
 
+/// 「只比版本、不选资产」那条腿的**回包**（两个调用点共用）。
+///
+/// 两处各写一遍 `match` 的下场是：一处把 `NoUpdate` 折成 `hasUpdate:false`、另一处把解析失败
+/// 也折进去，而两处都各自「看起来对」。抽出来之后，「解析失败绝不伪装成已是最新」这条只写一遍。
+fn release_only_response(
+    body: &str,
+    current: &str,
+    include_pre: bool,
+    skipped: Option<&str>,
+) -> ApiResponse<Value> {
+    match check_app_update_release_only(body, current, include_pre, skipped) {
+        Ok(AppUpdateCheck::Available(info)) => ApiResponse::ok(json!({
+            "hasUpdate": true,
+            "updateInfo": serde_json::to_value(&info).unwrap_or(Value::Null),
+        })),
+        Ok(AppUpdateCheck::NoUpdate) => ApiResponse::ok(json!({ "hasUpdate": false })),
+        Err(e) => ApiResponse::err(format!("failed to parse GitHub response: {e}")),
+    }
+}
+
 /// App 更新通道不再是进程级常量：启动、托盘与前端入口均从 `appUpdateChannel` 解析。
 /// mini 弹窗把产出提醒时的 `includePrerelease` 随会话保存，复查不得重新读取可能已变化的配置；
 /// 版本内容仍由下方的逐字对账处理，两个约束共同保证“提示哪个版本，就下载哪个版本”。
@@ -510,6 +531,13 @@ fn exit_after_detached_update(app: &AppHandle) {
 ///
 /// **失败语义**（B5 反伪造）：网络/SSRF/超时/非 2xx → `success:false`（前端 error 态显因），**绝不**
 /// 把失败伪装成「已是最新」；无更新 / 无适配资产 / 已跳过 → `{ hasUpdate:false }`（诚实无更新）。
+///
+/// **Android**：与桌面同样先走 `check_app_update`（选 `*-android-arm64.apk` 资产）。选不到时
+/// **不当作「已是最新」**，而是再问一次 `check_app_update_release_only`（只比版本、不选资产）：
+/// 报「有新版本」但三个资产字段如实为空 ⇒ 前端只画「打开发布页」，不画「下载」。
+/// 这一档今天真的会发生 —— APK 资产是 2026-09-13 才开始发的（`.github/workflows/android.yml`
+/// 的 `release-apk` job，且它还等着仓外的签名 secret），在那之前的每一个 release 都没有 APK。
+/// 把这一档折成 `{hasUpdate:false}`，就是把「有新版本」恒答成「已是最新」，与上一段的承诺直接相反。
 #[tauri::command]
 pub async fn update_check(
     app: AppHandle,
@@ -520,20 +548,30 @@ pub async fn update_check(
     let include_pre = include_prerelease.unwrap_or(false);
     let include_current = include_current.unwrap_or(false);
 
-    // 平台/架构：宿主真值注入纯逻辑（非三大目标平台 → 无适配包，如实报无更新）。
-    let Some(platform) = AssetPlatform::from_os(std::env::consts::OS) else {
-        return Ok(ApiResponse::ok(json!({ "hasUpdate": false })));
-    };
+    // 平台/架构：宿主真值注入纯逻辑。
+    //
+    // 🔴 **「选不到资产」绝不等于「已是最新」**（2026-09-06 立，2026-09-13 随 Android 出 APK 复核）：
+    // 最早这里对 `from_os` 返 `None` 的平台直接 `return Ok(hasUpdate:false)`，于是 Android 上
+    // 「检查更新」**结构性恒答「已是最新」**，连一次请求都不发。现在 Android 是 `AssetPlatform`
+    // 的一个正经变体（选 `*-android-arm64.apk`），但那条教训原样适用于**没有 APK 的那些 release**：
+    // 资产腿说 `NoUpdate` 之后必须再问一次「到底有没有比当前新的 release」，见下面的 Android 分支。
+    //
+    // `None` 今天只剩「本仓根本不为它发包的平台」（iOS、各 BSD……）：那些平台上整条自更新腿
+    // 没有对象，如实早退。
+    let platform = AssetPlatform::from_os(std::env::consts::OS);
     let arch = AssetArch::from_arch(std::env::consts::ARCH);
     // 运行形态（loose vs installed）：
     //  - Linux：`APPIMAGE` 由 AppImage 运行时注入（Electron/Tauri 通用，**真值**）。
     //  - Windows：exe 同级的便携标记文件（[`is_portable_layout`]）—— **不是** electron-builder
     //    的 `PORTABLE_EXECUTABLE_DIR`，那个在本仓恒不存在（成因见 [`is_portable_layout`] 文档）。
     //  - macOS：`.app` 恒 loose，但 mac 选包不看形态（只看架构），故传什么都不影响结果。
+    //  - Android：应用只有一种形态（由系统包管理器装的），选包器不看这个轴。
     let loose_form = match platform {
-        AssetPlatform::Windows => std::env::current_exe().is_ok_and(|exe| is_portable_layout(&exe)),
-        AssetPlatform::Linux => std::env::var_os("APPIMAGE").is_some(),
-        AssetPlatform::Macos => false,
+        Some(AssetPlatform::Windows) => {
+            std::env::current_exe().is_ok_and(|exe| is_portable_layout(&exe))
+        }
+        Some(AssetPlatform::Linux) => std::env::var_os("APPIMAGE").is_some(),
+        Some(AssetPlatform::Macos | AssetPlatform::Android) | None => false,
     };
 
     // await 前取出 owned 值（当前版本 / 跳过版本），fetch 不持 State 借用（同 icon.rs 纪律）。
@@ -547,6 +585,18 @@ pub async fn update_check(
         // 不再用中文（曾渗进弹窗括注：ru/fa 用户看到本地化正文 + 整句中文括注）。
         Err(e) => return Ok(ApiResponse::err(format!("update check failed: {e}"))),
     };
+
+    // 本仓不为它发包的平台（iOS、各 BSD……）：没有可选的资产，也没有可下载的东西。
+    // 这一档仍然如实回答「有没有比当前新的 release」—— 绝不因为「拿不到包」就报「已是最新」。
+    let Some(platform) = platform else {
+        return Ok(release_only_response(
+            &body,
+            &current,
+            include_pre,
+            skipped.as_deref(),
+        ));
+    };
+
     let checked = check_app_update(
         &body,
         &current,
@@ -563,6 +613,30 @@ pub async fn update_check(
                 "hasUpdate": true,
                 "updateInfo": info_v,
             })))
+        }
+        // ── Android：资产腿说「没有」时，再问一次「到底有没有新版本」───────────────────
+        //
+        // 两条腿共用前四道闸（`newer_release_then`），故它们只可能在**资产选择**这一步上分歧：
+        // 「有比当前新的 release，但那个 release 没发 `*-android-arm64.apk`」。
+        // 这一档如实报 `hasUpdate:true` + 三个空资产字段 ⇒ 前端按 `downloadUrl` 非空才画
+        // 「下载」，于是用户看到的是「有新版本 · 打开发布页」，而不是一句假的「已是最新」。
+        //
+        // 🔴 只在 Android 上这么做，**不推广到桌面**：桌面每个 release 的三平台包都由
+        // `package.yml` 的 `setup.outputs.full`（选中腿数 == 总腿数）保证「绝不发半套」，
+        // 那里选不到包是**异常**，该由打包门去红，不该在这里悄悄兜底成「有更新但下不了」。
+        // Android 这一档是历史事实（旧 release 本来就没有 APK），不是异常。
+        //
+        // 🔴 **排在 `include_current` 之后**：`includeCurrent` 是「重装当前版本」那条腿，
+        // 它要的是**当前版本**那份资产，不是「有没有更新」的答案。两条臂的守卫在 Android 上
+        // 会同时成立 —— 顺序写反，那条腿在 Android 上就永远拿不到目标（match 取第一条命中的臂），
+        // 而症状是一颗按下去报「这一档没有对象」的按钮。
+        Ok(AppUpdateCheck::NoUpdate) if !include_current && platform == AssetPlatform::Android => {
+            Ok(release_only_response(
+                &body,
+                &current,
+                include_pre,
+                skipped.as_deref(),
+            ))
         }
         Ok(AppUpdateCheck::NoUpdate) if include_current => match resolve_current_app_release(
             &body,
@@ -1523,8 +1597,64 @@ pub async fn update_install(
         }
     }
 
+    // ── Android：交系统安装器，**在停代理与写脚本之前整条早退** ────────────────────
+    //
+    // 三件事一件都不能做（成因见 [`update_install::InstallPlatform::Android`] 的文档）：
+    //  · 不写脚本 —— Android 上没有 shell 腿能替换自己的 APK；
+    //  · 不停代理 —— 停代理是为了让被替换的文件不被占用，而这里根本不替换文件。提前停了，
+    //    用户在系统确认框上按「取消」之后就只剩一条断掉的隧道；
+    //  · 不退出应用 —— 交出去 ≠ 装成了。退出等于把「用户还没决定」当成「已经装完」。
+    //
+    // 回包的 `reason` 原样来自 Kotlin 侧的 `REASON_*` 码（没授予「安装未知应用」时，那条腿
+    // **已经把用户送到那一页了**）。这里不翻译、不折叠：把「按一下开关就能继续」与「本机装不了」
+    // 压成同一句「安装失败」，正是这条腿要消灭的形态。
+    //
+    // 🔴 **判据键刻意不复用 `handedToSystem`**（2026-09-06 定）。那个键在本仓已有唯一相反的
+    // 语义：它只由上面那条**失败**路径产出（形态错配 ⇒ 放弃安装、回退 `shell.open`），
+    // 而前端唯一的消费点 `ui/src/components/screens/settings/use-app-update.ts` 是
+    // `if (result.handedToSystem || result.reason === 'form-mismatch')` ⇒ 命中即报
+    // 「更新失败 / 形态错配」。把 Android **成功**回包也标成 `handedToSystem:true`，用户会在
+    // 系统安装器弹出来的同时看到一句「安装失败」。故成功走 `awaitingSystemInstaller` 这个
+    // 只属于本条腿的键 —— 它说的是一件桌面没有的事：**包交出去了，而本进程还活着在等**。
+    //
+    // ⚠️ 前端今天还没有消费这个键（那半留给接 UI 的那一批）。这不是被忘掉的一格：
+    // `AssetPlatform::from_os("android")` 恒 `None` ⇒ Android 上整条更新腿今天不可达，
+    // 而「要补 UI 分支 + REASON_* 文案」已经登记进
+    // `tests::android_has_no_update_asset_selector_yet_and_that_is_registered` 的解锁清单。
+    if plan.platform == update_install::InstallPlatform::Android {
+        return Ok(
+            match crate::runtime::proxy::android_bridge::hand_apk_to_system_installer(&file_path)
+                .await
+            {
+                Ok(handoff) if handoff.handed_off => {
+                    log::info!("APK 已交系统安装器，等待用户在系统 UI 上确认：{file_path}");
+                    ApiResponse::ok(json!({ "ok": true, "awaitingSystemInstaller": true }))
+                }
+                Ok(handoff) => {
+                    let reason = handoff.reason.unwrap_or_else(|| "unknown".to_string());
+                    log::warn!("APK 没能交给系统安装器（reason={reason}）");
+                    ApiResponse::ok(json!({
+                        "ok": false,
+                        "awaitingSystemInstaller": false,
+                        "reason": reason,
+                    }))
+                }
+                // 桥本身的失败（没接线 / 超时 / Kotlin 抛异常）才是 `Err` —— 与上面那条
+                // 「交不出去但知道为什么」分开，两者的用户可执行下一步完全不同。
+                Err(e) => ApiResponse::err(format!("交系统安装器失败: {e}")),
+            },
+        );
+    }
+
     let texts = update_install::InstallTexts::default();
-    let spec = update_install::build_install_script(&plan, &texts);
+    // `None` 只可能来自 Android，而它在上面已经整条早退。真走到这里说明分流被改坏了 ——
+    // 如实报错，绝不 spawn 一个空脚本再汇报「安装脚本已起」（那是一次静默的假成功）。
+    let Some(spec) = update_install::build_install_script(&plan, &texts) else {
+        return Ok(ApiResponse::err(format!(
+            "本平台没有脚本安装腿（{:?}）—— 它本该在上面被分流到别的落地方式",
+            plan.platform
+        )));
+    };
 
     // ── 停代理（必须在写脚本/退出**之前**：Windows 上核进程占着文件会让替换失败）。
     let proxy = state.proxy.clone();

@@ -160,6 +160,11 @@ fn platform_tag(platform: Platform) -> &'static str {
         Platform::Win => "win32",
         Platform::Linux => "linux",
         Platform::Other => "other",
+        // Android / iOS：前端沿用的是 Node 的 `process.platform` 约定名，而那套约定里没有这两项
+        // （Node 不在这两个平台上跑）。用小写平台名与 Rust 侧 `Platform` 的序列化保持一致 ——
+        // 这个标签只进快照的 `platform` 字段，供 UI 说「本平台没有探测实现」时指名道姓。
+        Platform::Android => "android",
+        Platform::Ios => "ios",
     }
 }
 
@@ -344,7 +349,12 @@ impl ProxyRuntime {
         criteria: ConflictCriteria,
         own_interfaces: Vec<String>,
     ) {
-        if !mode.is_tun() {
+        // 🔴 读**生效值**而不是磁盘上存的那个：`proxy_mode_type` 的存盘缺省是 `systemProxy`，
+        // 而 Android 只有 `VpnService` 的 tun fd 一种接管形态 ⇒ 全新安装 / 备份恢复的客户端
+        // 在这里会判成「不是 TUN、不用探」，于是隧道冲突那一整块在 Android 上**永远**停在
+        // 「本次没探」——跑得起来、看着正常、就是不对。平台从 `self.helper.platform()` 取
+        // （同 `connection_flush.rs:106` 那一处，就近同源）。
+        if !mode.effective_on(self.helper.platform()).is_tun() {
             self.store_tunnel_conflict_snapshot(TunnelConflictSnapshot::NotProbed);
             return;
         }

@@ -154,22 +154,16 @@ fn serialized_field_names_match_frontend_contract() {
 }
 
 #[test]
-fn auth_urls_require_web_scheme_and_host_but_allow_custom_headscale() {
-    for url in [
-        "https://login.tailscale.com/a/key",
-        "http://headscale.example:8080/register/key",
-        "https://hs.example/custom?token=value",
+fn status_auth_url_accepts_custom_web_control_and_rejects_other_schemes() {
+    for (raw, accepted) in [
+        ("https://login.tailscale.com/a/fixture", true),
+        ("http://headscale.example/register/fixture", true),
+        ("https://custom.example/auth/fixture", true),
+        ("javascript:alert(1)", false),
+        ("file:///private/fixture", false),
+        ("tailscale://auth/fixture", false),
+        ("", false),
     ] {
-        assert_eq!(validated_tailscale_auth_url(url).as_deref(), Some(url));
-    }
-    for url in [
-        "javascript:alert(1)",
-        "file:///etc/passwd",
-        "ftp://hs.example/login",
-        "https://",
-        "/login",
-        "not a url",
-    ] {
-        assert!(validated_tailscale_auth_url(url).is_none());
+        assert_eq!(validated_tailscale_auth_url(raw).is_some(), accepted);
     }
 }

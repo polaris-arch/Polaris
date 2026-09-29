@@ -28,6 +28,9 @@ use polaris_config_engine::user_config::server_config::Protocol;
 // ── 假子进程 ──
 struct FakeChildState {
     terminated: AtomicBool,
+    close_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    close_failures: AtomicUsize,
+    close_started: AtomicUsize,
     /// `terminate()` 被调用那一刻、注册表里的在飞 pid 快照（未接探针 ⇒ 恒 `None`）。
     ///
     /// 存在的理由只有一个：**顺序**。测试事后回看只能看到「核被收了」与「pid 出表了」两件事都
@@ -54,6 +57,18 @@ impl LoginCoreChild for FakeLoginCoreChild {
         // 直到「退出」信号（自然退出或被终止）才返回；否则永挂（模拟核仍在等认证）。
         let mut rx = self.exited_rx.clone();
         let _ = rx.wait_for(|v| *v).await;
+    }
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        self.state.close_started.fetch_add(1, Ordering::SeqCst);
+        let gate = self.state.close_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        if self.state.close_failures.swap(0, Ordering::SeqCst) > 0 {
+            return Err("fixture close failed".into());
+        }
+        self.terminate().await;
+        Ok(())
     }
     async fn terminate(&mut self) {
         // 快照必须抓在 `terminated` 置位**之前**：测试是靠 `terminated` 醒过来的，先置位就可能
@@ -90,8 +105,9 @@ impl FakeSpawner {
     }
 }
 
+#[async_trait]
 impl LoginCoreSpawner for FakeSpawner {
-    fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+    async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
         self.count.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             return Err(SpawnError::Spawn {
@@ -103,6 +119,9 @@ impl LoginCoreSpawner for FakeSpawner {
         let (exited_tx, exited_rx) = watch::channel(false);
         let state = Arc::new(FakeChildState {
             terminated: AtomicBool::new(false),
+            close_gate: Mutex::new(None),
+            close_failures: AtomicUsize::new(0),
+            close_started: AtomicUsize::new(0),
             pids_at_terminate: Mutex::new(None),
         });
         self.spawned.lock().unwrap().push(state.clone());
@@ -410,13 +429,14 @@ async fn status_auth_url_emits_event() {
     let emitter = started(&reg, &ud, &server).await;
     sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
     wait_until(|| !emitter.captured.lock().unwrap().is_empty()).await;
-    let cap = emitter.captured.lock().unwrap();
-    assert_eq!(cap.len(), 1);
-    assert_eq!(cap[0].0, "ts1");
-    assert_eq!(cap[0].1, "myts");
-    assert_eq!(cap[0].2, URL_1);
-    drop(cap);
-    reg.cancel_login("ts1");
+    {
+        let cap = emitter.captured.lock().unwrap();
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0].0, "ts1");
+        assert_eq!(cap[0].1, "myts");
+        assert_eq!(cap[0].2, URL_1);
+    }
+    reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }
 
@@ -443,7 +463,7 @@ async fn stdout_auth_line_is_no_longer_a_url_source() {
     sub.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "NeedsLogin", URL_1));
     wait_until(|| !captured(&emitter).is_empty()).await;
     assert_eq!(captured(&emitter), vec![URL_1.to_string()]);
-    reg.cancel_login("ts1");
+    reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }
 
@@ -472,7 +492,7 @@ async fn repeated_auth_url_emits_once_changed_url_emits_again() {
         captured(&emitter),
         vec![URL_1.to_string(), URL_2.to_string()]
     );
-    reg.cancel_login("ts1");
+    reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }
 
@@ -690,7 +710,7 @@ async fn login_api_port_and_secret_are_resolved_and_handed_to_subscriber() {
         serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
     assert_eq!(cfg["services"][0]["listen_port"], u64::from(*port));
     assert_eq!(cfg["services"][0]["secret"], *secret);
-    reg.cancel_login("ts1");
+    reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }
 
@@ -717,7 +737,7 @@ async fn login_config_holds_secret_so_it_dies_with_the_core() {
     let second_cfg = sole_login_config(&ud);
     assert_ne!(first_cfg, second_cfg, "两代不得共用同一个 config 文件名");
     // 收掉新代 → 盘上不再留任何带 secret 的 config。
-    reg.cancel_login("ts1");
+    reg.cancel_login("ts1").await.unwrap();
     wait_until(|| !second_cfg.exists()).await;
     let _ = std::fs::remove_dir_all(&ud);
 }
@@ -836,7 +856,7 @@ async fn login_core_drains_stderr_so_a_flooding_core_never_wedges() {
          管道在无人读时把核堵死了（真核在这一格会卡死但不死，登录 URL 再也出不来）"
     );
 
-    reg.cancel_login("ts1");
+    reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }
 
@@ -911,16 +931,36 @@ async fn cancel_kills_and_deregisters() {
         StartLoginOutcome::Started
     ));
     wait_until(|| reg.shared.contains("ts1")).await;
-    assert!(reg.cancel_login("ts1"), "取消在飞登录返 true");
     assert!(
-        reg.shared.contains("ts1"),
-        "cancel retains ownership until reap"
+        reg.cancel_login("ts1").await.unwrap(),
+        "取消在飞登录返 true"
     );
+    assert!(!reg.shared.contains("ts1"), "cancel 在关闭回执后注销");
     let st = spawner.spawned.lock().unwrap()[0].clone();
     wait_until(|| st.terminated.load(Ordering::SeqCst)).await;
     // 幂等：再取消不存在的登录 → false（非错误）。
-    assert!(!reg.cancel_login("ts1"));
+    assert!(!reg.cancel_login("ts1").await.unwrap());
     let _ = std::fs::remove_dir_all(&ud);
+}
+
+#[tokio::test]
+async fn cancel_accepts_confirmed_close_even_if_supervisor_channel_already_dropped() {
+    let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+    drop(cancel_rx);
+    let (closed_tx, closed_rx) = watch::channel(Some(Ok(())));
+    drop(closed_tx);
+    assert!(signal_and_wait_close(cancel_tx, closed_rx).await.unwrap());
+
+    let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+    drop(cancel_rx);
+    let (closed_tx, closed_rx) = watch::channel(Some(Err("close failed".into())));
+    drop(closed_tx);
+    assert!(signal_and_wait_close(cancel_tx, closed_rx).await.is_err());
+
+    let (cancel_tx, _cancel_rx) = mpsc::unbounded_channel();
+    let (closed_tx, closed_rx) = watch::channel(Some(Ok(())));
+    drop(closed_tx);
+    assert!(signal_and_wait_close(cancel_tx, closed_rx).await.unwrap());
 }
 
 #[tokio::test]
@@ -954,7 +994,7 @@ async fn relogin_kills_prior_child() {
     assert!(reg.shared.contains("ts1"));
     let second = spawner.spawned.lock().unwrap()[1].clone();
     assert!(!second.terminated.load(Ordering::SeqCst));
-    reg.cancel_login("ts1");
+    reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }
 
@@ -990,7 +1030,7 @@ async fn concurrent_relogin_serializes_spawn_registration_transaction() {
     let first_child = spawner.spawned.lock().unwrap()[0].clone();
     wait_until(|| first_child.terminated.load(Ordering::SeqCst)).await;
     assert!(reg.shared.contains("ts1"), "新代仍须在册");
-    reg.cancel_login("ts1");
+    reg.cancel_login("ts1").await.unwrap();
     let _ = std::fs::remove_dir_all(&ud);
 }
 
@@ -1028,7 +1068,7 @@ async fn active_login_cores_are_hard_capped() {
         "超限请求不得再 spawn 子进程"
     );
     for id in ids {
-        reg.cancel_login(&id);
+        reg.cancel_login(&id).await.unwrap();
     }
     let _ = std::fs::remove_dir_all(&ud);
 }
@@ -1093,4 +1133,100 @@ async fn child_self_exit_reaps_registry() {
         "自然退出不应触发主动 terminate"
     );
     let _ = std::fs::remove_dir_all(&ud);
+}
+
+#[tokio::test]
+async fn relogin_waits_for_old_close_before_second_spawn() {
+    let spawner = fake_spawner(vec![], false, false);
+    let sub = fake_subscriber(false);
+    let reg = Arc::new(reg_with(
+        spawner.clone(),
+        sub,
+        true,
+        Duration::from_secs(60),
+    ));
+    let ud = temp_ud();
+    let server = ts_server("ts1", "myts");
+    let _ = started(&reg, &ud, &server).await;
+    let old = spawner.spawned.lock().unwrap()[0].clone();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *old.close_gate.lock().unwrap() = Some(gate.clone());
+    let task = tokio::spawn({
+        let reg = reg.clone();
+        let ud = ud.clone();
+        let server = server.clone();
+        async move {
+            reg.start_login(
+                &server,
+                &ud,
+                false,
+                None,
+                0,
+                Arc::new(FakeEmitter::default()),
+            )
+            .await
+        }
+    });
+    wait_until(|| old.close_started.load(Ordering::SeqCst) > 0).await;
+    assert_eq!(spawner.count.load(Ordering::SeqCst), 1);
+    assert!(reg.shared.contains("ts1"));
+    gate.notify_one();
+    assert!(matches!(task.await.unwrap(), StartLoginOutcome::Started));
+    assert!(old.terminated.load(Ordering::SeqCst));
+    assert_eq!(spawner.count.load(Ordering::SeqCst), 2);
+    reg.cancel_login("ts1").await.unwrap();
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn failed_close_keeps_claim_and_config_until_successful_retry() {
+    let spawner = fake_spawner(vec![], false, false);
+    let sub = fake_subscriber(false);
+    let reg = reg_with(spawner.clone(), sub, true, Duration::from_secs(60));
+    let ud = temp_ud();
+    let _ = started(&reg, &ud, &ts_server("ts1", "myts")).await;
+    let old = spawner.spawned.lock().unwrap()[0].clone();
+    old.close_failures.store(1, Ordering::SeqCst);
+    assert!(reg.cancel_login("ts1").await.is_err());
+    assert!(reg.shared.contains("ts1"));
+    assert!(!old.terminated.load(Ordering::SeqCst));
+    assert_eq!(std::fs::read_dir(&ud).unwrap().count(), 1);
+    assert!(reg.cancel_login("ts1").await.unwrap());
+    assert!(!reg.shared.contains("ts1"));
+    assert_eq!(std::fs::read_dir(&ud).unwrap().count(), 0);
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn status_custom_control_http_url_is_emitted_but_other_schemes_are_rejected() {
+    let spawner = fake_spawner(vec![], false, false);
+    let sub = fake_subscriber(false);
+    let reg = reg_with(spawner, sub.clone(), true, Duration::from_secs(60));
+    let ud = temp_ud();
+    let emitter = started(&reg, &ud, &ts_server("ts1", "myts")).await;
+    sub.push(
+        0,
+        frame(
+            TAILSCALE_LOGIN_ENDPOINT_TAG,
+            "NeedsLogin",
+            "http://headscale.example/register/fixture",
+        ),
+    );
+    wait_until(|| emitter.captured.lock().unwrap().len() == 1).await;
+    assert_eq!(
+        emitter.captured.lock().unwrap()[0].2,
+        "http://headscale.example/register/fixture"
+    );
+    sub.push(
+        0,
+        frame(
+            TAILSCALE_LOGIN_ENDPOINT_TAG,
+            "NeedsLogin",
+            "javascript:alert(1)",
+        ),
+    );
+    wait_until(|| !reg.shared.contains("ts1")).await;
+    assert_eq!(emitter.captured.lock().unwrap().len(), 1);
+    reg.cancel_login("ts1").await.unwrap();
+    std::fs::remove_dir_all(ud).unwrap();
 }

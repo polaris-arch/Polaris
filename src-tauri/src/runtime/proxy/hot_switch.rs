@@ -27,7 +27,7 @@ use polaris_config_engine::builder::hotswitch::{
 use polaris_config_engine::builder::orchestration::{config_generation_norm, stable_stringify};
 use polaris_config_engine::builder::outbounds::{build_outbounds, OutboundsDeps};
 use polaris_config_engine::builder::{build_id_to_tag_map, GenerateConfigDeps};
-use polaris_config_engine::singbox::SingBoxConfig;
+use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::dns_constants::{
     is_block_selection, is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
@@ -35,6 +35,8 @@ use polaris_config_engine::user_config::dns_constants::{
 use polaris_config_engine::user_config::rule::RuleAction;
 use polaris_config_engine::user_config::ProxyModeType;
 use polaris_core_supervisor::LifecycleKind;
+use polaris_helper_proto::Platform;
+use polaris_stats_engine::RuleIdentity;
 #[cfg(test)]
 use polaris_switch_engine::ConnectionSnapshot;
 use polaris_switch_engine::{
@@ -121,6 +123,8 @@ pub(super) struct SwitchSnapshot {
     pub(super) id_to_tag: BTreeMap<String, String>,
     /// ruleKey → rule-sel 元数据（上游 `currentRuleTargetMap`，:3607）。
     pub(super) rule_target: BTreeMap<String, RuleTargetEntry>,
+    /// 起核时真实 route 产物可证明的 raw 条件→用户名称；热切/暂存不改写。
+    pub(super) named_rule_by_raw: BTreeMap<String, RuleIdentity>,
     /// id → **全维**指纹（[`modified_fingerprint`]，上游 `runningServersFingerprint`，:672）。
     ///
     /// 两个消费面，同一个问题的两种问法：
@@ -147,6 +151,17 @@ pub(super) struct SwitchSnapshot {
     /// 与 `running` 同生共死（起核就绪时随本快照置、停核清）→「有池端口 ⟺ 运行核有池」；`server_speed_test`
     /// 据此裁定走「主核 K 槽分波测速」还是回退「仅活跃出口」。`poolPorts[k] ↔ probe-selector-k`（1:1 槽绑定）。
     pub(super) probe_pool_ports: Vec<u16>,
+    /// 运行核的专用出口探针端口（`probe-proxy-in`，固定走 `proxy-selector`）。`None` = 分配失败未注入。
+    ///
+    /// Android 上没有 `mixed-in`，解锁检测 / 出口 IP / 测速回退 / warm RTT 四条「经本机代理出网」的腿
+    /// 改走它（见 [`ProxyRuntime::local_http_proxy`](super::ProxyRuntime::local_http_proxy)）。与本快照同生共死，
+    /// 故「有端口 ⟺ 运行核里真有这个入站」。
+    pub(super) probe_proxy_port: Option<u16>,
+    /// 运行核回环探针/更新入站的一次性凭据（本次起核 CSPRNG 生成；桌面恒 `None`）。
+    ///
+    /// **只存内存**：不进 [`ProxyStatus`](super::ProxyStatus)（那个结构体序列化给渲染端、也会被整份打进日志），
+    /// `Debug` 经 `InboundUser` 自身抹掉口令。停核随快照一起清掉。
+    pub(super) loopback_auth: Option<InboundUser>,
 }
 
 /// `switch_mode` 的结果（供 command 层 / 测试断言；上游 switchMode 返 void，此处显式化以便可测）。
@@ -571,8 +586,17 @@ impl ProxyRuntime {
         // ── rule-sel 映射（重算 + live 过滤）──
         // OutboundsDeps 逐字段镜像 config-engine `generate.rs:208-219`；漏一个字段就可能算出与运行核
         // 不同的 selector 集合（→ 被 live 过滤兜住，退化为「该规则不热切」而非 PUT 到错的 selector）。
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]），与被镜像的那份
+        // （`config-engine/builder/generate.rs` 的 `system_interface_available`）逐字同源：
+        // 两侧算出不同的 selector 集合时，热切 PUT 的目标就与运行核里真实存在的 tag 对不上。
+        // 平台经 `Platform::parse(&deps.platform)` 过桥 —— 用的必须是**同一个** `deps.platform`
+        // 串，换成 `self.helper.platform()` 就又是两个可能漂移的真值源。
+        // 今天零行为差（合取项 `mesh_system_supported_on_platform` 是 mac/linux 允许清单，
+        // Android 不在其中），接上是为了不留需要人工复核的例外。
         let system_interface_available = matches!(
-            user_config.proxy_mode_type,
+            user_config
+                .proxy_mode_type
+                .effective_on(Platform::parse(&deps.platform)),
             polaris_config_engine::user_config::ProxyModeType::Tun
         )
             && polaris_config_engine::builder::endpoint_routes::mesh_system_supported_on_platform(
@@ -623,13 +647,24 @@ impl ProxyRuntime {
             }
         };
 
+        let named_rule_by_raw = super::rule_names::build_named_rule_snapshot(
+            user_config,
+            singbox_config,
+            deps,
+            &id_to_tag,
+        );
         SwitchSnapshot {
             id_to_tag,
             rule_target,
+            named_rule_by_raw,
             fingerprints,
             dirty_fingerprints,
             // §15：与运行核 config 同源（deps.probe_pool_ports 正是本次 generate 注入的池端口）→ 快照即池真值。
             probe_pool_ports: deps.probe_pool_ports.clone(),
+            // 同源同刻：本次 generate 实际注入的探针端口与凭据（凭据是否被发射由生成侧按平台决定，
+            // 桌面上 `deps.loopback_auth` 本就是 `None`）。
+            probe_proxy_port: deps.probe_proxy_port,
+            loopback_auth: deps.loopback_auth.clone(),
         }
     }
 
@@ -1037,8 +1072,9 @@ impl ProxyRuntime {
         // ── 腿 3：三腿分发（决策全在 switch-engine，本处只执行）──
         let outcome = match decision {
             SwitchDecision::HotSwitch(plan) => {
-                // Block is a route-level reject, never a selector PUT. Keep this
-                // executor fail-closed if the builder classification regresses.
+                // Block is expressed by generated reject routes, never by selector PUT.
+                // The builder already classifies entry/exit as structural; keep the
+                // executor fail-closed if that classification ever regresses.
                 let old_is_block = self.current_config.read().ok().is_some_and(|current| {
                     is_block_selection(
                         current
@@ -1538,7 +1574,14 @@ impl ProxyRuntime {
         // TUN 的逐目的网卡事实只在起核前（TUN 尚未接管路由时）可信。当前会话未覆盖的 automatic
         // physical root 不能靠 selector PUT 临时补算：活 TUN 下查询会命中 Polaris 自己，得到错误接口。
         // 因此切全局/规则到未覆盖根必须先走 stop→start，由 start_inner 在撤 TUN 后重新规划。
-        if new_cfg.proxy_mode_type.is_tun() {
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。Android 上零行为差：
+        // `runtime_binding_roots_covered` 里的 `automatic_runtime_binding_root_ids` 走
+        // `runtime_binding_planning_supported(Android) == false` 恒返空集，空集是任何集合的子集。
+        if new_cfg
+            .proxy_mode_type
+            .effective_on(self.helper.platform())
+            .is_tun()
+        {
             let binding_plan = self
                 .runtime_binding_state
                 .lock()
@@ -1727,8 +1770,10 @@ impl ProxyRuntime {
             return false;
         };
         if is_block_selection(Some(server_id)) {
-            // No selector member exists for block. A ready startup snapshot plus
-            // current R prove that the generated reject routes are in this core.
+            // No selector member exists for block. Only the ready core's startup
+            // snapshot and current R together prove that reject routes were emitted.
+            // The caller's selected-projection claim checks generation and intent
+            // before publishing an applied receipt.
             let started_blocked = self.startup_snapshot.read().ok().is_some_and(|snapshot| {
                 snapshot.as_ref().is_some_and(|config| {
                     config.get("selectedServerId").and_then(Value::as_str) == Some(server_id)
@@ -1853,9 +1898,10 @@ impl ProxyRuntime {
     // 1:1 移植 上游 `reassertSelectorSelection` + `reassertRuleSelectors`（`ProxyManager.ts:1176-1237`）
     // 与其调用点的 `.finally()` 串接（:1144-1165）。
     //
-    // **根因**：sing-box 1.14 的 `experimental.cache_file` 默认 `store_selected` —— 它把 selector 的
-    // **运行期**选择持久化进 `cache.db` 的 `selected` bucket，起核时用它**覆盖**新生成 config 里的
-    // `default`。于是「盘上选 Hk01、生成的 `proxy-selector.default = "Hk01"`」与「核实际跑上一轮残留的
+    // **根因**：随包 b609（1.15.0-alpha.8）的 `experimental.cache_file` 保留隐式 selector 持久化：
+    // `StoreSelected` 把**运行期**选择写进 `cache.db` 的 `selected` bucket，`LoadSelected`
+    // 在起核时用它**覆盖**新生成 config 里的 `default`。于是「盘上选 Hk01、生成的
+    // `proxy-selector.default = "Hk01"`」与「核实际跑上一轮残留的
     // `Tailscale`」可以同时成立，且**全链路零告警**（`attest_selected_exit` 是纯静态自证，量的是生成
     // 产物不是运行态，看不见这层覆盖）。
     //
@@ -1902,7 +1948,10 @@ impl ProxyRuntime {
         let mode = user_config.proxy_mode_type;
         // TUN 成功腿在 public start guard 归还前同步接棒；该 guard 经 reassert 的 finally 守卫延续到
         // schedule_connection_flush 接棒。非 TUN 没有无差别 RST，不额外延长稳定门。
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]），与下游 flush 自身的守卫同源：
+        // 两边不同源就会出现「门开着但稳定期没延长」或反之，而 Android 上存盘缺省值恰好是 `systemProxy`。
         let network_settle = mode
+            .effective_on(self.helper.platform())
             .is_tun()
             .then(|| self.network_settle.begin("tun-selector-reassert"));
         // `tauri::async_runtime::spawn` 而非裸 `tokio::spawn`：同 `spawn_ts_exit_recovery` 的理由

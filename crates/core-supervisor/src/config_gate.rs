@@ -214,6 +214,40 @@ pub fn decide_peel(verdict: &ConfigCheckVerdict, elapsed: Duration, budget: Dura
 /// 两阶段的用词不同（decode 用复数 `outbounds[]`、initialize 用单数 `outbound[]`），故两种写法都认；
 /// 数组身份取自词干而非取自分支，这样万一哪个版本把用词统一了也不会漏。
 ///
+/// # Android（libbox `CheckConfig`）的第二套文本
+///
+/// Android 上没有核二进制（核是进程内 `.so`），闸门改问 `Libbox.checkConfig`。同一个上游
+/// `E.Cause`，两处调用点的 message 参数不同，故 decode 阶段的前缀是**另一个串**：
+///
+/// | | 调用点 | 产出前缀 |
+/// |---|---|---|
+/// | 桌面 | `cmd/sing-box/cmd_run.go:62` → `E.Cause(err, "decode config at ", path)` | `decode config at <路径>: ` |
+/// | libbox | `experimental/libbox/config.go:45` → `E.Cause(err, "decode config")` | `decode config: ` |
+///
+/// 可归因（本轮自己造坏配置、真跑 `Libbox.CheckConfig` 取回的原文）：
+///
+/// ```text
+/// decode config: outbounds[7]: unknown outbound type: nonexistent-proto
+/// decode config: outbounds[0].obfs: json: unknown field "obfs"
+/// decode config: outbounds[0].unknown_key: json: unknown field "unknown_key"
+/// decode config: endpoints[1]: unknown endpoint type: nope
+/// initialize outbound[3]: unknown method: bad-a
+/// initialize endpoint[0]: WireGuard is not included in this build, rebuild with -tags with_wireguard
+/// ```
+///
+/// 不可归因（同样返 `None`）：
+///
+/// ```text
+/// decode config: duplicate outbound/endpoint tag: d
+/// decode config: route.rules[0]: unknown rule action: nope
+/// initialize router: parse rule-set[0]: open /nonexistent/outbounds[1].srs: no such file or directory
+/// ```
+///
+/// **`initialize` 那半边一个字节都不用改**：那段错误由 `box.New(...)` 产生，两侧走同一份代码，
+/// 桌面只是外面多包了一层 `log.Fatal` 的 `FATAL[0000] ` 前缀，而本函数的 `line.find(INIT_MARKER)`
+/// 本来就用 `find` 不用 `strip_prefix`。libbox 侧没有 `FATAL[0000] ` 前缀、是单行 `error`
+/// （不是日志行），既有的「取最后一条非空行 + `find` 而非行首锚定」两条设计正好把它一并吃下。
+///
 /// # 为什么用 `strip_prefix` 精确锚定，而不是在整行里搜 `outbounds[`
 ///
 /// 满行子串搜索会把**消息正文更深处**碰巧出现的同名 token 当成路径。最要紧的现场是
@@ -239,16 +273,29 @@ pub fn decide_peel(verdict: &ConfigCheckVerdict, elapsed: Duration, budget: Dura
 ///
 /// 取**最后一条非空行**，理由同 `parse_probe_diagnostic`：Go `log.Fatal` 记一行即 `os.Exit`，真正终止
 /// 进程的诊断永远是最后一行；若未来版本在 FATAL 前加了前置噪声，取最后一行仍然对。
+/// 桌面核（`sing-box check`）的 decode 阶段前缀。marker 之后是「配置文件路径: 键路径: 消息」。
+///
+/// **不许改宽成 `"decode config"`**：那个前缀在上游还有另外三个调用点
+/// （`cmd_rule_set_merge.go:65`、`common/networkquality/networkquality.go:873`、`daemon/instance.go:184`），
+/// 放宽后桌面侧会多认三种今天认不到的来源，而那三种**没有取证** —— 与本模块「宁可归因不到也
+/// 绝不错误归因」的口径正相反。
+const DECODE_MARKER_DESKTOP: &str = "decode config at ";
+
+/// libbox（`Libbox.checkConfig`）的 decode 阶段前缀。marker 之后**紧接着**就是键路径，没有文件名。
+///
+/// 与 [`DECODE_MARKER_DESKTOP`] **互斥**：`decode config at …` 不含 `decode config: `，
+/// 反之亦然 ⇒ 两条腿不可能互相误吃，可以并列而不必合并成一个更宽的 marker。
+const DECODE_MARKER_LIBBOX: &str = "decode config: ";
+
 #[must_use]
 pub fn parse_kernel_rejection(raw: &str) -> Option<KernelRejection> {
-    const DECODE_MARKER: &str = "decode config at ";
     const INIT_MARKER: &str = "initialize ";
 
     let line = raw.lines().rev().find(|l| !l.trim().is_empty())?.trim();
 
     // marker 用 `find` 而非 `strip_prefix`：日志框架前缀 `FATAL[0000] ` 挡在前面，锚定行首会全数错过。
-    if let Some(i) = line.find(DECODE_MARKER) {
-        let after_marker = &line[i + DECODE_MARKER.len()..];
+    if let Some(i) = line.find(DECODE_MARKER_DESKTOP) {
+        let after_marker = &line[i + DECODE_MARKER_DESKTOP.len()..];
         // after_marker = "<配置文件路径>: <路径段>: <消息>"。用第一个 `": "` 跳过文件名 —— 分隔符恒是
         // 冒号+空格，而路径里的冒号（Windows 盘符 `C:\`）后面跟的是反斜杠不是空格（这条实测依据见
         // `commands/proxy.rs::parse_probe_diagnostic` 的「文件路径含冒号」小节，此处不重复取证）。
@@ -257,6 +304,14 @@ pub fn parse_kernel_rejection(raw: &str) -> Option<KernelRejection> {
             if let Some(r) = match_array_segment(rest) {
                 return Some(r);
             }
+        }
+    }
+    // libbox 腿：marker 之后**紧接着**就是键路径（没有文件名可跳），故锚定比桌面那条更紧 ——
+    // 中间不许有任何东西。两个 marker 互斥（`decode config at …` 不含 `decode config: `，反之亦然）
+    // ⇒ 不存在互相误吃，桌面那条判据一个字节都没动。
+    if let Some(i) = line.find(DECODE_MARKER_LIBBOX) {
+        if let Some(r) = match_array_segment(&line[i + DECODE_MARKER_LIBBOX.len()..]) {
+            return Some(r);
         }
     }
     if let Some(i) = line.find(INIT_MARKER) {
@@ -444,6 +499,42 @@ fn decide_verdict(raw: RawCheck) -> ConfigCheckVerdict {
         None => ConfigCheckVerdict::Unattributable(if raw.is_empty() {
             // check 非零退出但双流全空的病态腿：不能报空串，否则日志里只剩一句没有内容的「拒收」。
             "check 非零退出但无任何输出".to_string()
+        } else {
+            raw.to_string()
+        }),
+    }
+}
+
+/// Android 腿的三态映射：`Libbox.checkConfig` 的结果 → [`ConfigCheckVerdict`]。**纯函数**，无 I/O。
+///
+/// 入参形状 `Result<Option<String>, String>` 把两件必须分开的事分开：
+///
+/// | 入参 | 现场 | 判决 |
+/// |---|---|---|
+/// | `Err(why)` | **桥**本身失败（activity 不在 / 30s 无回应 / 插件没注册） | [`Unavailable`](ConfigCheckVerdict::Unavailable) |
+/// | `Ok(None)` | 内核收下（`checkConfig` 没抛异常） | [`Accepted`](ConfigCheckVerdict::Accepted) |
+/// | `Ok(Some(msg))` | 内核拒收，`msg` 是 `e.message`（Go `error.Error()` 原文） | 归因得到 ⇒ `Rejected`，否则 `Unattributable` |
+///
+/// **为什么不把「桥挂了」和「配置坏了」合成一个入参**：合并之后桥一挂就会被当成「内核拒收但
+/// 归因不到」，于是走 `Unattributable` ⇒ `Stop`，日志里写的是「内核拒收」——一句与事实相反、
+/// 且把排查方向指向配置的话。这正是 `run_probe_check` 那条已定口径（「核缺失/慢盘 ≠ 不兼容」）
+/// 的反面，不能在这里重演。桥失败走 `Unavailable` ⇒ fail-open 放行到起核，由内核自己报错。
+///
+/// **没有 rc、没有两条流**：`CheckConfig` 要么抛异常要么什么都不返回，所以这里不复用
+/// [`RawCheck`]（那是「子进程跑成什么样」的形状，Android 上没有子进程）。
+#[must_use]
+pub fn verdict_from_libbox_check(result: Result<Option<String>, String>) -> ConfigCheckVerdict {
+    let raw = match result {
+        Err(why) => return ConfigCheckVerdict::Unavailable(format!("Android 起核桥不可用：{why}")),
+        Ok(None) => return ConfigCheckVerdict::Accepted,
+        Ok(Some(raw)) => raw,
+    };
+    let raw = raw.trim();
+    match parse_kernel_rejection(raw) {
+        Some(r) => ConfigCheckVerdict::Rejected(r),
+        // 空串的病态腿与桌面同款处理：不能报空串，否则日志里只剩一句没有内容的「拒收」。
+        None => ConfigCheckVerdict::Unattributable(if raw.is_empty() {
+            "libbox checkConfig 抛出了空消息的异常".to_string()
         } else {
             raw.to_string()
         }),

@@ -65,7 +65,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use tauri::AppHandle;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 mod attempts;
 use attempts::{Attempt, AttemptGuard, Attempts};
@@ -87,7 +87,9 @@ use polaris_singbox_grpc::{daemon, Endpoint, ReconnectConfig, SingBoxApiClient};
 
 use crate::events::broadcast;
 use crate::runtime::proxy::core_log::pipe_to_log_with_secrets;
-use crate::runtime::proxy::{pid_alive, resolve_core_binary, send_signal};
+#[cfg(not(target_os = "android"))]
+use crate::runtime::proxy::resolve_core_binary;
+use crate::runtime::proxy::{pid_alive, send_signal};
 use crate::runtime::tailscale_status::decode_tailscale_status;
 
 /// 瞬态登录核的最大挂起时长：登录不完成（用户不去浏览器认证）时到点自动杀核，避免核无限挂着。
@@ -141,15 +143,24 @@ pub trait LoginCoreChild: Send {
     async fn wait(&mut self);
     /// 主动终止并收割：生产 SIGTERM→宽限→SIGKILL 后 `wait()`；测试置终止标记即返回。
     async fn terminate(&mut self);
+    /// An Android close must be acknowledged by its own host before the state-directory claim is released.
+    async fn after_exit(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        self.terminate().await;
+        Ok(())
+    }
 }
 
 /// spawn 抽象：返回 [`LoginCoreChild`] 装箱句柄。生产 [`TokioLoginCoreSpawner`] 内部经 [`TokioSpawner`] 起真核。
+#[async_trait]
 pub trait LoginCoreSpawner: Send + Sync {
     /// spawn 一个瞬态登录核。失败返 [`SpawnError`]（ENOENT/EACCES）。
     ///
     /// **按值收请求**（与 [`SingBoxSpawner`] 同）：请求里的排空回调是 `FnOnce`，spawner 必须能
     /// 消费掉它。假 spawner 也一样要把自己那两条内存流喂给同一个回调，测试才走的是生产接线。
-    fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError>;
+    async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError>;
 }
 
 /// `sing-box check` 抽象：spawn 前先验配置形状（fail-fast）。生产真跑 `sing-box check -c <file>`，测试 mock。
@@ -254,14 +265,113 @@ impl LoginCoreChild for TokioLoginCoreChild {
 /// 生产 spawner：经 [`TokioSpawner`] 起真 sing-box，再适配为 [`LoginCoreChild`]。
 pub struct TokioLoginCoreSpawner;
 
+#[async_trait]
 impl LoginCoreSpawner for TokioLoginCoreSpawner {
-    fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+    async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
         // 装箱适配：把 `SpawnedChild` 换成 `LoginCoreChild`。请求原样透传 —— 排空回调在
         // `TokioSpawner::spawn` 内部就被调用完了，到这里 child 已经不带管道。
         let spawned = TokioSpawner::new().spawn(req)?;
         Ok(Box::new(TokioLoginCoreChild {
             child: spawned.child,
         }))
+    }
+}
+
+#[cfg(target_os = "android")]
+struct AndroidLoginCoreSpawner;
+#[cfg(target_os = "android")]
+struct AndroidLoginCoreChild {
+    instance_id: String,
+    closed: bool,
+}
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl LoginCoreSpawner for AndroidLoginCoreSpawner {
+    async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        let instance_id = req
+            .config
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let failure = |message: String| SpawnError::Spawn {
+            bin: PathBuf::from("android-libbox"),
+            source: std::io::Error::other(message),
+        };
+        let config =
+            std::fs::read_to_string(&req.config).map_err(|error| failure(error.to_string()))?;
+        let mut child = AndroidLoginCoreChild {
+            instance_id,
+            closed: false,
+        };
+        crate::runtime::proxy::android_bridge::start_transient_login(&child.instance_id, &config)
+            .await
+            .map_err(failure)?;
+        // Android's native factory has copied the config into its own service. No snapshot is written.
+        child.closed = false;
+        Ok(Box::new(child))
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for AndroidLoginCoreChild {
+    fn drop(&mut self) {
+        if !self.closed {
+            let id = self.instance_id.clone();
+            tokio::spawn(async move {
+                let _ = crate::runtime::proxy::android_bridge::close_transient_login(&id).await;
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl LoginCoreChild for AndroidLoginCoreChild {
+    fn pid(&self) -> Option<u32> {
+        None
+    } // A libbox instance has no independent process PID.
+    async fn wait(&mut self) {
+        loop {
+            if matches!(
+                crate::runtime::proxy::android_bridge::transient_login_running(&self.instance_id)
+                    .await,
+                Ok(false)
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    async fn after_exit(&mut self) -> Result<(), String> {
+        self.close_confirmed().await
+    }
+    async fn terminate(&mut self) {
+        let _ = self.close_confirmed().await;
+    }
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        crate::runtime::proxy::android_bridge::close_transient_login(&self.instance_id).await?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "android")]
+struct AndroidLoginConfigChecker;
+#[cfg(target_os = "android")]
+#[async_trait]
+impl ConfigChecker for AndroidLoginConfigChecker {
+    async fn check(&self, _binary: &Path, config_path: &Path) -> Result<(), String> {
+        use polaris_core_supervisor::config_gate::ConfigCheckVerdict;
+        let config = std::fs::read_to_string(config_path).map_err(|error| error.to_string())?;
+        match crate::runtime::proxy::android_bridge::check_config(&config).await {
+            ConfigCheckVerdict::Accepted => Ok(()),
+            _ => Err("Android 登录配置校验失败或不可用".to_owned()),
+        }
     }
 }
 
@@ -381,6 +491,7 @@ impl AuthUrlEmitter for AppHandleEmitter {
 struct LoginEntry {
     /// 单调 epoch：区分同一 serverId 的不同代次登录（kill-on-relogin 后旧 supervisor 不得误删新表项）。
     epoch: u64,
+    attempt_id: String,
     /// 该代次登录核的 OS pid（假 child 返占位值 ⇒ `None` 只在拿不到 pid 时出现）。
     ///
     /// **它不是日志字段**：`ProxyRuntime::cleanup_stale_cores` 的排除表经
@@ -389,8 +500,8 @@ struct LoginEntry {
     /// 「与 `cleanup_stale_cores` 的关系」）。
     pid: Option<u32>,
     /// 通知 supervisor kill+reap（cancel / kill-on-relogin 用）。
-    cancel_tx: Option<oneshot::Sender<()>>,
-    done: watch::Receiver<bool>,
+    cancel_tx: mpsc::UnboundedSender<()>,
+    closed_rx: watch::Receiver<Option<Result<(), String>>>,
 }
 
 /// 注册表共享状态（supervisor 任务与命令层共享）。
@@ -453,6 +564,16 @@ pub enum StartLoginOutcome {
     Cancelled,
 }
 
+/// Facts from this process's Tailscale login registry only. `Vacant` says nothing about an OS,
+/// Android, or helper-owned process and must not by itself authorize identity retirement.
+#[allow(dead_code, reason = "reserved for cross-registry owner reconciliation")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TsRegistryOwnerState {
+    Busy,
+    Unknown,
+    Vacant,
+}
+
 /// 瞬态登录核生命周期注册表。持有注入的 spawner/checker/binary-resolver（生产真实现，测试 mock）。
 ///
 /// 支撑：kill-on-relogin、超时自动杀、取消、自然退出 reap。与 `ProxyRuntime` 的常驻代理核隔离。
@@ -474,6 +595,16 @@ impl LoginCoreRegistry {
     /// 生产装配：真 spawner + 真 `sing-box check` + 真 gRPC STATUS 订阅 + 真核解析 + 默认超时。
     #[must_use]
     pub fn production() -> Self {
+        #[cfg(target_os = "android")]
+        return Self::with_deps(
+            Arc::new(AndroidLoginCoreSpawner),
+            Arc::new(AndroidLoginConfigChecker),
+            Arc::new(GrpcLoginStatusSubscriber),
+            // Android uses the in-process libbox factory, never an executable lookup.
+            Arc::new(|| Ok(PathBuf::from("android-libbox"))),
+            DEFAULT_LOGIN_TIMEOUT,
+        );
+        #[cfg(not(target_os = "android"))]
         Self::with_deps(
             Arc::new(TokioLoginCoreSpawner),
             Arc::new(SingBoxConfigChecker),
@@ -530,14 +661,16 @@ impl LoginCoreRegistry {
     /// pid 字段本身「由 `child.pid()` 填」这一半由本模块的行为门（走生产 `start_attempt`）单独钉。
     #[cfg(test)]
     pub(crate) fn register_inflight_for_test(&self, server_id: &str, pid: u32) {
-        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let (cancel_tx, _cancel_rx) = mpsc::unbounded_channel();
+        let (_, closed_rx) = watch::channel(None);
         self.shared.insert(
             server_id.to_owned(),
             LoginEntry {
                 epoch: 0,
+                attempt_id: "test-inflight".into(),
                 pid: Some(pid),
-                cancel_tx: Some(cancel_tx),
-                done: watch::channel(true).1,
+                cancel_tx,
+                closed_rx,
             },
         );
     }
@@ -548,47 +681,118 @@ impl LoginCoreRegistry {
         self.shared.take(server_id);
     }
 
-    /// Signal cancellation while retaining PID/state ownership until reap.
-    #[cfg(test)]
-    pub fn cancel_login(&self, server_id: &str) -> bool {
-        let mut entries = self.shared.guard();
-        let Some(entry) = entries.get_mut(server_id) else {
-            return false;
-        };
-        if let Some(tx) = entry.cancel_tx.take() {
-            let _ = tx.send(());
-        }
-        true
+    /// Cancel only this login and wait for an actual close receipt. Keep its claim on failure.
+    pub async fn cancel_login(&self, server_id: &str) -> Result<bool, String> {
+        self.cancel_matching_login(server_id, None).await
     }
 
-    pub async fn cancel_and_wait(&self, server_id: &str) {
-        let done = {
-            let mut entries = self.shared.guard();
-            entries.get_mut(server_id).map(|entry| {
-                if let Some(tx) = entry.cancel_tx.take() {
-                    let _ = tx.send(());
-                }
-                entry.done.clone()
-            })
+    async fn cancel_matching_login(
+        &self,
+        server_id: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool, String> {
+        let Some((cancel_tx, mut closed)) = self
+            .shared
+            .guard()
+            .get(server_id)
+            .filter(|entry| attempt_id.is_none_or(|id| entry.attempt_id == id))
+            .map(|entry| (entry.cancel_tx.clone(), entry.closed_rx.clone()))
+        else {
+            return Ok(false);
         };
-        if let Some(mut done) = done {
-            let _ = done.wait_for(|v| *v).await;
+        if matches!(&*closed.borrow_and_update(), Some(Ok(()))) {
+            return Ok(true);
         }
+        signal_and_wait_close(cancel_tx, closed).await
     }
 
-    pub fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+    /// A failed native close keeps the state-directory claim, preventing a successor from
+    /// opening the same Tailscale state.
+    async fn cancel_and_wait(&self, server_id: &str) -> Result<(), String> {
+        self.cancel_login(server_id).await.map(|_| ())
+    }
+
+    pub async fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
+        let _gate = self.state_gate().await;
         self.attempts.prepare(server_id, attempt_id).map(|_| ())
+    }
+
+    /// Fence every request already prepared for this state directory. The caller keeps the
+    /// state gate through its identity commit; a later prepare cannot register until then.
+    /// A failed native close leaves its registry entry in place and fails this retirement.
+    pub async fn retire_attempts_under_state_gate(
+        &self,
+        server_id: &str,
+        _gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        let cancelled = self.attempts.retire_node_except(server_id, None)?;
+        self.cancel_and_wait(server_id).await?;
+        for attempt in cancelled {
+            attempt.finished().await;
+        }
+        if self.shared.contains(server_id) || self.attempts.owns_state(server_id) {
+            return Err("Tailscale login owner has not been reaped".into());
+        }
+        Ok(())
     }
 
     pub async fn cancel_attempt(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
         let attempt = self.attempts.cancel(server_id, attempt_id)?;
-        attempt.finished().await;
+        self.cancel_matching_login(server_id, Some(attempt_id))
+            .await?;
+        if let Some(attempt) = attempt {
+            attempt.finished().await;
+        }
         Ok(())
     }
 
     /// Lock order: proxy lifecycle -> this gate. Login never waits for proxy lifecycle.
     pub async fn state_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.start_gate.lock().await
+    }
+
+    /// A registry-local fact while the caller continuously holds this exact registry's gate.
+    /// The gate prevents new prepare/reserve/spawn admissions. A supervisor can remove an entry
+    /// outside the gate after confirmed close or after_exit; that only clears local ownership.
+    /// Each std mutex is read and released separately.
+    #[allow(dead_code, reason = "reserved for cross-registry owner reconciliation")]
+    pub(crate) fn owner_state_under_gate(
+        &self,
+        server_id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> TsRegistryOwnerState {
+        if server_id.is_empty()
+            || !std::ptr::eq(tokio::sync::MutexGuard::mutex(gate), &self.start_gate)
+        {
+            return TsRegistryOwnerState::Unknown;
+        }
+        let main_reserved = match self.shared.main_ids.lock() {
+            Ok(ids) => ids.contains(server_id),
+            Err(_) => return TsRegistryOwnerState::Unknown,
+        };
+        let attempt_busy = match self.attempts.local_owner_in_use(server_id) {
+            Ok(busy) => busy,
+            Err(()) => return TsRegistryOwnerState::Unknown,
+        };
+        let transient = match self.shared.entries.lock() {
+            Ok(entries) => entries.get(server_id).map(|entry| {
+                if entry.cancel_tx.is_closed() || entry.closed_rx.has_changed().is_err() {
+                    TsRegistryOwnerState::Unknown
+                } else {
+                    match &*entry.closed_rx.borrow() {
+                        None => TsRegistryOwnerState::Busy,
+                        Some(_) => TsRegistryOwnerState::Unknown,
+                    }
+                }
+            }),
+            Err(_) => return TsRegistryOwnerState::Unknown,
+        };
+        match transient {
+            Some(TsRegistryOwnerState::Unknown) => TsRegistryOwnerState::Unknown,
+            Some(TsRegistryOwnerState::Busy) => TsRegistryOwnerState::Busy,
+            _ if main_reserved || attempt_busy => TsRegistryOwnerState::Busy,
+            _ => TsRegistryOwnerState::Vacant,
+        }
     }
 
     /// The deletion callback runs only when neither the main core nor a login process owns state.
@@ -612,10 +816,22 @@ impl LoginCoreRegistry {
                 "Only a prepared login request may be preserved",
             ));
         }
-        self.attempts
-            .cancel_node_except(server_id, keep_attempt)
-            .await;
-        self.cancel_and_wait(server_id).await;
+        if keep_attempt.is_none() {
+            self.retire_attempts_under_state_gate(server_id, &_gate)
+                .await
+                .map_err(std::io::Error::other)?;
+        } else {
+            let cancelled = self
+                .attempts
+                .retire_node_except(server_id, keep_attempt)
+                .map_err(std::io::Error::other)?;
+            self.cancel_and_wait(server_id)
+                .await
+                .map_err(std::io::Error::other)?;
+            for attempt in cancelled {
+                attempt.finished().await;
+            }
+        }
         delete(&_gate)?;
         Ok(true)
     }
@@ -638,7 +854,11 @@ impl LoginCoreRegistry {
     }
 
     /// Called under the gate with the final, peeled generated endpoint set, before spawn.
-    pub async fn reserve_main_states(&self, generated: &serde_json::Value, root: &Path) {
+    pub async fn reserve_main_states(
+        &self,
+        generated: &serde_json::Value,
+        root: &Path,
+    ) -> Result<(), String> {
         let state_root = root.join("tailscale");
         let ids: HashSet<String> = generated
             .get("endpoints")
@@ -674,19 +894,20 @@ impl LoginCoreRegistry {
                 })
             })
             .collect();
+        for id in &ids {
+            self.cancel_and_wait(id).await?;
+        }
         self.shared
             .main_endpoints
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .extend(endpoints);
-        for id in &ids {
-            self.cancel_and_wait(id).await;
-        }
         self.shared
             .main_ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .extend(ids);
+        Ok(())
     }
 
     pub fn release_main_states(&self) {
@@ -762,7 +983,7 @@ impl LoginCoreRegistry {
             attempt_id: format!("test-{}", self.epoch.fetch_add(1, Ordering::SeqCst)),
             mode: LoginMode::Browser,
         };
-        self.prepare(&server.id, &request.attempt_id).unwrap();
+        self.prepare(&server.id, &request.attempt_id).await.unwrap();
         self.start_attempt(
             server,
             user_data,
@@ -781,6 +1002,7 @@ impl LoginCoreRegistry {
     /// Start a prepared request under the shared state gate. Main ownership and port exclusions
     /// come from its actual startup snapshot. A spawned child is registered before subscription;
     /// request cancellation and terminal events wait for reap. Started means authorization pending.
+    #[cfg(test)]
     pub async fn start_attempt(
         &self,
         server: &ServerConfig,
@@ -789,7 +1011,29 @@ impl LoginCoreRegistry {
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
-        let attempt = match self.attempts.get(&server.id, &request.attempt_id) {
+        self.start_attempt_with_saved(
+            server,
+            user_data,
+            request,
+            &|| Ok(server.clone()),
+            main_core,
+            emitter,
+        )
+        .await
+    }
+
+    /// The saved server is loaded only after acquiring the state gate. The request's TS identity
+    /// must still name that saved server; a stale renderer request cannot start an old state.
+    pub async fn start_attempt_with_saved(
+        &self,
+        requested: &ServerConfig,
+        user_data: &Path,
+        request: LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+    ) -> StartLoginOutcome {
+        let attempt = match self.attempts.get(&requested.id, &request.attempt_id) {
             Ok(attempt) => attempt,
             Err(reason) => return StartLoginOutcome::Failed(reason),
         };
@@ -797,13 +1041,14 @@ impl LoginCoreRegistry {
             return StartLoginOutcome::Failed("attemptAlreadyUsed".into());
         }
         let mut request_guard = AttemptGuard(attempt.clone(), false);
-        emitter.progress(&server.id, &request.attempt_id, "starting", None, None);
+        emitter.progress(&requested.id, &request.attempt_id, "starting", None, None);
         let outcome = self
             .launch_attempt(
-                server,
+                requested,
                 user_data,
                 &request,
                 &attempt,
+                saved_server,
                 main_core,
                 emitter.clone(),
             )
@@ -812,12 +1057,12 @@ impl LoginCoreRegistry {
             match &outcome {
                 StartLoginOutcome::Started => {}
                 StartLoginOutcome::InMainCore => {
-                    emitter.progress(&server.id, &request.attempt_id, "mainCore", None, None);
+                    emitter.progress(&requested.id, &request.attempt_id, "mainCore", None, None);
                     attempt.finish();
                 }
                 StartLoginOutcome::InMainCorePending => {
                     emitter.progress(
-                        &server.id,
+                        &requested.id,
                         &request.attempt_id,
                         "mainCore",
                         Some("configurationPending"),
@@ -826,12 +1071,12 @@ impl LoginCoreRegistry {
                     attempt.finish();
                 }
                 StartLoginOutcome::Cancelled => {
-                    emitter.progress(&server.id, &request.attempt_id, "cancelled", None, None);
+                    emitter.progress(&requested.id, &request.attempt_id, "cancelled", None, None);
                     attempt.finish();
                 }
                 StartLoginOutcome::Failed(reason) => {
                     emitter.progress(
-                        &server.id,
+                        &requested.id,
                         &request.attempt_id,
                         "failed",
                         Some(reason),
@@ -943,12 +1188,17 @@ impl LoginCoreRegistry {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "login attempt inputs carry independent lifetime-bound authorities"
+    )]
     async fn launch_attempt(
         &self,
-        server: &ServerConfig,
+        requested: &ServerConfig,
         user_data: &Path,
         request: &LoginRequest,
         attempt: &Arc<Attempt>,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
@@ -959,10 +1209,24 @@ impl LoginCoreRegistry {
         if attempt.cancelled() {
             return StartLoginOutcome::Cancelled;
         }
+        if self.attempts.registration_exhausted() {
+            return StartLoginOutcome::Failed(attempts::RETIRED_LIMIT_ERROR.into());
+        }
+        let server = match saved_server() {
+            Ok(server)
+                if server.id == requested.id
+                    && server.protocol
+                        == polaris_config_engine::user_config::server_config::Protocol::Tailscale
+                    && server.tailscale_settings == requested.tailscale_settings =>
+            {
+                server
+            }
+            _ => return StartLoginOutcome::Failed("savedTailscaleIdentityChanged".into()),
+        };
         let main = main_core();
         if self.main_owns(&server.id, main.alive) {
-            return if self.main_matches_request(server, request.mode) {
-                self.confirm_main_request(server, request, attempt, &main, main_core, emitter)
+            return if self.main_matches_request(&server, request.mode) {
+                self.confirm_main_request(&server, request, attempt, &main, main_core, emitter)
                     .await
             } else {
                 StartLoginOutcome::InMainCorePending
@@ -1059,7 +1323,9 @@ impl LoginCoreRegistry {
         }
 
         // (f) kill-on-relogin：先杀该 server 在飞的旧瞬态核（若有），再起新核。
-        self.cancel_and_wait(&server.id).await;
+        if let Err(error) = self.cancel_login(&server.id).await {
+            return StartLoginOutcome::Failed(error);
+        }
         if attempt.cancelled() {
             return StartLoginOutcome::Cancelled;
         }
@@ -1095,31 +1361,34 @@ impl LoginCoreRegistry {
         );
         req.extra_args = vec!["--disable-color".to_string()];
         req.working_dir = Some(user_data.to_path_buf());
-        let child = match self.spawner.spawn(req) {
+        let child = match self.spawner.spawn(req).await {
             Ok(c) => c,
             Err(_) => return StartLoginOutcome::Failed("processStartFailed".into()),
         };
 
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let (done_tx, done_rx) = watch::channel(false);
+        // Register before the STATUS subscription awaits: a concurrent main-core start can
+        // see this child and must wait for its confirmed close.
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = watch::channel(None);
+        let pid = child.pid();
         self.shared.insert(
             server.id.clone(),
             LoginEntry {
                 epoch,
-                pid: child.pid(),
-                cancel_tx: Some(cancel_tx),
-                done: done_rx,
+                attempt_id: request.attempt_id.clone(),
+                pid,
+                cancel_tx,
+                closed_rx,
             },
         );
         let ctx = SuperviseCtx {
             shared: self.shared.clone(),
             attempt: attempt.clone(),
             attempt_id: request.attempt_id.clone(),
-            done: done_tx,
             server_id: server.id.clone(),
             node_name: server.name.clone(),
-            // 瞬态核使用固定 endpoint tag；显示名称仍取 server.name。
-            // 复用主核解码器时只登记此 tag，别的 tag 的 STATUS 帧一律丢弃。
+            // 瞬态核只含本节点一个 endpoint；固定 tag 与入站拒绝规则同一真值。
+            // 复用主核那套解码器就得给它同一份 tag→id 映射；一并承担了「别的 tag 的帧一律丢弃」。
             tag_to_id: BTreeMap::from([(
                 TAILSCALE_LOGIN_ENDPOINT_TAG.to_owned(),
                 server.id.clone(),
@@ -1128,6 +1397,7 @@ impl LoginCoreRegistry {
             epoch,
             deadline: tokio::time::Instant::now() + self.timeout,
             emitter,
+            closed_tx,
         };
         config_guard.disarm();
         attempt.process_owned.store(true, Ordering::SeqCst);
@@ -1146,6 +1416,27 @@ impl LoginCoreRegistry {
     }
 }
 
+async fn signal_and_wait_close(
+    cancel_tx: mpsc::UnboundedSender<()>,
+    mut closed: watch::Receiver<Option<Result<(), String>>>,
+) -> Result<bool, String> {
+    if cancel_tx.send(()).is_err() {
+        return if matches!(&*closed.borrow(), Some(Ok(()))) {
+            Ok(true)
+        } else {
+            Err("登录实例关闭监管器不可用".to_owned())
+        };
+    }
+    if closed.changed().await.is_err() && !matches!(&*closed.borrow(), Some(Ok(()))) {
+        return Err("登录实例关闭回执不可用".to_owned());
+    }
+    let result = closed
+        .borrow()
+        .clone()
+        .ok_or_else(|| "登录实例关闭回执为空".to_owned())?;
+    result.map(|()| true)
+}
+
 /// 瞬态核管理 API 的一次性 secret（CSPRNG 16 字节 → 32 位小写 hex）。
 /// 与 `clashApiSecret` 同源生成器（[`crate::commands::config::generate_local_api_secret`]）：同一熵源、
 /// 同一形状，熵源不可用 → Err（绝不产弱/空密钥而把管理面裸奔当成「降级可用」）。
@@ -1159,10 +1450,9 @@ struct SuperviseCtx {
     shared: Arc<Shared>,
     attempt: Arc<Attempt>,
     attempt_id: String,
-    done: watch::Sender<bool>,
     server_id: String,
     node_name: String,
-    /// 单条映射 `TAILSCALE_LOGIN_ENDPOINT_TAG → server.id`：喂给 [`decode_tailscale_status`]，顺带把「别的 tag」的
+    /// 单条映射 `server.name → server.id`：喂给 [`decode_tailscale_status`]，顺带把「别的 tag」的
     /// 端点整段丢掉（瞬态核理论上只有一个 endpoint，但判据不该建立在「理论上」之上）。
     tag_to_id: BTreeMap<String, String>,
     /// 本次登录写盘的临时 config 路径，收核后删。
@@ -1173,6 +1463,7 @@ struct SuperviseCtx {
     epoch: u64,
     deadline: tokio::time::Instant,
     emitter: Arc<dyn AuthUrlEmitter>,
+    closed_tx: watch::Sender<Option<Result<(), String>>>,
 }
 
 /// 瞬态登录核退出原因。
@@ -1196,12 +1487,12 @@ async fn subscribe_and_supervise(
     mut child: Box<dyn LoginCoreChild>,
     subscriber: Arc<dyn LoginStatusSubscriber>,
     api: TailscaleLoginApiService,
-    mut cancel_rx: oneshot::Receiver<()>,
+    mut cancel_rx: mpsc::UnboundedReceiver<()>,
     ready: oneshot::Sender<StartLoginOutcome>,
 ) {
     let result = tokio::select! {
         () = ctx.attempt.cancellation() => Err(("cancelled", "cancelled")),
-        _ = &mut cancel_rx => Err(("cancelled", "cancelled")),
+        _ = cancel_rx.recv() => Err(("cancelled", "cancelled")),
         () = tokio::time::sleep_until(ctx.deadline) => Err(("timedOut", "authorizationTimedOut")),
         result = subscriber.subscribe(api.port, &api.secret) => result.map_err(|_| ("failed", "statusSubscriptionFailed")),
     };
@@ -1211,10 +1502,22 @@ async fn subscribe_and_supervise(
             supervise(ctx, child, status, cancel_rx).await;
         }
         Err((phase, reason)) => {
-            child.terminate().await;
+            loop {
+                let result = child.close_confirmed().await;
+                if result.is_ok() {
+                    break;
+                }
+                let _ = ctx.closed_tx.send(Some(result));
+                // A failed Android close retains the registry entry and state claim. Another
+                // cancel retries promptly; otherwise a bounded delay avoids a hot loop.
+                tokio::select! {
+                    _ = cancel_rx.recv() => {},
+                    () = tokio::time::sleep(Duration::from_secs(5)) => {},
+                }
+            }
             remove_login_config(&ctx.config_path);
             ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
-            ctx.done.send_replace(true);
+            let _ = ctx.closed_tx.send(Some(Ok(())));
             ctx.emitter
                 .progress(&ctx.server_id, &ctx.attempt_id, phase, Some(reason), None);
             ctx.attempt.finish();
@@ -1234,7 +1537,7 @@ async fn supervise(
     ctx: SuperviseCtx,
     mut child: Box<dyn LoginCoreChild>,
     mut status: Box<dyn LoginStatusStream>,
-    mut cancel_rx: oneshot::Receiver<()>,
+    mut cancel_rx: mpsc::UnboundedReceiver<()>,
 ) {
     // stdout/stderr 的排空**不在这里**：它在 `start_attempt` 构造 `SpawnRequest` 时就接好了，
     // spawner 返回之前已经生效。放在 supervise 里曾经意味着「spawn 与接管之间有一段没人读的
@@ -1247,7 +1550,7 @@ async fn supervise(
 
     let reason = loop {
         tokio::select! {
-            _ = &mut cancel_rx => break ExitReason::Cancelled,
+            _ = cancel_rx.recv() => break ExitReason::Cancelled,
             () = ctx.attempt.cancellation() => break ExitReason::Cancelled,
             () = &mut sleep => break ExitReason::TimedOut,
             () = child.wait() => break ExitReason::SelfExit,
@@ -1274,14 +1577,12 @@ async fn supervise(
         }
         ExitReason::Cancelled => {
             log::info!("瞬态登录核取消 → 终止：server={}", ctx.server_id);
-            child.terminate().await;
         }
         ExitReason::TimedOut => {
             log::warn!(
                 "瞬态登录核未在授权期限内完成登录 → 超时终止：server={}",
                 ctx.server_id
             );
-            child.terminate().await;
         }
         ExitReason::LoggedIn => {
             // 控制面的终局肯定：已认证、state 已落盘 → 核没有再活着的理由，且它还占着该节点的
@@ -1290,24 +1591,41 @@ async fn supervise(
                 "Tailscale 登录成功（backendState=Running）→ 收瞬态登录核：server={}",
                 ctx.server_id
             );
-            child.terminate().await;
         }
         ExitReason::StatusStreamEnded => {
             log::warn!(
                 "瞬态登录核 STATUS 流终止（无 URL/登录成功判据来源）→ 终止：server={}",
                 ctx.server_id
             );
-            child.terminate().await;
         }
         ExitReason::InvalidAuthUrl => {
-            child.terminate().await;
+            log::warn!(
+                "瞬态登录核 STATUS 提供的授权地址无效：server={}",
+                ctx.server_id
+            );
+        }
+    }
+    loop {
+        let result = if matches!(reason, ExitReason::SelfExit) {
+            child.after_exit().await
+        } else {
+            child.close_confirmed().await
+        };
+        if result.is_ok() {
+            break;
+        }
+        let _ = ctx.closed_tx.send(Some(result));
+        // A failed native close keeps both the child and its claim; cancellation/relogin can retry.
+        tokio::select! {
+            _ = cancel_rx.recv() => {},
+            () = tokio::time::sleep(Duration::from_secs(5)) => {},
         }
     }
     // 核已收割 → 删掉带 secret 的临时 config。
     remove_login_config(&ctx.config_path);
     // reap 后注销（epoch 守卫：不误删 kill-on-relogin 后的新代次表项）。
     ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
-    ctx.done.send_replace(true);
+    let _ = ctx.closed_tx.send(Some(Ok(())));
     let (phase, reason) = match reason {
         ExitReason::LoggedIn => ("authorized", None),
         ExitReason::Cancelled => ("cancelled", None),

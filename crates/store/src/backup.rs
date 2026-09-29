@@ -3,7 +3,7 @@
 //! Polaris 锚点：`shared/backup-categories.ts`(246) + `main/ipc/handlers/backup-handlers.ts` 的纯逻辑部分
 //! （`parseBackupContent` / `sanitizeCrossPlatformRules` / `buildBackupInfo`）。
 //!
-//! 8 类（前 7 类对应「数据备份与恢复」卡的统计维度，第 8 类是通用设置）：
+//! 9 类（存量 8 类加 portable meshRouting）：
 //!   manualNodes     手动节点   —— servers（无 subscriptionId、非 endpoint 协议）
 //!   meshNodes       组网节点   —— servers（无 subscriptionId、endpoint 协议，如 Tailscale/WireGuard）
 //!   subscriptions   订阅源     —— subscriptions[] + 其展开节点（servers 有 subscriptionId）；两者一体进出
@@ -12,6 +12,7 @@
 //!   （两类规则共同）          —— networkProfiles[]：选任一规则类即整表导出，导入按 id 合并
 //!   dnsResources    DNS 资源   —— dnsServers[] + dnsServerGroups[] + dnsDefaults
 //!   appRules        应用分流   —— appRules[]（+ appRulesSeeded / customAppPresets 同族）
+//!   meshRouting     组网策略   —— 仅 portable policy 意图，不含本机 epoch/ledger
 //!   generalSettings 通用设置   —— 其余所有 config 字段，用**排除法**（自动涵盖未来新增设置）
 //!
 //! 导出 [`pick_categories`]：只抽选中类的字段。
@@ -26,7 +27,7 @@
 //!
 //! ## 单一真值
 //!
-//! 前端 `ui/src/shared/backup-categories.ts` 只保留 `BackupCategory` 类型 + `BACKUP_CATEGORIES` 有序清单
+//! 前端 `ui/src/domain/backup-categories.ts` 只保留 `BackupCategory` 类型 + `BACKUP_CATEGORIES` 有序清单
 //! （跨语言边界的枚举对应物，UI 勾选列表 + IPC 类型用）；分类/计数/合并**逻辑只此一份**，前端经
 //! `backup:importPick` 拿后端算好的 available/counts，不在渲染端重算 → 结构上不存在漂移面。
 //! 顺序不变式由 `tests::backup_categories_order_matches_frontend` 锁住。
@@ -38,6 +39,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value};
 
 use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
+use polaris_config_engine::user_config::mesh_route_state::MeshRoutePolicy;
 use polaris_config_engine::user_config::server_config::{
     declares_mesh_routes, is_mesh_protocol, Protocol,
 };
@@ -52,13 +54,14 @@ pub enum BackupCategory {
     DnsRules,
     DnsResources,
     AppRules,
+    MeshRouting,
     GeneralSettings,
 }
 
 /// 有序类别清单（UI 展示顺序 + 全选基准）。上游 `BACKUP_CATEGORIES`。
 ///
 /// **顺序是契约**：`detect_categories` 按此序返回，前端 `SettingsBackup.tsx` 按同序渲染勾选行。
-pub const BACKUP_CATEGORIES: [BackupCategory; 8] = [
+pub const BACKUP_CATEGORIES: [BackupCategory; 9] = [
     BackupCategory::ManualNodes,
     BackupCategory::MeshNodes,
     BackupCategory::Subscriptions,
@@ -66,6 +69,7 @@ pub const BACKUP_CATEGORIES: [BackupCategory; 8] = [
     BackupCategory::DnsRules,
     BackupCategory::DnsResources,
     BackupCategory::AppRules,
+    BackupCategory::MeshRouting,
     BackupCategory::GeneralSettings,
 ];
 
@@ -81,6 +85,7 @@ impl BackupCategory {
             Self::DnsRules => "dnsRules",
             Self::DnsResources => "dnsResources",
             Self::AppRules => "appRules",
+            Self::MeshRouting => "meshRouting",
             Self::GeneralSettings => "generalSettings",
         }
     }
@@ -127,7 +132,7 @@ impl NodeCategory {
 ///   （spec §7 / D12，见 [`pick_categories`] / [`merge_categories`]）。
 /// - `selectedServerId` 跟节点走、不随通用设置导入；导入节点后若失效，[`merge_categories`] 末尾主动归零
 ///   （[`crate::validate::validate_config`] 对失效 selectedServerId 是 **Err、非归零**，不兜底会令整份导入失败）。
-const DATA_FIELDS: [&str; 20] = [
+const DATA_FIELDS: [&str; 21] = [
     "servers",
     "subscriptions",
     "customRules",
@@ -148,6 +153,8 @@ const DATA_FIELDS: [&str; 20] = [
     "appRulesSeeded",
     "customAppPresets",
     "selectedServerId",
+    // Portable backup-only policy; never part of live config/generalSettings.
+    "meshRouting",
 ];
 
 /// 敏感 / 临时态字段：既不进任何类别、也不进通用设置（**绝不写入备份文件**）。
@@ -157,7 +164,7 @@ const DATA_FIELDS: [&str; 20] = [
 /// 曾有第七项 `diagnosticCapture`（临时诊断态）。整条机制已删除，且旧配置里的残留在 `load` 的
 /// 迁移链里就被 [`crate::migrate::migrate_diagnostic_capture`] 清掉 ⇒ 走到备份这一层时该键已不存在，
 /// 再留一个排除位就是为一个不可能出现的键守门。**旧备份文件里带着它也无妨**：导入侧同样过迁移链。
-const EXCLUDED_FROM_BACKUP: [&str; 5] = [
+const EXCLUDED_FROM_BACKUP: [&str; 7] = [
     "clashApiSecret",      // clash_api 明文密钥，不跨机
     "privacyPassword",     // 隐私解锁密码（legacy 明文残留），绝不入备份
     "privacyPasswordHash", // 隐私解锁密码 salted hash，本机凭据，绝不入备份
@@ -166,11 +173,77 @@ const EXCLUDED_FROM_BACKUP: [&str; 5] = [
     // 白占 3 个槽位之一）；且它是「后端权威」字段（前端零写入权，见 `commands/config.rs`
     // 的 `BACKEND_AUTHORITATIVE_KEYS`），不该经备份这条前端全量提交路径被改写。
     "recentServerIds",
+    // Portable meshRouting exports only policy intent; the live policy and
+    // machine-local ledger never travel through generalSettings.
+    "meshRoutePolicy",
+    "meshRouteState",
 ];
 
 /// 是否通用设置键（排除法）。上游 `isGeneralKey`。
 fn is_general_key(key: &str) -> bool {
     !DATA_FIELDS.contains(&key) && !EXCLUDED_FROM_BACKUP.contains(&key)
+}
+
+/// Export only validated policy intent. Owner references keep serverId but
+/// never carry this machine's epoch; the local ledger is excluded separately.
+fn portable_mesh_policy(config: &Value) -> Option<Value> {
+    let typed: MeshRoutePolicy =
+        serde_json::from_value(config.get("meshRoutePolicy")?.clone()).ok()?;
+    typed.validate().ok()?;
+    let mut portable = serde_json::to_value(typed).ok()?;
+    fn remove_epochs(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                fields.remove("identityEpoch");
+                for nested in fields.values_mut() {
+                    remove_epochs(nested);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    remove_epochs(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    remove_epochs(&mut portable);
+    Some(portable)
+}
+
+/// Server references shown in restore preview. This is diagnostic only: it
+/// never binds a foreign policy to a local epoch or authorizes a write.
+#[must_use]
+pub fn mesh_routing_owner_dependencies(config: &Value) -> Vec<String> {
+    let Some(policy) = config
+        .get("meshRouting")
+        .or_else(|| config.get("meshRoutePolicy"))
+    else {
+        return Vec::new();
+    };
+    let mut ids = BTreeSet::new();
+    let mut add = |target: &Value| {
+        if target["kind"] == "owner" {
+            if let Some(server_id) = target["serverId"].as_str().filter(|id| !id.is_empty()) {
+                ids.insert(server_id.to_owned());
+            }
+        }
+    };
+    for key in ["assignments", "overrides"] {
+        if let Some(items) = policy[key].as_array() {
+            for item in items {
+                add(&item["target"]);
+            }
+        }
+    }
+    if let Some(items) = policy["dnsPolicy"]["suffixAssignments"].as_array() {
+        for item in items {
+            add(&item["target"]);
+        }
+    }
+    add(&policy["dnsPolicy"]["serviceOwner"]);
+    add(&policy["dnsPolicy"]["shortNamePolicy"]);
+    ids.into_iter().collect()
 }
 
 /// JS 真值语义：`if (s.subscriptionId)` —— null/undefined/"" 皆为假。
@@ -295,6 +368,9 @@ pub fn count_category(config: &Value, cat: BackupCategory) -> usize {
             }
         }
         BackupCategory::AppRules => arr_len(config, "appRules"),
+        BackupCategory::MeshRouting => usize::from(
+            config.get("meshRouting").is_some() || config.get("meshRoutePolicy").is_some(),
+        ),
         BackupCategory::GeneralSettings => usize::from(has_general_settings(config)),
     }
 }
@@ -432,6 +508,11 @@ pub fn pick_categories(config: &Value, selected: &[BackupCategory]) -> Value {
                 "customAppPresets".into(),
                 config["customAppPresets"].clone(),
             );
+        }
+    }
+    if sel(BackupCategory::MeshRouting) {
+        if let Some(policy) = portable_mesh_policy(config) {
+            out.insert("meshRouting".into(), policy);
         }
     }
     if sel(BackupCategory::GeneralSettings) {
@@ -689,6 +770,18 @@ pub fn merge_categories(
         } else {
             skipped.push(BackupCategory::AppRules);
         }
+    }
+
+    // meshRouting is a portable policy preview only. No pure merge can bind
+    // foreign owner serverIds to this machine's identity epochs or retire old
+    // owner scope; the runtime restore gate rejects a selected meshRouting
+    // before any other category is written. Older backups without this class
+    // are an empty skip, never a command to clear local policy.
+    if sel(BackupCategory::MeshRouting)
+        && backup.get("meshRouting").is_none()
+        && backup.get("meshRoutePolicy").is_none()
+    {
+        skipped.push(BackupCategory::MeshRouting);
     }
 
     // generalSettings：排除法覆盖所有非数据键

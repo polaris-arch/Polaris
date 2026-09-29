@@ -133,7 +133,14 @@ impl ProxyRuntime {
             observed.as_ref(),
             None,
         );
-        let inferred_replan = config.proxy_mode_type.is_tun()
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。路径全称用完整路径而非
+        // `use`：本文件的 `Platform` 导入是 cfg(mac|linux) 门控的（见文件头那段），
+        // 而本判据在三平台都要跑。Android 上零行为差，且整条 watcher 在那里根本不起
+        // （见 `spawn_network_watcher` 的平台早退）。
+        let inferred_replan = config
+            .proxy_mode_type
+            .effective_on(polaris_helper_proto::Platform::current())
+            .is_tun()
             && needs_runtime_binding_plan(&config)
             && inferred_binding_changed;
         if explicit_recovered || inferred_replan {

@@ -6,7 +6,7 @@ import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { editRoute } from '@/lib/staged-config';
 import type { StagedEntry } from '@/lib/staged-config';
-import { meshSingletonConflict } from '@/domain/endpoint-routes';
+import { canCloneServer, meshSingletonConflict } from '@/domain/endpoint-routes';
 import { editDialogFor } from './node-edit-routing';
 
 interface Args {
@@ -69,7 +69,7 @@ export function useNodeActions({
       // `nodes.cloneTsSingleton` 说的是被实测推翻的「多个 TS 互相顶掉 tailnet 地址」。真实相交由
       // 生成侧 `endpoint_force_route_report` 检出（创建期判不了：新节点还没连上控制面）。
       const slot = meshSingletonConflict(server, servers);
-      if (slot) {
+      if (!canCloneServer(server) || slot) {
         toast.error(t('nodes.cloneWarpSingleton'));
         return;
       }

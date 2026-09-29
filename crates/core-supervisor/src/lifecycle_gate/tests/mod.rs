@@ -3,6 +3,72 @@
 use super::*;
 
 #[test]
+fn publication_guard_blocks_all_generation_writers_but_not_readers() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    for writer in 0..3 {
+        let gate = Arc::new(LifecycleGate::default());
+        let publication = gate.lock_generation_publication();
+        assert_eq!(gate.generation(), 0, "event callbacks may read generation");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let other = Arc::clone(&gate);
+        let task = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let claimed = match writer {
+                0 => other.bump_generation(),
+                1 => other.claim_generation(None, LifecycleKind::Start).unwrap(),
+                _ => other.try_begin_restart(0, None).unwrap(),
+            };
+            done_tx.send(claimed).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "writer {writer} must wait for synchronous publication"
+        );
+        drop(publication);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        task.join().unwrap();
+    }
+}
+
+#[test]
+fn current_generation_guard_serializes_a_later_stop_claim() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let gate = Arc::new(LifecycleGate::default());
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let (attempting_tx, attempting_rx) = mpsc::channel();
+    let (claimed_tx, claimed_rx) = mpsc::channel();
+    let other = Arc::clone(&gate);
+    let worker = gate
+        .with_current_generation(old, |live| {
+            assert_eq!(live.generation(), old);
+            assert_eq!(live.owner(), Some(LifecycleKind::Start));
+            let worker = std::thread::spawn(move || {
+                attempting_tx.send(()).unwrap();
+                let stop = other
+                    .claim_generation(Some(old), LifecycleKind::Stop)
+                    .unwrap();
+                claimed_tx.send(stop).unwrap();
+            });
+            attempting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(claimed_rx.try_recv().is_err());
+            worker
+        })
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        old + 1
+    );
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+}
+
+#[test]
 fn begin_end_pairs_track_depth_and_busy() {
     let g = LifecycleGate::default();
     assert!(!g.is_busy());

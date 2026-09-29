@@ -169,6 +169,7 @@ fn gate_deps(platform: &str, serve_dir: Option<String>) -> GenerateConfigDeps {
         probe_proxy_port: None,
         update_in_port: None,
         subscription_update_in_port: None,
+        loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
         race_upstream_ips: vec![],

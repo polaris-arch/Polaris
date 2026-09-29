@@ -4,12 +4,30 @@
 //! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs` /
 //! `win_console.rs`），façade 必须 `pub(crate) use` 再导出（§B.3）。
 
+#[allow(dead_code)] // Stopping custody is dormant until its exact supervisor is wired.
+mod direct_custody;
+#[allow(dead_code)] // No production commit bridge exists in this slice.
+mod direct_stop;
+pub(crate) use direct_custody::DirectCoreSlot;
+pub(super) use direct_custody::{HelperStartToken, HelperStopNonce};
+#[cfg(test)]
+pub(super) use direct_custody::{
+    ReserveStoppingError, SlotAdmissionError, StopView, TakeRunningError,
+};
+#[cfg(test)]
+pub(super) use direct_stop::{
+    commit_for_test, prepare_direct_stop, prepare_with_io_for_test, CommitDirectStopError,
+    CommitRejected, DirectStopIo, DirectStopObservation, DirectStopProvenance, PrepareError,
+    StopWaitOutcome,
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use polaris_core_supervisor::{scan_running_cores, stale_pids, ProcessKiller, Signal};
+use tokio::process::Child;
 
 use crate::runtime::helper::HelperStopOps;
 use crate::runtime::win_console::no_console_window;
@@ -18,6 +36,113 @@ use super::core_binary::resolve_core_binary;
 use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
 
+/// The blocking Stop returns this non-cloneable permit with its ACK. It stays
+/// booked through final Child→pid validation; Drop only releases booking.
+pub(super) struct HelperStopPermit {
+    child: Arc<std::sync::Mutex<DirectCoreSlot>>,
+    attempt: HelperStartToken,
+    nonce: HelperStopNonce,
+}
+
+impl HelperStopPermit {
+    pub(super) fn new(
+        child: Arc<std::sync::Mutex<DirectCoreSlot>>,
+        attempt: HelperStartToken,
+        nonce: HelperStopNonce,
+    ) -> Self {
+        Self {
+            child,
+            attempt,
+            nonce,
+        }
+    }
+
+    pub(super) fn nonce(&self) -> &HelperStopNonce {
+        &self.nonce
+    }
+
+    fn attempt(&self) -> &HelperStartToken {
+        &self.attempt
+    }
+}
+
+impl Drop for HelperStopPermit {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            child.finish_helper_stop_ipc(&self.attempt, &self.nonce);
+        }
+    }
+}
+
+/// Identity of one locally spawned core. The token is minted before spawn and
+/// attached only to the resulting Child, so neither a reused PID nor a later
+/// lifecycle request can impersonate that run.
+#[derive(Clone)]
+pub(super) struct RunIdentity(pub(super) Arc<RunToken>);
+
+pub(super) struct RunToken {
+    /// Opaque journal correlation, minted once per actual direct Child. The
+    /// Arc is still the live instance proof; this string alone cannot prove a
+    /// process after app restart or establish plan/artifact ownership.
+    persisted_ref: String,
+}
+
+impl RunIdentity {
+    pub(super) fn new() -> Self {
+        Self(Arc::new(RunToken {
+            persisted_ref: format!("direct-{}", uuid::Uuid::new_v4()),
+        }))
+    }
+
+    pub(super) fn same_run(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(super) fn persisted_ref(&self) -> &str {
+        &self.0.persisted_ref
+    }
+}
+
+pub(super) struct DirectCoreRun {
+    pub(super) child: Child,
+    pub(super) identity: RunIdentity,
+    #[allow(dead_code)] // Read when the managed coordinator's exact stop gate is wired.
+    pub(super) origin: DirectRunOrigin,
+}
+
+/// The legacy constructor records Legacy. A future managed coordinator must
+/// guard both spawn and slot assignment before treating Managed facts as
+/// authority; trusted proxy descendants can still reassign this field.
+#[allow(dead_code)] // The managed coordinator is deliberately not enabled yet.
+pub(super) enum DirectRunOrigin {
+    Legacy,
+    Managed(super::mesh_apply::run_birth::ManagedRunFacts),
+}
+
+impl DirectCoreRun {
+    #[cfg(test)]
+    pub(super) fn mark_managed_for_test(&mut self) {
+        self.origin = DirectRunOrigin::Managed(
+            super::mesh_apply::run_birth::ManagedRunFacts::fixture_for_test(
+                self.identity.persisted_ref(),
+            ),
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn new(child: Child) -> Self {
+        Self::with_identity(child, RunIdentity::new())
+    }
+
+    pub(super) fn with_identity(child: Child, identity: RunIdentity) -> Self {
+        Self {
+            child,
+            identity,
+            origin: DirectRunOrigin::Legacy,
+        }
+    }
+}
+
 /// SIGTERM→SIGKILL 宽限期（上游 `stopSingBoxProcess` 的 5s 优雅窗口，:5230）。
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -25,6 +150,25 @@ pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
 pub(super) const STALE_KILL_GRACE: Duration = Duration::from_millis(1_500);
 
 impl ProxyRuntime {
+    /// Register every helper start/stop/cleanup before its blocking IPC is
+    /// queued. Child is the serialization point for the direct-stop bridge.
+    pub(crate) fn register_helper_backend(&self) -> Result<(), String> {
+        self.helper.register_core_mutation()
+    }
+
+    pub(super) fn register_helper_start_backend(&self) -> Result<HelperStartToken, String> {
+        self.register_helper_backend()?;
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| "child lock poisoned".to_string())?;
+        let token = child
+            .begin_helper_start()
+            .map_err(|error| format!("helper IPC rejected by direct Child custody: {error:?}"))?;
+        self.core_via_helper.store(true, Ordering::SeqCst);
+        Ok(token)
+    }
+
     /// **内核自证**：核就绪后校验「**实际跑起来的那个二进制**的版本 == 本次期望的核版本」。
     ///
     /// # 这一条为什么必须观测事实（血证）
@@ -124,9 +268,19 @@ impl ProxyRuntime {
 
     /// 杀核（接线 core-supervisor [`ProcessKiller`]）：SIGTERM → 宽限 → SIGKILL，并 reap 子进程。
     ///
-    /// 无在跑核 = no-op。退出/崩溃/重启后不留孤儿：child 句柄被 take 后必 `wait()` 收割。
+    /// Empty = no-op；Stopping 由未来的 exact supervisor 持有，本 legacy 腿拒绝取出。
+    /// Running 句柄被 take 后必 `wait()` 收割。
     /// helper 腿未确认停止时返回错误，调用方不得继续清运行态或启动第二个核。
     pub(super) async fn kill_core(&self) -> Result<(), String> {
+        // Android：核在**本进程内**（libbox），没有 child 可杀、没有 pid 可发信号 —— 停核 = 请
+        // `VpnService` 拆隧道。与 `kill_core_via_helper` 同构：**要确定回执**，停不掉就返 Err，
+        // 调用方不得据此继续清运行态或起第二个核（tun fd 由 `VpnService.prepare()` 仲裁，
+        // 同一时刻只授权一个应用，前一条没拆干净就起第二个必然打架）。
+        //
+        // `if cfg!` 而非 `#[cfg]` 早退：后者会让下面整段在 Android 编译单元里变成不可达代码。
+        if cfg!(target_os = "android") {
+            return super::android_bridge::stop_core().await;
+        }
         // C6-5：经 helper 起的核 → 经 helper stop（对称）。daemon 摘其受管 child → SIGTERM→宽限→SIGKILL
         // 收割（app 无本地 child 句柄）。阻塞 IPC 挪出 async worker。
         if self.core_via_helper.load(Ordering::SeqCst) {
@@ -135,16 +289,18 @@ impl ProxyRuntime {
                 .await;
         }
         let child_opt = match self.child.lock() {
-            Ok(mut g) => g.take(),
+            Ok(mut g) => g
+                .take_running_legacy()
+                .map_err(|_| "direct Child is reserved in Stopping custody".to_string())?,
             Err(e) => {
                 log::error!("child lock poisoned: {e}");
                 return Err(format!("child lock poisoned: {e}"));
             }
         };
-        let Some(mut child) = child_opt else {
+        let Some(mut run) = child_opt else {
             return Ok(());
         };
-        let pid = child.id().unwrap_or(0);
+        let pid = run.child.id().unwrap_or(0);
         if pid == 0 {
             // 已退出且被收割 → 仅 reap 残句柄。
             //
@@ -152,21 +308,27 @@ impl ProxyRuntime {
             // 罕见角落 —— 核「起来就死」时就绪门的 `try_wait` 会先一步收割它，`child.id()` 随即变 None ⇒
             // 每一次起核失败都从这里走。留下的陈旧 pid 会被 `status()`、诊断、以及 stale 清扫的「受管
             // pid 排除表」当成活的受管核继续引用（排除表里挂个死 pid，等于给同号新进程发免死金牌）。
-            let _ = child.wait().await;
+            let _ = run.child.wait().await;
             if let Ok(mut g) = self.pid.lock() {
                 *g = None;
             }
             return Ok(());
         }
         log::info!("停核：pid={pid}（SIGTERM → {STOP_GRACE:?} 宽限 → SIGKILL）");
+        // The escalation task survives cancellation of this async Stop. Keep
+        // an existing restart/update lease through its final possible SIGKILL.
+        let escalation_lease = self.config.retain_active_legacy_start_lease();
         let escalation = ProcessKiller::escalate_async(
-            move |sig| send_signal(pid, sig),
+            move |sig| {
+                let _held = &escalation_lease;
+                send_signal(pid, sig);
+            },
             move || pid_alive(pid),
             STOP_GRACE,
         )
         .await;
         // 等进程退出（reap，防僵尸）。进程若拒 SIGTERM，升级 task 到点补 SIGKILL 解开此处。
-        let _ = child.wait().await;
+        let _ = run.child.wait().await;
         // 进程已退出 → 取消挂起的 SIGKILL 升级（防 timer 泄漏 + 防 pid 复用误杀）。
         escalation.wait().await;
         if let Ok(mut g) = self.pid.lock() {
@@ -189,30 +351,50 @@ impl ProxyRuntime {
         &self,
         ops: Arc<dyn HelperStopOps>,
     ) -> Result<(), String> {
-        let intended = self.pid.lock().ok().and_then(|g| *g);
+        self.register_helper_backend()?;
+        let (attempt, intended, nonce) = self
+            .child
+            .lock()
+            .map_err(|_| "child lock poisoned".to_string())?
+            .begin_helper_stop()
+            .ok_or_else(|| {
+                "helper cleanup-unknown: no confirmed idle Start attempt; refusing Stop(None) or concurrent Stop".to_string()
+            })?;
+        let permit = HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), nonce);
         // 阻塞 IPC 挪出 async worker。
-        let result =
-            match tokio::task::spawn_blocking(move || ops.stop_managed_core(intended)).await {
-                Ok(Ok(())) => {
-                    log::info!("经 helper 停核完成（pid={intended:?}）");
-                    Ok(())
-                }
-                // daemon 可能已因父死看护/崩溃自行收割 → stop 返 notrunning/错误，非致命；
-                // 也可能是身份不匹配的诚实 no-op（消息自述），那正是本守卫生效的痕迹。
-                Ok(Err(e)) => {
-                    log::warn!("经 helper 停核未完成：{e}");
-                    Err(e)
-                }
-                Err(e) => {
-                    let error = format!("helper 停核任务 join 失败：{e}");
-                    log::error!("{error}");
-                    Err(error)
-                }
-            };
-        if result.is_ok() {
-            self.clear_helper_core_bookkeeping(intended);
-        }
-        result
+        // An updater/restart may be cancelled while this blocking stop still
+        // runs. Retain its existing legacy lease in the closure; a normal Stop
+        // owns no such lease and must remain available in managed mode.
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        let (result, permit) = match tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
+            (ops.stop_managed_core(Some(intended)), permit)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                let error = format!("helper 停核任务 join 失败：{e}");
+                log::error!("{error}");
+                return Err(error);
+            }
+        };
+        // The permit remains booked while the ACK is checked and consumed.
+        let outcome = match result {
+            Ok(()) if self.clear_helper_core_bookkeeping(&permit, intended) => {
+                log::info!("经 helper 停核完成（pid={intended}）");
+                Ok(())
+            }
+            Ok(()) => {
+                Err("helper cleanup-unconfirmed: Stop acknowledged but attempt changed".into())
+            }
+            Err(error) => {
+                log::warn!("经 helper 停核未完成：{error}");
+                Err(error)
+            }
+        };
+        drop(permit);
+        outcome
     }
 
     /// helper 停核腿的记账收口：**只清自己那笔**（[`kill_core`](Self::kill_core) 的 helper 分支专用）。
@@ -222,23 +404,38 @@ impl ProxyRuntime {
     /// `status()` 的 helper 腿据 `self.pid` 探活、诊断据它报 pid、`cleanup_stale_cores` 的「受管 pid 排除表」
     /// 也据它——排除表里少了新核，下一次起核的孤儿清扫就会把它当孤儿杀掉（换个地方杀错进程）。
     ///
-    /// 本方法只会在 helper 已确认 `stopped/notrunning` 后调用；此时仅在「记账已换成另一个 pid」时
-    /// 留手，其余情形（等值 / 现为 `None`）照清。通信失败/结果未知不会进入本方法。
-    pub(super) fn clear_helper_core_bookkeeping(&self, intended: Option<u32>) {
+    /// 本方法只会在 helper 已确认 `stopped/notrunning` 后调用；必须仍持有
+    /// 同一 Child 的唯一 Stop permit，且 attempt、pid、nonce 全相同才清账。
+    /// 通信失败、取消或任何身份变动均保留 helper route。
+    pub(super) fn clear_helper_core_bookkeeping(
+        &self,
+        permit: &HelperStopPermit,
+        intended: u32,
+    ) -> bool {
+        if !Arc::ptr_eq(&permit.child, &self.child) {
+            return false;
+        }
+        let Ok(mut child) = self.child.lock() else {
+            log::error!("child lock poisoned：跳过 helper 停核记账收口");
+            return false;
+        };
         let Ok(mut g) = self.pid.lock() else {
             log::error!("pid lock poisoned：跳过 helper 停核记账收口");
-            return;
+            return false;
         };
         let current = *g;
-        if current.is_some() && current != intended {
+        if current != Some(intended)
+            || !child.confirm_helper_stop(permit.attempt(), intended, permit.nonce())
+        {
             log::warn!(
-                "helper 停核腿收口时发现受管 pid 记账已换人（{intended:?}→{current:?}）→ \
+                "helper 停核腿收口时发现受管 attempt/pid 记账已换人（{intended}→{current:?}）→ \
                  整段记账属新会话，不动它（清它等于让新核在 status/诊断/孤儿清扫排除表里集体失联）"
             );
-            return;
+            return false;
         }
         *g = None;
         self.core_via_helper.store(false, Ordering::SeqCst);
+        true
     }
 
     /// **起核前**的 stale-core 清扫：杀掉遗留的**本 app** 孤儿核。跑在**每一次** `start()` 上
@@ -252,6 +449,10 @@ impl ProxyRuntime {
     pub(super) async fn cleanup_stale_cores(&self) -> Result<(), StartError> {
         // 实跑计数：置于所有早退腿之前 —— 计的是「清扫这条腿被走到几次」，而非「杀掉几个孤儿」。
         self.stale_sweep_runs.fetch_add(1, Ordering::SeqCst);
+        // ── Android 腿：孤儿的形态是「系统拉起的核」，不是进程（见 [`Self::stop_system_started_core`]）──
+        if cfg!(target_os = "android") {
+            return self.stop_system_started_core().await;
+        }
         let binary = match resolve_core_binary() {
             Ok(b) => b,
             Err(e) => {
@@ -295,6 +496,25 @@ impl ProxyRuntime {
         self.escalate_root_orphans(&survivors).await
     }
 
+    /// [`Self::cleanup_stale_cores`] 的 Android 腿。
+    ///
+    /// 核在本进程内（libbox），没有二进制可解析、没有 cmdline 可扫；但「上次会话留下、本运行时不认识
+    /// 的核」这件事照样存在：always-on / 开机自动连接在**没有 Rust** 时由系统拉起的那个（配置是上次
+    /// 落盘的）。同一个处置：起核前先停掉它，再由本次 start 按当前配置起 —— 不停的话 Kotlin 桥判
+    /// 「已在运行」直接拒收这次起核，用户点连接永远连不上。本运行时自己起的核（`core_started`）
+    /// 不是孤儿，不碰。停不掉 ⇒ 有码失败（隧道还在，不许在它上面起第二个）。
+    async fn stop_system_started_core(&self) -> Result<(), StartError> {
+        if super::android_bridge::core_started()
+            || !super::android_bridge::system_started_core_running().await
+        {
+            return Ok(());
+        }
+        log::warn!("起核前发现系统拉起的核（本运行时未持有）→ 先停掉，再按当前配置起核");
+        super::android_bridge::stop_core()
+            .await
+            .map_err(|e| StartError::coded(e, code::STARTUP_FAILED))
+    }
+
     /// 清扫的**排除表** = 当前受管主核 pid + 此刻在飞的**测速临时核** pid + 此刻在飞的
     /// **Tailscale 瞬态登录核** pid。
     ///
@@ -322,21 +542,20 @@ impl ProxyRuntime {
     ///
     /// - 扫描之后才起的瞬态核 ⇒ 不在候选集里 ⇒ 本就杀不到它；
     /// - 扫描之前起的瞬态核 ⇒ 此刻要么仍在表里（被排除），要么已经退出并注销
-    ///   （`TempCorePidGuard` 的 Drop 跑在 `terminate()` 收割**之后** ⇒ 出表时进程已死）。
+    ///   （测速的 `TempCorePidGuard` 在收割后出表；登录核在确认 close/reap 后出表）。
     ///
     /// 反过来「先读表再扫描」就漏了一格：读表 → 瞬态核 spawn → 扫描，该 pid 既在候选集又不在表快照里。
-    /// 故这里**不需要**加锁扩大临界区（那要求 `INFLIGHT_TEMP_CORES` 罩住整条含 `await` 的清扫腿），
-    /// 只需要保持这个顺序。
+    /// 测速腿仍依赖此读取顺序；登录腿另由 `start_guarded` 持有同一 TS state gate 覆盖
+    /// 扫描到主核 spawn，登录 spawn/登记和旧实例关闭不会与清扫并发。
     ///
     /// # 两条腿各自的残余窗口（如实登记，别当成全覆盖）
     ///
     /// - **测速临时核**：spawn 返回到登记入表之间那一小段**同步**代码（起点其实是 fork），与主核
     ///   「spawn 完再记 `self.pid`」的窗口同构，是本仓既有的取舍。
-    /// - **登录核**：spawn 与登记之间隔着一次**真 `await`**（STATUS 流的 gRPC 订阅），窗口比上面那条
-    ///   宽得多；且 `cancel_login` 是先出表再收核，出表时进程还活着。两格都未关，详见
-    ///   [`LoginCoreRegistry::inflight_login_pids`](crate::runtime::tailscale_login_core::LoginCoreRegistry::inflight_login_pids)。
-    /// - **两条腿共有**：`victims` 在两段 1500 ms 宽限**之前**就冻结了，排除表管不到「孤儿被杀 →
-    ///   pid 被 init 回收 → 该 pid 号在 1.5 s 内被新起的瞬态核复用」这一格（需 pid 回绕，概率极低）。
+    /// - **登录核**：已改为 spawn 后先登记、再 await STATUS；cancel 先确认 close/reap，后出表。
+    ///   与起核前持有的 TS state gate 合起来封住本腿的扫描/登记窗口。
+    /// - **测速腿**：`victims` 在两段 1500 ms 宽限**之前**冻结；孤儿 pid 若被 init 回收并在
+    ///   宽限内由新测速临时核复用，排除表无从追踪该复用（需 pid 回绕，概率极低）。
     pub(super) fn sweep_exclusions(&self) -> Vec<u32> {
         let mut exclude: Vec<u32> = self.pid.lock().ok().and_then(|g| *g).into_iter().collect();
         let temp: Vec<u32> = crate::runtime::speedtest::inflight_temp_core_pids();
@@ -369,9 +588,17 @@ impl ProxyRuntime {
         );
         // helper 未装 → 无提权腿，直接落终态（不假装尝试过）。
         if self.helper.status().installed {
+            self.register_helper_backend()
+                .map_err(|message| StartError::coded(message, code::ROOT_ORPHAN_BLOCKED))?;
             let helper = Arc::clone(&self.helper);
             // `cleanup_cores` 是同步阻塞 IPC → 挪出 async worker 线程（同 start_core/stop_core）。
-            match tokio::task::spawn_blocking(move || helper.cleanup_cores()).await {
+            let blocking_lease = self.config.retain_active_legacy_start_lease();
+            match tokio::task::spawn_blocking(move || {
+                let _blocking_lease = blocking_lease;
+                helper.cleanup_cores()
+            })
+            .await
+            {
                 Ok(Ok(())) => {
                     tokio::time::sleep(STALE_KILL_GRACE).await;
                     let still: Vec<u32> = survivors

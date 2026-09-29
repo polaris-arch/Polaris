@@ -74,6 +74,43 @@ function parseShellGateCommand(line) {
   return { envVar: null, envVal: null, command: line.trim() };
 }
 
+/**
+ * 抠出 gate-rust.sh 里 `run_gate <name> bash -c '` 到**收尾那一行单引号**之间的整块（已剥注释）。
+ * 与 `extractShellGateLine` 的分工：那个抠单行门（五条可逐字对拍的），这个抠多行块。
+ */
+function extractShellGateBlock(strippedShell, gateName) {
+  const lines = strippedShell.split('\n');
+  const startIdx = lines.findIndex((l) => l.trim().startsWith(`run_gate ${gateName} bash -c '`));
+  assert.ok(startIdx !== -1, `gate-rust.sh 里找不到 "run_gate ${gateName} bash -c '…" 这一块`);
+  const endIdx = lines.findIndex((l, i) => i > startIdx && l.trim() === "'");
+  assert.ok(endIdx !== -1, `gate-rust.sh 里 "run_gate ${gateName}" 那块没有收尾的单引号行`);
+  return lines.slice(startIdx, endIdx + 1).join('\n');
+}
+
+/**
+ * 从一段文本里抠出每一条 `cargo check …` 的**参数序列**。
+ *
+ * 只归一化两样、且只归一化这两样：
+ *   · 命令前缀（`PATH="…" `）—— 两侧「怎么找到 NDK」的写法本来就不同（CI 用 job 级 env
+ *     `$ANDROID_NDK_BIN`，本机现算），那不是「量什么」；
+ *   · `>` 重定向与它的目标 —— CI 写 `$RUNNER_TEMP`，本机是 `mktemp -d` 的产物。
+ * 剩下的全部逐字进比对：`--workspace` / `--target` / `--message-format` / 有没有 `--all-targets`。
+ */
+function cargoCheckArgs(text) {
+  return text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.includes('cargo check '))
+    .map((l) => l.slice(l.indexOf('cargo check ')).replace(/\s*>.*$/, '').trim());
+}
+
+/** 抠出 `node scripts/check-android-only-face.mjs …` 那一行，路径参数归一成 basename 再比。 */
+function faceCheckerCall(text) {
+  const m = text.match(/^\s*node (scripts\/check-android-only-face\.mjs.*)$/m);
+  assert.ok(m, `找不到 check-android-only-face.mjs 的调用行：\n---\n${text}\n---`);
+  return m[1].replace(/"\$\{?[A-Za-z_]\w*\}?\/([\w.-]+)"/g, '$1').trim();
+}
+
 // 5 个门：ci.yml 的 step 名 → gate-rust.sh 的 run_gate 名 → 若该步骤有 env 限定则给出变量名。
 const GATES = [
   { ci: 'Check formatting', sh: 'fmt', envVar: null },
@@ -89,24 +126,45 @@ function loadStripped() {
   return { ci: stripComments(ciRaw), sh: stripComments(shRaw) };
 }
 
+/** ci.yml 里那条 Android 影响面完备性步骤的名字（本文件多处引用，抠成常量免得写歪一处不自知）。 */
+const ANDROID_FACE_STEP = 'Android impact face must be registered (dep-info 对差)';
+
 /**
  * 在 `gate-rust.sh` 里镜像了、但**不做逐字对拍**的 cargo 步骤。
  *
- * 这两条在脚本里挂 `--with-cross`（默认关闭，因为首跑要 `rustup target add` 联网）。
- * 不逐字对拍是因为它们是多行 shell 块（rustup + jq + 循环），不是一条 `run:` 命令 ——
- * 上面那套 `extractRunCommand` 抠不出可比的单行。
+ * 三条都挂在脚本的 `--with-cross` 下（默认关闭，因为首跑要 `rustup target add` 联网）。
+ * 不逐字对拍是因为它们都是多行 shell 块（rustup + jq + 循环 / 两条 cargo + 一条 node），
+ * 不是一条 `run:` 命令 —— 上面那套 `extractRunCommand` 抠不出可比的单行。
  *
- * 但**不能因此就不对拍**：漏掉的话 ci.yml 加第三个目标三元组、脚本没跟上，两边就分裂了。
- * 故下面 `crossTargetTriplesMatch` 单独钉住「目标集合两侧一致」这条最容易漂的判据。
+ * 🔴 **进这张名单的前提是「本机真的跑了这件事」**，不是「本机不跑但登记一下」。
+ * 只登记名字不补跑法的话，本机对那件事的检出力恒为 0，而 `MIRRORED`（已镜像）这个名字
+ * 会说谎 —— 完备性那条测试也就从「本机镜像跟得上 CI」退化成「名单跟得上 CI」。
+ *
+ * 且**不能因为不逐字对拍就不对拍**：漏掉的话 ci.yml 加第三个目标三元组 / 改一侧 cargo 的
+ * 选择器而脚本没跟上，两边就分裂了。故下面两条测试各自钉住这几条门最容易漂的实质：
+ *   · 跨目标那两条 → 目标三元组集合两侧一致；
+ *   · dep-info 对差那条 → 两条 cargo check 的选择器两侧一致且互相对称、checker 调用形态一致。
  */
 const MIRRORED_BUT_NOT_VERBATIM = [
-  'Cross-check platform targets (cfg(windows) / cfg(macos) 分支)',
+  'Cross-check platform targets (cfg(windows) / cfg(macos) / cfg(android) / cfg(ios) 分支)',
   'Cross-target exemptions must still be necessary',
+  ANDROID_FACE_STEP,
 ];
 
-/** 从一段文本里抠出 rust 目标三元组（`x86_64-pc-windows-msvc` / `x86_64-apple-darwin` 这类）。 */
+/**
+ * 从一段文本里抠出 rust 目标三元组（`x86_64-pc-windows-msvc` / `aarch64-linux-android` 这类）。
+ *
+ * 🔴 **`linux` 这一支是 2026-09-04 补的，补之前本函数对 android 三元组结构性失明**：
+ * 旧模式只认 `pc|apple|unknown` 三种 vendor 段，而 `aarch64-linux-android` 的 vendor 段被省略
+ * （arch-os-env 三段形态）⇒ 它一个字符都匹配不到。后果不是「少抓一条」而是**这条对拍门对本次改动
+ * 恰好完全失明**：ci.yml 加了 android 目标、gate-rust.sh 没跟上，两侧集合都算作「没有 android」
+ * 而判等 —— 门在但没牙，且哑在它最该说话的那一次。
+ *
+ * 负向前瞻 `(?<![-\w])` 是随之必需的：加了 `linux` 之后，`x86_64-unknown-linux-gnu` 里的
+ * `unknown-linux-gnu` 会被当成第二个「三元组」抠出来，凭空造出一个两侧对不上的幽灵条目。
+ */
 function targetTriples(text) {
-  return [...new Set(text.match(/\b\w+-(?:pc|apple|unknown)-[\w-]+\b/g) ?? [])].sort();
+  return [...new Set(text.match(/(?<![-\w])\w+-(?:pc|apple|unknown|linux)-[\w-]+/g) ?? [])].sort();
 }
 
 /**
@@ -138,6 +196,78 @@ test('跨目标门覆盖的目标三元组，ci.yml 与 gate-rust.sh 一致', ()
       `${name} 里找不到 scripts/cross-target-exempt.json —— 豁免表的路径两侧必须同源`
     );
   }
+});
+
+/**
+ * 「Android 影响面 dep-info 对差」门的**实质**两侧一致。
+ *
+ * 这条门抓的是：`ANDROID_IMPACT_SCOPES` 是 android.yml 的唯一触发面，新增 Android 专属源文件
+ * 而不登记 ⇒ APK 腿永远不为它跑。判据 = android 编译面 − host 编译面，两条 `cargo check` 的
+ * **选择器**就是这个差集的取材面本身 —— 改一侧而另一侧没跟上，差集当场失真。
+ */
+test(`「${ANDROID_FACE_STEP}」门的实质，ci.yml 与 gate-rust.sh 一致`, () => {
+  const { ci, sh } = loadStripped();
+  const ciBlock = extractCiStepBlock(ci, ANDROID_FACE_STEP);
+  const shBlock = extractShellGateBlock(sh, 'android-face');
+
+  const ciCargo = cargoCheckArgs(ciBlock);
+  const shCargo = cargoCheckArgs(shBlock);
+  // 取材面自检：两条（android 面 + host 面）。抠到 0 条或 1 条时下面的 deepEqual 可能恒真。
+  assert.equal(ciCargo.length, 2, `ci.yml 该步应抠到 2 条 cargo check，实为 ${ciCargo.length} 条：${JSON.stringify(ciCargo)}`);
+  assert.deepEqual(
+    shCargo,
+    ciCargo,
+    `两条 cargo check 的选择器不一致（ci.yml → gate-rust.sh）：\n  ci.yml       = ${JSON.stringify(ciCargo)}\n` +
+      `  gate-rust.sh = ${JSON.stringify(shCargo)}\n` +
+      '两边都要改：scripts/gate-rust.sh 的 android-face 门与 .github/workflows/ci.yml 的同名步骤。'
+  );
+
+  // 🔴 两侧选择器必须**逐字对称**：android 那条只比 host 那条多一个 `--target`。
+  //    成因见 ci.yml 同名步的 🔴 段 —— host 侧一旦更宽（例如借用已有的 clippy --all-targets 省钱），
+  //    `#[cfg(any(target_os = "android", test))]` 的文件会同时落进 host 面而从差集里掉出去，
+  //    方向是 **fail-open**：门说全绿而实际漏了。这个 pattern 仓里真的在用
+  //    （`src-tauri/src/runtime/stats/source.rs` 的三个通道常量）。
+  const [androidCmd, hostCmd] = ciCargo;
+  assert.equal(
+    androidCmd.replace(' --target aarch64-linux-android', ''),
+    hostCmd,
+    `两侧选择器不对称（android 那条应当只比 host 那条多一个 --target）：\n  android = ${androidCmd}\n  host    = ${hostCmd}`
+  );
+
+  // `--all-targets` 两侧都不许有：android 侧带它会让 polaris-helper 撞 4 条 E0433（同上注释）。
+  // 上面那条对称性拦得住「只有一侧带」，拦不住「两侧一起带」，故这里单独钉一句。
+  for (const cmd of ciCargo) {
+    assert.ok(
+      !cmd.includes('--all-targets'),
+      `dep-info 对差的两侧都不能带 --all-targets（android 侧会撞 E0433）：${cmd}`
+    );
+  }
+
+  assert.equal(
+    faceCheckerCall(shBlock),
+    faceCheckerCall(ciBlock),
+    'checker 的调用形态不一致（ci.yml → gate-rust.sh）：两侧都要 --android / --host 各喂一份，' +
+      '少一个 flag 或换个脚本名都会让本机量的不是 CI 量的那件事。'
+  );
+});
+
+// ── 切片自检：证明 android-face 那块抠的是块内的命令，不是块外注释里的同名字样 ──
+test('切片自检：android-face 块的抠取不吃块外/注释里的同名 cargo check', () => {
+  const synthetic = [
+    '  # 历史写法：cargo check --workspace --all-targets --target aarch64-linux-android（已废弃）',
+    "  run_gate android-face bash -c '",
+    '    set -euo pipefail',
+    '    cargo check --workspace --message-format=json-render-diagnostics > "$OUT/host-units.json"  # 就是这条',
+    "  '",
+    '  # 收尾之后又提一句 cargo check --workspace --all-targets，不该被抠进来',
+  ].join('\n');
+
+  const block = extractShellGateBlock(stripComments(synthetic), 'android-face');
+  assert.deepEqual(
+    cargoCheckArgs(block),
+    ['cargo check --workspace --message-format=json-render-diagnostics'],
+    '抠到的不是块内那条真命令 —— 切片被块外注释或行内注释污染了'
+  );
 });
 
 /**

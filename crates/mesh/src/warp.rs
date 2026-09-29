@@ -60,9 +60,9 @@ pub const WARP_DEREGISTER_MAX_PER_DRAIN: usize = 10;
 pub struct WarpWireGuardDraft {
     pub address: String,
     pub port: u16,
-    #[serde(alias = "private_key")]
+    #[serde(rename = "privateKey", alias = "private_key")]
     pub private_key: String,
-    #[serde(alias = "peer_public_key")]
+    #[serde(rename = "peerPublicKey", alias = "peer_public_key")]
     pub peer_public_key: String,
     #[serde(alias = "local_address")]
     pub local_address: Vec<String>,

@@ -71,7 +71,7 @@ export const ruleResourcesApi = {
   /**
    * 更新单个内置 geo 规则集到上游最新版。`tag` 是内置表里的 tag（如 `geosite-cn`），**不是** `builtin:` id。
    * 内置项不入 `config.ruleResources`，故不能走 `redownload`（那条按 id 查册，对内置恒 NOT_FOUND）。
-   * 只换 `<userData>/rules/` 里的文件，不重启内核 —— 生效要等下次起核。
+   * 更新 `<userData>/rules/` 本地文件，不主动重启内核；收据只确认文件更新。
    */
   updateBuiltin(tag: string): Promise<RuleResourceDownloadResult> {
     return invoke(IPC_CHANNELS.RULE_RESOURCES_UPDATE_BUILTIN, { tag });

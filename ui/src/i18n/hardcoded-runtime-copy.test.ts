@@ -64,6 +64,11 @@ describe('i18n 文案只有 locale 一个真值源', () => {
   it('直接可见文本与无障碍名称只允许跨语言同形的技术名', () => {
     const technicalText = new Set([
       'Geosite', 'GeoIP', 'WARP+', 'Polaris', 'English', 'DoH', 'DNSPod DoH',
+      // Wire protocol values are identical in every supported language.
+      'TCP', 'UDP', 'TCP + UDP',
+      // 上游 meta-rules-dat 的两个**分区名**（桌面 `ResUrlDialog` 的分类下拉里也是字面量）：
+      // 它们是数据源的名字，不是可译的词 —— 译出来只会得到五个一样的串。
+      'Geosite Lite', 'GeoIP Lite',
       'Mixed', 'gVisor', 'System', 'Auto', 'macOS', 'Windows', 'Linux', 'MB',
       'polaris-backup.json', '.conf · .yaml · .json · .txt', 'com.polaris.helper',
       'https://223.5.5.5/dns-query', 'https://1.12.12.12/dns-query',
@@ -72,6 +77,9 @@ describe('i18n 文案只有 locale 一个真值源', () => {
     const technicalNames = new Set([
       'Cloudflare WARP', 'Tailscale', 'OpenConnect', 'OpenVPN', 'WireGuard', 'MASQUE',
       'AI', 'DNS', 'FakeIP', 'TUN', 'MTU', 'CIDR', 'MAC', 'DoH URL',
+      // 品牌名与仓内文件名：跨语种同形，翻译它们只会制造第二种写法。
+      // （'Polaris' 早已在上面的 technicalText 里；移动端设置屏把它用在了 label 位。）
+      'Polaris', 'LICENSE',
     ]);
     const technicalExamples = new Set([
       'https://example.com/sub?token=…', 'YOUR_TAILSCALE_AUTH_KEY',
@@ -83,6 +91,14 @@ describe('i18n 文案只有 locale 一个真值源', () => {
       // Tailscale 官方控制面地址：登录弹窗 controlUrl 输入框的占位示例。
       // 与 `TsSettingsDialog` 的 FieldSpec `ph` 同一个值，属技术示例而非文案。
       'https://controlplane.tailscale.com',
+      // 移动端出口选择器的自定义出口输入框（2026-09-06 批 2）。与桌面 `TsSettingsDialog`
+      // 那一格的 `ph` **逐字相同** —— 那边是 FieldSpec 表里的字符串（本门看的是 JSX 属性，
+      // 故只在移动端这一侧露出来），两处同一个示例，不是新造的文案。
+      '100.x.y.z / hostname',
+      // 移动端 DNS 页自定义 DoH 上游那一格的占位示例。与同表里两个内置 DoH 地址同族
+      // （`https://223.5.5.5/dns-query` / `https://1.12.12.12/dns-query`），
+      // 换成 1.1.1.1 是因为这一格填的必须是**纯 IP**，示例要示范的正是这一点。
+      'https://1.1.1.1/dns-query',
     ]);
     const violations: string[] = [];
     for (const file of runtimeFiles(sourceRoot)) {

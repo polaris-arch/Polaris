@@ -140,6 +140,11 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
             2,
             1,
         ),
+        (
+            "crates/config-engine/tests/managed_mesh_emission_runtime.rs",
+            8,
+            1,
+        ),
     ];
     for (rel, total_tests, run_tests) in skip_wired {
         let code = mask_comments_and_strings(&read_repo(rel));

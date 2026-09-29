@@ -28,3 +28,97 @@
 # 这个代价在安装包口径下可忽略；体积门（MAX_UPDATE_ASSET_BYTES 200 MiB）余量充足。
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# ════════════════════════════════════════════════════════════════════════════
+# ANDROID-1（2026-09-05）：Android 交叉编译剥掉 Rust 侧的 DWARF
+# ════════════════════════════════════════════════════════════════════════════
+#
+# # 为什么（实测的产物缺陷，不是体积洁癖）
+#
+# arm64 debug APK 实测 606871040 字节（578.8 MiB），其中 `lib/arm64-v8a/libpolaris_lib.so`
+# **一条就占 515511872 字节**（AGP 对原生库按 `stor` 不压缩存放，包内即磁盘尺寸）。
+# 按节区拆开（`llvm-readelf -S`）：`.debug_info` 165.0 MB、`.debug_str` 159.9 MB、
+# `.debug_line` 32.6 MB、`.debug_ranges` 19.0 MB、`.debug_loc` 4.6 MB、`.debug_aranges` 4.5 MB
+# —— `.debug_*` 合计 387.6 MB，**占整个 APK 的 64%**。
+#
+# 这份 DWARF 在真机上没有任何消费者：`.debug_*` 不带 SHF_ALLOC，加载器**根本不映射它**
+# （所以它也不占运行期内存 —— 别把这条当省内存的改动）；Android 不用它做运行期符号化
+# （`ndk-stack` 吃的是构建机侧那份库）。它的全部代价落在下载量、安装包体积与设备存储上，
+# 而这三样正是「交给用户装真机做验收」这件事的成本。
+#
+# # 为什么落在 `.cargo/config.toml`，而不是 `Cargo.toml` 的 `[profile.dev]`
+#
+# cargo 的 profile **没有 per-target 形态**：`[profile.dev] strip = …` 会同时打在桌面
+# 三平台的每一次 `cargo build` / `cargo test` 上。而「Android 包大小」与「桌面开发的调试
+# 能力」之间**不存在权衡关系** —— 在 profile 上动手是纯损失，换不到任何东西。
+# 本文件的 per-target `rustflags` 段只在为该 triple 编译时参与，与顶上那段 Windows
+# `+crt-static` 同一形态、同一射程规则。
+#
+# 射程是**实测**的，不是从文档推的（cargo 1.98，`cargo build -v` 数 rustc 行里
+# `-C strip=` 的出现次数，隔离工程 /var/tmp/striptest）：
+#   · `--target aarch64-linux-android`     → 1 次（本段生效）
+#   · `--target x86_64-unknown-linux-gnu`  → 0 次
+#   · 不带 `--target`（本机开发的常态）     → 0 次
+#   · **正向对照**：把同一段挪到 `[target.x86_64-unknown-linux-gnu]` 后，桌面那两条
+#     变成 1 次。没有这条对照，上面两个 0 与「rustflags 整段根本没被读到」不可分。
+#
+# 另一条实测：dev profile **自己不下发** `-C strip=`（cargo 只在 strip != none 时才加），
+# 故本段不存在「被 profile 覆盖」的问题 —— 同一次 rustc 调用里 `-C strip=debuginfo` 唯一。
+#
+# # 为什么是 `debuginfo` 而不是 `symbols`
+#
+# 选型依据：同一份未剥的 `.so`（515511872 字节）上把两档各跑一遍（NDK 27 的 llvm-strip）：
+#   · 不剥                              515511872
+#   · `--strip-debug`（≈ strip=debuginfo）124773856   −75.8%
+#   · `--strip-all`  （≈ strip=symbols）   66663104   −87.1%
+# 三档的 `.dynsym` 导出 FUNC 数**均为 212**（JNI 入口面不受影响，这是能剥的前提）。
+# 落到真实构建上（下面这行 flag 生效后重新链接出来的那份）：**127652816 字节**，
+# `.debug_*` 节 0 个，`.symtab` 646224 个符号，`.dynsym` 229 条 / 212 个 FUNC。
+# （比 llvm-strip 事后剥的 124773856 略大 2.9 MB —— 链接期剥与事后剥的节区布局本就不同，
+#  这里如实记两个数，不拿其中一个冒充另一个。）
+#
+# 多剥的那 58 MB 换掉的是这个包**唯一剩下的原生诊断能力**：真机崩了之后 `ndk-stack` /
+# `addr2line` 靠那 646224 个 `.symtab` 符号还能给到函数名 + 偏移；剥成 `symbols` 就只剩
+# `.dynsym` 里那 212 个导出函数，与 release 包无异。
+#   [不选 `symbols`：省 58 MB，但把一个叫 debug 的包降到 release 的诊断水平]
+#   [不选「不剥」：515.5 MB 里 387.6 MB 是真机上零消费者的 DWARF]
+#
+# # 这四行由门守着，不靠本注释自觉
+#
+# 删掉它们的后果是**没有一条判据会说话**（2026-09-05 实证）：APK 从 219011984 弹回 606871040，
+# 而 `verify-apk.mjs` 的许可文本 / libbox 符号计数 / `.srs` 份数 / **死字节**四条全绿 ——
+# 死字节那条看的是「文件大小 ÷ 条目压缩和」的比值，这两个数是一起变大的，比值纹丝不动。
+# 故新增判据 ⑥（`scripts/verify-apk.mjs`）：`lib/<ABI>/` 下每一份 `.so` 的 ELF 节表里
+# `.debug_*` / `.zdebug_*` 必须为 0。删掉下面四段中的 aarch64 那段、重建重打，实测该条判红并
+# 点名 8 个节区、387858433 字节与本文件路径。
+# 另：本文件已登记进 `scripts/classify-ci-impact.mjs` 的 `ANDROID_IMPACT_SCOPES` —— 此前它只在
+# 桌面面上登记，改它**不会**拉起 Android 腿，等于「唯一会量这件事的门恰好不跑」。
+#
+# # 刻意的不生效面
+#
+# - **桌面（linux / windows / macos）零影响** —— per-target 段的定义如此，且上面有正反对照。
+# - **`libbox.so` 零影响**：那 80.9 MB 来自 `libbox.aar`，由 `scripts/build-libbox.sh` 走
+#   Go/gomobile 工具链构建，根本不经过 rustc。`scripts/verify-apk.mjs` 数它里面 cronet/naive
+#   的那条判据因此与本段无关 —— 实测改前 cronet=1201 naive=223，改后同。
+#   （判据 ⑥ 的射程**包含** libbox.so，但那是按「包里每一份 .so 都得剥过」派生出来的，
+#    与本段无关；实测 libbox.so 30 个节区、0 个 debug 节，是 gomobile 自己剥的。）
+# - `scripts/gate-rust.sh` 里本段的参与面：常规 `clippy` 步不带 `--target`（编的是宿主）且设了
+#   整体 `RUSTFLAGS="-D warnings"`（env 优先级高于本文件），两个理由各自都足以让本段不参与；
+#   `--with-cross` 的 `cross-clippy` / `cross-exempt` 两步确实带 `--target aarch64-linux-android`，
+#   本段在那里**会**参与，但那两步是 clippy / check —— 只出 metadata 不链接，`-C strip` 无从生效。
+#   与顶上 `+crt-static` 那段「clippy 步不生效」是同一条注记的两面。
+#
+# 四个 triple 全列：`gen/android/buildSrc` 的 RustPlugin 默认 targetList 就是
+# `aarch64 / armv7 / i686 / x86_64`（`universal` flavor 四个 ABI 一起打）。只写 aarch64
+# 的话，换个 `--target` 出的包就悄悄回到 515 MB，而没有任何东西会说话。
+[target.aarch64-linux-android]
+rustflags = ["-C", "strip=debuginfo"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "strip=debuginfo"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "strip=debuginfo"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "strip=debuginfo"]

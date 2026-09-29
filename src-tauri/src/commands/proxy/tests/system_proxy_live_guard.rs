@@ -12,8 +12,13 @@ fn live_query_rejects_starting_and_non_system_running_sessions_before_os_read() 
         .find("if status.starting")
         .expect("系统代理活态查询必须拒绝 starting 半成品");
     let running_mode = body
-        .find("running_proxy_mode_type() != Some(ProxyModeType::SystemProxy)")
-        .expect("活态查询必须核对运行核模式，不能读先行落盘的新配置");
+        .find("running_effective_proxy_mode_type() != Some(ProxyModeType::SystemProxy)")
+        .expect(
+            "活态查询必须核对运行核模式，不能读先行落盘的新配置；\
+             且必须读**本平台生效值**（访问器名字里的 `effective` 就是这件事的载体）——\
+             读裸值会让 Android 上判「运行核是系统代理接管模式」成立，继而去读一个那里\
+             根本不存在的 OS 设置",
+        );
     let os_read = body
         .find("production_system_proxy_live_status")
         .expect("活态查询必须保留真实 OS 读取");

@@ -21,8 +21,8 @@ fn category_ai_uses_noncn_filename() {
     assert_eq!(ai.file_name, "geosite-category-ai-!cn.srs");
 }
 
-/// CN 三件套取 SagerNet `rule-set` 分支的 SRS，保留完整文件名。
-/// release 只提供数据库资产；这些 URL 必须与官方 SRS 发布路径一致。
+/// CN 三件套走 SagerNet 的 `rule-set` 分支，保留其来源及本地文件名。
+/// release 只发布 `.db`，从 release 拼 `.srs` 会 404。
 #[test]
 fn cn_baseline_source_url_is_sagernet_rule_set() {
     let all = builtin_geo_rulesets();

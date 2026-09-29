@@ -83,7 +83,9 @@ impl ProxyRuntime {
     ) {
         let me = Arc::clone(self);
         // 与 ReassertSettledGuard 的 guard 重叠接棒：本行先 +1，前者随后 Drop -1，门全程不归零。
+        // 接管方式取**本平台生效值**（见 [`Self::flush_connections_once`] 守卫①的说明）。
         let network_settle = mode
+            .effective_on(self.helper.platform())
             .is_tun()
             .then(|| self.network_settle.begin("tun-post-start-flush"));
         tokio::spawn(async move {
@@ -139,6 +141,12 @@ impl ProxyRuntime {
     /// 2. **世代 + 核在跑**：延迟窗口内可能已被 stop / 重启接管，这一枪会打到**已经换掉的核**上，
     ///    把新核刚建立的连接全关掉。`connect` 本身是 await 点，故其后再复查一次。
     ///
+    /// 守卫①的接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）而不是磁盘上存的那个：
+    /// `proxy_mode_type` 在 Android 上的缺省值是 `systemProxy`，而那个平台只有 `VpnService` 的
+    /// tun fd 一种接管形态。照读裸值 ⇒ 全新安装的 Android 客户端起隧道后**这一枪永远不开**，
+    /// app 在 TUN 建立之前发起的连接继续沿物理网卡直出（真实 IP 已泄漏、且此后不会自愈），
+    /// 用户看到的是「已连接」。
+    ///
     /// 建连经 `connect` 注入（生产 = gRPC，单测 = 替身），使守卫、建连后复查与逐条关闭都能被行为测试
     /// 直接断言。
     pub(super) async fn flush_connections_with<A, F, Fut>(
@@ -152,7 +160,7 @@ impl ProxyRuntime {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<A, String>>,
     {
-        if !mode.is_tun() {
+        if !mode.effective_on(self.helper.platform()).is_tun() {
             return FlushOutcome::SkippedNotTun;
         }
         if self.gate.generation() != my_gen {

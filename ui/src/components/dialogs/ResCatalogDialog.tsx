@@ -27,6 +27,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { api } from '@/ipc';
+import { resourceUpdateOutcome } from '@/domain/resource-update-outcome';
 import type { RuleResourceCatalogItem, RuleResourceCatalogResult } from '@/contracts/types';
 import {
   categoryLabel,
@@ -207,18 +208,18 @@ export function ResCatalogDialog() {
   };
 
   const handleDownload = async () => {
-    if (downloadTargets.length === 0) return;
+    if (downloadTargets.length === 0 || downloading) return;
     setDownloading(true);
     try {
       const results = await api.ruleResources.download(
         downloadTargets.map((it) => ({ catalogId: it.id, name: it.name, category: it.category })),
       );
-      if (results.length === 0) {
+      const outcome = resourceUpdateOutcome(results, downloadTargets.length);
+      if (outcome.status === 'empty') {
         toast.error(t('resCatalog.errUnavailable'));
         return;
       }
-      const failed = results.filter((r) => !r.ok);
-      if (failed.length > 0) {
+      if (outcome.status !== 'success') {
         toast.error(
           t('resCatalog.downloadAllFailed'),
         );
@@ -237,12 +238,12 @@ export function ResCatalogDialog() {
     <Modal
       titleId="cat-dlg-title"
       title={t('resCatalog.title')}
-      onClose={close}
+      onClose={() => { if (!downloading) close(); }}
       icon={<CatalogIcon />}
       style={{ width: 'min(560px, 100%)' }}
       footer={
         <>
-          <button type="button" className="btn ghost" onClick={close}>
+          <button type="button" className="btn ghost" disabled={downloading} onClick={close}>
             {t('common.cancel')}
           </button>
           <button

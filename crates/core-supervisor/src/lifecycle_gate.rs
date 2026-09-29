@@ -74,7 +74,37 @@ pub struct PendingDrain {
 /// （Polaris 主线程同步 begin/end，await 仅发生在 begin/end 之间）。
 #[derive(Debug, Default)]
 pub struct LifecycleGate {
+    // Lock order for a generation publication is publication -> external
+    // runtime state locks -> inner. All generation writers acquire publication
+    // first, so a caller may commit status under inner, release inner and its
+    // state locks, then synchronously emit while still holding publication.
+    // Ordinary generation readers only take inner and remain callable by an
+    // event listener during that emission.
+    publication: Mutex<()>,
     inner: Mutex<Inner>,
+}
+
+/// A non-forgeable, synchronous proof that a lifecycle generation remains
+/// current. It holds the gate lock until the caller's closure returns. Never
+/// await, call another gate method, or perform IPC while holding this guard.
+pub struct LiveClaimGuard<'a> {
+    gate: &'a LifecycleGate,
+    inner: std::sync::MutexGuard<'a, Inner>,
+}
+
+impl LiveClaimGuard<'_> {
+    /// The guard is valid only for the gate that minted it.
+    pub fn belongs_to(&self, gate: &LifecycleGate) -> bool {
+        std::ptr::eq(self.gate, gate)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.generation
+    }
+
+    pub fn owner(&self) -> Option<LifecycleKind> {
+        self.inner.generation_owner
+    }
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +119,31 @@ struct Inner {
 }
 
 impl LifecycleGate {
+    /// Serialize a synchronous status/error publication with every generation
+    /// claim. Never claim/bump/try_begin_restart while holding this guard; the
+    /// publisher should release its own state locks before calling listeners.
+    pub fn lock_generation_publication(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.publication
+            .lock()
+            .expect("lifecycle publication lock poisoned")
+    }
+
+    /// Recheck a generation and execute one synchronous commit under the same
+    /// lock as Stop/Start claims. The closure may take the config write lock
+    /// and durably rename its document, but must not await or reenter this gate.
+    pub fn with_current_generation<T>(
+        &self,
+        expected: u64,
+        commit: impl FnOnce(&LiveClaimGuard<'_>) -> T,
+    ) -> Option<T> {
+        let inner = self.inner.lock().expect("lifecycle lock poisoned");
+        if inner.generation != expected {
+            return None;
+        }
+        let live = LiveClaimGuard { gate: self, inner };
+        Some(commit(&live))
+    }
+
     /// 进入一次 lifecycle 操作（beginLifecycleOp，:1522）。depth += 1。
     pub fn begin(&self) {
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
@@ -151,6 +206,7 @@ impl LifecycleGate {
 
     /// 生命周期世代 +1（start()/stop() 入口，:632/:1347）。返回新世代值。
     pub fn bump_generation(&self) -> u64 {
+        let _publication = self.lock_generation_publication();
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
         g.generation = g.generation.wrapping_add(1);
         g.generation_owner = None;
@@ -159,6 +215,7 @@ impl LifecycleGate {
 
     /// 同锁认领新世代。`expected` 有值时，旧 restart 只能在旧 stop 世代仍当权时接续 start。
     pub fn claim_generation(&self, expected: Option<u64>, owner: LifecycleKind) -> Option<u64> {
+        let _publication = self.lock_generation_publication();
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
         if expected.is_some_and(|expected| expected != g.generation) {
             return None;
@@ -176,6 +233,7 @@ impl LifecycleGate {
         expected_generation: u64,
         force_id: Option<u64>,
     ) -> Option<u64> {
+        let _publication = self.lock_generation_publication();
         let mut g = self.inner.lock().expect("lifecycle lock poisoned");
         if g.generation != expected_generation {
             return None;

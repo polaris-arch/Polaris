@@ -59,7 +59,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// 测速计时用 [`tokio::time::Instant`] 而非 `std::time::Instant`。
@@ -75,6 +75,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use polaris_config_engine::builder::level_to_string;
 use polaris_config_engine::builder::outbounds::effective_proxy_bind_interface;
+use polaris_config_engine::singbox::InboundUser;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::proxy_ports::control_api_port;
 use polaris_config_engine::user_config::server_config::ServerConfig;
@@ -84,7 +85,7 @@ use polaris_net_stack::subscription::server_fingerprint;
 
 use crate::events::channel::{EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT};
 use crate::response::ApiResponse;
-use crate::runtime::proxy::{ProxyRuntime, SpeedProbeTargets};
+use crate::runtime::proxy::{LocalHttpProxy, ProxyRuntime, SpeedProbeTargets};
 use crate::runtime::speedtest::{
     emit_speed_test_done, is_temp_core_superseded, plan_temp_core_with_bindings, InterruptReason,
     TempCoreDeps, TempCoreOutcome, TempCoreSession,
@@ -207,6 +208,26 @@ impl Drop for SpeedTestGuard {
     fn drop(&mut self) {
         SPEED_TEST_IN_FLIGHT.store(false, Ordering::Release);
     }
+}
+
+/// Process-local monotonic identity, encoded as a decimal string to avoid JS integer precision loss.
+/// Issued only after the command acquires the single-flight guard; never persisted across process restart.
+static SPEED_TEST_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_speed_test_run_id(sequence: &AtomicU64) -> Option<String> {
+    sequence
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+        .map(|previous| (previous + 1).to_string())
+}
+
+fn speed_test_run_payload(mut payload: Value, run_id: &str) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("runId".to_string(), Value::String(run_id.to_string()));
+    }
+    payload
 }
 
 /// 本波测速裁定（纯逻辑：请求集 × 当前活跃出口 × 本层可测范围 → 测谁 / 谁缺席 / 还是零可测）。
@@ -786,6 +807,7 @@ async fn run_temp_core_speed_test(
     state: &State<'_, AppRuntime>,
     config: &Value,
     server_ids: Option<Vec<String>>,
+    run_id: &str,
 ) -> ApiResponse<Value> {
     let url = resolve_speed_test_url(config);
     let all = all_server_ids(config);
@@ -813,17 +835,25 @@ async fn run_temp_core_speed_test(
     let plan = plan_temp_core_with_bindings(&servers, &proxy.core_build_env(), &bind_interfaces);
     if plan.testable.is_empty() {
         if !plan.system_interface_blocked.is_empty() {
-            let blocked_names: Vec<String> = servers
-                .iter()
-                .filter(|server| plan.system_interface_blocked.contains(&server.id))
-                .map(|server| server.name.clone())
-                .collect();
+            #[cfg(target_os = "android")]
             return ApiResponse::err_with_code(
+                "Android VPN mode cannot run a system-interface endpoint speed test",
+                crate::runtime::proxy::code::SYSTEM_INTERFACE_UNSUPPORTED,
+            );
+            #[cfg(not(target_os = "android"))]
+            {
+                let blocked_names: Vec<String> = servers
+                    .iter()
+                    .filter(|server| plan.system_interface_blocked.contains(&server.id))
+                    .map(|server| server.name.clone())
+                    .collect();
+                return ApiResponse::err_with_code(
                 polaris_config_engine::builder::system_interfaces::system_interface_ownership_error(
                     &blocked_names,
                 ),
                 crate::runtime::proxy::code::SYSTEM_INTERFACE_REQUIRES_HELPER,
             );
+            }
         }
         return ApiResponse::err_with_code(
             temp_core_none_testable_message(
@@ -855,6 +885,22 @@ async fn run_temp_core_speed_test(
     let privacy_mode = crate::commands::config::config_get_privacy_mode(State::clone(state))
         .data
         .unwrap_or(false);
+    #[cfg(target_os = "android")]
+    let temp_auth = match crate::commands::config::generate_local_api_secret() {
+        Ok(password) => InboundUser {
+            username: "polaris-temp".to_owned(),
+            password,
+        },
+        Err(error) => return ApiResponse::err_with_code(error, CODE_TEMP_CORE_FAILED),
+    };
+    #[cfg(target_os = "android")]
+    let deps = TempCoreDeps::production_android(
+        state.config().dir().to_path_buf(),
+        exclusions,
+        temp_core_log_level(config, privacy_mode),
+        temp_auth.clone(),
+    );
+    #[cfg(not(target_os = "android"))]
     let deps = TempCoreDeps::production(
         state.config().dir().to_path_buf(),
         exclusions,
@@ -867,10 +913,21 @@ async fn run_temp_core_speed_test(
         &superseded,
         |port| {
             let url = url.clone();
-            async move { measure_via_local_proxy(port, &url).await }
+            #[cfg(target_os = "android")]
+            let auth = temp_auth.clone();
+            async move {
+                #[cfg(target_os = "android")]
+                {
+                    measure_via_local_proxy(port, Some(&auth), &url).await
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    measure_via_local_proxy(port, None, &url).await
+                }
+            }
         },
         &mut |event, payload| {
-            let _ = app.emit(event, payload);
+            let _ = app.emit(event, speed_test_run_payload(payload, run_id));
         },
     )
     .await;
@@ -883,6 +940,7 @@ async fn run_temp_core_speed_test(
     not_in_pool.extend(missing);
     match outcome {
         TempCoreOutcome::Ran { results, outcome } => ApiResponse::ok(json!({
+            "runId": run_id,
             "results": results,
             "outcome": outcome,
             "notInPool": not_in_pool,
@@ -897,10 +955,24 @@ async fn run_temp_core_speed_test(
             CODE_TEMP_CORE_FAILED,
         ),
         TempCoreOutcome::Failed(e) => ApiResponse::err_with_code(e, CODE_TEMP_CORE_FAILED),
-        TempCoreOutcome::SystemInterfaceRequired(e) => ApiResponse::err_with_code(
-            e,
-            crate::runtime::proxy::code::SYSTEM_INTERFACE_REQUIRES_HELPER,
-        ),
+        TempCoreOutcome::CleanupUnknown(e) => ApiResponse::err_with_code(e, CODE_TEMP_CORE_FAILED),
+        TempCoreOutcome::SystemInterfaceRequired(e) => {
+            #[cfg(target_os = "android")]
+            {
+                let _ = e;
+                ApiResponse::err_with_code(
+                    "Android VPN mode cannot run a system-interface endpoint speed test",
+                    crate::runtime::proxy::code::SYSTEM_INTERFACE_UNSUPPORTED,
+                )
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                ApiResponse::err_with_code(
+                    e,
+                    crate::runtime::proxy::code::SYSTEM_INTERFACE_REQUIRES_HELPER,
+                )
+            }
+        }
         // 规模超限**必须**是独立的码：并进 `CODE_TEMP_CORE_FAILED` 就等于告诉用户「测速中断」，
         // 与就绪超时逐字相同，而两者的修法南辕北辙（一个是少选 naive 节点，一个是查网络/端口）。
         TempCoreOutcome::Oversized(e) => ApiResponse::err_with_code(e, CODE_TEMP_CORE_OVERSIZED),
@@ -918,13 +990,18 @@ pub async fn server_speed_test(
     server_ids: Option<Vec<String>>,
 ) -> Result<ApiResponse<Value>, ()> {
     let status = state.proxy().status();
-    // 核在跑却没有混合端口（分配失败的半态）→ 本层确实无从测：临时核腿在此形态下会被让位判据
-    // （`running == true`）当场掐掉，硬走只会空转一轮。如实 clean error，绝不回假延迟。
-    // **文案不得说「核未运行」**：核正跑着，缺的是混合端口。说反了会把用户支去点「连接」（他已经连着），
+    // 本机 http 代理入站（桌面 `mixed-in` / Android `probe-proxy-in`）的取址：本函数的回退腿用它测活跃出口。
+    let local_proxy = state.proxy().local_http_proxy();
+    // 核在跑却没有可用的本机 http 代理入站（分配失败的半态）→ 本层确实无从测：临时核腿在此形态下会被
+    // 让位判据（`running == true`）当场掐掉，硬走只会空转一轮。如实 clean error，绝不回假延迟。
+    // **文案不得说「核未运行」**：核正跑着，缺的是本地代理端口。说反了会把用户支去点「连接」（他已经连着），
     // 排查方向整个偏掉。
-    if status.running && status.mixed_port == 0 {
+    //
+    // 判据是 `local_http_proxy()` 而不是 `mixed_port == 0`：Android 不发射 mixed 入站、`mixed_port` 恒 0，
+    // 旧判据会让 Android 上**每一次**测速都在这里报「端口分配失败」（α 批修）。
+    if status.running && local_proxy.is_none() {
         return Ok(ApiResponse::err(
-            "代理核在运行但混合端口缺失（端口分配失败），本层无从测速：重启内核后重试",
+            "代理核在运行但本地代理端口缺失（端口分配失败），本层无从测速：重启内核后重试",
         ));
     }
     // 主核**正在启动**（`start` 已置在飞标记、核尚未就绪）→ 临时核腿视作「已被占用」，clean error。
@@ -952,6 +1029,10 @@ pub async fn server_speed_test(
         ));
     };
 
+    let Some(run_id) = next_speed_test_run_id(&SPEED_TEST_RUN_SEQUENCE) else {
+        return Ok(ApiResponse::err("测速运行序列已耗尽，请重启应用"));
+    };
+
     // 当前活跃节点 + 测速 URL（同步读；取值后不再借 state，避免跨 await 持有）。
     let config = state.config().current().unwrap_or_default();
 
@@ -960,7 +1041,7 @@ pub async fn server_speed_test(
     // 隔离/让位/收尾语义全在 `runtime::speedtest` 的模块文档（独立配置文件 + 独立端口 + 不写主核生命周期槽；
     // 主核一起来立刻让路）。
     if !status.running {
-        return Ok(run_temp_core_speed_test(&app, &state, &config, server_ids).await);
+        return Ok(run_temp_core_speed_test(&app, &state, &config, server_ids, &run_id).await);
     }
     let active = config
         .get("selectedServerId")
@@ -968,7 +1049,6 @@ pub async fn server_speed_test(
         .unwrap_or("")
         .to_string();
     let url = resolve_speed_test_url(&config);
-    let mixed = status.mixed_port;
     let all = all_server_ids(&config);
     let tailscale_ids = tailscale_server_ids(&config);
     let current_fingerprints = current_server_fingerprints(&config);
@@ -1003,7 +1083,10 @@ pub async fn server_speed_test(
             ts_pending: &ts_pending,
             ts_reasons: &ts_reasons,
         };
-        return Ok(run_pool_speed_test(&app, &proxy, &targets, &requested, &url, &prefilter).await);
+        return Ok(run_pool_speed_test(
+            &app, &proxy, &targets, &requested, &url, &prefilter, &run_id,
+        )
+        .await);
     }
 
     // ── 回退：探测池未注入（端口分配失败/回滚）→ 仅当前活跃出口经 mixed 口可测 ──
@@ -1045,17 +1128,25 @@ pub async fn server_speed_test(
     let gen0 = proxy.core_generation();
     let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running);
 
+    // 入口已判过 `running && local_proxy.is_none()` ⇒ 走到这里（running 为真）必有值；
+    // 仍按 `Option` 取而不 `expect`：判据写在别处，这里不押注它。
+    let Some(local_proxy) = local_proxy else {
+        return Ok(ApiResponse::err(
+            "代理核在运行但本地代理端口缺失（端口分配失败），本层无从测速：重启内核后重试",
+        ));
+    };
     let (results, outcome) = drive_fallback_measure(
         &active,
         &superseded,
-        || measure_via_local_proxy(mixed, &url),
+        || measure_via_local_proxy(local_proxy.port, local_proxy.auth.as_ref(), &url),
         &mut |event, payload| {
-            let _ = app.emit(event, payload);
+            let _ = app.emit(event, speed_test_run_payload(payload, &run_id));
         },
     )
     .await;
 
     Ok(ApiResponse::ok(json!({
+        "runId": run_id,
         "results": results,
         // completed：本次入参已全部裁定（测的测了、缺席的进 notInPool）；interrupted：被核跃迁/崩溃打断，
         // 该节点**缺席**（前端据此保留旧值，见 contracts/speed-test.ts SpeedTestOutcome）。
@@ -1165,6 +1256,7 @@ async fn run_pool_speed_test(
     requested: &[String],
     url: &str,
     prefilter: &PoolPrefilter<'_>,
+    run_id: &str,
 ) -> ApiResponse<Value> {
     let k = targets.pool_ports.len();
     let PoolPartition {
@@ -1206,16 +1298,19 @@ async fn run_pool_speed_test(
         |slot, tag: String| async move { proxy.probe_select_slot(slot, &tag).await },
         |port| {
             let url = url.to_string();
-            async move { measure_via_local_proxy(port, &url).await }
+            // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
+            let auth = targets.auth.clone();
+            async move { measure_via_local_proxy(port, auth.as_ref(), &url).await }
         },
         &mut |event, payload| {
-            let _ = app.emit(event, payload);
+            let _ = app.emit(event, speed_test_run_payload(payload, run_id));
         },
         targets.pool_ports.as_slice(),
     )
     .await;
 
     ApiResponse::ok(json!({
+        "runId": run_id,
         "results": results,
         // completed：本次入参已全部裁定（在池的测了、notInPool 如实缺席）；interrupted：被核跃迁/崩溃打断，
         // 未测节点**缺席**（前端据此保留旧值，见 contracts/speed-test.ts SpeedTestOutcome）。
@@ -1270,7 +1365,9 @@ pub(crate) async fn probe_runtime_candidates(
         |slot, tag: String| async move { proxy.probe_select_slot(slot, &tag).await },
         |port| {
             let url = url.to_string();
-            async move { measure_via_local_proxy(port, &url).await }
+            // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
+            let auth = targets.auth.clone();
+            async move { measure_via_local_proxy(port, auth.as_ref(), &url).await }
         },
         &mut |_, _| {},
         targets.pool_ports.as_slice(),
@@ -1601,12 +1698,19 @@ pub(crate) async fn measure_warm_ttfb<T: WarmTunnel>(
 /// URL 解析失败 → `None`：`resolve_speed_test_url` 已保证传进来的一定可解析（不可解析的用户值在那里
 /// 就回落成默认端点了），故这条腿实际不可达；即便到达也**不伪造数值**（上层记 -1）。
 /// 超时 / 传输错 / 非 2xx → None（上层记 -1，绝不伪造数值）。
-async fn measure_via_local_proxy(proxy_port: u16, url: &str) -> Option<u32> {
+///
+/// `auth`：该入站要求的凭据（Android 主核的 `probe-in-k` / `probe-proxy-in`：本次起核的一次性凭据；
+/// 桌面主核与临时核：`None`，那些入站零认证）。必填参数：每个调用点在编译期回答「我拿的是哪一份」。
+async fn measure_via_local_proxy(
+    proxy_port: u16,
+    auth: Option<&InboundUser>,
+    url: &str,
+) -> Option<u32> {
     let target = SpeedTestTarget::parse(url)?;
     measure_warm_ttfb(
         Duration::from_millis(SPEED_TEST_COLD_TIMEOUT_MS),
         Duration::from_millis(SPEED_TEST_REUSE_TIMEOUT_MS),
-        open_tunnel(proxy_port, &target),
+        open_tunnel(proxy_port, auth, &target),
     )
     .await
 }
@@ -1624,17 +1728,18 @@ async fn measure_via_local_proxy(proxy_port: u16, url: &str) -> Option<u32> {
 /// 四条件**全真**才 fire（对齐 oracle：只在隧道已热、有真实出站时伴测，绝不冷隧道 / 无出口虚高）：
 /// - `proxy_probed`：代理出口 IP 探测**探到值**（对齐 上游 `proxyProbed`；探测失败 / 直判无效 → 不测）；
 /// - `running`：核在跑（无核 = 无出站可测）；
-/// - `mixed_port != 0`：主混合端口有效（伴测经此口出网）；
+/// - `proxy_port != 0`：本机 http 代理入站有效（伴测经此口出网；桌面 `mixed-in`，Android `probe-proxy-in`，
+///   取自 [`crate::runtime::proxy::ProxyRuntime::local_http_proxy`]）；
 /// - active 非空且非直连（[`DIRECT_SERVER_ID`]）：直连 / 未选节点无真实出站，无从伴测。
 ///
 /// 返回 `Some(active_id)`（写 `EVENT_SPEED_TEST_RESULT.serverId` 的键）/ `None`（本轮不测）。
 fn plan_warm_rtt_probe(
     proxy_probed: bool,
     running: bool,
-    mixed_port: u16,
+    proxy_port: u16,
     active: &str,
 ) -> Option<String> {
-    if !proxy_probed || !running || mixed_port == 0 {
+    if !proxy_probed || !running || proxy_port == 0 {
         return None;
     }
     if has_no_real_exit(active) {
@@ -1665,7 +1770,7 @@ pub(crate) fn spawn_warm_rtt_probe(
     config: &Value,
     proxy_probed: bool,
     running: bool,
-    mixed_port: u16,
+    local_proxy: Option<LocalHttpProxy>,
     epoch: u64,
     seq: u64,
 ) {
@@ -1673,14 +1778,21 @@ pub(crate) fn spawn_warm_rtt_probe(
         .get("selectedServerId")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let Some(active_id) = plan_warm_rtt_probe(proxy_probed, running, mixed_port, active) else {
+    let proxy_port = local_proxy.as_ref().map_or(0, |p| p.port);
+    let Some(active_id) = plan_warm_rtt_probe(proxy_probed, running, proxy_port, active) else {
+        return;
+    };
+    // `plan_warm_rtt_probe` 放行 ⟹ `proxy_port != 0` ⟹ `local_proxy` 为 `Some`。
+    let Some(local_proxy) = local_proxy else {
         return;
     };
     let url = resolve_speed_test_url(config);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         // 失败 → None → 不 emit（保留旧徽标、绝不伪造 -1）；成功 → 广播让 UI 延迟徽标自动刷新。
-        if let Some(latency) = measure_via_local_proxy(mixed_port, &url).await {
+        if let Some(latency) =
+            measure_via_local_proxy(local_proxy.port, local_proxy.auth.as_ref(), &url).await
+        {
             // 🔵 **emit 前复查出口 IP 探测上下文**：`active_id` 取自**开探时刻**的 config 快照，而本
             // 测量是异步的（秒级）。测量期间起停 / 热切会换掉出口，此刻的 `latency` 量的是**新**出口，
             // 写进 `active_id` 就是把新节点的 RTT 记到旧节点头上 —— 而延迟徽标是用户选节点的依据，

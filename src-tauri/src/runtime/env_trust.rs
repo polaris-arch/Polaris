@@ -183,7 +183,7 @@ fn contained_in_trusted_roots(path: &Path, roots: &[PathBuf]) -> Option<PathBuf>
 
 /// 本进程的可信来源根（顺序无关，判据是「落在其中任一个之内」）。
 fn trusted_roots(scope: TrustScope) -> Vec<PathBuf> {
-    // app 自有数据目录 = `core_paths` 的基目录（`main.rs` 启动期注入的 `<app_config_dir>/polaris`，
+    // app 自有数据目录 = `core_paths` 的基目录（`lib.rs` 启动期注入的 `<app_config_dir>/polaris`，
     // 注入点排在 `AppRuntime::new` 之前）。未注入（单测 / 子进程 / 异常启动路径）⇒ 这一根缺席，
     // containment 只会更严、不会更松。
     let mut roots: Vec<PathBuf> = crate::runtime::core_paths::base_dir()

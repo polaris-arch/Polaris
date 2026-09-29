@@ -3,7 +3,7 @@
  *
  * # 背景：一个已经咬过人的假门
  *
- * 本仓的判据面**横跨 Rust 与前端两侧**：`main.rs` 遍历整棵 `ui/src`、`i18n.rs`
+ * 本仓的判据面**横跨 Rust 与前端两侧**：`lib.rs` 遍历整棵 `ui/src`、`i18n.rs`
  * `include_str!` 五个 locale、`config.rs` 读 App.tsx / TrayMenu.tsx 等前端源码；反向地，
  * 约 30 个前端测试文件读 `src-tauri/` 与 `crates/` 的 Rust 源码
  * 当判据。于是两个 workflow 的 push 过滤器**都不得 ignore 对侧的树**，也没理由 ignore
@@ -79,7 +79,7 @@ describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 i
     for (const banned of ['ui/**', 'src-tauri/**', 'crates/**', '.github/**']) {
       expect(
         entries.includes(banned),
-        `ci.yml 的 paths-ignore 含 ${banned} —— Rust 判据面横跨 ui/（main.rs 遍历 ui/src、` +
+        `ci.yml 的 paths-ignore 含 ${banned} —— Rust 判据面横跨 ui/（lib.rs 遍历 ui/src、` +
           `i18n.rs include_str! locale），ignore 它就造出「纯 UI 改动 Rust 门零 run」的假门（CI-5 实证形态）`,
       ).toBe(false);
     }

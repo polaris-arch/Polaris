@@ -20,10 +20,11 @@
 //! - [`aggregate_signature`] = aggregateSignature（connections-aggregate.ts:99）。
 
 use polaris_config_engine::builder::is_probe_pool_inbound_tag;
+use std::collections::BTreeMap;
 
 use crate::types::{
     ConnectionAggFlow, ConnectionAggHost, ConnectionAggOutbound, ConnectionCounters,
-    ConnectionEntry, ConnectionEventType, ConnectionMetadata, ConnectionsAggregate,
+    ConnectionEntry, ConnectionEventType, ConnectionMetadata, ConnectionsAggregate, RuleIdentity,
     SingBoxConnection, SingBoxConnectionEvent, SingBoxConnectionEvents, SingBoxStatus,
     TrafficStats, CONNECTION_RANKING_LIMIT, TOPOLOGY_OTHERS_KEY,
 };
@@ -88,6 +89,8 @@ const CONNECTION_ADDRESS_PART_MAX_BYTES: usize = 128;
 const CONNECTION_KIND_MAX_BYTES: usize = 256;
 const CONNECTION_PROCESS_PATH_MAX_BYTES: usize = 4096;
 const CONNECTION_RULE_MAX_BYTES: usize = 1024;
+const CONNECTION_RULE_ID_MAX_BYTES: usize = 256;
+const CONNECTION_RULE_NAME_MAX_BYTES: usize = 512;
 const CONNECTION_CHAIN_MAX_ITEMS: usize = 16;
 const CONNECTION_CHAIN_ITEM_MAX_BYTES: usize = 256;
 const TRUNCATION_MARK: &str = "…";
@@ -227,6 +230,8 @@ pub fn trim_connection(c: &SingBoxConnection) -> ConnectionEntry {
             .map(|chain| bounded_display_string(chain, CONNECTION_CHAIN_ITEM_MAX_BYTES))
             .collect(),
         rule: bounded_display_string(&c.rule, CONNECTION_RULE_MAX_BYTES),
+        rule_id: None,
+        rule_name: None,
         metadata: metadata_non_empty.then_some(metadata),
         upload: Some(c.uplink_total as u64),
         download: Some(c.downlink_total as u64),
@@ -662,6 +667,8 @@ pub struct StatsAggregator {
     snapshot: TrafficStats,
     /// 连接事件只在入表时裁剪一次；不保留 gRPC 原始对象中 UI/拓扑永远不会读取的字段。
     conn_map: indexmap::IndexMap<String, ConnectionEntry>,
+    /// 仅从已启动核的配置建立；给新连接冻结身份，配置后续保存不回写旧条目。
+    named_rules: BTreeMap<String, RuleIdentity>,
     /// max conn map size（OOM 安全网，默认 [`MAX_CONN_MAP_SIZE`]；测试可注入小值）。
     max_conn_map_size: usize,
     /// 速率差分基线：`(上一帧 at_ms, 该帧 uplink_total, 该帧 downlink_total)`。
@@ -688,6 +695,7 @@ impl StatsAggregator {
         Self {
             snapshot: TrafficStats::zeroed(),
             conn_map: indexmap::IndexMap::new(),
+            named_rules: BTreeMap::new(),
             max_conn_map_size,
             last_status: None,
         }
@@ -712,6 +720,27 @@ impl StatsAggregator {
     /// detail 真正要 emit 时克隆；aggregate 走借用迭代器，完全不克隆整表。
     pub fn entries(&self) -> Vec<ConnectionEntry> {
         self.conn_map.values().cloned().collect()
+    }
+
+    pub fn set_named_rules(&mut self, named_rules: BTreeMap<String, RuleIdentity>) {
+        self.named_rules = named_rules;
+    }
+
+    fn trim_with_rule_name(&self, c: &SingBoxConnection) -> ConnectionEntry {
+        let mut entry = trim_connection(c);
+        // 截断后的 raw 不能拿来配键：不同长条件会撞到同一个显示前缀。
+        if c.rule.len() <= CONNECTION_RULE_MAX_BYTES {
+            if let Some(identity) = self.named_rules.get(&c.rule) {
+                // 不截断身份：不同超长名称可能有相同前缀，截断后合组会伪造归属。
+                if identity.id.len() <= CONNECTION_RULE_ID_MAX_BYTES
+                    && identity.name.len() <= CONNECTION_RULE_NAME_MAX_BYTES
+                {
+                    entry.rule_id = Some(identity.id.clone());
+                    entry.rule_name = Some(identity.name.clone());
+                }
+            }
+        }
+        entry
     }
 
     /// 按 id 借用活动连接。CLOSED 帧若省略完整 payload，已结束历史可在删表前用它补齐最终展示字段。
@@ -874,7 +903,7 @@ impl StatsAggregator {
                     // 落到「表里没有」这一支——若此处不挡，只要内核在 UPDATE 里带上 connection，
                     // NEW 侧的过滤就被 100% 抵消（不是边角情形，是每条探测连接的必经路径）。
                     if !is_probe_pool_inbound_tag(&c.inbound) {
-                        let mut entry = trim_connection(c);
+                        let mut entry = self.trim_with_rule_name(c);
                         entry.id.clone_from(&id);
                         self.conn_map.insert(id, entry.clone());
                         change.upsert(entry);
@@ -897,7 +926,7 @@ impl StatsAggregator {
                 // 会以为这里多了一条——是 上游的既有缺陷，移植目标是功能对等而非缺陷对等。
                 if let Some(c) = &ev.connection {
                     if c.closed_at <= 0 && !is_probe_pool_inbound_tag(&c.inbound) {
-                        let mut entry = trim_connection(c);
+                        let mut entry = self.trim_with_rule_name(c);
                         entry.id.clone_from(&id);
                         self.conn_map.insert(id, entry.clone());
                         change.upsert(entry);

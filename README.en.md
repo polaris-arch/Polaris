@@ -133,7 +133,12 @@ This software is provided "as is", with no promise of network availability, anon
 
 ## License
 
-MIT (see `LICENSE`). sing-box (GPLv3) is integrated as a sidecar child process (mere aggregation) and does not affect this project's license; third-party components are listed in `NOTICE`.
+Polaris's own source is MIT (see `LICENSE`). **The terms a built artifact ships under differ by platform:**
+
+- **Desktop (Windows / macOS / Linux): MIT.** sing-box (GPLv3) is integrated as a sidecar child process, which under the mere-aggregation position leaves this project's license unaffected. **That position is untested in court** — see `NOTICE`.
+- **Android: GPLv3 as a whole.** There, sing-box can only run as libbox loaded into the application process (the tun descriptor is reachable only through an in-process interface), so mere aggregation does not apply; the Kotlin layer is additionally ported from the GPLv3 sing-box-for-android. Taking the APK gives you GPLv3; taking this repository's MIT source files alone still gives you MIT.
+
+Third-party components and the full reasoning are in `NOTICE`.
 
 ## Star History
 

@@ -31,6 +31,7 @@
  * 新增/挪走一个调用点则必然转红。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -48,7 +49,10 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
     if (e.isDirectory()) sourceFiles(p, out);
-    else if (/\.tsx?$/.test(e.name) && !/\.(test|spec)\.tsx?$/.test(e.name)) out.push(p);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (/\.tsx?$/.test(e.name) && !IS_TEST_ONLY_MODULE.test(e.name)) out.push(p);
   }
   return out;
 }
@@ -61,9 +65,9 @@ const CALL = /\bapi\s*\.\s*(server|rules|subscription)\s*\.\s*(\w+)/g;
 const RENDERS_EFFECTIVE = /useEffectiveServers|useEffectiveRules|use-node-deletion|use-node-subscription-actions|use-node-speed-test/;
 /** 同上，路径匹配腿（这些文件不 import useEffective*，靠调用方注入 effective/disk 投影）：
  *  use-node-deletion/use-node-subscription-actions/use-node-speed-test 是既有三家；
- *  use-node-actions.ts（5B）、rule-submit.ts（5C）是 2026-08-30 拆分新增的两家，同一条判据。 */
+ *  use-node-actions.ts（5B）、rule-submit.ts（5C）与移动窗口 use-mobile-speed-test（2026-09-27）同样接 caller 的实体投影，同一条判据。 */
 const EXTRACTED_OWNER_PATH =
-  /components[\\/](?:screens[\\/]nodes[\\/]use-node-(?:deletion|subscription-actions|speed-test|actions)|dialogs[\\/]rule-submit)\.ts$/;
+  /components[\\/](?:screens[\\/]nodes[\\/]use-node-(?:deletion|subscription-actions|speed-test|actions)|dialogs[\\/]rule-submit)\.ts$|mobile[\\/]use-mobile-speed-test\.ts$/;
 
 interface Call {
   readonly file: string;
@@ -117,6 +121,10 @@ interface ActionSite {
 }
 
 const SITES: readonly ActionSite[] = [
+  { file: 'mobile/use-mobile-speed-test.ts', callee: 'api.server.onSpeedTestProgress', count: 1, route: 'no-staged-only-id', why: '不传实体 id：窗口级事件订阅只收后端真实帧；结果/进度不是按 staged 实体寻址的命令' },
+  { file: 'mobile/use-mobile-speed-test.ts', callee: 'api.server.onSpeedTestResult', count: 1, route: 'no-staged-only-id', why: '不传实体 id：窗口级事件订阅只收后端真实帧；结果/进度不是按 staged 实体寻址的命令' },
+  { file: 'mobile/use-mobile-speed-test.ts', callee: 'api.server.onSpeedTestDone', count: 1, route: 'no-staged-only-id', why: '不传实体 id：窗口级事件订阅只收后端真实帧；结果/进度不是按 staged 实体寻址的命令' },
+
   // ── 已裁定 ──
   {
     file: 'components/screens/nodes/use-node-deletion.ts',
@@ -141,6 +149,14 @@ const SITES: readonly ActionSite[] = [
     route: 'ruled',
     op: 'server.speedTest',
     why: 'staged-only 在卡上置灰（speedTestBlockReason 第三参）并从三个批量候选集里排掉（speedTestableIds 第三参）',
+  },
+  {
+    file: 'mobile/use-mobile-speed-test.ts',
+    callee: 'api.server.speedTest',
+    count: 1,
+    route: 'ruled',
+    op: 'server.speedTest',
+    why: '移动窗口 coordinator 统一首页当前/全部与节点单项/批量请求；调用方沿 speedTestBlockReason/stagedOnlyIds 与 speedTestableIds 排除未保存节点，首页 planAllHomeSpeedTest 也只交磁盘节点。真实 IPC 仅此一处，守卫由 nodes-speedtest-wiring/home-speedtest 目标覆盖',
   },
   // 2026-07-30 行内删除落地后**仍是 1 处**：规则列表的行内垃圾桶与规则弹窗 footer 那颗共用
   // `useRuleDelete` 这一条腿（本文件即那条腿），没有第二个 `api.rules.delete` 调用点。
@@ -263,6 +279,137 @@ const SITES: readonly ActionSite[] = [
     route: 'no-staged-only-id',
     why: '仅取磁盘镜像或本次新建的 id：取消使用由提交计划生成的 activeRequest 或 server.id',
   },
+  // 移动端登录与桌面共用提交计划；既有身份从磁盘 servers 寻址，新身份先 mint 再保存。
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id：仅保存 planTsLoginSubmit 新建的节点；effective 集合只用于名称候选',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：既有节点从 servers.find(serverId) 取得',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.tailscaleGetStatus',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id：无参调用读取整机 TS 状态快照',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.tailscaleLoginPrepare',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：prepare 使用提交计划生成的 server.id',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.tailscaleStateExists',
+    count: 2,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：只校验提交计划生成的 server.id',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.tailscaleLogout',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：清理提交计划中的节点身份',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.tailscaleLogin',
+    count: 2,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：登录对象先保存再使用',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.tailscaleLoginCancel',
+    count: 2,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：取消只使用本次提交生成的 request.serverId 或 server.id',
+  },
+
+  // ── 移动端表单宿主与节点面（2026-09-06 批 2）。逐条与桌面同形腿的裁定**逐字一致** ──
+  {
+    file: 'mobile/nodes/node-deletion.ts',
+    callee: 'api.server.delete',
+    count: 1,
+    route: 'ruled',
+    op: 'server.delete',
+    why: '与桌面 use-node-deletion 同一条：先过 splitStagedOnly（staged-only ⇒ 撤销条目），盘上节点按 partitionNodeDeleteRoutes 分流，直落盘那支才走本调用',
+  },
+  {
+    file: 'mobile/nodes/node-deletion.ts',
+    callee: 'api.server.deleteBatch',
+    count: 1,
+    route: 'ruled',
+    op: 'server.deleteBatch',
+    why: '批量：与桌面同一条，staged-only 走撤销、盘上节点按策略分流，只有 directIds 非空才发这一次',
+  },
+  {
+    file: 'mobile/nodes/node-deletion.ts',
+    callee: 'api.subscription.delete',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（editRoute("subscriptions") 命中即 stage 订阅 + 同组 stageServerDeletions 并 return）；订阅新增/更新是远端直写，不存在 staged-only 订阅 id',
+  },
+  {
+    file: 'mobile/forms/NodeFormPanel.tsx',
+    callee: 'api.server.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达；新建腿不传已有实体 id（与 NodeDialog 逐字同形）',
+  },
+  {
+    file: 'mobile/forms/NodeFormPanel.tsx',
+    callee: 'api.server.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（同一 submit 里 editRoute 命中即 stage + return）',
+  },
+  {
+    file: 'mobile/forms/NodeFormPanel.tsx',
+    callee: 'api.server.tailcatKeypair',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id：只传表单里的私钥串（可空），后端纯计算密钥对，不读不写配置（与 NodeDialog 同形）',
+  },
+  {
+    file: 'mobile/forms/ImportFormPanel.tsx',
+    callee: 'api.server.addBulk',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（命中即逐节点 stage 并跳过本调用）；且它建新节点、不按已有 id 寻址',
+  },
+  {
+    file: 'mobile/forms/TsExitPanel.tsx',
+    callee: 'api.server.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（同一 save 里 editRoute 命中即 stage + return）',
+  },
+  {
+    file: 'mobile/forms/TsExitPanel.tsx',
+    callee: 'api.server.tailscaleGetStatus',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id（无参调用，拉的是整机 TS 状态快照，同 TsSettingsDialog）',
+  },
+  {
+    file: 'mobile/nodes/MobileNodesScreen.tsx',
+    callee: 'api.server.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '克隆腿：staged 分流后不可达（editRoute 命中即 stage 一条新 id 的条目并跳过）；克隆恒建新实体，剥掉了源节点的 id',
+  },
   {
     // 提交逻辑（含这两个调用点）2026-08-30 随 5C 拆分外提到 rule-submit.ts，登记跟着落点走。
     file: 'components/dialogs/rule-submit.ts',
@@ -294,6 +441,14 @@ const SITES: readonly ActionSite[] = [
     route: 'no-staged-only-id',
     why: 'staged 分流后不可达（「加入已有规则」追加腿，editRoute 命中即 stage + 不发 IPC）；开关关着时暂存条目恒空 ⇒ 也不存在 staged-only 规则',
   },
+  // ── 移动端连接屏 / 新建规则表（批 13）：与上面两条逐条同形，依据因此逐条相同 ──
+  {
+    file: 'mobile/connections/MobileConnectionsScreen.tsx',
+    callee: 'api.rules.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（「加入已有规则」追加腿，editRoute 命中即 stage + 不发 IPC）；开关关着时暂存条目恒空 ⇒ 也不存在 staged-only 规则',
+  },
   {
     file: 'components/screens/rules/RulesScreen.tsx',
     callee: 'api.rules.add',
@@ -315,6 +470,44 @@ const SITES: readonly ActionSite[] = [
     route: 'no-staged-only-id',
     why: 'staged 分流后不可达（顺序条目走 entityPath 单段，不下发 id）',
   },
+  // ── 移动端首页「给这个主机加一条规则」面板：两条腿与桌面
+  //    `ConnectionTopology#addSubjectRule` / `RuleSubjectMenuItems#append` 逐条同形 ──
+  {
+    file: 'mobile/home/MobileHomeScreen.tsx',
+    callee: 'api.rules.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（editRoute 命中即 stage 一条自铸 id 的新条目并跳过 IPC）；新建腿不传已有实体 id',
+  },
+  {
+    file: 'mobile/home/MobileHomeScreen.tsx',
+    callee: 'api.rules.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（「合并进已有规则」追加腿，同桌面 RuleSubjectMenuItems）；开关关着时暂存条目恒空 ⇒ 也不存在 staged-only 规则',
+  },
+  // ── 移动端「规则」屏：三条腿与桌面 RulesScreen 逐条同形，依据因此逐条相同 ──
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    callee: 'api.rules.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（行内复制腿，editRoute 命中即 stage + return）',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    callee: 'api.rules.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（开关切换腿）',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    callee: 'api.rules.reorder',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（顺序条目走 entityPath 单段，不下发 id）',
+  },
   {
     // cloneServer/copyLink/copyLinksBatch（含下面两条的调用点）2026-08-30 随 5B 拆分外提到
     // use-node-actions.ts，登记跟着落点走。
@@ -330,6 +523,13 @@ const SITES: readonly ActionSite[] = [
     count: 2,
     route: 'no-staged-only-id',
     why: '不传实体 id：api-client 传的是整个 ServerConfig 对象（`{ server }`），后端不按 id 查盘',
+  },
+  {
+    file: 'mobile/nodes/MobileNodesScreen.tsx',
+    callee: 'api.server.generateUrl',
+    count: 2,
+    route: 'no-staged-only-id',
+    why: '不传实体 id：传的是整个 ServerConfig 对象（`{ server }`），后端不按 id 查盘。单条 + 批量共两处',
   },
   /* `api.server.onSpeedTestProgress` 曾在此登记（NodesScreen 自订、渲染屏内进度行）。
      2026-07-31 进度改全局 sticky toast 后订阅上移到 `App.tsx` 的全局订阅层 —— 那个文件不在本门的
@@ -398,6 +598,75 @@ const SITES: readonly ActionSite[] = [
     route: 'ruled',
     op: 'warp.edit',
     why: '更新的是一台**已注册**的远端设备（本文件无 editRoute，写侧四条腿恒 direct/W-3）；staged-only 节点必须挡住',
+  },
+
+  /* ── 移动端组网三张表（2026-09-06 批 3）。逐条与桌面同形腿的裁定**逐字一致** —— 两端对
+        「这次调用会不会拿到一个盘上没有的 id」给出两种答案，就是两种可复现的失败。 ── */
+  {
+    file: 'mobile/forms/WgPanel.tsx',
+    callee: 'api.server.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达；新建腿不传已有实体 id（与 WgDialog 逐字同形）',
+  },
+  {
+    file: 'mobile/forms/WgPanel.tsx',
+    callee: 'api.server.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（同一 submit 里 editRoute 命中即 stage + return）',
+  },
+  {
+    file: 'mobile/forms/TsSettingsPanel.tsx',
+    callee: 'api.server.update',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: 'staged 分流后不可达（同 TsSettingsDialog）',
+  },
+  {
+    file: 'mobile/forms/TsSettingsPanel.tsx',
+    callee: 'api.server.tailscaleGetStatus',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id（无参调用，拉的是整机 TS 状态快照，同 TsSettingsDialog）',
+  },
+  {
+    file: 'mobile/forms/TsSettingsPanel.tsx',
+    callee: 'api.server.tailscaleLogout',
+    count: 2,
+    route: 'ruled',
+    op: 'server.tailscaleLogout',
+    why: '正常登出与主核持有时用户确认断开后的第二次登出均清磁盘 TS state；staged-only 节点必须挡住并提示先保存，后者还复核节点仍在磁盘镜像中并由原生 writer gate 兜底',
+  },
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    callee: 'api.server.registerWarp',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id（只传 license，返回一份 WireGuard 草稿），同 WarpDialog',
+  },
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    callee: 'api.server.add',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '注册腿：不传实体 id（后端落盘那一刻才发 id）。WARP 的写腿恒 bypass/W-2，不经暂存（同 WarpDialog）',
+  },
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    callee: 'api.server.applyWarpLicense',
+    count: 1,
+    route: 'ruled',
+    op: 'warp.edit',
+    why: '同 WarpDialog：向 Cloudflare 提交 license 当场改远端账户等级（W-3 不可逆）；staged-only 节点没有可更新的远端设备',
+  },
+  {
+    file: 'mobile/forms/WarpPanel.tsx',
+    callee: 'api.server.update',
+    count: 1,
+    route: 'ruled',
+    op: 'warp.edit',
+    why: '同 WarpDialog：更新的是一台**已注册**的远端设备；staged-only 节点由同一次提交里的 splitStagedOnly 前置挡住',
   },
 ];
 
@@ -483,11 +752,25 @@ describe('A2：每条登记说得出因由，且与策略表对得上', () => {
 
   it('组网远端动作的 block 理由必须明示覆盖 staged-only 实体', () => {
     // 普通节点删除已可暂存，因此 TS/WARP 实体也能够以 staged-only 形态存在。
-    // 这四条远端登录/注销腿必须继续 block，且理由不得再借用「今天走不到」的旧前提。
+    // 这几条远端登录/注销腿必须继续 block，且理由不得再借用「今天走不到」的旧前提。
     // `server.speedTest` 同样是 block，但它不属于远端账户动作，不在此列。
+    //
+    // 🔴 **2026-09-06（批 3）从「数个数」换成「逐条对差」**：移动端组网表落地后这一族从 4 条
+    // 涨到 7 条，而个数式断言只会说「4 变成了 7」，说不出**多了哪条、少了哪条**。
+    // 逐条清单严格更强：个数变了它必红，个数没变而某一条被换成另一条它同样红。
     const PREVENTIVE = new Set(['server.tailscaleLogout', 'warp.edit']);
     const rows = SITES.filter((x) => x.op !== undefined && PREVENTIVE.has(x.op));
-    expect(rows.length, '组网单例那四条腿被悄悄改路由或删掉').toBe(4);
+    expect(rows.map(key).sort(), '组网单例那几条腿被悄悄改路由 / 删掉 / 换了一条').toEqual(
+      [
+        'components/dialogs/TsSettingsDialog.tsx | api.server.tailscaleLogout',
+        'components/dialogs/WarpDialog.tsx | api.server.applyWarpLicense',
+        'components/dialogs/WarpDialog.tsx | api.server.update',
+        'components/screens/nodes/NodesScreen.tsx | api.server.tailscaleLogout',
+        'mobile/forms/TsSettingsPanel.tsx | api.server.tailscaleLogout',
+        'mobile/forms/WarpPanel.tsx | api.server.applyWarpLicense',
+        'mobile/forms/WarpPanel.tsx | api.server.update',
+      ].sort(),
+    );
     for (const s of rows) {
       expect(stagedOnlyStrategyOf(s.op!), `${key(s)} 不再是 block`).toBe('block');
       expect(s.why, `${key(s)} 没有说明 staged-only 实体的处理`).toMatch(/staged-only/);

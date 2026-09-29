@@ -649,6 +649,12 @@ jobs:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture --test-threads=1
 
+      - name: Managed mesh multi-answer CONNECT runtime gate
+        if: env.POLARIS_RUN_KERNEL_GATES == '1'
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture
+
       - name: Fetch sing-box dashboard
         run: node scripts/fetch-dashboard.mjs
 

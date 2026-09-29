@@ -1,0 +1,245 @@
+/*
+ * `tokens.resolved.css` —— 移动端**唯一** token 入口（契约 A1）。
+ *
+ * 契约与门规格：`~/docs/polaris/design/polaris-mobile-platform-evaluation-2026-08-29.md` §6.3
+ * （§6.3.1 桌面视觉真值链 / §6.3.3 契约 A·B·C / §6.3.5 门的五条）。
+ * 设计文档：`~/docs/polaris/design/polaris-mobile-token-entry-2026-09-04.md`。
+ *
+ * ── 这个文件解决什么 ────────────────────────────────────────────────────────
+ * 桌面 token 的最终取值**不在 `tokens.css`**。`index.css` 的 @import 序是
+ * tailwindcss → fonts.css → tokens.css → components.css → screens.css → prototype.css，
+ * 其后才是 index.css 自有规则：`prototype.css` 自带一整套同选择器的 `:root` token 压过
+ * `tokens.css`，`index.css` 又在全部 @import 之后把四个语义色与 `--sans` 压回来。
+ * 移动端按直觉只 `@import './tokens.css'` 会拿到**中间层**的值 —— 四个语义色高 5~9 个明度点、
+ * 丢掉桌面为 WCAG AA 做的对比度校准、`--sans` 里没有 Android 可用的中文族。
+ * **这个偏差不会有任何报错**，只会在真机上看起来「差不多」。
+ *
+ * 本文件把那条四层层叠**塌缩成扁平终值**，移动端只读这一份。选 A1 而不是 A2（复用 index.css
+ * 整条链）的理由：A2 会把 prototype.css 那 1626 行桌面组件 CSS 一起带进移动端包，而移动端
+ * 需要的只是它参与压出来的**终值**。
+ *
+ * ── 取值从哪来、怎么防漂 ────────────────────────────────────────────────────
+ * 取值不是手抄 `tokens.css`，而是**桌面层叠链实跑终值**，由
+ * `ui/src/styles/mobile-token-parity.test.ts` 双向钉住：
+ *   ① 该门先用一个带 @media 归属的 CSS 走查器解析桌面五个文件，把结果对拍文件内的 `BASELINE`；
+ *   ② 再用**同一个**走查器解析本文件，四条腿（`:root` / 跟随系统深色 / 显式深色 / 显式浅色）
+ *      与 `BASELINE` 逐值相等，多出来的 token 必须命中契约 C 白名单。
+ * 也就是说：桌面改了 token 而这里没跟，或这里改了取值，门都会红。**手改本文件的既有取值即违约**
+ * （契约 C：只许加，不许改）；桌面 token 有意演进时，先落桌面侧，再同步本文件与 `BASELINE`。
+ *
+ * ⚠️ **取值形态要逐字照抄胜出那条声明**，不是「同义即可」。门比的是声明原文（空白折叠后）：
+ *   · `--disp` / `--mono` 是 `prototype.css` 的**双引号、逗号后无空格**紧凑写法；
+ *   · `--sans` 是 `index.css` 覆盖层的**单引号、逗号后带空格**写法；
+ *   · `--shadow-pop` 里是 `hsl(var(--shadow)/0.6)`，斜杠两侧无空格。
+ * 把 `"` 改成 `'`、或给逗号后补个空格，都会让门红。这不是门太挑，而是「值是否与桌面同一份」
+ * 只能按原文比 —— 一旦允许归一化，就得自己写一个 CSS 值等价判定器，那才是真的会静默出错。
+ *
+ * ── 结构为什么只有三块 ──────────────────────────────────────────────────────
+ * `:root` 给全量浅色终值 + 两类主题无关 token（几何 / 字体栈）；两条深色腿只覆盖随主题变的颜色。
+ * **没有显式浅色块**：本文件里不存在桌面那场「prototype.css 反压」的层叠仗，`[data-theme='light']`
+ * 靠 `:root` 就解析出正确的浅色终值（门的第三条腿正是在验这个，不是恒真）。
+ * 两条深色腿逐字重复是 CSS 的固有约束（一条在 @media 里、一条不在，无法合并选择器列表），
+ * 门对两条腿分别对拍，改一条漏一条会红。
+ *
+ * ── 射程边界（别指望本文件承担的事）──────────────────────────────────────────
+ * · **只含自定义属性**。`color-scheme` / `font-synthesis` / `-webkit-font-smoothing` 这类非 token
+ *   声明不在内，由移动端外壳自己设（深色下不设 `color-scheme:dark` 会得到浅色的原生表单控件与
+ *   滚动条 —— 这是外壳的待办，不是本文件的缺口）。
+ * · **不含 Dynamic Type 的 `--font-scale`**（D-10）。它由原生层注入，且不在契约 C 的白名单前缀里，
+ *   现在写进来门会红。落 D-10 时要先显式扩白名单，那是一次有记录的决策，不是顺手加。
+ * · **不含字号 / 断点阈值**。D-10 规定移动端字号走 rem、断点走 em，与桌面 220 处 px 是**单位层的
+ *   刻意分叉**；那批值的真值源是 `~/Code/polaris/design/mobile/tokens/core.json`，不是本文件。
+ */
+
+/* 随包字体面。与桌面 index.css 共用同一份 @font-face —— `--disp` 首选族 `Space Grotesk`
+ * 在这里被点名，face 却不随入口进来的话，移动端会静默掉栈到 Roboto（§6.3.2①）。 */
+@import './fonts.css';
+
+/* ═══════════ 浅色终值（默认腿）+ 全部主题无关 token ═══════════ */
+:root {
+  /* ── 三级面 / 背景 / 线 ── */
+  --bg: 210 30% 96%;
+  --surface: 0 0% 100%;
+  --surface-2: 210 28% 94%;
+  --surface-3: 210 22% 89%;
+  --line: 213 22% 87%;
+  --hair: 213 22% 83%;
+
+  /* ── 文字 ── */
+  --fg: 220 32% 13%;
+  --fg-dim: 216 15% 40%;
+  --fg-faint: 214 14% 44%;
+
+  /* ── 主色 / 辅色 ── */
+  --flow: 197 88% 40%;
+  --flow-hi: 198 92% 33%;
+  --flow-weak: 196 70% 93%;
+  --ring: 197 88% 44%;
+  --aurora: 162 78% 33%;
+  --aurora-hi: 163 82% 27%;
+  --aurora-weak: 162 55% 92%;
+
+  /* ── 语义色 ──
+   * 这四个是**整条契约 A 的靶心**：`tokens.css` 声明 27/31/44/33，`prototype.css` 压成
+   * 36/42/50/42，`index.css` 在全部 @import 之后又压回 27/31/44/33。下面是最后那一档，
+   * 即浏览器里真正生效的、过了 WCAG AA 的那份。只 @import tokens.css 会拿到中间的 36/42/50/42。 */
+  --ok: 152 60% 27%;
+  --ok-weak: 152 48% 92%;
+  --warn: 32 84% 31%;
+  --warn-weak: 38 84% 92%;
+  --err: 356 68% 44%;
+  --err-weak: 356 74% 96%;
+
+  /* ── 速率 / 方向 ── */
+  --dn: 197 80% 33%;
+  --up: 262 52% 54%;
+
+  /* ── 阴影源 / 靛 / logo 磁贴 ── */
+  --shadow: 216 45% 20%;
+  --indigo: 234 60% 40%;
+  --logo-tile: 0 0% 100%;
+  --logo-tile-bd: 214 24% 80%;
+
+  /* ── 解锁徽章状态点（浅色档专用，两档同值）── */
+  --unlock-dot-ok-light: 152 75% 36%;
+  --unlock-dot-warn-light: 32 92% 42%;
+  --unlock-dot-err-light: 356 82% 52%;
+
+  /* ── 圆角阶梯（主题无关）── */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 10px;
+  --r: 11px;
+  --r-lg: 14px;
+
+  /* ── 间距阶梯（主题无关）。移动端一律走这 7 档，不另开 13/15/18/22。 ── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+
+  /* ── 桌面固定件高度 / 浮层投影（主题无关）──
+   * 这三条是桌面语汇，移动端多半用不到，但**照样搬过来**：契约 C 是「只许加不许改」，
+   * 少搬一个等于让门的对拍面出现空洞。用不用是组件的事，在不在是入口的事。 */
+  --statusbar-h: 32px;
+  --pending-bar-h: 36px;
+  --toast-gap: var(--sp-4);
+  --shadow-pop: 0 18px 40px -16px hsl(var(--shadow)/0.6);
+
+  /* ── 字体栈（主题无关）──
+   * `--sans` 已含 `Noto Sans CJK SC`（契约 B）：其余三个中文族只在 Apple / Windows 上存在，
+   * 不点名它则 Android 上中文没有任何被指定的族。
+   * `--disp` 首选 `Space Grotesk`，由本文件顶部 @import 的 fonts.css 随包提供。 */
+  --sans: -apple-system, 'Segoe UI Variable', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --disp: "Space Grotesk","Avenir Next","SF Pro Display","Segoe UI",var(--sans);
+  --mono: ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+
+  /* ═══════════ 移动端新增（契约 C 白名单：--tap-* / --safe-* / --shadow-sheet）═══════════
+   * 桌面 token 集合里没有触控目标与 safe-area（§6.3.2③），这两类是移动端**必须新增**的。
+   * 门第 2 条只允许这三个前缀，出现白名单外的新 token 即红。 */
+
+  /* 触控目标下限。真值源：`~/Code/polaris/design/mobile/tokens/core.json` 的
+   * `layout.touchTargetMin: 48`（Material 48dp ≥ iOS HIG 44pt，取大的那个一次覆盖两端）。
+   * **不随 Dynamic Type 缩放**（D-10）：48 是手指尺寸，不是文字尺寸。 */
+  --tap-min: 48px;
+
+  /* safe-area。带 `0px` 兜底，使 `calc(var(--safe-b) + var(--sp-4))` 在无刘海/无手势条的
+   * 设备与不支持 env() 的环境下都解析得出，而不是整条 calc 失效。
+   *
+   * ⚠️ **下面这四条在 Android 上是回落，不是真值源。** `env(safe-area-inset-*)` 在 Android
+   * WebView 里**只反映 display cutout，不反映系统栏**（2026-09-05 Pixel 6 实测：手势条
+   * navigationBars=63 设备像素，而 `env(safe-area-inset-bottom)` 恒 0）。真值由
+   * `MainActivity.onWebViewCreate` 从 `WindowInsetsCompat` 读出，写成根元素**内联**自定义属性
+   * ——内联样式压过本条 `:root` 规则，故"原生有值吃原生、没有则吃 env()"是白拿的，
+   * 不需要第二个变量名，也不需要 `!important`。整条链路与那台机器上的实测值见该文件头注。
+   *
+   * 顶部看起来"本来就对"是**巧合**：那台机器的挖孔高度恰好等于状态栏高度。没有 cutout 的设备上
+   * `env(safe-area-inset-top)` 同样是 0。故原生侧四个方向一起接管，别只补底部。 */
+  --safe-t: env(safe-area-inset-top, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-l: env(safe-area-inset-left, 0px);
+}
+
+/* ═══════════ 深色终值 · 跟随系统腿（无 data-theme 时）═══════════
+ * 选择器逐字对齐桌面：两个 `:not` 缺一个，**显式切浅色**的用户在系统偏好为深色时会被这条腿
+ * 污染成深色取值。 */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']):not([data-theme='dark']) {
+    --bg: 220 40% 6%;
+    --surface: 219 32% 10.5%;
+    --surface-2: 218 26% 14%;
+    --surface-3: 217 22% 19.5%;
+    --line: 217 19% 23%;
+    --hair: 217 17% 28%;
+
+    --fg: 210 30% 95%;
+    --fg-dim: 214 16% 66%;
+    --fg-faint: 214 13% 48%;
+
+    --flow: 195 90% 56%;
+    --flow-hi: 194 96% 68%;
+    --flow-weak: 200 60% 15%;
+    --ring: 195 90% 60%;
+    --aurora: 161 60% 45%;
+    --aurora-hi: 162 68% 55%;
+    --aurora-weak: 162 45% 13%;
+
+    --ok: 152 50% 46%;
+    --ok-weak: 154 40% 14%;
+    --warn: 36 88% 60%;
+    --warn-weak: 34 45% 14%;
+    --err: 356 74% 66%;
+    --err-weak: 356 42% 17%;
+
+    --dn: 195 82% 62%;
+    --up: 265 70% 74%;
+
+    --shadow: 224 80% 1%;
+    --indigo: 236 64% 32%;
+    --logo-tile: 213 26% 88%;
+    --logo-tile-bd: 214 18% 72%;
+  }
+}
+
+/* ═══════════ 深色终值 · 显式腿 ═══════════
+ * 与上面那块逐字相同。CSS 无法让一条 @media 内的规则与一条顶层规则共享声明块，故只能重复；
+ * 门对两条腿**分别**对拍，改一条漏一条会红。 */
+:root[data-theme='dark'] {
+  --bg: 220 40% 6%;
+  --surface: 219 32% 10.5%;
+  --surface-2: 218 26% 14%;
+  --surface-3: 217 22% 19.5%;
+  --line: 217 19% 23%;
+  --hair: 217 17% 28%;
+
+  --fg: 210 30% 95%;
+  --fg-dim: 214 16% 66%;
+  --fg-faint: 214 13% 48%;
+
+  --flow: 195 90% 56%;
+  --flow-hi: 194 96% 68%;
+  --flow-weak: 200 60% 15%;
+  --ring: 195 90% 60%;
+  --aurora: 161 60% 45%;
+  --aurora-hi: 162 68% 55%;
+  --aurora-weak: 162 45% 13%;
+
+  --ok: 152 50% 46%;
+  --ok-weak: 154 40% 14%;
+  --warn: 36 88% 60%;
+  --warn-weak: 34 45% 14%;
+  --err: 356 74% 66%;
+  --err-weak: 356 42% 17%;
+
+  --dn: 195 82% 62%;
+  --up: 265 70% 74%;
+
+  --shadow: 224 80% 1%;
+  --indigo: 236 64% 32%;
+  --logo-tile: 213 26% 88%;
+  --logo-tile-bd: 214 18% 72%;
+}

@@ -18,7 +18,7 @@ pub use dns::{
     DnsConfig, DnsRule, DnsServer, DomainResolver, DomainStrategy, FakeIpConfig, OneOrMany,
 };
 pub use endpoint::{Endpoint, WireGuardPeer};
-pub use inbound::{HttpProxyPlatform, Inbound, InboundPlatform, UdpNatBehavior};
+pub use inbound::{HttpProxyPlatform, Inbound, InboundPlatform, InboundUser, UdpNatBehavior};
 pub use outbound::{
     Ech, Hysteria2Obfs, Multiplex, Outbound, OutboundTls, OutboundVersion, Reality, Transport,
     UdpOverTcp, Utls,

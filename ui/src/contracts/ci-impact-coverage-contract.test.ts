@@ -46,6 +46,7 @@ type Impact = {
   platforms: string[];
   preflight: boolean;
   hasPackage: boolean;
+  android: boolean;
   unregisteredScopes: string[];
 };
 
@@ -57,6 +58,7 @@ type Classifier = {
   REGISTRY_ROOTS: readonly string[];
   PACKAGE_IMPACT_SCOPES: Record<string, { kernel: boolean; platforms: readonly string[]; why: string }>;
   NO_PACKAGE_IMPACT_SCOPES: Record<string, string>;
+  ANDROID_IMPACT_SCOPES: Record<string, { why: string }>;
 };
 
 const classifier: Classifier = await import(
@@ -70,6 +72,7 @@ const {
   ALL_PACKAGE_PLATFORMS,
   PACKAGE_IMPACT_SCOPES,
   NO_PACKAGE_IMPACT_SCOPES,
+  ANDROID_IMPACT_SCOPES,
 } = classifier;
 
 /** 目录 → `<path>/`，文件 → `<path>`；与分类器 `scopeOf` 的归一形态一致。 */
@@ -261,44 +264,91 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
     }
   });
 
-  it('打包 workflow 真正执行的每个仓库脚本都必须触发打包腿', () => {
+  it('CI workflow 真正执行的每个仓库脚本都必须触发它所在的那条腿', () => {
     // 同一个 fail-open 在 scripts/ 的姊妹腿：package.yml 真跑 `node scripts/fetch-protoc.mjs`，
     // 而它 2026-08-30 前不在任何表里 —— 改坏它，合入前零信号，打包链在发布时才断。
-    const invoked = new Map<string, string>();
-    for (const workflow of ['package.yml', 'release-risk.yml']) {
+    //
+    // 2026-09-04 两处加强：
+    //  ① 取材面加入 `android.yml`（Android APK 腿）。它跑的 `verify-apk.mjs` / `build-libbox.sh`
+    //     若落表外，就是同一个 fail-open 在 Android 侧原样复发。
+    //  ② 断言改成**逐 (脚本, workflow) 对**、且每个 workflow 有各自的「该亮哪条腿」判据。
+    //     原判据用 `Map<脚本, workflow>`（后写覆盖先写）：`fetch-protoc.mjs` 同时被 package.yml 与
+    //     android.yml 跑，Map 只会留下后一个，另一条腿的要求**静默消失**。
+    const requiredLeg: Record<string, { signal: (impact: Impact) => boolean; label: string }> = {
+      'package.yml': { signal: (impact) => impact.hasPackage, label: '打包腿' },
+      'release-risk.yml': { signal: (impact) => impact.hasPackage, label: '打包腿' },
+      'android.yml': { signal: (impact) => impact.android, label: 'Android APK 腿' },
+    };
+
+    const invoked: Array<[string, string]> = [];
+    for (const workflow of Object.keys(requiredLeg)) {
       const raw = readFileSync(join(REPO_ROOT, '.github/workflows', workflow), 'utf8');
       const source = stripLineComments(raw, 'yaml');
-      if (workflow === 'package.yml') {
-        // 切片自检：这句只在注释里出现，剥干净了取材面才是「真跑的命令」。
+      // 切片自检：这两句各自只在整行注释里出现，剥干净了取材面才是「真跑的命令」。
+      const commentOnly: Record<string, string> = {
+        'package.yml': 'root cause：此前每次 main push',
+        'android.yml': '[不选 package.yml 矩阵腿：见上',
+      };
+      if (commentOnly[workflow]) {
         expect(
-          source.includes('root cause：此前每次 main push'),
-          'YAML 注释剥离失效：整行注释仍留在取材面上',
+          source.includes(commentOnly[workflow]),
+          `YAML 注释剥离失效（${workflow}）：整行注释仍留在取材面上`,
         ).toBe(false);
       }
       for (const match of source.matchAll(
         /(?:^|[\s;&|(`])(?:node|sh|bash)\s+(?:--test\s+)?(scripts\/[A-Za-z0-9._-]+)/g,
       )) {
-        invoked.set(match[1], workflow);
+        invoked.push([match[1], workflow]);
       }
     }
 
     // 哨兵：抓取器变哑在此红（空表会让下面的 for 恒真）。
-    expect([...invoked.keys()].sort()).toEqual([
+    expect([...new Set(invoked.map(([script]) => script))].sort()).toEqual([
+      'scripts/assert-r8-evidence.mjs',
+      'scripts/build-android-apk.sh',
+      'scripts/build-libbox.sh',
       'scripts/classify-ci-impact.mjs',
       'scripts/fetch-core.mjs',
       'scripts/fetch-cronet.mjs',
       'scripts/fetch-dashboard.mjs',
       'scripts/fetch-protoc.mjs',
+      'scripts/gate-android-release-behavior.sh',
       'scripts/gate-node-test.sh',
       'scripts/postprocess-appimage.mjs',
+      'scripts/verify-apk.mjs',
       'scripts/verify-packaging.mjs',
+      'scripts/verify-wry-keep-rules.mjs',
     ]);
+    // 哨兵②：android.yml 必须真有脚本被抓到（它整个漏掉时上面那张表由别的 workflow 填满，
+    // 逐对断言就会对 Android 侧恒真）。
+    expect(
+      invoked.filter(([, workflow]) => workflow === 'android.yml').length,
+      'android.yml 一条 `run: node scripts/…` 都没抓到 —— 抓取器或该 workflow 的形状变了',
+    ).toBeGreaterThan(1);
 
     for (const [script, workflow] of invoked) {
+      const { signal, label } = requiredLeg[workflow];
       expect(
-        classifyImpact([script]).hasPackage,
-        `${workflow} 里真跑 ${script}，但改它不触发任何打包腿 —— 打包链的一环没有合入前信号`,
+        signal(classifyImpact([script])),
+        `${workflow} 里真跑 ${script}，但改它不触发${label} —— 那条腿的一环没有合入前信号`,
       ).toBe(true);
     }
+  });
+
+  it('Android 登记表不是装饰：每条登记都必须真的点亮 Android 腿', () => {
+    expect(Object.keys(ANDROID_IMPACT_SCOPES).length).toBeGreaterThan(10);
+    for (const [key, decision] of Object.entries(ANDROID_IMPACT_SCOPES)) {
+      expect(
+        classifyImpact([probeOf(key)]).android,
+        `ANDROID_IMPACT_SCOPES['${key}'] 登记了，但分类器不给它点亮 Android 腿`,
+      ).toBe(true);
+      expect(
+        decision.why.length,
+        `ANDROID_IMPACT_SCOPES['${key}'] 缺少可读的判据（why）`,
+      ).toBeGreaterThan(10);
+    }
+    // 反向对照：没有它，上面那条会被「android 恒真」满足。
+    expect(classifyImpact(['ui/src/App.tsx']).android).toBe(false);
+    expect(classifyImpact(['src-tauri/tauri.linux.conf.json']).android).toBe(false);
   });
 });

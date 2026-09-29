@@ -1,0 +1,1365 @@
+/*
+ * 移动端「规则」屏样式（F3）。四合一：流量 · DNS · 应用 · 资源。
+ *
+ * 规格：`~/docs/polaris/design/mobile-kit/component-specs/information-architecture.md` §2.2 / §3；
+ * 设计文档：`~/docs/polaris/design/polaris-mobile-screen-rules-2026-09-04.md`。
+ *
+ * ── 三条与外壳同源的纪律（`mobile.css` 头注的延伸，别在本文件里重新发明）────────────
+ * ① **唯一 token 来源是 `../../../styles/tokens.resolved.css`**（契约 A1）。本文件一个 `@import`
+ *    都不写 —— 桌面那条五层层叠链在结构上进不来，`mobile-entry.test.ts` 的 CSS 集合判据钉住这件事。
+ * ② **几何 px、排版 rem**：一个 24 的内边距在 Dynamic Type 2x 下变 48，是把屏幕花在空白上；
+ *    48 是手指的尺寸，不是字母的。
+ * ③ **只用 Chromium ≤105 的特性**：本文件在 `../../../styles/css-feature-floor.test.ts` 的取材面内
+ *    （它走目录树发现 `ui/src` 下全部 .css，新文件自动进面）。`column-count` / `break-inside`
+ *    **在**那份白名单里（`css-feature-floor.test.ts:446-447`），本屏仍不用它们 ——
+ *    理由不是特性下限，是阅读序，见下面 `.mr-flow` 的头注。
+ *
+ * ── 本屏最重要的一条版式裁定 ───────────────────────────────────────────────────
+ * **有序规则列表（`.mr-list`）在任何断点下都不进双列。**
+ * 桌面 `RuleItem.tsx:279` 渲染的 `index + 1` **就是这条规则的优先级**（首个命中生效）。
+ * 双列会把第 5 条摆在第 1 条右边 ⇒ 阅读序不再等于求值序，而用户唯一能读到优先级的地方就是这个序。
+ * 多列流存在的理由是「让排版引擎配平卡片高度」，**有序列表不是一组卡片**。正确性优先于版式一致性。
+ * 例外不扩大到整屏：应用行 / 资源行 / DNS 服务器与分组都是**无序集合**，照常走 `.mr-flow` 双列。
+ * 判据在 `rules-screen.test.tsx`（DOM 祖先链 + 本文件的选择器面双向对拍）。
+ */
+
+/* ═══════════ 屏骨架：吸顶头 + 分段条 ═══════════ */
+
+/*
+ * 屏根。外壳的 `.m-page` 是一列 flex + `--section-gap`；屏自己再是一个 flex 子项，
+ * 故在这里把同一份节奏**原样重放**一次，让屏内各块之间的间距与外壳同源
+ * （不是另定一套数：`--section-gap` 由外壳按断点解析，这里只继承）。
+ */
+.mr-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+  min-width: 0;
+}
+
+/*
+ * 屏头与分段条共用一个吸顶块。IA §2.2「Fixed / sticky」：屏头固定，四路分段条吸在它下面
+ * （它是**范围指示器** —— 分段标签滚走后，下面的内容读不出属于哪一段）。
+ *
+ * 负外边距把它撑回 `.m-page` 的页边距之外：不撑的话，吸顶时内容会从左右两条缝里穿过去。
+ * 左右各自还原一份横向安全区（横屏刘海在侧边，`.m-page` 那两条 padding 就是这么算的）。
+ */
+.mr-top {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: hsl(var(--bg));
+  margin-top: calc(-1 * var(--sp-3)); /* 抵消 .m-page 的 padding-top，贴住滚动区顶边 */
+  margin-left: calc(-1 * (var(--page-inset) + var(--safe-l)));
+  margin-right: calc(-1 * (var(--page-inset) + var(--safe-r)));
+  padding: var(--sp-3) calc(var(--page-inset) + var(--safe-r)) 0
+    calc(var(--page-inset) + var(--safe-l));
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+.mr-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  min-height: var(--tap-min);
+}
+
+.mr-head-tx {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mr-title {
+  margin: 0;
+  font-family: var(--disp);
+  font-size: 1.3125rem; /* type.nodeTitle compact 21 */
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+/* 屏头的计数/摘要行（桌面 `.nd-count` / `.app-summary` 折进屏头的那一半，IA §3.1 #10）。 */
+.mr-sum {
+  margin-top: 2px;
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem; /* type.caption 13 */
+  line-height: 1.4;
+}
+
+/* 屏头动作簇：桌面 `.acts` 最多三颗，移动端封顶两颗 + 一颗溢出（IA §3.1 #10）。 */
+.mr-acts {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+}
+
+/* ═══════════ 分段条（segmented-tabs，IA §3.1 #6）═══════════ */
+
+/*
+ * 横向可滚、活动项滚入视野、每项最小 48 高。计数徽标、活动下划线、字号角色与桌面 `.sub-tabs` 同。
+ * 与 `.mr-seg2`（桌面 `.seg2`）**刻意保持两套**：桌面这里就是两个不同控件，合并会造出
+ * 一个两端都不存在的移动端专有词汇（契约 D）。
+ */
+.mr-seg {
+  display: flex;
+  gap: var(--sp-4);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.mr-seg::-webkit-scrollbar {
+  display: none;
+}
+
+.mr-seg-item {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  padding: 0 2px;
+  margin: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  white-space: nowrap;
+  color: hsl(var(--fg-dim));
+  font-family: inherit;
+  font-size: 0.875rem; /* type.body compact 14 */
+  font-weight: 500;
+  touch-action: manipulation;
+}
+
+.mr-seg-item[aria-selected='true'] {
+  color: hsl(var(--fg));
+  font-weight: 600;
+}
+
+.mr-seg-item[aria-selected='true']::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: hsl(var(--flow));
+}
+
+.mr-seg-item:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+/* 计数徽标：与桌面 `.sub-tabs .cnt` 同形。 */
+.mr-cnt {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: hsl(var(--surface-3));
+  color: hsl(var(--fg-dim));
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+/* ═══════════ 列流：无序集合双列，有序列表恒单列 ═══════════ */
+
+/*
+ * 本屏有**两个**多列入口，都必须带 `data-flow="multi"`：
+ *  · `.mr-flow` —— 无序**行**集合（应用行 / 资源行 / DNS 服务器与分组）；
+ *  · `.mr-cards` —— 卡片块（IA §2.2 Breakpoints 的**必做面**：「two-column multi-column flow
+ *    for the card-shaped blocks only」）。
+ * 判据（`rules-screen.test.tsx` ①）按「祖先链里不许出现 `data-flow="multi"`」写，因此入口可以
+ * 有两个，但**每一个都得挂那个标记**；漏挂标记才是漏路，不是多一个类名。
+ *
+ * 两个都用 grid 而不是 `column-count`：列流会把一个逻辑列表在视觉上折成两段 —— 对无序集合
+ * 无所谓，但一旦有人把有序列表塞进来，`break-inside` 也救不了阅读序。
+ * grid 至少让「第 2 项在第 1 项右边」这件事在源码里显式可见。
+ */
+.mr-flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/*
+ * 卡片块的列流面。compact 与今天完全一样（一条竖列，间距仍是 `--section-gap`），
+ * medium/expanded 才分两列 —— 列间距取 `core.json#layout.responsive.columnGap`
+ * （medium 32 / expanded 40，compact 为 null 即不适用）。
+ * `align-items: start` 让每张卡保持自然高度，不被同排那张拉高。
+ */
+.mr-cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+  min-width: 0;
+}
+
+/*
+ * **`.mr-list` 没有、也不许有任何断点覆写。** 它是有序列表（优先级 = 行号）。
+ * 变异守卫：给它加一条 `@container` 双列规则 ⇒ `rules-screen.test.tsx` 的选择器面判据转红。
+ */
+.mr-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+@container mscreen (min-width: 37.5em) {
+  .mr-flow {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--sp-3);
+    align-items: start;
+  }
+
+  .mr-cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 32px;
+    row-gap: var(--section-gap);
+    align-items: start;
+  }
+
+  /*
+   * 只剩一张卡时跨满两列。流量段的卡片面里只有地区分流卡是无条件的，另外两条
+   * （模式警告 / 限定说明）只在 global/direct 下出现 ⇒ 智能分流这个常态下容器里只有一个孩子，
+   * 不写这条就会在平板上把那张卡压成半幅、右边空一半 —— 比今天的整幅更差。
+   * 轨道数仍写死 2（不用 `auto-fit`）：`auto-fit` 会让上面那条多列判据的正则看不见这条规则。
+   */
+  .mr-cards > :only-child {
+    grid-column: 1 / -1;
+  }
+}
+
+/* `.mr-switch-row` 的 expanded 行高**不写在这里**：它的基线在本文件更下面，
+   写在这儿会被基线按源码顺序盖回去（`@container` 不贡献特异性）。见那条基线旁的断点块。 */
+@container mscreen (min-width: 52.5em) {
+  .mr-cards {
+    column-gap: 40px;
+  }
+}
+
+/* ═══════════ 卡片 / 分节 ═══════════ */
+
+.mr-card {
+  background: hsl(var(--surface));
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r);
+  padding: var(--card-padding);
+  box-sizing: border-box;
+}
+
+/*
+ * 应用分流的卡片视图（桌面 `.app-card`）。它与列表行承载的不是同一份第二格
+ * （卡片给分类、行给进程名），故不是「同一个东西的两种宽度」。
+ */
+.mr-app-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  align-items: flex-start;
+}
+
+.mr-app-card .mr-row-ic {
+  width: 28px;
+  height: 28px;
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+.mr-card-h {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: hsl(var(--fg));
+}
+
+/*
+ * 常驻说明行。**这是 §4.12 的落点**：桌面把大量「为什么不能点 / 这个角标什么意思」只挂在
+ * `data-tip` 上，而触屏没有 hover。凡是桌面靠 tip 独家承载的解释，移动端一律落成这条常驻行
+ * （或落成动作面板里的可见文字）。一个含义不可达的角标比没有角标更坏 —— 它读作装饰，
+ * 用户于是得出「没出问题」的结论。
+ */
+.mr-note {
+  margin-top: var(--sp-1);
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.mr-note.warn {
+  color: hsl(var(--warn));
+}
+
+/*
+ * 写失败的行内回显。用 `--err`（动作标签轴那档红）：它说的是「这次操作没成功」，
+ * 不是「这里有个需要留意的状态」——后者是 `--warn`，两者不许串。
+ */
+.mr-error {
+  margin-top: var(--sp-1);
+  color: hsl(var(--err));
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+/*
+ * 「阻断」的**动作标签轴**（`styles/style-invariants.test.ts`）：作为动作标签时恒 `--err` 且常驻。
+ * 另一轴（流量表达，如拓扑里的 block 出口条）恒 `--warn`。两轴不许串。
+ */
+.mr-block-n {
+  color: hsl(var(--err));
+}
+
+/* ═══════════ 通告条（notice-banner，IA §3.1 #1）═══════════ */
+
+/*
+ * 三档严重度保持三档：合并会丢掉「未生效」「此平台不适用」「已被关掉」之间的差别 ——
+ * 那正是用户读这条横幅唯一想知道的事。
+ */
+.mr-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.mr-notice svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.mr-notice-tx {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mr-notice.warn {
+  border-color: hsl(var(--warn) / 0.35);
+  background: hsl(var(--warn-weak) / 0.6);
+  color: hsl(var(--warn));
+}
+
+.mr-notice.info {
+  border-color: hsl(var(--line));
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+}
+
+.mr-notice.off {
+  border-color: hsl(var(--hair));
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+}
+
+/* ═══════════ 实体行（entity-row，IA §3.1 #18）═══════════ */
+
+/*
+ * 桌面把 4–7 颗纯图标动作沿行尾排开（`.rule-acts` 有七颗）—— 每颗都远小于 48 且彼此相邻。
+ * 移动端只留**一颗主动作 + 一颗溢出**，其余进动作面板。变的是「动作怎么触达」，
+ * 不是视觉词汇：标题、角标 pill、行尾值、发丝线、暂存/失效标记与全部颜色角色原样过来。
+ */
+.mr-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  min-height: var(--tap-min);
+  padding: var(--sp-3);
+  background: hsl(var(--surface));
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-md);
+  box-sizing: border-box;
+}
+
+.mr-row.off {
+  opacity: 0.55;
+}
+
+/* 优先级序号：它是这条规则的求值次序，不是装饰。等宽字体让位数变化时左边缘不跳。 */
+.mr-pri {
+  flex-shrink: 0;
+  min-width: 22px;
+  padding-top: 2px;
+  color: hsl(var(--fg-faint));
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 抓握条（IA §4.13：「long-press drag on **the existing grip**」）。
+ * 视觉逐字取桌面 `.rule-grip`（`styles/screens.css:196-197`：`--fg-faint` 的六点，16px），
+ * 变的只有命中面 —— 桌面靠光标精确落点，手指不行，故整块拉到 `--tap-min`。
+ *
+ * `touch-action` 这里**必须是 `pan-y`，不许是 `none`**。
+ *
+ * 本条与 `align-self: stretch` + `min-width: var(--tap-min)` 联动：抓握条是一条跟满整行高度的
+ * 48px 竖条。写 `none` 就等于把每条规则行的左侧变成一块整行高的**滚动死区** —— 十几条规则的
+ * 列表上，屏幕左侧整条都划不动。`touch-action` 在 touchstart 那一刻按命中元素求值、之后不可改，
+ * 所以「拖拽时才禁滚动」这件事**做不到**用 `.mr-row.dragging .mr-grip{touch-action:none}` 表达：
+ * 求值时机早就过了。`RuleRow.tsx` 的 `DRAG_SLOP` 取消长按也救不回来 —— 取消的只是拖拽态，
+ * 浏览器的平移在 touchstart 那一刻就已经被关掉，不会因为取消而回来。
+ *
+ * 于是分工是：CSS 只保证平时能滚（`pan-y`），长按**成立之后**由 `RuleRow.tsx` 挂一个非被动
+ * `touchmove` 监听 + `preventDefault()` 接管平移（此刻手指还没移动、浏览器尚未开始滚，拦得住）。
+ * 那一半由 `rules-screen.test.tsx` 的 ⑫ 组看住，两半缺一条这条手势就退化。
+ */
+.mr-grip {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  align-self: stretch;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  margin: calc(var(--sp-3) * -1) 0;
+  color: hsl(var(--fg-faint));
+  touch-action: pan-y;
+}
+
+.mr-grip svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* 拖起来的那一行：同桌面 `.rule-item.dragging`（`styles/screens.css:191`）。 */
+.mr-row.dragging {
+  position: relative;
+  z-index: 1;
+  opacity: 0.5;
+  background: hsl(var(--flow-weak));
+}
+
+.mr-row-ic {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  color: hsl(var(--fg-dim));
+}
+
+.mr-row-ic svg {
+  width: 100%;
+  height: 100%;
+}
+
+/*
+ * 规则行的类型分类图标（桌面 `.rule-type-ic`）。尺寸与色与 `.mr-row-ic` 同一档 ——
+ * 它们在行里是同一格的两种内容（应用行放 emoji、规则行放分类字形），不该长得不一样。
+ */
+.mr-row-ty {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  color: hsl(var(--fg-dim));
+}
+
+.mr-row-ty svg {
+  width: 100%;
+  height: 100%;
+}
+
+.mr-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mr-row-title {
+  font-size: 0.9375rem; /* 15 */
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.mr-row-sub {
+  margin-top: 2px;
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.mr-row-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  margin-top: var(--sp-2);
+}
+
+.mr-row-acts {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/* ═══════════ pill ═══════════ */
+
+/*
+ * ⚠️ **不许给它 `white-space: nowrap`**（2026-09-05 `text-fit.test.ts` S15 首次量到）。
+ *
+ * 这颗 pill 装的是**静态 i18n 角标**（`rules.dnsResolverInherit` / `rules.meshOverlap` /
+ * `resources.updateFailed` …），而它**一条兜底都没有**：无 `text-overflow: ellipsis`、
+ * 无 `overflow: hidden`、无 `overflow-wrap`。nowrap 之下「装不下」的唯一表现就是**画到行外**
+ * —— 与 2026-07-31 侧栏那次（`text-fit.test.ts` 文件头的阳性对照）逐字同形。
+ *
+ * 几何：规则行里 `.mr-row-main` 只有 186px（页内容 358 − 行边框/内边距 26 − 序号 22 −
+ * 开关/更多那一簇 100 − 两道 12 的 gap），pill 内文可用 170px。
+ *
+ * **两个数分开写，别混为一谈**：ru 的 `rules.dnsResolverInherit`
+ * （「Следовать маршруту трафика」）**模型**算 239.4px，而 Android 模拟器实测（Roboto，11px）
+ * 只有 172px —— 在 390 参考视口的 170px 槽里仍**刚好**越界 2px，在 412 的机器上则装得下。
+ * 也就是说这一格的越界规模比模型报的小得多，但**形态**是确定的缺陷：nowrap + 零兜底
+ * 意味着任何一条译文一旦长过槽就直接画到行外，而这一格离满槽只剩 0.71px（ru `rules.meshOverlap`）。
+ * 真机阳性对照：把同一颗 pill 放进 150px 容器，`nowrap` 下越出容器 23.1px，改成换行后 0px（2 行）。
+ *
+ * 修法取**换行**而不是省略号，与 `home.css` 的 `.h-chiplabel.copy` / `.h-nodename.copy`
+ * 同一条口径：省略号留给运行期数据，静态文案整句换行（纵向增长在本屏是免费的）。
+ * 再配 `overflow-wrap: anywhere` 兜住「一个词就比整颗 pill 还宽」那一格 ——
+ * 与本文件 `.mr-row-title` / `.mr-row-sub` 用的是同一个属性值，不新造词汇。
+ * 短角标不受影响：flex 项的基础尺寸仍是 max-content，装得下就照旧一行并排。
+ */
+.mr-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border: 1px solid hsl(var(--line));
+  border-radius: 999px;
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.mr-pill.act-proxy {
+  border-color: hsl(var(--flow) / 0.35);
+  background: hsl(var(--flow-weak));
+  color: hsl(var(--flow));
+}
+
+.mr-pill.act-direct {
+  border-color: hsl(var(--ok) / 0.35);
+  background: hsl(var(--ok-weak));
+  color: hsl(var(--ok));
+}
+
+.mr-pill.act-block {
+  border-color: hsl(var(--err) / 0.35);
+  background: hsl(var(--err-weak));
+  color: hsl(var(--err));
+}
+
+.mr-pill.warn {
+  border-color: hsl(var(--warn) / 0.35);
+  background: hsl(var(--warn-weak));
+  color: hsl(var(--warn));
+}
+
+.mr-pill.inactive {
+  opacity: 0.6;
+  text-decoration: line-through;
+}
+
+/* ═══════════ 按钮 ═══════════ */
+
+.mr-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  padding: 0 var(--sp-3);
+  margin: 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-md);
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+.mr-btn.flow {
+  border-color: transparent;
+  background: hsl(var(--flow));
+  color: hsl(var(--bg));
+}
+
+.mr-btn.ghost {
+  border-color: transparent;
+  background: none;
+  color: hsl(var(--fg-dim));
+}
+
+.mr-btn.icon {
+  padding: 0;
+}
+
+.mr-btn.icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.mr-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mr-btn:active:not(:disabled) {
+  opacity: 0.7;
+}
+
+.mr-btn:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+/* ═══════════ 开关（IA §3.1 #11）═══════════ */
+
+/* 48×48 触控面包住一个与桌面逐像素相同的视觉。视觉不变，命中面变 —— 这就是「按触屏调交互层」。 */
+.mr-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap-min);
+  height: var(--tap-min);
+  flex-shrink: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.mr-switch::before {
+  content: '';
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: hsl(var(--surface-3));
+  box-shadow: inset 0 0 0 1px hsl(var(--line));
+  transition: background 140ms ease;
+}
+
+.mr-switch::after {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: hsl(var(--bg));
+  transform: translateX(-7px);
+  transition: transform 140ms ease;
+}
+
+.mr-switch[aria-checked='true']::before {
+  background: hsl(var(--flow));
+}
+
+.mr-switch[aria-checked='true']::after {
+  transform: translateX(7px);
+}
+
+.mr-switch:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mr-switch:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -6px;
+  border-radius: var(--r-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mr-switch::before,
+  .mr-switch::after {
+    transition: none;
+  }
+}
+
+/*
+ * 开关行（桌面 `settings-row`）：标题与开关同一行，说明在第二行。
+ * 说明**不许**塞进那条 flex 行 —— 会被挤成一条竖着的字，读作乱码而不是解释。
+ */
+/*
+ * 行高解析 `core.json#layout.responsive.rowMinHeight` = compact 54 / medium 54 / expanded 64
+ * （IA §3.1 #8 `settings-row`：「Row height to `layout.responsive.rowMinHeight`」）。
+ * **不是** `--tap-min`(48)：那是命中面的下限（`touchTargetMin`），不是这一行的高度；
+ * 拿它当行高，三个断点会塌成同一个值，纵向节奏不跟着断点走。
+ * expanded 的 64 写在**紧跟其后**的 52.5em 块里，与 `home/home.css` 的 `.h-diagrow`
+ * （基线在前、断点覆写在后）同款写法。
+ */
+.mr-switch-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  min-height: 54px;
+  margin-top: var(--sp-2);
+}
+
+/*
+ * expanded 档行高 64。**必须写在基线之后** —— `@container` 是条件分组规则、不贡献特异性，
+ * 两条 `.mr-switch-row` 特异性同为 (0,1,0) ⇒ 只按源码顺序决胜；写在基线之前就是死值。
+ * 本条由 `styles/cascade-dead-rules.test.ts` 全仓看住。
+ */
+@container mscreen (min-width: 52.5em) {
+  .mr-switch-row {
+    min-height: 64px;
+  }
+}
+
+.mr-switch-tx {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-top: var(--sp-3);
+}
+
+.mr-switch-title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+/* ═══════════ 搜索框（IA §3.1 #9）═══════════ */
+
+.mr-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-md);
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+}
+
+.mr-search svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.mr-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: none;
+  outline: none;
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 1rem; /* 16：低于 16 时 WebView 会在聚焦时缩放整页 */
+}
+
+/* ═══════════ 进度条（IA §3.1 #5）═══════════ */
+
+/*
+ * **与「份额条」保持两个物件**：这条读作「这件任务完成了 60%」，那条读作「这个出站占了 60% 的字节」。
+ * 同形反义，合并等于凭空造一个桌面没有的歧义。
+ */
+.mr-progress {
+  height: 4px;
+  border-radius: 2px;
+  background: hsl(var(--surface-3));
+  overflow: hidden;
+}
+
+.mr-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: hsl(var(--flow));
+}
+
+/* ═══════════ 空态 / 折叠 / 优先级链 ═══════════ */
+
+.mr-empty {
+  padding: var(--sp-6) var(--sp-4);
+  border: 1px dashed hsl(var(--line));
+  border-radius: var(--r-md);
+  color: hsl(var(--fg-dim));
+  font-size: 0.875rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.mr-fold > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.mr-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.mr-fold-tx {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mr-fold-tx .mr-note {
+  font-weight: 400;
+}
+
+.mr-fold-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* 优先级链（priority-flow，IA §3.1 #3）：静态图，零交互，与桌面同构。 */
+.mr-chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.mr-chain-step {
+  padding: 3px 8px;
+  border: 1px solid hsl(var(--line));
+  border-radius: 999px;
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg-dim));
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+
+.mr-chain-step.on {
+  border-color: hsl(var(--flow) / 0.35);
+  background: hsl(var(--flow-weak));
+  color: hsl(var(--flow));
+}
+
+.mr-chain-arrow {
+  color: hsl(var(--fg-faint));
+  font-size: 0.75rem;
+}
+
+/* ═══════════ 地区分流（GeoCard 的移动端呈现）═══════════ */
+
+/*
+ * `segmented-control`（桌面 `.seg2` / `.geo-region`）在 IA §3.1 #7 里是 **touch-adapted**：
+ * 「Hit area to `layout.touchTargetMin`. Border, radius and selected fill unchanged.」
+ * ⇒ 只准放大命中面，视觉词汇一处不动。所以它必须是「轨道 + 轨道内按钮」两层，
+ * 而不是三颗各自带边框的独立按钮。
+ *
+ * 轨道逐属性同构桌面 `styles/screens.css:300-301` 的 `.geo-region`
+ * （inline-flex / gap 3 / padding 3 / 1px --line / --r-sm / --surface-2）。
+ * 选中态取 `styles/index.css:642` 的 `.geo-region button.on`（= `.seg2 button.on`）：
+ * `--surface` 浮块 + `--flow-hi` 文字 + 投影。**不取 `flow-weak` 铺底** —— 那一档
+ * 已在桌面被当面否决（`styles/index.css:631-632`：「accent 铺在底色上，整块就是一片蓝」），
+ * 移动端照抄它等于把桌面已经改掉的那个观感又搬回来。
+ */
+.mr-geo-regions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  margin-top: var(--sp-2);
+  padding: 3px;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+}
+
+/*
+ * 轨道内的按钮交出自己的边框与底色（桌面 `.seg2 button`：border:0 / transparent / 7px）。
+ * `min-height`/`min-width` 仍由 `.mr-btn` 提供 = `--tap-min` ⇒ 命中面照样是 48，
+ * 这正是 touch-adapted 那一格允许改的**唯一**一件事。
+ */
+.mr-geo-regions .mr-btn {
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--fg-dim));
+  font-weight: 560;
+}
+
+.mr-geo-regions .mr-btn[aria-pressed='true'] {
+  background: hsl(var(--surface));
+  color: hsl(var(--flow-hi));
+  font-weight: 660;
+  box-shadow: 0 1px 3px hsl(var(--shadow) / 0.16);
+}
+
+/* ═══════════ 行分组（应用 / 资源 / DNS 的分类头）═══════════ */
+
+.mr-group-h {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+/* ═══════════ 动作面板（action-sheet，IA §3.1 #19）═══════════ */
+
+/*
+ * 桌面把浮动菜单锚在触发器上并做边缘钳制。触屏没有 hover 去打开它、没有光标去锚它，
+ * 拇指也够不到屏幕上半部。于是它变成底部面板 —— 条目行、分隔线、组标题、危险变体全是桌面那套，
+ * 只有容器与位置变了。
+ *
+ * 外壳不滚动的 `.m-screen-viewport` 显式 contain:layout，承接屏内 fixed 层。
+ * 面板覆盖正文可见范围，底部停靠区仍在外面；页面滚动不会改变弹层锚点。
+ */
+.mr-sheet-scrim {
+  position: fixed;
+  inset: 0;
+  /* SelectSheet 也可从 body 上的 FormSheet 打开，此时没有屏内包含块。 */
+  top: var(--m-vv-top, 0px);
+  left: var(--m-vv-left, 0px);
+  right: auto;
+  bottom: auto;
+  width: var(--m-vv-width, 100%);
+  height: var(--m-vv-height, 100%);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  background: hsl(var(--shadow) / 0.45);
+}
+
+.m-screen-viewport .mr-sheet-scrim {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.mr-sheet {
+  box-sizing: border-box;
+  max-height: 80%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-2) calc(var(--sp-3) + var(--safe-r)) var(--sp-4) calc(var(--sp-3) + var(--safe-l));
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  background: hsl(var(--surface));
+  box-shadow: var(--shadow-pop);
+}
+
+/* 抓握条：可拖拽消解的可供性（桌面那条「不在内容里开始的手势才关闭」在这里变成拖过阈值）。 */
+.mr-sheet-grip {
+  width: 36px;
+  height: 4px;
+  margin: var(--sp-2) auto var(--sp-3);
+  border-radius: 2px;
+  background: hsl(var(--line));
+}
+
+.mr-sheet-h {
+  padding: 0 var(--sp-2) var(--sp-2);
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.35;
+  max-height: 2.7em;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  letter-spacing: 0.04em;
+}
+
+.mr-sheet-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  margin: 0;
+  border: 0;
+  border-radius: var(--r-md);
+  background: none;
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+.mr-sheet-item svg {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  color: hsl(var(--fg-dim));
+}
+
+.mr-sheet-item.danger,
+.mr-sheet-item.danger svg {
+  color: hsl(var(--err));
+}
+
+/*
+ * 「再点一次即执行」的武装态。类名是硬约束而不是装饰：`lib/confirm-twice.ts` 用
+ * `closest('.confirming')` 判断一次按下是不是「第二次点击」。翻成实色是桌面同一档反馈。
+ */
+.mr-sheet-item.confirming,
+.mr-sheet-item.confirming svg {
+  color: hsl(var(--bg));
+}
+
+.mr-sheet-item.confirming {
+  background: hsl(var(--err));
+}
+
+.mr-sheet-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.mr-sheet-item:active:not(:disabled) {
+  background: hsl(var(--surface-2));
+}
+
+.mr-sheet-item:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+/*
+ * 面板条目的第二行说明。桌面把「为什么这颗不能点」放在 `data-tip` 里，这里它是**可见文字**
+ * —— §4.12 的另一个落点。
+ */
+.mr-sheet-item-sub {
+  display: block;
+  color: hsl(var(--fg-dim));
+  font-size: 0.75rem;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.mr-sheet-sep {
+  height: 1px;
+  margin: var(--sp-2) var(--sp-2);
+  background: hsl(var(--hair));
+}
+
+/* ═══════════ 选择面板（select-sheet，IA §3.1 #20）═══════════ */
+
+/*
+ * 触发器 = 桌面 `.csel-trigger` 的移动端对位：当前值 + 下箭头。
+ * 普通表单值与 `MobileSelect` 同为 40px / 常规字重，大字时由内边距自然撑高。
+ * 它与 `.mr-seg`（`segmented-tabs`）**不是**一套词汇（§3.3 第 1 条），也与
+ * `.mr-sheet-item`（`action-sheet` 的命令行）不是 —— 后两者都没有「当前值」这一格。
+ */
+.mr-sel-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  min-height: 40px;
+  padding: 8px 10px;
+  margin: 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-md);
+  background: hsl(var(--surface-2));
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 400;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+.mr-sel-trigger:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 1px;
+}
+
+/*
+ * 触发器的**动作配色**（应用分流的策略选择器）。三档逐条对齐同文件 `.mr-pill.act-*`，
+ * 用的是同一族 token —— 同一个动作在同一屏上有两个色，读起来就是两个不同的东西。
+ *
+ * 🔴 `act-block` 必须落在 `--err` 族：「阻断」在**动作标签轴**上恒 `--err` 且常驻
+ * （`styles/style-invariants.test.ts` 的两轴不变量）。收起来的触发器是这一档在应用行上
+ * **唯一**的常驻载体（面板要点开才看得见），漏了它这条不变量在本屏就断了。
+ */
+.mr-sel-trigger.act-proxy {
+  border-color: hsl(var(--flow) / 0.35);
+  background: hsl(var(--flow-weak));
+  color: hsl(var(--flow));
+}
+
+.mr-sel-trigger.act-direct {
+  border-color: hsl(var(--ok) / 0.35);
+  background: hsl(var(--ok-weak));
+  color: hsl(var(--ok));
+}
+
+.mr-sel-trigger.act-block {
+  border-color: hsl(var(--err) / 0.35);
+  background: hsl(var(--err-weak));
+  color: hsl(var(--err));
+}
+
+.mr-sel-trigger svg {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  color: hsl(var(--fg-dim));
+}
+
+.mr-sel-val {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mr-sel-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.mr-sel-opt {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  margin: 0;
+  border: 0;
+  border-radius: var(--r-md);
+  background: none;
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+.mr-sel-opt:active:not(:disabled) {
+  background: hsl(var(--surface-2));
+}
+
+.mr-sel-opt:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+/*
+ * 兑现不了的那一档：置灰但**留在列表里**（IA §3.3 第 2 条）。透明度与 `.mr-sheet-item:disabled`
+ * 同值，两套面板的「点不动」在视觉上必须是同一件事。理由由面板顶部的 `.mr-note` 说，不在这里。
+ */
+.mr-sel-opt:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/*
+ * 选项面板里的**分组组头**。两态：
+ *  · `.mr-sel-grp` 单独出现 = 不可折叠的纯标签（规则类型那 15×5 分组，同桌面 `.csel-grp`）；
+ *  · 叠 `.mr-sel-grp-t` = 可点的展开钮（节点按订阅分组，同桌面 `.csel-grp-t` / `.ns-grp`）。
+ * 可点那一档必须够到 `--tap-min`：它是这个面板里唯一一个「点了不选中任何东西」的控件，
+ * 摸不准就会被读成「点了没反应」。
+ */
+.mr-sel-grp {
+  display: block;
+  padding: var(--sp-2) var(--sp-2) var(--sp-1);
+  color: hsl(var(--fg-faint));
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mr-sel-grp-t {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: var(--r-md);
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: manipulation;
+}
+
+.mr-sel-grp-t:active {
+  background: hsl(var(--surface-2));
+}
+
+.mr-sel-grp-t:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+.mr-sel-grp-t > span:first-of-type {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mr-sel-grp-t svg {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  /* 收起 = 右指，展开 = 下指。**转的是同一枚字形**（同桌面）：换字形会让展开与收起
+     读成两个不同的控件。 */
+  transition: transform 0.15s ease;
+}
+
+.mr-sel-grp-t.open svg {
+  transform: rotate(90deg);
+}
+
+.mr-sel-opt-tx {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/*
+ * 勾恒在 DOM 里，靠 `aria-selected` 决定可见 —— 判据（与读屏）看的是同一个属性，
+ * 不会出现「视觉上有勾、语义上没选中」这种两个面对不上的状态。
+ */
+.mr-sel-ck {
+  flex: 0 0 auto;
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  color: hsl(var(--flow-hi));
+  visibility: hidden;
+}
+
+.mr-sel-opt[aria-selected='true'] .mr-sel-ck {
+  visibility: visible;
+}
+
+.mr-sel-opt[aria-selected='true'] {
+  color: hsl(var(--flow-hi));
+  font-weight: 660;
+}
+
+/*
+ * 「阻断」那一档：与 `.mr-sheet-item.danger` 同一档、同一 token（动作标签轴恒 --err）。
+ *
+ * 🔴 **必须写在 `[aria-selected='true']` 之后**：两条特异性都是 (0,2,0)，写在前面时
+ * 「当前就是阻断」的那一行会被选中态的 `--flow-hi` 压掉 —— 恰好是这一档最该红的时候。
+ */
+.mr-sel-opt.danger {
+  color: hsl(var(--err));
+}
+
+.mr-sel-ck svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* ═══════════ 应用分段：总开关关闭 / 非智能模式下的正文置灰 ═══════════ */
+
+/*
+ * 桌面 `AppPolicyScreen.tsx:459` 的 `#ap-body` + `components.css:635` 的 `.ap-disabled`。
+ * IA §2.2 States 那一行要的是**两件事**：`ap-off-note` 提示条 **plus the body dimmed
+ * while controls stay editable**。只渲染提示条不够 —— 用户往下滚两屏，提示条早已滚出视野，
+ * 屏上只剩一列看起来正常的应用与策略角标，没有任何持续信号说「这些策略当前不生效」。
+ *
+ * **只降透明度，不改可交互性**（与桌面注释同一条口径）：编辑照常保存，启用后生效。
+ * 这里同时承担 `.mr-screen` 的 gap —— 包了一层之后原本由 `.mr-screen` 提供的
+ * `--section-gap` 就落不到这些孩子身上了。
+ */
+.mr-ap-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+  min-width: 0;
+}
+
+.mr-ap-body.dim {
+  opacity: 0.5;
+}
+
+/*
+ * 网络场景命中态圆点（N4；组件 `components/screens/rules/MatchDot.tsx` 与桌面共用，类名来自
+ * `domain/network-profile#PROFILE_MATCH_DOT_CLASS`）。桌面的 `.dot` 住在 `components.css`，不进移动链
+ * （契约 A1），故这里按同值重画一份，限定在 `.mr-row` 内（规则行徽标 / 场景二级页行）。
+ * 未知 = 空心圆，与未命中（实心灰）按形状区分，不只靠颜色。
+ */
+.mr-row .dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.mr-row .dot.ok {
+  background: hsl(var(--ok));
+  box-shadow: 0 0 0 3px hsl(var(--ok) / 0.18);
+}
+
+.mr-row .dot.idle {
+  background: hsl(var(--fg-faint));
+}
+
+.mr-row .dot.np-unknown {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px hsl(var(--fg-faint));
+}
+
+.mr-pill .dot {
+  margin-inline-end: 5px;
+}
+
+.mr-np-match {
+  display: flex;
+  align-items: center;
+  column-gap: 6px;
+}

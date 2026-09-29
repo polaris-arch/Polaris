@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">"Polaris"</string>
+    <string name="main_activity_title">"Polaris"</string>
+
+    <!-- 前台服务通知。Android 8+ 持有 VpnService 必须常驻一条，它是移动端唯一始终可见的控制入口。 -->
+    <string name="notification_channel_service">"隧道服务"</string>
+    <string name="notification_state_starting">"Polaris · 正在启动"</string>
+    <string name="notification_state_started">"Polaris · 已连接"</string>
+    <string name="notification_state_stopping">"Polaris · 正在停止"</string>
+    <string name="notification_state_stopped">"Polaris · 已断开"</string>
+    <string name="notification_action_disconnect">"断开"</string>
+</resources>

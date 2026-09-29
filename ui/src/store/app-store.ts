@@ -14,6 +14,7 @@ import type {
   HelperStatus,
   IpInfoSnapshot,
   InvalidNodeInfo,
+  PendingNodeChanges,
   ServerConfig,
 } from '../contracts/types';
 import type { UnlockResult, UnlockEgress, UnlockSnapshot } from '../contracts/unlock-detection';
@@ -64,7 +65,7 @@ export interface UnlockDisplayState {
  * 形状与后端 `PendingChangesSummary` / 前端契约 [`PendingNodeChanges`] 逐字段一致
  * （pull 与 push 同构，后端无适配层）。
  *
- * 需要**即时**差集的场景（如 willRestartOnSelect 选节点预判）仍走 pull：切节点会触发重启清差集，
+ * 需要**即时**差集的场景仍走 pull；切节点的实际应用状态由 server_switch 收据决定，
  * 读 store 快照可能被 push 更新滞后一拍，pull 拿的是当下真值。
  */
 export interface PendingChangesState {
@@ -73,6 +74,26 @@ export interface PendingChangesState {
   removed: string[];
   /** 「保存只持久化」延后的非节点结构性变更（三个数组看不见它，见 `PendingNodeChanges`）。 */
   restartDeferred: boolean;
+}
+
+/**
+ * 后端载荷 → store 形态的**唯一**降级口径（pull / push / 两个入口共四条腿读同一份）。
+ *
+ * 三个 `?? []` 与 `?? false` 不是防御性洁癖：核未运行 / IPC 降级 / 旧版后端时可能拿到缺字段的
+ * 对象，缺一个字段就按「那一类没有欠账」降级，绝不抛、也绝不让操作条恒亮。
+ *
+ * 🔴 **必须是一份**：这段降级此前在 `App.tsx` 里写了两遍（pull 一遍、push 一遍），移动入口接线时
+ * 差点写成第三遍。`modified` 曾经恒空的那次退化，成因正是「pull 与 push 各持一份形状」。
+ */
+export function normalizePendingChanges(
+  raw: Partial<PendingNodeChanges> | null | undefined
+): PendingChangesState {
+  return {
+    added: raw?.added ?? [],
+    modified: raw?.modified ?? [],
+    removed: raw?.removed ?? [],
+    restartDeferred: raw?.restartDeferred ?? false,
+  };
 }
 
 /**
@@ -135,6 +156,8 @@ export interface AppState {
 
   // ── 出口 IP ──
   ipInfo: IpInfoSnapshot | null;
+  /** 最高已接收后端帧版本；清空显示帧时仍保留，拒绝迟到的旧会话帧。 */
+  ipInfoRevision: number;
 
   // ── 解锁检测 ──
   unlock: UnlockDisplayState;
@@ -189,6 +212,7 @@ export interface AppState {
   applyTailscaleStateExists: (states: Record<string, boolean>) => void;
   setTailscaleAuthUrl: (serverId: string, url: string | null) => void;
   setTailscaleStatus: (event: TailscaleStatusEvent) => void;
+  clearTailscaleStatus: (serverId: string) => void;
   setTailscaleLoginInitiated: (serverId: string, initiated: boolean) => void;
   /** 当前配置删除节点后统一驱逐所有以 serverId 为键的派生状态。 */
   retainServerIds: (serverIds: readonly string[]) => void;
@@ -231,6 +255,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   trafficStats: null,
   ipInfo: null,
+  ipInfoRevision: -1,
 
   unlock: initialUnlock,
 
@@ -406,7 +431,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   setTrafficStats: (stats) => set({ trafficStats: stats }),
-  setIpInfo: (info) => set({ ipInfo: info }),
+  setIpInfo: (info) => set((state) => {
+    if (info === null) return { ipInfo: null };
+    // IPC payloads are runtime data. A missing/unsafe revision must never poison
+    // the watermark (undefined would make every later comparison ineffective).
+    if (!Number.isSafeInteger(info.revision) || info.revision < 0) return state;
+    // Rust 在缓存提交时分配 revision。所有写入来源共享此门：事件、peek、
+    // 手动 get 即使按相反顺序返回，也不能将已显示的新帧倒退。
+    if (info.revision <= state.ipInfoRevision) return state;
+    return { ipInfo: info, ipInfoRevision: info.revision };
+  }),
   setUnlock: (partial) =>
     set((state) => ({ unlock: { ...state.unlock, ...partial } })),
 
@@ -575,6 +609,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ tailscaleStatuses: { ...prev, [event.serverId]: event } });
   },
 
+  /** A successful native logout invalidates only that node's last main-core frame. */
+  clearTailscaleStatus: (serverId) => {
+    const prev = get().tailscaleStatuses;
+    if (!(serverId in prev)) return;
+    const next = { ...prev };
+    delete next[serverId];
+    set({ tailscaleStatuses: next });
+  },
+
   /** 标记/清除「用户显式发起的登录在飞」。 */
   setTailscaleLoginInitiated: (serverId, initiated) => {
     if (!serverId) return;
@@ -630,6 +673,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       dnsRules: [],
       trafficStats: null,
       ipInfo: null,
+      // 不重置 ipInfoRevision：WebView 同一进程内清空显示态后，旧事件仍可能迟到。
       unlock: initialUnlock,
       pendingChanges: EMPTY_PENDING,
       invalidNodes: [],

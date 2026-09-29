@@ -432,9 +432,17 @@ fn network_canary_is_wired_into_lifecycle_legs() {
     );
     let crash = compact("    pub(super) fn spawn_crash_monitor(");
     assert_eq!(
-        crash.matches("me.disarm_network_canary()").count(),
+        crash
+            .matches("me.reset_crashed_run_state(my_gen,direct_run_identity.as_ref())")
+            .count(),
         1,
-        "崩溃腿必须 disarm"
+        "崩溃腿必须恰好调用一次受身份保护的状态复位"
+    );
+    let crash_reset = compact("    pub(super) async fn reset_crashed_run_state(");
+    assert_eq!(
+        crash_reset.matches("self.disarm_network_canary()").count(),
+        1,
+        "崩溃状态复位必须 disarm"
     );
     let change = compact("    async fn handle_network_change(");
     let invalidate = change

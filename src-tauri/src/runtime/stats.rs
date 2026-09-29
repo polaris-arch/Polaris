@@ -78,7 +78,7 @@
 //! 可见性真值来源：**窗口实况回读**（`is_visible() && !is_minimized()`，对齐 上游
 //! `isUiBroadcastActive`），**不是** `WindowEvent::Focused`——失焦但仍在屏上的窗口依然有 UI 消费者。
 //! Tauri 2 的 `WindowEvent` 没有 show/hide 变体，故实况回读按 [`PARK_RECHECK_INTERVAL`] 兜底重跑，
-//! `main.rs` 的显隐写入点（`Focused` / 收托盘 / 单实例唤起）只作「显隐可能刚变」的**即时**触发器
+//! `lib.rs` 的显隐写入点（`Focused` / 收托盘 / 单实例唤起）只作「显隐可能刚变」的**即时**触发器
 //! （[`StatsRelay::refresh_window_visible`]）：门一变即经 `watch` 唤醒等在门上的 relay，
 //! 恢复不等兜底周期，用户切回窗口无可感知空窗。
 //!
@@ -182,6 +182,8 @@ pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 mod gate;
 mod projection;
 mod relay;
+/// 两条长驻流的传输层与它**唯一**的平台分叉（桌面 daemon gRPC / Android libbox 命令通道）。
+mod source;
 mod subscription;
 
 pub(crate) use gate::probe_main_window_visible;

@@ -86,7 +86,7 @@ export default function SettingsDisplay({ config, update }: SettingsDisplayProps
       </SetBlock>
 
       {/* 本块四个控件现已全部接线，无 disabled 标记：
-          - minimizeToTray：main.rs 的 `CloseRequested` 读 `config.minimizeToTray` 决定「收进托盘」
+          - minimizeToTray：lib.rs 的 `CloseRequested` 读 `config.minimizeToTray` 决定「收进托盘」
             还是「退出应用」，不再只按托盘是否存在二选一。
           - rememberWindowSize：`tauri-plugin-window-state` 按此配置 gate 注册——开启时插件恢复/
             持久化窗口几何，关闭时不注册（窗口回到默认尺寸）。

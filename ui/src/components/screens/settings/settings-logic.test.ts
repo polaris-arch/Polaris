@@ -411,7 +411,7 @@ describe('消费面守卫 —— 确认框不得在组件里裸用', () => {
    *
    * 排除两类：① `settings-logic.ts` —— 唯一获授权的 `window.confirm` 归宿；② `*.test.ts(x)` /
    * `*.spec.ts(x)` —— 测试里的违规样本是**字符串字面量**（stripComments 摘不掉），扫它等于自己判自己
-   * 违规。**两种后缀都排**：Rust 侧 `main.rs:1535` 的同类扫描 `.test.` / `.spec.` 双排，此处只排前者
+   * 违规。**两种后缀都排**：Rust 侧 `lib.rs:1535` 的同类扫描 `.test.` / `.spec.` 双排，此处只排前者
    * ⇒ 谁第一个建 `foo.spec.ts` 谁踩（当前仓里恰好没有 `.spec.*`，所以是颗哑雷而非现行故障）。
    */
   function collect(dir: string, deps: typeof import('node:fs'), path: typeof import('node:path'), base = dir): string[] {
@@ -431,7 +431,7 @@ describe('消费面守卫 —— 确认框不得在组件里裸用', () => {
     const dir = path.dirname(fileURLToPath(import.meta.url));
     const scanned = collect(dir, fs, path);
 
-    // ── 扫描面自检（对齐 Rust 侧 main.rs 的 `assert!(!files.is_empty(), ...)`）──
+    // ── 扫描面自检（对齐 Rust 侧 lib.rs 的 `assert!(!files.is_empty(), ...)`）──
     // 没有这几条，`dir` 漂走 / 后缀过滤失配都会让 offenders 恒为 []、`toEqual([])` 恒绿。
     //
     // **必扫锚点优先于数量下限**：`toBeGreaterThan(0)` 只挡「全塌」，挡不住「缩水」—— 递归分支被改坏
@@ -2053,7 +2053,12 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
     };
     walk(uiSrc);
 
-    expect(sites.length).toBe(3);
+    /*
+     * 3 → 4（2026-09-06，W-19）：移动端设置页的应用更新检查
+     * （`mobile/settings/app-update-check.ts` 的 `checkAppUpdateViaIpc`）。
+     * 它同样显式带通道 —— 下面那条 `every` 正是为此逐条对拍，本数字只是取材面的量级自检。
+     */
+    expect(sites.length).toBe(4);
     expect(sites.every((site) => site.arg.includes('includePrerelease'))).toBe(true);
     expect(sites.filter((site) => site.arg.includes('includeCurrent:true'))).toEqual([
       {

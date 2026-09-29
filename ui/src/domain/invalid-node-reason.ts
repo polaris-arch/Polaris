@@ -27,6 +27,7 @@
 export const INVALID_NODE_REASON_KEY: Readonly<Record<string, string>> = {
   'detour-cascade': 'nodes.invalidDetourCascade',
   'system-interface-requires-helper': 'errors.systemInterfaceRequiresHelper',
+  'system-interface-unsupported-platform': 'errors.systemInterfaceUnsupported',
   'control-url-ip': 'nodes.invalidControlUrlIp',
   'control-url-scheme': 'nodes.invalidControlUrlScheme',
   'control-url-invalid': 'nodes.invalidControlUrlMalformed',

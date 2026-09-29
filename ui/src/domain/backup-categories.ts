@@ -1,7 +1,7 @@
 /**
  * 选择性备份 / 恢复的**类别枚举**（跨语言类型镜像 + UI 展示顺序）。
  *
- * 8 类（前 7 类对应「数据备份与恢复」卡的统计维度，第 8 类是通用设置）：
+ * 9 类（存量 8 类加 portable meshRouting）：
  *   manualNodes     手动节点   —— servers（无 subscriptionId、非 endpoint 协议）
  *   meshNodes       组网节点   —— servers（无 subscriptionId、endpoint 协议，如 Tailscale/WireGuard）
  *   subscriptions   订阅源     —— subscriptions[] + 其展开节点；两者一体进出（离线也能恢复）
@@ -9,6 +9,7 @@
  *   dnsRules        DNS 规则   —— dnsRules[] + dnsRuleOrder
  *   dnsResources    DNS 资源   —— dnsServers[] + dnsServerGroups[] + dnsDefaults
  *   appRules        应用分流   —— appRules[]
+ *   meshRouting     组网策略   —— 可移植 policy 意图；不含本机 epoch/ledger
  *   generalSettings 通用设置   —— 其余所有 config 字段（排除法，自动涵盖未来新增设置）
  *
  * ## 为什么这里只剩类型与常量（2026-07-16，§C5 落地时裁定）
@@ -43,6 +44,7 @@ export type BackupCategory =
   | 'dnsRules'
   | 'dnsResources'
   | 'appRules'
+  | 'meshRouting'
   | 'generalSettings';
 
 /**
@@ -58,6 +60,7 @@ export const BACKUP_CATEGORIES: readonly BackupCategory[] = [
   'dnsRules',
   'dnsResources',
   'appRules',
+  'meshRouting',
   'generalSettings',
 ];
 

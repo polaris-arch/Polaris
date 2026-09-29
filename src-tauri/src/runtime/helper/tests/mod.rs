@@ -71,6 +71,16 @@ fn stop_does_not_retry_a_structured_pid_mismatch() {
 }
 
 #[test]
+fn stop_requires_an_exact_stop_receipt() {
+    for wire in [b"OK running 4242\n".to_vec(), b"OK stopped 9001\n".to_vec()] {
+        let (client, connects) =
+            stop_test_client(vec![polaris_helper_client::MockStream::with_response(wire)]);
+        assert!(stop_core_with_client(&client, Some(4242)).is_err());
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
 fn managed_core_status_parses_running_and_stopped() {
     for (wire, expected) in [
         (
@@ -129,6 +139,61 @@ fn platform_supported_maps_all_platforms() {
     assert!(
         !platform_supported(Platform::Other),
         "未知平台无 helper 实现 → unsupported 正确"
+    );
+    assert!(
+        !platform_supported(Platform::Android),
+        "Android 无 helper：核在应用进程内跑，没有 daemon、没有提权通道；\
+         tun fd 由 VpnService 授予，不需要提权动作。这条 false 是整个 helper 子系统在\
+         该平台不可达的**唯一**入口闸（安装脚本 / 提权 / LinuxStart 帧全挂在它后面）。"
+    );
+
+    // 全变体穷举：有 helper 的就是那三个，多一个少一个都红。
+    let supported: Vec<Platform> = Platform::ALL
+        .iter()
+        .copied()
+        .filter(|p| platform_supported(*p))
+        .collect();
+    assert_eq!(
+        supported,
+        vec![Platform::Mac, Platform::Win, Platform::Linux],
+        "helper 支持面变了。它必须与 `runtime/proxy::should_start_via_helper` 的平台集合逐值\
+         相同（两处是同一个问题的两份写法），改一处就要对差另一处。"
+    );
+}
+
+/// **跨谓词不变式**：有受保护核目录 ⇒ 该平台有 helper。
+///
+/// 受保护核目录是 helper 的产物（root 安装脚本建、helper 的 `install-core` 写）。两个谓词住在
+/// 两个模块里、各自有各自的全变体测试，但**在此之前没有任何东西断言它们同向** —— 而 2026-09-05
+/// 之前它们确实是矛盾的：`platform_has_protected_core(Other) == true` 且
+/// `platform_supported(Other) == false`，即「这个平台没有 helper，但它有一个由 helper 锁定的核目录」。
+///
+/// 判据是**蕴含**而不是相等：P4 之前 Windows 有 helper 但核走 app 侧（无受保护目录）。P4 起 Win
+/// 也有受保护核目录，两谓词在全部变体上相等 —— 仍只断言蕴含，因为「有 helper 而无受保护目录」
+/// 本身不矛盾，将来某个平台合法地落进那一格时不该被本门拦下。
+///
+/// 正面断言（不能只写「不许出现矛盾」）：蕴含成立的那一侧必须真的非空 —— 若两个谓词同时坏成
+/// 全 false，蕴含会平凡成立，那种绿没有信息量。
+#[test]
+fn protected_core_platforms_are_a_subset_of_helper_platforms() {
+    use crate::runtime::core_promote::platform_has_protected_core;
+
+    let mut both = Vec::new();
+    for platform in Platform::ALL.iter().copied() {
+        if platform_has_protected_core(platform) {
+            assert!(
+                platform_supported(platform),
+                "{platform:?}：判了「有受保护核目录」却判「无 helper」—— 受保护核目录由 helper \
+                 创建并锁定，两者不可能一边有一边没有。改动方须先决定哪一边错了。"
+            );
+            both.push(platform);
+        }
+    }
+    assert_eq!(
+        both,
+        vec![Platform::Mac, Platform::Win, Platform::Linux],
+        "蕴含的非空侧必须是 mac/win/linux。两个谓词同时坏成全 false 时蕴含会平凡成立，\
+         这条相等断言就是那种无信息量绿的正面对照。"
     );
 }
 

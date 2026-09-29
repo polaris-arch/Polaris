@@ -1,0 +1,40 @@
+/* Mobile dark redesign. The shared resolved tokens remain the desktop baseline;
+   light keeps those values, and status colors retain their existing meanings. */
+:root { --mobile-sheet: var(--surface); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']):not([data-theme='dark']) {
+    --bg: 222 22% 8%;
+    --surface: 222 18% 12%;
+    --surface-2: 221 17% 16%;
+    --surface-3: 220 16% 21%;
+    --line: 222 15% 25%;
+    --hair: 222 13% 21%;
+    --fg: 220 20% 93%;
+    --fg-dim: 219 12% 70%;
+    --fg-faint: 220 10% 62%;
+    --flow: 214 90% 67%;
+    --flow-hi: 214 95% 76%;
+    --flow-weak: 216 34% 20%;
+    --ring: 214 90% 70%;
+    --err: 356 74% 70%;
+    --mobile-sheet: var(--surface-2);
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg: 222 22% 8%;
+  --surface: 222 18% 12%;
+  --surface-2: 221 17% 16%;
+  --surface-3: 220 16% 21%;
+  --line: 222 15% 25%;
+  --hair: 222 13% 21%;
+  --fg: 220 20% 93%;
+  --fg-dim: 219 12% 70%;
+  --fg-faint: 220 10% 62%;
+  --flow: 214 90% 67%;
+  --flow-hi: 214 95% 76%;
+  --flow-weak: 216 34% 20%;
+  --ring: 214 90% 70%;
+  --err: 356 74% 70%;
+  --mobile-sheet: var(--surface-2);
+}

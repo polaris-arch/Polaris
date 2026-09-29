@@ -28,14 +28,19 @@ use polaris_unlock_transport::UnlockClient;
 
 /// item6：选中 TS 出口是否直判无效（`unlock_gate_reason` 的 `exit_blocked` 输入）。
 ///
-/// 组装 [`TsExitWarningInput`]：当前配置的选中出口 + 直连模式 + 主核 running + 该节点 STATUS 末帧
+/// 组装 [`TsExitWarningInput`]：运行核 R 的选中出口 + 直连模式 + 主核 running + 该节点 STATUS 末帧
 /// （`peers`/`logged_in`）→ 纯谓词 [`selected_ts_exit_blocked`]。config 读失败/无选中 → false（保守，不误挡）。
 ///
-/// 本函数是**拉侧**（`unlock:run` 时按需求值）。TS STATUS 的逐帧翻转对账由运行时侧
+/// 本函数是**拉侧**（`unlock:run` 时按需求值）。磁盘 D 可能已选新节点但尚未 Apply；
+/// 此时检测传输仍经旧 R 出口，gating 必须用同一份 R，不能拿 D 的 TS 状态阻断旧出口。
+/// TS STATUS 的逐帧翻转对账由运行时侧
 /// `reconcile_ts_exit_block` 负责，并通过 invalidate/自跑腿触发需要的重检；这里仅负责读取当前配置并
 /// 计算本轮 gating 输入。
 fn compute_selected_exit_blocked(state: &AppRuntime, running: bool) -> bool {
-    let Ok(value) = state.config.current() else {
+    if !running {
+        return false;
+    }
+    let Some(value) = state.proxy.current_config_snapshot() else {
         return false;
     };
     let Ok(cfg) = serde_json::from_value::<UserConfig>(value) else {
@@ -78,7 +83,7 @@ fn compute_selected_exit_blocked(state: &AppRuntime, running: bool) -> bool {
 /// `Err` = 建出口 pin 客户端失败（唯一硬失败面）。
 pub async fn run_unlock_cycle(app: AppHandle, force: bool) -> Result<UnlockSnapshot, String> {
     // ── 同步段：取 Arc + 算 gating。Tauri `State` 守卫非 Send，**绝不可跨 await**，故限定在此块内。──
-    let (unlock, running, mixed_port, exit_blocked) = {
+    let (unlock, running, local_proxy, exit_blocked) = {
         use tauri::Manager;
         let Some(state) = app.try_state::<AppRuntime>() else {
             // setup 前极早期 / 关停中 → 静默放弃（同 proxy.rs try_state 范式，绝不 panic）。
@@ -89,30 +94,39 @@ pub async fn run_unlock_cycle(app: AppHandle, force: bool) -> Result<UnlockSnaps
         (
             state.unlock.clone(),
             status.running,
-            status.mixed_port,
+            // 本机 http 代理入站（桌面 `mixed-in`；Android 没有 mixed 入站，走带凭据的 `probe-proxy-in`）。
+            // 此前读 `status.mixed_port`：Android 上它指向一个没人监听的口 ⇒ 解锁检测全超时、无报错。
+            state.proxy.local_http_proxy(),
             exit_blocked,
         )
     };
+    let proxy_port = local_proxy.as_ref().map_or(0, |p| p.port);
 
     // ── gating（SoT `unlock_gate_reason`）：核未运行 → ProxyNotRunning；选中 TS 出口直判无效 → ExitInvalid
     //    （不空跑死出口检测）。blocked 快照不缓存，emit UPDATED 让前端 spinner 复位 ──
-    if let Some(reason) = unlock_gate_reason(running, mixed_port, exit_blocked) {
+    if let Some(reason) = unlock_gate_reason(running, proxy_port, exit_blocked) {
         // info 而非 warn：这是**预期**短路（没开代理就点检测 / 出口没选好），且前端会显示明确的 blocked 态，
         // 不是「卡住」。真机 logLevel=warn 下不刷屏。
-        log::info!("解锁检测短路：{reason:?}（running={running}，mixed_port={mixed_port}，exit_blocked={exit_blocked}）");
+        log::info!("解锁检测短路：{reason:?}（running={running}，proxy_port={proxy_port}，exit_blocked={exit_blocked}）");
         let snap = UnlockSnapshot::blocked(reason);
         BroadcastSink::new(&app).updated(&snap);
         return Ok(snap);
     }
 
-    // ── 出口 pin：经本机 mixed 端口建客户端（检测走当前分流出口）──
+    // ── 出口 pin：经本机 http 代理入站建客户端（桌面 mixed 口走当前分流出口；Android probe-proxy-in 走 proxy-selector）──
     //
     // **传输层 = `UnlockClient`（wreq + Chrome 131 指纹伪装），不是共享的 reqwest `HttpRuntime`**：
     // CF 按 TLS/JA3 指纹判自动化，rustls 形态会吃 1020/403（见 `polaris-unlock-transport` 模块文档）。
-    // 出口 pin 语义与原 `HttpRuntime::via_local_proxy` 等价（同一本机 mixed 口的 HTTP CONNECT）。
-    let http = UnlockClient::via_local_proxy(mixed_port).map_err(|e| {
+    // 出口 pin 语义与原 `HttpRuntime::via_local_proxy` 等价（同一本机 http 代理口的 HTTP CONNECT）。
+    // gating 放行 ⟹ `proxy_port != 0` ⟹ `local_proxy` 为 `Some`（`unlock_gate_reason` 判 0 即短路）。
+    let auth = local_proxy
+        .as_ref()
+        .and_then(|p| p.auth.as_ref())
+        .map(|u| (u.username.clone(), u.password.clone()));
+    let auth_ref = || auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+    let http = UnlockClient::via_local_proxy(proxy_port, auth_ref()).map_err(|e| {
         // warn：建不出客户端 = 这一轮**零 emit**，前端停在检测中。属「没有最终结果」的一种，必须可见。
-        log::warn!("解锁检测：建出口 pin 客户端失败（mixed_port={mixed_port}）：{e}");
+        log::warn!("解锁检测：建出口 pin 客户端失败（proxy_port={proxy_port}）：{e}");
         e
     })?;
     let epoch0 = unlock.epoch();
@@ -134,14 +148,16 @@ pub async fn run_unlock_cycle(app: AppHandle, force: bool) -> Result<UnlockSnaps
     if schedule_recheck {
         let unlock2 = unlock.clone();
         let app2 = app.clone();
-        let port = mixed_port;
+        let port = proxy_port;
+        let auth2 = auth.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(WARM_RECHECK_DELAY_MS)).await;
             // epoch 守卫：调度期间有 invalidate（切节点/起停）→ 取消（别测旧出口）。
             if unlock2.epoch() != epoch0 {
                 return;
             }
-            if let Ok(h) = UnlockClient::via_local_proxy(port) {
+            let auth2 = auth2.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+            if let Ok(h) = UnlockClient::via_local_proxy(port, auth2) {
                 let _ = unlock2
                     .run_recheck(&h, &BroadcastSink::new(&app2), epoch0, unix_millis)
                     .await;

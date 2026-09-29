@@ -10,7 +10,7 @@
  * 四个模式（各自独立、都可在任意平台的开发机上跑）：
  *
  *   node scripts/verify-packaging.mjs confs
- *     纯静态：只读 4 个平台 conf + core-manifest.json + package.yml。不需要构建产物。
+ *     纯静态：只读 4 个平台 conf + core-manifest.json + `.github/workflows/*.yml`。不需要构建产物。
  *     守：公共资源不丢 / 每个 conf 恰含一个平台内核 / base 不含任何平台内核 /
  *         每个 conf 都被 workflow 显式引用（改名即红）/
  *         **per-platform conf 不得含未登记条目**（不变量 E，反向；见下）/
@@ -73,7 +73,8 @@ import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = join(ROOT, 'src-tauri');
-const WORKFLOW = join(ROOT, '.github/workflows/package.yml');
+const WORKFLOWS_DIR = join(ROOT, '.github/workflows');
+const WORKFLOW = join(WORKFLOWS_DIR, 'package.yml');
 
 /**
  * label（CI matrix）→ 平台内核目录名（resources/ 下的目录 = core-manifest 的 key）。
@@ -93,6 +94,95 @@ const CORE_TO_CONF = {
   win: 'tauri.windows.conf.json',
   'mac-arm64': 'tauri.macos-arm64.conf.json',
   'mac-x64': 'tauri.macos-x64.conf.json',
+};
+
+/**
+ * **不随内核分平台**的平台专属 conf 登记表（key = 文件名，相对 `src-tauri/`）。
+ *
+ * `CORE_TO_CONF` 只认「一个平台 = 一份内核目录」那种 conf，方向是 **登记表 → 磁盘**
+ * （遍历 core-manifest 的平台键去找文件）。移动端 conf 不产生 `resources/<平台>/` 内核目录，
+ * 于是它对上面全部不变量（A/B/C/D/E）**结构性不可见**：既不会被扫红，也不会被覆盖。
+ * 本表 + [`checkPlatformConfRegistry`] 补的就是**反方向**那一半 —— 见该函数的文档。
+ *
+ * 每项字段：
+ *  - `why`        —— 这份 conf 为什么存在（登记表要能自解释，否则它只是第二份文件名清单）
+ *  - `topKeys`    —— 除 `$schema` 外允许的顶层键，**集合恰等于**。`--config` 与平台自动合并
+ *                    走同一条 RFC 7396 通路，键混进来就会覆盖 base（同 per-platform conf 的
+ *                    顶层白名单，成因见那里的 M10 变异记录）。
+ *  - `resources`  —— `bundle.resources` 的**登记表**，集合恰等于（多一条 / 少一条都红）。
+ *                    「不多」守的是不变量 E 那个方向（整目录递归铺进包）；「不少」守的是
+ *                    许可文本这类**正面**义务 —— 只写否定式判据会被「什么都没发生」骗过。
+ *  - `ciLeg`      —— 这份 conf 归哪条 CI 腿：`null`（本仓至今没有该平台的腿），或
+ *                    `{ workflow, bind }` —— 腿所在的 workflow 文件名 + 它绑定这份 conf 的**逐字串**。
+ *
+ *                    判据是**双向且按文件枚举**的（见 [`checkPlatformConfRegistry`] ④e）：
+ *                    `.github/workflows/` 下提到这个 conf 文件名的文件集合，必须**恰等于**
+ *                    `ciLeg === null ? {} : { ciLeg.workflow }`，且非 null 时那个文件必须逐字含 `bind`。
+ *
+ *                    🔴 **为什么枚举整个 workflow 目录、而不是只看 package.yml**（2026-09-04 订正）：
+ *                    原判据只 grep package.yml，于是「在**另一个** workflow 里加一条 Android 腿」
+ *                    对它完全不可见 —— 而这正是 Android 腿实际的落点（`android.yml`，步骤面与桌面
+ *                    打包腿不相交）。按 package.yml 一个文件写死的判据，会在它最该说话的那次静默判绿。
+ */
+const NON_CORE_CONFS = {
+  'tauri.android.conf.json': {
+    why:
+      'Android 包：改 identifier（base 的 com.polaris.app 与 Play 在架应用撞包名，同包名不同签名装不上）' +
+      ' + 按平台重筛 bundle.resources（桌面专属资源不进 APK，许可三份仍进）',
+    topKeys: ['identifier', 'bundle'],
+    resources: [
+      // 许可义务不因平台而免：APK 是「副本」，MIT 的版权声明与 NOTICE 的第三方来源指引都要随行。
+      '../LICENSE',
+      '../NOTICE',
+      '../THIRD-PARTY-LICENSES.md',
+      // geo `.srs` 出厂副本。`src-tauri/src/runtime/geo_seed.rs` 无任何 cfg 门控 ⇒ 在 android
+      // 目标里照常编译，`resolve_bundled_data_dir()` 运行期就会找这个目录。464 KB。
+      '../resources/data/',
+    ],
+    // 腿在 `.github/workflows/android.yml`（不在 package.yml：步骤面与四条桌面打包腿完全不相交，
+    // 取舍写在该文件顶部）。`bind` 是那条腿显式传 conf 的逐字串 —— 与四条桌面腿的 `--config` 同一条
+    // 判据：吃 Tauri 的「按平台名自动合并」的话，文件一改名就**静默**停止合并、包里少掉全部资源而
+    // 构建照绿；显式传则改名即 `failed to read configuration file` 硬失败。
+    //
+    // `invocation` 是那条 workflow 里**发起构建的命令**的逐字前缀。判据不是「bind 恰好出现 1 次」，
+    // 而是「**每一次**构建调用都带着 bind」：android.yml 今天有两条腿（debug 开箱验 + release 冒烟），
+    // 将来还会有第三条。写死 1 次的判据在加第二条腿的当天就会红，而它红的理由是错的
+    // （腿变多了，不是绑定丢了）；更糟的反向：把它改成 `>= 1` 就会让「新加的那条腿忘了传 conf」
+    // 静默过门 —— 而那正是本条判据要抓的事。改为按调用次数对拍，覆盖面由判据定，不由当天的腿数定。
+    ciLeg: {
+      workflow: 'android.yml',
+      bind: '--config src-tauri/tauri.android.conf.json',
+      invocation: 'bash scripts/build-android-apk.sh',
+    },
+  },
+  'tauri.ios.conf.json': {
+    why:
+      'iOS 包：按平台重筛 bundle.resources（桌面专属的 core-manifest.json 与 dashboard 不进 .ipa，'
+      + '许可三份仍进）。**没有 `identifier` 覆盖，这是刻意的**：Android 那份覆盖成 com.polaris2.app 的'
+      + '理由是 Play 在架应用撞包名（同包名不同签名装不上），那是 Play 命名空间的事实，不迁移到 App Store；'
+      + '而 Apple 侧反向还有个正面理由 —— macOS 与 iOS 用同一个 bundle id 才是同一条 App Store 记录，'
+      + '分叉 identifier 会连带分叉 keychain access group / app group / NE 扩展的 id。'
+      + '哪天真需要覆盖，本表的 topKeys 恰等于判据会当场红，逼人来写下理由。',
+    topKeys: ['bundle'],
+    resources: [
+      // 与 Android 同一条许可义务：.ipa 也是「副本」，MIT 版权声明与 NOTICE 的第三方来源指引都要随行。
+      '../LICENSE',
+      '../NOTICE',
+      '../THIRD-PARTY-LICENSES.md',
+      // geo `.srs` 出厂副本。`src-tauri/src/runtime/geo_seed.rs` 无任何 cfg 门控 ⇒ 在 ios 目标里
+      // 照常编译，`resolve_bundled_data_dir()` 运行期就会找这个目录。与 android 同形。
+      '../resources/data/',
+    ],
+    // 🔴 `ciLeg: null` 不是「还没填」，它是一条**主动断言**：④e 的方向二按整个 `.github/workflows/`
+    // 目录枚举「提到 tauri.ios.conf.json 的文件集合」，null 时要求该集合**恰为空** ——
+    // 也就是逐字断言「本仓今天没有任何 workflow 跑在这份 conf 上」。
+    // 哪天有人加了 iOS 腿却没回来改本表，那条腿就会跑在一份没有「腿 ↔ conf 绑定」断言覆盖的 conf 上，
+    // 而这一格会替它自曝（多出来的 workflow 文件名会被打进错误信息）。
+    //
+    // 这也是本条与 android 那条的全部差别所在：iOS 产物本仓构不出（无 macOS/Xcode），
+    // 这份 conf 今天只在有人本机 `tauri ios build` 时被 Tauri 按平台名自动合并。
+    ciLeg: null,
+  },
 };
 
 const errors = [];
@@ -527,6 +617,25 @@ function checkConfs() {
   }
 
   checkWindowsInstallMode(base);
+  // 整个 workflow 目录当取材面（不只 package.yml）：`ciLeg` 那条判据要回答的是
+  // 「**有没有哪条腿**跑在这份 conf 上」，只看一个文件对「腿开在别的 workflow 里」结构性失明。
+  let workflows = null;
+  try {
+    workflows = new Map(
+      readdirSync(WORKFLOWS_DIR)
+        .filter((f) => f.endsWith('.yml') || f.endsWith('.yaml'))
+        .sort()
+        .map((f) => [f, readFileSync(join(WORKFLOWS_DIR, f), 'utf8')])
+    );
+  } catch (e) {
+    fail(`读不到 .github/workflows/（${e.code ?? e.message}）—— ciLeg（腿 ↔ conf 绑定）无从断言`);
+  }
+  if (workflows !== null && workflows.size === 0) {
+    // 空扫描面 = 恒绿：package.yml 必然存在，一个 yml 都没枚举到只可能是枚举本身塌了。
+    fail('.github/workflows/ 下一个 *.yml 都没扫到 —— ciLeg 的取材面塌了，本检查退化成恒绿');
+    workflows = null;
+  }
+  checkPlatformConfRegistry(workflows);
   checkWindowsInstallerHooks(base);
   checkMacOpenGuide();
   checkLicenseArtifacts(base, platforms, manifest, workflow);
@@ -541,6 +650,231 @@ function checkConfs() {
     note(
       `conf 不变量：平台 ${platforms.join(', ')}，各含 1 份内核 + ${baseResources.length} 项公共资源，` +
         `且无未登记条目（不变量 E）`
+    );
+  }
+}
+
+/**
+ * **平台专属 conf 的反向登记检查**（磁盘 → 登记表，不是登记表 → 磁盘）。
+ *
+ * 存在理由（2026-09-04）：`confs` 模式的全部不变量都由 **core-manifest 的平台键 × `CORE_TO_CONF`**
+ * 驱动，`package.yml` 的矩阵同源。这条链的方向只有一个 —— **从登记表出发去找文件**。
+ * 对「磁盘上多出来一份没人登记的 `tauri.*.conf.json`」它结构性失明：
+ * 该文件会被 Tauri **按平台名自动合并**（`tauri android build` 自动吃掉 `tauri.android.conf.json`，
+ * CLI `--config` 帮助文本对此有明文），于是它能改 identifier、改 bundle.resources、
+ * 改任何 base 键 —— 而 identifier、资源清单、许可文本登记**全都无人核验**，且一条门都不会红。
+ * 实测：加 `src-tauri/tauri.android.conf.json` 后 `confs` 模式仍 rc=0，零输出提及它。
+ *
+ * 判据方向因此**必须**从磁盘起：`readdirSync(src-tauri)` 枚举全部 `tauri.<x>.conf.json`，
+ * 逐个反查是否登记在 `CORE_TO_CONF`（内核平台）或 [`NON_CORE_CONFS`]（其余）里。
+ * 反过来（遍历登记表查文件在不在）对「多出来一个」永远判绿 —— 那正是本函数要堵的形态。
+ *
+ * ⚠️ 只做到「登记了」还不够：登记表若只是第二份文件名清单，那份 conf 的**内容**依旧无人断言
+ * （「门在但没牙」）。故对 `NON_CORE_CONFS` 里的每份 conf，本函数另施四条：
+ * 顶层键集合恰等于登记值 / `bundle.resources` 集合恰等于登记值 / 引用路径存在且非空 /
+ * 不得含任何平台内核目录。
+ *
+ * @param {Map<string, string>|null} workflows `.github/workflows/` 下每个 `*.yml` 的文件名 → 全文
+ *   （读不到目录时为 null，`ciLeg` 一致性此时不可断言）
+ */
+function checkPlatformConfRegistry(workflows) {
+  const errorsBefore = errors.length;
+
+  // ── ① 磁盘枚举。`tauri.conf.json`（base，只有两段）不在此列；模式要求中间那段非空。
+  const PLATFORM_CONF_RE = /^tauri\.(.+)\.conf\.json$/;
+  let onDisk;
+  try {
+    onDisk = readdirSync(SRC_TAURI)
+      .filter((name) => PLATFORM_CONF_RE.test(name))
+      .sort();
+  } catch (e) {
+    fail(`读不到 src-tauri/ 目录（${e.code ?? e.message}）—— 平台 conf 的登记面无从枚举`);
+    return;
+  }
+  if (onDisk.length === 0) {
+    // 空扫描面 = 恒绿。四份内核 conf 必然存在，一个都没扫到只可能是枚举本身塌了。
+    fail(
+      'src-tauri/ 下一份 tauri.<平台>.conf.json 都没扫到 —— 扫描面塌了，本检查退化成恒绿'
+    );
+    return;
+  }
+
+  const registered = new Map(); // 文件名 → 归属说明（出错信息里要能指出它该归谁管）
+  for (const [core, confName] of Object.entries(CORE_TO_CONF)) {
+    registered.set(confName, `CORE_TO_CONF['${core}']`);
+  }
+  for (const confName of Object.keys(NON_CORE_CONFS)) {
+    if (registered.has(confName)) {
+      fail(
+        `${confName} 同时登记在 CORE_TO_CONF 与 NON_CORE_CONFS —— 两张表的判据不同，` +
+          `同一份 conf 归两处管等于谁都没真管`
+      );
+      continue;
+    }
+    registered.set(confName, 'NON_CORE_CONFS');
+  }
+
+  // ── ② 磁盘 → 登记表（**本函数存在的理由**）。
+  for (const name of onDisk) {
+    if (registered.has(name)) continue;
+    fail(
+      `src-tauri/${name}: 磁盘上存在一份平台专属 conf，但它没有登记在 CORE_TO_CONF 或 NON_CORE_CONFS 里 ——\n` +
+        `  Tauri 会**按平台名自动合并**同名 conf（\`tauri <平台> build\` 无需 --config 即生效），` +
+        `因此它能覆盖 identifier / bundle.resources / 任何 base 键，而 confs 模式的全部不变量都是` +
+        `「登记表 → 磁盘」方向、对多出来的文件结构性失明。\n` +
+        `  要新增平台 conf：带内核的登记进 CORE_TO_CONF（连带 core-manifest 平台键与 package.yml 矩阵腿），` +
+        `不带内核的登记进 NON_CORE_CONFS（连同它的 topKeys / resources / ciLeg 判据）`
+    );
+  }
+
+  // ── ③ 登记表 → 磁盘（NON_CORE_CONFS 那半；CORE_TO_CONF 那半由不变量本体判红）。
+  for (const name of Object.keys(NON_CORE_CONFS)) {
+    if (!onDisk.includes(name)) {
+      fail(
+        `NON_CORE_CONFS 登记了 ${name}，但 src-tauri/ 下没有这个文件 —— ` +
+          `登记表描述的是一份不存在的 conf，它的全部判据随之空转`
+      );
+    }
+  }
+
+  // ── ④ 已登记的非内核 conf：内容判据（登记 ≠ 被核验）。
+  const platformsForCore = Object.keys(CORE_TO_CONF);
+  for (const [name, spec] of Object.entries(NON_CORE_CONFS)) {
+    const confPath = join(SRC_TAURI, name);
+    if (!existsSync(confPath)) continue; // 缺失已在 ③ 判红
+    let conf;
+    try {
+      conf = readJson(confPath, `${name} 的登记判据（顶层键 / 资源清单 / 路径存在性）无从断言`);
+    } catch (e) {
+      fail(e.message);
+      continue;
+    }
+
+    // ④a 顶层键集合恰等于登记值。
+    const topKeys = Object.keys(conf).filter((k) => k !== '$schema').sort();
+    const wantTop = [...spec.topKeys].sort();
+    if (topKeys.join(',') !== wantTop.join(',')) {
+      fail(
+        `src-tauri/${name}: 顶层键应恰为 ${JSON.stringify(wantTop)}（+$schema），实为 ` +
+          `${JSON.stringify(topKeys)} —— 平台 conf 按 RFC 7396 覆盖 base，多一个键就是多一处` +
+          `静默改写（version / productName / 安全策略尤其危险）`
+      );
+    }
+
+    // ④b bundle.resources 集合恰等于登记值。「不多」= 不变量 E 那个方向；
+    //     「不少」= 许可文本这类正面义务（否定式判据会被「什么都没发生」骗过）。
+    const res = conf.bundle?.resources;
+    if (!Array.isArray(res)) {
+      fail(
+        `src-tauri/${name}: bundle.resources 缺失或不是数组 —— 本仓平台 conf 只用数组形态` +
+          `（RFC 7396 的数组整体替换正是按平台筛资源的机制本身）`
+      );
+      continue;
+    }
+    for (const want of spec.resources) {
+      const n = res.filter((e) => e === want).length;
+      if (n !== 1) {
+        fail(
+          `src-tauri/${name}: bundle.resources 里 ${JSON.stringify(want)} 应恰 1 条，实为 ${n} 条 —— ` +
+            `登记表是这份 conf 资源清单的唯一真值；少 = 该资源根本不进包（许可文本尤其：` +
+            `0 条 = 分发义务落空，且没有任何其它门会问）`
+        );
+      }
+    }
+    for (const entry of res) {
+      if (spec.resources.includes(entry)) continue;
+      fail(
+        `src-tauri/${name}: bundle.resources 含未登记条目 ${JSON.stringify(entry)} —— ` +
+          `bundler 会把目录条目**整目录递归**铺进包（源码 / 测试 / 桌面专属资源都能这样进），` +
+          `而本 conf 不在 A/B/C/D/E 任何一条的射程内。\n` +
+          `  登记表：${JSON.stringify(spec.resources)}（要新增先改 NON_CORE_CONFS['${name}'].resources）`
+      );
+    }
+
+    // ④c 不得含任何平台内核目录：桌面内核（x86_64 / mach-o / PE）进移动包 = 纯死重且架构不符。
+    for (const entry of res) {
+      const core = coreDirOf(entry, platformsForCore);
+      if (core) {
+        fail(
+          `src-tauri/${name}: bundle.resources 不得含平台内核目录 ${JSON.stringify(entry)}` +
+            `（属平台 '${core}'）—— 非内核平台的 conf 按定义不随内核分发`
+        );
+      }
+    }
+
+    // ④d 引用路径必须存在且非空（= 不变量 C / C2 同一条性质：存在 ≠ 有内容）。
+    for (const entry of res) {
+      const abs = resolve(SRC_TAURI, entry);
+      if (!existsSync(abs)) {
+        fail(`src-tauri/${name}: 资源路径不存在 '${entry}' → ${abs}`);
+        continue;
+      }
+      for (const [file, size] of nonEmptyViolations(abs)) {
+        fail(
+          `src-tauri/${name}: 资源 '${entry}' 下${size === null ? '目录为空' : '存在 0 字节文件'}：${file}\n` +
+            `  存在 ≠ 有内容 —— fetch / 解压失败的常见形态就是留下空目录或 0 字节文件`
+        );
+      }
+    }
+
+    // ④e ciLeg 一致性：**双向**，且取材面是整个 `.github/workflows/` 目录。
+    //    方向一（登记 → 实况）：ciLeg 指名的那个 workflow 必须真提到这份 conf，且必须逐字含 `bind`
+    //      —— 「登记了一条不存在的绑定」与「绑定写成了会静默失效的隐式合并」都在这里红。
+    //    方向二（实况 → 登记）：**提到这份 conf 的 workflow 文件集合必须恰等于登记值**。
+    //      ciLeg=null 时该集合必须为空：哪天有人在任意一个 workflow 里加了腿却没回来更新本表，
+    //      那条腿就跑在一份没有腿 ↔ conf 绑定断言覆盖的 conf 上 —— 本条替它自曝。
+    if (workflows !== null) {
+      const mentionedIn = [...workflows.entries()]
+        .filter(([, text]) => text.includes(name))
+        .map(([file]) => file)
+        .sort();
+      const wantIn = spec.ciLeg === null ? [] : [spec.ciLeg.workflow];
+      if (mentionedIn.join(',') !== wantIn.join(',')) {
+        fail(
+          `src-tauri/${name}: 提到它的 workflow 应恰为 ${JSON.stringify(wantIn)}，实为 ` +
+            `${JSON.stringify(mentionedIn)} —— NON_CORE_CONFS['${name}'].ciLeg ` +
+            `${spec.ciLeg === null ? '是 null（= 本仓至今没有该平台的 CI 腿）' : `登记在 ${spec.ciLeg.workflow}`}。\n` +
+            `  多出来的那个文件里有一条跑在这份 conf 上、却没有腿 ↔ conf 绑定断言覆盖的腿；` +
+            `少掉则说明登记的绑定根本不存在。改腿的落点必须同时改本表。`
+        );
+      }
+      if (spec.ciLeg !== null) {
+        const text = workflows.get(spec.ciLeg.workflow) ?? '';
+        const hits = text.split(spec.ciLeg.bind).length - 1;
+        // 期望值由**构建调用次数**推导，不写死。腿数会长（android.yml 今天已是 debug + release
+        // 冒烟两条），写死次数的判据会在加腿那天以错误的理由红；而放宽成 `>= 1` 又会让
+        // 「新腿忘了传 conf」静默过门。两个失败方向都要堵，只能对拍。
+        const calls = text.split(spec.ciLeg.invocation).length - 1;
+        if (calls < 1) {
+          fail(
+            `.github/workflows/${spec.ciLeg.workflow}: 找不到构建调用 \`${spec.ciLeg.invocation}\` —— ` +
+              `取材面塌了（腿改了命令形态或整条腿没了），下面那条「每次调用都带 bind」的对拍会在 ` +
+              `0 == 0 上恒真。先确认腿还在，再改 NON_CORE_CONFS 里的 invocation`
+          );
+        } else if (hits !== calls) {
+          fail(
+            `.github/workflows/${spec.ciLeg.workflow}: \`${spec.ciLeg.invocation}\` 被调用 ${calls} 次，` +
+              `而 \`${spec.ciLeg.bind}\` 只出现 ${hits} 次 —— 有构建调用没显式传这份 conf。` +
+              `吃 Tauri 的按平台名自动合并的话，conf 一改名就静默停止合并（包里少掉全部资源、` +
+              `构建照绿）；显式传则改名即硬失败`
+          );
+        }
+      }
+    }
+  }
+
+  if (errors.length === errorsBefore) {
+    const noCi = Object.entries(NON_CORE_CONFS)
+      .filter(([, v]) => v.ciLeg === null)
+      .map(([k]) => k);
+    const withCi = Object.entries(NON_CORE_CONFS)
+      .filter(([, v]) => v.ciLeg !== null)
+      .map(([k, v]) => `${k} → ${v.ciLeg.workflow}`);
+    note(
+      `平台 conf 登记面：磁盘 ${onDisk.length} 份（${onDisk.join(', ')}）全部已登记；` +
+        `非内核 conf ${Object.keys(NON_CORE_CONFS).length} 份内容判据通过` +
+        (withCi.length > 0 ? `；CI 腿绑定：${withCi.join('、')}` : '') +
+        (noCi.length > 0 ? `；其中 ${noCi.join(', ')} 尚无 CI 腿（ciLeg=null，本仓不构建该平台）` : '')
     );
   }
 }

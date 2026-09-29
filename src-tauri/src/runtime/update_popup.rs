@@ -149,16 +149,34 @@ fn build_popup_window(app: &AppHandle, boot: &PopupBootstrap) -> Result<(), Stri
             .initialization_script(crate::tray::theme_boot_script(dark))
             .inner_size(f64::from(boot.width), f64::from(boot.height))
             .resizable(false)
-            .minimizable(false)
-            .maximizable(false)
-            .decorations(false)
             // 上游注释：透明窗在 Win/Linux 有鼠标穿透 bug → 恒不透明 + 主题化底色防白闪。
             .transparent(false)
             .background_color(bg)
-            .always_on_top(true)
-            .skip_taskbar(true)
             // 先隐藏：定位完再 show，避免「先出现在错位置再跳」。
             .visible(false);
+    // ── 桌面独有的窗口装饰/层级属性，整组收进一个 `cfg(desktop)` ──
+    //
+    // 这五个方法**全部**来自 Tauri 的 `#[cfg(desktop)] impl WebviewWindowBuilder`
+    // （tauri 2.11.5 `src/webview/webview_window.rs:445`，同块还有 menu / fullscreen / icon /
+    // shadow / parent 等）—— 移动端没有窗口装饰、任务栏与 z-order 这些概念，整组在 mobile 上不存在。
+    // 逐个撞着修会一个一个来（rustc 对同一条链只报第一个未知方法：本批就先只看见 `minimizable`，
+    // 修完才露出 `maximizable`），故按**那个 impl 块**一次性划线。
+    //
+    // 挪到链尾而不是逐个 `#[cfg]`：属性宏加不进方法链中段；这几个方法各设一个独立字段，
+    // 调用先后不影响结果，桌面行为逐字节不变。
+    //
+    // TODO(mobile) 运行期语义仍待做：Tauri 2 在 mobile 上**不支持多窗口**，这两个次级窗
+    // （托盘浮层 / 更新弹窗）在移动端根本不该被创建。本批只做编译隔离；建窗调用点的门控随
+    // 移动端触发面（前台服务通知 / 商店更新通道）一起定，见 `app_tray` 模块文档的裁定表。
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .minimizable(false)
+            .maximizable(false)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true);
+    }
     // WebView2 启动参数（图形逃生门 `--disable-gpu`）：四个建窗点同值，唯一真值在 graphics_compat。
     if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
         builder = builder.additional_browser_args(args);

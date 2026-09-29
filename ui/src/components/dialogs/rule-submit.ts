@@ -11,15 +11,18 @@ import { editRoute, type StagedEntry } from '@/lib/staged-config';
 import { toast } from '@/lib/error-handler';
 import { isRuleTypeDnsEffectSupported, ruleTypeNameKey, validateRule } from '@/domain/rules';
 import { invalidCondValues, splitVals, type Cond } from './rule-cond';
-import { dnsActionFromChoice } from './dns-action-options';
+/* 🔴 两个符号都从纯 `.ts` 取。`splitDnsRecordLines` 此前 import 自 `./RuleDnsEffect`（`.tsx`），
+   而本模块是移动端规则表单复用的提交腿 —— 那条边会把整份桌面 DNS 字段组件拖进移动端闭包。 */
+import { dnsActionFromChoice, splitDnsRecordLines } from './dns-action-options';
 import { orderWithNewRuleFirst } from '@/domain/network-profile';
-import { splitDnsRecordLines } from './RuleDnsEffect';
 
 export interface RuleSubmitArgs {
   t: TFunction;
   conds: readonly Cond[];
   name: string;
   setErrName: (v: boolean) => void;
+  /** 可选呈现回调：只报告前端已确定的校验失败区域，不改变提交判据。 */
+  onValidationError?: (section: 'basic' | 'cond') => void;
   /** 生效网络：'' = 任何网络（不写 `networkProfileId`）。 */
   networkProfileId: string;
   /**
@@ -67,6 +70,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
     conds,
     name,
     setErrName,
+    onValidationError,
     networkProfileId,
     planeOrder,
     logic,
@@ -113,13 +117,18 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
   if (!filled.length) {
     toast.error(t('rules.invalidHead'), t('rules.errNoCond'));
     // 名称也空时两条错误一起显示（不让用户改完一个再发现另一个）。
+    onValidationError?.(nameEmpty ? 'basic' : 'cond');
     return;
   }
-  if (nameEmpty) return;
+  if (nameEmpty) {
+    onValidationError?.('basic');
+    return;
+  }
   const rconds: RuleCondition[] = filled.map((c) => ({ type: c.t, values: splitVals(c.v) }));
   const multi = rconds.length > 1;
   if (dnsEnabled && rconds.some((condition) => !isRuleTypeDnsEffectSupported(condition.type))) {
     toast.error(t('rules.invalidHead'), t('rules.errDnsCondition'));
+    onValidationError?.('cond');
     return;
   }
 
@@ -150,6 +159,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
           })
         : t('rules.errInvalidRule'),
     );
+    onValidationError?.('cond');
     return;
   }
   const routeAction: RuleAction =

@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn running_probe_attributes_warm_rtt_to_runtime_exit_not_saved_selection() {
+    let runtime = json!({"selectedServerId":"node-a","servers":[{"id":"node-a"}]});
+    let disk = json!({"selectedServerId":"node-b","servers":[{"id":"node-b"}]});
+    let selected = ipinfo_probe_config(true, Some(runtime.clone()), Some(disk.clone()));
+    assert_eq!(selected["selectedServerId"], "node-a");
+    assert!(ipinfo_config_has_real_exit(&selected));
+    assert_eq!(
+        ipinfo_probe_config(false, Some(runtime), Some(disk.clone())),
+        disk
+    );
+    assert!(
+        ipinfo_probe_config(true, None, Some(disk)).is_null(),
+        "运行中无 R 时不得把 D 节点冒充实际出口"
+    );
+}
+
 /// 🔴 出口 IP 自动重探的排程腿不得用 `tokio::spawn` —— 2026-07-21 真机 `SIGABRT` 的同款守卫。
 ///
 /// # 为什么必须是源码扫描，而不是行为测试
@@ -170,17 +187,53 @@ fn pending_snapshot_blanks_both_exits() {
 
 #[test]
 fn proxy_reachability_reports_only_observed_probe_state() {
+    let local = crate::runtime::proxy::LocalHttpProxy {
+        port: 7890,
+        auth: None,
+    };
     let stopped = ProxyStatus::default();
-    assert_eq!(proxy_reachability(&stopped, &Value::Null), "unknown");
+    assert_eq!(
+        proxy_reachability(&stopped, Some(&local), &Value::Null),
+        "unknown"
+    );
 
     let running = ProxyStatus {
         running: true,
         mixed_port: 7890,
         ..Default::default()
     };
-    assert_eq!(proxy_reachability(&running, &Value::Null), "unreachable");
     assert_eq!(
-        proxy_reachability(&running, &json!({ "ip": "1.1.1.1" })),
+        proxy_reachability(&running, Some(&local), &Value::Null),
+        "unreachable"
+    );
+    assert_eq!(
+        proxy_reachability(&running, Some(&local), &json!({ "ip": "1.1.1.1" })),
+        "reachable"
+    );
+    // 核在跑但本机没有可用的 http 代理入站（端口分配失败）→ 没探过，不许报「不可达」。
+    assert_eq!(proxy_reachability(&running, None, &Value::Null), "unknown");
+}
+
+/// **α 批回归**：Android 形态（`mixed_port == 0`、有 `probe-proxy-in`）下代理出口**照样探**。
+///
+/// 旧判据 `status.mixed_port == 0 ⇒ unknown` 让 Android 上首页代理出口 IP 恒空、状态恒「未知」。
+#[test]
+fn proxy_reachability_does_not_depend_on_mixed_port() {
+    let android_like = ProxyStatus {
+        running: true,
+        mixed_port: 0,
+        ..Default::default()
+    };
+    let probe = crate::runtime::proxy::LocalHttpProxy {
+        port: 31002,
+        auth: None,
+    };
+    assert_eq!(
+        proxy_reachability(&android_like, Some(&probe), &Value::Null),
+        "unreachable"
+    );
+    assert_eq!(
+        proxy_reachability(&android_like, Some(&probe), &json!({ "ip": "1.1.1.1" })),
         "reachable"
     );
 }
@@ -390,11 +443,16 @@ async fn retry_is_capped_by_the_total_budget() {
 
 /// 读当前缓存快照（`commit_ipinfo_snapshot` 的落地结果）。
 fn cached_snapshot() -> Value {
-    ipinfo_cache()
+    ipinfo_state()
         .lock()
         .unwrap()
+        .cache
         .clone()
         .expect("前置：本测试已至少落地过一次快照")
+}
+
+fn commit_test_snapshot(epoch: u64, seq: u64, snap: &Value) -> bool {
+    commit_ipinfo_snapshot(epoch, seq, snap).is_some()
 }
 
 /// 造一份带代理出口的快照（`cc` = 代理出口地区码）。
@@ -455,6 +513,11 @@ fn probe_start() -> (u64, u64) {
 /// → 段 (f) 转红（段 (a)–(d) **全绿**，这正是第三轮复审逮到的那一半）。
 #[test]
 fn stale_probe_leg_must_not_overwrite_newer_leg() {
+    assert_eq!(
+        peek_ipinfo_snapshot()["revision"],
+        json!(0),
+        "进程初始空快照也必须携带可比较版本"
+    );
     // ── 前提：世代**严格单调递增且互不相等** ──
     // 若两条腿能领到同一个号，「后来者胜」就退化成「两条都算最新」，下面整道闸形同虚设。
     // **变异锁**：把 `next_ipinfo_epoch` 的 `fetch_add(1, …) + 1` 改成 `load(…) + 1` → 此处转红。
@@ -482,12 +545,12 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
 
     let fresh = snap_with_proxy("1.1.1.1", "HK");
     assert!(
-        commit_ipinfo_snapshot(started, started_seq, &fresh),
+        commit_test_snapshot(started, started_seq, &fresh),
         "最新一腿必须能落地，否则这道闸就成了「谁都别想发布」的死规则"
     );
     // startup 腿 t≈10s 才探完，此刻核还没起 ⇒ 它手里是 proxy=null。
     assert!(
-        !commit_ipinfo_snapshot(startup, startup_seq, &snap_direct_only()),
+        !commit_test_snapshot(startup, startup_seq, &snap_direct_only()),
         "冷启动慢腿必须退场：它一落地就把代理出口盖成 null ⇒ 状态栏回退 '—'、旗面消失"
     );
     assert_eq!(
@@ -501,13 +564,13 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
     let (stopped, stopped_seq) = probe_start();
     next_ipinfo_schedule_seq(); // t≈1.5 起核就绪 → 排程（睡 4s）
     let (restarted, restarted_seq) = probe_start(); // t≈5.5 开探
-    assert!(commit_ipinfo_snapshot(
+    assert!(commit_test_snapshot(
         restarted,
         restarted_seq,
         &snap_with_proxy("2.2.2.2", "JP")
     ));
     assert!(
-        !commit_ipinfo_snapshot(stopped, stopped_seq, &snap_direct_only()),
+        !commit_test_snapshot(stopped, stopped_seq, &snap_direct_only()),
         "零延迟停核腿完全跳过睡前那道闸，只能靠探测**之后**这道闸挡住"
     );
     assert_eq!(
@@ -527,13 +590,13 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
         node_b_seq, node_c_seq,
         "连点（<4s）两腿快照到同一个排程线值"
     );
-    assert!(commit_ipinfo_snapshot(
+    assert!(commit_test_snapshot(
         node_c,
         node_c_seq,
         &snap_with_proxy("3.3.3.3", "SG")
     ));
     assert!(
-        !commit_ipinfo_snapshot(node_b, node_b_seq, &snap_with_proxy("4.4.4.4", "HK")),
+        !commit_test_snapshot(node_b, node_b_seq, &snap_with_proxy("4.4.4.4", "HK")),
         "B 腿后到必须退场，否则状态栏长期显示已经切走的 B 的出口 IP 与旗面"
     );
     let cached = cached_snapshot();
@@ -560,7 +623,7 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
     next_ipinfo_schedule_seq(); // t≈2 用户手点：force 腿的排程与开探同刻
     let (manual_click, manual_seq) = probe_start(); // t≈2 开探
     assert!(
-        commit_ipinfo_snapshot(manual_click, manual_seq, &snap_direct_only()),
+        commit_test_snapshot(manual_click, manual_seq, &snap_direct_only()),
         "手点腿此刻是最新的一条，它自己必须能落地（否则用户点了按钮什么都不会发生）"
     );
     let (settled, settled_seq) = probe_start(); // t=4：收敛腿睡满后才领号、才开探
@@ -575,7 +638,7 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
              若排程线在这里把收敛腿判过期，本轮新加的那一半判据就把 round-2 修好的洞又打开了"
     );
     assert!(
-        commit_ipinfo_snapshot(settled, settled_seq, &snap_with_proxy("6.6.6.6", "JP")),
+        commit_test_snapshot(settled, settled_seq, &snap_with_proxy("6.6.6.6", "JP")),
         "收敛后那条重探腿必须能落地 —— 它才是唯一能拿到真出口的一次探测"
     );
     assert_eq!(
@@ -609,7 +672,7 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
              也是为什么本段的红/绿完全取决于排程线那一半判据"
     );
     assert!(
-        !commit_ipinfo_snapshot(l1, l1_seq, &snap_with_proxy("8.8.8.8", "HK")),
+        !commit_test_snapshot(l1, l1_seq, &snap_with_proxy("8.8.8.8", "HK")),
         "🔴 睡眠中的新腿必须能作废在飞的旧腿：L1 落地会广播已切走的 B 的出口，\
              并把经 C 隧道量到的 RTT 持久写进 B 的延迟徽标"
     );
@@ -620,79 +683,80 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
     );
     let (l2, l2_seq) = probe_start(); // t=8.1 L2 醒 → 领世代开探
     assert!(
-        commit_ipinfo_snapshot(l2, l2_seq, &snap_with_proxy("5.5.5.5", "SG")),
+        commit_test_snapshot(l2, l2_seq, &snap_with_proxy("5.5.5.5", "SG")),
         "L2 是最新的一条，它自己必须能落地（否则这道闸又成了「谁都别想发布」）"
     );
     assert_eq!(cached_snapshot()["proxy"]["ip"], json!("5.5.5.5"));
 
-    // ── 🔵 段 (e) 在飞**计数**：谁排的位谁归还，落地一律不清位 ──
-    //
-    // 缓存里此刻是段 (f) 落地的 5.5.5.5/SG（= 上一个出口）。起核/热切排程腿一排位，peek 型消费方
-    // （托盘浮层每次弹出即 peek、主窗窗口重建水合）就必须与订阅方看到同一帧「置空」，否则同屏两处
-    // 对「我现在从哪出去」给出互相矛盾的答案，且错的那个是用旧出口冒充新出口。
-    //
-    // **变异锁**：① 删掉 `peek_ipinfo_snapshot` 的在飞分支（退回「无条件读缓存」）→ 转红；
-    // ② 把计数退回 `AtomicBool` 的 `store(true)/store(false)`（L1 归还即清掉 L2 的位）→ 转红；
-    // ③ 把归还搬回 `commit_ipinfo_snapshot`（落地即清位）→ 转红。
-    assert_eq!(IPINFO_INFLIGHT.load(Ordering::SeqCst), 0, "前置：无腿在飞");
+    // ── 可见 pending 与终态：同毫秒时仍按 revision 定序 ──
+    let before = peek_ipinfo_snapshot();
+    let (ticket, pending) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
     assert_eq!(
-        peek_ipinfo_snapshot()["proxy"]["ip"],
-        json!("5.5.5.5"),
-        "前置：未在飞时 peek 读缓存（这条同时钉住「别把 peek 改成恒回置空帧」）"
+        pending,
+        peek_ipinfo_snapshot(),
+        "peek 必须复用原 pending 帧"
     );
-
-    IPINFO_INFLIGHT.fetch_add(1, Ordering::SeqCst); // L1 排程（切到 B）
-    let peeked = peek_ipinfo_snapshot();
-    assert!(
-        peeked["proxy"].is_null() && peeked["direct"].is_null(),
-        "在飞时 peek 仍吐上一个出口 ⇒ 托盘浮层/水合腿把旧出口冒充成新出口"
-    );
-    assert_eq!(
-        peeked["loading"],
-        json!(true),
-        "在飞帧须与订阅方那一帧同形（含 loading 标记）"
-    );
-
-    // 缓存**不得**被 pending 帧污染：非 force 的 TTL 短路读的是同一份缓存，写进去会让收敛窗口后
-    // 15s 内的每次 `ipinfo_get` 都短路拿到双 null（把「正在探」固化成「探完了没探到」）。
-    // 这正是 reviewer 点名「不能靠把 pending 写进缓存解决」的那条。
+    assert!(pending["proxy"].is_null() && pending["direct"].is_null());
+    assert_eq!(pending["loading"], json!(true));
+    assert!(pending["revision"].as_u64() > before["revision"].as_u64());
     assert_eq!(
         cached_snapshot()["proxy"]["ip"],
         json!("5.5.5.5"),
-        "在飞标记绝不许顺手写缓存 —— 那会毒化 fresh_cached_snapshot"
+        "pending 不得毒化真实终态 TTL 缓存"
+    );
+    assert_eq!(
+        fresh_cached_snapshot(),
+        Some(pending.clone()),
+        "非 force 水合也不得在 pending 期间返回旧出口"
     );
 
-    IPINFO_INFLIGHT.fetch_add(1, Ordering::SeqCst); // L2 排程（切到 C，L1 仍在飞）
-                                                    // L1 落地（哪怕它这一次真的过了闸）**不得**清位 —— 位是排程腿自己排的。
-    let (landed, landed_seq) = probe_start();
-    assert!(commit_ipinfo_snapshot(
-        landed,
-        landed_seq,
-        &snap_with_proxy("7.7.7.7", "SG")
+    // 第二个事件同步替换 pending；旧排程醒来时不能抢新版的探测身份。
+    let (new_ticket, newer_pending) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
+    assert!(newer_pending["revision"].as_u64() > pending["revision"].as_u64());
+    assert!(begin_scheduled_probe(ticket, true).is_none());
+    assert_eq!(peek_ipinfo_snapshot(), newer_pending);
+    assert!(finish_scheduled_probe(ticket).is_none());
+    assert_eq!(peek_ipinfo_snapshot(), newer_pending);
+
+    let (manual_epoch, manual_seq) = begin_manual_probe();
+    let manual_frame = commit_ipinfo_snapshot(manual_epoch, manual_seq, &snap_direct_only())
+        .expect("手点腿在自动收敛窗口内应可先落地");
+    assert!(manual_frame["revision"].as_u64() > newer_pending["revision"].as_u64());
+    assert_eq!(
+        ipinfo_state().lock().unwrap().pending_seq,
+        Some(new_ticket),
+        "手点终态不得取消自动长热身排程"
+    );
+    let (landed, landed_seq) = begin_scheduled_probe(new_ticket, true).unwrap();
+    let final_frame =
+        commit_ipinfo_snapshot(landed, landed_seq, &snap_with_proxy("7.7.7.7", "SG")).unwrap();
+    assert!(final_frame["revision"].as_u64() > newer_pending["revision"].as_u64());
+    assert_eq!(
+        final_frame,
+        peek_ipinfo_snapshot(),
+        "终态与 peek 必须是同一权威帧"
+    );
+    assert!(finish_scheduled_probe(new_ticket).is_none());
+
+    // 停核同步清代理并写缓存，旧在飞探测不能在新版后落地。
+    let (old_epoch, old_seq) = probe_start();
+    let (stop_ticket, stopped) = declare_scheduled_refresh(0);
+    assert!(stopped["proxy"].is_null());
+    assert_eq!(stopped, peek_ipinfo_snapshot());
+    assert_eq!(stopped, cached_snapshot());
+    assert!(stopped["revision"].as_u64() > final_frame["revision"].as_u64());
+    assert!(!commit_test_snapshot(
+        old_epoch,
+        old_seq,
+        &snap_with_proxy("8.8.8.8", "HK")
     ));
-    assert_eq!(
-        IPINFO_INFLIGHT.load(Ordering::SeqCst),
-        2,
-        "落地不得清位：`AtomicBool` 时代 L1 一落地就把 L2 排的位也清了 —— \
-             L2 剩下的 3s 收敛窗口里 peek 型消费方照吐已切走节点的缓存值"
-    );
-    IPINFO_INFLIGHT.fetch_sub(1, Ordering::SeqCst); // L1 跑完归还自己那一格
+    let (stop_epoch, stop_seq) = begin_scheduled_probe(stop_ticket, false).unwrap();
+    let (_, restarted_pending) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
     assert!(
-        peek_ipinfo_snapshot()["proxy"].is_null(),
-        "L2 仍在收敛窗口里 ⇒ peek 必须继续置空，绝不许因为 L1 跑完就提前开窗"
+        !commit_test_snapshot(stop_epoch, stop_seq, &snap_direct_only()),
+        "旧停核探测不得越过重启 pending"
     );
-
-    IPINFO_INFLIGHT.fetch_sub(1, Ordering::SeqCst); // L2 跑完归还
-    assert_eq!(
-        IPINFO_INFLIGHT.load(Ordering::SeqCst),
-        0,
-        "全部归还后计数须归零"
-    );
-    assert_eq!(
-        peek_ipinfo_snapshot()["proxy"]["ip"],
-        json!("7.7.7.7"),
-        "归还后 peek 须回到读缓存，且读到的是最后落地的那个出口"
-    );
+    assert_eq!(peek_ipinfo_snapshot(), restarted_pending);
 
     // ── 🔴 段 (g) 出口**直判无效终态**：mark 必须宣告排程线，否则在飞探测腿把终态盖回去 ──
     //
@@ -720,7 +784,7 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
     );
     // t=15 在飞腿落地 —— 必须退场。
     assert!(
-        !commit_ipinfo_snapshot(blocked_probe, blocked_probe_seq, &snap_direct_only()),
+        !commit_test_snapshot(blocked_probe, blocked_probe_seq, &snap_direct_only()),
         "🔴 直判终态之后落地的在飞腿必须退场：它探的是一个**已知无效**的出口，结果只可能是 \
              null/error，而覆盖掉 proxyBlocked 之后终态不会重落（reconcile 同态早退）"
     );
@@ -729,4 +793,18 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
         json!("ts-exit-device-offline"),
         "段 (g) 复现：状态栏从「出口无效」被改写成「检测失败」，并一直挂到下一次真跨态"
     );
+
+    // 自愈认领与手点交错：自愈若先认领，手点领更大的世代且能落地；
+    // 若手点先宣告，自愈 CAS 失败。两者不允许出现“旧自愈在手点后领更大世代”的中间态。
+    let expected = current_ipinfo_schedule_seq();
+    let (retry_epoch, retry_seq) = claim_unreachable_retry_probe(expected).unwrap();
+    let (manual_epoch, manual_seq) = begin_manual_probe();
+    assert!(retry_epoch < manual_epoch && retry_seq < manual_seq);
+    assert!(commit_ipinfo_snapshot(manual_epoch, manual_seq, &snap_direct_only()).is_some());
+    assert!(!commit_test_snapshot(
+        retry_epoch,
+        retry_seq,
+        &snap_with_proxy("8.8.8.8", "HK")
+    ));
+    assert!(claim_unreachable_retry_probe(retry_seq).is_none());
 }

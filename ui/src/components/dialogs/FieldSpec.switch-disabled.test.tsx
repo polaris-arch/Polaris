@@ -94,8 +94,11 @@ describe('switch 禁用态：可见但不可写，且说明为什么', () => {
  *
  * # 为什么只能是结构门
  *
- * 理想做法是 import `wgSpec()` 直接看返回值。做不到：`WgDialog.tsx` 在 node 环境加载期就有依赖
- * 访问 DOM。故这里读源码：WARP 专用表单不得出现不适用项，通用 WG 表单则保留可见禁用项。
+ * 理想做法是 import `wgSpec()` 直接看返回值。`wgSpec` 2026-09-06 搬进了零 React 的 `wg-spec.ts`，
+ * 这条路今天**是通的** —— 而本组仍留在源码面上，因为它要断言的另一半是**否定式**的
+ * （「WARP 专用表单里不许出现 `k: 'reverseMesh'`」）：那半边没有可 import 的返回值，
+ * 只有「这段源码里没有这一项」。行为面由 `mobile/forms/mesh-forms.test.tsx` 那一组真渲染补上
+ * （它拿 `wgSpec()` 的返回值喂 `MobileFields`，断言禁用态真的渲染成 `disabled`）。
  *
  * # 为什么值得有
  *
@@ -138,8 +141,11 @@ describe('reverseMesh 表单边界：WARP 专用表单省略，通用 WG 可见�
     return entry;
   }
 
-  const warp = stripComments(read('./WarpDialog.tsx'));
-  const wg = specEntry(read('./WgDialog.tsx'));
+  /* WARP 专用表单的取材面是**两份的并集**（2026-09-06 `advSpec` 搬进 `warp-spec.ts` 之后）：
+     只读其中一份会让「不适用项没被塞回来」这条否定断言在另一份上失效。 */
+  const warp = stripComments(read('./WarpDialog.tsx') + '\n' + read('./warp-spec.ts'));
+  /* 通用 WG 的字段表住在 `wg-spec.ts`（`wgSpec` 搬了家，理由见那份文件头注）。 */
+  const wg = specEntry(read('./wg-spec.ts'));
 
   it('WARP 专用表单不展示不适用的 reverseMesh 项', () => {
     expect(warp).not.toContain("k: 'reverseMesh'");

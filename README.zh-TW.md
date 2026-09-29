@@ -146,8 +146,15 @@ DNS 與路由變更可能暫時影響網路連線；進行重要操作前請備�
 
 ## 授權
 
-MIT（見 `LICENSE`）。sing-box（GPLv3）以 sidecar 子行程形式整合（mere aggregation），
-不影響本專案授權；第三方元件見 `NOTICE`。
+Polaris 自身原始碼 MIT（見 `LICENSE`）。**但產物的散布條款按平台不同**：
+
+- **桌面（Windows / macOS / Linux）：MIT。** sing-box（GPLv3）以 sidecar 子行程形式整合，
+  依 mere-aggregation 立場不影響本專案授權。**該立場未經法院檢驗**，見 `NOTICE`。
+- **Android：整體 GPLv3。** 該平台上 sing-box 只能以 libbox 形態載入應用行程
+  （tun 描述子只能經行程內介面取得），mere aggregation 不成立；Kotlin 側亦移植自 GPLv3 的
+  sing-box-for-android。取用 APK 的人得到 GPLv3，只取本倉 MIT 原始碼檔的人仍得到 MIT。
+
+第三方元件與完整論述見 `NOTICE`。
 
 ## Star 趨勢
 

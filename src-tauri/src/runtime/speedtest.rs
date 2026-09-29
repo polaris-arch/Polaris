@@ -62,13 +62,15 @@ use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
 use polaris_config_engine::builder::system_interfaces::{
     raw_endpoint_requests_system_interface, system_interface_ownership_error,
 };
+#[cfg(any(target_os = "android", test))]
+use polaris_config_engine::singbox::inbound::InboundUser;
 use polaris_config_engine::singbox::DomainResolver;
 use polaris_config_engine::user_config::protocol_settings::tailcat_emit_check;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
 use polaris_core_supervisor::{
     core_startup_estimate_ms, wait_for_core_ready, CoreReadyDeps, CoreReadyOutcome, PortAllocator,
-    PortExclusions, Signal, SpawnRequest, StdioPolicy, WaitForCoreReadyOptions,
+    PortExclusions, Signal, SpawnError, SpawnRequest, StdioPolicy, WaitForCoreReadyOptions,
     CORE_READY_SAFETY_FACTOR, CORE_STARTUP_BASELINE_FIXED_MS, CORE_STARTUP_PER_NAIVE_MS,
     CORE_STARTUP_PER_NODE_US,
 };
@@ -85,6 +87,32 @@ use crate::runtime::proxy::{pid_alive, send_signal, CoreBuildEnv};
 use crate::runtime::tailscale_login_core::{
     ConfigChecker, LoginCoreChild, LoginCoreSpawner, SingBoxConfigChecker, TokioLoginCoreSpawner,
 };
+
+#[cfg(target_os = "android")]
+mod android;
+
+/// Only an acknowledged native close permits the next Android batch. The
+/// marker travels inside the existing SpawnError source so the desktop
+/// process-spawner contract stays unchanged.
+#[derive(Debug)]
+struct TempCoreCleanupUnknown(String);
+
+impl std::fmt::Display for TempCoreCleanupUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TempCoreCleanupUnknown {}
+
+fn spawn_cleanup_unknown(error: &SpawnError) -> Option<String> {
+    match error {
+        SpawnError::Spawn { source, .. } => source
+            .get_ref()?
+            .downcast_ref::<TempCoreCleanupUnknown>()
+            .map(|unknown| unknown.0.clone()),
+    }
+}
 
 /// 临时核可测节点的**滑动窗口**上限（对齐 上游 `SpeedTestService.PROXY_TEST_CONCURRENCY = 16`，`:90`）。
 ///
@@ -877,7 +905,14 @@ pub fn plan_temp_core_with_bindings(
     let mut out = TempCorePlan::default();
     let mut seen_tags: BTreeSet<String> = BTreeSet::new();
     for s in servers {
-        if s.protocol == Protocol::Tailscale {
+        // Custom endpoints can carry a raw tailscale type even when the typed
+        // protocol is Custom. Reject before constructing a node: constructing
+        // a second tsnet identity could initialize its state_directory.
+        let raw_tailscale = s.protocol == Protocol::Custom
+            && s.custom_settings.as_ref().is_some_and(|custom| {
+                custom.outbound.get("type").and_then(Value::as_str) == Some("tailscale")
+            });
+        if s.protocol == Protocol::Tailscale || raw_tailscale {
             out.tailscale.push(s.id.clone());
             continue;
         }
@@ -1236,6 +1271,72 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
         cfg["endpoints"] = Value::Array(endpoints);
     }
     cfg
+}
+
+/// Android never writes this round's HTTP inbound credential to `speedtest-core.json`.
+/// Both libbox check and start receive this in-memory derivative of the same
+/// generated file. It is deliberately strict: a raw custom endpoint cannot
+/// smuggle a second Tailscale state directory into the transient host.
+#[cfg(any(target_os = "android", test))]
+fn authenticated_android_temp_config(raw: &str, auth: &InboundUser) -> Result<String, String> {
+    if auth.username != "polaris-temp" || auth.password.len() < 32 {
+        return Err("Android 测速入站凭据无效".to_owned());
+    }
+    let mut config: Value =
+        serde_json::from_str(raw).map_err(|_| "Android 测速临时配置 JSON 无效".to_owned())?;
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| "Android 测速临时配置根节点无效".to_owned())?;
+    if root.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "log" | "dns" | "inbounds" | "outbounds" | "route" | "endpoints"
+        )
+    }) {
+        return Err("Android 测速临时配置包含禁止的顶层能力".to_owned());
+    }
+    for field in ["endpoints", "outbounds"] {
+        let Some(value) = root.get(field) else {
+            if field == "outbounds" {
+                return Err("Android 测速临时配置缺少出站".to_owned());
+            }
+            continue;
+        };
+        let nodes = value
+            .as_array()
+            .filter(|nodes| field != "outbounds" || !nodes.is_empty())
+            .ok_or_else(|| "Android 测速临时配置出站形态无效".to_owned())?;
+        if nodes.iter().any(|node| {
+            !node.is_object()
+                || node.get("type").and_then(Value::as_str) == Some("tailscale")
+                || raw_endpoint_requests_system_interface(node)
+        }) {
+            return Err("Android 测速临时核不允许 Tailscale 或系统网卡端点".to_owned());
+        }
+    }
+    let inbounds = root
+        .get_mut("inbounds")
+        .and_then(Value::as_array_mut)
+        .filter(|inbounds| (1..=512).contains(&inbounds.len()))
+        .ok_or_else(|| "Android 测速临时配置缺少 HTTP 入站".to_owned())?;
+    for inbound in inbounds {
+        let object = inbound
+            .as_object_mut()
+            .ok_or_else(|| "Android 测速临时配置入站形态无效".to_owned())?;
+        let valid = object.len() == 4
+            && object.get("type").and_then(Value::as_str) == Some("http")
+            && object.get("listen").and_then(Value::as_str) == Some("127.0.0.1")
+            && object.get("tag").and_then(Value::as_str).is_some()
+            && object
+                .get("listen_port")
+                .and_then(Value::as_u64)
+                .is_some_and(|port| (1..=u16::MAX as u64).contains(&port));
+        if !valid {
+            return Err("Android 测速临时配置包含非回环 HTTP 入站".to_owned());
+        }
+        object.insert("users".to_owned(), json!([auth]));
+    }
+    serde_json::to_string(&config).map_err(|_| "Android 测速临时配置序列化失败".to_owned())
 }
 
 /// **临时核让位判据**（纯逻辑；[`crate::commands::speedtest`] 的 `is_superseded` 的镜像腿）。
@@ -1942,6 +2043,8 @@ pub enum TempCoreOutcome {
     /// 起核前/就绪前失败（解析不到核 / 端口分配失败 / 写配置失败 / spawn 失败 / 未就绪）。
     /// **整批一个数值都不产出**（绝不把「核没起来」写成一批 `-1`）。
     Failed(String),
+    /// Native host teardown was not acknowledged. Never start another batch.
+    CleanupUnknown(String),
     /// 本批规模越过 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`] ⇒ **起核前**拒绝（一个端口都没烧、
     /// 一个子进程都没留）。载荷是**诊断原文**。
     ///
@@ -1980,6 +2083,7 @@ enum BatchOutcome {
         detail: String,
         oversized: bool,
     },
+    CleanupUnknown(String),
     /// 起核前/就绪期间被主核接管 ⇒ **整轮**到此为止（后面的批一个都不该再起）。
     Superseded,
 }
@@ -2126,6 +2230,9 @@ impl TempCoreSession {
                     if first_failure.is_none() {
                         first_failure = Some((detail, oversized));
                     }
+                }
+                BatchOutcome::CleanupUnknown(detail) => {
+                    return TempCoreOutcome::CleanupUnknown(detail);
                 }
             }
         }
@@ -2323,10 +2430,13 @@ impl TempCoreSession {
         // 理由同主核 spawner（GUI 从 launchd 拉起时父进程 CWD=`/` 只读）。
         req.extra_args = vec!["--disable-color".to_string()];
         req.working_dir = Some(deps.config_dir.clone());
-        let child = match deps.spawner.spawn(req) {
+        let child = match deps.spawner.spawn(req).await {
             Ok(c) => c,
             Err(e) => {
                 retire_temp_config(&config_path, keep_config);
+                if let Some(detail) = spawn_cleanup_unknown(&e) {
+                    return BatchOutcome::CleanupUnknown(detail);
+                }
                 return BatchOutcome::Failed {
                     detail: format!("测速临时核 spawn 失败: {e}"),
                     oversized: false,
@@ -2438,11 +2548,15 @@ impl TempCoreSession {
         match ready {
             CoreReadyOutcome::Ready => {}
             CoreReadyOutcome::Superseded => {
-                child.terminate().await;
+                if let Err(detail) = child.close_confirmed().await {
+                    return BatchOutcome::CleanupUnknown(detail);
+                }
                 return BatchOutcome::Superseded;
             }
             other => {
-                child.terminate().await;
+                if let Err(detail) = child.close_confirmed().await {
+                    return BatchOutcome::CleanupUnknown(detail);
+                }
                 // 整批一个数值都不产出：核没起来 ≠ 每个节点都超时。写一批 -1 就是伪造 N 次真实测量。
                 // 报错必须带**本批规模与预算的推导输入**：门不再是一个人人都知道的常数了，
                 // 少了这三个数，下一个人看到「20784ms 内未监听」根本无从判断门是算宽了还是算窄了。
@@ -2481,7 +2595,9 @@ impl TempCoreSession {
         };
         // 收核走**无条件**路径（含核已自己退出那条腿：那时 `terminate()` 只是收残句柄，不会再发信号，
         // 见 `TokioLoginCoreChild::terminate` 的 `pid == 0` 早退）。
-        child.terminate().await;
+        if let Err(detail) = child.close_confirmed().await {
+            return BatchOutcome::CleanupUnknown(detail);
+        }
         log::info!("测速临时核本批已回收：pid={pid}，outcome={outcome}");
         BatchOutcome::Ran(results)
     }

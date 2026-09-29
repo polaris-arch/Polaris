@@ -66,6 +66,7 @@ const { BackupImportDialog } = await import('./BackupImportDialog');
 const picked = {
   filePath: '/tmp/backup.json',
   available: ['manualNodes', 'subscriptions', 'generalSettings'] as BackupCategory[],
+  blockedCategories: [] as BackupCategory[],
   counts: { manualNodes: 2, subscriptions: 1, generalSettings: 1 },
   unavailableInterfaceBindings: {},
 };

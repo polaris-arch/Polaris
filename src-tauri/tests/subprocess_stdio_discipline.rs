@@ -172,12 +172,17 @@ const SPAWNER_TYPE_FORMS: &[&str] = &[
 
 /// [`SPAWNER_TYPE_FORMS`] 的「家」：定义与再导出所在的文件。
 ///
-/// 它们提到这些类型是在**定义**它们，不是在消费管道，故不要求登记为消费者。除此之外的任何生产文件
-/// 一旦提到这些类型，就必须是注册表 2 里的消费者——新写一个消费者却不登记，文件集合对差当场红。
+/// 它们提到这些类型是在**定义**它们，不是在消费管道，故不要求登记为消费者。除此之外的生产文件
+/// 必须是注册表 2 的管道消费者，或经 [`IN_PROCESS_SPAWNER`] 逐项核验的无管道实现。
+/// 新写一个消费者却不登记，文件集合对差当场红。
 const SPAWNER_TYPE_HOME: &[&str] = &[
     "crates/core-supervisor/src/lib.rs",
     "crates/core-supervisor/src/spawner.rs",
 ];
+
+/// Android 测速复用 `LoginCoreSpawner` trait，但用进程内 libbox instance；没有子进程管道。
+/// 此文件仍参加类型面对差，并在 G2 用实现锚点和无管道形态断言逐项核验。
+const IN_PROCESS_SPAWNER: &str = "src-tauri/src/runtime/speedtest/android.rs";
 
 /// 构造一个 spawn 请求的形态。**两种写法都要盖住**：构造函数与结构体字面量 —— 字段全 `pub`，
 /// 绕开构造函数直接写字面量一样编得过（少写 `stdio` 那一格才编不过）。
@@ -1144,6 +1149,26 @@ fn every_consumer_of_the_shared_spawner_drains_both_streams() {
     let surface = scan_surface();
     let index = surface_by_path(&surface);
 
+    let android = file_of(&index, IN_PROCESS_SPAWNER);
+    let spawn = block_of(
+        android,
+        "impl LoginCoreSpawner for AndroidSpeedtestSpawner {",
+    );
+    assert!(
+        spawn.contains("android_bridge::start_transient_speedtest(")
+            && spawn.contains("Box::new(AndroidSpeedtestChild"),
+        "{IN_PROCESS_SPAWNER} 必须仍经 Android libbox 创建进程内 instance"
+    );
+    assert!(
+        ![PIPED_FORM, POLICY_FORM, SPAWNER_CONSTRUCTION_FORM]
+            .iter()
+            .any(|form| android.masked.contains(form))
+            && !PIPE_TAKE_FORMS
+                .iter()
+                .any(|form| android.masked.contains(form)),
+        "{IN_PROCESS_SPAWNER} 出现子进程/管道形态；须改进消费者登记和双流排空判据"
+    );
+
     // 三条腿的判定结果**全部**收齐再报，不是撞到第一条就 panic：三条腿共用同一个 spawner、
     // 同一份排空实现，一次改动同时打坏两条是常态（本轮那个变异就是两条腿一起丢 stderr）。
     // 撞一条就停，失败信息只说得出其中一条，另一条要等下一轮才暴露 —— 而人看到「红了一条」
@@ -1186,7 +1211,8 @@ fn every_consumer_of_the_shared_spawner_drains_both_streams() {
              类型搬家了，这条豁免已经失去对象，成了将来某个真消费者的免死金牌"
         );
     }
-    let registered: Vec<&str> = PRODUCER_CONSUMERS.iter().map(|c| c.file).collect();
+    let mut registered: Vec<&str> = PRODUCER_CONSUMERS.iter().map(|c| c.file).collect();
+    registered.push(IN_PROCESS_SPAWNER);
     if let Err(reason) = judge_consumer_registry_files(&mentions, &registered) {
         panic!("{reason}");
     }

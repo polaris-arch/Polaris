@@ -1,5 +1,5 @@
 use crate::commands::guard_scan::top_level_fn_body;
-use crate::test_support::crate_code;
+use crate::test_support::{crate_code, crate_root_code};
 
 /// Q1-b ④：正常退出收尾在 `ExitRequested` 里的**落点**必须晚于轻量模式早退；统一汇流点内，
 /// 标记必须先于阻塞停核。行为断言够不着（要一个跑起来的 Tauri 事件循环），而挪错任何一边
@@ -15,7 +15,7 @@ use crate::test_support::crate_code;
 /// cleanup 之后 ⇒ 转红。
 #[test]
 fn clean_exit_marker_is_written_only_on_the_real_exit_leg() {
-    let main = top_level_fn_body(&crate_code("main.rs"), "fn main() {");
+    let main = top_level_fn_body(&crate_root_code(), "pub fn run() {");
     let prevent = main
         .find("api.prevent_exit();")
         .expect("锚点消失：C16 轻量模式的 prevent_exit 早退，守卫已失去判据");

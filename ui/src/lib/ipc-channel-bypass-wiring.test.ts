@@ -32,10 +32,11 @@
  * 新写一个裸 `invoke('x')`、或把常量表里某条改名而 Rust 侧没跟着改，都必然转红。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { productionRsFilesUnder } from '@/contracts/rust-source.test-support';
+import { crateRootSource, productionRsFilesUnder } from '@/contracts/rust-source.test-support';
 import { rawRustJsInvokes, rustCode } from '@/contracts/rust-js.test-support';
 
 const SRC = fileURLToPath(new URL('..', import.meta.url));
@@ -48,7 +49,10 @@ function collectSources(dir: string, ext: RegExp, acc: string[] = []): string[] 
     if (e === 'node_modules' || e === 'dist') continue;
     const full = join(dir, e);
     if (statSync(full).isDirectory()) collectSources(full, ext, acc);
-    else if (ext.test(e) && !/\.(test|spec)\.tsx?$/.test(e)) acc.push(full);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (ext.test(e) && !IS_TEST_ONLY_MODULE.test(e)) acc.push(full);
   }
   return acc;
 }
@@ -107,7 +111,7 @@ function registeredTauriCommands(main: string): Set<string> {
   const body = rustCode(main).match(
     /\.invoke_handler\s*\(\s*tauri::generate_handler!\s*\[([\s\S]*?)\]\s*\)/,
   )?.[1];
-  if (!body) throw new Error('[ipc-channel-bypass] main.rs 的 generate_handler![] 解析不到');
+  if (!body) throw new Error('[ipc-channel-bypass] crate 根的 generate_handler![] 解析不到');
   return new Set(
     body
       .split(',')
@@ -136,9 +140,9 @@ const RAW_RUST_JS_INVOKES = PRODUCTION_RUST_FILES.flatMap((file) =>
 // 这里登记 IPC_CHANNELS 的**键**而非再抄 wire 字符串；generic inventory 负责发现所有 raw invoke，
 // 本表负责防「删掉一条必备腿，再拿另一条合法/重复 invoke 补数量」的集合替换假绿。
 const REQUIRED_RAW_RUST_JS_CHANNEL_KEYS = ['FATAL_RETRY', 'TRAY_HIDE'] as const;
-const MAIN_RS = PRODUCTION_RUST_FILES.find((file) => file.rel === 'src-tauri/src/main.rs');
-if (!MAIN_RS) throw new Error('[ipc-channel-bypass] production Rust 面缺 main.rs');
-const REGISTERED_COMMANDS = registeredTauriCommands(MAIN_RS.src);
+// 取材面是 **crate 根**（`main.rs` + `lib.rs`）：`generate_handler![]` 住在哪个文件是实现细节
+// （装配已下沉进 `lib.rs`），判据是「注册集与定义集、调用集三方对得上」。见 `crateRootSource`。
+const REGISTERED_COMMANDS = registeredTauriCommands(crateRootSource('src-tauri/src'));
 const DEFINED_COMMANDS = definedTauriCommands(PRODUCTION_RUST_FILES.map((file) => file.src));
 
 /** 抽 `invoke('x')` / `listen('x')` 的裸字面量通道名（含泛型实参写法 `invoke<T>('x')`）。 */

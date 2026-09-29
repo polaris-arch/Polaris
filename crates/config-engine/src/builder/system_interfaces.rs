@@ -5,6 +5,8 @@ use serde_json::Value;
 
 pub const INVALID_REASON_SYSTEM_INTERFACE_REQUIRES_HELPER: &str =
     "system-interface-requires-helper";
+pub const INVALID_REASON_SYSTEM_INTERFACE_UNSUPPORTED_PLATFORM: &str =
+    "system-interface-unsupported-platform";
 
 /// Inspect both representations: flattened extras can conflict with typed fields when serialized.
 #[must_use]
@@ -50,6 +52,16 @@ pub fn ensure_managed_system_interfaces(
         Ok(())
     } else {
         Err(system_interface_ownership_error(&tags))
+    }
+}
+
+/// Android's in-process VPN host cannot create a second kernel interface. Check the final
+/// post-gate endpoints, including flattened extras, before handing the config to libbox.
+pub fn ensure_android_supported_endpoints(endpoints: &[Endpoint]) -> Result<(), &'static str> {
+    if endpoints.iter().any(endpoint_requests_system_interface) {
+        Err("Android VPN mode does not support an endpoint system interface")
+    } else {
+        Ok(())
     }
 }
 

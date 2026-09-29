@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { ServerConfig } from '../contracts/types';
-import { admitMeshSingletons, meshSingletonConflict } from './endpoint-routes';
+import { admitMeshSingletons, canCloneServer, meshSingletonConflict } from './endpoint-routes';
 
 const srv = (p: Partial<ServerConfig> & { id: string }): ServerConfig =>
   ({ name: p.id, protocol: 'vless', address: '', port: 443, ...p }) as ServerConfig;
@@ -34,6 +34,19 @@ const warpByDomain = (id: string, host = 'engage.cloudflareclient.com'): ServerC
 const tsNode = (id: string): ServerConfig => srv({ id, protocol: 'tailscale' });
 const plainWg = (id: string): ServerConfig =>
   srv({ id, protocol: 'wireguard', address: '203.0.113.7', wireguardSettings: { ...wgBase } });
+
+describe('canCloneServer —— 源节点自身占单例槽', () => {
+  it('新旧两种 WARP 都不提供克隆能力', () => {
+    expect(canCloneServer(warpTagged('registered'))).toBe(false);
+    expect(canCloneServer(warpByDomain('legacy'))).toBe(false);
+  });
+
+  it('Tailscale 多实例、普通 WireGuard 与代理节点仍可克隆', () => {
+    expect(canCloneServer(tsNode('ts'))).toBe(true);
+    expect(canCloneServer(plainWg('wg'))).toBe(true);
+    expect(canCloneServer(srv({ id: 'proxy' }))).toBe(true);
+  });
+});
 
 describe('meshSingletonConflict —— 槽位空闲时一律放行', () => {
   it('空节点集：WARP / TS / 普通 WG 都放行', () => {

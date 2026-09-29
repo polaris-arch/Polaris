@@ -27,6 +27,7 @@
 pub mod backup;
 pub mod error;
 pub mod fs;
+pub mod mesh_guard;
 pub mod migrate;
 pub mod privacy_lock;
 pub mod sanitize;
