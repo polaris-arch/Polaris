@@ -31,13 +31,16 @@ Cold-process bootstrap is shared by all rows: only `ENOENT` for
 failure keeps the process closed. Seal is permanent for this process; a matching
 fence may reread the frozen captured set, while another fence is rejected.
 
-The Go `checkConfig` implementation currently calls `box.New` and ignores its
-`Close` return. Many native `Close` methods also return nil for objects that
-were never `Start`ed, and partial `box.New` failures do not roll back every
-created resource. A validation that entered JNI therefore remains
-`ValidationCleanupUnknown`, even after its Java call returned. A future Go
-construction/disposal contract must prove both successful and partial-failure
-cleanup of unstarted resources; merely exposing `Close() == nil` is insufficient.
+The integrated conservative `construction-validation.patch` adds the typed Go
+`CheckConfigWithResult` API. Legacy `CheckConfig` still returns only the validation
+error, independently of cleanup uncertainty. The typed API binds request ID,
+config digest and contract version; parse rejection may report `NoConstruction`,
+but actual construction, partial failure and timeout remain `CleanupUnknown`.
+`DisposedExact` is reserved and is not emitted for constructed boxes. Timeout
+does not prove that its rollback worker has ended. Android still calls the
+legacy API and does not consume a typed disposal proof, so entered JNI validation
+remains `ValidationCleanupUnknown`, even after Java returns. Neither this typed
+shape nor an ordinary `Close() == nil` establishes exact native release.
 Main Start/Reload has the same partial-construction risk. A construction failure
 or cancelled completion records `Unknown` while holding the same attempt's
 `operationLock`, before Stop's close worker can settle it. A successful ordinary
@@ -88,7 +91,9 @@ executor has ended and cannot accept late SDK deliveries. Callback return,
 Go context cancellation, or an empty active-session map alone is insufficient.
 This gate is mandatory before advertising `speedtest.start`/`speedtest.close`
 coverage or using a queried resolver's disposal as an exact release fact. Native
-Go partial-construction disposal remains a separate mandatory proof contract.
+Consuming a Go construction/disposal receipt remains a separate mandatory
+Android proof gate; the current conservative contract cannot establish exact
+release of a constructed box.
 
 Validation of the Speedtest owner follow-up (2026-09-30): the targeted owner and
 admission suites passed 37 tests; the full `:app:testUniversalDebugUnitTest`
@@ -149,3 +154,32 @@ tests using the real std-only `polaris-source-probe` library and a standalone
 `rustc --test` invocation; this is not a full Cargo/runtime test. Bridge checking
 passed 31 commands and `git diff --check` passed. No APK/device testing or Go
 changes were performed, and coverage remains 4/11.
+
+Login Host seam follow-up: the production `TransientLoginHost` delegates to
+`TransientLoginHostState`, which owns the actual Entry map, state-directory
+claims, predecessor disposal, worker dispatch, close callbacks and timers.
+Fake-native tests run that same state machine with controlled queues and latches.
+The production adapter retains native CloseService/Close, network close and
+cache deletion in their prior order. Configuration is cleared from the adapter
+after Start returns or disposal is attempted. Successful cleanup drops the
+Entry's engine reference; failed cleanup retains it and blocks conflicting
+Login/main work. Callback exceptions are isolated from dispatch and complete
+each caller at most once; a failed retry timer cannot suppress the close result.
+
+The tests pause a queued old worker while main preemption and a successor
+overtake it, pause native Start while Stop waits for the ownership lock, and
+deliver old expiry/retry/native Stop callbacks after a successor uses the same
+state directory and cache path. The old disposed Entry cannot close that
+successor or delete its cache. A shared fake Tailscale-state file stays intact;
+this is not a Go Tailscale disposal or custody proof. Rust-authorized generation
+ordering, complete worker/network/DNS drain, TS/cache custody and ledger capacity
+remain separate gates. Capabilities stay empty and coverage remains 4/11.
+
+Validation of the Host seam follow-up (2026-09-30): targeted suites passed
+37 tests; the full Kotlin XML receipts contain 120 tests in 13 suites with no
+failures, errors or skipped tests. The completed Gradle PTY handle was lost during
+daemon recovery, so no duplicate test run was made. Bridge checking passed
+31 commands; the updated six Rust source-contract tests passed with the real
+std-only source-probe library and standalone `rustc --test`. This does not claim
+a full Cargo/runtime or Android device test. `git diff --check` passed; no APK
+or Go implementation change was made.

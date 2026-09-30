@@ -251,21 +251,24 @@ class TransientLoginNativeOwnerTest {
 
     @Test fun productionHostKeepsTicketsAndEveryDelayedCloseBoundToTheExactEntry() {
         val directory = File("src/main/java/com/polaris2/app/vpn")
-        val host = File(directory, "TransientLoginHost.kt").readText()
+        val host = File(directory, "TransientLoginHostState.kt").readText()
+        val adapter = File(directory, "TransientLoginHost.kt").readText()
         val owner = File(directory, "TransientLoginNativeOwner.kt").readText()
         val start = host.substringAfter("fun start(id: String,").substringBefore("fun close(id:")
         assertTrue(start.indexOf("TransientLoginNativeOwner.reserve(") < start.indexOf("nativeOwner.enqueue("))
-        assertTrue(start.indexOf("entry.nativeOwner.construct {") < start.indexOf("PolarisApplication.ensureSetup()"))
+        assertTrue(start.indexOf("entry.nativeOwner.construct {") < start.indexOf("createEngine(id, config,"))
         assertTrue(owner.indexOf("check(enterBirth())") < owner.indexOf("val result = action()"))
-        assertEquals(3, host.split("timer.schedule({ close(entry) {} }").size - 1)
-        assertFalse(host.contains("timer.schedule({ close(id)"))
-        assertTrue(host.contains("override fun serviceStop() { close(entry) {} }"))
+        assertTrue(host.contains("schedule(300_000) { close(entry) {} }"))
+        assertTrue(host.contains("schedule(5_000) { close(entry) {} }"))
+        assertFalse(host.contains("close(id) {}"))
+        assertTrue(adapter.contains("override fun serviceStop() { requestClose() }"))
+        assertTrue(host.contains("createEngine(id, config, entry.stateDirectories) { close(entry) {} }"))
         val close = host.substringAfter("fun close(id: String,").substringBefore("fun running(")
         assertTrue(close.contains("TransientLoginNativeOwner.retireBeforeStart("))
         assertTrue(close.contains("if (entries[entry.id] === entry) entries.remove(entry.id)"))
         assertTrue(host.contains("entry.nativeOwner.closedWithoutProof()"))
         assertFalse(host.contains("closedExact("))
-        assertFalse(host.contains("requireExactClose = true"))
+        assertFalse(adapter.contains("requireExactClose = true"))
     }
 
     @Test fun rustDropTimeoutAndConfirmedClosePreserveTheSameInstanceId() {

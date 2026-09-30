@@ -1,8 +1,14 @@
 //! Host contract checks complement the real Registry close/timeout/STATUS behavioral tests.
 static HOST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    polaris_source_probe::crate_file!(
-        "gen/android/app/src/main/java/com/polaris2/app/vpn/TransientLoginHost.kt"
-    )
+    [
+        polaris_source_probe::crate_file!(
+            "gen/android/app/src/main/java/com/polaris2/app/vpn/TransientLoginHostState.kt"
+        ),
+        polaris_source_probe::crate_file!(
+            "gen/android/app/src/main/java/com/polaris2/app/vpn/TransientLoginHost.kt"
+        ),
+    ]
+    .join("\n")
 });
 static NETWORK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     polaris_source_probe::crate_file!(
@@ -20,9 +26,13 @@ static REGISTRY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 
 #[test]
 fn android_login_uses_instance_factory_and_status_not_global_command_socket() {
-    assert!(HOST.contains("Libbox.newTransientCommandServer(LoginHandler(entry), network)"));
+    assert!(
+        HOST.contains(
+            "Libbox.newTransientCommandServer(LoginHandler(requestClose), createdNetwork)"
+        )
+    );
     assert!(!HOST.contains("server.start()"));
-    assert!(HOST.contains("Libbox.hasTunInbound(config)"));
+    assert!(HOST.contains("Libbox.hasTunInbound(value)"));
     assert!(!HOST.contains("VpnBridge."));
     assert!(REGISTRY.contains("Arc::new(AndroidLoginCoreSpawner)"));
     assert!(REGISTRY.contains("Arc::new(AndroidLoginConfigChecker)"));
@@ -79,17 +89,17 @@ fn per_attempt_cache_is_checked_and_removed_only_after_service_close() {
     let close = HOST.find("server.closeService()").unwrap();
     let delete = HOST.find("!it.exists() || it.delete()").unwrap();
     assert!(path_check < start && close < delete);
-    assert!(HOST.contains("cache.parent in entry.stateDirectories"));
+    assert!(HOST.contains("createdCache.parent in stateDirectories"));
 }
 
 #[test]
 fn first_login_creates_private_cache_parent_before_core_initialization() {
     let validate = HOST.find("Android 登录缓存路径未隔离").unwrap();
     let create = HOST
-        .find("ensurePrivateDirectory(requireNotNull(cache.parentFile))")
+        .find("ensurePrivateDirectory(requireNotNull(createdCache.parentFile))")
         .unwrap();
     let start = HOST
-        .find("server.startOrReloadService(config, OverrideOptions())")
+        .find("startOrReloadService(checkNotNull(config), OverrideOptions())")
         .unwrap();
     assert!(validate < create && create < start);
     assert!(HOST.contains("if (directory.isDirectory) return"));
