@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { produceDesktopCore } from './desktop-core/build-core.mjs';
+import { buildDesktopCore, produceDesktopCore } from './desktop-core/build-core.mjs';
 import { consumeDesktopBundle, coreFilename, verifyPackagedSource, writeBundleInventory } from './desktop-core/bundle.mjs';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, frozenSourceVersion, platformSourceIdentity,
   validateBuildInfo, validateSourcePins, validateSourceReceipt } from './desktop-core/source-graph.mjs';
@@ -80,15 +80,36 @@ function metadata(key, path = '/synthetic/core', { nft = key === 'linux', linuxT
 }
 function stub(f, key, change = {}) {
   const calls = [];
+  const fetched = new Map();
   const run = (command, args, options) => {
     calls.push({ command, args, options });
     if (command === 'git') {
-      if (args[0] === 'rev-parse') return candidate;
-      if (args[0] === 'status') return '';
+      if (args[0] === 'rev-parse') return change.rootHead ?? candidate;
+      if (args[0] === 'status') return change.status ?? '';
       if (args[0] === 'ls-files') return change.untracked ?? '';
-      if (args.includes('rev-parse')) return args.at(-1).slice(0, 40);
+      if (args[0] === '-C' && args[2] === 'fetch') {
+        const [commit, ref] = args.at(-1).split(':');
+        assert.match(commit, /^[a-f0-9]{40}$/);
+        assert.equal(ref, 'refs/heads/polaris-source');
+        fetched.set(args[1], commit);
+        return '';
+      }
+      if (args[0] === '-C' && args[2] === 'rev-parse') {
+        const commit = fetched.get(args[1]);
+        assert.ok(commit, 'source object must be fetched before inspection');
+        if (args[3] === `${commit}^{commit}`) return change.fetchedCommit ?? commit;
+        assert.equal(args[3], 'refs/heads/polaris-source');
+        return change.fetchedRef ?? commit;
+      }
+      if (args[0] === 'add') {
+        assert.equal(existsSync(join(options.cwd, '.polaris-source-receipt.json')), false);
+        assert.deepEqual(JSON.parse(readFileSync(join(dirname(options.cwd), 'source-receipt.staging.json'))),
+          change.receipt ?? f.receipt);
+        return '';
+      }
       if (args[0] === 'write-tree') return change.tree ?? (key === 'win' ? windowsTree : tree);
-      return '';
+      if (['init', 'apply', 'diff'].includes(args[0])) return '';
+      throw new Error(`Unrecognized stub git command: ${args}`);
     }
     if (args[0]?.endsWith('core-source-provision.py')) {
       const checkout = args[args.indexOf('--checkout') + 1];
@@ -123,16 +144,36 @@ const inspectStub = (command, args) => command === 'git'
     ? JSON.parse(readFileSync(`${args[2]}.source-receipt.json`)).buildID
     : metadata(args[2].split(/[/\\]/).at(-2), args[2]);
 
-test('production inputs remain explicitly unfrozen; force and old outputs cannot bypass', () => {
+test('frozen production inputs still require exact pins; force and old outputs cannot bypass', () => {
   const manifest = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')));
-  for (const key of Object.keys(DESKTOP_TARGETS)) {
-    let calls = 0;
-    assert.throws(() => produceDesktopCore(repo, manifest, key, '/must-not-be-written', candidate, () => calls++), /not frozen/);
-    assert.equal(calls, 0);
-  }
-  const cli = spawnSync(process.execPath, ['scripts/fetch-core.mjs', '--force', '--platform=linux'], { cwd: repo, encoding: 'utf8' });
-  assert.equal(cli.status, 1);
-  assert.match(cli.stderr, /not frozen/);
+  const f = fixture();
+  try {
+    for (const key of Object.keys(DESKTOP_TARGETS)) validateSourcePins(manifest, key, false);
+    const missingPin = structuredClone(manifest);
+    missingPin.sourceBuild.sourceReceiptFingerprint = null;
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const dest = join(f.root, 'resources', key, coreFilename(key));
+      write(dest, 'old cached core');
+      let calls = 0;
+      const run = () => calls++;
+      assert.throws(() => produceDesktopCore(f.root, missingPin, key, dest, candidate, run), /not frozen/);
+      assert.throws(() => buildDesktopCore(f.root, missingPin, key, dest, true, run, { candidate }), /not frozen/);
+      assert.equal(calls, 0);
+      assert.equal(readFileSync(dest, 'utf8'), 'old cached core');
+    }
+    // Run the real CLI against invalid fixture inputs, never the now-frozen
+    // product checkout: --force must reject before any source/tool execution.
+    write(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify(missingPin));
+    for (const path of ['scripts/fetch-core.mjs', 'scripts/desktop-core/build-core.mjs',
+      'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/source-graph.mjs']) {
+      write(join(f.root, path), readFileSync(join(repo, path)));
+    }
+    const cli = spawnSync(process.execPath, ['scripts/fetch-core.mjs', '--force', '--platform=linux'],
+      { cwd: f.root, encoding: 'utf8' });
+    assert.equal(cli.status, 1);
+    assert.match(cli.stderr, /not frozen/);
+    assert.equal(readFileSync(join(f.root, 'resources/linux/sing-box'), 'utf8'), 'old cached core');
+  } finally { f.dispose(); }
 });
 
 test('first source producer needs input pins but no unknown output hash', () => {
@@ -176,6 +217,16 @@ test('all four targets retain the existing platform feature and CGO faces', () =
       assert.equal(s.calls.filter(({ args }) => args[0] === 'apply').length, key === 'win' ? 2 : 0);
       assert.equal(s.calls.filter(({ args }) => args[0] === 'test').length, key === 'win' ? 1 : 0);
       assert.ok(s.calls.filter(({ args }) => args[0] === 'add').every(({ args }) => args.includes(':(exclude).polaris-source-receipt.json')));
+      const fetches = s.calls.filter(({ command, args }) => command === 'git' && args[2] === 'fetch');
+      assert.deepEqual(fetches.map(({ args }) => args.slice(4)),
+        [['https://github.com/SagerNet/sing-box.git', `${f.source.sourceCommit}:refs/heads/polaris-source`],
+          ...f.source.dependencyPatches.map((dep) => [dep.sourceURL, `${dep.upstreamCommit}:refs/heads/polaris-source`])]);
+      for (const { args } of fetches) {
+        const commit = args.at(-1).split(':')[0];
+        assert.deepEqual(s.calls.filter(({ command, args: query }) => command === 'git'
+          && query[1] === args[1] && query[2] === 'rev-parse').map(({ args: query }) => query[3]),
+        [`${commit}^{commit}`, 'refs/heads/polaris-source']);
+      }
     }
   } finally { f.dispose(); }
 });
@@ -322,6 +373,13 @@ test('missing candidate and changed input bytes fail before source execution', (
   try {
     let calls = 0;
     assert.throws(() => produceDesktopCore(f.root, f.manifest, 'linux', '/must-not-write', undefined, () => calls++), /candidate/);
+    for (const change of [{ rootHead: '9'.repeat(40) }, { status: ' M source.go' }]) {
+      const s = stub(f, 'linux', change);
+      const dest = join(f.root, 'rejected/core');
+      assert.throws(() => produceDesktopCore(f.root, f.manifest, 'linux', dest, candidate, s.run), /candidate checkout/);
+      assert.ok(s.calls.every(({ command }) => command === 'git'));
+      assert.equal(existsSync(dest), false);
+    }
     write(join(f.root, 'scripts/libbox-patches/tiny.patch'), 'changed');
     assert.throws(() => produceDesktopCore(f.root, f.manifest, 'linux', '/must-not-write', candidate, () => calls++), /SHA-256/);
     assert.equal(calls, 0);
@@ -332,6 +390,13 @@ test('wrong provider receipt and Windows overlay graph never publish', () => {
   const f = fixture();
   try {
     const dest = join(f.root, 'out/core');
+    for (const [change, error] of [[{ fetchedCommit: '9'.repeat(40) }, /source commit/],
+      [{ fetchedRef: '9'.repeat(40) }, /source ref/]]) {
+      const s = stub(f, 'linux', change);
+      assert.throws(() => produceDesktopCore(f.root, f.manifest, 'linux', dest, candidate, s.run), error);
+      assert.equal(s.calls.some(({ args }) => args[0]?.endsWith('core-source-provision.py')), false);
+      assert.equal(existsSync(dest), false);
+    }
     assert.throws(() => produceDesktopCore(f.root, f.manifest, 'linux', dest, candidate, stub(f, 'linux', { buildID: 'stock' }).run), /buildID/);
     assert.throws(() => produceDesktopCore(f.root, f.manifest, 'linux', dest, candidate, stub(f, 'linux', { untracked: 'ignored/unreviewed.go' }).run), /Untracked compiler/);
     const receipt = { ...f.receipt, buildTree: '9'.repeat(40) };
