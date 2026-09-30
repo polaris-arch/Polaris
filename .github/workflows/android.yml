@@ -286,7 +286,7 @@ jobs:
 
       - name: Cache libbox.aar
         id: libbox
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: |
             src-tauri/gen/android/app/libs/libbox.aar
@@ -354,6 +354,7 @@ jobs:
       # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
       # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
       - name: libbox.aar 必须在位
+        id: libbox_verified
         shell: bash
         run: |
           set -euo pipefail
@@ -363,6 +364,16 @@ jobs:
             exit 1; }
           echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
           python3 scripts/libbox-patches/verify-receipt.py
+
+      # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
+      - name: Save verified libbox.aar
+        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            src-tauri/gen/android/app/libs/libbox.aar
+            scripts/libbox-patches/build-receipt.json
+          key: ${{ steps.libbox.outputs.cache-primary-key }}
 
 
       # Release profile 构建直接让 Tauri 驱动 Gradle；本腿显式只产出未分发的未签名验证包。
@@ -710,7 +721,7 @@ jobs:
 
       - name: Cache libbox.aar
         id: libbox
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: |
             src-tauri/gen/android/app/libs/libbox.aar
@@ -778,6 +789,7 @@ jobs:
       # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
       # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
       - name: libbox.aar 必须在位
+        id: libbox_verified
         shell: bash
         run: |
           set -euo pipefail
@@ -787,6 +799,16 @@ jobs:
             exit 1; }
           echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
           python3 scripts/libbox-patches/verify-receipt.py
+
+      # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
+      - name: Save verified libbox.aar
+        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            src-tauri/gen/android/app/libs/libbox.aar
+            scripts/libbox-patches/build-receipt.json
+          key: ${{ steps.libbox.outputs.cache-primary-key }}
 
       # ── 签名凭据：从 secret 落到 runner 的临时路径，用后即删 ──
       #

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Finite host fixtures: real provider/Git replay; tool, bind and JNI callees are stubs."""
+import ast
 import copy
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -703,6 +705,172 @@ print(module.candidate(run))
                         self.assertNotIn('build_reached', result.stdout)
                         self.assertIn('App source candidate must be clean before libbox build', result.stdout)
                         self.assertIn(str(path.relative_to(app)), result.stdout)
+
+
+class CIReleaseResourceFixture(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='polaris-release-resource-fixture-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = Path(cls.temp.name)
+        manifest = cls.root / 'src-tauri'
+        manifest.mkdir()
+        source = (ROOT / 'src-tauri/build.rs').read_text()
+        # Compile the actual std-only resource guards, not a second implementation.
+        count = re.search(r'^const EXPECTED_SRS_COUNT: usize = \d+;$', source, re.M).group()
+        guards = source[source.index('fn assert_bundled_dashboard()'):]
+        probe = cls.root / 'probe.rs'
+        probe.write_text('use std::path::Path;\n' + count + '\n' + guards +
+                         '\nfn main() { assert_bundled_geo_data(); assert_bundled_dashboard(); }\n')
+        cls.binary = cls.root / ('probe.exe' if os.name == 'nt' else 'probe')
+        environment = os.environ.copy()
+        environment['CARGO_MANIFEST_DIR'] = str(manifest)
+        subprocess.run(['rustc', '--edition=2021', '-Dwarnings', str(probe), '-o', str(cls.binary)],
+                       env=environment, check=True, capture_output=True, text=True)
+
+    def test_actual_android_and_desktop_release_guards(self):
+        cases = [
+            ('android', 'release', 28, None, None, True),
+            ('android', 'release', 28, None, b'', True),
+            ('linux', 'release', 28, None, None, False),
+            ('windows', 'release', 28, None, None, False),
+            ('macos', 'release', 28, None, None, False),
+            ('linux', 'release', 28, None, b'', False),
+            ('linux', 'release', 28, None, b'<html>fixture</html>', True),
+            ('unknown', 'release', 28, None, None, False),
+            ('android', 'release', None, None, None, False),
+            ('android', 'release', 27, None, None, False),
+            ('android', 'release', 28, b'', None, False),
+            ('android', 'release', 28, b'404 HTML', None, False),
+            ('android', 'debug', None, None, None, True),
+            ('linux', 'debug', None, None, None, True),
+        ]
+        passed = 0
+        for target, profile, count, bad, dashboard, allowed in cases:
+            with self.subTest(target=target, profile=profile, geo=count, bad=bad, dashboard=dashboard):
+                resources = self.root / 'resources'
+                shutil.rmtree(resources, ignore_errors=True)
+                if count is not None:
+                    data = resources / 'data'
+                    data.mkdir(parents=True)
+                    for index in range(count):
+                        (data / (str(index) + '.srs')).write_bytes(b'SRSfixture')
+                    if bad is not None:
+                        (data / 'bad.srs').write_bytes(bad)
+                if dashboard is not None:
+                    directory = resources / 'dashboard'
+                    directory.mkdir(parents=True)
+                    (directory / 'index.html').write_bytes(dashboard)
+                environment = os.environ.copy()
+                environment.update(CARGO_CFG_TARGET_OS=target, PROFILE=profile)
+                result = subprocess.run([str(self.binary)], env=environment, text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertEqual(result.returncode == 0, allowed, result.stderr)
+                if not allowed:
+                    self.assertIn('拒绝出包', result.stderr)
+                passed += 1
+        print(f'Actual Rust resource guards: {passed}/14 passed (owned fixtures; no Tauri/backend execution)')
+
+    def test_android_ownership_and_unconditional_geo_call(self):
+        source = (ROOT / 'src-tauri/build.rs').read_text()
+        self.assertIn('    export_product_name();\n    assert_bundled_geo_data();\n    assert_bundled_dashboard();', source)
+        self.assertIn('cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS', source)
+        android_config = json.loads((ROOT / 'src-tauri/tauri.android.conf.json').read_bytes())
+        self.assertEqual(android_config['bundle']['resources'], [
+            '../resources/data/', '../THIRD-PARTY-LICENSES.md', '../NOTICE', '../LICENSE'])
+        desktop_config = json.loads((ROOT / 'src-tauri/tauri.conf.json').read_bytes())
+        self.assertIn('../resources/dashboard/', desktop_config['bundle']['resources'])
+
+
+class CIVerifiedCacheFixture(unittest.TestCase):
+    def legs(self):
+        text = (ROOT / '.github/workflows/android.yml').read_text()
+        unsigned, signed = text.split('\n  release-apk:\n', 1)
+        return [re.findall(r'(?m)^      - name: ([^\n]+)\n((?:^        .*\n|^\n)+)', body)
+                for body in (unsigned, signed)]
+
+    def cache_steps(self, steps):
+        names = [name for name, _ in steps]
+        restore_index = names.index('Cache libbox.aar')
+        verify_index = names.index('libbox.aar 必须在位')
+        save_index = names.index('Save verified libbox.aar')
+        self.assertLess(restore_index, names.index('Build libbox.aar (缓存未命中)'))
+        self.assertEqual(save_index, verify_index + 1)
+        self.assertLess(save_index, next(i for i, name in enumerate(names) if 'APK' in name and name.startswith('Build')))
+        restore, verify, save = [steps[i][1] for i in (restore_index, verify_index, save_index)]
+        self.assertIn('uses: actions/cache/restore@v6', restore)
+        self.assertIn('id: libbox\n', restore)
+        self.assertIn('key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', restore)
+        self.assertNotIn('restore-keys:', restore)
+        self.assertIn('id: libbox_verified\n', verify)
+        self.assertNotIn('continue-on-error:', verify)
+        self.assertIn('python3 scripts/libbox-patches/verify-receipt.py', verify)
+        self.assertIn('uses: actions/cache/save@v6', save)
+        self.assertIn('key: ${{ steps.libbox.outputs.cache-primary-key }}', save)
+        expected_paths = ['src-tauri/gen/android/app/libs/libbox.aar', 'scripts/libbox-patches/build-receipt.json']
+        for block in (restore, save):
+            paths = re.search(r'(?m)^          path: \|\n((?:^            .*\n)+)', block).group(1)
+            self.assertEqual([line.strip() for line in paths.splitlines()], expected_paths)
+        condition = re.search(r'(?m)^        if: (.*)$', save).group(1)
+        return verify.split('        run: |\n', 1)[1], condition
+
+    @staticmethod
+    def admitted(condition, hit, outcome, success):
+        # Evaluate only the closed literal expression taken from the actual YAML.
+        expression = condition.replace('success()', repr(success))
+        expression = expression.replace('steps.libbox.outputs.cache-hit', repr(hit))
+        expression = expression.replace('steps.libbox_verified.outcome', repr(outcome)).replace('&&', 'and')
+        parsed = ast.parse(expression, mode='eval')
+        if any(not isinstance(node, (ast.Expression, ast.BoolOp, ast.And, ast.Compare,
+                                     ast.NotEq, ast.Eq, ast.Constant)) for node in ast.walk(parsed)):
+            raise AssertionError('Cache admission is outside the closed success/miss/verification expression')
+        return eval(compile(parsed, '<actual-cache-if>', 'eval'), {'__builtins__': {}}, {})
+
+    def test_actual_verifier_failure_and_save_admission(self):
+        cases = [('false', 'valid', 0, True), ('', 'valid', 0, True), ('true', 'valid', 0, False),
+                 ('false', 'missing', 0, False), ('false', 'empty', 0, False),
+                 ('false', 'valid', 23, False), ('true', 'valid', 23, False)]
+        passed = 0
+        for leg, steps in enumerate(self.legs()):
+            body, condition = self.cache_steps(steps)
+            for hit, state, verify_exit, saved in cases:
+                with self.subTest(leg=leg, hit=hit, state=state, verify_exit=verify_exit), \
+                        tempfile.TemporaryDirectory(prefix='polaris-cache-verifier-fixture-') as directory:
+                    app = Path(directory)
+                    aar = app / 'src-tauri/gen/android/app/libs/libbox.aar'
+                    aar.parent.mkdir(parents=True)
+                    if state != 'missing':
+                        aar.write_bytes(b'private fixture only' if state == 'valid' else b'')
+                    trace = app / 'verifier-called'
+                    environment = os.environ.copy()
+                    environment.update(VERIFY_EXIT=str(verify_exit), VERIFY_TRACE=str(trace))
+                    run = '\n'.join(line[10:] if line.startswith('          ') else '' for line in body.splitlines())
+                    run = run.replace('${{ steps.libbox.outputs.cache-hit }}', hit)
+                    callee = ('python3() { [[ "$*" == "scripts/libbox-patches/verify-receipt.py" ]] || return 97; '
+                              'printf "actual verifier invocation\\n" >> "$VERIFY_TRACE"; return "$VERIFY_EXIT"; }\n')
+                    result = subprocess.run(['bash', '-c', callee + run], cwd=app, env=environment,
+                                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(result.returncode, verify_exit if state == 'valid' else 1, result.stderr)
+                    self.assertEqual(trace.exists(), state == 'valid')
+                    outcome = 'success' if result.returncode == 0 else 'failure'
+                    self.assertEqual(self.admitted(condition, hit, outcome, result.returncode == 0), saved)
+                    self.assertFalse(self.admitted(condition, 'false', 'skipped', True))
+                    self.assertFalse(self.admitted(condition, 'false', 'cancelled', True))
+                    self.assertFalse(self.admitted(condition, 'false', 'success', False))
+                    passed += 1
+        print(f'Actual YAML verification shell/cache admission: {passed}/14 passed (callee stub; cache/backend not executed)')
+
+    def test_two_legs_and_save_predicate_mutations(self):
+        values = [self.cache_steps(steps) for steps in self.legs()]
+        self.assertEqual(values[0], values[1])
+        condition = values[0][1]
+        for target, hit, outcome, success in [
+                ("steps.libbox.outputs.cache-hit != 'true'", 'true', 'success', True),
+                ("steps.libbox_verified.outcome == 'success'", 'false', 'failure', True),
+                ('success()', 'false', 'success', False)]:
+            with self.subTest(removed=target):
+                self.assertFalse(self.admitted(condition, hit, outcome, success))
+                self.assertTrue(self.admitted(condition.replace(target, 'True'), hit, outcome, success))
 
 
 if __name__ == '__main__':

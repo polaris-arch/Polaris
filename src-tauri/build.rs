@@ -9,6 +9,7 @@ use std::path::Path;
 const EXPECTED_SRS_COUNT: usize = 28;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         // NDK r27 still defaults Rust cdylibs to 4 KB. Keep every PT_LOAD segment
         // compatible with 16 KB devices, for both debug and release builds.
@@ -112,7 +113,7 @@ fn embed_windows_manifest_for_msvc() {
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
 }
 
-/// **随包 dashboard 完整性断言（打包期硬门）** —— [`assert_bundled_geo_data`] 的同构对等物。
+/// **桌面随包 dashboard 完整性断言（打包期硬门）**。
 ///
 /// 为什么从 `beforeBundleCommand` 搬到这里（2026-08-05，Windows 打包腿首次真跑时挂在那个 hook 上）：
 ///
@@ -141,12 +142,16 @@ fn embed_windows_manifest_for_msvc() {
 /// 判据用 **非空**而不是「文件存在」：0 字节 / 404 HTML 占位文件打进包里，与没有它同一后果 ——
 /// 核只能回落联网下载面板（离线不可用；CWD 只读时还会刷 mkdir 报错）。
 ///
-/// **只在 release 生效**（同 geo 那条）：release ⟺ 会被打包分发的那份。
+/// **只在 release 生效**。Android 的目标配置只打包 geo 和许可文本，不携带桌面 dashboard；
+/// build script 在宿主执行，因此必须读取 Cargo 的 target OS，不能使用宿主 `cfg!`。
 ///
 /// ⚠️ **不再顺手拉取**。原 hook 在有 node 时会替你跑一次 `fetch-dashboard.mjs`；build script 里不做
 /// 这件事（build script 不该联网，且它在 sandbox / 离线构建下会变成硬失败）。CI 侧本来就有独立的
 /// `Fetch sing-box dashboard` 步，不受影响；本机构建按下面 panic 文案里给的命令手动拉一次即可。
 fn assert_bundled_dashboard() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        return;
+    }
     let index = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("resources")
