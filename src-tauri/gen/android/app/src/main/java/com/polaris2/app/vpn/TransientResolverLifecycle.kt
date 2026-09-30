@@ -188,22 +188,28 @@ internal class TransientResolverLifecycle(
 
         /** Only the exchange/lookup stack uses this method; no JNI or waits occur under the metadata gate. */
         fun awaitAndDeliver(action: (T) -> Unit) {
-            try { ready.await() }
+            val result = try {
+                ready.await()
+                owner.update {
+                    // Monitor acquisition is not interruptible. Recheck before granting the permit.
+                    if (Thread.currentThread().isInterrupted) null
+                    else {
+                        if (owner.sealed || cancelled || state == State.Cancelled) {
+                            throw CancellationException("android: DNS query cancelled or transport closed")
+                        }
+                        check(state == State.Ready) { "android: DNS result already delivered" }
+                        val result = checkNotNull(value)
+                        value = null
+                        state = State.Delivering
+                        owner.deliveries++
+                        result
+                    }
+                } ?: throw InterruptedException("android: DNS query interrupted before delivery")
+            }
             catch (error: InterruptedException) {
                 cancel()
                 Thread.currentThread().interrupt()
                 throw error
-            }
-            val result = owner.update {
-                if (owner.sealed || cancelled || state == State.Cancelled) {
-                    throw CancellationException("android: DNS query cancelled or transport closed")
-                }
-                check(state == State.Ready) { "android: DNS result already delivered" }
-                val result = checkNotNull(value)
-                value = null
-                state = State.Delivering
-                owner.deliveries++
-                result
             }
             try { action(result) }
             finally { owner.update { owner.deliveries--; state = State.Delivered } }

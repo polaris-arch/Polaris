@@ -283,6 +283,105 @@ class TransientResolverLifecycleTest {
         assertEquals(0, lifecycle.snapshot().calls)
     }
 
+    @Test fun interruptWhileWaitingForPermitLockRevokesReadyWithoutEnteringJni() {
+        val cancellation = Queue()
+        val lifecycle = TransientResolverLifecycle(cancellation)
+        val query = lifecycle.enterQuery<Int>()
+        val gate = lifecycle.javaClass.getDeclaredField("gate").apply { isAccessible = true }.get(lifecycle)
+        val writes = AtomicInteger()
+        val signalCalls = AtomicInteger()
+        val error = AtomicReference<Throwable?>()
+        val interrupted = AtomicReference(false)
+        val done = CountDownLatch(1)
+        query.installCancellation { signalCalls.incrementAndGet() }
+        assertTrue(query.publish(1))
+        val worker = Thread {
+            try { query.awaitAndDeliver { writes.incrementAndGet() } }
+            catch (failure: Throwable) { error.set(failure) }
+            finally {
+                interrupted.set(Thread.currentThread().isInterrupted)
+                query.returned()
+                done.countDown()
+            }
+        }
+        synchronized(gate) {
+            worker.start()
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (worker.state != Thread.State.BLOCKED && System.nanoTime() < deadline) Thread.yield()
+            assertEquals(Thread.State.BLOCKED, worker.state)
+            worker.interrupt()
+            assertTrue(worker.isInterrupted)
+        }
+        await(done)
+        assertEquals(0, writes.get())
+        assertTrue(error.get() is InterruptedException)
+        assertTrue(interrupted.get())
+        assertEquals(0, lifecycle.snapshot().deliveries)
+        assertEquals(0, lifecycle.snapshot().calls)
+        assertFalse(query.publish(2))
+        assertEquals(1, cancellation.size)
+        assertEquals(1, lifecycle.snapshot().cancellationTasks)
+        cancellation.runNext()
+        assertEquals(1, signalCalls.get())
+        assertEquals(0, lifecycle.snapshot().cancellationTasks)
+    }
+
+    @Test fun interruptionAfterPermitKeepsJniCountedUntilItsRealReturn() {
+        val lifecycle = TransientResolverLifecycle()
+        val query = lifecycle.enterQuery<Int>()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val interruptionObserved = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        val writes = AtomicInteger()
+        val error = AtomicReference<Throwable?>()
+        val interrupted = AtomicReference(false)
+        query.publish(1)
+        val worker = Thread {
+            try {
+                query.awaitAndDeliver {
+                    entered.countDown()
+                    var sawInterrupt = false
+                    while (true) {
+                        try { release.await(); break }
+                        catch (_: InterruptedException) {
+                            // Models JNI that keeps running after its Java caller is interrupted.
+                            sawInterrupt = true
+                            interruptionObserved.countDown()
+                        }
+                    }
+                    writes.incrementAndGet()
+                    if (sawInterrupt) Thread.currentThread().interrupt()
+                }
+            } catch (failure: Throwable) { error.set(failure) }
+            finally {
+                interrupted.set(Thread.currentThread().isInterrupted)
+                query.returned()
+                done.countDown()
+            }
+        }
+        worker.start()
+        try {
+            await(entered)
+            worker.interrupt()
+            await(interruptionObserved)
+            lifecycle.beginClose()
+            assertEquals(1, lifecycle.snapshot().calls)
+            assertEquals(1, lifecycle.snapshot().deliveries)
+            assertEquals(0, writes.get())
+            assertEquals(TransientResolverLifecycle.Drain.Unknown, lifecycle.awaitLocalDrain(1, TimeUnit.MILLISECONDS))
+            assertEquals(1, lifecycle.snapshot().deliveries)
+            assertTrue(runCatching { query.returned() }.isFailure)
+        } finally { release.countDown() }
+        await(done)
+        assertNull(error.get())
+        assertTrue(interrupted.get())
+        assertEquals(1, writes.get())
+        assertEquals(0, lifecycle.snapshot().calls)
+        assertEquals(0, lifecycle.snapshot().deliveries)
+        assertEquals(TransientResolverLifecycle.Drain.Unknown, lifecycle.awaitLocalDrain(0, TimeUnit.SECONDS))
+    }
+
     @Test fun clearedLocalHookCannotCancelOrRetainAnActiveMailbox() {
         val cancellation = Queue()
         val lifecycle = TransientResolverLifecycle(cancellation)
