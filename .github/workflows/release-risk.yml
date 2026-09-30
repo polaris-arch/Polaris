@@ -41,6 +41,7 @@ jobs:
       has_package: ${{ steps.impact.outputs.has_package }}
       android: ${{ steps.impact.outputs.android }}
       unregistered: ${{ steps.impact.outputs.unregistered }}
+      candidate: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -117,13 +118,24 @@ jobs:
             echo "unregistered=$(jq -r '.unregisteredScopes | join(" ")' "$result")"
           } >> "$GITHUB_OUTPUT"
 
+  desktop_core:
+    name: four native source producers
+    needs: classify
+    if: needs.classify.outputs.preflight == 'true'
+    uses: ./.github/workflows/desktop-core.yml
+    with:
+      candidate: ${{ needs.classify.outputs.candidate }}
+
   preflight:
     name: static packaging + bundled core gate
-    needs: classify
+    needs: [classify, desktop_core]
     if: needs.classify.outputs.preflight == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.classify.outputs.candidate }}
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -139,8 +151,17 @@ jobs:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
 
+      - name: Download exact candidate core bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.desktop_core.outputs.artifact_name }}
+          path: ${{ runner.temp }}/desktop-core-bundle
+
       - name: Fetch sing-box core
-        run: node scripts/fetch-core.mjs
+        env:
+          CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
+          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
+        run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
 
       - name: Fetch packaging resources
         if: needs.classify.outputs.has_package == 'true'
@@ -202,7 +223,7 @@ jobs:
 
   package:
     name: package selected platforms
-    needs: [classify, preflight]
+    needs: [classify, preflight, desktop_core]
     if: needs.classify.outputs.has_package == 'true' && needs.preflight.result == 'success'
     # package.yml 内含一个仅 v* tag 才会运行的 publish job。GitHub 会在启动前校验整张复用图，
     # 即使本次 ref 不可能发布，也要求调用 job 提供它声明的 contents: write 权限上限。
@@ -215,6 +236,8 @@ jobs:
       skip_quality_gates: true
       run_kernel_gates: false
       upload_artifacts: false
+      core_candidate: ${{ needs.classify.outputs.candidate }}
+      core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
     secrets: inherit
 
   # ══ Android release-profile 产物腿 ══

@@ -79,6 +79,14 @@ on:
         type: boolean
         required: false
         default: true
+      core_candidate:
+        type: string
+        required: false
+        default: ''
+      core_bundle_artifact:
+        type: string
+        required: false
+        default: ''
 
 # 最小权限：打包 job 只读仓库（tauri-action 未传 tagName ⇒ 不碰 release API）；
 # release 写权限只发给发布 DAG 的三个写入 job（job 级 permissions 覆盖本块）。
@@ -116,6 +124,7 @@ jobs:
     outputs:
       include: ${{ steps.resolve.outputs.include }}
       full: ${{ steps.resolve.outputs.full }}
+      candidate: ${{ steps.resolve.outputs.candidate }}
     steps:
       # ══════════════════════════════════════════════════════════════════════════════
       # ↓↓↓ 以下整段原在 jobs.package.strategy.matrix.include 上方，随**数据本体**原样搬来。
@@ -162,8 +171,18 @@ jobs:
           # `|| 'all'` 兜到全矩阵。shell 侧保留 :-all，避免异常载荷生成空矩阵。
           PLATFORMS_JSON: ${{ inputs.platforms || '' }}
           PLATFORM: ${{ inputs.platform || github.event.inputs.platform || 'all' }}
+          CORE_CANDIDATE: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+          CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact }}
+          CORE_RUN_ID: ${{ github.run_id }}
+          CORE_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
+          [ "$CORE_CANDIDATE" = "$EXPECTED_CANDIDATE" ]
+          if [ -n "$CORE_BUNDLE_ARTIFACT" ]; then
+            [ "$CORE_BUNDLE_ARTIFACT" = "desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" ]
+          fi
 
           # 全量矩阵 = 单一真值来源。JSON 内只有双引号，故整体用 shell 单引号串包住，
           # 不经 heredoc（免去 terminator 缩进坑），也不做任何 shell 展开。
@@ -221,6 +240,7 @@ jobs:
           {
             echo "include=$include"
             echo "full=$full"
+            echo "candidate=$CORE_CANDIDATE"
           } >> "$GITHUB_OUTPUT"
 
   # ══ 发布前置门：与打包并行跑，门不绿则不发布 ══
@@ -256,6 +276,16 @@ jobs:
     uses: ./.github/workflows/ui.yml
     secrets: inherit
 
+  # Risk supplies the verified same-run bundle; standalone Package produces it
+  # once here. An installer subset still consumes the complete four-core set.
+  desktop_core:
+    name: four native source producers
+    needs: setup
+    if: inputs.core_bundle_artifact == ''
+    uses: ./.github/workflows/desktop-core.yml
+    with:
+      candidate: ${{ needs.setup.outputs.candidate }}
+
   package:
     name: build installer (${{ matrix.label }})
     # 2026-09-04：打包腿由「串在两门之后」改为「与两门并行」。此前不并行的唯一理由是额度——
@@ -270,15 +300,20 @@ jobs:
     #    但若有人直接从红 run 里下载 artifact，拿到的就是未经门验的包。这是并行拓扑的固有代价，
     #    在 package job 内无法消除：要读 ci/ui 的 result 就必须把它们写进 needs，而 needs 即等待。
     #
-    # setup 只允许 success：矩阵解析失败/取消时没有任何可信目标可打。此处不需要 `always()`——
-    # needs 里只剩 setup，默认语义已经等价。
-    needs: [setup]
-    if: needs.setup.result == 'success'
+    # setup 必须 success。source job 仅在已有同 run/attempt bundle 输入时允许 skipped；
+    # 显式 always() 消除复用依赖的默认 skip 传播，failure/cancelled 仍一律拒绝。
+    needs: [setup, desktop_core]
+    if: >-
+      always() && needs.setup.result == 'success'
+      && (needs.desktop_core.result == 'success'
+        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))
     # W24：helper 与 app 分两次 cargo build，但必须共享同一份构建身份。放 job 级而非某一步，
     # 让 helper staging 与后面的 tauri-action 都继承当前 checkout commit；同 protocol 的旧 helper
-    # 才能被新 app 识别为 upgradeable。github.sha 在 tag/dispatch 两条出包路径都指向被检出的 commit。
+    # 才能被新 app 识别为 upgradeable。resolved candidate 在 PR 上为 head，在 tag/dispatch 为 github.sha。
     env:
-      POLARIS_BUILD_ID: ${{ github.sha }}
+      POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}
+      CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
+      CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
       # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
       POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
       # 直接 tag / Package dispatch 保持原行为；release-risk 手动 dispatch 复用本 workflow 时
@@ -305,6 +340,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.setup.outputs.candidate }}
+          persist-credentials: false
 
       # 产物标识：tag 用 tag 名（ref_name，如 v0.1.0），否则用 run_id（数字，无 / 等非法字符）。
       # GitHub artifact 名 / 文件名禁含 /，分支名 feature/x 会破坏路径，故非 tag 一律回退 run_id。
@@ -512,8 +550,16 @@ jobs:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
 
+      - name: Download exact candidate core bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.CORE_BUNDLE_ARTIFACT }}
+          path: ${{ runner.temp }}/desktop-core-bundle
+
       - name: Fetch sing-box core (SHA256-pinned)
-        run: node scripts/fetch-core.mjs
+        env:
+          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
+        run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
 
       # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
       # REQUIRE 仅限本步，缺任一 manifest 平台时不能以本机允许的 skip 冒充验证通过。

@@ -495,6 +495,11 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
     why: 'Android Debug lends the original generation, birth, revision, digest and authenticated probe-input metadata through the native bridge. '
       + 'APK Rust/JNI compilation verifies the typed adapter is packaged; actual ingress and UID attribution still require device evidence.',
   },
+  'src-tauri/src/runtime/proxy/debug_pc_echo.rs': {
+    why: 'Android Debug validates the private authenticated PC-ready target against the original probe loan and erases its owned nonce. '
+      + 'This Android-only native admission code enters the APK Rust cdylib; dep-info and fresh APK compilation must cover it. '
+      + 'Source registration and compilation do not prove an installed package or live LAN witness.',
+  },
   'src-tauri/src/runtime/proxy/hot_switch.rs': {
     why: 'Android Debug binds an accepted reload revision to the original probe owner in Android cfg branches. '
       + 'These linked Rust inputs require a fresh APK; successful compilation does not prove runtime generation ownership.',
@@ -502,6 +507,11 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/runtime/speedtest.rs': {
     why: 'Android 临时测速核由独立 libbox 实例承载；改动会进入 APK 的 Rust cdylib。'
       + '真编 Android APK 可验证该 cfg 模块与 libbox/NDK 的链接，测速的运行期成败仍需设备验证。',
+  },
+  'src-tauri/src/runtime/speedtest/android.rs': {
+    why: 'Android-only stopped-state speedtests check and start the same authenticated in-memory config through the independent libbox bridge. '
+      + 'The typed checker/spawner/child are packaged in the Rust cdylib and require Android dep-info registration and fresh APK compilation; '
+      + 'this registration does not attest runtime cleanup or device speedtest results.',
   },
   'src-tauri/src/runtime/proxy/route_replan.rs': {
     why: 'Android route observation consumes the native physical-Network bridge and distinguishes a real empty snapshot from failure; synchronous selector locks skip only the OS inventory precheck. Fresh APK Rust/JNI compilation and device binding verification cover this Android-specific production path.',
@@ -970,7 +980,8 @@ export function androidRegistrationOf(rawPath) {
   return { key: none, table: 'NO_ANDROID_IMPACT_SCOPES' };
 }
 
-const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/build-desktop-core.test.mjs', 'scripts/core-source-provision.py']);
+const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/build-desktop-core.test.mjs', 'scripts/core-source-provision.py',
+  '.github/workflows/desktop-core.yml', 'scripts/desktop-core-ci-wiring.test.mjs']);
 
 /**
  * 随包拉取脚本**被导入的共享模块**面。

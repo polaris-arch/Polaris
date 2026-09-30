@@ -25,6 +25,12 @@ function assertWireStep(yaml, { kernelOnly }) {
   else assert.doesNotMatch(body, /^        if:/m, 'direct Package dispatch must not skip the wire gate');
 }
 
+function assertAllFourSourceConsumption(fetch) {
+  assert.match(fetch.body, /^        run: node scripts\/fetch-core\.mjs --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"$/m);
+  assert.match(fetch.body, /^          CORE_BUNDLE: \$\{\{ runner.temp \}\}\/desktop-core-bundle$/m);
+  assert.doesNotMatch(fetch.body, /--platform=|--force|continue-on-error|\|\| true/);
+}
+
 test('Package checks all fetched cores before optional runtime gates', () => {
   const yaml = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
   assertWireStep(yaml, { kernelOnly: false });
@@ -33,7 +39,7 @@ test('Package checks all fetched cores before optional runtime gates', () => {
   const wire = step(yaml, wireStep);
   const optionalRuntime = step(yaml, 'Bundled core dependency fingerprint (sing-tun pin)');
   assert.match(protoc.body, /^        run: node scripts\/fetch-protoc\.mjs$/m);
-  assert.match(fetch.body, /^        run: node scripts\/fetch-core\.mjs$/m);
+  assertAllFourSourceConsumption(fetch);
   assert.ok(protoc.start < fetch.start && fetch.start < wire.start && wire.start < optionalRuntime.start);
 });
 
@@ -44,7 +50,7 @@ test('Release Risk checks all fetched cores only on kernel-impact changes', () =
   const rust = step(yaml, 'Install Rust stable for bundled-core gates');
   const protoc = step(yaml, 'Fetch pinned protoc for gRPC wire check');
   const wire = step(yaml, wireStep);
-  assert.match(fetch.body, /^        run: node scripts\/fetch-core\.mjs$/m);
+  assertAllFourSourceConsumption(fetch);
   assert.match(protoc.body, /^        if: needs\.classify\.outputs\.kernel == 'true'$/m);
   assert.match(protoc.body, /^        run: node scripts\/fetch-protoc\.mjs$/m);
   assert.ok(fetch.start < rust.start && rust.start < protoc.start && protoc.start < wire.start);

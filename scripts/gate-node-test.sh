@@ -37,6 +37,7 @@ required_tests=(
   scripts/assert-pc-runtime-release.test.mjs
   # Desktop source graph predicates may not disappear from the host fixture gate.
   scripts/build-desktop-core.test.mjs
+  scripts/desktop-core-ci-wiring.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
@@ -92,8 +93,9 @@ fi
 #   132 → 141（2026-09-30）PC runtime publication freeze 的 9 条策略/变异回归。
 #   141 → 212（2026-09-30）冻结现有 200 条 + desktop source graph 12 条纯 fixture 合同。
 #   212 → 217（2026-09-30）G1 的 5 条逐平台 patched/transport presence 与 fingerprint 合同。
+#   217 → 223（2026-10-01）6 条 native source workflow/candidate/bundle/reuse/impact 纯接线合同。
 #   真实 tiny Go buildInfo 用显式 opt-in 单独执行，不借其 skip 数满足下限。
-if [ "$pass" -lt 217 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 217）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+if [ "$pass" -lt 223 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 223）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

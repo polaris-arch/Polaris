@@ -49,10 +49,15 @@ function requirePackagePolicy(yaml) {
   assert.match(promote, /^          set -euo pipefail\n          node scripts\/assert-pc-runtime-release\.mjs$/m);
   assert.ok(promote.indexOf(command) < promote.indexOf('gh release edit '));
   const candidate = job(yaml, 'package');
-  assert.match(candidate, /^    needs: \[setup\]$/m);
+  requireCandidateSources(candidate);
   assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
   assert.ok(candidate.includes('controlled validation candidates'));
   assert.ok(candidate.includes('uses: actions/upload-artifact@'));
+}
+
+function requireCandidateSources(candidate) {
+  assert.match(candidate, /^    needs: \[setup, desktop_core\]$/m);
+  assert.match(candidate, /^    if: >-\n      always\(\) && needs\.setup\.result == 'success'\n      && \(needs\.desktop_core\.result == 'success'\n        \|\| \(needs\.desktop_core\.result == 'skipped' && inputs\.core_bundle_artifact != ''\)\)$/m);
 }
 
 function requireRiskPolicy(yaml) {
@@ -129,9 +134,8 @@ test('removing, skipping or swallowing a release clearance fails the policy', ()
 
 test('candidate matrix remains buildable independently of publication block', () => {
   const candidate = job(packageYaml, 'package');
-  assert.match(candidate, /^    needs: \[setup\]$/m);
+  requireCandidateSources(candidate);
   assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
-  assert.match(candidate, /^    if: needs\.setup\.result == 'success'$/m);
   assert.ok(step(candidate, 'Mark desktop artifacts as controlled validation candidates').text.includes('GITHUB_STEP_SUMMARY'));
 });
 
