@@ -3614,10 +3614,7 @@ impl ProxyRuntime {
         runtime_bind_interfaces: &BTreeMap<String, String>,
     ) -> Result<GateOutcome, String> {
         if !cfg!(target_os = "android") {
-            polaris_core_supervisor::settle_check_cleanup()
-                .await
-                .map_err(|error| error.to_string())?;
-            polaris_core_supervisor::assert_check_admission().map_err(|error| error.to_string())?;
+            self.settle_kernel_validation_admission(binary).await?;
         }
         let started = std::time::Instant::now();
         let mut checks_run: u32 = 0;
@@ -3763,6 +3760,36 @@ impl ProxyRuntime {
                 }
             }
         }
+    }
+
+    async fn settle_kernel_validation_admission(
+        &self,
+        _binary: Option<&Path>,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(result) = self.metadata_validation_admission_fixture(_binary)? {
+            return result.map_err(|error| error.to_string());
+        }
+        polaris_core_supervisor::settle_check_cleanup()
+            .await
+            .map_err(|error| error.to_string())?;
+        polaris_core_supervisor::assert_check_admission().map_err(|error| error.to_string())
+    }
+
+    /// A fixture can replace only the admission dependency of a no-binary metadata call.
+    /// It never changes the shared registry or supplies a native check verdict.
+    #[cfg(test)]
+    pub(super) fn metadata_validation_admission_fixture(
+        &self,
+        binary: Option<&Path>,
+    ) -> Result<Option<Result<(), polaris_core_supervisor::ValidationLifecycleError>>, String> {
+        if binary.is_some() {
+            return Ok(None);
+        }
+        self.metadata_validation_admission
+            .lock()
+            .map(|result| result.clone())
+            .map_err(|error| error.to_string())
     }
 
     /// 单测保持既有调用面；生产必须显式给出本次会话的运行时绑定，防止新增调用点悄悄漏接。

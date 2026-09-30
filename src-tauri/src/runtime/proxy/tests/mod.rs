@@ -275,13 +275,18 @@ fn test_runtime_in_on(dir: PathBuf, helper: HelperRuntime) -> Arc<ProxyRuntime> 
                 .to_string_lossy()
                 .into_owned(),
         ));
-    Arc::new(ProxyRuntime::new(
+    let rt = Arc::new(ProxyRuntime::new(
         config,
         helper,
         mesh,
         clearer,
         Arc::new(NoNetworkDoh),
-    ))
+    ));
+    assert!(rt.metadata_validation_admission.lock().unwrap().is_none());
+    // This factory supplies no native core. Metadata calls own their admission fixture;
+    // a supplied binary still selects the original native settlement/check path.
+    *rt.metadata_validation_admission.lock().unwrap() = Some(Ok(()));
+    rt
 }
 
 fn test_runtime() -> (Arc<ProxyRuntime>, TestDir) {

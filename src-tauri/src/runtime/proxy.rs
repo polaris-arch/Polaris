@@ -1514,6 +1514,10 @@ pub struct ProxyRuntime {
     /// 耦合做成 flaky 源。故改用 per-runtime 覆盖 —— 作用域随实例，绝不外溢到别的测试。
     #[cfg(test)]
     core_binary_override: Mutex<Option<PathBuf>>,
+    /// Explicit metadata-only admission fixture. Native checks always use shared custody.
+    #[cfg(test)]
+    metadata_validation_admission:
+        Mutex<Option<Result<(), polaris_core_supervisor::ValidationLifecycleError>>>,
     /// 管理 API PUT 的落点桩（**仅单测置位**，同 `core_binary_override` 的先例；生产恒 `None`）。
     ///
     /// 生产的 PUT 出口是 [`ProxyRuntime::management_api`] → 真 gRPC；单测里核不起、`clash_api_port` 为 0
@@ -1680,6 +1684,8 @@ impl ProxyRuntime {
             runtime_binding_state: Mutex::new(RuntimeBindingState::default()),
             #[cfg(test)]
             core_binary_override: Mutex::new(None),
+            #[cfg(test)]
+            metadata_validation_admission: Mutex::new(None),
             #[cfg(test)]
             management_api_stub: Mutex::new(None),
         }
