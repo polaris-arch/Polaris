@@ -479,7 +479,7 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'scripts/core-source-provision.py': {
     why: '共同 core/dependency source provider 须点亮 Android AAR/APK 来源腿，避免共同来源变更静默沿用桌面豁免。'
-      + '当前 scripts/build-libbox.sh → scripts/libbox-patches/build.py 仍自行准备 checkout，尚未消费该共同 helper。'
+      + 'Android builder 直接消费原 provider checkout，prelookup 与 cached/fresh 共享完整来源和实际工具/SDK 谓词。'
       + 'Host Node fixtures 覆盖 provider receipt 与来源准入；本登记不证明真实 Android consumer 接线、AAR/APK 重构建或设备行为。',
   },
   'src-tauri/src/runtime/proxy/android_capacity.rs': {

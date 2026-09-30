@@ -188,6 +188,8 @@ jobs:
         id: libbox_go
         shell: bash
         run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
           version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").goVersion')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -226,7 +228,8 @@ jobs:
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
           yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0"
+          libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
@@ -240,7 +243,7 @@ jobs:
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
 
-          echo "NDK(rust)=$rust_ndk; libbox NDK is prepared from its pinned archive on cache miss"
+          echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
 
       - name: Resolve bundled core version
         id: core
@@ -257,9 +260,24 @@ jobs:
       # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
       #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
       # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
-      # [选「cache 在前、未命中就现建」：缓存只是省时间，**不是来源**。缓存不在 / 键变了 / 缓存服务挂了，
-      #  下一步照样从 sing-box 源码现建；建失败就红。缓存键含内核版本、builder、manifest 与补丁，
-      #  命中后仍按收据逐字节核 AAR，旧产物不能冒充本次来源]
+      # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
+      # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
+      # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
+      - name: Prepare libbox tools and source cache identity
+        id: libbox_input
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
+          libbox_go="$(command -v go)"
+          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
+          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
+          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
+          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
+          echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
+          echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
+          echo "fingerprint=$(python3 scripts/libbox-patches/android-source.py identity)" >> "$GITHUB_OUTPUT"
+
       - name: Cache libbox.aar
         id: libbox
         uses: actions/cache@v6
@@ -267,7 +285,7 @@ jobs:
           path: |
             src-tauri/gen/android/app/libs/libbox.aar
             scripts/libbox-patches/build-receipt.json
-          key: libbox-${{ runner.os }}-v${{ steps.core.outputs.version }}-${{ hashFiles('scripts/build-libbox.sh', 'scripts/libbox-patches/build.py', 'scripts/libbox-patches/prepare-ndk-linux.py', 'scripts/libbox-patches/ndk-linux-archive.json', 'scripts/libbox-patches/source-manifest.json', 'scripts/libbox-patches/*.patch') }}
+          key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
       - name: Build libbox.aar (缓存未命中)
         if: steps.libbox.outputs.cache-hit != 'true'
@@ -275,18 +293,26 @@ jobs:
         run: |
           set -euo pipefail
           src="$RUNNER_TEMP/sing-box"
-          # 浅克隆到 tag：脚本随后用 `git describe --tags` 与 core-manifest 对拍，不符即拒绝构建。
+          # upstream tag 与 pinned commit 对拍；patched output 使用共同 sourceBuild.version。
           git clone --depth 1 --branch "v${{ steps.core.outputs.version }}" \
             https://github.com/SagerNet/sing-box "$src"
-          libbox_go="$(command -v go)"
-          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
-          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
-          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
-          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
+          # Each dependency repository is explicit; shared provider performs the only replay.
+          python3 - "$RUNNER_TEMP" <<'PYDEPS'
+          import json, pathlib, subprocess, sys
+          source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
+          values = []
+          for dependency in source['dependencyPatches']:
+              repository = pathlib.Path(sys.argv[1]) / ('polaris-upstream-' + dependency['name'])
+              subprocess.run(['git', 'clone', '--no-checkout', dependency['sourceURL'], str(repository)], check=True)
+              subprocess.run(['git', '-C', str(repository), 'cat-file', '-e', dependency['upstreamCommit'] + '^{commit}'], check=True)
+              values.append('--module-source=' + dependency['module'] + '=' + str(repository))
+          pathlib.Path(sys.argv[1], 'polaris-module-sources.json').write_text(json.dumps(values))
+          PYDEPS
           (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
           mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
           df -h / | tail -1
-          bash scripts/build-libbox.sh "$src"
+          mapfile -t module_sources < <(python3 -c 'import json,os; print("\n".join(json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))))')
+          bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
 
           # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
           # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与 release
@@ -403,7 +429,9 @@ jobs:
       #      东西**。keep 指向一个不存在的类时，那行文本照样在，而类已被 R8 整包剪掉。
       #      「保住了什么」的判据是 seeds.txt —— 那份文件早就在上传清单里，却一条断言都没有。
       - name: R8 吃进了什么 / 保住了什么（产物级证据）
-        run: node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+        run: |
+          node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+          python3 scripts/libbox-patches/verify-receipt.py --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
 
       - name: 记录未分发 APK 体积
         shell: bash
@@ -560,6 +588,8 @@ jobs:
         id: libbox_go
         shell: bash
         run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
           version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").goVersion')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -598,7 +628,8 @@ jobs:
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
           yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0"
+          libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
@@ -612,7 +643,7 @@ jobs:
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
 
-          echo "NDK(rust)=$rust_ndk; libbox NDK is prepared from its pinned archive on cache miss"
+          echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
 
       - name: Resolve bundled core version
         id: core
@@ -629,9 +660,24 @@ jobs:
       # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
       #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
       # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
-      # [选「cache 在前、未命中就现建」：缓存只是省时间，**不是来源**。缓存不在 / 键变了 / 缓存服务挂了，
-      #  下一步照样从 sing-box 源码现建；建失败就红。缓存键含内核版本、builder、manifest 与补丁，
-      #  命中后仍按收据逐字节核 AAR，旧产物不能冒充本次来源]
+      # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
+      # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
+      # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
+      - name: Prepare libbox tools and source cache identity
+        id: libbox_input
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
+          libbox_go="$(command -v go)"
+          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
+          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
+          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
+          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
+          echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
+          echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
+          echo "fingerprint=$(python3 scripts/libbox-patches/android-source.py identity)" >> "$GITHUB_OUTPUT"
+
       - name: Cache libbox.aar
         id: libbox
         uses: actions/cache@v6
@@ -639,7 +685,7 @@ jobs:
           path: |
             src-tauri/gen/android/app/libs/libbox.aar
             scripts/libbox-patches/build-receipt.json
-          key: libbox-${{ runner.os }}-v${{ steps.core.outputs.version }}-${{ hashFiles('scripts/build-libbox.sh', 'scripts/libbox-patches/build.py', 'scripts/libbox-patches/prepare-ndk-linux.py', 'scripts/libbox-patches/ndk-linux-archive.json', 'scripts/libbox-patches/source-manifest.json', 'scripts/libbox-patches/*.patch') }}
+          key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
       - name: Build libbox.aar (缓存未命中)
         if: steps.libbox.outputs.cache-hit != 'true'
@@ -647,18 +693,26 @@ jobs:
         run: |
           set -euo pipefail
           src="$RUNNER_TEMP/sing-box"
-          # 浅克隆到 tag：脚本随后用 `git describe --tags` 与 core-manifest 对拍，不符即拒绝构建。
+          # upstream tag 与 pinned commit 对拍；patched output 使用共同 sourceBuild.version。
           git clone --depth 1 --branch "v${{ steps.core.outputs.version }}" \
             https://github.com/SagerNet/sing-box "$src"
-          libbox_go="$(command -v go)"
-          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
-          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
-          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
-          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
+          # Each dependency repository is explicit; shared provider performs the only replay.
+          python3 - "$RUNNER_TEMP" <<'PYDEPS'
+          import json, pathlib, subprocess, sys
+          source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
+          values = []
+          for dependency in source['dependencyPatches']:
+              repository = pathlib.Path(sys.argv[1]) / ('polaris-upstream-' + dependency['name'])
+              subprocess.run(['git', 'clone', '--no-checkout', dependency['sourceURL'], str(repository)], check=True)
+              subprocess.run(['git', '-C', str(repository), 'cat-file', '-e', dependency['upstreamCommit'] + '^{commit}'], check=True)
+              values.append('--module-source=' + dependency['module'] + '=' + str(repository))
+          pathlib.Path(sys.argv[1], 'polaris-module-sources.json').write_text(json.dumps(values))
+          PYDEPS
           (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
           mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
           df -h / | tail -1
-          bash scripts/build-libbox.sh "$src"
+          mapfile -t module_sources < <(python3 -c 'import json,os; print("\n".join(json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))))')
+          bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
 
           # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
           # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与 release
@@ -864,7 +918,9 @@ jobs:
       # 与未分发 release-profile 腿同一份判据（资源有没有静默逃逸 / 死字节 / cronet-naive 在不在 / 符号剥没剥 /
       # 出厂权限集）。发布包上少这一步，就是把「全绿但产物是垃圾」那四条已实证通路直接送给用户。
       - name: 开箱验（产物级判据）
-        run: node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a
+        run: |
+          node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a
+          python3 scripts/libbox-patches/verify-receipt.py --apk ${{ steps.asset.outputs.asset }} --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
 
       - name: 上传成 release 资产
         shell: bash

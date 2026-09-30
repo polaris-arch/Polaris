@@ -1,0 +1,14 @@
+{
+  "schema": "polaris-android-source-policy-v1",
+  "sdkBootclasspath": {
+    "platform": "android-36",
+    "androidJarSha256": "d9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a"
+  },
+  "requiredPatchedModules": ["github.com/sagernet/sing-tun", "github.com/sagernet/nftables"],
+  "abis": {
+    "arm64-v8a": {"goos": "android", "goarch": "arm64", "cgo": "1", "architecture": {"GOARM64": "v8.0"}, "elfClass": 2, "elfMachine": 183, "patchedModules": null, "transportModules": null},
+    "armeabi-v7a": {"goos": "android", "goarch": "arm", "cgo": "1", "architecture": {"GOARM": "7"}, "elfClass": 1, "elfMachine": 40, "patchedModules": null, "transportModules": null},
+    "x86": {"goos": "android", "goarch": "386", "cgo": "1", "architecture": {"GO386": "sse2"}, "elfClass": 1, "elfMachine": 3, "patchedModules": null, "transportModules": null},
+    "x86_64": {"goos": "android", "goarch": "amd64", "cgo": "1", "architecture": {"GOAMD64": "v1"}, "elfClass": 2, "elfMachine": 62, "patchedModules": null, "transportModules": null}
+  }
+}
