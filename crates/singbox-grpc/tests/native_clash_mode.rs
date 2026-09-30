@@ -1,6 +1,9 @@
 //! Optional contract test against the actual bundled sing-box executable. It starts only a
 //! loopback management service; no TUN, system proxy, or external traffic is configured.
 
+#[path = "../../config-engine/tests/support/kernel_run.rs"]
+mod kernel_run;
+
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -14,8 +17,11 @@ impl Drop for Core {
 }
 
 #[tokio::test]
-#[ignore = "requires the locally bundled Linux sing-box executable"]
+#[ignore = "requires POLARIS_SINGBOX_PATH or the locally bundled Linux sing-box executable"]
 async fn native_core_lists_and_switches_the_two_compiled_modes() {
+    if !kernel_run::kernel_run_or_skip("native_core_lists_and_switches_the_two_compiled_modes") {
+        return;
+    }
     let binary = std::env::var("POLARIS_SINGBOX_PATH").unwrap_or_else(|_| {
         format!(
             "{}/../../resources/linux/sing-box",
@@ -42,8 +48,7 @@ async fn native_core_lists_and_switches_the_two_compiled_modes() {
     }}"#
     );
     std::fs::write(&path, config).unwrap();
-    let child = Command::new(binary)
-        .arg("run")
+    let child = kernel_run::with_run(Command::new(binary))
         .arg("-c")
         .arg(&path)
         .stdout(Stdio::null())

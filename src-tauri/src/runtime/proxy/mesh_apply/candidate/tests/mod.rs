@@ -115,11 +115,34 @@ fn fixture() -> (
     fixture_with(|_| {})
 }
 
+#[test]
+fn stored_system_proxy_is_rejected_when_mobile_effective_mode_is_tun() {
+    let (dir, mut runtime, snapshot, input, plan) = fixture();
+    let parsed: UserConfig = serde_json::from_value(snapshot.raw().clone()).unwrap();
+    assert_eq!(parsed.proxy_mode_type, ProxyModeType::SystemProxy);
+    assert!(conservative_user_input(&parsed, Platform::Linux));
+    for platform in [Platform::Android, Platform::Ios] {
+        assert_eq!(
+            parsed.proxy_mode_type.effective_on(platform),
+            ProxyModeType::Tun
+        );
+        assert!(!conservative_user_input(&parsed, platform));
+        Arc::get_mut(&mut runtime).unwrap().helper = Arc::new(
+            HelperRuntime::with_platform_for_tests(dir.path().to_path_buf(), platform),
+        );
+        assert!(matches!(
+            generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan),
+            Err(CandidateError::Unsupported)
+        ));
+        assert!(!dir.join("mesh-apply").exists());
+    }
+}
+
 #[tokio::test]
 async fn full_builder_candidate_seals_direct_vless_and_preserves_old_resources() {
     let (dir, runtime, snapshot, input, plan) = fixture();
     let parsed: UserConfig = serde_json::from_value(snapshot.raw().clone()).unwrap();
-    assert!(conservative_user_input(&parsed));
+    assert!(conservative_user_input(&parsed, runtime.helper.platform()));
     assert!(conservative_raw_server(snapshot.raw()));
     let cache_path = dir.join("cache.db");
     let runtime_config_path = dir.join("singbox-runtime.json");

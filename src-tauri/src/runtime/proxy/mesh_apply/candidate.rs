@@ -20,6 +20,7 @@ use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_config_engine::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use polaris_config_engine::user_config::server_config::Protocol;
 use polaris_config_engine::user_config::UserConfig;
+use polaris_helper_proto::Platform;
 use serde_json::Value;
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -287,7 +288,7 @@ impl SealedCandidate {
             return Err(CandidateIntegrityError::PlanMismatch);
         }
         if expected_profile != CandidateProfile::DesktopNonTunDirectVlessV1
-            || !conservative_user_input(&f.effective_user_config)
+            || !conservative_user_input(&f.effective_user_config, Platform::parse(&f.deps.platform))
             || !conservative_raw_server(snapshot.raw())
             || f.metadata != metadata_for(&f.effective_user_config, &f.deps)
         {
@@ -380,9 +381,9 @@ fn no_candidate_srs_probe(_: &str) -> bool {
     false
 }
 
-fn conservative_user_input(config: &UserConfig) -> bool {
+fn conservative_user_input(config: &UserConfig, platform: Platform) -> bool {
     config.proxy_mode == ProxyMode::Direct
-        && config.proxy_mode_type == ProxyModeType::SystemProxy
+        && config.proxy_mode_type.effective_on(platform) == ProxyModeType::SystemProxy
         && config.servers.len() == 1
         && config.servers[0].protocol == Protocol::Vless
         && config.selected_server_id.as_deref() == Some(config.servers[0].id.as_str())
@@ -589,7 +590,9 @@ pub(crate) fn generate_direct_vless_candidate(
     }
     let user_config: UserConfig =
         serde_json::from_value(snapshot.raw().clone()).map_err(|_| CandidateError::Unsupported)?;
-    if !conservative_user_input(&user_config) || !conservative_raw_server(snapshot.raw()) {
+    if !conservative_user_input(&user_config, runtime.helper.platform())
+        || !conservative_raw_server(snapshot.raw())
+    {
         return Err(CandidateError::Unsupported);
     }
     let control_port =

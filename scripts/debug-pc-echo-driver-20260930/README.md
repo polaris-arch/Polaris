@@ -50,5 +50,5 @@ The future run command is `python3 driver.py --serial SERIAL --pc-plan PRIVATE_P
 Do not run it during source preparation. One run owns one original controller and one
 Android batch; errors stop that original controller and do not retry or reissue Ready.
 
-Pure checks: `POLARIS_NO_KERNEL_RUN=1 PYTHONDONTWRITEBYTECODE=1 python3 -B tests/test_driver.py`.
+Pure checks: `POLARIS_NO_KERNEL_RUN=1 PYTHONDONTWRITEBYTECODE=1 python3 -B tests/test-driver.py`.
 Synthetic fixtures only test logic and cannot construct runtime evidence or issuer custody.

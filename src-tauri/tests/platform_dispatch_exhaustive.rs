@@ -432,6 +432,92 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
          因而保留原有接口绑定；其他平台仍尝试枚举。Android 分支是独立平台行为，新增平台\
          不能默默继承枚举一侧，须在这里重新核对。",
     ),
+    // 2026-10-01：对齐出生/退出托管与 Android 调试桥的真实新增点。
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "else if matches!(client.platform(), Platform::Mac | Platform::Win)",
+        1,
+        "出生状态查询的 Mac/Win 分类器只认 NativeBirth；Android/iOS/Other 不进此臂。它们没有桌面 helper，实现不得借 Linux 或 native 凭据兜底。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if !matches!(self.platform, Platform::Mac | Platform::Win)",
+        1,
+        "native birth 能力准入在非 Mac/Win 直接返回；Android/iOS/Other 的 supported 为 false，主链不会因此获得启动许可，未来新平台须实现自己的能力门。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if client.platform() != Platform::Linux",
+        1,
+        "Linux birth 能力探测在非 Linux 不发送 Linux 专属请求；Mac/Win 另问 native birth，Android/iOS/Other 无 helper，不能靠此提前返回取得能力。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if client.platform() == Platform::Linux",
+        1,
+        "托管状态的 Linux 响应须提供 LinuxStartBirth；Android/iOS/Other 不进此臂，末端 Unsupported 不接受遗留 PID。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(client.platform(), Platform::Mac | Platform::Win)",
+        1,
+        "native stop 的 Mac/Win 响应只结算原生精确出生凭据；Android/iOS/Other 不进此臂，无此平台的 helper 停核协议。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) && error.code == polaris_helper_proto::ErrorCode::Unknown",
+        1,
+        "Unknown 只在现有三个桌面 helper 上转成协议升级提示；Android/iOS/Other 仍保留原错误，不能假称安装新 helper 就能支持其运行模型。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(self.platform, Platform::Mac | Platform::Win)",
+        1,
+        "native birth 状态请求只由 Mac/Win 发送；Android/iOS/Other 使用不了该请求，必须由其原有平台桥管理。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if self.platform != Platform::Linux",
+        1,
+        "新增 require_linux_birth_capability 的非 Linux 提前返回只免掉 Linux 专属询问；Android/iOS/Other 不支持 helper，准入仍由 supported 和平台启动分派限制。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if self.platform == Platform::Linux",
+        1,
+        "Linux 启动响应只进 LinuxBirth 分类器；Mac/Win 使用下一条 NativeBirth 分类，Android/iOS/Other 不能被降级为遗留启动凭据。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if self.platform == Platform::Linux && matches!(target, HelperStopTarget::Legacy(_))",
+        1,
+        "Linux 遗留 PID 停核目标被拒绝，强制使用精确出生身份；Android/iOS/Other 不进此拒绝臂，但它们也无 helper 停核实现，不能因此获准停核。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "let response = client .send(&if client.platform() == Platform::Linux",
+        1,
+        "托管状态请求在 Linux 取 LinuxBirth，Mac/Win 取 NativeBirth，Android/iOS/Other 在发送前明确 Unsupported；新平台不继承桌面请求。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "let response = if matches!(client.platform(), Platform::Mac | Platform::Win)",
+        1,
+        "Mac/Win 停核用 StopNativeBirth，其余臂显式区分 Linux 并拒绝移动端/Other；不是向新平台发送旧 Stop(PID) 请求。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "if helper.platform() == Platform::Linux",
+        1,
+        "启动前 Linux helper 自证只询问 LinuxBirth 能力；Mac/Win 询问 NativeBirth。Android/iOS/Other 没有 helper 路径，不能用返回 Ok 代替平台准入。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "if matches!(self.helper.platform(), Platform::Mac | Platform::Win)",
+        1,
+        "接收 helper 启动凭据前 Mac/Win 必须声明 NativeBirth；Linux 另有 LinuxBirth。Android/iOS/Other 不会进入此桌面 helper 启动路径。",
+    ),
+
 ];
 
 // ===================== 判据本体 =====================
@@ -1668,6 +1754,32 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
          talled 会走安装器路径（安装器能装、不会砸掉便携副本），判成 Loose 则会对一个真装过的副本\
          做原地替换。未知平台上取安全侧正确。",
     ),
+    // 2026-10-01：对齐出生/退出托管与 Android 调试桥的真实新增点。
+    (
+        "crates/config-engine/src/builder/generate.rs",
+        "if deps.platform == \"android\" && deps.has_management_api",
+        1,
+        "双模式 Clash 投影仅给已有管理 API 的 Android JNI 宿主；iOS/未知平台不因此取得该投影或管理能力，须先接入自己的管理 API 面。",
+    ),
+    (
+        "crates/config-engine/src/builder/inbounds.rs",
+        "if cfg!(debug_assertions) && deps.platform == \"android\" && deps.debug_probe_mixed_udp",
+        1,
+        "认证回环探针的 UDP mixed 仅限 Debug Android 且 runtime 明确开启；release/iOS/未知平台保持原 HTTP 入站，不凭平台字符串扩大监听能力。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/mesh_apply/candidate.rs",
+        "profile: CandidateProfile::DesktopNonTunDirectVlessV1, target_os: deps.platform.clone(), target_arch: deps.arch.clone(), ports: PortsProvenance::ProbedNumbersNotReserved, interface_binding: SubsetApplicability::NotRequiredByValidatedNonTunSubset, dns_sidecar: SubsetApplicability::NotRequiredByValidatedNonTunSubset, check_support: if deps.platform == \"linux\" && deps.arch == \"x86_64\" && plain_tcp",
+        1,
+        "严格候选核检查目前仅支持 Linux x86_64 的 plain TCP 子集；其它平台/架构落 UnsupportedProfile。候选生成已按 effective_on 拒绝移动端 Tun，且 managed_launch_unsupported 保持成立，此元数据不能许可出生。",
+    ),
+    (
+        "src-tauri/src/runtime/updater.rs",
+        "if allowed_absent .iter() .any(|module| key == \"linux\" || *module != \"github.com/sagernet/nftables\")",
+        1,
+        "core-manifest 补丁模块分区：Linux 不允许 nftables 缺席，其它已有目标可缺 Linux 专属模块。key 来自闭集清单目标；未知平台不会由该判断生成新核资源或运行能力。",
+    ),
+
 ];
 
 // ── 判据本体 ──
@@ -2702,6 +2814,204 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "Android 瞬态登录用 JNI/libbox instance；iOS 不能编译 Android 桥，\
          但当前又落到桌面可执行文件路径，需独立进程内登录宿主。",
     ),
+    // 2026-10-01：对齐出生/退出托管与 Android 调试桥的真实新增点。
+    (
+        "src-tauri/src/commands/android_batch_qa.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        1,
+        IosSide::DiffersOnlyInDebug,
+        "batch QA 命令仅 Debug Android 调 JNI 调试桥；release 两平台都关闭，Debug iOS 没有 Android 桥，保持 disabled。",
+    ),
+    (
+        "src-tauri/src/commands/android_batch_qa.rs",
+        "not(all(target_os = \"android\", debug_assertions))",
+        1,
+        IosSide::DiffersOnlyInDebug,
+        "batch QA 非 Debug Android 返回 disabled；release Android/iOS 同侧，Debug iOS 仍禁用而非引用不存在的 JNI。",
+    ),
+    (
+        "src-tauri/src/commands/window.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersWrongToday,
+        "restart 的桌面准备/提交在 iOS 也会编译，但 iOS 应由扩展进程管理退出；目前无 iOS exit ports/编译验证，不能将谓词简单扩到 JNI 路径，登记既有债。",
+    ),
+    (
+        "src-tauri/src/commands/window.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersWrongToday,
+        "Android restart 使用 QuitState 与 Activity 生命周期；iOS 缺扩展退出宿主，当前走桌面退出腿是同一笔债；先有 iOS exit ports 才能改分派。",
+    ),
+    (
+        "src-tauri/src/exit_lifecycle.rs",
+        "not(target_os = \"android\")",
+        7,
+        IosSide::DiffersWrongToday,
+        "DesktopExitPorts、prepare/commit、quit/final-exit 七处持桌面 Child/mesh 退出托管；iOS 不能沿用桌面核托管，缺 NE 扩展退出端口，登记债而不扩编 Android JNI。",
+    ),
+    (
+        "src-tauri/src/exit_lifecycle.rs",
+        "target_os = \"android\"",
+        5,
+        IosSide::DiffersWrongToday,
+        "五处 Android 退出入口拒绝桌面 prepare/commit 并保留原 mobile cleanup；iOS 当前落桌面侧，需扩展进程 quit/cleanup 协议与编译验证后再实现。",
+    ),
+    (
+        "src-tauri/src/lib.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersWrongToday,
+        "新增桌面退出路由在 iOS 仍落桌面 child 托管，延续本文件既有债；须先提供 iOS exit ports，不能换谓词去引用 Android 桥。",
+    ),
+    (
+        "src-tauri/src/lib.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "新增 Android Exit/ExitRequested 路由调用原 Android cleanup，专属 JNI 生命周期不能由 iOS 共用；非 Android 退出托管的 iOS 债由同文件反侧条目保留。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy.rs",
+        "any(all(target_os = \"android\", debug_assertions), test)",
+        3,
+        IosSide::DiffersOnlyInDebug,
+        "Android probe snapshot/session 输入及 QA/probe 模块只为调试 Android 桥，test 可编纯状态机；release iOS/Android 都无调试模块，Debug iOS 不引用 JNI。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        4,
+        IosSide::DiffersOnlyInDebug,
+        "新增四处 JNI debug command/core probe 实现只在 Debug Android 存在；iOS 无该插件，release 两端均无调试入口。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "any(target_os = \"android\", test)",
+        5,
+        IosSide::DiffersRight,
+        "新增五处 Android 主核/瞬态核的容量、出生与 drain 协议类型可在 test 编译纯状态机；iOS 不持 Android instance 身份，需自己的桥类型。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersRight,
+        "新增非 Android debug command 桩只返回 unsupported；iOS 同样没有 Android JNI，不能假装可调用该调试命令。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "target_os = \"android\"",
+        3,
+        IosSide::DiffersRight,
+        "新增三个 Android debug command/probe JNI 调用点仅属于 Android 插件；iOS 不可复用 Java 宿主，保持该支不编译。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_capacity.rs",
+        "any(target_os = \"android\", test)",
+        1,
+        IosSide::DiffersRight,
+        "Android 容量错误转 SpawnError 时使用 android-libbox 标识；test 只验错误投影，iOS 没有此容量宿主，须定义自己的错误转换。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_probe_loan.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        1,
+        IosSide::DiffersOnlyInDebug,
+        "debug_android_core_probe 消费 Debug Android 的会话/instance 出生凭据；release 两端均无此入口，iOS 不具 Android 实例身份。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/hot_switch.rs",
+        "any(all(target_os = \"android\", debug_assertions), test)",
+        2,
+        IosSide::DiffersOnlyInDebug,
+        "hot switch 的 probe snapshot 输入/提取仅 Debug Android 或纯 test；release 无此调试字段，Debug iOS 没有 Android probe session。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "any(target_os = \"android\", test)",
+        2,
+        IosSide::DiffersUndecided,
+        "Android lifecycle 的 legacy admission 与主核观察类型可在 test 验纯协议；iOS 的扩展主核 token/租约关系尚无事实，延续原未裁定债，需 iOS 宿主后判断。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "target_os = \"android\"",
+        7,
+        IosSide::DiffersUndecided,
+        "新增七处 Android reconnect、主核 claim/drain/stop 用原 JNI instance；iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/process_supervision.rs",
+        "any(all(target_os = \"android\", debug_assertions), test)",
+        2,
+        IosSide::DiffersOnlyInDebug,
+        "stop observation 的 debug_probe_input 初始与历史 Unknown 构造仅 Debug Android/test；release 两平台均无该字段，Debug iOS 无 Android probe 会话。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/process_supervision.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersWrongToday,
+        "新增主核停核 admission/legacy 权限在 Android 走实例凭据；iOS 仍落桌面 Child 观察，缺扩展主核精确出生/停止协议，延续既有债。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/process_supervision/direct_stop.rs",
+        "target_os = \"android\"",
+        3,
+        IosSide::DiffersWrongToday,
+        "三个 direct-stop 入口仅拒绝 Android/已有 helper，iOS 当前仍进入桌面 Child custody；iOS 不提供此 Child，需 NE 扩展 birth/stop adapter 后再收紧平台闭集。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        3,
+        IosSide::DiffersOnlyInDebug,
+        "启动后 Android probe 开始记录、发布 snapshot、deps UDP flag 仅 Debug Android；release 两平台同侧，Debug iOS 无 Android调试会话。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(all(target_os = \"android\", debug_assertions))",
+        1,
+        IosSide::DiffersOnlyInDebug,
+        "release 或非 Android 的常规 switch snapshot 分支不持 Android probe 凭据；Debug iOS 仍走常规分支，尚无 Android 调试能力。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersWrongToday,
+        "新增运行中二进制自证仅在非 Android 跑独立可执行文件；iOS 落此臂仍是桌面路径债，须以扩展内 libbox 自证替换，不得只扩大 JNI cfg。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "target_os = \"android\"",
+        4,
+        IosSide::DiffersWrongToday,
+        "新增 Android 启动 placeholder、自证免除及 API port ledger 使用进程内主核；iOS 仍落独立二进制/桌面端口逻辑，延续既有 iOS 启动债。",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
+        21,
+        IosSide::DiffersWrongToday,
+        "21 处非 Android 测速持桌面 Child、PID kill/reap/config retirement；iOS 扩展不提供这些进程句柄，必须先有 iOS 瞬态实例桥与关闭凭据，登记债而不扩大 Android JNI 分支。",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "target_os = \"android\"",
+        9,
+        IosSide::DiffersRight,
+        "新增九处 Android 测速走 Android JNI 瞬态实例、drain 与 snapshot；iOS 没有该 Java 宿主，不能编 Android 腿。其错误继承桌面路径的事实在 not(android) 条目单独登记为债。",
+    ),
+    (
+        "src-tauri/src/runtime/updater.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "core-manifest 的 Android resolver 标志选择 libbox 资源事实，iOS 不应借 Android 资源；未支持目标不因此获得核资源或更新能力。",
+    ),
+
 ];
 
 // ── cfg 轴的取材与求值 ──
@@ -3077,11 +3387,13 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 2026-09-29：识别 `debug_assertions` 后，旧的未知原子提前失败不再遮住随后一批 cfg 点。
 /// 按源码逐项登记后的总账是 227 处：debug 专属反侧 6、已核对反侧 96、待验证 12、
 /// iOS 现状已知不适用 73、同侧 40；下表与具名债清单分别防数量和位置漂移。
+/// 2026-10-01：新增 95 处实际分派并逐点登记；所有既有判决/债条目保留。
+/// 新增债仍是债；本次未取得 iOS 编译或真机收据，未还清任何 iOS 支持债。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
-    ("DiffersOnlyInDebug", 6),
-    ("DiffersRight", 96),
-    ("DiffersUndecided", 12),
-    ("DiffersWrongToday", 73),
+    ("DiffersOnlyInDebug", 24),
+    ("DiffersRight", 117),
+    ("DiffersUndecided", 21),
+    ("DiffersWrongToday", 120),
     ("WithAndroid", 40),
 ];
 
@@ -3141,6 +3453,27 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "target_os = \"android\"",
         1,
     ),
+    (
+        "src-tauri/src/commands/window.rs",
+        "not(target_os = \"android\")",
+        1,
+    ),
+    (
+        "src-tauri/src/commands/window.rs",
+        "target_os = \"android\"",
+        2,
+    ),
+    (
+        "src-tauri/src/exit_lifecycle.rs",
+        "not(target_os = \"android\")",
+        7,
+    ),
+    (
+        "src-tauri/src/exit_lifecycle.rs",
+        "target_os = \"android\"",
+        5,
+    ),
+    ("src-tauri/src/lib.rs", "not(target_os = \"android\")", 1),
     ("src-tauri/src/lib.rs", "not(target_os = \"android\")", 2),
     (
         "src-tauri/src/runtime/geo_seed.rs",
@@ -3149,6 +3482,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "any(target_os = \"android\", test)",
+        2,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
         "not(target_os = \"android\")",
         1,
     ),
@@ -3158,9 +3496,29 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         1,
     ),
     (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "target_os = \"android\"",
+        7,
+    ),
+    (
         "src-tauri/src/runtime/proxy/process_supervision.rs",
         "target_os = \"android\"",
         2,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/process_supervision.rs",
+        "target_os = \"android\"",
+        2,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/process_supervision/direct_stop.rs",
+        "target_os = \"android\"",
+        3,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(target_os = \"android\")",
+        1,
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",
@@ -3180,7 +3538,17 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/proxy/startup.rs",
         "target_os = \"android\"",
+        4,
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "target_os = \"android\"",
         7,
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
+        21,
     ),
     (
         "src-tauri/src/runtime/startup_tasks.rs",

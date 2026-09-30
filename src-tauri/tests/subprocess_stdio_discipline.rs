@@ -149,6 +149,9 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     // 回放（`the_order_leg_is_red_on_the_historical_resolvectl_defect`）要能登记它，才谈得上「排空
     // 形态在场、红的是次序」——否则回放红在「形态缺失」上，次序那一半仍旧没有被真缺陷证明过。
     "read_to_string(",
+    // CheckCustody 的两条流由 OutputCapture::read 立即起独立 read_to_end 任务。
+    // 精确接线与真实读体由 check_custody_starts_both_eof_readers_before_return 钉住。
+    "output.read(",
 ];
 
 /// 「带着两条未排空管道的 child」这件事在**类型**上的全部落点。
@@ -231,13 +234,11 @@ struct PipedSite {
 const PIPED_SITES: &[PipedSite] = &[
     // ── crates/core-supervisor ──
     PipedSite {
-        file: "crates/core-supervisor/src/config_gate.rs",
-        // 全仓唯一的 `sing-box check` 子进程实现：起核闸门、瞬态核起前自检、「测试内核兼容性」
-        // 按钮三处共用它。锚点随管道走 —— 管道从 `run_config_check_within` 挪进了它调用的这一层。
-        anchor: "pub async fn run_check_raw(",
+        file: "crates/core-supervisor/src/config_gate/check_custody.rs",
+        // 常规平台 check 子进程的 custody owner，返回前两条流均交给 EOF 任务。
+        anchor: "fn spawn(",
         kind: SiteKind::Sink,
-        // 本仓短命腿的最佳形态：`output()` 并发读两条流 + `timeout` + `kill_on_drop(true)`。
-        drain_forms: &[".output()"],
+        drain_forms: &["output.read("],
     },
     PipedSite {
         file: "crates/core-supervisor/src/spawner.rs",
@@ -271,7 +272,7 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/macos/server.rs",
-        anchor: "fn do_spawn(",
+        anchor: "fn do_native_spawn(",
         kind: SiteKind::Sink,
         // 预开日志文件成功走 loggers，失败退化成纯 drainers —— 两条都是生产路径，故两个形态都要在。
         drain_forms: &[
@@ -293,7 +294,7 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/windows/winproc/win.rs",
-        anchor: "fn start_singbox(",
+        anchor: "fn spawn_tracked(",
         kind: SiteKind::Sink,
         drain_forms: &[
             "spawn_pipe_loggers_with_preopened_files",
@@ -1102,6 +1103,37 @@ fn the_scan_surface_reports_itself_and_covers_the_known_pipe_bearing_crates() {
 // ════════════════════════════════════════════════════════════════════════════
 // G1：开管道的人负责排空，且排空早于等待
 // ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn check_custody_starts_both_eof_readers_before_return() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(
+        &index,
+        "crates/core-supervisor/src/config_gate/check_custody.rs",
+    );
+    let spawn = block_of(owner, "fn spawn(");
+    let compact: String = spawn.chars().filter(|c| !c.is_whitespace()).collect();
+    for wiring in [
+        "letstdout=child.stdout.take();",
+        "letstderr=child.stderr.take();",
+        "output.read(stdout,false);",
+        "output.read(stderr,true);",
+    ] {
+        assert_eq!(
+            compact.matches(wiring).count(),
+            1,
+            "custody 接线漂移：{wiring}"
+        );
+        assert!(compact.find(wiring).unwrap() < compact.find("Ok(Ok((request,output)))").unwrap());
+    }
+    let read = block_of(owner, "fn read<R:");
+    assert!(read.contains("tokio::spawn("), "EOF reader 必须立即起任务");
+    assert!(
+        read.contains("pipe.read_to_end("),
+        "读任务必须将真实 pipe 读到 EOF"
+    );
+}
 
 #[test]
 fn every_piped_site_is_registered_and_drains_before_it_waits() {

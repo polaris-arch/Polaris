@@ -16,6 +16,9 @@ function job(source, name) {
   const next = /^  [a-z_]+:\s*$/m.exec(body);
   return next ? body.slice(0, next.index) : body;
 }
+function kernelCoverage(source) {
+  assert.doesNotMatch(source, /POLARIS_NO_KERNEL_RUN/, 'CI must retain kernel coverage; only the local gate sets this switch');
+}
 function candidates(source) {
   const producer = source['desktop-core'];
   const risk = source['release-risk'];
@@ -92,6 +95,8 @@ function checkAllowlist(source) {
 
 test('four source producers use exact native hosts, source Go pin and real Darwin SDK', () => {
   const workflow = files['desktop-core'];
+  kernelCoverage(workflow);
+  assert.throws(() => kernelCoverage(workflow.replace('env:\n', "env:\n  POLARIS_NO_KERNEL_RUN: '1'\n")));
   const rows = job(workflow, 'produce').split('\n').filter((line) => /^\s+- \{"platform"/.test(line))
     .map((line) => JSON.parse(line.slice(line.indexOf('{'))));
   assert.deepEqual(rows, [

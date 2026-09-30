@@ -933,7 +933,7 @@ mod lifetime_wait {
     #[test]
     fn production_writer_is_transferred_after_spawn_without_fallible_publication() {
         // Check the narrow production lifetime transfer; other tests exercise real EOF/error IO.
-        let source = include_str!("../../update_install.rs");
+        let source = crate::test_support::crate_source("runtime/update_install.rs");
         let production = source.split("pub fn spawn_detached_script").nth(1).unwrap();
         let spawn = production
             .find("spawn_with_lifetime_pipe(&mut cmd)")

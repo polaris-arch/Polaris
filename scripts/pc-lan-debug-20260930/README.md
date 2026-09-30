@@ -72,7 +72,7 @@ PC snapshot order and Android attempt order are checked locally, with no cross-d
 ## Harmless source tests
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/pc-lan-debug-20260930/tests/test_lan.py
+PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/pc-lan-debug-20260930/tests/test-lan.py
 ```
 
 For this handoff source change, the added pure injection set is `ReadyHandoffTests`; select it by appending that class name to the command. Targeted affected codec, fixture and custody tests can be selected by their full unittest names. A full historical test rerun is not required by this source handoff.

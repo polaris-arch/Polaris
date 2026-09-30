@@ -25,7 +25,6 @@ env:
   CORE_CANDIDATE: ${{ inputs.candidate }}
   CORE_RUN_ID: ${{ github.run_id }}
   CORE_RUN_ATTEMPT: ${{ github.run_attempt }}
-  POLARIS_NO_KERNEL_RUN: '1'
 
 jobs:
   produce:

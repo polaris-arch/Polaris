@@ -289,7 +289,7 @@ fn native_stop_wire_rejects_missing_duplicate_and_extra_identity_lines() {
 
 #[test]
 fn native_windows_wait_source_cannot_upgrade_termination_ack_or_pid_probe_into_exit() {
-    let source = include_str!("../../winproc/win.rs");
+    let source = polaris_source_probe::crate_source!("platform/windows/winproc/win.rs");
     let wait = source
         .split("fn native_wait(")
         .nth(1)

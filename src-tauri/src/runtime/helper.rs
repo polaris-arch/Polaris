@@ -1654,7 +1654,9 @@ fn stop_core_with_client_budget(
     let mut pending_pid = None;
     let request = match client.platform() {
         Platform::Linux => Request::LinuxStop { pid: want_pid },
-        _ => Request::Stop { pid: want_pid },
+        Platform::Mac | Platform::Win | Platform::Android | Platform::Ios | Platform::Other => {
+            Request::Stop { pid: want_pid }
+        }
     };
     loop {
         let remaining = total_timeout.saturating_sub(started.elapsed());
@@ -1734,7 +1736,9 @@ fn stop_birth_with_client_budget(
     let request = match client.platform() {
         Platform::Linux => Request::LinuxStopBirth { target },
         Platform::Mac | Platform::Win => Request::NativeStopBirth { target },
-        _ => return Err("helper exact birth Stop unsupported on this platform".into()),
+        Platform::Android | Platform::Ios | Platform::Other => {
+            return Err("helper exact birth Stop unsupported on this platform".into());
+        }
     };
     loop {
         let remaining = total_timeout.saturating_sub(started.elapsed());

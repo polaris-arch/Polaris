@@ -1393,9 +1393,15 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
     (
         "        run: node scripts/assert-r8-evidence.mjs \
          src-tauri/gen/android/app/build/outputs/mapping/arm64Release",
-        2,
-        "R8 产物级判据：普通 unsigned release-profile 验证与正式 signed release 各一；发布路径必须以将要上传的\
-         那次构建的 configuration.txt / seeds.txt 为证据，不能借另一只包作保。",
+        1,
+        "signed release 的独立 run 行必须以将要上传的那次构建的 configuration.txt / seeds.txt 为证据。",
+    ),
+    (
+        "          node scripts/assert-r8-evidence.mjs \
+         src-tauri/gen/android/app/build/outputs/mapping/arm64Release",
+        1,
+        "unsigned release_check 在 run 块内执行 R8 判据，随后校验同包 libbox receipt；\
+         两条 release 路径各执行一次，失败退出码都必须传给 workflow。",
     ),
     (
         "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
