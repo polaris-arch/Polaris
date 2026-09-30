@@ -208,7 +208,7 @@ async fn superseded_crashed_run_is_replayed_once() {
         .unwrap();
     *rt.current_config.write().unwrap() = Some(serde_json::json!("config-b"));
     let mut b = DirectCoreRun::new(spawn_crash_test_child());
-    b.child.kill().await.expect("B exits");
+    b.child_for_test().kill().await.expect("B exits");
     let b_identity = b.identity.clone();
     rt.child.lock().unwrap().install_running_for_test(b);
     let b_event = rt
@@ -272,7 +272,7 @@ async fn stopped_superseded_crash_does_not_replay() {
         .unwrap();
     *rt.current_config.write().unwrap() = Some(serde_json::json!("config-b"));
     let mut b = DirectCoreRun::new(spawn_crash_test_child());
-    b.child.kill().await.expect("B exits");
+    b.child_for_test().kill().await.expect("B exits");
     let b_identity = b.identity.clone();
     rt.child.lock().unwrap().install_running_for_test(b);
     let b_event = rt
@@ -375,7 +375,10 @@ async fn stale_direct_crash_cannot_reset_replacement_state_across_ts_gate() {
     let (rt, _dir) = test_runtime();
     let state_gate = rt.mesh.tailscale_state_gate().await;
     let mut old = DirectCoreRun::new(spawn_crash_test_child());
-    old.child.kill().await.expect("exit old stand-in");
+    old.child_for_test()
+        .kill()
+        .await
+        .expect("exit old stand-in");
     let old_identity = old.identity.clone();
     rt.child.lock().unwrap().install_running_for_test(old);
 
@@ -407,7 +410,10 @@ async fn stale_direct_crash_cannot_reset_replacement_state_across_ts_gate() {
         slot.install_running_for_test(next);
         old
     };
-    old.child.wait().await.expect("reap old stand-in");
+    old.child_for_test()
+        .wait()
+        .await
+        .expect("reap old stand-in");
     *rt.network_watcher.lock().unwrap() = Some(tokio::spawn(std::future::pending()));
     rt.runtime_binding_state
         .lock()
@@ -541,7 +547,7 @@ async fn stale_recovery_skips_new_runs_admission_error() {
 async fn current_direct_crash_still_resets_its_own_state() {
     let (rt, _dir) = test_runtime();
     let mut run = DirectCoreRun::new(spawn_crash_test_child());
-    run.child.kill().await.expect("exit stand-in");
+    run.child_for_test().kill().await.expect("exit stand-in");
     let identity = run.identity.clone();
     rt.child.lock().unwrap().install_running_for_test(run);
     *rt.network_watcher.lock().unwrap() = Some(tokio::spawn(std::future::pending()));

@@ -1221,6 +1221,11 @@ jobs:
       # 副作用（无害，如实记）：windows 腿命中的文件从此全在 dist-win/ 下，upload-artifact v7 按
       # **实际命中文件的最近公共祖先**建树 ⇒ 该 artifact 由「保留 dist-win/ 一层」变成平铺。
       # 下游只用 `find -type f` + basename，不假设层级（见发布 DAG 的 Download 注释）。
+      - name: Mark desktop artifacts as controlled validation candidates
+        shell: bash
+        run: |
+          printf '%s\n' 'Desktop artifacts are controlled validation candidates. PC runtime publishing remains blocked until owner stop/custody and platform acceptance are complete.' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload artifacts
         if: env.POLARIS_UPLOAD_ARTIFACTS == '1'
         uses: actions/upload-artifact@v7
@@ -1304,6 +1309,13 @@ jobs:
     steps:
       # 只为拿 scripts/verify-packaging.mjs（断言脚本），不构建。
       - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Require PC runtime release clearance
+        run: node scripts/assert-pc-runtime-release.mjs
 
       # 四个 artifact 合并落进 dist-release/。
       # upload-artifact v7 的基准是**实际命中文件**的最近公共祖先（不是所列 path 的公共祖先，
@@ -1634,6 +1646,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Require PC runtime release clearance
+        run: node scripts/assert-pc-runtime-release.mjs
+
       - name: Verify release identity is still the same draft
         id: release_identity
         shell: bash
@@ -1781,6 +1800,7 @@ jobs:
           VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}
         run: |
           set -euo pipefail
+          node scripts/assert-pc-runtime-release.mjs
           # 长构建期间 tag 可能被强推；mutation 紧前重新抓远端 ref，不能信 checkout 里的旧 tag。
           git fetch --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
           remote_tag_sha="$(git rev-list -n 1 "$TAG")"

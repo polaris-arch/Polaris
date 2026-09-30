@@ -749,8 +749,7 @@ fn helper_gate_interactive() -> bool {
 /// 这句话。若断言只写 `is_err()`，那么在 `resources/` 为空的机器上，门被删掉后测试依然绿
 /// （解析器自己也返 Err）—— 门就成了只在装了核的机器上才有牙的门，而那恰恰是最不会被本地跑到的环境。
 #[cfg(test)]
-pub(super) const TEST_CORE_NOT_INJECTED: &str =
-    "单测态禁止解析真实核二进制：请经 ProxyRuntime::core_binary_override 注入假核（防单测漏出真 sing-box 进程）";
+pub(super) const TEST_CORE_NOT_INJECTED: &str = "单测态禁止解析真实核二进制：请经 ProxyRuntime::core_binary_override 注入假核（防单测漏出真 sing-box 进程）";
 
 /// 在**非交互**语境下跑一段起核/重启（崩溃自愈专用）：本调用链全程抑制 TUN 提权引导弹框。
 ///
@@ -1168,19 +1167,22 @@ impl ProxyRuntime {
         // start 腿撞上无人值守的 preflight 直接 bail。
         let t_helper_gate = std::time::Instant::now();
         self.run_helper_gate(user_config.proxy_mode_type).await?;
-        if self.helper.platform() == Platform::Linux
-            && should_start_via_helper(user_config.proxy_mode_type, self.helper.platform())
-        {
+        if should_start_via_helper(user_config.proxy_mode_type, self.helper.platform()) {
             let helper = Arc::clone(&self.helper);
-            let capability =
-                tokio::task::spawn_blocking(move || helper.require_linux_birth_capability())
-                    .await
-                    .map_err(|error| {
-                        StartError::coded(
-                            format!("Linux helper exact birth 能力探测任务失败：{error}"),
-                            code::STARTUP_FAILED,
-                        )
-                    })?;
+            let capability = tokio::task::spawn_blocking(move || {
+                if helper.platform() == Platform::Linux {
+                    helper.require_linux_birth_capability()
+                } else {
+                    helper.require_native_birth_capability()
+                }
+            })
+            .await
+            .map_err(|error| {
+                StartError::coded(
+                    format!("Linux helper exact birth 能力探测任务失败：{error}"),
+                    code::STARTUP_FAILED,
+                )
+            })?;
             if self.gate.generation() != my_gen {
                 return Ok(self.status());
             }
@@ -1647,7 +1649,9 @@ impl ProxyRuntime {
                             main_reservation.confirmed_no_external_writer();
                             retired_endpoint_retries += 1;
                             if retired_endpoint_retries <= 8 {
-                                log::warn!("Android 旧管理端点预检拒绝；重分配新端口再试（第 {retired_endpoint_retries} 次）");
+                                log::warn!(
+                                    "Android 旧管理端点预检拒绝；重分配新端口再试（第 {retired_endpoint_retries} 次）"
+                                );
                                 continue;
                             }
                             let exhausted = "Android 管理端点重分配预算耗尽；请完全退出应用后重试";
@@ -1685,100 +1689,115 @@ impl ProxyRuntime {
                 //   · 本判定先于 stop 的 bump → 本腿 spawn 并存 child；stop 随后取到 child 并杀 → 无孤儿。
                 //   · stop 的 bump 先于本判定 → 本腿直接让位、**根本不 spawn** → 无孤儿。
                 let direct_spawn = {
-                    let mut guard = self
-                        .child
+                    let closing = self
+                        .desktop_shutdown
                         .lock()
-                        .map_err(|e| format!("child lock poisoned: {e}"))?;
-                    if self.gate.generation() != my_gen {
-                        log::info!(
-                            "起核在 spawn 前被接管（世代 {my_gen} → {}）→ 让位",
-                            self.gate.generation()
+                        .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
+                    if *closing {
+                        return Err(StartError::from("proxy is shutting down".to_owned()));
+                    }
+                    polaris_core_supervisor::with_check_admission(|| {
+                        let mut guard = self
+                            .child
+                            .lock()
+                            .map_err(|e| format!("child lock poisoned: {e}"))?;
+                        if self.gate.generation() != my_gen {
+                            log::info!(
+                                "起核在 spawn 前被接管（世代 {my_gen} → {}）→ 让位",
+                                self.gate.generation()
+                            );
+                            return Ok(None);
+                        }
+                        if guard.has_helper_start() || self.core_via_helper.load(Ordering::SeqCst) {
+                            return Err(StartError::direct_slot_occupied());
+                        }
+                        let empty_slot = guard
+                            .empty_for_install()
+                            .ok_or_else(StartError::direct_slot_occupied)?;
+                        self.core_via_helper.store(false, Ordering::SeqCst);
+                        // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
+                        // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
+                        // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
+                        // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
+                        // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
+                        // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
+                        // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
+                        // FATAL 分类（见 `pipe_to_log` 文档）。
+                        let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
+                        let sink_handoff = Arc::clone(&handoff);
+                        let sink_fatal = Arc::clone(&fatal_slot);
+                        let mut req = SpawnRequest::new(
+                            &binary,
+                            &config_path,
+                            StdioPolicy::drain(move |stdout, stderr| {
+                                pipe_to_log(
+                                    stdout,
+                                    SING_BOX_TARGET,
+                                    None,
+                                    Some(Arc::clone(&sink_handoff)),
+                                );
+                                pipe_to_log(
+                                    stderr,
+                                    SING_BOX_TARGET,
+                                    Some(sink_fatal),
+                                    Some(sink_handoff),
+                                );
+                            }),
                         );
-                        return Ok(self.status());
-                    }
-                    if guard.has_helper_start() || self.core_via_helper.load(Ordering::SeqCst) {
-                        return Err(StartError::direct_slot_occupied());
-                    }
-                    let empty_slot = guard
-                        .empty_for_install()
-                        .ok_or_else(StartError::direct_slot_occupied)?;
-                    self.core_via_helper.store(false, Ordering::SeqCst);
-                    // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
-                    // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
-                    // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
-                    // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
-                    // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
-                    // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
-                    // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
-                    // FATAL 分类（见 `pipe_to_log` 文档）。
-                    let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
-                    let sink_handoff = Arc::clone(&handoff);
-                    let sink_fatal = Arc::clone(&fatal_slot);
-                    let mut req = SpawnRequest::new(
-                        &binary,
-                        &config_path,
-                        StdioPolicy::drain(move |stdout, stderr| {
-                            pipe_to_log(
-                                stdout,
-                                SING_BOX_TARGET,
-                                None,
-                                Some(Arc::clone(&sink_handoff)),
-                            );
-                            pipe_to_log(
-                                stderr,
-                                SING_BOX_TARGET,
-                                Some(sink_fatal),
-                                Some(sink_handoff),
-                            );
-                        }),
-                    );
-                    // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
-                    req.extra_args = vec!["--disable-color".to_string()];
-                    // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
-                    // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
-                    req.working_dir = Some(self.config.dir().to_path_buf());
-                    // Mint before spawn: even a failed OS random source must not
-                    // leave a successfully spawned Child without its run token.
-                    let run_identity = super::process_supervision::RunIdentity::new();
-                    main_reservation.arm_external_start();
-                    match TokioSpawner::new().spawn(req) {
-                        Ok(spawned) => {
-                            let pid = spawned.pid().unwrap_or(0);
-                            let run = if let Some(token) = main_claim_token.clone() {
-                                super::process_supervision::DirectCoreRun::with_main_token(
-                                    spawned.child,
-                                    run_identity,
-                                    token,
-                                )
-                            } else {
-                                super::process_supervision::DirectCoreRun::with_identity(
-                                    spawned.child,
-                                    run_identity,
-                                )
-                            };
-                            let identity = run.identity.clone();
-                            // The empty-slot permit retains this mutex guard
-                            // through spawn, so this cannot discard a Child.
-                            empty_slot.install_running(run);
-                            Ok((pid, handoff, identity))
+                        // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
+                        req.extra_args = vec!["--disable-color".to_string()];
+                        // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
+                        // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
+                        req.working_dir = Some(self.config.dir().to_path_buf());
+                        // Mint before spawn: even a failed OS random source must not
+                        // leave a successfully spawned Child without its run token.
+                        let run_identity = super::process_supervision::RunIdentity::new();
+                        main_reservation.arm_external_start();
+                        match TokioSpawner::new().spawn(req) {
+                            Ok(spawned) => {
+                                let pid = spawned.pid().unwrap_or(0);
+                                let run = if let Some(token) = main_claim_token.clone() {
+                                    super::process_supervision::DirectCoreRun::with_main_token(
+                                        spawned.child,
+                                        run_identity,
+                                        token,
+                                    )
+                                } else {
+                                    super::process_supervision::DirectCoreRun::with_identity(
+                                        spawned.child,
+                                        run_identity,
+                                    )
+                                };
+                                let identity = run.identity.clone();
+                                // The empty-slot permit retains this mutex guard
+                                // through spawn, so this cannot discard a Child.
+                                empty_slot.install_running(run);
+                                Ok(Some((pid, handoff, identity)))
+                            }
+                            Err(e) => {
+                                main_reservation.confirmed_no_external_writer();
+                                Err(StartError::from(format!("{e}")))
+                            }
                         }
-                        Err(e) => {
-                            main_reservation.confirmed_no_external_writer();
-                            Err(format!("{e}"))
-                        }
-                    }
+                    })
+                    .map_err(|error| StartError::from(error.to_string()))?
                 };
                 match direct_spawn {
-                    Ok((pid, handoff, identity)) => {
+                    Ok(Some((pid, handoff, identity))) => {
                         log_pipe_handoff = Some(handoff);
                         direct_run_identity = Some(identity);
                         pid
                     }
-                    Err(msg) => {
+                    Ok(None) => return Ok(self.status()),
+                    Err(error) if error.admission_denied => return Err(error),
+                    Err(error) => {
+                        let msg = error.message;
                         // Spawn failure releases the child lock before any
                         // retry sleep. No Child was installed on this path.
                         if attempt <= budget.max_retries && is_retryable_start_error(&msg) {
-                            log::warn!("sing-box spawn 失败（第 {attempt} 次，可重试）→ 预算内自动重试：{msg}");
+                            log::warn!(
+                                "sing-box spawn 失败（第 {attempt} 次，可重试）→ 预算内自动重试：{msg}"
+                            );
                             // 退避期被接管 → 让位（本腿 spawn 就没成，无核可孤；不 set_error、不重试）。
                             let t_backoff = std::time::Instant::now();
                             let superseded =
@@ -1925,7 +1944,9 @@ impl ProxyRuntime {
                 // Superseded。世代不等即等价让位腿：静默返回，不 kill、不 set_error、不重试。
                 CoreReadyOutcome::Dead => {
                     if self.gate.generation() != my_gen {
-                        log::info!("起核就绪期被接管（世代 {my_gen}，判定 Dead 系接管方拆核所致）→ 静默让位");
+                        log::info!(
+                            "起核就绪期被接管（世代 {my_gen}，判定 Dead 系接管方拆核所致）→ 静默让位"
+                        );
                         return Ok(self.status());
                     }
                     self.kill_core_and_release_main(ts_gate).await?;
@@ -1958,7 +1979,9 @@ impl ProxyRuntime {
                 }
                 CoreReadyOutcome::Timeout => {
                     if self.gate.generation() != my_gen {
-                        log::info!("起核就绪期被接管（世代 {my_gen}，判定 Timeout 系接管方拆核所致）→ 静默让位");
+                        log::info!(
+                            "起核就绪期被接管（世代 {my_gen}，判定 Timeout 系接管方拆核所致）→ 静默让位"
+                        );
                         return Ok(self.status());
                     }
                     self.kill_core_and_release_main(ts_gate).await?;
@@ -2423,10 +2446,22 @@ impl ProxyRuntime {
         my_gen: u64,
         main_reservation: &mut crate::runtime::tailscale_login_core::MainReservation<'_, '_>,
     ) -> Result<Option<u32>, String> {
+        polaris_core_supervisor::assert_check_admission().map_err(|error| error.to_string())?;
         // 让位早退（与直起临界区的「持锁判世代」同义；helper 核无本地 child 锁可持，靠世代 + 标记守）。
         if self.gate.generation() != my_gen {
             log::info!("helper 起核前被接管（世代 {my_gen}）→ 让位");
             return Ok(None);
+        }
+        if matches!(self.helper.platform(), Platform::Mac | Platform::Win) {
+            let helper = Arc::clone(&self.helper);
+            tokio::task::spawn_blocking(move || helper.require_native_birth_capability())
+                .await
+                .map_err(|error| {
+                    format!("helper native birth capability task failed: {error}")
+                })??;
+            if self.gate.generation() != my_gen {
+                return Ok(None);
+            }
         }
         // **受保护核对账**（换核在本条腿上真正生效的唯一途径）：helper 只会 exec 它安装期锁定的那个
         // 路径，故必须先把现役核的**内容**推进去。幂等——hash 相同即零动作、零 IPC。
@@ -2435,8 +2470,22 @@ impl ProxyRuntime {
         // The lease can reject before any helper operation is queued.
         let helper_call_lease = self.lease_legacy_start().map_err(|error| error.message)?;
         // Fence and helper flag publish under the same Child mutex.
-        let attempt =
-            self.register_helper_start_backend_with_main(main_reservation.claim_token())?;
+        let attempt = {
+            let closing = self
+                .desktop_shutdown
+                .lock()
+                .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
+            if *closing || self.gate.generation() != my_gen {
+                return Err("proxy is shutting down or helper Start was superseded".into());
+            }
+            polaris_core_supervisor::with_check_admission(|| {
+                let attempt =
+                    self.register_helper_start_backend_with_main(main_reservation.claim_token())?;
+                main_reservation.arm_external_start();
+                Ok::<_, String>(attempt)
+            })
+            .map_err(|error| error.to_string())??
+        };
         let log_path = self.config.join(SINGBOX_STARTUP_LOG);
         // fwd = allowLan（helper 侧开 IP 转发；上游 `forward = !!currentConfig.allowLan`）。
         let fwd = user_config.allow_lan.unwrap_or(false);
@@ -2456,7 +2505,6 @@ impl ProxyRuntime {
         // HelperClient::send 是同步阻塞 IPC → 挪出 async worker 线程。
         // **不传 bin**：helper 单方面决定跑哪个二进制（见 `HelperRuntime::start_core` 文档），
         // 传了也只会被丢掉——正是本缺陷的成因。
-        main_reservation.arm_external_start();
         let started = tokio::task::spawn_blocking(move || {
             let _helper_call_lease = helper_call_lease;
             let mut completion = completion;
@@ -2501,14 +2549,12 @@ impl ProxyRuntime {
                     Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
                     &attempt,
                     target,
+                    Some(main_reservation),
                 )
                 .await;
-            // This same-attempt exact Stop proves the external child is gone;
-            // reservation Drop only compare-removes this MainBirthToken. It
-            // does not open the runtime's sticky helper/no-owner gate.
-            if confirmed_stopped {
-                main_reservation.confirmed_no_external_writer();
-            }
+            // Native exit and reservation compare-remove committed together.
+            // The helper backend remains sticky; no platform NoOwner was proved.
+            let _ = confirmed_stopped;
             return Err(message);
         }
         log::info!("helper 已起 sing-box：pid={pid}（TUN 提权路径）");
@@ -2960,7 +3006,7 @@ impl ProxyRuntime {
         attempt: &HelperStartToken,
         pid: u32,
     ) -> String {
-        self.reject_helper_start_with_result(ops, attempt, HelperStopTarget::Legacy(pid))
+        self.reject_helper_start_with_result(ops, attempt, HelperStopTarget::Legacy(pid), None)
             .await
             .0
     }
@@ -2970,12 +3016,18 @@ impl ProxyRuntime {
         ops: Arc<dyn HelperStopOps>,
         attempt: &HelperStartToken,
         target: HelperStopTarget,
+        mut main_reservation: Option<
+            &mut crate::runtime::tailscale_login_core::MainReservation<'_, '_>,
+        >,
     ) -> (String, bool) {
         let pid = target.pid();
         if let Err(error) = self.register_helper_backend() {
-            return (format!(
-                "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: Child custody blocked Stop（{error}）"
-            ), false);
+            return (
+                format!(
+                    "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: Child custody blocked Stop（{error}）"
+                ),
+                false,
+            );
         }
         let reservation = self
             .child
@@ -2983,9 +3035,12 @@ impl ProxyRuntime {
             .ok()
             .and_then(|mut child| child.begin_exact_helper_stop(attempt, target));
         let Some(nonce) = reservation else {
-            return (format!(
-                "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: attempt changed or Stop in flight"
-            ), false);
+            return (
+                format!(
+                    "helper 报告已启动但进程不存在（pid={pid}）；cleanup-unconfirmed: attempt changed or Stop in flight"
+                ),
+                false,
+            );
         };
         let permit = HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), target, nonce);
         // stop 是同步阻塞 IPC → 挪出 async worker 线程（同 start_core/stop_core/cleanup_cores）。
@@ -2997,14 +3052,21 @@ impl ProxyRuntime {
         .await
         {
             Ok((Ok(()), permit)) => {
-                if self.clear_helper_core_bookkeeping(&permit) {
-                    log::info!("起核收口：已请 daemon 停掉其受管 child（pid={pid}）");
-                    (String::new(), true)
-                } else {
-                    (
+                match self.clear_helper_core_bookkeeping_with_main(&permit, |token| {
+                    main_reservation
+                        .as_mut()
+                        .ok_or_else(|| "helper startup Stop lacks its main reservation".to_owned())?
+                        .release_confirmed_stop_claim(token)
+                }) {
+                    Ok(true) => {
+                        log::info!("起核收口：已请 daemon 停掉其受管 child（pid={pid}）");
+                        (String::new(), true)
+                    }
+                    Ok(false) => (
                         "；cleanup-unconfirmed: Stop 已确认，但 attempt 已改变".to_owned(),
                         false,
-                    )
+                    ),
+                    Err(error) => (format!("；{error}"), false),
                 }
             }
             Ok((Err(e), _permit)) => {
@@ -3537,6 +3599,12 @@ impl ProxyRuntime {
         peeled: &mut BTreeMap<String, InvalidNode>,
         runtime_bind_interfaces: &BTreeMap<String, String>,
     ) -> Result<GateOutcome, String> {
+        if !cfg!(target_os = "android") {
+            polaris_core_supervisor::settle_check_cleanup()
+                .await
+                .map_err(|error| error.to_string())?;
+            polaris_core_supervisor::assert_check_admission().map_err(|error| error.to_string())?;
+        }
         let started = std::time::Instant::now();
         let mut checks_run: u32 = 0;
         loop {
@@ -3581,7 +3649,9 @@ impl ProxyRuntime {
             }
             checks_run += 1;
             let verdict = match binary {
-                Some(bin) => run_config_check(bin, config_path).await,
+                Some(bin) => run_config_check(bin, config_path)
+                    .await
+                    .map_err(|error| error.to_string())?,
                 // 只有 Android 走得到这里（上面的 failOpen 早退挡住了其余平台）。传的是**内存里
                 // 那一份字符串**，与刚写下去的盘上那份是同一个 `json` 变量 —— 两者不可能漂。
                 None => super::android_bridge::check_config(&json).await,
@@ -4120,21 +4190,19 @@ impl ExitAttestation {
             Self::WrongExit {
                 expected_tag,
                 actual_tag,
-            } => format!(
-                "流量未走选中节点「{expected_tag}」，实际出口为「{actual_tag}」。"
-            ),
+            } => format!("流量未走选中节点「{expected_tag}」，实际出口为「{actual_tag}」。"),
             Self::StaleSelection {
                 persisted,
                 started_with,
             } => format!(
                 "启动用的节点（{started_with}）与当前选中节点（{persisted}）不一致，流量可能未走选中节点。请重新连接。"
             ),
-            Self::UnknownSelection { selected_id } => format!(
-                "选中节点（{selected_id}）不在本次启动的节点表中，流量可能未走该节点。"
-            ),
-            Self::UnresolvedExit { expected_tag } => format!(
-                "无法确认流量是否走选中节点「{expected_tag}」（配置未指定默认出口）。"
-            ),
+            Self::UnknownSelection { selected_id } => {
+                format!("选中节点（{selected_id}）不在本次启动的节点表中，流量可能未走该节点。")
+            }
+            Self::UnresolvedExit { expected_tag } => {
+                format!("无法确认流量是否走选中节点「{expected_tag}」（配置未指定默认出口）。")
+            }
         }
     }
 }

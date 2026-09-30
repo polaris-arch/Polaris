@@ -23,7 +23,7 @@
 //! 0666 是为让普通用户 app 能连；远程不可达（unix socket 仅本机）。
 
 use crate::line_io::{read_line_trimmed_bounded, write_line, BoundedLineError};
-use crate::platform::macos::handler::{dispatch, MacConfig, MacServices, SpawnedCore};
+use crate::platform::macos::handler::{dispatch, MacConfig, MacServices};
 use polaris_helper_proto::request::{InstallCoreParams, RouteParams, StartParams};
 use polaris_helper_proto::{parse_stop_pid, Request};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -110,6 +110,19 @@ pub fn decode_request<I: Iterator<Item = String>>(
         "ping" => Ok(Request::Ping),
         "version" => Ok(Request::Version),
         "status" => Ok(Request::Status),
+        polaris_helper_proto::command::common::NATIVE_STATUS_BIRTH => {
+            Ok(Request::NativeStatusBirth)
+        }
+        polaris_helper_proto::command::common::NATIVE_STOP_BIRTH => {
+            let pid = required_line(lines, "pid")?;
+            let birth = required_line(lines, "birth")?;
+            if checked_line(lines, None)?.is_some() {
+                return Err(DecodeError::MissingArg("exact native birth frame"));
+            }
+            let target = polaris_helper_proto::parse_native_birth_stop_args(&[&pid, &birth])
+                .ok_or(DecodeError::MissingArg("native birth target"))?;
+            Ok(Request::NativeStopBirth { target })
+        }
         // stop 的受管 pid 身份行是**可选**的（旧客户端不发 → LineIter 在 EOF 产 None → `None`，
         // 沿用「停当前受管核」旧语义）。见 `polaris_helper_proto::stop_pid_matches`。
         "stop" => Ok(Request::Stop {
@@ -140,7 +153,7 @@ pub fn decode_request<I: Iterator<Item = String>>(
                 .map_err(|_| DecodeError::MissingArg("port"))?;
             Ok(Request::FreePort { port })
         }
-        "start" => {
+        "start" | polaris_helper_proto::command::common::NATIVE_START_BIRTH => {
             // helper.go:508-513: cfg/log/fwd/ppid
             let cfg = required_line(lines, "cfg")?;
             let log = optional_line(lines)?;
@@ -149,12 +162,17 @@ pub fn decode_request<I: Iterator<Item = String>>(
             // helper.go:513: ppid 可选（EOF → "" → 0 → None）
             let ppid_str = optional_line(lines)?;
             let parent_pid = ppid_str.trim().parse::<u32>().ok().filter(|&p| p > 0);
-            Ok(Request::Start(StartParams {
+            let params = StartParams {
                 cfg,
                 log,
                 fwd,
                 parent_pid,
-            }))
+            };
+            Ok(if command == "start" {
+                Request::Start(params)
+            } else {
+                Request::NativeStartBirth(params)
+            })
         }
         "route-add" | "route-del" => {
             // helper.go:455-456: iface/cidrs
@@ -203,15 +221,6 @@ pub enum ConnOutcome {
 
 // ===== 纯决策逻辑（跨平台可测；mac-gated 生命周期代码经此委托，杜绝 syscall 内藏判定）=====
 
-/// 命令是否须在 `command_mu` 临界区内处理（移植自 `helper.go:413` vs `:418`）。
-///
-/// `freeport` 不持锁（其 `lsof`/`ps` 在 stale 挂载下可能长阻塞，持锁会饿死并发 ping/status/start/stop）；
-/// 其余命令一律持锁（Go `mu.Lock(); defer mu.Unlock()`）。
-#[must_use]
-pub fn should_lock_command(command: &str) -> bool {
-    command != "freeport"
-}
-
 /// chownRuntimeDirs 归还属主的运行时子目录名（移植自 `helper.go:222`）。
 ///
 /// root 跑 sing-box 会把这些目录里的文件写成 root 600 → 登录用户跑读不了 → endpoint post-start FATAL。
@@ -259,9 +268,9 @@ pub fn terminate_needs_kill(exited: bool) -> bool {
 ///
 /// 泛型 `R: Read` 让测试可注入 `Cursor<&[u8]>`，生产接 `UnixStream`。
 ///
-/// `command_mu`（`§3.3 defect 7`，补 Go 单锁）：非 `freeport` 命令在此锁临界区内处理（对齐 Go
-/// `helper.go:418` `mu.Lock(); defer mu.Unlock()`，杜绝并发 start 双起核等复合 child 竞态）；`freeport`
-/// 不持锁（`helper.go:413`）。生产 serve 传 `Some(&command_mu)`；单线程测试传 `None`（无锁）。
+/// `command_mu` also serializes freeport with native admission: a PID cleanup cannot race Start.
+/// All commands use the lock after authentication (the original Go used it for other commands).
+/// 生产 serve 传 `Some(&command_mu)`；单线程测试传 `None`（无锁）。
 pub fn process_connection<R: Read, W: Write>(
     reader: R,
     mut writer: W,
@@ -285,7 +294,7 @@ pub fn process_connection<R: Read, W: Write>(
     // 🔴 **鉴权早退必须在取锁之前**（`dispatch` 里那道保留作纵深）。
     //
     // socket 是 0666（设计如此，token 行是唯一安全边界，见模块头）。若先取锁再鉴权，一条**未鉴权**
-    // 的连接就能：写 token+command 两行后不再写任何数据 → 命中 `should_lock_command` 取到全局
+    // 的连接就能：写 token+command 两行后不再写任何数据 → 取到全局
     // `command_mu` → 在锁内的 `decode_request` 阻塞读参数行，直到 5s 连接读超时才放锁。
     // 即「零 token、单条连接 = 独占 root daemon 命令锁 5 秒」；serve 每连接一线程且无并发上限，
     // 循环开 N 条即可把锁占满 —— 期间 GUI 侧 stop/start/status/flush-dns 全部排队超时，
@@ -303,14 +312,9 @@ pub fn process_connection<R: Read, W: Write>(
         return write_response(&mut writer, &resp);
     }
 
-    // helper.go:413 vs :418 —— freeport 锁外、其余锁内。守卫持有到函数末（覆盖参数解码 + dispatch + 响应
-    // 写，与 Go `defer mu.Unlock()` 一致，读超时 5s 兜底防持锁挂死）。command_mu==None（测试）→ 无锁。
-    // 锁中毒（某连接线程 panic）时 into_inner 复用（daemon 不因单连接崩溃而永久失锁）。
-    let _mu_guard = if should_lock_command(&command) {
-        command_mu.map(|m| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
-    } else {
-        None
-    };
+    // Freeport's native-slot check and PID-based cleanup share Start's command lock.
+    // Otherwise it could observe an empty slot, then kill a newly published owned Child.
+    let _mu_guard = command_mu.map(|m| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
 
     // 解码命令 + 参数行
     let mut lines_iter = LineIter {
@@ -391,106 +395,63 @@ mod sys {
         classify_accept_error, AcceptAction, LogThrottle, ACCEPT_BACKOFF, ACCEPT_LOG_INTERVAL,
     };
     use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
-    use crate::platform::macos::exec::SystemRunner;
+    use crate::platform::macos::exec::{CommandRunner, SystemRunner, EXEC_TIMEOUT};
     use crate::platform::macos::handler::{ChildHandle, SpawnError, TerminateOutcome};
+    use crate::platform::macos::native_birth::{NativeBirth, NativeChild, NativeCustody};
     use crate::platform::macos::proc_start::{
-        classify_alive, kill_zero_exists, proc_start_time, AliveProbe, TERMINATE_GRACE,
-        WATCH_TICK_INTERVAL,
+        classify_alive, kill_zero_exists, proc_start_time, AliveProbe, WATCH_TICK_INTERVAL,
     };
     use crate::token::{FileTokenStore, TokenStore};
     use nix::sys::signal::Signal;
+    use polaris_helper_proto::response::{
+        NativeBirthStart, NativeBirthStatus, NativeBirthStop, StartTiming,
+    };
+    use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::Path;
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    /// child 退出信号（等价 Go `childDone chan struct{}`）。
-    ///
-    /// 收割线程 `wait()` 完成后 [`signal`](DoneFlag::signal)（等价 `close(done)`）；terminateChild 与
-    /// watchParent 据此免 KILL / 退出看护（等价 Go `select { <-done: ... }`）。多等待者（terminate +
-    /// watchParent）同 `Condvar` 唤醒。
-    struct DoneFlag {
-        exited: Mutex<bool>,
-        cv: Condvar,
-    }
-
-    impl DoneFlag {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                exited: Mutex::new(false),
-                cv: Condvar::new(),
-            })
-        }
-
-        /// 置「已退出」并唤醒所有等待者（等价 Go `close(done)`）。
-        fn signal(&self) {
-            let mut g = self
-                .exited
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *g = true;
-            self.cv.notify_all();
-        }
-
-        /// 等 `exited` 置位或超时 `d`。返回 `true`=已退出、`false`=超时。
-        ///
-        /// 等价 Go `select { <-done: (true); <-time.After(d): (false) }`。用绝对截止时间循环 wait，
-        /// 规避 `Condvar` 虚假唤醒把等待窗口累加。
-        fn wait_exit(&self, d: Duration) -> bool {
-            let start = Instant::now();
-            let mut g = self
-                .exited
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while !*g {
-                let elapsed = start.elapsed();
-                if elapsed >= d {
-                    break;
-                }
-                let (ng, res) = self
-                    .cv
-                    .wait_timeout(g, d - elapsed)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                g = ng;
-                if res.timed_out() {
-                    break;
-                }
-            }
-            *g
-        }
-    }
-
-    /// child 的 `done` + 身份代记账（proc 内层锁；全局 lock 顺序恒为 `child` → `proc`）。
-    struct ProcSlot {
-        /// 当前 child 的退出信号（`None`=无 child；等价 Go `childDone`）。
-        done: Option<Arc<DoneFlag>>,
-        /// 身份代（每次 spawn 自增）—— Rust 无 Go 的 `child *exec.Cmd` 指针身份，用单调代号代替
-        /// `child == c` 判定（识别「收割/看护的是不是当前这个 child」，防 PID 复用误判）。
-        generation: u64,
-    }
-
-    /// 生产 [`MacServices`]：真 child 生命周期（`helper.go` 的 `child`/`childDone`/`mu` 全局态 + spawn/wait
-    /// 收割/terminate/watchParent/chownRuntimeDirs）。
-    ///
-    /// 锁层级（恒 `command_mu` → `child` → `proc`，无环）：
-    /// - `command_mu`：Go `mu`。server 在 [`process_connection`] 里跨整条非-freeport 命令持有（串行化命令）。
-    /// - `child`（trait [`MacServices::child`]）：pid 视图（Go `child`），dispatch 与后台线程共访。
-    /// - `proc`：`done`/`generation`（Go `childDone` + 指针身份）。
-    ///
-    /// 后台线程（收割 / terminate / watchParent）**不持 `command_mu`**（对齐 Go `go terminateChild`/
-    /// `go watchParent` 不持 `mu`）——只经 `child`/`proc` 与 dispatch 协调。
+    /// The registry retains the original Child through wait errors and the full chown tail.
     pub struct DaemonServices {
         token: FileTokenStore,
         runner: SystemRunner,
         config: MacConfig,
         command_mu: Mutex<()>,
-        child: Arc<Mutex<Option<ChildHandle>>>,
-        proc: Arc<Mutex<ProcSlot>>,
+        child: Mutex<Option<ChildHandle>>,
+        native: Arc<NativeCustody>,
+    }
+
+    struct OwnedNativeChild(std::process::Child);
+    impl NativeChild for OwnedNativeChild {
+        fn try_wait(&mut self) -> std::io::Result<bool> {
+            self.0.try_wait().map(|status| status.is_some())
+        }
+        fn terminate(&mut self) -> std::io::Result<()> {
+            // Unix signal is synchronous under the same Child lock after a native poll.
+            // ECHILD fences this operation permanently in NativeCustody.
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.0.id() as i32),
+                Signal::SIGTERM,
+            )
+            .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+        }
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.0.kill()
+        }
+    }
+
+    struct StartAdmission<'a>(&'a NativeCustody, bool);
+    impl Drop for StartAdmission<'_> {
+        fn drop(&mut self) {
+            if !self.1 {
+                self.0.abort_start();
+            }
+        }
     }
 
     impl DaemonServices {
-        /// 从锁定的 [`MacConfig`] 构造（token 读 `support_dir/helper.token`，与 Go `tokenValue` 一致）。
         #[must_use]
         pub fn new(config: MacConfig) -> Arc<Self> {
             Arc::new(Self {
@@ -498,76 +459,65 @@ mod sys {
                 runner: SystemRunner::new(),
                 config,
                 command_mu: Mutex::new(()),
-                child: Arc::new(Mutex::new(None)),
-                proc: Arc::new(Mutex::new(ProcSlot {
-                    done: None,
-                    generation: 0,
-                })),
+                child: Mutex::new(None),
+                native: Arc::new(NativeCustody::default()),
             })
         }
-
-        /// 锁定配置（serve 建 socket / 兜底 pkill 用）。
         #[must_use]
         pub fn config(&self) -> &MacConfig {
             &self.config
         }
-
-        /// 命令串行锁（serve 传给 [`process_connection`]，补 Go `mu` 单锁纪律）。
         #[must_use]
         pub fn command_mu(&self) -> &Mutex<()> {
             &self.command_mu
         }
 
-        /// 真 spawn（`helper.go:538-578`）：起锁定核 + log 重定向 + 收割线程 + ppid>0 起 watchParent。
-        ///
-        /// 调用前 dispatch 已在 `command_mu` 下过 already-check + cfgAllowed + fwd sysctl（`helper.go:521-537`）。
-        fn do_spawn(
-            &self,
-            cfg: &str,
-            log: &str,
-            _fwd: bool,
-            parent_pid: Option<u32>,
-        ) -> Result<SpawnedCore, SpawnError> {
-            let mut child_g = self
-                .child
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // command_mu 下 already-check 已保证此处为 None；防御性再判，杜绝双起核（§3.3 defect 4 的 mac 面）。
-            if let Some(existing) = child_g.as_ref() {
-                return Ok(SpawnedCore {
-                    pid: existing.pid,
-                    process_ms: 0,
-                    log_handoff_ms: 0,
-                });
+        fn do_native_spawn(&self, params: &StartParams) -> Result<NativeBirthStart, SpawnError> {
+            if let Err(not_admitted) = self.native.admit() {
+                return Ok(not_admitted);
             }
+            let mut admission = StartAdmission(&self.native, false);
+            let total_started = Instant::now();
+            // Identity is minted from OS entropy before spawning, never from a PID or clock.
+            let mut entropy = [0; 16];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut file| file.read_exact(&mut entropy))
+                .map_err(|error| {
+                    SpawnError::Failed(format!("native birth entropy failed: {error}"))
+                })?;
+            let birth_token = HelperBirthToken::from_bytes(entropy);
+            let forwarding_started = Instant::now();
+            if params.fwd {
+                let _ = self.runner.run(
+                    EXEC_TIMEOUT,
+                    "/usr/sbin/sysctl",
+                    &["-w", "net.inet.ip.forwarding=1"],
+                );
+                let _ = self.runner.run(
+                    EXEC_TIMEOUT,
+                    "/usr/sbin/sysctl",
+                    &["-w", "net.inet6.ip6.forwarding=1"],
+                );
+            }
+            let forwarding_ms = crate::elapsed_ms(forwarding_started);
             let process_started = Instant::now();
-            // root sing-box 会写 `<conf_dir>/cache.db`。文件若由上一轮 TUN 创建成 root:staff 0644，
-            // 切到用户态系统代理后会直接 FATAL permission denied；只在退出后 chown 又会与紧接着的
-            // 重启竞速。故 root 起核前先按 conf_dir 属主准备 cache，root 仍可写，后续用户核也可写。
-            // O_NOFOLLOW + fd 级 fchown：conf_dir 属用户可写，路径级 chown 存在换成 symlink 的 TOCTOU。
             prepare_cache_for_user(&self.config.conf_dir).map_err(SpawnError::Failed)?;
-            // helper.go:538: exec.Command(singboxBin, "run", "-c", cfg)
-            let mut cmd = std::process::Command::new(&self.config.singbox_bin);
-            cmd.arg("run").arg("-c").arg(cfg);
-            // CWD = 受管 conf_dir（root 拥有、0755 可写）：helper daemon 由 launchd 拉起 CWD=`/`，其 spawn 的核
-            // 继承 `/` → dashboard 下载兜底相对 mkdir `/dashboard` 只读失败每次起核报一条噪音。设为可写 conf_dir 即消。
-            // Polaris 生成的核配置其余路径全绝对（cache/log/rules/…），不受 CWD 影响。conf_dir 空则不设（继承旧行为）。
+            let mut command = std::process::Command::new(&self.config.singbox_bin);
+            command.arg("run").arg("-c").arg(&params.cfg);
             if !self.config.conf_dir.is_empty() {
-                cmd.current_dir(&self.config.conf_dir);
+                command.current_dir(&self.config.conf_dir);
             }
-            // B3/W26：不再把 child 直接绑到一个永不重开的 append fd。那种形状外部 rename 后 child
-            // 仍持续写旧 inode，Windows 还可能直接拒绝 rename，无法形成运行期硬上限。改用 pipe，
-            // 由 shared `polaris-log-budget` writer 掌握 current + `.1` 两代并在本次运行中轮转。
-            if !log.is_empty() {
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
+            if !params.log.is_empty() {
+                command.stdout(std::process::Stdio::piped());
+                command.stderr(std::process::Stdio::piped());
             }
-            // `conf_dir` 属登录用户可写，root helper 不能在 spawn 后再按字符串解析日志路径：目录
-            // component 可被并发换成 symlink。逐级 openat 固定 current/.1；失败只降级为排空 pipe。
-            let log_files = if log.is_empty() {
+            let log_files = if params.log.is_empty() {
                 None
             } else {
-                match crate::platform::unix_log::preopen_log_files(&self.config.conf_dir, log) {
+                match crate::platform::unix_log::preopen_log_files(
+                    &self.config.conf_dir,
+                    &params.log,
+                ) {
                     Ok(files) => Some(files),
                     Err(error) => {
                         log::warn!(
@@ -577,149 +527,79 @@ mod sys {
                     }
                 }
             };
-            // helper.go:548-554: c.Start()
-            let mut child = cmd.spawn().map_err(|e| SpawnError::Failed(e.to_string()))?;
-            let pid = child.id();
+            let mut child = command
+                .spawn()
+                .map_err(|error| SpawnError::Failed(error.to_string()))?;
+            let target = HelperBirthTarget {
+                pid: std::num::NonZeroU32::new(child.id()).expect("native Child has nonzero PID"),
+                birth: birth_token,
+            };
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            // No background thread, parent probe or cancellation point before custody publication.
+            let birth = self
+                .native
+                .publish(target, Box::new(OwnedNativeChild(child)));
+            admission.1 = true;
             let process_ms = crate::elapsed_ms(process_started);
             let log_handoff_started = Instant::now();
-            if !log.is_empty() {
-                // 与 Windows 已验证形态一致：先把 pipe 所有权移交后台，再尽快回 PID；日志旧代裁剪、
-                // fresh rotate 与 open 均不再占据 helper 请求临界路径。后台线程持有读端，child 不会因
-                // 父侧提前 drop 得到 broken pipe。
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
-                std::thread::spawn(move || {
-                    if let Some(files) = log_files {
-                        polaris_log_budget::spawn_pipe_loggers_with_preopened_files(
-                            stdout,
-                            stderr,
-                            files,
-                            polaris_log_budget::DEFAULT_GENERATION_BYTES,
-                        );
-                    } else {
-                        polaris_log_budget::spawn_pipe_drainers(stdout, stderr);
-                    }
-                });
-            }
-            let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
-            // helper.go:559-561: child=c; childDone=done（身份代自增）
-            let done = DoneFlag::new();
-            let generation = {
-                let mut proc_g = self
-                    .proc
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                proc_g.generation += 1;
-                proc_g.done = Some(Arc::clone(&done));
-                proc_g.generation
+            // Initialize Fresh/session synchronously while this admitted command still owns
+            // the slot. A delayed outer logger thread could otherwise truncate a successor's log.
+            let log_custody = if let Some(files) = log_files {
+                polaris_log_budget::spawn_pipe_loggers_with_preopened_files_custodied(
+                    stdout,
+                    stderr,
+                    files,
+                    polaris_log_budget::DEFAULT_GENERATION_BYTES,
+                )
+            } else {
+                polaris_log_budget::spawn_pipe_drainers_custodied(stdout, stderr)
             };
-            *child_g = Some(ChildHandle { pid });
-            drop(child_g);
-            // helper.go:517-519: 启动时快照父进程启动时间（唯一身份，watchParent 破 PID 复用假阴性）
-            let ppid_start = parent_pid.and_then(proc_start_time);
-            // helper.go:562-574: 收割 goroutine（Wait → close(done) → chownRuntimeDirs → 清 child if ==c）
-            spawn_reaper(
-                Arc::clone(&self.child),
-                Arc::clone(&self.proc),
+            birth.attach_log_custody(log_custody);
+            let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
+            spawn_native_worker(
+                Arc::clone(&self.native),
+                Arc::clone(&birth),
                 self.config.conf_dir.clone(),
-                child,
-                Arc::clone(&done),
-                generation,
             );
-            // helper.go:576-578: 父死看护（proto v2）
-            if let Some(ppid) = parent_pid {
-                spawn_watch_parent(
-                    Arc::clone(&self.child),
-                    Arc::clone(&self.proc),
-                    ppid,
-                    ppid_start,
-                    generation,
-                    done,
+            if let Some(parent_pid) = params.parent_pid {
+                spawn_native_parent_watch(
+                    Arc::clone(&self.native),
+                    birth,
+                    parent_pid,
+                    proc_start_time(parent_pid),
                 );
             }
-            Ok(SpawnedCore {
-                pid,
-                process_ms,
-                log_handoff_ms,
+            Ok(NativeBirthStart::Started {
+                target,
+                created: None,
+                timing: Some(StartTiming {
+                    forwarding_ms,
+                    process_ms,
+                    job_ms: 0,
+                    log_handoff_ms,
+                    total_ms: crate::elapsed_ms(total_started),
+                }),
             })
         }
 
-        /// 真 stop（`helper.go:432-443`）：**受管 pid 身份校验** → 摘 child → 后台 terminateChild
-        /// （TERM→≤5s→KILL），立即回复。
-        ///
-        /// 身份不匹配（手里的核属另一个会话）⇒ 直接返回 [`TerminateOutcome::Mismatch`]，**不摘 child、
-        /// 不碰 done、不发任何信号** —— 判据与摘除同在 child 锁内，见
-        /// [`polaris_helper_proto::stop_pid_matches`]。
-        fn do_terminate(&self, want_pid: Option<u32>) -> TerminateOutcome {
-            let taken = {
-                let mut child_g = self
-                    .child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut proc_g = self
-                    .proc
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(h) = child_g.as_ref() {
-                    if !polaris_helper_proto::stop_pid_matches(want_pid, h.pid) {
-                        return TerminateOutcome::Mismatch {
-                            want: want_pid.unwrap_or(0),
-                            current: h.pid,
-                        };
-                    }
+        /// Normal daemon exit is rejected while any admitted spawn or exact birth is
+        /// unconfirmed. The live daemon retains custody and accepts same-birth retries.
+        pub fn shutdown_reap(&self) -> Result<(), String> {
+            self.native.close_admission();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if self.native.shutdown_complete()? {
+                    return Ok(());
                 }
-                // helper.go:434-436: 摘 child + done（收割权独占；无 child → None，不碰 done）
-                child_g.take().map(|h| (h.pid, proc_g.done.take()))
-            };
-            match taken {
-                Some((pid, done)) => {
-                    // helper.go:439: go terminateChild(c, done)（不持锁，后台收割；client stop 超时仅 3-5s）
-                    std::thread::spawn(move || match done {
-                        Some(done) => terminate_pid(pid, &done),
-                        None => {
-                            let _ = send_signal(pid, Signal::SIGTERM);
-                        }
-                    });
-                    TerminateOutcome::Stopped { pid }
+                if Instant::now() >= deadline {
+                    return Err(
+                        "mac helper exit rejected: native child/tail or admitted spawn unconfirmed"
+                            .into(),
+                    );
                 }
-                None => TerminateOutcome::NotRunning,
+                std::thread::sleep(Duration::from_millis(50));
             }
-        }
-
-        /// 信号收割器主体（`helper.go:618-634`）：摘 child → 有则同步 graceful terminate（≤5s）否则 pkill
-        /// 兜底 → `exit(0)`。**同步**收割（非后台）—— Go 的收割 goroutine 在 terminateChild 返回后才
-        /// `os.Exit(0)`，否则退出会杀掉收割线程、丢 KILL 升级。
-        pub fn shutdown_reap(&self) -> ! {
-            // helper.go:620-623: mu.Lock; c,done=child,childDone; child,childDone=nil,nil; mu.Unlock
-            let taken = {
-                let mut child_g = self
-                    .child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut proc_g = self
-                    .proc
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let done = proc_g.done.take();
-                child_g.take().map(|h| (h.pid, done))
-            };
-            match taken {
-                // helper.go:624-625: 有 child → terminateChild（同步 TERM→≤5s→KILL）
-                Some((pid, Some(done))) => terminate_pid(pid, &done),
-                Some((pid, None)) => {
-                    let _ = send_signal(pid, Signal::SIGTERM);
-                }
-                // helper.go:627-631: child==nil → pkill -9 -U 0 -f "<singbox> run" 兜底（限 root 进程，避免
-                // 误杀 systemProxy 模式下 app 直起的用户态核；覆盖 stop 后台收割窗口内丢失的 KILL 升级）
-                None => {
-                    let filter = format!("{} run", self.config.singbox_bin);
-                    let _ = std::process::Command::new("/usr/bin/pkill")
-                        .args(["-9", "-U", "0", "-f", &filter])
-                        .status();
-                }
-            }
-            // helper.go:633: os.Exit(0)
-            std::process::exit(0);
         }
     }
 
@@ -731,152 +611,70 @@ mod sys {
             &self.runner
         }
         fn child(&self) -> &Mutex<Option<ChildHandle>> {
-            self.child.as_ref()
+            &self.child
         }
-        // uid() 走 trait 默认（`nix::unistd::Uid::current()` = `os.Getuid()`）—— 生产 root 下返回 0。
-        fn spawn_child(
-            &self,
-            cfg: &str,
-            log: &str,
-            fwd: bool,
-            parent_pid: Option<u32>,
-        ) -> Result<SpawnedCore, SpawnError> {
-            self.do_spawn(cfg, log, fwd, parent_pid)
+        fn native_start(&self, params: &StartParams) -> Result<NativeBirthStart, SpawnError> {
+            self.do_native_spawn(params)
         }
-        fn terminate_child(&self, want_pid: Option<u32>) -> TerminateOutcome {
-            self.do_terminate(want_pid)
+        fn native_status(&self) -> NativeBirthStatus {
+            self.native.status()
+        }
+        fn native_stop(&self, target: HelperBirthTarget) -> NativeBirthStop {
+            self.native.stop(target)
+        }
+        fn native_custody_active(&self) -> bool {
+            self.native.active()
+        }
+        // Old clients are rejected before any forwarding/cache/spawn, rather than stranded
+        // after a successful legacy Start with no exact native Stop authority.
+        fn legacy_start_supported(&self) -> bool {
+            false
         }
         fn clear_child(&self) {
-            // helper.go:448: child, childDone = nil, nil（cleanup 同步清 done/generation 视图）。
-            // 身份代不动 —— 已 pkill 的 child 的收割线程仍会 wait()+触发，届时 generation 若已被新 start
-            // 自增则守卫跳过，否则清（幂等）。
-            let mut child_g = self
-                .child
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut proc_g = self
-                .proc
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *child_g = None;
-            proc_g.done = None;
+            // Legacy Cleanup cannot discard native custody, even if called outside dispatch.
+        }
+        fn terminate_child(&self, _want_pid: Option<u32>) -> TerminateOutcome {
+            // A legacy PID or void termination never mints a native receipt or sends a signal.
+            TerminateOutcome::NotRunning
         }
     }
 
-    /// 收割线程（`helper.go:562-574` 的 `go func(){ c.Wait(); close(done); chownRuntimeDirs(); ... }`）。
-    fn spawn_reaper(
-        child: Arc<Mutex<Option<ChildHandle>>>,
-        proc: Arc<Mutex<ProcSlot>>,
-        conf_dir: String,
-        mut cmd_child: std::process::Child,
-        done: Arc<DoneFlag>,
-        generation: u64,
-    ) {
+    fn spawn_native_worker(custody: Arc<NativeCustody>, birth: Arc<NativeBirth>, conf_dir: String) {
         std::thread::spawn(move || {
-            // helper.go:563: c.Wait()（收割 zombie；期间不持锁）
-            let _ = cmd_child.wait();
-            // helper.go:564: close(done)（广播：terminateChild 免 KILL、watchParent 退出）
-            done.signal();
-            // helper.go:565-568: root 跑的 sing-box 退出后把运行时目录属主归还登录用户（放 Wait 之后确保属主稳定）
-            chown_runtime_dirs(&conf_dir);
-            // helper.go:569-573: if child == c { child, childDone = nil, nil }（身份代守卫）
-            let mut child_g = child
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut proc_g = proc
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if proc_g.generation == generation {
-                *child_g = None;
-                proc_g.done = None;
+            // A worker can stop or panic without owning the registry's retirement rights.
+            while custody.is_current(&birth) {
+                custody.drive(&birth, Instant::now(), &|| chown_runtime_dirs(&conf_dir));
+                std::thread::sleep(Duration::from_millis(100));
             }
         });
     }
 
-    /// 父死看护线程（`helper.go:316-356` 的 `watchParent`）。
-    ///
-    /// 每秒探测父 app：`kill(ppid,0)==ESRCH`（父已死）或启动时间变了（PID 复用假阴性）→ 摘 child 收割。
-    /// 退出条件（防线程泄漏）：child 退出（`done`）/ 被 stop·cleanup·新 start 摘除（身份代不符）/ 父死收割完成。
-    fn spawn_watch_parent(
-        child: Arc<Mutex<Option<ChildHandle>>>,
-        proc: Arc<Mutex<ProcSlot>>,
-        ppid: u32,
-        ppid_start: Option<String>,
-        generation: u64,
-        done: Arc<DoneFlag>,
+    fn spawn_native_parent_watch(
+        custody: Arc<NativeCustody>,
+        birth: Arc<NativeBirth>,
+        parent_pid: u32,
+        parent_start: Option<String>,
     ) {
-        std::thread::spawn(move || {
-            loop {
-                // helper.go:319-324: select { <-done: return; <-t.C: tick }
-                // wait_exit(1s)：done 触发→true→退出看护；超时→false→本轮探测。
-                if done.wait_exit(WATCH_TICK_INTERVAL) {
-                    return; // child 已退出，看护使命结束
-                }
-                // helper.go:325-330: current := child==c; if !current return（收割责任已转移）
-                {
-                    let _child_g = child
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let proc_g = proc
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if proc_g.generation != generation {
-                        return;
-                    }
-                }
-                // helper.go:336-343: 父死判定两路（ESRCH / PID 复用）
-                let exists = kill_zero_exists(ppid);
-                // helper.go:339-341: kill==nil && ppidStart!="" 才取当前启动时间比对
-                let current = if exists && ppid_start.is_some() {
-                    proc_start_time(ppid)
-                } else {
-                    None
-                };
-                let dead = matches!(
-                    classify_alive(exists, ppid_start.as_deref(), current.as_deref()),
-                    AliveProbe::Dead | AliveProbe::PidReused
-                );
-                if dead {
-                    // helper.go:344-353: 与 stop 竞态 —— 再确认 child==c → 摘除 → 独占收割
-                    let pid = {
-                        let mut child_g = child
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let mut proc_g = proc
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if proc_g.generation != generation {
-                            return; // 他人已摘除，收割权已转移
-                        }
-                        proc_g.done = None;
-                        child_g.take().map(|h| h.pid)
-                    };
-                    if let Some(pid) = pid {
-                        terminate_pid(pid, &done);
-                    }
-                    return;
-                }
+        std::thread::spawn(move || loop {
+            std::thread::sleep(WATCH_TICK_INTERVAL);
+            if !custody.is_current(&birth) {
+                return;
+            }
+            let exists = kill_zero_exists(parent_pid);
+            let current = if exists && parent_start.is_some() {
+                proc_start_time(parent_pid)
+            } else {
+                None
+            };
+            if matches!(
+                classify_alive(exists, parent_start.as_deref(), current.as_deref()),
+                AliveProbe::Dead | AliveProbe::PidReused
+            ) {
+                // Captured birth, never a naked child PID. Old callbacks cannot affect a successor.
+                custody.stop(birth.target);
+                return;
             }
         });
-    }
-
-    /// terminateChild（`helper.go:277-287`）：SIGTERM → 等 `done` 或宽限窗口 → SIGKILL。**不持 `command_mu`**。
-    ///
-    /// 信号按 pid 直发（`nix::kill`）——`done` 已在收割线程 `wait()` 后置位，正常退出路径 `wait_exit` 返回
-    /// `true`、跳过 KILL；仅未在 5s 内退出才 SIGKILL（对齐 Go `select{done / 5s Kill}`）。
-    fn terminate_pid(pid: u32, done: &DoneFlag) {
-        // helper.go:281: SIGTERM
-        let _ = send_signal(pid, Signal::SIGTERM);
-        // helper.go:282-286: 等 done 或 5s → 决定是否 KILL
-        let exited = done.wait_exit(TERMINATE_GRACE);
-        if terminate_needs_kill(exited) {
-            let _ = send_signal(pid, Signal::SIGKILL);
-        }
-    }
-
-    /// 向 pid 发信号（`nix::sys::signal::kill` safe wrapper，等价 Go `c.Process.Signal`/`Kill`）。
-    fn send_signal(pid: u32, sig: Signal) -> Result<(), nix::Error> {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig)
     }
 
     /// root 起核前把 cache.db 锁定为 confDir 属主。
@@ -909,54 +707,44 @@ mod sys {
             .map_err(|e| format!("归还 cache.db 属主失败（{}）：{e}", cache.display()))
     }
 
-    /// chownRuntimeDirs（`helper.go:206-242`）：把 confDir/{tailscale,singbox-dashboard,ui} 与根部
-    /// cache.db 里仍属 root 的条目 `Lchown` 归还登录用户。尽力而为，单项失败即跳过，绝不阻断。
-    fn chown_runtime_dirs(conf_dir: &str) {
-        // helper.go:207-209: confDir 空 → 跳过
+    /// A native receipt includes the complete ownership tail, not merely process exit.
+    fn chown_runtime_dirs(conf_dir: &str) -> Result<(), String> {
         if conf_dir.is_empty() {
-            return;
+            return Ok(());
         }
-        // helper.go:210-218: Stat confDir 取属主 uid/gid（confDir=app 数据目录，属主即登录用户）
-        let meta = match std::fs::metadata(conf_dir) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let uid = meta.uid();
-        let gid = meta.gid();
-        // helper.go:219-221: confDir 本身属 root（异常）→ 不动，避免把运行时目录误归 root
+        let meta = std::fs::metadata(conf_dir)
+            .map_err(|error| format!("read runtime owner {conf_dir}: {error}"))?;
+        let (uid, gid) = (meta.uid(), meta.gid());
         if should_skip_confdir_chown(uid) {
-            return;
+            return Err(format!(
+                "runtime config directory unexpectedly belongs to root: {conf_dir}"
+            ));
         }
-        // helper.go:222-224: 三个运行时子目录逐树归还
-        for name in CHOWN_SUBDIRS {
-            chown_tree(&Path::new(conf_dir).join(name), uid, gid);
+        for name in CHOWN_SUBDIRS.into_iter().chain(CHOWN_FILES) {
+            chown_tree(&Path::new(conf_dir).join(name), uid, gid)?;
         }
-        for name in CHOWN_FILES {
-            chown_tree(&Path::new(conf_dir).join(name), uid, gid);
-        }
+        Ok(())
     }
 
-    /// chownTree（`helper.go:230-242`）：递归把树里仍属 root 的条目 `Lchown` 到 `(uid,gid)`。
-    ///
-    /// 用 `symlink_metadata`（`Lstat` 语义，不跟随符号链接，对齐 Go `filepath.Walk` 的 Lstat）；条目
-    /// 读不了即跳过（绝不中断遍历）；仅 `uid==0` 的条目才 Lchown（省无谓 Lchown，`helper.go:237`）。
-    fn chown_tree(root: &Path, uid: u32, gid: u32) {
+    fn chown_tree(root: &Path, uid: u32, gid: u32) -> Result<(), String> {
         let meta = match std::fs::symlink_metadata(root) {
-            Ok(m) => m,
-            Err(_) => return, // 目录不存在/读不了即跳过（helper.go:232）
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("read runtime entry {}: {error}", root.display())),
         };
-        // helper.go:235-239: 仅 root 写入的条目归还（Lchown 不跟随符号链接）
         if should_chown_entry(meta.uid()) {
-            let _ = std::os::unix::fs::lchown(root, Some(uid), Some(gid));
+            std::os::unix::fs::lchown(root, Some(uid), Some(gid))
+                .map_err(|error| format!("chown runtime entry {}: {error}", root.display()))?;
         }
-        // 递归子项（仅真目录，符号链接经 Lstat 判为非目录 → 不跟随，对齐 Walk）
         if meta.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    chown_tree(&entry.path(), uid, gid);
-                }
+            for entry in std::fs::read_dir(root)
+                .map_err(|error| format!("read runtime tree {}: {error}", root.display()))?
+            {
+                let entry = entry.map_err(|error| format!("read runtime tree entry: {error}"))?;
+                chown_tree(&entry.path(), uid, gid)?;
             }
         }
+        Ok(())
     }
 
     /// 建 socket（0666）+ accept 循环，每连接一线程 dispatch（`helper.go:598-642`）。

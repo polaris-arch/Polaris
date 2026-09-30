@@ -201,7 +201,7 @@ async fn reap_test_stopping_child(rt: &Arc<ProxyRuntime>) {
 
 async fn reap_running_child(rt: &Arc<ProxyRuntime>) {
     let mut run = rt.child.lock().unwrap().take_running_for_test().unwrap();
-    run.child.kill().await.unwrap();
+    run.child_for_test().kill().await.unwrap();
 }
 
 async fn attach_main_claim(
@@ -1318,7 +1318,7 @@ async fn prepared_cancel_and_rejected_identity_leave_running_child_untouched() {
     let run = DirectCoreRun::new(spawn_custody_stand_in());
     let identity = run.identity.clone();
     let wrong = RunIdentity::new();
-    let pid = run.child.id().unwrap();
+    let pid = run.child_id_for_test().unwrap();
     rt.child.lock().unwrap().install_running_for_test(run);
     let (io, signals) = ScriptedIo::new(Fault::None);
     rt.core_via_helper.store(true, Ordering::SeqCst);
@@ -1377,7 +1377,7 @@ async fn prepared_cancel_and_rejected_identity_leave_running_child_untouched() {
     assert!(pid_alive(pid));
     assert_eq!(signals.load(Ordering::SeqCst), 0);
     let mut run = rt.child.lock().unwrap().take_running_for_test().unwrap();
-    run.child.kill().await.unwrap();
+    run.child_for_test().kill().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1413,7 +1413,7 @@ async fn committed_worker_reaps_after_observer_drop_but_never_empties_slot() {
     else {
         panic!("Reaped Stopping must reject replacement");
     };
-    let mut rejected_child = rejected.child;
+    let mut rejected_child = rejected.into_child_for_test();
     rejected_child.kill().await.unwrap();
 }
 
@@ -1561,7 +1561,7 @@ async fn injected_io_errors_and_timeout_retain_stopping_child() {
         let (rt, _dir) = test_runtime();
         let run = DirectCoreRun::new(spawn_custody_stand_in());
         let identity = run.identity.clone();
-        let pid = run.child.id().unwrap();
+        let pid = run.child_id_for_test().unwrap();
         rt.child.lock().unwrap().install_running_for_test(run);
         let (io, signals) = ScriptedIo::new(fault);
         let prepared = prepare_with_io_for_test(
@@ -1631,7 +1631,7 @@ async fn prepared_slot_and_nonce_cannot_act_on_another_real_child() {
     let (second, _second_dir) = test_runtime();
     let first_run = DirectCoreRun::new(spawn_custody_stand_in());
     let first_identity = first_run.identity.clone();
-    let first_pid = first_run.child.id().unwrap();
+    let first_pid = first_run.child_id_for_test().unwrap();
     first
         .child
         .lock()
@@ -1717,5 +1717,5 @@ async fn prepared_slot_and_nonce_cannot_act_on_another_real_child() {
     assert_eq!(winner_signals.load(Ordering::SeqCst), 1);
     assert_eq!(loser_signals.load(Ordering::SeqCst), 0);
     let mut first_run = first.child.lock().unwrap().take_running_for_test().unwrap();
-    first_run.child.kill().await.unwrap();
+    first_run.child_for_test().kill().await.unwrap();
 }

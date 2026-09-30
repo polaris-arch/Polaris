@@ -1261,6 +1261,8 @@ pub struct ProxyRuntime {
     /// 「stale 清扫 → 提权门 → config 生成 → spawn → 就绪等待 → 重试退避」整条起核腿，而不只是
     /// spawn 之后那一段。计数而非布尔：崩溃自愈/去抖重启也直调 `start`，可与用户发起的腿重叠。
     start_inflight: Arc<AtomicU32>,
+    /// Desktop exit admission; lock order crash→admission→Child. Permanent per session.
+    desktop_shutdown: Mutex<bool>,
     /// 后台网络任务的起核稳定门：覆盖整个 start，并在 TUN 成功后延续到 selector 校正与单次连接
     /// flush 结束。订阅自动更新复用它，避免自身请求被 post-start flush（快照逐条 `CloseConnection`）误杀。
     network_settle: Arc<NetworkSettleGate>,
@@ -1635,6 +1637,7 @@ impl ProxyRuntime {
             stop_domain,
             gen_changed: Arc::new(Notify::new()),
             start_inflight: Arc::new(AtomicU32::new(0)),
+            desktop_shutdown: Mutex::new(false),
             network_settle: Arc::new(NetworkSettleGate::default()),
             child,
             android_main_token: Mutex::new(None),

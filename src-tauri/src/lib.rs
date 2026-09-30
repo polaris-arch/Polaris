@@ -530,14 +530,9 @@ fn create_main_window(
                     });
                 }
                 CloseAction::QuitApp => {
-                    // 置 QuitState 再退：这条腿现在也会在**托盘在**时触发（用户选了「退出应用」），
-                    // 而 `ExitRequested` 的 C16 轻量守卫判据是 `lightweight && !quitting && 托盘在`
-                    // —— 不置位的话，一个陈旧的 lightweight 置位会把用户的真退出 `prevent_exit` 掉。
-                    app_handle
-                        .state::<QuitState>()
-                        .0
-                        .store(true, Ordering::SeqCst);
-                    app_handle.exit(0);
+                    // 保留窗口直到 Ready：失败时仍有可见表面承载原因与下一次退出重试。
+                    api.prevent_close();
+                    exit_lifecycle::queue_quit(&app_handle);
                 }
             }
         }
@@ -838,8 +833,8 @@ pub fn run() {
             app.manage(LightweightState(AtomicBool::new(false)));
             // Q1-b ④：「本次退出是 app:restart 发起的」，默认 false = 真退出（照落正常退出标记）。
             app.manage(RestartState(AtomicBool::new(false)));
-            // 正常 ExitRequested + 最终 Exit（以及 macOS 仅最终 Exit）共用的一次性退出收尾门。
-            app.manage(exit_lifecycle::ExitCleanupState(AtomicBool::new(false)));
+            // 正常退出准备可失败重试；Ready 持锁到实际退出提交，防止并发重复提交。
+            app.manage(exit_lifecycle::ExitCleanupState::default());
             // 托盘运行期状态（自绘浮层去抖 + 轻量重建时的待导航目标；Linux 虽不建浮层仍要后者）。
             app.manage(tray::TrayOverlay::default());
             // 同步托盘 warm 偏好。必须在 TrayOverlay manage 后执行；缺省 true，待托盘创建成功后后台预建。
@@ -971,8 +966,7 @@ pub fn run() {
                 h.set_menu(menu)?;
                 h.on_menu_event(|app, event| {
                     if event.id.as_ref() == "app_quit" {
-                        app.state::<QuitState>().0.store(true, Ordering::SeqCst);
-                        app.exit(0);
+                        exit_lifecycle::queue_quit(app);
                     }
                 });
             }
@@ -1345,13 +1339,8 @@ pub fn run() {
         // 不到它（需 mac 编译验证）。
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => show_main_window(app_handle),
-        // C1：任何退出请求（托盘/菜单「退出」→ app.exit、末窗关闭时托盘缺失 → exit、OS 关机/logout）
-        // → 阻塞清理。不 `prevent_exit`（清完照常退出）。安全关键：见 `run_exit_cleanup` 文档。
-        //
-        // C16 守卫：轻量驻留中有意销毁**末窗**（主 WebView，或主窗已销毁后的空闲托盘 WebView）若触发
-        // spurious ExitRequested，则必须保核——轻量语义恒不退出、代理连接不中断（对齐 上游）。判据：
-        // LightweightState 由销毁方前置真（swap 消费）且非显式退出（`!QuitState`）且托盘在（有唤出锚点）
-        // → `prevent_exit` + **跳过停核清理**。陈旧置位不阻断真实退出：真退出置 QuitState → 落到清理。
+        // C16 转场先早退；真实退出请求先 veto 再异步准备，成功持 Ready 重新发出退出。
+        // 已提交请求只放行，避免 app.exit → ExitRequested 再排队的循环。
         tauri::RunEvent::ExitRequested { api, .. } => {
             if matches!(
                 exit_lifecycle::exit_requested_action(app_handle),
@@ -1360,27 +1349,17 @@ pub fn run() {
                 api.prevent_exit();
                 return;
             }
-            // **必须在 C16 守卫之后**：被 `prevent_exit` 的那条腿进程根本没退（轻量模式销毁主窗
-            // 而已），在那儿收尾会停核，并让重建出来的 webview 把自己的编辑当「上次退出过」清掉。
-            if let Some(runtime) = app_handle.try_state::<AppRuntime>() {
-                // Keep create's precommit state linearizable across exit: first close its commit
-                // gate and cancel it, then discard parser queue work, then wait for workers.
-                // Reversing the first two lets a parser completion cross begin_commit in between.
-                runtime.subscription_create().shutdown_begin();
-                runtime.subscription_parse().shutdown();
-                runtime.subscription_create().shutdown_wait();
+            #[cfg(not(target_os = "android"))]
+            if !exit_lifecycle::exit_is_committed(app_handle) {
+                api.prevent_exit();
+                exit_lifecycle::queue_quit(app_handle);
             }
-            exit_lifecycle::run_real_exit_once(app_handle);
+            #[cfg(target_os = "android")]
+            exit_lifecycle::run_android_exit_once(app_handle);
         }
-        // macOS 原生 `NSApplication` 终止可不经过上面的 ExitRequested；最终 Exit 是不可阻止的
-        // 真实退出兜底。常规退出也会来到这里，由一次性门幂等短路，不能二次消费 RestartState。
+        // 平台直接终止无法 veto；只 best effort，未确认关闭绝不写 clean marker。
         tauri::RunEvent::Exit => {
-            if let Some(runtime) = app_handle.try_state::<AppRuntime>() {
-                runtime.subscription_create().shutdown_begin();
-                runtime.subscription_parse().shutdown();
-                runtime.subscription_create().shutdown_wait();
-            }
-            exit_lifecycle::run_real_exit_once(app_handle);
+            exit_lifecycle::final_exit_best_effort(app_handle);
         }
         _ => {}
     });

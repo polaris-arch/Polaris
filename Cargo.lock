@@ -3228,6 +3228,7 @@ dependencies = [
 name = "polaris-core-supervisor"
 version = "1.0.0"
 dependencies = [
+ "nix",
  "thiserror 2.0.20",
  "tokio",
 ]

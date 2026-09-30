@@ -9,7 +9,7 @@
 //! 本 crate 自己的 bin 目标三平台恒在，门没有平台盲区、也没有「资源没拉就静默失效」的盲区。
 //!
 //! **模式由 argv 里的配置路径选**（`run_config_check` 恒发 `--disable-color check -c <path>`，
-//! 唯一能由调用方控制的格是那个路径，故它就是模式选择器；探针从不真的打开这个路径）：
+//! 路径文件名选择模式；hang 模式读取私有配置副本中的见证路径）：
 //!
 //! | 配置路径含 | 行为 | 服务于 |
 //! |---|---|---|
@@ -22,23 +22,18 @@
 //! | `hang`     | 睡 400ms **然后**建一个见证文件再 rc=0  | 超时腿 + 「超时后子进程真的被杀掉」 |
 //! | 其余       | rc=0                                   | 缺省视同通过 |
 //!
-//! `hang` 腿的见证文件是**跨平台**证明子进程死了的办法：路径由调用方经配置路径传进来
-//! （`…hang…<witness>`），只有睡满之后才写。超时短于睡眠 ⇒ 文件永不出现 ⇒ 进程确实没跑完；
-//! 超时长于睡眠 ⇒ 文件出现（正向对照，证明这条腿本身是活的，不是路径写错了所以永远没文件）。
-//! 不用「扫进程表找残留」是因为那要按平台各写一套，且在 CI 的容器里未必看得见。
+//! `hang` 的配置内容是见证文件路径，探针睡满后才写入。
+//! 见证只用于辅助验证延迟写入行为；缺失不是退出证明，退出事实来自同 owned Child native wait。
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let joined = args.join(" ");
-    if let Some(rest) = joined.split("hang:").nth(1) {
-        let witness = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_string();
+    if joined.contains("hang") {
+        let config = args.last().expect("config path");
+        let witness = std::fs::read_to_string(config).expect("probe witness config");
         std::thread::sleep(std::time::Duration::from_millis(400));
         // 睡满才落见证。被 kill 掉的话这一行永远不执行。
-        let _ = std::fs::write(&witness, b"done");
+        let _ = std::fs::write(witness.trim(), b"done");
         return;
     }
     // 逐字取自随包 sing-box 1.14.0-beta.7 对「未知 outbound type」坏 config 的真实 stderr

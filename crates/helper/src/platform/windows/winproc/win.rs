@@ -11,8 +11,10 @@ use crate::platform::windows::logic::{
     local_port_from_net_order, AF_INET, AF_INET6, MIB_TCP_STATE_LISTEN,
     TCP_TABLE_OWNER_PID_LISTENER,
 };
+use crate::platform::windows::ops::NativeChildPoll;
 use crate::platform::windows::ops::{CoreStart, ManagedIdentity, NetTableOps, ProcOps};
 use crate::platform::windows::selfuninstall::self_uninstall_cmd_line;
+use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -26,10 +28,14 @@ use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_INVALID_PARAMETER, FALSE, FILETIME, GENERIC_ALL,
     GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::Cryptography::{
+    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::Security::{
     AclSizeInformation, GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
@@ -124,6 +130,11 @@ struct ManagedChild {
     handle: OwnedHandle,
     /// 起核当时从**同一个句柄**读到的身份（created + image）。
     identity: ManagedIdentity,
+    birth: Option<HelperBirthToken>,
+    exit_cached: bool,
+    term_requested: bool,
+    kill_requested: bool,
+    log_custody: Option<polaris_log_budget::PipeLogCustody>,
 }
 
 /// Windows FFI 生产实现（对应 Go `winproc.go` 全部原语）。
@@ -289,6 +300,136 @@ fn file_information(file: &File) -> std::io::Result<BY_HANDLE_FILE_INFORMATION> 
     reason = "owns the process-lifetime job HANDLE and transient process HANDLEs"
 )]
 impl WinProcOps {
+    fn spawn_tracked(
+        &self,
+        singbox_bin: &str,
+        cfg: &str,
+        log_path: &str,
+        fwd: bool,
+        birth: HelperBirthToken,
+    ) -> std::io::Result<CoreStart> {
+        let mut custody = self
+            .managed
+            .lock()
+            .map_err(|_| std::io::Error::other("managed HANDLE custody poisoned"))?;
+        if custody.is_some() {
+            return Err(std::io::Error::other(
+                "previous managed HANDLE custody still retained",
+            ));
+        }
+        // winproc.go:21-49 startSingbox + winproc.go:414-427 enableIPForwarding。
+        let total_started = Instant::now();
+        let forwarding_started = Instant::now();
+        if fwd {
+            self.enable_ip_forwarding();
+        }
+        let forwarding_ms = crate::elapsed_ms(forwarding_started);
+        // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
+        // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
+        let mut cmd = std::process::Command::new(singbox_bin);
+        cmd.args(["run", "-c", cfg])
+            .stdin(std::process::Stdio::null());
+        if !log_path.is_empty() {
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+        }
+        // SYSTEM helper 必须在 spawn 前固定日志对象。每级目录 handle 都拒绝 reparse 且不共享
+        // DELETE，直到 current/.1 两个 file object 都打开；之后轮转只操作这两个 handle。
+        // 安全打开失败只关闭日志能力，pipe 仍会被排空，不阻断核心启动。
+        let log_files = if log_path.is_empty() {
+            None
+        } else {
+            match preopen_log_files(log_path) {
+                Ok(files) => Some(files),
+                Err(error) => {
+                    log::warn!("privileged core logging disabled: secure pre-open failed: {error}");
+                    None
+                }
+            }
+        };
+        // CWD = 配置文件所在目录（= 用户可写 config 目录）。**不设的后果不是噪音，是写错地方**：
+        // helper 是 SCM 服务，进程 CWD 恒为 `C:\Windows\System32`，child 不设就继承它，而 sing-box
+        // 对配置里的**相对**路径按 CWD 解析。1.14.0-beta.15 起 tailscale endpoint 的
+        // `taildrop_directory` 默认值就是相对的 `Taildrop`，且在 initialize 阶段无条件 `MkdirAll(0700)`
+        // ⇒ 目录建在 System32 里，tailnet peer 发来的文件也落在那；helper 跑在 SYSTEM 下，这个 mkdir
+        // 还会**成功**，于是没有任何报错。另一条更老的同型：`services[].dashboard` 省略 `path` 时的
+        // 联网下载兜底目录 `dashboard`。
+        //
+        // App 直起（`runtime/proxy.rs`）、Linux helper（`platform/linux/server.rs`）、macOS helper
+        // （`platform/macos/server.rs`）三条腿早就设了，本腿是漏的那条 —— 同一根因下做对的三条腿，
+        // 正是「这不是有意取舍」的证据。取父目录的方式与 Linux 腿同（配置文件的所在目录），只是不能用
+        // `std::path`（见 `logic::filepath_dir`）。取不到父目录（裸文件名）→ 不设，保持旧行为。
+        if let Some(cwd) = filepath_dir(cfg) {
+            cmd.current_dir(cwd);
+        }
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        let process_started = Instant::now();
+        let mut child = cmd.spawn()?;
+        let process_ms = crate::elapsed_ms(process_started);
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // D2/D3：**不再 drop child**。把 std 的 Child 拆成裸句柄自行持有 —— drop 会关闭父侧进程
+        // 句柄，而句柄一关，核退出后这个 PID 立刻可被系统复用（见 `ManagedChild` 文档）。
+        // SAFETY: `into_raw_handle` 转移所有权且不关闭句柄；此处立刻用 OwnedHandle 接管，
+        // 关闭时机唯一（收割后 drop）。stdout/stderr 已在上面取走，不受影响。
+        let handle = unsafe { OwnedHandle::from_raw_handle(child.into_raw_handle()) };
+        // 身份从**这个句柄**读一次并缓存：句柄在手 ⇒ 读到的必是刚起的这个进程；
+        // 之后 status 每次直接回缓存值，既不重复 FFI，也不会在核退出后读到复用者的数据。
+        let identity = ManagedIdentity {
+            created: process_created_ticks(handle.as_raw_handle().cast()),
+            image: process_image_by_handle(handle.as_raw_handle().cast()),
+        };
+        let created = identity.created;
+        *custody = Some(ManagedChild {
+            pid,
+            handle,
+            identity,
+            birth: Some(birth),
+            exit_cached: false,
+            term_requested: false,
+            kill_requested: false,
+            log_custody: None,
+        });
+        // ensureJob + assignToJob（winproc.go:40-47）：best-effort 防孤儿安全网。失败不阻断 start。
+        let job_started = Instant::now();
+        if let Some(h_job) = self.ensure_job() {
+            self.assign_to_job(h_job, pid);
+        }
+        let job_ms = crate::elapsed_ms(job_started);
+
+        // Initialize this birth's Fresh log session before releasing admission. Keep
+        // its revocation capability beside the HANDLE so no delayed writer can affect
+        // a replacement after this birth's native exit has been cached.
+        let log_handoff_started = Instant::now();
+        let log_custody = if let Some(files) = log_files {
+            polaris_log_budget::spawn_pipe_loggers_with_preopened_files_custodied(
+                stdout,
+                stderr,
+                files,
+                polaris_log_budget::DEFAULT_GENERATION_BYTES,
+            )
+        } else {
+            polaris_log_budget::spawn_pipe_drainers_custodied(stdout, stderr)
+        };
+        custody
+            .as_mut()
+            .expect("published owned HANDLE")
+            .log_custody = Some(log_custody);
+        let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
+        Ok(CoreStart {
+            pid,
+            created,
+            timing: polaris_helper_proto::StartTiming {
+                forwarding_ms,
+                process_ms,
+                job_ms,
+                log_handoff_ms,
+                total_ms: crate::elapsed_ms(total_started),
+            },
+        })
+    }
+
     /// ensureJob（`winproc.go:75-96`）：惰性创建常驻 job 并设 KILL_ON_JOB_CLOSE。幂等。
     fn ensure_job(&self) -> Option<HANDLE> {
         let mut guard = self
@@ -344,15 +485,6 @@ impl WinProcOps {
         }
     }
 
-    /// 记账新的受管核句柄，替换（并关闭）上一把 —— 上一把若还在，它的进程早已不是受管核。
-    fn remember_managed_child(&self, child: ManagedChild) {
-        let mut guard = self
-            .managed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(child); // 旧 ManagedChild 在此 drop → CloseHandle（不泄漏）
-    }
-
     /// 取出（并从槽里摘除）`pid` 的受管句柄；`pid` 不是手里那个 → `None`，不动槽。
     ///
     /// 摘除即交出关闭权：调用方收割完 drop 掉它，那一刻 PID 才允许被系统复用。
@@ -361,7 +493,10 @@ impl WinProcOps {
             .managed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.as_ref().is_some_and(|c| c.pid == pid) {
+        if guard
+            .as_ref()
+            .is_some_and(|c| c.pid == pid && c.birth.is_none())
+        {
             return guard.take().map(|c| c.handle);
         }
         None
@@ -468,132 +603,152 @@ impl ProcOps for WinProcOps {
 
     fn start_singbox(
         &self,
-        singbox_bin: &str,
-        cfg: &str,
-        log_path: &str,
-        fwd: bool,
+        _bin: &str,
+        _cfg: &str,
+        _log: &str,
+        _fwd: bool,
     ) -> std::io::Result<CoreStart> {
-        // winproc.go:21-49 startSingbox + winproc.go:414-427 enableIPForwarding。
-        let total_started = Instant::now();
-        let forwarding_started = Instant::now();
-        if fwd {
-            self.enable_ip_forwarding();
-        }
-        let forwarding_ms = crate::elapsed_ms(forwarding_started);
-        // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
-        // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
-        let mut cmd = std::process::Command::new(singbox_bin);
-        cmd.args(["run", "-c", cfg])
-            .stdin(std::process::Stdio::null());
-        if !log_path.is_empty() {
-            cmd.stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-        }
-        // SYSTEM helper 必须在 spawn 前固定日志对象。每级目录 handle 都拒绝 reparse 且不共享
-        // DELETE，直到 current/.1 两个 file object 都打开；之后轮转只操作这两个 handle。
-        // 安全打开失败只关闭日志能力，pipe 仍会被排空，不阻断核心启动。
-        let log_files = if log_path.is_empty() {
-            None
-        } else {
-            match preopen_log_files(log_path) {
-                Ok(files) => Some(files),
-                Err(error) => {
-                    log::warn!("privileged core logging disabled: secure pre-open failed: {error}");
-                    None
-                }
-            }
-        };
-        // CWD = 配置文件所在目录（= 用户可写 config 目录）。**不设的后果不是噪音，是写错地方**：
-        // helper 是 SCM 服务，进程 CWD 恒为 `C:\Windows\System32`，child 不设就继承它，而 sing-box
-        // 对配置里的**相对**路径按 CWD 解析。1.14.0-beta.15 起 tailscale endpoint 的
-        // `taildrop_directory` 默认值就是相对的 `Taildrop`，且在 initialize 阶段无条件 `MkdirAll(0700)`
-        // ⇒ 目录建在 System32 里，tailnet peer 发来的文件也落在那；helper 跑在 SYSTEM 下，这个 mkdir
-        // 还会**成功**，于是没有任何报错。另一条更老的同型：`services[].dashboard` 省略 `path` 时的
-        // 联网下载兜底目录 `dashboard`。
-        //
-        // App 直起（`runtime/proxy.rs`）、Linux helper（`platform/linux/server.rs`）、macOS helper
-        // （`platform/macos/server.rs`）三条腿早就设了，本腿是漏的那条 —— 同一根因下做对的三条腿，
-        // 正是「这不是有意取舍」的证据。取父目录的方式与 Linux 腿同（配置文件的所在目录），只是不能用
-        // `std::path`（见 `logic::filepath_dir`）。取不到父目录（裸文件名）→ 不设，保持旧行为。
-        if let Some(cwd) = filepath_dir(cfg) {
-            cmd.current_dir(cwd);
-        }
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        let process_started = Instant::now();
-        let mut child = cmd.spawn()?;
-        let process_ms = crate::elapsed_ms(process_started);
-        let pid = child.id();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        // D2/D3：**不再 drop child**。把 std 的 Child 拆成裸句柄自行持有 —— drop 会关闭父侧进程
-        // 句柄，而句柄一关，核退出后这个 PID 立刻可被系统复用（见 `ManagedChild` 文档）。
-        // SAFETY: `into_raw_handle` 转移所有权且不关闭句柄；此处立刻用 OwnedHandle 接管，
-        // 关闭时机唯一（收割后 drop）。stdout/stderr 已在上面取走，不受影响。
-        let handle = unsafe { OwnedHandle::from_raw_handle(child.into_raw_handle()) };
-        // 身份从**这个句柄**读一次并缓存：句柄在手 ⇒ 读到的必是刚起的这个进程；
-        // 之后 status 每次直接回缓存值，既不重复 FFI，也不会在核退出后读到复用者的数据。
-        let identity = ManagedIdentity {
-            created: process_created_ticks(handle.as_raw_handle().cast()),
-            image: process_image_by_handle(handle.as_raw_handle().cast()),
-        };
-        let created = identity.created;
-        self.remember_managed_child(ManagedChild {
-            pid,
-            handle,
-            identity,
-        });
-        // ensureJob + assignToJob（winproc.go:40-47）：best-effort 防孤儿安全网。失败不阻断 start。
-        let job_started = Instant::now();
-        if let Some(h_job) = self.ensure_job() {
-            self.assign_to_job(h_job, pid);
-        }
-        let job_ms = crate::elapsed_ms(job_started);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native birth required before spawn",
+        ))
+    }
 
-        // 有界日志 writer 的旧文件裁剪/轮转是磁盘 IO，不属于「child 已受 Job 保护后才能回 PID」的
-        // 正确性关键路径。把两条 pipe 连同所有权交给后台线程：主程序可立即开始管理端口就绪探测；
-        // pipe 在接线完成前仍由该线程持有，不会因父侧提前 drop 而给核心制造 broken pipe。
-        let log_handoff_started = Instant::now();
-        if !log_path.is_empty() {
-            std::thread::spawn(move || {
-                if let Some(files) = log_files {
-                    polaris_log_budget::spawn_pipe_loggers_with_preopened_files(
-                        stdout,
-                        stderr,
-                        files,
-                        polaris_log_budget::DEFAULT_GENERATION_BYTES,
-                    );
-                } else {
-                    polaris_log_budget::spawn_pipe_drainers(stdout, stderr);
-                }
-            });
+    fn mint_native_birth(&self) -> std::io::Result<HelperBirthToken> {
+        let mut bytes = [0u8; 16];
+        // SAFETY: a valid writable fixed-size buffer; system-preferred RNG needs no provider HANDLE.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status < 0 {
+            return Err(std::io::Error::other(format!(
+                "OS birth RNG failed: NTSTATUS {status:#x}"
+            )));
         }
-        let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
-        Ok(CoreStart {
-            pid,
-            created,
-            timing: polaris_helper_proto::StartTiming {
-                forwarding_ms,
-                process_ms,
-                job_ms,
-                log_handoff_ms,
-                total_ms: crate::elapsed_ms(total_started),
-            },
-        })
+        Ok(HelperBirthToken::from_bytes(bytes))
+    }
+
+    fn start_native_singbox(
+        &self,
+        bin: &str,
+        cfg: &str,
+        log: &str,
+        fwd: bool,
+        birth: HelperBirthToken,
+    ) -> std::io::Result<CoreStart> {
+        self.spawn_tracked(bin, cfg, log, fwd, birth)
+    }
+
+    fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+        let Ok(mut guard) = self.managed.lock() else {
+            return NativeChildPoll::Unknown;
+        };
+        let Some(child) = guard
+            .as_mut()
+            .filter(|c| c.pid == target.pid.get() && c.birth == Some(target.birth))
+        else {
+            return NativeChildPoll::Unknown;
+        };
+        native_wait(child, 0)
+    }
+
+    fn stop_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+        let Ok(mut guard) = self.managed.lock() else {
+            return NativeChildPoll::Unknown;
+        };
+        let Some(child) = guard
+            .as_mut()
+            .filter(|c| c.pid == target.pid.get() && c.birth == Some(target.birth))
+        else {
+            return NativeChildPoll::Unknown;
+        };
+        let first = native_wait(child, 0);
+        if first != NativeChildPoll::Running {
+            return first;
+        }
+        if !child.term_requested {
+            // The HANDLE remains owned and unreaped while sending this compatibility signal.
+            child.term_requested = true;
+            if send_ctrl_break(child.pid).is_err() {
+                let _ = send_ctrl_break_via_child_console(child.pid);
+            }
+            let graceful = native_wait(child, 2000);
+            if graceful != NativeChildPoll::Running {
+                return graceful;
+            }
+        }
+        if !child.kill_requested {
+            if terminate_handle(child.handle.as_raw_handle().cast()).is_err() {
+                return match native_wait(child, 0) {
+                    NativeChildPoll::Exited => NativeChildPoll::Exited,
+                    _ => NativeChildPoll::Unknown,
+                };
+            }
+            child.kill_requested = true;
+        }
+        // TerminateProcess acceptance is not exit. Keep HANDLE custody through timeout/error.
+        native_wait(child, 2000)
+    }
+
+    fn retire_native_child(&self, target: HelperBirthTarget) -> bool {
+        let Ok(mut guard) = self.managed.lock() else {
+            return false;
+        };
+        if !guard.as_ref().is_some_and(|c| {
+            c.pid == target.pid.get() && c.birth == Some(target.birth) && c.exit_cached
+        }) {
+            return false;
+        }
+        let Some(log_custody) = guard.as_ref().and_then(|child| child.log_custody.as_ref()) else {
+            return false;
+        };
+        if log_custody.revoke().is_err() {
+            return false;
+        }
+        *guard = None;
+        true
+    }
+
+    fn native_custody_empty(&self) -> bool {
+        self.managed.lock().is_ok_and(|custody| custody.is_none())
     }
 
     fn reap_child(&self, pid: u32) {
+        if self.managed.lock().map_or(true, |g| {
+            g.as_ref()
+                .is_some_and(|c| c.pid == pid && c.birth.is_some())
+        }) {
+            return;
+        }
+
         // W6 修：后台异步收割（Go stop/cleanup/uninstall 的 `go terminateChild(c, done)`）——不阻塞
         // 管道回复（此前同步 sleep(2s) 阻塞 stop 回复）。线程捕获 pid + **摘下来的句柄**（D3：
         // 收割全程对同一个进程对象，绝不按号码重开），不捕获 &self（故无生命周期问题）。
-        let handle = self.take_managed_handle(pid);
-        std::thread::spawn(move || reap_sequence(pid, handle));
+        let Some(handle) = self.take_managed_handle(pid) else {
+            return;
+        };
+        std::thread::spawn(move || reap_sequence(pid, Some(handle)));
     }
 
     fn reap_child_blocking(&self, pid: u32) {
+        if self.managed.lock().map_or(true, |g| {
+            g.as_ref()
+                .is_some_and(|c| c.pid == pid && c.birth.is_some())
+        }) {
+            return;
+        }
+
         // 同步收割（Go reapChildOnExit 的**同步** terminateChild）：服务停止/关机路径须在返回前杀完
         // child，否则异步收割线程随进程退出消失 → 孤儿。
-        let handle = self.take_managed_handle(pid);
-        reap_sequence(pid, handle);
+        let Some(handle) = self.take_managed_handle(pid) else {
+            return;
+        };
+        reap_sequence(pid, Some(handle));
     }
 
     fn apply_route(&self, iface: &str, cidr: &str, del: bool) {
@@ -956,6 +1111,26 @@ fn reap_sequence(pid: u32, handle: Option<OwnedHandle>) {
         }
     }
     // handle 在此 drop → CloseHandle：核已收割，此刻起系统才可以复用这个 PID。
+}
+
+/// Only WAIT_OBJECT_0 caches local native exit; timeout/error retain this exact HANDLE.
+#[allow(
+    unsafe_code,
+    reason = "waits only on the retained owned process HANDLE"
+)]
+fn native_wait(child: &mut ManagedChild, timeout_ms: u32) -> NativeChildPoll {
+    if child.exit_cached {
+        return NativeChildPoll::Exited;
+    }
+    // SAFETY: HANDLE is retained in ManagedChild across this synchronous wait.
+    match unsafe { WaitForSingleObject(child.handle.as_raw_handle().cast(), timeout_ms) } {
+        WAIT_OBJECT_0 => {
+            child.exit_cached = true;
+            NativeChildPoll::Exited
+        }
+        WAIT_TIMEOUT => NativeChildPoll::Running,
+        _ => NativeChildPoll::Unknown,
+    }
 }
 
 /// 用**已持有的进程句柄**判存活（`GetExitCodeProcess`）。口径同 [`process_alive_raw`]：

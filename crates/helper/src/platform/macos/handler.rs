@@ -25,7 +25,7 @@
 //! - 协议分派逻辑（参数校验、白名单判定、错误码映射）跨平台可测（Linux CI 完整覆盖）。
 //! - socket IO（accept/read/write/超时）留给 [`crate::platform::macos::server`] 的 mac-gated 部分。
 //!
-//! freeport 不持锁（Go `helper.go:413`）—— 在 dispatch 内直接处理，由调用方决定是否在锁外调用。
+//! freeport 与 native Start 共用 server 命令锁，避免空槽检查后新核启动再遭 PID 清理。
 //! 本 dispatch 是无状态的（状态在 [`MacServices`] 内），不模拟 Go 的 mu —— 并发控制由 server 层负责。
 
 use crate::core_install::{install_core_files, InstallResult, SINGBOX_BIN_NAME};
@@ -36,9 +36,14 @@ use crate::platform::macos::install_core::to_response;
 use crate::platform::macos::route::{self, RouteOp};
 use crate::platform::macos::whitelist;
 use crate::token::{check_token, TokenCheck, TokenStore};
-use polaris_helper_proto::request::{InstallCoreParams, RouteParams};
-use polaris_helper_proto::response::{ResponseKind, Start as StartResp, StartTiming, Status, Stop};
-use polaris_helper_proto::{stop_pid_matches, Error as ProtoError, ErrorCode, Request, Response};
+use polaris_helper_proto::request::{InstallCoreParams, RouteParams, StartParams};
+use polaris_helper_proto::response::{
+    NativeBirthStart, NativeBirthStatus, NativeBirthStop, ResponseKind, Start as StartResp,
+    StartTiming, Status, Stop,
+};
+use polaris_helper_proto::{
+    stop_pid_matches, Error as ProtoError, ErrorCode, HelperBirthTarget, Request, Response,
+};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -105,6 +110,22 @@ pub struct SpawnedCore {
 /// macOS helper 的服务 bundle —— 把所有外部依赖（token 存储、命令执行、child 状态）打包成一个 trait，
 /// 便于测试注入 mock、生产注入真实实现。
 pub trait MacServices: Send + Sync {
+    /// Unsupported services cannot attest native custody by calling the legacy void stop.
+    fn native_start(&self, _params: &StartParams) -> Result<NativeBirthStart, SpawnError> {
+        Err(SpawnError::NotImplemented)
+    }
+    fn native_status(&self) -> NativeBirthStatus {
+        NativeBirthStatus::Unknown { target: None }
+    }
+    fn native_stop(&self, target: HelperBirthTarget) -> NativeBirthStop {
+        NativeBirthStop::Unknown { target }
+    }
+    fn native_custody_active(&self) -> bool {
+        false
+    }
+    fn legacy_start_supported(&self) -> bool {
+        true
+    }
     /// token 存储（读 `helper.token`）。
     fn token_store(&self) -> &dyn TokenStore;
 
@@ -226,8 +247,11 @@ pub fn dispatch(
         return Response::Err(ProtoError::new(ErrorCode::Auth));
     }
 
-    // freeport 不持锁、不碰 child（helper.go:413）—— 直接处理
+    // Freeport can signal PID owners, so native custody fences it before any runner call.
     if let Request::FreePort { port } = req {
+        if services.native_custody_active() {
+            return legacy_native_required();
+        }
         let port_str = port.to_string();
         return freeport::run_freeport(services.runner(), &port_str);
     }
@@ -235,6 +259,27 @@ pub fn dispatch(
     // 其余命令在「临界区」内处理 —— 这里用 child() mutex 体现互斥语义
     // （实际生产由 server 层在调 dispatch 前后包 mu；本函数内部对 child 状态的访问仍走 mutex）
     match req {
+        Request::NativeStatusBirth => {
+            Response::Ok(ResponseKind::NativeBirthStatus(services.native_status()))
+        }
+        Request::NativeStopBirth { target } => {
+            Response::Ok(ResponseKind::NativeBirthStop(services.native_stop(*target)))
+        }
+        Request::NativeStartBirth(params) => {
+            if let Err(error) = validate_start_paths(config, &params.cfg, &params.log) {
+                return Response::Err(error);
+            }
+            match services.native_start(params) {
+                Ok(started) => Response::Ok(ResponseKind::NativeBirthStart(started)),
+                Err(SpawnError::NotImplemented) => Response::Err(ProtoError::with_detail(
+                    ErrorCode::Start,
+                    "native birth custody unsupported",
+                )),
+                Err(SpawnError::Failed(error)) => {
+                    Response::Err(ProtoError::with_detail(ErrorCode::Start, error))
+                }
+            }
+        }
         Request::Ping => {
             // helper.go:422-423: OK pong uid=<n> v<ver>
             Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(
@@ -248,6 +293,9 @@ pub fn dispatch(
             })
         }
         Request::Status => {
+            if services.native_custody_active() {
+                return legacy_native_required();
+            }
             // helper.go:426-430
             let guard = services
                 .child()
@@ -265,6 +313,9 @@ pub fn dispatch(
             }
         }
         Request::Stop { pid } => {
+            if services.native_custody_active() {
+                return legacy_native_required();
+            }
             // helper.go:432-442（+ 受管 pid 身份判据，见 `terminate_child`）
             match services.terminate_child(*pid) {
                 TerminateOutcome::Stopped { pid } => {
@@ -277,6 +328,9 @@ pub fn dispatch(
             }
         }
         Request::Cleanup => {
+            if services.native_custody_active() {
+                return legacy_native_required();
+            }
             // helper.go:444-449: pkill -9 -f "<singboxBin> run" + 摘 child
             let pattern = format!("{} run", config.singbox_bin);
             let _ = services
@@ -416,6 +470,9 @@ fn handle_start(
     fwd: bool,
     parent_pid: Option<u32>,
 ) -> Response {
+    if !services.legacy_start_supported() || services.native_custody_active() {
+        return legacy_native_required();
+    }
     // helper.go:521-524: 已有 child → OK already <pid>
     {
         let guard = services
@@ -426,28 +483,11 @@ fn handle_start(
             return Response::Ok(ResponseKind::Start(StartResp::Already { pid: child.pid }));
         }
     }
-    // helper.go:525-527: cfg 空 → ERR no-config
-    if cfg.is_empty() {
-        return Response::Err(ProtoError::new(ErrorCode::NoConfig));
-    }
-    // helper.go:528-531: cfg 不在白名单 → ERR config-path-denied
-    if !whitelist::cfg_allowed(cfg, &config.conf_dir) {
-        return Response::Err(ProtoError::new(ErrorCode::ConfigPathDenied));
-    }
-    // **Polaris 新增（上游无）**：log 走与 cfg 同一条 lexical 白名单；`server::do_spawn`
-    // 再从 `/` 逐级 openat(O_NOFOLLOW) 固定 current/.1，二者缺一不可。否则 root helper 既能
-    // 越界创建文件，也会在用户可写父目录的 rename/symlink 竞态中写错对象。生产下发的 log
-    // 与 cfg 同在 conf_dir，收紧无行为变化；空串 = 不重定向，放行。
-    //
-    // 这里不把 cfg 内容伪装成 helper 的可信输入：同一登录账户可读 token 且可写 conf_dir，
-    // 因此当前承诺不抵抗同账户恶意进程。扩大承诺需要签名 app identity + 完整资源闭包封存，
-    // 只 staging 主 JSON 或 canonicalize 路径不成立。协议契约见 StartParams 文档。
-    if !log.is_empty() && !whitelist::cfg_allowed(log, &config.conf_dir) {
-        return Response::Err(ProtoError::new(ErrorCode::LogPathDenied));
+    if let Err(error) = validate_start_paths(config, cfg, log) {
+        return Response::Err(error);
     }
     // 从已通过参数/路径校验后开始计时：拒绝腿不伪装成“起核耗时”。
     let total_started = Instant::now();
-    // helper.go:533-537: allowLan 开启 IP 转发
     let forwarding_started = Instant::now();
     if fwd {
         let _ = services.runner().run(
@@ -462,7 +502,6 @@ fn handle_start(
         );
     }
     let forwarding_ms = crate::elapsed_ms(forwarding_started);
-    // helper.go:538-579: spawn child sing-box（ppid>0 → 起 watchParent 父死看护）
     match services.spawn_child(cfg, log, fwd, parent_pid) {
         Ok(started) => Response::Ok(ResponseKind::Start(StartResp::StartedTimed {
             pid: started.pid,
@@ -473,7 +512,6 @@ fn handle_start(
                 log_handoff_ms: started.log_handoff_ms,
                 total_ms: crate::elapsed_ms(total_started),
             },
-            // 同 status：身份 token 仅 Windows 回传（Q6）。
             created: None,
         })),
         Err(SpawnError::NotImplemented) => Response::Err(ProtoError::with_detail(
@@ -484,6 +522,36 @@ fn handle_start(
             Response::Err(ProtoError::with_detail(ErrorCode::Start, msg))
         }
     }
+}
+
+fn legacy_native_required() -> Response {
+    Response::Err(ProtoError::with_detail(
+        ErrorCode::Start,
+        "native birth protocol required; upgrade the client",
+    ))
+}
+
+fn validate_start_paths(config: &MacConfig, cfg: &str, log: &str) -> Result<(), ProtoError> {
+    // helper.go:525-527: cfg 空 → ERR no-config
+    if cfg.is_empty() {
+        return Err(ProtoError::new(ErrorCode::NoConfig));
+    }
+    // helper.go:528-531: cfg 不在白名单 → ERR config-path-denied
+    if !whitelist::cfg_allowed(cfg, &config.conf_dir) {
+        return Err(ProtoError::new(ErrorCode::ConfigPathDenied));
+    }
+    // **Polaris 新增（上游无）**：log 走与 cfg 同一条 lexical 白名单；`server::do_spawn`
+    // 再从 `/` 逐级 openat(O_NOFOLLOW) 固定 current/.1，二者缺一不可。否则 root helper 既能
+    // 越界创建文件，也会在用户可写父目录的 rename/symlink 竞态中写错对象。生产下发的 log
+    // 与 cfg 同在 conf_dir，收紧无行为变化；空串 = 不重定向，放行。
+    //
+    // 这里不把 cfg 内容伪装成 helper 的可信输入：同一登录账户可读 token 且可写 conf_dir，
+    // 因此当前承诺不抵抗同账户恶意进程。扩大承诺需要签名 app identity + 完整资源闭包封存，
+    // 只 staging 主 JSON 或 canonicalize 路径不成立。协议契约见 StartParams 文档。
+    if !log.is_empty() && !whitelist::cfg_allowed(log, &config.conf_dir) {
+        return Err(ProtoError::new(ErrorCode::LogPathDenied));
+    }
+    Ok(())
 }
 
 /// install-core 处理（移植自 `helper.go:580-585,127-198`）。

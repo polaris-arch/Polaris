@@ -30,11 +30,9 @@
 //! | 测速（[`MenuAction::SpeedTest`]） | 桌面独有（快捷入口） | 应用内已有入口，通知位次不该给它 |
 //! | macOS 菜单栏位置持久化 | 桌面独有 | 已由 `#[cfg(target_os = "macos")]` 门控 |
 //!
-use std::sync::atomic::Ordering;
-
 use tauri::Manager;
 
-use crate::{commands, i18n, show_main_window, tray, AppRuntime, Platform, QuitState};
+use crate::{commands, i18n, show_main_window, tray, AppRuntime, Platform};
 #[cfg(all(desktop, not(target_os = "macos")))]
 use crate::{dark_bg_from_probe, system_dark_bg};
 
@@ -995,10 +993,7 @@ pub(crate) fn native_exit_selection_notice(status: &str) -> Option<&'static str>
 pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
     match action {
         MenuAction::Show => show_main_window(app),
-        MenuAction::Quit => {
-            app.state::<QuitState>().0.store(true, Ordering::SeqCst);
-            app.exit(0);
-        }
+        MenuAction::Quit => crate::exit_lifecycle::queue_quit(app),
         MenuAction::OpenSettings => {
             // 与浮层「打开设置」逐字节同一条路径（含轻量模式重建时的首帧种子腿）。
             let lang = i18n::app_lang(app);

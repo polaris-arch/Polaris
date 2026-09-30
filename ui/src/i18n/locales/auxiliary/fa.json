@@ -80,6 +80,7 @@
     "errRecheckFailed": "بررسی به‌روزرسانی ناموفق بود"
   },
   "native": {
+    "exitBlocked": "بسته شدن اتصال‌های پس‌زمینه تأیید نشده است. Polaris همچنان اجرا می‌شود؛ خروج را دوباره امتحان کنید.",
     "backupExportTitle": "برون‌بری نسخهٔ پشتیبان پیکربندی Polaris",
     "backupImportTitle": "درون‌ریزی نسخهٔ پشتیبان پیکربندی Polaris",
     "backupFileType": "فایل پشتیبان Polaris",

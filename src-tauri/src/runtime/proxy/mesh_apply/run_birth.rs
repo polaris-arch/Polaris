@@ -135,12 +135,9 @@ impl ManagedDirectBirth {
     /// Attach to a direct Child after a future guarded spawn. Proxy descendants
     /// can still mutate the slot; they are not excluded by this type boundary.
     pub(in crate::runtime::proxy) fn attach(self, child: Child) -> DirectCoreRun {
-        DirectCoreRun {
-            child,
-            identity: self.identity,
-            origin: DirectRunOrigin::Managed(self.facts),
-            main_token: None,
-        }
+        let mut run = DirectCoreRun::with_identity(child, self.identity);
+        run.origin = DirectRunOrigin::Managed(self.facts);
+        run
     }
 }
 

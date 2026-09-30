@@ -35,8 +35,9 @@ use polaris_helper_client::{
 };
 use polaris_helper_proto::{
     FlushDns, HelperBirthTarget, InstallCoreParams, LinuxBirthStart, LinuxBirthStatus,
-    LinuxBirthStop, LinuxDns, LinuxDnsSetParams, LinuxStartParams, Platform, Request, Response,
-    ResponseKind, RouteParams, Start, StartNotAdmitted, StartParams, Status as CoreStatus, Stop,
+    LinuxBirthStop, LinuxDns, LinuxDnsSetParams, LinuxStartParams, NativeBirthStart,
+    NativeBirthStatus, NativeBirthStop, Platform, Request, Response, ResponseKind, RouteParams,
+    Start, StartNotAdmitted, StartParams, Status as CoreStatus, Stop,
 };
 use polaris_system_integration::dns_flush::HelperFlushResult;
 use polaris_system_integration::linux_resolved::LinuxResolvedOps;
@@ -437,6 +438,12 @@ pub(crate) enum ManagedCoreStatus {
     BirthRunning {
         target: HelperBirthTarget,
     },
+    NativeBirthRunning {
+        target: HelperBirthTarget,
+        created: Option<u64>,
+        image: Option<String>,
+    },
+    BirthUnidentified,
     BirthStopping {
         target: HelperBirthTarget,
     },
@@ -1010,7 +1017,7 @@ impl HelperRuntime {
             parent_pid: ppid,
         };
         let req = match self.platform {
-            Platform::Mac | Platform::Win => Request::Start(common),
+            Platform::Mac | Platform::Win => Request::NativeStartBirth(common),
             // linux/未知谱系：带核路径行，且**只能**是 helper 锁定的 coreBin（它会逐字比对）。
             // Android 同臂但不可达：`should_start_via_helper` 对它恒 false（`platform_supported`
             // 同源），Android 起核走的是进程内 libbox（`android_bridge`），根本不建 helper client。
@@ -1040,6 +1047,44 @@ impl HelperRuntime {
             .map_err(|e| format!("helper 起核通信失败：{e}"))?;
         if self.platform == Platform::Linux {
             return classify_linux_birth_start_response(resp);
+        }
+        if matches!(self.platform, Platform::Mac | Platform::Win) {
+            return match resp {
+                Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::Started {
+                    target,
+                    timing,
+                    created,
+                })) => {
+                    if let Some(timing) = timing {
+                        log::info!("helper native core start timing: {timing:?}");
+                    }
+                    self.remember_start_identity(target.pid.get(), created);
+                    Ok(HelperStartResult::BirthStarted(target))
+                }
+                Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::Already {
+                    target,
+                })) => Ok(HelperStartResult::BirthAlready(target)),
+                Response::Ok(ResponseKind::NativeBirthStart(
+                    NativeBirthStart::NotAdmittedPending { target },
+                )) => Ok(HelperStartResult::BirthNotAdmitted {
+                    target: Some(target),
+                    pending: true,
+                }),
+                Response::Ok(ResponseKind::NativeBirthStart(
+                    NativeBirthStart::NotAdmittedUnknown { target },
+                )) => Ok(HelperStartResult::BirthNotAdmitted {
+                    target,
+                    pending: false,
+                }),
+                Response::Ok(other) => Err(format!(
+                    "helper native birth 起核返回非预期响应：{other:?}；请升级或修复 helper"
+                )),
+                Response::Err(error) => Err(format_helper_mutation_error(
+                    self.platform,
+                    "native birth 起核",
+                    &error,
+                )),
+            };
         }
         match resp {
             Response::Ok(ResponseKind::Start(Start::StartedTimed {
@@ -1184,6 +1229,15 @@ impl HelperRuntime {
         require_linux_birth_capability_with_client(&client)
     }
 
+    /// Read-only native capability; called before a Mac/Windows external birth is armed.
+    pub(crate) fn require_native_birth_capability(&self) -> Result<(), String> {
+        if !matches!(self.platform, Platform::Mac | Platform::Win) {
+            return Ok(());
+        }
+        let client = self.build_client()?;
+        require_native_birth_capability_with_client(&client)
+    }
+
     /// **受保护核目录**（三平台的 root/SYSTEM 锁定核目录）。
     ///
     /// 与 helper 安装期烧进描述符的路径同源（[`InstallPaths::for_platform`]）：mac/linux 是
@@ -1264,27 +1318,19 @@ impl HelperRuntime {
         if target.pid() == 0 {
             return Err("helper Stop requires a nonzero PID".to_owned());
         }
-        match (self.platform, target) {
-            (Platform::Linux, HelperStopTarget::Legacy(_)) => {
-                return Err("Linux helper Stop requires an exact birth target".to_owned());
-            }
-            (Platform::Linux, HelperStopTarget::Birth(_)) | (_, HelperStopTarget::Legacy(_)) => {}
-            (_, HelperStopTarget::Birth(_)) => {
-                return Err("exact birth Stop is only available on Linux".to_owned());
-            }
+        if self.platform == Platform::Linux && matches!(target, HelperStopTarget::Legacy(_)) {
+            return Err("Linux helper Stop requires an exact birth target".into());
         }
         self.register_core_mutation()?;
         let client = self.build_client()?;
-        match (self.platform, target) {
-            (Platform::Linux, HelperStopTarget::Birth(target)) => stop_birth_with_client_budget(
+        match target {
+            HelperStopTarget::Birth(target) => stop_birth_with_client_budget(
                 &client,
                 target,
                 HELPER_STOP_TIMEOUT,
                 HELPER_STOP_RETRY_DELAY,
             ),
-            (Platform::Linux, HelperStopTarget::Legacy(_)) => unreachable!("validated above"),
-            (_, HelperStopTarget::Legacy(pid)) => stop_core_with_client(&client, Some(pid)),
-            (_, HelperStopTarget::Birth(_)) => unreachable!("validated above"),
+            HelperStopTarget::Legacy(pid) => stop_core_with_client(&client, Some(pid)),
         }
     }
 
@@ -1408,7 +1454,7 @@ impl HelperRuntime {
                     ok: false,
                     partial: None,
                     error: Some(e),
-                }
+                };
             }
         };
         match client.send_with_timeout(&Request::FlushDns, HELPER_FLUSH_TIMEOUT) {
@@ -1639,9 +1685,16 @@ fn stop_core_with_client_budget(
             Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }))
                 if want_pid.is_none_or(|want| want == pid) =>
             {
-                return Ok(());
+                return Err(format!(
+                    "helper cleanup-unknown: legacy Stop ACK for pid={pid} lacks same-birth native exit proof"
+                ));
             }
-            Response::Ok(ResponseKind::Stop(Stop::NotRunning)) => return Ok(()),
+            Response::Ok(ResponseKind::Stop(Stop::NotRunning)) => {
+                return Err(
+                    "helper cleanup-unknown: legacy notrunning cannot prove this owned birth exited"
+                        .into(),
+                );
+            }
             Response::Ok(ResponseKind::Stop(Stop::Pending { pid }))
                 if want_pid.is_none_or(|want| want == pid) =>
             {
@@ -1678,7 +1731,11 @@ fn stop_birth_with_client_budget(
     let started = std::time::Instant::now();
     let mut transport_retries = 0;
     let mut pending = false;
-    let request = Request::LinuxStopBirth { target };
+    let request = match client.platform() {
+        Platform::Linux => Request::LinuxStopBirth { target },
+        Platform::Mac | Platform::Win => Request::NativeStopBirth { target },
+        _ => return Err("helper exact birth Stop unsupported on this platform".into()),
+    };
     loop {
         let remaining = total_timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -1696,6 +1753,29 @@ fn stop_birth_with_client_budget(
                 continue;
             }
             Err(error) => return Err(format!("helper exact birth 停核通信失败：{error}")),
+        };
+        // Only the platform's exact response family can enter the common local-stop classifier.
+        let response = if matches!(client.platform(), Platform::Mac | Platform::Win) {
+            match response {
+                Response::Ok(ResponseKind::NativeBirthStop(stop)) => {
+                    Response::Ok(ResponseKind::LinuxBirthStop(match stop {
+                        NativeBirthStop::Stopped { target } => LinuxBirthStop::Stopped { target },
+                        NativeBirthStop::Pending { target } => LinuxBirthStop::Pending { target },
+                        NativeBirthStop::Unknown { target } => LinuxBirthStop::Unknown { target },
+                        NativeBirthStop::Mismatch { requested, current } => {
+                            LinuxBirthStop::Mismatch { requested, current }
+                        }
+                    }))
+                }
+                Response::Err(error) => Response::Err(error),
+                Response::Ok(other) => {
+                    return Err(format!(
+                        "helper native birth Stop response family mismatch: {other:?}"
+                    ));
+                }
+            }
+        } else {
+            response
         };
         match response {
             Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
@@ -1743,9 +1823,11 @@ fn format_helper_mutation_error(
     operation: &str,
     error: &polaris_helper_proto::Error,
 ) -> String {
-    if platform == Platform::Linux && error.code == polaris_helper_proto::ErrorCode::Unknown {
+    if matches!(platform, Platform::Linux | Platform::Mac | Platform::Win)
+        && error.code == polaris_helper_proto::ErrorCode::Unknown
+    {
         return format!(
-            "已安装的 Linux helper 不支持物理 reap 安全协议，已拒绝{operation}；请升级或修复 helper"
+            "已安装的 helper 不支持原生 birth 安全协议，已拒绝{operation}；请升级或修复 helper"
         );
     }
     format!("helper {operation}失败：{error}")
@@ -1784,10 +1866,22 @@ fn require_linux_birth_capability_with_client(client: &HelperClient) -> Result<(
     }
 }
 
+fn require_native_birth_capability_with_client(client: &HelperClient) -> Result<(), String> {
+    match client.send_with_timeout(&Request::NativeStatusBirth, Duration::from_millis(1500)) {
+        Ok(Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Empty | NativeBirthStatus::Running { .. }))) => Ok(()),
+        Ok(Response::Ok(ResponseKind::NativeBirthStatus(status))) => Err(format!("helper native birth 起核未获准：既有 custody={status:?}，等待同birth native Stop后重试")),
+        result => Err(format!(
+            "已安装的 helper 未提供 native birth 安全能力；请升级或修复 helper 后重试：{result:?}"
+        )),
+    }
+}
+
 fn managed_core_status_with_client(client: &HelperClient) -> Result<ManagedCoreStatus, String> {
     let response = client
         .send(&if client.platform() == Platform::Linux {
             Request::LinuxStatusBirth
+        } else if matches!(client.platform(), Platform::Mac | Platform::Win) {
+            Request::NativeStatusBirth
         } else {
             Request::Status
         })
@@ -1810,6 +1904,33 @@ fn managed_core_status_with_client(client: &HelperClient) -> Result<ManagedCoreS
             Response::Err(error) => Err(format!("helper exact birth 状态查询失败：{error}")),
         };
     }
+    if matches!(client.platform(), Platform::Mac | Platform::Win) {
+        return match response {
+            Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Running {
+                target,
+                created,
+                image,
+            })) => Ok(ManagedCoreStatus::NativeBirthRunning {
+                target,
+                created,
+                image,
+            }),
+            Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Stopping {
+                target,
+            })) => Ok(ManagedCoreStatus::BirthStopping { target }),
+            Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Unknown {
+                target: Some(target),
+            })) => Ok(ManagedCoreStatus::BirthUnknown { target }),
+            Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Unknown {
+                target: None,
+            })) => Ok(ManagedCoreStatus::BirthUnidentified),
+            Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Empty)) => {
+                Ok(ManagedCoreStatus::BirthEmpty)
+            }
+            other => Err(format!("helper native birth 状态未获有效回执：{other:?}")),
+        };
+    }
+
     match response {
         Response::Ok(ResponseKind::Status(CoreStatus::Running {
             pid,

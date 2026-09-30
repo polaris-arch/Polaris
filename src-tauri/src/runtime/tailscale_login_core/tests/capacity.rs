@@ -55,6 +55,24 @@ async fn default_desktop_checker_preserves_accept_and_reject_without_classifying
         Err(CheckFailure::Rejected(message)) => assert_eq!(message, "fake check 判定配置无效"),
         other => panic!("desktop fallback changed: {other:?}"),
     }
+    assert!(FakeChecker { ok: true }
+        .check_for_spawn(path, path)
+        .await
+        .is_ok());
+    match (FakeChecker { ok: false })
+        .check_for_spawn(path, path)
+        .await
+    {
+        Err(ConfigCheckFailure::Rejected(message)) => {
+            assert_eq!(message, "fake check 判定配置无效")
+        }
+        other => panic!("spawn checker diagnostics changed: {other:?}"),
+    }
+    let admitted: &dyn ConfigChecker = &CapacityChecker;
+    assert!(matches!(
+        admitted.check_for_spawn(path, path).await,
+        Err(ConfigCheckFailure::AndroidCapacityClosed(CapacityClosed))
+    ));
 }
 
 #[tokio::test]

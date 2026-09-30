@@ -80,6 +80,7 @@
     "errRecheckFailed": "Не удалось проверить обновления"
   },
   "native": {
+    "exitBlocked": "Закрытие фоновых соединений не подтверждено. Polaris продолжает работать; повторите выход.",
     "backupExportTitle": "Экспорт резервной копии настроек Polaris",
     "backupImportTitle": "Импорт резервной копии настроек Polaris",
     "backupFileType": "Файл резервной копии Polaris",

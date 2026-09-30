@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(target_os = "android"))]
+mod pc_custody;
 use crate::test_support::{crate_code, flooding_stderr, module_code};
 // 生产侧的 `TEMP_CORE_BATCH_WINDOW_OVERHEAD_MS` 是字面量（跨语言那道门要读得出来），它与
 // `sing-box check` 硬超时的关系由本模块的门断言 —— 故这个常量只在测试侧引。
@@ -1569,6 +1571,15 @@ impl LoginCoreChild for FakeChild {
     async fn terminate(&mut self) {
         self.terminated.fetch_add(1, Ordering::SeqCst);
     }
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        let before = self.terminated.load(Ordering::SeqCst);
+        self.terminate().await;
+        if self.terminated.load(Ordering::SeqCst) > before {
+            Ok(())
+        } else {
+            Err("fixture cleanup was not observed".into())
+        }
+    }
 }
 
 struct FakeSpawner {
@@ -1813,6 +1824,8 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
     let (stderr_tx, stderr_rx) = tokio::sync::watch::channel(0usize);
     Harness {
         deps: TempCoreDeps {
+            #[cfg(not(target_os = "android"))]
+            pc_custody: Arc::new(PcTempCoreCustody::default()),
             spawner: Arc::new(FakeSpawner {
                 terminated: Arc::clone(&terminated),
                 spawns: Arc::clone(&spawns),
@@ -2150,6 +2163,7 @@ async fn session_registers_inflight_pid_so_app_exit_cleanup_can_reach_it() {
 /// 收割动作经注入闭包 ⇒ 零真实信号。假 pid 取 `> i32::MAX`：即便有人把它接到真 `send_signal` 上，
 /// `checked_pid` 也会挡掉（负数 pid 是 kill 的**广播**语义 —— 那是全场 SIGKILL）。
 #[test]
+#[cfg(target_os = "android")]
 fn kill_inflight_temp_cores_drains_table_once_and_counts_each_pid() {
     let _lock = registry_guard();
     let fake: u32 = 0xDEAD_BEEF;
@@ -2164,21 +2178,31 @@ fn kill_inflight_temp_cores_drains_table_once_and_counts_each_pid() {
     assert!(again.is_empty());
 }
 
-/// 🔵 **调用点守卫**：退出生命周期 owner 必须真的调 [`kill_inflight_temp_cores`]。
-///
-/// 没有这条，「登记了 pid」与「退出时会被杀」之间是断的，而断了的表现**恰好是静默的**：
-/// 用户看不到孤儿核，只在下次起核时莫名 address-in-use（Windows 连那次兜底都没有）。
-/// 牙：把 `exit_lifecycle::run_exit_cleanup` 里那行删掉 / 挪出该函数 → 转红。
+/// Desktop exit must fence admission and await the retained exact Child through its gate.
 #[test]
-fn app_exit_cleanup_kills_inflight_temp_cores() {
-    let body = crate::commands::guard_scan::top_level_fn_body(
-        &crate_code("exit_lifecycle.rs"),
-        "fn run_exit_cleanup(",
+#[cfg(not(target_os = "android"))]
+fn app_exit_gate_fences_and_drains_exact_temp_custody() {
+    let source = crate_code("exit_lifecycle.rs");
+    let implementation = source
+        .split_once("impl ExitPorts for DesktopExitPorts {")
+        .expect("desktop production exit ports")
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    let fence = crate::commands::guard_scan::impl_method_body(
+        implementation,
+        "    fn fence_temp(&self) -> Result<(), String> {",
     );
-    assert!(
-            body.contains("kill_inflight_temp_cores()"),
-            "退出清理必须收掉在飞测速临时核：它不在 ProxyRuntime 的任何生命周期槽里，proxy.stop() 碰不到它"
-        );
+    let drain = crate::commands::guard_scan::impl_method_body(
+        implementation,
+        "    async fn drain_temp(&self) -> Result<(), String> {",
+    );
+    assert!(fence.contains("speedtest::begin_shutdown()"));
+    assert!(drain.contains("speedtest::shutdown_for_exit().await"));
+    let gate = crate::commands::guard_scan::top_level_fn_body(&source, "fn fence_all(");
+    assert!(gate.contains("ports.fence_temp()"));
+    assert!(source.contains("ports.drain_temp()"));
 }
 
 // ══════════════════════════════════════════════════════════════════════════

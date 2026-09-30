@@ -426,6 +426,74 @@ impl ProxyRuntime {
         sleep_unless_superseded_on(&self.gate, &self.gen_changed, my_gen, dur).await
     }
 
+    /// Permanently fence this desktop runtime's new writer admission before any exit wait.
+    pub(crate) fn begin_shutdown(&self) -> Result<(), String> {
+        let mut crash = self.crash_lock();
+        let mut closing = self
+            .desktop_shutdown
+            .lock()
+            .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
+        if !*closing {
+            *closing = true;
+            self.claim_generation(None, LifecycleKind::Stop)
+                .expect("unconditional exit fence");
+            crash.mark_user_aborted();
+        }
+        Ok(())
+    }
+
+    /// Drain only this runtime's owned writers. Unknown custody remains retryable.
+    /// Ordinary stop's superseded Ok(None) never authorizes process exit.
+    pub(crate) async fn shutdown_for_exit(self: &Arc<Self>) -> Result<(), String> {
+        self.begin_shutdown()?;
+        let generation = {
+            let mut crash = self.crash_lock();
+            let closing = self
+                .desktop_shutdown
+                .lock()
+                .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
+            if !*closing {
+                return Err("proxy shutdown admission is open".into());
+            }
+            let generation = self
+                .claim_generation(None, LifecycleKind::Stop)
+                .expect("unconditional exit drain");
+            crash.mark_user_aborted();
+            generation
+        };
+        let state_gate = self.mesh.tailscale_state_gate().await;
+        let drained = self.stop_inner_under_gate(generation, &state_gate).await?;
+        if drained != Some(generation) {
+            return Err("proxy exit drain was superseded".into());
+        }
+        {
+            let closing = self
+                .desktop_shutdown
+                .lock()
+                .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
+            let slot = self
+                .child
+                .lock()
+                .map_err(|_| "proxy Child custody poisoned at exit".to_owned())?;
+            let pid = self
+                .pid
+                .lock()
+                .map_err(|_| "proxy PID bookkeeping poisoned at exit".to_owned())?;
+            if !*closing
+                || !slot.is_empty()
+                || slot.has_helper_start()
+                || pid.is_some()
+                || self.start_inflight.load(Ordering::SeqCst) != 0
+            {
+                return Err("proxy exit drain retains an owned or in-flight writer".into());
+            }
+            self.mesh
+                .assert_tailscale_main_claims_drained(&state_gate)?;
+        }
+        self.clear_system_proxy().await;
+        Ok(())
+    }
+
     /// 启动 sing-box（上游 `proxy:start`）。
     ///
     /// 语义对齐 上游 ProxyManager.start：
@@ -450,6 +518,25 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
     ) -> StartLeg {
+        if !cfg!(target_os = "android") {
+            match self.desktop_shutdown.lock() {
+                Ok(closing) if *closing => {
+                    return StartLeg::Finished(
+                        Err(StartError::from("proxy is shutting down".to_owned())),
+                        None,
+                    )
+                }
+                Err(_) => {
+                    return StartLeg::Finished(
+                        Err(StartError::from(
+                            "proxy shutdown admission poisoned".to_owned(),
+                        )),
+                        None,
+                    )
+                }
+                _ => {}
+            }
+        }
         // A reaped exact helper birth may start another helper birth in this
         // runtime. The sticky helper route still forbids a direct/no-owner
         // transition. Invalid configs receive their normal later error unless
@@ -481,7 +568,24 @@ impl ProxyRuntime {
                 }
             } else {
                 let mut crash = self.crash_lock();
-                // Keep crash→Child lock order (also used by recovery). The Child
+                let closing = match self.desktop_shutdown.lock() {
+                    Ok(closing) => closing,
+                    Err(_) => {
+                        return StartLeg::Finished(
+                            Err(StartError::from(
+                                "proxy shutdown admission poisoned".to_owned(),
+                            )),
+                            None,
+                        )
+                    }
+                };
+                if *closing {
+                    return StartLeg::Finished(
+                        Err(StartError::from("proxy is shutting down".to_owned())),
+                        None,
+                    );
+                }
+                // Keep crash→admission→Child lock order (also used by recovery). The Child
                 // guard spans admission and publication: an older start either
                 // installs first and we reject, or sees our new generation before
                 // it can install. No await occurs while either lock is held.
@@ -581,6 +685,24 @@ impl ProxyRuntime {
             }
             generation
         } else {
+            let _crash = self.crash_lock();
+            let closing = match self.desktop_shutdown.lock() {
+                Ok(closing) => closing,
+                Err(_) => {
+                    return StartLeg::Finished(
+                        Err(StartError::from(
+                            "proxy shutdown admission poisoned".to_owned(),
+                        )),
+                        None,
+                    )
+                }
+            };
+            if *closing {
+                return StartLeg::Finished(
+                    Err(StartError::from("proxy is shutting down".to_owned())),
+                    None,
+                );
+            }
             let Some(generation) =
                 self.claim_generation(Some(requested_generation), LifecycleKind::Start)
             else {
@@ -922,6 +1044,25 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
     ) -> RestartLeg {
+        if !cfg!(target_os = "android") {
+            match self.desktop_shutdown.lock() {
+                Ok(closing) if *closing => {
+                    return RestartLeg::Finished(
+                        Err(StartError::from("proxy is shutting down".to_owned())),
+                        None,
+                    )
+                }
+                Err(_) => {
+                    return RestartLeg::Finished(
+                        Err(StartError::from(
+                            "proxy shutdown admission poisoned".to_owned(),
+                        )),
+                        None,
+                    )
+                }
+                _ => {}
+            }
+        }
         if expected_generation.is_some_and(|expected| self.gate.generation() != expected) {
             return RestartLeg::Superseded;
         }
@@ -1006,6 +1147,45 @@ impl ProxyRuntime {
             };
             return RestartLeg::Finished(Err(error), generation);
         }
+        // A restart checked before exit admission closed must not claim a later Stop
+        // generation. Publish its claim under the same crash→admission locks as exit.
+        let claim = if cfg!(target_os = "android") {
+            claim
+        } else {
+            let _crash = self.crash_lock();
+            let closing = match self.desktop_shutdown.lock() {
+                Ok(closing) => closing,
+                Err(_) => {
+                    return RestartLeg::Finished(
+                        Err(StartError::from(
+                            "proxy shutdown admission poisoned".to_owned(),
+                        )),
+                        None,
+                    )
+                }
+            };
+            let owned = match &claim {
+                StopClaim::AlreadyClaimed(generation)
+                | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
+                StopClaim::Request(_) => None,
+            };
+            if *closing {
+                return RestartLeg::Finished(
+                    Err(StartError::from("proxy is shutting down".to_owned())),
+                    owned,
+                );
+            }
+            match claim {
+                StopClaim::Request(expected) => {
+                    let Some(generation) = self.claim_generation(expected, LifecycleKind::Stop)
+                    else {
+                        return RestartLeg::Superseded;
+                    };
+                    StopClaim::AlreadyClaimed(generation)
+                }
+                claimed => claimed,
+            }
+        };
         // 旧接管模式以就绪时的 startup_snapshot 为准，须在 stop_inner 清快照之前取。
         // 去抖重启的目标配置由调用方传入（timer 从最新 D/显式 force 快照取），不是旧核快照。
         let old_mode = self
@@ -1195,7 +1375,8 @@ impl ProxyRuntime {
                 });
     }
 
-    /// Lock order: selector intent → force snapshot → lifecycle gate. The selector mutex also
+    /// Lock order: desktop admission → selector intent → force snapshot → lifecycle gate.
+    /// The selector mutex also
     /// serializes a new selection's publication, so a selected-only restart cannot claim stale
     /// intent and then stop the core after a newer selection has taken ownership.
     pub(super) fn claim_debounced_restart(
@@ -1204,6 +1385,17 @@ impl ProxyRuntime {
         scheduled_generation: u64,
         ticket: u64,
     ) -> Option<(Option<Value>, u64, Option<LegacyStartLease>)> {
+        // Keep exit admission and the generation claim indivisible. A late timer must
+        // never supersede the shutdown generation, even if it passed an earlier check.
+        let _admission = if cfg!(target_os = "android") {
+            None
+        } else {
+            let closing = self.desktop_shutdown.lock().ok()?;
+            if *closing {
+                return None;
+            }
+            Some(closing)
+        };
         // This check precedes try_begin_restart: a denied timer must not bump
         // the generation and silently retire the current monitor/report.
         let legacy_lease = match self.lease_legacy_start() {

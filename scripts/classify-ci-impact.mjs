@@ -951,6 +951,8 @@ const SHARED_PACKAGE_PATHS = new Set([
   'scripts/classify-ci-impact.mjs',
   'scripts/classify-ci-impact.test.mjs',
   'scripts/gate-node-test.sh',
+  'scripts/assert-pc-runtime-release.mjs',
+  'scripts/assert-pc-runtime-release.test.mjs',
   'scripts/fetch-dashboard.mjs',
   // package.yml 的 `Install protoc` 步骤真跑它（钉扎常量与版本依据的唯一真值）；
   // 它挂了整条打包链就编不出 singbox-grpc。2026-08-30 前它不在任何表里 = 同一 fail-open。

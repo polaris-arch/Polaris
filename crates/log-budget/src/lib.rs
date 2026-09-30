@@ -161,6 +161,25 @@ impl PipeLogWriter {
     }
 }
 
+/// Exact managed writer custody. Revocation waits only for an in-progress file write;
+/// readers may remain alive to drain inherited pipes but can never write after it succeeds.
+/// This is a writer-local fact, not a Child exit or platform ownership receipt.
+#[derive(Debug)]
+pub struct PipeLogCustody {
+    writer: Arc<Mutex<Option<PipeLogWriter>>>,
+}
+
+impl PipeLogCustody {
+    pub fn revoke(&self) -> std::io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("pipe log writer custody unavailable"))?;
+        *writer = None;
+        Ok(())
+    }
+}
+
 impl RotatingFile {
     /// 打开一个有界 writer。
     ///
@@ -296,11 +315,30 @@ pub fn spawn_pipe_loggers_with_preopened_files<O, E>(
     O: Read + Send + 'static,
     E: Read + Send + 'static,
 {
+    // Compatibility callers retain their original fire-and-drain behavior. Dropping the
+    // returned capability does not revoke the readers' writer or attest any exit fact.
+    let _ =
+        spawn_pipe_loggers_with_preopened_files_custodied(stdout, stderr, files, generation_bytes);
+}
+
+/// Initialize this birth's session synchronously before admission can be released. Keep
+/// the returned capability with the original Child and revoke it before retiring that birth.
+pub fn spawn_pipe_loggers_with_preopened_files_custodied<O, E>(
+    stdout: Option<O>,
+    stderr: Option<E>,
+    files: PreopenedLogFiles,
+    generation_bytes: u64,
+) -> PipeLogCustody
+where
+    O: Read + Send + 'static,
+    E: Read + Send + 'static,
+{
     let writer = PreopenedRotatingFile::open(files, generation_bytes, OpenMode::Fresh)
         .map(PipeLogWriter::Preopened)
         .ok();
     let shared = Arc::new(Mutex::new(writer));
-    spawn_pipe_readers(stdout, stderr, shared);
+    spawn_pipe_readers(stdout, stderr, Arc::clone(&shared));
+    PipeLogCustody { writer: shared }
 }
 
 /// 日志对象无法安全打开时仍持续排空 child stdout/stderr，避免 pipe buffer 反压卡死 child。
@@ -309,7 +347,19 @@ where
     O: Read + Send + 'static,
     E: Read + Send + 'static,
 {
-    spawn_pipe_readers(stdout, stderr, Arc::new(Mutex::new(None)));
+    let _ = spawn_pipe_drainers_custodied(stdout, stderr);
+}
+
+/// No managed writer was opened. The receipt has the same revocation contract without
+/// waiting for EOF; it says nothing about the process or other filesystem writers.
+pub fn spawn_pipe_drainers_custodied<O, E>(stdout: Option<O>, stderr: Option<E>) -> PipeLogCustody
+where
+    O: Read + Send + 'static,
+    E: Read + Send + 'static,
+{
+    let shared = Arc::new(Mutex::new(None));
+    spawn_pipe_readers(stdout, stderr, Arc::clone(&shared));
+    PipeLogCustody { writer: shared }
 }
 
 fn spawn_pipe_readers<O, E>(

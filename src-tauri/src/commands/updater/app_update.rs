@@ -12,7 +12,6 @@ use super::{fetch_releases_json, updater_downloader};
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::update_popup::{close_update_popup, show_update_popup};
 use crate::runtime::{update_install, AppRuntime};
-use crate::startup::QuitState;
 use polaris_updater::github::{
     check_app_update, check_app_update_release_only, resolve_current_app_release, strip_v,
     AppUpdateCheck, AssetArch, AssetPlatform, APP_UPDATE_REPO,
@@ -469,29 +468,14 @@ pub(crate) fn is_portable_layout(exe_path: &std::path::Path) -> bool {
         .is_some_and(|dir| dir.join(PORTABLE_MARKER).is_file())
 }
 
-/// 已成功 detached 的安装脚本之后，才允许把退出交给调用方。
-///
-/// 错误原样交回且不触碰任何副作用；成功路径固定为先标记显式退出、再退出进程。把顺序收进
-/// 这一个可注入控制流点，避免 command 侧的早退分支日后意外越过 spawn 预先置位。
+/// 已成功 detached 的安装脚本才可消费 Ready 并提交退出；spawn 失败保留准备态供重试。
 pub(super) fn complete_detached_install<T, E>(
     detached_spawn: Result<T, E>,
-    mark_quit: impl FnOnce(),
-    exit: impl FnOnce(),
+    commit: impl FnOnce() -> Result<(), E>,
 ) -> Result<T, E> {
     let detached = detached_spawn?;
-    mark_quit();
-    exit();
+    commit()?;
     Ok(detached)
-}
-
-fn mark_explicit_update_quit(app: &AppHandle) {
-    app.state::<QuitState>()
-        .0
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-fn exit_after_detached_update(app: &AppHandle) {
-    app.exit(0);
 }
 
 /// 「只比版本、不选资产」那条腿的**回包**（两个调用点共用）。
@@ -1540,7 +1524,7 @@ pub async fn update_download(
 #[tauri::command]
 pub async fn update_install(
     app: AppHandle,
-    state: State<'_, AppRuntime>,
+    _state: State<'_, AppRuntime>,
     file_path: String,
     confirmed: Option<bool>,
 ) -> Result<ApiResponse<Value>, ()> {
@@ -1656,14 +1640,17 @@ pub async fn update_install(
         )));
     };
 
-    // ── 停代理（必须在写脚本/退出**之前**：Windows 上核进程占着文件会让替换失败）。
-    let proxy = state.proxy.clone();
-    if proxy.status().running {
-        if let Err(e) = proxy.stop().await {
-            // 停不掉就**不装**（带着跑着的核去替换应用本体 = 半死不活的坏态），如实报错。
-            return Ok(ApiResponse::err(format!("安装前停止代理失败: {e}")));
+    // 所有 Start admission 同步关闭，主核/登录核/测速核/check 全部确认收口，才能启动安装脚本。
+    // 不用 status.running 作为捷径：起核中、Unknown 与独立临时 owner 都必须经过同一准备门。
+    let ready = match crate::exit_lifecycle::prepare_desktop_exit(&app).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            log::error!("安装前退出准备失败: {error}");
+            return Ok(ApiResponse::err(
+                "后台连接尚未确认关闭，应用保持运行，请重试安装",
+            ));
         }
-    }
+    };
 
     let dir = app
         .path()
@@ -1674,11 +1661,13 @@ pub async fn update_install(
     if detached_spawn.is_ok() {
         log::info!("安装脚本已起（{:?}），应用即将退出", plan.platform);
     }
-    if let Err(e) = complete_detached_install(
-        detached_spawn,
-        || mark_explicit_update_quit(&app),
-        || exit_after_detached_update(&app),
-    ) {
+    if let Err(e) = complete_detached_install(detached_spawn, || {
+        crate::exit_lifecycle::commit_desktop_exit(
+            &app,
+            ready,
+            crate::exit_lifecycle::ExitKind::Quit,
+        )
+    }) {
         return Ok(ApiResponse::err(format!("启动安装脚本失败: {e}")));
     }
     Ok(ApiResponse::ok(json!({ "ok": true, "success": true })))

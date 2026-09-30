@@ -1,6 +1,8 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod custody;
+
 static PREOPENED_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_dir(label: &str) -> PathBuf {

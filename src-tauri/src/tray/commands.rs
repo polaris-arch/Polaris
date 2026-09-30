@@ -9,8 +9,6 @@
 //! `tray::__tauri_command_name_*` 两个包装宏（`tauri-macros` 的 `Handler::parse` 只替换路径末段），
 //! 故 façade 必须整体 `pub use commands::*;` 把它们一并再导出——invoke_handler 里的路径因此零改动。
 
-use std::sync::atomic::Ordering;
-
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
@@ -261,15 +259,16 @@ pub async fn tray_check_update(app: AppHandle) -> ApiResponse<bool> {
     }
 }
 
-/// 退出 Polaris：置 `QuitState`（放行 `CloseRequested`，不被 close-to-tray 卡）+ `app.exit(0)`。
-/// 与 `lib.rs` 托盘原生菜单「退出」/ 应用菜单 ⌘Q 逐字节相同的退出路径。
+/// 退出 Polaris：与原生菜单共用可重试准备门，失败通过 IPC 回包且保留运行时。
 #[tauri::command]
-pub fn tray_quit(app: AppHandle) -> ApiResponse<()> {
-    app.state::<crate::QuitState>()
-        .0
-        .store(true, Ordering::SeqCst);
-    app.exit(0);
-    ok_void()
+pub async fn tray_quit(app: AppHandle) -> ApiResponse<()> {
+    match crate::exit_lifecycle::request_quit(&app).await {
+        Ok(()) => ok_void(),
+        Err(error) => {
+            log::error!("托盘退出准备失败: {error}");
+            ApiResponse::err("后台连接尚未确认关闭，应用保持运行，请重试退出")
+        }
+    }
 }
 
 /// C16 进入轻量模式（command 壳）：**只做排队，不做转场**。

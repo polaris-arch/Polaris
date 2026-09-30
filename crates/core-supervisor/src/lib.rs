@@ -27,8 +27,10 @@ pub mod spawner;
 pub mod stale_core;
 
 pub use config_gate::{
-    decide_peel, parse_kernel_rejection, run_check_raw, run_config_check, run_config_check_within,
-    ConfigCheckVerdict, KernelRejection, PeelStep, RawCheck, RejectedArray, CONFIG_CHECK_TIMEOUT,
+    assert_check_admission, begin_check_shutdown, decide_peel, parse_kernel_rejection,
+    run_check_raw, run_config_check, run_config_check_within, settle_check_cleanup,
+    shutdown_checks_for_exit, with_check_admission, ConfigCheckVerdict, KernelRejection, PeelStep,
+    RawCheck, RejectedArray, ValidationLifecycleError, CONFIG_CHECK_TIMEOUT,
     INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
 };
 pub use crash_recovery::{

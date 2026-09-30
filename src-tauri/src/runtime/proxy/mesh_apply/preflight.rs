@@ -11,7 +11,7 @@ use super::closure::ValidatedClosure;
 use crate::runtime::proxy::mesh_apply::plan_digest;
 use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
 use polaris_config_engine::singbox::SingBoxConfig;
-use polaris_core_supervisor::{run_config_check, ConfigCheckVerdict};
+use polaris_core_supervisor::{run_config_check, ConfigCheckVerdict, ValidationLifecycleError};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::future::Future;
@@ -26,6 +26,7 @@ pub(crate) enum PreflightError {
     CoreRejected,
     CoreUnattributable,
     CoreUnavailable,
+    ValidationLifecycle(ValidationLifecycleError),
     CandidateMismatch,
     InvalidConfig,
 }
@@ -164,7 +165,7 @@ pub(super) async fn checked_stage_with<F, Fut, G>(
 ) -> Result<StagedArtifacts, PreflightError>
 where
     F: FnOnce(PathBuf) -> Fut,
-    Fut: Future<Output = ConfigCheckVerdict>,
+    Fut: Future<Output = Result<ConfigCheckVerdict, ValidationLifecycleError>>,
     G: FnOnce() -> Result<(), PreflightError>,
 {
     if plan_digest(plan).map_err(|_| PreflightError::ClosureChanged)? != closure.plan_digest {
@@ -178,7 +179,10 @@ where
         generator_version,
     )?;
     compare_closure(&closure, plan, &pending)?;
-    match check(pending.config_path.clone()).await {
+    match check(pending.config_path.clone())
+        .await
+        .map_err(PreflightError::ValidationLifecycle)?
+    {
         ConfigCheckVerdict::Accepted => {}
         ConfigCheckVerdict::Rejected(_) => return Err(PreflightError::CoreRejected),
         ConfigCheckVerdict::Unattributable(_) => return Err(PreflightError::CoreUnattributable),

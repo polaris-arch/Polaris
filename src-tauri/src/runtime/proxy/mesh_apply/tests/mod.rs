@@ -383,8 +383,8 @@ async fn stop_receipt_requires_same_live_child_and_current_journal() {
         record_stop_intent(&reserved, &reserved.revision).unwrap(),
     );
     assert!(!receipt.matches_current_direct_run(&mgr, &newer, &frozen, Some(&old)));
-    old.child.kill().await.unwrap();
-    replacement.child.kill().await.unwrap();
+    old.child_for_test().kill().await.unwrap();
+    replacement.child_for_test().kill().await.unwrap();
 }
 
 #[test]

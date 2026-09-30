@@ -339,6 +339,7 @@ pub fn t(lang: Lang, key: &str) -> String {
 /// 本模块内每一条 `pub const` 都被 `every_declared_key_resolves_in_all_five_locales` 逐个查表
 /// 验证（五语种齐备），反向由 `every_native_key_in_locale_is_declared_here` 查死键。
 pub mod key {
+    pub const NATIVE_EXIT_BLOCKED: &str = "native.exitBlocked";
     // ── 托盘原生菜单（与浮层共用）──
     /// 「连接代理」。
     pub const TRAY_CONNECT: &str = "tray.connect";

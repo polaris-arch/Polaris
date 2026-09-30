@@ -67,6 +67,13 @@ request_samples! {
             "4242", "00112233445566778899aabbccddeeff"
         ).unwrap(),
     },
+    NativeStartBirth => Request::NativeStartBirth(StartParams {
+        cfg: r"C:\Users\polaris\config\config.json".to_owned(), log: String::new(), fwd: false, parent_pid: None,
+    }),
+    NativeStatusBirth => Request::NativeStatusBirth,
+    NativeStopBirth => Request::NativeStopBirth {
+        target: polaris_helper_proto::HelperBirthTarget::parse_wire("4242", "00112233445566778899aabbccddeeff").unwrap(),
+    },
     RouteAdd => Request::RouteAdd(RouteParams {
         iface: "polaris-tun0".to_owned(),
         cidrs: vec!["10.0.0.0/8".to_owned(), "fd00::/8".to_owned()],

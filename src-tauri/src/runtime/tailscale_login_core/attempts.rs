@@ -109,6 +109,26 @@ struct AttemptState {
 pub(super) struct Attempts(Mutex<AttemptState>);
 
 impl Attempts {
+    /// Shutdown first closes admission independently of this lock. Poison can still notify
+    /// existing requests, but cannot certify a drained table in the checked async path.
+    pub fn cancel_all(&self) {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for attempt in state.entries.values() {
+            attempt.cancel();
+            if !attempt.claimed.load(Ordering::SeqCst) {
+                attempt.finish();
+            }
+        }
+    }
+
+    pub fn shutdown_snapshot(&self) -> Result<Vec<Arc<Attempt>>, String> {
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| "登录请求关闭状态不可用".to_owned())?;
+        Ok(state.entries.values().cloned().collect())
+    }
+
     pub fn progress(&self, server_id: &str, id: &str) -> Option<LoginProgressReceipt> {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         state

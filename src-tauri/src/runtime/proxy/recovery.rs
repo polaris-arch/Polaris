@@ -255,6 +255,32 @@ impl ProxyRuntime {
                                             );
                                             ChildObservation::Exited
                                         }
+                                        Ok(Ok(ManagedCoreStatus::NativeBirthRunning {
+                                            target,
+                                            created,
+                                            ..
+                                        })) => {
+                                            let same_birth = match me.child.lock() {
+                                                Ok(child) => child.helper_stop_target().is_some_and(|(_, recorded)| recorded == crate::runtime::helper::HelperStopTarget::Birth(target)),
+                                                Err(_) => true,
+                                            };
+                                            let token = helper_identity_token(created);
+                                            let verdict = pid_identity_verdict(
+                                                helper_identity
+                                                    .as_ref()
+                                                    .filter(|(base_pid, _)| *base_pid == p)
+                                                    .map(|(_, t)| t.as_str()),
+                                                token.as_deref(),
+                                            );
+                                            if let Some(token) = token {
+                                                helper_identity = Some((p, token));
+                                            }
+                                            if same_birth && verdict != PidIdentity::Mismatch {
+                                                ChildObservation::Alive
+                                            } else {
+                                                ChildObservation::Exited
+                                            }
+                                        }
                                         Ok(Ok(ManagedCoreStatus::BirthRunning { target })) => {
                                             let same_birth = match me.child.lock() {
                                                 Ok(child) => child.helper_stop_target().is_some_and(
@@ -277,7 +303,8 @@ impl ProxyRuntime {
                                         Ok(Ok(
                                             ManagedCoreStatus::BirthStopping { .. }
                                             | ManagedCoreStatus::BirthUnknown { .. }
-                                            | ManagedCoreStatus::BirthEmpty,
+                                            | ManagedCoreStatus::BirthEmpty
+                                            | ManagedCoreStatus::BirthUnidentified,
                                         )) => ChildObservation::Alive,
                                         Ok(Err(error)) => {
                                             if ticks == 1
@@ -372,7 +399,7 @@ impl ProxyRuntime {
                 .child
                 .lock()
                 .ok()
-                .is_some_and(|slot| slot.running_matches(expected))
+                .is_some_and(|mut slot| slot.running_exit_proven(expected))
         }) || (direct_run_identity.is_none() && self.gate.generation() != my_gen)
         {
             return None;

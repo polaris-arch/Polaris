@@ -14,6 +14,7 @@
 //! Linux 嵌入式标题栏自绘 min/max/close；Mac 原生红绿灯 / Win titleBarOverlay 系统按钮无需。
 //! 最大化态变更广播 event:windowMaximizeChanged（标题栏跟随）。
 
+#[cfg(target_os = "android")]
 use std::sync::atomic::Ordering;
 
 use serde_json::json;
@@ -100,54 +101,40 @@ pub fn window_is_maximized(window: WebviewWindow) -> ApiResponse<bool> {
     ApiResponse::ok(window.is_maximized().unwrap_or(false))
 }
 
-/// `app:restart` —— 重启 Polaris 本体（U-7「第三类重启」：改了**进程启动期才读**的设置后，
-/// 用户在弹窗里点「立即重启」才走到这里）。
-///
-/// # 为什么是 `request_restart()` 而不是 `AppHandle::restart()`
-///
-/// `restart()` 在**主线程**上调用会**跳过** `RunEvent::ExitRequested` / `Exit`
-/// （tauri 2.11.5 `app.rs:588-592`：主线程分支直接 `cleanup_before_exit()` + `process::restart()`；
-/// 该函数只清 tray icon / resources table，**不碰任何子进程**）。而本仓**唯一的停核腿**挂在
-/// `ExitRequested`（`exit_lifecycle::run_exit_cleanup` → `proxy.stop()` + 清系统代理 + 收在飞测速临时核）。
-/// 跳过它 = sing-box 子进程活着进入新进程的生命周期：**孤儿核占住 mixedPort/TUN**，
-/// 且系统代理仍指向一个不再归本应用管的核 —— 新进程起核必撞端口，用户全网走一个没人能停的代理。
-/// `request_restart()`（`app.rs:615`）不分线程，恒走 `ExitRequested` → `Exit` 事件腿，故用它。
-///
-/// # 为什么必须先置 `QuitState`
-///
-/// `lib.rs` 的 `ExitRequested` arm 有 C16 轻量模式守卫：`lightweight && !quitting && 托盘在`
-/// → `api.prevent_exit()` + **早退，不跑停核清理**。而 tauri 对 `RESTART_EXIT_CODE` 的
-/// `prevent_exit` 是**空操作**（`app.rs:89-93`：`if self.code != Some(RESTART_EXIT_CODE)`）
-/// ⇒ 走到那条早退分支时，应用照样重启、核却没停 = 上面那个孤儿态。置 `QuitState` 让 `!quitting`
-/// 落空 → 恒落到 `run_exit_cleanup`，把这条缝堵死。（顺带对齐 `tray_quit`：任何经窗口关闭的
-/// 退出路径都不被 `prevent_close` 卡住。）
-///
-/// # 为什么还要置 `RestartState`（Q1-b ④）
-///
-/// 上面那个 `QuitState` 让本路径与**真退出**在 `ExitRequested` 里完全同形，而退出腿会在那儿落
-/// 「用户主动结束了这次使用」的标记、下次启动据此清掉暂存的编辑。重启不是那件事：用户几秒内就
-/// 回来、心智完全连续（本命令的主要用途正是 U-7「改了 hardwareAcceleration，重启生效」），
-/// 在这条路径上清 staged = App 自己吃掉了用户的工作（NFR-1）。
-/// 判据只有发起方知道 —— 从「`QuitState` 是谁置的」反推是把两个语义压进一个布尔。
-/// 必须在 `request_restart()` **之前**置：之后置就再也执行不到了。见 [`crate::clean_exit`]。
-///
-/// **用户可见后果**：重启连同内核一起停 ⇒ **代理会断开**，重启后按「启动时自动连接」恢复。
-/// 这一条必须在弹窗文案里如实写明（见 `settings.restartApp.proxyNote`），不许让用户在断网后才发现。
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "Tauri IPC command owns its deserialized payload across the call"
-)]
+/// `app:restart`：必须先确认所有本地 owner 已关闭，才设置重启意图并 request_restart。
+/// Tauri 的 RESTART_EXIT_CODE 忽略 prevent_exit，故不能把准备工作留给 ExitRequested。
+/// 准备失败不置 QuitState/RestartState；本地 custody 留在原进程，用户可重试。
 #[tauri::command]
-pub fn app_restart(app: AppHandle) -> ApiResponse<()> {
-    app.state::<crate::QuitState>()
-        .0
-        .store(true, Ordering::SeqCst);
-    app.state::<crate::RestartState>()
-        .0
-        .store(true, Ordering::SeqCst);
-    log::info!("app:restart —— 用户确认重启应用（经 ExitRequested 停核 + 清系统代理后重启）");
-    app.request_restart();
-    ok_void()
+pub async fn app_restart(app: AppHandle) -> ApiResponse<()> {
+    #[cfg(not(target_os = "android"))]
+    {
+        let ready = match crate::exit_lifecycle::prepare_desktop_exit(&app).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                log::error!("重启前退出准备失败: {error}");
+                return ApiResponse::err("后台连接尚未确认关闭，应用保持运行，请重试重启");
+            }
+        };
+        match crate::exit_lifecycle::commit_desktop_exit(
+            &app,
+            ready,
+            crate::exit_lifecycle::ExitKind::Restart,
+        ) {
+            Ok(()) => ok_void(),
+            Err(error) => ApiResponse::err(error),
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        app.state::<crate::QuitState>()
+            .0
+            .store(true, Ordering::SeqCst);
+        app.state::<crate::RestartState>()
+            .0
+            .store(true, Ordering::SeqCst);
+        app.request_restart();
+        ok_void()
+    }
 }
 
 /// `app:startupConfigFlags`：本次进程**启动时**读到的「需重启 App 才生效」三键的生效值（U-7 判据基线）。

@@ -1,10 +1,12 @@
 //! Dormant exact-stop worker for a locally owned desktop Child. Only tests can
 //! commit its prepared worker; no production stop or Apply path reaches it.
 
+use std::future::Future;
 use std::io;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tokio::process::Child;
@@ -33,9 +35,33 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(in crate::runtime::proxy) trait DirectStopIo: Send + Sync {
     fn try_wait(&self, child: &mut Child) -> io::Result<Option<ExitStatus>>;
     fn start_kill(&self, child: &mut Child) -> io::Result<()>;
+
+    fn poll_wait(&self, child: &mut Child, cx: &mut Context<'_>) -> Poll<io::Result<ExitStatus>> {
+        // Tokio wait is cancellation-safe: its process handle and cached exit
+        // live in Child, rather than in this temporary borrowing future.
+        let wait = child.wait();
+        tokio::pin!(wait);
+        wait.poll(cx)
+    }
+
+    fn terminate(&self, child: &mut Child) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            // Windows has no graceful signal here. Kill the owned handle;
+            // running taskkill under the slot lock would block and use a PID.
+            child.start_kill()
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(pid) = child.id() {
+                super::send_signal(pid, polaris_core_supervisor::Signal::Sigterm);
+            }
+            Ok(())
+        }
+    }
 }
 
-struct NativeStopIo;
+pub(super) struct NativeStopIo;
 
 impl DirectStopIo for NativeStopIo {
     fn try_wait(&self, child: &mut Child) -> io::Result<Option<ExitStatus>> {

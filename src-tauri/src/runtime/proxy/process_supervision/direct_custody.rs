@@ -1,9 +1,10 @@
-//! Direct desktop Child custody. Stopping never releases its Child in this
-//! slice, including after the exact worker has reaped it.
+//! Direct desktop Child custody. Ordinary Stop retains its Child through
+//! cancellation/errors; exact-worker Stopping remains permanently reserved.
 
 use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use crate::runtime::helper::HelperStopTarget;
 use crate::runtime::proxy::process_supervision::{DirectCoreRun, DirectRunOrigin, RunIdentity};
@@ -94,7 +95,7 @@ impl HelperStartPhase {
 }
 
 #[derive(Clone)]
-pub(super) struct WorkerNonce(Arc<()>);
+pub(in crate::runtime::proxy) struct WorkerNonce(Arc<()>);
 
 impl WorkerNonce {
     pub(super) fn new() -> Self {
@@ -132,6 +133,13 @@ struct DirectStoppingCustody {
 }
 
 enum StopPhase {
+    /// Ordinary Stop keeps the Child here while its cancellable waiter owns
+    /// only the nonce. Native wait success stays cached through commit errors.
+    NativeWait {
+        nonce: WorkerNonce,
+        inflight: bool,
+        exit: Option<ExitStatus>,
+    },
     Armed {
         nonce: WorkerNonce,
     },
@@ -149,7 +157,8 @@ enum StopPhase {
 impl StopPhase {
     fn nonce(&self) -> &WorkerNonce {
         match self {
-            Self::Armed { nonce }
+            Self::NativeWait { nonce, .. }
+            | Self::Armed { nonce }
             | Self::KillRequested { nonce }
             | Self::RetainedFailure { nonce, .. } => nonce,
             Self::Reaped(proof) | Self::BirthClosed(proof) => &proof.nonce,
@@ -307,6 +316,11 @@ impl DirectCoreSlot {
         } else {
             match &self.state {
                 SlotState::Running(run) => run.main_token.clone(),
+                SlotState::Stopping(custody)
+                    if matches!(custody.phase, StopPhase::NativeWait { .. }) =>
+                {
+                    custody.run.main_token.clone()
+                }
                 SlotState::Stopping(_) | SlotState::Empty => None,
             }
         }
@@ -464,20 +478,27 @@ impl DirectCoreSlot {
         target: HelperStopTarget,
         nonce: &HelperStopNonce,
     ) -> bool {
-        let Some(attempt) = &self.helper_start else {
-            return false;
-        };
-        if !attempt.token.same(token)
-            || attempt.phase.exact_stop_target() != Some(target)
-            || !attempt
-                .stop_inflight
-                .as_ref()
-                .is_some_and(|reserved| reserved.same(nonce))
-        {
+        if !self.helper_stop_matches(token, target, nonce) {
             return false;
         }
         self.helper_start = None;
         true
+    }
+
+    pub(in crate::runtime::proxy) fn helper_stop_matches(
+        &self,
+        token: &HelperStartToken,
+        target: HelperStopTarget,
+        nonce: &HelperStopNonce,
+    ) -> bool {
+        self.helper_start.as_ref().is_some_and(|attempt| {
+            attempt.token.same(token)
+                && attempt.phase.exact_stop_target() == Some(target)
+                && attempt
+                    .stop_inflight
+                    .as_ref()
+                    .is_some_and(|reserved| reserved.same(nonce))
+        })
     }
 
     pub(in crate::runtime::proxy) fn helper_pid_bookkeeping_matches(
@@ -608,6 +629,7 @@ impl DirectCoreSlot {
             StopPhase::BirthClosed(_) => return Err(DirectBirthCloseError::AlreadyClosed),
             StopPhase::Armed { .. }
             | StopPhase::KillRequested { .. }
+            | StopPhase::NativeWait { .. }
             | StopPhase::Reaped(_)
             | StopPhase::RetainedFailure { .. } => return Err(DirectBirthCloseError::NotReaped),
         };
@@ -658,6 +680,7 @@ impl DirectCoreSlot {
             }
         };
         let armed = match &custody.phase {
+            StopPhase::NativeWait { .. } => return StopPoll::Obsolete,
             StopPhase::Armed { .. } => true,
             StopPhase::KillRequested { .. } => false,
             StopPhase::Reaped(proof) | StopPhase::BirthClosed(proof) => {
@@ -670,7 +693,7 @@ impl DirectCoreSlot {
                 return StopPoll::RetainedFailure;
             }
         };
-        match try_wait(&mut custody.run.child) {
+        match custody.run.try_wait_with(try_wait) {
             Ok(Some(status)) => {
                 custody.phase = StopPhase::Reaped(DirectChildReaped {
                     identity: expected.clone(),
@@ -694,7 +717,7 @@ impl DirectCoreSlot {
                 StopPoll::RetainedFailure
             }
             Ok(None) if !armed => StopPoll::Pending,
-            Ok(None) => match start_kill(&mut custody.run.child) {
+            Ok(None) => match custody.run.signal_with(start_kill) {
                 Ok(()) => {
                     custody.phase = StopPhase::KillRequested {
                         nonce: nonce.clone(),
@@ -728,6 +751,7 @@ impl DirectCoreSlot {
             return StopView::Obsolete;
         }
         match &custody.phase {
+            StopPhase::NativeWait { .. } => StopView::Obsolete,
             StopPhase::Armed { .. } => StopView::Armed,
             StopPhase::KillRequested { .. } => StopView::KillRequested,
             StopPhase::Reaped(_) => StopView::Reaped,
@@ -759,6 +783,147 @@ impl DirectCoreSlot {
         }
         self.state = SlotState::Running(run);
         Ok(())
+    }
+
+    /// Ordinary Stop may retry its own retained custody, but never takes an
+    /// exact worker's Child or admits two waiters for the same native handle.
+    pub(in crate::runtime::proxy) fn begin_native_stop(
+        &mut self,
+    ) -> Result<Option<(RunIdentity, WorkerNonce)>, String> {
+        if self.helper_start.is_some() {
+            return Err("direct Stop blocked by helper Start custody".into());
+        }
+        let nonce = WorkerNonce::new();
+        match &mut self.state {
+            SlotState::Empty => return Ok(None),
+            SlotState::Stopping(custody) => match &mut custody.phase {
+                StopPhase::NativeWait {
+                    nonce: booked,
+                    inflight,
+                    ..
+                } if !*inflight => {
+                    *booked = nonce.clone();
+                    *inflight = true;
+                    return Ok(Some((custody.run.identity.clone(), nonce)));
+                }
+                _ => return Err("direct Child is reserved in Stopping custody".into()),
+            },
+            SlotState::Running(_) => {}
+        }
+        let SlotState::Running(run) = std::mem::replace(&mut self.state, SlotState::Empty) else {
+            unreachable!("the same mutable slot was just checked as Running");
+        };
+        let identity = run.identity.clone();
+        self.state = SlotState::Stopping(DirectStoppingCustody {
+            run,
+            phase: StopPhase::NativeWait {
+                nonce: nonce.clone(),
+                inflight: true,
+                exit: None,
+            },
+        });
+        Ok(Some((identity, nonce)))
+    }
+
+    fn native_stop_custody(
+        &mut self,
+        expected: &RunIdentity,
+        nonce: &WorkerNonce,
+    ) -> Result<&mut DirectStoppingCustody, String> {
+        let SlotState::Stopping(custody) = &mut self.state else {
+            return Err("direct Stop custody changed".into());
+        };
+        if !custody.run.identity.same_run(expected)
+            || !matches!(&custody.phase, StopPhase::NativeWait {
+                nonce: booked, inflight: true, ..
+            } if booked.same(nonce))
+        {
+            return Err("direct Stop run or booking changed".into());
+        }
+        Ok(custody)
+    }
+
+    /// Poll one cancellation-safe Tokio Child wait under the short slot lock.
+    /// The Child and successful native exit fact outlive the caller's future.
+    pub(in crate::runtime::proxy) fn poll_native_wait(
+        &mut self,
+        expected: &RunIdentity,
+        nonce: &WorkerNonce,
+        cx: &mut Context<'_>,
+        poll: impl FnOnce(&mut Child, &mut Context<'_>) -> Poll<io::Result<ExitStatus>>,
+    ) -> Poll<Result<ExitStatus, String>> {
+        let custody = match self.native_stop_custody(expected, nonce) {
+            Ok(custody) => custody,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let StopPhase::NativeWait { exit, .. } = &mut custody.phase else {
+            unreachable!("native booking was just checked");
+        };
+        if let Some(status) = *exit {
+            return Poll::Ready(Ok(status));
+        }
+        match custody.run.poll_wait_with(cx, poll) {
+            Poll::Ready(Ok(status)) => {
+                *exit = Some(status);
+                Poll::Ready(Ok(status))
+            }
+            Poll::Ready(Err(error)) => {
+                Poll::Ready(Err(format!("direct Child native wait failed: {error}")))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub(in crate::runtime::proxy) fn signal_native_stop(
+        &mut self,
+        expected: &RunIdentity,
+        nonce: &WorkerNonce,
+        signal: impl FnOnce(&mut Child) -> io::Result<()>,
+    ) -> Result<(), String> {
+        let custody = self.native_stop_custody(expected, nonce)?;
+        if matches!(&custody.phase, StopPhase::NativeWait { exit: Some(_), .. }) {
+            return Ok(());
+        }
+        custody
+            .run
+            .signal_with(signal)
+            .map_err(|error| format!("direct Child stop signal failed: {error}"))
+    }
+
+    /// Caller holds TS (when releasing main), then Child→pid. Registry
+    /// compare-remove is the last fallible step, before custody is made Empty.
+    /// This consumes only a local owned-Child exit, not platform NoOwner proof.
+    pub(in crate::runtime::proxy) fn retire_native_stop(
+        &mut self,
+        expected: &RunIdentity,
+        nonce: &WorkerNonce,
+        release_main: impl FnOnce(
+            &crate::runtime::tailscale_login_core::MainBirthToken,
+        ) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let custody = self.native_stop_custody(expected, nonce)?;
+        if !matches!(&custody.phase, StopPhase::NativeWait { exit: Some(_), .. }) {
+            return Err("direct Child exit is not confirmed by native wait".into());
+        }
+        if let Some(token) = &custody.run.main_token {
+            release_main(token)?;
+        }
+        self.state = SlotState::Empty;
+        Ok(())
+    }
+
+    /// Cancellation/error relinquishes only this waiter. The Child, main
+    /// claim and cached exit stay reserved, so a later Stop can safely retry.
+    pub(in crate::runtime::proxy) fn finish_native_stop_booking(
+        &mut self,
+        expected: &RunIdentity,
+        nonce: &WorkerNonce,
+    ) {
+        if let Ok(custody) = self.native_stop_custody(expected, nonce) {
+            if let StopPhase::NativeWait { inflight, .. } = &mut custody.phase {
+                *inflight = false;
+            }
+        }
     }
 
     /// An Arc-bound transition only. No signal, wait, receipt or release is
@@ -814,9 +979,15 @@ impl DirectCoreSlot {
     ) -> ChildObservation {
         match &mut self.state {
             SlotState::Running(run) if run.identity.same_run(expected) => {
-                match run.child.try_wait() {
+                match run.try_wait_with(Child::try_wait) {
                     Ok(None) => ChildObservation::Alive,
-                    Ok(Some(_)) | Err(_) => ChildObservation::Exited,
+                    Ok(Some(_)) => ChildObservation::Exited,
+                    Err(error) => {
+                        log::warn!(
+                            "direct native observation unknown; retaining run state: {error}"
+                        );
+                        ChildObservation::Alive
+                    }
                 }
             }
             SlotState::Empty | SlotState::Running(_) | SlotState::Stopping(_) => {
@@ -827,7 +998,7 @@ impl DirectCoreSlot {
 
     pub(in crate::runtime::proxy) fn is_running_alive(&mut self) -> bool {
         match &mut self.state {
-            SlotState::Running(run) => matches!(run.child.try_wait(), Ok(None)),
+            SlotState::Running(run) => matches!(run.try_wait_with(Child::try_wait), Ok(None)),
             SlotState::Empty | SlotState::Stopping(_) => false,
         }
     }
@@ -842,7 +1013,7 @@ impl DirectCoreSlot {
     ) -> bool {
         match &mut self.state {
             SlotState::Running(run) if run.identity.same_run(expected) => {
-                matches!(run.child.try_wait(), Ok(Some(_)))
+                matches!(run.try_wait_with(Child::try_wait), Ok(Some(_)))
             }
             SlotState::Empty | SlotState::Running(_) | SlotState::Stopping(_) => false,
         }
@@ -880,7 +1051,7 @@ impl DirectCoreSlot {
     #[cfg(test)]
     pub(in crate::runtime::proxy) fn stopping_child_for_test(&mut self) -> Option<&mut Child> {
         match &mut self.state {
-            SlotState::Stopping(custody) => Some(&mut custody.run.child),
+            SlotState::Stopping(custody) => Some(custody.run.child_for_test()),
             SlotState::Empty | SlotState::Running(_) => None,
         }
     }

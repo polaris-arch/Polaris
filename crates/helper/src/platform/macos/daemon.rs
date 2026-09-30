@@ -25,9 +25,8 @@
 //!   （委托 [`super::server::serve`]）、SIGTERM/SIGINT 收割器（[`run`]，mac-gated）**均落地**。
 //! - **C6-1**：accept 到的连接经 [`DaemonServices`](super::server::DaemonServices) 真 dispatch（每连接
 //!   线程 / 5s read deadline / `command_mu` 单锁纪律）；start 真起锁定核（log 重定向、收割线程、父死看护）；
-//!   stop/cleanup 真发信号；watchParent、chownRuntimeDirs、sysctl procStartTime 全接线。
-//! - 收割器「有 child → terminateChild」精确分支已补（`DaemonServices::shutdown_reap`）：有 child → 同步
-//!   graceful terminate；否则 pkill 兜底（`helper.go:627-631`）。
+//!   native birth 命令持有原始 Child；watchParent、chownRuntimeDirs、sysctl procStartTime 全接线。
+//! - 正常关机只在原生 wait 与整段 chown 尾部完成后提交；未确认则保持 daemon 与 custody 供重试。
 
 use crate::platform::macos::handler::MacConfig;
 
@@ -83,10 +82,22 @@ fn run(cfg: &MacConfig) -> std::process::ExitCode {
 
     // helper.go:598-611 + :636-642：MkdirAll support 0755 + socket 0666 建 + accept 循环 dispatch
     //（每连接线程 + 5s deadline + command_mu 单锁纪律，C6-1 已接线）。
-    match serve(services) {
+    let result = serve(std::sync::Arc::clone(&services));
+    // Listener return obeys the same normal-exit fence. Unconfirmed custody keeps the
+    // daemon alive rather than discarding it merely because socket service ended.
+    loop {
+        match services.shutdown_reap() {
+            Ok(()) => break,
+            Err(error) => {
+                log::error!("mac helper listener exit rejected: {error}");
+                std::thread::sleep(std::time::Duration::from_secs(8));
+            }
+        }
+    }
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("polaris-helper (macos): serve {}: {e}", cfg.support_dir);
+        Err(error) => {
+            eprintln!("polaris-helper (macos): serve {}: {error}", cfg.support_dir);
             std::process::ExitCode::FAILURE
         }
     }
@@ -95,9 +106,9 @@ fn run(cfg: &MacConfig) -> std::process::ExitCode {
 /// SIGTERM/SIGINT 收割器（`helper.go:615-641`）。
 ///
 /// 阻塞 SIGTERM/SIGINT（后续 spawn 的线程继承此掩码，杜绝默认处置直接杀进程），起一收割线程 `sigwait`。
-/// 收到信号后委托 [`DaemonServices::shutdown_reap`]：**有 child → 同步 terminateChild**（TERM→≤5s→KILL，
-/// `helper.go:624-625`）**否则 pkill 兜底**（`helper.go:627-631`：`pkill -9 -U 0 -f "<singbox> run"`），
-/// 再 `exit(0)`。C6-1 接 production services 后精确分支已补齐（C6-0 曾仅 pkill 兜底）。
+/// 收到信号后同步关闭 admission，等待原生 Child 退出及 chown 尾部完成。
+/// Unknown/Pending 拒绝正常退出并保留 daemon 与 registry，允许同代 Stop 或下一信号重试。
+/// 外部强杀不在这个正常退出门的保证内。
 ///
 /// 用 `nix::sys::signal::SigSet::{thread_block, wait}`（sigwait 的 safe wrapper）—— `deny(unsafe_code)`
 /// 下不写 unsafe 块（对齐移植纪律：syscall 走 nix crate）。
@@ -112,11 +123,15 @@ fn install_signal_reaper(services: std::sync::Arc<crate::platform::macos::server
     if set.thread_block().is_err() {
         return;
     }
-    std::thread::spawn(move || {
-        // helper.go:617-619：<-sigCh 等 SIGTERM/SIGINT。
-        let _ = set.wait();
-        // helper.go:620-634：摘 child → 有则 graceful terminate 否则 pkill 兜底 → os.Exit(0)。
-        services.shutdown_reap();
+    std::thread::spawn(move || loop {
+        if let Err(error) = set.wait() {
+            log::error!("mac helper shutdown signal wait failed: {error}");
+            return;
+        }
+        match services.shutdown_reap() {
+            Ok(()) => std::process::exit(0),
+            Err(error) => log::error!("mac helper normal exit rejected: {error}"),
+        }
     });
 }
 

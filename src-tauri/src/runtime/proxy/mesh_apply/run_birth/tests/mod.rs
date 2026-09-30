@@ -42,6 +42,6 @@ async fn legacy_constructor_marks_legacy_and_synthetic_birth_attaches_facts() {
     assert!(matches!(legacy.origin, DirectRunOrigin::Legacy));
     assert!(!legacy.identity.same_run(&managed.identity));
 
-    legacy.child.kill().await.unwrap();
-    managed.child.kill().await.unwrap();
+    legacy.child_for_test().kill().await.unwrap();
+    managed.child_for_test().kill().await.unwrap();
 }

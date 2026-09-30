@@ -122,7 +122,8 @@ async fn run_probe_check_core_missing_is_indeterminate_not_unsupported() {
         std::path::Path::new("/nonexistent/polaris-sing-box-xyz"),
         std::path::Path::new("/nonexistent/probe.json"),
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
         matches!(check, ProbeCheck::Indeterminate),
         "核缺失（spawn ENOENT）必须 failOpen → Indeterminate，绝不谎报 Unsupported"

@@ -11,3 +11,6 @@ thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "net", "sync", "time", "macros", "io-util", "test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31.3", features = ["process"] }

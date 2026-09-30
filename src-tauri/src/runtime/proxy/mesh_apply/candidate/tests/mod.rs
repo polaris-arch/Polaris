@@ -253,8 +253,8 @@ async fn full_builder_candidate_seals_direct_vless_and_preserves_old_resources()
             .unwrap()
             .take_running_for_test()
             .unwrap();
-        assert!(old.child.try_wait().unwrap().is_none());
-        old.child.kill().await.unwrap();
+        assert!(old.child_for_test().try_wait().unwrap().is_none());
+        old.child_for_test().kill().await.unwrap();
     }
 
     // Caller-side document mutation after generation cannot rewrite the
@@ -430,8 +430,11 @@ async fn pinned_strict_check_uses_full_builder_bytes_without_cache_or_listener_s
             .unwrap()
             .take_running_for_test()
             .unwrap();
-        assert!(old.child.try_wait().unwrap().is_none(), "{state}");
-        old.child.kill().await.unwrap();
+        assert!(
+            old.child_for_test().try_wait().unwrap().is_none(),
+            "{state}"
+        );
+        old.child_for_test().kill().await.unwrap();
         drop(cache_lock);
         drop(listeners);
     }

@@ -11,7 +11,10 @@
 //!
 //! [`Response::parse`] 是宽容的：未知 `OK <token>` 归 [`ResponseKind::OkRaw`]（保留原文），不丢消息。
 
-use crate::{error::Error, HelperBirthTarget};
+use crate::{HelperBirthTarget, error::Error};
+
+mod native_birth;
+pub use native_birth::{NativeBirthStart, NativeBirthStatus, NativeBirthStop};
 
 /// 拆出字符串首个空白分隔的 token + 余部（已 trim 首尾空白）。
 ///
@@ -250,7 +253,9 @@ pub enum ResponseKind {
     /// `OK pong uid=<n> v<ver> [build=<id>]`（ping）。
     Pong(Pong),
     /// `OK <ver>`（version）。
-    Version { proto_version: u32 },
+    Version {
+        proto_version: u32,
+    },
     /// `OK running <pid>` / `OK stopped`（status）。
     Status(Status),
     /// `OK stopped <pid>` / `OK notrunning`（stop）。
@@ -263,6 +268,10 @@ pub enum ResponseKind {
     LinuxBirthStatus(LinuxBirthStatus),
     /// Linux exact-birth Stop receipts use distinct wire tokens.
     LinuxBirthStop(LinuxBirthStop),
+    /// macOS/Windows receipts require their own typed native response family.
+    NativeBirthStart(NativeBirthStart),
+    NativeBirthStatus(NativeBirthStatus),
+    NativeBirthStop(NativeBirthStop),
     /// `OK cleaned`（cleanup）。
     Cleaned,
     /// `OK route`（route-add / route-del）。
@@ -284,7 +293,10 @@ pub enum ResponseKind {
     /// `OK uninstalling`（uninstall，win）。
     Uninstalling,
     /// 未识别的 `OK <token> <rest>` —— 保留原文，永不丢消息（协议演进期诊断兜底）。
-    OkRaw { token: String, rest: String },
+    OkRaw {
+        token: String,
+        rest: String,
+    },
 }
 
 /// 一个完整响应（成功或失败）。
@@ -329,6 +341,9 @@ impl Response {
             ResponseKind::LinuxBirthStart(_)
                 | ResponseKind::LinuxBirthStatus(_)
                 | ResponseKind::LinuxBirthStop(_)
+                | ResponseKind::NativeBirthStart(_)
+                | ResponseKind::NativeBirthStatus(_)
+                | ResponseKind::NativeBirthStop(_)
         ) && ok_kind_to_wire(&kind) != line
         {
             // Exact-birth receipts have one canonical wire spelling. The
@@ -472,6 +487,9 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
             current.pid,
             current.birth.to_wire()
         ),
+        ResponseKind::NativeBirthStart(_)
+        | ResponseKind::NativeBirthStatus(_)
+        | ResponseKind::NativeBirthStop(_) => native_birth::to_wire(kind),
         ResponseKind::Cleaned => "OK cleaned".to_owned(),
         ResponseKind::Route => "OK route".to_owned(),
         ResponseKind::FreePort(fp) => free_port_to_wire(fp),
@@ -630,6 +648,19 @@ fn parse_ok(rest: &str) -> ResponseKind {
         | "birth-stop-unknown"
         | "birth-stop-mismatch" => {
             parse_birth_ok(token, tail).unwrap_or_else(|| ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: tail.to_owned(),
+            })
+        }
+        "native-birth-started"
+        | "native-birth-already"
+        | "native-birth-start-not-admitted"
+        | "native-birth-status"
+        | "native-birth-stopped"
+        | "native-birth-stop-pending"
+        | "native-birth-stop-unknown"
+        | "native-birth-stop-mismatch" => {
+            native_birth::parse(token, tail).unwrap_or_else(|| ResponseKind::OkRaw {
                 token: token.to_owned(),
                 rest: tail.to_owned(),
             })

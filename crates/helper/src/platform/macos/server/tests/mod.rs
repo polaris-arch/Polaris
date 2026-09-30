@@ -1,9 +1,39 @@
 use super::*;
-use crate::platform::macos::handler::{ChildHandle, MacServices, SpawnError};
+use crate::platform::macos::handler::{ChildHandle, MacServices, SpawnError, SpawnedCore};
 use crate::token::TokenStore;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+#[test]
+fn native_birth_stop_frame_requires_both_exact_identity_lines_and_no_extra() {
+    let birth = "01010101010101010101010101010101";
+    let command = polaris_helper_proto::command::common::NATIVE_STOP_BIRTH;
+    for args in [
+        vec![],
+        vec!["42"],
+        vec!["42", "bad"],
+        vec!["42", birth, "extra"],
+        vec!["042", birth],
+    ] {
+        assert!(decode_request(command, &mut args.into_iter().map(str::to_owned)).is_err());
+    }
+    let req = decode_request(command, &mut ["42", birth].into_iter().map(str::to_owned)).unwrap();
+    assert_eq!(
+        req,
+        Request::NativeStopBirth {
+            target: polaris_helper_proto::HelperBirthTarget::parse_wire("42", birth).unwrap()
+        }
+    );
+    assert_eq!(
+        decode_request(
+            polaris_helper_proto::command::common::NATIVE_STATUS_BIRTH,
+            &mut std::iter::empty()
+        )
+        .unwrap(),
+        Request::NativeStatusBirth
+    );
+}
 
 /// 测试用 services（复用 handler 测试的简化版）。
 struct TestServices {
@@ -369,28 +399,30 @@ fn authenticated_connection_does_take_the_command_lock() {
     let mu = Mutex::new(());
     const HOLD: std::time::Duration = std::time::Duration::from_millis(800);
 
-    std::thread::scope(|scope| {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let mu_ref = &mu;
-        scope.spawn(move || {
-            let g = mu_ref.lock().unwrap();
-            ready_tx.send(()).unwrap();
-            std::thread::sleep(HOLD);
-            drop(g);
-        });
-        ready_rx.recv().expect("持锁线程没起来");
+    for wire in ["real\nstatus\n", "real\nfreeport\n9090\n"] {
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let mu_ref = &mu;
+            scope.spawn(move || {
+                let g = mu_ref.lock().unwrap();
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(HOLD);
+                drop(g);
+            });
+            ready_rx.recv().expect("持锁线程没起来");
 
-        let t0 = std::time::Instant::now();
-        let input = Cursor::new(b"real\nstatus\n".to_vec());
-        let mut output = Vec::new();
-        process_connection(input, &mut output, &svc, &cfg, Some(&mu));
-        let elapsed = t0.elapsed();
+            let t0 = std::time::Instant::now();
+            let input = Cursor::new(wire.as_bytes().to_vec());
+            let mut output = Vec::new();
+            process_connection(input, &mut output, &svc, &cfg, Some(&mu));
+            let elapsed = t0.elapsed();
 
-        assert!(
+            assert!(
             elapsed >= HOLD / 2,
             "已鉴权命令没去取 command_mu（耗时 {elapsed:?}）—— 锁形同虚设，上一条门也就没有信息量"
         );
-    });
+        });
+    }
 }
 
 #[test]
@@ -517,25 +549,6 @@ fn sock_mode_matches_go() {
 }
 
 // ===== 纯决策逻辑（mu 分流 / chown 筛选 / terminate 状态机）=====
-
-#[test]
-fn should_lock_all_but_freeport() {
-    // helper.go:413: freeport 不持锁；helper.go:418: 其余持锁
-    assert!(!should_lock_command("freeport"));
-    for c in [
-        "ping",
-        "version",
-        "status",
-        "start",
-        "stop",
-        "cleanup",
-        "route-add",
-        "flush-dns",
-        "system-proxy-transaction",
-    ] {
-        assert!(should_lock_command(c), "{c} 应持锁");
-    }
-}
 
 #[test]
 fn chown_subdirs_match_go() {

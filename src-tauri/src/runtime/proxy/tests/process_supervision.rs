@@ -1,6 +1,7 @@
 use super::*;
 
 mod direct_stop;
+mod native_direct_stop;
 
 #[cfg(target_os = "linux")]
 struct BirthDaemonStream {
@@ -130,7 +131,7 @@ async fn main_birth_follows_real_direct_child_through_confirmed_stop() {
 }
 
 #[tokio::test]
-async fn helper_attempt_keeps_main_birth_until_exact_confirmed_stop() {
+async fn legacy_helper_ack_keeps_main_birth_and_backend_custody() {
     let (rt, _dir) = test_runtime();
     let gate = rt.mesh.tailscale_state_gate().await;
     let state = rt.mesh.tailscale_state_dir("ts-helper").unwrap();
@@ -170,20 +171,103 @@ async fn helper_attempt_keeps_main_birth_until_exact_confirmed_stop() {
         .is_some_and(|found| found.same(&token)));
     assert!(rt.mesh.main_owns_tailscale("ts-helper", true));
     let (retry, calls, wants) = RecordingStop::new(Ok(()));
-    rt.kill_core_via_helper(retry as Arc<dyn HelperStopOps>)
+    let error = rt
+        .kill_core_via_helper_with_main(retry as Arc<dyn HelperStopOps>, Some(&gate))
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(error.contains("legacy Stop ACK"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(*wants.lock().unwrap(), vec![Some(7123)]);
-    assert!(rt.main_token_for_stop().unwrap().is_none());
+    assert!(rt.main_token_for_stop().unwrap().is_some());
     assert!(
         rt.mesh.main_owns_tailscale("ts-helper", true),
         "local registry is not itself a helper ACK"
     );
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    assert_eq!(*rt.pid.lock().unwrap(), Some(7123));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn exact_helper_main_mismatch_retains_custody_then_retries_production_birth_transport() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::HelperStartResult;
+    let pid = 7123;
+    let hex = "00112233445566778899aabbccddeeff";
+    let target = exact_helper_target(pid, hex);
+    let (rt, _dir, frames) = birth_daemon_runtime([
+        format!("OK birth-stopped {pid} {hex}\n"),
+        format!("OK birth-stopped {pid} {hex}\n"),
+    ]);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("helper-main-compare").unwrap();
+    let generated =
+        serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]});
+    let original = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, original.clone())
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(original.clone()))
+        .unwrap();
+    HelperStartCompletion::for_test(&rt, attempt.clone())
+        .publish(&Ok(HelperStartResult::BirthStarted(target)))
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
     assert!(rt
         .mesh
-        .release_tailscale_main_states_if_token(&token, &gate)
+        .release_tailscale_main_states_if_token(&original, &gate)
         .unwrap());
+    let successor = rt.mesh.mint_tailscale_main_birth();
+    let mut replacement = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, successor.clone())
+        .await
+        .unwrap();
+    replacement.arm_external_start();
+    drop(replacement);
+    assert!(rt
+        .kill_core_and_release_main(&gate)
+        .await
+        .unwrap_err()
+        .contains("main claim birth changed"));
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    assert!(!rt.child.lock().unwrap().helper_stop_inflight_for_test());
+    assert_eq!(*rt.pid.lock().unwrap(), Some(pid));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&original)));
+    assert!(
+        rt.mesh
+            .release_tailscale_main_states_if_token(&successor, &gate)
+            .unwrap(),
+        "the successor main claim was untouched"
+    );
+    let mut restored = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, original)
+        .await
+        .unwrap();
+    restored.arm_external_start();
+    drop(restored);
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    assert!(!rt.mesh.main_owns_tailscale("helper-main-compare", true));
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert_eq!(*rt.pid.lock().unwrap(), None);
+    assert!(
+        rt.core_via_helper.load(Ordering::SeqCst),
+        "native birth exit does not attest platform NoOwner"
+    );
+    assert_eq!(
+        *frames.lock().unwrap(),
+        vec![format!("stop-birth-safe\n{pid}\n{hex}\n"); 2]
+    );
 }
 
 #[tokio::test]
@@ -733,7 +817,7 @@ async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers()
 
     let run = DirectCoreRun::new(spawn_custody_stand_in());
     let identity = run.identity.clone();
-    let pid = run.child.id().expect("stand-in PID");
+    let pid = run.child_id_for_test().expect("stand-in PID");
     assert!(rt.child.lock().unwrap().install_running(run).is_ok());
     assert!(matches!(
         rt.child
@@ -753,7 +837,7 @@ async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers()
     else {
         panic!("Running rejects replacement and returns its Child");
     };
-    let mut returned_child = rejected.child;
+    let mut returned_child = rejected.into_child_for_test();
     assert!(returned_child.id().is_some());
     returned_child.kill().await.expect("reap rejected Child");
 
@@ -792,7 +876,7 @@ async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers()
     else {
         panic!("Stopping rejects replacement and returns its Child");
     };
-    let mut returned_child = rejected.child;
+    let mut returned_child = rejected.into_child_for_test();
     assert!(returned_child.id().is_some());
     returned_child.kill().await.expect("reap rejected Child");
     assert!(
@@ -821,7 +905,7 @@ async fn occupied_direct_slot_rejects_start_before_retiring_old_session() {
     let (rt, _dir, clearer_calls) = test_runtime_recording();
     let run = DirectCoreRun::new(spawn_custody_stand_in());
     let identity = run.identity.clone();
-    let pid = run.child.id().expect("old core PID");
+    let pid = run.child_id_for_test().expect("old core PID");
     *rt.status.write().unwrap() = ProxyStatus {
         running: true,
         ..Default::default()
@@ -862,7 +946,11 @@ async fn occupied_direct_slot_rejects_start_before_retiring_old_session() {
 
     rt.core_via_helper.store(false, Ordering::SeqCst);
     let mut old_run = rt.child.lock().unwrap().take_running_for_test().unwrap();
-    old_run.child.kill().await.expect("reap old stand-in");
+    old_run
+        .child_for_test()
+        .kill()
+        .await
+        .expect("reap old stand-in");
 }
 
 #[cfg(not(target_os = "android"))]
@@ -917,7 +1005,7 @@ async fn occupied_direct_slot_rechecks_after_waiting_for_ts_gate() {
 
     let run = DirectCoreRun::new(spawn_custody_stand_in());
     let identity = run.identity.clone();
-    let pid = run.child.id().expect("old core PID");
+    let pid = run.child_id_for_test().expect("old core PID");
     rt.child.lock().unwrap().install_running_for_test(run);
     *rt.status.write().unwrap() = ProxyStatus {
         running: true,
@@ -938,7 +1026,11 @@ async fn occupied_direct_slot_rechecks_after_waiting_for_ts_gate() {
     assert!(pid_alive(pid));
 
     let mut old_run = rt.child.lock().unwrap().take_running_for_test().unwrap();
-    old_run.child.kill().await.expect("reap old stand-in");
+    old_run
+        .child_for_test()
+        .kill()
+        .await
+        .expect("reap old stand-in");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1199,8 +1291,7 @@ async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_rep
             .unwrap()
             .running_for_test()
             .unwrap()
-            .child
-            .try_wait(),
+            .try_wait_with(tokio::process::Child::try_wait),
         Ok(None)
     ));
 
@@ -1219,7 +1310,7 @@ async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_rep
         slot.install_running_for_test(next);
         old
     };
-    old.child.kill().await.unwrap();
+    old.child_for_test().kill().await.unwrap();
     drop(old);
     tokio::time::sleep(Duration::from_millis(CRASH_MONITOR_POLL_MS + 100)).await;
     assert_eq!(Arc::strong_count(&identity.0), 1, "old monitor retired");
@@ -1242,8 +1333,7 @@ async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_rep
             .unwrap()
             .running_for_test()
             .unwrap()
-            .child
-            .try_wait(),
+            .try_wait_with(tokio::process::Child::try_wait),
         Ok(None)
     ));
     rt.kill_core().await.unwrap();
@@ -1341,7 +1431,9 @@ async fn exact_stop_permit_binds_birth_and_keeps_managed_gate() {
         HelperStopTarget::Birth(b),
         nonce,
     );
-    assert!(!rt.clear_helper_core_bookkeeping(&forged));
+    assert!(!rt
+        .clear_helper_core_bookkeeping_with_main(&forged, |_| Err("no test claim release".into()))
+        .unwrap());
     assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
     assert!(rt.child.lock().unwrap().has_helper_start());
     drop(forged);
@@ -1432,15 +1524,105 @@ async fn reaped_exact_start_releases_only_its_reserved_main_claim() {
 
     let (ops, calls, _) = RecordingStop::new(Ok(()));
     let (message, confirmed) = rt
-        .reject_helper_start_with_result(ops.clone(), &attempt, HelperStopTarget::Birth(target))
+        .reject_helper_start_with_result(
+            ops.clone(),
+            &attempt,
+            HelperStopTarget::Birth(target),
+            Some(&mut reservation),
+        )
         .await;
     assert!(confirmed, "same-attempt native Stop ACK: {message}");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    reservation.confirmed_no_external_writer();
     drop(reservation);
     assert!(!rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
+}
+
+#[tokio::test]
+async fn exact_start_cleanup_keeps_reservation_custody_when_registry_compare_remove_fails() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+    for poison in [false, true] {
+        let (rt, _dir) = test_runtime();
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let state = rt.mesh.tailscale_state_dir("start-cleanup-claim").unwrap();
+        let generated =
+            serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]});
+        let token = rt.mesh.mint_tailscale_main_birth();
+        let mut reservation = rt
+            .mesh
+            .reserve_tailscale_main_states(&generated, &gate, token.clone())
+            .await
+            .unwrap();
+        let attempt = rt
+            .register_helper_start_backend_with_main(Some(token.clone()))
+            .unwrap();
+        reservation.arm_external_start();
+        let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+        HelperStartCompletion::for_test(&rt, attempt.clone())
+            .publish(&Ok(HelperStartResult::BirthStarted(target)))
+            .unwrap();
+        let successor = rt.mesh.mint_tailscale_main_birth();
+        if poison {
+            rt.mesh.poison_tailscale_main_claim_lock_for_test();
+        } else {
+            assert!(rt
+                .mesh
+                .release_tailscale_main_states_if_token(&token, &gate)
+                .unwrap());
+            let mut replacement = rt
+                .mesh
+                .reserve_tailscale_main_states(&generated, &gate, successor.clone())
+                .await
+                .unwrap();
+            replacement.arm_external_start();
+            drop(replacement);
+        }
+        let (ops, calls, _) = RecordingStop::new(Ok(()));
+        let (message, confirmed) = rt
+            .reject_helper_start_with_result(
+                ops.clone(),
+                &attempt,
+                HelperStopTarget::Birth(target),
+                Some(&mut reservation),
+            )
+            .await;
+        assert!(!confirmed, "{message}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
+        assert!(rt.child.lock().unwrap().has_helper_start());
+        assert!(rt.core_via_helper.load(Ordering::SeqCst));
+        assert!(rt.mesh.main_owns_tailscale("start-cleanup-claim", true));
+        if !poison {
+            assert!(
+                rt.mesh
+                    .release_tailscale_main_states_if_token(&successor, &gate)
+                    .unwrap(),
+                "successor survived"
+            );
+            let mut restored = rt
+                .mesh
+                .reserve_tailscale_main_states(&generated, &gate, token)
+                .await
+                .unwrap();
+            restored.arm_external_start();
+            drop(restored);
+            let (_, confirmed) = rt
+                .reject_helper_start_with_result(
+                    ops,
+                    &attempt,
+                    HelperStopTarget::Birth(target),
+                    Some(&mut reservation),
+                )
+                .await;
+            assert!(confirmed);
+            assert!(!rt.child.lock().unwrap().has_helper_start());
+            assert_eq!(*rt.pid.lock().unwrap(), None);
+            assert!(!rt.mesh.main_owns_tailscale("start-cleanup-claim", true));
+        }
+        drop(reservation);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1847,22 +2029,28 @@ async fn start_not_admitted_preserves_prior_helper_and_main_custody() {
         .helper_start_not_admitted_for_test());
     assert!(rt.mesh.main_owns_tailscale("ts-helper-blocker", true));
 
-    let (reaped, _, _) = RecordingStop::new(Ok(()));
-    rt.kill_core_via_helper(reaped as Arc<dyn HelperStopOps>)
-        .await
-        .unwrap();
-    assert!(!rt.child.lock().unwrap().has_helper_start());
-    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+    let (acknowledged, _, _) = RecordingStop::new(Ok(()));
     assert!(rt
-        .mesh
-        .release_tailscale_main_states_if_token(&token, &gate)
-        .unwrap());
+        .kill_core_via_helper_with_main(acknowledged as Arc<dyn HelperStopOps>, Some(&gate))
+        .await
+        .unwrap_err()
+        .contains("legacy Stop ACK"));
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-helper-blocker", true));
 }
 
 #[tokio::test]
 async fn acknowledged_stop_keeps_exclusive_permit_through_final_clear() {
     let (rt, _dir) = test_runtime();
-    known_helper_attempt(&rt, 4242);
+    known_exact_helper_attempt(
+        &rt,
+        exact_helper_target(4242, "00112233445566778899aabbccddeeff"),
+    );
     let (token, pid, nonce) = rt.child.lock().unwrap().begin_helper_stop().unwrap();
     let permit = HelperStopPermit::new(Arc::clone(&rt.child), token.clone(), pid, nonce);
     let (ops, calls, _) = RecordingStop::new(Ok(()));
@@ -1881,10 +2069,12 @@ async fn acknowledged_stop_keeps_exclusive_permit_through_final_clear() {
     assert!(rt.start(local_only_config(free_port())).await.is_err());
     assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
 
-    assert!(rt.clear_helper_core_bookkeeping(&permit));
+    assert!(rt
+        .clear_helper_core_bookkeeping_with_main(&permit, |_| Err("no test claim release".into()))
+        .unwrap());
     drop(permit);
     assert!(rt.pid.lock().unwrap().is_none());
-    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1957,7 +2147,7 @@ async fn cancelled_helper_stop_keeps_existing_legacy_lease_until_ipc_returns() {
     ));
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
     let mut direct = rt.child.lock().unwrap().take_running_for_test().unwrap();
-    direct.child.kill().await.unwrap();
+    direct.child_for_test().kill().await.unwrap();
 }
 
 // ─── 停核的受管 pid 身份：app 侧下发 + 记账收口 ────────────────────────────────
@@ -1977,9 +2167,11 @@ async fn helper_stop_leg_sends_the_pid_it_intends_to_stop() {
     known_helper_attempt(&rt, 4242);
     let (ops, calls, wants) = RecordingStop::new(Ok(()));
 
-    rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+    assert!(rt
+        .kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
         .await
-        .expect("helper 停核应成功");
+        .unwrap_err()
+        .contains("legacy Stop ACK"));
 
     assert_eq!(
         *wants.lock().unwrap(),
@@ -1987,9 +2179,9 @@ async fn helper_stop_leg_sends_the_pid_it_intends_to_stop() {
         "停核请求必须携带受管 pid 身份 —— 这是 helper 侧唯一能据以拒杀的依据"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "恰调一次");
-    // 无人接管 → 记账照常清（反向失效：留着会让下次 kill_core 走错腿）。
-    assert!(rt.pid.lock().unwrap().is_none());
-    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+    // Request acceptance cannot attest a native exit, even without takeover.
+    assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 /// **结果未知门**：通信失败时不能清 helper 记账。请求可能根本没到，也可能已停但回包丢失；
@@ -2053,7 +2245,10 @@ async fn active_stop_keeps_running_state_when_helper_stop_is_unconfirmed() {
 #[tokio::test]
 async fn helper_stop_leg_does_not_wipe_bookkeeping_taken_over_mid_flight() {
     let (rt, _dir) = test_runtime();
-    known_helper_attempt(&rt, 4242);
+    known_exact_helper_attempt(
+        &rt,
+        exact_helper_target(4242, "00112233445566778899aabbccddeeff"),
+    );
     // 「IPC 在飞时新会话起了新核并提交 pid」——真机上这正是老 stop 腿醒来后会杀错人的那一刻。
     let pid_slot = Arc::clone(&rt.pid);
     let (ops, _calls, wants) = RecordingStop::with_hook(
@@ -2133,7 +2328,7 @@ async fn reject_leg_still_reports_failure_when_daemon_stop_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cancelled_reject_stop_keeps_known_attempt_until_reconfirmed() {
+async fn cancelled_reject_stop_keeps_legacy_attempt_after_repeated_acks() {
     let (rt, _dir) = test_runtime();
     let attempt = known_helper_attempt(&rt, 777);
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -2188,9 +2383,13 @@ async fn cancelled_reject_stop_keeps_known_attempt_until_reconfirmed() {
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
 
     let (confirm, _, _) = RecordingStop::new(Ok(()));
-    rt.kill_core_via_helper(confirm).await.unwrap();
-    assert!(rt.pid.lock().unwrap().is_none());
-    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .kill_core_via_helper(confirm)
+        .await
+        .unwrap_err()
+        .contains("legacy Stop ACK"));
+    assert_eq!(*rt.pid.lock().unwrap(), Some(777));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 /// **P1-a 不变式门（有牙版）**：**每一次** `start` 都必须走 stale 清扫腿，不是只走首次。

@@ -9,30 +9,22 @@
 //! - 分派逻辑（=Go switch 主体）跨平台纯逻辑，Linux 可单测。
 //! - IO（命名管道读写）由 `service.rs` 承接（`#[cfg(windows)]`）。
 //!
-//! ## 并发纪律（对齐 Go `mu` / `child` / `childDone`）
-//!
-//! Go 用 `sync.Mutex` 保护 `child *exec.Cmd` + `childDone chan`，规则：
-//! - **持锁摘除 child**（`child, childDone = nil, nil`），**不持锁收割**（`terminateChild` 最长阻塞 2s，
-//!   持锁会饿死并发 ping/status）。
-//! - 摘除后由摘除方独占收割权（后台 goroutine / `terminateChild`），watchParent 见 `child != c` 即退。
-//!
-//! 本实现用 [`std::sync::Mutex`]`<`[`ChildState`]`>` 镜像：持锁摘 pid，不持锁调 [`ops::ProcOps::reap_child`]。
-//! 收割权的独占性由「摘除时取出 pid → 释放锁 → 对该 pid 调 reap」保证（同一 pid 只被取一次）。
-//!
-//! ## 子进程状态
-//!
-//! Go 的 `child *exec.Cmd` 承载 pid + Wait 语义。本 trait 抽象的 [`ops::ProcOps`] 只需 pid + reap_child，
-//! 故 [`ChildState`] 只存 `Option<u32>`（pid）。真正的 `Wait()` 回收（Go `go func() { c.Wait(); close(done) }`）
-//! 由 [`ops::ProcOps`] 实现内部承载（生产侧 `winproc` 持有 `std::process::Child` 或 Job Object 句柄）。
+//! Native births keep their exact owned HANDLE in ProcOps and their target in
+//! ChildState until native wait succeeds. Lock order is ChildState→owned HANDLE;
+//! synchronous waits are bounded and no detached worker takes sole custody.
+//! Terminal receipts are cached per birth. Legacy Start is rejected before any
+//! forwarding/spawn; legacy Stop cannot detach native custody.
 
 use crate::core_install::{install_core_files, InstallResult, SINGBOX_BIN_NAME_WIN};
 use crate::platform::windows::coreacl;
 use crate::platform::windows::logic;
 use crate::platform::windows::ops::{NetTableOps, ProcOps};
+mod native_birth;
 use crate::token::{is_authed_constant_time, TokenStore};
+use native_birth::{stop_locked, NativeCustody};
 use polaris_helper_proto::{Request, Response, ResponseKind};
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 /// Windows helper 错误（helper 内部分派/状态错误，非协议错误码）。
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +42,9 @@ pub enum HelperError {
 struct ChildState {
     /// 当前 child sing-box 的 pid（None = 无 child）。
     pid: Option<u32>,
+    closing: bool,
+    native: Option<NativeCustody>,
+    terminal: std::collections::VecDeque<polaris_helper_proto::HelperBirthTarget>,
 }
 
 /// Windows helper 核心分派器（移植自 `helper.go` 的 `handle()` + 模块级 `mu/child/childDone`）。
@@ -259,11 +254,19 @@ where
                 proto_version: crate::platform::windows::PROTO_VERSION,
             })),
             Request::Status => {
-                // `pid` 是受管核记账，不是存活证据。Windows 生产侧已主动 drop `Child` 句柄，核自然退出
-                // 后没有 reaper 回写这格；若只看 `Some(pid)`，app 会永久收到 running，崩溃恢复也永远
-                // 不会触发。helper 自身以 SYSTEM 运行，能可靠执行这次原生进程探活；确定已死即在同一把
-                // 锁里清账，再诚实回 stopped。探活的「未知」仍由 ProcOps 按宁漏勿误折为 true。
-                let mut state = self.child_mu.lock().unwrap_or_else(PoisonError::into_inner);
+                // Native custody can retire only after exact HANDLE wait and writer revoke.
+                // Legacy status remains observational; poisoned or unmatched custody is unknown.
+                let Ok(mut state) = self.child_mu.lock() else {
+                    return native_busy();
+                };
+                if let Some(native) = &state.native {
+                    let target = native.target;
+                    if self.proc.poll_native_child(target)
+                        == crate::platform::windows::ops::NativeChildPoll::Exited
+                    {
+                        let _ = native_birth::cache_exit(&mut state, self.proc.as_ref(), target);
+                    }
+                }
                 match self.live_managed_pid(&mut state) {
                     Some(pid) => {
                         // D2/D3：把 helper 手里那个句柄读到的两个事实一并回传。app 是 Medium IL，
@@ -278,9 +281,10 @@ where
                             },
                         )))
                     }
-                    None => HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
-                        polaris_helper_proto::Status::Stopped,
-                    ))),
+                    None if self.proc.native_custody_empty() => HandleOutcome::Respond(
+                        Response::Ok(ResponseKind::Status(polaris_helper_proto::Status::Stopped)),
+                    ),
+                    None => native_busy(),
                 }
             }
             Request::Stop { pid: want } => {
@@ -290,7 +294,12 @@ where
                 // 请求所指的那个 = 它属另一个会话（老 stop 腿在管道上挂住期间用户重装 helper / 重起了
                 // 核）⇒ 诚实 no-op，绝不「反正要停就杀当前的」。见 `stop_pid_matches`。
                 let pid = {
-                    let mut state = self.child_mu.lock().unwrap_or_else(PoisonError::into_inner);
+                    let Ok(mut state) = self.child_mu.lock() else {
+                        return native_busy();
+                    };
+                    if state.native.is_some() || !self.proc.native_custody_empty() {
+                        return native_busy();
+                    }
                     if let Some(cur) = state.pid {
                         if !polaris_helper_proto::stop_pid_matches(want, cur) {
                             return HandleOutcome::Respond(Response::Ok(ResponseKind::Stop(
@@ -317,38 +326,17 @@ where
                     ))),
                 }
             }
-            Request::Cleanup => {
-                // Go helper.go:202-211: 先摘自家 child 精准收割，再 killAllSingbox 兜底外部孤儿 → OK cleaned
-                if let Some(pid) = {
-                    self.child_mu
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .pid
-                        .take()
-                } {
-                    self.proc.reap_child(pid);
-                }
-                let _ = self.proc.kill_all_singbox(&self.singbox_bin);
-                HandleOutcome::Respond(Response::Ok(ResponseKind::Cleaned))
+            Request::Cleanup => self.handle_cleanup(false),
+            Request::Uninstall => self.handle_cleanup(true),
+            Request::Start(_) => {
+                HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+                    polaris_helper_proto::ErrorCode::Start,
+                    "client-upgrade-required: use native birth safe Start",
+                )))
             }
-            Request::Uninstall => {
-                // Go helper.go:276-294: 收割 child → killAllSingbox 兜底 → spawnSelfUninstall →
-                // OK uninstalling → 800ms 后 os.Exit(0)
-                if let Some(pid) = {
-                    self.child_mu
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .pid
-                        .take()
-                } {
-                    self.proc.reap_child(pid);
-                }
-                let _ = self.proc.kill_all_singbox(&self.singbox_bin);
-                self.proc
-                    .spawn_self_uninstall(&self.service_name, &self.support_dir);
-                HandleOutcome::UninstallAndExit(Response::Ok(ResponseKind::Uninstalling))
-            }
-            Request::Start(params) => self.handle_start(&params),
+            Request::NativeStartBirth(params) => self.handle_native_start(&params),
+            Request::NativeStatusBirth => self.handle_native_status(),
+            Request::NativeStopBirth { target } => self.handle_native_stop(target),
             Request::FreePort { port } => self.handle_freeport(port),
             // W9 修：route-add / route-del 须区分 add/delete（此前合并丢了 op 区分）。
             Request::RouteAdd(rp) => self.handle_route(&rp.iface, &rp.cidrs, false),
@@ -377,124 +365,7 @@ where
         }
     }
 
-    /// `start` 分支（Go helper.go:338-390）。
-    ///
-    /// **并发纪律（修 W3）**：「已在跑？」判定 + `start_singbox` + 记录 pid 须在**同一 child_mu 临界区**内
-    /// （对齐 Go `handle()` 顶部 `mu.Lock` 覆盖整个 start）。此前判定与记录之间放锁 → 两个并发 start 都见
-    /// `None` → 双起核。记录 pid 后**先释放锁**再接父死看护（W15）——`spawn_watch_parent` 的闭包会重入
-    /// child_mu（`is_current`/`on_parent_dead`），持锁调用即自死锁。
-    fn handle_start(&self, p: &polaris_helper_proto::StartParams) -> HandleOutcome {
-        // ===== 全程持锁的临界区：check → start → record pid =====
-        let (started_pid, start_timing, started_created) = {
-            let mut state = self.child_mu.lock().unwrap_or_else(PoisonError::into_inner);
-            // 先复核旧记账，避免核自然退出后下一次 start 仍把死 pid 当作 already。探活与清账在同一
-            // 临界区内，故并发 start 不会越过此判据双起核。
-            if let Some(pid) = self.live_managed_pid(&mut state) {
-                return HandleOutcome::Respond(Response::Ok(ResponseKind::Start(
-                    polaris_helper_proto::Start::Already { pid },
-                )));
-            }
-            // Go helper.go:349-351: cfg 空 → ERR no-config
-            if p.cfg.is_empty() {
-                return HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::new(
-                    polaris_helper_proto::ErrorCode::NoConfig,
-                )));
-            }
-            // Go helper.go:352-356: cfg 不在 confDir 白名单 → ERR config-path-denied
-            if !logic::cfg_allowed(&p.cfg, &self.conf_dir) {
-                return HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::new(
-                    polaris_helper_proto::ErrorCode::ConfigPathDenied,
-                )));
-            }
-            // **Polaris 新增（上游无）**：log 走与 cfg 同一条 lexical 白名单；`start_singbox`
-            // 再逐级持有 no-reparse/no-share-delete prefix，固定 current/.1 两个 file object。
-            // 否则 SYSTEM helper 既能越界创建，也会在用户可写父目录的 junction/rename 竞态中
-            // 写错对象。生产下发的 log 与 cfg 同在 conf_dir，收紧无行为变化；空串放行。
-            //
-            // cfg 内容仍属于登录账户信任域：同一账户可读 token 且可写 conf_dir。抵抗同账户恶意
-            // 进程需要签名 app identity + 完整资源闭包封存，不是 canonicalize/staging 主 JSON。
-            // 协议契约见 StartParams 文档。
-            if !p.log.is_empty() && !logic::cfg_allowed(&p.log, &self.conf_dir) {
-                return HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::new(
-                    polaris_helper_proto::ErrorCode::LogPathDenied,
-                )));
-            }
-            // P4（spec §3.4 · Q9）：exec 之前复核「核住的地方还是 SYSTEM 写、普通用户只读」吗。
-            // 判定为放宽/异常 → 拒起核（下方 `core_acl_gate`）。锁内调用：这一步是 3 次
-            // `GetNamedSecurityInfoW`，比本临界区里已有的 `start_singbox`（真起进程）便宜得多。
-            if let Some(err) = self.core_acl_gate() {
-                return HandleOutcome::Respond(Response::Err(err));
-            }
-            // Go helper.go:358-369: fwd=="1" → enableIPForwarding + startSingbox（均在生产侧
-            // start_singbox 内；失败 → ERR start）。持锁调用 —— start_singbox 起进程后即返回（不 Wait），
-            // 不长阻塞（与 Go 持 mu 调 c.Start() 同）。
-            match self
-                .proc
-                .start_singbox(&self.singbox_bin, &p.cfg, &p.log, p.fwd)
-            {
-                Ok(started) => {
-                    // Go helper.go:374-385: child = c（收割/Wait goroutine 由生产侧 ProcOps 承载）。
-                    state.pid = Some(started.pid);
-                    (started.pid, started.timing, started.created)
-                }
-                Err(e) => {
-                    return HandleOutcome::Respond(Response::Err(
-                        polaris_helper_proto::Error::with_detail(
-                            polaris_helper_proto::ErrorCode::Start,
-                            e.to_string(),
-                        ),
-                    ));
-                }
-            }
-            // MutexGuard 在此块结束时释放 → 下方接线看护时锁已放。
-        };
-
-        // ===== W15 修：父死看护接线（Go helper.go:386-389: ppid>0 → go watchParent）=====
-        // 此前 parent_pid 被丢弃 → app 崩溃/taskkill（管道 stop 够不到）后 sing-box 成孤儿。
-        // 必须在释放 child_mu 后接线（闭包重入 child_mu，持锁调用即自死锁）。
-        if let Some(ppid) = p.parent_pid.filter(|&ppid| ppid > 0) {
-            // is_current(child_pid)：child 是否仍是当前的（被 stop/cleanup/新 start 摘除后返 false）。
-            let st_cur = Arc::clone(&self.child_mu);
-            let is_current = Box::new(move |cpid: u32| {
-                st_cur.lock().unwrap_or_else(PoisonError::into_inner).pid == Some(cpid)
-            });
-            // on_parent_dead(child_pid)：与 stop 竞态下持锁摘除（独占收割权）→ 后台异步收割。
-            let st_dead = Arc::clone(&self.child_mu);
-            let proc = Arc::clone(&self.proc);
-            let on_parent_dead = Box::new(move |cpid: u32| {
-                let taken = {
-                    let mut s = st_dead.lock().unwrap_or_else(PoisonError::into_inner);
-                    if s.pid == Some(cpid) {
-                        s.pid.take()
-                    } else {
-                        None // 他人已摘除（Go: child != c）→ 由他收割
-                    }
-                };
-                if let Some(pid) = taken {
-                    proc.reap_child(pid);
-                }
-            });
-            self.proc
-                .spawn_watch_parent(ppid, started_pid, is_current, on_parent_dead);
-        }
-
-        // Go helper.go:390: OK started <pid>
-        HandleOutcome::Respond(Response::Ok(ResponseKind::Start(
-            polaris_helper_proto::Start::StartedTimed {
-                pid: started_pid,
-                timing: start_timing,
-                // D3：起核当时就把身份基线交给 app（**只发 created，绝不发 image**——
-                // image 的 hex 路径不是 u64，会让旧 app 的 timing 解析整段返回 None）。
-                created: started_created,
-            },
-        )))
-    }
-
-    /// `flush-dns` 分支（D4，Windows 新增；mac 的同名命令在 `platform/macos/flush_dns.rs`）。
-    ///
-    /// DNS 缓存是**机器级单缓存**，SYSTEM 下刷一次即全局生效（helper 与 app 不必各刷一次）。
-    /// 失败时把 helper 侧自捕的 stdout+stderr 带进 `ERR ipconfig <detail>` —— 报错路径日志为空
-    /// 等于这条腿没法诊断，而 ipconfig 的错误文字恰恰只在 stdout。
+    /// Flush the OS DNS cache through the SYSTEM helper.
     fn handle_flush_dns(&self) -> HandleOutcome {
         match self.proc.flush_dns() {
             Ok(()) => HandleOutcome::Respond(Response::Ok(ResponseKind::FlushDns(
@@ -534,8 +405,12 @@ where
         // （本模块顶部的并发纪律）。放锁后若真有 start 抢进来，rename 会硬失败 → `ERR rename …`，
         // 是一条如实的错误；`.new + rename` 保证半成品永远不会变成生效的那个文件。
         let busy = {
-            let mut state = self.child_mu.lock().unwrap_or_else(PoisonError::into_inner);
-            self.live_managed_pid(&mut state).is_some()
+            let Ok(mut state) = self.child_mu.lock() else {
+                return HandleOutcome::Respond(InstallResult::Busy.to_response());
+            };
+            state.closing
+                || self.live_managed_pid(&mut state).is_some()
+                || !self.proc.native_custody_empty()
         };
         if busy {
             return HandleOutcome::Respond(InstallResult::Busy.to_response());
@@ -706,8 +581,45 @@ where
         Path::new(&self.support_dir).join("core")
     }
 
+    fn handle_cleanup(&self, uninstall: bool) -> HandleOutcome {
+        let Ok(mut state) = self.child_mu.lock() else {
+            return native_busy();
+        };
+        if uninstall {
+            state.closing = true;
+        }
+        if let Some(native) = &state.native {
+            let target = native.target;
+            if !matches!(
+                stop_locked(&mut state, self.proc.as_ref(), target),
+                polaris_helper_proto::NativeBirthStop::Stopped { .. }
+            ) {
+                return native_busy();
+            }
+        }
+        if !self.proc.native_custody_empty() {
+            return native_busy();
+        }
+        if let Some(pid) = state.pid.take() {
+            self.proc.reap_child_blocking(pid);
+        }
+        // Keep ChildState locked through raw legacy cleanup: a new native Start
+        // cannot publish between removal and the external-image sweep.
+        let _ = self.proc.kill_all_singbox(&self.singbox_bin);
+        if uninstall {
+            self.proc
+                .spawn_self_uninstall(&self.service_name, &self.support_dir);
+            HandleOutcome::UninstallAndExit(Response::Ok(ResponseKind::Uninstalling))
+        } else {
+            HandleOutcome::Respond(Response::Ok(ResponseKind::Cleaned))
+        }
+    }
+
     /// 返回仍存活的受管核 pid；确定已死时原子清除陈旧记账。
     fn live_managed_pid(&self, state: &mut ChildState) -> Option<u32> {
+        if let Some(native) = &state.native {
+            return Some(native.target.pid.get());
+        }
         let pid = state.pid?;
         if self.proc.process_alive(pid) {
             Some(pid)
@@ -720,6 +632,15 @@ where
     /// `freeport` 分支（Go helper.go:295-337）。
     fn handle_freeport(&self, port: u16) -> HandleOutcome {
         // Go helper.go:308-316: listenPidsForPort 失败 → ERR enum
+        let Ok(native_state) = self.child_mu.lock() else {
+            return native_busy();
+        };
+        if native_state.closing
+            || native_state.native.is_some()
+            || !self.proc.native_custody_empty()
+        {
+            return native_busy();
+        }
         let pids = match self.net.listen_pids_for_port(port) {
             Ok(pids) => pids,
             Err(e) => {
@@ -822,26 +743,53 @@ where
         HandleOutcome::Respond(Response::Ok(ResponseKind::IfaceMetric))
     }
 
-    /// 服务停止/关机时的兜底收割（Go helper.go:400-410 `reapChildOnExit`）。
-    ///
-    /// 持锁摘 child → 不持锁 reap；child==nil 时兜底 killAllSingbox（覆盖「停止恰落在某次 stop 的
-    /// 后台收割窗口内」—— Go 注释 helper.go:398-399）。
-    pub fn reap_child_on_exit(&self) {
-        let pid = {
-            self.child_mu
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pid
-                .take()
-        };
-        if let Some(pid) = pid {
-            // 退出路径用**同步**收割（Go reapChildOnExit 的同步 terminateChild）：进程即将退出，
-            // 须在返回前杀完 child，否则后台异步收割线程随进程消失 → 孤儿。命令路径才用异步 reap_child。
-            self.proc.reap_child_blocking(pid);
-        } else {
-            let _ = self.proc.kill_all_singbox(&self.singbox_bin);
+    /// Permanently fence native Start under the same lock as spawn/publication.
+    pub fn begin_shutdown(&self) -> Result<(), String> {
+        match self.child_mu.lock() {
+            Ok(mut state) => {
+                state.closing = true;
+                Ok(())
+            }
+            Err(poison) => {
+                // Recover only to fence admission, never to mint an empty or stopped receipt.
+                poison.into_inner().closing = true;
+                Err("helper child custody lock poisoned".into())
+            }
         }
     }
+
+    /// One bounded native close attempt. Err retains both registries and the logger tail;
+    /// normal service/console exit must retry or remain alive rather than discard custody.
+    pub fn reap_child_on_exit(&self) -> Result<(), String> {
+        self.begin_shutdown()?;
+        let mut state = self
+            .child_mu
+            .lock()
+            .map_err(|_| "helper child custody lock poisoned")?;
+        if let Some(native) = &state.native {
+            let target = native.target;
+            let outcome = stop_locked(&mut state, self.proc.as_ref(), target);
+            if !matches!(
+                outcome,
+                polaris_helper_proto::NativeBirthStop::Stopped { .. }
+            ) {
+                return Err(format!(
+                    "native child shutdown remains unconfirmed: {outcome:?}"
+                ));
+            }
+        }
+        if state.native.is_some() || state.pid.is_some() || !self.proc.native_custody_empty() {
+            return Err("helper child custody is not confirmed empty".into());
+        }
+        Ok(())
+    }
+}
+
+fn native_busy() -> HandleOutcome {
+    HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+        polaris_helper_proto::ErrorCode::Other,
+        "busy native child custody pending or unknown; exact birth Stop required",
+    )))
 }
 
 #[cfg(test)]

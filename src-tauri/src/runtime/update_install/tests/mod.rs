@@ -345,7 +345,7 @@ fn windows_vbs_is_utf16le_with_bom() {
         "必须用 wscript（无窗口），非 cscript"
     );
     // UTF-16LE：ASCII 字符后必跟 0x00。
-    assert_eq!(spec.bytes[2], b'W');
+    assert_eq!(spec.bytes[2], b'S');
     assert_eq!(spec.bytes[3], 0x00);
     // 解回文本验证内容。
     let units: Vec<u16> = spec.bytes[2..]
@@ -690,4 +690,202 @@ fn android_has_no_install_script() {
 #[test]
 fn android_defers_the_advisory_to_a_readable_system_fact() {
     assert_eq!(install_advisory(&plan_of(InstallPlatform::Android)), None);
+}
+
+#[test]
+fn windows_install_requires_successful_synchronous_native_process_wait() {
+    let wait = windows_process_wait(12345);
+    assert_eq!(wait.matches("GetProcessById(").count(), 1);
+    assert!(wait.contains("GetProcessById(12345)"));
+    let query = wait.find("GetProcessById(12345)").unwrap();
+    let handle = wait.find("$null = $process.Handle").unwrap();
+    let native_wait = wait.find("$process.WaitForExit(120000)").unwrap();
+    assert!(query < handle && handle < native_wait);
+    let query_error = &wait[query..handle];
+    assert!(query_error.contains("$queryError.GetType() -eq [System.ArgumentException]"));
+    assert!(query_error.contains("exit 1"));
+    let wait_error = &wait[handle..];
+    assert!(
+        wait_error.contains("exit 2"),
+        "timeout must refuse installing"
+    );
+    assert!(wait_error.contains("catch { exit 1 }"));
+    assert!(!wait_error.contains("ArgumentException"));
+    assert!(wait_error.contains("$process.Dispose()"));
+    for forbidden in ["Stop-Process", ".Kill(", "Get-Process", "Start-Sleep"] {
+        assert!(!wait.contains(forbidden));
+    }
+
+    let bytes: Vec<u8> = windows_process_wait(std::process::id())
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let encoded = crate::runtime::mesh::base64_encode(&bytes);
+    for platform in [
+        InstallPlatform::WindowsPortable,
+        InstallPlatform::WindowsSetup,
+    ] {
+        let text = build_windows_vbs(&plan_of(platform), &InstallTexts::default());
+        assert!(text.contains(&format!(
+            "-NoProfile -NonInteractive -EncodedCommand {encoded}"
+        )));
+        assert!(text.contains("%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+        let synchronous = text.find("WshShell.Run(waitCommand, 0, True)").unwrap();
+        let refusal = text
+            .find("If waitError <> 0 Or waitResult <> 0 Then WScript.Quit 1")
+            .unwrap();
+        assert!(synchronous < refusal);
+        assert!(text[synchronous..refusal].contains("waitError = Err.Number"));
+        for effect in [
+            "fso.CopyFile",
+            "fso.MoveFile",
+            "fso.DeleteFile",
+            "WshShell.Run \"",
+        ] {
+            if let Some(index) = text.find(effect) {
+                assert!(
+                    refusal < index,
+                    "{platform:?}: {effect} precedes exit proof"
+                );
+            }
+        }
+        assert!(!text.contains("WScript.Sleep"));
+    }
+}
+
+#[test]
+fn all_unix_install_paths_wait_before_any_install_or_open() {
+    for plan in [
+        plan_of(InstallPlatform::LinuxAppImage),
+        plan_of(InstallPlatform::LinuxDeb),
+        plan_of(InstallPlatform::Macos),
+        InstallPlan {
+            app_bundle_path: None,
+            ..plan_of(InstallPlatform::Macos)
+        },
+    ] {
+        let text = String::from_utf8(script_of(&plan, &InstallTexts::default()).bytes).unwrap();
+        assert!(text.starts_with(&format!("#!/bin/bash\n{UNIX_EXIT_WAIT}\n")));
+        assert_eq!(text.matches(UNIX_EXIT_WAIT).count(), 1);
+        assert!(!text.contains("sleep 2"));
+    }
+}
+
+#[cfg(unix)]
+mod lifetime_wait {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "polaris-installer-wait-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn marker(&self) -> PathBuf {
+            self.0.join("installed")
+        }
+        fn command(&self) -> Command {
+            let mut command = Command::new("/bin/bash");
+            // This only writes a test marker: no installer, application, or real kernel runs.
+            command.arg("-c").arg(format!(
+                "{UNIX_EXIT_WAIT}\nprintf installed > {}",
+                sh_quote(&self.marker().to_string_lossy())
+            ));
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+            command
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn lifetime_pipe_blocks_beyond_two_seconds_then_only_eof_admits_marker() {
+        let fixture = Fixture::new();
+        let (mut child, writer) = spawn_with_lifetime_pipe(&mut fixture.command()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let prematurely_installed = fixture.marker().exists();
+        let prematurely_exited = child.try_wait().unwrap().is_some();
+        // Reading bytes is not EOF: count=1 or a single read must never admit installation.
+        let write_result = nix::unistd::write(&writer, b"lifetime is still held");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let installed_after_bytes = fixture.marker().exists();
+        let exited_after_bytes = child.try_wait().unwrap().is_some();
+        drop(writer);
+        let status = child.wait().unwrap();
+        assert!(!prematurely_installed && !prematurely_exited);
+        assert!(write_result.is_ok());
+        assert!(!installed_after_bytes && !exited_after_bytes);
+        assert!(status.success());
+        assert_eq!(std::fs::read(fixture.marker()).unwrap(), b"installed");
+    }
+
+    #[test]
+    fn non_pipe_and_pipe_read_error_refuse_install_effects() {
+        let fixture = Fixture::new();
+        let status = fixture.command().stdin(Stdio::null()).status().unwrap();
+        assert!(!status.success());
+        assert!(!fixture.marker().exists());
+
+        let (reader, writer) = lifetime_pipe().unwrap();
+        // fd 0 is a pipe, but its write-only descriptor cannot produce a successful read EOF.
+        let status = fixture
+            .command()
+            .stdin(Stdio::from(writer))
+            .status()
+            .unwrap();
+        drop(reader);
+        assert!(!status.success());
+        assert!(!fixture.marker().exists());
+    }
+
+    #[test]
+    fn both_pipe_ends_are_cloexec_and_spawn_failure_keeps_raii_close() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+        let (reader, writer) = lifetime_pipe().unwrap();
+        for fd in [&reader, &writer] {
+            let flags = fcntl(fd, FcntlArg::F_GETFD).unwrap();
+            assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
+        }
+        let fixture = Fixture::new();
+        let mut missing = Command::new(fixture.0.join("missing-program"));
+        let observer = reader.try_clone().unwrap();
+        // Nonblocking read distinguishes EOF from a leaked live writer without hanging the test.
+        fcntl(&observer, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+        assert!(spawn_with_pipe(&mut missing, (reader, writer)).is_err());
+        assert_eq!(nix::unistd::read(&observer, &mut [0u8; 1]).unwrap(), 0);
+        // The command still owns the read end after failed spawn; the local writer was dropped.
+        // Taking this read descriptor out of Command is unnecessary: its Drop closes it normally.
+        assert!(!fixture.marker().exists());
+    }
+
+    #[test]
+    fn production_writer_is_transferred_after_spawn_without_fallible_publication() {
+        // Check the narrow production lifetime transfer; other tests exercise real EOF/error IO.
+        let source = include_str!("../../update_install.rs");
+        let production = source.split("pub fn spawn_detached_script").nth(1).unwrap();
+        let spawn = production
+            .find("spawn_with_lifetime_pipe(&mut cmd)")
+            .unwrap();
+        let transfer = production.find("lifetime_writer.into_raw_fd()").unwrap();
+        assert!(spawn < transfer);
+        let success = production[spawn..transfer].split_once('?').unwrap().1;
+        assert!(!success.contains(".await"));
+        assert!(
+            !success.contains('?'),
+            "no fallible publication may close the successful writer"
+        );
+        assert!(!success.contains("drop(lifetime_writer)"));
+    }
 }

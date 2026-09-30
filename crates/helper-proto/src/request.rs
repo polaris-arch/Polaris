@@ -25,7 +25,7 @@
 use crate::command;
 use std::num::NonZeroU32;
 
-/// Opaque identity minted once per Linux helper-owned child birth.
+/// Opaque identity minted once per helper-owned child birth.
 ///
 /// This type only carries bytes. The helper must mint them from an OS random source;
 /// PID, clocks, addresses, and `Arc` identity are not birth tokens.
@@ -108,6 +108,12 @@ pub fn parse_linux_birth_stop_args(lines: &[&str]) -> Option<HelperBirthTarget> 
         return None;
     };
     HelperBirthTarget::parse_wire(pid, birth)
+}
+
+/// Strict decoder for macOS/Windows native-birth Stop arguments.
+#[must_use]
+pub fn parse_native_birth_stop_args(lines: &[&str]) -> Option<HelperBirthTarget> {
+    parse_linux_birth_stop_args(lines)
 }
 
 /// `start` 命令的参数（三平台同构，`helper.go:508-513` 等）。
@@ -205,6 +211,12 @@ pub enum Request {
     LinuxStatusBirth,
     /// Linux exact birth Stop; both identity lines are required.
     LinuxStopBirth { target: HelperBirthTarget },
+    /// macOS/Windows exact native birth Start. Legacy helpers reject this command.
+    NativeStartBirth(StartParams),
+    /// Read-only native birth capability and custody status.
+    NativeStatusBirth,
+    /// Stop one exact native birth; both identity lines are mandatory.
+    NativeStopBirth { target: HelperBirthTarget },
     /// `cleanup`（无参数行）。
     Cleanup,
     /// `freeport <port>`（行3/行2 = 端口字符串）。
@@ -254,6 +266,9 @@ impl Request {
             Self::LinuxStartBirth(_) => command::linux::START_BIRTH_SAFE,
             Self::LinuxStatusBirth => command::linux::STATUS_BIRTH_SAFE,
             Self::LinuxStopBirth { .. } => command::linux::STOP_BIRTH_SAFE,
+            Self::NativeStartBirth(_) => command::common::NATIVE_START_BIRTH,
+            Self::NativeStatusBirth => command::common::NATIVE_STATUS_BIRTH,
+            Self::NativeStopBirth { .. } => command::common::NATIVE_STOP_BIRTH,
             Self::Cleanup => command::common::CLEANUP,
             Self::FreePort { .. } => command::common::FREEPORT,
             Self::Start(_) => command::common::START,
@@ -285,6 +300,7 @@ impl Request {
             | Self::Version
             | Self::Status
             | Self::LinuxStatusBirth
+            | Self::NativeStatusBirth
             | Self::Cleanup
             | Self::FlushDns
             | Self::MacProxyCompareCapability
@@ -308,7 +324,7 @@ impl Request {
                     out.push(p.to_string());
                 }
             }
-            Self::LinuxStopBirth { target } => {
+            Self::LinuxStopBirth { target } | Self::NativeStopBirth { target } => {
                 out.push(target.pid.to_string());
                 out.push(target.birth.to_wire());
             }
@@ -316,7 +332,7 @@ impl Request {
                 // helper.go:362: port := strings.TrimSpace(readLine(r))
                 out.push(port.to_string());
             }
-            Self::Start(p) => {
+            Self::Start(p) | Self::NativeStartBirth(p) => {
                 // mac helper.go:508-513 / win helper-win/helper.go:339-344（无 singbox 行）
                 push_start_args(p, out);
             }

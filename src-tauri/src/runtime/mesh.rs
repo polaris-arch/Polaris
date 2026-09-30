@@ -138,6 +138,14 @@ pub struct MeshRuntime {
 }
 
 impl MeshRuntime {
+    pub fn begin_shutdown(&self) {
+        self.login_registry.begin_shutdown();
+    }
+
+    pub async fn shutdown_for_exit(&self) -> Result<(), String> {
+        self.login_registry.shutdown_for_exit().await
+    }
+
     /// 测试/未接线默认构造：出口路由 op **禁用**（`enabled=false`，helper=None）——诚实 no-op，绝不 shell
     /// 任何 `ip`/`route` 命令、绝不碰宿主网络。生产装配走 [`Self::new_with_helper`]（注入 helper + 启用真手术）。
     #[cfg(test)]
@@ -636,6 +644,13 @@ impl MeshRuntime {
     ) -> Result<bool, String> {
         self.login_registry
             .release_main_states_if_token(token, gate)
+    }
+
+    pub(crate) fn assert_tailscale_main_claims_drained(
+        &self,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        self.login_registry.assert_main_claims_drained(gate)
     }
 
     #[cfg(test)]

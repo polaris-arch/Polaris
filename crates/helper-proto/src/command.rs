@@ -25,6 +25,12 @@ pub mod common {
     pub const STOP: &str = "stop";
     /// `OK running <pid>` / `OK stopped`（查核状态）。
     pub const STATUS: &str = "status";
+    /// macOS/Windows native admission; legacy helpers reject before spawning.
+    pub const NATIVE_START_BIRTH: &str = "start-native-birth-safe";
+    /// Read-only native custody capability.
+    pub const NATIVE_STATUS_BIRTH: &str = "status-native-birth-safe";
+    /// Stop one exact native child birth and complete its platform tail.
+    pub const NATIVE_STOP_BIRTH: &str = "stop-native-birth-safe";
     /// `OK cleaned`（兜底清所有锁定二进制实例 + 摘 child）。
     pub const CLEANUP: &str = "cleanup";
     /// `OK free` / `OK killed <pids>` / `OK foreign <names>` / `ERR bad-port`（按端口定位 LISTEN 持有者）。

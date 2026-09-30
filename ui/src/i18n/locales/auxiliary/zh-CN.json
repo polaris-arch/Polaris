@@ -80,6 +80,7 @@
     "errRecheckFailed": "检查更新失败"
   },
   "native": {
+    "exitBlocked": "后台连接尚未确认关闭，应用保持运行，请重试退出。",
     "backupExportTitle": "导出 Polaris 配置备份",
     "backupImportTitle": "导入 Polaris 配置备份",
     "backupFileType": "Polaris 备份文件",

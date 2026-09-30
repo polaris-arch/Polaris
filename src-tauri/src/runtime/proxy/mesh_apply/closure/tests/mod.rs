@@ -4,7 +4,9 @@ use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshCandidate;
 use polaris_config_engine::user_config::mesh_route_state::{
     MeshOwnerRef, MeshRoutePolicy, MeshRouteState,
 };
-use polaris_core_supervisor::{ConfigCheckVerdict, KernelRejection, RejectedArray};
+use polaris_core_supervisor::{
+    ConfigCheckVerdict, KernelRejection, RejectedArray, ValidationLifecycleError,
+};
 use serde_json::json;
 use std::fs;
 
@@ -205,7 +207,7 @@ async fn materializer_snapshots_local_rule_bytes_and_emits_private_paths() {
         &plan,
         materialized.closure,
         "generator-1",
-        |_| std::future::ready(ConfigCheckVerdict::Accepted),
+        |_| std::future::ready(Ok(ConfigCheckVerdict::Accepted)),
         || Ok(()),
     )
     .await
@@ -615,7 +617,7 @@ async fn accepted_check_runs_before_manifest_publish() {
                 serde_json::to_vec_pretty(&config).unwrap()
             );
             assert!(!during_check.join("manifest.json").exists());
-            ConfigCheckVerdict::Accepted
+            Ok(ConfigCheckVerdict::Accepted)
         },
         || Ok(()),
     )
@@ -626,23 +628,35 @@ async fn accepted_check_runs_before_manifest_publish() {
 }
 
 #[tokio::test]
-async fn rejected_unattributable_and_unavailable_checks_leave_no_manifest() {
+async fn rejected_unavailable_and_lifecycle_unknown_checks_leave_no_manifest() {
     let cases = [
         (
-            ConfigCheckVerdict::Rejected(KernelRejection {
+            Ok(ConfigCheckVerdict::Rejected(KernelRejection {
                 array: RejectedArray::Outbounds,
                 index: 0,
                 detail: "rejected".into(),
-            }),
+            })),
             PreflightError::CoreRejected,
         ),
         (
-            ConfigCheckVerdict::Unattributable("bad route".into()),
+            Ok(ConfigCheckVerdict::Unattributable("bad route".into())),
             PreflightError::CoreUnattributable,
         ),
         (
-            ConfigCheckVerdict::Unavailable("timeout".into()),
+            Ok(ConfigCheckVerdict::Unavailable("timeout".into())),
             PreflightError::CoreUnavailable,
+        ),
+        (
+            Err(ValidationLifecycleError::Closing),
+            PreflightError::ValidationLifecycle(ValidationLifecycleError::Closing),
+        ),
+        (
+            Err(ValidationLifecycleError::CleanupUnconfirmed(
+                "same-child wait pending".into(),
+            )),
+            PreflightError::ValidationLifecycle(ValidationLifecycleError::CleanupUnconfirmed(
+                "same-child wait pending".into(),
+            )),
         ),
     ];
     for (verdict, expected_error) in cases {
@@ -697,7 +711,7 @@ async fn changed_binary_or_payload_after_check_cannot_publish_manifest() {
         &plan,
         closure,
         "generator-1",
-        |_| std::future::ready(ConfigCheckVerdict::Accepted),
+        |_| std::future::ready(Ok(ConfigCheckVerdict::Accepted)),
         || Err(PreflightError::BinaryChanged),
     )
     .await;
@@ -722,7 +736,7 @@ async fn changed_binary_or_payload_after_check_cannot_publish_manifest() {
         &plan,
         closure,
         "generator-1",
-        |_| std::future::ready(ConfigCheckVerdict::Accepted),
+        |_| std::future::ready(Ok(ConfigCheckVerdict::Accepted)),
         move || {
             fs::write(config_path, b"tampered").unwrap();
             Ok(())

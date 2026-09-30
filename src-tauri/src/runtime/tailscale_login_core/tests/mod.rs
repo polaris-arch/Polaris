@@ -13,6 +13,7 @@ mod capacity;
 /// 真子进程腿：探针只在 unix 有（理由见 [`crate::test_support::write_sleeping_probe`]）。
 #[cfg(unix)]
 mod config_checker_process;
+mod process_exit;
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -58,6 +59,20 @@ impl LoginCoreChild for FakeLoginCoreChild {
         // 直到「退出」信号（自然退出或被终止）才返回；否则永挂（模拟核仍在等认证）。
         let mut rx = self.exited_rx.clone();
         let _ = rx.wait_for(|v| *v).await;
+    }
+    async fn wait_result(&mut self) -> Result<(), String> {
+        self.exited_rx
+            .wait_for(|exited| *exited)
+            .await
+            .map(|_| ())
+            .map_err(|_| "fixture exit channel closed".into())
+    }
+    async fn after_exit(&mut self) -> Result<(), String> {
+        if *self.exited_rx.borrow() {
+            Ok(())
+        } else {
+            Err("fixture child has not exited".into())
+        }
     }
     async fn close_confirmed(&mut self) -> Result<(), String> {
         self.state.close_started.fetch_add(1, Ordering::SeqCst);

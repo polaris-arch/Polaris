@@ -4,7 +4,8 @@
 //! 1. **命名管道监听**（`service.go:37-44` `listen` + `service.go:48-57` `serve`）：创建 SDDL 防护的命名管道
 //!    （`\\.\pipe\polaris-helper`，SDDL=`D:(A;;FA;;;SY)(A;;GRGW;;;IU)`），accept 循环，每连接一个线程跑//!    [`crate::platform::windows::helper::WinHelper::handle`]。
 //! 2. **SCM 服务托管**（`service.go:64-93` `Execute` + `main.go:39-42`）：注册服务控制处理器，
-//!    STOP/SHUTDOWN → reapChildOnExit → 关 listener → 报 Stopped 退出。
+//!    STOP/SHUTDOWN closes admission and the listener, then retains native custody
+//!    while retrying close. Only confirmed native exit and writer revoke allow Stopped.
 
 // 具体 item 才局部放开 crate 级 `#![deny(unsafe_code)]`：SCM/命名管道/SDDL 的 windows-sys FFI 调用
 // （CreateNamedPipeW/ConnectNamedPipe/ConvertStringSecurityDescriptorToSecurityDescriptorW/
@@ -18,7 +19,7 @@ use crate::token::FileTokenStore;
 use polaris_helper_proto::codec::MAX_FRAME_BYTES;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, FALSE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
@@ -70,6 +71,12 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// 存 `usize` 而非句柄类型：`static` 要求 `Sync`，而 `SERVICE_STATUS_HANDLE` 是裸指针别名。
 /// 0 = 尚未注册。
 static STATUS_HANDLE: AtomicUsize = AtomicUsize::new(0);
+static STOP_CHECKPOINT: AtomicU32 = AtomicU32::new(0);
+
+type ProductionHelper = WinHelper<FileTokenStore, WinProcOps, WinProcOps>;
+// SCM callbacks need the same synchronous admission fence as Start. This Arc remains
+// retained for this service process, including while an unconfirmed shutdown retries.
+static SERVICE_HELPER: std::sync::OnceLock<Arc<ProductionHelper>> = std::sync::OnceLock::new();
 
 /// 服务运行配置（main 解析 flags 后构造）。
 pub struct ServiceConfig {
@@ -103,16 +110,22 @@ pub fn run_console(cfg: ServiceConfig) -> std::io::Result<()> {
     let helper = build_helper(&cfg);
     let helper = Arc::new(helper);
     let helper_for_stop = helper.clone();
-    // Ctrl+C → reapChildOnExit + 设 STOP_REQUESTED → serve 退出。
-    let _ = ctrl_c_handler(move || {
-        helper_for_stop.reap_child_on_exit();
-        STOP_REQUESTED.store(true, Ordering::SeqCst);
-    });
-    serve(helper)
+    ctrl_c_handler(move || match helper_for_stop.reap_child_on_exit() {
+        Ok(()) => {
+            STOP_REQUESTED.store(true, Ordering::SeqCst);
+            wake_accept_loop();
+        }
+        Err(error) => {
+            log::error!("console shutdown unconfirmed; helper custody retained: {error}");
+        }
+    })?;
+    let served = serve(helper.clone());
+    drain_for_exit(helper.as_ref(), || {});
+    served
 }
 
 /// 构造生产 WinHelper（FileTokenStore + WinProcOps）。
-fn build_helper(cfg: &ServiceConfig) -> WinHelper<FileTokenStore, WinProcOps, WinProcOps> {
+fn build_helper(cfg: &ServiceConfig) -> ProductionHelper {
     let token = FileTokenStore::new(&cfg.support_dir);
     let proc = WinProcOps::new();
     let net = WinProcOps::new();
@@ -310,9 +323,14 @@ where
     write_response(h, reply.line.as_bytes(), reply.flush);
     cleanup_pipe(h);
     if reply.exit_after {
-        // 800ms 后 os.Exit（Go helper.go:291-294）。
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        std::process::exit(0);
+        // Uninstall uses the same service/console drain instead of bypassing it with exit().
+        match helper.reap_child_on_exit() {
+            Ok(()) => {
+                STOP_REQUESTED.store(true, Ordering::SeqCst);
+                wake_accept_loop();
+            }
+            Err(error) => log::error!("uninstall exit unconfirmed; helper retained: {error}"),
+        }
     }
 }
 
@@ -527,6 +545,10 @@ extern "system" fn service_main_entry(_argc: u32, _argv: *mut windows_sys::core:
     };
     let helper = build_helper(cfg);
     let helper = Arc::new(helper);
+    if SERVICE_HELPER.set(helper.clone()).is_err() {
+        log::error!("service helper custody was already registered");
+        return;
+    }
     let status_handle = register_ctrl_handler();
     if status_handle.is_null() {
         return;
@@ -542,9 +564,30 @@ extern "system" fn service_main_entry(_argc: u32, _argv: *mut windows_sys::core:
     );
     // serve（阻塞）。STOP/SHUTDOWN 时 ctrl_handler 设 STOP_REQUESTED → serve 退出。
     let _ = serve(helper.clone());
-    // reapChildOnExit（service.go:84-85：先收割 child 再退出，杜绝孤儿）。
-    helper.reap_child_on_exit();
+    // StopPending is a request, not an exit receipt. This loop owns an Arc even after
+    // the pipe listener stops and retries native close without depending on IPC clients.
+    drain_for_exit(helper.as_ref(), || {
+        let _ = set_status(status_handle, SERVICE_STOP_PENDING, 0);
+    });
     let _ = set_status(status_handle, SERVICE_STOPPED, 0);
+}
+
+fn drain_for_exit<T, P, N>(helper: &WinHelper<T, P, N>, mut pending: impl FnMut())
+where
+    T: crate::token::TokenStore,
+    P: crate::platform::windows::ops::ProcOps + 'static,
+    N: crate::platform::windows::ops::NetTableOps,
+{
+    loop {
+        match helper.reap_child_on_exit() {
+            Ok(()) => return,
+            Err(error) => {
+                log::error!("service shutdown unconfirmed; custody retained: {error}");
+                pending();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
 }
 
 /// 注册 SCM 控制处理器。
@@ -567,6 +610,14 @@ extern "system" fn ctrl_handler(
 ) -> u32 {
     match ctrl {
         SERVICE_CONTROL_STOP | windows_sys::Win32::System::Services::SERVICE_CONTROL_SHUTDOWN => {
+            if let Some(helper) = SERVICE_HELPER.get() {
+                if let Err(error) = helper.begin_shutdown() {
+                    log::error!("service admission fence remains unknown: {error}");
+                }
+            } else {
+                log::error!("service shutdown rejected: helper custody not registered");
+                return 1;
+            }
             STOP_REQUESTED.store(true, Ordering::SeqCst);
             // 诚实上报中间态：此前从不上报 STOP_PENDING，SCM 记录仍是 RUNNING，`sc stop` 直接
             // 返回成功而进程还在跑 —— 比「卡在 STOP_PENDING」更静默。
@@ -637,6 +688,11 @@ fn set_status(handle: SERVICE_STATUS_HANDLE, state: u32, accepts: u32) -> std::i
     status.dwCurrentState = state;
     status.dwControlsAccepted = accepts;
     status.dwWin32ExitCode = 0;
+    if state == SERVICE_STOP_PENDING {
+        status.dwCheckPoint = STOP_CHECKPOINT
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+    }
     status.dwWaitHint = 30000; // 30s
                                // SAFETY: SetServiceStatus 报状态。
     let ok = unsafe { SetServiceStatus(handle, &status) };

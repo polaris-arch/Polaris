@@ -490,8 +490,7 @@ fn build_windows_vbs(plan: &InstallPlan, texts: &InstallTexts) -> String {
     let Some(old_exe_p) = plan.portable_target.as_ref() else {
         // NSIS 安装态：跑 setup 原位升级 + 删自身。
         return [
-            "WScript.Sleep 2000".to_string(),
-            "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
+            windows_exit_wait(std::process::id()),
             // 🔴 `/UPDATE`，**不是 上游的 `--updated`**（2026-08-05 修）：`--updated` 是
             // **electron-builder** 的约定（它的模板里由 `${isUpdated}` 消费），换到 Tauri 后不成立。
             // Tauri 的 NSIS 模板解析的是 `/UPDATE`（tauri-cli 2.11.4 内嵌模板逐字：
@@ -523,8 +522,7 @@ fn build_windows_vbs(plan: &InstallPlan, texts: &InstallTexts) -> String {
     let src_display = vbs_str(&src_raw);
 
     [
-        "WScript.Sleep 2000".to_string(),
-        "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
+        windows_exit_wait(std::process::id()),
         "Set fso = CreateObject(\"Scripting.FileSystemObject\")".to_string(),
         format!("src = \"{src}\""),
         format!("oldExe = \"{old_exe}\""),
@@ -565,6 +563,58 @@ fn build_windows_vbs(plan: &InstallPlan, texts: &InstallTexts) -> String {
     .join("\r\n")
 }
 
+/// Query absence and waiting on an acquired native process object are separate facts.
+/// No query failure other than exact ArgumentException grants install permission.
+fn windows_process_wait(pid: u32) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $process = $null\n\
+         try {{\n\
+           try {{ $process = [System.Diagnostics.Process]::GetProcessById({pid}) }}\n\
+           catch {{\n\
+             $queryError = $_.Exception\n\
+             while ($null -ne $queryError.InnerException) {{ $queryError = $queryError.InnerException }}\n\
+             if ($queryError.GetType() -eq [System.ArgumentException]) {{ exit 0 }}\n\
+             exit 1\n\
+           }}\n\
+           try {{\n\
+             $null = $process.Handle\n\
+             if ($process.WaitForExit(120000)) {{ exit 0 }}\n\
+             exit 2\n\
+           }} catch {{ exit 1 }}\n\
+         }} finally {{\n\
+           if ($null -ne $process) {{ $process.Dispose() }}\n\
+         }}"
+    )
+}
+
+fn windows_exit_wait(pid: u32) -> String {
+    let bytes: Vec<u8> = windows_process_wait(pid)
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let encoded = crate::runtime::mesh::base64_encode(&bytes);
+    [
+        "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
+        format!(
+            "waitCommand = \"\"\"\" & WshShell.ExpandEnvironmentStrings(\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\") & \"\"\" -NoProfile -NonInteractive -EncodedCommand {encoded}\""
+        ),
+        "On Error Resume Next".to_string(),
+        "Err.Clear".to_string(),
+        "waitResult = WshShell.Run(waitCommand, 0, True)".to_string(),
+        "waitError = Err.Number".to_string(),
+        "On Error Goto 0".to_string(),
+        "If waitError <> 0 Or waitResult <> 0 Then WScript.Quit 1".to_string(),
+    ]
+    .join("\r\n")
+}
+
+// The parent's write descriptor stays open until OS process exit, not Ready/commit/Drop.
+// dd reads fd 0 through File and preserves read errors. Some cat implementations turn
+// stdin EBADF into EOF. No count/noerror option may permit admission before real EOF.
+const UNIX_EXIT_WAIT: &str =
+    "[ -p /dev/fd/0 ] || exit 1\n/bin/dd bs=4096 of=/dev/null 2>/dev/null || exit 1";
+
 /// macOS 更新脚本（移植 `buildMacUpdateScript`）。
 ///
 /// # ad-hoc 签名的关键一步
@@ -576,12 +626,12 @@ fn build_mac_script(plan: &InstallPlan) -> String {
     let dmg = sh_quote(&plan.installer_path.to_string_lossy());
     let Some(bundle) = plan.app_bundle_path.as_ref() else {
         // 定位不到 `.app` → 回退手动拖拽（**不猜路径**）。
-        return format!("#!/bin/bash\nsleep 2\nopen {dmg}\n");
+        return format!("#!/bin/bash\n{UNIX_EXIT_WAIT}\nopen {dmg}\n");
     };
     let dest = sh_quote(&bundle.to_string_lossy());
     [
         "#!/bin/bash",
-        "sleep 2",
+        UNIX_EXIT_WAIT,
         &format!("DMG={dmg}"),
         &format!("DEST={dest}"),
         "BAK=\"$DEST.bak-$$\"",
@@ -659,7 +709,7 @@ fn build_linux_appimage_script(plan: &InstallPlan) -> String {
     );
     [
         "#!/bin/bash",
-        "sleep 2",
+        UNIX_EXIT_WAIT,
         &format!("NEW={src}"),
         &format!("DEST={dst}"),
         // 只覆盖 AppImage 这一个文件；`~/.config/polaris` 不动 → 配置 + 已更新内核零丢失。
@@ -683,7 +733,7 @@ fn build_linux_deb_script(plan: &InstallPlan) -> String {
     let exe = sh_quote(&plan.exe_path.to_string_lossy());
     [
         "#!/bin/bash",
-        "sleep 2",
+        UNIX_EXIT_WAIT,
         &format!("DEB={deb}"),
         &format!("EXE={exe}"),
         // apt-get install 本地 deb（apt 1.1+ 支持绝对路径）：解依赖 + 同包名版本升级。
@@ -705,7 +755,7 @@ fn build_linux_deb_script(plan: &InstallPlan) -> String {
 
 /// 写脚本到临时目录并 `spawn(detached)`（**执行腿**）。
 ///
-/// 调用方必须**先**停代理（Windows 文件占用会让替换失败），**后**退出应用。
+/// 调用方先完成受管进程的严格 drain，再生成脚本；脚本还须等待旧应用的 OS 退出。
 ///
 /// # Errors
 ///
@@ -736,9 +786,55 @@ pub fn spawn_detached_script(dir: &Path, spec: &ScriptSpec) -> Result<PathBuf, S
             });
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::fd::IntoRawFd;
+        let (child, lifetime_writer) = spawn_with_lifetime_pipe(&mut cmd)
+            .map_err(|e| format!("启动安装脚本失败 {}: {e}", spec.program))?;
+        // No await or fallible publication after spawn: only OS process exit closes this fd.
+        // CLOEXEC prevents subsequent child processes from extending this lifetime.
+        let _process_lifetime_fd = lifetime_writer.into_raw_fd();
+        drop(child);
+    }
+    #[cfg(not(unix))]
     cmd.spawn()
         .map_err(|e| format!("启动安装脚本失败 {}: {e}", spec.program))?;
     Ok(path)
+}
+
+#[cfg(unix)]
+fn lifetime_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    let pipe = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC);
+    #[cfg(not(target_os = "linux"))]
+    let pipe = nix::unistd::pipe();
+    let (reader, writer) = pipe.map_err(std::io::Error::from)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        // Darwin lacks pipe2. A concurrent fork before both fcntls can only delay EOF.
+        for fd in [&reader, &writer] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(std::io::Error::from)?;
+        }
+    }
+    Ok((reader, writer))
+}
+
+#[cfg(unix)]
+fn spawn_with_lifetime_pipe(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, std::os::fd::OwnedFd)> {
+    spawn_with_pipe(cmd, lifetime_pipe()?)
+}
+
+#[cfg(unix)]
+fn spawn_with_pipe(
+    cmd: &mut std::process::Command,
+    (reader, writer): (std::os::fd::OwnedFd, std::os::fd::OwnedFd),
+) -> std::io::Result<(std::process::Child, std::os::fd::OwnedFd)> {
+    cmd.stdin(std::process::Stdio::from(reader));
+    let child = cmd.spawn()?;
+    Ok((child, writer))
 }
 
 #[cfg(test)]

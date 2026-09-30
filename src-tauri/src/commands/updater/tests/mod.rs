@@ -2695,60 +2695,43 @@ fn auto_close_timer_is_generation_guarded() {
         );
 }
 
-/// 🔴 detached spawn 失败时，任何退出副作用都不能发生；成功后必须严格 Quit → Exit，各一次。
-///
-/// **变异探针**：在 `?` 前先调 `mark_quit()` ⇒ 错误腿的 effects 非空，行为门转红。
+/// Detached spawn 失败不得提交退出；成功后消费持锁的 Ready，提交失败也不得报成功。
 #[test]
 fn complete_detached_install_owns_success_effects_and_leaves_errors_untouched() {
     let effects = std::cell::RefCell::new(Vec::new());
-    let failed: Result<(), &str> = complete_detached_install(
-        Err("spawn failed"),
-        || effects.borrow_mut().push("quit"),
-        || effects.borrow_mut().push("exit"),
-    );
-    assert_eq!(failed, Err("spawn failed"), "错误必须原样交回调用者");
-    assert!(
-        effects.borrow().is_empty(),
-        "detached spawn 失败时不得宣告退出或退出进程"
-    );
-
-    let completed: Result<&str, &str> = complete_detached_install(
-        Ok("detached-script"),
-        || effects.borrow_mut().push("quit"),
-        || effects.borrow_mut().push("exit"),
-    );
+    let failed: Result<(), &str> = complete_detached_install(Err("spawn failed"), || {
+        effects.borrow_mut().push("commit");
+        Ok(())
+    });
+    assert_eq!(failed, Err("spawn failed"));
+    assert!(effects.borrow().is_empty());
+    let completed: Result<&str, &str> = complete_detached_install(Ok("detached-script"), || {
+        effects.borrow_mut().push("commit");
+        Ok(())
+    });
     assert_eq!(completed, Ok("detached-script"));
-    assert_eq!(
-        effects.into_inner(),
-        vec!["quit", "exit"],
-        "成功路径必须严格先 Quit、再 Exit，且两者各一次"
-    );
+    assert_eq!(*effects.borrow(), vec!["commit"]);
+    let rejected: Result<&str, &str> =
+        complete_detached_install(Ok("detached-script"), || Err("ready invalid"));
+    assert_eq!(rejected, Err("ready invalid"));
 }
 
-/// 调用点只负责执行 spawn 并提供两条同步副作用；控制流、错误隔离与先后次序都归
-/// [`complete_detached_install`]。这个接线契约防止 command 重新在 helper 外越权置状态或 exit。
 #[test]
 fn update_install_delegates_detached_spawn_to_completion_helper() {
     let body =
         crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
-    assert!(
-        body.contains("let detached_spawn = update_install::spawn_detached_script(&dir, &spec);"),
-        "command 必须先实际执行 detached spawn，再把它的 Result 交控制流 helper"
-    );
-    assert_eq!(
-        body.matches("complete_detached_install(").count(),
-        1,
-        "update_install 必须只把这一处 spawn Result 交给 completion helper"
-    );
-    assert!(
-        body.contains("|| mark_explicit_update_quit(&app)")
-            && body.contains("|| exit_after_detached_update(&app)"),
-        "command 只能注入 Quit/Exit 副作用，不得自管成功控制流"
-    );
-    assert!(
-        !body.contains("app.state::<QuitState>()") && !body.contains("app.exit(0)"),
-        "QuitState 与 app.exit 均不得在 command helper 外直接执行"
-    );
+    let prepare = body.find("prepare_desktop_exit(&app).await").unwrap();
+    let spawn = body
+        .find("let detached_spawn = update_install::spawn_detached_script(&dir, &spec);")
+        .unwrap();
+    let complete = body
+        .find("complete_detached_install(detached_spawn, || {")
+        .unwrap();
+    assert!(prepare < spawn && spawn < complete);
+    assert_eq!(body.matches("complete_detached_install(").count(), 1);
+    assert!(body[complete..].contains("commit_desktop_exit("));
+    assert!(!body.contains("app.state::<QuitState>()") && !body.contains("app.exit(0)"));
+    assert!(!body.contains("proxy.status().running") && !body.contains("proxy.stop().await"));
 }
 
 // ── 更新进度快照槽：切走再切回来不丢进度 ────────────────────────────────
@@ -2961,15 +2944,15 @@ fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
     let android = body
         .find("if plan.platform == update_install::InstallPlatform::Android {")
         .expect("Android 分流不见了 —— 那条腿会掉进桌面的脚本路径");
-    let stop = body
-        .find("proxy.stop()")
-        .expect("停代理那一步不见了 —— 本条次序判据失去了它要比的另一端");
+    let prepare = body
+        .find("crate::exit_lifecycle::prepare_desktop_exit(&app).await")
+        .expect("严格退出准备门不见了 —— 本条次序判据失去了它要比的另一端");
     let script = body
         .find("update_install::build_install_script(&plan, &texts)")
         .expect("建脚本那一步不见了 —— 本条次序判据失去了它要比的另一端");
 
     assert!(
-        android < stop,
+        android < prepare,
         "Android 分流必须在停代理**之前**：用户在系统确认框上按取消之后，\
          留下的不该是一条已经被停掉的隧道"
     );
@@ -2979,7 +2962,11 @@ fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
     );
 
     // 早退必须是真的早退（`return`），不是算完一个值又往下走。
-    let branch = &body[android..stop];
+    let detach = body
+        .find("update_install::spawn_detached_script(&dir, &spec)")
+        .expect("安装器启动不见了");
+    assert!(prepare < detach, "安装器必须等待严格退出准备成功");
+    let branch = &body[android..prepare];
     assert!(
         branch.contains("return Ok("),
         "Android 分支必须整条 return —— 落下去就会碰到后面那三件不可逆的事"

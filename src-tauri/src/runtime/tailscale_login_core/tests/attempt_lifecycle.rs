@@ -16,6 +16,12 @@ impl LoginCoreChild for SlowChild {
     async fn wait(&mut self) {
         self.child.wait().await;
     }
+    async fn wait_result(&mut self) -> Result<(), String> {
+        self.child.wait_result().await
+    }
+    async fn after_exit(&mut self) -> Result<(), String> {
+        self.child.after_exit().await
+    }
     async fn terminate(&mut self) {
         self.terminating.add_permits(1);
         self.release.acquire().await.unwrap().forget();
@@ -125,6 +131,47 @@ async fn main_birth_token_only_retires_its_own_complete_claim() {
 }
 
 #[tokio::test]
+async fn confirmed_reservation_stop_commits_only_exact_registered_claim() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let gate = reg.state_gate().await;
+    reg.assert_main_claims_drained(&gate).unwrap();
+    let generated =
+        json!({"endpoints":[{"type":"tailscale", "state_directory":root.join("tailscale/ts1")}]});
+    let token = reg.mint_main_birth();
+    let mut reservation = reg
+        .reserve_main_states(&generated, &root, &gate, token.clone())
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    assert!(reg.assert_main_claims_drained(&gate).is_err());
+    assert!(reservation
+        .release_confirmed_stop_claim(&reg.mint_main_birth())
+        .is_err());
+    assert!(reservation.registered);
+    assert!(reservation.external_possible);
+    assert!(reg.main_claims("ts1"));
+    reservation.release_confirmed_stop_claim(&token).unwrap();
+    reg.assert_main_claims_drained(&gate).unwrap();
+    assert!(!reservation.registered);
+    assert!(!reg.main_claims("ts1"));
+    assert!(reservation.release_confirmed_stop_claim(&token).is_err());
+    drop(reservation);
+    let successor = claim_main_for_test(&reg, &generated, &root, &gate).await;
+    assert!(
+        reg.main_claims("ts1"),
+        "committed old guard cannot roll back a successor"
+    );
+    assert!(reg.release_main_states_if_token(&successor, &gate).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn main_birth_requires_actual_registry_and_gate() {
     let make = || {
         reg_with(
@@ -141,6 +188,7 @@ async fn main_birth_requires_actual_registry_and_gate() {
         json!({"endpoints":[{"type":"tailscale", "state_directory":root.join("tailscale/ts1")}]});
     let a_gate = a.state_gate().await;
     let b_gate = b.state_gate().await;
+    assert!(a.assert_main_claims_drained(&b_gate).is_err());
     let a_token = a.mint_main_birth();
     assert!(a
         .reserve_main_states(&generated, &root, &b_gate, a_token.clone())
@@ -559,6 +607,7 @@ async fn local_owner_fact_does_not_infer_vacancy_from_missing_pid_or_retained_cl
             pid: None,
             cancel_tx,
             closed_rx,
+            _child: None,
         },
     );
     let gate = reg.state_gate().await;

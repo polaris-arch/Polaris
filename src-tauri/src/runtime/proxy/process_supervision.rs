@@ -4,29 +4,33 @@
 //! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs` /
 //! `win_console.rs`），façade 必须 `pub(crate) use` 再导出（§B.3）。
 
-#[allow(dead_code)] // Stopping custody is dormant until its exact supervisor is wired.
+#[allow(dead_code)] // The managed exact supervisor remains dormant.
 mod direct_custody;
 #[allow(dead_code)] // No production commit bridge exists in this slice.
 mod direct_stop;
 pub(crate) use direct_custody::DirectCoreSlot;
+use direct_custody::WorkerNonce;
 #[cfg(test)]
 pub(super) use direct_custody::{
     DirectBirthCloseError, ReserveStoppingError, SlotAdmissionError, StopView, TakeRunningError,
 };
 pub(super) use direct_custody::{HelperStartToken, HelperStopNonce};
+pub(super) use direct_stop::DirectStopIo;
+use direct_stop::NativeStopIo;
 #[cfg(test)]
 pub(super) use direct_stop::{
     commit_for_test, prepare_direct_stop, prepare_with_io_for_test, CommitDirectStopError,
-    CommitRejected, DirectStopIo, DirectStopObservation, DirectStopProvenance, PrepareError,
-    StopWaitOutcome,
+    CommitRejected, DirectStopObservation, DirectStopProvenance, PrepareError, StopWaitOutcome,
 };
 
+use std::future::poll_fn;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use polaris_core_supervisor::{scan_running_cores, stale_pids, ProcessKiller, Signal};
+use polaris_core_supervisor::{scan_running_cores, stale_pids, Signal};
 use tokio::process::Child;
 
 use crate::runtime::helper::{HelperStopOps, HelperStopTarget};
@@ -189,6 +193,46 @@ impl Drop for HelperStopPermit {
     }
 }
 
+/// Owns only the ordinary direct Stop booking. The Child never leaves the
+/// slot, including when its native wait future is cancelled or errors.
+struct NativeStopBooking {
+    slot: Arc<std::sync::Mutex<DirectCoreSlot>>,
+    identity: RunIdentity,
+    nonce: WorkerNonce,
+}
+
+impl NativeStopBooking {
+    fn poll_wait(
+        &self,
+        cx: &mut Context<'_>,
+        io: &dyn DirectStopIo,
+    ) -> Poll<Result<std::process::ExitStatus, String>> {
+        match self.slot.lock() {
+            Ok(mut slot) => slot.poll_native_wait(&self.identity, &self.nonce, cx, |child, cx| {
+                io.poll_wait(child, cx)
+            }),
+            Err(_) => Poll::Ready(Err(
+                "direct Child custody poisoned during native wait".into()
+            )),
+        }
+    }
+
+    fn signal(&self, signal: impl FnOnce(&mut Child) -> std::io::Result<()>) -> Result<(), String> {
+        self.slot
+            .lock()
+            .map_err(|_| "direct Child custody poisoned before stop signal".to_owned())?
+            .signal_native_stop(&self.identity, &self.nonce, signal)
+    }
+}
+
+impl Drop for NativeStopBooking {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            slot.finish_native_stop_booking(&self.identity, &self.nonce);
+        }
+    }
+}
+
 /// Identity of one locally spawned core. The token is minted before spawn and
 /// attached only to the resulting Child, so neither a reused PID nor a later
 /// lifecycle request can impersonate that run.
@@ -219,7 +263,9 @@ impl RunIdentity {
 }
 
 pub(super) struct DirectCoreRun {
-    pub(super) child: Child,
+    child: Option<Child>,
+    #[cfg(unix)]
+    lost_wait_ownership: bool,
     pub(super) identity: RunIdentity,
     #[allow(dead_code)] // Read when the managed coordinator's exact stop gate is wired.
     pub(super) origin: DirectRunOrigin,
@@ -252,11 +298,87 @@ impl DirectCoreRun {
 
     pub(super) fn with_identity(child: Child, identity: RunIdentity) -> Self {
         Self {
-            child,
+            child: Some(child),
+            #[cfg(unix)]
+            lost_wait_ownership: false,
             identity,
             origin: DirectRunOrigin::Legacy,
             main_token: None,
         }
+    }
+
+    fn wait_allowed(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if self.lost_wait_ownership {
+            return Err(std::io::Error::from_raw_os_error(
+                nix::errno::Errno::ECHILD as i32,
+            ));
+        }
+        Ok(())
+    }
+
+    fn retain_wait_error(&mut self, error: &std::io::Error) {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
+            self.lost_wait_ownership = true;
+        }
+        #[cfg(not(unix))]
+        let _ = error;
+    }
+
+    pub(super) fn try_wait_with(
+        &mut self,
+        wait: impl FnOnce(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.wait_allowed()?;
+        let result = wait(self.child.as_mut().expect("custody Child retained"));
+        if let Err(error) = &result {
+            self.retain_wait_error(error);
+        }
+        result
+    }
+
+    pub(super) fn poll_wait_with(
+        &mut self,
+        cx: &mut Context<'_>,
+        wait: impl FnOnce(
+            &mut Child,
+            &mut Context<'_>,
+        ) -> Poll<std::io::Result<std::process::ExitStatus>>,
+    ) -> Poll<std::io::Result<std::process::ExitStatus>> {
+        if let Err(error) = self.wait_allowed() {
+            return Poll::Ready(Err(error));
+        }
+        let result = wait(self.child.as_mut().expect("custody Child retained"), cx);
+        if let Poll::Ready(Err(error)) = &result {
+            self.retain_wait_error(error);
+        }
+        result
+    }
+
+    pub(super) fn signal_with(
+        &mut self,
+        signal: impl FnOnce(&mut Child) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.wait_allowed()?;
+        signal(self.child.as_mut().expect("custody Child retained"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn child_id_for_test(&self) -> Option<u32> {
+        self.child.as_ref().expect("custody Child retained").id()
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_child_for_test(mut self) -> Child {
+        self.wait_allowed()
+            .expect("test cannot extract lost native identity");
+        self.child.take().expect("custody Child retained")
+    }
+
+    #[cfg(test)]
+    pub(super) fn child_for_test(&mut self) -> &mut Child {
+        self.child.as_mut().expect("custody Child retained")
     }
 
     pub(super) fn with_main_token(
@@ -267,6 +389,20 @@ impl DirectCoreRun {
         let mut run = Self::with_identity(child, identity);
         run.main_token = Some(token);
         run
+    }
+}
+
+// Tokio's Unix Child Drop may wait again or enqueue the old PID. ECHILD
+// permanently loses that authority: isolate just this wrapper, once per birth.
+// The slot and logical owner stay Unknown; this is not cleanup or NoOwner.
+#[cfg(unix)]
+impl Drop for DirectCoreRun {
+    fn drop(&mut self) {
+        if self.lost_wait_ownership {
+            if let Some(child) = self.child.take() {
+                std::mem::forget(child);
+            }
+        }
     }
 }
 
@@ -454,38 +590,21 @@ impl ProxyRuntime {
             return booking.finish_with_gate(result, &self.mesh, ts_gate);
         }
         if self.core_via_helper.load(Ordering::SeqCst) {
-            let (expected_attempt, token) = self
-                .child
-                .lock()
-                .map_err(|_| "helper Child custody poisoned".to_owned())?
-                .helper_main_claim_for_stop()
-                .ok_or_else(|| {
-                    "helper cleanup-unknown: no Start attempt for main claim".to_owned()
-                })?;
-            let stopped_attempt = self
-                .kill_core_via_helper(Arc::clone(&self.helper) as Arc<dyn HelperStopOps>)
-                .await?;
-            if !stopped_attempt.same(&expected_attempt) {
-                return Err("helper Stop attempt changed before main claim release".to_owned());
-            }
-            if let Some(token) = token {
-                self.mesh
-                    .release_tailscale_main_states_if_token(&token, ts_gate)?;
-            }
-            return Ok(());
+            return self
+                .kill_core_via_helper_with_main(
+                    Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
+                    Some(ts_gate),
+                )
+                .await
+                .map(|_| ());
         }
-        let token = self.main_token_for_stop()?;
-        self.kill_core().await?;
-        if let Some(token) = token {
-            self.mesh
-                .release_tailscale_main_states_if_token(&token, ts_gate)?;
-        }
-        Ok(())
+        self.kill_direct_core_with_io(Some(ts_gate), &NativeStopIo)
+            .await
     }
 
-    /// Called only while the caller holds the real TS state gate. Freeze the
-    /// birth token before kill_core can take a direct Child or retire a helper
-    /// attempt; no empty-slot inference may clear a registry entry.
+    /// Test observation of the token retained by backend custody. Empty slots
+    /// provide no authority to release a registry entry.
+    #[cfg(test)]
     pub(super) fn main_token_for_stop(
         &self,
     ) -> Result<Option<crate::runtime::tailscale_login_core::MainBirthToken>, String> {
@@ -634,11 +753,10 @@ impl ProxyRuntime {
         }
     }
 
-    /// 杀核（接线 core-supervisor [`ProcessKiller`]）：SIGTERM → 宽限 → SIGKILL，并 reap 子进程。
+    /// 杀核：SIGTERM → 宽限 → owned Child SIGKILL，并确认 native wait。
     ///
-    /// Empty = no-op；Stopping 由未来的 exact supervisor 持有，本 legacy 腿拒绝取出。
-    /// Running 句柄被 take 后必 `wait()` 收割。
-    /// helper 腿未确认停止时返回错误，调用方不得继续清运行态或启动第二个核。
+    /// Empty = no-op；普通 Stopping 可重试；exact worker 的 Stopping 保持独占。
+    /// native wait 错误或取消保留 Child/记账，调用方不得继续清运行态或起第二个核。
     pub(super) async fn kill_core(&self) -> Result<(), String> {
         // Android：核在**本进程内**（libbox），没有 child 可杀、没有 pid 可发信号 —— 停核 = 请
         // `VpnService` 拆隧道。与 `kill_core_via_helper` 同构：**要确定回执**，停不掉就返 Err，
@@ -662,53 +780,80 @@ impl ProxyRuntime {
                 .await
                 .map(|_| ());
         }
-        let child_opt = match self.child.lock() {
-            Ok(mut g) => g
-                .take_running_legacy()
-                .map_err(|_| "direct Child is reserved in Stopping custody".to_string())?,
-            Err(e) => {
-                log::error!("child lock poisoned: {e}");
-                return Err(format!("child lock poisoned: {e}"));
-            }
-        };
-        let Some(mut run) = child_opt else {
+        self.kill_direct_core_with_io(None, &NativeStopIo).await
+    }
+
+    /// Normal direct Stop uses the same native Child custody on every retry.
+    /// No PID liveness result or signal acknowledgement can retire this run.
+    pub(super) async fn kill_direct_core_with_io(
+        &self,
+        ts_gate: Option<&tokio::sync::MutexGuard<'_, ()>>,
+        io: &dyn DirectStopIo,
+    ) -> Result<(), String> {
+        let booked = self
+            .child
+            .lock()
+            .map_err(|_| "direct Child custody poisoned before Stop".to_owned())?
+            .begin_native_stop()?;
+        let Some((identity, nonce)) = booked else {
             return Ok(());
         };
-        let pid = run.child.id().unwrap_or(0);
-        if pid == 0 {
-            // 已退出且被收割 → 仅 reap 残句柄。
-            //
-            // **同样要清 `self.pid`**：此前这条腿直接 return，把上一次 spawn 的 pid 留在字段里。这不是
-            // 罕见角落 —— 核「起来就死」时就绪门的 `try_wait` 会先一步收割它，`child.id()` 随即变 None ⇒
-            // 每一次起核失败都从这里走。留下的陈旧 pid 会被 `status()`、诊断、以及 stale 清扫的「受管
-            // pid 排除表」当成活的受管核继续引用（排除表里挂个死 pid，等于给同号新进程发免死金牌）。
-            let _ = run.child.wait().await;
-            if let Ok(mut g) = self.pid.lock() {
-                *g = None;
+        let booking = NativeStopBooking {
+            slot: Arc::clone(&self.child),
+            identity,
+            nonce,
+        };
+        // Every possible signal stays inside this future; cancellation leaves
+        // no detached PID escalation that could later hit a replacement run.
+        let _stop_lease = self.config.retain_active_legacy_start_lease();
+        let initial = poll_fn(|cx| Poll::Ready(booking.poll_wait(cx, io))).await;
+        let exit = match initial {
+            Poll::Ready(result) => result?,
+            Poll::Pending => {
+                booking.signal(|child| io.terminate(child))?;
+                match tokio::time::timeout(STOP_GRACE, poll_fn(|cx| booking.poll_wait(cx, io)))
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        booking.signal(|child| io.start_kill(child))?;
+                        tokio::time::timeout(STOP_GRACE, poll_fn(|cx| booking.poll_wait(cx, io)))
+                            .await
+                            .map_err(|_| {
+                                "direct Child native wait timed out; Stop custody retained"
+                                    .to_owned()
+                            })??
+                    }
+                }
             }
-            return Ok(());
+        };
+        // No await follows native exit: TS→Child→pid→registry is the normal
+        // main-Stop order. Slot identity/nonce is checked before clearing pid.
+        // A registry error keeps the reaped Child and claim for a later retry.
+        {
+            let mut slot = self
+                .child
+                .lock()
+                .map_err(|_| "direct Child custody poisoned after native wait".to_owned())?;
+            let mut pid = self
+                .pid
+                .lock()
+                .map_err(|_| "direct pid bookkeeping poisoned after native wait".to_owned())?;
+            slot.retire_native_stop(&booking.identity, &booking.nonce, |token| {
+                let gate = ts_gate.ok_or_else(|| {
+                    "direct Child exited; main claim release requires TS gate".to_owned()
+                })?;
+                if !self
+                    .mesh
+                    .release_tailscale_main_states_if_token(token, gate)?
+                {
+                    return Err("direct Child main claim no longer matches its birth".into());
+                }
+                Ok(())
+            })?;
+            *pid = None;
         }
-        log::info!("停核：pid={pid}（SIGTERM → {STOP_GRACE:?} 宽限 → SIGKILL）");
-        // The escalation task survives cancellation of this async Stop. Keep
-        // an existing restart/update lease through its final possible SIGKILL.
-        let escalation_lease = self.config.retain_active_legacy_start_lease();
-        let escalation = ProcessKiller::escalate_async(
-            move |sig| {
-                let _held = &escalation_lease;
-                send_signal(pid, sig);
-            },
-            move || pid_alive(pid),
-            STOP_GRACE,
-        )
-        .await;
-        // 等进程退出（reap，防僵尸）。进程若拒 SIGTERM，升级 task 到点补 SIGKILL 解开此处。
-        let _ = run.child.wait().await;
-        // 进程已退出 → 取消挂起的 SIGKILL 升级（防 timer 泄漏 + 防 pid 复用误杀）。
-        escalation.wait().await;
-        if let Ok(mut g) = self.pid.lock() {
-            *g = None;
-        }
-        log::info!("停核完成：pid={pid} 已退出并收割");
+        log::info!("停核完成：owned Child 已退出并收割（exit={exit}）");
         Ok(())
     }
 
@@ -724,6 +869,14 @@ impl ProxyRuntime {
     pub(super) async fn kill_core_via_helper(
         &self,
         ops: Arc<dyn HelperStopOps>,
+    ) -> Result<HelperStartToken, String> {
+        self.kill_core_via_helper_with_main(ops, None).await
+    }
+
+    pub(super) async fn kill_core_via_helper_with_main(
+        &self,
+        ops: Arc<dyn HelperStopOps>,
+        ts_gate: Option<&tokio::sync::MutexGuard<'_, ()>>,
     ) -> Result<HelperStartToken, String> {
         self.register_helper_backend()?;
         let (attempt, intended, nonce) = self
@@ -757,13 +910,28 @@ impl ProxyRuntime {
         };
         // The permit remains booked while the ACK is checked and consumed.
         let outcome = match result {
-            Ok(()) if self.clear_helper_core_bookkeeping(&permit) => {
-                log::info!("经 helper 停核完成（pid={intended_pid}）");
-                Ok(attempt.clone())
-            }
-            Ok(()) => {
-                Err("helper cleanup-unconfirmed: Stop acknowledged but attempt changed".into())
-            }
+            Ok(()) => self
+                .clear_helper_core_bookkeeping_with_main(&permit, |token| {
+                    let gate = ts_gate.ok_or_else(|| {
+                        "helper cleanup-unknown: native exit needs TS gate to release main claim"
+                            .to_owned()
+                    })?;
+                    if !self
+                        .mesh
+                        .release_tailscale_main_states_if_token(token, gate)?
+                    {
+                        return Err("helper cleanup-unknown: main claim birth changed".into());
+                    }
+                    Ok(())
+                })
+                .and_then(|cleared| {
+                    if cleared {
+                        log::info!("经 helper 本地 birth 停核完成（pid={intended_pid}）");
+                        Ok(attempt.clone())
+                    } else {
+                        Err("helper cleanup-unconfirmed: Stop receipt but attempt changed".into())
+                    }
+                }),
             Err(error) => {
                 log::warn!("经 helper 停核未完成：{error}");
                 Err(error)
@@ -780,40 +948,56 @@ impl ProxyRuntime {
     /// `status()` 的 helper 腿据 `self.pid` 探活、诊断据它报 pid、`cleanup_stale_cores` 的「受管 pid 排除表」
     /// 也据它——排除表里少了新核，下一次起核的孤儿清扫就会把它当孤儿杀掉（换个地方杀错进程）。
     ///
-    /// 本方法只会在 helper 已确认 `stopped/notrunning` 后调用；必须仍持有
+    /// 本方法只接受 helper exact birth native-reap 回执；legacy ACK 不是退出事实。
+    /// 必须仍持有
     /// 同一 Child 的唯一 Stop permit，且 attempt、pid、nonce 全相同才清账。
     /// 通信失败、取消或任何身份变动均保留 helper route。
-    pub(super) fn clear_helper_core_bookkeeping(&self, permit: &HelperStopPermit) -> bool {
+    pub(super) fn clear_helper_core_bookkeeping_with_main(
+        &self,
+        permit: &HelperStopPermit,
+        release_main: impl FnOnce(
+            &crate::runtime::tailscale_login_core::MainBirthToken,
+        ) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if matches!(permit.target(), HelperStopTarget::Legacy(_)) {
+            return Err(
+                "helper cleanup-unknown: legacy Stop ACK lacks same-birth native exit proof; custody retained"
+                    .into(),
+            );
+        }
         if !Arc::ptr_eq(&permit.child, &self.child) {
-            return false;
+            return Ok(false);
         }
         let Ok(mut child) = self.child.lock() else {
             log::error!("child lock poisoned：跳过 helper 停核记账收口");
-            return false;
+            return Ok(false);
         };
         let Ok(mut g) = self.pid.lock() else {
             log::error!("pid lock poisoned：跳过 helper 停核记账收口");
-            return false;
+            return Ok(false);
         };
         let current = *g;
         if !child.helper_pid_bookkeeping_matches(permit.attempt(), permit.target(), current)
-            || !child.confirm_helper_stop(permit.attempt(), permit.target(), permit.nonce())
+            || !child.helper_stop_matches(permit.attempt(), permit.target(), permit.nonce())
         {
             log::warn!(
                 "helper 停核腿收口时发现受管 attempt/birth 记账已换人（{:?}→{current:?}）→ \
                  整段记账属新会话，不动它（清它等于让新核在 status/诊断/孤儿清扫排除表里集体失联）",
                 permit.target()
             );
-            return false;
+            return Ok(false);
         }
+        if let Some((_, Some(token))) = child.helper_main_claim_for_stop() {
+            release_main(&token)?;
+        }
+        // Same locked attempt/nonce was checked above. No await or fallible
+        // operation follows successful registry compare-remove.
+        assert!(child.confirm_helper_stop(permit.attempt(), permit.target(), permit.nonce()));
         *g = None;
         // The exact ACK proves only that this helper birth was natively
         // reaped. It does not prove that helper-owned side effects or other
         // births are absent, so it cannot open the managed/no-owner gate.
-        if matches!(permit.target(), HelperStopTarget::Legacy(_)) {
-            self.core_via_helper.store(false, Ordering::SeqCst);
-        }
-        true
+        Ok(true)
     }
 
     /// **起核前**的 stale-core 清扫：杀掉遗留的**本 app** 孤儿核。跑在**每一次** `start()` 上
@@ -1060,6 +1244,11 @@ pub(super) fn image_from_managed_status(
         {
             image.as_deref().map(PathBuf::from)
         }
+        crate::runtime::helper::ManagedCoreStatus::NativeBirthRunning { target, image, .. }
+            if target.pid.get() == want_pid =>
+        {
+            image.as_deref().map(PathBuf::from)
+        }
         _ => None,
     }
 }
@@ -1125,7 +1314,7 @@ fn core_version_first_line(bin: &Path) -> String {
     }
 }
 
-/// 发信号给 pid（core-supervisor [`ProcessKiller`] 的注入点）。
+/// 发信号给 pid（core-supervisor [`polaris_core_supervisor::ProcessKiller`] 的注入点）。
 ///
 /// unix：`nix::sys::signal::kill`（safe wrapper，本文件 `forbid(unsafe_code)` 下不可直接 libc FFI）。
 #[cfg(unix)]

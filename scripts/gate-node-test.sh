@@ -33,6 +33,8 @@ required_tests=(
   # 「移动端全部接线了没」这句话的退出码逻辑（scripts/wiring-verdict.mjs）的变异测试：
   # 它守的是「销账被报成门坏了」与「清零那天的提示是死循环、rc=0 到不了」这两条真缺陷。
   scripts/wiring-verdict.test.mjs
+  # PC 发布冻门的策略测试不能被删/改名后静默少跑。
+  scripts/assert-pc-runtime-release.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
@@ -85,7 +87,8 @@ fi
 #   124 → 132（2026-09-06）verify-apk 出厂权限集判据（⑦）的 8 条（真 aapt2 输出的反向对照 /
 #           行首锚定不许把 `permission:` 算成请求 / 注入 QUERY_ALL_PACKAGES 必红 / 误删一条必红 /
 #           自建 permission 多一条必红 / 取材面塌陷红在取材面 / 下限有牙 / 登记表 8+3 与理由自检）
-if [ "$pass" -lt 132 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同共 132 条；下限 132）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+#   132 → 141（2026-09-30）PC runtime publication freeze 的 9 条策略/变异回归。
+if [ "$pass" -lt 141 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 141）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

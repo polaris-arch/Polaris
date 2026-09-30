@@ -302,22 +302,29 @@ fn probe_verdict(check: ProbeCheck) -> Value {
 /// 子进程本身由 [`run_check_raw`] 起 —— 全仓唯一的 `sing-box check` 实现。本处此前自己写了一遍，
 /// 写漏的是 `kill_on_drop(true)`：超时腿把 `output()` 的 future 直接丢掉，而 `tokio::process::Child`
 /// 的 `kill_on_drop` 默认是 false，于是每次超时都留下一个游离的 `sing-box check`。
-async fn run_probe_check(binary: &std::path::Path, config_path: &std::path::Path) -> ProbeCheck {
-    match run_check_raw(binary, config_path, PROBE_CHECK_TIMEOUT).await {
-        // 超时 / spawn 失败（核缺失 / 无权限）→ failOpen
-        RawCheck::TimedOut { .. } | RawCheck::SpawnFailed(_) => ProbeCheck::Indeterminate,
-        RawCheck::Done { success: true, .. } => ProbeCheck::Supported,
-        RawCheck::Done { stderr, stdout, .. } => {
-            // stderr 优先、为空才落回 stdout —— 与此前行为一致（sing-box 恒写 stderr，留 stdout 兜底
-            // 给理论上把日志导向 stdout 的变体 / 未来版本）。
-            let raw = if stderr.trim().is_empty() {
-                stdout.as_str()
-            } else {
-                stderr.as_str()
-            };
-            ProbeCheck::Unsupported(parse_probe_diagnostic(raw))
-        }
-    }
+async fn run_probe_check(
+    binary: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<ProbeCheck, polaris_core_supervisor::ValidationLifecycleError> {
+    Ok(
+        match run_check_raw(binary, config_path, PROBE_CHECK_TIMEOUT).await? {
+            // 超时 / spawn 失败（核缺失 / 无权限）→ failOpen
+            RawCheck::TimedOut { .. } | RawCheck::SpawnFailed(_) | RawCheck::OutputFailed(_) => {
+                ProbeCheck::Indeterminate
+            }
+            RawCheck::Done { success: true, .. } => ProbeCheck::Supported,
+            RawCheck::Done { stderr, stdout, .. } => {
+                // stderr 优先、为空才落回 stdout —— 与此前行为一致（sing-box 恒写 stderr，留 stdout 兜底
+                // 给理论上把日志导向 stdout 的变体 / 未来版本）。
+                let raw = if stderr.trim().is_empty() {
+                    stdout.as_str()
+                } else {
+                    stderr.as_str()
+                };
+                ProbeCheck::Unsupported(parse_probe_diagnostic(raw))
+            }
+        },
+    )
 }
 
 /// 剥离 ANSI CSI 转义序列（`ESC '[' … 终止字节`）。
@@ -575,7 +582,10 @@ pub async fn kernel_probe_outbound(
         Ok(()) => {
             let check = run_probe_check(&binary, &tmp).await;
             let _ = std::fs::remove_file(&tmp); // best-effort 清理
-            probe_verdict(check)
+            match check {
+                Ok(check) => probe_verdict(check),
+                Err(error) => json!({"ok": false, "error": error.to_string()}),
+            }
         }
         Err(e) => json!({ "ok": false, "error": format!("写探测配置失败: {e}") }),
     };

@@ -80,6 +80,7 @@
     "errRecheckFailed": "檢查更新失敗"
   },
   "native": {
+    "exitBlocked": "背景連線尚未確認關閉，應用程式保持執行，請重試結束。",
     "backupExportTitle": "匯出 Polaris 設定備份",
     "backupImportTitle": "匯入 Polaris 設定備份",
     "backupFileType": "Polaris 備份檔案",
