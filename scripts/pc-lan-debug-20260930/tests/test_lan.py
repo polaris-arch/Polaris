@@ -68,7 +68,7 @@ class FakeSocket:
         self.events.append(("close",))
 
 
-def synthetic_fixture():
+def synthetic_fixture(with_handoff=False):
     """Every byte here is manufactured; deliberately cannot be device evidence."""
     p = example_plan()
     raw_plan = lan.canonical(p)
@@ -121,8 +121,16 @@ def synthetic_fixture():
             receiver.snapshot()
             snapshots.append(len(raw_events))
         cases.append({"caseId": cid, "snapshotSeqs": snapshots, "attemptSeqs": attempts})
+    if with_handoff:
+        receiver.ready_handoff("c" * 32)
     receiver.finish("ControllerStop")
-    records = [lan.canonical(lan._wrapper("6" * 32, i, "Synthetic", raw)) for i, raw in enumerate(raw_events, 1)]
+    records = []
+    for raw in raw_events:
+        if lan.decode(raw)["phase"] == "ReadyHandoff":
+            records.append(lan.canonical({"schema": "polaris-pc-lan-controller-v1", "role": "Controller",
+                "phase": "ReadyHandoffRequested", "controllerInstanceId": "6" * 32,
+                "eventSeq": len(records) + 1, "sourceKind": "Synthetic", "requestId": "c" * 32}))
+        records.append(lan.canonical(lan._wrapper("6" * 32, len(records) + 1, "Synthetic", raw)))
     records.append(lan.canonical({"schema": "polaris-pc-lan-controller-v1", "role": "Controller", "phase": "ChildWait",
         "controllerInstanceId": "6" * 32, "eventSeq": len(records) + 1, "sourceKind": "Synthetic",
         "childWait": {"state": "Waited", "returnCode": 0}}))
@@ -518,6 +526,370 @@ class CustodyTests(unittest.TestCase):
                 self.assertEqual(value, {"state": "Waited", "returnCode": 7})
             with self.assertRaises(lan.Fault):
                 child.poll()
+
+
+class ReadyHandoffTests(unittest.TestCase):
+    def setUp(self):
+        # All clocks/sockets/pipe reads/writes in this class are injected.
+        patcher = mock.patch.object(lan.threading.Thread, "start", lambda _: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def receiver(self, kind="Synthetic", source_hash="4" * 64):
+        p, ticks, events = example_plan(kind), [100.0], []
+        p["binding"]["receiverSourceSha256"] = source_hash
+        handles = [FakeSocket(), FakeSocket()]
+        remaining = handles.copy()
+        r = lan.Receiver(p, lan.plan_sha(lan.canonical(p)), "6" * 32, events.append,
+            factory=lambda *args: remaining.pop(0), clock=lambda: ticks[0], windows=False)
+        r.receiver_id = "7" * 32
+        with mock.patch.object(lan.secrets, "token_hex", side_effect=["8" * 32, "9" * 32]):
+            r.setup()
+        self.addCleanup(lambda: r.custody.close("ControllerStop"))
+        return r, ticks, events, handles
+
+    def test_original_receiver_samples_remaining_time_and_shared_budget_without_renewal(self):
+        r, ticks, events, handles = self.receiver()
+        raw_ready = events[0]
+        ready = lan.receiver_record(raw_ready)
+        for protocol, payload, peer in (("tcp", b"wrong\n", "192.168.8.11"),
+                                        ("udp", b"wrong", "192.168.8.12")):
+            r.begin_request(protocol)
+            r.request(protocol, payload, "Complete", peer, lambda _: 0, lambda _: False, 101)
+        connection = FakeSocket()
+        r.custody.publish("connection-1", connection)
+        r.custody.release("connection-1", connection)
+        ticks[0] = 108.0000005
+        r.ready_handoff("c" * 32)
+        handoff = lan.receiver_record(events[-1])
+        self.assertEqual(lan.handoff_check(ready, lan.sha(raw_ready), handoff, "c" * 32), handoff)
+        self.assertEqual(handoff["remainingLifetimeMs"], 111999)
+        self.assertEqual(handoff["remainingRequests"], 30)
+        self.assertEqual(handoff["counters"], r.counters)
+        self.assertEqual(handoff["observedMonotonicNs"], int(ticks[0] * 1e9))
+        self.assertEqual((handoff["startedMonotonicNs"], handoff["expiresMonotonicNs"]),
+                         (ready["startedMonotonicNs"], ready["expiresMonotonicNs"]))
+        self.assertEqual(r.custody.deadline, 220)
+        self.assertEqual(events[0], raw_ready)
+        self.assertTrue(all(not h.closed for h in handles))
+        before = copy.deepcopy(r.counters)
+        for request_id in ("c" * 32, "d" * 32):
+            with self.assertRaises(lan.Fault) as error:
+                r.ready_handoff(request_id)
+            self.assertEqual(error.exception.code, "HandoffAlreadyRequested")
+        self.assertEqual(r.counters, before)
+
+    def test_original_receiver_control_pipe_emits_matching_handoff_and_legal_close(self):
+        p, events, handles = example_plan(), [], [FakeSocket(), FakeSocket()]
+        r = lan.Receiver(p, lan.plan_sha(lan.canonical(p)), "6" * 32, events.append,
+            factory=lambda *args: handles.pop(0), clock=lambda: 100, windows=False)
+        frames = [lan.canonical({"command": "readyHandoff", "requestId": "c" * 32}) +
+                  b'\n{"command":"stop"}\n']
+        controls = lan.LineInput(600, 1024, read=lambda *_: frames.pop(0) if frames else b"")
+        output = types.SimpleNamespace(pending=bytearray(), pump=lambda: None)
+        with mock.patch.object(lan.select, "select", side_effect=AssertionError("selected after stop")):
+            lan.receiver_loop(r, controls, output)
+        records = [lan.receiver_record(raw) for raw in events]
+        self.assertEqual([x["phase"] for x in records], ["Ready", "ReadyHandoff", "Closed"])
+        self.assertEqual(records[1]["requestId"], "c" * 32)
+        self.assertEqual(records[1]["readyReceiptSha256"], lan.sha(events[0]))
+        self.assertTrue(records[-1]["allHandlesClosed"])
+
+    def test_expired_closed_submillisecond_and_exhausted_receivers_refuse_handoff_keep_cleanup(self):
+        for condition in ("expired", "closed", "submillisecond", "exhausted"):
+            with self.subTest(condition=condition):
+                r, ticks, events, handles = self.receiver()
+                if condition == "closed":
+                    r.custody.close("ControllerStop")
+                elif condition == "exhausted":
+                    for _ in range(lan.MAX_REQUESTS):
+                        r.begin_request("udp")
+                        r.request("udp", b"wrong", "Complete", "192.168.8.11", lambda _: 0, lambda _: False, 101)
+                else:
+                    ticks[0] = 220 if condition == "expired" else 219.9995
+                before = copy.deepcopy(r.counters)
+                with self.assertRaises(lan.Fault):
+                    r.ready_handoff("c" * 32)
+                self.assertFalse(any(lan.decode(raw)["phase"] == "ReadyHandoff" for raw in events))
+                ticks[0] = 221
+                r.finish("AbsoluteDeadline")
+                closed = lan.receiver_record(events[-1])
+                self.assertEqual(closed["phase"], "Closed")
+                self.assertTrue(closed["allHandlesClosed"])
+                self.assertEqual(closed["counters"], before)
+                self.assertTrue(all(h.closed for h in handles))
+
+    def test_identity_lease_or_actual_budget_change_fails_closed(self):
+        changes = (lambda r: setattr(r, "receiver_id", "f" * 32),
+                   lambda r: r.facts[0].update(socketInstanceId="f" * 32),
+                   lambda r: r.sockets.update(tcp=FakeSocket()),
+                   lambda r: setattr(r.custody, "deadline", 221),
+                   lambda r: setattr(r, "clock", lambda: 99),
+                   lambda r: setattr(r, "requests", 1))
+        for change in changes:
+            r, _, events, _ = self.receiver()
+            change(r)
+            with self.assertRaises(lan.Fault):
+                r.ready_handoff("c" * 32)
+            self.assertEqual(len(events), 1)
+
+    def test_receiver_malformed_or_replayed_control_retains_typed_unknown_and_legal_cleanup(self):
+        valid = lan.canonical({"command": "readyHandoff", "requestId": "c" * 32})
+        for frames, phases, reason in ((b'{"command":"readyHandoff","requestId":true}\n',
+                                       ["Ready", "Unknown", "Closed"], "ControlNotAllowed"),
+                                      (valid + b'\n' + valid + b'\n',
+                                       ["Ready", "ReadyHandoff", "Unknown", "Closed"], "HandoffAlreadyRequested"),
+                                      (b'{"command":"readyHandoff","command":"snapshot"}\n',
+                                       ["Ready", "Unknown", "Closed"], "ControlNotAllowed")):
+            p, events, handles = example_plan(), [], [FakeSocket(), FakeSocket()]
+            r = lan.Receiver(p, lan.plan_sha(lan.canonical(p)), "6" * 32, events.append,
+                factory=lambda *args: handles.pop(0), clock=lambda: 100, windows=False)
+            remaining = [frames]
+            controls = lan.LineInput(600, 1024, read=lambda *_: remaining.pop(0) if remaining else b"")
+            output = types.SimpleNamespace(pending=bytearray(), pump=lambda: None)
+            with mock.patch.object(lan.select, "select", side_effect=AssertionError("selected malformed control")):
+                lan.receiver_loop(r, controls, output)
+            records = [lan.receiver_record(raw) for raw in events]
+            self.assertEqual([x["phase"] for x in records], phases)
+            self.assertEqual(records[-2]["error"], reason)
+            self.assertEqual(records[-1]["stopReason"], reason)
+            self.assertTrue(records[-1]["allHandlesClosed"])
+
+    def test_control_and_handoff_closed_shapes_reject_malformed_ids_and_fake_counts(self):
+        for raw in (b'{"command":"readyHandoff"}',
+                    b'{"command":"readyHandoff","requestId":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"}',
+                    b'{"command":"readyHandoff","requestId":true}',
+                    b'{"command":"readyHandoff","requestId":"cccccccccccccccccccccccccccccccc","extra":0}',
+                    b'{"command":"snapshot","requestId":"cccccccccccccccccccccccccccccccc"}',
+                    b'{"command":"readyHandoff","requestId":"cccccccccccccccccccccccccccccccc","requestId":"cccccccccccccccccccccccccccccccc"}'):
+            with self.assertRaises(lan.Fault):
+                lan.control_record(raw)
+        r, _, events, _ = self.receiver()
+        r.ready_handoff("c" * 32)
+        sample = lan.receiver_record(events[-1])
+        for field, value in (("remainingLifetimeMs", True), ("remainingLifetimeMs", 119999),
+                             ("remainingRequests", 31), ("observedMonotonicNs", 220000000000),
+                             ("tcpSocketInstanceId", sample["udpSocketInstanceId"])):
+            altered = copy.deepcopy(sample)
+            altered[field] = value
+            with self.assertRaises(lan.Fault):
+                lan.receiver_record(lan.canonical(altered))
+        altered = copy.deepcopy(sample)
+        del altered["observedMonotonicNs"]
+        with self.assertRaises(lan.Fault):
+            lan.receiver_record(lan.canonical(altered))
+
+    def controller_pipeline(self, variant="valid"):
+        # Real controller/LineInput/OutputQueue/OriginalWaiter algorithms over injected IO.
+        sources = {path: b"fixture source" for _, path in lan.SOURCE_ITEMS}
+        manifest, source_hash = lan.source_manifest(sources)
+        r, ticks, receiver_events, _ = self.receiver("OperatorDeclared", source_hash)
+        incoming = bytearray(receiver_events[0] + b"\n")
+        outgoing, children, waits = [], [], []
+        original_frames, read_chunks = [receiver_events[0]], []
+        request_id = "c" * 32
+        state = {"startup": True, "console": 0, "exited": False}
+        real_queue, real_input, real_waiter = lan.OutputQueue, lan.LineInput, lan.OriginalWaiter
+        def finish(reason):
+            if not state["exited"]:
+                r.finish(reason)
+                incoming.extend(receiver_events[-1] + b"\n")
+                original_frames.append(receiver_events[-1])
+                state["exited"] = True
+        class Pipe:
+            def __init__(self, fd):
+                self.fd, self.closed = fd, False
+            def fileno(self):
+                return self.fd
+            def close(self):
+                self.closed = True
+                if self.fd == 701:
+                    finish("ControlEOF")
+        class Child:
+            def __init__(self, *args, **kwargs):
+                self.stdin, self.stdout, self.pid, self.returncode = Pipe(701), Pipe(702), 703, None
+                children.append(self)
+        def write(fd, data):
+            raw = bytes(data)
+            if fd == 701:
+                if state["startup"]:
+                    state["startup"] = False
+                else:
+                    for frame in real_input(601, 1024, read=lambda *_: raw).drain():
+                        item = lan.control_record(frame)
+                        outgoing.append(item)
+                        if item["command"] == "readyHandoff":
+                            if variant.startswith("request-at-expiry") or variant.startswith("request-after-expiry"):
+                                r.begin_request("udp")
+                                ticks[0] = 220 if variant.startswith("request-at-expiry") else 221
+                                r.request("udp", b"wrong", "Complete", "192.168.8.11",
+                                          lambda _: 0, lambda _: False, 220)
+                            elif variant == "cached-snapshot":
+                                r.snapshot()
+                            else:
+                                r.ready_handoff(item["requestId"])
+                            response = lan.decode(receiver_events[-1])
+                            if variant == "wrong-id":
+                                response["requestId"] = "d" * 32
+                            elif variant == "wrong-receiver":
+                                response["receiverInstanceId"] = "f" * 32
+                            elif variant == "wrong-socket":
+                                response["tcpSocketInstanceId"] = "f" * 32
+                            elif variant == "wrong-ready-sha":
+                                response["readyReceiptSha256"] = "f" * 64
+                            response_raw = b'{"bad":' if variant == "malformed-response" else lan.canonical(response)
+                            incoming.extend(response_raw + b"\n")
+                            original_frames.append(response_raw)
+                            if variant == "duplicate-response":
+                                response["receiverSeq"] += 1
+                                repeated = lan.canonical(response)
+                                incoming.extend(repeated + b"\n")
+                                original_frames.append(repeated)
+                            if variant.startswith("request-"):
+                                finish("AbsoluteDeadline")
+                        elif item["command"] == "stop":
+                            finish("ControllerStop")
+            return len(data)
+        class Queue(real_queue):
+            def __init__(self, fd):
+                super().__init__(fd, write=write)
+        def read(fd, size):
+            if fd == 702:
+                if incoming:
+                    if variant.endswith("next-chunk"):
+                        size = min(size, incoming.index(b"\n") + 1)
+                    block = bytes(incoming[:size])
+                    del incoming[:size]
+                    read_chunks.append(block)
+                    return block
+                if state["exited"]:
+                    return b""
+            elif fd == 704:
+                if state["console"] == 0:
+                    state["console"] = 1
+                    item = {"command": "readyHandoff", "requestId": request_id}
+                    if variant == "malformed-request":
+                        item["requestId"] = "C" * 32
+                    frame = lan.canonical(item) + b"\n"
+                    return frame * (2 if variant == "duplicate-request" else 1)
+                if outgoing and state["console"] == 1:
+                    state["console"] = 2
+                    return b'{"command":"stop"}\n'
+                if state["exited"]:
+                    return b""
+            raise BlockingIOError()
+        def waitpid(pid, flags):
+            waits.append(pid)
+            return (pid, 0) if state["exited"] else (0, 0)
+        with mock.patch.object(lan, "OwnedPopen", Child), mock.patch.object(lan, "OutputQueue", Queue), \
+             mock.patch.object(lan, "LineInput", lambda fd, maximum=lan.MAX_RECORD: real_input(fd, maximum, read=read)), \
+             mock.patch.object(lan.os, "fstat", return_value=types.SimpleNamespace(st_mode=stat.S_IFIFO)), \
+             mock.patch.object(lan.os, "set_blocking", lambda *_: None), \
+             mock.patch.object(lan.secrets, "token_hex", return_value="6" * 32), \
+             mock.patch.object(lan.time, "monotonic", return_value=221 if variant == "expired-at-controller" else 100), \
+             mock.patch.object(lan.time, "sleep", lambda _: None), \
+             mock.patch.object(lan, "OriginalWaiter", lambda child: real_waiter(child, waitpid=waitpid)):
+            records = lan.controller_run(lan.canonical(r.plan), sources, manifest, Queue(700), 704)
+        self.assertTrue(all(pid == 703 for pid in waits))
+        self.assertTrue(children[0].stdin.closed and children[0].stdout.closed)
+        self.assertFalse(lan.UNRESOLVED_CHILDREN)
+        self.pipeline_plan_raw = lan.canonical(r.plan)
+        return [lan.decode(raw) for raw in records], outgoing, original_frames, read_chunks
+
+    def test_controller_original_pipe_roundtrip_matches_once_and_preserves_original_raw_sha(self):
+        records, outgoing, _, _ = self.controller_pipeline()
+        self.assertEqual(outgoing, [{"command": "readyHandoff", "requestId": "c" * 32}, {"command": "stop"}])
+        self.assertEqual([x["phase"] for x in records],
+                         ["ReceiverRecord", "ReadyHandoffRequested", "ReceiverRecord", "StopRequested", "ReceiverRecord", "ChildWait"])
+        ready_raw = lan.raw_base64(records[0]["receiverRaw"])
+        handoff = lan.receiver_record(lan.raw_base64(records[2]["receiverRaw"]))
+        self.assertEqual(handoff["readyReceiptSha256"], lan.sha(ready_raw))
+        self.assertEqual(handoff["requestId"], records[1]["requestId"])
+
+    def test_controller_wrong_identity_id_digest_malformed_replay_or_cache_fail_closed_and_keep_wait(self):
+        for variant in ("wrong-id", "wrong-receiver", "wrong-socket", "wrong-ready-sha", "malformed-request",
+                        "duplicate-request", "duplicate-response", "cached-snapshot", "expired-at-controller"):
+            with self.subTest(variant=variant):
+                records, outgoing, originals, _ = self.controller_pipeline(variant)
+                self.assertTrue(any(x["phase"] == "Unknown" for x in records))
+                self.assertEqual(records[-1]["childWait"], {"state": "Waited", "returnCode": 0})
+                handoffs = [lan.receiver_record(lan.raw_base64(x["receiverRaw"])) for x in records
+                            if x["phase"] == "ReceiverRecord" and
+                            lan.receiver_record(lan.raw_base64(x["receiverRaw"]))["phase"] == "ReadyHandoff"]
+                self.assertEqual(len(handoffs), 2 if variant == "duplicate-response" else
+                                 0 if variant in ("malformed-request", "duplicate-request", "cached-snapshot") else 1)
+                self.assertEqual([lan.raw_base64(x["receiverRaw"]) for x in records if x["phase"] == "ReceiverRecord"],
+                                 originals)
+                if variant in ("malformed-request", "duplicate-request"):
+                    self.assertEqual(outgoing, [])
+
+    def test_rejected_late_wrong_or_malformed_handoff_keeps_original_close_and_wait(self):
+        for variant in ("expired-at-controller", "wrong-id", "wrong-receiver", "malformed-response"):
+            with self.subTest(variant=variant):
+                records, _, originals, _ = self.controller_pipeline(variant)
+                captured = [lan.raw_base64(x["receiverRaw"]) for x in records if x["phase"] == "ReceiverRecord"]
+                self.assertEqual(captured, originals)
+                closed = lan.receiver_record(captured[-1])
+                self.assertEqual(closed["phase"], "Closed")
+                self.assertTrue(closed["allHandlesClosed"])
+                self.assertEqual(records[-1]["childWait"], {"state": "Waited", "returnCode": 0})
+                failure = next(i for i, x in enumerate(records) if x["phase"] == "Unknown")
+                rejected = next(i for i, x in enumerate(records)
+                                if x["phase"] == "ReceiverRecord" and lan.raw_base64(x["receiverRaw"]) == originals[1])
+                self.assertLess(failure, rejected)
+                self.assertFalse(any(x["phase"] == "ReadyHandoffRequested" for x in records[rejected + 1:]))
+                # Retained bytes are diagnostic evidence; Unknown cannot become execution permission.
+                if variant != "malformed-response":
+                    data = lan.bundle_value(self.pipeline_plan_raw, [lan.canonical(x) for x in records], [], [])
+                    result = lan.verify(self.pipeline_plan_raw, data)
+                    self.assertIn(result["verdict"], ("Invalid", "Incomplete"))
+                    self.assertFalse(result["outboundReady"])
+                else:
+                    with self.assertRaises(lan.Fault):
+                        lan.controller_record(lan.canonical(records[rejected]))
+
+    def test_expiry_request_then_close_same_or_next_chunk_retains_exact_bytes_and_wait(self):
+        for expiry in ("at", "after"):
+            for chunk in ("same-chunk", "next-chunk"):
+                variant = "request-" + expiry + "-expiry-" + chunk
+                with self.subTest(variant=variant):
+                    records, _, originals, chunks = self.controller_pipeline(variant)
+                    self.assertEqual([lan.raw_base64(x["receiverRaw"]) for x in records if x["phase"] == "ReceiverRecord"],
+                                     originals)
+                    request, closed = (lan.receiver_record(raw) for raw in originals[1:])
+                    self.assertEqual(request["phase"], "Request")
+                    self.assertGreaterEqual(request["observedMonotonicNs"], 220000000000)
+                    self.assertEqual(closed["phase"], "Closed")
+                    self.assertTrue(closed["allHandlesClosed"])
+                    self.assertEqual(closed["counters"], request["counters"])
+                    self.assertEqual(records[-1]["childWait"], {"state": "Waited", "returnCode": 0})
+                    self.assertTrue(any(x["phase"] == "Unknown" for x in records))
+                    request_chunk = next(i for i, raw in enumerate(chunks) if originals[1] in raw)
+                    close_chunk = next(i for i, raw in enumerate(chunks) if originals[2] in raw)
+                    self.assertEqual(close_chunk - request_chunk, 0 if chunk == "same-chunk" else 1)
+
+    def test_offline_handoff_correlation_is_consistency_only_missing_or_forged_is_rejected(self):
+        fixture = synthetic_fixture(with_handoff=True)
+        raw_plan, bundle = lan.canonical(fixture["plan"]), fixture["bundle"]
+        self.assertEqual(lan.verify(raw_plan, bundle)["verdict"], "LogicOnly")
+        request_index = next(i for i, entry in enumerate(bundle["records"])
+            if lan.controller_record(lan.raw_base64(entry["raw"]))["phase"] == "ReadyHandoffRequested")
+        for field, value in (("requestId", "d" * 32), ("receiverInstanceId", "f" * 32),
+                             ("tcpSocketInstanceId", "f" * 32), ("readyReceiptSha256", "f" * 64),
+                             ("remainingLifetimeMs", 119999), ("remainingRequests", 31)):
+            data = copy.deepcopy(bundle)
+            _, handoff = original_receiver(data, request_index + 1)
+            handoff[field] = value
+            rewrite_receiver(data, request_index + 1, handoff)
+            self.assertEqual(lan.verify(raw_plan, data)["verdict"], "Invalid", field)
+        data = copy.deepcopy(bundle)
+        del data["records"][request_index]
+        for i, entry in enumerate(data["records"]):
+            item = lan.controller_record(lan.raw_base64(entry["raw"]))
+            item["eventSeq"] = i + 1
+            raw = lan.canonical(item)
+            entry.update(raw=base64.b64encode(raw).decode(), sha256=lan.sha(raw))
+        self.assertEqual(lan.verify(raw_plan, data)["verdict"], "Invalid")
 
 
 class FileTests(unittest.TestCase):

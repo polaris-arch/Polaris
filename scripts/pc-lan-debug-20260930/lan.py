@@ -825,6 +825,8 @@ class Receiver:
         self.sockets, self.facts = {}, []
         self.start = None
         self.custody = None
+        self.ready_raw, self.handoff_id = None, None
+        self.ready_handles = None
 
     def record(self, phase, **fields):
         self.seq += 1
@@ -832,7 +834,9 @@ class Receiver:
                  "binding": self.binding, "pcPlanSha256": self.plan_digest,
                  "sourceKind": self.plan["sourceKind"], "controllerInstanceId": self.controller_id,
                  "receiverInstanceId": self.receiver_id, "receiverSeq": self.seq, **fields}
-        self.emit(canonical(value))
+        raw = canonical(value)
+        self.emit(raw)
+        return raw
 
     def setup(self):
         if self.windows:
@@ -859,7 +863,8 @@ class Receiver:
             with self.custody.lock:
                 require(not self.custody.closing and self.clock() < self.custody.deadline, "LeaseClosed")
                 started_ns = int(self.start * 1e9)
-                self.record("Ready", sockets=self.facts, startedMonotonicNs=started_ns,
+                self.ready_handles = self.sockets.copy()
+                self.ready_raw = self.record("Ready", sockets=self.facts, startedMonotonicNs=started_ns,
                             expiresMonotonicNs=started_ns + self.binding["lifetimeSeconds"] * 1000000000,
                             observedMonotonicNs=int(self.clock() * 1e9), counters=self.counters)
         except BaseException:
@@ -872,6 +877,40 @@ class Receiver:
         self.snapshots += 1
         self.record("Counters", counters=self.counters, sealed=False,
                     observedMonotonicNs=int(self.clock() * 1e9))
+
+    def ready_handoff(self, request_id):
+        hex_value(request_id, 32)
+        require(self.handoff_id is None, "HandoffAlreadyRequested")
+        self.handoff_id = request_id
+        require(self.ready_raw is not None and self.custody is not None, "MissingReady")
+        ready = receiver_record(self.ready_raw)
+        # The guardian cannot begin close between this sample and its queued record.
+        with self.custody.lock:
+            sampled = self.clock()
+            require(not self.custody.closing and sampled < self.custody.deadline, "LeaseClosed")
+            require(set(self.sockets) == set(self.ready_handles) and
+                    all(self.sockets[p] is h for p, h in self.ready_handles.items()) and
+                    all(any(role == p and handle is h for role, handle in self.custody.handles)
+                        for p, h in self.ready_handles.items()) and
+                    not any(p in self.custody.results or p in self.custody.releasing for p in ("tcp", "udp")) and
+                    self.facts == ready["sockets"] and self.binding == ready["binding"] and
+                    self.plan_digest == ready["pcPlanSha256"] and self.receiver_id == ready["receiverInstanceId"] and
+                    self.controller_id == ready["controllerInstanceId"] and
+                    int(self.start * 1e9) == ready["startedMonotonicNs"] and
+                    self.custody.deadline == self.start + self.binding["lifetimeSeconds"], "HandoffIdentity")
+            counter_check(self.counters)
+            total = sum(c["total"] for c in self.counters.values())
+            require(total == self.requests, "HandoffBudget")
+            observed = int(sampled * 1e9)
+            require(observed >= ready["observedMonotonicNs"], "LeaseBinding")
+            remaining = (ready["expiresMonotonicNs"] - observed) // 1000000
+            require(remaining > 0 and total < MAX_REQUESTS, "HandoffUnavailable")
+            self.record("ReadyHandoff", requestId=request_id, readyReceiptSha256=sha(self.ready_raw),
+                        tcpSocketInstanceId=ready["sockets"][0]["socketInstanceId"],
+                        udpSocketInstanceId=ready["sockets"][1]["socketInstanceId"],
+                        startedMonotonicNs=ready["startedMonotonicNs"], expiresMonotonicNs=ready["expiresMonotonicNs"],
+                        observedMonotonicNs=observed, remainingLifetimeMs=remaining,
+                        remainingRequests=MAX_REQUESTS - total, counters=self.counters)
 
     def request(self, protocol, payload, state, peer, send, writable, deadline):
         item = self.counters[protocol]
@@ -962,6 +1001,19 @@ def _wait_socket(handle, writing, seconds):
         return False
 
 
+def control_record(raw):
+    try:
+        item = decode(raw, 1024)
+        require(type(item) is dict)
+        command = choice(item.get("command"), ("snapshot", "stop", "readyHandoff"))
+        shape(item, {"command", "requestId"} if command == "readyHandoff" else {"command"})
+        if command == "readyHandoff":
+            hex_value(item["requestId"], 32)
+        return item
+    except Fault:
+        raise Fault("ControlNotAllowed") from None
+
+
 def receiver_loop(receiver, controls, output):
     reason = "AbsoluteDeadline"
     try:
@@ -969,10 +1021,12 @@ def receiver_loop(receiver, controls, output):
         while not receiver.custody.closing and receiver.clock() < receiver.custody.deadline:
             output.pump()
             for raw in controls.drain():
-                command = shape(decode(raw), {"command"})["command"]
-                require(command in ("snapshot", "stop"), "ControlNotAllowed")
+                item = control_record(raw)
+                command = item["command"]
                 if command == "snapshot":
                     receiver.snapshot()
+                elif command == "readyHandoff":
+                    receiver.ready_handoff(item["requestId"])
                 else:
                     reason = "ControllerStop"
                     receiver.custody.close(reason)
@@ -1142,6 +1196,9 @@ def controller_run(raw_plan, sources, manifest, sink, console_input=0):
     writer, reader, console = None, None, None
     records, sequence, stop_sent, error_sent = debt["records"], 0, False, False
     end = time.monotonic() + value["binding"]["lifetimeSeconds"] + 3
+    ready, ready_raw, receiver_sequence, observed = None, None, 0, 0
+    previous, receiver_closed, receiver_unknown = empty_counters(), False, False
+    handoff_id, handoff_received = None, False
 
     def record(phase, **fields):
         nonlocal sequence
@@ -1157,13 +1214,72 @@ def controller_run(raw_plan, sources, manifest, sink, console_input=0):
         except (Fault, OSError):
             close_control()
 
+    def observe_original(raw):
+        nonlocal ready, ready_raw, observed, previous
+        nonlocal receiver_closed, receiver_unknown, handoff_received
+        child_record = receiver_record(raw)
+        require(child_record["controllerInstanceId"] == controller_id and
+                child_record["binding"] == value["binding"] and
+                child_record["pcPlanSha256"] == sha(raw_plan) and
+                child_record["sourceKind"] == value["sourceKind"], "OriginalChildBinding")
+        require(child_record["receiverSeq"] == receiver_sequence + 1 and not receiver_closed, "OriginalStreamFraming")
+        if ready is not None:
+            require(child_record["receiverInstanceId"] == ready["receiverInstanceId"], "HandoffIdentity")
+        if child_record["phase"] == "Ready":
+            require(ready is None and receiver_sequence == 0, "OriginalStreamFraming")
+            ready, ready_raw = child_record, raw
+        elif child_record["phase"] == "Unknown":
+            receiver_unknown = True
+        else:
+            require(ready is not None, "MissingReady")
+            counter_transition(previous, child_record)
+        if "counters" in child_record:
+            previous = child_record["counters"]
+        if "observedMonotonicNs" in child_record:
+            require(child_record["observedMonotonicNs"] >= observed, "OriginalStreamFraming")
+            observed = child_record["observedMonotonicNs"]
+        if child_record["phase"] == "Request":
+            request = child_record["request"]
+            socket_id = next(f["socketInstanceId"] for f in ready["sockets"]
+                             if f["protocol"] == request["protocol"])
+            require(request["socketInstanceId"] == socket_id, "HandoffIdentity")
+            require(business_window(child_record, ready), "HandoffUnavailable")
+        if child_record["phase"] == "ReadyHandoff":
+            require(handoff_id is not None and not handoff_received and not stop_sent and
+                    not receiver_unknown and not error_sent and writer is not None and
+                    not writer.pending and not child.stdin.closed, "HandoffUnavailable")
+            handoff_check(ready, sha(ready_raw), child_record, handoff_id)
+            require(int(time.monotonic() * 1e9) < ready["expiresMonotonicNs"], "LeaseClosed")
+            handoff_received = True
+        elif child_record["phase"] == "Closed":
+            require([{k: x[k] for k in x if k != "closeState"} for x in child_record["sockets"]]
+                    == ready["sockets"], "HandoffIdentity")
+            receiver_closed = True
+
     def original_record(raw):
-        nonlocal sequence
+        nonlocal sequence, receiver_sequence, receiver_unknown, error_sent
+        # Admission errors stay sticky, while every bounded original pipe frame is retained.
+        try:
+            observe_original(raw)
+        except (Fault, OSError, ValueError):
+            receiver_unknown = True
+            close_control()
+            if not error_sent:
+                error_sent = True
+                record("Unknown", error="ControllerIOUnknown")
+        receiver_sequence += 1
         sequence += 1
         require(sequence <= MAX_EVENTS, "RecordBudget")
         item = canonical(_wrapper(controller_id, sequence, value["sourceKind"], raw))
         records.append(item)
-        sink.put(item)
+        try:
+            sink.put(item)
+        except (Fault, OSError):
+            close_control()
+            receiver_unknown = True
+            if not error_sent:
+                error_sent = True
+                record("Unknown", error="ControllerIOUnknown")
 
     def close_control():
         if not child.stdin.closed:
@@ -1206,10 +1322,17 @@ def controller_run(raw_plan, sources, manifest, sink, console_input=0):
                 for raw in reader.drain() if reader is not None else ():
                     original_record(raw)
                 for raw in console.drain() if console is not None else ():
-                    command = shape(decode(raw), {"command"})["command"]
-                    require(command in ("snapshot", "stop"), "ControlNotAllowed")
+                    item = control_record(raw)
+                    command = item["command"]
                     if command == "stop":
                         stop("ControllerStop")
+                    elif command == "readyHandoff":
+                        require(handoff_id is None and ready is not None and not receiver_closed and
+                                not receiver_unknown and not error_sent and not stop_sent and
+                                writer is not None and not child.stdin.closed, "HandoffUnavailable")
+                        handoff_id = item["requestId"]
+                        writer.put(canonical(item))
+                        record("ReadyHandoffRequested", requestId=handoff_id)
                     else:
                         writer.put(raw)
                 if console is not None and console.eof:
@@ -1243,6 +1366,7 @@ def controller_run(raw_plan, sources, manifest, sink, console_input=0):
                         for raw in reader.drain():
                             original_record(raw)
                     require(reader.eof and not reader.pending, "TruncatedReceiverRecord")
+                    require(handoff_id is None or handoff_received, "HandoffUnavailable")
                 except (Fault, OSError, ValueError):
                     try:
                         record("Unknown", error="ControllerIOUnknown")
@@ -1286,6 +1410,9 @@ RECEIVER_COMMON = {"schema", "role", "phase", "binding", "pcPlanSha256", "source
                    "controllerInstanceId", "receiverInstanceId", "receiverSeq"}
 RECEIVER_FIELDS = {
     "Ready": {"sockets", "startedMonotonicNs", "expiresMonotonicNs", "observedMonotonicNs", "counters"},
+    "ReadyHandoff": {"requestId", "readyReceiptSha256", "tcpSocketInstanceId", "udpSocketInstanceId",
+                     "startedMonotonicNs", "expiresMonotonicNs", "observedMonotonicNs", "remainingLifetimeMs",
+                     "remainingRequests", "counters"},
     "Counters": {"counters", "sealed", "observedMonotonicNs"},
     "Request": {"request", "counters", "observedMonotonicNs"},
     "Closed": {"counters", "sealed", "stopReason", "sockets", "allHandlesClosed", "observedMonotonicNs"},
@@ -1293,13 +1420,16 @@ RECEIVER_FIELDS = {
 }
 ERRORS = {"RecordBackpressure", "RecordOutputLost", "RecordSize", "SnapshotBudget", "ControlNotAllowed",
           "PipeInputSize", "ReceiverIOUnknown", "DatagramConsumptionUnknown", "LeaseClosed",
-          "ExclusiveBindUnsupported", "BoundTupleMismatch", "StartupFailed", "InvalidShape", "InvalidJSON"}
+          "ExclusiveBindUnsupported", "BoundTupleMismatch", "StartupFailed", "InvalidShape", "InvalidJSON",
+          "InvalidDiscriminator", "HandoffAlreadyRequested", "HandoffIdentity", "HandoffBudget",
+          "HandoffUnavailable", "MissingReady", "LeaseBinding"}
 STOP_REASONS = ERRORS | {"AbsoluteDeadline", "ControllerStop", "ControlEOF", "RequestBudget"}
 CODEC_ERRORS = {"InvalidShape", "InvalidDiscriminator", "InvalidBase64", "InvalidJSON", "InvalidIPv4",
                 "InputSize", "DuplicateKey", "NonIntegerNumber", "NestingLimit", "StringLimit",
                 "ArrayLimit", "ObjectLimit", "DuplicatePort", "NonceBinding", "NonCanonicalPlan",
                 "SourceInventory", "SourceSize", "SourceBinding", "RawRecordCodec", "OriginalRawDigest",
-                "OriginalChildBinding", "OriginalStreamFraming", "SocketBinding", "LeaseBinding"}
+                "OriginalChildBinding", "OriginalStreamFraming", "SocketBinding", "LeaseBinding",
+                "HandoffIdentity", "HandoffBudget", "HandoffUnavailable", "HandoffRequestBinding"}
 
 
 def socket_facts(value, closed=False):
@@ -1352,6 +1482,21 @@ def receiver_record(raw):
         start, end = integer(item["startedMonotonicNs"]), integer(item["expiresMonotonicNs"])
         require(start <= item["observedMonotonicNs"] < end and
                 abs(end - start - item["binding"]["lifetimeSeconds"] * 1000000000) <= 1, "LeaseBinding")
+    if phase == "ReadyHandoff":
+        hex_value(item["requestId"], 32)
+        hex_value(item["readyReceiptSha256"], 64)
+        for key in ("tcpSocketInstanceId", "udpSocketInstanceId"):
+            hex_value(item[key], 32)
+        require(item["tcpSocketInstanceId"] != item["udpSocketInstanceId"], "HandoffIdentity")
+        start, end = integer(item["startedMonotonicNs"]), integer(item["expiresMonotonicNs"])
+        require(start <= item["observedMonotonicNs"] < end and
+                end - start == item["binding"]["lifetimeSeconds"] * 1000000000, "LeaseBinding")
+        integer(item["remainingLifetimeMs"], 1, 120000)
+        integer(item["remainingRequests"], 1, MAX_REQUESTS)
+        require(item["remainingLifetimeMs"] == (end - item["observedMonotonicNs"]) // 1000000,
+                "LeaseBinding")
+        require(item["remainingRequests"] == MAX_REQUESTS - sum(c["total"] for c in item["counters"].values()),
+                "HandoffBudget")
     if phase in ("Counters", "Closed"):
         require(type(item["sealed"]) is bool and item["sealed"] == (phase == "Closed"))
     if phase == "Closed":
@@ -1373,6 +1518,21 @@ def receiver_record(raw):
     return item
 
 
+def handoff_check(ready, ready_sha, item, request_id):
+    """Consistency of original private pipe records; this never grants execution authority."""
+    hex_value(request_id, 32)
+    require(ready["phase"] == "Ready" and item["phase"] == "ReadyHandoff" and
+            item["requestId"] == request_id, "HandoffRequestBinding")
+    require(item["readyReceiptSha256"] == ready_sha and
+            all(item[k] == ready[k] for k in ("binding", "pcPlanSha256", "sourceKind", "controllerInstanceId",
+                "receiverInstanceId", "startedMonotonicNs", "expiresMonotonicNs")), "HandoffIdentity")
+    sockets = {f["protocol"]: f["socketInstanceId"] for f in ready["sockets"]}
+    require(item["tcpSocketInstanceId"] == sockets["tcp"] and item["udpSocketInstanceId"] == sockets["udp"] and
+            item["receiverSeq"] > ready["receiverSeq"] and
+            item["observedMonotonicNs"] >= ready["observedMonotonicNs"], "HandoffIdentity")
+    return item
+
+
 def wait_union(value):
     require(type(value) is dict)
     choice(value.get("state"), ("Pending", "Waited", "Unknown"))
@@ -1390,7 +1550,7 @@ def controller_record(raw):
     item = decode(raw, MAX_RECORD)
     common = {"schema", "role", "phase", "controllerInstanceId", "eventSeq", "sourceKind"}
     fields = {"ReceiverRecord": {"receiverRaw", "receiverRawSha256"}, "StopRequested": {"reason"},
-              "ChildWait": {"childWait"}, "Unknown": {"error"}}
+              "ReadyHandoffRequested": {"requestId"}, "ChildWait": {"childWait"}, "Unknown": {"error"}}
     require(type(item) is dict)
     choice(item.get("phase"), fields)
     shape(item, common | fields[item["phase"]])
@@ -1407,6 +1567,8 @@ def controller_record(raw):
         require(item["reason"] in ("ControllerStop", "ControlEOF", "ControllerDeadline", "ControllerInterrupted"))
     elif item["phase"] == "ChildWait":
         wait_union(item["childWait"])
+    elif item["phase"] == "ReadyHandoffRequested":
+        hex_value(item["requestId"], 32)
     else:
         require(item["error"] == "ControllerIOUnknown")
     return item
@@ -1481,6 +1643,7 @@ def verify(raw_plan, value):
         previous = empty_counters()
         ready_sha = None
         sockets = {}
+        handoff_id, handoff_received, handoff_closed = None, False, False
         for entry in value["records"]:
             shape(entry, {"raw", "sha256"})
             raw = raw_base64(entry["raw"])
@@ -1493,6 +1656,7 @@ def verify(raw_plan, value):
             synthetic |= item["sourceKind"] == "Synthetic"
             if item["phase"] == "Unknown":
                 incomplete.append("ControllerUnknown")
+                handoff_closed = True
             elif item["phase"] == "ChildWait":
                 state = item["childWait"]
                 require(waited is None, "DuplicateWait")
@@ -1504,6 +1668,11 @@ def verify(raw_plan, value):
                     wait_identity_lost |= state.get("error") == "LostWaitOwnership"
             elif item["phase"] == "StopRequested":
                 require(waited is None, "ControlAfterWait")
+                handoff_closed = True
+            elif item["phase"] == "ReadyHandoffRequested":
+                require(handoff_id is None and ready is not None and closed is None and waited is None and
+                        not handoff_closed, "HandoffRequestBinding")
+                handoff_id = item["requestId"]
             elif item["phase"] == "ReceiverRecord":
                 require(waited is None, "RecordAfterWait")
                 child_raw = raw_base64(item["receiverRaw"])
@@ -1516,6 +1685,7 @@ def verify(raw_plan, value):
                 synthetic |= child["sourceKind"] == "Synthetic"
                 if child["phase"] == "Unknown":
                     incomplete.append("ReceiverUnknown")
+                    handoff_closed = True
                     continue
                 require(closed is None, "RecordAfterClose")
                 if "observedMonotonicNs" in child:
@@ -1532,6 +1702,11 @@ def verify(raw_plan, value):
                         incomplete.append("UnfinishedAcceptedRequest")
                 if child["phase"] == "Counters":
                     snapshots[item["eventSeq"]] = child
+                elif child["phase"] == "ReadyHandoff":
+                    require(handoff_id is not None and not handoff_received and not handoff_closed,
+                            "HandoffRequestBinding")
+                    handoff_check(ready, ready_sha, child, handoff_id)
+                    handoff_received = True
                 elif child["phase"] == "Request":
                     if not business_window(child, ready):
                         incomplete.append("MissingBusinessTime")
@@ -1549,6 +1724,8 @@ def verify(raw_plan, value):
                             x["pending"] for x in child["counters"].values()):
                         incomplete.append("OriginalCloseUnknown")
                 previous = child["counters"]
+        if handoff_id is not None and not handoff_received:
+            incomplete.append("MissingReadyHandoff")
         if ready is None or closed is None or waited is None:
             incomplete.append("MissingOriginalLifecycle")
         elif waited.get("state") != "Waited" or waited.get("returnCode") != 0:

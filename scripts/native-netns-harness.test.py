@@ -191,5 +191,39 @@ class RMetadataLandlockP1Tests(unittest.TestCase):
 
 
 # Classes appended above must be loaded before unittest discovers the full source suite.
+
+class RDictionaryAdapterTests(unittest.TestCase):
+    def test_only_actual_private_observations_fill_metadata_topology(self):
+        import copy
+        planned={"persistent":None,"foreignLink":{"name":"rnf0","kind":"dummy","linkIndex":None,"addresses":["198.18.253.1/24","fd00:729::1/64"]},"gateway":None,"ipv6Output":None,"providedTun":None,"independentActors":None,"rpFilter":{"all":0,"default":0,"deviceBefore":0,"deviceStarted":0,"deviceClosed":0,"writablePath":""}}
+        actual={"foreignLink":{"link":{"ifindex":42}}}
+        metadata=harness.r_observed_topology(planned,actual)
+        self.assertIsNone(planned["foreignLink"]["linkIndex"])
+        self.assertEqual(metadata["foreignLink"]["linkIndex"],42)
+        harness.r_topology(metadata,13,observed=True)
+        with self.assertRaises(RuntimeError):harness.r_topology(planned,13,observed=True)
+        wrong=copy.deepcopy(planned);wrong["foreignLink"]["linkIndex"]=41
+        with self.assertRaisesRegex(RuntimeError,"actual private"):harness.r_observed_topology(wrong,actual)
+        with self.assertRaises(KeyError):harness.r_observed_topology(planned,{})
+
+    def test_native_setup_has_no_pre_subject_foreign_or_gateway_route_mutation(self):
+        import ast
+        source=Path(harness.__file__).read_text()
+        functions={node.name:node for node in ast.parse(source).body if isinstance(node,ast.FunctionDef)}
+        setup=ast.get_source_segment(source,functions["r_setup"])
+        self.assertNotIn('("foreignLink","gatewayLink")',setup)
+        self.assertNotIn('"table"',setup)
+        self.assertIn('foreign=case["topology"]["foreignLink"]',setup)
+        self.assertIn('rules=r_ip("-j","-6","rule","show")',setup)
+        self.assertIn('if fd is not None:os.close(fd)',setup)
+        self.assertIn('if index==17:',setup)
+        self.assertFalse(harness.R_SOURCE_EXECUTION_READY)
+        self.assertFalse(harness.R_METADATA_ACK)
+        loop=ast.get_source_segment(source,functions["r_children"])
+        self.assertNotIn('-test.list',loop)
+        self.assertIn('evidence_bytes+=len(line)+1',loop)
+        self.assertIn('verifier.actor_birth(a["evidence"],True)',loop)
+
+
 if __name__ == "__main__":
     unittest.main()

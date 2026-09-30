@@ -17,7 +17,7 @@ import struct
 from pathlib import Path
 
 PROFILE = "native-tun-rtnetlink-child-userns-v1"
-METADATA_SCHEMA = "polaris-g-r-held-input-v1"
+METADATA_SCHEMA = "polaris-r-native-launch-metadata"
 ENVELOPE_SCHEMA = "polaris-g-r-case-envelope-v1"
 PLAN_SCHEMA = "polaris-g-r-frozen-plan-v1"
 MAX_METADATA = 65536
@@ -32,12 +32,8 @@ HASH = re.compile(r"[0-9a-f]{64}\Z")
 NONCE = re.compile(r"[0-9a-f]{32}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 METADATA_FIELDS = frozenset("schema version profile profileSha256 batchNonce caseNonce caseID actor sourceCommit sourceTree sourceFilesSha256 moduleGraphSha256 elfSha256 configSha256 planSha256 fdRoles fdObservedIdentities guardianParentIdentities caseOptions topology budgets".split())
-BUDGETS = {"setupSeconds": 10, "caseMilliseconds": 15000, "cleanupSeconds": 5,
-           "ioMaximumMilliseconds": 1000, "caseEvidenceMaximumBytes": MAX_EVIDENCE,
-           "casePacketsMaximum": 8, "stdoutMaximumBytes": MAX_STDOUT}
-FD_ROLES = {3: "targetNetns", 4: "childUserns", 5: "privateMountns", 6: "privateProcDir",
-            7: "formalClaimsBaseDir", 8: "readOnlyRegularMetadata", 9: "providedPrivateTun",
-            10: "oneShotGToAReadPipe"}
+BUDGETS = {"caseMilliseconds": 15000, "ioMilliseconds": 1000, "maxEvidenceBytes": MAX_EVIDENCE, "maxPackets": 8}
+FD_ROLES = {3: "targetNetns", 4: "childUserns", 5: "privateMountns", 6: "privateProcDir", 7: "formalClaimsBaseDir", 8: "metadata", 9: "providedPrivateTun", 10: "oneShotGToAReadPipe"}
 HOST_COMMANDS = (["/usr/sbin/ip", "-j", "link", "show"], ["/usr/sbin/ip", "-j", "address", "show"],
                  ["/usr/sbin/ip", "-j", "-4", "route", "show", "table", "all"],
                  ["/usr/sbin/ip", "-j", "-6", "route", "show", "table", "all"],
@@ -126,26 +122,23 @@ def validate_metadata(value):
         check(type(value[key]) is str and NONCE.fullmatch(value[key]), key + " differs")
     for key in ("sourceCommit", "sourceTree"):
         check(type(value[key]) is str and COMMIT.fullmatch(value[key]), key + " differs")
-    roles = {str(fd): FD_ROLES[fd] for fd in slots}
-    check(value["fdRoles"] == roles, "FD roles are not closed")
-    exact(value["fdObservedIdentities"], roles, "FD observations")
+    roles = [{"fd":fd, "role":FD_ROLES[fd]} for fd in slots]
+    check(encoded(value["fdRoles"]) == encoded(roles), "FD roles are not closed")
+    exact(value["fdObservedIdentities"], {FD_ROLES[fd] for fd in slots}, "FD observations")
     for fd in slots:
-        item = exact(value["fdObservedIdentities"][str(fd)], {"dev", "ino", "type", "access"}, "FD identity")
-        integer(item["dev"], 0, 2**64-1, "FD dev"); integer(item["ino"], 1, 2**64-1, "FD ino")
-        check(item["type"] == ({3:"nsfs",4:"nsfs",5:"nsfs",6:"directory",7:"directory",8:"regular",9:"tun",10:"pipe"}[fd]), "FD type differs")
-        check(item["access"] == ("readWrite" if fd == 9 else "readOnly"), "FD access differs")
-    exact(value["guardianParentIdentities"], {"net", "mnt", "user", "pid", "ipc"}, "guardian identities")
+        item = exact(value["fdObservedIdentities"][FD_ROLES[fd]], {"device", "inode"}, "FD identity")
+        integer(item["device"], 1, 2**64-1, "FD device");integer(item["inode"], 1, 2**64-1, "FD inode")
+    exact(value["guardianParentIdentities"], {"netns", "mountns", "userns", "pidns", "ipcns"}, "guardian identities")
     for item in value["guardianParentIdentities"].values():
-        exact(item, {"dev", "ino"}, "guardian identity")
-        integer(item["dev"],0,2**64-1,"guardian dev");integer(item["ino"],1,2**64-1,"guardian ino")
-    check(value["budgets"] == BUDGETS and all(type(v) is int for v in value["budgets"].values()), "case budgets differ")
-    # PC owns the complete actual Options/topology dictionary; missing source ACK is NotReady.
+        exact(item, {"device", "inode"}, "guardian identity")
+        integer(item["device"],1,2**64-1,"guardian device");integer(item["inode"],1,2**64-1,"guardian inode")
+    check(encoded(value["budgets"]) == encoded(BUDGETS), "case budgets differ")
     try:
         harness_source().r_options(value["caseOptions"], index, value["actor"])
-        harness_source().r_topology(value["topology"], index)
+        harness_source().r_topology(value["topology"], index, observed=True)
     except RuntimeError as error:
         raise ValueError(str(error)) from error
-    encoded(value)
+    check(value["configSha256"] == hashlib.sha256(encoded(value["caseOptions"])).hexdigest(), "actual per-actor constructor/update config digest differs")
     return value
 
 
@@ -163,52 +156,120 @@ def go_transcript(data, index, exit_status):
 
 
 def netlink_dump(value):
-    # Independently decode each original recv datagram; no mutation wire ACK assertion.
-    exact(value, {"request","sequence","localPortID","receives","terminalStatus","decoded"}, "raw dump")
-    request = integer(value["request"], 0, 255, "request")
-    expected = {18:16,22:20,26:24,34:32}
-    check(request in expected, "non-GET raw request")
+    """Validate the exact PC original receive/decoded codec without reserializing facts."""
+    exact(value, {"request","sequence","localPortID","senderPortID","senderGroups","recvFlags","receivedLength","rawDatagrams","receives","terminalStatus","decoded"}, "raw dump")
+    request=integer(value["request"],0,255,"request");expected={18:16,22:20,26:24,34:32}
+    check(request in expected,"non-GET raw request")
     seq=integer(value["sequence"],1,2**32-1,"sequence");local=integer(value["localPortID"],1,2**32-1,"local port")
-    check(type(value["receives"]) is list and 1 <= len(value["receives"]) <= 256, "raw recv budget")
+    check(type(value["receives"]) is list and 1 <= len(value["receives"]) <= 128 and type(value["rawDatagrams"]) is list and len(value["rawDatagrams"])==len(value["receives"]),"raw receive/datagram pairing differs")
     decoded=[];done=False;total=0
-    for recv in value["receives"]:
-        exact(recv, {"senderPortID","senderGroups","recvFlags","receivedLength","rawDatagrams"}, "raw recv")
-        check(type(recv["senderPortID"]) is int and recv["senderPortID"] == 0 and type(recv["senderGroups"]) is int and recv["senderGroups"] == 0 and type(recv["recvFlags"]) is int and recv["recvFlags"] == 0, "nonkernel/truncated raw recv")
-        check(type(recv["rawDatagrams"]) is str, "raw datagram encoding")
-        data=base64.b64decode(recv["rawDatagrams"],validate=True);total+=len(data)
-        check(type(recv["receivedLength"]) is int and recv["receivedLength"] == len(data) and total <= MAX_EVIDENCE, "raw received length/budget differs")
+    for recv,original in zip(value["receives"],value["rawDatagrams"]):
+        exact(recv,{"senderPortID","senderGroups","recvFlags","receivedLength"},"raw recv")
+        flags=integer(recv["recvFlags"],0,2**31-1,"recv flags")
+        check(type(recv["senderPortID"]) is int and recv["senderPortID"]==0 and type(recv["senderGroups"]) is int and recv["senderGroups"]==0 and flags & (0x20|0x8)==0,"raw recv nonkernel/truncation")
+        check(type(original) is str,"original datagram encoding")
+        data=base64.b64decode(original,validate=True);total+=len(data)
+        check(type(recv["receivedLength"]) is int and recv["receivedLength"]==len(data) and 0<len(data)<=65536 and total<=MAX_EVIDENCE,"raw received length/budget differs")
         pos=0
-        while pos < len(data):
-            check(not done and len(data)-pos >= 16, "raw trailing or message after DONE")
-            length,kind,flags,msgseq,pid=struct.unpack_from("<IHHII",data,pos)
-            check(16<=length<=len(data)-pos and msgseq==seq and pid==local and not flags & 0x10, "raw header/seq/port/DUMP_INTR")
-            body=data[pos+16:pos+length]
+        while pos<len(data):
+            check(not done and len(data)-pos>=16,"raw trailing or message after DONE")
+            length,kind,msgflags,msgseq,pid=struct.unpack_from("<IHHII",data,pos)
+            check(16<=length<=len(data)-pos and msgseq==seq and pid==local and not msgflags & 0x10,"raw header/seq/port/DUMP_INTR")
+            body=data[pos+16:pos+length];attrs=[]
             if kind==3:
-                check(body == b"\0\0\0\0", "missing/nonzero DONE error");done=True
+                check(body==b"\0\0\0\0","missing/nonzero DONE error");done=True;fixed=4
             else:
-                check(kind==expected[request] and flags & 2, "raw error/overrun/nonmultipart/unexpected message")
+                check(kind==expected[request] and msgflags & 2,"raw error/overrun/nonmultipart/unexpected message")
                 fixed={16:16,20:8,24:12,32:12}[kind];check(len(body)>=fixed,"truncated RTM payload")
-                attrs={};offset=fixed
+                offset=fixed
                 while offset<len(body):
                     check(len(body)-offset>=4,"truncated RTM attribute")
                     size,atype=struct.unpack_from("<HH",body,offset)
-                    # Preserve type flags and every original attribute byte. Nested payloads are
-                    # bounded opaque bytes, not silently discarded or promoted to decoded facts.
-                    check(4<=size<=len(body)-offset and atype not in attrs,"duplicate/invalid RTM attribute")
-                    attrs[atype]=body[offset+4:offset+size].hex();offset+=(size+3)&~3
-                    check(offset<=len(body),"RTM alignment exceeds payload")
-                # Full fixed selector bytes and all attributes retained, not a guessed reduced spec.
-                decoded.append({"kind":kind,"header":body[:fixed].hex(),"attributes":{str(k):v for k,v in sorted(attrs.items())}})
+                    check(4<=size<=len(body)-offset and offset+((size+3)&~3)<=len(body),"invalid RTM attribute alignment")
+                    attrs.append({"rawType":atype,"type":atype&0x3fff,"flags":atype&0xc000,"payload":base64.b64encode(body[offset+4:offset+size]).decode()})
+                    check(len(attrs)<=1024,"raw attribute budget")
+                    offset+=(size+3)&~3
+            decoded.append({"type":kind,"flags":msgflags,"sequence":msgseq,"portID":pid,"fixedHeader":base64.b64encode(body[:fixed]).decode(),"attributes":attrs})
             pos+=(length+3)&~3;check(pos<=len(data),"NLMSG alignment exceeds datagram")
-    check(done and value["terminalStatus"]=="DONE" and value["decoded"]==decoded,"missing DONE or independently decoded spec differs")
+    for key in ("senderPortID","senderGroups","recvFlags","receivedLength"):integer(value[key],0,2**31-1,"raw aggregate "+key)
+    last=value["receives"][-1]
+    check(value["senderPortID"]==last["senderPortID"] and value["senderGroups"]==last["senderGroups"] and value["recvFlags"]==last["recvFlags"] and value["receivedLength"]==total,"raw aggregate metadata differs")
+    check(done and value["terminalStatus"]=="DONE_ZERO" and encoded(value["decoded"],MAX_EVIDENCE)==encoded(decoded,MAX_EVIDENCE),"missing DONE or independently decoded spec differs")
     return decoded
 
 
+EVIDENCE_FIELDS = frozenset("schema version kind phase caseID caseName actor batchNonce caseNonce candidate sequence encodedBytes packetCount subjectCleanup testAssertions rCalleeCoverage consumerCoverage fixtureDisposal guardianSettlement hostUnchanged aggregateResult value".split())
+EVIDENCE_PHASES = ['pending', 'actual_case_return', 'failed_case_return', 'actual_packet', 'actual_new_without_start_close', 'actual_start', 'actual_dispose_and_double_close', 'actual_gateway_connected_route', 'explicit_seam_partial_seal', 'actual_close_and_owned_postcheck', 'allocator_preflight_eexist_before_tun', 'expected_unknown_retained_no_retry', 'foreign_full_spec_preserved_after_close', 'actual_persistent_before', 'actual_rp_filter_start', 'actual_rp_filter_close', 'actual_borrowed_snapshot_preserved', 'actual_foreign_before', 'actual_ipv6_priority_before', 'receiver_actual_close_and_join', 'actual_update_return_then_close_join', 'independent_b_allocator_priority_refusal', 'independent_a_running_before_b', 'independent_a_preserved_after_b_no_b_callback']
+BINDING_FIELDS = frozenset("profileSha256 batchNonce caseNonce sourceCommit sourceTree sourceFilesSha256 moduleGraphSha256 elfSha256 configSha256 planSha256".split())
+
+
+
+def required_phases(index, actor):
+    if index==0:return ["independent_b_allocator_priority_refusal"] if actor=="b" else ["independent_a_running_before_b", "independent_a_preserved_after_b_no_b_callback"]
+    if index==1:return ["actual_new_without_start_close"]
+    if index==2:return ["actual_start", "actual_dispose_and_double_close"]
+    if index in (8,9):return ["allocator_preflight_eexist_before_tun"]
+    if index in (10,11,12,13):return (["actual_foreign_before"] if index==13 else [])+["actual_start", "foreign_full_spec_preserved_after_close"]
+    if index==14:return ["actual_start", "expected_unknown_retained_no_retry"]
+    if index in (15,16,17):return ["actual_persistent_before"]+(["actual_rp_filter_start", "actual_rp_filter_close"] if index==16 else [])+["actual_borrowed_snapshot_preserved"]
+    if index==18:return ["actual_start", "receiver_actual_close_and_join"]
+    if index==21:return ["actual_start", "actual_update_return_then_close_join"]
+    return (["actual_ipv6_priority_before"] if index==25 else [])+["actual_start"]+(["actual_gateway_connected_route"] if index==19 else ["explicit_seam_partial_seal"] if index==20 else [])+["actual_close_and_owned_postcheck"]
+
+def actor_birth(events, required=False):
+    births=[]
+    for event in events:
+        value=event["value"];phase=event["phase"]
+        if phase in ("actual_start", "independent_a_running_before_b") and type(value) is dict:
+            births.append(value.get("Birth"))
+        elif phase=="independent_b_allocator_priority_refusal" and type(value) is dict:
+            births.append(value.get("ActualBirth"))
+        elif phase=="actual_new_without_start_close":births.append(value)
+    if not births:
+        check(not required,"actual original birth absent")
+        return None
+    check(all(type(b) is str and NONCE.fullmatch(b) for b in births) and len(set(births))==1,"original actor birth encoding/change differs")
+    return births[0]
+
+
+def b_refusal(events):
+    event=next((e for e in events if e["phase"]=="independent_b_allocator_priority_refusal"),None)
+    check(event is not None,"B actual refusal absent")
+    facts=exact(event["value"],{"ActualBirth","Errno","ReturnedNil","TUNCalls","Started","Callback"},"B actual refusal facts")
+    check(type(facts["ActualBirth"]) is str and NONCE.fullmatch(facts["ActualBirth"]),"B original birth absent")
+    check(type(facts["Errno"]) is str and "file exists" in facts["Errno"] and facts["ReturnedNil"] is True and type(facts["TUNCalls"]) is int and facts["TUNCalls"]==0 and facts["Started"] is False and facts["Callback"] is False,"B original EEXIST/nil/pre-TUN refusal differs")
+    return facts
+
+
+def raw_values(value):
+    # PC typed value contains original observations and full raw dump objects.
+    if type(value) is dict:
+        if "rawDatagrams" in value and "request" in value:
+            yield value
+        else:
+            for child in value.values():yield from raw_values(child)
+    elif type(value) is list:
+        for child in value:yield from raw_values(child)
+
+
+def planned_topology_matches(planned, actual):
+    import copy
+    original=copy.deepcopy(actual)
+    for key in ("persistent", "foreignLink"):
+        if planned[key] is not None and planned[key]["linkIndex"] is None:original[key]["linkIndex"]=None
+    if planned["ipv6Output"] is not None:
+        for key in ("beforePriorities", "selectedPriority"):
+            if planned["ipv6Output"][key] is None:original["ipv6Output"][key]=None
+    if planned["providedTun"] is not None and planned["providedTun"]["namespaceObservation"] is None:original["providedTun"]["namespaceObservation"]=None
+    check(encoded(original)==encoded(planned),"actual topology/recipe splice")
+
+
 def verify_actor(value, index, actor, binding, planned=None, producer_list=None):
-    exact(value, {"actor","metadata","pid","wait","stdout","stderr","list","evidence"}, "actor envelope")
+    exact(value,{"actor","metadata","pid","wait","stdout","stderr","list","evidence"},"actor envelope")
     check(value["actor"]==actor,"actor role differs");metadata=validate_metadata(value["metadata"])
     check(metadata["caseID"]==index and metadata["actor"]==actor,"actor metadata differs")
-    for key in binding:check(metadata[key]==binding[key],"candidate/nonce/plan mismatch: "+key)
+    for key in binding:
+        if key != "configSha256":check(metadata[key]==binding[key],"candidate/nonce/plan mismatch: "+key)
     integer(value["pid"],1,2**31-1,"actual child pid")
     wait=exact(value["wait"],{"pid","exitStatus","actual","timedOut"},"actual Wait")
     check(wait["pid"]==value["pid"] and wait["actual"] is True and wait["timedOut"] is False,"missing actual Wait")
@@ -217,33 +278,53 @@ def verify_actor(value, index, actor, binding, planned=None, producer_list=None)
     check(item=={"top":top,"argv":["-test.list=^"+top+"$"],"stdout":top+"\n","exitStatus":0,"elfSha256":binding["elfSha256"]} and type(item["exitStatus"]) is int,"selected top list differs")
     if producer_list is not None:check(item==producer_list,"producer actual selected-list plan splice")
     if planned is not None:
-        check(metadata["caseOptions"]==planned["options"][actor] and metadata["topology"]==planned["topology"],"frozen actor Options/topology splice")
+        check(encoded(metadata["caseOptions"])==encoded(planned["options"][actor]),"frozen actor Options splice")
+        planned_topology_matches(planned["topology"],metadata["topology"])
     stdout=base64.b64decode(value["stdout"],validate=True);stderr=base64.b64decode(value["stderr"],validate=True)
-    check(len(stdout)+len(stderr)<=MAX_STDOUT,"combined child output budget")
-    go_transcript(stdout,index,wait["exitStatus"])
-    # These exact typed records must be emitted by the PC's actual producer. Missing fields reject.
+    check(len(stdout)+len(stderr)<=MAX_STDOUT,"combined child output budget");go_transcript(stdout,index,wait["exitStatus"])
     evidence=value["evidence"];check(type(evidence) is list and 2<=len(evidence)<=256,"typed evidence absent/budget")
-    emitted=[closed_json(line[len(b"R_NATIVE_EVIDENCE "):],MAX_EVIDENCE) for line in stdout.splitlines() if line.startswith(b"R_NATIVE_EVIDENCE ")]
+    lines=[line for line in stdout.splitlines(keepends=True) if line.startswith(b"R_NATIVE_EVIDENCE ")]
+    emitted=[closed_json(line[len(b"R_NATIVE_EVIDENCE "):].rstrip(b"\n"),MAX_EVIDENCE) for line in lines]
     check(emitted==evidence,"typed evidence does not equal original child stdout bytes")
-    phases=[];packets=0;birth=None
-    for event in evidence:
-        exact(event,{"schema","phase","batchNonce","caseNonce","caseID","actor","birth","options","facts","packets","rawDumps","subjectCleanup","fixtureDisposal"},"native evidence")
-        check(event["schema"]=="polaris-r-native-evidence-v1" and event["phase"] in ("pending","running","priority_refused","complete"),"unknown evidence phase")
+    total=0;packets=0;phases=[];raw_count=0
+    for seq,(event,line) in enumerate(zip(evidence,lines),1):
+        exact(event,EVIDENCE_FIELDS,"native evidence")
+        phase=event["phase"]
+        check(type(event["caseID"]) is int,"typed caseID differs")
+        check(event["schema"]=="polaris-r-native-case-evidence" and type(event["version"]) is int and event["version"]==1 and phase in EVIDENCE_PHASES,"unknown evidence phase")
         for key in ("batchNonce","caseNonce","caseID","actor"):check(event[key]==metadata[key],"native evidence association differs")
-        check(type(event["birth"]) is str and NONCE.fullmatch(event["birth"]),"actual native birth absent")
-        if birth is None:birth=event["birth"]
-        check(event["birth"]==birth,"actor birth changed mid-receipt")
-        check(event["options"]==metadata["caseOptions"],"actual Options receipt differs")
-        integer(event["packets"],0,8,"packet count");packets+=event["packets"]
-        check(type(event["rawDumps"]) is list and len(event["rawDumps"])<=16,"raw dump budget")
-        for raw in event["rawDumps"]:netlink_dump(raw)
-        check(type(event["facts"]) is dict,"typed original facts missing")
-        check(event["subjectCleanup"] in ("Pending","Closed","ConstructionOnlyClosed","Unknown","PartialSealed") and event["fixtureDisposal"] in ("Pending","ActualRestoredAndDisposed","Unknown"),"unknown typed disposition")
-        phases.append(event["phase"])
-    check(packets<=metadata["topology"]["packetBudgetAllocation"]["native"] and phases[0]=="pending" and phases[-1]=="complete" and phases.count("pending")==1 and phases.count("complete")==1,"phase/packet closure differs")
-    check(sum(len(encoded(x,MAX_EVIDENCE)) for x in evidence)<=MAX_EVIDENCE,"cumulative case evidence exceeds bound")
-    if planned is not None:
-        check(evidence[-1]["subjectCleanup"]==planned["expectedSubjectCleanup"] and evidence[-1]["fixtureDisposal"]==planned["expectedFixtureDisposal"],"planned terminal disposition differs")
+        check(event["caseName"]=="/".join(CASES[index]),"native case name differs")
+        candidate={key:metadata[key] for key in ("profileSha256","sourceCommit","sourceTree","sourceFilesSha256","moduleGraphSha256","elfSha256","configSha256","planSha256")}
+        check(event["candidate"]==candidate,"original per-actor candidate digest differs")
+        total+=len(line)
+        check(line.endswith(b"\n") and type(event["sequence"]) is int and event["sequence"]==seq and type(event["encodedBytes"]) is int and event["encodedBytes"]==total and total<=MAX_EVIDENCE,"cumulative original newline evidence budget/sequence differs")
+        expected_kind="pending" if phase=="pending" else "terminal" if phase in ("actual_case_return","failed_case_return") else "phase"
+        check(event["kind"]==expected_kind,"typed phase/kind differs")
+        count=integer(event["packetCount"],0,8,"packet count")
+        check(count==packets+(phase=="actual_packet"),"actual cumulative packet count differs")
+        packets=count
+        if phase=="actual_packet":
+            packet=exact(event["value"],{"direction","length","raw"},"raw packet")
+            raw=base64.b64decode(packet["raw"],validate=True)
+            check(type(packet["length"]) is int and packet["length"]==len(raw) and 0<len(raw)<=2048 and packet["direction"] in ("endpoint_send","actual_TUN_Read","actual_TUN_Write_wrong_nonce","endpoint_receive_wrong_nonce","actual_TUN_Write_valid_response","endpoint_receive_valid_nonce","endpoint_send_excluded"),"actual raw packet/length/direction differs")
+        for dump in raw_values(event["value"]):
+            raw_count+=1;check(raw_count<=16,"raw dump count budget");netlink_dump(dump)
+        check(event["fixtureDisposal"]==event["guardianSettlement"]==event["hostUnchanged"]=="GuardianPending" and event["aggregateResult"]=="NotReady","subject cannot settle guardian/global resources")
+        check(event["consumerCoverage"]==("NotReady" if index==0 else "NotInScope") and event["rCalleeCoverage"]=="actual_R_API_only","subject coverage column differs")
+        check(event["testAssertions"]==("PASS" if phase=="actual_case_return" else "FAIL" if phase=="failed_case_return" else "Pending"),"typed assertion column differs")
+        check(event["subjectCleanup"]==("ConstructorClosedBeforeTUN" if actor=="b" else "UnknownOriginalCustody" if index==14 else "ReleasedOwnLedger") if phase=="actual_case_return" else event["subjectCleanup"]==("UnknownOriginalCustody" if phase=="failed_case_return" else "NotObserved"),"typed subject cleanup differs")
+        phases.append(phase)
+    check(phases[0]=="pending" and phases[-1]=="actual_case_return" and phases.count("pending")==1 and phases.count("actual_case_return")==1 and "failed_case_return" not in phases,"pending/phase/terminal closure differs")
+    required=required_phases(index,actor)
+    check([p for p in phases if p in required]==required,"actual case-specific callee phase closure differs")
+    check(all(p in required or p in ("pending","actual_case_return","actual_packet") for p in phases),"wrong-case phase replay")
+    check(not packets or (index==0 and actor=="a" or index in (17,27)),"unexpected case packet sender")
+    if index==16:
+        check(next(e["value"] for e in evidence if e["phase"]=="actual_rp_filter_start")==2 and next(e["value"] for e in evidence if e["phase"]=="actual_rp_filter_close")==1,"actual rp_filter 1→2→1 facts differ")
+    check(evidence[-1]["value"] is None,"successful terminal cannot carry a failure/fabricated result")
+    actor_birth(evidence,required=index==0)
+    if actor=="b":b_refusal(evidence)
+    if planned is not None:check(evidence[-1]["subjectCleanup"]==planned["expectedSubjectCleanup"][actor],"planned terminal disposition differs")
     return evidence
 
 
@@ -263,11 +344,12 @@ def verify_batch(envelopes, plan=None, plan_bytes=None):
         index=integer(envelope["caseID"],0,27,"caseID");check(envelope["schema"]==ENVELOPE_SCHEMA and envelope["selected"]=="/".join(CASES[index]),"case selector differs")
         binding=exact(envelope["binding"],{"profileSha256","batchNonce","caseNonce","sourceCommit","sourceTree","sourceFilesSha256","moduleGraphSha256","elfSha256","configSha256","planSha256"},"binding")
         if plan is not None:
-            expected={key:plan[key] for key in binding if key not in ("caseNonce","planSha256")}
+            expected={key:plan[key] for key in binding if key not in ("caseNonce","planSha256","configSha256")}
+            expected["configSha256"]=hashlib.sha256(encoded(plan["cases"][index]["options"][plan["cases"][index]["actors"][0]])).hexdigest()
             expected.update(caseNonce=plan["caseNonces"][index],planSha256=hashlib.sha256(plan_bytes).hexdigest())
             check(binding==expected,"actual frozen plan/candidate binding differs")
         check(binding["caseNonce"] not in nonces,"reused case nonce");nonces.add(binding["caseNonce"])
-        candidate={k:v for k,v in binding.items() if k!="caseNonce"}
+        candidate={k:v for k,v in binding.items() if k not in ("caseNonce","configSha256")}
         if common is None:common=candidate
         check(candidate==common,"cross-run candidate/plan splice")
         roles=("a","b") if index==0 else ("single",)
@@ -275,15 +357,14 @@ def verify_batch(envelopes, plan=None, plan_bytes=None):
         planned=None if plan is None else plan["cases"][index]
         producer=None if plan is None else next(x for x in plan["selectedTopLists"] if x["top"]==CASES[index][0])
         events=[verify_actor(a,index,role,binding,planned,producer) for a,role in zip(envelope["actors"],roles)]
-        check(sum(len(encoded(e,MAX_EVIDENCE)) for actor in events for e in actor)<=MAX_EVIDENCE and sum(e["packets"] for actor in events for e in actor)<=8,"combined actor evidence/packet budget")
+        check(sum(actor[-1]["encodedBytes"] for actor in events)<=MAX_EVIDENCE and sum(actor[-1]["packetCount"] for actor in events)<=8,"combined actor evidence/packet budget")
         check(sum(len(base64.b64decode(a[s],validate=True)) for a in envelope["actors"] for s in ("stdout","stderr"))<=MAX_STDOUT,"combined actor stdout/stderr budget")
         if index==0:
             barrier=exact(envelope["barrier"],{"bytes","aReadyBeforeBStart","bWaitBeforeWrite","closedAfterWrite","aAliveAtWrite"},"A/B barrier")
             check(base64.b64decode(barrier["bytes"],validate=True)==BARRIER and all(barrier[k] is True for k in barrier if k!="bytes"),"A/B actual Wait barrier absent")
-            a,b=events;check(any(e["phase"]=="running" and e["facts"].get("phaseLabel")=="independent_a_running_before_b" for e in a),"actual A not observed ready")
-            refusal=next((e for e in b if e["phase"]=="priority_refused"),None)
-            check(refusal is not None and refusal["facts"]=={"newReturnedNil":True,"errno":"EEXIST","source":"priority_preflight","tunOpenCount":0,"startCount":0,"callbackCount":0},"B actual refusal differs")
-            check(a[0]["birth"]!=b[0]["birth"],"A/B birth equal")
+            a,b=events;check(any(e["phase"]=="independent_a_running_before_b" for e in a),"actual A not observed ready")
+            b_refusal(b)
+            check(actor_birth(a,True)!=actor_birth(b,True),"A/B birth equal")
         else:check(envelope["barrier"] is None,"unexpected actor control")
         settlement=exact(envelope["settlement"],{"allChildrenWaited","controlledNamespaceLifetimeEnded","cleanupWithinMillis"},"guardian settlement")
         check(settlement["allChildrenWaited"] is True and settlement["controlledNamespaceLifetimeEnded"] is True,"unsettled guardian")
@@ -297,17 +378,22 @@ def verify_batch(envelopes, plan=None, plan_bytes=None):
             check(before["path"]=="/proc/sys/net/ipv4/conf/rnt16/rp_filter" and type(before["identity"]) is int and before["identity"]>0 and after["identity"]==before["identity"] and before["value"]==after["value"]=="1\n","G held writer leaf restoration differs")
         else:check(fixture["writerBefore"] is None and fixture["writerAfter"] is None,"unexpected G writer")
         check((fixture["providedOriginalIdentity"] is not None)==(index==17),"G original provided FD differs")
-        if index==17:check(fixture["providedOriginalIdentity"]=={k:envelope["actors"][0]["metadata"]["fdObservedIdentities"]["9"][k] for k in ("dev","ino")},"provided FD original identity splice")
-        expected_names=( ["rnt%02d"%index] if index in (15,16,17) else ["rfg%02d"%index] if index in (11,12,13,19) else [] )
+        if index==17:check(fixture["providedOriginalIdentity"]=={"dev":envelope["actors"][0]["metadata"]["fdObservedIdentities"]["providedPrivateTun"]["device"],"ino":envelope["actors"][0]["metadata"]["fdObservedIdentities"]["providedPrivateTun"]["inode"]},"provided FD original identity splice")
+        expected_names=( ["rnt%02d"%index] if index in (15,16,17) else ["rnf0"] if index==13 else [] )
         check(type(fixture["disposedObjects"]) is list and [x.get("name") for x in fixture["disposedObjects"]]==expected_names and all(type(x.get("ifindex")) is int and x["ifindex"]>0 and set(x)=={"name","ifindex"} for x in fixture["disposedObjects"]),"G-created fixture disposal identities differ")
+        for actor in envelope["actors"]:
+            topology=actor["metadata"]["topology"]
+            if topology["persistent"] is not None:
+                check(topology["persistent"]["linkIndex"]==fixture["persistentBefore"]["ifindex"],"actual persistent metadata index splice")
+            if topology["foreignLink"] is not None:
+                check(topology["foreignLink"]["linkIndex"]==fixture["disposedObjects"][0]["ifindex"],"actual foreign metadata index splice")
         host=exact(envelope["host"],{"before","after","claimsBefore","claimsAfter","namespaceBefore","namespaceAfter"},"host snapshots")
         check(type(host["before"]) is list and type(host["after"]) is list and [x.get("command") for x in host["before"]]==list(HOST_COMMANDS) and [x.get("command") for x in host["after"]]==list(HOST_COMMANDS) and host["claimsBefore"]==host["claimsAfter"] and host["namespaceBefore"]==host["namespaceAfter"],"host claim/namespace/command evidence differs")
         # The comparison uses the original harness normalization, not native flags.
         check(all(type(x.get("status")) is int and x["status"]==0 for x in host["before"]+host["after"]) and harness_source().compare_snapshots(host["before"],host["after"])["equal"],"host raw configuration differs")
         for e in events:
-            terminal=e[-1];columns["subjectCleanup"].append(terminal["subjectCleanup"]);columns["fixtureDisposal"].append(terminal["fixtureDisposal"])
-            if index==14:check(terminal["subjectCleanup"]=="Unknown","expected Unknown subject laundered")
-            if index==20:check(terminal["subjectCleanup"]=="PartialSealed","explicit partial seal laundered")
+            terminal=e[-1];columns["subjectCleanup"].append(terminal["subjectCleanup"]);columns["fixtureDisposal"].append(fixture["fixtureDisposal"])
+            if index==14:check(terminal["subjectCleanup"]=="UnknownOriginalCustody","expected Unknown subject laundered")
         check(envelope["evidenceClass"] in ("LogicOnly","ActualNative"),"unknown evidence class")
         check(envelope["evidenceClass"]!="ActualNative" or plan is not None,"actual receipt lacks frozen producer plan")
         logic_only |= envelope["evidenceClass"]=="LogicOnly";counts[CASES[index][0]]+=1

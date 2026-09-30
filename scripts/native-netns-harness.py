@@ -738,9 +738,7 @@ def r_plan(value, verifier):
         for actor in case["actors"]:
             r_options(case["options"][actor],index,actor)
         r_topology(case["topology"], index)
-        require(case["expectedSubjectCleanup"] in ("Closed","ConstructionOnlyClosed","Unknown","PartialSealed") and case["expectedFixtureDisposal"] == "ActualRestoredAndDisposed", "PC expected disposition missing")
-        if index == 14: require(case["expectedSubjectCleanup"] == "Unknown", "case14 Unknown must not be laundered")
-        if index == 20: require(case["expectedSubjectCleanup"] == "PartialSealed", "case20 explicit partial seam must remain distinct")
+        require(case["expectedSubjectCleanup"] == {actor: ("ConstructorClosedBeforeTUN" if actor == "b" else "UnknownOriginalCustody" if index == 14 else "ReleasedOwnLedger") for actor in case["actors"]} and case["expectedFixtureDisposal"] == "ActualRestoredAndDisposed", "PC expected disposition missing")
     # These are producer raw-list observations tied to this exact ELF, never invented expected data.
     require(type(value["selectedTopLists"]) is list and len(value["selectedTopLists"]) == 5, "actual frozen selected-top list evidence missing")
     for item, (top, _) in zip(value["selectedTopLists"], verifier.GROUPS):
@@ -749,65 +747,105 @@ def r_plan(value, verifier):
     require(type(value["sourceManifest"]) is dict and value["sourceManifest"] and all(type(k) is str and type(v) is str and verifier.HASH.fullmatch(v) for k,v in value["sourceManifest"].items()) and hashlib.sha256(verifier.encoded(value["sourceManifest"],4194304)).hexdigest() == value["sourceFilesSha256"],"full frozen source manifest missing/differs")
     require(type(value["moduleGraph"]) is dict and value["moduleGraph"].get("complete") is True and type(value["moduleGraph"].get("modules")) is list and value["moduleGraph"]["modules"] and hashlib.sha256(verifier.encoded(value["moduleGraph"],4194304)).hexdigest() == value["moduleGraphSha256"],"complete actual module/replacement graph missing")
     require(type(value["toolchain"]) is str and value["toolchain"] and type(value["buildFlags"]) is list and "polaris_r_native" in value["buildFlags"],"actual producer toolchain/build flags missing")
-    require(value["pcMetadataAck"] == "G_PC_EXACT_DICT_PENDING", "unissued PC ACK cannot activate this source")
+    require(value["pcMetadataAck"] == "0fdf9652adf4f69f222071c6062c5a7b263a619a38abe13c3d037f081a94db7b", "PC frozen source dictionary ACK differs; ACK never grants execution")
     return value
 
 
-def r_options(value,index,actor):
-    # Exact transport dictionary proposed to the PC owner. No opaque callback/factory/path input.
-    fields = {"name","netnsFD","providedTunFD","table","rulePriority","fallbackPriority","mtu","family","autoRoute","strict","marked","multiQueue","dnsMode","gso","txChecksumOffload","inet4Address","inet6Address","inputMark","outputMark","include","exclude","loopback","gateway","actualOptions","actualOptionsSha256"}
-    require(type(value) is dict and set(value) == fields, "complete PC actor Options exact dictionary missing")
-    expected_name = "rnt00b" if actor == "b" else "rnt%02d" % index
-    require(value["name"] == expected_name and type(value["netnsFD"]) is int and value["netnsFD"] == 3 and (type(value["providedTunFD"]) is int and value["providedTunFD"]==9 if index==17 else value["providedTunFD"] is None), "Options namespace/name/FD differs")
-    require(all(type(value[k]) is int for k in ("table","rulePriority","fallbackPriority")) and value["table"] == (40100 if actor == "b" else 40000+index) and value["rulePriority"] == 12000+64*index and value["fallbackPriority"] == 16000+64*index, "closed table/priority differs")
-    require(type(value["mtu"]) is int and value["mtu"] == 1400 and value["dnsMode"] == "disabled" and value["gso"] is False and value["txChecksumOffload"] is False, "unreviewed R effect Options")
-    require(type(value["family"]) is int and value["family"] == (6 if index in (4,24,25) else 4), "Options family differs")
-    for key,want in (("autoRoute",index not in (23,25)),("strict",index==6),("marked",index==7),("multiQueue",index==18)):
-        require(type(value[key]) is bool and value[key] is want,"Options branch differs: "+key)
-    require(value["inet4Address"] == ([] if value["family"] == 6 else ["198.18.0.1/24"]) and value["inet6Address"] == (["fd00:727::1/64"] if value["family"] == 6 else []) and type(value["inputMark"]) is int and type(value["outputMark"]) is int and value["inputMark"] == 0x210001 and value["outputMark"] == 0x210002, "source fixed address/marks differ")
-    import ipaddress
-    for key in ("include","exclude","loopback"):
-        require(type(value[key]) is list and len(value[key]) <= 4,"Options prefix budget")
-        for text in value[key]:
-            network = ipaddress.ip_network(text,strict=False) if key != "loopback" else ipaddress.ip_network(text+"/32",strict=False)
-            require(network.subnet_of(ipaddress.ip_network("198.18.0.0/15")),"Options endpoint outside fixed private topology")
-    require(value["gateway"] is None or str(ipaddress.ip_address(value["gateway"])) == value["gateway"],"gateway encoding differs")
-    require(all(value[key]==[] for key in ("include","exclude","loopback")) and value["gateway"] is None,"constructor Options differ from frozen source; updates belong in actual operation evidence")
-    require(type(value["actualOptionsSha256"]) is str and re.fullmatch("[0-9a-f]{64}",value["actualOptionsSha256"]),"actual PC Options source digest missing")
-    # PC must supply its full actual constructor Options, including zero defaults.
-    # G binds the original canonical body; it cannot invent the Go field projection.
-    require(type(value["actualOptions"]) is dict and value["actualOptions"],"full actual PC Options body missing")
-    actual=json.dumps(value["actualOptions"],sort_keys=True,separators=(",",":"),allow_nan=False).encode()
-    require(len(actual)<=32768 and hashlib.sha256(actual).hexdigest()==value["actualOptionsSha256"],"full actual PC Options body/digest differs")
+def r_original_options(index, actor):
+    """Exact source-only constructor/updates consumed from PC ace700a4 (29 records)."""
+    import copy
+    require(type(index) is int and 0 <= index < 28 and actor in (("a", "b") if index == 0 else ("single",)), "Options actor/case differs")
+    constructor = {'Name': 'rnt00', 'NetNs': '/proc/self/fd/3', 'Inet4Address': ['198.18.0.1/24'], 'Inet6Address': None, 'MTU': 1400, 'GSO': False, 'MultiQueue': False, 'AutoRoute': True, 'InterfaceScope': False, 'Inet4Gateway': '', 'Inet6Gateway': '', 'DNSMode': 'disabled', 'DNSAddress': None, 'IPRoute2TableIndex': 40000, 'IPRoute2RuleIndex': 12000, 'IPRoute2AutoRedirectFallbackRuleIndex': 16000, 'AutoRedirectMarkMode': False, 'AutoRedirectInputMark': 2162689, 'AutoRedirectOutputMark': 2162690, 'AutoRedirectResetMark': 0, 'AutoRedirectTProxyMark': 0, 'AutoRedirectNFQueue': 0, 'ExcludeMPTCP': False, 'Inet4LoopbackAddress': None, 'Inet6LoopbackAddress': None, 'StrictRoute': False, 'Inet4RouteAddress': None, 'Inet6RouteAddress': None, 'Inet4RouteExcludeAddress': None, 'Inet6RouteExcludeAddress': None, 'IncludeInterface': None, 'ExcludeInterface': None, 'BridgeInterface': None, 'IncludeUID': None, 'ExcludeUID': None, 'IncludeAndroidUser': None, 'IncludePackage': None, 'ExcludePackage': None, 'IncludeMACAddress': None, 'ExcludeMACAddress': None, 'InterfaceFinder': None, 'InterfaceMonitor': None, 'FileDescriptor': 0, 'Logger': None, 'EXP_DisableDNSHijack': False, 'EXP_ExternalConfiguration': False, 'EXP_MultiPendingPackets': False, 'EXP_SendMsgX': False}
+    constructor["Name"] = "rnt00b" if actor == "b" else "rnt%02d" % index
+    constructor["IPRoute2TableIndex"] = 40100 if actor == "b" else 40000 + index
+    constructor["IPRoute2RuleIndex"] = 12000 + 64 * index
+    constructor["IPRoute2AutoRedirectFallbackRuleIndex"] = 16000 + 64 * index
+    constructor["AutoRoute"] = index not in (23, 25)
+    constructor["StrictRoute"] = index == 6
+    constructor["AutoRedirectMarkMode"] = index == 7
+    constructor["MultiQueue"] = index == 18
+    constructor["FileDescriptor"] = 9 if index == 17 else 0
+    if index in (4, 24, 25):
+        constructor["Inet4Address"] = None
+        constructor["Inet6Address"] = ["fd00:727::1/64"]
+    updates = []
+    if index in (19, 20, 21, 26, 27):
+        update = copy.deepcopy(constructor)
+        if index == 19:
+            update.update(Inet4RouteAddress=["198.18.0.0/16"], Inet4RouteExcludeAddress=["198.18.20.0/24"], Inet4Gateway="198.18.0.2")
+        elif index == 27:
+            update.update(Inet4RouteAddress=["198.18.99.0/24"], Inet4RouteExcludeAddress=["198.19.99.10/32"])
+        else:
+            update["Inet4RouteAddress"] = ["198.18.10.0/24", "198.18.20.0/24"]
+            if index == 26:
+                update.update(Inet4RouteExcludeAddress=["198.18.10.128/25"], Inet4LoopbackAddress=["198.18.0.2"])
+        updates.append(update)
+    return {"constructor": constructor, "routeUpdates": updates}
 
 
-def r_topology(value,index):
-    require(type(value) is dict and set(value) == {"persistentBefore","providedEndpoint","foreignLink","gatewayLink","ipv6OutputPriority","packetBudgetAllocation"}, "PC topology exact dictionary missing")
-    persistent=value["persistentBefore"]
-    require((persistent is not None) == (index in (15,16,17)),"persistent topology case differs")
+def r_config_digest(options):
+    return hashlib.sha256(json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def r_options(value, index, actor):
+    require(type(value) is dict and set(value) == {"constructor", "routeUpdates"}, "PC full constructor/update dictionary missing")
+    require(json.dumps(value,sort_keys=True,separators=(",",":"),allow_nan=False) == json.dumps(r_original_options(index, actor),sort_keys=True,separators=(",",":"),allow_nan=False), "full original Go Options/defaults/updates differ")
+    for actual in [value["constructor"], *value["routeUpdates"]]:
+        body = json.dumps(actual, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        require(len(body) <= 32768, "full actual Options canonical body exceeds bound")
+    return value
+
+
+def r_topology(value, index, observed=False):
+    fields = {"persistent", "foreignLink", "gateway", "ipv6Output", "providedTun", "independentActors", "rpFilter"}
+    require(type(value) is dict and set(value) == fields, "PC topology exact dictionary missing")
+    persistent = value["persistent"]
+    require((persistent is not None) == (index in (15, 16, 17)), "persistent topology case differs")
     if persistent is not None:
-        require(type(persistent) is dict and set(persistent) == {"name","mtu","up","addresses"} and persistent["name"] == "rnt%02d"%index and type(persistent["mtu"]) is int and 576<=persistent["mtu"]<=9000 and type(persistent["up"]) is bool and type(persistent["addresses"]) is list and 1<=len(persistent["addresses"])<=4,"actual persistent original snapshot fields missing")
-        require(index != 16 or persistent["mtu"] != 1400 or persistent["up"] is False,"case16 must exercise actual borrowed change")
-        require(index != 17 or persistent["up"] is True,"provided queue must start UP")
-    for key in ("foreignLink","gatewayLink"):
-        item=value[key]
-        require((item is not None) == (index in ((11,12,13) if key=="foreignLink" else (19,))),"private foreign/gateway topology case differs")
-        if item is not None:
-            require(type(item) is dict and set(item)=={"name","kind","mtu","up","addresses","route"} and re.fullmatch(r"rfg[0-9]{2}",item["name"]) and item["kind"]=="dummy" and type(item["mtu"]) is int and 576<=item["mtu"]<=9000 and type(item["up"]) is bool and type(item["addresses"]) is list and len(item["addresses"])<=4,"PC private link exact fields missing")
-            require(item["name"]=="rfg%02d"%index,"private link case identity differs")
-            route=item["route"]
-            require(type(route) is dict and set(route)=={"destination","gateway","table","metric"} and type(route["table"]) is int and 40000<=route["table"]<=40100 and type(route["metric"]) is int and 0<=route["metric"]<=65535,"PC full route dictionary missing")
-            import ipaddress
-            require(ipaddress.ip_network(route["destination"],strict=False).subnet_of(ipaddress.ip_network("198.18.0.0/15")) and ipaddress.ip_address(route["gateway"]) in ipaddress.ip_network("198.18.0.0/15"),"private route outside fixed topology")
-    import ipaddress
-    for item in (persistent,value["foreignLink"],value["gatewayLink"]):
-        if item is not None:
-            for address in item["addresses"]:
-                require(type(address) is str and ipaddress.ip_interface(address).network.subnet_of(ipaddress.ip_network("198.18.0.0/15")),"prebuilt address outside fixed topology")
-    require((value["providedEndpoint"] is not None)==(index==17),"case17 UP/address/endpoint route missing")
-    if index==17:require(value["providedEndpoint"]=={"destination":"198.18.99.10/32","udpPort":19001,"linkName":"rnt17"},"case17 endpoint topology differs")
-    require(type(value["ipv6OutputPriority"]) is int and value["ipv6OutputPriority"]>0 if index==25 else value["ipv6OutputPriority"] is None,"actual IPv6 autoRoute=false output priority missing")
-    require(type(value["packetBudgetAllocation"]) is dict and set(value["packetBudgetAllocation"])=={"native","guardian"} and all(type(n) is int and 0<=n<=8 for n in value["packetBudgetAllocation"].values()) and sum(value["packetBudgetAllocation"].values())<=8,"shared total packet budget missing")
+        require(type(persistent) is dict and set(persistent) == {"name", "kind", "linkIndex", "mtu", "up", "addresses", "creatorQueueDisposition"}, "persistent original fields differ")
+        require(persistent["name"] == "rnt%02d" % index and persistent["kind"] == "tun" and type(persistent["mtu"]) is int and persistent["mtu"] == 1500 and persistent["up"] is (index == 17) and persistent["addresses"] == ["198.18.0.1/24"] and persistent["creatorQueueDisposition"] == ("retained_on_FD9" if index == 17 else "closed_before_R_attach"), "persistent actual configuration differs")
+        require((not observed and persistent["linkIndex"] is None) or type(persistent["linkIndex"]) is int and persistent["linkIndex"] > 0, "persistent actual link index absent")
+    foreign = value["foreignLink"]
+    require((foreign is not None) == (index == 13), "only case13 needs a foreign dummy")
+    if foreign is not None:
+        require(type(foreign) is dict and set(foreign) == {"name", "kind", "linkIndex", "addresses"} and foreign["name"] == "rnf0" and foreign["kind"] == "dummy" and foreign["addresses"] == ["198.18.253.1/24", "fd00:729::1/64"], "original foreign dummy topology differs")
+        require((not observed and foreign["linkIndex"] is None) or type(foreign["linkIndex"]) is int and foreign["linkIndex"] > 0, "foreign actual link index absent")
+    require(value["gateway"] == ({"address": "198.18.0.2", "subjectName": "rnt19", "subjectPrefix": "198.18.0.1/24", "routeWitness": "actual_subject_connected_route_after_New"} if index == 19 else None), "actual subject gateway recipe differs")
+    output = value["ipv6Output"]
+    require((output is not None) == (index == 25), "IPv6 output observation case differs")
+    if output is not None:
+        require(type(output) is dict and set(output) == {"policy", "beforePriorities", "selectedPriority"} and output["policy"] == "actual_min_positive_minus_one", "IPv6 output fields differ")
+        if observed or output["beforePriorities"] is not None or output["selectedPriority"] is not None:
+            priorities = output["beforePriorities"]
+            require(type(priorities) is list and priorities and all(type(n) is int and n >= 0 for n in priorities), "actual IPv6 RuleList observation missing")
+            minimum = min([32766] + [n for n in priorities if n > 0])
+            require(minimum > 1 and type(output["selectedPriority"]) is int and output["selectedPriority"] == minimum - 1, "original IPv6 selected priority differs")
+    require(value["providedTun"] is None if index != 17 else type(value["providedTun"]) is dict and set(value["providedTun"]) == {"fd", "name", "namespaceObservation"} and value["providedTun"]["fd"] == 9 and value["providedTun"]["name"] == "rnt17" and value["providedTun"]["namespaceObservation"] in (("getdevnetns_supported", "explicit_fd_io_only") if observed else (None, "getdevnetns_supported", "explicit_fd_io_only")), "provided original namespace observation differs")
+    require(json.dumps(value["independentActors"],sort_keys=True,separators=(",",":")) == json.dumps({"aName":"rnt00", "bName":"rnt00b", "aTable":40000, "bTable":40100, "sharedPriority":12000, "controlBytes":"B_NEW_REFUSED\n", "controlEOF":True} if index == 0 else None,sort_keys=True,separators=(",",":")), "independent actors/control differ")
+    require(json.dumps(value["rpFilter"], sort_keys=True, separators=(",",":")) == json.dumps({"all":0, "default":0, "deviceBefore":1 if index == 16 else 0, "deviceStarted":2 if index == 16 else 0, "deviceClosed":1 if index == 16 else 0, "writablePath":"/proc/sys/net/ipv4/conf/rnt16/rp_filter" if index == 16 else ""}, sort_keys=True, separators=(",",":")), "exact rp_filter branch differs")
+    return value
+
+
+def r_observed_topology(planned, actual):
+    """Only G's actual private setup fills runtime observations, never fake indexes."""
+    import copy
+    result = copy.deepcopy(planned)
+    for key in ("persistent", "foreignLink"):
+        if result[key] is not None:
+            observation = actual[key]
+            index = observation["link"]["ifindex"]
+            require(result[key]["linkIndex"] in (None, index), "frozen topology index differs from actual private setup")
+            result[key]["linkIndex"] = index
+    if result["ipv6Output"] is not None:
+        observed = actual["ipv6Output"]
+        for key in ("beforePriorities", "selectedPriority"):
+            require(result["ipv6Output"][key] in (None, observed[key]), "frozen priority differs from actual child RuleList")
+            result["ipv6Output"][key] = observed[key]
+    if result["providedTun"] is not None:
+        observed = actual["providedTun"]
+        require(result["providedTun"]["namespaceObservation"] in (None, observed), "original provided namespace support differs")
+        result["providedTun"]["namespaceObservation"] = observed
+    return result
 
 
 def r_child_environment(environment,metadata):
@@ -1009,12 +1047,12 @@ def r_ip(*arguments):
 
 
 def r_setup(context):
-    import fcntl,struct,ipaddress
+    import errno,fcntl,struct,ipaddress
     index=context["index"];case=context["plan"]["cases"][index];context["setupObjects"]=[];context["providedTun"]=None;context["sysctls"]={}
     for leaf in ("all","default"):
         path="/proc/sys/net/ipv4/conf/"+leaf+"/rp_filter";original=Path(path).read_bytes();require(original in (b"0\n",b"1\n",b"2\n"),"private setup rp_filter invalid")
         context["sysctls"][path]={"bytes":original,"identity":Path(path).stat().st_ino};Path(path).write_bytes(b"0\n")
-    persistent=case["topology"]["persistentBefore"]
+    persistent=case["topology"]["persistent"]
     if persistent is not None:
         fd=os.open("/dev/net/tun",os.O_RDWR|os.O_NONBLOCK|os.O_CLOEXEC)
         try:
@@ -1036,23 +1074,37 @@ def r_setup(context):
             # 15/16 intentionally close creator queue before R attaches. Never add multi-queue.
         finally:
             if fd is not None:os.close(fd)
-    for key in ("foreignLink","gatewayLink"):
-        item=case["topology"][key]
-        if item is None:continue
-        r_ip("link","add","name",item["name"],"type","dummy")
-        observed=r_link_observation(item["name"])
-        context["setupObjects"].append({"name":item["name"],"kind":"dummy","ifindex":observed["link"]["ifindex"]})
-        r_ip("link","set","dev",item["name"],"mtu",str(item["mtu"]))
-        for address in item["addresses"]:
-            interface=ipaddress.ip_interface(address);require(interface.ip.is_private,"PC private link address differs")
-            r_ip("address","add",str(interface),"dev",item["name"])
-        r_ip("link","set","dev",item["name"],"up" if item["up"] else "down")
-        route=item["route"]
-        require(type(route) is dict and set(route)=={"destination","gateway","table","metric"},"PC route exact fields missing")
-        network=ipaddress.ip_network(route["destination"],strict=False);gateway=ipaddress.ip_address(route["gateway"])
-        require(network.is_private and gateway.is_private and type(route["table"]) is int and 40000<=route["table"]<=40100 and type(route["metric"]) is int and 0<=route["metric"]<=65535,"PC topology route exceeds closure")
-        r_ip("route","add",str(network),"via",str(gateway),"dev",item["name"],"table",str(route["table"]),"metric",str(route["metric"]))
-        context.setdefault("topologyObserved",{})[key]=r_link_observation(item["name"])
+    foreign=case["topology"]["foreignLink"]
+    if foreign is not None:
+        # Only rnf0 is G-owned here; cases11/12 foreign routes and case19
+        # connected gateway are acquired by the actual original R callee.
+        r_ip("link","add","name",foreign["name"],"type","dummy")
+        observed=r_link_observation(foreign["name"])
+        context["setupObjects"].append({"name":foreign["name"],"kind":"dummy","ifindex":observed["link"]["ifindex"]})
+        for address in foreign["addresses"]:r_ip("address","add",address,"dev",foreign["name"])
+        context.setdefault("topologyObserved",{})["foreignLink"]=r_link_observation(foreign["name"])
+    observed=context.setdefault("topologyObserved",{})
+    if persistent is not None:observed["persistent"]=context["persistentBeforeObserved"]
+    if index==25:
+        rules=r_ip("-j","-6","rule","show")
+        original=json.loads(rules["stdout"])
+        require(type(original) is list and original and all(type(rule) is dict and type(rule.get("priority")) is int and rule["priority"]>=0 for rule in original),"actual private IPv6 RuleList missing")
+        priorities=[rule["priority"] for rule in original];minimum=min([32766]+[n for n in priorities if n>0])
+        require(minimum>1,"original IPv6 priority unavailable")
+        observed["ipv6Output"]={"beforePriorities":priorities,"selectedPriority":minimum-1}
+        context["ipv6BeforeOriginal"]=rules
+    if index==17:
+        try:
+            ns=fcntl.ioctl(context["providedTun"],0x54e3)
+        except OSError as error:
+            require(error.errno in (errno.ENOTTY,errno.EINVAL),"actual provided namespace observation failed")
+            observed["providedTun"]="explicit_fd_io_only"
+        else:
+            try:require(identity(ns)==identity(context["netfd"]),"provided original TUN netns differs")
+            finally:os.close(ns)
+            observed["providedTun"]="getdevnetns_supported"
+    context["actualTopology"]=r_observed_topology(case["topology"],observed)
+    r_topology(context["actualTopology"],index,observed=True)
     if index==16:
         leaf="/proc/sys/net/ipv4/conf/rnt16/rp_filter";Path(leaf).write_bytes(b"1\n")
         context["writerBefore"]={"path":leaf,"identity":Path(leaf).stat().st_ino,"value":Path(leaf).read_bytes().decode()}
@@ -1072,8 +1124,8 @@ def r_metadata(context,actor,control_fd=None):
     reader=None
     try:
         reader=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC);mapping[8]=reader
-        binding={key:plan[key] for key in ("profileSha256","batchNonce","sourceCommit","sourceTree","sourceFilesSha256","moduleGraphSha256","elfSha256","configSha256")}
-        binding.update(caseNonce=plan["caseNonces"][index],planSha256=context["planSha256"])
+        binding={key:plan[key] for key in ("profileSha256","batchNonce","sourceCommit","sourceTree","sourceFilesSha256","moduleGraphSha256","elfSha256")}
+        binding.update(caseNonce=plan["caseNonces"][index],planSha256=context["planSha256"],configSha256=r_config_digest(plan["cases"][index]["options"][actor]))
         observations={}
         for slot in verifier.role_fds(index,actor):
             fd=mapping[slot];flags=fcntl.fcntl(fd,fcntl.F_GETFL)&os.O_ACCMODE
@@ -1085,10 +1137,10 @@ def r_metadata(context,actor,control_fd=None):
             elif slot==8:require(stat.S_ISREG(value.st_mode),"actual metadata regular type differs")
             elif slot==9:require(stat.S_ISCHR(value.st_mode) and os.major(value.st_rdev)==10 and os.minor(value.st_rdev)==200,"actual provided TUN char type differs")
             elif slot==10:require(stat.S_ISFIFO(value.st_mode) and flags==os.O_RDONLY and fcntl.fcntl(fd,fcntl.F_GETFL)&os.O_NONBLOCK,"actual A pipe type/mode differs")
-            observations[str(slot)]={**identity(fd),"type":{3:"nsfs",4:"nsfs",5:"nsfs",6:"directory",7:"directory",8:"regular",9:"tun",10:"pipe"}[slot],"access":"readWrite" if slot==9 else "readOnly"}
+            observations[verifier.FD_ROLES[slot]]={"device":value.st_dev,"inode":value.st_ino}
         metadata={"schema":verifier.METADATA_SCHEMA,"version":1,"profile":R_PROFILE,**binding,"caseID":index,"actor":actor,
-                  "fdRoles":{str(fd):verifier.FD_ROLES[fd] for fd in verifier.role_fds(index,actor)},"fdObservedIdentities":observations,
-                  "guardianParentIdentities":context["parent"],"caseOptions":plan["cases"][index]["options"][actor],"topology":plan["cases"][index]["topology"],"budgets":verifier.BUDGETS}
+                  "fdRoles":[{"fd":fd,"role":verifier.FD_ROLES[fd]} for fd in verifier.role_fds(index,actor)],"fdObservedIdentities":observations,
+                  "guardianParentIdentities":{name+"ns":{"device":context["parent"][key]["dev"],"inode":context["parent"][key]["ino"]} for name,key in (("net","net"),("user","user"),("mount","mnt"),("pid","pid"),("ipc","ipc"))},"caseOptions":plan["cases"][index]["options"][actor],"topology":context["actualTopology"],"budgets":verifier.BUDGETS}
         verifier.validate_metadata(metadata);data=verifier.encoded(metadata)
         view=memoryview(data)
         while view:view=view[os.write(writer,view):]
@@ -1106,7 +1158,7 @@ def r_metadata(context,actor,control_fd=None):
 
 def r_control_write(fd,child,evidence,deadline):
     # Actual B wait precedes this function; all bytes and EOF are fixed and deadline bounded.
-    require(child.returncode==0 and evidence and any(x["phase"]=="priority_refused" for x in evidence),"B actual Wait/typed refusal prerequisite absent")
+    require(child.returncode==0 and evidence and any(x["phase"]=="independent_b_allocator_priority_refusal" for x in evidence),"B actual Wait/typed refusal prerequisite absent")
     payload=b"B_NEW_REFUSED\n";written=0
     import select
     expires=min(deadline,time.monotonic()+1)
@@ -1155,7 +1207,7 @@ def r_children(context):
                 while b"\n" in pending:
                     line,rest=pending.split(b"\n",1);pending[:]=rest
                     if stream=="stdout" and line.startswith(b"R_NATIVE_EVIDENCE "):
-                        raw=line[len(b"R_NATIVE_EVIDENCE "):];evidence_bytes+=len(raw)
+                        raw=line[len(b"R_NATIVE_EVIDENCE "):];evidence_bytes+=len(line)+1
                         require(evidence_bytes<=verifier.MAX_EVIDENCE,"case cumulative evidence budget exceeded")
                         event=verifier.closed_json(raw,verifier.MAX_EVIDENCE);entry["evidence"].append(event)
                         require(event.get("caseID")==index and event.get("actor")==entry["actor"] and event.get("caseNonce")==entry["metadata"]["caseNonce"] and event.get("batchNonce")==entry["metadata"]["batchNonce"],"actual child evidence association differs")
@@ -1165,7 +1217,7 @@ def r_children(context):
                     entry["wait"]={"pid":child.pid,"exitStatus":child.wait(timeout=max(0.001,min(1,deadline-time.monotonic()))),"actual":True,"timedOut":False}
                     require(entry["wait"]["exitStatus"]==0,"native child failed; no retry/next case")
             if index==0 and len(actors)==1:
-                a=actors[0];ready=any(x.get("phase")=="running" and x.get("facts",{}).get("phaseLabel")=="independent_a_running_before_b" for x in a["evidence"])
+                a=actors[0];ready=any(x.get("phase")=="independent_a_running_before_b" for x in a["evidence"])
                 if ready:
                     require(a["child"].poll() is None,"A died before B birth");spawn("b")
                 elif a["wait"] is not None:raise RuntimeError("A exited before actual ready barrier")
@@ -1176,8 +1228,8 @@ def r_children(context):
                 producer=next(x for x in context["plan"]["selectedTopLists"] if x["top"]==verifier.CASES[index][0])
                 actor_receipt={"actor":"b","metadata":b["metadata"],"pid":b["child"].pid,"wait":b["wait"],"stdout":base64.b64encode(b["stdout"]).decode(),"stderr":base64.b64encode(b["stderr"]).decode(),"list":producer,"evidence":b["evidence"]}
                 verifier.verify_actor(actor_receipt,index,"b",binding)
-                refusal=next((x for x in b["evidence"] if x["phase"]=="priority_refused"),None)
-                require(refusal is not None and refusal["facts"]=={"newReturnedNil":True,"errno":"EEXIST","source":"priority_preflight","tunOpenCount":0,"startCount":0,"callbackCount":0} and a["evidence"][0]["birth"]!=b["evidence"][0]["birth"],"actual distinct B preflight refusal absent")
+                verifier.b_refusal(b["evidence"])
+                require(verifier.actor_birth(a["evidence"],True)!=verifier.actor_birth(b["evidence"],True),"actual distinct B preflight refusal absent")
                 r_control_write(control_write,b["child"],b["evidence"],deadline);control_write=None
                 barrier={"bytes":base64.b64encode(verifier.BARRIER).decode(),"aReadyBeforeBStart":True,"bWaitBeforeWrite":True,"closedAfterWrite":True,"aAliveAtWrite":True}
         result=[]
@@ -1220,7 +1272,7 @@ def r_cleanup(context):
             actual=Path("/proc/sys/net/ipv4/conf/rnt16/rp_filter")
             require(actual.stat().st_ino==context["writerBefore"]["identity"] and actual.read_bytes()==b"1\n","actual R rp_filter restoration failed")
             context["writerAfter"]={"identity":actual.stat().st_ino,"value":actual.read_bytes().decode()}
-        persistent=context["plan"]["cases"][index]["topology"]["persistentBefore"]
+        persistent=context["plan"]["cases"][index]["topology"]["persistent"]
         if persistent is not None:
             context["persistentAfterObserved"]=r_link_observation(persistent["name"])
             require(r_link_configuration(context["persistentBeforeObserved"])==r_link_configuration(context["persistentAfterObserved"]),"actual persistent MTU/up/address restoration differs")
