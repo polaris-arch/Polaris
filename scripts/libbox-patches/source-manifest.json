@@ -63,7 +63,7 @@
     },
     {
       "file": "dns-cancellation-lifecycle.patch",
-      "sha256": "ef2d724ac11ad5ac929f636842605a7121fdb39fdbf16454d8f4e3b83085e1d4"
+      "sha256": "0450a210c36ba27189ec1af47d17d738a2a4241b712f90b54e94efb147469c74"
     }
   ],
   "ndkSelectionReason": "NDK 27.3.13750724 arm64 linker rejects the pinned Cronet static archive with unknown relocation (315); cached NDK 30 preserves upstream dependencies and all feature tags.",

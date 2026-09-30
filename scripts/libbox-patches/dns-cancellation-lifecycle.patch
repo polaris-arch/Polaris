@@ -1,9 +1,344 @@
+diff --git a/experimental/libbox/dns.go b/experimental/libbox/dns.go
+index 4916cbe..c0ad3d5 100644
+--- a/experimental/libbox/dns.go
++++ b/experimental/libbox/dns.go
+@@ -2,8 +2,10 @@ package libbox
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"net/netip"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -31,6 +33,7 @@ type platformTransport struct {
+ 	iif               LocalDNSTransport
+ 	preferredResolver *local.PreferredDomainResolver
+ 	networkManager    adapter.NetworkManager
++	calls             dnsCallGate
+ }
+ 
+ func newPlatformTransport(ctx context.Context, logger log.ContextLogger, iif LocalDNSTransport, tag string, options option.LocalDNSServerOptions) (*platformTransport, error) {
+@@ -52,6 +55,15 @@ func (p *platformTransport) Start(stage adapter.StartStage) error {
+ }
+ 
+ func (p *platformTransport) Close() error {
++	p.calls.access.Lock()
++	cancels, _ := p.calls.sealAndSnapshotLocked()
++	p.iif = nil
++	p.calls.access.Unlock()
++	for _, cancel := range cancels {
++		cancel()
++	}
++	// Cancellation and local counts do not change the operational Close result.
++	// Existing workers and registration drain tasks still own in-flight leases.
+ 	return nil
+ }
+ 
+@@ -102,38 +114,86 @@ func (p *platformTransport) Environment() []string {
+ 	return defaultInterface.DNSServers
+ }
+ 
+-func (p *platformTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+-	localResponse := p.preferredResolver.Lookup(message)
+-	if localResponse != nil {
+-		return localResponse, nil
++type dnsPlatformResult struct {
++	response *mDNS.Msg
++	err      error
++}
++
++func (p *platformTransport) startExchange(ctx context.Context, message *mDNS.Msg) (<-chan dnsPlatformResult, <-chan struct{}, error) {
++	p.calls.access.Lock()
++	lease, err := p.calls.beginLocked(ctx)
++	iif, preferredResolver := p.iif, p.preferredResolver
++	p.calls.access.Unlock()
++	if err != nil {
++		return nil, nil, err
+ 	}
+-	response := &ExchangeContext{
+-		context: ctx,
++	callCtx := lease.ctx
++	if message == nil {
++		lease.returned()
++		return nil, nil, E.New("nil DNS query")
+ 	}
+-	if p.iif.Raw() {
+-		messageBytes, err := message.Pack()
+-		if err != nil {
+-			return nil, err
+-		}
+-		done := make(chan error, 1)
+-		go func() {
+-			exchangeErr := p.iif.Exchange(response, messageBytes)
+-			if exchangeErr == nil {
+-				exchangeErr = response.error
++	request := message.Copy()
++	response := &ExchangeContext{context: callCtx}
++	done := make(chan dnsPlatformResult, 1)
++	// The interface reference is captured under the admission gate; this worker
++	// keeps it even if Close detaches the transport's reference.
++	go func() {
++		result := dnsPlatformResult{}
++		raw := false
++		var question mDNS.Question
++		defer func() {
++			if recovered := recover(); recovered != nil {
++				result.err = fmt.Errorf("platform DNS call panicked: %v", recovered)
++			}
++			snapshot, registrations := response.complete()
++			lease.returned(registrations...)
++			if result.err == nil {
++				result.err = snapshot.err
++			}
++			if result.err == nil && result.response == nil {
++				if raw {
++					result.response = snapshot.message
++				} else {
++					result.response = dns.FixedResponse(request.Id, question, snapshot.addresses, C.DefaultDNSTTL)
++				}
+ 			}
+-			done <- exchangeErr
++			// A canceled upper caller may already be gone; delivery never blocks drain.
++			done <- result
+ 		}()
+-		select {
+-		case err = <-done:
++		if err := callCtx.Err(); err != nil {
++			result.err = err
++			return
++		}
++		if preferredResolver != nil {
++			result.response = preferredResolver.Lookup(request)
++			if result.response != nil {
++				return
++			}
++		}
++		if iif == nil {
++			result.err = E.New("missing platform DNS transport")
++			return
++		}
++		// Raw is itself a platform call, covered by this lease and outside the gate.
++		raw = iif.Raw()
++		if err := callCtx.Err(); err != nil {
++			result.err = err
++			return
++		}
++		if raw {
++			messageBytes, err := request.Pack()
+ 			if err != nil {
+-				return nil, err
++				result.err = err
++				return
+ 			}
+-			return &response.message, nil
+-		case <-ctx.Done():
+-			return nil, ctx.Err()
++			result.err = iif.Exchange(response, messageBytes)
++			return
+ 		}
+-	} else {
+-		question := message.Question[0]
++		if len(request.Question) == 0 {
++			result.err = E.New("DNS query has no question")
++			return
++		}
++		question = request.Question[0]
+ 		var network string
+ 		switch question.Qtype {
+ 		case mDNS.TypeA:
+@@ -141,31 +201,41 @@ func (p *platformTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*m
+ 		case mDNS.TypeAAAA:
+ 			network = "ip6"
+ 		default:
+-			return nil, E.New("only IP queries are supported by current version of Android")
+-		}
+-		done := make(chan error, 1)
+-		go func() {
+-			lookupErr := p.iif.Lookup(response, network, question.Name)
+-			if lookupErr == nil {
+-				lookupErr = response.error
+-			}
+-			done <- lookupErr
+-		}()
+-		select {
+-		case err := <-done:
+-			if err != nil {
+-				return nil, err
+-			}
+-			return dns.FixedResponse(message.Id, question, response.addresses, C.DefaultDNSTTL), nil
+-		case <-ctx.Done():
+-			return nil, ctx.Err()
++			result.err = E.New("only IP queries are supported by current version of Android")
++			return
+ 		}
++		result.err = iif.Lookup(response, network, question.Name)
++	}()
++	return done, lease.aborted, nil
++}
++
++func waitPlatformDNS(done <-chan dnsPlatformResult, ctx context.Context, aborted <-chan struct{}) (*mDNS.Msg, error) {
++	select {
++	case result := <-done:
++		return result.response, result.err
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-aborted:
++		return nil, context.Canceled
++	}
++}
++
++func (p *platformTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	done, aborted, err := p.startExchange(ctx, message)
++	if err != nil {
++		return nil, err
+ 	}
++	return waitPlatformDNS(done, ctx, aborted)
+ }
+ 
+ func (p *platformTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
++	done, aborted, err := p.startExchange(ctx, message)
+ 	go func() {
+-		callback(p.Exchange(ctx, message))
++		if err != nil {
++			callback(nil, err)
++			return
++		}
++		callback(waitPlatformDNS(done, ctx, aborted))
+ 	}()
+ }
+ 
+@@ -174,40 +244,111 @@ type Func interface {
+ }
+ 
+ type ExchangeContext struct {
+-	context   context.Context
+-	message   mDNS.Msg
++	access        sync.Mutex
++	context       context.Context
++	message       mDNS.Msg
++	addresses     []netip.Addr
++	error         error
++	registrations []*dnsCancelRegistration
++	completed     bool
++}
++
++// The cancellation holder contains only the callable capability. In particular
++// it never captures an ExchangeContext, transport or host through our closure.
++type dnsCancelHolder struct {
++	access   sync.Mutex
++	callback Func
++}
++
++func (h *dnsCancelHolder) invoke() error {
++	h.access.Lock()
++	callback := h.callback
++	h.callback = nil
++	h.access.Unlock()
++	if callback == nil {
++		return nil
++	}
++	return callback.Invoke()
++}
++
++type dnsExchangeSnapshot struct {
++	message   *mDNS.Msg
+ 	addresses []netip.Addr
+-	error     error
++	err       error
++}
++
++func (c *ExchangeContext) complete() (dnsExchangeSnapshot, []*dnsCancelRegistration) {
++	c.access.Lock()
++	defer c.access.Unlock()
++	if c.completed {
++		return dnsExchangeSnapshot{}, nil
++	}
++	c.completed = true
++	snapshot := dnsExchangeSnapshot{message: c.message.Copy(), addresses: append([]netip.Addr(nil), c.addresses...), err: c.error}
++	registrations := c.registrations
++	c.context, c.registrations = nil, nil
++	c.message, c.addresses, c.error = mDNS.Msg{}, nil, nil
++	return snapshot, registrations
+ }
+ 
+ func (c *ExchangeContext) OnCancel(callback Func) {
+-	go func() {
+-		<-c.context.Done()
+-		callback.Invoke()
+-	}()
++	holder := &dnsCancelHolder{callback: callback}
++	registration := makeDNSCancelRegistration(holder.invoke)
++	c.access.Lock()
++	if c.completed || c.context == nil {
++		c.access.Unlock()
++		registration.stopAndDetach()
++		return
++	}
++	ctx := c.context
++	c.registrations = append(c.registrations, registration)
++	c.access.Unlock()
++	// complete can win this gap. An already stopped registration refuses arm.
++	registration.arm(ctx)
+ }
+ 
+ func (c *ExchangeContext) Success(result string) {
+-	c.addresses = common.Map(common.Filter(strings.Split(result, "\n"), func(it string) bool {
++	addresses := common.Map(common.Filter(strings.Split(result, "\n"), func(it string) bool {
+ 		return !common.IsEmpty(it)
+ 	}), func(it string) netip.Addr {
+ 		return M.ParseSocksaddrHostPort(it, 0).Unwrap().Addr
+ 	})
++	c.access.Lock()
++	defer c.access.Unlock()
++	if !c.completed {
++		c.addresses = addresses
++	}
+ }
+ 
+ func (c *ExchangeContext) RawSuccess(result []byte) {
+-	err := c.message.Unpack(result)
++	message := new(mDNS.Msg)
++	err := message.Unpack(result)
++	c.access.Lock()
++	defer c.access.Unlock()
++	if c.completed {
++		return
++	}
+ 	if err != nil {
+ 		c.error = E.Cause(err, "parse response")
++	} else {
++		c.message = *message
+ 	}
+ }
+ 
+ func (c *ExchangeContext) ErrorCode(code int32) {
+-	c.error = dns.RcodeError(code)
++	c.access.Lock()
++	defer c.access.Unlock()
++	if !c.completed {
++		c.error = dns.RcodeError(code)
++	}
+ }
+ 
+ func (c *ExchangeContext) ErrnoCode(code int32) {
+-	c.error = syscall.Errno(code)
++	c.access.Lock()
++	defer c.access.Unlock()
++	if !c.completed {
++		c.error = syscall.Errno(code)
++	}
+ }
+ 
+ var (
 diff --git a/experimental/libbox/dns_lifecycle.go b/experimental/libbox/dns_lifecycle.go
 new file mode 100644
-index 0000000..fb1df7f
+index 0000000..76a4aa9
 --- /dev/null
 +++ b/experimental/libbox/dns_lifecycle.go
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,207 @@
 +package libbox
 +
 +import (
@@ -13,8 +348,8 @@ index 0000000..fb1df7f
 +	"sync"
 +)
 +
-+// These private primitives are not yet connected to the platform transport.
-+// They provide local bookkeeping, never proof of gomobile proxy reclamation.
++// These primitives provide local bookkeeping, never proof of gomobile proxy
++// reclamation or an operational Close result.
 +type dnsCancelRegistration struct {
 +	access   sync.Mutex
 +	callback func() error
@@ -22,16 +357,32 @@ index 0000000..fb1df7f
 +	finished chan struct{}
 +	once     sync.Once
 +	failure  error
++	armed    bool
++	stopped  bool
 +}
 +
 +func newDNSCancelRegistration(ctx context.Context, callback func() error) *dnsCancelRegistration {
-+	r := &dnsCancelRegistration{callback: callback, finished: make(chan struct{})}
++	r := makeDNSCancelRegistration(callback)
++	r.arm(ctx)
++	return r
++}
++
++func makeDNSCancelRegistration(callback func() error) *dnsCancelRegistration {
++	return &dnsCancelRegistration{callback: callback, finished: make(chan struct{})}
++}
++
++// Publication on ExchangeContext and arming are separate: AfterFunc is never
++// called under its response gate. Completion before arm prevents registration.
++func (r *dnsCancelRegistration) arm(ctx context.Context) {
 +	// A pre-canceled context can launch invoke immediately. Publish stop under
 +	// the same lock it takes before consuming callback, with finished ready first.
 +	r.access.Lock()
++	defer r.access.Unlock()
++	if r.stopped || r.armed {
++		return
++	}
++	r.armed = true
 +	r.stop = context.AfterFunc(ctx, r.invoke)
-+	r.access.Unlock()
-+	return r
 +}
 +
 +func (r *dnsCancelRegistration) invoke() {
@@ -58,10 +409,12 @@ index 0000000..fb1df7f
 +// AfterFunc stop result is not completion; only finished proves callback exit.
 +func (r *dnsCancelRegistration) stopAndDetach() <-chan struct{} {
 +	r.access.Lock()
++	r.stopped = true
 +	stop := r.stop
++	unarmed := !r.armed
 +	r.stop, r.callback = nil, nil
 +	r.access.Unlock()
-+	if stop != nil && stop() {
++	if unarmed || (stop != nil && stop()) {
 +		r.once.Do(func() { close(r.finished) })
 +	}
 +	return r.finished
@@ -89,10 +442,13 @@ index 0000000..fb1df7f
 +}
 +
 +type dnsCallLease struct {
-+	owner  *dnsCallGate
-+	ctx    context.Context
-+	cancel context.CancelFunc
-+	once   sync.Once
++	owner         *dnsCallGate
++	ctx           context.Context
++	cancel        context.CancelFunc
++	cleanupCancel context.CancelFunc
++	aborted       chan struct{}
++	abortOnce     sync.Once
++	once          sync.Once
 +}
 +
 +// begin must run before launching the platform-call goroutine. Admission and
@@ -100,11 +456,19 @@ index 0000000..fb1df7f
 +func (g *dnsCallGate) begin(ctx context.Context) (*dnsCallLease, error) {
 +	g.access.Lock()
 +	defer g.access.Unlock()
++	return g.beginLocked(ctx)
++}
++
++func (g *dnsCallGate) beginLocked(ctx context.Context) (*dnsCallLease, error) {
 +	if g.sealed {
 +		return nil, errDNSCallAdmissionClosed
 +	}
 +	ctx, cancel := context.WithCancel(ctx)
-+	lease := &dnsCallLease{owner: g, ctx: ctx, cancel: cancel}
++	lease := &dnsCallLease{owner: g, ctx: ctx, cleanupCancel: cancel, aborted: make(chan struct{})}
++	lease.cancel = func() {
++		lease.abortOnce.Do(func() { close(lease.aborted) })
++		cancel()
++	}
 +	if g.calls == nil {
 +		g.calls = make(map[*dnsCallLease]struct{})
 +	}
@@ -118,6 +482,10 @@ index 0000000..fb1df7f
 +func (g *dnsCallGate) sealAndSnapshot() ([]context.CancelFunc, dnsCallSnapshot) {
 +	g.access.Lock()
 +	defer g.access.Unlock()
++	return g.sealAndSnapshotLocked()
++}
++
++func (g *dnsCallGate) sealAndSnapshotLocked() ([]context.CancelFunc, dnsCallSnapshot) {
 +	g.sealed = true
 +	cancels := make([]context.CancelFunc, 0, len(g.calls))
 +	for lease := range g.calls {
@@ -142,6 +510,9 @@ index 0000000..fb1df7f
 +// registrations finish, including when this method runs inside a callback.
 +func (l *dnsCallLease) returned(registrations ...*dnsCancelRegistration) {
 +	l.once.Do(func() {
++		// The drain task exclusively owns this copy even if a future caller
++		// accidentally reuses its input slice after returned finishes.
++		registrations = append([]*dnsCancelRegistration(nil), registrations...)
 +		var pending []<-chan struct{}
 +		for _, registration := range registrations {
 +			finished := registration.stopAndDetach()
@@ -163,8 +534,8 @@ index 0000000..fb1df7f
 +			g.access.Lock()
 +			delete(g.calls, l)
 +			g.failure = errors.Join(g.failure, errors.Join(failures...))
-+			cancel := l.cancel
-+			l.ctx, l.cancel = nil, nil
++			cancel := l.cleanupCancel
++			l.ctx, l.cancel, l.cleanupCancel = nil, nil, nil
 +			g.access.Unlock()
 +			cancel()
 +		}
@@ -177,10 +548,10 @@ index 0000000..fb1df7f
 +}
 diff --git a/experimental/libbox/dns_lifecycle_test.go b/experimental/libbox/dns_lifecycle_test.go
 new file mode 100644
-index 0000000..e341849
+index 0000000..fbaa565
 --- /dev/null
 +++ b/experimental/libbox/dns_lifecycle_test.go
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,273 @@
 +package libbox
 +
 +import (
@@ -409,4 +780,435 @@ index 0000000..e341849
 +		t.Fatal("local callback failure was erased when its lease ended")
 +	}
 +	// No operational Close result or Exact proof is produced by this snapshot.
++}
++
++func TestDNSCompletionBeforeArmCannotPublishCancellation(t *testing.T) {
++	var invoked atomic.Int32
++	registration := makeDNSCancelRegistration(func() error { invoked.Add(1); return nil })
++	awaitDNSFinished(t, registration.stopAndDetach())
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	registration.arm(ctx)
++	awaitDNSFinished(t, registration.finished)
++	if invoked.Load() != 0 || registration.callback != nil || registration.stop != nil {
++		t.Fatal("completion-before-arm resurrected cancellation capability")
++	}
++}
++
++func TestDNSReturnedDrainOwnsRegistrationSlice(t *testing.T) {
++	var gate dnsCallGate
++	lease, err := gate.begin(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	entered, release := make(chan struct{}), make(chan struct{})
++	failure := errors.New("original registration failure")
++	registration := newDNSCancelRegistration(ctx, func() error { close(entered); <-release; return failure })
++	cancel()
++	awaitDNSFinished(t, entered)
++	input := []*dnsCancelRegistration{registration}
++	lease.returned(input...)
++	other := newDNSCancelRegistration(context.Background(), func() error { t.Error("reused slice callback ran"); return nil })
++	input[0] = other
++	other.stopAndDetach()
++	if gate.snapshot().inFlight != 1 {
++		t.Fatal("caller slice reuse ended a running original registration")
++	}
++	close(release)
++	awaitDNSFinished(t, registration.finished)
++	deadline := time.Now().Add(time.Second)
++	for gate.snapshot().inFlight != 0 && time.Now().Before(deadline) {
++		runtime.Gosched()
++	}
++	if !errors.Is(gate.snapshot().failure, failure) || gate.snapshot().inFlight != 0 {
++		t.Fatal("drain task followed reused caller slice instead of its own snapshot")
++	}
++}
+diff --git a/experimental/libbox/dns_platform_lifecycle_test.go b/experimental/libbox/dns_platform_lifecycle_test.go
+new file mode 100644
+index 0000000..4f35fbf
+--- /dev/null
++++ b/experimental/libbox/dns_platform_lifecycle_test.go
+@@ -0,0 +1,381 @@
++package libbox
++
++import (
++	"context"
++	"errors"
++	"net/netip"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/sagernet/sing-box/dns"
++)
++
++type fakeDNSFunc func() error
++
++func (f fakeDNSFunc) Invoke() error { return f() }
++
++type fakeDNSPlatform struct {
++	raw      func() bool
++	lookup   func(*ExchangeContext, string, string) error
++	exchange func(*ExchangeContext, []byte) error
++}
++
++func (p *fakeDNSPlatform) Raw() bool {
++	if p.raw != nil {
++		return p.raw()
++	}
++	return false
++}
++func (p *fakeDNSPlatform) Lookup(c *ExchangeContext, network, domain string) error {
++	if p.lookup != nil {
++		return p.lookup(c, network, domain)
++	}
++	c.Success("203.0.113.1")
++	return nil
++}
++func (p *fakeDNSPlatform) Exchange(c *ExchangeContext, message []byte) error {
++	return p.exchange(c, message)
++}
++
++func dnsTestQuery() *mDNS.Msg {
++	query := new(mDNS.Msg)
++	query.SetQuestion("example.invalid.", mDNS.TypeA)
++	return query
++}
++
++func awaitDNSDrain(t *testing.T, p *platformTransport) {
++	t.Helper()
++	deadline := time.Now().Add(time.Second)
++	for p.calls.snapshot().inFlight != 0 && time.Now().Before(deadline) {
++		runtime.Gosched()
++	}
++	if p.calls.snapshot().inFlight != 0 {
++		t.Fatal("platform call or registration did not actually finish")
++	}
++}
++
++func assertDNSContextDetached(t *testing.T, c *ExchangeContext) {
++	t.Helper()
++	c.access.Lock()
++	defer c.access.Unlock()
++	if !c.completed || c.context != nil || c.registrations != nil || c.error != nil || c.addresses != nil || len(c.message.Question) != 0 {
++		t.Fatal("completed ExchangeContext retained mutable result or capable references")
++	}
++}
++
++func TestDNSPlatformBackgroundSuccessStopsOnCancel(t *testing.T) {
++	before := runtime.NumGoroutine()
++	var invoked atomic.Int32
++	p := &platformTransport{iif: &fakeDNSPlatform{lookup: func(c *ExchangeContext, _, _ string) error {
++		c.OnCancel(fakeDNSFunc(func() error { invoked.Add(1); return nil }))
++		c.Success("203.0.113.1")
++		return nil
++	}}}
++	for i := 0; i < 300; i++ {
++		response, err := p.Exchange(context.Background(), dnsTestQuery())
++		if err != nil || response == nil || len(response.Answer) != 1 {
++			t.Fatalf("success was canceled by internal cleanup: %v / %v", response, err)
++		}
++	}
++	awaitDNSDrain(t, p)
++	runtime.GC()
++	if invoked.Load() != 0 || runtime.NumGoroutine() > before+4 {
++		t.Fatal("successful public OnCancel retained permanent waiters")
++	}
++}
++
++func TestDNSPlatformPreCancelledSkipsAllPlatformAccess(t *testing.T) {
++	var calls atomic.Int32
++	p := &platformTransport{iif: &fakeDNSPlatform{raw: func() bool { calls.Add(1); return false }, lookup: func(*ExchangeContext, string, string) error { calls.Add(1); return nil }}}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := p.Exchange(ctx, dnsTestQuery()); !errors.Is(err, context.Canceled) {
++		t.Fatal(err)
++	}
++	awaitDNSDrain(t, p)
++	if calls.Load() != 0 {
++		t.Fatal("pre-canceled query entered platform Raw or Lookup")
++	}
++}
++
++func TestDNSPlatformOnCancelAndCompletionRace(t *testing.T) {
++	for i := 0; i < 200; i++ {
++		var invoked atomic.Int32
++		var registering sync.WaitGroup
++		registering.Add(1)
++		var captured *ExchangeContext
++		p := &platformTransport{iif: &fakeDNSPlatform{lookup: func(c *ExchangeContext, _, _ string) error {
++			captured = c
++			go func() { defer registering.Done(); c.OnCancel(fakeDNSFunc(func() error { invoked.Add(1); return nil })) }()
++			c.Success("203.0.113.1")
++			return nil
++		}}}
++		if _, err := p.Exchange(context.Background(), dnsTestQuery()); err != nil {
++			t.Fatal(err)
++		}
++		registering.Wait()
++		awaitDNSDrain(t, p)
++		assertDNSContextDetached(t, captured)
++		if invoked.Load() != 0 {
++			t.Fatal("finish/registration race resurrected cancellation after success")
++		}
++	}
++}
++
++func TestDNSPlatformFrozenResultRejectsConcurrentLateWrites(t *testing.T) {
++	var captured *ExchangeContext
++	p := &platformTransport{iif: &fakeDNSPlatform{lookup: func(c *ExchangeContext, _, _ string) error { captured = c; c.Success("203.0.113.1"); return nil }}}
++	response, err := p.Exchange(context.Background(), dnsTestQuery())
++	if err != nil {
++		t.Fatal(err)
++	}
++	late := dns.FixedResponse(1, dnsTestQuery().Question[0], []netip.Addr{netip.MustParseAddr("203.0.113.2")}, 60)
++	lateBytes, err := late.Pack()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var invoked atomic.Int32
++	var writing sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		writing.Add(1)
++		go func() {
++			defer writing.Done()
++			for j := 0; j < 50; j++ {
++				captured.Success("203.0.113.2")
++				captured.RawSuccess(lateBytes)
++				captured.ErrorCode(mDNS.RcodeServerFailure)
++				captured.ErrnoCode(int32(syscall.EIO))
++				captured.OnCancel(fakeDNSFunc(func() error { invoked.Add(1); return nil }))
++			}
++		}()
++	}
++	writing.Wait()
++	if len(response.Answer) != 1 || response.Answer[0].(*mDNS.A).A.String() != "203.0.113.1" || invoked.Load() != 0 {
++		t.Fatal("late platform callback changed frozen result or cancellation state")
++	}
++	assertDNSContextDetached(t, captured)
++}
++
++func TestDNSPlatformUpperReturnKeepsBlockedPlatformLease(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	var captured *ExchangeContext
++	p := &platformTransport{iif: &fakeDNSPlatform{lookup: func(c *ExchangeContext, _, _ string) error {
++		captured = c
++		close(entered)
++		<-release
++		c.Success("203.0.113.1")
++		return nil
++	}}}
++	ctx, cancel := context.WithCancel(context.Background())
++	upper := make(chan error, 1)
++	go func() { _, err := p.Exchange(ctx, dnsTestQuery()); upper <- err }()
++	awaitDNSFinished(t, entered)
++	cancel()
++	select {
++	case err := <-upper:
++		if !errors.Is(err, context.Canceled) {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("upper query did not return on cancellation")
++	}
++	if p.calls.snapshot().inFlight != 1 {
++		t.Fatal("upper cancellation erased blocked platform call")
++	}
++	if err := p.Close(); err != nil {
++		t.Fatalf("busy Close changed operational result: %v", err)
++	}
++	if p.calls.snapshot().inFlight != 1 {
++		t.Fatal("Close erased a platform call before actual return")
++	}
++	close(release)
++	awaitDNSDrain(t, p)
++	assertDNSContextDetached(t, captured)
++}
++
++func TestDNSPlatformReentrantCloseDoesNotJoinRunningCallback(t *testing.T) {
++	registered, callbackEntered, releaseCallback := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	var captured *ExchangeContext
++	var p *platformTransport
++	p = &platformTransport{iif: &fakeDNSPlatform{lookup: func(c *ExchangeContext, _, _ string) error {
++		captured = c
++		c.OnCancel(fakeDNSFunc(func() error {
++			if err := p.Close(); err != nil {
++				return err
++			}
++			close(callbackEntered)
++			<-releaseCallback
++			return nil
++		}))
++		close(registered)
++		<-callbackEntered
++		return nil
++	}}}
++	ctx, cancel := context.WithCancel(context.Background())
++	upper := make(chan error, 1)
++	go func() { _, err := p.Exchange(ctx, dnsTestQuery()); upper <- err }()
++	awaitDNSFinished(t, registered)
++	cancel()
++	awaitDNSFinished(t, callbackEntered)
++	select {
++	case <-upper:
++	case <-time.After(time.Second):
++		t.Fatal("reentrant Close waited for its own cancellation callback")
++	}
++	deadline := time.Now().Add(time.Second)
++	for {
++		captured.access.Lock()
++		completed := captured.completed
++		captured.access.Unlock()
++		if completed {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("actual platform return waited for callback exit")
++		}
++		runtime.Gosched()
++	}
++	if p.calls.snapshot().inFlight != 1 {
++		t.Fatal("actual return prematurely released a running callback lease")
++	}
++	assertDNSContextDetached(t, captured)
++	close(releaseCallback)
++	awaitDNSDrain(t, p)
++}
++
++func TestDNSPlatformCloseDuringRawIsNonblockingAndRejectsAdmission(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	var lookups atomic.Int32
++	p := &platformTransport{iif: &fakeDNSPlatform{raw: func() bool { close(entered); <-release; return false }, lookup: func(*ExchangeContext, string, string) error { lookups.Add(1); return nil }}}
++	upper := make(chan error, 1)
++	go func() { _, err := p.Exchange(context.Background(), dnsTestQuery()); upper <- err }()
++	awaitDNSFinished(t, entered)
++	closed := make(chan error, 1)
++	go func() { closed <- p.Close() }()
++	select {
++	case err := <-closed:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("Raw held the admission gate across platform access")
++	}
++	if p.calls.snapshot().inFlight != 1 {
++		t.Fatal("Raw access bypassed the call lease")
++	}
++	if _, err := p.Exchange(context.Background(), dnsTestQuery()); !errors.Is(err, errDNSCallAdmissionClosed) {
++		t.Fatal("Close allowed new platform access")
++	}
++	if err := <-upper; !errors.Is(err, context.Canceled) {
++		t.Fatal(err)
++	}
++	close(release)
++	awaitDNSDrain(t, p)
++	if lookups.Load() != 0 {
++		t.Fatal("canceled Raw call started another platform query")
++	}
++}
++
++func TestDNSPlatformErrorPriorityAndRawFrozenSnapshot(t *testing.T) {
++	platformFailure := errors.New("actual platform error")
++	for _, raw := range []bool{false, true} {
++		for _, failure := range []string{"platform", "errno", "rcode", "success"} {
++			t.Run(map[bool]string{false: "lookup", true: "raw"}[raw]+"/"+failure, func(t *testing.T) {
++				var captured *ExchangeContext
++				respond := func(c *ExchangeContext) error {
++					captured = c
++					if raw {
++						answer := dns.FixedResponse(7, dnsTestQuery().Question[0], []netip.Addr{netip.MustParseAddr("203.0.113.1")}, 60)
++						data, _ := answer.Pack()
++						c.RawSuccess(data)
++					} else {
++						c.Success("203.0.113.1")
++					}
++					switch failure {
++					case "platform":
++						c.ErrorCode(mDNS.RcodeServerFailure)
++						return platformFailure
++					case "errno":
++						c.ErrnoCode(int32(syscall.EIO))
++					case "rcode":
++						c.ErrorCode(mDNS.RcodeNameError)
++					}
++					return nil
++				}
++				p := &platformTransport{iif: &fakeDNSPlatform{raw: func() bool { return raw }, lookup: func(c *ExchangeContext, _, _ string) error { return respond(c) }, exchange: func(c *ExchangeContext, _ []byte) error { return respond(c) }}}
++				response, err := p.Exchange(context.Background(), dnsTestQuery())
++				switch failure {
++				case "platform":
++					if !errors.Is(err, platformFailure) {
++						t.Fatal("response error overrode platform error", err)
++					}
++				case "errno":
++					if !errors.Is(err, syscall.EIO) {
++						t.Fatal(err)
++					}
++				case "rcode":
++					if !errors.Is(err, dns.RcodeError(mDNS.RcodeNameError)) {
++						t.Fatal(err)
++					}
++				case "success":
++					if err != nil || len(response.Answer) != 1 {
++						t.Fatalf("%v / %v", response, err)
++					}
++					captured.RawSuccess([]byte{1})
++					if len(response.Answer) != 1 {
++						t.Fatal("raw result was aliased with mutable context")
++					}
++				}
++				assertDNSContextDetached(t, captured)
++			})
++		}
++	}
++}
++
++func TestDNSPlatformAsyncLeasePrecedesRawAndCloseStaysNil(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	p := &platformTransport{iif: &fakeDNSPlatform{raw: func() bool { close(entered); <-release; return false }}}
++	result := make(chan error, 1)
++	p.ExchangeAsync(context.Background(), dnsTestQuery(), func(_ *mDNS.Msg, err error) { result <- err })
++	awaitDNSFinished(t, entered)
++	if p.calls.snapshot().inFlight != 1 {
++		t.Fatal("ExchangeAsync launched platform goroutine without admission")
++	}
++	if err := p.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-result; !errors.Is(err, context.Canceled) {
++		t.Fatal(err)
++	}
++	close(release)
++	awaitDNSDrain(t, p)
++}
++
++func TestDNSPlatformCallbackFailureDoesNotChangeOperationalClose(t *testing.T) {
++	registered, invoked := make(chan struct{}), make(chan struct{})
++	failure := errors.New("callback cleanup failed")
++	p := &platformTransport{iif: &fakeDNSPlatform{lookup: func(c *ExchangeContext, _, _ string) error {
++		c.OnCancel(fakeDNSFunc(func() error { close(invoked); return failure }))
++		close(registered)
++		<-invoked
++		return nil
++	}}}
++	ctx, cancel := context.WithCancel(context.Background())
++	result := make(chan error, 1)
++	go func() { _, err := p.Exchange(ctx, dnsTestQuery()); result <- err }()
++	awaitDNSFinished(t, registered)
++	cancel()
++	<-result
++	awaitDNSDrain(t, p)
++	if !errors.Is(p.calls.snapshot().failure, failure) {
++		t.Fatal("local snapshot lost callback failure")
++	}
++	if err := p.Close(); err != nil {
++		t.Fatal("local proof failure changed operational Close", err)
++	}
 +}

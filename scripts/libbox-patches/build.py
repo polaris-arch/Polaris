@@ -121,7 +121,8 @@ def main():
              str(checkout / 'experimental/libbox/interface_binding_test.go'),
              str(checkout / 'experimental/libbox/config_validation_test.go'),
              str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
-             str(checkout / 'experimental/libbox/dns_lifecycle_test.go')], cwd=checkout, env=env)
+             str(checkout / 'experimental/libbox/dns_lifecycle_test.go'),
+             str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go')], cwd=checkout, env=env)
         # Optional registry services must preserve existing usage files with
         # either tag independently and with both real implementations present.
         for tags in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
@@ -130,7 +131,8 @@ def main():
                                 './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
             tagged_tests = [str(checkout / 'experimental/libbox/config_validation_test.go'),
                             str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
-                            str(checkout / 'experimental/libbox/dns_lifecycle_test.go')]
+                            str(checkout / 'experimental/libbox/dns_lifecycle_test.go'),
+                            str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go')]
             if tags == 'with_ccm,with_ocm':
                 tagged_tests.append(str(checkout / 'experimental/libbox/config_optional_persistence_test.go'))
             run([str(go), 'test', '-tags', tags, '-race', '-ldflags=-checklinkname=0',
@@ -182,7 +184,7 @@ def main():
             classes = checkout / 'classes.jar'
             classes.write_bytes(archive.read('classes.jar'))
             signatures = {}
-            for name in ['Libbox', 'CommandServer', 'PlatformInterface', 'ConfigValidationResult']:
+            for name in ['Libbox', 'CommandServer', 'PlatformInterface', 'ConfigValidationResult', 'ExchangeContext', 'LocalDNSTransport', 'Func']:
                 signatures[name] = run([str(jdk / 'bin/javap'), '-constants', '-classpath', str(classes), f'io.nekohasekai.libbox.{name}'], capture=True)
             require('newTransientCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Transient Java factory is missing')
             require('newStrictCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Strict primary Java factory is missing')
@@ -193,6 +195,18 @@ def main():
             for getter in ['RequestID', 'ConfigDigest', 'ContractVersion', 'Validation', 'Cleanup', 'ValidationError', 'CleanupError']:
                 require(f'java.lang.String get{getter}()' in signatures['ConfigValidationResult'], f'Config validation getter {getter} is missing')
                 require(f'set{getter}(' not in signatures['ConfigValidationResult'], f'Config validation field {getter} must be read-only')
+            dns_methods = {
+                'ExchangeContext': ['void errnoCode(int)', 'void errorCode(int)',
+                                    'void onCancel(io.nekohasekai.libbox.Func)',
+                                    'void rawSuccess(byte[])', 'void success(java.lang.String)'],
+                'LocalDNSTransport': ['void exchange(io.nekohasekai.libbox.ExchangeContext, byte[]) throws java.lang.Exception',
+                                     'void lookup(io.nekohasekai.libbox.ExchangeContext, java.lang.String, java.lang.String) throws java.lang.Exception',
+                                     'boolean raw()'],
+                'Func': ['void invoke() throws java.lang.Exception'],
+            }
+            for name, methods in dns_methods.items():
+                for method in methods:
+                    require(method in signatures[name], f'DNS Java ABI changed: {name}.{method}')
             receipt['javaInterfaces'] = signatures
         output = ROOT / 'src-tauri/gen/android/app/libs/libbox.aar'
         output.parent.mkdir(parents=True, exist_ok=True)
