@@ -120,7 +120,8 @@ def main():
              str(checkout / 'experimental/libbox/command_server_transient_test.go'),
              str(checkout / 'experimental/libbox/interface_binding_test.go'),
              str(checkout / 'experimental/libbox/config_validation_test.go'),
-             str(checkout / 'experimental/libbox/config_construction_persistence_test.go')], cwd=checkout, env=env)
+             str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
+             str(checkout / 'experimental/libbox/dns_lifecycle_test.go')], cwd=checkout, env=env)
         # Optional registry services must preserve existing usage files with
         # either tag independently and with both real implementations present.
         for tags in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
@@ -128,7 +129,8 @@ def main():
                                 '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}',
                                 './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
             tagged_tests = [str(checkout / 'experimental/libbox/config_validation_test.go'),
-                            str(checkout / 'experimental/libbox/config_construction_persistence_test.go')]
+                            str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
+                            str(checkout / 'experimental/libbox/dns_lifecycle_test.go')]
             if tags == 'with_ccm,with_ocm':
                 tagged_tests.append(str(checkout / 'experimental/libbox/config_optional_persistence_test.go'))
             run([str(go), 'test', '-tags', tags, '-race', '-ldflags=-checklinkname=0',

@@ -1,0 +1,385 @@
+diff --git a/experimental/libbox/dns_lifecycle.go b/experimental/libbox/dns_lifecycle.go
+new file mode 100644
+index 0000000..abd1246
+--- /dev/null
++++ b/experimental/libbox/dns_lifecycle.go
+@@ -0,0 +1,169 @@
++package libbox
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++)
++
++// These private primitives are not yet connected to the platform transport.
++// They provide local bookkeeping, never proof of gomobile proxy reclamation.
++type dnsCancelRegistration struct {
++	access   sync.Mutex
++	callback func() error
++	stop     func() bool
++	finished chan struct{}
++	once     sync.Once
++	failure  error
++}
++
++func newDNSCancelRegistration(ctx context.Context, callback func() error) *dnsCancelRegistration {
++	r := &dnsCancelRegistration{callback: callback, finished: make(chan struct{})}
++	r.access.Lock()
++	r.stop = context.AfterFunc(ctx, r.invoke)
++	r.access.Unlock()
++	return r
++}
++
++func (r *dnsCancelRegistration) invoke() {
++	var failure error
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			failure = fmt.Errorf("DNS cancellation callback panicked: %v", recovered)
++		}
++		r.access.Lock()
++		r.failure = failure
++		r.access.Unlock()
++		r.once.Do(func() { close(r.finished) })
++	}()
++	r.access.Lock()
++	callback := r.callback
++	r.callback, r.stop = nil, nil
++	r.access.Unlock()
++	if callback != nil {
++		failure = callback()
++	}
++}
++
++// stopAndDetach never waits, so it is safe inside the callback itself. A false
++// AfterFunc stop result is not completion; only finished proves callback exit.
++func (r *dnsCancelRegistration) stopAndDetach() <-chan struct{} {
++	r.access.Lock()
++	stop := r.stop
++	r.stop, r.callback = nil, nil
++	r.access.Unlock()
++	if stop != nil && stop() {
++		r.once.Do(func() { close(r.finished) })
++	}
++	return r.finished
++}
++
++func (r *dnsCancelRegistration) result() error {
++	r.access.Lock()
++	defer r.access.Unlock()
++	return r.failure
++}
++
++var errDNSCallAdmissionClosed = errors.New("DNS call admission is closed")
++
++type dnsCallGate struct {
++	access  sync.Mutex
++	sealed  bool
++	calls   map[*dnsCallLease]struct{}
++	failure error
++}
++
++type dnsCallSnapshot struct {
++	sealed   bool
++	inFlight int
++	failure  error
++}
++
++type dnsCallLease struct {
++	owner  *dnsCallGate
++	ctx    context.Context
++	cancel context.CancelFunc
++	once   sync.Once
++}
++
++// begin must run before launching the platform-call goroutine. Admission and
++// seal use the same gate; no WaitGroup can race a later Add.
++func (g *dnsCallGate) begin(ctx context.Context) (*dnsCallLease, error) {
++	g.access.Lock()
++	defer g.access.Unlock()
++	if g.sealed {
++		return nil, errDNSCallAdmissionClosed
++	}
++	ctx, cancel := context.WithCancel(ctx)
++	lease := &dnsCallLease{owner: g, ctx: ctx, cancel: cancel}
++	if g.calls == nil {
++		g.calls = make(map[*dnsCallLease]struct{})
++	}
++	g.calls[lease] = struct{}{}
++	return lease, nil
++}
++
++// sealAndSnapshot performs no SDK/JNI calls, cancellation or waiting under the
++// gate. Its caller can request cancellation outside the gate. Neither an empty
++// snapshot nor a nil failure is an exact cleanup or operational-close receipt.
++func (g *dnsCallGate) sealAndSnapshot() ([]context.CancelFunc, dnsCallSnapshot) {
++	g.access.Lock()
++	defer g.access.Unlock()
++	g.sealed = true
++	cancels := make([]context.CancelFunc, 0, len(g.calls))
++	for lease := range g.calls {
++		cancels = append(cancels, lease.cancel)
++	}
++	return cancels, g.snapshotLocked()
++}
++
++func (g *dnsCallGate) snapshot() dnsCallSnapshot {
++	g.access.Lock()
++	defer g.access.Unlock()
++	return g.snapshotLocked()
++}
++
++func (g *dnsCallGate) snapshotLocked() dnsCallSnapshot {
++	return dnsCallSnapshot{sealed: g.sealed, inFlight: len(g.calls), failure: g.failure}
++}
++
++// returned is only for the platform-call owner after Exchange/Lookup actually
++// returns. ctx.Done, upper-call timeout and cancellation must never call it.
++// It does not join callbacks: a running drain task retains the lease until all
++// registrations finish, including when this method runs inside a callback.
++func (l *dnsCallLease) returned(registrations ...*dnsCancelRegistration) {
++	l.once.Do(func() {
++		var pending []<-chan struct{}
++		for _, registration := range registrations {
++			finished := registration.stopAndDetach()
++			select {
++			case <-finished:
++			default:
++				pending = append(pending, finished)
++			}
++		}
++		release := func() {
++			for _, finished := range pending {
++				<-finished
++			}
++			var failures []error
++			for _, registration := range registrations {
++				failures = append(failures, registration.result())
++			}
++			g := l.owner
++			g.access.Lock()
++			delete(g.calls, l)
++			g.failure = errors.Join(g.failure, errors.Join(failures...))
++			cancel := l.cancel
++			l.ctx, l.cancel = nil, nil
++			g.access.Unlock()
++			cancel()
++		}
++		if len(pending) == 0 {
++			release()
++		} else {
++			go release()
++		}
++	})
++}
+diff --git a/experimental/libbox/dns_lifecycle_test.go b/experimental/libbox/dns_lifecycle_test.go
+new file mode 100644
+index 0000000..59fd578
+--- /dev/null
++++ b/experimental/libbox/dns_lifecycle_test.go
+@@ -0,0 +1,204 @@
++package libbox
++
++import (
++	"context"
++	"errors"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func awaitDNSFinished(t *testing.T, finished <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-finished:
++	case <-time.After(time.Second):
++		t.Fatal("DNS cancellation registration did not finish")
++	}
++}
++
++func TestDNSBackgroundRegistrationStopsWithoutPermanentWaiter(t *testing.T) {
++	before := runtime.NumGoroutine()
++	var invoked atomic.Int32
++	for i := 0; i < 2000; i++ {
++		registration := newDNSCancelRegistration(context.Background(), func() error { invoked.Add(1); return nil })
++		awaitDNSFinished(t, registration.stopAndDetach())
++		registration.access.Lock()
++		if registration.callback != nil || registration.stop != nil {
++			t.Fatal("stopped registration retained its callback or context association")
++		}
++		registration.access.Unlock()
++	}
++	runtime.GC()
++	if invoked.Load() != 0 || runtime.NumGoroutine() > before+4 {
++		t.Fatal("successful Background queries retained cancellation waiters")
++	}
++}
++
++func TestDNSRunningCancellationStopWaitsForActualExit(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	entered, release := make(chan struct{}), make(chan struct{})
++	failure := errors.New("injected cancellation failure")
++	registration := newDNSCancelRegistration(ctx, func() error { close(entered); <-release; return failure })
++	cancel()
++	awaitDNSFinished(t, entered)
++	finished := registration.stopAndDetach()
++	select {
++	case <-finished:
++		t.Fatal("stop mistook a running callback for completion")
++	default:
++	}
++	close(release)
++	awaitDNSFinished(t, finished)
++	if !errors.Is(registration.result(), failure) {
++		t.Fatal("running cancellation error was lost")
++	}
++}
++
++func TestDNSCancellationRegistrationRaceAndPanicCompletion(t *testing.T) {
++	for i := 0; i < 300; i++ {
++		ctx, cancel := context.WithCancel(context.Background())
++		var invoked atomic.Int32
++		registration := newDNSCancelRegistration(ctx, func() error { invoked.Add(1); return nil })
++		var running sync.WaitGroup
++		running.Add(2)
++		go func() { defer running.Done(); cancel() }()
++		go func() { defer running.Done(); registration.stopAndDetach() }()
++		running.Wait()
++		awaitDNSFinished(t, registration.stopAndDetach())
++		if invoked.Load() > 1 {
++			t.Fatal("cancellation callback ran more than once")
++		}
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	entered := make(chan struct{})
++	registration := newDNSCancelRegistration(ctx, func() error { close(entered); panic("injected cancellation panic") })
++	cancel()
++	awaitDNSFinished(t, entered)
++	awaitDNSFinished(t, registration.finished)
++	if registration.result() == nil {
++		t.Fatal("callback panic disappeared from local bookkeeping")
++	}
++}
++
++func TestDNSUpperCancellationDoesNotReleasePlatformLease(t *testing.T) {
++	var gate dnsCallGate
++	ctx, cancel := context.WithCancel(context.Background())
++	lease, err := gate.begin(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	entered, actualReturn := make(chan struct{}), make(chan struct{})
++	returned := make(chan struct{})
++	go func() {
++		close(entered)
++		<-actualReturn
++		lease.returned()
++		close(returned)
++	}()
++	awaitDNSFinished(t, entered)
++	cancel()
++	awaitDNSFinished(t, lease.ctx.Done())
++	cancels, snapshot := gate.sealAndSnapshot()
++	for _, requestCancel := range cancels {
++		requestCancel()
++	}
++	if !snapshot.sealed || snapshot.inFlight != 1 || gate.snapshot().inFlight != 1 {
++		t.Fatal("upper cancellation or seal erased an in-flight platform call")
++	}
++	if _, err = gate.begin(context.Background()); !errors.Is(err, errDNSCallAdmissionClosed) {
++		t.Fatal("sealed transport admitted another platform call")
++	}
++	close(actualReturn)
++	awaitDNSFinished(t, returned)
++	if gate.snapshot().inFlight != 0 || lease.ctx != nil || lease.cancel != nil {
++		t.Fatal("actual return did not release local lease references")
++	}
++}
++
++func TestDNSCallbackCannotSelfJoinAndRetainsLeaseUntilExit(t *testing.T) {
++	var gate dnsCallGate
++	lease, err := gate.begin(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	returned, release := make(chan struct{}), make(chan struct{})
++	var registration *dnsCancelRegistration
++	registration = newDNSCancelRegistration(ctx, func() error {
++		lease.returned(registration)
++		close(returned)
++		<-release
++		return nil
++	})
++	cancel()
++	awaitDNSFinished(t, returned)
++	if gate.snapshot().inFlight != 1 {
++		t.Fatal("callback self-unregistration prematurely released the lease")
++	}
++	close(release)
++	awaitDNSFinished(t, registration.finished)
++	deadline := time.Now().Add(time.Second)
++	for gate.snapshot().inFlight != 0 && time.Now().Before(deadline) {
++		runtime.Gosched()
++	}
++	if gate.snapshot().inFlight != 0 {
++		t.Fatal("drain task did not release the lease after callback exit")
++	}
++	lease.returned(registration)
++}
++
++func TestDNSAdmissionAndSealRace(t *testing.T) {
++	for i := 0; i < 300; i++ {
++		var gate dnsCallGate
++		start := make(chan struct{})
++		admitted := make(chan *dnsCallLease, 1)
++		sealed := make(chan struct{})
++		go func() {
++			<-start
++			lease, _ := gate.begin(context.Background())
++			admitted <- lease
++		}()
++		go func() {
++			<-start
++			cancels, _ := gate.sealAndSnapshot()
++			for _, cancel := range cancels {
++				cancel()
++			}
++			close(sealed)
++		}()
++		close(start)
++		lease := <-admitted
++		awaitDNSFinished(t, sealed)
++		if lease != nil {
++			if gate.snapshot().inFlight != 1 {
++				t.Fatal("seal lost a previously admitted call")
++			}
++			lease.returned()
++		}
++		if _, err := gate.begin(context.Background()); !errors.Is(err, errDNSCallAdmissionClosed) || gate.snapshot().inFlight != 0 {
++			t.Fatal("admission was not linearized with seal")
++		}
++	}
++}
++
++func TestDNSReturnedLeaseRetainsCancellationFailureSeparately(t *testing.T) {
++	var gate dnsCallGate
++	lease, err := gate.begin(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	failure := errors.New("cancellation returned an error")
++	registration := newDNSCancelRegistration(ctx, func() error { return failure })
++	cancel()
++	awaitDNSFinished(t, registration.finished)
++	lease.returned(registration)
++	_, snapshot := gate.sealAndSnapshot()
++	if snapshot.inFlight != 0 || !errors.Is(snapshot.failure, failure) {
++		t.Fatal("local callback failure was erased when its lease ended")
++	}
++	// No operational Close result or Exact proof is produced by this snapshot.
++}
