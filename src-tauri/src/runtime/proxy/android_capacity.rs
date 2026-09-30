@@ -55,7 +55,7 @@ impl std::fmt::Display for CheckFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::CapacityClosed;
+    use crate::runtime::proxy::android_capacity::CapacityClosed;
 
     #[test]
     fn only_exact_typed_code_is_capacity() {

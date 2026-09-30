@@ -401,7 +401,7 @@ async fn ts_and_warp_selection_matrix_preserves_route_rebuild_boundary() {
             (id.as_str(), "node-a", "Node A"),
         ] {
             let (rt, _dir) = test_runtime();
-            let running = config_with_nodes(old, &[node.clone()]);
+            let running = config_with_nodes(old, std::slice::from_ref(&node));
             rt.config.save_full(&running).unwrap();
             let running = rt.config.current().unwrap();
             mark_running_with_named_snapshot(&rt, &running);
@@ -1024,7 +1024,7 @@ async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_
         ("ts-mesh", "node-a", "TS Mesh", "mesh-direct"),
     ] {
         let (rt, _dir) = test_runtime();
-        let mut running = config_with_nodes(old, &[ts.clone()]);
+        let mut running = config_with_nodes(old, std::slice::from_ref(&ts));
         running["proxyMode"] = serde_json::json!("smart");
         running["singboxDashboard"] = serde_json::json!(true);
         rt.config.save_full(&running).unwrap();
