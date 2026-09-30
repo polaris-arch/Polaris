@@ -17,14 +17,14 @@ the shape verifier's `Ok(())` into `NoOldCore` or custody release.
 | `main.bridge` | Plugin Start before foreground-service dispatch; one ticket continues from `VpnBridge` pending into `MainKernelAttempt` | `CancelledBeforeBirth`; born main owners currently remain `Unknown` | Rust bridge timeout detaches but Kotlin ticket remains; late Service attempt must meet sealed admission |
 | `main.system` | `BoxService.onStartCommand` for Boot, always-on, system relaunch, and duplicate foreground intents | same main owner proof | fence, request replacement, or occupied registry rejects an ownerless Service; `stopSelfResult(startId)` tears down only that Android request |
 | `main.close` | exact attempt operational close after Stop/onDestroy/onRevoke | capability absent: born main owners remain `Unknown` until global DNS drain and native lease release are proved; genuinely unborn reservations may cancel | successful native Close and exact registry release preserve ordinary recovery but do not prove resource disposal; construction failure/revoked completion remains sticky `Unknown` |
-| `main.reload` | Service reload callback, including targetless callback | control operation leaves JNI; same main ticket stays owned | retired endpoint declines before native reload; late callback cannot start after seal |
+| `main.reload` | captured AttemptHandler callback reserves an independent TargetlessReload operation before target capture/config I/O | real callback work returns with the exact target still current, then control `Completed`; main owner remains owned and born-main release proof stays `Unknown` | pure preflight/birthAllowed precede Host work; first actual JNI rechecks entry; construction/revoked completion stays owner+operation `Unknown`; capability not declared yet |
 | `login.start` | owner reserve at invocation, independent validation reserve before worker queue, owner birth before setup/JNI | capability absent; born owners remain `Unknown` after ordinary cleanup | consumed ID cannot replay; cancelled/sealed worker cannot enter native; construction failure/revoked return is sticky `Unknown` under ownership lock |
 | `login.close` | explicit close and Rust Drop use original ID; serviceStop, 300 s expiry, retry and main preemption retain exact Entry | worker exit, native close, network/DNS and original cache/TS ownership proof remain pending | close-before-start tombstones ID; successful map removal is operational cleanup only and cannot prove TS release |
 | `speedtest.start` | ticket installed before pure config-validation thread and session queue; `enterBirth` before prepare's first resource | exact speedtest owner close; capability still absent pending resolver drain | its epoch:sequence ID cannot be replayed; cancelled/sealed queue cannot enter native; native construction failure or revoked completion stays ledger `Unknown` |
 | `speedtest.close` | same ticket for explicit close, serviceStop, expiry, main-start preemption | native close, original prepare/Start worker exit, network notifications/thread cleanup, and unused resolver shutdown | 8 s timeout leaves owner observable; used DNS resolver stays ledger `Unknown`; operational Close success preserves ordinary retry/main admission |
 | `validation.checkConfig` | common enqueue adapter reserves before plugin thread, login worker queue, and speedtest validation thread/session queue | `CancelledBeforeBirth`; otherwise `ValidationCleanupUnknown` until Go returns an observable construction/disposal proof | failed queue dispatch cancels before birth; Rust timeout/detached callback does not end the Kotlin JNI operation |
-| `control.targetlessStop` | old targetless Stop callback before dispatch | control callback leaves its work; main owner remains until exact close | queued/late callback cannot disappear from a sealed receipt |
-| `control.targetlessReload` | old targetless reload callback before dispatch | callback returns after any JNI work; main owner remains | reload rejected by seal cannot enter new native work |
+| `control.targetlessStop` | default unbound callback reserves before any dispatch; it never resolves the current main owner | no JNI work: `CancelledBeforeBirth`; rejected reservation does nothing; capability not declared yet | old or ambiguous callbacks cannot stop a successor; captured known-owner Stop keeps its existing operational cleanup after seal/capacity closure |
+| `control.targetlessReload` | default unbound callback reserves and declines without resolving an owner | no JNI work: `CancelledBeforeBirth`; rejected reservation does nothing; capability not declared yet | a missing target is never repaired by selecting a newer owner; captured reload has its own operation ticket and actual-boundary admission |
 
 Cold-process bootstrap is shared by all rows: only `ENOENT` for
 `mesh-route-state.required` opens admission. Marker presence or any other stat
@@ -79,17 +79,19 @@ errors or skips. Bridge checking passed 31 commands. CI impact classification
 selects Android with no unregistered scopes; `git diff --check` passed.
 No operational Service/registry, Rust, Go, Host, SDK or APK change is included.
 
-## Proposed main control contract (production wiring pending core review)
+## Main control contract (production wiring pending final review)
 
 The current primary factory supplies `AttemptHandler(attempt, this)` to
 `newStrictCommandServer`. Go's `ManagedService.StopService/ReloadService` calls
 the same server's `platformHandler`, which forwards to that captured handler.
-Its Stop therefore already names the original attempt. The default
-`BoxService.serviceStop/serviceReload` methods still select the current attempt
-at delivery, and reload currently reuses only the main owner ticket. This
-proposal does not change those production methods yet or add capabilities.
+Its Stop therefore names the original attempt. The default
+`BoxService.serviceStop/serviceReload` methods now reserve and decline unbound
+callbacks without looking up the current owner. The captured reload delegates
+to the real pure `AndroidNativeMainControls` producer with Service/Host/JNI
+adapters. Each invocation uses a separate control operation; no control
+capability is declared by this slice pending its final review.
 
-`AndroidNativeControlOperation` is a pure seam for this proposed contract:
+`AndroidNativeControlOperation` enforces the reviewed control contract:
 
 * An exact reload reserves an independent `TargetlessReload` operation ticket
   when its callback arrives, before any queue or config I/O. This kind represents
@@ -99,10 +101,14 @@ proposal does not change those production methods yet or add capabilities.
   operation holds that attempt's existing `operationLock`; Stop revokes it
   immediately and its close worker joins the same lock. Each JNI boundary checks
   the exact target again. `enterBirth` occurs before the callback's first JNI,
-  including `setError`, and rejects a reservation sealed or capacity-closed
-  while queued. Main/transient ownership helpers must not be disrupted before
-  this operation's admission check; their existing cleanup/claim order stays
-  unchanged when the production adapter is installed.
+  including `OverrideOptions` allocation and `setError`, and rejects a
+  reservation sealed or capacity-closed while queued. A pure `birthAllowed`
+  preflight precedes the Host adapters. Their existing cleanup and claim order
+  is retained outside the construction boundary: Speedtest preemption, Login
+  config claims/preemption, legacy-marker check, then the actual main JNI call.
+  Existing transient Close belongs to its original owner ticket; it is not a
+  new main construction. If seal races after Host preflight, the final
+  `enterBirth` still blocks main JNI and error-report JNI.
 * Pure configuration preflight and the dual-mode reload tombstone run before
   native construction. The ordinary reconnect notice keeps the live core and
   remains tied to the original attempt/notice owner. Hot mode switching still
@@ -113,12 +119,17 @@ proposal does not change those production methods yet or add capabilities.
   error for fixed-label logging; never route it to a successor. No new UI error
   surface is proposed. Existing safe load errors remain visible through native
   `setError` while admission and exact ownership permit it.
-* A construction throw or revoked return records main-owner construction
-  `Unknown` under `operationLock`, as today, and records operation `Unknown`
-  before attempting `setError`. Error reporting uses the same entered operation;
+* Only reaching the real main construction boundary sets `constructionEntered`.
+  A construction throw, revoked return, or later Host/target completion failure
+  after that boundary records main-owner construction `Unknown` under
+  `operationLock`, and records operation `Unknown` before attempting `setError`.
+  Pure Host/config failure before construction does not poison the main owner.
+  Error reporting uses the same entered operation;
   its success cannot clear `Unknown`, and its failure cannot replace the first
   error. Ordinary error-report failure does not assert construction uncertainty
-  for a core that was never reloaded.
+  for a core that was never reloaded. The first Throwable is retained for
+  fixed-label logging, including when error-report JNI or a final revocation
+  check fails; sensitive raw messages and stack traces are not newly logged.
 * Only the real synchronous callback/native work returning with its exact target
   still current can complete an entered operation. Pure refusal cancels before
   birth. A stalled callback remains captured and nonterminal; a Stop timeout
@@ -130,13 +141,32 @@ proposal does not change those production methods yet or add capabilities.
   captured Stop, user Stop, revoke, and destroy still close their existing exact
   owner without reserving a new operation or entering new birth. Seal and
   capacity closure must not block that cleanup.
+* Terminal main-close failure no longer invokes `commandServer.setError` from
+  `onAttemptClosed`. It retains fixed diagnostic logging, `finishStop`, and
+  ledger `Unknown`, without adding JNI after the close attempt.
 
 The seam tests exercise the actual helper with fake JNI latches and real
 `MainKernelAttempt`/ledger state, including queued seal/capacity rejection,
 first-error preservation, original owner revocation, and late error/notice
-delivery. Production call-site and all-entry validation remain a separate
-reviewed slice. Until that slice is complete, wiring remains **3/11**; this
-contract and helper emit no global `NoOwner` or Tailscale custody receipt.
+delivery. The real production producer tests also pause pure preflight and Host
+completion, exercise both native-failure/Stop orders, and deliver an old queued
+callback after a real registry release admits a successor. Its returned
+operation ticket is internal identity for state inspection, not a completion
+or resource-release assertion. Production wiring awaits final review; declared
+coverage remains **3/11**. Neither this producer nor its helper emits global
+`NoOwner`, a Go native lease proof, or a Tailscale custody receipt.
+
+Production control wiring validation (2026-09-30): actual Android Kotlin
+compilation and the targeted producer/control/main/dual-mode suites passed
+47 tests in four suites. Full `:app:testUniversalDebugUnitTest` passed 192 tests
+in 16 suites with zero failures, errors or skips, including 16 production
+control cases and 19 Host lifecycle cases from the combined base. The 31-command
+bridge check and six existing Rust transient-login source-contract tests passed;
+the latter used standalone `rustc --test` with the real std-only source-probe
+library, not a Cargo/runtime build. CI impact classification selects only
+Android and reports no unregistered scopes; `git diff --check` passed.
+No Host/Sessions/MainKernelAttempt, Go/Rust/UI/SDK, AAR/APK, device or real-network
+change/test is included. This slice adds no capability; coverage remains **3/11**.
 
 Control-contract seam validation (2026-09-30): the first targeted run passed
 14 tests after compiling the actual Android Kotlin sources. After adding two

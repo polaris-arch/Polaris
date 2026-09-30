@@ -33,8 +33,9 @@ class MainNativeAdmissionWiringTest {
         val ownership = nativeStart.indexOf("TransientLoginHost.withMainConfig(attempt,")
         assertTrue(operation >= 0 && operation < ownership && ownership < factory)
         val reload = service.substringAfter("private fun serviceReload(expectedAttempt:").substringBefore("private fun setReloadError(")
-        assertTrue(reload.indexOf("AndroidNativeMain.construct(attempt)") <
-            reload.indexOf("TransientLoginHost.withMainConfig(attempt,"))
+        assertTrue(reload.contains("AndroidNativeMain.controls.reload("))
+        assertFalse(reload.contains("AndroidNativeMain.construct(attempt)"))
+        assertTrue(reload.contains("TransientLoginHost.withMainConfig(attempt, config, { isReloadCurrent(attempt, server) })"))
         assertTrue(serviceStart.contains("LegacySystemStartFence.admitCurrentRequest(request, VpnBridge::currentStartRequest)"))
         assertTrue(serviceStart.contains("service.stopSelfResult(startId)"))
         assertFalse(serviceStart.contains("service.stopSelf()"))

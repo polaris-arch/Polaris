@@ -320,63 +320,63 @@ class BoxService(
     }
 
     override fun serviceStop() {
-        stopService()
+        AndroidNativeMain.controls.rejectUnbound(AndroidNativeAdmission.Kind.TargetlessStop) {
+            Log.w(TAG, "无来源的主核 Stop 回调准入被拒 type=${it.javaClass.simpleName}")
+        }
     }
 
-    override fun serviceReload() { serviceReload(null) }
+    override fun serviceReload() {
+        AndroidNativeMain.controls.rejectUnbound(AndroidNativeAdmission.Kind.TargetlessReload) {
+            Log.w(TAG, "无来源的主核 Reload 回调准入被拒 type=${it.javaClass.simpleName}")
+        }
+    }
 
-    private fun serviceReload(expectedAttempt: MainKernelAttempt<CommandServer>?) {
-        val (attempt, server) = synchronized(this) {
-            val current = mainAttempt?.takeIf {
-                (expectedAttempt == null || it === expectedAttempt) && !it.revoked && state == ServiceState.Started
-            } ?: return
-            Pair(current, commandServer ?: return)
-        }
-        // 系统发起的核没有桥配置 ⇒ 与起核同源，读 Rust 落盘的那一份。
-        val config = VpnBridge.currentConfig()
-            ?: runCatching { SystemStart.load(service) }.getOrElse {
-                setReloadError(attempt, server, it)
-                return
-            }
-        try {
-            SystemEndpointGuard.requireSupported(config)
-            MainDualModeEndpointTombstone.requireReloadAllowed(attempt.dualModeApiPort != null, config)
-        } catch (_: DualModeEndpointTombstone.ReloadRequiresReconnect) {
-            // Native reload would create a new core at the old management endpoint.
-            // Keep the current core alive; a bridge Start must allocate a fresh port.
-            Log.w(TAG, "双态内核重载被拒；保持现有连接，请通过应用重新连接")
-            runCatching { showReconnectNotice(attempt) }
-                .onFailure { Log.e(TAG, "重连提醒失败，保持现有连接", it) }
-            return
-        } catch (error: Exception) {
-            setReloadError(attempt, server, error)
-            return
-        }
-        runCatching { TransientSpeedtestHost.withMainStart(attempt, { synchronized(this) {
-            mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
-        } }) {
-            AndroidNativeMain.construct(attempt) {
-                TransientLoginHost.withMainConfig(attempt, config, { synchronized(this) {
-                    mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server
-                } }) {
-                    SystemStart.requireLegacyAllowed(service)
-                    server.startOrReloadService(config, OverrideOptions())
-                    SystemStart.requireLegacyAllowed(service)
+    private fun serviceReload(expectedAttempt: MainKernelAttempt<CommandServer>) {
+        val attempt = expectedAttempt
+        AndroidNativeMain.controls.reload(
+            attempt,
+            target = { synchronized(this) {
+                if (mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started &&
+                    MainKernelAttemptRegistry.isCurrent(attempt)) commandServer else null
+            } },
+            allowed = { server -> isReloadCurrent(attempt, server) },
+            // 系统发起的核没有桥配置 ⇒ 与起核同源，读 Rust 落盘的那一份。
+            loadConfig = { VpnBridge.currentConfig() ?: SystemStart.load(service) },
+            preflight = { config ->
+                SystemEndpointGuard.requireSupported(config)
+                MainDualModeEndpointTombstone.requireReloadAllowed(attempt.dualModeApiPort != null, config)
+            },
+            withHosts = { server, config, nativeReload ->
+                TransientSpeedtestHost.withMainStart(attempt, { isReloadCurrent(attempt, server) }) {
+                    TransientLoginHost.withMainConfig(attempt, config, { isReloadCurrent(attempt, server) }) {
+                        SystemStart.requireLegacyAllowed(service)
+                        nativeReload()
+                    }
                 }
-            }
-        } }
-            .onFailure {
-                Log.e(TAG, "重载失败", it)
-                setReloadError(attempt, server, it)
-            }
+            },
+            nativeReload = { server, config ->
+                // construct enters admission before OverrideOptions' first JNI allocation.
+                server.startOrReloadService(config, OverrideOptions())
+                SystemStart.requireLegacyAllowed(service)
+            },
+            setError = { server, error -> setReloadError(server, error) },
+            reconnectNotice = {
+                Log.w(TAG, "双态内核重载被拒；保持现有连接，请通过应用重新连接")
+                showReconnectNotice(attempt)
+            },
+            logFailure = { Log.e(TAG, "重载失败 type=${it.javaClass.simpleName}") },
+        )
     }
 
-    private fun setReloadError(attempt: MainKernelAttempt<CommandServer>, server: CommandServer, error: Throwable) {
+    private fun isReloadCurrent(attempt: MainKernelAttempt<CommandServer>, server: CommandServer): Boolean =
         synchronized(this) {
-            if (mainAttempt === attempt && !attempt.revoked && commandServer === server) {
-                runCatching { server.setError("android: reload: ${error.message}") }
-            }
+            mainAttempt === attempt && !attempt.revoked && state == ServiceState.Started && commandServer === server &&
+                MainKernelAttemptRegistry.isCurrent(attempt)
         }
+
+    /** Only the same entered control boundary may call this; it checks exact ownership under operationLock. */
+    private fun setReloadError(server: CommandServer, error: Throwable) {
+        server.setError("android: reload: ${error.message}")
     }
 
     private fun showReconnectNotice(attempt: MainKernelAttempt<CommandServer>) {
@@ -587,7 +587,7 @@ class BoxService(
             if (mainAttempt !== attempt || !MainKernelAttemptRegistry.isCurrent(attempt)) return
             if (failure != null) {
                 AndroidNativeMain.unknown(attempt)
-                runCatching { commandServer?.setError("android: close service failed") }
+                Log.e(TAG, "主核关闭回执失败 component=${safeCloseFailureComponent(failure)} type=${failure.javaClass.simpleName}")
                 closeFailed = true
                 VpnBridge.finishStop("android: 内核关闭失败")
                 return

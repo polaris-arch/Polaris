@@ -22,7 +22,9 @@ class DualModeEndpointWiringTest {
         val guard = reload.indexOf("requireReloadAllowed(attempt.dualModeApiPort != null, config)")
         val nativeReload = reload.indexOf("server.startOrReloadService(config, OverrideOptions())")
         assertTrue(guard >= 0 && guard < nativeReload)
-        assertTrue(reload.contains("catch (_: DualModeEndpointTombstone.ReloadRequiresReconnect)"))
+        val producer = File("src/main/java/com/polaris2/app/vpn/AndroidNativeMainControls.kt").readText()
+        assertTrue(producer.contains("catch (_: DualModeEndpointTombstone.ReloadRequiresReconnect)"))
+        assertTrue(producer.contains("boundary.ifCurrent(reconnectNotice)"))
         assertTrue(reload.contains("showReconnectNotice(attempt)"))
     }
 

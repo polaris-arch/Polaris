@@ -7,6 +7,9 @@ internal object AndroidNativeMain {
         AndroidNativeProducer.MainSystem,
     )
 
+    val controls: AndroidNativeMainControls
+        get() = AndroidNativeMainControls(AndroidNativeAdmissionGate.ledger)
+
     fun reserveBridge(runId: String): AndroidNativeAdmission.Ticket =
         AndroidNativeAdmissionGate.ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, runId)
 

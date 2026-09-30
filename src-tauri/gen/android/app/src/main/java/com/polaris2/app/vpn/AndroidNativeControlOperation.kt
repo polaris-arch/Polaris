@@ -36,9 +36,8 @@ internal class AndroidNativeControlOperation private constructor(
             } else ledger.cancelBeforeBirth(ticket)
             true
         } catch (failure: Throwable) {
-            if (boundary.entered) ledger.unknown(ticket)
-            else ledger.cancelBeforeBirth(ticket)
-            boundary.rememberFailure(failure)
+            if (!boundary.entered) ledger.cancelBeforeBirth(ticket)
+            boundary.recordFailure(failure)
             throw checkNotNull(boundary.firstFailure)
         } finally {
             boundary.active = false
@@ -53,6 +52,7 @@ internal class AndroidNativeControlOperation private constructor(
         internal var active = true
         internal var firstFailure: Throwable? = null
             private set
+        private var constructionEntered = false
 
         internal fun rememberFailure(failure: Throwable) {
             val first = firstFailure
@@ -63,6 +63,22 @@ internal class AndroidNativeControlOperation private constructor(
         private fun requireCurrent() {
             check(active && Thread.holdsLock(attempt.operationLock)) { "native control boundary has ended" }
             if (attempt.revoked || !allowed()) throw Revoked()
+        }
+
+        /** Pure preflight before Host claims/preemption; native entry still rechecks later. */
+        fun requireBirthAllowed() {
+            requireCurrent()
+            if (!ledger.birthAllowed(ticket)) throw ledger.admissionRejection()
+        }
+
+        internal fun recordFailure(failure: Throwable) {
+            check(active && Thread.holdsLock(attempt.operationLock)) { "native control boundary has ended" }
+            if (entered) ledger.unknown(ticket)
+            if (constructionEntered) {
+                attempt.markConstructionUnknown()
+                attempt.nativeTicket?.let(ledger::unknown)
+            }
+            rememberFailure(failure)
         }
 
         private fun enterNative() {
@@ -79,8 +95,7 @@ internal class AndroidNativeControlOperation private constructor(
             try {
                 return action()
             } catch (failure: Throwable) {
-                ledger.unknown(ticket)
-                rememberFailure(failure)
+                recordFailure(failure)
                 throw failure
             }
         }
@@ -89,6 +104,7 @@ internal class AndroidNativeControlOperation private constructor(
         fun <T> construct(action: () -> T): T {
             require(ticket.kind == AndroidNativeAdmission.Kind.TargetlessReload)
             enterNative()
+            constructionEntered = true
             try {
                 return AndroidNativeMain.construct(ledger, attempt) {
                     val result = action()
@@ -96,15 +112,14 @@ internal class AndroidNativeControlOperation private constructor(
                     result
                 }
             } catch (failure: Throwable) {
-                ledger.unknown(ticket)
-                rememberFailure(failure)
+                recordFailure(failure)
                 throw failure
             }
         }
 
         /** Keep the first error even if setError itself is rejected, revoked, or throws. */
         fun reportFailure(firstFailure: Throwable, report: () -> Unit) {
-            rememberFailure(firstFailure)
+            recordFailure(firstFailure)
             try { native(report) }
             catch (reportFailure: Throwable) { rememberFailure(reportFailure) }
         }
