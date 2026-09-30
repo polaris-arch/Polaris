@@ -9,6 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -134,12 +135,51 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const pkg = workflow('package.yml');
     const pkgJob = executable(jobBlock(pkg, 'package'));
     expect(pkgJob, '剥注释后 package 块空了 —— 取材面塌了').toMatch(/^\s+if:/m);
-    expect(pkgJob).toContain('needs: [setup]');
+    expect(pkgJob).toContain('needs: [setup, desktop_core]');
+    const coreJob = executable(jobBlock(pkg, 'desktop_core'));
+    expect(coreJob).toContain('needs: setup');
+    expect(coreJob).toContain('uses: ./.github/workflows/desktop-core.yml');
+    expect(coreJob).toContain('candidate: ${{ needs.setup.outputs.candidate }}');
+    expect(pkgJob).toContain("needs.setup.result == 'success'");
+    expect(pkgJob).toContain("needs.desktop_core.result == 'success'");
+    expect(pkgJob).toContain("needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''");
     // needs 即等待。package 一旦能读到 needs.ci/needs.ui，就说明它在等两门，并行拓扑已被推翻。
     expect(
       pkgJob,
       'package job 引用了 needs.ci / needs.ui —— 它又串回门后面了',
     ).not.toMatch(/needs\.(ci|ui)\./);
+  });
+
+  it('复用 bundle 的真实 setup 前置只接受同 candidate、run 和 attempt', () => {
+    const resolve = stepBlock(jobBlock(workflow('package.yml'), 'setup'), 'Resolve platform matrix');
+    expect(resolve).toContain('EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}');
+    expect(resolve).toContain('CORE_CANDIDATE: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}');
+    expect(resolve).toContain('CORE_RUN_ID: ${{ github.run_id }}');
+    expect(resolve).toContain('CORE_RUN_ATTEMPT: ${{ github.run_attempt }}');
+    const runAt = resolve.indexOf('\n        run: |\n');
+    const matrixAt = resolve.indexOf('\n          all=', runAt);
+    expect(runAt).toBeGreaterThan(0);
+    expect(matrixAt).toBeGreaterThan(runAt);
+    // Only the actual identity prelude runs: no matrix tools, producers or workflow jobs.
+    const script = resolve.slice(runAt + '\n        run: |\n'.length, matrixAt)
+      .split('\n').map((line) => line.slice(10)).join('\n');
+    const candidate = 'a'.repeat(40);
+    const base = {
+      CORE_CANDIDATE: candidate, EXPECTED_CANDIDATE: candidate,
+      CORE_RUN_ID: '12', CORE_RUN_ATTEMPT: '3',
+      CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-3`,
+    };
+    const cases: [string, Record<string, string>, number][] = [
+      ['exact reuse', {}, 0], ['standalone producer', { CORE_BUNDLE_ARTIFACT: '' }, 0],
+      ['different candidate', { CORE_CANDIDATE: 'b'.repeat(40) }, 1],
+      ['malformed candidate', { CORE_CANDIDATE: 'not-a-commit' }, 1],
+      ['previous run', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-11-3` }, 1],
+      ['previous attempt', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-2` }, 1],
+    ];
+    for (const [name, changed, status] of cases) {
+      const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...base, ...changed }, encoding: 'utf8' });
+      expect(result.status, `${name}: ${result.stderr}`).toBe(status);
+    }
   });
 
   it('发布 DAG 必须是桌面草稿 → 签名 APK → 全量核验公开，且取消态一律不放行', () => {

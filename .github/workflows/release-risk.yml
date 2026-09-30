@@ -259,12 +259,14 @@ jobs:
 
   gate:
     name: release risk gate
-    needs: [classify, preflight, package, android, pc_runtime_release_policy]
+    needs: [classify, desktop_core, preflight, package, android, pc_runtime_release_policy]
     if: always()
     runs-on: ubuntu-22.04
     env:
       CLASSIFY_RESULT: ${{ needs.classify.result }}
       PC_RUNTIME_POLICY_RESULT: ${{ needs.pc_runtime_release_policy.result }}
+      DESKTOP_CORE_REQUIRED: ${{ needs.classify.outputs.preflight }}
+      DESKTOP_CORE_RESULT: ${{ needs.desktop_core.result }}
       PREFLIGHT_REQUIRED: ${{ needs.classify.outputs.preflight }}
       PREFLIGHT_RESULT: ${{ needs.preflight.result }}
       PACKAGE_REQUIRED: ${{ needs.classify.outputs.has_package }}
@@ -290,6 +292,10 @@ jobs:
           #      这里把它升级成「当场红 + 点名 scope」，让补登记成为合入的前置条件。
           [ -z "$UNREGISTERED" ] || {
             echo "::error::未登记的影响面 scope：$UNREGISTERED"; exit 1; }
+          if [ "$DESKTOP_CORE_REQUIRED" = true ] && [ "$DESKTOP_CORE_RESULT" != success ]; then
+            echo "::error::四平台内核源码产物未通过：$DESKTOP_CORE_RESULT"
+            exit 1
+          fi
           if [ "$PREFLIGHT_REQUIRED" = true ] && [ "$PREFLIGHT_RESULT" != success ]; then
             echo "::error::发布预检未通过：$PREFLIGHT_RESULT"
             exit 1
@@ -304,4 +310,4 @@ jobs:
             echo "::error::Android APK 腿未通过：$ANDROID_RESULT"
             exit 1
           fi
-          echo "发布风险门通过：preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT"
+          echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT"

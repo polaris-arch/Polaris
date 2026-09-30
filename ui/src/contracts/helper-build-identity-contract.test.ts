@@ -14,22 +14,42 @@ import { productionRsFilesUnder } from './rust-source.test-support';
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const read = (rel: string): string => readFileSync(join(REPO_ROOT, rel), 'utf8');
 
-describe('W24：app/helper 共享出包构建身份', () => {
-  it('package job 以 job-level env 把 github.sha 同时注入 helper 与 app', () => {
-    const workflow = read('.github/workflows/package.yml');
-    const packageStart = workflow.indexOf('\n  package:');
-    const releaseStart = workflow.indexOf('\n  release:', packageStart + 1);
-    expect(packageStart, 'package job 消失').toBeGreaterThanOrEqual(0);
-    const packageJob = workflow.slice(packageStart, releaseStart === -1 ? undefined : releaseStart);
+function checkPackageBuildIdentity(workflow: string): void {
+  const packageStart = workflow.indexOf('\n  package:');
+  expect(packageStart, 'package job 消失').toBeGreaterThanOrEqual(0);
+  const rest = workflow.slice(packageStart + 1);
+  const next = rest.slice(1).search(/\n {2}[a-z][a-z0-9_-]*:\n/);
+  expect(next, 'package 的同级后继消失，取材不得延伸到后续发布 job').toBeGreaterThan(0);
+  const packageJob = rest.slice(0, next + 1)
+    .split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
 
-    expect(
-      packageJob.includes('env:\n      POLARIS_BUILD_ID: ${{ github.sha }}'),
-      'POLARIS_BUILD_ID 必须在 package job 级注入；只放 helper 或 tauri 单步会让两侧身份分叉',
-    ).toBe(true);
-    expect(packageJob.includes('cargo build --release -p polaris-helper'), 'helper 构建腿消失').toBe(
-      true,
-    );
-    expect(packageJob.includes('uses: tauri-apps/tauri-action@v1'), 'app 构建腿消失').toBe(true);
+  expect(
+    packageJob.includes('    env:\n      POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}'),
+    'POLARIS_BUILD_ID 必须在 package job 级注入；只放 helper 或 tauri 单步会让两侧身份分叉',
+  ).toBe(true);
+  expect(packageJob).toContain('      CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}');
+  expect(packageJob).toContain('ref: ${{ needs.setup.outputs.candidate }}');
+  expect(packageJob.match(/^\s+POLARIS_BUILD_ID:/gm) ?? [], 'step 不得覆盖共享 build id').toHaveLength(1);
+  expect(packageJob.includes('cargo build --release -p polaris-helper'), 'helper 构建腿消失').toBe(
+    true,
+  );
+  expect(packageJob.includes('uses: tauri-apps/tauri-action@v1'), 'app 构建腿消失').toBe(true);
+}
+
+describe('W24：app/helper 共享出包构建身份', () => {
+  it('package job 以 job-level env 把 resolved candidate 同时注入 helper 与 app', () => {
+    checkPackageBuildIdentity(read('.github/workflows/package.yml'));
+  });
+
+  it('checkout/build id 漂移到 merge SHA 或被 step 覆盖均拒绝', () => {
+    const workflow = read('.github/workflows/package.yml');
+    for (const changed of [
+      workflow.replace('POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}', 'POLARIS_BUILD_ID: ${{ github.sha }}'),
+      workflow.replace('ref: ${{ needs.setup.outputs.candidate }}', 'ref: ${{ github.sha }}'),
+      workflow.replace('uses: tauri-apps/tauri-action@v1', 'uses: tauri-apps/tauri-action@v1\n        env:\n          POLARIS_BUILD_ID: stale-build'),
+    ]) {
+      expect(() => checkPackageBuildIdentity(changed)).toThrow();
+    }
   });
 
   it('shared crate 是唯一读取 POLARIS_BUILD_ID 的 Rust 真值点', () => {

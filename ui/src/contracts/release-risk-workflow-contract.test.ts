@@ -168,12 +168,20 @@ esac
   });
 
   it('自动安装包验证复用 Package，但不上传产物也不重复内核门', () => {
-    expect(risk).toContain('uses: ./.github/workflows/package.yml');
-    expect(risk).toContain('needs: [classify, preflight]');
-    expect(risk).toContain("needs.preflight.result == 'success'");
     const pkgJob = jobSection(risk, 'package', 'release-risk.yml');
     // 切片自检：拿到的确实是这个 job，且没有把下一个 job 卷进来。
     expect(pkgJob).toContain('uses: ./.github/workflows/package.yml');
+    expect(pkgJob).toContain('needs: [classify, preflight, desktop_core]');
+    expect(pkgJob).toContain("needs.preflight.result == 'success'");
+    expect(pkgJob).toContain('core_candidate: ${{ needs.classify.outputs.candidate }}');
+    expect(pkgJob).toContain('core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}');
+    const coreJob = jobSection(risk, 'desktop_core', 'release-risk.yml');
+    expect(coreJob).toContain("if: needs.classify.outputs.preflight == 'true'");
+    expect(coreJob).toContain('candidate: ${{ needs.classify.outputs.candidate }}');
+    const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
+    expect(preflight).toContain('needs: [classify, desktop_core]');
+    expect(preflight).toContain('ref: ${{ needs.classify.outputs.candidate }}');
+    expect(preflight).toContain('name: ${{ needs.desktop_core.outputs.artifact_name }}');
     expect(pkgJob).not.toContain('name: release risk gate');
     expect(pkgJob).toMatch(/permissions:\n\s+contents: write/);
     expect(risk).toContain('run_kernel_gates: false');
@@ -316,6 +324,12 @@ esac
     ].sort();
     expect(selectors.length, '一个 classify 选择开关都没枚举到 —— 取材面塌了').toBeGreaterThan(3);
     for (const selector of selectors) {
+      // candidate is immutable event identity, not a classifier decision or
+      // impact-step bool. Its original provenance must remain explicit.
+      if (selector === 'candidate') {
+        expect(classify).toContain('candidate: ${{ github.event.pull_request.head.sha || github.sha }}');
+        continue;
+      }
       expect(
         classify,
         `classify job 没有声明 output \`${selector}\` —— 引用它的地方恒为空串`,
@@ -324,6 +338,46 @@ esac
         classify,
         `impact step 没有写出 \`${selector}\` —— output 声明了但没人赋值`,
       ).toContain(`echo "${selector}=`);
+    }
+  });
+
+  it('真实最终 gate 对选中的 desktop_core 只接受 success，未选中允许 skipped', () => {
+    const gate = risk.slice(risk.indexOf('\n  gate:\n'));
+    expect(gate).toContain('DESKTOP_CORE_REQUIRED: ${{ needs.classify.outputs.preflight }}');
+    expect(gate).toContain('DESKTOP_CORE_RESULT: ${{ needs.desktop_core.result }}');
+    const runAt = gate.indexOf('        run: |\n');
+    expect(runAt).toBeGreaterThan(0);
+    const script = gate.slice(runAt + '        run: |\n'.length)
+      .split('\n').map((line) => line.slice(10)).join('\n');
+    const base = {
+      CLASSIFY_RESULT: 'success', PC_RUNTIME_POLICY_RESULT: 'success', UNREGISTERED: '',
+      DESKTOP_CORE_REQUIRED: 'true', DESKTOP_CORE_RESULT: 'success',
+      PREFLIGHT_REQUIRED: 'true', PREFLIGHT_RESULT: 'success',
+      PACKAGE_REQUIRED: 'true', PACKAGE_RESULT: 'success',
+      ANDROID_REQUIRED: 'true', ANDROID_RESULT: 'success',
+    };
+    const run = (body: string, required: string, result: string) => spawnSync('bash', ['-c', body], {
+      env: { ...process.env, ...base, DESKTOP_CORE_REQUIRED: required, DESKTOP_CORE_RESULT: result },
+      encoding: 'utf8',
+    });
+    const check = (body: string) => {
+      expect(run(body, 'true', 'success').status).toBe(0);
+      expect(run(body, 'false', 'skipped').status).toBe(0);
+      for (const result of ['failure', 'cancelled', 'skipped', '']) {
+        const actual = run(body, 'true', result);
+        expect(actual.status, `selected desktop_core=${result}: ${actual.stdout}`).toBe(1);
+        expect(actual.stdout).toContain('四平台内核源码产物未通过：');
+      }
+    };
+    check(script);
+    // The same actual shell controls must catch permissive status tests and
+    // a guard that observes the result but exits successfully.
+    for (const changed of [
+      script.replace('[ "$DESKTOP_CORE_RESULT" != success ]', '[ "$DESKTOP_CORE_RESULT" = failure ]'),
+      script.replace('echo "::error::四平台内核源码产物未通过：$DESKTOP_CORE_RESULT"\n  exit 1', 'echo "::error::四平台内核源码产物未通过：$DESKTOP_CORE_RESULT"\n  exit 0'),
+    ]) {
+      expect(changed).not.toBe(script);
+      expect(() => check(changed)).toThrow();
     }
   });
 
