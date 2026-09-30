@@ -167,7 +167,7 @@ fn valid_id(value: &str, max_utf16_units: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runtime::proxy::android_drain::{verify, AndroidDrainReceipt, REQUIRED_PRODUCERS};
     use serde_json::{json, Value};
 
     fn receipt() -> Value {
