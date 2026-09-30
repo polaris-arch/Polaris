@@ -60,6 +60,74 @@ this change has no APK or device validation.
 No partial implementation may clear `historicUnknown`,
 Tailscale custody, or enable managed routing.
 
+## Proposed main control contract (production wiring pending core review)
+
+The current primary factory supplies `AttemptHandler(attempt, this)` to
+`newStrictCommandServer`. Go's `ManagedService.StopService/ReloadService` calls
+the same server's `platformHandler`, which forwards to that captured handler.
+Its Stop therefore already names the original attempt. The default
+`BoxService.serviceStop/serviceReload` methods still select the current attempt
+at delivery, and reload currently reuses only the main owner ticket. This
+proposal does not change those production methods yet or add capabilities.
+
+`AndroidNativeControlOperation` is a pure seam for this proposed contract:
+
+* An exact reload reserves an independent `TargetlessReload` operation ticket
+  when its callback arrives, before any queue or config I/O. This kind represents
+  callback work for both `main.reload` and `control.targetlessReload`; it does
+  not replace the main owner ticket or prove release of a core.
+* The captured attempt and server must still be the exact Started owner. The
+  operation holds that attempt's existing `operationLock`; Stop revokes it
+  immediately and its close worker joins the same lock. Each JNI boundary checks
+  the exact target again. `enterBirth` occurs before the callback's first JNI,
+  including `setError`, and rejects a reservation sealed or capacity-closed
+  while queued. Main/transient ownership helpers must not be disrupted before
+  this operation's admission check; their existing cleanup/claim order stays
+  unchanged when the production adapter is installed.
+* Pure configuration preflight and the dual-mode reload tombstone run before
+  native construction. The ordinary reconnect notice keeps the live core and
+  remains tied to the original attempt/notice owner. Hot mode switching still
+  uses its existing management API and is not converted into reload or restart.
+* A normal config-load/preflight error may be published through `setError` only
+  after this same operation enters admission and the original target is still
+  current. If seal, capacity, or revocation forbids that JNI, retain the original
+  error for fixed-label logging; never route it to a successor. No new UI error
+  surface is proposed. Existing safe load errors remain visible through native
+  `setError` while admission and exact ownership permit it.
+* A construction throw or revoked return records main-owner construction
+  `Unknown` under `operationLock`, as today, and records operation `Unknown`
+  before attempting `setError`. Error reporting uses the same entered operation;
+  its success cannot clear `Unknown`, and its failure cannot replace the first
+  error. Ordinary error-report failure does not assert construction uncertainty
+  for a core that was never reloaded.
+* Only the real synchronous callback/native work returning with its exact target
+  still current can complete an entered operation. Pure refusal cancels before
+  birth. A stalled callback remains captured and nonterminal; a Stop timeout
+  cannot complete it, remove it, or release its owner. Its later revoked return
+  remains `Unknown`, even if exact operational Close subsequently succeeds.
+* Default targetless callbacks have no trustworthy owner identity and must
+  decline without resolving the current owner. A successful reservation is
+  cancelled before birth; rejected admission performs no JNI. The production
+  captured Stop, user Stop, revoke, and destroy still close their existing exact
+  owner without reserving a new operation or entering new birth. Seal and
+  capacity closure must not block that cleanup.
+
+The seam tests exercise the actual helper with fake JNI latches and real
+`MainKernelAttempt`/ledger state, including queued seal/capacity rejection,
+first-error preservation, original owner revocation, and late error/notice
+delivery. Production call-site and all-entry validation remain a separate
+reviewed slice. Until that slice is complete, wiring remains **4/11**; this
+contract and helper emit no global `NoOwner` or Tailscale custody receipt.
+
+Control-contract seam validation (2026-09-30): the first targeted run passed
+14 tests after compiling the actual Android Kotlin sources. After adding two
+first-error/target-check cases, full `:app:testUniversalDebugUnitTest` passed
+167 tests in 15 suites, including all 16 control seam cases; failures, errors,
+and skipped tests were zero. `node scripts/check-android-bridge.mjs` passed all
+31 commands and `git diff --check` passed. `BoxService.kt` and
+`AndroidNativeMain.kt` are unchanged in this contract-only slice. These receipts
+do not validate a production reload adapter or device callback lifecycle.
+
 Validation of the preceding main/Service follow-up (2026-09-30): full
 `:app:testUniversalDebugUnitTest` passed 83 tests in 11 suites, with no failures,
 errors, or skipped tests. `node scripts/check-android-bridge.mjs` passed all
