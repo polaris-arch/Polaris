@@ -1,9 +1,9 @@
 diff --git a/experimental/libbox/dns_lifecycle.go b/experimental/libbox/dns_lifecycle.go
 new file mode 100644
-index 0000000..abd1246
+index 0000000..fb1df7f
 --- /dev/null
 +++ b/experimental/libbox/dns_lifecycle.go
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,171 @@
 +package libbox
 +
 +import (
@@ -26,6 +26,8 @@ index 0000000..abd1246
 +
 +func newDNSCancelRegistration(ctx context.Context, callback func() error) *dnsCancelRegistration {
 +	r := &dnsCancelRegistration{callback: callback, finished: make(chan struct{})}
++	// A pre-canceled context can launch invoke immediately. Publish stop under
++	// the same lock it takes before consuming callback, with finished ready first.
 +	r.access.Lock()
 +	r.stop = context.AfterFunc(ctx, r.invoke)
 +	r.access.Unlock()
@@ -175,10 +177,10 @@ index 0000000..abd1246
 +}
 diff --git a/experimental/libbox/dns_lifecycle_test.go b/experimental/libbox/dns_lifecycle_test.go
 new file mode 100644
-index 0000000..59fd578
+index 0000000..e341849
 --- /dev/null
 +++ b/experimental/libbox/dns_lifecycle_test.go
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,229 @@
 +package libbox
 +
 +import (
@@ -215,6 +217,31 @@ index 0000000..59fd578
 +	runtime.GC()
 +	if invoked.Load() != 0 || runtime.NumGoroutine() > before+4 {
 +		t.Fatal("successful Background queries retained cancellation waiters")
++	}
++}
++
++func TestDNSPreCancelledRegistrationAndRepeatedStopShareCompletion(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	entered, release := make(chan struct{}), make(chan struct{})
++	registration := newDNSCancelRegistration(ctx, func() error { close(entered); <-release; return nil })
++	awaitDNSFinished(t, entered)
++	first, second := registration.stopAndDetach(), registration.stopAndDetach()
++	if first != second {
++		t.Fatal("repeated stop manufactured another completion state")
++	}
++	select {
++	case <-second:
++		t.Fatal("already-stopped association was mistaken for callback exit")
++	default:
++	}
++	close(release)
++	awaitDNSFinished(t, first)
++	awaitDNSFinished(t, registration.stopAndDetach())
++	registration.access.Lock()
++	defer registration.access.Unlock()
++	if registration.callback != nil || registration.stop != nil {
++		t.Fatal("initial registration publication resurrected completed references")
 +	}
 +}
 +
