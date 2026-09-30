@@ -859,6 +859,17 @@ for (const [structName, rust] of rustStructs) {
     );
   }
 }
+// The fence factory is shared by one typed command. A local generic `Response`
+// in an unrelated call must never become its serde contract by name alone.
+const fenceFields = ['fenceId', 'processNonce', 'state', 'runId', 'closedRunId', 'reason'];
+const fenceResponse = rustStructs.get('AndroidLegacyDrainStatus');
+const fenceFactory = kotlinFnBody(pluginKtSrc, 'response');
+if (!fenceResponse || !fenceFactory || !sameSet(fenceResponse.wireFields, fenceFields) ||
+    !sameSet(allPutKeys(fenceFactory), fenceFields) ||
+    !rustCalls.some(call => call.command === 'legacyDrainStatus' && call.responseType === 'AndroidLegacyDrainStatus') ||
+    !(kotlinCommands.get('legacyDrainStatus')?.body ?? '').includes('invoke.resolve(LegacySystemStartFence.response(id))')) {
+  fail('A12 legacyDrainStatus must consume the exact six-field fence factory through its actual typed response');
+}
 if (elementContracts < 1) {
   fail(
     `A12 FLOOR：一个「工厂 ⇄ 同名结构体」配对都没对拍到（下限 1：installedApp ⇄ InstalledApp）。` +
@@ -1424,7 +1435,7 @@ a14SelfCheck();
       !command.includes('#[cfg(not(all(target_os = "android", debug_assertions)))]') || !command.includes('Debug Android batch QA is disabled')) fail('A15 Rust release/non-Android disabled stub missing');
 }
 
-// A16: native Debug loan remains a source-only, exact Start/session credential projection.
+// A16: native Debug loan keeps exact Start/session credential and private sender admission.
 {
   const loanRust = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/android_probe_loan.rs'), 'utf8'));
   const startRust = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/startup.rs'), 'utf8'));
@@ -1445,13 +1456,14 @@ a14SelfCheck();
       fail(`A16 ${name} must guard Release and admit its original ticket before queueing`);
   }
   const fields = ['bootNonce', 'sessionId', 'nonce', 'planSha256', 'apkSha256', 'expectedSourcePin', 'generation',
-    'runId', 'birthNonce', 'revision', 'configDigest', 'deadlineElapsed', 'probePort', 'expiresElapsed', 'password'];
+    'runId', 'birthNonce', 'revision', 'configDigest', 'deadlineElapsed', 'probePort', 'ingressKind',
+    'pcReadyRequestId', 'expiresElapsed', 'password'];
   const rustFields = rustStructs.get('DebugCoreProbeLoanPayload')?.wireFields ?? [];
   const argsBody = /class DebugCoreProbeLoanArgs\s*\{([\s\S]*?)override fun toString/.exec(loanKt)?.[1] ?? '';
   const ktFields = [...argsBody.matchAll(/(?:lateinit\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*:/g)].map(m => m[1]);
   if ([rustFields, ktFields].some(actual => actual.length !== fields.length || fields.some(f => !actual.includes(f))))
     fail('A16 native loan exact wire field set differs between Rust and Kotlin');
-  if (!startRust.includes('self.record_android_probe_start(my_gen, &android_birth, &receipt)') ||
+  if (!/self\.record_android_probe_start\(\s*my_gen\s*,\s*&android_birth\s*,\s*&receipt\s*,\s*&gate_config_json\s*,?\s*\)/.test(startRust) ||
       !startRust.includes('self.publish_android_probe_snapshot(') || !loanRust.includes('receipt.config_digest.clone()') ||
       !loanRust.includes('with_current_generation(b.generation') || !loanRust.includes('s.android_probe_input.as_ref() != Some(b)') ||
       /local_http_proxy\(|current_config|startup_snapshot|config\.current\(/.test(loanRust))
@@ -1460,11 +1472,19 @@ a14SelfCheck();
   if (!init || init.includes('invoke_handler') || /password|probe_port|DebugCoreProbeLoanArgs/.test(command))
     fail('A16 credential loan must stay native-only; no JS plugin handler or public secret/port input');
   const privateTask = kotlinFnBody(qa, 'privateProbeTask') ?? '';
+  const senderTask = kotlinFnBody(qa, 'coreProbeLoanTask') ?? '';
   if (!privateTask.includes('original.lease.commandBorn("probe")') || !privateTask.includes('session.lease.publish(buffer)') ||
       !privateTask.includes('DebugCoreProbeCredentialBuffer') || !loanKt.includes('witness.snapshotFor(owner, server)') ||
-      !loanKt.includes('synchronized(owner.operationLock)') || !qa.includes('"coreProbeTransport", "NotObserved"') ||
+      !loanKt.includes('synchronized(owner.operationLock)') ||
       /java\.net\.|Socket\(|CONNECT|bindProcessToNetwork|\.protect\(/.test(loanKt))
-    fail('A16 loan must retain original queued credential, actual Main witness and source-only no-transport boundary');
+    fail('A16 loan must retain original queued credential, actual Main witness and no transport factory in the loan');
+  if (!senderTask.includes('it.requestId == args.pcReadyRequestId') ||
+      !senderTask.includes('it.current(SystemClock.elapsedRealtime())') ||
+      !senderTask.includes('loan.isCurrent(SystemClock.elapsedRealtime(), DebugCoreProbeLoan.currentInput())') ||
+      !senderTask.includes('DebugPcEchoSender.run(loan, ready, session.lease, channel, session::allowed)') ||
+      !loanRust.includes('loan.pc_ready_request_id = admitted.request_id().to_owned();') ||
+      !loanRust.includes('loan.expires_elapsed = loan.expires_elapsed.min(admitted.deadline_elapsed());'))
+    fail('A16 private sender must bind the admitted Ready request and deadline to the original current loan');
   const box = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/BoxService.kt'), 'utf8'));
   const nativeInput = kotlinFnBody(box, 'observeNativeInput') ?? '';
   const invalidate = nativeInput.indexOf('DebugBatchQa.nativeInputChanged(attempt)');

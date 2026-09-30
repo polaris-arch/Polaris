@@ -91,6 +91,7 @@ use dns_takeover::dns_takeover_enabled;
 // `commands::config` 经 `crate::runtime::proxy::StagedClassification` 取用的公开契约面（§B.3 零
 // 调用方改动），`SwitchSnapshot` / `TestPutSink` 是 `ProxyRuntime` 的字段类型（结构体定义按
 // §A.5 钉死在 façade）。
+use android_bridge::AndroidRequestBirth;
 #[cfg(test)]
 use hot_switch::TestPutSink;
 use hot_switch::{PendingSwitch, SwitchSnapshot};
@@ -1528,21 +1529,6 @@ pub struct ProxyRuntime {
     /// 当前核会话的逐目的绑定与接口事实。只用于判断网络变化后的降级/重规划，不写回用户配置。
     /// 停核、崩溃及新核接管时整体替换，禁止跨会话沿用陈旧接口名。
     runtime_binding_state: Mutex<RuntimeBindingState>,
-}
-
-/// The old Android bridge starts and stops through detached tasks. A dropped
-/// waiter or timeout leaves a request that may still mutate the service; no
-/// later global `stop: ()` ACK can clear that uncertainty for this registry.
-#[derive(Clone)]
-struct AndroidRequestBirth {
-    identity: Arc<()>,
-    main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
-}
-
-impl AndroidRequestBirth {
-    fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.identity, &other.identity)
-    }
 }
 
 struct AndroidGlobalCustody {

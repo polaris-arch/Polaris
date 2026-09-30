@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "polaris"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "block2",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-config-engine"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "polaris-helper-proto",
  "polaris-source-probe",
@@ -3226,7 +3226,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-core-supervisor"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "nix",
  "rustix",
@@ -3237,7 +3237,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-dns-race"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3248,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-helper"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "caps",
  "hex",
@@ -3267,7 +3267,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-helper-client"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "getrandom 0.4.3",
  "log",
@@ -3280,18 +3280,18 @@ dependencies = [
 
 [[package]]
 name = "polaris-helper-proto"
-version = "1.0.1"
+version = "1.0.0"
 
 [[package]]
 name = "polaris-log-budget"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "polaris-mesh"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "polaris-config-engine",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-net-stack"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "futures",
  "polaris-config-engine",
@@ -3319,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-platform-events"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "polaris-helper-proto",
  "polaris-system-integration",
@@ -3327,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-singbox-grpc"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -3346,11 +3346,11 @@ dependencies = [
 
 [[package]]
 name = "polaris-source-probe"
-version = "1.0.1"
+version = "1.0.0"
 
 [[package]]
 name = "polaris-stats-engine"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "indexmap 2.14.0",
  "polaris-config-engine",
@@ -3361,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-store"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "polaris-config-engine",
  "polaris-source-probe",
@@ -3374,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-switch-engine"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "polaris-config-engine",
@@ -3385,7 +3385,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-system-integration"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "log",
  "plist",
@@ -3400,7 +3400,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-unlock"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3412,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-unlock-transport"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3426,7 +3426,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-updater"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "hex",
  "polaris-helper-proto",

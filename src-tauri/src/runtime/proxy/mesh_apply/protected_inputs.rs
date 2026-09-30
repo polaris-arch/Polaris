@@ -4,9 +4,9 @@
 use super::check::CheckedCandidate;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::check::CHECK_PROFILE;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::{CandidateProfile, CheckSupport};
 use crate::runtime::config::ApplyInputSnapshot;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::runtime::proxy::mesh_apply::candidate::{CandidateProfile, CheckSupport};
 use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
 use std::path::Path;
 

@@ -34,6 +34,21 @@ use polaris_core_supervisor::config_gate::{verdict_from_libbox_check, ConfigChec
 use super::android_capacity::CapacityClosed;
 use super::code;
 
+/// The old Android bridge starts and stops through detached tasks. A dropped
+/// waiter or timeout leaves a request that may still mutate the service; no
+/// later global `stop: ()` ACK can clear that uncertainty for this registry.
+#[derive(Clone)]
+pub(super) struct AndroidRequestBirth {
+    pub(super) identity: std::sync::Arc<()>,
+    pub(super) main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+}
+
+impl AndroidRequestBirth {
+    pub(super) fn same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
 /// 桥的 Kotlin 侧插件标识（`register_android_plugin` 会拼成 `com/polaris2/app/vpn/PolarisVpnPlugin`）。
 #[cfg(target_os = "android")]
 const PLUGIN_IDENTIFIER: &str = "com.polaris2.app.vpn";
@@ -797,11 +812,11 @@ pub(super) async fn debug_pc_echo_prepare(
         session_id: String,
     }
     #[derive(serde::Deserialize)]
-    struct Response {
+    struct DebugPcEchoPrepareResponse {
         ready: super::debug_pc_echo::PrivatePcReady,
     }
     let plugin = plugin_handle().map_err(|_| "Current PC Ready unavailable".to_owned())?;
-    call_with_budget::<Response, _>(
+    call_with_budget::<DebugPcEchoPrepareResponse, _>(
         plugin,
         "debugPcEchoPrepare",
         Args { session_id },

@@ -1,7 +1,8 @@
 //! Native-only Debug credential projection. No new lifecycle/lease owner and no socket work.
 //! Start bytes come from AndroidStartReceipt, never current/saved user configuration.
-use super::android_bridge::{AndroidExactTarget, AndroidStartReceipt};
-use super::{AndroidRequestBirth, ProxyRuntime, SwitchSnapshot};
+use super::android_bridge::{AndroidExactTarget, AndroidRequestBirth, AndroidStartReceipt};
+use super::hot_switch::SwitchSnapshot;
+use super::ProxyRuntime;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) enum DebugCoreProbeIngressKind {

@@ -125,7 +125,8 @@ impl AdmittedPcEchoAttempt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runtime::proxy::android_probe_loan::DebugCoreProbeSessionScope;
+    use crate::runtime::proxy::debug_pc_echo::PrivatePcReady;
     fn scope() -> DebugCoreProbeSessionScope {
         DebugCoreProbeSessionScope {
             boot_nonce: "1".repeat(32),
