@@ -411,3 +411,38 @@ fn verifier_rejects_symlinked_rule_file_even_when_hash_matches() {
         ArtifactError::Invalid("artifact is not a regular file")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn canonical_fixture_root_does_not_admit_later_ancestor_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let base = tempdir();
+    let real_parent = base.join("real");
+    let alias_parent = base.join("alias");
+    fs::create_dir(&real_parent).unwrap();
+    symlink(&real_parent, &alias_parent).unwrap();
+    let dir = TestDir::new_in("owned-artifacts-", &alias_parent);
+    let plan = plan("canonical-fixture");
+    stage_artifacts(dir.path(), &plan, b"{}", &files(), "generator-1").unwrap();
+    verify_artifacts(dir.path(), &plan).unwrap();
+
+    // Only the fixture's own newly created root was resolved. The reader
+    // still refuses the original aliased path, despite identical bytes.
+    let aliased_dir = alias_parent.join(dir.path().file_name().unwrap());
+    assert_eq!(
+        verify_artifacts(&aliased_dir, &plan).unwrap_err(),
+        ArtifactError::Invalid("artifact parent is not a real directory")
+    );
+
+    // Replacing a descendant of the trusted root with a symlink must fail
+    // even when its target retains every staged byte and permission.
+    let root = dir.join("mesh-routes/plans/canonical-fixture");
+    let saved_rules = dir.join("saved-rules");
+    fs::rename(root.join("rules"), &saved_rules).unwrap();
+    symlink(&saved_rules, root.join("rules")).unwrap();
+    assert_eq!(
+        verify_artifacts(dir.path(), &plan).unwrap_err(),
+        ArtifactError::Invalid("artifact directory is not a real directory")
+    );
+}

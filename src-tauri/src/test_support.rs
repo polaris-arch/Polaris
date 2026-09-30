@@ -26,6 +26,10 @@ pub(crate) struct TestDir(PathBuf);
 
 impl TestDir {
     pub(crate) fn new(prefix: &str) -> Self {
+        Self::new_in(prefix, &std::env::temp_dir())
+    }
+
+    pub(crate) fn new_in(prefix: &str, parent: &Path) -> Self {
         assert!(
             !prefix.is_empty() && !prefix.contains(['/', '\\']),
             "测试临时目录前缀必须是单个安全路径段"
@@ -34,10 +38,14 @@ impl TestDir {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("{prefix}{}-{nonce}-{sequence}", std::process::id()));
+        let path = parent.join(format!("{prefix}{}-{nonce}-{sequence}", std::process::id()));
         std::fs::create_dir(&path).expect("测试临时目录必须唯一且可创建");
-        Self(path)
+        // Resolve only our newly created fixture root, including system temp
+        // aliases such as macOS /var. Artifact/source readers keep their own
+        // no-follow checks on every subsequently supplied path component.
+        let mut dir = Self(path);
+        dir.0 = std::fs::canonicalize(&dir.0).expect("测试自有临时目录必须可解析为真实路径");
+        dir
     }
 
     pub(crate) fn path(&self) -> &Path {

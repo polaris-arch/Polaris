@@ -52,6 +52,29 @@ fn removes_directory_during_panic_unwind() {
     assert!(!path.unwrap().exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn created_directory_under_a_temp_alias_owns_its_canonical_path() {
+    use std::os::unix::fs::symlink;
+
+    let base = TestDir::new("polaris-test-support-alias-");
+    let real_parent = base.join("real");
+    let alias_parent = base.join("alias");
+    std::fs::create_dir(&real_parent).unwrap();
+    symlink(&real_parent, &alias_parent).unwrap();
+    let owned_path;
+    {
+        let dir = TestDir::new_in("owned-", &alias_parent);
+        owned_path = dir.path().to_path_buf();
+        assert_eq!(owned_path, std::fs::canonicalize(&owned_path).unwrap());
+        assert_eq!(owned_path.parent(), Some(real_parent.as_path()));
+        std::fs::write(dir.join("sentinel"), b"owned").unwrap();
+    }
+    assert!(!owned_path.exists());
+    assert!(alias_parent.is_symlink());
+    assert!(real_parent.is_dir());
+}
+
 // ── 锚点：与调用方文件位置无关 ────────────────────────────────────────────
 
 /// 🔴 **本次改造的核心断言**：取材锚点钉在 crate 根，不随测试实体的深度移动。

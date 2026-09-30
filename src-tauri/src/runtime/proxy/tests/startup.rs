@@ -1023,13 +1023,14 @@ fn helper_upgrade_leg_is_wired_into_the_start_gate() {
     );
 }
 
-/// helper 起核路径：本机无 daemon → 起核失败；通信错误统一保留
+/// Linux helper 起核路径：无 daemon → 起核失败；通信错误统一保留
 /// helper route，因为同一个错误型也覆盖请求已写出但回包丢失。
-/// **本机安全**：`start_core` 在 build_client→UnixConnector 连不存在的 socket 时即 ENOENT 失败，
+/// 平台显式注入 Linux：Mac/Win 在 native capability 门失败，尚未建立 helper route。
+/// **本机安全**：`start_core` 使用进程内 NeverConnect 替身，连接必失败，
 /// **绝不 spawn 真核 / 建 TUN / 碰宿主网络**。
 #[tokio::test]
 async fn helper_start_without_daemon_keeps_unconfirmed_route() {
-    let (rt, dir) = test_runtime();
+    let (rt, dir) = test_runtime_on(Platform::Linux);
     let cfg_path = dir.join("singbox-runtime.json");
     std::fs::write(&cfg_path, "{}").ok();
     let binary = PathBuf::from("/nonexistent/sing-box");
@@ -1048,9 +1049,10 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     let r = rt
         .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
         .await;
+    let error = r.expect_err("无 helper daemon → 起核必失败（不静默直起）");
     assert!(
-        r.is_err(),
-        "本机无 helper daemon → 起核必失败（不静默直起）"
+        error.starts_with("helper 起核通信失败："),
+        "必须抵达所测的起核通信失败分支：{error}"
     );
     assert!(
         rt.core_via_helper.load(Ordering::SeqCst),
@@ -1058,6 +1060,41 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     );
     assert!(rt.pid.lock().unwrap().is_none(), "未知结果不得伪造 pid");
     assert!(rt.child.lock().unwrap().has_helper_start());
+}
+
+/// Mac/Win 的只读能力门失败发生在 Start custody 建立前；同一个通信替身不得被当作已发 Start。
+#[tokio::test]
+async fn helper_start_native_capability_failure_keeps_route_unarmed() {
+    for platform in [Platform::Mac, Platform::Win] {
+        let (rt, dir) = test_runtime_on(platform);
+        let cfg_path = dir.join("singbox-runtime.json");
+        std::fs::write(&cfg_path, "{}").unwrap();
+        let binary = PathBuf::from("/nonexistent/sing-box");
+        let user_config: UserConfig =
+            serde_json::from_value(polaris_store::default_config()).unwrap();
+        let my_gen = rt.gate.generation();
+        let ts_gate = rt.mesh.tailscale_state_gate().await;
+        let mut main = rt
+            .mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints": []}),
+                &ts_gate,
+                rt.mesh.mint_tailscale_main_birth(),
+            )
+            .await
+            .unwrap();
+        let error = rt
+            .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
+            .await
+            .expect_err("未连接 helper → native capability 不可确认");
+        assert!(
+            error.contains("已安装的 helper 未提供 native birth 安全能力"),
+            "必须抵达 native capability 拒绝分支：{error}"
+        );
+        assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+        assert!(rt.pid.lock().unwrap().is_none());
+        assert!(!rt.child.lock().unwrap().has_helper_start());
+    }
 }
 
 /// helper 起核路径：起核前已被更新的 start/stop 接管（世代变）→ 让位（`Ok(None)`）、不 IPC、不置标记。
