@@ -65,20 +65,17 @@ class DebugCoreProbeCommandCustodyTest {
         }
     }
 
-    @Test fun actualPrivateScopeAndLoanManagerAdmitRealWitnessThenEraseWithoutTransport() {
+    @Test fun actualPrivateManagerWithoutOriginalPcReadyErasesAndRejectsBeforeTransport() {
         assumeTrue(BuildConfig.DEBUG)
         SessionFixture().use { f ->
-            var scope: String? = null; var report: String? = null
+            var scope: String? = null; var report: String? = null; var rejected: Throwable? = null
             DebugBatchQa.coreProbeScopeTask(f.id, { scope = it }, { throw it }).run()
             val actual = JSONObject(checkNotNull(scope)); assertEquals(f.token.revision, actual.getLong("revision"))
             assertEquals("a".repeat(64), actual.getString("configDigest"))
-            val args = f.args(); val task = DebugBatchQa.coreProbeLoanTask(args, { report = it }, { throw it })
+            val args = f.args(); val task = DebugBatchQa.coreProbeLoanTask(args, { report = it }, { rejected = it })
             assertEquals(1, f.lease.snapshot().commands); assertEquals(1, f.lease.snapshot().handles)
             task.run()
-            val result = JSONObject(checkNotNull(report))
-            assertEquals("ActualStartBoundCredentialAdmittedAndErased", result.getString("coreProbeLoan"))
-            assertEquals("NotObserved", result.getString("coreProbeTransport")); assertEquals("Unknown", result.getString("coreProbePath"))
-            assertFalse(checkNotNull(report).contains("b".repeat(32)))
+            assertNull(report); assertEquals("Current PC Ready unavailable", rejected?.message)
             assertTrue(args.password.all { it == 0.toByte() }); assertEquals(0, f.lease.snapshot().commands)
             assertEquals(0, f.lease.snapshot().handles); assertFalse(f.read("tcpBound") as Boolean); assertFalse(f.read("udpBound") as Boolean)
         }
@@ -102,7 +99,9 @@ class DebugCoreProbeCommandCustodyTest {
                 JSONObject().put("loan", body).toString(), mapper)
             val parsed = invoke.parseArgs(DebugCoreProbeLoanEnvelopeArgs::class.java).loan
             assertArrayEquals(original.password, parsed.password)
-            DebugBatchQa.coreProbeLoanTask(parsed, {}, { throw it }).run()
+            var rejected: Throwable? = null
+            DebugBatchQa.coreProbeLoanTask(parsed, { fail("Missing original Ready admitted") }, { rejected = it }).run()
+            assertEquals("Current PC Ready unavailable", rejected?.message)
             assertTrue(parsed.password.all { it == 0.toByte() })
             original.password.fill(0) // the fixture's independent source buffer is not an IPC loan
         }

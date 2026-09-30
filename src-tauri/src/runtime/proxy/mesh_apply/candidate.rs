@@ -176,6 +176,7 @@ fn deps_hash(deps: &GenerateConfigDeps) -> Result<String, CandidateIntegrityErro
         race_server_port,
         probe_direct_port,
         probe_proxy_port,
+        debug_probe_mixed_udp,
         update_in_port,
         subscription_update_in_port,
         loopback_auth,
@@ -210,6 +211,7 @@ fn deps_hash(deps: &GenerateConfigDeps) -> Result<String, CandidateIntegrityErro
     value_hash(&serde_json::json!({
         "platform":platform, "arch":arch, "raceServerPort":race_server_port,
         "probeDirectPort":probe_direct_port, "probeProxyPort":probe_proxy_port,
+        "debugProbeMixedUdp":debug_probe_mixed_udp,
         "updateInPort":update_in_port, "subscriptionUpdateInPort":subscription_update_in_port,
         "loopbackAuth":loopback_auth, "probePoolPorts":probe_pool_ports,
         "lanResolverForDns":lan_resolver_for_dns, "raceUpstreamIps":race_upstream_ips,

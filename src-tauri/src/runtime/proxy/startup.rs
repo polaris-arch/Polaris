@@ -1641,7 +1641,7 @@ impl ProxyRuntime {
                     Ok(receipt) => {
                         self.confirm_android_global_start(&android_birth, receipt.exact_target())?;
                         #[cfg(all(target_os = "android", debug_assertions))]
-                        self.record_android_probe_start(my_gen, &android_birth, &receipt);
+                        self.record_android_probe_start(my_gen, &android_birth, &receipt, &gate_config_json);
                         0
                     }
                     Err((msg, error_code)) => {
@@ -3398,6 +3398,7 @@ impl ProxyRuntime {
             race_server_port,
             probe_direct_port: None,
             probe_proxy_port,
+            debug_probe_mixed_udp: cfg!(all(target_os = "android", debug_assertions)),
             // C19：>0 才注入（0 = 分配失败/未接线，退化为不生成 update-in，对齐 上游 `deps.updateInPort` 真值判定）。
             update_in_port: (update_in_port > 0).then_some(update_in_port),
             subscription_update_in_port: (subscription_update_in_port > 0)

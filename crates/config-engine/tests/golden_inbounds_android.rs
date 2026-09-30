@@ -103,6 +103,7 @@ fn run_case(case: &AndroidCase) -> Vec<serde_json::Value> {
     let deps = InboundsDeps {
         probe_direct_port: case.input.ports.probe_direct,
         probe_proxy_port: case.input.ports.probe_proxy,
+        debug_probe_mixed_udp: false,
         update_in_port: case.input.ports.update_in,
         subscription_update_in_port: None,
         // 生产形态：运行期**恒**注入一份凭据（桌面也注入 —— 由生成侧按平台决定用不用）。
@@ -132,6 +133,7 @@ fn run_config(config: &serde_json::Value, platform: &str, ports: &Ports) -> Vec<
     let deps = InboundsDeps {
         probe_direct_port: ports.probe_direct,
         probe_proxy_port: ports.probe_proxy,
+        debug_probe_mixed_udp: false,
         update_in_port: ports.update_in,
         subscription_update_in_port: None,
         loopback_auth: Some(placeholder_auth()),
@@ -343,6 +345,7 @@ fn all_loopback_deps(platform: &str, auth: Option<InboundUser>) -> InboundsDeps 
     InboundsDeps {
         probe_direct_port: Some(31001),
         probe_proxy_port: Some(31002),
+        debug_probe_mixed_udp: false,
         update_in_port: Some(31003),
         subscription_update_in_port: Some(31004),
         loopback_auth: auth,

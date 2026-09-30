@@ -44,7 +44,7 @@ internal class DebugBatchLease {
     fun revokeProbeCredentials() {
         val credentials = synchronized(gate) {
             sealed = true
-            handles.filter { it is DebugCoreProbeCredentialBuffer || it is DebugCoreProbeLoan }
+            handles.filter { it is DebugCoreProbeCredentialBuffer || it is DebugCoreProbeLoan || it is DebugPcEchoReady }
         }
         credentials.forEach(::eraseProbeCredential)
     }
@@ -53,7 +53,7 @@ internal class DebugBatchLease {
             sealed = true
             val owned = handles.filter { !residualHandles.contains(it) && !closingHandles.contains(it) }
                 .also { closing += it.size; closingHandles.addAll(it) }
-            owned to handles.filter { it is DebugCoreProbeCredentialBuffer || it is DebugCoreProbeLoan }
+            owned to handles.filter { it is DebugCoreProbeCredentialBuffer || it is DebugCoreProbeLoan || it is DebugPcEchoReady }
         }
         // Pure typed byte erasure precedes every arbitrary Close. Custody/tickets remain owned;
         // no lease gate is held while taking the existing short loan byte lock or calling Close.
@@ -64,6 +64,7 @@ internal class DebugBatchLease {
         when (value) {
             is DebugCoreProbeCredentialBuffer -> value.erase()
             is DebugCoreProbeLoan -> value.erase()
+            is DebugPcEchoReady -> value.erase()
         }
     }
     private fun closeHandle(value: Closeable) {

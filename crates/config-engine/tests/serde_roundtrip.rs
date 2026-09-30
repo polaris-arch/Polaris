@@ -89,6 +89,7 @@ fn none_fields_are_skipped() {
 fn one_or_many_serializes_single_as_bare() {
     // OneOrMany::One → 裸值（非单元素数组），与 sing-box schema 的 Listable 语义一致。
     let r = RouteRule {
+        clash_mode: None,
         rule_set: Some(OneOrMany::One("geosite-cn".into())),
         inbound: Some(OneOrMany::One("mixed-in".into())),
         protocol: None,
@@ -137,6 +138,7 @@ fn one_or_many_serializes_single_as_bare() {
 #[test]
 fn one_or_many_serializes_many_as_array() {
     let r = RouteRule {
+        clash_mode: None,
         rule_set: Some(OneOrMany::Many(vec![
             "geosite-cn".into(),
             "geoip-cn".into(),

@@ -57,6 +57,7 @@ internal object DebugBatchQa {
         @Volatile var udpBound = false
         @Volatile var prepared = false // actual APK verification and owner observation have returned
         @Volatile var lastSnapshot: String? = null
+        @Volatile var pcReady: DebugPcEchoReady? = null // typed resource in this original lease
         data class PlatformSignal(val sampledAt: Long, val allowed: Boolean, val bindingCurrent: Boolean)
         private val createdAt = SystemClock.elapsedRealtime()
         private val signalPending = AtomicBoolean(false)
@@ -72,6 +73,7 @@ internal object DebugBatchQa {
         }
         fun allowed() = armed && !lease.snapshot().sealed && SystemClock.elapsedRealtime() < deadline &&
                         SystemClock.elapsedRealtime() < controllerLeaseUntil && platformReady()
+        fun privateRootCurrent() { controllerLeaseUntil = minOf(deadline, SystemClock.elapsedRealtime() + 10000) }
         fun close(reason: String) {
             abortReason = abortReason ?: reason
             tcp.seal(); udp.seal()
@@ -99,6 +101,7 @@ internal object DebugBatchQa {
             // blocked/redacted SDK sample expires and aborts; its original lease
             // remains Unknown until that actual task returns.
             val now = SystemClock.elapsedRealtime()
+            if (pcReady?.current(now) == false) { close("pc-ready-expired"); return }
             val previous = signal
             DebugBatchGuard.abortReason(now, createdAt, deadline, controllerLeaseUntil, previous?.bindingCurrent ?: true, previous?.sampledAt, previous?.allowed)
                 ?.let { close(it); return }
@@ -282,12 +285,23 @@ internal object DebugBatchQa {
                 .put("sampledElapsed", SystemClock.elapsedRealtime()).toString()
         }
 
-    /**
-     * Source-only production admission: PC receiver ABI is not frozen, so erase the loan and
-     * explicitly leave transport NotObserved. No socket is created or CONNECT attempted.
-     */
+    /** Native-only original-root challenge, before Rust borrows any core credential. */
+    fun pcEchoPrepareTask(activity: Activity, sessionId: String, success: (String) -> Unit,
+                          failure: (Throwable) -> Unit): DebugBatchCommandTask =
+        privateProbeTask(sessionId, success, failure) { session, ticket ->
+            check(session.pcReady == null) { "PC batch already admitted" }
+            val channel = DebugPcEchoChannel(DebugPcEchoChannel.directory(activity), session.secret,
+                session.probeScope(""), session.lease, ticket, session::allowed, session::privateRootCurrent)
+            val ready = channel.ready()
+            check(session.allowed() && ready.current(SystemClock.elapsedRealtime()))
+            session.pcReady = ready
+            JSONObject().put("target", JSONObject(ready.target.privateJson()))
+                .put("requestId", ready.requestId).put("deadlineElapsed", ready.deadlineElapsed).toString()
+        }
+
+    /** Exact actual-start credential and current root handoff meet only in this private task. */
     fun coreProbeLoanTask(args: DebugCoreProbeLoanArgs, success: (String) -> Unit,
-                          failure: (Throwable) -> Unit): DebugBatchCommandTask {
+                          failure: (Throwable) -> Unit, activity: Activity? = null): DebugBatchCommandTask {
         try {
             check(BuildConfig.DEBUG) { "Debug core probe loan is disabled" }
             val requested = DebugCoreProbeLoan.Scope(args.bootNonce, args.sessionId, args.nonce, args.planSha256,
@@ -296,18 +310,22 @@ internal object DebugBatchQa {
             return privateProbeTask(args.sessionId, success, { error -> args.password.fill(0); failure(error) }, args.password) { session, ticket ->
                 try {
                     val actualScope = session.probeScope(args.generation)
+                    val ready = checkNotNull(session.pcReady?.takeIf { it.requestId == args.pcReadyRequestId &&
+                        it.current(SystemClock.elapsedRealtime()) }) { "Current PC Ready unavailable" }
                     val loan = DebugCoreProbeLoan.admit(actualScope,
-                        DebugCoreProbeLoan.Binding(requested, args.probePort, args.expiresElapsed),
+                        DebugCoreProbeLoan.Binding(requested, args.probePort, args.expiresElapsed, args.ingressKind),
                         DebugCoreProbeLoan.currentInput(), session.lease, ticket, SystemClock.elapsedRealtime(), args.password)
                     try {
                         check(session.allowed() && loan.isCurrent(SystemClock.elapsedRealtime(), DebugCoreProbeLoan.currentInput())) {
                             "Core probe input changed"
                         }
-                    } finally { session.lease.retire(loan) }
-                    metadataReport(session, ticket).let(::JSONObject)
-                        .put("coreProbeLoan", "ActualStartBoundCredentialAdmittedAndErased")
-                        .put("coreProbeTransport", "NotObserved")
-                        .put("coreProbePath", "Unknown").toString()
+                        val channel = DebugPcEchoChannel(DebugPcEchoChannel.directory(checkNotNull(activity)), session.secret,
+                            actualScope, session.lease, ticket, session::allowed, session::privateRootCurrent, 1)
+                        DebugPcEchoSender.run(loan, ready, session.lease, channel, session::allowed)
+                    } finally {
+                        session.lease.retire(loan); session.lease.retire(ready)
+                        if (session.pcReady === ready) session.pcReady = null
+                    }
                 } finally { args.password.fill(0) }
             }
         } catch (failure: Throwable) {

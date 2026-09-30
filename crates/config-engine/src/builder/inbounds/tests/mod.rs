@@ -7,6 +7,7 @@ fn deps_linux() -> InboundsDeps {
     InboundsDeps {
         probe_direct_port: None,
         probe_proxy_port: None,
+        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
         loopback_auth: None,
@@ -17,6 +18,24 @@ fn deps_linux() -> InboundsDeps {
         observed_tailnet_addresses: Default::default(),
         log: |_, _| {},
     }
+}
+
+#[test]
+fn debug_probe_mixed_udp_is_same_authenticated_probe_only_on_android() {
+    let mut deps=deps_linux();deps.probe_proxy_port=Some(19385);deps.debug_probe_mixed_udp=true;
+    deps.loopback_auth=Some(InboundUser {username:"polaris".into(),password:"b".repeat(32)});
+    for platform in ["android","linux","darwin","win32"] {
+        deps.platform=platform.into();
+        let list=build_inbounds(&UserConfig::default(),None,&deps);
+        let probe=list.iter().find(|i|i.tag=="probe-proxy-in").unwrap();
+        assert_eq!(probe.type_field,if cfg!(debug_assertions) && platform=="android" {"mixed"} else {"http"});
+        assert_eq!(probe.listen.as_deref(),Some("127.0.0.1"));assert_eq!(probe.listen_port,Some(19385));
+        if platform=="android" { assert_eq!(probe.users.as_ref().unwrap()[0].password,"b".repeat(32)); }
+    }
+    deps.platform="android".into();deps.debug_probe_mixed_udp=false;
+    assert_eq!(build_inbounds(&UserConfig::default(),None,&deps).iter().find(|i|i.tag=="probe-proxy-in").unwrap().type_field,"http");
+    deps.debug_probe_mixed_udp=true;deps.loopback_auth=None;
+    assert!(!build_inbounds(&UserConfig::default(),None,&deps).iter().any(|i|i.tag=="probe-proxy-in"));
 }
 
 #[test]

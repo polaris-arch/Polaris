@@ -3,12 +3,63 @@
 use super::android_bridge::{AndroidExactTarget, AndroidStartReceipt};
 use super::{AndroidRequestBirth, ProxyRuntime, SwitchSnapshot};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) enum DebugCoreProbeIngressKind {
+    HttpTcp,
+    MixedTcpUdp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DebugCoreProbeIngress {
+    kind: DebugCoreProbeIngressKind,
+    port: u16,
+    credential_sha256: String,
+}
+
+fn actual_ingress(config: &str, digest: &str) -> Option<DebugCoreProbeIngress> {
+    if polaris_updater::verify::sha256_hex(config.as_bytes()) != digest {
+        return None;
+    }
+    let config: serde_json::Value = serde_json::from_str(config).ok()?;
+    let mut inbounds = config
+        .get("inbounds")?
+        .as_array()?
+        .iter()
+        .filter(|inbound| inbound.get("tag").and_then(|v| v.as_str()) == Some("probe-proxy-in"));
+    let inbound = inbounds.next()?;
+    if inbounds.next().is_some() || inbound.get("listen")?.as_str()? != "127.0.0.1" {
+        return None;
+    }
+    let kind = match inbound.get("type")?.as_str()? {
+        "http" => DebugCoreProbeIngressKind::HttpTcp,
+        "mixed" => DebugCoreProbeIngressKind::MixedTcpUdp,
+        _ => return None,
+    };
+    let port = u16::try_from(inbound.get("listen_port")?.as_u64()?)
+        .ok()
+        .filter(|p| *p != 0)?;
+    let users = inbound.get("users")?.as_array()?;
+    if users.len() != 1 || users[0].get("username")?.as_str()? != "polaris" {
+        return None;
+    }
+    let password = users[0].get("password")?.as_str()?;
+    if !hex(password, 32) {
+        return None;
+    }
+    Some(DebugCoreProbeIngress {
+        kind,
+        port,
+        credential_sha256: polaris_updater::verify::sha256_hex(password.as_bytes()),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AndroidProbeStartBinding {
     generation: u64,
     target: AndroidExactTarget,
     config_digest: String,
     selector_intent: u64,
+    ingress: DebugCoreProbeIngress,
 }
 
 /// Actual original-session Kotlin projection. It contains no inbound secret or arbitrary target.
@@ -46,6 +97,8 @@ pub(super) struct DebugCoreProbeLoanPayload {
     config_digest: String,
     deadline_elapsed: u64,
     probe_port: u16,
+    ingress_kind: DebugCoreProbeIngressKind,
+    pc_ready_request_id: String,
     expires_elapsed: u64,
     password: Vec<u8>,
 }
@@ -93,10 +146,14 @@ impl ProxyRuntime {
         generation: u64,
         birth: &AndroidRequestBirth,
         receipt: &AndroidStartReceipt,
+        actual_start_config: &str,
     ) {
         if !hex(&receipt.config_digest, 64) {
             return;
         }
+        let Some(ingress) = actual_ingress(actual_start_config, &receipt.config_digest) else {
+            return;
+        };
         let Ok(mut custody) = self.android_main_token.lock() else {
             return;
         };
@@ -116,6 +173,7 @@ impl ProxyRuntime {
                 target: receipt.exact_target(),
                 config_digest: receipt.config_digest.clone(),
                 selector_intent: self.selector_reconcile.intent_generation(),
+                ingress,
             });
         });
     }
@@ -212,6 +270,12 @@ impl ProxyRuntime {
                     .as_ref()
                     .filter(|a| a.username == "polaris" && hex(&a.password, 32))
                     .ok_or("Core probe credential missing")?;
+                if port != b.ingress.port
+                    || polaris_updater::verify::sha256_hex(auth.password.as_bytes())
+                        != b.ingress.credential_sha256
+                {
+                    return Err("Core probe actual ingress changed".into());
+                }
                 self.gate
                     .with_current_generation(b.generation, |_| DebugCoreProbeLoanPayload {
                         boot_nonce: scope.boot_nonce.clone(),
@@ -227,6 +291,8 @@ impl ProxyRuntime {
                         config_digest: scope.config_digest.clone(),
                         deadline_elapsed: scope.deadline_elapsed,
                         probe_port: port,
+                        ingress_kind: b.ingress.kind,
+                        pc_ready_request_id: String::new(),
                         expires_elapsed: scope.deadline_elapsed,
                         password: auth.password.as_bytes().to_vec(),
                     })
@@ -241,18 +307,33 @@ impl ProxyRuntime {
         session_id: String,
     ) -> Result<String, String> {
         let before = super::android_bridge::debug_core_probe_scope(session_id).await?;
-        let loan = self.collect_android_probe_loan(&before).await?;
+        let ready = super::android_bridge::debug_pc_echo_prepare(before.session_id.clone()).await?;
+        let admitted = ready.admit(&before)?;
+        let mut loan = self.collect_android_probe_loan(&before).await?;
+        loan.pc_ready_request_id = admitted.request_id().to_owned();
+        loan.expires_elapsed = loan.expires_elapsed.min(admitted.deadline_elapsed());
         let report = super::android_bridge::debug_core_probe_loan(loan).await?;
         // The native callback has already erased the credential and returned its original
         // command ticket. Never label a delayed callback as a current-generation observation.
-        let after =
-            super::android_bridge::debug_core_probe_scope(before.session_id.clone()).await?;
-        let mut expected_after = before;
-        expected_after.sampled_elapsed = after.sampled_elapsed;
-        if expected_after != after {
-            return Err("Core probe input changed".into());
-        }
-        drop(self.collect_android_probe_loan(&after).await?);
-        Ok(report)
+        // Preserve actual sent/returned evidence even when a later native fence is stale.
+        let current =
+            match super::android_bridge::debug_core_probe_scope(before.session_id.clone()).await {
+                Ok(after) => {
+                    let mut expected = before;
+                    expected.sampled_elapsed = after.sampled_elapsed;
+                    expected == after && self.collect_android_probe_loan(&after).await.is_ok()
+                }
+                Err(_) => false,
+            };
+        let mut value: serde_json::Value = serde_json::from_str(&report)
+            .map_err(|_| "Core probe report unavailable".to_owned())?;
+        value
+            .as_object_mut()
+            .ok_or("Core probe report unavailable")?
+            .insert(
+                "nativeScopeStatus".into(),
+                serde_json::Value::String(if current { "Current" } else { "StaleScope" }.into()),
+            );
+        serde_json::to_string(&value).map_err(|_| "Core probe report unavailable".to_owned())
     }
 }

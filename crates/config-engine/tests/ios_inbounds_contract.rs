@@ -101,6 +101,7 @@ fn run(config: &serde_json::Value, platform: &str, ports: &Ports) -> Vec<serde_j
     let deps = InboundsDeps {
         probe_direct_port: ports.probe_direct,
         probe_proxy_port: ports.probe_proxy,
+        debug_probe_mixed_udp: false,
         update_in_port: ports.update_in,
         subscription_update_in_port: None,
         loopback_auth: None,

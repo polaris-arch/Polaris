@@ -421,6 +421,7 @@ fn android_config_actually_contains_the_naive_outbound() {
             race_server_port: 0,
             probe_direct_port: None,
             probe_proxy_port: None,
+            debug_probe_mixed_udp: false,
             update_in_port: None,
             subscription_update_in_port: None,
             loopback_auth: None,

@@ -103,6 +103,7 @@ fn android_exclude_packages_of(custom: &[CustomAppPreset]) -> Vec<String> {
     let deps = InboundsDeps {
         probe_direct_port: None,
         probe_proxy_port: None,
+        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
         loopback_auth: None,

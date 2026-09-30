@@ -335,6 +335,7 @@ fn inbounds_deps(obs: ObservedTailnetAddresses) -> InboundsDeps {
     InboundsDeps {
         probe_direct_port: None,
         probe_proxy_port: None,
+        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
         loopback_auth: None,

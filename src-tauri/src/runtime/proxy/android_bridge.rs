@@ -779,12 +779,24 @@ pub(super) async fn debug_core_probe_loan(
         plugin,
         "debugCoreProbeLoan",
         DebugCoreProbeLoanEnvelopeArgs { loan },
-        Duration::from_secs(5),
+        Duration::from_secs(125), // original remote deadline/session guardian still closes resources
         None,
     )
     .await
     .map(|r| r.report)
     .map_err(|_| "Core probe loan unavailable".to_owned())
+}
+
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(super) async fn debug_pc_echo_prepare(session_id: String) -> Result<super::debug_pc_echo::PrivatePcReady, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all="camelCase")]
+    struct Args { session_id: String }
+    #[derive(serde::Deserialize)]
+    struct Response { ready: super::debug_pc_echo::PrivatePcReady }
+    let plugin=plugin_handle().map_err(|_|"Current PC Ready unavailable".to_owned())?;
+    call_with_budget::<Response,_>(plugin,"debugPcEchoPrepare",Args { session_id },Duration::from_secs(5),None)
+        .await.map(|r|r.ready).map_err(|_|"Current PC Ready unavailable".to_owned())
 }
 
 #[cfg(all(target_os = "android", debug_assertions))]

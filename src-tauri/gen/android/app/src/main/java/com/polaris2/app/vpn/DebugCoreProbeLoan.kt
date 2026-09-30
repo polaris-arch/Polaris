@@ -25,7 +25,9 @@ class DebugCoreProbeLoanArgs {
     var revision: Long = 0
     var deadlineElapsed: Long = 0
     var probePort: Int = 0
+    var ingressKind: String = "HttpTcp"
     var expiresElapsed: Long = 0
+    var pcReadyRequestId: String = ""
     var password: ByteArray = byteArrayOf()
     override fun toString() = "DebugCoreProbeLoanArgs(<private>)"
 }
@@ -40,7 +42,7 @@ internal class DebugCoreProbeCredentialBuffer(private val bytes: ByteArray) : Cl
 /**
  * One private credential resource in an existing batch lease. This is not a Main owner or a
  * transport factory. Only the native Rust publication provider supplies a trusted generation.
- * PC ACK/transport is not connected: the private manager admits and erases this resource only.
+ * The sender consumes the exact actual-start descriptor, outside all metadata locks.
  */
 internal class DebugCoreProbeLoan private constructor(
     private val scope: Scope,
@@ -59,7 +61,8 @@ internal class DebugCoreProbeLoan private constructor(
     )
 
     /** Typed native-only descriptor. The actual probe port is separate from the approved LAN port. */
-    data class Binding(val scope: Scope, val probePort: Int, val expiresElapsed: Long)
+    data class Binding(val scope: Scope, val probePort: Int, val expiresElapsed: Long,
+                       val ingressKind: String = "HttpTcp")
 
     /** A bounded metadata read from the actual Main operationLock and witness reference pair. */
     class CurrentInput internal constructor(
@@ -70,6 +73,10 @@ internal class DebugCoreProbeLoan private constructor(
 
     private var used = false
     @Volatile private var cleared = false
+
+    val probePort get() = binding.probePort
+    val supportsUdp get() = binding.ingressKind == "MixedTcpUdp"
+    val deadlineElapsed get() = minOf(binding.expiresElapsed, scope.deadlineElapsed)
 
     /** No callback under this short lock. Session seal can erase the bytes during a blocked write. */
     fun consume(now: Long, current: CurrentInput?, write: (ByteArray) -> Unit) {
@@ -145,6 +152,7 @@ internal class DebugCoreProbeLoan private constructor(
                 return synchronized(actual.owner.operationLock) {
                     val fresh = checkNotNull(refreshInput(actual)) { "Core probe Main input changed" }
                     require(validScope(scope) && scope == binding.scope && binding.probePort in 1..65535 &&
+                        binding.ingressKind in setOf("HttpTcp", "MixedTcpUdp") &&
                         now >= 0 && binding.expiresElapsed > now && binding.expiresElapsed <= scope.deadlineElapsed &&
                         scope.deadlineElapsed - now <= 300000 && matches(scope, fresh)) {
                         "Core probe binding unavailable"

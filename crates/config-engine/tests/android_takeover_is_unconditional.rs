@@ -47,6 +47,7 @@ fn deps(platform: &str) -> GenerateConfigDeps {
         race_server_port: 0,
         probe_direct_port: None,
         probe_proxy_port: None,
+        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
         loopback_auth: None,

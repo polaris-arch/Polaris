@@ -3,6 +3,10 @@ use super::super::android_probe_loan::DebugCoreProbeSessionScope;
 use super::*;
 
 // Pure fixture inputs. No Kotlin/JNI/device/core data are manufactured by production.
+fn start_config(kind: &str) -> String {
+    serde_json::json!({"inbounds":[{"type":kind,"tag":"probe-proxy-in","listen":"127.0.0.1","listen_port":19385,
+        "users":[{"username":"polaris","password":"b".repeat(32)}]}]}).to_string()
+}
 fn scope() -> DebugCoreProbeSessionScope {
     DebugCoreProbeSessionScope {
         boot_nonce: "1".repeat(32),
@@ -14,7 +18,7 @@ fn scope() -> DebugCoreProbeSessionScope {
         run_id: "probe-fixture".into(),
         birth_nonce: "fixture-birth".into(),
         revision: 1,
-        config_digest: "a".repeat(64),
+        config_digest: polaris_updater::verify::sha256_hex(start_config("mixed").as_bytes()),
         deadline_elapsed: 9000,
         sampled_elapsed: 1000,
     }
@@ -35,7 +39,7 @@ fn install(
     };
     rt.confirm_android_global_start(&birth, receipt.exact_target())
         .unwrap();
-    rt.record_android_probe_start(generation, &birth, &receipt);
+    rt.record_android_probe_start(generation, &birth, &receipt, &start_config("mixed"));
     rt.publish_android_probe_snapshot(
         generation,
         SwitchSnapshot {
@@ -61,6 +65,7 @@ async fn android_probe_loan_actual_custody_publication_and_collector_bind_start_
     assert_eq!(wire["generation"], generation.to_string());
     assert_eq!(wire["configDigest"], s.config_digest);
     assert_eq!(wire["probePort"], 19385);
+    assert_eq!(wire["ingressKind"], "MixedTcpUdp");
     assert_eq!(wire["password"].as_array().unwrap().len(), 32);
     // Current/saved user data do not stand in for the actual sent Start receipt.
     *rt.current_config.write().unwrap() = Some(serde_json::json!({"digest": "unrelated"}));
@@ -72,7 +77,7 @@ async fn android_probe_loan_actual_custody_publication_and_collector_bind_start_
 
 #[tokio::test]
 async fn android_probe_loan_changed_generation_selector_unknown_and_missing_publication_reject() {
-    for mutation in 0..6 {
+    for mutation in 0..8 {
         let (rt, _dir) = test_runtime();
         let s = scope();
         install(&rt, &s);
@@ -109,6 +114,25 @@ async fn android_probe_loan_changed_generation_selector_unknown_and_missing_publ
             }
             5 => {
                 rt.status.write().unwrap().running = false;
+            }
+            6 => {
+                rt.switch_snapshot
+                    .write()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .probe_proxy_port = Some(19386);
+            }
+            7 => {
+                rt.switch_snapshot
+                    .write()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .loopback_auth
+                    .as_mut()
+                    .unwrap()
+                    .password = "c".repeat(32);
             }
             _ => unreachable!(),
         }
@@ -166,6 +190,7 @@ async fn android_probe_loan_late_start_receipt_and_old_snapshot_cannot_publish_a
             claim: None,
             tun: None,
         },
+        &start_config("mixed"),
     );
     assert!(rt
         .android_main_token

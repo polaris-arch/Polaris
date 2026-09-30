@@ -90,6 +90,7 @@ fn every_platform_exposes_only_ports_that_its_generated_inbounds_listen_on() {
         let deps = InboundsDeps {
             probe_direct_port: None,
             probe_proxy_port: Some(probe_proxy),
+            debug_probe_mixed_udp: false,
             update_in_port: Some(update_in),
             subscription_update_in_port: Some(subscription_in),
             loopback_auth: loopback_auth.clone(),

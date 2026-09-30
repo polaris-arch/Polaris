@@ -18,5 +18,7 @@ class DebugCoreProbeReleaseGuardTest {
         assertTrue(args.password.all { it == 0.toByte() })
         val executor = DebugBatchCommandExecutor.javaClass.getDeclaredField("value\$delegate").also { it.isAccessible = true }
         assertFalse((executor.get(null) as Lazy<*>).isInitialized())
+        val pc = runCatching { DebugPcEchoReady.fromReply(emptyMap(), "", 0, 0, 0, "") }
+        assertEquals("Debug PC echo is disabled", pc.exceptionOrNull()?.message)
     }
 }
