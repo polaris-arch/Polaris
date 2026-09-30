@@ -22,6 +22,7 @@ internal class MainKernelAttempt<Server>(
     val nativeTicket: AndroidNativeAdmission.Ticket? = null,
     /** Established before registry/native publication; reload never replaces it. */
     val dns: MainAttemptDns? = null,
+    val network: NetworkMonitorSession<android.net.Network, io.nekohasekai.libbox.InterfaceUpdateListener>? = null,
 ) {
     /** Created by this attempt, never supplied by a bridge caller or reused after Service recreation. */
     val birthNonce: String = UUID.randomUUID().toString()
@@ -93,6 +94,7 @@ internal class MainKernelAttempt<Server>(
         }
         // Stop still holds BoxService's short state lock. This fence performs
         // no JNI/SDK call or wait, and precedes prepared/native-close waits.
+        network?.beginClose()
         dns?.beginClose()
         return previous
     }

@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import io.nekohasekai.libbox.InterfaceUpdateListener
+import io.nekohasekai.libbox.Libbox
 import java.net.NetworkInterface
 
 /**
@@ -38,83 +39,47 @@ import java.net.NetworkInterface
 object DefaultNetworkMonitor {
     private const val TAG = "PolarisNetMonitor"
 
-    @Volatile
-    var defaultNetwork: Network? = null
-        private set
-
-    @Volatile
-    private var listener: InterfaceUpdateListener? = null
-
-    private var registered = false
-
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val coordinator = NetworkMonitorCoordinator<Network, InterfaceUpdateListener>(
+        registration = { events ->
+            // This SDK callback is born with the exact attempt registration.
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = events.available(network)
+                override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
+                    events.capabilitiesChanged(network)
+                override fun onLost(network: Network) = events.lost(network)
+            }
+            object : NetworkMonitorRegistration {
+                override fun register() = register(callback)
+                override fun unregister() {
+                    try { PolarisApplication.connectivity.unregisterNetworkCallback(callback) }
+                    catch (error: Throwable) { Log.w(TAG, "注销网络回调失败", error); throw error }
+                }
+            }
+        },
+        initialNetwork = { PolarisApplication.connectivity.activeNetwork },
+        lookup = { network -> lookup(network) },
+        identity = Libbox::interfaceUpdateListenerIdentity,
+        deliver = { listener, update ->
+            listener.updateDefaultInterface(update.name, update.index, update.expensive, update.constrained)
+        },
+    )
 
-    private val callback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) {
-            defaultNetwork = network
-            notifyUpdate(network)
-        }
+    val defaultNetwork: Network? get() = coordinator.defaultNetwork
+    internal fun createSession(): NetworkMonitorSession<Network, InterfaceUpdateListener> = coordinator.createSession()
 
-        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-            if (defaultNetwork == network) notifyUpdate(network)
-        }
-
-        override fun onLost(network: Network) {
-            if (defaultNetwork != network) return
-            defaultNetwork = null
-            notifyUpdate(null)
-        }
-    }
-
-    @Synchronized
-    fun start() {
-        if (registered) return
-        register()
-        registered = true
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            // 回调是「变化时」才来的，首次要主动取一次当前值，否则内核在第一次切网之前一直看不到默认网卡。
-            defaultNetwork = PolarisApplication.connectivity.activeNetwork
-        }
-    }
-
-    @Synchronized
-    fun stop() {
-        if (!registered) return
-        runCatching { PolarisApplication.connectivity.unregisterNetworkCallback(callback) }
-            .onFailure { Log.w(TAG, "注销网络回调失败", it) }
-        registered = false
-        defaultNetwork = null
-    }
-
-    fun setListener(listener: InterfaceUpdateListener?) {
-        this.listener = listener
-        notifyUpdate(defaultNetwork)
-    }
-
-    private fun notifyUpdate(network: Network?) {
-        val listener = listener ?: return
-        if (network == null) {
-            listener.updateDefaultInterface("", -1, false, false)
-            return
-        }
-        // LinkProperties 与 NetworkInterface 在 onAvailable 的瞬间可能都还没就绪（网卡刚 up、
-        // 内核还没给它分配 index）。上游在这里重试 10 × 100ms，直接照抄——报一次 -1 会让内核
-        // 认为「没有默认网络」并把所有出站掐掉，代价远大于多等 1 秒。
+    private fun lookup(network: Network): NetworkMonitorUpdate? {
+        // Link/index lookup and its original retry behavior stay outside the gate.
+        // A slow result still needs a revision/identity permit before JNI.
         for (attempt in 0 until 10) {
-            val linkProperties = PolarisApplication.connectivity.getLinkProperties(network)
-            if (linkProperties == null) {
-                Thread.sleep(100)
-                continue
-            }
-            val index = runCatching { NetworkInterface.getByName(linkProperties.interfaceName).index }.getOrNull()
-            if (index == null) {
-                Thread.sleep(100)
-                continue
-            }
-            listener.updateDefaultInterface(linkProperties.interfaceName, index, false, false)
-            return
+            val properties = PolarisApplication.connectivity.getLinkProperties(network)
+            val name = properties?.interfaceName
+            val index = name?.let { runCatching { NetworkInterface.getByName(it)?.index }.getOrNull() }
+            if (name != null && index != null) return NetworkMonitorUpdate(name, index)
+            Thread.sleep(100)
         }
         Log.w(TAG, "10 次重试后仍拿不到默认网卡 index")
+        return null
     }
 
     /**
@@ -129,7 +94,7 @@ object DefaultNetworkMonitor {
      * 于是内核把自己的出站 socket 绑回自己的隧道，形成回环。
      */
     @SuppressLint("MissingPermission") // CHANGE_NETWORK_STATE 已在 Manifest 声明，lint 认不出跨方法的分支
-    private fun register() {
+    private fun register(callback: ConnectivityManager.NetworkCallback) {
         val request = NetworkRequest.Builder().apply {
             addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)

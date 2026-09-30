@@ -32,8 +32,8 @@ internal class MainAttemptDns(
 
     companion object {
         /** Construction creates no SDK query and never touches the singleton resolver. */
-        fun create(): MainAttemptDns {
-            val resolver = NetworkLocalResolver { DefaultNetworkMonitor.defaultNetwork }
+        fun create(currentNetwork: () -> android.net.Network? = { DefaultNetworkMonitor.defaultNetwork }): MainAttemptDns {
+            val resolver = NetworkLocalResolver(currentNetwork)
             return MainAttemptDns(resolver, resolver::beginClose, resolver::closeUnused)
         }
     }

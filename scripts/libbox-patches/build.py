@@ -122,7 +122,8 @@ def main():
              str(checkout / 'experimental/libbox/config_validation_test.go'),
              str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
              str(checkout / 'experimental/libbox/dns_lifecycle_test.go'),
-             str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go')], cwd=checkout, env=env)
+             str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go'),
+             str(checkout / 'experimental/libbox/monitor_lifecycle_test.go')], cwd=checkout, env=env)
         # Optional registry services must preserve existing usage files with
         # either tag independently and with both real implementations present.
         for tags in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
@@ -132,7 +133,8 @@ def main():
             tagged_tests = [str(checkout / 'experimental/libbox/config_validation_test.go'),
                             str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
                             str(checkout / 'experimental/libbox/dns_lifecycle_test.go'),
-                            str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go')]
+                            str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go'),
+                            str(checkout / 'experimental/libbox/monitor_lifecycle_test.go')]
             if tags == 'with_ccm,with_ocm':
                 tagged_tests.append(str(checkout / 'experimental/libbox/config_optional_persistence_test.go'))
             run([str(go), 'test', '-tags', tags, '-race', '-ldflags=-checklinkname=0',
@@ -188,6 +190,7 @@ def main():
                 signatures[name] = run([str(jdk / 'bin/javap'), '-constants', '-classpath', str(classes), f'io.nekohasekai.libbox.{name}'], capture=True)
             require('newTransientCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Transient Java factory is missing')
             require('newStrictCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)' in signatures['Libbox'], 'Strict primary Java factory is missing')
+            require('java.lang.String interfaceUpdateListenerIdentity(io.nekohasekai.libbox.InterfaceUpdateListener)' in signatures['Libbox'], 'Native monitor incarnation helper is missing')
             require('startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions)' in signatures['CommandServer'], 'Service Java signature changed')
             require('void bindInterfaceControl(int, java.lang.String) throws java.lang.Exception' in signatures['PlatformInterface'], 'Named interface Java platform contract is missing')
             require('checkConfigWithResult(java.lang.String, java.lang.String, long)' in signatures['Libbox'], 'Bound config validation Java API is missing')

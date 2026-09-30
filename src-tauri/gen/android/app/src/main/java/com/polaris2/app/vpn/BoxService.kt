@@ -114,7 +114,8 @@ class BoxService(
                 // The bridge may replace the request between the snapshot and the gate.
                 val admission = LegacySystemStartFence.admitCurrentRequest(request, VpnBridge::currentStartRequest) {
                     // Resource ownership precedes registry visibility and queued native work.
-                    val dns = MainAttemptDns.create()
+                    val network = DefaultNetworkMonitor.createSession()
+                    val dns = MainAttemptDns.create { network.defaultNetwork }
                     var claimed = false
                     try {
                         val next = MainKernelAttempt<CommandServer>(
@@ -122,6 +123,7 @@ class BoxService(
                             request?.runId ?: systemRunId,
                             nativeTicket,
                             dns,
+                            network,
                         )
                         if (!MainKernelAttemptRegistry.isVacant() ||
                             (request == null && !VpnBridge.beginSystemStart())) null
@@ -136,7 +138,7 @@ class BoxService(
                         }
                     } finally {
                         // No getter/native worker saw a rejected resource. Do not touch the singleton.
-                        if (!claimed) runCatching { dns.closeUnused() }
+                        if (!claimed) runCatching { network.beginClose(); dns.closeUnused() }
                             .onFailure { Log.e(TAG, "主核未发布 DNS 资源清理未知") }
                     }
                 }
@@ -230,13 +232,17 @@ class BoxService(
                 AndroidNativeMain.construct(attempt) {
                     TransientLoginHost.withMainConfig(attempt, config, { isStarting(attempt) }) {
                         check(isStarting(attempt)) { "起核已被停核接管" }
-                        DefaultNetworkMonitor.start()
+                        checkNotNull(attempt.network).start()
                         check(isStarting(attempt)) { "起核已被停核接管" }
                         val tunOpener = platformInterface as? PolarisVpnService
                             ?: error("android: 主核没有绑定 attempt 的 TUN 载体")
                         val dnsPlatform = checkNotNull(attempt.dns).bindPlatform(platformInterface)
                         val boundPlatform = object : PlatformInterface by dnsPlatform {
                             override fun openTun(options: TunOptions): Int = tunOpener.openTun(attempt, options)
+                            override fun startDefaultInterfaceMonitor(listener: io.nekohasekai.libbox.InterfaceUpdateListener) =
+                                checkNotNull(attempt.network).startListener(listener)
+                            override fun closeDefaultInterfaceMonitor(listener: io.nekohasekai.libbox.InterfaceUpdateListener) =
+                                checkNotNull(attempt.network).closeListener(listener)
                         }
                         val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), boundPlatform)
                         attempt.publish(server)
@@ -550,7 +556,7 @@ class BoxService(
             attempt.closeOnce { server ->
                 var closeStage = "network-monitor"
                 try {
-                    DefaultNetworkMonitor.stop()
+                    attempt.network?.stop()
                     closeStage = "speedtest-ownership"
                     TransientSpeedtestHost.closeMain(attempt) {
                         // Start/Reload holds this exact attempt's operationLock. A

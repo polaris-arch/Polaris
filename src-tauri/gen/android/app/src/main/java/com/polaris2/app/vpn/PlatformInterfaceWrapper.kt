@@ -100,11 +100,11 @@ interface PlatformInterfaceWrapper : PlatformInterface {
 
     // ── 默认网络 ────────────────────────────────────────────────────────────────
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
-        DefaultNetworkMonitor.setListener(listener)
+        error("android: 默认网络 monitor 必须绑定原 attempt session")
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
-        DefaultNetworkMonitor.setListener(null)
+        error("android: 默认网络 monitor 必须绑定原 attempt session")
     }
 
     @Suppress("DEPRECATION")
