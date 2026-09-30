@@ -1,0 +1,621 @@
+diff --git a/protocol/tun/inbound.go b/protocol/tun/inbound.go
+index f83d6df..dd254d5 100644
+--- a/protocol/tun/inbound.go
++++ b/protocol/tun/inbound.go
+@@ -2,6 +2,8 @@ package tun
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
+ 	"net"
+ 	"net/netip"
+ 	"os"
+@@ -14,6 +16,7 @@ import (
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/common/construction"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/experimental/deprecated"
+@@ -39,33 +42,54 @@ func RegisterInbound(registry *inbound.Registry) {
+ }
+ 
+ type Inbound struct {
+-	tag                         string
+-	ctx                         context.Context
+-	router                      adapter.Router
+-	networkManager              adapter.NetworkManager
+-	logger                      log.ContextLogger
+-	tunOptions                  tun.Options
+-	udpTimeout                  time.Duration
+-	udpMapping                  tun.NATMapping
+-	udpFiltering                tun.NATFiltering
+-	udpNATMax                   uint32
+-	dnsHijackAddress            []netip.Addr
+-	dnsHijackByPort             bool
+-	stack                       string
+-	tunIf                       tun.Tun
+-	tunStack                    tun.Stack
+-	platformInterface           adapter.PlatformInterface
+-	platformOptions             option.TunPlatformOptions
+-	autoRedirect                tun.AutoRedirect
+-	routeRuleSet                []adapter.RuleSet
+-	routeRuleSetCallback        []*list.Element[adapter.RuleSetUpdateCallback]
+-	routeExcludeRuleSet         []adapter.RuleSet
+-	routeExcludeRuleSetCallback []*list.Element[adapter.RuleSetUpdateCallback]
+-	routeAddressSetAccess       sync.RWMutex
+-	routeAddressSet             []*netipx.IPSet
+-	routeExcludeAddressSet      []*netipx.IPSet
++	tag                           string
++	ctx                           context.Context
++	router                        adapter.Router
++	networkManager                adapter.NetworkManager
++	logger                        log.ContextLogger
++	tunOptions                    tun.Options
++	udpTimeout                    time.Duration
++	udpMapping                    tun.NATMapping
++	udpFiltering                  tun.NATFiltering
++	udpNATMax                     uint32
++	dnsHijackAddress              []netip.Addr
++	dnsHijackByPort               bool
++	stack                         string
++	tunIf                         tun.Tun
++	tunStack                      tun.Stack
++	platformInterface             adapter.PlatformInterface
++	platformOptions               option.TunPlatformOptions
++	autoRedirect                  tun.AutoRedirect
++	routeRuleSet                  []adapter.RuleSet
++	routeRuleSetCallback          []*list.Element[adapter.RuleSetUpdateCallback]
++	routeExcludeRuleSet           []adapter.RuleSet
++	routeExcludeRuleSetCallback   []*list.Element[adapter.RuleSetUpdateCallback]
++	routeAddressSetAccess         sync.RWMutex
++	routeAddressSet               []*netipx.IPSet
++	routeExcludeAddressSet        []*netipx.IPSet
++	routeUpdateAccess             sync.Mutex
++	pendingRouteAddressSet        []*netipx.IPSet
++	pendingRouteExcludeAddressSet []*netipx.IPSet
++	routeUpdateGeneration         uint64
++	routeCommittedGeneration      uint64
++	routeAddressSetUnknown        bool
++	autoRedirectStarted           bool
++	autoRedirectAttempted         bool
++	tunStartAttempted             bool
++	lifecycleAccess               sync.Mutex
++	lifecycleClosed               bool
++	lifecycleOperations           sync.WaitGroup
++	routeRuleSetReferences        []adapter.RuleSet
++	closeOnce                     sync.Once
++	closeError                    error
+ }
+ 
++var errInboundCloseUnknown = errors.New("TUN inbound cleanup is incomplete")
++
++// This finite root retains the original consumer and its still-referenced
++// stack/TUN/backend graph when managers detach an unresolved instance.
++var inboundResidualCustody sync.Map // *Inbound -> *Inbound
++
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
+ 	//nolint:staticcheck
+ 	if len(options.Inet4Address) > 0 || len(options.Inet6Address) > 0 ||
+@@ -285,6 +309,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 				InterfaceFinder: networkManager.InterfaceFinder(),
+ 				TableName:       "sing-box",
+ 				DisableNFTables: parseErr == nil && disableNFTables,
++				RouteAddressSet: func() (include []netip.Prefix, exclude []netip.Prefix, err error) {
++					include, exclude = inbound.routeAddressSetPrefixes()
++					return
++				},
+ 			})
+ 		}
+ 		if err != nil {
+@@ -342,6 +370,12 @@ func (t *Inbound) Tag() string {
+ }
+ 
+ func (t *Inbound) Start(stage adapter.StartStage) error {
++	if !t.beginOperation() {
++		return os.ErrClosed
++	}
++	defer t.lifecycleOperations.Done()
++	t.routeUpdateAccess.Lock()
++	defer t.routeUpdateAccess.Unlock()
+ 	switch stage {
+ 	case adapter.StartStateInitialize:
+ 		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled && len(t.tunOptions.DNSAddress) == 0 {
+@@ -399,6 +433,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
+ 					t.logger.Warn("route_address_set: no destination IP CIDR rules found in rule-set: ", routeRuleSet.Name())
+ 				}
+ 				routeRuleSet.IncRef()
++				t.routeRuleSetReferences = append(t.routeRuleSetReferences, routeRuleSet)
+ 				routeAddressSet = append(routeAddressSet, ipSets...)
+ 			}
+ 			for _, routeExcludeRuleSet := range t.routeExcludeRuleSet {
+@@ -407,12 +442,15 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
+ 					t.logger.Warn("route_exclude_address_set: no destination IP CIDR rules found in rule-set: ", routeExcludeRuleSet.Name())
+ 				}
+ 				routeExcludeRuleSet.IncRef()
++				t.routeRuleSetReferences = append(t.routeRuleSetReferences, routeExcludeRuleSet)
+ 				routeExcludeAddressSet = append(routeExcludeAddressSet, ipSets...)
+ 			}
+ 			if t.autoRedirect != nil {
+ 				t.routeAddressSetAccess.Lock()
+-				t.routeAddressSet = routeAddressSet
+-				t.routeExcludeAddressSet = routeExcludeAddressSet
++				t.pendingRouteAddressSet = slices.Clone(routeAddressSet)
++				t.pendingRouteExcludeAddressSet = slices.Clone(routeExcludeAddressSet)
++				t.routeUpdateGeneration++
++				t.routeAddressSetUnknown = true
+ 				t.routeAddressSetAccess.Unlock()
+ 				for _, routeRuleSet := range t.routeRuleSet {
+ 					t.routeRuleSetCallback = append(t.routeRuleSetCallback, routeRuleSet.RegisterCallback(t.updateRouteAddressSet))
+@@ -456,17 +494,17 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
+ 		}
+ 		monitor.Finish()
+ 		t.tunOptions.Name = tunOptions.Name
++		// Preserve any actually returned object even when the acquisition reports
++		// an error. Construction disposal decides its own confirmed authority.
++		t.tunIf = tunInterface
+ 		if err != nil {
+ 			return E.Cause(err, "configure tun interface")
+ 		}
+ 		t.logger.Trace("creating stack")
+-		t.tunIf = tunInterface
+ 		if t.platformInterface != nil {
+ 			err = t.platformInterface.ProcessPlatformOptions(t.platformOptions)
+ 			if err != nil {
+-				closeError := t.tunIf.Close()
+-				t.tunIf = nil
+-				return E.Errors(E.Cause(err, "process platform options"), closeError)
++				return E.Cause(err, "process platform options")
+ 			}
+ 		}
+ 		var includeAllNetworks bool
+@@ -494,10 +532,10 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
+ 			IncludeAllNetworks:     includeAllNetworks,
+ 			MemoryPressure:         memoryPressure,
+ 		})
++		t.tunStack = tunStack
+ 		if err != nil {
+ 			return err
+ 		}
+-		t.tunStack = tunStack
+ 		t.logger.Info("started at ", t.tunOptions.Name)
+ 	case adapter.StartStatePostStart:
+ 		monitor := taskmonitor.New(t.logger, C.StartTimeout)
+@@ -508,6 +546,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
+ 			return E.Cause(err, "starting tun stack")
+ 		}
+ 		monitor.Start("starting tun interface")
++		t.tunStartAttempted = true
+ 		err = t.tunIf.Start()
+ 		monitor.Finish()
+ 		if err != nil {
+@@ -515,42 +554,118 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
+ 		}
+ 		if t.autoRedirect != nil {
+ 			monitor.Start("initialize auto-redirect")
++			t.autoRedirectAttempted = true
+ 			err := t.autoRedirect.Start()
+ 			monitor.Finish()
+ 			if err != nil {
+ 				return E.Cause(err, "auto-redirect")
+ 			}
++			t.routeAddressSetAccess.Lock()
++			t.routeAddressSet = slices.Clone(t.pendingRouteAddressSet)
++			t.routeExcludeAddressSet = slices.Clone(t.pendingRouteExcludeAddressSet)
++			t.routeCommittedGeneration = t.routeUpdateGeneration
++			t.autoRedirectStarted = true
++			t.routeAddressSetUnknown = false
++			t.routeAddressSetAccess.Unlock()
+ 		}
+ 	}
+ 	return nil
+ }
+ 
+ func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
++	if !t.beginOperation() {
++		return
++	}
++	defer t.lifecycleOperations.Done()
++	defer func() {
++		if value := recover(); value != nil {
++			t.routeAddressSetAccess.Lock()
++			t.routeAddressSetUnknown = true
++			t.routeAddressSetAccess.Unlock()
++			t.lifecycleAccess.Lock()
++			t.lifecycleClosed = true
++			t.lifecycleAccess.Unlock()
++			t.logger.Error("update route address set panicked: ", value)
++			go t.Close()
++		}
++	}()
++	t.routeUpdateAccess.Lock()
++	defer t.routeUpdateAccess.Unlock()
+ 	routeAddressSet := common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
+ 	routeExcludeAddressSet := common.FlatMap(t.routeExcludeRuleSet, adapter.RuleSet.ExtractIPSet)
+ 	t.routeAddressSetAccess.Lock()
+-	t.routeAddressSet = routeAddressSet
+-	t.routeExcludeAddressSet = routeExcludeAddressSet
++	t.pendingRouteAddressSet = slices.Clone(routeAddressSet)
++	t.pendingRouteExcludeAddressSet = slices.Clone(routeExcludeAddressSet)
++	t.routeUpdateGeneration++
++	generation := t.routeUpdateGeneration
++	started := t.autoRedirectStarted
+ 	t.routeAddressSetAccess.Unlock()
+-	err := t.autoRedirect.UpdateRouteAddressSet()
++	if !started {
++		return
++	}
++	updater, supported := t.autoRedirect.(tun.AutoRedirectRouteAddressSetUpdater)
++	if !supported {
++		t.logger.Error("update route address set: ", tun.ErrAutoRedirectOwnershipUnsupported)
++		return
++	}
++	include, exclude := routeAddressSetPrefixes(routeAddressSet, routeExcludeAddressSet)
++	result, err := updater.UpdateRouteAddressSetSnapshot(generation, include, exclude)
++	t.routeAddressSetAccess.Lock()
++	if result.Generation != generation {
++		result.State = tun.RouteAddressSetUnknown
++		err = errors.Join(err, errors.New("route address set generation mismatch"))
++	}
++	switch result.State {
++	case tun.RouteAddressSetCommitted:
++		t.routeAddressSet = slices.Clone(routeAddressSet)
++		t.routeExcludeAddressSet = slices.Clone(routeExcludeAddressSet)
++		t.routeCommittedGeneration = generation
++		t.routeAddressSetUnknown = false
++	case tun.RouteAddressSetUnchanged:
++	case tun.RouteAddressSetUnknown:
++		t.routeAddressSetUnknown = true
++	default:
++		t.routeAddressSetUnknown = true
++		err = errors.Join(err, errors.New("invalid route address set phase"))
++	}
++	unknown := t.routeAddressSetUnknown
++	t.routeAddressSetAccess.Unlock()
++	if unknown {
++		t.lifecycleAccess.Lock()
++		t.lifecycleClosed = true
++		t.lifecycleAccess.Unlock()
++		go t.Close() // this admitted callback must not synchronously join itself
++	}
+ 	if err != nil {
+ 		t.logger.Error("update route address set: ", err)
+ 	}
+ }
+ 
+-//nolint:unused
+ func (t *Inbound) routeAddressSetPrefixes() (include []netip.Prefix, exclude []netip.Prefix) {
+ 	t.routeAddressSetAccess.RLock()
+ 	defer t.routeAddressSetAccess.RUnlock()
+-	include = common.FlatMap(t.routeAddressSet, (*netipx.IPSet).Prefixes)
+-	if len(t.routeAddressSet) > 0 && len(include) == 0 {
++	if !t.autoRedirectStarted {
++		return routeAddressSetPrefixes(t.pendingRouteAddressSet, t.pendingRouteExcludeAddressSet)
++	}
++	return routeAddressSetPrefixes(t.routeAddressSet, t.routeExcludeAddressSet)
++}
++
++func routeAddressSetPrefixes(includeSets, excludeSets []*netipx.IPSet) (include []netip.Prefix, exclude []netip.Prefix) {
++	include = common.FlatMap(includeSets, (*netipx.IPSet).Prefixes)
++	if len(includeSets) > 0 && len(include) == 0 {
+ 		include = []netip.Prefix{netip.PrefixFrom(netip.IPv4Unspecified(), 32), netip.PrefixFrom(netip.IPv6Unspecified(), 128)}
+ 	}
+-	exclude = common.FlatMap(t.routeExcludeAddressSet, (*netipx.IPSet).Prefixes)
++	exclude = common.FlatMap(excludeSets, (*netipx.IPSet).Prefixes)
+ 	return
+ }
+ 
+ func (t *Inbound) InterfaceUpdated(ctx context.Context) {
++	if !t.beginOperation() {
++		return
++	}
++	defer t.lifecycleOperations.Done()
++	t.routeUpdateAccess.Lock()
++	defer t.routeUpdateAccess.Unlock()
+ 	tunStack := t.tunStack
+ 	if tunStack != nil {
+ 		tunStack.ResetNetwork()
+@@ -558,24 +673,84 @@ func (t *Inbound) InterfaceUpdated(ctx context.Context) {
+ }
+ 
+ func (t *Inbound) Close() error {
+-	return common.Close(
+-		t.tunStack,
+-		t.tunIf,
+-		t.autoRedirect,
+-	)
++	t.closeOnce.Do(func() {
++		t.closeError = errInboundCloseUnknown
++		inboundResidualCustody.Store(t, t)
++		defer func() {
++			if value := recover(); value != nil {
++				t.closeError = errors.Join(errInboundCloseUnknown, fmt.Errorf("TUN inbound cleanup panicked: %v", value))
++			}
++			if t.closeError == nil {
++				inboundResidualCustody.Delete(t)
++			}
++		}()
++		t.lifecycleAccess.Lock()
++		t.lifecycleClosed = true
++		t.lifecycleAccess.Unlock()
++		// Start may still be publishing callback registrations. Sealing first
++		// makes every delayed callback inert, then draining stabilizes the list.
++		t.lifecycleOperations.Wait()
++		for index, callback := range t.routeRuleSetCallback {
++			t.routeRuleSet[index].UnregisterCallback(callback)
++		}
++		for index, callback := range t.routeExcludeRuleSetCallback {
++			t.routeExcludeRuleSet[index].UnregisterCallback(callback)
++		}
++		// Redirect rules refer to the stack/TUN. Unknown withdrawal must retain
++		// those prerequisites and the rule-set references for this same owner.
++		if t.autoRedirect != nil {
++			if err := construction.Dispose("auto-redirect", t.autoRedirect, t.autoRedirectAttempted); err != nil {
++				t.closeError = errors.Join(errInboundCloseUnknown, err)
++				return
++			}
++		}
++		if t.tunStack != nil {
++			if err := t.tunStack.Close(); err != nil {
++				t.closeError = errors.Join(errInboundCloseUnknown, err)
++				return
++			}
++		}
++		if err := construction.Dispose("TUN interface", t.tunIf, t.tunStartAttempted); err != nil {
++			t.closeError = errors.Join(errInboundCloseUnknown, err)
++			return
++		}
++		for _, ruleSet := range t.routeRuleSetReferences {
++			ruleSet.DecRef()
++		}
++		t.closeError = nil
++	})
++	return t.closeError
++}
++
++// Disposal reaches only actually acquired objects through their construction
++// capability, rather than bypassing managers' runtimeOwner guard.
++func (t *Inbound) DisposeConstruction() error { return t.Close() }
++
++func (t *Inbound) beginOperation() bool {
++	t.lifecycleAccess.Lock()
++	defer t.lifecycleAccess.Unlock()
++	if t.lifecycleClosed {
++		return false
++	}
++	t.lifecycleOperations.Add(1)
++	return true
+ }
+ 
+ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
++	t.routeAddressSetAccess.RLock()
++	unknown := t.routeAddressSetUnknown
++	routeAddressSet := t.routeAddressSet
++	routeExcludeAddressSet := t.routeExcludeAddressSet
++	t.routeAddressSetAccess.RUnlock()
++	if unknown {
++		return tun.FlowVerdict{Action: tun.ActionDrop}
++	}
+ 	if slices.Contains(t.dnsHijackAddress, destination.Addr()) {
+ 		if network == uint8(header.UDPProtocolNumber) {
+ 			return tun.FlowVerdict{Action: tun.ActionHijackDNS}
+ 		}
+ 		return tun.FlowVerdict{Action: tun.ActionAccept}
+ 	}
+-	t.routeAddressSetAccess.RLock()
+-	routeAddressSet := t.routeAddressSet
+-	routeExcludeAddressSet := t.routeExcludeAddressSet
+-	t.routeAddressSetAccess.RUnlock()
+ 	destinationAddress := destination.Addr()
+ 	if len(routeAddressSet) > 0 && !slices.ContainsFunc(routeAddressSet, func(it *netipx.IPSet) bool {
+ 		return it.Contains(destinationAddress)
+diff --git a/protocol/tun/redirect_platform_linux.go b/protocol/tun/redirect_platform_linux.go
+index b1a024c..b773ae0 100644
+--- a/protocol/tun/redirect_platform_linux.go
++++ b/protocol/tun/redirect_platform_linux.go
+@@ -3,14 +3,15 @@
+ package tun
+ 
+ import (
++	"errors"
+ 	"net/netip"
+ 	"os"
++	"slices"
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/common/srs"
+ 	"github.com/sagernet/sing-tun"
+-	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 
+ 	"golang.org/x/sys/unix"
+@@ -18,9 +19,25 @@ import (
+ 
+ type platformAutoRedirect struct {
+ 	inbound        *Inbound
+-	redirectServer *tun.RedirectServer
+-	sessionAccess  sync.Mutex
+-	session        adapter.AutoRedirectSession
++	redirectServer interface {
++		Start() error
++		Close() error
++		Port() uint16
++		ListenerFileDescriptor() (int, error)
++	}
++	sessionAccess              sync.Mutex
++	session                    adapter.AutoRedirectSession
++	closed                     bool
++	startFailure               error
++	closeOnce                  sync.Once
++	closeError                 error
++	pipeAccess                 sync.Mutex
++	pipeClosed                 bool
++	pipeWriters                map[*os.File]struct{}
++	pipeWorkers                sync.WaitGroup
++	inputAccess                sync.RWMutex
++	inputSet                   bool
++	inputInclude, inputExclude []netip.Prefix
+ }
+ 
+ func newPlatformAutoRedirect(inbound *Inbound) (tun.AutoRedirect, error) {
+@@ -28,12 +45,18 @@ func newPlatformAutoRedirect(inbound *Inbound) (tun.AutoRedirect, error) {
+ }
+ 
+ func (r *platformAutoRedirect) Start() error {
++	r.sessionAccess.Lock()
++	defer r.sessionAccess.Unlock()
++	if r.closed {
++		return os.ErrClosed
++	}
+ 	handler := (*autoRedirectHandler)(r.inbound)
+ 	listenAddress := netip.IPv4Unspecified()
+ 	if len(r.inbound.tunOptions.Inet6Address) > 0 {
+ 		listenAddress = netip.IPv6Unspecified()
+ 	}
+ 	redirectServer := tun.NewRedirectServer(r.inbound.ctx, handler, r.inbound.logger, listenAddress)
++	r.redirectServer = redirectServer
+ 	if listenAddress.Is6() {
+ 		redirectServer.SetExternalTransparent()
+ 	}
+@@ -49,26 +72,40 @@ func (r *platformAutoRedirect) Start() error {
+ 		RouteAddressSetFileDescriptor:  r.routeAddressSetFileDescriptor,
+ 		Handler:                        handler,
+ 	})
+-	if err != nil {
+-		_ = redirectServer.Close()
+-		return err
+-	}
+-	r.redirectServer = redirectServer
+-	r.sessionAccess.Lock()
+ 	r.session = session
+-	r.sessionAccess.Unlock()
+-	return nil
++	if session == nil && err == nil {
++		err = E.New("platform auto-redirect returned no session")
++	}
++	r.startFailure = err
++	return err
+ }
+ 
+ func (r *platformAutoRedirect) routeAddressSetFileDescriptor() (int, error) {
+ 	include, exclude := r.inbound.routeAddressSetPrefixes()
++	r.inputAccess.RLock()
++	if r.inputSet {
++		include, exclude = slices.Clone(r.inputInclude), slices.Clone(r.inputExclude)
++	}
++	r.inputAccess.RUnlock()
++	r.pipeAccess.Lock()
++	defer r.pipeAccess.Unlock()
++	if r.pipeClosed {
++		return 0, os.ErrClosed
++	}
+ 	var pipeFds [2]int
+ 	err := unix.Pipe2(pipeFds[:], unix.O_CLOEXEC)
+ 	if err != nil {
+ 		return 0, E.Cause(err, "create route address set pipe")
+ 	}
+ 	writer := os.NewFile(uintptr(pipeFds[1]), "route-address-set")
++	if r.pipeWriters == nil {
++		r.pipeWriters = make(map[*os.File]struct{})
++	}
++	r.pipeWriters[writer] = struct{}{}
++	r.pipeWorkers.Add(1)
+ 	go func() {
++		defer r.pipeWorkers.Done()
++		defer func() { r.pipeAccess.Lock(); delete(r.pipeWriters, writer); r.pipeAccess.Unlock() }()
+ 		writeErr := srs.WriteRouteAddressSet(writer, include, exclude)
+ 		if writeErr != nil {
+ 			r.inbound.logger.Error("write route address set: ", writeErr)
+@@ -81,6 +118,10 @@ func (r *platformAutoRedirect) routeAddressSetFileDescriptor() (int, error) {
+ func (r *platformAutoRedirect) UpdateRouteAddressSet() error {
+ 	r.sessionAccess.Lock()
+ 	session := r.session
++	if r.closed {
++		r.sessionAccess.Unlock()
++		return os.ErrClosed
++	}
+ 	r.sessionAccess.Unlock()
+ 	if session == nil {
+ 		return nil
+@@ -89,8 +130,75 @@ func (r *platformAutoRedirect) UpdateRouteAddressSet() error {
+ }
+ 
+ func (r *platformAutoRedirect) Close() error {
++	r.closeOnce.Do(func() {
++		r.closeError = errInboundCloseUnknown
++		r.sessionAccess.Lock()
++		r.closed = true
++		session, server, startFailure := r.session, r.redirectServer, r.startFailure
++		r.sessionAccess.Unlock()
++		r.pipeAccess.Lock()
++		r.pipeClosed = true
++		r.pipeAccess.Unlock()
++		if session != nil {
++			if err := session.Close(); err != nil {
++				r.closeError = err
++				return
++			}
++		} else if startFailure != nil {
++			r.closeError = startFailure
++			return
++		}
++		// Session retirement authorizes closing owned producer FDs. Each actual
++		// pipe writer remains registered until its worker returns; no late Add.
++		r.pipeAccess.Lock()
++		r.pipeClosed = true
++		var pipeError error
++		for writer := range r.pipeWriters {
++			if err := writer.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
++				pipeError = errors.Join(pipeError, err)
++			}
++		}
++		r.pipeAccess.Unlock()
++		if pipeError != nil {
++			r.closeError = pipeError
++			return
++		}
++		r.pipeWorkers.Wait()
++		if server != nil {
++			if err := server.Close(); err != nil {
++				r.closeError = err
++				return
++			}
++		}
++		r.closeError = nil
++	})
++	return r.closeError
++}
++
++func (r *platformAutoRedirect) DisposeConstruction() error { return r.Close() }
++
++func (r *platformAutoRedirect) UpdateRouteAddressSetSnapshot(generation uint64, include, exclude []netip.Prefix) (result tun.RouteAddressSetUpdateResult, err error) {
++	result = tun.RouteAddressSetUpdateResult{Generation: generation, State: tun.RouteAddressSetUnchanged}
+ 	r.sessionAccess.Lock()
+-	session := r.session
+-	r.sessionAccess.Unlock()
+-	return common.Close(session, common.PtrOrNil(r.redirectServer))
++	defer r.sessionAccess.Unlock()
++	if r.closed {
++		return result, os.ErrClosed
++	}
++	updater, ok := r.session.(tun.AutoRedirectRouteAddressSetUpdater)
++	if !ok {
++		return result, tun.ErrAutoRedirectOwnershipUnsupported
++	}
++	include, exclude = slices.Clone(include), slices.Clone(exclude)
++	r.inputAccess.Lock()
++	previousSet, previousInclude, previousExclude := r.inputSet, r.inputInclude, r.inputExclude
++	r.inputSet, r.inputInclude, r.inputExclude = true, include, exclude
++	r.inputAccess.Unlock()
++	defer func() {
++		if result.Generation != generation || result.State != tun.RouteAddressSetCommitted {
++			r.inputAccess.Lock()
++			r.inputSet, r.inputInclude, r.inputExclude = previousSet, previousInclude, previousExclude
++			r.inputAccess.Unlock()
++		}
++	}()
++	return updater.UpdateRouteAddressSetSnapshot(generation, slices.Clone(include), slices.Clone(exclude))
+ }
