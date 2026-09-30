@@ -489,9 +489,166 @@ test('malformed or duplicate native metadata cannot be treated as a match', () =
   } finally { f.dispose(); }
 });
 
+test('real Git provider preserves dependency index modes and LF manifests without running Go', () => {
+  const result = JSON.parse(execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', String.raw`
+import copy, importlib.util, json, os, subprocess, sys, tempfile
+from pathlib import Path
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location('fixture_provider', sys.argv[1])
+provider = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(provider)
+def git(*args, cwd):
+    return subprocess.check_output(['git', *args], cwd=cwd, stderr=subprocess.PIPE).decode().strip()
+def repository(path, files):
+    path.mkdir()
+    git('init', '-q', cwd=path)
+    git('config', 'core.autocrlf', 'false', cwd=path)
+    git('config', 'core.filemode', 'true', cwd=path)
+    for name, (content, mode) in files.items():
+        (path / name).write_text(content)
+        (path / name).chmod(mode)
+    git('add', '-A', cwd=path)
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@invalid', 'commit', '-qm', 'fixture', cwd=path)
+    return git('rev-parse', 'HEAD', cwd=path)
+with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
+    root = Path(directory)
+    main = root / 'main'
+    commit = repository(main, {'go.mod': ('module example.com/core\n\ngo 1.25.5\n', 0o644), 'go.sum': ('fixture sum\n', 0o644)})
+    dependency = root / 'dependency'
+    upstream = repository(dependency, {'go.mod': ('module example.com/dependency\n\ngo 1.25.5\n', 0o644),
+        'input.go': ('package input\nconst value = 1\n', 0o644), 'keep.sh': ('kept executable\n', 0o755),
+        'mode.sh': ('new executable\n', 0o644), 'plain.sh': ('new plain\n', 0o755), 'remove.sh': ('deleted\n', 0o755)})
+    (dependency / 'input.go').write_text('package input\nconst value = 2\n')
+    (dependency / 'mode.sh').chmod(0o755)
+    (dependency / 'plain.sh').chmod(0o644)
+    (dependency / 'remove.sh').unlink()
+    (dependency / 'added.sh').write_text('added executable\n')
+    (dependency / 'added.sh').chmod(0o755)
+    git('add', '-A', cwd=dependency)
+    expected_tree = git('write-tree', cwd=dependency)
+    patch = root / 'dependency.patch'
+    patch.write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary', upstream], cwd=dependency))
+    git('reset', '--hard', upstream, cwd=dependency)
+    base = {'sourceCommit': commit, 'goVersion': '1.25.5', 'patches': [], 'dependencyPatches': []}
+    dep = {'name': 'dependency', 'module': 'example.com/dependency', 'sourceURL': 'https://github.com/fixture/dependency',
+        'upstreamCommit': upstream, 'upstreamVersion': 'v1.0.0', 'patchFile': patch.name,
+        'patchSha256': provider.digest(patch.read_bytes()), 'patchedTree': expected_tree}
+    second = root / 'second'
+    second_commit = repository(second, {'go.mod': ('module example.com/dependency-two\n\ngo 1.25.5\n', 0o644),
+        'input.go': ('package input\nconst value = 1\n', 0o644)})
+    (second / 'input.go').write_text('package input\nconst value = 2\n')
+    git('add', '-A', cwd=second)
+    second_tree = git('write-tree', cwd=second)
+    second_patch = root / 'second.patch'
+    second_patch.write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary', second_commit], cwd=second))
+    git('reset', '--hard', second_commit, cwd=second)
+    dep2 = {'name': 'second', 'module': 'example.com/dependency-two', 'sourceURL': 'https://github.com/fixture/second',
+        'upstreamCommit': second_commit, 'upstreamVersion': 'v1.0.0', 'patchFile': second_patch.name,
+        'patchSha256': provider.digest(second_patch.read_bytes()), 'patchedTree': second_tree}
+    dependencies = [dep, dep2]
+    go = root / 'go-stub'
+    go.write_text('never executed')
+    original_run, original_export = provider.run, provider.export_module
+    def replay(name, windows=False, declaration=None, corrupt=False):
+        manifest = copy.deepcopy(declaration if declaration is not None else base | {'dependencyPatches': dependencies})
+        manifest_path = root / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        checkout = root / name
+        # This is a private configuration file, never the user's global config.
+        config = root / 'fixture.gitconfig'
+        config.write_text('[core]\n\tautocrlf = ' + ('true' if windows else 'false') + '\n')
+        os.environ['GIT_CONFIG_GLOBAL'] = str(config)
+        def run(args, **kwargs):
+            if args[0] == str(go):
+                if args[1:] == ['version']:
+                    return 'go version go1.25.5 linux/amd64\n'
+                if args[1:3] == ['mod', 'edit']:
+                    edited = next(item for item in dependencies if args[3].startswith('-replace=' + item['module'] + '='))
+                    target = Path(kwargs['cwd']) / 'go.mod'
+                    target.write_text(target.read_text() + '\nreplace ' + edited['module'] + ' => ./polaris-dependencies/' + edited['name'] + '\n')
+                    return ''
+                if args[1:3] == ['list', '-m']:
+                    return '\n'.join(json.dumps({'Path': item['module'], 'Version': item['upstreamVersion'],
+                        'Replace': {'Path': './polaris-dependencies/' + item['name'], 'Dir': str(checkout / 'polaris-dependencies' / item['name'])}})
+                        for item in manifest['dependencyPatches'])
+                raise AssertionError('unexpected Go stub request: ' + repr(args))
+            assert args[0] == 'git', 'only Git and explicit in-process Go stubs are allowed'
+            try:
+                value = original_run(args, **kwargs)
+            except subprocess.CalledProcessError as error:
+                if name not in ('wrong-upstream', 'corrupt-input'):
+                    print(error.stderr.decode(), file=sys.stderr)
+                raise
+            if windows and args[1] == 'clone':
+                git('config', 'core.filemode', 'false', cwd=checkout)
+            return value
+        def export(repository, revision, target):
+            original_export(repository, revision, target)
+            if windows:
+                for file in target.rglob('*'):
+                    if file.is_file(): file.chmod(0o644)
+            if corrupt: (target / 'input.go').write_text('corrupt input\n')
+        provider.run, provider.export_module = run, export
+        return provider.provision(manifest_path, main, checkout, {dep['module']: dependency, dep2['module']: second}, go)
+    linux_plain = replay('linux-plain', declaration=base)
+    windows_plain = replay('windows-plain', True, declaration=base)
+    linux = replay('linux-dependency')
+    try:
+        windows = replay('windows-dependency', True)
+        windows_error = None
+    except (RuntimeError, subprocess.CalledProcessError) as error:
+        windows, windows_error = None, str(error)
+    rejected = {}
+    for name, declaration, corrupt, expected in [
+        ('wrong-patch', base | {'dependencyPatches': [dep | {'patchSha256': '0' * 64}]}, False, 'pinned patch hash'),
+        ('wrong-tree', base | {'dependencyPatches': [dep | {'patchedTree': '0' * 40}]}, False, 'patched tree differs'),
+        ('wrong-upstream', base | {'dependencyPatches': [dep | {'upstreamCommit': '0' * 40}]}, False, None),
+        ('corrupt-input', None, True, None),
+    ]:
+        try:
+            replay(name, True, declaration, corrupt)
+            raise AssertionError(name + ' unexpectedly accepted')
+        except (RuntimeError, subprocess.CalledProcessError) as error:
+            if expected: assert expected in str(error), str(error)
+            if name in ('wrong-patch', 'wrong-upstream'): assert not (root / name).exists()
+            rejected[name] = True
+    occupied = root / 'occupied'
+    occupied.mkdir()
+    (occupied / 'sentinel').write_text('retain existing checkout')
+    try:
+        replay('occupied')
+        raise AssertionError('occupied checkout accepted')
+    except RuntimeError as error:
+        assert 'fresh and empty' in str(error)
+        assert (occupied / 'sentinel').read_text() == 'retain existing checkout'
+        rejected['occupied'] = True
+    git('update-index', '--chmod=-x', 'polaris-dependencies/dependency/keep.sh', cwd=root / 'linux-dependency')
+    try:
+        provider.verify_checkout(root / 'linux-dependency', linux)
+        raise AssertionError('tampered index mode accepted')
+    except RuntimeError as error:
+        assert 'staged build source tree differs' in str(error)
+        rejected['tampered-index-mode'] = True
+    assert git('status', '--porcelain', cwd=main) == ''
+    assert git('status', '--porcelain', cwd=dependency) == ''
+    assert git('status', '--porcelain', cwd=second) == ''
+    print(json.dumps({'lfManifestEqual': linux_plain == windows_plain, 'sourceOnlyRawSums': [linux_plain['mainGoSumSha256'], windows_plain['mainGoSumSha256']],
+        'fullReceiptEqual': linux == windows, 'windowsError': windows_error, 'expectedTree': expected_tree,
+        'linuxTree': linux['dependencies'][0]['patchedTree'], 'rejected': rejected}))
+`, join(repo, 'scripts/core-source-provision.py')], {
+    encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+  }));
+  assert.equal(result.lfManifestEqual, true, JSON.stringify(result));
+  assert.equal(result.fullReceiptEqual, true, JSON.stringify(result));
+  assert.equal(result.windowsError, null);
+  assert.equal(result.linuxTree, result.expectedTree);
+  assert.deepEqual(result.rejected, { 'wrong-patch': true, 'wrong-tree': true, 'wrong-upstream': true,
+    'corrupt-input': true, occupied: true, 'tampered-index-mode': true });
+});
+
 test('shared source provider and desktop-only producers retain explicit platform impact', () => {
   assert.equal(digest(readFileSync(join(repo, 'scripts/core-source-provision.py'))),
-    'ef0238183e3076ed3cfa51df824cacd9a74bafa69f40298fa7aae7254e90a24d');
+    'b19f1568d6033e505dc7bd3f09918ac4e0d0f83435a204c2e58644d6d1efa44e');
   const provider = 'scripts/core-source-provision.py';
   const sharedImpact = classifyImpact([provider]);
   assert.equal(sharedImpact.kernel, true, provider);

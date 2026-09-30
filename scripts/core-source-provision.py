@@ -98,6 +98,9 @@ def provision(manifest_path, source_repo, checkout, module_repos=None, go_binary
         pinned_commit(module_repos[module], dependency["upstreamCommit"])
         patch_path(directory, dependency, dependency=True)
     run(["git", "clone", "--shared", "--no-checkout", str(source_repo), str(checkout)])
+    # Lock raw compiler/manifests to their source bytes even when the native
+    # runner's global Git configuration enables CRLF checkout conversion.
+    run(["git", "config", "--local", "core.autocrlf", "false"], cwd=checkout)
     run(["git", "checkout", "--detach", manifest["sourceCommit"]], cwd=checkout)
     for patch in patches:
         run(["git", "apply", "--check", str(patch)], cwd=checkout)
@@ -123,16 +126,23 @@ def provision(manifest_path, source_repo, checkout, module_repos=None, go_binary
         export_module(repository, dependency["upstreamCommit"], target)
         require(re.search(r"(?m)^module\s+" + re.escape(dependency["module"]) + r"\s*$", (target / "go.mod").read_text()), "dependency module identity differs")
         patch = patch_path(directory, dependency, dependency=True)
-        apply = ["git", "apply", "--directory=" + relative.as_posix()]
+        # Seed exact upstream blobs and modes from the pinned local repository.
+        # A Windows filesystem cannot supply Git's executable bits for new files.
+        run(["git", "fetch", "--no-tags", str(repository), dependency["upstreamCommit"]], cwd=checkout)
+        run(["git", "read-tree", "--prefix=" + relative.as_posix() + "/", dependency["upstreamCommit"]], cwd=checkout)
+        run(["git", "update-index", "--refresh"], cwd=checkout)
+        apply = ["git", "apply", "--index", "--directory=" + relative.as_posix()]
         run([*apply, "--check", str(patch)], cwd=checkout)
         run([*apply, str(patch)], cwd=checkout)
-        run(["git", "add", "-f", str(relative)], cwd=checkout)
         patched_tree = run(["git", "write-tree", "--prefix=" + relative.as_posix() + "/"], cwd=checkout).strip()
         require(patched_tree == dependency["patchedTree"], "dependency patched tree differs: " + dependency["module"])
         require(go_binary, "Go executable required for explicit dependency overrides")
         # This generated go.mod visibly names the patched source. No mutation
         # occurs in the supplied upstream tree or shared module cache.
         run([str(go_binary), "mod", "edit", "-replace=" + dependency["module"] + "=./" + relative.as_posix()], cwd=checkout, env=environment)
+        # The next dependency refresh must see the already generated manifest.
+        # The final receipt still hashes and stages both main module manifests.
+        run(["git", "add", "-f", "go.mod"], cwd=checkout)
         receipt["dependencies"].append({**dependency, "upstreamTree": tree,
                                          "replacement": "./" + relative.as_posix()})
     if dependencies:
