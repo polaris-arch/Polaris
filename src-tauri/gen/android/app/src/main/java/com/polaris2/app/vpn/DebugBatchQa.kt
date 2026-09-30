@@ -94,6 +94,7 @@ internal object DebugBatchQa {
             catch (_: Throwable) { task.rejectBeforeRun(); close("executor-rejected") }
         }
         fun guardTick(activity: Activity) {
+            if (lease.snapshot().sealed) { close(abortReason ?: "session-revoked"); return }
             // The deadline owner never calls SDK/Binder or waits an observer. A
             // blocked/redacted SDK sample expires and aborts; its original lease
             // remains Unknown until that actual task returns.
@@ -220,6 +221,101 @@ internal object DebugBatchQa {
         return checkNotNull(result)
     }
 
+    /** Both native bridge legs admit the immutable original probe ticket before queueing. */
+    private fun privateProbeTask(sessionId: String, success: (String) -> Unit,
+                                 failure: (Throwable) -> Unit,
+                                 credential: ByteArray? = null,
+                                 action: (Session, DebugBatchLease.CommandTicket) -> String): DebugBatchCommandTask {
+        check(BuildConfig.DEBUG) { "Debug core probe loan is disabled" }
+        require(sessionId.matches(Regex("[0-9a-f]{32}"))) { "Core probe session unavailable" }
+        val (session, ticket) = synchronized(gate) {
+            val original = checkNotNull(active?.takeIf { it.sessionId == sessionId }) { "Core probe session unavailable" }
+            original to checkNotNull(original.lease.commandBorn("probe")) { "Core probe session sealed" }
+        }
+        val buffer = credential?.let(::DebugCoreProbeCredentialBuffer)
+        val task = DebugBatchCommandTask(session.lease, ticket, { originalTicket ->
+            try {
+                check(session.prepared && session.allowed() && session.lease.ownsProbe(originalTicket)) { "Core probe session unavailable" }
+                success(action(session, originalTicket))
+            } finally { buffer?.let(session.lease::retire) }
+        }) { error -> session.close("core-probe-unavailable"); failure(error) }
+        try {
+            // Original command custody includes its queued credential. Guardian seal erases
+            // these bytes even if the shared command executor is blocked by another task.
+            if (buffer != null) {
+                check(session.lease.beginAcquire()) { "Core probe session sealed" }
+                check(session.lease.publish(buffer)) { "Core probe session sealed" }
+            }
+        } catch (error: Throwable) { task.rejectBeforeRun(error); throw error }
+        return task
+    }
+
+    /** Called before actual JNI input mutation and Stop seal; no I/O or native ownership here. */
+    fun nativeInputChanged(owner: MainKernelAttempt<*>) {
+        if (!BuildConfig.DEBUG) return
+        val original = synchronized(gate) {
+            active?.takeIf { it.binding.runId == owner.runId && it.binding.birthNonce == owner.birthNonce }
+        } ?: return
+        original.abortReason = original.abortReason ?: "native-input-changed"
+        original.lease.revokeProbeCredentials()
+    }
+
+    private fun Session.probeScope(generation: String) = DebugCoreProbeLoan.Scope(
+        appBootNonce, sessionId, nonce, planSha, apkSha, expectedSourcePin, generation,
+        binding.runId, binding.birthNonce, binding.revision, binding.digest, deadline,
+    )
+
+    /** No SDK/transport or batch gate around the actual Main operationLock/witness read. */
+    fun coreProbeScopeTask(sessionId: String, success: (String) -> Unit,
+                           failure: (Throwable) -> Unit): DebugBatchCommandTask =
+        privateProbeTask(sessionId, success, failure) { session, _ ->
+            val actual = checkNotNull(DebugCoreProbeLoan.currentInput()) { "Core probe Main input unavailable" }.snapshot
+            check(actual.runId == session.binding.runId && actual.birthNonce == session.binding.birthNonce &&
+                actual.revision == session.binding.revision && actual.configDigest == session.binding.digest && session.allowed()) {
+                "Core probe Main input changed"
+            }
+            val s = session.probeScope("") // Kotlin cannot invent a Rust lifecycle generation.
+            JSONObject().put("bootNonce", s.bootNonce).put("sessionId", s.sessionId).put("nonce", s.nonce)
+                .put("planSha256", s.planSha256).put("apkSha256", s.apkSha256).put("expectedSourcePin", s.expectedSourcePin)
+                .put("runId", s.runId).put("birthNonce", s.birthNonce).put("revision", s.revision)
+                .put("configDigest", s.configDigest).put("deadlineElapsed", s.deadlineElapsed)
+                .put("sampledElapsed", SystemClock.elapsedRealtime()).toString()
+        }
+
+    /**
+     * Source-only production admission: PC receiver ABI is not frozen, so erase the loan and
+     * explicitly leave transport NotObserved. No socket is created or CONNECT attempted.
+     */
+    fun coreProbeLoanTask(args: DebugCoreProbeLoanArgs, success: (String) -> Unit,
+                          failure: (Throwable) -> Unit): DebugBatchCommandTask {
+        try {
+            check(BuildConfig.DEBUG) { "Debug core probe loan is disabled" }
+            val requested = DebugCoreProbeLoan.Scope(args.bootNonce, args.sessionId, args.nonce, args.planSha256,
+                args.apkSha256, args.expectedSourcePin, args.generation, args.runId, args.birthNonce,
+                args.revision, args.configDigest, args.deadlineElapsed)
+            return privateProbeTask(args.sessionId, success, { error -> args.password.fill(0); failure(error) }, args.password) { session, ticket ->
+                try {
+                    val actualScope = session.probeScope(args.generation)
+                    val loan = DebugCoreProbeLoan.admit(actualScope,
+                        DebugCoreProbeLoan.Binding(requested, args.probePort, args.expiresElapsed),
+                        DebugCoreProbeLoan.currentInput(), session.lease, ticket, SystemClock.elapsedRealtime(), args.password)
+                    try {
+                        check(session.allowed() && loan.isCurrent(SystemClock.elapsedRealtime(), DebugCoreProbeLoan.currentInput())) {
+                            "Core probe input changed"
+                        }
+                    } finally { session.lease.retire(loan) }
+                    metadataReport(session, ticket).let(::JSONObject)
+                        .put("coreProbeLoan", "ActualStartBoundCredentialAdmittedAndErased")
+                        .put("coreProbeTransport", "NotObserved")
+                        .put("coreProbePath", "Unknown").toString()
+                } finally { args.password.fill(0) }
+            }
+        } catch (failure: Throwable) {
+            args.password.fill(0)
+            throw failure
+        }
+    }
+
     /** No SDK/files/registry here: this provisional source cannot arm before actual verification. */
     private fun provisionalSession(plan: String): Session {
         val input = JSONObject(plan)
@@ -227,15 +323,15 @@ internal object DebugBatchQa {
         val peers = input.getJSONArray("peers").let { a -> (0 until a.length()).map(a::getString) }
         val port = input.getInt("port"); val ttl = input.getLong("ttlMillis")
         DebugBatchProtocol.validatePlan(peers, port, ttl)
-        val sourcePin = input.getString("expectedSourcePin")
+        val expectedSourcePin = input.getString("expectedSourcePin")
         val apkSha = input.getString("apkSha256")
-        require(sourcePin.matches(Regex("[0-9a-f]{64}")) && apkSha.matches(Regex("[0-9a-f]{64}")))
+        require(expectedSourcePin.matches(Regex("[0-9a-f]{64}")) && apkSha.matches(Regex("[0-9a-f]{64}")))
         val before = DebugAppliedInputs.witness.snapshot()
         val binding = Binding(input.getString("runId"), input.getString("birthNonce"), input.getLong("nativeInputRevision"), checkNotNull(before.configDigest))
         require(before.runId == binding.runId && before.birthNonce == binding.birthNonce && before.revision == binding.revision && before.stage == "NativeInputReturned" && before.startAcknowledged)
         val secret = DebugBatchProtocol.unhex(input.getString("sessionSecret"))
-        val canonical = listOf(DebugBatchProtocol.SCHEMA, peers.sorted().joinToString(","), port.toString(), ttl.toString(), apkSha, sourcePin, binding.runId, binding.birthNonce, binding.revision.toString(), binding.digest).joinToString("|")
-        return Session(DebugBatchProtocol.sha(canonical), apkSha, sourcePin, peers, port, SystemClock.elapsedRealtime() + ttl, secret, binding)
+        val canonical = listOf(DebugBatchProtocol.SCHEMA, peers.sorted().joinToString(","), port.toString(), ttl.toString(), apkSha, expectedSourcePin, binding.runId, binding.birthNonce, binding.revision.toString(), binding.digest).joinToString("|")
+        return Session(DebugBatchProtocol.sha(canonical), apkSha, expectedSourcePin, peers, port, SystemClock.elapsedRealtime() + ttl, secret, binding)
     }
 
     private fun runCommand(activity: Activity, session: Session, ticket: DebugBatchLease.CommandTicket): String {

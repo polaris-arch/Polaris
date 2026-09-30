@@ -403,6 +403,7 @@ class BoxService(
     ) {
         val token = if (BuildConfig.DEBUG) runCatching {
             check(Thread.holdsLock(attempt.operationLock))
+            DebugBatchQa.nativeInputChanged(attempt)
             val digest = SystemStart.sha256(config.toByteArray(Charsets.UTF_8))
             DebugAppliedInputs.witness.begin(attempt, server, attempt.runId, attempt.birthNonce, digest)
         }.getOrNull() else null
@@ -570,7 +571,10 @@ class BoxService(
         val firstStop = state != ServiceState.Stopping
         closeFailed = false
         state = ServiceState.Stopping
-        if (BuildConfig.DEBUG) runCatching { DebugAppliedInputs.witness.seal(attempt) }
+        if (BuildConfig.DEBUG) runCatching {
+            DebugBatchQa.nativeInputChanged(attempt)
+            DebugAppliedInputs.witness.seal(attempt)
+        }
         val detachedTun = attempt.revokeAndDetachTun()
         StatsBridge.closeAll()
         unregisterStopReceiver()

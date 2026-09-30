@@ -242,6 +242,32 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun debugCoreProbeScope(invoke: Invoke) {
+        if (!BuildConfig.DEBUG) { invoke.reject("Debug core probe loan is disabled"); return }
+        val args = invoke.parseArgs(DebugCoreProbeSessionArgs::class.java)
+        val task = try {
+            DebugBatchQa.coreProbeScopeTask(args.sessionId,
+                { invoke.resolve(JSObject().put("scope", org.json.JSONObject(it))) },
+                { invoke.reject("Core probe scope unavailable") })
+        } catch (_: Throwable) { invoke.reject("Core probe scope unavailable"); return }
+        try { DebugBatchCommandExecutor.value.execute(task) }
+        catch (error: java.util.concurrent.RejectedExecutionException) { task.rejectBeforeRun(error) }
+    }
+
+    @Command
+    fun debugCoreProbeLoan(invoke: Invoke) {
+        if (!BuildConfig.DEBUG) { invoke.reject("Debug core probe loan is disabled"); return }
+        val args = invoke.parseArgs(DebugCoreProbeLoanEnvelopeArgs::class.java)
+        val task = try {
+            DebugBatchQa.coreProbeLoanTask(args.loan,
+                { invoke.resolve(JSObject().put("report", it)) },
+                { invoke.reject("Core probe loan unavailable") })
+        } catch (_: Throwable) { args.loan.password.fill(0); invoke.reject("Core probe loan unavailable"); return }
+        try { DebugBatchCommandExecutor.value.execute(task) }
+        catch (error: java.util.concurrent.RejectedExecutionException) { task.rejectBeforeRun(error) }
+    }
+
+    @Command
     fun collectDebugDiagnostics(invoke: Invoke) {
         if (!BuildConfig.DEBUG) { invoke.reject("Debug reports are disabled"); return }
         Thread {

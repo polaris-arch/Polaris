@@ -40,6 +40,19 @@ internal class DebugBatchLease {
         }
         if (owned) closeHandle(value)
     }
+    /** JNI-input/Stop metadata fence. Only known pure byte erasure here, no transport Close. */
+    fun revokeProbeCredentials() {
+        val credentials = synchronized(gate) {
+            sealed = true
+            handles.filter { it is DebugCoreProbeCredentialBuffer || it is DebugCoreProbeLoan }
+        }
+        credentials.forEach { value ->
+            when (value) {
+                is DebugCoreProbeCredentialBuffer -> value.erase()
+                is DebugCoreProbeLoan -> value.close() // pure byte erasure, original handle remains owned
+            }
+        }
+    }
     fun seal() {
         val owned = synchronized(gate) {
             sealed = true
@@ -63,6 +76,13 @@ internal class DebugBatchLease {
         if (!commands.containsKey(ticket)) false else { check(commands[ticket] == false); commands[ticket] = true; true }
     }
     fun commandReturned(ticket: CommandTicket) = synchronized(gate) { check(commands.remove(ticket) != null) }
+    /** Private resource loans use the original entered probe ticket, never a new command ledger. */
+    fun ownsProbe(ticket: CommandTicket): Boolean = synchronized(gate) {
+        !sealed && ticket.action == "probe" && commands[ticket] == true
+    }
+    fun ownsOpenHandle(value: Closeable): Boolean = synchronized(gate) {
+        !sealed && handles.contains(value) && !closingHandles.contains(value) && !residualHandles.contains(value)
+    }
     fun snapshot() = snapshotFor(null)
     /** Only the final pure metadata reporter may exclude its own entered ticket. */
     fun snapshotFor(reporter: CommandTicket?) = synchronized(gate) {

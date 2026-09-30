@@ -37,6 +37,13 @@ internal class DebugAppliedInputWitness {
         if (current?.owner === owner) { value = value.copy(stage = "Unknown", startAcknowledged = false); current = null }
     }
     fun snapshot(): Snapshot = synchronized(gate) { value.copy() }
+
+    /** An actual Main operationLock caller may bind the observation to both live references. */
+    fun snapshotFor(owner: Any, server: Any): Snapshot? = synchronized(gate) {
+        val token = current
+        if (token?.owner === owner && token.server === server &&
+            value.stage == "NativeInputReturned" && value.startAcknowledged) value.copy() else null
+    }
 }
 
 internal object DebugAppliedInputs { val witness = DebugAppliedInputWitness() }

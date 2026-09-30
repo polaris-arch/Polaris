@@ -735,6 +735,59 @@ pub(crate) async fn debug_batch_qa(
 }
 
 #[cfg(all(target_os = "android", debug_assertions))]
+pub(super) async fn debug_core_probe_scope(
+    session_id: String,
+) -> Result<super::android_probe_loan::DebugCoreProbeSessionScope, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DebugCoreProbeSessionArgs {
+        session_id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct DebugCoreProbeScopeResponse {
+        scope: super::android_probe_loan::DebugCoreProbeSessionScope,
+    }
+    let plugin = plugin_handle().map_err(|_| "Core probe bridge unavailable".to_owned())?;
+    call_with_budget::<DebugCoreProbeScopeResponse, _>(
+        plugin,
+        "debugCoreProbeScope",
+        DebugCoreProbeSessionArgs { session_id },
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .map(|r| r.scope)
+    .map_err(|_| "Core probe scope unavailable".to_owned())
+}
+
+/// Native plugin has no JS invoke_handler. Neither the public batch command nor any
+/// config/report command accepts or returns this credential-bearing type.
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(super) async fn debug_core_probe_loan(
+    loan: super::android_probe_loan::DebugCoreProbeLoanPayload,
+) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct DebugCoreProbeLoanEnvelopeArgs {
+        loan: super::android_probe_loan::DebugCoreProbeLoanPayload,
+    }
+    #[derive(serde::Deserialize)]
+    struct DebugCoreProbeLoanResponse {
+        report: String,
+    }
+    let plugin = plugin_handle().map_err(|_| "Core probe bridge unavailable".to_owned())?;
+    call_with_budget::<DebugCoreProbeLoanResponse, _>(
+        plugin,
+        "debugCoreProbeLoan",
+        DebugCoreProbeLoanEnvelopeArgs { loan },
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .map(|r| r.report)
+    .map_err(|_| "Core probe loan unavailable".to_owned())
+}
+
+#[cfg(all(target_os = "android", debug_assertions))]
 pub(crate) async fn collect_debug_diagnostics() -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct Diagnostics {

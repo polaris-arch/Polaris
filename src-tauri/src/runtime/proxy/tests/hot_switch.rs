@@ -2108,6 +2108,7 @@ fn mark_running_with_snapshot(rt: &ProxyRuntime, cfg: &Value) {
     // 两张表都装：生产的 build_switch_snapshot 同刻同源置两张，假快照漏一张会让被测腿看到
     // 「有全维表但 dirty 表空」这个生产里不可达的形态。
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        android_probe_input: None,
         mesh_mode_ready: false,
         dashboard_mode_selector: false,
         id_to_tag,

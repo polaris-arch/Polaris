@@ -121,6 +121,8 @@ pub(super) fn selected_server_present(config: &Value) -> bool {
 /// 停核清空（上游 :1386-1388）。
 #[derive(Debug, Clone, Default)]
 pub(super) struct SwitchSnapshot {
+    #[cfg(any(all(target_os = "android", debug_assertions), test))]
+    pub(super) android_probe_input: Option<super::android_probe_loan::AndroidProbeStartBinding>,
     pub(super) mesh_mode_ready: bool,
     pub(super) dashboard_mode_selector: bool,
     /// id → outbound tag（上游 `currentIdToTagMap`，:3480 = `buildIdToTagMap(config.servers)`）。
@@ -969,6 +971,8 @@ impl ProxyRuntime {
             &id_to_tag,
         );
         SwitchSnapshot {
+            #[cfg(any(all(target_os = "android", debug_assertions), test))]
+            android_probe_input: None,
             mesh_mode_ready: singbox_config
                 .experimental
                 .as_ref()

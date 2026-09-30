@@ -48,6 +48,7 @@ mod network_monitor;
 mod network_profile;
 mod platform_contracts;
 mod process_supervision;
+mod android_probe_loan;
 mod recovery;
 mod route_replan;
 mod startup;

@@ -1424,6 +1424,58 @@ a14SelfCheck();
       !command.includes('#[cfg(not(all(target_os = "android", debug_assertions)))]') || !command.includes('Debug Android batch QA is disabled')) fail('A15 Rust release/non-Android disabled stub missing');
 }
 
+// A16: native Debug loan remains a source-only, exact Start/session credential projection.
+{
+  const loanRust = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/android_probe_loan.rs'), 'utf8'));
+  const startRust = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/startup.rs'), 'utf8'));
+  const loanKt = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugCoreProbeLoan.kt'), 'utf8'));
+  const qa = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugBatchQa.kt'), 'utf8'));
+  const bridge = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/android_bridge.rs'), 'utf8'));
+  const command = stripComments(readFileSync(join(RUST_SRC, 'commands/android_batch_qa.rs'), 'utf8'));
+  for (const [name, args, admission] of [
+    ['debugCoreProbeScope', 'DebugCoreProbeSessionArgs', 'DebugBatchQa.coreProbeScopeTask('],
+    ['debugCoreProbeLoan', 'DebugCoreProbeLoanEnvelopeArgs', 'DebugBatchQa.coreProbeLoanTask('],
+  ]) {
+    const body = kotlinCommands.get(name)?.body ?? '';
+    const guard = body.indexOf('if (!BuildConfig.DEBUG)');
+    const parse = body.indexOf(`invoke.parseArgs(${args}::class.java)`);
+    const admit = body.indexOf(admission);
+    const queue = body.indexOf('DebugBatchCommandExecutor.value.execute(task)');
+    if (guard < 0 || parse <= guard || admit <= parse || queue <= admit || !body.slice(guard, parse).includes('return'))
+      fail(`A16 ${name} must guard Release and admit its original ticket before queueing`);
+  }
+  const fields = ['bootNonce', 'sessionId', 'nonce', 'planSha256', 'apkSha256', 'expectedSourcePin', 'generation',
+    'runId', 'birthNonce', 'revision', 'configDigest', 'deadlineElapsed', 'probePort', 'expiresElapsed', 'password'];
+  const rustFields = rustStructs.get('DebugCoreProbeLoanPayload')?.wireFields ?? [];
+  const argsBody = /class DebugCoreProbeLoanArgs\s*\{([\s\S]*?)override fun toString/.exec(loanKt)?.[1] ?? '';
+  const ktFields = [...argsBody.matchAll(/(?:lateinit\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*:/g)].map(m => m[1]);
+  if ([rustFields, ktFields].some(actual => actual.length !== fields.length || fields.some(f => !actual.includes(f))))
+    fail('A16 native loan exact wire field set differs between Rust and Kotlin');
+  if (!startRust.includes('self.record_android_probe_start(my_gen, &android_birth, &receipt)') ||
+      !startRust.includes('self.publish_android_probe_snapshot(') || !loanRust.includes('receipt.config_digest.clone()') ||
+      !loanRust.includes('with_current_generation(b.generation') || !loanRust.includes('s.android_probe_input.as_ref() != Some(b)') ||
+      /local_http_proxy\(|current_config|startup_snapshot|config\.current\(/.test(loanRust))
+    fail('A16 loan must bind actual Start receipt, publication and one current generation; no user-config/getter reconstruction');
+  const init = /pub\(crate\) fn init\(\)[\s\S]*?enum BridgeCallError/.exec(bridge)?.[0] ?? '';
+  if (!init || init.includes('invoke_handler') || /password|probe_port|DebugCoreProbeLoanArgs/.test(command))
+    fail('A16 credential loan must stay native-only; no JS plugin handler or public secret/port input');
+  const privateTask = kotlinFnBody(qa, 'privateProbeTask') ?? '';
+  if (!privateTask.includes('original.lease.commandBorn("probe")') || !privateTask.includes('session.lease.publish(buffer)') ||
+      !privateTask.includes('DebugCoreProbeCredentialBuffer') || !loanKt.includes('witness.snapshotFor(owner, server)') ||
+      !loanKt.includes('synchronized(owner.operationLock)') || !qa.includes('"coreProbeTransport", "NotObserved"') ||
+      /java\.net\.|Socket\(|CONNECT|bindProcessToNetwork|\.protect\(/.test(loanKt))
+    fail('A16 loan must retain original queued credential, actual Main witness and source-only no-transport boundary');
+  const box = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/BoxService.kt'), 'utf8'));
+  const nativeInput = kotlinFnBody(box, 'observeNativeInput') ?? '';
+  const invalidate = nativeInput.indexOf('DebugBatchQa.nativeInputChanged(attempt)');
+  const begin = nativeInput.indexOf('DebugAppliedInputs.witness.begin(');
+  const stop = box.indexOf('state = ServiceState.Stopping');
+  const stopRevoke = box.indexOf('DebugBatchQa.nativeInputChanged(attempt)', stop);
+  if (invalidate < 0 || begin <= invalidate || stopRevoke <= stop || stopRevoke >= box.indexOf('attempt.revokeAndDetachTun()', stop) ||
+      !qa.includes('original.lease.revokeProbeCredentials()') || !loanKt.includes('refreshInput(actual)'))
+    fail('A16 actual Start/Reload/Stop must fence credentials before input mutation; grant must refresh under operationLock');
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 if (failures.length > 0) {
   console.error('✗ check-android-bridge：Rust ⇄ Kotlin 起停核桥契约不一致\n');
