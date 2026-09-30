@@ -55,8 +55,11 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       const repository = join(work, name);
       mkdirSync(repository);
       run('git', ['init', '--quiet', repository], options);
-      run('git', ['-C', repository, 'fetch', '--depth=1', url, commit], options);
+      // A FETCH_HEAD-only repository clones as empty. Keep the exact pinned
+      // object reachable through a ref before the provider's shared clone.
+      run('git', ['-C', repository, 'fetch', '--depth=1', url, `${commit}:refs/heads/polaris-source`], options);
       requireGraph(capture('git', ['-C', repository, 'rev-parse', `${commit}^{commit}`]) === commit, 'Fetched upstream source commit differs');
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', 'refs/heads/polaris-source']) === commit, 'Fetched upstream source ref differs');
       return repository;
     };
     const repository = fetch('https://github.com/SagerNet/sing-box.git', source.sourceCommit, 'upstream');
@@ -71,13 +74,26 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     const checkout = join(work, 'checkout');
     requireGraph(canonical(JSON.parse(readFileSync(join(checkout, '.polaris-source-receipt.json'), 'utf8')))
       === canonical(receipt), 'Provider stdout and persisted receipt differ');
+    const stageCompilerInputs = () => {
+      // Git 2.53 rejects an excluded path when upstream also ignores it. Move
+      // only receipt metadata outside the checkout during staging, regardless
+      // of ignore policy, and restore its original bytes even when add fails.
+      const metadata = join(checkout, '.polaris-source-receipt.json');
+      const savedMetadata = join(work, 'source-receipt.staging.json');
+      renameSync(metadata, savedMetadata);
+      try {
+        run('git', ['add', '-A', '--', '.', ':(exclude).polaris-source-receipt.json'], { ...options, cwd: checkout });
+      } finally {
+        renameSync(savedMetadata, metadata);
+      }
+    };
     const buildOptions = { ...options, cwd: checkout };
     if (overlay) {
       run('git', ['apply', '--check', overlay], buildOptions);
       run('git', ['apply', overlay], buildOptions);
     }
     // Exclude untracked receipt metadata, retain relative replace source trees.
-    run('git', ['add', '-A', '--', '.', ':(exclude).polaris-source-receipt.json'], buildOptions);
+    stageCompilerInputs();
     const buildTree = capture('git', ['write-tree'], { cwd: checkout });
     requireGraph(buildTree === spec.platforms[key].buildTree, 'Platform source/overlay tree differs');
     const verifyCompilerInputs = () => {
@@ -112,7 +128,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       'Actual binary source buildID differs');
     const binarySha256 = digest(readFileSync(binary));
     if (!production.producer) verifyHash(binary, spec.platforms[key].binarySha256);
-    run('git', ['add', '-A', '--', '.', ':(exclude).polaris-source-receipt.json'], buildOptions);
+    stageCompilerInputs();
     requireGraph(capture('git', ['write-tree'], { cwd: checkout }) === buildTree, 'Build changed reviewed source graph');
     verifyCompilerInputs();
     const platformReceipt = { schema: 'polaris-desktop-core-v1', candidate: production.candidate, platform: key,
