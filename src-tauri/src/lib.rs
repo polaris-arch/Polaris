@@ -1309,6 +1309,7 @@ pub fn run() {
             backup_import_apply,
             backup_get_info,
             diagnostic_export,
+            debug_android_batch_qa,
             auto_start_set,
             auto_start_get_status,
             ipinfo_get,

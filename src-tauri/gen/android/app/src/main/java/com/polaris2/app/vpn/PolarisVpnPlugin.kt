@@ -42,6 +42,13 @@ class DebugReportArgs {
 }
 
 @InvokeArg
+class DebugBatchQaArgs {
+    lateinit var action: String
+    var sessionId: String? = null
+    var plan: String? = null
+}
+
+@InvokeArg
 class MainStartArgs {
     lateinit var configContent: String
     lateinit var runId: String
@@ -216,6 +223,22 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun transientSpeedtestStatus(invoke: Invoke) {
         val args = invoke.parseArgs(TransientSpeedtestInstanceArgs::class.java)
         invoke.resolve(JSObject().put("state", TransientSpeedtestHost.status(args.instanceId)))
+    }
+
+    @Command
+    fun debugBatchQa(invoke: Invoke) {
+        if (!BuildConfig.DEBUG) { invoke.reject("Debug batch QA is disabled"); return }
+        val args = invoke.parseArgs(DebugBatchQaArgs::class.java)
+        if (args.action.length > 32 || (args.sessionId?.length ?: 0) > 64 || (args.plan?.length ?: 0) > 4096) {
+            invoke.reject("Batch request outside finite profile"); return
+        }
+        try {
+            DebugBatchCommandExecutor.value.execute {
+                runCatching { DebugBatchQa.command(activity, args.action, args.sessionId, args.plan) }
+                    .onSuccess { invoke.resolve(JSObject().put("report", it)) }
+                    .onFailure { invoke.reject("Debug batch request unavailable") }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) { invoke.reject("Debug batch command queue is full") }
     }
 
     @Command

@@ -1388,6 +1388,27 @@ a14SelfCheck();
   }
 }
 
+// A15: the finite QA command must stay debug-only and observe actual JNI/ACK sites.
+{
+  const qa = kotlinCommands.get('debugBatchQa');
+  const body = qa?.body ?? '';
+  const guard = body.indexOf('if (!BuildConfig.DEBUG)');
+  const args = body.indexOf('invoke.parseArgs(DebugBatchQaArgs::class.java)');
+  const dispatch = body.indexOf('DebugBatchCommandExecutor.value.execute');
+  if (guard < 0 || args <= guard || dispatch <= args || !body.slice(guard, args).includes('return')) fail('A15 Debug batch release guard must precede executor/args/resource admission');
+  const box = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/BoxService.kt'), 'utf8'));
+  if ((box.match(/observeNativeInput\(attempt, server, config,/g) ?? []).length !== 2 ||
+      !box.includes('Thread.holdsLock(attempt.operationLock)') || !box.includes('DebugAppliedInputs.witness.returned(token, current() && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt))')) fail('A15 Actual Start/Reload JNI input observation or operationLock binding missing');
+  const ack = box.indexOf('val accepted = VpnBridge.finishStart(null, attempt = attempt)');
+  if (ack < 0 || box.indexOf('DebugAppliedInputs.witness.acknowledge(attempt, it, accepted)', ack) < ack) fail('A15 Start witness must use actual finishStart acceptance');
+  const stop = box.indexOf('state = ServiceState.Stopping');
+  const seal = box.indexOf('DebugAppliedInputs.witness.seal(attempt)', stop);
+  if (stop < 0 || seal < stop || seal > box.indexOf('attempt.revokeAndDetachTun()', stop)) fail('A15 Stop must seal the exact input observer before native cleanup');
+  const command = stripComments(readFileSync(join(RUST_SRC, 'commands/android_batch_qa.rs'), 'utf8'));
+  if (!command.includes('#[cfg(all(target_os = "android", debug_assertions))]') ||
+      !command.includes('#[cfg(not(all(target_os = "android", debug_assertions)))]') || !command.includes('Debug Android batch QA is disabled')) fail('A15 Rust release/non-Android disabled stub missing');
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 if (failures.length > 0) {
   console.error('✗ check-android-bridge：Rust ⇄ Kotlin 起停核桥契约不一致\n');

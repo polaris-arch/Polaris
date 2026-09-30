@@ -701,6 +701,40 @@ where
 
 /// Debug 报告使用相同的保活调用器；失败不影响代理生命周期。
 #[cfg(all(target_os = "android", debug_assertions))]
+pub(crate) async fn debug_batch_qa(
+    action: String,
+    session_id: Option<String>,
+    plan: Option<String>,
+) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DebugBatchQaArgs {
+        action: String,
+        session_id: Option<String>,
+        plan: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct DebugBatchQaResponse {
+        report: String,
+    }
+    let plugin = plugin_handle().map_err(|_| "Android batch bridge unavailable".to_owned())?;
+    call_with_budget::<DebugBatchQaResponse, _>(
+        plugin,
+        "debugBatchQa",
+        DebugBatchQaArgs {
+            action,
+            session_id,
+            plan,
+        },
+        Duration::from_secs(10),
+        None,
+    )
+    .await
+    .map(|result| result.report)
+    .map_err(|_| "Android batch request unavailable".to_owned())
+}
+
+#[cfg(all(target_os = "android", debug_assertions))]
 pub(crate) async fn collect_debug_diagnostics() -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct Diagnostics {

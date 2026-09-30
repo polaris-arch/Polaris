@@ -714,6 +714,10 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组断言要证伪的形态。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/commands/android_batch_qa.rs':
+    '单一 Debug Android 批次入口；android+debug_assertions 分支走已有预算 plugin 桥，其他构型零资源 disabled stub。'
+    + 'Android cargo check 守 cfg 类型，check-android-bridge A15 守 release guard/实际 BoxService 观察接线；'
+    + 'APK 构建不会执行 socket、SDK snapshot、OEM guardian 或独立 peer 验收。',
   'src-tauri/src/commands/window.rs':
     'app_restart 的共享 Rust 平台派发：Android 保留 QuitState/RestartState 与 request_restart 腿，'
     + '桌面才进入四 producer 的 prepare/commit 门；未新增 JNI 导出、Gradle 或包内资产契约。'

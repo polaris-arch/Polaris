@@ -27,6 +27,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.polaris2.app.MainActivity
+import com.polaris2.app.BuildConfig
 import com.polaris2.app.R
 import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
@@ -252,7 +253,9 @@ class BoxService(
                         // No login instance may hold this Tailscale state directory during main startup.
                         check(isStarting(attempt)) { "起核已被停核接管" }
                         SystemStart.requireLegacyAllowed(service)
-                        server.startOrReloadService(config, OverrideOptions())
+                        observeNativeInput(attempt, server, config, { isStarting(attempt) }) {
+                            server.startOrReloadService(config, OverrideOptions())
+                        }
                         SystemStart.requireLegacyAllowed(service)
                     }
                 }
@@ -265,7 +268,11 @@ class BoxService(
                 state = ServiceState.Started
                 StatsBridge.activateAll()
                 // The token check and bridge acknowledgement share Stop's lock.
-                VpnBridge.finishStart(null, attempt = attempt)
+                val accepted = VpnBridge.finishStart(null, attempt = attempt)
+                if (BuildConfig.DEBUG) runCatching {
+                    commandServer?.let { DebugAppliedInputs.witness.acknowledge(attempt, it, accepted) }
+                }
+                accepted
             }
             if (!acknowledged) {
                 // The native service may already be running. Keep its registry owner
@@ -292,6 +299,7 @@ class BoxService(
                     .onFailure { Log.e(TAG, "记录起核配置失败，系统发起的起核将不可用", it) }
             }
         } catch (e: Throwable) {
+            if (BuildConfig.DEBUG) runCatching { DebugAppliedInputs.witness.seal(attempt) }
             attempt.skipPreparation()
             // 🔴 这条 catch 此前只 Log.e + stopService()，Rust 侧什么都收不到 —— 那正是
             // 「静默没起来」的现场。先结账（把内核原话带回去），再拆自己。
@@ -374,7 +382,9 @@ class BoxService(
             },
             nativeReload = { server, config ->
                 // construct enters admission before OverrideOptions' first JNI allocation.
-                server.startOrReloadService(config, OverrideOptions())
+                observeNativeInput(attempt, server, config, { isReloadCurrent(attempt, server) }) {
+                    server.startOrReloadService(config, OverrideOptions())
+                }
                 SystemStart.requireLegacyAllowed(service)
             },
             setError = { server, error -> setReloadError(server, error) },
@@ -384,6 +394,28 @@ class BoxService(
             },
             logFailure = { Log.e(TAG, "重载失败 type=${it.javaClass.simpleName}") },
         )
+    }
+
+    /** Same operationLock as JNI. Digest/current lookups are outside the short observer gate. */
+    private fun observeNativeInput(
+        attempt: MainKernelAttempt<CommandServer>, server: CommandServer, config: String,
+        current: () -> Boolean, nativeCall: () -> Unit,
+    ) {
+        val token = if (BuildConfig.DEBUG) runCatching {
+            check(Thread.holdsLock(attempt.operationLock))
+            val digest = SystemStart.sha256(config.toByteArray(Charsets.UTF_8))
+            DebugAppliedInputs.witness.begin(attempt, server, attempt.runId, attempt.birthNonce, digest)
+        }.getOrNull() else null
+        if (BuildConfig.DEBUG && token == null) runCatching { DebugAppliedInputs.witness.seal(attempt) }
+        try {
+            nativeCall()
+            if (token != null) runCatching {
+                DebugAppliedInputs.witness.returned(token, current() && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt))
+            }
+        } catch (failure: Throwable) {
+            if (token != null) runCatching { DebugAppliedInputs.witness.failed(token) }
+            throw failure
+        }
     }
 
     private fun isReloadCurrent(attempt: MainKernelAttempt<CommandServer>, server: CommandServer): Boolean =
@@ -538,6 +570,7 @@ class BoxService(
         val firstStop = state != ServiceState.Stopping
         closeFailed = false
         state = ServiceState.Stopping
+        if (BuildConfig.DEBUG) runCatching { DebugAppliedInputs.witness.seal(attempt) }
         val detachedTun = attempt.revokeAndDetachTun()
         StatsBridge.closeAll()
         unregisterStopReceiver()

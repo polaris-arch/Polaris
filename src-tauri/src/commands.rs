@@ -495,6 +495,7 @@ pub(crate) mod guard_scan {
     }
 }
 
+pub mod android_batch_qa;
 pub mod config;
 pub mod helper;
 pub mod icon;
@@ -513,6 +514,7 @@ pub mod updater;
 pub mod vpn;
 pub mod window;
 
+pub use android_batch_qa::*;
 pub use config::*;
 pub use helper::*;
 pub use icon::*;
