@@ -469,7 +469,10 @@ class TransientSpeedtestSessionsTest {
         assertTrue(network.contains("callbacks.close { closed = true; listener = null }"))
         assertTrue(network.contains("thread.join()"))
         assertTrue(network.contains("resolver.closeUnused()"))
-        assertTrue(resolver.contains("lifecycle.deliver { if (rcode == 0) ctx.rawSuccess(answer) else ctx.errorCode(rcode) }"))
+        assertTrue(resolver.contains("query.awaitAndDeliver { it.deliver(ctx) }"))
+        val sdkCallbacks = resolver.substringAfter("// These top-level callback objects")
+        assertTrue(sdkCallbacks.contains("query.publish("))
+        assertFalse(sdkCallbacks.contains("ctx"))
     }
 
     @Test fun queuedNativeOwnerIsCapturedAndSealPreventsEveryPrepareResource() {
@@ -769,18 +772,24 @@ class TransientSpeedtestSessionsTest {
         val lateCallback = CountDownLatch(1)
         val releaseCallback = CountDownLatch(1)
         val callbackDone = CountDownLatch(1)
+        val queryDone = CountDownLatch(1)
         val oldContextWrites = AtomicInteger()
         val nextContextWrites = AtomicInteger()
         val engine = object : TransientSpeedtestSessions.Engine {
             private var proof = true
             override fun prepare() { }
             override fun start() {
-                resolver.enterQuery()
+                val query = resolver.enterQuery<Int>()
                 Thread {
                     lateCallback.countDown()
                     await(releaseCallback)
-                    resolver.deliver { oldContextWrites.incrementAndGet() }
+                    query.publish(1)
                     callbackDone.countDown()
+                }.start()
+                Thread {
+                    try { query.awaitAndDeliver { oldContextWrites.incrementAndGet() } }
+                    catch (_: java.util.concurrent.CancellationException) { }
+                    finally { query.returned(); queryDone.countDown() }
                 }.start()
             }
             override fun close() {
@@ -793,6 +802,7 @@ class TransientSpeedtestSessionsTest {
         await(lateCallback)
         val (closed, result) = close(sessions, id(1))
         await(closed)
+        await(queryDone)
         assertEquals(null, result.get())
         assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
         assertEquals("closed", sessions.status(id(1)))
@@ -818,7 +828,7 @@ class TransientSpeedtestSessionsTest {
         await(callbackDone)
         assertEquals(0, oldContextWrites.get())
         assertEquals(0, nextContextWrites.get())
-        assertTrue(runCatching { resolver.enterQuery() }.isFailure)
+        assertTrue(runCatching { resolver.enterQuery<Int>() }.isFailure)
         assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
         assertEquals(AndroidNativeAdmission.State.BirthEntered, ledger.state(nextTicket))
         assertTrue(TransientSpeedtestSessions.capabilities.isEmpty())
@@ -829,7 +839,7 @@ class TransientSpeedtestSessionsTest {
     @Test fun unusedResolverCanCloseAndRejectsQueriesThatArriveLater() {
         val resolver = TransientResolverLifecycle()
         resolver.closeUnused()
-        assertTrue(runCatching { resolver.enterQuery() }.isFailure)
+        assertTrue(runCatching { resolver.enterQuery<Int>() }.isFailure)
     }
 
     @Test fun actualNativeCloseFailureStillBlocksOrdinarySpeedtestAndMainConnection() {

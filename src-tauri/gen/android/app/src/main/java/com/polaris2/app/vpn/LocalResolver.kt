@@ -2,8 +2,8 @@
 // Copyright (C) 2022 by nekohasekai <contact-sagernet@sekai.icu>
 // 该项目按 GNU General Public License v3（或更新版本）分发，本文件因此继承 GPLv3。
 // 与上游的差异：上游用 kotlinx-coroutines 的 suspendCoroutine + runBlocking 把 DnsResolver 的
-// 异步回调转成同步；本仓不引 coroutines，改用 CountDownLatch（语义相同：Go 侧是同步调用，
-// 必须在本方法返回前把结果写进 ExchangeContext）。
+// 异步回调转成同步；本仓不引 coroutines，改用可撤销 mailbox。Go 侧是同步调用，
+// 结果仅由原调用线程在方法返回前写进 ExchangeContext。
 
 package com.polaris2.app.vpn
 
@@ -16,7 +16,6 @@ import io.nekohasekai.libbox.ExchangeContext
 import io.nekohasekai.libbox.LocalDNSTransport
 import java.net.InetAddress
 import java.net.UnknownHostException
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 
 /**
@@ -31,102 +30,58 @@ object LocalResolver : LocalDNSTransport by NetworkLocalResolver({ DefaultNetwor
 /** A login instance supplies its own physical-network monitor; the main resolver keeps its existing supplier. */
 internal class NetworkLocalResolver(private val currentNetwork: () -> android.net.Network?) : LocalDNSTransport {
     private val lifecycle = TransientResolverLifecycle()
-    // rawQuery（收发 DNS 报文原文）是 API 29 才有的；29 以下只能退到 InetAddress 级别的 lookup()。
     override fun raw(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
-    // 不用 direct executor：DnsResolver 在哪个线程回调是它的实现细节，万一它同步回调到调用线程，
-    // 下面的 latch.await() 就会等一个永远不会 countDown 的锁。给一份自己的线程池把这条排除掉。
-    private val executor = Executors.newCachedThreadPool()
+    // A queried executor must continue accepting SDK result/fd cleanup tasks, including after local close.
+    private val workers = Executors.newCachedThreadPool()
+    private val executor = lifecycle.sdkExecutor(workers)
 
-    /** Queried instances need a future SDK-callback drain contract, not ordinary Go Close. */
+    fun beginClose() = lifecycle.beginClose()
+
+    /** Only an unused resolver has a positive no-callback fact. Queried instances remain Unknown. */
     fun closeUnused() {
         lifecycle.closeUnused()
-        executor.shutdown()
-        if (!executor.isTerminated) throw TransientResolverLifecycle.CleanupUnknown()
+        workers.shutdown()
+        if (!workers.isTerminated) throw TransientResolverLifecycle.CleanupUnknown()
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    override fun exchange(ctx: ExchangeContext, message: ByteArray) {
-        lifecycle.enterQuery()
+    override fun exchange(ctx: ExchangeContext, message: ByteArray) = withQuery(ctx) { query ->
         val network = currentNetwork() ?: error("android: 没有可用的默认网络")
-        val latch = CountDownLatch(1)
         val signal = CancellationSignal()
-        var failure: Exception? = null
-        ctx.onCancel {
-            signal.cancel()
-            latch.countDown()
+        query.installCancellation { signal.cancel() }
+        if (query.enterSdkSubmission()) {
+            DnsResolver.getInstance().rawQuery(network, message, DnsResolver.FLAG_NO_RETRY,
+                executor, signal, RawResolverCallback(query))
         }
-        DnsResolver.getInstance().rawQuery(
-            network,
-            message,
-            DnsResolver.FLAG_NO_RETRY,
-            executor,
-            signal,
-            object : DnsResolver.Callback<ByteArray> {
-                override fun onAnswer(answer: ByteArray, rcode: Int) {
-                    lifecycle.deliver { if (rcode == 0) ctx.rawSuccess(answer) else ctx.errorCode(rcode) }
-                    latch.countDown()
-                }
-
-                override fun onError(error: DnsResolver.DnsException) {
-                    // errno 要原样回传：内核靠 ENETUNREACH / EPERM 之类区分「网络没了」与「查询失败」，
-                    // 一律翻成异常会让它把可重试的错误当成永久失败。
-                    lifecycle.deliver { when (val cause = error.cause) {
-                        is ErrnoException -> ctx.errnoCode(cause.errno)
-                        else -> failure = error
-                    } }
-                    latch.countDown()
-                }
-            },
-        )
-        latch.await()
-        failure?.let { throw it }
+        query.awaitAndDeliver { it.deliver(ctx) }
     }
 
-    override fun lookup(ctx: ExchangeContext, network: String, domain: String) {
-        lifecycle.enterQuery()
+    override fun lookup(ctx: ExchangeContext, network: String, domain: String) = withQuery(ctx) { query ->
         val defaultNetwork = currentNetwork() ?: error("android: 没有可用的默认网络")
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            val answer = try {
-                defaultNetwork.getAllByName(domain)
-            } catch (e: UnknownHostException) {
-                lifecycle.deliver { ctx.errorCode(RCODE_NXDOMAIN) }
-                return
+            // This SDK API is synchronous and has no cancellation handle. Keep the call counted until return.
+            if (query.canStartBlockingLookup()) {
+                val result = try {
+                    ResolverResult.Addresses(defaultNetwork.getAllByName(domain)
+                        .mapNotNull { it.hostAddress }.joinToString("\n"))
+                } catch (_: UnknownHostException) { ResolverResult.ErrorCode(RCODE_NXDOMAIN) }
+                query.publish(result)
             }
-            lifecycle.deliver { ctx.success(answer.mapNotNull { it.hostAddress }.joinToString("\n")) }
-            return
+        } else {
+            lookupQ(query, network, domain, defaultNetwork)
         }
-        lookupQ(ctx, network, domain, defaultNetwork)
+        query.awaitAndDeliver { it.deliver(ctx) }
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun lookupQ(ctx: ExchangeContext, network: String, domain: String, defaultNetwork: android.net.Network) {
-        val latch = CountDownLatch(1)
+    private fun lookupQ(query: TransientResolverLifecycle.Query<ResolverResult>, network: String,
+                        domain: String, defaultNetwork: android.net.Network) {
         val signal = CancellationSignal()
-        var failure: Exception? = null
-        ctx.onCancel {
-            signal.cancel()
-            latch.countDown()
-        }
-        val callback = object : DnsResolver.Callback<Collection<InetAddress>> {
-            override fun onAnswer(answer: Collection<InetAddress>, rcode: Int) {
-                lifecycle.deliver { if (rcode == 0) {
-                    ctx.success(answer.mapNotNull { it.hostAddress }.joinToString("\n"))
-                } else {
-                    ctx.errorCode(rcode)
-                } }
-                latch.countDown()
-            }
-
-            override fun onError(error: DnsResolver.DnsException) {
-                lifecycle.deliver { when (val cause = error.cause) {
-                    is ErrnoException -> ctx.errnoCode(cause.errno)
-                    else -> failure = error
-                } }
-                latch.countDown()
-            }
-        }
-        // network 形如 "tcp4" / "udp6" / "tcp"：内核用它表达「只要 A / 只要 AAAA / 都要」。
+        query.installCancellation { signal.cancel() }
+        if (!query.enterSdkSubmission()) return
+        val callback = AddressResolverCallback(query)
+        // network is tcp4/udp6/tcp: the core requests A, AAAA, or both.
         val type = when {
             network.endsWith("4") -> DnsResolver.TYPE_A
             network.endsWith("6") -> DnsResolver.TYPE_AAAA
@@ -138,28 +93,64 @@ internal class NetworkLocalResolver(private val currentNetwork: () -> android.ne
         } else {
             resolver.query(defaultNetwork, domain, DnsResolver.FLAG_NO_RETRY, executor, signal, callback)
         }
-        latch.await()
-        failure?.let { throw it }
+    }
+
+    private fun withQuery(ctx: ExchangeContext, action: (TransientResolverLifecycle.Query<ResolverResult>) -> Unit) {
+        val query = lifecycle.enterQuery<ResolverResult>()
+        val hook = TransientResolverCancelHook(query)
+        try {
+            // This registration captures only a clearable local holder, never ctx or this resolver.
+            ctx.onCancel { hook.cancel() }
+            action(query)
+        } catch (error: Throwable) {
+            query.cancel()
+            throw error
+        } finally {
+            // Does not prove physical JNI proxy reclamation or unregister Go's current cancellation goroutine.
+            hook.clear()
+            query.returned()
+        }
     }
 
     private val RCODE_NXDOMAIN = 3
 }
 
-/** A successful unused close is a positive no-callback fact; queried close stays unknown. */
-internal class TransientResolverLifecycle {
-    class CleanupUnknown : IllegalStateException("android: DNS callback cleanup unknown")
-    private val gate = Any()
-    @Volatile private var closed = false
-    private var queried = false
-    fun enterQuery() = synchronized(gate) {
-        check(!closed) { "android: DNS transport is closed" }
-        queried = true
+private sealed class ResolverResult {
+    data class Raw(val bytes: ByteArray) : ResolverResult()
+    data class Addresses(val value: String) : ResolverResult()
+    data class ErrorCode(val code: Int) : ResolverResult()
+    data class Errno(val code: Int) : ResolverResult()
+    data class Failure(val error: Exception) : ResolverResult()
+
+    // Only called on the original exchange/lookup stack, after its delivery permit.
+    fun deliver(ctx: ExchangeContext) = when (this) {
+        is Raw -> ctx.rawSuccess(bytes)
+        is Addresses -> ctx.success(value)
+        is ErrorCode -> ctx.errorCode(code)
+        is Errno -> ctx.errnoCode(code)
+        is Failure -> throw error
     }
-    fun closeUnused() = synchronized(gate) {
-        closed = true
-        if (queried) throw CleanupUnknown()
+}
+
+private fun resolverError(error: DnsResolver.DnsException): ResolverResult = when (val cause = error.cause) {
+    is ErrnoException -> ResolverResult.Errno(cause.errno)
+    else -> ResolverResult.Failure(error)
+}
+
+// These top-level callback objects retain only the pure Kotlin mailbox, with no native context or network supplier.
+private class RawResolverCallback(private val query: TransientResolverLifecycle.Query<ResolverResult>) :
+    DnsResolver.Callback<ByteArray> {
+    override fun onAnswer(answer: ByteArray, rcode: Int) {
+        query.publish(if (rcode == 0) ResolverResult.Raw(answer.copyOf()) else ResolverResult.ErrorCode(rcode))
     }
-    // Racing pre-close JNI writes keep their original ctx. Queried cleanup
-    // stays Unknown until a separate SDK/executor/JNI drain contract exists.
-    fun deliver(action: () -> Unit) { if (!closed) action() }
+    override fun onError(error: DnsResolver.DnsException) { query.publish(resolverError(error)) }
+}
+
+private class AddressResolverCallback(private val query: TransientResolverLifecycle.Query<ResolverResult>) :
+    DnsResolver.Callback<Collection<InetAddress>> {
+    override fun onAnswer(answer: Collection<InetAddress>, rcode: Int) {
+        query.publish(if (rcode == 0) ResolverResult.Addresses(answer.mapNotNull { it.hostAddress }.joinToString("\n"))
+            else ResolverResult.ErrorCode(rcode))
+    }
+    override fun onError(error: DnsResolver.DnsException) { query.publish(resolverError(error)) }
 }

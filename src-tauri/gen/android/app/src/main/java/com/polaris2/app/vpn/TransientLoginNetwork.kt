@@ -78,6 +78,9 @@ internal class TransientLoginNetwork(private val requireExactClose: Boolean = fa
         check(ready.await(5, TimeUnit.SECONDS) && network != null) { "android: 登录没有可用的物理网络" }
     }
 
+    /** Seal DNS admission and revoke undelivered results without waiting for a proof drain. */
+    fun beginResolverClose() = resolver.beginClose()
+
     fun close() {
         if (requireExactClose) callbacks.close { closed = true; listener = null }
         else { closed = true; listener = null }
