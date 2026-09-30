@@ -585,10 +585,10 @@ pub(super) const ENDPOINT_RETIRED_NO_BIRTH: &str = "API_ENDPOINT_RETIRED";
 
 #[cfg(target_os = "android")]
 mod handle {
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tauri::Wry;
+    use std::sync::OnceLock;
     use tauri::plugin::PluginHandle;
+    use tauri::Wry;
 
     /// 插件句柄。
     ///
@@ -1479,7 +1479,10 @@ enum TransientCloseError {
 #[cfg(any(target_os = "android", test))]
 impl std::fmt::Display for TransientCloseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::Failed(message) => f.write_str(message), Self::CapacityClosed(error) => error.fmt(f) }
+        match self {
+            Self::Failed(message) => f.write_str(message),
+            Self::CapacityClosed(error) => error.fmt(f),
+        }
     }
 }
 
@@ -1490,7 +1493,9 @@ fn speedtest_start_failure(
 ) -> SpeedtestStartError {
     match close {
         // A real Close failure has precedence over an admission-only diagnostic.
-        Err(TransientCloseError::Failed(_)) => SpeedtestStartError::CleanupUnknown("Android 测速临时核关闭结果未知；本轮已停止".to_owned()),
+        Err(TransientCloseError::Failed(_)) => SpeedtestStartError::CleanupUnknown(
+            "Android 测速临时核关闭结果未知；本轮已停止".to_owned(),
+        ),
         Ok(()) | Err(TransientCloseError::CapacityClosed(_)) if capacity.is_some() => {
             SpeedtestStartError::CapacityClosed(capacity.unwrap())
         }
@@ -1561,7 +1566,9 @@ pub(crate) async fn start_transient_speedtest(
 
 #[cfg(target_os = "android")]
 pub(crate) async fn close_transient_speedtest(instance_id: &str) -> Result<(), String> {
-    close_transient_speedtest_admitted(instance_id).await.map_err(|error| error.to_string())
+    close_transient_speedtest_admitted(instance_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "android")]

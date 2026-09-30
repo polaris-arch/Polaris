@@ -62,9 +62,9 @@ use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
 use polaris_config_engine::builder::system_interfaces::{
     raw_endpoint_requests_system_interface, system_interface_ownership_error,
 };
-use polaris_config_engine::singbox::DomainResolver;
 #[cfg(any(target_os = "android", test))]
 use polaris_config_engine::singbox::inbound::InboundUser;
+use polaris_config_engine::singbox::DomainResolver;
 use polaris_config_engine::user_config::protocol_settings::tailcat_emit_check;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;

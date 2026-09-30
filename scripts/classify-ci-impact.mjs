@@ -477,6 +477,11 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/proxy/android_capacity.rs': {
+    why: 'Android native admission capacity failures keep their typed identity through the Rust bridge, '
+      + 'login checker and speedtest spawn error. APK compilation must include these Android cfg branches '
+      + 'and their linked Rust cdylib; desktop tests cannot validate the packaged Android error adapter.',
+  },
   'src-tauri/src/runtime/speedtest.rs': {
     why: 'Android 临时测速核由独立 libbox 实例承载；改动会进入 APK 的 Rust cdylib。'
       + '真编 Android APK 可验证该 cfg 模块与 libbox/NDK 的链接，测速的运行期成败仍需设备验证。',

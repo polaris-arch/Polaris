@@ -47,12 +47,10 @@ fn capacity_progress_receipt_keeps_only_the_stable_reason() {
 #[tokio::test]
 async fn default_desktop_checker_preserves_accept_and_reject_without_classifying_capacity() {
     let path = Path::new("unused");
-    assert!(
-        FakeChecker { ok: true }
-            .check_admitted(path, path)
-            .await
-            .is_ok()
-    );
+    assert!(FakeChecker { ok: true }
+        .check_admitted(path, path)
+        .await
+        .is_ok());
     match (FakeChecker { ok: false }).check_admitted(path, path).await {
         Err(CheckFailure::Rejected(message)) => assert_eq!(message, "fake check 判定配置无效"),
         other => panic!("desktop fallback changed: {other:?}"),

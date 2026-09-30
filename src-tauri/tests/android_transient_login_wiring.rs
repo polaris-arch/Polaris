@@ -26,11 +26,8 @@ static REGISTRY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 
 #[test]
 fn android_login_uses_instance_factory_and_status_not_global_command_socket() {
-    assert!(
-        HOST.contains(
-            "Libbox.newTransientCommandServer(LoginHandler(requestClose), createdNetwork)"
-        )
-    );
+    assert!(HOST
+        .contains("Libbox.newTransientCommandServer(LoginHandler(requestClose), createdNetwork)"));
     assert!(!HOST.contains("server.start()"));
     assert!(HOST.contains("Libbox.hasTunInbound(value)"));
     assert!(!HOST.contains("VpnBridge."));
