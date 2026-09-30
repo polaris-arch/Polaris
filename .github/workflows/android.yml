@@ -77,6 +77,10 @@ on:
 permissions:
   contents: read
 
+# Shared provider imports are source reads; do not write Python bytecode into the App checkout.
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
 # 判据与 ci.yml / ui.yml 一致：调用方名称进并发组，Android 与 Release Risk 内的复用互不取消。
 concurrency:
   group: android-${{ github.workflow }}-${{ github.ref }}
@@ -294,6 +298,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          app_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$app_status" ]; then
+            echo "::error::App source candidate must be clean before libbox build"
+            git status --porcelain --untracked-files=all
+            exit 1
+          fi
           src="$RUNNER_TEMP/sing-box"
           # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
           # A named ref keeps the pinned core reachable in the provider's shared clone.
@@ -712,6 +722,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          app_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$app_status" ]; then
+            echo "::error::App source candidate must be clean before libbox build"
+            git status --porcelain --untracked-files=all
+            exit 1
+          fi
           src="$RUNNER_TEMP/sing-box"
           # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
           # A named ref keeps the pinned core reachable in the provider's shared clone.

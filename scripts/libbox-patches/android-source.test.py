@@ -604,5 +604,106 @@ class CIIdentityFixture(unittest.TestCase):
         print('Actual YAML identity shell controls: 14/14 PASS (two mirrors; no tool/cache execution)')
 
 
+class CIAppCleanFixture(unittest.TestCase):
+    def bytecode_environment(self):
+        text = (ROOT / '.github/workflows/android.yml').read_text()
+        match = re.search(r"(?m)^env:\n  PYTHONDONTWRITEBYTECODE: '1'\n", text)
+        self.assertIsNotNone(match, 'Both Android jobs must inherit no-bytecode before any provider import')
+        environment = os.environ.copy()
+        environment.pop('PYTHONPYCACHEPREFIX', None)
+        environment.update(PYTHONDONTWRITEBYTECODE='1', POLARIS_NO_KERNEL_RUN='1')
+        return environment
+
+    def app(self, directory):
+        app = Path(directory) / 'app'
+        files = ['.gitignore', 'scripts/libbox-patches/.gitignore',
+                 'scripts/libbox-patches/android-source.py', 'scripts/core-source-provision.py']
+        candidate = repository(app, {name: (ROOT / name).read_text() for name in files})
+        git('config', 'core.excludesFile', os.devnull, cwd=app)
+        return app, candidate
+
+    def load_provider(self, app, environment):
+        # Execute the actual identity provider import and actual clean predicate.
+        # No admission/tools/build action is called; the provider itself only imports here.
+        code = """import importlib.util, pathlib, subprocess
+path = pathlib.Path('scripts/libbox-patches/android-source.py')
+spec = importlib.util.spec_from_file_location('clean_fixture', path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.provider()
+def run(arguments, **kwargs):
+    kwargs.pop('capture', None)
+    return subprocess.run(arguments, check=True, text=True, stdout=subprocess.PIPE, **kwargs).stdout
+print(module.candidate(run))
+"""
+        return subprocess.run([sys.executable, '-c', code], cwd=app, env=environment,
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_real_provider_import_keeps_candidate_clean_without_ignoring_bytecode(self):
+        environment = self.bytecode_environment()
+        for disabled in (False, True):
+            with self.subTest(no_bytecode=disabled), tempfile.TemporaryDirectory(prefix='polaris-ci-app-clean-') as directory:
+                app, candidate = self.app(directory)
+                current = environment.copy()
+                if not disabled:
+                    current.pop('PYTHONDONTWRITEBYTECODE')
+                result = self.load_provider(app, current)
+                self.assertEqual(git('diff', '--name-only', cwd=app), '')
+                status = git('status', '--porcelain', '--untracked-files=all', cwd=app)
+                if disabled:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), candidate)
+                    self.assertEqual(status, '')
+                    self.assertFalse((app / 'scripts/__pycache__').exists())
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('App source candidate must be clean', result.stderr)
+                    self.assertRegex(status, r'^\?\? scripts/__pycache__/core-source-provision\.cpython-[0-9]+\.pyc$')
+
+    def test_real_candidate_still_rejects_tracked_and_untracked_compiler_inputs(self):
+        environment = self.bytecode_environment()
+        for kind in ('tracked', 'untracked'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='polaris-ci-app-dirty-') as directory:
+                app, _ = self.app(directory)
+                path = app / ('scripts/core-source-provision.py' if kind == 'tracked' else 'scripts/unowned-compiler.py')
+                path.write_text(path.read_text() + '\n# changed compiler input\n' if kind == 'tracked' else '# unowned compiler input\n')
+                before = git('status', '--porcelain', '--untracked-files=all', cwd=app)
+                result = self.load_provider(app, environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('App source candidate must be clean', result.stderr)
+                self.assertEqual(git('status', '--porcelain', '--untracked-files=all', cwd=app), before)
+
+    def test_actual_build_preludes_diagnose_exact_dirty_paths_and_stop(self):
+        text = (ROOT / '.github/workflows/android.yml').read_text()
+        blocks = re.findall(r'(?m)^      - name: Build libbox.aar \(缓存未命中\)\n((?:^        .*\n|^\n)+)', text)
+        self.assertEqual(len(blocks), 2)
+        for mirror, block in enumerate(blocks):
+            body = block.split('        run: |\n', 1)[1]
+            shell = '\n'.join(line[10:] for line in body.splitlines() if line.startswith('          '))
+            prelude = shell.split('src="$RUNNER_TEMP/sing-box"', 1)[0]
+            self.assertIn('git status --porcelain --untracked-files=normal', prelude)
+            self.assertIn('git status --porcelain --untracked-files=all', prelude)
+            for kind in ('clean', 'tracked', 'untracked'):
+                with self.subTest(mirror=mirror, kind=kind), tempfile.TemporaryDirectory(prefix='polaris-ci-clean-prelude-') as directory:
+                    app, _ = self.app(directory)
+                    path = app / ('scripts/core-source-provision.py' if kind == 'tracked' else 'scripts/unowned-compiler.py')
+                    if kind == 'tracked':
+                        path.write_text(path.read_text() + '\n# changed compiler input\n')
+                    elif kind == 'untracked':
+                        path.write_text('# unowned compiler input\n')
+                    before = git('status', '--porcelain', '--untracked-files=all', cwd=app)
+                    result = subprocess.run(['bash', '-c', prelude + '\nprintf "build_reached\\n"\n'],
+                                            cwd=app, env=self.bytecode_environment(), text=True,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(result.returncode, 0 if kind == 'clean' else 1, result.stderr)
+                    self.assertEqual(git('status', '--porcelain', '--untracked-files=all', cwd=app), before)
+                    if kind == 'clean':
+                        self.assertEqual(result.stdout, 'build_reached\n')
+                    else:
+                        self.assertNotIn('build_reached', result.stdout)
+                        self.assertIn('App source candidate must be clean before libbox build', result.stdout)
+                        self.assertIn(str(path.relative_to(app)), result.stdout)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
