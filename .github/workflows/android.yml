@@ -276,7 +276,9 @@ jobs:
           GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
           echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
           echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
-          echo "fingerprint=$(python3 scripts/libbox-patches/android-source.py identity)" >> "$GITHUB_OUTPUT"
+          fingerprint="$(python3 scripts/libbox-patches/android-source.py identity)"
+          [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
       - name: Cache libbox.aar
         id: libbox
@@ -676,7 +678,9 @@ jobs:
           GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
           echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
           echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
-          echo "fingerprint=$(python3 scripts/libbox-patches/android-source.py identity)" >> "$GITHUB_OUTPUT"
+          fingerprint="$(python3 scripts/libbox-patches/android-source.py identity)"
+          [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
       - name: Cache libbox.aar
         id: libbox

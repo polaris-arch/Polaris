@@ -470,5 +470,42 @@ class AndroidSourceFixture(unittest.TestCase):
             subprocess.run(['bash', '-n'], input=shell, text=True, check=True)
 
 
+class CIIdentityFixture(unittest.TestCase):
+    def test_actual_yaml_identity_refusal_before_output_and_lookup(self):
+        text = (ROOT / '.github/workflows/android.yml').read_text()
+        preparation_blocks = re.findall(
+            r'(?m)^      - name: Prepare libbox tools and source cache identity\n((?:^        .*\n|^\n)+)', text)
+        self.assertEqual(len(preparation_blocks), 2)
+        cases = [('exit7', '', 7, 7), ('empty', '', 0, 1), ('uppercase64', 'A' * 64, 0, 1),
+                 ('nonhex64', 'g' * 64, 0, 1), ('short63', 'a' * 63, 0, 1),
+                 ('long65', 'a' * 65, 0, 1), ('valid64', '0123456789abcdef' * 4, 0, 0)]
+        checked = 0
+        for index, block in enumerate(preparation_blocks):
+            run_body = block.split('        run: |\n', 1)[1]
+            actual_lines = [line[10:] for line in run_body.splitlines() if line.startswith('          ')]
+            identity_line = next(i for i, line in enumerate(actual_lines) if 'android-source.py identity' in line)
+            # Execute the actual YAML suffix and its actual shell failure policy.
+            # Only the identity callee is replaced; preceding SDK/tool preparation is outside this finite fixture.
+            source = actual_lines[0] + '\n' + '\n'.join(actual_lines[identity_line:]) + '\n'
+            for name, value, identity_exit, expected_exit in cases:
+                with self.subTest(mirror=index, case=name), tempfile.TemporaryDirectory(prefix='polaris-ci-identity-fixture-') as directory:
+                    output = Path(directory) / 'github-output'
+                    original = 'preexisting=retained\n'
+                    output.write_text(original)
+                    environment = os.environ.copy()
+                    environment.update(GITHUB_OUTPUT=str(output), IDENTITY_FIXTURE_VALUE=value,
+                                       IDENTITY_FIXTURE_EXIT=str(identity_exit))
+                    callee = ('python3() { [[ "$*" == "scripts/libbox-patches/android-source.py identity" ]] || return 97; '
+                              'printf "%s" "$IDENTITY_FIXTURE_VALUE"; return "$IDENTITY_FIXTURE_EXIT"; }\n')
+                    result = subprocess.run(['bash', '-c', callee + source + 'printf "cache_lookup_reached\\n"\n'],
+                                            env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(result.returncode, expected_exit, result.stderr)
+                    self.assertEqual(output.read_text(), original + ('fingerprint=' + value + '\n' if expected_exit == 0 else ''))
+                    self.assertEqual(result.stdout, 'cache_lookup_reached\n' if expected_exit == 0 else '')
+                    checked += 1
+        self.assertEqual(checked, 14)
+        print('Actual YAML identity shell controls: 14/14 PASS (two mirrors; no tool/cache execution)')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
