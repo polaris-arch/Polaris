@@ -232,13 +232,13 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         if (args.action.length > 32 || (args.sessionId?.length ?: 0) > 64 || (args.plan?.length ?: 0) > 4096) {
             invoke.reject("Batch request outside finite profile"); return
         }
-        try {
-            DebugBatchCommandExecutor.value.execute {
-                runCatching { DebugBatchQa.command(activity, args.action, args.sessionId, args.plan) }
-                    .onSuccess { invoke.resolve(JSObject().put("report", it)) }
-                    .onFailure { invoke.reject("Debug batch request unavailable") }
-            }
-        } catch (_: java.util.concurrent.RejectedExecutionException) { invoke.reject("Debug batch command queue is full") }
+        val task = try {
+            DebugBatchQa.commandTask(activity, args.action, args.sessionId, args.plan,
+                { invoke.resolve(JSObject().put("report", it)) },
+                { invoke.reject("Debug batch request unavailable") })
+        } catch (_: Throwable) { invoke.reject("Debug batch request unavailable"); return }
+        try { DebugBatchCommandExecutor.value.execute(task) }
+        catch (error: java.util.concurrent.RejectedExecutionException) { task.rejectBeforeRun(error) }
     }
 
     @Command

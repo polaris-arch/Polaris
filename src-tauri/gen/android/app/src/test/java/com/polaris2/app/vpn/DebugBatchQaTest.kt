@@ -115,4 +115,52 @@ class DebugBatchQaTest {
         assertEquals("bounded-guard-abort", DebugBatchGuard.abortReason(9000, 1000, 9000, 12000, true, 8900, true))
         assertEquals("bounded-guard-abort", DebugBatchGuard.abortReason(1500, 1000, 9000, 5000, false, 1500, true))
     }
+    @Test fun failedOriginalAndLateHandlesStayStrongWithoutBlindCloseRetry() {
+        for (late in listOf(false, true)) {
+            val lease = DebugBatchLease(); var calls = 0
+            val handle = Closeable { calls++; error("unknown close") }
+            assertTrue(lease.beginAcquire())
+            if (late) lease.seal()
+            assertEquals(!late, lease.publish(handle))
+            lease.seal(); lease.retire(handle); lease.seal()
+            val handles = lease.javaClass.getDeclaredField("handles").also { it.isAccessible = true }
+            assertTrue((handles.get(lease) as Set<*>).any { it === handle })
+            assertEquals(1, calls); assertEquals(1, lease.snapshot().handles)
+            assertEquals(1, lease.snapshot().residualHandles); assertEquals(0, lease.snapshot().closing)
+            assertTrue(lease.snapshot().closeFailed)
+        }
+    }
+    @Test fun queuedSealedAndRejectedCommandsKeepOriginalTicketsUntilActualCallbacksReturn() {
+        val lease = DebugBatchLease(); val ticket = checkNotNull(lease.commandBorn("snapshot"))
+        var failed = false
+        val queued = DebugBatchCommandTask(lease, ticket, {
+            check(!lease.snapshot().sealed); fail("sealed original command must not enter SDK")
+        }, { failed = true })
+        lease.seal(); assertEquals(1, lease.snapshot().commands)
+        queued.run(); assertTrue(failed); assertEquals(0, lease.snapshot().commands)
+        val other = DebugBatchLease(); val rejectedTicket = checkNotNull(other.commandBorn("snapshot"))
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val rejected = DebugBatchCommandTask(other, rejectedTicket, { fail("rejected work ran") }, {
+            entered.countDown(); check(release.await(3, TimeUnit.SECONDS))
+        })
+        val thread = Thread { rejected.rejectBeforeRun(IllegalStateException("executor rejected")) }
+        thread.start(); assertTrue(entered.await(3, TimeUnit.SECONDS)); other.seal()
+        assertEquals(1, other.snapshot().commands)
+        release.countDown(); thread.join(3000); assertFalse(thread.isAlive)
+        rejected.run(); assertEquals(0, other.snapshot().commands)
+    }
+    @Test fun onlyExactEnteredCleanupReporterCanExcludeItselfAndNeverAnotherCommand() {
+        val lease = DebugBatchLease()
+        val original = checkNotNull(lease.commandBorn("snapshot")); assertTrue(lease.commandEntered(original))
+        val reporter = checkNotNull(lease.commandBorn("cleanupObserve")); assertTrue(lease.commandEntered(reporter))
+        lease.seal()
+        assertEquals(2, lease.snapshot().commands); assertEquals(1, lease.snapshotFor(reporter).commands)
+        assertEquals(2, lease.snapshotFor(original).commands)
+        val foreign = checkNotNull(DebugBatchLease().commandBorn("cleanupObserve"))
+        assertEquals(2, lease.snapshotFor(foreign).commands)
+        lease.commandReturned(original); assertEquals(0, lease.snapshotFor(reporter).commands)
+        assertEquals(1, lease.snapshot().commands); lease.commandReturned(reporter)
+        val close = checkNotNull(lease.commandBorn("close")); assertTrue(lease.commandEntered(close))
+        assertEquals(1, lease.snapshotFor(close).commands); lease.commandReturned(close)
+    }
 }

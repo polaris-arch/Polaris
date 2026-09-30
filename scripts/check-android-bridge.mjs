@@ -1396,6 +1396,21 @@ a14SelfCheck();
   const args = body.indexOf('invoke.parseArgs(DebugBatchQaArgs::class.java)');
   const dispatch = body.indexOf('DebugBatchCommandExecutor.value.execute');
   if (guard < 0 || args <= guard || dispatch <= args || !body.slice(guard, args).includes('return')) fail('A15 Debug batch release guard must precede executor/args/resource admission');
+  const admission = body.indexOf('DebugBatchQa.commandTask(activity, args.action, args.sessionId, args.plan');
+  if (admission <= args || dispatch <= admission || !body.includes('execute(task)') || body.includes('DebugBatchQa.command(activity'))
+    fail('A15 Batch command must capture its original session ticket before queueing');
+  const qaSource = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugBatchQa.kt'), 'utf8'));
+  const tick = kotlinFnBody(qaSource, 'guardTick') ?? '';
+  if (!tick.includes('DebugBatchGuard.abortReason(') || !tick.includes('previous?.bindingCurrent') ||
+      /bindingCurrent\(|MainKernelAttemptRegistry|getSystemService|\.readText\(|java\.io\./.test(tick))
+    fail('A15 Guardian deadline must use local/stamped metadata without synchronous registry/SDK/files');
+  const metadata = kotlinFnBody(qaSource, 'metadataReport') ?? '';
+  if (!metadata.includes('session.completeFor(reporter)') || !metadata.includes('CachedReadOnlyMetadata') ||
+      /bindingCurrent\(|snapshotBody\(|getSystemService|MainKernelAttemptRegistry|\.readText\(|java\.io\./.test(metadata))
+    fail('A15 Cleanup reporter must stay metadata-only and exclude only its exact ticket');
+  if (!qaSource.includes('original to checkNotNull(original.lease.commandBorn(action))') ||
+      !qaSource.includes('DebugBatchCommandTask(session.lease, ticket,') || !qaSource.includes('session.prepared && session.bindingCurrent()'))
+    fail('A15 Original session admission or provisional-before-arm verification missing');
   const box = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/BoxService.kt'), 'utf8'));
   if ((box.match(/observeNativeInput\(attempt, server, config,/g) ?? []).length !== 2 ||
       !box.includes('Thread.holdsLock(attempt.operationLock)') || !box.includes('DebugAppliedInputs.witness.returned(token, current() && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt))')) fail('A15 Actual Start/Reload JNI input observation or operationLock binding missing');

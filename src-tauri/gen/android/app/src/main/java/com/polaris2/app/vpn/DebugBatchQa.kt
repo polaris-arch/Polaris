@@ -40,6 +40,7 @@ internal object DebugBatchQa {
     private class Session(val planSha: String, val apkSha: String, val expectedSourcePin: String,
                           val peers: List<String>, val port: Int, val deadline: Long,
                           val secret: ByteArray, val binding: Binding) {
+        val appBootNonce = bootNonce // captured at admission; metadata reporters never initialize RNG
         val sessionId = id(16)
         val nonce = id(24)
         val tcpInstance = id(16)
@@ -54,12 +55,14 @@ internal object DebugBatchQa {
         @Volatile var abortReason: String? = null
         @Volatile var tcpBound = false
         @Volatile var udpBound = false
-        data class PlatformSignal(val sampledAt: Long, val allowed: Boolean)
+        @Volatile var prepared = false // actual APK verification and owner observation have returned
+        @Volatile var lastSnapshot: String? = null
+        data class PlatformSignal(val sampledAt: Long, val allowed: Boolean, val bindingCurrent: Boolean)
         private val createdAt = SystemClock.elapsedRealtime()
         private val signalPending = AtomicBoolean(false)
         @Volatile private var signal: PlatformSignal? = null
         @Volatile private var signalTask: DebugBatchTask? = null
-        fun platformReady(): Boolean = signal.let { DebugBatchGuard.platformReady(SystemClock.elapsedRealtime(), it?.sampledAt, it?.allowed) }
+        fun platformReady(): Boolean = signal.let { DebugBatchGuard.platformReady(SystemClock.elapsedRealtime(), it?.sampledAt, it?.let { s -> s.allowed && s.bindingCurrent }) }
         fun bindingCurrent(): Boolean {
             val input = DebugAppliedInputs.witness.snapshot()
             val owner = MainKernelAttemptRegistry.ownerForDrain()?.attempt
@@ -68,7 +71,7 @@ internal object DebugBatchQa {
                 owner?.runId == binding.runId && owner.birthNonce == binding.birthNonce && !owner.revoked
         }
         fun allowed() = armed && !lease.snapshot().sealed && SystemClock.elapsedRealtime() < deadline &&
-                        SystemClock.elapsedRealtime() < controllerLeaseUntil && platformReady() && bindingCurrent()
+                        SystemClock.elapsedRealtime() < controllerLeaseUntil && platformReady()
         fun close(reason: String) {
             abortReason = abortReason ?: reason
             tcp.seal(); udp.seal()
@@ -78,9 +81,10 @@ internal object DebugBatchQa {
             // No join here: a guardian or I/O callback may be the caller. External
             // cleanupObserve reads actual executor termination and the exact ledger.
         }
-        fun complete(): Boolean {
-            val s = lease.snapshot()
-            return s.sealed && s.workers == 0 && s.acquiring == 0 && s.closing == 0 && s.handles == 0 &&
+        fun complete(): Boolean = completeFor(null)
+        fun completeFor(reporter: DebugBatchLease.CommandTicket?): Boolean {
+            val s = lease.snapshotFor(reporter)
+            return s.sealed && s.workers == 0 && s.commands == 0 && s.acquiring == 0 && s.closing == 0 && s.handles == 0 &&
                    !s.closeFailed && io.isTerminated && guardian.isTerminated
         }
         fun submit(action: () -> Unit) {
@@ -95,23 +99,27 @@ internal object DebugBatchQa {
             // remains Unknown until that actual task returns.
             val now = SystemClock.elapsedRealtime()
             val previous = signal
-            DebugBatchGuard.abortReason(now, createdAt, deadline, controllerLeaseUntil, bindingCurrent(), previous?.sampledAt, previous?.allowed)
+            DebugBatchGuard.abortReason(now, createdAt, deadline, controllerLeaseUntil, previous?.bindingCurrent ?: true, previous?.sampledAt, previous?.allowed)
                 ?.let { close(it); return }
             if (previous != null && now - previous.sampledAt < 1000 || !signalPending.compareAndSet(false, true)) return
             if (!lease.workerBorn()) { signalPending.set(false); return }
             val task = DebugBatchTask(lease, {
-                try {
-                    if (lease.snapshot().sealed) return@DebugBatchTask
-                    val power = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
-                    val keyguard = activity.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-                    val resumed = (activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
-                    val observed = PlatformSignal(SystemClock.elapsedRealtime(), power.isInteractive && !keyguard.isKeyguardLocked && resumed)
-                    if (!lease.snapshot().sealed) signal = observed
-                } finally { signalPending.set(false) }
+                try { samplePlatform(activity) } finally { signalPending.set(false) }
             }) { close("guard-observer-unavailable") }
             signalTask = task
             try { DebugBatchCommandExecutor.value.execute(task) }
             catch (_: Throwable) { task.rejectBeforeRun(); close("guard-observer-rejected") }
+        }
+        private fun samplePlatform(activity: Activity) {
+            if (lease.snapshot().sealed) return
+            // Stamp before every potentially blocked registry/SDK boundary, never after it.
+            val sampledAt = SystemClock.elapsedRealtime()
+            val current = bindingCurrent()
+            val power = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val keyguard = activity.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+            val resumed = (activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
+            val observed = PlatformSignal(sampledAt, power.isInteractive && !keyguard.isKeyguardLocked && resumed, current)
+            if (!lease.snapshot().sealed) signal = observed
         }
         fun tcpLoop() {
             if (!lease.beginAcquire()) return
@@ -168,58 +176,134 @@ internal object DebugBatchQa {
         }
     }
 
-    /** Caller input is intent only. Snapshot facts are sourced here, never supplied by JS. */
-    fun command(activity: Activity, action: String, sessionId: String?, plan: String?): String {
-        check(BuildConfig.DEBUG) { "Debug batch QA is disabled" } // before session/executor/socket creation
+    /** Admit the immutable original session before the first shared-executor queue boundary. */
+    fun commandTask(activity: Activity, action: String, sessionId: String?, plan: String?,
+                    success: (String) -> Unit, failure: (Throwable) -> Unit): DebugBatchCommandTask {
+        check(BuildConfig.DEBUG) { "Debug batch QA is disabled" }
         require(action in setOf("prepare", "arm", "snapshot", "probe", "health", "close", "cleanupObserve"))
-        if (action == "prepare") {
-            val input = JSONObject(checkNotNull(plan))
-            require(input.keys().asSequence().toSet() == setOf("peers", "port", "ttlMillis", "apkSha256", "expectedSourcePin", "sessionSecret", "runId", "birthNonce", "nativeInputRevision"))
-            val peers = input.getJSONArray("peers").let { a -> (0 until a.length()).map(a::getString) }
-            val port = input.getInt("port"); val ttl = input.getLong("ttlMillis")
-            DebugBatchProtocol.validatePlan(peers, port, ttl)
-            val sourcePin = input.getString("expectedSourcePin")
-            require(sourcePin.matches(Regex("[0-9a-f]{64}")))
-            val apkSha = activity.applicationInfo.sourceDir.let { filename ->
-                val digest = MessageDigest.getInstance("SHA-256")
-                java.io.File(filename).inputStream().use { stream -> val bytes = ByteArray(65536); while (true) { val n = stream.read(bytes); if (n < 0) break; digest.update(bytes, 0, n) } }
-                DebugBatchProtocol.hex(digest.digest())
-            }
-            require(apkSha == input.getString("apkSha256")) { "actual APK differs" }
-            val before = DebugAppliedInputs.witness.snapshot()
-            val binding = Binding(input.getString("runId"), input.getString("birthNonce"), input.getLong("nativeInputRevision"), checkNotNull(before.configDigest))
-            require(before.runId == binding.runId && before.birthNonce == binding.birthNonce && before.revision == binding.revision && before.stage == "NativeInputReturned" && before.startAcknowledged)
-            val secret = DebugBatchProtocol.unhex(input.getString("sessionSecret"))
-            val canonical = listOf(DebugBatchProtocol.SCHEMA, peers.sorted().joinToString(","), port.toString(), ttl.toString(), apkSha, sourcePin, binding.runId, binding.birthNonce, binding.revision.toString(), binding.digest).joinToString("|")
-            val session = Session(DebugBatchProtocol.sha(canonical), apkSha, sourcePin, peers, port, SystemClock.elapsedRealtime() + ttl, secret, binding)
-            val accepted = synchronized(gate) {
-                if (active != null && !checkNotNull(active).complete()) false else {
+        require(action.length <= 32 && (sessionId?.length ?: 0) <= 64 && (plan?.length ?: 0) <= 4096)
+        val candidate = if (action == "prepare") provisionalSession(checkNotNull(plan)) else null
+        val (session, ticket) = try {
+            synchronized(gate) {
+                val original = if (candidate != null) {
+                    check(active == null || checkNotNull(active).complete()) { "another batch still owns resources" }
                     active?.let { it.secret.fill(0); lastClosed = it }
-                    active = session; true
-                }
+                    active = candidate
+                    candidate
+                } else active?.takeIf { it.sessionId == sessionId }
+                    ?: if (action == "cleanupObserve") lastClosed?.takeIf { it.sessionId == sessionId } else null
+                checkNotNull(original) { "session not owned by this app boot" }
+                original to checkNotNull(original.lease.commandBorn(action)) { "session already sealed" }
             }
-            if (!accepted) { session.close("another-session"); secret.fill(0); error("another batch still owns resources") }
+        } catch (error: Throwable) {
+            candidate?.close("admission-rejected"); candidate?.secret?.fill(0); throw error
+        }
+        val task = DebugBatchCommandTask(session.lease, ticket, { originalTicket ->
+            if (session.lease.snapshot().sealed && originalTicket.action !in setOf("close", "cleanupObserve"))
+                error("original session was sealed before command entered")
+            success(runCommand(activity, session, originalTicket))
+        }) { error -> session.close("command-unavailable"); failure(error) }
+        if (action == "prepare") {
             try { session.guardian.scheduleAtFixedRate({ try { session.guardTick(activity) } catch (_: Throwable) { session.close("guardian-failed") } }, 0, 250, TimeUnit.MILLISECONDS) }
             catch (_: Throwable) { session.close("guardian-rejected") }
-            return snapshot(activity, session)
         }
-        val session = synchronized(gate) {
-            active?.takeIf { it.sessionId == sessionId }
-                ?: if (action == "cleanupObserve") lastClosed?.takeIf { it.sessionId == sessionId } else null
-        } ?: error("session not owned by this app boot")
-        when (action) {
+        return task
+    }
+
+    /** Direct internal callers use the identical custody path; Release rejects before any resource. */
+    fun command(activity: Activity, action: String, sessionId: String?, plan: String?): String {
+        check(BuildConfig.DEBUG) { "Debug batch QA is disabled" }
+        var result: String? = null
+        var error: Throwable? = null
+        commandTask(activity, action, sessionId, plan, { result = it }, { error = it }).run()
+        error?.let { throw it }
+        return checkNotNull(result)
+    }
+
+    /** No SDK/files/registry here: this provisional source cannot arm before actual verification. */
+    private fun provisionalSession(plan: String): Session {
+        val input = JSONObject(plan)
+        require(input.keys().asSequence().toSet() == setOf("peers", "port", "ttlMillis", "apkSha256", "expectedSourcePin", "sessionSecret", "runId", "birthNonce", "nativeInputRevision"))
+        val peers = input.getJSONArray("peers").let { a -> (0 until a.length()).map(a::getString) }
+        val port = input.getInt("port"); val ttl = input.getLong("ttlMillis")
+        DebugBatchProtocol.validatePlan(peers, port, ttl)
+        val sourcePin = input.getString("expectedSourcePin")
+        val apkSha = input.getString("apkSha256")
+        require(sourcePin.matches(Regex("[0-9a-f]{64}")) && apkSha.matches(Regex("[0-9a-f]{64}")))
+        val before = DebugAppliedInputs.witness.snapshot()
+        val binding = Binding(input.getString("runId"), input.getString("birthNonce"), input.getLong("nativeInputRevision"), checkNotNull(before.configDigest))
+        require(before.runId == binding.runId && before.birthNonce == binding.birthNonce && before.revision == binding.revision && before.stage == "NativeInputReturned" && before.startAcknowledged)
+        val secret = DebugBatchProtocol.unhex(input.getString("sessionSecret"))
+        val canonical = listOf(DebugBatchProtocol.SCHEMA, peers.sorted().joinToString(","), port.toString(), ttl.toString(), apkSha, sourcePin, binding.runId, binding.birthNonce, binding.revision.toString(), binding.digest).joinToString("|")
+        return Session(DebugBatchProtocol.sha(canonical), apkSha, sourcePin, peers, port, SystemClock.elapsedRealtime() + ttl, secret, binding)
+    }
+
+    private fun runCommand(activity: Activity, session: Session, ticket: DebugBatchLease.CommandTicket): String {
+        when (ticket.action) {
+            "prepare" -> {
+                val apkSha = activity.applicationInfo.sourceDir.let { filename ->
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    java.io.File(filename).inputStream().use { stream -> val bytes = ByteArray(65536); while (true) { val n = stream.read(bytes); if (n < 0) break; digest.update(bytes, 0, n) } }
+                    DebugBatchProtocol.hex(digest.digest())
+                }
+                check(apkSha == session.apkSha && session.bindingCurrent()) { "actual source differs" }
+                synchronized(session) {
+                    check(!session.lease.snapshot().sealed && SystemClock.elapsedRealtime() < session.deadline)
+                    session.prepared = true
+                }
+            }
             "arm" -> {
-                check(session.bindingCurrent() && session.platformReady() && SystemClock.elapsedRealtime() < session.deadline)
+                check(session.prepared && session.bindingCurrent() && session.platformReady() && SystemClock.elapsedRealtime() < session.deadline)
                 synchronized(session) { check(!session.armed && !session.lease.snapshot().sealed); session.armed = true }
                 session.submit(session::tcpLoop); session.submit(session::udpLoop)
             }
             "health" -> if (!session.lease.snapshot().sealed) session.controllerLeaseUntil = minOf(session.deadline, SystemClock.elapsedRealtime() + 10000)
             "close" -> session.close("controller-close")
         }
-        return snapshot(activity, session)
+        // Only these two controls are metadata-only. Only cleanupObserve's exact
+        // entered ticket may be excluded after this purely local report is formed.
+        return if (ticket.action in setOf("close", "cleanupObserve")) metadataReport(session, ticket)
+               else snapshotBody(activity, session).also { session.lastSnapshot = it }
     }
 
+    /** Also protects a direct actual snapshot seam, independently of the plugin queue wrapper. */
     private fun snapshot(activity: Activity, session: Session): String {
+        val ticket = checkNotNull(session.lease.commandBorn())
+        check(session.lease.commandEntered(ticket))
+        return try { snapshotBody(activity, session) } finally { session.lease.commandReturned(ticket) }
+    }
+
+    private fun metadataReport(session: Session, reporter: DebugBatchLease.CommandTicket): String {
+        val report = session.lastSnapshot?.let(::JSONObject) ?: JSONObject()
+            .put("schema", DebugBatchProtocol.SCHEMA).put("profile", "lan-inbound-app-witness")
+            .put("source", if (session.prepared) "AppLive" else "AppUnverified")
+            .put("bootNonce", session.appBootNonce).put("sessionId", session.sessionId).put("nonce", session.nonce)
+            .put("planSha", session.planSha).put("apkSha256", if (session.prepared) session.apkSha else "Unknown")
+            .put("expectedSourcePin", session.expectedSourcePin).put("input", JSONObject().put("stage", "Unknown"))
+            .put("builderTunScope", JSONObject().put("source", "Unknown")).put("vpnUnderlying", "Unknown")
+        fun counter(v: DebugBatchCounter.Snapshot) = JSONObject().put("matched", v.matched).put("health", v.health)
+            .put("invalid", v.invalid).put("replay", v.replay).put("bytes", v.bytes).put("sealed", v.sealed)
+        val lease = session.lease.snapshot()
+        val others = session.lease.snapshotFor(reporter)
+        report.put("tcp", counter(session.tcp.snapshot())).put("udp", counter(session.udp.snapshot()))
+            .put("abortReason", session.abortReason).put("result", if (session.abortReason != null) "Aborted" else "PreparedOnly")
+            .put("networkObservationStatus", if (session.lastSnapshot != null) "PreviouslyObservedReadOnly" else "Unknown")
+            .put("networkSnapshotScope", "CachedReadOnlyMetadata")
+            .put("cleanup", JSONObject().put("state", if (session.completeFor(reporter)) "OwnedWitnessResourcesReturned" else "Unknown")
+                .put("workers", lease.workers).put("commands", lease.commands).put("commandsExcludingThisReporter", others.commands)
+                .put("acquiring", lease.acquiring).put("closing", lease.closing).put("handles", lease.handles)
+                .put("residualHandles", lease.residualHandles).put("closeFailed", lease.closeFailed)
+                .put("ioTerminated", session.io.isTerminated).put("guardianTerminated", session.guardian.isTerminated)
+                .put("observationScope", "OnlyExactMetadataCleanupObserveReporterExcluded")
+                .put("artifacts", "ArtifactsNotCreated").put("independentOldSessionHealth", "NotObserved").put("mainNativeCleanup", "Unknown"))
+        if (lease.sealed || !session.prepared) {
+            report.getJSONObject("input").put("stage", "Unknown").put("startAcknowledged", false)
+            report.put("builderTunScope", JSONObject().put("source", "Unknown"))
+        }
+        return report.toString()
+    }
+
+    private fun snapshotBody(activity: Activity, session: Session): String {
         val firstOwner = MainKernelAttemptRegistry.ownerForDrain()?.attempt
         val first = DebugAppliedInputs.witness.snapshot()
         val scope = firstOwner?.currentTunScope()
@@ -240,7 +324,7 @@ internal object DebugBatchQa {
         fun outcome(value: DebugBatchCounter.Snapshot) = if (value.matched > 0) "ObservedPass" else if (value.health > 0) "ObservedNoMatch" else "NotObserved"
         val lease = session.lease.snapshot()
         return JSONObject().put("schema", DebugBatchProtocol.SCHEMA).put("profile", "lan-inbound-app-witness")
-            .put("source", "AppLive").put("bootNonce", bootNonce).put("sessionId", session.sessionId).put("nonce", session.nonce)
+            .put("source", "AppLive").put("bootNonce", session.appBootNonce).put("sessionId", session.sessionId).put("nonce", session.nonce)
             .put("planSha", session.planSha).put("apkSha256", session.apkSha).put("expectedSourcePin", session.expectedSourcePin)
             .put("packageName", activity.packageName).put("uid", Process.myUid()).put("pid", Process.myPid())
             .put("buildVersion", BuildConfig.VERSION_NAME).put("selinuxDomain", runCatching {
@@ -259,8 +343,8 @@ internal object DebugBatchQa {
             .put("networks", networks?.let(::JSONArray)).put("networkObservationStatus", if (networks == null) "Unknown" else "ObservedReadOnly")
             .put("networkSnapshotScope", "NonAtomicReadOnly").put("vpnUnderlying", "Unknown")
             .put("cleanup", JSONObject().put("state", if (session.complete()) "OwnedWitnessResourcesReturned" else "Unknown")
-                .put("workers", lease.workers).put("acquiring", lease.acquiring).put("closing", lease.closing)
-                .put("handles", lease.handles).put("closeFailed", lease.closeFailed).put("ioTerminated", session.io.isTerminated)
+                .put("workers", lease.workers).put("commands", lease.commands).put("acquiring", lease.acquiring).put("closing", lease.closing)
+                .put("handles", lease.handles).put("residualHandles", lease.residualHandles).put("closeFailed", lease.closeFailed).put("ioTerminated", session.io.isTerminated)
                 .put("guardianTerminated", session.guardian.isTerminated).put("artifacts", "ArtifactsNotCreated")
                 .put("independentOldSessionHealth", "NotObserved").put("mainNativeCleanup", "Unknown"))
             .put("cases", JSONObject().put("tcpWitness", outcome(session.tcp.snapshot())).put("udpAppSocket", outcome(session.udp.snapshot()))
