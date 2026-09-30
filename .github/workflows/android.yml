@@ -295,20 +295,36 @@ jobs:
         run: |
           set -euo pipefail
           src="$RUNNER_TEMP/sing-box"
-          # upstream tag 与 pinned commit 对拍；patched output 使用共同 sourceBuild.version。
-          git clone --depth 1 --branch "v${{ steps.core.outputs.version }}" \
-            https://github.com/SagerNet/sing-box "$src"
-          # Each dependency repository is explicit; shared provider performs the only replay.
+          # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
+          # A named ref keeps the pinned core reachable in the provider's shared clone.
           python3 - "$RUNNER_TEMP" <<'PYDEPS'
           import json, pathlib, subprocess, sys
           source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
+          core = json.loads(pathlib.Path('src-tauri/core-manifest.json').read_text())
+          directory = pathlib.Path(sys.argv[1])
+          def revision(repository, ref):
+              return subprocess.check_output(['git', '-C', str(repository), 'rev-parse', ref], text=True).strip()
+          def fetch(url, commit, name):
+              repository = directory / name
+              repository.mkdir()  # Refuse stale runner checkouts; every input is fetched fresh.
+              subprocess.run(['git', 'init', '--quiet', str(repository)], check=True)
+              ref = 'refs/heads/polaris-source'
+              subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, commit + ':' + ref], check=True)
+              if revision(repository, commit + '^{commit}') != commit or revision(repository, ref) != commit:
+                  raise RuntimeError('Fetched upstream object/ref differs from manifest pin: ' + name)
+              return repository
+          url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
+          repository = fetch(url, source['sourceCommit'], 'sing-box')
+          tag = 'refs/tags/v' + core['bundledCoreVersion']
+          subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, tag + ':' + tag], check=True)
+          if revision(repository, tag + '^{commit}') != source['sourceCommit']:
+              raise RuntimeError('Upstream version tag differs from source-manifest commit')
+          subprocess.run(['git', '-C', str(repository), 'checkout', '--detach', source['sourceCommit']], check=True)
           values = []
           for dependency in source['dependencyPatches']:
-              repository = pathlib.Path(sys.argv[1]) / ('polaris-upstream-' + dependency['name'])
-              subprocess.run(['git', 'clone', '--no-checkout', dependency['sourceURL'], str(repository)], check=True)
-              subprocess.run(['git', '-C', str(repository), 'cat-file', '-e', dependency['upstreamCommit'] + '^{commit}'], check=True)
+              repository = fetch(dependency['sourceURL'], dependency['upstreamCommit'], 'polaris-upstream-' + dependency['name'])
               values.append('--module-source=' + dependency['module'] + '=' + str(repository))
-          pathlib.Path(sys.argv[1], 'polaris-module-sources.json').write_text(json.dumps(values))
+          (directory / 'polaris-module-sources.json').write_text(json.dumps(values))
           PYDEPS
           (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
           mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
@@ -697,20 +713,36 @@ jobs:
         run: |
           set -euo pipefail
           src="$RUNNER_TEMP/sing-box"
-          # upstream tag 与 pinned commit 对拍；patched output 使用共同 sourceBuild.version。
-          git clone --depth 1 --branch "v${{ steps.core.outputs.version }}" \
-            https://github.com/SagerNet/sing-box "$src"
-          # Each dependency repository is explicit; shared provider performs the only replay.
+          # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
+          # A named ref keeps the pinned core reachable in the provider's shared clone.
           python3 - "$RUNNER_TEMP" <<'PYDEPS'
           import json, pathlib, subprocess, sys
           source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
+          core = json.loads(pathlib.Path('src-tauri/core-manifest.json').read_text())
+          directory = pathlib.Path(sys.argv[1])
+          def revision(repository, ref):
+              return subprocess.check_output(['git', '-C', str(repository), 'rev-parse', ref], text=True).strip()
+          def fetch(url, commit, name):
+              repository = directory / name
+              repository.mkdir()  # Refuse stale runner checkouts; every input is fetched fresh.
+              subprocess.run(['git', 'init', '--quiet', str(repository)], check=True)
+              ref = 'refs/heads/polaris-source'
+              subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, commit + ':' + ref], check=True)
+              if revision(repository, commit + '^{commit}') != commit or revision(repository, ref) != commit:
+                  raise RuntimeError('Fetched upstream object/ref differs from manifest pin: ' + name)
+              return repository
+          url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
+          repository = fetch(url, source['sourceCommit'], 'sing-box')
+          tag = 'refs/tags/v' + core['bundledCoreVersion']
+          subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, tag + ':' + tag], check=True)
+          if revision(repository, tag + '^{commit}') != source['sourceCommit']:
+              raise RuntimeError('Upstream version tag differs from source-manifest commit')
+          subprocess.run(['git', '-C', str(repository), 'checkout', '--detach', source['sourceCommit']], check=True)
           values = []
           for dependency in source['dependencyPatches']:
-              repository = pathlib.Path(sys.argv[1]) / ('polaris-upstream-' + dependency['name'])
-              subprocess.run(['git', 'clone', '--no-checkout', dependency['sourceURL'], str(repository)], check=True)
-              subprocess.run(['git', '-C', str(repository), 'cat-file', '-e', dependency['upstreamCommit'] + '^{commit}'], check=True)
+              repository = fetch(dependency['sourceURL'], dependency['upstreamCommit'], 'polaris-upstream-' + dependency['name'])
               values.append('--module-source=' + dependency['module'] + '=' + str(repository))
-          pathlib.Path(sys.argv[1], 'polaris-module-sources.json').write_text(json.dumps(values))
+          (directory / 'polaris-module-sources.json').write_text(json.dumps(values))
           PYDEPS
           (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
           mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.

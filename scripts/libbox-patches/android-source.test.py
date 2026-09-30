@@ -470,6 +470,103 @@ class AndroidSourceFixture(unittest.TestCase):
             subprocess.run(['bash', '-n'], input=shell, text=True, check=True)
 
 
+class CISourceFetchFixture(unittest.TestCase):
+    def programs(self):
+        text = (ROOT / '.github/workflows/android.yml').read_text()
+        blocks = re.findall(r'(?m)^          python3 - "\$RUNNER_TEMP" <<\'PYDEPS\'\n(.*?)^          PYDEPS$', text, re.S)
+        self.assertEqual(len(blocks), 2)
+        programs = ['\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines()) for block in blocks]
+        self.assertEqual(programs[0], programs[1])
+        self.assertGreater(len(programs[0]), 1000)
+        return programs
+
+    def test_actual_yaml_exact_fetch_and_refusal_controls(self):
+        source = json.loads((HERE / 'source-manifest.json').read_text())
+        core = json.loads((ROOT / 'src-tauri/core-manifest.json').read_text())
+        core_url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
+        declarations = {'sing-box': (core_url, source['sourceCommit'])}
+        declarations.update({'polaris-upstream-' + dep['name']: (dep['sourceURL'], dep['upstreamCommit']) for dep in source['dependencyPatches']})
+        cases = ['lightweight-tag', 'annotated-tag', 'fetch-failure', 'wrong-object', 'wrong-ref', 'missing-ref', 'wrong-tag', 'missing-tag']
+        checked = 0
+        for mirror, program in enumerate(self.programs()):
+            for case in cases:
+                with self.subTest(mirror=mirror, case=case), tempfile.TemporaryDirectory(prefix='polaris-ci-source-fetch-fixture-') as temporary:
+                    directory = Path(temporary)
+                    calls, refs = [], {}
+                    tag = 'refs/tags/v' + core['bundledCoreVersion']
+                    def run(arguments, **kwargs):
+                        self.assertTrue(kwargs.get('check'), 'Git failures must stop source preparation')
+                        calls.append(arguments)
+                        if arguments[:3] == ['git', 'init', '--quiet']:
+                            refs[arguments[3]] = {}
+                        else:
+                            self.assertEqual(arguments[:2], ['git', '-C'])
+                            repository, command = arguments[2], arguments[3]
+                            url, commit = declarations[Path(repository).name]
+                            if command == 'fetch':
+                                self.assertEqual(arguments[4:6], ['--no-tags', '--depth=1'])
+                                self.assertEqual(arguments[6], url)
+                                target = arguments[7]
+                                if target == tag + ':' + tag:
+                                    self.assertEqual(Path(repository).name, 'sing-box')
+                                    if case != 'missing-tag':
+                                        refs[repository][tag] = 'e' * 40 if case == 'annotated-tag' else source['sourceCommit']
+                                        refs[repository][tag + '^{commit}'] = 'f' * 40 if case == 'wrong-tag' else source['sourceCommit']
+                                else:
+                                    self.assertEqual(target, commit + ':refs/heads/polaris-source')
+                                    if case == 'fetch-failure' and Path(repository).name == 'polaris-upstream-sing-tun':
+                                        raise subprocess.CalledProcessError(128, arguments)
+                                    refs[repository][commit + '^{commit}'] = 'f' * 40 if case == 'wrong-object' else commit
+                                    if case != 'missing-ref':
+                                        refs[repository]['refs/heads/polaris-source'] = 'f' * 40 if case == 'wrong-ref' else commit
+                            else:
+                                self.assertEqual(command, 'checkout')
+                                self.assertEqual(Path(repository).name, 'sing-box')
+                                self.assertEqual(arguments[4:], ['--detach', source['sourceCommit']])
+                        return subprocess.CompletedProcess(arguments, 0)
+                    def check_output(arguments, **kwargs):
+                        self.assertEqual(arguments[:2], ['git', '-C'])
+                        self.assertEqual(arguments[3], 'rev-parse')
+                        self.assertTrue(kwargs.get('text'))
+                        value = refs[arguments[2]].get(arguments[4])
+                        if value is None:
+                            raise subprocess.CalledProcessError(128, arguments)
+                        return value + '\n'
+                    cwd = Path.cwd()
+                    try:
+                        os.chdir(ROOT)
+                        with patch.object(sys, 'argv', ['yaml-source-fixture', temporary]), patch.object(subprocess, 'run', side_effect=run), patch.object(subprocess, 'check_output', side_effect=check_output):
+                            if case in ('lightweight-tag', 'annotated-tag'):
+                                exec(compile(program, '<actual-android-yaml-source>', 'exec'), {})
+                            else:
+                                with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                                    exec(compile(program, '<actual-android-yaml-source>', 'exec'), {})
+                    finally:
+                        os.chdir(cwd)
+                    output = directory / 'polaris-module-sources.json'
+                    if case in ('lightweight-tag', 'annotated-tag'):
+                        self.assertEqual(json.loads(output.read_text()), ['--module-source=' + dep['module'] + '=' + str(directory / ('polaris-upstream-' + dep['name'])) for dep in source['dependencyPatches']])
+                        self.assertEqual(len([args for args in calls if len(args) > 3 and args[3] == 'fetch']), len(declarations) + 1)
+                    else:
+                        self.assertFalse(output.exists(), 'A failed source fetch must not publish a builder handoff')
+                    checked += 1
+        self.assertEqual(checked, 16)
+        print('Actual YAML source fetch controls: 16/16 PASS (two mirrors; Git/Go/network callees not executed)')
+
+    def test_two_preludes_and_actual_shell_syntax(self):
+        text = (ROOT / '.github/workflows/android.yml').read_text()
+        check, signed = text.split('\n  release-apk:\n', 1)
+        start = '      - uses: actions/setup-node@v7'
+        end = '          python3 scripts/libbox-patches/verify-receipt.py'
+        preludes = [body[body.index(start):body.index(end) + len(end)] for body in (check, signed)]
+        self.assertGreater(len(preludes[0]), 2000)
+        self.assertEqual(preludes[0], preludes[1])
+        for block in re.findall(r'(?m)^        run: \|\n((?:^          .*\n|^\n)+)', text):
+            shell = '\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines())
+            shell = re.sub(r'\$\{\{.*?\}\}', 'fixture', shell)
+            subprocess.run(['bash', '-n'], input=shell, text=True, check=True)
+
+
 class CIIdentityFixture(unittest.TestCase):
     def test_actual_yaml_identity_refusal_before_output_and_lookup(self):
         text = (ROOT / '.github/workflows/android.yml').read_text()
