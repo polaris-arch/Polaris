@@ -889,7 +889,7 @@ impl Shared {
     }
 }
 
-/// [`start_attempt`](LoginCoreRegistry::start_attempt) 的结果；Started 表示仍待授权。
+/// [`LoginCoreRegistry::start_attempt_with_saved`] 的结果；Started 表示仍待授权。
 pub enum StartLoginOutcome {
     AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
     /// 已起瞬态登录核（登录 URL 稍后经事件到达，非「已登录」）。

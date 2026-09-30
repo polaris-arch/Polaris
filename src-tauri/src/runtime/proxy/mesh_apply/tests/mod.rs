@@ -7,6 +7,7 @@ use polaris_config_engine::user_config::mesh_route_state::{
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::sync::Arc;
 
 fn fixture() -> (MeshRouteState, ManagedMeshRoutePlan) {

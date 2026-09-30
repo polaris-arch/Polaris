@@ -692,7 +692,7 @@ impl HelperRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_test_connector_for_tests(
         dir: PathBuf,
         status: HelperStatusSnapshot,

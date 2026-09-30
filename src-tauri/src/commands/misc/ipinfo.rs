@@ -704,8 +704,9 @@ fn ipinfo_config_has_real_exit(config: &Value) -> bool {
 /// 共用的唯一实现。抽出来是为了让「用户点网络检测」与「起核 / 热切 / 停核 / 启动自动触发」跑**同一条
 /// 编排**——两套逻辑必然漂移（本仓解锁检测已栽过一次：只移植了广播半边）。
 ///
-/// `epoch` / `seq` 由调用方在**开探那一刻**取（[`next_ipinfo_epoch`] + [`current_ipinfo_schedule_seq`]，
-/// 与 `inputs` 里的 status/config 快照同一时点）；探测**之后**经 [`commit_ipinfo_snapshot`] 复查，
+/// `epoch` / `seq` 由调用方在**开探那一刻**取（手动腿 [`begin_manual_probe`]、排程腿
+/// [`begin_scheduled_probe`]、自愈腿 [`claim_unreachable_retry_probe`]，与 `inputs` 里的
+/// status/config 快照同一时点）；探测**之后**经 [`commit_ipinfo_snapshot`] 复查，
 /// 任一判据变了即原样退场（不写缓存、不广播、不伴测），理由见 `commit_ipinfo_snapshot` 的文档。
 ///
 /// ⚠️ **本函数不得自己领号 / 自增**：那样复查就是拿现场刚取的值跟自己比，恒真 = 没闸，而下游伴测拿到
@@ -888,7 +889,7 @@ fn schedule_unreachable_ipinfo_recheck(
 /// `delay_ms > 0` ⇒ 同步落地并广播 pending（UI 立即置空成 `—`），睡满再探。
 /// `delay_ms == 0` ⇒ 同步发布代理出口已消失的终态，防旧出口跨停核/重启窗口回填。
 ///
-/// # 🟠 按开探顺序发号：[`next_ipinfo_epoch`] 必须在 `sleep` **之后**
+/// # 🟠 按开探顺序发号：[`begin_scheduled_probe`] 必须在 `sleep` **之后**
 ///
 /// 世代号是「谁更新」的唯一判据，而排程时刻与开探时刻之间隔着整整 [`IPINFO_SETTLE_DELAY_MS`]。
 /// 在**排程时**领号 ⇒ 号的顺序是「谁先被排上」，与「谁的结果更新」差一个维度，收敛窗口内会静默丢腿：

@@ -108,10 +108,12 @@ pub use pending_changes::PendingChangesSummary;
 #[cfg(test)]
 use platform_contracts::enumerate_own_lan_cidrs;
 use platform_contracts::platform_tag;
+pub(crate) use process_supervision::pid_alive;
+#[cfg(unix)]
+pub(crate) use process_supervision::send_signal;
 #[cfg(test)]
 use process_supervision::DirectCoreRun;
 pub(crate) use process_supervision::DirectCoreSlot;
-pub(crate) use process_supervision::{pid_alive, send_signal};
 use route_replan::RuntimeBindingState;
 // B7 跟随面：生产消费点随本批搬进 `hot_switch`/`auto_switch`，façade 只剩 `proxy/tests/` 用它
 // 构造期望值/输入 —— 不 gate 即非测试编译单元的 `unused_imports`（同 `RoutePrefix` 的既有形态）。
@@ -1350,7 +1352,8 @@ pub struct ProxyRuntime {
     /// **本运行时只在此持有并喂「慢起轴」**（`last_start_ready_retries`）——它是全仓唯一该产生这数的地方
     /// （起核就绪门的重试累计），此前无人喂 → 报告恒零（§O1）。
     ///
-    /// **「核崩轴」不在这里并行记**：`restart_count` 的单一真值是上面的 [`CrashRecoveryMachine`]
+    /// **「核崩轴」不在这里并行记**：`restart_count` 的单一真值是上面的
+    /// [`polaris_core_supervisor::CrashRecoveryMachine`]
     /// （它已按 上游 :548 计数且自带「诊断用」getter `restart_count()`）。`diagnostic_counters()`
     /// 在**读时**把它投影进快照，而非在 `run_crash_recovery` 里再 `record_restart` 一遍——同一崩溃事件
     /// 绝不记两遍（否则两计数器的复位时机会分叉，报告数与控制数打架）。故 `DiagnosticCounters` 的核崩轴
