@@ -54,8 +54,11 @@ class DebugCoreProbeCommandCustodyTest {
             val activity = unsafe.getMethod("allocateInstance", Class::class.java).invoke(field.get(null), Activity::class.java)
             sessionClass.getDeclaredMethod("guardTick", Activity::class.java).also { it.isAccessible = true }.invoke(session, activity)
         }
+        fun closeSession(reason: String) {
+            sessionClass.getDeclaredMethod("close", String::class.java).also { it.isAccessible = true }.invoke(session, reason)
+        }
         override fun close() {
-            sessionClass.getDeclaredMethod("close", String::class.java).also { it.isAccessible = true }.invoke(session, "pure-fixture-close")
+            closeSession("pure-fixture-close")
             if (active.get(manager) === session) active.set(manager, null)
             DebugAppliedInputs.witness.seal(owner); owner.closed.complete(null)
             MainKernelAttemptRegistry.completeAfterClose(owner) {}
@@ -196,6 +199,71 @@ class DebugCoreProbeCommandCustodyTest {
             }
             task.run(); assertTrue(failed); assertTrue(args.password.all { it == 0.toByte() })
             assertEquals(0, f.lease.snapshot().commands); assertEquals(0, f.lease.snapshot().handles)
+        }
+    }
+
+    @Test fun actualSessionExpiryControllerCloseAndQueueRejectionEraseBeforeUnrelatedCloseBlocks() {
+        assumeTrue(BuildConfig.DEBUG)
+        val handlesField = DebugBatchLease::class.java.getDeclaredField("handles").also { it.isAccessible = true }
+        val gateField = DebugBatchLease::class.java.getDeclaredField("gate").also { it.isAccessible = true }
+        // Select a naturally occurring identity order, exactly as the independent review fixture.
+        // No collection mutation, socket/SDK factory or synthetic close-success observation.
+        for (trigger in 0..4) {
+            var selected = false
+            for (attempt in 0 until 128) {
+                val f = SessionFixture(if (trigger == 0) 500 else 9000)
+                val entered = CountDownLatch(1); val release = CountDownLatch(1)
+                val error = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+                var calls = 0
+                val blocked = java.io.Closeable {
+                    assertFalse(Thread.holdsLock(f.owner.operationLock))
+                    assertFalse(Thread.holdsLock(gateField.get(f.lease)))
+                    calls++; entered.countDown(); check(release.await(3, TimeUnit.SECONDS))
+                    if (trigger == 4) throw IllegalStateException("pure close failure")
+                }
+                check(f.lease.beginAcquire()); check(f.lease.publish(blocked))
+                val args = f.args()
+                val task = DebugBatchQa.coreProbeLoanTask(args, { fail("sealed queued task succeeded") }, {})
+                var closer: Thread? = null
+                try {
+                    if ((handlesField.get(f.lease) as Set<*>).iterator().next() !== blocked) {
+                        release.countDown(); task.rejectBeforeRun(IllegalStateException("unused natural order"))
+                        continue
+                    }
+                    selected = true
+                    if (trigger == 1) f.set("controllerLeaseUntil", 999L)
+                    closer = Thread {
+                        try {
+                            when (trigger) {
+                                0, 1 -> f.expiredGuardian()
+                                2 -> f.closeSession("pure controller close")
+                                else -> task.rejectBeforeRun(IllegalStateException("pure rejected queue"))
+                            }
+                        } catch (failure: Throwable) { error.set(failure) }
+                    }
+                    closer.start(); assertTrue(entered.await(3, TimeUnit.SECONDS))
+                    val blockedState = f.lease.snapshot()
+                    assertTrue(blockedState.sealed)
+                    assertTrue("trigger=$trigger retains credential during original Close", args.password.all { it == 0.toByte() })
+                    assertEquals(2, blockedState.handles); assertEquals(2, blockedState.closing)
+                    assertEquals(1, blockedState.commands); assertEquals(0, blockedState.residualHandles)
+                    release.countDown(); closer.join(3000); assertFalse(closer.isAlive); assertNull(error.get())
+                    val returned = f.lease.snapshot()
+                    assertEquals(0, returned.closing); assertEquals(if (trigger == 4) 1 else 0, returned.handles)
+                    assertEquals(trigger == 4, returned.closeFailed)
+                    assertEquals(if (trigger == 4) 1 else 0, returned.residualHandles)
+                    assertEquals(if (trigger >= 3) 0 else 1, returned.commands)
+                    task.run(); assertEquals(0, f.lease.snapshot().commands)
+                    f.closeSession("repeat pure close")
+                    assertEquals(1, calls) // Failed residual Close is never retried or called fake-clean.
+                    println("credential seal trigger=$trigger erasedBeforeBlockedClose=true originalResponsibilityRetained=true")
+                    break
+                } finally {
+                    release.countDown(); closer?.join(3000)
+                    task.rejectBeforeRun(IllegalStateException("pure fixture cleanup")); f.close()
+                }
+            }
+            assertTrue("natural blocked-first order was not obtained", selected)
         }
     }
 }

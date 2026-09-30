@@ -147,4 +147,36 @@ class DebugCoreProbeLoanTest {
         f.witness.returned(f.token, true); f.witness.seal(f.owner)
         assertNotNull(f.witness.snapshotFor(b, bServer))
     }
+
+    @Test fun actualAdmittedLoanErasesBeforeAnyUnrelatedHandleCloseAndKeepsOriginalTicket() {
+        assumeTrue(BuildConfig.DEBUG)
+        val handles = DebugBatchLease::class.java.getDeclaredField("handles").also { it.isAccessible = true }
+        var selected = false
+        for (attempt in 0 until 128) {
+            val f = Fixture(); val entered = CountDownLatch(1); val release = CountDownLatch(1)
+            val error = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+            val blocked = java.io.Closeable {
+                assertFalse(Thread.holdsLock(f.owner.operationLock))
+                entered.countDown(); check(release.await(3, TimeUnit.SECONDS))
+            }
+            check(f.lease.beginAcquire()); check(f.lease.publish(blocked))
+            val loan = f.admit(); var closer: Thread? = null
+            try {
+                if ((handles.get(f.lease) as Set<*>).iterator().next() !== blocked) continue
+                selected = true
+                closer = Thread { try { f.lease.seal() } catch (failure: Throwable) { error.set(failure) } }
+                closer.start(); assertTrue(entered.await(3, TimeUnit.SECONDS))
+                assertTrue("admitted credential survives unrelated blocked Close", f.password.all { it == 0.toByte() })
+                assertFalse(loan.isCurrent(1000, f.input()))
+                assertEquals(2, f.lease.snapshot().handles); assertEquals(2, f.lease.snapshot().closing)
+                assertEquals(1, f.lease.snapshot().commands)
+                release.countDown(); closer.join(3000); assertFalse(closer.isAlive); assertNull(error.get())
+                assertEquals(0, f.lease.snapshot().handles); assertEquals(1, f.lease.snapshot().commands)
+                break
+            } finally {
+                release.countDown(); closer?.join(3000); f.lease.seal(); f.lease.commandReturned(f.ticket)
+            }
+        }
+        assertTrue("natural blocked-first order was not obtained", selected)
+    }
 }

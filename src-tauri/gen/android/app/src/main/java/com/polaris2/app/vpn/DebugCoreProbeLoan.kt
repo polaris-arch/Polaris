@@ -94,10 +94,13 @@ internal class DebugCoreProbeLoan private constructor(
         lease.ownsProbe(ticket) && lease.ownsOpenHandle(this) && current != null &&
         current.owner === input.owner && current.server === input.server && matches(scope, current)
 
-    @Synchronized override fun close() {
+    /** Pure byte fence; callable before any unrelated original-lease Close can block. */
+    @Synchronized fun erase() {
         credential.fill(0)
         cleared = true
     }
+
+    override fun close() = erase()
 
     override fun toString() = "DebugCoreProbeLoan(<private>)"
 

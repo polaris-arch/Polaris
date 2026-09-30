@@ -1474,6 +1474,12 @@ a14SelfCheck();
   if (invalidate < 0 || begin <= invalidate || stopRevoke <= stop || stopRevoke >= box.indexOf('attempt.revokeAndDetachTun()', stop) ||
       !qa.includes('original.lease.revokeProbeCredentials()') || !loanKt.includes('refreshInput(actual)'))
     fail('A16 actual Start/Reload/Stop must fence credentials before input mutation; grant must refresh under operationLock');
+  const lease = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugBatchLease.kt'), 'utf8'));
+  const seal = kotlinFnBody(lease, 'seal') ?? '';
+  const erase = seal.indexOf('credentials.forEach(::eraseProbeCredential)');
+  if (erase < 0 || erase >= seal.indexOf('owned.forEach(::closeHandle)') ||
+      !lease.includes('is DebugCoreProbeLoan -> value.erase()'))
+    fail('A16 session seal must erase known pure credential records before arbitrary original Close');
 }
 
 // ════════════════════════════════════════════════════════════════════════════
