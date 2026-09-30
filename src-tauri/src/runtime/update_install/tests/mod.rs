@@ -810,6 +810,38 @@ mod lifetime_wait {
         }
     }
 
+    fn wait_for_pipe_eof(
+        reader: &std::os::fd::OwnedFd,
+        budget: std::time::Duration,
+    ) -> Result<(), String> {
+        use nix::errno::Errno;
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        let deadline = std::time::Instant::now() + budget;
+        let flags = fcntl(reader, FcntlArg::F_GETFL).map_err(|error| error.to_string())?;
+        fcntl(
+            reader,
+            FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+        )
+        .map_err(|error| error.to_string())?;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("pipe EOF deadline elapsed".into());
+            }
+            match nix::unistd::read(reader, &mut [0u8; 1]) {
+                Ok(0) => return Ok(()),
+                Ok(_) => return Err("pipe data is not EOF".into()),
+                Err(Errno::EAGAIN | Errno::EINTR) => {}
+                Err(error) => return Err(format!("pipe read failed: {error}")),
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("pipe EOF deadline elapsed".into());
+            }
+            // Retry only transient syscall results; elapsed time never becomes an EOF fact.
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+        }
+    }
+
     #[test]
     fn lifetime_pipe_blocks_beyond_two_seconds_then_only_eof_admits_marker() {
         let fixture = Fixture::new();
@@ -864,10 +896,38 @@ mod lifetime_wait {
         // Nonblocking read distinguishes EOF from a leaked live writer without hanging the test.
         fcntl(&observer, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
         assert!(spawn_with_pipe(&mut missing, (reader, writer)).is_err());
-        assert_eq!(nix::unistd::read(&observer, &mut [0u8; 1]).unwrap(), 0);
+        // CLOEXEC closes at exec, so a concurrent fork can briefly retain a writer copy.
+        // Require actual EOF within a deadline rather than classifying one EAGAIN as a leak.
+        wait_for_pipe_eof(&observer, std::time::Duration::from_secs(5)).unwrap();
         // The command still owns the read end after failed spawn; the local writer was dropped.
         // Taking this read descriptor out of Command is unnecessary: its Drop closes it normally.
         assert!(!fixture.marker().exists());
+    }
+
+    #[test]
+    fn pipe_eof_observer_refuses_live_writer_data_and_read_errors() {
+        let (observer, writer) = lifetime_pipe().unwrap();
+        assert_eq!(
+            wait_for_pipe_eof(&observer, std::time::Duration::from_millis(25)).unwrap_err(),
+            "pipe EOF deadline elapsed"
+        );
+        drop(writer);
+        wait_for_pipe_eof(&observer, std::time::Duration::from_secs(5)).unwrap();
+
+        let (observer, writer) = lifetime_pipe().unwrap();
+        nix::unistd::write(&writer, b"x").unwrap();
+        assert_eq!(
+            wait_for_pipe_eof(&observer, std::time::Duration::from_secs(5)).unwrap_err(),
+            "pipe data is not EOF"
+        );
+        // A write-only pipe descriptor produces EBADF, which must never be retried into success.
+        assert!(
+            wait_for_pipe_eof(&writer, std::time::Duration::from_secs(5))
+                .unwrap_err()
+                .starts_with("pipe read failed:")
+        );
+        drop(writer);
+        wait_for_pipe_eof(&observer, std::time::Duration::from_secs(5)).unwrap();
     }
 
     #[test]

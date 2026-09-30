@@ -286,6 +286,7 @@ test('Android 面点亮 android 腿，且不误伤桌面腿', () => {
     'src-tauri/gen/android/app/build.gradle.kts',
     'src-tauri/gen/android/app/src/main/AndroidManifest.xml',
     'src-tauri/tauri.android.conf.json',
+    'src-tauri/src/runtime/proxy/android_capacity.rs',
     'scripts/build-libbox.sh',
     'scripts/libbox-patches/source-manifest.json',
     'scripts/libbox-patches/build.py',
@@ -325,6 +326,9 @@ test('反向对照：纯应用逻辑与前端不点亮 Android 腿（取舍见 A
   for (const path of [
     'ui/src/App.tsx',
     'src-tauri/src/lib.rs',
+    'src-tauri/src/commands/window.rs',
+    'src-tauri/src/exit_lifecycle.rs',
+    'src-tauri/src/runtime/speedtest/tests/mod.rs',
     'crates/stats-engine/src/lib.rs',
     'README.md',
     'src-tauri/tauri.linux.conf.json',

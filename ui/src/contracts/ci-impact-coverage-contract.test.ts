@@ -330,6 +330,8 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
 
     // 哨兵：抓取器变哑在此红（空表会让下面的 for 恒真）。
     expect([...new Set(invoked.map(([script]) => script))].sort()).toEqual([
+      'scripts/assert-pc-runtime-release.mjs',
+      'scripts/assert-pc-runtime-release.test.mjs',
       'scripts/assert-r8-evidence.mjs',
       'scripts/build-android-apk.sh',
       'scripts/build-libbox.sh',

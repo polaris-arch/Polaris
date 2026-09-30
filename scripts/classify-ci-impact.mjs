@@ -714,6 +714,23 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组断言要证伪的形态。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/commands/window.rs':
+    'app_restart 的共享 Rust 平台派发：Android 保留 QuitState/RestartState 与 request_restart 腿，'
+    + '桌面才进入四 producer 的 prepare/commit 门；未新增 JNI 导出、Gradle 或包内资产契约。'
+    + 'ci.yml 的 cargo check --target aarch64-linux-android -p polaris 编译 Android 分支，'
+    + 'exit_lifecycle/tests/mod.rs 在 host cargo test 上守桌面 prepare/commit 接线。'
+    + 'APK 构建不执行应用重启，Android 实际重启行为仍需设备验证。',
+  'src-tauri/src/exit_lifecycle.rs':
+    '桌面退出 admission/drain 与 Android 原 run_android_exit_once 腿通过 cfg 分派，'
+    + '不新增 APK 资产或外部 ABI；Android 不消费桌面 DesktopExitReady。'
+    + 'ci.yml 的 cargo check --target aarch64-linux-android -p polaris 覆盖 Android cfg 编译，'
+    + 'exit_lifecycle/tests/mod.rs 的 host 单测与源码门覆盖桌面协调和退出入口。'
+    + 'APK 构建不执行退出清理，Android 的运行期停止/退出结果未由这些 host 门验证。',
+  'src-tauri/src/runtime/speedtest/tests/mod.rs':
+    'cfg(test) 内新增的 pc_custody 模块与桌面退出源码门受 cfg(not android) 约束，测试代码不进入 APK。'
+    + 'ci.yml 的 host cargo test --workspace 实际执行这些桌面回归；'
+    + 'Android cargo check -p polaris 不带 --all-targets，未编译本测试目标的 Android 构型。'
+    + 'APK 构建同样不构建测试目标，点亮 APK 腿不能补成 Android 测试覆盖。',
   'src-tauri/src/commands/misc/backup.rs':
     'Android 导入选择器不带扩展过滤，以便 SAF 显示 .polaris-backup；导出仍走保存对话框。'
     + '`cargo check --target aarch64-linux-android -p polaris` 覆盖 cfg 编译，'
