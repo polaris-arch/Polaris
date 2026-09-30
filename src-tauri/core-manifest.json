@@ -16,7 +16,7 @@
     "sourceSha256": "77aabf518a4464832f6f4792196a8ab9aadadcc616dbbd82327137ce664a5862",
     "patchSha256": "69ae099ae06710bdb46c47448909e1bda11cb63dd944e85208c29a19b10bb7c9",
     "goVersion": "1.25.5",
-    "binarySha256": null
+    "binarySha256": "3fe6ab3911d3600ad1d949e071ae01d70d25075597269bacd37ce9904f290f81"
   },
   "sourceBuild": {
     "sourceManifestSha256": "1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a",
@@ -59,7 +59,7 @@
           ],
           "confirmedAbsent": []
         },
-        "binarySha256": null
+        "binarySha256": "27e5d7e30dd7cfc8313710341d798296a06840157a5811723e45ba4b12291686"
       },
       "win": {
         "buildTree": "484135e0d95edd95d7c8890a3f0b8ce0dcbe8fed",
@@ -83,7 +83,7 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": null
+        "binarySha256": "3fe6ab3911d3600ad1d949e071ae01d70d25075597269bacd37ce9904f290f81"
       },
       "mac-x64": {
         "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
@@ -107,7 +107,7 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": null
+        "binarySha256": "fb83ce82ec89bf56c821e623ccf8cbb9a3f36f9e72d66f867381964fe6819d06"
       },
       "mac-arm64": {
         "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
@@ -131,7 +131,7 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": null
+        "binarySha256": "febe21529e48911e43c078039a0a296ef785ca38b3170e888e939e53248e954d"
       }
     },
     "graphScope": "declared-patched-modules",
