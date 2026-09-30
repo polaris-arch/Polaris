@@ -131,15 +131,53 @@ no cross-ID ordering proof here; its string alone cannot establish staleness.
 A Rust-authorized generation protocol is needed for that boundary. No TTL or
 recent-ID eviction window may silently reopen a consumed identity.
 
-**P2 candidate for review: process-ledger metadata has no cardinality bound.**
-The live operational map remains limited to eight Entries. Successful disposal
-clears native/network/cache references; a captured expiry may still retain that
-disposed Entry's ID and directory metadata until its scheduled callback/worker
-drains. The ledger permanently retains ticket/state/ASCII-ID metadata, not Entry,
-config, authorization URL, File or cache contents, and its count grows with
-attempts. A conservative admission limit or epoch rotation needs an explicit
-Rust-authorized protocol and should be assessed separately. This slice neither
-evicts tombstones nor claims a bound or cleanup proof that does not exist.
+The process ledger now has a **16,384-record budget**, configured before any
+reservation and injectable at a smaller value in tests. This is a retained
+metadata entry budget, **not an exact byte commitment**: the count is
+`entries.size + usedOwners.size`. An owner reserves two records (ticket plus
+consumed ID), a validation/control operation one, and an unseen close one
+tombstone. IDs retain their existing 256-character ASCII bound. The budget
+permits thousands of complete start attempts in one process; a transient start
+also has independent validation records, so it is not a promise of 16,384
+successful logins or speedtest sessions.
+
+Every allocation and the combined count use the same ledger monitor. Filling
+the budget, or requesting an allocation that cannot fit, permanently closes new
+reservations and **every unentered birth**, including the last Reserved ticket
+and workers already queued. An unseen close that cannot record its tombstone
+also closes admission permanently. Known-ID retirement and already-entered
+owner completion/Close continue. No TTL/LRU, terminal-ticket deletion, consumed
+ID reuse or `historicUnknown` reset is permitted. Login checks the reservation
+before preempting a shared-directory predecessor and still rechecks at native
+birth; a capacity-rejected queue does not dispose an already-entered owner.
+
+Capacity closure is **not** an explicit drain fence or a native terminal fact:
+it creates no fence ID, capture membership or receipt. A later explicit seal
+remains legal and captures existing Unknown facts normally. Born Login tickets
+remain Unknown after operational Close, and queried DNS proof remains a
+separate P1 gate. Capability sets remain empty for Login/Speedtest, coverage
+remains **4/11**, and managed/NoOwner activation remains disabled.
+
+Only this invocation's explicit capacity rejection carries
+`ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED`. Kotlin keeps a typed cause internally;
+CheckConfig adds an optional `errorCode`, Main uses the rejection whitelist,
+and transient start/unknown close callbacks preserve the code. Rust propagates
+checker rejection as a typed error and native start rejection through a typed
+`SpawnError.source`, then selects the command's capacity outcome. Default
+desktop checker behavior and generic fallbacks remain unchanged. No global
+capacity latch or raw-message keyword overrides later native Close/network/TS
+authorization failures: a real speedtest cleanup failure keeps CleanupUnknown
+priority. UI uses the stable code/reason and five localized short messages
+instructing the user to **fully close and restart the app**, without rendering
+native diagnostics or adding persistent UI.
+
+The live Login operational map remains limited to eight Entries. Successful
+disposal clears native/network/cache references; a captured expiry may retain
+its disposed Entry's ID/directory metadata until the timer/worker drains. The
+bounded ledger retains ticket/state/ASCII-ID metadata, not Entry, config,
+authorization URL, File or cache contents. Epoch admission/rotation still needs
+an explicit Rust-authorized protocol; this change does not infer authority from
+the external ID string or change that contract.
 
 Validation of the Login identity follow-up (2026-09-30): targeted owner,
 validation and admission suites passed 27 tests; full
@@ -172,8 +210,9 @@ deliver old expiry/retry/native Stop callbacks after a successor uses the same
 state directory and cache path. The old disposed Entry cannot close that
 successor or delete its cache. A shared fake Tailscale-state file stays intact;
 this is not a Go Tailscale disposal or custody proof. Rust-authorized generation
-ordering, complete worker/network/DNS drain, TS/cache custody and ledger capacity
-remain separate gates. Capabilities stay empty and coverage remains 4/11.
+ordering, complete worker/network/DNS drain and TS/cache custody remain separate
+gates. The metadata budget described above closes the unbounded-ledger P2
+without proving any resource drain. Capabilities stay empty and coverage remains 4/11.
 
 Validation of the Host seam follow-up (2026-09-30): targeted suites passed
 37 tests; the full Kotlin XML receipts contain 120 tests in 13 suites with no
@@ -183,3 +222,32 @@ daemon recovery, so no duplicate test run was made. Bridge checking passed
 std-only source-probe library and standalone `rustc --test`. This does not claim
 a full Cargo/runtime or Android device test. `git diff --check` passed; no APK
 or Go implementation change was made.
+
+Validation of the capacity follow-up (2026-09-30): targeted Kotlin suites passed
+65 tests; the final full `:app:testUniversalDebugUnitTest` passed **135 tests in
+13 suites**, with zero failures/errors/skips. Production Host fake-native tests
+cover combined-count boundaries, failed validation reservation cancelling the
+original owner, the final Reserved ticket and existing queues rejected before
+factory entry, capacity rejection before shared-directory preemption, entered
+owner Close success/failure, unseen-close tombstone exhaustion and concurrent
+reserve/retire. Capacity never turns real cleanup failure into an exact fact.
+
+Actual `cargo check -p polaris --lib --locked` and
+`cargo check --target aarch64-linux-android -p polaris --lib --locked` both
+passed in this slice's independent target. The Android check used installed
+stable NDK 27.3.13750724 and versioned API-24 compiler/bindgen target; the
+installed NDK 30 beta rejected the dependency's unversioned CMake/bindgen target
+before source checking and was not used for the passing receipt. Existing
+Android desktop/platform warnings were not promoted to errors. With
+`POLARIS_NO_KERNEL_RUN=1`, real library tests passed **11 capacity-filter tests
+and 16 Android bridge tests**, including optional-code serde, typed source
+downcast/raw-message negative cases, default desktop checker behavior, real
+Login/Speedtest check/spawn outcomes and real-close precedence. Six supplemental
+Rust source-wiring tests passed; these do not replace the compiled tests.
+
+UI tests passed **119 tests in seven files**, including five-language code
+coverage, Login and Speedtest error presentation, short Main toast deduplication
+and raw-message rejection. `tsc --noEmit`, the 31-command bridge check and
+`git diff --check` passed. Gradle external dependency build directories were
+isolated inside this worktree to avoid parallel writes in the Cargo registry.
+No APK/device test, generation/SDK change or Go implementation edit was made.

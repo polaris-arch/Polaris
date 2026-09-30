@@ -68,8 +68,8 @@ internal class TransientLoginHostState(
         val reply = completion(done)
         val nativeOwner = try {
             TransientLoginNativeOwner.reserve(ledger, id)
-        } catch (_: Throwable) {
-            reply(TransientLoginHost.GeneralFailure("Android 独立登录失败 [admission/UNAVAILABLE]"))
+        } catch (error: Throwable) {
+            reply(startFailure(error, "Android 独立登录失败 [admission/UNAVAILABLE]"))
             return
         }
         val directories = try {
@@ -98,6 +98,7 @@ internal class TransientLoginHostState(
             nativeOwner.enqueue({ queue(it) }) { validationTicket ->
                 var stage = "ownership"
                 val failure = synchronized(ownershipLock) { runCatching {
+                    if (!ledger.birthAllowed(entry.nativeOwner.ticket)) throw ledger.admissionRejection()
                     check(!entry.cancelled) { "Android 登录请求已取消" }
                     check(mainClaims.values.none { claim -> entry.stateDirectories.any(claim::contains) }) { "Android Tailscale 端点已被主核持有" }
                     val predecessors = synchronized(entries) {
@@ -136,27 +137,39 @@ internal class TransientLoginHostState(
                         else -> "FAILED"
                     }
                     report(stage, failure, reason)
-                    reply(TransientLoginHost.GeneralFailure("Android 独立登录失败 [$stage/$reason]"))
+                    reply(startFailure(failure, "Android 独立登录失败 [$stage/$reason]"))
                 } else reply(null)
             }
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
             nativeOwner.cancel()
             synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
-            reply(TransientLoginHost.GeneralFailure("Android 独立登录失败 [admission/UNAVAILABLE]"))
+            reply(startFailure(error, "Android 独立登录失败 [admission/UNAVAILABLE]"))
         }
     }
 
     fun close(id: String, done: (String?) -> Unit) {
+        closeCoded(id) { done(it?.message) }
+    }
+
+    fun closeCoded(id: String, done: (AndroidNativeFailure?) -> Unit) {
         val reply = completion(done)
         val entry = try { synchronized(entries) {
             TransientLoginNativeOwner.retireBeforeStart(ledger, id)
             entries[id]?.also { it.nativeOwner.cancel() }
         } } catch (_: IllegalArgumentException) {
-            reply("Android 登录实例标识无效")
+            reply(AndroidNativeFailure("Android 登录实例标识无效"))
+            return
+        } catch (error: AndroidNativeAdmission.CapacityClosed) {
+            reply(AndroidNativeFailure.from(error, "Android 登录原生准入已关闭"))
             return
         }
         if (entry == null) { reply(null); return }
-        close(entry, reply)
+        close(entry) { reply(it?.let(::AndroidNativeFailure)) }
+    }
+
+    private fun startFailure(error: Throwable, fallback: String): TransientLoginHost.GeneralFailure {
+        val failure = AndroidNativeFailure.from(error, fallback)
+        return TransientLoginHost.GeneralFailure(failure.message, failure.code)
     }
 
     /** Timers, retries and native callbacks retain this exact entry, never a later ID lookup. */

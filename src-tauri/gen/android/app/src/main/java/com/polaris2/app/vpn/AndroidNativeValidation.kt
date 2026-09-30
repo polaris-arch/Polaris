@@ -39,7 +39,7 @@ internal object AndroidNativeValidation {
         require(ticket.kind == AndroidNativeAdmission.Kind.CheckConfig)
         if (!ledger.enterBirth(ticket)) {
             ledger.cancelBeforeBirth(ticket)
-            throw AndroidNativeAdmission.AdmissionClosed()
+            throw ledger.admissionRejection()
         }
         try {
             setup()

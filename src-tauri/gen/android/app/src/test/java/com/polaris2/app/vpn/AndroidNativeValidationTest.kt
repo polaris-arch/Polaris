@@ -12,6 +12,22 @@ import org.junit.Test
 class AndroidNativeValidationTest {
     private fun await(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
 
+    @Test fun mainAndValidationQueuedAdaptersRetainCapacityReasonWithoutCallingNative() {
+        val ledger = AndroidNativeAdmission("capacity-adapters", maxMetadataRecords = 3).also { it.bootstrap(RequiredMarkerProof.Absent) }
+        val main = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "queued-main")
+        var worker: (() -> Unit)? = null
+        AndroidNativeValidation.enqueue(ledger, { worker = it }) { ticket ->
+            val failure = runCatching { AndroidNativeValidation.run(ledger, ticket, setup = { error("setup reached") }, nativeCheck = { error("JNI reached") }) }.exceptionOrNull()
+            assertTrue(failure is AndroidNativeAdmission.CapacityClosed)
+            assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth, ledger.state(ticket))
+        }
+        val failure = runCatching { AndroidNativeMain.enterBirth(ledger, main) }.exceptionOrNull()
+        assertTrue(failure is AndroidNativeAdmission.CapacityClosed)
+        worker!!.invoke()
+        ledger.cancelBeforeBirth(main)
+        assertTrue(ledger.seal("fence").captured.isEmpty())
+    }
+
     @Test fun allCurrentValidationEntrypointsUseTheSameAdapter() {
         val directory = File("src/main/java/com/polaris2/app/vpn")
         val plugin = File(directory, "PolarisVpnPlugin.kt").readText()

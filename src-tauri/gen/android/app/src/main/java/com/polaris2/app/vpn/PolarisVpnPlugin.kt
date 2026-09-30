@@ -175,7 +175,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
             if (failure == null) invoke.resolve()
             else invoke.reject(
                 failure.message,
-                if (failure is TransientLoginHost.SystemInterfaceFailure) SystemEndpointGuard.ERROR else "TAILSCALE_LOGIN_FAILED",
+                failure.code ?: if (failure is TransientLoginHost.SystemInterfaceFailure) SystemEndpointGuard.ERROR else "TAILSCALE_LOGIN_FAILED",
             )
         }
     }
@@ -183,8 +183,8 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun closeTransientLogin(invoke: Invoke) {
         val args = invoke.parseArgs(TransientLoginInstanceArgs::class.java)
-        TransientLoginHost.close(args.instanceId) { failure ->
-            if (failure == null) invoke.resolve() else invoke.reject(failure, "TAILSCALE_LOGIN_CANCEL_FAILED")
+        TransientLoginHost.closeCoded(args.instanceId) { failure ->
+            if (failure == null) invoke.resolve() else invoke.reject(failure.message, failure.code ?: "TAILSCALE_LOGIN_CANCEL_FAILED")
         }
     }
 
@@ -197,18 +197,18 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun startTransientSpeedtest(invoke: Invoke) {
         val args = invoke.parseArgs(TransientSpeedtestStartArgs::class.java)
-        TransientSpeedtestHost.start(args.instanceId, args.configContent) { failure ->
+        TransientSpeedtestHost.startCoded(args.instanceId, args.configContent) { failure ->
             if (failure == null) invoke.resolve()
-            else invoke.reject(failure, "TRANSIENT_SPEEDTEST_FAILED")
+            else invoke.reject(failure.message, failure.code ?: "TRANSIENT_SPEEDTEST_FAILED")
         }
     }
 
     @Command
     fun closeTransientSpeedtest(invoke: Invoke) {
         val args = invoke.parseArgs(TransientSpeedtestInstanceArgs::class.java)
-        TransientSpeedtestHost.close(args.instanceId) { failure ->
+        TransientSpeedtestHost.closeCoded(args.instanceId) { failure ->
             if (failure == null) invoke.resolve()
-            else invoke.reject(failure, "TRANSIENT_SPEEDTEST_CLEANUP_UNKNOWN")
+            else invoke.reject(failure.message, failure.code ?: "TRANSIENT_SPEEDTEST_CLEANUP_UNKNOWN")
         }
     }
 
@@ -364,7 +364,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         val nativeTicket = try {
             AndroidNativeMain.reserveBridge(args.runId)
         } catch (error: AndroidNativeAdmission.AdmissionClosed) {
-            invoke.reject(error.message, ERR_NATIVE_ADMISSION_CLOSED)
+            invoke.reject(error.message, if (error is AndroidNativeAdmission.CapacityClosed) AndroidNativeAdmission.CAPACITY_CODE else ERR_NATIVE_ADMISSION_CLOSED)
             return
         } catch (_: IllegalArgumentException) {
             invoke.reject("android: 主核身份不在原生准入域", ERR_STARTUP_FAILED)
@@ -451,11 +451,14 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
                 val result = JSObject()
                 if (err != null) {
                     result.put("error", err.message ?: err.toString())
+                    if (err is AndroidNativeAdmission.CapacityClosed) result.put("errorCode", AndroidNativeAdmission.CAPACITY_CODE)
                 }
                 invoke.resolve(result)
             }
         } catch (error: Throwable) {
-            invoke.resolve(JSObject().put("error", error.message ?: "android: checkConfig worker unavailable"))
+            val result = JSObject().put("error", error.message ?: "android: checkConfig worker unavailable")
+            if (error is AndroidNativeAdmission.CapacityClosed) result.put("errorCode", AndroidNativeAdmission.CAPACITY_CODE)
+            invoke.resolve(result)
         }
     }
 

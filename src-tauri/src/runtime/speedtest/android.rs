@@ -73,12 +73,28 @@ fn spawn_error(message: String) -> SpawnError {
 #[async_trait]
 impl ConfigChecker for AndroidSpeedtestChecker {
     async fn check(&self, _binary: &Path, config_path: &Path) -> Result<(), String> {
+        self.check_admitted(_binary, config_path)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn check_admitted(
+        &self,
+        _binary: &Path,
+        config_path: &Path,
+    ) -> Result<(), crate::runtime::proxy::android_capacity::CheckFailure> {
+        use crate::runtime::proxy::android_capacity::CheckFailure;
         let raw = std::fs::read_to_string(config_path)
-            .map_err(|_| "Android 测速临时配置读取失败".to_owned())?;
-        let config = authenticated_android_temp_config(&raw, &self.auth)?;
-        match android_bridge::check_config(&config).await {
+            .map_err(|_| CheckFailure::Rejected("Android 测速临时配置读取失败".to_owned()))?;
+        let config =
+            authenticated_android_temp_config(&raw, &self.auth).map_err(CheckFailure::Rejected)?;
+        match android_bridge::check_config_admitted(&config)
+            .await
+            .map_err(CheckFailure::CapacityClosed)?
+        {
             polaris_core_supervisor::config_gate::ConfigCheckVerdict::Accepted => Ok(()),
-            _ => Err("Android 测速临时配置校验失败或不可用".to_owned()),
+            _ => Err(CheckFailure::Rejected(
+                "Android 测速临时配置校验失败或不可用".to_owned(),
+            )),
         }
     }
 }
@@ -96,6 +112,7 @@ impl LoginCoreSpawner for AndroidSpeedtestSpawner {
                 closed: false,
             })),
             Err(SpeedtestStartError::Failed(message)) => Err(spawn_error(message)),
+            Err(SpeedtestStartError::CapacityClosed(error)) => Err(error.spawn_error()),
             Err(SpeedtestStartError::CleanupUnknown(message)) => Err(SpawnError::Spawn {
                 bin: PathBuf::from("android-libbox"),
                 source: std::io::Error::other(TempCoreCleanupUnknown(message)),

@@ -1591,6 +1591,7 @@
     "tunAdapterMissing": "TUN 虛擬網卡未能建立，請檢查 wintun 驅動是否被安全軟體攔截，或重新啟動後重試",
     "autoSwitchNeedsRestart": "已嘗試自動換節點，但本次未能換成：有候選節點需要重新啟動核心才能切換過去。請手動選擇其他節點。",
     "tunAddressUnavailable": "TUN 虛擬網卡位址無法配置，可能被殘留網卡或其他 VPN 佔用。請中斷其他 VPN，或重新啟動系統後再試",
+    "androidNativeCapacityClosed": "本次執行的生命週期記錄已滿，請完全關閉並重新啟動應用程式後重試。",
     "vpnPermissionDenied": "VPN 授權尚未完成。請完成或關閉目前的授權視窗，再點擊連線，並在系統 VPN 連線要求中選擇允許。",
     "systemInterfaceUnsupported": "此節點要求系統網卡，Android VPN 模式不支援。請在節點編輯中關閉系統網卡選項；自訂節點請將 JSON 中的 system 設為 false。"
   },

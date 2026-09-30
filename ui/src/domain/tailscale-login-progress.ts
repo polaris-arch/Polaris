@@ -39,6 +39,7 @@ export function authorizeFromMainFrame(current: TailscaleLoginProgress | undefin
 }
 
 const REASON_KEYS: Record<string, string> = {
+  ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: 'errors.androidNativeCapacityClosed',
   coreUnavailable: 'ts.reasonCoreUnavailable', configurationCheckFailed: 'ts.reasonConfigurationCheck',
   configWriteFailed: 'ts.reasonConfigWrite', processStartFailed: 'ts.reasonProcessStart',
   statusSubscriptionFailed: 'ts.reasonStatusSubscription', statusStreamEnded: 'ts.reasonStatusSubscription',

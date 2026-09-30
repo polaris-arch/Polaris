@@ -1692,6 +1692,68 @@ struct Harness {
     stderr_written: tokio::sync::watch::Receiver<usize>,
 }
 
+struct CapacityChecker;
+#[async_trait]
+impl ConfigChecker for CapacityChecker {
+    async fn check(&self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        panic!("typed entry required")
+    }
+    async fn check_admitted(
+        &self,
+        _: &std::path::Path,
+        _: &std::path::Path,
+    ) -> Result<(), crate::runtime::proxy::android_capacity::CheckFailure> {
+        Err(
+            crate::runtime::proxy::android_capacity::CheckFailure::CapacityClosed(
+                crate::runtime::proxy::android_capacity::CapacityClosed,
+            ),
+        )
+    }
+}
+
+struct CapacitySpawner;
+#[async_trait]
+impl LoginCoreSpawner for CapacitySpawner {
+    async fn spawn(&self, _: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        Err(crate::runtime::proxy::android_capacity::CapacityClosed.spawn_error())
+    }
+}
+
+#[tokio::test]
+async fn typed_capacity_spawn_stops_the_actual_speedtest_round_without_a_child() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.spawner = Arc::new(CapacitySpawner);
+    let outcome = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { panic!("measured after admission rejection") },
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
+    assert_eq!(h.terminated.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    cleanup(&h.dir);
+}
+
+#[tokio::test]
+async fn capacity_check_stops_the_actual_speedtest_round_before_spawn_or_measurement() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.checker = Arc::new(CapacityChecker);
+    let outcome = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { panic!("measured after admission rejection") },
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    cleanup(&h.dir);
+}
 /// 会话夹具的可选开关。**默认全关**（`Default`）= 与本批改造之前逐字等价的假核。
 #[derive(Default)]
 struct HarnessOpts {

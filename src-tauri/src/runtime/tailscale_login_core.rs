@@ -168,6 +168,16 @@ pub trait LoginCoreSpawner: Send + Sync {
 pub trait ConfigChecker: Send + Sync {
     /// 校验 `config_path` 是否为合法 sing-box 配置。非法 → Err（含核的诊断）。
     async fn check(&self, binary: &Path, config_path: &Path) -> Result<(), String>;
+    /// Android admission failures are explicit causes; all existing checkers retain their behavior.
+    async fn check_admitted(
+        &self,
+        binary: &Path,
+        config_path: &Path,
+    ) -> Result<(), crate::runtime::proxy::android_capacity::CheckFailure> {
+        self.check(binary, config_path)
+            .await
+            .map_err(crate::runtime::proxy::android_capacity::CheckFailure::Rejected)
+    }
 }
 
 /// 登录 URL 事件发射抽象。生产经 [`AppHandle`] 广播 `event:tailscaleAuthUrl`，测试捕获断言。
@@ -219,6 +229,7 @@ impl AuthUrlEmitter for AttemptReceiptEmitter {
                         matches!(
                             *reason,
                             "coreUnavailable"
+                                | "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED"
                                 | "configurationCheckFailed"
                                 | "configWriteFailed"
                                 | "processStartFailed"
@@ -365,7 +376,14 @@ impl LoginCoreSpawner for AndroidLoginCoreSpawner {
         };
         crate::runtime::proxy::android_bridge::start_transient_login(&child.instance_id, &config)
             .await
-            .map_err(failure)?;
+            .map_err(|error| match error {
+                crate::runtime::proxy::android_bridge::LoginStartError::Failed(message) => {
+                    failure(message)
+                }
+                crate::runtime::proxy::android_bridge::LoginStartError::CapacityClosed(error) => {
+                    error.spawn_error()
+                }
+            })?;
         // Android's native factory has copied the config into its own service. No snapshot is written.
         child.closed = false;
         Ok(Box::new(child))
@@ -424,11 +442,27 @@ struct AndroidLoginConfigChecker;
 #[async_trait]
 impl ConfigChecker for AndroidLoginConfigChecker {
     async fn check(&self, _binary: &Path, config_path: &Path) -> Result<(), String> {
+        self.check_admitted(_binary, config_path)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn check_admitted(
+        &self,
+        _binary: &Path,
+        config_path: &Path,
+    ) -> Result<(), crate::runtime::proxy::android_capacity::CheckFailure> {
+        use crate::runtime::proxy::android_capacity::CheckFailure;
         use polaris_core_supervisor::config_gate::ConfigCheckVerdict;
-        let config = std::fs::read_to_string(config_path).map_err(|error| error.to_string())?;
-        match crate::runtime::proxy::android_bridge::check_config(&config).await {
+        let config = std::fs::read_to_string(config_path)
+            .map_err(|error| CheckFailure::Rejected(error.to_string()))?;
+        match crate::runtime::proxy::android_bridge::check_config_admitted(&config)
+            .await
+            .map_err(CheckFailure::CapacityClosed)?
+        {
             ConfigCheckVerdict::Accepted => Ok(()),
-            _ => Err("Android 登录配置校验失败或不可用".to_owned()),
+            _ => Err(CheckFailure::Rejected(
+                "Android 登录配置校验失败或不可用".to_owned(),
+            )),
         }
     }
 }
@@ -674,6 +708,7 @@ impl Shared {
 
 /// [`start_attempt`](LoginCoreRegistry::start_attempt) 的结果；Started 表示仍待授权。
 pub enum StartLoginOutcome {
+    AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
     /// 已起瞬态登录核（登录 URL 稍后经事件到达，非「已登录」）。
     Started,
     /// 双写守卫命中：该 TS endpoint 已在运行主核里，无需瞬态核（前端 `reason: 'inMainCore'`）。
@@ -1290,6 +1325,16 @@ impl LoginCoreRegistry {
                     emitter.progress(&requested.id, &request.attempt_id, "cancelled", None, None);
                     attempt.finish();
                 }
+                StartLoginOutcome::AndroidCapacityClosed(_) => {
+                    emitter.progress(
+                        &requested.id,
+                        &request.attempt_id,
+                        "failed",
+                        Some(crate::runtime::proxy::code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED),
+                        None,
+                    );
+                    attempt.finish();
+                }
                 StartLoginOutcome::Failed(reason) => {
                     emitter.progress(
                         &requested.id,
@@ -1540,8 +1585,10 @@ impl LoginCoreRegistry {
         // (e) sing-box check 先验配置形状（失败快退、不 spawn —— 这一段可单测）。
         tokio::select! {
             () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
-            result = self.checker.check(&binary, &config_path) => if result.is_err() {
-                return StartLoginOutcome::Failed("configurationCheckFailed".into());
+            result = self.checker.check_admitted(&binary, &config_path) => match result {
+                Ok(()) => {},
+                Err(crate::runtime::proxy::android_capacity::CheckFailure::CapacityClosed(error)) => return StartLoginOutcome::AndroidCapacityClosed(error),
+                Err(_) => return StartLoginOutcome::Failed("configurationCheckFailed".into()),
             },
         }
 
@@ -1586,7 +1633,14 @@ impl LoginCoreRegistry {
         req.working_dir = Some(user_data.to_path_buf());
         let child = match self.spawner.spawn(req).await {
             Ok(c) => c,
-            Err(_) => return StartLoginOutcome::Failed("processStartFailed".into()),
+            Err(error) => {
+                if let Some(capacity) =
+                    crate::runtime::proxy::android_capacity::CapacityClosed::from_spawn(&error)
+                {
+                    return StartLoginOutcome::AndroidCapacityClosed(capacity);
+                }
+                return StartLoginOutcome::Failed("processStartFailed".into());
+            }
         };
 
         // Register before the STATUS subscription awaits: a concurrent main-core start can

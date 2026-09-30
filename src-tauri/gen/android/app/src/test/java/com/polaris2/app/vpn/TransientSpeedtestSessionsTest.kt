@@ -11,6 +11,50 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TransientSpeedtestSessionsTest {
+    @Test fun queuedSpeedtestGetsExplicitCapacityCauseWithoutNativeBirth() {
+        val ledger = AndroidNativeAdmission("speed-capacity", maxMetadataRecords = 3).also { it.bootstrap(RequiredMarkerProof.Absent) }
+        var worker: (() -> Unit)? = null
+        val sessions = TransientSpeedtestSessions(nativeAdmission = ledger, launchStart = { worker = it })
+        val ticket = sessions.reserveOwner(id(1))
+        val nativeCalls = AtomicInteger()
+        val done = CountDownLatch(1)
+        val result = AtomicReference<AndroidNativeFailure?>()
+        sessions.startCoded(id(1), object : TransientSpeedtestSessions.Engine {
+            override fun prepare() { nativeCalls.incrementAndGet() }
+            override fun start() { nativeCalls.incrementAndGet() }
+            override fun close() {}
+        }, ticket) { result.set(it); done.countDown() }
+        ledger.retireOwner(AndroidNativeAdmission.Kind.Login, "fill")
+        worker!!.invoke()
+        await(done)
+        assertEquals(AndroidNativeAdmission.CAPACITY_CODE, result.get()!!.code)
+        assertEquals(0, nativeCalls.get())
+        assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth, ledger.state(ticket))
+        val unknown = AtomicReference<AndroidNativeFailure?>()
+        sessions.closeCoded(id(2)) { unknown.set(it) }
+        assertEquals(AndroidNativeAdmission.CAPACITY_CODE, unknown.get()!!.code)
+    }
+
+    @Test fun enteredSpeedtestCloseFailureAtCapacityStillMeansCleanupUnknown() {
+        val ledger = AndroidNativeAdmission("speed-capacity", maxMetadataRecords = 3).also { it.bootstrap(RequiredMarkerProof.Absent) }
+        val sessions = TransientSpeedtestSessions(nativeAdmission = ledger)
+        val ticket = sessions.reserveOwner(id(1))
+        val started = CountDownLatch(1)
+        sessions.startCoded(id(1), object : TransientSpeedtestSessions.Engine {
+            override fun prepare() {}
+            override fun start() {}
+            override fun close() { error(AndroidNativeAdmission.CAPACITY_MESSAGE) }
+        }, ticket) { assertEquals(null, it); started.countDown() }
+        await(started)
+        ledger.retireOwner(AndroidNativeAdmission.Kind.Login, "fill")
+        val closed = CountDownLatch(1)
+        val result = AtomicReference<AndroidNativeFailure?>()
+        sessions.closeCoded(id(1)) { result.set(it); closed.countDown() }
+        await(closed)
+        assertEquals(null, result.get()!!.code)
+        assertEquals("cleanupUnknown", sessions.status(id(1)))
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
+    }
     private fun await(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
     private fun id(sequence: Int, epoch: String = "a".repeat(32)): String =
         "$epoch:${sequence.toString(16).padStart(16, '0')}"
@@ -421,7 +465,7 @@ class TransientSpeedtestSessionsTest {
         assertTrue(host.contains("nativeAdmission = AndroidNativeAdmissionGate.ledger"))
         assertTrue(host.contains("TransientLoginNetwork(requireExactClose = true)"))
         assertTrue(host.contains("override fun serviceStop() { close(id) {} }"))
-        assertTrue(plugin.contains("TransientSpeedtestHost.close(args.instanceId)"))
+        assertTrue(plugin.contains("TransientSpeedtestHost.closeCoded(args.instanceId)"))
         assertTrue(network.contains("callbacks.close { closed = true; listener = null }"))
         assertTrue(network.contains("thread.join()"))
         assertTrue(network.contains("resolver.closeUnused()"))

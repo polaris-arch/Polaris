@@ -31,6 +31,10 @@ const t = ((key: string, opts?: unknown) => {
 }) as unknown as TFunction;
 
 describe('speedTestErrorMessage', () => {
+  it('容量拒绝提示完整重启应用，raw 相同文案仍走旧错误类别', () => {
+    expect(speedTestErrorMessage(new IpcError('server_speed_test', 'private', 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED'), t)).toBe('errors.androidNativeCapacityClosed');
+    expect(speedTestErrorMessage(new IpcError('server_speed_test', 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', 'SPEEDTEST_TEMP_CORE_FAILED'), t)).toBe('nodes.speedTestInterrupted');
+  });
   it('系统接口拒绝有可行动说明，不误报网络中断', () => {
     const err = new IpcError('server_speed_test', 'private diagnostics', 'SYSTEM_INTERFACE_REQUIRES_HELPER');
     expect(speedTestErrorMessage(err, t)).toBe('nodes.speedTestSystemInterfaceRequiresHelper');

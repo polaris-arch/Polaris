@@ -59,9 +59,11 @@ internal object TransientSpeedtestHost {
         }
     }
 
-    fun start(id: String, config: String, done: (String?) -> Unit) {
-        val nativeTicket = try { sessions.reserveOwner(id) } catch (_: Throwable) {
-            done("Android 临时测速原生准入已关闭或标识重复")
+    fun start(id: String, config: String, done: (String?) -> Unit) = startCoded(id, config) { done(it?.message) }
+
+    fun startCoded(id: String, config: String, done: (AndroidNativeFailure?) -> Unit) {
+        val nativeTicket = try { sessions.reserveOwner(id) } catch (error: Throwable) {
+            done(AndroidNativeFailure.from(error, "Android 临时测速原生准入已关闭或标识重复"))
             return
         }
         try {
@@ -69,25 +71,26 @@ internal object TransientSpeedtestHost {
                 try { validateConfig(config) } catch (_: Exception) {
                     AndroidNativeValidation.cancelBeforeBirth(validationTicket)
                     sessions.cancelBeforeBirth(nativeTicket)
-                    done("Android 临时测速配置被拒绝")
+                    done(AndroidNativeFailure("Android 临时测速配置被拒绝"))
                     return@enqueue
                 }
-                try { sessions.start(id, LibboxEngine(id, config, validationTicket), nativeTicket) { failure ->
+                try { sessions.startCoded(id, LibboxEngine(id, config, validationTicket), nativeTicket) { failure ->
                     AndroidNativeValidation.cancelBeforeBirth(validationTicket)
                     done(failure)
-                } } catch (_: Throwable) {
+                } } catch (error: Throwable) {
                     AndroidNativeValidation.cancelBeforeBirth(validationTicket)
                     sessions.cancelBeforeBirth(nativeTicket)
-                    done("Android 临时测速启动失败")
+                    done(AndroidNativeFailure.from(error, "Android 临时测速启动失败"))
                 }
             }
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
             sessions.cancelBeforeBirth(nativeTicket)
-            done("Android 临时测速原生准入已关闭")
+            done(AndroidNativeFailure.from(error, "Android 临时测速原生准入已关闭"))
         }
     }
 
     fun close(id: String, done: (String?) -> Unit) = sessions.close(id, done)
+    fun closeCoded(id: String, done: (AndroidNativeFailure?) -> Unit) = sessions.closeCoded(id, done)
     fun status(id: String): String = sessions.status(id)
     fun <T> withMainStart(owner: Any, allowed: () -> Boolean, action: () -> T): T =
         sessions.withMainStart(owner, allowed, action)

@@ -950,6 +950,10 @@ async fn run_temp_core_speed_test(
         })),
         // 起核前就被主核接管 → 一个节点都没测。**失败信封**：零进度事件 + 成功信封会把前端测速按钮
         // 永久卡灰（同池路径「反伪造 + 反卡死」那一节）。
+        TempCoreOutcome::AndroidCapacityClosed(error) => ApiResponse::err_with_code(
+            error.to_string(),
+            crate::runtime::proxy::code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED,
+        ),
         TempCoreOutcome::Superseded => ApiResponse::err_with_code(
             "测速已让位给正在启动的代理内核（主核起来后可经主核测速池重测）",
             CODE_TEMP_CORE_FAILED,

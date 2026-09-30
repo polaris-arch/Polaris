@@ -13,10 +13,12 @@ internal object AndroidNativeMain {
 
     fun reserveSystem(runId: String): AndroidNativeAdmission.Ticket = reserveBridge(runId)
 
-    fun enterBirth(ticket: AndroidNativeAdmission.Ticket) {
+    fun enterBirth(ticket: AndroidNativeAdmission.Ticket) = enterBirth(AndroidNativeAdmissionGate.ledger, ticket)
+
+    internal fun enterBirth(ledger: AndroidNativeAdmission, ticket: AndroidNativeAdmission.Ticket) {
         require(ticket.kind == AndroidNativeAdmission.Kind.Main)
-        if (!AndroidNativeAdmissionGate.ledger.enterBirth(ticket)) {
-            throw AndroidNativeAdmission.AdmissionClosed()
+        if (!ledger.enterBirth(ticket)) {
+            throw ledger.admissionRejection()
         }
     }
 

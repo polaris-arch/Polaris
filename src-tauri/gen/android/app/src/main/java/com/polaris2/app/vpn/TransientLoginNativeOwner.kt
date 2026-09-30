@@ -29,7 +29,7 @@ internal class TransientLoginNativeOwner private constructor(
 
     /** Host holds ownershipLock until this returns or records construction failure. */
     fun <T> construct(action: () -> T): T {
-        check(enterBirth()) { "Android 登录原生准入已关闭" }
+        if (!enterBirth()) throw ledger.admissionRejection()
         try {
             val result = action()
             check(!cancelled) { "Android 登录请求已取消" }

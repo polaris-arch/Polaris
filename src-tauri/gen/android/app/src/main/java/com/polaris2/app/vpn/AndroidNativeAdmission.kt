@@ -48,22 +48,29 @@ internal data class AndroidDrainReceipt(
 internal class AndroidNativeAdmission(
     val processNonce: String = UUID.randomUUID().toString(),
     private val coveredProducers: Set<String> = AndroidNativeCoverage.wiredProducers,
+    private val maxMetadataRecords: Int = DEFAULT_MAX_METADATA_RECORDS,
 ) {
     init {
         require(validId(processNonce, 128)) { "invalid native process nonce" }
         require(AndroidNativeCoverage.requiredProducers.containsAll(coveredProducers)) { "invalid native coverage manifest" }
+        require(maxMetadataRecords in 1..DEFAULT_MAX_METADATA_RECORDS) { "invalid native metadata budget" }
     }
     enum class Kind { Main, Login, Speedtest, CheckConfig, TargetlessStop, TargetlessReload }
     enum class State { Reserved, BirthEntered, CancelledBeforeBirth, ClosedExact, Completed, Unknown, ValidationCleanupUnknown }
     data class Ticket(val id: String, val kind: Kind, val logicalId: String)
     data class Entry(val ticket: Ticket, val state: State)
-    class AdmissionClosed : IllegalStateException("android: native admission is closed")
+    open class AdmissionClosed(message: String = "android: native admission is closed") : IllegalStateException(message)
+    class CapacityClosed : AdmissionClosed(CAPACITY_MESSAGE)
+    data class MetadataUsage(val entries: Int, val consumedOwners: Int, val limit: Int, val capacityClosed: Boolean) {
+        val records: Int get() = entries + consumedOwners
+    }
 
     private val lock = Any()
     private var bootstrap: RequiredMarkerProof? = null
     private var fenceId: String? = null
     private var sealedRevision = 0L
     private var revision = 0L
+    private var capacityClosed = false
     private val entries = LinkedHashMap<String, Entry>()
     private val usedOwners = HashMap<Pair<Kind, String>, Ticket?>()
     private var captured = emptyList<String>()
@@ -87,13 +94,16 @@ internal class AndroidNativeAdmission(
     private fun reserve(kind: Kind, logicalId: String, owner: Boolean): Ticket {
         val ticket = Ticket(UUID.randomUUID().toString(), kind, logicalId)
         return synchronized(lock) {
+            if (capacityClosed) throw CapacityClosed()
             if (fenceId != null || bootstrap != RequiredMarkerProof.Absent) throw AdmissionClosed()
             require(validId(logicalId, 256)) { "invalid native owner identity" }
             check(!entries.containsKey(ticket.id)) { "native ticket collision" }
             if (owner) check(!usedOwners.containsKey(kind to logicalId)) { "native owner identity was already consumed" }
+            requireCapacityLocked(if (owner) 2 else 1)
             if (owner) usedOwners[kind to logicalId] = ticket
             entries[ticket.id] = Entry(ticket, State.Reserved)
             revision++
+            closeIfFullLocked()
             ticket
         }
     }
@@ -101,11 +111,17 @@ internal class AndroidNativeAdmission(
     /** A worker must call this immediately before crossing a native factory/JNI boundary. */
     fun enterBirth(ticket: Ticket): Boolean = synchronized(lock) {
         val current = entries[ticket.id] ?: return@synchronized false
-        if (current.ticket != ticket || current.state != State.Reserved || fenceId != null) return@synchronized false
+        if (!birthAllowedLocked(ticket)) return@synchronized false
         entries[ticket.id] = current.copy(state = State.BirthEntered)
         revision++
         true
     }
+
+    /** A preflight before disrupting another owner; enterBirth still rechecks at the native boundary. */
+    fun birthAllowed(ticket: Ticket): Boolean = synchronized(lock) { birthAllowedLocked(ticket) }
+    private fun birthAllowedLocked(ticket: Ticket): Boolean = entries[ticket.id]?.let {
+        it.ticket == ticket && it.state == State.Reserved && fenceId == null && !capacityClosed
+    } == true
 
     /** A reservation cancelled before native birth is a positive terminal fact. */
     fun cancelBeforeBirth(ticket: Ticket): Boolean = settle(ticket, setOf(State.Reserved), State.CancelledBeforeBirth)
@@ -115,8 +131,10 @@ internal class AndroidNativeAdmission(
         require(kind in OWNER_KINDS && validId(logicalId, 256))
         val key = kind to logicalId
         if (!usedOwners.containsKey(key)) {
+            requireCapacityLocked(1)
             usedOwners[key] = null
             revision++
+            closeIfFullLocked()
         }
         val ticket = usedOwners[key]
         if (ticket != null) {
@@ -130,6 +148,30 @@ internal class AndroidNativeAdmission(
 
     fun state(ticket: Ticket): State? = synchronized(lock) {
         entries[ticket.id]?.takeIf { it.ticket == ticket }?.state
+    }
+
+    fun metadataUsage(): MetadataUsage = synchronized(lock) {
+        MetadataUsage(entries.size, usedOwners.size, maxMetadataRecords, capacityClosed)
+    }
+
+    fun admissionRejection(): AdmissionClosed = synchronized(lock) {
+        if (capacityClosed) CapacityClosed() else AdmissionClosed()
+    }
+
+    /** Capacity is a permanent admission failure, never a drain fence or terminal resource fact. */
+    private fun requireCapacityLocked(additional: Int) {
+        if (capacityClosed || additional > maxMetadataRecords - entries.size - usedOwners.size) {
+            closeCapacityLocked()
+            throw CapacityClosed()
+        }
+    }
+
+    private fun closeIfFullLocked() {
+        if (entries.size + usedOwners.size == maxMetadataRecords) closeCapacityLocked()
+    }
+
+    private fun closeCapacityLocked() {
+        if (!capacityClosed) { capacityClosed = true; revision++ }
     }
 
     /** Only an exact native close that returned successfully may call this. */
@@ -146,7 +188,7 @@ internal class AndroidNativeAdmission(
 
     fun unknown(ticket: Ticket): Boolean = settle(ticket, setOf(State.Reserved, State.BirthEntered), State.Unknown)
 
-    /** Go checkConfig currently ignores box.Close's result; a captured call cannot prove cleanup. */
+    /** Android's legacy checkConfig call does not consume the typed Go disposal contract. */
     fun validationCleanupUnknown(ticket: Ticket): Boolean {
         require(ticket.kind == Kind.CheckConfig)
         return settle(ticket, setOf(State.BirthEntered), State.ValidationCleanupUnknown)
@@ -191,6 +233,11 @@ internal class AndroidNativeAdmission(
     )
 
     companion object {
+        // A record budget, not a byte estimate. IDs are bounded; each owner uses
+        // two records, each validation/control one, and an unseen close one.
+        const val DEFAULT_MAX_METADATA_RECORDS = 16_384
+        const val CAPACITY_CODE = "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED"
+        const val CAPACITY_MESSAGE = "本次运行的生命周期记录已满，请完全关闭并重新启动应用后重试。"
         // Every producer uses UUID, hex, or a sanitized ASCII file stem. An explicit
         // shared alphabet avoids JVM/Rust Unicode whitespace and surrogate differences.
         private fun validId(value: String, maxUtf16Units: Int): Boolean =
@@ -201,6 +248,15 @@ internal class AndroidNativeAdmission(
         private val CONTROL_KINDS = setOf(Kind.TargetlessStop, Kind.TargetlessReload)
         private val TERMINAL = setOf(State.CancelledBeforeBirth, State.ClosedExact, State.Completed,
             State.Unknown, State.ValidationCleanupUnknown)
+    }
+}
+
+/** An explicit rejection cause for internal callbacks; arbitrary native text carries no code. */
+internal data class AndroidNativeFailure(val message: String, val code: String? = null) {
+    companion object {
+        fun from(error: Throwable, fallback: String): AndroidNativeFailure =
+            if (error is AndroidNativeAdmission.CapacityClosed) capacity() else AndroidNativeFailure(fallback)
+        fun capacity() = AndroidNativeFailure(AndroidNativeAdmission.CAPACITY_MESSAGE, AndroidNativeAdmission.CAPACITY_CODE)
     }
 }
 

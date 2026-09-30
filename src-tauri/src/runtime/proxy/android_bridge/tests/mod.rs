@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn capacity_rejection_survives_only_the_explicit_bridge_code() {
+    assert_eq!(
+        map_rejected_code(Some(code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED)),
+        code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED
+    );
+    for code in [
+        None,
+        Some("ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED "),
+        Some("ANDROID_NATIVE_ADMISSION_CLOSED"),
+        Some("restart app"),
+    ] {
+        assert_eq!(map_rejected_code(code), code::STARTUP_FAILED);
+    }
+}
+
+#[test]
+fn check_config_optional_code_has_a_typed_cause_and_never_guesses_raw_text() {
+    let accepted: CheckResponse = serde_json::from_str("{}").unwrap();
+    assert!(matches!(
+        check_response_verdict(accepted),
+        Ok(ConfigCheckVerdict::Accepted)
+    ));
+    let capacity: CheckResponse = serde_json::from_value(serde_json::json!({"error":"private text", "errorCode":code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED})).unwrap();
+    assert!(matches!(
+        check_response_verdict(capacity),
+        Err(CapacityClosed)
+    ));
+    for code in [
+        None,
+        Some("unknown"),
+        Some("ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED "),
+    ] {
+        let raw: CheckResponse = serde_json::from_value(
+            serde_json::json!({"error":CapacityClosed.to_string(), "errorCode":code}),
+        )
+        .unwrap();
+        assert!(matches!(
+            check_response_verdict(raw),
+            Ok(ConfigCheckVerdict::Unattributable(_))
+        ));
+    }
+}
+
+#[test]
+fn actual_close_failure_has_priority_over_capacity_and_never_becomes_an_exact_receipt() {
+    assert!(matches!(
+        speedtest_start_failure(Some(CapacityClosed), Ok(())),
+        SpeedtestStartError::CapacityClosed(_)
+    ));
+    assert!(matches!(
+        speedtest_start_failure(
+            Some(CapacityClosed),
+            Err(TransientCloseError::CapacityClosed(CapacityClosed))
+        ),
+        SpeedtestStartError::CapacityClosed(_)
+    ));
+    match speedtest_start_failure(
+        Some(CapacityClosed),
+        Err(TransientCloseError::Failed("close/network failed".into())),
+    ) {
+        SpeedtestStartError::CleanupUnknown(message) => {
+            assert_eq!(message, "Android 测速临时核关闭结果未知；本轮已停止")
+        }
+        other => panic!("real cleanup must win: {other:?}"),
+    }
+    assert!(matches!(
+        speedtest_start_failure(
+            None,
+            Err(TransientCloseError::CapacityClosed(CapacityClosed))
+        ),
+        SpeedtestStartError::CleanupUnknown(_)
+    ));
+    match speedtest_start_failure(None, Ok(())) {
+        SpeedtestStartError::Failed(message) => {
+            assert_eq!(message, "Android 测速临时核启动失败或超时")
+        }
+        other => panic!("old fallback changed: {other:?}"),
+    }
+}
+#[test]
 fn native_system_endpoint_guard_code_survives_the_bridge_whitelist() {
     assert_eq!(
         map_rejected_code(Some(code::SYSTEM_INTERFACE_UNSUPPORTED)),

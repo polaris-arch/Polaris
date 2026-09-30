@@ -972,6 +972,10 @@ pub async fn tailscale_login(
         StartLoginOutcome::Cancelled => Ok(ApiResponse::ok(
             json!({"started": false, "reason": "cancelled"}),
         )),
+        StartLoginOutcome::AndroidCapacityClosed(error) => Ok(ApiResponse::err_with_code(
+            error.to_string(),
+            crate::runtime::proxy::code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED,
+        )),
         StartLoginOutcome::Failed(reason) => {
             Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED"))
         }

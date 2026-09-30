@@ -20,6 +20,7 @@ export interface ProxyErrorTextInput {
 /** Rust `runtime/proxy.rs::code` 的全量用户可见映射。 */
 export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   STARTUP_FAILED: 'errors.startupFailed',
+  ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: 'errors.androidNativeCapacityClosed',
   PROCESS_EXITED: 'home.proxyCrashed',
   AUTO_RESTART_FAILED: 'home.proxyCrashed',
   HELPER_NOT_INSTALLED: 'errors.helperNotInstalledDesc',

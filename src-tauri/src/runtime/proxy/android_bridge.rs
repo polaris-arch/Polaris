@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use polaris_core_supervisor::config_gate::{verdict_from_libbox_check, ConfigCheckVerdict};
 
+use super::android_capacity::CapacityClosed;
 use super::code;
 
 /// 桥的 Kotlin 侧插件标识（`register_android_plugin` 会拼成 `com/polaris2/app/vpn/PolarisVpnPlugin`）。
@@ -570,6 +571,9 @@ fn map_rejected_code(code: Option<&str>) -> &'static str {
     match code {
         Some(c) if c == code::VPN_PERMISSION_DENIED => code::VPN_PERMISSION_DENIED,
         Some(c) if c == code::SYSTEM_INTERFACE_UNSUPPORTED => code::SYSTEM_INTERFACE_UNSUPPORTED,
+        Some(c) if CapacityClosed::from_code(Some(c)).is_some() => {
+            code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED
+        }
         Some(c) if c == ENDPOINT_RETIRED_NO_BIRTH => ENDPOINT_RETIRED_NO_BIRTH,
         _ => code::STARTUP_FAILED,
     }
@@ -581,10 +585,10 @@ pub(super) const ENDPOINT_RETIRED_NO_BIRTH: &str = "API_ENDPOINT_RETIRED";
 
 #[cfg(target_os = "android")]
 mod handle {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
-    use tauri::plugin::PluginHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tauri::Wry;
+    use tauri::plugin::PluginHandle;
 
     /// 插件句柄。
     ///
@@ -929,7 +933,36 @@ pub(super) async fn stop_core_with_birth(
 ///
 /// `pub(crate)`：`commands/proxy.rs::kernel_probe_outbound`（custom 协议兼容性探测）在 Android 上
 /// 走同一条腿 —— 两处各问各的，迟早有一处的超时 / 失败折叠跟不上另一处。
+#[cfg(any(target_os = "android", test))]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckResponse {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_code: Option<String>,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn check_response_verdict(response: CheckResponse) -> Result<ConfigCheckVerdict, CapacityClosed> {
+    if let Some(error) = CapacityClosed::from_code(response.error_code.as_deref()) {
+        return Err(error);
+    }
+    Ok(verdict_from_libbox_check(Ok(response.error)))
+}
+
 pub(crate) async fn check_config(config_json: &str) -> ConfigCheckVerdict {
+    match check_config_admitted(config_json).await {
+        Ok(verdict) => verdict,
+        // The primary config gate retains its old fail-open behavior. Its next
+        // owner reservation independently rejects with the explicit capacity code.
+        Err(error) => ConfigCheckVerdict::Unavailable(error.to_string()),
+    }
+}
+
+pub(crate) async fn check_config_admitted(
+    config_json: &str,
+) -> Result<ConfigCheckVerdict, CapacityClosed> {
     #[cfg(target_os = "android")]
     {
         // 拥有式载荷的理由同 `start_core`：调用由分离 task 持有到底（见 [`call_with_budget`]）。
@@ -938,18 +971,9 @@ pub(crate) async fn check_config(config_json: &str) -> ConfigCheckVerdict {
         struct CheckArgs {
             config_content: String,
         }
-        /// Kotlin 侧 `invoke.resolve(JSObject)` 的回包。
-        ///
-        /// `#[serde(default)]` 是承重的：`org.json.JSONObject.put(key, null)` 会**删掉**这个键，
-        /// 所以「内核收下」的回包是 `{}` 而不是 `{"error": null}`。
-        #[derive(serde::Deserialize)]
-        struct CheckResponse {
-            #[serde(default)]
-            error: Option<String>,
-        }
         let plugin = match plugin_handle() {
             Ok(p) => p,
-            Err((msg, _)) => return verdict_from_libbox_check(Err(msg)),
+            Err((msg, _)) => return Ok(verdict_from_libbox_check(Err(msg))),
         };
         let result = match call_with_budget::<CheckResponse, _>(
             plugin,
@@ -962,21 +986,23 @@ pub(crate) async fn check_config(config_json: &str) -> ConfigCheckVerdict {
         )
         .await
         {
-            Ok(r) => Ok(r.error),
+            Ok(r) => return check_response_verdict(r),
             Err(BridgeCallError::Invoke(e)) => Err(format!("{e}")),
             Err(BridgeCallError::TimedOut) => {
                 Err(format!("checkConfig 超时（>{}s）", CHECK_TIMEOUT.as_secs()))
             }
             Err(BridgeCallError::TaskFailed(e)) => Err(format!("checkConfig 投递腿异常：{e}")),
         };
-        verdict_from_libbox_check(result)
+        Ok(verdict_from_libbox_check(result))
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = config_json;
         // 非 Android 走不到这里（调用点在解析不到核二进制时已经 fail-open 早退）。真走到了也
         // 只是多一条 fail-open 的放行，绝不 panic —— 起核路径上不接受「判据本身把进程搞崩」。
-        verdict_from_libbox_check(Err("本平台没有 Android 起核桥".to_string()))
+        Ok(verdict_from_libbox_check(Err(
+            "本平台没有 Android 起核桥".to_string()
+        )))
     }
 }
 
@@ -1428,11 +1454,61 @@ mod tests;
 
 /// A speedtest host is identified by its own ID. A bridge timeout is not a
 /// native close acknowledgement: Kotlin retains the ID until cleanup finishes.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 #[derive(Debug)]
 pub(crate) enum SpeedtestStartError {
     Failed(String),
     CleanupUnknown(String),
+    CapacityClosed(CapacityClosed),
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug)]
+pub(crate) enum LoginStartError {
+    Failed(String),
+    CapacityClosed(CapacityClosed),
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug)]
+enum TransientCloseError {
+    Failed(String),
+    CapacityClosed(CapacityClosed),
+}
+
+#[cfg(any(target_os = "android", test))]
+impl std::fmt::Display for TransientCloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::Failed(message) => f.write_str(message), Self::CapacityClosed(error) => error.fmt(f) }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn speedtest_start_failure(
+    capacity: Option<CapacityClosed>,
+    close: Result<(), TransientCloseError>,
+) -> SpeedtestStartError {
+    match close {
+        // A real Close failure has precedence over an admission-only diagnostic.
+        Err(TransientCloseError::Failed(_)) => SpeedtestStartError::CleanupUnknown("Android 测速临时核关闭结果未知；本轮已停止".to_owned()),
+        Ok(()) | Err(TransientCloseError::CapacityClosed(_)) if capacity.is_some() => {
+            SpeedtestStartError::CapacityClosed(capacity.unwrap())
+        }
+        Ok(()) => SpeedtestStartError::Failed("Android 测速临时核启动失败或超时".to_owned()),
+        Err(TransientCloseError::CapacityClosed(error)) => {
+            SpeedtestStartError::CleanupUnknown(format!("Android 测速临时核关闭结果未知；{error}"))
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn transient_capacity(error: &BridgeCallError) -> Option<CapacityClosed> {
+    match error {
+        BridgeCallError::Invoke(tauri::plugin::mobile::PluginInvokeError::InvokeRejected(
+            rejection,
+        )) => CapacityClosed::from_code(rejection.code.as_deref()),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -1476,24 +1552,27 @@ pub(crate) async fn start_transient_speedtest(
     }
     // Even if start has not reached Kotlin yet, close records a permanent
     // tombstone for this ID and prevents a late callback from starting it.
-    match close_transient_speedtest(instance_id).await {
-        Ok(()) => Err(SpeedtestStartError::Failed(
-            "Android 测速临时核启动失败或超时".to_owned(),
-        )),
-        Err(_) => Err(SpeedtestStartError::CleanupUnknown(
-            "Android 测速临时核关闭结果未知；本轮已停止".to_owned(),
-        )),
-    }
+    let capacity = result.as_ref().err().and_then(transient_capacity);
+    Err(speedtest_start_failure(
+        capacity,
+        close_transient_speedtest_admitted(instance_id).await,
+    ))
 }
 
 #[cfg(target_os = "android")]
 pub(crate) async fn close_transient_speedtest(instance_id: &str) -> Result<(), String> {
+    close_transient_speedtest_admitted(instance_id).await.map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "android")]
+async fn close_transient_speedtest_admitted(instance_id: &str) -> Result<(), TransientCloseError> {
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
     struct CloseArgs {
         instance_id: String,
     }
-    let plugin = plugin_handle().map_err(|_| "Android 测速桥不可用".to_owned())?;
+    let plugin = plugin_handle()
+        .map_err(|_| TransientCloseError::Failed("Android 测速桥不可用".to_owned()))?;
     call_with_budget::<(), _>(
         plugin,
         "closeTransientSpeedtest",
@@ -1505,7 +1584,10 @@ pub(crate) async fn close_transient_speedtest(instance_id: &str) -> Result<(), S
     )
     .await
     .map(|_| ())
-    .map_err(|_| "Android 测速临时核关闭未确认".to_owned())
+    .map_err(|error| match transient_capacity(&error) {
+        Some(capacity) => TransientCloseError::CapacityClosed(capacity),
+        None => TransientCloseError::Failed("Android 测速临时核关闭未确认".to_owned()),
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -1541,14 +1623,14 @@ pub(crate) async fn transient_speedtest_status(
 pub(crate) async fn start_transient_login(
     instance_id: &str,
     config_content: &str,
-) -> Result<(), String> {
+) -> Result<(), LoginStartError> {
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
     struct TransientStartArgs {
         instance_id: String,
         config_content: String,
     }
-    let plugin = plugin_handle().map_err(|(message, _)| message)?;
+    let plugin = plugin_handle().map_err(|(message, _)| LoginStartError::Failed(message))?;
     let result = call_with_budget::<(), _>(
         plugin,
         "startTransientLogin",
@@ -1560,12 +1642,17 @@ pub(crate) async fn start_transient_login(
         None,
     )
     .await
-    .map_err(|error| match error {
-        BridgeCallError::Invoke(error) => {
-            format!("Android 独立登录桥拒绝: {}", invoke_error(&error).0)
+    .map_err(|error| {
+        if let Some(capacity) = transient_capacity(&error) {
+            return LoginStartError::CapacityClosed(capacity);
         }
-        BridgeCallError::TimedOut => "Android 独立登录启动桥超时".to_owned(),
-        BridgeCallError::TaskFailed(_) => "Android 独立登录启动桥投递失败".to_owned(),
+        LoginStartError::Failed(match error {
+            BridgeCallError::Invoke(error) => {
+                format!("Android 独立登录桥拒绝: {}", invoke_error(&error).0)
+            }
+            BridgeCallError::TimedOut => "Android 独立登录启动桥超时".to_owned(),
+            BridgeCallError::TaskFailed(_) => "Android 独立登录启动桥投递失败".to_owned(),
+        })
     });
     if result.is_err() {
         // Also closes a start callback that arrives after the bridge budget expired.
@@ -1593,7 +1680,12 @@ pub(crate) async fn close_transient_login(instance_id: &str) -> Result<(), Strin
     )
     .await
     .map(|_| ())
-    .map_err(|_| "Android 独立登录关闭未确认".to_owned())
+    .map_err(|error| {
+        transient_capacity(&error).map_or_else(
+            || "Android 独立登录关闭未确认".to_owned(),
+            |capacity| capacity.to_string(),
+        )
+    })
 }
 
 #[cfg(target_os = "android")]

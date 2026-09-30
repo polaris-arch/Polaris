@@ -1591,6 +1591,7 @@
     "tunAdapterMissing": "The TUN adapter could not be created. Check whether security software is blocking the wintun driver, then restart and try again.",
     "autoSwitchNeedsRestart": "Automatic node switching was triggered, but nothing was switched this time: some candidate nodes need the core restarted before they can take over. Pick another node manually.",
     "tunAddressUnavailable": "The TUN adapter address could not be assigned — it may be held by a leftover adapter or another VPN. Disconnect other VPNs, or restart and try again.",
+    "androidNativeCapacityClosed": "This session has reached its lifecycle record limit. Fully close and restart the app, then try again.",
     "vpnPermissionDenied": "VPN permission is still needed. Complete or dismiss any open permission dialog, then tap Connect again and allow the system VPN connection request.",
     "systemInterfaceUnsupported": "This node requests a system interface, which Android VPN mode does not support. Turn off the system interface option in the node editor; for custom nodes, set system to false in the JSON."
   },

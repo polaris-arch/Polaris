@@ -77,6 +77,12 @@ export function handleProxyErrorEvent(
   deps: { t: (key: string, fallback?: string) => string; refreshProxyStatus: () => Promise<void> }
 ): void {
   const { t, refreshProxyStatus } = deps;
+  if (data.errorCode === 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED') {
+    void refreshProxyStatus();
+    if (isProxyStartClaimed()) return;
+    toast.error(proxyErrorText(data, t));
+    return;
+  }
   if (data.errorCode === 'PROCESS_EXITED' || data.errorCode === 'AUTO_RESTART_FAILED') {
     void refreshProxyStatus();
     toast.error(proxyErrorText(data, t));

@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod android_bridge;
+pub(crate) mod android_capacity;
 // Read-only proof shape for a future Android managed handoff. It cannot release
 // legacy custody or publish NoOldCore until every native owner is wired.
 #[allow(dead_code)]
@@ -330,6 +331,8 @@ pub struct ProxyStatus {
 /// **只收录本层能从控制流位置诚实断言的成员**：本仓无「核 stderr / 退出码 → 错误码」分类器，
 /// 只收录可由控制流直接证明的分类；未收录的类别需先建立判据，不能靠 message 关键字补全。
 pub mod code {
+    /// This invocation was rejected by Android's permanent process metadata budget.
+    pub const ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: &str = "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED";
     /// 显式用户态入站策略遇到最终 System endpoint；OS 路径需外部防火墙。
     pub const MESH_INBOUND_SYSTEM_INTERFACE: &str = "MESH_INBOUND_SYSTEM_INTERFACE";
     /// Final generated endpoints request system interfaces without the managed helper runtime.

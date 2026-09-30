@@ -288,6 +288,7 @@ class BoxService(
                         e.message ?: e.toString(),
                         when (e) {
                             is SystemEndpointGuard.Unsupported -> SystemEndpointGuard.ERROR
+                            is AndroidNativeAdmission.CapacityClosed -> AndroidNativeAdmission.CAPACITY_CODE
                             is AndroidNativeAdmission.AdmissionClosed -> PolarisVpnPlugin.ERR_NATIVE_ADMISSION_CLOSED
                             else -> PolarisVpnPlugin.ERR_STARTUP_FAILED
                         },

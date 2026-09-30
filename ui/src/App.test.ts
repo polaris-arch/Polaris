@@ -102,6 +102,18 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     ({ withProxyStartClaim } = await import('./lib/proxy-start-claim'));
   });
 
+  it('capacity emits one short localized toast, with start-claim deduplication and no raw text', async () => {
+    handleProxyErrorEvent({ errorCode: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', message: 'private diagnostics' }, { t, refreshProxyStatus });
+    expect(refreshProxyStatus).toHaveBeenCalledOnce();
+    expect(toastErrorMock).toHaveBeenCalledWith('errors.androidNativeCapacityClosed');
+    expect(notifyDesktopMock).not.toHaveBeenCalled();
+    toastErrorMock.mockClear();
+    await withProxyStartClaim(async () => {
+      handleProxyErrorEvent({ errorCode: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED' }, { t, refreshProxyStatus });
+      expect(toastErrorMock).not.toHaveBeenCalled();
+    });
+  });
+
   it.each(['PROCESS_EXITED', 'AUTO_RESTART_FAILED'])(
     '崩溃腿 %s → 刷连接态 + 断开 toast + 桌面通知',
     (errorCode) => {

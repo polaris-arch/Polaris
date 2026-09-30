@@ -36,6 +36,8 @@ describe('Tailscale login request identity and result', () => {
   });
   it('failure presentation maps stable categories instead of arbitrary private diagnostics', () => {
     expect(loginFailureReasonKey('coreUnavailable')).toBe('ts.reasonCoreUnavailable');
+    expect(loginFailureReasonKey('ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED')).toBe('errors.androidNativeCapacityClosed');
+    expect(loginFailureReasonKey('ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED ')).toBe('ts.reasonAuthorization');
     expect(loginFailureReasonKey('mainCoreInUse')).toBe('ts.reasonMainCoreInUse');
     expect(loginFailureReasonKey('PRIVATE_KEY_RAW_DIAGNOSTIC')).toBe('ts.reasonAuthorization');
   });

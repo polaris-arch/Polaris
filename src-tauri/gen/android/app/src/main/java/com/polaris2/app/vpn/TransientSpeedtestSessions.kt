@@ -66,7 +66,10 @@ internal class TransientSpeedtestSessions(
         nativeAdmission?.cancelBeforeBirth(ticket)
     }
 
-    fun start(id: String, engine: Engine, nativeTicket: AndroidNativeAdmission.Ticket? = null, done: (String?) -> Unit) {
+    fun start(id: String, engine: Engine, nativeTicket: AndroidNativeAdmission.Ticket? = null, done: (String?) -> Unit) =
+        startCoded(id, engine, nativeTicket) { done(it?.message) }
+
+    fun startCoded(id: String, engine: Engine, nativeTicket: AndroidNativeAdmission.Ticket? = null, done: (AndroidNativeFailure?) -> Unit) {
         val identity = parseIdentity(id)
         // A rejected invocation has no custody of a different family or ID.
         val ownerTicket = nativeTicket?.takeIf {
@@ -74,7 +77,7 @@ internal class TransientSpeedtestSessions(
         }
         if (identity == null || (nativeAdmission != null && ownerTicket == null)) {
             ownerTicket?.let(::cancelBeforeBirth)
-            done("Android 临时测速实例标识无效")
+            done(AndroidNativeFailure("Android 临时测速实例标识无效"))
             return
         }
         val entry = synchronized(lock) {
@@ -90,16 +93,16 @@ internal class TransientSpeedtestSessions(
         }
         if (entry == null) {
             ownerTicket?.let(::cancelBeforeBirth)
-            done("Android 临时测速实例忙或标识重复")
+            done(AndroidNativeFailure("Android 临时测速实例忙或标识重复"))
             return
         }
         try { launchStart {
-            var failure: String? = null
+            var failure: AndroidNativeFailure? = null
             try {
                 if (!isRevoked(entry)) {
                     if (nativeAdmission != null && !nativeAdmission.enterBirth(checkNotNull(ownerTicket))) {
                         cancelBeforeBirth(ownerTicket)
-                        throw AndroidNativeAdmission.AdmissionClosed()
+                        throw nativeAdmission.admissionRejection()
                     }
                     entry.engine.prepare()
                     synchronized(lock) { entry.prepared = true; lock.notifyAll() }
@@ -114,12 +117,12 @@ internal class TransientSpeedtestSessions(
                             throw error
                         }
                     }
-                    if (isRevoked(entry)) failure = "Android 临时测速已取消"
+                    if (isRevoked(entry)) failure = AndroidNativeFailure("Android 临时测速已取消")
                     else synchronized(lock) {
                         if (!entry.revoked && active === entry) entry.state = "running"
-                        else failure = "Android 临时测速已取消"
+                        else failure = AndroidNativeFailure("Android 临时测速已取消")
                     }
-                } else failure = "Android 临时测速已取消"
+                } else failure = AndroidNativeFailure("Android 临时测速已取消")
             } catch (error: Throwable) {
                 synchronized(lock) {
                     if (ownerTicket != null && nativeAdmission?.state(ownerTicket) == AndroidNativeAdmission.State.BirthEntered) {
@@ -127,7 +130,7 @@ internal class TransientSpeedtestSessions(
                     }
                 }
                 logFailure(error)
-                failure = "Android 临时测速启动失败"
+                failure = AndroidNativeFailure.from(error, "Android 临时测速启动失败")
             } finally {
                 synchronized(lock) { entry.prepared = true; lock.notifyAll() }
                 entry.operationFinished.complete(Unit)
@@ -145,17 +148,19 @@ internal class TransientSpeedtestSessions(
             entry.operationFinished.complete(Unit)
             requestClose(entry)
             logFailure(error)
-            done("Android 临时测速启动线程不可用")
+            done(AndroidNativeFailure("Android 临时测速启动线程不可用"))
         }
     }
 
-    fun close(id: String, done: (String?) -> Unit) {
+    fun close(id: String, done: (String?) -> Unit) = closeCoded(id) { done(it?.message) }
+
+    fun closeCoded(id: String, done: (AndroidNativeFailure?) -> Unit) {
         val identity = parseIdentity(id)
         if (identity == null) {
-            done("Android 临时测速实例标识无效")
+            done(AndroidNativeFailure("Android 临时测速实例标识无效"))
             return
         }
-        val (entry, wrongEpoch) = synchronized(lock) {
+        val (entry, wrongEpoch) = try { synchronized(lock) {
             if (epoch == null) epoch = identity.epoch
             if (epoch != identity.epoch) Pair(null, true)
             else {
@@ -167,7 +172,11 @@ internal class TransientSpeedtestSessions(
                 Pair(owned, false)
             }
         }
-        if (wrongEpoch) { done("Android 临时测速实例 epoch 不匹配"); return }
+        } catch (error: AndroidNativeAdmission.CapacityClosed) {
+            done(AndroidNativeFailure.from(error, "Android 临时测速原生准入已关闭"))
+            return
+        }
+        if (wrongEpoch) { done(AndroidNativeFailure("Android 临时测速实例 epoch 不匹配")); return }
         if (entry == null) { done(null); return }
         requestClose(entry)
         val replied = AtomicBoolean(false)
@@ -175,12 +184,12 @@ internal class TransientSpeedtestSessions(
             synchronized(lock) {
                 if (active === entry && !entry.closed.isDone) entry.state = "cleanupUnknown"
             }
-            if (replied.compareAndSet(false, true)) done("Android 临时测速关闭结果未知")
+            if (replied.compareAndSet(false, true)) done(AndroidNativeFailure("Android 临时测速关闭结果未知"))
         }, closeTimeoutMillis, TimeUnit.MILLISECONDS)
         entry.closed.whenComplete { _, error ->
             deadline.cancel(false)
             if (replied.compareAndSet(false, true)) {
-                done(if (error == null) null else "Android 临时测速关闭失败，清理结果未知")
+                done(if (error == null) null else AndroidNativeFailure("Android 临时测速关闭失败，清理结果未知"))
             }
         }
     }

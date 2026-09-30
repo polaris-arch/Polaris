@@ -115,6 +115,7 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.TUN_ROUTE_NOT_CAPTURED:
       return ErrorCategory.System;
     case ProxyErrorCode.STARTUP_FAILED:
+    case ProxyErrorCode.ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED:
     case ProxyErrorCode.PROCESS_KILLED:
     case ProxyErrorCode.PROCESS_EXITED:
     case ProxyErrorCode.AUTO_RESTARTING:

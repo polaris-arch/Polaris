@@ -210,6 +210,8 @@ describe('移动登录：保存后的重试与安全授权状态', () => {
   });
   it('只按稳定错误码分类，秘密/URL/path 的原始错误不进入展示键', () => {
     expect(tsLoginFailureKey({ code: 'TAILSCALE_LOGIN_FAILED', message: 'tskey-secret https://private /data/user' })).toBe('ts.loginStartFailed');
+    expect(tsLoginFailureKey({ code: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', message: 'private' })).toBe('errors.androidNativeCapacityClosed');
+    expect(tsLoginFailureKey({ message: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED' })).toBe('ts.loginAttemptFailed');
     expect(tsLoginFailureKey(new Error('tskey-secret https://private /data/user'))).toBe('ts.loginAttemptFailed');
     expect(tsLoginFailureKey({ code: 'https://private' })).toBe('ts.loginAttemptFailed');
   });

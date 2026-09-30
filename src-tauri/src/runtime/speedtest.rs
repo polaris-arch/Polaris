@@ -62,9 +62,9 @@ use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
 use polaris_config_engine::builder::system_interfaces::{
     raw_endpoint_requests_system_interface, system_interface_ownership_error,
 };
+use polaris_config_engine::singbox::DomainResolver;
 #[cfg(any(target_os = "android", test))]
 use polaris_config_engine::singbox::inbound::InboundUser;
-use polaris_config_engine::singbox::DomainResolver;
 use polaris_config_engine::user_config::protocol_settings::tailcat_emit_check;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
@@ -2033,6 +2033,7 @@ impl TempCoreDeps {
 /// 一次临时核测速的结局（命令层折成响应信封）。
 #[derive(Debug)]
 pub enum TempCoreOutcome {
+    AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
     /// A caller bypassed planning and supplied a system endpoint to the unmanaged temporary core.
     SystemInterfaceRequired(String),
     /// 跑完了（可能部分节点 `-1` = 真实不可测）。`outcome` 同主核路径语义。
@@ -2071,6 +2072,7 @@ pub enum TempCoreOutcome {
 /// 就是「第一批测完即宣告整轮结束」——分批最危险的那个失效面。
 #[derive(Debug)]
 enum BatchOutcome {
+    AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
     SystemInterfaceRequired(String),
     /// 走到了测量阶段。载荷是**本批**的结果（可能部分节点真实 `-1`，也可能中途被中断 ——
     /// 成因已记进 [`RoundProgress`]，不在这里重复）。
@@ -2191,6 +2193,9 @@ impl TempCoreSession {
                 progress.emit_progress(emit);
             }
             match Self::run_batch(deps, batch, superseded, &measure, emit, &mut progress).await {
+                BatchOutcome::AndroidCapacityClosed(error) => {
+                    return TempCoreOutcome::AndroidCapacityClosed(error);
+                }
                 BatchOutcome::SystemInterfaceRequired(detail) => {
                     return TempCoreOutcome::SystemInterfaceRequired(detail);
                 }
@@ -2327,7 +2332,7 @@ impl TempCoreSession {
                 return BatchOutcome::Failed {
                     detail: e,
                     oversized: false,
-                }
+                };
             }
         };
 
@@ -2376,7 +2381,7 @@ impl TempCoreSession {
                 return BatchOutcome::Failed {
                     detail: format!("序列化测速临时核配置失败: {e}"),
                     oversized: false,
-                }
+                };
             }
         };
         if let Err(e) = std::fs::write(&config_path, bytes) {
@@ -2389,10 +2394,14 @@ impl TempCoreSession {
         // `sing-box check` 先验配置形态（fail-fast，同瞬态登录核的既定手法）。没有这道门时，`custom`
         // 协议里用户写错的原样 JSON 会让核预初始化 FATAL ⇒ 用户白等整个就绪预算再看到「未监听」这个指错方向的
         // 报错。check 的诊断原文冒泡给用户 —— 那句话里直接写着哪个字段错了。
-        if let Err(e) = deps.checker.check(&binary, &config_path).await {
+        if let Err(e) = deps.checker.check_admitted(&binary, &config_path).await {
             retire_temp_config(&config_path, keep_config);
+            if let crate::runtime::proxy::android_capacity::CheckFailure::CapacityClosed(error) = e
+            {
+                return BatchOutcome::AndroidCapacityClosed(error);
+            }
             return BatchOutcome::Failed {
-                detail: e,
+                detail: e.to_string(),
                 oversized: false,
             };
         }
@@ -2436,6 +2445,11 @@ impl TempCoreSession {
                 retire_temp_config(&config_path, keep_config);
                 if let Some(detail) = spawn_cleanup_unknown(&e) {
                     return BatchOutcome::CleanupUnknown(detail);
+                }
+                if let Some(error) =
+                    crate::runtime::proxy::android_capacity::CapacityClosed::from_spawn(&e)
+                {
+                    return BatchOutcome::AndroidCapacityClosed(error);
                 }
                 return BatchOutcome::Failed {
                     detail: format!("测速临时核 spawn 失败: {e}"),

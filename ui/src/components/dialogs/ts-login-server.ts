@@ -85,7 +85,8 @@ export function tsLoginMainCoreView(
 }
 
 /** 错误只用稳定码分类；message 可能包含 auth key、控制面 URL 或本地路径。 */
-export function tsLoginFailureKey(error: unknown): 'ts.loginStartFailed' | 'ts.loginAttemptFailed' {
+export function tsLoginFailureKey(error: unknown): 'ts.loginStartFailed' | 'ts.loginAttemptFailed' | 'errors.androidNativeCapacityClosed' {
+  if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED') return 'errors.androidNativeCapacityClosed';
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'TAILSCALE_LOGIN_FAILED'
     ? 'ts.loginStartFailed'
     : 'ts.loginAttemptFailed';
@@ -238,6 +239,7 @@ export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 
     return { phase: handedOff ? 'handedOff' : 'cancelled' };
   } catch (error) {
     const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
+    if (code === 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED') return { phase: 'failed', reason: code };
     return { phase: 'failed', reason: code === 'TAILSCALE_LOGOUT_MAIN_CORE' ? 'mainCoreInUse' : stage };
   } finally {
     if (!handedOff) await input.cancel().catch(() => {});

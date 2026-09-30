@@ -9,6 +9,7 @@
 //! 真 spawn+控制面路径**不在此覆盖**（真机门槛，见模块头）。
 
 mod attempt_lifecycle;
+mod capacity;
 /// 真子进程腿：探针只在 unix 有（理由见 [`crate::test_support::write_sleeping_probe`]）。
 #[cfg(unix)]
 mod config_checker_process;

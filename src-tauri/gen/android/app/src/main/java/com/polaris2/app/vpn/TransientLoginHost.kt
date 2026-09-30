@@ -16,8 +16,8 @@ import java.util.concurrent.TimeUnit
 
 /** Non-VPN login instances. The injected state machine is also the production Entry/claim owner. */
 internal object TransientLoginHost {
-    sealed class StartFailure(val message: String)
-    class GeneralFailure(message: String) : StartFailure(message)
+    sealed class StartFailure(val message: String, val code: String? = null)
+    class GeneralFailure(message: String, code: String? = null) : StartFailure(message, code)
     class SystemInterfaceFailure : StartFailure(SystemEndpointGuard.ERROR)
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "polaris-login-host") }
     private val timer = Executors.newSingleThreadScheduledExecutor { Thread(it, "polaris-login-expiry") }
@@ -38,6 +38,7 @@ internal object TransientLoginHost {
     fun closeMain(owner: Any, action: () -> Unit) = state.closeMain(owner, action)
     fun start(id: String, config: String, done: (StartFailure?) -> Unit) = state.start(id, config, done)
     fun close(id: String, done: (String?) -> Unit) = state.close(id, done)
+    fun closeCoded(id: String, done: (AndroidNativeFailure?) -> Unit) = state.closeCoded(id, done)
     fun running(id: String): Boolean = state.running(id)
 
     private fun stateDirectories(config: String): Set<String> {

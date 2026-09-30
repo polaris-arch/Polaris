@@ -40,8 +40,8 @@ class TransientLoginHostStateTest {
         }
     }
 
-    private inner class Fixture {
-        val ledger = AndroidNativeAdmission("host-process").also { it.bootstrap(RequiredMarkerProof.Absent) }
+    private inner class Fixture(limit: Int = AndroidNativeAdmission.DEFAULT_MAX_METADATA_RECORDS) {
+        val ledger = AndroidNativeAdmission("host-process", maxMetadataRecords = limit).also { it.bootstrap(RequiredMarkerProof.Absent) }
         val queue = Queue()
         val clock = Clock()
         val directory = temporary.newFolder()
@@ -97,6 +97,97 @@ class TransientLoginHostStateTest {
         val value = AtomicReference<T>()
         val done = CountDownLatch(1)
         val callback: (T) -> Unit = { count.incrementAndGet(); value.set(it); done.countDown() }
+    }
+
+    @Test fun ownerReservationIsCancelledIfIndependentValidationCannotFit() {
+        val f = Fixture(2)
+        val reply = start(f, "login-A")
+        await(reply.done)
+        assertEquals(1, reply.count.get())
+        assertEquals(AndroidNativeAdmission.CAPACITY_CODE, reply.value.get()!!.code)
+        assertEquals(0, f.queue.size())
+        assertTrue(f.engines.isEmpty())
+        assertFalse(f.cache.exists())
+        // The original owner cannot remain Reserved after failed enqueue.
+        assertTrue(f.ledger.seal("host-fence").captured.isEmpty())
+        assertEquals(AndroidNativeAdmission.MetadataUsage(1, 1, 2, true), f.ledger.metadataUsage())
+    }
+
+    @Test fun fullBudgetRejectsTheLastValidationAndEveryQueuedHostEntryBeforeFactory() {
+        val f = Fixture(6)
+        val first = start(f, "login-A")
+        val last = start(f, "login-B")
+        assertEquals(2, f.queue.size())
+        assertTrue(f.ledger.metadataUsage().capacityClosed)
+        f.queue.runNext()
+        f.queue.runNext()
+        for (reply in listOf(first, last)) {
+            await(reply.done)
+            assertEquals(1, reply.count.get())
+            assertEquals(AndroidNativeAdmission.CAPACITY_CODE, reply.value.get()!!.code)
+        }
+        assertTrue(f.engines.isEmpty())
+        assertFalse(f.cache.exists())
+        assertTrue(f.ledger.seal("host-fence").captured.isEmpty())
+    }
+
+    @Test fun enteredHostStillClosesAtCapacityAndItsProofRemainsUnknown() {
+        val f = Fixture(4)
+        val started = start(f, "login-A")
+        f.queue.runNext()
+        assertEquals(null, started.value.get())
+        f.ledger.retireOwner(AndroidNativeAdmission.Kind.Login, "unseen")
+        val closed = Reply<AndroidNativeFailure?>()
+        f.host.closeCoded("login-A", closed.callback)
+        f.queue.runNext()
+        await(closed.done)
+        assertEquals(null, closed.value.get())
+        assertEquals(1, f.engine("login-A").closes.get())
+        assertFalse(f.host.running("login-A"))
+        assertFalse(f.cache.exists())
+        val failed = Reply<AndroidNativeFailure?>()
+        f.host.closeCoded("another-unseen", failed.callback)
+        await(failed.done)
+        assertEquals(AndroidNativeAdmission.CAPACITY_CODE, failed.value.get()!!.code)
+        assertEquals(1, failed.count.get())
+        val receipt = f.ledger.seal("host-fence")
+        assertEquals(AndroidNativeAdmission.State.Unknown, receipt.captured.single { it.ticket.logicalId == "login-A" }.state)
+        assertFalse(receipt.coverageComplete)
+    }
+
+    @Test fun capacityRejectedQueueCannotPreemptAnAlreadyEnteredSharedDirectoryOwner() {
+        val f = Fixture(7)
+        start(f, "login-A")
+        f.queue.runNext()
+        val queued = start(f, "login-B")
+        f.ledger.retireOwner(AndroidNativeAdmission.Kind.Login, "fill")
+        f.queue.runNext()
+        await(queued.done)
+        assertEquals(AndroidNativeAdmission.CAPACITY_CODE, queued.value.get()!!.code)
+        assertTrue(f.host.running("login-A"))
+        assertEquals(0, f.engine("login-A").closes.get())
+        assertEquals("login-A", f.cache.readText())
+        val closed = close(f, "login-A")
+        f.queue.runNext()
+        await(closed.done)
+        assertEquals(null, closed.value.get())
+        assertFalse(f.cache.exists())
+    }
+
+    @Test fun actualCloseFailureIsNotReclassifiedByCapacityOrItsMessage() {
+        val f = Fixture(4)
+        start(f, "login-A")
+        f.queue.runNext()
+        f.ledger.retireOwner(AndroidNativeAdmission.Kind.Login, "unseen")
+        f.engine("login-A").closeFailure = IllegalStateException(AndroidNativeAdmission.CAPACITY_MESSAGE)
+        val closed = Reply<AndroidNativeFailure?>()
+        f.host.closeCoded("login-A", closed.callback)
+        f.queue.runNext()
+        await(closed.done)
+        assertEquals(null, closed.value.get()!!.code)
+        assertTrue(f.host.running("login-A"))
+        assertTrue(f.cache.exists())
+        assertEquals(AndroidNativeAdmission.State.Unknown, f.ledger.state(f.ticket("login-A")))
     }
 
     private fun start(f: Fixture, id: String): Reply<TransientLoginHost.StartFailure?> = Reply<TransientLoginHost.StartFailure?>().also {

@@ -89,6 +89,7 @@ export enum ProxyErrorCode {
   ROOT_ORPHAN_BLOCKED = 'ROOT_ORPHAN_BLOCKED', // 上次遗留的 root 孤儿核用户态杀不动、独占 cache.db，任何模式都起不来 → 阻断起核并落终态；message 携带的 pid 仅进脱敏日志，UI 显示稳定码对应的 i18n 指引
   // 进程生命周期类 → ErrorCategory.Process
   STARTUP_FAILED = 'STARTUP_FAILED', // 退出码 1
+  ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED = 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', // This invocation exhausted Android's process lifecycle metadata budget
   PROCESS_KILLED = 'PROCESS_KILLED', // 退出码 137
   PROCESS_EXITED = 'PROCESS_EXITED', // 其它异常退出
   AUTO_RESTARTING = 'AUTO_RESTARTING', // 自动重启中（瞬态）
