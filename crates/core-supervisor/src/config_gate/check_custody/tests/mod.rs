@@ -4,10 +4,10 @@ use super::*;
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicU8;
 
-    struct Fixture(PathBuf);
+    struct Fixture(PathBuf, PathBuf);
     impl Fixture {
         fn new(script: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
@@ -17,20 +17,20 @@ mod unix {
             ));
             std::fs::create_dir(&path).unwrap();
             std::fs::write(path.join("config.json"), b"{\"secret\":\"custody-test\"}").unwrap();
-            let binary = path.join("probe");
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o700)
-                .open(&binary)
-                .unwrap();
-            use std::io::Write;
-            file.write_all(format!("#!/bin/sh\n{script}\n").as_bytes())
-                .unwrap();
-            Self(path)
+            // These closed helpers are never opened for writing while tests spawn.
+            let helper = match script {
+                "exec /bin/sleep 2" => "sleep-two-seconds.sh",
+                "exit 0" => "exit-success.sh",
+                "exit 7" => "exit-seven.sh",
+                _ => panic!("unknown custody fixture script"),
+            };
+            let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/config_gate/check_custody/tests/fixtures")
+                .join(helper);
+            Self(path, binary)
         }
         fn binary(&self) -> PathBuf {
-            self.0.join("probe")
+            self.1.clone()
         }
         fn config(&self) -> PathBuf {
             self.0.join("config.json")
@@ -88,7 +88,11 @@ mod unix {
         let binary = fixture.binary();
         let config = fixture.config();
         let mut check = Box::pin(custody.run(&binary, &config, Duration::from_secs(3), io.clone()));
-        assert!(poll_fn(|cx| Poll::Ready(check.as_mut().poll(cx).is_pending())).await);
+        let first_poll = poll_fn(|cx| Poll::Ready(check.as_mut().poll(cx))).await;
+        assert!(
+            first_poll.is_pending(),
+            "expected pending custody check, got {first_poll:?}"
+        );
         let (request, snapshot) = {
             let state = custody.state.lock().unwrap();
             let (id, run) = state.runs.iter().next().unwrap();
