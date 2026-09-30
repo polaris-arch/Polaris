@@ -21,14 +21,14 @@ concurrency:
 
 jobs:
   pc_runtime_release_policy:
-    name: PC runtime publication block policy
+    name: Source-first release policy
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
-      - name: Verify unconditional PC publication block
+      - name: Verify fail-closed source-first release policy
         run: node --test scripts/assert-pc-runtime-release.test.mjs
 
   classify:
