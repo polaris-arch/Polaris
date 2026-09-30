@@ -520,8 +520,6 @@ interface Conn {
   child: ChildProcess;
   ws: WebSocket;
   dir: string;
-  sessionId: string;
-  frameId: string;
   send: (method: string, params?: Record<string, unknown>, sessionId?: string) => Promise<Record<string, unknown>>;
 }
 
@@ -883,15 +881,10 @@ async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => voi
       ws.send(JSON.stringify({ id, method, params, ...(sessionId === undefined ? {} : { sessionId }) }));
     });
 
-  const { targetId } = (await send('Target.createTarget', { url: 'about:blank' })) as { targetId: string };
-  const attached = (await send('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
-  const sessionId = attached.sessionId;
-  await send('Page.enable', {}, sessionId);
-  const tree = (await send('Page.getFrameTree', {}, sessionId)) as { frameTree: { frame: { id: string } } };
   // 子进程句柄不再钉住事件循环：收尾仍然只走 `Browser.close`（本模块任何路径都不 kill），
   // 但万一它退得慢，测试进程不必陪着它一起吊死。
   child.unref();
-  return { child, ws, dir, sessionId, frameId: tree.frameTree.frame.id, send };
+  return { child, ws, dir, send };
 }
 
 async function conn(): Promise<Conn> {
@@ -1296,8 +1289,8 @@ interface RawResult {
 /**
  * 渲染一次、问一批。
  *
- * 一次 `measure` = 一次 `Page.setDocumentContent` + 一次 `Runtime.evaluate`，
- * 浏览器实例整个测试文件复用（起一次 ~200ms，之后每次度量 ~10ms）。
+ * 浏览器实例整个测试文件复用；每次度量持有独立 target/session/frame，最后关闭 target。
+ * Vitest 的 timeout 不取消 callback，因此旧度量仍在途时也不能覆盖下一份 DOM 或媒体档。
  */
 export function measure(input: OracleInput, asks: readonly Ask[]): Promise<Measured> {
   // 🔴 第六轮 A1：**登记在途**。收尾要靠这张簿子把「还没走到 `conn()` 的那次度量」等回来。
@@ -1347,18 +1340,6 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
   // B1 的一半：**实际采样点必须在声明的采样面之内**。加了一档而忘了声明 ⇒ 这里当场抛。
   // 🔴 这一行的**接线**自己没有判据：删掉它全量照样全绿（见头注「抓不到的形态」表）。
   assertPointDeclared(point);
-  await c.send(
-    'Emulation.setDeviceMetricsOverride',
-    { width: vp.width, height: vp.height, deviceScaleFactor: vp.dpr, mobile: false },
-    c.sessionId,
-  );
-  await c.send(
-    'Emulation.setEmulatedMedia',
-    { features: Object.entries(media).map(([name, value]) => ({ name, value })) },
-    c.sessionId,
-  );
-  await c.send('Page.setDocumentContent', { frameId: c.frameId, html: buildDocument(input, chain) }, c.sessionId);
-
   const spec = JSON.stringify({
     asks: asks.map((a) => ({
       select: a.select,
@@ -1403,13 +1384,36 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     }
     return JSON.stringify(out);
   })()`;
-  const evaluated = (await c.send('Runtime.evaluate', { expression, returnByValue: true }, c.sessionId)) as {
-    result?: { value?: string };
-    exceptionDetails?: unknown;
-  };
-  if (evaluated.exceptionDetails !== undefined)
-    throw new Error(`裁判取值时页面抛了：${JSON.stringify(evaluated.exceptionDetails)}`);
-  const raw = JSON.parse(String(evaluated.result?.value)) as RawResult;
+  const html = buildDocument(input, chain);
+  const { targetId } = (await c.send('Target.createTarget', { url: 'about:blank' })) as { targetId: string };
+  let raw: RawResult;
+  try {
+    const { sessionId } = (await c.send('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
+    await c.send('Page.enable', {}, sessionId);
+    const tree = (await c.send('Page.getFrameTree', {}, sessionId)) as { frameTree: { frame: { id: string } } };
+    await c.send(
+      'Emulation.setDeviceMetricsOverride',
+      { width: vp.width, height: vp.height, deviceScaleFactor: vp.dpr, mobile: false },
+      sessionId,
+    );
+    await c.send(
+      'Emulation.setEmulatedMedia',
+      { features: Object.entries(media).map(([name, value]) => ({ name, value })) },
+      sessionId,
+    );
+    await c.send('Page.setDocumentContent', { frameId: tree.frameTree.frame.id, html }, sessionId);
+    const evaluated = (await c.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId)) as {
+      result?: { value?: string };
+      exceptionDetails?: unknown;
+    };
+    if (evaluated.exceptionDetails !== undefined)
+      throw new Error(`裁判取值时页面抛了：${JSON.stringify(evaluated.exceptionDetails)}`);
+    raw = JSON.parse(String(evaluated.result?.value)) as RawResult;
+  } finally {
+    // This request alone owns the page. Browser shutdown still drains every in-flight measure.
+    const closed = await c.send('Target.closeTarget', { targetId });
+    if (closed.success !== true) throw new Error('CSS 裁判没有关闭本次度量的页面。');
+  }
 
   const missing = asks.filter((_, i) => raw.asks[i].count === 0).map((a) => a.select);
   if (missing.length > 0)

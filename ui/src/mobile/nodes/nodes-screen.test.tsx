@@ -18,7 +18,7 @@
  * 纯否定式判据（「不许出现 X」）会被「什么都没发生」骗过：扫描器塌了、正则敲错一个字母、
  * 渲染抛异常被吞，都会让它们一路绿灯。故每组先断言取材面非空、量级合理，再断言正面等式。
  */
-import { afterAll, describe, it, expect } from 'vitest';
+import { beforeAll, describe, it, expect } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -49,7 +49,7 @@ import {
 } from './view-model';
 import type { NodeRowVM, NodesScreenViewProps, SheetItem } from './view-model';
 import { winners, winnersText } from '@/styles/css-cascade.test-support';
-import { closeOracle, measure } from '@/styles/css-oracle.test-support';
+import { measure } from '@/styles/css-oracle.test-support';
 import { inMobileShell } from '@/styles/mount.test-support';
 import { mobileEditFormFor } from '../forms/form-store';
 
@@ -248,6 +248,15 @@ const baseProps = (over: Partial<NodesScreenViewProps> = {}): NodesScreenViewPro
 
 const render = (over: Partial<NodesScreenViewProps> = {}): string =>
   renderToStaticMarkup(<NodesScreenView {...baseProps(over)} />);
+
+// Cold PostCSS compilation and Chromium launch are fixture setup, not a width assertion.
+// The oracle's own file-level hook drains and closes the shared browser after all groups.
+beforeAll(async () => {
+  const ready = await measure({ ctx: 'mobile', html: inMobileShell(render(), 'nodes') }, [
+    { select: '.mn', props: ['display'] },
+  ]);
+  expect(ready.get('.mn', 'display')).toBe('flex');
+}, 30_000);
 
 it('Tailscale 行保留协议与状态，空传输摘要不留下占位 span', () => {
   const ts = server('ts-summary', { protocol: 'tailscale' });
@@ -2850,10 +2859,6 @@ describe('⑰ nodes.css 的断点档位落地（阅读宽度与触控下限）',
  * 祖先链存不存在也由真 DOM 说了算 —— 那本来就不该由人在评审里断言。
  */
 describe('⑱ 浏览器裁判：行内颜色角色（真 DOM + 整条移动端 CSS 链）', () => {
-  // 收尾走 CDP 的 `Browser.close`，让 Chrome 自己退（全程不 kill 进程）。
-  // 超时给到 30s：全量并行跑时机器争用，默认的 10s hookTimeout 会在收尾这一步假红。
-  afterAll(closeOracle, 30_000);
-
   /** 五档 → 角色令牌。与 `nodes.css:527-554` 同源。 */
   const LAT_ROLE = {
     fast: '--ok',
@@ -3105,32 +3110,82 @@ describe('⑮ 无效节点：接线层真的把剔除理由喂进了行 VM（两
 });
 
 describe('mobile consequence badges with the real two-action row width', () => {
+  const translatedFor = (locale: string): NodesScreenViewProps['t'] => {
+    const catalog = JSON.parse(read(join(SRC, 'i18n', 'locales', `${locale}.json`))) as Record<string, unknown>;
+    return (key) => {
+      const value = key.split('.').reduce<unknown>((part, child) => typeof part === 'object' && part !== null ? (part as Record<string, unknown>)[child] : undefined, catalog);
+      return typeof value === 'string' ? value : key;
+    };
+  };
+  const viewports = [{ width: 390, height: 844 }, { width: 980, height: 740 }] as const;
   for (const locale of ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa'] as const) {
-    it(`${locale}: complete consequences fit the row and wrap within two lines`, async () => {
-      const catalog = JSON.parse(read(join(SRC, 'i18n', 'locales', `${locale}.json`))) as Record<string, unknown>;
-      const translated: NodesScreenViewProps['t'] = (key) => {
-        const value = key.split('.').reduce<unknown>((part, child) => typeof part === 'object' && part !== null ? (part as Record<string, unknown>)[child] : undefined, catalog);
-        return typeof value === 'string' ? value : key;
-      };
-      const html = render({ t: translated, rows: [row('help-status', {
-        stagedOnly: true, speedTestable: false, meshRouteReport: meshReport,
-      })] });
-      expect(html).toContain(translated('mobileHelp.stagedNode'));
-      expect(html).toContain(translated('mobileMeshRouteEvidence.summary.preview'));
-      const m = await measure({ ctx: 'mobile', html: inMobileShell(html, 'nodes'), viewport: { width: 390, height: 844 } }, [
-        { select: '.mn-row-main', props: ['width'] },
+    for (const viewport of viewports) {
+      it(`${locale} at ${viewport.width}px: complete consequences fit the row and wrap within two lines`, async () => {
+        const translated = translatedFor(locale);
+        const html = render({ t: translated, rows: [row('help-status', {
+          stagedOnly: true, speedTestable: false, meshRouteReport: meshReport,
+        })] });
+        expect(html).toContain(translated('mobileHelp.stagedNode'));
+        expect(html).toContain(translated('mobileMeshRouteEvidence.summary.preview'));
+        const m = await measure({ ctx: 'mobile', html: inMobileShell(html, 'nodes'), viewport }, [
+          { select: '.mn-row-main', props: ['width'] },
+          { select: '.mn-row-actions', props: ['width'] },
+          { select: '.mn-row-copy', props: ['width'] },
+          { select: '.mn-lat.none', props: ['width', 'text-align'] },
+          { select: '.mn-pill.warn', props: ['line-height', 'padding-top', 'padding-bottom', 'border-top-width', 'border-bottom-width'], many: 'all' },
+        ]);
+        const main = m.rect('.mn-row-main');
+        expect(m.rect('.mn-row-actions').width).toBe(88);
+        const copy = m.rect('.mn-row-copy');
+        const status = m.rect('.mn-lat.none');
+        expect(status.y).toBeGreaterThanOrEqual(copy.y + copy.height);
+        expect(status.width).toBeCloseTo(copy.width, 0);
+        expect(status.x).toBeGreaterThanOrEqual(main.x);
+        expect(status.x + status.width).toBeLessThanOrEqual(main.x + main.width + .5);
+        expect(m.get('.mn-lat.none', 'text-align')).toBe('start');
+        for (const [index, badge] of m.rectAll('.mn-pill.warn').entries()) {
+          expect(badge.x).toBeGreaterThanOrEqual(main.x);
+          expect(badge.x + badge.width).toBeLessThanOrEqual(main.x + main.width + .5);
+          const sum = ['padding-top', 'padding-bottom', 'border-top-width', 'border-bottom-width']
+            .reduce((total, prop) => total + parseFloat(m.getAll('.mn-pill.warn', prop)[index]), 0);
+          expect(badge.height).toBeLessThanOrEqual(parseFloat(m.getAll('.mn-pill.warn', 'line-height')[index]) * 2 + sum + .5);
+        }
+      });
+    }
+  }
+
+  for (const viewport of viewports) {
+    it(`${viewport.width}px: short non-numeric status uses its own line without overflow`, async () => {
+      const translated = translatedFor('zh-CN');
+      const html = render({ t: translated, rows: [row('short-status', { latencyMs: null })] });
+      expect(html).toContain(translated('nodes.timeout'));
+      const m = await measure({ ctx: 'mobile', html: inMobileShell(html, 'nodes'), viewport }, [
+        { select: '.mn-row-copy', props: ['width'] },
+        { select: '.mn-lat.dead', props: ['text-align'] },
         { select: '.mn-row-actions', props: ['width'] },
-        { select: '.mn-pill.warn', props: ['line-height', 'padding-top', 'padding-bottom', 'border-top-width', 'border-bottom-width'], many: 'all' },
       ]);
-      const main = m.rect('.mn-row-main');
+      const copy = m.rect('.mn-row-copy');
+      const status = m.rect('.mn-lat.dead');
       expect(m.rect('.mn-row-actions').width).toBe(88);
-      for (const [index, badge] of m.rectAll('.mn-pill.warn').entries()) {
-        expect(badge.x).toBeGreaterThanOrEqual(main.x);
-        expect(badge.x + badge.width).toBeLessThanOrEqual(main.x + main.width + .5);
-        const sum = ['padding-top', 'padding-bottom', 'border-top-width', 'border-bottom-width']
-          .reduce((total, prop) => total + parseFloat(m.getAll('.mn-pill.warn', prop)[index]), 0);
-        expect(badge.height).toBeLessThanOrEqual(parseFloat(m.getAll('.mn-pill.warn', 'line-height')[index]) * 2 + sum + .5);
-      }
+      expect(status.y).toBeGreaterThanOrEqual(copy.y + copy.height);
+      expect(status.x).toBeCloseTo(copy.x, 0);
+      expect(status.width).toBeCloseTo(copy.width, 0);
+      expect(m.get('.mn-lat.dead', 'text-align')).toBe('start');
+    });
+
+    it(`${viewport.width}px: numeric latency keeps its trailing slot beside the copy and both actions`, async () => {
+      const html = render({ rows: [row('numeric-status', { lanOnly: true })] });
+      const m = await measure({ ctx: 'mobile', html: inMobileShell(html, 'nodes'), viewport }, [
+        { select: '.mn-row-copy', props: ['width'] },
+        { select: '.mn-lat[data-numeric]', props: ['white-space'] },
+        { select: '.mn-row-actions', props: ['width'] },
+      ]);
+      const copy = m.rect('.mn-row-copy');
+      const latency = m.rect('.mn-lat[data-numeric]');
+      expect(m.rect('.mn-row-actions').width).toBe(88);
+      expect(latency.x).toBeGreaterThanOrEqual(copy.x + copy.width);
+      expect(latency.y).toBeLessThan(copy.y + copy.height);
+      expect(m.get('.mn-lat[data-numeric]', 'white-space')).toBe('nowrap');
     });
   }
 });

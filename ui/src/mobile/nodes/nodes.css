@@ -493,6 +493,18 @@
   opacity: 0.7;
 }
 
+/* Non-numeric status is a sentence, so give it its own line instead of narrowing
+   the consequence badges beside the two secondary actions. Numeric latency stays at the end. */
+.mn-row-main:has(.mn-lat:not([data-numeric])) {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.mn-row-main:has(.mn-lat:not([data-numeric])) > .mn-row-copy {
+  flex: none;
+}
+
 .mn-row-head {
   display: flex;
   min-width: 0;
@@ -553,6 +565,8 @@
 }
 
 .mn-lat:not([data-numeric]) {
+  flex: none;
+  text-align: start;
   min-width: 5.5em;
   font-family: var(--sans);
   letter-spacing: -0.025em;

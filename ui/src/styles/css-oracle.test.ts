@@ -317,6 +317,48 @@ describe('⑤ R5-08：`@layer` 与构建期注入的 Tailwind', () => {
 });
 
 describe('⑥ 反向对照：故障关闭', () => {
+  it('同时度量各自保留 DOM、视口和媒体档，不覆盖同一页面', async () => {
+    // 超时不会取消测试 callback；未结束的旧度量可以与下一条同时进入裁判。
+    // 不靠 sleep 或串行执行制造顺序，两份不同 DOM 的请求直接一起开始。
+    const results = await Promise.allSettled([
+      measure({
+        css: ['.left{width:50vw;color:rgb(1,2,3)}@media(prefers-color-scheme:dark){.left{color:rgb(4,5,6)}}'],
+        html: '<div class="left">left</div>',
+        viewport: { width: 390, height: 844 },
+        media: { 'prefers-color-scheme': 'dark' },
+      }, [{ select: '.left', props: ['width', 'color'] }]),
+      measure({
+        css: ['.right{width:50vw;color:rgb(7,8,9)}@media(prefers-color-scheme:dark){.right{color:rgb(10,11,12)}}'],
+        html: '<div class="right">right</div>',
+        viewport: { width: 980, height: 740 },
+        media: { 'prefers-color-scheme': 'light' },
+      }, [{ select: '.right', props: ['width', 'color'] }]),
+    ]);
+    expect(results.map((result) => result.status), results.map((result) =>
+      result.status === 'rejected' ? String(result.reason) : 'fulfilled').join('\n')).toEqual(['fulfilled', 'fulfilled']);
+    if (results[0].status === 'fulfilled' && results[1].status === 'fulfilled') {
+      expect(results[0].value.get('.left', 'width')).toBe('195px');
+      expect(results[0].value.get('.left', 'color')).toBe('rgb(4, 5, 6)');
+      expect(results[1].value.get('.right', 'width')).toBe('490px');
+      expect(results[1].value.get('.right', 'color')).toBe('rgb(7, 8, 9)');
+    }
+  }, 30_000);
+
+  it('并发的一份取材失败仍报错，另一份真 DOM 不受污染', async () => {
+    const results = await Promise.allSettled([
+      measure({ css: ['.absent{color:red}'], html: '<i>absent</i>' }, [
+        { select: '.absent', props: ['color'] },
+      ]),
+      measure({ css: ['.present{color:rgb(1,2,3)}'], html: '<i class="present">present</i>' }, [
+        { select: '.present', props: ['color'] },
+      ]),
+    ]);
+    expect(results.map((result) => result.status)).toEqual(['rejected', 'fulfilled']);
+    if (results[0].status === 'rejected') expect(String(results[0].reason)).toMatch(/一个元素都没命中/);
+    if (results[1].status === 'fulfilled') expect(results[1].value.get('.present', 'color')).toBe('rgb(1, 2, 3)');
+    expect(inflightMeasures()).toBe(0);
+  }, 30_000);
+
   it('目标元素在真 DOM 上不存在 ⇒ 抛（不是返回空让否定断言恒真）', async () => {
     await expect(
       measure({ css: ['.a{color:red}'], html: '<i class="a">x</i>' }, [
