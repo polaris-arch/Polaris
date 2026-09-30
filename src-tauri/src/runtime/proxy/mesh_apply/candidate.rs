@@ -11,6 +11,7 @@ use polaris_config_engine::builder::endpoint_routes::MeshRouteEmissionCandidate;
 use polaris_config_engine::builder::generate::{
     generate_sing_box_config_with_report_and_runtime_bindings, GenerateConfigDeps, InvalidNode,
 };
+use polaris_config_engine::builder::managed_mesh_emission::emit_managed_mesh_config;
 use polaris_config_engine::builder::managed_mesh_plan::{
     ManagedMeshPlanInput, ManagedMeshRoutePlan,
 };
@@ -52,6 +53,7 @@ enum CacheOwnership {
 
 /// This is a reference to the existing persistent, mutable cache. Never hash,
 /// copy, delete, create, or open it during candidate generation.
+#[derive(PartialEq, Eq)]
 struct PersistentMutableCache {
     ownership: CacheOwnership,
     path: PathBuf,
@@ -62,17 +64,78 @@ struct PersistentMutableCache {
     selected_policy: SelectedCachePolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateProfile {
+    DesktopNonTunDirectVlessV1,
+    ManagedMultiTsUnsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortsProvenance {
+    ProbedNumbersNotReserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubsetApplicability {
+    NotRequiredByValidatedNonTunSubset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckSupport {
+    LinuxX8664PinnedPlainTcpOnly,
+    UnsupportedProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestPublication {
+    Unpublished,
+}
+
+/// Non-secret preparation scope, never a managed/OS readiness capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidateMetadata {
+    pub profile: CandidateProfile,
+    pub target_os: String,
+    pub target_arch: String,
+    pub ports: PortsProvenance,
+    pub interface_binding: SubsetApplicability,
+    pub dns_sidecar: SubsetApplicability,
+    pub check_support: CheckSupport,
+    pub manifest: ManifestPublication,
+    pub cache_writer_lease_and_selector_readback_required: bool,
+    pub managed_launch_unsupported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateIntegrityError {
+    SnapshotMismatch,
+    PlanMismatch,
+    ProfileMismatch,
+    EffectiveFactsMismatch,
+    ClosureMismatch,
+    EmissionMismatch,
+    UnsupportedResources,
+}
+
 /// Captured before the one full-builder call. Contains loopback credentials
 /// where applicable, so it deliberately implements neither Debug nor Serialize.
 pub(crate) struct EffectiveCandidateFacts {
+    effective_user_config: UserConfig,
+    effective_user_config_sha256: String,
+    plan: ManagedMeshRoutePlan,
+    plan_input: ManagedMeshPlanInput,
+    metadata: CandidateMetadata,
     raw_document_sha256: String,
     plan_digest: String,
     config_version: String,
     input_state_revision: String,
     deps: GenerateConfigDeps,
+    deps_sha256: String,
     runtime_bind_interfaces: BTreeMap<String, String>,
     cache: PersistentMutableCache,
     source_config_sha256: String,
+    source_config_bytes: Vec<u8>,
+    source_config: SingBoxConfig,
     final_config_sha256: String,
     immutable_rule_sha256: BTreeMap<String, String>,
     mesh_route_candidates: Vec<MeshRouteEmissionCandidate>,
@@ -93,6 +156,198 @@ pub(crate) struct SealedCandidate {
 }
 
 mod check;
+#[path = "protected_inputs.rs"]
+pub(crate) mod protected_inputs;
+
+fn value_hash(value: &impl serde::Serialize) -> Result<String, CandidateIntegrityError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| CandidateIntegrityError::EffectiveFactsMismatch)?;
+    Ok(polaris_updater::verify::sha256_hex(&bytes))
+}
+
+/// Hash every value input, excluding the three callbacks which are inert
+/// constructor choices, not runtime facts. Exhaustive destructuring forces a
+/// newly added GenerateConfigDeps field to be classified here too. The value
+/// can contain credentials and is never returned or logged.
+fn deps_hash(deps: &GenerateConfigDeps) -> Result<String, CandidateIntegrityError> {
+    let GenerateConfigDeps {
+        platform,
+        arch,
+        race_server_port,
+        probe_direct_port,
+        probe_proxy_port,
+        update_in_port,
+        subscription_update_in_port,
+        loopback_auth,
+        probe_pool_ports,
+        lan_resolver_for_dns,
+        race_upstream_ips,
+        race_upstream_ports,
+        has_cronet,
+        cronet_copy_failed,
+        has_management_api,
+        privacy_mode,
+        log_level,
+        disable_log_file,
+        dashboard_serve_dir,
+        tailscale_api_port,
+        cache_path,
+        log_file_path,
+        runtime_rules_dir,
+        rule_resources_path,
+        custom_rules_dir,
+        tailnet_rules_dir,
+        tailscale_state_dir_prefix,
+        own_lan_cidrs,
+        system_dns_takeover_active,
+        netenv_dhcp_suppressed,
+        network_canary_port,
+        observed_tailnet_addresses,
+        is_valid_srs_fn: _,
+        log: _,
+        on_degraded: _,
+    } = deps;
+    value_hash(&serde_json::json!({
+        "platform":platform, "arch":arch, "raceServerPort":race_server_port,
+        "probeDirectPort":probe_direct_port, "probeProxyPort":probe_proxy_port,
+        "updateInPort":update_in_port, "subscriptionUpdateInPort":subscription_update_in_port,
+        "loopbackAuth":loopback_auth, "probePoolPorts":probe_pool_ports,
+        "lanResolverForDns":lan_resolver_for_dns, "raceUpstreamIps":race_upstream_ips,
+        "raceUpstreamPorts":race_upstream_ports, "hasCronet":has_cronet,
+        "cronetCopyFailed":cronet_copy_failed, "hasManagementApi":has_management_api,
+        "privacyMode":privacy_mode, "logLevel":log_level, "disableLogFile":disable_log_file,
+        "dashboardServeDir":dashboard_serve_dir, "tailscaleApiPort":tailscale_api_port,
+        "cachePath":cache_path, "logFilePath":log_file_path, "runtimeRulesDir":runtime_rules_dir,
+        "ruleResourcesPath":rule_resources_path, "customRulesDir":custom_rules_dir,
+        "tailnetRulesDir":tailnet_rules_dir, "tailscaleStateDirPrefix":tailscale_state_dir_prefix,
+        "ownLanCidrs":own_lan_cidrs, "systemDnsTakeoverActive":system_dns_takeover_active,
+        "netenvDhcpSuppressed":netenv_dhcp_suppressed, "networkCanaryPort":network_canary_port,
+        "observedTailnetAddresses":observed_tailnet_addresses,
+    }))
+}
+
+fn metadata_for(config: &UserConfig, deps: &GenerateConfigDeps) -> CandidateMetadata {
+    let server = &config.servers[0]; // validated conservative subset
+    let plain_tcp = server.tls_settings.is_none()
+        && server.reality_settings.is_none()
+        && matches!(
+            server.security,
+            None | Some(polaris_config_engine::user_config::server_config::SecurityMode::None)
+        );
+    CandidateMetadata {
+        profile: CandidateProfile::DesktopNonTunDirectVlessV1,
+        target_os: deps.platform.clone(),
+        target_arch: deps.arch.clone(),
+        ports: PortsProvenance::ProbedNumbersNotReserved,
+        interface_binding: SubsetApplicability::NotRequiredByValidatedNonTunSubset,
+        dns_sidecar: SubsetApplicability::NotRequiredByValidatedNonTunSubset,
+        check_support: if deps.platform == "linux" && deps.arch == "x86_64" && plain_tcp {
+            CheckSupport::LinuxX8664PinnedPlainTcpOnly
+        } else {
+            CheckSupport::UnsupportedProfile
+        },
+        manifest: ManifestPublication::Unpublished,
+        cache_writer_lease_and_selector_readback_required: true,
+        managed_launch_unsupported: true,
+    }
+}
+
+impl SealedCandidate {
+    pub(crate) fn metadata(&self) -> &CandidateMetadata {
+        &self.facts.metadata
+    }
+
+    /// Pure consistency validation of this owned full-builder result. It
+    /// performs no live reads, port/auth generation, I/O, or full-builder call.
+    pub(crate) fn validate_same_candidate(
+        &self,
+        snapshot: &ApplyInputSnapshot,
+        plan: &ManagedMeshRoutePlan,
+        expected_profile: CandidateProfile,
+    ) -> Result<(), CandidateIntegrityError> {
+        let f = &self.facts;
+        if f.raw_document_sha256 != snapshot.raw_document_sha256()
+            || f.config_version != snapshot.config_version()
+            || f.input_state_revision != snapshot.state().revision
+            || f.plan_input.policy != *snapshot.policy()
+            || f.plan_input.state != *snapshot.state()
+        {
+            return Err(CandidateIntegrityError::SnapshotMismatch);
+        }
+        if f.plan != *plan
+            || f.plan_digest
+                != plan_digest(plan).map_err(|_| CandidateIntegrityError::PlanMismatch)?
+            || f.plan_input.plan_id != plan.plan_id
+            || f.config_version != plan.config_version
+            || f.input_state_revision != plan.input_state_revision
+            || self.materialized.closure.plan_digest != f.plan_digest
+        {
+            return Err(CandidateIntegrityError::PlanMismatch);
+        }
+        if expected_profile != CandidateProfile::DesktopNonTunDirectVlessV1
+            || !conservative_user_input(&f.effective_user_config)
+            || !conservative_raw_server(snapshot.raw())
+            || f.metadata != metadata_for(&f.effective_user_config, &f.deps)
+        {
+            return Err(CandidateIntegrityError::ProfileMismatch);
+        }
+        if value_hash(&f.effective_user_config)? != f.effective_user_config_sha256
+            || deps_hash(&f.deps)? != f.deps_sha256
+        {
+            return Err(CandidateIntegrityError::EffectiveFactsMismatch);
+        }
+        if !f.runtime_bind_interfaces.is_empty()
+            || f.deps.race_server_port != 0
+            || !f.deps.race_upstream_ips.is_empty()
+            || !f.deps.race_upstream_ports.is_empty()
+            || !f.deps.observed_tailnet_addresses.is_empty()
+            || f.deps.log_file_path.is_some()
+            || f.deps.network_canary_port.is_some()
+            || !f.mesh_route_candidates.is_empty()
+            || f.mesh_route_total_candidate_count != 0
+            || f.mesh_route_diagnostics_limited
+            || f.mesh_route_dns_owner_server_id.is_some()
+            || !f.invalid_nodes.is_empty()
+            || !f.pruned_rule_set_tags.is_empty()
+            || !f.pruned_env_rules.is_empty()
+            || f.network_canary.is_some()
+        {
+            return Err(CandidateIntegrityError::UnsupportedResources);
+        }
+        // This first profile has no immutable rule files. Reject every entry
+        // and every expected hash, including duplicates; never collect away
+        // a duplicate pathname or silently drop an unsupported rule.
+        let closure = &self.materialized.closure;
+        if !closure.rule_files.is_empty()
+            || !closure.rule_file_sha256.is_empty()
+            || !f.immutable_rule_sha256.is_empty()
+            || closure.config_sha256 != f.final_config_sha256
+            || polaris_updater::verify::sha256_hex(&closure.config_bytes) != f.final_config_sha256
+            || polaris_updater::verify::sha256_hex(&f.source_config_bytes) != f.source_config_sha256
+        {
+            return Err(CandidateIntegrityError::ClosureMismatch);
+        }
+        let source_bytes = serde_json::to_vec_pretty(&f.source_config)
+            .map_err(|_| CandidateIntegrityError::EmissionMismatch)?;
+        let final_bytes = serde_json::to_vec_pretty(&self.materialized.emission.config)
+            .map_err(|_| CandidateIntegrityError::EmissionMismatch)?;
+        if source_bytes != f.source_config_bytes || final_bytes != closure.config_bytes {
+            return Err(CandidateIntegrityError::EmissionMismatch);
+        }
+        // Reuse D1's pure semantic verifier, not a second full builder or DNS
+        // owner map. Its comparison cannot replace the original execute bytes.
+        let emitted = emit_managed_mesh_config(&f.source_config, &f.plan_input, &f.plan)
+            .map_err(|_| CandidateIntegrityError::EmissionMismatch)?;
+        if emitted != self.materialized.emission
+            || resources_are_supported(&emitted.config, &f.cache.path)
+                .map_err(|_| CandidateIntegrityError::UnsupportedResources)?
+                != f.cache
+        {
+            return Err(CandidateIntegrityError::EmissionMismatch);
+        }
+        Ok(())
+    }
+}
 
 thread_local! {
     static BUILDER_CALLED_UNSUPPORTED_DEPENDENCY: Cell<bool> = const { Cell::new(false) };
@@ -399,9 +654,9 @@ pub(crate) fn generate_direct_vless_candidate(
     {
         return Err(CandidateError::Unsupported);
     }
-    let source_config_sha256 = polaris_updater::verify::sha256_hex(
-        &serde_json::to_vec_pretty(&generated.config).map_err(|_| CandidateError::Builder)?,
-    );
+    let source_config_bytes =
+        serde_json::to_vec_pretty(&generated.config).map_err(|_| CandidateError::Builder)?;
+    let source_config_sha256 = polaris_updater::verify::sha256_hex(&source_config_bytes);
     let materialized =
         materialize_local_rule_sets(runtime.config.dir(), plan, input, &generated.config, &[])
             .map_err(|_| CandidateError::Materialize)?;
@@ -409,14 +664,23 @@ pub(crate) fn generate_direct_vless_candidate(
     let final_config_sha256 = materialized.closure.config_sha256.clone();
     let immutable_rule_sha256 = materialized.closure.rule_file_sha256.clone();
     let facts = EffectiveCandidateFacts {
+        effective_user_config_sha256: value_hash(&user_config)
+            .map_err(|_| CandidateError::Builder)?,
+        metadata: metadata_for(&user_config, &deps),
+        effective_user_config: user_config,
+        plan: plan.clone(),
+        plan_input: input.clone(),
         raw_document_sha256: snapshot.raw_document_sha256().into(),
         plan_digest: plan_digest(plan).map_err(|_| CandidateError::SnapshotMismatch)?,
         config_version: snapshot.config_version().into(),
         input_state_revision: snapshot.state().revision.clone(),
+        deps_sha256: deps_hash(&deps).map_err(|_| CandidateError::Builder)?,
         deps,
         runtime_bind_interfaces,
         cache: final_cache,
         source_config_sha256,
+        source_config_bytes,
+        source_config: generated.config,
         final_config_sha256,
         immutable_rule_sha256,
         mesh_route_candidates: generated.mesh_route_candidates,
@@ -434,10 +698,14 @@ pub(crate) fn generate_direct_vless_candidate(
         .config
         .admit_mesh_apply_snapshot(snapshot)
         .map_err(|_| CandidateError::SnapshotChanged)?;
-    Ok(SealedCandidate {
+    let candidate = SealedCandidate {
         materialized,
         facts,
-    })
+    };
+    candidate
+        .validate_same_candidate(snapshot, plan, CandidateProfile::DesktopNonTunDirectVlessV1)
+        .map_err(|_| CandidateError::Materialize)?;
+    Ok(candidate)
 }
 
 #[cfg(test)]

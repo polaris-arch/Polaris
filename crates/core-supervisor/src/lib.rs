@@ -19,6 +19,8 @@
 /// 起核前的内核闸门：拿即将下发的 config 真跑 `sing-box check`，把内核点名拒收的节点剥掉。
 pub mod config_gate;
 pub mod crash_recovery;
+#[cfg(target_os = "linux")]
+pub mod exact_spawn;
 pub mod lifecycle_gate;
 pub mod port_bookkeeping;
 pub mod process_killer;

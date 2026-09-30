@@ -289,6 +289,159 @@ fn unsupported_rules_and_stale_snapshot_publish_no_manifest() {
 }
 
 #[test]
+fn pure_candidate_validator_binds_owned_effective_facts_plan_emission_and_profile() {
+    let (_dir, runtime, snapshot, input, plan) = fixture();
+    let mut candidate =
+        generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan).unwrap();
+    let profile = CandidateProfile::DesktopNonTunDirectVlessV1;
+    assert_eq!(
+        candidate.validate_same_candidate(&snapshot, &plan, profile),
+        Ok(())
+    );
+    assert_eq!(
+        candidate.facts.plan.identity_bindings,
+        plan.identity_bindings
+    );
+    assert_eq!(
+        candidate.metadata().ports,
+        PortsProvenance::ProbedNumbersNotReserved
+    );
+    assert_eq!(
+        candidate.metadata().manifest,
+        ManifestPublication::Unpublished
+    );
+    assert!(candidate.metadata().managed_launch_unsupported);
+    assert!(
+        candidate
+            .metadata()
+            .cache_writer_lease_and_selector_readback_required
+    );
+    assert_eq!(
+        candidate.validate_same_candidate(
+            &snapshot,
+            &plan,
+            CandidateProfile::ManagedMultiTsUnsupported
+        ),
+        Err(CandidateIntegrityError::ProfileMismatch)
+    );
+    let mut changed_plan = plan.clone();
+    changed_plan.identity_bindings.push(
+        polaris_config_engine::user_config::mesh_route_state::MeshOwnerRef {
+            server_id: "different-owner".into(),
+            identity_epoch: "2".into(),
+        },
+    );
+    assert_eq!(
+        candidate.validate_same_candidate(&snapshot, &changed_plan, profile),
+        Err(CandidateIntegrityError::PlanMismatch)
+    );
+    let port = candidate.facts.deps.tailscale_api_port;
+    candidate.facts.deps.tailscale_api_port = port.saturating_add(1);
+    assert_eq!(
+        candidate.validate_same_candidate(&snapshot, &plan, profile),
+        Err(CandidateIntegrityError::EffectiveFactsMismatch)
+    );
+    candidate.facts.deps.tailscale_api_port = port;
+    candidate.facts.effective_user_config.servers[0].uuid = Some("different-secret".into());
+    assert_eq!(
+        candidate.validate_same_candidate(&snapshot, &plan, profile),
+        Err(CandidateIntegrityError::EffectiveFactsMismatch)
+    );
+}
+
+#[test]
+fn pure_validator_rejects_changed_original_bytes_duplicate_rules_and_emission() {
+    let (_dir, runtime, snapshot, input, plan) = fixture();
+    let mut candidate =
+        generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan).unwrap();
+    let profile = CandidateProfile::DesktopNonTunDirectVlessV1;
+    candidate.materialized.closure.config_bytes.push(b' ');
+    assert_eq!(
+        candidate.validate_same_candidate(&snapshot, &plan, profile),
+        Err(CandidateIntegrityError::ClosureMismatch)
+    );
+    candidate.materialized.closure.config_bytes.pop();
+    candidate.materialized.closure.rule_files =
+        vec![("same.json".into(), vec![1]), ("same.json".into(), vec![2])];
+    assert_eq!(
+        candidate.validate_same_candidate(&snapshot, &plan, profile),
+        Err(CandidateIntegrityError::ClosureMismatch)
+    );
+    candidate.materialized.closure.rule_files.clear();
+    candidate
+        .materialized
+        .emission
+        .internal_inbound_exceptions
+        .push("foreign-inbound".into());
+    assert_eq!(
+        candidate.validate_same_candidate(&snapshot, &plan, profile),
+        Err(CandidateIntegrityError::EmissionMismatch)
+    );
+}
+
+#[test]
+fn live_deps_changes_do_not_rebuild_candidate_and_fresh_snapshot_is_required() {
+    use std::sync::atomic::Ordering;
+    let (dir, runtime, snapshot, input, plan) = fixture();
+    let candidate = generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan).unwrap();
+    let original = candidate.materialized.closure.config_bytes.clone();
+    let captured_deps = candidate.facts.deps_sha256.clone();
+    runtime.netenv_dhcp_suppressed.store(true, Ordering::SeqCst);
+    runtime
+        .observed_tailnet
+        .write()
+        .unwrap()
+        .insert("new-live-owner".into(), vec!["100.64.1.2".into()]);
+    assert_eq!(
+        candidate.validate_same_candidate(
+            &snapshot,
+            &plan,
+            CandidateProfile::DesktopNonTunDirectVlessV1
+        ),
+        Ok(())
+    );
+    assert_eq!(candidate.materialized.closure.config_bytes, original);
+    assert_eq!(candidate.facts.deps_sha256, captured_deps);
+    let mut changed = snapshot.raw().clone();
+    changed["newFutureSetting"] = json!(true);
+    fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&changed).unwrap(),
+    )
+    .unwrap();
+    let current = runtime.config.read_mesh_apply_snapshot().unwrap();
+    assert!(runtime.config.admit_mesh_apply_snapshot(&snapshot).is_err());
+    assert_eq!(
+        candidate.validate_same_candidate(
+            &current,
+            &plan,
+            CandidateProfile::DesktopNonTunDirectVlessV1
+        ),
+        Err(CandidateIntegrityError::SnapshotMismatch)
+    );
+    assert_eq!(candidate.materialized.closure.config_bytes, original);
+}
+
+#[test]
+fn new_check_capability_metadata_does_not_remove_ordinary_platform_features() {
+    let (_dir, runtime, snapshot, input, plan) = fixture();
+    let candidate = generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan).unwrap();
+    let mut deps = candidate.facts.deps.clone();
+    for platform in ["darwin", "win32", "android", "other"] {
+        deps.platform = platform.into();
+        let metadata = metadata_for(&candidate.facts.effective_user_config, &deps);
+        assert_eq!(metadata.check_support, CheckSupport::UnsupportedProfile);
+        assert!(metadata.managed_launch_unsupported);
+    }
+    deps.platform = "linux".into();
+    deps.arch = "aarch64".into();
+    assert_eq!(
+        metadata_for(&candidate.facts.effective_user_config, &deps).check_support,
+        CheckSupport::UnsupportedProfile
+    );
+}
+
+#[test]
 fn unsupported_resource_inputs_fail_closed_without_publishing_or_touching_cache() {
     type RawMutation = (&'static str, fn(&mut Value));
     let mutations: &[RawMutation] = &[
@@ -335,6 +488,49 @@ fn unsupported_resource_inputs_fail_closed_without_publishing_or_touching_cache(
         assert!(!dir.join("mesh-routes").exists(), "{name}");
         assert!(!dir.join("singbox-runtime.json").exists(), "{name}");
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+async fn checked_candidate_prepares_same_protected_images_without_managed_permit() {
+    let Some(binary) = pinned_core_for_test() else {
+        return;
+    };
+    let (_dir, runtime, snapshot, input, plan) = fixture();
+    let candidate = generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan).unwrap();
+    let expected_config = candidate.facts.final_config_sha256.clone();
+    let checked = strict_check_pinned_linux_candidate(&runtime, &snapshot, candidate, &binary)
+        .await
+        .unwrap();
+    let protected =
+        protected_inputs::prepare_checked_linux_inputs(checked, &snapshot, &plan, &binary).unwrap();
+    assert_eq!(protected.checked().config_sha256(), expected_config);
+    assert_eq!(
+        protected.checked().execution_profile(),
+        check::CHECK_PROFILE
+    );
+    assert!(
+        protected
+            .checked()
+            .candidate()
+            .metadata()
+            .managed_launch_unsupported
+    );
+    assert_eq!(
+        protected.checked().candidate().metadata().manifest,
+        ManifestPublication::Unpublished
+    );
+    use polaris_core_supervisor::exact_spawn::{LinuxInputProfile, MutableObligation};
+    assert_eq!(
+        protected
+            .inputs()
+            .validate_protection(LinuxInputProfile::B609PlainTcpCheckV1),
+        Ok(())
+    );
+    assert_eq!(
+        protected.inputs().mutable_obligations(),
+        &[MutableObligation::CacheWriterLeaseAndSelectorReadback]
+    );
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

@@ -45,8 +45,9 @@ impl CheckedCandidate {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(super) const PINNED_B609_LINUX_X86_64_SHA256: &str =
-    "64f6d8613f9c7d42ef9a8e90dd9fca7290f176c5b482714915c04353911559c0";
+    polaris_core_supervisor::exact_spawn::PINNED_B609_LINUX_X86_64_SHA256;
 pub(super) const CHECK_PROFILE: &str =
     "linux-x86_64-b609:env-empty:cwd-root:sealed-fd0:--disable-color check -c /proc/self/fd/0";
 
@@ -139,6 +140,13 @@ mod linux {
     }
 
     pub(super) fn sealed_binary(path: &Path) -> Result<(File, FileSnapshot), CandidateCheckError> {
+        sealed_binary_with_stat_hook(path, || {})
+    }
+
+    pub(super) fn sealed_binary_with_stat_hook(
+        path: &Path,
+        after_stat: impl FnOnce(),
+    ) -> Result<(File, FileSnapshot), CandidateCheckError> {
         if !path.is_absolute() {
             return Err(CandidateCheckError::Unsupported);
         }
@@ -146,12 +154,16 @@ mod linux {
         if !before.is_file() || before.is_reparse() || before.len() > MAX_BINARY_BYTES {
             return Err(CandidateCheckError::Unsupported);
         }
+        after_stat();
         let mut source = OpenOptions::new()
             .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
             .open(path)
             .map_err(|_| CandidateCheckError::Unsupported)?;
         let opened = FileSnapshot::opened(&source).map_err(|_| CandidateCheckError::Unsupported)?;
+        if !opened.is_file() || opened.is_reparse() || opened.len() > MAX_BINARY_BYTES {
+            return Err(CandidateCheckError::Unsupported);
+        }
         if !before.same_snapshot(&opened) {
             return Err(CandidateCheckError::Unsupported);
         }
@@ -302,20 +314,17 @@ mod linux {
             .config
             .admit_mesh_apply_snapshot(snapshot)
             .map_err(|_| CandidateCheckError::SnapshotChanged)?;
-        // The observed b609 check profile covers plain TCP VLESS here. TLS
-        // engine/ECH/reality branches need separate syscall/resource evidence.
-        let server = snapshot
-            .raw()
-            .get("servers")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|servers| servers.first())
-            .ok_or(CandidateCheckError::Unsupported)?;
-        if server.get("tlsSettings").is_some()
-            || server.get("realitySettings").is_some()
-            || !matches!(
-                server.get("security").and_then(serde_json::Value::as_str),
-                None | Some("none")
+        candidate
+            .validate_same_candidate(
+                snapshot,
+                &candidate.facts.plan,
+                super::super::CandidateProfile::DesktopNonTunDirectVlessV1,
             )
+            .map_err(|_| CandidateCheckError::Unsupported)?;
+        // Scope comes from the same owned effective config used by the full
+        // builder, never a new live deps/config projection after preparation.
+        if candidate.metadata().check_support
+            != super::super::CheckSupport::LinuxX8664PinnedPlainTcpOnly
         {
             return Err(CandidateCheckError::Unsupported);
         }
@@ -341,6 +350,13 @@ mod linux {
             .config
             .admit_mesh_apply_snapshot(snapshot)
             .map_err(|_| CandidateCheckError::SnapshotChanged)?;
+        candidate
+            .validate_same_candidate(
+                snapshot,
+                &candidate.facts.plan,
+                super::super::CandidateProfile::DesktopNonTunDirectVlessV1,
+            )
+            .map_err(|_| CandidateCheckError::Unsupported)?;
         Ok(CheckedCandidate {
             config_sha256: closure.config_sha256.clone(),
             binary_sha256: PINNED_B609_LINUX_X86_64_SHA256.into(),

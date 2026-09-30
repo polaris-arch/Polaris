@@ -50,6 +50,44 @@ mod linux_tests {
         child.wait().unwrap();
     }
 
+    #[test]
+    fn sealed_binary_stat_fifo_replacement_is_bounded_without_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TestDir::new("polaris-check-stat-fifo-");
+        let source = dir.join("core");
+        fs::write(&source, b"original regular bytes").unwrap();
+        let worker_path = source.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = linux::sealed_binary_with_stat_hook(&worker_path, || {
+                fs::remove_file(&worker_path).unwrap();
+                nix::unistd::mkfifo(
+                    &worker_path,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )
+                .unwrap();
+                ready_tx.send(()).unwrap();
+            })
+            .map(|_| ());
+            result_tx.send(result).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        // A writer exists only to settle a regressed blocking open after the
+        // rejection deadline has already failed, never on the passing path.
+        let _unblock_on_failure = result.is_err().then(|| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
+                .open(&source)
+                .unwrap()
+        });
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Err(CandidateCheckError::Unsupported));
+    }
+
     #[tokio::test]
     async fn timeout_reaps_without_publishing_any_artifact() {
         let Some(binary_path) = pinned_binary() else {

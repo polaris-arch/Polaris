@@ -28,7 +28,7 @@ async fn legacy_constructor_marks_legacy_and_synthetic_birth_attaches_facts() {
             run_ref: run_ref.clone(),
         },
     };
-    let mut managed = birth.attach(
+    let mut managed = birth.attach_synthetic_for_test(
         tokio::process::Command::new("sleep")
             .arg("30")
             .spawn()
