@@ -405,3 +405,40 @@ and raw-message rejection. `tsc --noEmit`, the 31-command bridge check and
 `git diff --check` passed. Gradle external dependency build directories were
 isolated inside this worktree to avoid parallel writes in the Cargo registry.
 No APK/device test, generation/SDK change or Go implementation edit was made.
+
+
+Main per-attempt DNS follow-up (2026-09-30, pending core review): BoxService
+creates an immutable MainAttemptDns resource before registry publication and
+queued native work. Its factory creates a fresh NetworkLocalResolver without
+submitting SDK queries. A rejected, never-exposed resource uses local unused
+cleanup; it never closes the process singleton. The bound platform captures the
+resource getter, so reload retains the same resolver and a successor has a new
+one. A late old getter returns the old sealed resolver, with no current-attempt
+lookup or singleton fallback.
+
+The existing exact-attempt Stop/revoke/destroy and failed-start cleanup path
+marks the attempt revoked, detaches its TUN under its short lock, then seals its
+resolver before prepared, Host/network and native-close waits. Stop still holds
+the outer BoxService monitor: the production fence only updates metadata and
+enqueues cancellation onto the actual asynchronous executor. It never waits for
+SDK/JNI/proof or operationLock. Fence-hook exceptions remain sticky uncertainty
+on the resource and do not prevent the original native close or override its
+error. The existing mailbox records rejected cancellation tasks as Unknown.
+No queried executor is shut down; late SDK tasks can finish framework fd cleanup,
+and JNI delivery or API<29 lookup stays counted until its real return.
+
+The actual resource/getter and MainKernelAttempt carrier tests use the real
+mailbox with fake SDK/JNI latches. The final Kotlin suite passes 205 tests in
+17 suites, including 13 Main DNS tests; Android-test Kotlin compilation also
+passes without running instrumentation. The bridge check passes 31 commands,
+Android changed-file classification and its 23-test suite pass, and six existing
+Rust source-contract tests pass. No APK/AAR or real DNS/device operation is made.
+
+This is attempt ownership and an early fence, not native-service incarnation
+proof within reload. The physical-network supplier still uses the existing
+DefaultNetworkMonitor; its listener generation/JNI callback audit remains
+independent. Go owner aggregation, all reload transports and final business
+callbacks, SDK request terminal facts and functional DNS proof remain pending.
+Operational close/reconnect and native error priority are preserved, all born
+Main owners remain Unknown, coverage stays **3/11**, and MainClose/managed/NoOwner
+promotion is disabled. Go source and gomobile method ABI are unchanged here.

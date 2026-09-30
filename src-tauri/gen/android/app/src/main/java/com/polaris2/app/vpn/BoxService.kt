@@ -113,20 +113,31 @@ class BoxService(
                 }
                 // The bridge may replace the request between the snapshot and the gate.
                 val admission = LegacySystemStartFence.admitCurrentRequest(request, VpnBridge::currentStartRequest) {
-                    val next = MainKernelAttempt<CommandServer>(
-                        generation,
-                        request?.runId ?: systemRunId,
-                        nativeTicket,
-                    )
-                    if (!MainKernelAttemptRegistry.isVacant() ||
-                        (request == null && !VpnBridge.beginSystemStart())) null
-                    else {
-                        check(MainKernelAttemptRegistry.claim(next) { stopService(next) }) {
-                            "主核准入锁内 registry 归属发生变化"
+                    // Resource ownership precedes registry visibility and queued native work.
+                    val dns = MainAttemptDns.create()
+                    var claimed = false
+                    try {
+                        val next = MainKernelAttempt<CommandServer>(
+                            generation,
+                            request?.runId ?: systemRunId,
+                            nativeTicket,
+                            dns,
+                        )
+                        if (!MainKernelAttemptRegistry.isVacant() ||
+                            (request == null && !VpnBridge.beginSystemStart())) null
+                        else {
+                            check(MainKernelAttemptRegistry.claim(next) { stopService(next) }) {
+                                "主核准入锁内 registry 归属发生变化"
+                            }
+                            claimed = true
+                            mainAttempt = next
+                            state = ServiceState.Starting
+                            next
                         }
-                        mainAttempt = next
-                        state = ServiceState.Starting
-                        next
+                    } finally {
+                        // No getter/native worker saw a rejected resource. Do not touch the singleton.
+                        if (!claimed) runCatching { dns.closeUnused() }
+                            .onFailure { Log.e(TAG, "主核未发布 DNS 资源清理未知") }
                     }
                 }
                 if (admission.value == null && request == null) {
@@ -223,7 +234,8 @@ class BoxService(
                         check(isStarting(attempt)) { "起核已被停核接管" }
                         val tunOpener = platformInterface as? PolarisVpnService
                             ?: error("android: 主核没有绑定 attempt 的 TUN 载体")
-                        val boundPlatform = object : PlatformInterface by platformInterface {
+                        val dnsPlatform = checkNotNull(attempt.dns).bindPlatform(platformInterface)
+                        val boundPlatform = object : PlatformInterface by dnsPlatform {
                             override fun openTun(options: TunOptions): Int = tunOpener.openTun(attempt, options)
                         }
                         val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), boundPlatform)

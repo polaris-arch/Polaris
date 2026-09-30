@@ -20,6 +20,8 @@ internal class MainKernelAttempt<Server>(
     val systemStartGeneration: Long = 0L,
     val runId: String = UUID.randomUUID().toString(),
     val nativeTicket: AndroidNativeAdmission.Ticket? = null,
+    /** Established before registry/native publication; reload never replaces it. */
+    val dns: MainAttemptDns? = null,
 ) {
     /** Created by this attempt, never supplied by a bridge caller or reused after Service recreation. */
     val birthNonce: String = UUID.randomUUID().toString()
@@ -81,12 +83,18 @@ internal class MainKernelAttempt<Server>(
     }
 
     /** The detached fd is closed by the Stop job outside BoxService's lock. */
-    fun revokeAndDetachTun(): Closeable? = synchronized(this) {
-        revoked = true
-        val previous = tun
-        tun = null
-        tunScope = null
-        previous
+    fun revokeAndDetachTun(): Closeable? {
+        val previous = synchronized(this) {
+            revoked = true
+            val detached = tun
+            tun = null
+            tunScope = null
+            detached
+        }
+        // Stop still holds BoxService's short state lock. This fence performs
+        // no JNI/SDK call or wait, and precedes prepared/native-close waits.
+        dns?.beginClose()
+        return previous
     }
     fun publish(server: Server) { check(prepared.complete(server)) }
     fun skipPreparation() { prepared.complete(null) }
