@@ -4,10 +4,105 @@ mod linux_tests {
     use crate::runtime::proxy::mesh_apply::file_snapshot::FileSnapshot;
     use crate::test_support::TestDir;
     use std::fs;
-    use std::io::{Seek, SeekFrom, Write};
-    use std::path::PathBuf;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    struct ReapedChild(std::process::Child);
+
+    impl Drop for ReapedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn wait_for_ready(marker: &Path, timeout: Duration) -> std::io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match fs::read(marker) {
+                Ok(bytes) if bytes == b"ready" => return Ok(()),
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "shell did not acknowledge completed exec",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn spawn_ready_child(stdin: Stdio) -> (TestDir, ReapedChild) {
+        let dir = TestDir::new("polaris-check-fd-probe-");
+        let marker = dir.join("ready");
+        let child = ReapedChild(
+            Command::new("/bin/sh")
+                .args(["-c", "printf ready > \"$1\" || exit 1; exec sleep 5", "sh"])
+                .arg(&marker)
+                .stdin(stdin)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        // A vfork-based spawn may return while exec is still closing CLOEXEC
+        // descriptors. Only code running in the new shell can write this marker.
+        wait_for_ready(&marker, Duration::from_secs(2)).unwrap();
+        (dir, child)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct InheritedConfig {
+        fd: u32,
+        identity: (u64, u64),
+        bytes_sha256: String,
+    }
+
+    fn inherited_configs(child: &ReapedChild) -> Vec<InheritedConfig> {
+        let fd_dir = format!("/proc/{}/fd", child.0.id());
+        let mut inherited = Vec::new();
+        for entry in fs::read_dir(fd_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let target = match fs::read_link(&path) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!(
+                    "cannot inspect child descriptor {}: {error}",
+                    path.display()
+                ),
+            };
+            // Keep the original all-config gate, including another test's file.
+            if target
+                .to_string_lossy()
+                .contains("polaris-strict-check-config")
+            {
+                let file = fs::File::open(&path).unwrap();
+                let metadata = file.metadata().unwrap();
+                let bytes_sha256 =
+                    polaris_updater::verify::sha256_reader_hex(&mut file.take(8 * 1024 * 1024 + 1))
+                        .unwrap();
+                inherited.push(InheritedConfig {
+                    fd: path.file_name().unwrap().to_str().unwrap().parse().unwrap(),
+                    identity: (metadata.dev(), metadata.ino()),
+                    bytes_sha256,
+                });
+            }
+        }
+        inherited
+    }
+
+    fn assert_no_inherited_configs(child: &ReapedChild) {
+        let inherited = inherited_configs(child);
+        assert!(
+            inherited.is_empty(),
+            "inherited sealed configs: {inherited:?}"
+        );
+    }
 
     fn pinned_binary() -> Option<PathBuf> {
         match std::env::var_os("POLARIS_TEST_CORE") {
@@ -31,23 +126,106 @@ mod linux_tests {
 
     #[test]
     fn unrelated_spawn_does_not_inherit_sealed_config() {
-        let _config = linux::sealed_config(b"{}").unwrap();
-        let mut child = Command::new("sleep")
-            .arg("5")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let fd_dir = format!("/proc/{}/fd", child.id());
-        for entry in fs::read_dir(fd_dir).unwrap() {
-            let target = fs::read_link(entry.unwrap().path()).unwrap();
-            assert!(!target
-                .to_string_lossy()
-                .contains("polaris-strict-check-config"));
+        use nix::fcntl::{fcntl, FcntlArg};
+
+        let config = linux::sealed_config(b"{\"fixture\":\"owned\"}").unwrap();
+        assert_ne!(
+            fcntl(&config, FcntlArg::F_GETFD).unwrap() & nix::libc::FD_CLOEXEC,
+            0
+        );
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let other = linux::sealed_config(b"{\"fixture\":\"parallel\"}").unwrap();
+                let copies: Vec<_> = (0..64)
+                    .map(|_| rustix::io::fcntl_dupfd_cloexec(&other, 3).unwrap())
+                    .collect();
+                for fd in &copies {
+                    assert_ne!(
+                        fcntl(fd, FcntlArg::F_GETFD).unwrap() & nix::libc::FD_CLOEXEC,
+                        0
+                    );
+                }
+                ready_tx.send(()).unwrap();
+                // Dropping release_tx during a panic also releases this worker.
+                let _ = release_rx.recv();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (_dir, child) = spawn_ready_child(Stdio::null());
+            assert_no_inherited_configs(&child);
+            release_tx.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn fd_probe_rejects_owned_and_other_configs_after_exec() {
+        let owned = linux::sealed_config(b"{\"fixture\":\"owned\"}").unwrap();
+        let other = linux::sealed_config(b"{\"fixture\":\"other\"}").unwrap();
+        assert_ne!(
+            owned.metadata().unwrap().ino(),
+            other.metadata().unwrap().ino()
+        );
+        for (config, bytes) in [
+            (&owned, b"{\"fixture\":\"owned\"}".as_slice()),
+            (&other, b"{\"fixture\":\"other\"}".as_slice()),
+        ] {
+            let stdin = fs::File::from(rustix::io::fcntl_dupfd_cloexec(config, 3).unwrap());
+            let (_dir, child) = spawn_ready_child(Stdio::from(stdin));
+            let metadata = config.metadata().unwrap();
+            assert_eq!(
+                inherited_configs(&child),
+                vec![InheritedConfig {
+                    fd: 0,
+                    identity: (metadata.dev(), metadata.ino()),
+                    bytes_sha256: polaris_updater::verify::sha256_hex(bytes),
+                }]
+            );
+            let rejection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_no_inherited_configs(&child);
+            }));
+            assert!(
+                rejection.is_err(),
+                "the all-config gate must reject either inode"
+            );
         }
-        child.kill().unwrap();
-        child.wait().unwrap();
+    }
+
+    #[test]
+    fn fd_probe_readiness_timeout_is_bounded_and_reaps_child() {
+        let dir = TestDir::new("polaris-check-fd-timeout-");
+        let child = ReapedChild(
+            Command::new("sleep")
+                .arg("5")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_ready(&dir.join("missing"), Duration::from_millis(20))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(child);
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn fd_probe_reaps_child_during_assertion_unwind() {
+        let mut pid = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_dir, child) = spawn_ready_child(Stdio::null());
+            pid = Some(child.0.id());
+            panic!("exercise FD probe cleanup");
+        }));
+        assert!(result.is_err());
+        assert!(!PathBuf::from(format!("/proc/{}", pid.unwrap())).exists());
     }
 
     #[test]
