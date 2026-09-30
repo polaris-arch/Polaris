@@ -558,6 +558,10 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
         config = root / 'fixture.gitconfig'
         config.write_text('[core]\n\tautocrlf = ' + ('true' if windows else 'false') + '\n')
         os.environ['GIT_CONFIG_GLOBAL'] = str(config)
+        # CI mirrors have their own Windows configuration: disabling conversion
+        # in the build checkout alone must not hide archive conversion here.
+        for mirror in (dependency, second):
+            git('config', 'core.autocrlf', 'true' if windows else 'false', cwd=mirror)
         def run(args, **kwargs):
             if args[0] == str(go):
                 if args[1:] == ['version']:
@@ -577,7 +581,7 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
                 value = original_run(args, **kwargs)
             except subprocess.CalledProcessError as error:
                 if name not in ('wrong-upstream', 'corrupt-input'):
-                    print(error.stderr.decode(), file=sys.stderr)
+                    print((error.stdout + error.stderr).decode(), file=sys.stderr)
                 raise
             if windows and args[1] == 'clone':
                 git('config', 'core.filemode', 'false', cwd=checkout)
@@ -632,9 +636,19 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
     assert git('status', '--porcelain', cwd=main) == ''
     assert git('status', '--porcelain', cwd=dependency) == ''
     assert git('status', '--porcelain', cwd=second) == ''
+    cli_manifest = root / 'invalid-cli-manifest.json'
+    cli_manifest.write_text(json.dumps(base | {'sourceCommit': '0' * 40}))
+    cli = subprocess.run([sys.executable, str(Path(sys.argv[1])), '--manifest', str(cli_manifest),
+        '--source', str(main), '--checkout', str(root / 'invalid-cli-checkout')], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert cli.returncode != 0
+    assert not (root / 'invalid-cli-checkout').exists()
+    cli_error = cli.stderr.decode()
     print(json.dumps({'lfManifestEqual': linux_plain == windows_plain, 'sourceOnlyRawSums': [linux_plain['mainGoSumSha256'], windows_plain['mainGoSumSha256']],
         'fullReceiptEqual': linux == windows, 'windowsError': windows_error, 'expectedTree': expected_tree,
-        'linuxTree': linux['dependencies'][0]['patchedTree'], 'rejected': rejected}))
+        'linuxTree': linux['dependencies'][0]['patchedTree'], 'rejected': rejected,
+        'cliNonzeroDiagnostics': {'nonzero': cli.returncode != 0,
+            'stdoutPreserved': 'command stdout:\n' + '0' * 40 + '^{commit}' in cli_error,
+            'stderrPreserved': 'command stderr:\nfatal:' in cli_error}}))
 `, join(repo, 'scripts/core-source-provision.py')], {
     encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
   }));
@@ -644,11 +658,12 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
   assert.equal(result.linuxTree, result.expectedTree);
   assert.deepEqual(result.rejected, { 'wrong-patch': true, 'wrong-tree': true, 'wrong-upstream': true,
     'corrupt-input': true, occupied: true, 'tampered-index-mode': true });
+  assert.deepEqual(result.cliNonzeroDiagnostics, { nonzero: true, stdoutPreserved: true, stderrPreserved: true });
 });
 
 test('shared source provider and desktop-only producers retain explicit platform impact', () => {
   assert.equal(digest(readFileSync(join(repo, 'scripts/core-source-provision.py'))),
-    'b19f1568d6033e505dc7bd3f09918ac4e0d0f83435a204c2e58644d6d1efa44e');
+    '5ad89596ee5b4e320c6bfec710933af6219318fff6c66fb4d911475240deaa5b');
   const provider = 'scripts/core-source-provision.py';
   const sharedImpact = classifyImpact([provider]);
   assert.equal(sharedImpact.kernel, true, provider);

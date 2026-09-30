@@ -49,7 +49,9 @@ def patch_path(directory, specification, dependency=False):
 
 
 def export_module(repository, commit, target):
-    archive = run(["git", "-C", str(repository), "archive", "--format=tar", commit], raw=True)
+    # Archive also applies the source repository's newline conversion policy.
+    # Override only this command so exported bytes match the locked Git blobs.
+    archive = run(["git", "-c", "core.autocrlf=false", "-C", str(repository), "archive", "--format=tar", commit], raw=True)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         # data_filter rejects absolute/traversing paths and escaping links.
         tar.extractall(target, filter="data")
@@ -236,4 +238,8 @@ if __name__ == "__main__":
         main()
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"core source provisioning failed: {error}", file=__import__("sys").stderr)
+        if isinstance(error, subprocess.CalledProcessError):
+            for label, output in (("stdout", error.stdout), ("stderr", error.stderr)):
+                if output:
+                    print(f"command {label}:\n" + output.decode(errors="backslashreplace"), file=__import__("sys").stderr)
         raise SystemExit(1)
