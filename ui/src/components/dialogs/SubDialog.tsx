@@ -32,6 +32,7 @@ import { subscriptionErrorDetail } from '@/domain/subscription-error-text';
 import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
+import { isSubscriptionUrl } from './sub-url';
 import { useSubscriptionCreateDialogOperation } from './use-subscription-create-dialog-operation';
 import { Fold } from '@/components/Fold';
 import { InfoIcon } from '@/components/InfoIcon';
@@ -39,6 +40,7 @@ import { Csel, type CselOption } from './Csel';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
 import {
   subAutoUpdateNoticeMode,
+  subAutoUpdateNoticeKey,
   subEffectiveIntervalHours,
 } from '@/domain/subscription-auto-update';
 
@@ -118,32 +120,11 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
     autoUpdateSubscriptionOnStart: autoUpdateMaster,
     subscriptionUpdateIntervalHours: autoUpdateInterval,
   });
-  const autoUpdateNotice =
-    autoUpdateMode === 'master-off'
-      ? t('sub.autoUpdateNoticeMasterOff')
-      : autoUpdateMode === 'startup-auto-apply'
-        ? t('sub.autoUpdateNoticeStartupAutoApply')
-        : autoUpdateMode === 'startup-selective'
-          ? t('sub.autoUpdateNoticeStartupSelective')
-          : autoUpdateMode === 'scheduled-auto-apply'
-            ? t('sub.autoUpdateNoticeScheduledAutoApply', { h: intervalHours })
-            : autoUpdateMode === 'scheduled-selective'
-              ? t('sub.autoUpdateNoticeScheduledSelective', { h: intervalHours })
-              : '';
+  const autoUpdateNoticeKey = subAutoUpdateNoticeKey(autoUpdateMode);
+  const autoUpdateNotice = autoUpdateNoticeKey === '' ? '' : t(autoUpdateNoticeKey, { h: intervalHours });
 
   const touch = () => {
     setDirty(true);
-  };
-
-  const validUrl = (u: string): boolean => {
-    const s = u.trim();
-    if (!s) return false;
-    try {
-      const p = new URL(s);
-      return p.protocol === 'http:' || p.protocol === 'https:';
-    } catch {
-      return false;
-    }
   };
 
   const requestClose = () => {
@@ -181,7 +162,7 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
   });
 
   const runPreview = async () => {
-    if (!validUrl(url)) {
+    if (!isSubscriptionUrl(url)) {
       setErrUrl(true);
       return;
     }
@@ -220,7 +201,7 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
   const handleSubmit = async () => {
     if (starting || cancelling || (isEdit ? submitting : operationBusy)) return;
     const nameEmpty = !name.trim();
-    const urlBad = !validUrl(url);
+    const urlBad = !isSubscriptionUrl(url);
     setErrName(nameEmpty);
     setErrUrl(urlBad);
     if (nameEmpty || urlBad) return;

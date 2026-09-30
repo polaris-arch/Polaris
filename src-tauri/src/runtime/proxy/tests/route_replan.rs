@@ -492,14 +492,74 @@ fn explicit_interface_unavailability_distinguishes_missing_down_and_recovery() {
 // `system-integration::proxy_ops` 单测覆盖。
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// C-tun-conflict 模式守卫：TUN 出口夺取硬闸**仅**适用 TUN 模式。
+/// C-tun-conflict 模式守卫：桌面三平台上 TUN 出口夺取硬闸**仅**适用 TUN 模式。
 /// systemProxy/manual 不接管 tun、出口恒在物理网卡 → baseline 差分永不成立，设闸必误判 → 不闸（caveat）。
 /// 变异锁：改成恒 true → systemProxy/manual 起核会被本不该有的闸拦（且 baseline/verify 空跑）。
 #[test]
-fn tun_route_gate_only_applies_to_tun_mode() {
-    assert!(tun_route_gate_applies(ProxyModeType::Tun));
-    assert!(!tun_route_gate_applies(ProxyModeType::SystemProxy));
-    assert!(!tun_route_gate_applies(ProxyModeType::Manual));
+fn tun_route_gate_only_applies_to_tun_mode_on_desktop() {
+    for platform in [Platform::Mac, Platform::Win, Platform::Linux] {
+        assert!(tun_route_gate_applies(ProxyModeType::Tun, platform));
+        assert!(!tun_route_gate_applies(
+            ProxyModeType::SystemProxy,
+            platform
+        ));
+        assert!(!tun_route_gate_applies(ProxyModeType::Manual, platform));
+    }
+}
+
+/// **Android / 未知平台：三个存盘档位得到同一个答案 —— 不挂闸。**
+///
+/// 判据本体是 baseline 差分，而这两个平台上
+/// [`SystemRouteOps::exit_interface_for`](polaris_system_integration::route_ops::SystemRouteOps::exit_interface_for)
+/// 恒 `Ok(None)`（Android 臂由 `system-integration` 的
+/// `impl_android_returns_none_and_never_spawns_ip` 钉住）⇒ 前后两次探测都读不出出口 ⇒ 判定
+/// 恒 `Indeterminate`（放行）。挂着闸唯一的效果是每次起核在主链上白付一整个 grace 窗口
+/// （`TUN_ROUTE_GRACE_POLLS` × `TUN_ROUTE_POLL_INTERVAL` ≈ 3.5s）。
+///
+/// **这不是假设**：本条修复前，存盘值恰为 `tun` 的 Android 客户端已经在付这笔钱；而把接管方式
+/// 改读生效值之后（Android 恒 TUN），全部 Android 客户端都会付。
+///
+/// 变异锁：删掉 `tun_route_gate_applies` 里的 `Platform::Android => false` 臂（改成走 true 那一支）
+/// → 本测三档全红。
+#[test]
+fn tun_route_gate_never_applies_where_exit_probing_is_blind() {
+    // 2026-09-06 K13 补 `Platform::Ios`：生产侧已有独立臂（`route_replan.rs` 的
+    // `Platform::Ios => false`），本圈是手写子集、加变体不会自曝。
+    for platform in [Platform::Android, Platform::Other, Platform::Ios] {
+        for mode in [
+            ProxyModeType::SystemProxy,
+            ProxyModeType::Tun,
+            ProxyModeType::Manual,
+        ] {
+            assert!(
+                !tun_route_gate_applies(mode, platform),
+                "{platform:?} + 存盘 {mode:?}：该平台读不出逐目的出口，闸没有取材面，\
+                 挂上去只会在每次起核上白付一个 grace 窗口"
+            );
+        }
+    }
+    // 反向对照：同一个 `Tun` 档在桌面上必须仍然挂闸，否则上面那条「全不挂」可能只是谓词整个坏了。
+    assert!(tun_route_gate_applies(ProxyModeType::Tun, Platform::Mac));
+}
+
+/// 接线门：起核前后那两条腿真的经 [`tun_route_gate_applies`] 分流，而不是各写一份 `is_tun()`。
+///
+/// 上一条只证明**谓词**答对了；谓词答对而生产不调它，Android 上照样白等 3.5s ——
+/// 「机制有门、接线没门」在这一处的形态。故两条成对交。
+#[test]
+fn tun_route_capture_and_verify_both_go_through_the_gate() {
+    let source = module_code("runtime/proxy");
+    for signature in [
+        "    pub(super) async fn capture_tun_route_baseline(",
+        "    pub(super) async fn verify_tun_route_captured(",
+    ] {
+        let body = method_body(&source, signature);
+        assert!(
+            body.contains("tun_route_gate_applies(mode, self.helper.platform())"),
+            "`{signature}` 必须经 `tun_route_gate_applies(mode, self.helper.platform())` 分流。\
+             实得方法体：\n{body}"
+        );
+    }
 }
 
 /// 🔴 **守卫①**：非 TUN 模式一律不 flush。
@@ -667,6 +727,136 @@ async fn flush_closes_each_live_connection_individually() {
     );
 }
 
+/// 🔴 **K6b 起停循环门（下半）**：起核收尾那次「推断绑定事实变了吗」的判据，
+/// **不许在某个平台上恒真** —— 恒真 = 每次起核都排一次去抖重启 = 起停循环。
+///
+/// # 缺陷原文（真机实测，2026-09-04 模拟器 Pixel 6 / x86_64 / Android 16）
+///
+/// 300 秒窗口内 `sing-box 已 spawn` **69 次**（均 4.35s 一轮），每一轮起核成功后紧跟一句
+/// `起核就绪前推断绑定接口事实发生变化 → 调度一次受控重启重新规划`（105 次 spawn 对 104 次告警），
+/// 500ms 后去抖 timer 落到 depth=0 → `Proceed` → `restart` → 下一轮。
+///
+/// 恒真的成因是**两条平台腿在 `Platform::Other` 上同时缺席**（Android 落在 `Other`：
+/// `Platform::current()` 只认 macos/windows/linux）：
+///  1. `SystemRouteOps::exit_interface_for` 恒 `Ok(None)` ⇒ 规划恒「0 绑定 + 全部候选未决」，
+///     而未决非空会让本判据退回**整份**网卡指纹比对；
+///  2. `managed_tun_interface_for_network_watcher(_, Other)` 恒 `None`、post-flight 捕获也
+///     `不可断言` ⇒ `ignored_interface` 恒 `None`，**我们自己刚建出来的 TUN 剔不掉**。
+///
+/// 于是那份「整份指纹比对」比的正是「起核前没有 tun0 / 就绪后有 tun0」——一个由本次起核自己造成的
+/// 差异，被读成「外部网络事实变了，需要撤 TUN 重新规划」。
+///
+/// # 这条门为什么在没有真机的 CI 上也说得出话
+///
+/// 被测的三样全是纯函数：平台能力谓词、指纹比对、以及喂给它的 plan 形态。真机指纹是**抄下来的常量**
+/// （`adb shell ip -o addr`，见文档 §取证），不需要设备在场。它守不住的是「Android 上真的没别的腿再
+/// 排重启」——那条只有真机能答，收据在文档里。
+///
+/// 上半（「无路由腿的平台上候选恒空」及其正对照）在
+/// `runtime/route_binding/tests/mod.rs::runtime_binding_planning_is_off_where_the_platform_has_no_route_leg`。
+#[test]
+fn runtime_binding_replan_is_inert_without_a_route_leg() {
+    use crate::runtime::route_binding::runtime_binding_planning_supported;
+
+    // 模拟器实测的两份指纹：起核前 / 就绪后**只差一张我们自己建的 tun0**，
+    // 且 tun0 的 link-local 每一代都换（故按名字剔除是唯一可行的剔法）。
+    let before: InterfaceFingerprint = BTreeMap::from([
+        (
+            "dummy0".into(),
+            (true, vec!["fe80::40df:abff:fe16:515".into()]),
+        ),
+        (
+            "eth0".into(),
+            (
+                true,
+                vec!["10.0.2.15".into(), "fe80::5054:ff:fe12:3456".into()],
+            ),
+        ),
+        ("lo".into(), (true, vec!["127.0.0.1".into(), "::1".into()])),
+        (
+            "wlan0".into(),
+            (
+                true,
+                vec!["10.0.2.16".into(), "fe80::f1be:d325:e4e1:8915".into()],
+            ),
+        ),
+    ]);
+    let mut after = before.clone();
+    after.insert(
+        "tun0".into(),
+        (
+            true,
+            vec!["172.19.0.1".into(), "fe80::469b:9602:fc09:232e".into()],
+        ),
+    );
+
+    // 起核收尾那次调用的形参形态（`startup.rs` 里写死 `interface: true`）。
+    let starting_impact = NetworkChangeImpact {
+        interface: true,
+        ..Default::default()
+    };
+
+    // 🔴 正对照：判据**确实**会对这份差异喊「变了」。缺陷当天 Android 产出的 plan 形态就是这个
+    // （候选 1 / 绑定 0 / 未决 1，日志原文「TUN 逐目的网卡规划：候选 1，特殊路由绑定 0，
+    // 原生自动探测 0，降级 1」）。这条若转绿，下面那条 `false` 就只是「判据坏了」，不是「修好了」。
+    let plan_before_fix = RuntimeBindingPlan {
+        bindings: BTreeMap::new(),
+        native_roots: BTreeSet::new(),
+        covered_roots: BTreeSet::from(["k4-probe-node".to_string()]),
+        probe_ips: BTreeMap::from([("k4-probe-node".into(), "203.0.113.7".parse().unwrap())]),
+        unresolved_roots: BTreeMap::from([("k4-probe-node".into(), "203.0.113.7".into())]),
+        candidate_count: 1,
+    };
+    assert!(
+        inferred_binding_replan_needed(
+            &starting_impact,
+            &plan_before_fix,
+            Some(&before),
+            Some(&after),
+            None,
+        ),
+        "剔除名单为空时，我方 tun0 的出现本身就会被判成『绑定事实变了』——这正是恒真的那一步"
+    );
+
+    // 修复后：`Other` 上不再产候选 ⇒ `plan_runtime_bindings` 走 `candidate_count == 0` 早退，
+    // Android 能拿到的**只可能**是这份 default plan；同一份指纹差异下判据为假。
+    assert!(!runtime_binding_planning_supported(Platform::Other));
+    assert!(
+        !inferred_binding_replan_needed(
+            &starting_impact,
+            &RuntimeBindingPlan::default(),
+            Some(&before),
+            Some(&after),
+            None,
+        ),
+        "无候选 ⇒ 无未决根、无绑定 ⇒ 起核自己建出来的 tun0 不得再被读成外部网络变化"
+    );
+
+    // 桌面零回归的可执行断言：同一份 default plan 在**有**路由腿的平台上也从不因 tun0 排重启，
+    // 而真正需要重启的形态（绑定的网卡不见了）照旧转真 —— 判据没有被整体削弱。
+    for platform in [Platform::Mac, Platform::Win, Platform::Linux] {
+        assert!(runtime_binding_planning_supported(platform));
+    }
+    let plan_bound_to_missing_iface = RuntimeBindingPlan {
+        bindings: BTreeMap::from([("node-a".to_string(), "en9".to_string())]),
+        native_roots: BTreeSet::new(),
+        covered_roots: BTreeSet::from(["node-a".to_string()]),
+        probe_ips: BTreeMap::new(),
+        unresolved_roots: BTreeMap::new(),
+        candidate_count: 1,
+    };
+    assert!(
+        inferred_binding_replan_needed(
+            &starting_impact,
+            &plan_bound_to_missing_iface,
+            Some(&before),
+            Some(&after),
+            None,
+        ),
+        "被绑定的网卡不在指纹里 ⇒ 仍必须重规划（本批只关掉『没有路由腿的平台』，不放宽这条）"
+    );
+}
+
 /// 🔴 **单条关闭失败必须在 `Flushed.failed` 上可观测**（日志据此升 warn）。
 ///
 /// **变异锁**：flush 把 `failed` 丢成 0 → 转红。
@@ -721,4 +911,49 @@ fn flush_and_close_all_never_call_close_all_connections() {
             "{name} 取材面上找不到 close_live_connections 调用点，判据已失去取材"
         );
     }
+}
+
+#[test]
+fn android_successful_empty_interface_snapshot_is_not_a_bridge_failure() {
+    let required = BTreeSet::from(["wlan0".to_owned()]);
+    let empty = observed_interface_fingerprint(Ok(Vec::new()), Platform::Android)
+        .expect("successful native empty snapshot is authoritative");
+    assert_eq!(
+        required_interfaces_unavailable(&required, &empty).missing,
+        required
+    );
+    assert!(
+        observed_interface_fingerprint(Err("bridge_failure".into()), Platform::Android).is_none()
+    );
+    assert!(observed_interface_fingerprint(Ok(Vec::new()), Platform::Linux).is_none());
+}
+
+#[test]
+fn android_interface_snapshot_keeps_real_names_and_availability() {
+    let rows = vec![
+        crate::commands::system::NetworkInterfaceInfo {
+            name: "wlan0".into(),
+            display_name: "wlan0".into(),
+            is_up: true,
+            addresses: vec!["192.0.2.2".into(), "192.0.2.2".into()],
+        },
+        crate::commands::system::NetworkInterfaceInfo {
+            name: "rmnet0".into(),
+            display_name: "rmnet0".into(),
+            is_up: false,
+            addresses: vec![],
+        },
+    ];
+    let observed = observed_interface_fingerprint(Ok(rows), Platform::Android).unwrap();
+    assert_eq!(observed["wlan0"], (true, vec!["192.0.2.2".to_owned()]));
+    let unavailable = required_interfaces_unavailable(
+        &BTreeSet::from([
+            "wlan0".to_owned(),
+            "rmnet0".to_owned(),
+            "missing0".to_owned(),
+        ]),
+        &observed,
+    );
+    assert_eq!(unavailable.down, BTreeSet::from(["rmnet0".to_owned()]));
+    assert_eq!(unavailable.missing, BTreeSet::from(["missing0".to_owned()]));
 }

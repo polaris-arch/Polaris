@@ -197,6 +197,12 @@ where
         })
     };
 
+    // The command body may queue a blocking service install/uninstall. Its
+    // HelperRuntime entry point rechecks this fence as well, covering direct
+    // callers that bypass this command wrapper.
+    if let Err(error) = state.proxy().register_helper_backend() {
+        log::warn!("helper service mutation blocked by Child custody: {error}");
+    }
     let out = body(stop_outcome).await;
 
     // 协作式收停（**不能 abort**，理由见 [`join_watchdog_cooperatively`]）。

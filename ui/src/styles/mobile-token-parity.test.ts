@@ -1,28 +1,32 @@
 /**
- * `mobile-token-parity` —— §6.3.5 的门，**本轮只落地其中两条**。
+ * `mobile-token-parity` —— §6.3.5 的门。
  *
  * 契约与门规格：`~/docs/polaris/design/polaris-mobile-platform-evaluation-2026-08-29.md` §6.3
  * （§6.3.1 桌面视觉真值链 / §6.3.2 缺口 / §6.3.3 四条契约 / §6.3.5 门的五条）。
+ * 落地设计：`~/docs/polaris/design/polaris-mobile-token-entry-2026-09-04.md`。
  *
- * ── 本轮落地范围 ────────────────────────────────────────────────────────────
- * ✅ 第 1 条的**右半边**：桌面 token 实跑终值基线（`:root` / `[data-theme='dark']` /
- *    `[data-theme='light']` 三条腿，即第 3 条要求的覆盖面），与仓内 checked-in 快照逐值对拍。
- * ✅ 第 4 条：字体栈断言（`--disp` 首选族随包、`--sans` 含 Android 可用 CJK 族）——
- *    当前是**已知缺口**，见文件末尾 `it.fails` 段。
- * ⏸ 第 1 条的**左半边** + 第 2 条（移动端入口解析出的 token 集合对拍 / 新增 token 白名单）：
- *    §6.3.0 实测移动端零代码落地（`src-tauri/gen/` 无 android|ios、`lib.rs` 无 `mobile_entry_point`），
- *    **没有移动端 token 入口就没有对拍的左操作数**，写了也只是恒真。
- *    **补齐条件**：契约 A1 的 `ui/src/styles/tokens.resolved.css`（或等价的移动端唯一 token 入口）落地当天，
- *    在本文件补两个 describe：① 该入口解析出的三条腿逐值等于下方 `BASELINE`；
- *    ② 该入口相对 `BASELINE` 多出的 token 必须命中契约 C 白名单前缀（`--tap-*` / `--safe-*` / `--shadow-sheet`）。
- *    §7 P1 的 gate 是「`mobile-token-parity` 未绿不合入任何移动端 UI 组件」，届时这两条必须先在。
+ * ── 已落地范围（2026-09-04 补齐左半边与第 2 条）────────────────────────────
+ * ✅ 第 1 条**两侧**：右半边是桌面 token 实跑终值基线（下方 `BASELINE`），左半边是移动端唯一
+ *    token 入口 `./tokens.resolved.css`（契约 A1）解析出的同一组腿，两侧逐值对拍。
+ * ✅ 第 2 条：入口相对 `BASELINE` **多出**的 token 必须命中契约 C 白名单前缀
+ *    （`--tap-*` / `--safe-*` / `--shadow-sheet`），且入口必须**确实**带上 `MOBILE_REQUIRED`
+ *    那几个——否则「没有多余项」会让白名单那条成为恒真断言。
+ * ✅ 第 3 条：**四条腿**，比 §6.3.5 原文的三条多一条「跟随系统深色」。多这条不是凑数：
+ *    §6.3.1 实测**只有那一条腿是 `tokens.css` 赢**（它的 media 腿多一个 `:not` ⇒ (0,3,0) >
+ *    prototype 的 (0,2,0)），方向与其余三条相反，恰恰是最该钉住的一条。
+ * ✅ 第 4 条：字体栈（`--disp` 首选族随包、字重区间覆盖在用字重、`--sans` 含 Android 可用 CJK 族）。
+ *    2026-09-04 前这两条是 `it.fails` 标着的已知缺口，本轮随契约 B 落地转为正式断言。
+ * ✅ 第 5 条：反向对照。桌面基线段、入口段、字体段各自带一条 `⓪`，用**同一套解析器**吃合成的
+ *    违约输入，证明每条断言真的报得出错。**未证明有牙的门不计入验收**（§9 验收清单原话）。
  *
  * ── 为什么要一份「终值」基线，而不是直接读 tokens.css ───────────────────────
  * 桌面 token 的最终取值**不在 `tokens.css`**（§6.3.1）。`index.css` 的 @import 序为
- * tailwindcss → tokens.css → components.css → screens.css → prototype.css，其后才是 index.css 自有规则；
- * `prototype.css` 自带一整套同选择器的 `:root` token 压过 `tokens.css`，`index.css` 的
- * `:root, :root[data-theme='light']` 又把四个语义色压回来。移动端按直觉只 `@import tokens.css`
+ * tailwindcss → fonts.css → tokens.css → components.css → screens.css → prototype.css，
+ * 其后才是 index.css 自有规则；`prototype.css` 自带一整套同选择器的 `:root` token 压过
+ * `tokens.css`，`index.css` 的 `:root, :root[data-theme='light']` 又把四个语义色压回来，
+ * 另一条 `:root` 把 `--sans` 压回来（契约 B 补的 CJK 族）。移动端按直觉只 `@import tokens.css`
  * 会拿到中间层的值，**没有任何报错**。基线钉的就是浏览器里真正生效的那一层。
+ * `fonts.css` 只有一条 @font-face、不声明任何 token，故不进 `CASCADE`（它由第 4 条那段扫描）。
  *
  * ── 解析器为什么不复用 style-invariants.test.ts 的 `flat()` ─────────────────
  * `read` / `stripComments` 与它同义（那两个是模块私有的 const，不能 import，只能同形复制）。
@@ -94,12 +98,23 @@ function walk(css: string, file: string, out: Rule[], at: string[], seq: { n: nu
   }
 }
 
-const ALL_RULES: Rule[] = (() => {
+/**
+ * 一组「文件名 → CSS 源文」走查成规则表。`order` 跨源连号 ⇒ 同特异性时源序在后者胜。
+ *
+ * 之所以吃**源文**而不是只吃路径：反向对照要把「变异过的入口」喂进**同一个**解析器
+ * （见各段 `⓪`）。若变异只能靠改磁盘上的文件来做，那门就得写盘再回滚，一旦中途失败
+ * 就把违约的取值留在了工作区。
+ */
+type Src = { file: string; css: string };
+function rulesOf(srcs: readonly Src[]): Rule[] {
   const out: Rule[] = [];
   const seq = { n: 0 };
-  for (const f of CASCADE) walk(stripComments(read(f)), f, out, [], seq);
+  for (const s of srcs) walk(s.css, s.file, out, [], seq);
   return out;
-})();
+}
+const srcOf = (rel: string): Src => ({ file: rel, css: stripComments(read(rel)) });
+
+const ALL_RULES: Rule[] = rulesOf(CASCADE.map(srcOf));
 
 /** 声明按 `;` 切（不是按行切），后声明覆盖同块内的前声明。 */
 function declsOf(body: string): Record<string, string> {
@@ -112,9 +127,14 @@ function declsOf(body: string): Record<string, string> {
 
 // ── 三条腿 ────────────────────────────────────────────────────────────────────
 type Env = { theme: null | 'dark' | 'light'; prefers: 'light' | 'dark' };
-/** 门覆盖的三条腿（§6.3.5 第 3 条）。`:root` 腿取「无 data-theme + 系统浅色」，即浅色默认。 */
+/**
+ * 门覆盖的**四条腿**（§6.3.5 第 3 条要求三条，这里多钉一条，理由见文件头）。
+ * `:root` 腿取「无 data-theme + 系统浅色」，即浅色默认；`:root@系统深色` 是同一个选择器
+ * 在系统偏好为深色时的另一条路径 —— 用户 uiTheme 选 'system' 时走的就是它。
+ */
 const LEGS: Record<string, Env> = {
   ':root': { theme: null, prefers: 'light' },
+  ':root@prefers-color-scheme:dark': { theme: null, prefers: 'dark' },
   ":root[data-theme='dark']": { theme: 'dark', prefers: 'dark' },
   ":root[data-theme='light']": { theme: 'light', prefers: 'light' },
 };
@@ -147,9 +167,9 @@ function atRuleApplies(at: string[], env: Env): boolean {
 }
 
 /** 解析某条腿上全部根级自定义属性的终值（特异性优先，同特异性取源序在后者）。 */
-function resolveLeg(env: Env): Record<string, string> {
+function resolveLeg(env: Env, rules: readonly Rule[] = ALL_RULES): Record<string, string> {
   const win: Record<string, { spec: number; order: number; val: string }> = {};
-  for (const r of ALL_RULES) {
+  for (const r of rules) {
     const d = declsOf(r.body);
     if (Object.keys(d).length === 0) continue;
     if (!atRuleApplies(r.at, env)) continue;
@@ -185,8 +205,10 @@ function resolveLeg(env: Env): Record<string, string> {
  * （`--ok` 152 60% 27% / `--warn` 32 84% 31% / `--err` 356 68% 44% / `--dn` 197 80% 33%），
  * 都不是 `tokens.css` 或 `prototype.css` 的声明值。
  *
- * 取值形态就是**胜出那条声明的原文**（空白折叠后）：字体栈是 `prototype.css` 的双引号紧凑写法，
- * 不是 `tokens.css` 的单引号折行写法 —— 因为浏览器里生效的是前者。
+ * 取值形态就是**胜出那条声明的原文**（空白折叠后）：`--disp` / `--mono` 是 `prototype.css` 的
+ * 双引号紧凑写法，不是 `tokens.css` 的单引号折行写法 —— 因为浏览器里生效的是前者。
+ * `--sans` 是**第三种**形态：契约 B 补 CJK 族后，胜出的那条在 `index.css` 的 @import 之后
+ * （单引号、逗号后带空格）。三个字体栈 token 三种写法，正是「取值形态跟着胜出者走」的实证。
  *
  * 改基线的唯一正当理由：桌面设计 token 有意演进，且改动已在桌面侧落地。
  * 「移动端对不上所以把基线调过去」是契约 C 的违约（只许加，不许改）。
@@ -222,7 +244,7 @@ const LIGHT: Record<string, string> = {
   '--r-xs': '6px',
   '--ring': '197 88% 44%',
   '--sans':
-    '-apple-system,"Segoe UI Variable","Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif',
+    "-apple-system, 'Segoe UI Variable', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', system-ui, sans-serif",
   '--shadow': '216 45% 20%',
   '--shadow-pop': '0 18px 40px -16px hsl(var(--shadow)/0.6)',
   '--sp-1': '4px',
@@ -278,21 +300,35 @@ const DARK: Record<string, string> = {
 };
 
 /**
- * 两条浅色腿共用同一张表**本身就是一条断言**：显式浅色与浅色默认必须逐值一致
- * （`tokens.css` 的「主题两档同步」注释、`index.css` 的双选择器写法都建立在这个前提上）。
- * 哪天它们真分叉了，这里会红，届时该拆表的是人，不是让门闭嘴。
+ * 两条浅色腿共用同一张表、两条深色腿共用同一张表，**本身就是四条断言**：
+ * 显式浅色 ≡ 浅色默认，显式深色 ≡ 跟随系统深色（`tokens.css` 的「主题两档同步」注释、
+ * `index.css` 的双选择器写法都建立在这个前提上）。哪天它们真分叉了，这里会红，
+ * 届时该拆表的是人，不是让门闭嘴。
+ *
+ * 深色两条腿共表这一条尤其值钱：它们在桌面上分别由 `tokens.css`(0,3,0) 与
+ * `prototype.css`(0,2,0) 赢下，来源不同却必须同值 —— §6.3.1 说的「四条主题路径里
+ * tokens.css 只赢一条」正是在这里被钉住。
  */
 const BASELINE: Record<string, Record<string, string>> = {
   ':root': LIGHT,
+  ':root@prefers-color-scheme:dark': DARK,
   ":root[data-theme='dark']": DARK,
   ":root[data-theme='light']": LIGHT,
 };
 
-describe('§6.3.5 第 1 条：桌面 token 终值基线（三条腿逐值对拍）', () => {
+describe('§6.3.5 第 1 条右半边：桌面 token 终值基线（四条腿逐值对拍）', () => {
   it('index.css 的 @import 序与解析器假设的层叠链一致（基线的前提，序一变整张表失真）', () => {
-    const imports = [...read('./index.css').matchAll(/@import\s+['"]([^'"]+)['"]/g)].map((m) => m[1]);
-    // tailwindcss 是裸包名，不在 CASCADE 里（射程边界见文件头）；其余四个必须按 CASCADE 顺序出现。
-    expect(imports).toEqual(['tailwindcss', './tokens.css', './components.css', './screens.css', './prototype.css']);
+    const imports = [...stripComments(read('./index.css')).matchAll(/@import\s+['"]([^'"]+)['"]/g)].map((m) => m[1]);
+    // tailwindcss 是裸包名、fonts.css 只带一条 @font-face，两者都不在 CASCADE 里（射程边界见文件头）；
+    // 其余四个必须按 CASCADE 顺序出现，且中间不许插入别的 @import（整表 toEqual，不是子序列匹配）。
+    expect(imports).toEqual([
+      'tailwindcss',
+      './fonts.css',
+      './tokens.css',
+      './components.css',
+      './screens.css',
+      './prototype.css',
+    ]);
   });
 
   for (const [leg, env] of Object.entries(LEGS)) {
@@ -300,6 +336,45 @@ describe('§6.3.5 第 1 条：桌面 token 终值基线（三条腿逐值对拍�
       expect(resolveLeg(env)).toEqual(BASELINE[leg]);
     });
   }
+
+  /**
+   * ⓪ 反向对照（§6.3.5 第 5 条）—— 证明上面那四条不是「解析器把什么都算成基线」。
+   *
+   * 两个变异靶各打一处**不同的层**，且都先证明「变异确实打上了」（needle 在剥注释后的源文里
+   * 恰好命中一次），再看门的反应：
+   *   ① 覆盖层（index.css 的 @import 后 `:root`）：改一个明度点 ⇒ `:root` 腿必须红。
+   *      这条钉的是「基线读的是覆盖层」——若解析器错读成 tokens.css 或 prototype.css 的声明值，
+   *      改覆盖层就不会有反应，门也就一直绿着放行一个丢掉无障碍校准的移动端。
+   *   ② 声明层的**跟随系统深色腿**（tokens.css 的 @media 块）：改一个明度点 ⇒
+   *      `:root@系统深色` 腿变、`[data-theme='dark']` 腿**不变**。
+   *      这条钉的是 @media 归属真的被解析。文件头写过：若把 @media 拍平，prototype 的 (0,2,0)
+   *      深色腿会盖过 `:root` 的 (0,1,0)，浅色基线会整张变成深色值 —— 那种失效模式下这两条腿
+   *      会一起动，一眼可辨。
+   */
+  it('⓪ 反向对照：两处层叠变异分别打红对应的腿，且不误伤别的腿', () => {
+    // ── ① 覆盖层 ──
+    const indexCss = stripComments(read('./index.css'));
+    const okNeedle = '--ok: 152 60% 27%;';
+    expect(indexCss.split(okNeedle).length - 1, `index.css 剥注释后 \`${okNeedle}\` 不是恰好 1 处 —— 变异靶变形了`).toBe(1);
+    const mutIndex = rulesOf([...CASCADE.slice(0, -1).map(srcOf), { file: './index.css', css: indexCss.replace(okNeedle, '--ok: 152 60% 28%;') }]);
+    expect(resolveLeg(LEGS[':root'], mutIndex)['--ok'], '改了覆盖层的 --ok，`:root` 腿却没跟着变 —— 基线读的不是覆盖层').toBe('152 60% 28%');
+    expect(resolveLeg(LEGS[':root'], mutIndex)).not.toEqual(LIGHT);
+
+    // ── ② 声明层的跟随系统深色腿 ──
+    const tokensCss = stripComments(read('./tokens.css'));
+    const mediaAt = tokensCss.indexOf('@media (prefers-color-scheme: dark)');
+    expect(mediaAt, 'tokens.css 的跟随系统深色腿不见了 —— 变异靶没了，本条不构成证据').toBeGreaterThan(-1);
+    const bgNeedle = '--bg: 220 40% 6%;';
+    const tail = tokensCss.slice(mediaAt);
+    expect(tail.split(bgNeedle).length - 1, `tokens.css 的 @media 块里 \`${bgNeedle}\` 不是恰好 1 处`).toBe(1);
+    const mutTokens = rulesOf([
+      { file: './tokens.css', css: tokensCss.slice(0, mediaAt) + tail.replace(bgNeedle, '--bg: 220 40% 7%;') },
+      ...CASCADE.slice(1).map(srcOf),
+    ]);
+    expect(resolveLeg(LEGS[':root@prefers-color-scheme:dark'], mutTokens)['--bg'], '改了 tokens.css 的 @media 深色腿，跟随系统腿却没变 —— 那条腿的胜出关系没被解析对').toBe('220 40% 7%');
+    expect(resolveLeg(LEGS[":root[data-theme='dark']"], mutTokens)['--bg'], '只改了 @media 腿，显式深色腿却跟着变了 —— @media 归属被拍平了').toBe('220 40% 6%');
+    expect(resolveLeg(LEGS[':root'], mutTokens), '只改了深色腿，浅色基线却动了').toEqual(LIGHT);
+  });
 
   it('四个语义色的浅色终值来自 index.css 的 @import 后覆盖，不是 tokens.css / prototype.css 的声明', () => {
     const light = resolveLeg(LEGS[':root']);
@@ -318,6 +393,121 @@ describe('§6.3.5 第 1 条：桌面 token 终值基线（三条腿逐值对拍�
       '356 68% 44%',
       '197 80% 33%',
     ]);
+  });
+});
+
+// ── §6.3.5 第 1 条左半边 + 第 2 条：移动端 token 入口（契约 A1 / C）──────────────
+/** 移动端唯一 token 入口。契约 A1：既不是 `tokens.css`，也不是整条 `index.css` 层叠链。 */
+const MOBILE_ENTRY = './tokens.resolved.css';
+/** 契约 C 白名单前缀（§6.3.3）：移动端只许新增这三类，改任何既有 token 的取值即违约。 */
+const MOBILE_ONLY = /^--tap-|^--safe-|^--shadow-sheet$/;
+/**
+ * 入口**必须**带上的移动端专属 token（§6.3.2③ 点名的两类缺口：触控目标与 safe-area）。
+ * 没有这条正面断言，白名单那条会被「一个多余 token 都没有」骗过去 —— 空集永远满足白名单，
+ * 那样第 2 条就成了零信息量的恒真断言。
+ * 这里用「必须含」而不是「恰好等于」：将来按契约 C 合法新增 `--shadow-sheet` 之类不该逼人改门。
+ */
+const MOBILE_REQUIRED = ['--tap-min', '--safe-t', '--safe-r', '--safe-b', '--safe-l'];
+
+/** 把一条腿的解析结果切成「基线里有的」与「多出来的」两半。 */
+function split(resolved: Record<string, string>, base: Record<string, string>) {
+  const shared: Record<string, string> = {};
+  const extra: Record<string, string> = {};
+  for (const [k, v] of Object.entries(resolved)) (k in base ? shared : extra)[k] = v;
+  return { shared, extra };
+}
+/** 解析入口的某条腿。反向对照传入变异过的源文，走的是**同一条**解析路径。 */
+const entryLeg = (leg: string, css: string = srcOf(MOBILE_ENTRY).css) =>
+  resolveLeg(LEGS[leg], rulesOf([{ file: MOBILE_ENTRY, css }]));
+
+describe('§6.3.5 第 1 条左半边 + 第 2 条：移动端 token 入口（契约 A1 / C）', () => {
+  it('自检：入口在、解析得出规则、四条腿都不是空集（空集会让下面每条断言恒绿）', () => {
+    expect(existsSync(abs(MOBILE_ENTRY)), `${MOBILE_ENTRY} 不存在 —— 契约 A1 的入口没了`).toBe(true);
+    expect(rulesOf([srcOf(MOBILE_ENTRY)]).length, '入口一条规则都没解析出来').toBeGreaterThan(0);
+    for (const leg of Object.keys(LEGS)) {
+      expect(Object.keys(entryLeg(leg)).length, `${leg} 腿解析出的 token 太少 —— 十有八九是选择器写法没被解析器认出来`).toBeGreaterThan(40);
+    }
+  });
+
+  it('契约 A：入口不得走桌面层叠链，只许 @import 随包字体面', () => {
+    const imports = [...stripComments(read(MOBILE_ENTRY)).matchAll(/@import\s+['"]([^'"]+)['"]/g)].map((m) => m[1]);
+    // 为什么要单独钉这一条：入口若 `@import './tokens.css'`，四条腿的**终值仍然对**
+    //（后面的扁平声明压过它），门照绿 —— 但移动端包里从此躺着一份声明层，且下一个人会以为
+    // 那份才是真值源。这是一条只在打包体积与阅读路径上出问题、在取值上完全不出声的违约。
+    expect(imports, '入口的 @import 集合变了 —— 只许有随包字体面 fonts.css').toEqual(['./fonts.css']);
+  });
+
+  for (const leg of Object.keys(LEGS)) {
+    it(`${leg}：入口解析出的既有 token 逐值等于桌面实跑终值`, () => {
+      expect(split(entryLeg(leg), BASELINE[leg]).shared).toEqual(BASELINE[leg]);
+    });
+  }
+
+  it('第 2 条：多出的 token 全部命中契约 C 白名单，且必备的移动端 token 确实在', () => {
+    for (const leg of Object.keys(LEGS)) {
+      const extra = Object.keys(split(entryLeg(leg), BASELINE[leg]).extra).sort();
+      expect(
+        extra.filter((k) => !MOBILE_ONLY.test(k)),
+        `${leg} 上出现了契约 C 白名单（--tap-* / --safe-* / --shadow-sheet）之外的新 token`,
+      ).toEqual([]);
+    }
+    const rootExtra = Object.keys(split(entryLeg(':root'), LIGHT).extra);
+    for (const k of MOBILE_REQUIRED) {
+      expect(rootExtra, `入口缺 ${k} —— §6.3.2③ 点名的移动端必需 token 没落地`).toContain(k);
+    }
+  });
+
+  /**
+   * ⓪ 反向对照（§6.3.5 第 5 条）。六个变异靶，每个都先证明**变异确实打上了**
+   * （needle 在剥注释后的源文里命中次数已知），再看门的反应。没有这一条，上面那堆 `toEqual`
+   * 只能证明「没崩」，证明不了「有牙」。
+   */
+  it('⓪ 反向对照：六类违约喂进同一套解析/比对，各自报得出错', () => {
+    const css = srcOf(MOBILE_ENTRY).css;
+    const shared = (mut: string, leg = ':root') => split(entryLeg(leg, mut), BASELINE[leg]).shared;
+    const extra = (mut: string, leg = ':root') => split(entryLeg(leg, mut), BASELINE[leg]).extra;
+    /** 变异收据：needle 必须命中恰好 n 次，且替换后源文确实变了。 */
+    const mutate = (needle: string, next: string, n = 1) => {
+      expect(css.split(needle).length - 1, `入口剥注释后 \`${needle}\` 不是恰好 ${n} 处 —— 变异靶变形了，本条不构成证据`).toBe(n);
+      const out = css.replace(needle, next);
+      expect(out, `\`${needle}\` 的替换没生效`).not.toBe(css);
+      return out;
+    };
+
+    // 前提：未变异的入口本身是绿的。少了这句，下面每条「红了」都可能只是「本来就红」。
+    expect(shared(css), '未变异的入口就对不上基线 —— 下面的红不构成证据').toEqual(LIGHT);
+
+    // ① 改一个明度点。契约 C 明写的典型违约（「只是稍微调亮一点以适应户外强光」）。
+    const m1 = mutate('--ok: 152 60% 27%;', '--ok: 152 60% 28%;');
+    expect(shared(m1)['--ok']).toBe('152 60% 28%');
+    expect(shared(m1)).not.toEqual(LIGHT);
+
+    // ② 漏搬一个 token（不是改值）。`toEqual` 对缺键同样要红。
+    const m2 = mutate('--warn-weak: 38 84% 92%;', '');
+    expect(Object.keys(shared(m2))).not.toContain('--warn-weak');
+    expect(shared(m2)).not.toEqual(LIGHT);
+
+    // ③ 字体栈把单引号换成双引号：CSS 语义等价，但**不是同一份声明**。
+    //    门比的是胜出声明的原文，这一条钉的正是文件头那段「取值形态要逐字照抄」。
+    const m3 = mutate("'Noto Sans CJK SC'", '"Noto Sans CJK SC"');
+    expect(shared(m3)).not.toEqual(LIGHT);
+
+    // ④ 白名单外的新 token。
+    const m4 = mutate('--tap-min: 48px;', '--tap-min: 48px;\n  --brand-outdoor-boost: 1.2;');
+    expect(Object.keys(extra(m4)).filter((k) => !MOBILE_ONLY.test(k))).toEqual(['--brand-outdoor-boost']);
+
+    // ⑤ 删掉必备的 `--tap-min` ⇒ 第 2 条的正面断言必须失守（证明它不是恒真）。
+    const m5 = mutate('--tap-min: 48px;', '');
+    expect(Object.keys(extra(m5))).not.toContain('--tap-min');
+
+    // ⑥ 两条深色腿逐字重复，改一条漏一条必须被抓到：动**显式**深色腿（源文里最后那处 `--bg`），
+    //    显式腿红、跟随系统腿绿。若门只对拍一条深色腿，这里会有一条判不出来。
+    const at = css.lastIndexOf('--bg: 220 40% 6%;');
+    expect(at, '入口里找不到深色 --bg —— 变异靶没了').toBeGreaterThan(-1);
+    const m6 = css.slice(0, at) + '--bg: 220 40% 7%;' + css.slice(at + '--bg: 220 40% 6%;'.length);
+    expect(m6).not.toBe(css);
+    expect(shared(m6, ":root[data-theme='dark']")['--bg'], '改了显式深色腿却没被抓到').toBe('220 40% 7%');
+    expect(shared(m6, ':root@prefers-color-scheme:dark')['--bg'], '只改了显式深色腿，跟随系统腿却跟着变了').toBe('220 40% 6%');
   });
 });
 
@@ -353,8 +543,8 @@ const unquote = (s: string) => s.replace(/^['"]|['"]$/g, '').trim();
 /** font-family 名比较：忽略大小写与多余空白（CSS 里族名大小写不敏感）。 */
 const sameFamily = (a: string, b: string) => a.toLowerCase().replace(/\s+/g, ' ') === b.toLowerCase().replace(/\s+/g, ' ');
 
-type FontFace = { family: string; srcs: string[]; dir: string };
-/** 抽出 @font-face 的族名与 src url 列表（含所在目录，用于判定「随包」而非远端拉取）。 */
+type FontFace = { family: string; srcs: string[]; weight: string; dir: string };
+/** 抽出 @font-face 的族名、src url 列表与字重声明（含所在目录，用于判定「随包」而非远端拉取）。 */
 function fontFaces(css: string, dir: string): FontFace[] {
   return [...css.matchAll(/@font-face\s*\{([^}]*)\}/g)].flatMap((m) => {
     const body = m[1];
@@ -364,6 +554,7 @@ function fontFaces(css: string, dir: string): FontFace[] {
       {
         family: unquote(fam[1].trim()),
         srcs: [...body.matchAll(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g)].map((u) => u[2].trim()),
+        weight: (body.match(/font-weight\s*:\s*([^;]+)/)?.[1] ?? '').replace(/\s+/g, ' ').trim(),
         dir,
       },
     ];
@@ -372,6 +563,19 @@ function fontFaces(css: string, dir: string): FontFace[] {
 /** 「随包」= 本地相对路径且文件真实存在；远端 URL（Google Fonts 之类）不算。 */
 const isBundled = (f: FontFace) =>
   f.srcs.some((u) => !/^(https?:)?\/\//.test(u) && !u.startsWith('data:') && existsSync(resolvePath(f.dir, u.split('?')[0])));
+/**
+ * `@font-face` 的字重区间。单值（静态 face 的写法）返回 `[w, w]`，缺省按 CSS 规范算 `[400, 400]`。
+ * 为什么要判它：设计交接包 `~/Code/polaris/design/mobile/tokens/core.json` 的
+ * `type.cardTitle` / `type.pill` / `type.ringValue` 用的是 **640**，不是标准静态字重；
+ * 且 `index.css` 的 `:root{font-synthesis:none}` 关掉了合成 ⇒ 静态 face 会把 500/600/640
+ * 静默塌到同一档。D-9 选 variable 的**全部理由**就是这一条，不钉住它，将来换成静态 face 无人可知。
+ */
+function weightRange(f: FontFace): [number, number] | null {
+  if (!f.weight) return [400, 400];
+  const n = f.weight.split(/\s+/).map(Number);
+  if (n.length < 1 || n.length > 2 || n.some((v) => !Number.isFinite(v))) return null;
+  return [n[0], n[n.length - 1]];
+}
 
 /**
  * 取材面：`ui/src` 下**全部** .css（styles/ 五个 + tray-overlay.css + update-popup/style.css）。
@@ -400,44 +604,74 @@ const ANDROID_CJK = [
 describe('§6.3.5 第 4 条：字体栈', () => {
   const light = resolveLeg(LEGS[':root']);
 
-  // ── 正向对照：先证明下面两条 it.fails 是「真的缺」，而不是「解析器坏了所以永远失败」──────
-  // 没有这两条，it.fails 会把「扫描器写错」也当成缺口通过，门就成了摆设。
-  it('⓪ 正向对照：字体栈解析与 @font-face 扫描器对合成输入能报出命中', () => {
+  /**
+   * ⓪ 反向对照（§6.3.5 第 5 条）——证明下面三条正式断言是「真的在判」，而不是扫描器恒真。
+   *
+   * 2026-09-04 之前这两条是 `it.fails` 标着的**已知缺口**（全仓 0 个 @font-face、0 个字体文件，
+   * `--sans` 里三个中文族在 Android 上全部缺席）。契约 B 落地后标记已删除、断言转正。
+   * 保留这段历史是为了说明：`it.fails` 那种写法一旦真的通过就会报「expected to fail」转红，
+   * 强制来人删标记 —— 缺口自曝、修复也自曝。绝不能反过来放宽断言让它变绿。
+   *
+   * 四个靶点，都用合成输入而非改盘上的文件：
+   *   · 本地存在的 src   → 随包（正向）
+   *   · 远端 URL          → 不随包（否则一个 Google Fonts 链接就能骗过第 1 条）
+   *   · 本地但**文件不在** → 不随包（「有人删了 woff2、CSS 还留着」是最可能的退化路径，
+   *                          它和远端 URL 是两种失效模式，只测远端会漏掉这一种）
+   *   · 静态字重 / 无字重 → 区间退化成一点（否则第 2 条抓不到「换成静态 face」）
+   */
+  it('⓪ 反向对照：@font-face 扫描器对合成输入能分辨随包 / 不随包 / 静态字重', () => {
     expect(splitTopLevel(light['--disp']).map(unquote)[0]).toBe('Space Grotesk');
     expect(splitTopLevel(light['--sans']).map(unquote)).toContain('PingFang SC');
 
-    const synthetic = fontFaces(
-      `@font-face{font-family:'Space Grotesk';src:url("./tokens.css") format("woff2");font-weight:600;}`,
-      abs('.'),
-    );
-    expect(synthetic).toHaveLength(1);
-    expect(sameFamily(synthetic[0].family, 'Space Grotesk')).toBe(true);
-    expect(isBundled(synthetic[0]), '本地存在的 src 应判为「随包」').toBe(true);
-    // 远端 src 必须判为「不随包」——否则第 1 条 it.fails 修好后会被一个 Google Fonts 链接骗过去。
-    expect(
-      isBundled(fontFaces(`@font-face{font-family:'X';src:url(https://fonts.gstatic.com/x.woff2);}`, abs('.'))[0]),
-    ).toBe(false);
+    const synth = (body: string) => fontFaces(`@font-face{${body}}`, abs('.'))[0];
+
+    const local = synth(`font-family:'Space Grotesk';src:url("./tokens.css") format("woff2");font-weight:300 700;`);
+    expect(sameFamily(local.family, 'Space Grotesk')).toBe(true);
+    expect(isBundled(local), '本地存在的 src 应判为「随包」').toBe(true);
+    expect(weightRange(local)).toEqual([300, 700]);
+
+    expect(isBundled(synth(`font-family:'X';src:url(https://fonts.gstatic.com/x.woff2);`)), '远端 src 必须判为「不随包」').toBe(false);
+    expect(isBundled(synth(`font-family:'X';src:url('./no-such-font.woff2') format('woff2');`)), '本地路径但文件不存在，必须判为「不随包」').toBe(false);
+
+    // 静态 face 的两种写法：显式单值、以及压根不写（CSS 规范默认 400）。两者都必须落成一个点。
+    expect(weightRange(synth(`font-family:'X';src:url(x.woff2);font-weight:600;`))).toEqual([600, 600]);
+    expect(weightRange(synth(`font-family:'X';src:url(x.woff2);`))).toEqual([400, 400]);
 
     expect(ANDROID_CJK.some((f) => sameFamily(f, 'noto sans cjk sc'))).toBe(true);
   });
 
-  // ── 已知缺口（§6.3.2 ① / ②，契约 B 记录）──────────────────────────────────────
-  // 这不是「本轮要修的东西」，是要让它在门上**可见**：全仓 0 个 @font-face、0 个字体文件，
-  // `--sans` 里 PingFang SC / Hiragino Sans GB / Microsoft YaHei 在 Android 上全部缺席。
-  // 用 `it.fails` 而不是 `it.skip`：skip 永远不跑，缺口修好后标记会烂在这里没人发现；
-  // it.fails 一旦真的通过就报「expected to fail」转红，强制来人删掉标记 —— 缺口自曝，修复也自曝。
-  // **修复后取消标记**：把 `it.fails` 改回 `it`，不要反过来放宽断言让它变绿（那是契约 B 的违约）。
-
-  it.fails('【已知缺口 §6.3.2① / 契约 B】--disp 的首选族 Space Grotesk 有随包的 @font-face', () => {
+  it('§6.3.2① / 契约 B：--disp 的首选族 Space Grotesk 有随包的 @font-face', () => {
     const first = splitTopLevel(light['--disp']).map(unquote)[0];
     const hit = ALL_FACES.filter((f) => sameFamily(f.family, first));
     expect(hit.length, `${first} 没有任何 @font-face（当前 ui/src 下共 ${ALL_FACES.length} 个 @font-face）`).toBeGreaterThan(0);
-    expect(hit.some(isBundled), `${first} 的 @font-face 没有随包的本地 src`).toBe(true);
+    expect(hit.some(isBundled), `${first} 的 @font-face 没有随包的本地 src —— 远端拉取不算随包`).toBe(true);
   });
 
-  it.fails('【已知缺口 §6.3.2② / 契约 B】--sans 含至少一个 Android 可用的 CJK 族', () => {
+  it('D-9：随包的那份 Space Grotesk 是 variable，字重区间覆盖在用字重（含非标准的 640）', () => {
+    const first = splitTopLevel(light['--disp']).map(unquote)[0];
+    const bundled = ALL_FACES.filter((f) => sameFamily(f.family, first) && isBundled(f));
+    expect(bundled.length, `${first} 没有随包的 face —— 上一条应已先红`).toBeGreaterThan(0);
+    // 交接包 core.json 的在用字重：500 / 600 / 640 / 700。取 [500,700] 作判据，640 落在区间内。
+    const covers = bundled.some((f) => {
+      const r = weightRange(f);
+      return r !== null && r[0] <= 500 && r[1] >= 700;
+    });
+    expect(
+      covers,
+      `${first} 的随包 face 字重区间为 [${bundled.map((f) => f.weight || '(缺省 400)').join(' | ')}]，` +
+        '未覆盖 500–700。静态 face 会把 500/600/640 静默塌到同一档（index.css 关了 font-synthesis），' +
+        '这正是 D-9 选 variable 的理由。',
+    ).toBe(true);
+  });
+
+  it('§6.3.2② / 契约 B：--sans 含至少一个 Android 可用的 CJK 族', () => {
     const fams = splitTopLevel(light['--sans']).map(unquote);
     const hit = fams.filter((f) => ANDROID_CJK.some((c) => sameFamily(c, f)));
     expect(hit, `--sans 当前为 [${fams.join(', ')}]，无 Android 可用 CJK 族`).not.toHaveLength(0);
+    // 位置也判：具名族排在通用族 `sans-serif` 之后，实践中不会再被走到（通用族一定解析得出）。
+    const generic = fams.findIndex((f) => f === 'sans-serif');
+    const cjkAt = fams.findIndex((f) => ANDROID_CJK.some((c) => sameFamily(c, f)));
+    expect(generic, '--sans 末尾的通用族 sans-serif 不见了').toBeGreaterThan(-1);
+    expect(cjkAt, `Android CJK 族排在通用族 sans-serif 之后，等于没写：[${fams.join(', ')}]`).toBeLessThan(generic);
   });
 });

@@ -375,6 +375,7 @@ test('Linux payload CLI rejects same-size substituted core bytes in a previously
   for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs']) {
     copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));
   }
+  cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
   writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify({ coreArchiveSha256: { linux: 'fixture' } }));
   writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'Polaris' }));
   const args = [join(root, 'scripts/verify-packaging.mjs'), 'payload', '--label', 'linux', '--root', bundle];

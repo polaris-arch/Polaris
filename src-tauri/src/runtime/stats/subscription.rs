@@ -368,7 +368,7 @@ impl StatsRelay {
 
     /// 按窗口实况刷新可见性 → 降流门（Polaris stats-worker 据此门控 connectionsStreamOn）。
     ///
-    /// 由 `main.rs` 的三个显隐写入点调（`WindowEvent::Focused` / 收托盘 `hide()` 后 / 单实例唤起
+    /// 由 `lib.rs` 的三个显隐写入点调（`WindowEvent::Focused` / 收托盘 `hide()` 后 / 单实例唤起
     /// `show()` 后）—— `Focused` 那处**不取 focused 的值**（失焦 ≠ 隐藏），只把它当「显隐可能刚变」
     /// 的即时触发器，真值一律经 [`probe_main_window_visible`](super::probe_main_window_visible) 回读窗口实况；变了即 bump 门代次 →
     /// 等在门上的 relay 立刻醒（恢复不等兜底周期）。

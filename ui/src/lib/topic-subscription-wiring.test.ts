@@ -20,6 +20,7 @@
  * 改注释、改文案、改变量名不会误伤；把任一调用点写回 `.subscribe().then()` 则必然转红。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -42,7 +43,10 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
     if (e.isDirectory()) sourceFiles(p, out);
-    else if (/\.tsx?$/.test(e.name) && !/\.(test|spec)\.tsx?$/.test(e.name)) out.push(p);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (/\.tsx?$/.test(e.name) && !IS_TEST_ONLY_MODULE.test(e.name)) out.push(p);
   }
   return out;
 }
@@ -75,12 +79,17 @@ describe('守卫自检：扫到的确实是源码（防扫空目录 / 过滤过�
    * 故先钉死订阅点的实际条数 —— 少一个就是有调用点被删/改名而守卫没跟上，多一个就是新增了订阅点
    * 而作者没读过本文件，两种都该停下来看一眼。
    */
-  it('恰好三个 stats 订阅点（首页拓扑 / 连接页 / 状态栏），且都被扫到', () => {
+  it('恰好五个 stats 订阅点（桌面：首页拓扑 / 连接页 / 状态栏；移动：首页 / 连接屏），且都被扫到', () => {
     const names = [...SUBSCRIBERS.keys()].map(rel).sort();
     expect(names).toEqual([
       'components/layout/StatusBar.tsx',
       'components/screens/connections/ConnectionsScreen.tsx',
       'components/screens/home/HomeScreen.tsx',
+      // 移动端「连接」屏（F5）：三条腿与桌面连接页逐条同形，按分段而不是按视图门控。
+      'mobile/connections/MobileConnectionsScreen.tsx',
+      // F1 移动端首页（2026-09-04）：流量图订 `stats`，三张分析卡订 `detail`。
+      // 两条腿都走状态机，形态与桌面逐字相同（T1/T2 对它照常生效）。
+      'mobile/home/MobileHomeScreen.tsx',
     ]);
   });
 
@@ -119,6 +128,16 @@ describe('守卫自检：扫到的确实是源码（防扫空目录 / 过滤过�
         'onConnectionsDetail',
       ],
       'components/layout/StatusBar.tsx': ['onStatsUpdated'],
+      // 移动首页两条真监听：流量图按秒差分 `totalUpload/totalDownload`（stats），
+      // 三张分析卡按活动连接窗口聚合（detail）。**刻意不订 aggregate** —— 那两个 `count`
+      // 是连接条数不是字节数，按字节排名的卡一个都不能用它。
+      'mobile/home/MobileHomeScreen.tsx': ['onConnectionsDetail', 'onStatsUpdated'],
+      // 移动端连接屏挂着同样三条真监听（空壳化 ⇒ 该项消失 ⇒ 转红，与桌面那条同一条判据）。
+      'mobile/connections/MobileConnectionsScreen.tsx': [
+        'onConnectionsAggregate',
+        'onConnectionsClosed',
+        'onConnectionsDetail',
+      ],
     });
   });
 });

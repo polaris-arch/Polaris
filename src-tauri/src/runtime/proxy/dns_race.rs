@@ -13,6 +13,7 @@ use polaris_dns_race::{
     plan_upstreams, DecoySet, DefaultUpstreamQuery, DohPost, NodeDnsRaceServer, OnRaceServerDead,
     DEFAULT_RACE_BUDGET,
 };
+use polaris_helper_proto::Platform;
 
 use super::startup::rule_resource_dir;
 use super::ProxyRuntime;
@@ -185,18 +186,37 @@ impl DnsRaceRuntime {
     }
 
     /// 按本轮配置起 sidecar；竞速关闭、绑口失败均 fail-open 到单上游。
+    ///
+    /// # `platform` 是入参，且接管方式必须过 [`effective_on`]
+    ///
+    /// [`effective_on`]: polaris_config_engine::user_config::ProxyModeType::effective_on
+    ///
+    /// [`plan_upstreams`] 里那条 INV-1（**TUN 接管期把 `system` 上游从竞速池里摘掉**）按接管方式
+    /// 分流，而 `proxy_mode_type` 的存盘缺省值是 `systemProxy` —— Android 上「接管方式」不是用户
+    /// 偏好而是平台事实（只有 `VpnService` 的 tun fd 一种形态，成因全在 `effective_on` 的文档里），
+    /// 于是照读裸值会让**每一台**全新安装 / 备份恢复的 Android 客户端在 TUN 之下仍把 `system`
+    /// 留在池里。那条腿防的是：sidecar 的 `system` 上游把查询交给 OS resolver → 明文 `:53` 发往
+    /// LAN DNS → 被 route 的 `hijack-dns` 抓走 → 内核按域名规则又指回 sidecar 的自递归。
+    ///
+    /// 这与 `crates/config-engine/src/builder/dns.rs` 里收掉的是**同一条 INV-1 的第二份实现**：
+    /// 那边管的是内核配置里的节点解析器档位，这边管的是 sidecar 自己的上游池，两边各错一半。
+    ///
+    /// 平台收成入参（而不是在函数里读 `Platform::current()`）：判定要在任何 host 上都跑得到，
+    /// 同 `should_probe_wintun_adapter` / `runtime_binding_candidates_for_roots` 的手法。
     pub(super) async fn start(
         self: &Arc<Self>,
         user_config: &UserConfig,
         data_dir: &Path,
         my_generation: u64,
+        platform: Platform,
     ) {
         if !self.clear_owned(Some(my_generation)) {
             return;
         }
-        let Some(upstreams) =
-            plan_upstreams(user_config.dns_config.as_ref(), user_config.proxy_mode_type)
-        else {
+        let Some(upstreams) = plan_upstreams(
+            user_config.dns_config.as_ref(),
+            user_config.proxy_mode_type.effective_on(platform),
+        ) else {
             log::info!("节点域名竞速解析已关闭 → 走单上游路径，不起 sidecar");
             return;
         };

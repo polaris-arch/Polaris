@@ -1,0 +1,61 @@
+{
+  "purpose": "移动端「规则 → 应用」那颗策略选择器的**跨语言契约夹具**。四档各一条，写的是「选了这一档之后 config.appRules 里那条规则长什么样」。两端各有一条判据读它：UI 端 ui/src/mobile/screens/rules/app-policy-write.test.ts 断言 appRuleForPick 逐字段产出四条、且 APP_POLICY_WRITABLE 恰好是标了 writable 的那些；引擎端 crates/config-engine/tests/golden_inbounds_android.rs 拿同一批 rule 当输入跑 build_inbounds，断言只有 direct 那条把包名放进 tun.exclude_package。两端读同一份文件，是为了让「UI 写的形态」与「引擎认的形态」没有各自漂移的余地。2026-09-13（批 10）四档由两档改为全部可写：proxy / block 在这台设备上按流量特征真的兑现（route.rs:880-904 的 rule_set 腿），此前的置灰守的是「在这一屏改」而不是「能不能兑现」。expectExcluded 与 rule 两格一个字未动 —— 引擎侧读的就是这两格。",
+  "appId": "telegram",
+  "why-telegram": "app_rules_preset_data.rs:96-105 那条内置预设的 package_names 恰好是一个非空单元素表（org.telegram.messenger）—— 判据要的是「包名真的进去了」，用一个 package_names 为空的预设（epic / riot）会让正反两面都得到空表，两条断言一起失去信息量。",
+  "picks": [
+    {
+      "pick": "follow",
+      "writable": true,
+      "meaning": "跟随全局。落盘形态是 action=proxy 且不带 targetServerId —— 桌面快选「默认代理」那一档，两端 appPolicyView 都把它显示成「跟随全局」。它是 direct 的**关**态：显式写一条，才能把一条已存在的 direct 从 exclude_package 里拿掉。",
+      "rule": {
+        "appId": "telegram",
+        "action": "proxy",
+        "enabled": true
+      },
+      "expectExcluded": false
+    },
+    {
+      "pick": "direct",
+      "writable": true,
+      "meaning": "直连。inbounds.rs:717 android_exclude_packages 只收 enabled && action == Direct，包名由 VpnService.Builder.addDisallowedApplication 在系统边界兑现。",
+      "rule": {
+        "appId": "telegram",
+        "action": "direct",
+        "enabled": true
+      },
+      "expectExcluded": true
+    },
+    {
+      "pick": "proxy",
+      "writable": true,
+      "meaning": "指定节点。落盘带 targetServerId，Android 上由 route.rs 的 package_name 腿（2026-09-25 A5，判据见 tests/android_app_owner_route.rs）按应用身份发成 outbound:\"rule-sel-app-<id>\"，rule_set 腿按已知域名 / IP 兜底。排除一个「要走某个节点」的应用 = 它直连出网，方向相反 ⇒ 不进 exclude_package。",
+      "rule": {
+        "appId": "telegram",
+        "action": "proxy",
+        "enabled": true,
+        "targetServerId": "srv-hk-01"
+      },
+      "expectExcluded": false
+    },
+    {
+      "pick": "block",
+      "writable": true,
+      "meaning": "阻断。同上走 package_name + rule_set 两条腿，发成 action:\"reject\"（no_drop:true）。排除一个被阻断的应用 = 它拿到完整互联网，是这张映射表里方向最反的一格 ⇒ 不进 exclude_package。",
+      "rule": {
+        "appId": "telegram",
+        "action": "block",
+        "enabled": true
+      },
+      "expectExcluded": false
+    }
+  ],
+  "expectedPackage": "org.telegram.messenger",
+  "baseConfig": {
+    "appRoutingEnabled": true,
+    "appRules": [],
+    "proxyMode": "smart",
+    "proxyModeType": "tun",
+    "selectedServerId": null,
+    "servers": []
+  }
+}

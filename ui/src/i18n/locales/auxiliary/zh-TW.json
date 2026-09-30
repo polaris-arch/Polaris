@@ -42,7 +42,8 @@
     "manageInMain": "在主視窗管理…",
     "actionFailed": "「{{action}}」失敗：{{detail}}",
     "actionFailedDetail": "操作未完成",
-    "switchPending": "已送出切換至 {{node}} 的請求，請查看連線狀態",
+    "switchPending": "{{node}} 已儲存，正在套用連線變更",
+    "switchRestarting": "{{node}} 已儲存，正在重啟",
     "switchSavedForNextStart": "{{node}} 已儲存，下次連線時生效",
     "switchRequiresApply": "{{node}} 已儲存，請套用待處理變更後使用"
   },
@@ -79,6 +80,7 @@
     "errRecheckFailed": "檢查更新失敗"
   },
   "native": {
+    "exitBlocked": "背景連線尚未確認關閉，應用程式保持執行，請重試結束。",
     "backupExportTitle": "匯出 Polaris 設定備份",
     "backupImportTitle": "匯入 Polaris 設定備份",
     "backupFileType": "Polaris 備份檔案",
@@ -112,6 +114,11 @@
     "speedTestComplete": "測速完成，可開啟 Polaris 查看結果。",
     "fatalPageTitle": "介面初始化失敗",
     "fatalPageBody": "介面載入發生問題，請嘗試重新載入。代理連線不受影響。",
-    "fatalPageReload": "重新載入"
+    "fatalPageReload": "重新載入",
+    "debugReport": "匯出故障報告（Debug）",
+    "debugReportBusy": "正在產生報告…",
+    "debugReportHint": "報告包含裝置資訊、近期日誌和去識別化設定，請檢查後再分享。",
+    "debugReportDone": "已開啟系統分享選單，請選擇接收方。",
+    "debugReportFailed": "產生或分享失敗，請重試或連接 ADB 擷取日誌。"
   }
 }

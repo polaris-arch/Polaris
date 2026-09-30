@@ -108,6 +108,7 @@ fn helper_flush_succeeded(
 /// - win：**helper ready 且** ok → 用 helper（SYSTEM 下 `ipconfig /flushdns`）；否则降级本地
 ///   `ipconfig /flushdns`（Medium IL 多半 rc=1，best-effort）。
 /// - linux：`resolvectl flush-caches`。
+/// - android：no-op（见下方臂上注释）。
 /// - 其它：no-op。
 ///
 /// # `helper_ready`：Windows 腿的前置判据（spec §3.1 的「if helper ready」）
@@ -168,7 +169,37 @@ pub fn flush_os_dns_cache<E: FlushExec>(
                 on_warn(&format!("刷新系统 DNS 缓存失败（忽略）: {e}"));
                 false
             }),
-        Platform::Other => true,
+        // Android：**没有应用可刷的系统 DNS 缓存**。解析全部发生在核自己的 tun fd 内
+        // （FakeIP / hijack-dns 由 sing-box 持有，系统 resolver 不在链路上），起停核跨越的那条
+        // 「受控/还原」边界在这个平台上根本不存在 ⇒ 无缓存残留可清。返 `true` 表示「本平台上
+        // 这件事已经完成」，不是「假装刷过了」：唯一的消费者只用它给 Linux 报错（见
+        // `runtime/proxy/dns_takeover.rs::flush_os_dns_cache_best_effort`）。
+        Platform::Android => true,
+        // iOS：同样返 `true`，但**独立成臂**——与 Android 同答不同因，合并臂会把两条不同的
+        // 事实链断言成一条。
+        //
+        // iOS 的事实：应用（含 NE 扩展）没有任何刷系统 DNS 缓存的 API —— macOS 上的
+        // `dscacheutil -flushcache` / `killall -HUP mDNSResponder` 在 iOS 上都没有对应面
+        // （无可执行 shell、无进程信号面）。且与 Android 同构的那一半也成立：解析发生在核自己的
+        // tun fd 内（FakeIP / hijack-dns 由 sing-box 持有），系统 resolver 不在链路上。
+        //
+        // 与 `Other` 的差别正是这条：`Other` 返 `false` 因为「不知道有没有缓存、也不知道怎么刷」；
+        // iOS 返 `true` 因为**知道没有可刷的东西**。判据是「本平台上这件事已经完成」，不是
+        // 「假装刷过了」。
+        //
+        // **未验证**：上述两条都是平台 API 面的事实推论，本仓构不出 iOS 产物，未经真机取证。
+        Platform::Ios => true,
+        // 未知平台：返 `false` = **「本次没有刷」**（2026-09-05 由 `true` 改）。
+        //
+        // Android 那条能答 `true`，靠的是一条**已知事实**：这个平台上没有应用可刷的系统缓存，
+        // 所以「刷完了」为真。`Other` 拿不到同一条事实 —— 它的定义就是「本仓没有为这个平台答过题」，
+        // 既不知道它有没有系统解析器缓存，也不知道该用什么命令刷。在这种情形下返 `true` 是**把
+        // 「没做」报成「做完了」**，与 `mesh_system_supported_on_platform` 那条乐观兜底同形。
+        //
+        // 今天没有行为差：唯一消费者（`runtime/proxy/dns_takeover.rs::flush_os_dns_cache_best_effort`）
+        // 只在 `Platform::current() == Linux` 时把 `false` 转成告警。改的是这个返回值**将来被别人
+        // 消费时说的是不是真话**。
+        Platform::Other => false,
     }
 }
 

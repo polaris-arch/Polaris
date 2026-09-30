@@ -1590,7 +1590,7 @@ fn measurement_leg_goes_through_a_connect_tunnel() {
         "测量腿不得经 reqwest client 请求（同上）"
     );
     assert!(
-        body.contains("open_tunnel(proxy_port, &target)"),
+        body.contains("open_tunnel(proxy_port, auth, &target)"),
         "测量腿必须经 CONNECT 隧道（`open_tunnel`）建连"
     );
     assert!(
@@ -1620,7 +1620,7 @@ async fn production_measurement_entrypoint_speaks_connect_on_the_wire() {
     })
     .await;
 
-    let out = measure_via_local_proxy(port, DEFAULT_SPEED_TEST_URL).await;
+    let out = measure_via_local_proxy(port, None, DEFAULT_SPEED_TEST_URL).await;
     assert!(out.is_some(), "mock 代理按脚本回 204，生产入口应出值");
 
     let lines = observed.lock().unwrap().request_lines.clone();
@@ -1963,7 +1963,7 @@ fn temp_core_leg_is_gated_on_main_core_absent_and_after_the_single_flight_latch(
         .find("if !status.running {")
         .expect("临时核腿必须**只**在主核未运行时进（主核在跑时起第二个核 = 双会话事故）");
     let call = body
-        .find("run_temp_core_speed_test(&app, &state, &config, server_ids)")
+        .find("run_temp_core_speed_test(&app, &state, &config, server_ids, &run_id)")
         .expect("临时核腿必须真被调用——不调等于这条能力不存在");
     assert!(
         latch < gate && gate < call,
@@ -2031,7 +2031,11 @@ fn temp_core_leg_captures_generation_before_awaiting_and_yields_to_a_running_cor
 /// 🔵 **调用点守卫**：「核在跑但缺混合端口」这条半态的文案**不得说「核未运行」**。
 ///
 /// 那句话与事实相反（核正跑着，缺的是端口），会把用户支去点「连接」——而他已经连着，排查方向整个
-/// 偏掉。两条腿（`!running` → 临时核；`running && mixed_port == 0` → 本条）必须给各自的文案。
+/// 偏掉。两条腿（`!running` → 临时核；`running && local_proxy.is_none()` → 本条）必须给各自的文案。
+///
+/// α 批（2026-09-25）：判据从 `mixed_port == 0` 换成「没有可用的本机 http 代理入站」—— Android
+/// 不发 mixed 入站、`mixed_port` 恒 0，旧判据让 Android 上每次测速都报端口缺失。文案随之从「混合端口」
+/// 改成「本地代理端口」（Android 上缺的是 `probe-proxy-in`，说「混合端口」是指错对象）。
 ///
 /// 牙：把文案改回「核未运行，无法测速」→ 转红。
 #[test]
@@ -2041,7 +2045,7 @@ fn missing_mixed_port_error_does_not_claim_the_core_is_down() {
         "pub async fn server_speed_test(",
     );
     let branch = body
-        .find("if status.running && status.mixed_port == 0 {")
+        .find("if status.running && local_proxy.is_none() {")
         .expect("半态腿锚点消失，守卫已失去判据");
     // 该分支到下一条早退之间的文案。
     let tail = &body[branch..];
@@ -2049,11 +2053,11 @@ fn missing_mixed_port_error_does_not_claim_the_core_is_down() {
     let msg = &tail[..msg_end];
     assert!(
         !msg.contains("核未运行"),
-        "核**在跑**、缺的是混合端口：说「核未运行」会把用户支去点已经连着的「连接」"
+        "核**在跑**、缺的是本地代理端口：说「核未运行」会把用户支去点已经连着的「连接」"
     );
     assert!(
-        msg.contains("混合端口"),
-        "文案须点明真实缺失项（混合端口），否则用户无从判断该做什么"
+        msg.contains("本地代理端口"),
+        "文案须点明真实缺失项（本地代理端口），否则用户无从判断该做什么"
     );
 }
 
@@ -2084,7 +2088,7 @@ fn starting_main_core_is_treated_as_occupied_before_the_temp_core_leg() {
              `!status.running` 这个入口条件根本看不见它",
     );
     let call = body
-        .find("run_temp_core_speed_test(&app, &state, &config, server_ids)")
+        .find("run_temp_core_speed_test(&app, &state, &config, server_ids, &run_id)")
         .expect("临时核腿必须真被调用——不调等于这条能力不存在");
     assert!(
         gate < call,
@@ -2301,7 +2305,7 @@ fn temp_core_leg_reuses_the_shared_warm_ttfb_measurement() {
         "async fn run_temp_core_speed_test(",
     );
     assert!(
-        body.contains("measure_via_local_proxy(port, &url)"),
+        body.contains("measure_via_local_proxy(port, None, &url)"),
         "临时核腿必须复用与主核路径同一个 warm-TTFB 测量（各写一份 ⇒ 同一个徽标里混着两种口径）"
     );
 }
@@ -2323,15 +2327,16 @@ fn pool_leg_wires_ts_prefilter_before_running_waves() {
         &crate_code("commands/speedtest.rs"),
         "pub async fn server_speed_test(",
     );
+    let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
 
-    let prefilter = body
-        .find("partition_ts_not_ready(&requested, &tailscale_ids,")
+    let prefilter = compact
+        .find("partition_ts_not_ready(&requested,&tailscale_ids,")
         .expect("池路径必须**现场**算 TS 未就绪集（取材面=本次请求集×config 里的 tailscale 节点）");
-    let ready_probe = body
+    let ready_probe = compact
         .find("ts_node_ready(state.mesh().ts_status_event(")
         .expect("就绪判据必须读 mesh 的 TS 状态**活态**末帧，而非任何静态/缓存假设");
-    let run = body
-        .find("run_pool_speed_test(&app, &proxy, &targets, &requested, &url, &prefilter)")
+    let run = compact
+        .find("run_pool_speed_test(&app,&proxy,&targets,&requested,&url,&prefilter,&run_id")
         .expect("预筛结果必须作为入参传进分波编排——不传等于算了不用");
     assert!(
         prefilter < run && ready_probe < run,
@@ -2357,16 +2362,17 @@ fn pool_leg_wires_dirty_prefilter_before_running_waves() {
         &crate_code("commands/speedtest.rs"),
         "pub async fn server_speed_test(",
     );
+    let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
 
     assert!(
             body.contains("let current_fingerprints = current_server_fingerprints(&config);"),
             "「新」一侧必须取自 ConfigManager 最新 config（运行核 config 镜像在订阅自动刷新路径上滞后 ⇒ 漏判 dirty）"
         );
-    let prefilter = body
-        .find("partition_dirty(&requested, &targets.fingerprints, &current_fingerprints)")
+    let prefilter = compact
+        .find("partition_dirty(&requested,&targets.fingerprints,&current_fingerprints)")
         .expect("池路径必须现场算 dirty 集：「旧」= 起核快照指纹，「新」= 当前配置指纹");
-    let run = body
-        .find("run_pool_speed_test(&app, &proxy, &targets, &requested, &url, &prefilter)")
+    let run = compact
+        .find("run_pool_speed_test(&app,&proxy,&targets,&requested,&url,&prefilter,&run_id")
         .expect("预筛结果必须作为入参传进分波编排——不传等于算了不用");
     assert!(
         prefilter < run,
@@ -2435,4 +2441,34 @@ fn fallback_leg_gates_unready_tailscale_exit_before_measuring() {
         gate < measure,
         "TS 就绪门在测量**之后** = 形同虚设：直连 RTT 已经被记到那个连不通的 TS 节点名下了"
     );
+}
+
+#[test]
+fn run_identity_is_monotonic_string_and_tag_preserves_existing_event_fields() {
+    let sequence = AtomicU64::new(9_007_199_254_740_991);
+    let first = next_speed_test_run_id(&sequence).unwrap();
+    let second = next_speed_test_run_id(&sequence).unwrap();
+    assert_eq!(first, "9007199254740992");
+    assert_eq!(second, "9007199254740993");
+    for (event, payload) in [
+        (
+            EVENT_SPEED_TEST_RESULT,
+            json!({"serverId":"fixture", "latency":-1}),
+        ),
+        (
+            EVENT_SPEED_TEST_PROGRESS,
+            json!({"tested":1, "ok":0, "total":2}),
+        ),
+        (
+            crate::events::channel::EVENT_SPEED_TEST_DONE,
+            json!({"outcome":"interrupted", "tested":1, "total":2, "serverIds":["fixture","pending"], "pending":["pending"]}),
+        ),
+    ] {
+        let tagged = speed_test_run_payload(payload.clone(), &first);
+        assert_eq!(tagged["runId"], first, "{event}");
+        for (key, value) in payload.as_object().unwrap() {
+            assert_eq!(&tagged[key], value, "{event}:{key}");
+        }
+    }
+    assert!(next_speed_test_run_id(&AtomicU64::new(u64::MAX)).is_none());
 }

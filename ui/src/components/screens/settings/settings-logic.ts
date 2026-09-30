@@ -693,6 +693,34 @@ export function progressResetsIntegrity(status: UpdateProgress['status']): boole
  * `update:progress` 一帧 → 更新卡的一次完整变更（态 + 该态依赖的全部随行事实）
  * ──────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * U1 失败机器码 → 本地化正文（**两端共用**的取文腿）。
+ *
+ * 后端只发码与语言中性的诊断串（`ProgressStage::Failed` / `update_download` 的信封），正文一律由
+ * 前端按码取键。桌面更新卡与移动端更新页是同一批码的两个消费点 —— 各写一份的下场是措辞与
+ * 兜底规则各自漂，而漂了**不会红**（两侧都只是「显示了一句话」）。
+ *
+ * `HTTP_BACKEND_UNAVAILABLE` 那一条是历史信封码（`CODE_HTTP_UNAVAILABLE`），与 U1 码表里的
+ * `backendUnavailable` 是同一件事的两个名字，在这里归一。
+ *
+ * 取不到对应文案时回落 `settings.update.downloadInterrupted`：i18next 在缺键时把**键本身**
+ * 原样返回，直接显示出来就是一串开发者信息（元规则 #5）。判据是 `t(key) !== key`。
+ *
+ * `detail` 刻意**不进正文**：它是给日志/支持收据用的诊断数据（路径、期望/实际摘要），
+ * 贴进界面就是开发者信息外露。形参保留是为了让调用点看得见「它被有意丢掉了」。
+ */
+export function appUpdateErrText(
+  rawCode: string | null | undefined,
+  _detail: string | null | undefined,
+  t: (k: string) => string,
+): string {
+  const code = rawCode === 'HTTP_BACKEND_UNAVAILABLE' ? 'backendUnavailable' : rawCode;
+  const body = code ? t(`settings.update.err.${code}`) : '';
+  return body && body !== `settings.update.err.${code}`
+    ? body
+    : t('settings.update.downloadInterrupted');
+}
+
 /** 更新卡里由 `update:progress` 推动的三个态（`SettingsUpdate` 那个 7 态机的子集）。 */
 export type ProgressDrivenState = 'downloading' | 'downloaded' | 'error';
 

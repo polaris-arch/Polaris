@@ -30,10 +30,12 @@
  *  G1 **码集双向精确相等**：Rust `mod code` 的常量集 = 映射表键集。
  *     正向抓「新增码没配键」，反向抓「码删了/改名了，前端表里留着死项」。
  *  G2 **键在五语种都有真译文**：映射表的每个 value 在五份 locale 里都必须是非空字符串。
- *  G3 **接线**（双向）：正向——`App.tsx` 里被 `errorCode === '…'` 路由的码，必须全在映射表里；
- *     反向——[`MUST_BE_ROUTED_IN_APP`] 点名的码必须在 `App.tsx` 里真有分腿（没有分腿 = 落到
- *     函数末尾的「其余码：忽略」被静默丢弃，后端半条链齐备而用户一个字看不到）；
- *     且七处 toast 文案确实走 `proxyErrorText(`，不是又在组件里手写一套。
+ *  G3 **接线**（三向）：正向——`domain/proxy-error-routing.ts` 里被 `errorCode === '…'` 路由的码，
+ *     必须全在映射表里；反向——[`MUST_BE_ROUTED`] 点名的码必须真有分腿（没有分腿 = 落到函数末尾的
+ *     「其余码：忽略」被静默丢弃，后端半条链齐备而用户一个字看不到）；第三向——**两个入口
+ *     （桌面 `App.tsx` / 移动 `mobile/app-wiring.ts`）都得真的把 `onError` 交给它**，
+ *     否则那一端的全部分腿都只是纸面判定。且六处 toast 文案确实走 `proxyErrorText(`，
+ *     不是又在组件里手写一套。
  *  G4 **raw 零容忍**：解析器不得读取 `message`；全仓不得让 raw message 压过 i18n。
  *
  * 另有行为断言锁定「已知码 → locale，未知/缺码 → 通用 locale」，并确认 raw `message`
@@ -41,7 +43,7 @@
  *
  * # 读不到就抛，不跳过
  *
- * 所有解析（`mod code` 段、App.tsx 分腿、locale 文件、源码清单）解析不到一律 `throw`。
+ * 所有解析（`mod code` 段、路由模块分腿、locale 文件、源码清单）解析不到一律 `throw`。
  * 「扫到 0 条于是 0 个断言全绿」是假门 —— 那样 Rust 模块一改名，门就静默消失，
  * 「没检查」与「检查通过」的输出不可区分。
  *
@@ -58,6 +60,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -77,7 +80,18 @@ const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.met
 // B0 换锚例外：钉 façade 是判据本体（`pub mod code { … }` 按 A.5 硬约束永不外移），故意保留单文件
 // 读取，不随 Rust 侧 35 条改宽锚。
 const RUST_PROXY = read('../../../src-tauri/src/runtime/proxy.rs');
+/**
+ * 🔴 **判据面跟着源码走**（2026-09-06）：分腿路由本体从 `App.tsx` 整段迁到了
+ * `domain/proxy-error-routing.ts`（两个入口共用一份，见该文件头注）。本门此前读的是 `App.tsx`，
+ * 迁移当天它会一条分腿都解析不到 ⇒ G0 自检当场抛「分腿写法变了」。判据改钉新位置，
+ * 同时**新增**下面 G3 那条「两个入口都真的接着它」——一个被抽出来却没人调的纯函数，
+ * 逐码断言再全绿也没有任何生产意义（`抽函数会造出新的缝`）。
+ */
+const ROUTING_TS = read('../domain/proxy-error-routing.ts');
+/** 桌面入口。只用于「订阅真的把事件交给了路由函数」这条接线断言，不再承载逐码分腿。 */
 const APP_TSX = read('../App.tsx');
+/** 移动入口的同一条接线（`mobile/app-wiring.ts`）。两端缺任何一侧，那一端就是静默丢弃。 */
+const MOBILE_WIRING_TS = read('../mobile/app-wiring.ts');
 
 // ════════════════════════════════════════════════════════════════════════════
 // 解析器（任何一处解析不到都抛）
@@ -117,12 +131,13 @@ function rustErrorCodes(): string[] {
   return codes;
 }
 
-/** `App.tsx` 里被 `data.errorCode === 'X'` 路由的码。 */
-function routedCodesInApp(): string[] {
-  const codes = [...APP_TSX.matchAll(/data\.errorCode === '([A-Z_0-9]+)'/g)].map((m) => m[1]);
+/** 路由模块里被 `data.errorCode === 'X'` 路由的码。 */
+function routedCodes(): string[] {
+  const codes = [...ROUTING_TS.matchAll(/data\.errorCode === '([A-Z_0-9]+)'/g)].map((m) => m[1]);
   if (codes.length === 0) {
     throw new Error(
-      'App.tsx 里一条 `data.errorCode === \'…\'` 分腿都没解析到 —— 分腿写法变了，本门已失去判据'
+      'domain/proxy-error-routing.ts 里一条 `data.errorCode === \'…\'` 分腿都没解析到 —— ' +
+        '分腿写法变了，本门已失去判据'
     );
   }
   return codes;
@@ -152,7 +167,10 @@ function collectSources(): string[] {
       if (e === 'node_modules' || e === 'dist') continue;
       const full = join(dir, e);
       if (statSync(full).isDirectory()) walk(full);
-      else if (/\.tsx?$/.test(e) && !/\.(test|spec)\.tsx?$/.test(e)) acc.push(full);
+      // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+      // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+      // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+      else if (/\.tsx?$/.test(e) && !IS_TEST_ONLY_MODULE.test(e)) acc.push(full);
     }
   };
   walk(SRC_DIR);
@@ -172,7 +190,7 @@ describe('G0 自检：语料与解析都非空', () => {
     for (const l of SUPPORTED_LANGUAGES) {
       expect(Object.keys(LOCALES[l]).length, `${l} 的语料为空`).toBeGreaterThan(100);
     }
-    expect(routedCodesInApp().length, 'App.tsx 分腿一条都没解析到').toBeGreaterThanOrEqual(6);
+    expect(routedCodes().length, '路由模块的分腿一条都没解析到').toBeGreaterThanOrEqual(6);
   });
 });
 
@@ -240,7 +258,7 @@ describe('G2 映射表指向的键在五份 locale 里都有真译文', () => {
  * 末尾的「其余码：忽略」被静默丢弃。后端那半条链（落状态 + 发事件 + Rust 单测锁死）全绿，
  * 用户端一个字都看不到 —— 这一侧此前没有任何门。
  */
-const MUST_BE_ROUTED_IN_APP = [
+const MUST_BE_ROUTED = [
   // 自动换节点落空（可用节点都要整核重启才能切过去）：整件事全程在后台发生、用户完全无感。
   // 不上屏 = 用户只知道「网怎么突然不通了」，不知道自己其实可以手动换个节点或重启代理。
   'AUTO_SWITCH_NEEDS_RESTART',
@@ -248,30 +266,57 @@ const MUST_BE_ROUTED_IN_APP = [
   'NETWORK_PROFILE_RULES_PRUNED',
 ] as const;
 
-describe('G3 接线：App.tsx 的分腿与映射表对得上，且文案真的走解析器', () => {
+describe('G3 接线：分腿与映射表对得上、两个入口都接着它、文案真的走解析器', () => {
   it('每个被路由的码都在映射表里', () => {
-    const unmapped = [...new Set(routedCodesInApp())].filter(
+    const unmapped = [...new Set(routedCodes())].filter(
       (c) => !Object.prototype.hasOwnProperty.call(PROXY_ERROR_TEXT_KEY, c)
     );
     expect(
       unmapped,
-      'App.tsx 路由了未配 i18n 键的错误码'
+      '路由模块里出现了未配 i18n 键的错误码'
     ).toEqual([]);
   });
 
   it('点名必须路由的码确实有分腿（反向：抓「后端发了、前端静默丢弃」）', () => {
-    // 变异实测（真跑过）：把 App.tsx 里 `data.errorCode === 'AUTO_SWITCH_NEEDS_RESTART'`
+    // 变异实测（真跑过）：把路由模块里 `data.errorCode === 'AUTO_SWITCH_NEEDS_RESTART'`
     // 那条分腿整段删掉 ⇒ 本条转红（而 G1/G2 与 tsc 全都照绿 —— 那正是这条门存在的理由）。
-    const routed = new Set(routedCodesInApp());
-    const unrouted = MUST_BE_ROUTED_IN_APP.filter((c) => !routed.has(c));
+    const routed = new Set(routedCodes());
+    const unrouted = MUST_BE_ROUTED.filter((c) => !routed.has(c));
     expect(
       unrouted,
-      'App.tsx 缺少这些码的分腿 —— 后端已发码、映射表也配了键，前端却落到「其余码：忽略」被静默丢弃'
+      '路由模块缺少这些码的分腿 —— 后端已发码、映射表也配了键，前端却落到「其余码：忽略」被静默丢弃'
     ).toEqual([]);
   });
 
+  /**
+   * 第三向：**抽出来的纯函数必须真的在两个入口上被调**。
+   *
+   * 上面两条即使全绿，也只证明「这张表写对了」；把任一入口的 `api.proxy.onError(...)` 订阅整条删掉，
+   * 它们一个字都不会变 —— 那正是「抽函数会造出新的缝」的形状，而这条缝的两侧现在是两个平台。
+   *
+   * 判据按**订阅体**取，不按「文件里出现过这个名字」：后者会被一行 `import` 或一句注释喂饱。
+   * 切片从 `api.proxy.onError(` 起、到最近的 `)` 收尾之后 60 字符封顶（回调体本身只有一行）。
+   */
+  it('两个入口都把 onError 交给了同一个路由函数（桌面 + 移动，缺一端即那端静默丢弃）', () => {
+    const wiredIn = (source: string): boolean => {
+      const stripped = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+      const at = stripped.indexOf('api.proxy.onError(');
+      if (at < 0) return false;
+      return stripped.slice(at, at + 300).includes('handleProxyErrorEvent(');
+    };
+    // 自检：谓词分得清「订阅体里真的调了」与「只是文件里提过这个名字」。
+    expect(wiredIn("api.proxy.onError((d) => handleProxyErrorEvent(d, deps));")).toBe(true);
+    expect(wiredIn("import { handleProxyErrorEvent } from 'x';\napi.proxy.onError(() => {});")).toBe(
+      false
+    );
+    expect(wiredIn('/* api.proxy.onError((d) => handleProxyErrorEvent(d)) */')).toBe(false);
+
+    expect(wiredIn(APP_TSX), '桌面入口没有把 proxyError 交给路由函数').toBe(true);
+    expect(wiredIn(MOBILE_WIRING_TS), '移动入口没有把 proxyError 交给路由函数').toBe(true);
+  });
+
   it('六处 toast 文案都走 `proxyErrorText(`，不在组件里另写一套', () => {
-    const stripped = APP_TSX.replace(/^\s*(\/\/|\*|\/\*).*$/gm, ''); // 注释里逐字写着反例
+    const stripped = ROUTING_TS.replace(/^\s*(\/\/|\*|\/\*).*$/gm, ''); // 注释里逐字写着反例
     const calls = [...stripped.matchAll(/proxyErrorText\(data, t\)/g)].length;
     expect(calls, 'handleProxyErrorEvent 的 toast 文案没有全部走解析器').toBeGreaterThanOrEqual(6);
   });

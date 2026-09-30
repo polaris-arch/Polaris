@@ -1,128 +1,287 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+
+use super::*;
 use crate::commands::guard_scan::top_level_fn_body;
-use crate::test_support::crate_code;
+use crate::test_support::{crate_code, crate_root_code};
 
-/// Q1-b ④：正常退出收尾在 `ExitRequested` 里的**落点**必须晚于轻量模式早退；统一汇流点内，
-/// 标记必须先于阻塞停核。行为断言够不着（要一个跑起来的 Tauri 事件循环），而挪错任何一边
-/// 都是静默的正确性缺陷：
-///
-/// - 挪到 C16 `prevent_exit` 早退**之前** ⇒ 轻量模式销毁主窗（**进程没退**）也落标记 ⇒
-///   用户唤出、webview 重建后，暂存的编辑被当成「上次退出过」清掉。
-/// - 挪到 `run_exit_cleanup` **之后** ⇒ 那里面是**阻塞**停核（`block_on(proxy.stop())`），
-///   卡住 / panic 都会让标记落不下去 ⇒ 每次正常退出都被下次启动当成强杀。
-///
-/// **变异锁**：把 bootstrap 的 `run_real_exit_once` 调用挪到 `api.prevent_exit();` 之前、删掉最终
-/// `RunEvent::Exit` 兜底里的 subscription shutdown / 真实退出汇流点，或在汇流点内把 mark 挪到
-/// cleanup 之后 ⇒ 转红。
-#[test]
-fn clean_exit_marker_is_written_only_on_the_real_exit_leg() {
-    let main = top_level_fn_body(&crate_code("main.rs"), "fn main() {");
-    let prevent = main
-        .find("api.prevent_exit();")
-        .expect("锚点消失：C16 轻量模式的 prevent_exit 早退，守卫已失去判据");
-    let finish = main
-        .find("exit_lifecycle::run_real_exit_once(app_handle);")
-        .expect("锚点消失：ExitRequested 的真实退出收尾，C1/Q1-b ④ 已无人守");
-    assert!(
-        prevent < finish,
-        "真实退出收尾落在了 C16 prevent_exit 早退之前：轻量模式会错误停核并清掉暂存编辑"
-    );
-    let exit_requested_start = main
-        .find("tauri::RunEvent::ExitRequested { api, .. } => {")
-        .expect("ExitRequested block disappeared: real-exit ordering has no source guard");
-    let final_exit_start = main
-        .find("tauri::RunEvent::Exit => {")
-        .expect("最终 RunEvent::Exit block 消失：macOS 原生终止可跳过 ExitRequested");
-    let exit_requested = &main[exit_requested_start..final_exit_start];
-    let final_exit_tail = &main[final_exit_start..];
-    let final_exit_end = final_exit_tail
-        .find("\n        _ => {}")
-        .expect("最终 RunEvent::Exit block 边界消失，源码守卫需随 match 结构同步更新");
-    let final_exit = &final_exit_tail[..final_exit_end];
-    for (name, exit_leg) in [("ExitRequested", exit_requested), ("最终 Exit", final_exit)] {
-        let create_begin = exit_leg
-            .find("runtime.subscription_create().shutdown_begin();")
-            .expect("真实退出必须先关闭 subscription create 的 precommit gate");
-        let parser_shutdown = exit_leg
-            .find("runtime.subscription_parse().shutdown();")
-            .expect("真实退出必须清空 subscription parse 队列");
-        let create_wait = exit_leg
-            .find("runtime.subscription_create().shutdown_wait();")
-            .expect("真实退出必须等待已启动的 subscription create worker");
-        assert!(
-            create_begin < parser_shutdown && parser_shutdown < create_wait,
-            "{name} 必须按 create gate/cancel → parser queue clear → create worker wait 的线性顺序退出"
-        );
-    }
-    let final_finish = final_exit
-        .find("exit_lifecycle::run_real_exit_once(app_handle);")
-        .expect("最终 RunEvent::Exit 真实退出兜底消失：系统代理会残留死端口");
-    let final_wait = final_exit
-        .find("runtime.subscription_create().shutdown_wait();")
-        .expect("最终 Exit 未等待订阅创建：commit 可能被进程退出截断");
-    assert!(
-        final_wait < final_finish,
-        "最终 Exit 必须先完成 create worker 收口，再落 clean marker 并停核"
-    );
-    assert_eq!(
-        main.matches("exit_lifecycle::run_real_exit_once(app_handle);")
-            .count(),
-        2,
-        "真实退出汇流点只能位于 ExitRequested 的非轻量腿与最终 Exit 兜底"
-    );
-
-    let finish = top_level_fn_body(
-        &crate_code("exit_lifecycle.rs"),
-        "pub(crate) fn run_real_exit_once(",
-    );
-    let once = finish
-        .find(".swap(true, Ordering::SeqCst)")
-        .expect("一次性门消失：ExitRequested + Exit 会重复执行退出收尾");
-    let mark = finish
-        .find("mark_clean_exit(app);")
-        .expect("锚点消失：正常退出标记的落点，Q1-b ④ 已无人守");
-    let cleanup = finish
-        .find("run_exit_cleanup(app);")
-        .expect("锚点消失：退出清理调用点，C1 已无人守");
-    assert!(once < mark, "一次性门必须先于任何有副作用的退出收尾");
-    assert!(
-        mark < cleanup,
-        "正常退出标记落在阻塞停核之后：每次正常退出都会被下次启动当成强杀"
-    );
+struct FakePorts {
+    admission_closed: [AtomicBool; 4],
+    custody: [AtomicUsize; 4],
+    results: StdMutex<[Result<(), String>; 4]>,
+    pending: AtomicBool,
+    trace: StdMutex<Vec<&'static str>>,
 }
 
-/// Q1-b ④：`app:restart` 这条腿**不落**正常退出标记。判定腿（「bit 为真就不落、为假照落」）由
-/// `clean_exit` 的真跑 FS 单测钉住；本条只钉接线：`app_restart` 确实在 `request_restart()` 前置位，
-/// 且退出 owner 确实消费那个 bit 并委托给唯一的判定函数。
-///
-/// 没有本条，接线断了两侧都不会红：`app_restart` 不置位 ⇒ 判定腿恒收到 `false`（照落标记），
-/// 而它自己的单测传的是自己造的 bit。
+impl FakePorts {
+    fn new() -> Self {
+        Self {
+            admission_closed: std::array::from_fn(|_| AtomicBool::new(false)),
+            custody: std::array::from_fn(|_| AtomicUsize::new(1)),
+            results: StdMutex::new(std::array::from_fn(|_| Ok(()))),
+            pending: AtomicBool::new(false),
+            trace: StdMutex::new(Vec::new()),
+        }
+    }
+
+    fn fence(&self, index: usize, event: &'static str) -> Result<(), String> {
+        self.admission_closed[index].store(true, Ordering::SeqCst);
+        self.trace.lock().unwrap().push(event);
+        Ok(())
+    }
+
+    async fn drain(&self, index: usize, event: &'static str) -> Result<(), String> {
+        assert!(self
+            .admission_closed
+            .iter()
+            .all(|a| a.load(Ordering::SeqCst)));
+        self.trace.lock().unwrap().push(event);
+        if self.pending.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let result = self.results.lock().unwrap()[index].clone();
+        if result.is_ok() {
+            self.custody[index].store(0, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl ExitPorts for FakePorts {
+    fn identity(&self) -> RuntimeIdentity {
+        [1, 2]
+    }
+
+    fn fence_main(&self) -> Result<(), String> {
+        self.fence(0, "main-fence")
+    }
+
+    fn fence_login(&self) -> Result<(), String> {
+        self.fence(1, "login-fence")
+    }
+
+    fn fence_temp(&self) -> Result<(), String> {
+        self.fence(2, "temp-fence")
+    }
+
+    fn fence_check(&self) -> Result<(), String> {
+        self.fence(3, "check-fence")
+    }
+
+    async fn drain_check(&self) -> Result<(), String> {
+        self.drain(3, "check-drain").await
+    }
+
+    async fn drain_main(&self) -> Result<(), String> {
+        self.drain(0, "main-drain").await
+    }
+
+    async fn drain_login(&self) -> Result<(), String> {
+        self.drain(1, "login-drain").await
+    }
+
+    async fn drain_temp(&self) -> Result<(), String> {
+        self.drain(2, "temp-drain").await
+    }
+}
+
+#[tokio::test]
+async fn every_admission_is_fenced_before_any_drain_and_prepare_has_no_commit_effects() {
+    let state = ExitCleanupState::default();
+    let ports = FakePorts::new();
+    let ready = state.prepare(&ports, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(
+        &ports.trace.lock().unwrap()[..4],
+        &["main-fence", "login-fence", "temp-fence", "check-fence"]
+    );
+    assert!(!state.committed.load(Ordering::SeqCst));
+    assert!(ports.custody.iter().all(|c| c.load(Ordering::SeqCst) == 0));
+    drop(ready);
+    assert!(!state.committed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn any_unknown_or_error_preserves_custody_and_allows_a_later_successful_retry() {
+    for failed_owner in 0..4 {
+        let state = ExitCleanupState::default();
+        let ports = FakePorts::new();
+        ports.results.lock().unwrap()[failed_owner] = Err("same birth close unknown".into());
+        let effects = AtomicUsize::new(0);
+        assert!(state.prepare(&ports, Duration::from_secs(1)).await.is_err());
+        assert_eq!(ports.custody[failed_owner].load(Ordering::SeqCst), 1);
+        assert!(!state.committed.load(Ordering::SeqCst));
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        ports.results.lock().unwrap()[failed_owner] = Ok(());
+        let ready = state.prepare(&ports, Duration::from_secs(1)).await.unwrap();
+        ready
+            .commit(ports.identity(), || {
+                effects.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert_eq!(ports.custody[failed_owner].load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_or_timeout_never_produces_ready_or_retires_custody() {
+    let state = ExitCleanupState::default();
+    let ports = FakePorts::new();
+    ports.pending.store(true, Ordering::SeqCst);
+    let error = state
+        .prepare(&ports, Duration::from_millis(50))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("超时"));
+    assert!(ports.custody.iter().all(|c| c.load(Ordering::SeqCst) == 1));
+    assert!(!state.committed.load(Ordering::SeqCst));
+    ports.pending.store(false, Ordering::SeqCst);
+    assert!(state.prepare(&ports, Duration::from_secs(1)).await.is_ok());
+}
+
+#[tokio::test]
+async fn detached_spawn_failure_keeps_ready_and_admissions_closed_for_retry() {
+    let state = ExitCleanupState::default();
+    let ports = FakePorts::new();
+    let ready = state.prepare(&ports, Duration::from_secs(1)).await.unwrap();
+    let drains = ports.trace.lock().unwrap().len();
+    // The detached script failed before commit; dropping its held Ready is the production path.
+    drop(ready);
+    assert!(!state.committed.load(Ordering::SeqCst));
+    assert!(ports
+        .admission_closed
+        .iter()
+        .all(|a| a.load(Ordering::SeqCst)));
+    let retry = state.prepare(&ports, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(ports.trace.lock().unwrap().len(), drains + 4);
+    retry.commit(ports.identity(), || {}).unwrap();
+    assert!(state.committed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn runtime_bound_ready_rejects_another_runtime_without_commit_effects() {
+    let state = ExitCleanupState::default();
+    let ports = FakePorts::new();
+    let ready = state.prepare(&ports, Duration::from_secs(1)).await.unwrap();
+    let effects = AtomicUsize::new(0);
+    assert!(ready
+        .commit([7, 8], || {
+            effects.fetch_add(1, Ordering::SeqCst);
+        })
+        .is_err());
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert!(!state.committed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn concurrent_exit_requests_commit_once_and_cannot_spawn_two_installers() {
+    let state = ExitCleanupState::default();
+    let ports = FakePorts::new();
+    let effects = AtomicUsize::new(0);
+    let request = || async {
+        let ready = state.prepare(&ports, Duration::from_secs(1)).await?;
+        // Actual exit / restart / detached spawn effects must occur while this Ready owns the lock.
+        ready.commit(ports.identity(), || {
+            effects.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let (first, second) = tokio::join!(request(), request());
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+}
+
 #[test]
-fn restart_leg_is_wired_to_skip_the_clean_exit_marker() {
+fn exit_requested_preserves_c16_then_vetoes_unprepared_exit_without_business_shutdown() {
+    let main = top_level_fn_body(&crate_root_code(), "pub fn run() {");
+    let start = main
+        .find("tauri::RunEvent::ExitRequested { api, .. } => {")
+        .unwrap();
+    let end = main.find("tauri::RunEvent::Exit => {").unwrap();
+    let leg = &main[start..end];
+    let c16 = leg
+        .find("ExitRequestedAction::PreserveLightweight")
+        .unwrap();
+    let c16_return = leg.find("return;").unwrap();
+    let committed = leg
+        .find("!exit_lifecycle::exit_is_committed(app_handle)")
+        .unwrap();
+    let veto = leg[committed..].find("api.prevent_exit();").unwrap() + committed;
+    let prepare = leg.find("exit_lifecycle::queue_quit(app_handle);").unwrap();
+    assert!(c16 < c16_return && c16_return < committed && committed < veto && veto < prepare);
+    assert!(!leg.contains("shutdown_begin") && !leg.contains("mark_clean_exit"));
+    assert!(main[end..].contains("exit_lifecycle::final_exit_best_effort(app_handle);"));
+}
+
+#[test]
+fn only_ready_commit_owns_irreversible_shutdown_marker_and_restart_request() {
+    let source = crate_code("exit_lifecycle.rs");
+    let prepare = top_level_fn_body(&source, "pub(crate) async fn prepare_desktop_exit(");
+    assert!(!prepare.contains("mark_clean_exit") && !prepare.contains("shutdown_begin"));
+    let commit = top_level_fn_body(&source, "pub(crate) fn commit_desktop_exit(");
+    let ready = commit.find("ready.commit(identity, || {").unwrap();
+    let begin = commit
+        .find("subscription_create().shutdown_begin()")
+        .unwrap();
+    let parser = commit.find("subscription_parse().shutdown()").unwrap();
+    let wait = commit
+        .find("subscription_create().shutdown_wait()")
+        .unwrap();
+    let mark = commit.find("mark_clean_exit(app);").unwrap();
+    let restart = commit.find("app.request_restart()").unwrap();
+    assert!(ready < begin && begin < parser && parser < wait && wait < mark && mark < restart);
+    assert!(commit.find("RestartState").unwrap() < mark);
+    let mark = top_level_fn_body(&source, "fn mark_clean_exit(");
+    assert!(mark.contains("RestartState") && mark.contains("mark_unless_restarting"));
+}
+
+#[test]
+fn restart_and_all_quit_entrypoints_consume_the_shared_prepare_gate() {
     let restart = top_level_fn_body(
         &crate_code("commands/window.rs"),
-        "pub fn app_restart(app: AppHandle) -> ApiResponse<()> {",
+        "pub async fn app_restart(",
     );
-    let set = restart
-        .find("RestartState")
-        .expect("app_restart 不再置 RestartState：重启会被当成真实退出，回来后暂存的编辑被清掉");
-    let restart_call = restart
-        .find("app.request_restart();")
-        .expect("锚点消失：request_restart() 调用点，守卫已失去判据");
     assert!(
-        set < restart_call,
-        "RestartState 置位落在 request_restart() 之后，等于没置"
+        restart.find("prepare_desktop_exit(&app).await").unwrap()
+            < restart.find("commit_desktop_exit(").unwrap()
     );
-
-    let exit_leg = top_level_fn_body(
+    assert!(restart.contains("ExitKind::Restart"));
+    let request = top_level_fn_body(
         &crate_code("exit_lifecycle.rs"),
-        "fn mark_clean_exit(app: &tauri::AppHandle) {",
+        "pub(crate) async fn request_quit(",
     );
     assert!(
-        exit_leg.contains("RestartState"),
-        "退出腿不再读 RestartState：app:restart 会照落标记"
+        request.find("prepare_desktop_exit(app).await?").unwrap()
+            < request
+                .find("commit_desktop_exit(app, ready, ExitKind::Quit)")
+                .unwrap()
     );
+    let tray = top_level_fn_body(&crate_code("tray/commands.rs"), "pub async fn tray_quit(");
+    assert!(tray.contains("request_quit(&app).await") && !tray.contains("app.exit("));
+    let menu = top_level_fn_body(&crate_code("app_tray.rs"), "pub(crate) fn run_menu_action(");
     assert!(
-        exit_leg.contains("mark_unless_restarting"),
-        "退出腿绕开 mark_unless_restarting：重启腿的豁免被丢失"
+        menu.contains("MenuAction::Quit => crate::exit_lifecycle::queue_quit(app)")
+            && !menu.contains("app.exit(")
     );
+    assert!(!crate_root_code().contains("app_handle.exit(0)"));
+}
+
+#[test]
+fn updater_must_prepare_before_detached_spawn_with_no_running_shortcut() {
+    let body = top_level_fn_body(
+        &crate_code("commands/updater/app_update.rs"),
+        "pub async fn update_install(",
+    );
+    let android = body
+        .find("if plan.platform == update_install::InstallPlatform::Android")
+        .unwrap();
+    let prepare = body.find("prepare_desktop_exit(&app).await").unwrap();
+    let spawn = body
+        .find("update_install::spawn_detached_script(&dir, &spec)")
+        .unwrap();
+    let commit = body.find("commit_desktop_exit(").unwrap();
+    assert!(android < prepare && prepare < spawn && spawn < commit);
+    assert!(!body.contains("proxy.status().running") && !body.contains("proxy.stop().await"));
+    assert!(body[prepare..spawn].contains("return Ok(ApiResponse::err("));
 }

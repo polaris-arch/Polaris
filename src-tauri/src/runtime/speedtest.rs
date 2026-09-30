@@ -49,6 +49,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(not(target_os = "android"))]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    LazyLock,
+};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -62,13 +67,15 @@ use polaris_config_engine::builder::outbounds::build_shadow_tls_outbound;
 use polaris_config_engine::builder::system_interfaces::{
     raw_endpoint_requests_system_interface, system_interface_ownership_error,
 };
+#[cfg(any(target_os = "android", test))]
+use polaris_config_engine::singbox::inbound::InboundUser;
 use polaris_config_engine::singbox::DomainResolver;
 use polaris_config_engine::user_config::protocol_settings::tailcat_emit_check;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
 use polaris_core_supervisor::{
     core_startup_estimate_ms, wait_for_core_ready, CoreReadyDeps, CoreReadyOutcome, PortAllocator,
-    PortExclusions, Signal, SpawnRequest, StdioPolicy, WaitForCoreReadyOptions,
+    PortExclusions, SpawnError, SpawnRequest, StdioPolicy, WaitForCoreReadyOptions,
     CORE_READY_SAFETY_FACTOR, CORE_STARTUP_BASELINE_FIXED_MS, CORE_STARTUP_PER_NAIVE_MS,
     CORE_STARTUP_PER_NODE_US,
 };
@@ -78,13 +85,51 @@ use crate::events::channel::{
 };
 use crate::logging::SPEEDTEST_CORE_TARGET;
 use crate::runtime::proxy::core_log::pipe_to_log;
-use crate::runtime::proxy::{pid_alive, send_signal, CoreBuildEnv};
+#[cfg(target_os = "android")]
+use crate::runtime::proxy::send_signal;
+use crate::runtime::proxy::{pid_alive, CoreBuildEnv};
+#[cfg(target_os = "android")]
+use polaris_core_supervisor::Signal;
 // 瞬态核的进程原语**复用** `tailscale_login_core` 已建好的那一套（spawn → 装箱 child → SIGTERM/宽限/
 // SIGKILL/reap）。名字带 "Login" 是历史包袱，语义是「瞬态 sing-box 子进程」，与本腿逐字相同；再写一套
 // 进程管理只会多一份要各自维护的收割纪律（而收割写漏的表现是孤儿核，静默且持久）。
 use crate::runtime::tailscale_login_core::{
-    ConfigChecker, LoginCoreChild, LoginCoreSpawner, SingBoxConfigChecker, TokioLoginCoreSpawner,
+    ConfigCheckFailure, ConfigChecker, LoginCoreChild, LoginCoreSpawner, SingBoxConfigChecker,
+    TokioLoginCoreSpawner,
 };
+
+#[cfg(target_os = "android")]
+mod android;
+
+/// Only an acknowledged native close permits the next Android batch. The
+/// marker travels inside the existing SpawnError source so the desktop
+/// process-spawner contract stays unchanged.
+#[derive(Debug)]
+struct TempCoreCleanupUnknown(String);
+
+impl std::fmt::Display for TempCoreCleanupUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TempCoreCleanupUnknown {}
+
+fn spawn_cleanup_unknown(error: &SpawnError) -> Option<String> {
+    match error {
+        SpawnError::Spawn { source, .. } => {
+            let error = source.get_ref()?;
+            error
+                .downcast_ref::<TempCoreCleanupUnknown>()
+                .map(|unknown| unknown.0.clone())
+                .or_else(|| {
+                    error
+                        .downcast_ref::<polaris_core_supervisor::ValidationLifecycleError>()
+                        .map(ToString::to_string)
+                })
+        }
+    }
+}
 
 /// 临时核可测节点的**滑动窗口**上限（对齐 上游 `SpeedTestService.PROXY_TEST_CONCURRENCY = 16`，`:90`）。
 ///
@@ -625,7 +670,8 @@ const TEMP_CORE_CONFIG_NAME: &str = "speedtest-core.json";
 /// 留档也就没留住。
 const TEMP_CORE_LAST_CONFIG_NAME: &str = "speedtest-core.last.json";
 
-/// **在飞临时核 pid 表** —— 应用退出清理的唯一真值源。
+/// **在飞临时核 PID 排除表**。Desktop custody owns the exact Child and shutdown rights;
+/// this numeric projection only protects it from the generic stale-core sweep.
 ///
 /// # 为什么光有 child 的 `Drop` 守卫不够
 ///
@@ -636,7 +682,8 @@ const TEMP_CORE_LAST_CONFIG_NAME: &str = "speedtest-core.last.json";
 /// `scan_running_cores` 恒返空（`core-supervisor/src/stale_core.rs`：`tasklist` 不输出命令行，无从
 /// 施加「只杀本 app 起的核」判据）⇒ **Windows 孤儿永不被清**。
 ///
-/// 故在此登记 pid，由 `exit_lifecycle::run_exit_cleanup` 经 [`kill_inflight_temp_cores`] 收口。
+/// PC shutdown requests its retained birth and waits for native close. Android keeps its
+/// existing shutdown path; PID snapshots alone supply no cleanup receipt on either platform.
 static INFLIGHT_TEMP_CORES: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 
 /// 取 pid 表锁（临界区极短、绝不跨 await；中毒仍恢复内层，不为一条清理路径 panic 掉退出流程）。
@@ -710,20 +757,20 @@ pub(crate) fn registry_guard() -> MutexGuard<'static, ()> {
 
 /// 排空 pid 表（**不发任何信号**）。退出清理与单测共用同一个真值源 —— 单测只走本函数即可观测
 /// 注册/注销，绝不对真实进程发信号（本仓禁在单测里碰宿主进程/网络）。
+#[cfg(target_os = "android")]
 fn take_inflight_temp_core_pids() -> Vec<u32> {
     std::mem::take(&mut *temp_core_pids()).into_iter().collect()
 }
 
-/// **应用退出清理**：SIGKILL 掉全部在飞临时核，返回实际发信号条数（0 = 退出时没有测速在飞）。
-///
-/// 直接 SIGKILL 不走 SIGTERM 宽限：退出路径不能再等一个 5s 宽限窗；临时核无状态（配置随后即删、
-/// 不写主核任何生命周期槽），强杀无副作用。
+/// Android's existing immediate shutdown signal path. The count is signal requests.
+#[cfg(target_os = "android")]
 pub fn kill_inflight_temp_cores() -> usize {
     kill_temp_cores_with(|pid| send_signal(pid, Signal::Sigkill))
 }
 
 /// [`kill_inflight_temp_cores`] 的可注入内核（**收割动作是唯一注入点**）：单测传记录闭包驱动整条
 /// 「排空 → 逐 pid 收割 → 计数」逻辑，**不对任何真实进程发信号**（本仓禁在单测里碰宿主进程）。
+#[cfg(target_os = "android")]
 fn kill_temp_cores_with(mut kill: impl FnMut(u32)) -> usize {
     let pids = take_inflight_temp_core_pids();
     for pid in &pids {
@@ -733,8 +780,8 @@ fn kill_temp_cores_with(mut kill: impl FnMut(u32)) -> usize {
     pids.len()
 }
 
-/// pid 登记 RAII 守卫：`drive_after_spawn` 的每一条 return / panic 展开 / future 被丢弃都会注销，
-/// 故表里只会留下**此刻真在飞**的 pid（退出清理据此发信号，pid 复用误杀窗口被压到最小）。
+/// PID exclusion token. Desktop keeps it in persistent birth custody until native close;
+/// an abandoned foreground future cannot unregister a child whose exit remains unknown.
 ///
 /// `pub(crate)`：`proxy` 的孤儿清扫排除表行为门也用它来构造「临时核正在飞」这个状态。**测试必须走
 /// 本守卫而不是手写 `insert`/`remove` 一对**——手写的那对在断言之间，任一断言先失败就把 pid 永久
@@ -755,6 +802,194 @@ impl Drop for TempCorePidGuard {
     fn drop(&mut self) {
         temp_core_pids().remove(&self.0);
     }
+}
+
+/// One desktop temporary core owns the fixed config path until this exact Child is reaped.
+/// Foreground cancellation only drops a borrow; the production singleton retains custody.
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct PcTempCoreCustody {
+    admission: tokio::sync::Mutex<()>,
+    birth: Mutex<Option<Arc<PcTempCoreBirth>>>,
+    closing: AtomicBool,
+}
+
+#[cfg(not(target_os = "android"))]
+struct PcTempCoreBirth {
+    child: tokio::sync::Mutex<Box<dyn LoginCoreChild>>,
+    pid: Option<u32>,
+    pid_guard: Mutex<Option<TempCorePidGuard>>,
+    config_path: PathBuf,
+    keep_config: bool,
+    close_requested: tokio::sync::watch::Sender<bool>,
+    retired: AtomicBool,
+}
+
+#[cfg(not(target_os = "android"))]
+static PC_TEMP_CORE_CUSTODY: LazyLock<Arc<PcTempCoreCustody>> =
+    LazyLock::new(|| Arc::new(PcTempCoreCustody::default()));
+
+#[cfg(not(target_os = "android"))]
+impl PcTempCoreCustody {
+    fn current(&self) -> Result<Option<Arc<PcTempCoreBirth>>, String> {
+        self.birth
+            .lock()
+            .map(|birth| birth.clone())
+            .map_err(|_| "测速临时核占用状态不可用".into())
+    }
+
+    fn request_close(&self) -> usize {
+        match self.current() {
+            Ok(Some(birth)) => {
+                // A request wakes the current borrow. Neither the signal count nor a PID
+                // snapshot attests exit, and no signal is aimed at a stale numeric PID.
+                usize::from(!birth.close_requested.send_replace(true))
+            }
+            _ => 0,
+        }
+    }
+
+    async fn close_requested(&self) {
+        match self.current() {
+            Ok(Some(birth)) => {
+                let mut request = birth.close_requested.subscribe();
+                let _ = request.wait_for(|requested| *requested).await;
+            }
+            Err(_) => {}
+            Ok(None) => std::future::pending::<()>().await,
+        }
+    }
+
+    fn retain(
+        self: &Arc<Self>,
+        child: Box<dyn LoginCoreChild>,
+        config_path: PathBuf,
+        keep_config: bool,
+    ) -> PcCustodiedChild {
+        let pid = child.pid();
+        let (close_requested, _) = tokio::sync::watch::channel(false);
+        let birth = Arc::new(PcTempCoreBirth {
+            child: tokio::sync::Mutex::new(child),
+            pid,
+            pid_guard: Mutex::new(TempCorePidGuard::register(pid.unwrap_or(0))),
+            config_path,
+            keep_config,
+            close_requested,
+            retired: AtomicBool::new(false),
+        });
+        // Admission remains held from the initial empty-slot check through publication.
+        // No other path can install a successor before this synchronous assignment.
+        *self.birth.lock().unwrap_or_else(PoisonError::into_inner) = Some(birth.clone());
+        // Shutdown may have observed an empty slot immediately before spawn returned.
+        // Publish first, then compensate for that lost notification under the closing fence.
+        if self.closing.load(Ordering::SeqCst) {
+            birth.close_requested.send_replace(true);
+        }
+        PcCustodiedChild {
+            custody: self.clone(),
+            birth,
+        }
+    }
+
+    async fn retry_close(self: &Arc<Self>) -> Result<(), String> {
+        let Some(birth) = self.current()? else {
+            return Ok(());
+        };
+        PcCustodiedChild {
+            custody: self.clone(),
+            birth,
+        }
+        .close_confirmed()
+        .await
+    }
+
+    fn retire(&self, birth: &Arc<PcTempCoreBirth>) -> Result<(), String> {
+        let mut current = self.birth.lock().map_err(|_| "测速临时核占用状态不可用")?;
+        if !current
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, birth))
+        {
+            return Err("测速临时核关闭回执不属于当前实例".into());
+        }
+        // Native close already succeeded. Keep these rights in one synchronous commit so
+        // cancellation or a delayed old completion cannot delete a successor's fixed config.
+        retire_temp_config(&birth.config_path, birth.keep_config);
+        birth
+            .pid_guard
+            .lock()
+            .map_err(|_| "测速临时核进程登记不可用")?
+            .take();
+        current.take();
+        birth.retired.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+struct PcCustodiedChild {
+    custody: Arc<PcTempCoreCustody>,
+    birth: Arc<PcTempCoreBirth>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[async_trait::async_trait]
+impl LoginCoreChild for PcCustodiedChild {
+    fn pid(&self) -> Option<u32> {
+        self.birth.pid
+    }
+    async fn wait(&mut self) {
+        if let Err(error) = self.wait_result().await {
+            log::error!("{error}");
+        }
+    }
+    async fn wait_result(&mut self) -> Result<(), String> {
+        self.birth.child.lock().await.wait_result().await
+    }
+    async fn after_exit(&mut self) -> Result<(), String> {
+        self.birth.child.lock().await.after_exit().await
+    }
+    async fn terminate(&mut self) {
+        if let Err(error) = self.close_confirmed().await {
+            log::error!("{error}");
+        }
+    }
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        let mut child = self.birth.child.lock().await;
+        if self.birth.retired.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        child.close_confirmed().await?;
+        self.custody.retire(&self.birth)
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+struct PcTempConfigGuard {
+    path: PathBuf,
+    keep: bool,
+    armed: bool,
+}
+
+#[cfg(not(target_os = "android"))]
+impl Drop for PcTempConfigGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            retire_temp_config(&self.path, self.keep);
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn begin_shutdown() {
+    PC_TEMP_CORE_CUSTODY.closing.store(true, Ordering::SeqCst);
+    PC_TEMP_CORE_CUSTODY.request_close();
+}
+
+#[cfg(not(target_os = "android"))]
+pub async fn shutdown_for_exit() -> Result<(), String> {
+    begin_shutdown();
+    let _admission = PC_TEMP_CORE_CUSTODY.admission.lock().await;
+    PC_TEMP_CORE_CUSTODY.retry_close().await
 }
 
 /// 临时核**入站→出站** 1:1 绑定的一个节点（[`plan_temp_core_with_bindings`] 产出，[`build_temp_core_config`] 消费）。
@@ -877,7 +1112,14 @@ pub fn plan_temp_core_with_bindings(
     let mut out = TempCorePlan::default();
     let mut seen_tags: BTreeSet<String> = BTreeSet::new();
     for s in servers {
-        if s.protocol == Protocol::Tailscale {
+        // Custom endpoints can carry a raw tailscale type even when the typed
+        // protocol is Custom. Reject before constructing a node: constructing
+        // a second tsnet identity could initialize its state_directory.
+        let raw_tailscale = s.protocol == Protocol::Custom
+            && s.custom_settings.as_ref().is_some_and(|custom| {
+                custom.outbound.get("type").and_then(Value::as_str) == Some("tailscale")
+            });
+        if s.protocol == Protocol::Tailscale || raw_tailscale {
             out.tailscale.push(s.id.clone());
             continue;
         }
@@ -1236,6 +1478,72 @@ pub fn build_temp_core_config(nodes: &[TempNode], ports: &[u16], log_level: &str
         cfg["endpoints"] = Value::Array(endpoints);
     }
     cfg
+}
+
+/// Android never writes this round's HTTP inbound credential to `speedtest-core.json`.
+/// Both libbox check and start receive this in-memory derivative of the same
+/// generated file. It is deliberately strict: a raw custom endpoint cannot
+/// smuggle a second Tailscale state directory into the transient host.
+#[cfg(any(target_os = "android", test))]
+fn authenticated_android_temp_config(raw: &str, auth: &InboundUser) -> Result<String, String> {
+    if auth.username != "polaris-temp" || auth.password.len() < 32 {
+        return Err("Android 测速入站凭据无效".to_owned());
+    }
+    let mut config: Value =
+        serde_json::from_str(raw).map_err(|_| "Android 测速临时配置 JSON 无效".to_owned())?;
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| "Android 测速临时配置根节点无效".to_owned())?;
+    if root.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "log" | "dns" | "inbounds" | "outbounds" | "route" | "endpoints"
+        )
+    }) {
+        return Err("Android 测速临时配置包含禁止的顶层能力".to_owned());
+    }
+    for field in ["endpoints", "outbounds"] {
+        let Some(value) = root.get(field) else {
+            if field == "outbounds" {
+                return Err("Android 测速临时配置缺少出站".to_owned());
+            }
+            continue;
+        };
+        let nodes = value
+            .as_array()
+            .filter(|nodes| field != "outbounds" || !nodes.is_empty())
+            .ok_or_else(|| "Android 测速临时配置出站形态无效".to_owned())?;
+        if nodes.iter().any(|node| {
+            !node.is_object()
+                || node.get("type").and_then(Value::as_str) == Some("tailscale")
+                || raw_endpoint_requests_system_interface(node)
+        }) {
+            return Err("Android 测速临时核不允许 Tailscale 或系统网卡端点".to_owned());
+        }
+    }
+    let inbounds = root
+        .get_mut("inbounds")
+        .and_then(Value::as_array_mut)
+        .filter(|inbounds| (1..=512).contains(&inbounds.len()))
+        .ok_or_else(|| "Android 测速临时配置缺少 HTTP 入站".to_owned())?;
+    for inbound in inbounds {
+        let object = inbound
+            .as_object_mut()
+            .ok_or_else(|| "Android 测速临时配置入站形态无效".to_owned())?;
+        let valid = object.len() == 4
+            && object.get("type").and_then(Value::as_str) == Some("http")
+            && object.get("listen").and_then(Value::as_str) == Some("127.0.0.1")
+            && object.get("tag").and_then(Value::as_str).is_some()
+            && object
+                .get("listen_port")
+                .and_then(Value::as_u64)
+                .is_some_and(|port| (1..=u16::MAX as u64).contains(&port));
+        if !valid {
+            return Err("Android 测速临时配置包含非回环 HTTP 入站".to_owned());
+        }
+        object.insert("users".to_owned(), json!([auth]));
+    }
+    serde_json::to_string(&config).map_err(|_| "Android 测速临时配置序列化失败".to_owned())
 }
 
 /// **临时核让位判据**（纯逻辑；[`crate::commands::speedtest`] 的 `is_superseded` 的镜像腿）。
@@ -1874,6 +2182,8 @@ pub fn emit_speed_test_done(
 
 /// 临时核会话的注入依赖（生产 [`TempCoreDeps::production`]，测试注入 mock spawner / 假核路径）。
 pub struct TempCoreDeps {
+    #[cfg(not(target_os = "android"))]
+    pc_custody: Arc<PcTempCoreCustody>,
     /// 瞬态 sing-box spawn（复用 `tailscale_login_core` 的瞬态核进程抽象）。
     pub spawner: Arc<dyn LoginCoreSpawner>,
     /// spawn 前的 `sing-box check`（fail-fast，复用瞬态登录核那条已建好的抽象）。
@@ -1909,6 +2219,8 @@ impl TempCoreDeps {
     #[must_use]
     pub fn production(config_dir: PathBuf, exclusions: PortExclusions, log_level: String) -> Self {
         Self {
+            #[cfg(not(target_os = "android"))]
+            pc_custody: PC_TEMP_CORE_CUSTODY.clone(),
             spawner: Arc::new(TokioLoginCoreSpawner),
             checker: Arc::new(SingBoxConfigChecker),
             resolve_binary: Arc::new(crate::runtime::proxy::resolve_core_binary),
@@ -1932,6 +2244,7 @@ impl TempCoreDeps {
 /// 一次临时核测速的结局（命令层折成响应信封）。
 #[derive(Debug)]
 pub enum TempCoreOutcome {
+    AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
     /// A caller bypassed planning and supplied a system endpoint to the unmanaged temporary core.
     SystemInterfaceRequired(String),
     /// 跑完了（可能部分节点 `-1` = 真实不可测）。`outcome` 同主核路径语义。
@@ -1942,6 +2255,8 @@ pub enum TempCoreOutcome {
     /// 起核前/就绪前失败（解析不到核 / 端口分配失败 / 写配置失败 / spawn 失败 / 未就绪）。
     /// **整批一个数值都不产出**（绝不把「核没起来」写成一批 `-1`）。
     Failed(String),
+    /// Child/native host teardown was not acknowledged. Never start another batch.
+    CleanupUnknown(String),
     /// 本批规模越过 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`] ⇒ **起核前**拒绝（一个端口都没烧、
     /// 一个子进程都没留）。载荷是**诊断原文**。
     ///
@@ -1968,6 +2283,7 @@ pub enum TempCoreOutcome {
 /// 就是「第一批测完即宣告整轮结束」——分批最危险的那个失效面。
 #[derive(Debug)]
 enum BatchOutcome {
+    AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
     SystemInterfaceRequired(String),
     /// 走到了测量阶段。载荷是**本批**的结果（可能部分节点真实 `-1`，也可能中途被中断 ——
     /// 成因已记进 [`RoundProgress`]，不在这里重复）。
@@ -1980,6 +2296,7 @@ enum BatchOutcome {
         detail: String,
         oversized: bool,
     },
+    CleanupUnknown(String),
     /// 起核前/就绪期间被主核接管 ⇒ **整轮**到此为止（后面的批一个都不该再起）。
     Superseded,
 }
@@ -2087,6 +2404,9 @@ impl TempCoreSession {
                 progress.emit_progress(emit);
             }
             match Self::run_batch(deps, batch, superseded, &measure, emit, &mut progress).await {
+                BatchOutcome::AndroidCapacityClosed(error) => {
+                    return TempCoreOutcome::AndroidCapacityClosed(error);
+                }
                 BatchOutcome::SystemInterfaceRequired(detail) => {
                     return TempCoreOutcome::SystemInterfaceRequired(detail);
                 }
@@ -2127,6 +2447,9 @@ impl TempCoreSession {
                         first_failure = Some((detail, oversized));
                     }
                 }
+                BatchOutcome::CleanupUnknown(detail) => {
+                    return TempCoreOutcome::CleanupUnknown(detail);
+                }
             }
         }
 
@@ -2155,16 +2478,16 @@ impl TempCoreSession {
 
     /// 跑**一批**：起核 → 就绪门 → 编排 → **无条件**收尾（杀核 + 删配置）。
     ///
-    /// 这就是分批之前的整条会话流程，逐字未动 —— 分批只是在它外面套了一层循环
-    /// （[`TempCoreSession::run`]），批内的起核/就绪/排空/收尾/pid 登记一格都没改。
+    /// Desktop admission also retries a retained predecessor before writing the fixed config.
+    /// From successful spawn, persistent custody owns that Child, config and exclusion token.
     ///
     /// - `nodes`：**本批**的节点（[`plan_temp_core_batches`] 的一片；`ports` 与它逐位 1:1）。
     /// - `progress`：**轮**级的进度账（跨批累加），逐节点事件与就绪心跳都从它取口径。
     ///
     /// # 收尾纪律
     ///
-    /// 杀核 + 删配置走**无条件**路径（正常完成 / 让位 / 就绪失败 / 编排 panic 之外的一切分支共用）——
-    /// 漏一条腿的表现是**孤儿 sing-box 常驻**，占着 N 个回环端口且用户完全看不见。
+    /// Every post-spawn outcome requests close. Desktop cancellation or a failed close keeps
+    /// custody and the current config, fencing the next admission until exact cleanup succeeds.
     async fn run_batch<Meas, MeasFut>(
         deps: &TempCoreDeps,
         nodes: &[TempNode],
@@ -2183,6 +2506,18 @@ impl TempCoreSession {
         // ── 让位（起核前）：主核已在跑/已跃迁 → 根本不起临时核（双会话从源头掐掉）──
         if superseded() {
             return BatchOutcome::Superseded;
+        }
+
+        #[cfg(not(target_os = "android"))]
+        let _admission = deps.pc_custody.admission.lock().await;
+        #[cfg(not(target_os = "android"))]
+        {
+            if deps.pc_custody.closing.load(Ordering::SeqCst) {
+                return BatchOutcome::CleanupUnknown("应用退出中，测速临时核禁止重新启动".into());
+            }
+            if let Err(error) = deps.pc_custody.retry_close().await {
+                return BatchOutcome::CleanupUnknown(error);
+            }
         }
 
         // ── 规模门（起核**之前**）：就绪预算按本批规模现算，越过硬上限就当场拒绝 ──
@@ -2220,7 +2555,7 @@ impl TempCoreSession {
                 return BatchOutcome::Failed {
                     detail: e,
                     oversized: false,
-                }
+                };
             }
         };
 
@@ -2269,7 +2604,7 @@ impl TempCoreSession {
                 return BatchOutcome::Failed {
                     detail: format!("序列化测速临时核配置失败: {e}"),
                     oversized: false,
-                }
+                };
             }
         };
         if let Err(e) = std::fs::write(&config_path, bytes) {
@@ -2279,14 +2614,29 @@ impl TempCoreSession {
             };
         }
 
+        #[cfg(not(target_os = "android"))]
+        let mut config_guard = PcTempConfigGuard {
+            path: config_path.clone(),
+            keep: keep_config,
+            armed: true,
+        };
+
         // `sing-box check` 先验配置形态（fail-fast，同瞬态登录核的既定手法）。没有这道门时，`custom`
         // 协议里用户写错的原样 JSON 会让核预初始化 FATAL ⇒ 用户白等整个就绪预算再看到「未监听」这个指错方向的
         // 报错。check 的诊断原文冒泡给用户 —— 那句话里直接写着哪个字段错了。
-        if let Err(e) = deps.checker.check(&binary, &config_path).await {
+        if let Err(error) = deps.checker.check_for_spawn(&binary, &config_path).await {
             retire_temp_config(&config_path, keep_config);
-            return BatchOutcome::Failed {
-                detail: e,
-                oversized: false,
+            return match error {
+                ConfigCheckFailure::Lifecycle(error) => {
+                    BatchOutcome::CleanupUnknown(error.to_string())
+                }
+                ConfigCheckFailure::AndroidCapacityClosed(error) => {
+                    BatchOutcome::AndroidCapacityClosed(error)
+                }
+                ConfigCheckFailure::Rejected(detail) => BatchOutcome::Failed {
+                    detail,
+                    oversized: false,
+                },
             };
         }
 
@@ -2323,15 +2673,37 @@ impl TempCoreSession {
         // 理由同主核 spawner（GUI 从 launchd 拉起时父进程 CWD=`/` 只读）。
         req.extra_args = vec!["--disable-color".to_string()];
         req.working_dir = Some(deps.config_dir.clone());
-        let child = match deps.spawner.spawn(req) {
+        #[cfg(not(target_os = "android"))]
+        if deps.pc_custody.closing.load(Ordering::SeqCst) {
+            return BatchOutcome::CleanupUnknown("应用退出中，测速临时核禁止重新启动".into());
+        }
+        let child = match deps.spawner.spawn(req).await {
             Ok(c) => c,
             Err(e) => {
                 retire_temp_config(&config_path, keep_config);
+                if let Some(detail) = spawn_cleanup_unknown(&e) {
+                    return BatchOutcome::CleanupUnknown(detail);
+                }
+                if let Some(error) =
+                    crate::runtime::proxy::android_capacity::CapacityClosed::from_spawn(&e)
+                {
+                    return BatchOutcome::AndroidCapacityClosed(error);
+                }
                 return BatchOutcome::Failed {
                     detail: format!("测速临时核 spawn 失败: {e}"),
                     oversized: false,
                 };
             }
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let child: Box<dyn LoginCoreChild> = {
+            // No await between returned Child and custody publication.
+            let retained = deps
+                .pc_custody
+                .retain(child, config_path.clone(), keep_config);
+            config_guard.armed = false;
+            Box::new(retained)
         };
 
         // 起核之后的一切分支都必须经收尾（杀核 + 删配置），故从此处起收束到一个 helper。
@@ -2348,12 +2720,13 @@ impl TempCoreSession {
             child,
         )
         .await;
+        #[cfg(target_os = "android")]
         retire_temp_config(&config_path, keep_config);
         outcome
     }
 
-    /// spawn 之后的编排（就绪门 → 测量 → **无条件杀核**）。抽出以保证「起了核就一定会被杀」这条纪律
-    /// 只有一个出口：本函数的每一条 `return` 之前都已 `terminate()`。
+    /// Post-spawn readiness/measurement always requests confirmed close before returning.
+    /// Failed or cancelled desktop cleanup retains the exact Child in its persistent slot.
     #[allow(clippy::too_many_arguments)]
     async fn drive_after_spawn<Meas, MeasFut>(
         deps: &TempCoreDeps,
@@ -2372,8 +2745,9 @@ impl TempCoreSession {
         MeasFut: Future<Output = Option<u32>> + Send + 'static,
     {
         let pid = child.pid().unwrap_or(0);
-        // 登记进在飞表：应用退出时 `run_exit_cleanup` 据此强杀（本 future 届时不会被 drop，Drop 守卫
-        // 覆盖不到那条路径）。守卫在本函数返回/展开时自动注销。
+        // Desktop's persistent birth already owns its exclusion token. Android keeps its
+        // existing PID guard for the native-host path.
+        #[cfg(target_os = "android")]
         let _pid_guard = TempCorePidGuard::register(pid);
         // 端口打**摘要**不打全量：`{ports:?}` 的长度与节点数线性（N=2000 时一行 14 KB），
         // 判据见 `format_ports_for_log`。顺带把本批的规模与算出来的就绪预算落进同一行 ——
@@ -2415,8 +2789,14 @@ impl TempCoreSession {
                 poll_ms: TEMP_CORE_READY_POLL_MS,
             },
             &ready_deps,
-        )
-        .await;
+        );
+        #[cfg(not(target_os = "android"))]
+        let ready = tokio::select! {
+            () = deps.pc_custody.close_requested() => CoreReadyOutcome::Superseded,
+            ready = ready => ready,
+        };
+        #[cfg(target_os = "android")]
+        let ready = ready.await;
         // ── 就绪心跳（批间空窗的第二把剪刀）───────────────────────────────────────────
         //
         // 就绪门**解析之后**立刻发一条心跳，把前端那个 20s 静默兜底重新起算 —— 后面紧接着的是
@@ -2438,11 +2818,15 @@ impl TempCoreSession {
         match ready {
             CoreReadyOutcome::Ready => {}
             CoreReadyOutcome::Superseded => {
-                child.terminate().await;
+                if let Err(detail) = child.close_confirmed().await {
+                    return BatchOutcome::CleanupUnknown(detail);
+                }
                 return BatchOutcome::Superseded;
             }
             other => {
-                child.terminate().await;
+                if let Err(detail) = child.close_confirmed().await {
+                    return BatchOutcome::CleanupUnknown(detail);
+                }
                 // 整批一个数值都不产出：核没起来 ≠ 每个节点都超时。写一批 -1 就是伪造 N 次真实测量。
                 // 报错必须带**本批规模与预算的推导输入**：门不再是一个人人都知道的常数了，
                 // 少了这三个数，下一个人看到「20784ms 内未监听」根本无从判断门是算宽了还是算窄了。
@@ -2467,7 +2851,7 @@ impl TempCoreSession {
                 probe_port: Arc::clone(&deps.probe_port),
                 port: first_port,
             };
-            drive_temp_core_measures(
+            let measures = drive_temp_core_measures(
                 nodes,
                 ports,
                 TEMP_CORE_CONCURRENCY,
@@ -2476,12 +2860,28 @@ impl TempCoreSession {
                 measure,
                 emit,
                 progress,
-            )
-            .await
+            );
+            #[cfg(not(target_os = "android"))]
+            let measured = tokio::select! {
+                () = deps.pc_custody.close_requested() => None,
+                measured = measures => Some(measured),
+            };
+            #[cfg(not(target_os = "android"))]
+            match measured {
+                Some(measured) => measured,
+                None => {
+                    progress.note_interrupt(InterruptReason::Superseded);
+                    (serde_json::Map::new(), "interrupted")
+                }
+            }
+            #[cfg(target_os = "android")]
+            measures.await
         };
         // 收核走**无条件**路径（含核已自己退出那条腿：那时 `terminate()` 只是收残句柄，不会再发信号，
         // 见 `TokioLoginCoreChild::terminate` 的 `pid == 0` 早退）。
-        child.terminate().await;
+        if let Err(detail) = child.close_confirmed().await {
+            return BatchOutcome::CleanupUnknown(detail);
+        }
         log::info!("测速临时核本批已回收：pid={pid}，outcome={outcome}");
         BatchOutcome::Ran(results)
     }

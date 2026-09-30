@@ -29,8 +29,7 @@ import {
   useEffectiveRules,
   useEffectiveServers,
 } from '@/store/app-store';
-import type { TFunction } from 'i18next';
-import type { NetworkProfile, Rule, RuleType } from '@/contracts/types';
+import type { Rule, RuleType } from '@/contracts/types';
 import {
   RULE_TYPE_IDS,
   RULE_TYPES,
@@ -54,7 +53,7 @@ import { useConfirmTwice } from '@/lib/confirm-twice';
 import { useRuleDelete } from '@/lib/use-rule-delete';
 import { cn } from '@/lib/utils';
 import { Modal } from './Modal';
-import type { CselGroup, CselOption } from './Csel';
+import type { CselGroup } from './Csel';
 import { InfoIcon } from '@/components/InfoIcon';
 import { useDialogStore } from './dialog-store';
 import { useRulePools, EMPTY_SNAP } from './use-rule-pools';
@@ -64,33 +63,9 @@ import { useRuleDnsEffect, RuleDnsEffectFields } from './RuleDnsEffect';
 import { useRuleTestFold, RuleTestFold } from './RuleTestFold';
 import { CondRow } from './RuleCondRow';
 import { Csel } from './Csel';
+import { NEW_PROFILE_CHOICE, networkProfileOptions } from './network-profile-options';
 
-/** 「生效网络」下拉里「新建场景…」这一项的哨兵值（不是场景 id：场景 id 恒以 `np-` 起头）。 */
-const NEW_PROFILE_CHOICE = '__new-network-profile__';
-
-/**
- * 「生效网络」候选：任何网络 / 各场景（停用的标注但仍可选 —— 选中即「停用期间不生效」，与场景面板语义一致）/
- * 新建场景…。当前值指向已删除的场景时补一项「场景已删除」，不让下拉静默显示成别的值。
- */
-function networkProfileOptions(
-  profiles: readonly NetworkProfile[],
-  current: string,
-  t: TFunction,
-): CselOption[] {
-  const options: CselOption[] = [
-    { value: '', label: t('rules.networkProfile.anyNetwork') },
-    ...profiles.map((p) => ({
-      value: p.id,
-      label: p.name,
-      description: p.enabled ? undefined : t('rules.networkProfile.disabledBadge'),
-    })),
-  ];
-  if (current && !profiles.some((p) => p.id === current)) {
-    options.push({ value: current, label: t('rules.networkProfile.badgeMissing'), disabled: true });
-  }
-  options.push({ value: NEW_PROFILE_CHOICE, label: t('rules.networkProfile.newOption') });
-  return options;
-}
+// 「生效网络」候选与「新建场景…」哨兵住在 `network-profile-options.ts`（移动端规则表单共用同一份）。
 
 function RuleIcon() {
   return (

@@ -70,6 +70,7 @@ pub mod cli;
 
 // ===== 共用层：三平台共享的普通模块（无 cfg，无抽象层）=====
 pub mod core_install;
+pub mod exact_start;
 pub mod line_io;
 pub mod token;
 
@@ -79,6 +80,18 @@ pub mod platform;
 /// 把 [`std::time::Instant`] 的已用时安全收窄为协议使用的毫秒整数。
 ///
 /// 三平台 helper 的起核计时共用同一饱和规则，避免各平台在 `u128 -> u64` 溢出时产生分叉。
+///
+/// 谓词 = **它三个消费者的门控之并**（`platform/mod.rs`：macos / windows 各带 `test`、linux 裸
+/// `target_os`），不是新划的一条线。为什么要写：本 crate 会被 `polaris` 依赖着一起编到
+/// `aarch64-linux-android`（helper 二进制是桌面专属，但那条依赖边是无条件的），而 android 上
+/// 三个平台模块一个都不编 ⇒ 本函数零消费点 ⇒ `dead_code`。
+///
+/// 🔴 **这条是「真·未使用」，处置方式是修，不是豁免**（2026-09-04）：本包在 android 上另有一条
+/// 「编不过」（测试目标要 `nix`，而它是 linux/macos target-specific 依赖），那条才走豁免。
+/// 两者不同类：前者是本 crate 自己的真信号，把它一起关掉等于让 android 侧的 lib 面从此没人看。
+/// 故 `cross-target-exempt.json` 里本包的豁免 `scope` 收窄成 `tests` —— lib/bins 面照样
+/// `clippy -D warnings`，本行就是被那条门盯着的。
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
 #[inline]
 pub(crate) fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)

@@ -32,6 +32,7 @@
 //! | macOS | `buildMacUpdateScript`（`hdiutil attach` → `ditto` 暂存 → mv-swap 原子替换 → `xattr -dr`） | 同上 |
 //! | Linux AppImage | `buildLinuxAppImageScript`（覆盖 `$APPIMAGE` + chmod +x） | 同上 |
 //! | Linux deb | `buildLinuxDebScript`（`pkexec apt-get install`） | 同上 |
+//! | Android | **上游没有这一腿**（ 上游 是桌面 Electron 应用） | [`InstallPlatform::Android`]：不生成脚本，经 FileProvider 交系统安装器（`android_bridge::hand_apk_to_system_installer`） |
 //! | 形态错配 | 不强制 root，回退 `shell.openPath` 交系统（`UpdateService.ts:427-436`） | [`InstallReject::FormMismatch`]，command 层回退 `shell.open` |
 
 use std::path::{Path, PathBuf};
@@ -58,6 +59,8 @@ pub enum InstallerKind {
     AppImage,
     /// Linux Debian 包。
     Deb,
+    /// Android 安装包。**它不走脚本腿** —— 落地方式是交系统安装器，见 [`InstallPlatform::Android`]。
+    Apk,
 }
 
 /// 由资产文件名判定形态（**纯函数**）。无法识别 → `None`。
@@ -74,6 +77,8 @@ pub fn classify_installer(file_name: &str) -> Option<InstallerKind> {
         Some(InstallerKind::AppImage)
     } else if lower.ends_with(".deb") {
         Some(InstallerKind::Deb)
+    } else if lower.ends_with(".apk") {
+        Some(InstallerKind::Apk)
     } else {
         None
     }
@@ -89,6 +94,11 @@ pub fn classify_installer(file_name: &str) -> Option<InstallerKind> {
 ///   判据**不是** electron-builder 的 `PORTABLE_EXECUTABLE_FILE`（那是它自解压 stub 注入的，
 ///   Polaris 的便携版是纯 zip、无 stub ⇒ 该 env 恒不存在，成因详见 `is_portable_layout` 文档）。
 /// - macOS：`.app` 恒 Loose（不分形态）。
+/// - **Android：不写具名臂，落 `_ => Installed`，且那个值在 Android 上一次都不会被读**。
+///   Android 应用只有一种形态（由系统包管理器装的），没有「便携 vs 安装态」这个轴；而
+///   [`decide_install_plan`] 的 Android 臂根本不看 `run_form`（交系统安装器与运行形态无关）。
+///   为一个不被消费的值新开一条具名臂，只会让 `platform_dispatch_exhaustive` 的字符串轴登记表
+///   多一条没有信息量的记录。**这不是「忘了答」，这就是答案。**
 ///
 /// ⚠️ **已知边界（未解决，如实登记）**：用户手动删掉 `portable.marker` 后判定退回 Installed，
 /// 该用户会重新被推 NSIS 安装器。方向是失败安全的那一侧（安装器能装、不会砸掉便携副本），
@@ -134,6 +144,16 @@ pub enum InstallPlatform {
     LinuxAppImage,
     /// Linux deb：`pkexec apt-get install` 原位升级。
     LinuxDeb,
+    /// Android：**不生成脚本、不停代理、不退出应用** —— 经 FileProvider 把 APK 交给系统安装器，
+    /// 之后由用户在系统 UI 里决定装不装。
+    ///
+    /// 与另外五种的结构性差别有三条，每条都能单独毁掉一次更新：
+    ///  1. **没有脚本**（[`build_install_script`] 对它返 `None`）：Android 上没有 shell 腿可以
+    ///     替换自己的 APK，替换是系统包管理器的事；
+    ///  2. **不能先停代理**：停代理是为了让替换文件不被占用，而这里根本不替换文件；提前停了，
+    ///     用户在系统确认框上按「取消」之后就只剩一条断掉的隧道；
+    ///  3. **不能退出应用**：交出去 ≠ 装成了。退出等于把「用户还没决定」当成「已经装完」。
+    Android,
 }
 
 /// 安装计划（[`build_install_script`] 的唯一输入）。
@@ -267,6 +287,10 @@ pub fn decide_install_plan(
             }
             Ok(base(InstallPlatform::LinuxDeb))
         }
+        // Android：`run_form` **不参与**（见 `detect_run_form` 文档的 Android 那一条）。
+        // 交系统安装器与应用是怎么装上来的无关，而另外四条腿的 run_form 判据都在回答
+        // 「该原位覆盖还是该跑安装器」——那个问题在 Android 上不存在。
+        ("android", InstallerKind::Apk) => Ok(base(InstallPlatform::Android)),
         _ => Err(mismatch()),
     }
 }
@@ -313,6 +337,19 @@ pub fn install_advisory(plan: &InstallPlan) -> Option<InstallAdvisory> {
         InstallPlatform::Macos => Some(InstallAdvisory::MacosGatekeeper),
         // AppImage 原位覆盖：无签名校验、无提权，装完直接跑 → 无需额外告知。
         InstallPlatform::LinuxAppImage => None,
+        // 🔴 Android **刻意不出 advisory**，而它恰恰是最需要「告知用户下一步」的那个平台 ——
+        // 理由是**判据的分辨率**，不是懒。
+        //
+        // advisory 是一次**预告**：它在动手之前猜「接下来 OS 会拦你」。Windows/macOS 上那个猜
+        // 恒真（没有证书就一定被拦），所以预告是诚实的。Android 上不是：「安装未知应用」是
+        // **按应用**授权且**可能早就给过了**（用户上次更新时授的）。给一个恒定的预告等于对
+        // 一半用户说一句不成立的话，而那正是 `install_advisory` 这个机制最容易腐烂的方向。
+        //
+        // Android 有一个 advisory 拿不到的东西：`canRequestPackageInstalls()` —— 一个**当场可读的
+        // 系统事实**。故这条腿把「要不要引导」推迟到真正交付的那一刻，由 Kotlin 侧按事实决定，
+        // 并把结果作为 `ApkHandoff.reason` 带回来（没授权时它已经把用户送到那一页了）。
+        // 「有真值可读就别猜」——这与本仓「没有登记来源的数据位不许编」是同一条口径。
+        InstallPlatform::Android => None,
     }
 }
 
@@ -400,36 +437,48 @@ impl Default for InstallTexts {
 }
 
 /// 按计划生成安装脚本（**纯函数**：同一 plan 恒得同一字节序列，可快照断言）。
+///
+/// # 为什么返回 `Option`
+///
+/// [`InstallPlatform::Android`] 上**没有脚本这个东西**：落地方式是把 APK 交给系统安装器
+/// （`android_bridge::hand_apk_to_system_installer`），一行 shell 都不跑。
+///
+/// 三种写法里选了 `Option`：`unreachable!()` 会把一个「本该在上游被分流掉」的接线错误变成
+/// 安装路径上的 panic；造一个假的空 `ScriptSpec` 会让调用方 `spawn` 一个空脚本、拿到 rc=0、
+/// 然后如实汇报「安装脚本已起」——一次**静默的**假成功。`None` 是唯一一种让调用方**必须**
+/// 写下「那这里怎么办」的形状。
 #[must_use]
-pub fn build_install_script(plan: &InstallPlan, texts: &InstallTexts) -> ScriptSpec {
+pub fn build_install_script(plan: &InstallPlan, texts: &InstallTexts) -> Option<ScriptSpec> {
     match plan.platform {
+        // 交系统安装器那条腿在 command 层就早退了，走不到这里。真走到了也不许瞎造一个脚本。
+        InstallPlatform::Android => None,
         InstallPlatform::WindowsPortable | InstallPlatform::WindowsSetup => {
             let text = build_windows_vbs(plan, texts);
-            ScriptSpec {
+            Some(ScriptSpec {
                 file_name: "polaris-update.vbs".to_string(),
                 bytes: utf16le_with_bom(&text),
                 program: "wscript.exe".to_string(),
                 leading_args: vec![],
-            }
+            })
         }
-        InstallPlatform::Macos => ScriptSpec {
+        InstallPlatform::Macos => Some(ScriptSpec {
             file_name: "polaris-update.sh".to_string(),
             bytes: build_mac_script(plan).into_bytes(),
             program: "/bin/bash".to_string(),
             leading_args: vec![],
-        },
-        InstallPlatform::LinuxAppImage => ScriptSpec {
+        }),
+        InstallPlatform::LinuxAppImage => Some(ScriptSpec {
             file_name: "polaris-update.sh".to_string(),
             bytes: build_linux_appimage_script(plan).into_bytes(),
             program: "/bin/bash".to_string(),
             leading_args: vec![],
-        },
-        InstallPlatform::LinuxDeb => ScriptSpec {
+        }),
+        InstallPlatform::LinuxDeb => Some(ScriptSpec {
             file_name: "polaris-update.sh".to_string(),
             bytes: build_linux_deb_script(plan).into_bytes(),
             program: "/bin/bash".to_string(),
             leading_args: vec![],
-        },
+        }),
     }
 }
 
@@ -441,8 +490,7 @@ fn build_windows_vbs(plan: &InstallPlan, texts: &InstallTexts) -> String {
     let Some(old_exe_p) = plan.portable_target.as_ref() else {
         // NSIS 安装态：跑 setup 原位升级 + 删自身。
         return [
-            "WScript.Sleep 2000".to_string(),
-            "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
+            windows_exit_wait(std::process::id()),
             // 🔴 `/UPDATE`，**不是 上游的 `--updated`**（2026-08-05 修）：`--updated` 是
             // **electron-builder** 的约定（它的模板里由 `${isUpdated}` 消费），换到 Tauri 后不成立。
             // Tauri 的 NSIS 模板解析的是 `/UPDATE`（tauri-cli 2.11.4 内嵌模板逐字：
@@ -474,8 +522,7 @@ fn build_windows_vbs(plan: &InstallPlan, texts: &InstallTexts) -> String {
     let src_display = vbs_str(&src_raw);
 
     [
-        "WScript.Sleep 2000".to_string(),
-        "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
+        windows_exit_wait(std::process::id()),
         "Set fso = CreateObject(\"Scripting.FileSystemObject\")".to_string(),
         format!("src = \"{src}\""),
         format!("oldExe = \"{old_exe}\""),
@@ -516,6 +563,58 @@ fn build_windows_vbs(plan: &InstallPlan, texts: &InstallTexts) -> String {
     .join("\r\n")
 }
 
+/// Query absence and waiting on an acquired native process object are separate facts.
+/// No query failure other than exact ArgumentException grants install permission.
+fn windows_process_wait(pid: u32) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $process = $null\n\
+         try {{\n\
+           try {{ $process = [System.Diagnostics.Process]::GetProcessById({pid}) }}\n\
+           catch {{\n\
+             $queryError = $_.Exception\n\
+             while ($null -ne $queryError.InnerException) {{ $queryError = $queryError.InnerException }}\n\
+             if ($queryError.GetType() -eq [System.ArgumentException]) {{ exit 0 }}\n\
+             exit 1\n\
+           }}\n\
+           try {{\n\
+             $null = $process.Handle\n\
+             if ($process.WaitForExit(120000)) {{ exit 0 }}\n\
+             exit 2\n\
+           }} catch {{ exit 1 }}\n\
+         }} finally {{\n\
+           if ($null -ne $process) {{ $process.Dispose() }}\n\
+         }}"
+    )
+}
+
+fn windows_exit_wait(pid: u32) -> String {
+    let bytes: Vec<u8> = windows_process_wait(pid)
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let encoded = crate::runtime::mesh::base64_encode(&bytes);
+    [
+        "Set WshShell = CreateObject(\"WScript.Shell\")".to_string(),
+        format!(
+            "waitCommand = \"\"\"\" & WshShell.ExpandEnvironmentStrings(\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\") & \"\"\" -NoProfile -NonInteractive -EncodedCommand {encoded}\""
+        ),
+        "On Error Resume Next".to_string(),
+        "Err.Clear".to_string(),
+        "waitResult = WshShell.Run(waitCommand, 0, True)".to_string(),
+        "waitError = Err.Number".to_string(),
+        "On Error Goto 0".to_string(),
+        "If waitError <> 0 Or waitResult <> 0 Then WScript.Quit 1".to_string(),
+    ]
+    .join("\r\n")
+}
+
+// The parent's write descriptor stays open until OS process exit, not Ready/commit/Drop.
+// dd reads fd 0 through File and preserves read errors. Some cat implementations turn
+// stdin EBADF into EOF. No count/noerror option may permit admission before real EOF.
+const UNIX_EXIT_WAIT: &str =
+    "[ -p /dev/fd/0 ] || exit 1\n/bin/dd bs=4096 of=/dev/null 2>/dev/null || exit 1";
+
 /// macOS 更新脚本（移植 `buildMacUpdateScript`）。
 ///
 /// # ad-hoc 签名的关键一步
@@ -527,12 +626,12 @@ fn build_mac_script(plan: &InstallPlan) -> String {
     let dmg = sh_quote(&plan.installer_path.to_string_lossy());
     let Some(bundle) = plan.app_bundle_path.as_ref() else {
         // 定位不到 `.app` → 回退手动拖拽（**不猜路径**）。
-        return format!("#!/bin/bash\nsleep 2\nopen {dmg}\n");
+        return format!("#!/bin/bash\n{UNIX_EXIT_WAIT}\nopen {dmg}\n");
     };
     let dest = sh_quote(&bundle.to_string_lossy());
     [
         "#!/bin/bash",
-        "sleep 2",
+        UNIX_EXIT_WAIT,
         &format!("DMG={dmg}"),
         &format!("DEST={dest}"),
         "BAK=\"$DEST.bak-$$\"",
@@ -610,7 +709,7 @@ fn build_linux_appimage_script(plan: &InstallPlan) -> String {
     );
     [
         "#!/bin/bash",
-        "sleep 2",
+        UNIX_EXIT_WAIT,
         &format!("NEW={src}"),
         &format!("DEST={dst}"),
         // 只覆盖 AppImage 这一个文件；`~/.config/polaris` 不动 → 配置 + 已更新内核零丢失。
@@ -634,7 +733,7 @@ fn build_linux_deb_script(plan: &InstallPlan) -> String {
     let exe = sh_quote(&plan.exe_path.to_string_lossy());
     [
         "#!/bin/bash",
-        "sleep 2",
+        UNIX_EXIT_WAIT,
         &format!("DEB={deb}"),
         &format!("EXE={exe}"),
         // apt-get install 本地 deb（apt 1.1+ 支持绝对路径）：解依赖 + 同包名版本升级。
@@ -656,7 +755,7 @@ fn build_linux_deb_script(plan: &InstallPlan) -> String {
 
 /// 写脚本到临时目录并 `spawn(detached)`（**执行腿**）。
 ///
-/// 调用方必须**先**停代理（Windows 文件占用会让替换失败），**后**退出应用。
+/// 调用方先完成受管进程的严格 drain，再生成脚本；脚本还须等待旧应用的 OS 退出。
 ///
 /// # Errors
 ///
@@ -687,9 +786,55 @@ pub fn spawn_detached_script(dir: &Path, spec: &ScriptSpec) -> Result<PathBuf, S
             });
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::fd::IntoRawFd;
+        let (child, lifetime_writer) = spawn_with_lifetime_pipe(&mut cmd)
+            .map_err(|e| format!("启动安装脚本失败 {}: {e}", spec.program))?;
+        // No await or fallible publication after spawn: only OS process exit closes this fd.
+        // CLOEXEC prevents subsequent child processes from extending this lifetime.
+        let _process_lifetime_fd = lifetime_writer.into_raw_fd();
+        drop(child);
+    }
+    #[cfg(not(unix))]
     cmd.spawn()
         .map_err(|e| format!("启动安装脚本失败 {}: {e}", spec.program))?;
     Ok(path)
+}
+
+#[cfg(unix)]
+fn lifetime_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    let pipe = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC);
+    #[cfg(not(target_os = "linux"))]
+    let pipe = nix::unistd::pipe();
+    let (reader, writer) = pipe.map_err(std::io::Error::from)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        // Darwin lacks pipe2. A concurrent fork before both fcntls can only delay EOF.
+        for fd in [&reader, &writer] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(std::io::Error::from)?;
+        }
+    }
+    Ok((reader, writer))
+}
+
+#[cfg(unix)]
+fn spawn_with_lifetime_pipe(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, std::os::fd::OwnedFd)> {
+    spawn_with_pipe(cmd, lifetime_pipe()?)
+}
+
+#[cfg(unix)]
+fn spawn_with_pipe(
+    cmd: &mut std::process::Command,
+    (reader, writer): (std::os::fd::OwnedFd, std::os::fd::OwnedFd),
+) -> std::io::Result<(std::process::Child, std::os::fd::OwnedFd)> {
+    cmd.stdin(std::process::Stdio::from(reader));
+    let child = cmd.spawn()?;
+    Ok((child, writer))
 }
 
 #[cfg(test)]

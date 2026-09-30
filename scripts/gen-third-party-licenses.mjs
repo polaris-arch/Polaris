@@ -23,6 +23,8 @@
  * dev 依赖不进产物，build 依赖只在构建期跑、其产物不被链接。
  * 前端：`pnpm list --prod --depth Infinity` 的生产闭包（devDependencies 不进 Vite 产物）。
  * 不自己走 `node_modules`：pnpm 布局下传递依赖在 `.pnpm/` 里，顶层只有直接依赖的软链。
+ * vendored：**手工登记**的 `VENDORED` 表 —— vendor 进仓、随产物分发、但两个包管理器都看不见的
+ * 第三方资产（当前只有随包字体）。这类东西不列进来就是「分发了别人的作品却没附许可」。
  *
  * # 用法
  *
@@ -161,6 +163,41 @@ function jsDeps() {
   });
 }
 
+/**
+ * vendor 进仓、随产物分发、但 `cargo metadata` / `pnpm list` 都看不见的第三方资产。
+ *
+ * 只登记「哪个目录」，许可正文仍由 `licenseTexts()` 从该目录读，与 Rust / npm 走同一条路径 ——
+ * 在这里手抄一遍正文，迟早和目录里那份对不上，而对不上的那一份正是要随产物分发的那份。
+ *
+ * `ui/src/assets/fonts/space-grotesk`：`--disp` 的首选族，由 `ui/src/styles/fonts.css` 的
+ * `@font-face` 随包引用（契约 B / D-9，见
+ * `~/docs/polaris/design/polaris-mobile-platform-evaluation-2026-08-29.md` §6.3.3）。
+ * 上游 https://github.com/floriankarsten/space-grotesk 的 `fonts/woff2/SpaceGrotesk[wght].woff2`
+ * 逐字节副本，版本取自字体 name 表 nameID 5（Version 2.000）。
+ */
+const VENDORED = [
+  {
+    ecosystem: 'vendored',
+    name: 'Space Grotesk',
+    version: '2.000',
+    license: 'OFL-1.1',
+    repository: 'https://github.com/floriankarsten/space-grotesk',
+    dir: 'ui/src/assets/fonts/space-grotesk',
+  },
+];
+
+function vendoredAssets() {
+  return VENDORED.map((v) => {
+    const texts = licenseTexts(join(ROOT, v.dir));
+    // 登记在册却没有正文，比压根不登记更糟：清单看上去合规，分发出去的却是一份没有许可的作品。
+    if (!texts.length) {
+      console.error(`缺 ${v.dir} 下的许可文本（LICENSE* / COPYING* / NOTICE*）—— ${v.name} 无法合规分发`);
+      process.exit(1);
+    }
+    return { ...v, texts };
+  });
+}
+
 function render(pkgs) {
   const sorted = pkgs.sort((a, b) =>
     a.ecosystem === b.ecosystem ? a.name.localeCompare(b.name) : a.ecosystem.localeCompare(b.ecosystem),
@@ -188,6 +225,8 @@ function render(pkgs) {
     '',
     '以子进程 / 二进制资源形式集成的组件（sing-box、libcronet、面板 UI、规则数据）属 mere aggregation，',
     '登记在 `NOTICE`，不在此列。',
+    '',
+    'vendor 进仓、随产物分发、但不由包管理器管理的第三方资产（如随包字体）生态列标 `vendored`。',
     '',
     `本文件由 \`scripts/gen-third-party-licenses.mjs\` 生成，请勿手改。共 ${sorted.length} 个包，`,
     `${groups.size} 份互不相同的许可文本（多数包共用逐字相同的文本，故按文本分组，每份只出现一次）。`,
@@ -232,7 +271,7 @@ function render(pkgs) {
   return lines.join('\n');
 }
 
-const content = render([...rustDeps(), ...jsDeps()]);
+const content = render([...rustDeps(), ...jsDeps(), ...vendoredAssets()]);
 
 if (CHECK) {
   if (!existsSync(OUT)) {

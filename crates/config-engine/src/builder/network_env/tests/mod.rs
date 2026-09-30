@@ -17,8 +17,10 @@ fn deps(platform: &str, takeover: bool, custom_rules_dir: &str) -> GenerateConfi
         race_server_port: 0,
         probe_direct_port: None,
         probe_proxy_port: None,
+        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
+        loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
         race_upstream_ips: vec![],
@@ -590,11 +592,18 @@ fn all_platforms() -> Vec<Platform> {
         Platform::Mac,
         Platform::Win,
         Platform::Linux,
+        Platform::Android,
+        Platform::Ios,
         Platform::Other,
     ];
     for p in &all {
         match p {
-            Platform::Mac | Platform::Win | Platform::Linux | Platform::Other => {}
+            Platform::Mac
+            | Platform::Win
+            | Platform::Linux
+            | Platform::Android
+            | Platform::Ios
+            | Platform::Other => {}
         }
     }
     all
@@ -718,11 +727,16 @@ fn u13_resolve_probe_source_table() {
         assert_eq!(got, want, "§4.4 行「{row}」");
     }
 
-    // 平台轴从枚举派生：显式 dhcp 的可用性 = 能绑 UDP 68（Win/Mac 恒可；Linux/未知仅 TUN）。
+    // 平台轴从枚举派生：显式 dhcp 的可用性 = 能绑 UDP 68（Win/Mac 恒可；Linux/未知仅 TUN；
+    // Android/iOS 恒不可 —— 沙箱进程，tun fd 不附带 capability，与 TUN 与否无关）。
     for platform in all_platforms() {
         for tun in [false, true] {
             let got = resolve_probe_source(&np(Dhcp, addr.0, addr.1), platform, tun, false);
-            let privileged = matches!(platform, Platform::Win | Platform::Mac) || tun;
+            let privileged = match platform {
+                Platform::Win | Platform::Mac => true,
+                Platform::Linux | Platform::Other => tun,
+                Platform::Android | Platform::Ios => false,
+            };
             let want = if privileged {
                 R::Dhcp
             } else {
@@ -1086,6 +1100,27 @@ fn n2_builtin_dhcp_status_matches_generation_side_b() {
             false,
             false,
             json!({"available": true, "reason": null}),
+        ),
+        // Android / iOS：核是应用沙箱里的 libbox，`VpnService` / NE 的 tun fd 不附带任何 capability ⇒
+        // **TUN 与否都不可用**（与 Linux 桌面「TUN 腿由 helper 提权」不是一回事，`dhcp_privileged` 头注）。
+        // 移动端 UI 把 DHCP 那一档置灰、DNS 动作里的内置 DHCP 解析器置灰，都读这一个结果。
+        (
+            Platform::Android,
+            true,
+            false,
+            json!({"available": false, "reason": "dhcpNeedsPrivilege"}),
+        ),
+        (
+            Platform::Android,
+            false,
+            false,
+            json!({"available": false, "reason": "dhcpNeedsPrivilege"}),
+        ),
+        (
+            Platform::Ios,
+            true,
+            false,
+            json!({"available": false, "reason": "dhcpNeedsPrivilege"}),
         ),
     ];
     for (platform, tun, suppressed, want) in cases {

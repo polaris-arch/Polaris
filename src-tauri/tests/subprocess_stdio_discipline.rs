@@ -149,6 +149,9 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     // 回放（`the_order_leg_is_red_on_the_historical_resolvectl_defect`）要能登记它，才谈得上「排空
     // 形态在场、红的是次序」——否则回放红在「形态缺失」上，次序那一半仍旧没有被真缺陷证明过。
     "read_to_string(",
+    // CheckCustody 的两条流由 OutputCapture::read 立即起独立 read_to_end 任务。
+    // 精确接线与真实读体由 check_custody_starts_both_eof_readers_before_return 钉住。
+    "output.read(",
 ];
 
 /// 「带着两条未排空管道的 child」这件事在**类型**上的全部落点。
@@ -172,12 +175,17 @@ const SPAWNER_TYPE_FORMS: &[&str] = &[
 
 /// [`SPAWNER_TYPE_FORMS`] 的「家」：定义与再导出所在的文件。
 ///
-/// 它们提到这些类型是在**定义**它们，不是在消费管道，故不要求登记为消费者。除此之外的任何生产文件
-/// 一旦提到这些类型，就必须是注册表 2 里的消费者——新写一个消费者却不登记，文件集合对差当场红。
+/// 它们提到这些类型是在**定义**它们，不是在消费管道，故不要求登记为消费者。除此之外的生产文件
+/// 必须是注册表 2 的管道消费者，或经 [`IN_PROCESS_SPAWNER`] 逐项核验的无管道实现。
+/// 新写一个消费者却不登记，文件集合对差当场红。
 const SPAWNER_TYPE_HOME: &[&str] = &[
     "crates/core-supervisor/src/lib.rs",
     "crates/core-supervisor/src/spawner.rs",
 ];
+
+/// Android 测速复用 `LoginCoreSpawner` trait，但用进程内 libbox instance；没有子进程管道。
+/// 此文件仍参加类型面对差，并在 G2 用实现锚点和无管道形态断言逐项核验。
+const IN_PROCESS_SPAWNER: &str = "src-tauri/src/runtime/speedtest/android.rs";
 
 /// 构造一个 spawn 请求的形态。**两种写法都要盖住**：构造函数与结构体字面量 —— 字段全 `pub`，
 /// 绕开构造函数直接写字面量一样编得过（少写 `stdio` 那一格才编不过）。
@@ -226,13 +234,11 @@ struct PipedSite {
 const PIPED_SITES: &[PipedSite] = &[
     // ── crates/core-supervisor ──
     PipedSite {
-        file: "crates/core-supervisor/src/config_gate.rs",
-        // 全仓唯一的 `sing-box check` 子进程实现：起核闸门、瞬态核起前自检、「测试内核兼容性」
-        // 按钮三处共用它。锚点随管道走 —— 管道从 `run_config_check_within` 挪进了它调用的这一层。
-        anchor: "pub async fn run_check_raw(",
+        file: "crates/core-supervisor/src/config_gate/check_custody.rs",
+        // 常规平台 check 子进程的 custody owner，返回前两条流均交给 EOF 任务。
+        anchor: "fn spawn(",
         kind: SiteKind::Sink,
-        // 本仓短命腿的最佳形态：`output()` 并发读两条流 + `timeout` + `kill_on_drop(true)`。
-        drain_forms: &[".output()"],
+        drain_forms: &["output.read("],
     },
     PipedSite {
         file: "crates/core-supervisor/src/spawner.rs",
@@ -266,7 +272,7 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/macos/server.rs",
-        anchor: "fn do_spawn(",
+        anchor: "fn do_native_spawn(",
         kind: SiteKind::Sink,
         // 预开日志文件成功走 loggers，失败退化成纯 drainers —— 两条都是生产路径，故两个形态都要在。
         drain_forms: &[
@@ -288,7 +294,7 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/windows/winproc/win.rs",
-        anchor: "fn start_singbox(",
+        anchor: "fn spawn_tracked(",
         kind: SiteKind::Sink,
         drain_forms: &[
             "spawn_pipe_loggers_with_preopened_files",
@@ -1099,6 +1105,37 @@ fn the_scan_surface_reports_itself_and_covers_the_known_pipe_bearing_crates() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
+fn check_custody_starts_both_eof_readers_before_return() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(
+        &index,
+        "crates/core-supervisor/src/config_gate/check_custody.rs",
+    );
+    let spawn = block_of(owner, "fn spawn(");
+    let compact: String = spawn.chars().filter(|c| !c.is_whitespace()).collect();
+    for wiring in [
+        "letstdout=child.stdout.take();",
+        "letstderr=child.stderr.take();",
+        "output.read(stdout,false);",
+        "output.read(stderr,true);",
+    ] {
+        assert_eq!(
+            compact.matches(wiring).count(),
+            1,
+            "custody 接线漂移：{wiring}"
+        );
+        assert!(compact.find(wiring).unwrap() < compact.find("Ok(Ok((request,output)))").unwrap());
+    }
+    let read = block_of(owner, "fn read<R:");
+    assert!(read.contains("tokio::spawn("), "EOF reader 必须立即起任务");
+    assert!(
+        read.contains("pipe.read_to_end("),
+        "读任务必须将真实 pipe 读到 EOF"
+    );
+}
+
+#[test]
 fn every_piped_site_is_registered_and_drains_before_it_waits() {
     let surface = scan_surface();
     let index = surface_by_path(&surface);
@@ -1144,6 +1181,26 @@ fn every_consumer_of_the_shared_spawner_drains_both_streams() {
     let surface = scan_surface();
     let index = surface_by_path(&surface);
 
+    let android = file_of(&index, IN_PROCESS_SPAWNER);
+    let spawn = block_of(
+        android,
+        "impl LoginCoreSpawner for AndroidSpeedtestSpawner {",
+    );
+    assert!(
+        spawn.contains("android_bridge::start_transient_speedtest(")
+            && spawn.contains("Box::new(AndroidSpeedtestChild"),
+        "{IN_PROCESS_SPAWNER} 必须仍经 Android libbox 创建进程内 instance"
+    );
+    assert!(
+        ![PIPED_FORM, POLICY_FORM, SPAWNER_CONSTRUCTION_FORM]
+            .iter()
+            .any(|form| android.masked.contains(form))
+            && !PIPE_TAKE_FORMS
+                .iter()
+                .any(|form| android.masked.contains(form)),
+        "{IN_PROCESS_SPAWNER} 出现子进程/管道形态；须改进消费者登记和双流排空判据"
+    );
+
     // 三条腿的判定结果**全部**收齐再报，不是撞到第一条就 panic：三条腿共用同一个 spawner、
     // 同一份排空实现，一次改动同时打坏两条是常态（本轮那个变异就是两条腿一起丢 stderr）。
     // 撞一条就停，失败信息只说得出其中一条，另一条要等下一轮才暴露 —— 而人看到「红了一条」
@@ -1186,7 +1243,8 @@ fn every_consumer_of_the_shared_spawner_drains_both_streams() {
              类型搬家了，这条豁免已经失去对象，成了将来某个真消费者的免死金牌"
         );
     }
-    let registered: Vec<&str> = PRODUCER_CONSUMERS.iter().map(|c| c.file).collect();
+    let mut registered: Vec<&str> = PRODUCER_CONSUMERS.iter().map(|c| c.file).collect();
+    registered.push(IN_PROCESS_SPAWNER);
     if let Err(reason) = judge_consumer_registry_files(&mentions, &registered) {
         panic!("{reason}");
     }

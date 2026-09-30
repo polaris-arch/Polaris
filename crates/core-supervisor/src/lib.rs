@@ -19,6 +19,8 @@
 /// 起核前的内核闸门：拿即将下发的 config 真跑 `sing-box check`，把内核点名拒收的节点剥掉。
 pub mod config_gate;
 pub mod crash_recovery;
+#[cfg(target_os = "linux")]
+pub mod exact_spawn;
 pub mod lifecycle_gate;
 pub mod port_bookkeeping;
 pub mod process_killer;
@@ -27,8 +29,10 @@ pub mod spawner;
 pub mod stale_core;
 
 pub use config_gate::{
-    decide_peel, parse_kernel_rejection, run_check_raw, run_config_check, run_config_check_within,
-    ConfigCheckVerdict, KernelRejection, PeelStep, RawCheck, RejectedArray, CONFIG_CHECK_TIMEOUT,
+    assert_check_admission, begin_check_shutdown, decide_peel, parse_kernel_rejection,
+    run_check_raw, run_config_check, run_config_check_within, settle_check_cleanup,
+    shutdown_checks_for_exit, with_check_admission, ConfigCheckVerdict, KernelRejection, PeelStep,
+    RawCheck, RejectedArray, ValidationLifecycleError, CONFIG_CHECK_TIMEOUT,
     INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
 };
 pub use crash_recovery::{
@@ -37,7 +41,7 @@ pub use crash_recovery::{
     PostStartOutcome, RestartFate,
 };
 pub use lifecycle_gate::{
-    LifecycleGate, LifecycleKind, PendingDrain, PendingSnapshot, StopDiscard,
+    LifecycleGate, LifecycleKind, LiveClaimGuard, PendingDrain, PendingSnapshot, StopDiscard,
 };
 pub use port_bookkeeping::{PortAllocator, PortExclusions, ResolvedPort};
 pub use process_killer::{EscalatedKill, ProcessKiller, Signal};

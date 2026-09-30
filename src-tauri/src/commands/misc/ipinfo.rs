@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -7,7 +7,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::response::ApiResponse;
 use crate::runtime::http::{app_user_agent, HttpRuntime, SystemDnsLookup};
-use crate::runtime::proxy::ProxyStatus;
+use crate::runtime::proxy::{LocalHttpProxy, ProxyStatus};
 use crate::runtime::AppRuntime;
 use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
 #[cfg(test)]
@@ -61,8 +61,49 @@ pub const IPINFO_SETTLE_DELAY_MS: u64 = 4_000;
 const IPINFO_UNREACHABLE_RETRY_INITIAL_MS: u64 = 15_000;
 const IPINFO_UNREACHABLE_RETRY_MAX_MS: u64 = 60_000;
 
-/// 最近一次出口 IP 快照缓存（`peek` 零探测读取；TTL 内非 force 复用）。
-static IPINFO_CACHE: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
+/// 缓存、可见快照和排程票据共用一把锁。序列宣告与结果落地也在此锁内，避免
+/// “旧腿过闸 → 新 pending 落地 → 旧腿覆写”的 check-then-act 窗口。
+static IPINFO_STATE: OnceLock<Mutex<IpinfoState>> = OnceLock::new();
+
+struct IpinfoState {
+    /// 仅存真实终态，供非 force 的 TTL 短路；pending 不能毒化此缓存。
+    cache: Option<Value>,
+    /// 最近一次权威发布帧。事件、peek 与手动响应复用其中的 revision。
+    visible: Value,
+    revision: u64,
+    /// 延迟排程的归属。手动探测不取消它；更新的起停/热切事件会替换它。
+    pending_seq: Option<u64>,
+}
+
+impl Default for IpinfoState {
+    fn default() -> Self {
+        Self {
+            cache: None,
+            visible: empty_ipinfo_snapshot(),
+            revision: 0,
+            pending_seq: None,
+        }
+    }
+}
+
+impl IpinfoState {
+    fn publish(&mut self, mut snapshot: Value, cache: bool) -> Value {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("ipinfo revision exhausted");
+        snapshot["revision"] = json!(self.revision);
+        if cache {
+            self.cache = Some(snapshot.clone());
+        }
+        self.visible = snapshot.clone();
+        snapshot
+    }
+}
+
+fn ipinfo_state() -> &'static Mutex<IpinfoState> {
+    IPINFO_STATE.get_or_init(|| Mutex::new(IpinfoState::default()))
+}
 
 /// 出口 IP 探测的**世代线**：每条会落地的探测腿开工前领一个世代号，落地前再比对。世代已变 ⇒ 后面有
 /// 更新的腿，本腿结果已过期，直接退场。「后来者胜」正是这里要的语义。
@@ -74,7 +115,9 @@ static IPINFO_REFRESH_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// 领一个新世代，作废所有在飞的旧腿。每条会写缓存 / 广播的探测腿都必须**在开探那一刻**领一次
 /// （不是在排程那一刻 —— 理由见 [`schedule_ipinfo_refresh`] 的「按开探顺序发号」一节）。
+#[cfg(test)]
 fn next_ipinfo_epoch() -> u64 {
+    let _state = ipinfo_state().lock().unwrap();
     IPINFO_REFRESH_EPOCH.fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -109,19 +152,89 @@ static IPINFO_SCHEDULE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 宣告一次「出口世界要变了」（排程 / 手点那一刻调，**不是**开探那一刻）。返回值无消费方：腿要的是
 /// 开探时刻的 [`current_ipinfo_schedule_seq`] 快照，不是自己自增出来的号。
+#[cfg(test)]
 fn next_ipinfo_schedule_seq() -> u64 {
+    let _state = ipinfo_state().lock().unwrap();
     IPINFO_SCHEDULE_SEQ.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+/// 已持有状态锁时宣告排程；与后续 pending/terminal 提交构成单个临界区。
+fn declare_schedule_locked() -> u64 {
+    IPINFO_SCHEDULE_SEQ.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn begin_manual_probe() -> (u64, u64) {
+    let _state = ipinfo_state().lock().unwrap();
+    let seq = declare_schedule_locked();
+    let epoch = IPINFO_REFRESH_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    (epoch, seq)
+}
+
+/// 返回本次排程的票据和已落地、待广播的占位/停核帧。
+fn declare_scheduled_refresh(delay_ms: u64) -> (u64, Value) {
+    let mut state = ipinfo_state().lock().unwrap();
+    let seq = declare_schedule_locked();
+    let snapshot = if delay_ms > 0 {
+        state.pending_seq = Some(seq);
+        state.publish(pending_ipinfo_snapshot(), false)
+    } else {
+        state.pending_seq = None;
+        let mut stopped = state.cache.clone().unwrap_or_else(empty_ipinfo_snapshot);
+        stopped["proxy"] = Value::Null;
+        stopped["proxyReachability"] = json!("unknown");
+        stopped["updatedAt"] = json!(u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX));
+        if let Some(obj) = stopped.as_object_mut() {
+            obj.remove("loading");
+            obj.remove("error");
+            obj.remove("proxyBlocked");
+        }
+        state.publish(stopped, true)
+    };
+    (seq, snapshot)
+}
+
+/// 旧排程醒来时不得抢新起停事件的 pending；手动检测不替换排程票据，
+/// 故窗口内的手点不会取消自动的长热身腿。
+fn begin_scheduled_probe(ticket: u64, delayed: bool) -> Option<(u64, u64)> {
+    let state = ipinfo_state().lock().unwrap();
+    if delayed {
+        if state.pending_seq != Some(ticket) {
+            return None;
+        }
+    } else if IPINFO_SCHEDULE_SEQ.load(Ordering::SeqCst) != ticket {
+        return None;
+    }
+    let epoch = IPINFO_REFRESH_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    let seq = IPINFO_SCHEDULE_SEQ.load(Ordering::SeqCst);
+    Some((epoch, seq))
+}
+
+fn finish_scheduled_probe(ticket: u64) -> Option<Value> {
+    let mut state = ipinfo_state().lock().unwrap();
+    if state.pending_seq == Some(ticket) {
+        state.pending_seq = None;
+        if state.visible.get("loading") == Some(&json!(true)) {
+            let mut empty = empty_ipinfo_snapshot();
+            empty["updatedAt"] = json!(u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX));
+            return Some(state.publish(empty, true));
+        }
+    }
+    None
+}
+
 /// 开探那一刻的排程线快照（与领世代、读 status/config 同一时点取）。
+#[cfg(test)]
 fn current_ipinfo_schedule_seq() -> u64 {
     IPINFO_SCHEDULE_SEQ.load(Ordering::SeqCst)
 }
 
-/// 仅当排程线仍停在 `expected` 时宣告一次自愈复查。CAS 同时承担“确认没有更新事件”和“宣告我最新”；
-/// 不能拆成 load + fetch_add，否则两条指令之间的停核/热切事件会被旧复查反向覆盖。
-fn claim_ipinfo_schedule_seq(expected: u64) -> Option<u64> {
-    claim_schedule_seq(&IPINFO_SCHEDULE_SEQ, expected)
+/// 自愈腿的排程认领与世代领取必须同锁：若隔开，一条更新的手点/起停腿可在
+/// 两者之间领号，而旧自愈腿随后反推 epoch，使两条合法结果都失效。
+fn claim_unreachable_retry_probe(expected: u64) -> Option<(u64, u64)> {
+    let _state = ipinfo_state().lock().unwrap();
+    let seq = claim_schedule_seq(&IPINFO_SCHEDULE_SEQ, expected)?;
+    let epoch = IPINFO_REFRESH_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    Some((epoch, seq))
 }
 
 fn claim_schedule_seq(counter: &AtomicU64, expected: u64) -> Option<u64> {
@@ -149,59 +262,20 @@ pub(crate) fn ipinfo_probe_is_current(epoch: u64, seq: u64) -> bool {
         && IPINFO_SCHEDULE_SEQ.load(Ordering::SeqCst) == seq
 }
 
-/// **收敛窗口在飞计数**：延迟腿广播「置空」帧那一刻 +1，该腿跑完（落地 / 被超越退场 / 早退）时 -1。
-/// `> 0` ⇒ 至少有一条延迟腿在收敛窗口里，[`peek_ipinfo_snapshot`] 回置空帧。
-///
-/// # 🔴 为什么是计数而不是 `AtomicBool`（2026-07-21 第三轮复审）
-///
-/// `AtomicBool` 没有所有权：谁都能清掉谁置的位。两次热切间隔 >4s（完全常规）就够复现——
-/// L1（切到 B）t=4 开探、t=5 落地时把位清掉，而 L2（切到 C）t=4.1 才置的位、要到 t=8.1 才开探：
-/// 中间 3s 里 `peek` 型消费方（托盘浮层 `TrayMenu.tsx`、主窗水合腿 `App.tsx`）读到的是 **B 的缓存值**，
-/// 而用户已在 C。冷启动同样可达（startup 腿清掉起核腿置的位）。
-/// 计数后「谁排的位谁归还」，L1 归还只把计数降回 1，窗口在最新那条腿跑完之前不会关。
-///
-/// # 已知取舍：慢腿会把窗口拖长
-///
-/// 最新腿已落地、而某条注定要退场的慢腿仍在飞（direct+proxy 两腿串行、各由
-/// [`IPINFO_PROBE_BUDGET_MS`] 封顶 ⇒ 最长 20s）时，计数仍 `> 0` ⇒
-/// `peek` 继续回置空帧，尽管缓存里已是正确的新值。代价是**多留空几秒**，而反过来（提前关窗）付出的
-/// 是**吐旧出口**——本模块的既定纪律是「留空优于用旧出口冒充新出口」，故取前者。要消掉这段窗口得给
-/// 在飞腿加取消语义（探测中途放弃），不值。
-///
-/// # 📌 登记（复审已裁**不计缺陷**，勿据此改代码）
-///
-/// [`build_ipinfo_snapshot`] 若 panic，排程腿的归还点（体尾那次 `fetch_sub`）走不到 ⇒ 计数永久卡在
-/// `> 0` ⇒ `peek` 从此恒回置空帧；按需复查只更新结果、不拥有这格计数，无法代替原排程腿归还。概率极低
-/// （该函数及其调用链无显式 panic 点，网络错误一律走 `Result`），故不为它加 catch_unwind / Drop 守卫。
-/// 记在这里是让后来者知道这是**已知取舍**，不是没想到。
-///
-/// # 为什么不能靠「把 pending 帧也写进 `IPINFO_CACHE`」代替
-///
-/// `IPINFO_CACHE` 同时喂着两条语义不同的读路径：`peek`（零探测水合）与 [`fresh_cached_snapshot`]
-/// （15s TTL 内的非 force 短路）。把双 null 的 pending 帧写进缓存会**毒化后者** —— 收敛窗口后的
-/// 15s 内，任何非 force 的 `ipinfo_get` 都会短路拿到双 null，等于把「正在探」固化成「探完了没探到」。
-/// 故在飞状态必须是独立标记，缓存里永远只放**真探测结果**。
-///
-/// # 不置位它会怎样（本标记要修的缺陷）
-///
-/// `peek` 型消费方（托盘浮层 `TrayMenu.tsx` 每次弹出即 peek 水合、主窗 `App.tsx` 窗口重建水合）
-/// **不订阅** `ipInfoUpdated`，只读缓存 ⇒ 起核/热切的 4s 收敛窗口里它们照样吐**上一个出口**的 IP，
-/// 而同一时刻订阅方（状态栏）已按 pending 帧置空。同屏两处对「我现在从哪出去」给出互相矛盾的答案，
-/// 且错的那个正是「用旧出口冒充新出口」——`pending_ipinfo_snapshot` 存在的全部理由。
-static IPINFO_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-
+/// 延迟排程的 pending 是独立于 TTL 缓存的可见帧。它在排程时原样写入
+/// [`IpinfoState::visible`]，而非在 peek 时临时生成；新事件的 revision 因此总是更大。
+/// 旧排程以 `pending_seq` 验票，不能在新停核或热切后抢先开探。
 /// 落地一次探测结果：[`ipinfo_probe_is_current`] 两条判据同时成立 ⇒ 写缓存、回 `true`（调用方随即
 /// 广播 + 伴测）；被更新的腿超越、或开探后又有更新事件宣告 ⇒ 什么都不做、回 `false`。
 ///
-/// **不碰 [`IPINFO_INFLIGHT`]**：那一格是**排程腿**排的，归还权也归它（见该 static 的「谁排的位谁
-/// 归还」一节）——在这里清位就是 `AtomicBool` 时代「L1 清掉 L2 的位」那个洞。
+/// 不改延迟排程票据：它只由对应排程收尾或更新的出口事件替换，手点腿完成后自动长热身仍可运行。
 ///
 /// # 为什么闸必须在**探测之后**再查一次
 ///
 /// [`build_ipinfo_snapshot`] 最长跑 `IPINFO_PROBE_BUDGET_MS × 2 = 20s`（direct + proxy 两腿串行，
 /// 各含定额重试、各自封顶），而排程间隔只有 [`IPINFO_SETTLE_DELAY_MS`] = 4s ——
 /// **探测窗口远大于排程间隔**（移植重试后差距进一步拉大），先发起的慢腿完全可能在后
-/// 发起的快腿之后落地。只在探测**前**查闸挡不住这段窗口，旧腿会同时污染 `IPINFO_CACHE` 与广播。
+/// 发起的快腿之后落地。只在探测**前**查闸挡不住这段窗口，旧腿会同时污染可见快照与广播。
 ///
 /// 三个真实序列（本函数即这三条的共同闸；时刻均为**开探**时刻 = 领号时刻）：
 /// - **冷启动**：startup 腿 t=3s 领号开探（此刻核未起，只有 direct），autoconnect 同期起核、其 4s 腿
@@ -216,41 +290,23 @@ static IPINFO_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// L2 还在睡（尚未领号）—— L1 落地那一刻世代仍是它自己的，过闸。挡它的是 [`IPINFO_SCHEDULE_SEQ`]
 /// 那一半判据（L1 开探时快照 seq=1，L2 一排程即 seq=2 ⇒ 不等 ⇒ 退场），详见该 static 的文档。
 ///
-/// # 边界：这是 check-then-act，不是临界区
-///
-/// 世代比对与写缓存**不在同一把锁下**（`IPINFO_REFRESH_EPOCH` 是 atomic，`IPINFO_CACHE` 是 Mutex）。
-/// 理论上存在 TOCTOU：本腿过闸之后、拿到 Mutex 之前，一条更新的腿领了号并抢先写完缓存 ⇒ 本腿仍会覆盖它。
-/// **实际不可达**：领号与写缓存之间隔着一整次 `build_ipinfo_snapshot`（网络往返，秒级），而这里的两条
-/// 指令间隔是纳秒级。合并成一把锁需要让世代号也进 Mutex，为一个够不到的窗口换掉 atomic 的无锁读，不值。
-/// 记在这里是为了让后来者知道这是**已知取舍**，不是没想到。
-fn commit_ipinfo_snapshot(epoch: u64, seq: u64, snap: &Value) -> bool {
+/// 世代/排程检查和帧提交在同一把锁内；所有序列变更也取得此锁。
+/// 因此旧腿即使在新 pending 之后结束，也不能领一个更新的 revision。
+fn commit_ipinfo_snapshot(epoch: u64, seq: u64, snap: &Value) -> Option<Value> {
+    let mut state = ipinfo_state().lock().unwrap();
     if !ipinfo_probe_is_current(epoch, seq) {
-        return false;
+        return None;
     }
-    if let Ok(mut g) = ipinfo_cache().lock() {
-        *g = Some(snap.clone());
-    }
-    true
+    Some(state.publish(snap.clone(), true))
 }
 
-/// `peek=true` 的零探测读取：**在飞时回置空帧**（与订阅方同一帧），否则回缓存快照。
+/// `peek=true` 的零探测读取：原样返回最近一次权威帧，不重新生成时间戳或 revision。
 ///
 /// 抽成独立函数而非内联在 [`ipinfo_get`] 里：`ipinfo_get` 是 `#[tauri::command]`（要 `AppHandle` +
 /// `State`，本仓未引 `tauri::test` ⇒ 单测造不出来），而「收敛窗口内 peek 到底吐什么」正是本轮要钉死的
 /// 语义，必须可被直测。
 fn peek_ipinfo_snapshot() -> Value {
-    if IPINFO_INFLIGHT.load(Ordering::SeqCst) > 0 {
-        return pending_ipinfo_snapshot();
-    }
-    ipinfo_cache()
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_else(empty_ipinfo_snapshot)
-}
-
-fn ipinfo_cache() -> &'static Mutex<Option<Value>> {
-    IPINFO_CACHE.get_or_init(|| Mutex::new(None))
+    ipinfo_state().lock().unwrap().visible.clone()
 }
 
 /// **出口无效直判终态的纯逻辑折叠**（1:1 上游 `IpInfoService.markProxyBlocked`，`IpInfoService.ts:187-197`
@@ -288,7 +344,7 @@ fn fold_proxy_blocked(cached: Option<Value>, reason: &str) -> Value {
 /// # 为什么必须写缓存（本函数存在的全部理由）
 ///
 /// `EVENT_IP_INFO_UPDATED` 只喂**订阅方**（状态栏）。`peek` 型消费方（托盘浮层每次弹出即 peek、主窗
-/// 窗口重建水合）**不订阅**，只读 [`IPINFO_CACHE`] —— 只广播不写缓存 ⇒ 那两处继续吐**上一次探到的
+/// 窗口重建水合）**不订阅**，只读权威可见帧 —— 只广播不写快照 ⇒ 那两处继续吐**上一次探到的
 /// 代理出口 IP**，而该出口此刻已被直判无效。同屏两处对「我现在从哪出去」给出互相矛盾的答案，且错的
 /// 那个正是「用旧出口冒充一个已知无效的出口」，与 [`pending_ipinfo_snapshot`] 要挡的是同一类失真。
 ///
@@ -324,14 +380,11 @@ pub(crate) fn mark_ipinfo_proxy_blocked(app: &AppHandle, reason: &str) {
 /// （见 `tests::stale_probe_leg_must_not_overwrite_newer_leg` 的段 (g)）。广播留在外面：它是唯一
 /// 需要 `AppHandle` 的动作。
 fn commit_proxy_blocked_snapshot(reason: &str) -> Value {
-    // 🔴 排程即宣告（**写缓存之前**）：见 [`mark_ipinfo_proxy_blocked`] 文档。
-    next_ipinfo_schedule_seq();
-    let cached = ipinfo_cache().lock().ok().and_then(|g| g.clone());
-    let snap = fold_proxy_blocked(cached, reason);
-    if let Ok(mut g) = ipinfo_cache().lock() {
-        *g = Some(snap.clone());
-    }
-    snap
+    let mut state = ipinfo_state().lock().unwrap();
+    declare_schedule_locked();
+    state.pending_seq = None;
+    let snap = fold_proxy_blocked(state.cache.clone(), reason);
+    state.publish(snap, true)
 }
 
 /// 空快照（无缓存时 peek 的回退：direct/proxy 均 null）。
@@ -341,6 +394,7 @@ fn empty_ipinfo_snapshot() -> Value {
         "proxy": Value::Null,
         "proxyReachability": "unknown",
         "updatedAt": 0,
+        "revision": 0,
     })
 }
 
@@ -353,7 +407,11 @@ fn now_epoch_ms() -> u128 {
 
 /// TTL 内的缓存快照（非 force 时短路复用）；无缓存 / 过期 → None。
 fn fresh_cached_snapshot() -> Option<Value> {
-    let snap = ipinfo_cache().lock().ok()?.clone()?;
+    let state = ipinfo_state().lock().ok()?;
+    if state.visible.get("loading") == Some(&json!(true)) {
+        return Some(state.visible.clone());
+    }
+    let snap = state.cache.clone()?;
     let updated = snap.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
     if now_epoch_ms().saturating_sub(u128::from(updated)) <= IPINFO_TTL_MS {
         Some(snap)
@@ -486,6 +544,7 @@ where
 async fn build_ipinfo_snapshot(
     direct_http: &HttpRuntime,
     status: &ProxyStatus,
+    local_proxy: Option<&LocalHttpProxy>,
     post_connect: bool,
 ) -> Value {
     let (direct, direct_err) = match with_ipinfo_retry(
@@ -506,8 +565,10 @@ async fn build_ipinfo_snapshot(
     } else {
         (IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS)
     };
-    let proxy = if status.running && status.mixed_port != 0 {
-        match HttpRuntime::via_local_proxy(status.mixed_port) {
+    // 代理出口经本机 http 代理入站探（桌面 `mixed-in`；Android 没有 mixed 入站，走 `probe-proxy-in`
+    // 并带本次起核的凭据 —— 此前无条件读 `mixed_port`，Android 上连向一个不存在的口，出口 IP 恒空）。
+    let proxy = if let Some(lp) = local_proxy.filter(|_| status.running) {
+        match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
             Ok(p) => with_ipinfo_retry(|| fetch_trace_ipinfo(&p), proxy_attempts, proxy_retry_ms)
                 .await
                 .unwrap_or(Value::Null),
@@ -519,7 +580,7 @@ async fn build_ipinfo_snapshot(
     let mut snap = json!({
         "direct": direct,
         "proxy": proxy,
-        "proxyReachability": proxy_reachability(status, &proxy),
+        "proxyReachability": proxy_reachability(status, local_proxy, &proxy),
         "updatedAt": u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX),
     });
     if let Some(e) = direct_err {
@@ -528,10 +589,14 @@ async fn build_ipinfo_snapshot(
     snap
 }
 
-/// 代理出口探测的可观测终态。这里只投影「本轮能否经 mixed 入站取回出口信息」，不从错误文本推断
+/// 代理出口探测的可观测终态。这里只投影「本轮能否经本机 http 代理入站取回出口信息」，不从错误文本推断
 /// TLS / QUIC / 认证等底层原因；那些原因在未 patch 内核时没有稳定的结构化信号。
-fn proxy_reachability(status: &ProxyStatus, proxy: &Value) -> &'static str {
-    if !status.running || status.mixed_port == 0 {
+fn proxy_reachability(
+    status: &ProxyStatus,
+    local_proxy: Option<&LocalHttpProxy>,
+    proxy: &Value,
+) -> &'static str {
+    if !status.running || local_proxy.is_none() {
         "unknown"
     } else if proxy.is_null() {
         "unreachable"
@@ -542,7 +607,7 @@ fn proxy_reachability(status: &ProxyStatus, proxy: &Value) -> &'static str {
 
 /// 上游 `IP_INFO_GET`：出口 IP 信息（本地直连出口 / 代理出口）。
 ///
-/// - `peek=true`：零探测，回最近快照；**收敛窗口在飞时回置空帧**（见 [`peek_ipinfo_snapshot`]）。
+/// - `peek=true`：零探测，原样回最近权威帧（收敛窗口为已发布的 pending 帧）。
 /// - 非 force：TTL 内回缓存，不打网。
 /// - 探测成功 → 缓存 + 广播 `event:ipInfoUpdated`。
 #[tauri::command]
@@ -566,9 +631,7 @@ pub async fn ipinfo_get(
     // 手点腿同样宣告排程线 + 领世代：既作废在飞的排程腿，也让自己可被更晚的排程腿作废（共用同一
     // 对判据，否则起核收敛窗口内点检测会出现两条互不作废的并行探测）。手点腿的排程与开探是同一刻
     // ⇒ 先自增再快照，快照到的正是自己刚宣告的那个值。
-    next_ipinfo_schedule_seq();
-    let epoch = next_ipinfo_epoch();
-    let seq = current_ipinfo_schedule_seq();
+    let (epoch, seq) = begin_manual_probe();
     // State 借用不跨 await：先取 owned（Arc + status + config），再探测。
     let inputs = ipinfo_probe_inputs(&state);
     let has_real_exit = ipinfo_config_has_real_exit(&inputs.config);
@@ -587,16 +650,35 @@ struct IpinfoProbeInputs {
     http: std::sync::Arc<HttpRuntime>,
     /// 探测时刻的核状态（决定是否探 proxy 出口 + 伴测门控）。
     status: ProxyStatus,
-    /// 用户配置（伴测取 `selectedServerId` / 测速 URL）。
+    /// 探测时刻的本机 http 代理入站（端口 + 凭据；与 `status` 同一时点取）。
+    local_proxy: Option<LocalHttpProxy>,
+    /// 运行时 R 配置（伴测取真实出口 `selectedServerId` / 测速 URL）；停核时可读磁盘 D。
     config: Value,
 }
 
 /// 从 `AppRuntime` 摘出 [`IpinfoProbeInputs`]（同步，无 await —— 借用在本函数内即结束）。
 fn ipinfo_probe_inputs(state: &AppRuntime) -> IpinfoProbeInputs {
+    let status = state.proxy().status();
+    // 代理探测走当前运行入口。D 可能已保存新选择但仍待 Apply；以 D 归属 warm RTT
+    // 会把经旧 R 隧道量到的时延记到新节点。运行中缺 R 时保守不给任何节点归属。
+    let config = ipinfo_probe_config(
+        status.running,
+        state.proxy().current_config_snapshot(),
+        (!status.running).then(|| state.config().current().unwrap_or_default()),
+    );
     IpinfoProbeInputs {
         http: state.http().clone(),
-        status: state.proxy().status(),
-        config: state.config().current().unwrap_or_default(),
+        status,
+        local_proxy: state.proxy().local_http_proxy(),
+        config,
+    }
+}
+
+fn ipinfo_probe_config(running: bool, runtime: Option<Value>, disk: Option<Value>) -> Value {
+    if running {
+        runtime.unwrap_or_default()
+    } else {
+        disk.unwrap_or_default()
     }
 }
 
@@ -622,8 +704,9 @@ fn ipinfo_config_has_real_exit(config: &Value) -> bool {
 /// 共用的唯一实现。抽出来是为了让「用户点网络检测」与「起核 / 热切 / 停核 / 启动自动触发」跑**同一条
 /// 编排**——两套逻辑必然漂移（本仓解锁检测已栽过一次：只移植了广播半边）。
 ///
-/// `epoch` / `seq` 由调用方在**开探那一刻**取（[`next_ipinfo_epoch`] + [`current_ipinfo_schedule_seq`]，
-/// 与 `inputs` 里的 status/config 快照同一时点）；探测**之后**经 [`commit_ipinfo_snapshot`] 复查，
+/// `epoch` / `seq` 由调用方在**开探那一刻**取（手动腿 [`begin_manual_probe`]、排程腿
+/// [`begin_scheduled_probe`]、自愈腿 [`claim_unreachable_retry_probe`]，与 `inputs` 里的
+/// status/config 快照同一时点）；探测**之后**经 [`commit_ipinfo_snapshot`] 复查，
 /// 任一判据变了即原样退场（不写缓存、不广播、不伴测），理由见 `commit_ipinfo_snapshot` 的文档。
 ///
 /// ⚠️ **本函数不得自己领号 / 自增**：那样复查就是拿现场刚取的值跟自己比，恒真 = 没闸，而下游伴测拿到
@@ -638,15 +721,17 @@ async fn probe_publish_ipinfo(
     let IpinfoProbeInputs {
         http,
         status,
+        local_proxy,
         config,
     } = inputs;
-    let snap = build_ipinfo_snapshot(http.as_ref(), &status, post_connect).await;
+    let snap =
+        build_ipinfo_snapshot(http.as_ref(), &status, local_proxy.as_ref(), post_connect).await;
 
-    // 探测期间（含重试，最长 20s）可能已有更新的腿排上并落地 ⇒ 本腿结果作废。返回值仍给直接调用方
-    // （`ipinfo_get` 的请求/响应语义），但绝不许污染全局缓存与广播。
-    if !commit_ipinfo_snapshot(epoch, seq, &snap) {
-        return (snap, false);
-    }
+    // 探测期间（含重试，最长 20s）可能已有更新的腿排上并落地。旧腿返回当前权威帧，
+    // 不把失效结果当作手动响应，也不污染缓存、广播或伴测。
+    let Some(snap) = commit_ipinfo_snapshot(epoch, seq, &snap) else {
+        return (peek_ipinfo_snapshot(), false);
+    };
     crate::events::broadcast(
         app,
         crate::events::channel::EVENT_IP_INFO_UPDATED,
@@ -668,7 +753,7 @@ async fn probe_publish_ipinfo(
         &config,
         proxy_probed,
         status.running,
-        status.mixed_port,
+        local_proxy,
         epoch,
         seq,
     );
@@ -751,7 +836,7 @@ fn snapshot_has_proxy_reachability(snapshot: &Value, expected: &str) -> bool {
 ///
 /// 与普通排程腿有两处刻意差异：
 /// - 等待/探测期间不广播 pending，警示态持续可见，旧测速值不会重新冒充当前延迟；
-/// - 醒来靠 [`claim_ipinfo_schedule_seq`] CAS 认领，旧腿不能跨越任何更新事件落地。
+/// - 醒来靠 [`claim_unreachable_retry_probe`] CAS 认领并同锁领取世代，旧腿不能跨越更新事件落地。
 fn schedule_unreachable_ipinfo_recheck(
     app: &AppHandle,
     snapshot: &Value,
@@ -767,10 +852,10 @@ fn schedule_unreachable_ipinfo_recheck(
         let mut delay_ms = IPINFO_UNREACHABLE_RETRY_INITIAL_MS;
         loop {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            let Some(seq) = claim_ipinfo_schedule_seq(expected_seq) else {
+            let Some((epoch, seq)) = claim_unreachable_retry_probe(expected_seq) else {
                 return;
             };
-            let previous_snapshot = ipinfo_cache().lock().ok().and_then(|g| g.clone());
+            let previous_snapshot = ipinfo_state().lock().ok().and_then(|g| g.cache.clone());
             let Some(inputs) = app
                 .try_state::<AppRuntime>()
                 .map(|state| ipinfo_probe_inputs(&state))
@@ -778,12 +863,11 @@ fn schedule_unreachable_ipinfo_recheck(
                 return;
             };
             if !inputs.status.running
-                || inputs.status.mixed_port == 0
+                || inputs.local_proxy.is_none()
                 || !ipinfo_config_has_real_exit(&inputs.config)
             {
                 return;
             }
-            let epoch = next_ipinfo_epoch();
             let (snapshot, committed) = probe_publish_ipinfo(&app, inputs, epoch, seq, false).await;
             if !committed || !ipinfo_probe_is_current(epoch, seq) {
                 return;
@@ -802,10 +886,10 @@ fn schedule_unreachable_ipinfo_recheck(
 /// 启动 +2s（`runtime::startup_tasks`）· 起核就绪 · 节点热切换 · 停核（后三点经
 /// [`ProxyErrorEmitter::schedule_exit_ip_refresh`](crate::runtime::proxy::ProxyErrorEmitter::schedule_exit_ip_refresh)）。
 ///
-/// `delay_ms > 0` ⇒ 先广播 [`pending_ipinfo_snapshot`]（**UI 即刻置空成 `—`**，不是显示可见的
-/// 「检测中」文案 —— 见该函数文档）并置 [`IPINFO_INFLIGHT`]，睡满再探。
+/// `delay_ms > 0` ⇒ 同步落地并广播 pending（UI 立即置空成 `—`），睡满再探。
+/// `delay_ms == 0` ⇒ 同步发布代理出口已消失的终态，防旧出口跨停核/重启窗口回填。
 ///
-/// # 🟠 按开探顺序发号：[`next_ipinfo_epoch`] 必须在 `sleep` **之后**
+/// # 🟠 按开探顺序发号：[`begin_scheduled_probe`] 必须在 `sleep` **之后**
 ///
 /// 世代号是「谁更新」的唯一判据，而排程时刻与开探时刻之间隔着整整 [`IPINFO_SETTLE_DELAY_MS`]。
 /// 在**排程时**领号 ⇒ 号的顺序是「谁先被排上」，与「谁的结果更新」差一个维度，收敛窗口内会静默丢腿：
@@ -847,69 +931,45 @@ pub fn schedule_network_recovery_refresh(app: &AppHandle) {
 }
 
 fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_on_recovery: bool) {
+    // 宣告与可见帧落地同步完成：停核调用返回前，任何 peek 都已看不到旧代理出口。
+    // 广播携带同一份 revision；若事件晚于下一帧抵达，渲染端可按 revision 丢弃。
+    let previous_snapshot = if recheck_unlock_on_recovery {
+        ipinfo_state().lock().unwrap().cache.clone()
+    } else {
+        None
+    };
+    let (ticket, frame) = declare_scheduled_refresh(delay_ms);
+    crate::events::broadcast(app, crate::events::channel::EVENT_IP_INFO_UPDATED, frame);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        // 🔴 **排程即宣告**（sleep 之前，无条件）：这一刻起，任何已开探的旧腿都过期了。世代号做不到
-        // 这件事——它要到 sleep 之后才领，而「已排程、尚未开探」的整个 4s 窗口里旧腿是无人作废的
-        // （见 `IPINFO_SCHEDULE_SEQ` 文档的 t=4.1 序列）。零延迟腿（停核）同样宣告：出口消失也是
-        // 一次「世界变了」，在飞的旧腿结果照样作废。
-        next_ipinfo_schedule_seq();
-        let previous_snapshot = if recheck_unlock_on_recovery {
-            ipinfo_cache().lock().ok().and_then(|g| g.clone())
-        } else {
-            None
-        };
-        // 只包住「排在飞 + 广播 pending + sleep」——探测之后那道闸在 probe_publish_ipinfo 里，
-        // 零延迟腿（停核）跳过本块但**同样**吃到它。
-        //
-        // 在飞计数只跟着**广播了置空帧**的延迟腿走：零延迟腿不广播 pending，若也计数就会造出
-        // 「订阅方（状态栏）仍显示旧出口、peek 方（托盘）却已置空」的同屏矛盾——而消掉这种矛盾
-        // 正是这个标记存在的全部理由。
         if delay_ms > 0 {
-            // 先排位再广播：排位后 peek 才与订阅方看到同一帧（顺序反了会留一个吐旧出口的窗口）。
-            IPINFO_INFLIGHT.fetch_add(1, Ordering::SeqCst);
-            crate::events::broadcast(
-                &app,
-                crate::events::channel::EVENT_IP_INFO_UPDATED,
-                pending_ipinfo_snapshot(),
-            );
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        // 🟠 **睡满之后**才领号 ⇒ 号按开探顺序发（理由见本函数文档）。挪回 sleep 之前 = 收敛腿被
-        // 窗口内的手点腿静默作废。排程线快照与它同刻取：两者合起来才是「我开探时的世界」。
-        let epoch = next_ipinfo_epoch();
-        let seq = current_ipinfo_schedule_seq();
-        // `State` 借用收在本块内，不跨下面的 await（同 `ipinfo_get` 纪律）。
-        // setup 前极早期 / 单测：managed state 还没有 ⇒ 静默跳过探测，绝不 panic。
-        if let Some(inputs) = app
-            .try_state::<AppRuntime>()
-            .map(|state| ipinfo_probe_inputs(&state))
-        {
-            let has_real_exit = ipinfo_config_has_real_exit(&inputs.config);
-            // 走**选路收敛延迟**的腿 = 起核 / 热切 ⇒ proxy 侧吃 post-connect 重试预算（隧道热身窗口）。
-            // 判据是「等于收敛延迟」而非「有没有延迟」：启动首探也带延迟（3s，`EXIT_IP_PROBE_DELAY_MS`），
-            // 但它不是热身场景，上游 那边同样走常规腿。停核腿（0）同理。
-            // 逐触发点对照表 + 一处已登记偏离见 `build_ipinfo_snapshot` 文档。
-            let post_connect = delay_ms == IPINFO_SETTLE_DELAY_MS;
-            let (snapshot, committed) =
-                probe_publish_ipinfo(&app, inputs, epoch, seq, post_connect).await;
-            if committed && ipinfo_probe_is_current(epoch, seq) {
-                if recheck_unlock_on_recovery {
-                    maybe_recheck_unlock_after_exit_recovery(
-                        &app,
-                        previous_snapshot.as_ref(),
-                        &snapshot,
-                    );
+        // 旧起停/热切排程不得在新 pending 之后开探；手动腿不取代 ticket，
+        // 因而收敛窗口内手点检测之后，这条自动长热身仍会醒来。
+        if let Some((epoch, seq)) = begin_scheduled_probe(ticket, delay_ms > 0) {
+            if let Some(inputs) = app
+                .try_state::<AppRuntime>()
+                .map(|state| ipinfo_probe_inputs(&state))
+            {
+                let has_real_exit = ipinfo_config_has_real_exit(&inputs.config);
+                let post_connect = delay_ms == IPINFO_SETTLE_DELAY_MS;
+                let (snapshot, committed) =
+                    probe_publish_ipinfo(&app, inputs, epoch, seq, post_connect).await;
+                if committed && ipinfo_probe_is_current(epoch, seq) {
+                    if recheck_unlock_on_recovery {
+                        maybe_recheck_unlock_after_exit_recovery(
+                            &app,
+                            previous_snapshot.as_ref(),
+                            &snapshot,
+                        );
+                    }
+                    schedule_unreachable_ipinfo_recheck(&app, &snapshot, seq, has_real_exit);
                 }
-                schedule_unreachable_ipinfo_recheck(&app, &snapshot, seq, has_real_exit);
             }
         }
-        // **谁排的位谁归还**，且落地 / 被超越退场 / managed state 缺失三条路径共用这一个归还点。
-        // 本函数体内既无 `return` 也无 `?`（spawn 不要求 `Output = ()` ⇒ `?` 同样能早退），两者
-        // 由 `ipinfo_epoch_guard` 一并禁掉 —— 故当下不存在绕过这个归还点的路径。
-        // 漏还则 peek 永久回置空帧、托盘/水合腿从此再也读不到缓存；按需复查不拥有这格计数，无法纠正。
-        if delay_ms > 0 {
-            IPINFO_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        if let Some(frame) = finish_scheduled_probe(ticket) {
+            crate::events::broadcast(&app, crate::events::channel::EVENT_IP_INFO_UPDATED, frame);
         }
     });
 }

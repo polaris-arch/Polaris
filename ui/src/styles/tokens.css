@@ -220,8 +220,12 @@
   /* 所有浮层（上下文菜单 / 迷你菜单 / 节点选择器）共用的一抹投影 */
   --shadow-pop: 0 18px 40px -16px hsl(var(--shadow) / 0.6);
 
+  /* `Noto Sans CJK SC` 是 Android 侧唯一被点名的中文族（契约 B / §6.3.2②）：其余三个中文族
+   * 都只在 Apple / Windows 上存在。这里同步改值只为不让声明的真值源说谎 —— 生效的那份在
+   * index.css 的全部 @import 之后（理由同本文件头「本文件的浅色取值进不了浏览器」段）。 */
   --sans: -apple-system, 'Segoe UI Variable', 'Segoe UI', 'PingFang SC',
-    'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
+    'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', system-ui,
+    sans-serif;
   --disp: 'Space Grotesk', 'Avenir Next', 'SF Pro Display', 'Segoe UI',
     var(--sans);
   --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Cascadia Code', Menlo,

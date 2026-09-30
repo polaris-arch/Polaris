@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en-US" dir="ltr">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      `viewport-fit=cover` 是 `env(safe-area-inset-*)` 的**开关**，不是修饰：不写它，WebView 把布局
+      视口收缩到安全区之内，四个 inset 一律解析成 0px —— `tokens.resolved.css` 里那四个 `--safe-*`
+      会**静默**退化成常量 0，刘海/手势条下的裁切照样发生，而 CSS 里一个字都不用改就能"看起来对"。
+    -->
+    <!-- WKWebView honours these limits; Android also disables its native zoom gestures in MainActivity. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <!-- 与 index.html 同一份 CSP 兜底（浏览器直开/dev）；打包态的权威策略在 tauri.conf.json。 -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws:; img-src 'self' data: https: polaris-icon: http://polaris-icon.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'" />
+    <title>Polaris</title>
+    <!--
+      首帧主题兜底，与 index.html 同款、同取值（tokens 的 `--bg`：深 220 40% 6% / 浅 210 30% 96%）。
+
+      移动端一样吃得到主进程的 `initialization_script`（`create_main_window` 对两端是同一段代码），
+      故这里同样是"注入够不着时"的第二道：`:not([data-theme])` 保证属性一落定本段立即失效。
+      为什么是 <style> 不是内联 <script>：上面那条 CSP 是 `script-src 'self'`，内联脚本会被拦掉。
+    -->
+    <style>
+      html:not([data-theme]) { background: hsl(220 40% 6%); }
+      @media (prefers-color-scheme: light) {
+        html:not([data-theme]) { background: hsl(210 30% 96%); }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/mobile/MobileMain.tsx"></script>
+  </body>
+</html>

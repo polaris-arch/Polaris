@@ -47,6 +47,13 @@ pub struct LogConfig {
 pub struct Experimental {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_file: Option<CacheFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clash_api: Option<ClashApi>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClashApi {
+    pub default_mode: String,
 }
 
 /// `experimental.cache_file`。

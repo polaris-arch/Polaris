@@ -45,7 +45,7 @@
 .nd-tabs-bar{ display:grid; grid-template-columns:minmax(0,1fr); align-items:center; margin:0 0 16px; min-width:0; }
 .nd-tabs-bar.has-overflow{ grid-template-columns:28px minmax(0,1fr) 28px; gap:4px; }
 .nd-tabs-bar .nd-tabs-scroll{ margin:0; min-width:0; overflow-x:auto; scrollbar-width:none; }
-.nd-tabs-scroll::-webkit-scrollbar{ display:none; }
+.nd-tabs-bar .nd-tabs-scroll::-webkit-scrollbar{ display:none; }
 .nd-tabs-scroll .sub-tabs{ width:max-content; max-width:none; margin-bottom:0; }
 .nd-tabs-scroll .sub-tabs button{ white-space:nowrap; }
 .sub-info{ display:flex; align-items:center; gap:10px; padding:11px 14px; border:1px solid hsl(var(--line));

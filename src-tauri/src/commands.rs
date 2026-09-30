@@ -17,7 +17,7 @@
 //! - [`misc`]：杂项（logs/version/shell/backup/diagnostic/autostart/ipinfo/singbox-dashboard）
 //!
 //! 所有 command 统一返回 [`crate::response::ApiResponse<T>`]（Polaris 信封），序列化形与 Polaris 前端契约一致。
-//! generate_handler! 列表见 `main.rs`。
+//! generate_handler! 列表见 `lib.rs`。
 
 /// 源码扫描式**调用点守卫**的共用工具（仅测试编译）。
 ///
@@ -46,7 +46,7 @@ pub(crate) mod guard_scan {
     /// - **正面断言**（`helper.rs` 的接线守卫 `find`/`contains`、`config.rs` 的顺序守卫）：把被守的调用
     ///   删掉、再在原处留一行 `// enforce_backend_authoritative_fields(...)` 就能让 `contains` 恒真 ——
     ///   接线没了，守卫仍绿（本仓已实测过这类假绿）；
-    /// - **负面断言**（`main.rs` 的 tray gate 禁 `.await` 等）：注释里出现禁词就会**误红**，逼后人把
+    /// - **负面断言**（`lib.rs` 的 tray gate 禁 `.await` 等）：注释里出现禁词就会**误红**，逼后人把
     ///   断言改宽 = 门被磨钝。
     ///
     /// 只剥**整行**注释（`trim_start().starts_with("//")`）：行尾注释要剥就得先分辨字符串字面量里的
@@ -495,10 +495,12 @@ pub(crate) mod guard_scan {
     }
 }
 
+pub mod android_batch_qa;
 pub mod config;
 pub mod helper;
 pub mod icon;
 pub mod misc;
+pub(crate) mod picked_file;
 pub mod proxy;
 pub mod rules;
 pub mod server;
@@ -512,6 +514,7 @@ pub mod updater;
 pub mod vpn;
 pub mod window;
 
+pub use android_batch_qa::*;
 pub use config::*;
 pub use helper::*;
 pub use icon::*;

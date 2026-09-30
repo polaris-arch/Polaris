@@ -304,6 +304,9 @@ impl AutoSwitchMachine {
 ///    `periodic_legs_read_config_by_projection_not_full_clone` 明禁常驻周期腿出现 `.current()`。
 ///    per-tick 反序列化成 [`UserConfig`] 需要 owned `Value` ⇒ 直接撞门；改在 `with_current` 闭包里
 ///    clone 整份配置 ⇒ 正是那道门要禁的深拷贝换个形态。
+///
+/// Android 的预编译双态 TS 核是例外：mode 可在同一世代内变化。心跳驱动只读当前提交的 R
+/// 选中 id，并用起核时确定的唯一无出口 TS id 动态覆写此启动判据，不读取磁盘 D。
 #[must_use]
 pub fn auto_switch_blocked_for_generation(config: &UserConfig) -> bool {
     mesh_selected_exit_falls_back_to_direct(config)
@@ -314,8 +317,8 @@ pub fn auto_switch_blocked_for_generation(config: &UserConfig) -> bool {
 /// 一次心跳 tick 的输入快照（全部布尔/常量，无 I/O）。
 ///
 /// `enabled` / `switching` 取自 [`AutoSwitchMachine`]（`enabled` 是**已同步过** `want_enabled`
-/// 之后的值）；`core_running` / `selected_server_is_real` 取自运行时；`generation_blocked` 是
-/// [`auto_switch_blocked_for_generation`] 在起核时求得的**世代常量**；`probe_proxy_port` 同为世代常量。
+/// 之后的值）；`core_running` / `selected_server_is_real` 取自运行时；`generation_blocked`
+/// 对单态核是启动常量，对 Android 双态核是当前提交 R 的动态投影；`probe_proxy_port` 为世代常量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickInput {
     pub enabled: bool,

@@ -32,12 +32,9 @@ pub struct BuiltinGeoRuleSet {
 impl BuiltinGeoRuleSet {
     /// 该内置集的**上游原址**（网络更新腿用）。
     ///
-    /// 此前这层被认为「缺失、需要随包 manifest 才能补」，复核后不成立：地址完全由 tag 推导得出，
-    /// 两个源各自的拼法都已在仓内有据 ——
-    /// - CN 三件套（`CN_BASELINE_TAGS`）→ SagerNet `rule-set` 分支，文件名等于 `file_name`；
-    ///   release 中的 `.db` 资产不是 sing-box `.srs` 规则集；
+    /// - CN 三件套（`CN_BASELINE_TAGS`）→ SagerNet 的 `rule-set` 分支，文件名逐字等于 `file_name`；
     /// - 其余 → MetaCubeX `meta-rules-dat@sing`，目录已带分类、**文件名是裸名**
-    ///   （`rule_resource_catalog.rs:114` 派生 `geo/<kind>/<name>.srs`，非 `geo/<kind>/<kind>-<name>.srs`）。
+    ///   与 `rule_resource_catalog` 派生的 `geo/<kind>/<name>.srs` 同源。
     ///   裸名由 `file_name` 去掉 `<kind>-` 前缀得到，`category-ai → category-ai-!cn` 这类改名
     ///   已在 `app_geo_entry` 处理过并固化进 `file_name`，此处不必再判一次。
     ///
@@ -99,8 +96,8 @@ const REGION_GEOIP_TAGS: &[&str] = &["ir", "ru"];
 const MRD_GEO_RAW_BASE: &str =
     "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo";
 
-/// 国内基线三件套：SagerNet `rule-set` 分支发布 `.srs`，保留 geosite/geoip 文件名前缀。
-/// 与 MetaCubeX raw 路径的裸文件名口径不同，也不能拼到 SagerNet 的 `.db` release 资产上。
+/// 国内基线三件套由 SagerNet 提供，保持与随包种子相同的来源。
+/// `.srs` 发布在 `rule-set` 分支；release 仅提供旧 `.db` 资产，不能用于规则集更新。
 const CN_BASELINE_TAGS: &[&str] = &["geosite-cn", "geosite-geolocation-!cn", "geoip-cn"];
 const SAGERNET_GEOSITE_RULE_SET: &str =
     "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";

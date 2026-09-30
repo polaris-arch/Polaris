@@ -13,6 +13,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { api } from '@/ipc';
+import { resourceUpdateOutcome } from '@/domain/resource-update-outcome';
 import type { RuleResourceCategory } from '@/contracts/types';
 import { Modal } from './Modal';
 import { Csel, type CselOption } from './Csel';
@@ -69,6 +70,7 @@ export function ResUrlDialog() {
   };
 
   const requestClose = () => {
+    if (submitting) return;
     if (url.trim() || name.trim()) {
       // 脏态 → 嵌套确认（放弃更改）。onConfirm 关两层：confirm + 本弹窗。
       open({
@@ -90,6 +92,7 @@ export function ResUrlDialog() {
   };
 
   const handleSubmit = async () => {
+    if (submitting) return;
     const ue = validateResUrl(url);
     if (ue) {
       toast.error(errText(ue));
@@ -105,13 +108,13 @@ export function ResUrlDialog() {
       const results = await api.ruleResources.download([
         { url: url.trim(), name: name.trim(), category },
       ]);
-      const r = results[0];
-      if (!r) {
+      const outcome = resourceUpdateOutcome(results, 1);
+      if (outcome.status === 'empty') {
         // 防御：下载结果与入参逐项同序，单项提交理应恒有结果；空数组仅可能于后端异常，兜为不可用态。
         toast.error(errText('downloadUnavailable'));
         return;
       }
-      if (!r.ok) {
+      if (outcome.status !== 'success') {
         toast.error(errText('downloadFailed'));
         return;
       }
@@ -136,7 +139,7 @@ export function ResUrlDialog() {
       }
       footer={
         <>
-          <button type="button" className="btn ghost" onClick={requestClose}>
+          <button type="button" className="btn ghost" disabled={submitting} onClick={requestClose}>
             {t('common.cancel')}
           </button>
           <button type="button" className="btn flow" onClick={() => void handleSubmit()} disabled={submitting}>

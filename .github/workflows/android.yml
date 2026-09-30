@@ -1,0 +1,1042 @@
+name: Android
+
+# Android APK 腿 —— 本仓**唯一**在产物级别问「包里到底有什么」的门。
+#
+# ── 为什么是独立 workflow，而不是 package.yml 的第五条矩阵腿 / 一个 job ──
+#
+# 面 A（本机实测的构建面，见 `polaris-android-first-apk-2026-09-04.md`）：
+#   NDK 交叉编译 aarch64-linux-android → JDK 21 跑 AGP 8.11 → gradle assemble；
+#   `libbox.aar` 117 MiB 且 **gitignored**，须由固定 Go/gomobile/JDK/NDK 与 sing-box 源码现建；
+#   Android 构建由 scripts/build-android-apk.sh 统一选择 Rust NDK 并调用仓内 Tauri CLI。
+# 面 B（GitHub runner 能给什么）：
+#   预装 Android SDK / cmdline-tools / 多版本 JDK / Go；NDK 预装但版本随镜像漂；
+#   `actions/cache` 按「内核版本 × builder/manifest/patch 哈希」缓存 AAR 与构建收据。
+#
+# 两个面的对差落在**步骤序列**上，不落在 runner 或 tauri_args 上：package.yml 的 `package` job 有 40 个
+# step，全是桌面形态（fetch 桌面内核归档 / cronet / dashboard、编 helper、tauri-action 出 NSIS+dmg+deb、
+# mac ad-hoc seal、便携 zip、update-asset 命名契约）。Android 一个都用不上，塞进那条矩阵等于给几乎每个
+# step 挂 `if: matrix.label != 'android'`。
+#   [不选 package.yml 矩阵腿：见上；且 `setup.outputs.full` = 选中腿数 == 总腿数，加第五条会连带改写
+#    release job「绝不发半套」的判据，射程远超本腿]
+#   [不选 package.yml 里的独立 job：package.yml 只在 tag push / 手动 dispatch / 被 release-risk 调用时
+#    触发，PR 上根本不跑 ⇒ 这道门会迟到到发布那天才说话]
+#   [不选带 `paths:` 过滤的独立 workflow：本仓已实测过「带路径过滤的 workflow 在某些推送形态下一次都不跑」，
+#    release-risk.yml 顶部注释也明写「workflow 永远触发，路径分类发生在 job 内」。本腿跟随同一条纪律：
+#    自己不带任何路径过滤，由 release-risk 的 classify job 按 `scripts/classify-ci-impact.mjs` 的
+#    ANDROID_IMPACT_SCOPES 登记表决定要不要调用]
+#   [选独立可复用 workflow：步骤面不相交、触发面对（PR/merge_group/push main 都覆盖）、
+#    将来 release 要出 APK 时 package.yml 一行 `uses:` 就能接上]
+#
+# ── 触发 ──
+# 只有 `workflow_call`（release-risk 按影响面调用）与 `workflow_dispatch`（手动复跑）。
+# 没有 push/pull_request 直接触发：本腿要现建 libbox + 全量交叉编译，冷跑昂贵，不该挂在每个 PR 上。
+#
+# ── 两种调用只走 release profile ──
+# `publish_release=false`：release-risk 的普通风险验证构建一份未签名 release-profile APK，只在 runner
+# 上做 R8 / resources / native libraries / 16 KiB alignment 等产物级检查，并留存 mapping；APK 本身
+# 不上传为 Actions artifact，也不进入 GitHub Release。Debug 仅用于开发者本地真机功能 QA，CI 不构建。
+#
+# `publish_release=true`：package.yml 的 tag 发布 DAG 在桌面草稿资产验过后调用 `release-apk`，构建
+# 正式签名 Release APK，校验签名证书与 base applicationId，并只把这一个 APK 上传到同 tag 草稿。
+# 四项签名 secret 已在仓库侧配置；值始终只经 `secrets.*` 注入，不进入 workflow 文本或构建日志。
+on:
+  workflow_call:
+    inputs:
+      publish_release:
+        description: 把**签名的** release APK 发成 GitHub release 资产（需要四个签名 secret）
+        type: boolean
+        default: false
+      release_tag:
+        description: 资产挂到哪个 release tag；留空 = 取当前 ref（那时 ref 必须是 tag）
+        type: string
+        default: ''
+    outputs:
+      signed_apk_name:
+        description: 已验签且远端 digest 对拍成功的 Release APK 资产名
+        value: ${{ jobs.release-apk.outputs.signed_apk_name }}
+      signed_apk_sha256:
+        description: 已验签且远端 digest 对拍成功的 Release APK SHA-256
+        value: ${{ jobs.release-apk.outputs.signed_apk_sha256 }}
+    secrets:
+      POLARIS_KEYSTORE_BASE64:
+        description: base64 编码的 release 密钥库（仓外 ~/.polaris/android/release.jks 的内容）
+        required: false
+      POLARIS_KEYSTORE_PASSWORD:
+        description: 密钥库口令
+        required: false
+      POLARIS_KEY_PASSWORD:
+        description: 私钥口令
+        required: false
+      POLARIS_KEY_ALIAS:
+        description: 私钥别名
+        required: false
+  # 手动入口只跑非发布 release-profile 验证。发布参数只声明在 workflow_call，故只有 Package DAG
+  # 能传 publish_release=true；避免直接 Android dispatch 与 Package 对同一 tag 草稿并发 --clobber。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Shared provider imports are source reads; do not write Python bytecode into the App checkout.
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+# 判据与 ci.yml / ui.yml 一致：调用方名称进并发组，Android 与 Release Risk 内的复用互不取消。
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # release-profile 验证腿 —— 无正式密钥、不会分发的产物证据路径
+  # ══════════════════════════════════════════════════════════════════════════════
+  #
+  # ── 为什么必须有它（三件今天完全没有观测面的事）──
+  #
+  # ① **R8 到底吃进了哪些规则**。本工程的 keep 规则来自五个互不相干的源：入库的
+  #    `proguard-rules.pro`、Tauri CLI 现场生成的 `proguard-tauri.pro` 与
+  #    `generated/proguard-wry.pro`、`libbox.aar` 内的 `proguard.txt`（consumer 规则）、
+  #    以及各 AAR 依赖的 consumer 规则。前三份有源码级门守着「文件在不在、内容对不对」，
+  #    但**「consumer 规则到底进没进 R8」这一跳没有任何门** —— 它发生在 AGP 内部，
+  #    源码上看不见。`mapping/<variant>/configuration.txt` 是 R8 自己吐出来的**实际生效规则全文**，
+  #    是这一跳今天唯一能拿到的产物级证据。
+  # ② **mapping.txt 的保全**。`-keepattributes SourceFile,LineNumberTable` 只开了取证入口的
+  #    一半：拿到 logcat 里的 `at f.a.b(SourceFile:118)` 之后，要把它翻回真实类名/方法名，
+  #    靠的是 mapping.txt。而它今天只存在于构建机的 `app/build/` 下 —— clean 一次、换台机器，
+  #    那条崩溃就**永远还原不出来**（重构一版也没用：R8 输入一变，映射就对不上）。
+  #    所以它必须离开构建机，成为 artifact。
+  # ③ **APK 实际内容**。release profile 仍可能在资源、原生库或 16 KiB alignment 上退化；
+  #    `verify-apk.mjs` 必须对本次 R8 产物开箱，而不能用源码静态检查替代。
+  #
+  # ── 为什么走逃生门出**未签名**包 ──
+  # 签名秘密按裁定只经环境变量、密钥库在仓外（`~/.polaris/android/release.jks`）。仓库虽已配置
+  # 正式发布 secret，这条未分发验证腿仍刻意不读取它们，不能为了产物检查扩大私钥接触面。
+  # `-PpolarisAllowUnsigned=true` 是为 CI 产物验证准备的显式逃生门：它换来
+  # `app-arm64-release-unsigned.apk`，文件名本身就写着没签名。
+  # 它只认命令行实参（见 build.gradle.kts 的 `gradle.startParameter.projectProperties`），
+  # 所以这一行不会把逃生门留给后面任何一次构建。
+  #
+  # 🔴 代价要说清：这条腿因此对**签名**零信息量。它守的是 release-profile 产物与 R8 那一层
+  #    （configuration.txt / seeds.txt）；签名有效性由下面 `release-apk` 的 apksigner 步负责，
+  #    两条腿的判据不能互相冒充。边界表在 scripts/gate-android-release-behavior.sh 头注。
+  #
+  # ── 前置步骤与 `release-apk` job 逐字相同 ──
+  # GitHub Actions 没有 job 内的 step 复用，只能复制。两份会漂 ⇒ 由
+  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑦ 逐字对拍
+  # （射程：`- uses: actions/checkout@v7` 起，到 `libbox.aar 必须在位` 步止）。
+  release_check:
+    name: 未分发 release-profile 产物验证
+    # 发布调用由 signed job 覆盖同一组产物判据，不并行构建 unsigned APK。
+    if: inputs.publish_release != true
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm 11 要求 Node 22.13+，且版本必须与 ui.yml / package.yml 一致（同一套前端产物）。
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Setup pnpm (pinned)
+        id: pnpm
+        shell: bash
+        env:
+          PNPM_VERSION: '11.24.0'
+        run: |
+          set -euo pipefail
+          npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
+          got="$("$RUNNER_TEMP/pnpm/bin/pnpm" --version)"
+          [ "$got" = "$PNPM_VERSION" ] || {
+            echo "::error::pnpm is '$got', expected '$PNPM_VERSION'"; exit 1; }
+          echo "$RUNNER_TEMP/pnpm/bin" >> "$GITHUB_PATH"
+          echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm.outputs.store_path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust stable + android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android
+          rustup default stable
+          echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      # key 用固定串而不是 matrix：本 workflow 只有这一个 job、一个 target，
+      # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: android-aarch64
+
+      # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
+      # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      - name: Read pinned libbox Go version
+        id: libbox_go
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
+          version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").goVersion')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.libbox_go.outputs.version }}
+          cache: false
+
+      # ══ 工具链解析：Gradle JDK 从 runner 取；Rust/libbox NDK 从入库版本与 manifest 取 ══
+      #
+      # 不回落到 runner 默认 NDK：Rust 与 libbox 各自有已验工具链，缺席即失败。
+      - name: Resolve JDK / Android SDK / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ── JDK：两个用途、两个版本，都取镜像预装的那份（以 JAVA_HOME_<主版本>_X64 暴露）──
+          #   · Gradle / AGP 8.11 → JDK 21（AGP 支持 17–21，本机实测面就是 21）
+          #   · scripts/build-libbox.sh → **必须 openjdk 17**（其坑①：上游 build_libbox 的 main.go
+          #     逐串匹配 "openjdk 17"，21 会 FATAL；那个版本约束管的是 gomobile 生成 Java 源后的
+          #     class 文件版本，绕过去会在 d8/AGP 那侧炸）
+          : "${JAVA_HOME_21_X64:?镜像未暴露 JDK 21（JAVA_HOME_21_X64）—— runner 镜像变了，先确认再改本步}"
+          : "${JAVA_HOME_17_X64:?镜像未暴露 JDK 17（JAVA_HOME_17_X64）—— build-libbox.sh 坑① 要求 openjdk 17}"
+          {
+            echo "JAVA_HOME=$JAVA_HOME_21_X64"
+            echo "JDK17=$JAVA_HOME_17_X64"
+          } >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+
+          # ── SDK：平台与 build-tools 跟着 gen/android 的 compileSdk 走（判据从代码里读，不抄）──
+          : "${ANDROID_HOME:?镜像未暴露 ANDROID_HOME}"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sdkmanager" ] || { echo "::error::找不到 sdkmanager：$sdkmanager"; exit 1; }
+          compile_sdk="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+' \
+            src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
+          [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
+          echo "compileSdk=$compile_sdk"
+          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
+
+          # ── NDK：两个用途、两条不同约束 ──
+          #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
+          #   · libbox：使用 source-manifest.json 固定的独立 NDK（当前 r30 beta3）；
+          #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
+          rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
+          rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
+          if [ ! -f "$rust_ndk/source.properties" ]; then
+            "$sdkmanager" "ndk;$rust_ndk_version"
+          fi
+          [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
+          echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
+
+          echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
+
+      - name: Resolve bundled core version
+        id: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
+          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
+          echo "内核版本真值：v$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
+      #
+      # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
+      #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
+      # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
+      # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
+      # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
+      # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
+      - name: Prepare libbox tools and source cache identity
+        id: libbox_input
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
+          libbox_go="$(command -v go)"
+          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
+          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
+          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
+          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
+          echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
+          echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
+          fingerprint="$(python3 scripts/libbox-patches/android-source.py identity)"
+          [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libbox.aar
+        id: libbox
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            src-tauri/gen/android/app/libs/libbox.aar
+            scripts/libbox-patches/build-receipt.json
+          key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
+
+      - name: Build libbox.aar (缓存未命中)
+        if: steps.libbox.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$app_status" ]; then
+            echo "::error::App source candidate must be clean before libbox build"
+            git status --porcelain --untracked-files=all
+            exit 1
+          fi
+          src="$RUNNER_TEMP/sing-box"
+          # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
+          # A named ref keeps the pinned core reachable in the provider's shared clone.
+          python3 - "$RUNNER_TEMP" <<'PYDEPS'
+          import json, pathlib, subprocess, sys
+          source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
+          core = json.loads(pathlib.Path('src-tauri/core-manifest.json').read_text())
+          directory = pathlib.Path(sys.argv[1])
+          def revision(repository, ref):
+              return subprocess.check_output(['git', '-C', str(repository), 'rev-parse', ref], text=True).strip()
+          def fetch(url, commit, name):
+              repository = directory / name
+              repository.mkdir()  # Refuse stale runner checkouts; every input is fetched fresh.
+              subprocess.run(['git', 'init', '--quiet', str(repository)], check=True)
+              ref = 'refs/heads/polaris-source'
+              subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, commit + ':' + ref], check=True)
+              if revision(repository, commit + '^{commit}') != commit or revision(repository, ref) != commit:
+                  raise RuntimeError('Fetched upstream object/ref differs from manifest pin: ' + name)
+              return repository
+          url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
+          repository = fetch(url, source['sourceCommit'], 'sing-box')
+          tag = 'refs/tags/v' + core['bundledCoreVersion']
+          subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, tag + ':' + tag], check=True)
+          if revision(repository, tag + '^{commit}') != source['sourceCommit']:
+              raise RuntimeError('Upstream version tag differs from source-manifest commit')
+          subprocess.run(['git', '-C', str(repository), 'checkout', '--detach', source['sourceCommit']], check=True)
+          values = []
+          for dependency in source['dependencyPatches']:
+              repository = fetch(dependency['sourceURL'], dependency['upstreamCommit'], 'polaris-upstream-' + dependency['name'])
+              values.append('--module-source=' + dependency['module'] + '=' + str(repository))
+          (directory / 'polaris-module-sources.json').write_text(json.dumps(values))
+          PYDEPS
+          (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
+          mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
+          df -h / | tail -1
+          mapfile -t module_sources < <(python3 -c 'import json,os; print("\n".join(json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))))')
+          bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
+
+          # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
+          # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与 release
+          # APK。GitHub runner 的系统盘余量有限，且爆盘的报错形态（链接器
+          # 中途 ENOSPC）离真因很远。这里的缓存对本 job 之后的步骤零价值 —— 要的是那个 aar，
+          # 它已经落在 app/libs/ 下并会被 actions/cache 保存。
+          go clean -cache -modcache || true
+          rm -rf "$src" /var/tmp/gomobile-tmp
+          df -h / | tail -1
+
+      # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
+      # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
+      - name: libbox.aar 必须在位
+        id: libbox_verified
+        shell: bash
+        run: |
+          set -euo pipefail
+          aar=src-tauri/gen/android/app/libs/libbox.aar
+          [ -s "$aar" ] || {
+            echo "::error::$aar 缺失或为 0 字节 —— 这条腿的内核来源没拿到（缓存命中=${{ steps.libbox.outputs.cache-hit }}）"
+            exit 1; }
+          echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
+          python3 scripts/libbox-patches/verify-receipt.py
+
+      # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
+      - name: Save verified libbox.aar
+        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            src-tauri/gen/android/app/libs/libbox.aar
+            scripts/libbox-patches/build-receipt.json
+          key: ${{ steps.libbox.outputs.cache-primary-key }}
+
+
+      # Release profile 构建直接让 Tauri 驱动 Gradle；本腿显式只产出未分发的未签名验证包。
+      - name: Build unsigned release-profile validation APK
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.NDK_RUST }}
+          NDK_HOME: ${{ env.NDK_RUST }}
+        run: |
+          set -euo pipefail
+          # Tauri 2 passes trailing runner args to Cargo, not Gradle. Passing -P here aborts
+          # before Rust release or R8. Force this package to rebuild, then accept only the
+          # explicit missing-signing guard after Tauri has emitted this checkout's release SO.
+          cargo clean -p polaris --target aarch64-linux-android --release
+          marker="$RUNNER_TEMP/release-stage1-start"
+          touch "$marker"
+          stage1_log="$RUNNER_TEMP/release-stage1.log"
+          if bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \
+              --config src-tauri/tauri.android.conf.json >"$stage1_log" 2>&1; then
+            echo '::error::unsigned release validation stage1 unexpectedly bypassed the signing guard'
+            exit 1
+          fi
+          if ! grep -Fq 'Android release 签名凭据缺失 —— 拒绝静默产出未签名包。' "$stage1_log" \
+              || ! grep -q 'Finished.*release.*profile' "$stage1_log"; then
+            tail -80 "$stage1_log"
+            echo '::error::release Rust build did not reach the expected signing-only refusal'
+            exit 1
+          fi
+          so=target/aarch64-linux-android/release/libpolaris_lib.so
+          jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
+          up=src-tauri/gen/android/app/src/main/assets/_up_
+          [ -s "$so" ] && [ "$so" -nt "$marker" ] \
+            || { echo '::error::fresh release Rust SO missing'; exit 1; }
+          [ "$(readlink -f "$jni/libpolaris_lib.so")" = "$(realpath "$so")" ] \
+            || { echo '::error::jniLibs does not point to this release SO'; exit 1; }
+          [ -s "$jni/libc++_shared.so" ] || { echo '::error::libc++_shared.so missing'; exit 1; }
+          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
+            [ -s "$up/$f" ] || { echo "::error::$up/$f missing"; exit 1; }
+          done
+          [ -d "$up/resources/data" ] || { echo '::error::bundled data missing'; exit 1; }
+          echo "source=$(git rev-parse HEAD) release_so=$(sha256sum "$so" | cut -d' ' -f1)"
+
+          # The exact Rust task above is already complete. Run Gradle itself so -P is a
+          # command-line project property; never put the unsigned hatch in env/properties.
+          bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android \
+            :app:assembleArm64Release -PpolarisAllowUnsigned=true \
+            -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
+
+          for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
+            [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了"; exit 1; }
+          done
+          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
+            [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
+          done
+          [ -d "$up/resources/data" ] || { echo "::error::$up/resources/data 没铺出来"; exit 1; }
+
+      - name: wry keep 规则与生成物对拍
+        run: node scripts/verify-wry-keep-rules.mjs
+
+      - name: release 构建行为裁判（gradle 配置期实证）
+        run: bash scripts/gate-android-release-behavior.sh
+
+      # APK 不会上传；验证结论与 mapping 才是这条非发布腿的输出。
+      - name: 开箱验（resources / native libraries / 16 KiB）
+        run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a
+
+      # 先留存再判定：configuration.txt 的断言万一红了，mapping 也已经拿到手，
+      # 不用为了取证再构一版（而重构一版的 R8 输入已经变了，映射对不上）。
+      - name: 留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-release-mapping
+          path: |
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/mapping.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/usage.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/seeds.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/configuration.txt
+          # 一个文件都没命中 = R8 没跑或产物路径变了，那正是本步要抓的事，不许静默绿。
+          if-no-files-found: error
+          retention-days: 90
+
+      # ── R8 吃进了什么、又保住了什么（产物级证据）──
+      #
+      # 判据本体在 `scripts/assert-r8-evidence.mjs`，由 `scripts/assert-r8-evidence.test.mjs`
+      # 的正反用例钉着（含把下面两个洞原样回放）。内联在这里的上一版有两个洞：
+      #   ① 针不剥注释：R8 的 -printconfiguration 会把每份规则文件的**原文**（含 `#` 注释）
+      #      抄进 configuration.txt，而本仓 proguard-rules.pro 的注释里就写着
+      #      「libbox.aar 的 proguard.txt（go.** / io.nekohasekai.**）」—— 于是
+      #      `io.nekohasekai` 那根针永远命中，libbox 的 consumer 规则一条没进 R8 也照绿。
+      #   ② 只问 configuration.txt：它只证明规则**文本**到过 R8，不证明规则**匹配到了任何
+      #      东西**。keep 指向一个不存在的类时，那行文本照样在，而类已被 R8 整包剪掉。
+      #      「保住了什么」的判据是 seeds.txt —— 那份文件早就在上传清单里，却一条断言都没有。
+      - name: R8 吃进了什么 / 保住了什么（产物级证据）
+        run: |
+          node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+          python3 scripts/libbox-patches/verify-receipt.py --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+
+      - name: 记录未分发 APK 体积
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk
+          [ -s "$apk" ] || {
+            echo "::error::$apk 不在 —— 逃生门那条「文件名带 -unsigned 后缀」的契约变了，先确认再改判据"
+            ls -R src-tauri/gen/android/app/build/outputs/apk || true
+            exit 1; }
+          echo "release(unsigned, runner-only) = $(stat -c%s "$apk") 字节"
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # release 资产腿 —— 把**签名的** release APK 发成 GitHub release 资产
+  # ══════════════════════════════════════════════════════════════════════════════
+  #
+  # 四项签名 secret 已配置；package.yml 是自动发布调用方。缺凭据时本腿仍**当场失败**（下面
+  # 「取出签名密钥库」逐条点名），绝不退化成未签名包。所有 release mutation 还要同时满足：
+  # 目标 tag 指向本次 `GITHUB_SHA`，且目标 release 在写入前后都保持 draft。
+  #
+  # ── 为什么不能复用 `release_check` 出的那个包 ──
+  # 那条腿走的是 `-PpolarisAllowUnsigned=true` 逃生门，产物叫 `app-arm64-release-unsigned.apk`，
+  # 文件名本身就写着没签名。Android **只接受与已装应用同一把签名的升级包**：拿一个签名不一致
+  # （或干脆没签名）的 APK 去覆盖安装，系统给的是一句「应用未安装」，而这件事应用内观测不到
+  # （ACTION_VIEW 交出去之后没有回调）。故这条腿与验证腿刻意分开，且本腿的 assemble 那一行
+  # **不许**带验证腿那个 `-P…` 逃生门实参 —— 由
+  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑧ 逐字守着。
+  #
+  # ⚠️ 本段（连同下面 assemble 那一步的注释）**刻意不写出那个属性名的字面量**：⑧ 的取材面是
+  #    整个 job 的原文、含注释 —— 说明与实参在文本上不可分辨，把判据改成「只扫非注释行」
+  #    等于给「在注释里写、在实参里也写」开一条缝。宁可让说明绕着走。
+  #
+  # ── 资产名是一条跨文件命名契约 ──
+  # 下面 `asset_name=` 那一行的字面形态，与 `crates/updater/src/github.rs` 的
+  # `ANDROID_APK_SUFFIX` 是同一条契约的两端：选包器按后缀选包，漂一个字符的后果不是报错，
+  # 是**「Android 上永远查不到更新」**（`find_suitable_update_asset` 返 `None` ⇒ `NoUpdate`，
+  # 一句话都不说）。两端由 `crates/updater` 的
+  # `the_ci_asset_name_is_exactly_what_the_selector_picks` 逐字对拍：那条测试从本文件原文里
+  # 把这一行取出来、展开成一个真实文件名、喂进真的选包器。
+  #
+  # ── 前置步骤与 `release_check` job 逐字相同 ──
+  # GitHub Actions 没有 job 内的 step 复用，只能复制。两份会漂 ⇒ 由
+  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑦ 逐字对拍。
+  release-apk:
+    name: 签名 release APK → GitHub release 资产
+    if: inputs.publish_release
+    runs-on: ubuntu-22.04
+    # 上传 release 资产要写权限；workflow 级是 `contents: read`，只给这一个 job 放开。
+    permissions:
+      contents: write
+    outputs:
+      signed_apk_name: ${{ steps.asset.outputs.name }}
+      signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 先验发布身份，后续所有资产写入只认这一组 tag / commit / draft。
+      # publish_release 输入只存在于 workflow_call；package.yml 创建草稿后才可调用本 job。
+      - name: Verify target tag and draft release
+        id: release_identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          [ -n "$tag" ] || tag="$GITHUB_REF_NAME"
+          case "$tag" in v*) ;; *)
+            echo "::error::release tag 必须以 v 开头，实得：$tag"; exit 1;;
+          esac
+          if [ -z "$REQUESTED_TAG" ] && [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            echo "::error::当前 ref（$GITHUB_REF）不是 tag，且没传 release_tag"
+            exit 1
+          fi
+
+          # workflow_call 可显式传 tag；显式抓远端 tag 后对拍，拒绝跨 commit 发包。
+          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+          head_sha="$(git rev-parse HEAD)"
+          tag_sha="$(git rev-list -n 1 "$tag")"
+          if [ "$head_sha" != "$GITHUB_SHA" ] || [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Android 发布身份不一致：HEAD=$head_sha tag($tag)=$tag_sha GITHUB_SHA=$GITHUB_SHA"
+            exit 1
+          fi
+
+          release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
+          actual_tag="$(jq -r .tagName <<<"$release_json")"
+          is_draft="$(jq -r .isDraft <<<"$release_json")"
+          target_commitish="$(jq -r .targetCommitish <<<"$release_json")"
+          if [ "$actual_tag" != "$tag" ] || [ "$is_draft" != "true" ]; then
+            echo "::error::Android 只允许写入同 tag 草稿（tagName=$actual_tag isDraft=$is_draft）"
+            exit 1
+          fi
+          echo "::notice::release targetCommitish=$target_commitish（仅诊断；SHA 由远端 peeled tag 对拍）"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      # pnpm 11 要求 Node 22.13+，且版本必须与 ui.yml / package.yml 一致（同一套前端产物）。
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Setup pnpm (pinned)
+        id: pnpm
+        shell: bash
+        env:
+          PNPM_VERSION: '11.24.0'
+        run: |
+          set -euo pipefail
+          npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
+          got="$("$RUNNER_TEMP/pnpm/bin/pnpm" --version)"
+          [ "$got" = "$PNPM_VERSION" ] || {
+            echo "::error::pnpm is '$got', expected '$PNPM_VERSION'"; exit 1; }
+          echo "$RUNNER_TEMP/pnpm/bin" >> "$GITHUB_PATH"
+          echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm.outputs.store_path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust stable + android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android
+          rustup default stable
+          echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      # key 用固定串而不是 matrix：本 workflow 只有这一个 job、一个 target，
+      # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: android-aarch64
+
+      # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
+      # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      - name: Read pinned libbox Go version
+        id: libbox_go
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
+          version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").goVersion')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.libbox_go.outputs.version }}
+          cache: false
+
+      # ══ 工具链解析：Gradle JDK 从 runner 取；Rust/libbox NDK 从入库版本与 manifest 取 ══
+      #
+      # 不回落到 runner 默认 NDK：Rust 与 libbox 各自有已验工具链，缺席即失败。
+      - name: Resolve JDK / Android SDK / NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ── JDK：两个用途、两个版本，都取镜像预装的那份（以 JAVA_HOME_<主版本>_X64 暴露）──
+          #   · Gradle / AGP 8.11 → JDK 21（AGP 支持 17–21，本机实测面就是 21）
+          #   · scripts/build-libbox.sh → **必须 openjdk 17**（其坑①：上游 build_libbox 的 main.go
+          #     逐串匹配 "openjdk 17"，21 会 FATAL；那个版本约束管的是 gomobile 生成 Java 源后的
+          #     class 文件版本，绕过去会在 d8/AGP 那侧炸）
+          : "${JAVA_HOME_21_X64:?镜像未暴露 JDK 21（JAVA_HOME_21_X64）—— runner 镜像变了，先确认再改本步}"
+          : "${JAVA_HOME_17_X64:?镜像未暴露 JDK 17（JAVA_HOME_17_X64）—— build-libbox.sh 坑① 要求 openjdk 17}"
+          {
+            echo "JAVA_HOME=$JAVA_HOME_21_X64"
+            echo "JDK17=$JAVA_HOME_17_X64"
+          } >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+
+          # ── SDK：平台与 build-tools 跟着 gen/android 的 compileSdk 走（判据从代码里读，不抄）──
+          : "${ANDROID_HOME:?镜像未暴露 ANDROID_HOME}"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sdkmanager" ] || { echo "::error::找不到 sdkmanager：$sdkmanager"; exit 1; }
+          compile_sdk="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+' \
+            src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
+          [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
+          echo "compileSdk=$compile_sdk"
+          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
+
+          # ── NDK：两个用途、两条不同约束 ──
+          #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
+          #   · libbox：使用 source-manifest.json 固定的独立 NDK（当前 r30 beta3）；
+          #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
+          rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
+          rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
+          if [ ! -f "$rust_ndk/source.properties" ]; then
+            "$sdkmanager" "ndk;$rust_ndk_version"
+          fi
+          [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
+          echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
+
+          echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
+
+      - name: Resolve bundled core version
+        id: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
+          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
+          echo "内核版本真值：v$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
+      #
+      # [不选「预置成 release asset / 从别处下载」：那要求有人先手工传一份上去，
+      #  「没人传」与「传错了一份」都不会有任何东西说话 —— 正是本仓纪律里那条「自动化必须让没执行自曝」]
+      # [不选「只用 actions/cache，没有就跳过」：`if: cache-hit == 'true'` 这类静默短路等于没有这条腿]
+      # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
+      # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
+      # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
+      - name: Prepare libbox tools and source cache identity
+        id: libbox_input
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/libbox-patches/android-source.py admit
+          libbox_go="$(command -v go)"
+          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
+          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
+          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
+          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
+          echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
+          echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
+          fingerprint="$(python3 scripts/libbox-patches/android-source.py identity)"
+          [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libbox.aar
+        id: libbox
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            src-tauri/gen/android/app/libs/libbox.aar
+            scripts/libbox-patches/build-receipt.json
+          key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
+
+      - name: Build libbox.aar (缓存未命中)
+        if: steps.libbox.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_status="$(git status --porcelain --untracked-files=normal)"
+          if [ -n "$app_status" ]; then
+            echo "::error::App source candidate must be clean before libbox build"
+            git status --porcelain --untracked-files=all
+            exit 1
+          fi
+          src="$RUNNER_TEMP/sing-box"
+          # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
+          # A named ref keeps the pinned core reachable in the provider's shared clone.
+          python3 - "$RUNNER_TEMP" <<'PYDEPS'
+          import json, pathlib, subprocess, sys
+          source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
+          core = json.loads(pathlib.Path('src-tauri/core-manifest.json').read_text())
+          directory = pathlib.Path(sys.argv[1])
+          def revision(repository, ref):
+              return subprocess.check_output(['git', '-C', str(repository), 'rev-parse', ref], text=True).strip()
+          def fetch(url, commit, name):
+              repository = directory / name
+              repository.mkdir()  # Refuse stale runner checkouts; every input is fetched fresh.
+              subprocess.run(['git', 'init', '--quiet', str(repository)], check=True)
+              ref = 'refs/heads/polaris-source'
+              subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, commit + ':' + ref], check=True)
+              if revision(repository, commit + '^{commit}') != commit or revision(repository, ref) != commit:
+                  raise RuntimeError('Fetched upstream object/ref differs from manifest pin: ' + name)
+              return repository
+          url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
+          repository = fetch(url, source['sourceCommit'], 'sing-box')
+          tag = 'refs/tags/v' + core['bundledCoreVersion']
+          subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, tag + ':' + tag], check=True)
+          if revision(repository, tag + '^{commit}') != source['sourceCommit']:
+              raise RuntimeError('Upstream version tag differs from source-manifest commit')
+          subprocess.run(['git', '-C', str(repository), 'checkout', '--detach', source['sourceCommit']], check=True)
+          values = []
+          for dependency in source['dependencyPatches']:
+              repository = fetch(dependency['sourceURL'], dependency['upstreamCommit'], 'polaris-upstream-' + dependency['name'])
+              values.append('--module-source=' + dependency['module'] + '=' + str(repository))
+          (directory / 'polaris-module-sources.json').write_text(json.dumps(values))
+          PYDEPS
+          (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
+          mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
+          df -h / | tail -1
+          mapfile -t module_sources < <(python3 -c 'import json,os; print("\n".join(json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))))')
+          bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
+
+          # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
+          # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与 release
+          # APK。GitHub runner 的系统盘余量有限，且爆盘的报错形态（链接器
+          # 中途 ENOSPC）离真因很远。这里的缓存对本 job 之后的步骤零价值 —— 要的是那个 aar，
+          # 它已经落在 app/libs/ 下并会被 actions/cache 保存。
+          go clean -cache -modcache || true
+          rm -rf "$src" /var/tmp/gomobile-tmp
+          df -h / | tail -1
+
+      # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
+      # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
+      - name: libbox.aar 必须在位
+        id: libbox_verified
+        shell: bash
+        run: |
+          set -euo pipefail
+          aar=src-tauri/gen/android/app/libs/libbox.aar
+          [ -s "$aar" ] || {
+            echo "::error::$aar 缺失或为 0 字节 —— 这条腿的内核来源没拿到（缓存命中=${{ steps.libbox.outputs.cache-hit }}）"
+            exit 1; }
+          echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
+          python3 scripts/libbox-patches/verify-receipt.py
+
+      # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
+      - name: Save verified libbox.aar
+        if: success() && steps.libbox.outputs.cache-hit != 'true' && steps.libbox_verified.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            src-tauri/gen/android/app/libs/libbox.aar
+            scripts/libbox-patches/build-receipt.json
+          key: ${{ steps.libbox.outputs.cache-primary-key }}
+
+      # ── 签名凭据：从 secret 落到 runner 的临时路径，用后即删 ──
+      #
+      # 🔴 缺任何一件**当场失败**，不许继续：gradle 那侧缺凭据时会走 `signingBlockers` 大声失败，
+      #    但那要等到 assemble 才发生，且失败信息里混着一堆构建噪声。这里先问一遍，让「secret 没配」
+      #    这件事在第一秒就自曝（`feedback_silent_absence_must_self_report` 同一条纪律）。
+      #
+      # 🔴 口令与别名**不经这一步**：它们由下一步的 `env:` 直接从 secret 注入 gradle 进程，
+      #    绝不落任何文件、不进 `$GITHUB_ENV`。本步只落密钥库文件本身（它不是明文口令），
+      #    并只把它的**路径**写进 `$GITHUB_ENV`。
+      - name: 取出签名密钥库（缺任何一件当场失败，绝不退化成未签名包）
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.POLARIS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.POLARIS_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.POLARIS_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.POLARIS_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${KEYSTORE_BASE64:-}" ] || missing="$missing POLARIS_KEYSTORE_BASE64"
+          [ -n "${KEYSTORE_PASSWORD:-}" ] || missing="$missing POLARIS_KEYSTORE_PASSWORD"
+          [ -n "${KEY_PASSWORD:-}" ] || missing="$missing POLARIS_KEY_PASSWORD"
+          [ -n "${KEY_ALIAS:-}" ] || missing="$missing POLARIS_KEY_ALIAS"
+          if [ -n "$missing" ]; then
+            echo "::error::签名 secret 缺失：$missing —— 先在仓库 secrets 里配齐四件再跑本腿。"
+            echo "::error::密钥库按裁定在仓外（~/.polaris/android/release.jks），本仓不生成、不存放任何密钥或口令。"
+            exit 1
+          fi
+          jks="$RUNNER_TEMP/polaris-release.jks"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$jks"
+          [ -s "$jks" ] || {
+            echo "::error::密钥库解码后是 0 字节 —— POLARIS_KEYSTORE_BASE64 不是一份有效的 base64 密钥库"
+            exit 1; }
+          # 从本次 secret keystore + alias 导出**公钥证书**并固定它的 SHA-256。后面的 apksigner
+          # 必须报出同一摘要，避免「包确实签了，但不是这把正式发布钥匙」逃过只验签名结构的门。
+          cert="$RUNNER_TEMP/polaris-release-cert.der"
+          keytool -exportcert -keystore "$jks" -storepass:env KEYSTORE_PASSWORD \
+            -alias "$KEY_ALIAS" -file "$cert"
+          [ -s "$cert" ] || { echo "::error::从 release keystore/alias 导不出证书"; exit 1; }
+          cert_sha256="$(sha256sum "$cert" | cut -d' ' -f1)"
+          # 正式发布证书的公开 pin。只拿 APK 与 secret 里的证书互比，会在 secret 被误换成新 key 时
+          # 两边一起漂而继续全绿；必须再对拍这个首次发布身份，才能保证后续 APK 可覆盖升级。
+          pinned_cert_sha256='22c183cb41d3dcbe6d355ba58d0a012953c5036592b61fb1efacfe3fa36eabd7'
+          if [ "$cert_sha256" != "$pinned_cert_sha256" ]; then
+            echo "::error::仓库 release keystore/alias 的证书不是 Polaris 正式发布证书"
+            exit 1
+          fi
+          echo "密钥库已就位（$(stat -c%s "$jks") 字节）"
+          {
+            echo "POLARIS_KEYSTORE_FILE=$jks"
+            echo "POLARIS_RELEASE_CERT_SHA256=$cert_sha256"
+          } >> "$GITHUB_ENV"
+
+      # 🔴 **这一行不许带验证腿那个逃生门实参**（`release_check` 那条腿才用它；名字见那一步）：
+      #    它换来的是 `app-arm64-release-unsigned.apk`，而未签名 / 签名不一致的包在 Android 上
+      #    装不上。发布腿要的恰恰是「签不上就失败」，不是「签不上就出个别的包」。
+      - name: Build signed release APK
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.NDK_RUST }}
+          NDK_HOME: ${{ env.NDK_RUST }}
+          POLARIS_KEYSTORE_PASSWORD: ${{ secrets.POLARIS_KEYSTORE_PASSWORD }}
+          POLARIS_KEY_PASSWORD: ${{ secrets.POLARIS_KEY_PASSWORD }}
+          POLARIS_KEY_ALIAS: ${{ secrets.POLARIS_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \
+            --config src-tauri/tauri.android.conf.json
+
+          jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
+          up=src-tauri/gen/android/app/src/main/assets/_up_
+          for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
+            [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了"; exit 1; }
+          done
+          for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
+            [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
+          done
+          [ -d "$up/resources/data" ] || { echo "::error::$up/resources/data 没铺出来"; exit 1; }
+
+      # 两条 release-profile 腿都跑这一步；发布腿上的结果才对应最终用户拿到的包。
+      - name: wry keep 规则与生成物对拍
+        run: node scripts/verify-wry-keep-rules.mjs
+
+      # publish_release=true 时 unsigned 验证腿不运行；配置期判据必须由 signed job 自己承担。
+      - name: release 构建行为裁判（gradle 配置期实证）
+        run: bash scripts/gate-android-release-behavior.sh
+
+      # signed release 本身就是最强的 R8 取材点：configuration/seeds 必须来自将要发布的这次构建。
+      # mapping 只留在 Actions 内部供崩溃反混淆，不上传 GitHub Release；对外 release 仍只有 APK。
+      - name: 留存正式发布 mapping（内部取证，不是 release 资产）
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-release-mapping
+          path: |
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/mapping.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/usage.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/seeds.txt
+            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/configuration.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: R8 吃进了什么 / 保住了什么（发布包产物级证据）
+        run: node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+
+      # 用后即删，且**无论成败**：assemble 失败时密钥库同样要走，不能留在 runner 的工作区里。
+      - name: 删掉 runner 上的密钥库
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/polaris-release.jks" "$RUNNER_TEMP/polaris-release-cert.der"
+
+      # ── 改名成资产名（跨文件命名契约的产出侧）──
+      #
+      # 版本取的是**包里那一份**（`.tauri/tauri.properties` 的 `tauri.android.versionName`，
+      # 即 `build.gradle.kts` 自己读的那个文件），不是 `tauri.conf.json`：判据要住在真值所在地，
+      # 否则「conf 改了但 tauri CLI 没重铺 properties」会产出一个名字与内容对不上的资产。
+      - name: 改名成 release 资产名
+        id: asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          built=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk
+          [ -s "$built" ] || {
+            echo "::error::$built 不在。gradle 出的若是 app-arm64-release-unsigned.apk，说明签名根本没接上 —— 那个包装不上，绝不发。"
+            ls -R src-tauri/gen/android/app/build/outputs/apk || true
+            exit 1; }
+          props=src-tauri/gen/android/.tauri/tauri.properties
+          [ -s "$props" ] || { echo "::error::$props 不在 —— 版本号的真值源没铺出来"; exit 1; }
+          version=$(sed -n 's/^tauri\.android\.versionName=//p' "$props" | head -n1)
+          [ -n "$version" ] || { echo "::error::$props 里没有 tauri.android.versionName"; exit 1; }
+          tag="${{ steps.release_identity.outputs.tag }}"
+          [ "$tag" = "v$version" ] || {
+            echo "::error::tag（$tag）与包里的版本（$version）对不上 —— 发出去的资产会与它的名字说两件事"
+            exit 1; }
+          asset_name="polaris-${version}-android-arm64.apk"
+          cp "$built" "$RUNNER_TEMP/$asset_name"
+          {
+            echo "asset=$RUNNER_TEMP/$asset_name"
+            echo "name=$asset_name"
+            echo "sha256=$(sha256sum "$RUNNER_TEMP/$asset_name" | cut -d' ' -f1)"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "资产：$asset_name（$(stat -c%s "$RUNNER_TEMP/$asset_name") 字节）"
+
+      # 文件名带 release 不等于真的有 APK Signature Scheme；签过也不等于用了正式发布证书。
+      # 同时对拍 manifest package = Android base identifier，防 release 误带任何非正式后缀。
+      - name: Verify APK package ID and exact release signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          compile_sdk="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+' \
+            src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
+          [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
+          apksigner="$ANDROID_HOME/build-tools/${compile_sdk}.0.0/apksigner"
+          aapt2="$ANDROID_HOME/build-tools/${compile_sdk}.0.0/aapt2"
+          [ -x "$apksigner" ] || { echo "::error::找不到 apksigner：$apksigner"; exit 1; }
+          [ -x "$aapt2" ] || { echo "::error::找不到 aapt2：$aapt2"; exit 1; }
+          asset="${{ steps.asset.outputs.asset }}"
+
+          signature_report="$("$apksigner" verify --verbose --print-certs "$asset")"
+          printf '%s\n' "$signature_report"
+          mapfile -t certs < <(printf '%s\n' "$signature_report" | \
+            sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' | \
+            tr -d ':' | tr '[:upper:]' '[:lower:]')
+          if [ "${#certs[@]}" -ne 1 ] || [ "${certs[0]:-}" != "$POLARIS_RELEASE_CERT_SHA256" ]; then
+            echo "::error::APK 签名证书不是本次 release keystore/alias 的精确证书"
+            exit 1
+          fi
+
+          expected_id="$(node -p 'require("./src-tauri/tauri.android.conf.json").identifier')"
+          actual_id="$("$aapt2" dump badging "$asset" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
+          if [ -z "$expected_id" ] || [ "$actual_id" != "$expected_id" ]; then
+            echo "::error::release APK package ID 不等于 Android base identifier：actual=$actual_id expected=$expected_id"
+            exit 1
+          fi
+          echo "release APK package ID 与正式发布证书均已精确对拍"
+
+      # ══ 发之前先开箱：构建成功 ≠ 包里有东西 ══
+      # 与未分发 release-profile 腿同一份判据（资源有没有静默逃逸 / 死字节 / cronet-naive 在不在 / 符号剥没剥 /
+      # 出厂权限集）。发布包上少这一步，就是把「全绿但产物是垃圾」那四条已实证通路直接送给用户。
+      - name: 开箱验（产物级判据）
+        run: |
+          node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a
+          python3 scripts/libbox-patches/verify-receipt.py --apk ${{ steps.asset.outputs.asset }} --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+
+      - name: 上传成 release 资产
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.asset.outputs.tag }}"
+          asset="${{ steps.asset.outputs.asset }}"
+          name="${{ steps.asset.outputs.name }}"
+          expected_sha="${{ steps.asset.outputs.sha256 }}"
+
+          # 构建很久，mutation 紧前重新抓远端 peeled tag，并复核 release tag/draft。
+          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+          remote_tag_sha="$(git rev-list -n 1 "$tag")"
+          release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
+          if [ "$remote_tag_sha" != "$GITHUB_SHA" ] || \
+             [ "$(jq -r .tagName <<<"$release_json")" != "$tag" ] || \
+             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
+            echo "::error::tag/release 身份漂移，拒绝上传 APK（tagSha=$remote_tag_sha）"; exit 1
+          fi
+          echo "::notice::release targetCommitish=$(jq -r .targetCommitish <<<"$release_json")（仅诊断）"
+          gh release upload "$tag" "$asset" \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+          api_url="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json apiUrl,isDraft \
+            --jq 'select(.isDraft == true) | .apiUrl')"
+          [ -n "$api_url" ] || { echo "::error::APK 上传后 release 已不是草稿或取不到 apiUrl"; exit 1; }
+          row=''
+          for attempt in 1 2 3; do
+            row="$(gh api "$api_url" --jq ".assets[] | select(.name == \"$name\") | \"\\(.digest // \\\"MISSING\\\")\\t\\(.state // \\\"unknown\\\")\\t\\(.name)\"")"
+            [ "$(printf '%s' "$row" | awk -F'\t' '{print $1}')" = "sha256:$expected_sha" ] && \
+              [ "$(printf '%s' "$row" | awk -F'\t' '{print $2}')" = "uploaded" ] && break
+            [ "$attempt" -eq 3 ] && break
+            sleep 5
+          done
+          actual_sha="$(printf '%s' "$row" | awk -F'\t' '{print $1}')"
+          state="$(printf '%s' "$row" | awk -F'\t' '{print $2}')"
+          actual_name="$(printf '%s' "$row" | awk -F'\t' '{print $3}')"
+          if [ "$actual_name" != "$name" ] || [ "$state" != "uploaded" ] || \
+             [ "$actual_sha" != "sha256:$expected_sha" ]; then
+            echo "::error::远端 APK 未落定或 digest 与本地签名 APK 不符：$row"
+            exit 1
+          fi
+          echo "签名 APK 已上传到草稿，GitHub digest 与本地 sha256 相符"

@@ -179,6 +179,8 @@ fn whitelist_membership_is_pinned() {
         BACKEND_AUTHORITATIVE_KEYS.contains(&"builtinGeoMeta"),
         "随包 geo 元数据必须在白名单内（ui 全仓零读零写）"
     );
+    assert!(BACKEND_AUTHORITATIVE_KEYS.contains(&polaris_store::mesh_guard::POLICY_KEY));
+    assert!(BACKEND_AUTHORITATIVE_KEYS.contains(&polaris_store::mesh_guard::STATE_KEY));
     assert!(
         !BACKEND_AUTHORITATIVE_KEYS.contains(&"diagnosticCapture"),
         "诊断采集机制已整体删除，该键不得再作为任何人的权威字段留在白名单里"

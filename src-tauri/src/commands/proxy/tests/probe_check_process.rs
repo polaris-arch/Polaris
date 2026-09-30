@@ -6,18 +6,16 @@
 //! # 守的是什么
 //!
 //! `run_probe_check` 此前自己写了一遍 `sing-box check` 的子进程接线，超时有、但漏了
-//! `kill_on_drop(true)`：超时腿把 `output()` 的 future 直接丢掉，而 `tokio::process::Child` 的
-//! `kill_on_drop` **默认是 false**，于是每次超时都留下一个游离的 `sing-box check`。现在它改调
-//! `core-supervisor::config_gate::run_check_raw` —— 全仓唯一那份两样齐全的实现。
+//! 原超时腿把 `output()` 的 future 直接丢掉，未保留 Child native wait，留下游离 check。
+//! 现在它调用 `core-supervisor::config_gate::run_check_raw`，持久 registry 保留原 Child
+//! 到 native wait 和配置副本退休完成；LifecycleUnknown 必须向调用方传播。
 //!
-//! 判据是**可观察的进程行为**：超时之后见证文件永不出现 ⇒ 子进程真的没跑完。为什么这能算证明、
-//! 以及为什么只有 unix，见 [`write_sleeping_probe`] 的文档。
+//! 退出事实来自该调用成功返回的同 Child native wait；见证文件只辅助观察延迟写入未发生。
 
-use std::path::Path;
 use std::time::Duration;
 
 use super::super::{run_probe_check, ProbeCheck};
-use crate::test_support::{write_sleeping_probe, TestDir, PROBE_SLEEP_MILLIS};
+use crate::test_support::{write_sleeping_probe, TestDir};
 
 /// **正向对照**：探针在预算内跑完 ⇒ 判 `Supported`，且见证文件真的出现。
 ///
@@ -29,7 +27,9 @@ async fn supported_and_lets_the_child_finish_when_it_fits_the_budget() {
     let witness = dir.path().join("ran.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);
 
-    let verdict = run_probe_check(&probe, Path::new("probe.json")).await;
+    let config = dir.path().join("probe.json");
+    std::fs::write(&config, b"{}").unwrap();
+    let verdict = run_probe_check(&probe, &config).await.unwrap();
     assert!(
         matches!(verdict, ProbeCheck::Supported),
         "探针 rc=0 ⇒ 必须判 Supported"
@@ -45,17 +45,22 @@ async fn supported_and_lets_the_child_finish_when_it_fits_the_budget() {
 /// 改动前的这条腿会**留下游离进程**：超时判决是对的，但丢掉 future 并不杀子进程，那个
 /// `sing-box check` 会一路跑完并写出见证文件。本测在那份源码上因此转红。
 ///
-/// 时钟用 `start_paused`：超时预算是写死的 [`PROBE_CHECK_TIMEOUT`](super::super::PROBE_CHECK_TIMEOUT)
-/// （8 s），而这里要验的是超时之后子进程的去向，不是 8 这个数。虚拟时钟在运行时空转时自动推进到
-/// 定时器截止点，8 s 于是在微秒内走完，真实的探针一步都还没睡完。随后的等待用**真实**时钟：
-/// 见证文件的有无是真实世界的事实。
-#[tokio::test(start_paused = true)]
+/// 使用真实时钟：暂停 Tokio 时钟会同时越过清理 wait 的预算，OS SIGCHLD 尚未调度时
+/// 正确得到 CleanupUnknown，不能用它假造成功退出。此探针睡10秒，超过真实8秒预算。
+#[tokio::test]
 async fn timing_out_is_indeterminate_and_kills_the_child() {
     let dir = TestDir::new("polaris-probe-check-timeout-");
     let witness = dir.path().join("killed.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);
+    std::fs::write(
+        &probe,
+        format!("#!/bin/sh\nsleep 10\n: > '{}'\n", witness.display()),
+    )
+    .unwrap();
 
-    let verdict = run_probe_check(&probe, Path::new("probe.json")).await;
+    let config = dir.path().join("probe.json");
+    std::fs::write(&config, b"{}").unwrap();
+    let verdict = run_probe_check(&probe, &config).await.unwrap();
     assert!(
         matches!(verdict, ProbeCheck::Indeterminate),
         "超时是 failOpen：判 Supported 会把没验过的协议说成支持，判 Unsupported 会把一个\
@@ -63,9 +68,9 @@ async fn timing_out_is_indeterminate_and_kills_the_child() {
     );
 
     // 真实时钟：等过探针的睡眠时长再看。活着的话这会儿早写完了。
-    std::thread::sleep(Duration::from_millis(PROBE_SLEEP_MILLIS + 300));
+    std::thread::sleep(Duration::from_secs(3));
     assert!(
         !witness.exists(),
-        "超时后子进程仍跑完并写了见证文件 ⇒ `kill_on_drop(true)` 没生效，每次超时泄漏一个 check 进程"
+        "超时后的探针仍完成延迟写入；原 Child wait/清理接线未守住"
     );
 }

@@ -22,7 +22,12 @@
  */
 
 import type { ServerConfig } from '@/contracts/types';
-import type { FieldSpec } from './FieldSpec';
+/* 类型从**纯类型模块** `./field-spec` 取，不从渲染器 `./FieldSpec.tsx` 取。
+   两者只差大小写，但后者是桌面 React 组件：移动端的 `ts-spec` / `wg-spec` / `warp-spec`
+   引用本模块，从渲染器取类型会把整棵桌面组件树拖进移动端模块图
+   （实测多出 `clsx` / `tailwind-merge` / `react-dom` 三个运行时依赖，
+   由 `styles/css-oracle.test.ts` ⑤ 的依赖钉钉住）。姊妹文件同一写法。 */
+import type { FieldSpec } from './field-spec';
 
 /** 三个组网表单共用的字段描述符（放各自的「高级」分组，与 `bindInterface` 同处）。 */
 export const ON_DEMAND_FIELD: FieldSpec = {

@@ -44,6 +44,7 @@ const NO_RECONNECT: Duration = Duration::from_secs(3600);
 /// mock server 状态：记录收到的调用 + 可配置的流行为。
 #[derive(Default)]
 struct MockState {
+    clash_mode: Arc<std::sync::Mutex<String>>,
     select_calls: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     close_calls: Arc<std::sync::Mutex<Vec<String>>>,
     close_all_count: Arc<AtomicU64>,
@@ -89,6 +90,28 @@ struct MockService {
 
 #[tonic::async_trait]
 impl StartedService for MockService {
+    async fn get_clash_mode_status(
+        &self,
+        req: Request<Empty>,
+    ) -> Result<Response<daemon::ClashModeStatus>, Status> {
+        check_auth(&req, &self.secret)?;
+        Ok(Response::new(daemon::ClashModeStatus {
+            mode_list: vec!["normal".into(), "mesh-direct".into()],
+            current_mode: self.state.clash_mode.lock().unwrap().clone(),
+        }))
+    }
+
+    async fn set_clash_mode(
+        &self,
+        req: Request<daemon::ClashMode>,
+    ) -> Result<Response<Empty>, Status> {
+        check_auth(&req, &self.secret)?;
+        let mode = req.into_inner().mode;
+        if mode == "normal" || mode == "mesh-direct" {
+            *self.state.clash_mode.lock().unwrap() = mode;
+        }
+        Ok(Response::new(Empty {}))
+    }
     type SubscribeOpenConnectStatusStream =
         ReceiverStream<Result<daemon::OpenConnectStatusUpdate, Status>>;
     async fn subscribe_open_connect_status(
@@ -676,6 +699,23 @@ async fn select_outbound_succeeds_with_bearer_auth() {
     assert_eq!(calls[0].1, "jp-tokyo-01");
 }
 
+#[tokio::test]
+async fn clash_mode_roundtrip_exposes_silent_invalid_mode_noop() {
+    let (addr, _state, _h) = spawn_server(SECRET, 0).await;
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    client.set_clash_mode("normal").await.unwrap();
+    assert_eq!(
+        client.get_clash_mode_status().await.unwrap().current_mode,
+        "normal"
+    );
+    client.set_clash_mode("missing").await.unwrap();
+    let after = client.get_clash_mode_status().await.unwrap();
+    assert_eq!(after.current_mode, "normal");
+    assert_eq!(after.mode_list, ["normal", "mesh-direct"]);
+}
+
 /// **首帧一次性读**：`SubscribeGroups` 是 server-stream，但服务端先发一帧当前快照，
 /// 故 `first_groups_snapshot` 必须拿到首帧就返回，**不得等到第二帧**（mock 首帧后沉默 30s，
 /// 等第二帧就会撞 3s `SnapshotTimeout`）。
@@ -982,6 +1022,37 @@ async fn endpoint_target_ipv6_bracketing() {
     // lazy channel：connect 不立即失败，但首 RPC 才报错。这里仅断言不 panic。
     // 若 connect 实现为 lazy（h2c 是 lazy），返回 Ok。
     let _ = res;
+}
+
+#[tokio::test]
+async fn lazy_old_h2c_request_cannot_reach_new_core_on_fresh_port() {
+    // Keep the old address reserved while binding the replacement so the
+    // endpoint identities are deterministically different. The client is a real
+    // tonic lazy Channel: its connector has not run before the new core starts.
+    let old_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old_port = old_listener.local_addr().unwrap().port();
+    let old_client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", old_port), SECRET)
+        .await
+        .unwrap();
+    let old_call = tokio::spawn(async move { old_client.set_clash_mode("mesh-direct").await });
+    // The real tonic connector has established TCP and queued the h2/RPC work,
+    // but this old endpoint deliberately never serves HTTP/2.
+    let (old_socket, _) = tokio::time::timeout(Duration::from_secs(2), old_listener.accept())
+        .await
+        .expect("old lazy connector reached TCP barrier")
+        .unwrap();
+    let (new_addr, new_state, _server) = spawn_server(SECRET, 0).await;
+    assert_ne!(old_port, new_addr.port());
+    drop(old_socket);
+    drop(old_listener);
+
+    assert!(old_call.await.unwrap().is_err());
+    assert!(new_state.clash_mode.lock().unwrap().is_empty());
+    let new_client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", new_addr.port()), SECRET)
+        .await
+        .unwrap();
+    new_client.set_clash_mode("normal").await.unwrap();
+    assert_eq!(*new_state.clash_mode.lock().unwrap(), "normal");
 }
 
 #[tokio::test]

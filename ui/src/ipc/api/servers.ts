@@ -62,6 +62,11 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PREPARE, { serverId, attemptId });
   },
 
+  /** Read the last native result for this request after a browser foreground transition. */
+  async tailscaleLoginProgress(serverId: string, attemptId: string): Promise<import('@/domain/tailscale-login-progress').TailscaleLoginProgress | null> {
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PROGRESS, { serverId, attemptId });
+  },
+
   async tailscaleLogin(server: ServerConfig, request: { attemptId: string; mode: 'browser' | 'authkey' }): Promise<{
     started: boolean;
     reason?: 'inMainCore' | 'cancelled';
@@ -170,14 +175,14 @@ export const serverApi = {
 
   /** 订阅测速单个节点完成事件（流式增量显示，不等队列）。 */
   onSpeedTestResult(
-    listener: (data: { serverId: string; latency: number }) => void
+    listener: (data: { serverId: string; latency: number; runId?: string }) => void
   ): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT, listener);
   },
 
   /** 订阅测速进度事件（已测/成功/总数）。 */
   onSpeedTestProgress(
-    listener: (data: { tested: number; ok: number; total: number }) => void
+    listener: (data: { tested: number; ok: number; total: number; runId?: string }) => void
   ): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_PROGRESS, listener);
   },

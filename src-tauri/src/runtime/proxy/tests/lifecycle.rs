@@ -1,5 +1,59 @@
 use super::*;
 
+#[test]
+fn native_reconnect_marker_is_a_read_only_status_projection() {
+    let (_rt, dir) = test_runtime();
+    let marker = dir.join(super::super::lifecycle::NATIVE_RECONNECT_MARKER);
+    assert!(!super::super::lifecycle::native_reconnect_required(&dir));
+    std::fs::write(&marker, b"dual-mode-reload-requires-reconnect").unwrap();
+    assert!(super::super::lifecycle::native_reconnect_required(&dir));
+    std::fs::remove_file(marker).unwrap();
+    assert!(!super::super::lifecycle::native_reconnect_required(&dir));
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sweep() {
+    let (rt, dir) = test_runtime();
+    std::fs::write(
+        dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE),
+        b"bad marker",
+    )
+    .unwrap();
+    let generation = rt.gate.generation();
+    let sweeps = rt.stale_sweep_runs.load(Ordering::SeqCst);
+
+    assert!(rt.start(bad_config()).await.is_err());
+    assert_eq!(rt.gate.generation(), generation);
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
+    assert!(rt.restart(bad_config()).await.is_err());
+    assert_eq!(rt.gate.generation(), generation);
+    assert!(
+        !rt.gate.is_busy(),
+        "restart must not begin a denied lifecycle"
+    );
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |outcome, ticket| {
+            let _ = tx.send((outcome, ticket));
+        });
+    let (outcome, ticket) = rx.await.unwrap();
+    assert!(matches!(
+        outcome,
+        polaris_switch_engine::DebouncedOutcome::Proceed(None)
+    ));
+    assert!(rt
+        .claim_debounced_restart(None, generation, ticket)
+        .is_none());
+    assert_eq!(
+        rt.gate.generation(),
+        generation,
+        "timer must not retire the live generation"
+    );
+}
+
 /// 停止终态必须丢弃暂存的 switch（停止优先：不得停后又被 switch 拉起）。
 #[tokio::test]
 async fn stop_terminal_discards_pending_switch() {
@@ -125,7 +179,7 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
     );
     let started = method_body(&src, "    pub(super) async fn start_guarded(");
     let inner_return = started
-        .find("let r = self.start_inner(config, my_gen).await;")
+        .find("let r = self.start_inner(config, my_gen, &_tailscale_gate).await;")
         .expect("start 包装必须等待 start_inner 完整事务");
     let drop_inflight = started
         .find("drop(inflight);")
@@ -139,10 +193,10 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
     );
 }
 
-/// 活态查询的模式必须取 `startup_snapshot` 这份**运行核快照**，不能取结构重启去抖前已被
-/// `apply_restart` 前推的新 `current_config`。
+/// 活态查询的模式必须取 `startup_snapshot` 这份**运行核快照**。即使出现其它来源造成的
+/// current_config 与已启动核分叉，也不能让磁盘/待应用的新模式覆盖实际运行模式。
 #[test]
-fn running_proxy_mode_type_tracks_the_running_snapshot_only() {
+fn running_effective_proxy_mode_type_tracks_the_running_snapshot_only() {
     let (rt, _dir) = test_runtime();
     mark_running(&rt);
     for (mode, expected) in [
@@ -156,24 +210,24 @@ fn running_proxy_mode_type_tracks_the_running_snapshot_only() {
             "proxyMode": "smart",
             "proxyModeType": mode,
         }));
-        // 精确复现结构切换窗口：current_config 已提交成相反的新模式，旧核仍按 startup snapshot 跑。
+        // 注入运行态账本意外分叉，确认活态模式仍由起核快照提供。
         *rt.current_config.write().unwrap() = Some(serde_json::json!({
             "servers": [],
             "selectedServerId": "__direct__",
             "proxyMode": "smart",
             "proxyModeType": if mode == "systemProxy" { "tun" } else { "systemProxy" },
         }));
-        assert_eq!(rt.running_proxy_mode_type(), Some(expected));
+        assert_eq!(rt.running_effective_proxy_mode_type(), Some(expected));
     }
     *rt.startup_snapshot.write().unwrap() = None;
     assert_eq!(
-        rt.running_proxy_mode_type(),
+        rt.running_effective_proxy_mode_type(),
         None,
-        "核在跑但无起核快照时必须返回 unknown，不能回落到已前推的 current_config"
+        "核在跑但无起核快照时必须返回 unknown，不能回落到 current_config"
     );
     *rt.status.write().unwrap() = ProxyStatus::default();
     assert_eq!(
-        rt.running_proxy_mode_type(),
+        rt.running_effective_proxy_mode_type(),
         None,
         "核未运行时不得把残留 current_config 冒充运行模式"
     );
@@ -730,6 +784,7 @@ async fn restart_stop_leg_does_not_clear_system_proxy() {
         1,
         "无旧运行快照的 restart 全程恰一次清（来自 start 失败腿）；共用 stop_inner 不得无条件清"
     );
+    assert_eq!(rt.gate.depth(), 0, "正常重启失败腿也必须归还外层门深度");
 }
 
 #[tokio::test]
@@ -932,25 +987,26 @@ async fn delayed_debounced_restart_cannot_start_after_stop() {
 /// 仍带着旧 OS 代理。行为逻辑由 `restart_system_proxy_cleanup_truth_table` 覆盖，这里只钉调用位置。
 #[test]
 fn restart_cross_mode_proxy_cleanup_is_owned_and_between_legs() {
-    let body = method_body(
-        &module_code("runtime/proxy"),
-        "    async fn restart_inner(self: &Arc<Self>, config: Value, claim: StopClaim) -> RestartLeg {",
-    );
-    let stop = body
-        .find("let stop_generation = match self.stop_inner(claim).await {")
+    let body = method_body(&module_code("runtime/proxy"), "    async fn restart_inner(");
+    let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let stop = compact
+        .find("letstop_generation=matchself.stop_inner(claim).await{")
         .unwrap();
-    let clear = body
-        .find("if should_clear_system_proxy_between_restart(old_mode, new_mode)")
-        .unwrap();
-    let start = body
-        .find("self.start_guarded(config, Some(stop_generation)).await")
+    let clear = compact
+        .find("ifshould_clear_system_proxy_between_restart(old_mode,new_mode,platform)")
+        .expect(
+            "跨模式代理收口必须调 `should_clear_system_proxy_between_restart`，\
+             且把**平台**一并喂进去（该谓词按本平台生效值判断，见其文档）",
+        );
+    let start = compact
+        .find("self.start_guarded(config,Some(stop_generation)).await")
         .unwrap();
     assert!(
         stop < clear && clear < start,
         "跨模式代理收口必须位于 owned stop 与新 start 之间；实际方法体：\n{body}"
     );
     assert!(
-        body[clear..start].contains("self.clear_system_proxy().await;"),
+        compact[clear..start].contains("self.clear_system_proxy().await;"),
         "判定命中后必须复用 marker 门控的统一清理点；实际方法体：\n{body}"
     );
 }
@@ -1025,6 +1081,8 @@ async fn real_core_full_lifecycle() {
                             id: conn.id.clone(),
                             chains: conn.chain_list.clone(),
                             rule: conn.rule.clone(),
+                            rule_id: None,
+                            rule_name: None,
                             metadata: None,
                             upload: Some(conn.uplink_total as u64),
                             download: Some(conn.downlink_total as u64),
@@ -1180,7 +1238,7 @@ async fn real_core_lifecycle_race_start_then_immediate_stop() {
             "[⑥] round{round}: stop 后不得 running"
         );
         assert!(
-            rt.child.lock().unwrap().is_none(),
+            rt.child.lock().unwrap().is_empty(),
             "[⑥] round{round}: stop 后不得残留 child 句柄"
         );
         assert!(
@@ -1216,6 +1274,7 @@ fn proxy_status_serializes_camel_case_contract() {
         update_in_port: 45678,
         subscription_update_in_port: 45679,
         starting: false,
+        reconnect_required: true,
     };
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["running"], true);
@@ -1230,6 +1289,7 @@ fn proxy_status_serializes_camel_case_contract() {
     assert_eq!(v["uptime"], 90);
     assert_eq!(v["error"], "boom");
     assert_eq!(v["errorCode"], "STARTUP_FAILED");
+    assert_eq!(v["reconnectRequired"], true);
 
     // pid=0 / 未运行时省略（对齐 上游 `pid?` / `startTime?` / `uptime?` / `errorCode?`）。
     let z = ProxyStatus::default();
@@ -1237,6 +1297,7 @@ fn proxy_status_serializes_camel_case_contract() {
     assert!(zv.get("pid").is_none());
     assert!(zv.get("startTime").is_none());
     assert!(zv.get("uptime").is_none());
+    assert!(zv.get("reconnectRequired").is_none());
     assert!(zv.get("errorCode").is_none());
     // starting 同样是「false 即省略」的可选字段（渲染端 `starting?: boolean`）。
     assert!(zv.get("starting").is_none());
@@ -1406,6 +1467,7 @@ fn lifecycle_payload_contract_keys() {
     let uncoded = serde_json::to_value(ProxyLifecycleEvent::failed(&StartError {
         message: "写盘失败".into(),
         code: None,
+        admission_denied: false,
     }))
     .expect("可序列化");
     assert_eq!(
@@ -1849,12 +1911,108 @@ async fn old_stop_waiting_for_tailscale_gate_preserves_new_generation_owner() {
     .await
     .unwrap();
     rt.bump_generation();
-    rt.mesh.reserve_tailscale_main_states(&serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":dir.join("tailscale/new-session")}]})).await;
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt.mesh.reserve_tailscale_main_states(&serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":dir.join("tailscale/new-session")}]}), &gate, token).await.unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
     mark_running(&rt);
     drop(gate);
     assert!(stop.await.unwrap().unwrap().is_none());
     assert!(rt.status().running);
     assert!(rt.mesh.main_owns_tailscale("new-session", true));
+}
+
+#[tokio::test]
+async fn preclaimed_stop_under_tailscale_gate_does_not_reacquire_or_admit_waiter() {
+    let (rt, _dir) = test_runtime();
+    let acquired = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let route_holder = {
+        let (mesh, acquired, release) = (
+            Arc::clone(&rt.mesh),
+            Arc::clone(&acquired),
+            Arc::clone(&release),
+        );
+        tokio::spawn(async move {
+            mesh.occupy_exit_route_lock_for_test(acquired, release)
+                .await;
+        })
+    };
+    acquired.notified().await;
+    let generation = rt.gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    let (gate_owned_tx, gate_owned_rx) = tokio::sync::oneshot::channel();
+    let stop = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            let held = rt.mesh.tailscale_state_gate().await;
+            gate_owned_tx.send(()).unwrap();
+            rt.stop_inner_under_gate(generation, &held).await
+        })
+    };
+    gate_owned_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rt.gate.depth() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("under-gate stop must enter the shared teardown body");
+    let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
+    let waiter = {
+        let mesh = Arc::clone(&rt.mesh);
+        tokio::spawn(async move {
+            let _held = mesh.tailscale_state_gate().await;
+            waiter_tx.send(()).unwrap();
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        waiter_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(
+        !stop.is_finished(),
+        "route lock must suspend the stop while it owns the state gate"
+    );
+    release.notify_one();
+    route_holder.await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), stop)
+            .await
+            .expect("holding the state gate must not deadlock the stop")
+            .unwrap()
+            .unwrap(),
+        Some(generation)
+    );
+    tokio::time::timeout(Duration::from_secs(2), &mut waiter_rx)
+        .await
+        .expect("gate waiter must enter after the stop releases it")
+        .unwrap();
+    waiter.await.unwrap();
+    assert_eq!(rt.gate.depth(), 0);
+}
+
+#[tokio::test]
+async fn superseded_preclaimed_stop_under_gate_balances_lifecycle() {
+    let (rt, _dir) = test_runtime();
+    let held = rt.mesh.tailscale_state_gate().await;
+    let obsolete = rt.gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    let newer = rt
+        .gate
+        .claim_generation(None, LifecycleKind::Start)
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            rt.stop_inner_under_gate(obsolete, &held)
+        )
+        .await
+        .expect("already held gate must not be acquired twice")
+        .unwrap(),
+        None
+    );
+    assert_eq!(rt.gate.generation(), newer);
+    assert_eq!(rt.gate.depth(), 0, "superseded stop must pair begin/end");
 }
 
 #[test]
@@ -1882,7 +2040,7 @@ fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
         .find("self.gate.generation()!=requested_generation")
         .unwrap();
     let inner = compact
-        .find("self.start_inner(config,my_gen).await")
+        .find("self.start_inner(config,my_gen,&_tailscale_gate).await")
         .unwrap();
     assert!(
         gate < early_fence && early_fence < sweep && sweep < inner,
@@ -1901,4 +2059,36 @@ fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
     let final_reservation = inner.rfind("reserve_tailscale_main_states").unwrap();
     let ready_snapshot = inner.find("self.startup_snapshot.write()").unwrap();
     assert!(reservation < spawn && final_reservation < ready_snapshot);
+}
+
+#[test]
+fn android_global_custody_is_checked_before_claim_and_stale_sweep() {
+    let src = module_code("runtime/proxy");
+    let claim_body = method_body(
+        &src,
+        "    pub(super) fn claim_android_global_start_generation(",
+    );
+    let claim_compact: String = claim_body
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let custody_lock = claim_compact
+        .find("self.android_main_token.lock()")
+        .expect("claim must hold Android custody");
+    let claim_generation = claim_compact
+        .find("self.claim_generation(None,LifecycleKind::Start)")
+        .expect("claim must publish generation under custody");
+    assert!(custody_lock < claim_generation);
+    let started = method_body(&src, "    pub(super) async fn start_guarded(");
+    let compact: String = started.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let custody = compact
+        .find("self.claim_android_global_start_generation()")
+        .expect("explicit Android Start must claim under global custody");
+    let sweep = compact
+        .find("self.cleanup_stale_cores().await")
+        .expect("stale cleanup entry");
+    let gate_recheck = compact[..sweep]
+        .rfind("self.admit_direct_slot()")
+        .expect("Start must recheck admission under the TS gate");
+    assert!(custody < gate_recheck && gate_recheck < sweep);
 }

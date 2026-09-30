@@ -39,7 +39,7 @@ const DIRECT_SERVER_ID: &str = "__direct__";
 /// id 缺失 / 空 → mint uuid（镜像 [`server_add_bulk`] 的 `s["id"]=new_uuid()`）。
 ///
 /// 此前 `server_add` 直接 push 原值不补 id → `store::sanitize` 丢弃 id 缺失/空的节点（要求 id 非空字符串）
-/// → 克隆 / 手动加的节点产出不可用、不持久。非对象由单条新增校验拒绝。
+/// → 克隆 / 手动加的节点产出不可用、不持久。非对象入参不动（随后由新增校验拒绝）。
 fn ensure_server_id(mut server: Value) -> Value {
     if let Some(obj) = server.as_object_mut() {
         let has_id = obj
@@ -53,63 +53,74 @@ fn ensure_server_id(mut server: Value) -> Value {
     server
 }
 
-/// 单条新增先走存储层同一套清洗与模型解码，避免被保存腿过滤后仍返回成功。
-fn validate_server_add(server: Value) -> Result<Value, String> {
-    let mut probe = polaris_store::sanitize_config(&json!({"servers": [server]}).to_string())
-        .map_err(|_| "SERVER_ADD_INVALID".to_string())?;
-    let server = probe["servers"]
-        .as_array_mut()
-        .filter(|servers| servers.len() == 1)
-        .map(|servers| servers.remove(0))
-        .ok_or_else(|| "SERVER_ADD_INVALID".to_string())?;
-    serde_json::from_value::<ServerConfig>(server.clone())
-        .map_err(|_| "SERVER_ADD_INVALID".to_string())?;
-    if !polaris_store::validate::protocol_requirement_ok(
-        &server["protocol"]
-            .as_str()
-            .expect("validated protocol")
-            .to_lowercase(),
-        &server,
-    ) {
-        return Err("SERVER_ADD_INVALID".to_string());
-    }
-    Ok(server)
+/// 用 ConfigStore 同一套规则校验/规范化新增记录，避免被清洗掉却向调用者报成功。
+fn normalized_add_server(server: Value) -> Result<Value, String> {
+    let cleaned = polaris_store::sanitize_config(&json!({"servers": [server]}).to_string())
+        .map_err(|_| "新增节点校验失败".to_string())?;
+    let normalized = cleaned["servers"]
+        .as_array()
+        .and_then(|servers| servers.first())
+        .cloned()
+        .ok_or_else(|| "新增节点缺少必填字段或协议配置无效".to_string())?;
+    // The store deliberately preserves unknown/optional fields. A wrong-typed known field
+    // (for example tlsSettings as a string) must still be rejected before a successful add.
+    serde_json::from_value::<ServerConfig>(normalized.clone())
+        .map_err(|_| "新增节点协议配置字段类型无效".to_string())?;
+    Ok(normalized)
 }
 
-/// `server:add` 核心：校验、补 id、原子落盘并确认存活。同 id 同内容重试幂等，冲突不写。
+/// 补 id + 校验 + 原子落盘。同 id 同规范化内容重试不再写入；冲突不覆盖既有节点。
 fn server_add_core(config: &ConfigManager, server: Value) -> Result<Value, String> {
-    let server = validate_server_add(ensure_server_id(server))?;
-    let id = server["id"].as_str().expect("validated server id");
+    let server = normalized_add_server(ensure_server_id(server))?;
+    let id = server["id"].as_str().expect("sanitize 保证非空 id");
     let (result, saved) = config
         .update(|cfg| {
             let Some(servers) = cfg.get("servers").and_then(Value::as_array) else {
-                return Decision::Skip(Err("SERVER_ADD_INVALID_CONFIG".to_string()));
+                return Decision::Skip(Err("节点列表不可用".to_string()));
             };
-            if let Some(existing) = servers.iter().find(|existing| existing["id"] == id) {
-                return if *existing == server {
-                    Decision::Skip(Ok(Some(cfg.clone())))
+            if let Some(existing) = servers.iter().find(|node| node["id"].as_str() == Some(id)) {
+                return if normalized_add_server(existing.clone()).as_ref() == Ok(&server) {
+                    Decision::Skip(Ok(cfg.clone()))
                 } else {
-                    Decision::Skip(Err("SERVER_ADD_ID_CONFLICT".to_string()))
+                    Decision::Skip(Err("节点标识已存在且内容不同".to_string()))
                 };
             }
+            // 检查集合级清洗约束；仅在副本上验证，不把清洗后的集合写回旧节点。
+            let mut proposed = servers.clone();
+            proposed.push(server.clone());
+            let cleaned =
+                match polaris_store::sanitize_config(&json!({"servers": proposed}).to_string()) {
+                    Ok(cleaned) => cleaned,
+                    Err(_) => return Decision::Skip(Err("新增节点校验失败".to_string())),
+                };
+            if !cleaned["servers"]
+                .as_array()
+                .is_some_and(|nodes| nodes.iter().any(|node| node["id"].as_str() == Some(id)))
+            {
+                return Decision::Skip(Err("新增节点与现有节点配置冲突".to_string()));
+            }
             cfg["servers"].as_array_mut().unwrap().push(server.clone());
-            Decision::Write(Ok(None))
+            Decision::Write(Ok(Value::Null))
         })
         .map_err(|e| format!("{e}"))?;
-    let persisted = saved.or(result?).expect("write or idempotent snapshot");
-    if !persisted["servers"]
-        .as_array()
-        .is_some_and(|servers| servers.contains(&server))
-    {
-        return Err("SERVER_ADD_NOT_PERSISTED".to_string());
-    }
-    Ok(persisted)
+    result.map(|unchanged| saved.unwrap_or(unchanged))
 }
 
 /// 上游 `SERVER_ADD`：新增节点（id 缺失/空则 mint，防 sanitize 丢弃）。
 ///
-/// WARP 单例槽继续由渲染端 `meshSingletonConflict` 在注册前检查。本入口负责单条输入
-/// 校验和持久化确认；Tailscale 可保存多个节点，其状态写入所有权由登录运行时管理。
+/// DESIGN-REVIEW(mesh-singleton-guard-renderer-only)：WARP 的 UI 单例槽判据在渲染端
+/// （`ui/src/domain/endpoint-routes.ts#meshSingletonConflict`）。上游存储允许多个独立的
+/// Tailscale 节点，本命令不得把旧 TS 单例 UX 误写成持久化约束。本命令不另造 WARP 启发式守卫；
+/// 但 `server:add` 会复用 ConfigStore 既有清洗策略，确保新增节点能保留，不能把策略拒绝报成成功。
+/// [`server_add_bulk`] 仍沿用原批量导入路径。UI 判据不在 Rust 侧重写，理由：
+///  1. 判定谓词 `isWarpServer` 在 Rust 侧无对应物（`domain/warp.ts` 头注已登记此边界：输入均在前端
+///     store，漂移后果止于 UI）。在此复刻一份「端点域名兜底 + warpDevice 标记」的启发式 = 造第二真值源，
+///     无 codegen 约束，日后必然与渲染端的 WARP 识别分叉。
+///  2. 误判方向不可接受：本命令同时是备份恢复 / 导入的落盘substrate，Rust 侧启发式误拒一个合法节点，
+///     用户在 UI 上无从修复；而渲染端误拒最多是弹一次错、用户改地址重来。
+///  3. 威胁模型：`server:add` 只被本应用自己的 webview 调用，不接受外部不可信输入。
+///
+/// 若日后新增**非渲染端**的写入方（CLI / 深链接 / 远程配置下发），本决定即失效，须在此补守卫。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -559,7 +570,10 @@ impl ServerSwitchReceipt {
             Some(SwitchOutcome::HotSwitched | SwitchOutcome::NoOp | SwitchOutcome::Unchanged) => {
                 ("applied", None)
             }
-            Some(SwitchOutcome::Pending | SwitchOutcome::Restarting) => ("pending", None),
+            Some(SwitchOutcome::Pending) => ("pending", None),
+            // The selector cannot express a route/DNS projection change. A restart is
+            // already scheduled; the user does not need to apply this selection again.
+            Some(SwitchOutcome::Restarting) => ("restarting", None),
             Some(SwitchOutcome::NotRunning) => ("notRunning", None),
             Some(SwitchOutcome::Deferred) => ("deferred", Some("nodeRequiresApply")),
             None => ("superseded", None),
@@ -590,7 +604,8 @@ pub async fn server_switch(
         || state.proxy().register_selector_intent(),
     ) {
         Ok((_cfg, _exit_changed, intent_generation)) => {
-            // Only signal disk observers. A regular config broadcast would Apply unrelated D debt.
+            // 只发磁盘变更信号：显式选择在下方等待受限 R 投影的结果，不能再让普通广播
+            // 后台把完整 D（含此前保存未 Apply 的 DNS/规则）送入运行核。
             emit_config_changed_signal(&app);
             let starting_generation = state.proxy().core_generation();
             match state
@@ -604,6 +619,8 @@ pub async fn server_switch(
                         starting_generation,
                         intent_generation,
                     );
+                    // 保存 D 本身未改变出口；热切成功由 runtime 按 R 作废，重启就绪由
+                    // start/reassert 续延作废。Pending/Deferred 时旧核仍跑旧出口，缓存仍有效。
                     Ok(ApiResponse::ok(ServerSwitchReceipt::from_outcome(outcome)))
                 }
                 Err(error) => Ok(ApiResponse::err(error)),
@@ -798,26 +815,44 @@ pub async fn warp_apply_license(
 /// Register the renderer-minted identity before save/check/subscribe can be cancelled.
 /// Registration never starts a process; cancelled identities remain bounded tombstones.
 #[tauri::command]
-pub fn tailscale_login_prepare(
+pub async fn tailscale_login_prepare(
     state: State<'_, AppRuntime>,
     server_id: String,
     attempt_id: String,
-) -> ApiResponse<()> {
+) -> Result<ApiResponse<()>, ()> {
     if polaris_mesh::tailscale_state::tailscale_state_dir(std::path::Path::new("."), &server_id)
         .is_err()
     {
-        return ApiResponse::err_with_code(
+        return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node identity",
             "TAILSCALE_LOGIN_BAD_SERVER",
-        );
+        ));
     }
-    match state
-        .mesh()
-        .prepare_tailscale_login(&server_id, &attempt_id)
-    {
-        Ok(()) => ok_void(),
-        Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_BAD_ATTEMPT"),
-    }
+    Ok(
+        match state
+            .mesh()
+            .prepare_tailscale_login(&server_id, &attempt_id)
+            .await
+        {
+            Ok(()) => ok_void(),
+            Err(reason) => ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_BAD_ATTEMPT"),
+        },
+    )
+}
+
+/// Recover the last native receipt for this exact request after the renderer resumes.
+/// Absence is unknown, never evidence that a TS state directory means authorization succeeded.
+#[tauri::command]
+pub async fn tailscale_login_progress(
+    state: State<'_, AppRuntime>,
+    server_id: String,
+    attempt_id: String,
+) -> Result<ApiResponse<Option<crate::runtime::tailscale_login_core::LoginProgressReceipt>>, ()> {
+    Ok(ApiResponse::ok(
+        state
+            .mesh()
+            .tailscale_login_progress(&server_id, &attempt_id),
+    ))
 }
 
 /// Authorize the persisted node with an explicit browser/AuthKey mode and prepared attempt identity.
@@ -831,36 +866,79 @@ pub async fn tailscale_login(
     server: Value,
     request: crate::runtime::tailscale_login_core::LoginRequest,
 ) -> Result<ApiResponse<Value>, ()> {
-    let Some(server_id) = server.get("id").and_then(Value::as_str) else {
+    let Ok(requested) = serde_json::from_value::<ServerConfig>(server) else {
         return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node",
             "TAILSCALE_LOGIN_BAD_SERVER",
         ));
     };
-    // Login consumes the persisted node, so a failed/staged save cannot authorize another identity.
-    let Ok(saved) = state.config().current() else {
+    if requested.id.is_empty()
+        || requested.protocol
+            != polaris_config_engine::user_config::server_config::Protocol::Tailscale
+    {
         return Ok(ApiResponse::err_with_code(
-            "Cannot read the saved node",
+            "Invalid Tailscale node",
             "TAILSCALE_LOGIN_BAD_SERVER",
         ));
-    };
-    let Some(server_cfg) = saved
-        .get("servers")
-        .and_then(Value::as_array)
-        .and_then(|nodes| {
-            nodes
+    }
+    // Resolve only after the registry takes the TS state gate. A renderer request may have
+    // waited through an identity retirement after this command was dispatched.
+    let saved_server = || -> Result<ServerConfig, String> {
+        let saved = state
+            .config()
+            .current()
+            .map_err(|_| "Cannot read the saved Tailscale node".to_string())?;
+        let nodes = saved
+            .get("servers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Saved Tailscale nodes are unavailable".to_string())?;
+        let matching: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.get("id").and_then(Value::as_str) == Some(&requested.id))
+            .collect();
+        let &[node] = matching.as_slice() else {
+            return Err("Saved Tailscale node is absent or duplicated".into());
+        };
+        let current: ServerConfig = serde_json::from_value(node.clone())
+            .map_err(|_| "Saved Tailscale node is invalid".to_string())?;
+        if current.protocol
+            != polaris_config_engine::user_config::server_config::Protocol::Tailscale
+        {
+            return Err("Saved Tailscale identity changed".into());
+        }
+        if let Some(raw_state) = saved.get("meshRouteState") {
+            use polaris_config_engine::user_config::mesh_route_state::{
+                MeshBindingState, MeshRouteState,
+            };
+            let state: MeshRouteState = serde_json::from_value(raw_state.clone())
+                .map_err(|_| "Saved mesh identity ledger is invalid".to_string())?;
+            let active: Vec<_> = state
+                .identities
                 .iter()
-                .find(|node| node.get("id").and_then(Value::as_str) == Some(server_id))
-        })
-        .and_then(|node| serde_json::from_value::<ServerConfig>(node.clone()).ok())
-        .filter(|node| {
-            node.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale
-        })
-    else {
-        return Ok(ApiResponse::err_with_code(
-            "Save the Tailscale node before authorization",
-            "TAILSCALE_LOGIN_BAD_SERVER",
-        ));
+                .filter(|identity| {
+                    identity.server_id == requested.id
+                        && matches!(
+                            identity.binding_state,
+                            MeshBindingState::Bound | MeshBindingState::Unbound
+                        )
+                })
+                .collect();
+            if active.len() != 1 {
+                return Err("Saved Tailscale identity epoch is unavailable".into());
+            }
+            let authority = current
+                .tailscale_settings
+                .as_ref()
+                .and_then(|settings| settings.control_url.as_deref())
+                .filter(|url| !url.is_empty())
+                .unwrap_or("https://controlplane.tailscale.com");
+            let canonical = polaris_config_engine::user_config::mesh_identity_reconcile::canonical_control_authority(authority)
+                .map_err(|_| "Saved Tailscale authority is invalid".to_string())?;
+            if canonical != active[0].control_authority {
+                return Err("Saved Tailscale identity authority changed".into());
+            }
+        }
+        Ok(current)
     };
     let main_core = || {
         let cfg = state
@@ -881,7 +959,7 @@ pub async fn tailscale_login(
     };
     match state
         .mesh()
-        .start_tailscale_login(app, &server_cfg, request, &main_core)
+        .start_tailscale_login(app, &requested, request, &saved_server, &main_core)
         .await
     {
         StartLoginOutcome::Started => Ok(ApiResponse::ok(json!({"started": true}))),
@@ -893,6 +971,10 @@ pub async fn tailscale_login(
         )),
         StartLoginOutcome::Cancelled => Ok(ApiResponse::ok(
             json!({"started": false, "reason": "cancelled"}),
+        )),
+        StartLoginOutcome::AndroidCapacityClosed(error) => Ok(ApiResponse::err_with_code(
+            error.to_string(),
+            crate::runtime::proxy::code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED,
         )),
         StartLoginOutcome::Failed(reason) => {
             Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED"))

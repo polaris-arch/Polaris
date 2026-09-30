@@ -4,6 +4,17 @@
 //! 以及 macOS legacy 路径「原生事务优先 / `Unavailable` 回落 networksetup CLI」的
 //! 唯一二择点（T3）。exact 路径一旦被 controller 选中就 fail closed，不再回落 CLI。
 //! 命令构造与输出解析在 `windows.rs` / `macos_cli.rs` / `linux.rs`，本模块不重复实现。
+//!
+//! # `Platform::Android` 与 `Platform::Other` 全程同臂（2026-09-04 K10 逐处判过，不是继承）
+//!
+//! 「系统代理」在 Android 上**没有对应的 OS 概念**：没有全局 HTTP/HTTPS/SOCKS 设置面（Wi-Fi 的
+//! per-SSID 代理既非全局、也非非 root 应用可写），亦无 gsettings / 注册表 / `networksetup` 的对应物。
+//! 故 `Err(UnsupportedPlatform)` 是**事实**而不是降级 —— 与 `Other`「不知道这个平台怎么做」是两条
+//! 不同的理由、同一个答案。
+//!
+//! 这条腿在 Android 上的可达性：移动端只跑 TUN 模式，`proxyModeType == systemProxy` 需要用户从
+//! 桌面备份里带过来。带过来时得到的是一条**显式错误**（会走到 `set_nonfatal_error`），不是静默失败
+//! —— 这是本次审计特意确认过的一点：本模块的 `Other` 臂全是 `Err`，没有一处 `Ok(())` 假成功。
 
 use super::linux::{
     linux_applied_snapshot, linux_disable_command, linux_enable_commands,
@@ -674,9 +685,13 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 Ok(false)
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy transaction".into(),
-            )),
+            // exact_transaction_available。iOS 同 Other：**没有可事务化的对象**。「精确事务」
+            // 指的是把系统代理设置的读-改-写收进一次原子操作，而 iOS 上第三方应用连那份设置的
+            // 读面都没有（见下方 get_proxy_status 臂）。返 Err 是显式的「本平台不支持」，
+            // 上层据此走非事务腿而不是拿一个假的 `false` 继续往下。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy transaction".into()),
+            ),
         }
     }
 
@@ -725,9 +740,13 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 self.linux_protocol_projection(false)
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy".into(),
-            )),
+            // get_proxy_status。iOS 同 Other：系统 HTTP 代理设置在 iOS 上是**每 Wi-Fi 网络**的
+            // 一项配置，只能由用户在设置里手改或由 MDM 描述文件下发，没有任何应用可读的 API。
+            // 返 Err（而不是 `SystemProxyStatus::default()`）是关键：default 会被上层读成
+            // 「已确认未启用」，而真相是「读不到」。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy".into()),
+            ),
         }
     }
 
@@ -786,9 +805,12 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
             // Win/Linux 的代理是全局设置（注册表 / gsettings），无「逐服务」概念 → 单元素占位
             // （与 trait doc 一致；调用方按单目标遍历即可）。
             Platform::Win | Platform::Linux => Ok(vec![String::new()]),
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy".into(),
-            )),
+            // list_network_services。iOS 同 Other：没有「网络服务」这个可枚举面
+            // （`networksetup -listallnetworkservices` 的对应物不存在）。Win/Linux 那条单元素
+            // 占位在这里不适用——占位的前提是「有一个全局设置可写」，iOS 连那个都没有。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy".into()),
+            ),
         }
     }
 
@@ -830,9 +852,12 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 },
                 self.sleeper,
             ),
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy".into(),
-            )),
+            // set_proxy。iOS 同 Other：无写面。这一臂是整条系统代理腿在 iOS 上的**承重拒绝点**
+            // ——`ProxyModeType::effective_on(Ios)` 已经把接管方式恒判成 `Tun`，本臂是那条判据
+            // 万一被绕过时的第二道显式失败，而不是静默 no-op。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy".into()),
+            ),
         }
     }
 
@@ -889,9 +914,11 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 Ok(())
             }
             Platform::Linux => self.run(&linux_disable_command()).map(|_| ()),
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy".into(),
-            )),
+            // clear_proxy。iOS 同 Other：既然写不进去，也就没有我们写的东西可清。返 Err 而不是
+            // `Ok(())`：`Ok(())` 会让「清理完成」这件事在日志与状态机里成立，而实际上什么都没发生。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy".into()),
+            ),
         }
     }
 
@@ -939,9 +966,10 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 Ok(())
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy".into(),
-            )),
+            // restore_proxy。iOS 同 Other：没有可还原的原值快照（capture 那一臂同样返 Err）。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy".into()),
+            ),
         }
     }
 
@@ -1031,9 +1059,12 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 SystemProxyOps::capture_transaction_snapshot(self)
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy transaction".into(),
-            )),
+            // capture_transaction_snapshot。iOS 同 Other：快照的内容是系统代理设置的当前值，
+            // 而那份值在 iOS 上读不到 —— 拍一张空快照会让后面的 relation 比对得出「没变」这个
+            // 假结论。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy transaction".into()),
+            ),
         }
     }
 
@@ -1108,9 +1139,10 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 SystemProxyOps::build_applied_snapshot(self, req, _apply_base)
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy transaction".into(),
-            )),
+            // build_applied_snapshot。iOS 同 Other：同上，没有「应用之后应当是什么样」可构造。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy transaction".into()),
+            ),
         }
     }
 
@@ -1177,9 +1209,10 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 SystemProxyOps::apply_transaction(self, req, apply_base)
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy transaction".into(),
-            )),
+            // apply_transaction。iOS 同 Other：无写面，同 set_proxy 臂。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy transaction".into()),
+            ),
         }
     }
 
@@ -1244,9 +1277,10 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 SystemProxyOps::restore_transaction(self, original, current)
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy transaction".into(),
-            )),
+            // restore_transaction。iOS 同 Other：无写面且无原值，同 restore_proxy 臂。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy transaction".into()),
+            ),
         }
     }
 
@@ -1300,7 +1334,12 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 }
                 SystemProxyOps::snapshot_relation(self, from, to, current)
             }
-            Platform::Other => ProxySnapshotRelation::Foreign,
+            // Android 同 Other：本平台没有「系统代理」这个 OS 概念可比对，任何快照
+            // 都不是我们写的 ⇒ Foreign（诚实的「管不着」）。
+            // iOS 同 Android/Other：同样没有「系统代理」这个 OS 概念可比对。理由与 Android 那句
+            // 同向但来源不同——Android 是非 root 应用无权改全局代理设置，iOS 是那份设置本身
+            // 按 Wi-Fi 网络存放且只对系统设置界面与 MDM 开放。
+            Platform::Other | Platform::Android | Platform::Ios => ProxySnapshotRelation::Foreign,
         }
     }
 }

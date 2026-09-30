@@ -61,8 +61,10 @@ fn inbounds_matches_polaris_golden() {
         let deps = InboundsDeps {
             probe_direct_port: case.input.ports.probe_direct,
             probe_proxy_port: case.input.ports.probe_proxy,
+            debug_probe_mixed_udp: false,
             update_in_port: case.input.ports.update_in,
             subscription_update_in_port: None,
+            loopback_auth: None,
             probe_pool_ports: case.input.ports.probe_pool.clone(),
             platform: case.input.platform.clone(),
             own_lan_cidrs: vec![],

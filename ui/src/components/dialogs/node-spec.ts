@@ -23,7 +23,7 @@
  * select 的**选项文案**不在此列：多为专有名词（TCP/xtls-rprx-vision/…）直接字面量，不入 i18n。
  */
 
-import type { FieldSpec, FormValues } from './FieldSpec';
+import type { FieldSpec, FormValues } from './field-spec';
 
 /** 节点表单支持的 17 协议（不含 wireguard/tailscale，见上方文件头注释）。 */
 export type NodeProto =

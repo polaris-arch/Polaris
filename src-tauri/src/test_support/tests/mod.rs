@@ -31,7 +31,7 @@ const MISC_MARKERS: [(&str, &str); 7] = [
         "misc.rs",
         "pub use autostart::{auto_start_get_status, auto_start_set}",
     ),
-    ("autostart.rs", "pub fn auto_start_set"),
+    ("autostart.rs", "pub async fn auto_start_set"),
     ("backup.rs", "pub async fn backup_export"),
     ("dashboard.rs", "pub async fn open_singbox_dashboard"),
     ("ipinfo.rs", "pub(crate) fn ipinfo_probe_is_current"),
@@ -50,6 +50,60 @@ fn removes_directory_during_panic_unwind() {
     }));
     assert!(result.is_err());
     assert!(!path.unwrap().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn created_directory_under_a_temp_alias_owns_its_canonical_path() {
+    use std::os::unix::fs::symlink;
+
+    let base = TestDir::new("polaris-test-support-alias-");
+    let real_parent = base.join("real");
+    let alias_parent = base.join("alias");
+    std::fs::create_dir(&real_parent).unwrap();
+    symlink(&real_parent, &alias_parent).unwrap();
+    let owned_path;
+    {
+        let dir = TestDir::new_in("owned-", &alias_parent);
+        owned_path = dir.path().to_path_buf();
+        assert_eq!(owned_path, std::fs::canonicalize(&owned_path).unwrap());
+        assert_eq!(owned_path.parent(), Some(real_parent.as_path()));
+        std::fs::write(dir.join("sentinel"), b"owned").unwrap();
+    }
+    assert!(!owned_path.exists());
+    assert!(alias_parent.is_symlink());
+    assert!(real_parent.is_dir());
+}
+
+#[test]
+fn created_directory_supports_file_url_roundtrips() {
+    let dir = TestDir::new("polaris-test-support-file-url-");
+    let path = dir.join("picked.md");
+    std::fs::write(&path, b"picked file").unwrap();
+
+    let picked = crate::commands::picked_file::tests::file_url_of(&path);
+    let roundtrip = picked.into_path().unwrap();
+    assert_eq!(roundtrip, path);
+    assert_eq!(std::fs::read(roundtrip).unwrap(), b"picked file");
+}
+
+#[test]
+fn retained_rule_file_can_be_read_using_builder_path_string() {
+    use polaris_config_engine::builder::custom_rule_files::ext_rule_file_exists;
+
+    let dir = TestDir::new("polaris-test-support-retained-rule-");
+    let rules_dir = dir.join("tailnet-rules");
+    std::fs::create_dir(&rules_dir).unwrap();
+    let path = rules_dir.join("tailnet-ts1.json");
+    let bytes = br#"{"version":3,"rules":[{"ip_cidr":["100.64.0.1/32"]}]}"#;
+    std::fs::write(&path, bytes).unwrap();
+
+    // The builder receives a directory string and appends '/' to its rule name.
+    let builder_path = format!("{}/tailnet-ts1.json", rules_dir.display());
+    assert!(ext_rule_file_exists(&builder_path));
+    assert_eq!(std::fs::read(&builder_path).unwrap(), bytes);
+    std::fs::remove_file(path).unwrap();
+    assert!(!ext_rule_file_exists(&builder_path));
 }
 
 // ── 锚点：与调用方文件位置无关 ────────────────────────────────────────────

@@ -23,6 +23,98 @@
 //! `crate::codec` 的编帧函数按 [`crate::Platform`] 决定是否加 token 行）。
 
 use crate::command;
+use std::num::NonZeroU32;
+
+/// Opaque identity minted once per helper-owned child birth.
+///
+/// This type only carries bytes. The helper must mint them from an OS random source;
+/// PID, clocks, addresses, and `Arc` identity are not birth tokens.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HelperBirthToken([u8; 16]);
+
+impl HelperBirthToken {
+    /// Wrap bytes obtained from the helper's OS random source.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Parse exactly 32 lowercase hex digits. No trimming or aliases are accepted.
+    #[must_use]
+    pub fn parse_wire(wire: &str) -> Option<Self> {
+        if wire.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0; 16];
+        for (index, pair) in wire.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            bytes[index] = (digit(pair[0])? << 4) | digit(pair[1])?;
+        }
+        Some(Self(bytes))
+    }
+
+    /// Canonical 32-character lowercase hex wire token.
+    #[must_use]
+    pub fn to_wire(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(32);
+        for byte in self.0 {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+}
+
+impl std::fmt::Debug for HelperBirthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HelperBirthToken(..)")
+    }
+}
+
+/// A PID alone is insufficient to name a helper-owned child across PID reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HelperBirthTarget {
+    pub pid: NonZeroU32,
+    pub birth: HelperBirthToken,
+}
+
+impl HelperBirthTarget {
+    /// Parse exactly one canonical decimal PID and one birth token.
+    #[must_use]
+    pub fn parse_wire(pid: &str, birth: &str) -> Option<Self> {
+        if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let parsed = pid.parse::<NonZeroU32>().ok()?;
+        (parsed.to_string() == pid).then_some(Self {
+            pid: parsed,
+            birth: HelperBirthToken::parse_wire(birth)?,
+        })
+    }
+}
+
+/// Strict decoder for the complete `stop-birth-safe` argument list.
+///
+/// A missing, duplicate, or extra identity line is invalid. In particular it
+/// must never become legacy `Stop(None)` or `LinuxStop { pid: None }`.
+#[must_use]
+pub fn parse_linux_birth_stop_args(lines: &[&str]) -> Option<HelperBirthTarget> {
+    let [pid, birth] = lines else {
+        return None;
+    };
+    HelperBirthTarget::parse_wire(pid, birth)
+}
+
+/// Strict decoder for macOS/Windows native-birth Stop arguments.
+#[must_use]
+pub fn parse_native_birth_stop_args(lines: &[&str]) -> Option<HelperBirthTarget> {
+    parse_linux_birth_stop_args(lines)
+}
 
 /// `start` 命令的参数（三平台同构，`helper.go:508-513` 等）。
 ///
@@ -51,7 +143,7 @@ pub struct StartParams {
     pub parent_pid: Option<u32>,
 }
 
-/// Linux `start` 多一个核路径行（客户端传的 sing-box 路径，必须 == 锁定的 coreDir/sing-box，
+/// Linux `start-reap-safe` 多一个核路径行（客户端传的 sing-box 路径，必须 == 锁定的 coreDir/sing-box，
 /// `helper-linux/helper.go:401,417-420`）。封装为独立字段以便 mac/win 不带它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxStartParams {
@@ -110,13 +202,28 @@ pub enum Request {
     /// `pid: Some(p)` = 「只停 p 这个受管核」；`pid: None` = 旧语义「停你当前受管的那个」
     /// （不发身份行，帧与旧客户端逐字节一致）。
     Stop { pid: Option<u32> },
+    /// Linux native-reap Stop capability. The distinct command token makes
+    /// old helpers reject before mutating their child state.
+    LinuxStop { pid: Option<u32> },
+    /// Linux exact birth Start; carries the same path/config lines as `LinuxStart`.
+    LinuxStartBirth(LinuxStartParams),
+    /// Linux exact birth Status; no argument lines.
+    LinuxStatusBirth,
+    /// Linux exact birth Stop; both identity lines are required.
+    LinuxStopBirth { target: HelperBirthTarget },
+    /// macOS/Windows exact native birth Start. Legacy helpers reject this command.
+    NativeStartBirth(StartParams),
+    /// Read-only native birth capability and custody status.
+    NativeStatusBirth,
+    /// Stop one exact native birth; both identity lines are mandatory.
+    NativeStopBirth { target: HelperBirthTarget },
     /// `cleanup`（无参数行）。
     Cleanup,
     /// `freeport <port>`（行3/行2 = 端口字符串）。
     FreePort { port: u16 },
     /// mac/win：`start <cfg> <log> <fwd> <ppid?>`。
     Start(StartParams),
-    /// linux：`start <singbox> <cfg> <log> <fwd> <ppid?>`（多核路径行）。
+    /// linux：`start-reap-safe <singbox> <cfg> <log> <fwd> <ppid?>`。
     LinuxStart(LinuxStartParams),
     /// `route-add <iface> <cidrs>`（mac/win）。
     RouteAdd(RouteParams),
@@ -155,9 +262,17 @@ impl Request {
             Self::Version => command::common::VERSION,
             Self::Status => command::common::STATUS,
             Self::Stop { .. } => command::common::STOP,
+            Self::LinuxStop { .. } => command::linux::STOP_REAP_SAFE,
+            Self::LinuxStartBirth(_) => command::linux::START_BIRTH_SAFE,
+            Self::LinuxStatusBirth => command::linux::STATUS_BIRTH_SAFE,
+            Self::LinuxStopBirth { .. } => command::linux::STOP_BIRTH_SAFE,
+            Self::NativeStartBirth(_) => command::common::NATIVE_START_BIRTH,
+            Self::NativeStatusBirth => command::common::NATIVE_STATUS_BIRTH,
+            Self::NativeStopBirth { .. } => command::common::NATIVE_STOP_BIRTH,
             Self::Cleanup => command::common::CLEANUP,
             Self::FreePort { .. } => command::common::FREEPORT,
-            Self::Start(_) | Self::LinuxStart(_) => command::common::START,
+            Self::Start(_) => command::common::START,
+            Self::LinuxStart(_) => command::linux::START_REAP_SAFE,
             Self::RouteAdd(_) => command::common::ROUTE_ADD,
             Self::RouteDel(_) => command::common::ROUTE_DEL,
             Self::InstallCore(_) => command::mac::INSTALL_CORE, // linux 同名（command::linux::INSTALL_CORE == "install-core"）
@@ -184,6 +299,8 @@ impl Request {
             Self::Ping
             | Self::Version
             | Self::Status
+            | Self::LinuxStatusBirth
+            | Self::NativeStatusBirth
             | Self::Cleanup
             | Self::FlushDns
             | Self::MacProxyCompareCapability
@@ -200,15 +317,26 @@ impl Request {
                     out.push(p.to_string());
                 }
             }
+            Self::LinuxStop { pid } => {
+                // Argument shape matches Stop, while the command token is intentionally
+                // incompatible: an old Linux helper must reject before it can mutate a child.
+                if let Some(p) = pid {
+                    out.push(p.to_string());
+                }
+            }
+            Self::LinuxStopBirth { target } | Self::NativeStopBirth { target } => {
+                out.push(target.pid.to_string());
+                out.push(target.birth.to_wire());
+            }
             Self::FreePort { port } => {
                 // helper.go:362: port := strings.TrimSpace(readLine(r))
                 out.push(port.to_string());
             }
-            Self::Start(p) => {
+            Self::Start(p) | Self::NativeStartBirth(p) => {
                 // mac helper.go:508-513 / win helper-win/helper.go:339-344（无 singbox 行）
                 push_start_args(p, out);
             }
-            Self::LinuxStart(p) => {
+            Self::LinuxStart(p) | Self::LinuxStartBirth(p) => {
                 // linux helper-linux/helper.go:401-405（多 singbox 行）
                 out.push(p.singbox_path.clone());
                 push_start_args(&p.common, out);
@@ -266,8 +394,8 @@ pub fn parse_stop_pid(line: &str) -> Option<u32> {
 
 /// **停核的受管 pid 身份判据**（三平台 helper 的 `stop` 分支共用的唯一真值）。
 ///
-/// `want` = 客户端在 [`Request::Stop`] 里声明的「我要停的那个 pid」，`current` = helper 此刻手里
-/// 受管 child 的 pid。返回 `true` 才允许动手杀。
+/// `want` = 客户端在 [`Request::Stop`] / [`Request::LinuxStop`] 里声明的「我要停的那个 pid」，
+/// `current` = helper 此刻手里受管 child 的 pid。返回 `true` 才允许动手杀。
 ///
 /// **为什么必须有**（根因）：客户端的停核腿是异步的 —— 从它发出 `stop` 到 helper 真执行之间，
 /// 可能夹进「用户重装 helper / 重新起核」的一整个新会话。此时 helper 手里的受管 pid 已经换成

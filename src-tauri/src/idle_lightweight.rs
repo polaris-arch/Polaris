@@ -21,7 +21,7 @@ const HIDDEN_RECLAIM_SECS: u64 = 10 * 60;
 /// 10 分钟量级无需秒级精度；粗粒度巡检也减少主线程可见性回读。
 const TICK_SECS: u64 = 30;
 
-/// 启动进程级驻留巡检。唯一调用点在 `main.rs::setup`，因此不另设 started 闸。
+/// 启动进程级驻留巡检。唯一调用点在 `lib.rs::setup`，因此不另设 started 闸。
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut hidden_secs = 0_u64;

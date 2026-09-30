@@ -17,6 +17,9 @@ use crate::builder::endpoint_routes::{
     endpoint_forced_route_cidrs, mesh_always_routes_subnets, referenced_server_ids,
     ObservedTailnetAddresses,
 };
+use crate::builder::mesh_mode::{
+    mode_candidates, selected_is_mode_candidate, selected_mode, DASHBOARD_SELECTOR, MESH_DIRECT,
+};
 use crate::builder::orchestration::{config_generation_norm, server_fingerprint};
 use crate::builder::route::mesh_selected_exit_falls_back_to_direct;
 use crate::user_config::app_config::UserConfig;
@@ -32,6 +35,10 @@ use crate::user_config::server_config::{is_mesh_node, ServerConfig};
 /// planHotSwitch 注入的运行态依赖（上游 `this.*` 态的纯化镜像）。
 #[derive(Debug, Clone, Default)]
 pub struct HotSwitchDeps {
+    /// The running core was built with both complete mode-guarded route/DNS policies.
+    pub mesh_mode_ready: bool,
+    /// Dashboard downloads use their own direct/proxy selector in the running core.
+    pub dashboard_mode_selector: bool,
     /// id → outbound tag（启动时映射；结构等价 ⇒ 不变，热切可复用）。
     /// 上游 `this.currentIdToTagMap`。None = 未注入（规则目标无法解析 → 规则热切返 None）。
     pub current_id_to_tag_map: Option<BTreeMap<String, String>>,
@@ -215,8 +222,25 @@ pub fn plan_hot_switch(old: &UserConfig, new: &UserConfig, deps: &HotSwitchDeps)
             .servers
             .iter()
             .find(|s| Some(s.id.as_str()) == new.selected_server_id.as_deref());
-        if mesh_selected_exit_falls_back_to_direct(old)
-            != mesh_selected_exit_falls_back_to_direct(new)
+        let fallback_changed = mesh_selected_exit_falls_back_to_direct(old)
+            != mesh_selected_exit_falls_back_to_direct(new);
+        // The generation norm above proves every server and policy setting is unchanged;
+        // still revalidate both candidate sets so a malformed target cannot borrow the old
+        // core's compiled policy. The normal candidate may differ as the selected ordinary
+        // node changes, while the unique no-exit TS must be identical.
+        let same_mode_candidates = mode_candidates(old).zip(mode_candidates(new)).is_some_and(
+            |((_, old_mesh), (_, new_mesh))| {
+                old_mesh == new_mesh
+                    && selected_is_mode_candidate(old, &old_mesh)
+                    && selected_is_mode_candidate(new, &new_mesh)
+            },
+        );
+        let mode_transition_supported = deps.mesh_mode_ready
+            && same_mode_candidates
+            && selected_mode(old) != selected_mode(new)
+            && (selected_mode(old) == MESH_DIRECT || selected_mode(new) == MESH_DIRECT)
+            && !deps.bootstrap_fallback_engaged;
+        if (fallback_changed && !mode_transition_supported)
             || sel_only_forces_subnets(old_sel)
             || sel_only_forces_subnets(new_sel)
         {
@@ -243,6 +267,18 @@ pub fn plan_hot_switch(old: &UserConfig, new: &UserConfig, deps: &HotSwitchDeps)
             member_tag: target_tag,
             old_member_tag: old_global_tag,
         });
+        if fallback_changed && deps.dashboard_mode_selector {
+            let (new_member, old_member) = if selected_mode(new) == MESH_DIRECT {
+                (DIRECT_TAG, PROXY_SELECTOR_TAG)
+            } else {
+                (PROXY_SELECTOR_TAG, DIRECT_TAG)
+            };
+            puts.push(HotSwitchPut {
+                selector_tag: DASHBOARD_SELECTOR.into(),
+                member_tag: new_member.into(),
+                old_member_tag: Some(old_member.into()),
+            });
+        }
         global_changed = true;
     }
 

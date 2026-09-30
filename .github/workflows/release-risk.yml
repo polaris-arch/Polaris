@@ -20,6 +20,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 jobs:
+  pc_runtime_release_policy:
+    name: PC runtime publication block policy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Verify unconditional PC publication block
+        run: node --test scripts/assert-pc-runtime-release.test.mjs
+
   classify:
     name: classify release impact
     runs-on: ubuntu-22.04
@@ -28,7 +39,9 @@ jobs:
       platforms: ${{ steps.impact.outputs.platforms }}
       preflight: ${{ steps.impact.outputs.preflight }}
       has_package: ${{ steps.impact.outputs.has_package }}
+      android: ${{ steps.impact.outputs.android }}
       unregistered: ${{ steps.impact.outputs.unregistered }}
+      candidate: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,16 +114,28 @@ jobs:
             echo "platforms=$(jq -c '.platforms' "$result")"
             echo "preflight=$(jq -r '.preflight' "$result")"
             echo "has_package=$(jq -r '.hasPackage' "$result")"
+            echo "android=$(jq -r '.android' "$result")"
             echo "unregistered=$(jq -r '.unregisteredScopes | join(" ")' "$result")"
           } >> "$GITHUB_OUTPUT"
 
+  desktop_core:
+    name: four native source producers
+    needs: classify
+    if: needs.classify.outputs.preflight == 'true'
+    uses: ./.github/workflows/desktop-core.yml
+    with:
+      candidate: ${{ needs.classify.outputs.candidate }}
+
   preflight:
     name: static packaging + bundled core gate
-    needs: classify
+    needs: [classify, desktop_core]
     if: needs.classify.outputs.preflight == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.classify.outputs.candidate }}
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -126,8 +151,17 @@ jobs:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
 
+      - name: Download exact candidate core bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.desktop_core.outputs.artifact_name }}
+          path: ${{ runner.temp }}/desktop-core-bundle
+
       - name: Fetch sing-box core
-        run: node scripts/fetch-core.mjs
+        env:
+          CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
+          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
+        run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
 
       - name: Fetch packaging resources
         if: needs.classify.outputs.has_package == 'true'
@@ -182,13 +216,14 @@ jobs:
           cargo test -p polaris-config-engine --test network_profile_runtime
           cargo test -p polaris-config-engine --test subscription_update_guard_runtime
           cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture
+          cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture
           cargo test -p polaris-net-stack --lib singbox_import::tests::local_import_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
 
   package:
     name: package selected platforms
-    needs: [classify, preflight]
+    needs: [classify, preflight, desktop_core]
     if: needs.classify.outputs.has_package == 'true' && needs.preflight.result == 'success'
     # package.yml 内含一个仅 v* tag 才会运行的 publish job。GitHub 会在启动前校验整张复用图，
     # 即使本次 ref 不可能发布，也要求调用 job 提供它声明的 contents: write 权限上限。
@@ -201,19 +236,43 @@ jobs:
       skip_quality_gates: true
       run_kernel_gates: false
       upload_artifacts: false
+      core_candidate: ${{ needs.classify.outputs.candidate }}
+      core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
     secrets: inherit
+
+  # ══ Android release-profile 产物腿 ══
+  # 与 preflight / package 并列的第三条选择性腿，判据同源（scripts/classify-ci-impact.mjs 的
+  # ANDROID_IMPACT_SCOPES）。它构建一份未签名 release-profile APK，只在 runner 内守桌面三条腿
+  # 结构性看不见的东西：R8 证据、资源、原生库与 16 KiB alignment。APK 不上传、不分发。
+  #
+  # 不与 package job 合并、也不进 package.yml 的矩阵：步骤面完全不相交，理由写在 android.yml 顶部。
+  # 不给 preflight 加依赖：本腿不读随包桌面内核，preflight 的 fetch/内核门对它零信息。
+  android:
+    name: android release-profile gate
+    needs: classify
+    if: needs.classify.outputs.android == 'true'
+    # 被调 workflow 的 release-apk 子 job 声明 contents: write；GitHub 在启动前校验
+    # 整张复用图，即使本次 publish_release=false，也要求调用 job 给足权限上限。
+    permissions:
+      contents: write
+    uses: ./.github/workflows/android.yml
 
   gate:
     name: release risk gate
-    needs: [classify, preflight, package]
+    needs: [classify, desktop_core, preflight, package, android, pc_runtime_release_policy]
     if: always()
     runs-on: ubuntu-22.04
     env:
       CLASSIFY_RESULT: ${{ needs.classify.result }}
+      PC_RUNTIME_POLICY_RESULT: ${{ needs.pc_runtime_release_policy.result }}
+      DESKTOP_CORE_REQUIRED: ${{ needs.classify.outputs.preflight }}
+      DESKTOP_CORE_RESULT: ${{ needs.desktop_core.result }}
       PREFLIGHT_REQUIRED: ${{ needs.classify.outputs.preflight }}
       PREFLIGHT_RESULT: ${{ needs.preflight.result }}
       PACKAGE_REQUIRED: ${{ needs.classify.outputs.has_package }}
       PACKAGE_RESULT: ${{ needs.package.result }}
+      ANDROID_REQUIRED: ${{ needs.classify.outputs.android }}
+      ANDROID_RESULT: ${{ needs.android.result }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
     steps:
       - name: Require every selected release-risk leg
@@ -222,6 +281,8 @@ jobs:
           set -euo pipefail
           [ "$CLASSIFY_RESULT" = success ] || {
             echo "::error::影响分类失败：$CLASSIFY_RESULT"; exit 1; }
+          [ "$PC_RUNTIME_POLICY_RESULT" = success ] || {
+            echo "::error::PC runtime 发布阻断策略未通过：$PC_RUNTIME_POLICY_RESULT"; exit 1; }
           # 未登记的影响面（落在 crates/ 或 src-tauri/ 内、两张登记表都查不到的 scope）当场红并点名。
           # 为什么这条门开在这里，而不是只靠 ui.yml 的 vitest 完备性门：
           #   1) 独立性 —— ui.yml 挂了、被 skip、或 required check 集合被改，那条门就没牙；
@@ -231,6 +292,10 @@ jobs:
           #      这里把它升级成「当场红 + 点名 scope」，让补登记成为合入的前置条件。
           [ -z "$UNREGISTERED" ] || {
             echo "::error::未登记的影响面 scope：$UNREGISTERED"; exit 1; }
+          if [ "$DESKTOP_CORE_REQUIRED" = true ] && [ "$DESKTOP_CORE_RESULT" != success ]; then
+            echo "::error::四平台内核源码产物未通过：$DESKTOP_CORE_RESULT"
+            exit 1
+          fi
           if [ "$PREFLIGHT_REQUIRED" = true ] && [ "$PREFLIGHT_RESULT" != success ]; then
             echo "::error::发布预检未通过：$PREFLIGHT_RESULT"
             exit 1
@@ -239,4 +304,10 @@ jobs:
             echo "::error::选中的安装包腿未全部通过：$PACKAGE_RESULT"
             exit 1
           fi
-          echo "发布风险门通过：preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT"
+          # Android 腿与上面两条同形：被选中就必须 success，skipped/failure/cancelled 一律红。
+          # 「没被选中」由分类器的登记表负责，而登记根内的未登记 scope 已 fail-closed 成 android=true。
+          if [ "$ANDROID_REQUIRED" = true ] && [ "$ANDROID_RESULT" != success ]; then
+            echo "::error::Android APK 腿未通过：$ANDROID_RESULT"
+            exit 1
+          fi
+          echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT"

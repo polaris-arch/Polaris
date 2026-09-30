@@ -62,6 +62,7 @@ import { blockedByMeshSingleton } from '@/domain/mesh-singleton-guard';
 import { isAddresslessProtocol, tailcatSettingsError } from '@/domain/server-completeness';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { meshTunnelDraftError } from './mesh-form-layout';
+import { applyDetour } from './detour-options';
 import { InfoIcon } from '@/components/InfoIcon';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
 import { MeshInboundPolicyEditor, applyMeshInboundPolicy, meshInboundPolicyError, normalizeMeshInboundPolicy } from './MeshInboundPolicyEditor';
@@ -310,6 +311,12 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       if (isMeshTunnelNodeProtocol(proto)) applyMeshInboundPolicy(full, policy);
       if (base?.subscriptionId || !bindInterface) delete full.bindInterface;
       else full.bindInterface = bindInterface;
+      /* 🔴 前置代理与 `bindInterface` **同形**，此前漏了这一手（2026-09-06 复审）：
+         `if (detour) meta.detour = detour` 在选了「不串联」时不写键，而 `codecBase` 是
+         `{ ...base, ...meta }` ⇒ 存量 `base.detour` 从 spread 里活下来，`protoCodec.toConfig`
+         全程不碰 detour ⇒ 写回的 `full.detour` 仍是旧值：界面显示「不串联」而流量照走前置代理。
+         走共用的 `applyDetour`（哨兵/空值 ⇒ **删键**，不写字面量 'direct'），与 Wg/Ts/Warp 三处同源。 */
+      applyDetour(full, detour);
 
       // Tailcat 的 key/DERP 形态门与生成侧、store 落盘门同一判据（`tailcatSettingsError` 镜像 Rust
       // `tailcat_emit_check`）。不在这里拦，节点会被 store 的 sanitize 静默丢掉 —— 用户看到的是「保存了但没了」。

@@ -129,16 +129,42 @@ describe('展开即露出 —— 全仓不变量', () => {
     expect(src).toMatch(/onToggle=\{[\s\S]*revealOnToggle\(e\)[\s\S]*\}/);
   });
 
+  /**
+   * 「露出」的两条腿 —— 判据认哪一条，取决于**分组的 DOM 形状**，不取决于谁先写的。
+   *
+   * · `revealSiblingGroup` —— **扁平兄弟**（组头与项目并列，没有分组容器）：四个桌面菜单
+   *   （`.ns-grp` / `.csel-grp` / `.tray-group-h`）都是这一形，只露出组头等于没露出。
+   * · `revealElement` —— **容器**（`<section>` 里装着组头与内容）：移动端节点表单的可折叠段
+   *   （`mobile/forms/NodeFormPanel.tsx`）是这一形，容器本身就是要滚进视区的那一段。
+   *
+   * 🔴 2026-09-06 从「只认 `revealSiblingGroup`」放宽到这两条。放宽的**边界**写清楚：
+   * 一个既不调 A 也不调 B 的分组菜单**仍然**是违规（下面那条反向对照钉着这一点）。
+   * 两条腿同住 `reveal.ts`、同走 `computeRevealDelta`，没有第二套滚动逻辑。
+   * 只认 A 会把容器形的分组逼去用一个对它不成立的函数（`marker` 取组头的第一个类名、
+   * 沿**兄弟**扫段尾 —— 容器形里组头没有兄弟，那条腿量出来的段恒等于组头自己）。
+   */
+  const REVEAL_LEGS = ['revealSiblingGroup', 'revealElement('] as const;
+  const revealsSomething = (src: string): boolean => REVEAL_LEGS.some((leg) => src.includes(leg));
+
   it('可滚菜单里的分组展开全部露出（.ns-grp / .csel-grp / .tray-group-h 同一形状）', () => {
     // 判据取「用了 openGroups 这个惯用法的组件」，不是「本次改了哪四个文件」：
     // 四个菜单都带 max-height + overflow-y:auto（.node-menu 430 / .mini-menu 360 /
     // .csel-menu 300 / .tray-menu 600），组头在底部时展开，新项目整段落在菜单视区之外。
+    // 移动端表单面板同理（`.m-form-body` 是 overflow-y:auto 的单一滚动容器）。
     // 第五个人再照抄这个惯用法加一个分组菜单，忘了露出 → 本条转红。
     const offenders = files
       .filter((f) => readFileSync(f, 'utf8').includes('openGroups'))
-      .filter((f) => !readFileSync(f, 'utf8').includes('revealSiblingGroup'))
+      .filter((f) => !revealsSomething(readFileSync(f, 'utf8')))
       .map((f) => f.slice(SRC.length));
     expect(offenders, '这些分组菜单展开后新项目落在视区外').toEqual([]);
+  });
+
+  it('反向对照：放宽之后「两条腿都没调」仍然算违规（否则上一条恒绿）', () => {
+    expect(revealsSomething('const [openGroups, setOpenGroups] = useState(new Set());')).toBe(false);
+    expect(revealsSomething('scheduleReveal(() => revealSiblingGroup(header));')).toBe(true);
+    expect(revealsSomething('scheduleReveal(() => revealElement(section));')).toBe(true);
+    // 「只是提到了那个名字的一部分」不算数：`revealElement` 必须是**调用**（带左括号）。
+    expect(revealsSomething('import type { revealElementProps } from "./x";')).toBe(false);
   });
 
   it('确有分组菜单被扫到（防止上一条在空集合上恒绿）', () => {

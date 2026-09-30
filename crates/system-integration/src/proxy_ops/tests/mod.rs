@@ -3718,17 +3718,152 @@ fn impl_restore_with_empty_original_degrades_to_clear() {
     }
 }
 
+/// `Other` / **`Android`** / **`Ios`** 三个变体在 `ops.rs` 上的**全部 11 处**臂都必须显式报错，
+/// 且一条命令都不跑。
+///
+/// # 为什么 Android 要单独跑一遍（今天它仨共用同一条 `match` 臂）
+///
+/// 本模块头注写着「`Platform::Android` 与 `Platform::Other` 全程同臂，是逐处判过、不是继承」——
+/// 而在 2026-09-05 之前，**只有 `Other` 有运行期证据**。共用臂随时可能被拆开（下一个人给
+/// Android 单写一支就够），拆开时若给了 `Ok(())`，这条腿会静默变成「假装设成功了」，而
+/// `runtime/proxy` 侧「Android 上不该来调它」的那道门管的是**调不调**，管不了**调了之后返什么**。
+///
+/// 这一格是 `should_enable_system_proxy` 收口的**依据**：那边之所以敢在 Android 上不调，
+/// 正是因为这边诚实地答「这个平台没有系统代理」。依据没有钉子 = 依据会漂。
+///
+/// # 为什么是 11 处，不是原来的 3 处（2026-09-06 补齐）
+///
+/// 2026-09-06 K13 把 `Platform::Ios` 补进本圈时，只跑了 `get_proxy_status` / `set_proxy` /
+/// `clear_proxy` 三条，而 `ops.rs` 里写下 iOS 答案的臂**有 11 处**：上面三条之外还有
+/// `exact_transaction_available` / `list_network_services` / `restore_proxy` /
+/// `capture_transaction_snapshot` / `build_applied_snapshot` / `apply_transaction` /
+/// `restore_transaction` 七条返 `Err(UnsupportedPlatform)`，加一条 `snapshot_relation` 返
+/// `ProxySnapshotRelation::Foreign`（它不返 `Result`，故单独断言）。
+///
+/// 「已补上运行期断言」这句话当时覆盖不到那 8 处 —— 而本测头注给 Android 的理由
+/// （共用臂随时会被拆开，拆开时给个 `Ok(())` 就静默变成「假装成功了」）对那 8 处**逐字成立**，
+/// 其中事务面那 6 条更危险：`capture_transaction_snapshot` 若被拆成 `Ok(Default::default())`，
+/// 后续 `snapshot_relation` 会拿空快照比出「没变」，整条事务腿于是「成功地什么都没做」。
+///
+/// 这 8 处**没有一处是宿主构造不出输入的**：全部是同一个 `SystemProxyOpsImpl` 上的 trait 方法，
+/// 入参只用到 `req()` 与 `ProxyTransactionSnapshot::default()`。原先只覆盖 3 处不是取材受限，
+/// 是清单没数全 —— 故本批直接补齐，而不是写一句「另外 8 处无法构造」。
 #[test]
-fn impl_other_platform_is_unsupported_not_silent_noop() {
-    let ops = ops_for(Platform::Other, MockRunner::default());
-    // 未知平台须显式报错，不得静默假装成功（否则 UI 显示「已接管」而系统毫无变化）。
-    assert!(matches!(
-        ops.get_proxy_status(),
-        Err(SystemIntegrationError::UnsupportedPlatform(_))
-    ));
-    assert!(ops.set_proxy(&req()).is_err());
-    assert!(ops.clear_proxy().is_err());
-    assert!(ops.runner.snapshot().is_empty(), "不该跑任何命令");
+fn impl_unsupported_platforms_are_err_not_silent_noop() {
+    // 返 `Result` 的那 10 处。统一成 `Result<(), _>` 只是为了能进同一张表；判据仍是
+    // 「错误种类必须是 UnsupportedPlatform」，不是宽泛的 `is_err()` ——
+    // 后者会被「因为别的原因也失败了」喂饱（比如 MockRunner 没配桩导致的解析失败）。
+    type UnsupportedCall =
+        fn(&SystemProxyOpsImpl<MockRunner>) -> Result<(), SystemIntegrationError>;
+    let calls: &[(&str, UnsupportedCall)] = &[
+        ("exact_transaction_available", |o| {
+            o.exact_transaction_available().map(|_| ())
+        }),
+        ("get_proxy_status", |o| o.get_proxy_status().map(|_| ())),
+        ("list_network_services", |o| {
+            o.list_network_services().map(|_| ())
+        }),
+        ("set_proxy", |o| o.set_proxy(&req())),
+        ("clear_proxy", |o| o.clear_proxy()),
+        ("restore_proxy", |o| {
+            o.restore_proxy(&SystemProxyStatus::default())
+        }),
+        ("capture_transaction_snapshot", |o| {
+            o.capture_transaction_snapshot().map(|_| ())
+        }),
+        ("build_applied_snapshot", |o| {
+            o.build_applied_snapshot(&req(), &ProxyTransactionSnapshot::default())
+                .map(|_| ())
+        }),
+        ("apply_transaction", |o| {
+            o.apply_transaction(&req(), &ProxyTransactionSnapshot::default())
+        }),
+        ("restore_transaction", |o| {
+            o.restore_transaction(
+                &ProxyTransactionSnapshot::default(),
+                &ProxyTransactionSnapshot::default(),
+            )
+        }),
+    ];
+    // 取材面自曝：清单被删空/被注释掉时，下面两层循环会一次都不执行而「全绿」。
+    assert_eq!(
+        calls.len(),
+        10,
+        "返 Result 的臂应有 10 条（第 11 条是 snapshot_relation，不返 Result）—— \
+         清单被改动了就回 ops.rs 数一遍 `Other | Android | Ios` 的臂"
+    );
+
+    for platform in [Platform::Other, Platform::Android, Platform::Ios] {
+        for (name, call) in calls {
+            let ops = ops_for(platform, MockRunner::default());
+            // 未知/无该概念的平台须显式报错，不得静默假装成功（否则 UI 显示「已接管」而系统毫无变化）。
+            assert!(
+                matches!(
+                    call(&ops),
+                    Err(SystemIntegrationError::UnsupportedPlatform(_))
+                ),
+                "{platform:?}: {name} 必须是 UnsupportedPlatform，不能是 Ok、也不能是别的错误种类"
+            );
+            assert!(
+                ops.runner.snapshot().is_empty(),
+                "{platform:?}: {name} 不该跑任何命令"
+            );
+        }
+        // 第 11 处：`snapshot_relation` 不返 `Result`，它的「诚实的管不着」是 `Foreign`。
+        // 判 `Exact`/`Unchanged` 都等于替一个我们从没写过的系统状态背书。
+        let ops = ops_for(platform, MockRunner::default());
+        let snap = ProxyTransactionSnapshot::default();
+        assert_eq!(
+            ops.snapshot_relation(&snap, &snap, &snap),
+            ProxySnapshotRelation::Foreign,
+            "{platform:?}: snapshot_relation 必须是 Foreign —— 本平台没有「系统代理」这个概念可比对"
+        );
+        assert!(
+            ops.runner.snapshot().is_empty(),
+            "{platform:?}: snapshot_relation 不该跑任何命令"
+        );
+    }
+
+    // ── 反向对照 ──
+    // 同一组调用在**有实现**的平台上必须走出不同的结果，否则上面那 33 条断言可能只是因为
+    // MockRunner 根本没接上 / trait 方法整体坏掉（那样这门对任何平台都恒绿）。
+    // 三个方向各钉一条：真的下发命令 / 不是 UnsupportedPlatform / 关系判定不是 Foreign。
+    let mac = ops_for(Platform::Mac, MockRunner::default());
+    let _ = mac.get_proxy_status();
+    assert!(
+        !mac.runner.snapshot().is_empty(),
+        "有实现的平台必须真的下发命令 —— 否则本门的『没跑命令』没有信息量"
+    );
+    // 🔴 对照平台取 **Linux 而不是 Mac**，理由是本批实测撞到的一个**既有**缺陷（本批不修，
+    // 修它的射程在 ops.rs 生产代码上，与本批无关）：`ops.rs` 的 `Platform::Mac` 臂在
+    // 非原生路径上写着 `SystemProxyOps::<方法名>(self, …)`，意图是「调 trait 的默认实现」，
+    // 而 Rust 没有这个写法 —— 它解析回**本 impl 的同一个覆盖**，于是无限递归。
+    // 五处同形：capture_transaction_snapshot / build_applied_snapshot / apply_transaction /
+    // restore_transaction / snapshot_relation（最后一处还要三份快照的 mac_services 都为空才走到）。
+    // 生产上今天走不到（`new()` 在 macOS 上把 native_macos 置 true，非 macOS 上 platform 不是 Mac；
+    // 只有测试专用的 `with_platform(_, Mac)` 会落进去），故属**潜伏**缺陷而非在线故障。
+    // 本对照因此改用 Linux：它对这 10 条全部有实现，且一条都不返 UnsupportedPlatform。
+    for (name, call) in calls {
+        let linux = ops_for(Platform::Linux, MockRunner::default());
+        assert!(
+            !matches!(
+                call(&linux),
+                Err(SystemIntegrationError::UnsupportedPlatform(_))
+            ),
+            "Linux 上 {name} 也返 UnsupportedPlatform —— 那么上面那 30 条断言对「本平台无实现」\
+             这件事没有任何区分力（有实现/无实现都长一个样）"
+        );
+    }
+    // 关系判定的对照要给**非空**快照：Linux 臂读的是 `linux_gsettings`，全 `None` 时它自己也判
+    // Foreign（诚实的「比不了」），拿默认值做对照等于在比较两个都为 Foreign 的结果。
+    let linux = ops_for(Platform::Linux, MockRunner::default());
+    let filled = exact_linux_snapshot("127.0.0.1:8080");
+    assert_ne!(
+        linux.snapshot_relation(&filled, &filled, &filled),
+        ProxySnapshotRelation::Foreign,
+        "有实现的平台在 from == to == current 且快照非空时也判 Foreign —— \
+         那么 Foreign 这个答案对「管不着」没有任何区分力"
+    );
 }
 
 // ══════════ FX-proxy-ops-retry（row69）：重试原语 + 三平台 enable 重试 ══════════

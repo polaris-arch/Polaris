@@ -268,6 +268,12 @@ const RECORDED_BETA15_TAILDROP_RECEIVING_FILE: &[(&str, u32)] = &[
 const RECORDED_BETA15_TAILDROP_DOWNLOAD_CHUNK: &[(&str, u32)] = &[("size", 1), ("data", 2)];
 
 const RECORDED_LAYOUTS: &[RecordedLayout] = &[
+    (SymbolKind::Message, "ClashMode", &[("mode", 3)]),
+    (
+        SymbolKind::Message,
+        "ClashModeStatus",
+        &[("modeList", 1), ("currentMode", 2)],
+    ),
     (SymbolKind::Message, CHECKED_MESSAGE, RECORDED_BETA7_LAYOUT),
     (
         SymbolKind::Message,

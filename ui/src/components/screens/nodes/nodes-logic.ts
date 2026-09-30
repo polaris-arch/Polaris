@@ -295,8 +295,8 @@ export type NodeUseAction =
   | 'switch'
   /** 武装二次确认（**普通切换**：整卡是个大命中面，误点代价虽轻但发生率高）。 */
   | 'confirm'
-  /** 武装二次确认（**会重启内核**：该节点在待应用差集里，选中它会断开现有连接）。 */
-  | 'confirm-restart';
+  /** 武装二次确认：该节点在待应用差集里，保存选择后可能还需 Apply。 */
+  | 'confirm-apply';
 
 /**
  * 触发面。两个面的**误触概率差一个量级**，故确认策略不同（陈先生 2026-07-30 裁定）：
@@ -310,8 +310,8 @@ export type NodeUseVia = 'card' | 'button';
  * 而判据必须能被单测钉住。留在组件里就只能靠人眼复核「哪种情况确认、哪种不确认」，
  * 而本仓 vitest 是 `environment:'node'`（无 jsdom），组件回调根本跑不到。
  *
- * `willRestart` 复用 `willRestartOnSelect` 的谓词、由调用方传入布尔 —— 本函数不自己读差集字段，
- * 否则同一条「哪些节点选中会重启」的判据在仓里会有两份。
+ * `needsApply` 复用 `needsApplyOnSelect` 的谓词、由调用方传入布尔 —— 本函数不自己读差集字段，
+ * 否则同一条「哪些节点仍有待应用更改」的判据在仓里会有两份。
  *
  * # 确认策略按触发面分档（陈先生 2026-07-30 两次裁定的合并结果）
  *
@@ -320,17 +320,17 @@ export type NodeUseVia = 'card' | 'button';
  *   用户可能过很久才发现自己在用错误的节点出网。可逆不等于无代价。
  * - `button` 直切 —— 命中面小、语义明确（按钮上就写着「设为出口」），点它就是要切，
  *   给它加确认税是拿高频动作换一个几乎不发生的误触。
- * - **重启那档两个面都确认** —— 代价不再是「视觉变了、再点回来」，而是断掉现有连接，
- *   这条信息必须在动作前给到，与命中面大小无关。
+ * - **待应用那档两个面都确认** —— 用户应在选择前知道可能仍需显式 Apply；
+ *   是否已经热切以执行后的后端收据为准，不能由本地差集预测。
  */
 export function nodeUseAction(
   serverId: string,
   selectedServerId: string | null | undefined,
-  willRestart: boolean,
+  needsApply: boolean,
   via: NodeUseVia,
 ): NodeUseAction {
   if (serverId === selectedServerId) return 'noop';
-  if (willRestart) return 'confirm-restart';
+  if (needsApply) return 'confirm-apply';
   return via === 'button' ? 'switch' : 'confirm';
 }
 
@@ -384,4 +384,69 @@ export function shadowedCidrNamed(
     );
   }
   return named;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 节点卡的协议名与传输摘要 —— 桌面 `NodeCard` 与移动端节点屏 / 首页**共用这一份**。
+ *
+ * 此前移动端两处各抄了一张表，MASQUE / Tailcat 上线时只加进了桌面这份，移动端于是把
+ * `masque-client` 原样（首页还大写成 `MASQUE-CLIENT`）渲染在角标上、传输摘要空着。
+ * 覆盖面由 `mobile/nodes/protocol-label-parity.test.ts` 按 `ALL_PROTOCOLS` 逐个核对。
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** 协议显示名（小写协议枚举 → 用户可读）。 */
+export function protocolLabel(proto: string): string {
+  const map: Record<string, string> = {
+    vless: 'VLESS',
+    vmess: 'VMess',
+    trojan: 'Trojan',
+    hysteria2: 'Hysteria2',
+    shadowsocks: 'Shadowsocks',
+    wireguard: 'WireGuard',
+    tailscale: 'Tailscale',
+    anytls: 'AnyTLS',
+    tuic: 'TUIC',
+    naive: 'Naive',
+    snell: 'Snell',
+    socks: 'SOCKS',
+    http: 'HTTP',
+    ssh: 'SSH',
+    hysteria: 'Hysteria',
+    tor: 'Tor',
+    openconnect: 'OpenConnect',
+    'openvpn-client': 'OpenVPN',
+    'masque-client': 'MASQUE',
+    tailcat: 'Tailcat',
+    custom: 'Custom',
+  };
+  return map[proto.toLowerCase()] ?? proto;
+}
+
+/** 传输/安全摘要（原型 .nd-xfer：reality · tcp / ws · tls / quic 等）。 */
+export function transferSummary(server: ServerConfig): string {
+  const proto = server.protocol.toLowerCase();
+  if (proto === 'wireguard') return 'udp · wg';
+  // Tailscale 的协议标签已足够；静态实现摘要不能说明当前连接/认证状态。
+  if (proto === 'tailscale') return '';
+  if (proto === 'openconnect') return 'enterprise vpn';
+  if (proto === 'tailcat') return 'derp · wg';
+  if (proto === 'openvpn-client') return server.openvpnClientSettings?.network || 'udp · vpn';
+  if (proto === 'masque-client') {
+    // 缺省 / 0 / 3 都是 HTTP/3（内核可回落，卡片只报用户选的首选档）。
+    const v = server.masqueClientSettings?.version;
+    return `${v === 1 ? 'h1' : v === 2 ? 'h2' : 'h3'} · masque`;
+  }
+  const parts: string[] = [];
+  if (server.network) {
+    const netMap: Record<string, string> = {
+      tcp: 'tcp',
+      ws: 'ws',
+      grpc: 'grpc',
+      http: 'http',
+      httpupgrade: 'httpupgrade',
+    };
+    parts.push(netMap[server.network] ?? server.network);
+  }
+  if (server.security) parts.push(server.security);
+  return parts.length > 0 ? parts.join(' · ') : '';
 }

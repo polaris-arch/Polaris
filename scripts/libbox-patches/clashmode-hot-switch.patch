@@ -1,0 +1,229 @@
+diff --git a/experimental/clashmode/manager.go b/experimental/clashmode/manager.go
+index 6491d75..2721ced 100644
+--- a/experimental/clashmode/manager.go
++++ b/experimental/clashmode/manager.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/log"
+@@ -17,26 +18,30 @@ type Manager struct {
+ 	ctx          context.Context
+ 	logger       log.Logger
+ 	dnsRouter    adapter.DNSRouter
+-	mode         string
++	mode         atomic.Value
+ 	modeList     []string
++	useCacheMode bool
+ 	updateAccess sync.Mutex
+ 	updateHooks  []*observable.Subscriber[struct{}]
+ }
+ 
+ func NewManager(ctx context.Context, logger log.Logger, defaultMode string, modeList []string) *Manager {
++	useCacheMode := defaultMode == ""
+ 	if defaultMode == "" {
+ 		defaultMode = "Rule"
+ 	}
+ 	if !common.Contains(modeList, defaultMode) {
+ 		modeList = append([]string{defaultMode}, modeList...)
+ 	}
+-	return &Manager{
+-		ctx:       ctx,
+-		logger:    logger,
+-		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
+-		mode:      defaultMode,
+-		modeList:  modeList,
++	m := &Manager{
++		ctx:          ctx,
++		logger:       logger,
++		dnsRouter:    service.FromContext[adapter.DNSRouter](ctx),
++		modeList:     modeList,
++		useCacheMode: useCacheMode,
+ 	}
++	m.mode.Store(defaultMode)
++	return m
+ }
+ 
+ func (m *Manager) Name() string {
+@@ -44,7 +49,7 @@ func (m *Manager) Name() string {
+ }
+ 
+ func (m *Manager) Start(stage adapter.StartStage) error {
+-	if stage != adapter.StartStateStart {
++	if stage != adapter.StartStateStart || !m.useCacheMode {
+ 		return nil
+ 	}
+ 	cacheFile := service.FromContext[adapter.CacheFile](m.ctx)
+@@ -53,7 +58,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
+ 		if common.Any(m.modeList, func(it string) bool {
+ 			return strings.EqualFold(it, mode)
+ 		}) {
+-			m.mode = mode
++			m.mode.Store(mode)
+ 		}
+ 	}
+ 	return nil
+@@ -64,7 +69,7 @@ func (m *Manager) Close() error {
+ }
+ 
+ func (m *Manager) Mode() string {
+-	return m.mode
++	return m.mode.Load().(string)
+ }
+ 
+ func (m *Manager) ModeList() []string {
+@@ -86,15 +91,15 @@ func (m *Manager) SetMode(newMode string) {
+ 	if !common.Contains(m.modeList, newMode) {
+ 		return
+ 	}
+-	if newMode == m.mode {
++	m.updateAccess.Lock()
++	defer m.updateAccess.Unlock()
++	if newMode == m.Mode() {
+ 		return
+ 	}
+-	m.mode = newMode
+-	m.updateAccess.Lock()
++	m.mode.Store(newMode)
+ 	for _, hook := range m.updateHooks {
+ 		hook.Emit(struct{}{})
+ 	}
+-	m.updateAccess.Unlock()
+ 	m.dnsRouter.ClearCache()
+ 	cacheFile := service.FromContext[adapter.CacheFile](m.ctx)
+ 	if cacheFile != nil {
+diff --git a/experimental/clashmode/manager_test.go b/experimental/clashmode/manager_test.go
+new file mode 100644
+index 0000000..810041a
+--- /dev/null
++++ b/experimental/clashmode/manager_test.go
+@@ -0,0 +1,126 @@
++package clashmode
++
++import (
++	"context"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing/service"
++)
++
++type testCacheFile struct {
++	adapter.CacheFile
++	mu     sync.Mutex
++	mode   string
++	loads  int
++	stored []string
++}
++
++func (c *testCacheFile) LoadMode() string {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.loads++
++	return c.mode
++}
++
++func (c *testCacheFile) StoreMode(mode string) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.mode = mode
++	c.stored = append(c.stored, mode)
++	return nil
++}
++
++type testDNSRouter struct {
++	adapter.DNSRouter
++	clears atomic.Int32
++}
++
++func (r *testDNSRouter) ClearCache() {
++	r.clears.Add(1)
++}
++
++func newTestManager(defaultMode, cachedMode string) (*Manager, *testCacheFile, *testDNSRouter) {
++	cache := &testCacheFile{mode: cachedMode}
++	dns := &testDNSRouter{}
++	ctx := service.ContextWith[adapter.CacheFile](context.Background(), cache)
++	ctx = service.ContextWith[adapter.DNSRouter](ctx, dns)
++	m := NewManager(ctx, log.NewNOPFactory().NewLogger("test"), defaultMode, []string{"Rule", "Direct", "Global"})
++	return m, cache, dns
++}
++
++func TestExplicitDefaultModeWinsOverCachedMode(t *testing.T) {
++	m, cache, _ := newTestManager("Direct", "Rule")
++	if got := m.Mode(); got != "Direct" {
++		t.Fatalf("mode before start = %q, want Direct", got)
++	}
++	if err := m.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	if got := m.Mode(); got != "Direct" {
++		t.Fatalf("mode after start = %q, want Direct", got)
++	}
++	if cache.loads != 0 {
++		t.Fatalf("explicit default mode loaded stale cache %d times", cache.loads)
++	}
++	if got := cache.mode; got != "Rule" {
++		t.Fatalf("startup changed cached mode to %q", got)
++	}
++}
++
++func TestUnspecifiedDefaultRestoresCachedMode(t *testing.T) {
++	m, cache, _ := newTestManager("", "Direct")
++	if err := m.Start(adapter.StartStateStart); err != nil {
++		t.Fatal(err)
++	}
++	if got := m.Mode(); got != "Direct" {
++		t.Fatalf("mode after start = %q, want Direct", got)
++	}
++	if cache.loads != 1 {
++		t.Fatalf("cache loads = %d, want 1", cache.loads)
++	}
++}
++
++func TestConcurrentModeReadAndSwitch(t *testing.T) {
++	m, cache, dns := newTestManager("Rule", "")
++	var wg sync.WaitGroup
++	for i := 0; i < 4; i++ {
++		wg.Add(2)
++		go func(i int) {
++			defer wg.Done()
++			for j := 0; j < 1000; j++ {
++				if (i+j)%2 == 0 {
++					m.SetMode("Direct")
++				} else {
++					m.SetMode("Rule")
++				}
++			}
++		}(i)
++		go func() {
++			defer wg.Done()
++			for j := 0; j < 1000; j++ {
++				if mode := m.Mode(); mode != "Rule" && mode != "Direct" {
++					t.Errorf("unexpected mode %q", mode)
++					return
++				}
++			}
++		}()
++	}
++	wg.Wait()
++	m.SetMode("invalid")
++	if got := m.Mode(); got != "Rule" && got != "Direct" {
++		t.Fatalf("invalid mode was accepted: %q", got)
++	}
++	cache.mu.Lock()
++	stored := cache.mode
++	cache.mu.Unlock()
++	if stored != m.Mode() {
++		t.Fatalf("cached mode = %q, current mode = %q", stored, m.Mode())
++	}
++	if dns.clears.Load() == 0 {
++		t.Fatal("mode switches did not clear DNS cache")
++	}
++}

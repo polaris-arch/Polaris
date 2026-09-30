@@ -10,10 +10,13 @@ use std::sync::{Arc, Mutex};
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::system_proxy_bypass::{effective_bypass_lan, BypassConfig};
 use polaris_config_engine::user_config::ProxyModeType;
+use polaris_helper_proto::Platform;
 use polaris_system_integration::proxy::MarkerFs;
 use polaris_system_integration::proxy_ops::{
     ProxyEnableRequest, SystemProxyController, SystemProxyOps,
 };
+
+use crate::runtime::config::LegacyStartLease;
 
 use super::{code, ProxyRuntime, ProxyStatus, StartError};
 
@@ -74,9 +77,10 @@ impl SystemProxyTakeover {
     }
 
     /// marker 门控清理。无 marker 时 controller 自身幂等 no-op。
-    async fn clear(&self) -> bool {
+    async fn clear(&self, blocking_lease: Option<LegacyStartLease>) -> bool {
         let controller = Arc::clone(&self.controller);
         let outcome = tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
             controller
                 .lock()
                 .map(|mut guard| guard.ensure_cleared())
@@ -135,9 +139,11 @@ impl SystemProxyTakeover {
     async fn enable(
         &self,
         request: ProxyEnableRequest,
+        blocking_lease: Option<LegacyStartLease>,
     ) -> Result<Result<(), String>, tokio::task::JoinError> {
         let controller = Arc::clone(&self.controller);
         tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
             controller
                 .lock()
                 .map(|mut guard| guard.enable_system_proxy(&request))
@@ -175,17 +181,36 @@ impl SystemProxyTakeover {
 }
 
 /// 仅 `systemProxy` 模式需把 OS 系统代理指向本地 mixed 入站。
-fn should_enable_system_proxy(mode: ProxyModeType) -> bool {
-    matches!(mode, ProxyModeType::SystemProxy)
+///
+/// # 为什么必须过 [`ProxyModeType::effective_on`]（这是今天真机上就能看见的症状）
+///
+/// `proxy_mode_type` 的存盘缺省值是 `systemProxy`，**全新安装的 Android 客户端拿到的就是它**
+/// （老用户、备份恢复、手改过的 config 同理）。而 Android 上根本没有「系统代理」这个承载物：
+/// 非 root 应用无权改全局 HTTP 代理设置，`crates/system-integration` 的
+/// [`SystemProxyOpsImpl`](polaris_system_integration::proxy_ops::SystemProxyOpsImpl) 每一条
+/// Android 臂都返 `Err(UnsupportedPlatform)`。
+///
+/// 照读裸值 ⇒ 每次起核成功后都会走进 [`ProxyRuntime::maybe_enable_system_proxy`] 去调
+/// `enable_system_proxy` ⇒ 拿到那条 `Err` ⇒ `set_nonfatal_error(SYSTEM_PROXY_FAILED)` ⇒
+/// **用户当场看到一条「系统代理启用失败，流量未经代理」的错误**，而那条提示在 Android 上从头到尾
+/// 是假的：流量正经由 `VpnService` 的 tun fd 走着。
+///
+/// 平台收成入参而不是在函数里读 `Platform::current()`：判定要在任何 host 上都跑得到。
+fn should_enable_system_proxy(mode: ProxyModeType, platform: Platform) -> bool {
+    matches!(mode.effective_on(platform), ProxyModeType::SystemProxy)
 }
 
 /// 重启空窗里仅 `SystemProxy → Tun/Manual` 需要收掉旧会话系统代理。
+///
+/// 两侧都过 [`should_enable_system_proxy`] ⇒ 都读本平台生效值：Android 上两侧恒 `Tun`，
+/// 于是「跨模式离开 systemProxy」永不成立 —— 那是对的，那个平台上压根没有旧会话系统代理可收。
 pub(super) fn should_clear_system_proxy_between_restart(
     old_mode: Option<ProxyModeType>,
     new_mode: Option<ProxyModeType>,
+    platform: Platform,
 ) -> bool {
-    old_mode.is_some_and(should_enable_system_proxy)
-        && new_mode.is_some_and(|mode| !should_enable_system_proxy(mode))
+    old_mode.is_some_and(|mode| should_enable_system_proxy(mode, platform))
+        && new_mode.is_some_and(|mode| !should_enable_system_proxy(mode, platform))
 }
 
 impl ProxyRuntime {
@@ -210,7 +235,8 @@ impl ProxyRuntime {
 
     /// marker 门控的公开清理 facade，供 stop、失败腿与 command 复用。
     pub async fn clear_system_proxy(&self) -> bool {
-        self.system_proxy.clear().await
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        self.system_proxy.clear(blocking_lease).await
     }
 
     /// 启动期恢复系统代理 marker，并在同一启动汇流点恢复系统 DNS marker。
@@ -226,7 +252,7 @@ impl ProxyRuntime {
         user_config: &UserConfig,
         mixed_port: u16,
     ) {
-        if !should_enable_system_proxy(user_config.proxy_mode_type) {
+        if !should_enable_system_proxy(user_config.proxy_mode_type, self.helper.platform()) {
             return;
         }
 
@@ -247,7 +273,8 @@ impl ProxyRuntime {
             socks_port: mixed_port,
             bypass_list: effective_bypass_lan(&BypassCfg(user_config)),
         };
-        match self.system_proxy.enable(request).await {
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        match self.system_proxy.enable(request, blocking_lease).await {
             Ok(Ok(())) => {
                 log::info!(
                     "系统代理已指向本地 mixed 入站（127.0.0.1:{mixed_port}）→ 流量经本地核（A1）"
@@ -274,7 +301,14 @@ impl ProxyRuntime {
         mode: ProxyModeType,
         my_generation: Option<u64>,
     ) {
-        if !mode.is_tun() || self.system_proxy.residual_warning_claimed() {
+        // 接管方式取**本平台生效值**：Android 上恒 TUN，于是这条 advisory 在那里恒进场。
+        // 那里的结局是**静默的 `None`** —— `SystemProxyController::detect_foreign_proxy` 里
+        // `self.ops.get_proxy_status().ok()?` 撞上 Android 臂的 `Err(UnsupportedPlatform)`
+        // 直接短路返 `None`，不发事件、不打日志、不跑任何命令。为一次 marker 读加平台早退，
+        // 换来的是又一处「今天还成立吗」需要人工复核的例外，不值。
+        if !mode.effective_on(self.helper.platform()).is_tun()
+            || self.system_proxy.residual_warning_claimed()
+        {
             return;
         }
         let found = self.system_proxy.detect_foreign_proxy().await;
@@ -308,7 +342,8 @@ impl ProxyRuntime {
         mode: ProxyModeType,
         my_generation: u64,
     ) {
-        if !mode.is_tun() {
+        // 同 [`Self::maybe_warn_system_proxy_residual`]，取本平台生效值（该处有 Android 结局说明）。
+        if !mode.effective_on(self.helper.platform()).is_tun() {
             return;
         }
         let runtime = Arc::clone(self);

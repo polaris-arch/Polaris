@@ -27,11 +27,23 @@
 //! [`ConnServer`] 把 accept 到的 tokio `UnixStream` 转同步 [`LineConn`](crate::platform::linux::handler::LineConn)
 //! （5s 读超时 + 捕获 SO_PEERCRED），交给同步 [`handle`](crate::platform::linux::handle)，对应 Go 的
 //! `for { conn := l.Accept(); go handle(conn) }`。
+//!
+//! ## Native birth custody 边界
+//!
+//! Linux 每次物理 spawn 有独立 birth，`Child::try_wait` 与 TERM/KILL 共用该 birth 的锁；只有
+//! 真实 wait 成功才能生成本地 `HelperBirthReaped`，并按 birth 清 handler/slot。wait 错误保持
+//! Unknown 和 Child custody。现有 Stop wire 仍是提前 ACK，Start 仍按旧准入；本地证明未传到
+//! app，也未用于 Tailscale owner、NoOwner 或 managed。故此片**不解决** helper→helper 或跨
+//! backend 启动重叠；macOS/Windows 未提供同等级 native reap 证明。后续若要消费证明放行
+//! 新启动，须同时解决 helper-client 对未投递拒绝/等待调度的区分，不能复用普通 `ERR start`。
 
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -39,8 +51,12 @@ use crate::platform::accept_retry::{LogThrottle, ACCEPT_LOG_INTERVAL};
 use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
 use crate::platform::linux::ops::set_forward_prod;
 use crate::platform::linux::state::{
-    CoreHandle, CoreSpawner, HandlerState, SpawnCoreRequest, SpawnError, SpawnedCore,
+    BirthAdmission, CoreHandle, CoreSpawner, HandlerState, ManagedChild, ReapBlockerState,
+    SpawnCoreRequest, SpawnError, SpawnedCore, StartAdmission, StopReap,
 };
+use polaris_helper_proto::HelperBirthTarget;
+
+const REAP_TOMBSTONES: usize = 64;
 
 /// 默认 socket 路径（移植自 Go flag default `/run/polaris/helper.sock`，:18）。
 pub const DEFAULT_SOCK_PATH: &str = "/run/polaris/helper.sock";
@@ -245,59 +261,182 @@ fn parent_alive(ppid: u32) -> bool {
 
 // ===== child 退出协调槽（对应 Go `childDone chan struct{}`）=====
 
-/// 单个 child 的退出协调槽：收割线程 `child.wait()` 收尸后 [`mark_exited`](ChildSlot::mark_exited) 唤醒
-/// 等待中的 terminate（TERM 后据此决定是否 KILL），并让 watchParent 的 tick 等待可提前结束。
-///
-/// **顺序不变式**：收割线程必须先 `mark_exited` 再去拿 `HandlerState` 锁清 child —— 否则与「持 state 锁
-/// 调 terminate 并等 `wait_exited`」的 handler 线程互等死锁。
+/// Only a successful `try_wait` on this exact owned Child can mint this local
+/// fact. Linux Stop may acknowledge success only after this fact exists.
+#[derive(Clone)]
+#[allow(dead_code)] // A later helper receipt slice may consume this native fact.
+struct HelperBirthReaped {
+    birth: CoreHandle,
+    status: ExitStatus,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // No product RPC consumes native facts in this slice.
+enum LocalReapFact {
+    Pending,
+    Reaped(HelperBirthReaped),
+    Unknown,
+}
+
+trait ChildWaiter: Send {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+}
+
+impl ChildWaiter for Child {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+}
+
+struct ChildCustody {
+    child: Box<dyn ChildWaiter>,
+    phase: LocalReapFact,
+    termination_started: bool,
+}
+
+/// The Child and its terminal phase share one per-birth mutex. A signal checks
+/// `try_wait` and sends while holding that same lock; the reaper cannot reap
+/// between the check and signal and release the PID for reuse.
 struct ChildSlot {
-    pid: u32,
-    exited: Mutex<bool>,
+    handle: CoreHandle,
+    custody: Mutex<ChildCustody>,
     cv: Condvar,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildWaitOutcome {
+    Reaped,
+    TimedOut,
+    Unknown,
+}
+
 impl ChildSlot {
-    fn new(pid: u32) -> Arc<Self> {
+    fn from_child(child: Child, handle: CoreHandle) -> Arc<Self> {
+        debug_assert_eq!(child.id(), handle.pid);
+        Self::with_waiter(handle, Box::new(child))
+    }
+
+    fn with_waiter(handle: CoreHandle, child: Box<dyn ChildWaiter>) -> Arc<Self> {
         Arc::new(Self {
-            pid,
-            exited: Mutex::new(false),
+            handle,
+            custody: Mutex::new(ChildCustody {
+                child,
+                phase: LocalReapFact::Pending,
+                termination_started: false,
+            }),
             cv: Condvar::new(),
         })
     }
 
+    #[cfg(test)]
+    fn new(pid: u32) -> Arc<Self> {
+        struct PendingWaiter;
+        impl ChildWaiter for PendingWaiter {
+            fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+                Ok(None)
+            }
+        }
+        Self::with_waiter(CoreHandle::new(pid), Box::new(PendingWaiter))
+    }
+
+    #[cfg(test)]
     fn mark_exited(&self) {
-        let mut g = self.exited.lock().unwrap_or_else(PoisonError::into_inner);
-        *g = true;
+        use std::os::unix::process::ExitStatusExt;
+        let mut custody = self.custody.lock().unwrap();
+        custody.phase = LocalReapFact::Reaped(HelperBirthReaped {
+            birth: self.handle.clone(),
+            status: ExitStatus::from_raw(0),
+        });
         self.cv.notify_all();
     }
 
-    /// 在「本 pid 仍指向本 child」的前提下投递信号；返回是否真的投递。
-    ///
-    /// pid 的复用窗口从收割线程的 `child.wait()` 返回那一刻开始 —— 在此之前 child 是僵尸，pid 被内核
-    /// 占住、系统不会复用；而 `exited` 恰好是「wait 已返回」的标记，故它就是**唯一**能把「这个 pid 还是
-    /// 我的 child」判准的东西（slot 在不在册判不了：收割线程的次序是 `mark_exited` → 取 state 锁清
-    /// `child` → 从 slots 摘除，handler 全程持 state 锁会把中间那步挡住，slot 于是能在「已收割」状态下
-    /// 长期留在册上）。
-    ///
-    /// 判定与投递必须在**同一把 `exited` 锁**下完成：先判后发会留一个「判完 → wait 返回 → pid 被系统
-    /// 复用 → 信号打到无关进程」的窗口，而收割线程正是在 [`mark_exited`](Self::mark_exited) 里拿这把锁。
-    fn signal_if_live(&self, send: impl FnOnce(u32)) -> bool {
-        let exited = self.exited.lock().unwrap_or_else(PoisonError::into_inner);
-        if *exited {
-            return false;
+    /// Called only with the per-birth Child lock. A failed wait is Unknown:
+    /// retain the real Child and never signal or mint a Reaped fact from it.
+    fn refresh_locked(&self, custody: &mut ChildCustody) {
+        if !matches!(custody.phase, LocalReapFact::Pending) {
+            return;
         }
-        send(self.pid);
-        true
+        match custody.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                custody.phase = LocalReapFact::Reaped(HelperBirthReaped {
+                    birth: self.handle.clone(),
+                    status,
+                });
+                self.cv.notify_all();
+            }
+            Err(error) => {
+                log::error!(
+                    "helper Child try_wait failed for pid {}: {error}",
+                    self.handle.pid
+                );
+                custody.phase = LocalReapFact::Unknown;
+                self.cv.notify_all();
+            }
+        }
     }
 
-    /// 等退出，最多 `timeout`；返回是否在期限内退出（对应 Go `select{<-done; <-time.After(...)}`）。
+    fn reap_fact(&self) -> LocalReapFact {
+        let Ok(mut custody) = self.custody.lock() else {
+            return LocalReapFact::Unknown;
+        };
+        self.refresh_locked(&mut custody);
+        custody.phase.clone()
+    }
+
+    /// Atomically decide whether this Stop poll must start the one background
+    /// TERM/KILL worker. Repeated requests only observe the same birth.
+    fn begin_or_poll_termination(&self) -> (StopReap, bool) {
+        let Ok(mut custody) = self.custody.lock() else {
+            return (StopReap::Unknown, false);
+        };
+        self.refresh_locked(&mut custody);
+        match custody.phase {
+            LocalReapFact::Reaped(_) => (StopReap::Reaped, false),
+            LocalReapFact::Unknown => (StopReap::Unknown, false),
+            LocalReapFact::Pending => {
+                let start_worker = !custody.termination_started;
+                custody.termination_started = true;
+                (StopReap::Pending, start_worker)
+            }
+        }
+    }
+
+    /// The check, native wait and signal occur under one birth lock. Failed
+    /// signal is not a reap fact; failed wait blocks all subsequent signals.
+    fn signal_if_live(&self, send: impl FnOnce(u32) -> nix::Result<()>) -> Result<bool, String> {
+        let mut custody = self
+            .custody
+            .lock()
+            .map_err(|_| "helper Child custody lock poisoned".to_owned())?;
+        self.refresh_locked(&mut custody);
+        if !matches!(custody.phase, LocalReapFact::Pending) {
+            return Ok(false);
+        }
+        send(self.handle.pid).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Wait at most `timeout`. Unknown must be distinct from a timed-out live
+    /// child: the parent watcher must not spin when native wait fails.
+    fn wait_outcome(&self, timeout: Duration) -> ChildWaitOutcome {
+        let Ok(g) = self.custody.lock() else {
+            return ChildWaitOutcome::Unknown;
+        };
+        let Ok((g, _)) = self.cv.wait_timeout_while(g, timeout, |custody| {
+            matches!(custody.phase, LocalReapFact::Pending)
+        }) else {
+            return ChildWaitOutcome::Unknown;
+        };
+        match g.phase {
+            LocalReapFact::Pending => ChildWaitOutcome::TimedOut,
+            LocalReapFact::Reaped(_) => ChildWaitOutcome::Reaped,
+            LocalReapFact::Unknown => ChildWaitOutcome::Unknown,
+        }
+    }
+
     fn wait_exited(&self, timeout: Duration) -> bool {
-        let g = self.exited.lock().unwrap_or_else(PoisonError::into_inner);
-        let (g, _) = self
-            .cv
-            .wait_timeout_while(g, timeout, |exited| !*exited)
-            .unwrap_or_else(PoisonError::into_inner);
-        *g
+        self.wait_outcome(timeout) == ChildWaitOutcome::Reaped
     }
 }
 
@@ -309,15 +448,11 @@ fn terminate_slot(slot: &ChildSlot) {
     let grace = Duration::from_secs(TERMINATE_GRACE_SECS);
     terminate_child(
         || {
-            slot.signal_if_live(|pid| {
-                let _ = send_signal(pid, nix::sys::signal::Signal::SIGTERM);
-            });
+            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGTERM));
         },
         || slot.wait_exited(grace),
         || {
-            slot.signal_if_live(|pid| {
-                let _ = send_signal(pid, nix::sys::signal::Signal::SIGKILL);
-            });
+            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL));
         },
     );
 }
@@ -363,9 +498,14 @@ impl ReapGroup {
 ///
 /// 持共享 [`HandlerState`]（收割/看护线程清 child）+ 在途 child 槽（terminate 按 pid 查）+ reapWG。
 pub struct AmbientCapsSpawner {
+    // Pin once for this helper lifetime. A valid-looking replacement cannot be
+    // adopted by an older helper; failed initialization never blocks Stop.
+    claims: Result<super::claims::ClaimsDeployment, String>,
     state: Arc<Mutex<HandlerState>>,
-    /// 在途 child 槽（至多 1 个：start 见 running 回 already）。收割后移除。
+    /// 在途 child 槽。Start 会扫描全部槽；只有 native reap 后才移除对应 birth。
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    /// Published under the slots lock, so removal and proof are atomic to readers.
+    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
     /// 在途后台 terminate 计数（SIGTERM 退出前 waitReaps 等它归零）。
     reaps: Arc<ReapGroup>,
 }
@@ -417,22 +557,141 @@ impl<R: Read> Read for PinnedReader<R> {
 }
 
 impl AmbientCapsSpawner {
+    #[cfg(test)]
     #[must_use]
     pub fn new(state: Arc<Mutex<HandlerState>>) -> Self {
+        Self::with_claims_provision(
+            state,
+            Err(std::io::Error::other("test deployment not initialized")),
+        )
+    }
+
+    fn with_claims_provision(
+        state: Arc<Mutex<HandlerState>>,
+        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
+    ) -> Self {
         Self {
+            claims: claims_provision.map_err(|error| error.to_string()),
             state,
             slots: Arc::new(Mutex::new(Vec::new())),
+            tombstones: Arc::new(Mutex::new(VecDeque::new())),
             reaps: ReapGroup::new(),
         }
     }
 
-    fn find_slot(&self, pid: u32) -> Option<Arc<ChildSlot>> {
+    fn find_slot(&self, handle: &CoreHandle) -> Option<Arc<ChildSlot>> {
         self.slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .find(|s| s.pid == pid)
+            .find(|s| s.handle.same_birth(handle))
             .cloned()
+    }
+
+    /// Linux-local fact only. No caller may treat this as a Stop wire ACK or
+    /// as a cross-backend no-writer receipt.
+    #[allow(dead_code)]
+    fn local_reap_fact(&self, handle: &CoreHandle) -> LocalReapFact {
+        self.find_slot(handle)
+            .map_or(LocalReapFact::Unknown, |slot| slot.reap_fact())
+    }
+
+    fn scan_start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
+        let Ok(slots) = self.slots.lock() else {
+            return StartAdmission::Blocked {
+                pid: current_running.map_or(0, |handle| handle.pid),
+                state: ReapBlockerState::Unknown,
+            };
+        };
+        let mut current_fact = None;
+        let mut pending_pid = None;
+        let mut unknown_pid = None;
+        for slot in slots.iter() {
+            let fact = slot.reap_fact();
+            if current_running.is_some_and(|current| slot.handle.same_birth(current)) {
+                current_fact = Some(fact.clone());
+            }
+            match fact {
+                LocalReapFact::Pending
+                    if !current_running.is_some_and(|current| slot.handle.same_birth(current)) =>
+                {
+                    pending_pid.get_or_insert(slot.handle.pid);
+                }
+                LocalReapFact::Unknown => {
+                    unknown_pid.get_or_insert(slot.handle.pid);
+                }
+                LocalReapFact::Pending | LocalReapFact::Reaped(_) => {}
+            }
+        }
+        // Unknown wins over Pending because retrying cannot establish safety.
+        if let Some(pid) = unknown_pid {
+            return StartAdmission::Blocked {
+                pid,
+                state: ReapBlockerState::Unknown,
+            };
+        }
+        if let Some(pid) = pending_pid {
+            return StartAdmission::Blocked {
+                pid,
+                state: ReapBlockerState::Pending,
+            };
+        }
+        match (current_running, current_fact) {
+            (Some(handle), Some(LocalReapFact::Pending)) => {
+                StartAdmission::Already { pid: handle.pid }
+            }
+            (Some(_), Some(LocalReapFact::Reaped(_))) | (None, _) => StartAdmission::Admitted,
+            (Some(handle), Some(LocalReapFact::Unknown) | None) => StartAdmission::Blocked {
+                pid: handle.pid,
+                state: ReapBlockerState::Unknown,
+            },
+        }
+    }
+
+    fn scan_birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        let Ok(slots) = self.slots.lock() else {
+            return BirthAdmission::Blocked {
+                target: current_running.and_then(CoreHandle::target),
+                state: ReapBlockerState::Unknown,
+            };
+        };
+        let mut current_pending = None;
+        let mut blocker = None;
+        for slot in slots.iter() {
+            let fact = slot.reap_fact();
+            if matches!(fact, LocalReapFact::Reaped(_)) {
+                continue;
+            }
+            let target = slot.handle.target();
+            let state = if matches!(fact, LocalReapFact::Unknown) {
+                ReapBlockerState::Unknown
+            } else {
+                ReapBlockerState::Pending
+            };
+            if target.is_some()
+                && current_running.is_some_and(|current| slot.handle.same_birth(current))
+                && state == ReapBlockerState::Pending
+            {
+                current_pending = target;
+            } else if blocker.is_none() || state == ReapBlockerState::Unknown {
+                blocker = Some((target, state));
+            }
+        }
+        if let Some((target, state)) = blocker {
+            return BirthAdmission::Blocked { target, state };
+        }
+        if let Some(target) = current_pending {
+            return BirthAdmission::Already(target);
+        }
+        if let Some(current) = current_running {
+            if !slots.iter().any(|slot| slot.handle.same_birth(current)) {
+                return BirthAdmission::Blocked {
+                    target: current.target(),
+                    state: ReapBlockerState::Unknown,
+                };
+            }
+        }
+        BirthAdmission::Admitted
     }
 
     /// 等在途后台 terminate 归零（对照 Go `waitReaps`）。SIGTERM 退出兜底用。
@@ -441,15 +700,89 @@ impl AmbientCapsSpawner {
     }
 
     /// 同步 terminate 指定 child（SIGTERM 退出兜底对当前 child 用，Go main reaper 同步 `terminateChild`）。
-    fn terminate_now(&self, pid: u32) {
-        if let Some(slot) = self.find_slot(pid) {
+    fn terminate_now(&self, handle: &CoreHandle) {
+        if let Some(slot) = self.find_slot(handle) {
             terminate_slot(&slot);
         }
     }
 }
 
 impl CoreSpawner for AmbientCapsSpawner {
+    fn validate_start_environment(&self) -> Result<(), SpawnError> {
+        self.claims
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|deployment| deployment.validate().map_err(|error| error.to_string()))
+            .map_err(|detail| SpawnError::Spawn {
+                detail: format!("claims deployment unavailable: {detail}"),
+            })
+    }
+
+    fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
+        self.scan_start_admission(current_running)
+    }
+
+    fn birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        self.scan_birth_admission(current_running)
+    }
+
+    fn has_exact_birth(&self) -> bool {
+        self.slots.lock().map_or(true, |slots| {
+            slots.iter().any(|slot| {
+                slot.handle.target().is_some()
+                    && !matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+            })
+        })
+    }
+
+    fn stop_birth(&self, target: &HelperBirthTarget) -> StopReap {
+        let Ok(slots) = self.slots.lock() else {
+            return StopReap::Unknown;
+        };
+        let slot = slots
+            .iter()
+            .find(|slot| slot.handle.target().as_ref() == Some(target))
+            .cloned();
+        if slot.is_none() {
+            return self.tombstones.lock().map_or(StopReap::Unknown, |proofs| {
+                if proofs.contains(target) {
+                    StopReap::Reaped
+                } else {
+                    StopReap::Unknown
+                }
+            });
+        }
+        drop(slots);
+        let slot = slot.expect("checked above");
+        let (outcome, start_worker) = slot.begin_or_poll_termination();
+        if start_worker {
+            let reaps = Arc::clone(&self.reaps);
+            reaps.add();
+            std::thread::spawn(move || {
+                terminate_slot(&slot);
+                reaps.done();
+            });
+        }
+        outcome
+    }
+
+    fn reaped_birth(&self, target: &HelperBirthTarget) -> bool {
+        let Ok(slots) = self.slots.lock() else {
+            return false;
+        };
+        if slots.iter().any(|slot| {
+            slot.handle.target().as_ref() == Some(target)
+                && matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+        }) {
+            return true;
+        }
+        self.tombstones
+            .lock()
+            .is_ok_and(|proofs| proofs.contains(target))
+    }
+
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
+        self.validate_start_environment()?;
         let pinned_log = req
             .log
             .as_deref()
@@ -525,7 +858,16 @@ impl CoreSpawner for AmbientCapsSpawner {
         }
         let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
 
-        let slot = ChildSlot::new(pid);
+        let handle = match req.birth {
+            Some(token) => CoreHandle::exact(
+                NonZeroU32::new(pid).ok_or_else(|| SpawnError::Spawn {
+                    detail: "spawn returned PID 0".into(),
+                })?,
+                token,
+            ),
+            None => CoreHandle::new(pid),
+        };
+        let slot = ChildSlot::from_child(child, handle.clone());
         self.slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -533,39 +875,47 @@ impl CoreSpawner for AmbientCapsSpawner {
 
         // Go :466-474：收割 goroutine —— c.Wait() 收尸 → close(done) → 清 child（若仍是本 child）。
         spawn_reaper(
-            child,
-            pid,
+            handle.clone(),
             Arc::clone(&self.state),
             Arc::clone(&slot),
             Arc::clone(&self.slots),
+            Arc::clone(&self.tombstones),
         );
 
         // Go :475-477：if ppid>0 { go watchParent(ppid, c, done) }。
         if let Some(ppid) = req.parent_pid {
-            spawn_watch_parent(ppid, pid, Arc::clone(&self.state), Arc::clone(&slot));
+            spawn_watch_parent(
+                ppid,
+                handle.clone(),
+                Arc::clone(&self.state),
+                Arc::clone(&slot),
+            );
         }
 
         // Go :478：OK started <pid>（wire 由 handler 拼）。
         Ok(SpawnedCore {
-            handle: CoreHandle { pid },
+            handle,
             process_ms,
             log_handoff_ms,
         })
     }
 
-    fn terminate(&self, h: &CoreHandle) {
-        // Go stop：`reapWG.Add(1); go terminateChild(c, done)`（:375-376）—— 后台 TERM→≤5s→KILL，
-        // stop 立即回复、**不持 state 锁 5s**。无槽 = no-op；在册但已收割的 slot 由 terminate_slot 内的
-        // `signal_if_live` 逐腿挡住（防 pid 复用误杀）。
-        let Some(slot) = self.find_slot(h.pid) else {
-            return;
+    fn terminate(&self, h: &CoreHandle) -> StopReap {
+        // The wire request never waits through the five-second escalation. One
+        // exact-birth worker owns it; later Stop requests only poll native reap.
+        let Some(slot) = self.find_slot(h) else {
+            return StopReap::Unknown;
         };
-        let reaps = Arc::clone(&self.reaps);
-        reaps.add();
-        std::thread::spawn(move || {
-            terminate_slot(&slot);
-            reaps.done();
-        });
+        let (outcome, start_worker) = slot.begin_or_poll_termination();
+        if start_worker {
+            let reaps = Arc::clone(&self.reaps);
+            reaps.add();
+            std::thread::spawn(move || {
+                terminate_slot(&slot);
+                reaps.done();
+            });
+        }
+        outcome
     }
 
     fn kill(&self, h: &CoreHandle) {
@@ -573,10 +923,8 @@ impl CoreSpawner for AmbientCapsSpawner {
         // 身份判据与 terminate 同源（slot 在册 + 尚未被收割）：cleanup 拿到的 `h.pid` 来自 state.child，
         // 而收割线程清 state.child 那一步会被「全程持 state 锁」的 handler 挡住 ⇒ 这里完全可能拿到一个
         // 已被 wait() 收走、已被系统复用的 pid，裸 SIGKILL 就是误杀无关进程。无槽/已收割 = no-op。
-        if let Some(slot) = self.find_slot(h.pid) {
-            slot.signal_if_live(|pid| {
-                let _ = send_signal(pid, nix::sys::signal::Signal::SIGKILL);
-            });
+        if let Some(slot) = self.find_slot(h) {
+            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL));
         }
     }
 }
@@ -588,7 +936,12 @@ impl CoreSpawner for AmbientCapsSpawner {
     unsafe_code,
     reason = "CommandExt::pre_exec is required to drop uid/gid before exec"
 )]
-fn attach_privilege_drop(cmd: &mut std::process::Command, uid: u32, gid: u32, groups: Vec<u32>) {
+pub(super) fn attach_privilege_drop(
+    cmd: &mut std::process::Command,
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+) {
     use std::os::unix::process::CommandExt;
     let gids: Vec<nix::unistd::Gid> = groups.into_iter().map(nix::unistd::Gid::from_raw).collect();
     let caps = ambient_caps();
@@ -629,67 +982,126 @@ fn apply_privilege_drop(
     Ok(())
 }
 
-/// 收割线程（Go reaper goroutine，:466-474）。owns Child → `wait()` 收尸（防僵尸）。
+/// Remove only the birth whose native Child was actually reaped. The Child
+/// lock is released before taking HandlerState or the slots registry.
+fn clear_reaped_birth(
+    proof: &HelperBirthReaped,
+    state: &Arc<Mutex<HandlerState>>,
+    slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+) {
+    {
+        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.child
+            .as_ref()
+            .is_some_and(|child| child.handle().same_birth(&proof.birth))
+        {
+            g.child = None;
+        }
+    }
+    let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = slots.len();
+    slots.retain(|s| !s.handle.same_birth(&proof.birth));
+    if slots.len() != before {
+        if let Some(target) = proof.birth.target() {
+            let mut tombstones = tombstones.lock().unwrap_or_else(PoisonError::into_inner);
+            if tombstones.len() == REAP_TOMBSTONES {
+                tombstones.pop_front();
+            }
+            tombstones.push_back(target);
+        }
+    }
+}
+
+/// 收割线程：仅真实 `Child::try_wait()` 成功才清本 birth；Err 留 Unknown custody。
 fn spawn_reaper(
-    mut child: std::process::Child,
-    pid: u32,
+    handle: CoreHandle,
     state: Arc<Mutex<HandlerState>>,
     slot: Arc<ChildSlot>,
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
 ) {
-    std::thread::spawn(move || {
-        let _ = child.wait(); // Go: _ = c.Wait()
-                              // 顺序不变式：先唤醒等待中的 terminate（不需 state 锁），再拿 state 锁清 child——杜绝与
-                              // 「持 state 锁调 terminate 等 wait_exited」的 handler 线程死锁。
-        slot.mark_exited(); // Go: close(done)
-        {
-            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-            if g.child.as_ref().map(|h| h.pid) == Some(pid) {
-                g.child = None; // Go: if child == c { child, childDone = nil, nil }
+    std::thread::spawn(move || run_reaper(&handle, &state, &slot, &slots, &tombstones));
+}
+
+fn run_reaper(
+    handle: &CoreHandle,
+    state: &Arc<Mutex<HandlerState>>,
+    slot: &Arc<ChildSlot>,
+    slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+) {
+    let proof = loop {
+        match slot.reap_fact() {
+            LocalReapFact::Pending => std::thread::sleep(Duration::from_millis(20)),
+            LocalReapFact::Unknown => return, // retain custody; no false reap fact
+            LocalReapFact::Reaped(proof) => {
+                if !slot.handle.same_birth(handle) || !proof.birth.same_birth(handle) {
+                    log::error!("helper reaper birth mismatch for pid {}", handle.pid);
+                    return;
+                }
+                break proof;
             }
         }
-        slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|s| s.pid != pid);
-    });
+    };
+    clear_reaped_birth(&proof, state, slots, tombstones);
 }
 
 /// 父死看护线程（Go `watchParent`，:258-285）。每 1s tick：child 退出→停；非当前 child→停；父死→摘+terminate。
-fn spawn_watch_parent(ppid: u32, pid: u32, state: Arc<Mutex<HandlerState>>, slot: Arc<ChildSlot>) {
-    std::thread::spawn(move || {
-        let interval = Duration::from_secs(WATCH_PARENT_INTERVAL_SECS);
-        loop {
-            // Go: select{<-done; <-t.C}。以 slot.wait_exited 折叠「等 1s 或 child 已退出」：
-            // 已退出（true）→ 停看护（Go: <-done → return）；超时（false）→ 走 tick 检查。
-            if slot.wait_exited(interval) {
+fn spawn_watch_parent(
+    ppid: u32,
+    handle: CoreHandle,
+    state: Arc<Mutex<HandlerState>>,
+    slot: Arc<ChildSlot>,
+) {
+    std::thread::spawn(move || watch_parent_loop(ppid, &handle, &state, &slot, parent_alive));
+}
+
+fn watch_parent_loop(
+    ppid: u32,
+    handle: &CoreHandle,
+    state: &Arc<Mutex<HandlerState>>,
+    slot: &Arc<ChildSlot>,
+    parent_probe: impl Fn(u32) -> bool,
+) {
+    let interval = Duration::from_secs(WATCH_PARENT_INTERVAL_SECS);
+    loop {
+        // Go: select{<-done; <-t.C}。以 slot.wait_exited 折叠「等 1s 或 child 已退出」：
+        // 已退出（true）→ 停看护（Go: <-done → return）；超时（false）→ 走 tick 检查。
+        match slot.wait_outcome(interval) {
+            ChildWaitOutcome::Reaped | ChildWaitOutcome::Unknown => return,
+            ChildWaitOutcome::TimedOut => {}
+        }
+        // Go: current := (child == c)。仍是当前 child 才继续（否则被 stop/cleanup 摘除）。
+        let still_current = {
+            let g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.child
+                .as_ref()
+                .and_then(ManagedChild::running)
+                .is_some_and(|running| running.same_birth(handle))
+        };
+        // 短路顺序对齐 Go：仅当仍是当前 child 才探父存活（parent_alive 是一次 kill(0) syscall）。
+        let alive = still_current && parent_probe(ppid);
+        match watch_parent_step(still_current, alive) {
+            WatchStep::Continue => {}
+            WatchStep::Stop => return,
+            WatchStep::ParentDead => {
+                // Go :274-280：摘 child（若仍是本 child）。
+                {
+                    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if g.child
+                        .as_ref()
+                        .is_some_and(|child| child.handle().same_birth(handle))
+                    {
+                        g.child = Some(ManagedChild::Stopping(handle.clone()));
+                    }
+                }
+                // Go :281：terminateChild(c, done)（不持 state 锁）。
+                terminate_slot(slot);
                 return;
             }
-            // Go: current := (child == c)。仍是当前 child 才继续（否则被 stop/cleanup 摘除）。
-            let still_current = {
-                let g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                g.child.as_ref().map(|h| h.pid) == Some(pid)
-            };
-            // 短路顺序对齐 Go：仅当仍是当前 child 才探父存活（parent_alive 是一次 kill(0) syscall）。
-            let alive = still_current && parent_alive(ppid);
-            match watch_parent_step(still_current, alive) {
-                WatchStep::Continue => {}
-                WatchStep::Stop => return,
-                WatchStep::ParentDead => {
-                    // Go :274-280：摘 child（若仍是本 child）。
-                    {
-                        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if g.child.as_ref().map(|h| h.pid) == Some(pid) {
-                            g.child = None;
-                        }
-                    }
-                    // Go :281：terminateChild(c, done)（不持 state 锁）。
-                    terminate_slot(&slot);
-                    return;
-                }
-            }
         }
-    });
+    }
 }
 
 // ===== 生产连接服务（accept 循环 → handle）=====
@@ -712,10 +1124,28 @@ pub struct ConnServer {
 
 impl ConnServer {
     /// 由 [`ServerConfig`] 建服务（单一共享 state + spawner）。
+    #[cfg(test)]
     #[must_use]
     pub fn new(cfg: &ServerConfig) -> Arc<Self> {
+        Self::with_claims_provision(
+            cfg,
+            Err(std::io::Error::other("test deployment not initialized")),
+        )
+    }
+
+    /// Consume this startup's exact provisioning result, retaining successful
+    /// original FDs or the failure for the whole helper lifetime. Never reopen
+    /// a statically valid directory to erase a provisioning error.
+    #[must_use]
+    pub fn with_claims_provision(
+        cfg: &ServerConfig,
+        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
+    ) -> Arc<Self> {
         let state = Arc::new(Mutex::new(HandlerState::new()));
-        let spawner = Arc::new(AmbientCapsSpawner::new(Arc::clone(&state)));
+        let spawner = Arc::new(AmbientCapsSpawner::with_claims_provision(
+            Arc::clone(&state),
+            claims_provision,
+        ));
         Arc::new(Self {
             state,
             spawner,
@@ -727,6 +1157,11 @@ impl ConnServer {
             limiter: ConnLimiter::new(MAX_CONCURRENT_CONNECTIONS),
             limit_log: LogThrottle::new(ACCEPT_LOG_INTERVAL),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_start_environment_for_test(&self) -> Result<(), SpawnError> {
+        self.spawner.validate_start_environment()
     }
 
     /// 处理一个连接（Go: `go handle(conn)`）。捕获 SO_PEERCRED → 转 std 阻塞流（5s 读超时）→
@@ -797,10 +1232,14 @@ impl ConnServer {
     pub fn reap_on_shutdown(&self) {
         let child = {
             let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            g.child.take()
+            let handle = g.child.as_ref().map(ManagedChild::handle).cloned();
+            if let Some(handle) = handle.as_ref() {
+                g.child = Some(ManagedChild::Stopping(handle.clone()));
+            }
+            handle
         };
         if let Some(h) = child {
-            self.spawner.terminate_now(h.pid); // 同步（Go main 里 terminateChild 是同步调用）。
+            self.spawner.terminate_now(&h); // sync; no PID-only lookup
         }
         self.spawner.wait_reaps(Duration::from_secs(6));
     }

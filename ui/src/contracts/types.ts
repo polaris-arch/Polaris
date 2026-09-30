@@ -88,6 +88,7 @@ export type {
   RuleCondition,
   Rule,
   SystemProcessInfo,
+  InstalledApp,
   CustomRuleSet,
   RuleResourceFormat,
   RuleResourceCategory,
@@ -393,8 +394,8 @@ export interface ImportParseResult {
 }
 
 export interface TunModeConfig {
-  // 缺席 = 自动：生成期取 Rust `crates/config-engine/src/user_config/tun_config.rs` 的 `DEFAULT_TUN_MTU`
-  // （渲染端副本 domain/tun-mtu.ts `DEFAULT_TUN_MTU`，parity 测试对拍）。在场 = 用户显式值，逐字下发内核。
+  // 缺席 = 自动：生成期**不下发** `mtu` 键，由 sing-box 内核按运行环境取默认（见 Rust
+  // `crates/config-engine/src/user_config/tun_config.rs` 的 `TunModeConfig::mtu`）。在场 = 用户显式值，逐字下发内核。
   // 存量值由 polaris-store 的 migrate_tun_mtu 一次性抹掉——本项此前从未有 UI 入口，磁盘上的
   // 任何值都是程序写的默认，不承载用户意图。
   mtu?: number;

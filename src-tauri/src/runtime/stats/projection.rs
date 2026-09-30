@@ -246,6 +246,9 @@ pub(super) struct ClosedHistory {
     pub(super) entries: Vec<ClosedConnectionEntry>,
     cutoff_ns: i64,
     generation: u64,
+    core_generation: Option<u64>,
+    /// 仅同一核的 reset 回放可继承已冻结身份，换核后旧历史仍显示但不作身份来源。
+    identity_ids_from_core: HashSet<String>,
 }
 
 impl ClosedHistory {
@@ -267,8 +270,16 @@ impl ClosedHistory {
 
     pub(super) fn clear(&mut self, cutoff_ns: i64) {
         self.entries.clear();
+        self.identity_ids_from_core.clear();
         self.cutoff_ns = self.cutoff_ns.max(cutoff_ns);
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub(super) fn set_core_generation(&mut self, generation: u64) {
+        if self.core_generation != Some(generation) {
+            self.identity_ids_from_core.clear();
+            self.core_generation = Some(generation);
+        }
     }
 
     /// 在活跃聚合器消费本帧前提取关闭记录，这样 CLOSED 缺少完整 connection 时仍能用活动表兜底。
@@ -315,7 +326,25 @@ impl ClosedHistory {
                 .connection
                 .as_ref()
                 .filter(|connection| !is_probe_pool_inbound_tag(&connection.inbound))
-                .map(trim_connection)
+                .map(|connection| {
+                    let mut entry = trim_connection(connection);
+                    let frozen = active.entry(&connection.id).or_else(|| {
+                        self.identity_ids_from_core
+                            .contains(&connection.id)
+                            .then(|| {
+                                self.entries
+                                    .iter()
+                                    .find(|old| old.entry.id == connection.id)
+                                    .map(|old| &old.entry)
+                            })
+                            .flatten()
+                    });
+                    if let Some(frozen) = frozen {
+                        entry.rule_id.clone_from(&frozen.rule_id);
+                        entry.rule_name.clone_from(&frozen.rule_name);
+                    }
+                    entry
+                })
                 .or_else(|| active.entry(&event.id).cloned());
             let Some(entry) = entry else {
                 continue;
@@ -326,6 +355,11 @@ impl ClosedHistory {
 
             let next = ClosedConnectionEntry { entry, closed_at };
             let id = next.entry.id.clone();
+            if next.entry.rule_name.is_some() {
+                self.identity_ids_from_core.insert(id.clone());
+            } else {
+                self.identity_ids_from_core.remove(&id);
+            }
             let old_at = self.entries.iter().position(|old| old.entry.id == id);
             if old_at.is_some_and(|at| self.entries[at] == next) {
                 continue;
@@ -347,6 +381,13 @@ impl ClosedHistory {
 
         if events.reset {
             self.entries.truncate(MAX_CLOSED_HISTORY);
+            let present: HashSet<_> = self
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id.as_str())
+                .collect();
+            self.identity_ids_from_core
+                .retain(|id| present.contains(id.as_str()));
             return Some(ClosedHistoryChange::Reset {
                 generation: self.generation,
             });
@@ -360,6 +401,7 @@ impl ClosedHistory {
         let mut removed_ids = Vec::new();
         for entry in evicted {
             let id = entry.entry.id;
+            self.identity_ids_from_core.remove(&id);
             let was_present = initially_present.remove(&id).unwrap_or(true);
             changed_ids.remove(&id);
             if was_present {

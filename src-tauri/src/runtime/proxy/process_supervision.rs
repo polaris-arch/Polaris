@@ -4,19 +4,407 @@
 //! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs` /
 //! `win_console.rs`），façade 必须 `pub(crate) use` 再导出（§B.3）。
 
+#[allow(dead_code)] // The managed exact supervisor remains dormant.
+mod direct_custody;
+#[allow(dead_code)] // No production commit bridge exists in this slice.
+mod direct_stop;
+pub(crate) use direct_custody::DirectCoreSlot;
+use direct_custody::WorkerNonce;
+#[cfg(test)]
+pub(super) use direct_custody::{
+    DirectBirthCloseError, ReserveStoppingError, SlotAdmissionError, StopView, TakeRunningError,
+};
+pub(super) use direct_custody::{HelperStartToken, HelperStopNonce};
+pub(super) use direct_stop::DirectStopIo;
+use direct_stop::NativeStopIo;
+#[cfg(test)]
+pub(super) use direct_stop::{
+    commit_for_test, prepare_direct_stop, prepare_with_io_for_test, CommitDirectStopError,
+    CommitRejected, DirectStopObservation, DirectStopProvenance, PrepareError, StopWaitOutcome,
+};
+
+use std::future::poll_fn;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use polaris_core_supervisor::{scan_running_cores, stale_pids, ProcessKiller, Signal};
+use polaris_core_supervisor::{scan_running_cores, stale_pids, Signal};
+use tokio::process::Child;
 
-use crate::runtime::helper::HelperStopOps;
+use crate::runtime::helper::{HelperStopOps, HelperStopTarget};
 use crate::runtime::win_console::no_console_window;
 
 use super::core_binary::resolve_core_binary;
 use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
+
+/// A detached Android Stop can finish after its waiter is cancelled. Drop
+/// ends only the local booking; uncertainty remains sticky across retries.
+pub(super) struct AndroidStopBooking<'a> {
+    custody: &'a std::sync::Mutex<Option<super::AndroidGlobalCustody>>,
+    birth: super::AndroidRequestBirth,
+    nonce: Arc<()>,
+    was_certain: bool,
+    completed: bool,
+}
+
+impl AndroidStopBooking<'_> {
+    fn birth(&self) -> super::AndroidRequestBirth {
+        self.birth.clone()
+    }
+
+    pub(super) fn finish_with_gate(
+        self,
+        result: Result<(), String>,
+        mesh: &crate::runtime::mesh::MeshRuntime,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        self.finish(result, |token| {
+            mesh.release_tailscale_main_states_if_token(token, gate)
+        })
+    }
+
+    pub(super) fn finish_without_main(self, result: Result<(), String>) -> Result<(), String> {
+        self.finish(result, |_| {
+            Err("Android global Stop lacks the TS gate for a main claim".into())
+        })
+    }
+
+    fn finish(
+        mut self,
+        result: Result<(), String>,
+        release_main: impl FnOnce(
+            &crate::runtime::tailscale_login_core::MainBirthToken,
+        ) -> Result<bool, String>,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .custody
+            .lock()
+            .map_err(|_| "Android global custody poisoned after Stop".to_string())?;
+        let attempt = guard
+            .as_mut()
+            .filter(|attempt| {
+                attempt.birth.same(&self.birth)
+                    && attempt
+                        .stop_inflight
+                        .as_ref()
+                        .is_some_and(|nonce| Arc::ptr_eq(nonce, &self.nonce))
+            })
+            .ok_or("Android global Stop custody changed")?;
+        if !self.was_certain || attempt.historic_unknown || result.is_err() {
+            attempt.stop_inflight = None;
+            attempt.historic_unknown = true;
+            self.completed = true;
+            return result.and_then(|()| {
+                Err(
+                    "Android global cleanup-unknown: earlier detached Stop may still complete"
+                        .into(),
+                )
+            });
+        }
+        if let Some(token) = &self.birth.main_token {
+            match release_main(token) {
+                Ok(true) => {}
+                Ok(false) => {
+                    attempt.stop_inflight = None;
+                    attempt.historic_unknown = true;
+                    self.completed = true;
+                    return Err("Android main Stop ACK did not match its registry birth".into());
+                }
+                Err(error) => {
+                    attempt.stop_inflight = None;
+                    attempt.historic_unknown = true;
+                    self.completed = true;
+                    return Err(error);
+                }
+            }
+        }
+        // This is the same mutex critical section as nonce validation and
+        // registry compare-remove. No new Start can observe an unbooked gap.
+        *guard = None;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for AndroidStopBooking<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Ok(mut guard) = self.custody.lock() {
+                if let Some(attempt) = guard.as_mut().filter(|attempt| {
+                    attempt.birth.same(&self.birth)
+                        && attempt
+                            .stop_inflight
+                            .as_ref()
+                            .is_some_and(|nonce| Arc::ptr_eq(nonce, &self.nonce))
+                }) {
+                    attempt.stop_inflight = None;
+                    attempt.historic_unknown = true;
+                }
+            }
+        }
+    }
+}
+
+/// The blocking Stop returns this non-cloneable permit with its ACK. It stays
+/// booked through final Child→pid validation; Drop only releases booking.
+pub(super) struct HelperStopPermit {
+    child: Arc<std::sync::Mutex<DirectCoreSlot>>,
+    attempt: HelperStartToken,
+    target: HelperStopTarget,
+    nonce: HelperStopNonce,
+}
+
+impl HelperStopPermit {
+    pub(super) fn new(
+        child: Arc<std::sync::Mutex<DirectCoreSlot>>,
+        attempt: HelperStartToken,
+        target: HelperStopTarget,
+        nonce: HelperStopNonce,
+    ) -> Self {
+        Self {
+            child,
+            attempt,
+            target,
+            nonce,
+        }
+    }
+
+    pub(super) fn nonce(&self) -> &HelperStopNonce {
+        &self.nonce
+    }
+
+    fn attempt(&self) -> &HelperStartToken {
+        &self.attempt
+    }
+
+    fn target(&self) -> HelperStopTarget {
+        self.target
+    }
+}
+
+impl Drop for HelperStopPermit {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            child.finish_helper_stop_ipc(&self.attempt, &self.nonce);
+        }
+    }
+}
+
+/// Owns only the ordinary direct Stop booking. The Child never leaves the
+/// slot, including when its native wait future is cancelled or errors.
+struct NativeStopBooking {
+    slot: Arc<std::sync::Mutex<DirectCoreSlot>>,
+    identity: RunIdentity,
+    nonce: WorkerNonce,
+}
+
+impl NativeStopBooking {
+    fn poll_wait(
+        &self,
+        cx: &mut Context<'_>,
+        io: &dyn DirectStopIo,
+    ) -> Poll<Result<std::process::ExitStatus, String>> {
+        match self.slot.lock() {
+            Ok(mut slot) => slot.poll_native_wait(&self.identity, &self.nonce, cx, |child, cx| {
+                io.poll_wait(child, cx)
+            }),
+            Err(_) => Poll::Ready(Err(
+                "direct Child custody poisoned during native wait".into()
+            )),
+        }
+    }
+
+    fn signal(&self, signal: impl FnOnce(&mut Child) -> std::io::Result<()>) -> Result<(), String> {
+        self.slot
+            .lock()
+            .map_err(|_| "direct Child custody poisoned before stop signal".to_owned())?
+            .signal_native_stop(&self.identity, &self.nonce, signal)
+    }
+}
+
+impl Drop for NativeStopBooking {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            slot.finish_native_stop_booking(&self.identity, &self.nonce);
+        }
+    }
+}
+
+/// Identity of one locally spawned core. The token is minted before spawn and
+/// attached only to the resulting Child, so neither a reused PID nor a later
+/// lifecycle request can impersonate that run.
+#[derive(Clone)]
+pub(super) struct RunIdentity(pub(super) Arc<RunToken>);
+
+pub(super) struct RunToken {
+    /// Opaque journal correlation, minted once per actual direct Child. The
+    /// Arc is still the live instance proof; this string alone cannot prove a
+    /// process after app restart or establish plan/artifact ownership.
+    persisted_ref: String,
+}
+
+impl RunIdentity {
+    pub(super) fn new() -> Self {
+        Self(Arc::new(RunToken {
+            persisted_ref: format!("direct-{}", uuid::Uuid::new_v4()),
+        }))
+    }
+
+    pub(super) fn same_run(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(super) fn persisted_ref(&self) -> &str {
+        &self.0.persisted_ref
+    }
+}
+
+pub(super) struct DirectCoreRun {
+    child: Option<Child>,
+    #[cfg(unix)]
+    lost_wait_ownership: bool,
+    pub(super) identity: RunIdentity,
+    #[allow(dead_code)] // Read when the managed coordinator's exact stop gate is wired.
+    pub(super) origin: DirectRunOrigin,
+    pub(super) main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+}
+
+/// The legacy constructor records Legacy. A future managed coordinator must
+/// guard both spawn and slot assignment before treating Managed facts as
+/// authority; trusted proxy descendants can still reassign this field.
+#[allow(dead_code)] // The managed coordinator is deliberately not enabled yet.
+pub(super) enum DirectRunOrigin {
+    Legacy,
+    Managed(super::mesh_apply::run_birth::ManagedRunFacts),
+}
+
+impl DirectCoreRun {
+    #[cfg(test)]
+    pub(super) fn mark_managed_for_test(&mut self) {
+        self.origin = DirectRunOrigin::Managed(
+            super::mesh_apply::run_birth::ManagedRunFacts::fixture_for_test(
+                self.identity.persisted_ref(),
+            ),
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn new(child: Child) -> Self {
+        Self::with_identity(child, RunIdentity::new())
+    }
+
+    pub(super) fn with_identity(child: Child, identity: RunIdentity) -> Self {
+        Self {
+            child: Some(child),
+            #[cfg(unix)]
+            lost_wait_ownership: false,
+            identity,
+            origin: DirectRunOrigin::Legacy,
+            main_token: None,
+        }
+    }
+
+    fn wait_allowed(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if self.lost_wait_ownership {
+            return Err(std::io::Error::from_raw_os_error(
+                nix::errno::Errno::ECHILD as i32,
+            ));
+        }
+        Ok(())
+    }
+
+    fn retain_wait_error(&mut self, error: &std::io::Error) {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
+            self.lost_wait_ownership = true;
+        }
+        #[cfg(not(unix))]
+        let _ = error;
+    }
+
+    pub(super) fn try_wait_with(
+        &mut self,
+        wait: impl FnOnce(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.wait_allowed()?;
+        let result = wait(self.child.as_mut().expect("custody Child retained"));
+        if let Err(error) = &result {
+            self.retain_wait_error(error);
+        }
+        result
+    }
+
+    pub(super) fn poll_wait_with(
+        &mut self,
+        cx: &mut Context<'_>,
+        wait: impl FnOnce(
+            &mut Child,
+            &mut Context<'_>,
+        ) -> Poll<std::io::Result<std::process::ExitStatus>>,
+    ) -> Poll<std::io::Result<std::process::ExitStatus>> {
+        if let Err(error) = self.wait_allowed() {
+            return Poll::Ready(Err(error));
+        }
+        let result = wait(self.child.as_mut().expect("custody Child retained"), cx);
+        if let Poll::Ready(Err(error)) = &result {
+            self.retain_wait_error(error);
+        }
+        result
+    }
+
+    pub(super) fn signal_with(
+        &mut self,
+        signal: impl FnOnce(&mut Child) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.wait_allowed()?;
+        signal(self.child.as_mut().expect("custody Child retained"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn child_id_for_test(&self) -> Option<u32> {
+        self.child.as_ref().expect("custody Child retained").id()
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_child_for_test(mut self) -> Child {
+        self.wait_allowed()
+            .expect("test cannot extract lost native identity");
+        self.child.take().expect("custody Child retained")
+    }
+
+    #[cfg(test)]
+    pub(super) fn child_for_test(&mut self) -> &mut Child {
+        self.child.as_mut().expect("custody Child retained")
+    }
+
+    pub(super) fn with_main_token(
+        child: Child,
+        identity: RunIdentity,
+        token: crate::runtime::tailscale_login_core::MainBirthToken,
+    ) -> Self {
+        let mut run = Self::with_identity(child, identity);
+        run.main_token = Some(token);
+        run
+    }
+}
+
+// Tokio's Unix Child Drop may wait again or enqueue the old PID. ECHILD
+// permanently loses that authority: isolate just this wrapper, once per birth.
+// The slot and logical owner stay Unknown; this is not cleanup or NoOwner.
+#[cfg(unix)]
+impl Drop for DirectCoreRun {
+    fn drop(&mut self) {
+        if self.lost_wait_ownership {
+            if let Some(child) = self.child.take() {
+                std::mem::forget(child);
+            }
+        }
+    }
+}
 
 /// SIGTERM→SIGKILL 宽限期（上游 `stopSingBoxProcess` 的 5s 优雅窗口，:5230）。
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -25,6 +413,253 @@ pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
 pub(super) const STALE_KILL_GRACE: Duration = Duration::from_millis(1_500);
 
 impl ProxyRuntime {
+    fn book_android_global_start_locked(
+        custody: &mut Option<super::AndroidGlobalCustody>,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<super::AndroidRequestBirth, String> {
+        if custody.is_some() {
+            return Err("Android global Start/Stop request is still owned".into());
+        }
+        let birth = super::AndroidRequestBirth {
+            identity: Arc::new(()),
+            main_token,
+        };
+        *custody = Some(super::AndroidGlobalCustody {
+            birth: birth.clone(),
+            exact_target: None,
+            stop_only: false,
+            start_confirmed: false,
+            #[cfg(any(all(target_os = "android", debug_assertions), test))]
+            debug_probe_input: None,
+            historic_unknown: false,
+            stop_inflight: None,
+        });
+        Ok(birth)
+    }
+
+    /// The TS gate is held by start_inner. Read the real generation while
+    /// holding the same Android custody mutex that explicit Start holds across
+    /// its generation claim; an older attempt cannot book after being replaced.
+    pub(super) fn book_android_global_start_for_generation(
+        &self,
+        my_gen: u64,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<Option<super::AndroidRequestBirth>, String> {
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned".to_string())?;
+        if self.gate.generation() != my_gen {
+            return Ok(None);
+        }
+        Self::book_android_global_start_locked(&mut custody, main_token).map(Some)
+    }
+
+    #[cfg(test)]
+    pub(super) fn book_android_global_start(
+        &self,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<super::AndroidRequestBirth, String> {
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned".to_string())?;
+        Self::book_android_global_start_locked(&mut custody, main_token)
+    }
+
+    pub(super) fn confirm_android_global_start(
+        &self,
+        birth: &super::AndroidRequestBirth,
+        exact_target: super::android_bridge::AndroidExactTarget,
+    ) -> Result<(), String> {
+        if !exact_target.is_valid() {
+            return Err("Android global Start receipt has invalid exact target".into());
+        }
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned after Start".to_string())?;
+        let attempt = custody
+            .as_mut()
+            .filter(|attempt| attempt.birth.same(birth) && !attempt.stop_only)
+            .ok_or("Android global Start custody changed")?;
+        if attempt
+            .exact_target
+            .as_ref()
+            .is_some_and(|current| current != &exact_target)
+        {
+            return Err("Android global Start exact target changed".into());
+        }
+        attempt.exact_target = Some(exact_target);
+        attempt.start_confirmed = true;
+        Ok(())
+    }
+
+    /// Only the typed Kotlin pre-dispatch rejection proves no native owner was
+    /// created. Release this exact request's booking so its next allocation can
+    /// retry; all unknown/late failures retain custody for safety.
+    pub(super) fn abandon_android_global_start_without_birth(
+        &self,
+        birth: &super::AndroidRequestBirth,
+    ) -> Result<(), String> {
+        let mut custody = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned after no-birth rejection".to_string())?;
+        match custody.as_ref() {
+            Some(attempt)
+                if attempt.birth.same(birth)
+                    && !attempt.start_confirmed
+                    && attempt.exact_target.is_none()
+                    && !attempt.stop_only
+                    && !attempt.historic_unknown
+                    && attempt.stop_inflight.is_none() =>
+            {
+                *custody = None;
+                Ok(())
+            }
+            _ => Err("Android no-birth rejection changed custody; refusing port retry".into()),
+        }
+    }
+
+    pub(super) fn begin_android_stop_booking(
+        &self,
+        allow_main: bool,
+    ) -> Result<AndroidStopBooking<'_>, String> {
+        let mut guard = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "Android global custody poisoned".to_string())?;
+        let nonce = Arc::new(());
+        match guard.as_mut() {
+            Some(attempt)
+                if (allow_main || attempt.birth.main_token.is_none())
+                    && (attempt.start_confirmed || attempt.stop_only)
+                    && attempt.stop_inflight.is_none() =>
+            {
+                let was_certain = !attempt.historic_unknown;
+                attempt.stop_inflight = Some(Arc::clone(&nonce));
+                Ok(AndroidStopBooking {
+                    custody: &self.android_main_token,
+                    birth: attempt.birth.clone(),
+                    nonce,
+                    was_certain,
+                    completed: false,
+                })
+            }
+            Some(_) => Err(
+                "Android global cleanup-unknown: a Start or Stop request may still complete".into(),
+            ),
+            None => {
+                // Cold system-started core cleanup is also a global Stop.
+                // It must book an independent birth before delivery.
+                let birth = super::AndroidRequestBirth {
+                    identity: Arc::new(()),
+                    main_token: None,
+                };
+                *guard = Some(super::AndroidGlobalCustody {
+                    birth: birth.clone(),
+                    exact_target: None,
+                    stop_only: true,
+                    start_confirmed: false,
+                    #[cfg(any(all(target_os = "android", debug_assertions), test))]
+                    debug_probe_input: None,
+                    historic_unknown: false,
+                    stop_inflight: Some(Arc::clone(&nonce)),
+                });
+                Ok(AndroidStopBooking {
+                    custody: &self.android_main_token,
+                    birth,
+                    nonce,
+                    was_certain: true,
+                    completed: false,
+                })
+            }
+        }
+    }
+
+    /// The caller holds the real TS gate across this entire existing stop leg.
+    /// Registry removal is only a local bookkeeping consequence of its ACK.
+    pub(super) async fn kill_core_and_release_main(
+        &self,
+        ts_gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), String> {
+        if cfg!(target_os = "android") {
+            // Stop booking spans the detached request, registry compare-remove,
+            // and global custody removal. The latter two share one short
+            // Android-custody→registry critical section under the TS gate.
+            super::android_bridge::main_start_dispatch_available().map_err(|(msg, _)| msg)?;
+            let booking = self.begin_android_stop_booking(true)?;
+            let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
+            return booking.finish_with_gate(result, &self.mesh, ts_gate);
+        }
+        if self.core_via_helper.load(Ordering::SeqCst) {
+            return self
+                .kill_core_via_helper_with_main(
+                    Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
+                    Some(ts_gate),
+                )
+                .await
+                .map(|_| ());
+        }
+        self.kill_direct_core_with_io(Some(ts_gate), &NativeStopIo)
+            .await
+    }
+
+    /// Test observation of the token retained by backend custody. Empty slots
+    /// provide no authority to release a registry entry.
+    #[cfg(test)]
+    pub(super) fn main_token_for_stop(
+        &self,
+    ) -> Result<Option<crate::runtime::tailscale_login_core::MainBirthToken>, String> {
+        if cfg!(target_os = "android") {
+            return self
+                .android_main_token
+                .lock()
+                .map(|custody| {
+                    custody.as_ref().and_then(|attempt| {
+                        (attempt.start_confirmed
+                            && !attempt.historic_unknown
+                            && attempt.stop_inflight.is_none())
+                        .then(|| attempt.birth.main_token.clone())
+                        .flatten()
+                    })
+                })
+                .map_err(|_| "Android global custody poisoned".into());
+        }
+        self.child
+            .lock()
+            .map(|child| child.main_token_for_stop(self.core_via_helper.load(Ordering::SeqCst)))
+            .map_err(|_| "direct Child token custody poisoned".into())
+    }
+
+    /// Register every helper start/stop/cleanup before its blocking IPC is
+    /// queued. Child is the serialization point for the direct-stop bridge.
+    pub(crate) fn register_helper_backend(&self) -> Result<(), String> {
+        self.helper.register_core_mutation()
+    }
+
+    #[cfg(test)]
+    pub(super) fn register_helper_start_backend(&self) -> Result<HelperStartToken, String> {
+        self.register_helper_start_backend_with_main(None)
+    }
+
+    pub(super) fn register_helper_start_backend_with_main(
+        &self,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<HelperStartToken, String> {
+        self.register_helper_backend()?;
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| "child lock poisoned".to_string())?;
+        let token = child
+            .begin_helper_start_with_main(main_token)
+            .map_err(|error| format!("helper IPC rejected by direct Child custody: {error:?}"))?;
+        self.core_via_helper.store(true, Ordering::SeqCst);
+        Ok(token)
+    }
+
     /// **内核自证**：核就绪后校验「**实际跑起来的那个二进制**的版本 == 本次期望的核版本」。
     ///
     /// # 这一条为什么必须观测事实（血证）
@@ -122,57 +757,107 @@ impl ProxyRuntime {
         }
     }
 
-    /// 杀核（接线 core-supervisor [`ProcessKiller`]）：SIGTERM → 宽限 → SIGKILL，并 reap 子进程。
+    /// 杀核：SIGTERM → 宽限 → owned Child SIGKILL，并确认 native wait。
     ///
-    /// 无在跑核 = no-op。退出/崩溃/重启后不留孤儿：child 句柄被 take 后必 `wait()` 收割。
-    /// helper 腿未确认停止时返回错误，调用方不得继续清运行态或启动第二个核。
+    /// Empty = no-op；普通 Stopping 可重试；exact worker 的 Stopping 保持独占。
+    /// native wait 错误或取消保留 Child/记账，调用方不得继续清运行态或起第二个核。
     pub(super) async fn kill_core(&self) -> Result<(), String> {
+        // Android：核在**本进程内**（libbox），没有 child 可杀、没有 pid 可发信号 —— 停核 = 请
+        // `VpnService` 拆隧道。与 `kill_core_via_helper` 同构：**要确定回执**，停不掉就返 Err，
+        // 调用方不得据此继续清运行态或起第二个核（tun fd 由 `VpnService.prepare()` 仲裁，
+        // 同一时刻只授权一个应用，前一条没拆干净就起第二个必然打架）。
+        //
+        // `if cfg!` 而非 `#[cfg]` 早退：后者会让下面整段在 Android 编译单元里变成不可达代码。
+        if cfg!(target_os = "android") {
+            // Stale/system-core cleanup has no TS claim to retire, but its
+            // global Stop still needs a nonce and sticky detached-task fence.
+            super::android_bridge::main_start_dispatch_available().map_err(|(msg, _)| msg)?;
+            let booking = self.begin_android_stop_booking(false)?;
+            let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
+            return booking.finish_without_main(result);
+        }
         // C6-5：经 helper 起的核 → 经 helper stop（对称）。daemon 摘其受管 child → SIGTERM→宽限→SIGKILL
         // 收割（app 无本地 child 句柄）。阻塞 IPC 挪出 async worker。
         if self.core_via_helper.load(Ordering::SeqCst) {
             return self
                 .kill_core_via_helper(Arc::clone(&self.helper) as Arc<dyn HelperStopOps>)
-                .await;
+                .await
+                .map(|_| ());
         }
-        let child_opt = match self.child.lock() {
-            Ok(mut g) => g.take(),
-            Err(e) => {
-                log::error!("child lock poisoned: {e}");
-                return Err(format!("child lock poisoned: {e}"));
-            }
-        };
-        let Some(mut child) = child_opt else {
+        self.kill_direct_core_with_io(None, &NativeStopIo).await
+    }
+
+    /// Normal direct Stop uses the same native Child custody on every retry.
+    /// No PID liveness result or signal acknowledgement can retire this run.
+    pub(super) async fn kill_direct_core_with_io(
+        &self,
+        ts_gate: Option<&tokio::sync::MutexGuard<'_, ()>>,
+        io: &dyn DirectStopIo,
+    ) -> Result<(), String> {
+        let booked = self
+            .child
+            .lock()
+            .map_err(|_| "direct Child custody poisoned before Stop".to_owned())?
+            .begin_native_stop()?;
+        let Some((identity, nonce)) = booked else {
             return Ok(());
         };
-        let pid = child.id().unwrap_or(0);
-        if pid == 0 {
-            // 已退出且被收割 → 仅 reap 残句柄。
-            //
-            // **同样要清 `self.pid`**：此前这条腿直接 return，把上一次 spawn 的 pid 留在字段里。这不是
-            // 罕见角落 —— 核「起来就死」时就绪门的 `try_wait` 会先一步收割它，`child.id()` 随即变 None ⇒
-            // 每一次起核失败都从这里走。留下的陈旧 pid 会被 `status()`、诊断、以及 stale 清扫的「受管
-            // pid 排除表」当成活的受管核继续引用（排除表里挂个死 pid，等于给同号新进程发免死金牌）。
-            let _ = child.wait().await;
-            if let Ok(mut g) = self.pid.lock() {
-                *g = None;
+        let booking = NativeStopBooking {
+            slot: Arc::clone(&self.child),
+            identity,
+            nonce,
+        };
+        // Every possible signal stays inside this future; cancellation leaves
+        // no detached PID escalation that could later hit a replacement run.
+        let _stop_lease = self.config.retain_active_legacy_start_lease();
+        let initial = poll_fn(|cx| Poll::Ready(booking.poll_wait(cx, io))).await;
+        let exit = match initial {
+            Poll::Ready(result) => result?,
+            Poll::Pending => {
+                booking.signal(|child| io.terminate(child))?;
+                match tokio::time::timeout(STOP_GRACE, poll_fn(|cx| booking.poll_wait(cx, io)))
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        booking.signal(|child| io.start_kill(child))?;
+                        tokio::time::timeout(STOP_GRACE, poll_fn(|cx| booking.poll_wait(cx, io)))
+                            .await
+                            .map_err(|_| {
+                                "direct Child native wait timed out; Stop custody retained"
+                                    .to_owned()
+                            })??
+                    }
+                }
             }
-            return Ok(());
+        };
+        // No await follows native exit: TS→Child→pid→registry is the normal
+        // main-Stop order. Slot identity/nonce is checked before clearing pid.
+        // A registry error keeps the reaped Child and claim for a later retry.
+        {
+            let mut slot = self
+                .child
+                .lock()
+                .map_err(|_| "direct Child custody poisoned after native wait".to_owned())?;
+            let mut pid = self
+                .pid
+                .lock()
+                .map_err(|_| "direct pid bookkeeping poisoned after native wait".to_owned())?;
+            slot.retire_native_stop(&booking.identity, &booking.nonce, |token| {
+                let gate = ts_gate.ok_or_else(|| {
+                    "direct Child exited; main claim release requires TS gate".to_owned()
+                })?;
+                if !self
+                    .mesh
+                    .release_tailscale_main_states_if_token(token, gate)?
+                {
+                    return Err("direct Child main claim no longer matches its birth".into());
+                }
+                Ok(())
+            })?;
+            *pid = None;
         }
-        log::info!("停核：pid={pid}（SIGTERM → {STOP_GRACE:?} 宽限 → SIGKILL）");
-        let escalation = ProcessKiller::escalate_async(
-            move |sig| send_signal(pid, sig),
-            move || pid_alive(pid),
-            STOP_GRACE,
-        )
-        .await;
-        // 等进程退出（reap，防僵尸）。进程若拒 SIGTERM，升级 task 到点补 SIGKILL 解开此处。
-        let _ = child.wait().await;
-        // 进程已退出 → 取消挂起的 SIGKILL 升级（防 timer 泄漏 + 防 pid 复用误杀）。
-        escalation.wait().await;
-        if let Ok(mut g) = self.pid.lock() {
-            *g = None;
-        }
-        log::info!("停核完成：pid={pid} 已退出并收割");
+        log::info!("停核完成：owned Child 已退出并收割（exit={exit}）");
         Ok(())
     }
 
@@ -188,31 +873,76 @@ impl ProxyRuntime {
     pub(super) async fn kill_core_via_helper(
         &self,
         ops: Arc<dyn HelperStopOps>,
-    ) -> Result<(), String> {
-        let intended = self.pid.lock().ok().and_then(|g| *g);
+    ) -> Result<HelperStartToken, String> {
+        self.kill_core_via_helper_with_main(ops, None).await
+    }
+
+    pub(super) async fn kill_core_via_helper_with_main(
+        &self,
+        ops: Arc<dyn HelperStopOps>,
+        ts_gate: Option<&tokio::sync::MutexGuard<'_, ()>>,
+    ) -> Result<HelperStartToken, String> {
+        self.register_helper_backend()?;
+        let (attempt, intended, nonce) = self
+            .child
+            .lock()
+            .map_err(|_| "child lock poisoned".to_string())?
+            .begin_helper_stop()
+            .ok_or_else(|| {
+                "helper cleanup-unknown: no confirmed idle Start attempt; refusing Stop(None) or concurrent Stop".to_string()
+            })?;
+        let permit =
+            HelperStopPermit::new(Arc::clone(&self.child), attempt.clone(), intended, nonce);
+        let intended_pid = intended.pid();
         // 阻塞 IPC 挪出 async worker。
-        let result =
-            match tokio::task::spawn_blocking(move || ops.stop_managed_core(intended)).await {
-                Ok(Ok(())) => {
-                    log::info!("经 helper 停核完成（pid={intended:?}）");
+        // An updater/restart may be cancelled while this blocking stop still
+        // runs. Retain its existing legacy lease in the closure; a normal Stop
+        // owns no such lease and must remain available in managed mode.
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        let (result, permit) = match tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
+            (ops.stop_managed_core(intended), permit)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                let error = format!("helper 停核任务 join 失败：{e}");
+                log::error!("{error}");
+                return Err(error);
+            }
+        };
+        // The permit remains booked while the ACK is checked and consumed.
+        let outcome = match result {
+            Ok(()) => self
+                .clear_helper_core_bookkeeping_with_main(&permit, |token| {
+                    let gate = ts_gate.ok_or_else(|| {
+                        "helper cleanup-unknown: native exit needs TS gate to release main claim"
+                            .to_owned()
+                    })?;
+                    if !self
+                        .mesh
+                        .release_tailscale_main_states_if_token(token, gate)?
+                    {
+                        return Err("helper cleanup-unknown: main claim birth changed".into());
+                    }
                     Ok(())
-                }
-                // daemon 可能已因父死看护/崩溃自行收割 → stop 返 notrunning/错误，非致命；
-                // 也可能是身份不匹配的诚实 no-op（消息自述），那正是本守卫生效的痕迹。
-                Ok(Err(e)) => {
-                    log::warn!("经 helper 停核未完成：{e}");
-                    Err(e)
-                }
-                Err(e) => {
-                    let error = format!("helper 停核任务 join 失败：{e}");
-                    log::error!("{error}");
-                    Err(error)
-                }
-            };
-        if result.is_ok() {
-            self.clear_helper_core_bookkeeping(intended);
-        }
-        result
+                })
+                .and_then(|cleared| {
+                    if cleared {
+                        log::info!("经 helper 本地 birth 停核完成（pid={intended_pid}）");
+                        Ok(attempt.clone())
+                    } else {
+                        Err("helper cleanup-unconfirmed: Stop receipt but attempt changed".into())
+                    }
+                }),
+            Err(error) => {
+                log::warn!("经 helper 停核未完成：{error}");
+                Err(error)
+            }
+        };
+        drop(permit);
+        outcome
     }
 
     /// helper 停核腿的记账收口：**只清自己那笔**（[`kill_core`](Self::kill_core) 的 helper 分支专用）。
@@ -222,23 +952,56 @@ impl ProxyRuntime {
     /// `status()` 的 helper 腿据 `self.pid` 探活、诊断据它报 pid、`cleanup_stale_cores` 的「受管 pid 排除表」
     /// 也据它——排除表里少了新核，下一次起核的孤儿清扫就会把它当孤儿杀掉（换个地方杀错进程）。
     ///
-    /// 本方法只会在 helper 已确认 `stopped/notrunning` 后调用；此时仅在「记账已换成另一个 pid」时
-    /// 留手，其余情形（等值 / 现为 `None`）照清。通信失败/结果未知不会进入本方法。
-    pub(super) fn clear_helper_core_bookkeeping(&self, intended: Option<u32>) {
+    /// 本方法只接受 helper exact birth native-reap 回执；legacy ACK 不是退出事实。
+    /// 必须仍持有
+    /// 同一 Child 的唯一 Stop permit，且 attempt、pid、nonce 全相同才清账。
+    /// 通信失败、取消或任何身份变动均保留 helper route。
+    pub(super) fn clear_helper_core_bookkeeping_with_main(
+        &self,
+        permit: &HelperStopPermit,
+        release_main: impl FnOnce(
+            &crate::runtime::tailscale_login_core::MainBirthToken,
+        ) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if matches!(permit.target(), HelperStopTarget::Legacy(_)) {
+            return Err(
+                "helper cleanup-unknown: legacy Stop ACK lacks same-birth native exit proof; custody retained"
+                    .into(),
+            );
+        }
+        if !Arc::ptr_eq(&permit.child, &self.child) {
+            return Ok(false);
+        }
+        let Ok(mut child) = self.child.lock() else {
+            log::error!("child lock poisoned：跳过 helper 停核记账收口");
+            return Ok(false);
+        };
         let Ok(mut g) = self.pid.lock() else {
             log::error!("pid lock poisoned：跳过 helper 停核记账收口");
-            return;
+            return Ok(false);
         };
         let current = *g;
-        if current.is_some() && current != intended {
+        if !child.helper_pid_bookkeeping_matches(permit.attempt(), permit.target(), current)
+            || !child.helper_stop_matches(permit.attempt(), permit.target(), permit.nonce())
+        {
             log::warn!(
-                "helper 停核腿收口时发现受管 pid 记账已换人（{intended:?}→{current:?}）→ \
-                 整段记账属新会话，不动它（清它等于让新核在 status/诊断/孤儿清扫排除表里集体失联）"
+                "helper 停核腿收口时发现受管 attempt/birth 记账已换人（{:?}→{current:?}）→ \
+                 整段记账属新会话，不动它（清它等于让新核在 status/诊断/孤儿清扫排除表里集体失联）",
+                permit.target()
             );
-            return;
+            return Ok(false);
         }
+        if let Some((_, Some(token))) = child.helper_main_claim_for_stop() {
+            release_main(&token)?;
+        }
+        // Same locked attempt/nonce was checked above. No await or fallible
+        // operation follows successful registry compare-remove.
+        assert!(child.confirm_helper_stop(permit.attempt(), permit.target(), permit.nonce()));
         *g = None;
-        self.core_via_helper.store(false, Ordering::SeqCst);
+        // The exact ACK proves only that this helper birth was natively
+        // reaped. It does not prove that helper-owned side effects or other
+        // births are absent, so it cannot open the managed/no-owner gate.
+        Ok(true)
     }
 
     /// **起核前**的 stale-core 清扫：杀掉遗留的**本 app** 孤儿核。跑在**每一次** `start()` 上
@@ -252,6 +1015,10 @@ impl ProxyRuntime {
     pub(super) async fn cleanup_stale_cores(&self) -> Result<(), StartError> {
         // 实跑计数：置于所有早退腿之前 —— 计的是「清扫这条腿被走到几次」，而非「杀掉几个孤儿」。
         self.stale_sweep_runs.fetch_add(1, Ordering::SeqCst);
+        // ── Android 腿：孤儿的形态是「系统拉起的核」，不是进程（见 [`Self::stop_system_started_core`]）──
+        if cfg!(target_os = "android") {
+            return self.stop_system_started_core().await;
+        }
         let binary = match resolve_core_binary() {
             Ok(b) => b,
             Err(e) => {
@@ -295,6 +1062,25 @@ impl ProxyRuntime {
         self.escalate_root_orphans(&survivors).await
     }
 
+    /// [`Self::cleanup_stale_cores`] 的 Android 腿。
+    ///
+    /// 核在本进程内（libbox），没有二进制可解析、没有 cmdline 可扫；但「上次会话留下、本运行时不认识
+    /// 的核」这件事照样存在：always-on / 开机自动连接在**没有 Rust** 时由系统拉起的那个（配置是上次
+    /// 落盘的）。同一个处置：起核前先停掉它，再由本次 start 按当前配置起 —— 不停的话 Kotlin 桥判
+    /// 「已在运行」直接拒收这次起核，用户点连接永远连不上。本运行时自己起的核（`core_started`）
+    /// 不是孤儿，不碰。停不掉 ⇒ 有码失败（隧道还在，不许在它上面起第二个）。
+    async fn stop_system_started_core(&self) -> Result<(), StartError> {
+        if super::android_bridge::core_started()
+            || !super::android_bridge::system_started_core_running().await
+        {
+            return Ok(());
+        }
+        log::warn!("起核前发现系统拉起的核（本运行时未持有）→ 先停掉，再按当前配置起核");
+        self.kill_core()
+            .await
+            .map_err(|e| StartError::coded(e, code::STARTUP_FAILED))
+    }
+
     /// 清扫的**排除表** = 当前受管主核 pid + 此刻在飞的**测速临时核** pid + 此刻在飞的
     /// **Tailscale 瞬态登录核** pid。
     ///
@@ -322,21 +1108,20 @@ impl ProxyRuntime {
     ///
     /// - 扫描之后才起的瞬态核 ⇒ 不在候选集里 ⇒ 本就杀不到它；
     /// - 扫描之前起的瞬态核 ⇒ 此刻要么仍在表里（被排除），要么已经退出并注销
-    ///   （`TempCorePidGuard` 的 Drop 跑在 `terminate()` 收割**之后** ⇒ 出表时进程已死）。
+    ///   （测速的 `TempCorePidGuard` 在收割后出表；登录核在确认 close/reap 后出表）。
     ///
     /// 反过来「先读表再扫描」就漏了一格：读表 → 瞬态核 spawn → 扫描，该 pid 既在候选集又不在表快照里。
-    /// 故这里**不需要**加锁扩大临界区（那要求 `INFLIGHT_TEMP_CORES` 罩住整条含 `await` 的清扫腿），
-    /// 只需要保持这个顺序。
+    /// 测速腿仍依赖此读取顺序；登录腿另由 `start_guarded` 持有同一 TS state gate 覆盖
+    /// 扫描到主核 spawn，登录 spawn/登记和旧实例关闭不会与清扫并发。
     ///
     /// # 两条腿各自的残余窗口（如实登记，别当成全覆盖）
     ///
     /// - **测速临时核**：spawn 返回到登记入表之间那一小段**同步**代码（起点其实是 fork），与主核
     ///   「spawn 完再记 `self.pid`」的窗口同构，是本仓既有的取舍。
-    /// - **登录核**：spawn 与登记之间隔着一次**真 `await`**（STATUS 流的 gRPC 订阅），窗口比上面那条
-    ///   宽得多；且 `cancel_login` 是先出表再收核，出表时进程还活着。两格都未关，详见
-    ///   [`LoginCoreRegistry::inflight_login_pids`](crate::runtime::tailscale_login_core::LoginCoreRegistry::inflight_login_pids)。
-    /// - **两条腿共有**：`victims` 在两段 1500 ms 宽限**之前**就冻结了，排除表管不到「孤儿被杀 →
-    ///   pid 被 init 回收 → 该 pid 号在 1.5 s 内被新起的瞬态核复用」这一格（需 pid 回绕，概率极低）。
+    /// - **登录核**：已改为 spawn 后先登记、再 await STATUS；cancel 先确认 close/reap，后出表。
+    ///   与起核前持有的 TS state gate 合起来封住本腿的扫描/登记窗口。
+    /// - **测速腿**：`victims` 在两段 1500 ms 宽限**之前**冻结；孤儿 pid 若被 init 回收并在
+    ///   宽限内由新测速临时核复用，排除表无从追踪该复用（需 pid 回绕，概率极低）。
     pub(super) fn sweep_exclusions(&self) -> Vec<u32> {
         let mut exclude: Vec<u32> = self.pid.lock().ok().and_then(|g| *g).into_iter().collect();
         let temp: Vec<u32> = crate::runtime::speedtest::inflight_temp_core_pids();
@@ -369,9 +1154,17 @@ impl ProxyRuntime {
         );
         // helper 未装 → 无提权腿，直接落终态（不假装尝试过）。
         if self.helper.status().installed {
+            self.register_helper_backend()
+                .map_err(|message| StartError::coded(message, code::ROOT_ORPHAN_BLOCKED))?;
             let helper = Arc::clone(&self.helper);
             // `cleanup_cores` 是同步阻塞 IPC → 挪出 async worker 线程（同 start_core/stop_core）。
-            match tokio::task::spawn_blocking(move || helper.cleanup_cores()).await {
+            let blocking_lease = self.config.retain_active_legacy_start_lease();
+            match tokio::task::spawn_blocking(move || {
+                let _blocking_lease = blocking_lease;
+                helper.cleanup_cores()
+            })
+            .await
+            {
                 Ok(Ok(())) => {
                     tokio::time::sleep(STALE_KILL_GRACE).await;
                     let still: Vec<u32> = survivors
@@ -455,6 +1248,11 @@ pub(super) fn image_from_managed_status(
         {
             image.as_deref().map(PathBuf::from)
         }
+        crate::runtime::helper::ManagedCoreStatus::NativeBirthRunning { target, image, .. }
+            if target.pid.get() == want_pid =>
+        {
+            image.as_deref().map(PathBuf::from)
+        }
         _ => None,
     }
 }
@@ -520,7 +1318,7 @@ fn core_version_first_line(bin: &Path) -> String {
     }
 }
 
-/// 发信号给 pid（core-supervisor [`ProcessKiller`] 的注入点）。
+/// 发信号给 pid（core-supervisor [`polaris_core_supervisor::ProcessKiller`] 的注入点）。
 ///
 /// unix：`nix::sys::signal::kill`（safe wrapper，本文件 `forbid(unsafe_code)` 下不可直接 libc FFI）。
 #[cfg(unix)]

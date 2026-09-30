@@ -7,6 +7,10 @@
  */
 
 @import 'tailwindcss';
+/* 随包字体面（契约 B / D-9）。与移动端 token 入口 `tokens.resolved.css` 共用同一份 @font-face，
+ * 两端各抄一份必然漂移。放在 tokens.css 之前只是为了让 @import 段读起来是「先资源后令牌」；
+ * @font-face 不参与层叠，位置对取值没有影响。 */
+@import './fonts.css';
 @import './tokens.css';
 /* port 自有组件样式（hover-card / dlg / light 主题补充 / brand-svg 等，原型 <style> 里没有的端口发明）
  * 作 gap-filler 放在 prototype.css **之前**：prototype.css 在后，凡与其冲突的规则一律被 prototype 覆盖
@@ -176,6 +180,27 @@
   --warn: 32 84% 31%;
   --ok: 152 60% 27%;
   --dn: 197 80% 33%;
+}
+
+/* ── `--sans` 补 Android 可用的 CJK 族（契约 B / §6.3.2②）──────────────────────
+ *
+ * 原栈里的中文族 PingFang SC（Apple 独有）/ Hiragino Sans GB（Apple 独有）/ Microsoft YaHei
+ * （Windows 独有）在 **Android 上全部缺席** ⇒ 中文没有任何被指定的族，落到未声明的系统兜底，
+ * 字宽与字重观感与桌面不同。`Noto Sans CJK SC` 随 Android 出厂，**点名它零成本、不随包**。
+ *
+ * 插在 Hiragino Sans GB 之后、Microsoft YaHei 之前，逐字对齐设计交接包
+ * `~/Code/polaris/design/mobile/tokens/core.json` 的 `typography.font.family.ui`
+ * ——那份是移动端字体栈的设计真值源，位置不一致就是两端各写一套。
+ * **不能追在 `sans-serif` 后面**：通用族一旦解析成功，后面的具名族在实践中不再被走到。
+ *
+ * ⚠️ 为什么写在这里而不是 tokens.css：与上面那段同一个理由 —— `prototype.css` 是最后一个
+ * @import，它的 `:root`（prototype.css:69）自带一份 `--sans`，同特异性、源序在后 ⇒ 压过
+ * tokens.css。改 tokens.css 是空操作。`--sans` / `--disp` / `--mono` 只在**无 data-theme 条件**的
+ * `:root` 块里声明过（tokens.css:223 与 prototype.css:69，两处都是 (0,1,0)），故这里一条
+ * (0,1,0) 的 `:root` 就压过四条主题路径的全部，不需要像语义色那样再写显式浅色腿。
+ * tokens.css 那份也同步改了值，只为不让声明的真值源说谎。 */
+:root {
+  --sans: -apple-system, 'Segoe UI Variable', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', system-ui, sans-serif;
 }
 
 /* 上面 `--ok` / `--warn` 下调后必须跟着换墨色的两处（不换 = 把缺陷从文字搬到墨色，净收益归零）。

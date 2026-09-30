@@ -17,6 +17,7 @@ fn handler_state_default_equals_new() {
 #[test]
 fn spawn_request_carries_all_fields() {
     let r = SpawnCoreRequest {
+        birth: None,
         binary: PathBuf::from("/core/sing-box"),
         config: PathBuf::from("/tmp/c.json"),
         log: Some(PathBuf::from("/tmp/l.log")),

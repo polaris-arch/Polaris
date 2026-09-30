@@ -82,7 +82,7 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
       <Phead title={t('settings.general.pageTitle')} sub={t('settings.general.pageSub')} />
 
       {/* 启动三开关均已接通后端，disabled 标记已删除（此前的「零消费者」块注释已过时）：
-          - silentStart：`main.rs` 的 `config_silent_start` 在 setup 期合并进 `start_hidden`，
+          - silentStart：`lib.rs` 的 `config_silent_start` 在 setup 期合并进 `start_hidden`，
             决定主窗是否首帧显示。这一条其实早就实现，之前的 disabled 属于陈旧标记。
           - autoConnect / autoCheckUpdate：`runtime/startup_tasks.rs` 落地后，启动期分别按 2s / 5s
             的一次性任务读取这两个字段（自动连接、检查更新）。

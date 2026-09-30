@@ -25,6 +25,12 @@ pub mod common {
     pub const STOP: &str = "stop";
     /// `OK running <pid>` / `OK stopped`（查核状态）。
     pub const STATUS: &str = "status";
+    /// macOS/Windows native admission; legacy helpers reject before spawning.
+    pub const NATIVE_START_BIRTH: &str = "start-native-birth-safe";
+    /// Read-only native custody capability.
+    pub const NATIVE_STATUS_BIRTH: &str = "status-native-birth-safe";
+    /// Stop one exact native child birth and complete its platform tail.
+    pub const NATIVE_STOP_BIRTH: &str = "stop-native-birth-safe";
     /// `OK cleaned`（兜底清所有锁定二进制实例 + 摘 child）。
     pub const CLEANUP: &str = "cleanup";
     /// `OK free` / `OK killed <pids>` / `OK foreign <names>` / `ERR bad-port`（按端口定位 LISTEN 持有者）。
@@ -74,6 +80,18 @@ pub mod win {
 
 /// Linux 专属命令（移植自 `helper-linux/helper.go`）。
 pub mod linux {
+    /// Exact helper-owned birth admission. Old helpers reject before spawning.
+    pub const START_BIRTH_SAFE: &str = "start-birth-safe";
+    /// Read the exact helper-owned birth, including its opaque birth token.
+    pub const STATUS_BIRTH_SAFE: &str = "status-birth-safe";
+    /// Stop only the exact helper-owned birth named by PID and birth token.
+    pub const STOP_BIRTH_SAFE: &str = "stop-birth-safe";
+    /// Atomic capability command for Linux Start under native-reap custody.
+    /// A v1 helper does not recognize this token and rejects before mutation.
+    pub const START_REAP_SAFE: &str = "start-reap-safe";
+    /// Atomic capability command for Linux Stop whose success requires native
+    /// reap. A v1 helper rejects it instead of returning an early `stopped`.
+    pub const STOP_REAP_SAFE: &str = "stop-reap-safe";
     /// `OK installed` / `ERR ...`（与 mac 同构：临时核 sha256 校验后 root 写锁定 coreDir，逐文件 .new+rename 原子就位；
     /// linux proto v1）。
     pub const INSTALL_CORE: &str = "install-core";

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标的背景层：设计 token `logo-tile` 的浅色档（0 0% 100%），
+     见 ui/src/styles/tokens.resolved.css 里的 CSS 变量。应用图标是固定资产，不跟随系统
+     主题，所以取浅色值，与 src-tauri/icons/polaris-logo.svg 的磁贴同源。 -->
+<resources>
+    <color name="ic_launcher_background">#FFFFFF</color>
+</resources>

@@ -1,11 +1,42 @@
-use std::sync::atomic::Ordering;
-
+//! 系统托盘的装配、图标四态、原生菜单与菜单动作执行器。
+//!
+//! # 桌面 / 移动端的分界：**呈现层桌面独有，动作层两端共用**
+//!
+//! `tauri::tray` 与 `tauri::menu` 这两个模块在 mobile target 上整个不存在，故凡是直接消费它们
+//! 的项都挂 `#[cfg(desktop)]`（三个桌面平台上 `desktop` 恒真 ⇒ 桌面行为逐字节不变）。被隔离的
+//! **只有呈现层**：托盘图标、原生菜单树、鼠标事件解析。
+//!
+//! 留在两端共用面上的是**动作模型与执行器** —— [`MenuAction`] / [`parse_menu_action`] /
+//! [`run_menu_action`] / [`TrayMenuModel`] / [`tray_proxy_action`] /
+//! [`tray_menu_config_projection`]。它们一个 Tauri 窗口/托盘 API 都不碰，只调 command，
+//! 所以移动端真要长出触发面（通知的 action 按钮、QuickSettings Tile）时，**接的是同一份执行器**，
+//! 不会出现「两个平台各写一份动作分发」这种必然漂移的形态。
+//!
+//! # 托盘承载的能力，逐项裁定（`TODO(mobile)` = 待做，本批只留锚点不实现）
+//!
+//! | 能力 | 移动端 | 依据 |
+//! |---|---|---|
+//! | 托盘图标本身（四态视觉） | 桌面独有 | Android 状态栏没有「常驻可点图标」这种对象 |
+//! | 看当前连接态 / 当前节点 | **换形态** `TODO(mobile)` | 归宿是**前台服务通知**的标题与正文 —— Android 8+ 起持有 `VpnService` 必须有前台服务通知，那条通知是强制存在的，正好承载状态 |
+//! | 切代理开关（[`MenuAction::ToggleProxy`]） | **换形态** `TODO(mobile)` | 归宿是前台服务通知的 action 按钮 + QuickSettings Tile；执行器已就位（[`run_menu_action`]） |
+//! | 选出口节点（[`MenuAction::SelectExit`]） | **换形态** `TODO(mobile)` | 通知 action 位次有限（实践上 ≤3），只放常用；完整列表归应用内 |
+//! | 切分流策略（[`MenuAction::Routing`]） | **换形态** `TODO(mobile)` | 规则/全局/直连在移动端仍成立，但归应用内，不进通知 |
+//! | 隐私锁（[`MenuAction::Lock`]） | **换形态** `TODO(mobile)` | 归宿是 Activity 生命周期钩子（`onStop` 即锁）+ BiometricPrompt，与托盘无关 |
+//! | 切接管方式（[`MenuAction::Takeover`]） | 桌面独有 | 移动端只有 `VpnService` 一种接管方式，「系统代理 vs TUN」这个维度在那里不存在 |
+//! | 显示主窗（[`MenuAction::Show`]） | 桌面独有 | Activity 由 launcher / 通知 intent 唤起，不存在「把窗拉回前台」这个应用侧动作 |
+//! | 退出应用（[`MenuAction::Quit`]） | 桌面独有 | 进程终止权在系统；用户要的「断开」已由 ToggleProxy 覆盖，两者在移动端不是一件事 |
+//! | 进轻量模式（[`MenuAction::EnterLightweight`]） | 桌面独有 | 「销毁 webview 保后台」是桌面为省内存自己做的取舍；Android 由系统按内存压力回收 Activity，应用不该抢这个决定 |
+//! | 检查更新（[`MenuAction::CheckUpdate`]） | 桌面独有 | 移动端走商店 / 自有分发通道 |
+//! | 测速（[`MenuAction::SpeedTest`]） | 桌面独有（快捷入口） | 应用内已有入口，通知位次不该给它 |
+//! | macOS 菜单栏位置持久化 | 桌面独有 | 已由 `#[cfg(target_os = "macos")]` 门控 |
+//!
 use tauri::Manager;
 
-use crate::{commands, i18n, show_main_window, tray, AppRuntime, Platform, QuitState};
-#[cfg(not(target_os = "macos"))]
+use crate::{commands, i18n, show_main_window, tray, AppRuntime, Platform};
+#[cfg(all(desktop, not(target_os = "macos")))]
 use crate::{dark_bg_from_probe, system_dark_bg};
 
+#[cfg(desktop)]
 pub(crate) fn set_tray_state(app: &tauri::AppHandle, state: crate::tray::TrayState) {
     let Some(tray) = app.tray_by_id("main") else {
         return; // 托盘整体缺失（Linux 无 StatusNotifier / appindicator 不可用）→ 静默跳过
@@ -174,6 +205,7 @@ pub(crate) fn reconcile_tray_visual(
 /// 由 runtime 层保证，托盘不必也不该复述一遍。这与本函数「回读真值而非信事件」的整体取向是同一条理由。
 ///
 /// 便宜（一次 `RwLock` 读快照，无 IO / 无 syscall），故可放心让轮询按秒级频率调。
+#[cfg(desktop)]
 pub(crate) fn reconcile_tray_icon(app: &tauri::AppHandle) {
     let state = app
         .try_state::<AppRuntime>()
@@ -223,6 +255,7 @@ pub(crate) const TRAY_ICON_POLL: std::time::Duration = std::time::Duration::from
 /// **逐腿补 emit**：正确性取决于「有没有漏掉某条腿」，而本 bug 的成因恰恰就是漏了一条 —— 同一类错误
 /// 会随新增终态腿反复发生（updater 那两处就是 started/stopped 搬全之后新长出来的）。回读真值把
 /// 正确性条件从「所有腿都记得发事件」降级为「任一触发点叫醒汇流点」，是**结构上**更难写错的形态。
+#[cfg(desktop)]
 pub(crate) fn wire_tray_icon_sync(
     mut subscribe: impl FnMut(&'static str),
     mut spawn_poll: impl FnMut(std::time::Duration),
@@ -266,7 +299,19 @@ pub(crate) enum MainWindowMenuOwner {
 pub(crate) const fn main_window_menu_owner(platform: Platform) -> MainWindowMenuOwner {
     match platform {
         Platform::Mac => MainWindowMenuOwner::NativeApplicationMenu,
-        Platform::Win | Platform::Linux | Platform::Other => MainWindowMenuOwner::RendererShortcut,
+        // Android 与 Win/Linux/Other 同臂，但**这两个函数在 Android 上整个不可达**：
+        // 调用点（`lib.rs` 的 app menu 装配、`reconcile_tray`、`tray_click_toggles_overlay`）
+        // 全带 `#[cfg(desktop)]`，`tauri::menu` / `tauri::tray` 在 mobile 上根本不存在。
+        // 给 `RendererShortcut` 是类型完整性上的诚实值（Android 的文本编辑上下文菜单由系统
+        // TextView 提供，应用侧既不装菜单栏也不装托盘），不是「Android 用桌面自绘快捷键」。
+        // iOS 与 Android 同臂，理由的**前半段相同、后半段不同**：同样整个不可达
+        // （调用点全带 `#[cfg(desktop)]`，`tauri::menu` / `tauri::tray` 在 mobile 上不存在）；
+        // 但「诚实值」的依据不同 —— Android 是系统 TextView 提供编辑上下文菜单，iOS 是
+        // UIKit 的 `UIMenuController` / edit menu 由 WKWebView 自带，两者都不经应用侧装配。
+        // 给 `RendererShortcut` 同样只是类型完整性上的诚实值，不是「iOS 用桌面自绘快捷键」。
+        Platform::Win | Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
+            MainWindowMenuOwner::RendererShortcut
+        }
     }
 }
 
@@ -274,13 +319,19 @@ pub(crate) const fn main_window_menu_owner(platform: Platform) -> MainWindowMenu
 pub(crate) const fn tray_interaction_mode(platform: Platform) -> TrayInteractionMode {
     match platform {
         Platform::Mac | Platform::Win => TrayInteractionMode::DirectClicks,
-        Platform::Linux | Platform::Other => TrayInteractionMode::NativeMenu,
+        // Android/iOS 同上不可达（两者都没有「托盘」这个 OS 概念）。见 `main_window_menu_owner`
+        // 的臂上注释。iOS 这一格比 Android 更彻底：Android 至少有通知栏常驻这个近亲形态，
+        // iOS 连那个都没有（NE 的状态只经系统「设置 → VPN」与 VPN 图标呈现）。
+        Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
+            TrayInteractionMode::NativeMenu
+        }
     }
 }
 
 /// macOS/Windows 的左/右键是否应切换托盘浮层。只在按键抬起时执行，
 /// 避免一次点击的 down/up 两帧各触发一次；macOS 双指辅助点按由系统归为 Right，与左键同语义。
 /// Linux/未知平台由原生菜单持有事件，任何偶发派发都忽略，防止两个菜单叠开。
+#[cfg(desktop)]
 #[must_use]
 pub(crate) fn tray_click_toggles_overlay(
     platform: Platform,
@@ -596,10 +647,12 @@ pub(crate) fn parse_menu_action(id: &str) -> Option<MenuAction> {
 
 /// 用户内容放进原生菜单前转义 `&`。GTK/Windows 菜单把单个 `&` 当快捷键标记；不转义会吞掉
 /// 订阅名/节点名里的字符，且同一名称在自绘与原生菜单显示不同。
+#[cfg(desktop)]
 pub(crate) fn native_menu_user_text(text: &str) -> String {
     text.replace('&', "&&")
 }
 
+#[cfg(desktop)]
 pub(crate) fn native_menu_group_text(
     lang: crate::i18n::Lang,
     label: &TrayMenuGroupLabel,
@@ -616,6 +669,7 @@ pub(crate) fn native_menu_group_text(
 ///
 /// 项序：连接 → 出口 → 分流/接管 → 测速 → 主窗/设置/更新 → 锁定/轻量 → 退出。
 /// 原生菜单只承载动作与勾选态；状态卡、国旗、延迟等视觉信息仍归自绘浮层。
+#[cfg(desktop)]
 pub(crate) fn build_tray_menu(
     app: &tauri::AppHandle,
     m: &TrayMenuModel,
@@ -809,6 +863,7 @@ pub(crate) fn build_tray_menu(
 
 /// Linux 原生托盘菜单的**唯一汇流点**（与 [`reconcile_tray_icon`] 并列，同一批驱动源叫醒）：
 /// 回读 proxy / config 真值 → 模型变了才重建菜单。macOS/Windows 不调用本函数，右键由自绘浮层独占。
+#[cfg(desktop)]
 pub(crate) fn reconcile_tray_menu(app: &tauri::AppHandle) {
     let Some(tray) = app.tray_by_id("main") else {
         return; // 托盘整体缺失 → 无菜单可装
@@ -859,6 +914,7 @@ pub(crate) fn reconcile_tray_menu(app: &tauri::AppHandle) {
 }
 
 /// 托盘汇流点的统一叫醒入口：三平台都刷新图标；仅 Linux 刷新原生菜单。两者各自幂等短路，多叫无害。
+#[cfg(desktop)]
 pub(crate) fn reconcile_tray(app: &tauri::AppHandle) {
     reconcile_tray_icon(app);
     if tray_interaction_mode(Platform::current()) == TrayInteractionMode::NativeMenu {
@@ -937,10 +993,7 @@ pub(crate) fn native_exit_selection_notice(status: &str) -> Option<&'static str>
 pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
     match action {
         MenuAction::Show => show_main_window(app),
-        MenuAction::Quit => {
-            app.state::<QuitState>().0.store(true, Ordering::SeqCst);
-            app.exit(0);
-        }
+        MenuAction::Quit => crate::exit_lifecycle::queue_quit(app),
         MenuAction::OpenSettings => {
             // 与浮层「打开设置」逐字节同一条路径（含轻量模式重建时的首帧种子腿）。
             let lang = i18n::app_lang(app);

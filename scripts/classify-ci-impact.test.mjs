@@ -278,3 +278,70 @@ test('resources 下新增未登记子树故障关闭为内核门加四平台并�
   assert.deepEqual(result.platforms, [...ALL_PACKAGE_PLATFORMS]);
   assert.deepEqual(result.unregisteredScopes, ['resources/__not_registered__/']);
 });
+
+// ───────────────────────── Android APK 腿（表三，与桌面两张表正交）─────────────────────────
+
+test('Android 面点亮 android 腿，且不误伤桌面腿', () => {
+  for (const path of [
+    'src-tauri/gen/android/app/build.gradle.kts',
+    'src-tauri/gen/android/app/src/main/AndroidManifest.xml',
+    'src-tauri/tauri.android.conf.json',
+    'src-tauri/src/runtime/proxy/android_capacity.rs',
+    'scripts/build-libbox.sh',
+    'scripts/libbox-patches/source-manifest.json',
+    'scripts/libbox-patches/build.py',
+    'scripts/libbox-patches/verify-receipt.py',
+    'scripts/libbox-patches/android-source.py',
+    'scripts/libbox-patches/android-source-policy.json',
+    'scripts/libbox-patches/android-source.test.py',
+    'scripts/build-android-apk.sh',
+    'scripts/android-rust-ndk.version',
+    'scripts/verify-apk.mjs',
+    '.github/workflows/android.yml',
+  ]) {
+    const result = classifyImpact([path]);
+    assert.equal(result.android, true, `${path} 应点亮 android 腿`);
+    assert.deepEqual(
+      compact([path]),
+      { kernel: false, platforms: [], preflight: false, hasPackage: false },
+      `${path} 不该拉起桌面打包腿`,
+    );
+  }
+});
+
+test('两边都真的路径：既重打桌面包，也跑 Android 腿', () => {
+  // `.cargo/config.toml`：Android 的剥符号开关（per-target rustflags 的四个 `*-android` 段）住在
+  // 那里，同一份文件也带着 Windows 的 `+crt-static`——两侧都真，故两条腿都要点亮。
+  for (const path of [
+    'resources/data/geosite-cn.srs',
+    'src-tauri/core-manifest.json',
+    'NOTICE',
+    '.cargo/config.toml',
+  ]) {
+    const result = classifyImpact([path]);
+    assert.equal(result.android, true, `${path} 应点亮 android 腿`);
+    assert.equal(result.hasPackage, true, `${path} 应同时拉起桌面打包腿`);
+  }
+});
+
+test('反向对照：纯应用逻辑与前端不点亮 Android 腿（取舍见 ANDROID_IMPACT_SCOPES 头注）', () => {
+  // 没有这条，上面两条会被「android 恒真」满足，等于没检查。
+  for (const path of [
+    'ui/src/App.tsx',
+    'src-tauri/src/lib.rs',
+    'src-tauri/src/commands/window.rs',
+    'src-tauri/src/exit_lifecycle.rs',
+    'src-tauri/src/runtime/speedtest/tests/mod.rs',
+    'crates/stats-engine/src/lib.rs',
+    'README.md',
+    'src-tauri/tauri.linux.conf.json',
+  ]) {
+    assert.equal(classifyImpact([path]).android, false, `${path} 不该点亮 android 腿`);
+  }
+});
+
+test('未登记 scope 与 --full 都把 Android 腿 fail-closed 为真', () => {
+  assert.equal(classifyImpact(['crates/__not_registered__/src/lib.rs']).android, true);
+  assert.equal(classifyImpact(['src-tauri/__not_registered__.json']).android, true);
+  assert.equal(classifyImpact([], { forceFull: true }).android, true);
+});

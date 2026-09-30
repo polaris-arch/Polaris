@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(target_os = "android"))]
+mod pc_custody;
 use crate::test_support::{crate_code, flooding_stderr, module_code};
 // 生产侧的 `TEMP_CORE_BATCH_WINDOW_OVERHEAD_MS` 是字面量（跨语言那道门要读得出来），它与
 // `sing-box check` 硬超时的关系由本模块的门断言 —— 故这个常量只在测试侧引。
@@ -21,8 +23,70 @@ fn system_endpoint_servers(system: bool) -> Vec<ServerConfig> {
         json!({"id":"ov-system", "name":"OV", "protocol":"openvpn-client",
             "openvpnClientSettings":{"server":"vpn.example", "server_port":1194, "tls":{}, "system":system}}),
         json!({"id":"raw-system", "name":"Custom", "protocol":"custom",
-            "customSettings":{"isEndpoint":true,"outbound":{"type":"tailscale", "system_interface":system}}}),
+            "customSettings":{"isEndpoint":true,"outbound":{"type":"wireguard", "system_interface":system}}}),
     ].into_iter().map(|value| serde_json::from_value(value).unwrap()).collect()
+}
+
+#[test]
+fn raw_tailscale_is_partitioned_before_any_endpoint_construction() {
+    let servers: Vec<ServerConfig> = [
+        json!({"id":"typed-ts", "name":"Typed", "protocol":"tailscale"}),
+        json!({"id":"raw-ts", "name":"Raw", "protocol":"custom", "customSettings":{
+            "isEndpoint":true,
+            "outbound":{"type":"tailscale", "state_directory":"/must-not-initialize"}
+        }}),
+    ]
+    .into_iter()
+    .map(|value| serde_json::from_value(value).unwrap())
+    .collect();
+    let plan = plan_temp_core(&servers, &env());
+    assert_eq!(plan.tailscale, ["typed-ts", "raw-ts"]);
+    assert!(plan.testable.is_empty());
+    assert!(plan.unusable.is_empty());
+}
+
+#[test]
+fn android_auth_stays_in_memory_and_rejects_identity_escape() {
+    let auth = InboundUser {
+        username: "polaris-temp".to_owned(),
+        password: "0123456789abcdef0123456789abcdef".to_owned(),
+    };
+    let raw = json!({
+        "log": {"level":"warn"}, "dns": {}, "route": {},
+        "inbounds":[{"type":"http","tag":"in-1","listen":"127.0.0.1","listen_port":43123}],
+        "outbounds":[{"type":"direct","tag":"direct"}]
+    })
+    .to_string();
+    let bridged = authenticated_android_temp_config(&raw, &auth).unwrap();
+    assert!(
+        !raw.contains("users"),
+        "disk input must omit this round's HTTP inbound credential"
+    );
+    assert!(!raw.contains(&auth.password));
+    let parsed: Value = serde_json::from_str(&bridged).unwrap();
+    assert_eq!(parsed["inbounds"][0]["users"][0]["password"], auth.password);
+    let mut invalid: Value = serde_json::from_str(&raw).unwrap();
+    invalid["endpoints"] = json!([{"type":"tailscale","state_directory":"/tmp/identity"}]);
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid.as_object_mut().unwrap().remove("endpoints");
+    invalid["outbounds"] = json!([{"type":"tailscale","tag":"hidden"}]);
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid["outbounds"] = json!([{"type":"direct","tag":"direct"}]);
+    invalid["experimental"] = json!({"cache_file":{"path":"/tmp/identity"}});
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid.as_object_mut().unwrap().remove("experimental");
+    invalid["inbounds"][0]["listen"] = json!("0.0.0.0");
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid["inbounds"][0]["listen"] = json!("127.0.0.1");
+    invalid["inbounds"] = Value::Array(vec![
+        json!({"type":"http","tag":"in-1","listen":"127.0.0.1","listen_port":43123});
+        513
+    ]);
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
+    invalid["inbounds"] =
+        json!([{"type":"http","tag":"in-1","listen":"127.0.0.1","listen_port":43123}]);
+    invalid["outbounds"] = json!({"type":"direct"});
+    assert!(authenticated_android_temp_config(&invalid.to_string(), &auth).is_err());
 }
 
 #[test]
@@ -1507,6 +1571,15 @@ impl LoginCoreChild for FakeChild {
     async fn terminate(&mut self) {
         self.terminated.fetch_add(1, Ordering::SeqCst);
     }
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        let before = self.terminated.load(Ordering::SeqCst);
+        self.terminate().await;
+        if self.terminated.load(Ordering::SeqCst) > before {
+            Ok(())
+        } else {
+            Err("fixture cleanup was not observed".into())
+        }
+    }
 }
 
 struct FakeSpawner {
@@ -1524,8 +1597,51 @@ struct FakeSpawner {
     stderr_written: tokio::sync::watch::Sender<usize>,
 }
 
+/// Simulates the two Android paths where native ownership cannot be released:
+/// start returns an unresolved cleanup, or a successfully started host cannot close.
+struct UnknownCleanupSpawner {
+    spawns: Arc<AtomicUsize>,
+    fail_during_spawn: bool,
+}
+
+struct UnknownCleanupChild;
+
+#[async_trait]
+impl LoginCoreChild for UnknownCleanupChild {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+    async fn wait(&mut self) {
+        std::future::pending::<()>().await;
+    }
+    async fn terminate(&mut self) {}
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        Err("native cleanup unconfirmed".to_string())
+    }
+}
+
+#[async_trait]
+impl LoginCoreSpawner for UnknownCleanupSpawner {
+    async fn spawn(
+        &self,
+        _req: SpawnRequest,
+    ) -> Result<Box<dyn LoginCoreChild>, polaris_core_supervisor::SpawnError> {
+        self.spawns.fetch_add(1, Ordering::SeqCst);
+        if self.fail_during_spawn {
+            return Err(polaris_core_supervisor::SpawnError::Spawn {
+                bin: PathBuf::from("android-libbox"),
+                source: std::io::Error::other(TempCoreCleanupUnknown(
+                    "native cleanup unconfirmed".to_string(),
+                )),
+            });
+        }
+        Ok(Box::new(UnknownCleanupChild))
+    }
+}
+
+#[async_trait]
 impl LoginCoreSpawner for FakeSpawner {
-    fn spawn(
+    async fn spawn(
         &self,
         req: SpawnRequest,
     ) -> Result<Box<dyn LoginCoreChild>, polaris_core_supervisor::SpawnError> {
@@ -1587,6 +1703,68 @@ struct Harness {
     stderr_written: tokio::sync::watch::Receiver<usize>,
 }
 
+struct CapacityChecker;
+#[async_trait]
+impl ConfigChecker for CapacityChecker {
+    async fn check(&self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        panic!("typed entry required")
+    }
+    async fn check_admitted(
+        &self,
+        _: &std::path::Path,
+        _: &std::path::Path,
+    ) -> Result<(), crate::runtime::proxy::android_capacity::CheckFailure> {
+        Err(
+            crate::runtime::proxy::android_capacity::CheckFailure::CapacityClosed(
+                crate::runtime::proxy::android_capacity::CapacityClosed,
+            ),
+        )
+    }
+}
+
+struct CapacitySpawner;
+#[async_trait]
+impl LoginCoreSpawner for CapacitySpawner {
+    async fn spawn(&self, _: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        Err(crate::runtime::proxy::android_capacity::CapacityClosed.spawn_error())
+    }
+}
+
+#[tokio::test]
+async fn typed_capacity_spawn_stops_the_actual_speedtest_round_without_a_child() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.spawner = Arc::new(CapacitySpawner);
+    let outcome = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { panic!("measured after admission rejection") },
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
+    assert_eq!(h.terminated.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    cleanup(&h.dir);
+}
+
+#[tokio::test]
+async fn capacity_check_stops_the_actual_speedtest_round_before_spawn_or_measurement() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.checker = Arc::new(CapacityChecker);
+    let outcome = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { panic!("measured after admission rejection") },
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    cleanup(&h.dir);
+}
 /// 会话夹具的可选开关。**默认全关**（`Default`）= 与本批改造之前逐字等价的假核。
 #[derive(Default)]
 struct HarnessOpts {
@@ -1646,6 +1824,8 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
     let (stderr_tx, stderr_rx) = tokio::sync::watch::channel(0usize);
     Harness {
         deps: TempCoreDeps {
+            #[cfg(not(target_os = "android"))]
+            pc_custody: Arc::new(PcTempCoreCustody::default()),
             spawner: Arc::new(FakeSpawner {
                 terminated: Arc::clone(&terminated),
                 spawns: Arc::clone(&spawns),
@@ -1983,6 +2163,7 @@ async fn session_registers_inflight_pid_so_app_exit_cleanup_can_reach_it() {
 /// 收割动作经注入闭包 ⇒ 零真实信号。假 pid 取 `> i32::MAX`：即便有人把它接到真 `send_signal` 上，
 /// `checked_pid` 也会挡掉（负数 pid 是 kill 的**广播**语义 —— 那是全场 SIGKILL）。
 #[test]
+#[cfg(target_os = "android")]
 fn kill_inflight_temp_cores_drains_table_once_and_counts_each_pid() {
     let _lock = registry_guard();
     let fake: u32 = 0xDEAD_BEEF;
@@ -1997,21 +2178,31 @@ fn kill_inflight_temp_cores_drains_table_once_and_counts_each_pid() {
     assert!(again.is_empty());
 }
 
-/// 🔵 **调用点守卫**：退出生命周期 owner 必须真的调 [`kill_inflight_temp_cores`]。
-///
-/// 没有这条，「登记了 pid」与「退出时会被杀」之间是断的，而断了的表现**恰好是静默的**：
-/// 用户看不到孤儿核，只在下次起核时莫名 address-in-use（Windows 连那次兜底都没有）。
-/// 牙：把 `exit_lifecycle::run_exit_cleanup` 里那行删掉 / 挪出该函数 → 转红。
+/// Desktop exit must fence admission and await the retained exact Child through its gate.
 #[test]
-fn app_exit_cleanup_kills_inflight_temp_cores() {
-    let body = crate::commands::guard_scan::top_level_fn_body(
-        &crate_code("exit_lifecycle.rs"),
-        "fn run_exit_cleanup(",
+#[cfg(not(target_os = "android"))]
+fn app_exit_gate_fences_and_drains_exact_temp_custody() {
+    let source = crate_code("exit_lifecycle.rs");
+    let implementation = source
+        .split_once("impl ExitPorts for DesktopExitPorts {")
+        .expect("desktop production exit ports")
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    let fence = crate::commands::guard_scan::impl_method_body(
+        implementation,
+        "    fn fence_temp(&self) -> Result<(), String> {",
     );
-    assert!(
-            body.contains("kill_inflight_temp_cores()"),
-            "退出清理必须收掉在飞测速临时核：它不在 ProxyRuntime 的任何生命周期槽里，proxy.stop() 碰不到它"
-        );
+    let drain = crate::commands::guard_scan::impl_method_body(
+        implementation,
+        "    async fn drain_temp(&self) -> Result<(), String> {",
+    );
+    assert!(fence.contains("speedtest::begin_shutdown()"));
+    assert!(drain.contains("speedtest::shutdown_for_exit().await"));
+    let gate = crate::commands::guard_scan::top_level_fn_body(&source, "fn fence_all(");
+    assert!(gate.contains("ports.fence_temp()"));
+    assert!(source.contains("ports.drain_temp()"));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -3699,6 +3890,30 @@ fn multi_batch_harness(nodes: usize, spawn_fail_at: Option<usize>) -> Harness {
             ..Default::default()
         },
     )
+}
+
+#[tokio::test]
+async fn unconfirmed_native_cleanup_stops_later_batches_for_both_start_and_close() {
+    let nodes = naive_nodes(300);
+    assert!(plan_temp_core_batches(&nodes).len() > 1);
+    for fail_during_spawn in [true, false] {
+        let mut h = multi_batch_harness(nodes.len(), None);
+        h.deps.spawner = Arc::new(UnknownCleanupSpawner {
+            spawns: Arc::clone(&h.spawns),
+            fail_during_spawn,
+        });
+        let (out, _) = run_round(&h, &nodes).await;
+        assert!(
+            matches!(out, TempCoreOutcome::CleanupUnknown(ref detail) if detail == "native cleanup unconfirmed"),
+            "native cleanup must not degrade into a recoverable failed batch: {out:?}"
+        );
+        assert_eq!(
+            h.spawns.load(Ordering::SeqCst),
+            1,
+            "a second batch started with unresolved native ownership"
+        );
+        cleanup(&h.dir);
+    }
 }
 
 /// 收集一轮里的事件（保序）。

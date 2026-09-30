@@ -330,6 +330,70 @@ fn scm_stop_wakes_the_blocked_accept_loop() {
     assert!(store < serve_at, "STATUS_HANDLE 存得比 serve 还晚");
 }
 
+// Windows-only service glue is compiled by the cross-target gate; the host tests
+// above exercise native custody outcomes. These checks cover the final exit commit.
+fn service_function<'a>(source: &'a str, anchor: &str) -> &'a str {
+    let start = source.find(anchor).expect("service function missing");
+    let end = source[start..]
+        .find("\n}\n")
+        .expect("service function end missing");
+    &source[start..start + end]
+}
+
+#[test]
+fn normal_service_and_console_exit_require_confirmed_custody_drain() {
+    let source = polaris_source_probe::crate_source!("platform/windows/service/win.rs");
+    let drain = service_function(&source, "fn drain_for_exit<");
+    assert!(drain.contains("loop {"));
+    assert!(drain.contains("match helper.reap_child_on_exit()"));
+    assert!(drain.contains("Ok(()) => return"));
+    let error = drain.split("Err(error) => {").nth(1).unwrap();
+    assert!(error.contains("pending()"));
+    assert!(error.contains("std::thread::sleep"));
+    assert!(!error.contains("return"));
+    assert!(!error.contains("SERVICE_STOPPED"));
+
+    let service = service_function(&source, "extern \"system\" fn service_main_entry(");
+    let retained = service.find("SERVICE_HELPER.set(helper.clone())").unwrap();
+    let listener = service.find("serve(helper.clone())").unwrap();
+    let confirmed = service.find("drain_for_exit(helper.as_ref()").unwrap();
+    let stopped = service
+        .find("set_status(status_handle, SERVICE_STOPPED")
+        .unwrap();
+    assert!(retained < listener && listener < confirmed && confirmed < stopped);
+    assert!(service[confirmed..stopped].contains("SERVICE_STOP_PENDING"));
+
+    let console = service_function(&source, "pub fn run_console(");
+    let close = console
+        .find("match helper_for_stop.reap_child_on_exit()")
+        .unwrap();
+    let stop = console.find("STOP_REQUESTED.store(true").unwrap();
+    let failed = console.find("Err(error) => {").unwrap();
+    assert!(close < stop && stop < failed);
+    assert!(!console[failed..].contains("STOP_REQUESTED.store(true"));
+    assert!(console.contains("drain_for_exit(helper.as_ref()"));
+
+    let connection = service_function(&source, "fn handle_connection<");
+    assert!(connection.contains("match helper.reap_child_on_exit()"));
+    assert!(!connection.contains("std::process::exit"));
+}
+
+#[test]
+fn scm_stop_fences_spawn_before_listener_stop_and_refreshes_pending_checkpoint() {
+    let source = polaris_source_probe::crate_source!("platform/windows/service/win.rs");
+    let control = service_function(&source, "extern \"system\" fn ctrl_handler(");
+    let fence = control.find("helper.begin_shutdown()").unwrap();
+    let stop = control.find("STOP_REQUESTED.store(true").unwrap();
+    assert!(fence < stop);
+    let status = service_function(&source, "fn set_status(");
+    assert!(status.contains("if state == SERVICE_STOP_PENDING"));
+    let compact_status = status.split_whitespace().collect::<String>();
+    assert!(compact_status.contains(
+        "status.dwCheckPoint=STOP_CHECKPOINT.fetch_add(1,Ordering::SeqCst).saturating_add(1)"
+    ));
+    assert!(status.contains("status.dwWaitHint = 30000"));
+}
+
 /// 写响应这条腿必须有取消守卫，且**未鉴权对端的响应不等对端**。
 ///
 /// `FlushFileBuffers` 在命名管道服务端按定义会一直等到 client 把数据读走 ⇒ 「连上、发一帧、不读」

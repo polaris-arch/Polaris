@@ -1,5 +1,100 @@
 use super::*;
 
+const BIRTH: &str = "00112233445566778899aabbccddeeff";
+
+#[test]
+fn helper_birth_token_has_one_canonical_wire_spelling() {
+    let token = HelperBirthToken::parse_wire(BIRTH).unwrap();
+    assert_eq!(token.to_wire(), BIRTH);
+    assert_eq!(
+        HelperBirthToken::from_bytes([0; 16]).to_wire(),
+        "0".repeat(32)
+    );
+    for bad in [
+        "",
+        "00112233445566778899aabbccddeef",
+        "00112233445566778899aabbccddeeff0",
+        "00112233445566778899AABBCCDDEEFF",
+        "00112233445566778899aabbccddeefg",
+        " 00112233445566778899aabbccddeeff",
+        "00112233445566778899aabbccddeeff\n",
+    ] {
+        assert_eq!(HelperBirthToken::parse_wire(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn exact_birth_stop_arguments_fail_closed() {
+    let target = parse_linux_birth_stop_args(&["42", BIRTH]).unwrap();
+    assert_eq!(target.pid.get(), 42);
+    assert_eq!(target.birth.to_wire(), BIRTH);
+    for bad in [
+        vec![],
+        vec!["42"],
+        vec!["42", BIRTH, BIRTH],
+        vec!["42", BIRTH, "extra"],
+        vec!["0", BIRTH],
+        vec!["+42", BIRTH],
+        vec!["042", BIRTH],
+        vec![" 42", BIRTH],
+        vec!["42", "00112233445566778899AABBCCDDEEFF"],
+        vec!["42", "00112233445566778899aabbccddeefg"],
+    ] {
+        assert_eq!(parse_linux_birth_stop_args(&bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn exact_birth_request_frames_are_distinct_and_complete() {
+    use crate::{codec, Platform};
+    let params = LinuxStartParams {
+        singbox_path: "/core/sing-box".into(),
+        common: StartParams {
+            cfg: "/cfg.json".into(),
+            log: "/core.log".into(),
+            fwd: true,
+            parent_pid: Some(7),
+        },
+    };
+    assert_eq!(
+        String::from_utf8(codec::encode(
+            Platform::Linux,
+            "",
+            &Request::LinuxStartBirth(params)
+        ))
+        .unwrap(),
+        "start-birth-safe\n/core/sing-box\n/cfg.json\n/core.log\n1\n7\n"
+    );
+    assert_eq!(
+        String::from_utf8(codec::encode(
+            Platform::Linux,
+            "",
+            &Request::LinuxStatusBirth
+        ))
+        .unwrap(),
+        "status-birth-safe\n"
+    );
+    let target = parse_linux_birth_stop_args(&["42", BIRTH]).unwrap();
+    assert_eq!(
+        String::from_utf8(codec::encode(
+            Platform::Linux,
+            "",
+            &Request::LinuxStopBirth { target }
+        ))
+        .unwrap(),
+        format!("stop-birth-safe\n42\n{BIRTH}\n")
+    );
+    assert_eq!(
+        String::from_utf8(codec::encode(
+            Platform::Linux,
+            "",
+            &Request::LinuxStop { pid: None }
+        ))
+        .unwrap(),
+        "stop-reap-safe\n"
+    );
+}
+
 #[test]
 fn ping_version_status_no_args() {
     for r in [Request::Ping, Request::Version, Request::Status] {
@@ -51,6 +146,11 @@ fn stop_omits_identity_line_when_unspecified() {
         "不声明身份 → 帧与旧客户端逐字节一致（旧 helper 照常停核）"
     );
     assert_eq!(Request::Stop { pid: Some(4242) }.args_lines(), vec!["4242"]);
+    assert!(Request::LinuxStop { pid: None }.args_lines().is_empty());
+    assert_eq!(
+        Request::LinuxStop { pid: Some(4242) }.args_lines(),
+        vec!["4242"]
+    );
 }
 
 /// 整帧形态（含平台差异）：stop 的身份行紧跟 command 行。
@@ -67,10 +167,10 @@ fn stop_frame_shape_carries_identity_line() {
     let linux = String::from_utf8(codec::encode(
         Platform::Linux,
         "",
-        &Request::Stop { pid: None },
+        &Request::LinuxStop { pid: Some(7) },
     ))
     .unwrap();
-    assert_eq!(linux, "stop\n", "旧语义帧不变");
+    assert_eq!(linux, "stop-reap-safe\n7\n");
 }
 
 #[test]
@@ -121,6 +221,7 @@ fn linux_start_writes_singbox_first() {
             "0",
         ]
     );
+    assert_eq!(r.command_name(), "start-reap-safe");
 }
 
 #[test]
@@ -210,6 +311,10 @@ fn command_name_mapping() {
     // 锁住 wire 命令名 ↔ Request 变体映射
     assert_eq!(Request::Ping.command_name(), "ping");
     assert_eq!(Request::Stop { pid: None }.command_name(), "stop");
+    assert_eq!(
+        Request::LinuxStop { pid: None }.command_name(),
+        "stop-reap-safe"
+    );
     assert_eq!(Request::FreePort { port: 1 }.command_name(), "freeport");
     assert_eq!(
         Request::Start(StartParams {

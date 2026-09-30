@@ -11,6 +11,13 @@ function execution(overrides: Partial<TsLoginExecution> = {}): TsLoginExecution 
 }
 
 describe('save followed by authorization', () => {
+  it('explicit capacity code survives the authorization flow and still cancels the original attempt', async () => {
+    const input = execution({ start: async () => { throw { code: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', message: 'private' }; } });
+    expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED' });
+    expect(input.cancel).toHaveBeenCalledOnce();
+    const ordinary = execution({ start: async () => { throw new Error('ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED'); } });
+    expect(await executeTsLogin(ordinary)).toEqual({ phase: 'failed', reason: 'authorizationRequestFailed' });
+  });
   it('failed authorization preserves the saved identity and retry updates instead of adding twice', async () => {
     let saved: ServerConfig | undefined;
     const additions: string[] = [];

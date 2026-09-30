@@ -106,9 +106,10 @@ describe('TsSettingsDialog：Auth Key 状态行只渲染布尔事实', () => {
     expect(html).toContain('ts.authKeyClearHint');
   });
 
-  it('状态行与登录态两条动作并存且互不冒充（退出登录仍在，清除不是它）', () => {
+  it('状态未知时保留手动登录入口，不虚构可登出的会话', () => {
     const html = render([tsNode(SENTINEL)]);
-    expect(html).toContain('ts.logout');
+    expect(html).toContain('meshJoin.switchAccount');
+    expect(html).not.toContain('>ts.logout</button>');
     expect(html).toContain(CLEAR_BTN);
   });
 });

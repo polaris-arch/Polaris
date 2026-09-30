@@ -140,10 +140,16 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
             2,
             1,
         ),
+        (
+            "crates/config-engine/tests/managed_mesh_emission_runtime.rs",
+            8,
+            1,
+        ),
+        ("crates/singbox-grpc/tests/native_clash_mode.rs", 1, 1),
     ];
     for (rel, total_tests, run_tests) in skip_wired {
         let code = mask_comments_and_strings(&read_repo(rel));
-        let tests = code.matches("#[test]").count();
+        let tests = code.matches("#[test]").count() + code.matches("#[tokio::test]").count();
         let skips = code.matches("kernel_run_or_skip(").count();
         assert_eq!(
             tests, total_tests,
@@ -155,6 +161,18 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
         );
         assert!(code.contains("with_run("), "{rel}：起核不再经 with_run");
     }
+
+    let native = mask_comments(&read_repo("crates/singbox-grpc/tests/native_clash_mode.rs"));
+    assert!(native.contains(
+        "#[path = \"../../config-engine/tests/support/kernel_run.rs\"]\nmod kernel_run;"
+    ));
+    let entry = native
+        .split("async fn native_core_lists_and_switches_the_two_compiled_modes() {")
+        .nth(1)
+        .expect("native clash-mode 起核入口消失");
+    assert!(entry.trim_start().starts_with(
+        "if !kernel_run::kernel_run_or_skip(\"native_core_lists_and_switches_the_two_compiled_modes\")"
+    ), "native clash-mode 必须在解析核、端口或写文件前经过原禁核入口");
 
     let ps = mask_comments_and_strings(&read_repo(
         "src-tauri/src/runtime/proxy/tests/process_supervision.rs",

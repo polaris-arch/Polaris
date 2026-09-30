@@ -2,7 +2,7 @@ import type { TFunction } from 'i18next';
 import type { ServerConfig, SubscriptionConfig, PendingNodeChanges } from '@/contracts/types';
 import type { ServerGroup } from '@/domain/server-grouping';
 import { isMeshNode, meshAllowsInternet, type SpeedTestCaps } from '@/domain/endpoint-routes';
-import { willRestartOnSelect } from '@/components/screens/home/pending-select-hint';
+import { needsApplyOnSelect } from '@/components/screens/home/pending-select-hint';
 import { speedTestBlockReason } from './nodes-logic';
 import { NodeCard } from './NodeCard';
 import type { MeshNodeRouteBadge } from '@/domain/mesh-route-badges';
@@ -107,7 +107,7 @@ export function NodesGrid({
               onEdit={editNode}
               onUse={useNode}
               useConfirming={confirmArmed === `node-use:${server.id}`}
-              useWillRestart={willRestartOnSelect(pendingChanges, server.id)}
+              useNeedsApply={needsApplyOnSelect(pendingChanges, server.id)}
               onDelete={deleteNode}
               deletable={!server.subscriptionId}
               deleteConfirming={confirmArmed === `node-del:${server.id}`}

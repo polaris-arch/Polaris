@@ -130,6 +130,11 @@ export function meshSingletonConflict(
   return null;
 }
 
+/** A clone creates a second node. Count its source as an occupied singleton slot. */
+export function canCloneServer(server: MeshSlotServer): boolean {
+  return meshSingletonConflict(server, [server]) === null;
+}
+
 /**
  * 批量入库（`server:addBulk`）的逐条单例准入：返回可入库的候选与被单例槽拒收的候选。
  *
@@ -352,17 +357,52 @@ export function meshUsesSystemInterface(server: ServerConfig): boolean {
 }
 
 /**
- * 平台是否支持组网 System 内核接口模式（reverseMesh）。**Windows 禁 System**：Windows 上 sing-box 的 tsnet 给
+ * 平台是否支持组网 System 内核接口模式（reverseMesh）。**Windows / Android 禁 System**：Windows 上 sing-box 的 tsnet 给
  * polaris-ts 自装 exit 0/0 metric=0、抢直连/bootstrap DNS 致全网瘫，且无 macOS 的 ifscope 作用域可隔离 → System
  * 不可靠；故 Windows 一律强制 gVisor（userspace 栈零提权、不建内核接口、出口经 tsnet 内部转发不依赖 OS 路由）。
  * macOS/Linux 支持 System。接受 process.platform / window.electron.platform 取值，是「Windows 禁 System」的**单一
  * 真值谓词**——ProxyManager.systemInterfaceAvailable、start-retry 预算、UI AccessModeField、MeshExitRouteManager
  * 共用，避免散落多处平台判断漂移（同 neighbor.ts 的能力谓词模式）。
+ *
+ * **Android 禁 System**（2026-09-04 K10）：应用进程无 `CAP_NET_ADMIN`，唯一的 tun fd 由
+ * `VpnService.establish()` 授予且已被主 TUN 占用 → 第二张内核接口无来源，`system:true` 会让起核
+ * FATAL。判据与 Rust 侧两份实现（`polaris_mesh::mesh_system_supported_on_platform` /
+ * `config-engine::builder::endpoint_routes::mesh_system_supported_on_platform`）逐值同口径。
+ *
+ * 🔴 本函数当前在 `ui/src/` 内**零调用点**（2026-09-06 复测 grep：全仓唯一命中就是本定义处），
+ * 是移植自上游但尚未接线的谓词。仍然一起改：移动端各屏正在接线中，接入模式（AccessModeField）
+ * 一旦上移动端就会读它，届时用户会在一个建不出内核接口的平台上看到「System」可选 ——
+ * 那时它就不再是死代码，而是一个开关。
+ *
+ * # 2026-09-06：从**禁止清单**改成**允许清单**（真缺陷，不是风格）
+ *
+ * 旧实现是 `p !== 'win32' && p !== 'android'` —— 任何没被点名的平台默认得到 `true`。
+ * Rust 侧两份实现在 2026-09-05 已经因为同一个理由改掉了（枚举版是穷举 `match`，字符串版
+ * `config-engine::builder::endpoint_routes` 改成了 `matches!(…, "darwin" | "macos" | "linux")`），
+ * **只剩这一份是旧形态**，于是三份在新平台上不同答：
+ *
+ * | 平台串 | Rust 枚举版 | Rust 字符串版 | 本函数（改前） |
+ * |---|---|---|---|
+ * | `ios` | false | false | **true** ← 方向错、静默 |
+ * | `windows`（未经 `platform_tag()` 映射的原值） | false | false | **true** ← 别名洞，禁的正是它 |
+ *
+ * iOS 与 Android 在这一格的物理约束同构：应用进程没有 `CAP_NET_ADMIN` 等价能力，唯一的 tun fd
+ * 由 `NEPacketTunnelProvider` 在扩展沙箱内授予且已被主 TUN 占用 ⇒ 第二张内核接口无来源。
+ * 判错成 `true` 的代价是**起核 FATAL**，判错成 `false` 只是退 gVisor（功能在）—— 代价不对称，
+ * 没有证据的那一格只能选后者（完整论证见 `crates/mesh/src/exit_route.rs` 的代价表）。
+ *
+ * 改动**零行为差**：今天零调用点。改的是「等它被接上时答的是不是对的」。
+ *
+ * 三份实现的一致性此前只写在注释里（Rust 两份由 `platform_dispatch_exhaustive.rs` 的
+ * `mesh_system_support_agrees_across_enum_and_string_faces` 逐名对拍，**TS 这份不在射程内**）。
+ * 本次补上跨语言那一道：`./endpoint-routes-mesh-parity.test.ts`。
  */
 export function meshSystemSupportedOnPlatform(
   platform: NodeJS.Platform | string | undefined
 ): boolean {
-  return (platform || '').toLowerCase() !== 'win32';
+  const p = (platform || '').toLowerCase();
+  // 允许清单，逐名与 Rust 字符串版对齐（含 darwin/macos 双别名；不收 windows）。
+  return p === 'darwin' || p === 'macos' || p === 'linux';
 }
 
 /** 测速可行性能力位（path-aware）：主核 probe 池是否可用（=代理运行且池就绪）。 */

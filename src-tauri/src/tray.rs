@@ -2,7 +2,7 @@
 //!
 //! macOS/Windows 以它替代原生上下文菜单：托盘左键或右键（macOS 双指辅助点按归为右键）都弹出/收起这个
 //! 独立窗口渲染的自绘浮层（连接状态卡 + 断开/连接 + 节点切换 + 模式 + 打开主窗 + 退出）。
-//! 主窗只由浮层内的明确入口唤出。Linux AppIndicator 不派发可靠点击事件，仍由 `main.rs` 保留完整原生菜单兜底。
+//! 主窗只由浮层内的明确入口唤出。Linux AppIndicator 不派发可靠点击事件，仍由 `lib.rs` 保留完整原生菜单兜底。
 //!
 //! # 窗口形态（对齐 `runtime::update_popup` 的独立 mini 窗模式）
 //!
@@ -31,7 +31,7 @@
 //! - [`tray_resize`]：浮层量出内容高度后回报 → 主进程设窗高（宽固定）并重定位（自适应高）。
 //! - [`tray_hide`]：连接/断开/切节点后收起浮层（原生菜单选项即关的等价）。
 //! - [`tray_show_main`]：显示主窗（打开主窗口/在主窗口管理）——复用 `crate::show_main_window`。
-//! - [`tray_quit`]：置 `QuitState` + `app.exit(0)`——与 `main.rs` 托盘/菜单「退出」路径逐字节相同。
+//! - [`tray_quit`]：置 `QuitState` + `app.exit(0)`——与 `lib.rs` 托盘/菜单「退出」路径逐字节相同。
 
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
@@ -46,7 +46,7 @@ mod transition;
 mod window;
 
 // 整体 glob 再导出：8 个 `#[tauri::command]` 各自还带 `__cmd__*` / `__tauri_command_name_*` 两个
-// 包装宏，而 `main.rs` 的 `generate_handler![tray::tray_*]` 是**按路径**取包装宏的（`tauri-macros`
+// 包装宏，而 `lib.rs` 的 `generate_handler![tray::tray_*]` 是**按路径**取包装宏的（`tauri-macros`
 // 的 `Handler::parse` 只替换路径末段）⇒ 逐项具名再导出会漏掉 16 个宏名。glob 与 `commands.rs`
 // 顶层项一一对应，且私有的 `set_pending_screen` 不在其中。
 pub use commands::*;
@@ -93,6 +93,31 @@ pub(crate) use window::{prewarm_overlay_if_enabled, reconcile_overlay_retention}
 
 /// 浮层窗 label（Tauri 内唯一；主窗为 `"main"`，更新弹窗为 `"update-popup"`）。
 pub const TRAY_LABEL: &str = "tray";
+
+/// **系统托盘是否在场** —— 「有没有一个能唤出主窗的常驻锚点」这个谓词的唯一出口。
+///
+/// 桌面：向 Tauri 查 conf 声明的那枚托盘（id `"main"`）。它可能整体缺席（Linux 无
+/// StatusNotifier / appindicator 不可用），关窗语义（`CloseRequested` → 收纳还是真退出）、
+/// C16 轻量守卫、浮层预热三处都据此分流。
+///
+/// 移动端：**恒 false**。Android/iOS 的状态栏里没有「常驻可点图标」这种对象 —— 最接近的
+/// 前台服务通知是通知栏里的一条记录，不是可挂点击与菜单的宿主（能力上的对应物见
+/// `app_tray` 模块文档的裁定表）。恒 false 让全部调用点各自落进它们**既有**的「没有托盘
+/// 锚点」分支：关窗即真退出、不进轻量驻留、不预热浮层 —— 语义正确且零新增分支。
+///
+/// [不选「每个调用点各写一处 `#[cfg(desktop)]`」：那是把同一个谓词散成五份，桌面侧的行为
+///  等价性此后要靠人逐处比对；收成一个函数后 `cfg(desktop)` 分支体逐字节还是原来那一句]
+#[cfg(desktop)]
+pub(crate) fn tray_present(app: &tauri::AppHandle) -> bool {
+    // `tray_by_id` 是 `AppHandle` 的固有方法，不经 `Manager` trait —— 不需要额外 use。
+    app.tray_by_id("main").is_some()
+}
+
+/// 见 [`tray_present`] 的 `cfg(desktop)` 孪生体：移动端无托盘对象，恒 false。
+#[cfg(mobile)]
+pub(crate) fn tray_present(_app: &tauri::AppHandle) -> bool {
+    false
+}
 
 /// 浮层运行期状态（app-managed）：记录最近一次隐藏时刻（供 [`toggle_overlay`] 去抖）+ 最近一次
 /// 托盘图标屏幕矩形（供 [`reposition`](placement::reposition) 对齐图标；[`tray_resize`] 改高后重定位也复用它）。

@@ -121,6 +121,9 @@ fn node_resolver_dial_tag(config: &UserConfig) -> String {
             .dns_config
             .as_ref()
             .and_then(|d| d.node_domain_resolver.as_deref()),
+        // 这个实参在 Dial 侧是**惰性的**：`get_node_resolver_tag` 只在 `ctx == Rule` 时读它
+        // （INV-1 防递归那条）。故此处读裸值还是读 [`ProxyModeType::effective_on`] 的生效值，
+        // 返回值逐字相同 —— Rule 侧那份在 `builder::dns` 里，那边接了生效值。
         match config.proxy_mode_type {
             crate::user_config::ProxyModeType::Tun => "tun",
             crate::user_config::ProxyModeType::SystemProxy => "systemProxy",
@@ -1273,7 +1276,7 @@ fn generate_rule_selectors(
     };
     let custom = effective_custom_rules(mode_str, config.effective_traffic_rules());
     let app = effective_app_rules(
-        config.app_routing_enabled == Some(true),
+        config.app_routing_enabled != Some(false),
         mode_str,
         &config.app_rules,
     );

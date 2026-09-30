@@ -20,6 +20,7 @@ export interface ProxyErrorTextInput {
 /** Rust `runtime/proxy.rs::code` 的全量用户可见映射。 */
 export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   STARTUP_FAILED: 'errors.startupFailed',
+  ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: 'errors.androidNativeCapacityClosed',
   PROCESS_EXITED: 'home.proxyCrashed',
   AUTO_RESTART_FAILED: 'home.proxyCrashed',
   HELPER_NOT_INSTALLED: 'errors.helperNotInstalledDesc',
@@ -33,11 +34,13 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   AUTO_SWITCH_NEEDS_RESTART: 'errors.autoSwitchNeedsRestart',
   OUTBOUND_INTERFACE_UNAVAILABLE: 'errors.outboundInterfaceUnavailable',
   SYSTEM_INTERFACE_REQUIRES_HELPER: 'errors.systemInterfaceRequiresHelper',
+  SYSTEM_INTERFACE_UNSUPPORTED: 'errors.systemInterfaceUnsupported',
   MESH_INBOUND_SYSTEM_INTERFACE: 'errors.meshInboundSystemInterface',
   HELPER_GATE_ABORTED: 'errors.helperGateAborted',
   TUN_ROUTE_NOT_CAPTURED: 'errors.tunRouteNotCaptured',
   TUN_ADAPTER_MISSING: 'errors.tunAdapterMissing',
   TUN_ADDRESS_UNAVAILABLE: 'errors.tunAddressUnavailable',
+  VPN_PERMISSION_DENIED: 'errors.vpnPermissionDenied',
 };
 
 /** 命中稳定码返回译文；未知/缺码返回 `null`，不渲染诊断 `message`。 */

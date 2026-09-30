@@ -49,6 +49,8 @@ export const TEMP_CORE_NAIVE_CEILING_HINT = 110;
 export function speedTestErrorMessage(err: unknown, t: TFunction): string {
   const code = err instanceof IpcError ? err.code : undefined;
   switch (code) {
+    case 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED':
+      return t('errors.androidNativeCapacityClosed');
     case 'SYSTEM_INTERFACE_REQUIRES_HELPER':
       return t('nodes.speedTestSystemInterfaceRequiresHelper');
     case 'SPEEDTEST_NO_ACTIVE_EXIT':

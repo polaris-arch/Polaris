@@ -132,7 +132,13 @@ impl ProxyRuntime {
     /// 只在接管成功时启动链路 watcher。
     pub(super) async fn set_system_dns_best_effort(self: &Arc<Self>) -> bool {
         let this = Arc::clone(self);
-        match tokio::task::spawn_blocking(move || this.set_system_dns_locked()).await {
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        match tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
+            this.set_system_dns_locked()
+        })
+        .await
+        {
             Ok(applied) => applied,
             Err(error) => {
                 log::error!("系统 DNS 接管 spawn_blocking join 失败: {error}");
@@ -144,7 +150,12 @@ impl ProxyRuntime {
     /// C7：停核/启动自愈尾还原系统 DNS（best-effort）。无 marker（fresh / 已还原）→ 惰性。
     pub(super) async fn restore_system_dns_best_effort(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        if let Err(e) = tokio::task::spawn_blocking(move || this.restore_system_dns_locked()).await
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
+            this.restore_system_dns_locked()
+        })
+        .await
         {
             log::error!("系统 DNS 还原 spawn_blocking join 失败: {e}");
         }
@@ -169,10 +180,13 @@ impl ProxyRuntime {
     /// 门控（[`Self::dns_reconcile_should_run`]）：当前配置 TUN + 接管 marker 在。锁中毒 / 门未过 → 跳过。
     pub(crate) fn reconcile_system_dns_locked(&self) -> bool {
         let raw = self.config.current().ok();
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。Android 上零行为差，
+        // 且整条腿在那里不可达：唯一调用链是通用网络变化 watcher，而 `spawn_network_watcher`
+        // 在非 mac/linux/windows 上直接早退。
         let is_tun = raw
             .clone()
             .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
-            .is_some_and(|c| c.proxy_mode_type.is_tun());
+            .is_some_and(|c| c.proxy_mode_type.effective_on(Platform::current()).is_tun());
         // 用户开关活态（从**原始 JSON** 读：`dnsConfig.takeoverSystemDns` 不在 `DnsConfig` 结构体里，
         // 同 `restartOnNodeChange` / `autoSwitchNode` / `meshLoginFallbackDirect` 的既定手法）。
         let takeover = raw.as_ref().and_then(dns_takeover_enabled);

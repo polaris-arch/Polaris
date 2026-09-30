@@ -75,6 +75,58 @@ fn platform_token_line_semantics() {
     assert!(!Platform::Linux.has_token_line());
     // Other 视同 Linux：未知平台无 helper 实现，保守不带 token 行。
     assert!(!Platform::Other.has_token_line());
+    // Android 同理：无 helper、无 daemon 可鉴权。
+    assert!(!Platform::Android.has_token_line());
+
+    // **全变体穷举**（不是「列几个我想到的」）：ALL 是唯一取材面，新增变体自动进这条断言。
+    let with_token: Vec<Platform> = Platform::ALL
+        .iter()
+        .copied()
+        .filter(|p| p.has_token_line())
+        .collect();
+    assert_eq!(
+        with_token,
+        vec![Platform::Mac, Platform::Win],
+        "带 token 行的平台集合变了。这不是风格问题：多一个平台 = 向一个**未鉴权对端**发送\
+         凭据行；少一个 = 该平台的 helper 收不到 token 直接拒。改这里必须有 helper 侧的对应改动。"
+    );
+}
+
+/// [`Platform::ALL`] 必须真的覆盖每一个变体。
+///
+/// 强制力来自下面这个**穷举 match**：新增变体时它编译不过，作者被迫回来加一行；而那一行
+/// 又要求对应变体出现在 `ALL` 里，否则断言红。`ALL` 是本仓所有「全变体」判据（含
+/// `src-tauri/tests/platform_dispatch_exhaustive.rs` 那道门）的取材面，它漏一个变体，
+/// 那个变体就不受任何全变体判据管辖。
+#[test]
+fn platform_all_covers_every_variant() {
+    for probe in [
+        Platform::Mac,
+        Platform::Win,
+        Platform::Linux,
+        Platform::Android,
+        Platform::Ios,
+        Platform::Other,
+    ] {
+        // 穷举 match：新增变体 ⇒ 此处 E0004 ⇒ 必须回来补。
+        let named = match probe {
+            Platform::Mac => "Mac",
+            Platform::Win => "Win",
+            Platform::Linux => "Linux",
+            Platform::Android => "Android",
+            Platform::Ios => "Ios",
+            Platform::Other => "Other",
+        };
+        assert!(
+            Platform::ALL.contains(&probe),
+            "{named} 不在 Platform::ALL 里 —— 补上，否则它逃出所有全变体判据"
+        );
+    }
+    assert_eq!(
+        Platform::ALL.len(),
+        6,
+        "ALL 长度变了：新增变体请同步本断言与上面的穷举 match（两处都改才算真的加进来了）"
+    );
 }
 
 #[test]
@@ -85,6 +137,16 @@ fn platform_current_matches_compile_target() {
         assert_eq!(cur, Platform::Mac);
     } else if cfg!(target_os = "windows") {
         assert_eq!(cur, Platform::Win);
+    } else if cfg!(target_os = "android") {
+        // Android 的 `target_os` 是 "android" 而非 "linux"，故必须排在 linux 之前判。
+        // 这条腿在本机（Linux）跑不到，靠 `--target aarch64-linux-android` 的交叉门覆盖编译面。
+        assert_eq!(cur, Platform::Android);
+    } else if cfg!(target_os = "ios") {
+        // iOS 的 `target_os` 是 "ios" 而非 "macos"，与上面 macos 那支互斥。
+        // **本条今天在任何门里都跑不到**：本仓构不出 iOS 产物，`gate-rust.sh` 的三目标
+        // cross-clippy 也不含 apple-ios。它在这里是为了让「current() 缺 ios 分支」这件事至少
+        // 有一处代码写着它该是什么 —— 不是收据，是待兑现的判据。见本批报告「本批未证实」。
+        assert_eq!(cur, Platform::Ios);
     } else if cfg!(target_os = "linux") {
         assert_eq!(cur, Platform::Linux);
     } else {
@@ -100,6 +162,15 @@ fn platform_parse_maps_known_strings() {
     assert_eq!(Platform::parse("win32"), Platform::Win);
     assert_eq!(Platform::parse("windows"), Platform::Win);
     assert_eq!(Platform::parse("linux"), Platform::Linux);
+    // "android" = `std::env::consts::OS` 在 Android 上的原值，config-engine 直传给本函数。
+    // 它此前落进 `Other`，靠「log builder 视 Other 同 Linux」顺带得到正确的日志落盘行为；
+    // 给 Android 具名后必须由本条覆盖，否则那条腿断掉（回归而非旧缺陷）。
+    assert_eq!(Platform::parse("android"), Platform::Android);
+    // "ios" = `std::env::consts::OS` 在 iOS 上的原值（Node 的 `process.platform` 同名，
+    // 不像 darwin/win32 那样有第二套写法）。它此前落进 `Other`：那条腿在**字符串轴**上顺带
+    // 给对了一部分答案（未知平台 = 桌面口径），也顺带给错了另一部分（见本批 inbounds 的
+    // mixed 入站与回环排除两格）。具名之后两部分都必须逐处显式答，本条只钉桥本身。
+    assert_eq!(Platform::parse("ios"), Platform::Ios);
     // 未知串 → Other（非 std FromStr，不报错）。
     assert_eq!(Platform::parse("freebsd"), Platform::Other);
     assert_eq!(Platform::parse(""), Platform::Other);
@@ -147,6 +218,6 @@ fn end_to_end_start_roundtrip() {
     let linux_bytes = codec::encode(Platform::Linux, "", &lreq);
     assert_eq!(
         String::from_utf8(linux_bytes).unwrap(),
-        "start\n/core/sing-box\n/tmp/c.json\n\n0\n"
+        "start-reap-safe\n/core/sing-box\n/tmp/c.json\n\n0\n"
     );
 }

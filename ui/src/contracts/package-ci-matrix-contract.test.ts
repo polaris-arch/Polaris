@@ -9,6 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,7 +23,7 @@ function workflow(name: string): string {
  * 取出 `jobs:` 下某个 job 的整段文本（含其注释），从 `\n  <name>:\n` 到下一个同缩进 job 键为止。
  *
  * 为什么必须按 job 切片、而不是对整个文件 `toContain`：判据是「这套 allowlist 挂在**哪个** job 上」。
- * 2026-09-04 打包腿与质量门改并行，两门的 allowlist 从 `package` 搬到了 `release`；如果断言只看
+ * 2026-09-04 打包腿与质量门改并行，两门的 allowlist 从 `package` 搬到了发布写入腿；如果断言只看
  * 全文，搬家前后同样通过——门在，但对「挂错 job」这件事完全没有牙。
  */
 function jobBlock(src: string, name: string): string {
@@ -30,6 +31,15 @@ function jobBlock(src: string, name: string): string {
   if (start < 0) throw new Error(`package.yml 里找不到 job '${name}' —— 取材面塌了，本门此刻没有判据`);
   const rest = src.slice(start + 1);
   const next = rest.slice(1).search(/\n {2}[a-z][a-z0-9_-]*:\n/);
+  return next < 0 ? rest : rest.slice(0, next + 1);
+}
+
+/** 取出 job 内一个具名 step，避免跨 step 的同名环境变量让接线断言假绿。 */
+function stepBlock(src: string, name: string): string {
+  const start = src.indexOf(`\n      - name: ${name}\n`);
+  if (start < 0) throw new Error(`job 里找不到 step '${name}' —— 取材面塌了，本门此刻没有判据`);
+  const rest = src.slice(start + 1);
+  const next = rest.slice(1).search(/\n {6}- (?:name:|uses:)/);
   return next < 0 ? rest : rest.slice(0, next + 1);
 }
 
@@ -79,25 +89,27 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
   it('切片器本身有效：两个 job 都切得出非平凡的块', () => {
     // 正面自检。少了这条，jobBlock 若因缩进/命名变化退化成空串，下面两条全部真空通过。
     const pkg = workflow('package.yml');
-    for (const name of ['package', 'release']) {
+    for (const name of ['package', 'release_desktop', 'android_release', 'release']) {
       const block = jobBlock(pkg, name);
       expect(block.length, `job '${name}' 的切片过短，取材面可疑`).toBeGreaterThan(200);
       expect(block, `job '${name}' 的切片没包含它自己的 needs`).toContain('needs:');
-      // 切片不得越界到下一个 job：package 的块里不该出现 release 的 job 名行。
-      expect(block).not.toMatch(/\n {2}(?!$)(?:release|package):\n(?![\s\S]*^$)/m);
+      // 切片不得越界到下一个 job。
+      expect(block).not.toMatch(
+        /\n {2}(?!$)(?:package|release_desktop|android_release|release):\n(?![\s\S]*^$)/m,
+      );
     }
   });
 
   it('发布腿只接受成功或按设计跳过的质量门，取消态不得被当成可放行', () => {
     const pkg = workflow('package.yml');
-    const release = executable(jobBlock(pkg, 'release'));
+    const release = executable(jobBlock(pkg, 'release_desktop'));
 
     // 剥注释自检（正面断言）：剥完必须还剩下 if 与 needs，否则下面全是真空通过。
     expect(release, '剥注释后 release 块空了 —— 取材面塌了').toMatch(/^\s+if:/m);
     expect(release).toMatch(/^\s+needs:/m);
     expect(release, '剥注释没生效 —— 块里仍有整行注释').not.toMatch(/^\s*#/m);
 
-    // 判据挂在 release 上（2026-09-04 起打包与门并行，门从 package 下移到发布）。
+    // 判据挂在第一次 release mutation 上（桌面草稿 job）；门未过时连草稿都不写。
     expect(release).toContain("needs: [setup, ci, ui, package]");
     expect(release).toContain(
       "needs.ci.result == 'success' || needs.ci.result == 'skipped'",
@@ -123,11 +135,293 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const pkg = workflow('package.yml');
     const pkgJob = executable(jobBlock(pkg, 'package'));
     expect(pkgJob, '剥注释后 package 块空了 —— 取材面塌了').toMatch(/^\s+if:/m);
-    expect(pkgJob).toContain('needs: [setup]');
+    expect(pkgJob).toContain('needs: [setup, desktop_core]');
+    const coreJob = executable(jobBlock(pkg, 'desktop_core'));
+    expect(coreJob).toContain('needs: setup');
+    expect(coreJob).toContain('uses: ./.github/workflows/desktop-core.yml');
+    expect(coreJob).toContain('candidate: ${{ needs.setup.outputs.candidate }}');
+    expect(pkgJob).toContain("needs.setup.result == 'success'");
+    expect(pkgJob).toContain("needs.desktop_core.result == 'success'");
+    expect(pkgJob).toContain("needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''");
     // needs 即等待。package 一旦能读到 needs.ci/needs.ui，就说明它在等两门，并行拓扑已被推翻。
     expect(
       pkgJob,
       'package job 引用了 needs.ci / needs.ui —— 它又串回门后面了',
     ).not.toMatch(/needs\.(ci|ui)\./);
+  });
+
+  it('复用 bundle 的真实 setup 前置只接受同 candidate、run 和 attempt', () => {
+    const resolve = stepBlock(jobBlock(workflow('package.yml'), 'setup'), 'Resolve platform matrix');
+    expect(resolve).toContain('EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}');
+    expect(resolve).toContain('CORE_CANDIDATE: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}');
+    expect(resolve).toContain('CORE_RUN_ID: ${{ github.run_id }}');
+    expect(resolve).toContain('CORE_RUN_ATTEMPT: ${{ github.run_attempt }}');
+    const runAt = resolve.indexOf('\n        run: |\n');
+    const matrixAt = resolve.indexOf('\n          all=', runAt);
+    expect(runAt).toBeGreaterThan(0);
+    expect(matrixAt).toBeGreaterThan(runAt);
+    // Only the actual identity prelude runs: no matrix tools, producers or workflow jobs.
+    const script = resolve.slice(runAt + '\n        run: |\n'.length, matrixAt)
+      .split('\n').map((line) => line.slice(10)).join('\n');
+    const candidate = 'a'.repeat(40);
+    const base = {
+      CORE_CANDIDATE: candidate, EXPECTED_CANDIDATE: candidate,
+      CORE_RUN_ID: '12', CORE_RUN_ATTEMPT: '3',
+      CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-3`,
+    };
+    const cases: [string, Record<string, string>, number][] = [
+      ['exact reuse', {}, 0], ['standalone producer', { CORE_BUNDLE_ARTIFACT: '' }, 0],
+      ['different candidate', { CORE_CANDIDATE: 'b'.repeat(40) }, 1],
+      ['malformed candidate', { CORE_CANDIDATE: 'not-a-commit' }, 1],
+      ['previous run', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-11-3` }, 1],
+      ['previous attempt', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-2` }, 1],
+    ];
+    for (const [name, changed, status] of cases) {
+      const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...base, ...changed }, encoding: 'utf8' });
+      expect(result.status, `${name}: ${result.stderr}`).toBe(status);
+    }
+  });
+
+  it('发布 DAG 必须是桌面草稿 → 签名 APK → 全量核验公开，且取消态一律不放行', () => {
+    const pkg = workflow('package.yml');
+    const desktopAt = pkg.indexOf('\n  release_desktop:\n');
+    const androidAt = pkg.indexOf('\n  android_release:\n');
+    const finalAt = pkg.indexOf('\n  release:\n');
+    expect(desktopAt).toBeGreaterThan(0);
+    expect(androidAt).toBeGreaterThan(desktopAt);
+    expect(finalAt).toBeGreaterThan(androidAt);
+
+    const desktop = executable(jobBlock(pkg, 'release_desktop'));
+    const android = executable(jobBlock(pkg, 'android_release'));
+    const release = executable(jobBlock(pkg, 'release'));
+
+    expect(desktop).toContain('release_tag: ${{ steps.release_identity.outputs.tag }}');
+    expect(desktop).toContain('release_sha: ${{ steps.release_identity.outputs.sha }}');
+    expect(android).toContain('needs: release_desktop');
+    expect(android).toContain('permissions:\n      contents: write');
+    expect(android).toContain('uses: ./.github/workflows/android.yml');
+    expect(android).toContain('publish_release: true');
+    expect(android).toContain(
+      'release_tag: ${{ needs.release_desktop.outputs.release_tag }}',
+    );
+    expect(android).toContain('secrets: inherit');
+
+    expect(release).toContain('needs: [release_desktop, android_release]');
+    expect(release).toContain("needs.release_desktop.result == 'success'");
+    expect(release).toContain("needs.android_release.result == 'success'");
+    expect(release).not.toContain("needs.android_release.result != 'failure'");
+  });
+
+  it('只有最终 job 能公开；已有公开 release 与 tag/commit 漂移都在写入前失败', () => {
+    const pkg = workflow('package.yml');
+    const desktop = executable(jobBlock(pkg, 'release_desktop'));
+    const android = executable(jobBlock(pkg, 'android_release'));
+    const release = executable(jobBlock(pkg, 'release'));
+
+    expect(executable(pkg).match(/--draft=false/g) ?? []).toHaveLength(1);
+    expect(desktop).not.toContain('--draft=false');
+    expect(android).not.toContain('--draft=false');
+    expect(release).toContain('gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false');
+    expect(release.indexOf('Verify combined asset set and digests')).toBeLessThan(
+      release.indexOf('Promote release to public'),
+    );
+
+    expect(desktop).toContain('tag_sha="$(git rev-list -n 1 "$tag")"');
+    expect(desktop).toContain(
+      'git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"',
+    );
+    expect(desktop).toContain(
+      'version="$(node -p \'require("./src-tauri/tauri.conf.json").version\')"',
+    );
+    expect(desktop).toContain('[ "$tag" != "v$version" ]');
+    expect(desktop).toContain('[ "$tag_sha" != "$GITHUB_SHA" ]');
+    expect(desktop).toContain('[ "$is_draft" != "true" ]');
+    expect(desktop).not.toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
+    expect(desktop).not.toContain('--target "$GITHUB_SHA"');
+    expect(desktop).toContain('targetCommitish=$target_commitish（诊断信息');
+    expect(desktop.match(/^\s*verify_remote_tag$/gm) ?? []).toHaveLength(3);
+    expect(desktop.indexOf('[ "$is_draft" != "true" ]')).toBeLessThan(
+      desktop.indexOf('gh release upload "$tag" "${files[@]}"'),
+    );
+    expect(desktop).toContain('已不再是同 tag 草稿，拒绝上传桌面资产');
+    const desktopUploadAt = desktop.indexOf('gh release upload "$tag" "${files[@]}"');
+    const lastDraftReadBeforeUpload = desktop.lastIndexOf(
+      'gh release view "$tag"',
+      desktopUploadAt,
+    );
+    expect(lastDraftReadBeforeUpload).toBeGreaterThan(0);
+    expect(lastDraftReadBeforeUpload).toBeLessThan(desktopUploadAt);
+    expect(release).toContain('EXPECTED_SHA: ${{ needs.release_desktop.outputs.release_sha }}');
+    expect(release).toContain('[ "$tag_sha" != "$GITHUB_SHA" ]');
+    expect(release.match(/git fetch --force/g) ?? []).toHaveLength(3);
+    expect(release).toContain('[ "$remote_tag_sha" != "$GITHUB_SHA" ]');
+    expect(release).toContain('.targetCommitish');
+    expect(release).not.toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
+    expect(release).not.toContain('targetCommitish <<<"$release_json")" != "$GITHUB_SHA"');
+    expect(release).toContain('拒绝覆盖 SHA256SUMS');
+  });
+
+  it('Android 发布腿只写同 commit 草稿，并验真实 APK 签名与远端 digest', () => {
+    const androidWorkflow = workflow('android.yml');
+    const allExecutable = executable(androidWorkflow);
+    const releaseCheck = executable(jobBlock(androidWorkflow, 'release_check'));
+    const publish = executable(jobBlock(androidWorkflow, 'release-apk'));
+    const dispatch = androidWorkflow.slice(
+      androidWorkflow.indexOf('  workflow_dispatch:'),
+      androidWorkflow.indexOf('\npermissions:'),
+    );
+
+    expect(publish).toContain('if: inputs.publish_release');
+    expect(dispatch).not.toContain('publish_release:');
+    expect(dispatch).not.toContain('release_tag:');
+    expect(androidWorkflow).toContain(
+      'value: ${{ jobs.release-apk.outputs.signed_apk_sha256 }}',
+    );
+    expect(
+      [androidWorkflow, workflow('package.yml'), workflow('release-risk.yml')]
+        .join('\n')
+        .match(/publish_release:\s*true/g) ?? [],
+    ).toHaveLength(1);
+    expect(androidWorkflow).toContain(
+      'group: android-${{ github.workflow }}-${{ github.ref }}',
+    );
+    expect(workflow('package.yml')).toContain(
+      "group: package-${{ github.ref }}-${{ inputs.platforms || inputs.platform || github.event.inputs.platform || 'all' }}",
+    );
+    expect(releaseCheck).toContain('if: inputs.publish_release != true');
+    expect(androidWorkflow).not.toContain('\n  apk:\n');
+    expect(allExecutable).not.toContain('--debug');
+    expect(allExecutable).not.toContain('app-arm64-debug.apk');
+    expect(allExecutable).not.toContain('assembleArm64Debug');
+
+    expect(releaseCheck).toContain(
+      ':app:assembleArm64Release -PpolarisAllowUnsigned=true',
+    );
+    expect(releaseCheck).toContain(
+      'run: bash scripts/gate-android-release-behavior.sh',
+    );
+    expect(releaseCheck).toContain(
+      'python3 scripts/libbox-patches/verify-receipt.py --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+    );
+    expect(releaseCheck).toContain(
+      'node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+    );
+    // R8 入口随 source-consumption 收敛到 verifier；守住实际委托、必填证据和失败传播。
+    const verifier = readFileSync(join(REPO_ROOT, 'scripts/libbox-patches/verify-receipt.py'), 'utf8');
+    const consumption = verifier.slice(verifier.indexOf('def consumption('), verifier.indexOf('\ndef main('));
+    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/assert-r8-evidence.mjs'), str(r8)], cwd=ROOT)");
+    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/verify-apk.mjs'), str(apk), '--abi', abi], cwd=ROOT)");
+    const beforePackage = consumption.slice(0, consumption.indexOf('    with zipfile.ZipFile('));
+    expect(beforePackage).not.toMatch(/^\s*try:/m);
+    expect(consumption).not.toMatch(/^\s*except\b/m);
+    expect(verifier).toContain("builder.require(args.r8 is not None, 'APK source consumption requires actual R8 evidence')");
+    expect(verifier).toContain('consumption(args.apk.resolve(), args.abi, args.r8.resolve(), receipt, receipt_path)');
+    expect(verifier).toMatch(/except \([^\n]*subprocess\.CalledProcessError\) as error:\n\s*print\([^\n]*\n\s*sys\.exit\(1\)/);
+    const builder = readFileSync(join(REPO_ROOT, 'scripts/libbox-patches/build.py'), 'utf8');
+    const run = builder.slice(builder.indexOf('def run('), builder.indexOf('\ndef require('));
+    expect(run).toContain('return subprocess.run(args, cwd=cwd, env=env, check=True, text=True,');
+    expect(run).not.toMatch(/^\s*(?:try:|except\b)/m);
+    expect(releaseCheck).toContain(
+      'run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a',
+    );
+    expect(releaseCheck).toContain('name: android-release-mapping');
+    expect(releaseCheck).not.toContain('gh release upload');
+    expect(releaseCheck).not.toContain('actions/upload-artifact@v7\n        with:\n          name: android-apk');
+
+    expect(publish).toContain(
+      'git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"',
+    );
+    expect(publish.match(/git fetch --force/g) ?? []).toHaveLength(2);
+    expect(publish).toContain('tag_sha="$(git rev-list -n 1 "$tag")"');
+    expect(publish).toContain('[ "$tag_sha" != "$GITHUB_SHA" ]');
+    expect(publish).toContain('[ "$is_draft" != "true" ]');
+    expect(publish).not.toContain('[ "$target_commitish" != "$GITHUB_SHA" ]');
+    expect(publish).toContain('targetCommitish=$target_commitish（仅诊断');
+    expect(publish).toContain('[ "$remote_tag_sha" != "$GITHUB_SHA" ]');
+    expect(publish.indexOf('[ "$is_draft" != "true" ]')).toBeLessThan(
+      publish.indexOf('gh release upload "$tag" "$asset"'),
+    );
+    expect(publish).toContain('keytool -exportcert -keystore "$jks"');
+    expect(publish).toContain(
+      "pinned_cert_sha256='22c183cb41d3dcbe6d355ba58d0a012953c5036592b61fb1efacfe3fa36eabd7'",
+    );
+    expect(publish).toContain('[ "$cert_sha256" != "$pinned_cert_sha256" ]');
+    expect(publish).toContain(
+      'signature_report="$("$apksigner" verify --verbose --print-certs "$asset")"',
+    );
+    expect(publish).toContain('[ "${certs[0]:-}" != "$POLARIS_RELEASE_CERT_SHA256" ]');
+    expect(publish).toContain(
+      'expected_id="$(node -p \'require("./src-tauri/tauri.android.conf.json").identifier\')"',
+    );
+    expect(publish).toContain('[ "$actual_id" != "$expected_id" ]');
+    expect(publish).toContain('run: bash scripts/gate-android-release-behavior.sh');
+    expect(publish).toContain(
+      'run: node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+    );
+    expect(publish).toContain('name: android-release-mapping');
+    expect(publish).toContain(
+      'node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a',
+    );
+    expect(publish).toContain(
+      'python3 scripts/libbox-patches/verify-receipt.py --apk ${{ steps.asset.outputs.asset }} --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+    );
+    expect(publish).toContain('expected_sha="${{ steps.asset.outputs.sha256 }}"');
+    expect(publish).toContain('[ "$actual_sha" != "sha256:$expected_sha" ]');
+    expect(publish).toContain(
+      'signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}',
+    );
+    expect(publish).not.toContain('--draft=false');
+  });
+
+  it('最终清单包含从草稿回读的 APK，并与远端完整资产集合双向对账后才公开', () => {
+    const release = executable(jobBlock(workflow('package.yml'), 'release'));
+    const promote = stepBlock(release, 'Promote release to public');
+    const downloadAt = release.indexOf('gh release download "$TAG"');
+    const sumsAt = release.indexOf('- name: Generate combined SHA256SUMS');
+    const uploadSumsAt = release.indexOf('- name: Upload combined SHA256SUMS');
+    const verifyAt = release.indexOf('- name: Verify combined asset set and digests');
+    const promoteAt = release.indexOf('- name: Promote release to public');
+    const remoteTagRefetchAt = release.lastIndexOf('git fetch --force --depth=1 origin');
+    const publishCommandAt = release.indexOf(
+      'gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false',
+    );
+
+    expect(downloadAt).toBeGreaterThan(0);
+    expect(downloadAt).toBeLessThan(sumsAt);
+    expect(sumsAt).toBeLessThan(uploadSumsAt);
+    expect(uploadSumsAt).toBeLessThan(verifyAt);
+    expect(verifyAt).toBeLessThan(promoteAt);
+    expect(remoteTagRefetchAt).toBeGreaterThan(verifyAt);
+    expect(remoteTagRefetchAt).toBeLessThan(publishCommandAt);
+    expect(release).toContain('android_asset=polaris-${tag#v}-android-arm64.apk');
+    expect(promote).toContain(
+      'VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}',
+    );
+    expect(promote).toContain(
+      'ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}',
+    );
+    expect(release).toContain('[ "$downloaded_sha" = "$VERIFIED_ANDROID_SHA256" ]');
+    expect(release).toContain('[ "$manifest_rows" != "$VERIFIED_ANDROID_SHA256" ]');
+    expect(release).toContain('find . -type f ! -name SHA256SUMS');
+    expect(release).toContain("cat \"$sums\"");
+    expect(release).toContain(
+      `printf '%s  %s\\n' "$(sha256sum "$sums" | cut -d' ' -f1)" 'SHA256SUMS'`,
+    );
+    expect(release).toContain(
+      `pending="$(awk -F'\\t' '$1 == "MISSING" || $2 != "uploaded"' "$raw")"`,
+    );
+    expect(release).toContain("'SHA256SUMS'");
+    expect(release).toContain('diff -u "$expected" "$actual"');
+    expect(release.match(/gh api "\$api_url" --jq/g) ?? []).toHaveLength(2);
+    expect(release.match(/diff -u "\$expected" "\$actual"/g) ?? []).toHaveLength(2);
+    expect(release).toContain('拒绝覆盖 SHA256SUMS');
+    expect(release).toContain('公开紧前远端资产已被替换，拒绝公开');
+    expect(release).toContain('公开前 tag/release 身份漂移，拒绝继续');
+    expect(promote.indexOf('gh api "$api_url" --jq')).toBeLessThan(
+      promote.indexOf('diff -u "$expected" "$actual"'),
+    );
+    expect(promote.indexOf('diff -u "$expected" "$actual"')).toBeLessThan(
+      promote.indexOf('gh release edit "$TAG"'),
+    );
   });
 });

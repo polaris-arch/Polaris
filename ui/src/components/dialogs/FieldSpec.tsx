@@ -24,125 +24,35 @@ import { useTranslation } from 'react-i18next';
 import { Fold } from '@/components/Fold';
 import { InfoIcon } from '@/components/InfoIcon';
 import { Csel, type CselOption } from './Csel';
+/* 规格与草稿的纯数据层住在 `./field-spec`（零 import，两个客户端共用；拆分理由见那份文件头注）。
+   本文件把它**原样再导出**，故既有的 `from './FieldSpec'` 调用点一个字都不用改。 */
+import {
+  normalizeSelectOptions,
+  parseNumberField,
+  type FieldSpec,
+  type FormValue,
+  type FormValues,
+  type SelectOption,
+} from './field-spec';
 
-/** 表单草稿值域：文本/数值/开关/未填。number 空 = undefined（R2）。 */
-export type FormValue = string | number | boolean | undefined;
+export type { FieldSpec, FormValue, FormValues, SelectOption } from './field-spec';
+export { draftFromSpecs, normalizeSelectOptions, parseNumberField } from './field-spec';
 
 /**
- * select 的一个选项：`[值, 文案]`，可选第三位 = **不可选**（省略 ⇒ 可选）。
+ * select 选项元组 → `Csel` 选项对象。
  *
- * 为什么是「可选第三元素」而不是改成 `{value,label,disabled}` 对象：`Csel` 早就支持
- * `disabled`（点击拦截 `Csel.tsx:172`、键盘跳过 `:241`、样式与 `aria-disabled` `:315/318`），
- * 唯一断点就是本层把选项拍平成了二元组、表达不出禁用。而二元组字面量对
- * `[string, string, boolean?]` 天然可赋值 ⇒ 全仓 22 处 select 调用点的选项字面量**一处都没改**
- * （实测 `tsc --noEmit` 全绿），要禁用的那一处多写一位即可。改成对象则要么全量改写、
- * 要么两种形状并存。
- */
-export type SelectOption = readonly [value: string, label: string, disabled?: boolean];
-
-/** 表单草稿：键（FieldSpec.k）→ 值。协议特定字段的扁平袋，protoCodec 在此与 ServerConfig 往返。 */
-export type FormValues = Record<string, FormValue>;
-
-/** 字段描述符公共部分。`when` = 显隐谓词（通用：节点的 tls/reality 条件、规则的类型条件都用它）。 */
-interface FieldBase {
-  /** 草稿键（= protoCodec 读写的键）。 */
-  k: string;
-  /** 标签 i18n key。 */
-  label: string;
-  /** 显隐谓词（返回 false = 该字段在当前草稿下隐藏）。缺省恒显。 */
-  when?: (values: FormValues) => boolean;
-  /** 「可选」徽标。 */
-  opt?: boolean;
-  /**
-   * 字段说明：所有字段类型统一收进标签后的 `InfoIcon`，不在控件下方常驻铺开。
-   *
-   * 加这一支最初是因为「选了会怎样」有时**不能只靠标签表达**：endpoint 的前置代理是实例——
-   * WireGuard 的握手走 UDP，前置代理不支持 UDP 转发就**静默不通**（不回落直连，见
-   * `crates/config-engine/src/singbox/endpoint.rs` 的实测），而 Tailscale 那侧只需 TCP。
-   * 两句话不同、都必须能从控件旁到达，否则用户只能靠试。
-   *
-   * 提到 `FieldBase` 是因为 text/textarea 也有同样的需求，而此前它们**没有说明位**，于是说明
-   * 只能塞进标签：`node.field.h2Host` = 「HTTP/2 Host（逗号分隔，留空回落 SNI/节点地址）」。
-   * 这不是排版偏好问题 —— 标签是控件的**名字**，`styles/text-fit.test.ts` 给 `.fld-l` 定的 2 行预算
-   * 正是这条判据的具象（占到第 3 行就说明它其实是一句说明），而这四条恰恰是把预算刚好用满的那批。
-   * 「不为两个字段去扩 union」的旧结论（`node-spec.ts` h2 段的原注释）在字段涨到 4 条、且行数预算
-   * 把它顶出来之后不再成立。
-   */
-  hint?: string;
-}
-
-/**
- * 字段描述符（discriminated union，§1.4）。渲染器按 `t` 穷尽 switch。
- * 新增字段类型 → 加一支 union + 一个 case（never 兜底保证补全）。
- */
-export type FieldSpec =
-  | (FieldBase & { t: 'text'; ph?: string; mono?: boolean; secret?: boolean })
-  | (FieldBase & { t: 'number'; ph?: string; mono?: boolean })
-  | (FieldBase & { t: 'textarea'; ph?: string; mono?: boolean; rows?: number; secret?: boolean })
-  | (FieldBase & { t: 'select'; options: readonly SelectOption[] })
-  | (FieldBase & {
-      t: 'switch';
-      /**
-       * 禁用态 —— **静态布尔，不是谓词**，由构表处算好传进来（同 `SelectOption` 第三位 `disabled`
-       * 那条既定形态）。
-       *
-       * 为什么不做成 `when` 那样的谓词：`when` 是**调用方** filter 掉的
-       * （`spec.filter(f => !f.when || f.when(draft))`），而 `FieldRenderer` 只收到单个 spec，
-       * 拿不到整份草稿。要谓词就得再给渲染器传一个 `values` prop —— 那样「某个调用点忘了传」会把
-       * 禁用**静默退化成可用**，而这个开关禁用与否是阻断级的（见 WarpDialog 的 `advSpec`）。
-       * 静态值没有这条退化路径：表里写了就是写了。
-       */
-      disabled?: boolean;
-      /**
-       * 禁用时**取代** `hint` 的说明（讲「为什么不能开」）。缺省 ⇒ 仍显示 `hint`。
-       * 之所以是取代而非追加：`hint` 描述的是开启后的行为，而那件事在禁用场景下结构上永远不会发生，
-       * 照显等于对着一个拨不动的开关解释它拨动后会怎样。
-       */
-      disabledHint?: string;
-    });
-
-/**
- * number 字段解析 —— **全库唯一实现点（R2）**。
- *  - 空串（含纯空白）→ `undefined`：允许退格删空重录，不被压成 0；
- *  - 非空 → 十进制解析；解析失败（NaN/Infinity）→ `undefined`，**绝不硬塞 0**。
- * 抽为纯函数供 NumberField 分支与 NodeDialog 的 port 字段共用（单一逻辑），并入 vitest。
- */
-export function parseNumberField(raw: string): number | undefined {
-  const s = raw.trim();
-  if (s === '') return undefined;
-  const n = Number(s);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-/**
- * select 选项元组 → `Csel` 选项对象 —— **抽成函数是为了让它可测**。
- *
- * 本仓 vitest 是 `environment:'node'`（无 jsdom），`FieldRenderer` 渲染不了 ⇒ 这条映射若内联在
- * 组件里，「少映一个字段」不会被任何门发现：类型不红（少写属性是合法的）、build 不红、
- * 渲染测不了。`disabled` 正是这么一路从 `Csel`（早就支持）断在这一层的。抽出来即可直测。
- *
- * **未知当前值保留（`current`）**：选项集是**前端选的展示档位**，而磁盘上的值域由 sing-box/后端拥有
- * 且更宽（ss `method`、uTLS `fingerprint`、`vmessSecurity` 等都是开放集，Rust 侧就是 `String`）。
- * 存量/订阅节点的值落在表外时，若照直渲染，下拉是空选中态，用户**一碰就被迫改成表内某档**——
- * 静默改坏一个本来能用的节点，且没有撤销入口。故当前值不在表里就把它并入首位（值即文案，同
- * 上游 ss-form 的 `sortedMethods.unshift(field.value)`）。放在这一层而不是给 ss 打补丁：
- * `fp` / `sec` / `enc` / `cc` / `obfs` … 每个 select 都是同一类风险，逐个补必然漏。
- * 空串不并入 —— 它是「未设置」而非未知取值，且多张表里 `''` 本身就是合法首项（flow=none / bbr=默认）。
+ * **本体住在 `./field-spec#normalizeSelectOptions`**（零 import 纯函数，两个客户端共用）：
+ * 那里面的两条判据（点分键才翻译 / 未知当前值并入首位）此前在移动端 `forms/FormFields.tsx` 里
+ * 被抄了一份，连正则都逐字相同 —— 抄一份等于给同一个问题造第二个答案，而这类分叉本仓没有任何门。
+ * 本函数只剩「归一化选项 → `CselOption`」这一步类型收窄（`CselOption` 是超集），保留是为了
+ * 桌面既有的调用点与那批单测一个字都不用改。
  */
 export function toCselOptions(
   options: readonly SelectOption[],
   current?: FormValue,
   translate: (key: string) => string = (key) => key,
 ): CselOption[] {
-  const opts = options.map(([value, label, disabled]) => ({
-    value,
-    label: /^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(label) ? translate(label) : label,
-    disabled,
-  }));
-  if (typeof current === 'string' && current !== '' && !opts.some((o) => o.value === current)) {
-    opts.unshift({ value: current, label: current, disabled: undefined });
-  }
-  return opts;
+  return normalizeSelectOptions(options, current, translate);
 }
 
 export interface FieldRendererProps {
@@ -448,21 +358,6 @@ export function FormTabs({
       </div>
     </>
   );
-}
-
-/**
- * 从 FieldSpec 列表构造初始草稿（新增态默认）：select→首选项、switch→false、number→undefined、text→''。
- * fromConfig 在此之上覆盖存量值（编辑态），保证每个键都有合法默认、缺省不漏键。
- */
-export function draftFromSpecs(specs: readonly FieldSpec[]): FormValues {
-  const d: FormValues = {};
-  for (const f of specs) {
-    if (f.t === 'select') d[f.k] = f.options[0]?.[0] ?? '';
-    else if (f.t === 'switch') d[f.k] = false;
-    else if (f.t === 'number') d[f.k] = undefined;
-    else d[f.k] = '';
-  }
-  return d;
 }
 
 export default FieldRenderer;

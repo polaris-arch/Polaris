@@ -456,6 +456,158 @@ fn bundled_core_accepts_tailcat_derp_ips_in_tun_route_exclude() {
     }
 }
 
+/// **Android 回环入站带凭据**（本批 α）：六个探针/更新入站各带 `users`，整份配置随包核必须收下；
+/// 反向对照：把 `users` 写成类型不对的值（字符串而非数组），同一份配置必须被拒，且拒绝原因点名
+/// `users` —— 证明 check 真的解析到了这个键，绿不是因为它被跳过。
+///
+/// （实测：`users` **项内**的未知键内核照收 —— `auth.User` 不走严格解码，故对照不能用「项内塞未知键」。）
+#[test]
+fn bundled_core_accepts_credentialed_loopback_inbounds() {
+    use polaris_config_engine::singbox::InboundUser;
+    let Some(core) = core_or_skip("Android 回环入站凭据完整配置门") else {
+        return;
+    };
+    let temp = tempdir().expect("建 TempDir");
+    let mut case = load_cases()
+        .into_iter()
+        .find(|case| case.name == "probe 端口注入")
+        .expect("probe 端口 fixture 不得丢失");
+    case.name = "probe 端口注入（android + 回环凭据）".into();
+    case.platform = "android".into();
+    let mut deps = full_config_deps(&case, &temp);
+    deps.probe_direct_port = Some(21001);
+    deps.probe_proxy_port = Some(21002);
+    deps.update_in_port = Some(21003);
+    deps.subscription_update_in_port = Some(21004);
+    deps.probe_pool_ports = vec![21005, 21006];
+    deps.loopback_auth = Some(InboundUser {
+        username: "polaris".into(),
+        password: "0123456789abcdef0123456789abcdef".into(),
+    });
+    let cfg = generate_sing_box_config(&case.input, &BTreeMap::new(), &deps)
+        .unwrap_or_else(|e| panic!("android 回环凭据配置生成失败: {e}"));
+    let mut value = serde_json::to_value(&cfg).expect("序列化");
+    let with_users = value["inbounds"]
+        .as_array()
+        .expect("inbounds")
+        .iter()
+        .filter(|ib| ib.get("users").is_some())
+        .count();
+    assert_eq!(
+        with_users, 6,
+        "六个回环入站都必须带 users：{}",
+        value["inbounds"]
+    );
+
+    let path = temp.path().join("android-loopback-users.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("JSON 编码")).expect("写盘");
+    let (ok, diag) = check(&core, &path);
+    assert!(ok, "带凭据的回环入站被真核拒绝：{diag}");
+
+    // 反向对照：`users` 换成类型错误的值 ⇒ 必须被拒。
+    let first = value["inbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|ib| ib.get("users").is_some())
+        .unwrap();
+    first["users"] = json!("kernel-gate-users-not-an-array");
+    let bad = temp.path().join("android-loopback-users-bad.json");
+    std::fs::write(&bad, serde_json::to_vec_pretty(&value).expect("JSON 编码")).expect("写盘");
+    let (ok, diag) = check(&core, &bad);
+    assert!(
+        !ok,
+        "类型错误的 users 被核收下 —— check 没解析到 users，上面的绿无信息量"
+    );
+    assert!(
+        diag.contains("users"),
+        "拒绝原因不是目标字段，反向对照不可信：{diag}"
+    );
+}
+
+/// **Android 按应用「指定节点 / 阻断」**（A5）：route 里带 `package_name` 的完整 Android 配置，
+/// 随包核必须收下；反向对照：同一份配置把键名拼错成 `package_nam`，必须被拒且拒绝原因点名该键 ——
+/// 证明 check 真的走到了 route 规则的严格解码，上面那条绿不是因为它被跳过。
+///
+/// 射程：本机只有 linux 随包核（与 Android `libbox.aar` 同一版 alpha.8）。`option/` 零 build tag，
+/// 规则解码与 GOOS 无关（`core_schema_surface.rs` 头注的取证）；**匹配**（包名回填）只在真机上可验。
+#[test]
+fn bundled_core_accepts_android_package_name_app_rules() {
+    let temp = tempdir().expect("建 TempDir");
+    let mut case = load_cases()
+        .into_iter()
+        .find(|case| case.name == "systemProxy+smart+vless（基线）")
+        .expect("基线 fixture 不得丢失");
+    case.name = "android + 应用规则 proxy/block（package_name）".into();
+    case.platform = "android".into();
+    case.input.app_routing_enabled = Some(true);
+    case.input.app_rules = serde_json::from_value(json!([
+        {"appId": "telegram", "action": "proxy", "enabled": true},
+        {"appId": "netflix", "action": "block", "enabled": true}
+    ]))
+    .expect("appRules 夹具");
+    let deps = full_config_deps(&case, &temp);
+    let cfg = generate_sing_box_config(&case.input, &BTreeMap::new(), &deps)
+        .unwrap_or_else(|e| panic!("android package_name 配置生成失败: {e}"));
+    let mut value = serde_json::to_value(&cfg).expect("序列化");
+    // 正面：两条 package_name 规则逐字在场（不在场则下面的 check 量的不是本批的键）。
+    let rules = value["route"]["rules"]
+        .as_array()
+        .expect("route.rules")
+        .clone();
+    let pkg_rules: Vec<&Value> = rules
+        .iter()
+        .filter(|r| r.get("package_name").is_some())
+        .collect();
+    assert!(
+        pkg_rules
+            .iter()
+            .any(|r| r["package_name"] == json!(["org.telegram.messenger"])
+                && r["action"] == "route"),
+        "telegram proxy package_name 规则缺席：{pkg_rules:?}"
+    );
+    assert!(
+        pkg_rules
+            .iter()
+            .any(|r| r["package_name"] == json!(["com.netflix.mediaclient"])
+                && r["action"] == "reject"),
+        "netflix block package_name 规则缺席：{pkg_rules:?}"
+    );
+
+    let Some(core) = core_or_skip("Android package_name 应用规则完整配置门") else {
+        return;
+    };
+    let path = temp.path().join("android-package-name.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("JSON 编码")).expect("写盘");
+    let (ok, diag) = check(&core, &path);
+    assert!(ok, "带 package_name 的 Android 配置被真核拒绝：{diag}");
+
+    // 反向对照：键名拼错 ⇒ 必须被拒。
+    let target = value["route"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r.get("package_name").is_some())
+        .unwrap();
+    let pkgs = target
+        .as_object_mut()
+        .unwrap()
+        .remove("package_name")
+        .unwrap();
+    target["package_nam"] = pkgs;
+    let bad = temp.path().join("android-package-name-typo.json");
+    std::fs::write(&bad, serde_json::to_vec_pretty(&value).expect("JSON 编码")).expect("写盘");
+    let (ok, diag) = check(&core, &bad);
+    assert!(
+        !ok,
+        "拼错的 package_nam 被核收下 —— check 没严格解码 route 规则，上面的绿无信息量"
+    );
+    assert!(
+        diag.contains("package_nam"),
+        "拒绝原因不是目标字段，反向对照不可信：{diag}"
+    );
+}
+
 /// 网络场景规则全形态（system/dhcp × DNS/流量 × inline/logical/外化）逐平台生成，完整配置喂 `check`。
 ///
 /// `check` 只 decode + initialize，**拦不住环境项的坏引用**（Start 才解析，spec K3）——那一格归

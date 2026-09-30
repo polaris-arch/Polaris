@@ -150,19 +150,39 @@ fn payload_stamp_requires_the_core_file() {
     assert!(payload_stamp(payload.path(), "sing-box").is_err());
 }
 
+/// 受保护核目录只有 mac / linux / win 有。
+///
+/// false 的理由**各不相同**，写在一起只是因为答案相同：Android 根本没有核文件（进程内 `.so`）；
+/// `Other` 没有 helper，因而不可能有 helper 锁定的目录（2026-09-05 由 true 改，理由见谓词文档）。
+/// 正对照是三条 true —— 少了它，「谓词整个坏掉、全平台 false」会把这条测试骗绿，而那会让桌面的
+/// `install-core` 提升整条静默停摆。
 #[test]
-fn every_platform_has_a_protected_core() {
+fn protected_core_is_mac_linux_and_windows_only() {
     // P4：Windows 由 `false` 翻成 `true` —— 不是把判据改软，而是那个 `false` 描述的事实已不存在
     //（helper 实现了 install-core，ImagePath 改指 `<support>\core\sing-box.exe`）。
-    // 真正守住这条腿的不是本断言，而是下面那条：受保护核路径必须由 `InstallPaths` 派生。
     assert!(platform_has_protected_core(Platform::Win));
     assert!(platform_has_protected_core(Platform::Mac));
     assert!(platform_has_protected_core(Platform::Linux));
-    assert!(platform_has_protected_core(Platform::Other));
+    assert!(!platform_has_protected_core(Platform::Android));
+    assert!(
+        !platform_has_protected_core(Platform::Other),
+        "未知平台没有 helper（`runtime/helper.rs::platform_supported` 恒 false），\
+         也就不可能有由 helper 创建并锁定的受保护核目录"
+    );
+
+    let with_protected: Vec<Platform> = Platform::ALL
+        .iter()
+        .copied()
+        .filter(|p| platform_has_protected_core(*p))
+        .collect();
+    assert_eq!(
+        with_protected,
+        vec![Platform::Mac, Platform::Win, Platform::Linux]
+    );
 }
 
-/// 上一条翻成恒真后，「Win 到底把核放哪」必须另有一条**正面**断言接管 —— 否则
-/// `platform_has_protected_core` 恒真只是一句空话：它不说那个目录在哪。
+/// 上一条翻成真后，「Win 到底把核放哪」必须另有一条**正面**断言接管 —— 否则
+/// `platform_has_protected_core(Win)` 只是一句空话：它不说那个目录在哪。
 ///
 /// app 侧起核前对账（`reconcile_protected_core` → `sha256_file(dest)`）读的目录来自
 /// `HelperRuntime::protected_core_dir_path()` = `InstallPaths::for_platform(Win).core_dir`，

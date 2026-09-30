@@ -1,5 +1,5 @@
-/** Saving an exit choice does not prove that the running core applied it. */
+/** Backend receipt for an explicit exit selection. Saving the choice is not proof that the live core applied it. */
 export interface ServerSwitchReceipt {
-  status: 'applied' | 'pending' | 'notRunning' | 'deferred' | 'superseded';
+  status: 'applied' | 'pending' | 'restarting' | 'notRunning' | 'deferred' | 'superseded';
   reason?: 'nodeRequiresApply';
 }

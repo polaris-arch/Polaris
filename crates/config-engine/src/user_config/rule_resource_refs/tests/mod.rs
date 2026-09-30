@@ -188,6 +188,7 @@ fn ref_via_custom_app_preset_uses_name_and_flags_non_builtin() {
         geosite_tags: vec!["foo".into()],
         geoip_tags: vec![],
         process_names: None,
+        package_names: vec![],
         category: Some("tools".into()),
     }];
     let input = RefScanInput {

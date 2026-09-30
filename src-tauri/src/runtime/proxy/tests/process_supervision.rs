@@ -1,5 +1,1074 @@
 use super::*;
 
+mod direct_stop;
+mod native_direct_stop;
+
+#[cfg(target_os = "linux")]
+struct BirthDaemonStream {
+    inner: polaris_helper_client::MockStream,
+    frames: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl polaris_helper_client::ConnectionStream for BirthDaemonStream {
+    fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.inner.read_until_timeout(buf)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(data)?;
+        self.frames
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(data).into_owned());
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown()
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct BirthDaemonConnector {
+    replies: Mutex<std::collections::VecDeque<polaris_helper_client::MockStream>>,
+    frames: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl polaris_helper_client::Connector for BirthDaemonConnector {
+    fn connect(
+        &self,
+    ) -> Result<Box<dyn polaris_helper_client::ConnectionStream>, polaris_helper_client::ClientError>
+    {
+        let reply = self.replies.lock().unwrap().pop_front().ok_or_else(|| {
+            polaris_helper_client::ClientError::Connect("mock daemon exhausted".into())
+        })?;
+        Ok(Box::new(BirthDaemonStream {
+            inner: reply,
+            frames: Arc::clone(&self.frames),
+        }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn birth_daemon_runtime(
+    replies: impl IntoIterator<Item = String>,
+) -> (Arc<ProxyRuntime>, TestDir, Arc<Mutex<Vec<String>>>) {
+    let dir = fresh_test_dir();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let connector = BirthDaemonConnector {
+        replies: Mutex::new(
+            replies
+                .into_iter()
+                .map(|line| polaris_helper_client::MockStream::with_response(line.into_bytes()))
+                .collect(),
+        ),
+        frames: Arc::clone(&frames),
+    };
+    let helper = crate::runtime::helper::HelperRuntime::with_test_connector_for_tests(
+        dir.clone(),
+        installed_helper_status(false),
+        Arc::new(connector),
+    );
+    (test_runtime_in_on(dir.clone(), helper), dir, frames)
+}
+
+fn android_target(run_id: &str) -> super::super::android_bridge::AndroidExactTarget {
+    super::super::android_bridge::AndroidExactTarget {
+        run_id: run_id.to_owned(),
+        birth_nonce: format!("nonce-{run_id}"),
+    }
+}
+
+fn spawn_custody_stand_in() -> tokio::process::Child {
+    let mut command = if cfg!(windows) {
+        let mut command = tokio::process::Command::new("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+        command
+    } else {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        command
+    };
+    command
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn local custody stand-in")
+}
+
+#[tokio::test]
+async fn main_birth_follows_real_direct_child_through_confirmed_stop() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-main").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    let run =
+        DirectCoreRun::with_main_token(spawn_custody_stand_in(), RunIdentity::new(), token.clone());
+    rt.child.lock().unwrap().install_running_for_test(run);
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-main", true));
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    assert!(!rt.mesh.main_owns_tailscale("ts-main", true));
+    assert!(!rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn legacy_helper_ack_keeps_main_birth_and_backend_custody() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-helper").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token.clone()))
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .finish_helper_start(&attempt, Some(7123)));
+    *rt.pid.lock().unwrap() = Some(7123);
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    let (failed, _, _) = RecordingStop::new(Err("no helper ACK".into()));
+    assert!(rt
+        .kill_core_via_helper(failed as Arc<dyn HelperStopOps>)
+        .await
+        .is_err());
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-helper", true));
+    let (retry, calls, wants) = RecordingStop::new(Ok(()));
+    let error = rt
+        .kill_core_via_helper_with_main(retry as Arc<dyn HelperStopOps>, Some(&gate))
+        .await
+        .unwrap_err();
+    assert!(error.contains("legacy Stop ACK"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*wants.lock().unwrap(), vec![Some(7123)]);
+    assert!(rt.main_token_for_stop().unwrap().is_some());
+    assert!(
+        rt.mesh.main_owns_tailscale("ts-helper", true),
+        "local registry is not itself a helper ACK"
+    );
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    assert_eq!(*rt.pid.lock().unwrap(), Some(7123));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn exact_helper_main_mismatch_retains_custody_then_retries_production_birth_transport() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::HelperStartResult;
+    let pid = 7123;
+    let hex = "00112233445566778899aabbccddeeff";
+    let target = exact_helper_target(pid, hex);
+    let (rt, _dir, frames) = birth_daemon_runtime([
+        format!("OK birth-stopped {pid} {hex}\n"),
+        format!("OK birth-stopped {pid} {hex}\n"),
+    ]);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("helper-main-compare").unwrap();
+    let generated =
+        serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]});
+    let original = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, original.clone())
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(original.clone()))
+        .unwrap();
+    HelperStartCompletion::for_test(&rt, attempt.clone())
+        .publish(&Ok(HelperStartResult::BirthStarted(target)))
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&original, &gate)
+        .unwrap());
+    let successor = rt.mesh.mint_tailscale_main_birth();
+    let mut replacement = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, successor.clone())
+        .await
+        .unwrap();
+    replacement.arm_external_start();
+    drop(replacement);
+    assert!(rt
+        .kill_core_and_release_main(&gate)
+        .await
+        .unwrap_err()
+        .contains("main claim birth changed"));
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    assert!(!rt.child.lock().unwrap().helper_stop_inflight_for_test());
+    assert_eq!(*rt.pid.lock().unwrap(), Some(pid));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&original)));
+    assert!(
+        rt.mesh
+            .release_tailscale_main_states_if_token(&successor, &gate)
+            .unwrap(),
+        "the successor main claim was untouched"
+    );
+    let mut restored = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, original)
+        .await
+        .unwrap();
+    restored.arm_external_start();
+    drop(restored);
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    assert!(!rt.mesh.main_owns_tailscale("helper-main-compare", true));
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert_eq!(*rt.pid.lock().unwrap(), None);
+    assert!(
+        rt.core_via_helper.load(Ordering::SeqCst),
+        "native birth exit does not attest platform NoOwner"
+    );
+    assert_eq!(
+        *frames.lock().unwrap(),
+        vec![format!("stop-birth-safe\n{pid}\n{hex}\n"); 2]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_detached_android_start_retains_unknown_birth_after_late_reply() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    rt.book_android_global_start(Some(token.clone())).unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    // Same topology as call_with_budget: dropping the waiter does not cancel
+    // the queued bridge task. A late Start success cannot confirm that waiter.
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let reached = Arc::new(tokio::sync::Semaphore::new(0));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let late = tokio::spawn({
+        let release = release.clone();
+        let reached = reached.clone();
+        async move {
+            reached.add_permits(1);
+            release.acquire().await.unwrap().forget();
+            let _ = done_tx.send(());
+        }
+    });
+    reached.acquire().await.unwrap().forget();
+    drop(late);
+    release.add_permits(1);
+    done_rx.await.unwrap();
+    assert!(
+        !rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .start_confirmed
+    );
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .exact_target
+        .is_none());
+    assert!(rt.begin_android_stop_booking(true).is_err());
+    assert!(rt.book_android_global_start(None).is_err());
+    assert!(rt.mesh.main_owns_tailscale("ts-android", true));
+}
+
+#[tokio::test]
+async fn android_exact_receipt_stays_with_its_request_birth() {
+    let (rt, _dir) = test_runtime();
+    let a = rt.book_android_global_start(None).unwrap();
+    let valid_a = android_target("android-a");
+    let invalid = super::super::android_bridge::AndroidExactTarget {
+        run_id: "android-a".into(),
+        birth_nonce: " ".into(),
+    };
+    assert!(rt.confirm_android_global_start(&a, invalid).is_err());
+    assert!(
+        !rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .start_confirmed
+    );
+    assert!(rt.begin_android_stop_booking(true).is_err());
+
+    rt.confirm_android_global_start(&a, valid_a.clone())
+        .unwrap();
+    rt.confirm_android_global_start(&a, valid_a.clone())
+        .unwrap();
+    assert!(rt
+        .confirm_android_global_start(&a, android_target("android-a-different"))
+        .is_err());
+    assert_eq!(
+        rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exact_target,
+        Some(valid_a.clone())
+    );
+
+    let stop_a = rt.begin_android_stop_booking(true).unwrap();
+    stop_a.finish_without_main(Ok(())).unwrap();
+    let b = rt.book_android_global_start(None).unwrap();
+    assert!(rt.confirm_android_global_start(&a, valid_a).is_err());
+    {
+        let custody = rt.android_main_token.lock().unwrap();
+        let current = custody.as_ref().unwrap();
+        assert!(current.birth.same(&b));
+        assert!(!current.start_confirmed);
+        assert!(current.exact_target.is_none());
+    }
+    assert!(rt.begin_android_stop_booking(true).is_err());
+    let valid_b = android_target("android-b");
+    rt.confirm_android_global_start(&b, valid_b.clone())
+        .unwrap();
+    assert_eq!(
+        rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exact_target,
+        Some(valid_b)
+    );
+}
+
+#[tokio::test]
+async fn typed_pre_dispatch_retirement_releases_only_exact_android_custody_and_ts_claim() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-endpoint-retired").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let first = rt.book_android_global_start(Some(token)).unwrap();
+    reservation.arm_external_start();
+    assert!(rt.mesh.main_owns_tailscale("ts-endpoint-retired", true));
+    rt.abandon_android_global_start_without_birth(&first)
+        .unwrap();
+    reservation.confirmed_no_external_writer();
+    drop(reservation);
+    assert!(!rt.mesh.main_owns_tailscale("ts-endpoint-retired", true));
+
+    let second = rt.book_android_global_start(None).unwrap();
+    assert!(rt
+        .abandon_android_global_start_without_birth(&first)
+        .is_err());
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .birth
+        .same(&second));
+    rt.confirm_android_global_start(&second, android_target("new-core"))
+        .unwrap();
+    assert!(rt
+        .abandon_android_global_start_without_birth(&second)
+        .is_err());
+}
+
+#[test]
+fn no_birth_retirement_never_erases_unknown_android_custody() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    rt.android_main_token
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .historic_unknown = true;
+    assert!(rt
+        .abandon_android_global_start_without_birth(&birth)
+        .is_err());
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .birth
+        .same(&birth));
+}
+
+#[test]
+fn retired_system_start_port_retries_with_fresh_port_and_stop_supersedes_old_birth() {
+    use polaris_core_supervisor::port_bookkeeping::{
+        FreePortProvider, PortAllocator, PortExclusions, PrimaryApiPortLedger,
+    };
+    use std::collections::VecDeque;
+
+    struct Ports(Mutex<VecDeque<u16>>);
+    impl FreePortProvider for Ports {
+        fn try_allocate(&self) -> Option<u16> {
+            self.0.lock().unwrap().pop_front()
+        }
+    }
+
+    let (rt, _dir) = test_runtime();
+    let ledger = PrimaryApiPortLedger::default();
+    let allocator = PortAllocator::new(Ports(Mutex::new(VecDeque::from([20_001, 20_001, 20_002]))))
+        .with_max_attempts(2);
+    let exclusions = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let generation = rt.gate.generation();
+
+    // A previous SystemStart used P before Rust's ledger existed. Rust first
+    // proposes P; Kotlin rejects it before VpnBridge.beginStart/native birth.
+    let first_port = ledger.allocate(&allocator, &exclusions).unwrap().port;
+    assert_eq!(first_port, 20_001);
+    let first = rt
+        .book_android_global_start_for_generation(generation, None)
+        .unwrap()
+        .unwrap();
+    rt.abandon_android_global_start_without_birth(&first)
+        .unwrap();
+
+    // A Stop/successor generation at this point must prevent the old request
+    // from booking or dispatching another native birth.
+    rt.gate.bump_generation();
+    assert!(rt
+        .book_android_global_start_for_generation(generation, None)
+        .unwrap()
+        .is_none());
+    assert!(rt.android_main_token.lock().unwrap().is_none());
+
+    // A fresh bridge Start remains possible. Even if the provider offers P
+    // again, the process ledger keeps it retired and picks Q.
+    let fresh_port = ledger.allocate(&allocator, &exclusions).unwrap().port;
+    assert_eq!(fresh_port, 20_002);
+    let second = rt
+        .book_android_global_start_for_generation(rt.gate.generation(), None)
+        .unwrap()
+        .unwrap();
+    assert!(!first.same(&second));
+}
+
+#[tokio::test]
+async fn cancelled_detached_android_stop_keeps_s2_ack_from_releasing_birth() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android-stop").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let birth = rt.book_android_global_start(Some(token.clone())).unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    rt.confirm_android_global_start(&birth, android_target("android-stop"))
+        .unwrap();
+    let queued = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let s1_waiter = tokio::spawn({
+        let rt = rt.clone();
+        let queued = queued.clone();
+        let release = release.clone();
+        async move {
+            let booking = rt.begin_android_stop_booking(true).unwrap();
+            let detached = tokio::spawn(async move {
+                queued.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                let _ = done_tx.send(());
+            });
+            detached.await.unwrap();
+            drop(booking);
+        }
+    });
+    queued.acquire().await.unwrap().forget();
+    s1_waiter.abort();
+    assert!(s1_waiter.await.is_err());
+    // A second global Stop may ACK; S1 may still be delivered afterwards.
+    let s2 = rt.begin_android_stop_booking(true).unwrap();
+    assert!(s2.finish_with_gate(Ok(()), &rt.mesh, &gate).is_err());
+    release.add_permits(1);
+    done_rx.await.unwrap();
+    assert!(
+        rt.android_main_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .historic_unknown
+    );
+    assert!(rt.mesh.main_owns_tailscale("ts-android-stop", true));
+}
+
+#[tokio::test]
+async fn certain_android_stop_ack_removes_matching_ts_and_global_birth_together() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android-certain").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    let birth = rt.book_android_global_start(Some(token.clone())).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-certain"))
+        .unwrap();
+    let booking = rt.begin_android_stop_booking(true).unwrap();
+    assert!(rt.admit_android_global_custody().is_err());
+    booking.finish_with_gate(Ok(()), &rt.mesh, &gate).unwrap();
+    assert!(!rt.mesh.main_owns_tailscale("ts-android-certain", true));
+    assert!(rt.android_main_token.lock().unwrap().is_none());
+    assert!(!rt
+        .mesh
+        .release_tailscale_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn android_stop_ack_cannot_clear_a_successor_registry_birth() {
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-android-successor").unwrap();
+    let generated =
+        serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]});
+    let old = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, old.clone())
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    let birth = rt.book_android_global_start(Some(old.clone())).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-successor"))
+        .unwrap();
+    let old_stop = rt.begin_android_stop_booking(true).unwrap();
+
+    // Deliberately bypass admission in this fixture to model a successor
+    // registry claim that an old asynchronous ACK must never erase.
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&old, &gate)
+        .unwrap());
+    let new = rt.mesh.mint_tailscale_main_birth();
+    let mut successor = rt
+        .mesh
+        .reserve_tailscale_main_states(&generated, &gate, new.clone())
+        .await
+        .unwrap();
+    successor.arm_external_start();
+    drop(successor);
+    assert!(old_stop.finish_with_gate(Ok(()), &rt.mesh, &gate).is_err());
+    assert!(rt.mesh.main_owns_tailscale("ts-android-successor", true));
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(rt
+        .mesh
+        .release_tailscale_main_states_if_token(&new, &gate)
+        .unwrap());
+}
+
+#[tokio::test]
+async fn no_ts_android_start_and_stop_still_hold_global_birth() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(rt.begin_android_stop_booking(true).is_err());
+    rt.confirm_android_global_start(&birth, android_target("android-no-ts"))
+        .unwrap();
+    let stop = rt.begin_android_stop_booking(true).unwrap();
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(stop.finish_without_main(Ok(())).is_ok());
+    assert!(rt.admit_android_global_custody().is_ok());
+    assert!(rt.book_android_global_start(None).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_android_claim_preempts_an_older_preflight_before_booking() {
+    let (rt, _dir) = test_runtime();
+    let a_preflight = Arc::new(tokio::sync::Semaphore::new(0));
+    let b_claimed = Arc::new(tokio::sync::Semaphore::new(0));
+    let a = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        let a_preflight = Arc::clone(&a_preflight);
+        let b_claimed = Arc::clone(&b_claimed);
+        async move {
+            let _ts_gate = rt.mesh.tailscale_state_gate().await;
+            let generation = rt.claim_android_global_start_generation().unwrap();
+            a_preflight.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(3), b_claimed.acquire())
+                .await
+                .expect("B must claim while A is in preflight")
+                .unwrap()
+                .forget();
+            rt.book_android_global_start_for_generation(generation, None)
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), a_preflight.acquire())
+        .await
+        .expect("A must reach preflight")
+        .unwrap()
+        .forget();
+    let b_generation = rt.claim_android_global_start_generation().unwrap();
+    b_claimed.add_permits(1);
+    assert!(
+        a.await.unwrap().is_none(),
+        "obsolete A must dispatch no IPC"
+    );
+    assert!(rt.android_main_token.lock().unwrap().is_none());
+    let _ts_gate = rt.mesh.tailscale_state_gate().await;
+    assert!(rt
+        .book_android_global_start_for_generation(b_generation, None)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn booked_android_birth_blocks_a_new_claim_before_generation_changes() {
+    let (rt, _dir) = test_runtime();
+    let a_booked = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_a = Arc::new(tokio::sync::Semaphore::new(0));
+    let a = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        let a_booked = Arc::clone(&a_booked);
+        let release_a = Arc::clone(&release_a);
+        async move {
+            let _ts_gate = rt.mesh.tailscale_state_gate().await;
+            let generation = rt.claim_android_global_start_generation().unwrap();
+            let birth = rt
+                .book_android_global_start_for_generation(generation, None)
+                .unwrap()
+                .unwrap();
+            a_booked.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(3), release_a.acquire())
+                .await
+                .expect("B must inspect A's booked birth")
+                .unwrap()
+                .forget();
+            birth
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), a_booked.acquire())
+        .await
+        .expect("A must book before B claims")
+        .unwrap()
+        .forget();
+    let owned_generation = rt.gate.generation();
+    assert!(rt.claim_android_global_start_generation().is_err());
+    assert_eq!(rt.gate.generation(), owned_generation);
+    release_a.add_permits(1);
+    let booked = a.await.unwrap();
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .birth
+        .same(&booked));
+}
+
+#[tokio::test]
+async fn no_ts_android_detached_stop_and_cold_sweep_remain_sticky() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-sticky"))
+        .unwrap();
+    let s1 = rt.begin_android_stop_booking(true).unwrap();
+    drop(s1);
+    let s2 = rt.begin_android_stop_booking(true).unwrap();
+    assert!(s2.finish_without_main(Ok(())).is_err());
+    assert!(rt.admit_android_global_custody().is_err());
+    assert!(rt.book_android_global_start(None).is_err());
+
+    let (fresh, _dir) = test_runtime();
+    let cold = fresh.begin_android_stop_booking(false).unwrap();
+    assert!(fresh.admit_android_global_custody().is_err());
+    drop(cold);
+    let retry = fresh.begin_android_stop_booking(false).unwrap();
+    assert!(retry.finish_without_main(Ok(())).is_err());
+    assert!(fresh.admit_android_global_custody().is_err());
+}
+
+#[tokio::test]
+async fn stale_android_stop_nonce_cannot_clear_a_later_booking() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.book_android_global_start(None).unwrap();
+    rt.confirm_android_global_start(&birth, android_target("android-stale-stop"))
+        .unwrap();
+    let stale = rt.begin_android_stop_booking(true).unwrap();
+    {
+        // Force the state a cancelled S1 would leave while retaining a stale
+        // test handle, so a late old ACK exercises the nonce comparison.
+        let mut guard = rt.android_main_token.lock().unwrap();
+        let attempt = guard.as_mut().unwrap();
+        attempt.stop_inflight = None;
+        attempt.historic_unknown = true;
+    }
+    let current = rt.begin_android_stop_booking(true).unwrap();
+    let current_nonce = rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .stop_inflight
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(stale.finish_without_main(Ok(())).is_err());
+    assert!(rt
+        .android_main_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .stop_inflight
+        .as_ref()
+        .is_some_and(|nonce| Arc::ptr_eq(nonce, &current_nonce)));
+    assert!(current.finish_without_main(Ok(())).is_err());
+    assert!(rt.admit_android_global_custody().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers() {
+    let (rt, _dir) = test_runtime();
+    let wrong = RunIdentity::new();
+    assert!(matches!(
+        rt.child
+            .lock()
+            .unwrap()
+            .reserve_stopping_without_worker_for_test(&wrong),
+        Err(ReserveStoppingError::Empty)
+    ));
+    assert!(rt.child.lock().unwrap().is_empty());
+
+    let run = DirectCoreRun::new(spawn_custody_stand_in());
+    let identity = run.identity.clone();
+    let pid = run.child_id_for_test().expect("stand-in PID");
+    assert!(rt.child.lock().unwrap().install_running(run).is_ok());
+    assert!(matches!(
+        rt.child
+            .lock()
+            .unwrap()
+            .reserve_stopping_without_worker_for_test(&wrong),
+        Err(ReserveStoppingError::WrongRun)
+    ));
+    assert!(rt.child.lock().unwrap().running_matches(&identity));
+    assert!(rt.child.lock().unwrap().empty_for_install().is_none());
+
+    let Err(rejected) = rt
+        .child
+        .lock()
+        .unwrap()
+        .install_running(DirectCoreRun::new(spawn_custody_stand_in()))
+    else {
+        panic!("Running rejects replacement and returns its Child");
+    };
+    let mut returned_child = rejected.into_child_for_test();
+    assert!(returned_child.id().is_some());
+    returned_child.kill().await.expect("reap rejected Child");
+
+    rt.spawn_crash_monitor(rt.gate.generation(), Some(identity.clone()));
+    let observation = rt
+        .child
+        .lock()
+        .unwrap()
+        .reserve_stopping_without_worker_for_test(&identity)
+        .expect("the exact Running identity reserves Stopping");
+    assert!(observation.same_run(&identity));
+    drop(observation);
+    assert!(rt.child.lock().unwrap().is_stopping_for_test());
+    assert!(rt.child.lock().unwrap().empty_for_install().is_none());
+    assert!(pid_alive(pid), "dropping observation cannot release Child");
+    assert!(matches!(
+        rt.child
+            .lock()
+            .unwrap()
+            .reserve_stopping_without_worker_for_test(&identity),
+        Err(ReserveStoppingError::Busy)
+    ));
+    assert!(matches!(
+        rt.child.lock().unwrap().take_running_legacy(),
+        Err(TakeRunningError::Stopping)
+    ));
+    assert!(!rt.child.lock().unwrap().is_running_alive());
+    assert!(!rt.child.lock().unwrap().running_matches(&identity));
+    assert!(!rt.child.lock().unwrap().running_exit_proven(&identity));
+
+    let Err(rejected) = rt
+        .child
+        .lock()
+        .unwrap()
+        .install_running(DirectCoreRun::new(spawn_custody_stand_in()))
+    else {
+        panic!("Stopping rejects replacement and returns its Child");
+    };
+    let mut returned_child = rejected.into_child_for_test();
+    assert!(returned_child.id().is_some());
+    returned_child.kill().await.expect("reap rejected Child");
+    assert!(
+        rt.kill_core().await.is_err(),
+        "legacy Stop cannot take Stopping"
+    );
+    assert!(
+        pid_alive(pid),
+        "legacy Stop cannot signal the reserved Child"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while Arc::strong_count(&identity.0) != 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the old crash monitor retires when its run is Stopping");
+    assert_eq!(rt.crash_lock().restart_count(), 0);
+    assert!(rt.child.lock().unwrap().is_stopping_for_test());
+    assert!(pid_alive(pid));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn occupied_direct_slot_rejects_start_before_retiring_old_session() {
+    let (rt, _dir, clearer_calls) = test_runtime_recording();
+    let run = DirectCoreRun::new(spawn_custody_stand_in());
+    let identity = run.identity.clone();
+    let pid = run.child_id_for_test().expect("old core PID");
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        ..Default::default()
+    };
+    rt.set_race_server(5353, vec!["1.1.1.1".into()], vec![443]);
+    rt.core_via_helper.store(true, Ordering::SeqCst);
+    let old_generation = rt.gate.generation();
+    let starter = {
+        let mut slot = rt.child.lock().unwrap();
+        let starter = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move { rt.start(local_only_config(free_port())).await })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while rt.crash_recovery.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "start must reach crash→Child admission"
+            );
+            std::thread::yield_now();
+        }
+        slot.install_running_for_test(run);
+        starter
+    };
+
+    let error = starter
+        .await
+        .expect("start task completes")
+        .expect_err("occupied slot must reject a second start");
+    assert!(error.admission_denied);
+    assert_eq!(rt.gate.generation(), old_generation);
+    assert_eq!(clearer_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(rt.race_server_port(), 5353);
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.status().running);
+    assert!(rt.child.lock().unwrap().running_matches(&identity));
+    assert!(pid_alive(pid));
+
+    rt.core_via_helper.store(false, Ordering::SeqCst);
+    let mut old_run = rt.child.lock().unwrap().take_running_for_test().unwrap();
+    old_run
+        .child_for_test()
+        .kill()
+        .await
+        .expect("reap old stand-in");
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn helper_attempt_rejects_explicit_start_before_claim_or_crash_reset() {
+    for known in [false, true] {
+        let (rt, _dir) = test_runtime();
+        let attempt = rt.register_helper_start_backend().unwrap();
+        assert!(rt
+            .child
+            .lock()
+            .unwrap()
+            .finish_helper_start(&attempt, known.then_some(4242)));
+        if known {
+            *rt.pid.lock().unwrap() = Some(4242);
+        }
+        rt.crash_lock().mark_user_aborted();
+        let generation = rt.gate.generation();
+        let sweeps = rt.stale_sweep_runs.load(Ordering::SeqCst);
+        let restart_count = rt.crash_lock().restart_count();
+
+        let error = rt
+            .start(local_only_config(free_port()))
+            .await
+            .expect_err("an unresolved helper attempt must deny explicit Start");
+        assert!(error.admission_denied);
+        assert_eq!(rt.gate.generation(), generation);
+        assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
+        assert!(rt.crash_lock().auto_restart_aborted());
+        assert_eq!(rt.crash_lock().restart_count(), restart_count);
+        assert!(rt.core_via_helper.load(Ordering::SeqCst));
+        assert_eq!(*rt.pid.lock().unwrap(), known.then_some(4242));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn occupied_direct_slot_rechecks_after_waiting_for_ts_gate() {
+    let (rt, _dir, clearer_calls) = test_runtime_recording();
+    let held_gate = rt.mesh.tailscale_state_gate().await;
+    let old_generation = rt.gate.generation();
+    let starter = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.start(local_only_config(free_port())).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while rt.gate.generation() == old_generation {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("start claims a generation before waiting for the TS gate");
+
+    let run = DirectCoreRun::new(spawn_custody_stand_in());
+    let identity = run.identity.clone();
+    let pid = run.child_id_for_test().expect("old core PID");
+    rt.child.lock().unwrap().install_running_for_test(run);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        ..Default::default()
+    };
+    rt.set_race_server(5353, vec!["1.1.1.1".into()], vec![443]);
+    drop(held_gate);
+
+    let error = starter
+        .await
+        .expect("start task completes")
+        .expect_err("late occupied slot must reject before preflight");
+    assert!(error.admission_denied);
+    assert_eq!(clearer_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(rt.race_server_port(), 5353);
+    assert!(rt.status().running);
+    assert!(rt.child.lock().unwrap().running_matches(&identity));
+    assert!(pid_alive(pid));
+
+    let mut old_run = rt.child.lock().unwrap().take_running_for_test().unwrap();
+    old_run
+        .child_for_test()
+        .kill()
+        .await
+        .expect("reap old stand-in");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newly_claimed_start_supersedes_an_old_direct_spawn() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let held_gate = rt.mesh.tailscale_state_gate().await;
+    let old_generation = rt.gate.generation();
+    let starter = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.start(local_only_config(free_port())).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while rt.gate.generation() == old_generation {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new start claims while the direct slot is Empty");
+
+    // The previous start reaches its Child critical section only after this
+    // claim. It must see the newer generation and leave the slot Empty.
+    {
+        let slot = rt.child.lock().unwrap();
+        assert!(slot.is_empty());
+        assert_ne!(rt.gate.generation(), old_generation);
+    }
+    let old_result = rt
+        .start_inner(local_only_config(free_port()), old_generation, &held_gate)
+        .await
+        .expect("superseded start yields without a Child");
+    assert!(!old_result.running);
+    assert!(rt.child.lock().unwrap().is_empty());
+
+    drop(held_gate);
+    let _ = starter.await.expect("new start task completes");
+}
+
 /// ⑩ stale-core 清扫：**本 app** 孤儿被清 + **非本 app** 的 sing-box **不被误杀**（最关键的安全点）。
 ///
 /// - 「本 app 孤儿」= 用 `POLARIS_SINGBOX_PATH` 指向的核二进制直接 spawn（不经 ProxyRuntime → 无句柄管理）。
@@ -88,6 +1157,188 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
 
 use std::sync::atomic::AtomicUsize;
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_replacement() {
+    use crate::runtime::config::{ApplyCasExpected, ApplyPersistError};
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyStep};
+    use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
+    use polaris_store::mesh_guard::{POLICY_KEY, REQUIRED_MARKER_FILE, STATE_KEY};
+
+    let (rt, dir) = test_runtime();
+    let wire: Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
+    ))
+    .unwrap();
+    let mut raw = polaris_store::store::default_config();
+    raw[POLICY_KEY] = wire[POLICY_KEY].clone();
+    raw[STATE_KEY] = wire[STATE_KEY].clone();
+    raw[STATE_KEY]["revision"] = serde_json::json!("1");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&serde_json::json!({
+            "phase": "enabled",
+            "localId": raw[STATE_KEY]["localId"],
+            "legacyConfigDigest": "0".repeat(64),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let version = crate::commands::config::config_version(&raw);
+    let plan = ManagedMeshRoutePlan {
+        schema_version: 1,
+        plan_id: "run-identity-cas".into(),
+        config_version: version.clone(),
+        input_state_revision: "1".into(),
+        identity_bindings: vec![],
+        protected_cidrs: vec![],
+        owner_routes: vec![],
+        reject_cidrs: vec![],
+        unassigned_cidrs: vec![],
+        released_cidrs: vec![],
+        overrides: vec![],
+        dns_managed: false,
+    };
+    let old_generation = rt
+        .gate
+        .claim_generation(None, LifecycleKind::Start)
+        .unwrap();
+    let snapshot = rt.config.read_mesh_apply_snapshot().unwrap();
+    let prepared = rt
+        .gate
+        .with_current_generation(old_generation, |live| {
+            rt.config.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                rt.stop_domain.boot_id(),
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: rt.stop_domain.boot_id(),
+                    manifest_ref: "mesh-routes/plans/run-identity-cas/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn real local child");
+    let run = DirectCoreRun::new(child);
+    let identity = run.identity.clone();
+    let old_run_ref = identity.persisted_ref().to_string();
+    rt.child.lock().unwrap().install_running_for_test(run);
+    rt.spawn_crash_monitor(old_generation, Some(identity.clone()));
+    tokio::time::sleep(Duration::from_millis(CRASH_MONITOR_POLL_MS + 100)).await;
+    assert_eq!(
+        Arc::strong_count(&identity.0),
+        3,
+        "child, test and monitor own the run"
+    );
+
+    // A real persistent CAS rejection occurs after Stop claims a request generation.
+    // No teardown ran; the old Child remains the physical owner.
+    rt.config
+        .set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    let stop_generation = rt
+        .gate
+        .claim_generation(Some(old_generation), LifecycleKind::Stop)
+        .unwrap();
+    let rejected = rt
+        .gate
+        .with_current_generation(stop_generation, |live| {
+            rt.config.reserve_mesh_stop_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                &rt.stop_domain,
+                live,
+                &plan,
+                &claim,
+                &old_run_ref,
+                old_generation,
+                stop_generation,
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::ConfigChanged)
+    ));
+    assert!(
+        rt.admit_legacy_start().is_err(),
+        "a failed managed Stop claim cannot reopen legacy crash restart"
+    );
+    tokio::time::sleep(Duration::from_millis(CRASH_MONITOR_POLL_MS + 100)).await;
+    assert_eq!(
+        Arc::strong_count(&identity.0),
+        3,
+        "failed Stop CAS must not retire the old child's live monitor"
+    );
+    assert!(matches!(
+        rt.child
+            .lock()
+            .unwrap()
+            .running_for_test()
+            .unwrap()
+            .try_wait_with(tokio::process::Child::try_wait),
+        Ok(None)
+    ));
+
+    // Replace the slot while the old monitor is alive. It must release only
+    // its own token and never inspect or classify the newer live child.
+    let next = DirectCoreRun::new(
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn replacement child"),
+    );
+    let next_identity = next.identity.clone();
+    let mut old = {
+        let mut slot = rt.child.lock().unwrap();
+        let old = slot.take_running_for_test().unwrap();
+        slot.install_running_for_test(next);
+        old
+    };
+    old.child_for_test().kill().await.unwrap();
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(CRASH_MONITOR_POLL_MS + 100)).await;
+    assert_eq!(Arc::strong_count(&identity.0), 1, "old monitor retired");
+    assert_eq!(
+        rt.crash_lock().restart_count(),
+        0,
+        "old monitor must not classify the replacement as its own crash"
+    );
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .running_for_test()
+        .unwrap()
+        .identity
+        .same_run(&next_identity));
+    assert!(matches!(
+        rt.child
+            .lock()
+            .unwrap()
+            .running_for_test()
+            .unwrap()
+            .try_wait_with(tokio::process::Child::try_wait),
+        Ok(None)
+    ));
+    rt.kill_core().await.unwrap();
+}
+
 /// 可观测的 [`HelperStopOps`] 替身：记调用次数 + 每次带的身份 pid，并可被指定成失败腿。
 ///
 /// `during_call` 在「IPC 往返中」执行 —— 用来**确定性**地复现「停核请求在飞、期间新会话起了新核」
@@ -95,6 +1346,7 @@ use std::sync::atomic::AtomicUsize;
 struct RecordingStop {
     calls: Arc<AtomicUsize>,
     wants: Arc<Mutex<Vec<Option<u32>>>>,
+    targets: Arc<Mutex<Vec<crate::runtime::helper::HelperStopTarget>>>,
     result: Result<(), String>,
     during_call: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -113,9 +1365,11 @@ impl RecordingStop {
     ) -> StopProbe {
         let calls = Arc::new(AtomicUsize::new(0));
         let wants = Arc::new(Mutex::new(Vec::new()));
+        let targets = Arc::new(Mutex::new(Vec::new()));
         let ops = Arc::new(Self {
             calls: Arc::clone(&calls),
             wants: Arc::clone(&wants),
+            targets,
             result,
             during_call,
         });
@@ -123,14 +1377,777 @@ impl RecordingStop {
     }
 }
 impl HelperStopOps for RecordingStop {
-    fn stop_managed_core(&self, want_pid: Option<u32>) -> Result<(), String> {
+    fn stop_managed_core(
+        &self,
+        target: crate::runtime::helper::HelperStopTarget,
+    ) -> Result<(), String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.wants.lock().unwrap().push(want_pid);
+        self.wants.lock().unwrap().push(Some(target.pid()));
+        self.targets.lock().unwrap().push(target);
         if let Some(f) = self.during_call.as_ref() {
             f();
         }
         self.result.clone()
     }
+}
+
+fn known_helper_attempt(rt: &Arc<ProxyRuntime>, pid: u32) -> HelperStartToken {
+    let token = rt.child.lock().unwrap().known_helper_start_for_test(pid);
+    *rt.pid.lock().unwrap() = Some(pid);
+    rt.core_via_helper.store(true, Ordering::SeqCst);
+    token
+}
+
+fn exact_helper_target(pid: u32, birth: &str) -> polaris_helper_proto::HelperBirthTarget {
+    polaris_helper_proto::HelperBirthTarget::parse_wire(&pid.to_string(), birth).unwrap()
+}
+
+fn known_exact_helper_attempt(
+    rt: &Arc<ProxyRuntime>,
+    target: polaris_helper_proto::HelperBirthTarget,
+) -> HelperStartToken {
+    use super::super::startup::HelperStartCompletion;
+    let attempt = rt.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(rt, attempt.clone())
+        .publish(&Ok(
+            crate::runtime::helper::HelperStartResult::BirthStarted(target),
+        ))
+        .unwrap();
+    attempt
+}
+
+#[tokio::test]
+async fn exact_stop_permit_binds_birth_and_keeps_managed_gate() {
+    use crate::runtime::helper::HelperStopTarget;
+    let (rt, _dir) = test_runtime();
+    let a = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    let b = exact_helper_target(4242, "11112222333344445555666677778888");
+    let attempt = known_exact_helper_attempt(&rt, a);
+    let (_, reserved, nonce) = rt.child.lock().unwrap().begin_helper_stop().unwrap();
+    assert_eq!(reserved, HelperStopTarget::Birth(a));
+    let forged = HelperStopPermit::new(
+        Arc::clone(&rt.child),
+        attempt.clone(),
+        HelperStopTarget::Birth(b),
+        nonce,
+    );
+    assert!(!rt
+        .clear_helper_core_bookkeeping_with_main(&forged, |_| Err("no test claim release".into()))
+        .unwrap());
+    assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    drop(forged);
+
+    let (ops, _, _) = RecordingStop::new(Ok(()));
+    let stopped_attempt = rt
+        .kill_core_via_helper(Arc::clone(&ops) as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert!(stopped_attempt.same(&attempt));
+    assert_eq!(*ops.targets.lock().unwrap(), [HelperStopTarget::Birth(a)]);
+    assert!(rt.pid.lock().unwrap().is_none());
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.start(local_only_config(free_port())).await.is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reaped_exact_birth_allows_same_helper_start_leg_but_not_direct_start() {
+    use super::super::lifecycle::StartLeg;
+
+    let (rt, _dir, _prompts) = test_runtime_installed_helper(false, false);
+    let old = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    known_exact_helper_attempt(&rt, old);
+    let (ops, _, _) = RecordingStop::new(Ok(()));
+    rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+
+    let before = rt.gate.generation();
+    assert!(rt.start(local_only_config(free_port())).await.is_err());
+    assert_eq!(
+        rt.gate.generation(),
+        before,
+        "direct admission stays closed"
+    );
+
+    // Both explicit Stop→Start and the restart/Apply start leg pass this same
+    // admission. The test helper has no daemon socket, so the subsequent
+    // read-only capability probe fails before a new helper attempt is booked.
+    let error = rt.start(tun_config()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("exact birth 能力探测"),
+        "helper Start reached a different failure: {error}"
+    );
+    assert!(rt.gate.generation() > before);
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    let guarded = rt
+        .start_guarded(tun_config(), Some(rt.gate.generation()))
+        .await;
+    assert!(matches!(guarded, StartLeg::Finished(Err(_), _)));
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+}
+
+#[tokio::test]
+async fn reaped_exact_start_releases_only_its_reserved_main_claim() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-reaped-exact").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token))
+        .unwrap();
+    reservation.arm_external_start();
+    let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    HelperStartCompletion::for_test(&rt, attempt.clone())
+        .publish(&Ok(HelperStartResult::BirthStarted(target)))
+        .unwrap();
+    assert!(rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
+
+    let (ops, calls, _) = RecordingStop::new(Ok(()));
+    let (message, confirmed) = rt
+        .reject_helper_start_with_result(
+            ops.clone(),
+            &attempt,
+            HelperStopTarget::Birth(target),
+            Some(&mut reservation),
+        )
+        .await;
+    assert!(confirmed, "same-attempt native Stop ACK: {message}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(reservation);
+    assert!(!rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+}
+
+#[tokio::test]
+async fn exact_start_cleanup_keeps_reservation_custody_when_registry_compare_remove_fails() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+    for poison in [false, true] {
+        let (rt, _dir) = test_runtime();
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let state = rt.mesh.tailscale_state_dir("start-cleanup-claim").unwrap();
+        let generated =
+            serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]});
+        let token = rt.mesh.mint_tailscale_main_birth();
+        let mut reservation = rt
+            .mesh
+            .reserve_tailscale_main_states(&generated, &gate, token.clone())
+            .await
+            .unwrap();
+        let attempt = rt
+            .register_helper_start_backend_with_main(Some(token.clone()))
+            .unwrap();
+        reservation.arm_external_start();
+        let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+        HelperStartCompletion::for_test(&rt, attempt.clone())
+            .publish(&Ok(HelperStartResult::BirthStarted(target)))
+            .unwrap();
+        let successor = rt.mesh.mint_tailscale_main_birth();
+        if poison {
+            rt.mesh.poison_tailscale_main_claim_lock_for_test();
+        } else {
+            assert!(rt
+                .mesh
+                .release_tailscale_main_states_if_token(&token, &gate)
+                .unwrap());
+            let mut replacement = rt
+                .mesh
+                .reserve_tailscale_main_states(&generated, &gate, successor.clone())
+                .await
+                .unwrap();
+            replacement.arm_external_start();
+            drop(replacement);
+        }
+        let (ops, calls, _) = RecordingStop::new(Ok(()));
+        let (message, confirmed) = rt
+            .reject_helper_start_with_result(
+                ops.clone(),
+                &attempt,
+                HelperStopTarget::Birth(target),
+                Some(&mut reservation),
+            )
+            .await;
+        assert!(!confirmed, "{message}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
+        assert!(rt.child.lock().unwrap().has_helper_start());
+        assert!(rt.core_via_helper.load(Ordering::SeqCst));
+        assert!(rt.mesh.main_owns_tailscale("start-cleanup-claim", true));
+        if !poison {
+            assert!(
+                rt.mesh
+                    .release_tailscale_main_states_if_token(&successor, &gate)
+                    .unwrap(),
+                "successor survived"
+            );
+            let mut restored = rt
+                .mesh
+                .reserve_tailscale_main_states(&generated, &gate, token)
+                .await
+                .unwrap();
+            restored.arm_external_start();
+            drop(restored);
+            let (_, confirmed) = rt
+                .reject_helper_start_with_result(
+                    ops,
+                    &attempt,
+                    HelperStopTarget::Birth(target),
+                    Some(&mut reservation),
+                )
+                .await;
+            assert!(confirmed);
+            assert!(!rt.child.lock().unwrap().has_helper_start());
+            assert_eq!(*rt.pid.lock().unwrap(), None);
+            assert!(!rt.mesh.main_owns_tailscale("start-cleanup-claim", true));
+        }
+        drop(reservation);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custody() {
+    use crate::runtime::helper::HelperStopTarget;
+
+    let mut a_process = spawn_custody_stand_in();
+    let mut b_process = spawn_custody_stand_in();
+    let a_pid = a_process.id().unwrap();
+    let b_pid = b_process.id().unwrap();
+    let a_hex = "00112233445566778899aabbccddeeff";
+    let b_hex = "11112222333344445555666677778888";
+    let (rt, dir, frames) = birth_daemon_runtime([
+        format!("OK birth-started {a_pid} {a_hex}\n"),
+        format!("OK birth-stopped {a_pid} {a_hex}\n"),
+        format!("OK birth-started {b_pid} {b_hex}\n"),
+    ]);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
+    let binary = dir.join("missing-test-core"); // Reconcile is best effort; no host helper.
+    let config_path = dir.join("test-core.json");
+    let mut a_reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.spawn_core_via_helper(
+            &binary,
+            &config_path,
+            &user_config,
+            rt.gate.generation(),
+            &mut a_reservation,
+        )
+        .await
+        .unwrap(),
+        Some(a_pid)
+    );
+    drop(a_reservation);
+    let a_target = exact_helper_target(a_pid, a_hex);
+    assert_eq!(
+        rt.child.lock().unwrap().helper_stop_target().unwrap().1,
+        HelperStopTarget::Birth(a_target)
+    );
+    let a_attempt = rt.child.lock().unwrap().helper_stop_target().unwrap().0;
+    drop(gate);
+    rt.stop().await.unwrap();
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    a_process.start_kill().unwrap();
+    a_process.wait().await.unwrap();
+
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let mut b_reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.spawn_core_via_helper(
+            &binary,
+            &config_path,
+            &user_config,
+            rt.gate.generation(),
+            &mut b_reservation,
+        )
+        .await
+        .unwrap(),
+        Some(b_pid)
+    );
+    drop(b_reservation);
+    let (current, target) = rt.child.lock().unwrap().helper_stop_target().unwrap();
+    assert!(!current.same(&a_attempt));
+    assert_eq!(
+        target,
+        HelperStopTarget::Birth(exact_helper_target(b_pid, b_hex))
+    );
+    {
+        let sent = frames.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            3,
+            "only Start A, Stop A, Start B may reach the daemon"
+        );
+        assert!(sent[0].starts_with("start-birth-safe\n"));
+        assert_eq!(sent[1], format!("stop-birth-safe\n{a_pid}\n{a_hex}\n"));
+        assert!(sent[2].starts_with("start-birth-safe\n"));
+    }
+    b_process.start_kill().unwrap();
+    b_process.wait().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_ack() {
+    let pid = u32::MAX; // checked_pid rejects it without probing any host process.
+    let hex = "00112233445566778899aabbccddeeff";
+    let (rt, dir, frames) = birth_daemon_runtime([
+        format!("OK birth-started {pid} {hex}\n"),
+        format!("OK birth-stopped {pid} {hex}\n"),
+    ]);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-dead-exact-spawn").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token,
+        )
+        .await
+        .unwrap();
+    assert!(rt.mesh.main_owns_tailscale("ts-dead-exact-spawn", true));
+    let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
+    let err = rt
+        .spawn_core_via_helper(
+            &dir.join("missing-test-core"),
+            &dir.join("test-core.json"),
+            &user_config,
+            rt.gate.generation(),
+            &mut reservation,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("进程不存在"), "{err}");
+    drop(reservation);
+    assert!(!rt.mesh.main_owns_tailscale("ts-dead-exact-spawn", true));
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    let sent = frames.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0].starts_with("start-birth-safe\n"));
+    assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{hex}\n"));
+}
+
+#[tokio::test]
+async fn exact_not_admitted_target_can_stop_but_unknown_without_target_cannot() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+    let target = exact_helper_target(7331, "00112233445566778899aabbccddeeff");
+    let (rt, _dir) = test_runtime();
+    let attempt = rt.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&rt, attempt)
+        .publish(&Ok(HelperStartResult::BirthNotAdmitted {
+            target: Some(target),
+            pending: true,
+        }))
+        .unwrap();
+    assert!(rt.pid.lock().unwrap().is_none());
+    let (ops, _, _) = RecordingStop::new(Ok(()));
+    rt.kill_core_via_helper(Arc::clone(&ops) as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap();
+    assert_eq!(
+        *ops.targets.lock().unwrap(),
+        [HelperStopTarget::Birth(target)]
+    );
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+
+    let (unknown, _dir) = test_runtime();
+    let attempt = unknown.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&unknown, attempt)
+        .publish(&Ok(HelperStartResult::BirthNotAdmitted {
+            target: None,
+            pending: false,
+        }))
+        .unwrap();
+    let (ops, calls, _) = RecordingStop::new(Ok(()));
+    assert!(unknown
+        .kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap_err()
+        .contains("cleanup-unknown"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(unknown.child.lock().unwrap().has_helper_start());
+    assert!(unknown.core_via_helper.load(Ordering::SeqCst));
+
+    let (already, _dir) = test_runtime();
+    let attempt = already.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&already, attempt)
+        .publish(&Ok(HelperStartResult::BirthAlready(target)))
+        .unwrap();
+    assert!(
+        already.pid.lock().unwrap().is_none(),
+        "Already did not start this config"
+    );
+    assert_eq!(
+        already
+            .child
+            .lock()
+            .unwrap()
+            .helper_stop_target()
+            .unwrap()
+            .1,
+        HelperStopTarget::Birth(target)
+    );
+}
+
+#[tokio::test]
+async fn unknown_helper_start_refuses_stop_and_stale_sweep_without_ipc() {
+    let (rt, _dir) = test_runtime();
+    let attempt = rt.register_helper_start_backend().unwrap();
+    assert!(rt.child.lock().unwrap().finish_helper_start(&attempt, None));
+    let (ops, calls, _) = RecordingStop::new(Ok(()));
+    let error = rt
+        .kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap_err();
+    assert!(error.contains("cleanup-unknown"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "unknown pid forbids Stop(None)"
+    );
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.pid.lock().unwrap().is_none());
+
+    let sweeps = rt.stale_sweep_runs.load(Ordering::SeqCst);
+    assert!(rt.start(local_only_config(free_port())).await.is_err());
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
+
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        started_via_helper: true,
+        ..Default::default()
+    };
+    let error = rt.stop().await.unwrap_err();
+    assert!(error.contains("cleanup-unknown"));
+    assert!(
+        rt.status().running,
+        "unknown helper Start cannot publish stopped"
+    );
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_helper_start_worker_publishes_late_exact_birth() {
+    use super::super::startup::HelperStartCompletion;
+
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-late-helper").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token.clone()))
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    drop(gate);
+    let mut completion = HelperStartCompletion::for_test(&rt, attempt.clone());
+    let target = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let held = Arc::clone(&release);
+    let late = tokio::task::spawn_blocking(move || {
+        entered_tx.send(()).unwrap();
+        let (lock, wake) = &*held;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+        completion
+            .publish(&Ok(
+                crate::runtime::helper::HelperStartResult::BirthStarted(target),
+            ))
+            .unwrap();
+    });
+    entered_rx.await.unwrap();
+    late.abort();
+    let (lock, wake) = &*release;
+    *lock.lock().unwrap() = true;
+    wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while *rt.pid.lock().unwrap() != Some(4242) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (current, known) = rt.child.lock().unwrap().helper_stop_target().unwrap();
+    assert!(current.same(&attempt));
+    assert_eq!(
+        known,
+        crate::runtime::helper::HelperStopTarget::Birth(target)
+    );
+    let (claim_attempt, claim_main) = rt
+        .child
+        .lock()
+        .unwrap()
+        .helper_main_claim_for_stop()
+        .unwrap();
+    assert!(claim_attempt.same(&attempt));
+    assert!(claim_main.is_some_and(|found| found.same(&token)));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-late-helper", true));
+}
+
+#[test]
+fn late_old_attempt_ack_cannot_replace_same_pid_new_birth() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::{HelperStartResult, HelperStopTarget};
+    let (rt, _dir) = test_runtime();
+    let a = exact_helper_target(4242, "00112233445566778899aabbccddeeff");
+    let b = exact_helper_target(4242, "11112222333344445555666677778888");
+    let old = rt.register_helper_start_backend().unwrap();
+    let mut late = HelperStartCompletion::for_test(&rt, old.clone());
+    {
+        let mut child = rt.child.lock().unwrap();
+        assert!(child.finish_helper_birth_start(&old, a));
+        let (_, target, nonce) = child.begin_helper_stop().unwrap();
+        assert!(child.confirm_helper_stop(&old, target, &nonce));
+    }
+    // A same-backend successor may start after exact Stop. Its receipt must
+    // not be overwritten by the prior attempt's delayed Start completion.
+    let new = rt.register_helper_start_backend().unwrap();
+    HelperStartCompletion::for_test(&rt, new.clone())
+        .publish(&Ok(HelperStartResult::BirthStarted(b)))
+        .unwrap();
+    assert!(late
+        .publish(&Ok(HelperStartResult::BirthStarted(a)))
+        .is_err());
+    let (current, target) = rt.child.lock().unwrap().helper_stop_target().unwrap();
+    assert!(current.same(&new));
+    assert_eq!(target, HelperStopTarget::Birth(b));
+    assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
+}
+
+#[tokio::test]
+async fn start_not_admitted_preserves_prior_helper_and_main_custody() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::HelperStartResult;
+    use polaris_helper_proto::StartNotAdmitted;
+
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let state = rt.mesh.tailscale_state_dir("ts-helper-blocker").unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let attempt = rt
+        .register_helper_start_backend_with_main(Some(token.clone()))
+        .unwrap();
+    reservation.arm_external_start();
+    let mut completion = HelperStartCompletion::for_test(&rt, attempt.clone());
+    completion
+        .publish(&Ok(HelperStartResult::NotAdmitted(
+            StartNotAdmitted::Pending { pid: 7331 },
+        )))
+        .unwrap();
+    drop(reservation);
+
+    {
+        let child = rt.child.lock().unwrap();
+        assert!(child.helper_start_not_admitted_for_test());
+        let (blocker_attempt, blocker_pid) = child.helper_stop_target().unwrap();
+        assert!(blocker_attempt.same(&attempt));
+        assert_eq!(blocker_pid.pid(), 7331);
+    }
+    assert!(rt.pid.lock().unwrap().is_none(), "no new core was spawned");
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt.mesh.main_owns_tailscale("ts-helper-blocker", true));
+
+    let (failed, failed_calls, wants) = RecordingStop::new(Err("still pending".into()));
+    assert!(rt
+        .kill_core_via_helper(failed as Arc<dyn HelperStopOps>)
+        .await
+        .is_err());
+    assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*wants.lock().unwrap(), [Some(7331)]);
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .helper_start_not_admitted_for_test());
+    assert!(rt.mesh.main_owns_tailscale("ts-helper-blocker", true));
+
+    let (acknowledged, _, _) = RecordingStop::new(Ok(()));
+    assert!(rt
+        .kill_core_via_helper_with_main(acknowledged as Arc<dyn HelperStopOps>, Some(&gate))
+        .await
+        .unwrap_err()
+        .contains("legacy Stop ACK"));
+    assert!(rt.child.lock().unwrap().has_helper_start());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(rt
+        .main_token_for_stop()
+        .unwrap()
+        .is_some_and(|found| found.same(&token)));
+    assert!(rt.mesh.main_owns_tailscale("ts-helper-blocker", true));
+}
+
+#[tokio::test]
+async fn acknowledged_stop_keeps_exclusive_permit_through_final_clear() {
+    let (rt, _dir) = test_runtime();
+    known_exact_helper_attempt(
+        &rt,
+        exact_helper_target(4242, "00112233445566778899aabbccddeeff"),
+    );
+    let (token, pid, nonce) = rt.child.lock().unwrap().begin_helper_stop().unwrap();
+    let permit = HelperStopPermit::new(Arc::clone(&rt.child), token.clone(), pid, nonce);
+    let (ops, calls, _) = RecordingStop::new(Ok(()));
+    ops.stop_managed_core(pid).unwrap(); // ACK arrived; async caller has not cleared yet.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(rt.child.lock().unwrap().helper_stop_inflight_for_test());
+
+    let (second, second_calls, _) = RecordingStop::new(Ok(()));
+    assert!(rt
+        .kill_core_via_helper(second as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap_err()
+        .contains("cleanup-unknown"));
+    assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+    let sweeps = rt.stale_sweep_runs.load(Ordering::SeqCst);
+    assert!(rt.start(local_only_config(free_port())).await.is_err());
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
+
+    assert!(rt
+        .clear_helper_core_bookkeeping_with_main(&permit, |_| Err("no test claim release".into()))
+        .unwrap());
+    drop(permit);
+    assert!(rt.pid.lock().unwrap().is_none());
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn cancelled_helper_stop_keeps_existing_legacy_lease_until_ipc_returns() {
+    let (rt, dir) = test_runtime();
+    known_helper_attempt(&rt, 4242);
+    let outer_lease = rt.config.lease_legacy_start().unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let held = Arc::clone(&release);
+    let entered = Mutex::new(Some(entered_tx));
+    let (ops, _, _) = RecordingStop::with_hook(
+        Ok(()),
+        Some(Box::new(move || {
+            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            let (lock, wake) = &*held;
+            let mut released = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !*released {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "test did not release helper IPC");
+                released = wake.wait_timeout(released, remaining).unwrap().0;
+            }
+        })),
+    );
+    let task = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>).await }
+    });
+    entered_rx.await.unwrap();
+    task.abort();
+    let _ = task.await;
+    let direct = DirectCoreRun::new(spawn_custody_stand_in());
+    let direct_identity = direct.identity.clone();
+    assert!(rt.child.lock().unwrap().install_running(direct).is_ok());
+    assert!(matches!(
+        prepare_direct_stop(&rt, &direct_identity).await,
+        Err(PrepareError::Unsupported)
+    ));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+    drop(outer_lease);
+    assert!(rt.config.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir
+        .join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE)
+        .exists());
+
+    {
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_one();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if rt.config.prepare_mesh_route_enable("local-test-1").is_ok() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "blocking IPC did not release its lease"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(dir
+        .join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE)
+        .exists());
+    assert!(matches!(
+        prepare_direct_stop(&rt, &direct_identity).await,
+        Err(PrepareError::Unsupported)
+    ));
+    assert!(rt.child.lock().unwrap().helper_touched_for_test());
+    let mut direct = rt.child.lock().unwrap().take_running_for_test().unwrap();
+    direct.child_for_test().kill().await.unwrap();
 }
 
 // ─── 停核的受管 pid 身份：app 侧下发 + 记账收口 ────────────────────────────────
@@ -147,13 +2164,14 @@ impl HelperStopOps for RecordingStop {
 #[tokio::test]
 async fn helper_stop_leg_sends_the_pid_it_intends_to_stop() {
     let (rt, _dir) = test_runtime();
-    *rt.pid.lock().unwrap() = Some(4242);
-    rt.core_via_helper.store(true, Ordering::SeqCst);
+    known_helper_attempt(&rt, 4242);
     let (ops, calls, wants) = RecordingStop::new(Ok(()));
 
-    rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+    assert!(rt
+        .kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
         .await
-        .expect("helper 停核应成功");
+        .unwrap_err()
+        .contains("legacy Stop ACK"));
 
     assert_eq!(
         *wants.lock().unwrap(),
@@ -161,9 +2179,9 @@ async fn helper_stop_leg_sends_the_pid_it_intends_to_stop() {
         "停核请求必须携带受管 pid 身份 —— 这是 helper 侧唯一能据以拒杀的依据"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "恰调一次");
-    // 无人接管 → 记账照常清（反向失效：留着会让下次 kill_core 走错腿）。
-    assert!(rt.pid.lock().unwrap().is_none());
-    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+    // Request acceptance cannot attest a native exit, even without takeover.
+    assert_eq!(*rt.pid.lock().unwrap(), Some(4242));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 /// **结果未知门**：通信失败时不能清 helper 记账。请求可能根本没到，也可能已停但回包丢失；
@@ -171,8 +2189,7 @@ async fn helper_stop_leg_sends_the_pid_it_intends_to_stop() {
 #[tokio::test]
 async fn helper_stop_failure_preserves_managed_identity() {
     let (rt, _dir) = test_runtime();
-    *rt.pid.lock().unwrap() = Some(4242);
-    rt.core_via_helper.store(true, Ordering::SeqCst);
+    known_helper_attempt(&rt, 4242);
     let (ops, calls, wants) = RecordingStop::new(Err("mock transport timeout".to_owned()));
 
     let error = rt
@@ -199,8 +2216,7 @@ async fn helper_stop_failure_preserves_managed_identity() {
 #[tokio::test]
 async fn active_stop_keeps_running_state_when_helper_stop_is_unconfirmed() {
     let (rt, _dir) = test_runtime();
-    *rt.pid.lock().unwrap() = Some(4242);
-    rt.core_via_helper.store(true, Ordering::SeqCst);
+    known_helper_attempt(&rt, 4242);
     {
         let mut status = rt.status.write().unwrap();
         status.running = true;
@@ -229,8 +2245,10 @@ async fn active_stop_keeps_running_state_when_helper_stop_is_unconfirmed() {
 #[tokio::test]
 async fn helper_stop_leg_does_not_wipe_bookkeeping_taken_over_mid_flight() {
     let (rt, _dir) = test_runtime();
-    *rt.pid.lock().unwrap() = Some(4242);
-    rt.core_via_helper.store(true, Ordering::SeqCst);
+    known_exact_helper_attempt(
+        &rt,
+        exact_helper_target(4242, "00112233445566778899aabbccddeeff"),
+    );
     // 「IPC 在飞时新会话起了新核并提交 pid」——真机上这正是老 stop 腿醒来后会杀错人的那一刻。
     let pid_slot = Arc::clone(&rt.pid);
     let (ops, _calls, wants) = RecordingStop::with_hook(
@@ -240,9 +2258,11 @@ async fn helper_stop_leg_does_not_wipe_bookkeeping_taken_over_mid_flight() {
         })),
     );
 
-    rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
+    let error = rt
+        .kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
         .await
-        .expect("老核已停且新会话记账应保留");
+        .expect_err("attempt/pid 换人后不能给上层已停成功回执");
+    assert!(error.contains("cleanup-unconfirmed"));
 
     assert_eq!(
         *wants.lock().unwrap(),
@@ -269,8 +2289,10 @@ async fn helper_stop_leg_does_not_wipe_bookkeeping_taken_over_mid_flight() {
 ///   「停它此刻手里的随便哪个」，本方法整段可与新会话并发 ⇒ 杀错进程）。
 #[tokio::test]
 async fn rejected_helper_start_asks_daemon_to_stop_its_child() {
+    let (rt, _dir) = test_runtime();
+    let attempt = known_helper_attempt(&rt, 6439);
     let (ops, calls, wants) = RecordingStop::new(Ok(()));
-    let msg = ProxyRuntime::reject_helper_start(ops, 6439).await;
+    let msg = rt.reject_helper_start(ops, &attempt, 6439).await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -291,13 +2313,83 @@ async fn rejected_helper_start_asks_daemon_to_stop_its_child() {
 /// 打断（stop 返 Err 时改成 `return Ok`/返回空串/panic）→ 本测转红。
 #[tokio::test]
 async fn reject_leg_still_reports_failure_when_daemon_stop_errors() {
+    let (rt, _dir) = test_runtime();
+    let attempt = known_helper_attempt(&rt, 777);
     let (ops, calls, _wants) = RecordingStop::new(Err("daemon 说 notrunning".to_owned()));
-    let msg = ProxyRuntime::reject_helper_start(ops, 777).await;
+    let msg = rt.reject_helper_start(ops, &attempt, 777).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1, "失败腿也必须真尝试过 stop");
     assert!(
         msg.contains("777") && msg.contains("进程不存在"),
         "stop 失败不改判：起核失败的结论与消息原样返回，不得被 stop 的结果污染"
     );
+    assert!(msg.contains("cleanup-unconfirmed"));
+    assert_eq!(*rt.pid.lock().unwrap(), Some(777));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_reject_stop_keeps_legacy_attempt_after_repeated_acks() {
+    let (rt, _dir) = test_runtime();
+    let attempt = known_helper_attempt(&rt, 777);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let held = Arc::clone(&release);
+    let late_done = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&late_done);
+    let entered = Mutex::new(Some(entered_tx));
+    let (ops, calls, wants) = RecordingStop::with_hook(
+        Ok(()),
+        Some(Box::new(move || {
+            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            let (lock, wake) = &*held;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            done.store(true, Ordering::Release);
+        })),
+    );
+    let task = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        let attempt = attempt.clone();
+        async move { rt.reject_helper_start(ops, &attempt, 777).await }
+    });
+    entered_rx.await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert!(rt.child.lock().unwrap().helper_stop_inflight_for_test());
+    let (second, second_calls, _) = RecordingStop::new(Ok(()));
+    let error = rt
+        .kill_core_via_helper(second as Arc<dyn HelperStopOps>)
+        .await
+        .unwrap_err();
+    assert!(error.contains("cleanup-unknown"));
+    assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+    let (lock, wake) = &*release;
+    *lock.lock().unwrap() = true;
+    wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !late_done.load(Ordering::Acquire)
+            || rt.child.lock().unwrap().helper_stop_inflight_for_test()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*wants.lock().unwrap(), vec![Some(777)]);
+    assert_eq!(*rt.pid.lock().unwrap(), Some(777));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+
+    let (confirm, _, _) = RecordingStop::new(Ok(()));
+    assert!(rt
+        .kill_core_via_helper(confirm)
+        .await
+        .unwrap_err()
+        .contains("legacy Stop ACK"));
+    assert_eq!(*rt.pid.lock().unwrap(), Some(777));
+    assert!(rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 /// **P1-a 不变式门（有牙版）**：**每一次** `start` 都必须走 stale 清扫腿，不是只走首次。
@@ -720,7 +2812,7 @@ fn active_stop_during_helper_observation_retires_instead_of_recovering() {
 /// `gen_now`。纯函数测试只能证明判据会算，守不住调用点重新喂陈旧快照的回归，故这里对方法体锁序。
 #[test]
 fn crash_monitor_classification_is_wired_after_observation() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let body = method_body(&module_code("runtime/proxy"), HEAD);
     let observation_at = body
         .find("let observation =")
@@ -778,7 +2870,7 @@ async fn public_stop_marks_recovery_aborted_and_next_start_resets_it() {
 /// 打断（把复核那段删掉、只留 `pid_alive`）→ 本地腿那几条全红。
 #[test]
 fn crash_monitor_actually_consults_the_pid_identity() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let src = module_code("runtime/proxy");
     // 切在「锚点之后的第一个顶层 `#[cfg(test)]`」：本文件里生产码与测试模块**交替**出现
     // （实测顶层 cfg(test) 有 5 处，最后一处还在本测试之后）⇒ 切第一处会把待验方法切掉、
@@ -957,7 +3049,7 @@ fn attestation_consults_the_helper_reported_image() {
 /// `ChildObservation::Alive` → 后三条转红；把那段整体换回只比 `pid == p` → 前两条也转红。
 #[test]
 fn crash_monitor_consults_the_helper_reported_created_token() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let src = module_code("runtime/proxy");
     let at = src
         .find(HEAD)
@@ -1019,7 +3111,7 @@ fn crash_monitor_consults_the_helper_reported_created_token() {
 /// `runtime::helper::tests::start_identity_baseline_is_remembered_and_never_goes_stale` 覆盖。
 #[test]
 fn crash_monitor_seeds_the_helper_baseline_from_the_start_response() {
-    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {";
+    const HEAD: &str = "    pub(super) fn spawn_crash_monitor(";
     let src = module_code("runtime/proxy");
     let at = src
         .find(HEAD)

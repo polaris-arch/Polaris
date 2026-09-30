@@ -1,0 +1,176 @@
+name: Desktop Core Sources
+
+# One four-native-producer bundle per caller run. Receipts remain transport
+# evidence; the unchanged consumer verifies all four actual binaries before use.
+on:
+  workflow_call:
+    inputs:
+      candidate:
+        type: string
+        required: true
+    outputs:
+      candidate:
+        value: ${{ inputs.candidate }}
+      artifact_name:
+        value: ${{ jobs.assemble.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CORE_CANDIDATE: ${{ inputs.candidate }}
+  CORE_RUN_ID: ${{ github.run_id }}
+  CORE_RUN_ATTEMPT: ${{ github.run_attempt }}
+
+jobs:
+  produce:
+    name: native core (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {"platform":"linux","os":"ubuntu-22.04","host":"linux","arch":"x64"}
+          - {"platform":"win","os":"windows-2022","host":"win32","arch":"x64"}
+          - {"platform":"mac-x64","os":"macos-15-intel","host":"darwin","arch":"x64"}
+          - {"platform":"mac-arm64","os":"macos-15","host":"darwin","arch":"arm64"}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Verify exact candidate and native compiler host
+        env:
+          CORE_HOST: ${{ matrix.host }}
+          CORE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
+          [ "$(git rev-parse HEAD)" = "$CORE_CANDIDATE" ]
+          [ -z "$(git status --porcelain --untracked-files=no)" ]
+          node -e 'if (process.platform !== process.env.CORE_HOST || process.arch !== process.env.CORE_ARCH) throw Error("native producer host differs")'
+
+      - name: Read pinned source Go version
+        id: go-pin
+        run: node -e 'console.log("version=" + require("./scripts/libbox-patches/source-manifest.json").goVersion)' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go-pin.outputs.version }}
+          cache: false
+
+      - name: Verify native macOS SDK and compiler
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk macosx --show-sdk-path)"
+          [ -d "$sdk" ]
+          cc="$(xcrun --sdk macosx --find clang)"
+          cxx="$(xcrun --sdk macosx --find clang++)"
+          [ -x "$cc" ] && [ -x "$cxx" ]
+          xcrun --sdk macosx --show-sdk-version
+          "$cc" --version
+          {
+            echo "SDKROOT=$sdk"
+            echo "CC=$cc"
+            echo "CXX=$cxx"
+          } >> "$GITHUB_ENV"
+
+      # On Windows the unchanged producer performs native systemconfig Go unit
+      # tests. Darwin CGO uses the actual SDK above; no cross-host substitute.
+      - name: Produce exact platform source artifact
+        env:
+          CORE_PLATFORM: ${{ matrix.platform }}
+          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
+        run: node scripts/fetch-core.mjs --producer --platform="$CORE_PLATFORM" --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/desktop-core-bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble:
+    name: verify four source artifacts
+    needs: produce
+    runs-on: ubuntu-22.04
+    outputs:
+      artifact_name: ${{ steps.bundle.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      - name: Read pinned source Go version
+        id: go-pin
+        run: node -e 'console.log("version=" + require("./scripts/libbox-patches/source-manifest.json").goVersion)' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.go-pin.outputs.version }}
+          cache: false
+
+      # Default download scope is this workflow run, including reusable jobs.
+      # No token/run-id override may turn this into a previous-run fallback.
+      - name: Download Linux source artifact from this attempt
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-linux
+          path: ${{ runner.temp }}/desktop-core-bundle
+
+      - name: Download Windows source artifact from this attempt
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-win
+          path: ${{ runner.temp }}/desktop-core-bundle
+
+      - name: Download Intel macOS source artifact from this attempt
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-x64
+          path: ${{ runner.temp }}/desktop-core-bundle
+
+      - name: Download arm64 macOS source artifact from this attempt
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-arm64
+          path: ${{ runner.temp }}/desktop-core-bundle
+
+      - name: Assemble and verify exact candidate bundle
+        id: bundle
+        env:
+          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
+        run: |
+          set -euo pipefail
+          node scripts/fetch-core.mjs --assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          echo "artifact_name=desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.bundle.outputs.artifact_name }}
+          path: ${{ runner.temp }}/desktop-core-bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

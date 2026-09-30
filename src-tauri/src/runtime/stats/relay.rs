@@ -9,10 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
 use tauri::AppHandle;
 
-use polaris_singbox_grpc::{daemon, Endpoint, ReconnectConfig, SingBoxApiClient};
+use polaris_singbox_grpc::daemon;
 use polaris_stats_engine::{
     aggregate_connections_with_topn, aggregate_signature, trim_connection, ConnectionEntry,
     ConnectionEventType, ConnectionsAggregate, EmitGate, SingBoxConnection, SingBoxConnectionEvent,
@@ -32,10 +31,11 @@ use crate::runtime::proxy::ProxyRuntime;
 
 use super::gate::{visibility_source, StreamGate};
 use super::projection::{ClosedHistory, PendingClosedUpdate, PendingDetailUpdate};
+use super::source;
 use super::subscription::ConnectionStreamLifecycle;
 use super::{
-    AGGREGATE_EMIT_MIN_INTERVAL, CLOSED_EMIT_MIN_INTERVAL, CONNECTIONS_STREAM_INTERVAL_NS,
-    DETAIL_EMIT_MIN_INTERVAL, PARK_RECHECK_INTERVAL, STATS_STREAM_INTERVAL_NS,
+    AGGREGATE_EMIT_MIN_INTERVAL, CLOSED_EMIT_MIN_INTERVAL, DETAIL_EMIT_MIN_INTERVAL,
+    PARK_RECHECK_INTERVAL,
 };
 
 /// gRPC `daemon::Connection` → stats-engine `ConnectionEntry`（复用 [`trim_connection`] 的裁剪，
@@ -91,7 +91,7 @@ fn daemon_conn_to_engine(c: &daemon::Connection) -> SingBoxConnection {
 /// **未知值兜底成 `New`**：proto3 的开放枚举语义 —— 新核加了事件类型而旧客户端不认时，
 /// 当 NEW 处理最多是多一条连接（还会被 `closed_at` 幽灵过滤兜一道），当 CLOSED 处理则会
 /// **误删一条活连接**。兜底方向选不伤表的那侧。
-fn daemon_events_to_engine(ev: &daemon::ConnectionEvents) -> SingBoxConnectionEvents {
+pub(super) fn daemon_events_to_engine(ev: &daemon::ConnectionEvents) -> SingBoxConnectionEvents {
     SingBoxConnectionEvents {
         reset: ev.reset,
         events: ev
@@ -245,6 +245,18 @@ pub(super) fn traffic_availability_changed(prev: Option<bool>, now: bool) -> boo
     prev != Some(now)
 }
 
+/// 起停入口会先推进核世代，`status.running` 则要等停核桥回执才清。
+/// 同时核对两者，避免关闭中的旧帧被当作运行期真值。
+fn stream_session_current(proxy: &ProxyRuntime, port: u16, generation: u64) -> bool {
+    source::stream_session_current(
+        &proxy.status(),
+        port,
+        generation,
+        proxy.core_generation(),
+        proxy.core_lifecycle_busy(),
+    )
+}
+
 /// 当前 epoch 毫秒（聚合 `at` 采样时刻；签名比对时被剔除，故不影响去重）。
 pub(super) fn now_ms() -> u64 {
     SystemTime::now()
@@ -259,19 +271,6 @@ pub(super) fn now_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
         .unwrap_or(0)
-}
-
-/// currentConfig.clashApiSecret（对齐 proxy.rs `management_api()` 的读法）。
-fn read_clash_secret(config: &ConfigManager) -> String {
-    config
-        .current()
-        .ok()
-        .and_then(|c| {
-            c.get("clashApiSecret")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
 }
 
 /// 把一次本地 reset 请求绑定到共享 owner 分配的 generation。已经有待发 reset 时沿用其编号，
@@ -368,6 +367,12 @@ pub(super) async fn run_connections_stream(
         // ① 降流门：关着就在这里断流待命。
         gate.wait_until(true, &visible).await;
 
+        // 停核桥尚未回执时 status.running 仍为 true；这段时间不可重开命令流。
+        if proxy.core_lifecycle_busy() {
+            tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
+            continue;
+        }
+
         // ② 核未运行 → 不碰 gRPC，推一帧离线态（只在进入该态时推一次；核停着重复推相同空帧
         //    只会让渲染端白重渲）。
         //
@@ -377,7 +382,7 @@ pub(super) async fn run_connections_stream(
         //    （`aggregate?.hosts ?? []`），且「无连接」正是核停着时的真相；核一起来建流即
         //    `last_sig = None` 自愈。**待真机确认**：`null` 态与空帧态的占位文案/骨架是否真的同形。
         let status = proxy.status();
-        if !status.running || status.clash_api_port == 0 {
+        if !source::stream_ready(&status) {
             if !offline_sent {
                 let Some(sig) = lifecycle.commit(task_epoch, || {
                     let sig = offline_aggregate_frame(&last_sig, now_ms(), |agg| {
@@ -423,27 +428,34 @@ pub(super) async fn run_connections_stream(
             continue;
         }
 
-        // ③ 建流。
-        let port = status.clash_api_port;
-        let secret = read_clash_secret(&config);
-        let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                log::debug!("连接流：管理 API 连接失败 {e}");
-                tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
-                continue;
-            }
+        // ③ 建流（传输层的平台分叉是**唯一**的分叉，见 [`super::source`]：桌面 = 管理 API 上的
+        //    daemon gRPC，Android = 本进程内的 libbox 命令通道。以下整个循环体两个平台共用一份）。
+        let port = source::stream_port(&status);
+        let generation = proxy.core_generation();
+        if !stream_session_current(&proxy, port, generation) {
+            continue;
+        }
+        let Some(mut stream) = source::subscribe_connections(&config, port).await else {
+            tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
+            continue;
         };
-        let mut stream = client
-            .subscribe_connections(CONNECTIONS_STREAM_INTERVAL_NS, ReconnectConfig::default());
+        if !stream_session_current(&proxy, port, generation) {
+            continue;
+        }
+        // 只在建流时读运行核起核快照；NEW 入表冻结名称。磁盘保存/暂存不会改旧连接。
+        let named_rules = proxy.running_rule_names();
         // 新流 = 新的一份真相：旧连接表在此刻作废，等首帧 reset 重建。
         if lifecycle
             .commit(task_epoch, || {
-                active_connections
+                let mut table = active_connections
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .reset();
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                table.reset();
+                table.set_named_rules(named_rules);
+                drop(table);
+                if let Ok(mut history) = closed_history.lock() {
+                    history.set_core_generation(generation);
+                }
             })
             .is_none()
         {
@@ -469,12 +481,15 @@ pub(super) async fn run_connections_stream(
         // `wait_until` 占着，这里另订一个：`watch::Receiver::changed()` 是 cancel-safe 的，被 select
         // 丢弃只是停止等待。每条流各建一个 ⇒ 建流那一刻的代次即基准，不会把上一条流的旧 bump 补收。
         let mut demand_epoch = gate.state.epoch.subscribe();
-        log::debug!("连接流已订阅（port={port}）");
+        log::debug!("连接流已订阅（{}）", source::stream_label(port));
 
         // ④ 流循环。
         loop {
             if stop.load(Ordering::Relaxed) {
                 return;
+            }
+            if !stream_session_current(&proxy, port, generation) {
+                break;
             }
             // 下次该醒的时刻：两条 emit 的到期时间与核状态复核周期取最小。
             // 两条都无待推变更（空闲）→ 只剩兜底复核，不设无谓定时器。
@@ -491,8 +506,10 @@ pub(super) async fn run_connections_stream(
 
             tokio::select! {
                 frame = stream.recv() => match frame {
-                    Some(ev) => {
-                        let events = daemon_events_to_engine(&ev);
+                    Some(events) => {
+                        if !stream_session_current(&proxy, port, generation) {
+                            break;
+                        }
                         let Some((closed_change, detail_change)) = lifecycle.commit(task_epoch, || {
                             let mut table = active_connections
                                 .lock()
@@ -544,6 +561,9 @@ pub(super) async fn run_connections_stream(
                 () = tokio::time::sleep(due) => {}
             }
 
+            if !stream_session_current(&proxy, port, generation) {
+                break;
+            }
             // emit：各条需求按自己的闸门与订阅状态（topology 信号与 aggregate 载荷共用 `agg_emit`
             // 那一条闸门 —— 同一次拓扑变更 —— 但各看各的订阅门）。
             let now = mono_ms(clock);
@@ -645,8 +665,7 @@ pub(super) async fn run_connections_stream(
             }
 
             // 核停 / 换端口（换核、重启动态口）→ 断流重来。ReconnectingStream 自己发现不了这两件事。
-            let st = proxy.status();
-            if !st.running || st.clash_api_port != port {
+            if !stream_session_current(&proxy, port, generation) {
                 break;
             }
         }
@@ -725,10 +744,16 @@ pub(super) async fn run_stats_stream(
         // ① 降流门：关着就在这里断流待命。
         gate.wait_until(true, &visible).await;
 
+        // status.running 到停核桥确认后才清；生命周期事务中不重开统计流。
+        if proxy.core_lifecycle_busy() {
+            tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
+            continue;
+        }
+
         // ② 核未运行 → 不碰 gRPC，推一帧清零态（只在进入该态时推一次；核停着重复推相同空帧
         //    只会让渲染端白重渲）。
         let status = proxy.status();
-        if !status.running || status.clash_api_port == 0 {
+        if !source::stream_ready(&status) {
             if !offline_sent {
                 broadcast(&app, EVENT_STATS_UPDATED, offline_stats_frame());
                 offline_sent = true;
@@ -738,36 +763,41 @@ pub(super) async fn run_stats_stream(
             continue;
         }
 
-        // ③ 建流。
-        let port = status.clash_api_port;
-        let secret = read_clash_secret(&config);
-        let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                log::debug!("Status 流：管理 API 连接失败 {e}");
-                tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
-                continue;
-            }
+        // ③ 建流（平台分叉见 [`super::source`]，理由与连接流那条逐字相同）。
+        let port = source::stream_port(&status);
+        let generation = proxy.core_generation();
+        if !stream_session_current(&proxy, port, generation) {
+            continue;
+        }
+        let Some(mut stream) = source::subscribe_status(&config, port).await else {
+            tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
+            continue;
         };
-        let mut stream =
-            client.subscribe_status(STATS_STREAM_INTERVAL_NS, ReconnectConfig::default());
+        if !stream_session_current(&proxy, port, generation) {
+            continue;
+        }
         // 新流 = 新的一份真相：速率基线在此刻作废。
         meter.reset();
         offline_sent = false;
         // 上一次见到的 `trafficAvailable`（`None` = 本条流还没见过帧 → 首帧必报一次）。
         // 随流而生、随流而灭：见 [`traffic_availability_changed`]。
         let mut traffic_available: Option<bool> = None;
-        log::debug!("Status 流已订阅（port={port}）");
+        log::debug!("Status 流已订阅（{}）", source::stream_label(port));
 
         // ④ 流循环。
         loop {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
+            if !stream_session_current(&proxy, port, generation) {
+                break;
+            }
             tokio::select! {
                 frame = stream.recv() => match frame {
                     Some(st) => {
+                        if !stream_session_current(&proxy, port, generation) {
+                            break;
+                        }
                         // 显式判 `trafficAvailable`：核没有 trafficManager 时本流照推、字段安静全 0，
                         // 不喊出来就是「0 B/s 且零报错」，与真的没流量无从区分。
                         if traffic_availability_changed(traffic_available, st.traffic_available) {
@@ -782,7 +812,7 @@ pub(super) async fn run_stats_stream(
                                 );
                             }
                         }
-                        meter.on_status(&daemon_status_to_engine(&st), mono_ms(clock));
+                        meter.on_status(&st, mono_ms(clock));
                         // 门关的一瞬可能正好收到一帧（`wait_until(false, ..)` 那条腿还没被调度到）→
                         // emit 前再看一次订阅门，别把帧推给已经没人看的窗口。
                         if gate.topic_open(Topic::Stats) {
@@ -799,8 +829,7 @@ pub(super) async fn run_stats_stream(
             }
 
             // 核停 / 换端口（换核、重启动态口）→ 断流重来。ReconnectingStream 自己发现不了这两件事。
-            let st = proxy.status();
-            if !st.running || st.clash_api_port != port {
+            if !stream_session_current(&proxy, port, generation) {
                 break;
             }
         }

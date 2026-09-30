@@ -1,3 +1,9 @@
+---
+status: active
+updated: 2026-09-28
+area: polaris
+---
+
 # GeoIP & GeoSite data files
 
 [简体中文](geo-rulesets.md) · **English**

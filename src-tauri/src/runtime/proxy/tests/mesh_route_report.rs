@@ -308,6 +308,119 @@ async fn dns_owner_exists_without_any_force_route_claimant() {
     assert!(report.results.is_empty());
 }
 
+async fn dns_only_metadata_gate(
+    rt: &ProxyRuntime,
+    path: &std::path::Path,
+) -> Result<GateOutcome, String> {
+    let (mut raw, _) = ts_config(&["ts-dns-only"], true);
+    raw["servers"][0]["tailscaleSettings"]["alwaysRouteSubnets"] = serde_json::Value::Bool(false);
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    rt.generate_and_gate_with_runtime_bindings(
+        &config,
+        &deps,
+        path,
+        None,
+        &mut BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_admission_is_instance_local_and_unknown_never_writes() {
+    use polaris_core_supervisor::ValidationLifecycleError;
+
+    for error in [
+        ValidationLifecycleError::CleanupUnconfirmed(
+            "a previous validation birth retains cleanup debt".into(),
+        ),
+        ValidationLifecycleError::Closing,
+    ] {
+        let (accepted_rt, accepted_dir) = test_runtime();
+        let (rejected_rt, rejected_dir) = test_runtime();
+        *rejected_rt.metadata_validation_admission.lock().unwrap() = Some(Err(error.clone()));
+        let accepted_path = accepted_dir.join("accepted.json");
+        let rejected_path = rejected_dir.join("rejected.json");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let accepted = tokio::spawn({
+            let rt = Arc::clone(&accepted_rt);
+            let path = accepted_path.clone();
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                dns_only_metadata_gate(&rt, &path).await
+            }
+        });
+        let rejected = tokio::spawn({
+            let rt = Arc::clone(&rejected_rt);
+            let path = rejected_path.clone();
+            let barrier = Arc::clone(&barrier);
+            async move {
+                barrier.wait().await;
+                dns_only_metadata_gate(&rt, &path).await
+            }
+        });
+        barrier.wait().await;
+        let (accepted, rejected) = tokio::join!(accepted, rejected);
+        let gate = accepted.unwrap().unwrap();
+        assert_eq!(gate.checks_run, 0, "metadata must not claim a native check");
+        assert!(gate.mesh_route_candidates.is_empty());
+        assert_eq!(gate.mesh_route_total_candidate_count, 0);
+        assert_eq!(
+            gate.mesh_route_dns_owner_server_id.as_deref(),
+            Some("ts-dns-only")
+        );
+        assert_eq!(
+            std::fs::read_to_string(accepted_path).unwrap(),
+            gate.config_json
+        );
+        let actual_error = match rejected.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("unconfirmed/closing admission must abort metadata generation"),
+        };
+        assert_eq!(actual_error, error.to_string());
+        assert!(
+            !rejected_path.exists(),
+            "rejection must precede config write"
+        );
+        assert!(rejected_rt.mesh_route_run.read().unwrap().is_none());
+        assert!(!rejected_rt.status().running);
+    }
+}
+
+#[test]
+fn native_binary_never_selects_metadata_admission_fixture() {
+    use polaris_core_supervisor::ValidationLifecycleError;
+
+    let (rt, dir) = test_runtime();
+    let binary = dir.join("not-a-native-backend");
+    assert!(!binary.exists()); // Only a path is passed; this control never spawns it.
+    for outcome in [
+        Ok(()),
+        Err(ValidationLifecycleError::Closing),
+        Err(ValidationLifecycleError::CleanupUnconfirmed(
+            "fixture debt".into(),
+        )),
+    ] {
+        *rt.metadata_validation_admission.lock().unwrap() = Some(outcome.clone());
+        assert_eq!(
+            rt.metadata_validation_admission_fixture(None).unwrap(),
+            Some(outcome)
+        );
+        assert_eq!(
+            rt.metadata_validation_admission_fixture(Some(&binary))
+                .unwrap(),
+            None
+        );
+    }
+    *rt.metadata_validation_admission.lock().unwrap() = None;
+    assert_eq!(
+        rt.metadata_validation_admission_fixture(None).unwrap(),
+        None
+    );
+}
+
 fn candidate(path: &std::path::Path) -> MeshRouteEmissionCandidate {
     MeshRouteEmissionCandidate {
         candidate: MeshRouteCandidate {

@@ -323,7 +323,14 @@ fn child_slot_signal_if_live_delivers_only_before_reap() {
     // 正向：未收割 → 投递，且拿到的是本 slot 的 pid。
     let slot = ChildSlot::new(4242);
     let mut got = None;
-    assert!(slot.signal_if_live(|pid| got = Some(pid)), "未收割应投递");
+    assert!(
+        slot.signal_if_live(|pid| {
+            got = Some(pid);
+            Ok(())
+        })
+        .unwrap(),
+        "未收割应投递"
+    );
     assert_eq!(got, Some(4242));
 
     // 反向：已收割（wait 已返回 ⇒ pid 随时可能被系统复用）→ 一律不投递。
@@ -331,7 +338,12 @@ fn child_slot_signal_if_live_delivers_only_before_reap() {
     reaped.mark_exited();
     let mut delivered = false;
     assert!(
-        !reaped.signal_if_live(|_| delivered = true),
+        !reaped
+            .signal_if_live(|_| {
+                delivered = true;
+                Ok(())
+            })
+            .unwrap(),
         "已收割应返回未投递"
     );
     assert!(!delivered, "已收割的 pid 不得再收到任何信号");
@@ -352,8 +364,9 @@ fn kill_skips_reaped_slot_but_still_kills_live_child() {
     let victim_pid = victim.id();
     let victim_slot = ChildSlot::new(victim_pid);
     victim_slot.mark_exited();
+    let victim_handle = victim_slot.handle.clone();
     spawner.slots.lock().unwrap().push(victim_slot);
-    spawner.kill(&CoreHandle { pid: victim_pid });
+    spawner.kill(&victim_handle);
     assert!(
         !exited_within(&mut victim, Duration::from_millis(300)),
         "已收割 slot 的 pid 收到了 SIGKILL —— 正是 pid 复用误杀"
@@ -364,8 +377,10 @@ fn kill_skips_reaped_slot_but_still_kills_live_child() {
     // ② 正向对照：同一条 kill 路径，未收割的 slot 必须真杀掉。
     let mut live = spawn_sleeper();
     let live_pid = live.id();
-    spawner.slots.lock().unwrap().push(ChildSlot::new(live_pid));
-    spawner.kill(&CoreHandle { pid: live_pid });
+    let live_slot = ChildSlot::new(live_pid);
+    let live_handle = live_slot.handle.clone();
+    spawner.slots.lock().unwrap().push(live_slot);
+    spawner.kill(&live_handle);
     assert!(
         exited_within(&mut live, Duration::from_secs(3)),
         "未收割的 child 必须被 SIGKILL（否则上一条的绿无信息量）"
@@ -390,6 +405,503 @@ fn terminate_slot_sends_nothing_to_a_reaped_slot() {
     );
     let _ = sleeper.kill();
     let _ = sleeper.wait();
+}
+
+struct ScriptedWaiter {
+    steps: std::collections::VecDeque<std::io::Result<Option<ExitStatus>>>,
+}
+
+impl ChildWaiter for ScriptedWaiter {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.steps.pop_front().unwrap_or(Ok(None))
+    }
+}
+
+fn scripted_slot(pid: u32, steps: Vec<std::io::Result<Option<ExitStatus>>>) -> Arc<ChildSlot> {
+    ChildSlot::with_waiter(
+        CoreHandle::new(pid),
+        Box::new(ScriptedWaiter {
+            steps: steps.into(),
+        }),
+    )
+}
+
+fn exact_scripted_slot(
+    pid: u32,
+    byte: u8,
+    steps: Vec<std::io::Result<Option<ExitStatus>>>,
+) -> Arc<ChildSlot> {
+    ChildSlot::with_waiter(
+        CoreHandle::exact(
+            NonZeroU32::new(pid).unwrap(),
+            polaris_helper_proto::HelperBirthToken::from_bytes([byte; 16]),
+        ),
+        Box::new(ScriptedWaiter {
+            steps: steps.into(),
+        }),
+    )
+}
+
+#[test]
+fn hidden_birth_blocks_exact_admission_without_inventing_empty_or_already() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let hidden = exact_scripted_slot(4242, 1, vec![Ok(None)]);
+    let target = hidden.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(hidden);
+    assert_eq!(
+        spawner.scan_birth_admission(None),
+        BirthAdmission::Blocked {
+            target: Some(target),
+            state: ReapBlockerState::Pending,
+        }
+    );
+    assert!(spawner.has_exact_birth());
+
+    let legacy = ChildSlot::new(4243);
+    spawner.slots.lock().unwrap().push(legacy);
+    assert!(matches!(
+        spawner.scan_birth_admission(None),
+        BirthAdmission::Blocked { .. }
+    ));
+}
+
+#[test]
+fn state_held_birth_without_native_slot_is_unknown_not_empty() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let missing = CoreHandle::exact(
+        NonZeroU32::new(5151).unwrap(),
+        polaris_helper_proto::HelperBirthToken::from_bytes([3; 16]),
+    );
+    assert_eq!(
+        spawner.scan_birth_admission(Some(&missing)),
+        BirthAdmission::Blocked {
+            target: missing.target(),
+            state: ReapBlockerState::Unknown,
+        }
+    );
+}
+
+#[test]
+fn native_reap_tombstone_serves_late_stop_but_not_restarted_helper() {
+    use std::os::unix::process::ExitStatusExt;
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    let old = exact_scripted_slot(4242, 1, vec![Ok(Some(ExitStatus::from_raw(0)))]);
+    let old_target = old.handle.target().unwrap();
+    state.lock().unwrap().child = Some(ManagedChild::Running(old.handle.clone()));
+    spawner.slots.lock().unwrap().push(Arc::clone(&old));
+    run_reaper(
+        &old.handle,
+        &state,
+        &old,
+        &spawner.slots,
+        &spawner.tombstones,
+    );
+    assert!(state.lock().unwrap().child.is_none());
+    assert!(spawner.slots.lock().unwrap().is_empty());
+    assert_eq!(spawner.stop_birth(&old_target), StopReap::Reaped);
+
+    let successor = exact_scripted_slot(4242, 2, vec![Ok(None)]);
+    let successor_target = successor.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(Arc::clone(&successor));
+    assert_eq!(
+        spawner.stop_birth(&old_target),
+        StopReap::Reaped,
+        "late old Stop must not signal a successor with a reused PID"
+    );
+    assert!(matches!(successor.reap_fact(), LocalReapFact::Pending));
+    assert!(!successor.custody.lock().unwrap().termination_started);
+    assert_ne!(old_target, successor_target);
+
+    let restarted = AmbientCapsSpawner::new(Arc::new(Mutex::new(HandlerState::new())));
+    assert_eq!(
+        restarted.stop_birth(&old_target),
+        StopReap::Unknown,
+        "a daemon restart has no proof of the previous birth"
+    );
+}
+
+#[test]
+fn tombstones_are_bounded_and_only_native_reap_populates_them() {
+    use std::os::unix::process::ExitStatusExt;
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    let mut first = None;
+    let mut last = None;
+    for byte in 0..=REAP_TOMBSTONES as u8 {
+        let slot = exact_scripted_slot(
+            u32::from(byte) + 1,
+            byte,
+            vec![Ok(Some(ExitStatus::from_raw(0)))],
+        );
+        let target = slot.handle.target().unwrap();
+        first.get_or_insert(target);
+        last = Some(target);
+        spawner.slots.lock().unwrap().push(Arc::clone(&slot));
+        run_reaper(
+            &slot.handle,
+            &state,
+            &slot,
+            &spawner.slots,
+            &spawner.tombstones,
+        );
+    }
+    assert_eq!(spawner.tombstones.lock().unwrap().len(), REAP_TOMBSTONES);
+    assert_eq!(spawner.stop_birth(&first.unwrap()), StopReap::Unknown);
+    assert_eq!(spawner.stop_birth(&last.unwrap()), StopReap::Reaped);
+
+    let unknown = exact_scripted_slot(
+        9999,
+        99,
+        vec![Err(std::io::Error::other("native wait failed"))],
+    );
+    let unknown_target = unknown.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(Arc::clone(&unknown));
+    run_reaper(
+        &unknown.handle,
+        &state,
+        &unknown,
+        &spawner.slots,
+        &spawner.tombstones,
+    );
+    assert_eq!(spawner.stop_birth(&unknown_target), StopReap::Unknown);
+    assert!(spawner
+        .slots
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|slot| slot.handle.same_birth(&unknown.handle)));
+}
+
+#[test]
+fn slot_removal_and_tombstone_publish_share_one_registry_lock_domain() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::mpsc;
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = Arc::new(AmbientCapsSpawner::new(Arc::clone(&state)));
+    let slot = exact_scripted_slot(5252, 5, vec![Ok(Some(ExitStatus::from_raw(0)))]);
+    let target = slot.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(Arc::clone(&slot));
+    let LocalReapFact::Reaped(proof) = slot.reap_fact() else {
+        panic!("native wait must reap")
+    };
+    let tombstone_lock = spawner.tombstones.lock().unwrap();
+    let clear_slots = Arc::clone(&spawner.slots);
+    let clear_tombstones = Arc::clone(&spawner.tombstones);
+    let clear_state = Arc::clone(&state);
+    let clear = std::thread::spawn(move || {
+        clear_reaped_birth(&proof, &clear_state, &clear_slots, &clear_tombstones)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while spawner.slots.try_lock().is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clear never acquired registry lock"
+        );
+        std::thread::yield_now();
+    }
+    let query_spawner = Arc::clone(&spawner);
+    let (tx, rx) = mpsc::channel();
+    let query = std::thread::spawn(move || tx.send(query_spawner.stop_birth(&target)).unwrap());
+    assert!(
+        rx.recv_timeout(Duration::from_millis(30)).is_err(),
+        "Stop must not observe slot deletion before tombstone publication"
+    );
+    drop(tombstone_lock);
+    clear.join().unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        StopReap::Reaped
+    );
+    query.join().unwrap();
+}
+
+#[test]
+fn native_wait_error_retains_unknown_custody_and_blocks_signal() {
+    let slot = scripted_slot(421, vec![Err(std::io::Error::other("fake wait failure"))]);
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+    let mut signals = 0;
+    assert!(!slot
+        .signal_if_live(|_| {
+            signals += 1;
+            Ok(())
+        })
+        .unwrap());
+    assert_eq!(signals, 0);
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+    assert!(!slot.wait_exited(Duration::from_millis(1)));
+}
+
+#[test]
+fn start_admission_scans_every_slot_and_unknown_wins() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let current = ChildSlot::new(610);
+    let earlier_pending = ChildSlot::new(611);
+    let earlier_unknown = scripted_slot(
+        612,
+        vec![Err(std::io::Error::other("unrecoverable native wait"))],
+    );
+    spawner
+        .slots
+        .lock()
+        .unwrap()
+        .extend([Arc::clone(&current), earlier_pending, earlier_unknown]);
+
+    assert_eq!(
+        spawner.scan_start_admission(Some(&current.handle)),
+        StartAdmission::Blocked {
+            pid: 612,
+            state: ReapBlockerState::Unknown,
+        },
+        "an exact Running slot cannot hide an earlier unreaped birth"
+    );
+}
+
+#[test]
+fn termination_booking_is_single_worker_and_never_mints_reap() {
+    let slot = ChildSlot::new(613);
+    assert_eq!(slot.begin_or_poll_termination(), (StopReap::Pending, true));
+    assert_eq!(
+        slot.begin_or_poll_termination(),
+        (StopReap::Pending, false),
+        "a retry may poll but must not dispatch a second TERM/KILL worker"
+    );
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+}
+
+#[test]
+fn failed_native_wait_cannot_clear_handler_or_registry_when_reaper_finishes() {
+    let slot = scripted_slot(425, vec![Err(std::io::Error::other("fake wait failure"))]);
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
+    run_reaper(
+        &slot.handle,
+        &state,
+        &slot,
+        &slots,
+        &Arc::new(Mutex::new(VecDeque::new())),
+    );
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.handle().same_birth(&slot.handle)));
+    assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+}
+
+#[test]
+fn unknown_native_wait_stops_parent_watcher_without_probe_or_clear() {
+    let slot = scripted_slot(427, vec![Err(std::io::Error::other("fake wait failure"))]);
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Unknown));
+    assert_eq!(
+        slot.wait_outcome(Duration::from_secs(1)),
+        ChildWaitOutcome::Unknown
+    );
+    watch_parent_loop(123, &slot.handle, &state, &slot, |_| {
+        panic!("Unknown watcher must exit before probing parent")
+    });
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.handle().same_birth(&slot.handle)));
+    assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
+}
+
+#[test]
+fn signal_success_or_error_never_mints_reaped_fact() {
+    let slot = scripted_slot(422, vec![Ok(None), Ok(None), Ok(None)]);
+    assert!(slot.signal_if_live(|_| Ok(())).unwrap());
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+    assert!(slot.signal_if_live(|_| Err(nix::Error::EIO)).is_err());
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+}
+
+#[test]
+fn late_old_birth_reaper_cannot_clear_successor_with_reused_pid() {
+    let old = ChildSlot::new(423);
+    let successor = ChildSlot::new(423);
+    assert!(!old.handle.same_birth(&successor.handle));
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(ManagedChild::Running(successor.handle.clone()));
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&old), Arc::clone(&successor)]));
+    old.mark_exited();
+    let LocalReapFact::Reaped(old_proof) = old.reap_fact() else {
+        panic!("old native wait must produce a same-birth fact");
+    };
+    clear_reaped_birth(
+        &old_proof,
+        &state,
+        &slots,
+        &Arc::new(Mutex::new(VecDeque::new())),
+    );
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.handle().same_birth(&successor.handle)));
+    let remaining = slots.lock().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].handle.same_birth(&successor.handle));
+}
+
+#[test]
+fn mismatched_reaper_handle_cannot_clear_reaped_slot() {
+    let slot = ChildSlot::new(428);
+    slot.mark_exited();
+    let wrong = CoreHandle::new(428);
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    state.lock().unwrap().child = Some(ManagedChild::Running(slot.handle.clone()));
+    let slots = Arc::new(Mutex::new(vec![Arc::clone(&slot)]));
+    run_reaper(
+        &wrong,
+        &state,
+        &slot,
+        &slots,
+        &Arc::new(Mutex::new(VecDeque::new())),
+    );
+    assert!(state
+        .lock()
+        .unwrap()
+        .child
+        .as_ref()
+        .is_some_and(|h| h.handle().same_birth(&slot.handle)));
+    assert!(Arc::ptr_eq(&slots.lock().unwrap()[0], &slot));
+}
+
+#[test]
+fn stale_handle_cannot_find_successor_slot_with_same_pid() {
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let old = CoreHandle::new(426);
+    let successor = ChildSlot::new(426);
+    spawner.slots.lock().unwrap().push(Arc::clone(&successor));
+    assert!(spawner.find_slot(&old).is_none());
+    assert!(spawner.find_slot(&successor.handle).is_some());
+    assert!(matches!(
+        spawner.local_reap_fact(&old),
+        LocalReapFact::Unknown
+    ));
+}
+
+#[test]
+fn native_wait_and_signal_serialize_at_birth_lock() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::mpsc;
+
+    struct HeldWaiter {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl ChildWaiter for HeldWaiter {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(Some(ExitStatus::from_raw(0)))
+        }
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let slot = ChildSlot::with_waiter(
+        CoreHandle::new(424),
+        Box::new(HeldWaiter {
+            entered: entered_tx,
+            release: release_rx,
+        }),
+    );
+    let for_reaper = Arc::clone(&slot);
+    let reaper = std::thread::spawn(move || for_reaper.reap_fact());
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let for_signal = Arc::clone(&slot);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (signal_tx, signal_rx) = mpsc::channel();
+    let signal = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let mut sent = false;
+        let result = for_signal.signal_if_live(|_| {
+            sent = true;
+            Ok(())
+        });
+        signal_tx.send((result, sent)).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(signal_rx.recv_timeout(Duration::from_millis(30)).is_err());
+    release_tx.send(()).unwrap();
+    assert!(matches!(reaper.join().unwrap(), LocalReapFact::Reaped(_)));
+    let (result, sent) = signal_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    signal.join().unwrap();
+    assert!(!result.unwrap());
+    assert!(!sent, "wait reaped before signal obtained the birth lock");
+}
+
+#[test]
+fn real_local_child_yields_reaped_only_after_native_wait() {
+    let child = spawn_sleeper();
+    let handle = CoreHandle::new(child.id());
+    let slot = ChildSlot::from_child(child, handle.clone());
+    assert!(matches!(slot.reap_fact(), LocalReapFact::Pending));
+    assert!(slot
+        .signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL))
+        .unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match slot.reap_fact() {
+            LocalReapFact::Pending if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            LocalReapFact::Reaped(proof) => {
+                assert!(proof.birth.same_birth(&handle));
+                assert!(!proof.status.success());
+                break;
+            }
+            _ => panic!("real child must be reaped by its owned Child handle"),
+        }
+    }
+}
+
+#[test]
+fn production_stop_poll_is_pending_until_native_reaper_clears_birth() {
+    let child = spawn_sleeper();
+    let handle = CoreHandle::new(child.id());
+    let slot = ChildSlot::from_child(child, handle.clone());
+    let state = Arc::new(Mutex::new(HandlerState {
+        child: Some(ManagedChild::Stopping(handle.clone())),
+    }));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    spawner.slots.lock().unwrap().push(Arc::clone(&slot));
+    spawn_reaper(
+        handle.clone(),
+        Arc::clone(&state),
+        Arc::clone(&slot),
+        Arc::clone(&spawner.slots),
+        Arc::clone(&spawner.tombstones),
+    );
+
+    assert_eq!(
+        spawner.terminate(&handle),
+        StopReap::Pending,
+        "dispatching TERM is not a successful Stop receipt"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if state.lock().unwrap().child.is_none() && spawner.slots.lock().unwrap().is_empty() {
+            spawner.wait_reaps(Duration::from_secs(1));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("native Child::try_wait never produced the reap proof");
 }
 
 // ===== 连接并发闸的接线（复审 Medium：spawn_blocking 在鉴权之前，且此前无上限）=====

@@ -9,6 +9,7 @@ describe('server switch receipt feedback', () => {
   it.each([
     [{ status: 'applied' }, 'success', 'home.switchedToast'],
     [{ status: 'pending' }, 'info', 'home.switchPending'],
+    [{ status: 'restarting' }, 'info', 'home.switchRestarting'],
     [{ status: 'notRunning' }, 'info', 'home.switchSavedForNextStart'],
     [{ status: 'deferred', reason: 'nodeRequiresApply' }, 'warning', 'home.switchRequiresApply'],
   ] as const)('%s reports only its confirmed state', (receipt, tone, text) => {

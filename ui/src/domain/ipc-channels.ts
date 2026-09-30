@@ -2,7 +2,7 @@
  * IPC 通道名（Tauri 2）。**command 与 event 两类命名规则不同，勿混用**：
  *
  *  1. **command**（经 `invoke()` 调用）：值 **必须逐字等于 Rust `#[tauri::command]` 的函数名**
- *     （snake_case，且必须出现在 `src-tauri/src/main.rs` 的 `generate_handler![]` 里）。
+ *     （snake_case，且必须出现在 `src-tauri/src/lib.rs` 的 `generate_handler![]` 里）。
  *     Tauri 的命令名就是 Rust 函数名，**冒号在 Rust 标识符里不合法** —— 故 command 值里
  *     绝不能出现 `:`。（历史坑：本文件曾从 Electron 照搬 `'config:get'` 风格，Rust 侧永远匹配不上，
  *     运行期报 `Command config:get not found`，而调用方 `.catch()` 把错误吞了、tsc 也查不出字符串值，
@@ -71,11 +71,15 @@ export const IPC_CHANNELS = {
   WARP_APPLY_LICENSE: 'warp_apply_license', // 对已注册 WARP 节点原地应用 WARP+ license（升级免重建）
   TAILSCALE_LOGIN: 'tailscale_login', // 按需瞬态登录核：拉起登录专用 sing-box 取交互登录 URL（Phase 2）
   TAILSCALE_LOGIN_PREPARE: 'tailscale_login_prepare',
+  TAILSCALE_LOGIN_PROGRESS: 'tailscale_login_progress',
   TAILSCALE_LOGIN_CANCEL: 'tailscale_login_cancel', // 取消某节点在飞的瞬态登录核（用户手动取消）
   TAILSCALE_LOGOUT: 'tailscale_logout', // 退出登录：清该节点 state 目录（持久会话）；保留节点配置/authKey
   TAILSCALE_STATE_EXISTS: 'tailscale_state_exists', // 批量查 TS 节点 state 目录存在性（不起核判「登录过没」）：代理关时登录态缓存未命中的兜底
   TAILSCALE_GET_STATUS: 'tailscale_get_status', // L2：主动拉各 TS 节点状态末帧(self IP/peers) + 新鲜度(connected)。治本「状态流 push-only 无 pull、渲染端错过推送即陈旧」
   VPN_GET_STATUS: 'vpn_get_status',
+  // 系统 VPN 授权状态（移动端设置页那一行；桌面恒 `unknown`，那里没有这个对象）。
+  // 与上一行同前缀但不是同一族：那条报的是 OpenConnect/OpenVPN 出站协议的会话状态。
+  VPN_AUTH_STATUS: 'vpn_auth_status',
   OPENCONNECT_SUBMIT_AUTH_FORM: 'openconnect_submit_auth_form',
   OPENCONNECT_SUBMIT_AUTH_BROWSER: 'openconnect_submit_auth_browser',
   OPENCONNECT_CANCEL_AUTH: 'openconnect_cancel_auth',
@@ -191,6 +195,15 @@ export const IPC_CHANNELS = {
 
   // 系统进程枚举（路由规则的进程快速选择器）
   SYSTEM_LIST_PROCESSES: 'system_list_processes',
+  // 已安装应用枚举（**Android 专属**：自定义应用的包名选择器）。与上一条是同一件事的两个平台
+  // 形态 —— 桌面按进程名匹配，Android 按 applicationId 匹配。桌面调它恒得 success:false
+  // （`android_bridge::installed_apps` 的非 android 臂），**不返空表**：空表与「这台机器上真的
+  // 一个应用都没有」在渲染端不可区分。
+  SYSTEM_LIST_INSTALLED_APPS: 'system_list_installed_apps',
+  // 系统自动备份开关（**Android 专属**：Google 云备份 + 设备间迁移的运行期闸门，默认关）。
+  // 真值住 Kotlin `noBackupFilesDir`（`PolarisBackupAgent`）；桌面调它恒得 success:false。
+  SYSTEM_BACKUP_SET: 'system_backup_set',
+  SYSTEM_BACKUP_GET_STATUS: 'system_backup_get_status',
 
   // 版本信息
   VERSION_GET_INFO: 'version_get_info',

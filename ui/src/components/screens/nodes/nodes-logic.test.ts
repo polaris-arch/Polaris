@@ -390,7 +390,7 @@ describe('subUsage —— 用量条阈值是契约数字（≥85% warn），不�
  * 变异锁：去掉 `noop` 那条 → 第 1 条转红（重选当前出口会白弹一条「已切换」）；
  * 让整卡也直切 → 第 3 条转红（整卡误触即当场改全局出口）；
  * 让按钮也确认 → 第 4 条转红（高频动作被收确认税）；
- * 把 `willRestart` 的判定挪到 `via` 之后 → 第 2 条的按钮腿转红（断连接那次必须两个面都确认）。
+ * 把 `needsApply` 的判定挪到 `via` 之后 → 第 2 条的按钮腿转红（断连接那次必须两个面都确认）。
  */
 describe('nodeUseAction —— 设为出口按触发面分档', () => {
   it('已是当前出口 → noop（后端重选同一节点是空操作，不该弹 toast）', () => {
@@ -400,9 +400,9 @@ describe('nodeUseAction —— 设为出口按触发面分档', () => {
     expect(nodeUseAction('a', 'a', true, 'card')).toBe('noop');
   });
 
-  it('在待应用差集里 → confirm-restart，**两个触发面都要**（代价是断连接，与命中面无关）', () => {
-    expect(nodeUseAction('b', 'a', true, 'card')).toBe('confirm-restart');
-    expect(nodeUseAction('b', 'a', true, 'button')).toBe('confirm-restart');
+  it('在待应用差集里 → confirm-apply，**两个触发面都要**（代价是断连接，与命中面无关）', () => {
+    expect(nodeUseAction('b', 'a', true, 'card')).toBe('confirm-apply');
+    expect(nodeUseAction('b', 'a', true, 'button')).toBe('confirm-apply');
   });
 
   it('整卡 + 普通节点 → confirm（最大命中面，误触即改全局出口且用户未必察觉）', () => {

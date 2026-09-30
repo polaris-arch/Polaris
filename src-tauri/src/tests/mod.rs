@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{crate_code, crate_file};
+use crate::test_support::{crate_file, crate_root_code};
 
 /// 本地 renderer → 应用命令这条高权限边界的 CSP 契约（门的实体在这个子模块里）。
 mod csp_contract;
@@ -14,7 +14,7 @@ mod window_build_sites;
 #[test]
 fn main_window_native_maximize_is_bridged_to_renderer() {
     let body = crate::commands::guard_scan::top_level_fn_body(
-        &crate_code("main.rs"),
+        &crate_root_code(),
         "fn create_main_window(",
     );
     for required in [
@@ -109,8 +109,7 @@ mod tray_dark_bg_probe {
 /// 故本门在 Linux/Windows 的 CI 上一样有判据 —— 不会出现「只有 mac 跑得到的门」。
 #[test]
 fn native_dialog_language_is_applied_before_appkit_boots() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(&crate_code("main.rs"), "fn main() {");
+    let body = crate::commands::guard_scan::top_level_fn_body(&crate_root_code(), "pub fn run() {");
     let apply = body
         .find("app_language::apply_process_language(")
         .expect("锚点消失：原生对话框语言对账的调用点没了 —— macOS 上原生对话框会退回跟随系统语言");
@@ -128,7 +127,7 @@ fn native_dialog_language_is_applied_before_appkit_boots() {
 /// 要么 controller 看不到 prewarm 标记并在每次 System 连接里重复 `netsh`。
 #[test]
 fn windows_quic_cleanup_prewarm_precedes_proxy_runtime_construction() {
-    let source = crate_code("main.rs");
+    let source = crate_root_code();
     let logging = source
         .find("logging::init(&config_dir)")
         .expect("日志初始化锚点消失");
@@ -145,8 +144,7 @@ fn windows_quic_cleanup_prewarm_precedes_proxy_runtime_construction() {
 /// 这里只钉装配顺序；mutex 的排他行为由 `windows_single_instance` 的 Windows 单测真跑。
 #[test]
 fn windows_single_instance_startup_gate_wraps_plugin_setup() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(&crate_code("main.rs"), "fn main() {");
+    let body = crate::commands::guard_scan::top_level_fn_body(&crate_root_code(), "pub fn run() {");
     let acquire = body
         .find("windows_single_instance::StartupGate::acquire(")
         .expect("Windows 单实例启动闸门的取得点消失");
@@ -187,7 +185,7 @@ fn windows_single_instance_startup_gate_wraps_plugin_setup() {
 /// 不在此列。
 #[test]
 fn main_window_size_comes_only_from_conf() {
-    let src = crate_code("main.rs");
+    let src = crate_root_code();
     let body = crate::commands::guard_scan::top_level_fn_body(&src, "fn create_main_window(");
     assert!(
         !body.is_empty(),
@@ -208,7 +206,7 @@ fn main_window_size_comes_only_from_conf() {
 /// 没有原生材质，表现为整个左侧导航直接透出桌面。
 #[test]
 fn main_window_rebuild_is_dispatched_to_main_thread() {
-    let src = crate_code("main.rs");
+    let src = crate_root_code();
     let entry = crate::commands::guard_scan::top_level_fn_body(&src, "fn show_main_window(");
     let on_main =
         crate::commands::guard_scan::top_level_fn_body(&src, "fn show_main_window_on_main_thread(");
@@ -340,22 +338,53 @@ fn regex_can_start(out: &str) -> bool {
 /// 并复位。任何残余的引号态误判（正则、JSX 文本里的 `don't` …）都被限制在**一行内**，
 /// 不再顺着文件级联。
 fn strip_ts_comments(src: &str) -> String {
+    strip_ts(src, false)
+}
+
+/// 在 [`strip_ts_comments`] 之上**再把字符串 / 模板 / 正则字面量的内部字符换成空格**（起止引号、
+/// 换行原样留着，只清内容，行号与行数都不动）。
+///
+/// 只给声明面扫描（[`declares_binding`]）用：一句 `const s = "const confirm = …"` 或一段示例
+/// 模板文本不该被当成「本文件真的声明了 confirm 绑定」—— 那会把一次**真实的**全局调用喂绿。
+/// 调用面判据（[`calls_global`]）反过来**不能**用这一档：它要看得见 `window['confirm']` 这种
+/// 写在字符串里的成员名。
+fn strip_ts_comments_and_strings(src: &str) -> String {
+    strip_ts(src, true)
+}
+
+/// 两档剥离的共同内核。`blank_literals` = 是否连字面量内容一起清空（见
+/// [`strip_ts_comments_and_strings`]）。只有一份状态机：正则/JSX/未闭合引号那一堆边界只此一处，
+/// 两档共享，不存在「一档修了另一档没修」。
+///
+/// 形状与 `crates/source-probe` 的 `mask_comments` / `mask_comments_and_strings` 两档一致
+/// （共用一份词法扫描、只差一个布尔）。这里没有直接用那一对，是因为那份扫的是 **Rust** 词法
+/// （字符 / 字节 / raw 字面量、生命周期 `'a`），认不得 TS 的模板串、正则与 JSX —— 本文件的
+/// TS 状态机本来就是为此单独存在的。
+fn strip_ts(src: &str, blank_literals: bool) -> String {
     let mut out = String::with_capacity(src.len());
     let mut it = src.chars().peekable();
     let mut quote: Option<char> = None; // Some(引号字符) = 字符串/模板内
     let mut escaped = false;
     while let Some(c) = it.next() {
         if let Some(q) = quote {
-            out.push(c);
+            // `closing` = 本字符是字面量的边界（收尾引号 / 触发复位的换行）⇒ 清空档里也要原样留。
+            let mut closing = false;
             if escaped {
                 escaped = false;
             } else if c == '\\' {
                 escaped = true;
             } else if c == q {
                 quote = None;
+                closing = true;
             } else if c == '\n' && q != '`' {
                 quote = None; // 单/双引号串不跨行 ⇒ 走到这儿说明刚才判错了，就地收手
+                closing = true;
             }
+            out.push(if blank_literals && !closing && c != '\n' {
+                ' '
+            } else {
+                c
+            });
             continue;
         }
         match c {
@@ -384,13 +413,15 @@ fn strip_ts_comments(src: &str) -> String {
                     prev = n;
                 }
             }
-            // 正则字面量：原样拷贝，只为屏蔽里面的引号，不改变任何字符。
+            // 正则字面量：结构原样（起止 `/` 与换行都留着），只为屏蔽里面的引号；
+            // `blank_literals` 档里内部字符一并清成空格，理由同字符串。
             '/' if regex_can_start(&out) => {
                 out.push('/');
                 let mut in_class = false; // `[...]` 内的 `/` 不结束字面量
                 let mut esc = false;
                 for n in it.by_ref() {
-                    out.push(n);
+                    let ends = !esc && ((n == '/' && !in_class) || n == '\n');
+                    out.push(if blank_literals && !ends { ' ' } else { n });
                     if esc {
                         esc = false;
                         continue;
@@ -438,12 +469,64 @@ fn collect_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Str
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_owned();
-        if name.contains(".test.") || name.contains(".spec.") {
+        // 🔴 三种**永不进包**的模块一律排出取材面（口径的单一真值源在
+        // `ui/src/contracts/test-only-modules.ts` 的 `IS_TEST_ONLY_MODULE`，
+        // 由 `test_only_module_infixes_match_the_typescript_source` 与本列表对拍）。
+        //
+        // `.test-support.` 是 2026-09-13 补的，起因是一次真的假阳性：连接屏的登记表
+        // `mobile/connections/absence-register.test-support.ts` 有一条 `note:`，那句话本身在说
+        // 「移动端**不用** `window.confirm` —— 它被 dialog 插件 init 覆写成 `plugin:dialog|confirm`」，
+        // 而 `DIALOG_INVOKE_TO_PERM` 按裸串匹配，把这句**解释**读成了一次调用。
+        //
+        // 为什么不改成「剥掉字符串再匹配」：真正的调用形态 `invoke('plugin:dialog|confirm')`
+        // 本身就是字符串字面量 —— 剥了它，这张表一条都匹配不到，门当场失去全部牙齿。
+        // 能分辨两者的不是「在不在字符串里」，是「这份文件会不会进包」。
+        if name.contains(".test.") || name.contains(".spec.") || name.contains(".test-support.") {
             continue;
         }
         if let Ok(s) = std::fs::read_to_string(&p) {
             out.push((p, strip_ts_comments(&s)));
         }
+    }
+}
+
+/// 本文件排除的三种「永不进包」中缀，必须与 TS 侧那份**单一枚举**逐条对上。
+///
+/// 两边各写一份名单，就是把「哪些文件不进包」这件事变成两个会各自漂的答案：TS 侧加一种
+/// 中缀（比如 `.fixture.`）而这边没跟上时，那种文件会重新落进 dialog ACL 的取材面，
+/// 而它们里面的任何一句说明文字都可能被读成一次调用。
+#[test]
+fn test_only_module_infixes_match_the_typescript_source() {
+    let path = ui_src().join("contracts/test-only-modules.ts");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("读不到 {}：{e} —— 本对拍的另一端没了", path.display()));
+    let line = src
+        .lines()
+        .find(|l| l.contains("IS_TEST_ONLY_MODULE"))
+        .unwrap_or_else(|| panic!("{} 里找不到 IS_TEST_ONLY_MODULE", path.display()));
+    // 取正则体里的那组交替分支：`\.(test|spec|test-support)\.tsx?$`
+    let open = line
+        .find("(")
+        .expect("IS_TEST_ONLY_MODULE 的正则里没有分组");
+    let close = line[open..].find(')').expect("分组没闭合") + open;
+    let infixes: Vec<&str> = line[open + 1..close].split('|').map(str::trim).collect();
+    assert!(
+        !infixes.is_empty() && infixes.iter().all(|i| !i.is_empty()),
+        "从 {} 解出 0 个中缀 —— 取材面塌了",
+        path.display()
+    );
+    // 本文件 `collect_sources` 里那三条 `name.contains(...)` 的字面量。
+    let rust = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tests/mod.rs"),
+    )
+    .expect("读不到本文件");
+    for infix in &infixes {
+        let needle = format!("name.contains(\".{infix}.\")");
+        assert!(
+            rust.contains(&needle),
+            "TS 侧把 `.{infix}.` 算成永不进包，而 `collect_sources` 没排除它 —— \
+             那种文件里的说明文字会被 dialog ACL 的裸串表读成一次调用"
+        );
     }
 }
 
@@ -479,6 +562,17 @@ const DIALOG_GLOBAL_TO_PERM: [(&str, &str); 2] = [
 ///
 /// `foo.confirm(` 这类**他人成员**不算全局调用（`window` / `globalThis` 才是），否则会把无关对象
 /// 的同名方法误判成 dialog 调用。
+///
+/// **裸调形态还要过一道作用域遮蔽**：文件自己声明了同名绑定时（依赖注入的
+/// `const { confirm } = deps`、`import { confirm } from …`、形参 …），裸 `confirm(` 按 JS 作用域
+/// 规则解析到那个局部绑定，**永远**到不了被插件覆写的全局 —— 判成全局调用就是假阳性，而本门守的
+/// 失败模式（漏授 `dialog:allow-confirm` ⇒ 整条腿抛 rejection）在那种文件里结构上不可能发生。
+/// `ui/src/mobile/nodes/node-deletion.ts` 的注入式 confirm 正是这样把本门与 ACL 门一起顶红的。
+/// 遮蔽面认哪些形态、已知边界在哪，见 [`declares_binding`]。
+///
+/// **显式属主不受遮蔽**：`window.confirm(` / `globalThis.confirm(` / `window['confirm'](` 即使在
+/// 声明了同名绑定的文件里也照抓 —— 那三种写法明确指名全局，与局部有没有同名绑定无关，而它们
+/// 恰恰是「真回退到全局对话框」最常见的写法。
 fn calls_global(src: &str, name: &str) -> bool {
     let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
     let is_global_owner = |head: &str| {
@@ -503,6 +597,10 @@ fn calls_global(src: &str, name: &str) -> bool {
             if !is_global_owner(owner.trim_end()) {
                 continue; // `dialog.confirm(` 之类：不是被覆写的那个全局
             }
+            return true; // 显式点了 window / globalThis：与同名局部绑定无关，照抓
+        }
+        if declares_binding(src, name) {
+            continue; // 裸调，但本文件自己声明了同名绑定 ⇒ 解析到它，到不了全局
         }
         return true;
     }
@@ -512,6 +610,188 @@ fn calls_global(src: &str, name: &str) -> bool {
             .iter()
             .any(|q| src.contains(&format!("{owner}[{q}{name}{q}]")))
     })
+}
+
+/// 从 `at` 向左找最近一个**未闭合**的开括号，返回 `(下标, 字符)`。同类括号各记各的深度：
+/// 够判「这次出现落在哪种模式里」，而括号不配平的源码本来就进不了编译面。
+fn enclosing_open(src: &str, at: usize) -> Option<(usize, char)> {
+    let (mut paren, mut brace, mut brack) = (0i32, 0i32, 0i32);
+    for (i, c) in src[..at].char_indices().rev() {
+        match c {
+            ')' => paren += 1,
+            ']' => brack += 1,
+            '}' => brace += 1,
+            '(' if paren == 0 => return Some((i, '(')),
+            '[' if brack == 0 => return Some((i, '[')),
+            '{' if brace == 0 => return Some((i, '{')),
+            '(' => paren -= 1,
+            '[' => brack -= 1,
+            '{' => brace -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `open` 处那个开括号的匹配闭括号下标。
+fn matching_close(src: &str, open: usize) -> Option<usize> {
+    let (o, c) = match src[open..].chars().next()? {
+        '(' => ('(', ')'),
+        '[' => ('[', ']'),
+        '{' => ('{', '}'),
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    for (i, ch) in src[open..].char_indices() {
+        if ch == o {
+            depth += 1;
+        } else if ch == c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(open + i);
+            }
+        }
+    }
+    None
+}
+
+/// `open` 处那个 `(` 是**形参列表**的开括号吗（而不是调用实参、控制流条件、分组括号）？
+///
+/// 判据两条：闭括号之后是 `=>`（箭头函数）或 `{`（函数体），且开括号前不是 `if|while|for|switch`
+/// 的条件括号（`if (confirm) {` 的 `)` 后面也是 `{`，光看后缀分不开）。
+///
+/// [`declares_binding`] 的 `'('` 支与 `'{'` 支**共用这一份**：`'('` 支问「`(confirm) =>` 里的
+/// confirm 是不是形参」，`'{'` 支问「`foo(a, { confirm })` 外面那层 `(` 是不是形参列表」——
+/// 同一个问题问两次，各写一份迟早漂。
+fn is_param_list(src: &str, open: usize) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let before = src[..open].trim_end();
+    matching_close(src, open).is_some_and(|close| {
+        let tail = src[close + 1..].trim_start();
+        tail.starts_with("=>") || tail.starts_with('{')
+    }) && !["if", "while", "for", "switch"].iter().any(|kw| {
+        before
+            .strip_suffix(kw)
+            .is_some_and(|rest| rest.chars().last().is_none_or(|c| !ident(c)))
+    })
+}
+
+/// `name` 是否由某条 `import … from '…'` 引入（默认 / 具名 / `as` 改名都算）。
+/// 语句射程与 [`dialog_import`] 同一套切分：本关键字 → 下一条 import/export 关键字，越不了界。
+fn imports_binding(src: &str, name: &str) -> bool {
+    let mut stmts: Vec<(usize, &str)> = ["import", "export"]
+        .iter()
+        .flat_map(|kw| keyword_positions(src, kw).map(move |i| (i, *kw)))
+        .collect();
+    stmts.sort_unstable();
+    stmts.iter().enumerate().any(|(n, &(pos, kw))| {
+        if kw != "import" {
+            return false; // `export … from` 不往本文件引入绑定
+        }
+        let end = stmts.get(n + 1).map_or(src.len(), |(next, _)| *next);
+        module_specifier(&src[pos + kw.len()..end])
+            .is_some_and(|(clause, _)| keyword_positions(clause, name).next().is_some())
+    })
+}
+
+/// 本文件**自己声明了**名为 `name` 的绑定吗？有则裸调 `name(` 解析到它，到不了被覆写的全局
+/// （[`calls_global`] 据此豁免裸调形态）。
+///
+/// 取材面先过 [`strip_ts_comments_and_strings`]：注释、字符串 / 模板 / 正则字面量里的
+/// `const confirm =` 一律不算声明 —— 否则一行注释或一段示例文本就能把真实的全局调用喂绿。
+///
+/// **认这些形态**（每条在 `calls_global_sees_through_local_bindings` 里各有一条用例）：
+/// - `import { confirm } from …` / `import confirm from …` / `import { ask as confirm } from …`
+/// - `const|let|var confirm = …`、`function confirm(…)`、`class confirm`
+/// - 对象解构：`const { a, confirm } = x`、`const { ask: confirm } = x`、嵌套 `const { a: { confirm } } = x`、
+///   形参解构 `function f({ confirm })`
+/// - 数组解构：`const [confirm] = x`（**只**认 const/let/var 前缀：否则 React 依赖数组
+///   `[confirm, dismiss]` 会被当成声明，那是使用位）
+/// - 形参：`function f(confirm)`、`(confirm) => …`、`(a, confirm: T) => …`、`catch (confirm)`。
+///   「这对圆括号是不是形参列表」按**闭括号之后是 `=>` 或 `{`** 判，并排掉 `if|while|for|switch`
+///   的条件括号（`if (confirm) {` 是使用位）
+///
+/// **刻意不认**（认了就是把使用位当声明、放过真实全局调用）：类型/接口字段
+/// `readonly confirm: (…) => string`（`node-deletion.ts:60` 正是这形态，它不是值绑定；那个文件
+/// 真正的绑定是 `:77` 的解构，本判据认的是后者）、对象字面量的键与简写 `{ confirm: x }` /
+/// `{ confirm }`、实参 `register(confirm)`、依赖数组 `[confirm]`。对象字面量简写写成**实参**时
+/// （`foo(a, { confirm })`）同样不认：花括号被 `(` 包着的话，得那个 `(` 经 [`is_param_list`]
+/// 判定为形参列表才算解构模式 —— 只有 `function f({ confirm })` / `({ confirm }) => …` 过得了。
+///
+/// **已知边界（文件粒度，不是词法作用域粒度）**：本判据只问「这个文件里有没有一处 `name` 绑定」，
+/// 不问那处绑定罩不罩得住调用点。于是一个文件若在某个嵌套块里声明了 `confirm`（比如某个函数的
+/// 形参），同时又在模块顶层裸调 `confirm(`，本判据会**放过那次真实的全局调用**。这是刻意取的
+/// 工程折中：要判准就得引 JS parser（新依赖 + 一整套 TS/TSX 语法面），而本门的实际护栏面是
+/// 「有人在前端写回 window.confirm」—— 那种写法的文件里通常压根没有同名绑定，且真要绕过它的人
+/// 有更省事的办法（`globalThis['con' + 'firm']`），本门从来不是对抗性判据。代价被兜在别处：
+/// 三种**显式属主**形态不受本豁免影响（见 [`calls_global`]），而那才是真回退到全局对话框的
+/// 常见写法。
+///
+/// **第二条已知边界（实测，不是推断）**：**嵌套一层**的对象字面量简写仍会被认成声明 ——
+/// `foo({ a: { confirm } })`、`const x = { deps: { confirm } }` 这两个形状同文件若还有裸
+/// `confirm(`，本判据会放过它。根因是它与嵌套解构 `const { a: { confirm } } = x` **前导完全同形**
+/// （都是 `:` 后跟 `{`），要分开得看等号右边有没有初始化器，那已经是在写 parser 了。外层那道
+/// 「花括号被 `(` 包着就得是形参列表」的收窄在这里够不着：`{ confirm }` 的外层是 `{` 不是 `(`。
+/// 未嵌套的同类形状（`foo(a, { confirm })`、`foo({ confirm })`、`return { confirm }`、
+/// `export default { confirm }`、`foo(a, [{ confirm }])`）都已判对，见
+/// `calls_global_local_binding_exemption_has_teeth`。
+fn declares_binding(src: &str, name: &str) -> bool {
+    let stripped = strip_ts_comments_and_strings(src);
+    let src = stripped.as_str();
+    if imports_binding(src, name) {
+        return true;
+    }
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let ends_with_kw = |head: &str, kw: &str| {
+        head.strip_suffix(kw)
+            .is_some_and(|rest| rest.chars().last().is_none_or(|c| !ident(c)))
+    };
+    for i in keyword_positions(src, name) {
+        let head = src[..i].trim_end();
+        // ① 声明关键字直接跟着名字。
+        if ["const", "let", "var", "function", "class"]
+            .iter()
+            .any(|kw| ends_with_kw(head, kw))
+        {
+            return true;
+        }
+        // ② 解构模式 / 形参列表里的绑定位：先问这次出现被哪种括号包着。
+        let Some((open, kind)) = enclosing_open(src, i) else {
+            continue;
+        };
+        let before = src[..open].trim_end();
+        let after = src[i + name.len()..].trim_start();
+        let hit = match kind {
+            '{' => {
+                // 这对花括号若被一个 `(` 直接包着，只有那个 `(` 真是形参列表才算解构模式。
+                // 否则就是**对象字面量简写实参**（`foo(a, { confirm })`）：里面的 confirm 引用的是
+                // 别处的绑定 —— 可能正是全局 —— 把它当声明，同文件那次真·全局调用就被放过了。
+                let in_call_args = match enclosing_open(src, open) {
+                    Some((outer, '(')) => !is_param_list(src, outer),
+                    _ => false, // 顶层 / 函数体 / 数组里的解构不经这道收窄
+                };
+                let is_pattern = !in_call_args
+                    && (["const", "let", "var"]
+                        .iter()
+                        .any(|kw| ends_with_kw(before, kw))
+                        || before.ends_with(['(', ',', '{', ':']));
+                // `{ confirm: other }`：confirm 是属性名，绑定的是 other。
+                is_pattern && !after.starts_with(':') && head.ends_with(['{', ',', ':'])
+            }
+            '[' => {
+                ["const", "let", "var"]
+                    .iter()
+                    .any(|kw| ends_with_kw(before, kw))
+                    && head.ends_with(['[', ','])
+            }
+            '(' => is_param_list(src, open) && head.ends_with(['(', ',']),
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
 }
 
 /// dialog 插件的 JS 模块说明符（具名 import 形态的入口）。
@@ -846,6 +1126,126 @@ fn unused_high_risk_renderer_permissions_stay_revoked() {
     }
 }
 
+/// [`calls_global`] 的**豁免面**：文件自己声明了同名绑定时，裸 `confirm(` 解析到那个局部绑定，
+/// 不是被插件覆写的 `window.confirm`，判成全局调用就是假阳性。
+///
+/// 每条用例 = [`declares_binding`] 头注里「认这些形态」的一条。少认一种形态，对应那条就红 ——
+/// 这份清单与头注互为对拍，不许只改一边。（源码片段只求触发判据，不求是能跑的 TS。）
+#[test]
+fn calls_global_sees_through_local_bindings() {
+    let misjudged: Vec<&str> = [
+        // import 三形态
+        "import { confirm } from './x';\nconfirm(1);",
+        "import confirm from './x';\nconfirm(1);",
+        "import { ask as confirm } from './x';\nconfirm(1);",
+        // 声明关键字
+        "const confirm = make();\nconfirm(1);",
+        "let confirm;\nconfirm(1);",
+        "var confirm = make();\nconfirm(1);",
+        "function confirm(x) { return x; }\nconfirm(1);",
+        "class confirm {}\nconfirm(1);",
+        // 解构
+        "const { t, confirm, dismiss } = deps;\nconfirm(1);",
+        "const { ask: confirm } = deps;\nconfirm(1);",
+        "const { a: { confirm } } = deps;\nconfirm(1);",
+        "const [confirm] = useState();\nconfirm(1);",
+        // 形参
+        "function f(confirm) { confirm(1); }",
+        "function f({ confirm }) { confirm(1); }",
+        "const f = (confirm) => confirm(1);",
+        "const f = (a, confirm: Fn) => confirm(1);",
+        "({ confirm }) => confirm(x);",
+        "try { x(); } catch (confirm) { confirm(1); }",
+        // 收窄「被 `(` 包着的花括号」之后的回归：不被括号包着的解构是主路径，不许被砍掉
+        "const { confirm } = deps;\nconfirm(1);",
+        // 病灶原型：`node-deletion.ts` 的注入式 confirm（接口字段声明类型 + 解构拿到真绑定 + 调用）
+        "interface Deps {\n  readonly confirm: (p: P) => string;\n}\n\
+         export function use(deps: Deps) {\n  const { t, confirm } = deps;\n\
+         const id = confirm({ title: t('x') });\n  return id;\n}",
+    ]
+    .into_iter()
+    .filter(|src| calls_global(src, "confirm"))
+    .collect::<Vec<_>>();
+    // 收集完再断言（不是逐条 assert）：一次跑出**所有**被误判的形态，而不是撞见第一条就停 ——
+    // 判据被改弱时，这份清单直接就是缺口全集。
+    assert!(
+        misjudged.is_empty(),
+        "这些都是局部绑定，裸调到不了 window.confirm，不该判成全局调用：{misjudged:#?}"
+    );
+}
+
+/// 上面那道豁免**不许把门吃空**：覆盖面缩水必须在这里自曝。
+///
+/// 三类都得留牙：①没有同名绑定时裸调照抓（门还在）②显式属主 `window.` / `globalThis.` /
+/// `window['…']` 不受豁免影响（真回退到全局对话框的常见写法）③声明只出现在注释 / 字符串 /
+/// 模板字面量里时不算声明（取材面剥离那一步有牙）。外加一组**使用位**，它们长得像声明位但不是。
+#[test]
+fn calls_global_local_binding_exemption_has_teeth() {
+    let leaked: Vec<&str> = [
+        // ① 没有绑定：门必须照抓
+        "confirm('x');",
+        "if (confirm('x')) drop();",
+        "await confirm('x');",
+        // 有绑定，但绑的是**别的**名字 —— 豁免认名字，不是「有任何绑定就放行」
+        "const dismiss = make();\nconfirm('x');",
+        // ② 显式属主：同文件也声明了 confirm 也照抓
+        "const confirm = make();\nwindow.confirm('x');",
+        "const confirm = make();\nglobalThis.confirm('x');",
+        "const confirm = make();\nwindow['confirm']('x');",
+        // ③ 声明只写在注释里（生产路径上注释已被 collect_sources 剥掉，这里连未剥的也不认）
+        "// const confirm = make();\nconfirm('x');",
+        "/* const { confirm } = deps; */\nconfirm('x');",
+        // ③ 声明只写在字符串 / 模板字面量里
+        "const s = 'const confirm = make()';\nconfirm('x');",
+        "const s = `const { confirm } = deps`;\nconfirm('x');",
+        // 使用位不是声明位
+        "register(confirm);\nconfirm('x');",
+        // 对象字面量简写**实参**：花括号被调用的 `(` 包着，不是解构模式；这里的 confirm 引用的是
+        // 别处的绑定（可能正是全局），把它当声明就会放过同文件那次真·全局调用。
+        "foo(a, { confirm });\nconfirm('x');",
+        "foo({ confirm });\nconfirm('x');",
+        "bar({ confirm: fn });\nconfirm('x');",
+        "foo(a, [{ confirm }]);\nconfirm('x');",
+        "return { confirm };\nconfirm('x');",
+        "export default { confirm };\nconfirm('x');",
+        "useMemo(() => 1, [confirm]);\nconfirm('x');",
+        "if (confirm) { drop(); }\nconfirm('x');",
+        "interface D { readonly confirm: Fn }\nconfirm('x');",
+        "const deps = { confirm: 1 };\nconfirm('x');",
+    ]
+    .into_iter()
+    .filter(|src| !calls_global(src, "confirm"))
+    .collect::<Vec<_>>();
+    // 同样收集完再断言：把豁免改弱（比如让遮蔽判据恒真）时，这份清单一次列全被放过的调用。
+    assert!(
+        leaked.is_empty(),
+        "这些是真·全局 confirm 调用，作用域豁免不该放过它们：{leaked:#?}"
+    );
+    // 生产取材面是剥过注释的（collect_sources），那一档同样不许把注释里的声明当真。
+    assert!(
+        calls_global(
+            &strip_ts_comments("// const confirm = make();\nconfirm('x');"),
+            "confirm"
+        ),
+        "剥注释后再判，注释里的声明依旧不算声明"
+    );
+    // 遮蔽面自身的地基自检：清空字面量那一档必须**只清内容**，不塌行、不改结构。
+    assert_eq!(
+        strip_ts_comments_and_strings("const s = 'const confirm = 1';\nconfirm(2);"),
+        // 引号原样留、内容等长清空、行不塌：长度用 `repeat` 算，免得手数空格数错。
+        format!(
+            "const s = '{}';\nconfirm(2);",
+            " ".repeat("const confirm = 1".len())
+        )
+    );
+    assert_eq!(
+        strip_ts_comments_and_strings("const t = `a\nb`;")
+            .lines()
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn comment_stripper_has_teeth() {
     // 哨兵的地基自检：剥注释必须**真的**吃掉注释里的 window.confirm，又**不能**吃掉代码。
@@ -1098,7 +1498,12 @@ fn main_window_native_menu_is_macos_only() {
         main_window_menu_owner(Platform::Mac),
         MainWindowMenuOwner::NativeApplicationMenu
     );
-    for platform in [Platform::Win, Platform::Linux, Platform::Other] {
+    for platform in [
+        Platform::Win,
+        Platform::Linux,
+        Platform::Other,
+        Platform::Android,
+    ] {
         assert_eq!(
             main_window_menu_owner(platform),
             MainWindowMenuOwner::RendererShortcut,
@@ -1106,12 +1511,14 @@ fn main_window_native_menu_is_macos_only() {
         );
     }
 
-    let src = crate_code("main.rs");
+    let src = crate_root_code();
     assert!(
         src.contains("if main_window_menu_owner(Platform::current())"),
         "setup 必须消费菜单所有权判据，不能只写一个无接线的纯函数"
     );
-    // 拆开拼词，避免守卫自己的搜索字面量也出现在 include_str!("main.rs") 里。
+    // 拆开拼词，避免守卫自己的搜索字面量也出现在 `crate_root_code()` 读进来的取材面里。
+    // （本处判据曾直接 `include_str!("main.rs")`；装配下沉后取材面换成 `main.rs` + `lib.rs`
+    //   两份拼接，拼词纪律是那时留下的，换取材器后仍然要守。）
     let hidden_menu_call = [".hide_", "menu()"].concat();
     assert!(
         !src.contains(&hidden_menu_call),

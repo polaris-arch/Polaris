@@ -1,6 +1,262 @@
 use super::*;
 use crate::error::ErrorCode;
 
+const BIRTH: &str = "00112233445566778899aabbccddeeff";
+const OTHER_BIRTH: &str = "ffeeddccbbaa99887766554433221100";
+
+#[test]
+fn native_birth_receipts_round_trip_without_linux_or_legacy_aliases() {
+    let target = HelperBirthTarget::parse_wire("42", BIRTH).unwrap();
+    let timing = StartTiming {
+        forwarding_ms: 1,
+        process_ms: 2,
+        job_ms: 3,
+        log_handoff_ms: 4,
+        total_ms: 5,
+    };
+    let cases = [
+        ResponseKind::NativeBirthStart(NativeBirthStart::Started {
+            target,
+            timing: None,
+            created: None,
+        }),
+        ResponseKind::NativeBirthStart(NativeBirthStart::Started {
+            target,
+            timing: Some(timing),
+            created: Some(123),
+        }),
+        ResponseKind::NativeBirthStart(NativeBirthStart::Started {
+            target,
+            timing: None,
+            created: Some(123),
+        }),
+        ResponseKind::NativeBirthStart(NativeBirthStart::Already { target }),
+        ResponseKind::NativeBirthStart(NativeBirthStart::NotAdmittedPending { target }),
+        ResponseKind::NativeBirthStart(NativeBirthStart::NotAdmittedUnknown {
+            target: Some(target),
+        }),
+        ResponseKind::NativeBirthStart(NativeBirthStart::NotAdmittedUnknown { target: None }),
+        ResponseKind::NativeBirthStatus(NativeBirthStatus::Running {
+            target,
+            created: Some(123),
+            image: Some("C:\\core path\\sing-box.exe".into()),
+        }),
+        ResponseKind::NativeBirthStatus(NativeBirthStatus::Running {
+            target,
+            created: None,
+            image: None,
+        }),
+        ResponseKind::NativeBirthStatus(NativeBirthStatus::Stopping { target }),
+        ResponseKind::NativeBirthStatus(NativeBirthStatus::Unknown {
+            target: Some(target),
+        }),
+        ResponseKind::NativeBirthStatus(NativeBirthStatus::Unknown { target: None }),
+        ResponseKind::NativeBirthStatus(NativeBirthStatus::Empty),
+        ResponseKind::NativeBirthStop(NativeBirthStop::Stopped { target }),
+        ResponseKind::NativeBirthStop(NativeBirthStop::Pending { target }),
+        ResponseKind::NativeBirthStop(NativeBirthStop::Unknown { target }),
+        ResponseKind::NativeBirthStop(NativeBirthStop::Mismatch {
+            requested: target,
+            current: HelperBirthTarget::parse_wire("43", OTHER_BIRTH).unwrap(),
+        }),
+    ];
+    for kind in cases {
+        let response = Response::Ok(kind);
+        let line = response.to_wire_line();
+        assert!(line.starts_with("OK native-birth-"));
+        assert_eq!(Response::parse(&line), response);
+        for malformed in [
+            format!("{line} extra"),
+            format!(" {line}"),
+            line.replacen("OK ", "OK  ", 1),
+        ] {
+            assert!(
+                matches!(
+                    Response::parse(&malformed),
+                    Response::Ok(ResponseKind::OkRaw { .. })
+                ),
+                "{malformed}"
+            );
+        }
+    }
+    for tail in [
+        "created=1 created=2",
+        "created=01",
+        "image=ab image=cd",
+        "created=1 image=GG",
+        "created=1 forwarding_ms=2",
+    ] {
+        let line = format!("OK native-birth-status running 42 {BIRTH} {tail}");
+        assert!(matches!(
+            Response::parse(&line),
+            Response::Ok(ResponseKind::OkRaw { .. })
+        ));
+    }
+}
+
+#[test]
+fn exact_birth_response_golden_lines_round_trip() {
+    let target = HelperBirthTarget::parse_wire("42", BIRTH).unwrap();
+    let other = HelperBirthTarget::parse_wire("43", OTHER_BIRTH).unwrap();
+    let timing = StartTiming {
+        forwarding_ms: 1,
+        process_ms: 2,
+        job_ms: 3,
+        log_handoff_ms: 4,
+        total_ms: 5,
+    };
+    let cases = [
+        (
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
+                target,
+                timing: None,
+            }),
+            format!("OK birth-started 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
+                target,
+                timing: Some(timing),
+            }),
+            format!(
+                "OK birth-started 42 {BIRTH} forwarding_ms=1 process_ms=2 job_ms=3 log_handoff_ms=4 total_ms=5"
+            ),
+        ),
+        (
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::Already { target }),
+            format!("OK birth-already 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedPending { target }),
+            format!("OK birth-start-not-admitted pending 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown {
+                target: Some(target),
+            }),
+            format!("OK birth-start-not-admitted unknown 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown { target: None }),
+            "OK birth-start-not-admitted unknown".into(),
+        ),
+        (
+            ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running { target }),
+            format!("OK birth-status running 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Stopping { target }),
+            format!("OK birth-status stopping 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Unknown { target }),
+            format!("OK birth-status unknown 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Empty),
+            "OK birth-status empty".into(),
+        ),
+        (
+            ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped { target }),
+            format!("OK birth-stopped 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStop(LinuxBirthStop::Pending { target }),
+            format!("OK birth-stop-pending 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStop(LinuxBirthStop::Unknown { target }),
+            format!("OK birth-stop-unknown 42 {BIRTH}"),
+        ),
+        (
+            ResponseKind::LinuxBirthStop(LinuxBirthStop::Mismatch {
+                requested: target,
+                current: other,
+            }),
+            format!("OK birth-stop-mismatch 42 {BIRTH} 43 {OTHER_BIRTH}"),
+        ),
+    ];
+    for (kind, line) in cases {
+        let response = Response::Ok(kind);
+        assert_eq!(response.to_wire_line(), line);
+        assert_eq!(Response::parse(&line), response);
+    }
+}
+
+#[test]
+fn malformed_exact_birth_responses_never_become_typed_or_legacy() {
+    for line in [
+        "OK birth-started 0 00112233445566778899aabbccddeeff",
+        "OK birth-started +42 00112233445566778899aabbccddeeff",
+        "OK birth-started 042 00112233445566778899aabbccddeeff",
+        "OK birth-started 42",
+        "OK birth-started 42 00112233445566778899AABBCCDDEEFF",
+        "OK birth-started 42 00112233445566778899aabbccddeefg",
+        "OK birth-started 42 00112233445566778899aabbccddeeff 00112233445566778899aabbccddeeff",
+        "OK birth-started 42 00112233445566778899aabbccddeeff created=1",
+        "OK birth-started 42 00112233445566778899aabbccddeeff forwarding_ms=1 process_ms=2 job_ms=3 log_handoff_ms=4 total_ms=5 total_ms=6",
+        "OK birth-started 42 00112233445566778899aabbccddeeff forwarding_ms=1 process_ms=2 job_ms=3 log_handoff_ms=4",
+        "OK birth-already 42 00112233445566778899aabbccddeeff extra",
+        "OK birth-start-not-admitted pending",
+        "OK birth-start-not-admitted pending 0 00112233445566778899aabbccddeeff",
+        "OK birth-start-not-admitted unknown 42",
+        "OK birth-start-not-admitted unknown 42 00112233445566778899aabbccddeeff extra",
+        "OK birth-status empty 42 00112233445566778899aabbccddeeff",
+        "OK birth-status running 42 00112233445566778899aabbccddeeff 00112233445566778899aabbccddeeff",
+        "OK birth-status stopping 0 00112233445566778899aabbccddeeff",
+        "OK birth-stopped 42",
+        "OK birth-stop-pending 42 00112233445566778899aabbccddeeff extra",
+        "OK birth-stop-unknown 42 00112233445566778899AABBCCDDEEFF",
+        "OK birth-stop-mismatch 42 00112233445566778899aabbccddeeff 43",
+        "OK birth-stop-mismatch 42 00112233445566778899aabbccddeeff 0 ffeeddccbbaa99887766554433221100",
+        "OKbirth-stopped 42 00112233445566778899aabbccddeeff",
+        "OK  birth-stopped 42 00112233445566778899aabbccddeeff",
+        "OK birth-stopped  42 00112233445566778899aabbccddeeff",
+    ] {
+        assert!(
+            matches!(
+                Response::parse(line),
+                Response::Ok(ResponseKind::OkRaw { .. })
+            ),
+            "malformed birth response must remain untyped: {line}"
+        );
+    }
+}
+
+#[test]
+fn legacy_birthless_receipts_keep_their_exact_wire_shape() {
+    for (line, expected) in [
+        (
+            "OK started 42",
+            ResponseKind::Start(Start::Started { pid: 42 }),
+        ),
+        (
+            "OK already 42",
+            ResponseKind::Start(Start::Already { pid: 42 }),
+        ),
+        (
+            "OK running 42",
+            ResponseKind::Status(Status::Running {
+                pid: 42,
+                created: None,
+                image: None,
+            }),
+        ),
+        (
+            "OK stopped 42",
+            ResponseKind::Stop(Stop::Stopped { pid: 42 }),
+        ),
+        (
+            "OK stop-pending 42",
+            ResponseKind::Stop(Stop::Pending { pid: 42 }),
+        ),
+    ] {
+        let response = Response::Ok(expected);
+        assert_eq!(response.to_wire_line(), line);
+        assert_eq!(Response::parse(line), response);
+    }
+}
+
 #[test]
 fn parse_pong_mac_linux() {
     // helper.go:423: fmt.Fprintf(conn, "OK pong uid=%d v%s\n", os.Getuid(), protoVersion)
@@ -117,6 +373,46 @@ fn stop_mismatch_round_trips_with_both_pids() {
         .to_wire_line(),
         "OK stop-mismatch 4242 9001"
     );
+}
+
+#[test]
+fn physical_reap_and_start_admission_states_round_trip() {
+    let cases = [
+        Response::Ok(ResponseKind::Stop(Stop::Pending { pid: 41 })),
+        Response::Ok(ResponseKind::Stop(Stop::Unknown { pid: 42 })),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Pending { pid: 43 },
+        ))),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Unknown { pid: 44 },
+        ))),
+    ];
+    for response in cases {
+        assert_eq!(Response::parse(&response.to_wire_line()), response);
+    }
+    assert!(matches!(
+        Response::parse("OK start-not-admitted future 45"),
+        Response::Ok(ResponseKind::OkRaw { .. })
+    ));
+}
+
+#[test]
+fn malformed_start_admission_never_publishes_typed_custody() {
+    for line in [
+        "OK start-not-admitted pending",
+        "OK start-not-admitted pending 0",
+        "OK start-not-admitted pending nope",
+        "OK start-not-admitted pending +42",
+        "OK start-not-admitted pending -1",
+        "OK start-not-admitted pending 42 trailing",
+        "OK start-not-admitted unknown 0",
+        "OK start-not-admitted unknown 42 trailing",
+    ] {
+        assert!(
+            matches!(Response::parse(line), Response::Ok(ResponseKind::OkRaw { token, .. }) if token == "start-not-admitted"),
+            "malformed custody response must stay untyped: {line}"
+        );
+    }
 }
 
 #[test]
@@ -500,6 +796,8 @@ fn to_wire_line_round_trips_through_parse() {
             want: 4242,
             current: 9001,
         })),
+        Response::Ok(ResponseKind::Stop(Stop::Pending { pid: 4242 })),
+        Response::Ok(ResponseKind::Stop(Stop::Unknown { pid: 4242 })),
         Response::Ok(ResponseKind::Start(Start::Started { pid: 2 })),
         Response::Ok(ResponseKind::Start(Start::StartedTimed {
             pid: 4,
@@ -524,6 +822,12 @@ fn to_wire_line_round_trips_through_parse() {
             created: Some(133_600_000_000_000_000),
         })),
         Response::Ok(ResponseKind::Start(Start::Already { pid: 3 })),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Pending { pid: 31 },
+        ))),
+        Response::Ok(ResponseKind::Start(Start::NotAdmitted(
+            StartNotAdmitted::Unknown { pid: 32 },
+        ))),
         Response::Ok(ResponseKind::Cleaned),
         Response::Ok(ResponseKind::Route),
         Response::Ok(ResponseKind::FreePort(FreePort::Free)),

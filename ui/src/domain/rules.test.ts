@@ -35,6 +35,7 @@ import {
   ruleTypeHintKey,
   ruleTypeNameKey,
   ruleTypePlaceholderKey,
+  ruleSubjectForValue,
   validateRuleValue,
 } from './rules';
 import type { RuleCategory } from './rules';
@@ -253,6 +254,40 @@ describe('domainKeyword 拒含冒号值（IPv6 字面量不得落成永不命中
     for (const t of ['domain', 'domainSuffix'] as const) {
       expect(validateRuleValue(t, '2001:db8::1')).toBe(false);
       expect(validateRuleValue(t, '[2001:db8::1]')).toBe(false);
+    }
+  });
+});
+
+/**
+ * `ruleSubjectForValue` —— 「一个显示名能不能写进规则、写成哪一类」的单一判据。
+ *
+ * 两个消费方：桌面首页拓扑图的图元命中区、移动端首页主机 Top 的行。**先判 IP 后判域名**
+ * 这个顺序是判据的一部分，下面第一条就钉它：反过来会把一个纯 IP 字面量写成 domain 规则
+ * （界面上显示 IP，落进配置的是一条永不命中的域名规则）。
+ */
+describe('ruleSubjectForValue：显示名 → 可写进规则的观测对象', () => {
+  it('IPv4 / IPv6 / CIDR 判成 `ipCidr`，**不是** domain（顺序就是判据）', () => {
+    for (const v of ['198.51.100.7', '2001:db8::1', '10.0.0.0/8']) {
+      expect(ruleSubjectForValue(v), `${v} 没判成 IP`).toEqual({
+        kind: 'ip',
+        type: 'ipCidr',
+        value: v,
+      });
+    }
+    // 正面对照：DOMAIN_RE 本身确实接受裸 IPv4（它有意不拒，见 validateRuleValue 的注释）——
+    // 所以「判成了 IP」只能归因于顺序，不能归因于「域名那一支恰好也不认」。
+    expect(validateRuleValue('domain', '198.51.100.7')).toBe(true);
+  });
+
+  it('域名判成 `domain`', () => {
+    for (const v of ['example.com', 'cdn.example.net']) {
+      expect(ruleSubjectForValue(v)).toEqual({ kind: 'domain', type: 'domain', value: v });
+    }
+  });
+
+  it('两样都不是 ⇒ `null`（调用方据此不画规则入口）', () => {
+    for (const v of ['', '   ', '内网 直连', 'a/b']) {
+      expect(ruleSubjectForValue(v), `${v} 不该判出对象`).toBeNull();
     }
   });
 });

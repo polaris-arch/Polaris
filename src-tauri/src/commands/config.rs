@@ -82,6 +82,11 @@ pub fn config_get(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
 fn apply_frontend_view(cfg: &mut Value) {
     // F29：绝不下发隐私密码（历史残留明文 `privacyPassword` + salted hash `privacyPasswordHash`）。
     strip_privacy_secrets(cfg);
+    // 本机 mesh 账本是后端权威状态；排除于前端快照和 configVersion。
+    // 策略意图仍可见，供专用预览 UI 读取，但普通保存没有修改权。
+    if let Some(object) = cfg.as_object_mut() {
+        object.remove(polaris_store::mesh_guard::STATE_KEY);
+    }
     // 生效值注入：前端因此一条默认都不必（也不许）自己兜底。根因与机制见该模块头注。
     polaris_config_engine::user_config::effective_view::ensure_effective_config(cfg);
 }
@@ -320,7 +325,7 @@ pub fn mesh_route_report(
 /// 输出 `5000` ⇒ 该形态下两侧分叉。config 里唯一的浮点字段是 `dnsConfig.dnsTimeoutMs`，其写入路径
 /// （前端提交 / `sanitize_dns_config` 取整成 i64）都产出整数字面量，故只有**手改 config.json 写成
 /// `5000.0`** 才够得着。后果是保存恒返 conflict（不丢数据、不误写），不是静默错值。
-fn config_version(cfg: &Value) -> String {
+pub(crate) fn config_version(cfg: &Value) -> String {
     let mut view = cfg.clone();
     apply_frontend_view(&mut view);
     config_content_hash(&view)
@@ -811,40 +816,52 @@ pub(crate) fn backup_import_save_core(
     current_platform: &str,
     available_interfaces: Option<&BTreeSet<String>>,
 ) -> Result<BackupImportSaved, polaris_store::StoreError> {
-    let ((old_selected, skipped, cross_disabled, unavailable), saved) = config
-        .update_deferred_cleanup(|latest| {
-            let old_selected = latest
-                .get("selectedServerId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let outcome = merge_categories(latest, backup, selected);
-            let mut next = outcome.config;
-            let effective_selected: Vec<BackupCategory> = selected
-                .iter()
-                .copied()
-                .filter(|category| !outcome.skipped.contains(category))
-                .collect();
-            let cross_disabled = if effective_selected.contains(&BackupCategory::CustomRules) {
-                sanitize_cross_platform_rules(&mut next, backup_platform, current_platform)
-            } else {
-                0
-            };
-            let unavailable = available_interfaces.map_or(0, |names| {
-                sanitize_unavailable_interface_bindings(&mut next, names, &effective_selected)
-            });
-            preserve_server_owned_secrets_from(latest, &mut next);
-            enforce_backend_authoritative_fields_from(latest, &mut next);
-            log_invalidated_validators(invalidate_validators_on_global_ua_change(
-                latest, &mut next,
+    let (outcome, saved) = config.update_deferred_cleanup(|latest| {
+        // A portable policy has serverId references but no local epoch.
+        // Restoring it needs a trusted old-owner scope snapshot and S4
+        // lifecycle/state receipt. Keep every category unchanged until
+        // that transaction exists; never bind foreign intent in this
+        // ordinary merge or let a selected policy silently skip.
+        if selected.contains(&BackupCategory::MeshRouting)
+            && (backup.get("meshRouting").is_some() || backup.get("meshRoutePolicy").is_some())
+        {
+            return crate::runtime::config::Decision::Skip(Err(
+                polaris_store::StoreError::validation(
+                    "meshRouting restore requires a trusted owner-scope transaction",
+                ),
             ));
-            *latest = next;
-            crate::runtime::config::Decision::Write((
-                old_selected,
-                outcome.skipped,
-                cross_disabled,
-                unavailable,
-            ))
-        })?;
+        }
+        let old_selected = latest
+            .get("selectedServerId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let outcome = merge_categories(latest, backup, selected);
+        let mut next = outcome.config;
+        let effective_selected: Vec<BackupCategory> = selected
+            .iter()
+            .copied()
+            .filter(|category| !outcome.skipped.contains(category))
+            .collect();
+        let cross_disabled = if effective_selected.contains(&BackupCategory::CustomRules) {
+            sanitize_cross_platform_rules(&mut next, backup_platform, current_platform)
+        } else {
+            0
+        };
+        let unavailable = available_interfaces.map_or(0, |names| {
+            sanitize_unavailable_interface_bindings(&mut next, names, &effective_selected)
+        });
+        preserve_server_owned_secrets_from(latest, &mut next);
+        enforce_backend_authoritative_fields_from(latest, &mut next);
+        log_invalidated_validators(invalidate_validators_on_global_ua_change(latest, &mut next));
+        *latest = next;
+        crate::runtime::config::Decision::Write(Ok((
+            old_selected,
+            outcome.skipped,
+            cross_disabled,
+            unavailable,
+        )))
+    })?;
+    let (old_selected, skipped, cross_disabled, unavailable) = outcome?;
     Ok(BackupImportSaved {
         config: saved.expect("Decision::Write 必须返回已落盘配置"),
         old_selected,
@@ -1127,11 +1144,14 @@ fn preserve_server_owned_secrets_from(current: &Value, incoming: &mut Value) {
 ///
 /// `appRulesSeeded` 同样**不收**：它在 `polaris_store::backup` 的 `DATA_FIELDS` 里，随 appRules 类
 /// 被备份导入合法写入 ⇒ 所有权有争议，不满足「零写入权」。
-const BACKEND_AUTHORITATIVE_KEYS: [&str; 2] = [
+const BACKEND_AUTHORITATIVE_KEYS: [&str; 4] = [
     // 托盘「节点·最近」MRU。只由 `server_switch` 写；ui 全仓仅 TrayMenu 读。
     "recentServerIds",
     // 内置 geo 元数据（随包）。只由 geo seed 写；ui 全仓零读零写。
     "builtinGeoMeta",
+    // 仅专用后端 revision-CAS mutation 可以修改；普通全量保存/patch/导入按盘上真值镜像。
+    polaris_store::mesh_guard::POLICY_KEY,
+    polaris_store::mesh_guard::STATE_KEY,
     // 曾有第三项 `diagnosticCapture`（诊断采集态）。整条机制已删除（核日志改由 `SubscribeLog` 全级别
     // 送达、级别筛在客户端，不再需要「临时把核提级到 debug」的会话），故该键不再是任何人的权威字段。
     // 旧配置里的残留由 `polaris_store::migrate::migrate_diagnostic_capture` 还原级别后清除。
@@ -1712,7 +1732,7 @@ pub(crate) fn broadcast_config_changed_with(
     // **无载荷信号**。四个消费方一个都不读 payload，收到即各自重拉：`App.tsx` → `loadConfig(true)`、
     // `TrayMenu.tsx` → `hydrate()`、`settings/use-config.ts` → `load(true)`（该处还专门注明「payload 的
     // newValue 不能直接用」——它经脱敏、且没走 `config_get` 那侧的 bypassLANList 补齐，与其契约不同源）、
-    // `main.rs` 的 `listen_any` → `reconcile_tray`（回调签名 `|_|` 直接丢弃）。
+    // `lib.rs` 的 `listen_any` → `reconcile_tray`（回调签名 `|_|` 直接丢弃）。
     //
     // 而 `cfg` 在这行之后仍要用（logLevel / uiTheme / move 进 `switch_mode_with`）⇒ 载荷里写 `cfg`
     // 只能借用 ⇒ `json!` 展开成 `to_value(&cfg)`，在上面那次 clone 之外**再深拷贝一整棵配置树**，

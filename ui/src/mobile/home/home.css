@@ -1,0 +1,1670 @@
+/*
+ * 移动端「首页」样式（F1）。八张卡 + 应用页头。
+ *
+ * 规格：`~/docs/polaris/design/mobile-kit/component-specs/home-screen.md` 与八张卡各自的 spec；
+ * 数值真值源 `mobile-kit/tokens/core.json`；设计文档
+ * `~/docs/polaris/design/polaris-mobile-screen-home-2026-09-04.md`。
+ *
+ * ── 三条与外壳同源的纪律（`mobile.css` 头注的延伸，别在这里重新发明）──────────
+ * ① **唯一 token 来源是 `../../styles/tokens.resolved.css`**（契约 A1）。本文件一个 `@import` 都不写。
+ * ② **几何 px、排版 rem**：48 是手指的尺寸，不是字母的。外壳响应标量决定横向安全边距与
+ *    列间距；卡片纵向内距稳定为 16px，宽屏增加横向余量时不把整张卡等比撑高。
+ * ③ **只用 Chromium ≤105 的特性**：本文件自动进 `../../styles/css-feature-floor.test.ts` 的取材面。
+ *    首页列流的 `column-count` / `break-inside` 是 Chrome 50 的老特性。
+ *
+ * ══ 本屏最重要的两条版式裁定，两者都有门 ══════════════════════════════════════
+ *
+ * **A. 三档断点内容完全一致。** 没有宽屏专属卡，也没有 compact 专属卡。
+ * 早期草案往 medium 以上加过拓扑图 / 收藏节点 / 内联连接列表，全部被否：断点条件内容 =
+ * 两套内容模型都要维持真实。宽屏通过受控内容宽度与列流组织现有信息，
+ * 不为填满窗口而放大按钮、只读行或图表。
+ * ⇒ 落成两条可执行的禁令：
+ *    · 本文件**任何地方**不出现 `display:none` / `visibility:hidden` / `content-visibility`；
+ *    · **任何 `@container` 块内**不出现 `display` / `visibility` / `content-visibility` 声明。
+ *    两条合起来把「默认藏住 + 宽屏放出来」这条路的两半各堵一次；只堵一半等于没堵。
+ *
+ * **B. DOM 序 = 重要性序，任何断点都不许重排。** 竖屏手机从上往下读，那个读序就是排名。
+ * ⇒ 多列走**列流**（`column-count`）而不是手摆两列网格：列高由排版引擎配平，DOM 序原样不动。
+ *    且本文件不出现 `order` / `*-reverse` / `grid-row` / `grid-column` / `grid-area` / `direction`
+ *    —— 那几个是「在断点内把某张卡挪到别处」的全部现成手段。
+ *
+ * ⚠️ 列流有一个原型里真踩过的坑：**`display: contents` 的包裹元素不改变 DOM 嵌套**，
+ *    于是对着列容器写的**直接子选择器**会静默匹配不上，「卡片不可跨列断开」这条规矩被悄悄忽略。
+ *    故下面 `break-inside` 用的是**后代**选择器，不是 `>`。
+ */
+
+/* ═══════════ 屏骨架 ═══════════ */
+
+/* 本屏自己就是外壳 `.m-page` 的一个 flex 子项；节奏原样重放一次，间距仍从外壳的
+   `--section-gap` 继承（不另定一套数）。 */
+.h-screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+  min-width: 0;
+}
+
+/*
+ * 应用页头。spec 把它列在滚动内容**之外**，而移动外壳（F0，已定稿、不属本线射程）没有页头槽位 ⇒
+ * 用屏内 sticky 兑现同一语义：不随内容滚走，且外壳零改动。
+ */
+.h-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  /* 60 取自原型 `.brand{height:60px}`，与 `ui-manifest.json` 的 app-header contentHeight
+     及 `core.json` 的 layout.headerContentHeight 同值；`app-header.md` 的 64 是 kit 里过时的那一处。 */
+  min-height: 60px;
+  background: hsl(var(--bg));
+  /* 卡片会从下面滚过去，页头必须是不透明的实底 + 一条发丝线收边。 */
+  border-bottom: 1px solid hsl(var(--hair));
+}
+
+.h-brandline {
+  display: flex;
+  align-items: center;
+  gap: 10px; /* 标记 → 字标 */
+  min-width: 0;
+}
+
+.h-brand {
+  flex: none;
+}
+
+/* 字标保持可读字号，宽屏靠卡片分栏而非放大字标填空白。 */
+.h-wordmark {
+  font-family: var(--disp);
+  font-size: 1.625rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: hsl(var(--fg));
+}
+
+/* 运行状态胶囊：**颜色 + 文字**，绝不只用颜色。 */
+.h-runchip {
+  display: inline-flex;
+  align-items: center;
+  /* 点 → 文字 7（原型 `.run{gap:7px}`；`app-header.md` 的 8 与原型冲突，按权威序取原型）。 */
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 var(--sp-3);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface));
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: hsl(var(--fg-dim));
+}
+
+.h-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: hsl(var(--fg-faint));
+}
+
+.h-runchip.s-running .h-dot {
+  background: hsl(var(--ok));
+}
+
+.h-runchip.s-error .h-dot {
+  background: hsl(var(--err));
+}
+
+/*
+ * 诊断行的内核状态：**圆点与文字同色**（原型 :303 两者都写死 `--aurora`）。
+ * 只给圆点上色 = 状态信息只走颜色这一条通道，而那颗点只有 8px。
+ * 这里的绿是 `status.connected`（`--aurora`），不是页头运行胶囊那支 `status.success`（`--ok`）：
+ * 前者说的是「链路通了」，后者说的是「进程起来了」，原型两处也确实取了不同的绿。
+ */
+.h-diagrow.s-running .h-diagdot {
+  background: hsl(var(--aurora));
+}
+
+.h-diagrow.s-running .h-diagval {
+  color: hsl(var(--aurora));
+}
+
+.h-diagrow.s-error .h-diagdot {
+  background: hsl(var(--err));
+}
+
+.h-diagrow.s-error .h-diagval {
+  color: hsl(var(--err));
+}
+
+.h-diagrow.s-starting .h-diagdot,
+.h-diagrow.s-stopping .h-diagdot {
+  background: hsl(var(--warn));
+}
+
+.h-runchip.s-starting .h-dot,
+.h-runchip.s-stopping .h-dot {
+  background: hsl(var(--warn));
+}
+
+/*
+ * 列流容器。compact 是单列（`column-count` 缺省即一列），medium 起两列。
+ * **块级容器**，不是 flex —— `column-count` 对 flex 容器不生效，那会是一次静默失效。
+ */
+.h-flow {
+  min-width: 0;
+}
+
+/* 卡与卡之间的节奏用 margin（列流里没有 `gap` 这条腿）。 */
+.h-flow .h-card {
+  margin: 0 0 var(--section-gap);
+  /* 卡片、整条芯片行都**不可跨列断开**。后代匹配，见文件头注的 `display: contents` 坑。 */
+  break-inside: avoid;
+}
+
+/* ═══════════ 卡片外观（`separators.md`）═══════════ */
+
+.h-card {
+  background: hsl(var(--surface));
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r);
+  padding: 16px var(--card-padding);
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+.h-cardhead {
+  display: flex;
+  /* meta 槽包含检测动作；垂直居中使标题与动作文案对齐。
+     紧凑层允许命中区延出可见标题行，完整触控尺寸仍由按钮提供。 */
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2); /* 标题块 → 内容 */
+}
+
+.h-cardtitle {
+  margin: 0;
+  font-size: 0.9375rem;
+  /* 640 不是 600 的笔误：`core.json` 专门为卡标题与环内数值打包了可变字体，
+     写 600/700 会被静默重映射成另一档字重。 */
+  font-weight: 640;
+  color: hsl(var(--fg));
+}
+
+/*
+ * 诊断卡是唯一一张**没有自己纵向内边距**的卡（`diagnostic-list.md:30`：rows supply their
+ * height）—— 三行各自 48 高，卡再加一次 16 上下就成了一张比内容高 32 的卡。
+ * 写成属性选择器覆盖 `.h-card`：只读行自己供应高度，不再追加卡片的上下内距。
+ */
+.h-card[data-home-card='diagnostic-list'] {
+  padding: 0 var(--card-padding);
+}
+
+.h-cardmeta {
+  font-size: 0.75rem;
+  color: hsl(var(--fg-faint));
+  font-variant-numeric: tabular-nums;
+}
+
+.h-hair {
+  margin: 16px 0 0;
+  border: 0;
+  border-top: 1px solid hsl(var(--hair));
+}
+
+.h-empty {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: hsl(var(--fg-faint));
+}
+
+/* 行内写失败（IA 裁定 #14）。贴着那颗控件，同处一张卡。 */
+.h-werr {
+  margin: var(--sp-2) 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: hsl(var(--err));
+}
+
+/*
+ * 反向（回国）分流的常驻指示行（真机 2026-07-20 §1.4）。
+ * 片本身复用 `.h-pill.warn`（不新造视觉）；解释是常驻第二句 —— 触屏没有 hover，桌面把它挂在
+ * `data-tip` 上的做法在这里够不着（IA §4.12）。
+ */
+.h-revrow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: hsl(var(--fg-dim));
+}
+
+.h-revrow > .m-info { flex: 1; }
+
+.h-pick-group { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 44px; padding: 0 8px; border: 0; background: transparent; color: hsl(var(--fg-dim)); font: inherit; font-size: .75rem; font-weight: 500; text-align: start; cursor: pointer; }
+.h-pick-group:disabled { opacity: 1; cursor: default; }
+.h-pick-group-chevron { flex: none; transition: transform 140ms ease; }
+.h-pick-group-chevron.open { transform: rotate(90deg); }
+.h-pick-group-count { margin-inline-start: auto; font-variant-numeric: tabular-nums; }
+.h-pick-group:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+
+/* 只读给辅助技术的状态文字。**不用 `display:none`**（那会把它从无障碍树里一并抹掉，
+   而且本文件禁用该声明，见头注 A）。 */
+.h-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ═══════════ ① 节点状态卡 ═══════════ */
+
+.h-nodetop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.h-nodelead {
+  display: flex;
+  align-items: center;
+  gap: 13px; /* 旗 → 文案 */
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--tap-min);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  /* 逻辑属性：这是按钮的**前导**文本区，fa 的 RTL 下要跟着翻边。 */
+  text-align: start;
+  font-family: inherit;
+  color: inherit;
+  touch-action: manipulation;
+}
+
+.h-flag {
+  width: 52px;
+  height: 52px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid hsl(var(--line));
+  object-fit: cover;
+  box-sizing: border-box;
+}
+
+.h-nodecopy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1); /* 标题 → 元信息：4 */
+  min-width: 0;
+}
+
+.h-nodename {
+  font-family: var(--disp);
+  font-size: 1.3125rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  color: hsl(var(--fg));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * 同一个槽位装着两类完全不同的东西，几何规矩也就必须分成两条（2026-09-05 真机缺陷④）：
+ *
+ *  · `kind === 'node'` ⇒ **运行期用户数据**（节点名）。没有静态真值可测，截断是信息损失
+ *    而不是破版 —— 省略号是对的，`text-fit.test.ts`「射程之外 a.」说的正是这一类。
+ *  · 其余三态 ⇒ **静态 i18n 整句**（`home.plsConfigServer` / `routingDirect` / `routingBlock`）。
+ *    对整句截断就是把话截掉：真机首页读作 `Please configure a s…`，用户看不到自己该做什么。
+ *
+ * 故这一档换行而不是省略。纵向增长是免费的（`mobile-screen-shell.md`「Horizontal clipping
+ * fallbacks」：Vertical growth is free），且这几句的长度在编译期就是已知的 —— 能被门测住。
+ *
+ * ── `overflow-wrap: anywhere` 是第二条腿（2026-09-05 Dynamic Type 实测）─────────────
+ *
+ * 只让整句换行**救不了单个词比槽还宽**的那一格：换行只在断行机会处发生，一个不可断单元照样
+ * 整块画出去，而这一档是 `overflow: visible` ⇒ 没有任何兜底，字直接落在卡外的空白上。
+ * 真机（Android 模拟器 412 CSS px，系统字号 2.0x）实测：`.h-nodename.copy` 的
+ * `scrollWidth 193 > clientWidth 136` —— en 的 `configure` 这一个词在 42px（1.3125rem × 2x）
+ * 下比整格还宽。几何是 px（不随缩放）、排版是 rem（随缩放）⇒ 字号一放大，每个词都在同一个框里
+ * 变宽，这条只会更糟，且没有字号可缩（`mobile-screen-shell.md`「Scale text, not the frame」）。
+ *
+ * 取 `anywhere` 而不是 `break-word`：与 `mobile.css` 的 `.m-nav-label` 同一条理由 ——
+ * 两者都能在渲染时断超宽的词，但只有 `anywhere` 同时把 **min-content 尺寸**压下去。
+ * 本格外层 `.h-nodelead` / `.h-nodecopy` 虽已写 `min-width: 0`（min-content 不参与 flex 定尺），
+ * 但同一个属性在本仓只有一种正确写法，两种混用会让下一个人以为它们等价。
+ *
+ * ⚠️ 这条与 `text-fit.test.ts` ⑩ 的节点名判据**互锁**：加上它 `breaksAnywhere()` 翻转，
+ *    那一节的横向判据随之从「登记表」升级成「恒不越界」+「谁踩到了词内断」两条，
+ *    两侧必须同批改（单边改任一侧都会当场红）。
+ */
+.h-nodename.copy {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+/* 「阻断」出口：动作标签轴恒 `--err` 且常驻（`styles/style-invariants.test.ts` ⑧ 的两轴规矩）。 */
+.h-nodename.blk {
+  color: hsl(var(--err));
+}
+
+.h-nodemeta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2); /* 胶囊 / 延迟 / 信号条之间：8 */
+  min-width: 0;
+}
+
+/*
+ * 协议 pill 是**强调片**，不是中性描边灰片：原型 `.pill.proto` 是
+ * `background:hsl(var(--flow-weak)); color:hsl(var(--flow-hi))`，无边框。
+ * 排版走 `type.pill`（11.5 / 640）—— 11.5/16 = 0.71875rem，仍在 Dynamic Type 轴上。
+ */
+.h-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: hsl(var(--flow-weak));
+  font-size: 0.71875rem;
+  font-weight: 640;
+  color: hsl(var(--flow-hi));
+  white-space: nowrap;
+}
+
+/* 变体各自换整套底/字色 —— 只改字色会让主变体那层 flow-weak 底串到它们身上。 */
+.h-pill.warn {
+  background: hsl(var(--warn-weak));
+  color: hsl(var(--warn));
+}
+
+/* 直连 / 阻断 / 未选那一档是**裸文字**，不是片：显式取消底色。
+   取消的是**前导**内边距（裸文字要与上一行左缘对齐），故用逻辑属性。 */
+.h-pill.muted {
+  padding-inline-start: 0;
+  background: none;
+  font-weight: 400;
+  color: hsl(var(--fg-faint));
+  white-space: normal;
+}
+
+.h-lat {
+  font-family: var(--mono);
+  /* `type.body` compact 14（`node-status-card.md`「Latency: type.body, tabular」+ 原型 `.nsub`）。 */
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--fg-dim));
+}
+
+.h-lat.fast, .h-latency-grade.fast { color: hsl(var(--ok)); }
+.h-lat.mid, .h-latency-grade.mid { color: hsl(var(--flow-hi)); }
+.h-lat.slow, .h-latency-grade.slow { color: hsl(var(--warn)); }
+.h-lat.dead, .h-latency-grade.dead { color: hsl(var(--err)); }
+
+/* 信号强度四格（几何取原型 `.bars`：4 条 / 宽 3 / 隙 2 / 满高 14）。 */
+.h-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+
+.h-bars i {
+  width: 3px;
+  border-radius: 1px;
+  background: hsl(var(--fg-faint) / 0.35);
+}
+
+/* 点亮档 = `interactive.primary`（原型 `.bars i` 直接写 `--flow`）。未点亮档原型没有，
+   遵 kit 的 `text.tertiary` 淡出，不属偏离。 */
+.h-bars i.on {
+  background: hsl(var(--flow));
+}
+
+/* 动作行：三等分 + 之间一根内缩竖发丝线。 */
+.h-acts {
+  display: flex;
+  padding-top: var(--card-padding);
+}
+
+/*
+ * 按钮**内轴**是竖排：字形在上、标签在下、之间 7（原型 `.acts button`）。
+ * 与 18em 回退块里 `.h-acts{flex-direction:column}` 不冲突 —— 那条管**容器**主轴
+ * （三颗按钮横排改竖排），这条管**按钮自己**的内轴，两者射程不重叠。
+ */
+.h-act {
+  flex: 1 1 0;
+  min-height: 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  color: hsl(var(--fg-dim));
+  touch-action: manipulation;
+}
+
+/* 动作字形 23；触控盒独立维持 48px。 */
+.h-acticon {
+  width: 23px;
+  height: 23px;
+  flex: none;
+}
+
+/*
+ * 断开是**危险动作**：整颗按钮（字形 + 标签）走 `status.danger`
+ * （原型 `.acts .off{color:hsl(var(--err))}`，`quick-actions.md:46` 同向）。
+ * 颜色挂在按钮上而不是字形上 —— `currentColor` 让两层一起走，且标签也跟着变色，
+ * 不至于「只有图标是红的」这种只用颜色的半吊子。
+ */
+.h-act-off {
+  color: hsl(var(--err));
+}
+
+/*
+ * 连接是**主动作**：未连接态整颗按钮走 `--flow`（与底部导航选中项、`--ring` 同一支）。
+ * 2026-09-06 陈先生真机看过之后的裁定 —— **这是对原型的有意偏离，不是实现漏跟**：
+ * 原型 `.acts button` 三颗同灰、只有 `.off` 是红的，于是「连接」这颗在三颗里没有任何
+ * 辨识度，而它是这一屏的主动作。后续 kit 一致性普查若判本条为偏差，判据看这条注释：
+ * 偏离是授权过的，不许"修回"原型。
+ * 与 `.h-act-off` 同构：颜色挂在按钮上而不是字形上，`currentColor` 让字形与标签一起走。
+ * 判据与标签同源 —— 标签说「连接」时才是这个色，说「断开」时走上面那条红。
+ */
+.h-act-on {
+  color: hsl(var(--flow));
+}
+
+/* 竖发丝线画成伪元素：它不进 flex 排布，故不挤压按钮的居中。 */
+.h-act + .h-act {
+  position: relative;
+}
+
+.h-act + .h-act::before {
+  content: '';
+  position: absolute;
+  /* 竖发丝线画在**后一颗按钮的前导边**上，故用逻辑属性（RTL 下自动翻到另一侧）。 */
+  inset-inline-start: 0;
+  top: 5px;
+  bottom: 5px;
+  width: 1px;
+  background: hsl(var(--hair));
+}
+
+.h-act:active {
+  opacity: 0.7;
+}
+
+.h-act:disabled {
+  color: hsl(var(--fg-faint));
+  cursor: default;
+}
+
+.h-act:focus-visible,
+.h-nodelead:focus-visible,
+.h-timestamp:focus-visible,
+.h-unlock:focus-visible,
+.h-pickrow:focus-visible,
+.h-opt:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: -2px;
+}
+
+.h-actlabel {
+  /* 12.5 / 500（原型 `.acts button`）。12.5/16 = 0.78125rem，随 `--font-scale` 走。 */
+  font-size: 0.78125rem;
+  font-weight: 500;
+}
+
+/*
+ * 忙态指示（`quick-actions.md`「Busy actions replace the icon with a code-rendered progress
+ * indicator while preserving the label.」+ `status-and-indicators.md:26` 的「20–24 视觉尺寸、
+ * 落在 48 触控区里」）。字形槽被它顶替，标签**原样保留** —— 用户要知道自己刚按的是哪一颗。
+ *
+ * 只用变暗（`:disabled`）说不出「在飞」与「不可点」的区别：起核要好几秒，那几秒里屏幕上没有
+ * 任何东西在动，用户会再按一次。
+ */
+.h-actspin {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  box-sizing: border-box;
+  border: 2px solid currentColor;
+  /* 缺口那一段 = 转起来才看得见的那条弧。 */
+  border-top-color: transparent;
+  border-radius: 50%;
+  /* 终态写在元素上、`@keyframes` 只写起点：CSS Animations L1 规定缺席的 100% 关键帧由元素的
+     计算值补齐（Chrome 44+，在本仓 ≤105 的地板之内）。
+     ⚠️ 这不是花活 —— `text-fit.test.ts` ⑩ 的层叠链交集判据用的是一个朴素的
+     `([^{}]+){...}` 切法，它会把关键帧步进名 `to` 当成一个**选择器**，而桌面的
+     `@keyframes spin{to{…}}` 里正好也有一个 `to` ⇒ 直接写 `to{}` 会让那道门报一次
+     「移动端起了与桌面重名的槽位」的假阳。`from` 不在桌面那份步进名里，故起点用它。 */
+  transform: rotate(1turn);
+  animation: h-actspin 0.8s linear infinite;
+}
+
+@keyframes h-actspin {
+  from {
+    transform: rotate(0turn);
+  }
+}
+
+/* 减弱动效：不转，但**仍然是一个与静止字形不同的形状** —— 忙态不能因为关了动画就消失。 */
+@media (prefers-reduced-motion: reduce) {
+  .h-actspin {
+    animation: none;
+    border-top-color: currentColor;
+    border-right-color: transparent;
+    opacity: 0.55;
+  }
+}
+
+/* 警示 / 提示条。 */
+.h-notice {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: hsl(var(--surface-2));
+}
+
+.h-notice.warn {
+  background: hsl(var(--warn-weak));
+  color: hsl(var(--warn));
+}
+
+.h-noticeicon {
+  flex: none;
+  line-height: 0;
+}
+
+.h-noticetext {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.h-noticeact {
+  margin: 0 0 0 var(--sp-2);
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 600;
+  color: hsl(var(--flow));
+  text-decoration: underline;
+}
+
+/* ═══════════ 底部弹层（节点选择器 / 模式选择）═══════════ */
+
+/* 背幕：吃掉弹层之外的所有点击（见 `Scrim` 的头注：穿透过去正好是连接开关）。 */
+.h-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 19;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: hsl(var(--shadow) / 0.42);
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+/*
+ * 覆盖整屏的浮层。**不做进出动画**：本屏没有动画宿主，且 `prefers-reduced-motion` 下要退化成
+ * 无动画，两条腿意味着两套形态 —— 一个都不做最简单，也最不会骗人。
+ */
+.h-sheet {
+  position: fixed;
+  /* 两侧都钉 0（整幅贴底），写成逻辑属性与本文件其余定位一致；`inset-inline` 简写不在
+     `../../styles/css-feature-floor.test.ts` 的 105 白名单里，故拆成两条。 */
+  inset-inline-start: 0;
+  inset-inline-end: 0;
+  bottom: 0;
+  z-index: 20;
+  max-height: 70%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-4);
+  padding-bottom: calc(var(--sp-4) + var(--m-overlay-safe-b, var(--safe-b)));
+  padding-left: calc(var(--sp-4) + var(--safe-l));
+  padding-right: calc(var(--sp-4) + var(--safe-r));
+  box-sizing: border-box;
+  background: hsl(var(--surface));
+  border-top: 1px solid hsl(var(--line));
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  box-shadow: var(--shadow-pop);
+}
+
+.h-sheethead {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.h-sheettitle {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: hsl(var(--fg));
+  line-height: 1.35;
+  max-height: 2.7em;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
+.h-picker-search { display: flex; margin-bottom: 8px; }
+
+/* The picker alone keeps its controls outside the clipped list viewport. */
+.h-picker-sheet { display: flex; flex-direction: column; overflow: hidden; }
+.h-picker-sheet .h-sheethead, .h-picker-search { flex: none; }
+.h-picker-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.h-picker-search { align-items: center; gap: 8px; }
+.h-picker-sort {
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: none;
+  min-height: var(--mobile-action-hit);
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: hsl(var(--fg-dim));
+  font: inherit;
+  font-size: var(--mobile-control-font);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.h-picker-sort::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: var(--mobile-action-inset) 0;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--mobile-action-neutral));
+}
+.h-picker-sort[aria-checked='true'] {
+  color: hsl(var(--flow-hi));
+}
+.h-picker-sort[aria-checked='true']::before {
+  border-color: hsl(var(--flow) / .45);
+  background: hsl(var(--flow-weak));
+}
+.m-shell .h-picker-sort:active { opacity: 1; }
+.m-shell .h-picker-sort:active::before { border-color: hsl(var(--fg) / .35); }
+.h-picker-sort:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+
+.h-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 40px;
+  padding: 0 var(--sp-3);
+  box-sizing: border-box;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: hsl(var(--bg));
+  color: hsl(var(--fg));
+  font-family: inherit;
+  font-size: 0.875rem;
+}
+
+.h-sheetclose {
+  flex: none;
+  min-height: var(--tap-min);
+  margin: 0;
+  padding: 0 var(--sp-2);
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.875rem;
+  color: hsl(var(--flow));
+}
+
+.h-picklist,
+.h-optlist {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.h-pickrow,
+.h-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: var(--tap-min);
+  margin: 0;
+  padding: var(--sp-2) 0;
+  border: 0;
+  border-bottom: 1px solid hsl(var(--hair));
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  color: hsl(var(--fg));
+  text-align: start;
+  touch-action: manipulation;
+}
+
+.h-pickrow.cur,
+.h-opt.cur {
+  color: hsl(var(--flow));
+  font-weight: 600;
+}
+
+.h-pickname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.875rem;
+}
+
+.h-pickmeta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+}
+
+.h-opt {
+  font-size: 0.9375rem;
+}
+
+/* 「合并进已有规则」那一档的行是**两行**（规则名 + 为什么可以/不可以），故换主轴。 */
+.h-opt.col {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+}
+
+.h-optname {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  font-size: 0.9375rem;
+}
+
+/* 置灰的三档各自带出路（`rules.pickWhyAnd` / `pickWhyUnfit` / `subjectAlreadyInRule`），
+   可追加的行这里写的是「会落到哪个条件上」。整句允许换行 —— 它是理由不是标签。 */
+.h-optwhy {
+  font-size: 0.78125rem;
+  line-height: 1.35;
+  color: hsl(var(--fg-faint));
+  overflow-wrap: anywhere;
+}
+
+.h-opt:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 「阻断」：动作标签轴恒 `--err` 且**常驻**（`styles/style-invariants.test.ts` ⑧ 的两轴规矩）。
+   写在 `.h-opt.cur` 之后 —— 选中「阻断」时红必须压过选中态的 `--flow`，否则那一档在被选中的
+   那一刻就不红了，而「常驻」说的正是它任何时候都红。 */
+.h-pickname.blk,
+.h-opt.blk {
+  color: hsl(var(--err));
+}
+
+/* 哨兵行「阻断」在直连模式下的置灰原因，贴在标签右边。 */
+.h-pickwhy {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.75rem;
+  line-height: 1.3;
+  text-align: end;
+  color: hsl(var(--fg-faint));
+  overflow-wrap: anywhere;
+}
+
+/* 弹层里的一句说明（已被哪条规则覆盖 / 这次要写的对象 / 选择提示）。 */
+.h-sheetnote {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: hsl(var(--fg-dim));
+  overflow-wrap: anywhere;
+}
+
+/* 搜索框 + 清空键。清空键是 flex 项而不是绝对定位的覆盖层：绝对定位要和输入框的内边距对齐，
+   而那个内边距在放大字号档下会变 —— 两者一旦错位，叉号就压在用户正在读的字上。 */
+.h-searchrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.h-searchclear {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--tap-min);
+  min-height: var(--tap-min);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  color: hsl(var(--fg-dim));
+  touch-action: manipulation;
+}
+
+/* 「新建规则」的提交键。`--flow` 实心 —— 它是这一层里唯一的主动作。 */
+.h-sheetsubmit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: var(--tap-min);
+  margin-top: var(--sp-3);
+  padding: 0 var(--sp-3);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: hsl(var(--flow));
+  color: #00141d;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  touch-action: manipulation;
+}
+
+/* 空态两条直达入口（加节点 / 加订阅）。等分一行，与下面的动作行同一套触控下限。 */
+.h-emptyacts {
+  display: flex;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+}
+
+.h-emptyact {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: var(--tap-min);
+  margin: 0;
+  padding: 0 var(--sp-2);
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-sm);
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: hsl(var(--flow));
+  touch-action: manipulation;
+}
+
+/* ═══════════ ② 模式芯片 ═══════════ */
+
+.h-exit-flag {
+  width: 19px;
+  height: 13px;
+  flex: none;
+  border-radius: 2px;
+  border: 1px solid hsl(var(--line));
+  object-fit: cover;
+  box-sizing: border-box;
+}
+
+.h-unlockgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 6.5rem), 1fr));
+  row-gap: 4px;
+  column-gap: 8px;
+}
+
+/* 条目是一颗真控件（点开服务详情）：徽章与圆点可见，服务名和状态留在可访问名称及详情。 */
+.h-unlock {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: var(--mobile-tap, 44px);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  font-family: inherit;
+  color: inherit;
+  text-align: start;
+  touch-action: manipulation;
+}
+
+.h-unlock:active {
+  opacity: 0.7;
+}
+
+/*
+ * 徽章底色**两个主题都是白的**，不是 surface token。
+ * 这是从桌面 `.ub-ico`（`components.css:308`）逐值抄来的，也正是这些标记能保持可辨识的原因：
+ * 好几个是多色的，至少一个（TikTok）带黑色描边，落在深色面上会直接消失。
+ * 给徽章上主题色，是这张卡最可能悄悄漂离桌面客户端的方式。
+ */
+.h-badge {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 3px;
+  box-sizing: border-box;
+  border: 1px solid hsl(var(--line));
+  border-radius: var(--r-xs);
+  background: #fff;
+  box-shadow: 0 1px 2px hsl(var(--shadow) / 0.14);
+}
+
+.h-badge img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* 失败态去饱和 —— 颜色之外的**第二条通道**（色盲安全），与桌面 `components.css:311` 同规则。
+   `partial` **不**去饱和：它是一个真实结果，不是失败。 */
+.h-badge.st-idle,
+.h-badge.st-timeout,
+.h-badge.st-blocked {
+  filter: grayscale(1);
+  opacity: 0.62;
+}
+
+.h-stdot {
+  position: absolute;
+  /* 角标挂在徽章的**尾随**下角，RTL 下跟着翻边（否则它会压到品牌标记的另一侧）。 */
+  inset-inline-end: -3px;
+  bottom: -3px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid hsl(var(--surface));
+  background: hsl(var(--fg-faint));
+}
+
+/* `unlock-detection.md:64` 的状态表首行是 `ok → status.connected`，其 sourceToken 是 `--aurora`；
+   `status.success`（`--ok`）是另一个角色。原型七个绿点也一律 `--aurora`。 */
+.h-stdot.st-ok {
+  background: hsl(var(--aurora));
+}
+
+/* `blocked`（换国家）与 `restricted`（换同国的干净出口）**必须视觉可分**：
+   它们带着不同的用户动作，合成同一个红会把检测引擎产出的唯一可行动差异抹掉。 */
+.h-stdot.st-blocked {
+  background: hsl(var(--err));
+}
+
+.h-stdot.st-restricted,
+.h-stdot.st-partial {
+  background: hsl(var(--warn));
+}
+
+/*
+ * `checking` = 探测在飞，规范要求 animated（`unlock-detection.md:69`）。
+ * 脉冲用 `alternate` + 只写起点关键帧：终点 100% 由元素自身的 `opacity` 补齐
+ * （CSS Animations L1 的隐式关键帧，与 `.h-actspin` 同一条理由——`to` 这个步进名会被
+ * `text-fit.test.ts` ⑩ 的朴素切法当成与桌面重名的选择器）。
+ */
+.h-stdot.st-checking {
+  background: hsl(var(--flow));
+  opacity: 1;
+  animation: h-stpulse 1s ease-in-out infinite alternate;
+}
+
+@keyframes h-stpulse {
+  from {
+    opacity: 0.3;
+  }
+}
+
+/* 关了动效仍要与静止的其它态可分：留一个恒定的半透明，而不是变回不动的实心点。 */
+@media (prefers-reduced-motion: reduce) {
+  .h-stdot.st-checking {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
+.h-stdot.st-idle {
+  opacity: 0.5;
+}
+
+/* 服务详情弹层的两行。状态那一行是**文字**，不再画一颗彩色点：详情层就是为了把颜色通道
+   翻译成词，再画一遍颜色等于把同一条通道说第二遍。 */
+.h-detailrow {
+  margin: 0;
+  font-size: 1rem;
+  color: hsl(var(--fg));
+}
+
+.h-detailmeta {
+  margin: var(--sp-2) 0 0;
+  font-size: 0.75rem;
+  color: hsl(var(--fg-faint));
+}
+
+/* ═══════════ ④ 流量图 ═══════════ */
+
+.h-rates {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: 12px; /* 数值 → 图 */
+}
+
+/* `type.metric`：19 / 500 / **display** 族 + tabular 数字。规范里的「mono digits」说的是
+   等宽数字（`font-variant-numeric`），不是整支换等宽字族。 */
+.h-rate {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-1);
+  font-family: var(--disp);
+  font-size: 1.1875rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.h-rate.dn {
+  color: hsl(var(--dn));
+}
+
+.h-rate.up {
+  color: hsl(var(--up));
+}
+
+.h-plotwrap {
+  position: relative;
+  /* 有采样曲线时的基础高度；宽屏按列宽给 150px。 */
+  height: 110px;
+}
+
+/* 无样本时不画坐标轴；提示居中，避免与上限刻度占据同一位置。 */
+.h-plotwrap.empty {
+  height: 92px;
+  display: grid;
+  place-items: center;
+  text-align: center;
+}
+
+/*
+ * `overflow: visible` 不是可有可无：四条网格线画在 y = 0 / 33 / 66 / 100，而描边以基线为中心，
+ * 首尾两条各有 0.5px 落在 viewBox 之外 —— SVG 的 UA 缺省是 `overflow:hidden` ⇒ 那两条只渲染
+ * 一半，四条「等重」的网格线里有两条是半重的（`traffic-chart.md:20` 要求四条同形）。
+ * `.h-plotwrap` 自身不裁切，多出来的两个半像素落在既有间距里。
+ */
+.h-plot {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.h-grid {
+  stroke: hsl(var(--hair));
+  stroke-opacity: 0.55;
+  stroke-width: 1;
+}
+
+.h-series {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.h-series.dn {
+  stroke: hsl(var(--dn));
+}
+
+/* 上行是**紫色**（契约 D-2），不是原始参考图里的绿。 */
+.h-series.up {
+  stroke: hsl(var(--up));
+}
+
+/* Y 轴只标两个数：刻度上限与 0。中间那两条网格线不标。 */
+/* 前导侧（原型两个 `.yl` 实例都是 `left:0`）：贴在尾随侧会正压在曲线最新那一端上方。 */
+.h-ymax,
+.h-ymin {
+  position: absolute;
+  left: 0;
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  color: hsl(var(--fg-faint));
+}
+
+.h-ymax {
+  top: 0;
+}
+
+.h-ymin {
+  bottom: 0;
+}
+
+.h-xaxis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--sp-1);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  color: hsl(var(--fg-faint));
+}
+
+/* ═══════════ ⑤ 流量构成 ═══════════ */
+
+.h-stack {
+  display: flex;
+  gap: 2px; /* 相邻段之间留缝，不靠描边分隔 */
+  height: 10px;
+  margin-bottom: 15px; /* 条 → 图例 */
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.h-seg {
+  min-width: 0;
+}
+
+.h-legend {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  row-gap: 10px;
+  column-gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.h-legend li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.h-swatch {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 2px;
+}
+
+/* 图例名与值都是 `type.caption`（13，扁平档，无 expanded）。 */
+.h-legendname {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.8125rem;
+  color: hsl(var(--fg-dim));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.h-legendval {
+  flex: none;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--fg));
+}
+
+/*
+ * 有序类别色序（`traffic-composition.md`）：主色 → 已连接 → 中性 → 警示，之后降亮度重复。
+ * 直连占中性那格、阻断占警示那格，故这两者在本卡与产品其它地方读作同一件事。
+ */
+.c0 {
+  background: hsl(var(--flow));
+}
+
+.c1 {
+  background: hsl(var(--aurora));
+}
+
+.c2 {
+  background: hsl(var(--fg-faint));
+}
+
+.c3 {
+  background: hsl(var(--warn));
+}
+
+.dim {
+  opacity: 0.55;
+}
+
+/* ═══════════ ⑥ 规则命中 ═══════════ */
+
+.h-rings {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr; /* 四等分格 */
+  gap: 12px;
+}
+
+/* 这一格有**两段不同**的间距：环 → 名字 8、名字 → 策略 2（`rule-hits.md:42`）。
+   一个 `gap` 只能给出一个数，故两段各自用 margin 表达。 */
+.h-ringcell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+}
+
+.h-ring {
+  width: 100%;
+  max-width: 72px;
+  margin-bottom: var(--sp-2); /* 环 → 名字 */
+  aspect-ratio: 1 / 1;
+  /* 起点转到 12 点方向；环的描边随环尺寸走（`stroke-width` 在 viewBox 单位里，故自动等比）。 */
+  transform: rotate(-90deg);
+}
+
+.h-ringtrack,
+.h-ringfill {
+  fill: none;
+  stroke-width: 5;
+}
+
+.h-ringtrack {
+  stroke: hsl(var(--surface-3));
+}
+
+/* 环色跟**策略**走，不跟规则走。 */
+.h-ring.p-proxy .h-ringfill {
+  stroke: hsl(var(--flow));
+}
+
+.h-ring.p-direct .h-ringfill,
+.h-ring.p-unknown .h-ringfill {
+  stroke: hsl(var(--fg-faint));
+}
+
+.h-ring.p-block .h-ringfill {
+  stroke: hsl(var(--warn));
+}
+
+/* `text-anchor` 与基线偏移落在 JSX 的 SVG 属性上，不落在这里（见 `HomeScreenView` 那处注释）。 */
+/*
+ * 环内数值用 rem 跟随用户字号。SVG 的 viewBox(64) → 环实宽仍会把字号按
+ * 当前环宽缩放，变更环尺寸时要一起核对阅读性。
+ */
+.h-ringval {
+  fill: hsl(var(--fg));
+  font-family: var(--disp);
+  font-size: 0.9375rem;
+  font-weight: 640;
+  /* 环整体转了 -90°，数字要转回来才是正的。 */
+  transform: rotate(90deg);
+  transform-origin: 32px 32px;
+}
+
+.h-ringname,
+.h-ringpolicy {
+  max-width: 100%;
+  font-size: 0.6875rem;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.h-ringname {
+  color: hsl(var(--fg-dim));
+}
+
+.h-ringpolicy {
+  margin-top: 2px; /* 名字 → 策略。无对应 --sp 档（--sp-1 已是 4），按原型写字面量。 */
+  color: hsl(var(--fg-faint));
+}
+
+/* ═══════════ ⑦ 域名 Top 5 ═══════════ */
+
+.h-hosts {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.h-hosts li {
+  min-width: 0;
+}
+
+.h-hosts li + li {
+  margin-top: 13px;
+}
+
+.h-hostline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: 6px; /* 名字行 → 条 */
+  min-width: 0;
+}
+
+/* 长域名在可用宽度末尾截断：**绝不换行到第二行，也绝不缩小字号**。 */
+.h-hostname {
+  min-width: 0;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--fg));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* `type.captionValue`：12.5 / **600** / tabular。 */
+.h-hostval {
+  flex: none;
+  font-size: 0.78125rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--fg-dim));
+}
+
+.h-hostbar {
+  display: block;
+  height: 5px;
+  border-radius: 3px;
+  /* `surface.secondary`（`host-traffic-top.md:32`）。**不要**跟着规则环的轨道走 ——
+     那一处原型写的就是 `--surface-3`，两者是不同的槽。 */
+  background: hsl(var(--surface-2));
+  overflow: hidden;
+}
+
+/* 条宽相对**首位**而不是总量 —— 否则最小的那条会细到看不见。 */
+.h-hostbar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+}
+
+/*
+ * 主机行的壳。可点的那些（判得出观测对象、且不在隐私模式）是 `<button class="h-hostrow act">`，
+ * 其余仍是 `<span>` —— 不留一个点下去什么也不发生的触控目标。
+ *
+ * `.act` 上的 `min-height: var(--tap-min)` 会把 5 行撑高，这是**有意的**：本仓对可点行一律取
+ * 48 的触控下限（`.h-unlockcell` 那处的注释逐字记着同一次权衡），不因为它原来是一行读数就放宽。
+ */
+.h-hostrow {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  appearance: none;
+  -webkit-appearance: none;
+  color: inherit;
+  font-family: inherit;
+  text-align: start;
+}
+
+.h-hostrow.act {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: var(--tap-min);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.h-hostrow:focus-visible,
+.h-emptyact:focus-visible,
+.h-searchclear:focus-visible,
+.h-sheetsubmit:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+/* ═══════════ ⑧ 诊断列表 ═══════════ */
+
+.h-diag {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/*
+ * 行首多了一个 23 的视觉列（图标或状态点）。它与标签合成**一个** `.h-diaglead` 子项，
+ * 而不是让行直接有三个子项 —— 两个理由，都不是审美：
+ *  · `justify-content: space-between` 在三个子项下会把空白**均分**，前导列与标签之间被撑开；
+ *  · 改用 `.h-diagval{margin-inline-start:auto}` 能解决横排，但那是一条**跨轴**的自动外边距，
+ *    到了下面 18em 的竖排回退里它会压过 `align-items: flex-start`，把取值推到行尾 ——
+ *    而那个回退块的选择器/属性面被 `../dynamic-type.test.ts` ④ 逐条登记着，不该为此扩表。
+ * 包一层之后横排与竖排都照旧，回退块一个字都不用改。
+ */
+.h-diagrow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  min-height: var(--tap-min);
+}
+
+/* 前导视觉 + 标签。间距 12（原型 `.srow{gap:12px}` 里字形到文字的那一段）。 */
+.h-diaglead {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/*
+ * 分隔线**前导内缩 35**（`layout.dividerLeadingInset`）：它从标签起，不横穿前导图标那一列。
+ * 画成伪元素而不是 `border-top` + `margin-left` —— 后者会把整行内容一起右移。
+ * 用逻辑属性：规范说的是 leading，fa 的 RTL 下要自动翻边（写 `left` 会翻错方向）。
+ */
+.h-diagrow + .h-diagrow::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  inset-inline-start: 35px;
+  inset-inline-end: 0;
+  height: 1px;
+  background: hsl(var(--hair));
+}
+
+/* 行首视觉列。`layout.iconVisualSize` = 23（`diagnostic-list.md:24`）。 */
+.h-diagicon {
+  width: 23px;
+  height: 23px;
+  flex: none;
+  color: hsl(var(--fg-faint));
+}
+
+/*
+ * 内核状态行的前导位是一颗状态点，不是图标 —— 但它必须**占满同一条前导列**。
+ *
+ * 点本体只有 8（`.h-dot`），前导列是 23（`layout.iconVisualSize`）⇒ 差 15，靠两侧各 7.5 的
+ * 外边距补齐（8 + 7.5×2 = 23）。`.h-diaglead` 的 gap 是三行共用的**一个常数**，补不出这 15：
+ * 不补的话前两行标签从 23+12 = 35 起、第三行从 8+12 = 20 起，三行标签左缘差 15px，且第三行
+ * 比压在它上面那条 `inset-inline-start: 35px` 的分隔线还靠左。
+ *
+ * 原型 :303 给这颗点写的是 `margin:0 7px`（22，比图标列窄 1）。这里取 7.5 而不是 7：
+ * 原型自己在同一段里把分隔线内缩写成 35（`.hair{margin-left:35px}`）、把图标列写成 23
+ * （`.srow>svg{width:23px}`），两者要求的前导列就是 23 —— 7px 那一档是原型**内部**不自洽的
+ * 那 1px，不是原型与 kit 的分歧。`margin-inline` 是逻辑属性，fa 的 RTL 下自动翻边。
+ */
+.h-diagdot {
+  flex: none;
+  margin-inline: 7.5px;
+}
+
+/* `type.row` / `type.rowValue`：都是 16，取值 600 且用主色（原型 `.srow .k` / `.srow .v`）。 */
+.h-diaglabel {
+  font-size: 1rem;
+  color: hsl(var(--fg));
+}
+
+.h-diagval {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--mono);
+  font-size: 1rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--fg));
+}
+
+/* ═══════════ Dynamic Type 竖排回退 ═══════════
+ *
+ * `mobile-screen-shell.md` 的「Horizontal clipping fallbacks」：三处**横排行**在容器有效宽低于
+ * 一条 em 阈值时改竖排 —— 节点状态卡的三按钮动作行、模式芯片行、诊断行。
+ *
+ * ══ 这条阈值量的是 Dynamic Type，不是窄屏 ═══════════════════════════════════
+ *
+ * 容器查询里的 `em` 按**容器自己的字号**解析，而 `.m-screen-viewport` 的字号 = `16px × var(--font-scale)`
+ * ⇒ 字放大 ⇒ 有效 em 宽度变窄。同一台 412 CSS px 的手机：1x 下是 25.75em，2x 下只剩 12.875em。
+ * 所以这是「字变大时容器相对变窄」的度量，与上面的 `min-width` 断点**是同一套机制**
+ * （spec 明写 Do not introduce a second responsive system for this），不是小屏专用的第二套。
+ *
+ * ⚠️ 上面的 `@container` 断点是加宽分栏，本条是大字下的变窄回退，两者射程不重叠。
+ *
+ * ══ 18em 的来历（两头都有硬边，判据钉在 `../dynamic-type.test.ts`）═══════════
+ *
+ *  · **下界 > 16.25em**：compact 参考视口 390px 在 1.5x 下正好 16.25em，而那时 `.h-act` 的
+ *    三等分槽只剩 (390 − 66) / 3 = 108px，已经装不下最长的动作文案（ru `Подключить`）
+ *    ⇒ 阈值若更小，回退会来得比溢出还晚。
+ *    ⚠️ 这条下界在 `../dynamic-type.test.ts` ③ 里是**按 em 直接结算**的
+ *    （`emWidth(390, 1.5) = 16.25`），不读标签字号 —— 标签从 13 收到 12.5（原型
+ *    `.acts button{font-size:12.5px}`）只让那一格的余量变窄一点，不动这个下界本身。
+ *  · **上界 < 20em**：真机最窄的 Android 竖屏 CSS 宽是 320px，1x 下正好 20em ⇒ 阈值必须严格
+ *    小于它，否则 1x 下就有真机踩进回退 —— 那就成了「窄屏回退」，与本条的用意相反。
+ *
+ * 18em 落在中间：1x 下任何 ≥ 288px 的屏都不触发（= **所有真机 1x 都不触发**），
+ * 412px 上它对应 fontScale ≈ 1.43，390px 上约 1.35。
+ *
+ * ⚠️ 本块**只改主轴方向与收缩性**，一个 `display` / `visibility` 都不出现 —— 头注 A 的硬约束，
+ *    `home-screen.test.tsx` 对每个 `@container` 块逐条扫。竖向长高是免费的，回退不藏任何内容。
+ */
+@container mscreen (max-width: 18em) {
+  /* ① 节点状态卡的三按钮动作行。 */
+  .h-acts {
+    flex-direction: column;
+  }
+
+  /* 竖排后不再瓜分一行宽，各自按内容高（`min-height: 48px` 仍是手指的下限）。
+     不写这条的话 `flex: 1 1 0` 在纵轴上会把三颗按钮的高度绑成一份可分配空间。 */
+  .h-act {
+    flex: none;
+  }
+
+  /* 分隔发丝线从「内缩竖线」翻成「整幅横线」：竖排下原来那根落在按钮左侧，读作装饰而不是分隔。 */
+  .h-act + .h-act::before {
+    /* 与基础规则的 `inset-inline-start` 配对铺满整幅（竖排后它是横线）。 */
+    inset-inline-end: 0;
+    top: 0;
+    bottom: auto;
+    width: auto;
+    height: 1px;
+  }
+
+  /* ② 模式芯片行。竖排后每颗拿到整个卡内宽（compact 参考视口下标签可用宽 138px → 324px）。 */
+
+
+  /* ③ 诊断行：标签与取值改上下排，沿行首对齐（`flex-start` 在 fa 的 RTL 下自动翻到右侧，
+     故这里不需要、也不许出现 `direction`）。 */
+  .h-diagrow {
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+  }
+}
+
+/* ═══════════ 断点：medium ≥ 37.5em ═══════════
+ *
+ * ⚠️ 断点块里**不出现** `display` / `visibility` / `content-visibility`：那三个会让
+ * 「三档内容一致」变成一句空话，门对着本文件的 `@container` 块逐条扫（见头注 A）。
+ * 同理，`order` 与网格显式定位一个都不出现（头注 B）。
+ *
+ * 原型的 expanded 整体放大与本次移动端密度要求冲突：触控目标维持 48px，
+ * 动态字号由用户设置控制，宽屏卡片靠列宽与内容上限取得可读长度。
+ */
+
+@container mscreen (min-width: 37.5em) {
+  .h-flow {
+    column-count: 2;
+    column-gap: 24px;
+  }
+
+  .h-plotwrap {
+    height: 150px;
+  }
+}
+
+/* Routing is a direct three-way choice; network checks have their own action row. */
+.h-routing { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.h-route-option, .h-check-btn {
+  appearance: none; font: inherit; cursor: pointer; min-height: var(--tap-min);
+  border: 1px solid hsl(var(--line)); border-radius: var(--r-sm);
+  background: hsl(var(--surface-2)); color: hsl(var(--fg-dim));
+  padding: 8px; min-width: 0; overflow-wrap: anywhere; line-height: 1.4;
+}
+.h-route-option { font-size: .875rem; }
+.h-route-option.sel, .h-check-btn {
+  background: hsl(var(--flow-weak)); color: hsl(var(--flow-hi)); border-color: hsl(var(--flow) / .45);
+}
+.h-route-option.sel { font-weight: 650; }
+.h-check-btn { font-size: .8125rem; padding: 6px 12px; }
+.h-check-btn:disabled { opacity: .65; cursor: default; }
+.h-route-option:focus-visible, .h-check-btn:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+.h-exit-info { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: .8125rem; margin-bottom: 8px; }
+.h-exit-label, .h-exit-direct, .h-check-time { color: hsl(var(--fg-dim)); }
+.h-exit-address { font-family: var(--mono); overflow-wrap: anywhere; min-width: 0; }
+.h-check-time { font-size: .75rem; margin: 0 0 6px; text-align: end; }

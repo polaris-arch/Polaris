@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn durable_managed_write_distinguishes_pre_and_post_replace_failure() {
+    let dir = std::env::temp_dir().join(format!("polaris-managed-durable-{}", random_tmp_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.json");
+    std::fs::write(&path, "old").unwrap();
+    let occupied_tmp = tmp_path(&path, "000000000001");
+    std::fs::write(&occupied_tmp, "another writer").unwrap();
+    assert!(durable_atomic_write(&path, "must not publish", "000000000001").is_err());
+    assert_eq!(
+        std::fs::read_to_string(&occupied_tmp).unwrap(),
+        "another writer"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+
+    let before = durable_atomic_write_with_hook(&path, "new", "abcdef012345", |stage| {
+        if stage == DurableWriteStage::BeforeReplace {
+            Err(crate::StoreError::Io("injected pre-replace failure".into()))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(before, Err(crate::StoreError::Io(_))));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+    assert!(!tmp_path(&path, "abcdef012345").exists());
+
+    let after = durable_atomic_write_with_hook(&path, "new", "abcdef012345", |stage| {
+        if stage == DurableWriteStage::AfterReplace {
+            Err(crate::StoreError::Io(
+                "injected directory sync failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(after, Err(crate::StoreError::CommitUncertain(_))));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    let guarantee = durable_atomic_write(&path, "newer", "abcdef012345").unwrap();
+    #[cfg(unix)]
+    assert_eq!(guarantee, DurableWriteGuarantee::FileAndDirectory);
+    #[cfg(not(unix))]
+    assert_eq!(guarantee, DurableWriteGuarantee::FileOnly);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn tmp_path_format_matches_sweep_regex() {
     let base = Path::new("/data/polaris/config.json");
     let p = tmp_path(base, "abcdef012345");

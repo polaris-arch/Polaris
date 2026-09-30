@@ -43,6 +43,7 @@ const h = vi.hoisted(() => ({
   statuses: {} as Record<string, unknown>,
   opened: [] as unknown[],
   closes: 0,
+  loggedOut: [] as string[],
 }));
 
 vi.mock('react-i18next', () => ({
@@ -72,7 +73,7 @@ vi.mock('./dialog-store', () => ({
   body: { nodeType: 1 },
 };
 
-const { MeshJoinDialog } = await import('./MeshJoinDialog');
+const { MeshJoinDialogView } = await import('./MeshJoinDialog');
 
 // ── 夹具 ────────────────────────────────────────────────────────────────────
 
@@ -109,6 +110,7 @@ beforeEach(() => {
   h.statuses = {};
   h.opened = [];
   h.closes = 0;
+  h.loggedOut = [];
   logouts.length = 0;
 });
 
@@ -164,8 +166,12 @@ function buttons(node: unknown): { label: string; click: () => void }[] {
   return out;
 }
 
-const tree = () => MeshJoinDialog(props) as unknown;
-const html = () => renderToStaticMarkup(<MeshJoinDialog {...props} />);
+const viewProps = () => ({ ...props, servers: h.servers as ServerConfig[],
+  tsStates: Object.fromEntries((h.servers as ServerConfig[])
+    .filter((server) => server.protocol === 'tailscale')
+    .map((server) => [server.id, !h.loggedOut.includes(server.id)])) });
+const tree = () => MeshJoinDialogView(viewProps()) as unknown;
+const html = () => renderToStaticMarkup(<MeshJoinDialogView {...viewProps()} />);
 
 // ════════════════════════════════════════════════════════════════════════════
 // 判据 1：恰好 1 个 TS 节点 ⇒ 保留原节点动作，另有独立新增入口
@@ -218,6 +224,16 @@ describe('判据 1 —— 单个 Tailscale 节点：既有动作和新增入口�
     ]);
     buttons(ts.props.actions)[2].click();
     expect(logouts.map((n) => n.id)).toEqual(['ts-a']);
+  });
+
+  it('登出后的节点提供原身份登录入口，且不再提供登出动作', () => {
+    h.servers = [tsNode('ts-a', '家里')];
+    h.loggedOut = ['ts-a'];
+    const ts = tiles(tree()).find((el) => el.props.title === 'Tailscale')!;
+    const acts = buttons(ts.props.actions);
+    expect(acts.map((button) => button.label)).toEqual(['meshJoin.taildrop', 'ts.signIn']);
+    acts[1].click();
+    expect(h.opened).toEqual([{ kind: 'ts-login', serverId: 'ts-a' }]);
   });
 
   it('已有节点时新增 tile 始终走无 serverId 的新建路径', () => {

@@ -355,6 +355,12 @@ fn tray_interaction_mode_is_direct_only_on_mac_and_windows() {
         tray_interaction_mode(Platform::Other),
         TrayInteractionMode::NativeMenu
     );
+    // Android 不可达（托盘调用点全带 `#[cfg(desktop)]`），但仍逐值钉死 —— 不可达不等于
+    // 可以不回答，本次审计的整条教训就是「没人为这个平台答过题」。
+    assert_eq!(
+        tray_interaction_mode(Platform::Android),
+        TrayInteractionMode::NativeMenu
+    );
 }
 
 #[test]
@@ -387,7 +393,14 @@ fn direct_tray_clicks_toggle_overlay_for_left_and_right() {
 fn native_menu_platforms_ignore_all_tray_click_events() {
     use tauri::tray::{MouseButton, MouseButtonState};
 
-    for platform in [Platform::Linux, Platform::Other] {
+    // 2026-09-06 K13 补 `Platform::Ios`：生产侧同臂（`app_tray.rs` 的
+    // `Linux | Other | Android | Ios`），而本圈是手写子集、加变体不会自曝。
+    for platform in [
+        Platform::Linux,
+        Platform::Other,
+        Platform::Android,
+        Platform::Ios,
+    ] {
         for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
             for state in [MouseButtonState::Down, MouseButtonState::Up] {
                 assert!(

@@ -2,7 +2,7 @@
  * 「窗口特效是否开启」的前端判定 —— 供 CSS 决定 mac 下 `.stage`/`.win` 该不该让位给原生 vibrancy。
  *
  * 为什么前端非要知道这件事（`index.css` 旧注释曾判定「拿不到 ⇒ 不做」，此处修正该结论）：
- *   mac 的两条建窗支路对前端的要求**相反**（`src-tauri/src/main.rs:440-459`）：
+ *   mac 的两条建窗支路对前端的要求**相反**（`src-tauri/src/lib.rs:440-459`）：
  *     · 特效开 → 建 `transparent(true)` 窗 + 全透明 backgroundColor + 挂 vibrancy
  *       ⇒ 前端必须让位（`.stage`/`.win` 不能自绘不透明底），否则 vibrancy 被盖住 = 用户报的「特效未生效」；
  *     · 特效关 → 保持 conf 的 `transparent:false` + **实色 #0B0F14** 底
@@ -16,7 +16,7 @@
  *   故此判定是对既有配置的纯函数复述，零新增 IPC / 零新增 Rust 代码 / 零新增状态源。
  *
  * **射程边界（已知残留，须真机确认）**：Rust 侧真正的第三个合取项是「`apply_vibrancy` 未报错」，
- *   失败只 `log::warn`（`main.rs:488-495`）、从不回传 webview，故本判定覆盖不到。mac 上该调用实际
+ *   失败只 `log::warn`（`lib.rs:488-495`）、从不回传 webview，故本判定覆盖不到。mac 上该调用实际
  *   ~恒成功（Windows 的 Mica 在非 Win11 恒失败才是这一项的现实场景，而本判定只驱动 mac 规则）。
  *   若真机确认存在 mac vibrancy 失败场景，那时才值得让 Rust 回传最终结果——在此之前不预造。
  */

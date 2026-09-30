@@ -13,6 +13,8 @@ use serde_json::Value;
 
 use polaris_config_engine::builder::endpoint_routes::mesh_node_carries_full_tunnel;
 use polaris_config_engine::builder::hotswitch::HotSwitchPlan;
+use polaris_config_engine::builder::mesh_mode::{selected_mode, MESH_DIRECT};
+use polaris_config_engine::singbox::InboundUser;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::is_mesh_node;
 use polaris_switch_engine::{HotSwitchOutcome, SwitchDecision, SwitchExecutor};
@@ -44,6 +46,18 @@ use super::{code, ProxyRuntime};
 /// 同配置重启只会世代 +1、锁存复位、同情形再报一次 —— 用户照做就进循环。
 const RESTART_BLOCKED_MESSAGE: &str =
     "自动切换已触发，但本轮未能换成节点：有候选节点需要重启内核才能切换过去";
+
+pub(super) fn heartbeat_mode_blocked(
+    startup_blocked: bool,
+    dynamic_mesh_id: Option<&str>,
+    running_id: Option<&str>,
+    reconciliation_required: bool,
+) -> bool {
+    match dynamic_mesh_id {
+        Some(mesh_id) => running_id.is_none_or(|id| id == mesh_id) || reconciliation_required,
+        None => startup_blocked,
+    }
+}
 
 /// 自动故障切换的热切事务结果。它刻意没有 `Restarting`：后台故障治理只允许操作当前运行核已加载的
 /// clean selector 成员；管理 API 不可用就失败，不得借一次整核重启把 D 中其他待 Apply 修改带进去。
@@ -137,6 +151,18 @@ impl ProxyRuntime {
                 decision: SwitchDecision::HotSwitch(plan),
                 new_cfg,
             } => {
+                let cross_mode = self
+                    .switch_snapshot
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.mesh_mode_ready))
+                    .unwrap_or(false)
+                    && serde_json::from_value::<UserConfig>(runtime_config.clone())
+                        .ok()
+                        .is_some_and(|old| selected_mode(&old) != selected_mode(&new_cfg));
+                if cross_mode {
+                    return CandidateSwitchPlan::NeedsRestart;
+                }
                 let puts_the_candidate = plan.puts.iter().any(|put| {
                     put.selector_tag == "proxy-selector" && put.member_tag == candidate.tag
                 });
@@ -309,6 +335,25 @@ impl ProxyRuntime {
         let Some(old_tag) = old_tag else {
             return AutoHotSwitchOutcome::NotEligible;
         };
+        // The background transaction only drives selector PUTs. It must never claim a
+        // cross-mode TS→ordinary switch, or commit atop mode/dashboard drift left by a
+        // superseded manual intent. The manual transaction owns mode changes and restart.
+        let dual_mode = self
+            .switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.mesh_mode_ready))
+            .unwrap_or(false);
+        if dual_mode {
+            let old_cfg = serde_json::from_value::<UserConfig>(old_runtime.clone()).ok();
+            if old_cfg
+                .as_ref()
+                .is_none_or(|config| selected_mode(config) == MESH_DIRECT)
+                || !self.mesh_live_state_matches_current(generation).await
+            {
+                return AutoHotSwitchOutcome::NotEligible;
+            }
+        }
 
         // 资格判定与 `do_switch_io` 的探测前剔除**同一份**（见 [`Self::candidate_switch_plan`]）：
         // 两处分歧的形态是「探了一整轮、提交时才拒、不计熔断、90 秒后重来」。三态里只有
@@ -515,9 +560,8 @@ impl ProxyRuntime {
     /// 本批禁区 commands/config.rs）。**世代守卫**：核被停/接管（stop/restart 先 bump 世代）→ 退场，
     /// 绝不让旧核的心跳污染新核（探测/切换均先复查世代）。
     ///
-    /// `generation_blocked`：本世代自动切换是否整体停摆（`true` ⇒ 不判、不切）。它在**起核处**对本次
-    /// 入核的那份配置求得，是**世代常量**而非每 tick 读配置 —— 判据、理由与那道禁 `.current()` 的门见
-    /// [`auto_switch_blocked_for_generation`](crate::runtime::auto_switch::auto_switch_blocked_for_generation)。
+    /// `generation_blocked` 是单态核的启动判据。Android 双态核另传唯一无出口 TS id；每 tick
+    /// 从已提交的 R 选中 id 覆写该判据，避免同世代热切后探错出口或永久停摆。不会读磁盘 D。
     ///
     /// 每 tick 的分支裁决在纯函数 [`decide_tick`]（真值表 + 变异锁死）；本方法只做「睡 → 查世代 →
     /// 同步开关 → 喂裁决 → 执行 I/O」。
@@ -525,7 +569,9 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         my_gen: u64,
         probe_proxy_port: Option<u16>,
+        loopback_auth: Option<InboundUser>,
         generation_blocked: bool,
+        dynamic_mesh_id: Option<String>,
     ) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
@@ -558,12 +604,28 @@ impl ProxyRuntime {
                 // 两处运行态在此**无条件求值**：`decide_tick` 的优先级保证前几道拦下时它们的值不被读到，
                 // 求值本身则各是一次持锁投影（无深拷贝，同 `auto_switch_enabled` 已有的每 tick 读），
                 // 未改任何决策语义。
+                // A dual-mode Android core can change its selected exit without a new core
+                // generation. Use committed R, not disk D, for the split-only TS guard.
+                let running_id = me.current_config.read().ok().and_then(|guard| {
+                    guard.as_ref().and_then(|config| {
+                        config
+                            .get("selectedServerId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                });
+                let currently_blocked = heartbeat_mode_blocked(
+                    generation_blocked,
+                    dynamic_mesh_id.as_deref(),
+                    running_id.as_deref(),
+                    me.selector_reconcile.is_required(),
+                );
                 let probe_proxy_port = match decide_tick(TickInput {
                     enabled: machine.is_enabled(),
                     switching: machine.is_switching(),
                     core_running: me.core_running(),
                     selected_server_is_real: me.selected_server_is_real(),
-                    generation_blocked,
+                    generation_blocked: currently_blocked,
                     probe_proxy_port,
                 }) {
                     TickAction::Skip(_) => continue,
@@ -574,7 +636,9 @@ impl ProxyRuntime {
                     TickAction::Probe { probe_proxy_port } => probe_proxy_port,
                 };
                 // 应用层连通性探测（真机门：真起核 + 碰网络）。
-                let alive = probe_proxy_connectivity(probe_proxy_port).await;
+                // `loopback_auth` 与端口同为世代常量（本次起核生成、随本心跳任务一起退场）。
+                let alive =
+                    probe_proxy_connectivity(probe_proxy_port, loopback_auth.as_ref()).await;
                 // 探测耗时窗口内可能已被接管 → 复查世代。
                 if me.gate.generation() != my_gen {
                     return;
@@ -692,6 +756,19 @@ impl ProxyRuntime {
             log::warn!("自动故障切换：运行核缺少 current_config 基准 → 跳过");
             return false;
         };
+        if self
+            .switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.mesh_mode_ready))
+            .unwrap_or(false)
+            && serde_json::from_value::<UserConfig>(runtime_config.clone())
+                .ok()
+                .is_none_or(|config| selected_mode(&config) == MESH_DIRECT)
+        {
+            log::info!("自动故障切换：双态核当前使用无出口 TS，后台 selector-only 事务禁用");
+            return false;
+        }
         let current_id = runtime_config
             .get("selectedServerId")
             .and_then(Value::as_str)
@@ -879,30 +956,48 @@ impl ProxyRuntime {
 /// **C3**：应用层连通性检测：只经钉死到 `proxy-selector` 的专用 HTTP 入站，以绝对 URI GET
 /// generate_204，任一端点返回 2xx/3xx → 判通。该入口不经过用户路由规则，因此结果只描述当前代理出口，
 /// 不会被一条 direct 分流伪装成“节点健康”。**真机门**：需真起核 + 碰网络。
-async fn probe_proxy_connectivity(probe_proxy_port: u16) -> bool {
+async fn probe_proxy_connectivity(probe_proxy_port: u16, auth: Option<&InboundUser>) -> bool {
     for url in CONNECTIVITY_URLS {
-        if probe_through_proxy(probe_proxy_port, url).await {
+        if probe_through_proxy(probe_proxy_port, auth, url).await {
             return true;
         }
     }
     false
 }
 
-/// 经指定的本地 HTTP 探针入口以绝对 URI GET 目标，判是否拿到 2xx/3xx。调用方负责保证该入口
-/// 固定路由到待测出口；这里仅实现通用 HTTP 代理握手。**真机门**：需真起核 + 碰网络，禁本机单测。
-async fn probe_through_proxy(proxy_port: u16, target_url: &str) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// 连通性探针发给本机 http 入站的请求报文（absolute-form GET；`auth` 非空时带 `Proxy-Authorization`）。
+///
+/// 纯函数，抽出来只为让报文形状可单测（[`probe_through_proxy`] 本身要真起核 + 碰网络）。
+/// 目标不是 `http://<host>/…` 形态 → `None`（取不到 Host 头）。
+pub(super) fn connectivity_probe_request(
+    target_url: &str,
+    auth: Option<&InboundUser>,
+) -> Option<String> {
     // 取 Host 头（`http://<host>/path` → `<host>`）。
     let host = target_url
         .strip_prefix("http://")
         .and_then(|rest| rest.split('/').next())
-        .unwrap_or("");
-    if host.is_empty() {
+        .filter(|h| !h.is_empty())?;
+    let proxy_auth = crate::runtime::http::proxy_authorization_line(auth);
+    Some(format!(
+        "GET {target_url} HTTP/1.1\r\nHost: {host}\r\n{proxy_auth}Proxy-Connection: close\r\nConnection: close\r\n\r\n"
+    ))
+}
+
+/// 经指定的本地 HTTP 探针入口以绝对 URI GET 目标，判是否拿到 2xx/3xx。调用方负责保证该入口
+/// 固定路由到待测出口；这里仅实现通用 HTTP 代理握手。**真机门**：需真起核 + 碰网络，禁本机单测。
+///
+/// `auth`：Android 上 `probe-proxy-in` 要求本次起核的一次性凭据；缺了内核回 407 ⇒ 每拍都判「不通」
+/// ⇒ 连续失败后**自动换走一个好好的节点**。这是比「探针失效」更坏的失效形态，故凭据是必填参数。
+async fn probe_through_proxy(
+    proxy_port: u16,
+    auth: Option<&InboundUser>,
+    target_url: &str,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(request) = connectivity_probe_request(target_url, auth) else {
         return false;
-    }
-    let request = format!(
-        "GET {target_url} HTTP/1.1\r\nHost: {host}\r\nProxy-Connection: close\r\nConnection: close\r\n\r\n"
-    );
+    };
     let addr = format!("127.0.0.1:{proxy_port}");
     let probe = async {
         let mut stream = tokio::net::TcpStream::connect(&addr).await.ok()?;

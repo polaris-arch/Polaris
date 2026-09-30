@@ -15,7 +15,7 @@
 
 use crate::platform::windows::coreacl::ObjectSecurity;
 use crate::platform::windows::logic::{self, ListenEntry};
-use polaris_helper_proto::StartTiming;
+use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartTiming};
 
 /// Windows helper 已创建的核心及其关键路径耗时。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,14 @@ pub struct CoreStart {
     pub timing: StartTiming,
     /// 进程创建时间（`GetProcessTimes`，100ns tick）。读不到 → `None`（协议侧不发该 token）。
     pub created: Option<u64>,
+}
+
+/// Native wait outcome for a still-custodied process object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeChildPoll {
+    Running,
+    Exited,
+    Unknown,
 }
 
 /// 受管核的进程身份（D2/D3）：从 helper **持有的进程句柄**读出的两个事实。
@@ -74,6 +82,46 @@ pub trait ProcOps: Send + Sync {
         log_path: &str,
         fwd: bool,
     ) -> std::io::Result<CoreStart>;
+
+    /// Mint an OS-random birth before spawning or changing forwarding.
+    fn mint_native_birth(&self) -> std::io::Result<HelperBirthToken> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native birth unsupported",
+        ))
+    }
+    /// Publish the same owned process HANDLE and birth before returning.
+    fn start_native_singbox(
+        &self,
+        _bin: &str,
+        _cfg: &str,
+        _log: &str,
+        _fwd: bool,
+        _birth: HelperBirthToken,
+    ) -> std::io::Result<CoreStart> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native start unsupported",
+        ))
+    }
+    /// Poll only the exact retained HANDLE. No numeric PID fallback is allowed.
+    fn poll_native_child(&self, _target: HelperBirthTarget) -> NativeChildPoll {
+        NativeChildPoll::Unknown
+    }
+    /// Termination ACK is insufficient; success requires a native HANDLE wait.
+    fn stop_native_child(&self, _target: HelperBirthTarget) -> NativeChildPoll {
+        NativeChildPoll::Unknown
+    }
+    /// Retire only an exact native object whose exit was successfully cached.
+    fn retire_native_child(&self, _target: HelperBirthTarget) -> bool {
+        false
+    }
+
+    /// Confirm that no owned native object or unconfirmed logger tail remains.
+    /// A missing implementation or poisoned custody cannot attest an empty registry.
+    fn native_custody_empty(&self) -> bool {
+        false
+    }
 
     /// 优雅停信号 → 等宽限 → 硬杀（`helper.go:111-123` `terminateChild` 的等价物）。
     ///
@@ -190,6 +238,15 @@ pub trait NetTableOps: Send + Sync {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct MockProcOpsInner {
+    native_target: std::sync::Mutex<Option<HelperBirthTarget>>,
+    native_exited: std::sync::atomic::AtomicBool,
+    native_poll: std::sync::Mutex<Option<NativeChildPoll>>,
+    native_stop: std::sync::Mutex<Option<NativeChildPoll>>,
+    native_stop_calls: std::sync::atomic::AtomicUsize,
+    native_retire_allowed: std::sync::atomic::AtomicBool,
+    native_start_pause:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    birth_count: std::sync::atomic::AtomicU32,
     /// `start_singbox` 累计调用次数。
     pub start_calls: std::sync::atomic::AtomicUsize,
     /// `start_singbox` 下一次返回的 pid（递增，模拟每次新起子进程）。
@@ -267,11 +324,37 @@ impl MockProcOps {
         let inner = MockProcOpsInner {
             next_pid: std::sync::atomic::AtomicU32::new(1000),
             alive_return: std::sync::atomic::AtomicBool::new(true),
+            native_retire_allowed: std::sync::atomic::AtomicBool::new(true),
             ..MockProcOpsInner::default()
         };
         Self {
             inner: std::sync::Arc::new(inner),
         }
+    }
+
+    pub fn set_native_poll(&self, poll: NativeChildPoll) {
+        *self.inner.native_poll.lock().unwrap() = Some(poll);
+    }
+    pub fn set_native_stop(&self, poll: NativeChildPoll) {
+        *self.inner.native_stop.lock().unwrap() = Some(poll);
+    }
+    pub fn set_native_retire_allowed(&self, allowed: bool) {
+        self.inner
+            .native_retire_allowed
+            .store(allowed, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn native_stop_calls(&self) -> usize {
+        self.inner
+            .native_stop_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn pause_native_publication(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.native_start_pause.lock().unwrap() = Some((entered, resume));
     }
 
     /// 预设 pid → 映像路径（freeport 测试用）。
@@ -478,6 +561,111 @@ impl ProcOps for MockProcOps {
             },
             created: self.inner.identity.lock().unwrap().created,
         })
+    }
+
+    fn mint_native_birth(&self) -> std::io::Result<HelperBirthToken> {
+        let number = self
+            .inner
+            .birth_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&number.to_be_bytes());
+        Ok(HelperBirthToken::from_bytes(bytes))
+    }
+    fn start_native_singbox(
+        &self,
+        bin: &str,
+        cfg: &str,
+        log: &str,
+        fwd: bool,
+        birth: HelperBirthToken,
+    ) -> std::io::Result<CoreStart> {
+        assert!(
+            self.inner.native_target.lock().unwrap().is_none(),
+            "mock owned object cannot be overwritten"
+        );
+        let start = self.start_singbox(bin, cfg, log, fwd)?;
+        *self.inner.native_target.lock().unwrap() = Some(HelperBirthTarget {
+            pid: std::num::NonZeroU32::new(start.pid).unwrap(),
+            birth,
+        });
+        self.inner
+            .native_exited
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some((entered, resume)) = self.inner.native_start_pause.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+        Ok(start)
+    }
+    fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+        if *self.inner.native_target.lock().unwrap() != Some(target) {
+            return NativeChildPoll::Unknown;
+        }
+        if self
+            .inner
+            .native_exited
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return NativeChildPoll::Exited;
+        }
+        let poll = self
+            .inner
+            .native_poll
+            .lock()
+            .unwrap()
+            .unwrap_or(NativeChildPoll::Running);
+        if poll == NativeChildPoll::Exited {
+            self.inner
+                .native_exited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        poll
+    }
+    fn stop_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+        if *self.inner.native_target.lock().unwrap() != Some(target) {
+            return NativeChildPoll::Unknown;
+        }
+        self.inner
+            .native_stop_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let poll = self
+            .inner
+            .native_stop
+            .lock()
+            .unwrap()
+            .unwrap_or(NativeChildPoll::Exited);
+        if poll == NativeChildPoll::Exited {
+            self.inner
+                .native_exited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        poll
+    }
+    fn retire_native_child(&self, target: HelperBirthTarget) -> bool {
+        let mut current = self.inner.native_target.lock().unwrap();
+        if *current != Some(target)
+            || !self
+                .inner
+                .native_retire_allowed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            || !self
+                .inner
+                .native_exited
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        *current = None;
+        true
+    }
+
+    fn native_custody_empty(&self) -> bool {
+        self.inner
+            .native_target
+            .lock()
+            .is_ok_and(|current| current.is_none())
     }
 
     fn managed_identity(&self, pid: u32) -> ManagedIdentity {

@@ -33,7 +33,7 @@
 //! 2. **核二进制路径解析的单一真值是 [`crate::runtime::proxy::resolve_core_binary`]**（`pub(crate)`）。
 //!    本模块**刻意不复制第二份**（§A3 教训：`RuleResourceManager` 曾有 2 域的 `GITHUB_HOSTS` 本地副本
 //!    与 `gh-proxy.ts` 的 5 域漂移，令三级兜底自相矛盾）。走**注入**：[`UpdaterRuntime::with_core_binary`]，
-//!    注入点 `main.rs:1293`（此前本条记「待编排者提为 `pub(crate)` 并注入」，该待办**已完成**）。
+//!    注入点 `lib.rs:1293`（此前本条记「待编排者提为 `pub(crate)` 并注入」，该待办**已完成**）。
 //!    未注入时（异常启动路径）版本读取如实返回「未知」/空串，**不猜、不谎报**。
 
 use std::path::{Path, PathBuf};
@@ -64,6 +64,8 @@ struct CoreManifest {
     bundled_core_version: String,
     #[serde(rename = "windowsBuild")]
     windows_build: Option<WindowsBuild>,
+    #[serde(rename = "sourceBuild")]
+    source_build: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,19 +77,162 @@ struct WindowsBuild {
 ///
 /// 解析失败 → 回落空串（调用方据此跳过基线比较；**不 panic**：清单损坏不该让整个 App 起不来）。
 fn bundled_core_version() -> String {
-    serde_json::from_str::<CoreManifest>(CORE_MANIFEST_JSON)
-        .map(|m| {
-            if cfg!(target_os = "windows") {
-                m.windows_build
-                    .map_or(m.bundled_core_version, |w| w.version)
-            } else {
-                m.bundled_core_version
+    bundled_core_version_from_manifest(
+        CORE_MANIFEST_JSON,
+        cfg!(target_os = "windows"),
+        cfg!(target_os = "android"),
+    )
+    .unwrap_or_else(|e| {
+        log::error!("core-manifest.json 解析失败 {e}：基线比较将跳过");
+        String::new()
+    })
+}
+
+// Match the desktop JS inputs-only gate. Output hashes are first computed by
+// native producers, so they are not prerequisites for the compiled baseline.
+// Null/partial inputs keep the existing baseline; fetch still rejects them.
+fn frozen_source_build_version<'a>(
+    source: &'a serde_json::Value,
+    upstream: &str,
+) -> Option<&'a str> {
+    fn valid_module(module: &str) -> bool {
+        !module.is_empty()
+            && module
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte))
+    }
+    fn module_partition<'a>(
+        policy: &'a serde_json::Value,
+        inventory: &std::collections::BTreeSet<&str>,
+        absent_field: &str,
+    ) -> Option<std::collections::BTreeSet<&'a str>> {
+        let policy = policy.as_object()?;
+        if policy.len() != 2 {
+            return None;
+        }
+        let required = policy.get("requiredLinked")?.as_array()?;
+        let absent = policy.get(absent_field)?.as_array()?;
+        let mut classified = std::collections::BTreeSet::new();
+        for module in required.iter().chain(absent) {
+            let module = module.as_str()?;
+            if !valid_module(module) || !classified.insert(module) {
+                return None;
             }
+        }
+        if &classified != inventory {
+            return None;
+        }
+        absent.iter().map(|module| module.as_str()).collect()
+    }
+    let hex = |value: Option<&str>, length| {
+        value.is_some_and(|value| {
+            value.len() == length
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
-        .unwrap_or_else(|e| {
-            log::error!("core-manifest.json 解析失败 {e}：基线比较将跳过");
-            String::new()
-        })
+    };
+    for field in [
+        "sourceManifestSha256",
+        "provisionerSha256",
+        "sourceReceiptFingerprint",
+        "moduleGraphSha256",
+    ] {
+        if !hex(source[field].as_str(), 64) {
+            return None;
+        }
+    }
+    for field in ["patchedSourceTree", "buildTree"] {
+        if !hex(source[field].as_str(), 40) {
+            return None;
+        }
+    }
+    let modules = source["dependencyModules"].as_array()?;
+    let mut unique = std::collections::BTreeSet::new();
+    for module in modules {
+        let module = module.as_str()?;
+        if !valid_module(module) || !unique.insert(module) {
+            return None;
+        }
+    }
+    if unique.is_empty() {
+        return None;
+    }
+    let transport = source["transportPins"].as_object()?;
+    if transport.is_empty() {
+        return None;
+    }
+    for (module, version) in transport {
+        let version = version.as_str()?.strip_prefix('v')?;
+        if !valid_module(module)
+            || version.is_empty()
+            || !version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+        {
+            return None;
+        }
+    }
+    let platforms = source["platforms"].as_object()?;
+    if platforms.len() != 4 {
+        return None;
+    }
+    let transport_inventory = transport.keys().map(String::as_str).collect();
+    for key in ["linux", "win", "mac-x64", "mac-arm64"] {
+        let platform = platforms.get(key)?;
+        if !hex(platform["buildTree"].as_str(), 40) {
+            return None;
+        }
+        let allowed_absent =
+            module_partition(&platform["patchedModules"], &unique, "allowedAbsent")?;
+        if allowed_absent
+            .iter()
+            .any(|module| key == "linux" || *module != "github.com/sagernet/nftables")
+        {
+            return None;
+        }
+        module_partition(
+            &platform["transportModules"],
+            &transport_inventory,
+            "confirmedAbsent",
+        )?;
+    }
+    let version = source["version"].as_str()?;
+    let suffix = version.strip_prefix(&format!("{upstream}.polaris."))?;
+    if suffix
+        .as_bytes()
+        .first()
+        .is_some_and(|first| (b'1'..=b'9').contains(first))
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Some(version)
+    } else {
+        None
+    }
+}
+
+fn bundled_core_version_from_manifest(
+    raw: &str,
+    windows: bool,
+    android: bool,
+) -> Result<String, serde_json::Error> {
+    let manifest = serde_json::from_str::<CoreManifest>(raw)?;
+    if !android {
+        if let Some(version) = manifest
+            .source_build
+            .as_ref()
+            .and_then(|source| frozen_source_build_version(source, &manifest.bundled_core_version))
+        {
+            return Ok(version.to_owned());
+        }
+    }
+    Ok(if windows {
+        manifest
+            .windows_build
+            .map_or(manifest.bundled_core_version, |build| build.version)
+    } else {
+        manifest.bundled_core_version
+    })
 }
 
 /// 持久化的更新状态（`<config_dir>/update-state.json`）。

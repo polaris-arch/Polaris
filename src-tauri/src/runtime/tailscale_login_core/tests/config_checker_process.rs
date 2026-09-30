@@ -9,20 +9,35 @@
 //! 超时**：`output()` 会一直等到子进程自己退出。它挂在瞬态登录核与测速临时核的起核前置位上，
 //! 于是 check 一旦挂住（慢盘、杀软扫描、核二进制半损坏），整条登录/测速流程跟着永久挂起。
 //! 现在它改调 `core-supervisor::config_gate::run_check_raw` —— 全仓唯一那份带超时与
-//! `kill_on_drop(true)` 的实现。本文件验的就是「它确实走了那条实现」这件事本身，判据是**可观察的
-//! 进程行为**（返回了、且子进程死了），不是「函数存在」。
+//! 原生 Child 保管与退出确认的实现。本文件验本调用点确实走了那条实现，保留真实进程
+//! 完成/超时行为与见证文件；文件缺席自身不能签退出，退出事实来自共用 custody 的 native wait。
 //!
 //! # 为什么只有 unix
 //!
-//! 见 [`write_sleeping_probe`] 的文档：跨平台的那一半（超时与 `kill_on_drop` 自身）由
+//! 见 [`write_sleeping_probe`] 的文档：跨平台的那一半（超时与原生退出确认）由
 //! `crates/core-supervisor/tests/config_gate_process.rs` 用 Rust 探针在三平台各跑一遍；本处只验
 //! 本包这个调用点接到了那条实现上，而这件事与平台无关。
 
-use std::path::Path;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::{ConfigChecker, SingBoxConfigChecker};
 use crate::test_support::{write_sleeping_probe, TestDir, PROBE_SLEEP_MILLIS};
+
+fn config_fixture(dir: &Path) -> PathBuf {
+    let config = dir.join("config.json");
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&config)
+        .expect("real check input fixture");
+    file.write_all(b"{}").unwrap();
+    assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    config
+}
 
 /// **正向对照**：探针在预算内跑完 ⇒ 判 `Ok`，且见证文件真的出现。
 ///
@@ -33,9 +48,10 @@ async fn accepts_and_lets_the_child_finish_when_it_fits_the_budget() {
     let dir = TestDir::new("polaris-login-cfgcheck-ok-");
     let witness = dir.path().join("ran.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);
+    let config = config_fixture(dir.path());
 
     SingBoxConfigChecker
-        .check(&probe, Path::new("config.json"))
+        .check(&probe, &config)
         .await
         .expect("探针 rc=0 ⇒ 必须判 Ok");
 
@@ -51,18 +67,45 @@ async fn accepts_and_lets_the_child_finish_when_it_fits_the_budget() {
 /// 子进程，`await` 永不返回 —— 本测在那份源码上跑不完（挂死），而不是失败一次就结束。
 ///
 /// 时钟用 `start_paused`：超时预算是写死的 [`CONFIG_CHECK_TIMEOUT`](polaris_core_supervisor::CONFIG_CHECK_TIMEOUT)
-/// （5 s），而这里要验的是「有没有超时这条腿」，不是「5 到底合不合适」。虚拟时钟在运行时空转时
-/// 自动推进到定时器截止点，于是 5 s 在微秒内走完，而真实的探针一步都还没睡完 ⇒ 超时腿必然先手，
-/// 测试却不必真等 5 秒。随后的等待用**真实**时钟：见证文件的有无是真实世界的事实。
+/// （5 s）。等探针的启动见证后只推进检查期限，随即恢复真实时钟，让 OS 原生 wait 有机会
+/// 完成。不能让虚时再次跳过收割预算，也不能把 CleanupUnknown 当成已确认的超时诊断。
 #[tokio::test(start_paused = true)]
 async fn times_out_instead_of_hanging_and_kills_the_child() {
     let dir = TestDir::new("polaris-login-cfgcheck-timeout-");
     let witness = dir.path().join("killed.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);
+    let config = config_fixture(dir.path());
+    let started = dir.path().join("started.txt");
+    let script = std::fs::read_to_string(&probe).unwrap();
+    std::fs::write(
+        &probe,
+        script.replacen(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\n: > '{}'\n", started.display()),
+            1,
+        ),
+    )
+    .unwrap();
 
-    let err = SingBoxConfigChecker
-        .check(&probe, Path::new("config.json"))
+    let check = tokio::spawn(async move { SingBoxConfigChecker.check(&probe, &config).await });
+    let start_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < start_deadline,
+            "probe did not start"
+        );
+        // Keep this paused runtime runnable until the real OS process has started.
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!witness.exists(), "probe must still be inside its sleep");
+    tokio::time::advance(polaris_core_supervisor::CONFIG_CHECK_TIMEOUT + Duration::from_millis(1))
+        .await;
+    tokio::time::resume();
+
+    let err = check
         .await
+        .unwrap()
         .expect_err("超时必须报错，而不是把一份没验过的配置当成通过");
     assert!(
         err.contains("超时"),
@@ -73,6 +116,6 @@ async fn times_out_instead_of_hanging_and_kills_the_child() {
     std::thread::sleep(Duration::from_millis(PROBE_SLEEP_MILLIS + 300));
     assert!(
         !witness.exists(),
-        "超时后子进程仍跑完并写了见证文件 ⇒ `kill_on_drop(true)` 没生效，每次超时泄漏一个 check 进程"
+        "超时后探针仍写了见证文件，原生关闭/退休没有在返回前收口"
     );
 }

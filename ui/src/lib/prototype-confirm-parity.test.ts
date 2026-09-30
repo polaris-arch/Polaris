@@ -32,6 +32,7 @@
  * 不会误伤；任一侧增删一个确认站点则必然转红。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { homedir } from 'node:os';
@@ -121,7 +122,11 @@ function collectSources(dir: string, acc: string[] = []): string[] {
     if (e === 'node_modules' || e === 'dist') continue;
     const full = join(dir, e);
     if (statSync(full).isDirectory()) collectSources(full, acc);
-    else if (/\.tsx?$/.test(e) && !/\.(test|spec)\.tsx?$/.test(e)) acc.push(full);
+    // `IS_TEST_ONLY_MODULE` 而不是就地写一份 `/\.(test|spec)\./`：`contracts/test-only-modules.ts` 的
+    // 头注明写「三道门需要同一个概念，不许各留一份拷贝」。`.test-support.` 模块同样不进产物
+    // （`i18n-coverage` G0-b 锁着「产品代码不许 import 它们」），它们里面的 `confirmTwice(…)` 是
+    // 判据的锚文本、不是确认站点。
+    else if (/\.tsx?$/.test(e) && !IS_TEST_ONLY_MODULE.test(e)) acc.push(full);
   }
   return acc;
 }
@@ -224,6 +229,80 @@ interface ImplOnlyRow {
 }
 
 const IMPL_ONLY: readonly ImplOnlyRow[] = [
+  /*
+   * 移动端「连接」屏的四处二次确认（F5，2026-09-04；主会话 2026-09-05 合并时登记）。
+   *
+   * 它们**必然**是 IMPL_ONLY：本门的对照物是桌面原型
+   * `~/docs/polaris/design/prototype/polaris-prototype.html`，而移动端从来没有原型
+   * （IA spec 与 mobile-kit 才是它的权威）。把它们写成 PARITY 行等于声称原型里有对应物，
+   * 那是假的；不登记又会让本门在「实现侧 key 集合 == 登记表」那条上恒红。
+   *
+   * ⚠️ 本门在 `ui.yml` 与本机 07/08 两条 vitest 腿里**都被排除**（判据面读仓外文件），
+   * 所以 F5 那一轮全绿并不覆盖它 —— 这四条是合并后手工跑 `src/lib` 才暴露的。
+   * 这不是 F5 的疏漏，是这道门的射程本来就够不到它。
+   */
+  /*
+   * 移动端待应用条上的「重置」（批 1 / W-26，2026-09-06）。
+   *
+   * 与桌面 `PendingChangesBar` 的 `reset-pending` 是**同一个动作的两个客户端实现**，但
+   * key 刻意不同名（`mobile-reset-pending`）：`useConfirmTwice` 的槽是全局单槽，两端各自持一份
+   * 组件实例，同名会让「桌面那颗武装着、移动那颗跟着变红」在将来某个共用宿主的场景里成立。
+   * 桌面那条走 PARITY 表（原型 L4070 有对应物），本条是移动端自己的实现，故落 IMPL_ONLY。
+   *
+   * 凭什么用确认：这颗按钮一次误点**丢光全部未保存编辑**（`staged-config-store.reset()` 清空
+   * 整个 entries），而它与「保存」「立即应用」在同一条上并排、同尺寸；触屏的误点率又高于鼠标。
+   * 其余动作（保存 / 应用 / 重试 / 忽略）都不销毁用户输入，一律不设闸 —— 给可逆操作套确认
+   * 会稀释「点两次 = 有危险」这个信号。
+   */
+  {
+    key: 'mobile-reset-pending',
+    file: 'mobile/MobilePendingBar.tsx',
+    why: '一次误点丢光全部未保存编辑（reset 清空整个 staged entries），且这颗按钮与「保存」「立即应用」在同一条上并排同尺寸；触屏误点率更高。',
+  },
+  /*
+   * 移动端规则屏批 10 接通的三处二次确认（2026-09-13）。三处都是**桌面已有**的动作，
+   * 但桌面那三处走的是各自屏内的 `confirmTwice`、原型里没有对应的 `case`
+   * （原型只画到规则列表，DNS 资源工作区与应用分流菜单都不在它的射程里）⇒ 落 IMPL_ONLY。
+   *
+   * 三处的 key 逐字沿用桌面同名前缀（`dns-server:` / `dns-group:` / `app-remove:`），
+   * 不另起名：`useConfirmTwice` 是全局单槽，两端将来若共用宿主，同名才能保证「同一个动作
+   * 只有一处武装着」。
+   */
+  {
+    key: 'dns-server',
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    why: '删一条 DNS 服务器：没有撤销腿，而它可能正被某条规则或某个分组当作解析目标——引用图那一闸只挡「删了会让别的东西失效」，挡不住「这条确实没人引用但用户点错了」。',
+  },
+  {
+    key: 'dns-group',
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    why: '删一条 DNS 分组：同上，且分组里的成员顺序与兜底服务器是一份手工排过的配置，删掉要从头再排一遍。',
+  },
+  {
+    key: 'app-remove',
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    why: '删一个自定义应用：预设与它的分流规则在同一个事务里一起删，而预设里那串 geosite 标签是用户一条条挑出来的，没有撤销腿。',
+  },
+  {
+    key: 'mconn-close-all',
+    file: 'mobile/connections/MobileConnectionsScreen.tsx',
+    why: '一次关掉全部活动连接：正在传输的下载/上传会当场断，且没有撤销腿——重连要靠对端或用户自己再发起。',
+  },
+  {
+    key: 'mconn-close-filtered',
+    file: 'mobile/connections/MobileConnectionsScreen.tsx',
+    why: '关掉当前筛选命中的连接：命中集随搜索串变，误点的代价与「全部关闭」同类，且更难在事后说清关了哪些。',
+  },
+  {
+    key: 'mconn-clear-closed',
+    file: 'mobile/connections/MobileConnectionsScreen.tsx',
+    why: '与桌面 `conn-clear-closed` 同一条理由：永久丢弃本会话最多 1000 条已结束连接的诊断记录，清空水位还会挡住上游重放恢复。',
+  },
+  {
+    key: 'mconn-logs-clear',
+    file: 'mobile/connections/MobileConnectionsScreen.tsx',
+    why: '清空日志视图：故障现场一旦清掉就只能靠重现，属不可逆的证据丢弃。',
+  },
   {
     key: 'network-profile',
     file: 'components/screens/rules/NetworkProfilePanel.tsx',
@@ -268,6 +347,35 @@ const IMPL_ONLY: readonly ImplOnlyRow[] = [
     why:
       '删除自定义 DNS Server 会永久移除其地址、协议、Bootstrap 与出口配置；执行前虽会拦截仍被规则、策略组或默认动作引用的资源，' +
       '但无引用资源同样没有撤销腿，因此保留原地二次确认。三个内置服务器根本不提供删除入口。',
+  },
+  // ── 移动端「规则」屏（四合一）：与桌面同一动作的**第二份实现**，不是新动作 ──
+  // 它们不能进 PARITY：那张表的 `site` 列被原型站点逐条锁死，一个原型站点只能对一个实现。
+  // 登记在这里是为了让「同一确认站点被复制了一份」这件事**显式可见** —— 两份实现会各自漂。
+  // 收口（把执行腿抽进 lib/ 两端共用）登记在
+  // `~/docs/polaris/design/polaris-mobile-screen-rules-2026-09-04.md` §7 第 2 项。
+  {
+    key: 'rule-del',
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    why:
+      '规则列表行内删除的移动端实现。凭什么用这道确认：与桌面 `components/screens/rules/RulesScreen.tsx` ' +
+      '的同名站点**同一个动作、同一条执行腿**（`useRuleDelete`）—— 删一条规则不进回收站、无撤销腿，' +
+      '且移动端把删除放进了动作面板，指头误触面比桌面更大。key 带 `:<id>` 实例后缀（单槽，武装 B 解除 A）。',
+  },
+  {
+    key: 'geo-reset',
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    why:
+      '重置内置资源的移动端实现。凭什么用这道确认：与桌面 `components/screens/resources/ResourcesScreen.tsx` ' +
+      '的同名站点同一个动作 —— 一键重新下载并**覆盖** geosite + geoip 两类全部内置资源，' +
+      '覆盖掉的旧内容退不回来，且点错没有别的拦截。',
+  },
+  {
+    key: 'res-del',
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    why:
+      '规则资源删除的移动端实现。凭什么用这道确认：与桌面 `components/screens/resources/ResourcesScreen.tsx` ' +
+      '的同名站点同一个动作 —— 删掉一份被规则引用的资源会让那条规则**静默失效**（后端按 fileExists 过滤），' +
+      '而恢复要重新下载。key 带 `:<id>` 实例后缀。',
   },
   {
     key: 'dns-group',

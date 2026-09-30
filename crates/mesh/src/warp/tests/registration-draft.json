@@ -1,0 +1,18 @@
+{
+  "address": "engage.cloudflareclient.com",
+  "port": 2408,
+  "privateKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "peerPublicKey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+  "localAddress": ["172.16.0.2/32", "2606:4700:110::2/128"],
+  "reserved": [1, 2, 3],
+  "meta": {
+    "deviceId": "synthetic-device",
+    "accountId": "synthetic-account",
+    "license": "",
+    "warpPlus": false
+  },
+  "warpDevice": {
+    "deviceId": "synthetic-device",
+    "token": "synthetic-test-token-not-a-real-credential"
+  }
+}

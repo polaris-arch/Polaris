@@ -59,13 +59,43 @@ fn rejects_non_http_schemes_and_hostless_urls() {
 fn connect_request_always_carries_an_explicit_port() {
     let t = SpeedTestTarget::parse("http://www.gstatic.com/generate_204").unwrap();
     assert_eq!(
-        t.connect_request(),
+        t.connect_request(None),
         "CONNECT www.gstatic.com:80 HTTP/1.1\r\nHost: www.gstatic.com:80\r\n\r\n"
     );
     let t = SpeedTestTarget::parse("https://example.com/x").unwrap();
     assert!(t
-        .connect_request()
+        .connect_request(None)
         .starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+}
+
+/// 🔴 **α 批**：带凭据的 CONNECT 必须携带 `Proxy-Authorization: Basic base64(user:pass)`，且凭据
+/// **只**出现在 CONNECT 这一步（隧道建成后对面是 origin，逐跳头不得带过去）。
+///
+/// Android 上 `probe-in-k` 要求本次起核的一次性凭据；漏发 ⇒ 内核回 407 ⇒ 整个测速池一律 -1。
+/// 牙：删掉 `connect_request` 里的 `proxy_authorization_line` → 正面断言转红。
+#[test]
+fn connect_request_presents_the_loopback_credential_only_on_connect() {
+    let user = polaris_config_engine::singbox::InboundUser {
+        username: "polaris".into(),
+        password: "0123456789abcdef0123456789abcdef".into(),
+    };
+    let t = SpeedTestTarget::parse("https://example.com/generate_204").unwrap();
+    let expected = format!(
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic {}\r\n\r\n",
+        crate::runtime::mesh::base64_encode(b"polaris:0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(t.connect_request(Some(&user)), expected);
+    assert!(
+        !t.get_request()
+            .to_ascii_lowercase()
+            .contains("proxy-authorization"),
+        "凭据不得跟进隧道内的 GET"
+    );
+    // 反向对照：无凭据 ⇒ 与改动前逐字节相同（桌面形态不变）。
+    assert_eq!(
+        t.connect_request(None),
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+    );
 }
 
 /// 🔴 隧道上的 GET 必须是 **origin-form**（absolute-form 是改前那条错路的形态）。
@@ -153,7 +183,8 @@ fn http_target() -> SpeedTestTarget {
 /// 测的是**线级报文形态与 socket 生命周期**，不测分段边界（那条在 `commands::speedtest` 的假时钟门里
 /// ——真 socket 与假时钟不能共存）。故这里两段注入同一个值，语义等价于原来的单一 `total`。
 async fn measure(port: u16, target: &SpeedTestTarget, budget: Duration) -> Option<u32> {
-    crate::commands::speedtest::measure_warm_ttfb(budget, budget, open_tunnel(port, target)).await
+    crate::commands::speedtest::measure_warm_ttfb(budget, budget, open_tunnel(port, None, target))
+        .await
 }
 
 /// 🔴 **结构事实门**：本腿说的是 CONNECT + origin-form GET，不是 absolute-form。

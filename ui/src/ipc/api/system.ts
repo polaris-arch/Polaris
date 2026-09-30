@@ -1,6 +1,11 @@
 import { invoke, listen } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { AutoStartStatus, HelperStatus, SystemProcessInfo, NetworkInterfaceInfo } from '../../contracts/types';
+import type {
+  HelperStatus,
+  SystemProcessInfo,
+  NetworkInterfaceInfo,
+  InstalledApp,
+} from '../../contracts/types';
 
 /** Helper 安装/卸载的稳定业务失败码；与 Rust `HelperActionErrorCode` 对齐。 */
 export type HelperActionErrorCode =
@@ -29,8 +34,27 @@ export const autoStartApi = {
     return invoke(IPC_CHANNELS.AUTO_START_SET, { enabled });
   },
 
-  async getStatus(): Promise<AutoStartStatus> {
+  /**
+   * 读执行侧真值。Rust `auto_start_get_status` 回的是 `bool`（不是对象）；Android 上读不到时 reject
+   * （不折成 `false`）。
+   */
+  async getStatus(): Promise<boolean> {
     return invoke(IPC_CHANNELS.AUTO_START_GET_STATUS);
+  },
+};
+
+// ============================================================================
+// systemBackupApi —— 系统自动备份开关（**Android 专属**，默认关）
+// ============================================================================
+
+export const systemBackupApi = {
+  /** 写执行侧真值（Kotlin `noBackupFilesDir` 里的开关文件）。失败 reject，由设置页那一行回显。 */
+  async set(enabled: boolean): Promise<void> {
+    return invoke(IPC_CHANNELS.SYSTEM_BACKUP_SET, { enabled });
+  },
+  /** 读执行侧真值。读不到 reject（不折成 `false`：「关着」与「不知道」是两句话）。 */
+  async getStatus(): Promise<boolean> {
+    return invoke(IPC_CHANNELS.SYSTEM_BACKUP_GET_STATUS);
   },
 };
 
@@ -45,6 +69,17 @@ export const systemApi = {
   },
   async listNetworkInterfaces(): Promise<NetworkInterfaceInfo[]> {
     return invoke(IPC_CHANNELS.SYSTEM_LIST_NETWORK_INTERFACES);
+  },
+  /**
+   * 枚举已安装应用（**Android 专属**：自定义应用的包名选择器）。
+   *
+   * **失败时 reject，不返空表** —— 后端 `system_list_installed_apps` 对
+   * 「包可见性没声明对 / 桥没接线 / 本平台没有这条腿」一律 `success:false` + 原因，
+   * 由 `ipc-client` 翻成 throw。空表只意味着「这台设备上真的一个应用都枚举不出来」，
+   * 两者在渲染端必须分得开：调用方要把失败说成「读不到」，不能说成「一个都没有」。
+   */
+  async listInstalledApps(): Promise<InstalledApp[]> {
+    return invoke(IPC_CHANNELS.SYSTEM_LIST_INSTALLED_APPS);
   },
   /** 用系统默认浏览器打开外部链接。 */
   async openExternal(url: string): Promise<void> {

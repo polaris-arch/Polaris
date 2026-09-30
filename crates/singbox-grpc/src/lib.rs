@@ -178,6 +178,23 @@ impl SingBoxApiClient {
         Ok(())
     }
 
+    /// Native dynamic route/DNS policy. The server may silently ignore an invalid mode;
+    /// callers must compare a subsequent status read with the requested mode.
+    pub async fn set_clash_mode(&self, mode: impl Into<String>) -> Result<(), ClientError> {
+        let mut c = self.client();
+        let mut req = self.with_auth(Request::new(daemon::ClashMode { mode: mode.into() }));
+        req.set_timeout(UNARY_DEADLINE);
+        c.set_clash_mode(req).await?;
+        Ok(())
+    }
+
+    pub async fn get_clash_mode_status(&self) -> Result<daemon::ClashModeStatus, ClientError> {
+        let mut c = self.client();
+        let mut req = self.with_auth(Request::new(daemon::Empty {}));
+        req.set_timeout(UNARY_DEADLINE);
+        Ok(c.get_clash_mode_status(req).await?.into_inner())
+    }
+
     /// Tailscale：热重设出口节点（不重启核）。按 `endpoint_tag` 定位具体 tailscale 端点，
     /// `stable_id` = 目标出口节点的 `TailscalePeer.stableID`（对齐 proto `SetTailscaleExitNodeRequest`）。
     /// 服务端按 stableID EditPrefs{ExitNodeID}，幂等。带 [`UNARY_DEADLINE`] deadline 保证必 settle。

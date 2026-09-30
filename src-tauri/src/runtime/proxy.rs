@@ -24,6 +24,16 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod android_bridge;
+pub(crate) mod android_capacity;
+#[cfg(any(all(target_os = "android", debug_assertions), test))]
+mod android_probe_loan;
+#[cfg(any(all(target_os = "android", debug_assertions), test))]
+mod debug_pc_echo;
+// Read-only proof shape for a future Android managed handoff. It cannot release
+// legacy custody or publish NoOldCore until every native owner is wired.
+#[allow(dead_code)]
+mod android_drain;
 mod auto_switch;
 mod connection_flush;
 mod core_binary;
@@ -36,6 +46,10 @@ mod hot_switch;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
+// S4 journal, artifact, and guarded CAS contract. The managed coordinator is
+// deliberately not wired until core ownership and platform receipts exist.
+#[allow(dead_code)]
+pub(crate) mod mesh_apply;
 mod mesh_route_report;
 mod network_canary;
 mod network_monitor;
@@ -47,6 +61,7 @@ pub(crate) mod platform_contracts;
 mod process_supervision;
 mod recovery;
 mod route_replan;
+mod rule_names;
 mod selector_reconcile;
 mod startup;
 pub(crate) mod system_takeover;
@@ -76,11 +91,11 @@ use dns_takeover::dns_takeover_enabled;
 // `commands::config` 经 `crate::runtime::proxy::StagedClassification` 取用的公开契约面（§B.3 零
 // 调用方改动），`SwitchSnapshot` / `TestPutSink` 是 `ProxyRuntime` 的字段类型（结构体定义按
 // §A.5 钉死在 façade）。
-pub use hot_switch::StagedClassification;
-pub use hot_switch::SwitchOutcome;
+use android_bridge::AndroidRequestBirth;
 #[cfg(test)]
 use hot_switch::TestPutSink;
 use hot_switch::{PendingSwitch, SwitchSnapshot};
+pub use hot_switch::{StagedClassification, SwitchOutcome};
 // B8：`ProxyLifecycleEvent` 是 `ProxyErrorEmitter::emit_lifecycle` 的载荷类型（trait 定义按
 // §C 例外② 钉死在 façade），按 §A.3 由 façade `pub use` 再导出。
 // B9：同批注释里的 `now_ms` / `sleep_unless_superseded_on` 随 `start_inner` / `wait_ready`
@@ -93,7 +108,12 @@ pub use pending_changes::PendingChangesSummary;
 #[cfg(test)]
 use platform_contracts::enumerate_own_lan_cidrs;
 use platform_contracts::platform_tag;
-pub(crate) use process_supervision::{pid_alive, send_signal};
+pub(crate) use process_supervision::pid_alive;
+#[cfg(unix)]
+pub(crate) use process_supervision::send_signal;
+#[cfg(test)]
+use process_supervision::DirectCoreRun;
+pub(crate) use process_supervision::DirectCoreSlot;
 use route_replan::RuntimeBindingState;
 // B7 跟随面：生产消费点随本批搬进 `hot_switch`/`auto_switch`，façade 只剩 `proxy/tests/` 用它
 // 构造期望值/输入 —— 不 gate 即非测试编译单元的 `unused_imports`（同 `RoutePrefix` 的既有形态）。
@@ -141,6 +161,7 @@ use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
 #[cfg(test)]
 use polaris_config_engine::builder::orchestration::config_generation_norm;
 use polaris_config_engine::builder::InvalidNode;
+use polaris_config_engine::singbox::InboundUser;
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
 use polaris_config_engine::singbox::SingBoxConfig;
@@ -171,22 +192,23 @@ use polaris_core_supervisor::{
     RejectedArray, RestartFate, Signal,
 };
 // 同上：`INVALID_REASON_KERNEL_REJECTED` 只被 `#[cfg(unix)]` 的内核剥除测试消费。
+#[cfg(test)]
+use polaris_core_supervisor::CrashRecoveryMachine;
+use polaris_core_supervisor::LifecycleGate;
 #[cfg(all(test, unix))]
 use polaris_core_supervisor::INVALID_REASON_KERNEL_REJECTED;
-use polaris_core_supervisor::{CrashRecoveryMachine, LifecycleGate};
 use polaris_dns_race::DohPost;
 // 双侧搬出跟随面：façade 的最后消费者（TS/核日志 relay）随 B6 搬进 `ts_exit.rs`/`core_log.rs`，
 // 仅 `proxy/tests/hot_switch.rs` 经 `use super::*` 仍用这两名；`ReconnectConfig` 已无消费者。
 #[cfg(test)]
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 use polaris_stats_engine::DiagnosticCounters;
+use polaris_stats_engine::RuleIdentity;
 use polaris_switch_engine::DebouncedRestart;
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
 use polaris_switch_engine::{ManagementApi, ManagementError};
 use serde_json::Value;
-use tokio::process::Child;
-
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
 use crate::commands::speedtest::current_server_fingerprints;
@@ -261,6 +283,10 @@ pub struct ProxyStatus {
     /// **再叠一次启动**（TrayMenu.tsx 原 :219-236 的缺陷）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub starting: bool,
+    /// Android native dual-mode reload was rejected; the live core remains up,
+    /// but the user must reconnect through the app for a fresh API endpoint.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reconnect_required: bool,
     /// sing-box 进程 pid（未运行=0）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub pid: u32,
@@ -312,10 +338,14 @@ pub struct ProxyStatus {
 /// **只收录本层能从控制流位置诚实断言的成员**：本仓无「核 stderr / 退出码 → 错误码」分类器，
 /// 只收录可由控制流直接证明的分类；未收录的类别需先建立判据，不能靠 message 关键字补全。
 pub mod code {
+    /// This invocation was rejected by Android's permanent process metadata budget.
+    pub const ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: &str = "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED";
     /// 显式用户态入站策略遇到最终 System endpoint；OS 路径需外部防火墙。
     pub const MESH_INBOUND_SYSTEM_INTERFACE: &str = "MESH_INBOUND_SYSTEM_INTERFACE";
     /// Final generated endpoints request system interfaces without the managed helper runtime.
     pub const SYSTEM_INTERFACE_REQUIRES_HELPER: &str = "SYSTEM_INTERFACE_REQUIRES_HELPER";
+    /// Android's in-process VPN core cannot own a second endpoint system interface.
+    pub const SYSTEM_INTERFACE_UNSUPPORTED: &str = "SYSTEM_INTERFACE_UNSUPPORTED";
     /// 起核腿失败（就绪门判定核已死 / 就绪超时）——「启动失败」轴。
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
     /// 核**意外**退出且无法自愈（无可用配置重启）——「运行中崩了」轴。
@@ -325,6 +355,15 @@ pub mod code {
     /// TUN 经提权 helper 起核，但 helper 未安装（起核前置校验拦截）——「权限/环境」轴。控制流位置可
     /// 诚实断言（判定点直接读到 helper 未装），非猜 message；渲染端据此引导去「设置 › Helper」安装。
     pub const HELPER_NOT_INSTALLED: &str = "HELPER_NOT_INSTALLED";
+    /// **Android**：起核被拒是因为用户没给 VPN 授权（`VpnService.prepare()` 返回非 null）
+    /// ——「权限/环境」轴。控制流位置可诚实断言：判定点是 Kotlin 侧起核前的那次 `prepare()`，
+    /// 不是猜 message；码经 `invoke.reject(msg, code)` 原样过桥，再经
+    /// `android_bridge::map_rejected_code` 的**白名单**落到本常量。
+    ///
+    /// **为什么不压成 [`STARTUP_FAILED`]**：这是 Android 首次运行最高频的失败路径，而用户的下一步
+    /// 动作与「起核失败」完全相反 —— 前者要再次点击连接完成系统授权，后者要去查节点/网络。压成一个码，
+    /// 渲染端给出的引导文案就是错的，用户会在网络排查上白花时间。
+    pub const VPN_PERMISSION_DENIED: &str = "VPN_PERMISSION_DENIED";
     /// **T3 终态**：上个会话遗留的 **root 孤儿核清不掉**（用户态 EPERM 杀不动，且 helper 不可用/清扫失败）
     /// ——「权限/环境」轴。对齐 上游 `ROOT_ORPHAN_BLOCKED` 语义。
     ///
@@ -511,6 +550,9 @@ pub struct StartError {
     pub message: String,
     /// 本次失败的结构化码（[`code`] 模块常量）。`None` = 无可诚实断言的分类。
     pub code: Option<&'static str>,
+    /// A rejected admission has not started a replacement. Its caller
+    /// must preserve the existing core's OS proxy and race sidecar.
+    pub(crate) admission_denied: bool,
 }
 
 impl StartError {
@@ -520,6 +562,41 @@ impl StartError {
         Self {
             message: message.into(),
             code: Some(code),
+            admission_denied: false,
+        }
+    }
+
+    fn direct_slot_occupied() -> Self {
+        let mut error = Self::coded(
+            "direct Child slot is occupied; the previous core still owns custody",
+            code::STARTUP_FAILED,
+        );
+        error.admission_denied = true;
+        error
+    }
+
+    fn direct_slot_poisoned(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!("direct Child slot lock poisoned: {error}"),
+            code: Some(code::STARTUP_FAILED),
+            admission_denied: true,
+        }
+    }
+
+    fn android_global_custody_occupied() -> Self {
+        let mut error = Self::coded(
+            "Android core request still owns global Start/Stop custody",
+            code::STARTUP_FAILED,
+        );
+        error.admission_denied = true;
+        error
+    }
+
+    fn android_global_custody_poisoned(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!("Android global core custody lock poisoned: {error}"),
+            code: Some(code::STARTUP_FAILED),
+            admission_denied: true,
         }
     }
 }
@@ -539,6 +616,7 @@ impl From<String> for StartError {
         Self {
             message,
             code: None,
+            admission_denied: false,
         }
     }
 }
@@ -555,8 +633,8 @@ impl From<StartError> for String {
 /// **为什么是 trait 而非直接持 `AppHandle`**：崩溃自愈跑在后台 task（无 command 上下文、无人 await），
 /// 而 `AppHandle` 只在 Tauri `setup` 之后才有 → 运行时必须能「先构造、后接线」。trait 同时让单测能
 /// 捕获发射记录断言「这条失败腿真发了事件」——§K7.1 的教训：光测函数、光测失败都不够，要测**组合路径**。
-/// **名字为何仍是 `...ErrorEmitter` 而不含后加的两个通道**：接线点在 `main.rs`
-/// （`set_error_emitter(Box::new(AppHandleProxyErrorEmitter{..}))`），改名要动 `main.rs`——本批次
+/// **名字为何仍是 `...ErrorEmitter` 而不含后加的两个通道**：接线点在 `lib.rs`
+/// （`set_error_emitter(Box::new(AppHandleProxyErrorEmitter{..}))`），改名要动 `lib.rs`——本批次
 /// 不碰它。语义上它已是「ProxyRuntime 的事件出口」，重命名留作纯机械的后续项。
 pub trait ProxyErrorEmitter: Send + Sync {
     /// 发射一条代理错误事件（payload 对齐前端 `ProxyErrorEvent`）。
@@ -575,8 +653,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 前端 `TailscaleStatusEvent`）。由 STATUS relay 每收一帧对每个在册端点各发一次。
     ///
     /// 未接线（单测 / setup 前）→ relay 侧 `error_emitter.get()` 取不到即静默跳过；本方法只负责「有 emitter
-    /// 时怎么发」。之所以复用本 trait（而非新加一个 emitter + main.rs 接线点）：`AppHandleProxyErrorEmitter`
-    /// 已持 `AppHandle`、已在 `main.rs` setup 期 `set_error_emitter` 一次接线，扩一个方法**无需动 main.rs**
+    /// 时怎么发」。之所以复用本 trait（而非新加一个 emitter + lib.rs 接线点）：`AppHandleProxyErrorEmitter`
+    /// 已持 `AppHandle`、已在 `lib.rs` setup 期 `set_error_emitter` 一次接线，扩一个方法**无需动 lib.rs**
     /// （本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
     fn emit_tailscale_status(&self, event: &TailscaleStatusEvent);
 
@@ -588,15 +666,15 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `{engaged, serverName?}`）。engage（进入让位）/ disengage（就绪切回 / 关开关 / 停核复位）各发一次。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) 的理由：`AppHandleProxyErrorEmitter` 已持 `AppHandle`、
-    /// 已在 `main.rs` setup 一次接线，扩方法**无需动 main.rs**（本批禁区）。
+    /// 已在 `lib.rs` setup 一次接线，扩方法**无需动 lib.rs**（本批禁区）。
     fn emit_mesh_login_fallback(&self, engaged: bool, server_name: Option<&str>);
 
     /// **C3**：发射「自动换节点成功」通知（`event:autoNodeSwitched`，payload = 前端
     /// `{ reason, newServerName, latency }`）。由自动换节点心跳在 selector 热切并回读自证后发一次。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) / [`emit_mesh_login_fallback`](Self::emit_mesh_login_fallback) 的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动
-    /// main.rs**（本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动
+    /// lib.rs**（本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
     fn emit_auto_node_switched(&self, payload: &AutoNodeSwitchedPayload);
 
     /// 只发“磁盘配置/运行投影需重拉”信号，不再次进入普通 config switch 流水线。用于 selector
@@ -610,8 +688,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 带核真态（start=true / stop=false）供渲染端决定「显检测中 vs 复位 idle」。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) / [`emit_auto_node_switched`](Self::emit_auto_node_switched) 的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动
-    /// main.rs**（本批禁区）。`UnlockRuntime` 经 `AppHandle` 的 `State<AppRuntime>` 取（生产接线点，
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动
+    /// lib.rs**（本批禁区）。`UnlockRuntime` 经 `AppHandle` 的 `State<AppRuntime>` 取（生产接线点，
     /// 单测 emitter 记录参数即可、不触 Tauri）。
     fn invalidate_unlock(&self, running: bool, exit_blocked: bool);
 
@@ -625,7 +703,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 都不同；合成一个方法会让日后任一侧改触发条件时误伤另一侧。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) 等的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动 main.rs**。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动 lib.rs**。
     fn schedule_exit_ip_refresh(&self, running: bool);
 
     /// OS 网络变化后的恢复探测：先跑出口探测，成功后再由 command 层按旧快照/能力置信度决定是否补跑
@@ -646,7 +724,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `exit_ip_wiring_guard` 因此把两者都算作合法的「出口 IP 腿」。
     ///
     /// 复用本 trait 的理由同 [`invalidate_unlock`](Self::invalidate_unlock)（emitter 已持 `AppHandle`，
-    /// 扩方法无需动 `main.rs`）。
+    /// 扩方法无需动 `lib.rs`）。
     fn mark_exit_blocked(&self, reason: &str);
 
     /// **R2 待应用差集 PUSH**：发一条差集摘要（`event:proxyPendingChanges`，payload = 前端 `{added, modified}`）。
@@ -654,7 +732,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// +「立即应用」）。契约适配依据见 [`PendingChangesSummary`]。
     ///
     /// 复用本 trait 同 [`emit_auto_node_switched`](Self::emit_auto_node_switched) 等的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动 main.rs**
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动 lib.rs**
     /// （本批禁区）。
     fn emit_pending_changes(&self, summary: &PendingChangesSummary);
 
@@ -665,7 +743,7 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `startup_snapshot` 同样是 `None`、差集同样为空，拿「差集变空」当成功信号会把失败误报成成功。
     ///
     /// 复用本 trait 的理由同 [`emit_pending_changes`](Self::emit_pending_changes)：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法无需动 main.rs。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法无需动 lib.rs。
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent);
 
     /// **网络场景命中态变更信号**（`event:networkProfileMatchChanged`，**无载荷** `{}`）。
@@ -691,8 +769,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 也绝不在 Tauri 主线程上调（`blocking_show` 在主线程会死锁）。
     ///
     /// 复用本 trait 同 [`emit_tailscale_status`](Self::emit_tailscale_status) 等的理由：
-    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `main.rs` setup 一次接线，扩方法**无需动
-    /// main.rs**（本批禁区）。
+    /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法**无需动
+    /// lib.rs**（本批禁区）。
     ///
     /// `status` = 弹框时刻的 helper 快照（供文案分流「安装」vs「修复」）。
     fn prompt_helper_gate(&self, status: &HelperStatusSnapshot) -> HelperGateDecision;
@@ -726,8 +804,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `config:setPrivacyMode` 翻转 + emit `EVENT_ENTER/EXIT_PRIVACY_MODE`）。若在 runtime 侧再存一份
     /// 镜像（哪怕靠事件同步），就有了两个真相源 —— 而这条轴的失效方式恰恰是**静默**的：镜像漏更新时
     /// 隐私模式看起来开着、核却继续按用户级别把域名写进 helper stderr，没有任何可见症状。故读取一律
-    /// 回到那一份 flag。`AppHandleProxyErrorEmitter` 已持 `AppHandle`（`main.rs` setup 一次接线，扩方法
-    /// **无需动 main.rs** —— 同 [`invalidate_unlock`](Self::invalidate_unlock) 的既定手法）。
+    /// 回到那一份 flag。`AppHandleProxyErrorEmitter` 已持 `AppHandle`（`lib.rs` setup 一次接线，扩方法
+    /// **无需动 lib.rs** —— 同 [`invalidate_unlock`](Self::invalidate_unlock) 的既定手法）。
     ///
     /// 未接线（单测 / setup 前极早期）→ 实现方返 `false`：**保守方向正确**——不抬级 = 与本方法接线前
     /// 的行为逐字节一致，绝不会因为「读不到 flag」就误把用户的 debug 日志静默降级掉。
@@ -1071,6 +1149,46 @@ pub struct CoreBuildEnv {
     pub has_cronet: bool,
 }
 
+/// 经本机 http 代理入站出网的目标（[`ProxyRuntime::local_http_proxy`] 产出）。
+///
+/// `Debug` 不泄凭据：`InboundUser` 的 `Debug` 已抹掉口令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHttpProxy {
+    /// 本机 http 代理入站端口（`mixed-in` 或 `probe-proxy-in`）。
+    pub port: u16,
+    /// 该入站要求的凭据；`mixed-in` 恒零认证 ⇒ 恒 `None`。
+    pub auth: Option<InboundUser>,
+}
+
+/// 选「经本机 http 代理入站出网」用哪个口（**纯函数**，单测与对拍门的取材点）。
+///
+/// - `mixed_port != 0`：本平台发射了 `mixed-in`（`ProxyStatus.mixed_port` 只在
+///   `emits_mixed_inbound` 为真时非 0，见起核处的赋值）→ 用它；它零认证，凭据不带。
+/// - 否则用 `probe-proxy-in`（固定走 `proxy-selector`，Android 上带本次起核的凭据）。
+/// - 两者都没有 → `None`：调用方按「本层无从经代理出网」处理，**不**连一个不存在的口。
+///
+/// 修的缺陷（2026-09-25 α 批）：此前四条腿无条件读 `mixed_port`，而 Android 不发 mixed 入站 ⇒
+/// 解锁检测全超时、首页代理出口 IP 为空、测速回退超时，全程无报错。
+#[must_use]
+pub fn select_local_http_proxy(
+    mixed_port: u16,
+    probe_proxy_port: Option<u16>,
+    loopback_auth: Option<InboundUser>,
+) -> Option<LocalHttpProxy> {
+    if mixed_port != 0 {
+        return Some(LocalHttpProxy {
+            port: mixed_port,
+            auth: None,
+        });
+    }
+    probe_proxy_port
+        .filter(|port| *port != 0)
+        .map(|port| LocalHttpProxy {
+            port,
+            auth: loopback_auth,
+        })
+}
+
 /// **§15**：主核测速探测池目标（[`ProxyRuntime::speed_probe_targets`] 产出，`server_speed_test` 消费）。
 ///
 /// = 上游 `MainCoreProbe` 的 Polaris 最小投影。`pool_ports[k]`（`probe-in-k` 的 http 代理口）与
@@ -1080,6 +1198,8 @@ pub struct CoreBuildEnv {
 pub struct SpeedProbeTargets {
     /// K 个 `probe-in-k` 的 http 代理端口（`pool_ports[k] ↔ probe-selector-k`）。
     pub pool_ports: Vec<u16>,
+    /// `probe-in-k` 要求的凭据（Android：本次起核的一次性凭据；桌面：`None`）。与端口同源同刻。
+    pub auth: Option<InboundUser>,
     /// 运行核 id → outbound tag（`probe-selector-k` 成员）。
     pub id_to_tag: BTreeMap<String, String>,
     /// **起核那一刻**运行核各节点的 **5 维** dirty 判据指纹
@@ -1106,9 +1226,11 @@ pub struct SpeedProbeTargets {
 /// 持有 config / helper / mesh 引用（跨运行时协作：启动需读 config + 可能经 helper 提权 + mesh exit route）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForceRestartSource {
-    /// A user Apply or full-config change owns the whole snapshot.
+    /// An explicit Apply or full-config operation owns the snapshot; later selector intents only
+    /// update its selected id and must not revoke the authorized full restart.
     Full,
-    /// A selection may restart only the projection of the running configuration.
+    /// Only the running projection may enter the restarted core. A newer selector intent
+    /// supersedes this snapshot unless it refreshes its target and ownership.
     Selected { intent_generation: u64 },
 }
 
@@ -1126,6 +1248,8 @@ pub struct ProxyRuntime {
     startup_snapshot: RwLock<Option<Value>>,
     /// 生命周期单飞守卫（core-supervisor 既有状态机；起停竞态/世代/pending 全在其中）。
     gate: Arc<LifecycleGate>,
+    /// Nonrecoverable authority for this runtime's reserved direct stops.
+    stop_domain: Arc<crate::runtime::config::StopRuntimeDomain>,
     /// **世代变更唤醒边沿**（起核腿的取消信号）。
     ///
     /// **不是第二个真值源**：谁当权仍然只看 `gate.generation()`，本 [`Notify`] 只负责把「世代已变」
@@ -1144,22 +1268,27 @@ pub struct ProxyRuntime {
     /// 「stale 清扫 → 提权门 → config 生成 → spawn → 就绪等待 → 重试退避」整条起核腿，而不只是
     /// spawn 之后那一段。计数而非布尔：崩溃自愈/去抖重启也直调 `start`，可与用户发起的腿重叠。
     start_inflight: Arc<AtomicU32>,
+    /// Desktop exit admission; lock order crash→admission→Child. Permanent per session.
+    desktop_shutdown: Mutex<bool>,
     /// 后台网络任务的起核稳定门：覆盖整个 start，并在 TUN 成功后延续到 selector 校正与单次连接
     /// flush 结束。订阅自动更新复用它，避免自身请求被 post-start flush（快照逐条 `CloseConnection`）误杀。
     network_settle: Arc<NetworkSettleGate>,
     /// 去抖重启调度器（switch-engine 既有 timer + 世代守卫，内部复用同一 `gate`）。
     debounced: DebouncedRestart,
-    /// sing-box 子进程句柄。std `Mutex`：就绪门的 `is_alive` 是**同步**闭包（`Fn()->bool`），
-    /// 必须能在其中即时 `try_wait`；guard 绝不跨 await 持有（否则 !Send 编译即拒）。
-    child: Arc<Mutex<Option<Child>>>,
+    /// Desktop 直起 Child 的 Empty/Running/Stopping custody。Stopping 保留真实句柄，
+    /// 不能被下一次启动覆盖；就绪门的同步 `is_alive` 只观察 Running，guard 绝不跨 await。
+    child: Arc<Mutex<DirectCoreSlot>>,
+    /// Android has no Child/PID; its TS birth stays here while a bridge request
+    /// can outlive the async waiter. An unknown request must retain custody.
+    android_main_token: Mutex<Option<AndroidGlobalCustody>>,
     /// spawn 出的 pid（child 被 stop 取走后仍可用于日志/诊断；helper 起核时 = daemon 报告的受管核 pid）。
     pid: Arc<Mutex<Option<u32>>>,
     /// **C6-5**：当前运行核是否经 helper 提权起（TUN 路由）。运行期内部真值源（≠ 面向前端的
     /// `ProxyStatus.started_via_helper`，后者仅就绪成功后落）——驱动 [`kill_core`](Self::kill_core) 走
-    /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`Child`] 句柄）。
+    /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`tokio::process::Child`] 句柄）。
     /// 起核提交时置、停核/直起时清。
     core_via_helper: Arc<AtomicBool>,
-    /// H-1 强制重启专用配置快照（`(id, config)`）。
+    /// H-1 强制重启专用配置快照（`(id, config, source)`）。
     ///
     /// **不可用 currentConfig 替代**：in-flight start 腿会覆盖 currentConfig，drain 必须读本字段
     /// 才能重启到 apply 当时那份 cfg（上游 `pendingForceRestartConfig`，:1729-1730）。
@@ -1175,7 +1304,7 @@ pub struct ProxyRuntime {
     /// 起核时刻的热切换基准（id→tag / rule-sel / 节点指纹）。None = 核未起或快照不可信 → 全部退回重启。
     switch_snapshot: RwLock<Option<SwitchSnapshot>>,
     /// lifecycle 在飞时暂存的 switchMode 配置（上游 `pendingSwitchConfig`，:1753）。
-    /// `(id, config, defer_restart)`：id 与 `LifecycleGate::set_switch_pending` 对齐，排空时按 id 认领。
+    /// id 与 `LifecycleGate::set_switch_pending` 对齐，排空时按 id 认领。
     ///
     /// **`defer_restart` 必须跟着一起暂存**：它是「本次落盘由谁触发」的意图，不是配置内容的一部分。
     /// 若排空重放时丢掉它，用户在核重启窗口内点的那次「保存」会在几秒后自己触发一次重启 ——
@@ -1217,13 +1346,14 @@ pub struct ProxyRuntime {
     /// 后台崩溃监测任务检测到核**意外**退出时喂它决策，本层只执行「退避 sleep + restart」的 I/O。
     /// 与运行核不同生命周期：跨 start/stop 持久（restart_count 靠 60s 冷却复位，不随每次 start 清零——
     /// 否则崩溃→重启→崩溃 的紧密循环永远达不到上限）。std `Mutex`：决策同步、绝不跨 await 持锁。
-    crash_recovery: Mutex<CrashRecoveryMachine>,
+    crash_recovery: Mutex<recovery::CrashRecoveryState>,
     /// 诊断分轴计数器（维度7 #11 慢起 vs 核崩，喂给 `diagnostic_export` 报告）。
     ///
     /// **本运行时只在此持有并喂「慢起轴」**（`last_start_ready_retries`）——它是全仓唯一该产生这数的地方
     /// （起核就绪门的重试累计），此前无人喂 → 报告恒零（§O1）。
     ///
-    /// **「核崩轴」不在这里并行记**：`restart_count` 的单一真值是上面的 [`CrashRecoveryMachine`]
+    /// **「核崩轴」不在这里并行记**：`restart_count` 的单一真值是上面的
+    /// [`polaris_core_supervisor::CrashRecoveryMachine`]
     /// （它已按 上游 :548 计数且自带「诊断用」getter `restart_count()`）。`diagnostic_counters()`
     /// 在**读时**把它投影进快照，而非在 `run_crash_recovery` 里再 `record_restart` 一遍——同一崩溃事件
     /// 绝不记两遍（否则两计数器的复位时机会分叉，报告数与控制数打架）。故 `DiagnosticCounters` 的核崩轴
@@ -1320,7 +1450,7 @@ pub struct ProxyRuntime {
     /// `event:proxyError` 发射器（[`set_error`](Self::set_error) 的出口）。
     ///
     /// **`OnceLock` 而非构造参数**：`AppHandle` 要到 Tauri `setup` 才存在，而本运行时在
-    /// `AppRuntime::new(config_dir)` 里就得造出来 → 只能「先构造、后接线」（`main.rs` setup 内
+    /// `AppRuntime::new(config_dir)` 里就得造出来 → 只能「先构造、后接线」（`lib.rs` setup 内
     /// [`set_error_emitter`](Self::set_error_emitter)）。未接线（单测 / setup 前的极早期失败）→
     /// `set_error` 只记日志 + 落状态码，不 panic：**发不出事件绝不能反过来打断错误处理本身**。
     error_emitter: std::sync::OnceLock<Box<dyn ProxyErrorEmitter>>,
@@ -1384,6 +1514,10 @@ pub struct ProxyRuntime {
     /// 耦合做成 flaky 源。故改用 per-runtime 覆盖 —— 作用域随实例，绝不外溢到别的测试。
     #[cfg(test)]
     core_binary_override: Mutex<Option<PathBuf>>,
+    /// Explicit metadata-only admission fixture. Native checks always use shared custody.
+    #[cfg(test)]
+    metadata_validation_admission:
+        Mutex<Option<Result<(), polaris_core_supervisor::ValidationLifecycleError>>>,
     /// 管理 API PUT 的落点桩（**仅单测置位**，同 `core_binary_override` 的先例；生产恒 `None`）。
     ///
     /// 生产的 PUT 出口是 [`ProxyRuntime::management_api`] → 真 gRPC；单测里核不起、`clash_api_port` 为 0
@@ -1402,6 +1536,24 @@ pub struct ProxyRuntime {
     /// 当前核会话的逐目的绑定与接口事实。只用于判断网络变化后的降级/重规划，不写回用户配置。
     /// 停核、崩溃及新核接管时整体替换，禁止跨会话沿用陈旧接口名。
     runtime_binding_state: Mutex<RuntimeBindingState>,
+}
+
+struct AndroidGlobalCustody {
+    birth: AndroidRequestBirth,
+    /// Verified Start receipt for this request birth. A run ID alone is not
+    /// native-close authority; the Kotlin birth nonce must stay paired with it.
+    #[allow(
+        dead_code,
+        reason = "stored for the later exact Android Stop dispatch slice"
+    )]
+    exact_target: Option<android_bridge::AndroidExactTarget>,
+    stop_only: bool,
+    start_confirmed: bool,
+    #[cfg(any(all(target_os = "android", debug_assertions), test))]
+    debug_probe_input: Option<android_probe_loan::AndroidProbeStartBinding>,
+    /// Monotone until this entire birth is removed after a certain ACK.
+    historic_unknown: bool,
+    stop_inflight: Option<Arc<()>>,
 }
 
 /// 单测用 DoH 桩：**永远 FAIL**。
@@ -1426,6 +1578,15 @@ impl DohPost for NoNetworkDoh {
 type UnlockInvalidationProbe = Arc<Mutex<Vec<(bool, bool)>>>;
 
 impl ProxyRuntime {
+    /// 只读起核时刻的名称映射；与当前磁盘配置隔离。
+    pub(crate) fn running_rule_names(&self) -> BTreeMap<String, RuleIdentity> {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|snapshot| snapshot.as_ref().map(|s| s.named_rule_by_raw.clone()))
+            .unwrap_or_default()
+    }
+
     /// 新建（注入 config / helper / mesh 运行时 + 系统代理清理收口器）。
     ///
     /// `proxy_clearer` 生产传 `production_proxy_controller(...)`（见 `runtime.rs`），测试传 mock。
@@ -1439,6 +1600,11 @@ impl ProxyRuntime {
         doh: Arc<dyn DohPost>,
     ) -> Self {
         let gate = Arc::new(LifecycleGate::default());
+        let stop_domain = crate::runtime::config::StopRuntimeDomain::new(Arc::clone(&gate));
+        let child = Arc::new(Mutex::new(DirectCoreSlot::default()));
+        helper
+            .bind_core_mutation_fence(Arc::downgrade(&child))
+            .expect("new direct slot must accept helper history");
         // C7：DNS marker 路径锚 `<userData>/system-dns.marker.json`（对齐 上游 `SystemDnsBase.getMarkerPath`）。
         // 在构造前算好（`config` 随后被 move 进 Self）。无 marker（fresh start）→ 控制器全惰性。
         let dns_marker_path = config
@@ -1467,10 +1633,13 @@ impl ProxyRuntime {
             startup_snapshot: RwLock::new(None),
             debounced: DebouncedRestart::new(gate.clone()),
             gate,
+            stop_domain,
             gen_changed: Arc::new(Notify::new()),
             start_inflight: Arc::new(AtomicU32::new(0)),
+            desktop_shutdown: Mutex::new(false),
             network_settle: Arc::new(NetworkSettleGate::default()),
-            child: Arc::new(Mutex::new(None)),
+            child,
+            android_main_token: Mutex::new(None),
             pid: Arc::new(Mutex::new(None)),
             core_via_helper: Arc::new(AtomicBool::new(false)),
             pending_force_restart: RwLock::new(None),
@@ -1484,7 +1653,7 @@ impl ProxyRuntime {
             restart_deferred: AtomicBool::new(false),
             netenv_dhcp_suppressed: AtomicBool::new(false),
             network_canary: Arc::default(),
-            crash_recovery: Mutex::new(CrashRecoveryMachine::default()),
+            crash_recovery: Mutex::new(recovery::CrashRecoveryState::default()),
             diagnostics: Mutex::new(DiagnosticCounters::new()),
             kernel_gate_cache: Mutex::new(kernel_gate_cache),
             protected_core_cache: Arc::new(Mutex::new(None)),
@@ -1516,6 +1685,8 @@ impl ProxyRuntime {
             #[cfg(test)]
             core_binary_override: Mutex::new(None),
             #[cfg(test)]
+            metadata_validation_admission: Mutex::new(None),
+            #[cfg(test)]
             management_api_stub: Mutex::new(None),
         }
     }
@@ -1541,7 +1712,7 @@ impl ProxyRuntime {
     // 物理网卡的 DHCP DNS → DNS 逃逸绕过 TUN（劫持/污染重现）。故长驻 `route -n monitor` 监听链路变化，
     // 去抖后把「新出现 / 仍未受控」的服务重新接管为受控 IP（`reconcile_dns` 幂等，只补未受控项）。
 
-    /// 接线 `event:proxyError` 发射器（`main.rs` setup 内调用一次，见 [`error_emitter`](Self::error_emitter) 字段文档）。
+    /// 接线 `event:proxyError` 发射器（`lib.rs` setup 内调用一次，见 [`error_emitter`](Self::error_emitter) 字段文档）。
     ///
     /// 幂等：已接线则忽略重复接线（`OnceLock::set` 的 Err 腿）——重复接线是编程错误而非运行期状况，
     /// 记 warn 让它可见，但不 panic（不为一个诊断通道搭上 App 启动）。
@@ -1566,12 +1737,41 @@ impl ProxyRuntime {
         }
         Some(SpeedProbeTargets {
             pool_ports: snap.probe_pool_ports,
+            auth: snap.loopback_auth,
             id_to_tag: snap.id_to_tag,
             // dirty 波前预筛的唯一诚实判据（见字段文档）：起核那刻的 **5 维**指纹表，与 id_to_tag 同源同刻。
             // **必须是 dirty_fingerprints 而非 fingerprints** —— 后者是全维表（喂重启判据 + pending
             // modified），与测速「新」一侧的 5 维公式不同 ⇒ 恒不等 ⇒ 全员恒 dirty、整个波前恒被免测。
             fingerprints: snap.dirty_fingerprints,
         })
+    }
+
+    /// 运行核回环探针/更新入站的一次性凭据（Android：本次起核生成；桌面 / 未运行：`None`）。
+    ///
+    /// 消费方：经 `update-in` / `subscription-update-in`（socks）出网的更新与订阅链路。与
+    /// `ProxyStatus` 里的端口是同一次起核的产物，停核随快照一起清掉。
+    #[must_use]
+    pub fn loopback_auth(&self) -> Option<InboundUser> {
+        self.switch_snapshot
+            .read()
+            .ok()?
+            .as_ref()
+            .and_then(|snap| snap.loopback_auth.clone())
+    }
+
+    /// 进程内「经本机 **http** 代理入站走当前代理出口」的目标（端口 + 该入站要求的凭据）。
+    ///
+    /// 解锁检测 / 出口 IP / 测速回退腿 / warm RTT 伴测四条腿的**唯一**取址处。判据在纯函数
+    /// [`select_local_http_proxy`]：有 `mixed-in` 用它，没有（Android / iOS）用 `probe-proxy-in`。
+    /// 核未运行 → `None`。
+    #[must_use]
+    pub fn local_http_proxy(&self) -> Option<LocalHttpProxy> {
+        let status = self.status();
+        if !status.running {
+            return None;
+        }
+        let snap = self.switch_snapshot.read().ok()?.clone()?;
+        select_local_http_proxy(status.mixed_port, snap.probe_proxy_port, snap.loopback_auth)
     }
 
     /// **临时测速核**的构建环境快照（platform / arch / cronet 可用性）。

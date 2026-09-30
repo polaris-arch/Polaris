@@ -335,8 +335,10 @@ fn inbounds_deps(obs: ObservedTailnetAddresses) -> InboundsDeps {
     InboundsDeps {
         probe_direct_port: None,
         probe_proxy_port: None,
+        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
+        loopback_auth: None,
         probe_pool_ports: vec![],
         // darwin：非 linux ⇒「连入来源排除」这条腿真的会跑；own_lan 留空以免物理 LAN 减法干扰。
         platform: "darwin".into(),

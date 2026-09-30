@@ -65,6 +65,7 @@ pub use types::{
     ClosedConnectionEntry, ConnectionAggFlow, ConnectionAggHost, ConnectionAggOutbound,
     ConnectionCounters, ConnectionEntry, ConnectionEventType, ConnectionMetadata,
     ConnectionsAggregate, ConnectionsClosedSnapshot, ConnectionsClosedUpdate,
-    ConnectionsDetailUpdate, SingBoxConnection, SingBoxConnectionEvent, SingBoxConnectionEvents,
-    SingBoxProcessInfo, SingBoxStatus, TrafficStats, CONNECTION_RANKING_LIMIT, TOPOLOGY_OTHERS_KEY,
+    ConnectionsDetailUpdate, RuleIdentity, SingBoxConnection, SingBoxConnectionEvent,
+    SingBoxConnectionEvents, SingBoxProcessInfo, SingBoxStatus, TrafficStats,
+    CONNECTION_RANKING_LIMIT, TOPOLOGY_OTHERS_KEY,
 };

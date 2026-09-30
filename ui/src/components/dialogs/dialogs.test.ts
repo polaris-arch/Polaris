@@ -558,27 +558,45 @@ describe('接线：规则集缺失提示的两条腿 + 复用既有按钮键', (
  *
  * 变异靶：删掉 `wgSpec` 里 `k: 'reserved'` 那一行 → 第 2 条红（覆盖门与逻辑单测都不会红）；
  * 删掉提交前的校验腿 → 第 3 条红（后端对不合法 reserved 是静默忽略，没有别的地方会说话）。
+ *
+ * 🔴 **两个取材面，不是一个**（2026-09-06 `wgSpec` 搬进 `wg-spec.ts` 之后）：
+ * **控件**住在 `wg-spec.ts`（字段表），**提交前校验**住在两个消费者里。把两条断言都指到同一个
+ * 文件上会让其中一条恒绿 —— 这里逐条指准，并各带一条自检。
+ * 校验那一条取**两个客户端的并集**：桌面 `WgDialog.tsx` 与移动 `mobile/forms/WgPanel.tsx`
+ * 都必须拦，任一端漏掉就是那一端「界面收下了、盘上没有」。
  */
-describe('接线：WG 弹窗的 Reserved 控件与提交校验', () => {
-  /** 去注释：本文件与 WgDialog 的注释都逐字引用了这些标识符，不去掉就是拿注释当证据。 */
+describe('接线：WG 表单的 Reserved 控件与提交校验', () => {
+  /** 去注释：本文件与被读的那几份源码都逐字引用了这些标识符，不去掉就是拿注释当证据。 */
   const code = (src: string): string =>
     src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1');
-  const src = code(readFileSync(fileURLToPath(new URL('./WgDialog.tsx', import.meta.url)), 'utf8'));
+  const readCode = (rel: string): string =>
+    code(readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'));
+  const spec = readCode('./wg-spec.ts');
+  const submitters: ReadonlyArray<readonly [string, string]> = [
+    ['WgDialog.tsx', readCode('./WgDialog.tsx')],
+    ['mobile/forms/WgPanel.tsx', readCode('../../mobile/forms/WgPanel.tsx')],
+  ];
 
-  it('自检：读到了 WgDialog 源码且去注释后仍是可断言的代码', () => {
-    expect(src.length, 'WgDialog.tsx 读空了 —— 被改名/移走了？').toBeGreaterThan(5000);
-    expect(src, '去注释把源码吃光了').toContain('import');
+  it('自检：三份源码都读到了，且去注释后仍是可断言的代码', () => {
+    expect(spec.length, 'wg-spec.ts 读空了 —— 被改名/移走了？').toBeGreaterThan(1500);
+    expect(spec, '去注释把字段表吃光了').toContain('export function wgSpec');
+    for (const [name, src] of submitters) {
+      expect(src.length, `${name} 读空了`).toBeGreaterThan(2000);
+      expect(src, `${name} 去注释后没剩下代码`).toContain('import');
+    }
   });
 
   it('FieldSpec 表里真有 reserved 这一项（= 用户改得了），且走 i18n 键', () => {
-    expect(src, 'wgSpec 里没有 reserved 字段项 —— 普通 WG 节点又改不了 Reserved 了').toMatch(
+    expect(spec, 'wgSpec 里没有 reserved 字段项 —— 普通 WG 节点又改不了 Reserved 了').toMatch(
       /k:\s*'reserved'/
     );
-    expect(src, 'Reserved 标签没走 i18n 键').toContain("'wg.reserved'");
+    expect(spec, 'Reserved 标签没走 i18n 键').toContain("'wg.reserved'");
   });
 
-  it('提交前拦下「填了但不合法」（否则后端静默忽略，用户以为存上了）', () => {
-    expect(src, 'WgDialog 不再校验 reserved').toContain('reservedInputInvalid(');
-    expect(src, '校验失败没有可见反馈').toContain("'wg.errReserved'");
+  it('两个客户端都在提交前拦下「填了但不合法」（否则后端静默忽略，用户以为存上了）', () => {
+    for (const [name, src] of submitters) {
+      expect(src, `${name} 不再校验 reserved`).toContain('reservedInputInvalid(');
+      expect(src, `${name} 的校验失败没有可见反馈`).toContain("'wg.errReserved'");
+    }
   });
 });

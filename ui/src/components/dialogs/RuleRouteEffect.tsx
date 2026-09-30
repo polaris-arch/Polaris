@@ -5,6 +5,7 @@ import { groupServersBySubscription, defaultOpenGroupIds } from '@/domain/server
 import { flagCodeForName } from '@/components/screens/nodes/NdFlag';
 import { FlagImg } from '@/components/FlagImg';
 import { Csel, type CselGroup } from './Csel';
+import { ruleRouteTargetChoice } from './rule-effect-state';
 
 /**
  * 「目标出站」三个快速策略的行首图标 —— **与首页出口选单 / 应用分流策略菜单同一组图形**
@@ -39,12 +40,8 @@ export function useRuleRouteEffect(
   subscriptions: SubscriptionConfig[] | undefined,
   t: TFunction,
 ) {
-  const [target, setTarget] = useState<string>(() => {
-    if (!baseRouteEffect) return 'proxy';
-    if (baseRouteEffect.action === 'direct') return 'direct';
-    if (baseRouteEffect.action === 'block') return 'block';
-    return baseRouteEffect.targetServerId ? `node:${baseRouteEffect.targetServerId}` : 'proxy';
-  });
+  /* 值编码的判据住在 `rule-effect-state.ts`（与 `rule-submit.ts` 的反解成对，两端共用一份）。 */
+  const [target, setTarget] = useState<string>(() => ruleRouteTargetChoice(baseRouteEffect));
 
   /**
    * 目标出站下拉 —— **按订阅/分组折叠**（与应用分流的策略菜单、托盘「全部节点」同一套语义）。

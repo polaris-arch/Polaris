@@ -27,6 +27,11 @@ import {
   validateDnsGroupForm,
   validateDnsServerForm,
 } from '../../dialogs/DnsResourceDialog';
+import {
+  DNS_PRESET_CUSTOM,
+  domesticPresets,
+  remotePresets,
+} from './settings-dns-logic';
 import type { UserConfig } from '@/contracts/types';
 
 describe('DNS 资源删除引用门', () => {
@@ -258,4 +263,123 @@ describe('normalizeDnsTimeoutInput（与 crates/store/src/sanitize.rs:498-517 �
       expect(normalizeDnsTimeoutInput(raw)).toBeNull();
     },
   );
+});
+
+/**
+ * 上游预设表的**内容门**（2026-09-06 新增）。
+ *
+ * # 补的是哪条缝
+ *
+ * `remotePresets` / `domesticPresets` 2026-09-06 从 `SettingsDns.tsx` 的私有函数提升成
+ * `settings-dns-logic.ts` 的**共享面**（移动端 `mobile/settings/DnsPage.tsx` 读同一张表）。
+ * 但当时仓里判这张表的三条判据**全都随表一起漂**：
+ *  · 移动端渲染断言写的是 `for (const preset of remotePresets(...)) expect(html).toContain(preset.value)`
+ *    —— 读的是表自己，改表则期望同步改；
+ *  · 「表只有一份」那条扫描只认两条针字面量，且只数**几个文件持有**，不判值对不对；
+ *  · 桌面侧一条都没有。
+ * 实测：把 `settings-dns-logic.ts:215` 的 `value: 'https://8.8.8.8/dns-query'` 改成
+ * `'https://8.8.4.4/dns-query'`（label 仍写着 `Google 8.8.8.8`，即值与标签当场互相矛盾），
+ * `npx vitest run` 全量 **全绿**。⇒ 一个改错的上游地址会同时发到两端而没有任何门转红，
+ * 用户在两端选中「Google 8.8.8.8」，落进 `dnsConfig.foreignDns` 的却是另一个地址。
+ *
+ * # 判据的取材：**逐字手写字面量**，不从 `remotePresets()` 反读
+ *
+ * 从被判对象自己身上取期望值就是自证。故下面两张表是手抄的，改表必须同步改这里 ——
+ * 那正是「共享面要有人签字」这件事的机器形态。
+ */
+describe('DNS 上游预设表：内容门（共享面，改表必须同时过两端的门）', () => {
+  /** i18n 桩：返回 key 本身 ⇒ label 的前缀就是那两个类型词的 key，可直接判类型归属。 */
+  const T = (key: string): string => key;
+
+  it('远程预设：四条、顺序与地址逐字不变', () => {
+    expect(remotePresets(T).map((p) => p.value)).toEqual([
+      'https://1.1.1.1/dns-query',
+      'https://8.8.8.8/dns-query',
+      'https://cloudflare-dns.com/dns-query',
+      'https://dns.google/dns-query',
+    ]);
+  });
+
+  it('国内预设：四条、顺序与地址逐字不变', () => {
+    expect(domesticPresets(T).map((p) => p.value)).toEqual([
+      'https://223.5.5.5/dns-query',
+      'https://1.12.12.12/dns-query',
+      'https://doh.pub/dns-query',
+      'https://dns.alidns.com/dns-query',
+    ]);
+  });
+
+  /**
+   * label 与 value 不许各走各的。两条不变量：
+   *  ① label 里印的那个地址，必须**就是** value 里的那个 host（`parseDnsServerSpec` 解出来的，
+   *     不是这里再写一遍正则）——这条直接抓「值改了、标签没改」；
+   *  ② label 开头那个类型词（IP DoH / 域名 DoH）必须与 value 的真实形态一致
+   *     ——这条抓「把一条域名 DoH 归进 IP DoH 那一组」，那会让 bootstrap 那一段判错。
+   */
+  function labelAgreesWithValue(preset: { value: string; label: string }): boolean {
+    const parsed = parseDnsServerSpec(preset.value);
+    if (!parsed) return false;
+    if (!preset.label.includes(parsed.server)) return false;
+    const claimsIp = preset.label.startsWith('settings.dns.dohByIp');
+    const claimsDomain = preset.label.startsWith('settings.dns.dohByDomain');
+    if (claimsIp === claimsDomain) return false; // 两个都不是（或都是）⇒ 类型词丢了
+    return claimsIp === !parsed.isDomain;
+  }
+
+  it('每一条 label 印的地址就是它 value 里的那个，且类型词与 value 的真实形态一致', () => {
+    for (const preset of [...remotePresets(T), ...domesticPresets(T)]) {
+      expect(labelAgreesWithValue(preset), `预设「${preset.label}」的标签与落库值对不上`).toBe(
+        true,
+      );
+    }
+  });
+
+  it('反向对照：谓词认得出「值改了、标签没改」与「类型词归错组」', () => {
+    // 这就是实测过的那条静默变异：标签仍写 8.8.8.8，落库的是 8.8.4.4。
+    expect(
+      labelAgreesWithValue({
+        value: 'https://8.8.4.4/dns-query',
+        label: 'settings.dns.dohByIp · Google 8.8.8.8',
+      }),
+      '值与标签矛盾都没抓出来 ⇒ 上一条是恒 true 的谓词',
+    ).toBe(false);
+    // 域名 DoH 被归进 IP DoH 那一组。
+    expect(
+      labelAgreesWithValue({
+        value: 'https://dns.google/dns-query',
+        label: 'settings.dns.dohByIp · dns.google',
+      }),
+    ).toBe(false);
+    // 正向对照：一条真的对得上的预设必须判 true（否则上面两条可能只是「它对谁都 false」）。
+    expect(
+      labelAgreesWithValue({
+        value: 'https://dns.google/dns-query',
+        label: 'settings.dns.dohByDomain · dns.google',
+      }),
+    ).toBe(true);
+  });
+
+  it('哨兵不许混进表里（`__custom__` 是显示态，不是可落库的上游）', () => {
+    for (const preset of [...remotePresets(T), ...domesticPresets(T)]) {
+      expect(preset.value).not.toBe(DNS_PRESET_CUSTOM);
+      // 且每条都必须是这个应用真的解析得了的规格，否则选中即静默回落到兜底上游。
+      expect(parseDnsServerSpec(preset.value), `「${preset.value}」解析不出来`).not.toBeNull();
+    }
+  });
+
+  it('两张表不许有交集（同一个上游同时挂在国内与国外两侧 = 选哪边都一样）', () => {
+    const remote = new Set(remotePresets(T).map((p) => p.value));
+    const overlap = domesticPresets(T)
+      .map((p) => p.value)
+      .filter((v) => remote.has(v));
+    expect(overlap).toEqual([]);
+  });
+
+  it('语言切换后重算：表是**函数**不是模块级常量（常量在 import 期求值，那时语言还没校正）', () => {
+    const zh = remotePresets(() => 'zh');
+    const en = remotePresets(() => 'en');
+    expect(zh[0].label).not.toBe(en[0].label);
+    // 但 value 不随语言变（落库的是地址，不是文案）。
+    expect(zh.map((p) => p.value)).toEqual(en.map((p) => p.value));
+  });
 });

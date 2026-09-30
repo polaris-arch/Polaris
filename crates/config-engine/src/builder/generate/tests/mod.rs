@@ -1,5 +1,6 @@
 use super::*;
 use crate::builder::outbounds::INVALID_REASON_DETOUR_CASCADE;
+use crate::user_config::dns_policy::{DnsPolicyAction, DnsServerGroup, DnsServerGroupMode};
 use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use crate::user_config::rule::{
     Rule, RuleAction, RuleDnsAnswerMode, RuleDnsEffect, RuleDnsResolver, RuleEffects, RuleResource,
@@ -15,8 +16,10 @@ fn deps_default() -> GenerateConfigDeps {
         race_server_port: 0,
         probe_direct_port: None,
         probe_proxy_port: None,
+        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
+        loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
         race_upstream_ips: vec![],
@@ -67,6 +70,300 @@ fn base_config() -> UserConfig {
         proxy_mode: ProxyMode::Smart,
         proxy_mode_type: ProxyModeType::SystemProxy,
         ..Default::default()
+    }
+}
+
+#[test]
+fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    config.singbox_dashboard = Some(true);
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let ordinary = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    let ordinary_base = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    assert_eq!(
+        ordinary
+            .experimental
+            .as_ref()
+            .unwrap()
+            .clash_api
+            .as_ref()
+            .map(|x| x.default_mode.as_str()),
+        Some("normal")
+    );
+    assert!(ordinary
+        .outbounds
+        .iter()
+        .any(|o| o.tag == super::super::mesh_mode::DASHBOARD_SELECTOR));
+    let mut mesh_config = config;
+    mesh_config.selected_server_id = Some("ts".into());
+    let mesh = generate_sing_box_config(&mesh_config, &BTreeMap::new(), &deps).unwrap();
+    let mesh_base = generate_base_config(&mesh_config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    assert_eq!(
+        mesh.experimental
+            .as_ref()
+            .unwrap()
+            .clash_api
+            .as_ref()
+            .map(|x| x.default_mode.as_str()),
+        Some("mesh-direct")
+    );
+    assert_eq!(ordinary.route, mesh.route);
+    assert_eq!(ordinary.dns, mesh.dns);
+    assert!(compiled_projection_matches_base(
+        &ordinary,
+        &ordinary_base,
+        "normal"
+    ));
+    assert!(compiled_projection_matches_base(
+        &ordinary,
+        &mesh_base,
+        "mesh-direct"
+    ));
+    if let Ok(path) = std::env::var("POLARIS_MESH_MODE_TEST_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&ordinary).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn existing_third_clash_mode_rejects_compilation_without_mutating_config() {
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let mut normal = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    let mut mesh_config = config;
+    mesh_config.selected_server_id = Some("ts".into());
+    let mesh = generate_base_config(&mesh_config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    normal.route.as_mut().unwrap().rules[0].clash_mode = Some("custom".into());
+    let before = normal.clone();
+    assert!(!super::super::mesh_mode::try_compile(
+        &mut normal,
+        &before,
+        &mesh,
+        "normal"
+    ));
+    assert_eq!(normal, before);
+}
+
+#[test]
+fn android_dns_group_keeps_valid_single_policy_when_dual_mode_cannot_namespace_evaluate() {
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    config.config_schema_version = Some(2);
+    config.dns_server_groups = vec![DnsServerGroup {
+        id: "race".into(),
+        name: "Race".into(),
+        enabled: true,
+        mode: DnsServerGroupMode::Race,
+        members: vec!["builtin-domestic".into(), "builtin-remote".into()],
+        fallback_server_id: Some("builtin-domestic".into()),
+    }];
+    let mut rule = dns_rule_set_rule("group", "unused");
+    rule.type_field = RuleType::Domain;
+    rule.values = vec!["race.example".into()];
+    rule.effects.as_mut().unwrap().dns.as_mut().unwrap().action = Some(DnsPolicyAction::Group {
+        group_id: "race".into(),
+    });
+    config.policy_rules = Some(vec![rule]);
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let generated = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    assert!(generated
+        .dns
+        .as_ref()
+        .unwrap()
+        .rules
+        .as_deref()
+        .unwrap()
+        .iter()
+        .any(|rule| rule.action.as_deref() == Some("evaluate")));
+    assert!(generated.experimental.as_ref().unwrap().clash_api.is_none());
+    assert_eq!(
+        generated,
+        generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+            .unwrap()
+            .config
+    );
+    if let Ok(path) = std::env::var("POLARIS_DNS_GROUP_TEST_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&generated).unwrap()).unwrap();
+    }
+}
+
+fn compiled_projection_matches_base(
+    compiled: &SingBoxConfig,
+    original: &SingBoxConfig,
+    mode: &str,
+) -> bool {
+    let (Some(mut route), Some(mut dns), Some(base_route), Some(base_dns)) = (
+        compiled.route.clone(),
+        compiled.dns.clone(),
+        original.route.as_ref(),
+        original.dns.as_ref(),
+    ) else {
+        return false;
+    };
+    let Some(final_route_index) = route.rules.iter().rposition(|r| {
+        r.clash_mode.as_deref() == Some(mode)
+            && r.action.as_deref() == Some("route")
+            && r.outbound.is_some()
+    }) else {
+        return false;
+    };
+    let final_route = route.rules[final_route_index].outbound.clone().unwrap();
+    route.rules.remove(final_route_index);
+    route
+        .rules
+        .retain(|r| r.clash_mode.is_none() || r.clash_mode.as_deref() == Some(mode));
+    for rule in &mut route.rules {
+        rule.clash_mode = None;
+        if mode == "mesh-direct" {
+            for tag in [&mut rule.server, &mut rule.domain_resolver] {
+                if let Some(name) = tag.as_mut() {
+                    if let Some(base) = name.strip_suffix("-mesh-direct") {
+                        *name = base.into();
+                    }
+                }
+            }
+        }
+    }
+    route.final_outbound = Some(final_route);
+    if route != *base_route {
+        return false;
+    }
+
+    let Some(final_dns_index) = dns.rules.as_ref().and_then(|rules| {
+        rules.iter().rposition(|r| {
+            r.clash_mode.as_deref() == Some(mode)
+                && r.server.is_some()
+                && r.domain.is_none()
+                && r.rule_set.is_none()
+        })
+    }) else {
+        return false;
+    };
+    let mut rules = dns.rules.take().unwrap_or_default();
+    let mut final_dns = rules.remove(final_dns_index).server.unwrap();
+    if mode == "mesh-direct" {
+        if let Some(base) = final_dns.strip_suffix("-mesh-direct") {
+            final_dns = base.into();
+        }
+    }
+    rules.retain(|r| r.clash_mode.is_none() || r.clash_mode.as_deref() == Some(mode));
+    for rule in &mut rules {
+        rule.clash_mode = None;
+        if mode == "mesh-direct" {
+            if let Some(server) = rule.server.as_mut() {
+                if let Some(base) = server.strip_suffix("-mesh-direct") {
+                    *server = base.into();
+                }
+            }
+        }
+    }
+    dns.rules = if base_dns.rules.is_none() && rules.is_empty() {
+        None
+    } else {
+        Some(rules)
+    };
+    dns.final_server = Some(final_dns);
+    let mut servers = Vec::with_capacity(base_dns.servers.len());
+    for server in &base_dns.servers {
+        let selected = if mode == "mesh-direct" {
+            dns.servers
+                .iter()
+                .find(|candidate| candidate.tag == format!("{}-mesh-direct", server.tag))
+                .unwrap_or_else(|| {
+                    dns.servers
+                        .iter()
+                        .find(|candidate| candidate.tag == server.tag)
+                        .unwrap()
+                })
+        } else {
+            dns.servers
+                .iter()
+                .find(|candidate| candidate.tag == server.tag)
+                .unwrap()
+        };
+        let mut selected = selected.clone();
+        if mode == "mesh-direct" {
+            selected.tag = server.tag.clone();
+            for tag in [
+                &mut selected.domain_resolver,
+                &mut selected.address_resolver,
+            ] {
+                if let Some(name) = tag.as_mut() {
+                    if let Some(base) = name.strip_suffix("-mesh-direct") {
+                        *name = base.into();
+                    }
+                }
+            }
+        }
+        servers.push(selected);
+    }
+    dns.servers = servers;
+    dns == *base_dns
+}
+
+#[test]
+fn restored_android_config_precompiles_when_fixture_is_available() {
+    let Ok(path) = std::env::var("POLARIS_RESTORED_CONFIG_FIXTURE") else {
+        return;
+    };
+    let input = std::fs::read_to_string(path).unwrap();
+    let config: UserConfig = serde_json::from_str(&input).unwrap();
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let output = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    assert!(
+        output
+            .experimental
+            .as_ref()
+            .and_then(|x| x.clash_api.as_ref())
+            .is_some(),
+        "restored configuration did not pass the dual policy equivalence gate"
+    );
+    let (normal_id, mesh_id) = super::super::mesh_mode::mode_candidates(&config).unwrap();
+    for (id, mode) in [(normal_id, "normal"), (mesh_id, "mesh-direct")] {
+        let mut variant = config.clone();
+        variant.selected_server_id = Some(id);
+        let base = generate_base_config(&variant, &BTreeMap::new(), &deps, &BTreeMap::new())
+            .unwrap()
+            .config;
+        assert!(
+            compiled_projection_matches_base(&output, &base, mode),
+            "restored configuration route/DNS projection differs in mode {mode}"
+        );
     }
 }
 
@@ -1720,6 +2017,25 @@ fn mesh_system_supported_excludes_win32() {
     assert!(mesh_system_supported_on_platform("darwin"));
     assert!(mesh_system_supported_on_platform("linux"));
     assert!(!mesh_system_supported_on_platform("WIN32")); // 大小写不敏感
+                                                          // Android 禁（2026-09-04 K10）：与枚举版 `polaris_mesh::mesh_system_supported_on_platform`
+                                                          // 是同一条判据的两份实现，必须同答 —— 一边禁一边准会造出「config 生成认为 System 可用、
+                                                          // 出口路由状态机认为不可用」的半开状态。入参是 `std::env::consts::OS` 直传值。
+    assert!(!mesh_system_supported_on_platform("android"));
+    assert!(!mesh_system_supported_on_platform("ANDROID")); // 大小写不敏感，与 win32 同口径
+
+    // 2026-09-05：禁止清单 → 允许清单。未知串一律 false（枚举版 `Platform::Other` 同批改）。
+    assert!(
+        !mesh_system_supported_on_platform("freebsd"),
+        "未知平台串不得默认支持：那是枚举版 `Platform::Other => true` 在字符串轴上的同一个缺陷"
+    );
+    assert!(!mesh_system_supported_on_platform(""), "空串同属未知");
+    // 别名洞的正面钉子：`std::env::consts::OS` 的原值是 `windows`/`macos`，而本函数收的是
+    // 上游 `process.platform` 风格串。旧的禁止清单只点名 `win32`，对漏映射直传的 `"windows"`
+    // 答 true —— 那正是它想禁的平台。允许清单把这个形态一并封死。
+    assert!(!mesh_system_supported_on_platform("windows"));
+    // 与 `Platform::parse` 的别名表对齐：`macos` 与 `darwin` 同指 macOS，两个都得支持。
+    assert!(mesh_system_supported_on_platform("macos"));
+    assert!(mesh_system_supported_on_platform("DARWIN"));
 }
 
 // ══════════════════════════════════════════════════════════════════════════

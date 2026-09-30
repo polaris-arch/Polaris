@@ -22,7 +22,7 @@ import { useDialogStore } from '@/components/dialogs/dialog-store';
 import { Phead, SetBlock, SetRow, Switch, Button } from './Primitives';
 
 /**
- * 7 类标签 → i18n key（模块级只存 key、渲染时才 t：常量在 import 期求值，那时语言还没被
+ * 备份类别标签 → i18n key（模块级只存 key、渲染时才 t：常量在 import 期求值，那时语言还没被
  * `syncLanguageChoice` 校正，直接存译文会钉死在首屏解析出的语言上）。
  *
  * 四类直接接既有的 `settings.advanced.backup.*`（文案逐字相同，不另造重复键）；
@@ -37,6 +37,7 @@ const CATEGORY_LABEL_KEYS: Record<BackupCategory, string> = {
   dnsRules: 'settings.backup.catDnsRules',
   dnsResources: 'settings.backup.catDnsResources',
   appRules: 'settings.advanced.backup.appRules',
+  meshRouting: 'settings.backup.catMeshRouting',
   generalSettings: 'settings.advanced.backup.generalSettings',
 };
 

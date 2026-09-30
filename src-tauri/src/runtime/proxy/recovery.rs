@@ -1,6 +1,7 @@
-//! 崩溃自愈 owner：后台崩溃监测腿（世代 + pid 身份双判据）、退避重启执行体、GiveUp 终态播报，
+//! 崩溃自愈 owner：后台崩溃监测腿（直起 Child 身份；helper 既有世代 + pid 身份判据）、退避重启执行体、GiveUp 终态播报，
 //! 以及「观察之后才读世代」的分类 seam 与「不可恢复重启错误」谓词。
 
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,15 +10,85 @@ use polaris_core_supervisor::{
     classify_child_exit, AutoRestartOutcome, ChildObservation, CrashRecoveryMachine,
     ExitClassification, FailureOutcome, LifecycleGate, RestartFate,
 };
+use serde_json::Value;
 
 use crate::runtime::helper::ManagedCoreStatus;
 
 use super::code;
 use super::lifecycle::monotonic_now_ms;
-use super::process_supervision::{pid_alive, pid_identity_verdict, process_identity, PidIdentity};
+use super::lifecycle::RestartLeg;
+use super::process_supervision::{
+    pid_alive, pid_identity_verdict, process_identity, PidIdentity, RunIdentity,
+};
 use super::route_replan::RuntimeBindingState;
 use super::startup::with_helper_gate_suppressed;
-use super::{ProxyRuntime, StartError};
+use super::{ProxyRuntime, ProxyStatus, StartError};
+
+#[derive(Clone)]
+pub(super) struct CrashEvent {
+    pub(super) generation: u64,
+    pub(super) direct_run_identity: Option<RunIdentity>,
+    pub(super) config: Option<Value>,
+}
+
+struct PendingReplay {
+    ticket: u64,
+    event: CrashEvent,
+}
+
+#[derive(Default)]
+pub(super) struct CrashRecoveryState {
+    machine: CrashRecoveryMachine,
+    next_ticket: u64,
+    pending_replay: Option<PendingReplay>,
+}
+
+#[cfg(test)]
+impl CrashRecoveryState {
+    pub(super) fn pending_replay_event(&self) -> Option<&CrashEvent> {
+        self.pending_replay.as_ref().map(|pending| &pending.event)
+    }
+}
+
+impl Deref for CrashRecoveryState {
+    type Target = CrashRecoveryMachine;
+
+    fn deref(&self) -> &Self::Target {
+        &self.machine
+    }
+}
+
+impl DerefMut for CrashRecoveryState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.machine
+    }
+}
+
+enum RecoveryCursor {
+    Observed(CrashEvent),
+    Owned { generation: u64, config: Value },
+}
+
+impl RecoveryCursor {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Observed(event) => event.generation,
+            Self::Owned { generation, .. } => *generation,
+        }
+    }
+
+    fn config(&self) -> Option<&Value> {
+        match self {
+            Self::Observed(event) => event.config.as_ref(),
+            Self::Owned { config, .. } => Some(config),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn direct_replay_exit_proven<T, E>(observation: &Result<Option<T>, E>) -> bool {
+    matches!(observation, Ok(Some(_)))
+}
 
 /// 崩溃监测轮询间隔（ms）。tokio `Child::wait()` 单持有者 → 监测只能轮询 `try_wait`（见
 /// `spawn_crash_monitor`）；1s 与健康检查同量级，CPU 可忽略，崩溃检出延迟 ≤1s。
@@ -60,10 +131,15 @@ impl ProxyRuntime {
     /// 路径（`kill_core`）已经持有并 `wait()` 那个句柄 → 崩溃监测不能也去 `wait()`，只能短暂持锁
     /// `try_wait` 观察。轮询绝不跨 await 持 `child` 锁（否则 !Send 编译即拒 + 与 `kill_core` 抢锁）。
     ///
-    /// **主动 vs 意外的区分**（本任务最易出 bug 处）：完全靠 `LifecycleGate` 世代。
-    /// `stop`/`restart` 入口必先 `bump_generation()` 再杀核 → 世代一变本监测即 `Retire`，
-    /// 主动杀核的 SIGTERM/SIGKILL 绝不会被误判成崩溃。判据见 [`classify_child_exit`]。
-    pub(super) fn spawn_crash_monitor(self: &Arc<Self>, my_gen: u64) {
+    /// The direct child is tracked by its spawn-bound identity. A request claim
+    /// alone cannot retire that monitor: persistent Stop reservation may fail
+    /// while the same child keeps running. Helper identity remains on its
+    /// existing protocol path and is not promoted to this guarantee.
+    pub(super) fn spawn_crash_monitor(
+        self: &Arc<Self>,
+        my_gen: u64,
+        direct_run_identity: Option<RunIdentity>,
+    ) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             // helper 腿的 pid 身份基线：`(基线取自哪个 pid, 令牌)`。见 [`process_identity`]。
@@ -94,7 +170,9 @@ impl ProxyRuntime {
                 // **pid 探活只回答「这个号码上有进程吗」**，不回答「是不是我那个」⇒ 核死后号码被复用
                 // 时它恒真、崩溃自愈永不触发。故每 `PID_IDENTITY_RECHECK_TICKS` 个 tick 复核一次
                 // 进程身份令牌（[`process_identity`]），换人即判退出。
-                let observation = if me.core_via_helper.load(Ordering::SeqCst) {
+                let observation = if direct_run_identity.is_none()
+                    && me.core_via_helper.load(Ordering::SeqCst)
+                {
                     match me.pid.lock().ok().and_then(|g| *g) {
                         Some(p) => {
                             if !pid_alive(p) {
@@ -177,6 +255,57 @@ impl ProxyRuntime {
                                             );
                                             ChildObservation::Exited
                                         }
+                                        Ok(Ok(ManagedCoreStatus::NativeBirthRunning {
+                                            target,
+                                            created,
+                                            ..
+                                        })) => {
+                                            let same_birth = match me.child.lock() {
+                                                Ok(child) => child.helper_stop_target().is_some_and(|(_, recorded)| recorded == crate::runtime::helper::HelperStopTarget::Birth(target)),
+                                                Err(_) => true,
+                                            };
+                                            let token = helper_identity_token(created);
+                                            let verdict = pid_identity_verdict(
+                                                helper_identity
+                                                    .as_ref()
+                                                    .filter(|(base_pid, _)| *base_pid == p)
+                                                    .map(|(_, t)| t.as_str()),
+                                                token.as_deref(),
+                                            );
+                                            if let Some(token) = token {
+                                                helper_identity = Some((p, token));
+                                            }
+                                            if same_birth && verdict != PidIdentity::Mismatch {
+                                                ChildObservation::Alive
+                                            } else {
+                                                ChildObservation::Exited
+                                            }
+                                        }
+                                        Ok(Ok(ManagedCoreStatus::BirthRunning { target })) => {
+                                            let same_birth = match me.child.lock() {
+                                                Ok(child) => child.helper_stop_target().is_some_and(
+                                                    |(_, recorded)| {
+                                                        recorded
+                                                            == crate::runtime::helper::HelperStopTarget::Birth(target)
+                                                    },
+                                                ),
+                                                Err(_) => true,
+                                            };
+                                            if same_birth {
+                                                ChildObservation::Alive
+                                            } else {
+                                                log::warn!(
+                                                    "崩溃监测：Linux helper exact birth 与本代 custody 失配（pid={p}）"
+                                                );
+                                                ChildObservation::Exited
+                                            }
+                                        }
+                                        Ok(Ok(
+                                            ManagedCoreStatus::BirthStopping { .. }
+                                            | ManagedCoreStatus::BirthUnknown { .. }
+                                            | ManagedCoreStatus::BirthEmpty
+                                            | ManagedCoreStatus::BirthUnidentified,
+                                        )) => ChildObservation::Alive,
                                         Ok(Err(error)) => {
                                             if ticks == 1
                                                 || ticks.is_multiple_of(PID_IDENTITY_RECHECK_TICKS)
@@ -204,7 +333,7 @@ impl ProxyRuntime {
                         // pid 已被清（停核/让位收口）→ 视作退场，非崩溃。
                         None => ChildObservation::Absent,
                     }
-                } else {
+                } else if let Some(expected) = direct_run_identity.as_ref() {
                     let mut guard = match me.child.lock() {
                         Ok(g) => g,
                         Err(e) => {
@@ -212,46 +341,40 @@ impl ProxyRuntime {
                             return;
                         }
                     };
-                    match guard.as_mut() {
-                        None => ChildObservation::Absent,
-                        Some(c) => match c.try_wait() {
-                            Ok(None) => ChildObservation::Alive,
-                            // 已退出（收割）或探活出错 → 保守当已退出。
-                            Ok(Some(_)) | Err(_) => ChildObservation::Exited,
-                        },
-                    }
+                    // Stopping retains the Child but retires this monitor. The
+                    // future supervisor alone will observe and reap that run.
+                    guard.observe_running(expected)
+                } else {
+                    ChildObservation::Absent
                 };
-                // 世代必须在观察**之后**读取：Windows 的进程身份查询可能与另一 worker 上的 stop 并行；
-                // 查询前缓存会把主动停核后的 Exited 配上旧世代，误判 Crash 并自动拉回 TUN。
-                match classify_observed_child_exit(&me.gate, my_gen, observation) {
+                // helper 腿仍在观察**之后**读请求世代，避免 Windows 的同步身份查询与
+                // 主动 stop 并行时误判。直起腿只看它实际持有的 Child 身份：Stop
+                // claim 后若持久 CAS 失败，旧 Child 仍运行，监测也必须继续。
+                let classification = if direct_run_identity.is_some() {
+                    match observation {
+                        ChildObservation::Alive => ExitClassification::KeepWatching,
+                        ChildObservation::Absent => ExitClassification::Retire,
+                        ChildObservation::Exited => ExitClassification::Crash,
+                    }
+                } else {
+                    classify_observed_child_exit(&me.gate, my_gen, observation)
+                };
+                match classification {
                     ExitClassification::KeepWatching => {}
                     // 主动 stop/restart 接管（世代变 / 句柄被取）→ 退场，不触发自愈。
                     ExitClassification::Retire => return,
                     ExitClassification::Crash => {
+                        let Some(event) = me
+                            .reset_crashed_run_state(my_gen, direct_run_identity.as_ref())
+                            .await
+                        else {
+                            return;
+                        };
                         log::warn!(
-                            "检测到 sing-box 意外退出（世代 {my_gen} 未变、非主动停止）→ 触发崩溃自愈"
+                            "检测到 sing-box 意外退出（启动请求世代 {my_gen}，当前请求世代 {}）→ 触发崩溃自愈",
+                            me.gate.generation()
                         );
-                        // C5：核意外退出 → TS 内核接口已随进程消失、其 ifscope 路由自动失效 → 同步复位内存态
-                        // （不发删命令，防对已消失接口误删主表）。自愈重启后由 start_inner 就绪后 reconcile 重建。
-                        me.mesh.exit_route_reset_state().await;
-                        // 核已死 → 停通用网络 watcher；自愈重启后由 start_inner 重起。
-                        me.stop_network_watcher();
-                        // 核已死 → 网络场景命中态回到未知；自愈重启就绪后重新 arm。
-                        me.disarm_network_canary();
-                        if let Ok(mut state) = me.runtime_binding_state.lock() {
-                            *state = RuntimeBindingState::default();
-                        }
-                        // A3：核已死 → STATUS 流失效 → 清 TS 状态末帧缓存（本 relay 亦随后由世代守卫退场）。
-                        me.mesh.clear_ts_status();
-                        // VPN 原生认证挑战同样随核会话失效，禁止自愈后继续提交旧 challengeID。
-                        me.mesh.clear_vpn_status();
-                        // A4：核已死 → 复位登录期出口让位内存态 + 撤 UI。自愈重启后由 start_inner 预置重建。
-                        me.reset_login_fallback_state();
-                        // R2：核已死 → 复位 TS 出口无效直判的翻转对账缓存（新会话首帧须能重新触发
-                        // none→blocked）。**恢复腿的单飞令牌不在此清**——它归在飞任务的 Drop 归还，
-                        // 见 `reset_ts_exit_block_state` 文档。
-                        me.reset_ts_exit_block_state();
-                        me.run_crash_recovery().await;
+                        me.run_crash_recovery(event).await;
                         return; // 自愈成功会起新核 + 新监测；失败/放弃则本核生命周期终结。
                     }
                 }
@@ -259,36 +382,134 @@ impl ProxyRuntime {
         });
     }
 
+    pub(super) async fn reset_crashed_run_state(
+        &self,
+        my_gen: u64,
+        direct_run_identity: Option<&RunIdentity>,
+    ) -> Option<CrashEvent> {
+        // Start/Stop take this gate before changing the physical run and the
+        // shared TS state. Hold it through the route reset's await (including
+        // its eager cancel) and every synchronous cleanup below.
+        let _state_gate = self.mesh.tailscale_state_gate().await;
+        // A replacement may land after try_wait released the child lock and
+        // before this gate is acquired. A failed Stop claim, however, leaves
+        // the same direct Child in place: its monitor must keep observing it.
+        if direct_run_identity.as_ref().is_some_and(|expected| {
+            !self
+                .child
+                .lock()
+                .ok()
+                .is_some_and(|mut slot| slot.running_exit_proven(expected))
+        }) || (direct_run_identity.is_none() && self.gate.generation() != my_gen)
+        {
+            return None;
+        }
+        // Freeze the config while the old run still owns the TS state gate.
+        // A later Start may replace current_config before a deduplicated crash
+        // is replayed; reading it then would turn B's exit into C's request.
+        let config = self.current_config.read().ok().and_then(|g| g.clone());
+        self.mesh.exit_route_reset_state().await;
+        self.stop_network_watcher();
+        self.disarm_network_canary();
+        if let Ok(mut state) = self.runtime_binding_state.lock() {
+            *state = RuntimeBindingState::default();
+        }
+        self.mesh.clear_ts_status();
+        self.mesh.clear_vpn_status();
+        self.reset_login_fallback_state();
+        self.reset_ts_exit_block_state();
+        Some(CrashEvent {
+            generation: my_gen,
+            direct_run_identity: direct_run_identity.cloned(),
+            config,
+        })
+    }
+
+    /// Call only while holding the TS state gate. A direct replay requires the
+    /// same Arc-bound Child slot and a fresh exited observation; a newer Start
+    /// cannot install its Child until this check releases that gate.
+    fn crash_event_still_exited_under_gate(&self, event: &CrashEvent) -> bool {
+        if self.gate.generation() != event.generation {
+            return false;
+        }
+        let Some(expected) = event.direct_run_identity.as_ref() else {
+            // Helper events are classified by their birth generation. They
+            // cannot authorize a cross-generation replay without a run token.
+            return true;
+        };
+        self.child
+            .lock()
+            .ok()
+            .is_some_and(|mut slot| slot.running_exit_proven(expected))
+    }
+
     /// 崩溃自愈执行体：决策全在 [`CrashRecoveryMachine`]（退避 / 上限 / 让位 / 补发），本方法只执行
     /// 「退避 sleep + restart」的 I/O，并把结果反馈回状态机（上游 `attemptAutoRestart` 的 I/O 侧）。
     ///
     /// **绝不无限重启**：`should_auto_restart` 达 `MAX_RESTART_COUNT`(3) → `GiveUp` → 报错并退场；
     /// 60s 冷却窗口内计数不复位（紧密崩溃循环必收敛到 GiveUp）。
-    async fn run_crash_recovery(self: &Arc<Self>) {
-        // 崩溃时用的配置：优先 last-applied（current_config），回落磁盘最新配置。
-        let cfg = self
-            .current_config
-            .read()
-            .ok()
-            .and_then(|g| g.clone())
-            .or_else(|| self.config.current().ok());
-        let Some(cfg) = cfg else {
-            let msg = "sing-box 意外退出，且无可用配置重启 → 放弃自愈".to_string();
-            log::error!("{msg}");
-            self.set_error(&msg, code::PROCESS_EXITED);
-            return;
-        };
-
+    pub(super) async fn run_crash_recovery(self: &Arc<Self>, event: CrashEvent) {
+        let mut cursor = RecoveryCursor::Observed(event);
         loop {
+            if let RecoveryCursor::Observed(event) = &cursor {
+                let _state_gate = self.mesh.tailscale_state_gate().await;
+                if !self.crash_event_still_exited_under_gate(event) {
+                    return;
+                }
+            }
+            let expected_generation = cursor.generation();
+            let Some(cfg) = cursor.config().cloned() else {
+                let _state_gate = self.mesh.tailscale_state_gate().await;
+                if self.gate.generation() != expected_generation {
+                    return;
+                }
+                let msg = "sing-box 意外退出，且无可用配置重启 → 放弃自愈".to_string();
+                log::error!("{msg}");
+                self.set_error_if_current(expected_generation, &msg, code::PROCESS_EXITED);
+                return;
+            };
             let outcome = {
                 let mut m = self.crash_lock();
                 // M-2′-G1：喂 handle_crash **真实的在途腿世代**（此前硬编码 `None`）。缺此，接管会话
                 // （新代核）崩溃永不置 `crash_while_superseded` → 让位腿 replay=false → 新代核崩溃无人接管。
                 // 单锁内读 getter + 决策（seam `drive_crash_decision`），绝不 TOCTOU（两次取锁间被改）。
-                drive_crash_decision(&mut m, monotonic_now_ms(), self.gate.generation())
+                self.gate.with_current_generation(expected_generation, |_| {
+                    let inflight = m.machine.restarting_gen();
+                    let outcome = drive_crash_decision(
+                        &mut m.machine,
+                        monotonic_now_ms(),
+                        expected_generation,
+                    );
+                    if outcome == AutoRestartOutcome::Dedup
+                        && inflight.is_some_and(|gen| gen != expected_generation)
+                    {
+                        // Only a direct Child's Arc-bound identity is a replay
+                        // proof. The helper leg has no equivalent immutable run
+                        // identity yet; it remains fail-closed on replay.
+                        if let RecoveryCursor::Observed(event) = &cursor {
+                            if event.direct_run_identity.is_some() {
+                                m.pending_replay = Some(PendingReplay {
+                                    ticket: m.next_ticket,
+                                    event: event.clone(),
+                                });
+                            }
+                        }
+                    }
+                    if matches!(outcome, AutoRestartOutcome::Attempt { .. }) {
+                        m.next_ticket = m.next_ticket.wrapping_add(1);
+                    }
+                    (outcome, m.next_ticket)
+                })
+            };
+            let Some((outcome, ticket)) = outcome else {
+                return;
             };
             match outcome {
                 AutoRestartOutcome::GiveUp => {
+                    let _state_gate = self.mesh.tailscale_state_gate().await;
+                    if self.gate.generation() != expected_generation {
+                        return;
+                    }
                     // GiveUp 有两种成因，文案必须分开：换核验证窗口下这是**第一次**崩溃，
                     // 报「已达自愈上限（3 次/60s）」是字面为假。这条 message 是诊断载荷，
                     // 会进脱敏日志成为下次排查的起点；UI 只消费结构化码的本地化文案。
@@ -301,7 +522,7 @@ impl ProxyRuntime {
                         "sing-box 反复崩溃，已达自愈上限（3 次/60s）→ 放弃自动重启".to_string()
                     };
                     log::error!("{msg}");
-                    self.set_error(&msg, code::AUTO_RESTART_FAILED);
+                    self.set_error_if_current(expected_generation, &msg, code::AUTO_RESTART_FAILED);
                     return;
                 }
                 // 已有重启腿在途 / 用户已停 → 静默退场。
@@ -313,17 +534,36 @@ impl ProxyRuntime {
                 } => {
                     log::warn!("崩溃自愈：第 {attempt} 次尝试，退避 {backoff:?} 后重启");
                     tokio::time::sleep(backoff).await;
-                    let fate = self
-                        .crash_lock()
-                        .post_backoff(generation, self.gate.generation());
+                    let (fate, replay_event) = {
+                        let _state_gate = self.mesh.tailscale_state_gate().await;
+                        let mut state = self.crash_lock();
+                        let fate = state
+                            .machine
+                            .post_backoff(generation, self.gate.generation());
+                        let replay_event =
+                            if matches!(fate, RestartFate::Superseded { replay: true }) {
+                                state.pending_replay.as_ref().and_then(|pending| {
+                                    (pending.ticket == ticket
+                                        && self.crash_event_still_exited_under_gate(&pending.event))
+                                    .then(|| pending.event.clone())
+                                })
+                            } else {
+                                None
+                            };
+                        if replay_event.is_some() {
+                            state.pending_replay = None;
+                        }
+                        (fate, replay_event)
+                    };
                     match fate {
                         RestartFate::AbortedByUser => {
                             log::info!("崩溃自愈：退避期间用户已主动停止 → 放弃重启");
                             return;
                         }
-                        RestartFate::Superseded { replay } => {
-                            if replay {
+                        RestartFate::Superseded { .. } => {
+                            if let Some(event) = replay_event {
                                 log::info!("崩溃自愈：让位，但接管腿也崩溃 → 补发一次");
+                                cursor = RecoveryCursor::Observed(event);
                                 continue;
                             }
                             log::info!("崩溃自愈：退避期间被更新的 start/stop 接管 → 让位");
@@ -333,32 +573,58 @@ impl ProxyRuntime {
                         // 操作**时自动发生的，此处弹系统授权框 = 凭空索要管理员密码，且崩溃循环里最多
                         // 连弹 MAX_RESTART_COUNT 次。抑制后退回类型化终态，待用户手动启停时经门引导。
                         RestartFate::Start => {
-                            match with_helper_gate_suppressed(self.restart(cfg.clone())).await {
-                                Ok(st) if st.running => {
+                            if let Err(error) = self.admit_legacy_start() {
+                                let _state_gate = self.mesh.tailscale_state_gate().await;
+                                if self.gate.generation() != generation {
+                                    let _ = self.crash_lock().post_start(true);
+                                    return;
+                                }
+                                log::warn!("崩溃自愈准入拒绝: {error}");
+                                let _ = self.crash_lock().post_start_failure(true);
+                                self.report_auto_restart_giveup_if_current(generation, &error);
+                                return;
+                            }
+                            match with_helper_gate_suppressed(
+                                self.restart_guarded_outcome(cfg.clone(), Some(generation)),
+                            )
+                            .await
+                            {
+                                RestartLeg::Finished(Ok(st), Some(_owned)) if st.running => {
                                     let _ = self.crash_lock().post_start(false);
                                     log::info!("崩溃自愈：重启成功（新 pid={}）", st.pid);
                                     return; // 新核已挂新监测。
                                 }
                                 // 就绪等待期被接管 → 让位，不报成功（lastStartSuperseded）。
-                                Ok(_) => {
+                                RestartLeg::Finished(Ok(_), _) | RestartLeg::Superseded => {
                                     let _ = self.crash_lock().post_start(true);
                                     log::info!("崩溃自愈：重启就绪期被接管 → 让位");
                                     return;
                                 }
-                                Err(e) => {
+                                RestartLeg::Finished(Err(e), owned_generation) => {
                                     log::error!("崩溃自愈：重启失败: {e}");
                                     // 不可恢复错误（helper 缺失/用户取消提权门 → 按码；权限/root 残留/
                                     // clash_api 端口占用 → 按 message 关键字）→ 立即终态放弃，不再空耗退避
                                     // （上游 isUnrecoverableRestartError，:6039/:6043）。整个 `e` 而非只
                                     // `e.message`：码腿要读 `e.code`，见 is_unrecoverable_restart_error 文档。
                                     let unrecoverable = is_unrecoverable_restart_error(&e);
-                                    match self.crash_lock().post_start_failure(unrecoverable) {
+                                    let failure =
+                                        { self.crash_lock().post_start_failure(unrecoverable) };
+                                    match failure {
                                         FailureOutcome::GiveUp => {
-                                            self.report_auto_restart_giveup(&e);
+                                            self.report_auto_restart_giveup_if_current(
+                                                owned_generation.unwrap_or(generation),
+                                                &e,
+                                            );
                                             return;
                                         }
                                         // 未达上限 → 自循环再试一次（下一轮 attempt 内按计数退避）。
-                                        FailureOutcome::Retry => continue,
+                                        FailureOutcome::Retry => {
+                                            cursor = RecoveryCursor::Owned {
+                                                generation: owned_generation.unwrap_or(generation),
+                                                config: cfg,
+                                            };
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -397,8 +663,63 @@ impl ProxyRuntime {
         self.set_error(&msg, code::AUTO_RESTART_FAILED);
     }
 
+    /// Commit a terminal error in report -> status -> generation lock order.
+    /// The publication guard keeps later claims behind the synchronous event,
+    /// but inner/report/status guards are gone before event listeners run.
+    fn set_error_if_current(&self, expected_generation: u64, msg: &str, error_code: &str) {
+        let _publication = self.gate.lock_generation_publication();
+        let mut route = self
+            .mesh_route_run
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut status = self
+            .status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let committed = self
+            .gate
+            .with_current_generation(expected_generation, |_| {
+                *route = None;
+                *status = ProxyStatus {
+                    error: Some(msg.to_string()),
+                    error_code: Some(error_code.to_string()),
+                    ..ProxyStatus::default()
+                };
+            })
+            .is_some();
+        drop(status);
+        drop(route);
+        if committed {
+            log::error!("{msg}");
+            match self.error_emitter.get() {
+                Some(emitter) => emitter.emit_proxy_error(msg, error_code),
+                None => {
+                    log::debug!("proxy error emitter 未接线 → 跳过 event:proxyError（状态已落值）")
+                }
+            }
+        }
+    }
+
+    /// An error receipt may be delivered after a later Start claims.
+    pub(super) fn report_auto_restart_giveup_if_current(
+        &self,
+        expected_generation: u64,
+        error: &StartError,
+    ) {
+        if error.code.is_some() {
+            // A more specific error was already emitted by this restart leg;
+            // keep the historical suppression without another status write.
+            if self.gate.generation() == expected_generation {
+                self.report_auto_restart_giveup(error);
+            }
+            return;
+        }
+        let msg = format!("sing-box 崩溃自愈重启失败且达上限 → 放弃：{error}");
+        self.set_error_if_current(expected_generation, &msg, code::AUTO_RESTART_FAILED);
+    }
+
     /// 短暂借出崩溃自愈状态机（决策同步、单语句用完即释；**绝不跨 await 持锁**）。
-    pub(super) fn crash_lock(&self) -> std::sync::MutexGuard<'_, CrashRecoveryMachine> {
+    pub(super) fn crash_lock(&self) -> std::sync::MutexGuard<'_, CrashRecoveryState> {
         self.crash_recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

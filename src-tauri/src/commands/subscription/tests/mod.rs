@@ -34,3 +34,7 @@ mod create_operation_tests;
 /// 放在 `mod wiring_gate` **之后**是刻意的：`production_src()` 截断到 `mod wiring_gate {` 为止，
 /// 本模块里的 `"phase"` / `"failed"` 等字面量因此不在扫描面内，不会把上面那些源码门喂成假绿。
 mod progress_tests;
+
+/// 本地导入命令（桌面与 Android 同一 IPC）的端到端产物：MASQUE / Tailcat 节点、failed 计数、
+/// 证书固定提示与 reality pin 剔除。
+mod local_import_tests;

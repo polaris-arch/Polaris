@@ -583,9 +583,29 @@ fn linux_live_status_read_failure_is_err_not_false() {
     );
 }
 
+/// `Other` 与 **`Android`** 上的活态查询都必须 `Err`（读不到 ≠ 没生效）。
+///
+/// Android 那一格是 `commands::proxy::system_proxy_get_status` 真正会撞上的臂：在
+/// `running_effective_proxy_mode_type` 改读生效值之前，Android 客户端只要存盘值是
+/// `systemProxy`（缺省值就是它）就会一路走到这里。收口之后那条路不再可达，但**这一格返什么**
+/// 仍是那条收口的依据 —— 依据没有钉子就会漂（同 `impl_unsupported_platforms_are_err_not_silent_noop`）。
 #[test]
-fn other_platform_is_err() {
-    assert!(live(ArgvMockRunner::default(), Platform::Other).0.is_err());
+fn unsupported_platforms_are_err() {
+    // 2026-09-06 K13 补 `Platform::Ios`：生产侧同臂（`live_status.rs` 的
+    // `Other | Android | Ios => Err`），而本圈是手写子集、加变体不会自曝。
+    for platform in [Platform::Other, Platform::Android, Platform::Ios] {
+        assert!(
+            live(ArgvMockRunner::default(), platform).0.is_err(),
+            "{platform:?}: 活态查询必须 Err —— 折成「未生效」会让 UI 稳定误亮降级黄灯"
+        );
+    }
+    // 反向对照：有实现的平台上同一条调用必须真的下发命令（否则上面那句「必须 Err」可能只是
+    // 因为整条装配坏了，对任何平台都恒 Err）。
+    let (_result, ops) = live(ArgvMockRunner::default(), Platform::Mac);
+    assert!(
+        ops.runner.ran_arg("-getwebproxy") || ops.runner.ran_arg("-listallnetworkservices"),
+        "有实现的平台必须真的下发 networksetup 读取命令 —— 否则本门的『Err』没有信息量"
+    );
 }
 
 #[test]

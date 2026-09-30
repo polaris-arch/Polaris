@@ -2,7 +2,7 @@
 //!
 //! 迁自 上游 PR #302（Electron），**按 Tauri 2 架构重新落地而非照搬代码**。三处关键差异：
 //!
-//! 1. **武装点：窗口创建时（`main.rs` setup）+ 每次 [`PageLoadEvent::Started`](tauri::webview::PageLoadEvent::Started)，而非 上游的
+//! 1. **武装点：窗口创建时（`lib.rs` setup）+ 每次 [`PageLoadEvent::Started`](tauri::webview::PageLoadEvent::Started)，而非 上游的
 //!    `did-finish-load`**。Tauri 2 的 `PageLoadEvent` 只有 `Started`/`Finished` 两个变体
 //!    （`tauri-runtime-2.11.3/src/webview.rs:83-91` 实证），**没有 did-fail-load 等价物**。更糟的是
 //!    加载失败时三平台行为还不一致（均为 wry 0.55.1 源码实证）：
@@ -369,7 +369,7 @@ pub struct WindowHealth {
     /// 计时器代次：每次 Arm/Clear/Reload/Fatal 递增，到点的计时器代次不符即自行作废
     /// （替代 Electron 侧 `clearTimeout`——无需持有 JoinHandle，也不怕竞态重复取消）。
     epoch: AtomicU64,
-    /// 应用真实 URL（启动时捕获），供 reload / `fatal_retry` 导航回真实应用。
+    /// 应用真实 URL（首次合法主窗装载时捕获），供 reload / `fatal_retry` 导航回真实应用。
     app_url: Mutex<Option<Url>>,
     /// console 转发限频的滑动窗口时间戳。
     console_ts: Mutex<Vec<u64>>,
@@ -417,11 +417,19 @@ impl WindowHealth {
         self.pending_show.swap(false, Ordering::SeqCst)
     }
 
-    /// 记录应用真实 URL（启动时，任何导航发生前）。
-    pub fn set_app_url(&self, url: Url) {
-        if let Ok(mut slot) = self.app_url.lock() {
-            *slot = Some(url);
+    /// 只记录首个可导航的主窗 URL。后续导航（包括外部页面）不能改变恢复目标。
+    pub fn capture_app_url(&self, url: Url) -> bool {
+        if !is_recovery_app_url(&url) {
+            return false;
         }
+        if let Ok(mut slot) = self.app_url.lock() {
+            if slot.is_none() {
+                *slot = Some(url);
+                log::info!("主窗恢复目标 URL 已捕获");
+                return true;
+            }
+        }
+        false
     }
 
     /// mount 门是否武装。
@@ -442,6 +450,15 @@ impl WindowHealth {
     fn app_url(&self) -> Option<Url> {
         self.app_url.lock().ok().and_then(|u| u.clone())
     }
+}
+
+/// Tauri 的 App 页面在打包态使用 `tauri:`（桌面）或 `http(s):`（Android/Windows），
+/// 开发态使用 devUrl 的 `http(s):`。拒绝 about/data/javascript 等非应用文档地址，
+/// 不把它们误记成故障恢复目标；主窗标签及首次写入由调用方/`capture_app_url` 保证。
+fn is_recovery_app_url(url: &Url) -> bool {
+    matches!(url.scheme(), "tauri" | "http" | "https")
+        && !url.cannot_be_a_base()
+        && url.host().is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -568,6 +585,17 @@ pub fn dispatch(app: &AppHandle, event: MountGateEvent) {
     let Some(health) = app.try_state::<WindowHealth>() else {
         return;
     };
+    // Tauri may deliver a very early page-load before the newly built WebView is registered
+    // under "main"; its global callback then cannot see it. A ready IPC proves that the app
+    // document is mounted, so read the now-absolute URL as a second one-time capture path.
+    // This also runs when the debug mount gate is disabled.
+    if event == MountGateEvent::RendererReady && health.app_url().is_none() {
+        if let Some(window) = app.get_webview_window("main") {
+            if let Ok(url) = window.url() {
+                health.capture_app_url(url);
+            }
+        }
+    }
     if !health.gate_enabled() {
         return;
     }
@@ -645,6 +673,7 @@ fn navigate_to_app(app: &AppHandle, health: &WindowHealth) {
             }
         }
         None => {
+            log::warn!("主窗恢复目标 URL 尚未捕获，回退当前文档 reload()");
             let _ = window.reload();
         }
     }

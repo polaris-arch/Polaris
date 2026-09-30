@@ -1,0 +1,56 @@
+{
+  "meshRoutePolicy": {
+    "schemaVersion": 1,
+    "candidateOrder": ["ts-a", "ts-b"],
+    "assignments": [
+      {
+        "cidr": "100.80.0.0/16",
+        "target": {
+          "kind": "owner",
+          "serverId": "ts-a",
+          "identityEpoch": "epoch-a"
+        }
+      },
+      { "cidr": "fd7a:115c:a1e0::/48", "target": { "kind": "reject" } }
+    ],
+    "overrides": [],
+    "migration": { "unknownPublicPool": "reject", "builtinExceptionsVersion": 1 }
+  },
+  "meshRouteState": {
+    "schemaVersion": 1,
+    "localId": "local-test-1",
+    "revision": "18446744073709551614",
+    "identities": [
+      {
+        "serverId": "ts-a",
+        "identityEpoch": "epoch-a",
+        "controlAuthority": "https://control.example.test/path",
+        "selfStableId": "self-a",
+        "bindingState": "bound",
+        "evidenceSource": "status"
+      }
+    ],
+    "observations": [
+      {
+        "ownerRef": { "serverId": "ts-a", "identityEpoch": "epoch-a" },
+        "rawHosts": ["100.80.1.2/32"],
+        "advertisedRoutes": ["100.80.0.0/16"],
+        "source": "status",
+        "lastValidEvidence": "status-frame-1"
+      }
+    ],
+    "reservations": [
+      {
+        "cidr": "100.80.0.0/16",
+        "ownerRef": {
+          "kind": "owner",
+          "serverId": "ts-a",
+          "identityEpoch": "epoch-a"
+        },
+        "origin": "migration"
+      }
+    ],
+    "intent": { "revision": "1", "desiredRun": "stopped" },
+    "identityEffects": []
+  }
+}

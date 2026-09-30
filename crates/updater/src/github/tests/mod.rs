@@ -108,6 +108,10 @@ fn source_repo_constants_are_the_polaris_and_sagernet_repos() {
     // 便携资产前缀是三处（package.yml 产出 / 本模块选包 / verify-packaging.mjs 断言）
     // 共用的命名契约，改它必须三处同改，故在此钉死字面值。
     assert_eq!(PORTABLE_ZIP_PREFIX, "polaris-portable-");
+    // Android APK 的尾缀同理，两处（android.yml 的 `release-apk` job 产出 / 本模块选包）
+    // 共用；下面 `the_ci_asset_name_is_exactly_what_the_selector_picks` 从 workflow 原文
+    // 反向对拍一次，这里只钉本侧的字面值。
+    assert_eq!(ANDROID_APK_SUFFIX, "-android-arm64.apk");
 }
 
 #[test]
@@ -118,6 +122,10 @@ fn platform_and_arch_mapping_from_std_env_consts() {
     );
     assert_eq!(AssetPlatform::from_os("macos"), Some(AssetPlatform::Macos));
     assert_eq!(AssetPlatform::from_os("linux"), Some(AssetPlatform::Linux));
+    assert_eq!(
+        AssetPlatform::from_os("android"),
+        Some(AssetPlatform::Android)
+    );
     assert_eq!(AssetPlatform::from_os("freebsd"), None);
     assert_eq!(AssetArch::from_arch("x86_64"), AssetArch::X64);
     assert_eq!(AssetArch::from_arch("aarch64"), AssetArch::Arm64);
@@ -663,4 +671,312 @@ fn check_app_update_empty_releases_is_no_update() {
     )
     .unwrap();
     assert_eq!(r, AppUpdateCheck::NoUpdate);
+}
+
+/*
+ * ── 「只比版本」那条检查腿（Android 等无安装包目标的平台）────────────────────────────
+ *
+ * 这一组守的缺陷是**结构性静默**：`AssetPlatform::from_os("android")` 返 `None`，
+ * 而 `check_app_update` 的资产选择在这一档恒 `None` ⇒ 整条检查恒答「已是最新」。
+ * 命令层此前更早一步就 `return hasUpdate:false`，连请求都不发。
+ * 下面第一条正是那个缺陷的直接对照：**同一份 release，有资产的平台报有更新，Android 也必须报有更新**。
+ */
+
+/// Android 这一档的 release JSON：本仓今天不出 APK 资产（`.github/workflows/android.yml`），
+/// 故样本里**故意一个 Android 能用的资产都没有**。
+fn desktop_only_release_json() -> String {
+    r#"[{"tag_name":"v9.9.9","name":"Polaris 9.9.9","body":"notes","prerelease":false,
+          "published_at":"2026-09-01T00:00:00Z","assets":[
+            {"name":"Polaris-9.9.9-win-setup.exe","browser_download_url":"https://x/win","size":7}]}]"#
+        .to_string()
+}
+
+#[test]
+fn check_app_update_release_only_reports_update_without_any_asset() {
+    let json = desktop_only_release_json();
+
+    // 反向对照：拿「要选资产」的那条腿去问 Android 那一档会得到什么 —— 没有 apk 资产 ⇒ 无更新。
+    // （命令层此前更早一步就早退，症状相同：结构性恒「已是最新」。）
+    let via_assets = check_app_update(
+        &json,
+        "1.0.0",
+        false,
+        None,
+        AssetPlatform::Macos,
+        AssetArch::Arm64,
+        false,
+    )
+    .unwrap();
+    assert!(
+        matches!(via_assets, AppUpdateCheck::NoUpdate),
+        "对照塌了：这份样本本该选不出 mac 资产"
+    );
+
+    // 正题：只比版本那条腿必须如实报「有更新」。
+    let r = check_app_update_release_only(&json, "1.0.0", false, None).unwrap();
+    let AppUpdateCheck::Available(info) = r else {
+        panic!("有比当前新的 release，却报了「已是最新」——Android 上的更新检查恒假就是这个形态");
+    };
+    assert_eq!(info.version, "v9.9.9");
+    assert_eq!(info.title, "Polaris 9.9.9");
+    assert_eq!(info.release_notes, "notes");
+    assert_eq!(info.published_at, "2026-09-01T00:00:00Z");
+    assert!(!info.is_prerelease);
+}
+
+#[test]
+fn check_app_update_release_only_has_no_asset_fields() {
+    // 三个资产字段必须**如实为空**：这一档没有选中的资产，编一个 URL 出来会让下载腿
+    // 去下一个不存在的东西。用户出口是发布页链接。
+    let r =
+        check_app_update_release_only(&desktop_only_release_json(), "1.0.0", false, None).unwrap();
+    let AppUpdateCheck::Available(info) = r else {
+        panic!("应有更新");
+    };
+    assert_eq!(info.download_url, "");
+    assert_eq!(info.file_name, "");
+    assert_eq!(info.file_size, 0);
+    assert_eq!(info.sha256, None);
+}
+
+#[test]
+fn check_app_update_release_only_shares_the_first_four_gates() {
+    let json = desktop_only_release_json();
+    // ① 已是最新 / 更旧 ⇒ 无更新（不是「有资产就报」）。
+    assert!(matches!(
+        check_app_update_release_only(&json, "9.9.9", false, None).unwrap(),
+        AppUpdateCheck::NoUpdate
+    ));
+    assert!(matches!(
+        check_app_update_release_only(&json, "10.0.0", false, None).unwrap(),
+        AppUpdateCheck::NoUpdate
+    ));
+    // ② 用户跳过了这个版本 ⇒ 无更新（比较侧同样走 strip_v）。
+    assert!(matches!(
+        check_app_update_release_only(&json, "1.0.0", false, Some("9.9.9")).unwrap(),
+        AppUpdateCheck::NoUpdate
+    ));
+    // ③ 通道过滤：预发布版在正式通道上不算候选，打开通道才算。
+    let pre = r#"[{"tag_name":"v9.9.9-beta.1","prerelease":true,
+          "published_at":"2026-09-01T00:00:00Z","assets":[]}]"#;
+    assert!(matches!(
+        check_app_update_release_only(pre, "1.0.0", false, None).unwrap(),
+        AppUpdateCheck::NoUpdate
+    ));
+    assert!(matches!(
+        check_app_update_release_only(pre, "1.0.0", true, None).unwrap(),
+        AppUpdateCheck::Available(_)
+    ));
+    // ④ JSON 坏了 ⇒ 报错，**不是**「已是最新」（把解析失败折成无更新是本模块最不能犯的错）。
+    assert!(check_app_update_release_only("not json", "1.0.0", false, None).is_err());
+}
+
+// ── Android 资产选择（2026-09-13：APK 开始作为 release 资产发布）────────────────
+
+/// 一个**同时带桌面与 Android 资产**的 release 资产集。
+///
+/// APK 名取的是 `.github/workflows/android.yml` 的 `release-apk` job 真会产出的那个形态
+/// （`polaris-<版本>-android-arm64.apk`），不是理想化名字 —— 同一条纪律见
+/// [`release_assets`] 的 🔴：在虚构输入上绿的选包测试挡不住真产物上的错配。
+fn release_assets_with_apk() -> Vec<GithubAsset> {
+    let mut assets = release_assets();
+    assets.push(asset("polaris-0.2.0-android-arm64.apk", 210));
+    assets
+}
+
+/// Android 只在 **arm64** 上有包；`loose_form` 在这一态上不参与。
+///
+/// 变异探针（每条各覆盖一条独立逃逸路径）：
+///  - 去掉 `arch != Arm64` 那道闸 ⇒ ③ 转红（x86_64 模拟器会拿到 arm64 包）；
+///  - 把 `ends_with(ANDROID_APK_SUFFIX)` 换成 `ends_with(".apk")` ⇒ ④ 转红（拿到别的架构包）；
+///  - 给 Android 分支补任何一级回落（`.or_else(|| assets.first())`）⇒ ⑤ 转红。
+#[test]
+fn update_asset_android_picks_the_arm64_apk_and_nothing_else() {
+    let assets = release_assets_with_apk();
+
+    // ① arm64：拿到 APK。
+    let picked =
+        find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::Arm64, false)
+            .expect("arm64 Android 必须选得到 APK");
+    assert_eq!(picked.name, "polaris-0.2.0-android-arm64.apk");
+
+    // ② `loose_form` 不参与：Android 应用只有一种形态（由系统包管理器装的）。
+    let loose = find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::Arm64, true)
+        .expect("loose_form 不该改变 Android 的结果");
+    assert_eq!(loose.name, picked.name);
+
+    // ③ 非 arm64（x86_64 模拟器）：**无包**，且绝不回落到 arm64 那个包。
+    assert!(
+        find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::X64, false)
+            .is_none(),
+        "x86_64 Android 上选出了包 —— 本仓只交叉编译 aarch64，发给模拟器的必然是装不上的东西"
+    );
+    assert!(
+        find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::Other, false)
+            .is_none()
+    );
+
+    // ④ 另一个架构的 APK **不许**被 arm64 选中（后缀判据不是「是个 apk 就行」）。
+    let wrong_arch = vec![asset("polaris-0.2.0-android-x86_64.apk", 200)];
+    assert!(
+        find_suitable_update_asset(&wrong_arch, AssetPlatform::Android, AssetArch::Arm64, false)
+            .is_none(),
+        "按 `.apk` 而不是按后缀契约选包 ⇒ 会把 x86_64 包发给真机"
+    );
+
+    // ⑤ 一个 APK 都没有（2026-09-13 之前的每一个 release 都长这样）：无包，**不回落**到
+    //    桌面那些资产。这一档不是「没有更新」，而是「有更新但没有你能装的包」——
+    //    分辨这两件事是 `update_check` 的 Android 腿再问一次
+    //    `check_app_update_release_only` 的全部理由。
+    assert!(
+        find_suitable_update_asset(
+            &release_assets(),
+            AssetPlatform::Android,
+            AssetArch::Arm64,
+            false
+        )
+        .is_none(),
+        "没有 APK 却选出了东西 —— 那会让下载腿去下一个 .exe/.dmg"
+    );
+}
+
+/// Android 上**没有可换的内核**：核是随 APK 打进去的进程内 `libbox.aar`。
+///
+/// 正面对照在同一条里：桌面三态仍然选得出来 —— 否则「Android 返 None」这句话可能只是因为
+/// `find_suitable_singbox_asset` 整个塌了（那时本条拿一个坏掉的判据冒充一条成立的结论）。
+#[test]
+fn singbox_asset_is_always_none_on_android_even_when_the_release_has_one() {
+    // SagerNet 确实发 android 构建；本仓一个字节都不消费它（消费了就是去替换一个不存在的文件）。
+    let assets = vec![
+        asset("sing-box-1.14.0-android-arm64.tar.gz", 10),
+        asset("sing-box-1.14.0-linux-arm64.tar.gz", 11),
+    ];
+    assert!(
+        find_suitable_singbox_asset(&assets, AssetPlatform::Android, AssetArch::Arm64).is_none(),
+        "Android 选出了内核资产 —— 那条腿的落点是一个可替换的可执行文件，这个形态下不存在"
+    );
+    // 正面对照：同一份资产集在 Linux 上选得出来。
+    assert!(
+        find_suitable_singbox_asset(&assets, AssetPlatform::Linux, AssetArch::Arm64).is_some(),
+        "对照塌了：这份样本本该能选出 linux/arm64 内核"
+    );
+}
+
+/// 🔴 **跨文件命名契约的对拍**：CI 真会产出的那个资产名，必须正好是选包器会选中的那个。
+///
+/// # 为什么必须是这条形态（而不是两边各钉一个字面量）
+///
+/// 两端各写一份字面量、各自有测试，是本仓反复吃过亏的形态：改一边、另一边的测试照绿，
+/// 而故障是**静默**的 —— 选包器选不中 ⇒ `AppUpdateCheck::NoUpdate` ⇒ Android 上「检查更新」
+/// 永远回答「已是最新」，一句错误都不报。故这里把 workflow 的**原文**当输入：
+/// 取出那一行 `asset_name=…`，把 `${version}` 展开成一个真实版本号，喂进真的选包器。
+///
+/// 取材自检（`assert!(line.contains(...))`）承重：workflow 改形状 ⇒ 取不到那一行 ⇒ 当场 panic，
+/// 而不是在一个空串上恒真。
+#[test]
+fn the_ci_asset_name_is_exactly_what_the_selector_picks() {
+    const WORKFLOW: &str = ".github/workflows/android.yml";
+    let yaml = polaris_source_probe::expect_marker(
+        polaris_source_probe::repo_file!(WORKFLOW),
+        WORKFLOW,
+        "name: Android",
+    );
+
+    // 产出侧：`release-apk` job 里那一行改名。整行取出来，不做模糊匹配。
+    let line = yaml
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("asset_name="))
+        .unwrap_or_else(|| {
+            panic!(
+                "{WORKFLOW}：找不到 `asset_name=` 那一行 —— 资产名的产出侧换形状了，\
+                 本条对拍的取材面塌了（而塌了之后 Android 的更新检查会静默恒假）。"
+            )
+        });
+    assert_eq!(
+        line, "asset_name=\"polaris-${version}-android-arm64.apk\"",
+        "{WORKFLOW}：资产名的产出侧变了。它与 `ANDROID_APK_SUFFIX` 是同一条契约的两端，\
+         漂一个字符的后果不是报错，是 Android 上永远查不到更新。"
+    );
+
+    // 把它展开成一个真实文件名（CI 那一行的 `${version}` 来自包里的 versionName）。
+    let name = line
+        .trim_start_matches("asset_name=")
+        .trim_matches('"')
+        .replace("${version}", "9.9.9");
+    assert_eq!(name, "polaris-9.9.9-android-arm64.apk");
+
+    // 消费侧：真的选包器必须选中它。
+    let assets = vec![asset(&name, 210)];
+    let picked =
+        find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::Arm64, false)
+            .unwrap_or_else(|| {
+                panic!("选包器选不中 CI 真会产出的那个资产名 `{name}` —— 命名契约两端已经漂了")
+            });
+    assert_eq!(picked.name, name);
+
+    // 反向对照：把契约后缀改掉一个字符，选包器就该选不中（证明上面那条不是恒真）。
+    let drifted = vec![asset(&name.replace("arm64", "aarch64"), 210)];
+    assert!(
+        find_suitable_update_asset(&drifted, AssetPlatform::Android, AssetArch::Arm64, false)
+            .is_none(),
+        "对照塌了：选包器对任何 .apk 都点头，那这条对拍证明不了什么"
+    );
+}
+
+/// 全链路：Android 上「有新版本且有 APK」走资产腿，「有新版本但没 APK」由只比版本那条腿兜。
+///
+/// 这两档合起来就是 `update_check` 的 Android 分支：先问资产腿，`NoUpdate` 时再问一次
+/// 只比版本那条。两条腿共用前四道闸，故「它说有、这条说没有」只可能是资产那一步的差别。
+#[test]
+fn check_app_update_android_end_to_end_with_and_without_an_apk_asset() {
+    let with_apk = r#"[{"tag_name":"v9.9.9","name":"Polaris 9.9.9","body":"notes","prerelease":false,
+          "published_at":"2026-09-01T00:00:00Z","assets":[
+            {"name":"polaris-9.9.9-android-arm64.apk","browser_download_url":"https://x/apk",
+             "size":210,"digest":"sha256:c3d4e5f6a7b8091a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819a"}]}]"#;
+    let r = check_app_update(
+        with_apk,
+        "1.0.0",
+        false,
+        None,
+        AssetPlatform::Android,
+        AssetArch::Arm64,
+        false,
+    )
+    .unwrap();
+    let AppUpdateCheck::Available(info) = r else {
+        panic!("有 APK 资产却报了「已是最新」");
+    };
+    assert_eq!(info.file_name, "polaris-9.9.9-android-arm64.apk");
+    assert_eq!(info.download_url, "https://x/apk");
+    assert_eq!(info.file_size, 210);
+    // 摘要必须一路穿到底：下载腿的强校验判据就是它（没有它这一档只剩 Content-Length）。
+    assert_eq!(
+        info.sha256.as_deref(),
+        Some("c3d4e5f6a7b8091a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819a")
+    );
+
+    // 没有 APK 的那一档（2026-09-13 之前的每一个 release）：资产腿说「没有」，
+    // 只比版本那条腿说「有，但三个资产字段为空」——前端据此只画「打开发布页」，不画「下载」。
+    let json = desktop_only_release_json();
+    assert!(matches!(
+        check_app_update(
+            &json,
+            "1.0.0",
+            false,
+            None,
+            AssetPlatform::Android,
+            AssetArch::Arm64,
+            false
+        )
+        .unwrap(),
+        AppUpdateCheck::NoUpdate
+    ));
+    let AppUpdateCheck::Available(fallback) =
+        check_app_update_release_only(&json, "1.0.0", false, None).unwrap()
+    else {
+        panic!("兜底腿也说没有 —— 那用户会被告知「已是最新」，而新版本确实存在");
+    };
+    assert_eq!(fallback.version, "v9.9.9");
+    assert_eq!(fallback.download_url, "");
 }

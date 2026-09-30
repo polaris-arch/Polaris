@@ -21,13 +21,16 @@ use tokio::sync::MutexGuard as AsyncMutexGuard;
 
 use polaris_config_engine::builder::helpers::ServerLike;
 use polaris_config_engine::builder::hotswitch::{
-    can_skip_restart_for_added_unreferenced, plan_hot_switch, HotSwitchDeps, HotSwitchPut,
-    RuleTargetEntry,
+    can_skip_restart_for_added_unreferenced, plan_hot_switch, resolve_global_exit_tag,
+    HotSwitchDeps, HotSwitchPut, RuleTargetEntry,
+};
+use polaris_config_engine::builder::mesh_mode::{
+    selected_mode, DASHBOARD_SELECTOR, MESH_DIRECT, NORMAL,
 };
 use polaris_config_engine::builder::orchestration::{config_generation_norm, stable_stringify};
 use polaris_config_engine::builder::outbounds::{build_outbounds, OutboundsDeps};
 use polaris_config_engine::builder::{build_id_to_tag_map, GenerateConfigDeps};
-use polaris_config_engine::singbox::SingBoxConfig;
+use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::dns_constants::{
     is_block_selection, is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
@@ -35,7 +38,8 @@ use polaris_config_engine::user_config::dns_constants::{
 use polaris_config_engine::user_config::rule::RuleAction;
 use polaris_config_engine::user_config::ProxyModeType;
 use polaris_core_supervisor::LifecycleKind;
-#[cfg(test)]
+use polaris_helper_proto::Platform;
+use polaris_stats_engine::RuleIdentity;
 use polaris_switch_engine::ConnectionSnapshot;
 use polaris_switch_engine::{
     decide, DecisionInput, HotSwitchOutcome, ManagementApi, ManagementError, SwitchDecision,
@@ -43,7 +47,7 @@ use polaris_switch_engine::{
 };
 
 use crate::commands::speedtest::current_server_fingerprints;
-use crate::runtime::management_api::{GroupSelection, GrpcManagementApi};
+use crate::runtime::management_api::{ClashModeStatus, GroupSelection, GrpcManagementApi};
 use crate::runtime::node_fingerprints;
 
 use super::network_settle::NetworkSettleGuard;
@@ -117,10 +121,16 @@ pub(super) fn selected_server_present(config: &Value) -> bool {
 /// 停核清空（上游 :1386-1388）。
 #[derive(Debug, Clone, Default)]
 pub(super) struct SwitchSnapshot {
+    #[cfg(any(all(target_os = "android", debug_assertions), test))]
+    pub(super) android_probe_input: Option<super::android_probe_loan::AndroidProbeStartBinding>,
+    pub(super) mesh_mode_ready: bool,
+    pub(super) dashboard_mode_selector: bool,
     /// id → outbound tag（上游 `currentIdToTagMap`，:3480 = `buildIdToTagMap(config.servers)`）。
     pub(super) id_to_tag: BTreeMap<String, String>,
     /// ruleKey → rule-sel 元数据（上游 `currentRuleTargetMap`，:3607）。
     pub(super) rule_target: BTreeMap<String, RuleTargetEntry>,
+    /// 起核时真实 route 产物可证明的 raw 条件→用户名称；热切/暂存不改写。
+    pub(super) named_rule_by_raw: BTreeMap<String, RuleIdentity>,
     /// id → **全维**指纹（[`modified_fingerprint`]，上游 `runningServersFingerprint`，:672）。
     ///
     /// 两个消费面，同一个问题的两种问法：
@@ -147,6 +157,17 @@ pub(super) struct SwitchSnapshot {
     /// 与 `running` 同生共死（起核就绪时随本快照置、停核清）→「有池端口 ⟺ 运行核有池」；`server_speed_test`
     /// 据此裁定走「主核 K 槽分波测速」还是回退「仅活跃出口」。`poolPorts[k] ↔ probe-selector-k`（1:1 槽绑定）。
     pub(super) probe_pool_ports: Vec<u16>,
+    /// 运行核的专用出口探针端口（`probe-proxy-in`，固定走 `proxy-selector`）。`None` = 分配失败未注入。
+    ///
+    /// Android 上没有 `mixed-in`，解锁检测 / 出口 IP / 测速回退 / warm RTT 四条「经本机代理出网」的腿
+    /// 改走它（见 [`ProxyRuntime::local_http_proxy`](super::ProxyRuntime::local_http_proxy)）。与本快照同生共死，
+    /// 故「有端口 ⟺ 运行核里真有这个入站」。
+    pub(super) probe_proxy_port: Option<u16>,
+    /// 运行核回环探针/更新入站的一次性凭据（本次起核 CSPRNG 生成；桌面恒 `None`）。
+    ///
+    /// **只存内存**：不进 [`ProxyStatus`](super::ProxyStatus)（那个结构体序列化给渲染端、也会被整份打进日志），
+    /// `Debug` 经 `InboundUser` 自身抹掉口令。停核随快照一起清掉。
+    pub(super) loopback_auth: Option<InboundUser>,
 }
 
 /// `switch_mode` 的结果（供 command 层 / 测试断言；上游 switchMode 返 void，此处显式化以便可测）。
@@ -225,6 +246,11 @@ impl RuntimeSelectionApi for GrpcManagementApi {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestPutSink {
+    pub(super) mode: Mutex<Option<String>>,
+    pub(super) mode_noop: AtomicBool,
+    pub(super) on_mode: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub(super) operations: Mutex<Vec<String>>,
+    pub(super) follow_puts: AtomicBool,
     /// 全部 PUT 的调用序（含失败那几次 —— 重试腿的行为正是靠它断言的）。
     pub(super) calls: Mutex<Vec<(String, String)>>,
     /// 前 N 次 PUT 返回失败（模拟「管理 API 刚起还没接上」），其后成功。
@@ -247,11 +273,63 @@ pub(crate) struct TestPutSink {
     pub(super) on_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 在运行期 group 读回边界制造 Full restart claim 或更新意图。
     pub(super) on_groups: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 在 mode 状态读回边界抢占，覆盖 Get → Set 之间的检查点。
+    pub(super) on_mode_status: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Keep the plan's management channel pinned and reject each new RPC if stop/start has
+/// replaced the core while an earlier RPC was awaiting a response.
+struct GenerationManagementApi<'a> {
+    runtime: &'a ProxyRuntime,
+    api: &'a dyn ManagementApi,
+    generation: u64,
+    intent_generation: u64,
+}
+
+#[async_trait::async_trait]
+impl ManagementApi for GenerationManagementApi<'_> {
+    async fn select_outbound(
+        &self,
+        selector_tag: &str,
+        member_tag: &str,
+    ) -> Result<(), ManagementError> {
+        if !self
+            .runtime
+            .selector_operation_is_current(self.generation, self.intent_generation)
+        {
+            return Err(ManagementError::NotReady);
+        }
+        self.api.select_outbound(selector_tag, member_tag).await
+    }
+
+    async fn close_connection(&self, id: &str) -> Result<(), ManagementError> {
+        if !self
+            .runtime
+            .selector_operation_is_current(self.generation, self.intent_generation)
+        {
+            return Err(ManagementError::NotReady);
+        }
+        self.api.close_connection(id).await
+    }
+
+    async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError> {
+        if !self
+            .runtime
+            .selector_operation_is_current(self.generation, self.intent_generation)
+        {
+            return Err(ManagementError::NotReady);
+        }
+        self.api.first_connection_snapshot().await
+    }
 }
 
 #[cfg(test)]
 impl TestPutSink {
     fn put(&self, selector_tag: &str, member_tag: &str) -> Result<(), String> {
+        self.operations
+            .lock()
+            .unwrap()
+            .push(format!("selector:{selector_tag}:{member_tag}"));
         if let Some(probe) = self.invalidation_probe.lock().unwrap().as_ref() {
             let n = probe.lock().unwrap().len();
             self.observed_invalidations.lock().unwrap().push(n);
@@ -271,6 +349,13 @@ impl TestPutSink {
             self.fail_first.fetch_sub(1, Ordering::SeqCst);
             return Err("单测注入：PUT 失败（管理 API 未就绪）".into());
         }
+        if self.follow_puts.load(Ordering::SeqCst) {
+            if let Some(groups) = self.groups.lock().unwrap().as_mut() {
+                if let Some(group) = groups.iter_mut().find(|g| g.tag == selector_tag) {
+                    group.selected = member_tag.into();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -285,6 +370,20 @@ impl TestPutSink {
             callback();
         }
         self.groups.lock().unwrap().clone()
+    }
+
+    fn clash_mode_status(&self) -> Option<ClashModeStatus> {
+        if let Some(callback) = self.on_mode_status.lock().unwrap().take() {
+            callback();
+        }
+        self.mode
+            .lock()
+            .ok()
+            .and_then(|mode| mode.clone())
+            .map(|current_mode| ClashModeStatus {
+                mode_list: vec![NORMAL.into(), MESH_DIRECT.into()],
+                current_mode,
+            })
     }
 }
 
@@ -525,6 +624,239 @@ pub(super) fn attest_runtime_selection(
 }
 
 impl ProxyRuntime {
+    async fn clash_mode_status(&self) -> Option<ClashModeStatus> {
+        #[cfg(test)]
+        if let Some(sink) = self
+            .management_api_stub
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(Arc::clone))
+        {
+            return sink.clash_mode_status();
+        }
+        self.management_api().await.clash_mode_status().await.ok()
+    }
+
+    pub(super) async fn set_clash_mode_strict(
+        &self,
+        generation: u64,
+        intent_generation: Option<u64>,
+        mode: &str,
+    ) -> bool {
+        let is_current = || {
+            intent_generation.map_or_else(
+                || self.gate.generation() == generation,
+                |intent| self.selector_operation_is_current(generation, intent),
+            )
+        };
+        if !is_current() {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(sink) = self
+            .management_api_stub
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(Arc::clone))
+        {
+            let Some(before) = sink.clash_mode_status() else {
+                return false;
+            };
+            if before.mode_list.len() != 2
+                || ![NORMAL, MESH_DIRECT]
+                    .iter()
+                    .all(|want| before.mode_list.iter().any(|name| name == want))
+                || !before.mode_list.iter().any(|name| name == mode)
+            {
+                return false;
+            }
+            if !is_current() {
+                return false;
+            }
+            if before.current_mode == mode {
+                return true;
+            }
+            sink.operations.lock().unwrap().push(format!("mode:{mode}"));
+            if !sink.mode_noop.load(Ordering::SeqCst) {
+                *sink.mode.lock().unwrap() = Some(mode.into());
+            }
+            if let Some(callback) = sink.on_mode.lock().unwrap().take() {
+                callback();
+            }
+            if !is_current() {
+                return false;
+            }
+            return sink
+                .clash_mode_status()
+                .is_some_and(|s| s.current_mode == mode)
+                && is_current();
+        }
+        // Keep one management client/channel for all three legs, and recheck the owner
+        // after each await. A tonic channel can reconnect to the same port: these local
+        // checks reject subsequent RPCs and stale receipts, but cannot revoke a single
+        // RPC already in flight when another process takes over that port.
+        let api = self.management_api().await;
+        if !is_current() {
+            return false;
+        }
+        let Ok(before) = api.clash_mode_status().await else {
+            return false;
+        };
+        if !is_current() {
+            return false;
+        }
+        if before.mode_list.len() != 2
+            || ![NORMAL, MESH_DIRECT]
+                .iter()
+                .all(|want| before.mode_list.iter().any(|candidate| candidate == want))
+            || !before.mode_list.iter().any(|candidate| candidate == mode)
+        {
+            return false;
+        }
+        if !is_current() {
+            return false;
+        }
+        if before.current_mode == mode {
+            return true;
+        }
+        if api.set_clash_mode(mode).await.is_err() {
+            return false;
+        }
+        if !is_current() {
+            return false;
+        }
+        api.clash_mode_status()
+            .await
+            .is_ok_and(|s| s.current_mode == mode)
+            && is_current()
+    }
+
+    async fn rollback_selector_puts(
+        &self,
+        plan: &polaris_config_engine::builder::hotswitch::HotSwitchPlan,
+        generation: u64,
+    ) {
+        #[cfg(test)]
+        if let Some(sink) = self
+            .management_api_stub
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(Arc::clone))
+        {
+            for put in plan.puts.iter().rev() {
+                if self.gate.generation() != generation {
+                    return;
+                }
+                if let Some(old) = put.old_member_tag.as_deref() {
+                    let _ = sink.put(&put.selector_tag, old);
+                }
+            }
+            return;
+        }
+        let api = self.management_api().await;
+        for put in plan.puts.iter().rev() {
+            if self.gate.generation() != generation {
+                return;
+            }
+            if let Some(old) = put.old_member_tag.as_deref() {
+                let _ = api.select_outbound(&put.selector_tag, old).await;
+            }
+        }
+    }
+
+    /// Roll back a superseded transaction in an order that never exposes a split-only
+    /// Tailscale endpoint under the normal public policy.
+    pub(super) async fn rollback_mode_transition(
+        &self,
+        plan: &polaris_config_engine::builder::hotswitch::HotSwitchPlan,
+        old_mode: &str,
+        generation: u64,
+    ) {
+        if old_mode == MESH_DIRECT {
+            let _ = self.set_clash_mode_strict(generation, None, old_mode).await;
+            self.rollback_selector_puts(plan, generation).await;
+        } else {
+            self.rollback_selector_puts(plan, generation).await;
+            let _ = self.set_clash_mode_strict(generation, None, old_mode).await;
+        }
+    }
+
+    /// The current R snapshot can lag a superseded mode RPC. Verify the native mode and the
+    /// dashboard's separate exit selector before any new intent, including an ordinary-only
+    /// switch or an unchanged selection, is allowed to claim success.
+    pub(super) async fn mesh_live_state_matches_current(&self, generation: u64) -> bool {
+        if self.gate.generation() != generation {
+            return false;
+        }
+        let running = self
+            .current_config
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .and_then(|raw| serde_json::from_value::<UserConfig>(raw).ok());
+        let Some(running) = running else {
+            return false;
+        };
+        self.mesh_live_state_matches_config(&running, generation)
+            .await
+    }
+
+    async fn mesh_live_state_matches_config(&self, expected: &UserConfig, generation: u64) -> bool {
+        if self.gate.generation() != generation {
+            return false;
+        }
+        let snapshot = self
+            .switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(snapshot) = snapshot else {
+            return false;
+        };
+        if !snapshot.mesh_mode_ready {
+            return true;
+        }
+        let expected_mode = selected_mode(expected);
+        let status = self.clash_mode_status().await;
+        if self.gate.generation() != generation {
+            return false;
+        }
+        if !status.is_some_and(|status| {
+            status.current_mode == expected_mode
+                && status.mode_list.len() == 2
+                && [NORMAL, MESH_DIRECT]
+                    .iter()
+                    .all(|mode| status.mode_list.iter().any(|name| name == mode))
+        }) {
+            return false;
+        }
+        let Some(expected_proxy) = resolve_global_exit_tag(
+            expected.selected_server_id.as_deref(),
+            Some(&snapshot.id_to_tag),
+        ) else {
+            return false;
+        };
+        let groups = self.read_selector_groups().await;
+        if self.gate.generation() != generation {
+            return false;
+        }
+        groups.is_some_and(|groups| {
+            let proxy_matches = groups
+                .iter()
+                .any(|group| group.tag == PROXY_SELECTOR_TAG && group.selected == expected_proxy);
+            let dashboard_matches = !snapshot.dashboard_mode_selector
+                || groups.iter().any(|group| {
+                    group.tag == DASHBOARD_SELECTOR
+                        && group.selected
+                            == if expected_mode == MESH_DIRECT {
+                                DIRECT_TAG
+                            } else {
+                                PROXY_SELECTOR_TAG
+                            }
+                });
+            proxy_matches && dashboard_matches
+        })
+    }
     /// 起核时刻建热切换基准快照（上游 在 generateSingBoxConfig / startInternal 内回填三个 `this.*`）。
     ///
     /// 三份基准各自的真值来源（**逐条对齐 上游，不自创**）：
@@ -571,8 +903,17 @@ impl ProxyRuntime {
         // ── rule-sel 映射（重算 + live 过滤）──
         // OutboundsDeps 逐字段镜像 config-engine `generate.rs:208-219`；漏一个字段就可能算出与运行核
         // 不同的 selector 集合（→ 被 live 过滤兜住，退化为「该规则不热切」而非 PUT 到错的 selector）。
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]），与被镜像的那份
+        // （`config-engine/builder/generate.rs` 的 `system_interface_available`）逐字同源：
+        // 两侧算出不同的 selector 集合时，热切 PUT 的目标就与运行核里真实存在的 tag 对不上。
+        // 平台经 `Platform::parse(&deps.platform)` 过桥 —— 用的必须是**同一个** `deps.platform`
+        // 串，换成 `self.helper.platform()` 就又是两个可能漂移的真值源。
+        // 今天零行为差（合取项 `mesh_system_supported_on_platform` 是 mac/linux 允许清单，
+        // Android 不在其中），接上是为了不留需要人工复核的例外。
         let system_interface_available = matches!(
-            user_config.proxy_mode_type,
+            user_config
+                .proxy_mode_type
+                .effective_on(Platform::parse(&deps.platform)),
             polaris_config_engine::user_config::ProxyModeType::Tun
         )
             && polaris_config_engine::builder::endpoint_routes::mesh_system_supported_on_platform(
@@ -623,13 +964,35 @@ impl ProxyRuntime {
             }
         };
 
+        let named_rule_by_raw = super::rule_names::build_named_rule_snapshot(
+            user_config,
+            singbox_config,
+            deps,
+            &id_to_tag,
+        );
         SwitchSnapshot {
+            #[cfg(any(all(target_os = "android", debug_assertions), test))]
+            android_probe_input: None,
+            mesh_mode_ready: singbox_config
+                .experimental
+                .as_ref()
+                .and_then(|x| x.clash_api.as_ref())
+                .is_some(),
+            dashboard_mode_selector: singbox_config
+                .outbounds
+                .iter()
+                .any(|outbound| outbound.tag == DASHBOARD_SELECTOR),
             id_to_tag,
             rule_target,
+            named_rule_by_raw,
             fingerprints,
             dirty_fingerprints,
             // §15：与运行核 config 同源（deps.probe_pool_ports 正是本次 generate 注入的池端口）→ 快照即池真值。
             probe_pool_ports: deps.probe_pool_ports.clone(),
+            // 同源同刻：本次 generate 实际注入的探针端口与凭据（凭据是否被发射由生成侧按平台决定，
+            // 桌面上 `deps.loopback_auth` 本就是 `None`）。
+            probe_proxy_port: deps.probe_proxy_port,
+            loopback_auth: deps.loopback_auth.clone(),
         }
     }
 
@@ -739,7 +1102,9 @@ impl ProxyRuntime {
             Some(LifecycleKind::Start | LifecycleKind::Restart)
                 if matches!(outcome, Some(SwitchOutcome::Restarting)) =>
             {
-                Some(SwitchOutcome::Pending)
+                // The scheduled restart has claimed the core. Keep its typed receipt
+                // even if the generation advances before the IPC response is sent.
+                Some(SwitchOutcome::Restarting)
             }
             Some(LifecycleKind::Start | LifecycleKind::Restart)
                 if matches!(outcome, Some(SwitchOutcome::Pending))
@@ -969,6 +1334,58 @@ impl ProxyRuntime {
             }
         }
 
+        // R is only a committed snapshot. A superseded intent can have changed the native
+        // mode (or dashboard selector) while leaving R untouched. Check the live controls
+        // before every decision, including ordinary→ordinary and Unchanged/NoOp paths.
+        let mesh_mode_ready = self
+            .switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.mesh_mode_ready))
+            .unwrap_or(false);
+        if mesh_mode_ready
+            && !self
+                .mesh_live_state_matches_current(switch_generation)
+                .await
+        {
+            if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                return SwitchOutcome::Pending;
+            }
+            self.selector_reconcile.mark_required();
+            log::warn!("TS 双态运行核与当前配置基准不符 → 禁止虚报热切");
+            if scope == SwitchApplyScope::SelectedOnly {
+                if !self.with_selected_projection_claim(
+                    &new_config,
+                    switch_generation,
+                    intent_generation,
+                    || {},
+                ) {
+                    return SwitchOutcome::Pending;
+                }
+                return self.restart_selected_projection(
+                    &new_config,
+                    switch_generation,
+                    intent_generation,
+                );
+            }
+            if defer_restart {
+                // D may also contain saved DNS/TUN/rule edits. Live-control drift does not
+                // grant permission to apply those edits: keep R and the running core intact
+                // until the user explicitly Applies the pending configuration.
+                self.restart_deferred.store(true, Ordering::SeqCst);
+                log::info!("TS 双态漂移但本次仅保存 → 留待显式 Apply，不调度重启");
+                self.push_pending_changes();
+                return SwitchOutcome::Deferred;
+            }
+            self.apply_restart();
+            return SwitchOutcome::Restarting;
+        }
+        if self.gate.generation() != switch_generation
+            || self.selector_reconcile.intent_generation() != intent_generation
+        {
+            return SwitchOutcome::Pending;
+        }
+
         // ── 腿 0.5 起的**判定**全部下沉 [`Self::classify_switch`]（纯读，无副作用）──
         // 本方法自此只负责「执行」：判据与 `config:classifyStaged` 逐字共用同一份。
         let (decision, new_cfg) = match self.classify_switch(&new_config, defer_restart) {
@@ -1037,8 +1454,9 @@ impl ProxyRuntime {
         // ── 腿 3：三腿分发（决策全在 switch-engine，本处只执行）──
         let outcome = match decision {
             SwitchDecision::HotSwitch(plan) => {
-                // Block is a route-level reject, never a selector PUT. Keep this
-                // executor fail-closed if the builder classification regresses.
+                // Block is expressed by generated reject routes, never by selector PUT.
+                // The builder already classifies entry/exit as structural; keep the
+                // executor fail-closed if that classification ever regresses.
                 let old_is_block = self.current_config.read().ok().is_some_and(|current| {
                     is_block_selection(
                         current
@@ -1068,13 +1486,181 @@ impl ProxyRuntime {
                     );
                 }
                 let interrupt = new_cfg.interrupt_connections_on_switch == Some(true);
+                let old_mode = self
+                    .current_config
+                    .read()
+                    .ok()
+                    .and_then(|raw| raw.as_ref().cloned())
+                    .and_then(|raw| serde_json::from_value::<UserConfig>(raw).ok())
+                    .map(|old| selected_mode(&old));
+                let new_mode = selected_mode(&new_cfg);
+                let mode_change = old_mode.filter(|old| *old != new_mode);
+                if let Some(old_mode) = mode_change {
+                    let ready = self
+                        .switch_snapshot
+                        .read()
+                        .ok()
+                        .and_then(|s| s.as_ref().map(|s| s.mesh_mode_ready))
+                        .unwrap_or(false);
+                    let current = self.clash_mode_status().await;
+                    if !ready
+                        || !current.is_some_and(|s| {
+                            s.current_mode == old_mode
+                                && s.mode_list.len() == 2
+                                && [NORMAL, MESH_DIRECT]
+                                    .iter()
+                                    .all(|want| s.mode_list.iter().any(|m| m == want))
+                        })
+                    {
+                        if !self.selector_operation_is_current(switch_generation, intent_generation)
+                        {
+                            return SwitchOutcome::Pending;
+                        }
+                        log::warn!("TS mode 热切前运行态无法自证 → 安全重启");
+                        if scope == SwitchApplyScope::SelectedOnly {
+                            return self.restart_selected_projection(
+                                &new_config,
+                                switch_generation,
+                                intent_generation,
+                            );
+                        }
+                        self.apply_restart();
+                        return SwitchOutcome::Restarting;
+                    }
+                    // Entering a TS without an exit node: route/DNS must fall back to direct
+                    // before proxy-selector points at a split-only endpoint.
+                    if new_mode == MESH_DIRECT
+                        && !self
+                            .set_clash_mode_strict(
+                                switch_generation,
+                                Some(intent_generation),
+                                MESH_DIRECT,
+                            )
+                            .await
+                    {
+                        if !self.selector_operation_is_current(switch_generation, intent_generation)
+                        {
+                            if self.gate.generation() == switch_generation {
+                                let _ = self
+                                    .set_clash_mode_strict(switch_generation, None, old_mode)
+                                    .await;
+                            }
+                            self.selector_reconcile.mark_required();
+                            self.push_pending_changes();
+                            return SwitchOutcome::Pending;
+                        }
+                        if self.gate.generation() != switch_generation {
+                            return SwitchOutcome::Pending;
+                        }
+                        log::warn!("TS mode 预切失败或读回不符 → 安全重启");
+                        if scope == SwitchApplyScope::SelectedOnly {
+                            return self.restart_selected_projection(
+                                &new_config,
+                                switch_generation,
+                                intent_generation,
+                            );
+                        }
+                        self.apply_restart();
+                        return SwitchOutcome::Restarting;
+                    }
+                    if new_mode == MESH_DIRECT
+                        && !self.selector_operation_is_current(switch_generation, intent_generation)
+                    {
+                        if self.gate.generation() == switch_generation {
+                            let _ = self
+                                .set_clash_mode_strict(switch_generation, None, old_mode)
+                                .await;
+                        }
+                        self.selector_reconcile.mark_required();
+                        return SwitchOutcome::Pending;
+                    }
+                }
                 log::info!(
                     "switchMode：热切换腿（kind={:?}，{} 个 selector PUT，断连开关={interrupt}）",
                     plan.kind,
                     plan.puts.len()
                 );
-                match self.execute_hot_switch_plan(&plan, interrupt).await {
+                match self
+                    .execute_hot_switch_plan(&plan, interrupt, switch_generation, intent_generation)
+                    .await
+                {
                     HotSwitchOutcome::Applied { disconnect } => {
+                        // Leaving split-only TS: select a usable public exit first, then make
+                        // normal route/DNS rules live. Strict mode readback is the commit gate.
+                        if mode_change.is_some()
+                            && new_mode == NORMAL
+                            && !self
+                                .set_clash_mode_strict(
+                                    switch_generation,
+                                    Some(intent_generation),
+                                    NORMAL,
+                                )
+                                .await
+                        {
+                            if !self
+                                .selector_operation_is_current(switch_generation, intent_generation)
+                            {
+                                if self.gate.generation() == switch_generation {
+                                    if let Some(old_mode) = mode_change {
+                                        self.rollback_mode_transition(
+                                            &plan,
+                                            old_mode,
+                                            switch_generation,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                self.selector_reconcile.mark_required();
+                                self.push_pending_changes();
+                                return SwitchOutcome::Pending;
+                            }
+                            if self.gate.generation() != switch_generation {
+                                return SwitchOutcome::Pending;
+                            }
+                            self.rollback_selector_puts(&plan, switch_generation).await;
+                            log::warn!("TS mode 切回普通出口失败或读回不符 → 安全重启");
+                            if scope == SwitchApplyScope::SelectedOnly {
+                                return self.restart_selected_projection(
+                                    &new_config,
+                                    switch_generation,
+                                    intent_generation,
+                                );
+                            }
+                            self.apply_restart();
+                            return SwitchOutcome::Restarting;
+                        }
+                        if mesh_mode_ready {
+                            let groups = self.read_selector_groups().await;
+                            if !selectors_match_puts(&plan.puts, groups.as_deref())
+                                || !self
+                                    .mesh_live_state_matches_config(&new_cfg, switch_generation)
+                                    .await
+                            {
+                                if self.gate.generation() != switch_generation {
+                                    return SwitchOutcome::Pending;
+                                }
+                                if let Some(old_mode) = mode_change {
+                                    self.rollback_mode_transition(
+                                        &plan,
+                                        old_mode,
+                                        switch_generation,
+                                    )
+                                    .await;
+                                } else {
+                                    self.rollback_selector_puts(&plan, switch_generation).await;
+                                }
+                                log::warn!("TS 热切 mode/proxy/dashboard 读回不符 → 安全重启");
+                                if scope == SwitchApplyScope::SelectedOnly {
+                                    return self.restart_selected_projection(
+                                        &new_config,
+                                        switch_generation,
+                                        intent_generation,
+                                    );
+                                }
+                                self.apply_restart();
+                                return SwitchOutcome::Restarting;
+                            }
+                        }
                         let current = if scope == SwitchApplyScope::SelectedOnly {
                             self.with_selected_projection_claim(
                                 &new_config,
@@ -1086,6 +1672,16 @@ impl ProxyRuntime {
                             self.selector_operation_is_current(switch_generation, intent_generation)
                         };
                         if !current {
+                            if let Some(old_mode) = mode_change {
+                                if self.gate.generation() == switch_generation {
+                                    self.rollback_mode_transition(
+                                        &plan,
+                                        old_mode,
+                                        switch_generation,
+                                    )
+                                    .await;
+                                }
+                            }
                             self.selector_reconcile.mark_required();
                             log::info!(
                                 "switchMode：selector PUT 后发现更新配置意图/内核世代 → 交给新所有者收敛"
@@ -1101,6 +1697,16 @@ impl ProxyRuntime {
                                 intent_generation,
                                 || {},
                             ) {
+                                if let Some(old_mode) = mode_change {
+                                    if self.gate.generation() == switch_generation {
+                                        self.rollback_mode_transition(
+                                            &plan,
+                                            old_mode,
+                                            switch_generation,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 self.selector_reconcile.mark_required();
                                 return SwitchOutcome::Pending;
                             }
@@ -1120,6 +1726,16 @@ impl ProxyRuntime {
                                 intent_generation,
                                 || self.commit_selected_projection(&new_config, intent_generation),
                             ) {
+                                if let Some(old_mode) = mode_change {
+                                    if self.gate.generation() == switch_generation {
+                                        self.rollback_mode_transition(
+                                            &plan,
+                                            old_mode,
+                                            switch_generation,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 self.selector_reconcile.mark_required();
                                 return SwitchOutcome::Pending;
                             }
@@ -1152,6 +1768,18 @@ impl ProxyRuntime {
                     // kind=rules 的失败会因 norm 等价 + 节点未变而被 no-op **静默吞掉**（变更永不生效）。
                     // 见交付说明「边界声明」。
                     other => {
+                        if let Some(old_mode) = mode_change {
+                            if self.gate.generation() == switch_generation {
+                                self.rollback_mode_transition(&plan, old_mode, switch_generation)
+                                    .await;
+                            }
+                        }
+                        if !self.selector_operation_is_current(switch_generation, intent_generation)
+                        {
+                            self.selector_reconcile.mark_required();
+                            self.push_pending_changes();
+                            return SwitchOutcome::Pending;
+                        }
                         if scope == SwitchApplyScope::SelectedOnly
                             && !self.with_selected_projection_claim(
                                 &new_config,
@@ -1538,7 +2166,14 @@ impl ProxyRuntime {
         // TUN 的逐目的网卡事实只在起核前（TUN 尚未接管路由时）可信。当前会话未覆盖的 automatic
         // physical root 不能靠 selector PUT 临时补算：活 TUN 下查询会命中 Polaris 自己，得到错误接口。
         // 因此切全局/规则到未覆盖根必须先走 stop→start，由 start_inner 在撤 TUN 后重新规划。
-        if new_cfg.proxy_mode_type.is_tun() {
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。Android 上零行为差：
+        // `runtime_binding_roots_covered` 里的 `automatic_runtime_binding_root_ids` 走
+        // `runtime_binding_planning_supported(Android) == false` 恒返空集，空集是任何集合的子集。
+        if new_cfg
+            .proxy_mode_type
+            .effective_on(self.helper.platform())
+            .is_tun()
+        {
             let binding_plan = self
                 .runtime_binding_state
                 .lock()
@@ -1555,6 +2190,8 @@ impl ProxyRuntime {
         };
 
         let deps = HotSwitchDeps {
+            mesh_mode_ready: snapshot.mesh_mode_ready,
+            dashboard_mode_selector: snapshot.dashboard_mode_selector,
             current_id_to_tag_map: Some(snapshot.id_to_tag.clone()),
             running_servers_fingerprint: Some(snapshot.fingerprints.clone()),
             current_rule_target_map: Some(snapshot.rule_target.clone()),
@@ -1718,7 +2355,10 @@ impl ProxyRuntime {
             return SwitchOutcome::Deferred;
         }
         self.schedule_restart_for_generation(expected_generation);
-        self.push_pending_changes();
+        // This selection is already being applied by the automatic restart. Emitting
+        // D/R debt here briefly presents an actionable "Apply pending" bar even though
+        // tapping it would queue a redundant full-config restart. Stop/ready publish
+        // the authoritative pending snapshot; deferred selections still push above.
         SwitchOutcome::Restarting
     }
 
@@ -1727,8 +2367,10 @@ impl ProxyRuntime {
             return false;
         };
         if is_block_selection(Some(server_id)) {
-            // No selector member exists for block. A ready startup snapshot plus
-            // current R prove that the generated reject routes are in this core.
+            // No selector member exists for block. Only the ready core's startup
+            // snapshot and current R together prove that reject routes were emitted.
+            // The caller's selected-projection claim checks generation and intent
+            // before publishing an applied receipt.
             let started_blocked = self.startup_snapshot.read().ok().is_some_and(|snapshot| {
                 snapshot.as_ref().is_some_and(|config| {
                     config.get("selectedServerId").and_then(Value::as_str) == Some(server_id)
@@ -1764,6 +2406,8 @@ impl ProxyRuntime {
         &self,
         plan: &polaris_config_engine::builder::hotswitch::HotSwitchPlan,
         interrupt: bool,
+        generation: u64,
+        intent_generation: u64,
     ) -> HotSwitchOutcome {
         #[cfg(test)]
         if let Some(sink) = self
@@ -1772,10 +2416,22 @@ impl ProxyRuntime {
             .ok()
             .and_then(|guard| guard.as_ref().map(Arc::clone))
         {
-            return SwitchExecutor.execute(sink.as_ref(), plan, interrupt).await;
+            let guarded = GenerationManagementApi {
+                runtime: self,
+                api: sink.as_ref(),
+                generation,
+                intent_generation,
+            };
+            return SwitchExecutor.execute(&guarded, plan, interrupt).await;
         }
         let api = self.management_api().await;
-        SwitchExecutor.execute(&api, plan, interrupt).await
+        let guarded = GenerationManagementApi {
+            runtime: self,
+            api: &api,
+            generation,
+            intent_generation,
+        };
+        SwitchExecutor.execute(&guarded, plan, interrupt).await
     }
 
     /// 重启腿收尾：保留当前运行态 R，**丢弃**旧 force-restart 快照 + 调度去抖重启。
@@ -1853,9 +2509,10 @@ impl ProxyRuntime {
     // 1:1 移植 上游 `reassertSelectorSelection` + `reassertRuleSelectors`（`ProxyManager.ts:1176-1237`）
     // 与其调用点的 `.finally()` 串接（:1144-1165）。
     //
-    // **根因**：sing-box 1.14 的 `experimental.cache_file` 默认 `store_selected` —— 它把 selector 的
-    // **运行期**选择持久化进 `cache.db` 的 `selected` bucket，起核时用它**覆盖**新生成 config 里的
-    // `default`。于是「盘上选 Hk01、生成的 `proxy-selector.default = "Hk01"`」与「核实际跑上一轮残留的
+    // **根因**：随包 b609（1.15.0-alpha.8）的 `experimental.cache_file` 保留隐式 selector 持久化：
+    // `StoreSelected` 把**运行期**选择写进 `cache.db` 的 `selected` bucket，`LoadSelected`
+    // 在起核时用它**覆盖**新生成 config 里的 `default`。于是「盘上选 Hk01、生成的
+    // `proxy-selector.default = "Hk01"`」与「核实际跑上一轮残留的
     // `Tailscale`」可以同时成立，且**全链路零告警**（`attest_selected_exit` 是纯静态自证，量的是生成
     // 产物不是运行态，看不见这层覆盖）。
     //
@@ -1902,7 +2559,10 @@ impl ProxyRuntime {
         let mode = user_config.proxy_mode_type;
         // TUN 成功腿在 public start guard 归还前同步接棒；该 guard 经 reassert 的 finally 守卫延续到
         // schedule_connection_flush 接棒。非 TUN 没有无差别 RST，不额外延长稳定门。
+        // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]），与下游 flush 自身的守卫同源：
+        // 两边不同源就会出现「门开着但稳定期没延长」或反之，而 Android 上存盘缺省值恰好是 `systemProxy`。
         let network_settle = mode
+            .effective_on(self.helper.platform())
             .is_tun()
             .then(|| self.network_settle.begin("tun-selector-reassert"));
         // `tauri::async_runtime::spawn` 而非裸 `tokio::spawn`：同 `spawn_ts_exit_recovery` 的理由

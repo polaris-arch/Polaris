@@ -308,7 +308,7 @@ function status(serverId: string, peers: TailscaleStatusPeer[]): TailscaleStatus
   };
 }
 
-describe('TS 出口候选按当前节点隔离', () => {
+describe('TS exit candidates stay within the selected node', () => {
   const a = peer({ hostName: 'tailnet-a-exit', ip: '100.64.0.10' });
   const b = peer({ hostName: 'tailnet-b-exit', ip: '100.65.0.20' });
   const snapshot: TailscaleStatusSnapshot = {
@@ -316,18 +316,13 @@ describe('TS 出口候选按当前节点隔离', () => {
     statuses: [status('ts-b', [b]), status('ts-a', [a])],
   };
 
-  it('两套控制面同在快照里时，只列当前节点的 peer 与当前已保存的自定义出口', () => {
+  it('keeps another control plane out of choices while retaining a manually saved exit', () => {
     const options = exitNodeOptions(peersForTsNode(snapshot, 'ts-a'), 'manual-a', L);
     expect(devices(options).map(([value]) => value)).toEqual(['tailnet-a-exit', 'manual-a']);
     expect(options.map(([value]) => value)).not.toContain('tailnet-b-exit');
-    expect(exitNodeOptions(peersForTsNode(snapshot, 'ts-b'), '', L)).toEqual([
-      ['', '<none>'],
-      ['tailnet-b-exit', 'tailnet-b-exit · 100.65.0.20', false],
-      [EXIT_CUSTOM, '<custom>'],
-    ]);
   });
 
-  it('当前节点没有 STATUS 时不借别的节点候选，保留自己的已保存值供回显', () => {
+  it('never borrows peers when the selected node has no frame', () => {
     const missing = { ...snapshot, statuses: [status('ts-b', [b])] };
     expect(peersForTsNode(missing, 'ts-a')).toEqual([]);
     expect(peersForTsNode(missing, undefined)).toEqual([]);

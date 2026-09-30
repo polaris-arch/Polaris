@@ -20,7 +20,7 @@ import { useTranslation } from 'react-i18next';
 import type { UserConfig, TunModeConfig, UdpNatType } from '@/contracts/types';
 import { injectedList, injectedRecord } from '@/domain/effective-config';
 import { isValidMacAddress, isValidNeighborDomain } from '@/domain/neighbor';
-import { DEFAULT_TUN_MTU, MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
+import { MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
 import { useNavStore } from '@/store/nav-store';
 import { Fold } from '@/components/Fold';
 import {
@@ -259,8 +259,8 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
 
       {/* 1. TUN 接管 */}
       <SetBlock header={t('settings.tun.takeoverBlock')}>
-        {/* 占位符里的「自动」值与内核实际拿到的是同一个常量（Rust `DEFAULT_TUN_MTU`，parity 见
-            domain/tun-mtu.test.ts）；与平台无关，故不再读 platform。 */}
+        {/* MTU 留空 = 不下发，由内核按运行环境取默认（Polaris 不持有平台 → MTU 表，见 Rust
+            `TunModeConfig::mtu`），故占位符只说「内核默认」、不写数字。 */}
         <SetRow
           label="MTU"
           tip={t('settings.tun.mtuDesc')}
@@ -272,9 +272,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
               inputMode="numeric"
               className="mono"
               value={mtuDraft}
-              placeholder={t('settings.tun.mtuAutoPlaceholder', {
-                n: DEFAULT_TUN_MTU,
-              })}
+              placeholder={t('settings.tun.mtuAutoPlaceholder')}
               onChange={(e) => {
                 setMtuDraft(e.target.value);
                 setMtuInvalid(false);

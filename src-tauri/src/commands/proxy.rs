@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
 use polaris_config_engine::user_config::ProxyModeType;
+use polaris_core_supervisor::config_gate::ConfigCheckVerdict;
 use polaris_core_supervisor::{run_check_raw, RawCheck};
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 
@@ -301,22 +302,29 @@ fn probe_verdict(check: ProbeCheck) -> Value {
 /// 子进程本身由 [`run_check_raw`] 起 —— 全仓唯一的 `sing-box check` 实现。本处此前自己写了一遍，
 /// 写漏的是 `kill_on_drop(true)`：超时腿把 `output()` 的 future 直接丢掉，而 `tokio::process::Child`
 /// 的 `kill_on_drop` 默认是 false，于是每次超时都留下一个游离的 `sing-box check`。
-async fn run_probe_check(binary: &std::path::Path, config_path: &std::path::Path) -> ProbeCheck {
-    match run_check_raw(binary, config_path, PROBE_CHECK_TIMEOUT).await {
-        // 超时 / spawn 失败（核缺失 / 无权限）→ failOpen
-        RawCheck::TimedOut { .. } | RawCheck::SpawnFailed(_) => ProbeCheck::Indeterminate,
-        RawCheck::Done { success: true, .. } => ProbeCheck::Supported,
-        RawCheck::Done { stderr, stdout, .. } => {
-            // stderr 优先、为空才落回 stdout —— 与此前行为一致（sing-box 恒写 stderr，留 stdout 兜底
-            // 给理论上把日志导向 stdout 的变体 / 未来版本）。
-            let raw = if stderr.trim().is_empty() {
-                stdout.as_str()
-            } else {
-                stderr.as_str()
-            };
-            ProbeCheck::Unsupported(parse_probe_diagnostic(raw))
-        }
-    }
+async fn run_probe_check(
+    binary: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<ProbeCheck, polaris_core_supervisor::ValidationLifecycleError> {
+    Ok(
+        match run_check_raw(binary, config_path, PROBE_CHECK_TIMEOUT).await? {
+            // 超时 / spawn 失败（核缺失 / 无权限）→ failOpen
+            RawCheck::TimedOut { .. } | RawCheck::SpawnFailed(_) | RawCheck::OutputFailed(_) => {
+                ProbeCheck::Indeterminate
+            }
+            RawCheck::Done { success: true, .. } => ProbeCheck::Supported,
+            RawCheck::Done { stderr, stdout, .. } => {
+                // stderr 优先、为空才落回 stdout —— 与此前行为一致（sing-box 恒写 stderr，留 stdout 兜底
+                // 给理论上把日志导向 stdout 的变体 / 未来版本）。
+                let raw = if stderr.trim().is_empty() {
+                    stdout.as_str()
+                } else {
+                    stderr.as_str()
+                };
+                ProbeCheck::Unsupported(parse_probe_diagnostic(raw))
+            }
+        },
+    )
 }
 
 /// 剥离 ANSI CSI 转义序列（`ESC '[' … 终止字节`）。
@@ -467,6 +475,44 @@ fn parse_probe_diagnostic(raw: &str) -> ProbeDiagnostic {
     }
 }
 
+/// Android 腿：libbox `CheckConfig` 给出的闸门判定 → 探测三态。
+///
+/// Android 上核在本进程内（libbox），没有可 spawn 的 `sing-box` 二进制，[`run_probe_check`] 那条腿
+/// 在那里恒走「核缺失 ⇒ Indeterminate」。起核闸门在 Android 上早就改问 libbox（`android_bridge::check_config`），
+/// 这里复用同一条腿，只做三态翻译：
+///  · `Accepted` ⇒ 支持；`Unavailable`（桥不可用 / 超时）⇒ 无法判定（failOpen，**不谎报不支持**）；
+///  · `Rejected` ⇒ 用内核点名的那一段（`outbounds[0].x: …`）拆键路径；
+///  · `Unattributable` ⇒ 原话照 CLI 那条腿的解析器拆一遍，拆不出键路径就整句当消息（不编造）。
+fn probe_check_from_gate(verdict: ConfigCheckVerdict) -> ProbeCheck {
+    match verdict {
+        ConfigCheckVerdict::Accepted => ProbeCheck::Supported,
+        ConfigCheckVerdict::Unavailable(_) => ProbeCheck::Indeterminate,
+        ConfigCheckVerdict::Rejected(r) => {
+            ProbeCheck::Unsupported(libbox_probe_diagnostic(&r.detail))
+        }
+        ConfigCheckVerdict::Unattributable(raw) => {
+            ProbeCheck::Unsupported(libbox_probe_diagnostic(&raw))
+        }
+    }
+}
+
+/// libbox 的报错不一定带 CLI 那两个 marker（`decode config at` / `initialize`）：先走同一个
+/// [`parse_probe_diagnostic`]，拆不出键路径时再认一次「`<键路径>: <消息>`」的裸形态。
+fn libbox_probe_diagnostic(raw: &str) -> ProbeDiagnostic {
+    let diag = parse_probe_diagnostic(raw);
+    if diag.path.is_some() {
+        return diag;
+    }
+    match diag.message.split_once(": ") {
+        Some((candidate, msg)) if looks_like_keypath(candidate) => ProbeDiagnostic {
+            path: Some(candidate.trim().to_string()),
+            message: msg.trim().to_string(),
+            raw: diag.raw,
+        },
+        _ => diag,
+    }
+}
+
 /// 唯一临时文件名后缀（pid + 单调计数 + 纳秒），避免并发 probe 撞名。
 fn probe_tmp_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -495,6 +541,24 @@ pub async fn kernel_probe_outbound(
         return Ok(ApiResponse::ok(json!({ "ok": false, "error": e })));
     }
     let cfg = build_probe_config(&outbound, is_endpoint.unwrap_or(false));
+
+    // Android：核在本进程内（libbox），下面的 `resolve_core_binary` 在那里恒 Err ⇒ 这颗按钮会恒报
+    // 「无法判定」。改问起核闸门同一条 libbox `CheckConfig` 腿（`if cfg!` 而非 `#[cfg]`：两个平台
+    // 都编译这一支，改名 / 改签名在桌面上就编不过）。
+    if cfg!(target_os = "android") {
+        let verdict = match serde_json::to_string(&cfg) {
+            Ok(json) => crate::runtime::proxy::android_bridge::check_config(&json).await,
+            Err(e) => {
+                return Ok(ApiResponse::ok(
+                    json!({ "ok": false, "error": format!("序列化探测配置失败: {e}") }),
+                ))
+            }
+        };
+        return Ok(ApiResponse::ok(probe_verdict(probe_check_from_gate(
+            verdict,
+        ))));
+    }
+
     // userData 目录（await 前取 owned，不跨 await 持 State 借用）。
     let dir = state.config().dir().to_path_buf();
 
@@ -518,7 +582,10 @@ pub async fn kernel_probe_outbound(
         Ok(()) => {
             let check = run_probe_check(&binary, &tmp).await;
             let _ = std::fs::remove_file(&tmp); // best-effort 清理
-            probe_verdict(check)
+            match check {
+                Ok(check) => probe_verdict(check),
+                Err(error) => json!({"ok": false, "error": error.to_string()}),
+            }
         }
         Err(e) => json!({ "ok": false, "error": format!("写探测配置失败: {e}") }),
     };
@@ -700,7 +767,7 @@ pub async fn system_proxy_get_status(
     if status.starting {
         return Ok(ApiResponse::err("代理接管仍在启动，系统代理活态尚未落定"));
     }
-    if state.proxy().running_proxy_mode_type() != Some(ProxyModeType::SystemProxy) {
+    if state.proxy().running_effective_proxy_mode_type() != Some(ProxyModeType::SystemProxy) {
         return Ok(ApiResponse::err("当前运行核不是系统代理接管模式"));
     }
     let mixed_port = status.mixed_port;

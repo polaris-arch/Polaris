@@ -2,6 +2,8 @@ use super::*;
 use crate::runtime::config::ConfigManager;
 use crate::test_support::{crate_code, TestDir};
 
+mod add_registration_tests;
+
 fn temp_dir(tag: &str) -> TestDir {
     TestDir::new(&format!("polaris-server-add-{tag}-"))
 }
@@ -15,6 +17,22 @@ fn seed_switch_nodes(mgr: &ConfigManager) {
     ]);
     cfg["selectedServerId"] = json!("n-a");
     mgr.save_full(&cfg).unwrap();
+}
+
+#[test]
+fn switch_receipt_distinguishes_scheduled_restart_from_pending_and_applied() {
+    assert_eq!(
+        ServerSwitchReceipt::from_outcome(Some(SwitchOutcome::Restarting)).status(),
+        "restarting"
+    );
+    assert_eq!(
+        ServerSwitchReceipt::from_outcome(Some(SwitchOutcome::Pending)).status(),
+        "pending"
+    );
+    assert_eq!(
+        ServerSwitchReceipt::from_outcome(Some(SwitchOutcome::HotSwitched)).status(),
+        "applied"
+    );
 }
 
 #[test]
@@ -267,7 +285,10 @@ fn single_add_rejects_invalid_or_conflicting_input_without_changing_config() {
         json!({"id":"bad","name":"node","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw","tlsSettings": "invalid"}),
         json!({"id":"n-a","name":"conflict","protocol":"trojan","address":"1.2.3.4","port":443,"password":"pw"}),
     ] {
-        assert!(server_add_core(&mgr, node).is_err());
+        assert!(
+            server_add_core(&mgr, node.clone()).is_err(),
+            "accepted {node:?}"
+        );
         assert_eq!(mgr.load_full().unwrap(), before);
         assert_eq!(std::fs::read(mgr.path()).unwrap(), disk_before);
     }
@@ -396,7 +417,7 @@ fn prune_recent_server_ids_drops_deleted_and_keeps_survivors() {
 
 /// **调用点守卫**（射程补齐）：上面那条只测纯函数，删掉命令里的**调用**它照样绿 = 门没盖住生产路径。
 /// 两个删除命令都持 `State<'_, AppRuntime>`，单测构造不出 Tauri 运行时 ⇒ 改用源码扫描锁调用点，
-/// 与 `main.rs` 既有的 Rust 侧源码扫描守卫同法。
+/// 与 `lib.rs` 既有的 Rust 侧源码扫描守卫同法。
 ///
 /// 牙：删掉 `server_delete` 或 `server_delete_batch` 里任一处
 /// `prune_recent_server_ids_to_existing(...)` → 转红。

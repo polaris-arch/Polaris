@@ -34,12 +34,22 @@ describe('W26 bounded core-log wiring', () => {
       const source = moduleSource(module);
       expect(source, module).toContain('preopen_log_files');
       expect(source, module).toContain(
-        'polaris_log_budget::spawn_pipe_loggers_with_preopened_files(',
+        'polaris_log_budget::spawn_pipe_loggers_with_preopened_files_custodied(',
       );
-      expect(source, module).toContain('polaris_log_budget::spawn_pipe_drainers(');
+      expect(source, module).toContain('polaris_log_budget::DEFAULT_GENERATION_BYTES');
+      expect(source, module).toContain('polaris_log_budget::spawn_pipe_drainers_custodied(');
       expect(source, module).not.toContain('polaris_log_budget::spawn_pipe_loggers(');
+      expect(source, module).not.toContain('polaris_log_budget::spawn_pipe_loggers_with_preopened_files(');
+      expect(source, module).not.toContain('polaris_log_budget::spawn_pipe_drainers(');
       expect(source, module).toContain('std::process::Stdio::piped()');
     }
+
+    // 返回的 writer custody 必须跟原 birth/HANDLE 一起持有；仅调用有界 API 不足以守住迟到写入。
+    const macos = moduleSource('crates/helper/src/platform/macos/server');
+    expect(macos).toContain('birth.attach_log_custody(log_custody);');
+    const windows = moduleSource('crates/helper/src/platform/windows/winproc/win');
+    expect(windows).toMatch(/custody\s*\.as_mut\(\)\s*\.expect\("published owned HANDLE"\)\s*\.log_custody = Some\(log_custody\);/);
+    expect(windows).toContain('if log_custody.revoke().is_err()');
 
     const linux = read('crates/helper/src/platform/linux/server.rs');
     expect(linux).toContain('polaris_log_budget::spawn_pipe_loggers_with_file(');
@@ -48,6 +58,8 @@ describe('W26 bounded core-log wiring', () => {
 
     const budget = read('crates/log-budget/src/lib.rs');
     expect(budget).toContain('after_open(writer.as_ref().map(|opened| &opened.file))');
+    expect(budget).toContain('PreopenedRotatingFile::open(files, generation_bytes, OpenMode::Fresh)');
+    expect(budget).toContain('PipeLogCustody { writer: shared }');
   });
 
   it('legacy log is surfaced and only archived/deleted after an explicit user action', () => {

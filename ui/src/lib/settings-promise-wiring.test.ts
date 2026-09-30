@@ -34,6 +34,7 @@
  *    后者要真机看。
  */
 import { describe, it, expect } from 'vitest';
+import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 
 import { moduleSource, moduleSourceWithTests } from '@/contracts/rust-source.test-support';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -54,7 +55,10 @@ function walk(dir: string, ext: RegExp, acc: string[] = []): string[] {
     if (e === 'node_modules' || e === 'dist' || e === 'target') continue;
     const full = join(dir, e);
     if (statSync(full).isDirectory()) walk(full, ext, acc);
-    else if (ext.test(e) && !/\.(test|spec)\.tsx?$/.test(e)) acc.push(full);
+    // 共享谓词（`contracts/test-only-modules.ts` 头注：三道门需要同一个概念，不许各留一份拷贝）。
+    // `.test-support.` 同样不进产物，且产品代码不许 import 它们（`i18n-coverage` G0-b 锁着）——
+    // 把它们留在产品面上，判据会被别的判据的**锚文本**喂饱（2026-09-06 在 app-wiring ⑩/⑫ 实测过一次假绿）。
+    else if (ext.test(e) && !IS_TEST_ONLY_MODULE.test(e)) acc.push(full);
   }
   return acc;
 }
@@ -71,7 +75,7 @@ function i18n(key: string): string | undefined {
 }
 
 /** 承诺词典 —— 命中即「这句话向用户许诺了某个行为」。 */
-const PROMISE_LEXICON = /自动|启动时|闲置|下次打开|每天|停止记录|\d+\s*(分钟|秒)/;
+const PROMISE_LEXICON = /自动|启动时|闲置|下次打开|每天|关闭磁盘日志|\d+\s*(分钟|秒)/;
 
 interface DescHit {
   file: string;
@@ -319,7 +323,7 @@ const REGISTRY: readonly PromiseRow[] = [
           needle: '"keepTrayMenuWarm": true',
         },
         {
-          file: 'src-tauri/src/main.rs',
+          file: 'src-tauri/src/lib.rs',
           needle: 'tray::prewarm_overlay_if_enabled(app.handle());',
         },
         {
@@ -387,7 +391,7 @@ const REGISTRY: readonly PromiseRow[] = [
     },
   },
   {
-    snippet: '停止记录 sing-box 日志',
+    snippet: '关闭磁盘日志后',
     evidence: { kind: 'config-key', key: 'disableLogFile' },
   },
   {
@@ -459,19 +463,21 @@ const REGISTRY: readonly PromiseRow[] = [
   {
     // 承诺是「留空即自动，使用推荐值」——兑现方是生成期那条回落，不是某个配置键
     // （恰恰相反：留空意味着**磁盘上没有那个键**，config-key 这条腿在这里天然举不出证）。
-    // 两个锚点缺一不可：只锚常量定义的话，builder 改成不回落（mtu 缺席就不发键）照样绿。
     // TUN stack 移除前的原文是「按协议栈与平台取推荐值」，锚在 `tun_stack.rs::default_mtu_for`。
+    // 2026-09-25 起「推荐值」= 内核默认：缺席即不发键（上游 `inbound.go` 的 `MTU == 0` 分支取值），
+    // 两个锚点：「生成侧只取用户值、不回落任何常量」+「该值原样进 inbound」。行为级判据（未设即不发键、
+    // 全平台）在 `builder::inbounds::tests::tun_inbound_omits_mtu_when_unset_on_every_platform`。
     snippet: '留空即自动，使用推荐值',
     evidence: {
       kind: 'anchors',
       items: [
         {
-          file: 'crates/config-engine/src/user_config/tun_config',
-          needle: 'pub const DEFAULT_TUN_MTU: u32',
+          file: 'crates/config-engine/src/builder/inbounds',
+          needle: 'let user_mtu = tun_cfg.and_then(|t| t.mtu);',
         },
         {
           file: 'crates/config-engine/src/builder/inbounds',
-          needle: '.unwrap_or(DEFAULT_TUN_MTU)',
+          needle: 'mtu: user_mtu,',
         },
       ],
     },

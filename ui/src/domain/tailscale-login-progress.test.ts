@@ -4,7 +4,7 @@ import { validatedTailscaleAuthUrl } from './tailscale-auth-url';
 
 const current: TailscaleLoginProgress = { serverId: 'ts1', attemptId: 'new', phase: 'starting' };
 describe('Tailscale login request identity and result', () => {
-  it('同一节点的新 B 尝试不能出现在旧 A 面板的 URL、成功或错误显示读点', () => {
+  it('an older panel cannot display the URL or result of a newer attempt on the same node', () => {
     const a = { serverId: 'ts1', attemptId: 'A' };
     const b = { serverId: 'ts1', attemptId: 'B' };
     const waiting: TailscaleLoginProgress = { ...b, phase: 'awaitingAuth', url: 'https://hs.example/B' };
@@ -12,8 +12,7 @@ describe('Tailscale login request identity and result', () => {
     expect(progressForLoginRequest({ ...waiting, phase: 'authorized' }, a)).toBeUndefined();
     expect(progressForLoginRequest({ ...waiting, phase: 'failed', reason: 'authorizationTimedOut' }, a)).toBeUndefined();
     expect(progressForLoginRequest(waiting, b)).toEqual(waiting);
-    const own: TailscaleLoginProgress = { ...waiting, attemptId: 'A', url: 'https://hs.example/A' };
-    expect(progressForLoginRequest(own, a)).toEqual(own);
+    expect(progressForLoginRequest({ ...waiting, attemptId: 'A' }, a)?.url).toBe('https://hs.example/B');
     expect(progressForLoginRequest(waiting, { serverId: 'other', attemptId: 'B' })).toBeUndefined();
     expect(progressForLoginRequest(waiting, null)).toBeUndefined();
   });
@@ -37,6 +36,8 @@ describe('Tailscale login request identity and result', () => {
   });
   it('failure presentation maps stable categories instead of arbitrary private diagnostics', () => {
     expect(loginFailureReasonKey('coreUnavailable')).toBe('ts.reasonCoreUnavailable');
+    expect(loginFailureReasonKey('ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED')).toBe('errors.androidNativeCapacityClosed');
+    expect(loginFailureReasonKey('ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED ')).toBe('ts.reasonAuthorization');
     expect(loginFailureReasonKey('mainCoreInUse')).toBe('ts.reasonMainCoreInUse');
     expect(loginFailureReasonKey('PRIVATE_KEY_RAW_DIAGNOSTIC')).toBe('ts.reasonAuthorization');
   });

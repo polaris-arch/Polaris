@@ -1,5 +1,575 @@
 use super::*;
 
+fn spawn_crash_test_child() -> tokio::process::Child {
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = tokio::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd
+    };
+    cmd.kill_on_drop(true).spawn().expect("spawn stand-in")
+}
+
+fn crash_event_for_test(rt: &Arc<ProxyRuntime>, generation: u64) -> CrashEvent {
+    CrashEvent {
+        generation,
+        direct_run_identity: rt
+            .child
+            .lock()
+            .unwrap()
+            .running_for_test()
+            .map(|run| run.identity.clone()),
+        config: rt.current_config.read().unwrap().clone(),
+    }
+}
+
+#[test]
+fn direct_replay_requires_os_confirmed_exit() {
+    assert!(!direct_replay_exit_proven::<(), ()>(&Ok(None)));
+    assert!(direct_replay_exit_proven::<(), ()>(&Ok(Some(()))));
+    assert!(
+        !direct_replay_exit_proven::<(), ()>(&Err(())),
+        "an OS probe failure cannot authorize replay"
+    );
+}
+
+/// A mesh-route report writer may hold its lock while reading the lifecycle
+/// generation. A blocked error report must not hold the inner generation lock.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(
+    clippy::await_holding_lock,
+    clippy::readonly_write_lock,
+    reason = "the test deliberately holds an exclusive report lock across awaits to reproduce lock inversion"
+)]
+async fn stale_error_report_does_not_reverse_report_to_generation_lock_order() {
+    let (rt, _dir, events) = test_runtime_recording_errors();
+    let birth = rt.gate.generation();
+    let route_guard = rt.mesh_route_run.write().unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let report_rt = Arc::clone(&rt);
+    let report = tokio::task::spawn_blocking(move || {
+        let _ = entered_tx.send(());
+        report_rt.report_auto_restart_giveup_if_current(
+            birth,
+            &StartError::from("old crash".to_string()),
+        );
+    });
+    entered_rx.await.expect("old reporter began");
+    let mut probe = {
+        let probe_rt = Arc::clone(&rt);
+        tokio::task::spawn_blocking(move || probe_rt.gate.generation())
+    };
+    let generation_read_before_report_unlock =
+        tokio::time::timeout(Duration::from_millis(500), &mut probe).await;
+    let read_fast = generation_read_before_report_unlock.is_ok();
+    drop(route_guard);
+    let seen_generation = match generation_read_before_report_unlock {
+        Ok(result) => result.expect("generation read task"),
+        Err(_) => probe.await.expect("generation read after release"),
+    };
+    report.await.expect("old reporter finished");
+    assert_eq!(seen_generation, birth);
+    assert!(
+        read_fast,
+        "report writer must be able to read generation while old error waits on its lock"
+    );
+    assert_eq!(events.lock().unwrap().len(), 1);
+    assert_eq!(
+        rt.status().error_code.as_deref(),
+        Some(code::AUTO_RESTART_FAILED)
+    );
+}
+
+/// The synchronous emitter reenters runtime readers. It must see committed
+/// status without holding inner/report/status locks, while a later claim waits
+/// until the event has been published.
+#[tokio::test(flavor = "multi_thread")]
+async fn error_emitter_reenters_readers_before_later_generation_claim() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.gate.generation();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let weak = Arc::downgrade(&rt);
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        events: Arc::clone(&events),
+        error_hook: Some(Arc::new(move || {
+            let runtime = weak.upgrade().expect("runtime alive during emit");
+            assert_eq!(runtime.gate.generation(), birth);
+            assert_eq!(
+                runtime.status().error_code.as_deref(),
+                Some(code::AUTO_RESTART_FAILED)
+            );
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            release_rx.lock().unwrap().recv().expect("release emitter");
+        })),
+        ..RecordingErrorEmitter::default()
+    }));
+    let report_rt = Arc::clone(&rt);
+    let report = tokio::task::spawn_blocking(move || {
+        report_rt.report_auto_restart_giveup_if_current(
+            birth,
+            &StartError::from("old crash".to_string()),
+        );
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .expect("emitter must reenter without deadlock")
+        .expect("emitter entered");
+    let mut claim = {
+        let claim_rt = Arc::clone(&rt);
+        tokio::task::spawn_blocking(move || {
+            claim_rt
+                .gate
+                .claim_generation(Some(birth), LifecycleKind::Start)
+        })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut claim)
+            .await
+            .is_err(),
+        "later Start claim must wait until the old event is emitted"
+    );
+    release_tx.send(()).expect("release emitter");
+    report.await.expect("report task");
+    assert_eq!(
+        claim.await.expect("claim task"),
+        Some(birth.wrapping_add(1))
+    );
+    assert_eq!(events.lock().unwrap().len(), 1);
+}
+
+/// The first retryable restart failure has already claimed Stop/Start generations.
+/// The same recovery task must make its second decision under the generation
+/// that this restart actually owned, with no external Start in the test.
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_after_owned_restart_failure_reaches_second_attempt() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    *rt.current_config.write().unwrap() = Some(bad_config());
+    let birth = rt.gate.generation();
+    let event = crash_event_for_test(&rt, birth);
+    let worker = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.run_crash_recovery(event).await })
+    };
+    let second_attempt = tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if rt.crash_lock().restart_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    let _ = worker.await;
+    assert!(
+        rt.gate.generation() > birth,
+        "first restart must own a new generation"
+    );
+    assert!(
+        second_attempt.is_ok(),
+        "retryable first failure must reach attempt two"
+    );
+}
+
+/// A is backing off; B claims a new run, really exits, and reports its crash.
+/// A's replay must be B's event (including B's config), not A's birth generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn superseded_crashed_run_is_replayed_once() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    *rt.current_config.write().unwrap() = Some(serde_json::json!("config-a"));
+    let a_gen = rt.gate.generation();
+    let a_event = crash_event_for_test(&rt, a_gen);
+    let a = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.run_crash_recovery(a_event).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !rt.crash_lock().is_restarting() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A entered backoff");
+
+    let b_gen = rt
+        .gate
+        .claim_generation(Some(a_gen), LifecycleKind::Start)
+        .unwrap();
+    *rt.current_config.write().unwrap() = Some(serde_json::json!("config-b"));
+    let mut b = DirectCoreRun::new(spawn_crash_test_child());
+    b.child_for_test().kill().await.expect("B exits");
+    let b_identity = b.identity.clone();
+    rt.child.lock().unwrap().install_running_for_test(b);
+    let b_event = rt
+        .reset_crashed_run_state(b_gen, Some(&b_identity))
+        .await
+        .expect("B crash captured");
+    rt.run_crash_recovery(b_event).await;
+    *rt.current_config.write().unwrap() = Some(serde_json::json!("config-c"));
+    assert_eq!(
+        rt.crash_lock()
+            .pending_replay_event()
+            .and_then(|event| event.config.as_ref()),
+        Some(&serde_json::json!("config-b")),
+        "B's exit must freeze B's config before a later request changes it"
+    );
+    assert_eq!(
+        rt.crash_lock().restart_count(),
+        1,
+        "B is deduplicated while A is in flight"
+    );
+
+    let replay = tokio::time::timeout(Duration::from_secs(6), async {
+        while rt.crash_lock().restart_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    a.abort();
+    let _ = a.await;
+    assert!(
+        replay.is_ok(),
+        "B's real crash must get exactly one replay attempt"
+    );
+    rt.kill_core().await.expect("reap B");
+}
+
+/// B's real exit is queued while A backs off, but a later explicit Stop owns
+/// the lifecycle before A wakes. The old replay ticket cannot restart B.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopped_superseded_crash_does_not_replay() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    *rt.current_config.write().unwrap() = Some(serde_json::json!("config-a"));
+    let a_gen = rt.gate.generation();
+    let a_event = crash_event_for_test(&rt, a_gen);
+    let a = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.run_crash_recovery(a_event).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !rt.crash_lock().is_restarting() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A entered backoff");
+
+    let b_gen = rt
+        .gate
+        .claim_generation(Some(a_gen), LifecycleKind::Start)
+        .unwrap();
+    *rt.current_config.write().unwrap() = Some(serde_json::json!("config-b"));
+    let mut b = DirectCoreRun::new(spawn_crash_test_child());
+    b.child_for_test().kill().await.expect("B exits");
+    let b_identity = b.identity.clone();
+    rt.child.lock().unwrap().install_running_for_test(b);
+    let b_event = rt
+        .reset_crashed_run_state(b_gen, Some(&b_identity))
+        .await
+        .expect("B crash captured");
+    rt.run_crash_recovery(b_event).await;
+    assert!(rt.crash_lock().pending_replay_event().is_some());
+
+    rt.stop().await.expect("later explicit Stop");
+    tokio::time::timeout(Duration::from_secs(5), a)
+        .await
+        .expect("A must retire after Stop")
+        .expect("A task finished");
+    assert_eq!(rt.crash_lock().restart_count(), 1);
+    assert!(!rt.crash_lock().is_restarting());
+    assert_eq!(rt.gate.generation(), b_gen.wrapping_add(1));
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn admission_failure_returns_recovery_single_flight_token() {
+    let (rt, dir) = test_runtime();
+    *rt.current_config.write().unwrap() = Some(bad_config());
+    std::fs::write(
+        dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE),
+        b"bad marker",
+    )
+    .unwrap();
+    let birth = rt.gate.generation();
+    let event = crash_event_for_test(&rt, birth);
+    tokio::time::timeout(Duration::from_secs(5), rt.run_crash_recovery(event))
+        .await
+        .expect("admission failure ends the recovery task");
+    assert!(
+        !rt.crash_lock().is_restarting(),
+        "terminal admission must return the in-flight token"
+    );
+    std::fs::remove_file(dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE)).unwrap();
+    assert!(matches!(
+        drive_crash_decision(&mut rt.crash_lock(), monotonic_now_ms(), birth),
+        AutoRestartOutcome::Attempt { .. }
+    ));
+}
+
+/// A denied restart owns no lifecycle generation; an attempted restart that
+/// entered Stop/Start returns only the generation it actually claimed.
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_restart_receipt_distinguishes_preclaim_and_owned_errors() {
+    let (rt, dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let birth = rt.gate.generation();
+    let marker = dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE);
+    std::fs::write(&marker, b"bad marker").unwrap();
+    assert!(matches!(
+        rt.restart_guarded_outcome(bad_config(), Some(birth)).await,
+        RestartLeg::Finished(Err(_), None)
+    ));
+    assert_eq!(rt.gate.generation(), birth, "preclaim error must not bump");
+
+    std::fs::remove_file(marker).unwrap();
+    let receipt = rt.restart_guarded_outcome(bad_config(), Some(birth)).await;
+    let owned = match receipt {
+        RestartLeg::Finished(Err(_), Some(generation)) => generation,
+        _ => panic!("failed restart must return its owned generation"),
+    };
+    assert_eq!(owned, rt.gate.generation());
+    assert!(owned > birth);
+
+    let c_gen = rt
+        .gate
+        .claim_generation(Some(owned), LifecycleKind::Start)
+        .expect("later C claims after the old receipt");
+    assert_eq!(c_gen, owned.wrapping_add(1));
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        pid: 4242,
+        ..ProxyStatus::default()
+    };
+    rt.report_auto_restart_giveup_if_current(
+        owned,
+        &StartError::from("old recovery failure".to_string()),
+    );
+    assert!(rt.status().running, "old receipt must not overwrite C");
+    assert_eq!(rt.status().pid, 4242);
+    assert!(matches!(
+        rt.restart_guarded_outcome(bad_config(), Some(owned)).await,
+        RestartLeg::Superseded
+    ));
+    assert_eq!(rt.gate.generation(), c_gen);
+}
+
+/// A dead direct Child was observed while a later Start holds the TS state gate.
+/// The old monitor must wait for that gate and recheck the physical run before
+/// touching any shared state. A plain child-lock check before the first await
+/// would clear the replacement's watcher and binding state.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_direct_crash_cannot_reset_replacement_state_across_ts_gate() {
+    let (rt, _dir) = test_runtime();
+    let state_gate = rt.mesh.tailscale_state_gate().await;
+    let mut old = DirectCoreRun::new(spawn_crash_test_child());
+    old.child_for_test()
+        .kill()
+        .await
+        .expect("exit old stand-in");
+    let old_identity = old.identity.clone();
+    rt.child.lock().unwrap().install_running_for_test(old);
+
+    let monitor_rt = Arc::clone(&rt);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let mut stale_reset = tokio::spawn(async move {
+        let _ = entered_tx.send(());
+        monitor_rt
+            .reset_crashed_run_state(0, Some(&old_identity))
+            .await
+    });
+    entered_rx.await.expect("reset task started");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut stale_reset)
+            .await
+            .is_err(),
+        "old crash cleanup must wait while a new Start owns the TS state gate"
+    );
+
+    let next = DirectCoreRun::new(spawn_crash_test_child());
+    assert_eq!(
+        rt.gate.claim_generation(Some(0), LifecycleKind::Start),
+        Some(1),
+        "replacement Start claims its own generation before committing the Child"
+    );
+    let mut old = {
+        let mut slot = rt.child.lock().unwrap();
+        let old = slot.take_running_for_test().unwrap();
+        slot.install_running_for_test(next);
+        old
+    };
+    old.child_for_test()
+        .wait()
+        .await
+        .expect("reap old stand-in");
+    *rt.network_watcher.lock().unwrap() = Some(tokio::spawn(std::future::pending()));
+    rt.runtime_binding_state
+        .lock()
+        .unwrap()
+        .managed_tun_interface = ExitInterfaceId::from_alias("new-tun");
+    drop(state_gate);
+
+    assert!(stale_reset.await.expect("reset task").is_none());
+    assert!(rt.network_watcher.lock().unwrap().is_some());
+    assert_eq!(
+        rt.runtime_binding_state
+            .lock()
+            .unwrap()
+            .managed_tun_interface
+            .as_ref()
+            .and_then(ExitInterfaceId::alias),
+        Some("new-tun")
+    );
+    rt.stop_network_watcher();
+    rt.kill_core().await.expect("reap replacement stand-in");
+}
+
+/// An old physical run may finish after a newer Start has claimed the gate.
+/// Recovery must neither overwrite the replacement's status nor count this
+/// exit as a crash of the newer generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_crash_recovery_cannot_borrow_new_start_generation() {
+    let (rt, _dir, events) = test_runtime_recording_errors();
+    let old_generation = rt.gate.generation();
+    let new_generation = rt
+        .gate
+        .claim_generation(Some(old_generation), LifecycleKind::Start)
+        .unwrap();
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        pid: 4242,
+        ..ProxyStatus::default()
+    };
+
+    rt.run_crash_recovery(crash_event_for_test(&rt, old_generation))
+        .await;
+
+    assert_eq!(rt.gate.generation(), new_generation);
+    assert!(
+        rt.status().running,
+        "old crash must preserve the new run status"
+    );
+    assert_eq!(rt.status().pid, 4242);
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "old crash must not emit a new run error"
+    );
+    assert_eq!(rt.crash_lock().restart_count(), 0);
+
+    // With a config available, the stale event must also leave the recovery
+    // machine untouched; a missing config alone would bypass that branch.
+    let (configured, _dir) = test_runtime();
+    *configured.current_config.write().unwrap() = Some(serde_json::json!({}));
+    let birth = configured.gate.generation();
+    configured
+        .gate
+        .claim_generation(Some(birth), LifecycleKind::Start)
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        configured.run_crash_recovery(crash_event_for_test(&configured, birth)),
+    )
+    .await
+    .expect("stale crash must return before any recovery backoff");
+    assert_eq!(configured.crash_lock().restart_count(), 0);
+}
+
+/// A conditional restart that lost its Stop claim cannot use the newer run's
+/// running status as evidence that the old crash was repaired.
+#[tokio::test(flavor = "multi_thread")]
+async fn superseded_recovery_restart_returns_no_success_receipt() {
+    let (rt, _dir) = test_runtime();
+    let birth = rt.gate.generation();
+    rt.gate
+        .claim_generation(Some(birth), LifecycleKind::Start)
+        .unwrap();
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        pid: 4242,
+        ..ProxyStatus::default()
+    };
+
+    let receipt = rt
+        .restart_guarded_outcome(serde_json::json!({}), Some(birth))
+        .await;
+    assert!(
+        matches!(receipt, RestartLeg::Superseded),
+        "new run status is not an old-run restart receipt"
+    );
+    assert_eq!(rt.status().pid, 4242);
+    assert_eq!(rt.gate.depth(), 0, "outer restart scope must be released");
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_recovery_skips_new_runs_admission_error() {
+    let (rt, dir, events) = test_runtime_recording_errors();
+    let birth = rt.gate.generation();
+    rt.gate
+        .claim_generation(Some(birth), LifecycleKind::Start)
+        .unwrap();
+    // This marker would reject a legacy restart if the old recovery attempted
+    // admission after the replacement claimed ownership.
+    std::fs::write(
+        dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE),
+        b"bad marker",
+    )
+    .unwrap();
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        pid: 4242,
+        ..ProxyStatus::default()
+    };
+
+    let receipt = rt
+        .restart_guarded_outcome(serde_json::json!({}), Some(birth))
+        .await;
+    assert!(matches!(receipt, RestartLeg::Superseded));
+    assert_eq!(rt.status().pid, 4242);
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(rt.gate.depth(), 0);
+}
+
+/// The fence must still perform old-run cleanup when no replacement exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn current_direct_crash_still_resets_its_own_state() {
+    let (rt, _dir) = test_runtime();
+    let mut run = DirectCoreRun::new(spawn_crash_test_child());
+    run.child_for_test().kill().await.expect("exit stand-in");
+    let identity = run.identity.clone();
+    rt.child.lock().unwrap().install_running_for_test(run);
+    *rt.network_watcher.lock().unwrap() = Some(tokio::spawn(std::future::pending()));
+    rt.runtime_binding_state
+        .lock()
+        .unwrap()
+        .managed_tun_interface = ExitInterfaceId::from_alias("old-tun");
+
+    assert!(rt
+        .reset_crashed_run_state(0, Some(&identity))
+        .await
+        .is_some());
+    assert!(rt.network_watcher.lock().unwrap().is_none());
+    assert!(rt
+        .runtime_binding_state
+        .lock()
+        .unwrap()
+        .managed_tun_interface
+        .is_none());
+    rt.kill_core().await.expect("reap stand-in");
+}
+
 // ── Fix 2：崩溃自愈 supersede-crash 补发（M-2′-G1）传真实在途世代 ──
 
 /// `drive_crash_decision` seam 读回**真实在途世代**喂 handle_crash（非硬编码 None）。
@@ -171,7 +741,10 @@ async fn diagnostic_slow_start_axis_fed_and_rendered() {
         c
     };
     let child = cmd.spawn().expect("spawn 占位核");
-    *rt.child.lock().unwrap() = Some(child);
+    rt.child
+        .lock()
+        .unwrap()
+        .install_running_for_test(DirectCoreRun::new(child));
 
     // 管理 API 端口：先取空闲口但不监听。把 wait_ready 放到独立任务中，等其 `on_retry` 屏障
     // 明确证明首探已经失败后才 bind。固定 700ms 在 Windows hosted runner 上并不构成先后关系：

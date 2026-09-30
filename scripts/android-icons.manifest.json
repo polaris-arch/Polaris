@@ -1,0 +1,45 @@
+{
+  "_": "由 scripts/gen-android-icons.mjs 生成；ui/src/contracts/android-launcher-icon.test.ts 据此钉住位图来源。请勿手改。",
+  "generator": "scripts/gen-android-icons.mjs",
+  "renderer": "rsvg-convert version 2.61.3",
+  "source": {
+    "path": "src-tauri/icons/polaris-logo.svg",
+    "sha256": "15ff81ba7258feac800a24857b2587d983cf5432d4fd7b6325d97898f708a8b4"
+  },
+  "geometry": {
+    "canvas": 1024,
+    "tileSide": 824,
+    "starCircumscribedDiameter": 628.32,
+    "starOverTile": 0.76252,
+    "adaptiveCanvasDp": 108,
+    "guaranteedViewportDp": 72,
+    "safeCircleDp": 66,
+    "starDiameterDp": 54.9017,
+    "srcToDp": 0.087378641
+  },
+  "files": {
+    "src-tauri/gen/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml": "5bef67e3eba5c56f6ca0f96173c76e654977bce5ea91f0161fce94c5f52bbef7",
+    "src-tauri/gen/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml": "5bef67e3eba5c56f6ca0f96173c76e654977bce5ea91f0161fce94c5f52bbef7",
+    "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher.png": "cb38d309dc6b618ae245b47090c57a782c2bcec7462a4a8674c8a20011d67a6e",
+    "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png": "1a6e764d60bb268b5ae2112b74a977081e394741a2a9224af515c7f9de87f00e",
+    "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher_monochrome.png": "a30ee5169415805686e19e6ce7f94244d3ad57cf3d09e0df0f15ad4ac5f473cd",
+    "src-tauri/gen/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png": "f01080a536fab57b88a92372dc75285dc8a4c3d879d9cb708b8e64e5c10936bf",
+    "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher.png": "f76af8310b92b1999faba132814b6bf4ddf923c2f2f239dceeaedcea2df99423",
+    "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher_foreground.png": "15d6e305ea9fa8ce0434e71605d1e55ff1b791fd34d70b48da7ac2f66c663007",
+    "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher_monochrome.png": "142c55b0594bdadc7bd29902705be84afa1dbb8a65e31ebb142350f0ab277892",
+    "src-tauri/gen/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png": "6be33c59b3f111d3d7e1831f706bee8ade935c177b5bafa8d663173f54854a15",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png": "444741852c6c256adba23fef7c4823c4939919660e12edda1c0e1ae01b2d10cd",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.png": "74fd9d234a61008fc385bd36327fdef526dcc4b01a4c459182ef4d0162828a3f",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher_monochrome.png": "0f84d1a19b8172fbd64f53363506f0dba7c9f5f193c2c58e08e74292cf1ba846",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png": "fc719e7466cf05b57f9b3ccf06a59922b49f3bded3c0bbd3065ad13be596c1e9",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png": "da91db7393ac9478843effac2dc1e8b0adf8eda3739f5f993622a1218939e714",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png": "f0725bbeed2ffd1af68275cf0e53190f3ad9b85904924283c77008d21768f0bb",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_monochrome.png": "f4a4c491c8a88975de27bcd98e6297419087697d282fff0973e03a785984f376",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png": "ccf08efc0d909c99e75f030bf23db965617bfb5c15d9aeb41f57ceeaa6e0e005",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png": "4302a1215347795be3632ce61115e6720d2ba331dd82865e417b0d752d966409",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png": "88c243ca86ace4f0406e3344211182da3b0f28c54fbb9b47be247e05fcced165",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_monochrome.png": "7b0ffe2eecdb40bda21b4b00ca4762225907dce72f4f7fdb2f344a590de8d079",
+    "src-tauri/gen/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png": "5f1ddd03b18e2c6a70d1ab78a0ded856b9bf32f84e0bdaa34240ad449fd3e803",
+    "src-tauri/gen/android/app/src/main/res/values/ic_launcher_background.xml": "a2f938910dbb59737709a81002d2a6c9bb05d1c65b131eb6fe05447746ff978f"
+  }
+}

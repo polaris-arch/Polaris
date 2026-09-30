@@ -23,7 +23,7 @@
  * 登记见 `lib/config-write-wiring.test.ts` 里本文件那行 `api.server.update(`。
  * key 本体在这一层**结构上不可达**：判据是 `hasTsAuthKey(node)` 这个布尔，不是字符串。
  *
- * 无 TS 节点时（未登录）：给 mesh-note 引导先登录，Save/Logout 置灰（无可写目标）。
+ * 无 TS 节点时：给 mesh-note 引导先登录，Save/登录动作置灰（无可写目标）。
  * R1：`key` 绑 TS 节点 id（见导出包装）+ useState 同步初始化。
  */
 
@@ -50,10 +50,10 @@ import {
   invalidTsCidrs,
   invalidControlUrl,
   peersForTsNode,
-  EXIT_CUSTOM,
 } from './ts-settings-logic';
 import { applyDetour, endpointDetourOptions } from './detour-options';
-import { applyOnDemand, onDemandDraftValue, ON_DEMAND_FIELD } from './on-demand-field';
+import { TS_ADV_SPEC, tsMainSpec } from './ts-spec';
+import { applyOnDemand, onDemandDraftValue } from './on-demand-field';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
@@ -79,60 +79,8 @@ function TsSetIcon() {
   );
 }
 
-function mainSpec(
-  exitOpts: readonly SelectOption[],
-  detourOpts: readonly SelectOption[],
-  interfaceOpts: readonly SelectOption[],
-): FieldSpec[] {
-  return [
-    { t: 'text', k: 'name', label: 'ts.nodeName' },
-    { t: 'text', k: 'hostname', label: 'ts.hostname', ph: 'sway-macbook' },
-    { t: 'select', k: 'exitNode', label: 'ts.exitNode', options: exitOpts },
-    { t: 'text', k: 'exitNodeCustom', label: 'ts.exitNodeCustom', ph: '100.x.y.z / hostname', mono: true, when: (v) => v.exitNode === EXIT_CUSTOM },
-    // 接入模式（上游 `AccessModeField`，同绑 reverseMesh）：上游 归常显的「接入与出口」段，故**不入高级折叠**——
-    // 它决定 `meshUsesSystemInterface`，进而决定该节点是否参与测速（domain/endpoint-routes.ts:320）。
-    // 藏起来 = 用户卡在「为什么这个节点测不出速」。降级由后端兜底（builder/outbounds.rs:145 在非 TUN /
-    // Windows 上把 system_interface 打回 false），故此处只需如实告知，不必复刻 上游的置灰选择器。
-    { t: 'switch', k: 'reverseMesh', label: 'ts.reverseMesh', hint: 'ts.reverseMeshHint' },
-    { t: 'switch', k: 'alwaysRouteSubnets', label: 'ts.alwaysRoute', hint: 'ts.alwaysRouteHint' },
-    { t: 'switch', k: 'acceptRoutes', label: 'ts.acceptRoutes', hint: 'ts.acceptRoutesHint' },
-    // routes ≠ advertiseRoutes（两个相反方向，上游 同样分列两处、绝不合并）：
-    //   routes         = 把这些网段的流量**送进**此节点（force-route 源，等价 WG allowedIPs）；
-    //   advertiseRoutes= 本机作子网路由器**对外宣告**我能到达这些段。
-    { t: 'text', k: 'routes', label: 'ts.routes', ph: '192.168.50.0/24, 10.0.0.0/24', mono: true, opt: true },
-    { t: 'switch', k: 'exitNodeAllowLanAccess', label: 'ts.allowLan', hint: 'ts.allowLanHint' },
-    { t: 'text', k: 'advertiseRoutes', label: 'ts.advertiseRoutes', ph: '192.168.1.0/24, 10.0.0.0/8', mono: true, opt: true },
-    // 前置代理 —— **对 上游的有意偏离**（它的 Tailscale 表单没有这一项）。接线与实测见
-    // `detour-options.ts` 文件头 / `crates/config-engine/src/singbox/endpoint.rs`。
-    //
-    // **提示文案与 WG/WARP 那两处刻意不同**：Tailscale 经前置代理的是**控制面 / DERP 的 TCP 拨号**
-    // （2026-07-31 loopback A/B 实测：有 detour ⇒ 控制面直连 0 次、SOCKS5 `CONNECT` 32 次），
-    // 只需 TCP，没有 WG 那条「必须支持 UDP 转发」的硬约束。抄同一句话会误导用户去换代理。
-    { t: 'select', k: 'detour', label: 'ts.detour', options: detourOpts, hint: 'ts.detourHint' },
-    { t: 'select', k: 'bindInterface', label: 'node.bindInterface', options: interfaceOpts, hint: 'node.bindInterfaceHint' },
-  ];
-}
-const ADV_SPEC: FieldSpec[] = [
-  { t: 'text', k: 'controlUrl', label: 'ts.controlUrl', ph: 'https://controlplane.tailscale.com', mono: true, opt: true },
-  { t: 'text', k: 'advertiseTags', label: 'ts.aclTags', ph: 'tag:server, tag:exit', mono: true, opt: true },
-  { t: 'switch', k: 'ephemeral', label: 'ts.ephemeral', hint: 'ts.ephemeralHint' },
-  // 低频专家项，跟 上游 一样归「高级」。u16：越界值会让整份 UserConfig 反序列化失败（同 server_config.rs:208
-  // 记的那类整机不可用），故提交前限 1..=65535，越界按未填处理。
-  // 自己这条 WireGuard 腿的 UDP 口。留空 = tsnet 随机选；填死才能在上游路由做端口映射，
-  // 决定的是「能不能直连打洞」而不是「通不通」—— 不填也能用（回落 DERP 中继），只是绕远。
-  // 越界口径同 relayServerPort（见其注释）。
-  { t: 'number', k: 'listenPort', label: 'ts.listenPort', hint: 'ts.listenPortHint', ph: '41641', mono: true, opt: true },
-  { t: 'number', k: 'relayServerPort', label: 'ts.relayPort', ph: '0', mono: true, opt: true },
-  { t: 'switch', k: 'sshServer', label: 'ts.ssh', hint: 'ts.sshHint' },
-  // P4b 按名解析：与 acceptDefaultResolvers 强联动。后端 `accept_default_resolvers` **只在 resolveByName
-  // 为真的分支里被读**（builder/dns.rs:1069，选节点的谓词就是 resolve_by_name==Some(true)）—— 故此前
-  // 「接受 DNS（MagicDNS）」那个常显开关是**恒无效**的：resolveByName 无处可设 ⇒ dns-tailscale server 永不发射。
-  // 两者同归高级并加 `when` 门控，既复刻 上游 分区，也让「开了没反应」这件事结构上不再可能。
-  { t: 'switch', k: 'resolveByName', label: 'ts.resolveByName', hint: 'ts.resolveByNameHint' },
-  { t: 'switch', k: 'acceptDefaultResolvers', label: 'ts.acceptDefaultResolvers', hint: 'ts.acceptDefaultResolversHint', when: (v) => v.resolveByName === true },
-  // 按需连接：与 `bindInterface` 同属 ServerConfig 顶层，定义与读写收在 `on-demand-field.ts` 一份。
-  ON_DEMAND_FIELD,
-];
+/* 字段表住在 `./ts-spec`（零 React 纯数据，两个客户端共用；拆分理由见那份文件头注）。
+   桌面「多 VPN 兼容」批新加的 `ON_DEMAND_FIELD` 已随 `TS_ADV_SPEC` 搬进那份文件。 */
 
 function TsSettingsForm({ node }: { node?: ServerConfig }) {
   const { t } = useTranslation();
@@ -153,6 +101,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
 
   const [peers, setPeers] = useState<TailscaleStatusPeer[]>([]);
   const [connected, setConnected] = useState<boolean | null>(null);
+  const [hasLoginState, setHasLoginState] = useState<boolean | null>(null);
   const [draft, setDraft] = useState<FormValues>(() => ({
     ...initTsDraft(node),
     name: node?.name ?? '',
@@ -199,6 +148,24 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     };
   }, [node?.id]);
 
+  useEffect(() => {
+    const id = node?.id;
+    if (!id) return;
+    let alive = true;
+    let revision = 0;
+    const readState = (): void => {
+      const request = ++revision;
+      setHasLoginState(null);
+      void api.server.tailscaleStateExists([id]).then(
+        (states) => { if (alive && request === revision) setHasLoginState(typeof states[id] === 'boolean' ? states[id] : null); },
+        () => { if (alive && request === revision) setHasLoginState(null); },
+      );
+    };
+    readState();
+    window.addEventListener('focus', readState);
+    return () => { alive = false; window.removeEventListener('focus', readState); };
+  }, [node?.id]);
+
   // 判据取**已保存值**而非草稿值（禁用豁免须在整个弹窗生命期内稳定，见 exitNodeOptions 头注）。
   const savedExit = node?.tailscaleSettings?.exitNode ?? '';
   const exitOpts = exitNodeOptions(peers, savedExit, {
@@ -223,12 +190,16 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       down: t('settings.network.interfaceDown'),
     },
   ).map(({ value, label, disabled }) => [value, label, disabled]);
-  const spec = mainSpec(exitOpts, detourOpts, interfaceOpts);
+  // 桌面名称随表单草稿保存；移动端已有独立名称输入，其他字段共用 ts-spec。
+  const spec: FieldSpec[] = [
+    { t: 'text', k: 'name', label: 'ts.nodeName' },
+    ...tsMainSpec(exitOpts, detourOpts, interfaceOpts),
+  ];
   const setField = (k: string, v: FormValue) => {
     setDraft((d) => ({ ...d, [k]: v }));
     setDirty(true);
   };
-  const groups = groupTsFields([...spec, ...ADV_SPEC]);
+  const groups = groupTsFields([...spec, ...TS_ADV_SPEC]);
 
   const requestClose = () => {
     if (!dirty) {
@@ -362,6 +333,11 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     setBusy(true);
     try {
       await api.server.tailscaleLogout(node.id);
+      const store = useAppStore.getState();
+      store.setTailscaleLoginState(node.id, false);
+      store.setTailscaleAuthUrl(node.id, null);
+      store.setTailscaleLoginInitiated(node.id, false);
+      store.clearTailscaleStatus(node.id);
       void loadConfig(true);
       close();
     } catch (e) {
@@ -377,7 +353,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   /**
    * Auth Key 状态行 —— 归**基础**页而非高级：本行存在的理由就是「用户此前无从知道盘上还躺着一把
    * 长期凭据」（`TsLoginDialog` 的输入框从不回填、退出登录也明说保留 authKey）。把唯一的可见面
-   * 再折进高级页，等于只解决了一半。同族的「退出登录」同样常驻（footer），二者视觉分量相称。
+   * 再折进高级页，等于只解决了一半。footer 账号动作按本机 state 是否存在切换登录/退出。
    *
    * ⚠️ 这里渲染的每一样东西都是**布尔派生**：三档状态文案 + 一颗按钮。key 的明文、前缀、后几位、
    * 长度一概不进 DOM —— 截图/录屏/演示都会把 DOM 里的东西带出去，而 pre-auth key 是长期凭据。
@@ -419,7 +395,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       className="entry-form-dlg"
       footer={
         <>
-          <button
+          {hasLoginState === true ? <button
             type="button"
             className="btn ghost"
             onClick={() => void handleLogout()}
@@ -427,7 +403,15 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
             style={{ marginRight: 'auto', color: 'hsl(var(--err))', borderColor: 'hsl(var(--err)/0.3)' }}
           >
             {t('ts.logout')}
-          </button>
+          </button> : <button
+            type="button"
+            className="btn ghost"
+            disabled={busy || !node}
+            style={{ marginRight: 'auto' }}
+            onClick={() => { if (node) { close(); open({ kind: 'ts-login', serverId: node.id }); } }}
+          >
+            {t(hasLoginState === false ? 'ts.signIn' : 'meshJoin.switchAccount')}
+          </button>}
           {/* 提交中**不锁**「取消」：原型 `:2545` 的 ghost 钮无 disabled，且本仓此前四个弹窗锁、
               两个不锁（NodeDialog/SubDialog）—— 不是与原型的差，是实现自己两套。统一为不锁：
               提交卡住（IPC 无应答）时用户必须还能退出，否则弹窗成了死窗。 */}
@@ -490,6 +474,9 @@ export function TsSettingsDialog({ serverId }: { serverId: string }) {
   // 不一定是调用方（`node-edit-routing.ts` / `MeshJoinDialog`）想编辑的那个）。取不到（节点已被删 /
   // id 不匹配）**不回落到任意节点**：走 `TsSettingsForm` 已有的 `!node` 空态（mesh-note 引导 + Save/Logout 置灰）。
   const servers = useEffectiveServers();
+  // 按 `serverId` 寻址，**不按协议 `.find()`**：Tailscale 已不是单例
+  // （`meshSingletonConflict` 只剩 WARP 支），按协议取「任意一个」会让编辑第二个节点
+  // 打开/写坏第一个（同 `node-edit-routing.ts` 记的那条缺陷）。
   const node = servers.find((s) => s.id === serverId);
   return <TsSettingsForm key={node?.id ?? 'none'} node={node} />;
 }

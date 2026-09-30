@@ -405,6 +405,26 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
         command::common::PING => Request::Ping,
         command::common::VERSION => Request::Version,
         command::common::STATUS => Request::Status,
+        command::common::NATIVE_STATUS_BIRTH if args.is_empty() => Request::NativeStatusBirth,
+        command::common::NATIVE_STOP_BIRTH => Request::NativeStopBirth {
+            target: polaris_helper_proto::parse_native_birth_stop_args(args)?,
+        },
+        command::common::NATIVE_START_BIRTH if (3..=4).contains(&args.len()) => {
+            if !matches!(args[2], "0" | "1") {
+                return None;
+            }
+            let parent_pid = if args.len() == 4 {
+                Some(args[3].parse::<u32>().ok().filter(|pid| *pid > 0)?)
+            } else {
+                None
+            };
+            Request::NativeStartBirth(polaris_helper_proto::StartParams {
+                cfg: next_line().to_owned(),
+                log: next_line().to_owned(),
+                fwd: next_line() == "1",
+                parent_pid,
+            })
+        }
         // stop 的受管 pid 身份行可选：旧客户端不发 → next_line() 返 "" → None（旧语义）。
         command::common::STOP => Request::Stop {
             pid: polaris_helper_proto::parse_stop_pid(next_line()),

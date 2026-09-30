@@ -20,7 +20,7 @@
 //!
 //! # 为什么数源码而不是数报告
 //!
-//! `cargo test` 报告里的 ignored 数**是平台相关的**：Linux 15 / Windows 16 / macOS 17
+//! `cargo test` 报告里的 ignored 数**是平台相关的**：受平台 cfg 与筛选器影响
 //! （平台专属的那几条在别的平台上被 cfg 掉、根本不编译）。写死任何一个数字都会在别的 CI 腿上假红。
 //! 源码里的 `#[ignore]` 总数是平台无关的事实，本门数它。
 //!
@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 // 登记表
 // ============================================================================
 
-/// 默认不跑的原因分类。**不许自造**：新形态必须先在这里加一个变体并说明它为什么不是已有的四类。
+/// 默认不跑的原因分类。**不许自造**：新形态必须先在这里加一个变体并说明它为什么不是已有类别。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
     /// 需要真实 sing-box 二进制（`POLARIS_SINGBOX_PATH`），会真起进程、真占端口。
@@ -49,6 +49,12 @@ enum Class {
     LiveHostState,
     /// 根本不是测试，是打印工具。用 `#[ignore]` 只为不进默认门。
     NotAGate,
+    /// 需要 root 的隔离私有文件系统门；只写临时目录，不操作真实 claims 或网络。
+    /// 与 LiveHostState 不同：权限是真实前提，被测布局始终由夹具拥有。
+    PrivilegedPrivateFs,
+    /// 被父测试以精确过滤器起出的私有子测试进程，不是可独立验收的门。
+    /// 与 NotAGate 打印工具不同：它是父门负责输入、身份与收尾的执行夹具。
+    PrivateChildFixture,
 }
 
 impl Class {
@@ -62,6 +68,8 @@ impl Class {
             Class::PublicNetwork => &["公网"],
             Class::LiveHostState => &["route", "proxy"],
             Class::NotAGate => &["非门"],
+            Class::PrivilegedPrivateFs => &["root-only"],
+            Class::PrivateChildFixture => &["private child fixture", "isolated root peer UID gate"],
         }
     }
 
@@ -71,6 +79,8 @@ impl Class {
             Class::PublicNetwork => "PublicNetwork",
             Class::LiveHostState => "LiveHostState",
             Class::NotAGate => "NotAGate",
+            Class::PrivilegedPrivateFs => "PrivilegedPrivateFs",
+            Class::PrivateChildFixture => "PrivateChildFixture",
         }
     }
 }
@@ -181,6 +191,87 @@ const REGISTRY: &[Entry] = &[
         file: "src-tauri/tests/release_escape_hatches.rs",
         test: "inventory",
         class: Class::NotAGate,
+    },
+    // 新增私有 root/子进程夹具与原生 gRPC 契约；每条单独登记，绝不按路径豁免。
+    Entry {
+        file: "crates/core-supervisor/src/exact_spawn/tests/mod.rs",
+        test: "no_network_fixture",
+        class: Class::PrivateChildFixture,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_provision_publishes_exact_v2_without_rewriting_existing_claims",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_old_private_or_partial_layout_is_never_repaired",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_concurrent_initializers_only_accept_the_completed_layout",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_existing_wrong_base_modes_and_owner_are_refused",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_symlink_and_untrusted_parent_are_refused",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_marker_bytes_links_mode_owner_and_allocator_size_are_strict",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_marker_and_allocator_replacements_do_not_rebind_old_fds",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_base_and_parent_replacements_are_detected",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_symlink_and_fifo_marker_never_block_or_publish",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_publication_sync_errors_survive_statically_valid_reopen",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_successful_handoff_keeps_the_original_deployment_fds",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_fresh_held_base_replacement_with_moved_files_is_not_published",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "root_peer_uids_with_original_ambient_caps_share_the_sticky_store",
+        class: Class::PrivilegedPrivateFs,
+    },
+    Entry {
+        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
+        test: "uid_worker",
+        class: Class::PrivateChildFixture,
+    },
+    Entry {
+        file: "crates/singbox-grpc/tests/native_clash_mode.rs",
+        test: "native_core_lists_and_switches_the_two_compiled_modes",
+        class: Class::RealCore,
     },
 ];
 
@@ -453,7 +544,7 @@ fn registry_and_source_agree_exactly() {
 
     // 计数写死是刻意的：数变了就说明有人动了「默认不跑」的集合，该停下来显式裁定，
     // 而不是让门自适应放行。数的是**源码里的 `#[ignore]` 总数**（平台无关），
-    // 不是 `cargo test` 报告里的 ignored（Linux 15 / Windows 16 / macOS 17，随平台变）。
+    // 不是 `cargo test` 报告里的 ignored（受平台 cfg 与筛选器影响，随平台变）。
     assert_eq!(
         sites.len(),
         REGISTRY.len(),
@@ -463,8 +554,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        18,
-        "默认不跑的测试数从 18 变成了 {} —— 这不是自动放行的事：\
+        34,
+        "默认不跑的测试数从 34 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );
@@ -509,12 +600,14 @@ fn class_matches_the_stated_reason() {
         bad.join("\n")
     );
 
-    // 阳性对照：四个类别都得有人用。某一类恒空 ⇒ 它的自洽判据从未被执行过。
+    // 阳性对照：每个类别都得有人用。某一类恒空 ⇒ 它的自洽判据从未被执行过。
     for class in [
         Class::RealCore,
         Class::PublicNetwork,
         Class::LiveHostState,
         Class::NotAGate,
+        Class::PrivilegedPrivateFs,
+        Class::PrivateChildFixture,
     ] {
         assert!(
             per_class.get(class.name()).copied().unwrap_or(0) > 0,

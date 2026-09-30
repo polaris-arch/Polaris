@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { TaildropTaskPhase, TaildropTaskSnapshot } from '@/contracts/taildrop';
+import { crateRootSource } from '@/contracts/rust-source.test-support';
 import {
   MAX_TAILDROP_TASK_SNAPSHOTS,
   mergeTaildropTaskSnapshots,
@@ -99,7 +100,7 @@ describe('Taildrop task 纵向接线契约', () => {
   });
 
   it('快照与取消 command 均注册，弹窗消费 taskId 取消腿', () => {
-    const main = readFileSync(resolve(src, '../../src-tauri/src/main.rs'), 'utf8');
+    const main = crateRootSource('src-tauri/src');
     expect(main).toMatch(/taildrop_tasks,\s*taildrop_task_cancel,/);
     const dialog = read('components/dialogs/TaildropDialog.tsx');
     expect(dialog).toContain('taildropTasks(serverId)');

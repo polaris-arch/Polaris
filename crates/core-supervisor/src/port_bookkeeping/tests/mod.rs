@@ -184,6 +184,87 @@ fn tokio_port_provider_returns_real_ephemeral_port() {
     assert!(port > 1023 || port > 0);
 }
 
+#[test]
+fn primary_api_ledger_retires_random_candidates_and_fixed_fallback() {
+    let ledger = PrimaryApiPortLedger::default();
+    let excluded = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let first = PortAllocator::new(SeededPortProvider::new(vec![Some(12001)]));
+    assert_eq!(ledger.allocate(&first, &excluded).unwrap().port, 12001);
+
+    // A retry first sees the old random endpoint, then chooses a fresh one.
+    let retry = PortAllocator::new(SeededPortProvider::new(vec![Some(12001), Some(12002)]));
+    assert_eq!(ledger.allocate(&retry, &excluded).unwrap().port, 12002);
+
+    // Even when every random bind fails, the fallback goes through the same ledger.
+    let fallback = PortAllocator::new(SeededPortProvider::new(vec![None; 5]));
+    assert_eq!(
+        ledger.allocate(&fallback, &excluded).unwrap(),
+        ResolvedPort {
+            port: 9091,
+            used_fallback: true,
+        }
+    );
+    assert_eq!(
+        ledger.allocate(&fallback, &excluded),
+        Err(PrimaryApiPortsExhausted)
+    );
+}
+
+#[test]
+fn primary_api_ledger_failure_and_cancellation_never_reuse_a_port() {
+    let ledger = PrimaryApiPortLedger::default();
+    let excluded = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let old = PortAllocator::new(SeededPortProvider::new(vec![Some(12345)]));
+    let port = ledger.allocate(&old, &excluded).unwrap().port;
+    // No success acknowledgement or release call exists: a failed/cancelled birth
+    // leaves the same reservation behind for this process.
+    assert_eq!(port, 12345);
+    let retry = PortAllocator::new(SeededPortProvider::new(vec![Some(port); 5]));
+    assert_eq!(ledger.allocate(&retry, &excluded).unwrap().port, 9091);
+    assert_eq!(
+        ledger.allocate(&retry, &excluded),
+        Err(PrimaryApiPortsExhausted)
+    );
+}
+
+#[test]
+fn primary_api_ledger_rejects_excluded_or_wrapped_fallback() {
+    let ledger = PrimaryApiPortLedger::default();
+    let excluded = PortExclusions::for_primary_api(Some(65535), None, None, None);
+    let allocator = PortAllocator::new(SeededPortProvider::new(vec![None; 5]));
+    assert_eq!(
+        ledger.allocate(&allocator, &excluded),
+        Err(PrimaryApiPortsExhausted)
+    );
+    let excluded = PortExclusions::for_primary_api(Some(9090), Some(9091), None, None);
+    assert_eq!(
+        ledger.allocate(&allocator, &excluded),
+        Err(PrimaryApiPortsExhausted)
+    );
+}
+
+#[test]
+fn primary_api_ledger_claim_is_atomic_across_starts() {
+    let ledger = std::sync::Arc::new(PrimaryApiPortLedger::default());
+    let excluded = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let ledger = ledger.clone();
+            let excluded = excluded.clone();
+            std::thread::spawn(move || {
+                let allocator = PortAllocator::new(SeededPortProvider::new(vec![Some(12001); 5]));
+                ledger.allocate(&allocator, &excluded)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 2); // random + fallback
+    assert_eq!(results.iter().filter(|r| r.is_err()).count(), 6);
+}
+
 // ── resolve_distinct_free_ports（测速探测池 K 端口批分配）─────────────────────
 
 #[test]

@@ -36,8 +36,33 @@ dist-package/
 *.pem
 *.p12
 
-# Tauri 生成物（generate_context 产出）
-src-tauri/gen/
+# Android release 签名密钥：**任何形态都不许入库**。
+# 真值在仓外 `~/.polaris/android/release.jks`（路径可用 POLARIS_KEYSTORE_FILE 覆盖），
+# 口令与别名只经环境变量传给 gradle（见 src-tauri/gen/android/app/build.gradle.kts 的
+# signingConfigs 段）—— 所以仓内**任何**位置出现下面这些文件都是事故，不是配置。
+# `key.properties` / `keystore.properties` 在 src-tauri/gen/android/.gitignore 里已被 Tauri 模板
+# 挡过一次，但那份只覆盖 gen/android/ 子树；这里把射程扩到全仓，并补上密钥库本体的两种扩展名。
+# 判据由 src-tauri/tests/android_release_signing_wiring.rs 持有（它从 gradle 里那条默认密钥库
+# 路径反推扩展名，再断言本文件确实忽略它）——别只删这几行而不动那道门。
+*.jks
+*.keystore
+keystore.properties
+key.properties
+
+# Tauri 生成物：`gen/schemas` 是 `generate_context` 每次构建重算的产物，不入库。
+#
+# 🔴 `gen/android` **入库**，不要退回整个 `src-tauri/gen/`：它不是生成物，是 Tauri 模板交给我们
+#    拥有并定制的真实 Gradle 工程。判据不是我的偏好 —— 模板自己在 `gen/android/.gitignore` 与
+#    `gen/android/app/.gitignore` 里只排除构建产物（`build` / `.gradle` / `.cxx` / `key.properties`）
+#    与它会重新生成的那几个文件；一个被忽略的目录不需要自带 .gitignore。
+#
+#    实证代价：`app/build.gradle.kts` 的 `ignoreAssetsPatterns` 修复（AGP 默认忽略 `_` 开头的
+#    assets 子目录，而 Tauri 恰好把 `../x` 铺成 `assets/_up_/x` ⇒ 三份许可文本与 28 份 .srs
+#    **一条都没进第一个 APK，且构建全绿**）就住在这个文件里。忽略它 = 那个修复活不过下一次
+#    `tauri android init`，且没有任何门会说话。
+#
+#    体积：排除构建产物后 3.2 MB（`app/build` 那 2.0 GB 由嵌套 .gitignore 挡住）。
+src-tauri/gen/schemas/
 
 # codegraph 索引（本地导航用）
 .codegraph/

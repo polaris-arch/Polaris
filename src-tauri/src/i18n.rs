@@ -238,7 +238,7 @@ pub fn resolve_effective(choice: &str, system: &[String]) -> Lang {
 /// 因为一个语言标签把整份配置（含 200 节点级 `servers`）深拷贝两遍。闭包内只取字段，不回调任何子系统。
 ///
 /// ⚠️ 调用方**不得**把本函数塞进另一个 `with_current` 闭包里：闭包内持着 `ConfigManager` 的读锁，
-/// 而本函数自己还要再读一次，递归读在有写者排队时永久阻塞。`main.rs` 的
+/// 而本函数自己还要再读一次，递归读在有写者排队时永久阻塞。`lib.rs` 的
 /// `tray_reconcile_reads_config_by_projection_not_full_clone` 在源码层面钉着这两条。
 #[must_use]
 pub fn app_lang(app: &AppHandle) -> Lang {
@@ -339,6 +339,7 @@ pub fn t(lang: Lang, key: &str) -> String {
 /// 本模块内每一条 `pub const` 都被 `every_declared_key_resolves_in_all_five_locales` 逐个查表
 /// 验证（五语种齐备），反向由 `every_native_key_in_locale_is_declared_here` 查死键。
 pub mod key {
+    pub const NATIVE_EXIT_BLOCKED: &str = "native.exitBlocked";
     // ── 托盘原生菜单（与浮层共用）──
     /// 「连接代理」。
     pub const TRAY_CONNECT: &str = "tray.connect";

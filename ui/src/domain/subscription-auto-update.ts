@@ -61,6 +61,19 @@ export function subAutoUpdateNoticeMode(
   return applyAllNodeChanges ? 'scheduled-auto-apply' : 'scheduled-selective';
 }
 
+/** Desktop and mobile explain the same schedule and apply policy using the existing copy. */
+export function subAutoUpdateNoticeKey(mode: SubAutoUpdateNoticeMode): string {
+  const keys: Record<SubAutoUpdateNoticeMode, string> = {
+    hidden: '',
+    'master-off': 'sub.autoUpdateNoticeMasterOff',
+    'startup-auto-apply': 'sub.autoUpdateNoticeStartupAutoApply',
+    'startup-selective': 'sub.autoUpdateNoticeStartupSelective',
+    'scheduled-auto-apply': 'sub.autoUpdateNoticeScheduledAutoApply',
+    'scheduled-selective': 'sub.autoUpdateNoticeScheduledSelective',
+  };
+  return keys[mode];
+}
+
 /**
  * 周期徽标显示的有效小时数。非正数/非法值/缺省均与后端一样回落 12 小时；0 的状态由
  * `subAutoUpdateStatus` 表达成 `startup-only`，不会拿这个回落值冒充真实周期。

@@ -207,9 +207,13 @@ const I18N_EXEMPT_FILES: Record<string, string> = {
   // 且内容本就是「像真数据的样例」，翻译它没有意义。
   'harness-fixture.ts': '开发 harness 的 mock 节点/订阅数据，不进产物（不在 vite 多入口里）',
   'tray-harness-main.tsx': '托盘 harness 的 mock 数据与演示用分组名，不进产物',
-  'src/main.tsx': 'i18n 初始化前的启动失败逃生页与错误上报前缀，必须零依赖',
+  // 抽自 `src/main.tsx`（两个应用入口共用同一份白屏防线）。裸 CJK 只有两类：转发给 Rust 日志的
+  // **开发者可见**前缀（与 console.* 同性质），以及兜底页的样式串；兜底页的**用户可见文案**走
+  // `i18n/recovery-text`（不经 i18next，因为 i18n 自己可能就是没起来的那个）。
+  'src/lib/renderer-recovery.ts': 'i18n 初始化前的启动失败上报前缀与逃生页装配，必须零依赖',
   'src/components/ErrorBoundary.tsx': '渲染/i18n 自身失败时仍可操作的双语逃生页，刻意零依赖',
   'src/components/screens/settings/SettingsDisplay.tsx': '语言选择项使用各语言自称名，不随当前 locale 翻译',
+  'src/mobile/settings/DisplayPage.tsx': '同上：移动端外观页的语言选择项同样用各语言自称名',
   'src/lib/staged-config.ts': '导出的治理策略表 why 字段，仅供测试审计，不进入任何用户界面',
 };
 
@@ -677,6 +681,13 @@ describe('G5b 全仓 FieldSpec 字面量：每个键都存在于 en-US', () => {
 describe('G5c FieldRenderer 每个字段类型都把 hint 收进统一信息提示', () => {
   const HINT_KEY = 'probe.hint.key';
   const FIELD_SPEC_SRC = readFileSync(join(SRC_DIR, 'components', 'dialogs', 'FieldSpec.tsx'), 'utf8');
+  /* union 的**定义处** 2026-09-06 搬进了 `field-spec.ts`（规格与渲染器拆开，两个客户端共用前者；
+     理由见那份文件头注）。渲染器仍在 `FieldSpec.tsx` ⇒ 下面的分支断言取材面不动，
+     只有「union 有哪几支」这一条跟着定义走 —— 判据的射程从来是「union 的分支」，不是某个文件名。 */
+  const FIELD_SPEC_UNION_SRC = readFileSync(
+    join(SRC_DIR, 'components', 'dialogs', 'field-spec.ts'),
+    'utf8',
+  );
   const html = (over: Record<string, unknown>) =>
     renderToStaticMarkup(
       createElement(FieldRenderer, {
@@ -697,8 +708,8 @@ describe('G5c FieldRenderer 每个字段类型都把 hint 收进统一信息提�
 
   it('自检：登记的字段类型 == FieldSpec 的全部 discriminant（漏登一支 = 这道门对它免检）', () => {
     // 真值取自 `FieldSpec.tsx` 源码里 union 定义处的 `t: '<kind>'` 字面量，不是手抄。
-    const block = FIELD_SPEC_SRC.match(/export type FieldSpec =([\s\S]*?)\n\n/);
-    if (!block) throw new Error('FieldSpec.tsx 里读不到 `export type FieldSpec = …` —— union 改写法了？');
+    const block = FIELD_SPEC_UNION_SRC.match(/export type FieldSpec =([\s\S]*?)\n\n/);
+    if (!block) throw new Error('field-spec.ts 里读不到 `export type FieldSpec = …` —— union 改写法了？');
     const kinds = [...block[1].matchAll(/\bt:\s*'([a-z]+)'/g)].map((m) => m[1]).sort();
     expect(kinds, 'FieldSpec 的 union 分支与本门登记的类型对不上').toEqual(
       [...Object.keys(RENDERABLE), ...DOM_ONLY].sort(),

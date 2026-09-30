@@ -37,12 +37,11 @@
 //!
 //! 代价因此是：健康路径 **恒 1 次 check ≈ 30ms**；有 K 个坏节点时 K+1 次。
 //!
-//! # `check` 不碰网络（这条是硬约束，实测取证而非假定）
+//! # 构造期资源边界
 //!
-//! `strace -f -e trace=socket,bind,connect,listen` 跑生产形状（含 TUN inbound + 管理 API + 119 节点）
-//! 的 `check`：**socket/bind/connect/listen 计数为 0**，且非 root 可跑。正向对照同一 strace 表达式能
-//! 抓到 loopback `connect`（`connect(3, {AF_INET, 127.0.0.1:9}) = -1 ECONNREFUSED`）⇒ 不是 strace 没抓到，
-//! 是真的一个都没有。这也意味着本门**不会**去抢 mixed 口/管理口 —— check 只解析与构造，不 Start。
+//! `check` 不调用 Start，但 decode/initialize 仍可能构造持久状态或平台资源。
+//! 某份配置的无 socket 观察不能推广为所有组件、所有版本零副作用。
+//! 本门只证明自己持有的 Child 原生退出与私有配置退休，不签构造 disposal 或全局 NoOwner。
 //!
 //! # 门的边界（说清楚它抓不到什么，比夸大它抓得到什么重要）
 //!
@@ -55,11 +54,17 @@
 use std::path::Path;
 use std::time::Duration;
 
+mod check_custody;
+pub use check_custody::{
+    assert_check_admission, begin_check_shutdown, settle_check_cleanup, shutdown_checks_for_exit,
+    with_check_admission, ValidationLifecycleError,
+};
+
 /// 单次 `sing-box check` 的超时。
 ///
 /// 实测生产形状 26–29ms（见模块头注表），5s ≈ 170× 余量，留给冷启首次读 79MB 核二进制、
-/// 慢盘、以及 Windows 上杀软对新进程的扫描。**超时不阻断起核**（→ [`ConfigCheckVerdict::Unavailable`]
-/// → fail-open），故这个上限只决定「最坏情况给起核多加多久」，不决定正确性。
+/// 慢盘、以及 Windows 上杀软对新进程的扫描。超时只有在原 Child native wait 和私有配置退休
+/// 都成功之后才成为诊断 Unavailable；保管未知属于 ValidationLifecycleError，必须中止新起核。
 ///
 /// 刻意**短于** `commands/proxy.rs::PROBE_CHECK_TIMEOUT`（8s）：那是用户主动点按钮、只等一个结果的
 /// 交互动作，等 8s 尚可；这里挂在**每次起核**的关键路径上，8s 的停顿会被当成「连接卡死」。
@@ -131,7 +136,7 @@ pub enum ConfigCheckVerdict {
     /// （`duplicate outbound/endpoint tag: d`）、`initialize router: ...`、陌生格式。
     /// 携带内核原话，**绝不归因到任何节点**（乱剥一个好节点比不剥更坏）。
     Unattributable(String),
-    /// 核不存在 / spawn 失败 / 超时 —— **无法判定**（failOpen）。
+    /// 核不存在 / 无 Child 的 spawn 失败 / 已确认清理的超时 —— 诊断无法判定（failOpen）。
     Unavailable(String),
 }
 
@@ -214,6 +219,40 @@ pub fn decide_peel(verdict: &ConfigCheckVerdict, elapsed: Duration, budget: Dura
 /// 两阶段的用词不同（decode 用复数 `outbounds[]`、initialize 用单数 `outbound[]`），故两种写法都认；
 /// 数组身份取自词干而非取自分支，这样万一哪个版本把用词统一了也不会漏。
 ///
+/// # Android（libbox `CheckConfig`）的第二套文本
+///
+/// Android 上没有核二进制（核是进程内 `.so`），闸门改问 `Libbox.checkConfig`。同一个上游
+/// `E.Cause`，两处调用点的 message 参数不同，故 decode 阶段的前缀是**另一个串**：
+///
+/// | | 调用点 | 产出前缀 |
+/// |---|---|---|
+/// | 桌面 | `cmd/sing-box/cmd_run.go:62` → `E.Cause(err, "decode config at ", path)` | `decode config at <路径>: ` |
+/// | libbox | `experimental/libbox/config.go:45` → `E.Cause(err, "decode config")` | `decode config: ` |
+///
+/// 可归因（本轮自己造坏配置、真跑 `Libbox.CheckConfig` 取回的原文）：
+///
+/// ```text
+/// decode config: outbounds[7]: unknown outbound type: nonexistent-proto
+/// decode config: outbounds[0].obfs: json: unknown field "obfs"
+/// decode config: outbounds[0].unknown_key: json: unknown field "unknown_key"
+/// decode config: endpoints[1]: unknown endpoint type: nope
+/// initialize outbound[3]: unknown method: bad-a
+/// initialize endpoint[0]: WireGuard is not included in this build, rebuild with -tags with_wireguard
+/// ```
+///
+/// 不可归因（同样返 `None`）：
+///
+/// ```text
+/// decode config: duplicate outbound/endpoint tag: d
+/// decode config: route.rules[0]: unknown rule action: nope
+/// initialize router: parse rule-set[0]: open /nonexistent/outbounds[1].srs: no such file or directory
+/// ```
+///
+/// **`initialize` 那半边一个字节都不用改**：那段错误由 `box.New(...)` 产生，两侧走同一份代码，
+/// 桌面只是外面多包了一层 `log.Fatal` 的 `FATAL[0000] ` 前缀，而本函数的 `line.find(INIT_MARKER)`
+/// 本来就用 `find` 不用 `strip_prefix`。libbox 侧没有 `FATAL[0000] ` 前缀、是单行 `error`
+/// （不是日志行），既有的「取最后一条非空行 + `find` 而非行首锚定」两条设计正好把它一并吃下。
+///
 /// # 为什么用 `strip_prefix` 精确锚定，而不是在整行里搜 `outbounds[`
 ///
 /// 满行子串搜索会把**消息正文更深处**碰巧出现的同名 token 当成路径。最要紧的现场是
@@ -239,16 +278,29 @@ pub fn decide_peel(verdict: &ConfigCheckVerdict, elapsed: Duration, budget: Dura
 ///
 /// 取**最后一条非空行**，理由同 `parse_probe_diagnostic`：Go `log.Fatal` 记一行即 `os.Exit`，真正终止
 /// 进程的诊断永远是最后一行；若未来版本在 FATAL 前加了前置噪声，取最后一行仍然对。
+/// 桌面核（`sing-box check`）的 decode 阶段前缀。marker 之后是「配置文件路径: 键路径: 消息」。
+///
+/// **不许改宽成 `"decode config"`**：那个前缀在上游还有另外三个调用点
+/// （`cmd_rule_set_merge.go:65`、`common/networkquality/networkquality.go:873`、`daemon/instance.go:184`），
+/// 放宽后桌面侧会多认三种今天认不到的来源，而那三种**没有取证** —— 与本模块「宁可归因不到也
+/// 绝不错误归因」的口径正相反。
+const DECODE_MARKER_DESKTOP: &str = "decode config at ";
+
+/// libbox（`Libbox.checkConfig`）的 decode 阶段前缀。marker 之后**紧接着**就是键路径，没有文件名。
+///
+/// 与 [`DECODE_MARKER_DESKTOP`] **互斥**：`decode config at …` 不含 `decode config: `，
+/// 反之亦然 ⇒ 两条腿不可能互相误吃，可以并列而不必合并成一个更宽的 marker。
+const DECODE_MARKER_LIBBOX: &str = "decode config: ";
+
 #[must_use]
 pub fn parse_kernel_rejection(raw: &str) -> Option<KernelRejection> {
-    const DECODE_MARKER: &str = "decode config at ";
     const INIT_MARKER: &str = "initialize ";
 
     let line = raw.lines().rev().find(|l| !l.trim().is_empty())?.trim();
 
     // marker 用 `find` 而非 `strip_prefix`：日志框架前缀 `FATAL[0000] ` 挡在前面，锚定行首会全数错过。
-    if let Some(i) = line.find(DECODE_MARKER) {
-        let after_marker = &line[i + DECODE_MARKER.len()..];
+    if let Some(i) = line.find(DECODE_MARKER_DESKTOP) {
+        let after_marker = &line[i + DECODE_MARKER_DESKTOP.len()..];
         // after_marker = "<配置文件路径>: <路径段>: <消息>"。用第一个 `": "` 跳过文件名 —— 分隔符恒是
         // 冒号+空格，而路径里的冒号（Windows 盘符 `C:\`）后面跟的是反斜杠不是空格（这条实测依据见
         // `commands/proxy.rs::parse_probe_diagnostic` 的「文件路径含冒号」小节，此处不重复取证）。
@@ -257,6 +309,14 @@ pub fn parse_kernel_rejection(raw: &str) -> Option<KernelRejection> {
             if let Some(r) = match_array_segment(rest) {
                 return Some(r);
             }
+        }
+    }
+    // libbox 腿：marker 之后**紧接着**就是键路径（没有文件名可跳），故锚定比桌面那条更紧 ——
+    // 中间不许有任何东西。两个 marker 互斥（`decode config at …` 不含 `decode config: `，反之亦然）
+    // ⇒ 不存在互相误吃，桌面那条判据一个字节都没动。
+    if let Some(i) = line.find(DECODE_MARKER_LIBBOX) {
+        if let Some(r) = match_array_segment(&line[i + DECODE_MARKER_LIBBOX.len()..]) {
+            return Some(r);
         }
     }
     if let Some(i) = line.find(INIT_MARKER) {
@@ -308,11 +368,14 @@ fn match_array_segment(s: &str) -> Option<KernelRejection> {
 
 /// 真跑 `sing-box <bin> --disable-color check -c <config_path>` 并映射三态。
 ///
-/// **不碰网络**（实测取证见模块头注）：`check` 只做 decode + initialize，不 Start，故不建 socket、
-/// 不绑端口 —— 这是它能安全地插在 spawn **之前**的前提（若它会绑 mixed 口，就会和随后的真核抢端口）。
+/// `check` 不调用 Start；构造期资源行为仍取决于组件和版本。本入口不证明
+/// state_directory、平台网络或普通 Go Close 的资源归属。
 ///
 /// `stdin` 置 null：`check` 不读标准输入，不置 null 会在无终端的 GUI 进程树里挂住。
-pub async fn run_config_check(binary: &Path, config_path: &Path) -> ConfigCheckVerdict {
+pub async fn run_config_check(
+    binary: &Path,
+    config_path: &Path,
+) -> Result<ConfigCheckVerdict, ValidationLifecycleError> {
     run_config_check_within(binary, config_path, CONFIG_CHECK_TIMEOUT).await
 }
 
@@ -324,66 +387,24 @@ pub async fn run_config_check_within(
     binary: &Path,
     config_path: &Path,
     timeout: Duration,
-) -> ConfigCheckVerdict {
-    decide_verdict(run_check_raw(binary, config_path, timeout).await)
+) -> Result<ConfigCheckVerdict, ValidationLifecycleError> {
+    Ok(decide_verdict(
+        run_check_raw(binary, config_path, timeout).await?,
+    ))
 }
 
-/// 全仓**唯一**的 `sing-box check` 子进程实现：起一次 check，读干两条流，带超时与
-/// `kill_on_drop`，把「子进程跑成什么样」原样交回调用方。
+/// 全仓唯一的 native check 入口。原 Child 与私有配置副本由持久 registry 保管，
+/// caller 取消仅请求关闭；不以 kill ACK、timeout 或丢弃 future 证明清理完成。
 ///
-/// # 为什么是一份而不是三份
-///
-/// 折叠之前，本仓有三处各写一遍的 `sing-box check`：本模块的起核闸门、瞬态登录核／测速临时核
-/// 起核前的自检（`src-tauri` 的 `SingBoxConfigChecker`）、以及「测试内核兼容性」按钮
-/// （`src-tauri` 的 `run_probe_check`）。同一段接线抄三遍的后果不是重复，是**三份各自漂**：
-/// 只有本处超时与 `kill_on_drop` 两样齐全，另两处一个连超时都没有（check 挂住 ⇒ 调用方永久
-/// 等待），一个有超时却没有 `kill_on_drop`（超时腿把 `output()` 的 future 直接丢掉，而
-/// `tokio::process::Child` 的 `kill_on_drop` **默认是 false** ⇒ 留下游离的 `sing-box check`）。
-///
-/// 三处的**返回类型与错误文案互不相同**，能共用的只有「怎么把子进程起起来、怎么把它收干净」
-/// 这一半；三态／二态的映射留在各自的调用点。超时值同理由调用方给：起核关键路径上的预算
-/// （[`CONFIG_CHECK_TIMEOUT`]）与用户手点一次按钮的预算不该相同。
-///
-/// # 不碰网络
-///
-/// 实测取证见模块头注：`check` 只做 decode + initialize，不 Start，故不建 socket、不绑端口 ——
-/// 这是它能安全地插在 spawn **之前**的前提（若它会绑 mixed 口，就会和随后的真核抢端口）。
-///
-/// `stdin` 置 null：`check` 不读标准输入，不置 null 会在无终端的 GUI 进程树里挂住。
-pub async fn run_check_raw(binary: &Path, config_path: &Path, timeout: Duration) -> RawCheck {
-    let mut builder = tokio::process::Command::new(binary);
-    builder
-        // 全局 flag 位（`check` 子命令位亦可，两处实测等效）；不加则 stderr 恒带 ANSI 彩色码，
-        // 且 sing-box **不看 stdout/stderr 是否为 tty**，管道里照样上色。
-        .arg("--disable-color")
-        .arg("check")
-        .arg("-c")
-        .arg(config_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // 🔴 超时腿会把 `output()` 的 future 直接丢掉，而 `tokio::process::Child` 的
-        // `kill_on_drop` **默认是 false** ⇒ 不置这一行就会留下一个游离的 `sing-box check`。
-        // 本函数挂在**每次起核**（含每条重试腿）上，不是用户手点一次的一次性动作，
-        // 泄漏会随重试累积。见 `times_out_and_kills_the_child` 那条门（带正向对照）。
-        .kill_on_drop(true);
-    // Windows：宿主是 GUI 子系统进程，起 console 程序（sing-box）会新分配控制台窗口。
-    // 本函数挂在**每次起核**上 ⇒ 不加就是每次连接闪一次黑框。tokio 无隐含默认，须显式给。
-    #[cfg(windows)]
-    builder.creation_flags(0x0800_0000);
-    let fut = builder.output();
-    match tokio::time::timeout(timeout, fut).await {
-        Err(_) => RawCheck::TimedOut {
-            after_secs: timeout.as_secs_f32(),
-        },
-        // spawn 失败（核缺失 ENOENT / 无执行权限 EACCES）→ 无法判定，**不是**配置无效。
-        Ok(Err(e)) => RawCheck::SpawnFailed(e.to_string()),
-        Ok(Ok(out)) => RawCheck::Done {
-            success: out.status.success(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        },
-    }
+/// 各调用方保留自己的诊断映射，但共同消费此处的 closing 与同 Child 清理事实。
+/// 历史 kill_on_drop 只能提出关闭请求，不能替代持久 custody 和原生 wait。
+/// 私有配置副本只保护输入文件寿命，不隔离配置引用的持久状态或平台资源。
+pub async fn run_check_raw(
+    binary: &Path,
+    config_path: &Path,
+    timeout: Duration,
+) -> Result<RawCheck, ValidationLifecycleError> {
+    check_custody::run_native_check(binary, config_path, timeout).await
 }
 
 /// [`run_check_raw`] 的产物 —— 把「子进程跑成什么样」从 tokio 类型里剥出来。
@@ -402,6 +423,8 @@ pub enum RawCheck {
         after_secs: f32,
     },
     SpawnFailed(String),
+    /// Output could not be read, after same-Child native exit and snapshot retirement.
+    OutputFailed(String),
     Done {
         success: bool,
         stderr: String,
@@ -422,6 +445,9 @@ fn decide_verdict(raw: RawCheck) -> ConfigCheckVerdict {
         }
         RawCheck::SpawnFailed(e) => {
             return ConfigCheckVerdict::Unavailable(format!("check 启动失败: {e}"))
+        }
+        RawCheck::OutputFailed(e) => {
+            return ConfigCheckVerdict::Unavailable(format!("check 输出读取失败: {e}"))
         }
         RawCheck::Done {
             success,
@@ -444,6 +470,42 @@ fn decide_verdict(raw: RawCheck) -> ConfigCheckVerdict {
         None => ConfigCheckVerdict::Unattributable(if raw.is_empty() {
             // check 非零退出但双流全空的病态腿：不能报空串，否则日志里只剩一句没有内容的「拒收」。
             "check 非零退出但无任何输出".to_string()
+        } else {
+            raw.to_string()
+        }),
+    }
+}
+
+/// Android 腿的三态映射：`Libbox.checkConfig` 的结果 → [`ConfigCheckVerdict`]。**纯函数**，无 I/O。
+///
+/// 入参形状 `Result<Option<String>, String>` 把两件必须分开的事分开：
+///
+/// | 入参 | 现场 | 判决 |
+/// |---|---|---|
+/// | `Err(why)` | **桥**本身失败（activity 不在 / 30s 无回应 / 插件没注册） | [`Unavailable`](ConfigCheckVerdict::Unavailable) |
+/// | `Ok(None)` | 内核收下（`checkConfig` 没抛异常） | [`Accepted`](ConfigCheckVerdict::Accepted) |
+/// | `Ok(Some(msg))` | 内核拒收，`msg` 是 `e.message`（Go `error.Error()` 原文） | 归因得到 ⇒ `Rejected`，否则 `Unattributable` |
+///
+/// **为什么不把「桥挂了」和「配置坏了」合成一个入参**：合并之后桥一挂就会被当成「内核拒收但
+/// 归因不到」，于是走 `Unattributable` ⇒ `Stop`，日志里写的是「内核拒收」——一句与事实相反、
+/// 且把排查方向指向配置的话。这正是 `run_probe_check` 那条已定口径（「核缺失/慢盘 ≠ 不兼容」）
+/// 的反面，不能在这里重演。桥失败走 `Unavailable` ⇒ fail-open 放行到起核，由内核自己报错。
+///
+/// **没有 rc、没有两条流**：`CheckConfig` 要么抛异常要么什么都不返回，所以这里不复用
+/// [`RawCheck`]（那是「子进程跑成什么样」的形状，Android 上没有子进程）。
+#[must_use]
+pub fn verdict_from_libbox_check(result: Result<Option<String>, String>) -> ConfigCheckVerdict {
+    let raw = match result {
+        Err(why) => return ConfigCheckVerdict::Unavailable(format!("Android 起核桥不可用：{why}")),
+        Ok(None) => return ConfigCheckVerdict::Accepted,
+        Ok(Some(raw)) => raw,
+    };
+    let raw = raw.trim();
+    match parse_kernel_rejection(raw) {
+        Some(r) => ConfigCheckVerdict::Rejected(r),
+        // 空串的病态腿与桌面同款处理：不能报空串，否则日志里只剩一句没有内容的「拒收」。
+        None => ConfigCheckVerdict::Unattributable(if raw.is_empty() {
+            "libbox checkConfig 抛出了空消息的异常".to_string()
         } else {
             raw.to_string()
         }),

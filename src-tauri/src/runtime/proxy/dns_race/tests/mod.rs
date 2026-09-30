@@ -91,6 +91,7 @@ async fn disabled_race_starts_no_sidecar() {
             })),
             directory.path(),
             gate.generation(),
+            Platform::Linux,
         )
         .await;
     assert_eq!(runtime.port(), 0);
@@ -112,6 +113,7 @@ async fn start_commits_sidecar_and_real_upstream_projection_then_replaces_it() {
             })),
             directory.path(),
             gate.generation(),
+            Platform::Linux,
         )
         .await;
     let (port, ips, ports) = runtime.config_projection();
@@ -126,6 +128,7 @@ async fn start_commits_sidecar_and_real_upstream_projection_then_replaces_it() {
             &config(serde_json::json!({ "resolveNodeDomainsAhead": false })),
             directory.path(),
             gate.generation(),
+            Platform::Linux,
         )
         .await;
     assert_eq!(runtime.config_projection(), (0, Vec::new(), Vec::new()));
@@ -141,13 +144,23 @@ async fn superseded_generation_cannot_clear_start_or_commit_over_takeover() {
     let generation_b = gate.bump_generation();
 
     runtime
-        .start(&config(enabled.clone()), directory.path(), generation_b)
+        .start(
+            &config(enabled.clone()),
+            directory.path(),
+            generation_b,
+            Platform::Linux,
+        )
         .await;
     let takeover_port = runtime.port();
     assert!(takeover_port > 0);
 
     runtime
-        .start(&config(enabled.clone()), directory.path(), generation_a)
+        .start(
+            &config(enabled.clone()),
+            directory.path(),
+            generation_a,
+            Platform::Linux,
+        )
         .await;
     assert_eq!(runtime.port(), takeover_port);
     assert!(!runtime.clear_owned(Some(generation_a)));
@@ -199,7 +212,12 @@ async fn registered_dead_callback_clears_its_generation_and_yields_to_takeover()
     let generation_a = gate.generation();
 
     runtime
-        .start(&config(enabled.clone()), directory.path(), generation_a)
+        .start(
+            &config(enabled.clone()),
+            directory.path(),
+            generation_a,
+            Platform::Linux,
+        )
         .await;
     let port_a = runtime.port();
     let callback_a =
@@ -207,7 +225,12 @@ async fn registered_dead_callback_clears_its_generation_and_yields_to_takeover()
 
     let generation_b = gate.bump_generation();
     runtime
-        .start(&config(enabled), directory.path(), generation_b)
+        .start(
+            &config(enabled),
+            directory.path(),
+            generation_b,
+            Platform::Linux,
+        )
         .await;
     let port_b = runtime.port();
     assert!(port_b > 0);
@@ -229,8 +252,20 @@ fn source_guards_pin_proxy_mode_threading_weak_callback_and_log_order() {
     let source = crate_code("runtime/proxy/dns_race.rs");
     let facade = crate_code("runtime/proxy.rs");
     let start = method_body(&source, "pub(super) async fn start(");
-    assert!(start
-        .contains("plan_upstreams(user_config.dns_config.as_ref(), user_config.proxy_mode_type)"));
+    // 接线门：生产 `start` 必须把**本平台生效值**喂给 `plan_upstreams`。
+    // 「机制有门、接线没门」在这一处的形态是：`ProxyModeType::effective_on` 自己有整张真值表的
+    // 单测（config-engine 侧），而这里若退回读裸值，那张表一格都不会红 —— INV-1 在 Android 上
+    // 静默失效，没有任何判据会说话。
+    // 折叠空白后再比：判据要对 rustfmt 的换行免疫，只在**判据本身**改动时才红。
+    let start_flat = start.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        start_flat.contains(
+            "plan_upstreams( user_config.dns_config.as_ref(), \
+             user_config.proxy_mode_type.effective_on(platform), )"
+        ),
+        "`DnsRaceRuntime::start` 必须把 `proxy_mode_type.effective_on(platform)` 喂给 \
+         `plan_upstreams`（INV-1 的接线点）。实得方法体：\n{start}"
+    );
     assert!(start.contains("Some(on_dead)"));
 
     let callback = method_body(&source, "fn dead_callback(");

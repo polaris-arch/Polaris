@@ -141,9 +141,13 @@ impl<R: CommandRunner> SystemProxyOpsImpl<R> {
                     bypass_domains: None,
                 })
             }
-            Platform::Other => Err(SystemIntegrationError::UnsupportedPlatform(
-                "system proxy".into(),
-            )),
+            // read_active_proxy。iOS 同 Other：活态查询要读的正是系统那份代理设置，而 iOS 上
+            // 它对第三方应用不可读（见 `ops.rs` 的 get_proxy_status 臂）。返 Err 让上层的
+            // 「代理是否仍指向我们」这条降级检测显式缺席，而不是拿 default 冒充「已确认未启用」
+            // ——本方法的整个存在理由就是抓那种静默的明文直连。
+            Platform::Other | Platform::Android | Platform::Ios => Err(
+                SystemIntegrationError::UnsupportedPlatform("system proxy".into()),
+            ),
         }
     }
 

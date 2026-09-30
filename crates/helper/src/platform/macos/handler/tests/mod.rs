@@ -11,6 +11,8 @@ struct TestServices {
     uid: i64,
     spawn_result: Mutex<Option<Result<u32, SpawnError>>>,
     terminate_calls: Mutex<u32>,
+    native_active: bool,
+    legacy_supported: bool,
 }
 
 impl TestServices {
@@ -22,6 +24,8 @@ impl TestServices {
             uid: 0,
             spawn_result: Mutex::new(Some(Ok(5555))),
             terminate_calls: Mutex::new(0),
+            native_active: false,
+            legacy_supported: true,
         }
     }
 
@@ -62,6 +66,12 @@ impl CommandRunner for TestServices {
 }
 
 impl MacServices for TestServices {
+    fn native_custody_active(&self) -> bool {
+        self.native_active
+    }
+    fn legacy_start_supported(&self) -> bool {
+        self.legacy_supported
+    }
     fn token_store(&self) -> &dyn TokenStore {
         self
     }
@@ -100,6 +110,102 @@ impl MacServices for TestServices {
         // 复用生产判定点（替身只记调用，不自抄一份判据 —— 否则删掉判据本测照样绿）。
         terminate_managed_child(&self.child, want_pid)
     }
+}
+
+#[test]
+fn default_native_services_never_upgrade_legacy_void_stop_to_receipt() {
+    let services = TestServices::new("token");
+    let target = HelperBirthTarget::parse_wire("42", "01010101010101010101010101010101").unwrap();
+    assert_eq!(
+        dispatch(
+            &services,
+            &test_config(),
+            "token",
+            &Request::NativeStatusBirth
+        ),
+        Response::Ok(ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Unknown { target: None }
+        ))
+    );
+    assert_eq!(
+        dispatch(
+            &services,
+            &test_config(),
+            "token",
+            &Request::NativeStopBirth { target }
+        ),
+        Response::Ok(ResponseKind::NativeBirthStop(NativeBirthStop::Unknown {
+            target
+        }))
+    );
+    let params = StartParams {
+        cfg: "/Users/test/Polaris/core.json".into(),
+        log: String::new(),
+        fwd: true,
+        parent_pid: None,
+    };
+    assert!(matches!(
+        dispatch(
+            &services,
+            &test_config(),
+            "token",
+            &Request::NativeStartBirth(params)
+        ),
+        Response::Err(_)
+    ));
+    assert!(
+        services.calls().is_empty(),
+        "unsupported native service cannot forward or use legacy spawn"
+    );
+    assert!(services.child.lock().unwrap().is_none());
+    assert_eq!(*services.terminate_calls.lock().unwrap(), 0);
+}
+
+#[test]
+fn legacy_requests_cannot_bypass_native_custody_or_apply_forwarding() {
+    let mut services = TestServices::new("token");
+    services.native_active = true;
+    *services.child.lock().unwrap() = Some(ChildHandle { pid: 42 });
+    for req in [
+        Request::Status,
+        Request::Stop { pid: Some(42) },
+        Request::Cleanup,
+        Request::FreePort { port: 9090 },
+        Request::Start(StartParams {
+            cfg: "/Users/test/Polaris/core.json".into(),
+            log: String::new(),
+            fwd: true,
+            parent_pid: None,
+        }),
+    ] {
+        assert!(matches!(
+            dispatch(&services, &test_config(), "token", &req),
+            Response::Err(_)
+        ));
+    }
+    assert!(
+        services.calls().is_empty(),
+        "native custody blocks pkill and sysctl"
+    );
+    assert_eq!(services.child.lock().unwrap().as_ref().unwrap().pid, 42);
+    assert_eq!(*services.terminate_calls.lock().unwrap(), 0);
+    services.native_active = false;
+    services.legacy_supported = false;
+    *services.child.lock().unwrap() = None;
+    let req = Request::Start(StartParams {
+        cfg: "/Users/test/Polaris/core.json".into(),
+        log: String::new(),
+        fwd: true,
+        parent_pid: None,
+    });
+    assert!(matches!(
+        dispatch(&services, &test_config(), "token", &req),
+        Response::Err(_)
+    ));
+    assert!(
+        services.calls().is_empty(),
+        "old clients are rejected before production Start writes"
+    );
 }
 
 fn test_config() -> MacConfig {

@@ -2,7 +2,8 @@
 //!
 //! 五条腿，全部 fire-and-forget、绝不阻断启动（**各占各的时刻**，见
 //! `startup_leg_delays_are_all_distinct`）：
-//! - **2s：启动时自动连接**（`config.autoConnect` + `selectedServerId`）。
+//! - **2s：启动时自动连接**（`config.autoConnect` + `selectedServerId`）；Android 上另有一条
+//!   **收编**腿：系统（always-on / 开机自动连接）在 Rust 不在时拉起的核，由同一条 `proxy_start` 收编。
 //! - **3s：首次出口 IP 探测**。
 //! - **5s：启动后自动检查更新**（`config.autoCheckUpdate !== false`）→ 有更新走既有 mini 弹窗；
 //!   若 `config.autoDownloadUpdate` 也开着，**顺带后台下载安装包但绝不安装**（见 [`spawn_auto_download`]）。
@@ -10,7 +11,7 @@
 //! - **7s：helper 可升级探测**（proto < 本 build 期望 → 发 `EVENT_HELPER_UPGRADEABLE`）。
 //!
 //! 上游 里同文件还有 staged 内核落位 / 随包核 reseed / WARP drain 三段：staged 落位与内核自动更新
-//! 已由 `runtime/core_update_scheduler.rs`（T+30s 起）承接，随包核 reseed 在 `main.rs` setup 的
+//! 已由 `runtime/core_update_scheduler.rs`（T+30s 起）承接，随包核 reseed 在 `lib.rs` setup 的
 //! `ensure_writable_core`，WARP drain 亦在 setup 单独接（`spawn_warp_drain`）——故本模块**只**接
 //! 上述五条腿，不重复接线。
 //!
@@ -66,6 +67,11 @@ static BASELINE_WARNED: AtomicBool = AtomicBool::new(false);
 pub enum AutoConnectDecision {
     /// 开关开 + 有选中节点 → 连。
     Connect { server_id: String },
+    /// 有一个**系统拉起、本运行时不认识**的核在跑（Android always-on / 开机自动连接，进程被回收后
+    /// 重拉时 Rust 是全新的）→ 不论 `autoConnect` 开没开，都走一次标准 `proxy_start` 把它收编：
+    /// 起核前的孤儿清扫腿先停掉它，再按当前配置起。不收编的话界面停在「未连接」而隧道其实在跑，
+    /// 且用户点「连接」前那段时间 Rust 的一切运行态（状态 / 数据面 / 崩溃监测）都是空的。
+    AdoptSystemCore { server_id: String },
     /// 开关开但没选节点 → 只 warn（对齐 上游「已启用，但未选择服务器」分支），不静默。
     NoServerSelected,
     /// 开关关（含缺省）→ 什么都不做。
@@ -74,16 +80,29 @@ pub enum AutoConnectDecision {
 
 /// 纯决策：`autoConnect` 显式为 true 才连（缺省 = 关，对齐 上游 `if (config.autoConnect && ...)`
 /// 的 truthy 判定）；空串 `selectedServerId` 视同未选（上游 里 `''` 也是 falsy）。
+///
+/// `system_core_running`：此刻是否有系统拉起、本运行时不认识的核（仅 Android 可能为真，见
+/// [`AutoConnectDecision::AdoptSystemCore`]）。它**优先于** `autoConnect`：用户的意图（连着）已经由
+/// 那个在跑的核表达了，开关只管「冷启动要不要主动连」。
 #[must_use]
-pub fn decide_auto_connect(config: &Value) -> AutoConnectDecision {
+pub fn decide_auto_connect(config: &Value, system_core_running: bool) -> AutoConnectDecision {
+    let selected = config
+        .get("selectedServerId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    if system_core_running {
+        return match selected {
+            Some(server_id) => AutoConnectDecision::AdoptSystemCore { server_id },
+            None => AutoConnectDecision::NoServerSelected,
+        };
+    }
     if config.get("autoConnect").and_then(Value::as_bool) != Some(true) {
         return AutoConnectDecision::Disabled;
     }
-    match config.get("selectedServerId").and_then(Value::as_str) {
-        Some(id) if !id.is_empty() => AutoConnectDecision::Connect {
-            server_id: id.to_string(),
-        },
-        _ => AutoConnectDecision::NoServerSelected,
+    match selected {
+        Some(server_id) => AutoConnectDecision::Connect { server_id },
+        None => AutoConnectDecision::NoServerSelected,
     }
 }
 
@@ -148,7 +167,7 @@ fn kind_label(build: CoreBuildKind) -> &'static str {
     }
 }
 
-/// 挂上五条启动期延迟任务。在 `main.rs` setup 内、主窗建好之后调用一次。
+/// 挂上五条启动期延迟任务。在 `lib.rs` setup 内、主窗建好之后调用一次。
 pub fn spawn(app: AppHandle) {
     spawn_auto_connect(app.clone());
     spawn_auto_check_update(app.clone());
@@ -174,16 +193,39 @@ fn spawn_exit_ip_probe(app: AppHandle) {
 fn spawn_auto_connect(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(AUTO_CONNECT_DELAY_MS)).await;
+        #[cfg(not(target_os = "android"))]
+        if let Err(error) = app.state::<AppRuntime>().config().admit_legacy_start() {
+            log::warn!("启动时自动连接准入拒绝: {error}");
+            return;
+        }
         let Some(config) = load_config(&app, "启动时自动连接") else {
             return;
         };
-        match decide_auto_connect(&config) {
+        // 非 Android 恒 false（桥那一侧的非 Android 腿），不必在这里再分平台。
+        let system_core_running =
+            crate::runtime::proxy::android_bridge::system_started_core_running().await;
+        match decide_auto_connect(&config, system_core_running) {
             AutoConnectDecision::Disabled => {}
             AutoConnectDecision::NoServerSelected => {
-                log::warn!("启动时自动连接已启用，但未选择服务器");
+                log::warn!(
+                    "启动时自动连接已启用（或系统拉起的核在跑={system_core_running}），但未选择服务器"
+                );
             }
-            AutoConnectDecision::Connect { server_id } => {
-                log::info!("启动时自动连接已启用（节点 {server_id}），正在连接...");
+            AutoConnectDecision::Connect { server_id }
+            | AutoConnectDecision::AdoptSystemCore { server_id } => {
+                #[cfg(not(target_os = "android"))]
+                if let Err(error) = app.state::<AppRuntime>().config().admit_legacy_start() {
+                    log::warn!("启动时自动连接准入拒绝: {error}");
+                    return;
+                }
+                log::info!(
+                    "启动时{}（节点 {server_id}），正在连接...",
+                    if system_core_running {
+                        "收编系统拉起的核"
+                    } else {
+                        "自动连接已启用"
+                    }
+                );
                 // State 借的是本 async block 里 owned 的 `app`，不跨 spawn 边界外泄。
                 let state = app.state::<AppRuntime>();
                 // 不再把 `config` 传进去：命令层自己读盘（见 `proxy_start` 头注）。上面那份

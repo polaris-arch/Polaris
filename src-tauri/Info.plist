@@ -31,9 +31,23 @@
   **加语种时这里要同步加**，否则新语种的用户在 macOS 上拿不到匹配、回落英文
   —— 而且这个失败是静默的（应用里翻译好好的，只有原生 UI 与 navigator.languages 不对）。
 
-  ══ 射程：仅 macOS ══
+  ══ 射程：macOS **与 iOS**（2026-09-06 订正）══
 
   Linux 的 WebKitGTK 读环境 locale、Windows 的 WebView2 读系统设置，都不经这层协商，不受影响。
+
+  但「仅 macOS」这句话在加 iOS 腿之后是**假话**：tauri-cli 的 iOS 打包腿合并 Info.plist 时，
+  来源列表里逐字含 `<tauri 目录>/Info.plist`（也就是本文件）——它排在 `gen/apple/<App>_iOS/Info.plist`
+  与内建 dict 之后、`Info.ios.plist` 与 `bundle.iOS.infoPlist` 之前。故本文件**同时是 iOS 的输入**。
+
+  本例里这恰好也是想要的：iOS 的 WKWebView 同样按「用户 AppleLanguages ∩ 应用声明的本地化集合」
+  算 `navigator.languages`，上面 ①② 两个症状在 iOS 上同构（③ 的 NSOpenPanel 在 iOS 上不存在）。
+  **但「不知道自己被谁读」本身是缺陷**——下一个往这里加 macOS 专属键的人会在 iOS 上得到它。
+
+  纪律：**iOS 专属键写 `src-tauri/Info.ios.plist`，macOS 专属键写 `src-tauri/Info.macos.plist`；
+  只有两端都要的才留在本文件**。本文件今天只有 `CFBundleLocalizations` 一个键，两端都要。
+
+  ⚠️ **本批未验证**：上述合并顺序读自 tauri-cli 的 iOS 打包实现，本仓在 Linux 上构不出任何
+  iOS 产物（`tauri ios` 子命令在非 macOS 宿主上不存在），故没有产物级收据。
 
   ══ 未覆盖：跟随**应用内**语言设置 ══
 

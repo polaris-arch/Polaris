@@ -278,15 +278,65 @@ describe('update:progress 的消费点', () => {
       return /\.tsx?$/.test(full) && !/\.test\.tsx?$/.test(full) ? [full] : [];
     });
 
-  it('全仓恰好一处消费，且就是被剥除表扫描的那个文件', () => {
+  /**
+   * 登记表：每个消费点 + 它那一侧的扫描面住在哪。
+   *
+   * 🔴 2026-09-13（批 15）从一条变成两条。上一版这里是一个写死的单元素数组，头注写着
+   * 「第二个消费者一出现，这条先红，作者必须回到上面那道门把扫描面补齐」—— 这一批正是那一刻，
+   * 补齐的方式是给移动端那侧也配一条扫描（下面第二个用例），不是把数组改长了事。
+   */
+  const CONSUMERS: readonly string[] = [
+    'components/screens/settings/use-app-update.ts',
+    'mobile/settings/UpdatePage.tsx',
+  ];
+
+  it('全仓的消费点恰好是登记过的那两处', () => {
     const files = walk(fileURLToPath(new URL('..', import.meta.url)));
     // 取材自检：遍历不到文件时下面的断言会在空集合上「恰好」失败/通过，两个方向都无意义。
     expect(files.length, '递归遍历 ui/src 一个源文件都没拿到 —— 取材器失效').toBeGreaterThan(50);
     const consumers = files.filter((f) => readFileSync(f, 'utf8').includes('updateApi.onProgress('));
     expect(
-      consumers.map((f) => f.replace(/^.*\/ui\/src\//, '')),
-      '`update:progress` 的消费点不再是唯一那一处 —— 剥除表扫描面只覆盖应用更新 owner，' +
+      consumers.map((f) => f.replace(/^.*\/ui\/src\//, '')).sort(),
+      '`update:progress` 的消费点与登记表对不上 —— 剥除表的扫描面按消费点逐个配，' +
         '新消费者会静默出界（读到的被剥字段恒 undefined，两道门都不响）',
-    ).toEqual(['components/screens/settings/use-app-update.ts']);
+    ).toEqual([...CONSUMERS].sort());
+  });
+
+  /**
+   * 移动端那一侧的扫描面（桌面那一侧是上面「progress 可达面」那道门）。
+   *
+   * 形状与桌面不同，故判据也不同：移动端更新页**整份**都是 progress 可达面（它没有 `available`
+   * 那一屏），而它同时还持有一份来自 `updateApi.check` 的完整清单（`check.target`）——
+   * 那一份是带着 `releaseNotes` / `title` 的，读它合法。两者的区别在**取自哪个对象**，
+   * 故这里只扫「从进度帧那份清单上取字段」这一形（`dl.info.x`）。
+   *
+   * 🔴 真实取材面今天是**空集**（那一页一个 `dl.info.*` 都不读）。空集上的否定断言没有信息量，
+   * 故下面先用**合成样本**证明这把尺子是准的：喂一句 `dl.info?.releaseNotes` 必须报得出来。
+   * 证完之后，真实集合是空的才算一条结论，而不是「什么都没发生所以通过」。
+   */
+  it('移动端那一侧也没有读被剥掉的字段（含尺子自检）', () => {
+    const omitted = rustOmittedManifestFields();
+    const readsOffFrameManifest = (region: string): Set<string> =>
+      new Set([...region.matchAll(/\bdl\s*\??\.\s*info\s*\??\.\s*(\w+)/g)].map((m) => m[1]));
+
+    // 尺子自检（两个方向）：该报的报得出，不该报的不报。
+    expect([...readsOffFrameManifest('const x = dl.info?.releaseNotes;')]).toEqual(['releaseNotes']);
+    expect([...readsOffFrameManifest('const x = check.target?.releaseNotes;')]).toEqual([]);
+
+    const mobile = stripLineComments(
+      stripBlockComments(
+        readFileSync(
+          fileURLToPath(new URL('../mobile/settings/UpdatePage.tsx', import.meta.url)),
+          'utf8',
+        ),
+      ),
+    );
+    expect(mobile.length, '移动端更新页读成空文件 —— 取材面塌了').toBeGreaterThan(400);
+    for (const field of readsOffFrameManifest(mobile)) {
+      expect(
+        omitted.has(field),
+        `移动端更新页从进度帧的清单上读了 \`${field}\`，而进度帧根本不带它`,
+      ).toBe(false);
+    }
   });
 });

@@ -51,6 +51,9 @@ pub struct RuleSet {
 /// `route.rules[]`（`singbox-config-types.ts:297`）。logical 规则递归（rules 字段）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RouteRule {
+    /// Runtime-selectable policy branch; sing-box evaluates this against ClashServer.Mode().
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clash_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,10 +90,22 @@ pub struct RouteRule {
     pub process_name: Option<OneOrMany<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_path: Option<OneOrMany<String>>,
+    /// Android applicationId 匹配（上游 `option/rule.go:165` `PackageName`，
+    /// 命中逻辑 `route/rule/rule_item_package_name.go:27-37`：读连接属主回填的
+    /// `ProcessInfo.PackageNames`，本仓由 `PlatformInterfaceWrapper.kt` 的 `findConnectionOwner`
+    /// 经 `setAndroidPackageNames` 填）。桌面恒不发 —— 发射点只有 `builder::route` 的应用规则
+    /// Android 腿，平台判据见那里的 `app_owner_leg`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<OneOrMany<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_name_not: Option<OneOrMany<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound: Option<OneOrMany<String>>,
+    /// Negate the default rule matcher. Managed mesh uses this to exclude the
+    /// subscription inbound from its generic resolve action; that inbound has
+    /// a dedicated resolve/reject pair and must not be resolved twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invert: Option<bool>,
     /// logical 子规则为纯 matcher 无 action；default/logical 外层显式设 'route'。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,

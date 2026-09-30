@@ -42,7 +42,8 @@
     "manageInMain": "在主窗口管理…",
     "actionFailed": "「{{action}}」失败：{{detail}}",
     "actionFailedDetail": "操作未完成",
-    "switchPending": "已提交 {{node}} 的切换请求，请查看连接状态",
+    "switchPending": "{{node}} 已保存，正在应用连接更改",
+    "switchRestarting": "{{node}} 已保存，正在重启",
     "switchSavedForNextStart": "{{node}} 已保存，下次连接时生效",
     "switchRequiresApply": "{{node}} 已保存，请应用待处理更改后使用"
   },
@@ -79,6 +80,7 @@
     "errRecheckFailed": "检查更新失败"
   },
   "native": {
+    "exitBlocked": "后台连接尚未确认关闭，应用保持运行，请重试退出。",
     "backupExportTitle": "导出 Polaris 配置备份",
     "backupImportTitle": "导入 Polaris 配置备份",
     "backupFileType": "Polaris 备份文件",
@@ -112,6 +114,11 @@
     "speedTestComplete": "测速完成，可打开 Polaris 查看结果。",
     "fatalPageTitle": "界面初始化失败",
     "fatalPageBody": "界面加载遇到问题，请尝试重新加载。代理连接不受影响。",
-    "fatalPageReload": "重新加载"
+    "fatalPageReload": "重新加载",
+    "debugReport": "导出故障报告（Debug）",
+    "debugReportBusy": "正在生成报告…",
+    "debugReportHint": "报告包含设备信息、近期日志和脱敏配置，请检查后再分享。",
+    "debugReportDone": "已打开系统分享菜单，请选择接收方。",
+    "debugReportFailed": "生成或分享失败，请重试或连接 ADB 采集日志。"
   }
 }

@@ -62,6 +62,7 @@
     "delete": "Delete",
     "edit": "Edit",
     "save": "Save",
+    "saved": "Saved",
     "copyFail": "Copy failed",
     "retry": "Retry",
     "loading": "Loading...",
@@ -324,6 +325,7 @@
     "noServerConfig": "No server configured",
     "others": "Others",
     "pageTitle": "Home",
+    "nativeReconnectRequired": "Connection changes need a reconnect. Connect on Home; if still connected, disconnect first.",
     "pendingApplyBtn": "Apply now",
     "pendingApplyFailed": "Failed to apply",
     "pendingApplyFailedReason": "Failed to apply: {{reason}}",
@@ -342,7 +344,7 @@
     "pendingGroupStaged": "Unsaved — not written to disk yet",
     "pendingIgnoreBtn": "Dismiss",
     "pendingResetBtn": "Reset",
-    "pendingResetConfirm": "Discard all pending changes?",
+    "pendingResetConfirm": "Discard all unsaved changes?",
     "pendingRetryBtn": "Retry",
     "pendingRetrySaveBtn": "Retry save",
     "pendingRevertOne": "Revert this change",
@@ -411,6 +413,7 @@
     "switchNodeTip": "Switch node",
     "switchedToast": "{{node}} · switched",
     "switchPending": "{{node}} · saved; applying connection change",
+    "switchRestarting": "{{node}} · saved; restarting the connection to complete the switch",
     "switchSavedForNextStart": "{{node}} · saved for the next connection",
     "switchRequiresApply": "{{node}} · saved; apply pending changes before use",
     "takeoverManual": "Local",
@@ -448,7 +451,14 @@
       "blocked": "Blocked",
       "restricted": "Region restricted",
       "timeout": "Timed out"
-    }
+    },
+    "pendingResetShortConfirm": "Discard drafts?",
+    "pendingResetDone": "Unsaved changes discarded",
+    "pendingSavedStillNeedsApply": "Saved changes still need to be applied",
+    "switchPending": "{{node}} · saved; applying connection change",
+    "switchRestarting": "{{node}} · saved; restarting the connection to complete the switch",
+    "switchSavedForNextStart": "{{node}} · saved for the next connection",
+    "switchRequiresApply": "{{node}} · saved; apply pending changes before use"
   },
   "settings": {
     "listImportHint": "One entry per line or comma-separated; duplicates are skipped",
@@ -514,7 +524,7 @@
       "rollbackConfirmDesc": "This rolls back to {{version}}; the core will restart.",
       "sameVersionGoManage": "Please confirm the same-version replacement in the Core Management card.",
       "baselineOverrideGoManage": "The selected core is older than the bundled baseline; confirm the temporary replacement in the Core Management card.",
-      "noRollbackEntryNote": "No backup is available to roll back to: the core update pipeline is not wired up yet, so no backup is produced."
+      "noRollbackEntryNote": "There is no backup to roll back to: a backup is created by each core update and is not kept after a rollback or a factory reset."
     },
     "coreManagement": {
       "rollback": "Roll back",
@@ -675,7 +685,7 @@
       },
       "autoSwitchNode": "Auto-Switch Node on Failure",
       "autoSwitchNodeDesc": "Switches to a working node automatically when the current one is detected as faulty. Intranet-only mesh nodes are excluded: nothing can substitute for them, so they are never switched away.",
-      "disableLogFileDescFull": "Stops sing-box logging. Live logs and log-based diagnostics become unavailable; crash detection is unaffected. While connected, save first and apply when ready; while stopped, it takes effect on the next connection.",
+      "disableLogFileDescFull": "Turning off disk logs disables live logs and log diagnostics; crash detection remains available. While connected, save and tap Apply Now; otherwise it takes effect on the next connection.",
       "lanGateway": "LAN Gateway",
       "neighborDomains": "LAN short-name resolution",
       "neighborDomainsHint": "One suffix per line (leading dot added automatically); dot-less short names under it (e.g. nas.lan) resolve via LAN devices.",
@@ -725,7 +735,7 @@
       "tagline": "Every connection, always pointed the right way",
       "intro": "Polaris is a modern sing-box-based proxy client, built to keep proxy control and connection management simple.",
       "releases": "Releases",
-      "noTelemetry": "Zero telemetry — no crash reports, no analytics, nothing sent back"
+      "noTelemetry": "Zero telemetry — no automatic upload of crash reports or analytics"
     },
     "update": {
       "ruleResourceAutoStatusOn": "Scheduled refresh",
@@ -866,6 +876,7 @@
       "catCustomRules": "Routing rules (with rule-set resources)",
       "catDnsRules": "DNS rules",
       "catDnsResources": "DNS servers, server groups, and resolution defaults",
+      "catMeshRouting": "Mesh routing policy",
       "exportSelected": "Export selected",
       "import": "Import…"
     },
@@ -904,7 +915,7 @@
       "addSuffix": "Add suffix",
       "addMac": "Add MAC",
       "mtuDesc": "Leave empty for automatic (the recommended value). Fill it in only when tuning by hand.",
-      "mtuAutoPlaceholder": "Auto ({{n}})",
+      "mtuAutoPlaceholder": "Auto (kernel default)",
       "mtuInvalid": "MTU must be a whole number between {{min}} and {{max}}",
       "effectiveExcludeBlock": "Exclusions in effect on this platform",
       "effectiveExcludeHint": "The two lists above feed different places on different platforms. This is the exclusion list the backend actually hands to the core, computed from the currently saved config; staged edits show up here only after you apply them.",
@@ -1000,7 +1011,12 @@
         "unknownStale": "Snapshot is stale",
         "unknownFile": "Referenced file or load evidence unavailable",
         "unknownArtifact": "Running artifact or candidate unavailable"
-      }
+      },
+      "inboundExcludeEmpty": "No subnets added. Leaving this empty means no inbound source is excluded.",
+      "bypassLanBlock": "Local network",
+      "bypassLanDesc": "When on, LAN subnets in the list (e.g. 192.168.x.x, 10.x.x.x) use this device's network directly instead of the VPN. When off, they go through the tunnel too.",
+      "bypassLanListHint": "Only subnet (CIDR) entries take effect on this device; domain entries have no effect on mobile. Loopback ranges are handled by the system and ignored.",
+      "bypassLanListEmpty": "The list is empty: all LAN addresses go through the tunnel."
     },
     "dns": {
       "pageSub": "System takeover, query runtime, and node resolution",
@@ -1113,7 +1129,12 @@
       "browserDohFold": "DoH endpoints",
       "browserDohHint": "Matched by domain suffix (cloudflare-dns.com covers all its subdomains). The built-in entries are a starting point, not a complete list — a DoH endpoint can be any self-hosted domain, so add whatever you find missing.",
       "domain": "Domain",
-      "displacedResolversNote": "Taking over system DNS overrode the non-public resolvers below. They most likely belong to another VPN or mesh client on this machine (for example Tailscale MagicDNS). Names served by those resolvers will not resolve while the proxy is on, which looks like \"the IP connects but the hostname does not\"."
+      "displacedResolversNote": "Taking over system DNS overrode the non-public resolvers below. They most likely belong to another VPN or mesh client on this machine (for example Tailscale MagicDNS). Names served by those resolvers will not resolve while the proxy is on, which looks like \"the IP connects but the hostname does not\".",
+      "upstreamPreset": "Upstream preset",
+      "raceCustomHint": "Custom upstreams must be plain IP addresses (they cannot need resolving themselves) and they count toward the race quota.",
+      "raceCustomEmpty": "No custom upstreams",
+      "fakeIpFilterEmpty": "No exceptions; every domain goes through FakeIP",
+      "browserDohEmpty": "No endpoints listed; nothing is blocked"
     }
   },
   "rules": {
@@ -1548,7 +1569,8 @@
     "viaProxyOverrideDirect": "Overridden by global policy: all subscriptions direct",
     "previewBtn": "Preflight",
     "added": "Subscription added",
-    "updated": "Subscription updated"
+    "updated": "Subscription updated",
+    "createTaskRecoveredHint": "The subscription is added in the background; its progress resumes here after the app restarts."
   },
   "errors": {
     "operationFailed": "Operation failed, please try again later",
@@ -1568,14 +1590,18 @@
     "coreBinaryMismatch": "The running core does not match the selected version. Reinstall Helper or reapply the core update, then check Logs for details.",
     "tunAdapterMissing": "The TUN adapter could not be created. Check whether security software is blocking the wintun driver, then restart and try again.",
     "autoSwitchNeedsRestart": "Automatic node switching was triggered, but nothing was switched this time: some candidate nodes need the core restarted before they can take over. Pick another node manually.",
-    "tunAddressUnavailable": "The TUN adapter address could not be assigned — it may be held by a leftover adapter or another VPN. Disconnect other VPNs, or restart and try again."
+    "tunAddressUnavailable": "The TUN adapter address could not be assigned — it may be held by a leftover adapter or another VPN. Disconnect other VPNs, or restart and try again.",
+    "androidNativeCapacityClosed": "This session has reached its lifecycle record limit. Fully close and restart the app, then try again.",
+    "vpnPermissionDenied": "VPN permission is still needed. Complete or dismiss any open permission dialog, then tap Connect again and allow the system VPN connection request.",
+    "systemInterfaceUnsupported": "This node requests a system interface, which Android VPN mode does not support. Turn off the system interface option in the node editor; for custom nodes, set system to false in the JSON."
   },
   "privacy": {
     "wrongPassword": "Incorrect unlock password",
     "title": "Polaris is locked",
     "subtitle": "Enter your password to unlock. The proxy keeps running.",
     "unlock": "Unlock",
-    "enterPassword": "Enter a password"
+    "enterPassword": "Enter a password",
+    "unlockFailed": "The unlock attempt could not be completed. Try again."
   },
   "appAdd": {
     "catCustom": "Custom…",
@@ -1609,7 +1635,8 @@
     "submit": "Add",
     "tagSearchPh": "Search tags…",
     "title": "Add Custom App",
-    "galleryMore": "Showing {{shown}} / {{total}} — keep scrolling to load more"
+    "galleryMore": "Showing {{shown}} / {{total}} — keep scrolling to load more",
+    "emojiOnlyNote": "Mobile draws this emoji as the app icon; it does not load icon artwork over the network."
   },
   "appPolicy": {
     "addCustom": "Add Custom App",
@@ -1657,6 +1684,7 @@
   },
   "backupImport": {
     "categories": "Categories in this file",
+    "confirmScope": "About to replace: {{categories}}.",
     "confirmTitle": "Restore selected categories?",
     "confirmMsg": "Your current data in these categories will be replaced by the backup. This cannot be undone. Empty backup categories will be skipped; unselected categories stay unchanged:\n• {{categories}}",
     "discardMsg": "The selected backup file and categories won't be restored.",
@@ -1668,6 +1696,8 @@
     "interfaceFallbackWarn": "{{n}} interface binding(s) in the selected categories are unavailable on this device. They will be reset to Automatic or Inherit; the backup file will remain unchanged.",
     "pickHint": "Click to choose a backup file",
     "replaceWarn": "Selected categories will be fully replaced by the backup's contents; unselected categories stay unchanged.",
+    "meshRoutingBlocked": "Mesh routing policy cannot be restored without a trusted snapshot of the old ranges. Selecting it rejects the entire import; deselect it to restore other categories.",
+    "meshRoutingOwners": "Referenced nodes: {{ids}}",
     "restoreSelected": "Restore selected",
     "restoreSuccess": "Backup restored",
     "title": "Import Backup",
@@ -1680,6 +1710,8 @@
       "invalidFormat": "This is not a valid Polaris backup file",
       "invalidArgs": "Choose at least one category to restore",
       "saveFailed": "Could not save the restored configuration",
+      "meshRoutingRequiresTrustedRestore": "Mesh routing policy restore needs trusted proof of the old ranges; no changes were saved.",
+      "meshRoutingInvalidPolicy": "Mesh routing policy validation failed; the backup was not exported.",
       "unknown": "The backup operation could not be completed"
     }
   },
@@ -1716,7 +1748,8 @@
     "submitN": "Import {{count}} item(s)",
     "resultUnsupported": "{{count}} node(s) use protocols unsupported by the core and are dimmed",
     "textPlaceholder": "Paste Base64 subscription content, or one share link per line (vmess:// vless:// ss:// …)",
-    "fileTooLarge": "File too large (max 10 MB)"
+    "fileTooLarge": "File too large (max 10 MB)",
+    "pickFile": "Import from file"
   },
   "meshJoin": {
     "title": "Add Access",
@@ -2048,10 +2081,10 @@
     "subAutoUpdateActiveHint": "The background scheduler catches up this subscription after {{h}} hours have elapsed since its last refresh",
     "subAutoUpdateEvery": "Auto · {{h}}h",
     "subAutoUpdateFail": "Subscription auto-update failed",
-    "subAutoUpdateMasterOffHint": "Auto Update is on for this subscription, but global Subscription auto-update is off, so it will not refresh automatically.",
+    "subAutoUpdateMasterOffHint": "Global subscription auto-update is off. Turn it on in Settings.",
     "subAutoUpdatePaused": "Auto · inactive",
     "subAutoUpdateStartupOnly": "Auto · on start only",
-    "subAutoUpdateStartupOnlyHint": "Update interval is set to \"Manual only\": the app checks for catch-up at startup, never on a schedule",
+    "subAutoUpdateStartupOnlyHint": "Updates are checked at startup only. Change the interval in Settings.",
     "subCopyUrl": "Copy URL",
     "subCopyUrlOk": "Subscription URL copied",
     "subDeleteConfirm": "Delete subscription \"{{name}}\"? Its {{count}} nodes will be removed as well. This cannot be undone.",
@@ -2088,8 +2121,6 @@
     "testVisibleHint": "Speed-test the nodes currently visible after filtering",
     "use": "Set as exit",
     "useConfirmAgain": "Click again to confirm",
-    "useConfirmRestart": "This restarts the core and drops existing connections — click again to confirm",
-    "useConfirmRestartToast": "Click again to switch to {{node}} — this restarts the core and drops existing connections",
     "useConfirmToast": "Click again to switch to {{node}}",
     "useCurrent": "Current exit",
     "view": {
@@ -2142,7 +2173,22 @@
     "invalidCustomOutbound": "The custom outbound JSON must be an object with a string type field",
     "exitCapableBadge": "Exit",
     "meshLoginFallbackTitle": "Temporarily connecting directly (mesh login)",
-    "meshLoginFallbackRestored": "Connected to {{name}}, routing switched back to this exit"
+    "meshLoginFallbackRestored": "Connected to {{name}}, routing switched back to this exit",
+    "selectedChoice": "Selected",
+    "useConfirmApply": "This node has pending changes; click again to save the selection",
+    "useConfirmApplyToast": "Click again to select {{node}}; pending changes may still need Apply",
+    "mobileGroupsLabel": "Node groups",
+    "mobileFilterSort": "Filter / sort",
+    "mobileLatencyStale": "Latency expired",
+    "mobileMoreActions": "More",
+    "mobileProtocolFilter": "Protocol",
+    "mobileRowMore": "More actions",
+    "tsAccountUnknown": "Log in / switch account",
+    "mobileSortLatency": "Latency",
+    "mobileSortName": "Name",
+    "mobileSortProtocol": "Protocol",
+    "deleteConfirmMobile": "Delete the node \"{{name}}\"? This cannot be undone.",
+    "batchDeleteConfirmMobile": "Delete the {{count}} selected nodes? This cannot be undone."
   },
   "procPick": {
     "empty": "No process data / backend not wired up",
@@ -2242,7 +2288,14 @@
     "urlDlgErrFailed": "Download failed",
     "urlDlgDiscardTitle": "Discard download?",
     "urlDlgDiscardMsg": "The details you entered will not be saved.",
-    "urlDlgDiscard": "Discard"
+    "urlDlgDiscard": "Discard",
+    "updateResult": {
+      "success": "Updated {{succeeded}} local resource files",
+      "partial": "Updated {{succeeded}} local files, failed {{failed}}, cancelled {{cancelled}}",
+      "failed": "Resource update failed ({{failed}})",
+      "cancelled": "Resource update cancelled",
+      "empty": "No resource update result was returned"
+    }
   },
   "taildrop": {
     "title": "File Transfer",
@@ -2355,6 +2408,12 @@
     "authUrlCopyFailed": "Could not copy the login URL. Select and copy it manually.",
     "loginTitle": "Connect Tailscale",
     "logout": "Log out",
+    "logoutStopTitle": "Disconnect and log out?",
+    "logoutStopMessage": "The current proxy connection owns this node. Continuing will disconnect the proxy, then clear this node's local login state after it stops. The proxy will stay disconnected.",
+    "logoutStopConfirm": "Disconnect and log out",
+    "logoutStopChanged": "The connection or selected node changed. No logout occurred. Please confirm again.",
+    "logoutStopFailed": "Could not confirm that the proxy stopped. Login state was kept.",
+    "logoutRefreshFailed": "Logged out, but the node list did not refresh. Reopen this page to check it.",
     "method": "Login method",
     "noNode": "No Tailscale node yet — please log in to Tailscale first.",
     "nodeName": "Node name",
@@ -2383,7 +2442,23 @@
     "authKeyClearAgain": "Click again to clear",
     "authKeyClearHint": "Shows only whether this node has an auth key stored — never the key itself. Clearing removes the key from the configuration and does not touch the current login (that lives in the state directory — use Log out for it). Afterwards the node has no static credential left to re-authenticate with and must sign in again. Applies on save.",
     "browserOpenFailed": "Unable to open the browser. Copy the login link to continue.",
-    "reasonMainCoreChanged": "The main connection changed. Retry authorization."
+    "reasonMainCoreChanged": "The main connection changed. Retry authorization.",
+    "loginSavedAttemptIncomplete": "Node saved; this authorization attempt is not complete.",
+    "loginSaveFailed": "Could not save the node. Login was not started. Try again.",
+    "loginRefreshFailed": "Could not read the saved configuration. Try again.",
+    "loginLogoutFailed": "Could not sign out the previous session. New authorization was not started. Try again.",
+    "loginStartFailed": "Could not start this login attempt. Try again.",
+    "loginAttemptFailed": "This login request failed. Try again.",
+    "loginCancelFailed": "Could not cancel login. Try again.",
+    "loginSubmitted": "Login request submitted. Please wait for authorization to complete.",
+    "loginMainCoreStatus": "Reading this node’s authorization status in the main connection.",
+    "loginMainCoreAuthorized": "This node is authorized in the main connection; newly saved authentication settings may still need to be applied.",
+    "loginMainCoreAwaiting": "This node needs authorization. Getting the login URL…",
+    "loginMainCoreUnknown": "This node’s authorization status in the main connection is not yet confirmed. Retry to read it.",
+    "loginUrlTimeout": "Timed out getting the login URL. Try again.",
+    "loginSessionReadFailed": "Could not read the previous login session. New authorization was not started. Try again.",
+    "loginProgressReadFailed": "Could not check this authorization result yet. Authorization may still be in progress; returning to the app will retry.",
+    "loginStateUnknown": "The previous login state is unverified. It will be checked again before submitting an auth key; a failed check will not switch accounts."
   },
   "warp": {
     "addTitle": "Connect Cloudflare WARP",
@@ -2411,7 +2486,12 @@
     "plan": "License type",
     "planFree": "Free WARP",
     "register": "Register and Connect",
-    "registering": "Registering an anonymous device…"
+    "registering": "Registering an anonymous device…",
+    "registeredLocked": "The registration result is retained and the form is locked.",
+    "registeredPending": "Cloudflare registration is complete and the form is locked. Retry only saves or refreshes this node; it does not register again.",
+    "registeredSaveFailed": "Cloudflare registration is complete, but saving the node has not been confirmed. Keep this panel open and retry saving.",
+    "registeredRefreshFailed": "The node was saved, but the list has not refreshed. Retry refreshing; registration will not run again.",
+    "discardRegisteredMsg": "The Cloudflare device is registered, but local saving has not been confirmed. Closing discards this panel’s credentials; if the node was not saved to disk, you cannot finish saving it."
   },
   "wg": {
     "address": "Peer address",
@@ -2458,7 +2538,8 @@
     "reverseMesh": "System access mode (kernel interface)",
     "reverseMeshHint": "Creates a real system interface so peers can reach this device and subnet traffic can be forwarded when peer routes, access controls, and the system firewall allow it. This switch does not replace those permissions. Requires TUN mode; on Windows or without TUN it falls back to the gVisor userspace stack. This node is excluded from speed tests while enabled.",
     "reverseMeshWarp": "WARP System access conflicts with the main TUN, so WARP always uses the gVisor userspace stack.",
-    "source": "Source"
+    "source": "Source",
+    "pasteHint": "Parsing fills the fields below directly; you can still edit each one."
   },
   "meshInbound": {
     "title": "Tunnel inbound connection policy",
@@ -2489,5 +2570,382 @@
     "targetInvalid": "Enter a valid destination CIDR. Use the local-service scope for loopback addresses.",
     "udp53": "The core handles UDP 53 through its DNS path, so this policy cannot grant it. Remove the port or use TCP.",
     "tsBoundary": "This rule only limits TCP/UDP connections delivered through Polaris. Tailscale built-in services, including file reception, SSH and DNS, remain governed by tailnet permissions."
+  },
+  "mobileNav": {
+    "home": "Home",
+    "nodes": "Nodes",
+    "rules": "Routing",
+    "connections": "Activity",
+    "settings": "Settings"
+  },
+  "mobileHome": {
+    "latencyLabel": "Node latency",
+    "latencyChecking": "Checking",
+    "connectToTest": "Connect to test this exit",
+    "notApplicable": "Not applicable",
+    "currentSpeedTest": "Test current",
+    "allSpeedTest": "Test all",
+    "allSpeedTestBusy": "Testing all",
+    "listedHostsTotal": "Listed hosts total",
+    "connect": "Connect",
+    "disconnect": "Disconnect",
+    "networkCheck": "Network check",
+    "checkNow": "Check",
+    "exitIp": "Exit IP",
+    "trafficChart": "Live traffic",
+    "ruleHits": "Rule hits",
+    "noSamples": "No samples yet",
+    "axisNow": "now",
+    "noNodeSelected": "No node selected",
+    "noMatchingNode": "No matching node",
+    "checkedJustNow": "Checked just now",
+    "checkedMinutesAgo": "Checked {{n}} min ago",
+    "checkedHoursAgo": "Checked {{n}} h ago",
+    "actionFailed": "Action failed",
+    "actionFailedWithReason": "Action failed: {{reason}}",
+    "ruleHitsViewAll": "View all ({{count}})",
+    "ruleHitsAll": "All rule hits"
+  },
+  "mobileConnections": {
+    "exactRuleFilter": "Rule",
+    "clearExactRule": "Clear rule filter",
+    "seg": {
+      "overview": "Overview",
+      "logs": "Logs"
+    },
+    "more": "More",
+    "rowMore": "More actions",
+    "clearSearch": "Clear search",
+    "sourceIP": "Source IP",
+    "addRule": "Add rule",
+    "sort": "Sort",
+    "sortNote": "All nine data columns are sortable: tap again to flip the direction, a third time to clear the sort.",
+    "sortAsc": "ascending",
+    "sortDesc": "descending",
+    "sortedBy": "Sorted by {{key}}, {{dir}}",
+    "pauseNote": "Pausing unsubscribes: the whole data path stops rather than the view freezing. Resuming refills on the next frame, about one second.",
+    "pausedNote": "Paused: connection details are unsubscribed and the list is no longer updating.",
+    "overview": {
+      "hostsTitle": "Top hosts (by connection count)",
+      "outboundsTitle": "Outbound split (by connection count)",
+      "unitNote": "Ranked by connection count; the home screen uses traffic volume."
+    },
+    "rules": {
+      "canAppend": "Can be added",
+      "cannotAppend": "Cannot be added"
+    },
+    "logs": {
+      "filter": "Level and source",
+      "filterSummary": "Adjust level and source; core startup diagnostics take effect after a core restart.",
+      "emptyTitle": "No logs yet",
+      "emptyBody": "Nothing has been logged at the current level and source. Lower the level, clear the search, or wait for core output.",
+      "lines": "{{n}} lines",
+      "levelSaveFailed": "Could not save the log level"
+    }
+  },
+  "mobileRules": {
+    "matchDetailsLabel": "Matching details",
+    "matchSummary": "Android matches package names or traffic · Details",
+    "matchTrafficOnlyShort": "Domain / IP only · resource required",
+    "matchCustomDetail": "Custom apps have no Android package name. Direct does not add them to the system VPN exclusion list. Traffic matching requires a matching local rule resource; a missing resource disables that rule.",
+    "matchPresetNoPackageDetail": "This built-in preset has no Android package name. Domain/IP matching requires its local rule resource; a missing resource disables that rule.",
+    "matchDirectShort": "VPN exclusion · domain / IP",
+    "matchDirectDetail": "A built-in preset with a package name can be excluded through Android VPN. Domain/IP matching also requires its local rule resource; a missing resource disables that traffic rule.",
+    "matchPackageShort": "Package (Android 10+) · domain / IP",
+    "matchPackageDetail": "On Android 10+, per-node and Block policies can match the package name. Direct can also exclude the package through system VPN. Domain/IP matching requires its local rule resource.",
+    "seg": {
+      "traffic": "Traffic",
+      "dns": "DNS",
+      "apps": "Apps",
+      "resources": "Resources"
+    },
+    "more": "More",
+    "back": "Back",
+    "appRoutingMatchNote": "App routing recognizes an app in two ways. By identity: on Android 10 and later, Block and per-node policies match apps that carry a package name by that name; Direct excludes the app from the tunnel entirely through the system VPN (on every version). By traffic: the app's known domains and IPs, which needs the matching rule resource in place. Apps without a package name (some built-in apps, and custom apps where no app was picked), and Block and per-node policies on Android 9 and earlier, only get the domain and IP leg.",
+    "dnsSystemPaneAbsent": "The settings behind these rules are adjusted in Settings → DNS; this screen only lists the order they run in.",
+    "dnsServersEmpty": "No DNS servers",
+    "customAppMatch": "A custom app is matched two ways here: by the domains and IPs you list, and by the apps you pick below. The app leg covers the Direct policy — it keeps those apps out of the tunnel entirely; the domain leg is what the other policies match on.",
+    "customAppPackages": "Match by app",
+    "customAppPackagesFailed": "Could not read the installed app list from this device. You can still save the app and match it by domain.",
+    "networkProfile": {
+      "intro": "A rule limited to a profile applies only while this phone is on that network, and is skipped automatically when you leave. No reconnect needed.",
+      "reasonDhcpNoPermission": "apps on a phone have no permission to ask the router directly (DHCP). Use Auto or System DNS",
+      "listEmpty": "Nothing added yet"
+    }
+  },
+  "mobileSettings": {
+    "saveFailedWithReason": "Save failed: {{reason}}",
+    "back": "Back",
+    "general": {
+      "autoStartTitle": "Connect automatically after boot",
+      "autoStartDesc": "After reboot, restore the last connection if you did not disconnect it manually. VPN permission must already be granted.",
+      "autoStartReadFailed": "Could not read the current state of the connect-after-boot switch.",
+      "autoStartReadFailedWithReason": "Could not read the current state of the connect-after-boot switch: {{reason}}",
+      "bootConnectTitle": "Always-on VPN (system settings)",
+      "bootConnectDesc": "Android can restore the VPN after boot or a drop, and block traffic outside the VPN.",
+      "bootConnectPath": "Settings → Network & internet → VPN → Polaris → Always-on VPN",
+      "bootConnectOpenFailed": "The system settings page could not be opened — follow the path above.",
+      "privacyLockFailed": "The idle lock did not engage; the screen is still unlocked."
+    },
+    "dns": {
+      "fakeIpOffRisk": "Turning this off under TUN makes nodes receive real IPs instead of domains; providers with strict anti-abuse rules may refuse the connection, and the client cannot mitigate that."
+    },
+    "display": {
+      "notifyBlock": "Notifications",
+      "notifications": "System notifications",
+      "notificationsDesc": "Proxy errors and disconnects, plus Tailscale sign-in prompts, arrive as system notifications.",
+      "notificationsPermission": "The system notification permission is requested the first time one is sent; if it is denied, nothing is posted. The persistent notification you see while connected is posted by the VPN service itself and is not controlled by this switch."
+    },
+    "vpnAuth": {
+      "title": "VPN authorization",
+      "desc": "Polaris will request system VPN permission when you connect.",
+      "granted": "Granted",
+      "denied": "Not granted",
+      "unknown": "Unreadable"
+    },
+    "update": {
+      "channelBlock": "App updates",
+      "appTitle": "App update",
+      "appDesc": "The Android build ships through GitHub Releases. Check here, download the signed APK and hand it to the system installer; when a release ships no APK, the release page is still there.",
+      "ghScopeNote": "This mirror and custom domain serve rule-resource downloads, not the core.",
+      "checkAction": "Check for updates",
+      "checking": "Checking…",
+      "openReleases": "Open the release page",
+      "checkFailed": "Update check failed: {{reason}}",
+      "checkFailedPlain": "Update check failed.",
+      "skipFailed": "Could not skip this version: {{reason}}",
+      "skipFailedPlain": "Could not skip this version.",
+      "entryDesc": "Open Updates to read the release notes, then download and install it.",
+      "downloadingPercent": "Downloading the update… {{percent}}%",
+      "downloadReady": "The update package is downloaded; tap Install to hand it to the system installer.",
+      "downloadingAction": "Downloading…",
+      "installAction": "Install",
+      "handedOffNote": "Handed to the system installer — finish the install there. If it says \"App not installed\", the package is signed with a different key than the one you have installed: get the official build from the release page.",
+      "installUnknownSourcesDenied": "Android has not allowed Polaris to install apps. The permission page has been opened for you — turn it on, then tap Install again.",
+      "installUnknownSourcesNoSettings": "Android has not allowed Polaris to install apps, and the shortcut to that permission page is missing on this device. Open system settings, turn on \"install unknown apps\" for Polaris, then tap Install again.",
+      "installNoInstaller": "This device has no component that can install APK files, so the package cannot be installed here.",
+      "installPathRejected": "The package is outside the app private directory and was refused for safety. Download it again from this page.",
+      "installPackageMissing": "The package is no longer on disk — download it again.",
+      "installHandoffFailed": "The package could not be handed to the system installer."
+    },
+    "backup": {
+      "pickerNote": "Export goes through the system file-save dialog and import through the system file picker; both read and write the exact file you pick in that system panel.",
+      "exportFailedWithReason": "Export failed: {{reason}}",
+      "importFailedWithReason": "Restore failed: {{reason}}",
+      "importDone": "Backup restored",
+      "systemBackupGroup": "System backup",
+      "systemBackupTitle": "Allow system backup of app data",
+      "systemBackupDesc": "Off by default. When on, Android backs up Polaris app data — including node credentials and subscriptions — to your Google account, and carries it to a new device during a device transfer. Google cloud backups are end-to-end encrypted only on Android 9 or later and only when the device has a screen lock (PIN, pattern or password). After a restore on a new device this switch is off again until you turn it back on. Export above is not affected by this switch.",
+      "systemBackupReadFailed": "Could not read the current state of the system backup switch.",
+      "systemBackupReadFailedWithReason": "Could not read the current state of the system backup switch: {{reason}}"
+    },
+    "about": {
+      "licenseBlock": "Licensing",
+      "licenseSource": "Source license",
+      "licenseSourceValue": "MIT — Polaris's own source is released under it.",
+      "licenseArtifact": "License of this build",
+      "licenseArtifactValue": "GPLv3 — on Android the core is loaded into the app process as libbox rather than a separate subprocess, so the artifact as a whole is distributed under GPLv3.",
+      "uninstallNote": "Uninstall through the system's app manager; uninstalling removes all of this app's data.",
+      "openLinkFailed": "Couldn't open the link",
+      "openLinkFailedWithReason": "Couldn't open the link: {{reason}}"
+    }
+  },
+  "mobileActions": {
+    "exportOptions": "Export options",
+    "chooseExport": "Choose what to export",
+    "exportHint": "Choose a diagnostic report or logs, then share or save using the system dialog.",
+    "report": "Export diagnostic report",
+    "reportHint": "Redacted logs, configuration and runtime information. Debug builds include crash and device details.",
+    "saveLogs": "Save logs only",
+    "copyLogs": "Copy current logs",
+    "preparing": "Preparing file…",
+    "shareOpened": "Share dialog opened; choose a destination",
+    "back": "Back",
+    "chooseOption": "Choose an option"
+  },
+  "mobileHelp": {
+    "viewDetails": "View details about {{title}}",
+    "nodeDetails": "{{name}} · Node details",
+    "speedTest": "Speed test",
+    "stagedNodeDetails": "This node is not saved yet, so it cannot be selected as exit or speed-tested. Save it from the bottom notice bar. When the core is running, saved changes must also be applied before they take effect.",
+    "tsExitTitle": "Tailscale exit",
+    "tsExitNeedsAuth": "Authorization is unfinished; internet cannot use Tailscale.",
+    "tsExitNoDevice": "No exit device selected; internet still goes direct.",
+    "tsExitOffline": "Exit device offline; internet may be affected.",
+    "tsExitNotAdvertised": "The selected device does not offer an exit; internet cannot use it.",
+    "stagedNode": "Unsaved · Cannot connect yet",
+    "stagedSpeedTest": "Cannot test yet",
+    "reverseRoutingTitle": "Reversed region routing",
+    "reverseRouting": "Reversed: local traffic uses the proxy, everything else goes direct. Only active in smart routing.",
+    "certPin": "Server certificate SHA-256; hex or Base64, comma-separated for multiple pins.",
+    "noParrot": "Disable Chrome QUIC imitation if an Ed25519 certificate causes handshake failure.",
+    "spoofMethod": "Requires elevated privileges; unsupported on ARM64. Decoy SNI must differ from real SNI.",
+    "tlsEngine": "Applies only on the matching platform; omitted on other platforms.",
+    "tlsFragment": "Try only for reset handshakes; adds latency and may be rejected by some servers.",
+    "meshRoutes": "One forced-route subnet per line; leave empty to disable.",
+    "sysIface": "Android VPN mode does not support system interfaces. If enabled, turn this option off before connecting.",
+    "extraJson": "Protocol-native JSON object; controls above override matching keys. Empty means none.",
+    "masqueVersion": "Defaults to HTTP/3, falling back to HTTP/2; an HTTP/3 detour must support UDP.",
+    "tcServerPub": "Server PublicKey (44-character Base64); may be an access credential. Keep private.",
+    "tcPrivateKey": "Empty generates a random key each start; required when the server or DERP verifies clients.",
+    "derpMode": "Default map is hosted at tailcat.dev; use a detour or your own DERP if unreachable directly.",
+    "derpMapUrl": "DERP map JSON URL; fetched through the detour, or directly when none is set.",
+    "derpServers": "One hostname or single-line JSON per line; hostname must match the certificate.",
+    "onDemand": "Pauses when unreferenced; paused Tailscale disables MagicDNS and cannot receive Taildrop.",
+    "wgDetour": "Detour must support UDP; failure does not fall back to a direct connection.",
+    "reverseMesh": "Requires TUN; unsupported on Windows. Otherwise falls back to userspace; speed tests are disabled.",
+    "tsDetour": "Control plane and DERP require TCP; detour failure never falls back to direct.",
+    "tsListenPort": "Peer-to-peer UDP port; empty selects randomly. A fixed port allows router port mapping.",
+    "tsResolveByName": "Resolves tailnet / MagicDNS names only while this node is the selected exit.",
+    "tsControlUrl": "Leave empty for the official service; enter your own server address before login.",
+    "tsAuthKeySwitch": "Submitting signs out the current session and uses the new Auth Key.",
+    "meshJoinRoutes": "OpenConnect / OpenVPN / MASQUE: private subnets force routing; leaving them blank still allows use as a VPN exit.",
+    "customAppMatch": "Direct excludes selected apps from the tunnel; other policies match domains / IPs.",
+    "resourceUrl": "Type is detected or set manually; downloads use your GitHub acceleration settings.",
+    "tcChain": "Detour carries DERP relay traffic only; peer-to-peer direct traffic bypasses it.",
+    "profileCidrs": "Subnet or IP per line; any matching current-network DNS address selects this profile.",
+    "profileProbe": "Auto selects an available probe, or you can choose system DNS.",
+    "profileProbeDetails": "Auto selects an available probe for the current network; system DNS reads the device's DNS settings. Android and iOS apps cannot query the router directly over DHCP, so no new DHCP choice is offered. An imported DHCP setting stays visible until you change it to Auto or system DNS.",
+    "networkProfiles": "Rules apply only on matching networks; leaving skips them automatically without reconnecting.",
+    "appRoutingMatch": "Matches app identity or domains / IPs; direct bypasses the tunnel, while node / block matching depends on OS version and resources.",
+    "connectionResolution": "Preserve domains for outbound handling, or resolve real addresses with local DNS rules; resolution failure ends the connection.",
+    "browserDoh": "Blocks listed browser encrypted-DNS endpoints to force system-DNS fallback; off by default.",
+    "browserDohList": "Matches domain suffixes; the list is not exhaustive, so add missing endpoints.",
+    "raceUpstreams": "Enable up to 3 racing upstreams; system-DNS fallback does not count toward the limit.",
+    "ipv6": "Enable IPv6 resolution and routing. If the exit does not support IPv6, IPv6 connections will time out.",
+    "bypassLan": "On: listed LAN ranges connect directly. Off: they use the VPN tunnel.",
+    "notifications": "Requires system notification permission; the ongoing VPN notification is unaffected.",
+    "disableLogs": "Disabling removes live logs and log diagnostics; save and apply when running, otherwise effective next connection.",
+    "systemBackup": "Off by default; node credentials and subscriptions are backed up to your Google account. End-to-end encryption needs Android 9+ and a screen lock; re-enable after restoring to a new device.",
+    "appUpdate": "Check and download signed APKs for system installation; open the release page when no APK exists.",
+    "autoDownload": "New versions found at startup download in the background; installation is never automatic.",
+    "appChannel": "Stable checks releases only; testing includes alpha / beta / rc. All update checks use this setting.",
+    "githubDownload": "Uses the original URL first; falls back only on failure when an acceleration domain is configured."
+  },
+  "mobileSpeedTest": {
+    "preparing": "Preparing latency test…",
+    "waiting": "No new progress received; status is unconfirmed",
+    "progress": "Latency test progress",
+    "measuredCounts": "Succeeded {{ok}} · Failed {{failed}}",
+    "skippedCount": "Skipped {{count}}",
+    "pendingCount": "Unfinished {{count}}"
+  },
+  "mobileMeshInbound": {
+    "boundary": "Limits only tunnel-forwarded TCP/UDP connections and DNS resolution.",
+    "boundaryTs": "Limits only TCP/UDP and DNS forwarded by Polaris; Tailscale built-in services remain governed by tailnet permissions.",
+    "applySummary": "Apply pending changes after saving."
+  },
+  "mobileMeshRouteEvidence": {
+    "title": "Mesh range report",
+    "unavailable": "No verifiable mesh range report is available yet.",
+    "summary": {
+      "legacy": "Ranges · ownership unavailable",
+      "noRequested": "Ranges · no separate intranet range",
+      "bootstrapOverlap": "Ranges · default pool overlaps; actual ranges unknown",
+      "unavailable": "Ranges · awaiting report",
+      "previous": "Ranges · previous result",
+      "preview": "Ranges · preview, apply pending",
+      "pending": "Ranges · load unconfirmed",
+      "empty": "Ranges · no participating node",
+      "absent": "Ranges · awaiting evidence",
+      "full": "Ranges · no overlap found",
+      "partial": "Ranges · partial overlap",
+      "none": "Ranges · all overlap",
+      "unknown": "Ranges · ownership unknown"
+    },
+    "incomplete": "The report omits some candidates or has unresolved evidence; an empty list does not prove no overlap.",
+    "coverageCaveat": "These results cover only the listed candidates and do not establish current overall ownership.",
+    "runningResult": "Running-config report: {{result}}; this does not describe the current edit.",
+    "scopeTitle": "Report status",
+    "reportNotes": "Report scope and notes",
+    "scope": {
+      "unmatchedConfig": "This running-config report is for reference. The current edits have not been matched to it, so it cannot establish ownership for the visible nodes or rules.",
+      "previous": "Previous result; refresh before judging the current route.",
+      "applied": "Loaded in the recorded running generation. This describes the mesh route layer only.",
+      "preview": "Configuration preview; apply is still pending.",
+      "pending": "Saved or sampled data; loading in the core has not been confirmed."
+    },
+    "load": {
+      "startupReady": "Core startup confirmed the loaded generation.",
+      "fileWrittenUnacknowledged": "File was written; reload is unconfirmed.",
+      "loadFailed": "Loading failed; range ownership is unknown.",
+      "unknown": "No loading evidence is available."
+    },
+    "sampledAt": "Sampled: {{time}}",
+    "layerBoundary": "This report covers the mesh force-route layer; it does not test connectivity or prove the final path of every connection.",
+    "dnsUnknown": "Name resolution owner is unknown.",
+    "dnsOwner": "Name resolution currently selects {{node}}.",
+    "singleDns": "Only one Tailscale DNS owner is configured; other tailnet names are not guaranteed to resolve.",
+    "precedingExceptions": "Custom traffic and app rules run before this mesh layer.",
+    "customRule": "A custom traffic rule may override these ranges.",
+    "appRule": "An app rule may override these ranges.",
+    "otherException": "A preceding rule may change the final path.",
+    "noResults": "No node has a range result in this report.",
+    "coverage": {
+      "full": "No overlap was found within this layer; connectivity is untested.",
+      "partial": "Some requested ranges overlap an earlier candidate.",
+      "none": "No requested range remains for this node in this layer.",
+      "unknown": "The remaining range cannot be determined."
+    },
+    "leg": {
+      "preferredBy": "Policy match",
+      "externalRuleSet": "External rule set",
+      "inline": "Inline ranges"
+    },
+    "generated": "Generated for this run",
+    "notGenerated": "Not generated for this run",
+    "requested": "Requested ranges and sources",
+    "noRequested": "No enumerable requested ranges.",
+    "loadedRanges": "Ranges in the loaded mesh layer",
+    "calculatedRanges": "Calculated remaining ranges; loading unconfirmed",
+    "effectiveUnknown": "Unknown; an empty list would mean proven zero, which is not established here.",
+    "zeroEffective": "Proven zero ranges in this layer.",
+    "zeroCalculated": "No ranges remain in this sample calculation; current loading is unconfirmed.",
+    "possibleRuleOverlap": "Possible mesh overlap",
+    "possibleRuleOverlapKnown": "This IP rule runs before the mesh route layer and may match a reported destination range; final traffic path is not proven.",
+    "possibleRuleOverlapUnknown": "The mesh range report is incomplete or not loaded. This IP rule runs first, so overlap cannot be ruled out.",
+    "possibleRuleOverlapPrevious": "This IP rule intersects a requested range in the previous report; the current connection path remains unconfirmed.",
+    "catchAllExcluded": "Internet catch-all ranges are excluded from this subnet report: {{cidrs}}.",
+    "blockedTitle": "Overlapping range and earlier candidate",
+    "blockedConfirmed": "Earlier owner in this layer: {{node}}",
+    "blockedCandidate": "Earlier candidate, ownership unconfirmed: {{node}}",
+    "sourceDetails": "Source and loading details",
+    "engaged": {
+      "alwaysRouteSubnets": "Auto subnet routing enabled",
+      "selected": "Selected node",
+      "ruleTargeted": "Targeted by a rule",
+      "other": "Participation reason is available in the report."
+    },
+    "configured": "Configured ranges",
+    "observed": "Observed addresses",
+    "noRanges": "No ranges recorded.",
+    "noObservation": "No address observation; a default pool does not prove duplicate accounts.",
+    "fileReadFailed": "Referenced range file could not be read.",
+    "fileSampled": "Referenced range file sampled: {{time}}",
+    "timeUnknown": "time unknown",
+    "uncertainReasons": "Why this result is uncertain",
+    "invalid": "Invalid range",
+    "source": {
+      "declared": "Configured by the user",
+      "observed": "Observed from the network",
+      "retained": "Retained from an earlier sample",
+      "bootstrap": "Default pool estimate",
+      "opaque": "Range cannot be enumerated"
+    },
+    "reason": {
+      "opaqueMatchSet": "The matching range cannot be enumerated.",
+      "earlierOpaqueMatchSet": "An earlier candidate has an unknown matching range.",
+      "invalidCidr": "A configured range is invalid.",
+      "inputLimitExceeded": "The input range limit was exceeded.",
+      "resourceLimitExceeded": "The range calculation exceeded its limit.",
+      "snapshotStale": "The sample is stale.",
+      "fileReadFailed": "The referenced file could not be read.",
+      "fileParseFailed": "The referenced file contains invalid ranges.",
+      "fileLoadUnacknowledged": "File reload was not confirmed.",
+      "runningArtifactMissing": "The running artifact is unavailable.",
+      "generationFailed": "This node's route was not generated.",
+      "other": "Further evidence is unavailable."
+    },
+    "legacy": "This version cannot provide a verifiable route ownership report."
   }
 }

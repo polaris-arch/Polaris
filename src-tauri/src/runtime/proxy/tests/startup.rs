@@ -122,24 +122,27 @@ fn race_server_default_is_off_zero_port() {
 fn subscription_update_port_is_independent_and_flows_into_generate_deps() {
     let (rt, _dir) = test_runtime();
     let config = UserConfig::default();
-    let (api, update, subscription, probe, pool) = rt.resolve_start_ports(&config, 9090);
-    assert_ne!(subscription, 0);
-    assert_ne!(subscription, api);
-    assert_ne!(subscription, update);
-    assert_ne!(Some(subscription), probe);
-    assert!(!pool.contains(&subscription));
+    let ports = rt.resolve_start_ports(&config, 9090).unwrap();
+    assert_ne!(ports.subscription_update_in, 0);
+    assert_ne!(ports.subscription_update_in, ports.api);
+    assert_ne!(ports.subscription_update_in, ports.update_in);
+    assert_ne!(Some(ports.subscription_update_in), ports.probe_proxy);
+    assert!(!ports.probe_pool.contains(&ports.subscription_update_in));
 
     let deps = rt.generate_deps(
-        api,
-        update,
-        subscription,
-        probe,
-        &pool,
+        ports.api,
+        ports.update_in,
+        ports.subscription_update_in,
+        ports.probe_proxy,
+        &ports.probe_pool,
         &serde_json::json!({}),
         false,
     );
-    assert_eq!(deps.update_in_port, Some(update));
-    assert_eq!(deps.subscription_update_in_port, Some(subscription));
+    assert_eq!(deps.update_in_port, Some(ports.update_in));
+    assert_eq!(
+        deps.subscription_update_in_port,
+        Some(ports.subscription_update_in)
+    );
 }
 
 #[test]
@@ -199,6 +202,7 @@ async fn race_off_starts_no_sidecar_and_keeps_generate_deps_at_zero() {
             })),
             rt.config.dir(),
             rt.gate.generation(),
+            Platform::Linux,
         )
         .await;
     assert_eq!(rt.race_server_port(), 0, "竞速关 → 端口恒 0");
@@ -232,6 +236,7 @@ async fn race_on_starts_sidecar_and_feeds_port_and_custom_upstream_ips() {
             })),
             rt.config.dir(),
             rt.gate.generation(),
+            Platform::Linux,
         )
         .await;
     let port = rt.race_server_port();
@@ -281,13 +286,16 @@ fn should_start_via_helper_truth_table() {
         !should_start_via_helper(Tun, Platform::Other),
         "无 helper 平台的 TUN 不应经 helper（退回直起 best-effort）"
     );
+    // TUN@Android → 同样不经 helper，但**这一条是起核走对腿的前提**而不是 best-effort 降级：
+    // Android 的 TUN 由 `VpnService` 建、核跑在进程内 libbox，`start_inner` 的 android 腿
+    // （`android_bridge::start_core`）挂在 `!via_helper` 那一侧。这里若判 true，Android 会去
+    // 连一个根本不存在的 helper socket。
+    assert!(
+        !should_start_via_helper(Tun, Platform::Android),
+        "Android 无 helper：起核走进程内 libbox，绝不建 helper client"
+    );
     // 非 TUN（systemProxy/manual 不接管 TUN）→ 恒直起，绝不弹提权。
-    for p in [
-        Platform::Mac,
-        Platform::Win,
-        Platform::Linux,
-        Platform::Other,
-    ] {
+    for p in Platform::ALL.iter().copied() {
         assert!(
             !should_start_via_helper(SystemProxy, p),
             "systemProxy@{p:?} 不应经 helper"
@@ -1015,33 +1023,78 @@ fn helper_upgrade_leg_is_wired_into_the_start_gate() {
     );
 }
 
-/// helper 起核路径：本机无 daemon → 起核失败（**不静默回退直起**）且**复位 `core_via_helper`**。
-///
-/// 复位是硬不变式：若失败后仍留标记 true，后续 [`kill_core`] 会误走 helper stop（child 恒 None）→
-/// 直起的核永不被杀。变异锚点：删 `store(false)` 复位腿 → 本断言炸。
-/// **本机安全**：`start_core` 在 build_client→UnixConnector 连不存在的 socket 时即 ENOENT 失败，
+/// Linux helper 起核路径：无 daemon → 起核失败；通信错误统一保留
+/// helper route，因为同一个错误型也覆盖请求已写出但回包丢失。
+/// 平台显式注入 Linux：Mac/Win 在 native capability 门失败，尚未建立 helper route。
+/// **本机安全**：`start_core` 使用进程内 NeverConnect 替身，连接必失败，
 /// **绝不 spawn 真核 / 建 TUN / 碰宿主网络**。
 #[tokio::test]
-async fn helper_start_without_daemon_errs_and_resets_flag() {
-    let (rt, dir) = test_runtime();
+async fn helper_start_without_daemon_keeps_unconfirmed_route() {
+    let (rt, dir) = test_runtime_on(Platform::Linux);
     let cfg_path = dir.join("singbox-runtime.json");
     std::fs::write(&cfg_path, "{}").ok();
     let binary = PathBuf::from("/nonexistent/sing-box");
     let user_config: UserConfig = serde_json::from_value(polaris_store::default_config()).unwrap();
     let my_gen = rt.gate.generation();
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let mut main = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &ts_gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
     let r = rt
-        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen)
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
         .await;
+    let error = r.expect_err("无 helper daemon → 起核必失败（不静默直起）");
     assert!(
-        r.is_err(),
-        "本机无 helper daemon → 起核必失败（不静默直起）"
+        error.starts_with("helper 起核通信失败："),
+        "必须抵达所测的起核通信失败分支：{error}"
     );
     assert!(
-        !rt.core_via_helper.load(Ordering::SeqCst),
-        "起核失败必复位 core_via_helper（否则 kill_core 误走 helper stop）"
+        rt.core_via_helper.load(Ordering::SeqCst),
+        "通信错误不得清掉可能已起核的 helper route"
     );
-    // pid 亦不得残留。
-    assert!(rt.pid.lock().unwrap().is_none(), "失败不得残留 pid");
+    assert!(rt.pid.lock().unwrap().is_none(), "未知结果不得伪造 pid");
+    assert!(rt.child.lock().unwrap().has_helper_start());
+}
+
+/// Mac/Win 的只读能力门失败发生在 Start custody 建立前；同一个通信替身不得被当作已发 Start。
+#[tokio::test]
+async fn helper_start_native_capability_failure_keeps_route_unarmed() {
+    for platform in [Platform::Mac, Platform::Win] {
+        let (rt, dir) = test_runtime_on(platform);
+        let cfg_path = dir.join("singbox-runtime.json");
+        std::fs::write(&cfg_path, "{}").unwrap();
+        let binary = PathBuf::from("/nonexistent/sing-box");
+        let user_config: UserConfig =
+            serde_json::from_value(polaris_store::default_config()).unwrap();
+        let my_gen = rt.gate.generation();
+        let ts_gate = rt.mesh.tailscale_state_gate().await;
+        let mut main = rt
+            .mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints": []}),
+                &ts_gate,
+                rt.mesh.mint_tailscale_main_birth(),
+            )
+            .await
+            .unwrap();
+        let error = rt
+            .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
+            .await
+            .expect_err("未连接 helper → native capability 不可确认");
+        assert!(
+            error.contains("已安装的 helper 未提供 native birth 安全能力"),
+            "必须抵达 native capability 拒绝分支：{error}"
+        );
+        assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+        assert!(rt.pid.lock().unwrap().is_none());
+        assert!(!rt.child.lock().unwrap().has_helper_start());
+    }
 }
 
 /// helper 起核路径：起核前已被更新的 start/stop 接管（世代变）→ 让位（`Ok(None)`）、不 IPC、不置标记。
@@ -1055,8 +1108,18 @@ async fn helper_start_superseded_before_ipc_yields_none() {
     let user_config: UserConfig = serde_json::from_value(polaris_store::default_config()).unwrap();
     let stale_gen = rt.gate.generation();
     rt.gate.bump_generation(); // 模拟被接管
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let mut main = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &ts_gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
     let r = rt
-        .spawn_core_via_helper(&binary, &cfg_path, &user_config, stale_gen)
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, stale_gen, &mut main)
         .await
         .expect("让位是正常返回，非 Err");
     assert!(r.is_none(), "起核前世代已变 → 让位 Ok(None)");
@@ -1076,11 +1139,12 @@ async fn start_yields_without_spawning_when_superseded_before_spawn() {
 
     // 直接调 start_inner 并传入已过期的世代 → 应让位返回、不 spawn。
     let cfg = serde_json::json!({ "servers": [], "selectedServerId": "__direct__" });
-    let r = rt.start_inner(cfg, stale_gen).await;
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let r = rt.start_inner(cfg, stale_gen, &ts_gate).await;
     assert!(r.is_ok(), "让位是正常返回，不是错误");
     assert!(!rt.status().running, "让位腿不得置 running");
     assert!(
-        rt.child.lock().unwrap().is_none(),
+        rt.child.lock().unwrap().is_empty(),
         "让位腿绝不能 spawn 子进程（否则成孤儿：接管方不知道它的存在）"
     );
 }
@@ -1214,37 +1278,21 @@ async fn start_lands_custom_rule_files_before_generate() {
     );
 }
 
-/// public start 经 guarded 起核腿，在任何 await（含 TS 状态门和 stale 清扫）之前占住稳定门；
-/// 否则清扫较慢时，8s 订阅补更仍可从缝里起跑，随后被成功 TUN 的 flush 杀掉。
-/// 同时锁住 public 入口到 guarded 腿的委托，避免只检查一个未被调用的方法而假绿。
+/// public start 必须在 stale 清扫之前就占住稳定门；否则清扫较慢时，8s 订阅补更仍可从缝里起跑，
+/// 随后被成功 TUN 的 flush 杀掉。源码顺序门补足上面纯 gate 测试够不着的生产接线。
 #[test]
 fn public_start_arms_network_settle_before_any_await() {
-    let source = module_code("runtime/proxy");
-    let public = method_body(
-        &source,
-        "    pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {",
+    let body = method_body(
+        &module_code("runtime/proxy"),
+        "    pub(super) async fn start_guarded(",
     );
-    let delegate = public
-        .find("self.start_guarded(config, None).await")
-        .expect("public start 必须委托 guarded 起核腿");
-    assert_eq!(
-        public.find(".await"),
-        Some(delegate + "self.start_guarded(config, None)".len()),
-        "public start 不能先 await 再委托 guarded 起核腿"
-    );
-    let guarded = method_body(&source, "    ) -> StartLeg {");
-    let arm = guarded
+    let arm = body
         .find("let _network_settle = self.network_settle.begin(\"proxy-start\")")
-        .expect("guarded 起核腿必须占住订阅稳定门");
-    let first_await = guarded.find(".await").expect("guarded 起核腿必须有 await");
-    assert!(
-        arm < first_await,
-        "稳定门必须先于 guarded 起核腿的首个 await"
-    );
-    let stale_sweep = guarded
+        .expect("public start 必须占住订阅稳定门");
+    let first_await = body
         .find("self.cleanup_stale_cores().await")
         .expect("stale 清扫锚必须存在");
-    assert!(first_await < stale_sweep, "TS 状态门须先于 stale 清扫");
+    assert!(arm < first_await, "稳定门必须先于 start 的第一个 await");
 }
 
 /// ① **退避期取消 → 就地退场**（本任务的主门；直接对应「点了立刻停 vs 静默等 35s」）。
@@ -1301,7 +1349,7 @@ async fn cancelling_start_interrupts_backoff_and_settles_clean() {
     assert!(st.error.is_none(), "主动取消不得留错误态");
     assert!(rt.pid.lock().unwrap().is_none(), "取消后不得残留 pid");
     assert!(
-        rt.child.lock().unwrap().is_none(),
+        rt.child.lock().unwrap().is_empty(),
         "取消后不得残留 child 句柄"
     );
     assert!(
@@ -1365,7 +1413,7 @@ async fn cancelling_start_during_readiness_wait_reaps_the_real_process() {
     assert!(!rt.status().running);
     assert!(!rt.status().starting, "在飞计数必须归零");
     assert!(
-        rt.child.lock().unwrap().is_none(),
+        rt.child.lock().unwrap().is_empty(),
         "child 句柄必须已被接管方取走并收割"
     );
 }

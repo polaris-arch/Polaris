@@ -11,6 +11,7 @@
 //! 确定性桩；生产用 [`TokioPortProvider`]（bind 0 → 取端口 → drop）。
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 /// 默认 control_api 端口（对齐 上游 `DEFAULT_CONTROL_PORT = 9090`，proxy-ports.ts:11）。
 pub const DEFAULT_CONTROL_PORT: u16 = 9090;
@@ -95,6 +96,50 @@ pub struct ResolvedPort {
     pub port: u16,
     /// true = 5 次重试仍撞 exclude → 用了 fallback（极少见）。
     pub used_fallback: bool,
+}
+
+/// Ports already offered to a primary API in this process. A cancelled or failed
+/// start may still have an h2c request buffered for that endpoint, so retirement
+/// is permanent until process exit. The lock makes selection and retirement one
+/// atomic operation across concurrent starts.
+#[derive(Default)]
+pub struct PrimaryApiPortLedger(Mutex<HashSet<u16>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryApiPortsExhausted;
+
+impl PrimaryApiPortLedger {
+    pub fn allocate<P: FreePortProvider>(
+        &self,
+        allocator: &PortAllocator<P>,
+        exclusions: &PortExclusions,
+    ) -> Result<ResolvedPort, PrimaryApiPortsExhausted> {
+        let mut used = self.0.lock().map_err(|_| PrimaryApiPortsExhausted)?;
+        let excluded = exclusions.as_set();
+        for _ in 0..allocator.max_attempts {
+            if let Some(port) = allocator.provider.try_allocate() {
+                if port != 0 && !excluded.contains(&port) && used.insert(port) {
+                    return Ok(ResolvedPort {
+                        port,
+                        used_fallback: false,
+                    });
+                }
+            }
+        }
+        let fallback = exclusions
+            .control_api
+            .checked_add(1)
+            .filter(|port| *port != 0);
+        if let Some(port) = fallback {
+            if !excluded.contains(&port) && used.insert(port) {
+                return Ok(ResolvedPort {
+                    port,
+                    used_fallback: true,
+                });
+            }
+        }
+        Err(PrimaryApiPortsExhausted)
+    }
 }
 
 /// bind 0 → 取端口 → 立即关的抽象（resolveFreeLocalPort 内核，:3040-3046）。

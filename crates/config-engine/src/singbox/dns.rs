@@ -75,6 +75,8 @@ pub struct DnsServer {
 /// `dns.rules[]`（`singbox-config-types.ts:41 SingBoxDnsRule`）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DnsRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clash_mode: Option<String>,
     /// `rule_set`：sing-box DNS rule 是 `string | string[]`（OneOrMany）。
     /// Polaris dns-builder 在 region-local geo（单/多 tag）与外化 dns rule_set（数组）两处 emit。
     #[serde(skip_serializing_if = "Option::is_none")]

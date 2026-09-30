@@ -759,7 +759,7 @@ export const BYPASS_TABLE: readonly BypassRule[] = [
     op: 'switchServer',
     predicate: 'W-1',
     configKey: 'selectedServerId',
-    why: '首页出口框 / 状态栏节点名 / willRestartOnSelect 提示都实时回显它',
+    why: '首页出口框 / 状态栏节点名会实时回显选择；实际内核生效由 server_switch 收据判断',
   },
   {
     op: 'switchProxyMode',

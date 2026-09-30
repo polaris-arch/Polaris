@@ -59,6 +59,10 @@ use std::sync::OnceLock;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use polaris_config_engine::singbox::InboundUser;
+
+use crate::runtime::http::proxy_authorization_line;
+
 /// 响应头累积上限：超过即判失败。
 ///
 /// 没有这条上限时，一个「一直吐字节但永远不出 `\r\n\r\n`」的端点会让缓冲无界增长直到总超时才被掐断
@@ -133,9 +137,14 @@ impl SpeedTestTarget {
     }
 
     /// CONNECT 请求报文（建隧道那一步）。
-    fn connect_request(&self) -> String {
+    ///
+    /// `auth` 非空时带 `Proxy-Authorization`（Android 上 `probe-in-k` 要求本次起核的一次性凭据；
+    /// 缺了内核回 407 ⇒ 该节点本轮记 -1，且全池一起 -1）。凭据**只**出现在这条 CONNECT 里：
+    /// 隧道建成后我们面对的是 origin，逐跳头不得带过去（[`Self::get_request`] 一个字都不加）。
+    fn connect_request(&self, auth: Option<&InboundUser>) -> String {
         let a = self.authority();
-        format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n\r\n")
+        let proxy_auth = proxy_authorization_line(auth);
+        format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n{proxy_auth}\r\n")
     }
 
     /// 隧道上的 GET 报文 —— **origin-form**（`GET /path HTTP/1.1`），不是 absolute-form。
@@ -357,12 +366,16 @@ async fn read_response_status<S: AsyncRead + Unpin>(
 /// `tokio::spawn`，超时只会丢掉 join handle 而**任务仍在跑**，socket 挂在运行时里直到自己结束 ——
 /// 这正是 上游 注释点名的那个坑（「持有所有已建立句柄，finish 时统一 destroy；大订阅并发 32 时累积」），
 /// Rust 侧靠「不 spawn + drop 兜底」达成同一效果。门：`timeout_closes_the_socket_not_leaks_it`。
-pub async fn open_tunnel(proxy_port: u16, target: &SpeedTestTarget) -> Option<SpeedTestTunnel> {
+pub async fn open_tunnel(
+    proxy_port: u16,
+    auth: Option<&InboundUser>,
+    target: &SpeedTestTarget,
+) -> Option<SpeedTestTunnel> {
     let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.ok()?;
     // 关 Nagle：小请求的 TTFB 不该被 delayed-ACK / 合包拖慢（上游 `socket.setNoDelay(true)`）。
     let _ = sock.set_nodelay(true);
 
-    sock.write_all(target.connect_request().as_bytes())
+    sock.write_all(target.connect_request(auth).as_bytes())
         .await
         .ok()?;
     sock.flush().await.ok()?;

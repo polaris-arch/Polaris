@@ -23,6 +23,66 @@ fn linux_frame_no_token_line() {
     assert_eq!(lines, vec!["ping"]);
 }
 
+/// token 行的**唯一判据**是 [`Platform::has_token_line`]，帧编码不得另写一份。
+///
+/// # 这条测试是为一个真缺陷写的（2026-09-04 K10）
+///
+/// `encode_frame` 原先写的是 `if platform != Platform::Linux { push(token) }` —— 与
+/// `has_token_line()` 是同一个问题的两份答案，**且已经漂了**：`Platform::Other` 上
+/// `has_token_line()` 返 false（枚举文档与 `platform_token_line_semantics` 都写着「未知平台
+/// 无 helper 实现，保守不带 token 行，避免对未鉴权对端误发凭据」），而 `!= Linux` 判 true，
+/// 即生产**照发**。没有任何测试能发现这件事，因为两份判据从没被放在一起比过。
+///
+/// # 判据形态：逐平台对拍两份实现，而不是「看起来一样」
+///
+/// 对 [`Platform::ALL`] 的每一个变体，断言帧的首行**当且仅当** `has_token_line()` 为真时
+/// 是 token。三个桌面平台的期望值在这里被逐值钉死 ⇒ 这同时是本次收口对桌面的**零回归判据**
+/// （不是「加了个函数调用所以应该没变」，是「mac 首行仍是 tok、win 仍是 tok、linux 仍是 ping」）。
+#[test]
+fn token_line_presence_follows_the_single_predicate_on_every_platform() {
+    for platform in Platform::ALL.iter().copied() {
+        let lines = encode_frame(platform, "TOK", &Request::Ping);
+        if platform.has_token_line() {
+            assert_eq!(
+                lines,
+                vec!["TOK", "ping"],
+                "{platform:?}: has_token_line()=true 却没发 token 行 —— 该平台的 helper 会拒连"
+            );
+        } else {
+            assert_eq!(
+                lines,
+                vec!["ping"],
+                "{platform:?}: has_token_line()=false 却发了 token 行 —— \
+                 向一个未鉴权对端泄露了凭据。这正是 2026-09-04 修掉的那条。"
+            );
+        }
+    }
+
+    // 逐值零回归（桌面三平台的期望值写死，不经谓词 —— 谓词若整个坏掉，上面那段会一起坏，
+    // 这段不会）。
+    assert_eq!(
+        encode_frame(Platform::Mac, "T", &Request::Ping),
+        vec!["T", "ping"]
+    );
+    assert_eq!(
+        encode_frame(Platform::Win, "T", &Request::Ping),
+        vec!["T", "ping"]
+    );
+    assert_eq!(
+        encode_frame(Platform::Linux, "T", &Request::Ping),
+        vec!["ping"]
+    );
+    // 修复本身：这两个平台此前会拿到 `["T", "ping"]`。
+    assert_eq!(
+        encode_frame(Platform::Other, "T", &Request::Ping),
+        vec!["ping"]
+    );
+    assert_eq!(
+        encode_frame(Platform::Android, "T", &Request::Ping),
+        vec!["ping"]
+    );
+}
+
 #[test]
 fn mac_start_frame_full() {
     // 完整 mac start 帧（对照 helper.go:508-513 的 6 行 readLine 序列）

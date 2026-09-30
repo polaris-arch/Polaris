@@ -36,7 +36,14 @@ describe('backup category dependencies', () => {
       'dnsRules',
       'dnsResources',
       'appRules',
+      'meshRouting',
       'generalSettings',
     ]);
+  });
+
+  it('keeps mesh routing separate from mesh nodes and subscriptions', () => {
+    expect([...normalizeBackupSelection(['meshRouting'])]).toEqual(['meshRouting']);
+    expect([...toggleBackupCategory(new Set<BackupCategory>(['meshRouting']), 'meshNodes')])
+      .toEqual(['meshRouting', 'meshNodes']);
   });
 });

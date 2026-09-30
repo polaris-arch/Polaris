@@ -240,7 +240,7 @@ pub fn validate_config(value: &mut Value) -> Result<(), crate::StoreError> {
     let tun = tun
         .as_object()
         .ok_or_else(|| crate::StoreError::validation("tunConfig is required"))?;
-    // mtu **缺席即合法**（= 自动，生成期取 config-engine `tun_config::DEFAULT_TUN_MTU`）。
+    // mtu **缺席即合法**（= 自动，生成期不下发 `mtu` 键，由 sing-box 内核取默认，见 config-engine `TunModeConfig::mtu`）。
     // 在场则必须是 1280–65535 的数；`null` / 字符串 / 越界一律拒——「设了但是脏值」与「没设」是两回事，
     // 前者静默吞掉就是又一个「设置了不生效」。
     if let Some(raw) = tun.get("mtu").filter(|v| !v.is_null()) {

@@ -49,6 +49,103 @@ pub trait ConfigFs {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdFs;
 
+/// The strongest durability guarantee supplied by the current platform.
+/// Atomic rename is available on every target; directory sync is only claimed
+/// where the platform exposes it and it succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableWriteGuarantee {
+    FileAndDirectory,
+    FileOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableWriteStage {
+    BeforeReplace,
+    AfterReplace,
+}
+
+/// Publish a managed document only after syncing its private temporary file.
+/// A failure after rename is deliberately different from a pre-rename error:
+/// callers must re-read the on-disk document under their transaction lock.
+pub fn durable_atomic_write(
+    path: &Path,
+    content: &str,
+    suffix_hex: &str,
+) -> Result<DurableWriteGuarantee, crate::StoreError> {
+    durable_atomic_write_with_hook(path, content, suffix_hex, |_| Ok(()))
+}
+
+fn durable_atomic_write_with_hook(
+    path: &Path,
+    content: &str,
+    suffix_hex: &str,
+    mut hook: impl FnMut(DurableWriteStage) -> Result<(), crate::StoreError>,
+) -> Result<DurableWriteGuarantee, crate::StoreError> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::StoreError::Io("managed document has no parent directory".into()))?;
+    std::fs::create_dir_all(parent).map_err(|e| crate::StoreError::Io(e.to_string()))?;
+    let temporary = tmp_path(path, suffix_hex);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut owned_temporary = false;
+    let result = (|| {
+        let mut file = opts
+            .open(&temporary)
+            .map_err(|e| crate::StoreError::Io(e.to_string()))?;
+        owned_temporary = true;
+        file.write_all(content.as_bytes())
+            .map_err(|e| crate::StoreError::Io(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| crate::StoreError::Io(e.to_string()))?;
+        drop(file);
+        hook(DurableWriteStage::BeforeReplace)?;
+        std::fs::rename(&temporary, path).map_err(|e| crate::StoreError::Io(e.to_string()))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if owned_temporary {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        return Err(error);
+    }
+    hook(DurableWriteStage::AfterReplace)
+        .map_err(|error| crate::StoreError::CommitUncertain(error.to_string()))?;
+    sync_parent_after_publish(parent)
+}
+
+/// Deleting an opt-in marker also changes authority. If unlink succeeds but
+/// syncing the directory fails, the caller cannot claim cancellation finished.
+pub fn durable_remove(path: &Path) -> Result<DurableWriteGuarantee, crate::StoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::StoreError::Io("managed marker has no parent directory".into()))?;
+    std::fs::remove_file(path).map_err(|e| crate::StoreError::Io(e.to_string()))?;
+    sync_parent_after_publish(parent)
+}
+
+fn sync_parent_after_publish(parent: &Path) -> Result<DurableWriteGuarantee, crate::StoreError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| crate::StoreError::CommitUncertain(e.to_string()))?;
+        Ok(DurableWriteGuarantee::FileAndDirectory)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(DurableWriteGuarantee::FileOnly)
+    }
+}
+
 impl StdFs {
     /// 以 0o600 权限写入文件（Unix）；Windows 忽略权限（chmod 无效）。
     fn write_secure(path: &Path, content: &str) -> Result<(), crate::StoreError> {

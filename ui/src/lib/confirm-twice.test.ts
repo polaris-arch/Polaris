@@ -6,7 +6,7 @@
  * 「hook 真的用了这个核心、各屏真的用了这个 hook」由 `destructive-confirm-wiring.test.ts` 的源码守卫管。
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createConfirmTwice, CONFIRM_TWICE_MS } from './confirm-twice';
+import { createConfirmTwice, CONFIRM_TWICE_MS, pointerOutsideConfirmation } from './confirm-twice';
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
@@ -175,5 +175,27 @@ describe('reset：点别处即复原（陈先生 2026-07-30）', () => {
     core.reset();
     core.reset();
     expect(changes).toEqual([]);
+  });
+});
+
+describe('物理触摸的 capture 阶段', () => {
+  it('独立 `.confirming` 类中的第二次 pointerdown 不解除武装', () => {
+    const { core } = harness();
+    const action = vi.fn();
+    core.confirmTwice('k', action);
+    const button = { closest: (selector: string) => selector === '.confirming' ? button : null } as unknown as EventTarget;
+    if (pointerOutsideConfirmation(button)) core.reset();
+    core.confirmTwice('k', action);
+    expect(action).toHaveBeenCalledOnce();
+  });
+
+  it('只有前缀类 `m-pending-confirming` 时会误判为外部点击（根因对照）', () => {
+    const { core } = harness();
+    const action = vi.fn();
+    core.confirmTwice('k', action);
+    const button = { closest: () => null } as unknown as EventTarget;
+    if (pointerOutsideConfirmation(button)) core.reset();
+    core.confirmTwice('k', action);
+    expect(action).not.toHaveBeenCalled();
   });
 });

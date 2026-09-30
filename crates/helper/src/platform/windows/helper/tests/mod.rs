@@ -5,6 +5,7 @@ use crate::platform::windows::ops::{MockNetTableOps, MockProcOps};
 use crate::token::StaticTokenStore;
 use polaris_helper_proto::StartParams;
 
+mod native_birth;
 mod wire_gate;
 
 /// **已迁移**形态（P4 的目标态，也是安装脚本装出来的形态）：`--singbox` 就在
@@ -143,7 +144,7 @@ fn start_with_empty_cfg_is_no_config() {
     let h = make_helper_defaults();
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: String::new(),
             log: String::new(),
             fwd: false,
@@ -161,7 +162,7 @@ fn start_with_cfg_outside_confdir_is_denied() {
     let h = make_helper_defaults();
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Windows\evil.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -180,7 +181,7 @@ fn start_with_log_outside_confdir_is_denied() {
     let h = make_helper_defaults();
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             // cfg 合法，只有 log 越界 —— 单独钉住 log 这一格。
             cfg: r"C:\Users\polaris\config\singbox-runtime.json".to_owned(),
             log: r"C:\Windows\System32\drivers\etc\hosts".to_owned(),
@@ -200,7 +201,7 @@ fn start_with_log_inside_confdir_is_allowed() {
     let h = make_helper_defaults();
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\singbox-runtime.json".to_owned(),
             log: r"C:\Users\polaris\config\singbox-startup.log".to_owned(),
             fwd: false,
@@ -223,7 +224,7 @@ fn start_with_empty_log_is_allowed() {
     let h = make_helper_defaults();
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\singbox-runtime.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -246,21 +247,25 @@ fn start_with_valid_cfg_starts_and_records_pid() {
     let h = make_helper(proc_ops, MockNetTableOps::new());
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,
             parent_pid: None,
         }),
     );
-    let HandleOutcome::Respond(Response::Ok(ResponseKind::Start(
-        polaris_helper_proto::Start::StartedTimed { pid, timing, .. },
+    let HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
+        polaris_helper_proto::NativeBirthStart::Started {
+            target,
+            timing: Some(timing),
+            ..
+        },
     ))) = out
     else {
         panic!("{out:?}");
     };
     // mock next_pid + mock 阶段耗时。
-    assert_eq!(pid, 1000);
+    assert_eq!(target.pid.get(), 1000);
     assert_eq!(timing.total_ms, 0);
     // status 应反映 running
     let out2 = h.handle("real-token", Request::Status);
@@ -276,7 +281,7 @@ fn start_with_valid_cfg_starts_and_records_pid() {
 fn status_clears_a_managed_pid_after_the_child_exits() {
     let proc_ops = MockProcOps::new();
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
-    let request = Request::Start(StartParams {
+    let request = Request::NativeStartBirth(StartParams {
         cfg: r"C:\Users\polaris\config\c.json".to_owned(),
         log: String::new(),
         fwd: false,
@@ -284,7 +289,7 @@ fn status_clears_a_managed_pid_after_the_child_exits() {
     });
     let _ = h.handle("real-token", request.clone());
 
-    proc_ops.set_alive(false);
+    proc_ops.set_native_poll(crate::platform::windows::ops::NativeChildPoll::Exited);
     assert!(matches!(
         h.handle("real-token", Request::Status),
         HandleOutcome::Respond(Response::Ok(ResponseKind::Status(
@@ -292,13 +297,13 @@ fn status_clears_a_managed_pid_after_the_child_exits() {
         )))
     ));
 
-    proc_ops.set_alive(true);
+    proc_ops.set_native_poll(crate::platform::windows::ops::NativeChildPoll::Running);
     let restarted = h.handle("real-token", request);
     assert!(matches!(
         restarted,
-        HandleOutcome::Respond(Response::Ok(ResponseKind::Start(
-            polaris_helper_proto::Start::StartedTimed { pid: 1001, .. }
-        )))
+        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
+            polaris_helper_proto::NativeBirthStart::Started { target, .. }
+        ))) if target.pid.get() == 1001
     ));
 }
 
@@ -307,7 +312,7 @@ fn start_when_already_running_returns_already() {
     let proc_ops = MockProcOps::new();
     let h = make_helper(proc_ops, MockNetTableOps::new());
     let cfg = r"C:\Users\polaris\config\c.json".to_owned();
-    let req = Request::Start(StartParams {
+    let req = Request::NativeStartBirth(StartParams {
         cfg,
         log: String::new(),
         fwd: false,
@@ -317,9 +322,9 @@ fn start_when_already_running_returns_already() {
     let out = h.handle("real-token", req);
     assert!(matches!(
         out,
-        HandleOutcome::Respond(Response::Ok(ResponseKind::Start(
-            polaris_helper_proto::Start::Already { pid: 1000 }
-        )))
+        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
+            polaris_helper_proto::NativeBirthStart::Already { target }
+        ))) if target.pid.get() == 1000
     ));
 }
 
@@ -330,7 +335,7 @@ fn start_failure_returns_err_start() {
     let h = make_helper(proc_ops, MockNetTableOps::new());
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -350,7 +355,7 @@ fn start_with_fwd_calls_enable_ip_forwarding() {
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
     let _ = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: true, // 应触发 enable_ip_forwarding
@@ -380,15 +385,11 @@ fn stop_reaps_running_child_and_clears_state() {
     let proc_ops = MockProcOps::new();
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
     // 先 start
-    let _ = h.handle(
-        "real-token",
-        Request::Start(StartParams {
-            cfg: r"C:\Users\polaris\config\c.json".to_owned(),
-            log: String::new(),
-            fwd: false,
-            parent_pid: None,
-        }),
-    );
+    // Fixture for a pre-native legacy core; production legacy Start is refused.
+    let old = proc_ops
+        .start_singbox("fixture", "fixture", "", false)
+        .unwrap();
+    h.child_mu.lock().unwrap().pid = Some(old.pid);
     let snap_before = proc_ops.snapshot();
     // stop
     let out = h.handle("real-token", Request::Stop { pid: None });
@@ -423,15 +424,11 @@ fn stop_refuses_to_reap_when_managed_pid_is_another_session() {
     let proc_ops = MockProcOps::new();
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
     // daemon 手里的是新会话的核（MockProcOps 的 start 固定报 1000）。
-    let _ = h.handle(
-        "real-token",
-        Request::Start(StartParams {
-            cfg: r"C:\Users\polaris\config\c.json".to_owned(),
-            log: String::new(),
-            fwd: false,
-            parent_pid: None,
-        }),
-    );
+    // Fixture for a pre-native legacy core; production legacy Start is refused.
+    let old = proc_ops
+        .start_singbox("fixture", "fixture", "", false)
+        .unwrap();
+    h.child_mu.lock().unwrap().pid = Some(old.pid);
     let snap_before = proc_ops.snapshot();
     // 老 stop 腿声明它要停 4242。
     let out = h.handle("real-token", Request::Stop { pid: Some(4242) });
@@ -466,15 +463,11 @@ fn stop_refuses_to_reap_when_managed_pid_is_another_session() {
 fn stop_proceeds_when_managed_pid_matches() {
     let proc_ops = MockProcOps::new();
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
-    let _ = h.handle(
-        "real-token",
-        Request::Start(StartParams {
-            cfg: r"C:\Users\polaris\config\c.json".to_owned(),
-            log: String::new(),
-            fwd: false,
-            parent_pid: None,
-        }),
-    );
+    // Fixture for a pre-native legacy core; production legacy Start is refused.
+    let old = proc_ops
+        .start_singbox("fixture", "fixture", "", false)
+        .unwrap();
+    h.child_mu.lock().unwrap().pid = Some(old.pid);
     let snap_before = proc_ops.snapshot();
     let out = h.handle("real-token", Request::Stop { pid: Some(1000) });
     assert_eq!(
@@ -496,7 +489,7 @@ fn cleanup_reaps_child_and_kills_all_singbox() {
     // 先 start
     let _ = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -510,7 +503,8 @@ fn cleanup_reaps_child_and_kills_all_singbox() {
         HandleOutcome::Respond(Response::Ok(ResponseKind::Cleaned))
     );
     let snap_after = proc_ops.snapshot();
-    assert_eq!(snap_after.reap_calls, snap_before.reap_calls + 1);
+    assert_eq!(proc_ops.native_stop_calls(), 1);
+    assert_eq!(snap_after.reap_calls, snap_before.reap_calls);
     // kill_all_singbox 由 mock 的 kill_all_return 返回 2（调用计数不经此路径，但行为对齐 Go）
 }
 
@@ -706,7 +700,7 @@ fn route_denied_iface_runs_no_netsh() {
 // ===== 父死看护接线（W15 修）=====
 
 fn start_req_with_ppid(ppid: Option<u32>) -> Request {
-    Request::Start(StartParams {
+    Request::NativeStartBirth(StartParams {
         cfg: r"C:\Users\polaris\config\c.json".to_owned(),
         log: String::new(),
         fwd: false,
@@ -752,7 +746,8 @@ fn watch_parent_reaps_child_when_parent_dead() {
     let _ = h.handle("real-token", start_req_with_ppid(Some(4242)));
     let snap_after = proc_ops.snapshot();
     // on_parent_dead → proc.reap_child(pid) → reap_calls +1。
-    assert_eq!(snap_after.reap_calls, snap_before.reap_calls + 1);
+    assert_eq!(proc_ops.native_stop_calls(), 1);
+    assert_eq!(snap_after.reap_calls, snap_before.reap_calls);
     // child 已被摘 → status 现在 stopped。
     let out = h.handle("real-token", Request::Status);
     assert!(matches!(
@@ -804,7 +799,7 @@ fn reap_child_on_exit_reaps_when_child_present() {
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
     let _ = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -812,17 +807,21 @@ fn reap_child_on_exit_reaps_when_child_present() {
         }),
     );
     let snap_before = proc_ops.snapshot();
-    h.reap_child_on_exit();
+    h.reap_child_on_exit().unwrap();
     let snap_after = proc_ops.snapshot();
-    assert_eq!(snap_after.reap_calls, snap_before.reap_calls + 1);
+    assert_eq!(proc_ops.native_stop_calls(), 1);
+    assert_eq!(snap_after.reap_calls, snap_before.reap_calls);
 }
 
 #[test]
-fn reap_child_on_exit_killall_when_no_child() {
+fn reap_child_on_exit_confirms_both_empty_registries() {
     let proc_ops = MockProcOps::new();
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
-    h.reap_child_on_exit(); // 无 child → 走 killAllSingbox 兜底
-                            // kill_all_singbox 调用无独立计数器，但行为对齐 Go（Go 注释 helper.go:407-409）
+    h.reap_child_on_exit().unwrap();
+    assert!(h.child_mu.lock().unwrap().closing);
+    assert!(proc_ops.native_custody_empty());
+    assert_eq!(proc_ops.snapshot().reap_calls, 0);
+    assert_eq!(proc_ops.snapshot().terminate_calls, 0);
 }
 
 // ===== unsupported commands =====
@@ -909,7 +908,7 @@ fn install_core_is_busy_while_the_managed_core_runs() {
     let h = make_helper_with_support(MockProcOps::new(), support.path().to_str().unwrap());
     let started = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -920,7 +919,9 @@ fn install_core_is_busy_while_the_managed_core_runs() {
         panic!("{started:?}");
     };
     assert!(
-        started.to_wire_line().starts_with("OK started"),
+        started
+            .to_wire_line()
+            .starts_with("OK native-birth-started"),
         "前置条件没成立（核没起来）：{}",
         started.to_wire_line()
     );
@@ -979,7 +980,7 @@ fn start_consults_the_acl_self_check_on_the_exec_dir() {
     );
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -989,7 +990,7 @@ fn start_consults_the_acl_self_check_on_the_exec_dir() {
     let HandleOutcome::Respond(resp) = out else {
         panic!("{out:?}");
     };
-    assert!(resp.to_wire_line().starts_with("OK started"));
+    assert!(resp.to_wire_line().starts_with("OK native-birth-started"));
     assert_eq!(
         proc_ops.acl_queries(),
         vec![ACL_DIR.to_owned(), ACL_BIN.to_owned(), ACL_DLL.to_owned()],
@@ -1007,7 +1008,7 @@ fn start_proceeds_when_the_core_dir_acl_is_locked_down() {
         panic!("{out:?}");
     };
     assert!(
-        resp.to_wire_line().starts_with("OK started"),
+        resp.to_wire_line().starts_with("OK native-birth-started"),
         "目标态被误拒：{}",
         resp.to_wire_line()
     );
@@ -1084,7 +1085,7 @@ fn start_proceeds_when_the_acl_cannot_be_read() {
         panic!("{out:?}");
     };
     assert!(
-        resp.to_wire_line().starts_with("OK started"),
+        resp.to_wire_line().starts_with("OK native-birth-started"),
         "读不到被当成了被放宽：{}",
         resp.to_wire_line()
     );
@@ -1190,7 +1191,7 @@ fn enumerated_entries_are_deduplicated_against_the_fallback_names() {
     let HandleOutcome::Respond(resp) = out else {
         panic!("{out:?}");
     };
-    assert!(resp.to_wire_line().starts_with("OK started"));
+    assert!(resp.to_wire_line().starts_with("OK native-birth-started"));
     assert_eq!(
         proc_ops.acl_queries(),
         vec![
@@ -1214,7 +1215,7 @@ fn start_proceeds_when_the_core_dir_cannot_be_enumerated() {
         panic!("{out:?}");
     };
     assert!(
-        resp.to_wire_line().starts_with("OK started"),
+        resp.to_wire_line().starts_with("OK native-birth-started"),
         "枚举失败被当成了被放宽：{}",
         resp.to_wire_line()
     );
@@ -1258,7 +1259,7 @@ fn start_skips_the_acl_check_only_when_the_helper_is_not_migrated_yet() {
         panic!("未迁移的机器被 brick 了");
     };
     assert!(
-        resp.to_wire_line().starts_with("OK started"),
+        resp.to_wire_line().starts_with("OK native-birth-started"),
         "未迁移的机器被拒起核 = brick：{}",
         resp.to_wire_line()
     );
@@ -1367,7 +1368,7 @@ fn status_and_start_carry_the_managed_identity() {
 
     let out = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,
@@ -1417,7 +1418,7 @@ fn status_without_identity_falls_back_to_the_old_wire() {
     let h = make_helper(proc_ops, MockNetTableOps::new());
     let _ = h.handle(
         "real-token",
-        Request::Start(StartParams {
+        Request::NativeStartBirth(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),
             fwd: false,

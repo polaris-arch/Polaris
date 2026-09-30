@@ -1,7 +1,9 @@
 use super::*;
 use crate::singbox::Endpoint;
 use crate::user_config::app_config::UserConfig;
-use crate::user_config::proxy_mode::ProxyMode;
+// 生产侧已改读「本平台生效值」（`ProxyModeType::effective_on`），不再直接引这个类型；
+// 测试仍要按档构造输入，故在此单独引入。
+use crate::user_config::proxy_mode::{ProxyMode, ProxyModeType};
 use crate::user_config::rule::{
     AppRule, CustomAppPreset, Rule, RuleAction, RuleDnsAnswerMode, RuleDnsEffect, RuleDnsResolver,
     RuleEffects, RuleRouteEffect, RuleType,
@@ -1430,6 +1432,7 @@ fn app_rule_process_name_route() {
         geosite_tags: vec![],
         geoip_tags: vec![],
         process_names: Some(vec!["myapp".into()]),
+        package_names: vec![],
         category: None,
     });
     let deps = deps_default(&[]);
@@ -1474,6 +1477,7 @@ fn app_rule_block_emits_rule_level_reject_and_no_udp443_pair() {
         geosite_tags: vec![],
         geoip_tags: vec![],
         process_names: Some(vec!["myapp".into()]),
+        package_names: vec![],
         category: None,
     });
     let deps = deps_default(&[]);

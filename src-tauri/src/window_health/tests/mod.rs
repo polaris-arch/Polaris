@@ -4,6 +4,35 @@ fn initial() -> MountGateState {
     MountGateState::default()
 }
 
+#[test]
+fn recovery_url_keeps_first_valid_app_page_across_later_navigation() {
+    let health = WindowHealth::new();
+    let app = Url::parse("https://tauri.localhost/mobile.html").unwrap();
+    let external = Url::parse("https://example.com/mobile.html").unwrap();
+
+    assert!(health.capture_app_url(app.clone()));
+    assert!(!health.capture_app_url(external));
+
+    assert_eq!(health.app_url(), Some(app));
+}
+
+#[test]
+fn non_document_urls_do_not_claim_recovery_target() {
+    let health = WindowHealth::new();
+    for candidate in [
+        "about:blank",
+        "data:text/html,broken",
+        "javascript:alert(1)",
+    ] {
+        assert!(!health.capture_app_url(Url::parse(candidate).unwrap()));
+    }
+    assert_eq!(health.app_url(), None);
+
+    let app = Url::parse("tauri://localhost/").unwrap();
+    assert!(health.capture_app_url(app.clone()));
+    assert_eq!(health.app_url(), Some(app));
+}
+
 // ── 上屏时机（[`resolve_show_timing`]）────────────────────────────────────
 //
 // 变异对照（改坏哪一处 → 哪条转红）：

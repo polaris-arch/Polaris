@@ -1,54 +1,123 @@
 Polaris
 Copyright (c) 2026 Outsider
 
-本项目以 MIT 许可发布，许可全文见随包分发的 LICENSE。
-Polaris is released under the MIT License. The full text ships next to this file
-as LICENSE; the copyright notice above and that permission notice must be
-included in all copies or substantial portions of the Software.
+Polaris 自身的源码以 MIT 许可发布，许可全文见随包分发的 LICENSE。
+Polaris's own source is released under the MIT License; the full text ships
+next to this file as LICENSE.
+
+⚠️ **但随包产物的分发条款按平台不同**（详见下方「按平台的许可形态」一节）：
+   桌面三平台 = MIT；**Android 产物整体按 GPLv3 分发**。
+⚠️ The terms under which a built artifact is distributed differ by platform
+   (see "Per-platform licensing" below): the desktop builds are MIT, while
+   **the Android artifact is distributed as a whole under GPLv3**.
 
 以子进程 / 二进制资源形式集成的第三方组件（非源码链接）：
-  - sing-box v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
-        随包版本对应源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
+  - 桌面 sing-box v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
         （代理内核，以独立 sidecar 子进程运行）
-        Windows 修复构建：1.15.0-alpha.8.polaris.1（DNS-only 变更缓存刷新）
+        桌面源码修复构建：1.15.0-alpha.8.polaris.2（Linux、Windows、macOS x64 / arm64）
         固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
-        补丁与构建说明：https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches
-        构建脚本：scripts/lib/build-windows-core.mjs；完整 pin：src-tauri/core-manifest.json
+        共同 source manifest SHA-256：1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a
+        共享补丁与依赖源码指引：https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches
+        固定共享补丁：https://github.com/polaris-arch/Polaris/tree/d69f3d1eccac1f6a3b1ee66aa4c7407fe6b3eefa/scripts/libbox-patches
+        Windows 修复构建：1.15.0-alpha.8.polaris.2（共同修复加 DNS-only 变更缓存刷新）
+        Windows 附加补丁与构建说明：https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches
+        固定 Windows 附加补丁：https://github.com/polaris-arch/Polaris/tree/d69f3d1eccac1f6a3b1ee66aa4c7407fe6b3eefa/scripts/core-patches
+        构建脚本：scripts/fetch-core.mjs；完整 pin：src-tauri/core-manifest.json
+  - Android libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
+        （以 libbox 形态载入应用进程，见下）
   - cronet-go               — https://github.com/SagerNet/cronet-go     （NaiveProxy 核心，libcronet 动态库）
-  - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI）
+  - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI，桌面专属）
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）
 
-随包 sing-box 的上游基线是 `src-tauri/core-manifest.json` 的 `bundledCoreVersion`；
-Windows 修复版本及构建输入/产物校验值记录在同文件的 `windowsBuild`。
-上面写死的版本号与 tag 链接由 `scripts/verify-packaging.mjs confs` 与该真值对拍，
+桌面随包 sing-box 的上游基线是 `src-tauri/core-manifest.json` 的 `bundledCoreVersion`；
+四平台共同修复版本及来源记录在同文件的 `sourceBuild`，Windows 附加输入记录在 `windowsBuild`。
+共享 `source-manifest.json` 固定 sing-box、sing-tun、nftables 的上游 commit、补丁顺序与摘要；
+Android libbox 也消费这些共同源码与补丁，构建说明见上述共享补丁目录。
+上面写死的桌面版本号与 tag 链接由 `scripts/verify-packaging.mjs confs` 与该真值对拍，
 两边不一致即构建转红 —— 版本号写在这里是因为法律声明不该让读者去翻另一个文件。
 
 **链进产物的源码级依赖**（Tauri / React / 数百个 Rust crate 等）不属 mere aggregation，
 其许可与版权声明随二进制分发，逐包登记在 `THIRD-PARTY-LICENSES.md`
 （由 `scripts/gen-third-party-licenses.mjs` 生成，依赖一变 CI 即要求重生成）。
 
-以上组件版权归各自作者所有，以独立二进制 / 数据形式分发。
+以上组件版权归各自作者所有。
 
---- GPLv3 组件与本项目许可的关系 / GPLv3 components and this project's license ---
+════ 按平台的许可形态 / Per-platform licensing ════
 
-Polaris 采用 mere-aggregation 立场：sing-box 以独立子进程运行、不与 Polaris 链接，
-因此 Polaris 自身源码仍以 MIT 发布。**该立场未经检验** —— GNU 官方 FAQ 明确
-「什么构成一个作品」是法律问题，最终由法院裁定。本文件不构成法律意见。
-出处：https://www.gnu.org/licenses/gpl-faq.html#MereAggregation
+同一份源码在不同平台上与 sing-box 的结合方式不同，分发条款因此不同。这不是措辞选择，
+是集成形态的直接后果。
+The same source integrates sing-box differently per platform, so the terms
+under which each artifact is distributed differ. This follows from the
+integration form, not from a choice of wording.
 
-Polaris takes the position that shipping sing-box alongside Polaris is mere
-aggregation: sing-box runs as a separate process and is not linked into Polaris,
-so Polaris's own source stays under the MIT License. This position is untested —
-the GNU FAQ states that what counts as "one work" is a legal question that is
-ultimately decided by courts. Nothing here is legal advice.
-Source: https://www.gnu.org/licenses/gpl-faq.html#MereAggregation
+──── 桌面（Windows / macOS / Linux）：MIT，立场未经检验 ────
 
-sing-box 的完整对应源码（Corresponding Source）在上面的 tag 链接处获取 —— GPLv3 §6
-要求在二进制旁给出获取对应源码的明确指引，本段即该指引。Polaris **不自建归档或镜像**，
-可获得性依赖上游仓库；若该链接失效，请在本项目 issue 中提出。
+Polaris 采用 mere-aggregation 立场：sing-box 以**独立子进程**运行、不与 Polaris 链接，
+因此桌面产物整体仍以 MIT 发布。**该立场未经检验** —— GNU 官方 FAQ 明确「什么构成一个作品」
+是法律问题，最终由法院裁定。本文件不构成法律意见。
 
-The Corresponding Source for the bundled sing-box is the upstream tag linked
-above; GPLv3 §6 requires clear directions next to the object code, and this
-paragraph is those directions. Polaris keeps no archive or mirror of its own, so
-availability depends on the upstream repository. If that link stops working,
-please open an issue on this project.
+Polaris takes the position that shipping sing-box alongside the desktop app is
+mere aggregation: sing-box runs as a **separate process** and is not linked
+into Polaris, so the desktop artifact stays under the MIT License. This
+position is untested — the GNU FAQ states that what counts as "one work" is a
+legal question ultimately decided by courts. Nothing here is legal advice.
+
+出处 / Source: https://www.gnu.org/licenses/gpl-faq.html#MereAggregation
+
+──── Android：GPLv3，且这一条不是灰区 ────
+
+Android 上不存在「独立子进程」这个选项：sing-box 的 tun 入站只能经进程内的
+`PlatformInterface.OpenTun` 拿到 tun 描述符（其 `TunInboundOptions` 没有接收已开 fd 的字段），
+故内核以 **libbox 形态载入应用进程**，经 JNI 调用。
+
+**因此 mere-aggregation 在 Android 上不成立，而这一条与桌面那条不同 —— 它不是一个有争议的
+立场，是同进程链接的直接结果。** 不要把上面那段「未经检验」的措辞套用到本节。
+
+此外，本仓 Android 侧的 Kotlin 实现（`src-tauri/gen/android/app/src/main/java/com/polaris2/app/vpn/`）
+移植自 GPLv3 的 sing-box-for-android，逐文件在首行标注了上游路径：
+
+    BoxService.kt · LocalResolver.kt · PlatformInterfaceWrapper.kt · PolarisVpnService.kt
+    DefaultNetworkMonitor.kt          ← 移植（上游 https://github.com/SagerNet/sing-box-for-android）
+    PolarisApplication.kt · ServiceNotification.kt   ← 结构参考
+    BootstrapConfig.kt · ServiceState.kt             ← 本仓自有
+
+**Android 产物整体按 GPLv3 分发。** Polaris 自身的源文件仍标 MIT（MIT 与 GPL 兼容），
+故只取这些文件的人得到的是 MIT；而取用 Android 产物（APK）的人得到的是 GPLv3。
+
+On Android there is no separate-process option: the tun descriptor can only be
+obtained through the in-process `PlatformInterface.OpenTun`, so the kernel is
+loaded into the application process as libbox and called over JNI. Mere
+aggregation therefore does not apply on Android — and unlike the desktop
+position above, this is not a contested reading but a direct consequence of
+linking within one process. The Kotlin implementation is additionally ported
+from the GPLv3 sing-box-for-android, with per-file attribution. **The Android
+artifact is distributed as a whole under GPLv3.** Polaris's own source files
+remain MIT-licensed (MIT is GPL-compatible), so taking those files alone gives
+you MIT; taking the Android artifact gives you GPLv3.
+
+════ 对应源码 / Corresponding Source ════
+
+sing-box 的上游基线在上述 tag / 固定 commit 链接处获取；修复构建的完整对应源码还包括
+上述固定共享补丁目录中的 source-manifest.json、各依赖的固定上游源码及补丁，Windows 另加
+固定 Windows 附加补丁目录中的补丁。按 manifest 中的 SHA-256 核对输入，并按随附构建说明重放。
+GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，本段即该指引。Polaris **不自建上游归档
+或镜像**；上游源码在其各自仓库，Polaris 补丁与构建脚本在本项目仓库。若链接失效，请在本项目 issue 中提出。
+
+**对 Android 产物，GPLv3 §6 的对应源码还包括 Polaris 自身的完整源码**，它在本项目仓库公开：
+https://github.com/polaris-arch/Polaris
+
+The upstream baseline is available at the tag and fixed commit linked above.
+The complete Corresponding Source for the patched build also includes the
+source-manifest.json, pinned dependency sources and patches in the fixed shared
+patch directory; Windows additionally uses the fixed Windows overlay directory.
+Verify the inputs against the manifest's SHA-256 values and follow the included
+build instructions. GPLv3 §6 requires clear directions next to the object code,
+and this paragraph provides those directions. Polaris keeps no upstream archive
+or mirror; upstream sources remain in their respective repositories, and Polaris
+patches and build scripts are in this project's repository. If a link stops
+working, please open an issue on this project.
+
+For the Android artifact, the Corresponding Source under GPLv3 §6 also
+includes Polaris's own complete source, published at the repository above.

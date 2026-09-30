@@ -1,10 +1,12 @@
-import type { ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import { api } from '@/ipc';
 import type { ServerConfig } from '@/contracts/types';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { taildropBadgeCount } from '@/domain/taildrop';
 import { tsAccountLabel } from '@/domain/tailscale-conn-state';
 import { findWarpNode } from '@/domain/warp';
+import { isAccountBasedProtocol } from '@/domain/endpoint-routes';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
 import { InfoIcon } from '@/components/InfoIcon';
@@ -53,23 +55,39 @@ function Choice({
   );
 }
 
-export function MeshJoinDialog({ onTsLogout, onWarpReregister, onWarpDeregister }: MeshJoinDialogProps) {
-  const { t } = useTranslation();
+export function MeshJoinDialog(props: MeshJoinDialogProps) {
   const servers = useEffectiveServers();
+  const tsNodeIds = servers.filter((server) => isAccountBasedProtocol(server.protocol)).map((node) => node.id);
+  const tsNodeIdsKey = JSON.stringify(tsNodeIds);
+  const [tsStates, setTsStates] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    if (tsNodeIds.length === 0) return;
+    let alive = true;
+    let revision = 0;
+    const readStates = (): void => {
+      const request = ++revision;
+      setTsStates({});
+      void api.server.tailscaleStateExists(tsNodeIds).then(
+        (states) => { if (alive && request === revision) setTsStates(states); },
+        () => { if (alive && request === revision) setTsStates({}); },
+      );
+    };
+    readStates();
+    window.addEventListener('focus', readStates);
+    return () => { alive = false; window.removeEventListener('focus', readStates); };
+  }, [tsNodeIdsKey]);
+  return <MeshJoinDialogView {...props} servers={servers} tsStates={tsStates} />;
+}
+
+/** Pure action view: the native state read above decides which account actions are truthful. */
+export function MeshJoinDialogView({ onTsLogout, onWarpReregister, onWarpDeregister, servers, tsStates }:
+  MeshJoinDialogProps & { servers: ServerConfig[]; tsStates: Record<string, boolean> }) {
+  const { t } = useTranslation();
   const open = useDialogStore((state) => state.open);
   const close = useDialogStore((state) => state.close);
   /* Tailscale 不再是单例（`meshSingletonConflict` 已只剩 WARP 一支）⇒ 这里不能再 `.find()` 取
-     「任意一个」：那样第二个及以后的节点在这张卡上根本不存在，而 **Taildrop 收件箱的全仓唯一入口
-     就在这张卡上**（`kind:'taildrop'` 全仓只此一处 go），把它绑在第一个节点上 = 多节点用户永远
-     进不去别的账号的收件箱。
-
-     形态按节点数分两支，不新开弹窗、不造选择器：
-      - 0 个     ⇒ Tailscale tile 是新增入口；
-      - 1 个     ⇒ 保留原节点 tile 与三颗动作，另给独立新增入口；
-      - ≥2 个   ⇒ 每个节点一行，各自带自己的 taildrop / 切换账号 / 登出，另给新增入口；标题用节点名、副标题用
-                  `tsAccountLabel`（登录名 · tailnet）区分是哪个账号 —— 同为「已登录」时，
-                  节点名可能都叫 Tailscale，账号段才是能区分的那一维。 */
-  const tsNodes = servers.filter((server) => server.protocol === 'tailscale');
+     「任意一个」：那样第二个及以后的账号在这张卡上不存在。 */
+  const tsNodes = servers.filter((server) => isAccountBasedProtocol(server.protocol));
   const singleTsNode = tsNodes.length === 1 ? tsNodes[0] : undefined;
   const warpNode = findWarpNode(servers);
   // 入口只跟「配置里有 TS 节点」绑定；离线 / tailnet 未授权时也必须能打开，弹窗会给出可行动的原因。
@@ -95,13 +113,14 @@ export function MeshJoinDialog({ onTsLogout, onWarpReregister, onWarpDeregister 
   );
 
   /**
-   * 一个 TS 节点的三颗动作。**单节点与多节点共用这一份**：两支各写一遍，改一处漏一处只是时间问题，
-   * 而「逐像素相同」那条零回归判据正是靠共用同一份 JSX 成立的。
+   * 一个 TS 节点的账号动作。**单节点与多节点共用这一份**；有本机 state 时展示登出，
+   * 没有时提供登录，读取失败时仍能手动切换账号。
    *
-   * 三颗都携 `node.id`，不读任何外层的「当前 TS 节点」—— 多节点时那个概念不存在。
+   * 每颗都携 `node.id`，不读任何外层的「当前 TS 节点」—— 多节点时那个概念不存在。
    */
   const tsActions = (node: ServerConfig) => {
     const unread = taildropBadgeCount(tailscaleStatuses[node.id]);
+    const accountActionLabel = tsStates[node.id] === false ? t('ts.signIn') : t('meshJoin.switchAccount');
     return (
       <>
         <button
@@ -117,11 +136,11 @@ export function MeshJoinDialog({ onTsLogout, onWarpReregister, onWarpDeregister 
           className="btn ghost sm"
           onClick={() => go({ kind: 'ts-login', serverId: node.id })}
         >
-          {t('meshJoin.switchAccount')}
+          {accountActionLabel}
         </button>
-        <button type="button" className="btn ghost sm danger-text" onClick={() => action(() => onTsLogout(node))}>
+        {tsStates[node.id] === true && <button type="button" className="btn ghost sm danger-text" onClick={() => action(() => onTsLogout(node))}>
           {t('meshJoin.logout')}
-        </button>
+        </button>}
       </>
     );
   };

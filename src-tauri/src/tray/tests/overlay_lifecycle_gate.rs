@@ -5,7 +5,7 @@ use super::super::lifecycle::{
     rollback_owned_exit_guard, should_arm_last_webview_exit_guard, OverlayLifecycle,
     OverlayOpenAction,
 };
-use crate::test_support::{crate_code, module_code};
+use crate::test_support::{crate_code, crate_root_code, module_code};
 
 /// 取材面 = **模块** `tray`（`tray.rs` 根文件 + `tray/**` 递归，剔除 `tests/`）。
 ///
@@ -14,7 +14,8 @@ use crate::test_support::{crate_code, module_code};
 /// 切片锚点当场 panic、而 `tray_rs.contains(..)` 那两条全文正面断言会静默失去它们的证据源。
 /// 换成模块取材后，新增的任何 `tray/**.rs` 自动进面（`module_source` 递归），不需要改一个字符。
 ///
-/// `main.rs` 仍走 `crate_source`：它是单文件，没有同名模块目录。
+/// crate 根走 [`crate_root_code`]：装配下沉进 `lib.rs` 后它横跨 `main.rs` + `lib.rs` 两个文件，
+/// 写死其中一个与上面写死 `tray.rs` 是同一类错（取材面只写一半）。
 /// **剥注释**取材（[`module_code`]）：本文件两条全文正面断言（`schedule_overlay_reclaim(app);`
 /// 与 `TRAY_IDLE_RECLAIM_SECS`）的针都是单行代码文本，写进任何一行 `//` / `//!` 注释就够替
 /// 生产调用点作证。实测：`tray.rs:25` 的模块文档写着 `window::TRAY_IDLE_RECLAIM_SECS`，把常量的
@@ -23,10 +24,10 @@ fn tray_rs() -> String {
     module_code("tray")
 }
 
-/// 同上：`main.rs` 侧的 `matches(..).count() == 1` 同样可被注释充数 —— 生产接线删掉、注释里
+/// 同上：crate 根侧的 `matches(..).count() == 1` 同样可被注释充数 —— 生产接线删掉、注释里
 /// 留一处，计数仍是 1。
 fn main_rs() -> String {
-    crate_code("main.rs")
+    crate_root_code()
 }
 
 #[test]
@@ -586,7 +587,7 @@ fn last_webview_destroys_delegate_owner_rollback_to_the_shared_helper() {
     let pre_destroy = &main[..destroy];
     for required in [
         "app.webview_windows().len()",
-        "app.tray_by_id(\"main\").is_some()",
+        "crate::tray::tray_present(",
         ".compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)",
     ] {
         assert!(

@@ -66,8 +66,8 @@ struct Guarded {
     before: Option<&'static [&'static str]>,
 }
 
-/// 「进程在这里被真正创建」的形态。`.stdout(` 也算：它之后的构建器调用与标志的先后已经无从分辨，
-/// 而把判据钉在**最早**的那一处（而不是只钉 `.spawn()`）会让窗口更窄、判据更严。
+/// 既有构造点的较早边界；`.stdout(` 是构建器调用，`.spawn()` 才创建进程。
+/// CheckCustody 在配置 stdout/stderr 后挂 Windows 标志，单独以真实 `.spawn()` 为边界。
 const CREATION_FORMS: &[&str] = &[".stdout(", ".spawn()"];
 
 /// 全部「Windows 可达 + 目标是 console 程序」的子进程构造点。
@@ -152,12 +152,12 @@ const GUARDED: &[Guarded] = &[
         before: Some(CREATION_FORMS),
     },
     Guarded {
-        file: "crates/core-supervisor/src/config_gate.rs",
-        anchor: "pub async fn run_check_raw(",
+        file: "crates/core-supervisor/src/config_gate/check_custody.rs",
+        anchor: "fn spawn(",
         suppressor: "creation_flags(0x0800_0000)",
         self_check: "Command::new(",
-        window: 30,
-        before: None,
+        window: 0,
+        before: Some(&[".spawn()"]),
     },
     Guarded {
         file: "crates/helper-client/src/manager.rs",
@@ -353,7 +353,7 @@ fn no_new_console_program_spawn_escapes_the_suppression() {
     );
 }
 
-/// 全仓生产码里 `sing-box check` 只允许有**一处**子进程构造点。
+/// Windows 可达的 `sing-box check` 构造点只有 CheckCustody 一处；另有 Linux x86_64 sealed-fd 检查。
 ///
 /// # 这条门补的是哪个缝
 ///
@@ -365,21 +365,22 @@ fn no_new_console_program_spawn_escapes_the_suppression() {
 /// （`tasklist` / `sc` / `netsh`…），而 sing-box 的路径是个变量。于是「有人在这两个文件里重新写一份
 /// `Command::new(binary).arg("check")`」既不会被清单抓到，也不会被字面量扫描抓到。
 ///
-/// 本门把那两条登记换成一条**更强**的：不是「这两处挂了抑制标志」，而是「全仓只允许存在一处
-/// check 构造点」。第四份一出现就红，且它红的时候要求的是折叠回去，而不是补一个抑制标志 ——
-/// 后者只治黑框，治不了那份新拷贝必然又漏掉的超时与 `kill_on_drop`。
+/// 常规 check 已移至 CheckCustody。新 mesh candidate 的另一处仅在 Linux x86_64 模块编译，
+/// 且必须使用 sealed fd、空输出管道、kill_on_drop 与预算托管。本门逐个锁住两处精确 argv、
+/// 次数和 Linux cfg；新拷贝仍要求归入已有托管入口，不能只补一个窗口标志。
 ///
 /// # 判据形态
 ///
 /// 针是 argv 里的字面量 `"check"`（含引号），比 `.arg("check")` 宽：`.args(["check", …])` 之类的
 /// 写法同样落网。取材面先过 [`strip_comments`]，否则被守文件的文档注释里那些讲 `check` 的句子会
-/// 让本门恒红。正向对照是「必须恰好命中一次」：命中 0 次说明针或遍历坏了，那种绿没有信息量。
+/// 让本门恒红。正向对照是「两处各恰好命中一次」；缺失、新增或失去 Linux 闭集条件都变红。
 #[test]
 fn only_one_production_site_spawns_sing_box_check() {
     /// argv 里的子命令字面量（含引号）。
     const CHECK_ARG: &str = "\"check\"";
-    /// 允许持有它的唯一文件。
-    const HOME: &str = "crates/core-supervisor/src/config_gate.rs";
+    /// Windows 可达的常规 check 构造点，与仅 Linux x86_64 的 sealed-fd check 各一处。
+    const HOME: &str = "crates/core-supervisor/src/config_gate/check_custody.rs";
+    const LINUX: &str = "src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs";
 
     let root = repo_root();
     let mut sites: Vec<String> = Vec::new();
@@ -409,18 +410,92 @@ fn only_one_production_site_spawns_sing_box_check() {
     );
     assert_eq!(
         sites.len(),
-        1,
-        "`sing-box check` 的构造点必须恰好一处（在 `{HOME}`）。\
-         为 0 = 针或遍历坏了，本门的绿没有信息量；>1 = 又出现了一份各自漂的拷贝，\
+        2,
+        "`sing-box check` 的构造点必须是 Windows 可达的 `{HOME}` 与仅 Linux x86_64 的 `{LINUX}` 各一处。\
+         缺任一处 = 针或遍历坏了；>2 = 又出现了一份各自漂的拷贝，\
          而每一份拷贝都得自己记得超时与 `kill_on_drop` —— 折叠之前的三份里就有两份没记住。\
          实际命中：\n{}",
         sites.join("\n")
     );
-    assert!(
-        sites[0].starts_with(HOME),
-        "唯一的 `sing-box check` 构造点跑到了 `{}`，而它应该在 `{HOME}`",
-        sites[0]
+    for (file, argv) in [
+        (HOME, ".arg(\"check\")"),
+        (
+            LINUX,
+            ".args([\"--disable-color\", \"check\", \"-c\", \"/proc/self/fd/0\"])",
+        ),
+    ] {
+        assert_eq!(
+            sites
+                .iter()
+                .filter(|site| site.starts_with(&format!("{file}:")) && site.ends_with(argv))
+                .count(),
+            1,
+            "{file} 必须持有其唯一精确 check argv；其它构造点不受豁免：{sites:?}"
+        );
+    }
+    let linux = strip_comments(&read(LINUX));
+    let module = braced_block(
+        &linux,
+        "#[cfg(all(target_os = \"linux\", target_arch = \"x86_64\"))]\nmod linux {",
     );
+    let run = braced_block(module, "pub(super) async fn run_check(");
+    for required in [
+        ".args([\"--disable-color\", \"check\", \"-c\", \"/proc/self/fd/0\"])",
+        "/proc/self/fd/",
+        ".env_clear()",
+        ".current_dir(\"/\")",
+        ".stdin(Stdio::from(child_stdin))",
+        ".stdout(Stdio::null())",
+        ".stderr(Stdio::null())",
+        ".kill_on_drop(true)",
+        "supervise(command, binary, config, timeout, None).await",
+    ] {
+        assert!(
+            run.contains(required),
+            "Linux-only protected check 失去严格构造条件：{required}"
+        );
+    }
+}
+
+/// 在已有词法净化面配平块，保证 check 的构造位于 Linux cfg 的实际作用域中。
+fn braced_block<'a>(source: &'a str, anchor: &str) -> &'a str {
+    assert_eq!(
+        source.matches(anchor).count(),
+        1,
+        "块锚点必须唯一：{anchor}"
+    );
+    let start = source.find(anchor).unwrap();
+    let masked = polaris_source_probe::mask_comments_and_strings(source);
+    let bytes = masked.as_bytes();
+    let open = start + masked[start..].find('{').expect("块没有起始括号");
+    let mut depth = 0usize;
+    for (offset, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("块没有闭合：{anchor}");
+}
+
+#[test]
+fn linux_check_scope_does_not_borrow_a_function_outside_its_cfg() {
+    const MODULE: &str =
+        "#[cfg(all(target_os = \"linux\", target_arch = \"x86_64\"))]\nmod linux {";
+    const RUN: &str = "pub(super) async fn run_check(";
+    let inside = format!("{MODULE}\n{RUN}) {{ let message = \"}}\"; }}\n}}");
+    assert!(braced_block(braced_block(&inside, MODULE), RUN).contains("let message"));
+    let outside = format!("{MODULE}}}\n{RUN}) {{}}");
+    assert!(
+        std::panic::catch_unwind(|| braced_block(braced_block(&outside, MODULE), RUN)).is_err()
+    );
+    assert!(std::panic::catch_unwind(|| braced_block("mod linux {", "mod linux {")).is_err());
 }
 
 /// 四份实现散在四个无共同依赖的 crate 里 —— 值必须逐字一致，否则「改了一处以为全改了」。

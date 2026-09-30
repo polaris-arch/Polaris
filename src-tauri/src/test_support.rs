@@ -26,6 +26,10 @@ pub(crate) struct TestDir(PathBuf);
 
 impl TestDir {
     pub(crate) fn new(prefix: &str) -> Self {
+        Self::new_in(prefix, &std::env::temp_dir())
+    }
+
+    pub(crate) fn new_in(prefix: &str, parent: &Path) -> Self {
         assert!(
             !prefix.is_empty() && !prefix.contains(['/', '\\']),
             "测试临时目录前缀必须是单个安全路径段"
@@ -34,10 +38,20 @@ impl TestDir {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("{prefix}{}-{nonce}-{sequence}", std::process::id()));
+        let path = parent.join(format!("{prefix}{}-{nonce}-{sequence}", std::process::id()));
         std::fs::create_dir(&path).expect("测试临时目录必须唯一且可创建");
-        Self(path)
+        let dir = Self(path);
+        // Resolve Unix temp aliases such as macOS /var only for our owned root.
+        // Windows canonicalize adds a verbatim prefix, which breaks file URLs
+        // and rule-file paths assembled with '/'; keep the created normal path.
+        // Artifact/source readers retain their own no-follow component checks.
+        #[cfg(unix)]
+        let dir = {
+            let mut dir = dir;
+            dir.0 = std::fs::canonicalize(&dir.0).expect("测试自有临时目录必须可解析为真实路径");
+            dir
+        };
+        dir
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -156,6 +170,34 @@ pub(crate) fn module_code(dir_rel: &str) -> String {
 /// [`crate_source`] 的**剥注释**形态。取舍与射程同 [`module_code`]。
 pub(crate) fn crate_code(rel: &str) -> String {
     literal_face(&crate_source(rel))
+}
+
+/// **crate 根**的取材面：`main.rs` + `lib.rs` 两份拼接（各自已剥注释）。
+///
+/// # 为什么取材面是「两个文件」而不是其中某一个
+///
+/// 应用装配（18 个 `mod`、插件注册、`setup`、command 注册表、`RunEvent` 循环）已从 `main.rs`
+/// 下沉进 `lib.rs`（移动端加载的是 cdylib、根本没有 `main()`，理由见 `lib.rs` 模块文档），
+/// `main.rs` 收成薄壳。把取材写死成其中任何**一个**文件，都会在下一次同类搬迁时静默失效 ——
+/// 这正是本仓吃过一次的亏，[`module_source`] 的文档记着原话：「测试实体从 `foo.rs` 搬进
+/// `foo/tests/mod.rs` 的那一刻，143 处锚点全部平移一层，失败模式是**解析到另一个真实存在的
+/// 文件** ⇒ 编译通过、门继续绿、扫的却是别的东西」。crate 根横跨 `main.rs` 与 `lib.rs`，
+/// 与「模块横跨 `foo.rs` 与 `foo/`」是同一件事的另一个面，修法也同款：取整个面。
+///
+/// [不选「逐处改成 `crate_code("lib.rs")`」：改动确实更小，但那是把「装配住在哪个文件」这个
+///  **实现细节**重新焊进十来处判据里，下一次搬迁再来一遍；而且负面断言（「不许出现 X」）
+///  取到空文件时恒真 —— 失效方向是静默的]
+///
+/// # 顺序断言为什么仍然成立
+///
+/// 拼接序固定 `main.rs` 在前。薄壳里只剩 `windows_subsystem` 属性与一句 `run()`，不含任何
+/// 判据锚点 ⇒ 全部 `find(A) < find(B)` 的相对位置与只取 `lib.rs` 时逐字节相同。哪天薄壳里
+/// 真长出与锚点同名的文本，[`crate::commands::guard_scan::top_level_fn_body`] 的「恰好命中
+/// 一次」是硬断言（不是取第一处），会当场把这件事报出来。
+pub(crate) fn crate_root_code() -> String {
+    // 中间垫一个换行：`crate_source` 返回的是文件全文、末尾未必带换行，首尾直接相接会把薄壳
+    // 最后一行与 `lib.rs` 第一行粘成同一行 —— 按行工作的取材器（整行注释剥离）会跟着错一行。
+    format!("{}\n{}", crate_code("main.rs"), crate_code("lib.rs"))
 }
 
 /// 逐文件形态，用于让失败信息说得出「哪个文件」。

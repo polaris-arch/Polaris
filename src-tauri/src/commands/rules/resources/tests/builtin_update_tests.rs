@@ -185,7 +185,10 @@ fn manual_all_wires_real_builtin_registry_and_one_deferred_batch_broadcast() {
     assert_eq!(body.matches("BroadcastMode::Deferred").count(), 2);
     assert!(!body.contains("BroadcastMode::Immediate"));
     assert_eq!(body.matches("broadcast_config_changed(").count(), 1);
-    assert!(body.contains("if !stored.is_empty() || builtin_ok"));
+    assert!(body.contains("let mut changed = false"));
+    assert!(body.contains("Ok(()) => changed = true"));
+    assert!(body.contains("changed |= result.get(\"ok\").and_then(Value::as_bool) == Some(true)"));
+    assert!(body.contains("if changed {"));
     // 空外置表没有 return，全部内置项仍需出现在逐项结果数组中。
     let external = body.find("for entry in &raw_entries").unwrap();
     let builtin = body.find("for builtin in builtins").unwrap();

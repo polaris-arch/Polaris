@@ -609,6 +609,124 @@ fn new_event_adds_to_conn_map() {
 }
 
 #[test]
+fn named_rule_is_frozen_on_insert_and_never_inferred_from_truncated_raw() {
+    let mut agg = StatsAggregator::new();
+    let raw = "rule_set=cr-streaming";
+    agg.set_named_rules(BTreeMap::from([(
+        raw.into(),
+        RuleIdentity {
+            id: "r1".into(),
+            name: "流媒体".into(),
+        },
+    )]));
+    let mut first = raw_conn("first", 1_000_000_000, 0, 0, "Proxy");
+    first.rule = raw.into();
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            reset: false,
+            events: vec![SingBoxConnectionEvent {
+                kind: ConnectionEventType::New,
+                id: "first".into(),
+                connection: Some(first),
+                ..Default::default()
+            }],
+        },
+        0,
+    );
+    assert_eq!(
+        agg.entry("first").unwrap().rule_name.as_deref(),
+        Some("流媒体")
+    );
+
+    // 保存或热切后的新运行映射仅影响之后入表的连接，旧连接保持起初身份。
+    agg.set_named_rules(BTreeMap::from([(
+        raw.into(),
+        RuleIdentity {
+            id: "r2".into(),
+            name: "新名称".into(),
+        },
+    )]));
+    let mut second = raw_conn("second", 1_000_000_000, 0, 0, "Proxy");
+    second.rule = raw.into();
+    let long_raw = format!("{raw}{}", "x".repeat(CONNECTION_RULE_MAX_BYTES));
+    let mut too_long = raw_conn("long", 1_000_000_000, 0, 0, "Proxy");
+    too_long.rule = long_raw.clone();
+    agg.set_named_rules(BTreeMap::from([
+        (
+            raw.into(),
+            RuleIdentity {
+                id: "r2".into(),
+                name: "新名称".into(),
+            },
+        ),
+        (
+            long_raw,
+            RuleIdentity {
+                id: "r3".into(),
+                name: "不应命名".into(),
+            },
+        ),
+    ]));
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            reset: false,
+            events: vec![
+                SingBoxConnectionEvent {
+                    kind: ConnectionEventType::Update,
+                    id: "second".into(),
+                    connection: Some(second),
+                    ..Default::default()
+                },
+                SingBoxConnectionEvent {
+                    kind: ConnectionEventType::New,
+                    id: "long".into(),
+                    connection: Some(too_long),
+                    ..Default::default()
+                },
+            ],
+        },
+        0,
+    );
+    assert_eq!(
+        agg.entry("first").unwrap().rule_name.as_deref(),
+        Some("流媒体")
+    );
+    assert_eq!(
+        agg.entry("second").unwrap().rule_name.as_deref(),
+        Some("新名称")
+    );
+    assert_eq!(agg.entry("second").unwrap().rule_id.as_deref(), Some("r2"));
+    assert_eq!(agg.entry("long").unwrap().rule_name, None);
+    assert_eq!(
+        agg.entry("long").unwrap().rule.len(),
+        CONNECTION_RULE_MAX_BYTES
+    );
+
+    agg.set_named_rules(BTreeMap::from([(
+        raw.into(),
+        RuleIdentity {
+            id: "r4".into(),
+            name: "测".repeat(CONNECTION_RULE_NAME_MAX_BYTES / "测".len() + 1),
+        },
+    )]));
+    let mut oversized_name = raw_conn("oversized-name", 1_000_000_000, 0, 0, "Proxy");
+    oversized_name.rule = raw.into();
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            reset: false,
+            events: vec![SingBoxConnectionEvent {
+                kind: ConnectionEventType::New,
+                id: "oversized-name".into(),
+                connection: Some(oversized_name),
+                ..Default::default()
+            }],
+        },
+        0,
+    );
+    assert_eq!(agg.entry("oversized-name").unwrap().rule_name, None);
+}
+
+#[test]
 fn new_event_drops_closed_history_ring_entries() {
     let mut agg = StatsAggregator::new();
     let mut dead = raw_conn("c1", 1_000_000_000i64, 0, 0, "P");

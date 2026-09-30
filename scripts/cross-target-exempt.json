@@ -1,10 +1,27 @@
 {
   "polaris": {
-    "targets": ["x86_64-pc-windows-msvc", "x86_64-apple-darwin"],
-    "why": "Tauri 的 macOS 后端与 Windows 资源编译都要宿主没有的工具链，而 cargo check / clippy 同样会跑 build script。darwin 侧挡路的是 objc2-exception-helper（链路 objc2 <- block2 <- dispatch2 <- {rfd <- tauri-plugin-dialog, tao <- tauri-runtime-wry} <- polaris），它的 cc-rs 调用要 Apple clang（宿主 gcc 不认 -arch / -mmacosx-version-min）；msvc 侧首个挡路的是 polaris 自己 build.rs 里的 tauri-winres，要 llvm-rc。注意 x86_64-pc-windows-gnu 不在此列：宿主有 mingw-w64，polaris 在该 target 上是能过的，且它覆盖同一套 cfg(windows) 分支。"
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-linux-android",
+      "aarch64-apple-ios"
+    ],
+    "why": "Tauri 的 macOS 后端与 Windows 资源编译都要宿主没有的工具链，而 cargo check / clippy 同样会跑 build script。darwin 侧挡路的是 objc2-exception-helper（链路 objc2 <- block2 <- dispatch2 <- {rfd <- tauri-plugin-dialog, tao <- tauri-runtime-wry} <- polaris），它的 cc-rs 调用要 Apple clang（宿主 gcc 不认 -arch / -mmacosx-version-min）；msvc 侧首个挡路的是 polaris 自己 build.rs 里的 tauri-winres，要 llvm-rc。注意 x86_64-pc-windows-gnu 不在此列：宿主有 mingw-w64，polaris 在该 target 上是能过的，且它覆盖同一套 cfg(windows) 分支。 ── aarch64-linux-android（2026-09-04 加 android 腿时实测）：挡路的**不是**工具链而是既有 lint 债 —— 有了 NDK 之后它编得过（`cargo check` rc=0 / 32s），但 `clippy -D warnings` 上有 100+ 条 android-only 发现（托盘子系统整棵在 android 上不可达 ⇒ 大批 dead_code，外加一批 unused import / unused variable / needless mut）。清理它们要先定「`#[cfg(desktop)]` 收编 vs `#[allow]`」，那是独立决定。🔴 **本包在 android 上的编译面没有一起丢**：Cross-check 步在 clippy 循环之后单跑一条 `cargo check --target aarch64-linux-android -p polaris` —— 「改坏 Android 交叉编译」正是那条门要抓的，而它恰好只住在这个包里（K4 的 Rust↔Kotlin 桥）。lint 债清完后本条豁免会被下面的反腐烂步判红，逼着升回 clippy。 ── aarch64-apple-ios（2026-09-06 加 ios 腿时实测）：与 darwin 是同一条 objc2 链路，但**失败形态不同、且更早**——挡路的是 build script 阶段：`objc2-exception-helper` 与 `zstd-sys` 各自倒在 `error occurred in cc-rs: failed to find tool \"xcrun\"`（cc-rs 先打 `Detecting \"ios\" SDK path for iphoneos`，而宿主既没有 Apple SDK 也没有 xcrun）。🔴 这是**编译之前**的阶段，不是链接期 —— 分清这一点才能决定豁免形态：`cargo check` 照样跑 build script，所以 android 那格「clippy 豁免 + 单跑一条 cargo check 保住编译面」的补救在 ios 上**取不到任何收据**，本表因此对 ios 是整包豁免且没有伴随的 check。后果要说清：src-tauri 那 12 处穷举 match 的 iOS 臂、以及 `CFG_REGISTRY` 记的 37 条 cfg 债，在本宿主上一行都没被 iOS target 编译过；ios 这条腿守的是另外 17 个纯 Rust 包。解锁条件是一台带 Xcode 的 macOS runner，与 iOS 产物本身同一批。"
   },
   "polaris-unlock-transport": {
-    "targets": ["x86_64-pc-windows-msvc", "x86_64-apple-darwin"],
-    "why": "wreq 的依赖链带两个 C 组件：async-compression -> zstd-sys（darwin 需要认 -arch / -mmacosx-version-min 的 Apple clang），tokio-btls -> btls-sys/BoringSSL（msvc 的 build script 自报 'GNU compiler is not supported for this target'）。本 crate 的 Cargo.toml 自述它是 workspace 里唯一允许依赖 wreq 的地方，这条豁免与那条约束是同一件事的两面。"
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-ios"
+    ],
+    "why": "wreq 的依赖链带两个 C 组件：async-compression -> zstd-sys（darwin 需要认 -arch / -mmacosx-version-min 的 Apple clang），tokio-btls -> btls-sys/BoringSSL（msvc 的 build script 自报 'GNU compiler is not supported for this target'）。本 crate 的 Cargo.toml 自述它是 workspace 里唯一允许依赖 wreq 的地方，这条豁免与那条约束是同一件事的两面。 ── aarch64-apple-ios（2026-09-06 实测）：与 darwin 半边同根因（async-compression -> zstd-sys 的 cc-rs），但报错形态不同 —— darwin 上是宿主 gcc 不认 `-arch`/`-mmacosx-version-min`，ios 上是 cc-rs 走 `Detecting \"ios\" SDK path for iphoneos` 后直接 `failed to find tool \"xcrun\"`（宿主连这个工具都没有）。同样是 build script 阶段，不是链接期。btls-sys 这次没轮到报错：zstd-sys 先失败，构建就停了 —— 本条豁免的射程写 zstd-sys 是实测结论，不是「大概和 msvc 一样」。"
+  },
+  "polaris-helper": {
+    "targets": [
+      "aarch64-linux-android",
+      "aarch64-apple-ios"
+    ],
+    "scope": "tests",
+    "why": "**只豁免测试目标**（`scope: tests` ⇒ lib/bins 面照跑 clippy -D warnings）。阻塞是「编不过」而不是 lint：`platform/mod.rs` 给 macos / windows 两个模块的谓词刻意带 `test`（收紧成裸 target_os 会让本机 `cargo test` 静默丢掉 197/334 个测试，含 SYSTEM 命令注入防护与 token 鉴权），于是 `--all-targets` 下 android 也要编 mac/win 模块，而 `nix` 在 Cargo.toml 里是 linux/macos target-specific 依赖 ⇒ 4 条 `E0433: cannot find module or crate nix`。这是「本包不为 android 而生」的证据，不是本仓某条线造成的债（在零改动的树上实测同样 rc=101）。🔴 **同一轮实测里的另一条发现被单独修掉、没有一起豁免**：lib 侧 `crate::elapsed_ms` 在 android 上零消费点（三个平台模块都不编）⇒ `dead_code`。那是真·未使用，已在 `crates/helper/src/lib.rs` 用「消费者门控之并」的 cfg 修掉；豁免它等于把本包在 android 上的 lib 面信号一起关掉。两类分开处置，别一刀切成整包豁免。 ── aarch64-apple-ios（2026-09-06 实测）：**同一条根因原样复现，连挂在哪个目标上都一样**——`--all-targets` 下 ios 也要编 mac/win 模块（`platform/mod.rs` 的谓词刻意带 `test`），而 `nix` 在 Cargo.toml 里是 linux/macos target-specific 依赖、ios 不在其列 ⇒ `crates/helper/src/platform/unix_log.rs` 4 条 `E0433: cannot find module or crate nix`，报错只出现在 `lib test` 目标上。lib/bins 面单独实测 rc=0（`cargo clippy --target aarch64-apple-ios -p polaris-helper -- -D warnings`），故 ios 沿用同一档 `scope: \"tests\"`，不升级成整包豁免 —— 那会把本包在 ios 上的 lib 面信号一起关掉。"
   }
 }

@@ -79,6 +79,28 @@ impl GrpcManagementApi {
             })
             .collect())
     }
+
+    pub async fn clash_mode_status(&self) -> Result<ClashModeStatus, ManagementError> {
+        let status = self
+            .client()?
+            .get_clash_mode_status()
+            .await
+            .map_err(map_err)?;
+        Ok(ClashModeStatus {
+            mode_list: status.mode_list,
+            current_mode: status.current_mode,
+        })
+    }
+
+    pub async fn set_clash_mode(&self, mode: &str) -> Result<(), ManagementError> {
+        self.client()?.set_clash_mode(mode).await.map_err(map_err)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClashModeStatus {
+    pub mode_list: Vec<String>,
+    pub current_mode: String,
 }
 
 /// 一个出站 group 的运行期选择（`daemon::Group` 的最小投影）。

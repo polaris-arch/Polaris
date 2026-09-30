@@ -15,7 +15,8 @@ const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.met
 const code = (src: string) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 
 describe('网络场景命中态：信号 → 重拉', () => {
-  const panel = code(read('../components/screens/rules/NetworkProfilePanel.tsx'));
+  // hook 2026-09-25 搬进零 DOM 依赖的共享模块（桌面与移动端同一份），切片跟着搬。
+  const panel = code(read('../components/screens/rules/network-profile-probes.ts'));
   const start = panel.indexOf('export function useResolvedProbes(');
   const end = panel.indexOf('\n}\n', start);
   const hook = panel.slice(start, end);

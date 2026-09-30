@@ -6,6 +6,7 @@
 // （测试起一条 h2c tonic transport::Server，验证客户端连接/认证/流/重连）。
 
 include!("proto_wire_check.rs");
+include!("android_wire_check.rs");
 
 // 符号表与 vendored proto 原文均取自 `proto_wire_check`（此前 build.rs / tests 各存一份，
 // 两处注释都写着「一处漏加，另一处就白守」；运行期换核检查要用第三次，故下沉共用）。
@@ -19,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&["proto/started_service.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/started_service.proto");
     println!("cargo:rerun-if-changed=proto_wire_check.rs");
+    println!("cargo:rerun-if-changed=android_wire_check.rs");
     Ok(())
 }
 
@@ -60,6 +62,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// 扩到全部 message 仍是显然的下一步，但要不要扩由人决定，不在此自作主张 —— 扩的成本主要在
 /// 「上游合法新增字段」会不会把门变成噪声源，那需要单独判。
 fn assert_proto_matches_bundled_core() {
+    // Cargo target facts, not the build-script host: Android ships the verified
+    // AAR's JNI library. Its actual descriptor must satisfy the same wire table.
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        let aar = proto_wire_check::repo_root().join("src-tauri/gen/android/app/libs/libbox.aar");
+        println!("cargo:rerun-if-changed={}", aar.display());
+        if std::env::var("PROFILE").as_deref() == Ok("release") {
+            let arch = std::env::var("CARGO_CFG_TARGET_ARCH")
+                .expect("Android Release wire guard requires Cargo target architecture");
+            android_wire_check::check_android_aar(&aar, &arch)
+                .unwrap_or_else(|report| panic!("Android Release wire guard refused: {report}"));
+        }
+        return;
+    }
     // 覆盖轴（有哪几个平台）来自 `src-tauri/core-manifest.json` 的 `coreArchiveSha256` 键集合，
     // 不在这里再写一份名单 —— 此前这里那四条字面路径正是「两处各写一份平台名单」的第三份。
     // manifest 本身也要进重跑触发面：加/减平台时本门的覆盖轴跟着变。

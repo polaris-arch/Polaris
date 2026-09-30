@@ -62,6 +62,7 @@
     "delete": "删除",
     "edit": "编辑",
     "save": "保存",
+    "saved": "已保存",
     "copyFail": "复制失败",
     "retry": "重试",
     "loading": "加载中...",
@@ -324,6 +325,7 @@
     "noServerConfig": "暂无服务器配置",
     "others": "其他",
     "pageTitle": "主页",
+    "nativeReconnectRequired": "连接更改需要重连。请在首页点击连接；若仍显示已连接，先断开再连接。",
     "pendingApplyBtn": "立即应用",
     "pendingApplyFailed": "应用失败",
     "pendingApplyFailedReason": "应用失败：{{reason}}",
@@ -342,7 +344,7 @@
     "pendingGroupStaged": "待保存 · 尚未落盘",
     "pendingIgnoreBtn": "忽略",
     "pendingResetBtn": "重置",
-    "pendingResetConfirm": "放弃全部待应用改动？",
+    "pendingResetConfirm": "放弃全部未保存改动？",
     "pendingRetryBtn": "重试",
     "pendingRetrySaveBtn": "重试保存",
     "pendingRevertOne": "撤销这一条",
@@ -411,6 +413,7 @@
     "switchNodeTip": "切换节点",
     "switchedToast": "{{node}} · 已切换",
     "switchPending": "{{node}} · 已保存，正在应用连接更改",
+    "switchRestarting": "{{node}} · 已保存，正在重启连接以完成切换",
     "switchSavedForNextStart": "{{node}} · 已保存，下次连接时生效",
     "switchRequiresApply": "{{node}} · 已保存，请应用待处理更改后使用",
     "takeoverManual": "本地",
@@ -448,7 +451,14 @@
       "blocked": "受限",
       "restricted": "区域受限",
       "timeout": "超时"
-    }
+    },
+    "pendingResetShortConfirm": "放弃草稿？",
+    "pendingResetDone": "已放弃未保存改动",
+    "pendingSavedStillNeedsApply": "已保存的改动仍待应用",
+    "switchPending": "{{node}} · 已保存，正在应用连接更改",
+    "switchRestarting": "{{node}} · 已保存，正在重启连接以完成切换",
+    "switchSavedForNextStart": "{{node}} · 已保存，下次连接时生效",
+    "switchRequiresApply": "{{node}} · 已保存，请应用待处理更改后使用"
   },
   "settings": {
     "listImportHint": "每行或逗号分隔一个条目，重复项自动跳过",
@@ -514,7 +524,7 @@
       "rollbackConfirmDesc": "将回滚到 {{version}}，内核会重启。",
       "sameVersionGoManage": "请到「内核管理」卡片确认替换同版本内核。",
       "baselineOverrideGoManage": "所选内核旧于随包基线，请到「内核管理」卡片确认临时替换。",
-      "noRollbackEntryNote": "当前无备份可回滚：内核更新链路尚未接线，因此不会产生备份。"
+      "noRollbackEntryNote": "当前没有可回滚的备份：备份在每次内核更新时产生，回滚一次或恢复出厂后就不再保留。"
     },
     "coreManagement": {
       "rollback": "回滚",
@@ -675,7 +685,7 @@
       },
       "autoSwitchNode": "节点故障自动切换",
       "autoSwitchNodeDesc": "当前节点检测到故障时自动切到可用节点。只走内网的组网节点不参与判定——没有可替代的节点，不会被自动切走。",
-      "disableLogFileDescFull": "停止记录 sing-box 日志；实时日志与日志诊断将不可用，崩溃检测不受影响。代理运行中保存后等待立即应用；未运行时下次连接生效。",
+      "disableLogFileDescFull": "关闭磁盘日志后，实时日志与日志诊断不可用；崩溃检测仍可用。运行中需保存后点“立即应用”；未运行时下次连接生效。",
       "lanGateway": "局域网网关",
       "neighborDomains": "局域网短名解析",
       "neighborDomainsHint": "每行一个后缀（自动补前导点）；对该后缀下无点的短名（如 nas.lan）走局域网设备解析。",
@@ -725,7 +735,7 @@
       "tagline": "让连接，始终指向正确的方向",
       "intro": "Polaris 是一款基于 sing-box 的现代网络代理工具，专注于简化代理控制与连接管理。",
       "releases": "发行版",
-      "noTelemetry": "零遥测 — 无崩溃上报、无分析、无回传"
+      "noTelemetry": "零遥测 — 不自动上传崩溃报告或分析数据"
     },
     "update": {
       "ruleResourceAutoStatusOn": "按间隔刷新",
@@ -866,6 +876,7 @@
       "catCustomRules": "路由规则（含规则集资源）",
       "catDnsRules": "DNS 规则",
       "catDnsResources": "DNS 服务器、服务器组与默认解析策略",
+      "catMeshRouting": "组网路由策略",
       "exportSelected": "导出所选",
       "import": "导入…"
     },
@@ -904,7 +915,7 @@
       "addSuffix": "添加后缀",
       "addMac": "添加 MAC",
       "mtuDesc": "留空即自动，使用推荐值。仅在需要手动调优时填写。",
-      "mtuAutoPlaceholder": "自动（{{n}}）",
+      "mtuAutoPlaceholder": "自动（内核默认）",
       "mtuInvalid": "MTU 须为 {{min}}–{{max}} 之间的整数",
       "effectiveExcludeBlock": "本平台生效的排除网段",
       "effectiveExcludeHint": "上面两张表在不同平台喂给不同的地方。这里是后端按当前已保存的配置算出的、真正下发给内核的排除清单；暂存中的改动要「应用」后才反映到这里。",
@@ -1000,7 +1011,12 @@
         "unknownStale": "快照已过期",
         "unknownFile": "引用文件或加载证据不可用",
         "unknownArtifact": "运行产物或候选不可用"
-      }
+      },
+      "inboundExcludeEmpty": "尚未添加网段。留空表示不做连入来源排除。",
+      "bypassLanBlock": "局域网",
+      "bypassLanDesc": "开启后，清单中的局域网网段（如 192.168.x.x、10.x.x.x）直接走本机网络、不进入 VPN；关闭后这些地址也经隧道转发。",
+      "bypassLanListHint": "只有网段（CIDR）条目在本机生效，域名条目在手机上不起作用。回环网段由系统自行处理，会被自动忽略。",
+      "bypassLanListEmpty": "清单为空：局域网地址会全部经隧道转发。"
     },
     "dns": {
       "pageSub": "系统接管、查询运行时与节点域名解析",
@@ -1113,7 +1129,12 @@
       "browserDohFold": "DoH 端点清单",
       "browserDohHint": "按域名后缀匹配（填 cloudflare-dns.com 即覆盖其全部子域）。内置的是常用起点，不是全集——DoH 端点可以是任意自建域名，遇到漏网的自行添加。",
       "domain": "域名",
-      "displacedResolversNote": "接管系统 DNS 时覆盖了下列非公网解析器，它们很可能属于本机的其它 VPN / 组网客户端（如 Tailscale 的 MagicDNS）。这些解析器负责的域名在代理开启期间将无法解析，表现为「IP 能连、域名不通」。"
+      "displacedResolversNote": "接管系统 DNS 时覆盖了下列非公网解析器，它们很可能属于本机的其它 VPN / 组网客户端（如 Tailscale 的 MagicDNS）。这些解析器负责的域名在代理开启期间将无法解析，表现为「IP 能连、域名不通」。",
+      "upstreamPreset": "上游预设",
+      "raceCustomHint": "自定义上游必须是纯 IP 地址（它自己不能再要解析），并且占用竞速额度。",
+      "raceCustomEmpty": "没有自定义上游",
+      "fakeIpFilterEmpty": "没有例外域名，所有域名都走 FakeIP",
+      "browserDohEmpty": "清单为空，不会拦截任何端点"
     }
   },
   "rules": {
@@ -1548,7 +1569,8 @@
     "viaProxyOverrideDirect": "已由全局策略覆盖：全部订阅直连",
     "previewBtn": "预检",
     "added": "订阅已添加",
-    "updated": "订阅配置已更新"
+    "updated": "订阅配置已更新",
+    "createTaskRecoveredHint": "订阅添加在后台执行，应用重启后会在这里继续显示进度。"
   },
   "errors": {
     "operationFailed": "操作失败，请稍后重试",
@@ -1568,14 +1590,18 @@
     "coreBinaryMismatch": "当前运行的内核与已选版本不一致。请重新安装 Helper 或重新应用内核更新，并在日志中查看详情",
     "tunAdapterMissing": "TUN 虚拟网卡未能创建，请检查 wintun 驱动是否被安全软件拦截，或重启后重试",
     "autoSwitchNeedsRestart": "已尝试自动换节点，但本次未能换成：有候选节点需要重启内核才能切换过去。请手动选择其他节点。",
-    "tunAddressUnavailable": "TUN 虚拟网卡地址无法分配，可能被残留网卡或其他 VPN 占用。请断开其他 VPN，或重启系统后重试"
+    "tunAddressUnavailable": "TUN 虚拟网卡地址无法分配，可能被残留网卡或其他 VPN 占用。请断开其他 VPN，或重启系统后重试",
+    "androidNativeCapacityClosed": "本次运行的生命周期记录已满，请完全关闭并重新启动应用后重试。",
+    "vpnPermissionDenied": "VPN 授权尚未完成。请完成或关闭当前授权窗口，再点击连接，并在系统 VPN 连接请求中选择允许。",
+    "systemInterfaceUnsupported": "此节点请求系统网卡，Android VPN 模式不支持。请在节点编辑中关闭系统网卡选项；自定义节点请将 JSON 中的 system 设为 false。"
   },
   "privacy": {
     "wrongPassword": "解锁密码错误",
     "title": "Polaris 已锁定",
     "subtitle": "输入密码解锁。代理仍在运行。",
     "unlock": "解锁",
-    "enterPassword": "请输入密码"
+    "enterPassword": "请输入密码",
+    "unlockFailed": "解锁没能完成，请稍后再试。"
   },
   "appAdd": {
     "catCustom": "自定义…",
@@ -1609,7 +1635,8 @@
     "submit": "添加",
     "tagSearchPh": "搜索标签…",
     "title": "添加自定义应用",
-    "galleryMore": "已显示 {{shown}} / {{total}}，继续滚动加载更多"
+    "galleryMore": "已显示 {{shown}} / {{total}}，继续滚动加载更多",
+    "emojiOnlyNote": "移动端把这个 emoji 直接画成应用图标，不走网络加载图标资源。"
   },
   "appPolicy": {
     "addCustom": "添加自定义应用",
@@ -1657,6 +1684,7 @@
   },
   "backupImport": {
     "categories": "文件内的类别",
+    "confirmScope": "即将替换：{{categories}}。",
     "confirmTitle": "确认恢复所选类别？",
     "confirmMsg": "以下类别的当前内容将被备份整体替换，无法撤销；备份中为空的类别会跳过，未选类别保持不变：\n• {{categories}}",
     "discardMsg": "已选择的备份文件与类别将不会恢复。",
@@ -1668,6 +1696,8 @@
     "interfaceFallbackWarn": "所选类别中有 {{n}} 处网卡绑定在本机不存在。恢复时将改为自动或继承，并保留原备份文件不变。",
     "pickHint": "点击选择备份文件",
     "replaceWarn": "选中类别将被备份内容整体替换；未选类别保留不变。",
+    "meshRoutingBlocked": "组网路由策略缺少可信旧范围证明，当前不能恢复。若选中它，整次导入都会拒绝；取消该类后可恢复其他类别。",
+    "meshRoutingOwners": "策略引用的节点：{{ids}}",
     "restoreSelected": "恢复所选",
     "restoreSuccess": "备份恢复完成",
     "title": "导入备份",
@@ -1680,6 +1710,8 @@
       "invalidFormat": "这不是有效的 Polaris 备份文件",
       "invalidArgs": "请至少选择一个要恢复的类别",
       "saveFailed": "无法保存恢复后的配置",
+      "meshRoutingRequiresTrustedRestore": "组网路由策略恢复需要可信旧范围证明，当前已阻止写入。",
+      "meshRoutingInvalidPolicy": "组网路由策略校验失败，备份未导出。",
       "unknown": "备份操作未能完成"
     }
   },
@@ -1716,7 +1748,8 @@
     "submitN": "导入 {{count}} 项",
     "resultUnsupported": "其中 {{count}} 个协议当前内核不支持，已置灰",
     "textPlaceholder": "粘贴 Base64 订阅内容，或每行一个分享链接（vmess:// vless:// ss:// …）",
-    "fileTooLarge": "文件过大（上限 10 MB）"
+    "fileTooLarge": "文件过大（上限 10 MB）",
+    "pickFile": "从文件导入"
   },
   "meshJoin": {
     "title": "添加接入",
@@ -2048,10 +2081,10 @@
     "subAutoUpdateActiveHint": "距离上次刷新达到 {{h}} 小时后，由后台自动补更本订阅",
     "subAutoUpdateEvery": "自动 · {{h}}h",
     "subAutoUpdateFail": "订阅自动更新失败",
-    "subAutoUpdateMasterOffHint": "本订阅已开启自动更新，但全局「订阅自动更新」已关闭，因此不会自动刷新",
+    "subAutoUpdateMasterOffHint": "全局订阅自动更新已关闭；可在设置中开启。",
     "subAutoUpdatePaused": "自动 · 未生效",
     "subAutoUpdateStartupOnly": "自动 · 仅启动时",
-    "subAutoUpdateStartupOnlyHint": "更新间隔设为「仅手动」：应用启动时检查并在需要时补更，不按周期刷新",
+    "subAutoUpdateStartupOnlyHint": "仅启动时检查更新；可在设置中更改周期。",
     "subCopyUrl": "复制 URL",
     "subCopyUrlOk": "已复制订阅 URL",
     "subDeleteConfirm": "确定删除订阅 \"{{name}}\" 吗？其下 {{count}} 个节点将一并移除，此操作无法撤销。",
@@ -2088,8 +2121,6 @@
     "testVisibleHint": "测速当前筛选后可见的节点",
     "use": "设为出口",
     "useConfirmAgain": "再点一次确认切换",
-    "useConfirmRestart": "将重启内核并断开现有连接，再点一次确认",
-    "useConfirmRestartToast": "再点一次切换到 {{node}} —— 该节点需重启内核，现有连接会断开",
     "useConfirmToast": "再点一次切换到 {{node}}",
     "useCurrent": "当前出口",
     "view": {
@@ -2142,7 +2173,22 @@
     "invalidCustomOutbound": "自定义 Outbound JSON 须是带字符串 type 字段的对象",
     "exitCapableBadge": "出口",
     "meshLoginFallbackTitle": "组网登录期已临时直连",
-    "meshLoginFallbackRestored": "已连接「{{name}}」，已切回该出口"
+    "meshLoginFallbackRestored": "已连接「{{name}}」，已切回该出口",
+    "selectedChoice": "已选择",
+    "useConfirmApply": "此节点有待应用更改；再点一次保存选择",
+    "useConfirmApplyToast": "再点一次选择 {{node}}；保存后可能仍需应用待处理更改",
+    "mobileGroupsLabel": "节点分组",
+    "mobileFilterSort": "筛选 / 排序",
+    "mobileLatencyStale": "延迟已过期",
+    "mobileMoreActions": "更多",
+    "mobileProtocolFilter": "协议",
+    "mobileRowMore": "更多操作",
+    "tsAccountUnknown": "登录 / 切换账号",
+    "mobileSortLatency": "延迟",
+    "mobileSortName": "名称",
+    "mobileSortProtocol": "协议",
+    "deleteConfirmMobile": "确定删除节点 \"{{name}}\" 吗？此操作无法撤销。",
+    "batchDeleteConfirmMobile": "确定删除选中的 {{count}} 个节点吗？此操作无法撤销。"
   },
   "procPick": {
     "empty": "暂无进程数据 / 后端未接入",
@@ -2242,7 +2288,14 @@
     "urlDlgErrFailed": "下载失败",
     "urlDlgDiscardTitle": "放弃下载？",
     "urlDlgDiscardMsg": "已填写的内容将不会保存。",
-    "urlDlgDiscard": "放弃"
+    "urlDlgDiscard": "放弃",
+    "updateResult": {
+      "success": "已更新 {{succeeded}} 项本地资源文件",
+      "partial": "本地文件已更新 {{succeeded}} 项，失败 {{failed}} 项，取消 {{cancelled}} 项",
+      "failed": "资源更新失败（{{failed}} 项）",
+      "cancelled": "资源更新已取消",
+      "empty": "未收到资源更新结果"
+    }
   },
   "taildrop": {
     "title": "文件传输",
@@ -2355,6 +2408,12 @@
     "authUrlCopyFailed": "无法复制登录地址，请手动选择并复制。",
     "loginTitle": "连接 Tailscale",
     "logout": "退出登录",
+    "logoutStopTitle": "断开连接并退出登录？",
+    "logoutStopMessage": "该节点由当前代理连接持有。继续会断开代理，确认停止后清除此节点的本机登录状态；代理会保持断开。",
+    "logoutStopConfirm": "断开并退出",
+    "logoutStopChanged": "连接或所选节点已变化，未退出登录。请重新确认。",
+    "logoutStopFailed": "未能确认代理已停止，登录状态未清除。",
+    "logoutRefreshFailed": "已退出登录，但节点列表刷新失败。请重新打开页面核对。",
     "method": "登录方式",
     "noNode": "尚无 Tailscale 节点，请先登录 Tailscale。",
     "nodeName": "节点名称",
@@ -2383,7 +2442,23 @@
     "authKeyClearAgain": "再点一次以清除",
     "authKeyClearHint": "此处只显示这台节点有没有存过 Auth Key，不显示密钥本身。清除只删配置里的密钥，不影响当前登录状态（登录状态在 state 目录里，要清它用「退出登录」）；清除后该节点在需要重新认证时就没有可用的静态凭据，必须重新登录。保存后生效。",
     "browserOpenFailed": "无法打开浏览器，请复制登录链接。",
-    "reasonMainCoreChanged": "主连接已变更，请重新尝试授权。"
+    "reasonMainCoreChanged": "主连接已变更，请重新尝试授权。",
+    "loginSavedAttemptIncomplete": "节点已保存；本次授权尚未完成。",
+    "loginSaveFailed": "节点保存失败，未发起登录。请重试。",
+    "loginRefreshFailed": "读取已保存配置失败。请重试。",
+    "loginLogoutFailed": "退出旧登录会话失败，未发起新的授权。请重试。",
+    "loginStartFailed": "无法启动本次登录。请重试。",
+    "loginAttemptFailed": "本次登录请求失败。请重试。",
+    "loginCancelFailed": "取消登录失败，请重试。",
+    "loginSubmitted": "已提交登录请求。请等待授权完成。",
+    "loginMainCoreStatus": "正在读取主连接中该节点的授权状态。",
+    "loginMainCoreAuthorized": "主连接中的该节点已授权；这不代表新保存的认证设置已生效。",
+    "loginMainCoreAwaiting": "该节点需要授权。正在获取登录页地址…",
+    "loginMainCoreUnknown": "尚无法确认主连接中该节点的授权状态，可重试读取。",
+    "loginUrlTimeout": "获取登录页地址超时。请重试。",
+    "loginSessionReadFailed": "无法读取旧登录会话，未发起新的授权。请重试。",
+    "loginProgressReadFailed": "暂时无法核对本次授权结果。授权可能仍在进行；返回应用时会重试。",
+    "loginStateUnknown": "旧登录状态暂无法确认；提交 Auth Key 前会重新读取，读取失败则不会更换账号。"
   },
   "warp": {
     "addTitle": "接入 Cloudflare WARP",
@@ -2411,7 +2486,12 @@
     "plan": "许可类型",
     "planFree": "免费 WARP",
     "register": "注册并接入",
-    "registering": "正在注册匿名设备…"
+    "registering": "正在注册匿名设备…",
+    "registeredLocked": "注册结果已保留，表单已锁定。",
+    "registeredPending": "Cloudflare 注册已完成，表单已锁定。重试只会保存或刷新同一节点，不会重新注册。",
+    "registeredSaveFailed": "Cloudflare 注册已完成，但节点保存尚未确认。请保持此面板打开并重试保存。",
+    "registeredRefreshFailed": "节点已保存，但列表刷新未完成。请重试刷新，不会重新注册。",
+    "discardRegisteredMsg": "Cloudflare 设备已注册，但本地保存尚未确认。关闭将丢弃本面板的凭据；若节点尚未落盘，将无法继续保存。"
   },
   "wg": {
     "address": "对端地址",
@@ -2458,7 +2538,8 @@
     "reverseMesh": "System 接入模式（内核接口）",
     "reverseMeshHint": "创建真实系统接口，可在对端路由、访问控制和系统防火墙允许时接受对端访问并转发子网流量；此开关不代替这些授权。需 TUN 模式，Windows 不支持，不满足时降级为 gVisor 用户态。开启后不参与测速。",
     "reverseMeshWarp": "WARP 的 System 接入会与主 TUN 冲突，因此固定使用 gVisor 用户态。",
-    "source": "来源"
+    "source": "来源",
+    "pasteHint": "点「解析预览」后，字段会直接填进下面的表单，可再逐项修改。"
   },
   "meshInbound": {
     "title": "隧道入站连接策略",
@@ -2489,5 +2570,382 @@
     "targetInvalid": "请填写合法的目标 CIDR；回环地址请改选“隧道地址对应的本机服务”。",
     "udp53": "UDP 53 由内核 DNS 路径处理，不能通过此策略授权；请移除该端口或改用 TCP。",
     "tsBoundary": "此规则仅限制经 Polaris 转交的 TCP/UDP 连接。Tailscale 内置服务（如文件接收、SSH、DNS）仍由 tailnet 权限控制。"
+  },
+  "mobileNav": {
+    "home": "首页",
+    "nodes": "节点",
+    "rules": "分流",
+    "connections": "活动",
+    "settings": "设置"
+  },
+  "mobileHome": {
+    "latencyLabel": "节点延迟",
+    "latencyChecking": "检测中",
+    "connectToTest": "连接后可测当前出口",
+    "notApplicable": "不适用",
+    "currentSpeedTest": "当前测速",
+    "allSpeedTest": "全部测速",
+    "allSpeedTestBusy": "全部测速中",
+    "listedHostsTotal": "所列域名合计",
+    "connect": "连接",
+    "disconnect": "断开",
+    "networkCheck": "网络检测",
+    "checkNow": "检测",
+    "exitIp": "出口 IP",
+    "trafficChart": "实时流量",
+    "ruleHits": "规则命中",
+    "noSamples": "暂无采样",
+    "axisNow": "现在",
+    "noNodeSelected": "未选择节点",
+    "noMatchingNode": "没有匹配的节点",
+    "checkedJustNow": "刚刚检测",
+    "checkedMinutesAgo": "{{n}} 分钟前检测",
+    "checkedHoursAgo": "{{n}} 小时前检测",
+    "actionFailed": "操作失败",
+    "actionFailedWithReason": "操作失败：{{reason}}",
+    "ruleHitsViewAll": "查看全部（{{count}}）",
+    "ruleHitsAll": "全部规则命中"
+  },
+  "mobileConnections": {
+    "exactRuleFilter": "规则",
+    "clearExactRule": "清除规则筛选",
+    "seg": {
+      "overview": "概览",
+      "logs": "日志"
+    },
+    "more": "更多",
+    "rowMore": "更多操作",
+    "clearSearch": "清除搜索",
+    "sourceIP": "来源 IP",
+    "addRule": "加入规则",
+    "sort": "排序",
+    "sortNote": "九个数据列都可排序：再点一次切换升降序，第三次取消排序。",
+    "sortAsc": "升序",
+    "sortDesc": "降序",
+    "sortedBy": "已按「{{key}}」{{dir}}排列",
+    "pauseNote": "暂停即退订：整条数据链停机，不是只冻结画面；恢复后下一帧（约 1 秒）回填。",
+    "pausedNote": "已暂停：连接明细已退订，列表不再更新。",
+    "overview": {
+      "hostsTitle": "TOP 域名（按连接数）",
+      "outboundsTitle": "出站分布（按连接数）",
+      "unitNote": "按连接数排名；首页按流量统计。"
+    },
+    "rules": {
+      "canAppend": "可追加",
+      "cannotAppend": "不可追加"
+    },
+    "logs": {
+      "filter": "级别与来源",
+      "filterSummary": "调整级别与来源；内核启动诊断级别需重启后生效。",
+      "emptyTitle": "暂无日志",
+      "emptyBody": "当前级别与来源下还没有日志。可以调低级别、清空搜索条件，或等待内核输出。",
+      "lines": "{{n}} 行",
+      "levelSaveFailed": "保存日志级别失败"
+    }
+  },
+  "mobileRules": {
+    "matchDetailsLabel": "匹配说明",
+    "matchSummary": "Android 按包名或流量特征匹配 · 查看说明",
+    "matchTrafficOnlyShort": "仅域名 / IP · 需规则资源",
+    "matchCustomDetail": "自定义应用没有 Android 包名；直连不会加入系统 VPN 排除名单。仅在对应规则资源在位且流量特征命中时生效；资源缺失则规则失效。",
+    "matchPresetNoPackageDetail": "此内置预设没有 Android 包名，不能通过包名识别。仅在对应规则资源在位且域名或 IP 命中时生效。",
+    "matchDirectShort": "系统 VPN 排除 · 域名 / IP",
+    "matchDirectDetail": "带包名的内置预设可通过 Android 系统 VPN 排除该应用；对应规则资源在位时，还能按域名 / IP 匹配。资源缺失时流量规则失效。",
+    "matchPackageShort": "包名（Android 10+）· 域名 / IP",
+    "matchPackageDetail": "Android 10 及以上可按包名识别指定节点和阻断；直连也可通过系统 VPN 排除该包。域名 / IP 匹配需对应规则资源在位。",
+    "seg": {
+      "traffic": "流量",
+      "dns": "DNS",
+      "apps": "应用",
+      "resources": "资源"
+    },
+    "more": "更多",
+    "back": "返回",
+    "appRoutingMatchNote": "应用分流按两条腿认应用。一是应用身份：Android 10 及以上，带包名的应用在「指定节点」与「阻断」下按包名命中；「直连」由系统 VPN 把它整个排除在隧道外（各版本都有效）。二是流量特征：该应用已知的域名 / IP，需要对应的规则资源在位。没有包名的应用（部分内置应用，以及没有挑应用的自定义应用），以及 Android 9 及以下的「指定节点」「阻断」，只走域名 / IP 这条腿。",
+    "dnsSystemPaneAbsent": "这些规则的参数在「设置 → DNS」里调整；本屏只列出它们的执行顺序。",
+    "dnsServersEmpty": "暂无 DNS 服务器",
+    "customAppMatch": "自定义应用在这里有两条匹配腿：你填的域名 / IP，以及你在下面挑的应用。应用这条腿覆盖「直连」——它把那些应用整个留在隧道之外；其余几档策略靠域名这条腿命中。",
+    "customAppPackages": "按应用匹配",
+    "customAppPackagesFailed": "读不到这台设备的已安装应用清单。仍可保存这个应用，按域名匹配它。",
+    "networkProfile": {
+      "intro": "规则在「生效网络」里选中某个场景后，只在手机连着该网络时生效；离开后自动跳过，不用重新连接。",
+      "reasonDhcpNoPermission": "手机上的应用没有权限直接向路由器询问（DHCP），请改用自动或系统 DNS",
+      "listEmpty": "还没有填写"
+    }
+  },
+  "mobileSettings": {
+    "saveFailedWithReason": "保存失败：{{reason}}",
+    "back": "返回",
+    "general": {
+      "autoStartTitle": "开机自动连接",
+      "autoStartDesc": "设备重启后，恢复上次未手动断开的连接；需已授予 VPN 权限。",
+      "autoStartReadFailed": "读不到开机自动连接开关的当前状态。",
+      "autoStartReadFailedWithReason": "读不到开机自动连接开关的当前状态：{{reason}}",
+      "bootConnectTitle": "始终开启的 VPN（系统设置）",
+      "bootConnectDesc": "由系统在开机或断线后恢复 VPN，也可阻止未通过 VPN 的流量。",
+      "bootConnectPath": "系统设置 → 网络和互联网 → VPN → Polaris → 始终开启的 VPN",
+      "bootConnectOpenFailed": "打不开系统设置页，请按上面的路径手动前往。",
+      "privacyLockFailed": "自动锁屏没能生效，界面仍是解锁状态。"
+    },
+    "dns": {
+      "fakeIpOffRisk": "在 TUN 模式下关掉它，节点会收到真实 IP 而不是域名；部分防滥用严格的机场会因此拒绝连接，这个风险客户端缓解不了。"
+    },
+    "display": {
+      "notifyBlock": "通知",
+      "notifications": "系统通知",
+      "notificationsDesc": "代理异常与断开、Tailscale 登录提示会经系统通知送达。",
+      "notificationsPermission": "首次发送时会向系统申请通知权限；被拒绝则静默不发。连接时状态栏那条常驻通知由 VPN 服务本身发出，不受这个开关控制。"
+    },
+    "vpnAuth": {
+      "title": "VPN 授权",
+      "desc": "连接时会按需请求系统 VPN 授权。",
+      "granted": "已授权",
+      "denied": "未授权",
+      "unknown": "读不到"
+    },
+    "update": {
+      "channelBlock": "应用更新",
+      "appTitle": "应用更新",
+      "appDesc": "Android 版经 GitHub Releases 分发。在这里检查、下载签名 APK 并交给系统安装器；某个版本没有发 APK 时，仍可打开发布页。",
+      "ghScopeNote": "这里的加速与自定义域名服务的是规则资源下载，与内核更新无关。",
+      "checkAction": "检查更新",
+      "checking": "正在检查…",
+      "openReleases": "打开发布页",
+      "checkFailed": "检查更新失败：{{reason}}",
+      "checkFailedPlain": "检查更新失败。",
+      "skipFailed": "跳过此版本失败：{{reason}}",
+      "skipFailedPlain": "跳过此版本失败。",
+      "entryDesc": "在「更新」页查看版本说明，并下载安装。",
+      "downloadingPercent": "正在下载更新包… {{percent}}%",
+      "downloadReady": "更新包已下载，点「安装」交给系统安装器。",
+      "downloadingAction": "正在下载…",
+      "installAction": "安装",
+      "handedOffNote": "已交给系统安装器，请在系统界面上完成安装。若系统提示「应用未安装」，多半是这个包与你已装的那份签名不一致 —— 请到发布页获取官方版本。",
+      "installUnknownSourcesDenied": "系统还没允许 Polaris 安装应用。已为你打开那一页，打开开关后再点一次「安装」。",
+      "installUnknownSourcesNoSettings": "系统还没允许 Polaris 安装应用，而这台设备上那一页的快捷入口打不开。请到系统设置里为 Polaris 打开「安装未知应用」，再点一次「安装」。",
+      "installNoInstaller": "这台设备没有能安装 APK 的组件，无法在本机安装。",
+      "installPathRejected": "安装包不在应用私有目录里，出于安全已拒绝交付。请在本页重新下载。",
+      "installPackageMissing": "安装包已不在磁盘上，请重新下载。",
+      "installHandoffFailed": "没能把安装包交给系统安装器。"
+    },
+    "backup": {
+      "pickerNote": "导出走系统的文件保存器，导入走系统的文件选择器；两侧都直接读写你在系统面板里选中的那个文件。",
+      "exportFailedWithReason": "导出失败：{{reason}}",
+      "importFailedWithReason": "恢复失败：{{reason}}",
+      "importDone": "备份已恢复",
+      "systemBackupGroup": "系统备份",
+      "systemBackupTitle": "允许系统备份应用数据",
+      "systemBackupDesc": "默认关闭。打开后，Android 会把 Polaris 的应用数据（包括节点凭据和订阅）备份到你的 Google 账号，换机迁移时也会一并带到新设备。Google 云备份仅在 Android 9 及以上、且设备设置了锁屏（PIN、图案或密码）时才端到端加密。在新设备上恢复后，此开关仍为关闭，需要重新打开。上面的导出不受此开关影响。",
+      "systemBackupReadFailed": "读不到系统备份开关的当前状态。",
+      "systemBackupReadFailedWithReason": "读不到系统备份开关的当前状态：{{reason}}"
+    },
+    "about": {
+      "licenseBlock": "许可",
+      "licenseSource": "源码许可",
+      "licenseSourceValue": "MIT —— Polaris 自身的源码按此发布。",
+      "licenseArtifact": "本产物许可",
+      "licenseArtifactValue": "GPLv3 —— Android 上内核以 libbox 形态载入应用进程、不是独立子进程，故整份产物按 GPLv3 分发。",
+      "uninstallNote": "卸载请经系统的应用管理进行；卸载会一并移除本应用的全部数据。",
+      "openLinkFailed": "打开链接失败",
+      "openLinkFailedWithReason": "打开链接失败：{{reason}}"
+    }
+  },
+  "mobileActions": {
+    "exportOptions": "导出选项",
+    "chooseExport": "选择导出内容",
+    "exportHint": "选择故障报告或纯日志；下一步打开系统分享或保存窗口。",
+    "report": "导出故障报告",
+    "reportHint": "包含脱敏日志、配置和运行信息；Debug 版附带崩溃与设备信息。",
+    "saveLogs": "保存纯日志",
+    "copyLogs": "复制当前日志",
+    "preparing": "正在准备文件…",
+    "shareOpened": "已打开分享窗口，请选择接收方式",
+    "back": "返回上一级",
+    "chooseOption": "选择选项"
+  },
+  "mobileHelp": {
+    "viewDetails": "查看{{title}}说明",
+    "nodeDetails": "{{name}} · 节点说明",
+    "speedTest": "测速",
+    "stagedNodeDetails": "节点尚未保存，暂时不能选为出口或测速。请通过底部提示条保存；主核运行时，已保存的改动仍需应用后才会生效。",
+    "tsExitTitle": "Tailscale 出口",
+    "tsExitNeedsAuth": "授权未完成，不能经 Tailscale 出网。",
+    "tsExitNoDevice": "未选出口设备，外网仍直连。",
+    "tsExitOffline": "出口设备离线，出网可能受影响。",
+    "tsExitNotAdvertised": "所选设备未提供出口，无法经其出网。",
+    "stagedNode": "待保存 · 暂不可连接",
+    "stagedSpeedTest": "暂不可测速",
+    "reverseRoutingTitle": "地区分流反向",
+    "reverseRouting": "已反向：本地走代理、其余直连；仅智能分流生效。",
+    "certPin": "服务端证书 SHA-256；十六进制或 Base64，多个逗号分隔。",
+    "noParrot": "Ed25519 证书握手失败时，可关闭 Chrome QUIC 拟态。",
+    "spoofMethod": "需要提权，不支持 ARM64；诱饵 SNI 须不同于真实 SNI。",
+    "tlsEngine": "仅对应平台生效；平台不匹配时不下发。",
+    "tlsFragment": "仅握手被重置时尝试；增加延迟，部分服务端可能拒绝。",
+    "meshRoutes": "每行一个强制路由子网；留空不启用。",
+    "sysIface": "Android VPN 模式不支持系统网卡。若已启用，请关闭此项再连接。",
+    "extraJson": "填写协议原生 JSON 对象；同名字段以上方控件为准，留空表示无。",
+    "masqueVersion": "默认 HTTP/3，失败回落 HTTP/2；HTTP/3 前置代理须支持 UDP。",
+    "tcServerPub": "服务端 PublicKey（44 字符 Base64）；可能是准入凭据，请勿公开。",
+    "tcPrivateKey": "留空每次随机生成；服务端或 DERP 校验客户端时必填。",
+    "derpMode": "默认地图托管在 tailcat.dev；不可直连时设置前置代理或自建 DERP。",
+    "derpMapUrl": "填写 DERP 地图 JSON 地址；通过前置代理拉取，否则直连。",
+    "derpServers": "每行主机名或单行 JSON；主机名须匹配证书。",
+    "onDemand": "未被引用时暂停；Tailscale 暂停会停用 MagicDNS，并无法接收 Taildrop。",
+    "wgDetour": "前置代理必须支持 UDP；不可用时连接失败，不回落直连。",
+    "reverseMesh": "需 TUN，Windows 不支持；不满足时降级用户态，开启后不测速。",
+    "tsDetour": "控制面与 DERP 需要 TCP；前置代理失败时不回落直连。",
+    "tsListenPort": "点对点 UDP 端口；留空随机选择，固定端口可用于路由器映射。",
+    "tsResolveByName": "解析 tailnet / MagicDNS 名称；仅此节点为选中出口时生效。",
+    "tsControlUrl": "留空使用官方；自建服务请先填写地址。",
+    "tsAuthKeySwitch": "提交将退出当前登录并使用新 Auth Key。",
+    "meshJoinRoutes": "OpenConnect / OpenVPN / MASQUE：内网段用于强制路由，留空仍可作 VPN 出口。",
+    "customAppMatch": "直连可将所选应用排除出隧道；其他策略按域名 / IP 命中。",
+    "resourceUrl": "类型可自动识别或手动调整；下载沿用 GitHub 加速设置。",
+    "tcChain": "前置代理只承载 DERP 中继；点对点直连不经过它。",
+    "profileCidrs": "每行网段或 IP；当前网络 DNS 地址命中任一条即匹配。",
+    "profileProbe": "自动选择可用方式，或指定系统 DNS。",
+    "profileProbeDetails": "自动会按当前网络选择可用探测；系统 DNS 读取设备当前的 DNS 设置。Android 和 iOS 应用无法直接向路由器询问 DHCP，因此不提供新的 DHCP 选项。跨平台导入的旧 DHCP 值仍会显示，可改为自动或系统 DNS。",
+    "networkProfiles": "规则仅在匹配的网络生效；离开后自动跳过，无需重连。",
+    "appRoutingMatch": "应用身份或域名 / IP 匹配；直连排除隧道，指定节点 / 阻断受系统版本与资源限制。",
+    "connectionResolution": "保留域名由出站处理；本地解析按 DNS 规则获取真实地址，失败则终止连接。",
+    "browserDoh": "阻断清单内浏览器加密 DNS，使其回退系统 DNS；默认关闭。",
+    "browserDohList": "按域名后缀匹配；清单不完整，可添加遗漏的端点。",
+    "raceUpstreams": "最多启用 3 个抢跑上游；系统 DNS 兜底不占额度。",
+    "ipv6": "启用 IPv6 解析与路由；出口不支持时，IPv6 连接会超时。",
+    "bypassLan": "开启后清单内局域网直连；关闭后经 VPN 隧道。",
+    "notifications": "需系统通知权限；VPN 常驻通知不受此开关控制。",
+    "disableLogs": "关闭后实时日志与日志诊断不可用；运行中需保存并立即应用，未运行时下次连接生效。",
+    "systemBackup": "默认关闭；节点凭据和订阅也备份至 Google 账号。端到端加密需 Android 9+ 与锁屏；新设备恢复后须重新开启。",
+    "appUpdate": "检查并下载签名 APK，由系统安装；没有 APK 时可打开发布页。",
+    "autoDownload": "启动时发现新版本会后台下载，不会自动安装。",
+    "appChannel": "正式版只查正式发布；测试版也包含 alpha / beta / rc，所有检查均遵循此设置。",
+    "githubDownload": "优先原始地址；原址失败且已设置加速域名时才回退。"
+  },
+  "mobileSpeedTest": {
+    "preparing": "准备测速…",
+    "waiting": "暂未收到新进度，状态待确认",
+    "progress": "测速进度",
+    "measuredCounts": "成功 {{ok}} · 失败 {{failed}}",
+    "skippedCount": "未纳入 {{count}}",
+    "pendingCount": "未测完 {{count}}"
+  },
+  "mobileMeshInbound": {
+    "boundary": "仅限制隧道转交的 TCP/UDP 连接及 DNS 解析。",
+    "boundaryTs": "仅限制 Polaris 转交的 TCP/UDP 与 DNS；Tailscale 内置服务仍由 tailnet 权限控制。",
+    "applySummary": "保存后仍需应用更改。"
+  },
+  "mobileMeshRouteEvidence": {
+    "title": "组网网段报告",
+    "unavailable": "暂时没有可核实的组网网段报告。",
+    "summary": {
+      "legacy": "网段 · 归属暂无法确认",
+      "noRequested": "网段 · 无单独内网段",
+      "bootstrapOverlap": "网段 · 默认范围重叠，真实网段待确认",
+      "unavailable": "网段 · 等待报告",
+      "previous": "网段 · 上次结果待刷新",
+      "preview": "网段 · 预览待应用",
+      "pending": "网段 · 加载待确认",
+      "empty": "网段 · 无参与节点",
+      "absent": "网段 · 等待证据",
+      "full": "网段 · 未见重叠",
+      "partial": "网段 · 部分重叠",
+      "none": "网段 · 全部重叠",
+      "unknown": "网段 · 归属待确认"
+    },
+    "incomplete": "报告有省略的候选或未解证据；空列表不能证明没有重叠。",
+    "coverageCaveat": "以下仅为所列候选的样本结算，不能代表当前完整归属。",
+    "runningResult": "运行配置报告的结果：{{result}}；不代表当前编辑。",
+    "scopeTitle": "报告状态",
+    "reportNotes": "报告范围与说明",
+    "scope": {
+      "unmatchedConfig": "以下仅供查看运行配置报告；当前编辑与报告未核对，不能据此判断当前节点或规则。",
+      "previous": "上次结果，需刷新后再判断当前路由。",
+      "applied": "已在所列运行代加载；仅描述组网路由层。",
+      "preview": "配置预览，尚待应用。",
+      "pending": "已保存或采样，尚无内核加载确认。"
+    },
+    "load": {
+      "startupReady": "内核启动已确认加载代。",
+      "fileWrittenUnacknowledged": "文件已写入，重载未确认。",
+      "loadFailed": "加载失败，网段归属未知。",
+      "unknown": "没有可用的加载证据。"
+    },
+    "sampledAt": "采样时间：{{time}}",
+    "layerBoundary": "只报告组网强制路由层，不是连通测试，也不证明每条连接的最终出口。",
+    "dnsUnknown": "按名解析归属未知。",
+    "dnsOwner": "当前按名解析选中「{{node}}」。",
+    "singleDns": "当前只配置一个 Tailscale DNS 承接者；其他 tailnet 的名称不保证可解析。",
+    "precedingExceptions": "自定义流量规则与应用规则先于本组网层。",
+    "customRule": "自定义流量规则可能改写这些网段的出口。",
+    "appRule": "应用规则可能改写这些网段的出口。",
+    "otherException": "前置规则可能改变最终出口。",
+    "noResults": "本报告没有节点网段结果。",
+    "coverage": {
+      "full": "本层未见重叠；连通性未测试。",
+      "partial": "部分目标网段与更早候选重叠。",
+      "none": "本层没有留给此节点的目标网段。",
+      "unknown": "无法确定剩余目标网段。"
+    },
+    "leg": {
+      "preferredBy": "按策略匹配",
+      "externalRuleSet": "外部规则集",
+      "inline": "规则内网段"
+    },
+    "generated": "本轮已生成",
+    "notGenerated": "本轮未生成",
+    "requested": "目标网段与来源",
+    "noRequested": "没有可枚举的目标网段。",
+    "loadedRanges": "已加载组网层的剩余网段",
+    "calculatedRanges": "计算剩余网段；加载未确认",
+    "effectiveUnknown": "未知；这里不能视为空网段。",
+    "zeroEffective": "本层确认剩余零网段。",
+    "zeroCalculated": "按此样本计算，没有剩余网段；当前加载未确认。",
+    "possibleRuleOverlap": "可能覆盖组网目的",
+    "possibleRuleOverlapKnown": "此 IP 规则先于组网路由层，可能命中报告中的目标网段；实际连接路径尚未验证。",
+    "possibleRuleOverlapUnknown": "组网网段报告不完整或尚未加载；此 IP 规则先执行，无法排除它覆盖组网目的。",
+    "possibleRuleOverlapPrevious": "上次报告的目标网段与此 IP 规则相交；当前连接路径仍待确认。",
+    "catchAllExcluded": "公网兜底段不计入此子网报告：{{cidrs}}。",
+    "blockedTitle": "重叠范围与更早候选",
+    "blockedConfirmed": "本层已证实的先行归属：「{{node}}」",
+    "blockedCandidate": "更早候选「{{node}}」，归属未确认",
+    "sourceDetails": "来源与加载明细",
+    "engaged": {
+      "alwaysRouteSubnets": "已启用自动子网路由",
+      "selected": "已选择此节点",
+      "ruleTargeted": "规则指定此节点",
+      "other": "参与原因见报告。"
+    },
+    "configured": "配置网段",
+    "observed": "观测地址",
+    "noRanges": "没有记录网段。",
+    "noObservation": "没有地址观测；默认池重叠不能证明账号重复。",
+    "fileReadFailed": "引用的网段文件读取失败。",
+    "fileSampled": "引用文件采样：{{time}}",
+    "timeUnknown": "时间未知",
+    "uncertainReasons": "结果不确定的原因",
+    "invalid": "无效网段",
+    "source": {
+      "declared": "用户声明",
+      "observed": "网络观测",
+      "retained": "从早前样本保留",
+      "bootstrap": "默认地址池推算",
+      "opaque": "范围不可枚举"
+    },
+    "reason": {
+      "opaqueMatchSet": "匹配范围不可枚举。",
+      "earlierOpaqueMatchSet": "更早候选的匹配范围未知。",
+      "invalidCidr": "配置网段无效。",
+      "inputLimitExceeded": "输入网段数超过上限。",
+      "resourceLimitExceeded": "网段计算超过资源上限。",
+      "snapshotStale": "采样已过期。",
+      "fileReadFailed": "引用文件读取失败。",
+      "fileParseFailed": "引用文件含无效网段。",
+      "fileLoadUnacknowledged": "文件重载未确认。",
+      "runningArtifactMissing": "运行中的产物不可读取。",
+      "generationFailed": "此节点路由未生成。",
+      "other": "其他证据暂不可用。"
+    },
+    "legacy": "当前版本无法提供可核实的路由归属报告。"
   }
 }

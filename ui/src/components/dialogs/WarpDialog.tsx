@@ -21,21 +21,27 @@ import { useStagedConfigStore } from '@/store/staged-config-store';
 import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 import { api } from '@/ipc';
 import type { ServerConfig, WireGuardSettings } from '@/contracts/types';
-import { findWarpNode, WARP_MTU } from '@/domain/warp';
+import { findWarpNode } from '@/domain/warp';
 import { registerWarpIfSlotFree } from '@/domain/mesh-singleton-guard';
 import { Modal } from './Modal';
 import {
   FormSection,
-  type FieldSpec,
   type FormValue,
   type FormValues,
   type SelectOption,
 } from './FieldSpec';
 import { applyDetour, endpointDetourOptions, DETOUR_NONE } from './detour-options';
+import {
+  WARP_DEFAULT_NAME,
+  planWarpSubmit,
+  warpAdvancedSpec,
+  warpDraftFromNode,
+  type WarpPlan,
+} from './warp-spec';
 // 表单 → WireGuardSettings 的整段接线共用 `wg-logic.ts`；WARP 内部的路由/接入模式也在提交边界收口，
 // 不能只靠「界面没展示」来假定旧配置里不存在。
 import { buildWarpSettings, workersInputInvalid } from './wg-logic';
-import { applyOnDemand, onDemandDraftValue, ON_DEMAND_FIELD } from './on-demand-field';
+import { applyOnDemand } from './on-demand-field';
 import { useDialogStore } from './dialog-store';
 import { InfoIcon } from '@/components/InfoIcon';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -50,52 +56,8 @@ function WarpIcon() {
   );
 }
 
-/** "host:port" → {host,port}；非法返 null（IPv6 用 [::1]:port）。 */
-function parseHostPort(ep: string): { host: string; port: number } | null {
-  const s = ep.trim();
-  if (!s) return null;
-  let host: string;
-  let portStr: string;
-  if (s.startsWith('[')) {
-    const c = s.indexOf(']');
-    if (c < 0) return null;
-    host = s.slice(1, c);
-    const rest = s.slice(c + 1);
-    if (!rest.startsWith(':')) return null;
-    portStr = rest.slice(1);
-  } else {
-    const i = s.lastIndexOf(':');
-    if (i < 0) return null;
-    host = s.slice(0, i);
-    portStr = s.slice(i + 1);
-  }
-  const port = Number(portStr);
-  if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) return null;
-  return { host, port };
-}
-
-function advSpec(
-  detourOpts: readonly SelectOption[],
-  endpointPlaceholder: string,
-  interfaceOpts: readonly SelectOption[],
-): FieldSpec[] {
-  return [
-    { t: 'text', k: 'endpoint', label: 'warp.endpoint', ph: endpointPlaceholder, mono: true },
-    { t: 'number', k: 'mtu', label: 'warp.mtu', ph: String(WARP_MTU), mono: true, opt: true },
-    { t: 'number', k: 'workers', label: 'wg.workers', hint: 'wg.workersHint', mono: true, opt: true },
-    { t: 'number', k: 'keepalive', label: 'warp.keepalive', ph: '25', mono: true, opt: true },
-    // 前置代理 —— **对 上游的有意偏离**（它的 WARP 表单没有这一项）。本轮之前这个控件是个
-    // **装饰开关**：值写进了 `server.detour`，但 Rust 侧 `Endpoint` 结构体压根没有 detour 字段，
-    // 序列化时被丢掉。现已真生效（`builder/outbounds.rs` 的 WG endpoint 腿）。
-    //
-    // hint 那句 UDP 与 `WgDialog` 同源同因：WARP 就是 WireGuard，握手走 UDP，前置代理不支持
-    // UDP 转发就静默不通且不回落直连（实测见 `singbox/endpoint.rs`）。
-    { t: 'select', k: 'detour', label: 'warp.detour', options: detourOpts, hint: 'warp.detourHint' },
-    { t: 'select', k: 'bindInterface', label: 'node.bindInterface', options: interfaceOpts, hint: 'node.bindInterfaceHint' },
-    ON_DEMAND_FIELD,
-  ];
-}
-
+/* 字段表 / 端点解析 / 提交前校验住在 `./warp-spec`（零 React，两个客户端共用；见那份文件头注）。
+   桌面「多 VPN 兼容」批新加的 `ON_DEMAND_FIELD` 与草稿里的 `onDemand` 初值已随表搬进那份文件。 */
 interface WarpFormProps {
   editNode?: ServerConfig;
   servers: ServerConfig[];
@@ -118,35 +80,11 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
   // `TsSettingsDialog` 同一个函数，排除判据一处定义、三处生效。
   const detourOpts = endpointDetourOptions(servers, editNode?.id, t('node.detourDirect'));
 
-  // R1 同步初始化。
-  const initWs = editNode?.wireguardSettings;
-  // 新建默认名 `WARP`（不是 `Cloudflare WARP`）：节点卡的名字位很窄，长名会被截断成「Cloudflare W…」，
-  // 而「Cloudflare」这一段对用户毫无区分度 —— 单例槽位里只可能有一个 WARP。改名不影响身份判定：
-  // `isWarpServer` 认的是 `warpDevice` 凭据与 `*.cloudflareclient.com` 端点域名，从不看 name。
-  const [name, setName] = useState(editNode?.name ?? 'WARP');
-  const [plan, setPlan] = useState<'free' | 'plus'>('free');
+  // R1 同步初始化。默认名与草稿缺省都取自 `warp-spec`（两端共用，不在这里再写一份）。
+  const [name, setName] = useState(editNode?.name ?? WARP_DEFAULT_NAME);
+  const [plan, setPlan] = useState<WarpPlan>('free');
   const [license, setLicense] = useState('');
-  const [draft, setDraft] = useState<FormValues>(() =>
-    editNode
-      ? {
-          endpoint: `${editNode.address}:${editNode.port}`,
-          mtu: initWs?.mtu,
-          workers: initWs?.workers,
-          keepalive: initWs?.persistentKeepalive,
-          detour: editNode.detour || DETOUR_NONE,
-          bindInterface: editNode.bindInterface ?? '',
-          onDemand: onDemandDraftValue(editNode),
-        }
-      : {
-          endpoint: '',
-          mtu: undefined,
-          workers: undefined,
-          keepalive: undefined,
-          detour: DETOUR_NONE,
-          bindInterface: '',
-          onDemand: false,
-        },
-  );
+  const [draft, setDraft] = useState<FormValues>(() => warpDraftFromNode(editNode));
   const interfaceOpts: SelectOption[] = buildNetworkInterfaceChoices(
     interfaces.items,
     typeof draft.bindInterface === 'string' ? draft.bindInterface : '',
@@ -156,7 +94,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       down: t('settings.network.interfaceDown'),
     },
   ).map(({ value, label, disabled }) => [value, label, disabled]);
-  const spec = advSpec(detourOpts, t('warp.endpointAuto'), interfaceOpts);
+  const spec = warpAdvancedSpec(detourOpts, t('warp.endpointAuto'), interfaceOpts);
 
   const [errName, setErrName] = useState(false);
   const [errLicense, setErrLicense] = useState(false);
@@ -283,18 +221,25 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       close();
       return;
     }
-    if (!name.trim()) {
+    /* 三档拒绝走**共用**判据 `planWarpSubmit`（`warp-spec.ts`），移动端消费的是同一个函数 ——
+       两端各写一份 `if` 必然在某天对同一份输入给出不同结论。 */
+    const plan_ = planWarpSubmit({
+      name,
+      plan,
+      license,
+      endpointRaw: String(draft.endpoint ?? ''),
+      isEdit,
+    });
+    if (plan_.reject === 'name') {
       setErrName(true);
       return;
     }
-    if (plan === 'plus' && !license.trim()) {
+    if (plan_.reject === 'license') {
       setErrLicense(true);
       return;
     }
     // M6：端点解析失败必须内联报错并保持弹窗打开，不得静默回退旧地址后假装提交成功。
-    const endpointRaw = String(draft.endpoint ?? '').trim();
-    const ep = endpointRaw ? parseHostPort(endpointRaw) : null;
-    if ((endpointRaw && !ep) || (isEdit && !ep)) {
+    if (plan_.reject === 'endpoint') {
       toast.error(t('warp.errEndpoint'));
       return;
     }
@@ -302,6 +247,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       toast.error(t('wg.errWorkers'));
       return;
     }
+    const ep = plan_.endpoint;
     setSubmitting(true);
     try {
       if (isEdit) {

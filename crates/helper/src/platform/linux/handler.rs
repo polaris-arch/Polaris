@@ -16,6 +16,7 @@
 //! 核 spawn（start 命令）经 [`CoreSpawner`] trait 抽象（生产用真实 AmbientCaps
 //! 派生，测试 mock）。进程状态放在 [`HandlerState`]（实例化可测）。
 
+use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -24,8 +25,9 @@ use std::time::Instant;
 use crate::line_io;
 use polaris_helper_proto::command::{common as cmd, linux as lcmd};
 use polaris_helper_proto::{
-    parse_stop_pid, stop_pid_matches, Error as ProtoError, ErrorCode, LinuxDns, Response,
-    ResponseKind, Start, StartTiming, Stop,
+    parse_linux_birth_stop_args, parse_stop_pid, stop_pid_matches, Error as ProtoError, ErrorCode,
+    HelperBirthToken, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns, Response,
+    ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
 };
 
 use crate::core_install::InstallResult;
@@ -36,7 +38,10 @@ use crate::platform::linux::core_installer::install_core;
 use crate::platform::linux::freeport::{free_port, parse_ss_pids, FreePortDeps};
 use crate::platform::linux::ops::SystemdOps;
 use crate::platform::linux::resolved_dns::ResolvedDnsOps;
-use crate::platform::linux::state::{CoreSpawner, HandlerState, SpawnCoreRequest, SpawnError};
+use crate::platform::linux::state::{
+    BirthAdmission, CoreSpawner, HandlerState, ManagedChild, ReapBlockerState, SpawnCoreRequest,
+    SpawnError, StartAdmission, StopReap,
+};
 
 /// Linux helper protoVersion（三平台统一演进，见 `polaris_helper_proto` crate 文档）。
 pub const PROTO_VERSION: u32 = polaris_helper_proto::proto_version::CURRENT;
@@ -73,9 +78,18 @@ pub struct HandlerDeps<'a, P: PeerCredProvider, S: CoreSpawner, D: FreePortDeps,
 pub trait Conn: Send {
     /// 读一行（trim 尾部 \n/\r）。EOF / 读失败返回 ""（对齐 Go readLine 的 ReadString 行为）。
     fn read_line(&mut self) -> String;
+    /// Exact-birth framing distinguishes EOF from an empty/extra line and
+    /// treats timeout, invalid UTF-8, or overlong input as a hard error.
+    fn read_line_strict(&mut self) -> Result<Option<String>, StrictReadError> {
+        Err(StrictReadError)
+    }
     /// 写一行（自动加 \n）。返回是否写成功。
     fn write_line(&mut self, line: &str) -> bool;
 }
+
+/// Exact command framing failed before a complete line or EOF was observed.
+#[derive(Debug, Clone, Copy)]
+pub struct StrictReadError;
 
 /// 把任意 Read + Write 包成 BufRead 行 IO（生产 unix socket adapter 用）。
 ///
@@ -98,6 +112,14 @@ impl<RW: Read + Write + Send> Conn for LineConn<RW> {
     fn read_line(&mut self) -> String {
         // Conn 契约：EOF/读失败与空行一律 ""（对齐 Go readLine 的 ReadString 行为）。
         line_io::read_line_trimmed(&mut self.inner).unwrap_or_default()
+    }
+
+    fn read_line_strict(&mut self) -> Result<Option<String>, StrictReadError> {
+        line_io::read_line_trimmed_bounded(
+            &mut self.inner,
+            polaris_helper_proto::codec::MAX_FRAME_BYTES,
+        )
+        .map_err(|_| StrictReadError)
     }
 
     fn write_line(&mut self, line: &str) -> bool {
@@ -192,17 +214,45 @@ fn dispatch_locked<P, S, D, SD>(
     SD: SystemdOps,
 {
     match command {
+        lcmd::STATUS_BIRTH_SAFE => handle_birth_status(state, deps, conn),
+        lcmd::STOP_BIRTH_SAFE => handle_birth_stop(state, deps, conn),
+        lcmd::START_BIRTH_SAFE => handle_start(state, deps, cred, conn, true),
+        _ if legacy_command_rejected(command, state, deps.spawner) => {
+            let _ = conn.write_line("ERR unknown");
+        }
         cmd::STATUS => handle_status(state, conn),
-        cmd::STOP => handle_stop(state, deps, conn),
+        cmd::STOP | lcmd::STOP_REAP_SAFE => handle_stop(state, deps, conn),
         cmd::CLEANUP => handle_cleanup(state, deps, cred, conn),
         cmd::FREEPORT => handle_freeport(deps, cred, conn),
         // install-core 是 linux 专属命令名（lcmd::INSTALL_CORE == "install-core"）。
         lcmd::INSTALL_CORE => handle_install_core(deps, conn),
-        cmd::START => handle_start(state, deps, cred, conn),
+        cmd::START | lcmd::START_REAP_SAFE => handle_start(state, deps, cred, conn, false),
         _ => {
             let _ = conn.write_line("ERR unknown");
         }
     }
+}
+
+fn legacy_command_rejected(
+    command: &str,
+    state: &HandlerState,
+    spawner: &impl CoreSpawner,
+) -> bool {
+    matches!(
+        command,
+        cmd::START
+            | lcmd::START_REAP_SAFE
+            | cmd::STOP
+            | lcmd::STOP_REAP_SAFE
+            | cmd::STATUS
+            | cmd::CLEANUP
+            | cmd::FREEPORT
+            | lcmd::INSTALL_CORE
+    ) && (state
+        .child
+        .as_ref()
+        .is_some_and(|child| child.handle().target().is_some())
+        || spawner.has_exact_birth())
 }
 
 // ===== 各命令处理（逐分支对照 Go 源）=====
@@ -239,14 +289,130 @@ fn single_line_wire_detail(detail: &str) -> String {
 
 /// status（:363-368）：running `<pid>` 或 stopped。
 fn handle_status(state: &HandlerState, conn: &mut impl Conn) {
-    if let Some(h) = state.child.as_ref() {
+    if let Some(h) = state.child.as_ref().map(ManagedChild::handle) {
         let _ = conn.write_line(&format!("OK running {}", h.pid));
     } else {
         let _ = conn.write_line("OK stopped");
     }
 }
 
-/// stop（:369-380）：**受管 pid 身份校验** → 摘除 child + 后台收割 + 复位转发态。
+fn handle_birth_status<P, S, D, SD>(
+    state: &HandlerState,
+    deps: &HandlerDeps<'_, P, S, D, SD>,
+    conn: &mut impl Conn,
+) where
+    P: PeerCredProvider,
+    S: CoreSpawner,
+    D: FreePortDeps,
+    SD: SystemdOps,
+{
+    if !matches!(conn.read_line_strict(), Ok(None)) {
+        let _ = conn.write_line("ERR bad-args");
+        return;
+    }
+    let current = state.child.as_ref().map(ManagedChild::handle);
+    let outcome = match deps.spawner.birth_admission(current) {
+        BirthAdmission::Admitted => LinuxBirthStatus::Empty,
+        BirthAdmission::Already(target) if state.child.as_ref().is_some_and(|child| {
+            matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))
+        }) => LinuxBirthStatus::Stopping { target },
+        BirthAdmission::Already(target) => LinuxBirthStatus::Running { target },
+        BirthAdmission::Blocked {
+            target: Some(target),
+            state: ReapBlockerState::Pending,
+        } if state.child.as_ref().is_some_and(|child| {
+            matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))
+        }) => LinuxBirthStatus::Stopping { target },
+        BirthAdmission::Blocked {
+            target: Some(target),
+            ..
+        } => LinuxBirthStatus::Unknown { target },
+        BirthAdmission::Blocked { target: None, .. } => {
+            let _ = conn.write_line("ERR unknown");
+            return;
+        }
+    };
+    let _ = conn.write_line(&Response::Ok(ResponseKind::LinuxBirthStatus(outcome)).to_wire_line());
+}
+
+fn handle_birth_stop<P, S, D, SD>(
+    state: &mut HandlerState,
+    deps: &HandlerDeps<'_, P, S, D, SD>,
+    conn: &mut impl Conn,
+) where
+    P: PeerCredProvider,
+    S: CoreSpawner,
+    D: FreePortDeps,
+    SD: SystemdOps,
+{
+    let (Ok(Some(pid)), Ok(Some(birth)), Ok(None)) = (
+        conn.read_line_strict(),
+        conn.read_line_strict(),
+        conn.read_line_strict(),
+    ) else {
+        let _ = conn.write_line("ERR bad-args");
+        return;
+    };
+    let Some(target) = parse_linux_birth_stop_args(&[&pid, &birth]) else {
+        let _ = conn.write_line("ERR bad-args");
+        return;
+    };
+    if let Some(current) = state.child.as_ref().map(ManagedChild::handle) {
+        match current.target() {
+            Some(current) if current != target => {
+                let response = if deps.spawner.reaped_birth(&target) {
+                    LinuxBirthStop::Stopped { target }
+                } else {
+                    LinuxBirthStop::Mismatch {
+                        requested: target,
+                        current,
+                    }
+                };
+                let _ = conn.write_line(
+                    &Response::Ok(ResponseKind::LinuxBirthStop(response)).to_wire_line(),
+                );
+                return;
+            }
+            None => {
+                // A newer Legacy child cannot hide native reap proof for an
+                // older exact birth whose Stop ACK was lost. Never pass this
+                // request to the spawner while the Legacy child is current.
+                let response = if deps.spawner.reaped_birth(&target) {
+                    LinuxBirthStop::Stopped { target }
+                } else {
+                    LinuxBirthStop::Unknown { target }
+                };
+                let _ = conn.write_line(
+                    &Response::Ok(ResponseKind::LinuxBirthStop(response)).to_wire_line(),
+                );
+                return;
+            }
+            Some(_) => {}
+        }
+    }
+    let same_current = state
+        .child
+        .as_ref()
+        .is_some_and(|child| child.handle().target() == Some(target));
+    if same_current {
+        let handle = state.child.as_ref().unwrap().handle().clone();
+        state.child = Some(ManagedChild::Stopping(handle));
+    }
+    let outcome = match deps.spawner.stop_birth(&target) {
+        StopReap::Reaped => {
+            if same_current {
+                state.child = None;
+                (deps.set_forward)(false);
+            }
+            LinuxBirthStop::Stopped { target }
+        }
+        StopReap::Pending => LinuxBirthStop::Pending { target },
+        StopReap::Unknown => LinuxBirthStop::Unknown { target },
+    };
+    let _ = conn.write_line(&Response::Ok(ResponseKind::LinuxBirthStop(outcome)).to_wire_line());
+}
+
+/// stop（:369-380）：**受管 pid 身份校验** → 启动/轮询后台终止 → 仅在 native reap 后复位转发态。
 ///
 /// 身份行（可选，本协议新增）：客户端声明它意图停的那个 pid。判据走
 /// [`stop_pid_matches`] —— 不匹配 = 手里这个核属**另一个会话**（客户端的老 stop 腿在 IPC 上挂住
@@ -268,7 +434,7 @@ fn handle_stop<P, S, D, SD>(
 {
     // 旧客户端不发这一行 → read_line 在 EOF 返 "" → None → 沿用「停当前受管核」旧语义。
     let want = parse_stop_pid(&conn.read_line());
-    if let Some(h) = state.child.as_ref() {
+    if let Some(h) = state.child.as_ref().map(ManagedChild::handle) {
         if !stop_pid_matches(want, h.pid) {
             let resp = Response::Ok(ResponseKind::Stop(Stop::Mismatch {
                 want: want.unwrap_or(0),
@@ -278,17 +444,50 @@ fn handle_stop<P, S, D, SD>(
             return;
         }
     }
-    if let Some(h) = state.child.take() {
-        let pid = h.pid;
-        // 复位转发态（:374，跟随运行中的核）。
-        (deps.set_forward)(false);
-        // 后台收割：TERM → ≤5s → KILL（Go: go func() { terminateChild(c, done) }()）。
-        // 本实现同步等待 spawner.terminate（trait 抽象，测试可控；生产 spawn task）。
-        deps.spawner.terminate(&h);
-        let _ = conn.write_line(&format!("OK stopped {pid}"));
-    } else {
-        let _ = conn.write_line("OK notrunning");
+    let Some(handle) = state.child.as_ref().map(ManagedChild::handle).cloned() else {
+        // `child == None` alone is not a reap proof: cleanup/older state may
+        // still leave a native slot. Reuse the all-slot admission scan before
+        // emitting the idempotent success response.
+        match deps.spawner.start_admission(None) {
+            StartAdmission::Admitted => {
+                let _ = conn.write_line("OK notrunning");
+            }
+            StartAdmission::Blocked { pid, state } => write_stop_blocked(conn, pid, state),
+            StartAdmission::Already { pid } => {
+                write_stop_blocked(conn, pid, ReapBlockerState::Unknown);
+            }
+        }
+        return;
+    };
+
+    let pid = handle.pid;
+    state.child = Some(ManagedChild::Stopping(handle.clone()));
+    match deps.spawner.terminate(&handle) {
+        StopReap::Reaped => {
+            // The exact native Child has been reaped. Only this branch may
+            // clear custody, reset forwarding, and acknowledge Stop success.
+            if state
+                .child
+                .as_ref()
+                .is_some_and(|child| child.handle().same_birth(&handle))
+            {
+                state.child = None;
+            }
+            (deps.set_forward)(false);
+            let response = Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }));
+            let _ = conn.write_line(&response.to_wire_line());
+        }
+        StopReap::Pending => write_stop_blocked(conn, pid, ReapBlockerState::Pending),
+        StopReap::Unknown => write_stop_blocked(conn, pid, ReapBlockerState::Unknown),
     }
+}
+
+fn write_stop_blocked(conn: &mut impl Conn, pid: u32, state: ReapBlockerState) {
+    let outcome = match state {
+        ReapBlockerState::Pending => Stop::Pending { pid },
+        ReapBlockerState::Unknown => Stop::Unknown { pid },
+    };
+    let _ = conn.write_line(&Response::Ok(ResponseKind::Stop(outcome)).to_wire_line());
 }
 
 /// cleanup（:381-388）：kill child + pkill sing-box + 复位转发态。
@@ -303,9 +502,10 @@ fn handle_cleanup<P, S, D, SD>(
     D: FreePortDeps,
     SD: SystemdOps,
 {
-    if let Some(h) = state.child.take() {
+    if let Some(h) = state.child.as_ref().map(ManagedChild::handle).cloned() {
         // :383: kill child。
         deps.spawner.kill(&h);
+        state.child = Some(ManagedChild::Stopping(h));
     }
     (deps.set_forward)(false);
     // :387: pkill -9 -U <uid> -f "sing-box run"（兜底清对端 uid 的所有 sing-box 实例）。
@@ -369,6 +569,7 @@ fn handle_start<P, S, D, SD>(
     deps: &HandlerDeps<'_, P, S, D, SD>,
     cred: &PeerCred,
     conn: &mut impl Conn,
+    exact: bool,
 ) where
     P: PeerCredProvider,
     S: CoreSpawner,
@@ -376,17 +577,106 @@ fn handle_start<P, S, D, SD>(
     SD: SystemdOps,
 {
     // :401-405: 读 singbox / cfg / log / fwd / ppid 行。
-    let singbox = conn.read_line();
-    let cfg = conn.read_line();
-    let log_path = conn.read_line();
-    let fwd = conn.read_line();
-    let ppid_str = conn.read_line();
+    let (singbox, cfg, log_path, fwd, ppid_str) = if exact {
+        let (Ok(Some(singbox)), Ok(Some(cfg)), Ok(Some(log)), Ok(Some(fwd))) = (
+            conn.read_line_strict(),
+            conn.read_line_strict(),
+            conn.read_line_strict(),
+            conn.read_line_strict(),
+        ) else {
+            let _ = conn.write_line("ERR bad-args");
+            return;
+        };
+        let ppid = match conn.read_line_strict() {
+            Ok(Some(value)) => value,
+            Ok(None) => String::new(),
+            Err(_) => {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            }
+        };
+        if !matches!(conn.read_line_strict(), Ok(None)) {
+            let _ = conn.write_line("ERR bad-args");
+            return;
+        }
+        (singbox, cfg, log, fwd, ppid)
+    } else {
+        (
+            conn.read_line(),
+            conn.read_line(),
+            conn.read_line(),
+            conn.read_line(),
+            conn.read_line(),
+        )
+    };
     let ppid: u32 = ppid_str.trim().parse().unwrap_or(0);
 
-    // :407-410: 已有 child → already。
-    if let Some(h) = state.child.as_ref() {
-        let _ = conn.write_line(&format!("OK already {}", h.pid));
-        return;
+    // Admission precedes `already`, validation, forwarding, and spawn. The
+    // production spawner inspects every retained native slot, including births
+    // no longer represented by this handler state.
+    let current_running = state.child.as_ref().and_then(ManagedChild::running);
+    if exact {
+        // Include Stopping in the custody scan. A state-held birth whose
+        // registry slot vanished without native proof must block admission.
+        let current = state.child.as_ref().map(ManagedChild::handle);
+        match deps.spawner.birth_admission(current) {
+            BirthAdmission::Admitted => state.child = None,
+            BirthAdmission::Already(target)
+                if state.child.as_ref().is_some_and(|child| {
+                    matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))
+                }) =>
+            {
+                let response = LinuxBirthStart::NotAdmittedPending { target };
+                let _ = conn.write_line(
+                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
+                );
+                return;
+            }
+            BirthAdmission::Already(target) => {
+                let response = LinuxBirthStart::Already { target };
+                let _ = conn.write_line(
+                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
+                );
+                return;
+            }
+            BirthAdmission::Blocked {
+                target,
+                state: blocker,
+            } => {
+                let response = match (target, blocker) {
+                    (Some(target), ReapBlockerState::Pending) => {
+                        LinuxBirthStart::NotAdmittedPending { target }
+                    }
+                    (target, _) => LinuxBirthStart::NotAdmittedUnknown { target },
+                };
+                let _ = conn.write_line(
+                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
+                );
+                return;
+            }
+        }
+    } else {
+        match deps.spawner.start_admission(current_running) {
+            StartAdmission::Admitted => {
+                // A stale Running/Stopping state can be cleared only because the
+                // admission scan observed its exact slot as Reaped.
+                state.child = None;
+            }
+            StartAdmission::Already { pid } => {
+                let response = Response::Ok(ResponseKind::Start(Start::Already { pid }));
+                let _ = conn.write_line(&response.to_wire_line());
+                return;
+            }
+            StartAdmission::Blocked { pid, state } => {
+                let blocked = match state {
+                    ReapBlockerState::Pending => StartNotAdmitted::Pending { pid },
+                    ReapBlockerState::Unknown => StartNotAdmitted::Unknown { pid },
+                };
+                let response = Response::Ok(ResponseKind::Start(Start::NotAdmitted(blocked)));
+                let _ = conn.write_line(&response.to_wire_line());
+                return;
+            }
+        }
     }
     // :411-413: cfg 空 → bad-args。
     let cfg = cfg.trim();
@@ -443,6 +733,25 @@ fn handle_start<P, S, D, SD>(
         let _ = conn.write_line("ERR log-path-denied");
         return;
     }
+    if let Err(error) = deps.spawner.validate_start_environment() {
+        let _ = conn.write_line(&format!(
+            "ERR {}",
+            single_line_wire_detail(&error.to_string())
+        ));
+        return;
+    }
+    let birth = if exact {
+        match mint_birth_token() {
+            Ok(token) => Some(token),
+            Err(error) => {
+                log::error!("Linux helper could not mint birth token: {error}");
+                let _ = conn.write_line("ERR start birth-entropy");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     // 从已通过参数/路径/属主校验后开始计时：拒绝腿不伪装成“起核耗时”。
     let total_started = Instant::now();
     // :429: 显式跟随本次会话的转发态。
@@ -455,6 +764,7 @@ fn handle_start<P, S, D, SD>(
     // 测试 mock 返回固定 pid。
     let process_prepare_started = Instant::now();
     let req = SpawnCoreRequest {
+        birth,
         binary: core_bin.clone(),
         config: PathBuf::from(cfg),
         log: if log_path.trim().is_empty() {
@@ -474,20 +784,37 @@ fn handle_start<P, S, D, SD>(
     match deps.spawner.spawn(&req) {
         Ok(started) => {
             let pid = started.handle.pid;
-            state.child = Some(started.handle);
+            let target = started.handle.target();
+            state.child = Some(ManagedChild::Running(started.handle));
             let process_ms = started.process_ms.saturating_add(process_prepare_ms);
-            let response = Response::Ok(ResponseKind::Start(Start::StartedTimed {
-                pid,
-                timing: StartTiming {
-                    forwarding_ms,
-                    process_ms,
-                    job_ms: 0,
-                    log_handoff_ms: started.log_handoff_ms,
-                    total_ms: crate::elapsed_ms(total_started),
-                },
-                // 身份令牌是 Windows 专属（Q6：mac/linux 的 running_exe_path 本就可观测）。
-                created: None,
-            }));
+            let timing = StartTiming {
+                forwarding_ms,
+                process_ms,
+                job_ms: 0,
+                log_handoff_ms: started.log_handoff_ms,
+                total_ms: crate::elapsed_ms(total_started),
+            };
+            let response = if exact {
+                match target {
+                    Some(target) => {
+                        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
+                            target,
+                            timing: Some(timing),
+                        }))
+                    }
+                    None => {
+                        // A broken spawner cannot publish a successful exact birth.
+                        let _ = conn.write_line("ERR start missing-birth");
+                        return;
+                    }
+                }
+            } else {
+                Response::Ok(ResponseKind::Start(Start::StartedTimed {
+                    pid,
+                    timing,
+                    created: None,
+                }))
+            };
             let _ = conn.write_line(&response.to_wire_line());
         }
         Err(SpawnError::Spawn { detail }) => {
@@ -496,6 +823,12 @@ fn handle_start<P, S, D, SD>(
             let _ = conn.write_line(&format!("ERR start {detail}"));
         }
     }
+}
+
+fn mint_birth_token() -> std::io::Result<HelperBirthToken> {
+    let mut bytes = [0; 16];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(HelperBirthToken::from_bytes(bytes))
 }
 
 #[cfg(test)]

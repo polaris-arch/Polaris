@@ -2695,60 +2695,43 @@ fn auto_close_timer_is_generation_guarded() {
         );
 }
 
-/// 🔴 detached spawn 失败时，任何退出副作用都不能发生；成功后必须严格 Quit → Exit，各一次。
-///
-/// **变异探针**：在 `?` 前先调 `mark_quit()` ⇒ 错误腿的 effects 非空，行为门转红。
+/// Detached spawn 失败不得提交退出；成功后消费持锁的 Ready，提交失败也不得报成功。
 #[test]
 fn complete_detached_install_owns_success_effects_and_leaves_errors_untouched() {
     let effects = std::cell::RefCell::new(Vec::new());
-    let failed: Result<(), &str> = complete_detached_install(
-        Err("spawn failed"),
-        || effects.borrow_mut().push("quit"),
-        || effects.borrow_mut().push("exit"),
-    );
-    assert_eq!(failed, Err("spawn failed"), "错误必须原样交回调用者");
-    assert!(
-        effects.borrow().is_empty(),
-        "detached spawn 失败时不得宣告退出或退出进程"
-    );
-
-    let completed: Result<&str, &str> = complete_detached_install(
-        Ok("detached-script"),
-        || effects.borrow_mut().push("quit"),
-        || effects.borrow_mut().push("exit"),
-    );
+    let failed: Result<(), &str> = complete_detached_install(Err("spawn failed"), || {
+        effects.borrow_mut().push("commit");
+        Ok(())
+    });
+    assert_eq!(failed, Err("spawn failed"));
+    assert!(effects.borrow().is_empty());
+    let completed: Result<&str, &str> = complete_detached_install(Ok("detached-script"), || {
+        effects.borrow_mut().push("commit");
+        Ok(())
+    });
     assert_eq!(completed, Ok("detached-script"));
-    assert_eq!(
-        effects.into_inner(),
-        vec!["quit", "exit"],
-        "成功路径必须严格先 Quit、再 Exit，且两者各一次"
-    );
+    assert_eq!(*effects.borrow(), vec!["commit"]);
+    let rejected: Result<&str, &str> =
+        complete_detached_install(Ok("detached-script"), || Err("ready invalid"));
+    assert_eq!(rejected, Err("ready invalid"));
 }
 
-/// 调用点只负责执行 spawn 并提供两条同步副作用；控制流、错误隔离与先后次序都归
-/// [`complete_detached_install`]。这个接线契约防止 command 重新在 helper 外越权置状态或 exit。
 #[test]
 fn update_install_delegates_detached_spawn_to_completion_helper() {
     let body =
         crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
-    assert!(
-        body.contains("let detached_spawn = update_install::spawn_detached_script(&dir, &spec);"),
-        "command 必须先实际执行 detached spawn，再把它的 Result 交控制流 helper"
-    );
-    assert_eq!(
-        body.matches("complete_detached_install(").count(),
-        1,
-        "update_install 必须只把这一处 spawn Result 交给 completion helper"
-    );
-    assert!(
-        body.contains("|| mark_explicit_update_quit(&app)")
-            && body.contains("|| exit_after_detached_update(&app)"),
-        "command 只能注入 Quit/Exit 副作用，不得自管成功控制流"
-    );
-    assert!(
-        !body.contains("app.state::<QuitState>()") && !body.contains("app.exit(0)"),
-        "QuitState 与 app.exit 均不得在 command helper 外直接执行"
-    );
+    let prepare = body.find("prepare_desktop_exit(&app).await").unwrap();
+    let spawn = body
+        .find("let detached_spawn = update_install::spawn_detached_script(&dir, &spec);")
+        .unwrap();
+    let complete = body
+        .find("complete_detached_install(detached_spawn, || {")
+        .unwrap();
+    assert!(prepare < spawn && spawn < complete);
+    assert_eq!(body.matches("complete_detached_install(").count(), 1);
+    assert!(body[complete..].contains("commit_desktop_exit("));
+    assert!(!body.contains("app.state::<QuitState>()") && !body.contains("app.exit(0)"));
+    assert!(!body.contains("proxy.status().running") && !body.contains("proxy.stop().await"));
 }
 
 // ── 更新进度快照槽：切走再切回来不丢进度 ────────────────────────────────
@@ -2932,5 +2915,202 @@ fn update_get_progress_returns_the_slot_and_never_fabricates_an_idle_frame() {
     assert!(
         !body.contains("\"status\""),
         "回读腿不得自己拼装任何进度态：它只是把槽里的那一帧原样交出去"
+    );
+}
+
+/// 🔴 **次序锁：Android 那条腿必须在「停代理」与「写脚本」之前整条早退。**
+///
+/// # 为什么次序是判据本体，而不是风格
+///
+/// `update_install` 的后半段做三件不可逆的事：停代理 → 写脚本 → `spawn` + 退出应用。
+/// Android 上这三件一件都不该做（成因见 [`crate::runtime::update_install::InstallPlatform`] 的
+/// `Android` 文档）。而**「交给系统安装器」返回之后用户还没决定装不装** —— 排在它后面的每一行
+/// 都会把「用户还在看确认框」当成「已经装完」。
+///
+/// 最坏的一形是把 Android 分支写在 `proxy.stop()` 之后：功能看起来完全正常（安装器照样弹出来），
+/// 只有在用户按「取消」时才暴露 —— 隧道已经被停了，而应用以为自己什么都没做。
+/// 那种缺陷跑一次 happy path 是抓不到的，只有次序判据抓得到。
+///
+/// # 为什么是源码扫描
+///
+/// 这条不变式的两端（`State<'_, AppRuntime>` 与 Tauri `AppHandle`）在单测里构造不出来，
+/// 而它守的是**控制流位置**，不是某个函数的返回值。同一理由见本文件
+/// `update_install_delegates_detached_spawn_to_completion_helper`。
+#[test]
+fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
+
+    let android = body
+        .find("if plan.platform == update_install::InstallPlatform::Android {")
+        .expect("Android 分流不见了 —— 那条腿会掉进桌面的脚本路径");
+    let prepare = body
+        .find("crate::exit_lifecycle::prepare_desktop_exit(&app).await")
+        .expect("严格退出准备门不见了 —— 本条次序判据失去了它要比的另一端");
+    let script = body
+        .find("update_install::build_install_script(&plan, &texts)")
+        .expect("建脚本那一步不见了 —— 本条次序判据失去了它要比的另一端");
+
+    assert!(
+        android < prepare,
+        "Android 分流必须在停代理**之前**：用户在系统确认框上按取消之后，\
+         留下的不该是一条已经被停掉的隧道"
+    );
+    assert!(
+        android < script,
+        "Android 分流必须在建脚本**之前**：Android 上没有脚本腿，走到那里只能造一个假的"
+    );
+
+    // 早退必须是真的早退（`return`），不是算完一个值又往下走。
+    let detach = body
+        .find("update_install::spawn_detached_script(&dir, &spec)")
+        .expect("安装器启动不见了");
+    assert!(prepare < detach, "安装器必须等待严格退出准备成功");
+    let branch = &body[android..prepare];
+    assert!(
+        branch.contains("return Ok("),
+        "Android 分支必须整条 return —— 落下去就会碰到后面那三件不可逆的事"
+    );
+    // 「交出去了」与「交不出去但知道为什么」必须分开回报：压成一句「安装失败」正是这条腿
+    // 要消灭的形态（没授予「安装未知应用」的用户按一下开关就能继续）。
+    assert!(
+        branch.contains("\"awaitingSystemInstaller\": true")
+            && branch.contains("\"awaitingSystemInstaller\": false"),
+        "两种结局必须各有各的回包，不许折成一个"
+    );
+    assert!(
+        branch.contains("\"reason\": reason"),
+        "交不出去时必须把 Kotlin 侧的原因码原样带回来，不许吞掉"
+    );
+    // 🔴 **判据键不许与 `handedToSystem` 共用**（2026-09-06 补，复审抓到的真缺陷）。
+    //
+    // `handedToSystem` 在本仓只有一个产地：上面那条**失败**路径（形态错配 ⇒ 放弃安装、
+    // 回退 `shell.open`，见 `\"handedToSystem\": opened`）。前端唯一的消费点
+    // `ui/.../use-app-update.ts` 是 `if (result.handedToSystem || result.reason === 'form-mismatch')`
+    // ⇒ 命中即 `settleInstall('error', formMismatch)`。Android **成功**回包如果也标它，
+    // 用户会在系统安装器弹出来的同时看到「更新失败 / 形态错配」；而 Android **失败**回包
+    // （`handedToSystem:false` + 一个 `unknown-sources-*` 码）两个条件都不成立 ⇒ 一个分支
+    // 都不进 ⇒ 卡在「安装中」一个字都不说 —— 正是这条腿声称要消灭的那句话。
+    //
+    // 这条断言的射程只有 Android 那一段（`branch`），上面那条形态错配路径照旧用它。
+    assert!(
+        !branch.contains("handedToSystem"),
+        "Android 分支复用了 `handedToSystem` —— 那个键在本仓已有唯一相反的语义（失败/回退），\
+         前端的判据按失败处理。成功要用只属于本条腿的键（`awaitingSystemInstaller`）。"
+    );
+}
+
+/// 🔴 **Android 自更新资产：从「如实登记的缺口」变成「接上了，并且被钉住」**（2026-09-13）。
+///
+/// # 这条断言的历史
+///
+/// 它上一版叫 `android_has_no_update_asset_selector_yet_and_that_is_registered`，钉的是
+/// 「今天 `AssetPlatform::from_os("android")` 返 `None`」这个事实，并在文档里列了一张
+/// 「谁把它填上，谁要一起做的四件事」的解锁清单。那张清单本批逐条做完了：
+///
+///  1. **release 真的出 APK** —— `.github/workflows/android.yml` 的 `release-apk` job
+///     （签名构建 + 开箱验 + 上传成 release 资产）。⚠️ 它要的四个签名 secret 在仓外，
+///     且今天没有任何调用方传 `publish_release: true` ⇒ **这条腿还一次都没跑过**。
+///     这不是「做完了」，是「代码侧接好了、外部前置还欠着」——两者必须分得清。
+///  2. **内核更新那一格答过题** —— `find_suitable_singbox_asset` 的 Android 臂恒 `None`，
+///     且 `core_update_check_inner` 在 Android 上零网络早退（下面 ② 逐条核对）。
+///  3. **`decide_install_plan("android", …, ".apk")`** —— `runtime::update_install::tests::
+///     android_apk_plans_the_system_installer_regardless_of_run_form` 已在。
+///  4. **前端那半** —— `ui/src/ipc/api/updater.ts` 的 `UpdateInstallResult` 现在带
+///     `awaitingSystemInstaller`，`ui/src/mobile/settings/UpdatePage.tsx` 画出了下载→交系统
+///     安装器那一跳，五个 `REASON_*` 码各有各的文案（判据在
+///     `ui/src/mobile/settings/app-update-install.test.ts`）。
+///
+/// # 于是这条断言换了对象：从「缺口还在」换成「接上了的那几条不许悄悄退回去」
+///
+/// 一条只会在「被填上那天」响一次的断言，填上之后如果只是删掉，等于把这一族的观测面清零 ——
+/// 而这一族恰恰是「改一个字符 ⇒ Android 上永远查不到更新，且一句错都不报」的那种静默故障。
+#[test]
+fn android_update_assets_are_wired_and_the_core_leg_stays_answered() {
+    // ① App 资产腿：Android 是一个正经变体，且**只有 arm64**有包。
+    assert_eq!(
+        AssetPlatform::from_os("android"),
+        Some(AssetPlatform::Android),
+        "Android 从 AssetPlatform 里消失了 —— 移动端的「检查更新」会退回结构性恒答「已是最新」"
+    );
+    let apk = polaris_updater::github::GithubAsset {
+        name: "polaris-9.9.9-android-arm64.apk".to_string(),
+        browser_download_url: "https://x/apk".to_string(),
+        size: 210,
+        digest: None,
+    };
+    let picked = polaris_updater::github::find_suitable_update_asset(
+        std::slice::from_ref(&apk),
+        AssetPlatform::Android,
+        AssetArch::Arm64,
+        false,
+    );
+    assert!(
+        picked.is_some(),
+        "选包器选不中 CI 真会产出的那个资产名 —— 命名契约两端漂了（逐字对拍在 crates/updater）"
+    );
+    assert!(
+        polaris_updater::github::find_suitable_update_asset(
+            std::slice::from_ref(&apk),
+            AssetPlatform::Android,
+            AssetArch::X64,
+            false
+        )
+        .is_none(),
+        "x86_64（模拟器）也选出了包 —— 本仓只交叉编译 aarch64，发过去的必然装不上"
+    );
+
+    // ② 内核腿：Android 上**没有可换的内核**，这一条不许随 ① 一起松掉。
+    //
+    // 命令层那道早退是零网络的（`core_update_check_inner` 的 Android 臂），源码级核对；
+    // 纯函数那道是第二闸，行为级核对。两道都在，才没有「新调用方绕过早退」的缝。
+    let core_src = polaris_source_probe::crate_source!("commands/updater/core_update.rs");
+    assert!(
+        core_src.contains("Some(AssetPlatform::Android) | None => {"),
+        "core_update_check_inner 的 Android 早退没了 —— Android 上「检查内核更新」会开始真的\
+         去打 SagerNet 的 releases API，而结果恒为「没有适配资产」"
+    );
+    // SagerNet 确实发 android 构建；本仓一个字节都不消费它。样本里同时放一份 linux/arm64，
+    // 供下面那条正面对照用 —— 只有 android 那一份的话，「Linux 也选不出」会被误读成本条塌了。
+    let singbox = [
+        polaris_updater::github::GithubAsset {
+            name: "sing-box-1.14.0-android-arm64.tar.gz".to_string(),
+            browser_download_url: "https://x/core-android".to_string(),
+            size: 10,
+            digest: None,
+        },
+        polaris_updater::github::GithubAsset {
+            name: "sing-box-1.14.0-linux-arm64.tar.gz".to_string(),
+            browser_download_url: "https://x/core-linux".to_string(),
+            size: 11,
+            digest: None,
+        },
+    ];
+    assert!(
+        polaris_updater::github::find_suitable_singbox_asset(
+            &singbox,
+            AssetPlatform::Android,
+            AssetArch::Arm64
+        )
+        .is_none(),
+        "Android 选出了内核资产 —— 换核那条腿的落点是一个可替换的可执行文件，这个形态下不存在"
+    );
+
+    // 正面对照：三个桌面平台仍然认得出来 —— 否则上面那些 `is_none()` 可能只是因为
+    // 选包器整个塌了（那时本条拿一个坏掉的判据冒充一条成立的结论）。
+    for os in ["windows", "macos", "linux"] {
+        assert!(
+            AssetPlatform::from_os(os).is_some(),
+            "{os} 也认不出来了 —— from_os 塌了，本条的每一条否定断言都不成立"
+        );
+    }
+    assert!(
+        polaris_updater::github::find_suitable_singbox_asset(
+            &singbox,
+            AssetPlatform::Linux,
+            AssetArch::Arm64
+        )
+        .is_some(),
+        "对照塌了：这份样本本该能选出 linux/arm64 内核"
     );
 }

@@ -8,11 +8,12 @@ use super::subscription::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::runtime::proxy::ProxyStatus;
 use polaris_singbox_grpc::daemon;
 use polaris_stats_engine::{
-    aggregate_signature, ConnectionEventType, ConnectionsAggregate, EmitGate, SingBoxConnection,
-    SingBoxConnectionEvent, SingBoxConnectionEvents, SingBoxStatus, StatsAggregator, Topic,
-    TrafficStats,
+    aggregate_signature, ConnectionEventType, ConnectionsAggregate, EmitGate, RuleIdentity,
+    SingBoxConnection, SingBoxConnectionEvent, SingBoxConnectionEvents, SingBoxStatus,
+    StatsAggregator, Topic, TrafficStats,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -188,6 +189,76 @@ fn closed_event_without_payload_uses_active_entry_before_removal() {
         active.conn_count(),
         0,
         "活动表仍按 CLOSED 删除，不被历史污染"
+    );
+}
+
+#[test]
+fn closed_payload_keeps_the_name_frozen_on_the_active_connection() {
+    let mut active = StatsAggregator::new();
+    active.set_named_rules(std::collections::BTreeMap::from([(
+        "rule_set=local-rs-a".into(),
+        RuleIdentity {
+            id: "r1".into(),
+            name: "原名称".into(),
+        },
+    )]));
+    let mut live = engine_conn("live", 0);
+    live.rule = "rule_set=local-rs-a".into();
+    active.on_connection_events(
+        &SingBoxConnectionEvents {
+            reset: false,
+            events: vec![SingBoxConnectionEvent {
+                kind: ConnectionEventType::New,
+                id: "live".into(),
+                connection: Some(live.clone()),
+                ..Default::default()
+            }],
+        },
+        0,
+    );
+    active.set_named_rules(std::collections::BTreeMap::new());
+    live.closed_at = 700;
+    let closed = SingBoxConnectionEvents {
+        reset: false,
+        events: vec![SingBoxConnectionEvent {
+            kind: ConnectionEventType::Closed,
+            id: "live".into(),
+            connection: Some(live.clone()),
+            closed_at: 700,
+            ..Default::default()
+        }],
+    };
+    let mut history = ClosedHistory::default();
+    history.set_core_generation(1);
+    history.apply_events(&closed, &active);
+    assert_eq!(history.entries[0].entry.rule_id.as_deref(), Some("r1"));
+    assert_eq!(
+        history.entries[0].entry.rule_name.as_deref(),
+        Some("原名称")
+    );
+    let replay = SingBoxConnectionEvents {
+        reset: true,
+        events: vec![SingBoxConnectionEvent {
+            kind: ConnectionEventType::New,
+            connection: Some(live),
+            ..Default::default()
+        }],
+    };
+    history.apply_events(&replay, &StatsAggregator::new());
+    assert_eq!(
+        history.entries[0].entry.rule_name.as_deref(),
+        Some("原名称"),
+        "流重订阅的历史回放不能抹去已冻结名称"
+    );
+    history.set_core_generation(2);
+    assert_eq!(
+        history.entries[0].entry.rule_name.as_deref(),
+        Some("原名称")
+    );
+    history.apply_events(&replay, &StatsAggregator::new());
+    assert_eq!(
+        history.entries[0].entry.rule_name, None,
+        "新核复用同 ID 不得继承旧核规则身份"
     );
 }
 
@@ -1314,6 +1385,73 @@ fn traffic_availability_reports_only_on_change() {
     );
 }
 
+#[test]
+fn stream_generation_discard_stops_teardown_frames_without_hiding_live_failure() {
+    let running = ProxyStatus {
+        running: true,
+        clash_api_port: 54321,
+        ..Default::default()
+    };
+    let port = 54321;
+    let old_generation = 7;
+    assert!(source::stream_session_current(
+        &running,
+        port,
+        old_generation,
+        old_generation,
+        false
+    ));
+
+    // stop_inner 先推进世代、再 await 真正停核：running 此时仍为 true。
+    assert!(!source::stream_session_current(
+        &running,
+        port,
+        old_generation,
+        old_generation + 1,
+        true
+    ));
+    // 停止事务中就算有人用新世代尝试建流，也不能读拆核尾帧。
+    assert!(!source::stream_session_current(
+        &running,
+        port,
+        old_generation + 1,
+        old_generation + 1,
+        true
+    ));
+    // 事务结束后旧流仍无权；新核的新流才恢复供数。
+    assert!(!source::stream_session_current(
+        &running,
+        port,
+        old_generation,
+        old_generation + 2,
+        false
+    ));
+    assert!(source::stream_session_current(
+        &running,
+        port,
+        old_generation + 2,
+        old_generation + 2,
+        false
+    ));
+    assert!(!source::stream_session_current(
+        &ProxyStatus::default(),
+        port,
+        old_generation + 2,
+        old_generation + 2,
+        false
+    ));
+
+    // 运行中的真实缺能力帧照旧沿变化沿告警；过滤依据是流归属，不是 false/零值。
+    let unavailable = SingBoxStatus {
+        traffic_available: false,
+        ..Default::default()
+    };
+    assert!(traffic_availability_changed(
+        None,
+        unavailable.traffic_available
+    ));
+}
+
 /// 首帧：速率 0（无基线），累计 + 活跃连接数即刻真实。
 ///
 /// **变异探针**：把首帧速率改成拿 `uplink_total` 本身（或拿 `Status.uplink`）⇒ 第一段转红。
@@ -1578,7 +1716,7 @@ async fn 可见性翻回true_立刻恢复() {
     visible.store(false, Ordering::Relaxed);
     assert_gate_holds(&mut gate, true, &visible, "先确认确实断着流").await;
 
-    // 另一条腿（main.rs 的 Focused 触发器）把可见性写回 true 并 bump 门代次。
+    // 另一条腿（lib.rs 的 Focused 触发器）把可见性写回 true 并 bump 门代次。
     let waker = state.clone();
     let flag = visible.clone();
     tokio::spawn(async move {
@@ -1677,6 +1815,11 @@ async fn 全部topic门控口径一致() {
 /// 长驻流下降流的动作是 drop 流，恢复的动作是**重新订阅** —— 于是判据落在建流处那一句
 /// `meter.reset()` 上：只要它在，跨越断流期的旧基线就不可能被沿用。
 ///
+/// 锚点取 `subscribe_status(` 而非 `client.subscribe_status(`：传输层已按平台拆到
+/// [`super::source`]（桌面 daemon gRPC / Android libbox 命令通道），建流那一句在 relay 里现在是
+/// `source::subscribe_status(…)`。**判据没有变松** —— 断言的仍是同一件事（建流点必须排在
+/// `meter.reset()` 之前），只是锚点跟着建流点搬了家；写死 `client.` 会让它在两个平台里只认一个。
+///
 /// 锁的是「隐藏期均速被当成当前速率」这个具体缺陷：用户隐藏窗口期间下过大文件，
 /// 切回来的瞬间状态栏闪一个与此刻无关的高速率。
 ///
@@ -1688,8 +1831,8 @@ fn 断流重订阅必须丢掉速率基线() {
     let src = module_code("runtime/stats");
     let body = crate::commands::guard_scan::top_level_fn_body(&src, "async fn run_stats_stream(");
     let subscribe_at = body
-        .find("client.subscribe_status(")
-        .expect("锚点消失：stats relay 已不走 SubscribeStatus，守卫失去判据");
+        .find("subscribe_status(")
+        .expect("锚点消失：stats relay 已不走 Status 长驻流订阅，守卫失去判据");
     let reset_at = body[subscribe_at..]
         .find("meter.reset();")
         .map(|i| i + subscribe_at)
