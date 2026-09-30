@@ -56,6 +56,7 @@
 #![deny(unsafe_code)]
 
 pub mod auth;
+pub mod claims;
 pub mod core_installer;
 pub mod daemon;
 pub mod freeport;

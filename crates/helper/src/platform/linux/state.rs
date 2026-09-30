@@ -159,6 +159,12 @@ pub enum StopReap {
 ///
 /// 对照 Go 源 start 分支的 `c.Start()`（:452）+ stop 的 `terminateChild`（:246-256）+ cleanup 的 `Kill`（:383）。
 pub trait CoreSpawner: Send + Sync {
+    /// Validate the shared deployment only for a genuinely new Start, after
+    /// parameter checks and before forwarding/spawn effects. Stop never calls
+    /// this gate. Test spawners have no shared filesystem dependency.
+    fn validate_start_environment(&self) -> Result<(), SpawnError> {
+        Ok(())
+    }
     /// Inspect every physical birth before a Start can reuse or spawn.
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         current_running.map_or(StartAdmission::Admitted, |handle| StartAdmission::Already {
