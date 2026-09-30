@@ -5,7 +5,6 @@ internal object AndroidNativeMain {
     val capabilities = setOf(
         AndroidNativeProducer.MainBridge,
         AndroidNativeProducer.MainSystem,
-        AndroidNativeProducer.MainClose,
     )
 
     fun reserveBridge(runId: String): AndroidNativeAdmission.Ticket =
@@ -48,7 +47,7 @@ internal object AndroidNativeMain {
             }
         }
 
-    /** Caller first confirms native CloseService/Close, then releases this exact registry owner. */
+    /** Operational close releases the registry; global DNS and native leases remain unproved. */
     fun settleAfterExactRelease(attempt: MainKernelAttempt<*>) =
         settleAfterExactRelease(AndroidNativeAdmissionGate.ledger, attempt)
 
@@ -61,7 +60,9 @@ internal object AndroidNativeMain {
             return
         }
         if (attempt.prepared.getNow(null) != null) {
-            if (!ledger.closedExact(ticket)) ledger.unknown(ticket)
+            // Ordinary CommandServer Close does not prove process-global resolver
+            // drainage or all native leases. Never promote a born main owner.
+            ledger.unknown(ticket)
         } else if (!ledger.cancelBeforeBirth(ticket)) {
             ledger.unknown(ticket)
         }

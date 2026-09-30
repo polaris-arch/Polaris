@@ -259,7 +259,7 @@ class AndroidNativeControlOperationTest {
         assertFalse(attempt.constructionUnknown)
     }
 
-    @Test fun existingOwnerCleanupStillSettlesAfterSealOrCapacityClosure() {
+    @Test fun existingOwnerCleanupStillRunsAfterSealOrCapacityButProofStaysUnknown() {
         for (capacity in listOf(false, true)) {
             val ledger = ledger(if (capacity) 3 else AndroidNativeAdmission.DEFAULT_MAX_METADATA_RECORDS)
             val attempt = owner(ledger)
@@ -269,7 +269,7 @@ class AndroidNativeControlOperationTest {
             assertNull(attempt.closed.get(3, TimeUnit.SECONDS))
             attempt.released.complete(Unit)
             AndroidNativeMain.settleAfterExactRelease(ledger, attempt)
-            assertEquals(AndroidNativeAdmission.State.ClosedExact, ledger.state(attempt.nativeTicket!!))
+            assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(attempt.nativeTicket!!))
         }
     }
 

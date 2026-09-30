@@ -45,7 +45,8 @@ class MainNativeAdmissionWiringTest {
         assertTrue(adapter.contains("ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, runId)"))
         assertTrue(adapter.contains("ledger.enterBirth(ticket)"))
         assertTrue(adapter.contains("attempt.released.isDone"))
-        assertTrue(adapter.contains("ledger.closedExact(ticket)"))
+        assertFalse(adapter.contains("ledger.closedExact(ticket)"))
+        assertFalse(AndroidNativeMain.capabilities.contains(AndroidNativeProducer.MainClose))
     }
 
     @Test fun sealDuringPendingToAttemptTransferCannotCreateNativeServer() {
@@ -73,7 +74,7 @@ class MainNativeAdmissionWiringTest {
             ledger.receipt("fence-1").captured.single().state)
     }
 
-    @Test fun enteredOwnerSettlesOnlyAfterExactRegistryRelease() {
+    @Test fun successfulOperationalCloseReleasesRegistryButBornOwnerRemainsUnknown() {
         val ledger = AndroidNativeAdmission("process-1").also { it.bootstrap(RequiredMarkerProof.Absent) }
         val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "run-1")
         val attempt = MainKernelAttempt<String>(runId = "run-1", nativeTicket = ticket)
@@ -88,9 +89,39 @@ class MainNativeAdmissionWiringTest {
             ledger.receipt("fence-1").captured.single().state)
         assertTrue(registry.completeAfterClose(attempt) {})
         assertTrue(attempt.released.isDone)
+        assertTrue(registry.isVacant())
+        assertEquals("AlreadyGone", registry.exactStatus(MainKernelExactTarget(attempt.runId, attempt.birthNonce)).state)
         AndroidNativeMain.settleAfterExactRelease(ledger, attempt)
-        assertEquals(AndroidNativeAdmission.State.ClosedExact,
+        assertEquals(AndroidNativeAdmission.State.Unknown,
             ledger.receipt("fence-1").captured.single().state)
+    }
+
+    @Test fun genuinelyUnbornMainStillCancelsAfterSuccessfulOperationalRelease() {
+        val ledger = AndroidNativeAdmission("process-1").also { it.bootstrap(RequiredMarkerProof.Absent) }
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "unborn")
+        val attempt = MainKernelAttempt<String>(runId = "unborn", nativeTicket = ticket)
+        val registry = MainKernelAttemptLedger()
+        assertTrue(registry.claim(attempt))
+        attempt.skipPreparation()
+        attempt.closeOnce { assertEquals(null, it) }
+        assertEquals(null, attempt.closed.get(2, TimeUnit.SECONDS))
+        assertTrue(registry.completeAfterClose(attempt) {})
+        AndroidNativeMain.settleAfterExactRelease(ledger, attempt)
+        assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth, ledger.state(ticket))
+        assertTrue(registry.isVacant())
+    }
+
+    @Test fun enteredButUnpublishedMainCannotClaimNoBirthAfterSuccessfulEmptyClose() {
+        val ledger = AndroidNativeAdmission("process-1").also { it.bootstrap(RequiredMarkerProof.Absent) }
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "entered")
+        val attempt = MainKernelAttempt<String>(runId = "entered", nativeTicket = ticket)
+        assertTrue(ledger.enterBirth(ticket))
+        attempt.skipPreparation()
+        attempt.closeOnce { assertEquals(null, it) }
+        assertEquals(null, attempt.closed.get(2, TimeUnit.SECONDS))
+        attempt.released.complete(Unit)
+        AndroidNativeMain.settleAfterExactRelease(ledger, attempt)
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
     }
 
     @Test fun closeFailureCannotProduceExactReleaseReceipt() {

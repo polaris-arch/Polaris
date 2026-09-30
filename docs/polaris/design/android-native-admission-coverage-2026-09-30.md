@@ -14,9 +14,9 @@ the shape verifier's `Ok(())` into `NoOldCore` or custody release.
 
 | Producer | Entry and captured work | Terminal proof required | Late, timeout, or cancellation path |
 | --- | --- | --- | --- |
-| `main.bridge` | Plugin Start before foreground-service dispatch; one ticket continues from `VpnBridge` pending into `MainKernelAttempt` | `CancelledBeforeBirth` or exact close | Rust bridge timeout detaches but Kotlin ticket remains; late Service attempt must meet sealed admission |
+| `main.bridge` | Plugin Start before foreground-service dispatch; one ticket continues from `VpnBridge` pending into `MainKernelAttempt` | `CancelledBeforeBirth`; born main owners currently remain `Unknown` | Rust bridge timeout detaches but Kotlin ticket remains; late Service attempt must meet sealed admission |
 | `main.system` | `BoxService.onStartCommand` for Boot, always-on, system relaunch, and duplicate foreground intents | same main owner proof | fence, request replacement, or occupied registry rejects an ownerless Service; `stopSelfResult(startId)` tears down only that Android request |
-| `main.close` | exact attempt close after Stop/onDestroy/onRevoke | construction completed normally, native `CloseService` and `Close` succeeded, then registry released the same attempt, then `ClosedExact` | native construction failure/revoked completion is sticky `Unknown` under `operationLock`; timeout, failed close, or exceptional future cannot become exact |
+| `main.close` | exact attempt operational close after Stop/onDestroy/onRevoke | capability absent: born main owners remain `Unknown` until global DNS drain and native lease release are proved; genuinely unborn reservations may cancel | successful native Close and exact registry release preserve ordinary recovery but do not prove resource disposal; construction failure/revoked completion remains sticky `Unknown` |
 | `main.reload` | Service reload callback, including targetless callback | control operation leaves JNI; same main ticket stays owned | retired endpoint declines before native reload; late callback cannot start after seal |
 | `login.start` | owner reserve at invocation, independent validation reserve before worker queue, owner birth before setup/JNI | capability absent; born owners remain `Unknown` after ordinary cleanup | consumed ID cannot replay; cancelled/sealed worker cannot enter native; construction failure/revoked return is sticky `Unknown` under ownership lock |
 | `login.close` | explicit close and Rust Drop use original ID; serviceStop, 300 s expiry, retry and main preemption retain exact Entry | worker exit, native close, network/DNS and original cache/TS ownership proof remain pending | close-before-start tombstones ID; successful map removal is operational cleanup only and cannot prove TS release |
@@ -48,8 +48,10 @@ CommandServer close cannot clear that fact. Exceptional/cancelled preparation,
 close, or registry-release futures also remain `Unknown` without throwing from
 the settlement callback.
 
-Current wiring remains **4/11**: `main.bridge`, `main.system`, `main.close`, and
-`validation.checkConfig`. Speedtest and Login owner tickets are installed, but
+Current wiring remains **3/11**: `main.bridge`, `main.system`, and
+`validation.checkConfig`. The prior `main.close` declaration is withdrawn: main
+cores share a process-global resolver, and ordinary Close does not prove all
+Go native leases or DNS work have ended. Speedtest and Login owner tickets are installed, but
 their capabilities remain empty until their remaining cleanup gates are proved. Other
 rows describe required contracts. Deterministic JVM seam tests cover both Stop/construction
 failure orders, revoked JNI completion, old-A/new-B settlement, prequeue seal
@@ -59,6 +61,23 @@ The Android startId comparison is documented by [Service.stopSelfResult](https:/
 this change has no APK or device validation.
 No partial implementation may clear `historicUnknown`,
 Tailscale custody, or enable managed routing.
+
+Main-close proof withdrawal changes only the native admission ledger and its
+capability declaration. Successful operational Close still releases the exact
+registry owner and preserves ordinary reconnect behavior. The target-local
+`MainKernelAttemptLedger.lastReleased`/`exactStatus` `AlreadyGone` fact and
+`PolarisVpnPlugin.stopMainCoreExact` `Closed` mapping are unchanged. They describe
+that operational target, not process-global DNS drainage or Go lease release.
+The later global NoOwner coordinator must never substitute these wire results
+for those outstanding proofs. An entered but unpublished main owner also stays
+`Unknown`; only a reservation that genuinely never entered native may cancel.
+
+Main-close proof withdrawal validation (2026-09-30): full Android Kotlin
+compilation and `:app:testUniversalDebugUnitTest` passed 169 tests in 15 suites,
+including 11 main-admission and 16 control-contract seam tests, with no failures,
+errors or skips. Bridge checking passed 31 commands. CI impact classification
+selects Android with no unregistered scopes; `git diff --check` passed.
+No operational Service/registry, Rust, Go, Host, SDK or APK change is included.
 
 ## Proposed main control contract (production wiring pending core review)
 
@@ -116,7 +135,7 @@ The seam tests exercise the actual helper with fake JNI latches and real
 `MainKernelAttempt`/ledger state, including queued seal/capacity rejection,
 first-error preservation, original owner revocation, and late error/notice
 delivery. Production call-site and all-entry validation remain a separate
-reviewed slice. Until that slice is complete, wiring remains **4/11**; this
+reviewed slice. Until that slice is complete, wiring remains **3/11**; this
 contract and helper emit no global `NoOwner` or Tailscale custody receipt.
 
 Control-contract seam validation (2026-09-30): the first targeted run passed
@@ -184,7 +203,7 @@ queried-DNS operational recovery versus ledger uncertainty, and actual Close
 failure blocking retries. Foreign-family and foreign-ID ticket rejection
 replies without retiring another owner. Android DNS/framework behavior has no
 APK or device validation; queried resolver disposal remains the pending P1 gate
-above, and coverage stays 4/11.
+above, and coverage stays 3/11.
 
 Login identity follow-up: `TransientLoginNativeOwner` holds one original ticket
 from invocation through queue dispatch and Entry disposal. The independent
@@ -235,7 +254,7 @@ it creates no fence ID, capture membership or receipt. A later explicit seal
 remains legal and captures existing Unknown facts normally. Born Login tickets
 remain Unknown after operational Close, and queried DNS proof remains a
 separate P1 gate. Capability sets remain empty for Login/Speedtest, coverage
-remains **4/11**, and managed/NoOwner activation remains disabled.
+remains **3/11**, and managed/NoOwner activation remains disabled.
 
 Only this invocation's explicit capacity rejection carries
 `ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED`. Kotlin keeps a typed cause internally;
@@ -270,7 +289,7 @@ The unchanged `android_transient_login_wiring.rs` passed all six source-contract
 tests using the real std-only `polaris-source-probe` library and a standalone
 `rustc --test` invocation; this is not a full Cargo/runtime test. Bridge checking
 passed 31 commands and `git diff --check` passed. No APK/device testing or Go
-changes were performed, and coverage remains 4/11.
+changes were performed, and coverage remains 3/11.
 
 Login Host seam follow-up: the production `TransientLoginHost` delegates to
 `TransientLoginHostState`, which owns the actual Entry map, state-directory
@@ -298,7 +317,7 @@ successor or delete its cache. A shared fake Tailscale-state file stays intact;
 this is not a Go Tailscale disposal or custody proof. Rust-authorized generation
 ordering, complete worker/network/DNS drain and TS/cache custody remain separate
 gates. The metadata budget described above closes the unbounded-ledger P2
-without proving any resource drain. Capabilities stay empty and coverage remains 4/11.
+without proving any resource drain. Capabilities stay empty and coverage remains 3/11.
 
 The fence runs at the actual Engine.close stage entry. Login's existing serial
 worker and ownership lock still wait for a constructing Start to return before

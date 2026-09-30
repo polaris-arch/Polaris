@@ -47,7 +47,7 @@ class AndroidNativeAdmissionTest {
         val receipt = ledger.seal("explicit-fence")
         assertEquals(setOf(owner.id, last.id), receipt.captured.map { it.ticket.id }.toSet())
         assertFalse(receipt.coverageComplete)
-        assertEquals(4, receipt.coveredProducers.size)
+        assertEquals(3, receipt.coveredProducers.size)
     }
 
     @Test fun allocationThatCannotFitPermanentlyClosesEvenWithOneSlotLeft() {
@@ -131,7 +131,7 @@ class AndroidNativeAdmissionTest {
     @Test fun partialProductionManifestNeverClaimsCompleteCoverage() {
         val receipt = open().seal("fence-1")
         assertEquals(1, receipt.protocolVersion)
-        assertEquals(setOf("main.bridge", "main.system", "main.close", "validation.checkConfig"),
+        assertEquals(setOf("main.bridge", "main.system", "validation.checkConfig"),
             receipt.coveredProducers.toSet())
         assertFalse(receipt.coverageComplete)
         assertEquals(0, receipt.capturedCount)

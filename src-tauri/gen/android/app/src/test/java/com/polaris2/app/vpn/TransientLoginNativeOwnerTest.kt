@@ -35,7 +35,7 @@ class TransientLoginNativeOwnerTest {
         assertTrue(failure.get() is IllegalStateException)
         assertEquals(0, acquisitions.get())
         assertTrue(ledger.receipt("login-fence").captured.all { it.state == AndroidNativeAdmission.State.CancelledBeforeBirth })
-        assertEquals(4, receipt.coveredProducers.size)
+        assertEquals(3, receipt.coveredProducers.size)
         assertFalse(receipt.coverageComplete)
     }
 
