@@ -40,11 +40,17 @@ impl TestDir {
         let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!("{prefix}{}-{nonce}-{sequence}", std::process::id()));
         std::fs::create_dir(&path).expect("测试临时目录必须唯一且可创建");
-        // Resolve only our newly created fixture root, including system temp
-        // aliases such as macOS /var. Artifact/source readers keep their own
-        // no-follow checks on every subsequently supplied path component.
-        let mut dir = Self(path);
-        dir.0 = std::fs::canonicalize(&dir.0).expect("测试自有临时目录必须可解析为真实路径");
+        let dir = Self(path);
+        // Resolve Unix temp aliases such as macOS /var only for our owned root.
+        // Windows canonicalize adds a verbatim prefix, which breaks file URLs
+        // and rule-file paths assembled with '/'; keep the created normal path.
+        // Artifact/source readers retain their own no-follow component checks.
+        #[cfg(unix)]
+        let dir = {
+            let mut dir = dir;
+            dir.0 = std::fs::canonicalize(&dir.0).expect("测试自有临时目录必须可解析为真实路径");
+            dir
+        };
         dir
     }
 
