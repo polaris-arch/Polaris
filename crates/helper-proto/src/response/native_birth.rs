@@ -1,6 +1,6 @@
 //! macOS/Windows native child receipts. Linux keeps its separate wire family.
 
-use super::{ResponseKind, StartTiming, hex_encode, parse_birth_start_timing};
+use super::{hex_encode, parse_birth_start_timing, ResponseKind, StartTiming};
 use crate::HelperBirthTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

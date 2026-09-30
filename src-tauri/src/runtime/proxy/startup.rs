@@ -1641,7 +1641,12 @@ impl ProxyRuntime {
                     Ok(receipt) => {
                         self.confirm_android_global_start(&android_birth, receipt.exact_target())?;
                         #[cfg(all(target_os = "android", debug_assertions))]
-                        self.record_android_probe_start(my_gen, &android_birth, &receipt, &gate_config_json);
+                        self.record_android_probe_start(
+                            my_gen,
+                            &android_birth,
+                            &receipt,
+                            &gate_config_json,
+                        );
                         0
                     }
                     Err((msg, error_code)) => {

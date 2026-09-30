@@ -80,7 +80,7 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
         id: "ts".into(),
         name: "Tailnet".into(),
         protocol: Protocol::Tailscale,
-        tailscale_settings: Some(Box::new(Default::default())),
+        tailscale_settings: Some(Box::default()),
         ..Default::default()
     });
     config.singbox_dashboard = Some(true);
@@ -144,7 +144,7 @@ fn existing_third_clash_mode_rejects_compilation_without_mutating_config() {
         id: "ts".into(),
         name: "Tailnet".into(),
         protocol: Protocol::Tailscale,
-        tailscale_settings: Some(Box::new(Default::default())),
+        tailscale_settings: Some(Box::default()),
         ..Default::default()
     });
     let mut deps = deps_default();
@@ -176,7 +176,7 @@ fn android_dns_group_keeps_valid_single_policy_when_dual_mode_cannot_namespace_e
         id: "ts".into(),
         name: "Tailnet".into(),
         protocol: Protocol::Tailscale,
-        tailscale_settings: Some(Box::new(Default::default())),
+        tailscale_settings: Some(Box::default()),
         ..Default::default()
     });
     config.config_schema_version = Some(2);

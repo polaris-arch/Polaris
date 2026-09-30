@@ -261,8 +261,26 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       'run: bash scripts/gate-android-release-behavior.sh',
     );
     expect(releaseCheck).toContain(
-      'run: node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+      'python3 scripts/libbox-patches/verify-receipt.py --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
     );
+    expect(releaseCheck).toContain(
+      'node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+    );
+    // R8 入口随 source-consumption 收敛到 verifier；守住实际委托、必填证据和失败传播。
+    const verifier = readFileSync(join(REPO_ROOT, 'scripts/libbox-patches/verify-receipt.py'), 'utf8');
+    const consumption = verifier.slice(verifier.indexOf('def consumption('), verifier.indexOf('\ndef main('));
+    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/assert-r8-evidence.mjs'), str(r8)], cwd=ROOT)");
+    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/verify-apk.mjs'), str(apk), '--abi', abi], cwd=ROOT)");
+    const beforePackage = consumption.slice(0, consumption.indexOf('    with zipfile.ZipFile('));
+    expect(beforePackage).not.toMatch(/^\s*try:/m);
+    expect(consumption).not.toMatch(/^\s*except\b/m);
+    expect(verifier).toContain("builder.require(args.r8 is not None, 'APK source consumption requires actual R8 evidence')");
+    expect(verifier).toContain('consumption(args.apk.resolve(), args.abi, args.r8.resolve(), receipt, receipt_path)');
+    expect(verifier).toMatch(/except \([^\n]*subprocess\.CalledProcessError\) as error:\n\s*print\([^\n]*\n\s*sys\.exit\(1\)/);
+    const builder = readFileSync(join(REPO_ROOT, 'scripts/libbox-patches/build.py'), 'utf8');
+    const run = builder.slice(builder.indexOf('def run('), builder.indexOf('\ndef require('));
+    expect(run).toContain('return subprocess.run(args, cwd=cwd, env=env, check=True, text=True,');
+    expect(run).not.toMatch(/^\s*(?:try:|except\b)/m);
     expect(releaseCheck).toContain(
       'run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a',
     );
@@ -302,7 +320,10 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
     expect(publish).toContain('name: android-release-mapping');
     expect(publish).toContain(
-      'run: node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a',
+      'node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a',
+    );
+    expect(publish).toContain(
+      'python3 scripts/libbox-patches/verify-receipt.py --apk ${{ steps.asset.outputs.asset }} --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
     );
     expect(publish).toContain('expected_sha="${{ steps.asset.outputs.sha256 }}"');
     expect(publish).toContain('[ "$actual_sha" != "sha256:$expected_sha" ]');

@@ -25,11 +25,11 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod android_bridge;
+pub(crate) mod android_capacity;
 #[cfg(any(all(target_os = "android", debug_assertions), test))]
 mod android_probe_loan;
 #[cfg(any(all(target_os = "android", debug_assertions), test))]
 mod debug_pc_echo;
-pub(crate) mod android_capacity;
 // Read-only proof shape for a future Android managed handoff. It cannot release
 // legacy custody or publish NoOldCore until every native owner is wired.
 #[allow(dead_code)]

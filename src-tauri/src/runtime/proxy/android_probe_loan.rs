@@ -259,7 +259,7 @@ impl ProxyRuntime {
                     || b.target.birth_nonce != scope.birth_nonce
                     || b.config_digest != scope.config_digest
                 {
-                    return Err("Core probe input changed".into());
+                    return Err("Core probe input changed");
                 }
                 let port = s
                     .probe_proxy_port
@@ -274,7 +274,7 @@ impl ProxyRuntime {
                     || polaris_updater::verify::sha256_hex(auth.password.as_bytes())
                         != b.ingress.credential_sha256
                 {
-                    return Err("Core probe actual ingress changed".into());
+                    return Err("Core probe actual ingress changed");
                 }
                 self.gate
                     .with_current_generation(b.generation, |_| DebugCoreProbeLoanPayload {
@@ -296,7 +296,7 @@ impl ProxyRuntime {
                         expires_elapsed: scope.deadline_elapsed,
                         password: auth.password.as_bytes().to_vec(),
                     })
-                    .ok_or_else(|| "Core probe generation changed".into())
+                    .ok_or("Core probe generation changed")
             })
             .map_err(str::to_owned)
     }

@@ -487,6 +487,18 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + 'login checker and speedtest spawn error. APK compilation must include these Android cfg branches '
       + 'and their linked Rust cdylib; desktop tests cannot validate the packaged Android error adapter.',
   },
+  'src-tauri/src/runtime/proxy.rs': {
+    why: 'Android Debug observer/probe modules and original Start-input ownership are wired by Android cfg in this module. '
+      + 'A fresh APK must compile and link these Rust cdylib branches; source registration does not attest runtime attribution.',
+  },
+  'src-tauri/src/runtime/proxy/android_probe_loan.rs': {
+    why: 'Android Debug lends the original generation, birth, revision, digest and authenticated probe-input metadata through the native bridge. '
+      + 'APK Rust/JNI compilation verifies the typed adapter is packaged; actual ingress and UID attribution still require device evidence.',
+  },
+  'src-tauri/src/runtime/proxy/hot_switch.rs': {
+    why: 'Android Debug binds an accepted reload revision to the original probe owner in Android cfg branches. '
+      + 'These linked Rust inputs require a fresh APK; successful compilation does not prove runtime generation ownership.',
+  },
   'src-tauri/src/runtime/speedtest.rs': {
     why: 'Android 临时测速核由独立 libbox 实例承载；改动会进入 APK 的 Rust cdylib。'
       + '真编 Android APK 可验证该 cfg 模块与 libbox/NDK 的链接，测速的运行期成败仍需设备验证。',

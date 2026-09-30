@@ -1394,7 +1394,7 @@ describe('④ 锚：每一条豁免都被真的打开核对（不是形状检查
     // 第二条反向对照，针对上一版真栽过的那个形态：**指在一堆 cfg 守卫中间、但自己不是守卫**的一行。
     const nearGuards: Anchor = {
       file: 'src-tauri/src/app_tray.rs',
-      mustContain: 'use std::sync::atomic::Ordering;',
+      mustContain: 'use tauri::Manager;',
     };
     expect(resolveAnchor('synthetic', nearGuards).hit, '这段样本得真的在').toBeGreaterThan(0);
     expect(

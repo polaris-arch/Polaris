@@ -205,6 +205,6 @@ fn ipv6_parsing_variants() {
     assert!(is_valid_cidr("2001:db8::1/64"));
     assert!(is_valid_cidr("fe80::/10"));
     assert!(!is_valid_cidr("2001:db8::/130")); // prefix > 128
-    // 完整 IPv6（无 ::）
+                                               // 完整 IPv6（无 ::）
     assert!(is_valid_cidr("2001:0db8:0000:0000:0000:0000:0000:0001/64"));
 }

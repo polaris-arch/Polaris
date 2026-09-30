@@ -46,7 +46,7 @@ fn exact_birth_stop_arguments_fail_closed() {
 
 #[test]
 fn exact_birth_request_frames_are_distinct_and_complete() {
-    use crate::{Platform, codec};
+    use crate::{codec, Platform};
     let params = LinuxStartParams {
         singbox_path: "/core/sing-box".into(),
         common: StartParams {
@@ -156,7 +156,7 @@ fn stop_omits_identity_line_when_unspecified() {
 /// 整帧形态（含平台差异）：stop 的身份行紧跟 command 行。
 #[test]
 fn stop_frame_shape_carries_identity_line() {
-    use crate::{Platform, codec};
+    use crate::{codec, Platform};
     let framed = String::from_utf8(codec::encode(
         Platform::Mac,
         "TOK",

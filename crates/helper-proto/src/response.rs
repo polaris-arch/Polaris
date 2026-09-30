@@ -11,7 +11,7 @@
 //!
 //! [`Response::parse`] 是宽容的：未知 `OK <token>` 归 [`ResponseKind::OkRaw`]（保留原文），不丢消息。
 
-use crate::{HelperBirthTarget, error::Error};
+use crate::{error::Error, HelperBirthTarget};
 
 mod native_birth;
 pub use native_birth::{NativeBirthStart, NativeBirthStatus, NativeBirthStop};

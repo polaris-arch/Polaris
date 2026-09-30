@@ -155,6 +155,7 @@ mod tests {
     fn private_bridge_shape_is_closed_and_native_scope_bounds_the_original_deadline() {
         let valid: PrivatePcReady = serde_json::from_value(fixture()).unwrap();
         let attempt = valid.admit(&scope()).unwrap();
+        assert_eq!(attempt.request_id(), "8".repeat(32));
         assert_eq!(attempt.deadline_elapsed(), 2800);
         for (key, value) in [
             ("approved", serde_json::json!(true)),

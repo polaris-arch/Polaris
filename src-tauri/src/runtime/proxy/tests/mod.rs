@@ -36,6 +36,7 @@ use super::recovery::*;
 /// 改动者对新触发点做一次显式决定。
 mod exit_ip_wiring_guard;
 
+mod android_probe_loan;
 mod android_takeover;
 mod core_log;
 mod hot_switch;
@@ -48,7 +49,6 @@ mod network_monitor;
 mod network_profile;
 mod platform_contracts;
 mod process_supervision;
-mod android_probe_loan;
 mod recovery;
 mod route_replan;
 mod startup;

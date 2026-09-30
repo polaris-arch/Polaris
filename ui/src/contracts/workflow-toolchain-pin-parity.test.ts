@@ -72,6 +72,9 @@ describe('CI 工具链钉扎守门', () => {
       '26',
       '26',
       '26',
+      '26',
+      '26',
+      '26',
     ]);
     expect(readFileSync(join(REPO_ROOT, '.nvmrc'), 'utf8').trim()).toBe('26');
     const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, 'ui/package.json'), 'utf8')) as {
@@ -79,10 +82,18 @@ describe('CI 工具链钉扎守门', () => {
     };
     expect(packageJson.engines?.node).toBe('>=24');
 
-    // package 发布 DAG 的桌面草稿与最终汇总各自需要 checkout：前者跑打包断言脚本，后者对拍
-    // HEAD/tag SHA。故四份 workflow 合计 7 处；少一处会让某段身份或源码判据失去取材面。
-    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(7);
-    expect(all.match(/actions\/setup-node@v7/g) ?? []).toHaveLength(5);
+    // 各桌面 source producer、草稿与汇总保有独立 checkout / Node；不能以总数相等掩盖某腿缺失。
+    for (const [workflow, count] of [
+      ['ci.yml', 1], ['ui.yml', 1], ['package.yml', 3], ['release-risk.yml', 3],
+    ] as const) {
+      const source = read(workflow);
+      expect(source.match(/actions\/checkout@v7/g) ?? [], workflow).toHaveLength(count);
+      expect(source.match(/actions\/setup-node@v7/g) ?? [], workflow).toHaveLength(count);
+      expect([...source.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), workflow)
+        .toEqual(Array(count).fill('26'));
+    }
+    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(8);
+    expect(all.match(/actions\/setup-node@v7/g) ?? []).toHaveLength(8);
     expect(all).not.toMatch(/actions\/(?:checkout|setup-node)@v[1-6]\b/);
     expect(read('package.yml')).toContain('actions/upload-artifact@v7');
     expect(read('package.yml')).toContain('actions/download-artifact@v8');

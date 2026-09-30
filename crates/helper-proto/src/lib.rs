@@ -53,9 +53,9 @@ pub mod response;
 // 顶层便利重导出：让 `polaris_helper_proto::Request` 等无需钻模块路径（core/helper 两侧主用类型）。
 pub use error::{Error, ErrorCode};
 pub use request::{
+    parse_linux_birth_stop_args, parse_native_birth_stop_args, parse_stop_pid, stop_pid_matches,
     HelperBirthTarget, HelperBirthToken, InstallCoreParams, LinuxDnsSetParams, LinuxStartParams,
-    Request, RouteParams, StartParams, parse_linux_birth_stop_args, parse_native_birth_stop_args,
-    parse_stop_pid, stop_pid_matches,
+    Request, RouteParams, StartParams,
 };
 pub use response::{
     FlushDns, FreePort, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns,
