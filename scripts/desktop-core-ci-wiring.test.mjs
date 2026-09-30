@@ -1,5 +1,6 @@
 // Workflow wiring contracts only: no producers, Go tools, sockets or devices run.
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +19,12 @@ function job(source, name) {
 }
 function kernelCoverage(source) {
   assert.doesNotMatch(source, /POLARIS_NO_KERNEL_RUN/, 'CI must retain kernel coverage; only the local gate sets this switch');
+}
+function packageFetchStep(source) {
+  const marker = '      - name: Fetch sing-box core (SHA256-pinned)\n';
+  const body = job(source, 'package');
+  assert.ok(body.includes(marker), 'Package requires its exact source consumption step');
+  return body.split(marker)[1].split('\n      - ')[0];
 }
 function candidates(source) {
   const producer = source['desktop-core'];
@@ -72,6 +79,9 @@ function bundles(source) {
   assert.match(job(source.package, 'setup'), /CORE_RUN_ATTEMPT: \$\{\{ github.run_attempt \}\}/);
   assert.match(packageJob, /CORE_BUNDLE_ARTIFACT: \$\{\{ inputs.core_bundle_artifact \|\| needs.desktop_core.outputs.artifact_name \}\}/);
   assert.match(packageJob, /name: \$\{\{ env.CORE_BUNDLE_ARTIFACT \}\}/);
+  const fetch = packageFetchStep(source.package);
+  assert.match(fetch, /^        shell: bash$/m, 'Windows consumption must expand the declared environment with Bash');
+  assert.match(fetch, /^        run: node scripts\/fetch-core.mjs --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"$/m);
 }
 function packageAllows(source, setup, core, provided) {
   const block = /    if: >-\n((?:      .*\n)+)/.exec(job(source, 'package'));
@@ -131,7 +141,20 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
     { ...files, 'release-risk': files['release-risk'].replace(' --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"', '') },
     { ...files, package: files.package.replace('name: ${{ env.CORE_BUNDLE_ARTIFACT }}', 'name: old-source-artifact') },
     { ...files, package: files.package.replace('desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" ]', 'desktop-core-bundle-$CORE_CANDIDATE" ]') },
+    { ...files, package: files.package.replace('      - name: Fetch sing-box core (SHA256-pinned)\n        shell: bash\n', '      - name: Fetch sing-box core (SHA256-pinned)\n') },
+    { ...files, package: files.package.replace('      - name: Fetch sing-box core (SHA256-pinned)\n        shell: bash\n', '      - name: Fetch sing-box core (SHA256-pinned)\n        shell: pwsh\n') },
   ]) assert.throws(() => bundles(changed));
+  // Exercise the unchanged run line's quoting with actual Bash and a Node argv
+  // reporter. This invokes neither the consumer nor any Go/core command.
+  const invocation = /^        run: (.+)$/m.exec(packageFetchStep(files.package))[1];
+  const bundle = String.raw`D:\a\_temp/desktop-core-bundle`;
+  const candidate = '4914566fb0777b45e3aeabcf01a5a9f8059f9c9c';
+  const command = invocation.replace('node scripts/fetch-core.mjs',
+    "node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' --");
+  const args = JSON.parse(execFileSync('bash', ['-c', command], {
+    encoding: 'utf8', env: { ...process.env, CORE_BUNDLE: bundle, CORE_CANDIDATE: candidate },
+  }));
+  assert.deepEqual(args, [`--bundle-dir=${bundle}`, `--candidate=${candidate}`]);
 });
 
 test('Package reuses the provided bundle without a second producer and rejects failed or cancelled source jobs', () => {

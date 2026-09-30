@@ -557,6 +557,7 @@ jobs:
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Fetch sing-box core (SHA256-pinned)
+        shell: bash
         env:
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
