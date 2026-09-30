@@ -477,6 +477,11 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'scripts/core-source-provision.py': {
+    why: '共同 core/dependency source provider 须点亮 Android AAR/APK 来源腿，避免共同来源变更静默沿用桌面豁免。'
+      + '当前 scripts/build-libbox.sh → scripts/libbox-patches/build.py 仍自行准备 checkout，尚未消费该共同 helper。'
+      + 'Host Node fixtures 覆盖 provider receipt 与来源准入；本登记不证明真实 Android consumer 接线、AAR/APK 重构建或设备行为。',
+  },
   'src-tauri/src/runtime/proxy/android_capacity.rs': {
     why: 'Android native admission capacity failures keep their typed identity through the Rust bridge, '
       + 'login checker and speedtest spawn error. APK compilation must include these Android cfg branches '
@@ -718,10 +723,6 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     '单一 Debug Android 批次入口；android+debug_assertions 分支走已有预算 plugin 桥，其他构型零资源 disabled stub。'
     + 'Android cargo check 守 cfg 类型，check-android-bridge A15 守 release guard/实际 BoxService 观察接线；'
     + 'APK 构建不会执行 socket、SDK snapshot、OEM guardian 或独立 peer 验收。',
-  'scripts/core-source-provision.py':
-    'This slice consumes the exact frozen shared provider from desktop-core/build-core.mjs. '
-    + 'The current source baseline Android build-libbox does not call it; host source-graph fixtures cover its desktop ABI consumption only. '
-    + 'This is not a claim that the shared helper is desktop-only: merging an Android consumer must replace this registration with its actual APK impact and coverage.',
   'src-tauri/src/runtime/updater.rs':
     'Frozen desktop sourceBuild selects the compiled desktop baseline only; the Android branch keeps bundledCoreVersion unchanged. '
     + 'cargo check --target aarch64-linux-android -p polaris type-checks that branch, while host updater/tests exercises explicit Android '

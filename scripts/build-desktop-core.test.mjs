@@ -424,10 +424,16 @@ test('malformed or duplicate native metadata cannot be treated as a match', () =
   } finally { f.dispose(); }
 });
 
-test('desktop source code and its required tests have explicit desktop and Android impact', () => {
+test('shared source provider and desktop-only producers retain explicit platform impact', () => {
   assert.equal(digest(readFileSync(join(repo, 'scripts/core-source-provision.py'))),
     'ef0238183e3076ed3cfa51df824cacd9a74bafa69f40298fa7aae7254e90a24d');
-  for (const path of ['scripts/core-source-provision.py', 'scripts/build-desktop-core.test.mjs', 'scripts/desktop-core/source-graph.mjs',
+  const provider = 'scripts/core-source-provision.py';
+  const sharedImpact = classifyImpact([provider]);
+  assert.equal(sharedImpact.kernel, true, provider);
+  assert.equal(sharedImpact.platforms.length, 4, provider);
+  assert.equal(sharedImpact.android, true, provider);
+  assert.deepEqual(androidRegistrationOf(provider), { key: provider, table: 'ANDROID_IMPACT_SCOPES' });
+  for (const path of ['scripts/build-desktop-core.test.mjs', 'scripts/desktop-core/source-graph.mjs',
     'scripts/desktop-core/build-core.mjs', 'scripts/desktop-core/bundle.mjs']) {
     const impact = classifyImpact([path]);
     assert.equal(impact.kernel, true, path);
