@@ -3,6 +3,8 @@ package com.polaris2.app.vpn
 import android.os.SystemClock
 import com.polaris2.app.BuildConfig
 import java.io.Closeable
+import java.io.EOFException
+import java.io.InputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -65,13 +67,35 @@ internal object DebugPcEchoSender {
         val now = SystemClock.elapsedRealtime()
         check(allowed() && ready.current(now) && loan.isCurrent(now, DebugCoreProbeLoan.currentInput()))
     }
-    private fun readExact(socket: Socket, count: Int, deadline: Long, fence: () -> Unit): ByteArray {
+    /** Handshake EOF is always a transport failure, including a negative attempt. */
+    internal fun readHandshake(input: InputStream, count: Int, fence: () -> Unit): ByteArray {
         val out = ByteArray(count); var used = 0
         while (used < count) {
-            fence(); socket.soTimeout = remaining(deadline)
-            val n = socket.getInputStream().read(out, used, count - used); check(n > 0); used += n
+            fence()
+            val n = input.read(out, used, count - used)
+            if (n < 0) throw EOFException("PC echo handshake ended")
+            check(n > 0); used += n
         }
         return out
+    }
+    private fun readExact(socket: Socket, count: Int, deadline: Long, fence: () -> Unit): ByteArray =
+        readHandshake(socket.getInputStream(), count) { fence(); socket.soTimeout = remaining(deadline) }
+    /** Only the fully sent WrongNonce echo phase may treat clean EOF as expected refusal. */
+    internal fun readTcpEcho(input: InputStream, payload: ByteArray, kind: String, fullySent: Boolean,
+                             fence: () -> Unit, progress: (ByteArray) -> Unit): String {
+        val echoed = ArrayList<Byte>()
+        while (echoed.size < 65) {
+            fence()
+            val value = input.read()
+            if (value < 0) {
+                fence()
+                if (kind == "WrongNonce" && fullySent) return "NoEcho"
+                throw EOFException("PC echo ended")
+            }
+            val b = value.toByte(); echoed.add(b); progress(echoed.toByteArray())
+            if (b == 10.toByte()) break
+        }
+        return if (echoed.toByteArray().contentEquals(payload)) "ExactEcho" else "NoEcho"
     }
     /** Bytewise writes preserve exactly confirmed progress, including cancellation after send. */
     private fun write(socket: Socket, raw: ByteArray, fence: () -> Unit, progress: ((Int) -> Unit)? = null) {
@@ -103,13 +127,9 @@ internal object DebugPcEchoSender {
             val status = response.toByteArray().toString(Charsets.US_ASCII).substringBefore("\r\n")
             require(status.matches(Regex("HTTP/1\\.[01] 200(?: .*)?")))
             write(socket, payload, fence) { confirmed -> report.sent = payload.copyOfRange(0, confirmed) }
-            val echoed = ArrayList<Byte>()
-            while (echoed.size < 65) {
-                val b = readExact(socket, 1, deadline, fence)[0]; echoed.add(b)
-                report.returned = echoed.toByteArray()
-                if (b == 10.toByte()) break
-            }
-            report.outcome = if (report.returned?.contentEquals(payload) == true) "ExactEcho" else "NoEcho"
+            report.outcome = readTcpEcho(socket.getInputStream(), payload, report.kind,
+                report.sent?.contentEquals(payload) == true,
+                { fence(); socket.soTimeout = remaining(deadline) }, { report.returned = it })
         } finally { privateBuffers.forEach(lease::retire); lease.retire(socket) }
     }
     private fun udp(loan: DebugCoreProbeLoan, ready: DebugPcEchoReady, lease: DebugBatchLease,

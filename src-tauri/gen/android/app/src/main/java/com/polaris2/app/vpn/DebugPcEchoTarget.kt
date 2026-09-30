@@ -132,11 +132,16 @@ internal object DebugPcEchoCodec {
 /** Immutable actual receiver descriptor. Raw echo nonce remains private and erasable. */
 internal class DebugPcEchoTarget private constructor(internal val fields: Map<String, Any?>,
                                                     internal val nonce: ByteArray) {
+    private var erased = false
     val address get() = fields["destinationIPv4"] as String
     fun port(protocol: String) = (fields[protocol + "Port"] as Long).toInt()
     fun socketId(protocol: String) = fields[protocol + "SocketInstanceId"] as String
     val apkSha get() = fields["androidPackageSha256"] as String
-    fun privateJson() = DebugPcEchoCodec.canonical(fields).toString(Charsets.UTF_8)
+    // This bounded record monitor holds only metadata/bytes, never SDK or IPC work.
+    @Synchronized fun privateJson(): String = DebugPcEchoCodec.canonical(
+        if (erased) fields else fields + ("echoNonce" to nonce.toString(Charsets.US_ASCII))
+    ).toString(Charsets.UTF_8)
+    @Synchronized fun erase() { erased = true; nonce.fill(0) }
     override fun toString() = "DebugPcEchoTarget(<private>)"
     companion object {
         val KEYS = setOf("schema", "pcRunId", "pcPlanSha256", "readyReceiptSha256", "pcCandidateSha",
@@ -160,7 +165,7 @@ internal class DebugPcEchoTarget private constructor(internal val fields: Map<St
             require(m["maxRequests"] == 32L && DebugPcEchoCodec.hex(s("echoNonce"), 32, 64))
             val nonce = s("echoNonce").toByteArray(Charsets.US_ASCII)
             require(DebugPcEchoCodec.sha(nonce) == s("echoNonceSha256"))
-            return DebugPcEchoTarget(m.toMap(), nonce)
+            return DebugPcEchoTarget(m.filterKeys { it != "echoNonce" }, nonce)
         }
     }
 }
@@ -170,7 +175,7 @@ internal class DebugPcEchoReady private constructor(val target: DebugPcEchoTarge
                                                    val requestId: String, val remainingRequests: Int) : Closeable {
     @Volatile private var erased = false
     fun current(now: Long) = !erased && now >= 0 && now < deadlineElapsed
-    @Synchronized fun erase() { erased = true; target.nonce.fill(0) }
+    @Synchronized fun erase() { erased = true; target.erase() }
     override fun close() = erase()
     override fun toString() = "DebugPcEchoReady(<private>)"
     companion object {
@@ -203,7 +208,7 @@ internal class DebugPcEchoReady private constructor(val target: DebugPcEchoTarge
                 val deadline = minOf(sessionDeadline, anchor + remaining)
                 require(deadline > now)
                 return DebugPcEchoReady(t, deadline, requestId, budget.toInt())
-            } catch (failure: Throwable) { t.nonce.fill(0); throw failure }
+            } catch (failure: Throwable) { t.erase(); throw failure }
         }
     }
 }

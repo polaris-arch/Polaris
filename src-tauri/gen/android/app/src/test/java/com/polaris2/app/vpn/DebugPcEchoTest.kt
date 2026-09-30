@@ -1,7 +1,11 @@
 package com.polaris2.app.vpn
 
 import com.polaris2.app.BuildConfig
+import java.io.ByteArrayInputStream
 import java.io.Closeable
+import java.io.EOFException
+import java.io.IOException
+import java.io.InputStream
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -83,10 +87,63 @@ class DebugPcEchoTest {
         assumeTrue(BuildConfig.DEBUG)
         val lease = DebugBatchLease(); val ready = DebugPcEchoReady.fromReply(reply(), "d".repeat(32), 1000, 1400, 9000, "7".repeat(64))
         val entered = CountDownLatch(1); val release = CountDownLatch(1)
-        val blocker = Closeable { entered.countDown(); check(release.await(3, TimeUnit.SECONDS)) }
+        val retained = "\"echoNonce\":\"" + "b".repeat(32) + "\""
+        val live = DebugPcEchoCodec.parse(ready.target.privateJson().toByteArray())
+        assertEquals(DebugPcEchoTarget.KEYS, live.keys); assertEquals("b".repeat(32), live["echoNonce"])
+        assertFalse(ready.target.fields.containsKey("echoNonce"))
+        val blocker = Closeable {
+            check(!ready.target.fields.containsKey("echoNonce") && !ready.target.privateJson().contains(retained))
+            entered.countDown(); check(release.await(3, TimeUnit.SECONDS))
+        }
         check(lease.beginAcquire()); check(lease.publish(blocker)); check(lease.beginAcquire()); check(lease.publish(ready))
         val worker = Thread { lease.seal() }; worker.start(); assertTrue(entered.await(3, TimeUnit.SECONDS))
-        assertTrue(ready.target.nonce.all { it == 0.toByte() }); assertFalse(ready.current(1400))
-        release.countDown(); worker.join(3000); assertFalse(worker.isAlive); assertEquals(0, lease.snapshot().handles)
+        try {
+            assertTrue(ready.target.nonce.all { it == 0.toByte() }); assertFalse(ready.current(1400))
+            assertFalse(ready.target.privateJson().contains(retained))
+            // Even refilling the old byte array cannot restore a revoked private descriptor.
+            ready.target.nonce.fill('b'.code.toByte())
+            assertFalse(ready.target.privateJson().contains(retained)); ready.target.nonce.fill(0)
+        } finally { release.countDown(); worker.join(3000) }
+        assertFalse(worker.isAlive); assertEquals(0, lease.snapshot().handles)
+        assertFalse(ready.target.privateJson().contains(retained))
+    }
+    @Test fun actualTcpEchoReaderAcceptsOnlyFullySentWrongNonceEofAndPreservesProgress() {
+        val payload = "b".repeat(32).toByteArray() + byteArrayOf(10)
+        var returned: ByteArray? = null; var fences = 0
+        fun echo(raw: ByteArray, kind: String = "Positive", sent: Boolean = true): String =
+            DebugPcEchoSender.readTcpEcho(ByteArrayInputStream(raw), payload, kind, sent,
+                { fences++ }, { returned = it })
+        assertEquals("ExactEcho", echo(payload))
+        returned = null
+        assertEquals("NoEcho", echo(byteArrayOf(), "WrongNonce")); assertNull(returned)
+        val partial = payload.copyOfRange(0, 3)
+        assertEquals("NoEcho", echo(partial, "WrongNonce")); assertArrayEquals(partial, returned)
+        assertTrue(runCatching { echo(byteArrayOf()) }.exceptionOrNull() is EOFException)
+        assertTrue(runCatching { echo(partial) }.exceptionOrNull() is EOFException)
+        assertTrue(runCatching { echo(byteArrayOf(), "WrongNonce", false) }.exceptionOrNull() is EOFException)
+        assertTrue(runCatching { echo(byteArrayOf(), "ForeignPeer") }.exceptionOrNull() is EOFException)
+        // Actual reader resumes after the expected negative; UDP uses its unchanged closed codec.
+        assertEquals("ExactEcho", echo(payload)); assertArrayEquals(payload, returned); assertTrue(fences > 0)
+        val target = DebugPcEchoTarget.decode(target())
+        val tuple = DebugPcEchoSender.Tuple(target.address, target.port("udp"), "udp")
+        val packet = DebugPcEchoSender.socksRequest(tuple, target.nonce)
+        assertArrayEquals(target.nonce, DebugPcEchoSender.socksPayload(packet, tuple))
+        packet.fill(0); target.erase(); payload.fill(0); returned?.fill(0)
+    }
+    @Test fun actualTcpReadersKeepHandshakeIoAndCancellationFailures() {
+        assertArrayEquals(byteArrayOf(5, 2), DebugPcEchoSender.readHandshake(ByteArrayInputStream(byteArrayOf(5, 2)), 2) {})
+        for (raw in listOf(byteArrayOf(), byteArrayOf(5)))
+            assertTrue(runCatching { DebugPcEchoSender.readHandshake(ByteArrayInputStream(raw), 2) {} }.exceptionOrNull() is EOFException)
+        val io = IOException("synthetic read failure")
+        val broken = object : InputStream() { override fun read(): Int = throw io }
+        assertSame(io, runCatching { DebugPcEchoSender.readHandshake(broken, 1) {} }.exceptionOrNull())
+        for (kind in listOf("Positive", "WrongNonce"))
+            assertSame(io, runCatching { DebugPcEchoSender.readTcpEcho(broken, byteArrayOf(10), kind, true, {}, {}) }.exceptionOrNull())
+        val canceled = IllegalStateException("synthetic revoked scope")
+        var fences = 0
+        assertSame(canceled, runCatching {
+            DebugPcEchoSender.readTcpEcho(ByteArrayInputStream(byteArrayOf()), byteArrayOf(10), "WrongNonce", true,
+                { if (++fences == 2) throw canceled }, {})
+        }.exceptionOrNull())
     }
 }
