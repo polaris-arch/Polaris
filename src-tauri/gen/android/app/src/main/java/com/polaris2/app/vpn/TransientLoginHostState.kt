@@ -2,6 +2,36 @@ package com.polaris2.app.vpn
 
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** Shared production close stages. No lock or supplemental proof wait is added here. */
+internal class TransientHostCleanup(
+    private val beginResolverClose: () -> Unit,
+    private val closeService: () -> Unit,
+    private val closeServer: () -> Unit,
+    private val closeNetwork: () -> Unit,
+    private val nativeClosed: () -> Unit = {},
+    private val networkClosed: () -> Unit = {},
+    private val closeCache: () -> Unit = {},
+    private val resolverUnknown: () -> Unit = {},
+) {
+    fun close() {
+        // Fence first; do not let a fence failure hide a real native/network cleanup failure.
+        val fenceFailure = runCatching { beginResolverClose() }.exceptionOrNull()
+        var failure: Throwable? = null
+        runCatching { closeService() }.onFailure { failure = it }
+        runCatching { closeServer() }.onFailure { if (failure == null) failure = it }
+        if (failure == null && fenceFailure == null) nativeClosed()
+        runCatching { closeNetwork() }.onFailure {
+            if (it is TransientResolverLifecycle.CleanupUnknown) resolverUnknown()
+            else if (failure == null) failure = it
+        }
+        if (failure == null && fenceFailure == null) {
+            networkClosed()
+            runCatching { closeCache() }.onFailure { failure = it }
+        }
+        (failure ?: fenceFailure)?.let { throw it }
+    }
+}
+
 /** Production login lifecycle; JNI, Android networking, queue and clock are injected boundaries. */
 internal class TransientLoginHostState(
     private val ledger: AndroidNativeAdmission,

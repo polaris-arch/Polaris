@@ -58,6 +58,18 @@ internal object TransientLoginHost {
         private var server: CommandServer? = null
         private var network: TransientLoginNetwork? = null
         private var cache: File? = null
+        private val cleanup = TransientHostCleanup(
+            beginResolverClose = { network?.beginResolverClose() },
+            closeService = { server?.let { server -> server.closeService() } },
+            closeServer = { server?.let { server -> server.close() } },
+            closeNetwork = { network?.close() },
+            nativeClosed = { server = null },
+            networkClosed = { network = null },
+            closeCache = {
+                cache?.let { check(!it.exists() || it.delete()) { "Android 登录缓存清理失败" } }
+                cache = null
+            },
+        )
 
         override fun prepare(validationTicket: AndroidNativeAdmission.Ticket, stage: (String) -> Unit, cancelled: () -> Boolean) {
             val value = checkNotNull(config)
@@ -89,22 +101,8 @@ internal object TransientLoginHost {
         }
 
         override fun close() {
-            try {
-                var failure: Throwable? = null
-                server?.let { server ->
-                    runCatching { server.closeService() }.onFailure { failure = it }
-                    runCatching { server.close() }.onFailure { if (failure == null) failure = it }
-                    if (failure == null) this.server = null
-                }
-                runCatching { network?.close() }.onFailure { if (failure == null) failure = it }
-                if (failure == null) network = null
-                if (failure == null) {
-                    runCatching { cache?.let { check(!it.exists() || it.delete()) { "Android 登录缓存清理失败" } } }
-                        .onFailure { failure = it }
-                    if (failure == null) cache = null
-                }
-                failure?.let { throw it }
-            } finally { config = null }
+            try { cleanup.close() }
+            finally { config = null }
         }
     }
 

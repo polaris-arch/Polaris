@@ -2,6 +2,8 @@ package com.polaris2.app.vpn
 
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CancellationException
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -11,6 +13,159 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TransientSpeedtestSessionsTest {
+    private class ResolverEngine : TransientSpeedtestSessions.Engine {
+        private val cancelQueue = java.util.concurrent.LinkedBlockingQueue<Runnable>()
+        val resolver = TransientResolverLifecycle(Executor { cancelQueue.add(it) })
+        val stages = mutableListOf<String>()
+        val closes = AtomicInteger()
+        var serviceAction: () -> Unit = {}
+        var serviceFailure: Throwable? = null
+        var serverFailure: Throwable? = null
+        private var proof = true
+        private val cleanup = TransientHostCleanup(
+            beginResolverClose = { stages.add("fence"); resolver.beginClose() },
+            closeService = { stages.add("service"); serviceAction(); serviceFailure?.let { throw it } },
+            closeServer = { stages.add("server"); serverFailure?.let { throw it } },
+            closeNetwork = { stages.add("network"); resolver.closeUnused() },
+            resolverUnknown = { proof = false },
+        )
+        override fun prepare() {}
+        override fun start() {}
+        override fun close() { closes.incrementAndGet(); cleanup.close() }
+        override fun cleanupConfirmed(): Boolean = proof
+        fun runCancel() { checkNotNull(cancelQueue.poll()).run() }
+        fun pendingCancels(): Int = cancelQueue.size
+    }
+
+    @Test fun productionCleanupFencesBeforeNativeJoinAndReentrantCloseWithoutWaitingForSdkCancel() {
+        val ledger = ledger()
+        val sessions = TransientSpeedtestSessions(nativeAdmission = ledger)
+        val engine = ResolverEngine()
+        val ticket = sessions.reserveOwner(id(1))
+        val (started, startResult) = startNative(sessions, 1, engine, ticket)
+        await(started)
+        assertEquals(null, startResult.get())
+        val query = engine.resolver.enterQuery<Int>()
+        val queryDone = CountDownLatch(1)
+        val reenteredDone = CountDownLatch(1)
+        val queryError = AtomicReference<Throwable?>()
+        val writes = AtomicInteger()
+        val signalCalls = AtomicInteger()
+        query.installCancellation { signalCalls.incrementAndGet() }
+        Thread {
+            try { query.awaitAndDeliver { writes.incrementAndGet() } }
+            catch (_: CancellationException) {}
+            catch (failure: Throwable) { queryError.set(failure) }
+            finally { query.returned(); queryDone.countDown() }
+        }.start()
+        engine.serviceAction = {
+            assertTrue(engine.resolver.snapshot().sealed)
+            assertTrue(runCatching { engine.resolver.enterQuery<Int>() }.isFailure)
+            await(queryDone)
+            sessions.close(id(1)) { assertEquals(null, it); reenteredDone.countDown() }
+        }
+        val (closed, closeResult) = close(sessions, id(1))
+        await(closed)
+        await(reenteredDone)
+        assertEquals(null, closeResult.get())
+        assertEquals(null, queryError.get())
+        assertEquals(listOf("fence", "service", "server", "network"), engine.stages)
+        assertEquals(0, writes.get())
+        assertEquals(0, signalCalls.get())
+        assertEquals(1, engine.pendingCancels())
+        assertFalse(engine.cleanupConfirmed())
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
+        assertEquals("closed", sessions.status(id(1)))
+        val next = ResolverEngine()
+        val nextTicket = sessions.reserveOwner(id(2))
+        val (nextStarted, nextResult) = startNative(sessions, 2, next, nextTicket)
+        await(nextStarted)
+        assertEquals(null, nextResult.get())
+        val (duplicate, _) = close(sessions, id(1))
+        await(duplicate)
+        assertFalse(query.publish(2))
+        engine.runCancel()
+        assertEquals(1, signalCalls.get())
+        assertEquals(1, engine.closes.get())
+        assertEquals(0, next.closes.get())
+        assertFalse(next.resolver.snapshot().sealed)
+        assertEquals("running", sessions.status(id(2)))
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
+        assertTrue(TransientSpeedtestSessions.capabilities.isEmpty())
+        val (nextClosed, _) = close(sessions, id(2))
+        await(nextClosed)
+    }
+
+    @Test fun productionCleanupKeepsAlreadyDeliveringJniAndQueuedCancelUnknownAfterOperationalSuccess() {
+        val ledger = ledger()
+        val sessions = TransientSpeedtestSessions(nativeAdmission = ledger)
+        val engine = ResolverEngine()
+        val ticket = sessions.reserveOwner(id(1))
+        val (started, _) = startNative(sessions, 1, engine, ticket)
+        await(started)
+        val query = engine.resolver.enterQuery<Int>()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val queryDone = CountDownLatch(1)
+        val queryError = AtomicReference<Throwable?>()
+        val writes = AtomicInteger()
+        query.installCancellation {}
+        query.publish(1)
+        Thread {
+            try { query.awaitAndDeliver { entered.countDown(); await(release); writes.incrementAndGet() } }
+            catch (failure: Throwable) { queryError.set(failure) }
+            finally { query.returned(); queryDone.countDown() }
+        }.start()
+        try {
+            await(entered)
+            val (closed, result) = close(sessions, id(1))
+            await(closed)
+            assertEquals(null, result.get())
+            assertEquals("closed", sessions.status(id(1)))
+            assertEquals(1, engine.resolver.snapshot().calls)
+            assertEquals(1, engine.resolver.snapshot().deliveries)
+            assertEquals(1, engine.resolver.snapshot().cancellationTasks)
+            assertEquals(TransientResolverLifecycle.Drain.Unknown, engine.resolver.awaitLocalDrain(0, TimeUnit.SECONDS))
+            assertEquals(1, engine.resolver.snapshot().deliveries)
+            assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
+        } finally { release.countDown() }
+        await(queryDone)
+        assertEquals(null, queryError.get())
+        assertEquals(1, writes.get())
+        assertEquals(0, engine.resolver.snapshot().deliveries)
+        assertEquals(1, engine.resolver.snapshot().cancellationTasks)
+        engine.runCancel()
+        assertEquals(0, engine.resolver.snapshot().cancellationTasks)
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
+    }
+
+    @Test fun realNativeCloseFailureWinsOverQueriedResolverProofAndRetainsOperationalOwner() {
+        val ledger = ledger()
+        val logged = AtomicReference<Throwable?>()
+        val sessions = TransientSpeedtestSessions(nativeAdmission = ledger, logFailure = { logged.set(it) })
+        val engine = ResolverEngine()
+        val actual = IllegalStateException("real CloseService failure")
+        engine.serviceFailure = actual
+        engine.serverFailure = IllegalStateException("secondary Close failure")
+        val ticket = sessions.reserveOwner(id(1))
+        val (started, _) = startNative(sessions, 1, engine, ticket)
+        await(started)
+        val query = engine.resolver.enterQuery<Int>()
+        val (closed, result) = close(sessions, id(1))
+        await(closed)
+        assertTrue(result.get()!!.contains("未知"))
+        assertTrue(logged.get() === actual)
+        assertEquals(listOf("fence", "service", "server", "network"), engine.stages)
+        assertFalse(engine.cleanupConfirmed())
+        assertEquals("cleanupUnknown", sessions.status(id(1)))
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
+        assertFalse(query.publish(1))
+        query.returned()
+        val untouched = AtomicInteger()
+        assertTrue(runCatching { sessions.withMainStart(Any(), { true }) { untouched.incrementAndGet() } }.isFailure)
+        assertEquals(0, untouched.get())
+    }
+
     @Test fun queuedSpeedtestGetsExplicitCapacityCauseWithoutNativeBirth() {
         val ledger = AndroidNativeAdmission("speed-capacity", maxMetadataRecords = 3).also { it.bootstrap(RequiredMarkerProof.Absent) }
         var worker: (() -> Unit)? = null

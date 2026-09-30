@@ -101,6 +101,13 @@ internal object TransientSpeedtestHost {
         private var network: TransientLoginNetwork? = null
         private var server: CommandServer? = null
         private var cleanupProof = true
+        private val cleanup = TransientHostCleanup(
+            beginResolverClose = { network?.beginResolverClose() },
+            closeService = { server?.closeService() },
+            closeServer = { server?.close() },
+            closeNetwork = { network?.close() },
+            resolverUnknown = { cleanupProof = false },
+        )
 
         override fun prepare() {
             PolarisApplication.ensureSetup()
@@ -115,18 +122,7 @@ internal object TransientSpeedtestHost {
             requireNotNull(server).startOrReloadService(config, OverrideOptions())
         }
 
-        override fun close() {
-            var failure: Throwable? = null
-            server?.let { value ->
-                runCatching { value.closeService() }.onFailure { failure = it }
-                runCatching { value.close() }.onFailure { if (failure == null) failure = it }
-            }
-            runCatching { network?.close() }.onFailure {
-                if (it is TransientResolverLifecycle.CleanupUnknown) cleanupProof = false
-                else if (failure == null) failure = it
-            }
-            failure?.let { throw it }
-        }
+        override fun close() = cleanup.close()
 
         override fun cleanupConfirmed(): Boolean = cleanupProof
     }

@@ -75,20 +75,31 @@ factory/box.New failure or revoked completion is sticky ledger `Unknown`, even
 when operational Close succeeds. Real native Close or network-unregistration
 failure keeps the existing operational `cleanupUnknown` owner and blocks retry.
 
-Network notification callbacks are fenced and joined, and the instance's
-HandlerThread must exit before an unused resolver may contribute exact cleanup
-proof. A queried resolver is sealed against new queries and drops later writes
-through its original ExchangeContext. A JNI write that passed the close flag
-before sealing can still finish on that old context, so queried cleanup remains
-`Unknown`. This supplemental proof result does not turn an operationally
+The strict speedtest network path fences and joins notification callbacks, and
+the instance's HandlerThread must exit before an unused resolver may contribute
+local cleanup proof. DNS SDK callbacks now retain only pure Kotlin mailboxes
+and publish copied results; they never deliver through an ExchangeContext.
+Only the original exchange/lookup stack can acquire a one-shot delivery permit
+under the resolver metadata gate and call JNI before returning. Seal revokes
+Pending/Ready results, rejects new queries and permits, and wakes original
+waiters. A previously acquired JNI permit remains counted until its action
+really returns or throws; timeout and interruption do not fabricate completion.
+An interrupt while waiting for the permit monitor is rechecked before delivery.
+Queried cleanup remains `Unknown`. This supplemental proof result does not turn an operationally
 successful close into permanent active ownership: ordinary subsequent speedtest
 and main Start retain their prior admission behavior.
 
 **Pending P1 gate: queried resolver callback drain and disposal.** A future
-independent slice must capture each SDK DNS query/cancellation, suppress late
-context writes, join in-flight query/JNI work, and confirm that the callback
-executor has ended and cannot accept late SDK deliveries. Callback return,
-Go context cancellation, or an empty active-session map alone is insufficient.
+independent slice must prove SDK/native query and cancellation drain, original
+JNI return, Go cancellation-registration removal and physical JNI proxy disposal.
+Local cancellation revokes and wakes first, then queues best-effort
+CancellationSignal.cancel; cancellation tasks themselves remain counted until
+they really finish. The queried SDK executor continues accepting and running
+late SDK tasks because those Runnables also read results and clean up framework
+fds. Shutdown, dropping tasks, or rejecting late SDK work is not a drain proof.
+API 24–28 synchronous Network.getAllByName remains counted while blocked and
+checks the delivery permit only after it returns. Clearing the local hook holder,
+callback return, Go context cancellation, or an empty active-session map alone is insufficient.
 This gate is mandatory before advertising `speedtest.start`/`speedtest.close`
 coverage or using a queried resolver's disposal as an exact release fact. Native
 Consuming a Go construction/disposal receipt remains a separate mandatory
@@ -198,7 +209,14 @@ Login Host seam follow-up: the production `TransientLoginHost` delegates to
 claims, predecessor disposal, worker dispatch, close callbacks and timers.
 Fake-native tests run that same state machine with controlled queues and latches.
 The production adapter retains native CloseService/Close, network close and
-cache deletion in their prior order. Configuration is cleared from the adapter
+cache deletion in their prior order. Both Login and Speedtest now use the same
+production close-stage seam: nonblocking beginResolverClose precedes native
+CloseService/Close, revokes undelivered DNS results and dispatches cancellation
+without waiting for it. Login retains its ordinary requireExactClose=false
+network path. Real native/network/cache failures retain their original priority
+and cleanup conditions; queried resolver proof uncertainty is separate from
+operational success. A native serviceStop may reenter the captured Entry close
+without a new cleanup lock or a proof wait. Configuration is cleared from the adapter
 after Start returns or disposal is attempted. Successful cleanup drops the
 Entry's engine reference; failed cleanup retains it and blocks conflicting
 Login/main work. Callback exceptions are isolated from dispatch and complete
@@ -213,6 +231,25 @@ this is not a Go Tailscale disposal or custody proof. Rust-authorized generation
 ordering, complete worker/network/DNS drain and TS/cache custody remain separate
 gates. The metadata budget described above closes the unbounded-ledger P2
 without proving any resource drain. Capabilities stay empty and coverage remains 4/11.
+
+The fence runs at the actual Engine.close stage entry. Login's existing serial
+worker and ownership lock still wait for a constructing Start to return before
+that close sequence can run; this slice does not bypass those operational waits.
+The shared seam is tested through the production HostState and SpeedtestSessions
+with fake native boundaries, controlled SDK-cancel queues and JNI latches. Tests
+check fence-before-native-join, reentrant/duplicate old-A close versus successor B,
+error priority and cache/reference conditions, and an already Delivering JNI call
+that stays counted after an operationally successful close. No APK, framework
+network operation, device receipt, queried resolver Exact release, or coverage
+promotion is claimed.
+
+Validation of the early resolver fence (2026-09-30): the two targeted Host suites
+passed 51 tests; the full Kotlin XML receipts contain 158 tests in 14 suites,
+with no failures, errors or skipped tests. Bridge checking passed 31 commands,
+and the six existing Rust login source-contract tests passed with the real
+std-only source-probe library and standalone rustc --test. git diff --check
+passed. These receipts validate the production seam and local mailbox ordering,
+not Android SDK drain, native box disposal or device behavior; coverage stays 4/11.
 
 Validation of the Host seam follow-up (2026-09-30): targeted suites passed
 37 tests; the full Kotlin XML receipts contain 120 tests in 13 suites with no

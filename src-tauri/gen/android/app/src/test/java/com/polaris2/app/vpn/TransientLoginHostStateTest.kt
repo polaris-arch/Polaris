@@ -2,6 +2,8 @@ package com.polaris2.app.vpn
 
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CancellationException
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -43,6 +45,7 @@ class TransientLoginHostStateTest {
     private inner class Fixture(limit: Int = AndroidNativeAdmission.DEFAULT_MAX_METADATA_RECORDS) {
         val ledger = AndroidNativeAdmission("host-process", maxMetadataRecords = limit).also { it.bootstrap(RequiredMarkerProof.Absent) }
         val queue = Queue()
+        val cancellation = Queue()
         val clock = Clock()
         val directory = temporary.newFolder()
         val cache = File(directory, "login-cache-1.db")
@@ -71,10 +74,27 @@ class TransientLoginHostStateTest {
 
         inner class FakeEngine(val id: String, val stop: () -> Unit) : TransientLoginHostState.Engine {
             val closes = AtomicInteger()
+            val resolver = TransientResolverLifecycle(Executor { task -> cancellation.submit { task.run() } })
+            val stages = mutableListOf<String>()
+            var nativeRetained = true
+            var networkRetained = true
+            var fenceFailure: Throwable? = null
             var closeFailure: Throwable? = null
+            var serverCloseFailure: Throwable? = null
+            var networkCloseFailure: Throwable? = null
+            var cacheFailure: Throwable? = null
             var prepareFailure: Throwable? = null
             var startAction: () -> Unit = { }
             var closeAction: () -> Unit = { }
+            private val cleanup = TransientHostCleanup(
+                beginResolverClose = { stages.add("fence"); resolver.beginClose(); fenceFailure?.let { throw it } },
+                closeService = { stages.add("service"); closeAction(); closeFailure?.let { throw it } },
+                closeServer = { stages.add("server"); serverCloseFailure?.let { throw it } },
+                closeNetwork = { stages.add("network"); networkCloseFailure?.let { throw it } },
+                nativeClosed = { nativeRetained = false },
+                networkClosed = { networkRetained = false },
+                closeCache = { stages.add("cache"); cacheFailure?.let { throw it }; check(!cache.exists() || cache.delete()) },
+            )
             override fun prepare(validationTicket: AndroidNativeAdmission.Ticket, stage: (String) -> Unit, cancelled: () -> Boolean) {
                 stage("check")
                 AndroidNativeValidation.run(ledger, validationTicket, setup = {}, nativeCheck = {})
@@ -85,9 +105,7 @@ class TransientLoginHostStateTest {
             override fun start() = startAction()
             override fun close() {
                 closes.incrementAndGet()
-                closeAction()
-                closeFailure?.let { throw it }
-                check(!cache.exists() || cache.delete())
+                cleanup.close()
             }
         }
     }
@@ -194,6 +212,162 @@ class TransientLoginHostStateTest {
         f.host.start(id, "same-state-directory", it.callback)
     }
     private fun close(f: Fixture, id: String): Reply<String?> = Reply<String?>().also { f.host.close(id, it.callback) }
+
+    @Test fun bothProductionHostsUseTheSameEarlyResolverFenceAndLoginKeepsOrdinaryNetworkClose() {
+        val directory = File("src/main/java/com/polaris2/app/vpn")
+        val login = File(directory, "TransientLoginHost.kt").readText()
+        val speedtest = File(directory, "TransientSpeedtestHost.kt").readText()
+        for (source in listOf(login, speedtest)) {
+            assertTrue(source.contains("private val cleanup = TransientHostCleanup("))
+            assertTrue(source.contains("beginResolverClose = { network?.beginResolverClose() }"))
+            assertTrue(source.contains("cleanup.close()"))
+        }
+        assertTrue(login.contains("val createdNetwork = TransientLoginNetwork()"))
+        assertTrue(speedtest.contains("resolverUnknown = { cleanupProof = false }"))
+    }
+
+    @Test fun loginFencesBeforeNativeJoinWithoutWaitingForSdkCancelAndReentrantOldCloseStaysIsolated() {
+        val f = Fixture()
+        start(f, "login-A")
+        f.queue.runNext()
+        val old = f.engine("login-A")
+        val query = old.resolver.enterQuery<Int>()
+        val queryDone = CountDownLatch(1)
+        val writes = AtomicInteger()
+        val error = AtomicReference<Throwable?>()
+        val signalCalls = AtomicInteger()
+        val ownershipLock = f.host.javaClass.getDeclaredField("ownershipLock").apply { isAccessible = true }.get(f.host)
+        val resolverGate = old.resolver.javaClass.getDeclaredField("gate").apply { isAccessible = true }.get(old.resolver)
+        query.installCancellation {
+            assertFalse(Thread.holdsLock(ownershipLock))
+            assertFalse(Thread.holdsLock(resolverGate))
+            signalCalls.incrementAndGet()
+        }
+        Thread {
+            try { query.awaitAndDeliver { writes.incrementAndGet() } }
+            catch (_: CancellationException) { }
+            catch (failure: Throwable) { error.set(failure) }
+            finally { query.returned(); queryDone.countDown() }
+        }.start()
+        old.closeAction = {
+            assertTrue(old.resolver.snapshot().sealed)
+            assertTrue(runCatching { old.resolver.enterQuery<Int>() }.isFailure)
+            await(queryDone) // Existing native Close joins query work; the earlier fence makes it return.
+            old.stop() // Native callback reenters the exact Entry close while the outer close owns it.
+        }
+        val closed = close(f, "login-A")
+        f.queue.runNext()
+        await(closed.done)
+        assertEquals(null, closed.value.get())
+        assertEquals(null, error.get())
+        assertEquals(listOf("fence", "service", "server", "network", "cache"), old.stages)
+        assertEquals(0, writes.get())
+        assertEquals(0, signalCalls.get())
+        assertEquals(1, old.resolver.snapshot().cancellationTasks)
+        assertEquals(1, f.cancellation.size())
+        assertFalse(old.nativeRetained)
+        assertFalse(old.networkRetained)
+        assertFalse(f.cache.exists())
+        f.queue.runNext()
+        assertEquals(1, old.closes.get())
+        val duplicate = close(f, "login-A")
+        await(duplicate.done)
+        start(f, "login-B")
+        f.queue.runNext()
+        val next = f.engine("login-B")
+        old.stop()
+        f.queue.runNext()
+        f.cancellation.runNext()
+        assertEquals(1, signalCalls.get())
+        assertEquals(1, old.closes.get())
+        assertEquals(0, next.closes.get())
+        assertFalse(next.resolver.snapshot().sealed)
+        assertEquals("login-B", f.cache.readText())
+        assertTrue(f.host.running("login-B"))
+        assertEquals(AndroidNativeAdmission.State.Unknown, f.ledger.state(f.ticket("login-A")))
+    }
+
+    @Test fun closeStagesKeepRealErrorPriorityAndOriginalReferenceAndCacheConditions() {
+        for (failedStage in listOf("fence", "service", "server", "network", "cache")) {
+            val f = Fixture()
+            start(f, "login-A")
+            f.queue.runNext()
+            val engine = f.engine("login-A")
+            val error = IllegalStateException("actual-$failedStage")
+            when (failedStage) {
+                "fence" -> engine.fenceFailure = error
+                "service" -> {
+                    engine.fenceFailure = IllegalStateException("secondary-fence")
+                    engine.closeFailure = error
+                    engine.serverCloseFailure = IllegalStateException("secondary-server")
+                    engine.networkCloseFailure = TransientResolverLifecycle.CleanupUnknown()
+                }
+                "server" -> {
+                    engine.serverCloseFailure = error
+                    engine.networkCloseFailure = IllegalStateException("secondary-network")
+                }
+                "network" -> engine.networkCloseFailure = error
+                "cache" -> engine.cacheFailure = error
+            }
+            val closed = close(f, "login-A")
+            f.queue.runNext()
+            await(closed.done)
+            assertEquals(error.message, closed.value.get())
+            val expected = listOf("fence", "service", "server", "network") + if (failedStage == "cache") listOf("cache") else emptyList()
+            assertEquals(expected, engine.stages)
+            assertEquals(failedStage in listOf("fence", "service", "server"), engine.nativeRetained)
+            assertEquals(failedStage != "cache", engine.networkRetained)
+            assertTrue(f.cache.exists())
+            assertTrue(f.host.running("login-A"))
+            assertEquals(AndroidNativeAdmission.State.Unknown, f.ledger.state(f.ticket("login-A")))
+        }
+    }
+
+    @Test fun loginOperationalCloseDoesNotReturnAlreadyDeliveringJniOrQueuedCancelCounts() {
+        val f = Fixture()
+        start(f, "login-A")
+        f.queue.runNext()
+        val old = f.engine("login-A")
+        val query = old.resolver.enterQuery<Int>()
+        val inJni = CountDownLatch(1)
+        val releaseJni = CountDownLatch(1)
+        val queryDone = CountDownLatch(1)
+        val writes = AtomicInteger()
+        val error = AtomicReference<Throwable?>()
+        query.installCancellation { }
+        query.publish(1)
+        Thread {
+            try { query.awaitAndDeliver { inJni.countDown(); await(releaseJni); writes.incrementAndGet() } }
+            catch (failure: Throwable) { error.set(failure) }
+            finally { query.returned(); queryDone.countDown() }
+        }.start()
+        try {
+            await(inJni)
+            val closed = close(f, "login-A")
+            f.queue.runNext()
+            await(closed.done)
+            assertEquals(null, closed.value.get())
+            assertEquals(1, old.resolver.snapshot().calls)
+            assertEquals(1, old.resolver.snapshot().deliveries)
+            assertEquals(1, old.resolver.snapshot().cancellationTasks)
+            assertEquals(TransientResolverLifecycle.Drain.Unknown, old.resolver.awaitLocalDrain(0, TimeUnit.SECONDS))
+            assertEquals(1, old.resolver.snapshot().deliveries)
+            start(f, "login-B")
+            f.queue.runNext()
+            assertTrue(f.host.running("login-B"))
+            assertFalse(f.engine("login-B").resolver.snapshot().sealed)
+            assertFalse(query.publish(2))
+        } finally { releaseJni.countDown() }
+        await(queryDone)
+        assertEquals(null, error.get())
+        assertEquals(1, writes.get())
+        assertEquals(0, old.resolver.snapshot().calls)
+        assertEquals(0, old.resolver.snapshot().deliveries)
+        assertEquals(1, old.resolver.snapshot().cancellationTasks)
+        f.cancellation.runNext()
+        assertEquals(0, old.resolver.snapshot().cancellationTasks)
+        assertEquals(AndroidNativeAdmission.State.Unknown, f.ledger.state(f.ticket("login-A")))
+    }
 
     @Test fun queuedMainPreemptAndLateOldWorkerDoNotCreateNativeOrDeleteSuccessorCache() {
         val f = Fixture()
