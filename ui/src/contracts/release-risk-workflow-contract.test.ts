@@ -43,6 +43,14 @@ const classifyScript = (risk: string) => {
   return lines.slice(start + 1).map((line) => line.slice(10)).join('\n');
 };
 
+function hasStrictResultGate(body: string, variable: string): boolean {
+  const result = `"\\$${variable}"`;
+  const fail = '(?:echo "[^"\\n]*";?\\s*)?exit 1;?\\s*';
+  const negative = new RegExp(`^\\s*if (?:\\[ "\\$[A-Z_]+" = true \\] && )?\\[ ${result} != success \\];?\\s*then\\s*${fail}fi(?:\\s*$)`, 'm');
+  const positive = new RegExp(`^\\s*\\[ ${result} = success \\] \\|\\| \\{\\s*${fail}\\}(?:\\s*$)`, 'm');
+  return negative.test(body) || positive.test(body);
+}
+
 describe('合入前发布风险门', () => {
   const risk = read('release-risk.yml');
   const pkg = read('package.yml');
@@ -295,9 +303,9 @@ esac
 
       // ③ 必须有一条「非 success 就 exit 1」的断言。
       expect(
-        gate,
+        hasStrictResultGate(gate, envMatch![1]),
         `gate 读了 ${job} 的 result 却没有据它判红 —— 读进来不等于判据`,
-      ).toMatch(new RegExp(`\\$${envMatch![1]}" != success[\\s\\S]{0,240}?exit 1`));
+      ).toBe(true);
     }
 
     // ④ 每个「选哪条腿」的开关都必须在 classify 的 outputs 与 impact step 里真的接出来。
@@ -316,6 +324,23 @@ esac
         classify,
         `impact step 没有写出 \`${selector}\` —— output 声明了但没人赋值`,
       ).toContain(`echo "${selector}=`);
+    }
+  });
+
+  it('result 门接受严格等价写法，缺失失败退出或成功绕过仍拒绝', () => {
+    const variable = 'PC_RUNTIME_POLICY_RESULT';
+    const positive = '[ "$PC_RUNTIME_POLICY_RESULT" = success ] || {\n  echo "failure"; exit 1; }';
+    const negative = 'if [ "$PC_RUNTIME_POLICY_RESULT" != success ]; then\n  echo "failure"\n  exit 1\nfi';
+    expect(hasStrictResultGate(positive, variable)).toBe(true);
+    expect(hasStrictResultGate(negative, variable)).toBe(true);
+    for (const body of [positive.replace('exit 1;', ''), positive.replace(variable, 'OTHER_RESULT'),
+      positive.replace('exit 1', 'exit 0'), positive.replace('= success', '!= success'),
+      positive.replace('exit 1', 'true'), positive.replace('exit 1;', 'exit 1 || true;'),
+      `${positive} || true`, negative.replace('exit 1', 'exit 0'),
+      negative.replace('exit 1', 'echo skipped'), negative.replace(variable, 'OTHER_RESULT'),
+      positive.split('\n').map((line) => `# ${line}`).join('\n'),
+      negative.split('\n').map((line) => `# ${line}`).join('\n')]) {
+      expect(hasStrictResultGate(body, variable), body).toBe(false);
     }
   });
 

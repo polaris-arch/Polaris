@@ -17,5 +17,42 @@
     "patchSha256": "69ae099ae06710bdb46c47448909e1bda11cb63dd944e85208c29a19b10bb7c9",
     "goVersion": "1.25.5",
     "binarySha256": "75c33fa1b51d6e7dbb9273b415a31e01bc124cebc062814191e2bdce46224492"
+  },
+  "sourceBuild": {
+    "sourceManifestSha256": null,
+    "provisionerSha256": null,
+    "sourceReceiptFingerprint": null,
+    "moduleGraphSha256": null,
+    "patchedSourceTree": null,
+    "buildTree": null,
+    "version": null,
+    "dependencyModules": null,
+    "transportPins": null,
+    "platforms": {
+      "linux": {
+        "buildTree": null,
+        "patchedModules": null,
+        "transportModules": null,
+        "binarySha256": null
+      },
+      "win": {
+        "buildTree": null,
+        "patchedModules": null,
+        "transportModules": null,
+        "binarySha256": null
+      },
+      "mac-x64": {
+        "buildTree": null,
+        "patchedModules": null,
+        "transportModules": null,
+        "binarySha256": null
+      },
+      "mac-arm64": {
+        "buildTree": null,
+        "patchedModules": null,
+        "transportModules": null,
+        "binarySha256": null
+      }
+    }
   }
 }

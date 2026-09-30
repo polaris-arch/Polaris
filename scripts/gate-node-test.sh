@@ -35,6 +35,8 @@ required_tests=(
   scripts/wiring-verdict.test.mjs
   # PC 发布冻门的策略测试不能被删/改名后静默少跑。
   scripts/assert-pc-runtime-release.test.mjs
+  # Desktop source graph predicates may not disappear from the host fixture gate.
+  scripts/build-desktop-core.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
@@ -88,7 +90,10 @@ fi
 #           行首锚定不许把 `permission:` 算成请求 / 注入 QUERY_ALL_PACKAGES 必红 / 误删一条必红 /
 #           自建 permission 多一条必红 / 取材面塌陷红在取材面 / 下限有牙 / 登记表 8+3 与理由自检）
 #   132 → 141（2026-09-30）PC runtime publication freeze 的 9 条策略/变异回归。
-if [ "$pass" -lt 141 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 141）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+#   141 → 212（2026-09-30）冻结现有 200 条 + desktop source graph 12 条纯 fixture 合同。
+#   212 → 217（2026-09-30）G1 的 5 条逐平台 patched/transport presence 与 fingerprint 合同。
+#   真实 tiny Go buildInfo 用显式 opt-in 单独执行，不借其 skip 数满足下限。
+if [ "$pass" -lt 217 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 217）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

@@ -1,7 +1,19 @@
-# Windows DNS refresh build
+# Desktop patched source graph
 
-Windows ships the pinned `windowsBuild` in `src-tauri/core-manifest.json`.
-Linux and macOS keep the official `bundledCoreVersion` release assets.
+The four desktop builders consume the same core/dependency source graph through
+the shared `scripts/core-source-provision.py` API. This tree consumes its exact
+frozen bytes from `9929a38f19e31ce4374acbb5940bd2985df4a8c0`, SHA-256
+`ef0238183e3076ed3cfa51df824cacd9a74bafa69f40298fa7aae7254e90a24d`.
+That provider is owned outside this desktop slice. Existing eight Go patches
+and the shared source manifest are unchanged here. Unfrozen consumer patches
+and dependency pins are not imported.
+
+`sourceBuild` in `src-tauri/core-manifest.json` deliberately has null pins.
+`fetch-core.mjs` rejects this state before any clone/build/resource write,
+including with `--force`. Old official archive hashes, old Windows output hashes,
+fetch stamps and existing binaries cannot substitute for the new graph. The
+historical `coreArchiveSha256` keys and `windowsBuild` are retained for current
+platform/runtime contracts; they are not proof of a new patched build.
 
 `windows-dns-refresh.patch` changes only Windows system DNS cache invalidation:
 configuration reads recheck adapter DNS at most once per second, even when the
@@ -11,12 +23,154 @@ The patch includes regression tests for DNS-only changes, restoration,
 invalidation and concurrent readers. It is derived from GPLv3 sing-box source
 and distributed under the same license.
 
-Build: `node scripts/fetch-core.mjs --platform=win --force` (Node, Git, curl,
-tar and Go required). The manifest pins the upstream source archive, patch,
-Go toolchain and output SHA-256. Builds use the upstream Windows tags/flags,
-CGO disabled, trimpath and no VCS build metadata. Windows builders execute
-the regression tests 20 times; other hosts cross-compile them without running
-the kernel. A mismatched output is never installed in resources.
+The Windows patch is applied **after** the common provisioned graph. Its final
+Git tree is a separate platform input pin, and its receipt includes the common
+receipt plus overlay SHA. It cannot replace or drop shared patches. Native
+Windows builders retain the DNS regression tests repeated 20 times; other hosts
+compile those tests without executing a Windows binary.
+
+Every platform retains the existing feature tags. Linux is linux/amd64/CGO=0
+with purego and gVisor; Windows is windows/amd64/CGO=0 with purego; both macOS
+architectures are darwin/CGO=1 with gVisor. macOS requires a real SDK/C compiler.
+There is no CGO=0 fallback or removal of QUIC, Tailscale, naive, CCM or USB/IP.
+Upstream preset drift rejects before building. These tools do not change CAP-only
+TUN/P6 admission or any runtime permissions, and do not establish a cross-UID
+broker contract.
+
+Inputs and outputs have separate gates to avoid a first-build hash cycle:
+
+- A native producer needs frozen manifest/provider digests, core/dependency
+  trees, exact module inventory, declared-module graph and source receipt fingerprints,
+  transport module versions, each platform's linked-module policy, version and
+  four platform source trees. It does **not** need an unknown output
+  hash. It verifies an explicit candidate against a clean tracked Git checkout,
+  fetches fresh exact commits, calls the shared provider, applies the overlay,
+  and builds with readonly go.mod, trimpath and no VCS metadata. It reads real
+  `go version -m` output, checks local dependency replacements/features, and emits
+  the actual binary digest and a platform receipt. The desktop BuildID binds the
+  common receipt fingerprint plus final platform tree/overlay, version, Go target
+  and tags plus the selected platform's patched/transport module policy;
+  `go tool buildid` verifies it. Full linked module rows and main
+  go.mod/go.sum byte hashes are recorded, and untracked compiler inputs reject.
+  It never runs the kernel.
+- After all four producer outputs are transported together, assembly computes
+  a four-entry output inventory. This is a transport declaration, not an
+  authentication or acceptance verdict.
+- Artifact consumption requires the same candidate and all four output/receipt
+  hashes, even when `--platform` selects a subset to publish. It rechecks common
+  receipts, Windows overlay tree, actual embedded module replacements and build
+  settings before writing any selected resource. Header paths are excluded from
+  the metadata fingerprint so transport cannot change its identity.
+
+After joint input freeze only, the explicit CLI forms are:
+
+```sh
+# On the appropriate native runner, once per platform key:
+node scripts/fetch-core.mjs --producer --platform=linux \
+  --candidate=FINAL_UNIFIED_SOURCE_SHA --bundle-dir=/controlled/output
+# Combine outputs at <bundle>/<key>/sing-box[.exe] and their .source-receipt.json:
+node scripts/fetch-core.mjs --assemble \
+  --candidate=FINAL_UNIFIED_SOURCE_SHA --bundle-dir=/controlled/bundle
+# Consumption defaults to all four; a selected subset still verifies all four:
+node scripts/fetch-core.mjs \
+  --candidate=FINAL_UNIFIED_SOURCE_SHA --bundle-dir=/controlled/bundle
+```
+
+`FINAL_UNIFIED_SOURCE_SHA` is a placeholder, not an accepted SHA. Do not replace
+it with a source parent or infer artifact provenance from Git HEAD alone. Node,
+Git, Python compatible with the frozen provider, and the pinned Go toolchain are
+required. Provider module-cache/toolchain prerequisites remain part of its
+separate contract; failure is propagated and cannot fall back to stock sources.
+
+The source receipt must explicitly declare `graphScope = declared-patched-modules`
+and `sourceGraphState = dependencies-patched`, with the exact sorted declared
+paths in `moduleGraphQueries`. Its `moduleGraph` and `moduleGraphSha256` cover
+those patched modules, not the full linked graph. The provider separately binds
+the full generated main files as `mainGoModSha256` and `mainGoSumSha256`.
+It does not query or emit transport pins. Desktop `sourceBuild.transportPins`
+is a separate inventory map from module path to exact MVS version. Every
+`sourceBuild.platforms.<key>` requires two complete, disjoint classifications:
+`patchedModules.requiredLinked` + `patchedModules.allowedAbsent` cover exactly
+`dependencyModules`; `transportModules.requiredLinked` +
+`transportModules.confirmedAbsent` cover exactly the transport inventory.
+Missing fields, duplicates, overlaps, omitted inventory entries, unknown entries
+or extra policy fields reject the input freeze in both JS and the Rust updater.
+Every patched module must link by default, including sing-tun on all four
+platforms and nftables on Linux. Only the reviewed Windows/macOS NFT omission
+may be explicitly frozen in `allowedAbsent`; this records permission for the
+confirmed platform nonparticipation, not proof of a particular binary's absence.
+If NFT actually links there, its exact upstream version and local patched
+replacement are still required. A transport module in `requiredLinked` must be
+present with its exact MVS version; one in `confirmedAbsent` must be absent.
+Present non-patched transports cannot use replacements.
+
+For example, with a common patched inventory containing sing-tun and nftables,
+and a transport inventory containing `example.com/transport` and
+`example.com/linux-transport`, the Windows policy is:
+
+```json
+{
+  "patchedModules": {
+    "requiredLinked": ["github.com/sagernet/sing-tun"],
+    "allowedAbsent": ["github.com/sagernet/nftables"]
+  },
+  "transportModules": {
+    "requiredLinked": ["example.com/transport"],
+    "confirmedAbsent": ["example.com/linux-transport"]
+  }
+}
+```
+
+The Linux policy puts both patched and both transport modules in `requiredLinked`
+with empty absence arrays. macOS freezes its own actual transport participation
+and may use the same reviewed NFT omission. These example paths are synthetic,
+not production transport pins. The selected platform policy is bound in
+`platformInputFingerprint` and its BuildID; changing it rejects older platform
+receipts while preserving the provider's common fingerprint and complete graph.
+Final dependency/transport input pins remain null pending joint
+freeze. The final binary receipt records all linked module rows, preserves the
+common receipt fingerprint as `sourceFingerprint`, and adds the final platform
+inputs as `platformInputFingerprint`. Its platform BuildID is checked separately from the
+provider's common BuildID contract, so the Windows overlay cannot be mistaken
+for the common pre-overlay build tree.
+
+The current workflows still call `fetch-core.mjs` without a candidate bundle and
+are intentionally blocked by missing graph pins. Their existing four-binary wire,
+dependency and build-face gates are unchanged. Coordinated native four-producer
+jobs and exact-candidate artifact transport are pending; no CI topology, source
+provenance authentication, real desktop source binary or package execution is
+claimed by these fixtures. The runtime baseline uses a common source version
+only when all frozen input fields are complete; null/partial input keeps the
+existing baseline and Android version behavior. Packaging uses actual consumed
+source receipts/digests for frozen inputs, retaining the old Windows hash check
+for the historical path. Final common source pins and NOTICE text remain pending.
+
+Producer artifacts keep their receipt filenames visible inside each platform
+artifact. Consumption stores metadata at `resources/.source-receipts/`, outside
+the platform directories packaged into the app. Any future artifact upload of
+that metadata must include hidden files explicitly; losing it rejects packaging
+and must not disable a check. Receipt/inventory transport is not source
+authentication by itself.
+
+Light verification (no sing-box build or execution):
+
+```sh
+bash scripts/gate-node-test.sh
+POLARIS_REAL_GO_BUILDINFO_TEST=1 POLARIS_BUILDINFO_GO=/path/to/pinned/go node --test \
+  --test-name-pattern='real tiny local Go' scripts/build-desktop-core.test.mjs
+```
+
+Default source tests use synthetic provider receipts and a stub command runner;
+they prove only rejection/control-flow logic. The opt-in requires the manifest's
+pinned Go version and cross-compiles a tiny local fixture for all four targets,
+with common patched modules and a Linux-only patched module. It keeps the same
+go.mod replacements and confirms that Go omits the Linux-only BuildInfo row on
+Windows/macOS. It downloads no dependencies and executes no output binary.
+It checks actual Go row parsing, not full sing-box build provenance or macOS SDK
+readiness (the tiny fixture contains only Go code).
+None of these receipts prove native process exit, platform resource cleanup,
+global NoOwner, managed admission or release eligibility. The existing release
+freeze remains in force.
 
 The `.polaris.N` suffix follows the upstream prerelease number so normal
 version ordering remains correct: alpha.8 < alpha.8.polaris.1 < alpha.9.
@@ -24,9 +178,6 @@ Polaris builds update with the app. Official online core updates (including
 already staged downloads) cannot replace them. Explicit manual imports stay
 available and retain the existing manual-core protection.
 
-To update: review the upstream patch applicability, rebuild with pinned inputs,
-update all hashes and the NOTICE version, then run native Windows tests and
-package validation. Do not reuse an old binary hash or bypass the check.
-When upstream includes the fix, remove `windowsBuild` and the patch/build
-branch; a newer official bundled version replaces the old managed build via
-the ordinary version comparison.
+Any future pin must follow the combined L/N/R/I/C source freeze and native
+four-platform builds. Do not reuse an old output hash or remove the Windows
+overlay until its upstream replacement and the combined graph are reviewed.

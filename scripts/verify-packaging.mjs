@@ -70,6 +70,8 @@ import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
+import { frozenSourceVersion } from './desktop-core/source-graph.mjs';
+import { verifyPackagedSource } from './desktop-core/bundle.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = join(ROOT, 'src-tauri');
@@ -966,6 +968,12 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   // 取材面是 NOTICE 全文（纯文本，无注释/字符串层需要剥）。两条正则各自**至少命中一次**是正面断言：
   // 只写「不许出现别的版本号」会被「把版本号整段删掉」骗过（删了就一处都不命中，仍是零违反）。
   const version = String(manifest.bundledCoreVersion ?? '');
+  const sourceVersion = frozenSourceVersion(manifest);
+  if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
+      || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
+      || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
+    fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
+  }
   if (manifest.windowsBuild) {
     const build = manifest.windowsBuild;
     if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
@@ -1966,7 +1974,11 @@ function checkPayload(label, root) {
       // 必须独立比 SHA/权限，不能用相同体积或 Build ID 豁免替代内容身份。
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
-        if (label === 'windows' && family.what === 'sing-box') {
+        const coreManifest = family.what === 'sing-box' ? readJson(join(SRC_TAURI, 'core-manifest.json')) : undefined;
+        if (coreManifest && frozenSourceVersion(coreManifest)) {
+          try { verifyPackagedSource(ROOT, coreManifest, expected, p); }
+          catch (error) { fail(`${scope.name}: frozen source artifact/receipt mismatch: ${error.message}`); }
+        } else if (label === 'windows' && family.what === 'sing-box') {
           const build = readJson(join(SRC_TAURI, 'core-manifest.json')).windowsBuild;
           if (build && createHash('sha256').update(readFileSync(p)).digest('hex') !== build.binarySha256) {
             fail(`${scope.name}: Windows 修复核 SHA-256 与 manifest 不符：${p}`);

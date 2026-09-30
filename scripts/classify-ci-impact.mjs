@@ -718,6 +718,25 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     '单一 Debug Android 批次入口；android+debug_assertions 分支走已有预算 plugin 桥，其他构型零资源 disabled stub。'
     + 'Android cargo check 守 cfg 类型，check-android-bridge A15 守 release guard/实际 BoxService 观察接线；'
     + 'APK 构建不会执行 socket、SDK snapshot、OEM guardian 或独立 peer 验收。',
+  'scripts/core-source-provision.py':
+    'This slice consumes the exact frozen shared provider from desktop-core/build-core.mjs. '
+    + 'The current source baseline Android build-libbox does not call it; host source-graph fixtures cover its desktop ABI consumption only. '
+    + 'This is not a claim that the shared helper is desktop-only: merging an Android consumer must replace this registration with its actual APK impact and coverage.',
+  'src-tauri/src/runtime/updater.rs':
+    'Frozen desktop sourceBuild selects the compiled desktop baseline only; the Android branch keeps bundledCoreVersion unchanged. '
+    + 'cargo check --target aarch64-linux-android -p polaris type-checks that branch, while host updater/tests exercises explicit Android '
+    + 'baseline compatibility and incomplete-source negatives. No JNI, APK resource, Android updater flow or on-device cleanup is verified by this change.',
+  'scripts/fetch-core.mjs':
+    'Desktop source producers and four-artifact consumption are invoked by package/release-risk, not android.yml. '
+    + 'Android build-libbox is separately owned and does not invoke desktop fetch-core. Node source-graph fixture tests '
+    + 'cover this desktop control flow; four native source producers and actual embedded buildInfo remain required before packaging.',
+  'scripts/desktop-core/':
+    'Desktop-only source producers and four-artifact receipt consumption preserve existing feature/CGO faces. '
+    + 'This directory is not imported by fetch-protoc or Android build-libbox; Android source provisioning is separately owned. '
+    + 'Required host gate-node-test fixtures cover its rejection boundaries, and native desktop producers must provide real embedded buildInfo before packaging.',
+  'scripts/build-desktop-core.test.mjs':
+    'Host Node fixtures for desktop source graph admission and artifact consumption are registered as required in gate-node-test. '
+    + 'The opt-in tiny Go build only verifies embedded row parsing; neither these tests nor an APK build verify full desktop source binaries.',
   'src-tauri/src/commands/window.rs':
     'app_restart 的共享 Rust 平台派发：Android 保留 QuitState/RestartState 与 request_restart 腿，'
     + '桌面才进入四 producer 的 prepare/commit 门；未新增 JNI 导出、Gradle 或包内资产契约。'
@@ -938,7 +957,7 @@ export function androidRegistrationOf(rawPath) {
   return { key: none, table: 'NO_ANDROID_IMPACT_SCOPES' };
 }
 
-const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs']);
+const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/build-desktop-core.test.mjs', 'scripts/core-source-provision.py']);
 
 /**
  * 随包拉取脚本**被导入的共享模块**面。
@@ -952,7 +971,7 @@ const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs'
  * 逐文件枚举会原样重造这个盲区（下一个抽出来的共享模块又落表外），故按目录整取；
  * 只被非内核脚本引用的将来模块因此被**从严**判为内核门 —— 方向是 fail-closed，可接受。
  */
-const CORE_PATH_PREFIXES = ['scripts/lib/', 'scripts/core-patches/'];
+const CORE_PATH_PREFIXES = ['scripts/lib/', 'scripts/core-patches/', 'scripts/desktop-core/'];
 
 const SHARED_PACKAGE_PATHS = new Set([
   '.cargo/config.toml',
