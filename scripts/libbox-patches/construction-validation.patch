@@ -1,5 +1,5 @@
 diff --git a/adapter/certificate/manager.go b/adapter/certificate/manager.go
-index e4b9b53..d3e9381 100644
+index e4b9b53..2c6ed4b 100644
 --- a/adapter/certificate/manager.go
 +++ b/adapter/certificate/manager.go
 @@ -2,11 +2,13 @@ package certificate
@@ -94,7 +94,7 @@ index e4b9b53..d3e9381 100644
  	if err != nil {
  		return err
  	}
-@@ -135,15 +152,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -135,14 +152,15 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  				return E.Cause(err, stage, " ", name)
  			}
  			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
@@ -108,19 +108,14 @@ index e4b9b53..d3e9381 100644
 -			err = existsProvider.Close()
 -			if err != nil {
 -				return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
+-			}
 +		err = construction.Replace(ctx, "replaced provider", existsProvider, m.runtimeOwners[tag])
-+		if !m.runtimeOwners[tag] {
-+			if err == nil || construction.RecordError(ctx, err) {
-+				err = nil
- 			}
- 		}
 +		if err != nil {
 +			return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
-+		}
+ 		}
  		existsIndex := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
  			return it == existsProvider
- 		})
-@@ -153,6 +176,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -153,6 +171,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
  	}
  	m.providers = append(m.providers, provider)
@@ -326,6 +321,145 @@ index 0000000..758a333
 +		})
 +	}
 +}
+diff --git a/adapter/certificate/manager_replacement_scope_test.go b/adapter/certificate/manager_replacement_scope_test.go
+new file mode 100644
+index 0000000..0ef7b14
+--- /dev/null
++++ b/adapter/certificate/manager_replacement_scope_test.go
+@@ -0,0 +1,133 @@
++package certificate
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++type replacementScopeProbe struct {
++	constructionProbe
++	beforeDispose func()
++}
++
++func (p *replacementScopeProbe) DisposeConstruction() error {
++	if p.beforeDispose != nil {
++		p.beforeDispose()
++	}
++	return p.constructionProbe.DisposeConstruction()
++}
++func (*replacementScopeProbe) Dependencies() []string { return nil }
++
++func TestReplacementFailureDoesNotPublishWithoutActiveParent(t *testing.T) {
++	for _, state := range []string{"no-parent", "closed", "transferred", "active"} {
++		for _, outcome := range []string{"error", "panic", "success"} {
++			t.Run(state+"/"+outcome, func(t *testing.T) {
++				ctx := context.Background()
++				var parent construction.Scope
++				if state != "no-parent" {
++					ctx = construction.WithScope(ctx, &parent)
++				}
++				switch state {
++				case "closed":
++					if err := parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++				case "transferred":
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("replaced child cleanup failed")
++				oldDisposed, newDisposed := 0, 0
++				old := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &oldDisposed}}
++				next := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &newDisposed}}
++				registry := NewRegistry()
++				child := old
++				Register[struct{}](registry, "replacement-factory", func(_ context.Context, _ log.ContextLogger, _ string, _ struct{}) (adapter.CertificateProviderService, error) {
++					return child, nil
++				})
++				m := NewManager(logger, registry)
++				if err := m.Create(context.Background(), logger, "probe", "replacement-factory", nil); err != nil {
++					t.Fatal(err)
++				}
++				if outcome == "error" {
++					old.failure = failure
++				}
++				if outcome == "panic" {
++					old.panicOnClose = true
++				}
++				old.beforeDispose = func() {
++					expected := old
++					if state == "active" {
++						expected = next
++					}
++					if m.providerByTag["probe"] != expected || len(m.providers) != 1 || m.providers[0] != expected {
++						t.Error("replacement disposal observed an unexpected publication")
++					}
++				}
++				next.beforeDispose = func() {
++					if m.providerByTag["probe"] != old || len(m.providers) != 1 || m.providers[0] != old {
++						t.Error("failed replacement child was published before rollback")
++					}
++				}
++				child = next
++				err := m.Create(ctx, logger, "probe", "replacement-factory", nil)
++				if state == "active" {
++					if err != nil {
++						t.Fatalf("active construction parent lost prompt return: %v", err)
++					}
++					if oldDisposed != 0 || newDisposed != 0 {
++						t.Fatal("active parent disposal ran synchronously")
++					}
++					if m.providerByTag["probe"] != next || len(m.providers) != 1 || m.providers[0] != next {
++						t.Fatal("successful child was not published")
++					}
++					err = parent.Close()
++				}
++				switch outcome {
++				case "error":
++					if !errors.Is(err, failure) {
++						t.Fatalf("replacement cleanup error was lost: %v", err)
++					}
++				case "panic":
++					if err == nil || !strings.Contains(err.Error(), "injected cleanup panic") {
++						t.Fatalf("replacement cleanup panic was lost: %v", err)
++					}
++				default:
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				failed := state != "active" && outcome != "success"
++				if failed {
++					if m.providerByTag["probe"] != old || len(m.providers) != 1 || m.providers[0] != old {
++						t.Fatal("failed Create published its new child")
++					}
++					if oldDisposed != 1 || newDisposed != 1 {
++						t.Fatalf("replacement/rollback disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				} else {
++					if m.providerByTag["probe"] != next || len(m.providers) != 1 || m.providers[0] != next {
++						t.Fatal("successful Create did not publish its child")
++					}
++					if oldDisposed != 1 || newDisposed != 0 {
++						t.Fatalf("replacement/published disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				}
++				if err = parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if oldDisposed != 1 || (failed && newDisposed != 1) || (!failed && newDisposed != 0) {
++					t.Fatal("scope retried current-operation disposal")
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/certificate/manager_terminal_scope_test.go b/adapter/certificate/manager_terminal_scope_test.go
 new file mode 100644
 index 0000000..de74207
@@ -413,7 +547,7 @@ index 0000000..de74207
 +	}
 +}
 diff --git a/adapter/endpoint/manager.go b/adapter/endpoint/manager.go
-index ff1889a..bf68f08 100644
+index ff1889a..05251a0 100644
 --- a/adapter/endpoint/manager.go
 +++ b/adapter/endpoint/manager.go
 @@ -2,10 +2,12 @@ package endpoint
@@ -497,7 +631,7 @@ index ff1889a..bf68f08 100644
  	if err != nil {
  		return err
  	}
-@@ -133,15 +147,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -133,14 +147,15 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -511,19 +645,14 @@ index ff1889a..bf68f08 100644
 -			err = existsEndpoint.Close()
 -			if err != nil {
 -				return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
+-			}
 +		err = construction.Replace(ctx, "replaced endpoint", existsEndpoint, m.runtimeOwners[tag])
-+		if !m.runtimeOwners[tag] {
-+			if err == nil || construction.RecordError(ctx, err) {
-+				err = nil
- 			}
- 		}
 +		if err != nil {
 +			return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
-+		}
+ 		}
  		existsIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
  			return it == existsEndpoint
- 		})
-@@ -151,6 +171,24 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -151,6 +166,24 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.endpoints = append(m.endpoints[:existsIndex], m.endpoints[existsIndex+1:]...)
  	}
  	m.endpoints = append(m.endpoints, endpoint)
@@ -762,6 +891,145 @@ index 0000000..f31356a
 +		})
 +	}
 +}
+diff --git a/adapter/endpoint/manager_replacement_scope_test.go b/adapter/endpoint/manager_replacement_scope_test.go
+new file mode 100644
+index 0000000..96d77f0
+--- /dev/null
++++ b/adapter/endpoint/manager_replacement_scope_test.go
+@@ -0,0 +1,133 @@
++package endpoint
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++type replacementScopeProbe struct {
++	constructionProbe
++	beforeDispose func()
++}
++
++func (p *replacementScopeProbe) DisposeConstruction() error {
++	if p.beforeDispose != nil {
++		p.beforeDispose()
++	}
++	return p.constructionProbe.DisposeConstruction()
++}
++func (*replacementScopeProbe) Dependencies() []string { return nil }
++
++func TestReplacementFailureDoesNotPublishWithoutActiveParent(t *testing.T) {
++	for _, state := range []string{"no-parent", "closed", "transferred", "active"} {
++		for _, outcome := range []string{"error", "panic", "success"} {
++			t.Run(state+"/"+outcome, func(t *testing.T) {
++				ctx := context.Background()
++				var parent construction.Scope
++				if state != "no-parent" {
++					ctx = construction.WithScope(ctx, &parent)
++				}
++				switch state {
++				case "closed":
++					if err := parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++				case "transferred":
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("replaced child cleanup failed")
++				oldDisposed, newDisposed := 0, 0
++				old := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &oldDisposed}}
++				next := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &newDisposed}}
++				registry := NewRegistry()
++				child := old
++				Register[struct{}](registry, "replacement-factory", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, _ string, _ struct{}) (adapter.Endpoint, error) {
++					return child, nil
++				})
++				m := NewManager(logger, registry)
++				if err := m.Create(context.Background(), nil, logger, "probe", "replacement-factory", nil); err != nil {
++					t.Fatal(err)
++				}
++				if outcome == "error" {
++					old.failure = failure
++				}
++				if outcome == "panic" {
++					old.panicOnClose = true
++				}
++				old.beforeDispose = func() {
++					expected := old
++					if state == "active" {
++						expected = next
++					}
++					if m.endpointByTag["probe"] != expected || len(m.endpoints) != 1 || m.endpoints[0] != expected {
++						t.Error("replacement disposal observed an unexpected publication")
++					}
++				}
++				next.beforeDispose = func() {
++					if m.endpointByTag["probe"] != old || len(m.endpoints) != 1 || m.endpoints[0] != old {
++						t.Error("failed replacement child was published before rollback")
++					}
++				}
++				child = next
++				err := m.Create(ctx, nil, logger, "probe", "replacement-factory", nil)
++				if state == "active" {
++					if err != nil {
++						t.Fatalf("active construction parent lost prompt return: %v", err)
++					}
++					if oldDisposed != 0 || newDisposed != 0 {
++						t.Fatal("active parent disposal ran synchronously")
++					}
++					if m.endpointByTag["probe"] != next || len(m.endpoints) != 1 || m.endpoints[0] != next {
++						t.Fatal("successful child was not published")
++					}
++					err = parent.Close()
++				}
++				switch outcome {
++				case "error":
++					if !errors.Is(err, failure) {
++						t.Fatalf("replacement cleanup error was lost: %v", err)
++					}
++				case "panic":
++					if err == nil || !strings.Contains(err.Error(), "injected cleanup panic") {
++						t.Fatalf("replacement cleanup panic was lost: %v", err)
++					}
++				default:
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				failed := state != "active" && outcome != "success"
++				if failed {
++					if m.endpointByTag["probe"] != old || len(m.endpoints) != 1 || m.endpoints[0] != old {
++						t.Fatal("failed Create published its new child")
++					}
++					if oldDisposed != 1 || newDisposed != 1 {
++						t.Fatalf("replacement/rollback disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				} else {
++					if m.endpointByTag["probe"] != next || len(m.endpoints) != 1 || m.endpoints[0] != next {
++						t.Fatal("successful Create did not publish its child")
++					}
++					if oldDisposed != 1 || newDisposed != 0 {
++						t.Fatalf("replacement/published disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				}
++				if err = parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if oldDisposed != 1 || (failed && newDisposed != 1) || (!failed && newDisposed != 0) {
++					t.Fatal("scope retried current-operation disposal")
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/endpoint/manager_terminal_scope_test.go b/adapter/endpoint/manager_terminal_scope_test.go
 new file mode 100644
 index 0000000..ee38f57
@@ -849,7 +1117,7 @@ index 0000000..ee38f57
 +	}
 +}
 diff --git a/adapter/inbound/manager.go b/adapter/inbound/manager.go
-index 075e410..d2bd533 100644
+index 075e410..2134b2b 100644
 --- a/adapter/inbound/manager.go
 +++ b/adapter/inbound/manager.go
 @@ -2,10 +2,12 @@ package inbound
@@ -958,7 +1226,7 @@ index 075e410..d2bd533 100644
  	if err != nil {
  		return err
  	}
-@@ -135,15 +152,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -135,14 +152,15 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -972,19 +1240,14 @@ index 075e410..d2bd533 100644
 -			err = existsInbound.Close()
 -			if err != nil {
 -				return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
+-			}
 +		err = construction.Replace(ctx, "replaced inbound", existsInbound, m.runtimeOwners[tag])
-+		if !m.runtimeOwners[tag] {
-+			if err == nil || construction.RecordError(ctx, err) {
-+				err = nil
- 			}
- 		}
 +		if err != nil {
 +			return E.Cause(err, "close inbound/", existsInbound.Type(), "[", existsInbound.Tag(), "]")
-+		}
+ 		}
  		existsIndex := common.Index(m.inbounds, func(it adapter.Inbound) bool {
  			return it == existsInbound
- 		})
-@@ -153,6 +176,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -153,6 +171,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.inbounds = append(m.inbounds[:existsIndex], m.inbounds[existsIndex+1:]...)
  	}
  	m.inbounds = append(m.inbounds, inbound)
@@ -1217,6 +1480,145 @@ index 0000000..7cd8497
 +		})
 +	}
 +}
+diff --git a/adapter/inbound/manager_replacement_scope_test.go b/adapter/inbound/manager_replacement_scope_test.go
+new file mode 100644
+index 0000000..7306dc2
+--- /dev/null
++++ b/adapter/inbound/manager_replacement_scope_test.go
+@@ -0,0 +1,133 @@
++package inbound
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++type replacementScopeProbe struct {
++	constructionProbe
++	beforeDispose func()
++}
++
++func (p *replacementScopeProbe) DisposeConstruction() error {
++	if p.beforeDispose != nil {
++		p.beforeDispose()
++	}
++	return p.constructionProbe.DisposeConstruction()
++}
++func (*replacementScopeProbe) Dependencies() []string { return nil }
++
++func TestReplacementFailureDoesNotPublishWithoutActiveParent(t *testing.T) {
++	for _, state := range []string{"no-parent", "closed", "transferred", "active"} {
++		for _, outcome := range []string{"error", "panic", "success"} {
++			t.Run(state+"/"+outcome, func(t *testing.T) {
++				ctx := context.Background()
++				var parent construction.Scope
++				if state != "no-parent" {
++					ctx = construction.WithScope(ctx, &parent)
++				}
++				switch state {
++				case "closed":
++					if err := parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++				case "transferred":
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("replaced child cleanup failed")
++				oldDisposed, newDisposed := 0, 0
++				old := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &oldDisposed}}
++				next := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &newDisposed}}
++				registry := NewRegistry()
++				child := old
++				Register[struct{}](registry, "replacement-factory", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, _ string, _ struct{}) (adapter.Inbound, error) {
++					return child, nil
++				})
++				m := NewManager(logger, registry, nil)
++				if err := m.Create(context.Background(), nil, logger, "probe", "replacement-factory", nil); err != nil {
++					t.Fatal(err)
++				}
++				if outcome == "error" {
++					old.failure = failure
++				}
++				if outcome == "panic" {
++					old.panicOnClose = true
++				}
++				old.beforeDispose = func() {
++					expected := old
++					if state == "active" {
++						expected = next
++					}
++					if m.inboundByTag["probe"] != expected || len(m.inbounds) != 1 || m.inbounds[0] != expected {
++						t.Error("replacement disposal observed an unexpected publication")
++					}
++				}
++				next.beforeDispose = func() {
++					if m.inboundByTag["probe"] != old || len(m.inbounds) != 1 || m.inbounds[0] != old {
++						t.Error("failed replacement child was published before rollback")
++					}
++				}
++				child = next
++				err := m.Create(ctx, nil, logger, "probe", "replacement-factory", nil)
++				if state == "active" {
++					if err != nil {
++						t.Fatalf("active construction parent lost prompt return: %v", err)
++					}
++					if oldDisposed != 0 || newDisposed != 0 {
++						t.Fatal("active parent disposal ran synchronously")
++					}
++					if m.inboundByTag["probe"] != next || len(m.inbounds) != 1 || m.inbounds[0] != next {
++						t.Fatal("successful child was not published")
++					}
++					err = parent.Close()
++				}
++				switch outcome {
++				case "error":
++					if !errors.Is(err, failure) {
++						t.Fatalf("replacement cleanup error was lost: %v", err)
++					}
++				case "panic":
++					if err == nil || !strings.Contains(err.Error(), "injected cleanup panic") {
++						t.Fatalf("replacement cleanup panic was lost: %v", err)
++					}
++				default:
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				failed := state != "active" && outcome != "success"
++				if failed {
++					if m.inboundByTag["probe"] != old || len(m.inbounds) != 1 || m.inbounds[0] != old {
++						t.Fatal("failed Create published its new child")
++					}
++					if oldDisposed != 1 || newDisposed != 1 {
++						t.Fatalf("replacement/rollback disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				} else {
++					if m.inboundByTag["probe"] != next || len(m.inbounds) != 1 || m.inbounds[0] != next {
++						t.Fatal("successful Create did not publish its child")
++					}
++					if oldDisposed != 1 || newDisposed != 0 {
++						t.Fatalf("replacement/published disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				}
++				if err = parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if oldDisposed != 1 || (failed && newDisposed != 1) || (!failed && newDisposed != 0) {
++					t.Fatal("scope retried current-operation disposal")
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/inbound/manager_terminal_scope_test.go b/adapter/inbound/manager_terminal_scope_test.go
 new file mode 100644
 index 0000000..9184bd4
@@ -1304,7 +1706,7 @@ index 0000000..9184bd4
 +	}
 +}
 diff --git a/adapter/outbound/manager.go b/adapter/outbound/manager.go
-index e4abba6..4fdfbca 100644
+index e4abba6..904098b 100644
 --- a/adapter/outbound/manager.go
 +++ b/adapter/outbound/manager.go
 @@ -2,12 +2,13 @@ package outbound
@@ -1424,7 +1826,7 @@ index e4abba6..4fdfbca 100644
  	if err != nil {
  		return err
  	}
-@@ -274,17 +290,23 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -274,16 +290,17 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -1440,19 +1842,14 @@ index e4abba6..4fdfbca 100644
 -			err = common.Close(existsOutbound)
 -			if err != nil {
 -				return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
+-			}
 +		err = construction.Replace(ctx, "replaced outbound", existsOutbound, m.runtimeOwners[tag])
-+		if !m.runtimeOwners[tag] {
-+			if err == nil || construction.RecordError(ctx, err) {
-+				err = nil
- 			}
- 		}
 +		if err != nil {
 +			return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
-+		}
+ 		}
  		existsIndex := common.Index(m.outbounds, func(it adapter.Outbound) bool {
  			return it == existsOutbound
- 		})
-@@ -294,7 +316,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -294,7 +311,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
  	}
  	m.outbounds = append(m.outbounds, outbound)
@@ -1465,7 +1862,7 @@ index e4abba6..4fdfbca 100644
  	dependencies := outbound.Dependencies()
  	for _, dependency := range dependencies {
  		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
-@@ -307,3 +334,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+@@ -307,3 +329,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
  	}
  	return nil
  }
@@ -1695,6 +2092,145 @@ index 0000000..f83d7b4
 +		})
 +	}
 +}
+diff --git a/adapter/outbound/manager_replacement_scope_test.go b/adapter/outbound/manager_replacement_scope_test.go
+new file mode 100644
+index 0000000..2108245
+--- /dev/null
++++ b/adapter/outbound/manager_replacement_scope_test.go
+@@ -0,0 +1,133 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++type replacementScopeProbe struct {
++	constructionProbe
++	beforeDispose func()
++}
++
++func (p *replacementScopeProbe) DisposeConstruction() error {
++	if p.beforeDispose != nil {
++		p.beforeDispose()
++	}
++	return p.constructionProbe.DisposeConstruction()
++}
++func (*replacementScopeProbe) Dependencies() []string { return nil }
++
++func TestReplacementFailureDoesNotPublishWithoutActiveParent(t *testing.T) {
++	for _, state := range []string{"no-parent", "closed", "transferred", "active"} {
++		for _, outcome := range []string{"error", "panic", "success"} {
++			t.Run(state+"/"+outcome, func(t *testing.T) {
++				ctx := context.Background()
++				var parent construction.Scope
++				if state != "no-parent" {
++					ctx = construction.WithScope(ctx, &parent)
++				}
++				switch state {
++				case "closed":
++					if err := parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++				case "transferred":
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("replaced child cleanup failed")
++				oldDisposed, newDisposed := 0, 0
++				old := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &oldDisposed}}
++				next := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &newDisposed}}
++				registry := NewRegistry()
++				child := old
++				Register[struct{}](registry, "replacement-factory", func(_ context.Context, _ adapter.Router, _ log.ContextLogger, _ string, _ struct{}) (adapter.Outbound, error) {
++					return child, nil
++				})
++				m := NewManager(logger, registry, noEndpoints{}, "")
++				if err := m.Create(context.Background(), nil, logger, "probe", "replacement-factory", nil); err != nil {
++					t.Fatal(err)
++				}
++				if outcome == "error" {
++					old.failure = failure
++				}
++				if outcome == "panic" {
++					old.panicOnClose = true
++				}
++				old.beforeDispose = func() {
++					expected := old
++					if state == "active" {
++						expected = next
++					}
++					if m.outboundByTag["probe"] != expected || len(m.outbounds) != 1 || m.outbounds[0] != expected {
++						t.Error("replacement disposal observed an unexpected publication")
++					}
++				}
++				next.beforeDispose = func() {
++					if m.outboundByTag["probe"] != old || len(m.outbounds) != 1 || m.outbounds[0] != old {
++						t.Error("failed replacement child was published before rollback")
++					}
++				}
++				child = next
++				err := m.Create(ctx, nil, logger, "probe", "replacement-factory", nil)
++				if state == "active" {
++					if err != nil {
++						t.Fatalf("active construction parent lost prompt return: %v", err)
++					}
++					if oldDisposed != 0 || newDisposed != 0 {
++						t.Fatal("active parent disposal ran synchronously")
++					}
++					if m.outboundByTag["probe"] != next || len(m.outbounds) != 1 || m.outbounds[0] != next {
++						t.Fatal("successful child was not published")
++					}
++					err = parent.Close()
++				}
++				switch outcome {
++				case "error":
++					if !errors.Is(err, failure) {
++						t.Fatalf("replacement cleanup error was lost: %v", err)
++					}
++				case "panic":
++					if err == nil || !strings.Contains(err.Error(), "injected cleanup panic") {
++						t.Fatalf("replacement cleanup panic was lost: %v", err)
++					}
++				default:
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				failed := state != "active" && outcome != "success"
++				if failed {
++					if m.outboundByTag["probe"] != old || len(m.outbounds) != 1 || m.outbounds[0] != old {
++						t.Fatal("failed Create published its new child")
++					}
++					if oldDisposed != 1 || newDisposed != 1 {
++						t.Fatalf("replacement/rollback disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				} else {
++					if m.outboundByTag["probe"] != next || len(m.outbounds) != 1 || m.outbounds[0] != next {
++						t.Fatal("successful Create did not publish its child")
++					}
++					if oldDisposed != 1 || newDisposed != 0 {
++						t.Fatalf("replacement/published disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				}
++				if err = parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if oldDisposed != 1 || (failed && newDisposed != 1) || (!failed && newDisposed != 0) {
++					t.Fatal("scope retried current-operation disposal")
++				}
++			})
++		}
++	}
++}
 diff --git a/adapter/outbound/manager_terminal_scope_test.go b/adapter/outbound/manager_terminal_scope_test.go
 new file mode 100644
 index 0000000..e6463a0
@@ -1786,7 +2322,7 @@ index 0000000..e6463a0
 +	}
 +}
 diff --git a/adapter/service/manager.go b/adapter/service/manager.go
-index 9db1585..25c39d5 100644
+index 9db1585..edbfb0d 100644
 --- a/adapter/service/manager.go
 +++ b/adapter/service/manager.go
 @@ -2,10 +2,12 @@ package service
@@ -1893,7 +2429,7 @@ index 9db1585..25c39d5 100644
  	if err != nil {
  		return err
  	}
-@@ -130,15 +147,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -130,14 +147,15 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  			if err != nil {
  				return E.Cause(err, stage, " ", name)
  			}
@@ -1907,19 +2443,14 @@ index 9db1585..25c39d5 100644
 -			err = existsService.Close()
 -			if err != nil {
 -				return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
+-			}
 +		err = construction.Replace(ctx, "replaced service", existsService, m.runtimeOwners[tag])
-+		if !m.runtimeOwners[tag] {
-+			if err == nil || construction.RecordError(ctx, err) {
-+				err = nil
- 			}
- 		}
 +		if err != nil {
 +			return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
-+		}
+ 		}
  		existsIndex := common.Index(m.services, func(it adapter.Service) bool {
  			return it == existsService
- 		})
-@@ -148,6 +171,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
+@@ -148,6 +166,21 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
  		m.services = append(m.services[:existsIndex], m.services[existsIndex+1:]...)
  	}
  	m.services = append(m.services, service)
@@ -2150,6 +2681,145 @@ index 0000000..3e8a19f
 +				t.Fatalf("unowned object runtime-closed %d times", closed)
 +			}
 +		})
++	}
++}
+diff --git a/adapter/service/manager_replacement_scope_test.go b/adapter/service/manager_replacement_scope_test.go
+new file mode 100644
+index 0000000..873b8aa
+--- /dev/null
++++ b/adapter/service/manager_replacement_scope_test.go
+@@ -0,0 +1,133 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++type replacementScopeProbe struct {
++	constructionProbe
++	beforeDispose func()
++}
++
++func (p *replacementScopeProbe) DisposeConstruction() error {
++	if p.beforeDispose != nil {
++		p.beforeDispose()
++	}
++	return p.constructionProbe.DisposeConstruction()
++}
++func (*replacementScopeProbe) Dependencies() []string { return nil }
++
++func TestReplacementFailureDoesNotPublishWithoutActiveParent(t *testing.T) {
++	for _, state := range []string{"no-parent", "closed", "transferred", "active"} {
++		for _, outcome := range []string{"error", "panic", "success"} {
++			t.Run(state+"/"+outcome, func(t *testing.T) {
++				ctx := context.Background()
++				var parent construction.Scope
++				if state != "no-parent" {
++					ctx = construction.WithScope(ctx, &parent)
++				}
++				switch state {
++				case "closed":
++					if err := parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++				case "transferred":
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("replaced child cleanup failed")
++				oldDisposed, newDisposed := 0, 0
++				old := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &oldDisposed}}
++				next := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &newDisposed}}
++				registry := NewRegistry()
++				child := old
++				Register[struct{}](registry, "replacement-factory", func(_ context.Context, _ log.ContextLogger, _ string, _ struct{}) (adapter.Service, error) {
++					return child, nil
++				})
++				m := NewManager(logger, registry)
++				if err := m.Create(context.Background(), logger, "probe", "replacement-factory", nil); err != nil {
++					t.Fatal(err)
++				}
++				if outcome == "error" {
++					old.failure = failure
++				}
++				if outcome == "panic" {
++					old.panicOnClose = true
++				}
++				old.beforeDispose = func() {
++					expected := old
++					if state == "active" {
++						expected = next
++					}
++					if m.serviceByTag["probe"] != expected || len(m.services) != 1 || m.services[0] != expected {
++						t.Error("replacement disposal observed an unexpected publication")
++					}
++				}
++				next.beforeDispose = func() {
++					if m.serviceByTag["probe"] != old || len(m.services) != 1 || m.services[0] != old {
++						t.Error("failed replacement child was published before rollback")
++					}
++				}
++				child = next
++				err := m.Create(ctx, logger, "probe", "replacement-factory", nil)
++				if state == "active" {
++					if err != nil {
++						t.Fatalf("active construction parent lost prompt return: %v", err)
++					}
++					if oldDisposed != 0 || newDisposed != 0 {
++						t.Fatal("active parent disposal ran synchronously")
++					}
++					if m.serviceByTag["probe"] != next || len(m.services) != 1 || m.services[0] != next {
++						t.Fatal("successful child was not published")
++					}
++					err = parent.Close()
++				}
++				switch outcome {
++				case "error":
++					if !errors.Is(err, failure) {
++						t.Fatalf("replacement cleanup error was lost: %v", err)
++					}
++				case "panic":
++					if err == nil || !strings.Contains(err.Error(), "injected cleanup panic") {
++						t.Fatalf("replacement cleanup panic was lost: %v", err)
++					}
++				default:
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				failed := state != "active" && outcome != "success"
++				if failed {
++					if m.serviceByTag["probe"] != old || len(m.services) != 1 || m.services[0] != old {
++						t.Fatal("failed Create published its new child")
++					}
++					if oldDisposed != 1 || newDisposed != 1 {
++						t.Fatalf("replacement/rollback disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				} else {
++					if m.serviceByTag["probe"] != next || len(m.services) != 1 || m.services[0] != next {
++						t.Fatal("successful Create did not publish its child")
++					}
++					if oldDisposed != 1 || newDisposed != 0 {
++						t.Fatalf("replacement/published disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				}
++				if err = parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if oldDisposed != 1 || (failed && newDisposed != 1) || (!failed && newDisposed != 0) {
++					t.Fatal("scope retried current-operation disposal")
++				}
++			})
++		}
 +	}
 +}
 diff --git a/adapter/service/manager_terminal_scope_test.go b/adapter/service/manager_terminal_scope_test.go
@@ -2831,10 +3501,10 @@ index 34871a6..5f34090 100644
  
 diff --git a/common/construction/scope.go b/common/construction/scope.go
 new file mode 100644
-index 0000000..5cfa53e
+index 0000000..78dfd60
 --- /dev/null
 +++ b/common/construction/scope.go
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,318 @@
 +// Package construction tracks resources acquired before a lifecycle owner exists.
 +// Completing this stack is cleanup evidence, not proof of a complete resource audit.
 +package construction
@@ -2852,6 +3522,10 @@ index 0000000..5cfa53e
 +	entries  []*Ownership
 +	errors   []error
 +	terminal bool
++	// Factory scopes cannot retain replacement cleanup past publication. Only
++	// their enclosing construction owner can accept that deferred work.
++	factory          bool
++	replacementOwner *Scope
 +}
 +
 +type Ownership struct {
@@ -2898,7 +3572,11 @@ index 0000000..5cfa53e
 +		ctx = context.Background()
 +	}
 +	parent, _ := ctx.Value(contextKey{}).(*Scope)
-+	scope := new(Scope)
++	replacementOwner := parent
++	if parent != nil && parent.factory {
++		replacementOwner = parent.replacementOwner
++	}
++	scope := &Scope{factory: true, replacementOwner: replacementOwner}
 +	return WithScope(ctx, scope), func(published bool) error {
 +		if published {
 +			cleanup := scope.TransferAll()
@@ -2959,12 +3637,16 @@ index 0000000..5cfa53e
 +	return DeferCleanup(ctx, name, func() error { return Dispose(name, value, runtimeOwner) })
 +}
 +
-+// Replace defers construction disposal separately from the resources transferred
-+// to a completed parent. Runtime replacement retains its synchronous Close.
++// Replace can defer only to an enclosing construction owner that accepts the
++// work now. A factory without that owner must dispose before publishing its new
++// child and return any failure. Runtime replacement stays synchronous.
 +func Replace(ctx context.Context, name string, value any, runtimeOwner bool) error {
 +	if !runtimeOwner && ctx != nil {
 +		if scope, _ := ctx.Value(contextKey{}).(*Scope); scope != nil {
-+			if scope.appendPending(name, func() error { return Dispose(name, value, false) }) {
++			if scope.factory {
++				scope = scope.replacementOwner
++			}
++			if scope != nil && scope.appendPending(name, func() error { return Dispose(name, value, false) }) {
 +				return nil
 +			}
 +		}
@@ -3140,6 +3822,174 @@ index 0000000..5cfa53e
 +		return fmt.Errorf("close %s: %w", name, err)
 +	}
 +	return nil
++}
+diff --git a/common/construction/scope_replacement_test.go b/common/construction/scope_replacement_test.go
+new file mode 100644
+index 0000000..b159c7c
+--- /dev/null
++++ b/common/construction/scope_replacement_test.go
+@@ -0,0 +1,162 @@
++package construction
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type replacementCleanupProbe struct{ cleanup func() error }
++
++func (p replacementCleanupProbe) DisposeConstruction() error { return p.cleanup() }
++
++func TestFactoryReplacementWithoutConstructionOwnerIsSynchronous(t *testing.T) {
++	for _, state := range []string{"no-parent", "closed", "transferred", "closed-after-begin", "transferred-after-begin"} {
++		for _, outcome := range []string{"error", "panic"} {
++			t.Run(state+"/"+outcome, func(t *testing.T) {
++				ctx := context.Background()
++				var parent Scope
++				if state != "no-parent" {
++					ctx = WithScope(ctx, &parent)
++				}
++				terminate := func() {
++					if strings.HasPrefix(state, "closed") {
++						if err := parent.Close(); err != nil {
++							t.Fatal(err)
++						}
++					} else if strings.HasPrefix(state, "transferred") {
++						if err := parent.TransferAll().Close(); err != nil {
++							t.Fatal(err)
++						}
++					}
++				}
++				if !strings.HasSuffix(state, "after-begin") {
++					terminate()
++				}
++				outer, completeOuter := Begin(ctx)
++				inner, completeInner := Begin(outer)
++				if strings.HasSuffix(state, "after-begin") {
++					terminate()
++				}
++				failure := errors.New("replacement cleanup failed")
++				disposed := 0
++				err := Replace(inner, "replaced child", replacementCleanupProbe{func() error {
++					disposed++
++					if outcome == "panic" {
++						panic("replacement cleanup panic")
++					}
++					return failure
++				}}, false)
++				if outcome == "error" && !errors.Is(err, failure) || outcome == "panic" && (err == nil || !strings.Contains(err.Error(), "replacement cleanup panic")) {
++					t.Fatalf("replacement was deferred past its caller: %v", err)
++				}
++				if disposed != 1 {
++					t.Fatalf("synchronous replacement disposal = %d", disposed)
++				}
++				if err = completeInner(false); err != nil {
++					t.Fatal(err)
++				}
++				if err = completeOuter(false); err != nil {
++					t.Fatal(err)
++				}
++				if err = parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if disposed != 1 {
++					t.Fatal("nested factory scopes retried replacement disposal")
++				}
++			})
++		}
++	}
++}
++
++func TestActiveParentReplacementReturnsBeforeBlockedDisposal(t *testing.T) {
++	var parent Scope
++	outer, completeOuter := Begin(WithScope(context.Background(), &parent))
++	inner, completeInner := Begin(outer)
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
++	failure := errors.New("blocked replacement cleanup failed")
++	var disposed atomic.Int32
++	replaced := make(chan error, 1)
++	go func() {
++		replaced <- Replace(inner, "blocked old child", replacementCleanupProbe{func() error {
++			disposed.Add(1)
++			close(entered)
++			<-release
++			return failure
++		}}, false)
++	}()
++	select {
++	case err := <-replaced:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("replacement blocked despite an active construction owner")
++	}
++	if disposed.Load() != 0 {
++		t.Fatal("factory operation ran deferred disposal")
++	}
++	if err := completeInner(true); err != nil {
++		t.Fatal(err)
++	}
++	if err := completeOuter(true); err != nil {
++		t.Fatal(err)
++	}
++	drained := make(chan error, 1)
++	go func() { drained <- parent.Close() }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("enclosing construction owner did not retain replacement disposal")
++	}
++	select {
++	case err := <-drained:
++		t.Fatalf("owner returned while replacement was blocked: %v", err)
++	default:
++	}
++	releaseOnce.Do(func() { close(release) })
++	if err := <-drained; !errors.Is(err, failure) {
++		t.Fatalf("enclosing owner lost replacement failure: %v", err)
++	}
++	if disposed.Load() != 1 {
++		t.Fatal("replacement was not disposed exactly once by its retained owner")
++	}
++}
++
++func TestFactoryReplacementAndParentCloseRace(t *testing.T) {
++	for i := 0; i < 100; i++ {
++		var parent Scope
++		ctx, complete := Begin(WithScope(context.Background(), &parent))
++		failure := errors.New("raced replacement cleanup failed")
++		var disposed atomic.Int32
++		start := make(chan struct{})
++		replaced, closed := make(chan error, 1), make(chan error, 1)
++		go func() {
++			<-start
++			replaced <- Replace(ctx, "raced old child", replacementCleanupProbe{func() error { disposed.Add(1); return failure }}, false)
++		}()
++		go func() {
++			<-start
++			closed <- parent.Close()
++		}()
++		close(start)
++		replacementErr, closeErr := <-replaced, <-closed
++		if errors.Is(replacementErr, failure) == errors.Is(closeErr, failure) {
++			t.Fatalf("iteration %d: replacement failure must have one active owner: %v / %v", i, replacementErr, closeErr)
++		}
++		if disposed.Load() != 1 {
++			t.Fatalf("iteration %d: replacement disposal = %d", i, disposed.Load())
++		}
++		if err := complete(false); err != nil {
++			t.Fatal(err)
++		}
++		assertDetached(t, &parent)
++	}
 +}
 diff --git a/common/construction/scope_terminal_test.go b/common/construction/scope_terminal_test.go
 new file mode 100644
@@ -3651,7 +4501,7 @@ index 0000000..6ed742f
 +
 +func (p constructionProbe) DisposeConstruction() error { return p.Close() }
 diff --git a/dns/transport_manager.go b/dns/transport_manager.go
-index e822231..2742a20 100644
+index e822231..dcd7572 100644
 --- a/dns/transport_manager.go
 +++ b/dns/transport_manager.go
 @@ -2,12 +2,13 @@ package dns
@@ -3760,7 +4610,7 @@ index e822231..2742a20 100644
  	if err != nil {
  		return err
  	}
-@@ -257,15 +268,21 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -257,14 +268,15 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  			if err != nil {
  				return E.Cause(err, stage, " dns/", transport.Type(), "[", transport.Tag(), "]")
  			}
@@ -3774,19 +4624,14 @@ index e822231..2742a20 100644
 -			err = common.Close(existsTransport)
 -			if err != nil {
 -				return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
+-			}
 +		err = construction.Replace(ctx, "replaced transport", existsTransport, m.runtimeOwners[tag])
-+		if !m.runtimeOwners[tag] {
-+			if err == nil || construction.RecordError(ctx, err) {
-+				err = nil
- 			}
- 		}
 +		if err != nil {
 +			return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
-+		}
+ 		}
  		existsIndex := common.Index(m.transports, func(it adapter.DNSTransport) bool {
  			return it == existsTransport
- 		})
-@@ -275,7 +292,12 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -275,7 +287,12 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  		m.transports = append(m.transports[:existsIndex], m.transports[existsIndex+1:]...)
  	}
  	m.transports = append(m.transports, transport)
@@ -3799,7 +4644,7 @@ index e822231..2742a20 100644
  	dependencies := transport.Dependencies()
  	for _, dependency := range dependencies {
  		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
-@@ -297,3 +319,13 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
+@@ -297,3 +314,13 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
  	}
  	return nil
  }
@@ -3957,6 +4802,145 @@ index 0000000..a3f5a2f
 +				t.Fatalf("unowned object runtime-closed %d times", closed)
 +			}
 +		})
++	}
++}
+diff --git a/dns/transport_manager_replacement_scope_test.go b/dns/transport_manager_replacement_scope_test.go
+new file mode 100644
+index 0000000..cc4aad7
+--- /dev/null
++++ b/dns/transport_manager_replacement_scope_test.go
+@@ -0,0 +1,133 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing-box/log"
++)
++
++type replacementScopeProbe struct {
++	constructionProbe
++	beforeDispose func()
++}
++
++func (p *replacementScopeProbe) DisposeConstruction() error {
++	if p.beforeDispose != nil {
++		p.beforeDispose()
++	}
++	return p.constructionProbe.DisposeConstruction()
++}
++func (*replacementScopeProbe) Dependencies() []string { return nil }
++
++func TestReplacementFailureDoesNotPublishWithoutActiveParent(t *testing.T) {
++	for _, state := range []string{"no-parent", "closed", "transferred", "active"} {
++		for _, outcome := range []string{"error", "panic", "success"} {
++			t.Run(state+"/"+outcome, func(t *testing.T) {
++				ctx := context.Background()
++				var parent construction.Scope
++				if state != "no-parent" {
++					ctx = construction.WithScope(ctx, &parent)
++				}
++				switch state {
++				case "closed":
++					if err := parent.Close(); err != nil {
++						t.Fatal(err)
++					}
++				case "transferred":
++					if err := parent.TransferAll().Close(); err != nil {
++						t.Fatal(err)
++					}
++				}
++				logger := log.NewNOPFactory().Logger()
++				failure := errors.New("replaced child cleanup failed")
++				oldDisposed, newDisposed := 0, 0
++				old := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &oldDisposed}}
++				next := &replacementScopeProbe{constructionProbe: constructionProbe{tag: "probe", closed: &newDisposed}}
++				registry := NewTransportRegistry()
++				child := old
++				RegisterTransport[struct{}](registry, "replacement-factory", func(_ context.Context, _ log.ContextLogger, _ string, _ struct{}) (adapter.DNSTransport, error) {
++					return child, nil
++				})
++				m := NewTransportManager(logger, registry, nil, "")
++				if err := m.Create(context.Background(), logger, "probe", "replacement-factory", nil); err != nil {
++					t.Fatal(err)
++				}
++				if outcome == "error" {
++					old.failure = failure
++				}
++				if outcome == "panic" {
++					old.panicOnClose = true
++				}
++				old.beforeDispose = func() {
++					expected := old
++					if state == "active" {
++						expected = next
++					}
++					if m.transportByTag["probe"] != expected || len(m.transports) != 1 || m.transports[0] != expected {
++						t.Error("replacement disposal observed an unexpected publication")
++					}
++				}
++				next.beforeDispose = func() {
++					if m.transportByTag["probe"] != old || len(m.transports) != 1 || m.transports[0] != old {
++						t.Error("failed replacement child was published before rollback")
++					}
++				}
++				child = next
++				err := m.Create(ctx, logger, "probe", "replacement-factory", nil)
++				if state == "active" {
++					if err != nil {
++						t.Fatalf("active construction parent lost prompt return: %v", err)
++					}
++					if oldDisposed != 0 || newDisposed != 0 {
++						t.Fatal("active parent disposal ran synchronously")
++					}
++					if m.transportByTag["probe"] != next || len(m.transports) != 1 || m.transports[0] != next {
++						t.Fatal("successful child was not published")
++					}
++					err = parent.Close()
++				}
++				switch outcome {
++				case "error":
++					if !errors.Is(err, failure) {
++						t.Fatalf("replacement cleanup error was lost: %v", err)
++					}
++				case "panic":
++					if err == nil || !strings.Contains(err.Error(), "injected cleanup panic") {
++						t.Fatalf("replacement cleanup panic was lost: %v", err)
++					}
++				default:
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				failed := state != "active" && outcome != "success"
++				if failed {
++					if m.transportByTag["probe"] != old || len(m.transports) != 1 || m.transports[0] != old {
++						t.Fatal("failed Create published its new child")
++					}
++					if oldDisposed != 1 || newDisposed != 1 {
++						t.Fatalf("replacement/rollback disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				} else {
++					if m.transportByTag["probe"] != next || len(m.transports) != 1 || m.transports[0] != next {
++						t.Fatal("successful Create did not publish its child")
++					}
++					if oldDisposed != 1 || newDisposed != 0 {
++						t.Fatalf("replacement/published disposal = %d/%d", oldDisposed, newDisposed)
++					}
++				}
++				if err = parent.Close(); err != nil {
++					t.Fatal(err)
++				}
++				if oldDisposed != 1 || (failed && newDisposed != 1) || (!failed && newDisposed != 0) {
++					t.Fatal("scope retried current-operation disposal")
++				}
++			})
++		}
 +	}
 +}
 diff --git a/dns/transport_manager_terminal_scope_test.go b/dns/transport_manager_terminal_scope_test.go
