@@ -16,6 +16,12 @@ use polaris_core_supervisor::{
 /// 冒充 `sing-box check` 的探针（cargo 在集成测试期注入绝对路径）。
 const PROBE: &str = env!("CARGO_BIN_EXE_check_probe");
 
+// Production validation custody is process-wide and deliberately refuses new
+// births while another caller is settling cleanup debt. These independent probe
+// cases each own a Tokio runtime but share that registry, so keep each fixture's
+// complete check/cleanup/witness lifecycle exclusive within this test target.
+static CHECK_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct ConfigFixture {
     dir: std::path::PathBuf,
     config: std::path::PathBuf,
@@ -38,6 +44,7 @@ impl Drop for ConfigFixture {
     }
 }
 async fn checked(mode: &str) -> ConfigCheckVerdict {
+    let _fixture_guard = CHECK_FIXTURE.lock().await;
     let fixture = ConfigFixture::new(mode);
     run_config_check(Path::new(PROBE), &fixture.config)
         .await
@@ -126,6 +133,7 @@ async fn nonzero_exit_with_no_output_still_reports_something() {
 /// 「一个节点都用不了」。变异：把 spawn 失败那一支改成返回 `Unattributable` 或 `Rejected` ⇒ 本条断。
 #[tokio::test]
 async fn missing_binary_is_unavailable_not_invalid() {
+    let _fixture_guard = CHECK_FIXTURE.lock().await;
     let missing = Path::new(PROBE).with_file_name("polaris-no-such-core-binary");
     let fixture = ConfigFixture::new("accept");
     let verdict = run_config_check(&missing, &fixture.config).await.unwrap();
@@ -151,6 +159,7 @@ async fn missing_binary_is_unavailable_not_invalid() {
 /// 「路径根本没传对、这条腿从来就写不出文件」—— 那样断言恒真、零信息量。
 #[tokio::test]
 async fn times_out_and_kills_the_child() {
+    let _fixture_guard = CHECK_FIXTURE.lock().await;
     let dir = std::env::temp_dir().join(format!("polaris-gate-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("建临时目录");
 
@@ -209,6 +218,7 @@ async fn times_out_and_kills_the_child() {
 /// 判据形态与正向对照的必要性同 [`times_out_and_kills_the_child`]，此处不重复论证。
 #[tokio::test]
 async fn run_check_raw_confirms_same_child_exit_after_timeout() {
+    let _fixture_guard = CHECK_FIXTURE.lock().await;
     let dir = std::env::temp_dir().join(format!("polaris-raw-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("建临时目录");
 
