@@ -924,9 +924,8 @@ jobs:
 
       # ── 改名成资产名（跨文件命名契约的产出侧）──
       #
-      # 版本取的是**包里那一份**（`.tauri/tauri.properties` 的 `tauri.android.versionName`，
-      # 即 `build.gradle.kts` 自己读的那个文件），不是 `tauri.conf.json`：判据要住在真值所在地，
-      # 否则「conf 改了但 tauri CLI 没重铺 properties」会产出一个名字与内容对不上的资产。
+      # 命名使用 aapt2 读取的 APK manifest 版本；同时与 Gradle 实际读取的
+      # app/tauri.properties 双版本对拍，拒绝生成 metadata 与产物内容漂移。
       - name: 改名成 release 资产名
         id: asset
         shell: bash
@@ -937,10 +936,23 @@ jobs:
             echo "::error::$built 不在。gradle 出的若是 app-arm64-release-unsigned.apk，说明签名根本没接上 —— 那个包装不上，绝不发。"
             ls -R src-tauri/gen/android/app/build/outputs/apk || true
             exit 1; }
-          props=src-tauri/gen/android/.tauri/tauri.properties
+          props=src-tauri/gen/android/app/tauri.properties
           [ -s "$props" ] || { echo "::error::$props 不在 —— 版本号的真值源没铺出来"; exit 1; }
-          version=$(sed -n 's/^tauri\.android\.versionName=//p' "$props" | head -n1)
-          [ -n "$version" ] || { echo "::error::$props 里没有 tauri.android.versionName"; exit 1; }
+          expected_version=$(sed -n 's/^tauri\.android\.versionName=//p' "$props")
+          expected_version_code=$(sed -n 's/^tauri\.android\.versionCode=//p' "$props")
+          compile_sdk="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+' \
+            src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
+          [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
+          aapt2="$ANDROID_HOME/build-tools/${compile_sdk}.0.0/aapt2"
+          [ -x "$aapt2" ] || { echo "::error::找不到 aapt2：$aapt2"; exit 1; }
+          badging="$("$aapt2" dump badging "$built")"
+          version=$(printf '%s\n' "$badging" | sed -n "s/^package: .* versionName='\([^']*\)'.*/\1/p")
+          version_code=$(printf '%s\n' "$badging" | sed -n "s/^package: .* versionCode='\([^']*\)'.*/\1/p")
+          if [ -z "$version" ] || [[ ! "$version_code" =~ ^[1-9][0-9]*$ ]] || \
+             [ "$version" != "$expected_version" ] || [ "$version_code" != "$expected_version_code" ]; then
+            echo "::error::APK manifest versionName/versionCode 与 $props 不一致或不可读取（APK=$version/$version_code，Gradle=$expected_version/$expected_version_code）"
+            exit 1
+          fi
           tag="${{ steps.release_identity.outputs.tag }}"
           [ "$tag" = "v$version" ] || {
             echo "::error::tag（$tag）与包里的版本（$version）对不上 —— 发出去的资产会与它的名字说两件事"

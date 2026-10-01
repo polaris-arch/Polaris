@@ -8,9 +8,10 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
@@ -371,6 +372,75 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       'signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}',
     );
     expect(publish).not.toContain('--draft=false');
+  });
+
+  it('Android 资产命名读取实际 Gradle metadata，并与 APK manifest 的双版本对拍', () => {
+    const publish = jobBlock(workflow('android.yml'), 'release-apk');
+    const asset = stepBlock(publish, '改名成 release 资产名');
+    const run = asset.split('        run: |\n')[1];
+    expect(run).toBeDefined();
+    const good = "package: name='com.polaris2.app' versionCode='1000000' versionName='1.0.0' platformBuildVersionName='16'";
+    const goodProps = 'tauri.android.versionName=1.0.0\ntauri.android.versionCode=1000000\n';
+    for (const [badging, properties, tag, aaptExit, expected] of [
+      [good, goodProps, 'v1.0.0', 0, 0],
+      [good.replace("versionName='1.0.0'", "versionName='0.9.0'"), goodProps, 'v1.0.0', 0, 1],
+      [good.replace("versionCode='1000000'", "versionCode='999999'"), goodProps, 'v1.0.0', 0, 1],
+      [good, goodProps.replace('versionName=1.0.0', 'versionName=0.9.0'), 'v1.0.0', 0, 1],
+      [good, goodProps.replace('versionCode=1000000', 'versionCode=999999'), 'v1.0.0', 0, 1],
+      [good, goodProps + 'tauri.android.versionName=1.0.0\n', 'v1.0.0', 0, 1],
+      [good, goodProps + 'tauri.android.versionCode=1000000\n', 'v1.0.0', 0, 1],
+      [good, 'tauri.android.versionName=1.0.0\n', 'v1.0.0', 0, 1],
+      [good, 'tauri.android.versionCode=1000000\n', 'v1.0.0', 0, 1],
+      [good, null, 'v1.0.0', 0, 1],
+      ['', goodProps, 'v1.0.0', 0, 1],
+      ["package: name='com.polaris2.app'", goodProps, 'v1.0.0', 0, 1],
+      [good + '\n' + good, goodProps, 'v1.0.0', 0, 1],
+      [good.replace("versionCode='1000000'", "versionCode='invalid'"), goodProps, 'v1.0.0', 0, 1],
+      [good, goodProps, 'v1.0.0', 1, 1],
+      [good, goodProps, 'v0.9.0', 0, 1],
+    ] as const) {
+      const fixture = mkdtempSync(join(tmpdir(), 'polaris-android-asset-'));
+      try {
+        const app = join(fixture, 'src-tauri/gen/android/app');
+        const apkDir = join(app, 'build/outputs/apk/arm64/release');
+        const tools = join(fixture, 'sdk/build-tools/36.0.0');
+        const output = join(fixture, 'github-output');
+        mkdirSync(apkDir, { recursive: true });
+        mkdirSync(tools, { recursive: true });
+        writeFileSync(join(app, 'build.gradle.kts'), 'android { compileSdk = 36 }\n');
+        if (properties !== null) {
+          writeFileSync(join(app, 'tauri.properties'), properties);
+        }
+        const bytes = 'synthetic APK bytes; no Android build';
+        writeFileSync(join(apkDir, 'app-arm64-release.apk'), bytes);
+        // Only the real asset step's metadata input is synthetic. No SDK or APK
+        // command runs; the shell probe returns the manifest fixture verbatim.
+        const aapt2 = join(tools, 'aapt2');
+        writeFileSync(aapt2, '#!/bin/sh\n[ "$1" = dump ] && [ "$2" = badging ] || exit 2\nprintf \'%s\\n\' "$APK_BADGING"\nexit "$AAPT_EXIT"\n');
+        chmodSync(aapt2, 0o755);
+        expect(existsSync(join(fixture, 'src-tauri/gen/android/.tauri/tauri.properties'))).toBe(false);
+        const script = run.replace(/^ {10}/gm, '').replaceAll(
+          '${{ steps.release_identity.outputs.tag }}', tag,
+        );
+        const result = spawnSync('bash', ['-c', script], {
+          cwd: fixture,
+          env: { ...process.env, RUNNER_TEMP: fixture, GITHUB_OUTPUT: output,
+            ANDROID_HOME: join(fixture, 'sdk'), APK_BADGING: badging, AAPT_EXIT: String(aaptExit) },
+          encoding: 'utf8',
+        });
+        expect(result.status, result.stdout + result.stderr).toBe(expected);
+        const renamed = join(fixture, 'polaris-1.0.0-android-arm64.apk');
+        expect(existsSync(renamed)).toBe(expected === 0);
+        if (expected === 0) {
+          expect(readFileSync(renamed, 'utf8')).toBe(bytes);
+          expect(readFileSync(output, 'utf8')).toContain('name=polaris-1.0.0-android-arm64.apk\n');
+        } else {
+          expect(existsSync(output)).toBe(false);
+        }
+      } finally {
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    }
   });
 
   it('最终清单包含从草稿回读的 APK，并与远端完整资产集合双向对账后才公开', () => {
