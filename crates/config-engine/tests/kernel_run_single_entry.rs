@@ -142,7 +142,7 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
         ),
         (
             "crates/config-engine/tests/managed_mesh_emission_runtime.rs",
-            8,
+            10,
             1,
         ),
         ("crates/singbox-grpc/tests/native_clash_mode.rs", 1, 1),
