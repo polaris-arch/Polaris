@@ -1268,10 +1268,10 @@ jobs:
       # 副作用（无害，如实记）：windows 腿命中的文件从此全在 dist-win/ 下，upload-artifact v7 按
       # **实际命中文件的最近公共祖先**建树 ⇒ 该 artifact 由「保留 dist-win/ 一层」变成平铺。
       # 下游只用 `find -type f` + basename，不假设层级（见发布 DAG 的 Download 注释）。
-      - name: Mark desktop artifacts as controlled validation candidates
+      - name: Describe source-first desktop artifacts
         shell: bash
         run: |
-          printf '%s\n' 'Desktop artifacts are controlled validation candidates. PC runtime publishing remains blocked until owner stop/custody and platform acceptance are complete.' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'Desktop artifacts use the reviewed source-first release policy. Native/device acceptance is NotObserved; Exact/NoOwner remain Unknown and managed status is NotGranted. Publication still requires the complete signed Release DAG.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
         if: env.POLARIS_UPLOAD_ARTIFACTS == '1'
@@ -1361,7 +1361,7 @@ jobs:
         with:
           node-version: '26'
 
-      - name: Require PC runtime release clearance
+      - name: Require reviewed source-first release policy
         run: node scripts/assert-pc-runtime-release.mjs
 
       # 四个 artifact 合并落进 dist-release/。
@@ -1697,7 +1697,7 @@ jobs:
         with:
           node-version: '26'
 
-      - name: Require PC runtime release clearance
+      - name: Require reviewed source-first release policy
         run: node scripts/assert-pc-runtime-release.mjs
 
       - name: Verify release identity is still the same draft

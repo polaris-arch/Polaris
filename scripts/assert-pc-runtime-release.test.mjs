@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { ALL_PACKAGE_PLATFORMS, classifyImpact } from './classify-ci-impact.mjs';
+import { assertSourceFirstRelease } from './assert-pc-runtime-release.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const script = join(root, 'scripts/assert-pc-runtime-release.mjs');
 const command = 'node scripts/assert-pc-runtime-release.mjs';
-const clearanceName = 'Require PC runtime release clearance';
+const clearanceName = 'Require reviewed source-first release policy';
 const packageYaml = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
 const riskYaml = readFileSync(join(root, '.github/workflows/release-risk.yml'), 'utf8');
 
@@ -51,7 +53,9 @@ function requirePackagePolicy(yaml) {
   const candidate = job(yaml, 'package');
   requireCandidateSources(candidate);
   assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
-  assert.ok(candidate.includes('controlled validation candidates'));
+  assert.ok(candidate.includes('reviewed source-first release policy'));
+  assert.ok(candidate.includes('Native/device acceptance is NotObserved'));
+  assert.ok(candidate.includes('Exact/NoOwner remain Unknown and managed status is NotGranted'));
   assert.ok(candidate.includes('uses: actions/upload-artifact@'));
 }
 
@@ -63,7 +67,7 @@ function requireCandidateSources(candidate) {
 function requireRiskPolicy(yaml) {
   const policy = job(yaml, 'pc_runtime_release_policy');
   assert.doesNotMatch(policy, /^    (?:if|needs|continue-on-error):/m);
-  const verify = step(policy, 'Verify unconditional PC publication block').text;
+  const verify = step(policy, 'Verify fail-closed source-first release policy').text;
   assert.doesNotMatch(verify, /^        (?:if|continue-on-error):/m);
   assert.match(verify, /^        run: node --test scripts\/assert-pc-runtime-release\.test\.mjs$/m);
   const gate = job(yaml, 'gate');
@@ -75,45 +79,124 @@ function requireRiskPolicy(yaml) {
   assert.doesNotMatch(events, /^\s+(?:paths|paths-ignore):/m);
 }
 
-function runBlock(args = [], env = {}) {
-  return spawnSync(process.execPath, [script, ...args], {
+function runPolicy(args = [], env = {}, policyScript = script) {
+  return spawnSync(process.execPath, [policyScript, ...args], {
     cwd: root,
     encoding: 'utf8',
     env: { ...process.env, ...env },
   });
 }
 
-test('PC runtime script blocks publishing and labels candidates for controlled validation', () => {
-  const result = runBlock();
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED/);
-  assert.match(result.stderr, /sing-tun PC runtime Start\/PostStart, internal rollback, stale cleanup/);
-  assert.match(result.stderr, /controlled validation/);
+const sourcePath = 'scripts/libbox-patches/source-manifest.json';
+const manifestPath = 'src-tauri/core-manifest.json';
+const source = JSON.parse(readFileSync(join(root, sourcePath)));
+const inputPaths = [manifestPath, sourcePath, 'scripts/core-source-provision.py',
+  ...source.patches.map((patch) => `scripts/libbox-patches/${patch.file}`),
+  ...source.dependencyPatches.map((dep) => `scripts/libbox-patches/${dep.patchFile}`),
+  'scripts/core-patches/windows-dns-refresh.patch'];
+const inputs = new Map(inputPaths.map((path) => [path, readFileSync(join(root, path))]));
+function fixtureRead(changes = new Map()) {
+  return (path) => {
+    const bytes = changes.has(path) ? changes.get(path) : inputs.get(path);
+    assert.ok(bytes !== undefined, `missing source input: ${path}`);
+    return bytes;
+  };
+}
+function manifestRead(mutate) {
+  const manifest = JSON.parse(inputs.get(manifestPath));
+  mutate(manifest);
+  return fixtureRead(new Map([[manifestPath, Buffer.from(JSON.stringify(manifest))]]));
+}
+function requireUnobserved(policy) {
+  assert.equal(policy.policyState, 'SOURCE_FIRST_RELEASE_ELIGIBLE');
+  assert.equal(policy.publicationRequirements, 'existing-signed-release-dag');
+  assert.equal(policy.nativeAcceptance, 'NotObserved');
+  assert.equal(policy.deviceAcceptance, 'NotObserved');
+  assert.equal(policy.Exact, 'Unknown');
+  assert.equal(policy.NoOwner, 'Unknown');
+  assert.equal(policy.managed, 'NotGranted');
+}
+
+test('only reviewed source inputs are eligible, without native or ownership clearance', () => {
+  const result = runPolicy();
+  assert.equal(result.status, 0, result.stderr);
+  const policy = JSON.parse(result.stdout);
+  requireUnobserved(policy);
+  assert.equal(policy.reviewedCandidate, '123259cb4ee0eef484368e34d8ea7211d39964b6');
+  assert.deepEqual(assertSourceFirstRelease(fixtureRead()), policy);
+  for (const path of inputPaths) {
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(new Map([[path, undefined]]))), /missing source input/);
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(new Map([[path,
+      Buffer.concat([inputs.get(path), Buffer.from('\nchanged-source')])]]))), undefined, path);
+  }
+  for (const mutate of [
+    (manifest) => { manifest.sourceBuild.sourceManifestSha256 = 'a'.repeat(64); },
+    (manifest) => { manifest.sourceBuild.provisionerSha256 = 'a'.repeat(64); },
+    (manifest) => { manifest.sourceBuild.sourceReceiptFingerprint = 'a'.repeat(64); },
+    (manifest) => { manifest.sourceBuild.moduleGraphSha256 = 'a'.repeat(64); },
+    (manifest) => { manifest.sourceBuild.mainGoModSha256 = 'a'.repeat(64); },
+    (manifest) => { manifest.sourceBuild.mainGoSumSha256 = 'a'.repeat(64); },
+    (manifest) => { manifest.sourceBuild.patchedSourceTree = 'a'.repeat(40); },
+    (manifest) => { manifest.sourceBuild.platforms.win.buildTree = 'a'.repeat(40); },
+    (manifest) => { manifest.sourceBuild.transportPins['golang.org/x/sys'] = 'v0.48.0'; },
+    (manifest) => { delete manifest.sourceBuild.platforms['mac-arm64']; },
+    (manifest) => { manifest.sourceBuild.platforms.linux.patchedModules.allowedAbsent.push('github.com/sagernet/sing-tun'); },
+    (manifest) => { manifest.windowsBuild.patchSha256 = 'a'.repeat(64); },
+    (manifest) => { manifest.sourceBuild.version = '1.15.0-alpha.8.polaris.3'; },
+    (manifest) => { manifest.clearance = 'approved'; },
+  ]) assert.throws(() => assertSourceFirstRelease(manifestRead(mutate)));
+
+  // These are historical output pins, not review authority for newly produced
+  // binaries. Actual all-four source bundle consumption remains mandatory.
+  requireUnobserved(assertSourceFirstRelease(manifestRead((manifest) => {
+    manifest.windowsBuild.binarySha256 = null;
+    for (const platform of Object.values(manifest.sourceBuild.platforms)) platform.binarySha256 = null;
+  })));
 });
 
-test('arguments, version changes, skip flags and claimed receipts cannot grant clearance', () => {
-  for (const [args, env] of [
-    [['--allow', '--skip'], {}],
-    [['--version', '999.999.999'], {}],
-    [[], { POLARIS_SKIP_PC_RUNTIME_RELEASE_GATE: '1' }],
-    [[], { POLARIS_ALLOW_PC_RUNTIME_RELEASE: '1', PC_RUNTIME_RELEASE_READY: 'true' }],
-    [[], { POLARIS_NO_KERNEL_RUN: '1', POLARIS_SKIP_QUALITY_GATES: '1' }],
-    [[], { HELPER_STOP_ACK: 'stopped', PC_OWNER_STATE: 'NoOwner', GITHUB_REF_NAME: 'v999.999.999' }],
-  ]) {
-    const result = runBlock(args, env);
-    assert.equal(result.status, 1, JSON.stringify({ args, env }));
-    assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED/);
+test('arguments, skip flags and claimed receipts cannot bypass source checks or grant native clearance', () => {
+  for (const args of [['--allow', '--skip'], ['--version', '999.999.999']]) {
+    const result = runPolicy(args);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED.*no arguments/);
+  }
+  const fixture = mkdtempSync(join(tmpdir(), 'polaris-source-release-policy-'));
+  try {
+    // Exercise the actual CLI with a changed source input under every claimed
+    // clearance. Only copies in this private fixture are modified.
+    const fixturePaths = [...inputPaths, 'scripts/assert-pc-runtime-release.mjs',
+      'scripts/desktop-core/source-graph.mjs'];
+    for (const path of fixturePaths) {
+      mkdirSync(dirname(join(fixture, path)), { recursive: true });
+      writeFileSync(join(fixture, path), readFileSync(join(root, path)));
+    }
+    writeFileSync(join(fixture, 'scripts/core-source-provision.py'), 'changed-source');
+    for (const env of [
+      { POLARIS_SKIP_PC_RUNTIME_RELEASE_GATE: '1' },
+      { POLARIS_ALLOW_PC_RUNTIME_RELEASE: '1', PC_RUNTIME_RELEASE_READY: 'true' },
+      { POLARIS_NO_KERNEL_RUN: '1', POLARIS_SKIP_QUALITY_GATES: '1' },
+      { HELPER_STOP_ACK: 'stopped', PC_OWNER_STATE: 'NoOwner', GITHUB_REF_NAME: 'v999.999.999' },
+    ]) {
+      const good = runPolicy([], env);
+      assert.equal(good.status, 0, good.stderr);
+      requireUnobserved(JSON.parse(good.stdout));
+      const bad = runPolicy([], env, join(fixture, 'scripts/assert-pc-runtime-release.mjs'));
+      assert.equal(bad.status, 1, JSON.stringify(env));
+      assert.match(bad.stderr, /PC_RUNTIME_RELEASE_BLOCKED.*core-source-provision\.py/);
+    }
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
 });
 
-test('missing release block script fails closed', () => {
+test('missing release policy script fails closed', () => {
   const missing = join(root, 'scripts/__missing_pc_runtime_release_gate__.mjs');
   assert.equal(existsSync(missing), false);
   const result = spawnSync(process.execPath, [missing], { cwd: root, encoding: 'utf8' });
   assert.notEqual(result.status, 0);
 });
 
-test('desktop draft, uploads and final public promotion all require unconditional clearance', () => {
+test('desktop draft, uploads and final public promotion all require the source-first policy', () => {
   requirePackagePolicy(packageYaml);
 });
 
@@ -132,11 +215,13 @@ test('removing, skipping or swallowing a release clearance fails the policy', ()
   for (const mutant of mutants) assert.throws(() => requirePackagePolicy(mutant));
 });
 
-test('candidate matrix remains buildable independently of publication block', () => {
+test('candidate matrix preserves strict source consumption and states unobserved acceptance', () => {
   const candidate = job(packageYaml, 'package');
   requireCandidateSources(candidate);
   assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
-  assert.ok(step(candidate, 'Mark desktop artifacts as controlled validation candidates').text.includes('GITHUB_STEP_SUMMARY'));
+  const summary = step(candidate, 'Describe source-first desktop artifacts').text;
+  assert.ok(summary.includes('GITHUB_STEP_SUMMARY'));
+  assert.ok(summary.includes('Publication still requires the complete signed Release DAG'));
 });
 
 test('Release Risk runs policy independently of path classification and requires it in final gate', () => {
