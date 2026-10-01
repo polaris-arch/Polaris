@@ -7,7 +7,7 @@
  * 最终是 `runs-on: ""` / labels=[] 的永久 pending job（run 32357370395 的真实失败形态）。
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, onTestFinished } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFile, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -445,7 +445,9 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     }
   });
 
-  it.each([0, 1, 2, 3] as const)('四处远端 digest 裁判 %i 经真实 gh/gojq 解析，且拒绝缺失或漂移的资产', async (index) => {
+  it.each(([0, 1, 2, 3] as const).flatMap((index) =>
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((caseIndex) => [index, caseIndex] as const),
+  ))('四处远端 digest 裁判 %i 场景 %i 经真实 gh/gojq 解析，且拒绝缺失或漂移的资产', async (index, caseIndex) => {
     const android = stepBlock(jobBlock(workflow('android.yml'), 'release-apk'), '上传成 release 资产');
     const desktop = stepBlock(jobBlock(workflow('package.yml'), 'release_desktop'),
       'Verify draft desktop asset digests against SHA256SUMS');
@@ -469,15 +471,28 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       response.setHeader('Content-Type', 'application/json');
       response.end(JSON.stringify({ assets }));
     });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    if (address === null || typeof address === 'string') throw new Error('REST fixture has no TCP port');
     const fixture = mkdtempSync(join(tmpdir(), 'polaris-release-digest-'));
     const run = promisify(execFile);
+    const controller = new AbortController();
+    let cleanup: Promise<void> | undefined;
+    const dispose = () => {
+      if (cleanup) return cleanup;
+      controller.abort();
+      server.closeAllConnections();
+      cleanup = new Promise<void>((resolve, reject) => {
+        if (!server.listening) resolve();
+        else server.close((error) => error ? reject(error) : resolve());
+      }).finally(() => rmSync(fixture, { recursive: true, force: true }));
+      return cleanup;
+    };
+    onTestFinished(dispose);
     try {
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      if (address === null || typeof address === 'string') throw new Error('REST fixture has no TCP port');
       const name = index === 0 ? 'polaris-1.0.0-android-arm64.apk' : 'polaris-1.0.0-linux-x64.AppImage';
       const good = { name, digest: `sha256:${sha}`, state: 'uploaded' };
-      for (const [responseAssets, expectedStatus] of [
+      const [responseAssets, expectedStatus] = ([
         [[good], 0],
         [[{ name, state: 'uploaded' }], 1],
         [[{ ...good, digest: null }], 1],
@@ -488,29 +503,30 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
         [[], 1],
         [[good, good], 1],
         [[good, { ...good, name: 'unexpected-asset.zip' }], index === 0 ? 0 : 1],
-      ] as const) {
-        assets = [...responseAssets];
-        const expected = join(fixture, 'expected');
-        writeFileSync(expected, `${sha}  ${name}\n`);
-        const before = requests;
-        // Execute the actual post-upload/read guards, ending before any
-        // mutation. Only retry sleeps are elided for the fixed REST fixture.
-        const result = await run('bash', ['-c',
-          `set -euo pipefail\nsleep() { :; }\n${guard.replace(/^ {10}/gm, '')}`], {
-          env: { ...process.env, GH_TOKEN: 'localhost-fixture-not-a-secret',
-            GH_CONFIG_DIR: fixture, TMPDIR: fixture, NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1',
-            api_url: `http://127.0.0.1:${address.port}/release`, name, expected,
-            expected_sha: sha, android_asset: 'polaris-1.0.0-android-arm64.apk', tag: 'v1.0.0' },
-          encoding: 'utf8',
-        }).then(({ stdout, stderr }) => ({ status: 0, stdout, stderr }),
-          (error: { code: number; stdout: string; stderr: string }) =>
-            ({ status: error.code, stdout: error.stdout, stderr: error.stderr }));
-        expect(result.status, `guard ${index}: ${result.stdout}${result.stderr}`).toBe(expectedStatus);
-        expect(requests).toBeGreaterThan(before);
-      }
+      ] as const)[caseIndex];
+      assets = [...responseAssets];
+      const expected = join(fixture, 'expected');
+      writeFileSync(expected, `${sha}  ${name}\n`);
+      const before = requests;
+      // Execute the actual post-upload/read guards, ending before any
+      // mutation. Only retry sleeps are elided for the fixed REST fixture.
+      const result = await run('bash', ['-c',
+        `set -euo pipefail\nsleep() { :; }\n${guard.replace(/^ {10}/gm, '')}`], {
+        env: { ...process.env, GH_TOKEN: 'localhost-fixture-not-a-secret',
+          GH_CONFIG_DIR: fixture, TMPDIR: fixture, NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1',
+          api_url: `http://127.0.0.1:${address.port}/release`, name, expected,
+          expected_sha: sha, android_asset: 'polaris-1.0.0-android-arm64.apk', tag: 'v1.0.0' },
+        encoding: 'utf8',
+        timeout: 3500,
+        killSignal: 'SIGKILL',
+        signal: controller.signal,
+      }).then(({ stdout, stderr }) => ({ status: 0, stdout, stderr }),
+        (error: { code: number; stdout: string; stderr: string }) =>
+          ({ status: error.code, stdout: error.stdout, stderr: error.stderr }));
+      expect(result.status, `guard ${index}, case ${caseIndex}: ${result.stdout}${result.stderr}`).toBe(expectedStatus);
+      expect(requests).toBeGreaterThan(before);
     } finally {
-      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-      rmSync(fixture, { recursive: true, force: true });
+      await dispose();
     }
   });
 
