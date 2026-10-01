@@ -1,0 +1,602 @@
+//! 协议设置类型（上游 `shared/types/protocol-settings.ts` 1:1 移植）。
+//!
+//! 各协议专用 Settings struct，ServerConfig 按需引用。buildOutbounds 消费。
+//! 纯类型，serde camelCase rename 对齐 Polaris JSON。
+
+#![forbid(unsafe_code)]
+
+use serde::{Deserialize, Serialize};
+
+/// TLS 设置。上游 `TlsSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsSettings {
+    #[serde(rename = "serverName", skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(rename = "allowInsecure", skip_serializing_if = "Option::is_none")]
+    pub allow_insecure: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<Vec<String>>,
+    /// uTLS 指纹（`chrome`/`firefox`/`none`/...）。取值集由 sing-box/uTLS 拥有且随版本增长
+    /// → 保留 String + 边界归一（R4；上游 #298 修的正是此字段大小写）。
+    #[serde(
+        default,
+        deserialize_with = "crate::user_config::normalize::de_opt_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fingerprint: Option<String>,
+    /// ECH（隐藏 SNI）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ech: Option<bool>,
+    #[serde(rename = "echConfig", skip_serializing_if = "Option::is_none")]
+    pub ech_config: Option<String>,
+    /// TLS ClientHello 分片（抗 SNI-DPI）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<bool>,
+    /// TLS 栈引擎（go/windows/apple）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// TLS spoof 诱饵 SNI。
+    #[serde(rename = "spoofSni", skip_serializing_if = "Option::is_none")]
+    pub spoof_sni: Option<String>,
+    #[serde(rename = "spoofMethod", skip_serializing_if = "Option::is_none")]
+    pub spoof_method: Option<String>,
+    /// 证书固定：叶子证书 DER 的 SHA-256（sing-box `certificate_sha256`）。逗号分隔多条，
+    /// 每条 hex（可带 `:`/`-`）或标准 base64；生成侧经 `tls_pin::cert_pins_for_kernel` 转内核形态。
+    #[serde(rename = "certificateSha256", skip_serializing_if = "Option::is_none")]
+    pub certificate_sha256: Option<String>,
+    /// 公钥固定：叶子证书 SubjectPublicKeyInfo（PKIX DER）的 SHA-256（sing-box
+    /// `certificate_public_key_sha256`）。换证不换钥时仍匹配。口径同上。
+    #[serde(
+        rename = "certificatePublicKeySha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub certificate_public_key_sha256: Option<String>,
+}
+
+/// Reality 设置。上游 `RealitySettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealitySettings {
+    #[serde(rename = "publicKey")]
+    pub public_key: String,
+    #[serde(rename = "shortId", skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
+}
+
+/// WebSocket 传输。上游 `WebSocketSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSocketSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(rename = "maxEarlyData", skip_serializing_if = "Option::is_none")]
+    pub max_early_data: Option<u32>,
+    #[serde(
+        rename = "earlyDataHeaderName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub early_data_header_name: Option<String>,
+}
+
+/// gRPC 传输。上游 `GrpcSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrpcSettings {
+    #[serde(rename = "serviceName", skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(rename = "multiMode", skip_serializing_if = "Option::is_none")]
+    pub multi_mode: Option<bool>,
+}
+
+/// HTTP 传输。上游 `HttpSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, Vec<String>>>,
+}
+
+/// Hysteria2 混淆设置。上游 `Hysteria2ObfsSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hysteria2ObfsSettings {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(rename = "minPacketSize", skip_serializing_if = "Option::is_none")]
+    pub min_packet_size: Option<u32>,
+    #[serde(rename = "maxPacketSize", skip_serializing_if = "Option::is_none")]
+    pub max_packet_size: Option<u32>,
+}
+
+/// Hysteria2 设置。上游 `Hysteria2Settings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hysteria2Settings {
+    #[serde(rename = "upMbps", skip_serializing_if = "Option::is_none")]
+    pub up_mbps: Option<u32>,
+    #[serde(rename = "downMbps", skip_serializing_if = "Option::is_none")]
+    pub down_mbps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obfs: Option<Hysteria2ObfsSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(rename = "serverPorts", skip_serializing_if = "Option::is_none")]
+    pub server_ports: Option<String>,
+    #[serde(rename = "hopInterval", skip_serializing_if = "Option::is_none")]
+    pub hop_interval: Option<String>,
+    #[serde(rename = "bbrProfile", skip_serializing_if = "Option::is_none")]
+    pub bbr_profile: Option<String>,
+    /// 关闭 Chrome QUIC 握手拟态（sing-box 1.14.0-beta.7 outbound `disable_chrome_parrot`）。
+    /// beta.7 起 Hysteria2 客户端默认拟态 Chrome 握手抗指纹识别，而 Chrome 不声明支持 Ed25519 ⇒
+    /// **服务端证书是 Ed25519 的节点会直接握手失败**（用户只看到「连不上」）。这是该回归的逃生舱。
+    /// 核心默认 false（拟态开）⇒ 仅 `Some(true)` 才下发键，`None`/`Some(false)` 都不发。
+    #[serde(
+        rename = "disableChromeParrot",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disable_chrome_parrot: Option<bool>,
+}
+
+/// Snell 版本（4=v4 obfs 系 / 6=v6 mode 系）。
+pub type SnellVersion = u32;
+
+/// Snell 设置。上游 `SnellSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnellSettings {
+    pub version: SnellVersion,
+    #[serde(rename = "obfsMode", skip_serializing_if = "Option::is_none")]
+    pub obfs_mode: Option<String>,
+    #[serde(rename = "obfsHost", skip_serializing_if = "Option::is_none")]
+    pub obfs_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub userkey: Option<String>,
+}
+
+/// Multiplex 设置。上游 `MultiplexSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiplexSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(rename = "maxConnections", skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    #[serde(rename = "minStreams", skip_serializing_if = "Option::is_none")]
+    pub min_streams: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<bool>,
+}
+
+/// TUIC 设置。上游 `TuicSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuicSettings {
+    #[serde(rename = "congestionControl", skip_serializing_if = "Option::is_none")]
+    pub congestion_control: Option<String>,
+    #[serde(rename = "udpRelayMode", skip_serializing_if = "Option::is_none")]
+    pub udp_relay_mode: Option<String>,
+    #[serde(rename = "zeroRttHandshake", skip_serializing_if = "Option::is_none")]
+    pub zero_rtt_handshake: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<String>,
+}
+
+/// Naive 设置。上游 `NaiveSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NaiveSettings {
+    #[serde(rename = "useHttp3", skip_serializing_if = "Option::is_none")]
+    pub use_http3: Option<bool>,
+}
+
+/// Shadowsocks 设置。上游 `ShadowsocksSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowsocksSettings {
+    pub method: String,
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    #[serde(rename = "pluginOptions", skip_serializing_if = "Option::is_none")]
+    pub plugin_opts: Option<String>,
+}
+
+/// AnyTLS 设置。上游 `AnyTlsSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnyTlsSettings {
+    #[serde(
+        rename = "idleSessionCheckInterval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idle_session_check_interval: Option<String>,
+    #[serde(rename = "idleSessionTimeout", skip_serializing_if = "Option::is_none")]
+    pub idle_session_timeout: Option<String>,
+    #[serde(rename = "minIdleSession", skip_serializing_if = "Option::is_none")]
+    pub min_idle_session: Option<u32>,
+}
+
+/// Hysteria **v1** 设置（2026-08-11）。
+///
+/// 与 `Hysteria2Settings` 是**两个协议**而不是同一协议的版本字段：v1 的 `obfs` 是裸字符串、
+/// 认证走 `auth_str`（或 base64 的 `auth`），且 `up_mbps`/`down_mbps` 是必填带宽语义。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HysteriaSettings {
+    /// 明文认证串。与 `auth`（base64）二选一，两者都给时内核以 `auth_str` 为准。
+    #[serde(rename = "authStr", skip_serializing_if = "Option::is_none")]
+    pub auth_str: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    #[serde(rename = "upMbps", skip_serializing_if = "Option::is_none")]
+    pub up_mbps: Option<u32>,
+    #[serde(rename = "downMbps", skip_serializing_if = "Option::is_none")]
+    pub down_mbps: Option<u32>,
+    /// v1 的 obfs 是**裸字符串**（混淆口令），不是 v2 的 `{type,password}` 对象。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obfs: Option<String>,
+    /// 端口跳跃范围（如 `20000:30000`）。**抗封锁常用**，故进表单而非透传袋。
+    #[serde(rename = "serverPorts", skip_serializing_if = "Option::is_none")]
+    pub server_ports: Option<String>,
+    /// 跳跃间隔（如 `30s`）。同上。
+    #[serde(rename = "hopInterval", skip_serializing_if = "Option::is_none")]
+    pub hop_interval: Option<String>,
+    /// **透传袋**：本结构未建模的键原样存放，生成时合并回下发内容。
+    ///
+    /// 表单是**精选子集**（内核这支有几十个键，多数是调优旋钮，铺成控件收益递减且有两类不该给：
+    /// 格式苛刻的证书指纹、厂商专有的外部认证钩子）。没有本袋子时，「导入 → 编辑 → 保存」会把
+    /// 未建模的键**静默丢掉** —— 配置从能连变成连不上且无任何提示。
+    /// 有了它，可编辑与无损不再互斥，importer 才能安全映射到建模协议。
+    /// 同型先例：`singbox::Outbound::extra` / `singbox::Endpoint::extra`。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// 内嵌 Tor 设置（2026-08-11）。
+///
+/// ⚠️ **无 server/server_port**：实测给随包核传 `server` 得
+/// `outbounds[0].server: json: unknown field "server"`。它自带 Tor 客户端
+/// （随包二进制里 `cretz/bine` 与 `torrc` 符号共 320 处），与 `Tailscale` 同属「无地址协议」。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TorSettings {
+    #[serde(rename = "executablePath", skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    #[serde(rename = "dataDirectory", skip_serializing_if = "Option::is_none")]
+    pub data_directory: Option<String>,
+    #[serde(rename = "extraArgs", default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// 直接注入 torrc 的键值对。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub torrc: std::collections::BTreeMap<String, String>,
+    /// **透传袋**：本结构未建模的键原样存放，生成时合并回下发内容。
+    ///
+    /// 表单是**精选子集**（内核这支有几十个键，多数是调优旋钮，铺成控件收益递减且有两类不该给：
+    /// 格式苛刻的证书指纹、厂商专有的外部认证钩子）。没有本袋子时，「导入 → 编辑 → 保存」会把
+    /// 未建模的键**静默丢掉** —— 配置从能连变成连不上且无任何提示。
+    /// 有了它，可编辑与无损不再互斥，importer 才能安全映射到建模协议。
+    /// 同型先例：`singbox::Outbound::extra` / `singbox::Endpoint::extra`。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// OpenConnect 设置（2026-08-11）。
+///
+/// ⚠️ **本结构的 serde 名 = sing-box 的键名**：生成侧把它整体序列化后 flatten 进
+/// `Endpoint::extra`，而不是给 wire struct 加 61 个具名字段。类型化留在这里，wire 保持精简。
+/// 改名即改下发内容 —— 动字段名前先对随包核的 `$defs/Endpoint` 那支 `openconnect` 分支。
+///
+/// 一个类型覆盖六家商用 VPN，由 `flavor` 区分。**不进表单**的字段（`csd` / `hip` / `tncc` /
+/// `fortinet_host_check` / `form_entries`）是各家专有的外部认证脚本钩子，语义强绑定厂商，
+/// 做成通用控件只会误导 —— 需要它们的用户走 custom 直通。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenconnectSettings {
+    /// `host:port` 单串（内核这支的 `server` 就是带端口的整串，不拆两个键）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// anyconnect(Cisco) / gp(GlobalProtect) / fortinet / f5 / pulse / nc(Juniper)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flavor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 内核的 OTP 设置对象；Value 保留旧配置中的字符串形态供读取，远端导入只接收对象。
+    pub token: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_udp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pfs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_insecure_crypto: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_os: Option<String>,
+    /// 绑内核接口 —— 与 WG 的 `system:true` 同义，属「独立承载流量」语义键
+    /// （已在 `CARRY_TRAFFIC_KEYS` 里）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<bool>,
+    /// **透传袋**：本结构未建模的键原样存放，生成时合并回下发内容。
+    ///
+    /// 表单是**精选子集**（内核这支有几十个键，多数是调优旋钮，铺成控件收益递减且有两类不该给：
+    /// 格式苛刻的证书指纹、厂商专有的外部认证钩子）。没有本袋子时，「导入 → 编辑 → 保存」会把
+    /// 未建模的键**静默丢掉** —— 配置从能连变成连不上且无任何提示。
+    /// 有了它，可编辑与无损不再互斥，importer 才能安全映射到建模协议。
+    /// 同型先例：`singbox::Outbound::extra` / `singbox::Endpoint::extra`。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// OpenVPN 客户端设置（2026-08-11）。serde 名 = sing-box 键名，理由同 [`OpenconnectSettings`]。
+///
+/// `tls` **必填**：缺了内核判 `initialize endpoint[0]: missing \`tls\` options`。
+/// `tls.peer_fingerprint` 也是合法材料但必须是**规范小写十六进制**（非规范格式内核硬报错），
+/// 做成输入框会制造一类只有真连才暴露的错误 ⇒ 表单只给 `certificate`。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenvpnClientSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// tcp / udp（内核键名就叫 `network`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cipher: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+    /// OpenVPN 的全隧道开关（等价 WG 的 `allowed_ips: 0.0.0.0/0`）。
+    /// 已在 `CARRY_TRAFFIC_KEYS` 里 —— 见 `builder/endpoint_routes.rs`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_gateway: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<bool>,
+    /// TLS 材料。**必填**，见结构头注。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<OpenvpnTlsSettings>,
+    /// **透传袋**：本结构未建模的键原样存放，生成时合并回下发内容。
+    ///
+    /// 表单是**精选子集**（内核这支有几十个键，多数是调优旋钮，铺成控件收益递减且有两类不该给：
+    /// 格式苛刻的证书指纹、厂商专有的外部认证钩子）。没有本袋子时，「导入 → 编辑 → 保存」会把
+    /// 未建模的键**静默丢掉** —— 配置从能连变成连不上且无任何提示。
+    /// 有了它，可编辑与无损不再互斥，importer 才能安全映射到建模协议。
+    /// 同型先例：`singbox::Outbound::extra` / `singbox::Endpoint::extra`。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// MASQUE 客户端设置（2026-09-24）。serde 名 = sing-box 键名，理由同 [`OpenconnectSettings`]。
+///
+/// ⚠️ 与 openconnect 的差别：`server` / `server_port` / `username` / `password` / `tls` **不在这里**，
+/// 复用 `ServerConfig` 顶层的 address/port/username/password/tlsSettings —— 内核这支的 server 本就是
+/// 拆开的两个键，另存一份只会造出第二份真值（`route_binding`、sanitize 地址校验、订阅指纹都读顶层）。
+/// 生成侧见 `builder::endpoints::build_masque_endpoint`：透传袋 → 剥禁止键/不兼容键 → 具名字段覆盖。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MasqueClientSettings {
+    /// URI 模板路径；非空时必须以 `/` 开头，否则内核 initialize 失败、整核起不来（生成侧剔节点）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// 额外 HTTP 头。值可为字符串或字符串数组（内核 `Listable`），故不收窄成 `Vec<String>` ——
+    /// 收窄会让导入的单串形态整份 UserConfig 反序列化失败。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// HTTP 版本：缺省（内核 = 3 并可回落）/ 3 / 2 / 1。决定哪些 H2/QUIC 调优键可下发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+    /// **透传袋**：同 [`OpenconnectSettings::extra`]。其中 `system` / `name` / `advertise_routes`
+    /// 由生成侧强制剥掉（理由见 `build_masque_endpoint`）。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Tailcat 设置（2026-09-24）。camelCase 类型化 + 内核键名透传袋，形态同 [`TorSettings`]。
+///
+/// 无 server/server_port（同 Tor）：对端由两把服务端公钥定位，经 DERP 引导打洞/中继。
+/// 生成侧见 `builder::outbound::build_proxy_outbound` 的 Tailcat 分支；下发前先过
+/// [`tailcat_emit_check`]，不合格的节点剔除并上报 —— 下面每条校验都对应一种**整核起不来**的写法。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TailcatSettings {
+    /// 服务端 WireGuard 公钥（必填，标准 base64 的 32 字节）。服务端不校验 users 时它就是准入凭据
+    /// （上游称其为 tailcat 地址里不可猜的部分）⇒ 按秘密处理，进脱敏表。
+    #[serde(rename = "serverPublicKey", skip_serializing_if = "Option::is_none")]
+    pub server_public_key: Option<String>,
+    /// 服务端 disco 公钥（必填，同上形态）。disco 包在直连 UDP 上明文携带它，不算秘密。
+    #[serde(rename = "serverDiscoKey", skip_serializing_if = "Option::is_none")]
+    pub server_disco_key: Option<String>,
+    /// 可选；空串等同未填（内核对空串放行，实测）。
+    #[serde(rename = "preSharedKey", skip_serializing_if = "Option::is_none")]
+    pub pre_shared_key: Option<String>,
+    /// 可选；缺省时内核每次起核随机生成。服务端开了 users 校验或 DERP 开了 `verify_client_*` 时必填。
+    #[serde(rename = "privateKey", skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// region 模式：必须与服务端所用 region 一致（内核无自动选区）。`i64` 而非 `u32`：手改配置里的
+    /// 负数不该让整份 UserConfig 反序列化失败，交给 [`tailcat_emit_check`] 剔节点即可。
+    #[serde(rename = "derpRegion", skip_serializing_if = "Option::is_none")]
+    pub derp_region: Option<i64>,
+    /// region 模式可选：自建 DERP 地图 URL（内核缺省 `https://tailcat.dev/derpmap.json`）。
+    #[serde(rename = "derpMapUrl", skip_serializing_if = "Option::is_none")]
+    pub derp_map_url: Option<String>,
+    /// servers 模式：每项是裸主机名字符串，或内核原生对象
+    /// `{host, ipv4, ipv6, derp_port, stun_port, cert_name}`，原样下发。
+    ///
+    /// ⚠️ `cert_name: "sha256-raw:<hex>"` **不只比证书哈希，还校验主机名**：`host` 必须在该证书的
+    /// SAN 里（sagernet/tailscale `a8fbeb4b0838` `net/tlsdial/tlsdial.go:341-345` 的
+    /// `cert.VerifyHostname`，host 为空才跳过）。不匹配时客户端 TLS 断开，内核日志只有
+    /// `wait for server: context deadline exceeded`，看不出原因（R0 实测）。生成侧拿不到证书、
+    /// 判不了这一条，故不校验；UI 提示文案须写明「主机名必须与 DERP 证书一致」。
+    #[serde(rename = "derpServers", default, skip_serializing_if = "Vec::is_empty")]
+    pub derp_servers: Vec<serde_json::Value>,
+    /// **透传袋**：内核键名，同 [`TorSettings::extra`]。`http_client` 与 Dial Fields 由生成侧决定，
+    /// 袋里出现也剥掉。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Tailcat 密钥形态非法（服务端两把公钥缺失，或任一把 key 不是标准 base64 的 32 字节）的 reason token。
+pub const INVALID_REASON_TAILCAT_KEY: &str = "tailcat-key-invalid";
+/// Tailcat DERP 配置非法（region 与 servers 同时设 / 都没设 / servers 项缺 host）的 reason token。
+pub const INVALID_REASON_TAILCAT_DERP: &str = "tailcat-derp-invalid";
+
+/// Tailcat 节点能否下发。主核发射腿、`selected_server_precludes_selector_fallback`、store 落盘必填门
+/// 共用这一份判据（复刻条件清单会随发射腿改动静默漂移）。
+///
+/// 每条都**照内核判据写**，不多不少（随包 1.15.0-alpha.7 `check` 逐条实测，均为 initialize/decode
+/// 整核失败）：key 必须是带填充的标准 base64 且解出 32 字节（无填充 / url-safe / hex / 首尾空白都判
+/// FATAL）；`derp_region > 0` 与 `derp_servers` 非空恰好其一（`<= 0` 内核视同未设）；servers 每项的
+/// host 非空（数字等非串非对象项是 decode 失败）。
+pub fn tailcat_emit_check(settings: Option<&TailcatSettings>) -> Result<(), &'static str> {
+    let Some(t) = settings else {
+        return Err(INVALID_REASON_TAILCAT_KEY);
+    };
+    // 32 字节的标准 base64 恒为 44 字符、恰一个 `=` 填充；反之亦然。
+    let key_ok = |k: &str| {
+        let b = k.as_bytes();
+        b.len() == 44
+            && b[43] == b'='
+            && b[..43]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
+    };
+    let required = [&t.server_public_key, &t.server_disco_key];
+    let optional = [&t.pre_shared_key, &t.private_key];
+    if !required.iter().all(|k| k.as_deref().is_some_and(key_ok))
+        || !optional
+            .iter()
+            .all(|k| k.as_deref().is_none_or(|k| k.is_empty() || key_ok(k)))
+    {
+        return Err(INVALID_REASON_TAILCAT_KEY);
+    }
+    let region = t.derp_region.is_some_and(|r| r > 0);
+    let servers_ok = t.derp_servers.iter().all(|item| {
+        let host = match item {
+            serde_json::Value::String(h) => Some(h.as_str()),
+            serde_json::Value::Object(o) => o.get("host").and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        host.is_some_and(|h| !h.is_empty())
+    });
+    if region == t.derp_servers.is_empty() && servers_ok {
+        Ok(())
+    } else {
+        Err(INVALID_REASON_TAILCAT_DERP)
+    }
+}
+
+/// OpenVPN 的 TLS 材料（内核 `$defs/OpenVPNOutboundTLSOptions` 的子集）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenvpnTlsSettings {
+    /// CA 证书（PEM 逐行）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificate: Vec<String>,
+    /// 双向认证：客户端证书与私钥。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_certificate: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_key: Vec<String>,
+    /// 嵌套透传袋。父结构的袋子救不了这一层：`tls` 整体在父结构里算「已建模」而被排除出父袋，
+    /// 但本结构只建模了三个子键 —— `peer_fingerprint` 之类会从**嵌套层**漏掉。
+    /// 2026-08-11 由导入往返测试当场判红发现（内核唯一的 TLS 材料被丢 ⇒ 节点从能连变成起不来）。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// SSH 设置。上游 `SshSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(rename = "privateKey", skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    #[serde(rename = "privateKeyPath", skip_serializing_if = "Option::is_none")]
+    pub private_key_path: Option<String>,
+    #[serde(
+        rename = "privateKeyPassphrase",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub private_key_passphrase: Option<String>,
+    #[serde(rename = "hostKey", skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<Vec<String>>,
+    #[serde(rename = "hostKeyAlgorithms", skip_serializing_if = "Option::is_none")]
+    pub host_key_algorithms: Option<Vec<String>>,
+    #[serde(rename = "clientVersion", skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cipher: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<Vec<String>>,
+    #[serde(rename = "kexAlgorithm", skip_serializing_if = "Option::is_none")]
+    pub kex_algorithm: Option<Vec<String>>,
+}
+
+/// Shadow-TLS 插件设置。上游 `ShadowTlsSettings`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowTlsSettings {
+    pub password: String,
+    pub sni: String,
+    /// uTLS 指纹。同 `TlsSettings::fingerprint`，边界归一（R4）。
+    #[serde(
+        default,
+        deserialize_with = "crate::user_config::normalize::de_opt_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// 自定义协议（raw-JSON 透传）。上游 `CustomSettings`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomSettings {
+    pub outbound: serde_json::Value,
+    #[serde(rename = "isEndpoint", skip_serializing_if = "Option::is_none")]
+    pub is_endpoint: Option<bool>,
+    #[serde(rename = "secretKeys", skip_serializing_if = "Option::is_none")]
+    pub secret_keys: Option<Vec<String>>,
+}
+
+/// custom 逃生舱 outbound JSON 的**形状判据** —— probe 与生成路径的单一真值。
+///
+/// 返回 `Some(type)` ⟺ 它是一个带 string `type` 的 JSON 对象。
+///
+/// # 为什么必须共用一个谓词
+///
+/// C10「测试内核兼容性」按钮（`src-tauri/src/commands/proxy.rs`）把用户 JSON **原样**包成最小 config
+/// 送 `sing-box check`；生成路径（`builder/outbound.rs` / `builder/outbounds.rs`）把**同一份** JSON
+/// 原样下发。两条路径此前的判据不同——按钮走 raw `Value`、生成走窄 struct——于是按钮可以报
+/// `{ok:true}` 而真正生成的运行配置根本不是同一个东西。透传修好之后，剩下的唯一判据就是本函数，
+/// 两边同调它，分叉面为零。
+///
+/// **不校验 `type` 的取值**（空串也算合法形状）：「这个 type 内核认不认」是 `sing-box check` 的活，
+/// 在此复刻一份协议白名单只会与内核版本漂移，且会把逃生舱重新变成白名单——那正是它要逃的东西。
+#[must_use]
+pub fn custom_outbound_type(outbound: &serde_json::Value) -> Option<&str> {
+    outbound.as_object()?.get("type")?.as_str()
+}
+
+/// WARP 设备凭据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarpDevice {
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    pub token: String,
+}

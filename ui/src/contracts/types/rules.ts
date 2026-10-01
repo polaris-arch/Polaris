@@ -1,0 +1,405 @@
+export type RuleAction = 'proxy' | 'direct' | 'block';
+
+/** DNS 解析效果使用的解析器。`inherit` 按流量动作选择：代理→代理 DNS，其余→直连 DNS。 */
+export type RuleDnsResolver = 'inherit' | 'direct' | 'proxy';
+
+/** DNS 应答形态。真实 IP 可再配合 resolver 选择具体解析器；FakeIP 由内核合成。 */
+export type RuleDnsAnswerMode = 'real' | 'fakeIp';
+
+export type DnsServerKind = 'udp' | 'tcp' | 'tls' | 'https' | 'local' | 'hosts';
+
+export interface DnsServerEndpoint {
+  host: string;
+  port?: number;
+  path?: string;
+}
+
+export type DnsServerOutbound =
+  | { type: 'direct' }
+  | { type: 'currentExit' }
+  | { type: 'node'; nodeId: string };
+
+export interface DnsServerResource {
+  id: string;
+  name: string;
+  enabled: boolean;
+  type: DnsServerKind;
+  endpoint?: DnsServerEndpoint;
+  bootstrapServerId?: string;
+  outbound: DnsServerOutbound;
+  paths?: string[];
+  predefined?: Record<string, string[]>;
+}
+
+export interface DnsServerGroup {
+  id: string;
+  name: string;
+  enabled: boolean;
+  mode: 'fallback' | 'race';
+  members: string[];
+  fallbackServerId?: string;
+}
+
+export type DnsPolicyAction =
+  | { type: 'server'; serverId: string }
+  | { type: 'group'; groupId: string }
+  | { type: 'fakeIp' }
+  | { type: 'hostsFirst'; hostsServerId: string; fallback: DnsPolicyAction }
+  | { type: 'reject'; method?: 'default' | 'drop' }
+  | { type: 'predefined'; rcode?: string; answer?: string[]; ns?: string[]; extra?: string[] }
+  | { type: 'followRouteDefault' };
+
+export type DestinationResolutionMode =
+  | 'inherit'
+  | 'preserveDomain'
+  | 'dnsRules'
+  | 'server';
+
+export interface DestinationResolution {
+  mode: DestinationResolutionMode;
+  serverId?: string;
+}
+
+export interface RuleRouteEffect {
+  enabled?: boolean;
+  action: RuleAction;
+  /** 目标代理服务器 ID（仅当 action === 'proxy' 时有效）。 */
+  targetServerId?: string;
+  /** @deprecated schema v4 起连接解析由 dnsDefaults 全局拥有。 */
+  destinationResolution?: DestinationResolution;
+  /** @deprecated schema v4 迁移会删除这类影子流量规则。 */
+  resolutionOnly?: boolean;
+}
+
+export interface RuleDnsEffect {
+  enabled?: boolean;
+  action?: DnsPolicyAction;
+  migratedImplicitResolve?: boolean;
+  resolver: RuleDnsResolver;
+  answerMode: RuleDnsAnswerMode;
+}
+
+/**
+ * 规则效果容器。trafficRules 只保存 route，dnsRules 只保存 dns；双字段仅用于旧配置迁移。
+ */
+export interface RuleEffects {
+  route?: RuleRouteEffect;
+  dns?: RuleDnsEffect;
+}
+
+/**
+ * 自定义规则类型（对应 sing-box route rule 常用全集，去冗余）。
+ * 域名类：domain/domainSuffix/domainKeyword/domainRegex；
+ * IP/端口类：ipCidr(目的)/sourceIpCidr(源)/port(目的)/sourcePort(源)；
+ * 源设备类（sing-box 1.14 LAN 设备识别）：sourceMac(源 MAC)/sourceHostname(源主机名)；
+ * 进程类：processName/processPath；规则集类：geosite/geoip/ruleSet。
+ */
+export type RuleType =
+  | 'domain'
+  | 'domainSuffix'
+  | 'domainKeyword'
+  | 'domainRegex'
+  | 'ipCidr'
+  | 'sourceIpCidr'
+  | 'port'
+  | 'sourcePort'
+  // sing-box 1.14 源设备识别（按 MAC / DHCP 主机名分流；仅 Linux/macOS，见 shared/neighbor.ts）。
+  | 'sourceMac'
+  | 'sourceHostname'
+  | 'processName'
+  | 'processPath'
+  | 'geosite'
+  | 'geoip'
+  | 'ruleSet';
+
+/** 单个匹配条件（type + values）。多条件规则用 conditions 数组承载。 */
+export interface RuleCondition {
+  type: RuleType;
+  values: string[];
+}
+
+/**
+ * 自定义路由规则（一条规则 = 单一 type + values 数组）。统一 values 为字符串数组：域名/CIDR/
+ * 端口("443"或"1000-2000")/进程名/路径/geo 标签/规则集(URL 或 res:<resourceId>)，一项一条。
+ */
+export interface Rule {
+  id: string;
+  type: RuleType; // 首条件镜像（向后兼容旧消费点 + 回滚安全；恒与 conditions[0] 一致）
+  values: string[]; // 首条件镜像
+  /** 多条件共存（≥2 条件时存在；首条件镜像到 type/values）。空/缺省 = 单条件规则。 */
+  conditions?: RuleCondition[];
+  /** 多条件组合：'or'(默认，命中任一) / 'and'(全部命中)。单条件时无意义。 */
+  combineMode?: 'and' | 'or';
+  /**
+   * 旧版流量动作镜像。新代码以 effects 为权威；effects 缺省时回退读取本字段。
+   * DNS 规则也保留该镜像字段供旧结构校验通过，但 v3 执行只读取 effects.dns。
+   */
+  action: RuleAction;
+  effects?: RuleEffects;
+  enabled: boolean;
+  /** 绕过 FakeIP（仅 domain/domainSuffix/domainKeyword 有效） */
+  bypassFakeIP?: boolean;
+  /** 目标代理服务器 ID（仅当 action === 'proxy' 时有效） */
+  targetServerId?: string;
+  /** 规则备注说明 */
+  remarks?: string;
+  /**
+   * TLS spoof（P3a 抗审查，sing-box 1.14 route action tls_spoof/tls_spoof_method）：对命中本规则的连接，
+   * 真握手前发伪造 ClientHello 骗 SNI 过滤中间盒。tlsSpoof=伪造的白名单 SNI（域名，非空才生效），
+   * tlsSpoofMethod=方法（wrong-ack/wrong-md5/wrong-timestamp）。两者须成对填写。
+   * **硬限界（同 outbound spoof，见 shared/tls-spoof.ts）**：需提权、ARM64 不支持、SNI 须为域名（非 IP 字面量）。
+   * 构建期按 arch/方法/IP 字面量门控（singbox-custom-rules applyRuleAction）。
+   */
+  tlsSpoof?: string;
+  tlsSpoofMethod?: 'wrong-ack' | 'wrong-md5' | 'wrong-timestamp';
+  /**
+   * 仅在该网络场景（`NetworkProfile.id`）下生效；缺省 = 任何网络。场景不存在/停用/本机探测源不可用时
+   * 本规则不生成（绝不退化成无条件规则）。SoT = Rust `Rule.network_profile_id`。
+   */
+  networkProfileId?: string;
+}
+
+/** 网络场景的探测源：auto 由后端按平台与模式解析（渲染端不重算）。 */
+export type NetworkProbeSource = 'auto' | 'system' | 'dhcp';
+
+/**
+ * 网络场景（`UserConfig.networkProfiles[]`）。两种判据之间「任一命中」；搜索域是精确匹配（不含子域）。
+ * SoT = Rust `crates/config-engine/src/user_config/network_profile.rs`。
+ */
+export interface NetworkProfile {
+  id: string;
+  name: string;
+  enabled: boolean;
+  match: {
+    /** 当前网络 DNS 服务器地址落在其中任一网段即命中（CIDR 或裸 IP）。 */
+    dnsServerCidrs?: string[];
+    /** 当前网络搜索域精确等于其中之一即命中。 */
+    searchDomains?: string[];
+  };
+  probe: NetworkProbeSource;
+}
+
+/**
+ * 某个网络场景在本机实际使用的探测源（IPC `network_profile_resolved_sources` 的元素）。
+ * 由后端按与生成侧同一判据算好，渲染端只显示、不重算。
+ * SoT = Rust `builder/network_env.rs` `ResolvedProbe`。
+ */
+export type ProbeReason =
+  | 'profileInvalid'
+  | 'dhcpNeedsPrivilege'
+  | 'systemNoSearchDomain'
+  | 'dhcpMonitorMissing'
+  | 'dhcpIpv6Only';
+
+/**
+ * 内置解析器 `builtin-netenv-dhcp`（当前网络 DHCP 下发的 DNS）在本机是否可用
+ * （IPC `network_profile_builtin_dhcp_status`）。不可用时引用它的 DNS 规则本次不生成。
+ * reason：`dhcpNeedsPrivilege` / `dhcpMonitorMissing`；可用时 null。
+ */
+export interface BuiltinDhcpStatus {
+  available: boolean;
+  reason: ProbeReason | null;
+}
+
+export interface ResolvedProbe {
+  profileId: string;
+  /** 本机使用（不可用时为按解析表本应使用）的探测源。 */
+  probeSource: 'system' | 'dhcp';
+  /** false = 引用该场景的规则本次不生成。 */
+  available: boolean;
+  /**
+   * 不可用或告警原因（Rust `ProbeReason` 的 camelCase）；可用且无告警时为 null。
+   * 不可用：`profileInvalid`（停用/判据全空）、`dhcpNeedsPrivilege`（本机核无特权绑 UDP 68）、
+   * `systemNoSearchDomain`（Windows 系统 DNS 读不到搜索域）、`dhcpMonitorMissing`（本次起核 dhcp 兜底剔除）。
+   * 告警（available 仍为 true）：`dhcpIpv6Only`（dhcp 源只写了 IPv6 地址段，永不命中）。
+   */
+  reason: ProbeReason | null;
+  /**
+   * 「当前是否处在该网络」（N4）：运行核的 canary 探针结果，内核亲自求值。
+   * true 命中 / false 未命中 / null 未知（核未运行、本场景本次没有探针、网络刚变化还没探完、或本机不可用）。
+   * 变化时后端发无载荷事件 `EVENT_NETWORK_PROFILE_MATCH_CHANGED`，渲染端重拉本接口。
+   */
+  matched: boolean | null;
+}
+
+/** 系统进程信息（进程快速选择器用）。 */
+export interface SystemProcessInfo {
+  name: string;
+  path?: string;
+  count: number;
+}
+
+/**
+ * 已安装应用（Android 的包名选择器用）—— Rust `runtime/proxy/android_bridge.rs#InstalledApp`
+ * 的 1:1 镜像（serde camelCase 已对齐），数据源 ⇄ Kotlin `PolarisVpnPlugin.listInstalledApps`。
+ *
+ * 它与 [`SystemProcessInfo`] 是**同一件事的两个平台形态**：桌面按进程名匹配、Android 按
+ * applicationId 匹配。两条腿各有各的 command（`system_list_processes` / `system_list_installed_apps`），
+ * 因为两侧的标识、枚举方式与失败模式都不一样。
+ */
+export interface InstalledApp {
+  /** 显示名（`ResolveInfo.loadLabel`）。同一个包在不同语言下不同，**不能**当标识用。 */
+  label: string;
+  /** applicationId —— 这才是标识，也是 `CustomAppPreset.packageNames` 要存的那一列。 */
+  packageName: string;
+  /** 是否系统应用（`FLAG_SYSTEM`）。只给渲染端分组/排序用。 */
+  system: boolean;
+}
+
+// 自定义规则集（从 URL 导入）
+export interface CustomRuleSet {
+  id: string;
+  name: string;
+  url: string; // 规则集 URL（.srs 或 .json）
+  action: 'proxy' | 'direct' | 'block';
+  enabled: boolean;
+  addedAt: string;
+}
+
+// ============================================================================
+// 规则资源（已下载到本地的 sing-box .srs 规则集）
+// ============================================================================
+
+export type RuleResourceFormat = 'binary' | 'source'; // .srs→binary（下载恒此），.json→source（仅保留扩展位）
+export type RuleResourceCategory = 'geosite' | 'geoip' | 'geosite-lite' | 'geoip-lite' | 'custom';
+
+/** 已下载到本地的规则资源（文件落 <userData>/rule-resources/，本清单存 config.json）。 */
+export interface RuleResource {
+  id: string; // 内置=catalog id（'geosite-youtube'）；手动='res_<ts>_<rand>'
+  name: string;
+  category: RuleResourceCategory;
+  sourceUrl: string; // 原始 URL（不含加速前缀，更新时现拼）
+  fileName: string; // 落盘名，含分类前缀防撞，如 'geosite-youtube.srs'
+  format: RuleResourceFormat;
+  size: number; // 字节
+  downloadedAt: string; // ISO
+}
+
+/** 内置/动态资源库条目（catalog）。 */
+export interface RuleResourceCatalogItem {
+  id: string;
+  category: RuleResourceCategory;
+  name: string;
+  path: string; // meta-rules-dat 仓库内路径，如 'geo/geosite/youtube.srs'
+  /**
+   * 已随包出厂（Rust `builtin_geo_rulesets` 表内同名 tag）→ 资源库显示「已内置」，不作为下载目标。
+   * 与「内置 tab」不是一回事：那是 33 条精选清单，随包的只有其中一部分。
+   */
+  bundled: boolean;
+}
+
+/** 列表项：本地资源 + 文件是否存在 + 被启用 ruleSet 规则引用计数。 */
+export interface RuleResourceListItem extends RuleResource {
+  fileExists: boolean;
+  referencedBy: number;
+  /** 内置 geo 规则集（智能分流固定依赖）：不可删除、更新写回 <userData>/rules 热重载、可重置为出厂。id 形如 'builtin:geosite-cn'。 */
+  builtin?: boolean;
+}
+
+/**
+ * 规则资源引用记录（单一真值，见 shared/rule-resource-refs.ts）。
+ * kind 区分来源：'route'=自定义路由规则 / 'app'=应用分流卡片。
+ * label：route=已就绪文案（备注/首条件摘要）；app=内置 labelKey(i18n key) 或自定义 name（由 appBuiltin 决定渲染端是否 i18n）。
+ */
+export interface RuleResourceRef {
+  // system = 智能分流 geo 基线层对内置默认(geosite-cn/geoip-cn/geolocation-!cn)的隐式引用（纳入 referencedBy 计数）
+  kind: 'route' | 'app' | 'system';
+  id: string;
+  label: string;
+  appBuiltin?: boolean;
+}
+
+/** 删除资源结果：被启用规则引用且未 force 时不删，回传 needConfirm + 引用规则明细（供前端分组展开确认列出）。 */
+export interface RuleResourceDeleteResult {
+  ok: boolean;
+  needConfirm?: boolean;
+  referencingRules?: RuleResourceRef[];
+}
+
+/** 下载入参：catalogId（内置/动态项）或 url（手动，name 可选自动生成）。id/category 仅 redownload 内部用于保留原 id。 */
+export interface RuleResourceDownloadItem {
+  catalogId?: string;
+  url?: string;
+  name?: string;
+  id?: string;
+  category?: RuleResourceCategory;
+}
+
+export interface RuleResourceDownloadResult {
+  ok: boolean;
+  resource?: RuleResource;
+  error?: string;
+  errorCode?: string;
+  id?: string;
+  name?: string;
+  /** 下载前目标文件是否已存在：用于收窄重启判定（已存在=内容更新，sing-box ≥1.10 热重载，无需重启）。 */
+  existedBefore?: boolean;
+}
+
+export interface RuleResourceProgress {
+  id: string;
+  name: string;
+  received: number;
+  total: number | null;
+  percent: number | null;
+  /**
+   * `cancelled` = 用户在下载途中点了「取消」（`ruleResources.cancel`），后端 `select!` 丢弃了传输
+   * future（真中断，非「标记后继续下完」）。**刻意与 `error` 分开**：取消是用户意图，不是故障，
+   * 报成 error 会让资源行变红、看起来像源挂了。
+   */
+  status: 'queued' | 'downloading' | 'done' | 'error' | 'cancelled';
+  error?: string;
+  errorCode?: string;
+}
+
+export interface RuleResourceCatalogResult {
+  items: RuleResourceCatalogItem[];
+  fetchedAt: number | null;
+  source: 'remote' | 'cache' | 'builtin';
+}
+
+// 应用分流规则（实验性）- 映射到内置 geosite 规则集
+export interface AppRule {
+  /** 应用 ID，对应 APP_PRESETS 中的 id 或 customAppPresets 中的 id */
+  appId: string;
+  action: RuleAction;
+  enabled: boolean;
+  /** 目标代理服务器 ID (仅当 action === 'proxy' 时有效) */
+  targetServerId?: string;
+}
+
+/** 自定义应用分流预设（用户手动添加） */
+export interface CustomAppPreset {
+  id: string;
+  name: string;
+  emoji: string;
+  /** Qure Color 等彩色图标集的应用图标 */
+  iconUrl?: string;
+  geositeTags: string[];
+  geoipTags?: string[];
+  /**
+   * 进程名（真·应用分流，与内置预设 processNames 同源消费点 ProxyManager.effectiveAppRules）。
+   * 由 getAppPreset 透传给配置生成：命中即按进程名路由，比 geo 域名匹配更精准（macOS/Windows/Linux TUN 模式）。
+   */
+  processNames?: string[];
+  /**
+   * Android applicationId —— 与 `processNames` 是**同一件事的两个平台形态**，不是同一个值的
+   * 两种写法：桌面按进程名走 sing-box 的 `process_name` 路由规则，Android 按 applicationId 走
+   * `VpnService.Builder.addDisallowedApplication`（把进程名喂给它一条都命不中，且是静默的）。
+   *
+   * 消费点在 Rust：`user_config::app_rules_preset::get_app_preset` 转发 →
+   * `builder::inbounds::android_exclude_packages` → `tun.exclude_package`。
+   * **只有 `action === 'direct'` 那一档发射**（排除 = 该应用整个不进隧道）；
+   * 「指定某个应用走某个节点」在这台设备上做不到，`RouteRule` 没有 `package_name` 这一列。
+   *
+   * 缺省 / 空数组等价（Rust 侧 `#[serde(default, skip_serializing_if = "Vec::is_empty")]`）：
+   * 没挑包名的预设退回 geosite/geoip 腿，在磁盘上一个字节都不变。
+   * 来源：`AppAddPanel` 从 `api.system.listInstalledApps()` 拉的已装应用清单。
+   */
+  packageNames?: string[];
+  /**
+   * 分类归属（纯 UI：应用卡按分类分组展示，可为内置 5 类之一或用户自建分类名）。
+   * 配置生成不消费 category（后端只读 geositeTags/geoipTags/processNames/packageNames），故仅影响卡片分组呈现。
+   */
+  category?: string;
+}

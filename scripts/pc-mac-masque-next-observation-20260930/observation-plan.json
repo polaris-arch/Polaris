@@ -1,0 +1,145 @@
+{
+  "schema": "c4-next-observation-plan-v1",
+  "status": "offline_template_only",
+  "ready": false,
+  "authorization_assessed": false,
+  "new_instrumentation_implemented": false,
+  "new_package_exists": false,
+  "device_runner_implemented": false,
+  "window_count": 1,
+  "scope": {
+    "devices": [
+      "Mac142",
+      "Linux185"
+    ],
+    "mac_interface": "en0",
+    "linux_interface": "ens18",
+    "mac_ip": "192.168.10.142",
+    "linux_ip": "192.168.10.185",
+    "port_range": [
+      58000,
+      60999
+    ],
+    "nonce": null,
+    "mode": "raw",
+    "tun": false
+  },
+  "budgets": {
+    "capture_soft_seconds": 240,
+    "capture_hard_seconds": 255,
+    "packet_cap": 256,
+    "event_cap": 512,
+    "input_bytes": 2097152,
+    "terminal_to_return_ns": 3000000000,
+    "cross_host_clock_skew_ns": null
+  },
+  "next_candidate_sha256": null,
+  "next_observer_sha256": null,
+  "next_source_manifest_sha256": null,
+  "dependencies": {
+    "new_reviewed_Go_hooks_and_CGO1_build": "not_implemented",
+    "new_signed_candidate_and_fixture_seal": "not_prepared",
+    "new_observer_root_stage_SHA_and_permissions": "not_verified",
+    "single_batch_device_execution": "not_implemented_here"
+  },
+  "source_references": {
+    "bpf_counter_design": "/home/sway/docs/polaris/design/polaris-c4-mac-bpf-counter-gate-2026-09-30.md",
+    "hk01_c4_SoT": "/home/sway/docs/polaris/design/polaris-hk01-c4-compare-2026-09-29.md",
+    "existing_prepare": {
+      "path": "/home/sway/docs/polaris/scripts/pc-mac-masque-fdtrace-2026-09-29/prepare.py",
+      "sha256": "e31164da1174ee378ee662ed21d213fedb16e1e434b9fda6f8b69bb283393751",
+      "role": "read_only_base_reference_not_next_instrumentation"
+    },
+    "existing_runner": "/home/sway/docs/polaris/scripts/pc-mac-masque-fdtrace-2026-09-29/runner.py",
+    "formal_classifier": "/home/sway/docs/polaris/scripts/pc-mac-masque-fdtrace-2026-09-29/classify.py",
+    "existing_exact_postcheck": "/home/sway/docs/polaris/scripts/pc-mac-masque-fdtrace-2026-09-29/postcheck.py",
+    "BPF_pure_draft": "/home/sway/docs/polaris/scripts/pc-mac-masque-bpf-observer-2026-09-30/capture-gate-v2-draft.pl"
+  },
+  "instrumentation_sites": [
+    {
+      "path": "quic-go/sys_conn_msgx_darwin.go",
+      "symbol": "msgXReader.ReadBatch",
+      "fields": [
+        "raw_read_id",
+        "whole_rawConn.Read_enter_return",
+        "callback_index",
+        "EAGAIN_false_wait_request",
+        "callback_reentry",
+        "rawconn_error_kind",
+        "last_syscall_errno"
+      ],
+      "status": "not_implemented"
+    },
+    {
+      "path": "quic-go/connection.go",
+      "symbol": "Conn.setCloseError/destroyImpl",
+      "fields": [
+        "successful_CAS_winner",
+        "conn_id",
+        "cause_seq",
+        "fixed_reason",
+        "before_ns",
+        "after_ns"
+      ],
+      "status": "not_implemented"
+    },
+    {
+      "path": "quic-go/transport.go",
+      "symbol": "Transport.close/Close/maybeStopListening",
+      "fields": [
+        "transport_id",
+        "first_assignment_under_mutex",
+        "cause_seq",
+        "created_conn",
+        "deadline_id",
+        "set_now_or_restore_zero",
+        "deadline_result"
+      ],
+      "status": "not_implemented"
+    },
+    {
+      "path": "quic-go/transport.go",
+      "symbol": "Transport.doDial",
+      "fields": [
+        "dial_id",
+        "ctx_done/err_chan/recreate/early_ready/handshake_complete/setup_error/transport_closed",
+        "explicit_winner_association"
+      ],
+      "status": "not_implemented"
+    }
+  ],
+  "timing_rules": [
+    "Use one process monotonic clock with before/after samples around CAS/mutex mutation; FIFO seq is not cross-goroutine time order.",
+    "RawRead callback false reports a wait request, not an observed runtime waitRead or kernel readiness delivery.",
+    "Separate Conn CAS winner from Transport mutex winner; timestamps alone do not identify causes.",
+    "Preserve rawConn.Read error and last syscall errno separately; nil RawRead error can still precede ReadBatch errno wrapping.",
+    "Record all deadline set/restore calls and all doDial exit branches; the two synthetic templates are deliberately narrower and extra branches remain Unknown.",
+    "Same-host monotonic trace requires an anchored clock conversion plus measured cross-host skew for any pcap correlation; missing anchor/skew is Unknown.",
+    "Both capture windows must conservatively cover the candidate interval after including skew bounds; no cross-observer counter subtraction."
+  ],
+  "batch_steps": [
+    "Review and pin new hooks/build/observer/fixture/seal offline; missing prerequisites block execution.",
+    "Capture original app/core/config/route/port baselines; root-owned exact staged SHA/argv/PID/uid gates.",
+    "Both captures ready before one candidate run; preserve the existing frozen Stop/restore/exact-Clean budgets.",
+    "Keep raw trace/final/pcap originals and compare all root/coordination hash pairs.",
+    "Run original formal classifier unchanged plus this diagnostic-only checker.",
+    "Independent two-host postcheck proves scoped restoration; missing/failed cleanup preserves evidence and blocks another window."
+  ],
+  "forbidden_collection": [
+    "payload",
+    "keys",
+    "credentials",
+    "generic_environment",
+    "full_config",
+    "unbounded_logs"
+  ],
+  "historical_window": {
+    "nonce": "be243c8d",
+    "observer_sha256": "7ecc5fa3a53412d857dbc644af7ec242b7f3f3611ce19d0f1a7f164a76046353",
+    "observer_status": "unknown",
+    "formal_exit_code": 2,
+    "formal_usable": false,
+    "formal_reason": "bidirectional outer UDP missing",
+    "never_reclassify": true
+  }
+}

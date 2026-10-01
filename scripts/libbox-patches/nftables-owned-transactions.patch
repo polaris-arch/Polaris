@@ -1,0 +1,4149 @@
+diff --git a/chain.go b/chain.go
+index c2155b8..1eafc93 100644
+--- a/chain.go
++++ b/chain.go
+@@ -96,6 +96,8 @@ const (
+ // A Chain contains Rules. See also
+ // https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains
+ type Chain struct {
++	Handle   uint64
++	UserData []byte
+ 	Name     string
+ 	Table    *Table
+ 	Hooknum  *ChainHook
+@@ -140,6 +142,9 @@ func (cc *Conn) AddChain(c *Chain) *Chain {
+ 			{Type: unix.NFTA_CHAIN_TYPE, Data: []byte(c.Type + "\x00")},
+ 		})...)
+ 	}
++	if len(c.UserData) != 0 {
++		data = append(data, cc.marshalAttr([]netlink.Attribute{{Type: nftChainUserdata, Data: c.UserData}})...)
++	}
+ 	cc.messages = append(cc.messages, netlink.Message{
+ 		Header: netlink.Header{
+ 			Type:  netlink.HeaderType((unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_NEWCHAIN),
+@@ -153,7 +158,9 @@ func (cc *Conn) AddChain(c *Chain) *Chain {
+ 
+ // DelChain deletes the specified Chain. See also
+ // https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains#Deleting_chains
+-func (cc *Conn) DelChain(c *Chain) {
++func (cc *Conn) DelChain(c *Chain) { cc.delChain(c, 0) }
++
++func (cc *Conn) delChain(c *Chain, flags netlink.HeaderFlags) {
+ 	cc.mu.Lock()
+ 	defer cc.mu.Unlock()
+ 	data := cc.marshalAttr([]netlink.Attribute{
+@@ -164,7 +171,7 @@ func (cc *Conn) DelChain(c *Chain) {
+ 	cc.messages = append(cc.messages, netlink.Message{
+ 		Header: netlink.Header{
+ 			Type:  netlink.HeaderType((unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_DELCHAIN),
+-			Flags: netlink.Request | netlink.Acknowledge,
++			Flags: netlink.Request | netlink.Acknowledge | flags,
+ 		},
+ 		Data: append(extraHeader(uint8(c.Table.Family), 0), data...),
+ 	})
+@@ -280,8 +287,13 @@ func chainFromMsg(msg netlink.Message) (*Chain, error) {
+ 		return nil, err
+ 	}
+ 
++	ad.ByteOrder = binary.BigEndian
+ 	for ad.Next() {
+ 		switch ad.Type() {
++		case unix.NFTA_CHAIN_HANDLE:
++			c.Handle = ad.Uint64()
++		case nftChainUserdata:
++			c.UserData = ad.Bytes()
+ 		case unix.NFTA_CHAIN_NAME:
+ 			c.Name = ad.String()
+ 		case unix.NFTA_TABLE_NAME:
+@@ -301,7 +313,7 @@ func chainFromMsg(msg netlink.Message) (*Chain, error) {
+ 		}
+ 	}
+ 
+-	return &c, nil
++	return &c, ad.Err()
+ }
+ 
+ func hookFromMsg(b []byte) (*ChainHook, *ChainPriority, error) {
+@@ -324,5 +336,5 @@ func hookFromMsg(b []byte) (*ChainHook, *ChainPriority, error) {
+ 		}
+ 	}
+ 
+-	return &hooknum, &prio, nil
++	return &hooknum, &prio, ad.Err()
+ }
+diff --git a/conn.go b/conn.go
+index 6596347..cba970a 100644
+--- a/conn.go
++++ b/conn.go
+@@ -17,9 +17,7 @@ package nftables
+ import (
+ 	"errors"
+ 	"fmt"
+-	"os"
+ 	"sync"
+-	"syscall"
+ 
+ 	"github.com/mdlayher/netlink"
+ 	"github.com/mdlayher/netlink/nltest"
+@@ -38,7 +36,10 @@ type Conn struct {
+ 	TestDial nltest.Func // for testing only; passed to nltest.Dial
+ 	NetNS    int         // fd referencing the network namespace netlink will interact with.
+ 
++	sealed      bool
++	owned       *ownedState
+ 	lasting     bool       // establish a lasting connection to be used across multiple netlink operations.
++	ioMu        sync.Mutex // serializes complete read/commit IO exchanges
+ 	mu          sync.Mutex // protects the following state
+ 	messages    []netlink.Message
+ 	err         error
+@@ -64,6 +65,11 @@ func New(opts ...ConnOption) (*Conn, error) {
+ 	for _, opt := range opts {
+ 		opt(cc)
+ 	}
++	// Collect every option first, but never give an Owned socket to a callback.
++	// Checking after dial would permit subscription history or a retained fd.
++	if cc.owned != nil && len(cc.sockOptions) != 0 {
++		return nil, errors.New("owned nft socket rejects socket callbacks")
++	}
+ 
+ 	if !cc.lasting {
+ 		return cc, nil
+@@ -74,6 +80,10 @@ func New(opts ...ConnOption) (*Conn, error) {
+ 		return nil, err
+ 	}
+ 	cc.nlconn = nlconn
++	if err := cc.initOwned(); err != nil {
++		_ = nlconn.Close()
++		return nil, err
++	}
+ 	return cc, nil
+ }
+ 
+@@ -128,14 +138,23 @@ type netlinkCloser func() error
+ // be called while the Conn.mu lock is currently helt (this will cause a
+ // deadlock). Use netlinkConnUnderLock instead in such situations.
+ func (cc *Conn) netlinkConn() (*netlink.Conn, netlinkCloser, error) {
++	cc.ioMu.Lock()
+ 	cc.mu.Lock()
+-	defer cc.mu.Unlock()
+-	return cc.netlinkConnUnderLock()
++	conn, closer, err := cc.netlinkConnUnderLock()
++	cc.mu.Unlock()
++	if err != nil {
++		cc.ioMu.Unlock()
++		return nil, nil, err
++	}
++	return conn, func() error { defer cc.ioMu.Unlock(); return closer() }, nil
+ }
+ 
+ // netlinkConnUnderLock works like netlinkConn but must be called while holding
+ // the Conn.mu lock.
+ func (cc *Conn) netlinkConnUnderLock() (*netlink.Conn, netlinkCloser, error) {
++	if cc.sealed {
++		return nil, nil, ErrSealed
++	}
+ 	if cc.nlconn != nil {
+ 		return cc.nlconn, func() error { return nil }, nil
+ 	}
+@@ -220,9 +239,7 @@ func receiveAckAware(nlconn *netlink.Conn, sentMsgFlags netlink.HeaderFlags) ([]
+ // CloseLasting will terminate all pending netlink operations using the lasting
+ // connection.
+ //
+-// After closing a lasting connection, the connection will revert to using
+-// on-demand transient netlink connections when calling further netlink
+-// operations (such as GetTables).
++// Closing permanently seals the connection; no transient fallback is allowed.
+ func (cc *Conn) CloseLasting() error {
+ 	// Don't acquire the lock for the whole duration of the CloseLasting
+ 	// operation, but instead only so long as to make sure to only run the
+@@ -232,6 +249,8 @@ func (cc *Conn) CloseLasting() error {
+ 	cc.mu.Lock()
+ 	nlconn := cc.nlconn
+ 	cc.nlconn = nil
++	cc.sealed = true
++	cc.messages = nil
+ 	cc.mu.Unlock()
+ 	if nlconn != nil {
+ 		return nlconn.Close()
+@@ -241,68 +260,41 @@ func (cc *Conn) CloseLasting() error {
+ 
+ // Flush sends all buffered commands in a single batch to nftables.
+ func (cc *Conn) Flush() error {
++	cc.ioMu.Lock()
++	defer cc.ioMu.Unlock()
+ 	cc.mu.Lock()
+-	defer func() {
+-		cc.messages = nil
+-		cc.mu.Unlock()
+-	}()
++	defer func() { cc.messages = nil; cc.mu.Unlock() }()
++	if cc.sealed {
++		return ErrSealed
++	}
++	if cc.owned != nil && cc.owned.tainted {
++		return ErrUncertain
++	}
++	if cc.err != nil {
++		return cc.err
++	}
+ 	if len(cc.messages) == 0 {
+-		// Messages were already programmed, returning nil
+ 		return nil
+ 	}
+-	if cc.err != nil {
+-		return cc.err // serialization error
++	if cc.owned != nil {
++		return cc.flushOwned()
+ 	}
+ 	conn, closer, err := cc.netlinkConnUnderLock()
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer func() { _ = closer() }()
+-
+-	batchMessages := batch(cc.messages)
+-	_, err = conn.SendMessages(batchMessages)
+-	if errors.Is(err, syscall.EMSGSIZE) {
+-		const netlinkReplyBufferOverhead = 1024
+-		var batchSize int
+-		for _, message := range batchMessages {
+-			messageData, marshalErr := message.MarshalBinary()
+-			if marshalErr != nil {
+-				return fmt.Errorf("marshal netlink message: %w", marshalErr)
+-			}
+-			batchSize += len(messageData)
+-		}
+-		readBufferSize := batchSize*2 + len(batchMessages)*netlinkReplyBufferOverhead
+-		err = conn.SetReadBuffer(readBufferSize)
+-		if err != nil {
+-			return fmt.Errorf("SetReadBuffer: %w", err)
+-		}
+-		err = conn.SetWriteBuffer(batchSize * 2)
+-		if err != nil {
+-			return fmt.Errorf("SetWriteBuffer: %w", err)
+-		}
+-		_, err = conn.SendMessages(batchMessages)
+-	}
+-	if err != nil {
++	defer closer()
++	messages := batch(cc.messages)
++	if _, err = conn.SendMessages(messages); err != nil {
+ 		return fmt.Errorf("SendMessages: %w", err)
+ 	}
+-
+ 	var errs error
+-	// Fetch the requested acknowledgement for each message we sent.
+ 	for _, msg := range cc.messages {
+ 		if _, err := receiveAckAware(conn, msg.Header.Flags); err != nil {
+-			if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.ENOBUFS) {
+-				// Kernel will only send one error to user space.
+-				return err
+-			}
+ 			errs = errors.Join(errs, err)
+ 		}
+ 	}
+-
+-	if errs != nil {
+-		return fmt.Errorf("conn.Receive: %w", errs)
+-	}
+-
+-	return nil
++	return errs
+ }
+ 
+ // FlushRuleset flushes the entire ruleset. See also
+diff --git a/monitor.go b/monitor.go
+index d3f5d9b..ff4f240 100644
+--- a/monitor.go
++++ b/monitor.go
+@@ -15,6 +15,7 @@
+ package nftables
+ 
+ import (
++	"errors"
+ 	"math"
+ 	"strings"
+ 	"sync"
+@@ -330,6 +331,9 @@ func (monitor *Monitor) Close() error {
+ // Caller may receive a MonitorEventTypeOOB event which contains an error we didn't
+ // handle, for now.
+ func (cc *Conn) AddMonitor(monitor *Monitor) (chan *MonitorEvent, error) {
++	if cc.owned != nil {
++		return nil, errors.New("owned nft socket rejects shared monitor receivers")
++	}
+ 	generationalEventCh, err := cc.AddGenerationalMonitor(monitor)
+ 	if err != nil {
+ 		return nil, err
+@@ -350,6 +354,9 @@ func (cc *Conn) AddMonitor(monitor *Monitor) (chan *MonitorEvent, error) {
+ }
+ 
+ func (cc *Conn) AddGenerationalMonitor(monitor *Monitor) (chan *MonitorEvents, error) {
++	if cc.owned != nil {
++		return nil, errors.New("owned nft socket rejects shared monitor receivers")
++	}
+ 	conn, closer, err := cc.netlinkConn()
+ 	if err != nil {
+ 		return nil, err
+diff --git a/owned.go b/owned.go
+new file mode 100644
+index 0000000..69f0819
+--- /dev/null
++++ b/owned.go
+@@ -0,0 +1,758 @@
++package nftables
++
++import (
++	"bytes"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"syscall"
++	"time"
++
++	"github.com/mdlayher/netlink"
++	"github.com/sagernet/nftables/binaryutil"
++	"golang.org/x/sys/unix"
++)
++
++// These values are pinned to Linux v6.12's UAPI, including backported kernels.
++const (
++	TableFlagOwner   uint32 = 0x2
++	TableFlagPersist uint32 = 0x4
++	nftTableHandle   uint16 = 4
++	nftTableUserdata uint16 = 6
++	nftTableOwner    uint16 = 7
++	nftSetHandle     uint16 = 16
++	nftChainUserdata uint16 = 12
++	nftGenID         uint16 = 1
++	nfnlBatchGenID   uint16 = 1
++)
++
++var (
++	ErrSealed            = errors.New("nftables connection permanently sealed")
++	ErrUncertain         = errors.New("nftables transaction outcome uncertain")
++	ErrGenerationChanged = errors.New("nftables generation changed; discard observation")
++)
++
++type TransactionState uint8
++
++const (
++	TransactionUnknown TransactionState = iota
++	TransactionNotSent
++	TransactionAborted
++	TransactionCommitted
++)
++
++// MessageIntent is produced only by the library serializer. Bytes, header and
++// object association are copied before the journal is called and before send.
++type MessageIntent struct {
++	Index             int
++	Header            netlink.Header
++	Family            TableFamily
++	Table, Chain, Set string
++	Handle            uint64
++	Bytes             []byte
++}
++
++type TransactionIntent struct {
++	Birth                           string
++	NamespaceDevice, NamespaceInode uint64
++	PortID, Generation              uint32
++	Messages                        []MessageIntent // includes BEGIN and END
++}
++
++type TransactionReceipt struct {
++	Intent  TransactionIntent
++	State   TransactionState
++	Sent    bool
++	Replies []netlink.Message
++	// GenerationNotifications are observations, never ACKs or object ownership.
++	GenerationNotifications []GenerationNotification
++	Err                     error
++}
++
++// TransactionJournal must persist Pending before returning from Prepare.
++// Complete receives an independent copy; the caller cannot change wire bytes.
++type TransactionJournal interface {
++	Prepare(TransactionIntent) error
++	Complete(TransactionReceipt)
++}
++
++type ownedState struct {
++	birth                           string
++	namespaceDevice, namespaceInode uint64
++	journal                         TransactionJournal
++	portID, sequence, generation    uint32
++	raw                             syscall.RawConn
++	transport                       ownedTransport
++	last                            TransactionReceipt
++	timeout                         time.Duration
++	tainted                         bool
++}
++
++// AsOwnedTransactions binds all transactions to one lasting socket and the
++// borrowed original namespace fd. Closing permanently seals every later IO.
++func AsOwnedTransactions(birth string, journal TransactionJournal) ConnOption {
++	return func(cc *Conn) {
++		cc.lasting = true
++		cc.owned = &ownedState{birth: birth, journal: journal, timeout: 5 * time.Second}
++	}
++}
++
++func (cc *Conn) initOwned() error {
++	o := cc.owned
++	if o == nil {
++		return nil
++	}
++	if o.birth == "" || o.journal == nil || cc.NetNS <= 0 {
++		return errors.New("owned nft socket requires birth, journal and pinned namespace fd")
++	}
++	var st unix.Stat_t
++	if err := unix.Fstat(cc.NetNS, &st); err != nil {
++		return err
++	}
++	typ, err := unix.IoctlRetInt(cc.NetNS, unix.NS_GET_NSTYPE)
++	if err != nil || typ != unix.CLONE_NEWNET {
++		return errors.New("owned nft socket fd is not a network namespace")
++	}
++	o.namespaceDevice, o.namespaceInode = uint64(st.Dev), st.Ino
++	o.raw, err = cc.nlconn.SyscallConn()
++	if err != nil {
++		return err
++	}
++	controlErr := o.raw.Control(func(fd uintptr) {
++		sa, e := unix.Getsockname(int(fd))
++		if e != nil {
++			err = e
++			return
++		}
++		nl, ok := sa.(*unix.SockaddrNetlink)
++		if !ok {
++			err = errors.New("owned nft socket is not netlink")
++			return
++		}
++		o.portID = nl.Pid
++	})
++	if controlErr != nil {
++		return controlErr
++	}
++	if err != nil {
++		return err
++	}
++	if o.portID == 0 {
++		return errors.New("owned nft socket has no port id")
++	}
++	if err = o.checkMemberships(); err != nil {
++		return err
++	}
++	var seed [4]byte
++	if _, err = rand.Read(seed[:]); err != nil {
++		return err
++	}
++	o.transport = &ownedNetlinkTransport{conn: cc.nlconn, state: o}
++	o.sequence = binary.NativeEndian.Uint32(seed[:])
++	if o.sequence == 0 {
++		o.sequence = 1
++	}
++	return nil
++}
++
++func cloneIntent(in TransactionIntent) TransactionIntent {
++	out := in
++	out.Messages = append([]MessageIntent(nil), in.Messages...)
++	for i := range out.Messages {
++		out.Messages[i].Bytes = bytes.Clone(in.Messages[i].Bytes)
++	}
++	return out
++}
++func cloneReceipt(in TransactionReceipt) TransactionReceipt {
++	out := in
++	out.Intent = cloneIntent(in.Intent)
++	out.Replies = cloneMessages(in.Replies)
++	out.GenerationNotifications = cloneGenerationNotifications(in.GenerationNotifications)
++	return out
++}
++func cloneMessages(in []netlink.Message) []netlink.Message {
++	out := append([]netlink.Message(nil), in...)
++	for i := range out {
++		out[i].Data = bytes.Clone(in[i].Data)
++	}
++	return out
++}
++
++// LastTransaction is a copy and is never authority to retry an uncertain send.
++func (cc *Conn) LastTransaction() TransactionReceipt {
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	if cc.owned == nil {
++		return TransactionReceipt{}
++	}
++	return cloneReceipt(cc.owned.last)
++}
++
++// UseGeneration consumes the complete 32-bit generation from a consistent
++// snapshot. It applies to the next Flush only; aborts are never replayed.
++func (cc *Conn) UseGeneration(generation uint32) error {
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	if cc.sealed {
++		return ErrSealed
++	}
++	if cc.owned != nil && cc.owned.tainted {
++		return ErrUncertain
++	}
++	if cc.owned == nil || generation == 0 {
++		return errors.New("conditional nft commit requires owned socket and nonzero generation")
++	}
++	cc.owned.generation = generation
++	return nil
++}
++
++func (cc *Conn) freezeOwned() ([]netlink.Message, TransactionIntent, error) {
++	o := cc.owned
++	messages := batch(cloneMessages(cc.messages))
++	messages[0].Header.Flags |= netlink.Acknowledge
++	messages[len(messages)-1].Header.Flags |= netlink.Acknowledge
++	if o.generation != 0 {
++		attrs, err := netlink.MarshalAttributes([]netlink.Attribute{{Type: nfnlBatchGenID, Data: binaryutil.BigEndian.PutUint32(o.generation)}})
++		if err != nil {
++			return nil, TransactionIntent{}, err
++		}
++		messages[0].Data = append(messages[0].Data, attrs...)
++	}
++	intent := TransactionIntent{Birth: o.birth, NamespaceDevice: o.namespaceDevice, NamespaceInode: o.namespaceInode, PortID: o.portID, Generation: o.generation}
++	for i := range messages {
++		m := &messages[i]
++		// Only supported object creates require echo; set-element batches still have
++		// full intent and ACK association and do not invent durable anonymous IDs.
++		op := int(m.Header.Type) & 0xff
++		if int(m.Header.Type)>>8 == unix.NFNL_SUBSYS_NFTABLES && (op == unix.NFT_MSG_NEWTABLE || op == unix.NFT_MSG_NEWCHAIN || op == unix.NFT_MSG_NEWRULE || op == unix.NFT_MSG_NEWSET) {
++			m.Header.Flags |= unix.NLM_F_ECHO
++		}
++		o.sequence++
++		if o.sequence == 0 {
++			return nil, intent, errors.New("owned nft sequence exhausted")
++		}
++		m.Header.Sequence = o.sequence
++		m.Header.PID = o.portID
++		m.Header.Length = uint32(16 + len(m.Data))
++		mi, err := messageIntent(i, *m)
++		if err != nil {
++			return nil, intent, err
++		}
++		intent.Messages = append(intent.Messages, mi)
++	}
++	return messages, intent, nil
++}
++
++func messageIntent(index int, m netlink.Message) (MessageIntent, error) {
++	mi := MessageIntent{Index: index, Header: m.Header}
++	var err error
++	mi.Bytes, err = m.MarshalBinary()
++	if err != nil {
++		return mi, err
++	}
++	if len(m.Data) < 4 {
++		return mi, errors.New("nft message missing nfgen header")
++	}
++	mi.Family = TableFamily(m.Data[0])
++	if m.Header.Type == unix.NFNL_MSG_BATCH_BEGIN || m.Header.Type == unix.NFNL_MSG_BATCH_END {
++		return mi, nil
++	}
++	if int(m.Header.Type)>>8 != unix.NFNL_SUBSYS_NFTABLES {
++		return mi, errors.New("foreign subsystem in nft transaction")
++	}
++	attrs, err := netlink.UnmarshalAttributes(m.Data[4:])
++	if err != nil {
++		return mi, err
++	}
++	op := int(m.Header.Type) & 0xff
++	var table, chain, set, handle uint16
++	switch op {
++	case unix.NFT_MSG_NEWTABLE, unix.NFT_MSG_DELTABLE:
++		table = unix.NFTA_TABLE_NAME
++		handle = nftTableHandle
++	case unix.NFT_MSG_NEWCHAIN, unix.NFT_MSG_DELCHAIN:
++		table = unix.NFTA_CHAIN_TABLE
++		chain = unix.NFTA_CHAIN_NAME
++		handle = unix.NFTA_CHAIN_HANDLE
++	case unix.NFT_MSG_NEWRULE, unix.NFT_MSG_DELRULE:
++		table = unix.NFTA_RULE_TABLE
++		chain = unix.NFTA_RULE_CHAIN
++		handle = unix.NFTA_RULE_HANDLE
++	case unix.NFT_MSG_NEWSET, unix.NFT_MSG_DELSET:
++		table = unix.NFTA_SET_TABLE
++		set = unix.NFTA_SET_NAME
++		handle = nftSetHandle
++	case unix.NFT_MSG_NEWSETELEM, unix.NFT_MSG_DELSETELEM:
++		table = unix.NFTA_SET_ELEM_LIST_TABLE
++		set = unix.NFTA_SET_ELEM_LIST_SET
++	default:
++		return mi, fmt.Errorf("nft operation %d has no audited transaction intent", op)
++	}
++	for _, a := range attrs {
++		typ := a.Type & 0x3fff
++		switch typ {
++		case table:
++			mi.Table = string(bytes.TrimSuffix(a.Data, []byte{0}))
++		case chain:
++			if chain != 0 {
++				mi.Chain = string(bytes.TrimSuffix(a.Data, []byte{0}))
++			}
++		case set:
++			if set != 0 {
++				mi.Set = string(bytes.TrimSuffix(a.Data, []byte{0}))
++			}
++		case handle:
++			if handle != 0 && len(a.Data) == 8 {
++				mi.Handle = binary.BigEndian.Uint64(a.Data)
++			}
++		}
++	}
++	if mi.Table == "" {
++		return mi, errors.New("nft global mutation has no owned parent intent")
++	}
++	return mi, nil
++}
++
++// flushOwned holds cc.mu. The one SendMessages call has no implicit retry.
++func (cc *Conn) flushOwned() (err error) {
++	o := cc.owned
++	messages, intent, err := cc.freezeOwned()
++	receipt := TransactionReceipt{Intent: intent, State: TransactionNotSent}
++	defer func() {
++		receipt.Err = err
++		if receipt.State == TransactionUnknown {
++			o.tainted = true
++		}
++		o.last = cloneReceipt(receipt)
++		o.generation = 0
++		o.journal.Complete(cloneReceipt(receipt))
++	}()
++	if err != nil {
++		return err
++	}
++	if err = o.journal.Prepare(cloneIntent(intent)); err != nil {
++		return err
++	}
++	var total, largestRequest int
++	for _, m := range intent.Messages {
++		total += len(m.Bytes)
++		largestRequest = max(largestRequest, len(m.Bytes))
++	}
++	// Configure and read back the original socket before delivery. The queue
++	// budget does not substitute for the complete observed ACK/echo receipt.
++	if err = o.transport.Buffers(total, largestRequest, len(messages)); err != nil {
++		return err
++	}
++	if err = o.transport.CheckMemberships(); err != nil {
++		return err
++	}
++	if err = o.transport.Deadline(time.Now().Add(o.timeout)); err != nil {
++		return err
++	}
++	defer o.transport.Deadline(time.Time{})
++	if err = o.transport.Send(messages); err != nil {
++		if !errors.Is(err, unix.EMSGSIZE) {
++			receipt.State = TransactionUnknown
++		}
++		return err
++	}
++
++	receipt.Sent = true
++	receipt.State = TransactionUnknown
++	expected := make(map[uint32]int, len(messages))
++	for i, m := range messages {
++		expected[m.Header.Sequence] = i
++	}
++	acked := make([]bool, len(messages))
++	echoed := make([]bool, len(messages))
++	var first error
++	lastACK := -1
++	// This exchange alone grants the requested echo exception. The intent was
++	// frozen before Send and is never recovered from a previous transaction.
++	receiveContext := ownedMutationReceiveContext(intent)
++	for {
++		packet, recvErr := o.transport.Receive(receiveContext)
++		if first == nil && packet.kernelError != nil {
++			first = packet.kernelError
++		}
++		if recvErr != nil {
++			return errors.Join(first, recvErr, ErrUncertain)
++		}
++		if len(receipt.GenerationNotifications)+len(packet.notifications) > 1 {
++			return errors.Join(first, errors.New("duplicate nft generation notification"), ErrUncertain)
++		}
++		receipt.GenerationNotifications = append(receipt.GenerationNotifications, cloneGenerationNotifications(packet.notifications)...)
++		// Validate the whole packet before selecting even a known abort. A GEN
++		// cannot coexist with a kernel failure in this transaction.
++		generationAbort := false
++		for _, reply := range packet.replies {
++			receipt.Replies = append(receipt.Replies, reply)
++			i, ok := expected[reply.Header.Sequence]
++			if !ok || reply.Header.PID != o.portID || reply.Header.Flags&netlink.DumpInterrupted != 0 {
++				return errors.Join(first, errors.New("nft reply has wrong sequence/PID or interrupted dump"), ErrUncertain)
++			}
++			sent := messages[i]
++			if reply.Header.Type == netlink.Error {
++				errno, ackErr := validateACK(reply, sent)
++				if ackErr != nil || acked[i] || i < lastACK {
++					return errors.Join(first, ackErr, errors.New("nft ACK missing, duplicate or out of order"), ErrUncertain)
++				}
++				acked[i] = true
++				lastACK = i
++				if errno != 0 {
++					if first == nil {
++						first = errno
++					}
++					// A validated begin failure is emitted before any batch handler, or
++					// after commit error's abort. ERESTART specifically proves no commit.
++					if i == 0 && errno == unix.ERESTART {
++						generationAbort = true
++					}
++				}
++			} else {
++				if echoed[i] || sent.Header.Flags&unix.NLM_F_ECHO == 0 {
++					return errors.Join(first, errors.New("unexpected/duplicate nft echo"), ErrUncertain)
++				}
++				if err := validateEcho(intent.Messages[i], reply); err != nil {
++					return errors.Join(first, err, ErrUncertain)
++				}
++				echoed[i] = true
++			}
++		}
++		if first != nil && len(receipt.GenerationNotifications) != 0 {
++			return errors.Join(first, errors.New("nft generation notification contradicts kernel error"), ErrUncertain)
++		}
++		if generationAbort {
++			receipt.State = TransactionAborted
++			return errors.Join(first, ErrGenerationChanged)
++		}
++		// The kernel emits END success only after commit. No individual ACK can
++		// publish ownership while END, an expected member ACK or echo is missing.
++		if acked[len(messages)-1] {
++			if first != nil {
++				return errors.Join(first, ErrUncertain)
++			}
++			for i, m := range messages {
++				if !acked[i] || (m.Header.Flags&unix.NLM_F_ECHO != 0 && !echoed[i]) {
++					return errors.Join(errors.New("incomplete nft batch receipt"), ErrUncertain)
++				}
++			}
++			receipt.State = TransactionCommitted
++			return nil
++		}
++		// Linux delivers member errors after the abort and then does not ACK END.
++		// Drain all requested member ACKs to retain full correlation; receipt is
++		// Aborted only for the pinned complete error list, never a recv errno.
++		if first != nil {
++			all := true
++			for i := 0; i < len(messages)-1; i++ {
++				if !acked[i] {
++					all = false
++					break
++				}
++			}
++			if all {
++				receipt.State = TransactionAborted
++				return first
++			}
++		}
++	}
++}
++
++func validateACK(reply, sent netlink.Message) (syscall.Errno, error) {
++	if len(reply.Data) < 20 {
++		return 0, errors.New("short nft ACK")
++	}
++	code := int32(binary.NativeEndian.Uint32(reply.Data[:4]))
++	h := reply.Data[4:20]
++	if binary.NativeEndian.Uint32(h[:4]) != sent.Header.Length || binary.NativeEndian.Uint16(h[4:6]) != uint16(sent.Header.Type) || binary.NativeEndian.Uint16(h[6:8]) != uint16(sent.Header.Flags) || binary.NativeEndian.Uint32(h[8:12]) != sent.Header.Sequence || binary.NativeEndian.Uint32(h[12:16]) != sent.Header.PID {
++		return 0, errors.New("nft ACK embedded request differs from frozen intent")
++	}
++	if code > 0 {
++		return 0, errors.New("positive nft ACK errno")
++	}
++	return syscall.Errno(-code), nil
++}
++func validateEcho(intent MessageIntent, reply netlink.Message) error {
++	echo, err := messageIntent(intent.Index, reply)
++	if err != nil {
++		return err
++	}
++	if reply.Header.Type != intent.Header.Type || echo.Family != intent.Family || echo.Table != intent.Table || echo.Chain != intent.Chain || echo.Set != intent.Set || intent.Handle != 0 && echo.Handle != intent.Handle {
++		return errors.New("nft echo differs in family, parent or handle")
++	}
++	op := int(reply.Header.Type) & 0xff
++	if (op == unix.NFT_MSG_NEWTABLE || op == unix.NFT_MSG_NEWCHAIN || op == unix.NFT_MSG_NEWRULE || op == unix.NFT_MSG_NEWSET) && echo.Handle == 0 {
++		return errors.New("nft object echo has no durable handle")
++	}
++	return nil
++}
++
++type ownedReceiveContext struct {
++	mutation  *TransactionIntent // nil for queries; immutable current frozen intent
++	requested map[uint32]MessageIntent
++}
++
++func ownedMutationReceiveContext(intent TransactionIntent) ownedReceiveContext {
++	frozen := cloneIntent(intent)
++	context := ownedReceiveContext{mutation: &frozen, requested: make(map[uint32]MessageIntent, len(frozen.Messages))}
++	for _, message := range frozen.Messages {
++		context.requested[message.Header.Sequence] = message
++	}
++	return context
++}
++
++func (o *ownedState) receiveRaw(context ownedReceiveContext) (ownedReceivePacket, error) {
++	var size int
++	var recvErr error
++	err := o.raw.Read(func(fd uintptr) bool {
++		size, _, _, _, recvErr = unix.Recvmsg(int(fd), nil, nil, unix.MSG_PEEK|unix.MSG_TRUNC|unix.MSG_DONTWAIT)
++		return recvErr != unix.EAGAIN && recvErr != unix.EWOULDBLOCK
++	})
++	if err != nil {
++		return ownedReceivePacket{}, err
++	}
++	if recvErr != nil {
++		return ownedReceivePacket{}, recvErr
++	}
++	if size <= 0 || size > 4<<20 {
++		return ownedReceivePacket{}, errors.New("nft datagram exceeds bounded receive budget")
++	}
++	buf := make([]byte, size)
++	var n, flags int
++	var from unix.Sockaddr
++	err = o.raw.Read(func(fd uintptr) bool {
++		n, _, flags, from, recvErr = unix.Recvmsg(int(fd), buf, nil, unix.MSG_DONTWAIT)
++		return recvErr != unix.EAGAIN && recvErr != unix.EWOULDBLOCK
++	})
++	if err != nil {
++		return ownedReceivePacket{}, err
++	}
++	if recvErr != nil {
++		return ownedReceivePacket{}, recvErr
++	}
++	return decodeOwnedReceivePacket(buf[:n], flags, from, context)
++}
++func decodeOwnedDatagram(buf []byte, flags int, from unix.Sockaddr) ([]netlink.Message, error) {
++	return decodeOwnedDatagramContext(buf, flags, from, ownedReceiveContext{})
++}
++func decodeOwnedDatagramContext(buf []byte, flags int, from unix.Sockaddr, context ownedReceiveContext) ([]netlink.Message, error) {
++	packet, err := decodeOwnedReceivePacket(buf, flags, from, context)
++	return packet.replies, err
++}
++
++// Record the rejected receive without changing peer acceptance. Headers are
++// untrusted diagnostic data, never an ACK/echo receipt or authority to retry.
++func rejectedOwnedSender(buf []byte, flags int, from unix.Sockaddr) error {
++	return rejectedOwnedDatagram("nft datagram sender is not the unicast kernel", buf, flags, from)
++}
++
++func rejectedOwnedDatagram(reason string, buf []byte, flags int, from unix.Sockaddr) error {
++	pid, groups := "unavailable", "unavailable"
++	if sender, ok := from.(*unix.SockaddrNetlink); ok && sender != nil {
++		pid, groups = fmt.Sprint(sender.Pid), fmt.Sprint(sender.Groups)
++	}
++	parsed, parseErr := syscall.ParseNetlinkMessage(buf)
++	// Bound only the rejected receive's diagnostic text; the wire receive and
++	// all accepted message validation keep their existing limits and behavior.
++	headers := make([]syscall.NlMsghdr, min(len(parsed), 8))
++	for i := range headers {
++		headers[i] = parsed[i].Header
++	}
++	return fmt.Errorf("%s: from_type=%T from_pid=%s from_groups=%s recvmsg_flags=%#x datagram_bytes=%d datagram_sha256=%x header_count=%d headers=%+v header_parse_error=%v", reason, from, pid, groups, flags, len(buf), sha256.Sum256(buf), len(parsed), headers, parseErr)
++}
++
++// PendingBytes includes framing. It lets complete builders use an actual
++// encoded-byte budget rather than an element-count proxy.
++func (cc *Conn) PendingBytes() (int, error) {
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	if cc.sealed {
++		return 0, ErrSealed
++	}
++	if cc.err != nil {
++		return 0, cc.err
++	}
++	size := 40
++	if cc.owned != nil && cc.owned.generation != 0 {
++		size += 8
++	}
++	for _, m := range cc.messages {
++		m.Header.Length = uint32(16 + len(m.Data))
++		b, err := m.MarshalBinary()
++		if err != nil {
++			return 0, err
++		}
++		size += len(b)
++	}
++	return size, nil
++}
++
++// SetElementBytes uses exactly the same serializer as SetAddElements.
++func SetElementBytes(s *Set, values []SetElement) (int, error) {
++	attrs, err := s.makeElemList(values, s.ID)
++	if err != nil {
++		return 0, err
++	}
++	b, err := netlink.MarshalAttributes(attrs)
++	return 20 + len(b), err
++}
++
++// DiscardPending discards an unsent builder queue. It never retries a receipt.
++func (cc *Conn) DiscardPending() {
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	cc.messages = nil
++	cc.err = nil
++	if cc.owned != nil {
++		cc.owned.generation = 0
++	}
++}
++
++// This is the actual transport injection seam. Production always installs the
++// sender-aware raw receiver; no exported option accepts caller wire bytes.
++type ownedTransport interface {
++	Send([]netlink.Message) error
++	Receive(ownedReceiveContext) (ownedReceivePacket, error)
++	CheckMemberships() error
++	Buffers(wireBytes, largestRequestBytes, messageCount int) error
++	Deadline(time.Time) error
++}
++type ownedNetlinkTransport struct {
++	conn  *netlink.Conn
++	state *ownedState
++}
++
++func (t *ownedNetlinkTransport) Send(messages []netlink.Message) error {
++	_, err := t.conn.SendMessages(messages)
++	return err
++}
++func (t *ownedNetlinkTransport) Receive(context ownedReceiveContext) (ownedReceivePacket, error) {
++	return t.state.receiveRaw(context)
++}
++func (t *ownedNetlinkTransport) CheckMemberships() error { return t.state.checkMemberships() }
++func (t *ownedNetlinkTransport) Deadline(deadline time.Time) error {
++	return t.conn.SetReadDeadline(deadline)
++}
++
++// The lower bounds below are observable wire requirements, not estimates of
++// skb truesize. A sufficient value never proves receipt completion: ENOBUFS
++// after Send still permanently taints the connection and is never replayed.
++const ownedReceiveBufferTarget = 4 << 20
++
++type ownedBufferSocket interface {
++	ReadBuffer() (int, error)
++	WriteBuffer() (int, error)
++	SetReadBuffer(int) error
++	SetWriteBuffer(int) error
++}
++
++func (t *ownedNetlinkTransport) ReadBuffer() (int, error)  { return t.conn.ReadBuffer() }
++func (t *ownedNetlinkTransport) WriteBuffer() (int, error) { return t.conn.WriteBuffer() }
++func (t *ownedNetlinkTransport) SetReadBuffer(size int) error {
++	return t.setBuffer(unix.SO_RCVBUF, size)
++}
++func (t *ownedNetlinkTransport) SetWriteBuffer(size int) error {
++	return t.setBuffer(unix.SO_SNDBUF, size)
++}
++func (t *ownedNetlinkTransport) setBuffer(option, size int) error {
++	var socketErr error
++	err := t.state.raw.Control(func(fd uintptr) {
++		// The dependency's setters try SO_*BUFFORCE first. Owned transports
++		// use only the normal bounded options on their original socket.
++		socketErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, option, size)
++	})
++	if err != nil {
++		return err
++	}
++	return socketErr
++}
++func (t *ownedNetlinkTransport) Buffers(total, largestRequest, count int) error {
++	return configureOwnedBuffers(t, total, largestRequest, count)
++}
++func configureOwnedBuffers(socket ownedBufferSocket, total, largestRequest, count int) error {
++	maxInt := int(^uint(0) >> 1)
++	if total < 20 || largestRequest < 20 || largestRequest > total || total > maxInt-64 || count < 1 || count > maxInt/36 {
++		return errors.New("invalid nft socket buffer requirements")
++	}
++	readSize, err := socket.ReadBuffer()
++	if err != nil {
++		return err
++	}
++	writeSize, err := socket.WriteBuffer()
++	if err != nil {
++		return err
++	}
++	// An uncapped error ACK includes its complete original request plus the
++	// outer netlink header and errno. Every requested ACK is at least 36 bytes.
++	// Use the largest individual request, not the sum of unrelated payloads.
++	minimumRead := max(largestRequest+20, count*36)
++	beforeRead, beforeWrite := readSize, writeSize
++	if readSize < minimumRead {
++		if err := socket.SetReadBuffer(ownedReceiveBufferTarget); err != nil {
++			return err
++		}
++		readSize, err = socket.ReadBuffer()
++		if err != nil {
++			return err
++		}
++	}
++	if readSize < beforeRead || readSize < minimumRead {
++		return fmt.Errorf("nft actual receive buffer is insufficient: before=%d actual=%d minimum-wire=%d target=%d", beforeRead, readSize, minimumRead, ownedReceiveBufferTarget)
++	}
++	if writeSize < total+32 {
++		if err := socket.SetWriteBuffer(total + 64); err != nil {
++			return err
++		}
++		writeSize, err = socket.WriteBuffer()
++		if err != nil {
++			return err
++		}
++	}
++	if writeSize < beforeWrite || writeSize < total+32 {
++		return fmt.Errorf("nft encoded batch exceeds actual send buffer: wire=%d before=%d actual=%d", total, beforeWrite, writeSize)
++	}
++	return nil
++}
++
++// ConfirmedObjects returns kernel handles only after the full commit receipt.
++func (r TransactionReceipt) ConfirmedObjects() (*ConsistentSnapshot, error) {
++	if r.State != TransactionCommitted {
++		return nil, ErrUncertain
++	}
++	out := &ConsistentSnapshot{}
++	for _, m := range r.Replies {
++		if int(m.Header.Type)>>8 != unix.NFNL_SUBSYS_NFTABLES {
++			continue
++		}
++		switch int(m.Header.Type) & 0xff {
++		case unix.NFT_MSG_NEWTABLE:
++			t, e := tableFromMsg(m)
++			if e != nil {
++				return nil, e
++			}
++			out.Tables = append(out.Tables, t)
++		case unix.NFT_MSG_NEWCHAIN:
++			c, e := chainFromMsg(m)
++			if e != nil {
++				return nil, e
++			}
++			out.Chains = append(out.Chains, c)
++		case unix.NFT_MSG_NEWRULE:
++			r, e := ruleFromMsg(TableFamily(m.Data[0]), m)
++			if e != nil {
++				return nil, e
++			}
++			out.Rules = append(out.Rules, r)
++		case unix.NFT_MSG_NEWSET:
++			s, e := setsFromMsg(m)
++			if e != nil {
++				return nil, e
++			}
++			out.Sets = append(out.Sets, s)
++		}
++	}
++	return out, nil
++}
+diff --git a/owned_buffers_test.go b/owned_buffers_test.go
+new file mode 100644
+index 0000000..8bbaa90
+--- /dev/null
++++ b/owned_buffers_test.go
+@@ -0,0 +1,229 @@
++package nftables
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/mdlayher/netlink"
++	"github.com/sagernet/nftables/binaryutil"
++	"golang.org/x/sys/unix"
++)
++
++type bufferSocketResult struct {
++	read, write                 int
++	readLimit, writeLimit       int
++	readCalls, writeCalls       int
++	readFailAt, writeFailAt     int
++	readSetErr, writeSetErr     error
++	readRequests, writeRequests []int
++}
++
++func (s *bufferSocketResult) ReadBuffer() (int, error) {
++	s.readCalls++
++	if s.readCalls == s.readFailAt {
++		return 0, unix.EBADF
++	}
++	return s.read, nil
++}
++func (s *bufferSocketResult) WriteBuffer() (int, error) {
++	s.writeCalls++
++	if s.writeCalls == s.writeFailAt {
++		return 0, unix.EBADF
++	}
++	return s.write, nil
++}
++func (s *bufferSocketResult) SetReadBuffer(size int) error {
++	s.readRequests = append(s.readRequests, size)
++	if s.readSetErr != nil {
++		return s.readSetErr
++	}
++	s.read = min(size*2, s.readLimit)
++	return nil
++}
++func (s *bufferSocketResult) SetWriteBuffer(size int) error {
++	s.writeRequests = append(s.writeRequests, size)
++	if s.writeSetErr != nil {
++		return s.writeSetErr
++	}
++	s.write = min(size*2, s.writeLimit)
++	return nil
++}
++func TestOwnedBuffersPreserveDefault(t *testing.T) {
++	for _, size := range []int{212992, 16 << 20} {
++		socket := &bufferSocketResult{read: size, write: size}
++		if err := configureOwnedBuffers(socket, 124, 84, 3); err != nil {
++			t.Fatal(err)
++		}
++		if socket.read != size || socket.write != size || len(socket.readRequests)+len(socket.writeRequests) != 0 {
++			t.Fatal("an adequate original/default buffer was set or reduced")
++		}
++	}
++}
++func TestOwnedBuffersKernelClampMayMeetActualMinimum(t *testing.T) {
++	socket := &bufferSocketResult{read: 64, write: 128, readLimit: 425984, writeLimit: 425984}
++	if err := configureOwnedBuffers(socket, 124, 84, 3); err != nil {
++		t.Fatal(err)
++	}
++	if socket.read >= ownedReceiveBufferTarget || socket.read < 108 || socket.readCalls != 2 || socket.writeCalls != 2 {
++		t.Fatal("clamped actual buffer was rejected or not read back")
++	}
++	if len(socket.readRequests) != 1 || socket.readRequests[0] != ownedReceiveBufferTarget {
++		t.Fatal("receive expansion was not bounded")
++	}
++}
++func TestOwnedBuffersPreSendFailuresHaveNoSend(t *testing.T) {
++	cases := []struct {
++		name   string
++		socket bufferSocketResult
++		errno  error
++	}{
++		{"initial-read-fails", bufferSocketResult{read: 212992, write: 212992, readFailAt: 1}, unix.EBADF},
++		{"initial-write-fails", bufferSocketResult{read: 212992, write: 212992, writeFailAt: 1}, unix.EBADF},
++		{"read-set-fails", bufferSocketResult{read: 64, write: 212992, readSetErr: unix.EPERM}, unix.EPERM},
++		{"read-back-fails", bufferSocketResult{read: 64, write: 212992, readLimit: 425984, readFailAt: 2}, unix.EBADF},
++		{"read-clamp-insufficient", bufferSocketResult{read: 64, write: 212992, readLimit: 80}, nil},
++		{"read-was-reduced", bufferSocketResult{read: 64, write: 212992, readLimit: 32}, nil},
++		{"write-set-fails", bufferSocketResult{read: 212992, write: 64, writeSetErr: unix.EPERM}, unix.EPERM},
++		{"write-back-fails", bufferSocketResult{read: 212992, write: 64, writeLimit: 425984, writeFailAt: 2}, unix.EBADF},
++		{"write-clamp-insufficient", bufferSocketResult{read: 212992, write: 64, writeLimit: 80}, nil},
++	}
++	for _, item := range cases {
++		t.Run(item.name, func(t *testing.T) {
++			c, tr, journal := testOwnedConn(t)
++			tr.bufferFunc = func(total, largest, count int) error {
++				return configureOwnedBuffers(&item.socket, total, largest, count)
++			}
++			c.CreateTable(&Table{Name: "budget-preflight", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			err := c.Flush()
++			if err == nil || item.errno != nil && !errors.Is(err, item.errno) {
++				t.Fatalf("original preflight error missing: %v", err)
++			}
++			if len(tr.sent) != 0 || c.LastTransaction().Sent || c.LastTransaction().State != TransactionNotSent || c.owned.tainted {
++				t.Fatal("preflight failure sent a batch or invented an uncertain effect")
++			}
++			if len(journal.pending) != 1 || len(journal.completed) != 1 {
++				t.Fatal("preflight outcome lacks original journal")
++			}
++		})
++	}
++}
++
++// Linux table/chain dumps enumerate the whole family before selection. Valid
++// foreign objects cannot impose a new aggregate limit on a small owned table.
++func TestOwnedLargeFamilyDumpPreservesSelectedTable(t *testing.T) {
++	cases := []struct {
++		name      string
++		op, count int
++		padded    bool
++	}{
++		{"table-bytes", unix.NFT_MSG_GETTABLE, 60000, true},
++		{"table-count", unix.NFT_MSG_GETTABLE, 65537, false},
++		{"chain-bytes", unix.NFT_MSG_GETCHAIN, 60000, true},
++		{"chain-count", unix.NFT_MSG_GETCHAIN, 65537, false},
++	}
++	for _, item := range cases {
++		t.Run(item.name, func(t *testing.T) {
++			c, tr, _ := testOwnedConn(t)
++			var foreignBytes, foreignCount int
++			deliver := func(packets [][]netlink.Message) [][]netlink.Message {
++				for i, packet := range packets {
++					var wire []byte
++					for _, message := range packet {
++						message.Header.Length = uint32(16 + len(message.Data))
++						encoded, err := message.MarshalBinary()
++						if err != nil {
++							t.Fatal(err)
++						}
++						wire = append(wire, encoded...)
++					}
++					if len(wire) >= 4<<20 {
++						t.Fatal("positive control exceeded the retained single datagram limit")
++					}
++					decoded, err := decodeOwnedDatagram(wire, 0, &unix.SockaddrNetlink{})
++					if err != nil {
++						t.Fatal(err)
++					}
++					packets[i] = decoded
++				}
++				return packets
++			}
++			tr.onSend = func(sent []netlink.Message) [][]netlink.Message {
++				if len(sent) > 1 {
++					return deliver(successfulReplies(sent))
++				}
++				request := sent[0]
++				op := int(request.Header.Type) & 255
++				done := queryReplies(request, 0xfedcba98)
++				if op != unix.NFT_MSG_GETTABLE && op != unix.NFT_MSG_GETCHAIN {
++					return deliver([][]netlink.Message{done})
++				}
++				packets := [][]netlink.Message{{dumpObject(request, "own", "own-chain")}}
++				if op != item.op {
++					if op == unix.NFT_MSG_GETTABLE {
++						attributes, err := netlink.MarshalAttributes([]netlink.Attribute{
++							{Type: unix.NFTA_TABLE_NAME, Data: []byte("foreign-parent\x00")},
++							{Type: nftTableHandle, Data: binaryutil.BigEndian.PutUint64(102)},
++						})
++						if err != nil {
++							t.Fatal(err)
++						}
++						foreignParent := netlink.Message{Header: netlink.Header{Type: request.Header.Type - 1, Flags: netlink.Multi, Sequence: request.Header.Sequence, PID: request.Header.PID}, Data: append(extraHeader(byte(TableFamilyINet), 0), attributes...)}
++						packets[0] = append(packets[0], foreignParent)
++					}
++					return deliver(append(packets, done))
++				}
++				// Each complete datagram is far below the retained 4 MiB limit;
++				// table userdata stays within Linux's 256-byte attribute limit.
++				for start := 0; start < item.count; start += 128 {
++					packet := make([]netlink.Message, 0, min(128, item.count-start))
++					for i := start; i < min(start+128, item.count); i++ {
++						name := fmt.Sprintf("foreign-%d", i)
++						var attributes []netlink.Attribute
++						if op == unix.NFT_MSG_GETTABLE {
++							attributes = []netlink.Attribute{{Type: unix.NFTA_TABLE_NAME, Data: []byte(name + "\x00")}, {Type: nftTableHandle, Data: binaryutil.BigEndian.PutUint64(uint64(i + 1000))}}
++							if item.padded {
++								attributes = append(attributes, netlink.Attribute{Type: nftTableUserdata, Data: make([]byte, 256)})
++							}
++						} else {
++							if item.padded {
++								name = strings.Repeat("c", 235) + name
++							}
++							attributes = []netlink.Attribute{{Type: unix.NFTA_CHAIN_TABLE, Data: []byte("foreign-parent\x00")}, {Type: unix.NFTA_CHAIN_NAME, Data: []byte(name + "\x00")}, {Type: unix.NFTA_CHAIN_HANDLE, Data: binaryutil.BigEndian.PutUint64(uint64(i + 1000))}}
++						}
++						encoded, err := netlink.MarshalAttributes(attributes)
++						if err != nil {
++							t.Fatal(err)
++						}
++						data := append(extraHeader(byte(TableFamilyINet), 0), encoded...)
++						object := netlink.Message{Header: netlink.Header{Length: uint32(16 + len(data)), Type: request.Header.Type - 1, Flags: netlink.Multi, Sequence: request.Header.Sequence, PID: request.Header.PID}, Data: data}
++						foreignBytes += 16 + len(data)
++						foreignCount++
++						packet = append(packet, object)
++					}
++					packets = append(packets, packet)
++				}
++				return deliver(append(packets, done))
++			}
++			snapshot, err := c.ReadConsistentTable(&Table{Name: "own", Family: TableFamilyINet})
++			if err != nil || c.owned.tainted || snapshot == nil {
++				t.Fatalf("valid large foreign family poisoned a small own table: %v", err)
++			}
++			if foreignCount != item.count || item.padded && foreignBytes <= 16<<20 || !item.padded && foreignCount <= 65536 {
++				t.Fatal("positive control did not cross the removed aggregate limit")
++			}
++			if snapshot.Generation != 0xfedcba98 || len(snapshot.Tables) != 1 || len(snapshot.Chains) != 1 || snapshot.Tables[0].Name != "own" || snapshot.Chains[0].Name != "own-chain" || snapshot.Chains[0].Table.Name != "own" || len(tr.sent) != 6 {
++				t.Fatal("complete generation/terminal family selection was lost")
++			}
++			if generation, err := c.Generation(); err != nil || generation != 0xfedcba98 {
++				t.Fatal("valid foreign family dump sealed the next read")
++			}
++			c.CreateTable(&Table{Name: "after-valid-observation", Family: TableFamilyINet, Flags: TableFlagOwner})
++			if err := c.Flush(); err != nil || c.LastTransaction().State != TransactionCommitted || len(tr.sent) != 8 {
++				t.Fatalf("valid foreign family dump blocked the next write: %v", err)
++			}
++			t.Logf("complete valid foreign family objects=%d wire-bytes=%d retained own tables=1 chains=1; next read/write succeeded", foreignCount, foreignBytes)
++		})
++	}
++}
+diff --git a/owned_echo_diagnostic_test.go b/owned_echo_diagnostic_test.go
+new file mode 100644
+index 0000000..d660d0f
+--- /dev/null
++++ b/owned_echo_diagnostic_test.go
+@@ -0,0 +1,65 @@
++package nftables
++
++import (
++	"crypto/sha256"
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/mdlayher/netlink"
++)
++
++func TestOwnedRejectedEchoDiagnosticPreservesUnknown(t *testing.T) {
++	for _, rejectedIndex := range []int{0, 9} {
++		t.Run(fmt.Sprint(rejectedIndex), func(t *testing.T) {
++			c, p, j := newPeerConn(t)
++			table := c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			for i := 0; i < rejectedIndex; i++ {
++				c.AddChain(&Chain{Name: fmt.Sprintf("chain-%d", i), Table: table})
++			}
++			var rejectedPacket peerPacket
++			var rejectedHeader netlink.Header
++			p.makePackets = func(sent []netlink.Message) []peerPacket {
++				first := marshalPeerPacket(t, 64, kernelPeerEcho(t, sent[1]))
++				var mixed []netlink.Message
++				for _, message := range sent[2 : len(sent)-1] {
++					mixed = append(mixed, kernelPeerEcho(t, message))
++				}
++				bad := ack(sent[1], 0)
++				bad.Header.Length = uint32(16 + len(bad.Data))
++				rejectedHeader = bad.Header
++				mixed = append(mixed, bad)
++				rejectedPacket = marshalPeerPacket(t, 64, mixed...)
++				return []peerPacket{first, rejectedPacket, peerACKs(t, sent)}
++			}
++			err := c.Flush()
++			if !errors.Is(err, ErrUncertain) {
++				t.Fatal("rejected echo did not retain uncertainty", err)
++			}
++			text := err.Error()
++			for _, field := range []string{
++				"nft notification is not a requested current mutation echo:",
++				"from_type=*unix.SockaddrNetlink from_pid=0 from_groups=64 recvmsg_flags=0x0",
++				fmt.Sprintf("datagram_bytes=%d datagram_sha256=%x", len(rejectedPacket.wire), sha256.Sum256(rejectedPacket.wire)),
++				fmt.Sprintf("header_count=%d", rejectedIndex+1),
++				fmt.Sprintf("rejected_header_index=%d rejected_header={Len:%d Type:%d Flags:%d Seq:%d Pid:%d}", rejectedIndex, rejectedHeader.Length, uint16(rejectedHeader.Type), uint16(rejectedHeader.Flags), rejectedHeader.Sequence, rejectedHeader.PID),
++			} {
++				if !strings.Contains(text, field) {
++					t.Fatalf("missing actual diagnostic field %q in %s", field, text)
++				}
++			}
++			prefix := strings.Split(strings.Split(text, " headers=[")[1], "] header_parse_error=")[0]
++			if strings.Count(prefix, "{Len:") != min(rejectedIndex+1, 8) {
++				t.Fatal("diagnostic prefix was not bounded to eight headers", text)
++			}
++			receipt := c.LastTransaction()
++			if receipt.State != TransactionUnknown || !receipt.Sent || len(receipt.Replies) != 1 || len(p.sent) != 1 || len(j.completed) != 1 {
++				t.Fatal("diagnostic accepted a mixed prefix or changed the single-send Unknown receipt", receipt)
++			}
++			if err := c.Flush(); !errors.Is(err, ErrUncertain) || len(p.sent) != 1 {
++				t.Fatal("diagnostic replayed the sealed transaction", err)
++			}
++		})
++	}
++}
+diff --git a/owned_generation.go b/owned_generation.go
+new file mode 100644
+index 0000000..59ebd3d
+--- /dev/null
++++ b/owned_generation.go
+@@ -0,0 +1,196 @@
++package nftables
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"syscall"
++
++	"github.com/mdlayher/netlink"
++	"golang.org/x/sys/unix"
++)
++
++// GenerationNotification preserves an actual receive on the original owned
++// socket. TaskPID is the kernel's initial-namespace task ID, not the socket port
++// or a PID in the caller's namespace. No field grants ACK or ownership authority.
++type GenerationNotification struct {
++	RawDatagram       []byte
++	DatagramSHA256    string
++	RawMessage        netlink.Message
++	MessageIndex      int
++	SenderPID, Groups uint32
++	RecvmsgFlags      int
++	Generation        uint32
++	TaskPID           uint32
++	TaskName          []byte // bytes before the single terminating NUL
++}
++
++func cloneGenerationNotifications(in []GenerationNotification) []GenerationNotification {
++	out := append([]GenerationNotification(nil), in...)
++	for i := range out {
++		out[i].RawDatagram = bytes.Clone(in[i].RawDatagram)
++		out[i].RawMessage.Data = bytes.Clone(in[i].RawMessage.Data)
++		out[i].TaskName = bytes.Clone(in[i].TaskName)
++	}
++	return out
++}
++
++// Only this private carrier can attach metadata from recvmsg to a receipt.
++// A rejected packet exposes no accepted prefix/aux. kernelError retains an
++// exactly associated negative ACK as an error, even when the packet is invalid.
++type ownedReceivePacket struct {
++	replies       []netlink.Message
++	notifications []GenerationNotification
++	kernelError   error
++}
++
++func decodeOwnedReceivePacket(buf []byte, flags int, from unix.Sockaddr, context ownedReceiveContext) (ownedReceivePacket, error) {
++	var packet ownedReceivePacket
++	sender, ok := from.(*unix.SockaddrNetlink)
++	const nftNotifyGroupMask = 1 << (unix.NFNLGRP_NFTABLES - 1)
++	if !ok || sender == nil || sender.Pid != 0 || sender.Groups != 0 && (sender.Groups != nftNotifyGroupMask || context.mutation == nil) {
++		return packet, rejectedOwnedSender(buf, flags, from)
++	}
++	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
++		return packet, errors.New("nft received truncated datagram")
++	}
++	parsed, err := syscall.ParseNetlinkMessage(buf)
++	if err != nil {
++		return packet, err
++	}
++	var consumed int
++	messages := make([]netlink.Message, len(parsed))
++	for i, m := range parsed {
++		consumed += (int(m.Header.Len) + 3) &^ 3
++		messages[i] = netlink.Message{Header: netlink.Header{Length: m.Header.Len, Type: netlink.HeaderType(m.Header.Type), Flags: netlink.HeaderFlags(m.Header.Flags), Sequence: m.Header.Seq, PID: m.Header.Pid}, Data: bytes.Clone(m.Data)}
++	}
++	if consumed != len(buf) || sender.Groups != 0 && len(messages) == 0 {
++		return packet, errors.New("nft datagram has empty or unparsed framing")
++	}
++	if context.mutation == nil {
++		// Ordinary group-zero queries keep their own complete query validator.
++		packet.replies = messages
++		return packet, nil
++	}
++	// Inspect the complete packet for original errno before any validation or
++	// terminal return. This does not publish an invalid packet as ACK authority.
++	for _, m := range messages {
++		intent, found := context.requested[m.Header.Sequence]
++		if found && m.Header.PID == context.mutation.PortID && m.Header.Flags&netlink.DumpInterrupted == 0 && m.Header.Type == netlink.Error {
++			code, ackErr := validateACK(m, netlink.Message{Header: intent.Header})
++			if ackErr == nil && code != 0 && packet.kernelError == nil {
++				packet.kernelError = code
++			}
++		}
++	}
++	var replies []netlink.Message
++	var notifications []GenerationNotification
++	reject := func(index int, m netlink.Message, reason error) (ownedReceivePacket, error) {
++		return ownedReceivePacket{kernelError: packet.kernelError}, fmt.Errorf("%w rejected_header_index=%d rejected_header={Len:%d Type:%d Flags:%d Seq:%d Pid:%d}",
++			errors.Join(reason, rejectedOwnedDatagram("nft notification is not a requested current mutation echo", buf, flags, from)),
++			index, m.Header.Length, uint16(m.Header.Type), uint16(m.Header.Flags), m.Header.Sequence, m.Header.PID)
++	}
++	for index, m := range messages {
++		if int(m.Header.Type) == (unix.NFNL_SUBSYS_NFTABLES<<8)|unix.NFT_MSG_NEWGEN {
++			generation, pid, name, err := validateGenerationNotification(context, m)
++			if err != nil {
++				return reject(index, m, err)
++			}
++			if len(notifications) != 0 {
++				return reject(index, m, errors.New("duplicate nft generation notification"))
++			}
++			notifications = append(notifications, GenerationNotification{RawDatagram: bytes.Clone(buf), DatagramSHA256: fmt.Sprintf("%x", sha256.Sum256(buf)), RawMessage: cloneMessages([]netlink.Message{m})[0], MessageIndex: index, SenderPID: sender.Pid, Groups: sender.Groups, RecvmsgFlags: flags, Generation: generation, TaskPID: pid, TaskName: bytes.Clone(name)})
++			continue
++		}
++		intent, found := context.requested[m.Header.Sequence]
++		if !found || m.Header.PID != context.mutation.PortID || m.Header.Flags&netlink.DumpInterrupted != 0 {
++			return reject(index, m, errors.New("nft reply has wrong sequence/PID or interrupted dump"))
++		}
++		if sender.Groups == 0 && m.Header.Type == netlink.Error {
++			if _, err := validateACK(m, netlink.Message{Header: intent.Header}); err != nil {
++				return reject(index, m, err)
++			}
++		} else {
++			if !ownedObjectEchoType(m.Header.Type) || intent.Header.Flags&unix.NLM_F_ECHO == 0 {
++				return reject(index, m, errors.New("unexpected nft notification/echo type"))
++			}
++			if err := validateEcho(intent, m); err != nil {
++				return reject(index, m, err)
++			}
++		}
++		replies = append(replies, m)
++	}
++	packet.replies, packet.notifications = replies, notifications
++	return packet, nil
++}
++
++func ownedObjectEchoType(typ netlink.HeaderType) bool {
++	if int(typ)>>8 != unix.NFNL_SUBSYS_NFTABLES {
++		return false
++	}
++	switch int(typ) & 0xff {
++	case unix.NFT_MSG_NEWTABLE, unix.NFT_MSG_NEWCHAIN, unix.NFT_MSG_NEWRULE, unix.NFT_MSG_NEWSET:
++		return true
++	}
++	return false
++}
++
++func validateGenerationNotification(context ownedReceiveContext, m netlink.Message) (uint32, uint32, []byte, error) {
++	if context.mutation == nil || len(context.mutation.Messages) < 3 {
++		return 0, 0, nil, errors.New("nft generation notification has no current mutation")
++	}
++	first := context.mutation.Messages[1]
++	if first.Index != 1 || !ownedObjectEchoType(first.Header.Type) || first.Header.Flags&unix.NLM_F_ECHO == 0 || m.Header.Sequence != first.Header.Sequence || m.Header.PID != context.mutation.PortID || m.Header.Flags != 0 {
++		return 0, 0, nil, errors.New("nft generation notification differs from first reporting member")
++	}
++	if len(m.Data) < 4 || m.Data[0] != unix.AF_UNSPEC || m.Data[1] != unix.NFNETLINK_V0 {
++		return 0, 0, nil, errors.New("invalid nft generation nfgen header")
++	}
++	var generation, pid uint32
++	var name []byte
++	var seen [4]bool
++	for data := m.Data[4:]; len(data) != 0; {
++		if len(data) < 4 {
++			return 0, 0, nil, errors.New("truncated nft generation attribute header")
++		}
++		size, typ := int(binary.NativeEndian.Uint16(data[:2])), binary.NativeEndian.Uint16(data[2:4])
++		aligned := (size + 3) &^ 3
++		id, attrFlags := typ&0x3fff, typ&0xc000
++		if size < 4 || size > len(data) || aligned > len(data) || id < 1 || id > 3 || seen[id] {
++			return 0, 0, nil, errors.New("unknown, duplicate or truncated nft generation attribute")
++		}
++		seen[id] = true
++		value := data[4:size]
++		if id < 3 {
++			if len(value) != 4 || attrFlags != 0 && attrFlags != unix.NLA_F_NET_BYTEORDER {
++				return 0, 0, nil, errors.New("invalid nft generation scalar encoding")
++			}
++			if id == 1 {
++				generation = binary.BigEndian.Uint32(value)
++			} else {
++				pid = binary.BigEndian.Uint32(value)
++			}
++		} else {
++			if attrFlags != 0 || len(value) == 0 || value[len(value)-1] != 0 || bytes.IndexByte(value[:len(value)-1], 0) >= 0 {
++				return 0, 0, nil, errors.New("invalid nft generation task name")
++			}
++			name = bytes.Clone(value[:len(value)-1])
++		}
++		data = data[aligned:]
++	}
++	if !seen[1] || !seen[2] || !seen[3] || generation == 0 || pid == 0 || binary.BigEndian.Uint16(m.Data[2:4]) != uint16(generation) {
++		return 0, 0, nil, errors.New("incomplete or inconsistent nft generation notification")
++	}
++	if before := context.mutation.Generation; before != 0 {
++		next := before + 1
++		if next == 0 {
++			next = 1
++		}
++		if generation != next {
++			return 0, 0, nil, errors.New("nft generation notification differs from full conditional successor")
++		}
++	}
++	return generation, pid, name, nil
++}
+diff --git a/owned_generation_counterexample_test.go b/owned_generation_counterexample_test.go
+new file mode 100644
+index 0000000..0d84c36
+--- /dev/null
++++ b/owned_generation_counterexample_test.go
+@@ -0,0 +1,37 @@
++package nftables
++
++import (
++	"encoding/binary"
++	"fmt"
++	"testing"
++
++	"github.com/mdlayher/netlink"
++	"golang.org/x/sys/unix"
++)
++
++// This test also compiles against the frozen predecessor: no new receipt
++// field or transport interface is needed to expose the rejected legal GEN.
++func TestOwnedGenerationKernelProducerCounterexample(t *testing.T) {
++	for _, group := range []uint32{0, 64} {
++		t.Run(fmt.Sprintf("group%d", group), func(t *testing.T) {
++			c, p, _ := newPeerConn(t)
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			p.makePackets = func(sent []netlink.Message) []peerPacket {
++				attrs, err := netlink.MarshalAttributes([]netlink.Attribute{{Type: 1, Data: []byte{0, 1, 0, 2}}, {Type: 2, Data: []byte{0, 0, 4, 1}}, {Type: 3, Data: []byte("native.test\x00")}})
++				if err != nil {
++					t.Fatal(err)
++				}
++				data := []byte{0, 0, 0, 0}
++				binary.BigEndian.PutUint16(data[2:], 2)
++				gen := netlink.Message{Header: netlink.Header{Type: (unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_NEWGEN, Sequence: sent[1].Header.Sequence, PID: sent[1].Header.PID}, Data: append(data, attrs...)}
++				return []peerPacket{marshalPeerPacket(t, group, kernelPeerEcho(t, sent[1]), gen), peerACKs(t, sent)}
++			}
++			if err := c.Flush(); err != nil {
++				t.Fatalf("legal full GEN/echo/ACK transaction, group %d: %v", group, err)
++			}
++			if c.LastTransaction().State != TransactionCommitted || len(p.sent) != 1 {
++				t.Fatal("missing original complete commit")
++			}
++		})
++	}
++}
+diff --git a/owned_generation_test.go b/owned_generation_test.go
+new file mode 100644
+index 0000000..7d7ced7
+--- /dev/null
++++ b/owned_generation_test.go
+@@ -0,0 +1,438 @@
++package nftables
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/mdlayher/netlink"
++	"golang.org/x/sys/unix"
++)
++
++func generationMessage(t *testing.T, first netlink.Message, generation uint32, scalarFlags uint16, name []byte) netlink.Message {
++	t.Helper()
++	b, err := netlink.MarshalAttributes([]netlink.Attribute{
++		{Type: 1 | scalarFlags, Data: binary.BigEndian.AppendUint32(nil, generation)},
++		{Type: 2 | scalarFlags, Data: binary.BigEndian.AppendUint32(nil, 900001)},
++		{Type: 3, Data: append(bytes.Clone(name), 0)},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	data := []byte{0, 0, 0, 0}
++	binary.BigEndian.PutUint16(data[2:], uint16(generation))
++	return netlink.Message{Header: netlink.Header{Type: (unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_NEWGEN, Sequence: first.Header.Sequence, PID: first.Header.PID}, Data: append(data, b...)}
++}
++func rewriteGenerationAttrs(t *testing.T, m netlink.Message, change func([]netlink.Attribute) []netlink.Attribute) netlink.Message {
++	t.Helper()
++	a, err := netlink.UnmarshalAttributes(m.Data[4:])
++	if err != nil {
++		t.Fatal(err)
++	}
++	a = change(a)
++	for i := range a {
++		a[i].Length = 0
++	}
++	b, err := netlink.MarshalAttributes(a)
++	if err != nil {
++		t.Fatal(err)
++	}
++	m.Data = append(bytes.Clone(m.Data[:4]), b...)
++	return m
++}
++
++// Serialize deliberately malformed lengths without the message marshal helper
++// normalizing them; receive validation sees the exact fixture bytes.
++func marshalGenerationPacket(t *testing.T, group uint32, messages ...netlink.Message) peerPacket {
++	t.Helper()
++	p := peerPacket{from: &unix.SockaddrNetlink{Family: unix.AF_NETLINK, Groups: group}}
++	for _, m := range messages {
++		size := 16 + len(m.Data)
++		b := make([]byte, (size+3)&^3)
++		binary.NativeEndian.PutUint32(b[:4], uint32(size))
++		binary.NativeEndian.PutUint16(b[4:6], uint16(m.Header.Type))
++		binary.NativeEndian.PutUint16(b[6:8], uint16(m.Header.Flags))
++		binary.NativeEndian.PutUint32(b[8:12], m.Header.Sequence)
++		binary.NativeEndian.PutUint32(b[12:16], m.Header.PID)
++		copy(b[16:], m.Data)
++		p.wire = append(p.wire, b...)
++	}
++	return p
++}
++func assertGenerationUnknown(t *testing.T, c *Conn, p *peerTransport, err error) {
++	t.Helper()
++	if !errors.Is(err, ErrUncertain) || c.LastTransaction().State != TransactionUnknown || !c.owned.tainted || len(p.sent) != 1 {
++		t.Fatalf("lost Unknown/no replay: %v %+v", err, c.LastTransaction())
++	}
++	c.CreateTable(&Table{Name: "later", Family: TableFamilyIPv4})
++	if !errors.Is(c.Flush(), ErrUncertain) || len(p.sent) != 1 {
++		t.Fatal("sealed transaction replayed")
++	}
++}
++func TestOwnedGenerationCompleteAndImmutable(t *testing.T) {
++	for _, group := range []uint32{0, 64} {
++		for _, test := range []struct {
++			before, after uint32
++			flags         uint16
++			name          []byte
++		}{
++			{0, 0xfefe0002, 0, []byte("native.test")},
++			{0x10001, 0x10002, unix.NLA_F_NET_BYTEORDER, []byte{}},
++			{0xffffffff, 1, 0, []byte{0xff, 0xfe}},
++			{0, 7, 0, bytes.Repeat([]byte{'n'}, 4096)},
++		} {
++			t.Run(fmt.Sprintf("group%d_before%d_name%d", group, test.before, len(test.name)), func(t *testing.T) {
++				c, p, j := newPeerConn(t)
++				table := c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++				c.AddChain(&Chain{Name: "child", Table: table})
++				if test.before != 0 {
++					if err := c.UseGeneration(test.before); err != nil {
++						t.Fatal(err)
++					}
++				}
++				var received []byte
++				p.makePackets = func(m []netlink.Message) []peerPacket {
++					firstEcho := kernelPeerEcho(t, m[1])
++					ownerAttr, err := netlink.MarshalAttributes([]netlink.Attribute{{Type: nftTableOwner, Data: binary.BigEndian.AppendUint32(nil, m[1].Header.PID)}})
++					if err != nil {
++						t.Fatal(err)
++					}
++					firstEcho.Data = append(firstEcho.Data, ownerAttr...)
++					packet := marshalPeerPacket(t, group, firstEcho, generationMessage(t, m[1], test.after, test.flags, test.name), kernelPeerEcho(t, m[2]))
++					received = packet.wire
++					return []peerPacket{packet, peerACKs(t, m)}
++				}
++				if err := c.Flush(); err != nil {
++					t.Fatal(err)
++				}
++				r := c.LastTransaction()
++				if r.State != TransactionCommitted || len(r.GenerationNotifications) != 1 || len(r.Replies) != 6 || len(p.sent) != 1 || c.owned.generation != 0 {
++					t.Fatalf("GEN changed original success gate: %+v", r)
++				}
++				g := r.GenerationNotifications[0]
++				if g.Generation != test.after || g.TaskPID != 900001 || !bytes.Equal(g.TaskName, test.name) || g.MessageIndex != 1 || g.SenderPID != 0 || g.Groups != group || g.RecvmsgFlags != 0 || !bytes.Equal(g.RawDatagram, received) {
++					t.Fatal("lost actual raw or decoded metadata")
++				}
++				objects, err := r.ConfirmedObjects()
++				if err != nil || len(objects.Tables) != 1 || len(objects.Chains) != 1 {
++					t.Fatal("GEN became an object echo", err)
++				}
++				if directory := os.Getenv("POLARIS_GEN_PURE_RECEIPT_DIR"); directory != "" {
++					b, err := json.Marshal(r)
++					if err != nil {
++						t.Fatal(err)
++					}
++					if err = os.WriteFile(filepath.Join(directory, fmt.Sprintf("group%d_before%d_name%d.json", group, test.before, len(test.name))), b, 0600); err != nil {
++						t.Fatal(err)
++					}
++				}
++				received[0] ^= 0xff
++				r.GenerationNotifications[0].RawDatagram[1] ^= 0xff
++				r.GenerationNotifications[0].RawMessage.Data[0] ^= 0xff
++				if len(r.GenerationNotifications[0].TaskName) > 0 {
++					r.GenerationNotifications[0].TaskName[0] ^= 0xff
++				}
++				j.completed[0].GenerationNotifications[0].RawDatagram[2] ^= 0xff
++				j.completed[0].GenerationNotifications[0].RawMessage.Data[1] ^= 0xff
++				if len(j.completed[0].GenerationNotifications[0].TaskName) > 0 {
++					j.completed[0].GenerationNotifications[0].TaskName[0] ^= 0xff
++				}
++				again := c.LastTransaction().GenerationNotifications[0]
++				if bytes.Equal(again.RawDatagram, r.GenerationNotifications[0].RawDatagram) || again.RawMessage.Data[0] != 0 || again.RawMessage.Data[1] != 0 || !bytes.Equal(again.TaskName, test.name) {
++					t.Fatal("aux aliases recv buffer, LastTransaction or Complete")
++				}
++			})
++		}
++	}
++}
++func TestOwnedGenerationRejectsSchemaAndAssociation(t *testing.T) {
++	cases := []struct {
++		name   string
++		change func(*testing.T, netlink.Message, []netlink.Message) netlink.Message
++	}{
++		{"begin-seq", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message {
++			g.Header.Sequence = m[0].Header.Sequence
++			return g
++		}},
++		{"later-member-seq", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message {
++			g.Header.Sequence = m[2].Header.Sequence
++			return g
++		}},
++		{"wrong-port", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message { g.Header.PID++; return g }},
++		{"request-flags", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message {
++			g.Header.Flags = netlink.Request
++			return g
++		}},
++		{"wrong-family", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message { g.Data[0] = 2; return g }},
++		{"wrong-version", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message { g.Data[1] = 1; return g }},
++		{"wrong-low16", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message { g.Data[3]++; return g }},
++		{"same-low16-wrong-high32", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message {
++			return generationMessage(t, m[1], 0x20002, 0, []byte("n"))
++		}},
++		{"trailing-byte", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message {
++			g.Data = append(g.Data, 1)
++			return g
++		}},
++		{"short-nfgen", func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message {
++			g.Data = g.Data[:3]
++			return g
++		}},
++	}
++	for _, kind := range []string{"duplicate", "duplicate-pid", "duplicate-name", "unknown", "missing", "nested-scalar", "short-scalar", "long-scalar", "nested-name", "byteorder-name", "unterminated-name", "internal-NUL", "zero-generation", "zero-task", "truncated-attr"} {
++		k := kind
++		cases = append(cases, struct {
++			name   string
++			change func(*testing.T, netlink.Message, []netlink.Message) netlink.Message
++		}{k, func(t *testing.T, g netlink.Message, m []netlink.Message) netlink.Message {
++			return rewriteGenerationAttrs(t, g, func(a []netlink.Attribute) []netlink.Attribute {
++				switch k {
++				case "duplicate":
++					a = append(a, a[0])
++				case "duplicate-pid":
++					a = append(a, a[1])
++				case "duplicate-name":
++					a = append(a, a[2])
++				case "unknown":
++					a = append(a, netlink.Attribute{Type: 4, Data: []byte{1}})
++				case "missing":
++					a = a[:2]
++				case "nested-scalar":
++					a[0].Type |= unix.NLA_F_NESTED
++				case "short-scalar":
++					a[0].Data = a[0].Data[:3]
++				case "long-scalar":
++					a[0].Data = append(a[0].Data, 0)
++				case "nested-name":
++					a[2].Type |= unix.NLA_F_NESTED
++				case "byteorder-name":
++					a[2].Type |= unix.NLA_F_NET_BYTEORDER
++				case "unterminated-name":
++					a[2].Data = []byte("bad")
++				case "internal-NUL":
++					a[2].Data = []byte{'a', 0, 'b', 0}
++				case "zero-generation":
++					a[0].Data = make([]byte, 4)
++				case "zero-task":
++					a[1].Data = make([]byte, 4)
++				case "truncated-attr":
++					a[0].Data = nil
++				}
++				return a
++			})
++		}})
++	}
++	for _, group := range []uint32{0, 64} {
++		for _, test := range cases {
++			t.Run(fmt.Sprintf("group%d/%s", group, test.name), func(t *testing.T) {
++				c, p, _ := newPeerConn(t)
++				table := c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++				c.AddChain(&Chain{Name: "child", Table: table})
++				if err := c.UseGeneration(0x10001); err != nil {
++					t.Fatal(err)
++				}
++				p.makePackets = func(m []netlink.Message) []peerPacket {
++					g := test.change(t, generationMessage(t, m[1], 0x10002, 0, []byte("n")), m)
++					return []peerPacket{marshalGenerationPacket(t, group, kernelPeerEcho(t, m[1]), g), peerACKs(t, m)}
++				}
++				assertGenerationUnknown(t, c, p, c.Flush())
++				r := c.LastTransaction()
++				if len(r.GenerationNotifications) != 0 || len(r.Replies) != 0 {
++					t.Fatal("published prefix of malformed packet")
++				}
++			})
++		}
++	}
++}
++func TestOwnedGenerationWholePacketErrnoContradiction(t *testing.T) {
++	for _, group := range []uint32{0, 64} {
++		for _, code := range []unix.Errno{unix.ERESTART, unix.EEXIST, unix.EBUSY} {
++			for _, before := range []bool{false, true} {
++				for _, malformed := range []bool{false, true} {
++					t.Run(fmt.Sprintf("group%d_errno%d_before%v_bad%v", group, code, before, malformed), func(t *testing.T) {
++						c, p, _ := newPeerConn(t)
++						c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++						p.makePackets = func(m []netlink.Message) []peerPacket {
++							g := generationMessage(t, m[1], 7, 0, []byte("n"))
++							if malformed {
++								g.Data[1] = 1
++							}
++							a := ack(m[0], code)
++							messages := []netlink.Message{g, a}
++							if before {
++								messages = []netlink.Message{a, g}
++							}
++							return []peerPacket{marshalPeerPacket(t, group, messages...), peerACKs(t, m)}
++						}
++						err := c.Flush()
++						assertGenerationUnknown(t, c, p, err)
++						if !errors.Is(err, code) || !bytes.HasPrefix([]byte(err.Error()), []byte(code.Error())) {
++							t.Fatal("original errno not first", err)
++						}
++						want := 0
++						if group == 0 && !malformed {
++							want = 1
++						}
++						if len(c.LastTransaction().GenerationNotifications) != want {
++							t.Fatal("invalid whole packet aux published")
++						}
++					})
++				}
++			}
++		}
++	}
++	for _, code := range []unix.Errno{unix.ERESTART, unix.EEXIST} {
++		t.Run(fmt.Sprintf("prior-packet_errno%d", code), func(t *testing.T) {
++			c, p, _ := newPeerConn(t)
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			p.makePackets = func(m []netlink.Message) []peerPacket {
++				return []peerPacket{marshalPeerPacket(t, 64, generationMessage(t, m[1], 7, 0, []byte("n"))), marshalPeerPacket(t, 0, ack(m[0], code), ack(m[1], 0))}
++			}
++			err := c.Flush()
++			assertGenerationUnknown(t, c, p, err)
++			if !errors.Is(err, code) || len(c.LastTransaction().GenerationNotifications) != 1 {
++				t.Fatal("lost prior aux or errno", err)
++			}
++		})
++	}
++}
++func TestOwnedGenerationDuplicateAndNoAuthority(t *testing.T) {
++	for _, kind := range []string{"duplicate-same", "duplicate-later", "no-end", "no-echo", "no-acks", "first-not-reporting", "query-notification", "mixed-unknown"} {
++		t.Run(kind, func(t *testing.T) {
++			c, p, _ := newPeerConn(t)
++			if kind == "first-not-reporting" {
++				c.DelTable(&Table{Name: "earlier", Family: TableFamilyIPv4})
++			}
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			p.makePackets = func(m []netlink.Message) []peerPacket {
++				if kind == "query-notification" {
++					return []peerPacket{marshalPeerPacket(t, 64, generationMessage(t, m[0], 7, 0, []byte("n")))}
++				}
++				g := generationMessage(t, m[1], 7, 0, []byte("n"))
++				e := kernelPeerEcho(t, m[1])
++				switch kind {
++				case "duplicate-same":
++					return []peerPacket{marshalPeerPacket(t, 64, e, g, g)}
++				case "duplicate-later":
++					return []peerPacket{marshalPeerPacket(t, 64, g), marshalPeerPacket(t, 0, g)}
++				case "no-end":
++					return []peerPacket{marshalPeerPacket(t, 64, e, g), marshalPeerPacket(t, 0, ack(m[0], 0), ack(m[1], 0))}
++				case "no-echo":
++					return []peerPacket{marshalPeerPacket(t, 64, g), peerACKs(t, m)}
++				case "no-acks":
++					return []peerPacket{marshalPeerPacket(t, 64, e, g)}
++				case "first-not-reporting":
++					return []peerPacket{marshalPeerPacket(t, 64, g)}
++				case "mixed-unknown":
++					bad := g
++					bad.Header.Type++
++					return []peerPacket{marshalPeerPacket(t, 64, e, g, bad)}
++				case "query-notification":
++					g.Header.Sequence = m[0].Header.Sequence
++					return []peerPacket{marshalPeerPacket(t, 64, g)}
++				}
++				return nil
++			}
++			if kind == "query-notification" {
++				c.DiscardPending()
++				_, err := c.Generation()
++				if !errors.Is(err, ErrUncertain) || len(p.sent) != 1 || !c.owned.tainted {
++					t.Fatal(err)
++				}
++				return
++			}
++			assertGenerationUnknown(t, c, p, c.Flush())
++			if _, err := c.LastTransaction().ConfirmedObjects(); !errors.Is(err, ErrUncertain) {
++				t.Fatal("aux granted ownership")
++			}
++		})
++	}
++}
++func TestOwnedGenerationQueryResponseRemainsOrdinary(t *testing.T) {
++	c, p, _ := newPeerConn(t)
++	p.makePackets = func(m []netlink.Message) []peerPacket {
++		b, err := netlink.MarshalAttributes([]netlink.Attribute{{Type: 1, Data: binary.BigEndian.AppendUint32(nil, 0x20007)}})
++		if err != nil {
++			t.Fatal(err)
++		}
++		g := netlink.Message{Header: netlink.Header{Type: (unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_NEWGEN, Sequence: m[0].Header.Sequence, PID: m[0].Header.PID}, Data: append([]byte{0, 0, 0, 7}, b...)}
++		return []peerPacket{marshalPeerPacket(t, 0, g, ack(m[0], 0))}
++	}
++	g, err := c.Generation()
++	if err != nil || g != 0x20007 || len(c.LastTransaction().GenerationNotifications) != 0 {
++		t.Fatal("query response was treated as mutation aux", g, err)
++	}
++}
++
++func TestOwnedGenerationCompleteMemberAbortContradicts(t *testing.T) {
++	for _, before := range []bool{false, true} {
++		t.Run(fmt.Sprint(before), func(t *testing.T) {
++			c, p, _ := newPeerConn(t)
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			p.makePackets = func(m []netlink.Message) []peerPacket {
++				gen := generationMessage(t, m[1], 7, 0, []byte("n"))
++				list := []netlink.Message{ack(m[0], 0), ack(m[1], unix.EEXIST), gen}
++				if before {
++					list = []netlink.Message{gen, ack(m[0], 0), ack(m[1], unix.EEXIST)}
++				}
++				return []peerPacket{marshalPeerPacket(t, 0, list...)}
++			}
++			err := c.Flush()
++			assertGenerationUnknown(t, c, p, err)
++			if !errors.Is(err, unix.EEXIST) || len(c.LastTransaction().GenerationNotifications) != 1 || len(c.LastTransaction().Replies) != 2 {
++				t.Fatal("complete error list incorrectly Aborted", err)
++			}
++		})
++	}
++}
++func TestOwnedGenerationPacketQualification(t *testing.T) {
++	for _, fault := range []string{"nil", "typed-nil", "pid", "group32", "group65", "trunc", "ctrunc", "trailing", "partial-header", "malformed-length", "mixed-query", "mixed-done"} {
++		t.Run(fault, func(t *testing.T) {
++			c, p, _ := newPeerConn(t)
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			p.makePackets = func(m []netlink.Message) []peerPacket {
++				g := generationMessage(t, m[1], 7, 0, []byte("n"))
++				packet := marshalPeerPacket(t, 64, g)
++				switch fault {
++				case "nil":
++					packet.from = nil
++				case "typed-nil":
++					packet.from = (*unix.SockaddrNetlink)(nil)
++				case "pid":
++					packet.from = &unix.SockaddrNetlink{Pid: 1, Groups: 64}
++				case "group32":
++					packet.from = &unix.SockaddrNetlink{Groups: 32}
++				case "group65":
++					packet.from = &unix.SockaddrNetlink{Groups: 65}
++				case "trunc":
++					packet.flags = unix.MSG_TRUNC
++				case "ctrunc":
++					packet.flags = unix.MSG_CTRUNC
++				case "trailing":
++					packet.wire = append(packet.wire, 1)
++				case "partial-header":
++					packet.wire = append(packet.wire, make([]byte, 15)...)
++				case "malformed-length":
++					binary.NativeEndian.PutUint32(packet.wire[:4], 15)
++				case "mixed-query":
++					bad := g
++					bad.Header.Type++
++					packet = marshalPeerPacket(t, 0, g, bad)
++				case "mixed-done":
++					bad := g
++					bad.Header.Type = netlink.Done
++					packet = marshalPeerPacket(t, 0, g, bad)
++				}
++				return []peerPacket{packet, peerACKs(t, m)}
++			}
++			assertGenerationUnknown(t, c, p, c.Flush())
++			if len(c.LastTransaction().GenerationNotifications) != 0 || len(c.LastTransaction().Replies) != 0 {
++				t.Fatal("bad packet prefix published")
++			}
++		})
++	}
++}
+diff --git a/owned_kernel_linux_test.go b/owned_kernel_linux_test.go
+new file mode 100644
+index 0000000..b099977
+--- /dev/null
++++ b/owned_kernel_linux_test.go
+@@ -0,0 +1,316 @@
++//go:build linux && !android
++
++package nftables
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/netip"
++	"os"
++	"path/filepath"
++	"strconv"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/nftables/expr"
++	"golang.org/x/sys/unix"
++)
++
++type kernelJournal struct {
++	mu    sync.Mutex
++	file  *os.File
++	nonce string
++}
++
++func (j *kernelJournal) Prepare(intent TransactionIntent) error {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	if err := json.NewEncoder(j.file).Encode(map[string]any{"phase": "pending", "nonce": j.nonce, "intent": intent}); err != nil {
++		return err
++	}
++	return j.file.Sync()
++}
++func (j *kernelJournal) Complete(receipt TransactionReceipt) {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	errorText := ""
++	if receipt.Err != nil {
++		errorText = receipt.Err.Error()
++	}
++	_ = json.NewEncoder(j.file).Encode(map[string]any{"phase": "complete", "nonce": j.nonce, "receipt": receipt, "original_error": errorText})
++	_ = j.file.Sync()
++}
++func kernelNamespace(t *testing.T) (int, *kernelJournal) {
++	t.Helper()
++	if os.Getenv("POLARIS_NFT_KERNEL_TEST") != "1" || os.Getenv("POLARIS_NO_KERNEL_RUN") == "1" {
++		t.Skip("requires reviewed private namespace guardian")
++	}
++	if os.Geteuid() != 0 {
++		t.Fatal("native nft test requires root inside its private namespace")
++	}
++	fd, err := strconv.Atoi(os.Getenv("POLARIS_NATIVE_NAMESPACE_FD"))
++	if err != nil || fd != 3 {
++		t.Fatal("missing pinned private namespace fd")
++	}
++	var target unix.Stat_t
++	if err = unix.Fstat(fd, &target); err != nil {
++		t.Fatal(err)
++	}
++	typ, err := unix.IoctlRetInt(fd, unix.NS_GET_NSTYPE)
++	if err != nil || typ != unix.CLONE_NEWNET {
++		t.Fatal("fd is not a network namespace")
++	}
++	dev, e1 := strconv.ParseUint(os.Getenv("POLARIS_NATIVE_PARENT_NETNS_DEV"), 10, 64)
++	ino, e2 := strconv.ParseUint(os.Getenv("POLARIS_NATIVE_PARENT_NETNS_INO"), 10, 64)
++	if e1 != nil || e2 != nil || dev == uint64(target.Dev) && ino == target.Ino {
++		t.Fatal("private namespace has not been separated from parent")
++	}
++	current, err := unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unix.Close(current)
++	var currentStat unix.Stat_t
++	if err = unix.Fstat(current, &currentStat); err != nil || currentStat.Dev != target.Dev || currentStat.Ino != target.Ino {
++		t.Fatal("test thread is not in pinned private namespace")
++	}
++	dir := os.Getenv("POLARIS_NATIVE_RECEIPT_DIR")
++	nonce := os.Getenv("POLARIS_NATIVE_NONCE")
++	if nonce == "" {
++		t.Fatal("missing guardian nonce")
++	}
++	st, err := os.Stat(dir)
++	if err != nil || !st.IsDir() || st.Mode().Perm()&0077 != 0 {
++		t.Fatal("receipt directory must be a private existing directory")
++	}
++	file, err := os.OpenFile(filepath.Join(dir, t.Name()+".ndjson"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = file.Close() })
++	t.Logf("validated private netns dev=%d ino=%d parent=%d:%d", target.Dev, target.Ino, dev, ino)
++	return fd, &kernelJournal{file: file, nonce: nonce}
++}
++func kernelConn(t *testing.T, fd int, birth string, j *kernelJournal) *Conn {
++	t.Helper()
++	c, err := New(WithNetNSFd(fd), AsOwnedTransactions(birth, j))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = c.CloseLasting() })
++	return c
++}
++func kernelOwnerTable(t *testing.T, c *Conn, name string) *Table {
++	t.Helper()
++	table := c.CreateTable(&Table{Name: name, Family: TableFamilyIPv4, Flags: TableFlagOwner, UserData: []byte(name)})
++	beforeRead, readErr := c.nlconn.ReadBuffer()
++	beforeWrite, writeErr := c.nlconn.WriteBuffer()
++	if readErr != nil || writeErr != nil {
++		t.Fatal(errors.Join(readErr, writeErr))
++	}
++	flushErr := c.Flush()
++	afterRead, readErr := c.nlconn.ReadBuffer()
++	afterWrite, writeErr := c.nlconn.WriteBuffer()
++	t.Logf("actual original socket buffers before rcv=%d snd=%d after rcv=%d snd=%d", beforeRead, beforeWrite, afterRead, afterWrite)
++	if flushErr != nil || readErr != nil || writeErr != nil {
++		t.Fatal(errors.Join(flushErr, readErr, writeErr))
++	}
++	if afterRead < beforeRead || afterWrite < beforeWrite {
++		t.Fatal("owned transport reduced the original socket buffer")
++	}
++	receipt := c.LastTransaction()
++	objects, err := receipt.ConfirmedObjects()
++	if err != nil || len(objects.Tables) != 1 {
++		t.Fatalf("invalid table receipt: %v", err)
++	}
++	table = objects.Tables[0]
++	if table.Handle == 0 || table.Owner != receipt.Intent.PortID || table.Flags != TableFlagOwner {
++		t.Fatal("owner table receipt lacks actual socket association")
++	}
++	return table
++}
++
++func TestOwnedKernelT2(t *testing.T) {
++	fd, j := kernelNamespace(t)
++	a := kernelConn(t, fd, "native-a", j)
++	b := kernelConn(t, fd, "native-b", j)
++	var table, shared *Table
++	if !t.Run("owner_create_exclusive_and_foreign_denial", func(t *testing.T) {
++		table = kernelOwnerTable(t, a, "polaris_native_owner_a")
++		b.CreateTable(&Table{Name: table.Name, Family: table.Family, Flags: TableFlagOwner})
++		if err := b.Flush(); err == nil {
++			t.Fatal("exclusive collision succeeded")
++		}
++		if b.LastTransaction().State != TransactionAborted {
++			t.Fatal("EXCL rejection did not produce a complete abort")
++		}
++		b.AddChain(&Chain{Name: "foreign", Table: table})
++		if err := b.Flush(); err == nil {
++			t.Fatal("foreign socket modified owner table")
++		}
++		b.DelTable(table)
++		if err := b.Flush(); err == nil {
++			t.Fatal("foreign socket deleted owner table")
++		}
++	}) {
++		return
++	}
++	if !t.Run("stale_generation_aborts_without_effect", func(t *testing.T) {
++		generation, err := a.Generation()
++		if err != nil {
++			t.Fatal(err)
++		}
++		_ = kernelOwnerTable(t, b, "polaris_native_owner_b")
++		a.CreateTable(&Table{Name: "polaris_native_stale_generation", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++		if err = a.UseGeneration(generation); err != nil {
++			t.Fatal(err)
++		}
++		if err = a.Flush(); !errors.Is(err, ErrGenerationChanged) || !errors.Is(err, unix.ERESTART) {
++			t.Fatalf("stale GENID did not abort: %v", err)
++		}
++		snapshot, err := a.ReadConsistent(TableFamilyIPv4)
++		if err != nil {
++			t.Fatal(err)
++		}
++		for _, it := range snapshot.Tables {
++			if it.Name == "polaris_native_stale_generation" {
++				t.Fatal("GENID-mismatched batch created a table")
++			}
++		}
++	}) {
++		return
++	}
++	if !t.Run("nonrecursive_delete_preserves_foreign_child", func(t *testing.T) {
++		var err error
++		shared = a.CreateTable(&Table{Name: "polaris_native_nonrec", Family: TableFamilyIPv4})
++		if err = a.Flush(); err != nil {
++			t.Fatal(err)
++		}
++		b.AddChain(&Chain{Name: "foreign_child", Table: shared})
++		if err = b.Flush(); err != nil {
++			t.Fatal(err)
++		}
++		observed, err := a.ReadConsistentTable(shared)
++		if err != nil {
++			t.Fatal(err)
++		}
++		a.DelTableNonRecursive(shared)
++		if err = a.UseGeneration(observed.Generation); err != nil {
++			t.Fatal(err)
++		}
++		if err = a.Flush(); !errors.Is(err, unix.EBUSY) {
++			t.Fatalf("NONREC did not preserve foreign child: %v", err)
++		}
++	}) {
++		return
++	}
++	if !t.Run("original_socket_retirement_and_permanent_seal", func(t *testing.T) {
++		var err error
++		if err = a.CloseLasting(); err != nil {
++			t.Fatal(err)
++		}
++		// The observer is bound to the same pinned namespace. Socket retirement may
++		// remove only A's non-PERSIST owner table; B's table and shared parent remain.
++		remaining, err := b.ReadConsistent(TableFamilyIPv4)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var seenB, seenShared bool
++		for _, it := range remaining.Tables {
++			if it.Name == table.Name {
++				t.Fatal("closed owner socket retained its table")
++			}
++			seenB = seenB || it.Name == "polaris_native_owner_b"
++			seenShared = seenShared || it.Name == shared.Name
++		}
++		if !seenB || !seenShared {
++			t.Fatal("A retirement removed another permission domain")
++		}
++		if err = a.Flush(); !errors.Is(err, ErrSealed) {
++			t.Fatal("closed connection reopened")
++		}
++	}) {
++		return
++	}
++}
++
++func TestOwnedKernelT3(t *testing.T) {
++	fd, j := kernelNamespace(t)
++	c := kernelConn(t, fd, "native-t3", j)
++	table := kernelOwnerTable(t, c, "polaris_native_t3")
++	for _, count := range []int{0, 1000, 1001} {
++		if !t.Run(fmt.Sprintf("constant_%d_unbound_fill_then_bound_rejection", count), func(t *testing.T) {
++			set := &Set{Table: table, ID: uint32(200 + count), Name: fmt.Sprintf("constant_%d", count), Constant: true, KeyType: TypeIPAddr}
++			c.AddChain(&Chain{Name: fmt.Sprintf("preceding_%d", count), Table: table})
++			if err := c.AddSet(set, nil); err != nil {
++				t.Fatal(err)
++			}
++			elements := make([]SetElement, count)
++			addr := netip.MustParseAddr("10.17.0.1")
++			for i := range elements {
++				elements[i] = SetElement{Key: addr.AsSlice()}
++				addr = addr.Next()
++			}
++			for start := 0; start < len(elements); start += 1000 {
++				end := min(start+1000, len(elements))
++				if err := c.SetAddElements(set, elements[start:end]); err != nil {
++					t.Fatal(err)
++				}
++				if err := c.Flush(); err != nil {
++					t.Fatalf("unbound constant count=%d chunk=%d: %v", count, start, err)
++				}
++			}
++			if err := c.Flush(); err != nil {
++				t.Fatal(err)
++			}
++			got, _, err := c.ReadConsistentElements(set)
++			if err != nil || len(got) != count {
++				t.Fatalf("count=%d actual=%d err=%v", count, len(got), err)
++			}
++			chain := &Chain{Name: fmt.Sprintf("preceding_%d", count), Table: table}
++			c.AddRule(&Rule{Table: table, Chain: chain, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyMARK, Register: 1}, &expr.Lookup{SourceRegister: 1, SetName: set.Name}, &expr.Verdict{Kind: expr.VerdictReturn}}})
++			if err := c.Flush(); err != nil {
++				t.Fatal(err)
++			}
++			if err := c.SetAddElements(set, []SetElement{{Key: netip.MustParseAddr("10.99.0.1").AsSlice()}}); err != nil {
++				t.Fatal(err)
++			}
++			if err := c.Flush(); err == nil {
++				t.Fatal("bound Constant accepted a late element")
++			}
++		}) {
++			return
++		}
++	}
++	if !t.Run("anonymous_set_and_lookup_same_batch", func(t *testing.T) {
++		chain := c.AddChain(&Chain{Name: "anonymous", Table: table})
++		anonymous := &Set{Table: table, Anonymous: true, Constant: true, KeyType: TypeInetProto}
++		if err := c.AddSet(anonymous, []SetElement{{Key: []byte{unix.IPPROTO_TCP}}, {Key: []byte{unix.IPPROTO_UDP}}}); err != nil {
++			t.Fatal(err)
++		}
++		c.AddRule(&Rule{Table: table, Chain: chain, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Lookup{SourceRegister: 1, SetID: anonymous.ID, SetName: anonymous.Name}, &expr.Verdict{Kind: expr.VerdictReturn}}})
++		if err := c.Flush(); err != nil {
++			t.Fatalf("anonymous + lookup same batch: %v", err)
++		}
++	}) {
++		return
++	}
++
++	t.Run("interval_pair_complete", func(t *testing.T) {
++		interval := &Set{Table: table, ID: 77, Name: "paired_interval", Constant: true, Interval: true, KeyType: TypeIPAddr}
++		if err := c.AddSet(interval, nil); err != nil {
++			t.Fatal(err)
++		}
++		if err := c.SetAddElements(interval, []SetElement{{Key: netip.MustParseAddr("10.28.0.0").AsSlice()}, {Key: netip.MustParseAddr("10.28.1.0").AsSlice(), IntervalEnd: true}}); err != nil {
++			t.Fatal(err)
++		}
++		if err := c.Flush(); err != nil {
++			t.Fatal(err)
++		}
++		elements, _, err := c.ReadConsistentElements(interval)
++		if err != nil || len(elements) != 2 || !elements[1].IntervalEnd {
++			t.Fatalf("interval pair not complete: %+v %v", elements, err)
++		}
++	})
++}
+diff --git a/owned_membership.go b/owned_membership.go
+new file mode 100644
+index 0000000..72459e7
+--- /dev/null
++++ b/owned_membership.go
+@@ -0,0 +1,58 @@
++package nftables
++
++import (
++	"errors"
++	"fmt"
++	"unsafe"
++
++	"golang.org/x/sys/unix"
++)
++
++// The probe and full read use the same original fd under one Control call.
++// NETLINK_LIST_MEMBERSHIPS returns native-endian u32 bitmasks, not group IDs.
++func (o *ownedState) checkMemberships() error {
++	var socketErr error
++	err := o.raw.Control(func(fd uintptr) {
++		socketErr = checkOwnedMemberships(func(words []uint32, length *uint32) error {
++			var value unsafe.Pointer
++			if len(words) != 0 {
++				value = unsafe.Pointer(&words[0])
++			}
++			_, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, fd, unix.SOL_NETLINK, unix.NETLINK_LIST_MEMBERSHIPS, uintptr(value), uintptr(unsafe.Pointer(length)), 0)
++			if errno != 0 {
++				return errno
++			}
++			return nil
++		})
++	})
++	if err != nil {
++		return err
++	}
++	return socketErr
++}
++
++func checkOwnedMemberships(read func([]uint32, *uint32) error) error {
++	var required uint32
++	if err := read(nil, &required); err != nil {
++		return fmt.Errorf("nft membership size probe: %w", err)
++	}
++	// socklen is passed to a kernel int, and the full byte count must fit int
++	// on this architecture. These are representation checks, not a group cap.
++	if required%4 != 0 || uint64(required) > uint64(^uint(0)>>1) || required > uint32(^uint32(0)>>1) {
++		return errors.New("nft membership size is not a representable u32 mask array")
++	}
++	words := make([]uint32, int(required)/4)
++	actual := required
++	if err := read(words, &actual); err != nil {
++		return fmt.Errorf("nft full membership read: %w", err)
++	}
++	if actual != required {
++		return fmt.Errorf("nft membership read changed length: required=%d actual=%d", required, actual)
++	}
++	for index, mask := range words {
++		if mask != 0 {
++			return fmt.Errorf("owned nft socket has a subscription: word=%d mask=%#x", index, mask)
++		}
++	}
++	return nil
++}
+diff --git a/owned_membership_test.go b/owned_membership_test.go
+new file mode 100644
+index 0000000..0d4d888
+--- /dev/null
++++ b/owned_membership_test.go
+@@ -0,0 +1,155 @@
++package nftables
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++
++	"github.com/mdlayher/netlink"
++	"golang.org/x/sys/unix"
++)
++
++type membershipReadResult struct {
++	required, actual  uint32
++	masks             []uint32
++	probeErr, readErr error
++	calls             int
++}
++
++func (r *membershipReadResult) read(words []uint32, length *uint32) error {
++	r.calls++
++	if r.calls == 1 {
++		if len(words) != 0 || *length != 0 {
++			return errors.New("bad membership size probe")
++		}
++		*length = r.required
++		return r.probeErr
++	}
++	if r.calls != 2 || len(words) != int(r.required)/4 || *length != r.required {
++		return errors.New("unexpected membership full read or retry")
++	}
++	copy(words, r.masks)
++	*length = r.actual
++	return r.readErr
++}
++func TestOwnedMembershipFullRead(t *testing.T) {
++	cases := []struct {
++		name string
++		r    membershipReadResult
++		want bool
++	}{
++		{"fresh-zero-length", membershipReadResult{}, true},
++		{"multiple-zero-masks", membershipReadResult{required: 16, actual: 16, masks: make([]uint32, 4)}, true},
++		{"large-zero-array-no-cap", membershipReadResult{required: 4 * (65536 + 1), actual: 4 * (65536 + 1), masks: make([]uint32, 65536+1)}, true},
++		{"low-subscription", membershipReadResult{required: 4, actual: 4, masks: []uint32{64}}, false},
++		{"high-subscription", membershipReadResult{required: 16, actual: 16, masks: []uint32{0, 0, 0, 1 << 31}}, false},
++		{"size-probe-error", membershipReadResult{probeErr: unix.EBADF}, false},
++		{"full-read-error", membershipReadResult{required: 4, actual: 4, readErr: unix.EPERM}, false},
++		{"unaligned-length", membershipReadResult{required: 3}, false},
++		{"kernel-int-overflow", membershipReadResult{required: 0x80000000}, false},
++		{"larger-readback", membershipReadResult{required: 4, actual: 8}, false},
++		{"smaller-readback", membershipReadResult{required: 8, actual: 4}, false},
++		{"nonzero-after-zero-probe", membershipReadResult{actual: 4}, false},
++	}
++	for _, item := range cases {
++		t.Run(item.name, func(t *testing.T) {
++			err := checkOwnedMemberships(item.r.read)
++			if (err == nil) != item.want {
++				t.Fatal("membership completeness predicate wrong", err)
++			}
++			if item.r.calls > 2 || item.want && item.r.calls != 2 {
++				t.Fatal("membership read used retries or omitted full read")
++			}
++			if item.r.probeErr != nil && !errors.Is(err, item.r.probeErr) || item.r.readErr != nil && !errors.Is(err, item.r.readErr) {
++				t.Fatal("original membership errno lost", err)
++			}
++		})
++	}
++}
++func TestOwnedMembershipFailureBeforeMutationAndQuerySend(t *testing.T) {
++	for _, query := range []bool{false, true} {
++		for _, which := range []string{"subscription", "probe", "readback"} {
++			t.Run(fmt.Sprintf("query%v_%s", query, which), func(t *testing.T) {
++				c, tr, j := testOwnedConn(t)
++				c.CreateTable(&Table{Name: "confirmed", Family: TableFamilyIPv4})
++				if err := c.Flush(); err != nil {
++					t.Fatal(err)
++				}
++				before := c.LastTransaction()
++				r := membershipReadResult{required: 16, actual: 16, masks: []uint32{0, 0, 0, 1}}
++				if which == "probe" {
++					r.probeErr = unix.EBADF
++				}
++				if which == "readback" {
++					r.masks = nil
++					r.actual = 20
++				}
++				tr.membershipFunc = func() error { return checkOwnedMemberships(r.read) }
++				var err error
++				if query {
++					_, err = c.Generation()
++				} else {
++					c.CreateTable(&Table{Name: "attempt", Family: TableFamilyIPv4})
++					err = c.Flush()
++				}
++				if err == nil || errors.Is(err, ErrUncertain) || c.owned.tainted || len(tr.sent) != 1 {
++					t.Fatal("membership preflight sent, tainted, or replayed", err)
++				}
++				if query {
++					after := c.LastTransaction()
++					if after.State != TransactionCommitted || after.Intent.Messages[1].Table != before.Intent.Messages[1].Table || len(j.completed) != 1 {
++						t.Fatal("query preflight rewrote historical confirmation")
++					}
++				} else if last := c.LastTransaction(); last.State != TransactionNotSent || last.Sent || len(j.completed) != 2 {
++					t.Fatal("mutation preflight was not journaled NotSent")
++				}
++			})
++		}
++	}
++}
++
++func TestOwnedMembershipEverySendUsesFreshRead(t *testing.T) {
++	c, tr, _ := testOwnedConn(t)
++	checks := 0
++	tr.membershipFunc = func() error {
++		checks++
++		r := membershipReadResult{required: 8, actual: 8}
++		if checks == 3 {
++			r.masks = []uint32{0, 1}
++		}
++		return checkOwnedMemberships(r.read)
++	}
++	tr.onSend = func(m []netlink.Message) [][]netlink.Message {
++		if len(m) > 1 {
++			return successfulReplies(m)
++		}
++		return [][]netlink.Message{queryReplies(m[0], 0xfedcba98)}
++	}
++	c.CreateTable(&Table{Name: "confirmed", Family: TableFamilyIPv4})
++	if err := c.Flush(); err != nil {
++		t.Fatal(err)
++	}
++	if gen, err := c.Generation(); err != nil || gen != 0xfedcba98 {
++		t.Fatal(err)
++	}
++	if _, err := c.Generation(); err == nil || checks != 3 || len(tr.sent) != 2 || c.LastTransaction().State != TransactionCommitted {
++		t.Fatal("membership was cached, sent, or rewrote historical confirmation", err)
++	}
++}
++
++type failedMembershipRaw struct{ controls int }
++
++func (r *failedMembershipRaw) Control(func(uintptr)) error { r.controls++; return unix.EBADF }
++func (r *failedMembershipRaw) Read(func(uintptr) bool) error {
++	return errors.New("unexpected membership Read")
++}
++func (r *failedMembershipRaw) Write(func(uintptr) bool) error {
++	return errors.New("unexpected membership Write")
++}
++func TestOwnedMembershipUsesOriginalRawControlAndPropagatesFailure(t *testing.T) {
++	raw := &failedMembershipRaw{}
++	o := &ownedState{raw: raw}
++	if err := o.checkMemberships(); !errors.Is(err, unix.EBADF) || raw.controls != 1 {
++		t.Fatal("membership used fallback socket or lost original Control error", err)
++	}
++}
+diff --git a/owned_peer_test.go b/owned_peer_test.go
+new file mode 100644
+index 0000000..9831e53
+--- /dev/null
++++ b/owned_peer_test.go
+@@ -0,0 +1,481 @@
++package nftables
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"io"
++	"iter"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/mdlayher/netlink"
++	"github.com/sagernet/nftables/binaryutil"
++	"golang.org/x/sys/unix"
++)
++
++type peerPacket struct {
++	wire  []byte
++	flags int
++	from  unix.Sockaddr
++}
++type peerTransport struct {
++	*injectedTransport
++	packets     []peerPacket
++	makePackets func([]netlink.Message) []peerPacket
++}
++
++func (p *peerTransport) Send(m []netlink.Message) error {
++	p.sent = append(p.sent, cloneMessages(m))
++	p.packets = p.makePackets(m)
++	return p.sendErr
++}
++func (p *peerTransport) Receive(context ownedReceiveContext) (ownedReceivePacket, error) {
++	if len(p.packets) == 0 {
++		return ownedReceivePacket{}, io.ErrUnexpectedEOF
++	}
++	packet := p.packets[0]
++	p.packets = p.packets[1:]
++	return decodeOwnedReceivePacket(packet.wire, packet.flags, packet.from, context)
++}
++func newPeerConn(t *testing.T) (*Conn, *peerTransport, *memoryJournal) {
++	c, tr, j := testOwnedConn(t)
++	p := &peerTransport{injectedTransport: tr}
++	c.owned.transport = p
++	return c, p, j
++}
++func marshalPeerPacket(t *testing.T, group uint32, messages ...netlink.Message) peerPacket {
++	t.Helper()
++	packet := peerPacket{from: &unix.SockaddrNetlink{Family: unix.AF_NETLINK, Groups: group}}
++	for _, m := range messages {
++		m.Header.Length = uint32(16 + len(m.Data))
++		b, err := m.MarshalBinary()
++		if err != nil {
++			t.Fatal(err)
++		}
++		packet.wire = append(packet.wire, b...)
++	}
++	return packet
++}
++func changePeerAttribute(t *testing.T, m netlink.Message, kind uint16, data []byte) netlink.Message {
++	t.Helper()
++	attrs, err := netlink.UnmarshalAttributes(m.Data[4:])
++	if err != nil {
++		t.Fatal(err)
++	}
++	for i := range attrs {
++		if attrs[i].Type&0x3fff == kind {
++			attrs[i].Data = bytes.Clone(data)
++		}
++	}
++	b, err := netlink.MarshalAttributes(attrs)
++	if err != nil {
++		t.Fatal(err)
++	}
++	m.Data = append(bytes.Clone(m.Data[:4]), b...)
++	return m
++}
++func kernelPeerEcho(t *testing.T, m netlink.Message) netlink.Message {
++	t.Helper()
++	out := echo(m)
++	out.Header.Flags = m.Header.Flags & (netlink.Create | netlink.Excl)
++	intent, err := messageIntent(1, m)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if intent.Handle != 0 {
++		out = changePeerAttribute(t, out, unix.NFTA_RULE_HANDLE, binaryutil.BigEndian.PutUint64(intent.Handle))
++	}
++	return out
++}
++func peerACKs(t *testing.T, messages []netlink.Message) peerPacket {
++	t.Helper()
++	var result []netlink.Message
++	for _, m := range messages {
++		result = append(result, ack(m, 0))
++	}
++	return marshalPeerPacket(t, 0, result...)
++}
++func TestOwnedCorrectPeerCompleteMutation(t *testing.T) {
++	for _, group := range []uint32{0, 64} {
++		for _, count := range []int{1, 40} {
++			t.Run(fmt.Sprintf("group%d_echoes%d", group, count), func(t *testing.T) {
++				c, p, _ := newPeerConn(t)
++				table := c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++				for i := 1; i < count; i++ {
++					c.AddChain(&Chain{Name: fmt.Sprintf("chain-%d", i), Table: table})
++				}
++				checks := 0
++				p.membershipFunc = func() error { checks++; return nil }
++				p.makePackets = func(sent []netlink.Message) []peerPacket {
++					var es []netlink.Message
++					for _, m := range sent[1 : len(sent)-1] {
++						es = append(es, kernelPeerEcho(t, m))
++					}
++					return []peerPacket{marshalPeerPacket(t, group, es...), peerACKs(t, sent)}
++				}
++				if err := c.Flush(); err != nil {
++					t.Fatal(err)
++				}
++				if r := c.LastTransaction(); r.State != TransactionCommitted || !r.Sent || len(p.sent) != 1 || checks != 1 || len(r.Replies) != count+count+2 {
++					t.Fatalf("incomplete full receipt: %+v, checks=%d", r, checks)
++				}
++			})
++		}
++	}
++}
++func TestOwnedCorrectPeerExistingHandle(t *testing.T) {
++	for _, wrong := range []bool{false, true} {
++		t.Run(fmt.Sprint(wrong), func(t *testing.T) {
++			c, p, _ := newPeerConn(t)
++			table := &Table{Name: "own", Family: TableFamilyIPv4}
++			c.ReplaceRule(&Rule{Table: table, Chain: &Chain{Name: "c", Table: table}, Handle: 77})
++			p.makePackets = func(m []netlink.Message) []peerPacket {
++				e := kernelPeerEcho(t, m[1])
++				if wrong {
++					e = changePeerAttribute(t, e, unix.NFTA_RULE_HANDLE, binaryutil.BigEndian.PutUint64(78))
++				}
++				return []peerPacket{marshalPeerPacket(t, 64, e), peerACKs(t, m)}
++			}
++			err := c.Flush()
++			if wrong {
++				if !errors.Is(err, ErrUncertain) || c.LastTransaction().State != TransactionUnknown {
++					t.Fatal(err)
++				}
++			} else if err != nil || c.LastTransaction().State != TransactionCommitted {
++				t.Fatal(err)
++			}
++		})
++	}
++}
++func TestOwnedCorrectPeerRejectsWholePacketAndNoReplay(t *testing.T) {
++	cases := []string{"nil", "typed-nil", "other-sockaddr", "foreign-pid", "wrong-group", "mixed-mask", "ack", "done", "overrun", "begin", "end", "query-type", "wrong-seq", "wrong-header-pid", "wrong-type", "wrong-family", "wrong-table", "zero-handle", "mixed-notification", "mixed-ack", "truncated", "ancillary-truncated", "interrupted", "malformed", "empty", "trailing-junk", "duplicate-same-packet", "duplicate-across-packets", "echo-only", "missing-end", "missing-member-ack"}
++	for _, fault := range cases {
++		t.Run(fault, func(t *testing.T) {
++			c, p, j := newPeerConn(t)
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++			p.makePackets = func(m []netlink.Message) []peerPacket {
++				e := kernelPeerEcho(t, m[1])
++				valid := marshalPeerPacket(t, 64, e)
++				packet := valid
++				switch fault {
++				case "nil":
++					packet.from = nil
++				case "typed-nil":
++					packet.from = (*unix.SockaddrNetlink)(nil)
++				case "other-sockaddr":
++					packet.from = &unix.SockaddrUnix{}
++				case "foreign-pid":
++					packet.from = &unix.SockaddrNetlink{Pid: 17, Groups: 64}
++				case "wrong-group":
++					packet.from = &unix.SockaddrNetlink{Groups: 32}
++				case "mixed-mask":
++					packet.from = &unix.SockaddrNetlink{Groups: 65}
++				case "ack":
++					packet = marshalPeerPacket(t, 64, ack(m[1], 0))
++				case "done":
++					e.Header.Type = netlink.Done
++					packet = marshalPeerPacket(t, 64, e)
++				case "overrun":
++					e.Header.Type = netlink.Overrun
++					packet = marshalPeerPacket(t, 64, e)
++				case "begin":
++					packet = marshalPeerPacket(t, 64, m[0])
++				case "end":
++					packet = marshalPeerPacket(t, 64, m[len(m)-1])
++				case "query-type":
++					e.Header.Type = netlink.HeaderType((unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_NEWGEN)
++					packet = marshalPeerPacket(t, 64, e)
++				case "wrong-seq":
++					e.Header.Sequence++
++					packet = marshalPeerPacket(t, 64, e)
++				case "wrong-header-pid":
++					e.Header.PID++
++					packet = marshalPeerPacket(t, 64, e)
++				case "wrong-type":
++					e.Header.Type++
++					packet = marshalPeerPacket(t, 64, e)
++				case "wrong-family":
++					e.Data = bytes.Clone(e.Data)
++					e.Data[0] = byte(TableFamilyIPv6)
++					packet = marshalPeerPacket(t, 64, e)
++				case "wrong-table":
++					e = changePeerAttribute(t, e, unix.NFTA_TABLE_NAME, []byte("foreign\x00"))
++					packet = marshalPeerPacket(t, 64, e)
++				case "zero-handle":
++					e = changePeerAttribute(t, e, nftTableHandle, make([]byte, 8))
++					packet = marshalPeerPacket(t, 64, e)
++				case "mixed-notification":
++					bad := e
++					bad.Header.Sequence++
++					packet = marshalPeerPacket(t, 64, e, bad)
++				case "mixed-ack":
++					packet = marshalPeerPacket(t, 64, e, ack(m[1], 0))
++				case "truncated":
++					packet.flags = unix.MSG_TRUNC
++				case "ancillary-truncated":
++					packet.flags = unix.MSG_CTRUNC
++				case "interrupted":
++					e.Header.Flags |= netlink.DumpInterrupted
++					packet = marshalPeerPacket(t, 64, e)
++				case "malformed":
++					packet.wire[0] = 4
++					packet.wire[1] = 0
++				case "empty":
++					packet.wire = nil
++				case "trailing-junk":
++					packet.wire = append(packet.wire, 1)
++				case "duplicate-same-packet":
++					packet = marshalPeerPacket(t, 64, e, e)
++				case "duplicate-across-packets":
++					return []peerPacket{valid, valid, peerACKs(t, m)}
++				case "echo-only":
++					return []peerPacket{valid}
++				case "missing-end":
++					return []peerPacket{valid, marshalPeerPacket(t, 0, ack(m[0], 0), ack(m[1], 0))}
++				case "missing-member-ack":
++					return []peerPacket{valid, marshalPeerPacket(t, 0, ack(m[0], 0), ack(m[len(m)-1], 0))}
++				}
++				return []peerPacket{packet, peerACKs(t, m)}
++			}
++			if err := c.Flush(); !errors.Is(err, ErrUncertain) {
++				t.Fatal("bad peer/context committed", err)
++			}
++			if r := c.LastTransaction(); r.State != TransactionUnknown || !r.Sent || len(j.completed) != 1 {
++				t.Fatalf("rejected receive lost Unknown: %+v", r)
++			}
++			if fault == "mixed-notification" || fault == "mixed-ack" {
++				if len(c.LastTransaction().Replies) != 0 {
++					t.Fatal("valid prefix escaped rejected datagram")
++				}
++			}
++			c.CreateTable(&Table{Name: "later", Family: TableFamilyIPv4})
++			if err := c.Flush(); !errors.Is(err, ErrUncertain) || len(p.sent) != 1 {
++				t.Fatal("replay or later mutation allowed", err)
++			}
++		})
++	}
++}
++func TestOwnedCorrectPeerQueryAndStaleContext(t *testing.T) {
++	t.Run("query-no-echo-permission", func(t *testing.T) {
++		c, p, _ := newPeerConn(t)
++		p.makePackets = func(m []netlink.Message) []peerPacket {
++			return []peerPacket{marshalPeerPacket(t, 64, queryReplies(m[0], 0xfedcba98)...)}
++		}
++		if snapshot, err := c.ReadConsistent(TableFamilyIPv4); snapshot != nil || !errors.Is(err, ErrUncertain) || !c.owned.tainted {
++			t.Fatal("query accepted notification or partial snapshot", err)
++		}
++		if _, err := c.Generation(); !errors.Is(err, ErrUncertain) || len(p.sent) != 1 {
++			t.Fatal("query replayed after uncertain peer", err)
++		}
++	})
++	t.Run("current-context-only", func(t *testing.T) {
++		c, _, _ := testOwnedConn(t)
++		c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4})
++		m, intent, err := c.freezeOwned()
++		if err != nil {
++			t.Fatal(err)
++		}
++		packet := marshalPeerPacket(t, 64, kernelPeerEcho(t, m[1]))
++		old := cloneIntent(intent)
++		old.Messages[1].Header.Sequence--
++		for _, context := range []ownedReceiveContext{{}, ownedMutationReceiveContext(old)} {
++			if _, err := decodeOwnedDatagramContext(packet.wire, 0, packet.from, context); err == nil {
++				t.Fatal("old or absent context permitted echo")
++			}
++		}
++		intent.Messages[1].Header.Flags &^= unix.NLM_F_ECHO
++		if _, err := decodeOwnedDatagramContext(packet.wire, 0, packet.from, ownedMutationReceiveContext(intent)); err == nil {
++			t.Fatal("unrequested echo accepted")
++		}
++	})
++	t.Run("unrequested-elements", func(t *testing.T) {
++		c, p, _ := newPeerConn(t)
++		set := &Set{Name: "s", Table: &Table{Name: "own", Family: TableFamilyIPv4}, ID: 1, KeyType: TypeIPAddr}
++		if err := c.SetAddElements(set, []SetElement{{Key: []byte{10, 0, 0, 1}}}); err != nil {
++			t.Fatal(err)
++		}
++		p.makePackets = func(m []netlink.Message) []peerPacket {
++			return []peerPacket{marshalPeerPacket(t, 64, m[1]), peerACKs(t, m)}
++		}
++		if err := c.Flush(); !errors.Is(err, ErrUncertain) {
++			t.Fatal("unrequested element entered echo exception", err)
++		}
++	})
++}
++
++func TestOwnedSockOptionNeverEscapesRegardlessOfOrder(t *testing.T) {
++	for _, first := range []bool{false, true} {
++		t.Run(fmt.Sprint(first), func(t *testing.T) {
++			callbacks := 0
++			captured := false
++			callback := WithSockOptions(func(*netlink.Conn) error { callbacks++; captured = true; return nil })
++			owned := AsOwnedTransactions("birth", &memoryJournal{})
++			opts := []ConnOption{owned, callback}
++			if first {
++				opts = []ConnOption{callback, owned}
++			}
++			opts = append(opts, WithTestDial(func([]netlink.Message) ([]netlink.Message, error) { t.Fatal("dial exchange occurred"); return nil, nil }))
++			if c, err := New(opts...); c != nil || err == nil || callbacks != 0 || captured || !strings.Contains(err.Error(), "socket callbacks") {
++				t.Fatalf("callback escaped before Owned initialization: c=%v err=%v calls=%d", c, err, callbacks)
++			}
++		})
++	}
++	calls := 0
++	c, err := New(AsLasting(), WithTestDial(func([]netlink.Message) ([]netlink.Message, error) { return nil, io.EOF }), WithSockOptions(func(*netlink.Conn) error { calls++; return nil }))
++	if err != nil || calls != 1 {
++		t.Fatal("ordinary socket callback lost", err)
++	}
++	_ = c.CloseLasting()
++}
++
++type monitorControlSocket struct{ receives, joins, closes atomic.Int32 }
++
++func (s *monitorControlSocket) Close() error               { s.closes.Add(1); return nil }
++func (s *monitorControlSocket) Send(netlink.Message) error { return errors.New("unexpected Send") }
++func (s *monitorControlSocket) SendMessages([]netlink.Message) error {
++	return errors.New("unexpected SendMessages")
++}
++func (s *monitorControlSocket) Receive() ([]netlink.Message, error) {
++	s.receives.Add(1)
++	return nil, errors.New("use of closed file")
++}
++func (s *monitorControlSocket) ReceiveIter() iter.Seq2[netlink.Message, error] {
++	return func(yield func(netlink.Message, error) bool) {
++		s.receives.Add(1)
++		yield(netlink.Message{}, errors.New("use of closed file"))
++	}
++}
++func (s *monitorControlSocket) JoinGroup(uint32) error  { s.joins.Add(1); return nil }
++func (s *monitorControlSocket) LeaveGroup(uint32) error { return errors.New("unexpected group drop") }
++func TestOwnedMonitorEntrancesRejectBeforeAcquiringSocket(t *testing.T) {
++	for _, owned := range []bool{false, true} {
++		for _, flag := range []uint32{0, 1} {
++			for _, generational := range []bool{false, true} {
++				t.Run(fmt.Sprintf("owned%v_flags%d_gen%v", owned, flag, generational), func(t *testing.T) {
++					sock := &monitorControlSocket{}
++					c := &Conn{lasting: true, nlconn: netlink.NewConn(sock, 42)}
++					if owned {
++						c.owned = &ownedState{}
++					}
++					m := NewMonitor()
++					m.monitorFlags = flag
++					var err error
++					var closed <-chan struct{}
++					done := make(chan struct{})
++					if generational {
++						var ch chan *MonitorEvents
++						ch, err = c.AddGenerationalMonitor(m)
++						if err == nil {
++							go func() {
++								for range ch {
++								}
++								close(done)
++							}()
++							closed = done
++						}
++					} else {
++						var ch chan *MonitorEvent
++						ch, err = c.AddMonitor(m)
++						if err == nil {
++							go func() {
++								for range ch {
++								}
++								close(done)
++							}()
++							closed = done
++						}
++					}
++					if owned {
++						if err == nil || m.conn != nil || m.closer != nil || sock.joins.Load() != 0 || sock.receives.Load() != 0 {
++							t.Fatal("Owned monitor acquired or shared original socket", err)
++						}
++					} else {
++						if err != nil || m.conn == nil || sock.joins.Load() != int32(flag) {
++							t.Fatal("ordinary monitor behavior changed", err)
++						}
++						select {
++						case <-closed:
++						case <-time.After(time.Second):
++							t.Fatal("ordinary monitor goroutine did not actually exit")
++						}
++						if sock.receives.Load() != 1 {
++							t.Fatal("ordinary monitor did not use receiver")
++						}
++					}
++					_ = c.CloseLasting()
++					if sock.closes.Load() != 1 {
++						t.Fatal("fixture socket did not close")
++					}
++				})
++			}
++		}
++	}
++}
++
++func TestOwnedCorrectPeerAllObjectKindsAndNames(t *testing.T) {
++	for _, fault := range []string{"none", "chain-name", "set-name"} {
++		t.Run(fault, func(t *testing.T) {
++			c, p, _ := newPeerConn(t)
++			table := c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4})
++			chain := c.AddChain(&Chain{Name: "c", Table: table})
++			set := &Set{Name: "s", Table: table, KeyType: TypeIPAddr}
++			if err := c.AddSet(set, nil); err != nil {
++				t.Fatal(err)
++			}
++			c.AddRule(&Rule{Table: table, Chain: chain})
++			p.makePackets = func(m []netlink.Message) []peerPacket {
++				var es []netlink.Message
++				for _, r := range m[1 : len(m)-1] {
++					e := kernelPeerEcho(t, r)
++					op := int(e.Header.Type) & 255
++					if fault == "chain-name" && op == unix.NFT_MSG_NEWCHAIN {
++						e = changePeerAttribute(t, e, unix.NFTA_CHAIN_NAME, []byte("foreign\x00"))
++					}
++					if fault == "set-name" && op == unix.NFT_MSG_NEWSET {
++						e = changePeerAttribute(t, e, unix.NFTA_SET_NAME, []byte("foreign\x00"))
++					}
++					es = append(es, e)
++				}
++				return []peerPacket{marshalPeerPacket(t, 64, es...), peerACKs(t, m)}
++			}
++			err := c.Flush()
++			if fault == "none" {
++				if err != nil || c.LastTransaction().State != TransactionCommitted {
++					t.Fatal("legal object echo failed", err)
++				}
++			} else if !errors.Is(err, ErrUncertain) || c.LastTransaction().State != TransactionUnknown || len(c.LastTransaction().Replies) != 0 {
++				t.Fatal("wrong name or partial echo packet accepted", err)
++			}
++		})
++	}
++}
++func TestOwnedCorrectPeerContextCopiesFrozenIntent(t *testing.T) {
++	c, _, _ := testOwnedConn(t)
++	c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4})
++	m, intent, err := c.freezeOwned()
++	if err != nil {
++		t.Fatal(err)
++	}
++	context := ownedMutationReceiveContext(intent)
++	packet := marshalPeerPacket(t, 64, kernelPeerEcho(t, m[1]))
++	intent.PortID++
++	intent.Messages[1].Header.Sequence++
++	intent.Messages[1].Table = "changed"
++	intent.Messages[1].Bytes[0] ^= 1
++	if out, err := decodeOwnedDatagramContext(packet.wire, 0, packet.from, context); err != nil || len(out) != 1 {
++		t.Fatal("receive context aliased its caller intent", err)
++	}
++	if context.mutation.Messages[1].Bytes[0] != byte(m[1].Header.Length) {
++		t.Fatal("receive context did not freeze bytes")
++	}
++}
++
++func TestOwnedEmptySocketCallbackListDoesNotCreateNewGate(t *testing.T) {
++	c, err := New(WithSockOptions(), AsOwnedTransactions("birth", &memoryJournal{}), WithTestDial(func([]netlink.Message) ([]netlink.Message, error) { return nil, io.EOF }))
++	if c != nil || err == nil || strings.Contains(err.Error(), "socket callbacks") || !strings.Contains(err.Error(), "pinned namespace") {
++		t.Fatal("empty callback list was blocked instead of reaching original Owned initialization", err)
++	}
++}
+diff --git a/owned_sender_diagnostic_test.go b/owned_sender_diagnostic_test.go
+new file mode 100644
+index 0000000..4513cba
+--- /dev/null
++++ b/owned_sender_diagnostic_test.go
+@@ -0,0 +1,90 @@
++package nftables
++
++import (
++	"crypto/sha256"
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/mdlayher/netlink"
++	"golang.org/x/sys/unix"
++)
++
++func TestOwnedRejectedSenderDiagnostic(t *testing.T) {
++	m := netlink.Message{Header: netlink.Header{Length: 36, Type: netlink.Error, PID: 42, Sequence: 9}, Data: make([]byte, 20)}
++	wire, err := m.MarshalBinary()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, test := range []struct {
++		name   string
++		from   unix.Sockaddr
++		fields []string
++	}{
++		{"missing", nil, []string{"from_type=<nil>", "from_pid=unavailable", "from_groups=unavailable"}},
++		{"other-type", &unix.SockaddrUnix{}, []string{"from_type=*unix.SockaddrUnix", "from_pid=unavailable", "from_groups=unavailable"}},
++		{"foreign-port", &unix.SockaddrNetlink{Pid: 77}, []string{"from_type=*unix.SockaddrNetlink", "from_pid=77", "from_groups=0"}},
++		{"nft-notify-group-still-rejected", &unix.SockaddrNetlink{Groups: 64}, []string{"from_pid=0", "from_groups=64"}},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			messages, err := decodeOwnedDatagram(wire, unix.MSG_TRUNC, test.from)
++			if err == nil || len(messages) != 0 {
++				t.Fatal("diagnostic changed rejected sender acceptance")
++			}
++			for _, want := range append(test.fields, "nft datagram sender is not the unicast kernel", "recvmsg_flags=0x20", "datagram_bytes=36", fmt.Sprintf("datagram_sha256=%x", sha256.Sum256(wire)), "header_count=1", "Len:36 Type:2 Flags:0 Seq:9 Pid:42", "header_parse_error=<nil>") {
++				if !strings.Contains(err.Error(), want) {
++					t.Fatalf("rejected receive diagnostic missing %q: %v", want, err)
++				}
++			}
++		})
++	}
++	if messages, err := decodeOwnedDatagram(wire, 0, &unix.SockaddrNetlink{}); err != nil || len(messages) != 1 {
++		t.Fatalf("existing trusted unicast changed: %v", err)
++	}
++}
++
++func TestOwnedRejectedSenderDiagnosticPreservesUnknownAndNoReplay(t *testing.T) {
++	c, tr, j := testOwnedConn(t)
++	tr.onSend = func(messages []netlink.Message) [][]netlink.Message {
++		wire, err := echo(messages[1]).MarshalBinary()
++		if err != nil {
++			t.Fatal(err)
++		}
++		_, tr.receiveErr = decodeOwnedDatagram(wire, 0, &unix.SockaddrNetlink{Groups: 64})
++		return nil
++	}
++	c.CreateTable(&Table{Name: "own", Family: TableFamilyIPv4, Flags: TableFlagOwner})
++	if err := c.Flush(); !errors.Is(err, ErrUncertain) || !strings.Contains(err.Error(), "from_groups=64") {
++		t.Fatalf("rejected actual receive lost Unknown or diagnostic: %v", err)
++	}
++	r := c.LastTransaction()
++	if r.State != TransactionUnknown || !r.Sent || len(r.Replies) != 0 || len(j.pending) != 1 || len(j.completed) != 1 || !strings.Contains(j.completed[0].Err.Error(), "from_groups=64") {
++		t.Fatalf("diagnostic changed uncertain transaction receipt: %+v", r)
++	}
++	c.CreateTable(&Table{Name: "later", Family: TableFamilyIPv4})
++	if err := c.Flush(); !errors.Is(err, ErrUncertain) || len(tr.sent) != 1 {
++		t.Fatalf("diagnostic permitted replay or later mutation: %v", err)
++	}
++}
++
++func TestOwnedRejectedSenderDiagnosticMalformedAndTextBound(t *testing.T) {
++	_, err := decodeOwnedDatagram([]byte{8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, nil)
++	if err == nil || !strings.Contains(err.Error(), "datagram_bytes=16") || !strings.Contains(err.Error(), "header_parse_error=invalid argument") {
++		t.Fatal("malformed rejected datagram diagnostic lost original bytes length or parse failure", err)
++	}
++	m := netlink.Message{Header: netlink.Header{Length: 20, Type: netlink.Error, PID: 42}, Data: make([]byte, 4)}
++	var wire []byte
++	for i := range 100 {
++		m.Header.Sequence = uint32(i + 1)
++		b, marshalErr := m.MarshalBinary()
++		if marshalErr != nil {
++			t.Fatal(marshalErr)
++		}
++		wire = append(wire, b...)
++	}
++	_, err = decodeOwnedDatagram(wire, 0, &unix.SockaddrNetlink{Pid: 1})
++	if err == nil || !strings.Contains(err.Error(), "header_count=100") || !strings.Contains(err.Error(), "Seq:8 Pid:42") || strings.Contains(err.Error(), "Seq:9 Pid:42") || len(err.Error()) > 1024 {
++		t.Fatal("rejected datagram diagnostic text was not bounded", err)
++	}
++}
+diff --git a/owned_snapshot.go b/owned_snapshot.go
+new file mode 100644
+index 0000000..d6ffe5c
+--- /dev/null
++++ b/owned_snapshot.go
+@@ -0,0 +1,314 @@
++package nftables
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/mdlayher/netlink"
++	"golang.org/x/sys/unix"
++)
++
++// ConsistentSnapshot is a complete family observation guarded by a 32-bit
++// GENID before/after. It grants no ownership; callers must match own receipts.
++type ConsistentSnapshot struct {
++	Generation uint32
++	Tables     []*Table
++	Chains     []*Chain
++	Rules      []*Rule
++	Sets       []*Set
++}
++
++func (cc *Conn) ReadConsistent(family TableFamily) (*ConsistentSnapshot, error) {
++	return cc.readConsistent(family, "")
++}
++
++func (cc *Conn) ReadConsistentTable(table *Table) (*ConsistentSnapshot, error) {
++	if table == nil || table.Name == "" {
++		return nil, errors.New("missing table observation intent")
++	}
++	return cc.readConsistent(table.Family, table.Name)
++}
++
++func (cc *Conn) readConsistent(family TableFamily, tableName string) (*ConsistentSnapshot, error) {
++	cc.ioMu.Lock()
++	defer cc.ioMu.Unlock()
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	if cc.sealed {
++		return nil, ErrSealed
++	}
++	if cc.owned == nil {
++		return nil, errors.New("consistent nft read requires owned transport")
++	}
++	if len(cc.messages) != 0 {
++		return nil, errors.New("consistent read requires an empty unsent builder queue")
++	}
++	before, err := cc.generationUnderLock()
++	if err != nil {
++		return nil, err
++	}
++	out := &ConsistentSnapshot{Generation: before}
++	for _, op := range []int{unix.NFT_MSG_GETTABLE, unix.NFT_MSG_GETCHAIN, unix.NFT_MSG_GETRULE, unix.NFT_MSG_GETSET} {
++		var attrs []netlink.Attribute
++		// Linux table/chain DUMP enumerates the whole family even when a
++		// name attribute is supplied. Rule/set DUMP actually filters by table.
++		if tableName != "" && (op == unix.NFT_MSG_GETRULE || op == unix.NFT_MSG_GETSET) {
++			typ := uint16(1)
++			attrs = []netlink.Attribute{{Type: typ, Data: []byte(tableName + "\x00")}}
++		}
++		messages, err := cc.queryOwned(op, family, attrs, true)
++		if err != nil {
++			return nil, err
++		}
++		for _, m := range messages {
++			switch op {
++			case unix.NFT_MSG_GETTABLE:
++				t, e := tableFromMsg(m)
++				if e != nil {
++					return nil, cc.uncertainObservation(e)
++				}
++				if t.Name == "" || t.Handle == 0 {
++					return nil, cc.uncertainObservation(errors.New("nft table snapshot missing identity"))
++				}
++				if tableName != "" && t.Name != tableName {
++					continue
++				}
++				out.Tables = append(out.Tables, t)
++			case unix.NFT_MSG_GETCHAIN:
++				c, e := chainFromMsg(m)
++				if e != nil {
++					return nil, cc.uncertainObservation(e)
++				}
++				if c.Table == nil || c.Table.Name == "" || c.Name == "" || c.Handle == 0 {
++					return nil, cc.uncertainObservation(errors.New("nft chain snapshot missing identity"))
++				}
++				if tableName != "" && c.Table.Name != tableName {
++					continue
++				}
++				out.Chains = append(out.Chains, c)
++			case unix.NFT_MSG_GETRULE:
++				r, e := ruleFromMsg(family, m)
++				if e != nil {
++					return nil, cc.uncertainObservation(e)
++				}
++				if r.Table == nil || r.Table.Name == "" || r.Chain == nil || r.Chain.Name == "" || r.Handle == 0 || tableName != "" && r.Table.Name != tableName {
++					return nil, cc.uncertainObservation(errors.New("nft rule snapshot identity mismatch"))
++				}
++				out.Rules = append(out.Rules, r)
++			case unix.NFT_MSG_GETSET:
++				s, e := setsFromMsg(m)
++				if e != nil {
++					return nil, cc.uncertainObservation(e)
++				}
++				if s.Table == nil || s.Table.Name == "" || s.Name == "" || tableName != "" && s.Table.Name != tableName {
++					return nil, cc.uncertainObservation(errors.New("nft set snapshot parent mismatch"))
++				}
++				out.Sets = append(out.Sets, s)
++			}
++		}
++	}
++	after, err := cc.generationUnderLock()
++	if err != nil {
++		return nil, err
++	}
++	if before != after {
++		return nil, ErrGenerationChanged
++	}
++	return out, nil
++}
++
++func (cc *Conn) Generation() (uint32, error) {
++	cc.ioMu.Lock()
++	defer cc.ioMu.Unlock()
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	if cc.sealed {
++		return 0, ErrSealed
++	}
++	if cc.owned == nil {
++		return 0, errors.New("generation requires owned transport")
++	}
++	return cc.generationUnderLock()
++}
++func (cc *Conn) generationUnderLock() (uint32, error) {
++	messages, err := cc.queryOwned(unix.NFT_MSG_GETGEN, TableFamilyUnspecified, nil, false)
++	if err != nil {
++		return 0, err
++	}
++	if len(messages) != 1 || int(messages[0].Header.Type) != (unix.NFNL_SUBSYS_NFTABLES<<8)|unix.NFT_MSG_NEWGEN {
++		return 0, cc.uncertainObservation(errors.New("invalid GETGEN response"))
++	}
++	attrs, err := netlink.UnmarshalAttributes(messages[0].Data[4:])
++	if err != nil {
++		return 0, cc.uncertainObservation(err)
++	}
++	var generation uint32
++	var found bool
++	for _, a := range attrs {
++		if a.Type&0x3fff == nftGenID {
++			if len(a.Data) != 4 || found {
++				return 0, cc.uncertainObservation(errors.New("invalid 32-bit GENID"))
++			}
++			generation = binary.BigEndian.Uint32(a.Data)
++			found = true
++		}
++	}
++	if generation == 0 {
++		return 0, cc.uncertainObservation(errors.New("kernel returned zero or missing GENID"))
++	}
++	return generation, nil
++}
++
++func (cc *Conn) queryOwned(op int, family TableFamily, attrs []netlink.Attribute, dump bool) ([]netlink.Message, error) {
++	o := cc.owned
++	if o.tainted {
++		return nil, ErrUncertain
++	}
++	o.sequence++
++	if o.sequence == 0 {
++		return nil, errors.New("owned nft sequence exhausted")
++	}
++	flags := netlink.Request | netlink.Acknowledge
++	if dump {
++		flags = netlink.Request | netlink.Dump
++	}
++	data := extraHeader(uint8(family), 0)
++	if len(attrs) != 0 {
++		b, err := netlink.MarshalAttributes(attrs)
++		if err != nil {
++			return nil, err
++		}
++		data = append(data, b...)
++	}
++	sent := netlink.Message{Header: netlink.Header{Length: uint32(16 + len(data)), Type: netlink.HeaderType((unix.NFNL_SUBSYS_NFTABLES << 8) | op), Flags: flags, Sequence: o.sequence, PID: o.portID}, Data: data}
++	if err := o.transport.Buffers(int(sent.Header.Length), int(sent.Header.Length), 1); err != nil {
++		return nil, err
++	}
++	if err := o.transport.CheckMemberships(); err != nil {
++		return nil, err
++	}
++	if err := o.transport.Deadline(time.Now().Add(o.timeout)); err != nil {
++		return nil, err
++	}
++	defer o.transport.Deadline(time.Time{})
++	if err := o.transport.Send([]netlink.Message{sent}); err != nil {
++		if !errors.Is(err, unix.EMSGSIZE) {
++			o.tainted = true
++			return nil, errors.Join(err, ErrUncertain)
++		}
++		return nil, err
++	}
++	var messages []netlink.Message
++	var ack, done bool
++	for {
++		packet, err := o.transport.Receive(ownedReceiveContext{})
++		if err != nil {
++			o.tainted = true
++			return nil, errors.Join(err, ErrUncertain)
++		}
++		replies := packet.replies
++		for index, m := range replies {
++			if m.Header.Sequence != sent.Header.Sequence || m.Header.PID != o.portID || m.Header.Flags&netlink.DumpInterrupted != 0 {
++				o.tainted = true
++				return nil, errors.Join(errors.New("incomplete or misassociated nft observation"), ErrUncertain)
++			}
++			switch m.Header.Type {
++			case netlink.Error:
++				code, err := validateACK(m, sent)
++				if err != nil {
++					o.tainted = true
++					return nil, errors.Join(err, ErrUncertain)
++				}
++				if code != 0 {
++					return nil, code
++				}
++				if ack {
++					o.tainted = true
++					return nil, errors.Join(errors.New("duplicate query ACK"), ErrUncertain)
++				}
++				ack = true
++			case netlink.Done:
++				if !dump || done || len(m.Data) < 4 || index != len(replies)-1 {
++					o.tainted = true
++					return nil, errors.Join(errors.New("invalid nft dump terminal"), ErrUncertain)
++				}
++				if code := int32(binary.NativeEndian.Uint32(m.Data[:4])); code < 0 {
++					return nil, unix.Errno(-code)
++				} else if code > 0 {
++					return nil, cc.uncertainObservation(fmt.Errorf("invalid positive nft dump errno %d", code))
++				}
++				done = true
++			case netlink.Overrun:
++				o.tainted = true
++				return nil, errors.Join(unix.ENOBUFS, ErrUncertain)
++			default:
++				if int(m.Header.Type) != (unix.NFNL_SUBSYS_NFTABLES<<8)|(op-1) || ack || done {
++					return nil, cc.uncertainObservation(errors.New("nft observation has an unexpected object type or order"))
++				}
++				if len(m.Data) < 4 || m.Data[0] != byte(family) && family != TableFamilyUnspecified {
++					o.tainted = true
++					return nil, errors.Join(errors.New("nft observation family mismatch"), ErrUncertain)
++				}
++				messages = append(messages, m)
++			}
++		}
++		if dump && done || !dump && ack {
++			return messages, nil
++		}
++	}
++}
++
++func (cc *Conn) uncertainObservation(err error) error {
++	cc.owned.tainted = true
++	return errors.Join(err, ErrUncertain)
++}
++
++// DelTableNonRecursive and DelChainNonRecursive rely on the kernel's commit
++// critical section. A preceding observation alone never authorizes a parent.
++func (cc *Conn) DelTableNonRecursive(t *Table) { cc.delTable(t, unix.NLM_F_NONREC) }
++func (cc *Conn) DelChainNonRecursive(c *Chain) { cc.delChain(c, unix.NLM_F_NONREC) }
++
++// ReadConsistentElements includes a complete dump terminal and a generation
++// fence; no truncated/ENOBUFS partial element list is returned as a snapshot.
++func (cc *Conn) ReadConsistentElements(set *Set) ([]SetElement, uint32, error) {
++	cc.ioMu.Lock()
++	defer cc.ioMu.Unlock()
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	if cc.sealed {
++		return nil, 0, ErrSealed
++	}
++	if cc.owned == nil || set == nil || set.Table == nil || set.Name == "" {
++		return nil, 0, errors.New("invalid consistent element intent")
++	}
++	if len(cc.messages) != 0 {
++		return nil, 0, errors.New("consistent element read requires an empty builder queue")
++	}
++	before, err := cc.generationUnderLock()
++	if err != nil {
++		return nil, 0, err
++	}
++	attrs := []netlink.Attribute{{Type: unix.NFTA_SET_ELEM_LIST_TABLE, Data: []byte(set.Table.Name + "\x00")}, {Type: unix.NFTA_SET_ELEM_LIST_SET, Data: []byte(set.Name + "\x00")}}
++	messages, err := cc.queryOwned(unix.NFT_MSG_GETSETELEM, set.Table.Family, attrs, true)
++	if err != nil {
++		return nil, 0, err
++	}
++	var out []SetElement
++	for _, m := range messages {
++		elements, err := elementsFromMsg(byte(set.Table.Family), m)
++		if err != nil {
++			return nil, 0, cc.uncertainObservation(err)
++		}
++		out = append(out, elements...)
++	}
++	after, err := cc.generationUnderLock()
++	if err != nil {
++		return nil, 0, err
++	}
++	if before != after {
++		return nil, 0, ErrGenerationChanged
++	}
++	return out, before, nil
++}
+diff --git a/owned_test.go b/owned_test.go
+new file mode 100644
+index 0000000..4f27ec1
+--- /dev/null
++++ b/owned_test.go
+@@ -0,0 +1,492 @@
++package nftables
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/mdlayher/netlink"
++	"github.com/sagernet/nftables/binaryutil"
++	"github.com/sagernet/nftables/expr"
++	"golang.org/x/sys/unix"
++)
++
++type memoryJournal struct {
++	mu        sync.Mutex
++	pending   []TransactionIntent
++	completed []TransactionReceipt
++	prepare   func(TransactionIntent) error
++}
++
++func (j *memoryJournal) Prepare(i TransactionIntent) error {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	j.pending = append(j.pending, cloneIntent(i))
++	if j.prepare != nil {
++		return j.prepare(i)
++	}
++	return nil
++}
++func (j *memoryJournal) Complete(r TransactionReceipt) {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	j.completed = append(j.completed, r)
++}
++
++type injectedTransport struct {
++	sent                           [][]netlink.Message
++	replies                        [][]netlink.Message
++	sendErr, receiveErr, bufferErr error
++	bufferFunc                     func(int, int, int) error
++	membershipFunc                 func() error
++	onSend                         func([]netlink.Message) [][]netlink.Message
++}
++
++func (t *injectedTransport) Send(m []netlink.Message) error {
++	t.sent = append(t.sent, cloneMessages(m))
++	if t.sendErr != nil {
++		return t.sendErr
++	}
++	t.replies = t.onSend(m)
++	return nil
++}
++func (t *injectedTransport) Receive(ownedReceiveContext) (ownedReceivePacket, error) {
++	if len(t.replies) == 0 {
++		if t.receiveErr != nil {
++			return ownedReceivePacket{}, t.receiveErr
++		}
++		return ownedReceivePacket{}, io.ErrUnexpectedEOF
++	}
++	m := t.replies[0]
++	t.replies = t.replies[1:]
++	return ownedReceivePacket{replies: m}, nil
++}
++func (t *injectedTransport) CheckMemberships() error {
++	if t.membershipFunc != nil {
++		return t.membershipFunc()
++	}
++	return nil
++}
++func (t *injectedTransport) Buffers(total, largest, count int) error {
++	if t.bufferFunc != nil {
++		return t.bufferFunc(total, largest, count)
++	}
++	return t.bufferErr
++}
++func (t *injectedTransport) Deadline(time.Time) error { return nil }
++func testOwnedConn(t *testing.T) (*Conn, *injectedTransport, *memoryJournal) {
++	t.Helper()
++	tr := &injectedTransport{onSend: successfulReplies}
++	j := &memoryJournal{}
++	c := &Conn{lasting: true, owned: &ownedState{birth: "test-birth", portID: 42, sequence: 99, namespaceDevice: 1, namespaceInode: 2, journal: j, transport: tr, timeout: time.Second}}
++	return c, tr, j
++}
++func ack(m netlink.Message, errno unix.Errno) netlink.Message {
++	data := make([]byte, 20)
++	binary.NativeEndian.PutUint32(data, uint32(-int32(errno)))
++	wire, _ := m.MarshalBinary()
++	copy(data[4:], wire[:16])
++	return netlink.Message{Header: netlink.Header{Type: netlink.Error, Sequence: m.Header.Sequence, PID: m.Header.PID}, Data: data}
++}
++func echo(m netlink.Message) netlink.Message {
++	out := m
++	out.Data = bytes.Clone(m.Data)
++	op := int(m.Header.Type) & 0xff
++	var typ uint16
++	switch op {
++	case unix.NFT_MSG_NEWTABLE:
++		typ = nftTableHandle
++	case unix.NFT_MSG_NEWCHAIN:
++		typ = unix.NFTA_CHAIN_HANDLE
++	case unix.NFT_MSG_NEWRULE:
++		typ = unix.NFTA_RULE_HANDLE
++	case unix.NFT_MSG_NEWSET:
++		typ = nftSetHandle
++	}
++	if typ != 0 {
++		a, _ := netlink.MarshalAttributes([]netlink.Attribute{{Type: typ, Data: binaryutil.BigEndian.PutUint64(100 + uint64(m.Header.Sequence))}})
++		out.Data = append(out.Data, a...)
++	}
++	out.Header.Length = uint32(16 + len(out.Data))
++	return out
++}
++func successfulReplies(m []netlink.Message) [][]netlink.Message {
++	var replies []netlink.Message
++	for _, x := range m {
++		if x.Header.Flags&unix.NLM_F_ECHO != 0 {
++			replies = append(replies, echo(x))
++		}
++	}
++	for _, x := range m {
++		if x.Header.Flags&netlink.Acknowledge != 0 {
++			replies = append(replies, ack(x, 0))
++		}
++	}
++	return [][]netlink.Message{replies}
++}
++func TestOwnedFrozenCompleteBatch(t *testing.T) {
++	c, tr, j := testOwnedConn(t)
++	table := c.CreateTable(&Table{Name: "own", Family: TableFamilyINet, Flags: TableFlagOwner, UserData: []byte("test-birth")})
++	c.AddChain(&Chain{Name: "base", Table: table})
++	j.prepare = func(i TransactionIntent) error {
++		if len(tr.sent) != 0 {
++			t.Fatal("send preceded journal")
++		}
++		i.Messages[1].Bytes[0] ^= 0xff
++		i.Messages[1].Table = "foreign"
++		return nil
++	}
++	if err := c.Flush(); err != nil {
++		t.Fatal(err)
++	}
++	if len(tr.sent) != 1 || len(j.completed) != 1 || j.completed[0].State != TransactionCommitted {
++		t.Fatalf("bad receipt: %+v", j.completed)
++	}
++	if j.completed[0].Intent.Messages[1].Table != "own" {
++		t.Fatal("journal changed intent")
++	}
++	receipt := c.LastTransaction()
++	receipt.Intent.Messages[1].Bytes[0] ^= 0xff
++	if bytes.Equal(receipt.Intent.Messages[1].Bytes, c.LastTransaction().Intent.Messages[1].Bytes) {
++		t.Fatal("last receipt aliases immutable bytes")
++	}
++	if tr.sent[0][1].Header.Flags&(netlink.Excl|netlink.Create) != (netlink.Excl | netlink.Create) {
++		t.Fatal("owner create is not exclusive")
++	}
++}
++func TestOwnedNoReplayAtFailureBoundaries(t *testing.T) {
++	for _, test := range []struct {
++		name       string
++		send, recv error
++		state      TransactionState
++	}{{"send-emsgsize", unix.EMSGSIZE, nil, TransactionNotSent}, {"send-other", unix.ENOBUFS, nil, TransactionUnknown}, {"missing-ack", nil, io.ErrUnexpectedEOF, TransactionUnknown}, {"recv-enobufs", nil, unix.ENOBUFS, TransactionUnknown}} {
++		t.Run(test.name, func(t *testing.T) {
++			c, tr, _ := testOwnedConn(t)
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyINet, Flags: TableFlagOwner})
++			tr.sendErr = test.send
++			tr.receiveErr = test.recv
++			tr.onSend = func([]netlink.Message) [][]netlink.Message { return nil }
++			if err := c.Flush(); err == nil {
++				t.Fatal("missing error")
++			}
++			if len(tr.sent) != 1 || c.LastTransaction().State != test.state {
++				t.Fatalf("send attempts=%d state=%d", len(tr.sent), c.LastTransaction().State)
++			}
++			if err := c.Flush(); test.state == TransactionUnknown && !errors.Is(err, ErrUncertain) || test.state != TransactionUnknown && err != nil {
++				t.Fatal(err)
++			}
++			if len(tr.sent) != 1 {
++				t.Fatal("queue was replayed")
++			}
++		})
++	}
++}
++func TestOwnedCompleteAbortAndOriginalError(t *testing.T) {
++	c, tr, _ := testOwnedConn(t)
++	c.CreateTable(&Table{Name: "collision", Family: TableFamilyINet, Flags: TableFlagOwner})
++	tr.onSend = func(m []netlink.Message) [][]netlink.Message {
++		return [][]netlink.Message{{ack(m[0], 0), ack(m[1], unix.EEXIST)}}
++	}
++	if err := c.Flush(); !errors.Is(err, unix.EEXIST) {
++		t.Fatalf("original errno lost: %v", err)
++	}
++	if c.LastTransaction().State != TransactionAborted {
++		t.Fatal("complete kernel abort not recorded")
++	}
++	c, tr, _ = testOwnedConn(t)
++	c.CreateTable(&Table{Name: "own", Family: TableFamilyINet, Flags: TableFlagOwner})
++	tr.onSend = func(m []netlink.Message) [][]netlink.Message {
++		return [][]netlink.Message{{ack(m[0], 0), ack(m[1], unix.EEXIST), {Header: netlink.Header{Type: netlink.Overrun, Sequence: m[1].Header.Sequence, PID: 42}}}}
++	}
++	if err := c.Flush(); !errors.Is(err, unix.EEXIST) {
++		t.Fatalf("first error lost on follow-up corruption: %v", err)
++	}
++	if c.LastTransaction().State != TransactionUnknown {
++		t.Fatal("corrupted abort should be unknown")
++	}
++}
++func TestOwnedACKAssociation(t *testing.T) {
++	for _, fault := range []string{"pid", "seq", "embedded", "end-missing", "echo-missing", "echo-parent", "ack-reorder", "duplicate"} {
++		t.Run(fault, func(t *testing.T) {
++			c, tr, _ := testOwnedConn(t)
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyINet, Flags: TableFlagOwner})
++			tr.onSend = func(m []netlink.Message) [][]netlink.Message {
++				r := successfulReplies(m)[0]
++				switch fault {
++				case "pid":
++					r[1].Header.PID++
++				case "seq":
++					r[1].Header.Sequence++
++				case "embedded":
++					r[1].Data[8]++
++				case "end-missing":
++					r = r[:len(r)-1]
++				case "echo-missing":
++					r = r[1:]
++				case "echo-parent":
++					a, _ := netlink.MarshalAttributes([]netlink.Attribute{{Type: unix.NFTA_TABLE_NAME, Data: []byte("foreign\x00")}, {Type: nftTableHandle, Data: binaryutil.BigEndian.PutUint64(3)}})
++					r[0].Data = append(extraHeader(byte(TableFamilyINet), 0), a...)
++				case "ack-reorder":
++					r[1], r[2] = r[2], r[1]
++				case "duplicate":
++					r = append(r, r[len(r)-1])
++				}
++				return [][]netlink.Message{r}
++			}
++			if err := c.Flush(); err == nil {
++				t.Fatal("invalid receipt succeeded")
++			}
++			if c.LastTransaction().State != TransactionUnknown || len(tr.sent) != 1 {
++				t.Fatal("invalid receipt claimed/replayed")
++			}
++		})
++	}
++}
++func TestOwnedAnonymousLookupSameFrozenBatch(t *testing.T) {
++	c, tr, _ := testOwnedConn(t)
++	table := &Table{Name: "own", Family: TableFamilyINet}
++	chain := &Chain{Name: "route", Table: table}
++	set := &Set{Table: table, Anonymous: true, Constant: true, KeyType: TypeEtherAddr}
++	if err := c.AddSet(set, []SetElement{{Key: []byte{0, 1, 2, 3, 4, 5}}, {Key: []byte{0, 1, 2, 3, 4, 6}}}); err != nil {
++		t.Fatal(err)
++	}
++	c.AddRule(&Rule{Table: table, Chain: chain, Exprs: []expr.Any{&expr.Lookup{SourceRegister: 1, SetID: set.ID, SetName: set.Name}, &expr.Verdict{Kind: expr.VerdictReturn}}})
++	if err := c.Flush(); err != nil {
++		t.Fatal(err)
++	}
++	if len(tr.sent) != 1 || len(tr.sent[0]) != 5 {
++		t.Fatal("anonymous set escaped lookup transaction")
++	}
++}
++func TestOwnedGenerationConditionalAndDiscard(t *testing.T) {
++	c, tr, _ := testOwnedConn(t)
++	table := &Table{Name: "own", Family: TableFamilyINet}
++	c.DelTableNonRecursive(table)
++	if err := c.UseGeneration(0xfedcba98); err != nil {
++		t.Fatal(err)
++	}
++	tr.onSend = func(m []netlink.Message) [][]netlink.Message {
++		a, e := netlink.UnmarshalAttributes(m[0].Data[4:])
++		if e != nil || len(a) != 1 || binary.BigEndian.Uint32(a[0].Data) != 0xfedcba98 {
++			t.Fatal("generation truncated")
++		}
++		if m[1].Header.Flags&unix.NLM_F_NONREC == 0 {
++			t.Fatal("parent delete recursive")
++		}
++		return [][]netlink.Message{{ack(m[0], unix.ERESTART)}}
++	}
++	if err := c.Flush(); !errors.Is(err, ErrGenerationChanged) || !errors.Is(err, unix.ERESTART) {
++		t.Fatalf("bad generation result: %v", err)
++	}
++	if c.LastTransaction().State != TransactionAborted || c.owned.generation != 0 {
++		t.Fatal("old observation retained")
++	}
++}
++func TestOwnedPermanentSeal(t *testing.T) {
++	c := &Conn{lasting: true}
++	if err := c.CloseLasting(); err != nil {
++		t.Fatal(err)
++	}
++	c.CreateTable(&Table{Name: "own", Family: TableFamilyINet})
++	if err := c.Flush(); !errors.Is(err, ErrSealed) {
++		t.Fatal(err)
++	}
++	if _, _, err := c.netlinkConn(); !errors.Is(err, ErrSealed) {
++		t.Fatal("reopened after close")
++	}
++}
++func TestOwnedRejectGlobalRawIntent(t *testing.T) {
++	c, tr, _ := testOwnedConn(t)
++	c.FlushRuleset()
++	if err := c.Flush(); err == nil {
++		t.Fatal("global mutation bypassed intent")
++	}
++	if len(tr.sent) != 0 {
++		t.Fatal("invalid intent sent")
++	}
++}
++
++func TestOwnedSenderAndTruncation(t *testing.T) {
++	m := netlink.Message{Header: netlink.Header{Length: 20, Type: netlink.Error, PID: 42, Sequence: 9}, Data: make([]byte, 4)}
++	wire, err := m.MarshalBinary()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, test := range []struct {
++		name   string
++		flags  int
++		sender unix.Sockaddr
++	}{{"foreign", 0, &unix.SockaddrNetlink{Pid: 1}}, {"multicast", 0, &unix.SockaddrNetlink{Groups: 1}}, {"truncated", unix.MSG_TRUNC, &unix.SockaddrNetlink{}}, {"ancillary-truncated", unix.MSG_CTRUNC, &unix.SockaddrNetlink{}}} {
++		t.Run(test.name, func(t *testing.T) {
++			if _, err := decodeOwnedDatagram(wire, test.flags, test.sender); err == nil {
++				t.Fatal("untrusted datagram accepted")
++			}
++		})
++	}
++	if messages, err := decodeOwnedDatagram(wire, 0, &unix.SockaddrNetlink{}); err != nil || len(messages) != 1 {
++		t.Fatal(err)
++	}
++}
++
++func queryReplies(request netlink.Message, generation uint32) []netlink.Message {
++	if int(request.Header.Type)&0xff == unix.NFT_MSG_GETGEN {
++		attrs, _ := netlink.MarshalAttributes([]netlink.Attribute{{Type: nftGenID, Data: binaryutil.BigEndian.PutUint32(generation)}})
++		return []netlink.Message{{Header: netlink.Header{Type: request.Header.Type - 1, Sequence: request.Header.Sequence, PID: request.Header.PID}, Data: append(extraHeader(0, 0), attrs...)}, ack(request, 0)}
++	}
++	return []netlink.Message{{Header: netlink.Header{Type: netlink.Done, Sequence: request.Header.Sequence, PID: request.Header.PID}, Data: make([]byte, 4)}}
++}
++
++func TestOwnedConsistentSnapshotUsesCompleteGeneration(t *testing.T) {
++	for _, change := range []bool{false, true} {
++		t.Run(fmt.Sprint(change), func(t *testing.T) {
++			c, tr, _ := testOwnedConn(t)
++			genReads := 0
++			tr.onSend = func(m []netlink.Message) [][]netlink.Message {
++				generation := uint32(0xfedcba98)
++				if int(m[0].Header.Type)&0xff == unix.NFT_MSG_GETGEN {
++					genReads++
++					if change && genReads == 2 {
++						generation++
++					}
++				}
++				return [][]netlink.Message{queryReplies(m[0], generation)}
++			}
++			snapshot, err := c.ReadConsistentTable(&Table{Name: "own", Family: TableFamilyINet})
++			if change {
++				if snapshot != nil || !errors.Is(err, ErrGenerationChanged) || c.owned.tainted {
++					t.Fatalf("generation mismatch claimed snapshot or corrupted socket: %+v %v", snapshot, err)
++				}
++			} else if err != nil || snapshot.Generation != 0xfedcba98 {
++				t.Fatalf("GENID lost bits: %+v %v", snapshot, err)
++			}
++			if len(tr.sent) != 6 {
++				t.Fatalf("missing before/dumps/after: %d", len(tr.sent))
++			}
++		})
++	}
++}
++
++func TestOwnedCorruptedObservationTaintsSocketWithoutReplay(t *testing.T) {
++	for _, fault := range []string{"genid-short", "genid-duplicate-zero", "wrong-type", "filtered-rule-parent", "filtered-set-parent", "malformed-family-table", "malformed-family-chain", "malformed-family-chain-hook", "dump-interrupted", "dump-missing-end", "dump-enobufs"} {
++		t.Run(fault, func(t *testing.T) {
++			c, tr, _ := testOwnedConn(t)
++			tr.onSend = func(m []netlink.Message) [][]netlink.Message {
++				request := m[0]
++				replies := queryReplies(request, 0xfedcba98)
++				if int(request.Header.Type)&0xff == unix.NFT_MSG_GETGEN {
++					switch fault {
++					case "genid-short":
++						replies[0].Data = []byte{0, 0, 0, 0, 1}
++					case "genid-duplicate-zero":
++						attrs, _ := netlink.MarshalAttributes([]netlink.Attribute{{Type: nftGenID, Data: make([]byte, 4)}, {Type: nftGenID, Data: binaryutil.BigEndian.PutUint32(7)}})
++						replies[0].Data = append(extraHeader(0, 0), attrs...)
++					case "wrong-type":
++						replies[0].Header.Type++
++					}
++				} else {
++					switch fault {
++					case "filtered-rule-parent":
++						if int(request.Header.Type)&0xff == unix.NFT_MSG_GETRULE {
++							replies = append([]netlink.Message{dumpObject(request, "foreign", "chain")}, replies...)
++						}
++					case "filtered-set-parent":
++						if int(request.Header.Type)&0xff == unix.NFT_MSG_GETSET {
++							replies = append([]netlink.Message{dumpObject(request, "foreign", "set")}, replies...)
++						}
++					case "malformed-family-table", "malformed-family-chain":
++						op := unix.NFT_MSG_GETTABLE
++						if fault == "malformed-family-chain" {
++							op = unix.NFT_MSG_GETCHAIN
++						}
++						if int(request.Header.Type)&0xff == op {
++							object := dumpObject(request, "foreign", "foreign-child")
++							object.Data = append(object.Data, 1)
++							replies = append([]netlink.Message{object}, replies...)
++						}
++					case "malformed-family-chain-hook":
++						if int(request.Header.Type)&0xff == unix.NFT_MSG_GETCHAIN {
++							object := dumpObject(request, "foreign", "foreign-child")
++							attrs, _ := netlink.MarshalAttributes([]netlink.Attribute{{Type: unix.NFTA_CHAIN_HOOK | unix.NLA_F_NESTED, Data: []byte{1}}})
++							object.Data = append(object.Data, attrs...)
++							replies = append([]netlink.Message{object}, replies...)
++						}
++					case "dump-interrupted":
++						replies[0].Header.Flags |= netlink.DumpInterrupted
++					case "dump-missing-end":
++						return nil
++					case "dump-enobufs":
++						tr.receiveErr = unix.ENOBUFS
++						return nil
++					}
++				}
++				return [][]netlink.Message{replies}
++			}
++			if snapshot, err := c.ReadConsistentTable(&Table{Name: "own", Family: TableFamilyINet}); snapshot != nil || !errors.Is(err, ErrUncertain) {
++				t.Fatalf("invalid snapshot accepted: %+v %v", snapshot, err)
++			}
++			attempts := len(tr.sent)
++			if _, err := c.Generation(); !errors.Is(err, ErrUncertain) {
++				t.Fatal("uncertain observation did not seal later query")
++			}
++			c.CreateTable(&Table{Name: "own", Family: TableFamilyINet})
++			if err := c.Flush(); !errors.Is(err, ErrUncertain) || len(tr.sent) != attempts {
++				t.Fatal("uncertain query replayed or permitted a later mutation")
++			}
++		})
++	}
++}
++
++func dumpObject(request netlink.Message, table, name string) netlink.Message {
++	attrs := []netlink.Attribute{{Type: 1, Data: []byte(table + "\x00")}}
++	switch int(request.Header.Type) & 0xff {
++	case unix.NFT_MSG_GETTABLE:
++		attrs = append(attrs, netlink.Attribute{Type: nftTableHandle, Data: binaryutil.BigEndian.PutUint64(101)})
++	case unix.NFT_MSG_GETCHAIN:
++		attrs = append(attrs, netlink.Attribute{Type: unix.NFTA_CHAIN_NAME, Data: []byte(name + "\x00")}, netlink.Attribute{Type: unix.NFTA_CHAIN_HANDLE, Data: binaryutil.BigEndian.PutUint64(201)})
++	case unix.NFT_MSG_GETRULE:
++		attrs = append(attrs, netlink.Attribute{Type: unix.NFTA_RULE_CHAIN, Data: []byte(name + "\x00")}, netlink.Attribute{Type: unix.NFTA_RULE_HANDLE, Data: binaryutil.BigEndian.PutUint64(301)})
++	case unix.NFT_MSG_GETSET:
++		attrs = append(attrs, netlink.Attribute{Type: unix.NFTA_SET_NAME, Data: []byte(name + "\x00")}, netlink.Attribute{Type: nftSetHandle, Data: binaryutil.BigEndian.PutUint64(401)})
++	}
++	data, _ := netlink.MarshalAttributes(attrs)
++	return netlink.Message{Header: netlink.Header{Type: request.Header.Type - 1, Flags: netlink.Multi, Sequence: request.Header.Sequence, PID: request.Header.PID}, Data: append(extraHeader(byte(TableFamilyINet), 0), data...)}
++}
++
++func TestOwnedFamilyDumpSelectsTargetAfterValidatingAllObjects(t *testing.T) {
++	for _, target := range []string{"own", ""} {
++		t.Run(target, func(t *testing.T) {
++			c, tr, _ := testOwnedConn(t)
++			tr.onSend = func(messages []netlink.Message) [][]netlink.Message {
++				request := messages[0]
++				replies := queryReplies(request, 0xfedcba98)
++				op := int(request.Header.Type) & 0xff
++				if op == unix.NFT_MSG_GETTABLE || op == unix.NFT_MSG_GETCHAIN {
++					if attrs, err := netlink.UnmarshalAttributes(request.Data[4:]); err != nil || len(attrs) != 0 {
++						t.Fatal("family-wide dump pretended to have a table filter")
++					}
++					replies = append([]netlink.Message{dumpObject(request, "own", "own-chain"), dumpObject(request, "coexisting", "foreign-chain")}, replies...)
++				}
++				return [][]netlink.Message{replies}
++			}
++			snapshot, err := c.readConsistent(TableFamilyINet, target)
++			if err != nil || c.owned.tainted || snapshot.Generation != 0xfedcba98 {
++				t.Fatalf("valid coexisting family dump poisoned transport: %+v %v", snapshot, err)
++			}
++			want := 1
++			if target == "" {
++				want = 2
++			}
++			if len(snapshot.Tables) != want || len(snapshot.Chains) != want || snapshot.Tables[0].Name != "own" || snapshot.Chains[0].Table.Name != "own" {
++				t.Fatalf("incorrect family selection: %+v", snapshot)
++			}
++			if _, err = c.Generation(); err != nil {
++				t.Fatal("valid family dump tainted next query")
++			}
++		})
++	}
++}
+diff --git a/set.go b/set.go
+index ddf27f7..9994e28 100644
+--- a/set.go
++++ b/set.go
+@@ -19,6 +19,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/mdlayher/netlink"
+@@ -245,6 +246,8 @@ func ConcatSetTypeElements(t SetDatatype) []SetDatatype {
+ // Set represents an nftables set. Anonymous sets are only valid within the
+ // context of a single batch.
+ type Set struct {
++	Handle     uint64
++	UserData   []byte
+ 	Table      *Table
+ 	ID         uint32
+ 	Name       string
+@@ -505,12 +508,11 @@ func (cc *Conn) AddSet(s *Set, vals []SetElement) error {
+ 	}
+ 
+ 	if s.ID == 0 {
+-		allocSetID++
+-		s.ID = allocSetID
++		s.ID = atomic.AddUint32(&allocSetID, 1)
+ 		if s.Anonymous {
+-			s.Name = "__set%d"
++			s.Name = fmt.Sprintf("__set%d", s.ID)
+ 			if s.IsMap {
+-				s.Name = "__map%d"
++				s.Name = fmt.Sprintf("__map%d", s.ID)
+ 			}
+ 		}
+ 	}
+@@ -622,7 +624,7 @@ func (cc *Conn) AddSet(s *Set, vals []SetElement) error {
+ 	}
+ 
+ 	// https://git.netfilter.org/libnftnl/tree/include/udata.h#n17
+-	var userData []byte
++	userData := append([]byte(nil), s.UserData...)
+ 
+ 	if s.KeyByteOrder == binaryutil.NativeEndian {
+ 		// Per https://git.netfilter.org/nftables/tree/src/mnl.c?id=187c6d01d35722618c2711bbc49262c286472c8f#n1165
+@@ -758,6 +760,10 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
+ 	var set Set
+ 	for ad.Next() {
+ 		switch ad.Type() {
++		case nftSetHandle:
++			set.Handle = ad.Uint64()
++		case unix.NFTA_SET_TABLE:
++			set.Table = &Table{Name: ad.String(), Family: TableFamily(msg.Data[0])}
+ 		case unix.NFTA_SET_NAME:
+ 			set.Name = ad.String()
+ 		case unix.NFTA_SET_ID:
+@@ -799,6 +805,7 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
+ 			set.DataType.Bytes = binary.BigEndian.Uint32(ad.Bytes())
+ 		case unix.NFTA_SET_USERDATA:
+ 			data := ad.Bytes()
++			set.UserData = append([]byte(nil), data...)
+ 			value, ok := userdata.GetUint32(data, userdata.NFTNL_UDATA_SET_MERGE_ELEMENTS)
+ 			set.AutoMerge = ok && value == 1
+ 		case unix.NFTA_SET_DESC:
+@@ -817,7 +824,7 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
+ 			}
+ 		}
+ 	}
+-	return &set, nil
++	return &set, ad.Err()
+ }
+ 
+ func parseSetDatatype(magic uint32) (SetDatatype, error) {
+diff --git a/table.go b/table.go
+index 8413a00..1ba1ae8 100644
+--- a/table.go
++++ b/table.go
+@@ -45,24 +45,32 @@ const (
+ // A Table contains Chains. See also
+ // https://wiki.nftables.org/wiki-nftables/index.php/Configuring_tables
+ type Table struct {
+-	Name   string // NFTA_TABLE_NAME
+-	Use    uint32 // NFTA_TABLE_USE (Number of chains in table)
+-	Flags  uint32 // NFTA_TABLE_FLAGS
+-	Family TableFamily
++	Name     string // NFTA_TABLE_NAME
++	Use      uint32 // NFTA_TABLE_USE (Number of chains in table)
++	Flags    uint32 // NFTA_TABLE_FLAGS
++	Family   TableFamily
++	Handle   uint64
++	Owner    uint32
++	UserData []byte
+ }
+ 
+ // DelTable deletes a specific table, along with all chains/rules it contains.
+-func (cc *Conn) DelTable(t *Table) {
++func (cc *Conn) DelTable(t *Table) { cc.delTable(t, 0) }
++
++func (cc *Conn) delTable(t *Table, flags netlink.HeaderFlags) {
+ 	cc.mu.Lock()
+ 	defer cc.mu.Unlock()
+ 	data := cc.marshalAttr([]netlink.Attribute{
+ 		{Type: unix.NFTA_TABLE_NAME, Data: []byte(t.Name + "\x00")},
+ 		{Type: unix.NFTA_TABLE_FLAGS, Data: binaryutil.BigEndian.PutUint32(t.Flags)},
+ 	})
++	if t.Handle != 0 {
++		data = append(data, cc.marshalAttr([]netlink.Attribute{{Type: nftTableHandle, Data: binaryutil.BigEndian.PutUint64(t.Handle)}})...)
++	}
+ 	cc.messages = append(cc.messages, netlink.Message{
+ 		Header: netlink.Header{
+ 			Type:  netlink.HeaderType((unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_DELTABLE),
+-			Flags: netlink.Request | netlink.Acknowledge,
++			Flags: netlink.Request | netlink.Acknowledge | flags,
+ 		},
+ 		Data: append(extraHeader(uint8(t.Family), 0), data...),
+ 	})
+@@ -75,6 +83,9 @@ func (cc *Conn) addTable(t *Table, flag netlink.HeaderFlags) *Table {
+ 		{Type: unix.NFTA_TABLE_NAME, Data: []byte(t.Name + "\x00")},
+ 		{Type: unix.NFTA_TABLE_FLAGS, Data: binaryutil.BigEndian.PutUint32(t.Flags)},
+ 	})
++	if len(t.UserData) != 0 {
++		data = append(data, cc.marshalAttr([]netlink.Attribute{{Type: nftTableUserdata, Data: t.UserData}})...)
++	}
+ 	cc.messages = append(cc.messages, netlink.Message{
+ 		Header: netlink.Header{
+ 			Type:  netlink.HeaderType((unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_NEWTABLE),
+@@ -94,7 +105,7 @@ func (cc *Conn) AddTable(t *Table) *Table {
+ // CreateTable create the specified Table if it do not existed.
+ // just like `nft create table ...`.
+ func (cc *Conn) CreateTable(t *Table) *Table {
+-	return cc.addTable(t, netlink.Excl)
++	return cc.addTable(t, netlink.Create|netlink.Excl)
+ }
+ 
+ // FlushTable removes all rules in all chains within the specified Table. See also
+@@ -202,6 +213,12 @@ func tableFromMsg(msg netlink.Message) (*Table, error) {
+ 
+ 	for ad.Next() {
+ 		switch ad.Type() {
++		case nftTableHandle:
++			t.Handle = ad.Uint64()
++		case nftTableOwner:
++			t.Owner = ad.Uint32()
++		case nftTableUserdata:
++			t.UserData = ad.Bytes()
+ 		case unix.NFTA_TABLE_NAME:
+ 			t.Name = ad.String()
+ 		case unix.NFTA_TABLE_USE:
+@@ -211,5 +228,5 @@ func tableFromMsg(msg netlink.Message) (*Table, error) {
+ 		}
+ 	}
+ 
+-	return &t, nil
++	return &t, ad.Err()
+ }

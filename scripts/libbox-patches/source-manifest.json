@@ -1,0 +1,103 @@
+{
+  "sourceCommit": "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
+  "goVersion": "1.25.5",
+  "gomobileVersion": "v0.1.13",
+  "ndkVersion": "30.0.16138531-beta3",
+  "javaMajor": 17,
+  "androidAPI": 24,
+  "buildTags": [
+    "with_quic",
+    "with_wireguard",
+    "with_utls",
+    "with_naive_outbound",
+    "with_clash_api",
+    "with_usbip",
+    "with_openvpn",
+    "with_openconnect",
+    "badlinkname",
+    "tfogo_checklinkname0",
+    "with_tailscale",
+    "ts_omit_logtail",
+    "ts_omit_ssh",
+    "ts_omit_drive",
+    "ts_omit_taildrop",
+    "ts_omit_webclient",
+    "ts_omit_doctor",
+    "ts_omit_capture",
+    "ts_omit_kube",
+    "ts_omit_aws",
+    "ts_omit_synology",
+    "ts_omit_bird"
+  ],
+  "abis": [
+    "arm64-v8a",
+    "armeabi-v7a",
+    "x86",
+    "x86_64"
+  ],
+  "minimumLoadAlignment": 16384,
+  "patches": [
+    {
+      "file": "transient-command-server.patch",
+      "sha256": "4e946ad8c9ef5925849103c519f358da860eaf2c162631aa6f2c70cb6e49101b"
+    },
+    {
+      "file": "android-interface-binding.patch",
+      "sha256": "ca12eef0f94fb4592b4653dabf903711c52bdb8d14658ab6163534eb5098b879"
+    },
+    {
+      "file": "stopped-speed-strict-cleanup.patch",
+      "sha256": "af5a0dc89dbcd0c7cd9e4d055b8565cd39c1a9cef51a7b89e45896150755e474"
+    },
+    {
+      "file": "api-service-close.patch",
+      "sha256": "3995ffaaa387ade7058826387733b6a7bd5252c5640810f7e65b15bebbf6e9cc"
+    },
+    {
+      "file": "clashmode-hot-switch.patch",
+      "sha256": "e65b52666212ab142f310decde3369258827d9b36520922acf03a74313a82994"
+    },
+    {
+      "file": "construction-validation.patch",
+      "sha256": "f699001b797fdc473f20ad8738ee674f7244371ed34e383367b3cfa33bad7ec5"
+    },
+    {
+      "file": "dns-cancellation-lifecycle.patch",
+      "sha256": "0450a210c36ba27189ec1af47d17d738a2a4241b712f90b54e94efb147469c74"
+    },
+    {
+      "file": "default-monitor-isolation.patch",
+      "sha256": "2643792f83bda6a2a3a812dc9e644c0517c4398d7a20dce90cb5920a0c1e91ea"
+    },
+    {
+      "file": "tun-owner-consumer.patch",
+      "sha256": "8cbf14aa99dae00d246f009fe24b8ce52d04d273b31e8df8dda3c3f753bd000e"
+    }
+  ],
+  "ndkSelectionReason": "NDK 27.3.13750724 arm64 linker rejects the pinned Cronet static archive with unknown relocation (315); cached NDK 30 preserves upstream dependencies and all feature tags.",
+  "ndkDirectory": "30.0.16138531",
+  "dependencyPatches": [
+    {
+      "name": "sing-tun",
+      "module": "github.com/sagernet/sing-tun",
+      "sourceURL": "https://github.com/SagerNet/sing-tun.git",
+      "upstreamVersion": "v0.9.6-0.20260924073434-3077c705bbdb",
+      "upstreamCommit": "3077c705bbdb0c86f316a15d75f04766a022c84d",
+      "patchFile": "sing-tun-owned-native.patch",
+      "patchSha256": "4978d0b3a187167cca7e06b7cd9b0420f4a47f16ab379b1981ebbba40d043af0",
+      "patchedTree": "9b7e18f9a2207bb398fbd8a0e7359c8a72c5f913",
+      "candidateCommit": "3ec1612ca69760f16df5aa2cac64e0dfa766e76f"
+    },
+    {
+      "name": "nftables",
+      "module": "github.com/sagernet/nftables",
+      "sourceURL": "https://github.com/SagerNet/nftables.git",
+      "upstreamVersion": "v0.3.0-mod.4",
+      "upstreamCommit": "55b467739faeff10b431fbc060cba7c5222c85cf",
+      "patchFile": "nftables-owned-transactions.patch",
+      "patchSha256": "c9d0f4cdf6c1d548eb88a6a38b1e6cdf4c0f1935d4e73712dab874f865833d42",
+      "patchedTree": "3b777c8b9fb68fac4be9fa67a343f61331ade759",
+      "candidateCommit": "4a74248aedcaa30129bbc1ef991c35db8e25fdaf"
+    }
+  ]
+}

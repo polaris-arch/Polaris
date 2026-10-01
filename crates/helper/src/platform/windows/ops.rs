@@ -1,0 +1,810 @@
+//! 系统操作 trait 抽象（移植自 `helper-win/winproc.go` 的全部副作用原语）。
+//!
+//! ## 为什么 trait
+//!
+//! Go 源 `winproc.go` 全是直接 syscall（`windows.OpenProcess` / `CreateToolhelp32Snapshot` /
+//! `TerminateProcess` / `GetExtendedTcpTable` / 注册表写）—— 在 Linux CI 上无法编译，更无法单测。
+//! 本模块把这些副作用原语抽象为 trait，让 [`crate::platform::windows::helper`] 的协议分派逻辑能脱离真实 Windows 测试：
+//! - 生产实现：[`crate::platform::windows::winproc::WinProcOps`]（`#[cfg(windows)]`，真实 FFI）。
+//! - 测试 mock：本模块的 [`MockProcOps`]（纯内存，Linux 上跑）。
+//!
+//! ## trait 边界
+//!
+//! 每个 trait 方法对应一个 Go `winproc.go` 函数，签名镜像其语义（返回值、best-effort 语义）。错误处理对齐 Go：
+//! 大多是 best-effort（失败不阻断主流程），trait 方法返回 `Result` 但调用方据场景决定是否忽略。
+
+use crate::platform::windows::coreacl::ObjectSecurity;
+use crate::platform::windows::logic::{self, ListenEntry};
+use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartTiming};
+
+/// Windows helper 已创建的核心及其关键路径耗时。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreStart {
+    pub pid: u32,
+    pub timing: StartTiming,
+    /// 进程创建时间（`GetProcessTimes`，100ns tick）。读不到 → `None`（协议侧不发该 token）。
+    pub created: Option<u64>,
+}
+
+/// Native wait outcome for a still-custodied process object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeChildPoll {
+    Running,
+    Exited,
+    Unknown,
+}
+
+/// 受管核的进程身份（D2/D3）：从 helper **持有的进程句柄**读出的两个事实。
+///
+/// 两个字段各自可缺（FFI 读失败）—— 缺就是 `None`，绝不填一个猜的值：下游据此判「不可观测」，
+/// 而一个编造的值会被当成事实去比对，把读失败变成假崩溃 / 假自证。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedIdentity {
+    /// 进程创建时间（100ns tick）。同一 pid 被复用时必变 ⇒ 崩溃监测的身份判据。
+    pub created: Option<u64>,
+    /// 实跑二进制全路径（`QueryFullProcessImageNameW`）⇒ 内核自证的事实来源。
+    pub image: Option<String>,
+}
+
+/// 进程操作抽象（对应 `winproc.go` 的进程/Job/freeport-kill/singbox-spawn/旁路 spawn 原语）。
+///
+/// 生产实现见 [`crate::platform::windows::winproc::WinProcOps`]。所有方法对齐 Go 源的 best-effort 语义。
+pub trait ProcOps: Send + Sync {
+    /// 判 ppid 是否存活（`winproc.go:123-143` `processAlive`）。
+    ///
+    /// 「确定已死」返回 `false`；不确定（句柄打开失败等非「确定已死」）按 Go「宁漏勿误」返回 `true`。
+    fn process_alive(&self, ppid: u32) -> bool;
+
+    /// 硬杀指定 pid（`winproc.go:146-153` `terminatePid`）。
+    ///
+    /// 成功返回 `Ok(())`；pid 不存在/无权限 → `Err`（调用方按场景忽略或回报）。
+    fn terminate_pid(&self, pid: u32) -> std::io::Result<()>;
+
+    /// 取 pid 的可执行映像全路径（`winproc.go:157-169` `processImageName`）。失败返回空串。
+    ///
+    /// 仅映像路径、不含命令行参数（镜像 macOS `ps -o comm=`），避免「参数里碰巧含 sing-box」被误判。
+    fn process_image_name(&self, pid: u32) -> String;
+
+    /// 杀所有运行中的「锁定 singbox」实例（`winproc.go:184-214` `killAllSingbox`）。
+    ///
+    /// 按映像全路径大小写不敏感匹配 `singbox_bin` → TerminateProcess。返回杀掉的实例数。
+    fn kill_all_singbox(&self, singbox_bin: &str) -> usize;
+
+    /// 启动 sing-box 子进程（`winproc.go:21-49` `startSingbox`）。
+    ///
+    /// 返回子进程 pid 与 helper 内部阶段耗时（Go 返回 `*exec.Cmd`，本 trait 只需 pid + 可终止语义）。
+    /// `log_path` 非空 → 子进程 stdout/stderr 经 shared 有界 writer 写入两代文件（早期启动诊断）。
+    /// `fwd`（allowLan）= true → 启动前 best-effort 开 IP 转发（`enableIPForwarding`）。
+    fn start_singbox(
+        &self,
+        singbox_bin: &str,
+        cfg: &str,
+        log_path: &str,
+        fwd: bool,
+    ) -> std::io::Result<CoreStart>;
+
+    /// Mint an OS-random birth before spawning or changing forwarding.
+    fn mint_native_birth(&self) -> std::io::Result<HelperBirthToken> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native birth unsupported",
+        ))
+    }
+    /// Publish the same owned process HANDLE and birth before returning.
+    fn start_native_singbox(
+        &self,
+        _bin: &str,
+        _cfg: &str,
+        _log: &str,
+        _fwd: bool,
+        _birth: HelperBirthToken,
+    ) -> std::io::Result<CoreStart> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native start unsupported",
+        ))
+    }
+    /// Poll only the exact retained HANDLE. No numeric PID fallback is allowed.
+    fn poll_native_child(&self, _target: HelperBirthTarget) -> NativeChildPoll {
+        NativeChildPoll::Unknown
+    }
+    /// Termination ACK is insufficient; success requires a native HANDLE wait.
+    fn stop_native_child(&self, _target: HelperBirthTarget) -> NativeChildPoll {
+        NativeChildPoll::Unknown
+    }
+    /// Retire only an exact native object whose exit was successfully cached.
+    fn retire_native_child(&self, _target: HelperBirthTarget) -> bool {
+        false
+    }
+
+    /// Confirm that no owned native object or unconfirmed logger tail remains.
+    /// A missing implementation or poisoned custody cannot attest an empty registry.
+    fn native_custody_empty(&self) -> bool {
+        false
+    }
+
+    /// 优雅停信号 → 等宽限 → 硬杀（`helper.go:111-123` `terminateChild` 的等价物）。
+    ///
+    /// Go 源：`sendCtrlBreak(pid)` → `select { done | 2s timeout }` → `Process.Kill`。
+    /// session-0 无 console → CTRL_BREAK 是 no-op → 硬杀是预期收割手段。
+    /// 本方法封装「对指定 pid 的收割序列」，宽限窗口由实现决定（生产 = 2s，测试可缩短）。
+    fn reap_child(&self, pid: u32);
+
+    /// 派生自卸载旁路 cmd（`winproc.go:233-245` `spawnSelfUninstall`）。
+    ///
+    /// best-effort：失败只记日志（Go `_ = c.Start()`）。旁路须比 helper 活得久（DETACHED_PROCESS、
+    /// 不 assignToJob、继承 SYSTEM token）。
+    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str);
+
+    /// 受管核的进程身份（D2/D3）：`pid` 是当前受管核时返回其 created/image，否则全 `None`。
+    ///
+    /// **取材来自 helper 持有的进程句柄**，不是 `OpenProcess(pid)` —— 句柄在手时 PID 不会被系统
+    /// 复用，读到的必是同一个进程；按 pid 现开句柄则可能读到复用者，那正是本条要消除的假象。
+    fn managed_identity(&self, pid: u32) -> ManagedIdentity;
+
+    /// 以 SYSTEM 刷系统 DNS 缓存（D4）：跑 `ipconfig /flushdns`。
+    ///
+    /// 成功 `Ok(())`；失败 `Err(<合并 stdout+stderr 的诊断串>)` —— ipconfig 把错误文字写在 stdout，
+    /// 故本腿局部自捕两条流（判据见 [`logic::flush_dns_result`]），不改共用 exec 的全局错误格式。
+    fn flush_dns(&self) -> Result<(), String>;
+
+    /// 开 IP 转发（`winproc.go:414-427` `enableIPForwarding`）。
+    ///
+    /// IPv4：注册表 `IPEnableRouter=1`（持久写入，stop/卸载不还原 —— 已知限制，镜像 Go 现状）。
+    /// IPv6：`netsh interface ipv6 set global forwarding=enabled`（运行时开关）。
+    /// best-effort，失败不阻塞 start。
+    fn enable_ip_forwarding(&self);
+
+    /// route-add / route-del 执行（`helper.go:222-240`）：对单个已校验 CIDR 跑
+    /// `netsh interface <ipv4|ipv6> add|delete route prefix=<cidr> interface=<iface> store=active`。
+    ///
+    /// `del`=false → add，true → delete。地址族由 `cidr` 是否含 `:` 决定（Go 同款）。best-effort
+    /// （Go `_ = exec.Command(...).Run()`，失败不阻断）。调用方（helper 分派层）已过 iface 白名单 + CIDR 校验。
+    fn apply_route(&self, iface: &str, cidr: &str, del: bool);
+
+    /// 阻塞式收割（`helper.go:400-410` `reapChildOnExit` → 同步 `terminateChild`）。
+    ///
+    /// 与 [`reap_child`](ProcOps::reap_child) 的区别：本方法**同步**跑完收割序列（优雅信号→宽限→硬杀）
+    /// 再返回 —— 供服务停止/关机路径用（进程即将退出，须在返回前确保 child 已被杀，杜绝孤儿）。
+    /// 命令路径（stop/cleanup/uninstall）用异步 [`reap_child`](ProcOps::reap_child)（快回复，不阻塞管道）。
+    fn reap_child_blocking(&self, pid: u32);
+
+    /// 读一个文件系统对象的 owner + DACL（P4 ACL 自检的**搬运**腿，spec §3.4）。
+    ///
+    /// **只搬运，不判断** —— 判据由纯函数 [`crate::platform::windows::coreacl`] 持有（它无 cfg、
+    /// 在 Linux 上逐形态单测）。本方法的全部职责是把 `GetNamedSecurityInfoW` 读到的 owner SID 与
+    /// 逐条 ACE 转成纯数据。
+    ///
+    /// `Err(<诊断串>)` = **读不到这个对象**（对象不存在 / 无权限），**不是**「读到被放宽」：
+    /// 两者在起核路径上的处置刻意不同（Q9：读不到 → warn 继续；读到放宽 → 拒起核）。
+    ///
+    /// 安全描述符拿到手之后的任何逐格失败（SID 转串、`GetAclInformation`、`GetAce`）**不得**折进
+    /// `Err` —— 那是「这一格判不了」，折过去会让一条判不出的 ACE 把同对象上另一条真放宽的 ACE
+    /// 一起变成 warn。它们各落一条 [`coreacl::AceKind::Unparsed`] 哨兵，由判据侧失败向关。
+    ///
+    /// [`coreacl::AceKind::Unparsed`]: crate::platform::windows::coreacl::AceKind::Unparsed
+    fn read_object_security(&self, path: &str) -> Result<ObjectSecurity, String>;
+
+    /// 列一个目录的**实际条目名**（P4 ACL 自检取材面的枚举腿，spec §3.4）。
+    ///
+    /// **只搬运，不判断**：返回条目名（不含路径），由调用方拼成全路径喂
+    /// [`crate::platform::windows::coreacl::judge_object`]。没有它，取材面就是硬编码的两个白名单
+    /// 文件名，攻击者预创建的第三个文件（带去继承的 `Users:(F)` DACL，安装脚本的 `/inheritance:r`
+    /// 传播按定义跳过它）永远不会被问到。
+    ///
+    /// `Err(<诊断串>)` = **列不出来**（目录不存在 / 无权限），按 Q9 走读不到腿（warn 继续）——
+    /// 与 [`read_object_security`](ProcOps::read_object_security) 同一处置。
+    fn list_dir_names(&self, dir: &str) -> Result<Vec<String>, String>;
+
+    /// 启动父死看护线程（`helper.go:131-159` `watchParent` + `helper.go:387-388` 的 `go watchParent`）。
+    ///
+    /// 每秒探测父 app（`ppid`）存活；父死且 `is_current(child_pid)` 仍为真 → `on_parent_dead(child_pid)`
+    /// 收割 child。退出条件（防线程泄漏）：`is_current` 返 false（child 已被 stop/cleanup/新 start 摘除）
+    /// 或父死收割完成。生产侧起后台线程（`&self` 不被线程捕获，用无状态 pid FFI）；mock 单次评估
+    /// （测试双，无线程/sleep）。**调用方须在释放 child 锁后调用**（闭包会重入 child 锁）。
+    fn spawn_watch_parent(
+        &self,
+        ppid: u32,
+        child_pid: u32,
+        is_current: Box<dyn Fn(u32) -> bool + Send>,
+        on_parent_dead: Box<dyn Fn(u32) + Send>,
+    );
+}
+
+/// 网络表操作抽象（对应 `winproc.go:300-406` `listenPidsForPort` 的 `GetExtendedTcpTable`）。
+///
+/// 生产实现见 [`crate::platform::windows::winproc::WinProcOps`]。把「枚举 LISTEN 持有者」与「Windows 字节布局」解耦：
+/// 生产侧调 `GetExtendedTcpTable` 解析 IPv4+IPv6 表为 [`ListenEntry`] 列表；测试 mock 直接构造。
+pub trait NetTableOps: Send + Sync {
+    /// 返回所有 LISTEN 持有者（IPv4 + IPv6 合并，去重，port 为网络序→主机序已转换）。
+    ///
+    /// 镜像 macOS `lsof -ti tcp:<port> -sTCP:LISTEN`：仅 LISTEN 持有者，不含 ESTABLISHED 连接方。
+    /// Go 源 `collect` 闭包已在此把 state==LISTEN 过滤 + 网络序 port 转 host 序。
+    fn list_listen_entries(&self) -> std::io::Result<Vec<ListenEntry>>;
+
+    /// 便利：返回在 `port` 上 LISTEN 的去重 pid 列表（`winproc.go:302-406` `listenPidsForPort`）。
+    ///
+    /// 默认实现基于 [`list_listen_entries`](NetTableOps::list_listen_entries) + [`logic::filter_listen_pids`]，
+    /// 生产侧与测试 mock 共用同一过滤逻辑。
+    fn listen_pids_for_port(&self, port: u16) -> std::io::Result<Vec<u32>> {
+        let entries = self.list_listen_entries()?;
+        Ok(logic::filter_listen_pids(&entries, port))
+    }
+}
+
+// ===== 测试 mock =====
+
+/// mock 共享内部状态（Arc 后，使 [`MockProcOps`] 可 clone 共享同一计数器）。
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct MockProcOpsInner {
+    native_target: std::sync::Mutex<Option<HelperBirthTarget>>,
+    native_exited: std::sync::atomic::AtomicBool,
+    native_poll: std::sync::Mutex<Option<NativeChildPoll>>,
+    native_stop: std::sync::Mutex<Option<NativeChildPoll>>,
+    native_stop_calls: std::sync::atomic::AtomicUsize,
+    native_retire_allowed: std::sync::atomic::AtomicBool,
+    native_start_pause:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    birth_count: std::sync::atomic::AtomicU32,
+    /// `start_singbox` 累计调用次数。
+    pub start_calls: std::sync::atomic::AtomicUsize,
+    /// `start_singbox` 下一次返回的 pid（递增，模拟每次新起子进程）。
+    pub next_pid: std::sync::atomic::AtomicU32,
+    /// `kill_all_singbox` 上次返回的杀掉数。
+    pub kill_all_return: std::sync::atomic::AtomicUsize,
+    /// `terminate_pid` 累计调用次数。
+    pub terminate_calls: std::sync::atomic::AtomicUsize,
+    /// `reap_child` 累计调用次数。
+    pub reap_calls: std::sync::atomic::AtomicUsize,
+    /// `spawn_self_uninstall` 累计调用次数。
+    pub spawn_uninstall_calls: std::sync::atomic::AtomicUsize,
+    /// `enable_ip_forwarding` 累计调用次数。
+    pub ip_forward_calls: std::sync::atomic::AtomicUsize,
+    /// `process_alive` 返回值（默认 true=存活，宁漏勿误）。
+    pub alive_return: std::sync::atomic::AtomicBool,
+    /// `process_image_name` 的 pid → 映像路径映射（freeport 测试用）。
+    pub images: std::sync::Mutex<std::collections::HashMap<u32, String>>,
+    /// `start_singbox` 失败时返回此错误（模拟启动失败 → `ERR start`）。
+    pub start_error: std::sync::Mutex<Option<std::io::Error>>,
+    /// 最近一次 `reap_child` 的 pid（断言用）。
+    pub last_reaped_pid: std::sync::atomic::AtomicU32,
+    /// 最近一次 `spawn_self_uninstall` 的参数（断言用）。
+    pub last_spawn_args: std::sync::Mutex<Option<(String, String)>>,
+    /// `apply_route` 累计调用次数（W9 netsh route 断言用）。
+    pub route_calls: std::sync::atomic::AtomicUsize,
+    /// 最近一次 `apply_route` 的参数（iface, cidr, del）（断言用）。
+    pub last_route: std::sync::Mutex<Option<(String, String, bool)>>,
+    /// `spawn_watch_parent` 累计调用次数（W15 看护接线断言用）。
+    pub watch_parent_calls: std::sync::atomic::AtomicUsize,
+    /// `flush_dns` 累计调用次数（D4 断言用）。
+    pub flush_dns_calls: std::sync::atomic::AtomicUsize,
+    /// 预设的受管核身份（D2/D3）：`start_singbox` 起核后归属于新 pid。
+    pub identity: std::sync::Mutex<ManagedIdentity>,
+    /// 最近一次 `start_singbox` 返回的 pid（身份按 pid 归属，镜像生产的「只认手里那个」）。
+    pub last_started_pid: std::sync::atomic::AtomicU32,
+    /// `flush_dns` 预设失败串（`None` = 成功）。
+    pub flush_dns_error: std::sync::Mutex<Option<String>>,
+    /// 最近一次 `spawn_watch_parent` 的 (ppid, child_pid)（断言用）。
+    pub last_watch_args: std::sync::Mutex<Option<(u32, u32)>>,
+    /// `read_object_security` 的**逐路径**预设结果（P4 ACL 自检）。未预设的路径走
+    /// `acl_default`（= spec §3.4 的目标态），故既有 start 测试无需改预设即照常通过。
+    pub acl_results:
+        std::sync::Mutex<std::collections::HashMap<String, Result<ObjectSecurity, String>>>,
+    /// `read_object_security` 的兜底结果（`None` = 用目标态夹具）。
+    pub acl_default: std::sync::Mutex<Option<Result<ObjectSecurity, String>>>,
+    /// `read_object_security` 被查过的路径（**按调用顺序**）。
+    ///
+    /// 「自检根本没被调用」这个 bug 在「默认预设 = 通过」下是**不可见**的 —— 这份记录是唯一
+    /// 能把它照出来的东西（见 `start_consults_the_acl_self_check_on_the_exec_dir`）。
+    pub acl_queries: std::sync::Mutex<Vec<String>>,
+    /// `list_dir_names` 的**逐目录**预设结果（P4 ACL 自检的枚举腿）。未预设的目录返回空表
+    /// （= 目录里只有白名单那两个名字，取材面退化成兜底），故既有测试无需改预设。
+    pub dir_entries:
+        std::sync::Mutex<std::collections::HashMap<String, Result<Vec<String>, String>>>,
+}
+
+/// 内存 mock 的 [`ProcOps`]（测试用）。
+///
+/// 记录所有调用供断言；行为可预设（start 返回的 pid、process_alive 的存活判定等）。
+///
+/// `Clone` 共享底层计数器（`Arc`）—— 测试可 `clone()` 一份传进 helper，原件保留读计数（helper take ownership
+/// 后仍可经 clone 读到更新）。
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct MockProcOps {
+    inner: std::sync::Arc<MockProcOpsInner>,
+}
+
+#[cfg(test)]
+impl MockProcOps {
+    /// 构造默认 mock（alive=true、next_pid=1000、images 空）。
+    #[must_use]
+    pub fn new() -> Self {
+        let inner = MockProcOpsInner {
+            next_pid: std::sync::atomic::AtomicU32::new(1000),
+            alive_return: std::sync::atomic::AtomicBool::new(true),
+            native_retire_allowed: std::sync::atomic::AtomicBool::new(true),
+            ..MockProcOpsInner::default()
+        };
+        Self {
+            inner: std::sync::Arc::new(inner),
+        }
+    }
+
+    pub fn set_native_poll(&self, poll: NativeChildPoll) {
+        *self.inner.native_poll.lock().unwrap() = Some(poll);
+    }
+    pub fn set_native_stop(&self, poll: NativeChildPoll) {
+        *self.inner.native_stop.lock().unwrap() = Some(poll);
+    }
+    pub fn set_native_retire_allowed(&self, allowed: bool) {
+        self.inner
+            .native_retire_allowed
+            .store(allowed, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn native_stop_calls(&self) -> usize {
+        self.inner
+            .native_stop_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn pause_native_publication(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.native_start_pause.lock().unwrap() = Some((entered, resume));
+    }
+
+    /// 预设 pid → 映像路径（freeport 测试用）。
+    pub fn set_image(&self, pid: u32, image: &str) {
+        self.inner
+            .images
+            .lock()
+            .unwrap()
+            .insert(pid, image.to_owned());
+    }
+
+    /// 预设 `start_singbox` 失败（模拟 `ERR start`）。
+    pub fn set_start_error(&self, e: std::io::Error) {
+        *self.inner.start_error.lock().unwrap() = Some(e);
+    }
+
+    /// 预设 `process_alive` 返回值（父死看护测试用；false = 模拟父已死）。
+    pub fn set_alive(&self, v: bool) {
+        self.inner
+            .alive_return
+            .store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 最近一次 `apply_route` 的参数（iface, cidr, del）（测试断言）。
+    #[must_use]
+    pub fn last_route(&self) -> Option<(String, String, bool)> {
+        self.inner.last_route.lock().unwrap().clone()
+    }
+
+    /// 最近一次 `spawn_watch_parent` 的 (ppid, child_pid)（测试断言）。
+    #[must_use]
+    pub fn last_watch_args(&self) -> Option<(u32, u32)> {
+        *self.inner.last_watch_args.lock().unwrap()
+    }
+
+    /// 取调用计数快照（测试断言用）。
+    #[must_use]
+    pub fn snapshot(&self) -> MockSnapshot {
+        use std::sync::atomic::Ordering;
+        MockSnapshot {
+            start_calls: self.inner.start_calls.load(Ordering::SeqCst),
+            kill_all_return: self.inner.kill_all_return.load(Ordering::SeqCst),
+            terminate_calls: self.inner.terminate_calls.load(Ordering::SeqCst),
+            reap_calls: self.inner.reap_calls.load(Ordering::SeqCst),
+            spawn_uninstall_calls: self.inner.spawn_uninstall_calls.load(Ordering::SeqCst),
+            ip_forward_calls: self.inner.ip_forward_calls.load(Ordering::SeqCst),
+            route_calls: self.inner.route_calls.load(Ordering::SeqCst),
+            watch_parent_calls: self.inner.watch_parent_calls.load(Ordering::SeqCst),
+        }
+    }
+
+    /// 最近一次 `reap_child` 的 pid（测试断言）。
+    #[must_use]
+    pub fn last_reaped_pid(&self) -> u32 {
+        self.inner
+            .last_reaped_pid
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 最近一次 `spawn_self_uninstall` 的参数（测试断言）。
+    #[must_use]
+    pub fn last_spawn_args(&self) -> Option<(String, String)> {
+        self.inner.last_spawn_args.lock().unwrap().clone()
+    }
+
+    /// 预设受管核身份（D2/D3；`start_singbox` 之后按新 pid 生效）。
+    pub fn set_identity(&self, created: Option<u64>, image: Option<&str>) {
+        *self.inner.identity.lock().unwrap() = ManagedIdentity {
+            created,
+            image: image.map(ToOwned::to_owned),
+        };
+    }
+
+    /// 预设 `flush_dns` 失败（模拟 ipconfig 非零退出；串即 helper 侧自捕的 stdout+stderr）。
+    pub fn set_flush_dns_error(&self, detail: &str) {
+        *self.inner.flush_dns_error.lock().unwrap() = Some(detail.to_owned());
+    }
+
+    /// `flush_dns` 累计调用次数（测试断言）。
+    #[must_use]
+    pub fn flush_dns_calls(&self) -> usize {
+        self.inner
+            .flush_dns_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 预设某个路径的 `read_object_security` 结果（P4 ACL 自检）。
+    pub fn set_acl(&self, path: &str, result: Result<ObjectSecurity, String>) {
+        self.inner
+            .acl_results
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), result);
+    }
+
+    /// 预设 `read_object_security` 的兜底结果（覆盖所有未单独预设的路径）。
+    pub fn set_acl_default(&self, result: Result<ObjectSecurity, String>) {
+        *self.inner.acl_default.lock().unwrap() = Some(result);
+    }
+
+    /// `read_object_security` 被查过的路径（按调用顺序；测试断言自检确实在生产路径上跑过）。
+    #[must_use]
+    pub fn acl_queries(&self) -> Vec<String> {
+        self.inner.acl_queries.lock().unwrap().clone()
+    }
+
+    /// 预设某个目录的 `list_dir_names` 结果（P4 ACL 自检的枚举腿）。
+    pub fn set_dir_entries(&self, dir: &str, result: Result<Vec<String>, String>) {
+        self.inner
+            .dir_entries
+            .lock()
+            .unwrap()
+            .insert(dir.to_owned(), result);
+    }
+
+    /// 预设 `kill_all_singbox` 返回的杀掉数。
+    pub fn set_kill_all_return(&self, n: usize) {
+        self.inner
+            .kill_all_return
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// mock 调用计数快照。
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MockSnapshot {
+    pub start_calls: usize,
+    pub kill_all_return: usize,
+    pub terminate_calls: usize,
+    pub reap_calls: usize,
+    pub spawn_uninstall_calls: usize,
+    pub ip_forward_calls: usize,
+    pub route_calls: usize,
+    pub watch_parent_calls: usize,
+}
+
+#[cfg(test)]
+impl ProcOps for MockProcOps {
+    fn process_alive(&self, _ppid: u32) -> bool {
+        // 宁漏勿误：默认 true（存活），测试父死看护时设 false
+        self.inner
+            .alive_return
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn terminate_pid(&self, _pid: u32) -> std::io::Result<()> {
+        self.inner
+            .terminate_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn process_image_name(&self, pid: u32) -> String {
+        self.inner
+            .images
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn kill_all_singbox(&self, _singbox_bin: &str) -> usize {
+        self.inner
+            .kill_all_return
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn start_singbox(
+        &self,
+        _singbox_bin: &str,
+        _cfg: &str,
+        _log_path: &str,
+        fwd: bool,
+    ) -> std::io::Result<CoreStart> {
+        self.inner
+            .start_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if fwd {
+            // 模拟生产：fwd=true 会调 enable_ip_forwarding（Go: if fwd=="1" { enableIPForwarding() }）
+            self.enable_ip_forwarding();
+        }
+        if let Some(e) = self.inner.start_error.lock().unwrap().take() {
+            return Err(e);
+        }
+        let pid = self
+            .inner
+            .next_pid
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // 生产侧 created 与 status 的 created 同源（同一个句柄读一次、缓存起来）——mock 照此归属，
+        // 否则两条腿能各自返回不同的值，测试就再也发现不了「start 与 status 报的不是同一个进程」。
+        self.inner
+            .last_started_pid
+            .store(pid, std::sync::atomic::Ordering::SeqCst);
+        Ok(CoreStart {
+            pid,
+            timing: StartTiming {
+                forwarding_ms: 0,
+                process_ms: 0,
+                job_ms: 0,
+                log_handoff_ms: 0,
+                total_ms: 0,
+            },
+            created: self.inner.identity.lock().unwrap().created,
+        })
+    }
+
+    fn mint_native_birth(&self) -> std::io::Result<HelperBirthToken> {
+        let number = self
+            .inner
+            .birth_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&number.to_be_bytes());
+        Ok(HelperBirthToken::from_bytes(bytes))
+    }
+    fn start_native_singbox(
+        &self,
+        bin: &str,
+        cfg: &str,
+        log: &str,
+        fwd: bool,
+        birth: HelperBirthToken,
+    ) -> std::io::Result<CoreStart> {
+        assert!(
+            self.inner.native_target.lock().unwrap().is_none(),
+            "mock owned object cannot be overwritten"
+        );
+        let start = self.start_singbox(bin, cfg, log, fwd)?;
+        *self.inner.native_target.lock().unwrap() = Some(HelperBirthTarget {
+            pid: std::num::NonZeroU32::new(start.pid).unwrap(),
+            birth,
+        });
+        self.inner
+            .native_exited
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some((entered, resume)) = self.inner.native_start_pause.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+        Ok(start)
+    }
+    fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+        if *self.inner.native_target.lock().unwrap() != Some(target) {
+            return NativeChildPoll::Unknown;
+        }
+        if self
+            .inner
+            .native_exited
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return NativeChildPoll::Exited;
+        }
+        let poll = self
+            .inner
+            .native_poll
+            .lock()
+            .unwrap()
+            .unwrap_or(NativeChildPoll::Running);
+        if poll == NativeChildPoll::Exited {
+            self.inner
+                .native_exited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        poll
+    }
+    fn stop_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+        if *self.inner.native_target.lock().unwrap() != Some(target) {
+            return NativeChildPoll::Unknown;
+        }
+        self.inner
+            .native_stop_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let poll = self
+            .inner
+            .native_stop
+            .lock()
+            .unwrap()
+            .unwrap_or(NativeChildPoll::Exited);
+        if poll == NativeChildPoll::Exited {
+            self.inner
+                .native_exited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        poll
+    }
+    fn retire_native_child(&self, target: HelperBirthTarget) -> bool {
+        let mut current = self.inner.native_target.lock().unwrap();
+        if *current != Some(target)
+            || !self
+                .inner
+                .native_retire_allowed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            || !self
+                .inner
+                .native_exited
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        *current = None;
+        true
+    }
+
+    fn native_custody_empty(&self) -> bool {
+        self.inner
+            .native_target
+            .lock()
+            .is_ok_and(|current| current.is_none())
+    }
+
+    fn managed_identity(&self, pid: u32) -> ManagedIdentity {
+        // 只认「手里那个」：pid 不是最近起的受管核 → 全 None（镜像生产的句柄归属判据）。
+        if pid
+            != self
+                .inner
+                .last_started_pid
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return ManagedIdentity::default();
+        }
+        self.inner.identity.lock().unwrap().clone()
+    }
+
+    fn reap_child(&self, pid: u32) {
+        self.inner
+            .reap_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .last_reaped_pid
+            .store(pid, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str) {
+        self.inner
+            .spawn_uninstall_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.inner.last_spawn_args.lock().unwrap() =
+            Some((service_name.to_owned(), support_dir.to_owned()));
+    }
+
+    fn enable_ip_forwarding(&self) {
+        self.inner
+            .ip_forward_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn flush_dns(&self) -> Result<(), String> {
+        self.inner
+            .flush_dns_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.inner.flush_dns_error.lock().unwrap().clone() {
+            Some(detail) => Err(detail),
+            None => Ok(()),
+        }
+    }
+
+    fn apply_route(&self, iface: &str, cidr: &str, del: bool) {
+        self.inner
+            .route_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.inner.last_route.lock().unwrap() = Some((iface.to_owned(), cidr.to_owned(), del));
+    }
+
+    fn reap_child_blocking(&self, pid: u32) {
+        // mock 里同步收割与异步 reap_child 等价记账（都计入 reap_calls）。
+        self.inner
+            .reap_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .last_reaped_pid
+            .store(pid, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn read_object_security(&self, path: &str) -> Result<ObjectSecurity, String> {
+        self.inner.acl_queries.lock().unwrap().push(path.to_owned());
+        if let Some(r) = self.inner.acl_results.lock().unwrap().get(path) {
+            return r.clone();
+        }
+        // 兜底 = spec §3.4 的目标态（不是一个「恒通过」的布尔量）：既有 start 测试因此真的跑一遍
+        // 判定函数，而不是绕过它。
+        self.inner
+            .acl_default
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Ok(crate::platform::windows::coreacl::locked_down_fixture()))
+    }
+
+    fn list_dir_names(&self, dir: &str) -> Result<Vec<String>, String> {
+        self.inner
+            .dir_entries
+            .lock()
+            .unwrap()
+            .get(dir)
+            .cloned()
+            // 兜底 = 空目录（取材面退化成 `core_acl_targets` 的兜底白名单），不是「枚举失败」——
+            // 后者会给每条既有 start 测试多塞一条 unreadable 记录，噪音掩盖真事。
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn spawn_watch_parent(
+        &self,
+        ppid: u32,
+        child_pid: u32,
+        is_current: Box<dyn Fn(u32) -> bool + Send>,
+        on_parent_dead: Box<dyn Fn(u32) + Send>,
+    ) {
+        self.inner
+            .watch_parent_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.inner.last_watch_args.lock().unwrap() = Some((ppid, child_pid));
+        // 测试双：单次评估父死看护逻辑（无后台线程 / 无 sleep）。父死（process_alive=false）且
+        // child 仍当前 → on_parent_dead 收割。alive_return 默认 true → 不触发（仅验接线计数）。
+        if !self.process_alive(ppid) && is_current(child_pid) {
+            on_parent_dead(child_pid);
+        }
+    }
+}
+
+/// 内存 mock 的 [`NetTableOps`]（测试用）。
+/// 内存 mock 的 [`NetTableOps`]（测试用）。`Clone` 共享底层 `Arc`（同 [`MockProcOps`]）。
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct MockNetTableOps {
+    /// 预设的 LISTEN 表（测试构造任意占用场景）。
+    entries: std::sync::Arc<std::sync::Mutex<Vec<ListenEntry>>>,
+}
+
+#[cfg(test)]
+impl MockNetTableOps {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 预设 LISTEN 表。
+    pub fn set_entries(&self, entries: Vec<ListenEntry>) {
+        *self.entries.lock().unwrap() = entries;
+    }
+}
+
+#[cfg(test)]
+impl NetTableOps for MockNetTableOps {
+    fn list_listen_entries(&self) -> std::io::Result<Vec<ListenEntry>> {
+        Ok(self.entries.lock().unwrap().clone())
+    }
+}
+
+#[cfg(test)]
+mod tests;

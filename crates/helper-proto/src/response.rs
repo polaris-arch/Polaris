@@ -1,0 +1,947 @@
+//! 协议响应（Polaris 行协议响应行 `OK <payload>` / `ERR <code>[ <detail>]` 的全部载荷分类）。
+//!
+//! 响应一律单行（`\n` 结尾由帧层加），首 token 决定分类：
+//! - `OK` 开头 → 成功，载荷格式由命令决定（见 [`Response`] 各变体）。
+//! - `ERR` 开头 → 失败，见 [`crate::error::Error`]。
+//!
+//! 逐平台对照（Go 源每个 `fmt.Fprintln(conn, "OK ...")` / `fmt.Fprintf(conn, "OK ...\n", ...)` 调用点）：
+//! - mac `helper/helper.go:423,425,428,430,441,443,449,480,491,506,522,579,585,597`
+//! - win `helper-win/helper.go:180,182,185,187,197,199,211,241,275,289,314,333,336,390`
+//! - linux `helper-linux/helper.go:347,350,365,367,377,379,388,478`
+//!
+//! [`Response::parse`] 是宽容的：未知 `OK <token>` 归 [`ResponseKind::OkRaw`]（保留原文），不丢消息。
+
+use crate::{error::Error, HelperBirthTarget};
+
+mod native_birth;
+pub use native_birth::{NativeBirthStart, NativeBirthStatus, NativeBirthStop};
+
+/// 拆出字符串首个空白分隔的 token + 余部（已 trim 首尾空白）。
+///
+/// Go 源用 `strings.Fields` / `strings.SplitN(line, " ", 2)` 拆响应载荷；本函数是等价原语，供
+/// [`Response::parse`] / [`Error::parse`](crate::error::Error::parse) 共用。空串或全空白 → `("", "")`。
+#[must_use]
+pub(crate) fn parse_first_token(s: &str) -> (&str, &str) {
+    let trimmed = s.trim();
+    match trimmed.find(char::is_whitespace) {
+        Some(i) => (&trimmed[..i], trimmed[i..].trim_start()),
+        None => (trimmed, ""),
+    }
+}
+
+/// `ping` 响应载荷 `OK pong uid=<n> v<ver> [build=<id>]`。前三项兼容 Polaris Go helper；Rust
+/// helper 追加可选 build token。Windows 的 uid 恒为 0（`helper-win/helper.go:179` 注释）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pong {
+    /// helper 进程的 uid（mac/linux 真实值；win 固定 0）。
+    pub uid: i64,
+    /// helper 报告的 protoVersion。
+    pub proto_version: u32,
+    /// helper 构建身份。旧 helper 的 pong 没有该字段，解析为 `None`，供新 app 识别同 protocol 旧构建。
+    pub build_identity: Option<String>,
+}
+
+impl Pong {
+    /// 构造当前 helper 的握手响应。协议版本与构建身份都取 shared crate 的单一真值。
+    #[must_use]
+    pub fn current(uid: i64) -> Self {
+        Self {
+            uid,
+            proto_version: crate::proto_version::CURRENT,
+            build_identity: Some(crate::build_identity::current().to_owned()),
+        }
+    }
+}
+
+/// `status` 响应载荷（三平台，`helper.go:427-430` 等）：running `<pid>` 或 stopped。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// `OK running <pid> [created=<十进制u64>] [image=<hex(path)>]` —— child sing-box 在跑。
+    ///
+    /// `created` / `image` 是**可选、向后兼容**的身份 token（Windows helper 起核后持进程句柄读取；
+    /// mac/linux 不发，恒 `None`）：
+    /// - `created`：进程创建时间（Windows `GetProcessTimes`，100ns tick），跨 tick 不变 ⇒ 变了说明
+    ///   受管核已退出、PID 被系统复用（app 侧崩溃监测的身份判据）。
+    /// - `image`：实跑二进制全路径（Windows `QueryFullProcessImageNameW`），供内核自证读到「实际
+    ///   跑起来的是哪个文件」。路径含空格 ⇒ wire 上 hex 编码，避免破坏按空白切 token 的解析。
+    ///
+    /// 旧 helper 不发这两个 token（解析为 `None`），旧客户端只取首 token pid（`parse_pid`）忽略尾部
+    /// —— 四象限兼容矩阵的依据。
+    Running {
+        /// child sing-box 的 pid。
+        pid: u32,
+        /// 进程创建时间令牌（Windows 专属；旧 helper / 其它平台 `None`）。
+        created: Option<u64>,
+        /// 实跑二进制全路径（Windows 专属；旧 helper / 其它平台 `None`）。
+        image: Option<String>,
+    },
+    /// `OK stopped` —— 无 child。
+    Stopped,
+}
+
+/// `stop` 响应载荷（三平台，`helper.go:440-442` 等）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// `OK stopped <pid>` —— helper 确认停核；Linux 仅在 exact Child 已 native reap 后发送。
+    Stopped { pid: u32 },
+    /// `OK notrunning` —— 本来就没 child（幂等）。
+    NotRunning,
+    /// `OK stop-mismatch <want> <current>` —— **诚实 no-op**：请求要停 `want`，但 helper 手里的受管
+    /// 核是 `current`（另一个会话的）。不杀，原样回报两个 pid 供客户端记账/日志。
+    ///
+    /// 判据见 [`stop_pid_matches`](crate::request::stop_pid_matches)。旧客户端不发身份行 ⇒
+    /// `want` 恒 `None` ⇒ 永不产生本响应，故新 helper + 旧客户端不受影响。
+    Mismatch { want: u32, current: u32 },
+    /// `OK stop-pending <pid>` — termination was dispatched, but the exact
+    /// owned Child has not yet produced a successful native reap.
+    Pending { pid: u32 },
+    /// `OK stop-unknown <pid>` — native wait failed. Custody is retained and
+    /// callers must fail closed rather than treating this as stopped.
+    Unknown { pid: u32 },
+}
+
+/// A Linux Start that provably did not spawn because an earlier helper birth
+/// still owns native custody. The PID is diagnostic and permits an exact Stop;
+/// neither variant is a no-owner receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartNotAdmitted {
+    Pending { pid: u32 },
+    Unknown { pid: u32 },
+}
+
+impl StartNotAdmitted {
+    #[must_use]
+    pub const fn pid(self) -> u32 {
+        match self {
+            Self::Pending { pid } | Self::Unknown { pid } => pid,
+        }
+    }
+}
+
+/// helper 起核关键路径耗时（毫秒，三平台共用）。
+///
+/// 这些字段是 `OK started <pid>` 后的**可选、向后兼容** token：旧 app 只读取 pid，会忽略尾部；
+/// 新 app 遇到旧 helper 时仍解析为 [`Start::Started`]。因此不需要提升协议大版本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartTiming {
+    /// allow-LAN 所需 IP forwarding 准备耗时。
+    pub forwarding_ms: u64,
+    /// 进程准备与 `Command::spawn` 耗时；Unix 还包含降权/能力准备等平台必要工作。
+    pub process_ms: u64,
+    /// 把 child 纳入平台生命周期容器的耗时；当前仅 Windows Job Object 非零。
+    pub job_ms: u64,
+    /// 把 stdout/stderr 日志接线移交后台线程的耗时。
+    pub log_handoff_ms: u64,
+    /// helper 已通过校验后的整段起核关键路径耗时。
+    pub total_ms: u64,
+}
+
+/// `start` 响应载荷（三平台，`helper.go:522,579` 等）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// `OK started <pid>` —— 新起了 child sing-box。
+    Started { pid: u32 },
+    /// `OK started <pid> forwarding_ms=… process_ms=… job_ms=… log_handoff_ms=… total_ms=…
+    /// [created=<十进制u64>]`。
+    ///
+    /// 新版三平台 Rust helper 均可发送；独立变体让旧 helper 的既有形态保持兼容。
+    ///
+    /// `created` 与 [`Status::Running`] 的同名 token 同源（Windows 进程创建时间），让 app 起核当时
+    /// 就拿到身份基线，不必等第一次 status。**必须是十进制 u64，且 `image=` 绝不进本响应**：
+    /// `parse_start_timing` 对 tail 的**每个** `key=value` 先 `value.parse::<u64>().ok()?`，`?` 作用于
+    /// 整个函数 ⇒ 任何非 u64 的 value（hex 路径含 a-f）都会让旧 app **丢掉全部 timing**。
+    StartedTimed {
+        /// 新起 child sing-box 的 pid。
+        pid: u32,
+        /// helper 侧起核关键路径耗时。
+        timing: StartTiming,
+        /// 进程创建时间令牌（Windows 专属，十进制 u64；旧 helper / 其它平台 `None`）。
+        created: Option<u64>,
+    },
+    /// `OK already <pid>` —— 已有 child 在跑，复用（不重启）。
+    Already { pid: u32 },
+    /// `OK start-not-admitted pending|unknown <pid>` — no forwarding mutation
+    /// and no spawn occurred; an earlier native birth still blocks admission.
+    NotAdmitted(StartNotAdmitted),
+}
+
+/// Linux exact-birth Start receipts. A typed target is never inferred from a
+/// legacy PID-only response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxBirthStart {
+    Started {
+        target: HelperBirthTarget,
+        timing: Option<StartTiming>,
+    },
+    Already {
+        target: HelperBirthTarget,
+    },
+    NotAdmittedPending {
+        target: HelperBirthTarget,
+    },
+    /// A failed native wait can leave the helper unable to prove custody.
+    /// `None` means there is no exact target the client can safely stop.
+    NotAdmittedUnknown {
+        target: Option<HelperBirthTarget>,
+    },
+}
+
+/// Linux exact-birth status; `Unknown` remains an owned or uncertain birth,
+/// never a no-owner receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxBirthStatus {
+    Running { target: HelperBirthTarget },
+    Stopping { target: HelperBirthTarget },
+    Unknown { target: HelperBirthTarget },
+    Empty,
+}
+
+/// Linux exact-birth Stop receipts. Pending and unknown cannot release custody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxBirthStop {
+    Stopped {
+        target: HelperBirthTarget,
+    },
+    Pending {
+        target: HelperBirthTarget,
+    },
+    Unknown {
+        target: HelperBirthTarget,
+    },
+    Mismatch {
+        requested: HelperBirthTarget,
+        current: HelperBirthTarget,
+    },
+}
+
+/// `freeport` 响应载荷（三平台，`helper.go:370-394` 等）。`foreign` 的 names 由 ` | ` 分隔（Go `strings.Join(foreign, " | ")`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreePort {
+    /// `OK free` —— 端口无 LISTEN 持有者。
+    Free,
+    /// `OK killed <pid>,<pid>,...` —— 杀掉的 sing-box 实例 pid 列表（Go `strings.Join(killed, ",")`）。
+    Killed { pids: Vec<u32> },
+    /// `OK foreign <name> | <name>` —— 端口被非 sing-box 进程占用，未杀、回报占用者名（混合占用亦归此）。
+    Foreign { names: Vec<String> },
+}
+
+/// `flush-dns` 响应载荷（mac 专属，`helper/helper.go:498-506`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlushDns {
+    /// `OK flushed` —— dscacheutil + HUP mDNSResponder 均成功。
+    Flushed,
+    /// `OK flushed-partial killall-hup <err> <out>` —— dscacheutil 成功但 HUP mDNSResponder 失败
+    ///（用户级同样无权 HUP，app 不降级）。tail 保留 Go `:503` 的 `killall-hup <err> <out>` 诊断文本。
+    FlushedPartial { tail: String },
+}
+
+/// Linux systemd-resolved 接管响应（proto v1 兼容扩展）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxDns {
+    /// `OK resolved-dns-set`：写入并读回自证成功。
+    Set,
+    /// `OK resolved-dns-reverted`：链路配置已撤销，或接口已不存在（等价于无残留）。
+    Reverted,
+}
+
+/// 协议成功响应的全部载荷分类（一个请求一个响应，类型由请求命令决定）。
+///
+/// 设计原则：每个变体对应一组 Go `case` 分支的 `OK ...` 输出；未识别的 `OK <token>` 归
+/// [`ResponseKind::OkRaw`]（保留原文）——保证解析永不丢消息，便于协议演进期的诊断。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseKind {
+    /// `OK pong uid=<n> v<ver> [build=<id>]`（ping）。
+    Pong(Pong),
+    /// `OK <ver>`（version）。
+    Version {
+        proto_version: u32,
+    },
+    /// `OK running <pid>` / `OK stopped`（status）。
+    Status(Status),
+    /// `OK stopped <pid>` / `OK notrunning`（stop）。
+    Stop(Stop),
+    /// `OK started <pid>` / `OK already <pid>`（start）。
+    Start(Start),
+    /// Linux exact-birth Start receipts use distinct wire tokens.
+    LinuxBirthStart(LinuxBirthStart),
+    /// Linux exact-birth Status receipts use distinct wire tokens.
+    LinuxBirthStatus(LinuxBirthStatus),
+    /// Linux exact-birth Stop receipts use distinct wire tokens.
+    LinuxBirthStop(LinuxBirthStop),
+    /// macOS/Windows receipts require their own typed native response family.
+    NativeBirthStart(NativeBirthStart),
+    NativeBirthStatus(NativeBirthStatus),
+    NativeBirthStop(NativeBirthStop),
+    /// `OK cleaned`（cleanup）。
+    Cleaned,
+    /// `OK route`（route-add / route-del）。
+    Route,
+    /// `OK free` / `OK killed <pids>` / `OK foreign <names>`（freeport）。
+    FreePort(FreePort),
+    /// `OK installed`（install-core，mac/linux）。
+    Installed,
+    /// `OK default-restore`（default-restore，mac）。
+    DefaultRestored,
+    /// `OK flushed` / `OK flushed-partial ...`（flush-dns，mac）。
+    FlushDns(FlushDns),
+    /// Linux systemd-resolved 接管/还原。
+    LinuxDns(LinuxDns),
+    /// macOS SystemConfiguration 原生代理事务已提交并应用。
+    MacProxyTransaction,
+    /// `OK iface-metric`（iface-metric，win 退役命令）。
+    IfaceMetric,
+    /// `OK uninstalling`（uninstall，win）。
+    Uninstalling,
+    /// 未识别的 `OK <token> <rest>` —— 保留原文，永不丢消息（协议演进期诊断兜底）。
+    OkRaw {
+        token: String,
+        rest: String,
+    },
+}
+
+/// 一个完整响应（成功或失败）。
+///
+/// 对应 Go 源每个 `fmt.Fprintln(conn, "...")` 调用点产生的单行。`Err` 变体承载 [`Error`]，
+/// 与 [`ResponseKind`] 各成功变体互补。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Response {
+    /// 成功响应（载荷分类见 [`ResponseKind`]）。
+    Ok(ResponseKind),
+    /// 失败响应（错误码 + detail）。
+    Err(Error),
+}
+
+impl Response {
+    /// 解析一个响应行（已剥 `\n`）为 [`Response`]。
+    ///
+    /// - `OK ...` → [`Response::Ok`]，载荷按首 token 分派。
+    /// - `ERR ...` → [`Response::Err`]（见 [`Error::parse`](crate::error::Error::parse)）。
+    /// - 其它 → [`Response::Ok`](ResponseKind::OkRaw)，token 为原文（永不丢消息，便于诊断畸形/未来协议响应）。
+    #[must_use]
+    pub fn parse(line: &str) -> Self {
+        if let Some(err) = Error::parse(line) {
+            return Self::Err(err);
+        }
+        let rest = match line.strip_prefix("OK") {
+            // 严格对照 Go：所有响应形如 "OK ..." 或 "OK\n"（无 payload 的极少，如未识别命令的兜底）。
+            // strip_prefix("OK") 后若紧跟空格 → 取余部；若 "OK" 恰是整行 → rest 为空（归 OkRaw token="")。
+            Some(r) => r.trim_start(),
+            None => {
+                // 既非 OK 也非 ERR —— 视作未知成功响应，保留原文兜底（不丢消息）。
+                let (token, rest) = parse_first_token(line);
+                return Self::Ok(ResponseKind::OkRaw {
+                    token: token.to_owned(),
+                    rest: rest.to_owned(),
+                });
+            }
+        };
+        let kind = parse_ok(rest);
+        if matches!(
+            kind,
+            ResponseKind::LinuxBirthStart(_)
+                | ResponseKind::LinuxBirthStatus(_)
+                | ResponseKind::LinuxBirthStop(_)
+                | ResponseKind::NativeBirthStart(_)
+                | ResponseKind::NativeBirthStatus(_)
+                | ResponseKind::NativeBirthStop(_)
+        ) && ok_kind_to_wire(&kind) != line
+        {
+            // Exact-birth receipts have one canonical wire spelling. The
+            // legacy parser is deliberately permissive; do not let its "OK"
+            // prefix/whitespace handling turn a malformed birth line into
+            // proof of custody.
+            let (token, rest) = parse_first_token(rest);
+            return Self::Ok(ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: rest.to_owned(),
+            });
+        }
+        Self::Ok(kind)
+    }
+
+    /// 序列化为 wire 行（不含尾部 `\n`，由帧层加）—— [`Response::parse`] 的反方向。
+    ///
+    /// 对应 Go 源每个 `fmt.Fprintln(conn, "OK ...")` / `fmt.Fprintf(conn, "OK ...\n", ...)` 调用点
+    /// （逐平台调用点清单见本模块顶部注释）。**三平台 helper 共用本函数**：读/写两个方向在同一文件里
+    /// 成对定义，协议演进时不会只改一侧（原先 mac/win 各持一份副本、linux 内联 `format!`，
+    /// 是漏改的温床）。
+    ///
+    /// 与 [`parse`](Self::parse) 满足 round-trip：`parse(r.to_wire_line()) == r`
+    /// （`OkRaw` 的空 `rest` 不产尾空格，即为此）。
+    #[must_use]
+    pub fn to_wire_line(&self) -> String {
+        match self {
+            Self::Ok(kind) => ok_kind_to_wire(kind),
+            Self::Err(e) => e.to_wire_line(),
+        }
+    }
+}
+
+/// 把 [`ResponseKind`] 序列化为 `OK ...` wire 行（[`parse_ok`] 的反方向）。
+fn ok_kind_to_wire(kind: &ResponseKind) -> String {
+    match kind {
+        ResponseKind::Pong(p) => {
+            let base = format!("OK pong uid={} v{}", p.uid, p.proto_version);
+            p.build_identity
+                .as_ref()
+                .map_or(base.clone(), |build| format!("{base} build={build}"))
+        }
+        ResponseKind::Version { proto_version } => format!("OK {proto_version}"),
+        ResponseKind::Status(Status::Running {
+            pid,
+            created,
+            image,
+        }) => status_running_to_wire(*pid, *created, image.as_deref()),
+        ResponseKind::Status(Status::Stopped) => "OK stopped".to_owned(),
+        ResponseKind::Stop(Stop::Stopped { pid }) => format!("OK stopped {pid}"),
+        ResponseKind::Stop(Stop::NotRunning) => "OK notrunning".to_owned(),
+        ResponseKind::Stop(Stop::Mismatch { want, current }) => {
+            format!("OK stop-mismatch {want} {current}")
+        }
+        ResponseKind::Stop(Stop::Pending { pid }) => format!("OK stop-pending {pid}"),
+        ResponseKind::Stop(Stop::Unknown { pid }) => format!("OK stop-unknown {pid}"),
+        ResponseKind::Start(Start::Started { pid }) => format!("OK started {pid}"),
+        ResponseKind::Start(Start::StartedTimed {
+            pid,
+            timing,
+            created,
+        }) => {
+            let base = format!(
+                "OK started {pid} forwarding_ms={} process_ms={} job_ms={} log_handoff_ms={} total_ms={}",
+                timing.forwarding_ms,
+                timing.process_ms,
+                timing.job_ms,
+                timing.log_handoff_ms,
+                timing.total_ms
+            );
+            // 十进制 u64 追加在 timing token 之后；**永不**在此追加 image=（见 Start::StartedTimed 文档）。
+            created.map_or_else(|| base.clone(), |c| format!("{base} created={c}"))
+        }
+        ResponseKind::Start(Start::Already { pid }) => format!("OK already {pid}"),
+        ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Pending { pid })) => {
+            format!("OK start-not-admitted pending {pid}")
+        }
+        ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Unknown { pid })) => {
+            format!("OK start-not-admitted unknown {pid}")
+        }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::Started { target, timing }) => {
+            let mut line = format!("OK birth-started {} {}", target.pid, target.birth.to_wire());
+            if let Some(timing) = timing {
+                line.push_str(&format!(
+                    " forwarding_ms={} process_ms={} job_ms={} log_handoff_ms={} total_ms={}",
+                    timing.forwarding_ms,
+                    timing.process_ms,
+                    timing.job_ms,
+                    timing.log_handoff_ms,
+                    timing.total_ms
+                ));
+            }
+            line
+        }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::Already { target }) => {
+            format!("OK birth-already {} {}", target.pid, target.birth.to_wire())
+        }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedPending { target }) => {
+            format!(
+                "OK birth-start-not-admitted pending {} {}",
+                target.pid,
+                target.birth.to_wire()
+            )
+        }
+        ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown { target }) => target
+            .map_or_else(
+                || "OK birth-start-not-admitted unknown".to_owned(),
+                |target| {
+                    format!(
+                        "OK birth-start-not-admitted unknown {} {}",
+                        target.pid,
+                        target.birth.to_wire()
+                    )
+                },
+            ),
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running { target }) => {
+            birth_status_to_wire("running", *target)
+        }
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Stopping { target }) => {
+            birth_status_to_wire("stopping", *target)
+        }
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Unknown { target }) => {
+            birth_status_to_wire("unknown", *target)
+        }
+        ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Empty) => {
+            "OK birth-status empty".to_owned()
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped { target }) => {
+            birth_stop_to_wire("birth-stopped", *target)
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Pending { target }) => {
+            birth_stop_to_wire("birth-stop-pending", *target)
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Unknown { target }) => {
+            birth_stop_to_wire("birth-stop-unknown", *target)
+        }
+        ResponseKind::LinuxBirthStop(LinuxBirthStop::Mismatch { requested, current }) => format!(
+            "OK birth-stop-mismatch {} {} {} {}",
+            requested.pid,
+            requested.birth.to_wire(),
+            current.pid,
+            current.birth.to_wire()
+        ),
+        ResponseKind::NativeBirthStart(_)
+        | ResponseKind::NativeBirthStatus(_)
+        | ResponseKind::NativeBirthStop(_) => native_birth::to_wire(kind),
+        ResponseKind::Cleaned => "OK cleaned".to_owned(),
+        ResponseKind::Route => "OK route".to_owned(),
+        ResponseKind::FreePort(fp) => free_port_to_wire(fp),
+        ResponseKind::Installed => "OK installed".to_owned(),
+        ResponseKind::DefaultRestored => "OK default-restore".to_owned(),
+        ResponseKind::FlushDns(f) => flush_dns_to_wire(f),
+        ResponseKind::LinuxDns(LinuxDns::Set) => "OK resolved-dns-set".to_owned(),
+        ResponseKind::LinuxDns(LinuxDns::Reverted) => "OK resolved-dns-reverted".to_owned(),
+        ResponseKind::MacProxyTransaction => "OK system-proxy".to_owned(),
+        ResponseKind::IfaceMetric => "OK iface-metric".to_owned(),
+        ResponseKind::Uninstalling => "OK uninstalling".to_owned(),
+        // 空 rest 不产尾空格 —— 保 round-trip（`OK <token> ` 会被 parse 回 rest=""，但原文多一空格）。
+        ResponseKind::OkRaw { token, rest } => {
+            if rest.is_empty() {
+                format!("OK {token}")
+            } else {
+                format!("OK {token} {rest}")
+            }
+        }
+    }
+}
+
+fn birth_status_to_wire(state: &str, target: HelperBirthTarget) -> String {
+    format!(
+        "OK birth-status {state} {} {}",
+        target.pid,
+        target.birth.to_wire()
+    )
+}
+
+fn birth_stop_to_wire(token: &str, target: HelperBirthTarget) -> String {
+    format!("OK {token} {} {}", target.pid, target.birth.to_wire())
+}
+
+/// `status` 的 running 载荷 → wire（`OK running <pid> [created=<十进制>] [image=<hex>]`）。
+///
+/// 两个 token 都只在有值时出现 —— 不发的 helper 与本函数的 `None` 分支产生**逐字相同**的旧形态
+/// （`OK running <pid>`），故 round-trip 对旧 wire 亦成立。
+fn status_running_to_wire(pid: u32, created: Option<u64>, image: Option<&str>) -> String {
+    let mut line = format!("OK running {pid}");
+    if let Some(created) = created {
+        line.push_str(" created=");
+        line.push_str(&created.to_string());
+    }
+    if let Some(image) = image {
+        line.push_str(" image=");
+        line.push_str(&hex_encode(image.as_bytes()));
+    }
+    line
+}
+
+/// `freeport` 载荷 → wire（`OK free` / `OK killed <pids>` / `OK foreign <names>`）。
+///
+/// 分隔符逐字对齐 Go：killed 用 `strings.Join(killed, ",")`，foreign 用 `strings.Join(foreign, " | ")`。
+fn free_port_to_wire(fp: &FreePort) -> String {
+    match fp {
+        FreePort::Free => "OK free".to_owned(),
+        FreePort::Killed { pids } => {
+            let joined: Vec<String> = pids.iter().map(ToString::to_string).collect();
+            format!("OK killed {}", joined.join(","))
+        }
+        FreePort::Foreign { names } => format!("OK foreign {}", names.join(" | ")),
+    }
+}
+
+/// `flush-dns` 载荷 → wire（mac 专属，`helper/helper.go:498-506`）。
+fn flush_dns_to_wire(f: &FlushDns) -> String {
+    match f {
+        FlushDns::Flushed => "OK flushed".to_owned(),
+        FlushDns::FlushedPartial { tail } => format!("OK flushed-partial {tail}"),
+    }
+}
+
+/// 分派 `OK <rest>` 的载荷（rest 已剥 "OK " 前缀，可能为空）。
+fn parse_ok(rest: &str) -> ResponseKind {
+    let (token, tail) = parse_first_token(rest);
+    match token {
+        "" => ResponseKind::OkRaw {
+            token: String::new(),
+            rest: String::new(),
+        },
+        "pong" => ResponseKind::Pong(parse_pong(tail)),
+        "version" => ResponseKind::Version { proto_version: 0 }, // version 响应是 "OK <ver>"，ver 是首 token
+        // 注意：version 响应 `OK 9` 中 "9" 是首 token，非 "version" —— 上方 "version" 分支永远不命中，
+        // 真实 version 响应走下方纯数字兜底。这里保留分支以防未来协议加 "OK version <ver>" 形态。
+        "running" => {
+            // 首 token 恒为 pid（旧 client 的 `parse_pid` 口径不变）；其后是可选身份 token。
+            let (pid_token, identity) = parse_first_token(tail);
+            ResponseKind::Status(Status::Running {
+                pid: pid_token.parse().unwrap_or(0),
+                created: parse_created(identity),
+                image: parse_image(identity),
+            })
+        }
+        "stopped" => {
+            // `OK stopped` 或 `OK stopped <pid>`（后者是 stop 响应，前者是 status 响应）
+            if tail.trim().is_empty() {
+                ResponseKind::Status(Status::Stopped)
+            } else {
+                ResponseKind::Stop(Stop::Stopped {
+                    pid: parse_pid(tail),
+                })
+            }
+        }
+        "notrunning" => ResponseKind::Stop(Stop::NotRunning),
+        "stop-mismatch" => {
+            // `<want> <current>`：解析失败归 0（不丢消息，客户端据此诊断；与 parse_pid 同处置）。
+            let (want, rest) = parse_first_token(tail);
+            ResponseKind::Stop(Stop::Mismatch {
+                want: want.parse().unwrap_or(0),
+                current: parse_pid(rest),
+            })
+        }
+        "stop-pending" => ResponseKind::Stop(Stop::Pending {
+            pid: parse_pid(tail),
+        }),
+        "stop-unknown" => ResponseKind::Stop(Stop::Unknown {
+            pid: parse_pid(tail),
+        }),
+        "started" => {
+            let (pid_token, metrics) = parse_first_token(tail);
+            let pid = pid_token.parse().unwrap_or(0);
+            match parse_start_timing(metrics) {
+                Some(timing) => ResponseKind::Start(Start::StartedTimed {
+                    pid,
+                    timing,
+                    created: parse_created(metrics),
+                }),
+                None => ResponseKind::Start(Start::Started { pid }),
+            }
+        }
+        "already" => ResponseKind::Start(Start::Already {
+            pid: parse_pid(tail),
+        }),
+        "start-not-admitted" => {
+            let (state, pid) = parse_first_token(tail);
+            match (state, parse_exact_nonzero_pid(pid)) {
+                ("pending", Some(pid)) => {
+                    ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Pending { pid }))
+                }
+                ("unknown", Some(pid)) => {
+                    ResponseKind::Start(Start::NotAdmitted(StartNotAdmitted::Unknown { pid }))
+                }
+                _ => ResponseKind::OkRaw {
+                    token: "start-not-admitted".to_owned(),
+                    rest: tail.to_owned(),
+                },
+            }
+        }
+        "birth-started"
+        | "birth-already"
+        | "birth-start-not-admitted"
+        | "birth-status"
+        | "birth-stopped"
+        | "birth-stop-pending"
+        | "birth-stop-unknown"
+        | "birth-stop-mismatch" => {
+            parse_birth_ok(token, tail).unwrap_or_else(|| ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: tail.to_owned(),
+            })
+        }
+        "native-birth-started"
+        | "native-birth-already"
+        | "native-birth-start-not-admitted"
+        | "native-birth-status"
+        | "native-birth-stopped"
+        | "native-birth-stop-pending"
+        | "native-birth-stop-unknown"
+        | "native-birth-stop-mismatch" => {
+            native_birth::parse(token, tail).unwrap_or_else(|| ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: tail.to_owned(),
+            })
+        }
+        "cleaned" => ResponseKind::Cleaned,
+        "route" => ResponseKind::Route,
+        "free" => ResponseKind::FreePort(FreePort::Free),
+        "killed" => ResponseKind::FreePort(FreePort::Killed {
+            pids: parse_pid_list(tail),
+        }),
+        "foreign" => ResponseKind::FreePort(FreePort::Foreign {
+            names: parse_foreign_names(tail),
+        }),
+        "installed" => ResponseKind::Installed,
+        "default-restore" => ResponseKind::DefaultRestored,
+        "flushed" => ResponseKind::FlushDns(FlushDns::Flushed),
+        "flushed-partial" => ResponseKind::FlushDns(FlushDns::FlushedPartial {
+            tail: tail.to_owned(),
+        }),
+        "resolved-dns-set" => ResponseKind::LinuxDns(LinuxDns::Set),
+        "resolved-dns-reverted" => ResponseKind::LinuxDns(LinuxDns::Reverted),
+        "system-proxy" => ResponseKind::MacProxyTransaction,
+        "iface-metric" => ResponseKind::IfaceMetric,
+        "uninstalling" => ResponseKind::Uninstalling,
+        _ => {
+            // version 响应 `OK 9`：首 token 是纯数字 → 当作 version 报告
+            if token.chars().all(|c| c.is_ascii_digit()) {
+                ResponseKind::Version {
+                    proto_version: token.parse().unwrap_or(0),
+                }
+            } else {
+                ResponseKind::OkRaw {
+                    token: token.to_owned(),
+                    rest: tail.to_owned(),
+                }
+            }
+        }
+    }
+}
+
+/// Parse the new safety-critical response family as a closed grammar.
+/// Unknown or duplicate identity/timing fields stay untyped (`OkRaw`).
+fn parse_birth_ok(token: &str, tail: &str) -> Option<ResponseKind> {
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let pair = |fields: &[&str]| -> Option<HelperBirthTarget> {
+        let [pid, birth] = fields else {
+            return None;
+        };
+        HelperBirthTarget::parse_wire(pid, birth)
+    };
+    Some(match token {
+        "birth-started" => {
+            let [pid, birth, rest @ ..] = fields.as_slice() else {
+                return None;
+            };
+            let target = HelperBirthTarget::parse_wire(pid, birth)?;
+            let timing = if rest.is_empty() {
+                None
+            } else {
+                Some(parse_birth_start_timing(rest)?)
+            };
+            ResponseKind::LinuxBirthStart(LinuxBirthStart::Started { target, timing })
+        }
+        "birth-already" => ResponseKind::LinuxBirthStart(LinuxBirthStart::Already {
+            target: pair(&fields)?,
+        }),
+        "birth-start-not-admitted" => match fields.as_slice() {
+            ["pending", pid, birth] => {
+                ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedPending {
+                    target: HelperBirthTarget::parse_wire(pid, birth)?,
+                })
+            }
+            ["unknown"] => {
+                ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown { target: None })
+            }
+            ["unknown", pid, birth] => {
+                ResponseKind::LinuxBirthStart(LinuxBirthStart::NotAdmittedUnknown {
+                    target: Some(HelperBirthTarget::parse_wire(pid, birth)?),
+                })
+            }
+            _ => return None,
+        },
+        "birth-status" => match fields.as_slice() {
+            ["empty"] => ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Empty),
+            ["running", pid, birth] => ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running {
+                target: HelperBirthTarget::parse_wire(pid, birth)?,
+            }),
+            ["stopping", pid, birth] => {
+                ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Stopping {
+                    target: HelperBirthTarget::parse_wire(pid, birth)?,
+                })
+            }
+            ["unknown", pid, birth] => ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Unknown {
+                target: HelperBirthTarget::parse_wire(pid, birth)?,
+            }),
+            _ => return None,
+        },
+        "birth-stopped" => ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
+            target: pair(&fields)?,
+        }),
+        "birth-stop-pending" => ResponseKind::LinuxBirthStop(LinuxBirthStop::Pending {
+            target: pair(&fields)?,
+        }),
+        "birth-stop-unknown" => ResponseKind::LinuxBirthStop(LinuxBirthStop::Unknown {
+            target: pair(&fields)?,
+        }),
+        "birth-stop-mismatch" => {
+            let [want_pid, want_birth, current_pid, current_birth] = fields.as_slice() else {
+                return None;
+            };
+            ResponseKind::LinuxBirthStop(LinuxBirthStop::Mismatch {
+                requested: HelperBirthTarget::parse_wire(want_pid, want_birth)?,
+                current: HelperBirthTarget::parse_wire(current_pid, current_birth)?,
+            })
+        }
+        _ => return None,
+    })
+}
+
+fn parse_birth_start_timing(fields: &[&str]) -> Option<StartTiming> {
+    let [forwarding, process, job, log_handoff, total] = fields else {
+        return None;
+    };
+    let value = |field: &str, key: &str| -> Option<u64> {
+        let digits = field.strip_prefix(key)?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    Some(StartTiming {
+        forwarding_ms: value(forwarding, "forwarding_ms=")?,
+        process_ms: value(process, "process_ms=")?,
+        job_ms: value(job, "job_ms=")?,
+        log_handoff_ms: value(log_handoff, "log_handoff_ms=")?,
+        total_ms: value(total, "total_ms=")?,
+    })
+}
+
+/// 解析 `uid=<n> v<ver>` → [`Pong`]。
+///
+/// 对照 Go wire 形态：`fmt.Fprintf(conn, "OK pong uid=%d v%s\n", os.Getuid(), protoVersion)`
+///（`helper.go:423` / `helper-linux/helper.go:347` / `helper-win/helper.go:180`）。注意 `%s` 直接接 protoVersion
+/// 常量值（如 "9"），故 wire 形态是 `uid=0 v9`（`v` 后无 `=`，ver 是独立 token）。
+fn parse_pong(tail: &str) -> Pong {
+    let mut uid: i64 = 0;
+    let mut ver: u32 = 0;
+    let mut build_identity = None;
+    for field in tail.split_whitespace() {
+        if let Some(v) = field.strip_prefix("uid=") {
+            uid = v.parse().unwrap_or(0);
+        } else if let Some(v) = field.strip_prefix('v') {
+            // `v9` 形态：v 后直接跟版本号数字（无 `=`）
+            ver = v.parse().unwrap_or(0);
+        } else if let Some(v) = field.strip_prefix("build=") {
+            if crate::build_identity::is_wire_safe(v) {
+                build_identity = Some(v.to_owned());
+            }
+        }
+    }
+    Pong {
+        uid,
+        proto_version: ver,
+        build_identity,
+    }
+}
+
+/// 解析 `<pid>` → u32（失败归 0；调用方据此诊断，不丢响应）。
+fn parse_pid(tail: &str) -> u32 {
+    let (tok, _) = parse_first_token(tail);
+    tok.parse().unwrap_or(0)
+}
+
+/// Parse a safety-critical custody target. Unlike the compatibility parsers
+/// above, this accepts exactly one non-zero PID token: publishing a typed
+/// blocker without an exact Stop target would strand recovery bookkeeping.
+fn parse_exact_nonzero_pid(tail: &str) -> Option<u32> {
+    let mut tokens = tail.split_whitespace();
+    let token = tokens.next()?;
+    if !token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let pid = token.parse::<u32>().ok()?;
+    (pid != 0 && tokens.next().is_none()).then_some(pid)
+}
+
+/// 解析 Windows helper 追加的完整 timing token 集。
+///
+/// 只要有字段缺失/非法就整体降级为旧 [`Start::Started`]，避免用默认 0 伪造阶段耗时。
+fn parse_start_timing(tail: &str) -> Option<StartTiming> {
+    let mut forwarding_ms = None;
+    let mut process_ms = None;
+    let mut job_ms = None;
+    let mut log_handoff_ms = None;
+    let mut total_ms = None;
+    for field in tail.split_whitespace() {
+        let (key, value) = field.split_once('=')?;
+        let parsed = value.parse::<u64>().ok()?;
+        match key {
+            "forwarding_ms" => forwarding_ms = Some(parsed),
+            "process_ms" => process_ms = Some(parsed),
+            "job_ms" => job_ms = Some(parsed),
+            "log_handoff_ms" => log_handoff_ms = Some(parsed),
+            "total_ms" => total_ms = Some(parsed),
+            _ => continue,
+        }
+    }
+    Some(StartTiming {
+        forwarding_ms: forwarding_ms?,
+        process_ms: process_ms?,
+        job_ms: job_ms?,
+        log_handoff_ms: log_handoff_ms?,
+        total_ms: total_ms?,
+    })
+}
+
+/// 从可选 token 尾里取 `created=<十进制 u64>`（[`Status::Running`] / [`Start::StartedTimed`] 共用）。
+///
+/// 缺失、非十进制、溢出一律 `None` —— 身份令牌读不到时下游判「不可观测」，绝不折成「不匹配」
+/// （那会把一次读失败变成一次假崩溃）。
+fn parse_created(tail: &str) -> Option<u64> {
+    tail.split_whitespace()
+        .find_map(|field| field.strip_prefix("created=")?.parse().ok())
+}
+
+/// 从可选 token 尾里取 `image=<hex(path)>` 并解回路径（[`Status::Running`] 专属）。
+///
+/// hex 非法或解出的字节不是 UTF-8 → `None`（同 [`parse_created`]：读不到就说读不到，不伪造路径）。
+fn parse_image(tail: &str) -> Option<String> {
+    tail.split_whitespace().find_map(|field| {
+        let hex = field.strip_prefix("image=")?;
+        String::from_utf8(hex_decode(hex)?).ok()
+    })
+}
+
+/// 16 进制编码（小写）。
+///
+/// # 为何不用 `hex::encode`
+///
+/// 本 crate 是 wire 协议的单一真值，**零第三方依赖**（`Cargo.toml` 的 `[dependencies]` 为空）——
+/// 这条性质让三平台 helper、app、client 引它时都不背额外依赖边。为一个全函数编码腿破这条性质，
+/// 收益（省 10 行无分支代码）远小于成本。同款取舍与 `helper-client/src/token.rs::hex_encode` 一致。
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// [`hex_encode`] 的逆：偶数长度的小写/大写 hex → 字节；任一字符非 hex 或长度为奇数 → `None`。
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// 解析 `pid,pid,pid` → `Vec<u32>`（Go `strings.Join(killed, ",")` 的逆）。
+fn parse_pid_list(tail: &str) -> Vec<u32> {
+    tail.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
+}
+
+/// 解析 `name | name | name` → `Vec<String>`（Go `strings.Join(foreign, " | ")` 的逆）。
+fn parse_foreign_names(tail: &str) -> Vec<String> {
+    tail.split('|')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests;

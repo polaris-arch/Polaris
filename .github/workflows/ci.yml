@@ -1,0 +1,504 @@
+name: CI
+
+# B0 验证门禁：Rust 单链（fmt + clippy + build + test），无 Go 工具链（§D.1 day-1 全 Rust）。
+# 职责 = 「改动是否正确」，快速反馈。打包（出安装包）拆到 package.yml（B10 发布工程批补）。
+#
+# ── 反馈架构（2026-08-26 按公开仓实况更新）──
+#    标准 GitHub-hosted runner 对公开仓不计分钟额度；仍需控制等待、并发与无信息量重跑。
+#    此前每次 push main = 3-OS CI + 4 平台 Package 并行，反馈噪声与 artifact 体积都过高。
+#   · push main（调试热路径）：只跑 ubuntu-22.04 单腿 —— 最便宜、最快反馈；
+#   · pull_request / workflow_dispatch / 被 package.yml workflow_call（发布）：完整 3-OS 矩阵；
+#   · 发布质量不降级：tag 发布经 package.yml 的 `ci` gate job 调回本 workflow 跑满 3-OS，
+#     CI 不绿不发布（见 package.yml jobs.release）。2026-09-04 起打包腿与本门**并行**开跑：
+#     门拦的是 release job，不是 package job —— 门红时安装包会被构建出来但发不出去。
+# main 应开 ruleset，把三平台本 job、UI 与 release risk gate 设为 required checks。
+on:
+  push:
+    branches: [main]
+    # 纯文档改动不碰任何判据面，push 直跑是纯浪费。注意 paths-ignore 只在**全部**改动文件命中时跳过。
+    # 只对 push 生效：PR 不加，避免将来设 required checks 后文档 PR 卡在 pending。
+    #
+    # ── CI-5（2026-08-18）：`ui/**` 从 paths-ignore 里删除 ──
+    # 此前这里还 ignore 了 `ui/**`，而 **Rust 判据面横跨 ui/**：`main.rs` 遍历整棵 `ui/src`、
+    # `i18n.rs` include_str! 五个 locale、键覆盖断言读前端源码 —— 纯 UI 改动 push 时 Rust 门
+    # 根本不触发。实证：`0742de0`（G1，只改一个 ui/ 文件）只跑了 UI workflow，CI 零 run。
+    # 这正是 ui.yml 头注明令防范的那个假门的**反方向**（那边写着「绝不能把 src-tauri/** 加进
+    # paths-ignore」，却没人检查对称的一侧）。代价：纯 UI 改动多跑一次 ubuntu 1x（约 5 分钟），
+    # 换「被 Rust 测试读取的路径改动 ⇒ Rust 门必跑到」。对称规则由
+    # `ui/src/contracts/ci-paths-contract.test.ts` 钉死（两个 workflow 都不得 ignore 对侧树）。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      os:
+        # 单平台确认专用（2026-08-05）：要回答的是「**这一个**平台还能不能编/跑」时，另外两条腿
+        # 不增加目标平台的信息且延长反馈。缺省仍是 `all`，不改任何既有语义。
+        #
+        # ⚠️ 它**只影响手动 dispatch**：push / pull_request / package.yml 的 workflow_call 都不传
+        # inputs ⇒ 下面的表达式落到原来那条判定上。发布门跑满 3-OS 这条口径一字未动。
+        description: '跑哪些平台（单平台用于定向确认并缩短反馈；发布门不受影响）'
+        type: choice
+        default: all
+        options:
+          - all
+          - ubuntu-22.04
+          - windows-2022
+          - macos-14
+  # 供 package.yml 复用作发布前置门（与打包并行跑，门不绿则 release job 不起），零重复定义。
+  workflow_call:
+
+# 同一 ref 上新跑取消在途旧跑。
+# 2026-07-31 把 main push 也纳入取消：连着推几笔时，被顶掉的旧 tip 没有消费者，照跑只会计费。
+# `workflow_call` 里的 `github.workflow` 取**调用方**名称（GitHub 官方语义），故把它纳入组：
+# 独立 CI 与 Package 内复用的 CI 门互不取消；同一调用方/ref 的旧跑仍会被新跑顶掉。
+# tag ref 是 refs/tags/*，走不进下面的 cancel 条件。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+
+jobs:
+  lint-and-test:
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 为什么不改成 fail-fast: true 缩短失败反馈（2026-07-31 复核，**这条别优化掉**）：
+      # true 的收益只来自「取消**在途**的 job」，所以只在「快腿先挂、慢腿还在跑」时才兑现。
+      # 2026-07-28 run 30328102467 是反例：挂的是 windows（墙钟 23min），而 ubuntu(7)/macos(4)
+      # 那时早已各自跑完 —— 没有任何在途 job 可取消，true 省下的是 0 分钟。
+      # 会先挂的那类失败（fmt/clippy）多半平台无关，取消掉的另外两腿信息量本就低；而三平台矩阵
+      # 存在的理由（平台特定失败）恰恰浮现在最慢的那条腿上，true 帮不到。
+      # 代价一侧则是确定的：true 之后看不到「只有 win 挂」还是「三平台全挂」，为补这个信息还要
+      # 再跑一次整份矩阵。故维持 false。
+      fail-fast: false
+      matrix:
+        # 事件条件矩阵（额度架构核心）：
+        #   push main → 只 ubuntu（调试期 1 个 1x 计费 job）；
+        #   其余（PR / dispatch / 经 workflow_call 的 tag 发布）→ 三平台全跑。
+        # 三平台语义必留（helper crate 平台特定，mac/win 分支代码只有本平台 native build 能验），
+        # 只是把「每次 push 都验三平台」降频到「合 PR / 发布时验」。
+        # workflow_call 时 github.event_name/ref 取**调用方**的事件：tag push → ref=refs/tags/* →
+        # 走全矩阵分支，正确。
+        #
+        # 最前面多一段 dispatch 单平台分支（2026-08-05）：手动 dispatch 且选了具体平台 → 只跑那一条。
+        # 判据用 `github.event.inputs.os` 而**不是** `inputs.os`，并且先守 `os != ''`：package.yml 的
+        # `platform=all` workflow_dispatch 会把外层 event_name / payload 传给 workflow_call；那份 payload
+        # 有 `platform`、没有 `os`。若只写 `os != 'all'`，空串也满足，矩阵会生成 `[""]` ⇒
+        # `runs-on: ""`、job labels 为空，永远没有 runner 能接（B9 run 32357370395 实证）。push / PR /
+        # package workflow_call 的空 `os` 必须落回下方原矩阵；只有 CI 自己手动 dispatch 且明确选了
+        # 非 all 的 os 才走单平台腿。
+        os: >-
+          ${{ (github.event_name == 'workflow_dispatch'
+              && github.event.inputs.os != ''
+              && github.event.inputs.os != 'all')
+              && fromJSON(format('["{0}"]', github.event.inputs.os))
+              || ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+                  && fromJSON('["ubuntu-22.04"]')
+                  || fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 仓库脚本的最低运行时是 Node 24；CI 与 UI/Package 的实际构建口径统一钉在 Node 26。
+      # 显式安装后，三平台不再依赖 runner 镜像里随时可能漂移的预装 node。
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      # ── 核 → Cronet go.mod 来源解析（2026-08-10 新增）──
+      # 只 curl 一次 go.mod（~10KB），解析 linux/windows 的实际 require 版本并校验两个库的完整性 pin，不下载任何库。
+      # 装在**最便宜的那条腿**上、且排在装 Rust 之前：判据只要 manifest + 一次 curl，几秒出结果，
+      # 没理由让它跟在 clippy/build 后面。此前同一判据只存在于 package.yml，于是漂移要等到
+      # 发布/手动打包才暴露 —— 实测代价是 macos-arm64 腿（10x 计费）挂在第 15 个 step。
+      # 限 Linux：push main 只起 ubuntu 一条腿，全矩阵时另外两腿跑同一判据纯属重复付费。
+      - name: Resolve core-owned Cronet dependencies
+        if: runner.os == 'Linux'
+        run: node scripts/fetch-cronet.mjs --check-only
+
+      # ── Rust toolchain（2026-08-17：不再经 dtolnay/rust-toolchain@stable）──
+      # 三个 runner 镜像都预装 rustup 1.29（ubuntu/windows 带 stable 1.97.1、macos-14 带 1.96.0），
+      # 而本仓 `ui.yml` 早已直接写 `rustup toolchain install stable --profile minimal --no-self-update`
+      # —— 这里只是把同一条既有口径搬过来，代价是零，换掉一次 action tarball 拉取。
+      #
+      # 逐条复刻被替掉那个 composite action 的**全部**副作用（读它的 action.yml 得到，不是猜）：
+      #   · rustup toolchain install <tc> --profile minimal --component … --no-self-update
+      #   · rustup default <tc>
+      #   · CARGO_INCREMENTAL=0（仅当未设置）—— 这条是**它**设的，`Swatinem/rust-cache` 并不设；
+      #     漏掉会静默改变增量编译行为与缓存体积，属于「删掉也不报错」的那类回归，故必须带上
+      #   · CARGO_TERM_COLOR=always（仅当未设置）
+      #   · 打印 `rustc -Vv`
+      # 确认无消费者、故意不复刻的三项：`cachekey` output（本仓两处 rust-cache 都没引用）、
+      # 显式导出 `CARGO_HOME`（不设时 rust-cache 自己回落到同一个 ~/.cargo）、
+      # 「rustup 缺失就下载安装」（三镜像都自带；真缺了应该红，不该静默补装掩盖镜像变更）。
+      #
+      # 失效自曝：components 没装上时下面两条 `--version` 直接非零退出，不会拖到 fmt/clippy 才发现。
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # 原生构建前置：protoc（singbox-grpc build.rs 三平台都要）、Windows NASM（喂 btls-sys
+      # 的 BoringSSL 汇编；曾名 boring-sys2，grep "boring" 会扑空——2026-08-18 探针实测移除本步
+      # ⇒ Windows 腿 CMake configure 死在 btls-sys v0.5.6，run 32058640935，**活步，勿删**）、
+      # Linux webkit/gtk（Tauri）。首次 CI 运行前 workspace 从未在 runner 上
+      # 全量构建过，这些系统依赖一直缺 → clippy/build 在 build-script 阶段就炸。
+      #
+      # ── protoc：钉扎常量与版本依据的唯一真值在 scripts/fetch-protoc.mjs（2026-08-18，CI-4）──
+      # 此前「固定版本 + 四平台 URL + sha256」在本文件与 package.yml 各内联一份、靠对拍测试防漂；
+      # 收敛到脚本后只剩一处，对拍测试的 protoc 部分随之退休（NASM 仍内联两份，对拍照旧）。
+      # 版本为什么是 35.1、为什么升版本零行为差、sha256 从哪来、被替掉的 arduino/setup-protoc@v3
+      # 两个外部失效点 —— 全部在脚本头注，改版本先读它。sha 校验走 node createHash、解压走
+      # lib/extract-zip.mjs（三平台 CI 已绿），与 shell 是 bash 还是 pwsh 彻底解耦。
+      # （node 依赖：前置 Setup Node 已在三平台统一钉 26；不再借 runner 镜像的浮动预装版本。）
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      # ── NASM（Windows）：固定 URL + sha256（2026-08-17，替掉 ilammy/setup-nasm@v1）──
+      # 被替掉的 action 实际只做三件事（读它的 index.js 得到）：从
+      # `github.com/ilammy/setup-nasm/raw/mirror/...` 取 nasm-<ver>-win64.zip（取不到再退 www.nasm.us）、
+      # 解出 nasm.exe/ndisasm.exe、addPath —— **全程零校验**（一个 hash 都没有）。
+      # 版本取 nasm.us 官方 releasebuilds 当前最新稳定版 3.02；实际下载 win64 zip 后计算 sha256，
+      # 与 package.yml 同常量对拍。
+      # 代价说清楚：镜像那条腿去掉了，现在只有 www.nasm.us 一个源（本机实测那个 GitHub 镜像
+      # 当时正好也在 429，拿不到字节 ⇒ 无法核对它的 sha256，不写未验证的常量进来）。
+      # curl 带重试兜瞬时抖动；真下不来会红，不会静默跳过。
+      #
+      # 本步 **Windows-only**（`if: runner.os == 'Windows'`），所以校验器不写平台分支 ——
+      # 写了另一条也是死代码。「Git Bash 是否自带 `sha256sum`」已由 CI-1 的 windows-2022
+      # 真跑实证（当初六条不确定项里唯一「明确未证实」的那条）。
+      # 解压器用 System32 的 bsdtar 绝对路径，不用 `7z`：
+      # 两者都合乎「按平台写死」那条 🔴，但 `7z` 多押一个「它在 Git Bash 的 PATH 上」——
+      # runner 镜像清单只说装了 7zip、没说在不在 PATH（它对 Miniconda / MSYS2 才显式标注了
+      # 「不在 PATH」，对 7-Zip 的沉默是推断不是证据）。绝对路径把 PATH 这一维整个去掉，
+      # 于是 windows 腿（2x 计费）在「解压」这件事上只需要验证一个机制而不是两个。
+      - name: Install NASM (Windows — pinned URL + sha256)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          NASM_VERSION: '3.02'
+        run: |
+          set -euo pipefail
+          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
+          tmp="$(cygpath -u "$RUNNER_TEMP")"
+          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
+            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
+          echo "${sha256}  ${zip}" | sha256sum -c -
+          rm -rf "${tmp}/nasm-${NASM_VERSION}"
+          # zip 内已带 `nasm-<ver>/` 顶层目录，解到 tmp 即得 `<tmp>/nasm-<ver>/nasm.exe`。
+          # 落点是 `$tmp`（= RUNNER_TEMP，runner 保证存在；bsdtar 的 -C 要求目录已在，故成立）。
+          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
+          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
+          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
+          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
+
+      # 装完必须断言，而且要断言 **PATH 上解析到的那一个** —— 一个静默 no-op 的安装步骤比没有这
+      # 一步更坏：构建会悄悄用 runner 上碰巧存在的另一份 protoc，或者把「根本没装上」推迟到
+      # build.rs 里报一句没人看的错。上面两步把期望值写进 $GITHUB_ENV，所以任何一步被跳过 /
+      # 没执行，这里都会因 `set -u` 取不到变量而直接红 —— 「没执行」自曝，不需要额外的登记表。
+      - name: Assert pinned tools resolve on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+          if [ "$RUNNER_OS" = 'Windows' ]; then
+            echo "nasm → $(command -v nasm)"
+            got="$(nasm -v)"
+            case "$got" in
+              "NASM version ${NASM_EXPECT} "*) ;;
+              *) echo "::error::nasm on PATH is '$got', expected NASM version ${NASM_EXPECT}"; exit 1 ;;
+            esac
+          fi
+
+      - name: Install Linux system dependencies (Tauri webkit/gtk)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      # tauri build.rs 校验 bundle.resources 路径存在。resources/{dashboard,linux,win,mac-*}
+      # 被 .gitignore 排除（仅 .gitkeep + data/ 入库，核/仪表盘运行期 fetch），裸 checkout 无这些
+      # 目录 → build-script 报 "resource path doesn't exist" 而炸。ci 不打包、不需真产物，建空占位
+      # 目录 + .keep 占位文件（防 glob 零匹配）即可让 cargo build/clippy/test 通过。
+      - name: Create resource placeholder dirs (tauri build.rs 路径校验)
+        shell: bash
+        run: |
+          for d in dashboard linux win mac-arm64 mac-x64; do
+            mkdir -p "resources/$d" && touch "resources/$d/.keep"
+          done
+
+      # fmt 独立 job 之外的快速门：直接检 fmt 是否干净（--check 不改文件）。
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        env:
+          # helper crate 平台特定：本平台 build 才编对应 crate（避免无平台头文件的 target 编不过）。
+          RUSTFLAGS: "-D warnings"
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # rustdoc 文档约束门（2026-08-31 新增）：`///`/`//!` 里的链接若解不到真实符号、公开文档链接到
+      # 私有项、冗余地重复显式目标，或 HTML 标签无效，发布的文档都会失真；这类问题在 `cargo build`/
+      # `clippy` 里完全不可见（rustdoc 是独立的第二遍解析）。四个 `-D rustdoc::*` 都把警告提到错误。
+      #
+      # 只在 Linux 腿跑（省两腿重复付费）：与「Cross-check platform targets」同一取舍——这条门查的是
+      # 文档链接能否解析，不是能否编译，三平台的差异只在 `cfg(windows)`/`cfg(target_os = "macos")`
+      # 那批符号上，而这批符号本轮已全部去链接化为纯文本（见下方盲区说明），Linux 腿之外再跑不增加
+      # 检出力。
+      #
+      # 🔴 已知盲区（两条，都已 2026-08-31 实测）：
+      #  1. `--bins --document-private-items` 是必须的，缺一都会让 `src-tauri`（bin crate，无
+      #     lib.rs）的 `runtime`/`commands` 等模块整体跑不到 rustdoc 的默认取材面——不带这两个
+      #     flag 时，往 `src-tauri/src/runtime/` 下随便注入一条必坏链接，门读不到、rc=0（假绿）。
+      #  2. `--bins` 单独出现时会把 `cargo doc --workspace` 的目标种类**收窄成只剩 bin**——纯 lib
+      #     的 workspace 成员（`crates/*` 里 17 个只有 lib.rs、没有 `[[bin]]` 的 crate）会被整批
+      #     排除出取材面，而不是被文档判「零断链」。同一条注入实验证实：只传 `--bins` 时门读不到
+      #     `crates/config-engine` 里的坏链接，补上 `--lib` 后同一条必红。故 `--bins` 与 `--lib`
+      #     必须同时给，二者互不包含、互不能替代。
+      # 改这条门前，先重跑一次同款注入验证两条盲区仍然都咬得住。
+      - name: Rustdoc documentation invariants (deny four lints)
+        if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags -D rustdoc::private_intra_doc_links -D rustdoc::redundant_explicit_links"
+        run: cargo doc --no-deps --workspace --bins --lib --document-private-items
+
+      - name: Build
+        run: cargo build --workspace --verbose
+
+      # 平台特定代码在 Linux 腿上的**唯一**检出通道（2026-08-09 新增）。
+      #
+      # 背景：`#[cfg(windows)]` / `#[cfg(target_os = "macos")]` 里的代码 Linux 编译单元根本不含
+      # ⇒ 本腿对平台特定代码的检出力此前**恒为 0**（不是「这次没抓到」）。踩过一次：本地 + ubuntu
+      # 全绿而 windows-2022 红。
+      #
+      # 此前记的结论是「本地补不上：msvc 交叉卡 `lib.exe`」—— 那是**链接**期的限制，而 `cargo check`
+      # 不链接 ⇒ 对**不含 C 依赖**的三个纯 Rust crate 完全可行（本机实测 5s）。
+      #
+      # 覆盖边界（别当成「平台代码都验过了」）：只有 `polaris`(src-tauri) 不在内 —— 它的依赖树里有
+      # C 组件（cc-rs 要 `lib.exe` / `x86_64-w64-mingw32-gcc`），本机与 Linux runner 都给不出。
+      #
+      # 🔴 `polaris-helper` **在内**（2026-08-09 补）：上一版把它排除在外，理由是「build script 要 C
+      # 工具链」—— 那是**推断，没实测**。实测两个 target 都是秒过（它只依赖纯 Rust 的 windows-sys / nix）。
+      # 而 helper 恰恰是全仓平台特定代码最密集的 crate（Windows SCM + 命名管道 + wintun + WFP、
+      # macOS launchd + sysctl），排除它等于把最大的一块留在盲区里。
+      # ── android 腿的 C 工具链（2026-09-04）──
+      #
+      # 为什么 android 需要 NDK 而 msvc / darwin 不需要（**实测三点，别从「clippy 不链接」推断**）：
+      #   · 只设 ANDROID_NDK_HOME / NDK_HOME ⇒ `zstd-sys` 的 cc-rs 报
+      #     `failed to find tool "aarch64-linux-android-clang"` —— NDK 只提供带 API 号的
+      #     `aarch64-linux-android24-clang`，没有这个不带号的名字 ⇒ rc=101
+      #   · 只把 NDK 的 toolchain bin 放进 PATH ⇒ 过了 zstd-sys，倒在 `btls-sys`
+      #     （BoringSSL 的 CMake 子构建要从 ANDROID_NDK_ROOT 找 toolchain 文件）⇒ rc=101
+      #   · 两者都给 ⇒ rc=0（本机实测 `-p polaris-unlock-transport` 38s）
+      # 成因差别：msvc / darwin 上带 C 依赖的包（polaris / polaris-unlock-transport）本来就在豁免表里，
+      # 剩下的全是纯 Rust；android 这边我们**要**覆盖 wreq 那条 C 依赖链，所以真的需要一套工具链。
+      #
+      # 🔴 **不写 GITHUB_PATH**：NDK 的 bin 目录里有 `clang` / `ld.lld` / `llvm-*`，进了 job 级 PATH
+      #    会影响同 job 后面 Build / Test 两步的**宿主**编译。只导出目录，由用它的两步各自局部前置。
+      - name: Resolve Android NDK
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-}"
+          [ -n "$ndk" ] || {
+            echo "::error::runner 未暴露预装 NDK（ANDROID_NDK_LATEST_HOME）—— 镜像变了；"
+            echo "::error::Cross-check 的 aarch64-linux-android 腿要它编 zstd-sys / btls-sys，先确认再改本步"
+            exit 1; }
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$bin" ] || { echo "::error::NDK 里没有 toolchain 目录：$bin"; exit 1; }
+          # 🔴 预发布 NDK 当场红（2026-09-04 本机实测的真缺陷）：用 30.0.16138531-**beta3** 跑本腿时
+          #    `btls-sys` 的 bindgen 炸在 NDK 30 的 sysroot —— `sys/cdefs.h:365: error: Unversioned
+          #    target triples are not supported!`（bindgen 传的是不带 API 号的 aarch64-linux-android）。
+          #    镜像目前给的是稳定版，这条是给「哪天镜像换上预发布 NDK」留的自曝，免得报错点漂到 bindgen 里。
+          rev="$(sed -n 's/^Pkg.Revision *= *//p' "$ndk/source.properties" 2>/dev/null || true)"
+          case "$rev" in
+            *-*) echo "::error::runner 的 NDK 是预发布版（$rev）—— 实测 NDK 30 beta 会让 btls-sys 的 bindgen 报 'Unversioned target triples are not supported'。需要在本步显式选一个稳定版 NDK"; exit 1 ;;
+          esac
+          echo "NDK 版本：${rev:-未知}"
+          {
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "NDK_HOME=$ndk"
+            echo "ANDROID_NDK_ROOT=$ndk"
+            echo "ANDROID_NDK_BIN=$bin"
+          } >> "$GITHUB_ENV"
+          echo "NDK: $ndk"
+
+      - name: Cross-check platform targets (cfg(windows) / cfg(macos) / cfg(android) / cfg(ios) 分支)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios
+          # 覆盖面从 workspace 成员**推导**，不是手写清单 —— 新建 crate 默认被覆盖。
+          # 上一版硬编码 4 个 -p，而实测 19 个包里 17 个双目标可过：门只覆盖了它能覆盖的 4/17，
+          # 且新 crate 不会自动进清单、也没有任何东西在守这份清单的完整性。
+          mapfile -t ALL < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | sort)
+          # 🔴 豁免**按 target** 生效（2026-09-04 改）。此前主循环只读 `keys[]`：一个包只要出现在表里，
+          #    就对**所有** target 一起跳过，`.targets` 那个字段在主循环里是装饰品（只有下面的反腐烂步在读它）。
+          #    加 android 腿后这条不能再将就，两个方向都会出错：
+          #      · `polaris-unlock-transport` 在 msvc/darwin 上是 C 工具链问题，而 android 有 NDK ⇒ 它**能过**，
+          #        沿用旧逻辑会把它一并跳掉，覆盖面凭空少一格且没有任何东西会说；
+          #      · `polaris-helper` 只该在 android 上豁免（它在 msvc/darwin 上是覆盖面里最重要的一个包 ——
+          #        全仓平台特定代码最密集），旧逻辑会把它从那两个 target 上一起摘掉。
+          #
+          # 🔴 豁免还分**两档**（`scope`，2026-09-04）。起因：`polaris-helper` 在 android 上同时撞到两类东西 ——
+          #    「编不过」（`--all-targets` 会连 mac/win 模块一起编，而 `nix` 是 linux/macos target-specific
+          #    依赖 ⇒ 4 条 E0433）与「真·未使用」（lib 侧 `elapsed_ms` 在 android 零消费点 ⇒ dead_code）。
+          #    整包豁免会把后者这条**真信号**一起关掉，此后本包在 android 上的 lib 面再没人看。
+          #    故：前者走豁免（`scope: "tests"` 只摘测试目标），后者在 `crates/helper/src/lib.rs` 里修掉。
+          #      · `scope` 缺省 / "all" ⇒ 整包跳过；
+          #      · `scope: "tests"`     ⇒ 只跳过测试目标：该包仍逐条 `clippy -D warnings`，只是不带 --all-targets。
+          for t in x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios; do
+            mapfile -t EXEMPT < <(jq -r --arg t "$t" \
+              'to_entries[] | select(.value.targets | index($t)) | select((.value.scope // "all") != "tests") | .key' \
+              scripts/cross-target-exempt.json)
+            mapfile -t LIBONLY < <(jq -r --arg t "$t" \
+              'to_entries[] | select(.value.targets | index($t)) | select((.value.scope // "all") == "tests") | .key' \
+              scripts/cross-target-exempt.json)
+            TARGETS=()
+            for p in "${ALL[@]}"; do
+              skip=0
+              for e in "${EXEMPT[@]}" "${LIBONLY[@]}"; do [ "$p" = "$e" ] && skip=1; done
+              [ "$skip" = 0 ] && TARGETS+=("-p" "$p")
+            done
+            echo "--- $t：全目标覆盖 $(( ${#TARGETS[@]} / 2 )) 个包（整包豁免 ${EXEMPT[*]:-无}；仅 lib/bins ${LIBONLY[*]:-无}）"
+            # 「静默零执行」自曝：派生坏掉 / 豁免写宽了 ⇒ 在这里红，而不是循环跑 0 个包也绿。
+            # 下限是**逐 target 实测**的当前派生数（20 个包 − 该 target 的豁免数）；
+            # 新建 crate 只会让它变大，再豁免一个就会红并逼人来这里确认。
+            # 🔴 2026-09-06 加 ios 腿时从「全局一个数」改成**逐 target**：ios 实测要豁免 3 个包
+            #    （polaris / polaris-unlock-transport 的 cc-rs 撞 `xcrun` 缺席，polaris-helper 的
+            #    测试目标撞 `nix` 不覆盖 ios），另三个 target 各 2 个。把全局值降到 17 迁就 ios，
+            #    等于给另外三个 target 白送一格没人会发现的豁免额度 —— 那正是本断言要拦的方向。
+            case "$t" in
+              aarch64-apple-ios) FLOOR=17 ;;
+              *) FLOOR=18 ;;
+            esac
+            test "$(( ${#TARGETS[@]} / 2 ))" -ge "$FLOOR"
+            # 判据是 **clippy -D warnings**，不是 cargo check。
+            # 实测（2026-08-30）：同一份带 `field_reassign_with_default` 的 cfg(windows) 代码，
+            # `cargo check --target x86_64-pc-windows-gnu` rc=0（绿），`cargo clippy` 同 target rc=101。
+            # 也就是说旧的 check 循环对整类 clippy lint 检出力为零 —— 它抓的只是「编不过」，
+            # 而那批缺陷是「编得过但 clippy 拒收」，会一路滑到 windows-2022 腿的 clippy 步才炸。
+            #
+            # PATH 只在 android 那一格前置（成因见上一步的 🔴）。用命令前缀而不是 `export`：
+            # 射程就是这一条命令，读的人不必回头找它在哪里被改回去。
+            extra=""
+            [ "$t" = aarch64-linux-android ] && extra="$ANDROID_NDK_BIN:"
+            PATH="${extra}${PATH}" cargo clippy --target "$t" --all-targets "${TARGETS[@]}" -- -D warnings
+            # `scope: "tests"` 那一档：同样的 `-D warnings`，只是不带 --all-targets。
+            # 不写成「有就跑、没有就算了」的静默形态 —— 空集时打印一行说明，让「这一档这次没执行」可读。
+            if [ "${#LIBONLY[@]}" -gt 0 ]; then
+              LIB_ARGS=()
+              for p in "${LIBONLY[@]}"; do LIB_ARGS+=("-p" "$p"); done
+              echo "    · 仅 lib/bins：${LIBONLY[*]}"
+              PATH="${extra}${PATH}" cargo clippy --target "$t" "${LIB_ARGS[@]}" -- -D warnings
+            else
+              echo "    · 仅 lib/bins：本 target 无此档条目"
+            fi
+          done
+          # 🔴 `polaris`(src-tauri) 在 android 上被豁免出上面的 clippy 循环（既有 lint 债，理由在豁免表），
+          #    但**它的编译面不能跟着一起丢**：本门要抓的「一次改坏 Android 交叉编译的 Rust 改动」恰好
+          #    只住在这个包里（K4 的 Rust↔Kotlin 桥在 `src-tauri/src/**`）。丢了它，那类改动会一路绿到
+          #    有人手工打包为止 —— APK 腿（android.yml）虽然真编它，但按登记表只在 Android 专属面被改时才跑。
+          #    `cargo check` 不 deny warnings ⇒ 不受那批 dead_code 影响，仍抓得住「编不过」。本机实测 32s。
+          # 🔴 **ios 上没有这条对应的补救，而且补不了**（2026-09-06 实测）：polaris 在 ios 上不是 lint 债，
+          #    是 `objc2-exception-helper` / `zstd-sys` 两个 build script 直接倒在
+          #    `error occurred in cc-rs: failed to find tool "xcrun"` —— 那是**编译之前**的阶段（cc-rs 要
+          #    Apple SDK），不是链接期，`cargo check` 也绕不过（它照样跑 build script）。
+          #    ⇒ src-tauri 那 12 处穷举 match 的 iOS 臂在非 macOS runner 上一行都编不到。ios 这条腿守住的
+          #    是另外 17 个纯 Rust 包的 iOS 编译面，别把它读成「整仓 iOS 面已验」。
+          PATH="$ANDROID_NDK_BIN:$PATH" cargo check --target aarch64-linux-android -p polaris
+
+      # ── Android 影响面的**产物级**完备性门（2026-09-05）──
+      #
+      # `ANDROID_IMPACT_SCOPES`（scripts/classify-ci-impact.mjs）是 `android.yml` 的**唯一**触发面，
+      # 而那条 workflow 没有 push/PR 触发 ⇒ 新增一个 Android 专属文件而不登记，APK 腿永远不为它跑。
+      # 此前两轮完备性门的取材面都是源码级正则推导，等于在重新实现 rustc 的 `mod` 解析与 cfg 求值：
+      # 每补一种形态，下一轮验收就找出下一种（两层嵌套 / `#[cfg_attr(…, path = …)]` /
+      # `r"android"` / `#[cfg(...)]mod foo;` 零空白 / 内联夹具的 raw string 污染判据）。
+      #
+      # 这里换真值源：`cargo check` 默认下发 `--emit=dep-info`，`.d` 是 rustc **解析完模块图、
+      # 求值完 cfg 之后**写出的源文件清单。Android 专属文件集 = android 编译面 − host 编译面。
+      # 上面五种形态在隔离工程里一次写全，六条全部落在差集里（raw string 夹具两侧都没有它 ——
+      # rustc 解析的是真模块图，字符串里的文本结构上就进不来）。射程与已知上限见那个脚本的头注。
+      #
+      # 🔴 两侧选择器必须**逐字对称**，都是 `cargo check --workspace`（lib + bins）：
+      #  · 不能拿上面的 `cargo clippy --workspace --all-targets` 当 host 侧省钱（那是零额外编译）——
+      #    host 侧一旦更宽，`#[cfg(any(target_os = "android", test))]` 的文件会同时落进 host 的 test
+      #    单元、从差集里掉出去，方向是 **fail-open**（门说全绿而实际漏了）。这个 pattern 仓里真的
+      #    在用：`src-tauri/src/runtime/stats/source.rs` 的三个通道常量就是这么写的。
+      #  · 也不能两侧都上 `--all-targets`：android 侧带它会让 `polaris-helper` 撞 4 条 E0433
+      #    （同上一步注释）。代价是**测试目标里的 android 专属代码不在射程内**，已如实登记。
+      #
+      # 成本：android 侧接近零 —— 上一步的 `cargo check --target aarch64-linux-android -p polaris`
+      # 已把 20 个成员里 19 个的 check 单元编热，本步只多一个 `polaris-source-probe`。host 侧是本
+      # 方案**唯一**的实质代价：check 单元与本 job 已有的 clippy（走 clippy-driver wrapper）、
+      # build（出 rlib）、test（test 构型）指纹都不共享，是一趟真的增量编译。若哪天它进不了每个 PR
+      # 的关键路径，退路是加 `github.event_name != 'pull_request'`（与下一步「豁免反腐烂」同一取舍）：
+      # 代价是延迟到合入后一次 run 才发现，不是漏检。
+      #
+      # JSON 用 `>` 重定向、**不接管道**：管道会让 cargo 自己的 rc 失真。且 dep-info 是类型检查
+      # **之前**产出的（rustc 对有类型错误的代码照样写出正确 `.d`），「.d 是对的」与「代码编得过」
+      # 是两件事 —— 两条 cargo 的 rc 必须真的拦住这一步，故 errexit 全程有效。
+      - name: Android impact face must be registered (dep-info 对差)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATH="$ANDROID_NDK_BIN:$PATH" cargo check --workspace --target aarch64-linux-android --message-format=json-render-diagnostics > "$RUNNER_TEMP/android-units.json"
+          cargo check --workspace --message-format=json-render-diagnostics > "$RUNNER_TEMP/host-units.json"
+          node scripts/check-android-only-face.mjs --android "$RUNNER_TEMP/android-units.json" --host "$RUNNER_TEMP/host-units.json"
+
+      # 豁免表的反腐烂：豁免一旦不再必要就必须自己转红，否则它会退化成一张永久白名单。
+      # 只在非 PR 事件上跑：两个被豁免的包都在 build script 阶段就失败，成本低但不为零，
+      # 而豁免腐烂最多延迟到合入后一次 run 被发现，不值得给每个 PR 加时。
+      - name: Cross-target exemptions must still be necessary
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -uo pipefail
+          rot=0
+          # NDK 的 bin 同样要前置：少了它，android 上的豁免会因为「找不到 C 工具链」而失败，
+          # 于是本步得出「豁免仍必要」——**理由却是假的**。豁免腐烂检查必须与主循环量同一件事。
+          export PATH="$ANDROID_NDK_BIN:$PATH"
+          for e in $(jq -r 'keys[]' scripts/cross-target-exempt.json); do
+            for t in $(jq -r --arg e "$e" '.[$e].targets[]' scripts/cross-target-exempt.json); do
+              if cargo clippy --target "$t" --all-targets -p "$e" -- -D warnings >/dev/null 2>&1; then
+                echo "::error::豁免已腐烂：$e 现在能过 $t —— 从 scripts/cross-target-exempt.json 删掉它"
+                rot=1
+              fi
+            done
+          done
+          exit $rot
+
+      - name: Test
+        # `--no-fail-fast`（2026-08-05）：默认行为是**某个 crate 挂了就不再跑后面的 crate**，
+        # 于是一次 run 只能看见「第一个」失败。修 Windows 腿时这一条把成本放大成 N 倍——
+        # 每修一条要再等一整轮（Windows 冷编译约 20 分钟），而那一轮又只暴露下一条。
+        # 实测连剥四层（checkout 保留名 → uninstall+dns → launchd → helper-client）才见底。
+        # 加上它之后，一次 run 给出**全部**失败清单，代价只是失败时多跑几个 crate 的测试（秒级）。
+        run: cargo test --workspace --no-fail-fast

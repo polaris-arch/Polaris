@@ -1,0 +1,463 @@
+════════════════════════════════════════════════════════════════════════
+Polaris route_probe 真机抓取（Windows）
+
+读这份样本、准备照着写解析器的人，先看这三条：
+
+ 1. 两张表的"接口"列根本不是同一种东西（这是 Windows 与 macOS/Linux 最大的不同）：
+      IPv4 路由表的 Interface 列是【本地 IP 地址】，不是接口名；
+      IPv6 路由表的 If 列是【接口索引】（整数）。
+    两者都落不到接口名上，必须再查一张对照表：route print 开头的 Interface List
+    （索引 → 描述）、@@@GET_NETIPADDRESS（IP → 接口别名）、或直接用 @@@GET_NETROUTE_*
+    （它一列就给出 InterfaceAlias）。这三张表本脚本都抓了，别只拿 route print 就动手。
+
+ 2. route print 的表头是本地化的：中文系统上是「接口列表」「IPv4 路由表」「活动路由」。
+    按英文表头硬匹配的解析器在中文机器上解析出空表 —— 而空表长得像"这台机器没有路由"。
+    本次抓取的语言 / 代码页记在 @@@META 里。中文机器上抓的样本比英文的更有价值。
+
+ 3. 编码：route print / ipconfig 是原生 exe，输出按控制台代码页编码。
+    若 @@@ROUTE_PRINT_4 看起来是乱码，用 Windows PowerShell 5.1 重跑，或先 chcp 65001。
+    @@@GET_NETROUTE_* / @@@GET_NETADAPTER 走 cmdlet 对象、不经控制台解码，天然免疫这条。
+
+@@@GET_NETADAPTER 必须带 InterfaceType（IANA ifType）：131 = IF_TYPE_TUNNEL，6 = 以太网。
+隧道名单只能靠它判 —— 这台机器上实测 Teredo / IP-HTTPS / 6to4 三个隧道全是 131，
+两块以太网卡是 6。两条看着可行的土办法都必错：「描述列为空」恰好圈中 Teredo/IP-HTTPS/6to4，
+但 Tailscale 的 wintun **有**描述；「没有 MAC」会把内核调试适配器一起圈进来，而 wintun **自带** MAC。
+ComponentID / NdisPhysicalMedium 一并带上作交叉判据。
+
+落库：把本文件原样放进
+  polaris/crates/system-integration/src/route_probe/tests/fixtures/
+不要手工规整（行尾空格、对齐、空行、CRLF 都是证据）。
+════════════════════════════════════════════════════════════════════════
+@@@META
+platform=windows
+host=sway
+label=ovpn-tun-connected
+date=2026-09-13 b4:75:5c +08:00
+script=polaris-collect-routes-windows.ps1
+psversion=5.1.26100.9444
+psedition=Desktop
+os=Microsoft Windows NT 10.0.26200.0
+culture=zh-CN
+uiculture=en-US
+consoleoutputencoding=utf-8
+@@@ROUTE_PRINT_4
+===========================================================================
+Interface List
+ 22...........................Tailscale Tunnel
+  8...bc 24 11 24 98 95 ......Red Hat VirtIO Ethernet Adapter
+  2...00 ff 1a 2b d5 64 ......TAP-Windows Adapter V9
+  1...........................Software Loopback Interface 1
+===========================================================================
+
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0     192.168.10.1   192.168.10.207     16
+         10.8.0.0    255.255.255.0         On-link          10.8.0.2    281
+         10.8.0.2  255.255.255.255         On-link          10.8.0.2    281
+       10.8.0.255  255.255.255.255         On-link          10.8.0.2    281
+        10.66.0.0    255.255.255.0         10.8.0.1         10.8.0.2     25
+         32.0.0.1  255.255.255.255  100.100.100.100        32.0.0.31      5
+         32.0.0.2  255.255.255.255  100.100.100.100        32.0.0.31      5
+         32.0.0.3  255.255.255.255  100.100.100.100        32.0.0.31      5
+         32.0.0.4  255.255.255.255  100.100.100.100        32.0.0.31      5
+         32.0.0.5  255.255.255.255  100.100.100.100        32.0.0.31      5
+         32.0.0.7  255.255.255.255  100.100.100.100        32.0.0.31      5
+         32.0.0.8  255.255.255.255  100.100.100.100        32.0.0.31      5
+         32.0.0.9  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.10  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.12  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.13  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.14  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.15  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.17  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.19  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.20  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.21  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.23  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.24  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.25  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.26  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.27  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.28  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.29  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.30  255.255.255.255  100.100.100.100        32.0.0.31      5
+        32.0.0.31  255.255.255.255         On-link         32.0.0.31    261
+        32.0.0.32  255.255.255.255  100.100.100.100        32.0.0.31      5
+  100.100.100.100  255.255.255.255         On-link         32.0.0.31      5
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1   5811
+        127.0.0.1  255.255.255.255         On-link         127.0.0.1   5811
+  127.255.255.255  255.255.255.255         On-link         127.0.0.1   5811
+     192.168.10.0    255.255.255.0         On-link    192.168.10.207    271
+   192.168.10.207  255.255.255.255         On-link    192.168.10.207    271
+   192.168.10.255  255.255.255.255         On-link    192.168.10.207    271
+        224.0.0.0        240.0.0.0         On-link         127.0.0.1   5811
+        224.0.0.0        240.0.0.0         On-link    192.168.10.207    271
+        224.0.0.0        240.0.0.0         On-link          10.8.0.2    281
+  255.255.255.255  255.255.255.255         On-link         127.0.0.1   5811
+  255.255.255.255  255.255.255.255         On-link    192.168.10.207    271
+  255.255.255.255  255.255.255.255         On-link          10.8.0.2    281
+===========================================================================
+Persistent Routes:
+  Network Address          Netmask  Gateway Address  Metric
+          0.0.0.0          0.0.0.0     192.168.10.1       1
+===========================================================================
+@@@ROUTE_PRINT_6
+===========================================================================
+Interface List
+ 22...........................Tailscale Tunnel
+  8...bc 24 11 24 98 95 ......Red Hat VirtIO Ethernet Adapter
+  2...00 ff 1a 2b d5 64 ......TAP-Windows Adapter V9
+  1...........................Software Loopback Interface 1
+===========================================================================
+
+IPv6 Route Table
+===========================================================================
+Active Routes:
+ If Metric Network Destination      Gateway
+  8    271 ::/0                     fe80::fff:1f0b:6e3c:e05a
+  1    331 ::1/128                  On-link
+  8    271 530d:ebd9:89bf:95d8::/60 fe80::fff:1f0b:6e3c:e05a
+  8    271 530d:ebd9:89bf:95d8::/64 On-link
+  8    271 530d:ebd9:89bf:95d8:ef5f:4baa:db2f:9532/128
+                                    On-link
+  8    271 530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413/128
+                                    On-link
+  8    271 530d:ebd9:89bf:95d8:380c:163d:954d:16cf/128
+                                    On-link
+  8    271 530d:ebd9:89bf:95d8:f643:21ee:360c:171d/128
+                                    On-link
+  8    271 530d:ebd9:89bf:95d8:bcbe:562d:aac8:1ef1/128
+                                    On-link
+  8    271 530d:ebd9:89bf:95d8:8d99:917d:2276:c86/128
+                                    On-link
+  8    271 8db8:e8a1:92da:9f6b::/60 fe80::fff:1f0b:6e3c:e05a
+  8    271 8db8:e8a1:92da:9f6b::/64 On-link
+  8    271 8db8:e8a1:92da:9f6b::2bb/128
+                                    On-link
+  8    271 8db8:e8a1:92da:9f6b:ef5f:4baa:db2f:9532/128
+                                    On-link
+  8    271 8db8:e8a1:92da:9f6b:380c:163d:954d:16cf/128
+                                    On-link
+  8    271 8db8:e8a1:92da:9f6b:f643:21ee:360c:171d/128
+                                    On-link
+  8    271 8db8:e8a1:92da:9f6b:bcbe:562d:aac8:1ef1/128
+                                    On-link
+  8    271 8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73/128
+                                    On-link
+  8    271 8db8:e8a1:92da:9f6b:8d99:917d:2276:c86/128
+                                    On-link
+  8    271 8db8:e8a1:92da:caa4::/64 fe80::221f:e5d9:65dd:9095
+  8    271 8db8:e8a1:92da:caa4::/64 fe80::0943:8f79:c8cb:17d0
+  8    271 16f7:9c0:d0e5:569d::/56  fe80::fff:1f0b:6e3c:e05a
+  8    271 16f7:9c0:d0e5:569d::/64  On-link
+  8    271 16f7:9c0:d0e5:569d::2bb/128
+                                    On-link
+  8    271 16f7:9c0:d0e5:569d:ef5f:4baa:db2f:9532/128
+                                    On-link
+  8    271 16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf/128
+                                    On-link
+  8    271 16f7:9c0:d0e5:569d:380c:163d:954d:16cf/128
+                                    On-link
+  8    271 16f7:9c0:d0e5:569d:f643:21ee:360c:171d/128
+                                    On-link
+  8    271 16f7:9c0:d0e5:569d:bcbe:562d:aac8:1ef1/128
+                                    On-link
+  8    271 16f7:9c0:d0e5:569d:8d99:917d:2276:c86/128
+                                    On-link
+ 22      5 fd7a:115c:a1e0::/48      fd7a:115c:a1e0::e9
+ 22    261 fd7a:115c:a1e0::52/128   On-link
+ 22      5 fd7a:115c:a1e0::e9/128   On-link
+  8    271 fe80::/64                On-link
+  2    281 fe80::/64                On-link
+  2    281 fe80::042f:65e0:22cd:b6c3/128
+                                    On-link
+  8    271 fe80::8578:0cf5:9048:f4a2/128
+                                    On-link
+  1    331 ff00::/8                 On-link
+  8    271 ff00::/8                 On-link
+  2    281 ff00::/8                 On-link
+===========================================================================
+Persistent Routes:
+  None
+@@@GET_NETADAPTER
+
+InterfaceAlias                        InterfaceIndex InterfaceType NdisPhysicalMedium ComponentID                                  DriverDescription                      Name                                  InterfaceDescription                   Status      MacAddress       
+--------------                        -------------- ------------- ------------------ -----------                                  -----------------                      ----                                  --------------------                   ------      ----------       
+Teredo Tunneling Pseudo-Interface                 12           131                  0                                                                                     Teredo Tunneling Pseudo-Interface                                            Not Present                  
+以太网                                                8             6                  0 PCI\VEN_1AF4&DEV_1000&SUBSYS_00011AF4&REV_00 Red Hat VirtIO Ethernet Adapter        以太网                                   Red Hat VirtIO Ethernet Adapter        Up          81-51-90-51-a6-00
+Tailscale                                         22            53                  0 Wintun                                       Wintun Userspace Tunnel                Tailscale                             Tailscale Tunnel                       Up                           
+以太网(内核调试器)                                         7             6                 14 root\kdnic                                   Microsoft Kernel Debug Network Adapter 以太网(内核调试器)                            Microsoft Kernel Debug Network Adapter Not Present                  
+Microsoft IP-HTTPS Platform Interface              6           131                  0                                                                                     Microsoft IP-HTTPS Platform Interface                                        Not Present                  
+OpenVPN TAP-Windows6                               2            53                  0 root\tap0901                                 TAP-Windows Adapter V9                 OpenVPN TAP-Windows6                  TAP-Windows Adapter V9                 Up          84-3e-18-e6-7b-15
+6to4 Adapter                                       3           131                  0                                                                                     6to4 Adapter                                                                 Not Present                  
+
+
+@@@NETSH_INTERFACE
+
+Idx     Met         MTU          State                Name
+---  ----------  ----------  ------------  ---------------------------
+  1        5555  4294967295  connected     Loopback Pseudo-Interface 1
+  2          25        1500  connected     OpenVPN TAP-Windows6
+  8          15        1500  connected     以太网
+ 22           5        1280  connected     Tailscale
+
+@@@GET_NETROUTE_4
+
+DestinationPrefix  InterfaceAlias              InterfaceIndex NextHop         RouteMetric       Store
+-----------------  --------------              -------------- -------         -----------       -----
+127.0.0.0/8        Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
+127.0.0.1/32       Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
+127.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
+224.0.0.0/4        Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
+255.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
+10.66.0.0/24       OpenVPN TAP-Windows6                     2 10.8.0.1                  0 ActiveStore
+10.8.0.0/24        OpenVPN TAP-Windows6                     2 0.0.0.0                 256 ActiveStore
+10.8.0.2/32        OpenVPN TAP-Windows6                     2 0.0.0.0                 256 ActiveStore
+10.8.0.255/32      OpenVPN TAP-Windows6                     2 0.0.0.0                 256 ActiveStore
+224.0.0.0/4        OpenVPN TAP-Windows6                     2 0.0.0.0                 256 ActiveStore
+255.255.255.255/32 OpenVPN TAP-Windows6                     2 0.0.0.0                 256 ActiveStore
+0.0.0.0/0          以太网                                      8 192.168.10.1              1 ActiveStore
+192.168.10.0/24    以太网                                      8 0.0.0.0                 256 ActiveStore
+192.168.10.207/32  以太网                                      8 0.0.0.0                 256 ActiveStore
+192.168.10.255/32  以太网                                      8 0.0.0.0                 256 ActiveStore
+224.0.0.0/4        以太网                                      8 0.0.0.0                 256 ActiveStore
+255.255.255.255/32 以太网                                      8 0.0.0.0                 256 ActiveStore
+100.100.100.100/32 Tailscale                               22 0.0.0.0                   0 ActiveStore
+32.0.0.1/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.10/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.12/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.13/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.14/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.15/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.17/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.19/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.2/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.20/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.21/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.23/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.24/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.25/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.26/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.27/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.28/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.29/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.3/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.30/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.31/32       Tailscale                               22 0.0.0.0                 256 ActiveStore
+32.0.0.32/32       Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.4/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.5/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.7/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.8/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+32.0.0.9/32        Tailscale                               22 100.100.100.100           0 ActiveStore
+
+
+@@@GET_NETROUTE_6
+
+DestinationPrefix                           InterfaceAlias              InterfaceIndex NextHop                   RouteMetric       Store
+-----------------                           --------------              -------------- -------                   -----------       -----
+::1/128                                     Loopback Pseudo-Interface 1              1 ::                                256 ActiveStore
+ff00::/8                                    Loopback Pseudo-Interface 1              1 ::                                256 ActiveStore
+fe80::/64                                   OpenVPN TAP-Windows6                     2 ::                                256 ActiveStore
+fe80::042f:65e0:22cd:b6c3/128               OpenVPN TAP-Windows6                     2 ::                                256 ActiveStore
+ff00::/8                                    OpenVPN TAP-Windows6                     2 ::                                256 ActiveStore
+::/0                                        以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+530d:ebd9:89bf:95d8::/60                    以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+530d:ebd9:89bf:95d8::/64                    以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:ef5f:4baa:db2f:9532/128 以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413/128 以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:380c:163d:954d:16cf/128 以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:f643:21ee:360c:171d/128 以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:bcbe:562d:aac8:1ef1/128 以太网                                      8 ::                                256 ActiveStore
+530d:ebd9:89bf:95d8:8d99:917d:2276:c86/128  以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b::/60                    以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+8db8:e8a1:92da:9f6b::/64                    以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b::2bb/128                以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:ef5f:4baa:db2f:9532/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:380c:163d:954d:16cf/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:f643:21ee:360c:171d/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:bcbe:562d:aac8:1ef1/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73/128 以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:9f6b:8d99:917d:2276:c86/128  以太网                                      8 ::                                256 ActiveStore
+8db8:e8a1:92da:caa4::/64                    以太网                                      8 fe80::221f:e5d9:65dd:9095         256 ActiveStore
+8db8:e8a1:92da:caa4::/64                    以太网                                      8 fe80::0943:8f79:c8cb:17d0         256 ActiveStore
+16f7:9c0:d0e5:569d::/56                     以太网                                      8 fe80::fff:1f0b:6e3c:e05a          256 ActiveStore
+16f7:9c0:d0e5:569d::/64                     以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d::2bb/128                 以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:ef5f:4baa:db2f:9532/128  以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf/128   以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:380c:163d:954d:16cf/128  以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:f643:21ee:360c:171d/128  以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:bcbe:562d:aac8:1ef1/128  以太网                                      8 ::                                256 ActiveStore
+16f7:9c0:d0e5:569d:8d99:917d:2276:c86/128   以太网                                      8 ::                                256 ActiveStore
+fe80::/64                                   以太网                                      8 ::                                256 ActiveStore
+fe80::8578:0cf5:9048:f4a2/128               以太网                                      8 ::                                256 ActiveStore
+ff00::/8                                    以太网                                      8 ::                                256 ActiveStore
+fd7a:115c:a1e0::/48                         Tailscale                               22 fd7a:115c:a1e0::e9                  0 ActiveStore
+fd7a:115c:a1e0::52/128                      Tailscale                               22 ::                                256 ActiveStore
+fd7a:115c:a1e0::e9/128                      Tailscale                               22 ::                                  0 ActiveStore
+
+
+@@@GET_NETIPADDRESS
+
+IPAddress                               PrefixLength AddressFamily InterfaceAlias              InterfaceIndex
+---------                               ------------ ------------- --------------              --------------
+127.0.0.1                                          8          IPv4 Loopback Pseudo-Interface 1              1
+::1                                              128          IPv6 Loopback Pseudo-Interface 1              1
+10.8.0.2                                          24          IPv4 OpenVPN TAP-Windows6                     2
+fe80::042f:65e0:22cd:b6c3%2                       64          IPv6 OpenVPN TAP-Windows6                     2
+192.168.10.207                                    24          IPv4 以太网                                      8
+8db8:e8a1:92da:9f6b::2bb                         128          IPv6 以太网                                      8
+530d:ebd9:89bf:95d8:8d99:917d:2276:c86           128          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:380c:163d:954d:16cf          128          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:ef5f:4baa:db2f:9532          128          IPv6 以太网                                      8
+530d:ebd9:89bf:95d8:bcbe:562d:aac8:1ef1          128          IPv6 以太网                                      8
+530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413           64          IPv6 以太网                                      8
+530d:ebd9:89bf:95d8:ef5f:4baa:db2f:9532          128          IPv6 以太网                                      8
+530d:ebd9:89bf:95d8:f643:21ee:360c:171d          128          IPv6 以太网                                      8
+530d:ebd9:89bf:95d8:380c:163d:954d:16cf          128          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:f643:21ee:360c:171d           128          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:380c:163d:954d:16cf           128          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf             64          IPv6 以太网                                      8
+fe80::8578:0cf5:9048:f4a2%8                       64          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:8d99:917d:2276:c86            128          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:bcbe:562d:aac8:1ef1           128          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73           64          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:bcbe:562d:aac8:1ef1          128          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:f643:21ee:360c:171d          128          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d:ef5f:4baa:db2f:9532           128          IPv6 以太网                                      8
+16f7:9c0:d0e5:569d::2bb                          128          IPv6 以太网                                      8
+8db8:e8a1:92da:9f6b:8d99:917d:2276:c86           128          IPv6 以太网                                      8
+32.0.0.31                                         32          IPv4 Tailscale                               22
+fe80::e0f0:5ebb:ee26:2479%22                      64          IPv6 Tailscale                               22
+fd7a:115c:a1e0::52                               128          IPv6 Tailscale                               22
+
+
+@@@NETSH_INTERFACE_6
+
+Idx     Met         MTU          State                Name
+---  ----------  ----------  ------------  ---------------------------
+  1          75  4294967295  connected     Loopback Pseudo-Interface 1
+  2          25        1500  connected     OpenVPN TAP-Windows6
+  8          15        1492  connected     以太网
+ 22           5        1280  connected     Tailscale
+
+@@@IPCONFIG
+
+Windows IP Configuration
+
+   Host Name . . . . . . . . . . . . : Sway
+   Primary Dns Suffix  . . . . . . . : 
+   Node Type . . . . . . . . . . . . : Hybrid
+   IP Routing Enabled. . . . . . . . : No
+   WINS Proxy Enabled. . . . . . . . : No
+
+Unknown adapter Tailscale:
+
+   Connection-specific DNS Suffix  . : hs.net
+   Description . . . . . . . . . . . : Tailscale Tunnel
+   Physical Address. . . . . . . . . : 
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   IPv6 Address. . . . . . . . . . . : fd7a:115c:a1e0::52(Preferred) 
+   Link-local IPv6 Address . . . . . : fe80::e0f0:5ebb:ee26:2479%22(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 32.0.0.31(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.255
+   Default Gateway . . . . . . . . . : 
+   DNS Servers . . . . . . . . . . . : fd7a:115c:a1e0::e9
+                                       100.100.100.100
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+   Connection-specific DNS Suffix Search List :
+                                       hs.net
+                                       lan
+
+Ethernet adapter ��̫��:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Red Hat VirtIO Ethernet Adapter
+   Physical Address. . . . . . . . . : 81-51-90-51-a6-00
+   DHCP Enabled. . . . . . . . . . . : No
+   Autoconfiguration Enabled . . . . : Yes
+   IPv6 Address. . . . . . . . . . . : 530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413(Preferred) 
+   IPv6 Address. . . . . . . . . . . : 8db8:e8a1:92da:9f6b::2bb(Preferred) 
+   Lease Obtained. . . . . . . . . . : 2026��9��13�� fc:01:26
+   Lease Expires . . . . . . . . . . : 2026��9��13�� 95:28:74
+   IPv6 Address. . . . . . . . . . . : 8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73(Preferred) 
+   IPv6 Address. . . . . . . . . . . : 16f7:9c0:d0e5:569d::2bb(Preferred) 
+   Lease Obtained. . . . . . . . . . : 2026��9��9�� 5:79:77
+   Lease Expires . . . . . . . . . . : 2026��9��13�� 95:28:26
+   IPv6 Address. . . . . . . . . . . : 16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf(Preferred) 
+   Temporary IPv6 Address. . . . . . : 530d:ebd9:89bf:95d8:ef5f:4baa:db2f:9532(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 530d:ebd9:89bf:95d8:380c:163d:954d:16cf(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 530d:ebd9:89bf:95d8:f643:21ee:360c:171d(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 530d:ebd9:89bf:95d8:bcbe:562d:aac8:1ef1(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 530d:ebd9:89bf:95d8:8d99:917d:2276:c86(Preferred) 
+   Temporary IPv6 Address. . . . . . : 8db8:e8a1:92da:9f6b:ef5f:4baa:db2f:9532(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 8db8:e8a1:92da:9f6b:380c:163d:954d:16cf(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 8db8:e8a1:92da:9f6b:f643:21ee:360c:171d(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 8db8:e8a1:92da:9f6b:bcbe:562d:aac8:1ef1(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 8db8:e8a1:92da:9f6b:8d99:917d:2276:c86(Preferred) 
+   Temporary IPv6 Address. . . . . . : 16f7:9c0:d0e5:569d:ef5f:4baa:db2f:9532(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 16f7:9c0:d0e5:569d:380c:163d:954d:16cf(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 16f7:9c0:d0e5:569d:f643:21ee:360c:171d(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 16f7:9c0:d0e5:569d:bcbe:562d:aac8:1ef1(Deprecated) 
+   Temporary IPv6 Address. . . . . . : 16f7:9c0:d0e5:569d:8d99:917d:2276:c86(Preferred) 
+   Link-local IPv6 Address . . . . . : fe80::8578:0cf5:9048:f4a2%8(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 192.168.10.207(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : fe80::fff:1f0b:6e3c:e05a%8
+                                       192.168.10.1
+   DHCPv6 IAID . . . . . . . . . . . : 112993297
+   DHCPv6 Client DUID. . . . . . . . : 84-e6-e6-84-4a-a4-a6-13-81-51-90-51-98-95
+   DNS Servers . . . . . . . . . . . : 8db8:e8a1:92da:9f6b::9
+                                       192.168.10.1
+                                       8db8:e8a1:92da:9f6b::9
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+
+Unknown adapter OpenVPN TAP-Windows6:
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : TAP-Windows Adapter V9
+   Physical Address. . . . . . . . . : 84-3e-18-e6-7b-15
+   DHCP Enabled. . . . . . . . . . . : Yes
+   Autoconfiguration Enabled . . . . : Yes
+   Link-local IPv6 Address . . . . . : fe80::042f:65e0:22cd:b6c3%2(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 10.8.0.2(Preferred) 
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Lease Obtained. . . . . . . . . . : 2026��9��13�� b4:e9:75
+   Lease Expires . . . . . . . . . . : 2027��9��13�� b4:e9:75
+   Default Gateway . . . . . . . . . : 
+   DHCP Server . . . . . . . . . . . : 10.8.0.0
+   DHCPv6 IAID . . . . . . . . . . . : 33619738
+   DHCPv6 Client DUID. . . . . . . . : 84-e6-e6-84-4a-a4-a6-13-81-51-90-51-98-95
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+@@@TAILSCALE
+32.0.0.31           sway              youzhen.lin     windows  -                                                    
+fd7a:115c:a1e0::5   aliyun-hb         fengsen.deng    linux    offline, last seen 34d ago                           
+fd7a:115c:a1e0::1   aneya-pad         tagged-devices  android  offline, last seen 8d ago                            
+fd7a:115c:a1e0::e   ipad-pro          fengsen.deng    iOS      offline, last seen 93d ago                           
+fd7a:115c:a1e0::5   iphone15-pro-max  tagged-devices  iOS      -                                                    
+fd7a:115c:a1e0::0   lml9pn690         fengsen.deng    macOS    idle; offers exit node                               
+fd7a:115c:a1e0::13  localhost         tagged-devices  android  offline, last seen 105d ago                          
+fd7a:115c:a1e0::9   mac-m4            tagged-devices  macOS    offline, last seen 3d ago                            
+fd7a:115c:a1e0::4   mac-studio        tagged-devices  macOS    idle; offers exit node                               
+fd7a:115c:a1e0::2   mac               fengsen.deng    macOS    offline, last seen 80d ago                           
+fd7a:115c:a1e0::28  macbookpro        youzhen.lin     macOS    -                                                    
+fd7a:115c:a1e0::2   macmini           fengsen.deng    macOS    -                                                    
+fd7a:115c:a1e0::95  nuc               tagged-devices  macOS    -                                                    
+fd7a:115c:a1e0::2d  polaris-acct-a    youzhen.lin     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::6c  polaris-acct-b    youzhen.lin     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::b2  polaris-e2e       youzhen.lin     linux    offline                                              
+fd7a:115c:a1e0::18  polaris-probe-a   youzhen.lin     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::47  polaris-probe-b   youzhen.lin     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::57  swaymacbook-pro   youzhen.lin     macOS    -                                                    
+fd7a:115c:a1e0::74  tlt-testmac-mini  youzhen.lin     macOS    -                                                    
+fd7a:115c:a1e0::0   tlt               youzhen.lin     macOS    -                                                    
+fd7a:115c:a1e0::34  tlt02mac-mini     youzhen.lin     macOS    -                                                    
+fd7a:115c:a1e0::6   x300u             tagged-devices  android  offline, last seen 72d ago                           
+fd7a:115c:a1e0::5   xfold6            tagged-devices  android  offline, last seen 16h ago                           
+fd7a:115c:a1e0::90  xiaomi14          fengsen.deng    android  offline, last seen 159d ago                          
+fd7a:115c:a1e0::8   xmn-router        fengsen.deng    linux    idle; offers exit node; offline, last seen 567d ago  
+fd7a:115c:a1e0::bd  yee-pad           tagged-devices  android  offline, last seen 7d ago                            

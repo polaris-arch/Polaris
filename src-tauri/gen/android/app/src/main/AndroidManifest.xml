@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 隧道（VpnService + libbox）所需 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- VPN 应用是 systemExempted 前台服务类型的合法用例；上游 sing-box-for-android 同款声明。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- API 28..30 上「取真正的默认网络」只能用 requestNetwork，那条 API 要这个权限。
+         成因见 DefaultNetworkMonitor.register() 的注释：用 registerDefaultNetworkCallback
+         会把我们自己的 tun 当成默认网络，导致内核出站绕回自己。 -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- readWIFIState()：内核的 wifi_ssid / wifi_bssid 路由规则要它 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- 应用内自更新（W-21）：把 update_download 落到应用私有 cache 的 APK 交给系统安装器。
+         没有它，API 26+ 上 canRequestPackageInstalls() 恒 false、那次 ACTION_VIEW 被系统直接拒，
+         症状是「点了更新什么都没发生」。本仓经 GitHub Releases 分发、没有商店托管更新，
+         这是唯一的落地手段。射程只有「请求安装一个包」——不给静默安装、不给卸载、
+         每次仍然由系统弹确认框。判据：src-tauri/tests/android_native_surface_wiring.rs。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 设置 → 通用「开机自动连接」（autoStart 的 Android 腿）：开机后由 vpn.BootReceiver 判准入再起核。
+         normal 级权限（安装即授予，不弹窗）。射程只有「开机时收到一次广播」。判据：
+         src-tauri/tests/android_native_surface_wiring.rs 的权限登记表 + scripts/check-android-bridge.mjs 的 A13。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- 包可见性（Android 11 / API 30 起；本仓 targetSdk = 36 ⇒ 生效）。
+         「自定义应用分流」要让用户从已装应用里挑 applicationId，而默认可见集**不含**第三方应用 ——
+         什么都不声明的后果不是报错，是真机上拿到一个空列表（低 targetSdk 的机器上反而是满的）。
+         这里只声明「带启动器图标的 activity」这一类，恰好等于用户能在桌面点开的那批应用。
+         🔴 **刻意不要 QUERY_ALL_PACKAGES**：它多拿到的是无界面的服务/输入法/系统组件，
+         这个界面一条都用不上 —— 多要一个敏感权限换零收益。
+         路线由 Kotlin 侧 PolarisVpnPlugin.PACKAGE_VISIBILITY_ROUTE 声明，与本块由
+         src-tauri/tests/android_native_surface_wiring.rs 的包可见性门钉在一起。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <!-- AndroidTV support -->
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
+    <!-- 系统自动备份（Google 云备份 + 设备间迁移）：默认关、用户可在 设置 → 通用 打开（2026-09-25 决策）。
+         allowBackup 是静态属性、关不了运行期，且 targetSdk ≥ 31 时在部分设备上 allowBackup="false"
+         不关设备间迁移 ⇒ 这里显式保留备份能力，由 PolarisBackupAgent.onFullBackup 读用户开关做运行期闸门
+         （关 / 缺省 ⇒ 不调 super，一个文件都不交出去）。fullBackupOnly：走文件级 Auto Backup，不走 key-value。
+         判据：scripts/check-android-bridge.mjs 的 A14。 -->
+    <application
+        android:name=".vpn.PolarisApplication"
+        android:allowBackup="true"
+        android:backupAgent=".PolarisBackupAgent"
+        android:fullBackupOnly="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.polaris"
+        android:usesCleartextTraffic="${usesCleartextTraffic}">
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:label="@string/main_activity_title"
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- AndroidTV support -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- tun 的载体。exported=false 且要求 BIND_VPN_SERVICE：只有系统能绑定它。
+             intent-filter 的 android.net.VpnService 是系统识别 VPN 组件的判据，缺了它
+             `VpnService.prepare()` 永远返回非 null（系统认为本应用没有 VPN 组件）。 -->
+        <service
+            android:name=".vpn.PolarisVpnService"
+            android:exported="false"
+            android:foregroundServiceType="systemExempted"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            tools:ignore="ForegroundServicePermission">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
+        <!-- 开机自动连接的执行者。exported=false：BOOT_COMPLETED 由 system uid 投递、不受导出限制，
+             关掉导出让别的应用伪造不了一次「开机」来替用户连上隧道。准入四条件见 BootReceiver.kt。 -->
+        <receiver
+            android:name=".vpn.BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <provider
+          android:name="androidx.core.content.FileProvider"
+          android:authorities="${applicationId}.fileprovider"
+          android:exported="false"
+          android:grantUriPermissions="true">
+          <meta-data
+            android:name="android.support.FILE_PROVIDER_PATHS"
+            android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

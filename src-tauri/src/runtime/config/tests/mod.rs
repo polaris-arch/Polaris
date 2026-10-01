@@ -1,0 +1,2980 @@
+use super::*;
+use crate::test_support::TestDir;
+
+fn temp_dir(tag: &str) -> TestDir {
+    TestDir::new(&format!("polaris-config-test-{tag}-"))
+}
+
+#[test]
+fn legacy_start_admission_reads_raw_disk_and_rejects_uncertain_mode() {
+    let dir = temp_dir("legacy-start-admission");
+    let manager = ConfigManager::new(dir.clone());
+    assert!(
+        manager.admit_legacy_start().is_ok(),
+        "fresh install is legacy"
+    );
+
+    let mut legacy = polaris_store::store::default_config();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    assert!(manager.admit_legacy_start().is_ok());
+
+    legacy[mesh_guard::STATE_KEY] = serde_json::Value::Null;
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "partial managed raw fields must block"
+    );
+
+    std::fs::write(dir.join("config.json"), b"{broken json").unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "a permissive load fallback is not admission"
+    );
+
+    std::fs::write(dir.join("config.json"), b"42").unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "non-object raw config is uncertain"
+    );
+
+    std::fs::write(dir.join("config.json"), b"{}").unwrap();
+    std::fs::write(dir.join(REQUIRED_MARKER_FILE), b"{broken marker").unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "bad marker still blocks legacy"
+    );
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Preparing,
+            local_id: "local".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "preparing must block"
+    );
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manager.admit_legacy_start().is_err(),
+        "enabled requires a managed claim"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_start_admission_rejects_dangling_marker() {
+    let dir = temp_dir("dangling-mesh-marker");
+    std::os::unix::fs::symlink("missing-marker-target", dir.join(REQUIRED_MARKER_FILE)).unwrap();
+    assert!(ConfigManager::new(dir.clone())
+        .admit_legacy_start()
+        .is_err());
+}
+
+#[test]
+fn legacy_start_lease_excludes_marker_publication_until_last_operation_finishes() {
+    let dir = temp_dir("legacy-start-lease");
+    let manager = ConfigManager::new(dir.clone());
+    let first = manager.lease_legacy_start().unwrap();
+    let second = manager.lease_legacy_start().unwrap();
+    assert!(manager.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    drop(first);
+    assert!(manager.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    drop(second);
+    manager.prepare_mesh_route_enable("local-test-1").unwrap();
+    assert!(dir.join(REQUIRED_MARKER_FILE).exists());
+    assert!(manager.lease_legacy_start().is_err());
+}
+
+#[test]
+fn ordinary_config_writes_preserve_managed_ledger_and_cannot_drop_dns_policy() {
+    let dir = temp_dir("mesh-protected-writes");
+    let wire: Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
+    ))
+    .unwrap();
+    let mut config = polaris_store::store::default_config();
+    config[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    config[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    config[mesh_guard::POLICY_KEY]["dnsPolicy"] = serde_json::json!({
+        "schemaVersion": 1,
+        "suffixAssignments": [{"suffix": "tail.example.invalid", "target": {"kind": "reject"}}],
+        "shortNamePolicy": {"kind": "system"},
+        "serviceOwner": {"kind": "reject"}
+    });
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: config[mesh_guard::STATE_KEY]["localId"]
+                .as_str()
+                .unwrap()
+                .into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mgr = ConfigManager::new(dir.clone());
+    let current = mgr.load_full().unwrap();
+    let mut old_frontend = current.clone();
+    old_frontend
+        .as_object_mut()
+        .unwrap()
+        .remove(mesh_guard::POLICY_KEY);
+    old_frontend
+        .as_object_mut()
+        .unwrap()
+        .remove(mesh_guard::STATE_KEY);
+    old_frontend["logLevel"] = serde_json::json!("debug");
+    mgr.save_full(&old_frontend).unwrap();
+    let saved = mgr.set_value("mixedPort", serde_json::json!(7891)).unwrap();
+    assert_eq!(
+        saved[mesh_guard::POLICY_KEY],
+        config[mesh_guard::POLICY_KEY]
+    );
+    assert_eq!(saved[mesh_guard::STATE_KEY], config[mesh_guard::STATE_KEY]);
+
+    let mut nested_omission = saved.clone();
+    nested_omission[mesh_guard::POLICY_KEY]
+        .as_object_mut()
+        .unwrap()
+        .remove("dnsPolicy");
+    assert!(mgr.save_full(&nested_omission).is_err());
+    assert!(mgr
+        .save_full_deferred_cleanup(&saved, &nested_omission)
+        .is_err());
+    assert!(mgr
+        .set_value(mesh_guard::STATE_KEY, serde_json::json!({}))
+        .is_err());
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(
+        after[mesh_guard::POLICY_KEY],
+        config[mesh_guard::POLICY_KEY]
+    );
+    assert_eq!(after[mesh_guard::STATE_KEY], config[mesh_guard::STATE_KEY]);
+}
+
+fn mesh_wire_fixture() -> Value {
+    serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/mesh-route-state.fixture.json",
+    ))
+    .unwrap()
+}
+
+fn managed_apply_cas_fixture() -> (
+    TestDir,
+    ConfigManager,
+    polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan,
+    String,
+) {
+    use polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan;
+
+    let dir = temp_dir("mesh-apply-cas");
+    let wire = mesh_wire_fixture();
+    let mut raw = polaris_store::store::default_config();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("1");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: raw[mesh_guard::STATE_KEY]["localId"]
+                .as_str()
+                .unwrap()
+                .into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let version = config_version(&raw);
+    let plan = ManagedMeshRoutePlan {
+        schema_version: 1,
+        plan_id: "apply-cas-plan".into(),
+        config_version: version.clone(),
+        input_state_revision: "1".into(),
+        identity_bindings: vec![],
+        protected_cidrs: vec![],
+        owner_routes: vec![],
+        reject_cidrs: vec![],
+        unassigned_cidrs: vec![],
+        released_cidrs: vec![],
+        overrides: vec![],
+        dns_managed: false,
+    };
+    let mgr = ConfigManager::new(dir.path().to_path_buf());
+    (dir, mgr, plan, version)
+}
+
+struct ReservedStopFixture {
+    dir: TestDir,
+    mgr: ConfigManager,
+    plan: polaris_config_engine::builder::managed_mesh_plan::ManagedMeshRoutePlan,
+    gate: Arc<polaris_core_supervisor::LifecycleGate>,
+    domain: Arc<StopRuntimeDomain>,
+    stop_generation: u64,
+    receipt: StopReservationReceipt,
+}
+
+fn reserved_stop_fixture() -> ReservedStopFixture {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyStep};
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = Arc::new(LifecycleGate::default());
+    let domain = StopRuntimeDomain::with_boot_for_test(Arc::clone(&gate), "boot-stop");
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    let stop_generation = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let receipt = gate
+        .with_current_generation(stop_generation, |live| {
+            mgr.reserve_mesh_stop_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                &domain,
+                live,
+                &plan,
+                &claim,
+                "direct-old-run",
+                old,
+                stop_generation,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    ReservedStopFixture {
+        dir,
+        mgr,
+        plan,
+        gate,
+        domain,
+        stop_generation,
+        receipt,
+    }
+}
+
+#[test]
+fn apply_snapshot_is_strict_owned_raw_value_and_read_only() {
+    let (dir, mgr, _plan, version) = managed_apply_cas_fixture();
+    let original = std::fs::read(dir.join("config.json")).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(snapshot.config_version(), version);
+    assert_eq!(snapshot.state().revision, "1");
+    assert_eq!(snapshot.policy().schema_version, 1);
+    assert_eq!(snapshot.raw()[mesh_guard::STATE_KEY]["revision"], "1");
+    assert_eq!(
+        snapshot.raw_document_sha256(),
+        polaris_updater::sha256_hex(&serde_json::to_vec(snapshot.raw()).unwrap())
+    );
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), original);
+    assert!(mgr.cache.read().unwrap().is_none());
+    mgr.admit_mesh_apply_snapshot(&snapshot).unwrap();
+
+    // This is a digest of the raw parsed document, not whitespace or key order.
+    let raw: Value = serde_json::from_slice(&original).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec_pretty(&raw).unwrap(),
+    )
+    .unwrap();
+    mgr.admit_mesh_apply_snapshot(&snapshot).unwrap();
+}
+
+#[test]
+fn apply_snapshot_admission_rejects_plain_save_stop_and_identity_epoch_change() {
+    use crate::runtime::proxy::mesh_apply::ApplyStep;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (_dir, mgr, _plan, _version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    mgr.set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    assert!(mgr.admit_mesh_apply_snapshot(&snapshot).is_err());
+
+    let (_dir, mgr, _plan, version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let gate = LifecycleGate::default();
+    let stop = gate.claim_generation(None, LifecycleKind::Stop).unwrap();
+    gate.with_current_generation(stop, |live| {
+        mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: "1",
+            },
+            "boot-admission",
+            live,
+            ApplyStep::StopIntent,
+        )
+    })
+    .unwrap()
+    .unwrap();
+    let stopped = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(stopped.config_version(), version);
+    assert_ne!(
+        stopped.raw_document_sha256(),
+        snapshot.raw_document_sha256()
+    );
+    assert!(mgr.admit_mesh_apply_snapshot(&snapshot).is_err());
+
+    let (dir, mgr, _plan, version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw[mesh_guard::STATE_KEY]["identities"][0]["identityEpoch"] = serde_json::json!("epoch-b");
+    raw[mesh_guard::STATE_KEY]["reservations"][0]["ownerRef"]["identityEpoch"] =
+        serde_json::json!("epoch-b");
+    raw[mesh_guard::STATE_KEY]["observations"][0]["ownerRef"]["identityEpoch"] =
+        serde_json::json!("epoch-b");
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("2");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_ok());
+    assert_eq!(config_version(&raw), version);
+    assert!(mgr.admit_mesh_apply_snapshot(&snapshot).is_err());
+}
+
+#[test]
+fn apply_snapshot_requires_enabled_marker_and_complete_raw_managed_document() {
+    let (dir, mgr, _plan, _version) = managed_apply_cas_fixture();
+    std::fs::remove_file(dir.join(REQUIRED_MARKER_FILE)).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Preparing,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw.as_object_mut().unwrap().remove(mesh_guard::POLICY_KEY);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    raw[mesh_guard::POLICY_KEY] = mesh_wire_fixture()[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["localId"] = serde_json::json!("other-local");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+    std::fs::write(dir.join("config.json"), b"{broken-json").unwrap();
+    assert!(mgr.read_mesh_apply_snapshot().is_err());
+}
+
+#[test]
+fn prepare_cas_requires_typed_snapshot_even_when_version_and_revision_match() {
+    use crate::runtime::proxy::mesh_apply::ApplyStep;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let gate = LifecycleGate::default();
+    let start = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw[mesh_guard::STATE_KEY]["intent"]["desiredRun"] = serde_json::json!("running");
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(config_version(&raw), version);
+    assert_eq!(raw[mesh_guard::STATE_KEY]["revision"], "1");
+    assert!(mgr.read_mesh_apply_snapshot().is_ok());
+
+    let rejected = gate
+        .with_current_generation(start, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-admission",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-admission",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap();
+    assert!(matches!(rejected, Err(ApplyPersistError::ConfigChanged)));
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert!(after[mesh_guard::STATE_KEY]["transaction"].is_null());
+}
+
+#[test]
+fn apply_cas_checks_disk_config_and_state_together_but_stop_survives_config_edits() {
+    use crate::runtime::proxy::mesh_apply::{ApplyError, ApplyStep};
+    use polaris_config_engine::user_config::mesh_route_state::{
+        MeshDesiredRun, MeshTransactionPhase,
+    };
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (dir, mgr, mut plan, original_version) = managed_apply_cas_fixture();
+    let gate = LifecycleGate::default();
+    let start = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let stale_snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    mgr.set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    let current: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    let latest_version = config_version(&current);
+    assert_ne!(latest_version, original_version);
+    assert_eq!(current[mesh_guard::STATE_KEY]["revision"], "1");
+    let stale = gate
+        .with_current_generation(start, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &original_version,
+                    state_revision: "1",
+                },
+                "boot-cas",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &stale_snapshot,
+                    plan: &plan,
+                    boot_id: "boot-cas",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap();
+    assert!(matches!(stale, Err(ApplyPersistError::ConfigChanged)));
+    let unchanged: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert!(unchanged[mesh_guard::STATE_KEY]["transaction"].is_null());
+
+    plan.config_version = latest_version.clone();
+    let fresh_snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(start, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &latest_version,
+                    state_revision: "1",
+                },
+                "boot-cas",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &fresh_snapshot,
+                    plan: &plan,
+                    boot_id: "boot-cas",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared.revision, "2");
+    assert_eq!(
+        prepared.transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Prepared
+    );
+
+    mgr.set_value("logLevel", serde_json::json!("warn"))
+        .unwrap();
+    let stop = gate
+        .claim_generation(Some(start), LifecycleKind::Stop)
+        .unwrap();
+    let stopped = gate
+        .with_current_generation(stop, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &latest_version,
+                    state_revision: "2",
+                },
+                "boot-cas",
+                live,
+                ApplyStep::StopIntent,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.intent.desired_run, MeshDesiredRun::Stopped);
+    assert_eq!(
+        stopped.transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Interrupted
+    );
+    assert_eq!(stopped.transaction.as_ref().unwrap().candidate_run_id, None);
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &latest_version,
+                state_revision: "2"
+            },
+            "boot-cas",
+            live,
+            ApplyStep::StopIntent,
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Conflict))
+    ));
+    assert!(gate.with_current_generation(start, |_| ()).is_none());
+}
+
+#[test]
+fn reserved_start_must_bind_old_claim_to_the_live_new_generation_before_spawn() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = LifecycleGate::default();
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-cas",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-cas",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    // This test is only about the new Start generation. Seed a historical
+    // OldStopped ledger directly; production CAS cannot accept a caller's
+    // unproved NoOldCore assertion (tested separately below).
+    let projected = crate::runtime::proxy::mesh_apply::advance(
+        &prepared,
+        &prepared.revision,
+        &version,
+        "boot-cas",
+        &old.to_string(),
+        &claim,
+        &plan,
+        PhaseEvent::NoOldCore,
+    )
+    .unwrap();
+    let old_stopped = revise_semantic(&prepared, &prepared.revision, projected)
+        .unwrap()
+        .unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw[mesh_guard::STATE_KEY] = serde_json::to_value(&old_stopped).unwrap();
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(
+        old_stopped.transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::OldStopped
+    );
+    assert!(matches!(
+        gate.with_current_generation(old, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &old_stopped.revision
+            },
+            "boot-cas",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::RequestStart {
+                    run_id: "run-cas",
+                    start_generation: "2"
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(_)))
+    ));
+
+    let new = gate
+        .claim_generation(Some(old), LifecycleKind::Start)
+        .unwrap();
+    assert!(matches!(
+        gate.with_current_generation(new, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &old_stopped.revision
+            },
+            "boot-cas",
+            live,
+            ApplyStep::RequestStartReserved {
+                plan: &plan,
+                claim: &claim,
+                run_id: "run-cas",
+                old_generation: old + 1,
+                new_generation: new,
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Superseded))
+    ));
+    let started = gate
+        .with_current_generation(new, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &old_stopped.revision,
+                },
+                "boot-cas",
+                live,
+                ApplyStep::RequestStartReserved {
+                    plan: &plan,
+                    claim: &claim,
+                    run_id: "run-cas",
+                    old_generation: old,
+                    new_generation: new,
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let tx = started.transaction.as_ref().unwrap();
+    assert_eq!(tx.phase, MeshTransactionPhase::StartRequested);
+    assert_eq!(tx.candidate_run_id.as_deref(), Some("run-cas"));
+    assert_eq!(tx.lifecycle_generation, new.to_string());
+
+    // A later Stop takes the action right away. The old Start cannot write a
+    // stale journal phase after that claim, and no spawn is authorized here.
+    let stop = gate
+        .claim_generation(Some(new), LifecycleKind::Stop)
+        .unwrap();
+    assert!(gate.with_current_generation(new, |_| ()).is_none());
+    let stopped = gate
+        .with_current_generation(stop, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &started.revision,
+                },
+                "boot-cas",
+                live,
+                ApplyStep::StopIntent,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stopped.transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Interrupted
+    );
+    assert_eq!(
+        stopped
+            .transaction
+            .as_ref()
+            .unwrap()
+            .candidate_run_id
+            .as_deref(),
+        Some("run-cas")
+    );
+}
+
+#[test]
+fn reserved_stop_persists_handoff_under_live_gate_without_claiming_exit() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = Arc::new(LifecycleGate::default());
+    let domain = StopRuntimeDomain::with_boot_for_test(Arc::clone(&gate), "boot-stop");
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    let prepared_bytes = std::fs::read(dir.join("config.json")).unwrap();
+    // Neither a missing local Child nor a caller's no-owner assertion proves
+    // that helper/Android ownership and OS resources are gone.
+    assert!(matches!(
+        gate.with_current_generation(old, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::NoOldCore,
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(
+            "stop completion requires exact core and platform receipts"
+        )))
+    ));
+    assert_eq!(
+        std::fs::read(dir.join("config.json")).unwrap(),
+        prepared_bytes
+    );
+    assert!(matches!(
+        gate.with_current_generation(old, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::RequestStop {
+                    stop_target_run_ref: "direct-old-run"
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(_)))
+    ));
+
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::RequestStopReserved {
+                plan: &plan,
+                claim: &claim,
+                stop_target_run_ref: "direct-old-run",
+                old_generation: old,
+                stop_generation: stop,
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::Step(ApplyError::Invalid(
+                "reserved Stop requires the typed receipt entry point"
+            )))
+    ));
+    assert_eq!(
+        mgr.read_mesh_apply_snapshot()
+            .unwrap()
+            .state()
+            .transaction
+            .as_ref()
+            .unwrap()
+            .phase,
+        MeshTransactionPhase::Prepared
+    );
+    let receipt = gate
+        .with_current_generation(stop, |live| {
+            mgr.reserve_mesh_stop_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                &domain,
+                live,
+                &plan,
+                &claim,
+                "direct-old-run",
+                old,
+                stop,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let reserved = mgr.read_mesh_apply_snapshot().unwrap().state().clone();
+    let tx = reserved.transaction.as_ref().unwrap();
+    assert_eq!(tx.phase, MeshTransactionPhase::StopRequested);
+    assert_eq!(tx.stop_target_run_ref.as_deref(), Some("direct-old-run"));
+    assert_eq!(tx.lifecycle_generation, stop.to_string());
+    assert!(receipt.issued_by(&mgr));
+    assert!(!receipt.issued_by(&ConfigManager::new(dir.path().to_path_buf())));
+    assert_eq!(receipt.state_revision(), reserved.revision);
+    assert_eq!(receipt.claim(), &ApplyClaim::from(tx));
+    assert_eq!(receipt.stop_target_run_ref(), "direct-old-run");
+    assert!(tx.candidate_run_id.is_none());
+    assert_eq!(reserved.active_plan, prepared.active_plan);
+    assert_eq!(reserved.intent, prepared.intent);
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+
+    let stop_claim = ApplyClaim::from(tx);
+    let reserved_bytes = std::fs::read(dir.join("config.json")).unwrap();
+    // Both booleans are caller input, not an exact exit and platform ACK.
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &reserved.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &stop_claim,
+                event: PhaseEvent::OldStopped {
+                    stop_target_run_ref: "direct-old-run",
+                    exited: true,
+                    owners_released: true,
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(
+            "stop completion requires exact core and platform receipts"
+        )))
+    ));
+    assert_eq!(
+        std::fs::read(dir.join("config.json")).unwrap(),
+        reserved_bytes
+    );
+    assert_eq!(
+        mgr.read_mesh_apply_snapshot()
+            .unwrap()
+            .state()
+            .transaction
+            .as_ref()
+            .unwrap()
+            .phase,
+        MeshTransactionPhase::StopRequested
+    );
+
+    // A concurrent config writer must not make the lifecycle short lock wait
+    // on write_lock. Busy returns the original receipt without invoking the
+    // custody callback, so the caller can release the short lock and retry.
+    let receipt = std::thread::scope(|scope| {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let manager = &mgr;
+        scope.spawn(move || {
+            let _write_guard = manager.write_lock.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let outcome = gate
+            .with_current_generation(stop, |live| {
+                mgr.try_with_current_stop_reservation(receipt, live, &domain, &plan, |_, _| {
+                    panic!("Busy must not invoke custody callback")
+                })
+            })
+            .unwrap()
+            .unwrap();
+        release_tx.send(()).unwrap();
+        match outcome {
+            StopReservationCheck::Busy(receipt) => *receipt,
+            _ => panic!("contended config write lock must return Busy"),
+        }
+    });
+    // The real-CAS receipt moves into the manager. Current yields only the
+    // checked value, leaving no owned receipt for another admissible call.
+    let checked_revision: String = match gate
+        .with_current_generation(stop, |live| {
+            mgr.try_with_current_stop_reservation(receipt, live, &domain, &plan, |state, _| {
+                state.revision.clone()
+            })
+        })
+        .unwrap()
+        .unwrap()
+    {
+        StopReservationCheck::Current(revision) => revision,
+        _ => panic!("uncontended current reservation should pass strict disk check"),
+    };
+    assert_eq!(checked_revision, reserved.revision);
+}
+
+#[test]
+fn current_stop_callback_holds_disk_writer_until_receipt_is_consumed() {
+    let ReservedStopFixture {
+        dir,
+        mgr,
+        plan,
+        gate,
+        domain,
+        stop_generation,
+        receipt,
+    } = reserved_stop_fixture();
+    let before = std::fs::read(dir.join("config.json")).unwrap();
+    std::thread::scope(|scope| {
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let manager = &mgr;
+        scope.spawn(move || {
+            start_rx.recv().unwrap();
+            assert!(matches!(
+                manager.write_lock.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            attempt_tx.send(()).unwrap();
+            manager
+                .set_value("logLevel", serde_json::json!("debug"))
+                .unwrap();
+            let _ = done_tx.send(());
+        });
+        let outcome = gate
+            .with_current_generation(stop_generation, |live| {
+                mgr.try_with_current_stop_reservation(
+                    receipt,
+                    live,
+                    &domain,
+                    &plan,
+                    |state, _borrowed_receipt| {
+                        start_tx.send(()).unwrap();
+                        attempt_rx.recv().unwrap();
+                        assert!(
+                            done_rx
+                                .recv_timeout(std::time::Duration::from_millis(100))
+                                .is_err(),
+                            "a config writer cannot publish while callback owns write_lock"
+                        );
+                        state.revision.clone()
+                    },
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, StopReservationCheck::Current(_)));
+    });
+    assert_ne!(std::fs::read(dir.join("config.json")).unwrap(), before);
+}
+
+#[test]
+fn current_stop_rejects_wrong_issuer_boot_or_generation_without_callback() {
+    use polaris_core_supervisor::LifecycleKind;
+
+    for case in ["issuer", "boot", "gate", "generation"] {
+        let ReservedStopFixture {
+            dir,
+            mgr,
+            plan,
+            gate,
+            domain,
+            stop_generation,
+            receipt,
+        } = reserved_stop_fixture();
+        let other_manager = ConfigManager::new(dir.path().to_path_buf());
+        let manager = if case == "issuer" {
+            &other_manager
+        } else {
+            &mgr
+        };
+        let generation = if case == "generation" {
+            gate.claim_generation(Some(stop_generation), LifecycleKind::Stop)
+                .unwrap()
+        } else {
+            stop_generation
+        };
+        let other_domain = StopRuntimeDomain::with_boot_for_test(Arc::clone(&gate), "other-boot");
+        let selected_domain = if case == "boot" {
+            &other_domain
+        } else {
+            &domain
+        };
+        let other_gate = Arc::new(polaris_core_supervisor::LifecycleGate::default());
+        other_gate
+            .claim_generation(None, LifecycleKind::Start)
+            .unwrap();
+        other_gate
+            .claim_generation(None, LifecycleKind::Stop)
+            .unwrap();
+        let selected_gate = if case == "gate" { &other_gate } else { &gate };
+        assert!(matches!(
+            selected_gate
+                .with_current_generation(generation, |live| manager
+                    .try_with_current_stop_reservation(
+                        receipt,
+                        live,
+                        selected_domain,
+                        &plan,
+                        |_, _| { panic!("{case} must not invoke custody callback") }
+                    ))
+                .unwrap()
+                .unwrap(),
+            StopReservationCheck::Rejected
+        ));
+    }
+}
+
+#[test]
+fn current_stop_rejects_changed_intent_target_plan_and_local_identity() {
+    for case in ["intent", "target", "plan", "local_id"] {
+        let mut fixture = reserved_stop_fixture();
+        if case == "plan" {
+            fixture.plan.plan_id = "other-plan".into();
+        } else {
+            let path = fixture.dir.join("config.json");
+            let mut raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            match case {
+                "intent" => {
+                    raw[mesh_guard::STATE_KEY]["intent"]["desiredRun"] =
+                        serde_json::json!("stopped")
+                }
+                "target" => {
+                    raw[mesh_guard::STATE_KEY]["transaction"]["stopTargetRunRef"] =
+                        serde_json::json!("other-run")
+                }
+                "local_id" => {
+                    raw[mesh_guard::STATE_KEY]["localId"] = serde_json::json!("other-local");
+                    let marker_path = fixture.dir.join(REQUIRED_MARKER_FILE);
+                    let mut marker: Value =
+                        serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+                    marker["localId"] = serde_json::json!("other-local");
+                    std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            let snapshot = fixture.mgr.read_mesh_apply_snapshot().unwrap();
+            assert_eq!(snapshot.config_version(), fixture.plan.config_version);
+            assert_eq!(snapshot.state().revision, fixture.receipt.state_revision());
+            if case == "local_id" {
+                let tx = snapshot.state().transaction.as_ref().unwrap();
+                assert_eq!(ApplyClaim::from(tx), *fixture.receipt.claim());
+                assert_eq!(
+                    tx.stop_target_run_ref.as_deref(),
+                    Some(fixture.receipt.stop_target_run_ref())
+                );
+            }
+        }
+        let ReservedStopFixture {
+            mgr,
+            plan,
+            gate,
+            domain,
+            stop_generation,
+            receipt,
+            ..
+        } = fixture;
+        assert!(matches!(
+            gate.with_current_generation(stop_generation, |live| mgr
+                .try_with_current_stop_reservation(receipt, live, &domain, &plan, |_, _| panic!(
+                    "{case} must not invoke custody callback"
+                ),))
+                .unwrap()
+                .unwrap(),
+            StopReservationCheck::Rejected
+        ));
+    }
+}
+
+#[test]
+fn current_stop_strict_disk_read_error_never_invokes_callback() {
+    let ReservedStopFixture {
+        dir,
+        mgr,
+        plan,
+        gate,
+        domain,
+        stop_generation,
+        receipt,
+    } = reserved_stop_fixture();
+    std::fs::write(dir.join("config.json"), b"{invalid").unwrap();
+    assert!(gate
+        .with_current_generation(stop_generation, |live| mgr
+            .try_with_current_stop_reservation(receipt, live, &domain, &plan, |_, _| {
+                panic!("strict disk read error must not invoke custody callback")
+            }))
+        .unwrap()
+        .is_err());
+}
+
+#[test]
+fn current_stop_poisoned_write_lock_never_invokes_callback() {
+    let ReservedStopFixture {
+        mgr,
+        plan,
+        gate,
+        domain,
+        stop_generation,
+        receipt,
+        ..
+    } = reserved_stop_fixture();
+    let mgr = Arc::new(mgr);
+    let poison = Arc::clone(&mgr);
+    assert!(std::thread::spawn(move || {
+        let _guard = poison.write_lock.lock().unwrap();
+        panic!("poison config writer");
+    })
+    .join()
+    .is_err());
+    assert!(matches!(
+        gate.with_current_generation(stop_generation, |live| mgr
+            .try_with_current_stop_reservation(receipt, live, &domain, &plan, |_, _| {
+                panic!("poisoned config lock cannot commit custody")
+            }))
+        .unwrap(),
+        Err(StoreError::Io(_))
+    ));
+}
+
+#[test]
+fn current_stop_rejects_config_change_after_receipt_without_callback() {
+    let ReservedStopFixture {
+        dir: _dir,
+        mgr,
+        plan,
+        gate,
+        domain,
+        stop_generation,
+        receipt,
+    } = reserved_stop_fixture();
+    mgr.set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    let after = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_ne!(after.config_version(), plan.config_version);
+    assert_eq!(after.state().revision, receipt.state_revision());
+    assert!(matches!(
+        gate.with_current_generation(stop_generation, |live| mgr
+            .try_with_current_stop_reservation(receipt, live, &domain, &plan, |_, _| {
+                panic!("a changed configVersion must not invoke custody callback")
+            }))
+        .unwrap()
+        .unwrap(),
+        StopReservationCheck::Rejected
+    ));
+}
+
+#[test]
+fn failed_stop_reservation_keeps_ledger_unchanged_and_marks_old_owner_unknown() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (_dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = Arc::new(LifecycleGate::default());
+    let domain = StopRuntimeDomain::with_boot_for_test(Arc::clone(&gate), "boot-stop");
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    mgr.set_value("logLevel", serde_json::json!("debug"))
+        .unwrap();
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let rejected = gate
+        .with_current_generation(stop, |live| {
+            mgr.reserve_mesh_stop_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                &domain,
+                live,
+                &plan,
+                &claim,
+                "direct-old-run",
+                old,
+                stop,
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::ConfigChanged)
+    ));
+    let after = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(after.state().revision, prepared.revision);
+    assert_eq!(after.state().reservations, prepared.reservations);
+    assert_eq!(after.state().active_plan, prepared.active_plan);
+    assert_eq!(
+        after.state().transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Prepared
+    );
+    assert!(after
+        .state()
+        .transaction
+        .as_ref()
+        .unwrap()
+        .stop_target_run_ref
+        .is_none());
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::OldStopped {
+                    stop_target_run_ref: "direct-old-run",
+                    exited: true,
+                    owners_released: true,
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::ConfigChanged)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_reservation_pre_rename_io_failure_preserves_disk_cache_and_old_owner() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions<'a> {
+        dir: &'a std::path::Path,
+        original: std::fs::Permissions,
+    }
+    impl Drop for RestorePermissions<'_> {
+        fn drop(&mut self) {
+            std::fs::set_permissions(self.dir, self.original.clone())
+                .expect("test directory permissions must be restored");
+        }
+    }
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = Arc::new(LifecycleGate::default());
+    let domain = StopRuntimeDomain::with_boot_for_test(Arc::clone(&gate), "boot-stop");
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    let disk_before = std::fs::read(dir.join("config.json")).unwrap();
+    let cache_before = mgr.cache.read().unwrap().clone();
+    assert!(cache_before.is_some());
+
+    // The managed writer reads config.json first, then creates a private tmp
+    // beside it. Remove directory write permission only after Prepared, so
+    // the actual durable_atomic_write path fails before rename.
+    let original = std::fs::metadata(dir.path()).unwrap().permissions();
+    let mut denied = original.clone();
+    denied.set_mode(original.mode() & !0o222);
+    std::fs::set_permissions(dir.path(), denied).unwrap();
+    let restore = RestorePermissions {
+        dir: dir.path(),
+        original,
+    };
+    let probe = dir.join("permission-probe");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            std::fs::remove_file(probe).unwrap();
+            eprintln!("SKIPPED: this process can create files in a non-writable test directory");
+            return;
+        }
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+    }
+
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let rejected = gate
+        .with_current_generation(stop, |live| {
+            mgr.reserve_mesh_stop_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                &domain,
+                live,
+                &plan,
+                &claim,
+                "direct-old-run",
+                old,
+                stop,
+            )
+        })
+        .unwrap();
+    drop(restore);
+    assert!(matches!(
+        rejected,
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::Store(StoreError::Io(_)))
+    ));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), disk_before);
+    assert_eq!(*mgr.cache.read().unwrap(), cache_before);
+    let after = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(after.state().revision, prepared.revision);
+    assert_eq!(after.state().reservations, prepared.reservations);
+    assert_eq!(
+        after.state().transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Prepared
+    );
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &prepared.revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &claim,
+                event: PhaseEvent::OldStopped {
+                    stop_target_run_ref: "direct-old-run",
+                    exited: true,
+                    owners_released: true,
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(
+            "stop completion requires exact core and platform receipts"
+        )))
+    ));
+}
+
+#[test]
+fn stop_reservation_post_publish_uncertainty_withholds_receipt_after_disk_replacement() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
+    use polaris_config_engine::user_config::mesh_route_state::MeshTransactionPhase;
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = Arc::new(LifecycleGate::default());
+    let domain = StopRuntimeDomain::with_boot_for_test(Arc::clone(&gate), "boot-stop");
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    let bytes_before = std::fs::read(dir.join("config.json")).unwrap();
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+
+    // The ordinary durable writer publishes the file first. The one-shot
+    // fault then reports CommitUncertain at the same ConfigManager boundary
+    // used for a real post-rename directory-sync failure.
+    mgr.test_uncertain_after_mesh_publish_once
+        .store(true, Ordering::SeqCst);
+    let rejected = gate
+        .with_current_generation(stop, |live| {
+            mgr.reserve_mesh_stop_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                &domain,
+                live,
+                &plan,
+                &claim,
+                "direct-old-run",
+                old,
+                stop,
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::Store(StoreError::CommitUncertain(_)))
+    ));
+    let bytes_after = std::fs::read(dir.join("config.json")).unwrap();
+    assert_ne!(
+        bytes_after, bytes_before,
+        "the replacement really reached disk"
+    );
+    let disk = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_ne!(disk.state().revision, prepared.revision);
+    assert_eq!(
+        disk.state().transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::StopRequested
+    );
+    assert_eq!(
+        disk.state()
+            .transaction
+            .as_ref()
+            .unwrap()
+            .stop_target_run_ref
+            .as_deref(),
+        Some("direct-old-run")
+    );
+    assert_eq!(
+        mgr.cache.read().unwrap().as_ref().unwrap()[mesh_guard::STATE_KEY],
+        serde_json::to_value(disk.state()).unwrap(),
+        "the uncertainty path must reconcile cache from strict disk truth"
+    );
+    // A strict reread sees StopRequested, but cannot turn the uncertain write
+    // into a success receipt by retrying the reservation at its new revision.
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.reserve_mesh_stop_if_current(
+            ApplyCasExpected {
+                config_version: disk.config_version(),
+                state_revision: &disk.state().revision,
+            },
+            &domain,
+            live,
+            &plan,
+            &claim,
+            "direct-old-run",
+            old,
+            stop,
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::Step(ApplyError::Superseded))
+    ));
+    let disk_claim = ApplyClaim::from(disk.state().transaction.as_ref().unwrap());
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.apply_mesh_step_if_current(
+            ApplyCasExpected {
+                config_version: disk.config_version(),
+                state_revision: &disk.state().revision,
+            },
+            "boot-stop",
+            live,
+            ApplyStep::Advance {
+                plan: &plan,
+                claim: &disk_claim,
+                event: PhaseEvent::OldStopped {
+                    stop_target_run_ref: "direct-old-run",
+                    exited: true,
+                    owners_released: true,
+                },
+            },
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::Step(ApplyError::Invalid(
+            "stop completion requires exact core and platform receipts"
+        )))
+    ));
+    assert!(gate.with_current_generation(old, |_| ()).is_none());
+}
+
+#[test]
+fn newer_stop_intent_supersedes_reserved_apply_stop_even_at_current_state_revision() {
+    use crate::runtime::proxy::mesh_apply::{ApplyClaim, ApplyError, ApplyStep};
+    use polaris_config_engine::user_config::mesh_route_state::{
+        MeshDesiredRun, MeshTransactionPhase,
+    };
+    use polaris_core_supervisor::{LifecycleGate, LifecycleKind};
+
+    let (_dir, mgr, plan, version) = managed_apply_cas_fixture();
+    let gate = Arc::new(LifecycleGate::default());
+    let domain = StopRuntimeDomain::with_boot_for_test(Arc::clone(&gate), "boot-stop");
+    let old = gate.claim_generation(None, LifecycleKind::Start).unwrap();
+    let snapshot = mgr.read_mesh_apply_snapshot().unwrap();
+    let prepared = gate
+        .with_current_generation(old, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: "1",
+                },
+                "boot-stop",
+                live,
+                ApplyStep::Prepare {
+                    snapshot: &snapshot,
+                    plan: &plan,
+                    boot_id: "boot-stop",
+                    manifest_ref: "mesh-routes/plans/apply-cas-plan/manifest.json",
+                },
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let claim = ApplyClaim::from(prepared.transaction.as_ref().unwrap());
+    let stop = gate
+        .claim_generation(Some(old), LifecycleKind::Stop)
+        .unwrap();
+    let stopped = gate
+        .with_current_generation(stop, |live| {
+            mgr.apply_mesh_step_if_current(
+                ApplyCasExpected {
+                    config_version: &version,
+                    state_revision: &prepared.revision,
+                },
+                "boot-stop",
+                live,
+                ApplyStep::StopIntent,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        gate.with_current_generation(stop, |live| mgr.reserve_mesh_stop_if_current(
+            ApplyCasExpected {
+                config_version: &version,
+                state_revision: &stopped.revision,
+            },
+            &domain,
+            live,
+            &plan,
+            &claim,
+            "direct-old-run",
+            old,
+            stop,
+        ))
+        .unwrap(),
+        Err(ApplyPersistError::StopReservationUncertain(cause))
+            if matches!(*cause, ApplyPersistError::Step(ApplyError::Superseded))
+    ));
+    let after = mgr.read_mesh_apply_snapshot().unwrap();
+    assert_eq!(after.state().revision, stopped.revision);
+    assert_eq!(after.state().intent.desired_run, MeshDesiredRun::Stopped);
+    assert_eq!(
+        after.state().transaction.as_ref().unwrap().phase,
+        MeshTransactionPhase::Interrupted
+    );
+}
+
+#[test]
+fn trusted_mesh_identity_write_requires_no_owner_receipt_and_commits_old_scope_with_edit() {
+    let dir = temp_dir("mesh-identity-transaction");
+    let wire = mesh_wire_fixture();
+    let mut raw = polaris_store::store::default_config();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("4");
+    raw["servers"] = serde_json::json!([{
+        "id":"ts-a", "name":"Old name", "protocol":"tailscale",
+        "tailscaleSettings": {
+            "controlUrl":"https://control.example.test/path",
+            "routes":["203.0.113.0/24"],
+            "advertiseRoutes":["198.51.100.0/24"],
+            "authKey":"old-local-secret"
+        }
+    }]);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    let old = mgr.load_full().unwrap();
+    let mut renamed = old.clone();
+    renamed["servers"][0]["name"] = serde_json::json!("Display only");
+    mgr.save_full(&renamed).unwrap();
+    let after_rename = mgr.load_full().unwrap();
+    assert_eq!(
+        after_rename[mesh_guard::STATE_KEY],
+        old[mesh_guard::STATE_KEY]
+    );
+    let old_bytes = std::fs::read(dir.join("config.json")).unwrap();
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    let replacement = serde_json::json!({
+        "id":"ts-a", "name":"New name", "protocol":"tailscale",
+        "tailscaleSettings": {"controlUrl":"https://new.example.test/path"}
+    });
+    assert!(mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(replacement.clone()),
+            None,
+        )
+        .is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+    let live = AtomicU64::new(1);
+    let receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let name_only = serde_json::json!({
+        "id":"ts-a", "name":"Another display name", "protocol":"tailscale",
+        "tailscaleSettings": {
+            "controlUrl":"https://control.example.test/path",
+            "routes":["203.0.113.0/24"],
+            "advertiseRoutes":["198.51.100.0/24"]
+        }
+    });
+    let name_error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(name_only),
+            Some(&receipt),
+        )
+        .unwrap_err();
+    assert!(name_error.to_string().contains("identity is unchanged"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+    let expired = AtomicU64::new(2);
+    let expired_receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &expired,
+        expected_generation: 1,
+    };
+    let expired_error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(replacement.clone()),
+            Some(&expired_receipt),
+        )
+        .unwrap_err();
+    assert!(expired_error
+        .to_string()
+        .contains("expired before config publish"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+    assert!(mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "3",
+            MeshServerIdentityEdit::Replace(replacement.clone()),
+            Some(&receipt),
+        )
+        .is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), old_bytes);
+
+    let next = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Replace(replacement),
+            Some(&receipt),
+        )
+        .unwrap();
+    assert_eq!(next.revision, "5");
+    assert!(next.identity_effects.is_empty());
+    assert!(next.reservations.iter().any(|reservation| {
+        reservation.cidr == "203.0.113.0/24"
+            && matches!(&reservation.owner_ref,
+                polaris_config_engine::user_config::mesh_route_state::MeshReservationOwner::Owner {
+                    server_id, identity_epoch
+                } if server_id == "ts-a" && identity_epoch == "epoch-a")
+    }));
+    assert!(next.reservations.iter().any(|reservation| {
+        reservation.cidr == "198.51.100.0/24"
+            && matches!(&reservation.owner_ref,
+                polaris_config_engine::user_config::mesh_route_state::MeshReservationOwner::Owner {
+                    server_id, identity_epoch
+                } if server_id == "ts-a" && identity_epoch == "epoch-a")
+    }));
+    let saved = mgr.load_full().unwrap();
+    assert_eq!(saved["servers"][0]["name"], "New name");
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert!(!saved.to_string().contains("old-local-secret"));
+    assert_eq!(saved[mesh_guard::STATE_KEY]["revision"], "5");
+    assert_eq!(
+        saved[mesh_guard::STATE_KEY]["identities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(old[mesh_guard::STATE_KEY]["revision"], "4");
+    assert!(mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Delete,
+            Some(&receipt),
+        )
+        .is_err());
+    let new_epoch = next
+        .identities
+        .iter()
+        .find(|identity| identity.server_id == "ts-a" && identity.identity_epoch != "epoch-a")
+        .unwrap()
+        .identity_epoch
+        .clone();
+    let new_owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: new_epoch,
+    };
+    let delete_receipt = MeshNoOwnerReceipt {
+        owner_ref: new_owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "5".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let deleted = mgr
+        .update_mesh_identity_server_if_revision(
+            &new_owner,
+            "5",
+            MeshServerIdentityEdit::Delete,
+            Some(&delete_receipt),
+        )
+        .unwrap();
+    assert_eq!(deleted.revision, "6");
+    assert!(deleted.identity_effects.is_empty());
+    assert!(deleted
+        .reservations
+        .iter()
+        .any(|reservation| reservation.cidr == "203.0.113.0/24"));
+    assert!(mgr.load_full().unwrap()["servers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn trusted_mesh_identity_write_rejects_active_plan_without_owner_slices() {
+    let dir = temp_dir("mesh-active-plan-no-slices");
+    let wire = mesh_wire_fixture();
+    let mut raw = polaris_store::store::default_config();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("4");
+    raw[mesh_guard::STATE_KEY]["activePlan"] = serde_json::json!({
+        "planId":"old-plan", "digest":"old-digest", "configVersion":"old-config",
+        "inputStateRevision":"3"
+    });
+    raw["servers"] = serde_json::json!([{
+        "id":"ts-a", "name":"Old name", "protocol":"tailscale",
+        "tailscaleSettings": {"routes":["203.0.113.0/24"]}
+    }]);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: "local-test-1".into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(dir.join("config.json")).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    let live = AtomicU64::new(1);
+    let receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Delete,
+            Some(&receipt),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("S4 plan manifest"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), before);
+}
+
+#[test]
+fn trusted_mesh_identity_write_rejects_invalid_old_configured_scope_without_publishing() {
+    let dir = temp_dir("mesh-invalid-old-scope");
+    let wire = mesh_wire_fixture();
+    let mut raw = polaris_store::store::default_config();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    raw[mesh_guard::STATE_KEY]["revision"] = serde_json::json!("4");
+    raw["servers"] = serde_json::json!([{
+        "id":"ts-a", "name":"Old name", "protocol":"tailscale",
+        "tailscaleSettings": {
+            "controlUrl":"https://control.example.test/path",
+            "routes":["not-a-cidr"]
+        }
+    }]);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    std::fs::write(
+        dir.join(REQUIRED_MARKER_FILE),
+        serde_json::to_vec(&MeshRequiredMarker {
+            phase: MeshMarkerPhase::Enabled,
+            local_id: raw[mesh_guard::STATE_KEY]["localId"]
+                .as_str()
+                .unwrap()
+                .into(),
+            legacy_config_digest: "0".repeat(64),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(dir.join("config.json")).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    let owner = MeshOwnerRef {
+        server_id: "ts-a".into(),
+        identity_epoch: "epoch-a".into(),
+    };
+    let live = AtomicU64::new(1);
+    let receipt = MeshNoOwnerReceipt {
+        owner_ref: owner.clone(),
+        local_id: raw[mesh_guard::STATE_KEY]["localId"]
+            .as_str()
+            .unwrap()
+            .into(),
+        state_revision: "4".into(),
+        live_generation: &live,
+        expected_generation: 1,
+    };
+    let error = mgr
+        .update_mesh_identity_server_if_revision(
+            &owner,
+            "4",
+            MeshServerIdentityEdit::Delete,
+            Some(&receipt),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("invalid old mesh scope CIDR"));
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), before);
+}
+
+#[test]
+fn preparing_marker_blocks_ordinary_writes_and_only_proven_legacy_can_cancel() {
+    let dir = temp_dir("mesh-prepare-cancel");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    mgr.prepare_mesh_route_enable("local-test-1").unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr.set_value("mixedPort", serde_json::json!(7891)).is_err());
+    assert_eq!(
+        mgr.recover_preparing_mesh_route().unwrap(),
+        MeshPrepareRecovery::AwaitingCommit
+    );
+    mgr.cancel_preparing_mesh_route().unwrap();
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    mgr.load_full().unwrap();
+
+    mgr.prepare_mesh_route_enable("local-test-1").unwrap();
+    let mut changed: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    changed["logLevel"] = serde_json::json!("debug");
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&changed).unwrap(),
+    )
+    .unwrap();
+    assert!(mgr.cancel_preparing_mesh_route().is_err());
+    assert!(dir.join(REQUIRED_MARKER_FILE).exists());
+}
+
+#[test]
+fn preparing_refuses_legacy_fallback_from_corrupt_disk() {
+    let dir = temp_dir("mesh-prepare-corrupt-legacy");
+    let corrupt = b"{broken-legacy";
+    std::fs::write(dir.join("config.json"), corrupt).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    assert!(mgr.prepare_mesh_route_enable("local-test-1").is_err());
+    assert!(!dir.join(REQUIRED_MARKER_FILE).exists());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), corrupt);
+}
+
+#[test]
+fn prepared_commit_and_state_only_cas_preserve_policy_and_reject_stale_revision() {
+    let dir = temp_dir("mesh-prepare-commit");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let wire = mesh_wire_fixture();
+    let policy: MeshRoutePolicy =
+        serde_json::from_value(wire[mesh_guard::POLICY_KEY].clone()).unwrap();
+    let mut state: MeshRouteState =
+        serde_json::from_value(wire[mesh_guard::STATE_KEY].clone()).unwrap();
+    state.revision = "1".into();
+    mgr.prepare_mesh_route_enable(&state.local_id).unwrap();
+    mgr.commit_prepared_mesh_route(policy.clone(), state.clone())
+        .unwrap();
+    let marker = mgr.mesh_required_marker().unwrap().unwrap();
+    assert_eq!(marker.phase, MeshMarkerPhase::Enabled);
+    let before = mgr.load_full().unwrap();
+    assert_eq!(
+        before[mesh_guard::POLICY_KEY],
+        serde_json::to_value(policy).unwrap()
+    );
+
+    let updated = mgr
+        .update_mesh_state_if_revision("1", |next| {
+            next.intent.desired_run =
+                polaris_config_engine::user_config::mesh_route_state::MeshDesiredRun::Running;
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.revision, "2");
+    assert!(mgr.update_mesh_state_if_revision("1", |_| {}).is_err());
+    assert!(mgr
+        .update_mesh_state_if_revision("2", |_| {})
+        .unwrap()
+        .is_none());
+    assert!(mgr
+        .update_mesh_state_if_revision("2", |next| {
+            next.identities[0].binding_state =
+                polaris_config_engine::user_config::mesh_route_state::MeshBindingState::Retired;
+        })
+        .is_err());
+    assert!(mgr
+        .update_mesh_state_if_revision("2", |next| next.reservations.clear())
+        .is_err());
+    let after = mgr.load_full().unwrap();
+    assert_eq!(
+        after[mesh_guard::POLICY_KEY],
+        before[mesh_guard::POLICY_KEY]
+    );
+    assert_eq!(after[mesh_guard::STATE_KEY]["revision"], "2");
+}
+
+#[test]
+fn interrupted_prepare_recovers_only_exact_published_identity() {
+    let dir = temp_dir("mesh-prepare-recover");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    mgr.prepare_mesh_route_enable("local-test-1").unwrap();
+    let wire = mesh_wire_fixture();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    raw[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr.cancel_preparing_mesh_route().is_err());
+    assert_eq!(
+        mgr.recover_preparing_mesh_route().unwrap(),
+        MeshPrepareRecovery::Enabled
+    );
+    assert_eq!(
+        mgr.load_full().unwrap()[mesh_guard::STATE_KEY],
+        wire[mesh_guard::STATE_KEY]
+    );
+    assert!(mgr.cancel_preparing_mesh_route().is_err());
+}
+
+#[test]
+fn marked_corruption_and_unmarked_managed_document_never_fall_back_or_overwrite() {
+    let dir = temp_dir("mesh-strict-load");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let wire = mesh_wire_fixture();
+    let policy: MeshRoutePolicy =
+        serde_json::from_value(wire[mesh_guard::POLICY_KEY].clone()).unwrap();
+    let state: MeshRouteState =
+        serde_json::from_value(wire[mesh_guard::STATE_KEY].clone()).unwrap();
+    mgr.prepare_mesh_route_enable(&state.local_id).unwrap();
+    mgr.commit_prepared_mesh_route(policy, state).unwrap();
+
+    let corrupt = b"{not-json";
+    std::fs::write(dir.join("config.json"), corrupt).unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr
+        .save_full(&polaris_store::store::default_config())
+        .is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), corrupt);
+
+    std::fs::remove_file(dir.join(REQUIRED_MARKER_FILE)).unwrap();
+    let mut managed = polaris_store::store::default_config();
+    managed[mesh_guard::POLICY_KEY] = wire[mesh_guard::POLICY_KEY].clone();
+    managed[mesh_guard::STATE_KEY] = wire[mesh_guard::STATE_KEY].clone();
+    let raw = serde_json::to_vec(&managed).unwrap();
+    std::fs::write(dir.join("config.json"), &raw).unwrap();
+    assert!(mgr.load_full().is_err());
+    assert!(mgr.save_full(&managed).is_err());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), raw);
+}
+
+#[test]
+fn managed_mode_never_executes_legacy_server_id_only_ts_deletion() {
+    let dir = temp_dir("mesh-old-ts-delete-journal");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut legacy = mgr.load_full().unwrap();
+    legacy["servers"] = deletion_fixture()["servers"].clone();
+    mgr.save_full(&legacy).unwrap();
+    let wire = mesh_wire_fixture();
+    let policy: MeshRoutePolicy =
+        serde_json::from_value(wire[mesh_guard::POLICY_KEY].clone()).unwrap();
+    let state: MeshRouteState =
+        serde_json::from_value(wire[mesh_guard::STATE_KEY].clone()).unwrap();
+    mgr.prepare_mesh_route_enable(&state.local_id).unwrap();
+    mgr.commit_prepared_mesh_route(policy, state).unwrap();
+
+    let current = mgr.load_full().unwrap();
+    let mut removed = current.clone();
+    removed["servers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|server| server.get("id").and_then(Value::as_str) != Some("ts-1"));
+    mgr.save_full_deferred_cleanup(&current, &removed).unwrap();
+    assert!(
+        !mgr.deferred_deletions_path().exists(),
+        "managed 删除 TS 节点不得写入只含 serverId 的旧清理日志"
+    );
+
+    // A pre-opt-in journal might survive into managed mode. Its old identity
+    // cannot be upgraded to an epoch merely by reading the current serverId.
+    let journal = DeferredDeletionJournal {
+        version: DEFERRED_DELETIONS_VERSION,
+        entries: vec![DeferredConfigDeletion::TailscaleState {
+            server_id: "ts-1".into(),
+        }],
+    };
+    std::fs::write(
+        mgr.deferred_deletions_path(),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    let mut calls = 0;
+    let summary = mgr
+        .process_deferred_deletions(|_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls, 0);
+    assert_eq!(summary.retrying, 1);
+    assert!(mgr.deferred_deletions_path().exists());
+}
+
+#[test]
+fn staged_pending_marker_survives_restart_and_clears_explicitly() {
+    let dir = temp_dir("staged-pending");
+    let marker = dir.join(STAGED_PENDING_FILE);
+    let mgr = ConfigManager::new(dir.clone());
+    assert!(!mgr.has_staged_pending());
+
+    // 非节点草稿显式传空遮罩：它仍阻止旧配置起核，但允许运行态 clean 节点参与故障切换。
+    mgr.set_staged_pending_snapshot(true, Some(vec![]));
+    assert!(mgr.has_staged_pending());
+    assert!(marker.exists(), "崩溃重启要靠持久 marker 拦住旧配置起核");
+    let mask = mgr.staged_node_mask();
+    assert!(mask.pending);
+    assert!(mask.scope_known, "新 marker 的空节点遮罩也是已知范围");
+    assert!(mask.node_ids.is_empty());
+
+    let restarted = ConfigManager::new(dir.clone());
+    assert!(
+        restarted.has_staged_pending(),
+        "无 clean-exit 标记时必须恢复 pending"
+    );
+    assert_eq!(
+        restarted.staged_node_mask(),
+        StagedNodeMask {
+            pending: true,
+            node_ids: BTreeSet::new(),
+            scope_known: true,
+        },
+        "marker 重启恢复必须保留已知空遮罩"
+    );
+    restarted.set_staged_pending(false);
+    assert!(!restarted.has_staged_pending());
+    assert!(!marker.exists());
+}
+
+#[test]
+fn staged_legacy_empty_marker_has_unknown_scope() {
+    let dir = temp_dir("staged-legacy-empty");
+    std::fs::write(dir.join(STAGED_PENDING_FILE), b"").unwrap();
+
+    let mgr = ConfigManager::new(dir.clone());
+    let mask = mgr.staged_node_mask();
+    assert!(mask.pending, "旧空 marker 仍表示有未保存草稿");
+    assert!(
+        !mask.scope_known,
+        "无法解析旧空 marker 时必须按未知节点范围 fail-closed"
+    );
+    assert!(mask.node_ids.is_empty());
+}
+
+#[test]
+fn staged_marker_ignores_the_removed_revision_field_from_previous_builds() {
+    let dir = temp_dir("staged-old-revision");
+    std::fs::write(
+        dir.join(STAGED_PENDING_FILE),
+        br#"{"version":1,"revision":42,"nodeIds":["node-a"]}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        ConfigManager::new(dir.clone()).staged_node_mask(),
+        StagedNodeMask {
+            pending: true,
+            node_ids: BTreeSet::from(["node-a".to_string()]),
+            scope_known: true,
+        }
+    );
+}
+
+#[test]
+fn clean_exit_discards_stale_staged_pending_marker_before_auto_connect() {
+    let dir = temp_dir("staged-clean-exit");
+    std::fs::write(dir.join(STAGED_PENDING_FILE), b"").unwrap();
+    std::fs::write(dir.join(crate::clean_exit::CLEAN_EXIT_MARKER_FILENAME), b"").unwrap();
+
+    let mgr = ConfigManager::new(dir.clone());
+    assert!(!mgr.has_staged_pending());
+    assert!(
+        !dir.join(STAGED_PENDING_FILE).exists(),
+        "2s 自动连接不能被一份已由正常退出判作废的草稿镜像误拦"
+    );
+}
+
+/// **P0 复现路径**：config.json 不存在（首次启动/新装）→ `load_full` 必须把默认配置写盘。
+///
+/// 修复前此处传字面量 `"polaris"` 作 12hex tmp 后缀 → `store::fs::tmp_path` 的
+/// `debug_assert!` 触发 → **debug 构型直接 abort**（非 unwind，`#[should_panic]` 都接不住），
+/// 即「首启必崩」；release 则写出永不被清扫的 `config.json.polaris.tmp`。
+#[test]
+fn load_full_on_missing_config_writes_default_to_disk() {
+    let dir = temp_dir("missing");
+    let path = dir.join("config.json");
+    assert!(
+        !path.exists(),
+        "前提：config.json 必须不存在（这才是新装路径）"
+    );
+
+    let mgr = ConfigManager::new(dir.clone());
+    let cfg = mgr.load_full().expect("新装路径 load_full 应成功");
+
+    // ① 真的落盘了（was_missing 腿跑通）。
+    assert!(
+        path.exists(),
+        "新装必须把默认配置写盘（P0：此前这一步在 debug 下 abort）"
+    );
+    // ② 落盘内容是合法 JSON 且与返回值一致。
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+        .expect("落盘内容应是合法 JSON");
+    assert!(on_disk.is_object(), "落盘配置应是 JSON 对象");
+    assert!(cfg.is_object());
+    // ③ tmp→rename 已完成：目录里不得残留任何 .tmp（尤其不得有 config.json.polaris.tmp）。
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "原子写后不得残留 tmp，实得 {leftovers:?}"
+    );
+}
+
+/// 二次 load（文件已在）不得重写盘，且缓存命中。
+#[test]
+fn load_full_is_idempotent_and_does_not_leave_tmp() {
+    let dir = temp_dir("idem");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let first = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    mgr.load_full().unwrap();
+    let second = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    assert_eq!(first, second, "二次 load 不应改变磁盘内容");
+}
+
+/// 迁移不能只存在于进程内 cache：带标记的一次性默认纠偏必须在首次 load 后立即落盘；用户之后
+/// 显式改回 false 时，新进程读取到标记并尊重该值。
+#[test]
+fn load_full_persists_migration_marker_then_respects_user_value() {
+    let dir = temp_dir("migration-persist");
+    let path = dir.join("config.json");
+    let mut legacy = polaris_store::default_config();
+    legacy["keepTrayMenuWarm"] = Value::Bool(false);
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("keepTrayMenuWarmDefaultMigrated");
+    std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+    let mgr = ConfigManager::new(dir.clone());
+    let migrated = mgr.load_full().expect("升级配置应成功迁移");
+    assert_eq!(migrated["keepTrayMenuWarm"], true);
+    assert_eq!(migrated["keepTrayMenuWarmDefaultMigrated"], true);
+
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+        .expect("迁移结果应立即落为合法 JSON");
+    assert_eq!(on_disk["keepTrayMenuWarm"], true);
+    assert_eq!(on_disk["keepTrayMenuWarmDefaultMigrated"], true);
+
+    mgr.set_value("keepTrayMenuWarm", Value::Bool(false))
+        .expect("用户关闭预热应落盘");
+    let restarted = ConfigManager::new(dir.clone())
+        .load_full()
+        .expect("二次启动应读取已标记配置");
+    assert_eq!(restarted["keepTrayMenuWarm"], false);
+    assert_eq!(restarted["keepTrayMenuWarmDefaultMigrated"], true);
+}
+
+/// `Write` / `Skip` 两条腿各走一遍。
+///
+/// 变异对照：把 `Skip` 腿改成照样 `save_full` → 「不写」那两条断言转红（真实后果是净零改动
+/// 多一次广播 + 多一次 `switch_mode`）；把 `Skip` 腿改成回传 `Some(cfg)` → 「必须不回传配置」
+/// 转红（调用方正是据它决定要不要广播）。
+#[test]
+fn update_writes_or_skips_and_never_leaks_skipped_edits() {
+    let dir = temp_dir("update-outcomes");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+
+    // ① 正常改动：落盘 + 把值和已落盘那份一起带回。
+    let (tag, saved) = mgr
+        .update(|cfg| {
+            cfg.as_object_mut()
+                .unwrap()
+                .insert("mixedPort".into(), Value::from(7801u64));
+            Decision::Write("created-id")
+        })
+        .expect("不该报错");
+    assert_eq!(tag, "created-id", "闭包算出的值必须能带出来给调用方");
+    assert_eq!(
+        saved.expect("Write 腿必须回传已落盘那份（调用方要拿它去锁外广播）")["mixedPort"],
+        7801
+    );
+    assert_eq!(mgr.current().unwrap()["mixedPort"], 7801);
+
+    // ② `Skip`：不是错误、**一个字节都不该写**，且不回传配置（回传就等于邀请调用方去广播）。
+    let (payload, skipped) = mgr
+        .update(|cfg| {
+            cfg.as_object_mut()
+                .unwrap()
+                .insert("mixedPort".into(), Value::from(9999u64));
+            // 真实形态：净零改动照样要把「成功」的载荷还给调用方（如 `ApiResponse::ok(0u32)`）。
+            Decision::Skip(0u32)
+        })
+        .expect("跳过不是错误");
+    assert_eq!(payload, 0, "Skip 腿同样要能带出调用方的返回值");
+    assert!(
+        skipped.is_none(),
+        "Skip 腿必须不回传配置 —— 回传就等于让调用方多广播一次 configChanged"
+    );
+    assert_eq!(
+        mgr.current().unwrap()["mixedPort"],
+        7801,
+        "Skip 必须不写 —— 闭包对 cfg 的改动一律丢弃"
+    );
+}
+
+/// 写事务的返回值、缓存与磁盘必须是同一份规范形。`ConfigStore::save` 会归一枚举并删除类型错误
+/// 的可选字段；若 `update` 仍返回/缓存清洗前 `cfg`，后续版本校验会对一份磁盘上从未存在过的对象
+/// 求 hash，产生假冲突。
+#[test]
+fn update_returns_and_caches_the_canonical_bytes_written_to_disk() {
+    let dir = temp_dir("update-canonical");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+
+    let (_, saved) = mgr
+        .update(|cfg| {
+            cfg["proxyModeType"] = Value::String("SYSTEMPROXY".into());
+            cfg["desktopNotifications"] = Value::String("not-a-boolean".into());
+            Decision::Write(())
+        })
+        .expect("可清洗输入应保存成功");
+    let saved = saved.expect("Write 必须返回事务终态");
+    assert_eq!(saved["proxyModeType"], "systemProxy");
+    assert!(saved.get("desktopNotifications").is_none());
+    assert_eq!(mgr.current().unwrap(), saved, "缓存必须等于写接口返回值");
+
+    let reloaded = ConfigManager::new(dir.clone()).load_full().unwrap();
+    assert_eq!(reloaded, saved, "新进程从磁盘读到的也必须是同一事务终态");
+}
+
+/// **不丢更新** —— 本原语存在的全部理由。
+///
+/// 两个线程各自把 `mixedPort` 加 1。分离三步（`load_full` → mutate → `save_full`）下二者会读到
+/// 同一个初值、后写的整份覆盖前者 ⇒ 终值 +1（丢了一次）。原子后必为 +2。
+///
+/// 闭包里那次 `sleep` 是**逼出交错**用的：没有它，两个线程可能天然错开而让本条在无锁实现下
+/// 也偶然变绿（那种门等于没门）。
+///
+/// 变异对照（实跑）：把 `update` 体内的 `write_lock.lock()` 那三行删掉 → 终值 7801 而非 7802，转红。
+#[test]
+fn concurrent_updates_do_not_lose_each_other() {
+    use std::sync::Arc;
+    let dir = temp_dir("update-concurrent");
+    let mgr = Arc::new(ConfigManager::new(dir.clone()));
+    let mut cfg = mgr.load_full().unwrap();
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("mixedPort".into(), Value::from(7800u64));
+    mgr.save_full(&cfg).unwrap();
+
+    let bump = |m: Arc<ConfigManager>| {
+        std::thread::spawn(move || {
+            m.update(|c| {
+                let cur = c["mixedPort"].as_u64().unwrap();
+                // 持锁期间睡一下，逼出「两个线程都已读、都还没写」这个交错。
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                c.as_object_mut()
+                    .unwrap()
+                    .insert("mixedPort".into(), Value::from(cur + 1));
+                Decision::Write(())
+            })
+            .expect("update 不该失败");
+        })
+    };
+    let a = bump(Arc::clone(&mgr));
+    let b = bump(Arc::clone(&mgr));
+    a.join().unwrap();
+    b.join().unwrap();
+
+    assert_eq!(
+        mgr.current().unwrap()["mixedPort"],
+        7802,
+        "两次 +1 必须都在；7801 = 有一次被整份覆盖掉了（丢更新）"
+    );
+}
+
+/// **起核载荷新鲜的地基**：`save_full` 之后 `current()` 必须立刻返回新值。
+///
+/// `proxy_start` / `proxy_restart` 改成用 `state.config().current()` 取起核配置之后，
+/// 「写盘 → 立刻点启动用的是写后的配置」这条用户可见承诺**全部押在这条性质上**：
+/// 若 `current()` 还回旧缓存，起核就仍会用写之前那份 —— 与改之前的缺陷一模一样，
+/// 只是从「渲染端副本陈旧」换成「后端缓存陈旧」。
+///
+/// 变异对照：删掉 `save_full` 末尾那段刷缓存（`*guard = Some(config.clone())`）→ 本条转红。
+#[test]
+fn current_reflects_the_write_immediately_after_save_full() {
+    let dir = temp_dir("current-after-save");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut cfg = mgr.load_full().unwrap();
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("mixedPort".into(), Value::from(7899u64));
+    mgr.save_full(&cfg).expect("save_full 应成功");
+    assert_eq!(
+        mgr.current().expect("current 应可读")["mixedPort"],
+        7899,
+        "save_full 之后 current() 必须已是新值 —— 起核载荷就是从这里取的"
+    );
+}
+
+/// `save_full` 每次都取新 tmp 后缀 → 连续保存不得残留 tmp、内容以最后一次为准。
+#[test]
+fn save_full_persists_and_leaves_no_tmp() {
+    let dir = temp_dir("save");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut cfg = mgr.load_full().unwrap();
+    for port in [7890u64, 7891, 7892] {
+        cfg.as_object_mut()
+            .unwrap()
+            .insert("mixedPort".into(), Value::from(port));
+        mgr.save_full(&cfg).expect("save_full 应成功");
+    }
+    let on_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(on_disk["mixedPort"], 7892, "应落最后一次保存的值");
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "连续保存不得残留 tmp，实得 {leftovers:?}"
+    );
+}
+
+/// LOW-4：`customAppPresets` 未变的保存不得驱逐仍在册应用的缓存图标（改无关键仍保留图标）。
+#[test]
+fn save_full_keeps_icon_when_presets_unchanged() {
+    let dir = temp_dir("icon-keep");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut cfg = mgr.load_full().unwrap();
+    cfg.as_object_mut().unwrap().insert(
+        "customAppPresets".into(),
+        serde_json::json!([{ "id": "custom-keep", "name": "K" }]),
+    );
+    mgr.save_full(&cfg).unwrap(); // 暖缓存：旧集 = {custom-keep}
+    let icons = crate::icon_cache::icons_dir(&dir);
+    crate::icon_cache::write_icon(&icons, "custom-keep", "png", b"\x89PNG").unwrap();
+    // 改无关键（customAppPresets 不动）→ id 集未变 → reconcile 跳过 → 图标须存活。
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("mixedPort".into(), Value::from(7890u64));
+    mgr.save_full(&cfg).unwrap();
+    assert!(
+        icons.join("custom-keep.png").exists(),
+        "preset 未变时不得驱逐仍在册图标"
+    );
+}
+
+/// `with_current` 的投影结论必须与 `current()` 的整份快照**逐字段一致**（缓存已暖路径）。
+///
+/// 这条是把 `current()` 换成 `with_current` 的等价性根据：换的是「谁付深拷贝」，不是读到的内容。
+/// **变异锁**：把 `with_current` 实现成「先 `load_full()` 再跑 `f`」（即忽略缓存）→ 本测仍绿，
+/// 但 `with_current_does_not_touch_disk_when_cache_is_warm` 转红。
+#[test]
+fn with_current_projection_matches_current_snapshot() {
+    let dir = temp_dir("with-current-eq");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut cfg = mgr.load_full().unwrap();
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("mixedPort".into(), Value::from(7899u64));
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("selectedServerId".into(), Value::from("srv-1"));
+    mgr.save_full(&cfg).unwrap();
+
+    let snapshot = mgr.current().unwrap();
+    let projected = mgr
+        .with_current(|v| {
+            (
+                v.get("mixedPort").cloned(),
+                v.get("selectedServerId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            )
+        })
+        .unwrap();
+    assert_eq!(projected.0.as_ref(), snapshot.get("mixedPort"));
+    assert_eq!(projected.1.as_deref(), Some("srv-1"));
+}
+
+/// 缓存已暖时 `with_current` **不得触盘**：把盘上文件删掉后仍能投影出内存里的值。
+///
+/// 这正是热路径（STATUS 每帧 / 心跳每 tick）走它的前提 —— 若它退化成每次 `load_full`，
+/// 省掉的深拷贝会被一次磁盘读 + sanitize + validate 换成更贵的开销。
+#[test]
+fn with_current_does_not_touch_disk_when_cache_is_warm() {
+    let dir = temp_dir("with-current-warm");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut cfg = mgr.load_full().unwrap();
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("mixedPort".into(), Value::from(7123u64));
+    mgr.save_full(&cfg).unwrap(); // 暖缓存
+    std::fs::remove_file(dir.join("config.json")).unwrap();
+
+    let port = mgr.with_current(|v| v.get("mixedPort").cloned()).unwrap();
+    assert_eq!(
+        port,
+        Some(Value::from(7123u64)),
+        "缓存暖时必须走内存投影，不得回落读盘"
+    );
+    assert!(
+        !dir.join("config.json").exists(),
+        "缓存暖路径不得因一次投影就把默认配置写回磁盘"
+    );
+}
+
+/// 缓存**未暖**（冷启首次读）时 `with_current` 必须回落 `load_full` 并对读到的配置跑投影。
+#[test]
+fn with_current_falls_back_to_load_when_cache_is_cold() {
+    let dir = temp_dir("with-current-cold");
+    // 先用一个实例把非默认值落盘，再用**全新实例**（缓存冷）读。
+    {
+        let seed = ConfigManager::new(dir.clone());
+        let mut cfg = seed.load_full().unwrap();
+        cfg.as_object_mut()
+            .unwrap()
+            .insert("mixedPort".into(), Value::from(7456u64));
+        seed.save_full(&cfg).unwrap();
+    }
+    let cold = ConfigManager::new(dir.clone());
+    let port = cold
+        .with_current(|v| v.get("mixedPort").and_then(Value::as_u64))
+        .unwrap();
+    assert_eq!(port, Some(7456), "冷缓存须经 load_full 读到盘上的值");
+    // 回落腿也须顺带暖上缓存（与 `current()` 同款懒加载语义）。
+    assert_eq!(
+        cold.current()
+            .unwrap()
+            .get("mixedPort")
+            .and_then(Value::as_u64),
+        Some(7456)
+    );
+}
+
+/// **读锁必须在 `with_current` 返回前释放**：返回后紧接着的写腿（`set_value` 要 `cache.write()`）
+/// 不得阻塞。
+///
+/// 用带超时的独立线程跑，是因为「锁没释放」的失败形态是**永久阻塞**而不是断言失败 —— 直接在测试
+/// 线程里跑会把整个 `cargo test` 挂死（看起来像 CI 卡住，而不是一条红测）。
+///
+/// **变异锁**：把实现改成「读锁跨越 `load_full`」（即把 `f(c)` 与后续写腿放进同一个 guard 作用域）
+/// → 本测超时转红。
+#[test]
+fn with_current_releases_read_lock_before_returning() {
+    use std::sync::mpsc;
+    let dir = temp_dir("with-current-unlock");
+    let mgr = std::sync::Arc::new(ConfigManager::new(dir.clone()));
+    mgr.load_full().unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let m = std::sync::Arc::clone(&mgr);
+    let h = std::thread::spawn(move || {
+        let seen = m.with_current(|v| v.get("mixedPort").cloned());
+        // 紧接着取写锁：若上面的读锁被 `with_current` 带出来了，这里同线程自死锁。
+        let wrote = m.set_value("mixedPort", Value::from(7001u64)).is_ok();
+        let _ = tx.send(seen.is_ok() && wrote);
+    });
+    let ok = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("with_current 返回后写腿必须立刻可取写锁（超时 = 读锁被带出闭包）");
+    assert!(ok, "投影与随后的写入都应成功");
+    h.join().unwrap();
+    assert_eq!(
+        mgr.current()
+            .unwrap()
+            .get("mixedPort")
+            .and_then(Value::as_u64),
+        Some(7001)
+    );
+}
+
+// ── with_current 闭包禁忌的「牙」（debug 构型探针）─────────────────────────────
+//
+// 三条测试穷举闭包内**可能**回到 ConfigManager 的三种形态（读 / 写 / 嵌套投影）—— 只测一条会被
+// 「只在 current() 上加探针」这种半吊子修法蒙混过关。三条都不能靠真死锁来验（那是挂死不是红测），
+// 故判据是探针 panic。
+
+/// 闭包内调 `current()`（**读**腿）→ 探针 panic。
+///
+/// 这条是三条里最危险的：不加探针时它**平时不显形**（无写者排队 → 递归读通常拿得到），
+/// 只在恰好有另一条腿写配置时永久阻塞。
+///
+/// **变异锁**：删掉 `with_current` 里的 `ReentrancyProbe::enter()`，或删掉 `current()` 开头的
+/// `deny_inside_projection` → 本测（无 panic）转红。
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "with_current 闭包内被调用")]
+fn nested_current_inside_projection_panics_in_debug() {
+    let dir = temp_dir("reentrancy-read");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let _ = mgr.with_current(|_| mgr.current());
+}
+
+/// 闭包内调 `set_value()`（**写**腿）→ 探针 panic。不加探针时这条是**必然自死锁**。
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "with_current 闭包内被调用")]
+fn nested_write_inside_projection_panics_in_debug() {
+    let dir = temp_dir("reentrancy-write");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let _ = mgr.with_current(|_| mgr.set_value("mixedPort", Value::from(1u64)));
+}
+
+/// 闭包内**嵌套** `with_current` → 同样 panic（自己人也不例外）。
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "with_current 闭包内被调用")]
+fn nested_with_current_inside_projection_panics_in_debug() {
+    let dir = temp_dir("reentrancy-nested");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let _ = mgr.with_current(|_| mgr.with_current(|v| v.is_object()));
+}
+
+/// 探针必须**随闭包退场归零**——含闭包 panic 的退场。否则一次失败测试会把同线程后续所有配置读
+/// 全打成 panic：故障从一条变成一片，而真正的根因被淹没。
+///
+/// **变异锁**：把 `ReentrancyProbe` 的 `Drop` 换成手工「闭包返回后 -1」→ panic 腿不再归零，
+/// 本测最后那次 `current()` 转红。
+#[cfg(debug_assertions)]
+#[test]
+fn probe_depth_unwinds_on_closure_panic() {
+    let dir = temp_dir("reentrancy-unwind");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = mgr.with_current(|_| panic!("闭包内业务 panic"));
+    }));
+    assert!(boom.is_err(), "前提：闭包确实 panic 了");
+    // 探针归零 ⇒ 后续正常读写照常可用（不归零则这两行 panic）。
+    assert!(mgr.current().is_ok(), "闭包 panic 后深度必须已归零");
+    assert!(mgr.with_current(|v| v.is_object()).unwrap());
+}
+
+/// LOW-4：id 集**实际变化**（移除某 preset）时 reconcile 照跑——被移除项图标驱逐、仍在册保留。
+#[test]
+fn save_full_reconciles_icons_when_preset_removed() {
+    let dir = temp_dir("icon-evict");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut cfg = mgr.load_full().unwrap();
+    cfg.as_object_mut().unwrap().insert(
+        "customAppPresets".into(),
+        serde_json::json!([{ "id": "custom-keep" }, { "id": "custom-drop" }]),
+    );
+    mgr.save_full(&cfg).unwrap();
+    let icons = crate::icon_cache::icons_dir(&dir);
+    crate::icon_cache::write_icon(&icons, "custom-keep", "png", b"\x89PNG").unwrap();
+    crate::icon_cache::write_icon(&icons, "custom-drop", "png", b"\x89PNG").unwrap();
+    // 移除 custom-drop → id 集变化 → reconcile 跑。
+    cfg.as_object_mut().unwrap().insert(
+        "customAppPresets".into(),
+        serde_json::json!([{ "id": "custom-keep" }]),
+    );
+    mgr.save_full(&cfg).unwrap();
+    assert!(icons.join("custom-keep.png").exists(), "仍在册图标须保留");
+    assert!(!icons.join("custom-drop.png").exists(), "移除项图标须驱逐");
+}
+
+fn deletion_fixture() -> Value {
+    serde_json::json!({
+        "servers": [
+            {
+                "id": "ts-1", "name": "TS", "protocol": "tailscale",
+                "address": "100.64.0.1", "port": 0, "tailscaleSettings": {}
+            },
+            {
+                "id": "warp-1", "name": "WARP", "protocol": "wireguard",
+                "address": "engage.cloudflareclient.com", "port": 2408,
+                "wireguardSettings": {
+                    "privateKey": "private", "localAddress": ["172.16.0.2/32"],
+                    "peerPublicKey": "peer", "allowedIPs": ["0.0.0.0/0"],
+                    "warpDevice": { "deviceId": "dev-1", "token": "tok-1" }
+                }
+            },
+            {
+                "id": "proxy-1", "name": "Proxy", "protocol": "vless",
+                "address": "example.com", "port": 443
+            }
+        ],
+        "ruleResources": [
+            {
+                "id": "geo-custom", "name": "Custom", "category": "custom",
+                "sourceUrl": "https://example.com/geo-custom.srs",
+                "fileName": "geo-custom.srs", "format": "binary",
+                "size": 1, "downloadedAt": "2026-08-28T00:00:00.000Z"
+            }
+        ],
+        "customAppPresets": [
+            {
+                "id": "app-custom", "name": "Custom", "emoji": "C",
+                "geositeTags": [], "geoipTags": [], "processNames": [], "category": "custom"
+            }
+        ]
+    })
+}
+
+#[test]
+fn derive_deferred_deletions_covers_only_irreversible_assets() {
+    let current = deletion_fixture();
+    let incoming = serde_json::json!({
+        "servers": [{ "id": "proxy-1", "protocol": "vless" }],
+        "ruleResources": [],
+        "customAppPresets": []
+    });
+    let entries = derive_deferred_deletions(&current, &incoming);
+    assert_eq!(
+        entries.len(),
+        4,
+        "TS/WARP/资源文件/图标各一条；普通节点没有副作用"
+    );
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        DeferredConfigDeletion::TailscaleState { server_id } if server_id == "ts-1"
+    )));
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        DeferredConfigDeletion::WarpDevice { device_id, token, .. }
+            if device_id == "dev-1" && token == "tok-1"
+    )));
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        DeferredConfigDeletion::RuleResource { file_name } if file_name == "geo-custom.srs"
+    )));
+    assert!(entries.iter().any(|entry| matches!(
+        entry,
+        DeferredConfigDeletion::AppIcon { app_id } if app_id == "app-custom"
+    )));
+}
+
+#[test]
+fn deferred_save_writes_intent_without_running_cleanup() {
+    let dir = temp_dir("deferred-delete-save");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut current = mgr.load_full().unwrap();
+    let fixture = deletion_fixture();
+    current["servers"] = fixture["servers"].clone();
+    current["ruleResources"] = fixture["ruleResources"].clone();
+    current["customAppPresets"] = fixture["customAppPresets"].clone();
+    mgr.save_full(&current).unwrap();
+
+    let resource = dir.join("rule-resource/geo-custom.srs");
+    std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
+    std::fs::write(&resource, b"SRS").unwrap();
+    let icon_dir = crate::icon_cache::icons_dir(&dir);
+    crate::icon_cache::write_icon(&icon_dir, "app-custom", "png", b"PNG").unwrap();
+    let ts_state = dir.join("tailscale/ts-1");
+    std::fs::create_dir_all(&ts_state).unwrap();
+
+    let mut incoming = current.clone();
+    incoming["servers"] = serde_json::json!([{ "id": "proxy-1", "protocol": "vless" }]);
+    incoming["ruleResources"] = serde_json::json!([]);
+    incoming["customAppPresets"] = serde_json::json!([]);
+    mgr.save_full_deferred_cleanup(&current, &incoming).unwrap();
+
+    assert!(resource.exists(), "保存阶段不得删除规则资源文件");
+    assert!(
+        icon_dir.join("app-custom.png").exists(),
+        "保存阶段不得驱逐图标"
+    );
+    assert!(ts_state.exists(), "保存阶段不得清 Tailscale state");
+    assert!(
+        mgr.deferred_deletions_path().exists(),
+        "删除意图须持久化以跨崩溃恢复"
+    );
+}
+
+#[test]
+fn deferred_deletions_cancel_readded_entities_and_retry_failures() {
+    let dir = temp_dir("deferred-delete-reconcile");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut current = mgr.load_full().unwrap();
+    let fixture = deletion_fixture();
+    current["servers"] = fixture["servers"].clone();
+    current["ruleResources"] = fixture["ruleResources"].clone();
+    current["customAppPresets"] = fixture["customAppPresets"].clone();
+    mgr.save_full(&current).unwrap();
+    let mut incoming = current.clone();
+    incoming["servers"] = serde_json::json!([{ "id": "proxy-1", "protocol": "vless" }]);
+    incoming["ruleResources"] = serde_json::json!([]);
+    incoming["customAppPresets"] = serde_json::json!([]);
+    mgr.stage_deferred_deletions(&current, &incoming).unwrap();
+
+    let mut calls = 0usize;
+    let cancelled = mgr
+        .process_deferred_deletions(|_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls, 0, "实体重新出现时不得执行任何不可逆动作");
+    assert_eq!(cancelled.cancelled, 4);
+    assert!(!mgr.deferred_deletions_path().exists(), "已取消意图须清账");
+
+    mgr.stage_deferred_deletions(&current, &incoming).unwrap();
+    mgr.save_full(&incoming).unwrap();
+    let first = mgr
+        .process_deferred_deletions(|entry, _| {
+            if matches!(entry, DeferredConfigDeletion::WarpDevice { .. }) {
+                Err("queue unavailable".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+    assert_eq!(first.applied, 3);
+    assert_eq!(first.retrying, 1);
+    let second = mgr.process_deferred_deletions(|_, _| Ok(())).unwrap();
+    assert_eq!(second.applied, 1, "失败条目须在下一次 Apply 重试");
+    assert!(!mgr.deferred_deletions_path().exists());
+}
+
+#[test]
+fn explicit_deletions_are_write_ahead_skip_safe_and_cancellable() {
+    let dir = temp_dir("explicit-deletion");
+    let mgr = ConfigManager::new(dir.clone());
+    mgr.load_full().unwrap();
+    let deletion = DeferredConfigDeletion::BuiltinRuleResource {
+        tag: "cn".to_string(),
+        file_name: "geosite-cn.srs".to_string(),
+    };
+
+    // Skip 不是提交点：显式意图同样不得越过它单独落 journal。
+    let (_, saved) = mgr
+        .update_with_explicit_deletions(vec![deletion.clone()], |_| Decision::Skip(()))
+        .unwrap();
+    assert!(saved.is_none());
+    assert!(!mgr.deferred_deletions_path().exists());
+
+    // Write 把意图先于配置提交；此刻不执行不可逆动作。
+    mgr.update_with_explicit_deletions(vec![deletion.clone()], |_| Decision::Write(()))
+        .unwrap();
+    assert!(mgr.deferred_deletions_path().exists());
+
+    // Apply 前同一内置 tag 被重新下载并登记，旧 reset 意图必须取消，不能删掉新文件。
+    mgr.update(|cfg| {
+        cfg["builtinGeoMeta"] = serde_json::json!({ "cn": { "updatedAt": "now" } });
+        Decision::Write(())
+    })
+    .unwrap();
+    let mut calls = 0usize;
+    let summary = mgr
+        .process_deferred_deletions(|_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls, 0, "重新登记的内置资源不得执行旧 reset 删除");
+    assert_eq!(summary.cancelled, 1);
+    assert!(!mgr.deferred_deletions_path().exists());
+}
+
+#[test]
+fn deferred_icon_delete_cancels_when_a_new_id_reuses_the_same_sanitized_path() {
+    let dir = temp_dir("deferred-icon-sanitize-collision");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut current = mgr.load_full().unwrap();
+    current["customAppPresets"] = serde_json::json!([{ "id": "custom/app", "name": "Old" }]);
+    let mut removed = current.clone();
+    removed["customAppPresets"] = serde_json::json!([]);
+    mgr.stage_deferred_deletions(&current, &removed).unwrap();
+
+    let mut latest = current.clone();
+    latest["customAppPresets"] = serde_json::json!([{ "id": "custom?app", "name": "New" }]);
+    mgr.save_full(&latest).unwrap();
+    let mut calls = 0usize;
+    let summary = mgr
+        .process_deferred_deletions(|_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls, 0, "同一落盘 stem 已被新实体复用时不得删图标");
+    assert_eq!(summary.cancelled, 1);
+}

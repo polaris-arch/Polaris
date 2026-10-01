@@ -1,0 +1,129 @@
+diff --git a/dns/transport/local/systemconfig/source_windows.go b/dns/transport/local/systemconfig/source_windows.go
+index c45f06e..e6c5c0a 100644
+--- a/dns/transport/local/systemconfig/source_windows.go
++++ b/dns/transport/local/systemconfig/source_windows.go
+@@ -22,10 +22,15 @@ import (
+ 	"golang.org/x/sys/windows"
+ )
+ 
++// DNS-only changes do not necessarily trigger an interface update. Bound the
++// cached configuration lifetime without resetting active network connections.
++const configRefreshInterval = time.Second
++
+ type Source struct {
+ 	interfaceMonitor tun.DefaultInterfaceMonitor
+ 	access           sync.Mutex
+ 	updateCallback   *list.Element[tun.DefaultInterfaceUpdateCallback]
++	lastChecked      time.Time
+ 	stale            bool
+ 	config           *Config
+ }
+@@ -41,13 +46,18 @@ func NewSource(ctx context.Context) *Source {
+ }
+ 
+ func (s *Source) Configuration() *Config {
++	return s.configuration(time.Now(), s.readConfig)
++}
++
++func (s *Source) configuration(now time.Time, readConfig func() *Config) *Config {
+ 	s.access.Lock()
+ 	defer s.access.Unlock()
+-	if s.config != nil && !s.stale && s.updateCallback != nil {
++	if s.config != nil && !s.stale && s.updateCallback != nil && now.Sub(s.lastChecked) < configRefreshInterval {
+ 		return s.config
+ 	}
+ 	s.stale = false
+-	config := s.readConfig()
++	s.lastChecked = now
++	config := readConfig()
+ 	if s.config != nil && config.Equal(s.config) {
+ 		return s.config
+ 	}
+diff --git a/dns/transport/local/systemconfig/source_windows_test.go b/dns/transport/local/systemconfig/source_windows_test.go
+new file mode 100644
+index 0000000..f05d02c
+--- /dev/null
++++ b/dns/transport/local/systemconfig/source_windows_test.go
+@@ -0,0 +1,82 @@
++package systemconfig
++
++import (
++	"net/netip"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-tun"
++	M "github.com/sagernet/sing/common/metadata"
++	"github.com/sagernet/sing/common/x/list"
++)
++
++func TestConfigurationRefreshWithoutInterfaceEvent(t *testing.T) {
++	start := time.Now()
++	initial := &Config{Servers: []M.Socksaddr{M.SocksaddrFrom(netip.MustParseAddr("192.168.10.1"), 53)}}
++	changed := &Config{Servers: []M.Socksaddr{M.SocksaddrFrom(netip.MustParseAddr("223.5.5.5"), 53)}, Search: []string{"corp.example."}}
++	s := &Source{updateCallback: new(list.Element[tun.DefaultInterfaceUpdateCallback])}
++	reads := 0
++	current := initial
++	read := func() *Config { reads++; return current }
++	if s.configuration(start, read) != initial {
++		t.Fatal("initial configuration was not read")
++	}
++	current = changed
++	if s.configuration(start.Add(configRefreshInterval-time.Nanosecond), read) != initial || reads != 1 {
++		t.Fatal("cache did not bound reads")
++	}
++	if s.configuration(start.Add(configRefreshInterval), read) != changed || reads != 2 {
++		t.Fatal("DNS-only change remained stale")
++	}
++	current = initial
++	if s.configuration(start.Add(2*configRefreshInterval), read) != initial {
++		t.Fatal("DNS restoration remained stale")
++	}
++}
++
++func TestConfigurationInvalidationAndEqualReuse(t *testing.T) {
++	for _, invalidate := range []string{"reset", "interface", "no-monitor", "expired"} {
++		t.Run(invalidate, func(t *testing.T) {
++			now := time.Now()
++			initial := &Config{Search: []string{"corp.example."}}
++			s := &Source{config: initial, lastChecked: now, updateCallback: new(list.Element[tun.DefaultInterfaceUpdateCallback])}
++			switch invalidate {
++			case "reset":
++				s.Reset()
++			case "interface":
++				s.interfaceUpdated(nil, 0)
++			case "no-monitor":
++				s.updateCallback = nil
++			case "expired":
++				now = now.Add(configRefreshInterval)
++			}
++			reads := 0
++			got := s.configuration(now, func() *Config { reads++; return &Config{Search: []string{"corp.example."}} })
++			if reads != 1 || got != initial {
++				t.Fatal("invalidation must reread and reuse an equal snapshot")
++			}
++		})
++	}
++}
++
++func TestConfigurationConcurrentRefresh(t *testing.T) {
++	now := time.Now()
++	s := &Source{config: &Config{}, lastChecked: now.Add(-configRefreshInterval), updateCallback: new(list.Element[tun.DefaultInterfaceUpdateCallback])}
++	changed := &Config{Search: []string{"new.example."}}
++	reads := 0
++	var wg sync.WaitGroup
++	for range 32 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			if s.configuration(now, func() *Config { reads++; return changed }) != changed {
++				t.Error("inconsistent snapshot")
++			}
++		}()
++	}
++	wg.Wait()
++	if reads != 1 {
++		t.Fatalf("concurrent reads = %d, want 1", reads)
++	}
++}

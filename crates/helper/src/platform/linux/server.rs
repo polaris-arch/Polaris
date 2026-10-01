@@ -1,0 +1,1249 @@
+//! Server 主循环 —— 移植自 上游 `helper-linux/main.go`。
+//!
+//! ## 流程（逐行对照 Go 源 main()）
+//!
+//! 1. 解析 flags：socket / authfile / coredir / console（:17-22）。
+//! 2. 建 socket 目录（0755，任意登录用户可穿越）+ 删旧 socket（:25-31）。
+//! 3. Listen(unix) + chmod socket 0666（:33-38）—— socket 本身 0666 + SO_PEERCRED + 授权列表把关。
+//! 4. SIGTERM/SIGINT 收割器：先收割 child sing-box，等在途后台收割，复位转发态，退出（:42-58）。
+//! 5. Accept 循环：每连接 go handle(conn)（:63-69）。
+//!
+//! ## Rust 移植
+//!
+//! Go 源的 socket 循环 + handle 分发是同步多 goroutine。本实现提供：
+//! - [`ServerConfig`]：flags 的类型化等价（socket/authfile/coredir 三路径 + console 标记）。
+//! - [`prepare_socket`]：建目录 + 删旧 socket + bind + chmod（纯逻辑，可单测）。
+//! - [`ss_lookup`]：freeport 的 ss 子进程封装。
+//!
+//! ## C6-2 提权心脏（本批落地）
+//!
+//! [`AmbientCapsSpawner`] 是真实的 fork+setuid+AmbientCaps 拉核（替换 C6-0 的 `NotImplementedSpawner` 桩）：
+//! `Command` + `pre_exec`（`set_keepcaps` → `setgroups`/`setgid`/`setuid` 降权 → raise Inheritable/Ambient
+//! CAP_NET_ADMIN/RAW/BIND_SERVICE），log 重定向 + chown 到对端 uid，收割线程收尸 + 清 state，父死看护
+//! （watchParent），terminate（TERM→≤5s→KILL）+ reapWG 退出兜底。**pre_exec 后 fork+execve 链、真降权
+//! 拉核为真机门**（本机绝不跑，见 [`super`] 模块文档「关键地雷」段）；纯逻辑（caps 集/terminate 决策/
+//! watchParent 决策/ChildSlot 协调）本文件单测覆盖。
+//!
+//! [`ConnServer`] 把 accept 到的 tokio `UnixStream` 转同步 [`LineConn`](crate::platform::linux::handler::LineConn)
+//! （5s 读超时 + 捕获 SO_PEERCRED），交给同步 [`handle`](crate::platform::linux::handle)，对应 Go 的
+//! `for { conn := l.Accept(); go handle(conn) }`。
+//!
+//! ## Native birth custody 边界
+//!
+//! Linux 每次物理 spawn 有独立 birth，`Child::try_wait` 与 TERM/KILL 共用该 birth 的锁；只有
+//! 真实 wait 成功才能生成本地 `HelperBirthReaped`，并按 birth 清 handler/slot。wait 错误保持
+//! Unknown 和 Child custody。现有 Stop wire 仍是提前 ACK，Start 仍按旧准入；本地证明未传到
+//! app，也未用于 Tailscale owner、NoOwner 或 managed。故此片**不解决** helper→helper 或跨
+//! backend 启动重叠；macOS/Windows 未提供同等级 native reap 证明。后续若要消费证明放行
+//! 新启动，须同时解决 helper-client 对未投递拒绝/等待调度的区分，不能复用普通 `ERR start`。
+
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, Read};
+use std::num::NonZeroU32;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
+use crate::platform::accept_retry::{LogThrottle, ACCEPT_LOG_INTERVAL};
+use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
+use crate::platform::linux::ops::set_forward_prod;
+use crate::platform::linux::state::{
+    BirthAdmission, CoreHandle, CoreSpawner, HandlerState, ManagedChild, ReapBlockerState,
+    SpawnCoreRequest, SpawnError, SpawnedCore, StartAdmission, StopReap,
+};
+use polaris_helper_proto::HelperBirthTarget;
+
+const REAP_TOMBSTONES: usize = 64;
+
+/// 默认 socket 路径（移植自 Go flag default `/run/polaris/helper.sock`，:18）。
+pub const DEFAULT_SOCK_PATH: &str = "/run/polaris/helper.sock";
+/// 默认授权 uid 列表文件（Go default `/var/lib/polaris/authorized-uids`，:19）。
+pub const DEFAULT_AUTH_FILE: &str = "/var/lib/polaris/authorized-uids";
+/// 默认锁定的 root-owned 受管核目录（Go default `/usr/local/lib/polaris/core`，:20）。
+pub const DEFAULT_CORE_DIR: &str = "/usr/local/lib/polaris/core";
+
+/// server 配置（flags 的类型化等价，对照 Go main 的 flag.String/flag.Bool）。
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// unix socket 路径。
+    pub sock_path: PathBuf,
+    /// 授权 uid 列表文件。
+    pub auth_file: PathBuf,
+    /// 锁定的 root-owned 受管核目录（None = install-core 报 coredir-unset）。
+    pub core_dir: Option<PathBuf>,
+    /// 前台运行（开发/测试，systemd 不要求）。
+    pub console: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            sock_path: PathBuf::from(DEFAULT_SOCK_PATH),
+            auth_file: PathBuf::from(DEFAULT_AUTH_FILE),
+            core_dir: Some(PathBuf::from(DEFAULT_CORE_DIR)),
+            console: false,
+        }
+    }
+}
+
+/// socket bind 失败的错误（对照 Go main 的 `fmt.Fprintln(os.Stderr, err); os.Exit(1)`，:35-37）。
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    /// socket 目录创建失败。
+    #[error("mkdir socket dir {dir:?}: {source}")]
+    Mkdir {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// unix socket bind 失败。
+    #[error("listen {path:?}: {source}")]
+    Listen {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// chmod socket 失败。
+    #[error("chmod {path:?}: {source}")]
+    Chmod {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// 准备 socket：建目录 0755 + 删旧 socket + bind + chmod 0666（移植自 Go :25-38）。
+///
+/// 返回绑定好的 std UnixListener（同步，对齐 Go `net.Listen`）。生产 accept 循环在 async 上下文中
+/// 经 `tokio::net::UnixListener::from_std` + `set_nonblocking(true)` 转换为 tokio listener。
+/// 这样 bind/chmod 不依赖 tokio reactor，单元测试可在同步上下文直接验证。
+pub fn prepare_socket(cfg: &ServerConfig) -> Result<std::os::unix::net::UnixListener, ServerError> {
+    // :25-30: socket 目录必须 0755（任意登录用户可穿越 → app 才能连）。
+    let sock_dir = cfg.sock_path.parent().unwrap_or_else(|| Path::new("/"));
+    std::fs::create_dir_all(sock_dir).map_err(|source| ServerError::Mkdir {
+        dir: sock_dir.to_path_buf(),
+        source,
+    })?;
+    set_mode(sock_dir, 0o755).map_err(|source| ServerError::Chmod {
+        path: sock_dir.to_path_buf(),
+        source,
+    })?;
+    // :31: 删旧 socket（bind 失败 otherwise）。
+    let _ = std::fs::remove_file(&cfg.sock_path);
+
+    // :33-37: Listen(unix) —— std 同步 bind（对齐 Go net.Listen）。
+    let listener = std::os::unix::net::UnixListener::bind(&cfg.sock_path).map_err(|source| {
+        ServerError::Listen {
+            path: cfg.sock_path.clone(),
+            source,
+        }
+    })?;
+
+    // :38: chmod socket 0666（SO_PEERCRED + 授权列表把关，socket 本身可连）。
+    set_mode(&cfg.sock_path, 0o666).map_err(|source| ServerError::Chmod {
+        path: cfg.sock_path.clone(),
+        source,
+    })?;
+
+    Ok(listener)
+}
+
+/// 设文件/dir 权限（unix only）。
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// ss 命令的输出提供者（freeport 用，对照 Go `exec.Command("ss", "-H", "-ltnp", ...)`，:292）。
+///
+/// 生产实现：调 `ss` 子进程；失败返回 None（freeport 视作端口空闲）。
+pub fn ss_lookup(port: &str) -> Option<String> {
+    let sport = format!("sport = :{port}");
+    let out = std::process::Command::new("ss")
+        .args(["-H", "-ltnp", &sport])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// IP 转发开关闭包（生产 = set_forward_prod，对齐 Go setForward）。
+pub fn forward_fn() -> fn(bool) {
+    set_forward_prod
+}
+
+// ===== L16 AmbientCaps 常量 + 集（对照 Go `helper-linux/helper.go:51-55,441`）=====
+
+/// `capNetBindService`（Go :52）—— `caps::Capability::CAP_NET_BIND_SERVICE.index()` 恒等于此。
+pub const CAP_NET_BIND_SERVICE_NUM: u8 = 10;
+/// `capNetAdmin`（Go :53）。
+pub const CAP_NET_ADMIN_NUM: u8 = 12;
+/// `capNetRaw`（Go :54）。
+pub const CAP_NET_RAW_NUM: u8 = 13;
+
+/// start 拉核授予的 ambient capability 集（顺序对照 Go `AmbientCaps: []uintptr{capNetAdmin, capNetRaw,
+/// capNetBindService}`，:441 —— 与现役 setcap 授权一致，不推测削减）。
+#[must_use]
+pub fn ambient_caps() -> [caps::Capability; 3] {
+    [
+        caps::Capability::CAP_NET_ADMIN,
+        caps::Capability::CAP_NET_RAW,
+        caps::Capability::CAP_NET_BIND_SERVICE,
+    ]
+}
+
+// ===== terminate / watchParent 纯决策（可测；对照 Go terminateChild / watchParent）=====
+
+/// terminate 宽限期（Go terminateChild：TERM → 等 ≤5s → KILL，:253）。
+pub const TERMINATE_GRACE_SECS: u64 = 5;
+/// watchParent 轮询周期（Go: `time.NewTicker(time.Second)`，:259）。
+pub const WATCH_PARENT_INTERVAL_SECS: u64 = 1;
+
+/// terminate 决策（对照 Go `terminateChild`，:246-256）：先 TERM，等退出；期限内退出则**不** KILL，
+/// 超时才 KILL。抽象三原语便于单测（不发真信号）。`wait_exited` 返回是否在期限内退出。
+fn terminate_child<S, W, K>(send_term: S, wait_exited: W, send_kill: K)
+where
+    S: FnOnce(),
+    W: FnOnce() -> bool,
+    K: FnOnce(),
+{
+    send_term(); // Go: c.Process.Signal(SIGTERM)
+    if !wait_exited() {
+        // Go: case <-time.After(5s): c.Process.Kill()
+        send_kill();
+    }
+}
+
+/// watchParent 单 tick 决策（对照 Go `watchParent` 循环体，:267-283）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchStep {
+    /// 父仍活 + 仍是当前 child → 继续下一 tick。
+    Continue,
+    /// 已非当前 child（被 stop/cleanup 摘除或自然退出）→ 停看护（Go: `if !current { return }`）。
+    Stop,
+    /// 父已死（`kill(ppid,0)==ESRCH`）→ 摘 child + terminate（Go: :273-282）。
+    ParentDead,
+}
+
+/// 由「仍是当前 child」+「父仍活」推出 watchParent 决策（纯逻辑，短路顺序对照 Go：先判 current 再判父存活）。
+#[must_use]
+pub fn watch_parent_step(still_current_child: bool, parent_alive: bool) -> WatchStep {
+    if !still_current_child {
+        WatchStep::Stop
+    } else if !parent_alive {
+        WatchStep::ParentDead
+    } else {
+        WatchStep::Continue
+    }
+}
+
+// ===== 信号原语（nix safe wrapper；forbid(unsafe) 下替代 libc::kill）=====
+
+/// u32 pid → nix Pid（真实 pid ≤ PID_MAX≈4M，恒 ≤ i32::MAX；越界退化 i32::MAX 仅防御性）。
+fn to_pid(pid: u32) -> nix::unistd::Pid {
+    nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX))
+}
+
+fn send_signal(pid: u32, sig: nix::sys::signal::Signal) -> nix::Result<()> {
+    nix::sys::signal::kill(to_pid(pid), sig)
+}
+
+/// 父进程是否存活（对照 Go `syscall.Kill(ppid, 0) == ESRCH`，:273）。signal 0 仅探活不投递。
+fn parent_alive(ppid: u32) -> bool {
+    nix::sys::signal::kill(to_pid(ppid), None).is_ok()
+}
+
+// ===== child 退出协调槽（对应 Go `childDone chan struct{}`）=====
+
+/// Only a successful `try_wait` on this exact owned Child can mint this local
+/// fact. Linux Stop may acknowledge success only after this fact exists.
+#[derive(Clone)]
+#[allow(dead_code)] // A later helper receipt slice may consume this native fact.
+struct HelperBirthReaped {
+    birth: CoreHandle,
+    status: ExitStatus,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // No product RPC consumes native facts in this slice.
+enum LocalReapFact {
+    Pending,
+    Reaped(HelperBirthReaped),
+    Unknown,
+}
+
+trait ChildWaiter: Send {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+}
+
+impl ChildWaiter for Child {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+}
+
+struct ChildCustody {
+    child: Box<dyn ChildWaiter>,
+    phase: LocalReapFact,
+    termination_started: bool,
+}
+
+/// The Child and its terminal phase share one per-birth mutex. A signal checks
+/// `try_wait` and sends while holding that same lock; the reaper cannot reap
+/// between the check and signal and release the PID for reuse.
+struct ChildSlot {
+    handle: CoreHandle,
+    custody: Mutex<ChildCustody>,
+    cv: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildWaitOutcome {
+    Reaped,
+    TimedOut,
+    Unknown,
+}
+
+impl ChildSlot {
+    fn from_child(child: Child, handle: CoreHandle) -> Arc<Self> {
+        debug_assert_eq!(child.id(), handle.pid);
+        Self::with_waiter(handle, Box::new(child))
+    }
+
+    fn with_waiter(handle: CoreHandle, child: Box<dyn ChildWaiter>) -> Arc<Self> {
+        Arc::new(Self {
+            handle,
+            custody: Mutex::new(ChildCustody {
+                child,
+                phase: LocalReapFact::Pending,
+                termination_started: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn new(pid: u32) -> Arc<Self> {
+        struct PendingWaiter;
+        impl ChildWaiter for PendingWaiter {
+            fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+                Ok(None)
+            }
+        }
+        Self::with_waiter(CoreHandle::new(pid), Box::new(PendingWaiter))
+    }
+
+    #[cfg(test)]
+    fn mark_exited(&self) {
+        use std::os::unix::process::ExitStatusExt;
+        let mut custody = self.custody.lock().unwrap();
+        custody.phase = LocalReapFact::Reaped(HelperBirthReaped {
+            birth: self.handle.clone(),
+            status: ExitStatus::from_raw(0),
+        });
+        self.cv.notify_all();
+    }
+
+    /// Called only with the per-birth Child lock. A failed wait is Unknown:
+    /// retain the real Child and never signal or mint a Reaped fact from it.
+    fn refresh_locked(&self, custody: &mut ChildCustody) {
+        if !matches!(custody.phase, LocalReapFact::Pending) {
+            return;
+        }
+        match custody.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                custody.phase = LocalReapFact::Reaped(HelperBirthReaped {
+                    birth: self.handle.clone(),
+                    status,
+                });
+                self.cv.notify_all();
+            }
+            Err(error) => {
+                log::error!(
+                    "helper Child try_wait failed for pid {}: {error}",
+                    self.handle.pid
+                );
+                custody.phase = LocalReapFact::Unknown;
+                self.cv.notify_all();
+            }
+        }
+    }
+
+    fn reap_fact(&self) -> LocalReapFact {
+        let Ok(mut custody) = self.custody.lock() else {
+            return LocalReapFact::Unknown;
+        };
+        self.refresh_locked(&mut custody);
+        custody.phase.clone()
+    }
+
+    /// Atomically decide whether this Stop poll must start the one background
+    /// TERM/KILL worker. Repeated requests only observe the same birth.
+    fn begin_or_poll_termination(&self) -> (StopReap, bool) {
+        let Ok(mut custody) = self.custody.lock() else {
+            return (StopReap::Unknown, false);
+        };
+        self.refresh_locked(&mut custody);
+        match custody.phase {
+            LocalReapFact::Reaped(_) => (StopReap::Reaped, false),
+            LocalReapFact::Unknown => (StopReap::Unknown, false),
+            LocalReapFact::Pending => {
+                let start_worker = !custody.termination_started;
+                custody.termination_started = true;
+                (StopReap::Pending, start_worker)
+            }
+        }
+    }
+
+    /// The check, native wait and signal occur under one birth lock. Failed
+    /// signal is not a reap fact; failed wait blocks all subsequent signals.
+    fn signal_if_live(&self, send: impl FnOnce(u32) -> nix::Result<()>) -> Result<bool, String> {
+        let mut custody = self
+            .custody
+            .lock()
+            .map_err(|_| "helper Child custody lock poisoned".to_owned())?;
+        self.refresh_locked(&mut custody);
+        if !matches!(custody.phase, LocalReapFact::Pending) {
+            return Ok(false);
+        }
+        send(self.handle.pid).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    /// Wait at most `timeout`. Unknown must be distinct from a timed-out live
+    /// child: the parent watcher must not spin when native wait fails.
+    fn wait_outcome(&self, timeout: Duration) -> ChildWaitOutcome {
+        let Ok(g) = self.custody.lock() else {
+            return ChildWaitOutcome::Unknown;
+        };
+        let Ok((g, _)) = self.cv.wait_timeout_while(g, timeout, |custody| {
+            matches!(custody.phase, LocalReapFact::Pending)
+        }) else {
+            return ChildWaitOutcome::Unknown;
+        };
+        match g.phase {
+            LocalReapFact::Pending => ChildWaitOutcome::TimedOut,
+            LocalReapFact::Reaped(_) => ChildWaitOutcome::Reaped,
+            LocalReapFact::Unknown => ChildWaitOutcome::Unknown,
+        }
+    }
+
+    fn wait_exited(&self, timeout: Duration) -> bool {
+        self.wait_outcome(timeout) == ChildWaitOutcome::Reaped
+    }
+}
+
+/// 对某 child 执行 terminate（TERM→≤5s→KILL，经 slot 协调）。
+///
+/// pid-复用安全由 [`ChildSlot::signal_if_live`] 兜住：**两条**信号腿都只在「尚未被收割」时投递。
+/// 只判「slot 还在册」是不够的（见 `signal_if_live` 文档），TERM 腿同样会打到复用后的新进程。
+fn terminate_slot(slot: &ChildSlot) {
+    let grace = Duration::from_secs(TERMINATE_GRACE_SECS);
+    terminate_child(
+        || {
+            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGTERM));
+        },
+        || slot.wait_exited(grace),
+        || {
+            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL));
+        },
+    );
+}
+
+// ===== reapWG：在途后台 terminate 计数（对应 Go `reapWG sync.WaitGroup`，L15）=====
+
+/// SIGTERM 退出前须等在途后台 terminate 跑完 KILL 升级，杜绝留下带 CAP_NET_ADMIN 的孤儿核。
+struct ReapGroup {
+    count: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl ReapGroup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            count: Mutex::new(0),
+            cv: Condvar::new(),
+        })
+    }
+    fn add(&self) {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    }
+    fn done(&self) {
+        let mut g = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        *g = g.saturating_sub(1);
+        if *g == 0 {
+            self.cv.notify_all();
+        }
+    }
+    /// 等在途 terminate 归零，最多 `timeout`（对照 Go `waitReaps`，`main.go:73-80`）。
+    fn wait(&self, timeout: Duration) {
+        let g = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = self
+            .cv
+            .wait_timeout_while(g, timeout, |c| *c > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+// ===== L10 真 CoreSpawner：fork + setuid + AmbientCaps 拉核 =====
+
+/// 生产 spawner（对照 Go start 分支 `c.SysProcAttr = ...; c.Start()`，:431-478）。
+///
+/// 持共享 [`HandlerState`]（收割/看护线程清 child）+ 在途 child 槽（terminate 按 pid 查）+ reapWG。
+pub struct AmbientCapsSpawner {
+    // Pin once for this helper lifetime. A valid-looking replacement cannot be
+    // adopted by an older helper; failed initialization never blocks Stop.
+    claims: Result<super::claims::ClaimsDeployment, String>,
+    state: Arc<Mutex<HandlerState>>,
+    /// 在途 child 槽。Start 会扫描全部槽；只有 native reap 后才移除对应 birth。
+    slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    /// Published under the slots lock, so removal and proof are atomic to readers.
+    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    /// 在途后台 terminate 计数（SIGTERM 退出前 waitReaps 等它归零）。
+    reaps: Arc<ReapGroup>,
+}
+
+/// 把用户可写日志目录固定到已打开的 directory fd，后续即使目录名被 rename/symlink 替换，
+/// root helper 仍只会在原目录打开日志。末段 symlink 由 log-budget 的 `O_NOFOLLOW` 拒绝。
+#[derive(Debug)]
+struct PinnedLogPath {
+    directory: Arc<File>,
+    path: PathBuf,
+}
+
+fn pin_log_path(path: &Path, uid: u32) -> std::io::Result<PinnedLogPath> {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "log path has no parent")
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "log path has no file name",
+        )
+    })?;
+    let directory = File::open(parent)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "log directory is not owned by the authenticated uid",
+        ));
+    }
+    let fd: RawFd = directory.as_raw_fd();
+    Ok(PinnedLogPath {
+        directory: Arc::new(directory),
+        path: PathBuf::from(format!("/proc/self/fd/{fd}")).join(file_name),
+    })
+}
+
+struct PinnedReader<R> {
+    inner: R,
+    _directory: Arc<File>,
+}
+
+impl<R: Read> Read for PinnedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+impl AmbientCapsSpawner {
+    #[cfg(test)]
+    #[must_use]
+    pub fn new(state: Arc<Mutex<HandlerState>>) -> Self {
+        Self::with_claims_provision(
+            state,
+            Err(std::io::Error::other("test deployment not initialized")),
+        )
+    }
+
+    fn with_claims_provision(
+        state: Arc<Mutex<HandlerState>>,
+        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
+    ) -> Self {
+        Self {
+            claims: claims_provision.map_err(|error| error.to_string()),
+            state,
+            slots: Arc::new(Mutex::new(Vec::new())),
+            tombstones: Arc::new(Mutex::new(VecDeque::new())),
+            reaps: ReapGroup::new(),
+        }
+    }
+
+    fn find_slot(&self, handle: &CoreHandle) -> Option<Arc<ChildSlot>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|s| s.handle.same_birth(handle))
+            .cloned()
+    }
+
+    /// Linux-local fact only. No caller may treat this as a Stop wire ACK or
+    /// as a cross-backend no-writer receipt.
+    #[allow(dead_code)]
+    fn local_reap_fact(&self, handle: &CoreHandle) -> LocalReapFact {
+        self.find_slot(handle)
+            .map_or(LocalReapFact::Unknown, |slot| slot.reap_fact())
+    }
+
+    fn scan_start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
+        let Ok(slots) = self.slots.lock() else {
+            return StartAdmission::Blocked {
+                pid: current_running.map_or(0, |handle| handle.pid),
+                state: ReapBlockerState::Unknown,
+            };
+        };
+        let mut current_fact = None;
+        let mut pending_pid = None;
+        let mut unknown_pid = None;
+        for slot in slots.iter() {
+            let fact = slot.reap_fact();
+            if current_running.is_some_and(|current| slot.handle.same_birth(current)) {
+                current_fact = Some(fact.clone());
+            }
+            match fact {
+                LocalReapFact::Pending
+                    if !current_running.is_some_and(|current| slot.handle.same_birth(current)) =>
+                {
+                    pending_pid.get_or_insert(slot.handle.pid);
+                }
+                LocalReapFact::Unknown => {
+                    unknown_pid.get_or_insert(slot.handle.pid);
+                }
+                LocalReapFact::Pending | LocalReapFact::Reaped(_) => {}
+            }
+        }
+        // Unknown wins over Pending because retrying cannot establish safety.
+        if let Some(pid) = unknown_pid {
+            return StartAdmission::Blocked {
+                pid,
+                state: ReapBlockerState::Unknown,
+            };
+        }
+        if let Some(pid) = pending_pid {
+            return StartAdmission::Blocked {
+                pid,
+                state: ReapBlockerState::Pending,
+            };
+        }
+        match (current_running, current_fact) {
+            (Some(handle), Some(LocalReapFact::Pending)) => {
+                StartAdmission::Already { pid: handle.pid }
+            }
+            (Some(_), Some(LocalReapFact::Reaped(_))) | (None, _) => StartAdmission::Admitted,
+            (Some(handle), Some(LocalReapFact::Unknown) | None) => StartAdmission::Blocked {
+                pid: handle.pid,
+                state: ReapBlockerState::Unknown,
+            },
+        }
+    }
+
+    fn scan_birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        let Ok(slots) = self.slots.lock() else {
+            return BirthAdmission::Blocked {
+                target: current_running.and_then(CoreHandle::target),
+                state: ReapBlockerState::Unknown,
+            };
+        };
+        let mut current_pending = None;
+        let mut blocker = None;
+        for slot in slots.iter() {
+            let fact = slot.reap_fact();
+            if matches!(fact, LocalReapFact::Reaped(_)) {
+                continue;
+            }
+            let target = slot.handle.target();
+            let state = if matches!(fact, LocalReapFact::Unknown) {
+                ReapBlockerState::Unknown
+            } else {
+                ReapBlockerState::Pending
+            };
+            if target.is_some()
+                && current_running.is_some_and(|current| slot.handle.same_birth(current))
+                && state == ReapBlockerState::Pending
+            {
+                current_pending = target;
+            } else if blocker.is_none() || state == ReapBlockerState::Unknown {
+                blocker = Some((target, state));
+            }
+        }
+        if let Some((target, state)) = blocker {
+            return BirthAdmission::Blocked { target, state };
+        }
+        if let Some(target) = current_pending {
+            return BirthAdmission::Already(target);
+        }
+        if let Some(current) = current_running {
+            if !slots.iter().any(|slot| slot.handle.same_birth(current)) {
+                return BirthAdmission::Blocked {
+                    target: current.target(),
+                    state: ReapBlockerState::Unknown,
+                };
+            }
+        }
+        BirthAdmission::Admitted
+    }
+
+    /// 等在途后台 terminate 归零（对照 Go `waitReaps`）。SIGTERM 退出兜底用。
+    pub fn wait_reaps(&self, timeout: Duration) {
+        self.reaps.wait(timeout);
+    }
+
+    /// 同步 terminate 指定 child（SIGTERM 退出兜底对当前 child 用，Go main reaper 同步 `terminateChild`）。
+    fn terminate_now(&self, handle: &CoreHandle) {
+        if let Some(slot) = self.find_slot(handle) {
+            terminate_slot(&slot);
+        }
+    }
+}
+
+impl CoreSpawner for AmbientCapsSpawner {
+    fn validate_start_environment(&self) -> Result<(), SpawnError> {
+        self.claims
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|deployment| deployment.validate().map_err(|error| error.to_string()))
+            .map_err(|detail| SpawnError::Spawn {
+                detail: format!("claims deployment unavailable: {detail}"),
+            })
+    }
+
+    fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
+        self.scan_start_admission(current_running)
+    }
+
+    fn birth_admission(&self, current_running: Option<&CoreHandle>) -> BirthAdmission {
+        self.scan_birth_admission(current_running)
+    }
+
+    fn has_exact_birth(&self) -> bool {
+        self.slots.lock().map_or(true, |slots| {
+            slots.iter().any(|slot| {
+                slot.handle.target().is_some()
+                    && !matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+            })
+        })
+    }
+
+    fn stop_birth(&self, target: &HelperBirthTarget) -> StopReap {
+        let Ok(slots) = self.slots.lock() else {
+            return StopReap::Unknown;
+        };
+        let slot = slots
+            .iter()
+            .find(|slot| slot.handle.target().as_ref() == Some(target))
+            .cloned();
+        if slot.is_none() {
+            return self.tombstones.lock().map_or(StopReap::Unknown, |proofs| {
+                if proofs.contains(target) {
+                    StopReap::Reaped
+                } else {
+                    StopReap::Unknown
+                }
+            });
+        }
+        drop(slots);
+        let slot = slot.expect("checked above");
+        let (outcome, start_worker) = slot.begin_or_poll_termination();
+        if start_worker {
+            let reaps = Arc::clone(&self.reaps);
+            reaps.add();
+            std::thread::spawn(move || {
+                terminate_slot(&slot);
+                reaps.done();
+            });
+        }
+        outcome
+    }
+
+    fn reaped_birth(&self, target: &HelperBirthTarget) -> bool {
+        let Ok(slots) = self.slots.lock() else {
+            return false;
+        };
+        if slots.iter().any(|slot| {
+            slot.handle.target().as_ref() == Some(target)
+                && matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+        }) {
+            return true;
+        }
+        self.tombstones
+            .lock()
+            .is_ok_and(|proofs| proofs.contains(target))
+    }
+
+    fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
+        self.validate_start_environment()?;
+        let pinned_log = req
+            .log
+            .as_deref()
+            .map(|path| pin_log_path(path, req.uid))
+            .transpose()
+            .map_err(|error| SpawnError::Spawn {
+                detail: format!("secure log path: {error}"),
+            })?;
+        // Go: exec.Command(coreBin(), "run", "-c", cfg)（:431）。
+        let mut cmd = std::process::Command::new(&req.binary);
+        cmd.arg("run").arg("-c").arg(&req.config);
+
+        // CWD = 配置文件所在目录（= 用户可写 config 目录）：helper daemon（systemd）CWD=`/`，spawn 的核继承 `/`
+        // → dashboard 下载兜底相对 mkdir `/dashboard` 只读失败噪音。设为可写目录即消。std 在 fork 后、pre_exec
+        // 降权闭包**之前** chdir（此刻仍 root，可 chdir 任意目录），降权后核 CWD = 用户目录，两不冲突。
+        // Polaris 生成的核配置其余路径全绝对，不受 CWD 影响。取不到父目录（极端形态）则不设，继承旧行为。
+        if let Some(cwd) = req.config.parent() {
+            cmd.current_dir(cwd);
+        }
+
+        // B3/W26：child 输出走 pipe → shared 有界 writer；直接继承一个 append fd 无法在运行期安全
+        // 轮转（rename 后 child 仍写旧 inode/handle），正是历史 `singbox.log` 无界增长的同型风险。
+        if pinned_log.is_some() {
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+        }
+
+        // Go :434-442：SysProcAttr{Credential{Uid,Gid,Groups}, AmbientCaps}。降权+ambient 经 pre_exec 装。
+        attach_privilege_drop(&mut cmd, req.uid, req.gid, req.groups.clone());
+
+        // Go :452：c.Start()。失败 → ERR start（转发态复位由 handler 负责，对照 :456）。
+        let process_started = std::time::Instant::now();
+        let mut child = cmd.spawn().map_err(|e| SpawnError::Spawn {
+            detail: e.to_string(),
+        })?;
+        let pid = child.id();
+        let process_ms = crate::elapsed_ms(process_started);
+
+        let log_handoff_started = std::time::Instant::now();
+        if let Some(log) = pinned_log {
+            // 与 Windows 已验证形态一致：pipe 所有权先交后台，日志裁剪/轮转/open/fchown 不再阻塞
+            // helper 回复。线程持有读端，child 不会在 writer 就绪前收到 broken pipe。
+            let stdout = child.stdout.take().map(|inner| PinnedReader {
+                inner,
+                _directory: Arc::clone(&log.directory),
+            });
+            let stderr = child.stderr.take().map(|inner| PinnedReader {
+                inner,
+                _directory: Arc::clone(&log.directory),
+            });
+            let owned_log_path = log.path;
+            let directory = log.directory;
+            let uid = req.uid;
+            let gid = req.gid;
+            std::thread::spawn(move || {
+                // 保持 directory fd 至少活到 writer 同步打开；两个 PinnedReader 再把它持到管道排空，
+                // 覆盖运行期轮转对 `/proc/self/fd/<n>` 的后续重开。
+                let _directory = directory;
+                polaris_log_budget::spawn_pipe_loggers_with_file(
+                    stdout,
+                    stderr,
+                    &owned_log_path,
+                    polaris_log_budget::DEFAULT_GENERATION_BYTES,
+                    |opened| {
+                        // helper 自身是 root，创建出的文件需归还对端属主；直接作用于 writer 已打开的
+                        // 同一 fd，不再按用户可写路径二次 open，避免路径替换让属主修正打到别的 inode。
+                        if let Some(file) = opened {
+                            let _ = std::os::unix::fs::fchown(file, Some(uid), Some(gid));
+                        }
+                    },
+                );
+            });
+        }
+        let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
+
+        let handle = match req.birth {
+            Some(token) => CoreHandle::exact(
+                NonZeroU32::new(pid).ok_or_else(|| SpawnError::Spawn {
+                    detail: "spawn returned PID 0".into(),
+                })?,
+                token,
+            ),
+            None => CoreHandle::new(pid),
+        };
+        let slot = ChildSlot::from_child(child, handle.clone());
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(&slot));
+
+        // Go :466-474：收割 goroutine —— c.Wait() 收尸 → close(done) → 清 child（若仍是本 child）。
+        spawn_reaper(
+            handle.clone(),
+            Arc::clone(&self.state),
+            Arc::clone(&slot),
+            Arc::clone(&self.slots),
+            Arc::clone(&self.tombstones),
+        );
+
+        // Go :475-477：if ppid>0 { go watchParent(ppid, c, done) }。
+        if let Some(ppid) = req.parent_pid {
+            spawn_watch_parent(
+                ppid,
+                handle.clone(),
+                Arc::clone(&self.state),
+                Arc::clone(&slot),
+            );
+        }
+
+        // Go :478：OK started <pid>（wire 由 handler 拼）。
+        Ok(SpawnedCore {
+            handle,
+            process_ms,
+            log_handoff_ms,
+        })
+    }
+
+    fn terminate(&self, h: &CoreHandle) -> StopReap {
+        // The wire request never waits through the five-second escalation. One
+        // exact-birth worker owns it; later Stop requests only poll native reap.
+        let Some(slot) = self.find_slot(h) else {
+            return StopReap::Unknown;
+        };
+        let (outcome, start_worker) = slot.begin_or_poll_termination();
+        if start_worker {
+            let reaps = Arc::clone(&self.reaps);
+            reaps.add();
+            std::thread::spawn(move || {
+                terminate_slot(&slot);
+                reaps.done();
+            });
+        }
+        outcome
+    }
+
+    fn kill(&self, h: &CoreHandle) {
+        // Go cleanup：child.Process.Kill()（SIGKILL 即时；收割线程随后收尸，:383）。
+        // 身份判据与 terminate 同源（slot 在册 + 尚未被收割）：cleanup 拿到的 `h.pid` 来自 state.child，
+        // 而收割线程清 state.child 那一步会被「全程持 state 锁」的 handler 挡住 ⇒ 这里完全可能拿到一个
+        // 已被 wait() 收走、已被系统复用的 pid，裸 SIGKILL 就是误杀无关进程。无槽/已收割 = no-op。
+        if let Some(slot) = self.find_slot(h) {
+            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL));
+        }
+    }
+}
+
+/// 装 pre_exec 降权+ambient 拉核闭包（**唯一 unsafe 点** = `CommandExt::pre_exec`）。
+///
+/// 所有可分配的输入（gids/caps 列表）在 fork **前**于父进程算好，闭包本体只做 syscall。
+#[allow(
+    unsafe_code,
+    reason = "CommandExt::pre_exec is required to drop uid/gid before exec"
+)]
+pub(super) fn attach_privilege_drop(
+    cmd: &mut std::process::Command,
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+) {
+    use std::os::unix::process::CommandExt;
+    let gids: Vec<nix::unistd::Gid> = groups.into_iter().map(nix::unistd::Gid::from_raw).collect();
+    let caps = ambient_caps();
+    // SAFETY: pre_exec 闭包在 fork 后、execve 前于**子进程**运行，仅调 async-signal-safe 的 syscall
+    //   （set_keepcaps/setgroups/setgid/setuid + capset/prctl via caps crate），且 gids/caps 列表已在
+    //   fork 前于父进程分配 → 闭包本体不分配。每步失败即返 Err 中止 execve（**fail-closed**：setuid 失败
+    //   绝不以 root 拉核）。残留风险：caps crate 内部 capget 可能分配 —— 与「真降权拉核链」同属真机门
+    //   （DESIGN-REVIEW(preexec-async-signal-safety)），本机绝不跑。
+    unsafe {
+        cmd.pre_exec(move || apply_privilege_drop(uid, gid, &gids, &caps));
+    }
+}
+
+/// pre_exec 闭包本体：降权到对端登录用户 + raise ambient caps（全 safe wrapper，无 unsafe 块）。
+///
+/// 顺序对照 Go runtime 对 `SysProcAttr{Credential, AmbientCaps}` 的编排（keepcaps→降权→raise ambient）：
+/// 1. `set_keepcaps(true)`：permitted caps 跨 setuid 存活（Go AmbientCaps 非空时 PR_SET_KEEPCAPS）。
+/// 2. `setgroups`：补充组（须在 setuid 前、仍 root 时；空 = 清空，对齐 Go `Groups: nil`）。
+/// 3. `setgid` → 4. `setuid`：降权（drop 放最后）。
+/// 5. raise Inheritable + 6. raise Ambient（逐 cap；降权后 permitted 已留，加 inheritable 再抬 ambient）。
+///
+/// 任一步失败即 `Err` → std 中止 execve → `c.spawn()` 返错 → handler 回 `ERR start`（fail-closed）。
+fn apply_privilege_drop(
+    uid: u32,
+    gid: u32,
+    groups: &[nix::unistd::Gid],
+    caps: &[caps::Capability],
+) -> std::io::Result<()> {
+    use nix::unistd::{setgid, setgroups, setuid, Gid, Uid};
+    caps::securebits::set_keepcaps(true).map_err(std::io::Error::other)?;
+    setgroups(groups).map_err(std::io::Error::other)?;
+    setgid(Gid::from_raw(gid)).map_err(std::io::Error::other)?;
+    setuid(Uid::from_raw(uid)).map_err(std::io::Error::other)?;
+    for &cap in caps {
+        caps::raise(None, caps::CapSet::Inheritable, cap).map_err(std::io::Error::other)?;
+        caps::raise(None, caps::CapSet::Ambient, cap).map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Remove only the birth whose native Child was actually reaped. The Child
+/// lock is released before taking HandlerState or the slots registry.
+fn clear_reaped_birth(
+    proof: &HelperBirthReaped,
+    state: &Arc<Mutex<HandlerState>>,
+    slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+) {
+    {
+        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.child
+            .as_ref()
+            .is_some_and(|child| child.handle().same_birth(&proof.birth))
+        {
+            g.child = None;
+        }
+    }
+    let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
+    let before = slots.len();
+    slots.retain(|s| !s.handle.same_birth(&proof.birth));
+    if slots.len() != before {
+        if let Some(target) = proof.birth.target() {
+            let mut tombstones = tombstones.lock().unwrap_or_else(PoisonError::into_inner);
+            if tombstones.len() == REAP_TOMBSTONES {
+                tombstones.pop_front();
+            }
+            tombstones.push_back(target);
+        }
+    }
+}
+
+/// 收割线程：仅真实 `Child::try_wait()` 成功才清本 birth；Err 留 Unknown custody。
+fn spawn_reaper(
+    handle: CoreHandle,
+    state: Arc<Mutex<HandlerState>>,
+    slot: Arc<ChildSlot>,
+    slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+) {
+    std::thread::spawn(move || run_reaper(&handle, &state, &slot, &slots, &tombstones));
+}
+
+fn run_reaper(
+    handle: &CoreHandle,
+    state: &Arc<Mutex<HandlerState>>,
+    slot: &Arc<ChildSlot>,
+    slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+) {
+    let proof = loop {
+        match slot.reap_fact() {
+            LocalReapFact::Pending => std::thread::sleep(Duration::from_millis(20)),
+            LocalReapFact::Unknown => return, // retain custody; no false reap fact
+            LocalReapFact::Reaped(proof) => {
+                if !slot.handle.same_birth(handle) || !proof.birth.same_birth(handle) {
+                    log::error!("helper reaper birth mismatch for pid {}", handle.pid);
+                    return;
+                }
+                break proof;
+            }
+        }
+    };
+    clear_reaped_birth(&proof, state, slots, tombstones);
+}
+
+/// 父死看护线程（Go `watchParent`，:258-285）。每 1s tick：child 退出→停；非当前 child→停；父死→摘+terminate。
+fn spawn_watch_parent(
+    ppid: u32,
+    handle: CoreHandle,
+    state: Arc<Mutex<HandlerState>>,
+    slot: Arc<ChildSlot>,
+) {
+    std::thread::spawn(move || watch_parent_loop(ppid, &handle, &state, &slot, parent_alive));
+}
+
+fn watch_parent_loop(
+    ppid: u32,
+    handle: &CoreHandle,
+    state: &Arc<Mutex<HandlerState>>,
+    slot: &Arc<ChildSlot>,
+    parent_probe: impl Fn(u32) -> bool,
+) {
+    let interval = Duration::from_secs(WATCH_PARENT_INTERVAL_SECS);
+    loop {
+        // Go: select{<-done; <-t.C}。以 slot.wait_exited 折叠「等 1s 或 child 已退出」：
+        // 已退出（true）→ 停看护（Go: <-done → return）；超时（false）→ 走 tick 检查。
+        match slot.wait_outcome(interval) {
+            ChildWaitOutcome::Reaped | ChildWaitOutcome::Unknown => return,
+            ChildWaitOutcome::TimedOut => {}
+        }
+        // Go: current := (child == c)。仍是当前 child 才继续（否则被 stop/cleanup 摘除）。
+        let still_current = {
+            let g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.child
+                .as_ref()
+                .and_then(ManagedChild::running)
+                .is_some_and(|running| running.same_birth(handle))
+        };
+        // 短路顺序对齐 Go：仅当仍是当前 child 才探父存活（parent_alive 是一次 kill(0) syscall）。
+        let alive = still_current && parent_probe(ppid);
+        match watch_parent_step(still_current, alive) {
+            WatchStep::Continue => {}
+            WatchStep::Stop => return,
+            WatchStep::ParentDead => {
+                // Go :274-280：摘 child（若仍是本 child）。
+                {
+                    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if g.child
+                        .as_ref()
+                        .is_some_and(|child| child.handle().same_birth(handle))
+                    {
+                        g.child = Some(ManagedChild::Stopping(handle.clone()));
+                    }
+                }
+                // Go :281：terminateChild(c, done)（不持 state 锁）。
+                terminate_slot(slot);
+                return;
+            }
+        }
+    }
+}
+
+// ===== 生产连接服务（accept 循环 → handle）=====
+
+/// 跨连接共享的 daemon 服务：持 [`HandlerState`] + [`AmbientCapsSpawner`] + 生产 deps，把 accept 到的
+/// tokio `UnixStream` 交给同步 [`handle`](crate::platform::linux::handle)（Go `for { l.Accept(); go handle }`）。
+pub struct ConnServer {
+    state: Arc<Mutex<HandlerState>>,
+    spawner: Arc<AmbientCapsSpawner>,
+    freeport: crate::platform::linux::freeport::ProdFreePortDeps,
+    systemd: crate::platform::linux::ops::TokioSystemd,
+    resolved_dns: crate::platform::linux::resolved_dns::ResolvectlDnsOps,
+    core_dir: Option<PathBuf>,
+    auth_file: PathBuf,
+    /// 在途连接闸（与 mac 腿同一份类型、同一个上限，见 [`crate::platform::conn_limit`]）。
+    limiter: Arc<ConnLimiter>,
+    /// 超限告警的限频器：达上限是持续态，逐次打就是第二个 DoS 面（写爆 journal）。
+    limit_log: LogThrottle,
+}
+
+impl ConnServer {
+    /// 由 [`ServerConfig`] 建服务（单一共享 state + spawner）。
+    #[cfg(test)]
+    #[must_use]
+    pub fn new(cfg: &ServerConfig) -> Arc<Self> {
+        Self::with_claims_provision(
+            cfg,
+            Err(std::io::Error::other("test deployment not initialized")),
+        )
+    }
+
+    /// Consume this startup's exact provisioning result, retaining successful
+    /// original FDs or the failure for the whole helper lifetime. Never reopen
+    /// a statically valid directory to erase a provisioning error.
+    #[must_use]
+    pub fn with_claims_provision(
+        cfg: &ServerConfig,
+        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
+    ) -> Arc<Self> {
+        let state = Arc::new(Mutex::new(HandlerState::new()));
+        let spawner = Arc::new(AmbientCapsSpawner::with_claims_provision(
+            Arc::clone(&state),
+            claims_provision,
+        ));
+        Arc::new(Self {
+            state,
+            spawner,
+            freeport: crate::platform::linux::freeport::ProdFreePortDeps,
+            systemd: crate::platform::linux::ops::TokioSystemd,
+            resolved_dns: crate::platform::linux::resolved_dns::ResolvectlDnsOps::new(),
+            core_dir: cfg.core_dir.clone(),
+            auth_file: cfg.auth_file.clone(),
+            limiter: ConnLimiter::new(MAX_CONCURRENT_CONNECTIONS),
+            limit_log: LogThrottle::new(ACCEPT_LOG_INTERVAL),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_start_environment_for_test(&self) -> Result<(), SpawnError> {
+        self.spawner.validate_start_environment()
+    }
+
+    /// 处理一个连接（Go: `go handle(conn)`）。捕获 SO_PEERCRED → 转 std 阻塞流（5s 读超时）→
+    /// spawn_blocking 跑同步 handle（含 fork 拉核，不占 async worker）。
+    ///
+    /// **补 Go 源没有的护栏**（复审 Medium，与 mac 腿同口径）：起 `spawn_blocking` 之前先取
+    /// [`ConnLimiter`] 许可。socket 是 0666、uid 鉴权发生在 `handle` **之内**，即阻塞任务是在
+    /// 鉴权之前起的 —— 无上限时「连上就滴喂、不发完整帧」的无 token 进程能按连接数占满
+    /// `spawn_blocking` 池（合法请求排队等不到，比 EMFILE 更早发作），再攥满 fd 走到 EMFILE。
+    pub fn dispatch(self: &Arc<Self>, stream: tokio::net::UnixStream) {
+        use crate::platform::linux::auth::{CapturedPeerCred, PeerCredProvider, TokioPeerCred};
+        use crate::platform::linux::handler::{handle, HandlerDeps, LineConn, READ_TIMEOUT_SECS};
+
+        // 0. 闸在**起阻塞任务之前**（也在鉴权之前）。超限即快速失败：`stream` 在此 drop = 立即关连接，
+        //    不排队（排队只是把耗尽从池搬到队列，攻击面不变）、不阻塞 accept 循环。
+        let Some(permit) = self.limiter.try_acquire() else {
+            if self.limit_log.allow() {
+                eprintln!(
+                    "polaris-helper (linux): 在途连接达上限 {MAX_CONCURRENT_CONNECTIONS}，拒绝新连接"
+                );
+            }
+            drop(stream);
+            return;
+        };
+
+        // 1. 先取 SO_PEERCRED（转 std 后原流被消费，无法再取）。失败 → 捕获 None → handle 回 ERR peercred。
+        let cred = TokioPeerCred::new(&stream).peer_cred();
+        // 2. 转 std 阻塞流 + 5s 读超时。Go SetReadDeadline 是**连接级绝对**期限，std set_read_timeout 是
+        //    **每次读** SO_RCVTIMEO —— 行数上界固定（start ≤6 行），DESIGN-REVIEW(read-deadline-per-read)，
+        //    且 socket 已受授权 uid 门限，差异可控。
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if std_stream.set_nonblocking(false).is_err() {
+            return;
+        }
+        let _ = std_stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            // 许可随阻塞任务结束（含 panic 展开）归还，见 ConnPermit 文档。
+            let _permit = permit;
+            let peer = CapturedPeerCred(cred);
+            let ss_fn = ss_lookup;
+            let fwd_fn = set_forward_prod;
+            let ss: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &ss_fn;
+            let fwd: &(dyn Fn(bool) + Send + Sync) = &fwd_fn;
+            let deps = HandlerDeps {
+                core_dir: this.core_dir.as_deref(),
+                auth_file: &this.auth_file,
+                peer_cred: &peer,
+                spawner: this.spawner.as_ref(),
+                freeport_deps: &this.freeport,
+                systemd: &this.systemd,
+                resolved_dns: &this.resolved_dns,
+                ss_provider: ss,
+                set_forward: fwd,
+            };
+            let state: &Mutex<HandlerState> = &this.state;
+            let mut conn = LineConn::new(std_stream);
+            handle(state, &deps, &mut conn);
+        });
+    }
+
+    /// SIGTERM 退出兜底（Go main reaper，`main.go:46-54`）：同步 terminate 当前 child（TERM→≤5s→KILL）+
+    /// waitReaps 等在途后台 terminate 归零。调用方随后 `set_forward_prod(false)`（对齐 `main.go:55`）。
+    pub fn reap_on_shutdown(&self) {
+        let child = {
+            let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let handle = g.child.as_ref().map(ManagedChild::handle).cloned();
+            if let Some(handle) = handle.as_ref() {
+                g.child = Some(ManagedChild::Stopping(handle.clone()));
+            }
+            handle
+        };
+        if let Some(h) = child {
+            self.spawner.terminate_now(&h); // sync; no PID-only lookup
+        }
+        self.spawner.wait_reaps(Duration::from_secs(6));
+    }
+}
+
+#[cfg(test)]
+mod tests;

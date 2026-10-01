@@ -1,0 +1,337 @@
+//! polaris-helper-proto — core ↔ helper 共享协议 crate（§D.1 day-1 Rust 收益：消灭跨语言 wire drift）。
+//!
+//! Polaris 今天 core(TS)↔helper(Go) 的 line-based 文本协议在两侧手工同步（`singbox-api-client.ts:303-306`
+//! 甚至用 proto 内容 hash 防上游漂移）。全 Rust 后 core 与 helper 引用本 crate，协议演进编译期强一致。
+//!
+//! ## 协议形态（Polaris Go 源作移植 oracle，逐序列对照）
+//!
+//! Polaris helper 用 **line-based 文本协议**（非 protobuf/gRPC）：每行以 `\n` 结尾，Go 源用
+//! `bufio.Reader.ReadString('\n')` 读、`fmt.Fprintln(conn, ...)` 写。本 crate 把这套 wire 协议固化为
+//! 类型化的 Rust 类型 —— 选 serde 而非 prost/tonic 的理由：
+//! 1. **逐字移植 Polaris wire 形态**：Go 源没有 .proto 文件、没有 gRPC，只有 `fmt.Fprintf(conn, "OK ...\n")`。
+//!    prost/tonic 会引入一套全新 wire 格式，与已部署 helper（迁移期共存）断协议。
+//! 2. **wire drift 收益不依赖 prost**：类型化枚举 + 编译期单一定义点已经消灭 drift（core/helper 引用同一
+//!    `Request::Stop` 而非各自手写字符串）。
+//! 3. **最小依赖 + 审计友好**：line-based 协议仅靠 std 即可编解码，符合 Polaris helper「仅依赖标准库便于审计」
+//!    的设计纪律（`helper.go:18`）。serde 用于把 [`Request`]/[`Response`] 暴露给 core 侧的 IPC 层
+//!    （Tauri command 经 serde_json 序列化到 renderer），与 wire 形态解耦。
+//!
+//! ## protoVersion 三平台统一演进（不移植 上游的三谱系）
+//!
+//! 上游的 9/5/1 是**三套独立 Go module 各自演进出的历史谱系**（mac 从 v1 加到 v9、win 加到 v5、
+//! linux 停在 v1），版本号唯一的作用是让新 client 认出「机器上装着的是哪一代旧 helper」。
+//! Polaris 是全新产品 + 全新 Rust helper：**世上不存在旧版 Polaris helper**，没有任何一代需要被认出，
+//! 抄那三个数字只会把别人的演进史当成自己的约束。故三平台始终共用同一个
+//! [`proto_version::CURRENT`]。
+//!
+//! 平台差异不再靠版本号表达，而是由 [`Platform`] 承载（mac/win 有 token 行、linux 走 SO_PEERCRED；
+//! 命令集差异由 [`command`] 常量 + 各平台 handler 的 `case` 覆盖面表达）——本 crate 是三平台**共用**
+//! 的单一 crate，编译期就保证 core 与 helper 引用同一份定义，版本号本就无需分叉。
+//!
+//! Linux resolved 接管在正式发布前作为 v1 的向后兼容命令扩展加入；旧开发版 helper 收到未知命令时，
+//! app 会明确提示升级并把 DNS 接管标为降级，绝不静默假成功。能力判断依赖实际命令结果，不滥用版本号。
+//!
+//! ## 模块布局
+//!
+//! - [`windows_helper`]：Windows helper 服务名 / 管道 / support 目录（helper 与 client 共用的会合点）。
+//! - [`proto_version`] / [`Platform`]：协议版本 + 平台标识（B0 建立的骨架，本批保持向后兼容）。
+//! - [`command`]：wire 命令名常量（逐字对照 Go `case` 分支）。
+//! - [`error`]：错误码 [`ErrorCode`] + [`Error`]（对照 Go 所有 `ERR <code>` 调用点）。
+//! - [`response`]：成功响应 [`Response`] / [`ResponseKind`]（对照 Go 所有 `OK ...` 调用点）。
+//! - [`request`]：请求 [`Request`] + 参数类型（对照 Go 各 `case` 的 readLine 序列）。
+//! - [`codec`]：帧编解码 + 安全白名单（移植自 Go 的 ifaceAllowed/cfgAllowed/ParseCIDR 校验）。
+
+#![forbid(unsafe_code)]
+
+pub mod codec;
+pub mod command;
+pub mod error;
+pub mod exact_start;
+pub mod request;
+pub mod response;
+
+// 顶层便利重导出：让 `polaris_helper_proto::Request` 等无需钻模块路径（core/helper 两侧主用类型）。
+pub use error::{Error, ErrorCode};
+pub use request::{
+    parse_linux_birth_stop_args, parse_native_birth_stop_args, parse_stop_pid, stop_pid_matches,
+    HelperBirthTarget, HelperBirthToken, InstallCoreParams, LinuxDnsSetParams, LinuxStartParams,
+    Request, RouteParams, StartParams,
+};
+pub use response::{
+    FlushDns, FreePort, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns,
+    NativeBirthStart, NativeBirthStatus, NativeBirthStop, Pong, Response, ResponseKind, Start,
+    StartNotAdmitted, StartTiming, Status, Stop,
+};
+
+/// Linux resolved 接管跨 crate 契约。
+///
+/// 接口名同时被 config-engine 写进 sing-box TUN 配置、app 发给 helper、helper 做 root 白名单校验；
+/// DNS IP 同时被系统接管与 route `hijack-dns` 消费。放在 helper-proto 是为了让三方编译期共用，避免
+/// 任何一侧改名后静默把系统 DNS 指向不存在的接口或真实公共 DNS。
+pub mod linux_dns {
+    /// Polaris 在 Linux 上创建的固定 TUN 接口名（Linux IFNAMSIZ=16，含结尾 NUL，故最多 15 字节）。
+    pub const TUN_INTERFACE_NAME: &str = "polaris-tun0";
+    /// systemd-resolved 被指向的受控 DNS 哨兵；其 UDP/TCP 53 会被 TUN 的 `hijack-dns` 捕获。
+    pub const CONTROLLED_DNS_IP: &str = "8.8.8.8";
+    /// route-only 根域：让 resolved 把所有普通 DNS 查询交给 Polaris TUN 链路。
+    pub const ROUTE_ALL_DOMAIN: &str = "~.";
+
+    /// root helper 的最窄白名单判据：只允许操作 Polaris 自己的 TUN 与固定受控哨兵。
+    #[must_use]
+    pub fn takeover_request_allowed(interface_name: &str, server_ip: &str) -> bool {
+        interface_name == TUN_INTERFACE_NAME && server_ip == CONTROLLED_DNS_IP
+    }
+}
+
+/// Windows helper 的会合点跨 crate 契约（SCM 服务名 / 命名管道 / support 目录）。
+///
+/// helper 侧（`polaris-helper` 的 `platform::windows`）按它注册服务、创建管道、落 token；
+/// app 侧（`polaris-helper-client` 的 `InstallPaths::win` 与安装/卸载脚本）按它连管道、`sc` 起停、
+/// 外置 helper.exe 与播种受保护核。两侧早先各写一份字面量且零门对账，漂移后果全是**静默**的
+/// （`sc query` 打空 ⇒ 恒判未装；连错管道 ⇒ 恒判未运行；脚本装进另一个目录 ⇒ 服务 ImagePath 与
+/// helper 实际读的 token/核脱钩）。
+///
+/// 放在这里而不是 helper 的 `platform::windows`：那个模块的门是 `cfg(any(target_os = "windows", test))`，
+/// `test` 只在 polaris-helper 自己的测试编译期成立，别的 crate 在 Linux 上根本看不见它；而
+/// helper-client 不依赖 polaris-helper（特权 daemon 的平台依赖不该被装卸壳拖进来）。本 crate 无 cfg、
+/// 两侧都已依赖 ⇒ 构造上单源，不需要等值门。
+pub mod windows_helper {
+    /// Windows SCM 服务名（上游 `helper-win/main.go:15`，`const serviceName`）。
+    pub const SERVICE_NAME: &str = "PolarisHelper";
+    /// 命名管道路径（上游 `helper-win/service.go:16`，`const pipeName`）。
+    pub const PIPE_NAME: &str = r"\\.\pipe\polaris-helper";
+    /// helper 的 support 目录（上游 `helper-win/main.go:21` 的 `--support` 默认值）：
+    /// helper.exe 外置副本、`helper.token`、受保护核目录都落在它下面。
+    pub const DEFAULT_SUPPORT_DIR: &str = r"C:\ProgramData\Polaris";
+}
+
+/// 协议版本（**三平台统一**，单一常量）。
+pub mod proto_version {
+    /// 当前 wire 协议版本，mac/win/linux 共用。
+    ///
+    /// 唯一定义点：helper 侧的 `ping`/`version` 响应与 client 侧的握手期望都读它 → 结构上不可能分叉。
+    /// Linux resolved 命令在首次正式发布前加入，仍属于 v1；只有已发布 wire 出现不兼容变化时才递增。
+    pub const CURRENT: u32 = 1;
+}
+
+/// 当前安装包内 app/helper 的共同构建身份。
+///
+/// 发布流水线把同一份 `github.sha` 通过 `POLARIS_BUILD_ID` 注入 helper 与 app 的所有 Cargo
+/// 编译步骤；两侧都链接本 crate，因而不会再各自维护版本字符串。开发/源码包未注入时退回 workspace
+/// package version，保证本地分别编译 app/helper 仍能互认。
+pub mod build_identity {
+    /// wire token 的最大长度。Git SHA-1 为 40 字节；留出算法升级和带前缀身份的余量。
+    pub const MAX_BYTES: usize = 96;
+
+    const CONFIGURED: &str = match option_env!("POLARIS_BUILD_ID") {
+        Some(value) => value,
+        None => env!("CARGO_PKG_VERSION"),
+    };
+
+    /// 当前构建身份；若构建环境误注入了会破坏行协议的值，安全退回 package version。
+    #[must_use]
+    pub fn current() -> &'static str {
+        if is_wire_safe(CONFIGURED) {
+            CONFIGURED
+        } else {
+            env!("CARGO_PKG_VERSION")
+        }
+    }
+
+    /// 构建身份必须是单个、可审计的 ASCII token，不能注入空白或换行。
+    #[must_use]
+    pub fn is_wire_safe(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= MAX_BYTES
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+    }
+}
+
+/// 平台标识（helper 协议谱系选择，运行期由编译 target 决定）。
+///
+/// 单一真值：全 workspace 仅此处定义，其余 crate（system-integration / mesh / config-engine）
+/// 一律 `use polaris_helper_proto::Platform`。变体名对齐 helper 协议三谱系（mac/win/linux），
+/// 三处历史重定义的别名（Macos/Windows/Darwin/Win32）已统一。
+///
+/// [`Platform`] 决定帧结构差异（mac/win 有 token 行，linux 经 SO_PEERCRED 无 token 行）——
+/// 见 [`codec::encode_frame`]。
+///
+/// # 为什么 Android 是**具名变体**而不是继续落在 [`Other`](Platform::Other)（2026-09-04）
+///
+/// 这个类型早已不只回答「helper 谱系」：system DNS / 系统代理 / route 查询 / 托盘 / 进程枚举 /
+/// 网络事件解析 / mesh 出口路由都按它分派。`Other` 的语义是**「没有 helper 实现」**（那是 helper
+/// 谱系轴上的答案），而各分派点在自己的轴上把它读成了「未知平台，做保守的那件事」——保守的定义
+/// 逐处不同，且没有一处是照着 Android 想的。
+///
+/// 真实代价（K6b，2026-09-04 模拟器实测）：`exit_interface_for` 在 `Other` 上恒 `Ok(None)`、
+/// `managed_tun_interface_for_network_watcher` 在 `Other` 上恒 `None`，两条腿同时缺席让「起核前后
+/// 网卡事实是否变了」这条判据恒真 ⇒ **300 秒内起核 69 次**。两条腿各自都写着自洽的理由，
+/// 错的是它们被同一个 `Other` 串在一起、而没有人在 Android 这个轴上答过题。
+///
+/// 具名变体把「答题」搬到编译期：每一个穷举 `match` 都会因缺臂而**编译不过**，作者必须逐处写下
+/// Android 的答案（哪怕答案是「与 Other 相同」——那也是写下来的决定，不是继承来的默认）。
+///
+/// **编译器只覆盖 `match` 那一半**：`== / != / matches!` 形态的分派点它一个都不报。那一半由
+/// `src-tauri/tests/platform_dispatch_exhaustive.rs` 的登记表守（新增即红、腐烂即红）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// macOS：root LaunchDaemon + 0666 unix socket + token 行协议。
+    Mac,
+    /// Windows：SCM 服务 + 命名管道（SDDL）+ token 行协议。
+    Win,
+    /// Linux：root systemd + 0666 unix socket + SO_PEERCRED（无 token 行）。
+    Linux,
+    /// Android：`VpnService` + **进程内** libbox（`.so`）。无 helper、无核子进程、无提权命令面；
+    /// tun fd 由系统仲裁，路由/DNS 由核在 fd 内自理。
+    ///
+    /// 与 [`Other`](Platform::Other) 的区别不是「更具体一点」，而是**这条腿有人负责回答**：
+    /// `Other` 是「不知道」，`Android` 是「知道，且答案写在各分派点的 Android 臂里」。
+    Android,
+    /// iOS：`NEPacketTunnelProvider` + **扩展进程内** libbox（`.xcframework`）。无 helper、
+    /// 无核子进程、无提权命令面；tun fd 由系统在 NE 沙箱内授予，路由/DNS 由核在 fd 内自理。
+    ///
+    /// 与 [`Android`](Platform::Android) 的区别不是「同一条腿的第二个名字」：两者在**多数**
+    /// 分派点上答案确实相同（都没有 helper、都没有可指的本地端口、都没有系统代理承载物），
+    /// 但**理由不同**，且至少两处理由不同到答案的依据也不同（见 `ProxyModeType::effective_on`
+    /// 与 `mesh::mesh_system_supported_on_platform` 各自的 `Ios` 臂）。合并成一条 `Android | Ios`
+    /// 臂就是在断言「同一个理由」——那个断言在下一个人改 Android 臂时会连带把 iOS 改错。
+    ///
+    /// 与 [`Other`](Platform::Other) 的区别同 Android：`Other` 是「不知道」，`Ios` 是
+    /// 「知道，且答案写在各分派点的 Ios 臂里」——**哪怕本仓今天一个 iOS 产物都构不出来**。
+    /// 具名的意义正在于此：等到构得出的那天，答题已经发生过了，而不是靠 `Other` 顺带兜住。
+    Ios,
+    /// 未知平台兜底（freebsd/openbsd/…）。无对应 helper 实现，按 Linux 语义保守处理
+    /// （无 token 行、走 Unix 路径），避免对未鉴权对端误发 token 行。
+    ///
+    /// **不再兼任 Android**（2026-09-04，见枚举头注）：它现在只表示「本仓没有为这个平台答过题」。
+    Other,
+}
+
+impl Platform {
+    /// 全部变体。门与穷举断言的取材面。
+    ///
+    /// **新增变体必须同步这里**：`src-tauri/tests/platform_dispatch_exhaustive.rs` 直接从本文件的
+    /// `enum Platform` 声明里抠变体名，与本数组逐名对拍 —— 漏改即红。写成数组而不是靠 `strum`
+    /// 之类派生：本仓不为一条门引依赖，而对拍门给的强制力与派生等价（且它连「枚举加了、
+    /// 数组没加」这一种漂移都盖得住，派生宏盖不住数组本身不存在的情形）。
+    pub const ALL: &'static [Self] = &[
+        Self::Mac,
+        Self::Win,
+        Self::Linux,
+        Self::Android,
+        Self::Ios,
+        Self::Other,
+    ];
+
+    /// 当前平台是否在 wire 头部带 token 行（mac/win = true，linux/other = false）。
+    ///
+    /// 移植自：linux `helper-linux/main.go` 经 SO_PEERCRED 取对端 uid，`handle()` 首个 `readLine` 读的是
+    /// command 而非 token（对照 mac `helper.go:403-404` 的 token+command 两行）。
+    ///
+    /// [`Platform::Other`] / [`Platform::Android`] / [`Platform::Ios`] 视同 Linux（无 token 行）：
+    /// 三者都无对应 helper 实现，保守按 SO_PEERCRED 类语义处理，避免对未鉴权对端误发 token 行。
+    ///
+    /// # 本判据曾在两张登记表的射程之外，**2026-09-06 已收进去**
+    ///
+    /// 它写成 `matches!(self, Self::Mac | Self::Win)` —— `Self::` 而不是 `Platform::`。
+    /// `src-tauri/tests/platform_dispatch_exhaustive.rs` 的比较型扫描器按 `Platform::<Variant>`
+    /// 取材（`find_variant`），此前**扫不到这一处**：25 次比较型分派里没有它，登记表里也没有它。
+    /// 于是新增平台变体时，这里既不会编译错（`matches!` 不是穷举 match），也不会有门变红 ——
+    /// 与 K6b 的成因形态同类，只是这一格的答案恰好是安全的。
+    ///
+    /// iOS 落 `false`（不发 token 行）**是对的**：token 行是给 mac/win 那两种 helper 传送凭据用的，
+    /// iOS 上根本没有 helper（`runtime::helper::platform_supported(Ios) == false`），
+    /// 这条 wire 路径整个不可达；且判错的方向不对称 —— 多发是把凭据发给未鉴权对端，少发只是被拒。
+    ///
+    /// 上一批不改扫描器的理由是「会引入真实的假阳性」，**那条理由复核成立**：
+    /// `crates/updater/src/github.rs`（`AssetPlatform`）、`crates/helper-proto/src/error.rs`、
+    /// `crates/system-integration/src/error.rs`、`src-tauri/src/commands/server.rs` 四处都有
+    /// **别的枚举**的 `Self::Linux` / `Self::Other`，扫描器无法从裸文本判断 `Self` 是谁。
+    /// 故收法不是一刀切，而是**按所在 `impl` 块的自身类型限定**：只有块头 self 类型逐字为
+    /// `Platform` 时，块体里的 `Self::` 才被读成 `Platform::`（`resolve_self_in_platform_impls`）。
+    /// 那四处分别在 `impl AssetPlatform` / `impl ErrorKind` 等块里，一处都不会被改写 ——
+    /// 由该门的 `self_alias_does_not_leak_into_other_enums` 拿这四处**真实源码**正反双向钉住。
+    /// 本函数因此已在 `COMPARISON_REGISTRY` 里有一条自己的登记：判据一改，那条当场腐烂变红。
+    ///
+    /// **这是 token 行的唯一判据**：[`codec::encode_frame`] 曾另写一份 `platform != Platform::Linux`
+    /// —— 同一个问题的第二份答案，且**已经漂了**（那份对 `Other` 判「发 token 行」，与本函数
+    /// 及本注释所述的安全意图正相反，2026-09-04 K10 发现）。现已改为调用本函数。
+    #[must_use]
+    pub const fn has_token_line(self) -> bool {
+        matches!(self, Self::Mac | Self::Win)
+    }
+
+    /// 编译目标平台（下沉自 system-integration/dns_flush.rs 三分 cfg!）。运行期决定本机谱系。
+    ///
+    /// `target_os = "android"` → [`Platform::Android`]。Rust 的 `target_os` 对 Android 就是
+    /// `"android"`（**不是** `"linux"`），两条互斥，故分支顺序在此无语义。写成独立分支而不是
+    /// `any(linux, android)`，正是为了让「Android 与 Linux 是两个答案」在这个唯一的产地就成立。
+    ///
+    /// `target_os = "ios"` → [`Platform::Ios`]，同理：Rust 对 iOS 就是 `"ios"`（**不是**
+    /// `"macos"`，两条同样互斥），故它与上面的 macos 分支谁先谁后也无语义。
+    ///
+    /// **本函数是整条链的第一块多米诺**：40 处穷举 `match` 都可以为 `Ios` 写满答案、
+    /// `platform_variants_stay_in_sync_with_all` 也可以照绿，但只要这里少一条 ios 分支，
+    /// iOS 上就恒取 [`Platform::Other`]，那 40 个答案一处都走不到 —— 那正是 K6b 的成因形态
+    /// （代价见 `src-tauri/tests/platform_dispatch_exhaustive.rs` 头注：300 秒内起核 69 次）。
+    /// 这条缺失**不会被任何门抓到**（本仓在 Linux 上构不出 iOS 产物，见下方 §射程），
+    /// 所以它写在这里而不是靠断言。
+    ///
+    /// # 射程：本仓今天构不出 iOS 产物，这条分支现在一次都不会被求值
+    ///
+    /// `cfg!` 是编译期常量折叠，Linux/macOS/Windows 三种宿主构建下这一支恒 false。它现在的
+    /// 价值不是运行，而是**让 `Ios` 有一个唯一的产地**——等哪天真在 `--target aarch64-apple-ios`
+    /// 上编译时，答案已经在那里，而不是届时才发现全仓落 `Other`。
+    ///
+    /// 其余未知 target（freebsd/openbsd/…）→ [`Platform::Other`]。
+    #[must_use]
+    pub fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Mac
+        } else if cfg!(target_os = "windows") {
+            Self::Win
+        } else if cfg!(target_os = "android") {
+            Self::Android
+        } else if cfg!(target_os = "ios") {
+            Self::Ios
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Other
+        }
+    }
+
+    /// 平台字符串解析（下沉自 mesh/exit_route.rs，对齐 上游 `process.platform` 口径）。
+    ///
+    /// 非 std `FromStr`：未知串不报错，返 [`Platform::Other`]。兼容 "darwin"/"macos" 与
+    /// "win32"/"windows" 两套写法（各历史调用点传参不一，合并后仍受支持）。iOS 只有一个写法：
+    /// Rust 的 `std::env::consts::OS` 与 Node 的 `process.platform` 在 iOS 上都是 `"ios"`，
+    /// 没有 darwin/win32 那种双词汇问题。
+    ///
+    /// **加 `"ios"` 这一行不是无代价的**：`src-tauri/tests/platform_dispatch_exhaustive.rs` 的
+    /// 字符串轴取材面正是从本函数体抠字面量派生的，加一个名字就把整个字符串分派面的扫描口径
+    /// 变宽一档，并让本函数自己那条登记（语句原文含全部臂）当场腐烂变红。那是它该有的行为：
+    /// 新平台进字符串轴的入口只有这一处，门在这里逼人重新答一次「未知平台在各分派点得到什么」。
+    ///
+    /// **生产唯一调用点是 `config-engine/builder/generate.rs`**（把 `deps.platform` 解析给 log
+    /// builder），入参是 `std::env::consts::OS` 的直传值 —— Android 上就是 `"android"`，故这里
+    /// 必须认它，否则 Android 的日志落盘判据会在**加了变体之后**反而退化（`Other` 那条腿曾经
+    /// 顺带盖住它）。[`Platform`] 本身不带 `Serialize`/`Deserialize`，从不跨进程序列化，
+    /// 故本函数的入参面只有上述一处 + 测试，加变体没有线上兼容代价。
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "darwin" | "macos" => Self::Mac,
+            "win32" | "windows" => Self::Win,
+            "linux" => Self::Linux,
+            "android" => Self::Android,
+            "ios" => Self::Ios,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

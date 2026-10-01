@@ -1,0 +1,750 @@
+{
+  "cases": [
+    {
+      "input": {
+        "config": {
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "android",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "android_tun_no_mixed",
+      "output": [
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "172.16.0.0/15",
+            "172.18.0.0/16",
+            "172.20.0.0/14",
+            "172.24.0.0/13",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10"
+          ],
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "appRoutingEnabled": true,
+          "appRules": [
+            {
+              "action": "direct",
+              "appId": "youtube",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "netflix",
+              "enabled": true
+            },
+            {
+              "action": "block",
+              "appId": "telegram",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "spotify",
+              "enabled": false
+            },
+            {
+              "action": "direct",
+              "appId": "riot",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "github",
+              "enabled": true
+            }
+          ],
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "android",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "android_tun_direct_apps",
+      "output": [
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "exclude_package": [
+            "com.google.android.youtube",
+            "com.github.android"
+          ],
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "172.16.0.0/15",
+            "172.18.0.0/16",
+            "172.20.0.0/14",
+            "172.24.0.0/13",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10"
+          ],
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "appRules": [
+            {
+              "action": "direct",
+              "appId": "youtube",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "netflix",
+              "enabled": true
+            },
+            {
+              "action": "block",
+              "appId": "telegram",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "spotify",
+              "enabled": false
+            },
+            {
+              "action": "direct",
+              "appId": "riot",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "github",
+              "enabled": true
+            }
+          ],
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "android",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "android_tun_direct_apps_gate_key_absent",
+      "output": [
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "exclude_package": [
+            "com.google.android.youtube",
+            "com.github.android"
+          ],
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "172.16.0.0/15",
+            "172.18.0.0/16",
+            "172.20.0.0/14",
+            "172.24.0.0/13",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10"
+          ],
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "appRoutingEnabled": true,
+          "appRules": [
+            {
+              "action": "proxy",
+              "appId": "youtube",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "netflix",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "tiktok",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "telegram",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "twitter",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "instagram",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "openai",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "anthropic",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "gemini",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "github",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "google",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "spotify",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "steam",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "epic",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "riot",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "disney",
+              "enabled": true
+            }
+          ],
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "android",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "android_tun_all_presets_proxy",
+      "output": [
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "172.16.0.0/15",
+            "172.18.0.0/16",
+            "172.20.0.0/14",
+            "172.24.0.0/13",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10"
+          ],
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "android",
+        "ports": {
+          "probeDirect": 21001,
+          "probePool": [],
+          "probeProxy": 21002,
+          "updateIn": 21003
+        }
+      },
+      "name": "android_tun_loopback_probe_ports",
+      "output": [
+        {
+          "listen": "127.0.0.1",
+          "listen_port": 21001,
+          "tag": "probe-direct-in",
+          "type": "http",
+          "users": [
+            {
+              "password": "<loopback-password>",
+              "username": "<loopback-user>"
+            }
+          ]
+        },
+        {
+          "listen": "127.0.0.1",
+          "listen_port": 21002,
+          "tag": "probe-proxy-in",
+          "type": "http",
+          "users": [
+            {
+              "password": "<loopback-password>",
+              "username": "<loopback-user>"
+            }
+          ]
+        },
+        {
+          "listen": "127.0.0.1",
+          "listen_port": 21003,
+          "tag": "update-in",
+          "type": "socks",
+          "users": [
+            {
+              "password": "<loopback-password>",
+              "username": "<loopback-user>"
+            }
+          ]
+        },
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "172.16.0.0/15",
+            "172.18.0.0/16",
+            "172.20.0.0/14",
+            "172.24.0.0/13",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10"
+          ],
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "proxyMode": "smart",
+          "proxyModeType": "systemProxy",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "android",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "android_systemproxy_still_yields_tun",
+      "output": [
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "172.16.0.0/15",
+            "172.18.0.0/16",
+            "172.20.0.0/14",
+            "172.24.0.0/13",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10"
+          ],
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "proxyMode": "smart",
+          "proxyModeType": "manual",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "android",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "android_manual_still_yields_tun",
+      "output": [
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "169.254.0.0/16",
+            "172.16.0.0/15",
+            "172.18.0.0/16",
+            "172.20.0.0/14",
+            "172.24.0.0/13",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10"
+          ],
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "appRoutingEnabled": true,
+          "appRules": [
+            {
+              "action": "direct",
+              "appId": "youtube",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "netflix",
+              "enabled": true
+            },
+            {
+              "action": "block",
+              "appId": "telegram",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "spotify",
+              "enabled": false
+            },
+            {
+              "action": "direct",
+              "appId": "riot",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "github",
+              "enabled": true
+            }
+          ],
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "linux",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "linux_same_input_keeps_mixed",
+      "output": [
+        {
+          "listen": "127.0.0.1",
+          "listen_port": 7890,
+          "tag": "mixed-in",
+          "type": "mixed"
+        },
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "interface_name": "polaris-tun0",
+          "strict_route": true,
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "appRoutingEnabled": true,
+          "appRules": [
+            {
+              "action": "direct",
+              "appId": "youtube",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "netflix",
+              "enabled": true
+            },
+            {
+              "action": "block",
+              "appId": "telegram",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "spotify",
+              "enabled": false
+            },
+            {
+              "action": "direct",
+              "appId": "riot",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "github",
+              "enabled": true
+            }
+          ],
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "darwin",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "darwin_same_input_keeps_mixed",
+      "output": [
+        {
+          "listen": "127.0.0.1",
+          "listen_port": 7890,
+          "tag": "mixed-in",
+          "type": "mixed"
+        },
+        {
+          "address": [
+            "172.19.0.1/30"
+          ],
+          "auto_route": true,
+          "platform": {
+            "http_proxy": {
+              "enabled": true,
+              "server": "127.0.0.1",
+              "server_port": 7890
+            }
+          },
+          "route_exclude_address": [
+            "127.0.0.0/8",
+            "::1/128"
+          ],
+          "strict_route": true,
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    },
+    {
+      "input": {
+        "config": {
+          "appRoutingEnabled": true,
+          "appRules": [
+            {
+              "action": "direct",
+              "appId": "youtube",
+              "enabled": true
+            },
+            {
+              "action": "proxy",
+              "appId": "netflix",
+              "enabled": true
+            },
+            {
+              "action": "block",
+              "appId": "telegram",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "spotify",
+              "enabled": false
+            },
+            {
+              "action": "direct",
+              "appId": "riot",
+              "enabled": true
+            },
+            {
+              "action": "direct",
+              "appId": "github",
+              "enabled": true
+            }
+          ],
+          "proxyMode": "smart",
+          "proxyModeType": "tun",
+          "selectedServerId": null,
+          "servers": []
+        },
+        "platform": "win32",
+        "ports": {
+          "probeDirect": null,
+          "probePool": [],
+          "probeProxy": null,
+          "updateIn": null
+        }
+      },
+      "name": "win32_same_input_keeps_mixed",
+      "output": [
+        {
+          "listen": "127.0.0.1",
+          "listen_port": 7890,
+          "tag": "mixed-in",
+          "type": "mixed"
+        },
+        {
+          "address": [
+            "172.19.0.1/16"
+          ],
+          "auto_route": true,
+          "interface_name": "polaris-tun0",
+          "route_exclude_address": [
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "233.252.0.0/24",
+            "240.0.0.0/4",
+            "fc00::/7",
+            "fe80::/10",
+            "223.5.5.5/32",
+            "223.6.6.6/32",
+            "1.12.12.12/32",
+            "119.29.29.29/32",
+            "119.28.28.28/32",
+            "114.114.114.114/32",
+            "8.8.8.8/32"
+          ],
+          "strict_route": true,
+          "tag": "tun-in",
+          "type": "tun"
+        }
+      ]
+    }
+  ]
+}

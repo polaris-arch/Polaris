@@ -1,0 +1,16 @@
+/src/main/**/generated
+/src/main/jniLibs/**/*.so
+/src/main/assets/tauri.conf.json
+/tauri.build.gradle.kts
+/proguard-tauri.pro
+/tauri.properties
+
+# ↓ 本仓自加（上游模板没有）。`bundle.resources` 里的 `../x` 会被 Tauri CLI 在构建期铺成
+#   `assets/_up_/x`，那是**仓内文件的副本**：THIRD-PARTY-LICENSES.md（2 MB）、NOTICE、LICENSE、
+#   28 份 .srs。入库 = 同一份内容两处存放，必然漂，而漂掉的那份正是要随 APK 发出去的那份。
+#   真值在仓根与 resources/data/，由构建重新铺。
+/src/main/assets/_up_/
+
+# libbox.aar 112 MiB，不入库。它由 `scripts/build-libbox.sh` 从 sing-box v1.14.0 tag 现场构建
+# （上游没有为本 pin 发布预编译 aar，故不能像桌面内核那样 fetch）。sha256 收据见该脚本头注。
+/libs/
