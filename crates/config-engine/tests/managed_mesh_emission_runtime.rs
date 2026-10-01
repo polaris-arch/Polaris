@@ -310,6 +310,17 @@ fn spawn_observer() -> (
     mpsc::Receiver<&'static str>,
     Arc<AtomicBool>,
 ) {
+    spawn_observer_with_accept_mode(false)
+}
+
+fn spawn_observer_with_accept_mode(
+    force_inherited_nonblocking: bool,
+) -> (
+    SocketAddr,
+    mpsc::Receiver<String>,
+    mpsc::Receiver<&'static str>,
+    Arc<AtomicBool>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -322,6 +333,13 @@ fn spawn_observer() -> (
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let _ = event_tx.send("accepted");
+                    if force_inherited_nonblocking {
+                        stream.set_nonblocking(true).unwrap();
+                    }
+                    // accept() may inherit the listener's nonblocking mode.
+                    // read_exact must wait for fragmented SOCKS messages within
+                    // the existing timeout instead of dropping on WouldBlock.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                     let mut greeting = [0u8; 2];
                     if stream.read_exact(&mut greeting).is_err() {
@@ -680,6 +698,126 @@ fn socks_connect_requires_complete_reply() {
             expected
         );
         server.join().unwrap();
+    }
+}
+
+fn assert_observer_reply_pending(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let result = stream.read(&mut [0u8; 1]);
+    assert!(
+        matches!(&result, Err(error) if matches!(
+            error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )),
+        "incomplete SOCKS message must stay open without a reply: {result:?}"
+    );
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+}
+
+#[test]
+fn observer_reads_fragmented_connect_with_inherited_nonblocking() {
+    for force_inherited_nonblocking in [false, true] {
+        let (addr, targets, events, stop) =
+            spawn_observer_with_accept_mode(force_inherited_nonblocking);
+        let _stop = StopOnDrop(vec![stop]);
+        for (atyp, address, expected) in [
+            (1, vec![100, 80, 4, 1], "100.80.4.1"),
+            (3, b"\x0cexample.test".to_vec(), "example.test"),
+            (
+                4,
+                "fd7a:115c:a1e0:1::9"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+                    .octets()
+                    .to_vec(),
+                "fd7a:115c:a1e0:1::9",
+            ),
+        ] {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "accepted"
+            );
+            // The accepted stream has no complete greeting yet. A nonblocking
+            // read_exact would drop it rather than wait for the next fragment.
+            stream.write_all(&[5]).unwrap();
+            assert_observer_reply_pending(&mut stream);
+            stream.write_all(&[1, 0]).unwrap();
+            let mut method = [0u8; 2];
+            stream.read_exact(&mut method).unwrap();
+            assert_eq!(method, [5, 0]);
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "greeted"
+            );
+
+            stream.write_all(&[5, 1]).unwrap();
+            assert_observer_reply_pending(&mut stream);
+            stream.write_all(&[0, atyp]).unwrap();
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "request header received"
+            );
+            let last = address.len() - 1;
+            stream.write_all(&address[..last]).unwrap();
+            assert_observer_reply_pending(&mut stream);
+            stream.write_all(&[address[last], 0]).unwrap();
+            assert_observer_reply_pending(&mut stream);
+            assert_eq!(targets.try_recv(), Err(mpsc::TryRecvError::Empty));
+            assert_eq!(events.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+            stream.write_all(&[80]).unwrap();
+            let mut reply = [0u8; 10];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(reply, [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                targets.recv_timeout(Duration::from_secs(2)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                events.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "target received"
+            );
+            assert_eq!(targets.try_recv(), Err(mpsc::TryRecvError::Empty));
+            assert_eq!(events.try_recv(), Err(mpsc::TryRecvError::Empty));
+        }
+    }
+}
+
+#[test]
+fn observer_does_not_publish_truncated_connect() {
+    let (addr, targets, events, stop) = spawn_observer_with_accept_mode(true);
+    let _stop = StopOnDrop(vec![stop]);
+    for (request, complete_header) in [
+        (vec![5, 1], false),
+        (vec![5, 1, 0, 1, 100, 80], true),
+        (vec![5, 1, 0, 3, 5, b'a', b'b'], true),
+        (vec![5, 1, 0, 4, 0xfd, 0x7a], true),
+        (vec![5, 1, 0, 1, 100, 80, 4, 1, 0], true),
+    ] {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(&[5, 1, 0]).unwrap();
+        let mut method = [0u8; 2];
+        stream.read_exact(&mut method).unwrap();
+        assert_eq!(method, [5, 0]);
+        stream.write_all(&request).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+        assert_eq!(targets.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let mut expected_events = vec!["accepted", "greeted"];
+        if complete_header {
+            expected_events.push("request header received");
+        }
+        assert_eq!(observer_steps(&events), expected_events);
     }
 }
 
