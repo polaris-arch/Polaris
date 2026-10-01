@@ -9,10 +9,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -440,6 +442,75 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       } finally {
         rmSync(fixture, { recursive: true, force: true });
       }
+    }
+  });
+
+  it.each([0, 1, 2, 3] as const)('四处远端 digest 裁判 %i 经真实 gh/gojq 解析，且拒绝缺失或漂移的资产', async (index) => {
+    const android = stepBlock(jobBlock(workflow('android.yml'), 'release-apk'), '上传成 release 资产');
+    const desktop = stepBlock(jobBlock(workflow('package.yml'), 'release_desktop'),
+      'Verify draft desktop asset digests against SHA256SUMS');
+    const release = jobBlock(workflow('package.yml'), 'release');
+    const combined = stepBlock(release, 'Verify combined asset set and digests');
+    const promote = stepBlock(release, 'Promote release to public');
+    const guards = [
+      android.slice(android.indexOf("          row=''")),
+      desktop.slice(desktop.indexOf('          raw_all=')),
+      combined.slice(combined.indexOf('          raw="$(mktemp)"')),
+      promote.slice(promote.indexOf('          raw="$(mktemp)"'), promote.indexOf('          gh release edit')),
+    ] as const;
+    const guard = guards[index];
+    const sha = 'a'.repeat(64);
+    let assets: Array<{ name: string; digest?: string | null; state?: string }> = [];
+    let requests = 0;
+    const server = createServer((request, response) => {
+      expect(request.method).toBe('GET');
+      expect(request.url).toBe('/release');
+      requests += 1;
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ assets }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('REST fixture has no TCP port');
+    const fixture = mkdtempSync(join(tmpdir(), 'polaris-release-digest-'));
+    const run = promisify(execFile);
+    try {
+      const name = index === 0 ? 'polaris-1.0.0-android-arm64.apk' : 'polaris-1.0.0-linux-x64.AppImage';
+      const good = { name, digest: `sha256:${sha}`, state: 'uploaded' };
+      for (const [responseAssets, expectedStatus] of [
+        [[good], 0],
+        [[{ name, state: 'uploaded' }], 1],
+        [[{ ...good, digest: null }], 1],
+        [[{ ...good, digest: `sha256:${'b'.repeat(64)}` }], 1],
+        [[{ ...good, state: 'starting' }], 1],
+        [[{ name, digest: good.digest }], 1],
+        [[{ ...good, name: 'wrong-name.apk' }], 1],
+        [[], 1],
+        [[good, good], 1],
+        [[good, { ...good, name: 'unexpected-asset.zip' }], index === 0 ? 0 : 1],
+      ] as const) {
+        assets = [...responseAssets];
+        const expected = join(fixture, 'expected');
+        writeFileSync(expected, `${sha}  ${name}\n`);
+        const before = requests;
+        // Execute the actual post-upload/read guards, ending before any
+        // mutation. Only retry sleeps are elided for the fixed REST fixture.
+        const result = await run('bash', ['-c',
+          `set -euo pipefail\nsleep() { :; }\n${guard.replace(/^ {10}/gm, '')}`], {
+          env: { ...process.env, GH_TOKEN: 'localhost-fixture-not-a-secret',
+            GH_CONFIG_DIR: fixture, TMPDIR: fixture, NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1',
+            api_url: `http://127.0.0.1:${address.port}/release`, name, expected,
+            expected_sha: sha, android_asset: 'polaris-1.0.0-android-arm64.apk', tag: 'v1.0.0' },
+          encoding: 'utf8',
+        }).then(({ stdout, stderr }) => ({ status: 0, stdout, stderr }),
+          (error: { code: number; stdout: string; stderr: string }) =>
+            ({ status: error.code, stdout: error.stdout, stderr: error.stderr }));
+        expect(result.status, `guard ${index}: ${result.stdout}${result.stderr}`).toBe(expectedStatus);
+        expect(requests).toBeGreaterThan(before);
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      rmSync(fixture, { recursive: true, force: true });
     }
   });
 

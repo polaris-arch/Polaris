@@ -1037,7 +1037,7 @@ jobs:
           [ -n "$api_url" ] || { echo "::error::APK 上传后 release 已不是草稿或取不到 apiUrl"; exit 1; }
           row=''
           for attempt in 1 2 3; do
-            row="$(gh api "$api_url" --jq ".assets[] | select(.name == \"$name\") | \"\\(.digest // \\\"MISSING\\\")\\t\\(.state // \\\"unknown\\\")\\t\\(.name)\"")"
+            row="$(gh api "$api_url" --jq ".assets[] | select(.name == \"$name\") | [(.digest // \"MISSING\"), (.state // \"unknown\"), .name] | @tsv")"
             [ "$(printf '%s' "$row" | awk -F'\t' '{print $1}')" = "sha256:$expected_sha" ] && \
               [ "$(printf '%s' "$row" | awk -F'\t' '{print $2}')" = "uploaded" ] && break
             [ "$attempt" -eq 3 ] && break
