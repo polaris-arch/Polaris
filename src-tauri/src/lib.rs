@@ -641,6 +641,8 @@ pub fn run() {
     // Tauri setup 之后才有；ProxyRuntime 在 `AppRuntime::new` 里就造好了，够不着。
     #[cfg(target_os = "android")]
     let builder = builder.plugin(runtime::proxy::android_bridge::init());
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(tauri_plugin_polaris_ios::init());
     let builder = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -711,6 +713,12 @@ pub fn run() {
                 .unwrap_or_else(|e| {
                     log::warn!("app_config_dir 解析失败 {e}，回落 cwd/polaris");
                     std::path::PathBuf::from("./polaris")
+                });
+            #[cfg(target_os = "ios")]
+            let config_dir =
+                tauri_plugin_polaris_ios::shared_directory().unwrap_or_else(|error| {
+                    eprintln!("iOS shared container unavailable: {error}");
+                    config_dir
                 });
             // 确保目录存在（首次启动）。
             let _ = std::fs::create_dir_all(&config_dir);
@@ -789,6 +797,13 @@ pub fn run() {
             // 装配 18 crate 运行时（注入 tokio / std::fs / 真 socket / 真 HTTP client）。
             // 传输层 client 建不起来 = 网络栈残缺 → 报错退出（? 冒泡给 setup），不带病硬跑。
             let app_runtime = AppRuntime::new(config_dir)?;
+            #[cfg(target_os = "ios")]
+            {
+                let proxy = Arc::clone(&app_runtime.proxy);
+                tauri::async_runtime::spawn(async move {
+                    proxy.reconcile_ios_session_on_startup().await;
+                });
+            }
 
             // ── 版本感知 reseed：随包核 → 可写现役核（幂等；**失败不 fatal**）──
             // 失败即回落随包种子照常起核（`resolve_core_binary` 第 3 级）⇒ 首启/迁移永不 brick。
@@ -1350,7 +1365,7 @@ pub fn run() {
                 api.prevent_exit();
                 return;
             }
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if !exit_lifecycle::exit_is_committed(app_handle) {
                 api.prevent_exit();
                 exit_lifecycle::queue_quit(app_handle);

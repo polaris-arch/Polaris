@@ -413,7 +413,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
       dnsRules: config.dnsRules ?? [],
     });
-    hydrateStagedConfig(config);
+    const hydration = hydrateStagedConfig(config);
+    if (typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios') await hydration;
     return receipt;
   },
 

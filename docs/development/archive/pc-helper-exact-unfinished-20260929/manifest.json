@@ -1,0 +1,56 @@
+{
+  "status": "UnfinishedSourceArchive",
+  "baseline": "728a8683f950ab224f7d62165da90709fc0afca1",
+  "sourceWorktree": "polaris-multi-ts-pc-helper-exact-sol-20260929",
+  "productionEnabled": false,
+  "independentBuildVerified": false,
+  "sourceFiles": [
+    {
+      "path": "crates/helper-proto/src/exact.rs",
+      "sha256": "f2370ce2142fb736d155ce3ecd93af892766737154c2410ac8c1fd33381265d0",
+      "bytes": 7999
+    },
+    {
+      "path": "crates/helper/src/exact.rs",
+      "sha256": "e0a18ea476508971accfd4a7cb1c512e20cebb454d94c3b35570b6803bff1c9a",
+      "bytes": 2371
+    },
+    {
+      "path": "crates/helper/src/exact_cache.rs",
+      "sha256": "2a565e3f62cbc6a2b87a3f6fb6f45744b1e5fe2d8934e9182f5cf577700de3a2",
+      "bytes": 23955
+    },
+    {
+      "path": "crates/helper/src/exact_cache/store.rs",
+      "sha256": "8e555735c8d519b5a781f64421d446bb13db8801999a5b56222a6594e002a653",
+      "bytes": 21904
+    },
+    {
+      "path": "crates/helper/src/exact_cache/store/tests.rs",
+      "sha256": "523b74cf1caba4d4705a1749f0d97a684b831e6280e5c54526d861a8f734f8e3",
+      "bytes": 21031
+    },
+    {
+      "path": "crates/helper/src/exact_cache/tests.rs",
+      "sha256": "b88b9e05fbc85a3636c6c9c27a335281fb51751fcba583d4f70191152d2108d3",
+      "bytes": 20354
+    },
+    {
+      "path": "crates/helper/src/exact_snapshot.rs",
+      "sha256": "e222c8a8ac2248fcf841ddb8e563ac9951a227731679eb70e863c9d2d97c0a07",
+      "bytes": 20107
+    },
+    {
+      "path": "crates/helper/src/exact_snapshot/tests.rs",
+      "sha256": "138f5eafadb3f9b3cafdfb3550cb7a08283dfb36dc998422a2eed5b238245f67",
+      "bytes": 8782
+    },
+    {
+      "path": "docs/pc-helper-exact-mutable-path-contract-2026-09-29.md",
+      "sha256": "36c718bc478cac877935192006beb99105dc3dcaf289d0bf6eba5a8f18e03339",
+      "bytes": 30510
+    }
+  ],
+  "trackedPatchSha256": "e1b8377958a78240179f4ddd4b69307ea2f29582cb523a44f03369ecbfa87c56",
+  "recoverableHistoryBundleSha256": "740f802d7ae26f2d8b39a307f8915193ec2f2b99a7c56d25b7396a745c24d385"
+}

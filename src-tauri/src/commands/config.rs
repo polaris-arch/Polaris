@@ -398,7 +398,8 @@ pub fn config_save(
     let mut config = config;
     // `deferRestart=true` 是暂存保存；即使调用方未传该标志，只要旧核仍在也不能立即清资源/state。
     // 后者覆盖将来新增的直写入口，避免把安全性押在“前端一定经过暂存层”这一条接线上。
-    let defer_cleanup = defer_restart.unwrap_or(false) || state.proxy().status().running;
+    let defer_cleanup =
+        cfg!(target_os = "ios") || defer_restart.unwrap_or(false) || state.proxy().status().running;
     match config_save_core(
         state.config(),
         &mut config,

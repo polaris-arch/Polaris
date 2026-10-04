@@ -1,6 +1,32 @@
 use super::super::*;
 
 #[test]
+fn ios_probe_rejects_independent_construction_before_config_or_binary_access() {
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &crate::test_support::crate_code("commands/proxy.rs"),
+        "pub async fn kernel_probe_outbound(",
+    );
+    let guard = body.find("if cfg!(target_os = \"ios\") {").unwrap();
+    let rejection = guard
+        + body[guard..]
+            .find("return Ok(ApiResponse::ok(probe_verdict(ProbeCheck::Indeterminate)));")
+            .unwrap();
+    assert!(body.find("validate_probe_outbound(&outbound)").unwrap() < guard);
+    for action in [
+        "build_probe_config(",
+        "state.config().dir()",
+        "resolve_core_binary()",
+        "std::fs::write(",
+        "run_probe_check(",
+    ] {
+        assert!(
+            rejection < body.find(action).unwrap(),
+            "guard must precede {action}"
+        );
+    }
+}
+
+#[test]
 fn unsaved_config_only_blocks_starting_from_stopped_state() {
     assert!(!should_block_unsaved_start(false, false));
     assert!(should_block_unsaved_start(false, true));

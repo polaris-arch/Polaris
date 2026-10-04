@@ -136,7 +136,7 @@ export function MobileShell({
   };
 
   return (
-    <div className="m-shell">
+    <div className="m-shell" data-navigation={pushed ? 'hidden' : 'visible'}>
       {/* 不滚动的边界承接断点和屏内 fixed 弹层；内层只滚动正文。字号继续继承根缩放。 */}
       <div className="m-screen-viewport">
         <div className="m-scroll" ref={scrollRef}>

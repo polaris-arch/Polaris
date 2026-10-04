@@ -1595,6 +1595,7 @@
     "createTaskRecoveredHint": "Подписка добавляется в фоне; после перезапуска приложения ход операции снова появится здесь."
   },
   "errors": {
+    "iosSessionActive": "A Polaris VPN session is already active in the system. Stop that session in iOS Settings before connecting.",
     "operationFailed": "Операция не удалась, повторите позже",
     "systemDnsTakeoverFailed": "Системный DNS Linux не удалось подключить к Polaris. Прокси продолжает работать, но DNS может завершаться ошибкой или обходить правила. Проверьте Helper и systemd-resolved, затем переподключитесь.",
     "outboundInterfaceUnavailable": "Выбранный выходной сетевой интерфейс отсутствует или неактивен. Чтобы трафик не переключился на другой интерфейс, подключение не применено; выберите доступный интерфейс.",
@@ -2017,6 +2018,8 @@
     "errUnknown": "Не удалось выполнить операцию."
   },
   "ts": {
+    "iosAccountActionsUnavailable": "iOS does not yet support separate login sessions, switching accounts, or logout. You can save node settings and an Auth Key; authorization uses a login URL returned by the main VPN.",
+    "iosConfigurationSaved": "Settings saved; login has not been confirmed. Connect or reconnect the main VPN from Home. Saving a new Auth Key does not clear an existing account session.",
     "acceptDefaultResolvers": "Принимать DNS-резолверы tailnet по умолчанию",
     "acceptDefaultResolversHint": "Дополнительно принимать DNS-резолверы, раздаваемые tailnet (split-DNS). Необязательно.",
     "acceptRoutes": "Принимать маршруты подсетей",

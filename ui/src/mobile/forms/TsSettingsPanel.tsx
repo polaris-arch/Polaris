@@ -1,3 +1,4 @@
+import { supportsTsAccountActions } from '@/components/dialogs/ts-login-server';
 /**
  * 移动端 **Tailscale 设置表** —— 批 3。节点行上「编辑」一个 tailscale 节点落到这里
  * （`form-store#mobileEditFormFor`），组网接入面上点 Tailscale 且已有节点时也落到这里
@@ -78,6 +79,7 @@ export function TsSettingsPanel({
   serverId: string;
 }): ReactElement {
   const { t } = useTranslation();
+  const accountActionsSupported = supportsTsAccountActions();
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -142,7 +144,7 @@ export function TsSettingsPanel({
   // Re-read when this sheet becomes visible again after a login sheet closes, and when
   // Android returns from system UI. A failed read is unknown, never proof of a session.
   useEffect(() => {
-    if (!isTop) return;
+    if (!isTop || !accountActionsSupported) return;
     let alive = true;
     const readState = (): void => {
       const revision = ++stateReadRevision.current;
@@ -304,6 +306,7 @@ export function TsSettingsPanel({
 
   /** 登出：主核持有该节点时另问一次是否断开，绝不从通用错误推断可以停核。 */
   const requestLogout = (): void => {
+    if (!accountActionsSupported) return;
     if (node === undefined) return;
     const serverId = node.id;
     const confirmId = open({
@@ -452,6 +455,7 @@ export function TsSettingsPanel({
               本面板的 union 那一支**必须带 id**（`form-store.ts`），于是「绑在第一个节点上」
               这件事在移动端结构上就不会发生；而每个 Tailscale 节点在节点屏上各有一行、
               「编辑」都落到这张表 ⇒ 每一个节点的收件箱都到得了。完整依据见 `TaildropPanel` 头注。 */}
+          {!accountActionsSupported && <p className="m-form-hint">{t('ts.iosAccountActionsUnavailable')}</p>}
           <div className="m-form-row">
             <span className="m-form-label">{t('ts.method')}</span>
             <div className="m-form-inline">
@@ -472,12 +476,12 @@ export function TsSettingsPanel({
                 disabled={busy}
                 onClick={() => open({ kind: 'ts-login', serverId })}
               >
-                {t(hasLoginState === false ? 'ts.signIn' : 'meshJoin.switchAccount')}
+                {t(!accountActionsSupported ? 'common.edit' : hasLoginState === false ? 'ts.signIn' : 'meshJoin.switchAccount')}
               </button>
-              {hasLoginState === true && <button
+              {(hasLoginState === true || !accountActionsSupported) && <button
                 type="button"
                 className="m-form-btn danger"
-                disabled={busy}
+                disabled={busy || !accountActionsSupported}
                 onClick={requestLogout}
               >
                 {t('ts.logout')}

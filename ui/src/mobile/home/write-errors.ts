@@ -22,6 +22,8 @@
  * 3. **写成功要清掉上一次的错误**，否则一条修好的失败会永久挂在控件下面，读作「它还是坏的」。
  */
 import type { TFunction } from 'i18next';
+import type { ProxyStatus } from '@/contracts/types';
+import { proxyErrorText } from '@/domain/proxy-error-text';
 import type { WriteControlId, WriteErrors } from './view-model';
 
 /** 记一条（同一控件重复失败覆盖同一条，不堆积）。 */
@@ -42,6 +44,16 @@ export function withoutWriteError(prev: WriteErrors, id: WriteControlId): WriteE
   return next;
 }
 
+/** Cold status can carry an active system session without a host-owned running config. */
+export function writeErrorsFromProxyStatus(
+  errors: WriteErrors,
+  status: Pick<ProxyStatus, 'running' | 'errorCode'> | null,
+  t: TFunction,
+): WriteErrors {
+  if (errors.connect || status?.running || status?.errorCode !== 'IOS_SESSION_ACTIVE') return errors;
+  return withWriteError(errors, 'connect', proxyErrorText({ errorCode: status.errorCode }, (key) => t(key)));
+}
+
 /**
  * 失败原因取文。
  *
@@ -50,6 +62,9 @@ export function withoutWriteError(prev: WriteErrors, id: WriteControlId): WriteE
  * **宁可少说，不许编一个原因**。
  */
 export function writeFailureText(t: TFunction, err: unknown): string {
+  if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'IOS_SESSION_ACTIVE') {
+    return proxyErrorText({ errorCode: err.code }, (key) => t(key));
+  }
   const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
   const reason = raw.split('\n')[0].trim().slice(0, 120);
   return reason.length > 0

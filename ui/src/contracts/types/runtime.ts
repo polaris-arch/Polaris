@@ -54,6 +54,7 @@ export interface ProxyStatus {
 // ============================================================================
 
 export enum ProxyErrorCode {
+  IOS_SESSION_ACTIVE = 'IOS_SESSION_ACTIVE',
   // 连接类 → ErrorCategory.Connection
   DEST_CONNECTION_REFUSED = 'DEST_CONNECTION_REFUSED', // 'report handshake success: connection refused'
   CONNECTION_REFUSED = 'CONNECTION_REFUSED', // 'connection refused'

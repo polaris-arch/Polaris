@@ -1,0 +1,365 @@
+diff --git a/adapter/platform.go b/adapter/platform.go
+index 4ec165d..d4db464 100644
+--- a/adapter/platform.go
++++ b/adapter/platform.go
+@@ -62,6 +62,12 @@ type PlatformInterface interface {
+ 	CreateAutoRedirect(options AutoRedirectOptions) (AutoRedirectSession, error)
+ }
+ 
++// PlatformInterfaceBinder supplies per-socket named-interface binding on Android.
++// Other platform adapters retain their existing PlatformInterface contract.
++type PlatformInterfaceBinder interface {
++	BindInterfaceControl(fd int, interfaceName string) error
++}
++
+ type AutoRedirectOptions struct {
+ 	TunOptions                     *tun.Options
+ 	TableName                      string
+diff --git a/common/dialer/default.go b/common/dialer/default.go
+index 2596a19..2ccb2da 100644
+--- a/common/dialer/default.go
++++ b/common/dialer/default.go
+@@ -81,7 +81,10 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
+ 		if !(C.IsLinux || C.IsDarwin || C.IsWindows) {
+ 			return nil, E.New("`bind_interface` is only supported on Linux, macOS and Windows")
+ 		}
+-		bindFunc := control.BindToInterface(interfaceFinder, options.BindInterface, -1)
++		bindFunc, err := bindInterfaceControl(platformInterface, interfaceFinder, options.BindInterface)
++		if err != nil {
++			return nil, err
++		}
+ 		dialer.Control = control.Append(dialer.Control, bindFunc)
+ 		listenConfig.Control = control.Append(listenConfig.Control, bindFunc)
+ 	}
+@@ -102,7 +105,10 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
+ 	if networkManager != nil {
+ 		defaultOptions := networkManager.DefaultOptions()
+ 		if defaultOptions.BindInterface != "" && !disableDefaultBind {
+-			bindFunc := control.BindToInterface(networkManager.InterfaceFinder(), defaultOptions.BindInterface, -1)
++			bindFunc, err := bindInterfaceControl(platformInterface, networkManager.InterfaceFinder(), defaultOptions.BindInterface)
++			if err != nil {
++				return nil, err
++			}
+ 			dialer.Control = control.Append(dialer.Control, bindFunc)
+ 			listenConfig.Control = control.Append(listenConfig.Control, bindFunc)
+ 		} else if networkManager.AutoDetectInterface() && !disableDefaultBind {
+diff --git a/common/dialer/interface_binding.go b/common/dialer/interface_binding.go
+new file mode 100644
+index 0000000..66cc344
+--- /dev/null
++++ b/common/dialer/interface_binding.go
+@@ -0,0 +1,33 @@
++package dialer
++
++import (
++	"syscall"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing/common/control"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++func bindInterfaceControl(platform adapter.PlatformInterface, finder control.InterfaceFinder, interfaceName string) (control.Func, error) {
++	if C.IsAndroid {
++		return platformBindInterfaceControl(platform, interfaceName)
++	}
++	return control.BindToInterface(finder, interfaceName, -1), nil
++}
++
++func platformBindInterfaceControl(platform adapter.PlatformInterface, interfaceName string) (control.Func, error) {
++	binder, ok := platform.(adapter.PlatformInterfaceBinder)
++	if !ok {
++		return nil, E.New("Android named interface binding requires a platform socket binder")
++	}
++	return func(_, _ string, conn syscall.RawConn) error {
++		var bindErr error
++		if err := conn.Control(func(fd uintptr) {
++			bindErr = binder.BindInterfaceControl(int(fd), interfaceName)
++		}); err != nil {
++			return err
++		}
++		return bindErr
++	}, nil
++}
+diff --git a/common/dialer/interface_binding_test.go b/common/dialer/interface_binding_test.go
+new file mode 100644
+index 0000000..cf66fe4
+--- /dev/null
++++ b/common/dialer/interface_binding_test.go
+@@ -0,0 +1,174 @@
++package dialer
++
++import (
++	"context"
++	"errors"
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"syscall"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/control"
++	"github.com/sagernet/sing/service"
++)
++
++type bindingTestPlatform struct {
++	adapter.PlatformInterface
++	calls int
++	fd    int
++	name  string
++	err   error
++}
++
++func (p *bindingTestPlatform) BindInterfaceControl(fd int, name string) error {
++	p.calls++
++	p.fd, p.name = fd, name
++	return p.err
++}
++
++type bindingTestRawConn struct{ err error }
++
++func (c bindingTestRawConn) Control(f func(uintptr)) error {
++	if c.err != nil {
++		return c.err
++	}
++	f(42)
++	return nil
++}
++func (bindingTestRawConn) Read(func(uintptr) bool) error  { panic("unused") }
++func (bindingTestRawConn) Write(func(uintptr) bool) error { panic("unused") }
++
++func TestPlatformInterfaceBindingTCPUDPAndFailures(t *testing.T) {
++	for _, network := range []string{"tcp4", "tcp6", "udp4", "udp6"} {
++		t.Run(network, func(t *testing.T) {
++			p := &bindingTestPlatform{}
++			bind, err := platformBindInterfaceControl(p, "wlan0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err = bind(network, "synthetic", bindingTestRawConn{}); err != nil {
++				t.Fatal(err)
++			}
++			if p.calls != 1 || p.fd != 42 || p.name != "wlan0" {
++				t.Fatalf("binding not forwarded: %#v", p)
++			}
++			p.err = errors.New("network disappeared")
++			if err = bind(network, "synthetic", bindingTestRawConn{}); !errors.Is(err, p.err) {
++				t.Fatalf("binding failure was hidden: %v", err)
++			}
++			rawErr := errors.New("descriptor closed")
++			if err = bind(network, "synthetic", bindingTestRawConn{rawErr}); !errors.Is(err, rawErr) {
++				t.Fatalf("RawConn failure was hidden: %v", err)
++			}
++			if p.calls != 2 {
++				t.Fatal("RawConn failure still called binder")
++			}
++		})
++	}
++	for _, platform := range []adapter.PlatformInterface{nil, struct{ adapter.PlatformInterface }{}} {
++		if bind, err := platformBindInterfaceControl(platform, "wlan0"); err == nil || bind != nil {
++			t.Fatal("missing platform binder accepted")
++		}
++	}
++}
++
++type bindingTestNetworkManager struct{ adapter.NetworkManager }
++
++func (bindingTestNetworkManager) InterfaceFinder() control.InterfaceFinder {
++	return control.NewDefaultInterfaceFinder()
++}
++func (bindingTestNetworkManager) DefaultOptions() adapter.NetworkOptions {
++	return adapter.NetworkOptions{BindInterface: "lo"}
++}
++func (bindingTestNetworkManager) AutoRedirectOutputMarkFunc() control.Func { return nil }
++
++func TestNamedInterfaceBindingPreservesNonAndroidAndAutomaticDialers(t *testing.T) {
++	if C.IsAndroid {
++		t.Skip("host regression")
++	}
++	p := &bindingTestPlatform{err: errors.New("must not be called")}
++	ctx := service.ContextWith[adapter.PlatformInterface](context.Background(), p)
++	for _, options := range []option.DialerOptions{{}, {AbstractDialerOptions: option.AbstractDialerOptions{BindInterface: "lo"}}} {
++		dialer, err := NewDefault(ctx, options)
++		if err != nil {
++			t.Fatal(err)
++		}
++		_ = dialer.dialer4.Control("tcp4", "127.0.0.1:443", bindingTestRawConn{})
++	}
++	ctx = service.ContextWith[adapter.NetworkManager](ctx, bindingTestNetworkManager{})
++	dialer, err := NewDefault(ctx, option.DialerOptions{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = dialer.dialer4.Control("tcp4", "127.0.0.1:443", bindingTestRawConn{})
++	if p.calls != 0 {
++		t.Fatal("non-Android dialer called Android platform binder")
++	}
++}
++
++// Host behavior tests cannot change GOOS. Inspect the actual constructor AST to ensure both
++// explicit and default choices attach the same binder to TCP dialing and UDP listening.
++func TestNamedInterfaceBindingConstructorWiring(t *testing.T) {
++	f, err := parser.ParseFile(token.NewFileSet(), "default.go", nil, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var branches int
++	ast.Inspect(f, func(n ast.Node) bool {
++		block, ok := n.(*ast.BlockStmt)
++		if !ok {
++			return true
++		}
++		var found bool
++		for _, stmt := range block.List {
++			assign, ok := stmt.(*ast.AssignStmt)
++			if !ok {
++				continue
++			}
++			for _, rhs := range assign.Rhs {
++				call, ok := rhs.(*ast.CallExpr)
++				if ok {
++					id, ok := call.Fun.(*ast.Ident)
++					found = found || ok && id.Name == "bindInterfaceControl"
++				}
++			}
++		}
++		if !found {
++			return true
++		}
++		branches++
++		controls := map[string]bool{}
++		for _, stmt := range block.List {
++			assign, ok := stmt.(*ast.AssignStmt)
++			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
++				continue
++			}
++			sel, ok := assign.Lhs[0].(*ast.SelectorExpr)
++			if !ok || sel.Sel.Name != "Control" {
++				continue
++			}
++			owner, ok := sel.X.(*ast.Ident)
++			call, callOK := assign.Rhs[0].(*ast.CallExpr)
++			if !ok || !callOK || len(call.Args) != 2 {
++				continue
++			}
++			binder, ok := call.Args[1].(*ast.Ident)
++			if ok && binder.Name == "bindFunc" {
++				controls[owner.Name] = true
++			}
++		}
++		if !controls["dialer"] || !controls["listenConfig"] {
++			t.Error("named binding not attached to both TCP and UDP")
++		}
++		return true
++	})
++	if branches != 2 {
++		t.Fatalf("expected explicit and default bind paths, got %d", branches)
++	}
++}
++
++var _ syscall.RawConn = bindingTestRawConn{}
+diff --git a/experimental/libbox/config.go b/experimental/libbox/config.go
+index 63e8699..14c693e 100644
+--- a/experimental/libbox/config.go
++++ b/experimental/libbox/config.go
+@@ -81,6 +81,11 @@ func (s *platformInterfaceStub) AutoDetectInterfaceControl(fd int) error {
+ 	return nil
+ }
+ 
++// CheckConfig constructs but never starts sockets. An accidental socket use must fail.
++func (s *platformInterfaceStub) BindInterfaceControl(fd int, interfaceName string) error {
++	return os.ErrInvalid
++}
++
+ func (s *platformInterfaceStub) UsePlatformInterface() bool {
+ 	return false
+ }
+diff --git a/experimental/libbox/interface_binding_test.go b/experimental/libbox/interface_binding_test.go
+new file mode 100644
+index 0000000..6502d30
+--- /dev/null
++++ b/experimental/libbox/interface_binding_test.go
+@@ -0,0 +1,44 @@
++package libbox
++
++import (
++	"errors"
++	"os"
++	"testing"
++)
++
++type interfaceBindingTestPlatform struct {
++	PlatformInterface
++	fd   int32
++	name string
++	err  error
++}
++
++func (p *interfaceBindingTestPlatform) BindInterfaceControl(fd int32, name string) error {
++	p.fd, p.name = fd, name
++	return p.err
++}
++
++func TestInterfaceBindingWrapperPreservesDescriptorNameAndError(t *testing.T) {
++	p := &interfaceBindingTestPlatform{}
++	w := &platformInterfaceWrapper{iif: p}
++	if err := w.BindInterfaceControl(42, "wlan0"); err != nil {
++		t.Fatal(err)
++	}
++	if p.fd != 42 || p.name != "wlan0" {
++		t.Fatal("platform binding arguments changed")
++	}
++	p.err = errors.New("network no longer available")
++	if err := w.BindInterfaceControl(43, "rmnet_data0"); !errors.Is(err, p.err) {
++		t.Fatal("platform binding failure hidden")
++	}
++	if p.fd != 43 || p.name != "rmnet_data0" {
++		t.Fatal("platform binding arguments changed on failure")
++	}
++}
++
++func TestInterfaceBindingCheckConfigStubCannotBindSockets(t *testing.T) {
++	var stub *platformInterfaceStub
++	if err := stub.BindInterfaceControl(42, "wlan0"); !errors.Is(err, os.ErrInvalid) {
++		t.Fatal("CheckConfig stub unexpectedly permits actual socket binding")
++	}
++}
+diff --git a/experimental/libbox/platform.go b/experimental/libbox/platform.go
+index f0e465f..e63d405 100644
+--- a/experimental/libbox/platform.go
++++ b/experimental/libbox/platform.go
+@@ -6,6 +6,7 @@ type PlatformInterface interface {
+ 	LocalDNSTransport() LocalDNSTransport
+ 	UsePlatformAutoDetectInterfaceControl() bool
+ 	AutoDetectInterfaceControl(fd int32) error
++	BindInterfaceControl(fd int32, interfaceName string) error
+ 	OpenTun(options TunOptions) (int32, error)
+ 	UseProcFS() bool
+ 	FindConnectionOwner(ipProtocol int32, sourceAddress string, sourcePort int32, destinationAddress string, destinationPort int32) (*ConnectionOwner, error)
+diff --git a/experimental/libbox/service.go b/experimental/libbox/service.go
+index 982e1a2..8e24f31 100644
+--- a/experimental/libbox/service.go
++++ b/experimental/libbox/service.go
+@@ -26,6 +26,7 @@ import (
+ )
+ 
+ var _ adapter.PlatformInterface = (*platformInterfaceWrapper)(nil)
++var _ adapter.PlatformInterfaceBinder = (*platformInterfaceWrapper)(nil)
+ 
+ type platformInterfaceWrapper struct {
+ 	iif                    PlatformInterface
+@@ -53,6 +54,10 @@ func (w *platformInterfaceWrapper) AutoDetectInterfaceControl(fd int) error {
+ 	return w.iif.AutoDetectInterfaceControl(int32(fd))
+ }
+ 
++func (w *platformInterfaceWrapper) BindInterfaceControl(fd int, interfaceName string) error {
++	return w.iif.BindInterfaceControl(int32(fd), interfaceName)
++}
++
+ func (w *platformInterfaceWrapper) UsePlatformInterface() bool {
+ 	return true
+ }

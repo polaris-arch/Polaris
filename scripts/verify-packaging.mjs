@@ -159,13 +159,13 @@ const NON_CORE_CONFS = {
   },
   'tauri.ios.conf.json': {
     why:
-      'iOS 包：按平台重筛 bundle.resources（桌面专属的 core-manifest.json 与 dashboard 不进 .ipa，'
+      'iOS 包：build hook 仅生成移动端 UI（不构建桌面 dashboard）；按平台重筛 bundle.resources（桌面专属的 core-manifest.json 与 dashboard 不进 .ipa，'
       + '许可三份仍进）。**没有 `identifier` 覆盖，这是刻意的**：Android 那份覆盖成 com.polaris2.app 的'
       + '理由是 Play 在架应用撞包名（同包名不同签名装不上），那是 Play 命名空间的事实，不迁移到 App Store；'
       + '而 Apple 侧反向还有个正面理由 —— macOS 与 iOS 用同一个 bundle id 才是同一条 App Store 记录，'
       + '分叉 identifier 会连带分叉 keychain access group / app group / NE 扩展的 id。'
       + '哪天真需要覆盖，本表的 topKeys 恰等于判据会当场红，逼人来写下理由。',
-    topKeys: ['bundle'],
+    topKeys: ['build', 'bundle'],
     resources: [
       // 与 Android 同一条许可义务：.ipa 也是「副本」，MIT 版权声明与 NOTICE 的第三方来源指引都要随行。
       '../LICENSE',

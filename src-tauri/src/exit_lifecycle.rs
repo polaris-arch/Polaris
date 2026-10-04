@@ -126,13 +126,13 @@ impl DesktopExitReady {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct DesktopExitPorts {
     proxy: Arc<crate::runtime::proxy::ProxyRuntime>,
     mesh: Arc<crate::runtime::mesh::MeshRuntime>,
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl DesktopExitPorts {
     fn from_runtime(runtime: &AppRuntime) -> Self {
         Self {
@@ -142,7 +142,7 @@ impl DesktopExitPorts {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[async_trait]
 impl ExitPorts for DesktopExitPorts {
     fn identity(&self) -> RuntimeIdentity {
@@ -193,7 +193,7 @@ impl ExitPorts for DesktopExitPorts {
 pub(crate) async fn prepare_desktop_exit(
     app: &tauri::AppHandle,
 ) -> Result<DesktopExitReady, String> {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let Some(runtime) = app.try_state::<AppRuntime>() else {
             crate::runtime::speedtest::begin_shutdown();
@@ -207,10 +207,10 @@ pub(crate) async fn prepare_desktop_exit(
         };
         state.prepare(&ports, EXIT_PREPARE_BUDGET).await
     }
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = app;
-        Err("桌面退出准备不适用于 Android".into())
+        Err("桌面退出准备不适用于移动端".into())
     }
 }
 
@@ -226,7 +226,7 @@ pub(crate) fn commit_desktop_exit(
     ready: DesktopExitReady,
     kind: ExitKind,
 ) -> Result<(), String> {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let runtime = app
             .try_state::<AppRuntime>()
@@ -248,10 +248,10 @@ pub(crate) fn commit_desktop_exit(
             }
         })
     }
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (app, ready, kind);
-        Err("桌面退出提交不适用于 Android".into())
+        Err("桌面退出提交不适用于移动端".into())
     }
 }
 
@@ -261,13 +261,21 @@ pub(crate) fn exit_is_committed(app: &tauri::AppHandle) -> bool {
 }
 
 pub(crate) async fn request_quit(app: &tauri::AppHandle) -> Result<(), String> {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let ready = prepare_desktop_exit(app).await?;
         commit_desktop_exit(app, ready, ExitKind::Quit)
     }
     #[cfg(target_os = "android")]
     {
+        app.state::<QuitState>().0.store(true, Ordering::SeqCst);
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(target_os = "ios")]
+    {
+        // The system-owned Packet Tunnel outlives the host. Quitting the host
+        // is neither an explicit VPN stop nor a resource cleanup receipt.
         app.state::<QuitState>().0.store(true, Ordering::SeqCst);
         app.exit(0);
         Ok(())
@@ -318,7 +326,7 @@ pub(crate) fn exit_requested_action(app: &tauri::AppHandle) -> ExitRequestedActi
 
 /// 最终 Exit 无法 veto。仅作同门 best effort；Unknown/超时/错误不写正常退出标记。
 pub(crate) fn final_exit_best_effort(app: &tauri::AppHandle) {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         if exit_is_committed(app) {
             return;
@@ -336,6 +344,11 @@ pub(crate) fn final_exit_best_effort(app: &tauri::AppHandle) {
     }
     #[cfg(target_os = "android")]
     run_android_exit_once(app);
+    #[cfg(target_os = "ios")]
+    {
+        let _ = app;
+        log::info!("iOS host exiting; preserve the running Packet Tunnel session");
+    }
 }
 
 /// Android 沿用原退出腿，本批桌面 admission gate 不改变移动端生命周期。

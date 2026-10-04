@@ -1,6 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "node scripts/fetch-dashboard.mjs && pnpm --dir ui build",
+    "beforeDevCommand": "node scripts/fetch-dashboard.mjs && pnpm --dir ui dev"
+  },
   "bundle": {
+    "iOS": {
+      "minimumSystemVersion": "17.0"
+    },
     "resources": [
       "../resources/data/",
       "../THIRD-PARTY-LICENSES.md",

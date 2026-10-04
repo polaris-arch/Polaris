@@ -11,16 +11,11 @@ repository.workspace = true
 # 覆盖（cargo#8519），Tauri 官方移动端模板因此一律加 `_lib` 后缀。本机是 Linux、这条撞不出来，
 # 故按官方既定做法取，不等真机上撞了再改（改名要动 `main.rs` 的调用点，届时代价更大）。
 #
-# crate-type 两项，一项都不多：
-#   · `cdylib` —— Android/iOS **唯一**的加载形态（系统 `System.loadLibrary` 装 `.so`，经 JNI
-#     调进 `#[tauri::mobile_entry_point]`）。没有它 `cargo build --target aarch64-linux-android`
-#     产出的只是 rlib，安卓侧无从加载。
-#   · `rlib` —— 桌面 `main.rs` 这个 bin 链接 lib 所需，也是 `cargo test` 编 lib 单测的形态。
-# [不加 `staticlib`：那是 iOS 的形态，本批不做 iOS。多一个 crate-type 就多一遍链接，
-#  而 `cargo build --workspace` 是本仓最慢的一条门]
+# 三种加载形态：Android 的 `.so`、iOS Xcode 链入的 `.a`、桌面 bin 与测试使用的 rlib。
+# 新增 staticlib 只增加构建产物；桌面装配与运行分支不变。
 [lib]
 name = "polaris_lib"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -127,6 +122,9 @@ rustix = { version = "1.1.4", features = ["fs"] }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.22.4", default-features = false }
 rustls-platform-verifier = { version = "0.7", default-features = false }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+tauri-plugin-polaris-ios = { path = "../crates/tauri-plugin-polaris-ios" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

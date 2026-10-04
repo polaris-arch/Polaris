@@ -191,7 +191,7 @@ impl Drop for HelperStartCompletion {
 /// 核是进程内 `.so`（libbox），Android 上根本没有核可执行文件，而起核腿的 `binary` 是一个
 /// `PathBuf`。占位串只出现在两处：起核日志的 `bin=` 字段（写明「核在进程内」比写一个假路径诚实），
 /// 以及被带出重试循环的那个元组。**真正会拿它去碰盘的内核自证在 Android 上整条不挂**（见调用点）。
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 pub(super) const IN_PROCESS_CORE_PLACEHOLDER: &str = "<in-process libbox>";
 
 /// 回环探针/更新入站凭据的用户名。**不是秘密**：sing-box 在连接日志里会打出认证用户名，
@@ -1566,9 +1566,9 @@ impl ProxyRuntime {
             // Android 上 `core_binary_for_start()` **恒 Err**：核是进程内 `.so`，盘上根本没有可执行
             // 文件（`resolve_core_binary` 按平台目录找 `sing-box`，Android 不在那张表里）。桌面三平台
             // 解析不到核仍是终态 Err —— 这里的分叉是**平台事实**，不是把桌面那条判据放宽。
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             let binary = std::path::PathBuf::from(IN_PROCESS_CORE_PLACEHOLDER);
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let binary = binary_res?;
             // C5：起核前快照 utun 基线（每尝试；macOS 时序 diff 锚点）——须在核创建 TS 内核接口**前**。
             let t_mesh_baseline = std::time::Instant::now();
@@ -1669,6 +1669,21 @@ impl ProxyRuntime {
                         return Err(StartError::coded(msg, error_code));
                     }
                 }
+            } else if cfg!(target_os = "ios") {
+                #[cfg(target_os = "ios")]
+                {
+                    // Once submitted, failure/cancellation cannot prove no external writer.
+                    // Retain the 554 main reservation; NE cleanup remains CleanupUnknown.
+                    if self.gate.generation() != my_gen {
+                        return Ok(self.status());
+                    }
+                    main_reservation.arm_external_start();
+                    if let Err(msg) = tauri_plugin_polaris_ios::start(&gate_config_json).await {
+                        self.set_error(&msg, code::STARTUP_FAILED);
+                        return Err(StartError::coded(msg, code::STARTUP_FAILED));
+                    }
+                }
+                0
             } else if via_helper {
                 // 经 helper 起（阻塞 IPC 挪 spawn_blocking；helper 核无本地 child 句柄）。
                 // 让位 → Ok(None) → 静默返回（接管方拥有已提交 pid + core_via_helper 标记，负责收口）。
@@ -1828,7 +1843,7 @@ impl ProxyRuntime {
             // Android 腿**不提交 pid**：核在本进程内，没有号码可记。写 `Some(0)` 会被
             // `status()`、诊断以及 stale 清扫的「受管 pid 排除表」当成一个真实号码引用
             // ——那等于给 0 号发一张免死金牌。
-            if !via_helper && !cfg!(target_os = "android") {
+            if !via_helper && !cfg!(any(target_os = "android", target_os = "ios")) {
                 let pid_commit_started = std::time::Instant::now();
                 if let Ok(mut g) = self.pid.lock() {
                     *g = Some(pid);
@@ -2262,9 +2277,9 @@ impl ProxyRuntime {
         // Android 上没有核二进制可对账（`binary` 是 `IN_PROCESS_CORE_PLACEHOLDER` 占位串，
         // 不指向任何文件）⇒ 整条自证不挂。挂了只会得到一条恒 `Unobservable` 的噪音，而
         // 「换核没生效」在 Android 上是换 aar 的事，不由这条链回答。
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         self.spawn_running_core_binary_attestation(pid, binary.clone(), my_gen);
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let _ = &binary;
         // TUN 起来了 → 后台查一次「别人设的系统代理」并提示（只读不动手，见下方方法文档）。
         // 这只是 advisory、不是起核成立条件；Windows 真机首次 `reg query` 曾因系统冷态/安全软件扫描
@@ -2920,6 +2935,15 @@ impl ProxyRuntime {
                     // 异步的，塞进来只能 `block_on`，而它本就跑在 async 上下文里 ⇒ 必 panic。
                     let alive = if cfg!(target_os = "android") {
                         super::android_bridge::core_started()
+                    } else if cfg!(target_os = "ios") {
+                        #[cfg(target_os = "ios")]
+                        {
+                            tauri_plugin_polaris_ios::started()
+                        }
+                        #[cfg(not(target_os = "ios"))]
+                        {
+                            false
+                        }
                     } else if via_helper {
                         helper_pid.is_some_and(pid_alive)
                     } else if let Ok(mut g) = child.lock() {
@@ -3613,7 +3637,7 @@ impl ProxyRuntime {
         peeled: &mut BTreeMap<String, InvalidNode>,
         runtime_bind_interfaces: &BTreeMap<String, String>,
     ) -> Result<GateOutcome, String> {
-        if !cfg!(target_os = "android") {
+        if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
         let started = std::time::Instant::now();
@@ -3639,7 +3663,11 @@ impl ProxyRuntime {
             // **Android 例外**：核是**进程内 `.so`**（libbox），压根没有二进制可解析 ⇒ `binary`
             // 恒 `None`。照旧早退的话闸门在 Android 上**永不运行**（不是「运行了但归因不到」），
             // 「坏节点被剥掉」这项能力就静默消失了。那条腿改问桥要 `Libbox.checkConfig`。
-            if binary.is_none() && !cfg!(target_os = "android") {
+            if cfg!(target_os = "ios") || (binary.is_none() && !cfg!(target_os = "android")) {
+                #[cfg(target_os = "ios")]
+                log::warn!(
+                    "iOS 配置预检查未执行：Libbox 只在 PacketTunnel 扩展中；构造检查的目录隔离与 CleanupUnknown 尚未满足独立检查后启动主核的条件。配置将在扩展实际启动时由内核检查。"
+                );
                 return Ok(GateOutcome::assemble(
                     gen_out, effective, json, peeled, checks_run, None,
                 ));
@@ -4049,31 +4077,10 @@ pub(super) fn is_valid_srs_file(path: &str) -> bool {
 /// 形态与 cronet 编不编进去**没有因果关系** —— linux 的核也是独立可执行文件却走动态库，macOS
 /// 同样是独立可执行文件却静态编入。用形态推是伪相关，第一个反例就静默判错。
 ///
-/// # `ios` 是**具名的 false**，不是兜底落进去的 false（2026-09-06）
-///
-/// 加 `Platform::Ios` 变体时逐处答题走到这里。答案是 `false`，与不写它时求值的结果相同 ——
-/// 所以必须写出来，否则没有人知道这个 false 是答过的还是漏掉的。
-///
-/// 依据：**本仓今天构不出任何 iOS 产物**，所以「那个核里有没有 cronet」今天没有事实可查；
-/// 而将来有了也不是白送的 —— iOS 的 cronet 是一份预编译静态库，链接面要另外接十几个 Apple
-/// framework，与 Android 那份「`build_libbox` 默认 sharedTags 就含 `with_naive_outbound`」
-/// 完全不同形。故在那件事真的做完并取到证之前，这里只能答 `false`。
-///
-/// ⚠️ **这个诚实的 false 带着一个已知的坏形态**：`cronet_available` 随之为 false ⇒
-/// `generate.rs` 的 `is_node_usable` 丢弃**全部** naive/H3 节点，而用户看到的是「节点无效」
-/// 而不是「本构建不含 naive」（下方 `cronet_available` 注释里记着的那两个真机 bug 是同一根因）。
-/// iOS 腿真正接上核之后，这一格必须连同归因提示一起重答；在那之前它由
-/// `runtime/proxy/tests/platform_contracts.rs` 的 `cronet_available_across_core_forms` 钉住
-/// （翻成 `true` 即红），确保它不会被当成「随便填的」而悄悄改掉。
-///
-/// **未验证**：上述 iOS 链接面结论来自上游构建脚本与 cronet 发布物的形态，本仓未实际构建过。
+/// iOS: the pinned six-patch source build verifies naive/cronet in device and simulator slices.
+/// Its static framework is linked only into the Packet Tunnel extension.
 pub(super) fn core_has_builtin_cronet(platform: &str) -> bool {
-    match platform {
-        "darwin" | "android" => true,
-        // 见上方 §`ios` 是具名的 false。
-        "ios" => false,
-        _ => false,
-    }
+    matches!(platform, "darwin" | "android" | "ios")
 }
 
 /// NaiveProxy 可用性判定（抽纯函数便于单测 + 变异验证）。`generate_deps` 的 `has_cronet` 经此。

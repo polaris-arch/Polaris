@@ -69,6 +69,7 @@ const classifier: Classifier = await import(
 const {
   classifyImpact,
   scopeOf,
+  REGISTRY_ROOTS,
   isScopeRegistered,
   ALL_PACKAGE_PLATFORMS,
   PACKAGE_IMPACT_SCOPES,
@@ -101,10 +102,9 @@ function scopeKeys(relDir: string, root = REPO_ROOT): string[] {
 function scopesOnDisk(): string[] {
   const srcTauri = scopeKeys('src-tauri').filter((key) => key !== 'src-tauri/src/');
   return [
-    ...scopeKeys('crates'),
+    ...REGISTRY_ROOTS.filter((root) => root !== 'src-tauri/').flatMap((root) => scopeKeys(root.slice(0, -1))),
     ...srcTauri,
     ...scopeKeys('src-tauri/src'),
-    ...scopeKeys('resources'),
   ].sort();
 }
 
@@ -164,6 +164,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       // resources/data/ 的 28 个 .srs 入库且进四个包（见分类器的 PACKAGE_IMPACT_SCOPES）；
       // 它掉出枚举面 = 整个 resources/ 登记根没被扫到，那正是 2026-08-30 前的 fail-open 形态。
       'resources/data/',
+      'vendor/swift-rs/',
     ]) {
       expect(onDisk, `枚举结果里没有 ${known} —— 枚举器的取材面漏了整棵树`).toContain(known);
     }
@@ -218,6 +219,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       ['src-tauri/src/__not_registered__/mod.rs', 'src-tauri/src/__not_registered__/'],
       ['src-tauri/__not_registered__.json', 'src-tauri/__not_registered__.json'],
       ['resources/__not_registered__/x.srs', 'resources/__not_registered__/'],
+      ['vendor/__not_registered__/src/lib.rs', 'vendor/__not_registered__/'],
     ]) {
       const result = classifyImpact([probe]);
       expect(scopeOf(probe), `scopeOf('${probe}') 归一结果与预期 scope 不一致`).toBe(scope);

@@ -1668,3 +1668,56 @@
 .h-exit-label, .h-exit-direct, .h-check-time { color: hsl(var(--fg-dim)); }
 .h-exit-address { font-family: var(--mono); overflow-wrap: anywhere; min-width: 0; }
 .h-check-time { font-size: .75rem; margin: 0 0 6px; text-align: end; }
+
+
+/* Preserve the full Dynamic Type wordmark; move status to the next line when
+ * the two labels no longer fit beside each other. */
+:root[data-mobile-os='ios'] .h-header {
+  flex-wrap: wrap;
+}
+
+:root[data-mobile-os='ios'] .h-brandline {
+  flex: none;
+  max-width: 100%;
+}
+
+:root[data-mobile-os='ios'] .h-wordmark {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+:root[data-mobile-os='ios'] .h-runchip {
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+}
+
+/* Let an empty chart grow with Dynamic Type; its message needs room between
+ * the two axis labels even when it wraps to more than one line. */
+:root[data-mobile-os='ios'] .h-plotwrap:has(> .h-empty) {
+  height: auto;
+  min-height: 110px;
+}
+
+:root[data-mobile-os='ios'] .h-plotwrap > .h-empty {
+  padding-block: 1.5em;
+  overflow-wrap: anywhere;
+}
+
+
+/* A colliding header action keeps its DOM and moves within its header's flow. */
+:root[data-mobile-os='ios'] .h-header-actions[data-ios-reserved-adjusted='row'] {
+  flex: 0 0 auto;
+  width: var(--ios-region-width);
+  margin-inline-start: 0;
+  margin-left: var(--ios-region-left);
+  margin-right: calc(100% - var(--ios-region-width) - var(--ios-region-left));
+  flex-direction: column;
+  align-items: stretch;
+  box-sizing: border-box;
+}
+:root[data-mobile-os='ios'] .h-header-actions[data-ios-reserved-adjusted='row'] .h-connect-action {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  min-width: var(--tap-min);
+}

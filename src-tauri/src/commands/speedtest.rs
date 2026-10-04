@@ -184,6 +184,30 @@ const CODE_IN_FLIGHT: &str = "SPEEDTEST_IN_FLIGHT";
 /// 走主核测速池，路径都不同）。渲染端对未知 code 走 `default` 直显本层文案，故新码零 UI 改动即可用。
 const CODE_CORE_STARTING: &str = "SPEEDTEST_CORE_STARTING";
 
+/// iOS can measure through the connected packet tunnel, but cannot spawn a separate test core.
+const CODE_REQUIRES_CONNECTION_ON_IOS: &str = "SPEEDTEST_REQUIRES_CONNECTION_ON_IOS";
+
+fn ios_speed_test_unavailable(
+    is_ios: bool,
+    running: bool,
+    starting: bool,
+) -> Option<ApiResponse<Value>> {
+    if !is_ios || running {
+        return None;
+    }
+    Some(if starting {
+        ApiResponse::err_with_code(
+            "代理内核正在启动，请等待连接完成后再测速",
+            CODE_CORE_STARTING,
+        )
+    } else {
+        ApiResponse::err_with_code(
+            "iOS 测速需要已连接的 Polaris VPN；请先连接后再测速",
+            CODE_REQUIRES_CONNECTION_ON_IOS,
+        )
+    })
+}
+
 /// 测速进程级单飞闸（审查 MED「前后端均无 busy/single-flight」的后端半）。
 ///
 /// 托盘浮层与主窗（首页 / 节点页）是**独立 JS 堆**，各自的「测速中」灰态只锁本窗按钮，拦不住跨窗口
@@ -994,6 +1018,13 @@ pub async fn server_speed_test(
     server_ids: Option<Vec<String>>,
 ) -> Result<ApiResponse<Value>, ()> {
     let status = state.proxy().status();
+    // A configured executable path does not grant iOS an independent core owner.
+    // Reject before taking the test slot, reading config, or resolving a binary.
+    if let Some(response) =
+        ios_speed_test_unavailable(cfg!(target_os = "ios"), status.running, status.starting)
+    {
+        return Ok(response);
+    }
     // 本机 http 代理入站（桌面 `mixed-in` / Android `probe-proxy-in`）的取址：本函数的回退腿用它测活跃出口。
     let local_proxy = state.proxy().local_http_proxy();
     // 核在跑却没有可用的本机 http 代理入站（分配失败的半态）→ 本层确实无从测：临时核腿在此形态下会被

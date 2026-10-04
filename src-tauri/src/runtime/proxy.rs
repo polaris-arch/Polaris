@@ -348,6 +348,8 @@ pub mod code {
     pub const SYSTEM_INTERFACE_UNSUPPORTED: &str = "SYSTEM_INTERFACE_UNSUPPORTED";
     /// 起核腿失败（就绪门判定核已死 / 就绪超时）——「启动失败」轴。
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
+    #[cfg(target_os = "ios")]
+    pub const IOS_SESSION_ACTIVE: &str = "IOS_SESSION_ACTIVE";
     /// 核**意外**退出且无法自愈（无可用配置重启）——「运行中崩了」轴。
     pub const PROCESS_EXITED: &str = "PROCESS_EXITED";
     /// 崩溃自愈达上限放弃（反复崩溃 / 自愈重启反复失败）——「运行中崩了」轴的终态。

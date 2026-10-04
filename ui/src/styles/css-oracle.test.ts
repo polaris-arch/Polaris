@@ -269,6 +269,7 @@ describe('⑤ R5-08：`@layer` 与构建期注入的 Tailwind', () => {
     expect(s.externals, '移动端模块图里多了/少了一个 npm 依赖').toEqual([
       '@tauri-apps/api/core',
       '@tauri-apps/api/event',
+      '@tauri-apps/plugin-os', // 2.4.0 exports only dist-js JS/types; package contains no CSS assets or style imports.
       'i18next',
       'react',
       'react-dom', // MobileSelect portal；不自带 CSS，样式仍由 mobile.css 提供。
