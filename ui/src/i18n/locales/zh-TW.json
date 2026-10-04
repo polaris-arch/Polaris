@@ -1573,6 +1573,7 @@
     "createTaskRecoveredHint": "訂閱新增在背景執行，應用程式重新啟動後會在這裡繼續顯示進度。"
   },
   "errors": {
+    "iosSessionActive": "系統中已有 Polaris VPN 工作階段，請先在 iOS 系統設定中停止該工作階段，再連線。",
     "operationFailed": "操作失敗，請稍後重試",
     "systemDnsTakeoverFailed": "Linux 系統 DNS 未能接入 Polaris。代理仍在執行，但網域解析可能失敗或繞過 DNS 規則；請檢查 Helper 與 systemd-resolved 後重新連線。",
     "outboundInterfaceUnavailable": "指定的出口網卡不存在或尚未啟用。為避免改走其他網卡，本次連線未套用；請重新選擇出口網卡。",
@@ -2342,6 +2343,8 @@
     "errUnknown": "操作失敗。"
   },
   "ts": {
+    "iosAccountActionsUnavailable": "iOS 暫不支援獨立登入工作階段、切換帳戶或登出。可儲存節點設定及 Auth Key；授權使用主 VPN 回傳的登入網址。",
+    "iosConfigurationSaved": "設定已儲存，尚未確認登入。請在首頁連線或重新連線主 VPN；儲存新 Auth Key 不會清除既有帳戶工作階段。",
     "acceptDefaultResolvers": "接受 tailnet 預設解析器",
     "acceptDefaultResolversHint": "額外接受 tailnet 下發的預設 DNS 解析器（split-DNS）。可選。",
     "acceptRoutes": "接受子網路由",

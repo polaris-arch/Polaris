@@ -52,7 +52,7 @@ const MACOS = Object.freeze(['macos-arm64', 'macos-x64']);
 const NO_LEG = Object.freeze([]);
 
 /**
- * fail-closed 的作用域根。这三棵树的内容全部编译进安装包、随包分发或参与打包契约，
+ * fail-closed 的作用域根。这些树的内容全部编译进安装包、随包分发或参与打包契约，
  * 且 scope 数量有限可枚举 —— 所以「没登记」在这里是错误，不是默认放行。
  *
  * `resources/` 是 2026-08-30 补上的第三条姊妹腿：`resources/data/` 的 28 个 `.srs` **入库**
@@ -61,7 +61,7 @@ const NO_LEG = Object.freeze([]);
  * 而此前分类器对 `resources/**` 输出 `kernel=false platforms=[] hasPackage=false`（实测），
  * 与改 `crates/`、改 `src-tauri/` 是同一个 fail-open。
  */
-export const REGISTRY_ROOTS = Object.freeze(['crates/', 'src-tauri/', 'resources/']);
+export const REGISTRY_ROOTS = Object.freeze(['crates/', 'src-tauri/', 'resources/', 'vendor/']);
 
 /**
  * scope 粒度：`crates/<name>/`、`src-tauri/<entry>`、`src-tauri/src/<entry>`。
@@ -74,6 +74,7 @@ const SCOPE_DEPTH = Object.freeze([
   // `resources/<子树>/`：data/ dashboard/ 与四个平台目录各自一个 scope；
   // 根下的散文件（.gitkeep / .fetch-stamp.json）按单文件 scope 归一。
   ['resources/', 2],
+  ['vendor/', 2],
 ]);
 
 /**
@@ -103,6 +104,11 @@ export function scopeOf(rawPath) {
  * 用来把「整棵树四平台」收窄成单腿。
  */
 export const PACKAGE_IMPACT_SCOPES = Object.freeze({
+  'vendor/swift-rs/': {
+    kernel: false,
+    platforms: ALL,
+    why: 'Cargo crates.io patch 使用的本地 Swift/Rust 桥源码；库及构建脚本可能改变桌面 Tauri 产物，须保留四平台打包门。',
+  },
   'crates/config-engine/': {
     kernel: true,
     platforms: NO_LEG,
@@ -321,6 +327,11 @@ const APP_LOGIC = (what) =>
  * value 是理由。在这里 = 「有人看过、判过」，不是「没人管过」。
  */
 export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
+  'crates/tauri-plugin-polaris-ios/':
+    'iOS 原生 VPN/viewport bridge；runtime 依赖及 Swift 构建均限 target_os=ios。当前桌面/Android包不链接它，'
+    + '无 iOS CI 发布腿；共享纯 Rust lifecycle 测试由 workspace test 覆盖，Apple目标另以实际Xcode构建验证。',
+  'src-tauri/Info.ios.plist':
+    'iOS scene/bundle 配置，Tauri 仅在 iOS 构建消费；当前桌面与 Android 包不读取。无 iOS CI 发布腿，实际Xcode归档另验。',
   'crates/core-supervisor/': APP_LOGIC('sing-box 进程 spawn / readiness / 崩溃自愈；核路径由调用方传入'),
   'crates/dns-race/': APP_LOGIC('节点域名解析竞速 sidecar（UDP server + DNS wire 编解码）'),
   'crates/helper-client/': APP_LOGIC(
@@ -371,9 +382,10 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
     + '（release-risk.yml 的条件是 has_package==true），判据由本机全量门承担。',
 
   'src-tauri/gen/':
-    '两棵子树、同一条结论「不影响桌面安装包」：`gen/schemas` 是 tauri-build 构建期重生成的 ACL/schema 产物，'
+    '平台生成子树不影响桌面安装包：`gen/schemas` 是 tauri-build 构建期重生成的 ACL/schema 产物，'
     + '不是包内资产（生成源 capabilities/ 与 permissions/ 已在影响表）；`gen/android` 是**入库的** Gradle 工程'
-    + '（49 个文件，.gitignore :41 起有承重注释），四条桌面腿一个字节都不读它。'
+    + '（入库工程），四条桌面腿一个字节都不读它；`gen/apple` 是 iOS 源码自编译的 Xcode 工程，'
+    + '同样不被桌面/Android腿读取，当前无 iOS CI 发布腿。'
     + '🔴 但 `gen/android/` **不是没人管**：它是 Android APK 腿的主要触发面，登记在 [`ANDROID_IMPACT_SCOPES`]，'
     + '改它会点亮 `android=true`。本条只说「不加桌面腿」，别据此推断「改它没有门」。',
   'src-tauri/tests/':

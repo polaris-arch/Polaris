@@ -1,0 +1,15 @@
+[package]
+name = "tauri-plugin-polaris-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "tauri-plugin-polaris-ios"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+tauri = { version = "2", default-features = false, features = ["wry"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["time", "rt"] }
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

@@ -866,6 +866,12 @@ pub async fn tailscale_login(
     server: Value,
     request: crate::runtime::tailscale_login_core::LoginRequest,
 ) -> Result<ApiResponse<Value>, ()> {
+    if cfg!(target_os = "ios") {
+        return Ok(ApiResponse::err_with_code(
+            "Independent Tailscale login is unavailable in the iOS packet tunnel",
+            "TAILSCALE_LOGIN_UNSUPPORTED_ON_IOS",
+        ));
+    }
     let Ok(requested) = serde_json::from_value::<ServerConfig>(server) else {
         return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node",
@@ -994,6 +1000,12 @@ pub async fn tailscale_login_cancel(
     server_id: String,
     attempt_id: String,
 ) -> Result<ApiResponse<()>, ()> {
+    if cfg!(target_os = "ios") {
+        return Ok(ApiResponse::err_with_code(
+            "Independent Tailscale login cancellation is unavailable in the iOS packet tunnel",
+            "TAILSCALE_LOGIN_UNSUPPORTED_ON_IOS",
+        ));
+    }
     Ok(
         match state
             .mesh()
@@ -1018,6 +1030,12 @@ pub async fn tailscale_logout(
     server_id: String,
     keep_attempt_id: Option<String>,
 ) -> Result<ApiResponse<Value>, ()> {
+    if cfg!(target_os = "ios") {
+        return Ok(ApiResponse::err_with_code(
+            "Tailscale state deletion is unavailable while iOS session ownership is unknown",
+            "TAILSCALE_LOGOUT_UNSUPPORTED_ON_IOS",
+        ));
+    }
     match state
         .mesh()
         .logout_tailscale_safely(

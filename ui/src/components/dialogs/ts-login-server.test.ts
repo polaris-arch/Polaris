@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { nextTsNodeName, planTsLoginSubmit, tsLoginMainCoreView, tsLoginFailureKey } from './ts-login-server';
+import { supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsLoginMainCoreView, tsLoginFailureKey } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -215,4 +215,12 @@ describe('移动登录：保存后的重试与安全授权状态', () => {
     expect(tsLoginFailureKey(new Error('tskey-secret https://private /data/user'))).toBe('ts.loginAttemptFailed');
     expect(tsLoginFailureKey({ code: 'https://private' })).toBe('ts.loginAttemptFailed');
   });
+});
+
+// iOS owns only the main VPN; Android and desktop retain their account sessions.
+it.each(['android', 'windows', 'macos', undefined])('keeps account actions on %s', (os) => {
+  expect(supportsTsAccountActions(os)).toBe(true);
+});
+it('guards standalone iOS account actions', () => {
+  expect(supportsTsAccountActions('ios')).toBe(false);
 });

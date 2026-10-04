@@ -876,3 +876,29 @@
   border-radius: 2px;
   background: currentcolor;
 }
+
+
+/* Keep the iOS reading order stable as the available space changes. An active
+ * inline control stays visible until focus leaves; filtering remains reachable
+ * through the same sheet entry at every size. Android retains its existing flow.
+ */
+:root[data-mobile-os='ios'] .mn-list {
+  column-count: 1;
+}
+
+:root[data-mobile-os='ios'] .mn-until-expanded,
+:root[data-mobile-os='ios'] .mn-toolbar .mn-select:focus-within,
+:root[data-mobile-os='ios'] .mn-toolbar .mn-act:focus-within {
+  display: inline-block;
+}
+
+/* The layer is bounded by m-scroll, which already excludes the shell's top and
+ * bottom safe areas. Do not subtract them again. The panel needs its own side
+ * insets; border-box keeps its padding inside the percentage height cap.
+ */
+:root[data-mobile-os='ios'] .mn-sheet {
+  padding-left: calc(var(--card-padding) + var(--safe-l));
+  padding-right: calc(var(--card-padding) + var(--safe-r));
+  padding-bottom: var(--card-padding);
+  box-sizing: border-box;
+}

@@ -26,6 +26,7 @@ import '/src/mobile/screens/rules/rules-redesign.css';
 import '/src/mobile/connections/connections-redesign.css';
 await i18nReady;
 const mode = new URLSearchParams(location.search).get('mode');
+if (mode?.startsWith('ios')) document.documentElement.dataset.mobileOs = 'ios';
 const listeners = new Map();
 const on = name => fn => { const set = listeners.get(name) || new Set(); listeners.set(name, set); set.add(fn); return () => set.delete(fn); };
 const bus = (domain, names) => { for (const name of names) api[domain][name] = on(name); };
@@ -48,7 +49,7 @@ api.server.tailscaleStateExists = async () => {
   if (mode === 'state-read-fail') throw Error('state unavailable');
   return { 'ts-1': mode === 'state-true' };
 };
-const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode };
+const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
   if (test.failProgress) throw new Error('RECEIPT_READ_FAILED');
@@ -64,6 +65,7 @@ api.server.tailscaleLoginPrepare = async () => {
   test.prepares++;
   if (mode === 'prepare') await new Promise(resolve => { test.releasePrepare = resolve; });
 };
+api.server.tailscaleLogout = async () => { test.logouts++; };
 api.server.tailscaleLoginCancel = async (serverId, attemptId) => { test.cancels.push([serverId,attemptId]); };
 api.server.tailscaleLogin = async () => {
   test.starts++;
@@ -117,6 +119,32 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
     browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
+
+  it('iOS saves Auth Key without prepare, login, logout or cancellation and keeps the main VPN URL reachable', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      page.setDefaultTimeout(4000);
+      await page.goto(`${origin}/__ts-login?mode=ios`);
+      await page.getByText('iOS 暂不支持独立登录会话', { exact: false }).waitFor();
+      expect(await page.getByText('授权后本机自动加入 tailnet', { exact: false }).count()).toBe(0);
+      await page.evaluate(() => (window as any).__tsTest.emit('onTailscaleAuth', {
+        serverId: 'ts-1', nodeName: 'n', url: 'https://login.example/main', transient: false,
+      }));
+      await page.getByText('https://login.example/main', { exact: true }).waitFor();
+      expect(await page.evaluate(() => (window as any).__tsTest.opens)).toEqual(['https://login.example/main']);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.locator('#mts-authkey').fill('synthetic-test-key');
+      await page.locator('.m-form-foot .primary').click();
+      await page.getByText('配置已保存，尚未确认登录', { exact: false }).waitFor();
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { saves: t.saves, starts: t.starts, prepares: t.prepares, logouts: t.logouts, cancels: t.cancels.length };
+      })).toEqual({ saves: 1, starts: 0, prepares: 0, logouts: 0, cancels: 0 });
+      await page.locator('.m-form-head .m-form-x').click();
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels.length)).toBe(0);
+    } finally { await page.close(); }
+  }, 30_000);
 
   it('URL arrived → close revokes attempt before native cleanup; late AUTH and progress cannot reopen', async () => {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });

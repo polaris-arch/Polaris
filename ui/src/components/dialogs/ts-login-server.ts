@@ -14,6 +14,12 @@
 import type { ServerConfig } from '@/contracts/types';
 import type { TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
 
+/** iOS has the main Packet Tunnel only, with no standalone account session owner. */
+export function supportsTsAccountActions(mobileOs = typeof document === 'undefined'
+  ? undefined : document.documentElement.dataset.mobileOs): boolean {
+  return mobileOs !== 'ios';
+}
+
 export type TsLoginMode = 'browser' | 'authkey';
 
 /**

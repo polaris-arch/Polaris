@@ -26,6 +26,7 @@ vi.mock('../ipc', () => ({
 
 import { useAppStore } from './app-store';
 import { withConfigWriteLock } from '../lib/config-write-lock';
+import * as stagedConfig from './staged-config-store';
 
 /** 起核前的形态：config 里存着旧的选中值（这里用直连哨兵 = 真机命中的那一版）。 */
 function seed(oldSelected: string) {
@@ -152,4 +153,24 @@ describe('app-store switchServer', () => {
     expect(s.selectedServerId).toBe('n-c');
     expect(s.config?.selectedServerId).toBe('n-c');
   });
+});
+
+// iOS needs its saved-config projection before reporting the canonical receipt.
+it.each(['ios', 'android'])('only %s decides whether switch waits for hydration', async (mobileOs) => {
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const hydration = vi.spyOn(stagedConfig, 'hydrateStagedConfig').mockReturnValue(pending);
+  vi.stubGlobal('document', { documentElement: { dataset: { mobileOs } } });
+  let settled = false;
+  try {
+    const switching = useAppStore.getState().switchServer('n-final').then(() => { settled = true; });
+    await vi.waitFor(() => expect(hydration).toHaveBeenCalled());
+    expect(settled).toBe(mobileOs !== 'ios');
+    release();
+    await switching;
+  } finally {
+    release();
+    hydration.mockRestore();
+    vi.unstubAllGlobals();
+  }
 });

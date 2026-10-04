@@ -106,7 +106,7 @@ pub fn window_is_maximized(window: WebviewWindow) -> ApiResponse<bool> {
 /// 准备失败不置 QuitState/RestartState；本地 custody 留在原进程，用户可重试。
 #[tauri::command]
 pub async fn app_restart(app: AppHandle) -> ApiResponse<()> {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let ready = match crate::exit_lifecycle::prepare_desktop_exit(&app).await {
             Ok(ready) => ready,
@@ -132,6 +132,19 @@ pub async fn app_restart(app: AppHandle) -> ApiResponse<()> {
         app.state::<crate::RestartState>()
             .0
             .store(true, Ordering::SeqCst);
+        app.request_restart();
+        ok_void()
+    }
+    #[cfg(target_os = "ios")]
+    {
+        // Restart only the host; the system-owned NE session is preserved by
+        // the iOS ExitRequested/Exit dispatch and is reconciled on cold start.
+        app.state::<crate::QuitState>()
+            .0
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        app.state::<crate::RestartState>()
+            .0
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         app.request_restart();
         ok_void()
     }

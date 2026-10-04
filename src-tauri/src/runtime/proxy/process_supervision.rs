@@ -593,6 +593,12 @@ impl ProxyRuntime {
             let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
             return booking.finish_with_gate(result, &self.mesh, ts_gate);
         }
+        // NE completion does not attest that Go/TS resources have no owner.
+        // Preserve any central TS claim; do not infer it from the empty Child slot.
+        #[cfg(target_os = "ios")]
+        {
+            return tauri_plugin_polaris_ios::stop().await;
+        }
         if self.core_via_helper.load(Ordering::SeqCst) {
             return self
                 .kill_core_via_helper_with_main(
@@ -775,6 +781,10 @@ impl ProxyRuntime {
             let booking = self.begin_android_stop_booking(false)?;
             let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
             return booking.finish_without_main(result);
+        }
+        #[cfg(target_os = "ios")]
+        {
+            return tauri_plugin_polaris_ios::stop().await;
         }
         // C6-5：经 helper 起的核 → 经 helper stop（对称）。daemon 摘其受管 child → SIGTERM→宽限→SIGKILL
         // 收割（app 无本地 child 句柄）。阻塞 IPC 挪出 async worker。
@@ -1019,6 +1029,20 @@ impl ProxyRuntime {
         if cfg!(target_os = "android") {
             return self.stop_system_started_core().await;
         }
+        #[cfg(target_os = "ios")]
+        {
+            let session = tauri_plugin_polaris_ios::status()
+                .await
+                .map_err(|error| StartError::coded(error, super::code::STARTUP_FAILED))?;
+            let error_code = if session.active {
+                super::code::IOS_SESSION_ACTIVE
+            } else {
+                super::code::STARTUP_FAILED
+            };
+            return session
+                .require_idle()
+                .map_err(|error| StartError::coded(error, error_code));
+        }
         let binary = match resolve_core_binary() {
             Ok(b) => b,
             Err(e) => {
@@ -1060,6 +1084,40 @@ impl ProxyRuntime {
             return Ok(());
         }
         self.escalate_root_orphans(&survivors).await
+    }
+
+    /// A cold host has no running configuration to adopt. Preserve the NE session
+    /// and expose its state while keeping the host runtime's configuration unclaimed.
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn reconcile_ios_session_on_startup(&self) {
+        let generation = self.gate.generation();
+        let observed = tauri_plugin_polaris_ios::status().await;
+        if generation != self.gate.generation() {
+            return; // a user start/stop superseded this cold-host observation
+        }
+        match observed {
+            Ok(session) => {
+                log::info!(
+                    "iOS NE 对账：status={} active={} ownership={} runtimeStopped={:?} cleanupEvidence={}",
+                    session.status, session.active, session.ownership,
+                    session.runtime_stopped, session.cleanup_evidence
+                );
+                if session.active {
+                    self.set_nonfatal_error(
+                        "系统仍有 Polaris iOS VPN 会话；请先在系统设置中停止现有 VPN，再返回连接。",
+                        super::code::IOS_SESSION_ACTIVE,
+                    );
+                } else if let Err(error) = session.require_idle() {
+                    self.set_nonfatal_error(&error, super::code::STARTUP_FAILED);
+                }
+            }
+            Err(error) => {
+                self.set_nonfatal_error(
+                    &format!("无法读取 iOS 系统 VPN 状态：{error}。请检查系统设置后再连接。"),
+                    super::code::STARTUP_FAILED,
+                );
+            }
+        }
     }
 
     /// [`Self::cleanup_stale_cores`] 的 Android 腿。

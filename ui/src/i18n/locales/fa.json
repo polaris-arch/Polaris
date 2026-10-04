@@ -1595,6 +1595,7 @@
     "createTaskRecoveredHint": "افزودن اشتراک در پس‌زمینه انجام می‌شود؛ پس از راه‌اندازی مجدد برنامه، پیشرفت آن دوباره اینجا نمایش داده می‌شود."
   },
   "errors": {
+    "iosSessionActive": "A Polaris VPN session is already active in the system. Stop that session in iOS Settings before connecting.",
     "operationFailed": "عملیات ناموفق بود، لطفاً بعداً دوباره تلاش کنید",
     "systemDnsTakeoverFailed": "DNS سیستمی لینوکس به Polaris متصل نشد. پراکسی همچنان در حال اجراست، اما DNS ممکن است ناموفق شود یا قواعد DNS را دور بزند. Helper و systemd-resolved را بررسی و دوباره متصل شوید.",
     "outboundInterfaceUnavailable": "رابط شبکهٔ خروجی انتخاب‌شده وجود ندارد یا فعال نیست. برای جلوگیری از انتقال ترافیک به رابطی دیگر، این اتصال اعمال نشد؛ یک رابط در دسترس انتخاب کنید.",
@@ -2017,6 +2018,8 @@
     "errUnknown": "عملیات ناموفق بود."
   },
   "ts": {
+    "iosAccountActionsUnavailable": "iOS does not yet support separate login sessions, switching accounts, or logout. You can save node settings and an Auth Key; authorization uses a login URL returned by the main VPN.",
+    "iosConfigurationSaved": "Settings saved; login has not been confirmed. Connect or reconnect the main VPN from Home. Saving a new Auth Key does not clear an existing account session.",
     "acceptRoutes": "پذیرش مسیرهای زیرشبکه",
     "acceptRoutesHint": "مسیرهای زیرشبکهٔ اعلام‌شده توسط همتایان tailnet را بپذیر. با واردکردن زیرشبکه‌های قابل مسیریابی از این گره، خودکار فعال می‌شود.",
     "acceptDefaultResolvers": "پذیرش حل‌کننده‌های پیش‌فرض tailnet",

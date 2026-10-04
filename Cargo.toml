@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = ["src-tauri", "crates/*"]
+exclude = ["vendor/swift-rs"]
 
 [workspace.package]
 version = "1.0.0"
@@ -22,6 +23,12 @@ regex = "1"
 async-trait = "0.1"
 # futures = async 工具：unlock 并发齐射 6 checker（join_all），无依赖则需手搓 VecFuture。
 futures = "0.3"
+
+# SwiftPM in Xcode 27 needs the package target triple in addition to swiftc's
+# target. The local swift-rs change is gated to iOS; macOS builds keep the
+# upstream command line. Remove this patch when upstream swift-rs includes it.
+[patch.crates-io]
+swift-rs = { path = "vendor/swift-rs" }
 
 # ════════════════════════════════════════════════════════════════════════════
 # 发行构型

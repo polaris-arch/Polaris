@@ -8,6 +8,49 @@ fn ids(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
+#[test]
+fn ios_speed_test_admission_preserves_connected_and_other_platforms() {
+    for starting in [false, true] {
+        assert!(ios_speed_test_unavailable(true, true, starting).is_none());
+        for running in [false, true] {
+            assert!(ios_speed_test_unavailable(false, running, starting).is_none());
+        }
+    }
+    let disconnected = ios_speed_test_unavailable(true, false, false).unwrap();
+    assert!(!disconnected.success);
+    assert!(disconnected.data.is_none());
+    assert_eq!(
+        disconnected.code.as_deref(),
+        Some("SPEEDTEST_REQUIRES_CONNECTION_ON_IOS")
+    );
+    let starting = ios_speed_test_unavailable(true, false, true).unwrap();
+    assert!(!starting.success);
+    assert_eq!(starting.code.as_deref(), Some("SPEEDTEST_CORE_STARTING"));
+}
+
+#[test]
+fn ios_speed_test_admission_precedes_independent_core_side_effects() {
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &crate_code("commands/speedtest.rs"),
+        "pub async fn server_speed_test(",
+    );
+    let guard = body
+        .find("ios_speed_test_unavailable(cfg!(target_os = \"ios\"), status.running, status.starting)")
+        .expect("the production entry must use iOS admission with its actual status");
+    let rejection = guard + body[guard..].find("return Ok(response);").unwrap();
+    for action in [
+        "state.proxy().local_http_proxy()",
+        "SpeedTestGuard::acquire()",
+        "state.config().current()",
+        "run_temp_core_speed_test(",
+    ] {
+        assert!(
+            rejection < body.find(action).unwrap(),
+            "guard must precede {action}"
+        );
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // plan_speed_test：本波裁定。每条测都盯住「静默返回 + 前端卡死」这个根因的一个面。
 // ══════════════════════════════════════════════════════════════════════════

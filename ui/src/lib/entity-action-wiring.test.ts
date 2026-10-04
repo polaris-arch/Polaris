@@ -295,16 +295,16 @@ const SITES: readonly ActionSite[] = [
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
     callee: 'api.server.add',
-    count: 1,
+    count: 2,
     route: 'no-staged-only-id',
-    why: '不传实体 id：仅保存 planTsLoginSubmit 新建的节点；effective 集合只用于名称候选',
+    why: '两处都不传实体 id：iOS 仅保存配置腿与 transient 登录 save 腿都只保存同一 planTsLoginSubmit 新建的节点；effective 集合只用于名称候选',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
     callee: 'api.server.update',
-    count: 1,
+    count: 2,
     route: 'no-staged-only-id',
-    why: '仅取磁盘镜像或本次新建的 id：既有节点从 servers.find(serverId) 取得',
+    why: '两处仅取磁盘镜像或本次新建的 id：iOS 仅保存配置腿与 transient 登录 save 腿共用提交计划；既有节点从 servers.find(serverId) 取得',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',

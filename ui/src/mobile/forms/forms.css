@@ -573,3 +573,154 @@
   display: flex;
   gap: var(--sp-2);
 }
+
+
+/* Bound the custom iOS sheet to the actual WebView safe content height, as well
+ * as its camera-side insets. The panel's percentage cap uses this padded layer.
+ * This does not substitute for fold division/occlusion reserved regions.
+ */
+:root[data-mobile-os='ios'] .m-form-layer {
+  top: var(--ios-form-viewport-top, 0px);
+  bottom: auto;
+  height: var(--ios-form-viewport-height, 100%);
+  /* Insets and keyboard height share the physical WebView origin. */
+  --ios-form-safe-top: calc(var(--safe-t) / var(--ios-form-visual-scale, 1));
+  --ios-form-safe-bottom: max(0px, calc(var(--safe-b) / var(--ios-form-visual-scale, 1) - var(--ios-form-viewport-bottom-gap, 0px)));
+  padding-top: var(--ios-form-safe-top);
+  padding-bottom: var(--ios-form-safe-bottom);
+  box-sizing: border-box;
+  container: ios-form / size;
+}
+
+:root[data-mobile-os='ios'] .m-form-panel {
+  padding-left: calc(var(--page-inset) + var(--safe-l) / var(--ios-form-visual-scale, 1));
+  padding-right: calc(var(--page-inset) + var(--safe-r) / var(--ios-form-visual-scale, 1));
+  box-sizing: border-box;
+}
+
+/* The same panel and draft remain mounted. Its own free region can be smaller
+ * than the full keyboard layer, so short-panel behavior follows that region. */
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-adjusted] {
+  width: var(--ios-region-width);
+  max-height: var(--ios-region-height);
+  margin-left: var(--ios-region-left);
+  margin-bottom: var(--ios-region-bottom);
+  align-self: var(--ios-region-align, start);
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-adjusted] .m-form-btn {
+  min-width: var(--tap-min);
+  overflow-wrap: anywhere;
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-adjusted] .m-form-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] {
+  height: 100%;
+  padding-top: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-grip { display: none; }
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-head {
+  position: static;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-body {
+  flex: none;
+  min-height: var(--tap-min);
+  overflow-y: visible;
+  padding: var(--sp-1) 0;
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-foot {
+  min-height: var(--tap-min);
+  padding-top: 0;
+  padding-bottom: 0;
+  border-top: 0;
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-btn { min-height: var(--tap-min); }
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] textarea {
+  min-height: var(--tap-min);
+  max-height: max(var(--tap-min), calc(var(--ios-region-height) - var(--sp-2)));
+  overflow-y: auto;
+}
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-tiny] .m-form-foot,
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short]:has(textarea:focus) .m-form-foot {
+  position: static;
+}
+
+:root[data-mobile-os='ios'] .m-form-foot {
+  /* The layer already reserves the bottom inset. */
+  padding-bottom: var(--sp-2);
+}
+
+/* Normal fixed chrome (~142px) plus a 48px field and body padding requires
+ * ~233px with the 92% cap. Below 15em, scroll the same panel so its header can
+ * leave view while the field and 48px footer remain accessible above a keyboard.
+ */
+@container ios-form (max-height: 15em) {
+  :root[data-mobile-os='ios'] .m-form-panel {
+    height: 100%;
+    max-height: 100%;
+    padding-top: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  :root[data-mobile-os='ios'] .m-form-grip {
+    display: none;
+  }
+
+  :root[data-mobile-os='ios'] .m-form-head {
+    /* Shared SheetHeading is sticky on 554; the short panel must scroll it out. */
+    position: static;
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
+
+  :root[data-mobile-os='ios'] .m-form-body {
+    flex: none;
+    min-height: var(--tap-min);
+    overflow-y: visible;
+    padding: var(--sp-1) 0;
+  }
+
+  :root[data-mobile-os='ios'] .m-form-foot {
+    min-height: var(--tap-min);
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top: 0;
+  }
+
+  :root[data-mobile-os='ios'] .m-form-btn { min-height: var(--tap-min); }
+
+  :root[data-mobile-os='ios'] .m-form-panel:has(textarea:focus) .m-form-foot {
+    position: static;
+  }
+
+  :root[data-mobile-os='ios'] .m-form-panel textarea {
+    min-height: var(--tap-min);
+    max-height: max(var(--tap-min), calc(var(--ios-form-viewport-height, 100%) - var(--ios-form-safe-top) - var(--ios-form-safe-bottom) - var(--sp-2)));
+    overflow-y: auto;
+  }
+}
+
+/* Below two 48px targets plus 8px body padding, a field and pinned footer cannot
+ * both fit. Keep controls in the panel's flow instead of covering the field.
+ */
+@container ios-form (max-height: 6.5em) {
+  :root[data-mobile-os='ios'] .m-form-foot {
+    position: static;
+  }
+}
+
+/* The iOS entry does not load Tailwind's desktop border-box reset. */
+:root[data-mobile-os="ios"] .m-form-input,
+:root[data-mobile-os="ios"] .m-form-select,
+:root[data-mobile-os="ios"] .m-form-area {
+  box-sizing: border-box;
+}
+
+
+:root[data-mobile-os='ios'] .m-form-layer { left: 0; right: 0; width: 100%; padding-left: 0; padding-right: 0; justify-content: flex-end; }

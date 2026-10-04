@@ -281,6 +281,12 @@ impl ProxyRuntime {
         &self,
         gate: &tokio::sync::MutexGuard<'_, ()>,
     ) {
+        if cfg!(target_os = "ios") {
+            // NE disconnection and host running=false do not prove no Go resource owner.
+            // Keep the durable deletion journal until iOS has an admitted cleanup contract.
+            log::debug!("iOS deferred config deletions retained: CleanupUnknown");
+            return;
+        }
         let config_dir = self.config.dir().to_path_buf();
         let result = self
             .config

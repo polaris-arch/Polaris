@@ -540,6 +540,11 @@ pub async fn kernel_probe_outbound(
     if let Err(e) = validate_probe_outbound(&outbound) {
         return Ok(ApiResponse::ok(json!({ "ok": false, "error": e })));
     }
+    if cfg!(target_os = "ios") {
+        // Libbox belongs to the extension. Independent construction checks have
+        // no directory isolation or cleanup ownership proof, even with a binary override.
+        return Ok(ApiResponse::ok(probe_verdict(ProbeCheck::Indeterminate)));
+    }
     let cfg = build_probe_config(&outbound, is_endpoint.unwrap_or(false));
 
     // Android：核在本进程内（libbox），下面的 `resolve_core_binary` 在那里恒 Err ⇒ 这颗按钮会恒报

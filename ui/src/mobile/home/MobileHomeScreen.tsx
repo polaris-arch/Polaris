@@ -90,7 +90,7 @@ import { deriveTakeoverConnState } from '@/components/screens/home/connection-st
 import { useConfig } from '@/components/screens/settings/use-config';
 import type { ServiceId } from '@/contracts/unlock-detection';
 import { UNLOCK_SERVICES, unlockBadgeSrc } from './unlock-services';
-import { createRunWrite } from './write-errors';
+import { createRunWrite, writeErrorsFromProxyStatus } from './write-errors';
 import { EMPTY_TRAFFIC_BUFFER, pushTotals, type TrafficBuffer } from './traffic-buffer';
 import {
   applyDetail,
@@ -701,7 +701,7 @@ export function MobileHomeScreen(): ReactElement {
   return (
     <HomeScreenView
       t={t}
-      writeErrors={writeErrors}
+      writeErrors={writeErrorsFromProxyStatus(writeErrors, proxyStatus, t)}
       core={core}
       connState={connState}
       node={node}

@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
 import {
   TS_LOGIN_TIMEOUT_MS,
+  supportsTsAccountActions,
   executeTsLogin,
   nextTsNodeName,
   planTsLoginSubmit,
@@ -36,6 +37,7 @@ export function TsLoginPanel({
   serverId?: string;
 }): ReactElement {
   const { t } = useTranslation();
+  const accountActionsSupported = supportsTsAccountActions();
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -71,7 +73,7 @@ export function TsLoginPanel({
   const [errControl, setErrControl] = useState<string | null>(null);
   /* 该节点是否已有登录 state。切 auth_key 时必须先清掉它 —— tsnet 手上只要有有效 node key
      就不会去用 `auth_key`，于是「填了新 key、提交成功、身份一动不动」。 */
-  const [hasState, setHasState] = useState<boolean | null>(existingTs ? null : false);
+  const [hasState, setHasState] = useState<boolean | null>(accountActionsSupported && existingTs ? null : false);
   const [submitting, setSubmitting] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | undefined>();
@@ -96,6 +98,7 @@ export function TsLoginPanel({
 
   /* 首次查询只驱动旧会话提示；提交 Auth Key 前会重新读取，读取失败中断，不操作旧会话。 */
   useEffect(() => {
+    if (!accountActionsSupported) return;
     const id = savedServer?.id ?? existingTs?.id;
     if (!id) {
       setHasState(false);
@@ -118,13 +121,15 @@ export function TsLoginPanel({
 
   // 每次提交先清该 id 的 URL；此处只消费提交后到达的 URL，不读历史登录态。
   const receivedUrl = useAppStore((s) =>
-    pendingServerId === null ? null : (s.tailscaleAuthUrls[pendingServerId] ?? null),
+    pendingServerId === null ? (!accountActionsSupported
+      ? s.tailscaleAuthUrls[savedServer?.id ?? existingTs?.id ?? ''] ?? null : null)
+      : (s.tailscaleAuthUrls[pendingServerId] ?? null),
   );
   const mainView = pending?.source === 'main' && progress?.phase === 'mainCore' && !progress.reason
     ? tsLoginMainCoreView(pending.serverId, mainSnapshot, receivedUrl)
     : null;
   const authUrl = validatedTailscaleAuthUrl(mainView?.authUrl ?? (
-    progress?.phase === 'awaitingAuth' ? progress.url : null
+    !accountActionsSupported ? receivedUrl : progress?.phase === 'awaitingAuth' ? progress.url : null
   ));
 
   // Native progress can fail after start has handed off; that path has no pending submit
@@ -367,13 +372,22 @@ export function TsLoginPanel({
     setNotice(undefined);
     let persisted = false;
     try {
-      if (!await discardPendingLogin()) return;
+      if (accountActionsSupported && !await discardPendingLogin()) return;
       const { server, persist } = planTsLoginSubmit({
         // The fresh state query occurs after prepare and before save. This preview flag does
         // not decide logout; executeTsLogin consumes only the fresh result below.
         existing: submissionBase, name: submittedName, mode, authKey, controlUrl, hasState: false,
         mintId: () => crypto.randomUUID(),
       });
+      if (!accountActionsSupported) {
+        if (persist === 'add') await api.server.add(server);
+        else if (persist === 'update') await api.server.update(server);
+        setSavedServer(server);
+        await loadConfig(true);
+        if (editRevisionRef.current === submissionRevision) setDirty(false);
+        setNotice({ tone: 'info', text: t('ts.iosConfigurationSaved') });
+        return;
+      }
       persisted = persist === 'none';
       const request: PendingLogin = { serverId: server.id, attemptId: crypto.randomUUID(), source: 'transient', persisted };
       pendingRef.current = request;
@@ -475,7 +489,7 @@ export function TsLoginPanel({
       // Validation above has explicit inline errors. Unexpected IPC failures only expose a
       // stable localized stage, never raw URLs, auth keys, or filesystem paths.
       console.error('[mobile-ts-login] unexpected UI failure');
-      setNotice({ tone: 'err', text: t('ts.loginAttemptFailed') });
+      setNotice({ tone: 'err', text: t(accountActionsSupported ? 'ts.loginAttemptFailed' : 'common.saveFailed') });
     } finally {
       if (hasInstance(instanceId)) setSubmitting(false);
     }
@@ -487,13 +501,14 @@ export function TsLoginPanel({
       onRequestClose={requestClose}
       closeLabel={t('common.close')}
       cancelLabel={t('common.cancel')}
-      submitLabel={mode === 'browser' ? t('ts.openLogin') : t('ts.signIn')}
+      submitLabel={!accountActionsSupported ? t('common.save') : mode === 'browser' ? t('ts.openLogin') : t('ts.signIn')}
       submitDisabled={submitting}
       onSubmit={() => void submit()}
       notice={progressReadFailedAttempt === pending?.attemptId && progress
         && loginAttemptActive(progress.phase)
         ? { tone: 'err', text: t('ts.loginProgressReadFailed') } : notice}
     >
+      {!accountActionsSupported && <p className="m-form-hint">{t('ts.iosAccountActionsUnavailable')}</p>}
       <div className="m-form-row">
         <label className="m-form-label" htmlFor="mts-name">
           {t('ts.nodeName')}<span className="m-form-req" aria-hidden>*</span>
@@ -646,7 +661,7 @@ export function TsLoginPanel({
           ? mainView.state === 'needs-login' ? 'ts.loginMainCoreAwaiting' : 'ts.loginMainCoreUnknown'
           : 'ts.loginMainCoreUnknown')}</p>
       ) : (
-        <p className="m-form-hint">{t('ts.browserHint')}</p>
+        accountActionsSupported && <p className="m-form-hint">{t('ts.browserHint')}</p>
       ))}
     </FormSheet>
   );

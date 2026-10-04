@@ -1573,6 +1573,7 @@
     "createTaskRecoveredHint": "订阅添加在后台执行，应用重启后会在这里继续显示进度。"
   },
   "errors": {
+    "iosSessionActive": "系统中已有 Polaris VPN 会话，请先在 iOS 系统设置中停止该会话，再连接。",
     "operationFailed": "操作失败，请稍后重试",
     "systemDnsTakeoverFailed": "Linux 系统 DNS 未能接入 Polaris。代理仍在运行，但域名解析可能失败或绕过 DNS 规则；请检查 Helper 与 systemd-resolved 后重连。",
     "outboundInterfaceUnavailable": "指定的出口网卡不存在或尚未启用。为避免改走其他网卡，本次连接未应用；请重新选择出口网卡。",
@@ -2342,6 +2343,8 @@
     "errUnknown": "操作失败。"
   },
   "ts": {
+    "iosAccountActionsUnavailable": "iOS 暂不支持独立登录会话、切换账户或退出登录。可保存节点配置和 Auth Key；授权使用主 VPN 返回的登录地址。",
+    "iosConfigurationSaved": "配置已保存，尚未确认登录。请在首页连接或重新连接主 VPN；保存新 Auth Key 不会清除已有账户会话。",
     "acceptDefaultResolvers": "接受 tailnet 默认解析器",
     "acceptDefaultResolversHint": "额外接受 tailnet 下发的默认 DNS 解析器（split-DNS）。可选。",
     "acceptRoutes": "接受子网路由",

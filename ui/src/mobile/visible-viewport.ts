@@ -4,6 +4,7 @@ const PROPERTIES = ['--m-vv-height', '--m-vv-width', '--m-vv-top', '--m-vv-left'
 
 /** IME can resize only the visual viewport. Publish geometry once, without touching focus or state. */
 export function installMobileVisibleViewport(win: Window, root: HTMLElement): () => void {
+  if (root.dataset?.mobileOs === 'ios') return () => {};
   const viewport = win.visualViewport;
   if (!viewport) return () => undefined;
   const previous = PROPERTIES.map((name) => ({
