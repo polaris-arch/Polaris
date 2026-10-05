@@ -21,7 +21,7 @@ use polaris_core_supervisor::config_gate::ConfigCheckVerdict;
 use polaris_core_supervisor::{run_check_raw, RawCheck};
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 
-use crate::events::channel::{EVENT_PROXY_STARTED, EVENT_PROXY_STOPPED};
+use crate::events::channel::EVENT_PROXY_STOPPED;
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::management_api::{close_live_connections, GrpcManagementApi};
 use crate::runtime::proxy::{PendingChangesSummary, ProxyStatus, StartError};
@@ -105,7 +105,7 @@ pub async fn proxy_start(
         // 真实状态刷回去。取消腿的收口信号由那次 `proxy_stop` 的 `proxyStopped` 负责，此处**沉默**才是
         // 诚实的（本腿没有任何可断言的成功事实）。
         Ok(status) if status.running => {
-            let _ = app.emit(EVENT_PROXY_STARTED, json!({}));
+            // The complete shared producer emitted the lifecycle/started pair once.
             ok_void()
         }
         Ok(_yielded) => {

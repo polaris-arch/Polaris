@@ -1,12 +1,20 @@
 import { invoke, listen } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { UnlockSnapshot, UnlockProgress, UnlockInvalidatedPayload } from '../../contracts/unlock-detection';
+import type { ManualNetworkCheckResult } from '../../contracts/manual-network-check';
 
 // ============================================================================
 // unlockApi —— 解锁检测（AI/流媒体），经当前代理出口。
 // ============================================================================
 
 export const unlockApi = {
+  /** Explicit iOS action: prepare normal main, then check IP and services through that same main. */
+  async manualCheck(requestId: string, force = false): Promise<ManualNetworkCheckResult> {
+    return invoke(IPC_CHANNELS.MANUAL_NETWORK_CHECK, { requestId, force });
+  },
+  async cancelManualCheck(requestId: string): Promise<void> {
+    return invoke(IPC_CHANNELS.MANUAL_NETWORK_CHECK_CANCEL, { requestId });
+  },
   /** 跑一轮检测（force 绕 TTL，仍受 15s 硬下限约束）。 */
   async run(force = false): Promise<UnlockSnapshot> {
     return invoke(IPC_CHANNELS.UNLOCK_RUN, { force });

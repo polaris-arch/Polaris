@@ -2566,16 +2566,19 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "not(target_os = \"android\")",
         4,
         IosSide::DiffersWrongToday,
-        "四处非 Android 腿使用桌面子进程测速、无认证本地代理与 helper 错误码。\
-         iOS 核在扩展进程内，不能直接继承桌面起子进程的实现；需 iOS 原生测速宿主。",
+        "四处独立临时测速实现仍编译非 Android 的桌面子进程/无认证代理/helper 错误腿。\
+         2026-10-06 普通 iOS 测速入口已先等待正常主 NE ticket，运行/代次失效时显式退出，\
+         不可到达独立临时腿；这未证明这些底层实现适用于 iOS，也未取得临时 owner 清理收据，\
+         故保留原具名债及判决，不将普通操作接线视作还债。",
     ),
     (
         "src-tauri/src/commands/speedtest.rs",
         "target_os = \"android\"",
         6,
         IosSide::DiffersWrongToday,
-        "六处 Android 腿装配 libbox 测速、内存凭据和系统接口不支持的错误码。\
-         iOS 不可使用 Android 插件，但落到桌面测速腿同样不成立；需要自己的原生桥。",
+        "六处独立临时测速的 Android 腿装配 libbox 实例、内存凭据及系统接口错误码。\
+         iOS 不可使用 Android 插件，也不能继承其桌面互补腿；普通 iOS 入口现使用正常主 NE\
+         prerequisite，不进入这些构造，底层独立路径的原适用性/清理债仍保留。",
     ),
     (
         "src-tauri/src/commands/subscription.rs",
@@ -2793,9 +2796,11 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy.rs",
         "target_os = \"ios\"",
-        1,
+        5,
         IosSide::DiffersRight,
-        "IOS_SESSION_ACTIVE 仅由两个 cfg-ios 的系统会话对账/起核拒绝入口使用；host/Android 不持有不可达的常量。",
+        "原 IOS_SESSION_ACTIVE 常量，加实际前台/权限错误常量及当前正常启动 native receipt 字段/构造。\
+         iOS 使用自己的 NE 绑定证据，Android 不持有 iOS session receipt；这些普通操作证据\
+         不证明 NE disposal，也不签发 NoOwner，既有 Unknown/清理债不变。",
     ),
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
@@ -2849,9 +2854,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "any(target_os = \"android\", test)",
-        2,
+        3,
         IosSide::DiffersUndecided,
-        "Android lifecycle 的 legacy admission 与主核观察类型可在 test 验纯协议；iOS 的扩展主核 token/租约关系尚无事实，延续原未裁定债，需 iOS 宿主后判断。",
+        "Android lifecycle 的 legacy admission、主核观察类型与无条件 generation claim 可在 host test 验纯协议；claim 的实际生产 consumer 仅 Android。iOS 的扩展主核 token/租约关系尚无事实，保留原未裁定债，新增 test 入口不升级 iOS 权威。",
     ),
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
@@ -2919,8 +2924,11 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/commands/config.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS配置保存延迟资源删除，不以host/NE停止签发NoOwner。"),
     ("src-tauri/src/commands/proxy.rs", "target_os = \"android\"", 1, IosSide::DiffersRight, "iOS在合法payload后拒绝独立probe构造；Android既有bridge保持，结果不冒充支持或owner清除。"),
     ("src-tauri/src/commands/proxy.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS在合法payload后拒绝独立probe构造；Android既有bridge保持，结果不冒充支持或owner清除。"),
-    ("src-tauri/src/commands/server.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "iOS独立TS login/cancel/logout在副作用前拒绝；canonical共享异步switch原样保留。"),
-    ("src-tauri/src/commands/speedtest.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS停态拒绝独立测速核，已连接仅使用同一主NE API；不建立临时Go owner。"),
+    ("src-tauri/src/commands/server.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "iOS TS login 接正常主 NE prerequisite 与真实本次 observer；authkey覆写已存身份仍拒绝，logout物理删除仍因Unknown拒绝。cancel只撤本次observer，不停正常连接；PCAndroid独立路径保留。"),
+    ("src-tauri/src/commands/speedtest.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS测速先持真实run单飞身份等待正常主 NE prerequisite，再用ticket绑定池/回退I/O；若就绪后已停只退出，绝不构造临时Go owner。PCAndroid临时原路保留。"),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "用户Stop原子claim后、TS gate等待前撤销captured previous generation上界内的精确native pending start，并保留撤销错误；正常Stop终态清ready receipt。任务cancel/timeout不触发Stop，迟Stop不撤更大继任。"),
+    ("src-tauri/src/runtime/proxy/prerequisite.rs", "target_os = \"ios\"", 4, IosSide::DiffersRight, "iOS正常producer ticket捕获native私有完整session receipt，每次target操作前后fresh observe_session；Android没有iOS NE API且保留自己的桥。ticket只证明普通操作ready，不证明Stop/disposal或NoOwner。"),
+    ("src-tauri/src/runtime/proxy/prerequisite.rs", "all(test, not(target_os = \"ios\"))", 3, IosSide::WithAndroid, "纯trait/mock模块与两个ready-commit fixture accessor只在host测试编译；生产release两移动端同不编译。iOS opaque native receipt不可由host mock伪造，iOS原生状态机/SDK门另由独立收据覆盖，真机验收仍未执行。"),
     ("src-tauri/src/commands/window.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 1, IosSide::WithAndroid, "桌面restart仍持Ready完成四owner drain；iOS只重启host并保留NE，Android原腿不变。"),
     ("src-tauri/src/commands/window.rs", "target_os = \"android\"", 2, IosSide::DiffersRight, "桌面restart仍持Ready完成四owner drain；iOS只重启host并保留NE，Android原腿不变。"),
     ("src-tauri/src/commands/window.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "桌面restart仍持Ready完成四owner drain；iOS只重启host并保留NE，Android原腿不变。"),
@@ -2936,9 +2944,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/runtime/proxy/process_supervision.rs", "target_os = \"ios\"", 4, IosSide::DiffersRight, "iOS两停核入口委托NE且保留TS claim，cold host/stale只对账；独立Androidbooking原样保留。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "any(target_os = \"android\", target_os = \"ios\")", 4, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 3, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
-    ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"android\")", 4, IosSide::DiffersUndecided, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
+    ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"android\")", 3, IosSide::DiffersUndecided, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留。管理API的进程端口退役现为所有平台共用，剩余三处分派的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"ios\")", 1, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
-    ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"android\"", 10, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
+    ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"android\"", 7, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留。管理API的ledger/import三处分派已消除，所有平台同进程禁止主端口跨代复用。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"ios\"", 6, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
 ];
 
@@ -3356,12 +3364,25 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 2026-10-06：补登记共享移动资源前台补更的两处 `mobile`（`lib.rs` 的主窗 resumed 挂钩、
 /// `rule_resource_scheduler.rs` 的 `on_resume`），`WithAndroid` 59→61。
 /// 两端同侧；没有改变任何既有判决或具名债条目。
+/// 2026-10-06（正常主 NE prerequisite）：新增 12 处实到分派，11 处 iOS native receipt/Stop
+/// 撤销/typed error 为 DiffersRight，1 处 host-only opaque-ticket mock 为 WithAndroid。
+/// DiffersRight 169→180，WithAndroid 61→62；普通操作证据不等于 NE disposal，
+/// DiffersUndecided 25 / DiffersWrongToday 78 及原 26 条具名债（103 处）全部保留。
+/// 2026-10-06（Core residual）：主 API ledger 全平台共用，startup 删除三处 Android
+/// 正确侧与一处非 Android 未裁定分叉；lifecycle 新增一处 Android/test claim 可见性。
+/// 实到 369→366，文件/谓词仍 99 对；DiffersRight 180→177，DiffersUndecided 仍 25。
+/// 具名债按源码同步：startup not(android) 4→3，lifecycle any(android,test) 2→3；
+/// 26 条/103 处总量不变，不把 host mock RPC 或端口隔离视为 iOS disposal 证据。
+/// 2026-10-06（Core gate upkeep）：补记 prerequisite 两个实际 host-only ready-commit
+/// fixture accessor，all(test,not(ios)) 1→3；实到 366→368 / 99 对，WithAndroid 62→64。
+/// canonical tests 目录迁移不改变生产取材面；显式 Start/共享动作及 helper task-local
+/// 传播修复没有新增 cfg 分派。既有所有判决与 26 条/103 处具名债保持。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
-    ("DiffersRight", 169),
+    ("DiffersRight", 177),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 78),
-    ("WithAndroid", 61),
+    ("WithAndroid", 64),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -3424,7 +3445,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "any(target_os = \"android\", test)",
-        2,
+        3,
     ),
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
@@ -3449,7 +3470,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/proxy/startup.rs",
         "not(target_os = \"android\")",
-        4,
+        3,
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",

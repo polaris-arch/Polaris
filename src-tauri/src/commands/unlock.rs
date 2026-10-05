@@ -26,6 +26,182 @@ use crate::runtime::unlock::{
 use crate::runtime::AppRuntime;
 use polaris_unlock_transport::UnlockClient;
 
+use super::manual_network::{GuardedUnlock, ManualBindingGuard, ManualCheckFailure};
+
+struct UnlockBinding<'a, G> {
+    main: &'a G,
+    unlock: &'a crate::runtime::unlock::UnlockRuntime,
+    epoch: u64,
+}
+
+#[async_trait::async_trait]
+impl<G: ManualBindingGuard> ManualBindingGuard for UnlockBinding<'_, G> {
+    fn commit<T>(
+        &self,
+        commit: impl FnOnce() -> Result<T, ManualCheckFailure>,
+    ) -> Result<T, ManualCheckFailure> {
+        self.main.commit(commit)
+    }
+    fn check(&self) -> Result<(), ManualCheckFailure> {
+        self.main.check()?;
+        if self.unlock.epoch() != self.epoch {
+            return Err(ManualCheckFailure::new("superseded"));
+        }
+        Ok(())
+    }
+    async fn validate(&self) -> Result<(), ManualCheckFailure> {
+        self.main.validate().await?;
+        self.check()
+    }
+}
+
+struct BoundUnlockSink<'a, G> {
+    sink: BroadcastSink<'a>,
+    guard: &'a G,
+}
+
+struct BoundUnlockClient<'a, G> {
+    client: UnlockClient,
+    guard: &'a G,
+}
+
+#[async_trait::async_trait]
+impl<G: ManualBindingGuard> polaris_unlock::UnlockHttp for BoundUnlockClient<'_, G> {
+    async fn request(
+        &self,
+        request: &polaris_unlock::UnlockRequest,
+    ) -> polaris_unlock::UnlockResponse {
+        self.client
+            .request_fresh_guarded(
+                request,
+                &|| self.guard.check().map_err(|error| error.code),
+                &|| async { self.guard.validate().await.map_err(|error| error.code) },
+            )
+            .await
+    }
+}
+
+impl<G: ManualBindingGuard> UnlockEventSink for BoundUnlockSink<'_, G> {
+    fn with_current_commit(&self, commit: &mut dyn FnMut() -> bool) -> bool {
+        self.guard.commit(|| Ok(commit())).unwrap_or(false)
+    }
+    fn is_current(&self) -> bool {
+        self.guard.check().is_ok()
+    }
+    fn progress(&self, service_id: &str, result: &polaris_unlock::UnlockResult) {
+        if self.is_current() {
+            self.sink.progress(service_id, result);
+        }
+    }
+    fn updated(&self, snapshot: &UnlockSnapshot) {
+        if self.is_current() {
+            self.sink.updated(snapshot);
+        }
+    }
+    fn invalidated(&self, running: bool, exit_blocked: bool) {
+        if self.is_current() {
+            self.sink.invalidated(running, exit_blocked);
+        }
+    }
+    // A manual bracket loss cannot enqueue an unbound follow-up through the ordinary self-run path.
+}
+
+/// Existing detector and cache semantics, with the explicit action's pinned transport and commit guard.
+pub(super) async fn run_bound_unlock_cycle<G: ManualBindingGuard + Clone + 'static>(
+    app: &AppHandle,
+    unlock: &std::sync::Arc<crate::runtime::unlock::UnlockRuntime>,
+    local_proxy: &crate::runtime::proxy::LocalHttpProxy,
+    exit_blocked: bool,
+    force: bool,
+    main: &G,
+) -> Result<UnlockSnapshot, ManualCheckFailure> {
+    let epoch = unlock.epoch();
+    let guard = UnlockBinding {
+        main,
+        unlock,
+        epoch,
+    };
+    guard.check()?;
+    let sink = BoundUnlockSink {
+        sink: BroadcastSink::new(app),
+        guard: &guard,
+    };
+    if let Some(reason) = unlock_gate_reason(true, local_proxy.port, exit_blocked) {
+        let snapshot = UnlockSnapshot::blocked(reason);
+        guard.check()?;
+        sink.updated(&snapshot);
+        return Ok(snapshot);
+    }
+    let auth = local_proxy
+        .auth
+        .as_ref()
+        .map(|auth| (auth.username.as_str(), auth.password.as_str()));
+    let http = UnlockClient::via_local_proxy(local_proxy.port, auth)
+        .map_err(|_| ManualCheckFailure::new("unlockFailed"))?;
+    let http = BoundUnlockClient {
+        client: http,
+        guard: &guard,
+    };
+    let pinned = GuardedUnlock {
+        http: &http,
+        guard: &guard,
+    };
+    let snapshot = unlock.run(&pinned, &sink, force, unix_millis).await;
+    guard.check()?;
+
+    let restricted = is_restricted_egress_region(
+        snapshot
+            .egress
+            .as_ref()
+            .and_then(|egress| egress.region.as_deref()),
+    );
+    let has_timeout = snapshot
+        .results
+        .values()
+        .any(|result| result.status == UnlockStatus::Timeout);
+    if snapshot.checked_at.is_some()
+        && has_timeout
+        && !restricted
+        && snapshot.low_confidence != Some(true)
+    {
+        let app = app.clone();
+        let unlock = std::sync::Arc::clone(unlock);
+        let local_proxy = local_proxy.clone();
+        let main = main.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(WARM_RECHECK_DELAY_MS)).await;
+            let guard = UnlockBinding {
+                main: &main,
+                unlock: &unlock,
+                epoch,
+            };
+            if guard.check().is_err() {
+                return;
+            }
+            let auth = local_proxy
+                .auth
+                .as_ref()
+                .map(|auth| (auth.username.as_str(), auth.password.as_str()));
+            if let Ok(http) = UnlockClient::via_local_proxy(local_proxy.port, auth) {
+                let http = BoundUnlockClient {
+                    client: http,
+                    guard: &guard,
+                };
+                let http = GuardedUnlock {
+                    http: &http,
+                    guard: &guard,
+                };
+                let sink = BoundUnlockSink {
+                    sink: BroadcastSink::new(&app),
+                    guard: &guard,
+                };
+                let _ = unlock.run_recheck(&http, &sink, epoch, unix_millis).await;
+            }
+        });
+    }
+    Ok(snapshot)
+}
+
 /// item6：选中 TS 出口是否直判无效（`unlock_gate_reason` 的 `exit_blocked` 输入）。
 ///
 /// 组装 [`TsExitWarningInput`]：运行核 R 的选中出口 + 直连模式 + 主核 running + 该节点 STATUS 末帧
@@ -36,7 +212,7 @@ use polaris_unlock_transport::UnlockClient;
 /// TS STATUS 的逐帧翻转对账由运行时侧
 /// `reconcile_ts_exit_block` 负责，并通过 invalidate/自跑腿触发需要的重检；这里仅负责读取当前配置并
 /// 计算本轮 gating 输入。
-fn compute_selected_exit_blocked(state: &AppRuntime, running: bool) -> bool {
+pub(super) fn compute_selected_exit_blocked(state: &AppRuntime, running: bool) -> bool {
     if !running {
         return false;
     }

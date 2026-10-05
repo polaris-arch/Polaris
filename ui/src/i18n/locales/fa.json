@@ -2026,8 +2026,8 @@
     "errUnknown": "عملیات ناموفق بود."
   },
   "ts": {
-    "iosAccountActionsUnavailable": "iOS does not yet support separate login sessions, switching accounts, or logout. You can save node settings and an Auth Key; authorization uses a login URL returned by the main VPN.",
-    "iosConfigurationSaved": "Settings saved; login has not been confirmed. Connect or reconnect the main VPN from Home. Saving a new Auth Key does not clear an existing account session.",
+    "identityRetirementRequired": "جایگزینی Auth Key به حذف امن هویت فعلی نیاز دارد. این کار فعلاً در iOS در دسترس نیست.",
+    "iosAccountActionsUnavailable": "در iOS حذف امن هویت فعلی، تعویض حساب یا خروج هنوز پشتیبانی نمی‌شود. اولین ورود از اتصال عادی VPN استفاده می‌کند.",
     "acceptRoutes": "پذیرش مسیرهای زیرشبکه",
     "acceptRoutesHint": "مسیرهای زیرشبکهٔ اعلام‌شده توسط همتایان tailnet را بپذیر. با واردکردن زیرشبکه‌های قابل مسیریابی از این گره، خودکار فعال می‌شود.",
     "acceptDefaultResolvers": "پذیرش حل‌کننده‌های پیش‌فرض tailnet",
@@ -2141,10 +2141,8 @@
     "loginAttemptFailed": "این درخواست ورود ناموفق بود. دوباره تلاش کنید.",
     "loginCancelFailed": "لغو ورود ناموفق بود. دوباره تلاش کنید.",
     "loginSubmitted": "درخواست ورود ارسال شد. منتظر تکمیل مجوزدهی بمانید.",
-    "loginMainCoreStatus": "در حال خواندن وضعیت مجوز این گره در اتصال اصلی.",
     "loginMainCoreAuthorized": "این گره در اتصال اصلی مجوز دارد؛ تنظیمات احراز هویت تازه ذخیره‌شده ممکن است هنوز نیاز به اعمال داشته باشند.",
     "loginMainCoreAwaiting": "این گره به مجوز نیاز دارد. در حال دریافت نشانی ورود…",
-    "loginMainCoreUnknown": "وضعیت مجوز این گره در اتصال اصلی هنوز تأیید نشده است. برای خواندن دوباره تلاش کنید.",
     "loginUrlTimeout": "زمان دریافت نشانی ورود به پایان رسید. دوباره تلاش کنید.",
     "loginSessionReadFailed": "خواندن نشست قبلی ناموفق بود. مجوزدهی جدید آغاز نشد. دوباره تلاش کنید.",
     "loginProgressReadFailed": "هنوز نتیجهٔ این مجوزدهی قابل بررسی نیست. ممکن است مجوزدهی همچنان در جریان باشد؛ با بازگشت به برنامه دوباره بررسی می‌شود.",
@@ -2970,5 +2968,17 @@
       "other": "شواهد بیشتری در دست نیست."
     },
     "legacy": "این نسخه گزارش قابل تأیید مالکیت مسیر ندارد."
+  },
+  "prerequisite": {
+    "preparingConnection": "در حال آماده‌سازی اتصال پراکسی. درخواست مجوز سیستم را تأیید کنید.",
+    "waitingForReady": "در انتظار آماده‌شدن پراکسی…",
+    "foregroundRequired": "به برنامه در پیش‌زمینه برگردید و دوباره تلاش کنید.",
+    "permissionDenied": "مجوز VPN رد شد. دوباره تلاش کنید و درخواست سیستم را تأیید کنید.",
+    "readyUnknown": "آماده‌بودن اتصال تأیید نشد. اتصال را بررسی و دوباره تلاش کنید.",
+    "cancelled": "این عملیات لغو شد. می‌توانید دوباره تلاش کنید.",
+    "cancelFailed": "لغو این اقدام انجام نشد. دوباره تلاش کنید.",
+    "saveConfiguration": "ابتدا تنظیمات را ذخیره و سپس دوباره تلاش کنید.",
+    "ipInfoFailed": "اطلاعات IP به‌روزرسانی نشد. بررسی شبکه را دوباره انجام دهید.",
+    "unlockFailed": "دسترسی به سرویس‌ها بررسی نشد. بررسی شبکه را دوباره انجام دهید."
   }
 }

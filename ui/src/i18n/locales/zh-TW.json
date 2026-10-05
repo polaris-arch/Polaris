@@ -2351,8 +2351,8 @@
     "errUnknown": "操作失敗。"
   },
   "ts": {
-    "iosAccountActionsUnavailable": "iOS 暫不支援獨立登入工作階段、切換帳戶或登出。可儲存節點設定及 Auth Key；授權使用主 VPN 回傳的登入網址。",
-    "iosConfigurationSaved": "設定已儲存，尚未確認登入。請在首頁連線或重新連線主 VPN；儲存新 Auth Key 不會清除既有帳戶工作階段。",
+    "identityRetirementRequired": "更換 Auth Key 前需安全清理既有身分；iOS 暫不支援此操作。",
+    "iosAccountActionsUnavailable": "iOS 暫不支援安全清理既有身分、切換帳戶或登出。首次登入會透過正常 VPN 連線完成授權。",
     "acceptDefaultResolvers": "接受 tailnet 預設解析器",
     "acceptDefaultResolversHint": "額外接受 tailnet 下發的預設 DNS 解析器（split-DNS）。可選。",
     "acceptRoutes": "接受子網路由",
@@ -2466,10 +2466,8 @@
     "loginAttemptFailed": "本次登入請求失敗。請重試。",
     "loginCancelFailed": "取消登入失敗，請重試。",
     "loginSubmitted": "已提交登入請求。請等待授權完成。",
-    "loginMainCoreStatus": "正在讀取主連線中該節點的授權狀態。",
     "loginMainCoreAuthorized": "主連線中的該節點已授權；這不代表新儲存的認證設定已生效。",
     "loginMainCoreAwaiting": "該節點需要授權。正在取得登入頁位址…",
-    "loginMainCoreUnknown": "尚無法確認主連線中該節點的授權狀態，可重試讀取。",
     "loginUrlTimeout": "取得登入頁位址逾時。請重試。",
     "loginSessionReadFailed": "無法讀取舊登入工作階段，未發起新的授權。請重試。",
     "loginProgressReadFailed": "暫時無法核對這次授權結果。授權可能仍在進行；返回應用程式時會重試。",
@@ -2970,5 +2968,17 @@
       "other": "其他證據暫不可用。"
     },
     "legacy": "目前版本無法提供可核實的路由歸屬報告。"
+  },
+  "prerequisite": {
+    "preparingConnection": "正在準備代理連線，請完成系統授權。",
+    "waitingForReady": "等待代理就緒…",
+    "foregroundRequired": "請返回應用程式前景後重試。",
+    "permissionDenied": "VPN 授權未獲允許，請重試並允許系統請求。",
+    "readyUnknown": "無法確認連線已就緒，請檢查連線後重試。",
+    "cancelled": "本次操作已取消，可重試。",
+    "cancelFailed": "未能取消這次操作，請重試。",
+    "saveConfiguration": "請先儲存設定，再重試。",
+    "ipInfoFailed": "IP 資訊未能重新整理，請重試網路檢測。",
+    "unlockFailed": "服務可用性未能檢測，請重試網路檢測。"
   }
 }

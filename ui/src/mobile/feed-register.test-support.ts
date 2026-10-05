@@ -114,7 +114,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useNodeSortStore.toggleSortByLatency', role: 'action', disposition: act(STORE_NODE_SORT), note: '首页选择 sheet 的按延迟排序动作；组内排序复用既有比较器。' },
   /* 测速轮次为窗口级内存状态；真实事件/回执写入，静默只切 waiting。 */
   { id: 'useMobileSpeedTestStore.task', role: 'state', disposition: fed(SPEED_FED), note: '真实轮次与本地请求锁由窗口事件 feed 和 invoke 回执更新；跨屏读同一状态。' },
-  { id: 'useMobileSpeedTestStore.request', role: 'state', disposition: fed({ file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: '.begin(ids, kind, acceptLatency)' }), note: '真实轮次与本地请求锁由窗口事件 feed 和 invoke 回执更新；跨屏读同一状态。' },
+  { id: 'useMobileSpeedTestStore.request', role: 'state', disposition: fed({ file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: '.begin(ids, kind, latencyGuard(ids, kind, acceptLatency))' }), note: '真实轮次与本地请求锁由窗口事件 feed 和 invoke 回执更新；请求先保存意图，ready 后才核实测量连接；跨屏读同一状态。' },
   { id: 'useMobileSpeedTestStore.begin', role: 'action', disposition: act(STORE_SPEED), note: '测速 coordinator 的 begin 写腿；runId高水位与本地token保护已由行为测试核对。' },
   { id: 'useMobileSpeedTestStore.progress', role: 'action', disposition: act(STORE_SPEED), note: '测速 coordinator 的 progress 写腿；runId高水位与本地token保护已由行为测试核对。' },
   { id: 'useMobileSpeedTestStore.result', role: 'action', disposition: act(STORE_SPEED), note: '测速 coordinator 的 result 写腿；runId高水位与本地token保护已由行为测试核对。' },

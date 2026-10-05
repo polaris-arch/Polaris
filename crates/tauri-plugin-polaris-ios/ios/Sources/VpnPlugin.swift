@@ -3,9 +3,16 @@ import Foundation
 import NetworkExtension
 import Tauri
 import WebKit
+import UIKit
 
 private struct StartArgs: Decodable { let configContent: String; let requestID: String }
 private struct StopArgs: Decodable { let requestID: String }
+private struct RevokeArgs: Decodable { let expectedStartRequestID: String; let stopRequestID: String }
+private struct ObserveArgs: Decodable {
+    let sessionID: String; let requestID: String; let configDigest: String
+    let extensionGeneration: UInt64; let observationNonce: String
+    var identity: [String: Any] { ["sessionID": sessionID, "requestID": requestID, "configDigest": configDigest] }
+}
 private struct LoadedVpnManager {
     let manager: NETunnelProviderManager?
     let existing: Bool
@@ -18,6 +25,10 @@ private final class VpnOperation {
     let requestID: String
     var manager: NETunnelProviderManager?
     var started = false
+    var completed = false
+    var readingReady = false
+    var identity: [String: Any]?
+    var startIntent: VpnStartIntent?
     var observer: NSObjectProtocol?
     var deadline: DispatchWorkItem?
     init(_ invoke: Invoke, generation: UInt64, kind: String, requestID: String) {
@@ -49,6 +60,8 @@ final class VpnPlugin: Plugin {
     private var uncertainSession: String?
     private var uncertainReason: String?
     private let preferenceMutation = VpnPreferenceMutation()
+    private let startAdmission = VpnStartAdmission()
+    private var submittedStart: VpnStartIntent?
 
     private func directory() throws -> URL {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "PolarisAppGroup") as? String,
@@ -94,7 +107,13 @@ final class VpnPlugin: Plugin {
             invoke.reject("A previous VPN preference write has not completed; no new profile mutation can be accepted"); return nil
         }
         generation += 1
-        let op = VpnOperation(invoke, generation: generation, kind: kind, requestID: freshVpnRequestID(requestID))
+        let op = VpnOperation(invoke, generation: generation, kind: kind, requestID: requestID)
+        if kind == "start" {
+            guard let intent = startAdmission.admit(requestID) else {
+                invoke.reject("StartCancelled: This VPN start request was revoked before dispatch"); return nil
+            }
+            op.startIntent = intent
+        }
         operation = op
         // Deadline includes load/save/reload preferences, not only NE status changes.
         let deadline = DispatchWorkItem {
@@ -103,14 +122,26 @@ final class VpnPlugin: Plugin {
                 self.uncertainSession = (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["sessionID"] as? String
                 self.uncertainReason = "A VPN operation timed out; extension completion is unknown. Stop the VPN and inspect its lifecycle report before retrying."
             }
-            if op.kind == "start", op.started { op.manager?.connection.stopVPNTunnel() }
-            self.finish(op, error: vpnError("VPN \(kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."))
+            if op.kind == "start", let intent = op.startIntent, op.started {
+                self.stopSubmittedStart(intent, stopRequestID: freshVpnRequestID("timeout"))
+            }
+            self.finish(op, error: vpnError("StartupFailed: VPN \(kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."))
         }
         op.deadline = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + (kind == "start" ? 40 : 25), execute: deadline)
         return op
     }
-    private func current(_ op: VpnOperation) -> Bool { operation === op && generation == op.generation }
+    private func current(_ op: VpnOperation) -> Bool {
+        operation === op && generation == op.generation && !op.completed
+            && (op.startIntent?.allowsContinuation ?? true)
+    }
+
+    private func requireForeground() throws {
+        if let failure = vpnForegroundFailure(appActive: UIApplication.shared.applicationState == .active,
+            foregroundScene: UIApplication.shared.connectedScenes.contains(where: { $0.activationState == .foregroundActive })) {
+            throw vpnError(failure)
+        }
+    }
 
     @objc func start(_ invoke: Invoke) {
         do {
@@ -118,11 +149,13 @@ final class VpnPlugin: Plugin {
             guard !args.configContent.isEmpty, !args.requestID.isEmpty else { throw vpnError("VPN configuration/request identity is empty") }
             let configURL = try directory().appendingPathComponent("sing-box-config.json")
             DispatchQueue.main.async {
+                do { try self.requireForeground() } catch { invoke.reject(error.localizedDescription); return }
                 guard let op = self.begin(invoke, kind: "start", requestID: args.requestID) else { return }
                 self.loadManager(create: true) { result in
                     guard self.current(op) else { return }
                     do {
-                        let loaded = try result.get()
+                        let loaded: LoadedVpnManager
+                        do { loaded = try result.get() } catch { throw vpnError(vpnStartFailure(error, stage: "load")) }
                         guard let manager = loaded.manager else { throw vpnError("VPN manager is unavailable") }
                         op.manager = manager
                         let before = try self.snapshot(manager, profileExists: loaded.existing)
@@ -134,6 +167,8 @@ final class VpnPlugin: Plugin {
                         let digest = SHA256.hash(data: Data(args.configContent.utf8)).map { String(format: "%02x", $0) }.joined()
                         guard let configuration = manager.protocolConfiguration as? NETunnelProviderProtocol else { throw vpnError("Unexpected VPN protocol") }
                         configuration.providerConfiguration = ["sessionID": sessionID, "requestID": op.requestID, "configDigest": digest]
+                        op.identity = configuration.providerConfiguration
+                        try self.requireForeground()
                         // Config bytes are written only after the previous manager is inactive.
                         try Data(args.configContent.utf8).write(to: configURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
                         manager.isEnabled = true
@@ -152,12 +187,16 @@ final class VpnPlugin: Plugin {
                                     }
                                 }
                                 guard self.current(op) else { return }
-                                if let error { self.finish(op, error: error); return }
+                                if let error { self.finish(op, error: vpnError(vpnStartFailure(error, stage: "save"))); return }
                                 manager.loadFromPreferences { error in
                                     DispatchQueue.main.async {
                                         guard self.current(op) else { return }
-                                        if let error { self.finish(op, error: error); return }
+                                        if let error { self.finish(op, error: vpnError(vpnStartFailure(error, stage: "reload"))); return }
                                         do {
+                                            try self.requireForeground()
+                                            guard let expected = op.identity,
+                                                  vpnIdentityMatches(expected, (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+                                            else { throw vpnError("ReadyUnknown: Saved VPN profile changed before start submission") }
                                             self.observe(op, wanted: .connected)
                                             // Register observer before issuing the transition.
                                             try manager.connection.startVPNTunnel(options: [
@@ -165,8 +204,14 @@ final class VpnPlugin: Plugin {
                                                 "configContent": args.configContent as NSString
                                             ])
                                             op.started = true
+                                            op.startIntent?.submitted(expected)
+                                            self.submittedStart = op.startIntent
                                             self.check(op, wanted: .connected, allowInitialDisconnected: true)
-                                        } catch { self.finish(op, error: error) }
+                                        } catch {
+                                            let message = error.localizedDescription
+                                            self.finish(op, error: message.hasPrefix("ForegroundRequired:") || message.hasPrefix("ReadyUnknown:")
+                                                ? error : vpnError(vpnStartFailure(error, stage: "start")))
+                                        }
                                     }
                                 }
                             }
@@ -199,6 +244,151 @@ final class VpnPlugin: Plugin {
                 }
             }
         } catch { invoke.reject(error.localizedDescription) }
+    }
+
+    @objc func revokePendingStart(_ invoke: Invoke) {
+        do {
+            let args = try invoke.parseArgs(RevokeArgs.self)
+            guard !args.expectedStartRequestID.isEmpty, !args.stopRequestID.isEmpty else {
+                throw vpnError("VPN revocation request identity is empty")
+            }
+            DispatchQueue.main.async {
+                let pending = self.operation.flatMap { $0.kind == "start" && $0.requestID == args.expectedStartRequestID ? $0 : nil }
+                let submitted = self.submittedStart.flatMap { $0.requestID == args.expectedStartRequestID ? $0 : nil }
+                self.startAdmission.revoke(args.expectedStartRequestID, pending: pending?.startIntent ?? submitted)
+                if let op = pending {
+                    if op.started || self.preferenceMutation.requestID == op.requestID {
+                        self.uncertainSession = op.identity?["sessionID"] as? String
+                        self.uncertainReason = "The start request was revoked; submitted system work and cleanup remain unknown."
+                    }
+                    // Complete the old invoke exactly once. Save callbacks still
+                    // reconcile their own durable preference intent before returning.
+                    self.finish(op, error: vpnError("StartCancelled: The user stopped this VPN start request"))
+                    self.generation += 1
+                }
+                // A ready callback can win after Rust captured this exact request
+                // but before revoke reached the main queue. Retain its submitted
+                // intent so that race still closes only the addressed session.
+                if let submitted {
+                    self.uncertainSession = submitted.submittedIdentity?["sessionID"] as? String
+                    self.uncertainReason = "The submitted start was revoked; extension cleanup remains unknown."
+                    self.stopSubmittedStart(submitted, stopRequestID: args.stopRequestID)
+                }
+                invoke.resolve(["revoked": true, "cleanupEvidence": "CleanupUnknown"])
+            }
+        } catch { invoke.reject(error.localizedDescription) }
+    }
+
+    /// Re-load the addressed profile at the point of stop. Neither a stale
+    /// manager nor a late revocation/deadline may stop a successor session.
+    private func stopSubmittedStart(_ intent: VpnStartIntent, stopRequestID: String) {
+        self.loadManager(create: false) { result in
+            do {
+                guard let manager = try result.get().manager,
+                      let values = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration,
+                      intent.mayStop(values) else { return }
+                try self.writeStopIntent(values: values, requestID: stopRequestID)
+                if let session = manager.connection as? NETunnelProviderSession {
+                    var message = values
+                    message["command"] = "prepareStop"; message["stopRequestID"] = stopRequestID
+                    // This records the same stop intent in the extension when reachable.
+                    try? session.sendProviderMessage(JSONSerialization.data(withJSONObject: message)) { _ in }
+                }
+                // No deferred callback may issue this transition against B.
+                guard intent.mayStop((manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration) else { return }
+                manager.connection.stopVPNTunnel()
+            } catch {
+                self.uncertainSession = intent.submittedIdentity?["sessionID"] as? String
+                self.uncertainReason = "The revoked start could not be reconciled: " + error.localizedDescription
+            }
+        }
+    }
+
+    @objc func observeSession(_ invoke: Invoke) {
+        do {
+            let args = try invoke.parseArgs(ObserveArgs.self)
+            guard args.extensionGeneration > 0, !args.observationNonce.isEmpty,
+                  vpnIdentityMatches(args.identity, args.identity) else { throw vpnError("ReadyUnknown: Session observation binding is empty") }
+            DispatchQueue.main.async {
+                var completed = false
+                let deadline = DispatchWorkItem {
+                    guard !completed else { return }; completed = true
+                    invoke.reject("ReadyUnknown: Loading the bound VPN profile timed out")
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: deadline)
+                self.loadManager(create: false) { result in
+                    guard !completed else { return }; completed = true; deadline.cancel()
+                    do {
+                        guard let manager = try result.get().manager else { throw vpnError("ReadyUnknown: VPN profile is unavailable") }
+                        self.readLiveSession(manager, expectedIdentity: args.identity,
+                            nonce: args.observationNonce, expectedGeneration: args.extensionGeneration) { result in
+                            switch result {
+                            case .success(let snapshot): invoke.resolve(["observationNonce": args.observationNonce, "snapshot": snapshot])
+                            case .failure(let error): invoke.reject(error.localizedDescription)
+                            }
+                        }
+                    } catch { invoke.reject(error.localizedDescription) }
+                }
+            }
+        } catch { invoke.reject(error.localizedDescription) }
+    }
+
+    /// A fresh provider response replaces file evidence for ordinary readiness.
+    /// Re-check both the loaded profile and its NE status after the response.
+    private func readLiveSession(_ manager: NETunnelProviderManager, expectedIdentity: [String: Any],
+                                 nonce: String, expectedGeneration: UInt64? = nil,
+                                 completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        let values = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+        guard manager.connection.status == .connected, vpnIdentityMatches(expectedIdentity, values),
+              let session = manager.connection as? NETunnelProviderSession else {
+            completion(.failure(vpnError("ReadyUnknown: The current system VPN does not match the bound session"))); return
+        }
+        var completed = false
+        let finish: (Result<[String: Any], Error>) -> Void = { result in
+            guard !completed else { return }; completed = true; completion(result)
+        }
+        let deadline = DispatchWorkItem { finish(.failure(vpnError("ReadyUnknown: Bound extension observation timed out"))) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: deadline)
+        let message = vpnObservationMessage(identity: expectedIdentity, nonce: nonce, expectedGeneration: expectedGeneration)
+        do {
+            try session.sendProviderMessage(JSONSerialization.data(withJSONObject: message)) { data in
+                DispatchQueue.main.async {
+                    guard !completed else { return }
+                    do {
+                        guard let data,
+                              let observation = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let evidence = vpnLiveEvidence(
+                                profileIdentity: (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration,
+                                expectedIdentity: expectedIdentity, observation: observation, nonce: nonce,
+                                expectedGeneration: expectedGeneration) else {
+                            throw vpnError("ReadyUnknown: Extension observation changed or reported an uncertain session")
+                        }
+                        // The saved profile can change while a provider response is
+                        // in flight. Load its current manager again before granting.
+                        self.loadManager(create: false) { result in
+                            guard !completed else { return }
+                            do {
+                                guard let currentManager = try result.get().manager,
+                                      currentManager.connection.status == .connected,
+                                      vpnIdentityMatches(expectedIdentity,
+                                        (currentManager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration),
+                                      self.operation == nil || self.operation?.requestID == (expectedIdentity["requestID"] as? String),
+                                      self.submittedStart?.requestID == (expectedIdentity["requestID"] as? String),
+                                      self.submittedStart?.revoked == false,
+                                      self.uncertainReason == nil || (self.uncertainSession != nil && self.uncertainSession != (expectedIdentity["sessionID"] as? String)),
+                                      try self.pendingPreferenceIntent() == nil else {
+                                    throw vpnError("ReadyUnknown: The current VPN manager changed during observation")
+                                }
+                                var snapshot: [String: Any] = ["status": currentManager.connection.status.rawValue,
+                                    "running": true, "active": true, "profileExists": true]
+                                snapshot.merge(evidence) { _, fresh in fresh }
+                                deadline.cancel(); finish(.success(snapshot))
+                            } catch { deadline.cancel(); finish(.failure(vpnError("ReadyUnknown: " + error.localizedDescription))) }
+                        }
+                    } catch { deadline.cancel(); finish(.failure(vpnError("ReadyUnknown: " + error.localizedDescription))) }
+                }
+            }
+        } catch { deadline.cancel(); finish(.failure(vpnError("ReadyUnknown: " + error.localizedDescription))) }
     }
 
     @objc func status(_ invoke: Invoke) {
@@ -250,19 +440,18 @@ final class VpnPlugin: Plugin {
         let status = manager.connection.status
         if wanted == .disconnected, status == .disconnected || status == .invalid { finishStopped(op); return }
         if wanted == .connected, status == .connected {
-            do {
-                let observed = try snapshot(manager)
-                guard observed["ownership"] as? String == "ownedSessionReported",
-                      observed["lifecycle"] as? String == "running",
-                      observed["runtimeStopped"] as? Bool == false,
-                      observed["cleanupError"] == nil, observed["lastError"] == nil else {
-                    uncertainSession = observed["sessionId"] as? String
-                    let reason = "System VPN connected without a matching successful extension session report; inspect Settings before retrying."
-                    uncertainReason = reason
-                    throw vpnError(reason)
+            guard !op.readingReady, let identity = op.identity else { return }
+            op.readingReady = true
+            readLiveSession(manager, expectedIdentity: identity, nonce: freshVpnRequestID("start-observe")) { result in
+                guard self.current(op) else { return }
+                switch result {
+                case .success(let observed): self.finish(op, snapshot: observed)
+                case .failure(let error):
+                    self.uncertainSession = identity["sessionID"] as? String
+                    self.uncertainReason = error.localizedDescription
+                    self.finish(op, error: error)
                 }
-                finish(op, snapshot: observed)
-            } catch { finish(op, error: error) }
+            }
         } else if wanted == .connected, !allowInitialDisconnected, status == .disconnected || status == .invalid {
             manager.connection.fetchLastDisconnectError { error in
                 DispatchQueue.main.async {
@@ -336,8 +525,11 @@ final class VpnPlugin: Plugin {
         return pending ? "A VPN preference write was submitted without a reconciled completion; no new profile may be created or changed." : nil
     }
     private func writeStopIntent(_ op: VpnOperation) throws {
-        var values = (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
-        values["stopRequestID"] = op.requestID
+        try writeStopIntent(values: (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:], requestID: op.requestID)
+    }
+    private func writeStopIntent(values: [String: Any], requestID: String) throws {
+        var values = values
+        values["stopRequestID"] = requestID
         let url = try directory().appendingPathComponent("vpn-stop-intent.json")
         try JSONSerialization.data(withJSONObject: values).write(to: url,
             options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
@@ -354,7 +546,9 @@ final class VpnPlugin: Plugin {
     }
 
     private func finish(_ op: VpnOperation, error: Error? = nil, snapshot: [String: Any]? = nil) {
-        guard current(op) else { return }
+        guard operation === op, generation == op.generation, !op.completed else { return }
+        op.completed = true
+        op.startIntent?.finish()
         operation = nil
         op.deadline?.cancel()
         if let observer = op.observer { NotificationCenter.default.removeObserver(observer) }

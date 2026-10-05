@@ -49,6 +49,19 @@ export const TEMP_CORE_NAIVE_CEILING_HINT = 110;
 export function speedTestErrorMessage(err: unknown, t: TFunction): string {
   const code = err instanceof IpcError ? err.code : undefined;
   switch (code) {
+    case 'IOS_FOREGROUND_REQUIRED':
+      return t('prerequisite.foregroundRequired');
+    case 'IOS_VPN_PERMISSION_DENIED':
+      return t('prerequisite.permissionDenied');
+    case 'IOS_READY_UNKNOWN':
+    case 'readyUnknown':
+      return t('prerequisite.readyUnknown');
+    case 'IOS_START_CANCELLED':
+    case 'cancelled':
+      return t('prerequisite.cancelled');
+    case 'configurationPending':
+    case 'unsavedConfiguration':
+      return t('prerequisite.saveConfiguration');
     case 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED':
       return t('errors.androidNativeCapacityClosed');
     case 'SYSTEM_INTERFACE_REQUIRES_HELPER':

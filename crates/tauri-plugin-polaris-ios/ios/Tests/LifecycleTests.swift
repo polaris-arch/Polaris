@@ -131,6 +131,93 @@ struct LifecycleTests {
         let wrongSession = vpnSessionEvidence(profileIdentity: replaced, report: report)
         assert(wrongSession["runtimeStopped"] == nil)
         assert(wrongSession["ownership"] as? String == "profileMatchedUnattested")
-        print("iOS lifecycle counterexamples passed: receipt ordering, repeated reload, late settings, sticky close failure, report identity, cold host, CleanupUnknown")
+
+        let live = TunnelLifecycle()
+        let liveGeneration = try live.start(identity)
+        assert(live.complete(liveGeneration, phase: "running", stopped: false))
+        let observed = live.observeSession(identity: identity, nonce: "fresh-nonce", expectedGeneration: liveGeneration)!
+        let observation = try JSONSerialization.jsonObject(with: JSONEncoder().encode(observed)) as! [String: Any]
+        let liveEvidence = vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "fresh-nonce", expectedGeneration: liveGeneration)!
+        assert(liveEvidence["extensionGeneration"] as? NSNumber == NSNumber(value: liveGeneration))
+        assert(liveEvidence["cleanupEvidence"] as? String == "CleanupUnknown")
+        assert(vpnLiveEvidence(profileIdentity: replaced, expectedIdentity: profile, observation: observation,
+            nonce: "fresh-nonce", expectedGeneration: liveGeneration) == nil)
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile, observation: observation,
+            nonce: "stale-nonce", expectedGeneration: liveGeneration) == nil)
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile, observation: observation,
+            nonce: "fresh-nonce", expectedGeneration: liveGeneration + 1) == nil)
+        let other = TunnelIdentity(sessionID: "session-b", requestID: "start-b", configDigest: "digest-b")
+        assert(live.observeSession(identity: other, nonce: "fresh-nonce") == nil)
+        assert(live.observeSession(identity: identity, nonce: "") == nil)
+        let changedGeneration = try live.reload()
+        assert(live.observeSession(identity: identity, nonce: "fresh-nonce", expectedGeneration: liveGeneration) == nil)
+        assert(live.complete(changedGeneration, phase: "running", stopped: false))
+        live.settingsUncertain(changedGeneration, "late system settings")
+        let uncertainObservation = try JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            live.observeSession(identity: identity, nonce: "fresh-nonce")!)) as! [String: Any]
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: uncertainObservation, nonce: "fresh-nonce") == nil)
+
+        // Actual JSON serialization of first-read (no generation yet) and bound
+        // reads. Optional values must never be boxed into the provider message.
+        let firstMessage = vpnObservationMessage(identity: profile, nonce: "first")
+        let firstWire = try JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: firstMessage)) as! [String: Any]
+        assert(firstWire["extensionGeneration"] == nil)
+        let boundMessage = vpnObservationMessage(identity: profile, nonce: "bound", expectedGeneration: 41)
+        let boundWire = try JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: boundMessage)) as! [String: Any]
+        assert((boundWire["extensionGeneration"] as? NSNumber)?.uint64Value == 41)
+
+        // These are the admission and continuation predicates used at the four
+        // real NE boundaries: load, save, reload, and start already submitted.
+        for boundary in ["load", "save", "reload", "submitted"] {
+            let admission = VpnStartAdmission()
+            let intent = admission.admit("start-" + boundary)!
+            let write = VpnPreferenceMutation()
+            if boundary == "save" { assert(write.begin(intent.requestID)) }
+            if boundary == "submitted" { intent.submitted(profile) }
+            admission.revoke(intent.requestID, pending: intent)
+            assert(!intent.allowsContinuation) // Late preference callbacks cannot start.
+            assert(intent.finish())
+            assert(!intent.finish()) // Both timeout and late callback are terminal once.
+            assert(!intent.mayStop(replaced)) // A late stop may never address B.
+            assert(intent.mayStop(profile) == (boundary == "submitted"))
+            if boundary == "save" {
+                assert(write.pending) // Revocation cannot erase an unknown OS write.
+                assert(!write.finish("start-b"))
+                assert(write.finish(intent.requestID)) // Late save still reconciles A.
+            }
+        }
+        let admission = VpnStartAdmission()
+        admission.revoke("start-a", pending: nil)
+        assert(admission.admit("start-a") == nil) // Stop dispatch can precede Start.
+        assert(admission.admit("start-a") == nil) // Even a repeated late dispatch stays revoked.
+        let bIntent = admission.admit("start-b")!
+        admission.revoke("start-a", pending: bIntent)
+        assert(bIntent.allowsContinuation)
+        let readyBeforeRevoke = VpnStartIntent("ready-a")
+        readyBeforeRevoke.submitted(profile)
+        assert(readyBeforeRevoke.finish())
+        admission.revoke("ready-a", pending: readyBeforeRevoke)
+        assert(readyBeforeRevoke.revoked)
+        assert(readyBeforeRevoke.mayStop(profile)) // Ready callback may precede revoke dispatch.
+        assert(!readyBeforeRevoke.mayStop(replaced))
+        for index in 0...64 { admission.revoke("never-dispatched-\(index)", pending: nil) }
+        assert(admission.admit("never-dispatched-0") == nil)
+        assert(admission.admit("new-after-capacity") == nil) // Fail closed, no unsafe eviction.
+
+        assert(vpnForegroundFailure(appActive: true, foregroundScene: true) == nil)
+        assert(vpnForegroundFailure(appActive: false, foregroundScene: true)?.hasPrefix("ForegroundRequired:") == true)
+        assert(vpnForegroundFailure(appActive: true, foregroundScene: false)?.hasPrefix("ForegroundRequired:") == true)
+        let denied = NSError(domain: NSPOSIXErrorDomain, code: 1)
+        assert(vpnStartFailure(denied, stage: "save").hasPrefix("PermissionDenied:"))
+        let cancelledPermit = NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)
+        assert(vpnStartFailure(cancelledPermit, stage: "save").hasPrefix("PermissionDenied:"))
+        let unknownSave = NSError(domain: "NEVPNErrorDomain", code: 5)
+        assert(vpnStartFailure(unknownSave, stage: "save").hasPrefix("StartupFailed:"))
+        assert(vpnStartFailure(denied, stage: "load").hasPrefix("StartupFailed:"))
+        let timeout = NSError(domain: "PolarisVPN", code: 1, userInfo: [NSLocalizedDescriptionKey: "timed out"])
+        assert(vpnStartFailure(timeout, stage: "save").hasPrefix("StartupFailed:"))
+        print("iOS lifecycle counterexamples passed: exact live observation, permission attribution, foreground, four pending-start revoke boundaries, late Stop(A)/Start(B), durable preference uncertainty, receipt ordering, sticky close failure, CleanupUnknown")
     }
 }

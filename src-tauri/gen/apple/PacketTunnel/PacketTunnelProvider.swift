@@ -161,9 +161,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         if messageData != Data("status".utf8) {
             guard let object = try? JSONSerialization.jsonObject(with: messageData) as? [String: Any],
-                  object["command"] as? String == "prepareStop",
-                  let requestID = object["stopRequestID"] as? String,
-                  let identity = identity(from: object),
+                  let command = object["command"] as? String,
+                  let identity = identity(from: object) else { completionHandler?(nil); return }
+            if command == "observeSession" {
+                guard let nonce = object["observationNonce"] as? String,
+                      let observation = lifecycle.observeSession(identity: identity, nonce: nonce,
+                          expectedGeneration: (object["extensionGeneration"] as? NSNumber)?.uint64Value)
+                else { completionHandler?(nil); return }
+                completionHandler?(try? JSONEncoder().encode(observation))
+                return
+            }
+            guard command == "prepareStop", let requestID = object["stopRequestID"] as? String,
                   lifecycle.prepareStop(identity: identity, requestID: requestID) else { completionHandler?(nil); return }
             publishReport()
         }

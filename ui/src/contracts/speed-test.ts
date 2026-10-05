@@ -37,6 +37,37 @@ export type SpeedTestOutcome = 'completed' | 'interrupted';
  */
 export type SpeedTestInterruptReason = 'superseded' | 'core_exited' | 'core_unresponsive';
 
+/** Emitted by the ready producer, before target measurement starts. */
+export interface SpeedTestMeasurementContext {
+  runId: string;
+  requestId: string;
+  mainGeneration: number;
+  startTime: number | null;
+}
+
+export interface SpeedTestCountProgress {
+  runId?: string;
+  tested: number;
+  ok: number;
+  total: number;
+  measurementContext?: SpeedTestMeasurementContext | null;
+}
+
+export type SpeedTestProgressPayload = SpeedTestCountProgress
+  | { runId: string; phase: 'preparingConnection' | 'waitingForReady' }
+  | { runId: string; phase: 'measuring'; measurementContext: SpeedTestMeasurementContext };
+
+export interface SpeedTestResultPayload {
+  runId?: string;
+  serverId: string;
+  latency: number;
+  measurementContext?: SpeedTestMeasurementContext | null;
+}
+
+export function isSpeedTestCountProgress(event: SpeedTestProgressPayload): event is SpeedTestCountProgress {
+  return 'tested' in event;
+}
+
 /** SERVER_SPEED_TEST invoke 返回（renderer 消费 §16.2/§16.3.3）：Record 化结果（null→-1）+ outcome + 波前缺席两列表。
  *
  *  `notInPool` = 请求了但不在**运行核**测速池里的节点（订阅新增/改址后未重启核 ⇒ 出站 tag 尚不是
@@ -48,6 +79,7 @@ export type SpeedTestInterruptReason = 'superseded' | 'core_exited' | 'core_unre
 export interface SpeedTestInvokeResult {
   /** Process-local monotonic decimal identity; optional for older backends. */
   runId?: string;
+  measurementContext?: SpeedTestMeasurementContext | null;
   dirty?: string[];
   results: Record<string, number>;
   outcome: SpeedTestOutcome;
@@ -72,6 +104,7 @@ export interface SpeedTestInvokeResult {
  */
 export interface SpeedTestDonePayload {
   runId?: string;
+  measurementContext?: SpeedTestMeasurementContext | null;
   outcome: SpeedTestOutcome;
   /** 已出值的节点数（含真实 -1）。 */
   tested: number;

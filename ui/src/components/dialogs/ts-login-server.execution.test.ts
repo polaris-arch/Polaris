@@ -63,6 +63,26 @@ describe('save followed by authorization', () => {
     expect(input.cancel).toHaveBeenCalledOnce();
   });
 
+  it('authorization can detach the panel while invoke awaits the main observer without a late cancel', async () => {
+    let active = true;
+    let finish!: (value: { started: boolean; reason: string }) => void;
+    const input = execution({ isActive: () => active, start: () => new Promise(resolve => { finish = resolve; }) });
+    const pending = executeTsLogin(input);
+    await vi.waitFor(() => expect(input.onSaved).toHaveBeenCalledOnce());
+    active = false;
+    finish({ started: false, reason: 'inMainCore' });
+    expect(await pending).toEqual({ phase: 'cancelled' });
+    expect(input.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['IOS_FOREGROUND_REQUIRED', 'IOS_VPN_PERMISSION_DENIED', 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED'])('preserves %s without disclosing diagnostics or retrying', async code => {
+    const input = execution({ start: vi.fn(async () => { throw { code, message: 'private token/path' }; }) });
+    expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: code });
+    expect(input.start).toHaveBeenCalledOnce();
+    expect(input.logout).not.toHaveBeenCalled();
+    expect(input.cancel).toHaveBeenCalledOnce();
+  });
+
   it('fresh state-query failure blocks logout/save/start and cannot claim save success', async () => {
     const input = execution({ verifyState: async () => { throw new Error('unavailable'); } });
     expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'stateQueryFailed' });

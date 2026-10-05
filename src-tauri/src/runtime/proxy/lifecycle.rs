@@ -264,7 +264,16 @@ impl ProxyRuntime {
     /// custody critical section. A concurrent older Start cannot book between
     /// the empty check and this claim, and a newer Start cannot claim after an
     /// older attempt has booked its physical request.
+    #[cfg(any(target_os = "android", test))]
     pub(super) fn claim_android_global_start_generation(&self) -> Result<u64, StartError> {
+        self.claim_android_global_start_generation_expected(None)
+            .map(|generation| generation.expect("unconditional Android start claim"))
+    }
+
+    fn claim_android_global_start_generation_expected(
+        &self,
+        expected: Option<u64>,
+    ) -> Result<Option<u64>, StartError> {
         let mut crash = self.crash_lock();
         let custody = self
             .android_main_token
@@ -273,11 +282,11 @@ impl ProxyRuntime {
         if custody.is_some() {
             return Err(StartError::android_global_custody_occupied());
         }
-        let generation = self
-            .claim_generation(None, LifecycleKind::Start)
-            .expect("unconditional Android start claim");
+        let Some(generation) = self.claim_generation(expected, LifecycleKind::Start) else {
+            return Ok(None);
+        };
         crash.reset_user_aborted();
-        Ok(generation)
+        Ok(Some(generation))
     }
 
     /// Transitional desktop fence. No managed claim is accepted by this API;
@@ -323,6 +332,7 @@ impl ProxyRuntime {
     /// 读可能在几小时后 → 存了必假。见 [`ProxyStatus`] 文档。
     pub fn status(&self) -> ProxyStatus {
         let mut snap = self.status.read().map(|g| g.clone()).unwrap_or_default();
+        snap.main_generation = self.gate.generation();
         snap.uptime = snap
             .start_time
             .map(|t0| now_ms().saturating_sub(t0) / 1_000);
@@ -506,9 +516,17 @@ impl ProxyRuntime {
     ///
     /// **边界**：系统代理 enable / TUN / helper 提权起核**不在本批次**——见模块级声明。
     pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
-        match self.start_guarded(config, None).await {
-            StartLeg::Finished(result, _) => result,
-            StartLeg::Superseded => Ok(self.status()),
+        let mut completion = self.explicit_start_completion(config)?;
+        loop {
+            let state = completion.borrow_and_update().clone();
+            match state {
+                super::prerequisite::NormalStartCompletion::Finished(result, _) => return result,
+                super::prerequisite::NormalStartCompletion::Superseded => return Ok(self.status()),
+                _ => {}
+            }
+            if completion.changed().await.is_err() {
+                return Err(StartError::from("normal Start completion lost".to_owned()));
+            }
         }
     }
 
@@ -517,6 +535,52 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         config: Value,
         expected_generation: Option<u64>,
+    ) -> StartLeg {
+        let (mut receiver, claim) =
+            match self.guarded_start_completion(&config, expected_generation) {
+                Ok(completion) => completion,
+                Err(leg) => return leg,
+            };
+        if let Some(claim) = claim {
+            let leg = self
+                .start_guarded_with_completion(config, expected_generation, Some(&claim))
+                .await;
+            claim.completion.send_replace(match &leg {
+                StartLeg::Finished(result, generation) => {
+                    super::prerequisite::NormalStartCompletion::Finished(
+                        result.clone(),
+                        *generation,
+                    )
+                }
+                StartLeg::Superseded => super::prerequisite::NormalStartCompletion::Superseded,
+            });
+            return leg;
+        }
+        loop {
+            let state = receiver.borrow_and_update().clone();
+            match state {
+                super::prerequisite::NormalStartCompletion::Finished(result, generation) => {
+                    return StartLeg::Finished(result, generation)
+                }
+                super::prerequisite::NormalStartCompletion::Superseded => {
+                    return StartLeg::Superseded
+                }
+                _ => {}
+            }
+            if receiver.changed().await.is_err() {
+                return StartLeg::Finished(
+                    Err(StartError::from("normal Start completion lost".to_owned())),
+                    None,
+                );
+            }
+        }
+    }
+
+    pub(super) async fn start_guarded_with_completion(
+        self: &Arc<Self>,
+        config: Value,
+        expected_generation: Option<u64>,
+        completion: Option<&super::prerequisite::NormalStartClaim>,
     ) -> StartLeg {
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
@@ -556,73 +620,109 @@ impl ProxyRuntime {
             Ok(lease) => lease,
             Err(error) => return StartLeg::Finished(Err(error), None),
         };
-        // Explicit starts take ownership before their first await. This preserves the order of
-        // two start requests (the later one wins), and lets a later stop supersede an earlier
-        // start while it waits for the TS gate. Keep abort reset and claim under the same short
-        // crash lock used by the explicit stop entry; no mutex is held across await.
-        let explicit_generation = if expected_generation.is_none() {
-            if cfg!(target_os = "android") {
-                match self.claim_android_global_start_generation() {
-                    Ok(generation) => Some(generation),
-                    Err(error) => return StartLeg::Finished(Err(error), None),
-                }
-            } else {
-                let mut crash = self.crash_lock();
-                let closing = match self.desktop_shutdown.lock() {
-                    Ok(closing) => closing,
+        // The current producer token, direct admission, generation claim and Starting
+        // publication are one synchronous section. A later pending producer wins before
+        // any spawn, while a Stop that claimed first cannot be undone by queued dispatch.
+        let (explicit_generation, requested_generation) = {
+            let _normal_claim_guard = if let Some(claim) = completion {
+                let guard = match self.normal_start.lock() {
+                    Ok(guard) => guard,
                     Err(_) => {
                         return StartLeg::Finished(
                             Err(StartError::from(
-                                "proxy shutdown admission poisoned".to_owned(),
+                                "normal Start completion poisoned".to_owned(),
                             )),
                             None,
                         )
                     }
                 };
-                if *closing {
-                    return StartLeg::Finished(
-                        Err(StartError::from("proxy is shutting down".to_owned())),
-                        None,
-                    );
+                if !claim.owns(guard.as_ref()) || self.gate.generation() != claim.expected {
+                    return StartLeg::Superseded;
                 }
-                // Keep crash→admission→Child lock order (also used by recovery). The Child
-                // guard spans admission and publication: an older start either
-                // installs first and we reject, or sees our new generation before
-                // it can install. No await occurs while either lock is held.
-                let direct_slot = match self.child.lock() {
-                    Ok(slot) => slot,
-                    Err(error) => {
+                Some(guard)
+            } else {
+                None
+            };
+            // Explicit starts take ownership before their first await. This preserves the order of
+            // two start requests (the later one wins), and lets a later stop supersede an earlier
+            // start while it waits for the TS gate. Keep abort reset and claim under the same short
+            // crash lock used by the explicit stop entry; no mutex is held across await.
+            let explicit_generation = if expected_generation.is_none() {
+                if cfg!(target_os = "android") {
+                    match self.claim_android_global_start_generation_expected(
+                        completion.map(|claim| claim.expected),
+                    ) {
+                        Ok(Some(generation)) => Some(generation),
+                        Ok(None) => return StartLeg::Superseded,
+                        Err(error) => return StartLeg::Finished(Err(error), None),
+                    }
+                } else {
+                    let mut crash = self.crash_lock();
+                    let closing = match self.desktop_shutdown.lock() {
+                        Ok(closing) => closing,
+                        Err(_) => {
+                            return StartLeg::Finished(
+                                Err(StartError::from(
+                                    "proxy shutdown admission poisoned".to_owned(),
+                                )),
+                                None,
+                            )
+                        }
+                    };
+                    if *closing {
                         return StartLeg::Finished(
-                            Err(StartError::direct_slot_poisoned(error)),
+                            Err(StartError::from("proxy is shutting down".to_owned())),
                             None,
                         );
                     }
-                };
-                if !direct_slot.is_empty()
-                    || direct_slot.has_helper_start()
-                    || (self.core_via_helper.load(Ordering::SeqCst) && !via_helper)
-                {
-                    return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
+                    // Keep crash→admission→Child lock order (also used by recovery). The Child
+                    // guard spans admission and publication: an older start either
+                    // installs first and we reject, or sees our new generation before
+                    // it can install. No await occurs while either lock is held.
+                    let direct_slot = match self.child.lock() {
+                        Ok(slot) => slot,
+                        Err(error) => {
+                            return StartLeg::Finished(
+                                Err(StartError::direct_slot_poisoned(error)),
+                                None,
+                            );
+                        }
+                    };
+                    if !direct_slot.is_empty()
+                        || direct_slot.has_helper_start()
+                        || (self.core_via_helper.load(Ordering::SeqCst) && !via_helper)
+                    {
+                        return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
+                    }
+                    let Some(generation) = self.claim_generation(
+                        completion.map(|claim| claim.expected),
+                        LifecycleKind::Start,
+                    ) else {
+                        return StartLeg::Superseded;
+                    };
+                    crash.reset_user_aborted();
+                    drop(direct_slot);
+                    Some(generation)
                 }
-                let generation = self
-                    .claim_generation(None, LifecycleKind::Start)
-                    .expect("unconditional start claim");
-                crash.reset_user_aborted();
-                drop(direct_slot);
-                Some(generation)
-            }
-        } else {
-            let admission = if via_helper {
-                self.admit_helper_slot()
             } else {
-                self.admit_direct_slot()
+                let admission = if via_helper {
+                    self.admit_helper_slot()
+                } else {
+                    self.admit_direct_slot()
+                };
+                if let Err(error) = admission {
+                    return StartLeg::Finished(Err(error), None);
+                }
+                None
             };
-            if let Err(error) = admission {
-                return StartLeg::Finished(Err(error), None);
+            let requested_generation = expected_generation.or(explicit_generation).unwrap();
+            if let Some(claim) = completion {
+                claim.completion.send_replace(
+                    super::prerequisite::NormalStartCompletion::Starting(requested_generation),
+                );
             }
-            None
+            (explicit_generation, requested_generation)
         };
-        let requested_generation = expected_generation.or(explicit_generation).unwrap();
         let t_start_request = std::time::Instant::now();
         // 后台网络任务须等整个起核事务稳定。TUN 成功腿会在 selector 校正/flush 任务里先接棒一个
         // 新 guard，再由本 guard 退场，因此计数不会在两段之间短暂归零、放进一条注定被 RST 的请求。
@@ -685,6 +785,25 @@ impl ProxyRuntime {
             }
             generation
         } else {
+            let _normal_claim_guard = if let Some(claim) = completion {
+                let guard = match self.normal_start.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return StartLeg::Finished(
+                            Err(StartError::from(
+                                "normal Start completion poisoned".to_owned(),
+                            )),
+                            None,
+                        )
+                    }
+                };
+                if !claim.owns(guard.as_ref()) {
+                    return StartLeg::Superseded;
+                }
+                Some(guard)
+            } else {
+                None
+            };
             let _crash = self.crash_lock();
             let closing = match self.desktop_shutdown.lock() {
                 Ok(closing) => closing,
@@ -708,6 +827,11 @@ impl ProxyRuntime {
             else {
                 return StartLeg::Superseded;
             };
+            if let Some(claim) = completion {
+                claim.completion.send_replace(
+                    super::prerequisite::NormalStartCompletion::Starting(generation),
+                );
+            }
             generation
         };
         if !self.core_running() {
@@ -740,13 +864,13 @@ impl ProxyRuntime {
         //
         // `start_inner` 的让位腿也会 `Ok(self.status())`，甚至可能读到接管方的 running 核；故成功不能只看
         // `r.is_ok()`，还要本世代仍当权。世代已变就由接管方自己的 ready/failed 收口，本腿保持沉默。
-        let committed =
-            r.as_ref().is_ok_and(|status| status.running) && self.gate.generation() == my_gen;
         drop(inflight);
-        if committed {
-            // 与 stopped 腿同一配对纪律：差集与生命周期描述同一次终态跃迁，必须相邻发布。
-            self.push_pending_changes();
-            self.push_lifecycle(&ProxyLifecycleEvent::ready());
+        if r.as_ref().is_ok_and(|status| status.running) {
+            self.publish_committed_ready_main(my_gen, || {
+                // 与 stopped 腿同一配对纪律：差集与生命周期描述同一次终态跃迁，必须相邻发布。
+                self.push_pending_changes();
+                self.push_lifecycle(&ProxyLifecycleEvent::ready());
+            });
         }
         // **起核失败的唯一广播点**（`event:proxyLifecycle{phase:'failed'}`）。挂这里而不是各失败腿，
         // 理由同上面两条收口：这是全部起核入口（IPC / 托盘 / 启动自动连接 / `restart` 的 start 腿）
@@ -807,6 +931,14 @@ impl ProxyRuntime {
             crash.mark_user_aborted();
             generation
         };
+        // Revoke the captured previous Start before waiting for its TS gate. Never discover
+        // a current replacement request after an await; late Stop must not revoke a successor.
+        #[cfg(target_os = "ios")]
+        let pending_revoke = tauri_plugin_polaris_ios::revoke_pending_start_through(
+            generation.wrapping_sub(1),
+            generation,
+        )
+        .await;
         if self
             .stop_inner(StopClaim::AlreadyClaimed(generation))
             .await?
@@ -818,6 +950,8 @@ impl ProxyRuntime {
             // 维度7 #8 对称收口（见方法文档）：marker 门控幂等，失败只记日志不阻断停止。
             self.clear_system_proxy().await;
         }
+        #[cfg(target_os = "ios")]
+        pending_revoke?;
         Ok(())
     }
 
@@ -959,6 +1093,13 @@ impl ProxyRuntime {
         self.schedule_exit_ip_refresh(false);
         if let Ok(mut snap) = self.startup_snapshot.write() {
             *snap = None;
+        }
+        if let Ok(mut ready) = self.ready_main.write() {
+            *ready = None;
+        }
+        #[cfg(target_os = "ios")]
+        if let Ok(mut receipt) = self.ios_ready_session.write() {
+            *receipt = None;
         }
         if let Ok(mut route) = self.mesh_route_run.write() {
             *route = None;

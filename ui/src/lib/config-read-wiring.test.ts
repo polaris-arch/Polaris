@@ -363,6 +363,13 @@ interface MirrorSite {
 
 const MIRROR_SITES: readonly MirrorSite[] = [
   {
+    file: 'mobile/use-mobile-speed-test.ts',
+    shape: 'useAppStore.getState().servers.some',
+    count: 1,
+    surface: 'operation',
+    why: '测量回执写延迟前复核请求目标仍在后端按 id 寻址的磁盘节点集合中；effective 暂存可见对象不能证明该测量目标仍实际存在。',
+  },
+  {
     file: 'mobile/forms/WarpPanel.tsx',
     shape: 'useAppStore.getState().servers',
     count: 1,

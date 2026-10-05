@@ -26,9 +26,16 @@ impl ProxyRuntime {
             return GrpcManagementApi::not_ready();
         }
         let secret = self.clash_api_secret();
-        match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", status.clash_api_port), secret)
-            .await
-        {
+        Self::management_api_at(status.clash_api_port, secret).await
+    }
+
+    /// Bind the ordinary transport to the producer's endpoint before any action I/O.
+    /// This constructor never reads the current runtime's status or saved credentials.
+    pub(super) async fn management_api_at(port: u16, secret: String) -> GrpcManagementApi {
+        if port == 0 {
+            return GrpcManagementApi::not_ready();
+        }
+        match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await {
             Ok(c) => GrpcManagementApi::new(c),
             Err(e) => {
                 log::warn!("管理 API 连接失败（热切换将退回重启）: {e}");

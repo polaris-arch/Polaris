@@ -38,6 +38,12 @@ pub struct LoginProgressReceipt {
     pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_epoch: Option<String>,
 }
 
 pub(super) struct Attempt {
@@ -47,6 +53,7 @@ pub(super) struct Attempt {
     cancel: watch::Sender<bool>,
     done: watch::Sender<bool>,
     progress: Mutex<Option<LoginProgressReceipt>>,
+    main_context: Mutex<Option<(u64, Option<String>)>>,
 }
 
 impl Attempt {
@@ -56,6 +63,27 @@ impl Attempt {
 
     pub fn cancel(&self) {
         self.cancel.send_replace(true);
+    }
+
+    fn cancel_dropped_request(&self) {
+        self.cancel();
+        let context = self.main_context();
+        let mut progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(receipt) = progress.as_mut() {
+            if matches!(
+                receipt.phase.as_str(),
+                "authorized" | "failed" | "timedOut" | "cancelled"
+            ) {
+                return;
+            }
+            receipt.phase = "cancelled".into();
+            receipt.reason = None;
+            receipt.url = None;
+            if let Some((generation, epoch)) = context {
+                receipt.main_generation = Some(generation);
+                receipt.identity_epoch = epoch;
+            }
+        }
     }
 
     pub async fn cancellation(&self) {
@@ -77,17 +105,40 @@ impl Attempt {
         let _ = rx.wait_for(|v| *v).await;
     }
 
-    pub fn record_progress(&self, receipt: LoginProgressReceipt) {
+    pub fn bind_main(&self, generation: u64, identity_epoch: Option<String>) {
+        *self
+            .main_context
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((generation, identity_epoch));
+    }
+
+    pub fn main_context(&self) -> Option<(u64, Option<String>)> {
+        self.main_context
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn record_progress(&self, receipt: LoginProgressReceipt) -> bool {
         let mut current = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.cancelled()
+            && !matches!(receipt.phase.as_str(), "cancelled" | "failed" | "timedOut")
+        {
+            return false;
+        }
         if current.as_ref().is_some_and(|last| {
             matches!(
                 last.phase.as_str(),
                 "authorized" | "failed" | "timedOut" | "cancelled"
             )
         }) {
-            return;
+            return false;
+        }
+        if current.as_ref() == Some(&receipt) {
+            return false;
         }
         *current = Some(receipt);
+        true
     }
 
     pub fn progress_receipt(&self) -> Option<LoginProgressReceipt> {
@@ -273,6 +324,7 @@ impl Attempts {
             cancel,
             done,
             progress: Mutex::new(None),
+            main_context: Mutex::new(None),
         });
         state.entries.insert(id.into(), attempt.clone());
         Ok(attempt)
@@ -310,6 +362,7 @@ impl Attempts {
                 cancel,
                 done,
                 progress: Mutex::new(None),
+                main_context: Mutex::new(None),
             });
             state.entries.insert(id.into(), attempt.clone());
             attempt
@@ -328,7 +381,7 @@ pub(super) struct AttemptGuard(pub Arc<Attempt>, pub bool);
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
         if !self.1 {
-            self.0.cancel();
+            self.0.cancel_dropped_request();
             if !self.0.process_owned.load(Ordering::SeqCst) {
                 self.0.finish();
             }

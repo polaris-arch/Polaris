@@ -307,6 +307,9 @@ const SILENT_TOAST_BASELINE = 0;
  *         节点列表整合后少 1 处；53 + 17 + 3 + 2 - 1 = 74。表单、节点与备份页都调用同一
  *         `toast` 门面，移动宿主仍由 `MobileToaster` 装载并在 effect 中注入；下方两条反向
  *         对照分别移除注入调用和移动宿主，确保这些新反馈不会被误算成可见）。
+ *       → 75（2026-10-06：Home 手动网络 observer 精确取消失败新增一处全局 error。
+ *         Home 卸载后仍由既有 MobileToaster 宿主显示；picker-speed.browser.test.ts 的
+ *         cancel reject + 离开 Home 负门使用真实宿主证明可见，不将取消记为只读豁免）。
  *
  * 🔴 抬这个数的门槛：**必须确认新增的那几处调用真的能到用户眼前**。它今天成立的依据是四条：
  * 宿主已挂（上面第一条断言）＋ 宿主真的调了注入函数（上面第二条）＋ 装配面已证
@@ -320,7 +323,7 @@ const SILENT_TOAST_BASELINE = 0;
  * ——它按整个移动端层叠上下文取材，谁新加一个更高的层就当场红。
  * 🔴 抬这个数之前仍要先过上面那几条，否则就是又写了几处静音反馈还把账做平了。
  */
-const SILENT_TOAST_WITHOUT_HOST = 74;
+const SILENT_TOAST_WITHOUT_HOST = 75;
 
 /* ══════════════════════════ 断言 ══════════════════════════ */
 

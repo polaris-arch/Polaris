@@ -250,8 +250,43 @@ async fn read_body_truncating(
     }
 }
 
-#[async_trait]
-impl UnlockHttp for UnlockClient {
+/// The same before/after boundary wraps every redirect send and terminal body read.
+/// The closure is invoked before polling I/O, so a revoked binding never dispatches another hop.
+async fn with_hop_guard<T, G, F, Fut>(guard: &G, operation: F) -> Result<T, String>
+where
+    G: Fn() -> Result<(), String> + Sync,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    guard()?;
+    let result = operation().await;
+    guard()?;
+    result
+}
+
+async fn with_fresh_hop_guard<T, G, V, VFut, F, Fut>(
+    guard: &G,
+    validate: &V,
+    operation: F,
+) -> Result<T, String>
+where
+    G: Fn() -> Result<(), String> + Sync,
+    V: Fn() -> VFut + Sync,
+    VFut: std::future::Future<Output = Result<(), String>>,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    guard()?;
+    validate().await?;
+    guard()?;
+    let result = operation().await;
+    guard()?;
+    validate().await?;
+    guard()?;
+    result
+}
+
+impl UnlockClient {
     /// **永不 panic、永不 Err**：失败落 `status=0 + error`（契约：由 checker 兜底为 Timeout）。
     ///
     /// # 头集与 emulation 的关系（诚实边界）
@@ -272,7 +307,26 @@ impl UnlockHttp for UnlockClient {
     ///
     /// 权衡：header **顺序**是次级信号，TLS/H2 指纹（本 crate 的主要收益）不受影响；而**值的可控性**
     /// 关系到「UA 与 sec-ch-ua 是否自洽」这条已被单测钉死的硬不变量。故取「值自持、序让步」。
-    async fn request(&self, req: &UnlockRequest) -> UnlockResponse {
+    /// An explicit action can guard each actual HTTP hop while retaining this transport's algorithm.
+    pub async fn request_guarded(
+        &self,
+        req: &UnlockRequest,
+        guard: &(impl Fn() -> Result<(), String> + Sync),
+    ) -> UnlockResponse {
+        self.request_fresh_guarded(req, guard, &|| async { Ok(()) })
+            .await
+    }
+
+    /// Fresh session/control validation belongs to every new HTTP target, including redirects.
+    pub async fn request_fresh_guarded<VFut>(
+        &self,
+        req: &UnlockRequest,
+        guard: &(impl Fn() -> Result<(), String> + Sync),
+        validate: &(impl Fn() -> VFut + Sync),
+    ) -> UnlockResponse
+    where
+        VFut: std::future::Future<Output = Result<(), String>> + Send,
+    {
         let mut current = req.url.clone();
         let mut chain: Vec<RedirectHop> = Vec::new();
 
@@ -288,15 +342,17 @@ impl UnlockHttp for UnlockClient {
                 builder = builder.body(body.clone());
             }
 
-            let sent = match tokio::time::timeout(UNLOCK_TIMEOUT, builder.send()).await {
-                Err(_) => {
-                    return UnlockResponse::err(format!(
-                        "请求超时（{}ms）",
-                        UNLOCK_TIMEOUT.as_millis()
-                    ))
+            let sent = match with_fresh_hop_guard(guard, validate, || async {
+                match tokio::time::timeout(UNLOCK_TIMEOUT, builder.send()).await {
+                    Err(_) => Err(format!("请求超时（{}ms）", UNLOCK_TIMEOUT.as_millis())),
+                    Ok(Err(error)) => Err(format!("请求失败: {error}")),
+                    Ok(Ok(response)) => Ok(response),
                 }
-                Ok(Err(e)) => return UnlockResponse::err(format!("请求失败: {e}")),
-                Ok(Ok(r)) => r,
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => return UnlockResponse::err(error),
             };
             let resp = sent;
             let status = resp.status().as_u16();
@@ -339,11 +395,17 @@ impl UnlockHttp for UnlockClient {
                 }
             }
 
-            let (body, truncated) =
-                match read_body_truncating(resp, MAX_BODY_BYTES, UNLOCK_TIMEOUT).await {
-                    Ok(v) => v,
-                    Err(e) => return UnlockResponse::err(e),
-                };
+            let (body, truncated) = match with_hop_guard(guard, || {
+                read_body_truncating(resp, MAX_BODY_BYTES, UNLOCK_TIMEOUT)
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return UnlockResponse::err(e),
+            };
+            if let Err(error) = validate().await.and_then(|()| guard()) {
+                return UnlockResponse::err(error);
+            }
             return UnlockResponse {
                 status,
                 body: String::from_utf8_lossy(&body).into_owned(),
@@ -354,6 +416,13 @@ impl UnlockHttp for UnlockClient {
             };
         }
         UnlockResponse::err(format!("重定向次数超过上限（{MAX_REDIRECTS}）"))
+    }
+}
+
+#[async_trait]
+impl UnlockHttp for UnlockClient {
+    async fn request(&self, req: &UnlockRequest) -> UnlockResponse {
+        self.request_guarded(req, &|| Ok(())).await
     }
 }
 

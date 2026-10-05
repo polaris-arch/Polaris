@@ -47,12 +47,16 @@ api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
 api.server.tailscaleStateExists = async () => {
   if (mode === 'state-read-fail') throw Error('state unavailable');
-  return { 'ts-1': mode === 'state-true' };
+  return { 'ts-1': mode === 'state-true' || mode === 'ios-existing' };
 };
-const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode };
+const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode, mainStarts: 0, mainStops: 0, progressQueries: [], receipts: {} };
+api.proxy.start = async () => { test.mainStarts++; };
+api.proxy.stop = async () => { test.mainStops++; };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
+  test.progressQueries.push([serverId,attemptId]);
   if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
   if (test.failProgress) throw new Error('RECEIPT_READ_FAILED');
+  if (test.receipts[attemptId]) return test.receipts[attemptId];
   return test.receipt?.serverId === serverId && test.receipt?.attemptId === attemptId ? test.receipt : null;
 };
 api.server.tailscaleGetStatus = async () => mode?.startsWith('main') && test.starts > 0
@@ -67,8 +71,18 @@ api.server.tailscaleLoginPrepare = async () => {
 };
 api.server.tailscaleLogout = async () => { test.logouts++; };
 api.server.tailscaleLoginCancel = async (serverId, attemptId) => { test.cancels.push([serverId,attemptId]); };
-api.server.tailscaleLogin = async () => {
+api.server.tailscaleLogin = async (node, request) => {
   test.starts++;
+  test.startRequest = { serverId: node.id, attemptId: request.attemptId };
+  if (mode === 'ios-existing') throw { code: 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED' };
+  if (mode === 'ios-pending') {
+    test.emit('onTailscaleLoginProgress', { ...test.startRequest, phase: 'preparingConnection' });
+    await new Promise(resolve => { test.releaseStart = resolve; });
+    return { started: false, reason: 'inMainCore' };
+  }
+  if (mode?.startsWith('main')) {
+    test.emit('onTailscaleLoginProgress', { ...test.startRequest, phase: 'mainCore', mainGeneration: 7, identityEpoch: 'epoch-A' });
+  }
   if (mode === 'early-start') await new Promise(resolve => { test.releaseStart = resolve; });
   if (mode?.startsWith('main')) return { started: false, reason: 'inMainCore',
     configurationPending: mode === 'main-pending' };
@@ -97,6 +111,10 @@ function Host() {
 useMobileFormStore.getState().open({kind:'ts-login', serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><Host /><MobileToaster /></main>);
 `;
+const desktopEntry = entry.replace(
+  "import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';",
+  "import { TsLoginDialog as TsLoginPanel } from '/src/components/dialogs/TsLoginDialog';\nimport '/src/styles/index.css';",
+);
 
 let server: ViteDevServer;
 let browser: Browser;
@@ -105,10 +123,13 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
   beforeAll(async () => {
     server = await createServer({ root, server: { host: '127.0.0.1', port: 0, strictPort: false }, plugins: [{
       name: 'ts-login-browser-fixture',
-      resolveId(id) { if (id === '/ts-login-fixture.tsx') return id; },
-      load(id) { if (id === '/ts-login-fixture.tsx') return entry; },
+      resolveId(id) { if (id === '/ts-login-fixture.tsx' || id === '/ts-desktop-fixture.tsx') return id; },
+      load(id) { if (id === '/ts-login-fixture.tsx') return entry; if (id === '/ts-desktop-fixture.tsx') return desktopEntry; },
       configureServer(vite) { vite.middlewares.use('/__ts-login', async (_req, res) => {
         const html = await vite.transformIndexHtml('/__ts-login', '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/ts-login-fixture.tsx"></script></html>');
+        res.setHeader('Content-Type', 'text/html'); res.end(html);
+      }); vite.middlewares.use('/__ts-desktop', async (_req, res) => {
+        const html = await vite.transformIndexHtml('/__ts-desktop', '<html lang="zh-CN"><div id="root"></div><script type="module" src="/ts-desktop-fixture.tsx"></script></html>');
         res.setHeader('Content-Type', 'text/html'); res.end(html);
       }); },
     }] });
@@ -120,29 +141,48 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
 
-  it('iOS saves Auth Key without prepare, login, logout or cancellation and keeps the main VPN URL reachable', async () => {
+  it('iOS starts the real login action, shows preparation while invoke waits, and detaches authorized progress without late cancel', async () => {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
     try {
       page.setDefaultTimeout(4000);
-      await page.goto(`${origin}/__ts-login?mode=ios`);
-      await page.getByText('iOS 暂不支持独立登录会话', { exact: false }).waitFor();
-      expect(await page.getByText('授权后本机自动加入 tailnet', { exact: false }).count()).toBe(0);
-      await page.evaluate(() => (window as any).__tsTest.emit('onTailscaleAuth', {
-        serverId: 'ts-1', nodeName: 'n', url: 'https://login.example/main', transient: false,
-      }));
-      await page.getByText('https://login.example/main', { exact: true }).waitFor();
-      expect(await page.evaluate(() => (window as any).__tsTest.opens)).toEqual(['https://login.example/main']);
+      await page.goto(`${origin}/__ts-login?mode=ios-pending`);
       await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
       await page.locator('#mts-authkey').fill('synthetic-test-key');
       await page.locator('.m-form-foot .primary').click();
-      await page.getByText('配置已保存，尚未确认登录', { exact: false }).waitFor();
+      await page.getByText('正在准备代理连接，请完成系统授权。').waitFor();
       expect(await page.evaluate(() => {
         const t = (window as any).__tsTest;
-        return { saves: t.saves, starts: t.starts, prepares: t.prepares, logouts: t.logouts, cancels: t.cancels.length };
-      })).toEqual({ saves: 1, starts: 0, prepares: 0, logouts: 0, cancels: 0 });
-      await page.locator('.m-form-head .m-form-x').click();
+        return { saves: t.saves, starts: t.starts, prepares: t.prepares, logouts: t.logouts };
+      })).toEqual({ saves: 1, starts: 1, prepares: 1, logouts: 0 });
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleLoginProgress', { ...test.startRequest, phase: 'waitingForReady' });
+      });
+      await page.getByText('等待代理就绪…').waitFor();
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleLoginProgress', { ...test.startRequest, phase: 'authorized', mainGeneration: 7, identityEpoch: 'epoch-A', url: null });
+      });
       await page.getByRole('dialog').waitFor({ state: 'detached' });
-      expect(await page.evaluate(() => (window as any).__tsTest.cancels.length)).toBe(0);
+      await page.evaluate(() => (window as any).__tsTest.releaseStart());
+      await page.waitForTimeout(50);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { cancels: t.cancels.length, mainStarts: t.mainStarts, mainStops: t.mainStops };
+      })).toEqual({ cancels: 0, mainStarts: 0, mainStops: 0 });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('iOS existing identity returns a specific retirement hint without blind logout', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=ios-existing`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.locator('#mts-authkey').fill('synthetic-test-key');
+      await page.locator('.m-form-foot .primary').click();
+      await page.getByText('更换 Auth Key 前需安全清理已有身份；iOS 暂不支持此操作。', { exact: false }).first().waitFor();
+      expect(await page.evaluate(() => (window as any).__tsTest.logouts)).toBe(0);
+      expect(await page.locator('.m-form-foot .primary').isEnabled()).toBe(true);
     } finally { await page.close(); }
   }, 30_000);
 
@@ -403,23 +443,81 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
     } finally { await page.close(); }
   }, 30_000);
 
-  it('a fresh main-core pull completes the owned attempt; pending config cannot inherit that success', async () => {
-    for (const mode of ['main', 'main-pending']) {
-      const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
-      try {
-        await page.goto(`${origin}/__ts-login?mode=${mode}`);
-        await page.locator('.m-form-foot .primary').click();
-        await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
-        if (mode === 'main') {
-          await page.getByRole('dialog').waitFor({ state: 'detached' });
-          expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('authorized');
-          expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
-        } else {
-          await page.waitForTimeout(100);
-          expect(await page.getByRole('dialog').count()).toBe(1);
-          expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('mainCore');
-        }
-      } finally { await page.close(); }
-    }
+  it('global main-core Running cannot complete the request; a bound receipt does', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=main`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.attempt()?.phase === 'mainCore');
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.emit('onTailscaleStatus', { serverId: 'ts-1', backendState: 'Running', loggedIn: true,
+          expired: false, peers: [], tailscaleIPs: [], authURL: 'https://login.example/unbound' });
+        test.emit('onTailscaleAuth', { serverId: 'ts-1', nodeName: 'n', url: 'https://login.example/unbound' });
+      });
+      await page.waitForTimeout(50);
+      expect(await page.getByRole('dialog').count()).toBe(1);
+      expect(await page.evaluate(() => (window as any).__tsTest.opens)).toEqual([]);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipt = { ...test.startRequest, phase: 'mainCore', mainGeneration: 7, identityEpoch: 'epoch-A', url: 'https://login.example/bound' };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.getByText('https://login.example/bound', { exact: true }).waitFor();
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipt = { ...test.receipt, phase: 'authorized', url: null };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+  it('desktop same-node retry recovers B on focus and rejects a delayed A receipt', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      page.setDefaultTimeout(4000);
+      await page.goto(`${origin}/__ts-desktop`);
+      const submit = page.locator('.entry-form-dlg .btn.flow');
+      await submit.click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      const attemptA = await page.evaluate(() => (window as any).__tsTest.attempt().attemptId as string);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.holdProgress = true;
+        test.receipts[test.attempt().attemptId] = { ...test.attempt(), phase: 'awaitingAuth', url: 'https://login.example/old-A' };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseProgress);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.holdProgress = false;
+        test.emit('onTailscaleLoginProgress', { ...test.attempt(), phase: 'failed', reason: 'authorizationTimedOut', url: null });
+      });
+      await page.waitForFunction(() => document.querySelector<HTMLButtonElement>('.entry-form-dlg .btn.flow')?.disabled === false);
+      await submit.click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 2);
+      const attemptB = await page.evaluate(() => (window as any).__tsTest.attempt().attemptId as string);
+      expect(attemptB).not.toBe(attemptA);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipts[test.attempt().attemptId] = { ...test.attempt(), phase: 'mainCore', mainGeneration: 7, identityEpoch: 'epoch-B', url: 'https://login.example/bound-B' };
+        window.dispatchEvent(new Event('focus'));
+      });
+      const url = page.locator('.entry-form-dlg input[readonly]');
+      await page.waitForFunction(() => document.querySelector<HTMLInputElement>('.entry-form-dlg input[readonly]')?.value === 'https://login.example/bound-B');
+      await page.evaluate(() => (window as any).__tsTest.releaseProgress());
+      await page.waitForTimeout(50);
+      expect(await url.inputValue()).toBe('https://login.example/bound-B');
+      expect(await page.evaluate(() => (window as any).__tsTest.progressQueries.at(-1))).toEqual(['ts-1', attemptB]);
+      await page.evaluate(() => {
+        const test = (window as any).__tsTest;
+        test.receipts[test.attempt().attemptId] = { ...test.receipts[test.attempt().attemptId], phase: 'authorized', url: null };
+        window.dispatchEvent(new Event('focus'));
+      });
+      await page.waitForFunction(() => (window as any).__tsTest.attempt().phase === 'authorized');
+      expect(await page.evaluate(() => (window as any).__tsTest.attempt().attemptId)).toBe(attemptB);
+      expect(await page.evaluate(() => (window as any).__tsTest.mainStops)).toBe(0);
+    } finally { await page.close(); }
   }, 30_000);
 });

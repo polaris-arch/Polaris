@@ -291,27 +291,27 @@ const SITES: readonly ActionSite[] = [
     route: 'no-staged-only-id',
     why: '仅取磁盘镜像或本次新建的 id：取消使用由提交计划生成的 activeRequest 或 server.id',
   },
+  {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    callee: 'api.server.tailscaleLoginProgress',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '仅取磁盘镜像或本次新建的 id：焦点回读只使用提交前登记的 serverId+attemptId；节点已保存并通过刷新对账，不取 effective 暂存身份，旧请求回执不能覆盖新请求。',
+  },
   // 移动端登录与桌面共用提交计划；既有身份从磁盘 servers 寻址，新身份先 mint 再保存。
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
     callee: 'api.server.add',
-    count: 2,
+    count: 1,
     route: 'no-staged-only-id',
-    why: '两处都不传实体 id：iOS 仅保存配置腿与 transient 登录 save 腿都只保存同一 planTsLoginSubmit 新建的节点；effective 集合只用于名称候选',
+    why: '不传实体 id：各平台共用真实登录 save 腿，只保存 planTsLoginSubmit 新建的节点；effective 集合只用于名称候选，不再有 iOS 仅保存配置的分支。',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
     callee: 'api.server.update',
-    count: 2,
-    route: 'no-staged-only-id',
-    why: '两处仅取磁盘镜像或本次新建的 id：iOS 仅保存配置腿与 transient 登录 save 腿共用提交计划；既有节点从 servers.find(serverId) 取得',
-  },
-  {
-    file: 'mobile/forms/TsLoginPanel.tsx',
-    callee: 'api.server.tailscaleGetStatus',
     count: 1,
     route: 'no-staged-only-id',
-    why: '不传实体 id：无参调用读取整机 TS 状态快照',
+    why: '仅取磁盘镜像或本次新建的 id：各平台共用真实登录 save 腿，既有节点从磁盘 servers.find(serverId) 取得并交给提交计划；请求授权仅使用 bound progress，不再轮询全局 TS STATUS。',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',

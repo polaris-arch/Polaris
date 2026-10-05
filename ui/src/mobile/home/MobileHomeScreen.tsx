@@ -41,6 +41,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } 
 import './home.css';
 import { useTranslation } from 'react-i18next';
 import { api, unlockApi } from '@/ipc';
+import { manualNetworkContextMatches } from '@/contracts/manual-network-check';
+import { manualSpeedTestCaps } from '@/domain/endpoint-routes';
 import type {
   ConnectionsDetailUpdate,
   ProxyMode,
@@ -81,7 +83,6 @@ import { countryCodeToFlagAsset } from '@/domain/flag-assets';
 import { localizeRegion, resolveExitNodeFlagCode, resolveExitRegion } from '@/domain/exit-flag';
 import { deriveTsExitWarning } from '@/domain/tailscale-exit-warning';
 import { tsExitAction } from '../ts-exit-action';
-import { loginAttemptActive } from '@/domain/tailscale-login-progress';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
 import { createTopicSubscription } from '@/lib/topic-subscription';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
@@ -157,7 +158,8 @@ export function MobileHomeScreen(): ReactElement {
   /** 连接/断开在飞（后端只投影 `starting`，「停止中」没有对应字段，由这里补）。 */
   const [connectBusy, setConnectBusy] = useState<'starting' | 'stopping' | null>(null);
   const [manualCheckBusy, setManualCheckBusy] = useState(false);
-  const checkRun = useRef({ generation: 0, busy: false, alive: true });
+  const checkRun = useRef({ generation: 0, busy: false, alive: true, requestId: null as string | null });
+  const normalMainRequired = manualSpeedTestCaps(false).normalMainRequired === true;
   const runWrite = useMemo(() => createRunWrite(setWriteErrors, t), [t]);
 
   /* ── store ───────────────────────────────────────────────────────────────── */
@@ -198,13 +200,24 @@ export function MobileHomeScreen(): ReactElement {
   useEffect(() => {
     checkRun.current.alive = true;
     checkRun.current.generation += 1;
-    // Keep the single-flight lock while both old promises settle. Clearing it here would
-    // permit a new force run to overlap the old run after a stop, switch, or reconnect.
+    // A normal-main preparation may change running/startTime itself. Only independent
+    // checks use that old connection fence; iOS consumes the backend ready context below.
     return () => {
       checkRun.current.generation += 1;
       checkRun.current.alive = false;
+      const requestId = checkRun.current.requestId;
+      if (requestId) void runWrite('network-check', async () => {
+        try {
+          await unlockApi.cancelManualCheck(requestId);
+        } catch {
+          const message = i18n.t('prerequisite.cancelFailed');
+          toast.error(message);
+          throw new Error(message);
+        }
+      });
     };
-  }, [proxyRunning, proxyStatus?.startTime, selectedServerId, routing]);
+  }, [normalMainRequired, normalMainRequired ? null : proxyRunning,
+    normalMainRequired ? null : proxyStatus?.startTime, selectedServerId, routing]);
 
   /* ── 事件流：stats + detail ─────────────────────────────────────────────── */
   const [stats, setStats] = useState<TrafficStats | null>(null);
@@ -500,8 +513,32 @@ export function MobileHomeScreen(): ReactElement {
     const startedAt = useAppStore.getState().proxyStatus?.startTime;
     const startedServerId = useAppStore.getState().selectedServerId;
     const startedRouting = getEffectiveConfig()?.proxyMode ?? 'smart';
+    const startedConfig = JSON.stringify(getEffectiveConfig());
+    const requestId = normalMainRequired ? crypto.randomUUID() : null;
+    checkRun.current.requestId = requestId;
     setManualCheckBusy(true);
     void runWrite('network-check', async () => {
+      if (requestId) {
+        const result = await unlockApi.manualCheck(requestId, true);
+        const previous = useAppStore.getState().proxyStatus;
+        const current = await api.proxy.getStatus();
+        const state = useAppStore.getState();
+        if (checkRun.current.generation !== generation || !checkRun.current.alive
+          || state.selectedServerId !== startedServerId
+          || JSON.stringify(getEffectiveConfig()) !== startedConfig
+          || !manualNetworkContextMatches(result.context, requestId, current)
+          || (state.proxyStatus !== previous && !manualNetworkContextMatches(result.context, requestId, state.proxyStatus))) return;
+        state.setProxyStatus(current);
+        if (result.ipInfo.data) setIpInfo(result.ipInfo.data);
+        if (result.unlock.data) applyUnlockSnapshot(result.unlock.data);
+        state.setUnlock({ running: false });
+        // The same explicit network action also refreshes the current RTT, after ready.
+        await latencyCheck.runCurrent();
+        const failures = [result.ipInfo.error && t('prerequisite.ipInfoFailed'),
+          result.unlock.error && t('prerequisite.unlockFailed')].filter(Boolean);
+        if (failures.length) throw new Error(failures.join(' '));
+        return;
+      }
       beginUnlockCheck();
       const [ip, services] = await Promise.allSettled([
         api.ipInfo.get(true, true),
@@ -520,9 +557,11 @@ export function MobileHomeScreen(): ReactElement {
       if (services.status === 'rejected') throw services.reason;
     }).finally(() => {
       checkRun.current.busy = false;
+      checkRun.current.requestId = null;
+      if (requestId && checkRun.current.generation === generation) useAppStore.getState().setUnlock({ running: false });
       if (checkRun.current.alive) setManualCheckBusy(false);
     });
-  }, [runWrite, beginUnlockCheck, applyUnlockSnapshot, setIpInfo]);
+  }, [runWrite, beginUnlockCheck, applyUnlockSnapshot, setIpInfo, normalMainRequired, latencyCheck, t]);
 
   const onUseAsExit = useCallback(
     (server: ServerConfig) => {
@@ -580,14 +619,15 @@ export function MobileHomeScreen(): ReactElement {
   /** Match the action to the warning: missing auth URL must not open exit setup. */
   const onTsExitAction = useCallback(() => {
     if (tsId === undefined) return;
-    const storeUrl = !tsLoginAttempt || loginAttemptActive(tsLoginAttempt.phase) ? tsAuthUrl : null;
-    const action = tsExitAction(tsExitWarning, tsStatus?.authURL, storeUrl);
+    const action = tsExitAction(tsExitWarning, {
+      liveUrl: tsStatus?.authURL, storeUrl: tsAuthUrl, attempt: tsLoginAttempt, normalMainRequired,
+    });
     if (action.kind === 'login-url') {
       void runWrite('switch-node', () => api.system.openExternal(action.url));
     } else {
       openMobileForm({ kind: action.kind === 'login-panel' ? 'ts-login' : 'ts-exit', serverId: tsId });
     }
-  }, [tsExitWarning, tsStatus?.authURL, tsAuthUrl, tsLoginAttempt, tsId, runWrite, openMobileForm]);
+  }, [tsExitWarning, tsStatus?.authURL, tsAuthUrl, tsLoginAttempt, tsId, runWrite, openMobileForm, normalMainRequired]);
 
   /* ── ⑦ 规则写腿。三个入口（快速两颗 / 新建 / 合并）共用一个控件 id 与一条暂存闸门 ──────── */
 
@@ -708,7 +748,7 @@ export function MobileHomeScreen(): ReactElement {
       onToggleConnect={onToggleConnect}
       onNetworkCheck={() => {
         runNetworkCheck();
-        void latencyCheck.runCurrent();
+        if (!normalMainRequired) void latencyCheck.runCurrent();
       }}
       latencyCheck={latencyCheck.view}
       tsExitWarning={tsExitWarning}

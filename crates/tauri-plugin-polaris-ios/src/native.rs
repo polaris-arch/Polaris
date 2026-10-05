@@ -1,7 +1,9 @@
 use super::lifecycle_state::LifecycleState;
 use serde::de::DeserializeOwned;
+use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use tauri::plugin::mobile::PluginInvokeError;
 use tauri::plugin::PluginHandle;
 
 tauri::ios_plugin_binding!(init_plugin_polaris_ios);
@@ -60,9 +62,87 @@ pub struct TunnelStatus {
     pub cleanup_error: Option<String>,
     pub last_error: Option<String>,
     pub lifecycle: Option<String>,
+    pub extension_generation: Option<u64>,
+    pub uncertain_settings_generation: Option<u64>,
+}
+
+/// An ordinary action session receipt, produced only by this start adapter.
+/// It grants neither Go disposal evidence nor TS state ownership.
+#[derive(Clone, Debug)]
+pub struct ReadySessionReceipt {
+    native_generation: u64,
+    shared_generation: u64,
+    session_id: String,
+    request_id: String,
+    config_digest: String,
+    extension_generation: u64,
+}
+
+impl ReadySessionReceipt {
+    fn from_start(
+        snapshot: &TunnelStatus,
+        native_generation: u64,
+        shared_generation: u64,
+        request_id: &str,
+    ) -> Result<Self, String> {
+        snapshot.require_ready()?;
+        if snapshot.request_id.as_deref() != Some(request_id) {
+            return Err("ReadyUnknown: iOS start returned another request's receipt".into());
+        }
+        Ok(Self {
+            native_generation,
+            shared_generation,
+            session_id: snapshot
+                .session_id
+                .clone()
+                .ok_or("ReadyUnknown: missing session identity")?,
+            request_id: request_id.to_owned(),
+            config_digest: snapshot
+                .config_digest
+                .clone()
+                .ok_or("ReadyUnknown: missing config digest")?,
+            extension_generation: snapshot
+                .extension_generation
+                .ok_or("ReadyUnknown: missing extension generation")?,
+        })
+    }
+
+    fn payload(&self, nonce: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionID": self.session_id, "requestID": self.request_id,
+            "configDigest": self.config_digest, "extensionGeneration": self.extension_generation,
+            "observationNonce": nonce,
+        })
+    }
 }
 
 impl TunnelStatus {
+    fn require_ready(&self) -> Result<(), String> {
+        if self.status != 3
+            || !self.running
+            || !self.active
+            || !self.profile_exists
+            || self.ownership != "ownedSessionReported"
+            || self.lifecycle.as_deref() != Some("running")
+            || self.runtime_stopped != Some(false)
+            || self
+                .extension_generation
+                .filter(|generation| *generation > 0)
+                .is_none()
+            || self.uncertain_settings_generation.is_some()
+            || self.cleanup_error.is_some()
+            || self.last_error.is_some()
+            || self.session_id.as_deref().is_none_or(str::is_empty)
+            || self.request_id.as_deref().is_none_or(str::is_empty)
+            || self.config_digest.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(
+                "ReadyUnknown: iOS session has no exact successful live extension receipt".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn require_idle(&self) -> Result<(), String> {
         if self.active {
             return Err(
@@ -88,28 +168,58 @@ impl TunnelStatus {
     }
 }
 
+enum NativeCallFailure {
+    Terminal(String),
+    Unknown(String),
+}
+
+impl NativeCallFailure {
+    fn message(self) -> String {
+        match self {
+            Self::Terminal(message) | Self::Unknown(message) => message,
+        }
+    }
+}
+
 async fn call<T: DeserializeOwned + Send + 'static>(
     command: &'static str,
     payload: serde_json::Value,
     seconds: u64,
-) -> Result<T, String> {
+    start_generation: Option<u64>,
+) -> Result<T, NativeCallFailure> {
     let plugin = PLUGIN
         .get()
-        .ok_or("iOS VPN plugin is not initialized")?
+        .ok_or_else(|| NativeCallFailure::Unknown("iOS VPN plugin is not initialized".into()))?
         .clone();
-    // Keep the detached receiver alive after timeout for Tauri's native callback.
-    // It never writes lifecycle state; only the caller may commit the receipt.
+    // Keep the detached receiver alive after timeout/drop for Tauri's callback.
+    // A genuine terminal callback may release only its exact registration;
+    // it cannot produce readiness or write another generation's running state.
     let task = tauri::async_runtime::spawn(async move {
-        plugin
+        let result = plugin
             .run_mobile_plugin_async::<T>(command, payload)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|error| match error {
+                PluginInvokeError::InvokeRejected(response) => {
+                    NativeCallFailure::Terminal(response.message.unwrap_or_else(|| {
+                        "StartupFailed: Native VPN rejected the request without a message".into()
+                    }))
+                }
+                other => NativeCallFailure::Unknown(other.to_string()),
+            });
+        if result.is_ok() || matches!(&result, Err(NativeCallFailure::Terminal(_))) {
+            if let Some(generation) = start_generation {
+                if let Ok(mut state) = state().lock() {
+                    state.native_terminal(generation);
+                }
+            }
+        }
+        result
     });
     match tokio::time::timeout(Duration::from_secs(seconds), task).await {
-        Ok(result) => result.map_err(|e| e.to_string())?,
-        Err(_) => Err(format!(
+        Ok(result) => result.map_err(|error| NativeCallFailure::Unknown(error.to_string()))?,
+        Err(_) => Err(NativeCallFailure::Unknown(format!(
             "iOS VPN {command} timed out; check the system VPN status before retrying"
-        )),
+        ))),
     }
 }
 
@@ -118,7 +228,9 @@ pub async fn status() -> Result<TunnelStatus, String> {
         .lock()
         .map_err(|_| "iOS VPN state lock poisoned")?
         .generation();
-    let result = call::<TunnelStatus>("status", serde_json::json!({}), 12).await;
+    let result = call::<TunnelStatus>("status", serde_json::json!({}), 12, None)
+        .await
+        .map_err(NativeCallFailure::message);
     state()
         .lock()
         .map_err(|_| "iOS VPN state lock poisoned")?
@@ -129,43 +241,154 @@ pub async fn status() -> Result<TunnelStatus, String> {
     result
 }
 
-async fn lifecycle_call(command: &'static str, config: Option<&str>) -> Result<(), String> {
-    let generation = state()
-        .lock()
-        .map_err(|_| "iOS VPN state lock poisoned")?
-        .begin()?;
+fn fresh_request_id() -> Result<String, String> {
+    let mut nonce = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut nonce))
+        .map_err(|error| format!("Cannot register iOS request identity: {error}"))?;
+    Ok(nonce.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+async fn lifecycle_call(
+    command: &'static str,
+    config: Option<&str>,
+    shared_generation: Option<u64>,
+) -> Result<(TunnelStatus, u64, String), String> {
+    let request_id = fresh_request_id()?;
+    let generation = {
+        let mut state = state().lock().map_err(|_| "iOS VPN state lock poisoned")?;
+        match shared_generation {
+            Some(shared) => state.begin_start(shared, request_id.clone())?,
+            None => state.begin()?,
+        }
+    };
     let _receipt = RequestReceipt(generation);
-    let request_id = generation.to_string();
     let payload = match config {
         Some(config) => serde_json::json!({"configContent": config, "requestID": request_id}),
         None => serde_json::json!({"requestID": request_id}),
     };
-    let result =
-        call::<TunnelStatus>(command, payload, if command == "start" { 45 } else { 30 }).await;
+    let result = match call::<TunnelStatus>(
+        command,
+        payload,
+        if command == "start" { 45 } else { 30 },
+        config.map(|_| generation),
+    )
+    .await
+    {
+        Err(NativeCallFailure::Unknown(message)) => {
+            state()
+                .lock()
+                .map_err(|_| "iOS VPN state lock poisoned")?
+                .abandon(generation);
+            return Err(message);
+        }
+        result => result,
+    };
     let running = result.as_ref().ok().map(|snapshot| snapshot.running);
-    state()
+    let committed = state()
         .lock()
         .map_err(|_| "iOS VPN state lock poisoned")?
         .finish(generation, running);
-    result.map(|_| ())
+    if !committed {
+        return Err("StartCancelled: iOS lifecycle receipt was superseded or revoked".into());
+    }
+    result
+        .map(|snapshot| (snapshot, generation, request_id))
+        .map_err(NativeCallFailure::message)
 }
 
 // Dropping the caller's future leaves the native task alive for its callback,
-// but releases only this generation's pending receipt as unknown.
+// but abandons only this generation's observation as unknown. Its submitted
+// start remains registered until native terminal or explicit user revocation.
 struct RequestReceipt(u64);
 impl Drop for RequestReceipt {
     fn drop(&mut self) {
         if let Ok(mut state) = state().lock() {
-            state.finish(self.0, None);
+            state.abandon(self.0);
         }
     }
 }
 
-pub async fn start(config: &str) -> Result<(), String> {
-    lifecycle_call("start", Some(config)).await
+pub async fn start(config: &str, shared_generation: u64) -> Result<ReadySessionReceipt, String> {
+    let (snapshot, generation, request_id) =
+        lifecycle_call("start", Some(config), Some(shared_generation)).await?;
+    let receipt =
+        ReadySessionReceipt::from_start(&snapshot, generation, shared_generation, &request_id)?;
+    if !state()
+        .lock()
+        .map_err(|_| "iOS VPN state lock poisoned")?
+        .accepts_receipt(generation, shared_generation)
+    {
+        return Err("StartCancelled: iOS start was revoked before receipt delivery".into());
+    }
+    Ok(receipt)
 }
 pub async fn stop() -> Result<(), String> {
-    lifecycle_call("stop", None).await
+    lifecycle_call("stop", None, None).await.map(|_| ())
+}
+
+/// Called immediately after the normal user Stop claim, before the TS gate.
+pub async fn revoke_pending_start_through(
+    captured_previous_generation: u64,
+    stop_generation: u64,
+) -> Result<(), String> {
+    if stop_generation <= captured_previous_generation {
+        return Err("iOS Stop has an invalid generation binding".into());
+    }
+    let expected_request_id = state()
+        .lock()
+        .map_err(|_| "iOS VPN state lock poisoned")?
+        .revoke_start_through(captured_previous_generation);
+    let Some(expected_request_id) = expected_request_id else {
+        return Ok(());
+    };
+    // This is an intent acknowledgement, never cleanup proof. Swift also remembers
+    // the nonce when this dispatch wins the race against the old start dispatch.
+    let _: serde_json::Value = call(
+        "revokePendingStart",
+        serde_json::json!({
+            "expectedStartRequestID": expected_request_id,
+            "stopRequestID": format!("{stop_generation}:{}", fresh_request_id()?),
+        }),
+        12,
+        None,
+    )
+    .await
+    .map_err(NativeCallFailure::message)?;
+    Ok(())
+}
+
+pub async fn observe_session(receipt: &ReadySessionReceipt) -> Result<(), String> {
+    let accepts = || -> Result<bool, String> {
+        Ok(state()
+            .lock()
+            .map_err(|_| "iOS VPN state lock poisoned")?
+            .accepts_receipt(receipt.native_generation, receipt.shared_generation))
+    };
+    if !accepts()? {
+        return Err("ReadyUnknown: iOS session receipt was superseded".into());
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Observation {
+        observation_nonce: String,
+        snapshot: TunnelStatus,
+    }
+    let nonce = fresh_request_id()?;
+    let observed: Observation = call("observeSession", receipt.payload(&nonce), 12, None)
+        .await
+        .map_err(NativeCallFailure::message)?;
+    observed.snapshot.require_ready()?;
+    if !accepts()?
+        || observed.observation_nonce != nonce
+        || observed.snapshot.session_id.as_deref() != Some(receipt.session_id.as_str())
+        || observed.snapshot.request_id.as_deref() != Some(receipt.request_id.as_str())
+        || observed.snapshot.config_digest.as_deref() != Some(receipt.config_digest.as_str())
+        || observed.snapshot.extension_generation != Some(receipt.extension_generation)
+    {
+        return Err("ReadyUnknown: iOS live observation does not match the ready session".into());
+    }
+    Ok(())
 }
 pub fn started() -> bool {
     state().lock().map(|state| state.running()).unwrap_or(false)

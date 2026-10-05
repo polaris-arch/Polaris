@@ -703,8 +703,9 @@ describe('④ Tailscale 登录：URL 与登录态都只**读** store，不在面
     expect(panel, '面板又挂了一条 URL 订阅 —— 面板一卸载它就没了，而登录多半发生在别的屏').not.toContain(
       'onTailscaleAuth(',
     );
-    expect(panel, '面板没有从 store 读 URL').toContain('tailscaleAuthUrls[');
-    // 应用级那条必须还在（它才是真正的写入方；被摘掉的话面板永远等不到地址）。
+    expect(panel, '面板必须按本次请求读取进度').toContain('progressForLoginRequest(');
+    expect(panel, '全局 URL 缓存不能冒领本次登录地址').not.toContain('tailscaleAuthUrls[');
+    // Legacy AUTH remains available outside an active request; request URLs use producer progress.
     expect(strip(read('../app-wiring.ts')), '应用级的 onTailscaleAuth 订阅不见了').toContain(
       'api.proxy.onTailscaleAuth(',
     );

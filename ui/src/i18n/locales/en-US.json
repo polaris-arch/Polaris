@@ -2351,8 +2351,8 @@
     "errUnknown": "The operation failed."
   },
   "ts": {
-    "iosAccountActionsUnavailable": "iOS does not yet support separate login sessions, switching accounts, or logout. You can save node settings and an Auth Key; authorization uses a login URL returned by the main VPN.",
-    "iosConfigurationSaved": "Settings saved; login has not been confirmed. Connect or reconnect the main VPN from Home. Saving a new Auth Key does not clear an existing account session.",
+    "identityRetirementRequired": "Replacing an Auth Key requires safe retirement of the existing identity. This is currently unavailable on iOS.",
+    "iosAccountActionsUnavailable": "iOS cannot yet safely retire an existing identity, switch accounts, or log out. First login uses the normal VPN connection.",
     "acceptDefaultResolvers": "Accept tailnet default resolvers",
     "acceptDefaultResolversHint": "Also accept the default DNS resolvers pushed by the tailnet (split-DNS). Optional.",
     "acceptRoutes": "Accept subnet routes",
@@ -2466,10 +2466,8 @@
     "loginAttemptFailed": "This login request failed. Try again.",
     "loginCancelFailed": "Could not cancel login. Try again.",
     "loginSubmitted": "Login request submitted. Please wait for authorization to complete.",
-    "loginMainCoreStatus": "Reading this node’s authorization status in the main connection.",
     "loginMainCoreAuthorized": "This node is authorized in the main connection; newly saved authentication settings may still need to be applied.",
     "loginMainCoreAwaiting": "This node needs authorization. Getting the login URL…",
-    "loginMainCoreUnknown": "This node’s authorization status in the main connection is not yet confirmed. Retry to read it.",
     "loginUrlTimeout": "Timed out getting the login URL. Try again.",
     "loginSessionReadFailed": "Could not read the previous login session. New authorization was not started. Try again.",
     "loginProgressReadFailed": "Could not check this authorization result yet. Authorization may still be in progress; returning to the app will retry.",
@@ -2970,5 +2968,17 @@
       "other": "Further evidence is unavailable."
     },
     "legacy": "This version cannot provide a verifiable route ownership report."
+  },
+  "prerequisite": {
+    "preparingConnection": "Preparing the proxy connection. Complete any system permission request.",
+    "waitingForReady": "Waiting for the proxy to be ready…",
+    "foregroundRequired": "Return to the app in the foreground and retry.",
+    "permissionDenied": "VPN permission was denied. Retry and allow the system request.",
+    "readyUnknown": "Connection readiness could not be confirmed. Check the connection and retry.",
+    "cancelled": "This action was cancelled. You can retry.",
+    "cancelFailed": "Could not cancel this action. Please try again.",
+    "saveConfiguration": "Save the configuration first, then retry.",
+    "ipInfoFailed": "IP information could not be refreshed. Retry the network check.",
+    "unlockFailed": "Service availability could not be checked. Retry the network check."
   }
 }

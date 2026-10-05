@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { acceptLoginProgress, authorizeFromMainFrame, copyLoginUrl, claimLoginUrl, mainAuthUrlOwner, openLoginUrl, loginFailureReasonKey, progressForLoginRequest, type TailscaleLoginProgress } from './tailscale-login-progress';
+import { acceptLoginProgress, copyLoginUrl, claimLoginUrl, mainAuthUrlOwner, openLoginUrl, loginAttemptActive, loginFailureReasonKey, progressForLoginRequest, type TailscaleLoginProgress } from './tailscale-login-progress';
 import { validatedTailscaleAuthUrl } from './tailscale-auth-url';
 
 const current: TailscaleLoginProgress = { serverId: 'ts1', attemptId: 'new', phase: 'starting' };
@@ -23,16 +23,16 @@ describe('Tailscale login request identity and result', () => {
     expect(acceptLoginProgress(current, { ...current, phase: 'awaitingAuth' })).toBe(true);
     expect(acceptLoginProgress({ ...current, phase: 'failed' }, { ...current, phase: 'authorized' })).toBe(false);
   });
-  it('only a fresh Running frame for a compatible main-core request can authorize', () => {
-    const frame = { serverId: 'ts1', backendState: 'Running', expired: false };
-    expect(authorizeFromMainFrame(current, frame)).toBeNull();
-    const owned = { ...current, phase: 'mainCore' as const };
-    expect(authorizeFromMainFrame(owned, frame)?.phase).toBe('authorized');
-    expect(authorizeFromMainFrame({ ...owned, reason: 'configurationPending' }, frame)).toBeNull();
-    expect(authorizeFromMainFrame({ ...owned, reason: 'confirmingMainCore' }, frame)).toBeNull();
-    expect(authorizeFromMainFrame(owned, { ...frame, serverId: 'another' })).toBeNull();
-    expect(authorizeFromMainFrame(owned, { ...frame, backendState: 'Starting' })).toBeNull();
-    expect(authorizeFromMainFrame(owned, { ...frame, expired: true })).toBeNull();
+  it('a bound producer cannot move an attempt to another main generation or identity epoch', () => {
+    const owned: TailscaleLoginProgress = { ...current, phase: 'mainCore', mainGeneration: 7, identityEpoch: 'epoch-A' };
+    expect(acceptLoginProgress(owned, { ...owned, phase: 'authorized' })).toBe(true);
+    expect(acceptLoginProgress(owned, { ...owned, phase: 'authorized', mainGeneration: 8 })).toBe(false);
+    expect(acceptLoginProgress(owned, { ...owned, phase: 'authorized', identityEpoch: 'epoch-B' })).toBe(false);
+    expect(acceptLoginProgress(owned, { ...current, phase: 'authorized' })).toBe(false);
+    expect(acceptLoginProgress(owned, { ...owned, serverId: 'other', phase: 'authorized' })).toBe(false);
+    for (const phase of ['starting', 'preparingConnection', 'waitingForReady', 'awaitingAuth', 'mainCore'] as const) {
+      expect(loginAttemptActive(phase)).toBe(true);
+    }
   });
   it('failure presentation maps stable categories instead of arbitrary private diagnostics', () => {
     expect(loginFailureReasonKey('coreUnavailable')).toBe('ts.reasonCoreUnavailable');
@@ -69,20 +69,21 @@ describe('authorization URL and clipboard', () => {
 });
 
 describe('browser event delivery', () => {
-  it('main STATUS and AUTH use one owner and open the same URL once', () => {
+  it('bound progress opens a URL once; bare AUTH serves only an absent request', () => {
     const seen = new Map<string, string>();
     const owned = { ...current, phase: 'mainCore' as const };
     for (const _event of ['STATUS', 'AUTH']) {
-      const owner = mainAuthUrlOwner(owned)!;
+      const owner = owned.attemptId;
       expect(claimLoginUrl(seen, 'ts1', owner, 'https://hs.example/login')).toBe(_event === 'STATUS');
     }
     expect(claimLoginUrl(seen, 'ts1', 'next', 'https://hs.example/login')).toBe(true);
     expect(seen.size).toBe(1);
     expect(mainAuthUrlOwner(undefined)).toBe('legacy');
+    expect(mainAuthUrlOwner(owned)).toBeNull();
   });
   it('Running success and pending credentials ignore residual primary URLs', () => {
     const owned = { ...current, phase: 'mainCore' as const };
-    const authorized = authorizeFromMainFrame(owned, { serverId: 'ts1', backendState: 'Running', expired: false })!;
+    const authorized: TailscaleLoginProgress = { ...owned, phase: 'authorized' };
     expect(mainAuthUrlOwner(authorized)).toBeNull();
     expect(mainAuthUrlOwner({ ...owned, reason: 'configurationPending' })).toBeNull();
     expect(mainAuthUrlOwner(current)).toBeNull();

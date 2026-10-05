@@ -55,6 +55,10 @@ mod network_canary;
 mod network_monitor;
 mod network_settle;
 mod pending_changes;
+mod prerequisite;
+pub(crate) use prerequisite::{
+    ActionBinding, ActionRequirement, MainPrerequisiteError, NormalMainAction, ReadyMainTicket,
+};
 // `pub(crate)`：`commands::config` 的排除面预览要用同一份 `platform_tag` /
 // `enumerate_own_lan_cidrs` —— 预览若自己另探一次平台或网卡，就成了第二真值源。
 pub(crate) mod platform_contracts;
@@ -272,6 +276,9 @@ const PROBE_POOL_SIZE: usize = 16;
 pub struct ProxyStatus {
     /// 是否运行中。
     pub running: bool,
+    /// Read-time projection of the shared lifecycle generation for action attribution.
+    #[serde(rename = "mainGeneration", default)]
+    pub main_generation: u64,
     /// **是否有起核腿在飞**（`running:false` 期间也可能正在起核——重试预算内一轮可达数十秒）。
     ///
     /// **读时投影**（同 `uptime`）：存储态恒 `false`，真值是 [`ProxyRuntime::start_inflight`] 计数，
@@ -350,6 +357,10 @@ pub mod code {
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
     #[cfg(target_os = "ios")]
     pub const IOS_SESSION_ACTIVE: &str = "IOS_SESSION_ACTIVE";
+    #[cfg(target_os = "ios")]
+    pub const IOS_FOREGROUND_REQUIRED: &str = "IOS_FOREGROUND_REQUIRED";
+    #[cfg(target_os = "ios")]
+    pub const IOS_VPN_PERMISSION_DENIED: &str = "IOS_VPN_PERMISSION_DENIED";
     /// 核**意外**退出且无法自愈（无可用配置重启）——「运行中崩了」轴。
     pub const PROCESS_EXITED: &str = "PROCESS_EXITED";
     /// 崩溃自愈达上限放弃（反复崩溃 / 自愈重启反复失败）——「运行中崩了」轴的终态。
@@ -978,6 +989,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             crate::events::channel::EVENT_PROXY_LIFECYCLE,
             event,
         );
+        // All normal Start consumers receive the same complete-transaction notification.
+        if event.phase == "ready" {
+            crate::events::broadcast(
+                &self.app,
+                crate::events::channel::EVENT_PROXY_STARTED,
+                serde_json::json!({}),
+            );
+        }
     }
 
     fn emit_network_profile_match_changed(&self) {
@@ -1248,6 +1267,11 @@ pub struct ProxyRuntime {
     status: RwLock<ProxyStatus>,
     /// 运行核启动时的配置快照（待应用差集基准，上游 ProxyManager.startupSnapshot）。
     startup_snapshot: RwLock<Option<Value>>,
+    /// Only the current normal Start completion and its committed evidence. LifecycleGate owns generations.
+    normal_start: Mutex<Option<prerequisite::NormalStart>>,
+    ready_main: RwLock<Option<Arc<prerequisite::ReadyMainCore>>>,
+    #[cfg(target_os = "ios")]
+    ios_ready_session: RwLock<Option<(u64, tauri_plugin_polaris_ios::ReadySessionReceipt)>>,
     /// 生命周期单飞守卫（core-supervisor 既有状态机；起停竞态/世代/pending 全在其中）。
     gate: Arc<LifecycleGate>,
     /// Nonrecoverable authority for this runtime's reserved direct stops.
@@ -1633,6 +1657,10 @@ impl ProxyRuntime {
             mesh,
             status: RwLock::new(ProxyStatus::default()),
             startup_snapshot: RwLock::new(None),
+            normal_start: Mutex::new(None),
+            ready_main: RwLock::new(None),
+            #[cfg(target_os = "ios")]
+            ios_ready_session: RwLock::new(None),
             debounced: DebouncedRestart::new(gate.clone()),
             gate,
             stop_domain,
@@ -1803,6 +1831,24 @@ impl ProxyRuntime {
     pub async fn probe_select_slot(&self, k: usize, member_tag: &str) -> bool {
         self.hot_switch_selector(&format!("probe-selector-{k}"), member_tag)
             .await
+    }
+
+    /// A prerequisite action writes only to its ticket's management endpoint. Current
+    /// generation changes can reject this write, but cannot select a successor's transport.
+    pub(crate) async fn probe_select_slot_bound(
+        &self,
+        ticket: &ReadyMainTicket,
+        k: usize,
+        member_tag: &str,
+    ) -> bool {
+        prerequisite::select_ticket_probe(
+            ticket,
+            k,
+            member_tag,
+            || self.check_ready_main(ticket).is_ok(),
+            Self::management_api_at,
+        )
+        .await
     }
 }
 

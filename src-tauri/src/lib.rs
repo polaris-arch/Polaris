@@ -1257,6 +1257,8 @@ pub fn run() {
             // ── 解锁检测（unlock:run/get）──
             unlock_run,
             unlock_get,
+            manual_network_check,
+            manual_network_check_cancel,
             // ── 测速（server:speedTest）──
             server_speed_test,
             // ── 更新（version + app update + core update）──

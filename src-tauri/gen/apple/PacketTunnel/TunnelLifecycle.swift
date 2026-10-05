@@ -19,6 +19,11 @@ struct TunnelReport: Encodable {
     let lastError: String?
 }
 
+struct TunnelObservation: Encodable {
+    let observationNonce: String
+    let report: TunnelReport
+}
+
 /// Admission and callback ordering only. Go work is owned by the provider's serial queue.
 final class TunnelLifecycle {
     private let lock = NSLock()
@@ -123,6 +128,19 @@ final class TunnelLifecycle {
 
     func report() -> TunnelReport {
         lock.lock(); defer { lock.unlock() }
+        return reportLocked()
+    }
+
+    /// Identity check and report generation share the same lock acquisition;
+    /// neither a prior file nor a later generation can satisfy this observation.
+    func observeSession(identity expected: TunnelIdentity, nonce: String, expectedGeneration: UInt64? = nil) -> TunnelObservation? {
+        lock.lock(); defer { lock.unlock() }
+        guard !nonce.isEmpty, identity == expected,
+              expectedGeneration == nil || generation == expectedGeneration else { return nil }
+        return TunnelObservation(observationNonce: nonce, report: reportLocked())
+    }
+
+    private func reportLocked() -> TunnelReport {
         return TunnelReport(identity: identity, generation: generation, lifecycle: phase,
                             runtimeStopped: runtimeStopped, operationRequestID: operationRequestID,
                             uncertainSettingsGeneration: uncertainSettingsGeneration,

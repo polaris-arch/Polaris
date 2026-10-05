@@ -23,7 +23,7 @@
  */
 import type { TFunction } from 'i18next';
 import type { ProxyStatus } from '@/contracts/types';
-import { proxyErrorText } from '@/domain/proxy-error-text';
+import { proxyErrorReason, proxyErrorText } from '@/domain/proxy-error-text';
 import type { WriteControlId, WriteErrors } from './view-model';
 
 /** 记一条（同一控件重复失败覆盖同一条，不堆积）。 */
@@ -62,8 +62,13 @@ export function writeErrorsFromProxyStatus(
  * **宁可少说，不许编一个原因**。
  */
 export function writeFailureText(t: TFunction, err: unknown): string {
-  if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'IOS_SESSION_ACTIVE') {
-    return proxyErrorText({ errorCode: err.code }, (key) => t(key));
+  if (typeof err === 'object' && err !== null && 'code' in err && typeof err.code === 'string') {
+    const reason = proxyErrorReason({ errorCode: err.code }, (key) => t(key));
+    if (reason) return reason;
+    if (err.code === 'readyUnknown' || err.code === 'IOS_READY_UNKNOWN') return t('prerequisite.readyUnknown');
+    if (err.code === 'cancelled' || err.code === 'IOS_START_CANCELLED') return t('prerequisite.cancelled');
+    if (err.code === 'configurationPending' || err.code === 'unsavedConfiguration') return t('prerequisite.saveConfiguration');
+    return t('errors.operationFailed');
   }
   const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
   const reason = raw.split('\n')[0].trim().slice(0, 120);

@@ -7,6 +7,9 @@
 //! 与 `ProxyRuntime` 的常驻代理核**隔离**（独立注册表、独立 child 句柄；瞬态核绝不写进 proxy 的
 //! pid 槽，故不会被误当作代理核）。
 //!
+//! iOS 首次登录消费正常主核 producer 的 ready ticket，再观察同一主核的 fresh STATUS。
+//! 主核观察的完成、取消和超时只收订阅，不停止正常连接；已有平台的瞬态 custody 保留。
+//!
 //! ## 为什么 URL 只认 gRPC，不再扫 stdout（含「gRPC 腿失败要不要回退 stdout」的结论）
 //!
 //! 曾经的实现从核 stdout 正则抓 `Waiting for authentication: <url>`。改掉它有两条独立理由：
@@ -91,6 +94,9 @@ use crate::runtime::proxy::core_log::pipe_to_log_with_secrets;
 use crate::runtime::proxy::resolve_core_binary;
 #[cfg(unix)]
 use crate::runtime::proxy::send_signal;
+use crate::runtime::proxy::{
+    ActionBinding, MainPrerequisiteError, NormalMainAction, ProxyRuntime, ReadyMainTicket,
+};
 use crate::runtime::tailscale_status::decode_tailscale_status;
 
 /// 瞬态登录核的最大挂起时长：登录不完成（用户不去浏览器认证）时到点自动杀核，避免核无限挂着。
@@ -121,6 +127,40 @@ pub struct MainLoginSnapshot {
     pub api_port: u16,
     pub http_port: Option<u16>,
     pub mixed_port: Option<u16>,
+}
+
+/// Only the normal lifecycle producer supplies this ticket. The observer can read and
+/// revalidate it, but cannot promote a running cache or a TCP connection to readiness.
+struct ReadyMainLogin<'a> {
+    proxy: &'a ProxyRuntime,
+    ticket: ReadyMainTicket,
+}
+
+#[async_trait]
+trait MainLoginBinding: Send + Sync {
+    async fn validate(&self) -> Result<(), String>;
+    fn target_tag(&self, _server_id: &str) -> Option<&str> {
+        None
+    }
+}
+
+#[async_trait]
+impl MainLoginBinding for ReadyMainLogin<'_> {
+    fn target_tag(&self, server_id: &str) -> Option<&str> {
+        self.ticket.target_tag(server_id)
+    }
+    async fn validate(&self) -> Result<(), String> {
+        self.proxy
+            .validate_ready_main(&self.ticket)
+            .await
+            .map_err(|error| error.code().to_owned())
+    }
+}
+
+struct NormalMainLoginInput<'a> {
+    proxy: &'a Arc<ProxyRuntime>,
+    saved: &'a serde_json::Value,
+    identity_epoch: Option<String>,
 }
 
 /// Production resolves the bundled binary; tests inject a path without running a real core.
@@ -237,6 +277,15 @@ pub trait AuthUrlEmitter: Send + Sync {
         _url: Option<&str>,
     ) {
     }
+    fn progress_receipt(&self, receipt: &LoginProgressReceipt) {
+        self.progress(
+            &receipt.server_id,
+            &receipt.attempt_id,
+            &receipt.phase,
+            receipt.reason.as_deref(),
+            receipt.url.as_deref(),
+        );
+    }
 }
 
 /// Save the receipt before broadcasting. Android may suspend the WebView while Chrome owns the
@@ -260,42 +309,61 @@ impl AuthUrlEmitter for AttemptReceiptEmitter {
         reason: Option<&str>,
         url: Option<&str>,
     ) {
-        if server_id == self.attempt.server_id && attempt_id == self.attempt_id {
-            self.attempt.record_progress(LoginProgressReceipt {
-                server_id: server_id.to_owned(),
-                attempt_id: attempt_id.to_owned(),
-                phase: phase.to_owned(),
-                // Only stable UI reason codes cross this read API. Native error text could
-                // contain a URL or secret and the UI already maps unknown codes to a generic
-                // authorization error.
-                reason: reason
-                    .filter(|reason| {
-                        matches!(
-                            *reason,
-                            "coreUnavailable"
-                                | "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED"
-                                | "configurationCheckFailed"
-                                | "configWriteFailed"
-                                | "processStartFailed"
-                                | "statusSubscriptionFailed"
-                                | "statusStreamEnded"
-                                | "processExited"
-                                | "processWaitFailed"
-                                | "authorizationTimedOut"
-                                | "mainCoreChanged"
-                                | "mainCoreInUse"
-                                | "stateQueryFailed"
-                                | "saveFailed"
-                                | "configurationRefreshFailed"
-                                | "tooManyLogins"
-                                | "invalidAuthUrl"
-                        )
-                    })
-                    .map(str::to_owned),
-            });
+        if server_id != self.attempt.server_id || attempt_id != self.attempt_id {
+            return;
         }
-        self.inner
-            .progress(server_id, attempt_id, phase, reason, url);
+        let context = self.attempt.main_context();
+        let receipt = LoginProgressReceipt {
+            server_id: server_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            phase: phase.to_owned(),
+            // Only stable UI reason codes cross this read API. Native error text could
+            // contain a URL or secret and the UI already maps unknown codes to a generic
+            // authorization error.
+            reason: reason
+                .filter(|reason| {
+                    matches!(
+                        *reason,
+                        "coreUnavailable"
+                            | "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED"
+                            | "configurationCheckFailed"
+                            | "configWriteFailed"
+                            | "processStartFailed"
+                            | "statusSubscriptionFailed"
+                            | "statusStreamEnded"
+                            | "processExited"
+                            | "processWaitFailed"
+                            | "authorizationTimedOut"
+                            | "mainCoreChanged"
+                            | "mainCoreInUse"
+                            | "stateQueryFailed"
+                            | "saveFailed"
+                            | "configurationRefreshFailed"
+                            | "tooManyLogins"
+                            | "invalidAuthUrl"
+                            | "savedTailscaleIdentityChanged"
+                            | "configurationPending"
+                            | "superseded"
+                            | "readyUnknown"
+                            | "targetNotInMain"
+                            | "unsavedConfiguration"
+                    )
+                })
+                .map(str::to_owned),
+            // An active attempt can recover only a URL validated from its own fresh stream.
+            // Terminal receipts discard it so browser return cannot revive an old URL.
+            url: if matches!(phase, "awaitingAuth" | "mainCore") {
+                url.and_then(crate::runtime::tailscale_status::validated_tailscale_auth_url)
+            } else {
+                None
+            },
+            main_generation: context.as_ref().map(|(generation, _)| *generation),
+            identity_epoch: context.and_then(|(_, epoch)| epoch),
+        };
+        if !self.attempt.record_progress(receipt.clone()) {
+            return;
+        }
+        self.inner.progress_receipt(&receipt);
     }
 }
 
@@ -709,6 +777,23 @@ pub struct AppHandleEmitter {
 }
 
 impl AuthUrlEmitter for AppHandleEmitter {
+    fn progress_receipt(&self, receipt: &LoginProgressReceipt) {
+        broadcast(
+            &self.app,
+            crate::events::channel::EVENT_TAILSCALE_LOGIN_PROGRESS,
+            json!({"serverId": receipt.server_id, "attemptId": receipt.attempt_id,
+                "phase": receipt.phase, "reason": receipt.reason, "url": receipt.url,
+                "mainGeneration": receipt.main_generation, "identityEpoch": receipt.identity_epoch}),
+        );
+        if receipt.phase == "awaitingAuth" {
+            broadcast(
+                &self.app,
+                crate::events::channel::EVENT_TAILSCALE_AUTH_URL,
+                json!({"serverId": receipt.server_id, "attemptId": receipt.attempt_id,
+                    "nodeName": "", "url": receipt.url, "transient": true}),
+            );
+        }
+    }
     fn progress(
         &self,
         server_id: &str,
@@ -892,6 +977,10 @@ impl Shared {
 /// [`LoginCoreRegistry::start_attempt_with_saved`] 的结果；Started 表示仍待授权。
 pub enum StartLoginOutcome {
     AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
+    PrerequisiteFailed {
+        reason: String,
+        code: String,
+    },
     /// 已起瞬态登录核（登录 URL 稍后经事件到达，非「已登录」）。
     Started,
     /// 双写守卫命中：该 TS endpoint 已在运行主核里，无需瞬态核（前端 `reason: 'inMainCore'`）。
@@ -901,6 +990,13 @@ pub enum StartLoginOutcome {
     Failed(String),
     /// The request was cancelled before its process was started.
     Cancelled,
+}
+
+fn prerequisite_failure(error: MainPrerequisiteError) -> StartLoginOutcome {
+    StartLoginOutcome::PrerequisiteFailed {
+        reason: error.to_string(),
+        code: error.code().to_owned(),
+    }
 }
 
 /// Facts from this process's Tailscale login registry only. `Vacant` says nothing about an OS,
@@ -1559,6 +1655,64 @@ impl LoginCoreRegistry {
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
+        self.start_attempt_inner(
+            requested,
+            user_data,
+            request,
+            saved_server,
+            main_core,
+            emitter,
+            None,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "normal prerequisite retains the saved action binding"
+    )]
+    pub async fn start_attempt_with_normal_main(
+        &self,
+        requested: &ServerConfig,
+        user_data: &Path,
+        request: LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+        proxy: &Arc<ProxyRuntime>,
+        saved: &serde_json::Value,
+        identity_epoch: Option<String>,
+    ) -> StartLoginOutcome {
+        self.start_attempt_inner(
+            requested,
+            user_data,
+            request,
+            saved_server,
+            main_core,
+            emitter,
+            Some(NormalMainLoginInput {
+                proxy,
+                saved,
+                identity_epoch,
+            }),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "existing and normal-main paths share the same attempt custody"
+    )]
+    async fn start_attempt_inner(
+        &self,
+        requested: &ServerConfig,
+        user_data: &Path,
+        request: LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+        normal_main: Option<NormalMainLoginInput<'_>>,
+    ) -> StartLoginOutcome {
         if self.closing.load(Ordering::SeqCst) {
             return StartLoginOutcome::Failed("Polaris is shutting down".into());
         }
@@ -1576,8 +1730,19 @@ impl LoginCoreRegistry {
             attempt_id: request.attempt_id.clone(),
         });
         emitter.progress(&requested.id, &request.attempt_id, "starting", None, None);
-        let outcome = self
-            .launch_attempt(
+        let outcome = if let Some(normal_main) = normal_main {
+            self.launch_normal_main_attempt(
+                requested,
+                &request,
+                &attempt,
+                saved_server,
+                main_core,
+                emitter.clone(),
+                normal_main,
+            )
+            .await
+        } else {
+            self.launch_attempt(
                 requested,
                 user_data,
                 &request,
@@ -1586,7 +1751,8 @@ impl LoginCoreRegistry {
                 main_core,
                 emitter.clone(),
             )
-            .await;
+            .await
+        };
         if !attempt.is_finished() {
             match &outcome {
                 StartLoginOutcome::Started => {}
@@ -1618,6 +1784,16 @@ impl LoginCoreRegistry {
                     );
                     attempt.finish();
                 }
+                StartLoginOutcome::PrerequisiteFailed { code, .. } => {
+                    emitter.progress(
+                        &requested.id,
+                        &request.attempt_id,
+                        "failed",
+                        Some(code),
+                        None,
+                    );
+                    attempt.finish();
+                }
                 StartLoginOutcome::Failed(reason) => {
                     emitter.progress(
                         &requested.id,
@@ -1634,8 +1810,130 @@ impl LoginCoreRegistry {
         outcome
     }
 
-    /// A steady Running core need not send another global frame. Subscribe once for a fresh
-    /// initial snapshot; this query never starts/stops the primary core or keeps its stream alive.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the ticket and saved identity are distinct authorities"
+    )]
+    async fn launch_normal_main_attempt(
+        &self,
+        requested: &ServerConfig,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+        normal: NormalMainLoginInput<'_>,
+    ) -> StartLoginOutcome {
+        if attempt.cancelled() {
+            return StartLoginOutcome::Cancelled;
+        }
+        let server = match saved_server() {
+            Ok(server)
+                if server.id == requested.id
+                    && server.protocol
+                        == polaris_config_engine::user_config::server_config::Protocol::Tailscale
+                    && server.tailscale_settings == requested.tailscale_settings =>
+            {
+                server
+            }
+            _ => return StartLoginOutcome::Failed("savedTailscaleIdentityChanged".into()),
+        };
+        let key = server
+            .tailscale_settings
+            .as_ref()
+            .and_then(|ts| ts.auth_key.as_deref())
+            .filter(|key| !key.trim().is_empty());
+        if request.mode == LoginMode::Browser && key.is_some() {
+            return StartLoginOutcome::InMainCorePending;
+        }
+        if request.mode == LoginMode::Authkey && key.is_none() {
+            return StartLoginOutcome::Failed("authKeyRequired".into());
+        }
+        let binding = match ActionBinding::new(
+            NormalMainAction::TailscaleLogin,
+            request.attempt_id.clone(),
+            normal.saved,
+            vec![server.id.clone()],
+            normal.identity_epoch,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => return prerequisite_failure(error),
+        };
+        emitter.progress(
+            &server.id,
+            &request.attempt_id,
+            "preparingConnection",
+            None,
+            None,
+        );
+        // No TS state gate is held while the normal Start producer acquires its lifecycle gate.
+        emitter.progress(
+            &server.id,
+            &request.attempt_id,
+            "waitingForReady",
+            None,
+            None,
+        );
+        let ticket = tokio::select! {
+            biased;
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            result = tokio::time::timeout(self.timeout, normal.proxy.await_normal_main(binding)) => match result {
+                Ok(Ok(ticket)) => ticket,
+                Ok(Err(error)) => return prerequisite_failure(error),
+                Err(_) => {
+                    emitter.progress(&server.id, &request.attempt_id, "timedOut", Some("authorizationTimedOut"), None);
+                    attempt.finish();
+                    return StartLoginOutcome::Failed("authorizationTimedOut".into());
+                },
+            },
+        };
+        attempt.bind_main(
+            ticket.generation(),
+            ticket.identity_epoch().map(str::to_owned),
+        );
+        let bound = ReadyMainLogin {
+            proxy: normal.proxy,
+            ticket,
+        };
+        let main = main_core();
+        if main.generation != bound.ticket.generation()
+            || main.api_port != bound.ticket.api_port()
+            || main.api_secret != bound.ticket.api_secret()
+        {
+            return StartLoginOutcome::Failed("mainCoreChanged".into());
+        }
+        let gate = tokio::select! {
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            gate = self.start_gate.lock() => gate,
+        };
+        let current = saved_server();
+        if !current.is_ok_and(|current| {
+            current.id == server.id && current.tailscale_settings == server.tailscale_settings
+        }) || !self.main_matches_request(&server, request.mode)
+            || bound.ticket.target_tag(&server.id).is_none()
+        {
+            return StartLoginOutcome::InMainCorePending;
+        }
+        drop(gate);
+        self.confirm_main_request(
+            &server,
+            request,
+            attempt,
+            &main,
+            main_core,
+            saved_server,
+            Some(&bound),
+            emitter,
+        )
+        .await
+    }
+
+    /// Observe a fresh target stream until authorization or an exact request terminal. Its
+    /// cancellation and deadline close only this subscription; the normal connection persists.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "observer retains independent request and main authorities"
+    )]
     async fn confirm_main_request(
         &self,
         server: &ServerConfig,
@@ -1643,6 +1941,8 @@ impl LoginCoreRegistry {
         attempt: &Arc<Attempt>,
         main: &MainLoginSnapshot,
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        binding: Option<&dyn MainLoginBinding>,
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
         let tag = self
@@ -1658,6 +1958,12 @@ impl LoginCoreRegistry {
         let Some(tag) = tag.filter(|_| main.api_port != 0) else {
             return StartLoginOutcome::Failed("statusSubscriptionFailed".into());
         };
+        if binding.is_some_and(|binding| binding.target_tag(&server.id) != Some(tag.as_str())) {
+            return StartLoginOutcome::Failed("mainCoreChanged".into());
+        }
+        if attempt.main_context().is_none() {
+            attempt.bind_main(main.generation, None);
+        }
         emitter.progress(
             &server.id,
             &request.attempt_id,
@@ -1666,48 +1972,65 @@ impl LoginCoreRegistry {
             None,
         );
         let query = async {
+            self.check_main_observer(server, request.mode, main, main_core, saved_server, binding)
+                .await?;
             let mut stream = self
                 .subscriber
                 .subscribe(main.api_port, &main.api_secret)
                 .await
-                .map_err(|_| "statusSubscriptionFailed")?;
-            let frame = stream.recv().await.ok_or("statusStreamEnded")?;
-            let current = main_core();
-            if !current.alive
-                || current.generation != main.generation
-                || current.api_port != main.api_port
-            {
-                return Err("mainCoreChanged");
-            }
-            let endpoint = frame
-                .endpoints
-                .iter()
-                .find(|ep| ep.endpoint_tag == tag)
-                .ok_or("statusSubscriptionFailed")?;
-            let authorized = endpoint.backend_state == "Running"
-                && !endpoint.self_.as_ref().is_some_and(|peer| peer.expired);
-            let url = if authorized || endpoint.auth_url.is_empty() {
-                None
-            } else {
-                Some(
-                    crate::runtime::tailscale_status::validated_tailscale_auth_url(
-                        &endpoint.auth_url,
-                    )
-                    .ok_or("invalidAuthUrl")?,
+                .map_err(|_| "statusSubscriptionFailed".to_owned())?;
+            let mut check = tokio::time::interval(Duration::from_millis(250));
+            check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    () = attempt.cancellation() => return Err("cancelled".to_owned()),
+                    frame = stream.recv() => frame.ok_or_else(|| "statusStreamEnded".to_owned())?,
+                    _ = check.tick() => {
+                        self.check_main_observer(server, request.mode, main, main_core, saved_server, binding).await?;
+                        continue;
+                    },
+                };
+                self.check_main_observer(
+                    server,
+                    request.mode,
+                    main,
+                    main_core,
+                    saved_server,
+                    binding,
                 )
-            };
-            Ok((authorized, url))
-        };
-        let result = tokio::select! {
-            biased;
-            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
-            result = tokio::time::timeout(self.timeout.min(CONFIG_CHECK_TIMEOUT), query) => result,
-        };
-        if attempt.cancelled() {
-            return StartLoginOutcome::Cancelled;
-        }
-        match result {
-            Ok(Ok((authorized, url))) => {
+                .await?;
+                let endpoint = frame
+                    .endpoints
+                    .iter()
+                    .find(|ep| ep.endpoint_tag == tag)
+                    .ok_or_else(|| "statusSubscriptionFailed".to_owned())?;
+                let expired = endpoint.self_.as_ref().is_some_and(|peer| peer.expired);
+                let authorized = endpoint.backend_state == "Running" && !expired;
+                let url = if authorized
+                    || endpoint.auth_url.is_empty()
+                    || (endpoint.backend_state != "NeedsLogin" && !expired)
+                {
+                    None
+                } else {
+                    Some(
+                        crate::runtime::tailscale_status::validated_tailscale_auth_url(
+                            &endpoint.auth_url,
+                        )
+                        .ok_or_else(|| "invalidAuthUrl".to_owned())?,
+                    )
+                };
+                // The final synchronous checks and receipt emission have no await between them.
+                self.check_main_observer_snapshot(
+                    server,
+                    request.mode,
+                    main,
+                    main_core,
+                    saved_server,
+                )?;
+                if attempt.cancelled() {
+                    return Err("cancelled".into());
+                }
                 emitter.progress(
                     &server.id,
                     &request.attempt_id,
@@ -1715,10 +2038,25 @@ impl LoginCoreRegistry {
                     None,
                     if authorized { None } else { url.as_deref() },
                 );
+                if authorized {
+                    return Ok(());
+                }
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            result = tokio::time::timeout(self.timeout, query) => result,
+        };
+        if attempt.cancelled() {
+            return StartLoginOutcome::Cancelled;
+        }
+        match result {
+            Ok(Ok(())) => {
                 attempt.finish();
                 StartLoginOutcome::InMainCore
             }
-            Ok(Err(reason)) => StartLoginOutcome::Failed(reason.into()),
+            Ok(Err(reason)) => StartLoginOutcome::Failed(reason),
             Err(_) => {
                 emitter.progress(
                     &server.id,
@@ -1731,6 +2069,53 @@ impl LoginCoreRegistry {
                 StartLoginOutcome::Failed("authorizationTimedOut".into())
             }
         }
+    }
+
+    fn check_main_observer_snapshot(
+        &self,
+        server: &ServerConfig,
+        mode: LoginMode,
+        main: &MainLoginSnapshot,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+    ) -> Result<(), String> {
+        let current = main_core();
+        if !current.alive
+            || current.generation != main.generation
+            || current.api_port != main.api_port
+            || current.api_secret != main.api_secret
+            || !self.main_matches_request(server, mode)
+        {
+            return Err("mainCoreChanged".into());
+        }
+        if !saved_server().is_ok_and(|saved| {
+            saved.id == server.id
+                && saved.protocol == server.protocol
+                && saved.tailscale_settings == server.tailscale_settings
+        }) {
+            return Err("savedTailscaleIdentityChanged".into());
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fresh native binding supplements the saved request checks"
+    )]
+    async fn check_main_observer(
+        &self,
+        server: &ServerConfig,
+        mode: LoginMode,
+        main: &MainLoginSnapshot,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        binding: Option<&dyn MainLoginBinding>,
+    ) -> Result<(), String> {
+        self.check_main_observer_snapshot(server, mode, main, main_core, saved_server)?;
+        if let Some(binding) = binding {
+            binding.validate().await?;
+        }
+        self.check_main_observer_snapshot(server, mode, main, main_core, saved_server)
     }
 
     #[allow(
@@ -1779,12 +2164,23 @@ impl LoginCoreRegistry {
             if !main.alive {
                 return StartLoginOutcome::InMainCorePending;
             }
-            return if self.main_matches_request(&server, request.mode) {
-                self.confirm_main_request(&server, request, attempt, &main, main_core, emitter)
-                    .await
-            } else {
-                StartLoginOutcome::InMainCorePending
-            };
+            if !self.main_matches_request(&server, request.mode) {
+                return StartLoginOutcome::InMainCorePending;
+            }
+            // Keeping this gate through a browser login would block normal Stop/retirement.
+            drop(_start_guard);
+            return self
+                .confirm_main_request(
+                    &server,
+                    request,
+                    attempt,
+                    &main,
+                    main_core,
+                    saved_server,
+                    None,
+                    emitter,
+                )
+                .await;
         }
         if !self.shared.can_start(&server.id) {
             return StartLoginOutcome::Failed("tooManyLogins".into());
