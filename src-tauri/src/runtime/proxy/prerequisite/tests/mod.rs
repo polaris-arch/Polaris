@@ -720,10 +720,10 @@ fn finished_same_generation_producer_remains_joinable_while_outer_operation_sett
         Ok(core.status.clone()),
         Some(core.generation),
     ));
-    *runtime.normal_start.lock().unwrap() = Some(NormalStart {
+    runtime.normal_start.lock().unwrap().replace(NormalStart {
         digest: digest(&saved).unwrap(),
         completion,
-        identity: Arc::new(()),
+        identity: ProducerCell::queued(Arc::clone(&runtime.stop_domain), core.generation),
     });
     runtime.gate.begin();
     assert!(runtime.join_current_normal_start(&saved).unwrap().is_some());
@@ -744,7 +744,23 @@ async fn current_same_config_producer_is_shared_and_waiter_drop_never_stops_it()
         first.changed().await.unwrap();
     }
     let generation = runtime.core_generation();
+    let original_cell = runtime
+        .admitted_native_producer(generation)
+        .unwrap()
+        .unwrap();
     let second = runtime.normal_start_completion(Value::Null).unwrap();
+    assert!(Arc::ptr_eq(
+        &original_cell,
+        &runtime
+            .admitted_native_producer(generation)
+            .unwrap()
+            .unwrap()
+    ));
+    assert_eq!(runtime.normal_start.lock().unwrap().retained.len(), 1);
+    assert!(
+        !original_cell.reclaimable(),
+        "Starting is only observer state"
+    );
     assert!(first.same_channel(&second));
     drop(first);
     drop(second);
@@ -769,6 +785,11 @@ async fn current_same_config_producer_is_shared_and_waiter_drop_never_stops_it()
         "dropping all action waiters never invokes Stop"
     );
     assert!(!runtime.status().starting);
+    assert!(
+        original_cell.reclaimable(),
+        "actual returned prebirth producer cannot enter factory again"
+    );
+    assert!(runtime.normal_start.lock().unwrap().retained.is_empty());
 }
 
 #[tokio::test]
@@ -782,10 +803,26 @@ async fn different_config_cannot_join_and_old_completion_cannot_follow_successor
     ) {
         first.changed().await.unwrap();
     }
+    let old_generation = runtime.core_generation();
+    let old_cell = runtime
+        .admitted_native_producer(old_generation)
+        .unwrap()
+        .unwrap();
     let mut second = runtime
         .normal_start_completion(serde_json::json!(false))
         .unwrap();
     assert!(!first.same_channel(&second));
+    assert!(!old_cell.reclaimable());
+    assert!(
+        runtime
+            .normal_start
+            .lock()
+            .unwrap()
+            .retained
+            .iter()
+            .any(|cell| Arc::ptr_eq(cell, &old_cell)),
+        "current B replacement cannot erase admitted A"
+    );
     while matches!(
         &*second.borrow_and_update(),
         NormalStartCompletion::Pending(_)
@@ -806,6 +843,8 @@ async fn different_config_cannot_join_and_old_completion_cannot_follow_successor
         second.changed().await.unwrap();
     }
     assert!(runtime.ready_main.read().unwrap().is_none());
+    assert!(old_cell.reclaimable());
+    assert!(runtime.normal_start.lock().unwrap().retained.is_empty());
 }
 
 #[tokio::test]
@@ -816,7 +855,27 @@ async fn explicit_same_config_replaces_pending_action_producer_before_dispatch()
     // Neither producer can run yet on the current-thread executor. Explicit Start must
     // replace even an identical pending action producer; subsequent actions join the new one.
     let mut action = runtime.normal_start_completion(Value::Null).unwrap();
+    let action_cell = Arc::clone(
+        &runtime
+            .normal_start
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .identity,
+    );
     let mut explicit = runtime.explicit_start_completion(Value::Null).unwrap();
+    let explicit_cell = Arc::clone(
+        &runtime
+            .normal_start
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .identity,
+    );
+    assert!(!Arc::ptr_eq(&action_cell, &explicit_cell));
+    assert_eq!(runtime.normal_start.lock().unwrap().retained.len(), 2);
     let joined_action = runtime.normal_start_completion(Value::Null).unwrap();
     assert!(!action.same_channel(&explicit));
     assert!(explicit.same_channel(&joined_action));
@@ -837,6 +896,9 @@ async fn explicit_same_config_replaces_pending_action_producer_before_dispatch()
     .await
     .expect("the pending producer must yield to explicit Start");
     assert_eq!(runtime.core_generation(), base + 1);
+    assert!(action_cell.reclaimable());
+    assert!(!explicit_cell.reclaimable());
+    assert_eq!(runtime.normal_start.lock().unwrap().retained.len(), 1);
     drop(state_gate);
     tokio::time::timeout(Duration::from_secs(2), async {
         while !matches!(
@@ -850,6 +912,8 @@ async fn explicit_same_config_replaces_pending_action_producer_before_dispatch()
     .expect("invalid mock input must complete without starting a core");
     assert_eq!(runtime.core_generation(), base + 1);
     assert!(!runtime.status().starting);
+    assert!(explicit_cell.reclaimable());
+    assert!(runtime.normal_start.lock().unwrap().retained.is_empty());
 }
 
 #[tokio::test]
@@ -894,6 +958,15 @@ async fn stop_between_pending_and_dispatch_then_new_start_uses_new_producer() {
     let (runtime, _dir) = runtime();
     let state_gate = runtime.mesh.tailscale_state_gate().await;
     let mut old = runtime.normal_start_completion(Value::Null).unwrap();
+    let old_cell = Arc::clone(
+        &runtime
+            .normal_start
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .identity,
+    );
     let stop_generation = runtime
         .gate
         .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
@@ -910,11 +983,78 @@ async fn stop_between_pending_and_dispatch_then_new_start_uses_new_producer() {
         new.changed().await.unwrap();
     }
     assert_eq!(runtime.core_generation(), stop_generation + 1);
+    assert!(old_cell.reclaimable());
+    assert_eq!(runtime.normal_start.lock().unwrap().retained.len(), 1);
     drop(state_gate);
     while !matches!(
         &*new.borrow_and_update(),
         NormalStartCompletion::Finished(Err(_), _)
     ) {
         new.changed().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn guarded_requested_generation_is_not_final_native_birth_generation() {
+    let (runtime, _dir) = runtime();
+    let base = runtime
+        .gate
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
+        .unwrap();
+    let gate = runtime.mesh.tailscale_state_gate().await;
+    let producer_runtime = Arc::clone(&runtime);
+    let task = tokio::spawn(async move {
+        producer_runtime
+            .start_guarded(Value::Null, Some(base))
+            .await
+    });
+    let (cell, mut completion) = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(start) = runtime.normal_start.lock().unwrap().as_ref() {
+                if matches!(&*start.completion.borrow(), NormalStartCompletion::Starting(owner) if *owner == base) {
+                    break (Arc::clone(&start.identity), start.completion.subscribe());
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(cell.observation().0, base);
+    assert_eq!(cell.observation().1, base);
+    assert!(!cell.reclaimable());
+    drop(gate);
+    assert!(
+        matches!(task.await.unwrap(), StartLeg::Finished(Err(_), Some(generation)) if generation == base + 1)
+    );
+    assert_eq!(
+        cell.observation().1,
+        base + 1,
+        "record final atomic admission rather than first Starting watch"
+    );
+    assert!(
+        matches!(&*completion.borrow_and_update(), NormalStartCompletion::Finished(Err(_), Some(generation)) if *generation == base + 1)
+    );
+    assert!(cell.reclaimable());
+    assert!(runtime.normal_start.lock().unwrap().retained.is_empty());
+}
+
+#[tokio::test]
+async fn completed_prebirth_normal_requests_do_not_accumulate_native_catalog_entries() {
+    let (runtime, _dir) = runtime();
+    for _ in 0..16 {
+        let mut completion = runtime.explicit_start_completion(Value::Null).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                &*completion.borrow_and_update(),
+                NormalStartCompletion::Finished(Err(_), _)
+            ) {
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            runtime.normal_start.lock().unwrap().retained.is_empty(),
+            "completed nonnative request creates no permanent single-Child obligations"
+        );
     }
 }

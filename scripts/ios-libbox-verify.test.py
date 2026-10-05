@@ -83,6 +83,34 @@ def preflight_tests():
     count = 0
     missing = Path('/nonexistent/polaris-ios-preflight-artifact')
 
+    # C1 uses real adapter bytes for both fresh and cached inspection. The
+    # deliberately synthetic graph/contracts never become a checked-in policy.
+    spec = importlib.util.spec_from_file_location('apple_carrier_fixtures', Path(__file__).with_name('apple-carrier.test.py'))
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    fixture = fixtures.fixture()
+    target = 'ios-arm64'
+    carrier_bytes = fixture['archives'][target]
+    with mock.patch.object(builder, 'final_preflight', return_value=(fixture['source'], fixture['core'], {})), \
+            mock.patch.object(builder, 'run', side_effect=AssertionError('Carrier inspection executed a tool')):
+        with tempfile.TemporaryDirectory(prefix='polaris-ios-carrier-cache-test-') as temp:
+            cached = Path(temp) / 'carrier.a'
+            cached.write_bytes(carrier_bytes)
+            produced = builder.inspect_source_carrier(carrier_bytes, [target], fixture['receipt'],
+                                                       fixture['policy'], fixture['tools'])
+            consumed = builder.inspect_source_carrier(cached, [target], fixture['receipt'],
+                                                       fixture['policy'], fixture['tools'])
+            assert produced == consumed and produced['evidenceScope'] == 'carrier-inspection-only'
+            count += 1
+            cached.write_bytes(carrier_bytes.replace(fixture['id'].encode(), b'0' * len(fixture['id']), 1))
+            for binary in (cached, cached.read_bytes()):
+                rejected(lambda: builder.inspect_source_carrier(binary, [target], fixture['receipt'],
+                                                                 fixture['policy'], fixture['tools']), 'source BuildID differs')
+                count += 1
+            rejected(lambda: builder.inspect_source_carrier(carrier_bytes, [target], fixture['receipt'], None),
+                     'complete observed carrier contract required (C2 pending)')
+            count += 1
+
     def no_side_effects(actions, expected):
         nonlocal count
         with ExitStack() as stack:

@@ -1268,7 +1268,7 @@ pub struct ProxyRuntime {
     /// 运行核启动时的配置快照（待应用差集基准，上游 ProxyManager.startupSnapshot）。
     startup_snapshot: RwLock<Option<Value>>,
     /// Only the current normal Start completion and its committed evidence. LifecycleGate owns generations.
-    normal_start: Mutex<Option<prerequisite::NormalStart>>,
+    normal_start: Mutex<prerequisite::NormalStarts>,
     ready_main: RwLock<Option<Arc<prerequisite::ReadyMainCore>>>,
     #[cfg(target_os = "ios")]
     ios_ready_session: RwLock<Option<(u64, tauri_plugin_polaris_ios::ReadySessionReceipt)>>,
@@ -1657,7 +1657,7 @@ impl ProxyRuntime {
             mesh,
             status: RwLock::new(ProxyStatus::default()),
             startup_snapshot: RwLock::new(None),
-            normal_start: Mutex::new(None),
+            normal_start: Mutex::new(prerequisite::NormalStarts::default()),
             ready_main: RwLock::new(None),
             #[cfg(target_os = "ios")]
             ios_ready_session: RwLock::new(None),
