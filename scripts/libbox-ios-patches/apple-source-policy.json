@@ -1,0 +1,117 @@
+{
+  "schema": "polaris-apple-source-policy-v1",
+  "evidenceScope": "source-inputs-only",
+  "sourceHelperSha256": "f41b7ea2ba57301d8810b940e2c5788735d2d851788463ee42babef40e622e1a",
+  "commonSource": {
+    "sourceManifestSha256": "1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a",
+    "provisionerSha256": "5ad89596ee5b4e320c6bfec710933af6219318fff6c66fb4d911475240deaa5b",
+    "sourceReceiptFingerprint": "b0eb6c10e5883b70016d22c0f5aa1f5e95700df1a194fcebba10d1928b06b257",
+    "moduleGraphSha256": "c4f92118f017f76bfe0bed59ffd5517123e9da6e27318e9968f3abb1c0f62512",
+    "patchedSourceTree": "1f6bf34b1e12d6bcef7750453c4eeff7040ca533",
+    "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
+    "version": "1.15.0-alpha.8.polaris.2",
+    "dependencyModules": [
+      "github.com/sagernet/sing-tun",
+      "github.com/sagernet/nftables"
+    ],
+    "transportPins": {
+      "github.com/mdlayher/netlink": "v1.11.2",
+      "github.com/mdlayher/socket": "v0.6.0",
+      "github.com/sagernet/netlink": "v0.0.0-20260814022025-64455d367bbf",
+      "golang.org/x/sys": "v0.47.0",
+      "golang.org/x/net": "v0.57.0",
+      "golang.org/x/sync": "v0.22.0"
+    },
+    "graphScope": "declared-patched-modules",
+    "mainGoModSha256": "b46717b2476acfc3f497d48f466993f644e29f32213a27932a956241b9f68f5f",
+    "mainGoSumSha256": "b0b62e1b51d268a1c569bf0ec39b72debb9683036d4913edfd8dee073db3a64f"
+  },
+  "binding": {
+    "target": "ios,iossimulator",
+    "libname": "box",
+    "trimpath": true,
+    "buildVCS": false,
+    "gomobileVersion": "v0.1.12",
+    "iosMinimumVersion": "15.0",
+    "appMinimumVersion": "17.0",
+    "buildTags": [
+      "with_quic",
+      "with_wireguard",
+      "with_utls",
+      "with_naive_outbound",
+      "with_clash_api",
+      "with_usbip",
+      "with_openvpn",
+      "with_openconnect",
+      "badlinkname",
+      "tfogo_checklinkname0",
+      "with_tailscale",
+      "ts_omit_logtail",
+      "ts_omit_ssh",
+      "ts_omit_drive",
+      "ts_omit_taildrop",
+      "ts_omit_webclient",
+      "ts_omit_doctor",
+      "ts_omit_capture",
+      "ts_omit_kube",
+      "ts_omit_aws",
+      "ts_omit_synology",
+      "ts_omit_bird",
+      "with_dhcp",
+      "grpcnotrace"
+    ],
+    "nonMacOSTags": [
+      "with_low_memory"
+    ]
+  },
+  "targets": {
+    "ios-arm64": {
+      "goos": "ios",
+      "goarch": "arm64",
+      "cgo": "1",
+      "sdk": "iphoneos",
+      "variant": null
+    },
+    "ios-arm64-simulator": {
+      "goos": "ios",
+      "goarch": "arm64",
+      "cgo": "1",
+      "sdk": "iphonesimulator",
+      "variant": "simulator"
+    },
+    "ios-x86_64-simulator": {
+      "goos": "ios",
+      "goarch": "amd64",
+      "cgo": "1",
+      "sdk": "iphonesimulator",
+      "variant": "simulator"
+    }
+  },
+  "moduleInventory": {
+    "patched": [
+      "github.com/sagernet/sing-tun",
+      "github.com/sagernet/nftables"
+    ],
+    "transport": [
+      "github.com/mdlayher/netlink",
+      "github.com/mdlayher/socket",
+      "github.com/sagernet/netlink",
+      "golang.org/x/net",
+      "golang.org/x/sync",
+      "golang.org/x/sys"
+    ]
+  },
+  "validationCleanupContract": {
+    "version": "polaris-validation-v1",
+    "constructedBoxCleanup": "CleanupUnknown",
+    "exactCleanupEnabled": false,
+    "noOwnerCleanupEnabled": false
+  },
+  "unresolvedArtifactEvidence": [
+    "Apple SDK/compiler identities",
+    "per-target linked module partitions",
+    "generated Objective-C/Swift ABI",
+    "Framework carrier source BuildID",
+    "final appex static-link provenance"
+  ]
+}

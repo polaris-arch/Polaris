@@ -78,8 +78,8 @@ capture envelope 要求 `synthetic / binding / planSha256 / caseId / state / sou
 ## 无害离线回归
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
-  -s scripts/pc-owner-stop-acceptance-20260930 -p 'test_*.py' -v
+POLARIS_NO_KERNEL_RUN=1 PYTHONDONTWRITEBYTECODE=1 python3 -B \
+  scripts/pc-owner-stop-acceptance-20260930/test-acceptance.py -v
 sh -n scripts/pc-owner-stop-acceptance-20260930/preflight-linux.sh
 sh -n scripts/pc-owner-stop-acceptance-20260930/preflight-macos.sh
 ```
