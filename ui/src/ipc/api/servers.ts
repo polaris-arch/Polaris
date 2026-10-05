@@ -85,9 +85,9 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGOUT, { serverId, keepAttemptId });
   },
 
-  /** 批量查 TS 节点 state 目录存在性（不起核判「登录过没」）。 */
-  async tailscaleStateExists(serverIds: string[]): Promise<Record<string, boolean>> {
-    return invoke(IPC_CHANNELS.TAILSCALE_STATE_EXISTS, { serverIds });
+  /** Default: physical state for safe replacement. Opt-in: cached sessions for presentation only. */
+  async tailscaleStateExists(serverIds: string[], cachedSessionOnly = false): Promise<Record<string, boolean>> {
+    return invoke(IPC_CHANNELS.TAILSCALE_STATE_EXISTS, { serverIds, cachedSessionOnly });
   },
 
   /** L2：主动拉各 TS 节点状态末帧(self IP/peers) + 新鲜度(connected)。 */

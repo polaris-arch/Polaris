@@ -51,6 +51,25 @@ function details(report: MeshRouteReport | null, serverId?: string): string {
 }
 
 describe('mobile mesh route evidence', () => {
+  it('keeps report details and refresh in the same status row and distinguishes trustworthy states', () => {
+    h.lang = 'zh-CN';
+    const report = applied();
+    report.results[2].effective = [];
+    report.results[2].coverage = 'full';
+    report.results[2].unknownReasons = [];
+    expect(block(report)).toContain('data-tone="warn"');
+    report.results[1].requested = [];
+    report.results[1].effective = [];
+    report.results[1].blockedBy = [];
+    report.results[1].coverage = 'full';
+    const markup = block(report);
+    expect(markup).toContain('data-route-state="full" data-tone="ok"');
+    expect(markup).toMatch(/class="ms-force-head ms-mesh-status"[^>]*>.*m-info-summary.*ms-force-refresh.*<\/div>/);
+    expect(block(report, { previous: true })).toContain('data-tone="warn"');
+    expect(block(report, { error: true })).toContain('data-tone="error"');
+    expect(block(clone())).toContain('data-tone="plain"');
+    expect(block(null)).not.toContain('data-tone="ok"');
+  });
   it('uses the mobile route command and preserves the mobile platform boundary', () => {
     const backend = readFileSync(fileURLToPath(new URL('../../../../crates/system-integration/src/route_probe.rs', import.meta.url)), 'utf8');
     const page = readFileSync(fileURLToPath(new URL('./TunPage.tsx', import.meta.url)), 'utf8');

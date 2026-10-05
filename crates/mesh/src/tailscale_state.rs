@@ -14,6 +14,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
+mod cached_session;
+pub use cached_session::{cached_session_exists, UnknownTailscaleSession};
+
 /// 不可信节点 id 不能作为路径片段使用。该错误只表达技术边界；面向用户的文案由应用层按错误码本地化。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidTailscaleStateId;

@@ -26,6 +26,7 @@ import {
   ruleResourceAutoStatus,
   ruleResourceAutoUpdateChecked,
   ruleResourceAutoUpdatePatch,
+  ruleResourceIntervalSelectValue,
   subscriptionAutoUpdateStatus,
 } from './settings-logic';
 
@@ -62,7 +63,6 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
             onChange={(event) =>
               void update({
                 subscriptionUpdateIntervalHours: Number(event.target.value),
-                ruleResourceUpdateIntervalHours: Number(event.target.value),
               })
             }
             aria-label={t('settings.update.intervalCard')}
@@ -146,6 +146,21 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
             onChange={(value) => void update(ruleResourceAutoUpdatePatch(value))}
             aria-label={t('settings.update.ruleResourceAutoCard')}
           />
+        </SetRow>
+        <SetRow label={t('resources.updateInterval')} tip={t('resources.updateIntervalDesc')}>
+          <Select
+            value={ruleResourceIntervalSelectValue(config)}
+            onChange={(event) => void update({ ruleResourceUpdateIntervalHours: Number(event.target.value) })}
+            aria-label={t('resources.updateInterval')}
+            style={{ width: '170px' }}
+          >
+            <option value="0">{t('settings.update.intervalManualOnly')}</option>
+            <option value="6">{t('settings.update.intervalHours', { n: 6 })}</option>
+            <option value="12">{t('settings.update.intervalHours', { n: 12 })}</option>
+            <option value="24">{t('settings.update.intervalHours', { n: 24 })}</option>
+            <option value="72">{t('settings.update.intervalDays', { n: 3 })}</option>
+            <option value="168">{t('settings.update.intervalDays', { n: 7 })}</option>
+          </Select>
         </SetRow>
       </Card>
 

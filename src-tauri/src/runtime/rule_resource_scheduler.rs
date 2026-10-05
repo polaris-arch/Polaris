@@ -294,18 +294,32 @@ impl RuleResourceScheduler {
         });
     }
 
+    /// 移动应用回到前台时补查到期资源；仍走同一周期、开关、退避和单飞门。
+    /// 不安装后台保活任务，也不强制重下尚未到期的资源。
+    #[cfg(mobile)]
+    pub fn on_resume(self: &Arc<Self>, app: AppHandle) {
+        let this = self.clone();
+        tauri::async_runtime::spawn(async move {
+            this.run_due_updates(&app, "前台补更").await;
+        });
+    }
+
+    fn try_running_guard(&self) -> Option<RunningGuard> {
+        let mut inner = lock_inner(&self.inner);
+        if inner.is_running {
+            return None;
+        }
+        inner.is_running = true;
+        // 中途 return / panic 都要清 is_running。
+        Some(RunningGuard {
+            inner: self.inner.clone(),
+        })
+    }
+
     /// 一轮到期更新：防重入 → 选到期 → 逐个调既有 redownload 命令 → 记退避 + 汇总日志。
     async fn run_due_updates(self: &Arc<Self>, app: &AppHandle, reason: &str) {
-        {
-            let mut inner = lock_inner(&self.inner);
-            if inner.is_running {
-                return;
-            }
-            inner.is_running = true;
-        }
-        // 中途 return / panic 都要清 is_running。
-        let _guard = RunningGuard {
-            inner: self.inner.clone(),
+        let Some(_guard) = self.try_running_guard() else {
+            return;
         };
 
         let (config, res_dir) = {

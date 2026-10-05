@@ -107,7 +107,7 @@ export function TsLoginPanel({
     let cancelled = false;
     setHasState(null);
     api.server
-      .tailscaleStateExists([id])
+      .tailscaleStateExists([id], true)
       .then((map) => {
         if (!cancelled) setHasState(typeof map[id] === 'boolean' ? map[id] : null);
       })

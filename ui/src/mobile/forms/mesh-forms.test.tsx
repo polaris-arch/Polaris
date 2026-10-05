@@ -566,6 +566,12 @@ describe('② 真渲染：三张表的字段在移动端画得出来', () => {
     expect(tsEdit, 'TS 编辑设置没有节点名称输入').toContain('id="mts-settings-name"');
     expect(tsEdit, 'TS 编辑设置没有回填现有名称').toContain('value="Tailscale"');
     expect(tsEdit, 'TS 设置表没回填主机名').toContain('value="sway-phone"');
+    expect(tsEdit).toContain(tr('ts.accountActions'));
+    expect(tsEdit).toContain(tr('ts.fileTransfer'));
+    expect(tsEdit).not.toContain(tr('ts.method'));
+    expect(tsEdit).toContain(tr('ts.signIn'));
+    expect(tsEdit).not.toContain(tr('meshJoin.switchAccount'));
+    expect(tsEdit).not.toContain('sway-macbook');
     expect(tsEdit, '有节点时保存键仍被置灰').not.toMatch(/class="m-form-btn primary"[^>]*disabled/);
     /* 🔴 `authKey` 是登录腿写进去的凭据：整张表（不只是那一格）都不许回显它。
        这一条此前只在「规格 → 渲染器」那一半上量过，现在量的是面板真身。 */

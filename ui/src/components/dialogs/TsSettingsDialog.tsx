@@ -156,7 +156,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     const readState = (): void => {
       const request = ++revision;
       setHasLoginState(null);
-      void api.server.tailscaleStateExists([id]).then(
+      void api.server.tailscaleStateExists([id], true).then(
         (states) => { if (alive && request === revision) setHasLoginState(typeof states[id] === 'boolean' ? states[id] : null); },
         () => { if (alive && request === revision) setHasLoginState(null); },
       );
@@ -193,7 +193,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   // 桌面名称随表单草稿保存；移动端已有独立名称输入，其他字段共用 ts-spec。
   const spec: FieldSpec[] = [
     { t: 'text', k: 'name', label: 'ts.nodeName' },
-    ...tsMainSpec(exitOpts, detourOpts, interfaceOpts),
+    ...tsMainSpec(exitOpts, detourOpts, interfaceOpts, t('ts.hostnamePlaceholder')),
   ];
   const setField = (k: string, v: FormValue) => {
     setDraft((d) => ({ ...d, [k]: v }));
@@ -410,7 +410,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
             style={{ marginRight: 'auto' }}
             onClick={() => { if (node) { close(); open({ kind: 'ts-login', serverId: node.id }); } }}
           >
-            {t(hasLoginState === false ? 'ts.signIn' : 'meshJoin.switchAccount')}
+            {t('ts.signIn')}
           </button>}
           {/* 提交中**不锁**「取消」：原型 `:2545` 的 ghost 钮无 disabled，且本仓此前四个弹窗锁、
               两个不锁（NodeDialog/SubDialog）—— 不是与原型的差，是实现自己两套。统一为不锁：

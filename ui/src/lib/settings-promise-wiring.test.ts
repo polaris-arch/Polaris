@@ -499,13 +499,21 @@ const REGISTRY: readonly PromiseRow[] = [
     evidence: { kind: 'config-key', key: 'autoUpdateSubscriptionOnStart' },
   },
   {
-    snippet: '订阅与规则资源按此周期在后台刷新',
+    snippet: '订阅按此周期在后台刷新；规则资源有独立周期',
     evidence: {
       kind: 'anchors',
       items: [
         {
           file: 'ui/src/components/screens/settings/SettingsUpdate.tsx',
+          needle: 'subscriptionUpdateIntervalHours: Number(event.target.value)',
+        },
+        {
+          file: 'ui/src/components/screens/settings/SettingsUpdate.tsx',
           needle: 'ruleResourceUpdateIntervalHours: Number(event.target.value)',
+        },
+        {
+          file: 'ui/src/components/screens/settings/SettingsUpdate.tsx',
+          needle: 'value={ruleResourceIntervalSelectValue(config)}',
         },
         {
           file: 'src-tauri/src/runtime/subscription_scheduler.rs',
@@ -519,11 +527,23 @@ const REGISTRY: readonly PromiseRow[] = [
     },
   },
   {
-    snippet: '按「后台检查间隔」自动重新下载规则资源',
+    snippet: '按规则资源的独立周期自动重新下载资源',
     evidence: {
-      kind: 'anchor',
-      file: 'src-tauri/src/runtime/rule_resource_scheduler.rs',
-      needle: 'select_due_resources(',
+      kind: 'anchors',
+      items: [
+        {
+          file: 'src-tauri/src/runtime/rule_resource_scheduler.rs',
+          needle: 'select_due_resources(',
+        },
+        {
+          file: 'src-tauri/src/runtime/rule_resource_scheduler.rs',
+          needle: '.get("ruleResourceUpdateIntervalHours")',
+        },
+        {
+          file: 'src-tauri/src/runtime/rule_resource_scheduler.rs',
+          needle: '.get("ruleResourceAutoUpdate")',
+        },
+      ],
     },
   },
 ] as const;

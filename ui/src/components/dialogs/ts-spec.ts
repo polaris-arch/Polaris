@@ -23,9 +23,10 @@ export function tsMainSpec(
   exitOpts: readonly SelectOption[],
   detourOpts: readonly SelectOption[],
   interfaceOpts: readonly SelectOption[],
+  hostnamePlaceholder?: string,
 ): FieldSpec[] {
   return [
-    { t: 'text', k: 'hostname', label: 'ts.hostname', ph: 'sway-macbook' },
+    { t: 'text', k: 'hostname', label: 'ts.hostname', ph: hostnamePlaceholder, hint: 'ts.hostnameHint', opt: true },
     { t: 'select', k: 'exitNode', label: 'ts.exitNode', options: exitOpts },
     { t: 'text', k: 'exitNodeCustom', label: 'ts.exitNodeCustom', ph: '100.x.y.z / hostname', mono: true, when: (v) => v.exitNode === EXIT_CUSTOM },
     // 接入模式（上游 `AccessModeField`，同绑 reverseMesh）：上游 归常显的「接入与出口」段，故**不入高级折叠**——

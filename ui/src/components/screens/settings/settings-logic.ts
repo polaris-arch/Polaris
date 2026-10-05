@@ -376,6 +376,13 @@ export function backgroundIntervalSelectValue(config: {
   return String(config.subscriptionUpdateIntervalHours ?? DEFAULT_INTERVAL_HOURS);
 }
 
+/** 规则资源有独立周期；不能从订阅周期回填，也不能将 0（仅手动）当成缺省。 */
+export function ruleResourceIntervalSelectValue(config: {
+  ruleResourceUpdateIntervalHours?: number;
+}): string {
+  return String(config.ruleResourceUpdateIntervalHours ?? DEFAULT_INTERVAL_HOURS);
+}
+
 /**
  * 是否「仅手动」（周期调度不跑）。缺省（未设）不是手动 —— 缺省走 12h 周期。
  */

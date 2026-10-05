@@ -1349,6 +1349,19 @@ pub fn run() {
     // RunEvent 循环：① macOS dock 图标重开 ② C1 退出清理（停核 + 清系统代理）。关窗语义仍由
     // on_window_event + QuitState 决定，未改动；本回调只在**进程级真实退出**时兜安全清理。
     app.run(|app_handle, event| match event {
+        // Android onResume / iOS willEnterForeground；首启仍由调度器的 12s 补更覆盖。
+        #[cfg(mobile)]
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Resumed,
+            ..
+        } if label == "main" => {
+            if let Some(scheduler) = app_handle
+                .try_state::<Arc<runtime::rule_resource_scheduler::RuleResourceScheduler>>()
+            {
+                scheduler.on_resume(app_handle.clone());
+            }
+        }
         // macOS：点 dock 图标（NSApplicationDelegate applicationShouldHandleReopen）→ RunEvent::Reopen。
         // 主窗关闭进入轻量驻留后，Dock 重开是 macOS 上召回/重建窗口的路径；Windows 靠任务栏
         // 或托盘浮层的明确入口，Linux 靠原生菜单「显示」。show_main_window 会按存在性选择呈现或重建。

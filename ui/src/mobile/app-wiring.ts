@@ -197,12 +197,12 @@ export function reconcileEntityCaches(config: UserConfig | null | undefined): vo
 
 /**
  * Tailscale 登录态的**挂载兜底**（三条 feed 之二，见 `domain/tailscale-conn-state.ts` 头注）：
- * 不起核、只查 state 目录「登录过没」。缺它时代理没跑的整段时间里角标只有 localStorage 缓存一条来源。
+ * 不起核、只读当前持久会话（不证明授权仍有效）。缺它时代理没跑的整段时间里角标只有 localStorage 缓存一条来源。
  */
 export function hydrateTailscaleStates(serverIds: readonly string[]): void {
   if (serverIds.length === 0) return;
   void api.server
-    .tailscaleStateExists([...serverIds])
+    .tailscaleStateExists([...serverIds], true)
     .then((states) => useAppStore.getState().applyTailscaleStateExists(states))
     .catch((err: unknown) => console.error('[mobile] tailscaleStateExists failed:', err));
 }

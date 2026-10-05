@@ -179,7 +179,7 @@ export function MobileNodesScreen(): ReactElement {
     if (row.server.protocol.toLowerCase() !== 'tailscale' || row.stagedOnly) return;
     const id = row.server.id;
     setTsState({ id, exists: null });
-    void api.server.tailscaleStateExists([id]).then((states) => {
+    void api.server.tailscaleStateExists([id], true).then((states) => {
       if (request !== tsStateRequest.current) return;
       setTsState({ id, exists: typeof states[id] === 'boolean' ? states[id] : null });
     }, () => {
