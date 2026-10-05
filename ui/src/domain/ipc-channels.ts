@@ -215,6 +215,7 @@ export const IPC_CHANNELS = {
   // 下载一无所知（下完了的那一帧永不再来）⇒ 挂载时补一次回读。
   UPDATE_GET_PROGRESS: 'update_get_progress',
   UPDATE_INSTALL: 'update_install',
+  UPDATE_REQUEST_INSTALL_PERMISSION: 'update_request_install_permission',
   UPDATE_SKIP: 'update_skip',
   // App 更新弹窗（独立 mini 更新窗）：主进程 → 弹窗推状态载荷；弹窗 → 主进程回传按钮/关闭动作。
   UPDATE_POPUP_ACTION: 'update_popup_action',

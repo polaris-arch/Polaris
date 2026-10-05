@@ -88,6 +88,10 @@ const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "android")]
 const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Native APK permission waiting expires at 90s; this also bounds delayed Activity dispatch.
+#[cfg(target_os = "android")]
+const APK_PERMISSION_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// 本地状态读写超时（系统起核对账 `systemStartStatus`、开机自动连接开关的读/写）。Kotlin 侧只读桥内存
 /// 两位 / 读写 `noBackupFilesDir` 里一个标记文件，与 `vpnAuthStatus` 同量级，取同一档。
 #[cfg(target_os = "android")]
@@ -1454,6 +1458,63 @@ pub(crate) async fn installed_apps() -> Result<Vec<InstalledApp>, String> {
     }
 }
 
+/// Permission alone: even a late response cannot launch an installer.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApkInstallPermissionResponse {
+    pub(crate) granted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
+#[cfg(target_os = "android")]
+fn apk_request_expires_at_epoch_ms(budget: Duration) -> Result<u64, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "无法确认安装请求的有效期".to_owned())?;
+    u64::try_from(now.as_millis())
+        .ok()
+        .zip(u64::try_from(budget.as_millis()).ok())
+        .and_then(|(now, remaining)| now.checked_add(remaining))
+        .ok_or_else(|| "无法确认安装请求的有效期".to_owned())
+}
+
+pub(crate) async fn request_apk_install_permission() -> Result<ApkInstallPermissionResponse, String>
+{
+    #[cfg(target_os = "android")]
+    {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ApkInstallPermissionArgs {
+            expires_at_epoch_ms: u64,
+        }
+        let expires_at_epoch_ms = apk_request_expires_at_epoch_ms(Duration::from_secs(90))?;
+        let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+        match call_with_budget::<ApkInstallPermissionResponse, _>(
+            plugin,
+            "requestApkInstallPermission",
+            ApkInstallPermissionArgs {
+                expires_at_epoch_ms,
+            },
+            APK_PERMISSION_TIMEOUT,
+            None,
+        )
+        .await
+        {
+            Ok(response) => Ok(response),
+            Err(BridgeCallError::Invoke(_)) => Err("无法完成安装授权，请回到应用重试".to_owned()),
+            Err(BridgeCallError::TimedOut) => {
+                Err("等待安装授权超时，请完成系统授权后再次点击安装".to_owned())
+            }
+            Err(BridgeCallError::TaskFailed(_)) => Err("安装授权请求不可用，请重试".to_owned()),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("本平台不需要 Android 安装授权".to_owned())
+    }
+}
+
 /// 把已下载的 APK 交给系统安装器（W-21 的第二段；第一段「下载」在 `update_download`）。
 ///
 /// # 返回三态，而不是两态
@@ -1461,7 +1522,7 @@ pub(crate) async fn installed_apps() -> Result<Vec<InstalledApp>, String> {
 /// - `Ok(handed_off: true)` —— 系统安装器已拉起。**不等于装成了**：之后是用户按不按确认的事，
 ///   本进程既不等也等不到（Android 上装完新包会把旧进程杀掉）。
 /// - `Ok(handed_off: false, reason)` —— 交不出去，且**知道为什么**（最常见：没授予「安装未知
-///   应用」，Kotlin 侧已经把用户送到那一页了）。这不是错误，是一个用户可以处理的事实。
+///   应用」或刚撤销授权）。设置授权由独立命令完成，交付不会再次打开设置。
 /// - `Err` —— 桥本身出了问题（没接线 / 超时 / Kotlin 抛异常）。
 ///
 /// 把中间那一态压进 `Err` 是本条腿最容易犯的错：它会让界面只剩「安装失败」一句话可说，
@@ -1474,6 +1535,7 @@ pub(crate) async fn hand_apk_to_system_installer(apk_path: &str) -> Result<ApkHa
         #[serde(rename_all = "camelCase")]
         struct InstallApkArgs {
             apk_path: String,
+            expires_at_epoch_ms: u64,
         }
         /// Kotlin 侧 `invoke.resolve(JSObject)` 的回包。
         ///
@@ -1492,6 +1554,7 @@ pub(crate) async fn hand_apk_to_system_installer(apk_path: &str) -> Result<ApkHa
             "installApk",
             InstallApkArgs {
                 apk_path: apk_path.to_owned(),
+                expires_at_epoch_ms: apk_request_expires_at_epoch_ms(INSTALL_APK_TIMEOUT)?,
             },
             INSTALL_APK_TIMEOUT,
             None,

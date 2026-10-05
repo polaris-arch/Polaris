@@ -580,6 +580,12 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'scripts/android-rust-ndk.version': {
     why: 'Rust Android 构建默认使用的已验稳定 NDK 版本；改版本须重跑 APK 腿验证交叉编译与 Gradle。',
   },
+  'scripts/strip-android-release-native.mjs': {
+    why: 'Release native producer strips copied libraries before APK packaging; changes require the actual Android APK and source-receipt checks.',
+  },
+  'scripts/strip-android-release-native.test.mjs': {
+    why: 'Mutation checks preserve runtime/JNI/Go metadata and source AAR bytes during release stripping; changes must retain actual Android package validation.',
+  },
   'scripts/verify-apk.mjs': {
     why:
       '本腿的产物级判据本体（三份许可文本逐字节对拍 / libbox.so 的 naive+cronet 指纹 / .srs 份数 / '

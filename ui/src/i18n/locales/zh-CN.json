@@ -738,6 +738,10 @@
       "noTelemetry": "零遥测 — 不自动上传崩溃报告或分析数据"
     },
     "update": {
+      "hideProgress": "收起进度",
+      "showProgress": "查看进度",
+      "backgroundProgress": "更新任务仍在继续",
+      "hideProgressHint": "收起进度后，任务会继续进行",
       "ruleResourceAutoStatusOn": "按间隔刷新",
       "ruleResourceAutoStatusManual": "仅手动",
       "formMismatch": "更新包形态与当前安装形态不匹配，已交由系统处理",

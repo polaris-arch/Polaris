@@ -67,6 +67,11 @@ rustflags = ["-C", "target-feature=+crt-static"]
 #
 # # 为什么是 `debuginfo` 而不是 `symbols`
 #
+# 以下保留 Android debug 的诊断符号；release 分发另由 app/build.gradle.kts 在
+# AGP StripDebugSymbolsTask 的独立产物副本上执行 llvm-strip --strip-all。
+# 该步骤逐字节核对所有运行节与程序头，去掉 C++ 的 .symtab/.strtab 后再压缩入 APK；
+# 不修改这里的 debug 策略，也不修改 target/ 下的原始 Rust SO 或来源 AAR。
+#
 # 选型依据：同一份未剥的 `.so`（515511872 字节）上把两档各跑一遍（NDK 27 的 llvm-strip）：
 #   · 不剥                              515511872
 #   · `--strip-debug`（≈ strip=debuginfo）124773856   −75.8%

@@ -1541,13 +1541,27 @@ const EXECUTION_PHASE_HOOKS: &[&str] = &[
 /// 执行期钩子的**登记表**：`(文件, 钩子, 允许出现次数, 为什么允许)`。
 ///
 /// 表外一律 0 次。要加一个就来这里写一行，并写清楚「它在执行期做什么、为什么不改判据面」。
-const REGISTERED_EXECUTION_HOOKS: &[(&str, &str, usize, &str)] = &[(
-    GRADLE_FACTS,
-    "doLast",
-    1,
-    "事实任务的打印体。配置期把三样值取好，执行期只 println —— 不改任何文件、不改任何任务状态。\
-     它自己就是裁判的取材点：真被换成会改文件的东西，裁判读到的事实与 R8 到手的东西就对不上了。",
-)];
+const REGISTERED_EXECUTION_HOOKS: &[(&str, &str, usize, &str)] = &[
+    (
+        GRADLE_FACTS,
+        "doLast",
+        1,
+        "事实任务的打印体。配置期把三样值取好，执行期只 println —— 不改任何文件、不改任何任务状态。\
+         它自己就是裁判的取材点：真被换成会改文件的东西，裁判读到的事实与 R8 到手的东西就对不上了。",
+    ),
+    (
+        GRADLE_APP,
+        "configureEach",
+        1,
+        "Match only the release variant's actual StripDebugSymbolsTask producer; do not change R8 rules, signing or debug tasks.",
+    ),
+    (
+        GRADLE_APP,
+        "doLast",
+        1,
+        "Strip non-runtime symbols from the producer's independent release native output before packaging. The script verifies allocated sections, dynamic exports and Go metadata; source AAR/Rust SO, R8 rules and signing inputs stay unchanged. Actual release APK verification remains required.",
+    ),
+];
 
 /// B2 `release` / minify 相关的**执行期钩子**必须逐处登记。
 ///
