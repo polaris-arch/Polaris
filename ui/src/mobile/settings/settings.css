@@ -45,6 +45,11 @@
 
 .ms-force-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .ms-force-head > span { min-width: 0; overflow-wrap: anywhere; }
+.ms-mesh-status { font-size: .875rem; font-weight: 400; color: hsl(var(--fg)); }
+.ms-mesh-status > .m-info { flex: 1; }
+.ms-mesh-status[data-tone="ok"] .m-info-summary { color: hsl(var(--ok)); }
+.ms-mesh-status[data-tone="warn"] .m-info-summary { color: hsl(var(--warn)); }
+.ms-mesh-status[data-tone="error"] .m-info-summary { color: hsl(var(--err)); }
 .ms-force-refresh {
   position: relative; isolation: isolate; flex: none; display: grid; place-items: center;
   width: var(--mobile-action-hit); height: var(--mobile-action-hit); padding: 0;

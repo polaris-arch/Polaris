@@ -57,6 +57,8 @@ export interface ResourcesSegmentProps {
   onCatalog: () => void;
   /** 按 URL 下载一份外部资源（开表单宿主的 `res-url` 那一层）。 */
   onUrlDownload: () => void;
+  autoUpdatePolicy: string;
+  onAutoUpdateSettings: () => void;
 }
 
 
@@ -83,6 +85,8 @@ export function ResourcesSegment({
   onOpenSheet,
   onCatalog,
   onUrlDownload,
+  autoUpdatePolicy,
+  onAutoUpdateSettings,
 }: ResourcesSegmentProps): ReactElement {
   const rowCount = groups.reduce((count, group) => count + group.rows.length, 0);
   const sources = [
@@ -111,6 +115,9 @@ export function ResourcesSegment({
           <span className="rc-count" aria-label={`${t('resources.srcFilter')} ${rowCount}`}>{rowCount}</span>
         </div>
         <div className="rc-toolbar-actions">
+          <button type="button" className="rc-action" onClick={onAutoUpdateSettings}>
+            {t('resources.autoUpdateSettings')}
+          </button>
           <button type="button" className="rc-action rc-action-primary" onClick={onCatalog}>
             {t('resources.catalog')}
           </button>
@@ -123,6 +130,7 @@ export function ResourcesSegment({
           </button>
         </div>
         <div className="rc-toolbar-foot">
+          <span className="rc-group-note">{autoUpdatePolicy}</span>
           <button
             type="button"
             className={`rc-reset${resetConfirming ? ' confirming' : ''}`}
@@ -132,6 +140,7 @@ export function ResourcesSegment({
           </button>
           <InlineError text={errorOf('res:all')} />
           <InlineError text={errorOf('res:reset')} />
+          <InlineError text={errorOf('res:settings')} />
         </div>
       </div>
 

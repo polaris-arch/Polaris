@@ -3,6 +3,7 @@ use crate::runtime::config::ConfigManager;
 use crate::test_support::{crate_code, TestDir};
 
 mod add_registration_tests;
+mod tailscale_session_tests;
 
 fn temp_dir(tag: &str) -> TestDir {
     TestDir::new(&format!("polaris-server-add-{tag}-"))

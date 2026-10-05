@@ -67,7 +67,7 @@ export function MeshJoinDialog(props: MeshJoinDialogProps) {
     const readStates = (): void => {
       const request = ++revision;
       setTsStates({});
-      void api.server.tailscaleStateExists(tsNodeIds).then(
+      void api.server.tailscaleStateExists(tsNodeIds, true).then(
         (states) => { if (alive && request === revision) setTsStates(states); },
         () => { if (alive && request === revision) setTsStates({}); },
       );
@@ -120,7 +120,7 @@ export function MeshJoinDialogView({ onTsLogout, onWarpReregister, onWarpDeregis
    */
   const tsActions = (node: ServerConfig) => {
     const unread = taildropBadgeCount(tailscaleStatuses[node.id]);
-    const accountActionLabel = tsStates[node.id] === false ? t('ts.signIn') : t('meshJoin.switchAccount');
+    const accountActionLabel = tsStates[node.id] === true ? t('meshJoin.switchAccount') : t('ts.signIn');
     return (
       <>
         <button

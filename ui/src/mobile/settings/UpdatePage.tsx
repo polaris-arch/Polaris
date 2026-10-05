@@ -70,6 +70,8 @@ import {
   appUpdateErrText,
   backgroundIntervalSelectValue,
   ruleResourceAutoUpdateChecked,
+  ruleResourceAutoUpdatePatch,
+  ruleResourceIntervalSelectValue,
   wireUpdateProgress,
   type AppDownloadIntegrity,
   type ProgressDrivenState,
@@ -100,6 +102,7 @@ import {
 import { androidInstallFailureKey, classifyInstallHandoff, classifyInstallPermission } from './app-update-install';
 import { failureText } from './write-feedback';
 import type { MobileSettingsPageProps } from './settings-pages';
+import { ruleResourceUpdatePolicyText } from './rule-resource-update-policy';
 
 type SubProxyPolicy = 'follow' | 'proxy' | 'direct';
 
@@ -318,6 +321,44 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
 
   return (
     <>
+      <SettingsGroup header={t('settings.update.ruleResourceAutoCard')}>
+        <SettingsRow
+          first
+          id="rule-resource-auto"
+          label={t('settings.update.ruleResourceAutoCard')}
+          desc={t('mobileSettings.update.ruleResourceAutoDesc')}
+          control={
+            <MobileSwitch
+              checked={ruleResourceAutoUpdateChecked(config)}
+              ariaLabel={t('settings.update.ruleResourceAutoCard')}
+              onChange={(v) => commit('rule-resource-auto', update(ruleResourceAutoUpdatePatch(v)))}
+            />
+          }
+        />
+        <SettingsRow
+          stacked
+          id="rule-resource-interval"
+          label={t('mobileSettings.update.ruleResourceInterval')}
+          desc={t('mobileSettings.update.ruleResourceIntervalDesc')}
+          control={
+            <MobileSelect
+              value={ruleResourceIntervalSelectValue(config)}
+              ariaLabel={t('mobileSettings.update.ruleResourceInterval')}
+              onChange={(v) => commit('rule-resource-interval', update({ ruleResourceUpdateIntervalHours: Number(v) }))}
+            >
+              <option value="0">{t('settings.update.intervalManualOnly')}</option>
+              <option value="6">{t('settings.update.intervalHours', { n: 6 })}</option>
+              <option value="12">{t('settings.update.intervalHours', { n: 12 })}</option>
+              <option value="24">{t('settings.update.intervalHours', { n: 24 })}</option>
+              <option value="72">{t('settings.update.intervalDays', { n: 3 })}</option>
+              <option value="168">{t('settings.update.intervalDays', { n: 7 })}</option>
+            </MobileSelect>
+          }
+        />
+        <SettingsNote id="rule-resource-policy">{ruleResourceUpdatePolicyText(config, t)}</SettingsNote>
+        <SettingsNote id="rule-resource-scope">{t('mobileSettings.update.ruleResourceScopeNote')}</SettingsNote>
+      </SettingsGroup>
+
       <SettingsGroup header={t('mobileSettings.update.channelBlock')}>
         {/* 版本号是真值（`about-info`），拿不到就显示 `—` —— 不编一个「最新」，也不说成「待接线」
             （那是一条腿的状态，不是一个读不到的值；见头注那条 🔴）。
@@ -615,7 +656,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
           stacked
           id="update-interval"
           label={t('settings.update.intervalCard')}
-          desc={t('settings.update.intervalCardSub')}
+          desc={t('mobileSettings.update.subscriptionIntervalDesc')}
           control={
             <MobileSelect
               value={interval}
@@ -625,7 +666,6 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
                   'update-interval',
                   update({
                     subscriptionUpdateIntervalHours: Number(v),
-                    ruleResourceUpdateIntervalHours: Number(v),
                   }),
                 )
               }
@@ -666,26 +706,6 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
               <option value="proxy">{t('settings.update.subViaProxy')}</option>
               <option value="direct">{t('settings.update.subDirect')}</option>
             </MobileSelect>
-          }
-        />
-        <SettingsRow
-          id="rule-resource-auto"
-          label={t('settings.update.ruleResourceAutoCard')}
-          desc={t('settings.update.ruleResourceAutoDesc')}
-          control={
-            <MobileSwitch
-              checked={ruleResourceAutoUpdateChecked(config)}
-              ariaLabel={t('settings.update.ruleResourceAutoCard')}
-              onChange={(v) =>
-                commit(
-                  'rule-resource-auto',
-                  update({
-                    ruleResourceAutoUpdate: v,
-                    ruleResourceUpdateIntervalHours: config.subscriptionUpdateIntervalHours,
-                  }),
-                )
-              }
-            />
           }
         />
       </SettingsGroup>

@@ -65,7 +65,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
     }
     let cancelled = false;
     api.server
-      .tailscaleStateExists([id])
+      .tailscaleStateExists([id], true)
       .then((map) => {
         if (!cancelled) setHasState(map[id] === true);
       })

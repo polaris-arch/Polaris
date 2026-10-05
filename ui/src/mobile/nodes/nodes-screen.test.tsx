@@ -351,7 +351,7 @@ it('Tailscale 行账号入口只按 native state 证据换文案，其他节点�
   expect(staged?.onSelect).toBeUndefined();
 
   const wiring = strip(read(join(MOBILE, 'nodes', 'MobileNodesScreen.tsx')));
-  expect(wiring).toContain('api.server.tailscaleStateExists([id])');
+  expect(wiring).toContain('api.server.tailscaleStateExists([id], true)');
   expect(wiring).toContain("openMobileForm({ kind: 'ts-login', serverId: row.server.id })");
 });
 

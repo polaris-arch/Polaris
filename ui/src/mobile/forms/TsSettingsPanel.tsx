@@ -149,7 +149,7 @@ export function TsSettingsPanel({
     const readState = (): void => {
       const revision = ++stateReadRevision.current;
       setHasLoginState(null);
-      void api.server.tailscaleStateExists([serverId]).then(
+      void api.server.tailscaleStateExists([serverId], true).then(
         (states) => {
           if (alive && revision === stateReadRevision.current)
             setHasLoginState(typeof states[serverId] === 'boolean' ? states[serverId] : null);
@@ -196,7 +196,7 @@ export function TsSettingsPanel({
       down: t('settings.network.interfaceDown'),
     },
   ).map(({ value, label, disabled }) => [value, label, disabled] as SelectOption);
-  const groups = groupTsFields([...tsMainSpec(exitOpts, detourOpts, interfaceOpts), ...TS_ADV_SPEC]);
+  const groups = groupTsFields([...tsMainSpec(exitOpts, detourOpts, interfaceOpts, t('ts.hostnamePlaceholder')), ...TS_ADV_SPEC]);
 
   const requestClose = (): void => {
     if (!dirty) {
@@ -457,7 +457,7 @@ export function TsSettingsPanel({
               「编辑」都落到这张表 ⇒ 每一个节点的收件箱都到得了。完整依据见 `TaildropPanel` 头注。 */}
           {!accountActionsSupported && <p className="m-form-hint">{t('ts.iosAccountActionsUnavailable')}</p>}
           <div className="m-form-row">
-            <span className="m-form-label">{t('ts.method')}</span>
+            <span className="m-form-label">{t('ts.fileTransfer')}</span>
             <div className="m-form-inline">
               <button
                 type="button"
@@ -470,13 +470,18 @@ export function TsSettingsPanel({
                     一个进不去的收件箱不该在界面上顶着数字。 */}
                 {unread > 0 && ` (${unread})`}
               </button>
+            </div>
+          </div>
+          <div className="m-form-row">
+            <span className="m-form-label">{t('ts.accountActions')}</span>
+            <div className="m-form-inline">
               <button
                 type="button"
                 className="m-form-btn"
                 disabled={busy}
                 onClick={() => open({ kind: 'ts-login', serverId })}
               >
-                {t(!accountActionsSupported ? 'common.edit' : hasLoginState === false ? 'ts.signIn' : 'meshJoin.switchAccount')}
+                {t(!accountActionsSupported ? 'common.edit' : hasLoginState === true ? 'meshJoin.switchAccount' : 'ts.signIn')}
               </button>
               {(hasLoginState === true || !accountActionsSupported) && <button
                 type="button"

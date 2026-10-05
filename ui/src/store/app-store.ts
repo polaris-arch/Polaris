@@ -541,10 +541,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   /**
-   * 挂载兜底：用 state 目录存在性批量校正「登录过没」（TAILSCALE_STATE_EXISTS，不起核）。
+   * 挂载兜底：用当前持久会话批量校正账号显示（TAILSCALE_STATE_EXISTS 的 cached 模式，不起核）。
    *
-   * 不写 localStorage 缓存：缓存的语义是「上次 STATUS 已知态」，而这里只是文件系统层面的粗粒度兜底
-   * （state 在 ≠ key 没过期）。与 STATUS 的竞态（挂载时代理已在跑）无需额外守卫：STATUS 是持续流，
+   * 不写 localStorage 缓存：缓存的语义是「上次 STATUS 已知态」，这里的持久会话不证明授权仍有效。
+   * 与 STATUS 的竞态（挂载时代理已在跑）无需额外守卫：STATUS 是持续流，
    * 下一帧即把真值盖回来。
    */
   applyTailscaleStateExists: (states) => {

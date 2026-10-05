@@ -325,7 +325,7 @@ export default function App() {
     const ids = servers.filter((s) => s.protocol === 'tailscale').map((s) => s.id);
     if (ids.length === 0) return;
     void api.server
-      .tailscaleStateExists(ids)
+      .tailscaleStateExists(ids, true)
       .then((states) => useAppStore.getState().applyTailscaleStateExists(states))
       .catch((err) => console.error('[App] tailscaleStateExists failed:', err));
   }, [servers]);

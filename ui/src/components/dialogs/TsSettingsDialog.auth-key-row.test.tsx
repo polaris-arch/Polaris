@@ -108,9 +108,18 @@ describe('TsSettingsDialog：Auth Key 状态行只渲染布尔事实', () => {
 
   it('状态未知时保留手动登录入口，不虚构可登出的会话', () => {
     const html = render([tsNode(SENTINEL)]);
-    expect(html).toContain('meshJoin.switchAccount');
+    expect(html).toContain('ts.signIn');
+    expect(html).not.toContain('meshJoin.switchAccount');
     expect(html).not.toContain('>ts.logout</button>');
     expect(html).toContain(CLEAR_BTN);
+  });
+
+  it('an unset hostname stays empty and explains automatic naming instead of suggesting a test Mac', () => {
+    const html = render([tsNode()]);
+    expect(html).toMatch(/id="nd-f-hostname"[^>]*value=""/);
+    expect(html).toContain('placeholder="ts.hostnamePlaceholder"');
+    expect(html).toContain('ts.hostnameHint');
+    expect(html).not.toContain('sway-macbook');
   });
 });
 

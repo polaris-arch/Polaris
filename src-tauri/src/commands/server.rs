@@ -1068,7 +1068,8 @@ pub async fn tailscale_logout(
     Ok(ApiResponse::ok(json!({ "runningNeedsRestart": false })))
 }
 
-/// 上游 `TAILSCALE_STATE_EXISTS`：批量查 TS 节点 state 目录存在性。
+/// 默认查物理 state 目录，供认证密钥替换前清理；`cached_session_only` 仅供 UI 展示
+/// 持久化的当前会话，不证明 live authentication、NoOwner 或可以跳过停核/清理。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -1077,6 +1078,7 @@ pub async fn tailscale_logout(
 pub fn tailscale_state_exists(
     state: State<'_, AppRuntime>,
     server_ids: Vec<String>,
+    cached_session_only: Option<bool>,
 ) -> ApiResponse<Value> {
     let mut map = serde_json::Map::new();
     for id in server_ids {
@@ -1086,9 +1088,8 @@ pub fn tailscale_state_exists(
                 "TAILSCALE_STATE_QUERY_FAILED",
             );
         };
-        let exists = match std::fs::metadata(path) {
-            Ok(metadata) => metadata.is_dir(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        let exists = match tailscale_state_exists_at(&path, cached_session_only.unwrap_or(false)) {
+            Ok(exists) => exists,
             Err(_) => {
                 return ApiResponse::err_with_code(
                     "Cannot verify Tailscale state",
@@ -1099,6 +1100,69 @@ pub fn tailscale_state_exists(
         map.insert(id, Value::Bool(exists));
     }
     ApiResponse::ok(Value::Object(map))
+}
+
+/// The default physical-directory query protects auth-key replacement cleanup. Only UI
+/// presentation opts into cached account evidence; neither query establishes writer ownership.
+fn tailscale_state_exists_at(
+    path: &std::path::Path,
+    cached_session_only: bool,
+) -> std::io::Result<bool> {
+    if !cached_session_only {
+        return match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        };
+    }
+    use std::io::Read;
+    const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
+    let unknown = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cannot verify Tailscale state",
+        )
+    };
+    let directory = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !directory.is_dir() || directory.file_type().is_symlink() {
+        return Err(unknown());
+    }
+    let state_root = path.parent().ok_or_else(unknown)?;
+    let config_root = state_root.parent().ok_or_else(unknown)?.canonicalize()?;
+    let state_root = state_root.canonicalize()?;
+    let target = path.canonicalize()?;
+    if !state_root.starts_with(&config_root)
+        || !target.starts_with(&state_root)
+        || target == state_root
+    {
+        return Err(unknown());
+    }
+    let file_path = path.join("tailscaled.state");
+    let metadata = match std::fs::symlink_metadata(&file_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_BYTES
+    {
+        return Err(unknown());
+    }
+    let file = std::fs::File::open(file_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES {
+        return Err(unknown());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(unknown());
+    }
+    polaris_mesh::tailscale_state::cached_session_exists(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// 上游 `TAILSCALE_GET_STATUS`：拉各 TS 节点状态末帧（sing-box 管理 API STATUS 流缓存）。
