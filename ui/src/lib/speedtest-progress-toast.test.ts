@@ -127,6 +127,16 @@ const done = (p: Partial<SpeedTestDonePayload> = {}): SpeedTestDonePayload => ({
 });
 
 describe('reduce：纯状态机', () => {
+  it('preparation and ready binding never create counts or a measured progress toast', () => {
+    const initial = initialSpeedTestToastState;
+    for (const event of [
+      { runId: '1', phase: 'preparingConnection' as const },
+      { runId: '1', phase: 'waitingForReady' as const },
+      { runId: '1', phase: 'measuring' as const, measurementContext: { runId: '1', requestId: 'speed-1', mainGeneration: 7, startTime: 123 } },
+    ]) {
+      expect(reduceSpeedTestProgress(initial, event)).toEqual({ next: initial, intent: null });
+    }
+  });
   it('未跑完 ⇒ sticky 进度（这就是「持续状态」那一档）', () => {
     const { next, intent } = reduceSpeedTestProgress(initialSpeedTestToastState, {
       tested: 3,

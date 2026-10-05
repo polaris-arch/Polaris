@@ -192,6 +192,8 @@ export const IPC_CHANNELS = {
   // 解锁检测（AI/流媒体，经当前代理出口）：run 触发一轮检测（force 绕 TTL）；get 纯读最近快照（水合）
   UNLOCK_RUN: 'unlock_run',
   UNLOCK_GET: 'unlock_get',
+  MANUAL_NETWORK_CHECK: 'manual_network_check',
+  MANUAL_NETWORK_CHECK_CANCEL: 'manual_network_check_cancel',
 
   // 系统进程枚举（路由规则的进程快速选择器）
   SYSTEM_LIST_PROCESSES: 'system_list_processes',

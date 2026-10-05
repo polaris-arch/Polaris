@@ -31,9 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-#[cfg(target_os = "android")]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use polaris_config_engine::builder::custom_rule_files::{
@@ -73,9 +71,9 @@ use polaris_config_engine::user_config::proxy_ports::{control_api_port, local_pr
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_config_engine::user_config::tun_config::resolve_win_tun_interface_name;
 use polaris_config_engine::user_config::ProxyModeType;
-#[cfg(target_os = "android")]
-use polaris_core_supervisor::port_bookkeeping::PrimaryApiPortLedger;
-use polaris_core_supervisor::port_bookkeeping::{FreePortProvider, TokioPortProvider};
+use polaris_core_supervisor::port_bookkeeping::{
+    FreePortProvider, PrimaryApiPortLedger, ResolvedPort, TokioPortProvider,
+};
 use polaris_core_supervisor::{
     core_ready_budget_ms, core_startup_estimate_ms, decide_peel, run_config_check,
     wait_for_core_ready, CoreReadyDeps, CoreReadyOutcome, KernelRejection, PeelStep, PortAllocator,
@@ -406,6 +404,18 @@ pub(super) struct StartPorts {
     pub(super) probe_pool: Vec<u16>,
 }
 
+/// Primary endpoints stay retired until this app process exits. No failure or
+/// cancellation may return a port to a later main's lazy controller transport.
+pub(super) fn allocate_primary_api_port<P: FreePortProvider>(
+    ledger: &PrimaryApiPortLedger,
+    allocator: &PortAllocator<P>,
+    exclusions: &PortExclusions,
+) -> Result<ResolvedPort, String> {
+    ledger
+        .allocate(allocator, exclusions)
+        .map_err(|_| "管理 API 端口已耗尽；请完全退出应用后重试".to_string())
+}
+
 /// Adds one exclusion to the fixed-size core-supervisor port book without
 /// changing its public contract. Used only for the optional probe pool after
 /// the essential subscription port has already been allocated.
@@ -733,13 +743,14 @@ tokio::task_local! {
     ///    退场会提前解除外层。
     ///
     /// task-local 天然随调用链传递、随作用域嵌套、且**不跨任务泄漏** —— 别的任务里的 `start` 读不到，
-    /// 上面两条缺陷从物理上不再存在。`tokio::spawn` 出去的任务不继承（正确：那已是另一次调用）。
+    /// 上面两条缺陷从物理上不再存在。任意 `tokio::spawn` 不自动继承；normal Start producer
+    /// 延续当前起核请求，因此注册时捕获交互性，并在其任务内显式恢复非交互作用域。
     static HELPER_GATE_INTERACTIVE: bool;
 }
 
 /// 当前调用链是否为交互式起核。**未设置 = 交互式**（默认放行弹框）：绝大多数入口（IPC / 托盘 /
 /// 启动自动连接 / switchMode 去抖重启）都不显式声明，它们全是用户驱动的，默认必须能弹框。
-fn helper_gate_interactive() -> bool {
+pub(super) fn helper_gate_interactive() -> bool {
     HELPER_GATE_INTERACTIVE.try_with(|v| *v).unwrap_or(true)
 }
 
@@ -1678,9 +1689,28 @@ impl ProxyRuntime {
                         return Ok(self.status());
                     }
                     main_reservation.arm_external_start();
-                    if let Err(msg) = tauri_plugin_polaris_ios::start(&gate_config_json).await {
-                        self.set_error(&msg, code::STARTUP_FAILED);
-                        return Err(StartError::coded(msg, code::STARTUP_FAILED));
+                    match tauri_plugin_polaris_ios::start(&gate_config_json, my_gen).await {
+                        Ok(receipt) => {
+                            self.gate.with_current_generation(my_gen, |_live| {
+                                if let Ok(mut ready) = self.ios_ready_session.write() {
+                                    *ready = Some((my_gen, receipt));
+                                }
+                            });
+                        }
+                        Err(msg) => {
+                            if self.gate.generation() != my_gen {
+                                return Ok(self.status());
+                            }
+                            // These exact prefixes are emitted by the native NSError adapter.
+                            // Unknown failures remain StartupFailed; no timeout is permission denial.
+                            let error_code = match msg.split_once(':').map(|(code, _)| code) {
+                                Some("ForegroundRequired") => code::IOS_FOREGROUND_REQUIRED,
+                                Some("PermissionDenied") => code::IOS_VPN_PERMISSION_DENIED,
+                                _ => code::STARTUP_FAILED,
+                            };
+                            self.set_error(&msg, error_code);
+                            return Err(StartError::coded(msg, error_code));
+                        }
                     }
                 }
                 0
@@ -2100,6 +2130,7 @@ impl ProxyRuntime {
         let user_config = effective_user_config;
 
         let new_status = ProxyStatus {
+            main_generation: my_gen,
             running: true,
             // 读时投影字段，存储态恒 false（真值 = `start_inflight` 计数，见字段文档）。
             starting: false,
@@ -2144,7 +2175,7 @@ impl ProxyRuntime {
         // The final endpoint set was claimed before native/libbox startup. Keep that claim
         // continuously through readiness; releasing and re-reserving here opens a takeover gap.
         if let Ok(mut snap) = self.startup_snapshot.write() {
-            *snap = Some(config);
+            *snap = Some(config.clone());
         }
         // 核刚按磁盘配置生成并起来 ⇒ 一切「保存但没进核」的欠账在这一刻结清。
         // 清点必须与 `startup_snapshot` 同刻：这两者一起定义了「运行核吃进去的是什么」。
@@ -2448,6 +2479,14 @@ impl ProxyRuntime {
              TUN路由校验={tun_route_ms}ms 系统代理设置={system_proxy_ms}ms \
              mesh路由接线={mesh_route_ms}ms DNS接管={dns_ms}ms）"
         );
+        self.capture_ready_main(
+            my_gen,
+            &config,
+            &user_config,
+            &serde_json::to_value(&singbox_config)
+                .map_err(|error| StartError::from(error.to_string()))?,
+            &new_status,
+        )?;
         Ok(new_status)
     }
 
@@ -3165,19 +3204,18 @@ impl ProxyRuntime {
             user_config.mixed_port,
         );
         let allocator = PortAllocator::new(TokioPortProvider);
-        #[cfg(target_os = "android")]
-        let resolved = {
-            static USED_PRIMARY_API_PORTS: OnceLock<PrimaryApiPortLedger> = OnceLock::new();
-            USED_PRIMARY_API_PORTS
-                .get_or_init(PrimaryApiPortLedger::default)
-                .allocate(&allocator, &exclusions)
-                .map_err(|_| "Android 管理 API 端口已耗尽；请完全退出应用后重试".to_string())?
-        };
-        #[cfg(not(target_os = "android"))]
-        let resolved = allocator.resolve_tailscale_api_port(&exclusions);
+        // h2c channels dial lazily and may reconnect. Every platform must retire a
+        // proposed primary endpoint, including cancelled/failed starts, so a ticket's
+        // port and saved secret cannot address a later main in this process.
+        static USED_PRIMARY_API_PORTS: OnceLock<PrimaryApiPortLedger> = OnceLock::new();
+        let resolved = allocate_primary_api_port(
+            USED_PRIMARY_API_PORTS.get_or_init(PrimaryApiPortLedger::default),
+            &allocator,
+            &exclusions,
+        )?;
         let api_port = resolved.port;
         if resolved.used_fallback {
-            log::warn!("管理 API 端口 5 次解析均撞排除集 → 回落 {api_port}");
+            log::warn!("管理 API 端口 5 次解析无可用新端口 → 回落 {api_port}");
         }
         // C19 update-in 端口：额外排除已占的 api_port，fallback = control_api+3（避与 api/login 的 +1/+2 撞）。
         let update_in_excl = PortExclusions::for_login_api(

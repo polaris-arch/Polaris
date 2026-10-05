@@ -16,6 +16,7 @@ use super::*;
 mod spawn_guard;
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex as StdMutex;
 
 use polaris_unlock::http::{RedirectHop, UnlockRequest, UnlockResponse};
@@ -225,6 +226,238 @@ fn all_ok_mock() -> MockHttp {
 
 fn runtime() -> UnlockRuntime {
     UnlockRuntime::default()
+}
+
+struct PausingCommitSink {
+    calls: std::sync::atomic::AtomicUsize,
+    pause_at: usize,
+    ready: std::sync::Barrier,
+    resume: std::sync::Barrier,
+    recorded: RecordingSink,
+}
+
+impl PausingCommitSink {
+    fn new(pause_at: usize) -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            pause_at,
+            ready: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+            recorded: RecordingSink::default(),
+        }
+    }
+}
+
+impl UnlockEventSink for PausingCommitSink {
+    fn with_current_commit(&self, commit: &mut dyn FnMut() -> bool) -> bool {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.pause_at {
+            // This is after the last external guard, immediately before the detector write lock.
+            self.ready.wait();
+            self.resume.wait();
+        }
+        commit()
+    }
+    fn progress(&self, id: &str, result: &UnlockResult) {
+        UnlockEventSink::progress(&self.recorded, id, result);
+    }
+    fn updated(&self, snapshot: &UnlockSnapshot) {
+        UnlockEventSink::updated(&self.recorded, snapshot);
+    }
+    fn invalidated(&self, running: bool, blocked: bool) {
+        UnlockEventSink::invalidated(&self.recorded, running, blocked);
+    }
+}
+
+#[test]
+fn completed_invalidate_cannot_be_refilled_by_run_after_its_last_guard() {
+    let runtime = Arc::new(runtime());
+    let sink = Arc::new(PausingCommitSink::new(2));
+    let task_runtime = Arc::clone(&runtime);
+    let task_sink = Arc::clone(&sink);
+    let task = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(task_runtime.run(&all_ok_mock(), &*task_sink, false, || 1_000))
+    });
+    sink.ready.wait();
+    runtime.invalidate(&*sink, false, false);
+    assert_eq!(runtime.epoch(), 1);
+    sink.resume.wait();
+    assert!(task.join().unwrap().checked_at.is_none());
+    assert!(runtime.peek(1_001).is_none());
+    assert!(runtime.last_snapshot().is_none());
+    assert_eq!(runtime.last_run_at.load(Ordering::SeqCst), 0);
+    assert!(sink.recorded.updated().is_empty());
+}
+
+#[test]
+fn completed_invalidate_cannot_be_refilled_by_warm_recheck() {
+    let runtime = Arc::new(runtime());
+    let mut old = UnlockSnapshot {
+        checked_at: Some(500),
+        ..Default::default()
+    };
+    old.results
+        .insert("chatgpt".into(), UnlockResult::new(UnlockStatus::Timeout));
+    runtime.store(old.clone(), 500, FRESH_TTL_MS);
+    runtime.set_last_snapshot(Some(old));
+    let sink = Arc::new(PausingCommitSink::new(1));
+    let task_runtime = Arc::clone(&runtime);
+    let task_sink = Arc::clone(&sink);
+    let task = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(task_runtime.run_recheck(&all_ok_mock(), &*task_sink, 0, || 1_000))
+    });
+    sink.ready.wait();
+    runtime.invalidate(&*sink, false, false);
+    sink.resume.wait();
+    assert!(!task.join().unwrap());
+    assert!(runtime.peek(1_001).is_none());
+    assert!(runtime.last_snapshot().is_none());
+    assert!(sink.recorded.updated().is_empty());
+    assert_eq!(sink.recorded.progress_count(), 0);
+}
+
+#[test]
+fn legal_commit_before_invalidate_is_cleared_atomically() {
+    use std::sync::mpsc;
+    let runtime = Arc::new(runtime());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (invalidating_tx, invalidating_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let committing = Arc::clone(&runtime);
+    let commit = std::thread::spawn(move || {
+        committing.commit_epoch(&RecordingSink::default(), 0, || {
+            let snapshot = UnlockSnapshot {
+                checked_at: Some(500),
+                ..Default::default()
+            };
+            committing.set_last_snapshot_locked(Some(snapshot.clone()));
+            committing.store_locked(snapshot, 500, FRESH_TTL_MS);
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let invalidating = Arc::clone(&runtime);
+    let invalidate = std::thread::spawn(move || {
+        invalidating_tx.send(()).unwrap();
+        invalidating.invalidate(&RecordingSink::default(), false, false);
+        done_tx.send(()).unwrap();
+    });
+    invalidating_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    release_tx.send(()).unwrap();
+    assert!(commit.join().unwrap());
+    done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    invalidate.join().unwrap();
+    assert!(runtime.peek(501).is_none());
+    assert!(runtime.last_snapshot().is_none());
+}
+
+struct BoundRecordingSink {
+    current: std::sync::Arc<AtomicBool>,
+    sink: RecordingSink,
+}
+
+impl UnlockEventSink for BoundRecordingSink {
+    fn is_current(&self) -> bool {
+        self.current.load(Ordering::SeqCst)
+    }
+    fn progress(&self, id: &str, result: &UnlockResult) {
+        if self.is_current() {
+            self.sink.progress(id, result);
+        }
+    }
+    fn updated(&self, snapshot: &UnlockSnapshot) {
+        if self.is_current() {
+            UnlockEventSink::updated(&self.sink, snapshot);
+        }
+    }
+    fn invalidated(&self, running: bool, blocked: bool) {
+        if self.is_current() {
+            UnlockEventSink::invalidated(&self.sink, running, blocked);
+        }
+    }
+}
+
+#[tokio::test]
+async fn manual_binding_failure_at_commit_cannot_write_cache_or_last_snapshot() {
+    let rt = runtime();
+    let current = std::sync::Arc::new(AtomicBool::new(true));
+    let sink = BoundRecordingSink {
+        current: current.clone(),
+        sink: RecordingSink::default(),
+    };
+    let clocks = AtomicU64::new(0);
+    let snapshot = rt
+        .run(&all_ok_mock(), &sink, false, || {
+            if clocks.fetch_add(1, Ordering::SeqCst) == 2 {
+                // A saved-config/owner change after the final response, immediately before commit.
+                current.store(false, Ordering::SeqCst);
+            }
+            1_000
+        })
+        .await;
+    assert!(snapshot.checked_at.is_none());
+    assert!(rt.peek(1_000).is_none());
+    assert!(rt.last_snapshot().is_none());
+    assert!(sink.sink.updated().is_empty());
+    assert!(
+        sink.sink.invalidated().is_empty(),
+        "cannot invalidate or reschedule the successor"
+    );
+}
+
+#[tokio::test]
+async fn stale_manual_binding_never_enters_readiness_io() {
+    let rt = runtime();
+    let sink = BoundRecordingSink {
+        current: std::sync::Arc::new(AtomicBool::new(false)),
+        sink: RecordingSink::default(),
+    };
+    let calls = std::sync::Arc::new(AtomicU64::new(0));
+    let observed = calls.clone();
+    let http = all_ok_mock().hook(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+    });
+    let snapshot = rt.run(&http, &sink, false, || 1_000).await;
+    assert!(snapshot.checked_at.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(rt.last_snapshot().is_none());
+}
+
+#[tokio::test]
+async fn bound_recheck_losing_identity_keeps_the_previous_cache() {
+    let rt = runtime();
+    let mut old = UnlockSnapshot {
+        checked_at: Some(500),
+        ..Default::default()
+    };
+    old.results
+        .insert("chatgpt".into(), UnlockResult::new(UnlockStatus::Timeout));
+    rt.store(old.clone(), 500, FRESH_TTL_MS);
+    rt.set_last_snapshot(Some(old.clone()));
+    let current = std::sync::Arc::new(AtomicBool::new(true));
+    let sink = BoundRecordingSink {
+        current: current.clone(),
+        sink: RecordingSink::default(),
+    };
+    let http = all_ok_mock().hook(move || {
+        current.store(false, Ordering::SeqCst);
+    });
+    assert!(!rt.run_recheck(&http, &sink, rt.epoch(), || 1_000).await);
+    assert_eq!(rt.peek(1_000), Some(old.clone()));
+    assert_eq!(rt.last_snapshot(), Some(old));
+    assert!(sink.sink.updated().is_empty());
 }
 
 /// gating SoT 全矩阵（item6）：核未运行/无端口 → ProxyNotRunning；running 但 exit_blocked → ExitInvalid；

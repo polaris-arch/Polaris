@@ -1,0 +1,920 @@
+use super::*;
+use std::sync::atomic::AtomicUsize;
+
+fn saved() -> Value {
+    let mut config = polaris_store::default_config();
+    config["servers"] = serde_json::json!([
+        {"id":"first", "name":"First", "protocol":"tailscale", "tailscaleSettings":{}},
+        {"id":"second", "name":"Second", "protocol":"tailscale", "tailscaleSettings":{}},
+    ]);
+    config["selectedServerId"] = serde_json::json!("first");
+    config
+}
+
+fn ticket() -> ReadyMainTicket {
+    let saved = saved();
+    let binding = ActionBinding::new(
+        NormalMainAction::TailscaleLogin,
+        "attempt".into(),
+        &saved,
+        vec!["second".into()],
+        Some("epoch-authority".into()),
+    )
+    .unwrap();
+    let core = Arc::new(ReadyMainCore {
+        generation: 7,
+        saved_digest: digest(&saved).unwrap(),
+        emission_digest: "final-emission".into(),
+        targets: BTreeMap::from([("second".into(), "Second".into())]),
+        status: ProxyStatus {
+            running: true,
+            clash_api_port: 9876,
+            ..ProxyStatus::default()
+        },
+        api_secret: "bound-secret".into(),
+        probe_ports: vec![9877],
+        local_http_proxy: Some(LocalHttpProxy {
+            port: 9878,
+            auth: None,
+        }),
+        committed: AtomicBool::new(true),
+    });
+    ReadyMainTicket { core, binding }
+}
+
+#[test]
+fn final_emission_includes_unselected_ts_and_excludes_peeled_targets() {
+    let parsed = serde_json::from_value::<UserConfig>(saved()).unwrap();
+    let final_config =
+        serde_json::json!({"endpoints":[{"type":"tailscale","tag":"Second"}], "outbounds":[]});
+    assert_eq!(
+        final_targets(&parsed, &final_config),
+        BTreeMap::from([("second".into(), "Second".into())])
+    );
+    let mut ticket = ticket();
+    ticket.binding.target_ids = vec!["first".into()];
+    assert_eq!(
+        check_binding(
+            &ticket,
+            7,
+            true,
+            false,
+            &ticket.binding.saved_digest,
+            Some(&ticket.core)
+        ),
+        Err(MainPrerequisiteError::TargetMissing)
+    );
+}
+
+#[test]
+fn ready_capture_uses_final_effective_ids_after_same_name_target_is_peeled() {
+    let (runtime, _directory) = runtime();
+    let mut saved = saved();
+    saved["servers"][0]["name"] = serde_json::json!("X");
+    saved["servers"][1]["name"] = serde_json::json!("X");
+    let mut effective: UserConfig = serde_json::from_value(saved.clone()).unwrap();
+    effective.servers.retain(|server| server.id == "second");
+    let emitted = serde_json::json!({"endpoints":[{"type":"tailscale","tag":"X"}],"outbounds":[]});
+    runtime
+        .capture_ready_main(
+            runtime.core_generation(),
+            &saved,
+            &effective,
+            &emitted,
+            &ProxyStatus {
+                running: true,
+                clash_api_port: 9876,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let core = runtime.ready_main.read().unwrap().clone().unwrap();
+    assert_eq!(
+        core.targets,
+        BTreeMap::from([("second".into(), "X".into())])
+    );
+    assert!(
+        !core.targets.contains_key("first"),
+        "the peeled identity cannot inherit a reused tag"
+    );
+    assert_eq!(core.saved_digest, digest(&saved).unwrap());
+    assert_ne!(
+        core.saved_digest,
+        digest(&serde_json::to_value(&effective).unwrap()).unwrap()
+    );
+    assert_eq!(core.emission_digest, digest(&emitted).unwrap());
+}
+
+type ProbeWrites = Arc<std::sync::Mutex<Vec<(u16, String, String, String)>>>;
+struct RecordedProbeApi {
+    port: u16,
+    secret: String,
+    writes: ProbeWrites,
+    current: Arc<AtomicBool>,
+    supersede_during_write: bool,
+}
+#[async_trait]
+impl polaris_switch_engine::ManagementApi for RecordedProbeApi {
+    async fn select_outbound(
+        &self,
+        selector: &str,
+        member: &str,
+    ) -> Result<(), polaris_switch_engine::ManagementError> {
+        self.writes.lock().unwrap().push((
+            self.port,
+            self.secret.clone(),
+            selector.into(),
+            member.into(),
+        ));
+        if self.supersede_during_write {
+            self.current.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    async fn close_connection(
+        &self,
+        _: &str,
+    ) -> Result<(), polaris_switch_engine::ManagementError> {
+        panic!("a bound probe must not close another connection")
+    }
+    async fn first_connection_snapshot(
+        &self,
+    ) -> Result<
+        Vec<polaris_switch_engine::ConnectionSnapshot>,
+        polaris_switch_engine::ManagementError,
+    > {
+        panic!("a bound probe must not query current connection state")
+    }
+}
+
+#[tokio::test]
+async fn bound_probe_transport_stays_on_ticket_a_when_current_runtime_becomes_b() {
+    let (runtime, _directory) = runtime();
+    runtime.status.write().unwrap().clash_api_port = 9876;
+    let ticket = ticket();
+    let current = Arc::new(AtomicBool::new(true));
+    let writes = ProbeWrites::default();
+    let connected = std::sync::Mutex::new(Vec::new());
+    let selected = select_ticket_probe(
+        &ticket,
+        0,
+        "Second",
+        || current.load(Ordering::SeqCst) && runtime.status().clash_api_port == ticket.api_port(),
+        |port, secret| {
+            std::future::ready({
+                connected.lock().unwrap().push((port, secret.clone()));
+                // This is the real transport-construction seam, after validation A. Generation B
+                // owns a different current endpoint before construction completes.
+                runtime.status.write().unwrap().clash_api_port = 34567;
+                current.store(false, Ordering::SeqCst);
+                RecordedProbeApi {
+                    port,
+                    secret,
+                    writes: writes.clone(),
+                    current: current.clone(),
+                    supersede_during_write: false,
+                }
+            })
+        },
+    )
+    .await;
+    assert!(!selected);
+    assert_eq!(runtime.status().clash_api_port, 34567);
+    assert_eq!(
+        *connected.lock().unwrap(),
+        vec![(9876, "bound-secret".into())]
+    );
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "neither A nor successor B may receive a stale PUT"
+    );
+}
+
+#[tokio::test]
+async fn bound_probe_actual_write_is_pinned_and_supersession_discards_completion() {
+    for supersede_during_write in [false, true] {
+        let ticket = ticket();
+        let current = Arc::new(AtomicBool::new(true));
+        let writes = ProbeWrites::default();
+        let selected = select_ticket_probe(
+            &ticket,
+            0,
+            "Second",
+            || current.load(Ordering::SeqCst),
+            |port, secret| {
+                std::future::ready({
+                    RecordedProbeApi {
+                        port,
+                        secret,
+                        writes: writes.clone(),
+                        current: current.clone(),
+                        supersede_during_write,
+                    }
+                })
+            },
+        )
+        .await;
+        assert_eq!(selected, !supersede_during_write);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![(
+                9876,
+                "bound-secret".into(),
+                "probe-selector-0".into(),
+                "Second".into()
+            )]
+        );
+    }
+}
+
+#[tokio::test]
+async fn bound_probe_rejects_foreign_target_slot_or_invalid_ticket_before_transport() {
+    for (slot, member, current) in [
+        (0, "First", true),
+        (1, "Second", true),
+        (0, "Second", false),
+    ] {
+        let connected = AtomicUsize::new(0);
+        let ticket = ticket();
+        assert!(
+            !select_ticket_probe(
+                &ticket,
+                slot,
+                member,
+                || current,
+                |port, secret| std::future::ready({
+                    connected.fetch_add(1, Ordering::SeqCst);
+                    RecordedProbeApi {
+                        port,
+                        secret,
+                        writes: ProbeWrites::default(),
+                        current: Arc::new(AtomicBool::new(current)),
+                        supersede_during_write: false,
+                    }
+                })
+            )
+            .await
+        );
+        assert_eq!(connected.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn inherited_running_tcp_and_uncommitted_start_cannot_authorize() {
+    let ticket = ticket();
+    assert_eq!(
+        check_binding(&ticket, 7, true, false, &ticket.binding.saved_digest, None),
+        Err(MainPrerequisiteError::ReadyUnknown)
+    );
+    ticket.core.committed.store(false, Ordering::SeqCst);
+    assert_eq!(
+        check_binding(
+            &ticket,
+            7,
+            true,
+            false,
+            &ticket.binding.saved_digest,
+            Some(&ticket.core)
+        ),
+        Err(MainPrerequisiteError::ReadyUnknown)
+    );
+    ticket.core.committed.store(true, Ordering::SeqCst);
+    for (generation, running, busy) in [(8, true, false), (7, false, false), (7, true, true)] {
+        assert_eq!(
+            check_binding(
+                &ticket,
+                generation,
+                running,
+                busy,
+                &ticket.binding.saved_digest,
+                Some(&ticket.core)
+            ),
+            Err(MainPrerequisiteError::Superseded)
+        );
+    }
+    assert_eq!(
+        check_binding(&ticket, 7, true, false, "changed", Some(&ticket.core)),
+        Err(MainPrerequisiteError::ConfigurationChanged)
+    );
+}
+
+#[test]
+fn epoch_and_config_content_are_bound_without_compatibility_version_shortcuts() {
+    let ticket = ticket();
+    assert_eq!(ticket.identity_epoch(), Some("epoch-authority"));
+    assert_eq!(ticket.target_tag("second"), Some("Second"));
+    assert_eq!(ticket.target_tag("first"), None);
+    let mut newer = saved();
+    newer["servers"][1]["tailscaleSettings"]["hostname"] = serde_json::json!("changed");
+    assert_ne!(digest(&saved()).unwrap(), digest(&newer).unwrap());
+    assert_eq!(
+        NormalMainAction::TailscaleLogin.requirement(Platform::Ios),
+        ActionRequirement::NormalMainRequired
+    );
+    for platform in [
+        Platform::Mac,
+        Platform::Linux,
+        Platform::Win,
+        Platform::Android,
+    ] {
+        assert_eq!(
+            NormalMainAction::TailscaleLogin.requirement(platform),
+            ActionRequirement::IndependentExistingPath
+        );
+        assert_eq!(
+            NormalMainAction::ManualSpeedTest.requirement(platform),
+            ActionRequirement::IndependentExistingPath
+        );
+        assert_eq!(
+            NormalMainAction::ManualNetworkCheck.requirement(platform),
+            ActionRequirement::NormalMainRequired
+        );
+    }
+}
+
+struct MockProbe {
+    calls: AtomicUsize,
+    current: AtomicBool,
+    result: Result<(), MainPrerequisiteError>,
+    supersede_during_io: bool,
+}
+#[async_trait]
+impl MainReadinessProbe for MockProbe {
+    async fn observe(&self, _core: &ReadyMainCore) -> Result<(), MainPrerequisiteError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.supersede_during_io {
+            self.current.store(false, Ordering::SeqCst);
+        }
+        self.result.clone()
+    }
+}
+
+#[tokio::test]
+async fn fresh_observation_is_required_and_supersession_during_io_rejects_commit() {
+    for (result, supersede, expected) in [
+        (Ok(()), false, Ok(())),
+        (
+            Err(MainPrerequisiteError::ReadyUnknown),
+            false,
+            Err(MainPrerequisiteError::ReadyUnknown),
+        ),
+        (Ok(()), true, Err(MainPrerequisiteError::Superseded)),
+    ] {
+        let probe = MockProbe {
+            calls: AtomicUsize::new(0),
+            current: AtomicBool::new(true),
+            result,
+            supersede_during_io: supersede,
+        };
+        let ticket = ticket();
+        let result = validate_with_probe(&probe, &ticket, || {
+            if !probe.current.load(Ordering::SeqCst) {
+                return Err(MainPrerequisiteError::Superseded);
+            }
+            check_binding(
+                &ticket,
+                7,
+                true,
+                false,
+                &ticket.binding.saved_digest,
+                Some(&ticket.core),
+            )
+        })
+        .await;
+        assert_eq!(result, expected);
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn invalid_binding_never_dispatches_target_observation() {
+    let probe = MockProbe {
+        calls: AtomicUsize::new(0),
+        current: AtomicBool::new(true),
+        result: Ok(()),
+        supersede_during_io: false,
+    };
+    let ticket = ticket();
+    assert_eq!(
+        validate_with_probe(&probe, &ticket, || Err(
+            MainPrerequisiteError::ConfigurationChanged
+        ))
+        .await,
+        Err(MainPrerequisiteError::ConfigurationChanged)
+    );
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+}
+
+struct NoSystemProxy;
+impl super::super::system_takeover::SystemProxyClearer for NoSystemProxy {
+    fn ensure_cleared(&mut self) -> bool {
+        false
+    }
+    fn detect_foreign_proxy(&self) -> Option<String> {
+        None
+    }
+    fn enable_system_proxy(
+        &mut self,
+        _: &polaris_system_integration::proxy_ops::ProxyEnableRequest,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn recover_from_marker(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+struct NoNetwork;
+#[async_trait]
+impl polaris_dns_race::DohPost for NoNetwork {
+    async fn post_dns_message(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>, String> {
+        panic!("prerequisite pure tests cannot use host network")
+    }
+}
+pub(super) fn runtime() -> (Arc<ProxyRuntime>, crate::test_support::TestDir) {
+    let dir = crate::test_support::TestDir::new("polaris-prerequisite-");
+    let runtime = Arc::new(ProxyRuntime::new(
+        Arc::new(crate::runtime::config::ConfigManager::new(
+            dir.to_path_buf(),
+        )),
+        Arc::new(
+            crate::runtime::helper::HelperRuntime::never_installed_for_tests(dir.to_path_buf()),
+        ),
+        Arc::new(crate::runtime::mesh::MeshRuntime::new(dir.to_path_buf())),
+        Box::new(NoSystemProxy),
+        Arc::new(NoNetwork),
+    ));
+    (runtime, dir)
+}
+
+pub(super) fn ready_for(runtime: &ProxyRuntime) -> (Arc<ReadyMainCore>, ActionBinding) {
+    let saved = runtime.config.current().unwrap();
+    let binding = ActionBinding::new(
+        NormalMainAction::ManualNetworkCheck,
+        "network-check".into(),
+        &saved,
+        vec![],
+        None,
+    )
+    .unwrap();
+    let status = ProxyStatus {
+        running: true,
+        clash_api_port: 9876,
+        main_generation: runtime.core_generation(),
+        ..ProxyStatus::default()
+    };
+    let core = Arc::new(ReadyMainCore {
+        generation: runtime.core_generation(),
+        saved_digest: digest(&saved).unwrap(),
+        emission_digest: "observed-final-emission".into(),
+        targets: BTreeMap::new(),
+        status: status.clone(),
+        api_secret: String::new(),
+        probe_ports: vec![],
+        local_http_proxy: None,
+        committed: AtomicBool::new(true),
+    });
+    *runtime.status.write().unwrap() = status;
+    *runtime.ready_main.write().unwrap() = Some(Arc::clone(&core));
+    (core, binding)
+}
+
+#[test]
+fn saved_writer_completed_before_ready_commit_rejects_same_selection() {
+    let (runtime, ticket, _directory) = ProxyRuntime::ready_commit_fixture_for_test();
+    runtime.check_ready_main(&ticket).unwrap();
+    let before = runtime.config.current().unwrap();
+    let selected = before.get("selectedServerId").cloned();
+    let mut changed = before.clone();
+    changed["logLevel"] = serde_json::json!("debug");
+    let writer = Arc::clone(&runtime.config);
+    std::thread::spawn(move || {
+        writer
+            .save_full_deferred_cleanup(&before, &changed)
+            .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        runtime
+            .config
+            .current()
+            .unwrap()
+            .get("selectedServerId")
+            .cloned(),
+        selected
+    );
+    let calls = AtomicUsize::new(0);
+    assert_eq!(
+        runtime.with_ready_main_commit(&ticket, || calls.fetch_add(1, Ordering::SeqCst)),
+        Err(MainPrerequisiteError::ConfigurationChanged)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ready_commit_busy_writer_is_unknown_and_completed_stop_is_superseded() {
+    let (runtime, ticket, _directory) = ProxyRuntime::ready_commit_fixture_for_test();
+    let writer = runtime.config.hold_write_lock_for_test();
+    assert_eq!(
+        runtime.with_ready_main_commit(&ticket, || ()),
+        Err(MainPrerequisiteError::ReadyUnknown)
+    );
+    drop(writer);
+    let stopping = Arc::clone(&runtime);
+    std::thread::spawn(move || {
+        stopping
+            .gate
+            .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
+    })
+    .join()
+    .unwrap();
+    let called = AtomicUsize::new(0);
+    assert_eq!(
+        runtime.with_ready_main_commit(&ticket, || called.fetch_add(1, Ordering::SeqCst)),
+        Err(MainPrerequisiteError::Superseded)
+    );
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ready_commit_serializes_a_later_stop_generation() {
+    use std::sync::mpsc;
+    let (runtime, ticket, _directory) = ProxyRuntime::ready_commit_fixture_for_test();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let stopping = Arc::clone(&runtime);
+    let stop = runtime
+        .with_ready_main_commit(&ticket, || {
+            let stop = std::thread::spawn(move || {
+                attempt_tx.send(()).unwrap();
+                stopping
+                    .gate
+                    .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop);
+                done_tx.send(()).unwrap();
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            stop
+        })
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    stop.join().unwrap();
+    assert_eq!(
+        runtime.with_ready_main_commit(&ticket, || ()),
+        Err(MainPrerequisiteError::Superseded)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_main_waits_for_outer_lifecycle_and_tun_flush_without_restart() {
+    let (runtime, _dir) = runtime();
+    let (core, binding) = ready_for(&runtime);
+    let generation = runtime.core_generation();
+    runtime.gate.begin();
+    let flush = runtime.network_settle.begin("mock-post-start-flush");
+    let waiter_runtime = Arc::clone(&runtime);
+    let waiter = tokio::spawn(async move {
+        waiter_runtime
+            .wait_ready_main_stable(&core, &binding, Duration::from_secs(1))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    runtime
+        .gate
+        .end(polaris_core_supervisor::LifecycleKind::Start);
+    tokio::time::advance(Duration::from_millis(30)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the actual TUN flush must return its guard"
+    );
+    drop(flush);
+    assert_eq!(waiter.await.unwrap(), Ok(()));
+    assert_eq!(runtime.core_generation(), generation);
+    assert!(runtime.core_running());
+}
+
+#[tokio::test(start_paused = true)]
+async fn unresolved_busy_is_unknown_and_successor_cannot_complete_old_ready_wait() {
+    let (runtime, _dir) = runtime();
+    let (core, binding) = ready_for(&runtime);
+    runtime.gate.begin();
+    assert_eq!(
+        runtime
+            .wait_ready_main_stable(&core, &binding, Duration::from_millis(30))
+            .await,
+        Err(MainPrerequisiteError::ReadyUnknown),
+    );
+    assert!(
+        runtime.core_running(),
+        "action timeout does not Stop the normal main"
+    );
+    runtime.gate.bump_generation();
+    assert_eq!(
+        runtime
+            .wait_ready_main_stable(&core, &binding, Duration::from_secs(1))
+            .await,
+        Err(MainPrerequisiteError::Superseded),
+    );
+}
+
+#[test]
+fn completed_generation_cannot_capture_same_config_successor_evidence() {
+    let (runtime, _dir) = runtime();
+    let (old, _) = ready_for(&runtime);
+    runtime
+        .gate
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Start)
+        .unwrap();
+    let (successor, _) = ready_for(&runtime);
+    assert_eq!(old.saved_digest, successor.saved_digest);
+    assert!(matches!(
+        runtime.ready_main_for_generation(old.generation),
+        Err(MainPrerequisiteError::Superseded)
+    ));
+    assert!(Arc::ptr_eq(
+        &runtime
+            .ready_main_for_generation(successor.generation)
+            .unwrap(),
+        &successor
+    ));
+}
+
+#[test]
+fn stop_at_ready_commit_boundary_prevents_commit_and_started_publication() {
+    let (runtime, _dir) = runtime();
+    let (old, _) = ready_for(&runtime);
+    old.committed.store(false, Ordering::SeqCst);
+    let stop_generation = runtime
+        .gate
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
+        .unwrap();
+    let published = AtomicUsize::new(0);
+    assert!(!runtime.publish_committed_ready_main(old.generation, || {
+        published.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    assert!(!old.committed.load(Ordering::SeqCst));
+    assert_eq!(runtime.core_generation(), stop_generation);
+
+    runtime
+        .gate
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Start)
+        .unwrap();
+    let (successor, _) = ready_for(&runtime);
+    successor.committed.store(false, Ordering::SeqCst);
+    assert!(
+        runtime.publish_committed_ready_main(successor.generation, || {
+            // This is the production event callback boundary: ordinary readers may
+            // read the gate/status/evidence because commit holds none of those locks.
+            assert_eq!(runtime.status().main_generation, successor.generation);
+            assert!(runtime.ready_main.try_write().is_ok());
+            published.fetch_add(1, Ordering::SeqCst);
+        })
+    );
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+    assert!(successor.committed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn running_before_transaction_commit_only_joins_its_current_saved_producer() {
+    let (runtime, _dir) = runtime();
+    let state_gate = runtime.mesh.tailscale_state_gate().await;
+    let mut producer = runtime.normal_start_completion(Value::Null).unwrap();
+    while matches!(
+        &*producer.borrow_and_update(),
+        NormalStartCompletion::Pending(_)
+    ) {
+        producer.changed().await.unwrap();
+    }
+    runtime.status.write().unwrap().running = true;
+    let joined = runtime
+        .join_current_normal_start(&Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(producer.same_channel(&joined));
+    assert!(runtime
+        .join_current_normal_start(&serde_json::json!(false))
+        .unwrap()
+        .is_none());
+    assert!(runtime.ready_main.read().unwrap().is_none());
+    drop(state_gate);
+    while !matches!(
+        &*producer.borrow_and_update(),
+        NormalStartCompletion::Finished(Err(_), _)
+    ) {
+        producer.changed().await.unwrap();
+    }
+    assert!(
+        runtime.ready_main.read().unwrap().is_none(),
+        "running alone never produced ready authority"
+    );
+}
+
+#[test]
+fn finished_same_generation_producer_remains_joinable_while_outer_operation_settles() {
+    let (runtime, _dir) = runtime();
+    let (core, _) = ready_for(&runtime);
+    let saved = runtime.config.current().unwrap();
+    let (completion, _) = watch::channel(NormalStartCompletion::Finished(
+        Ok(core.status.clone()),
+        Some(core.generation),
+    ));
+    *runtime.normal_start.lock().unwrap() = Some(NormalStart {
+        digest: digest(&saved).unwrap(),
+        completion,
+        identity: Arc::new(()),
+    });
+    runtime.gate.begin();
+    assert!(runtime.join_current_normal_start(&saved).unwrap().is_some());
+    runtime.gate.bump_generation();
+    assert!(runtime.join_current_normal_start(&saved).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn current_same_config_producer_is_shared_and_waiter_drop_never_stops_it() {
+    let (runtime, _dir) = runtime();
+    let state_gate = runtime.mesh.tailscale_state_gate().await;
+    // Invalid input terminates before any spawn/probe after the gate is released.
+    let mut first = runtime.normal_start_completion(Value::Null).unwrap();
+    while matches!(
+        &*first.borrow_and_update(),
+        NormalStartCompletion::Pending(_)
+    ) {
+        first.changed().await.unwrap();
+    }
+    let generation = runtime.core_generation();
+    let second = runtime.normal_start_completion(Value::Null).unwrap();
+    assert!(first.same_channel(&second));
+    drop(first);
+    drop(second);
+    let mut completion = runtime
+        .normal_start
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .completion
+        .subscribe();
+    drop(state_gate);
+    while !matches!(
+        &*completion.borrow_and_update(),
+        NormalStartCompletion::Finished(Err(_), _)
+    ) {
+        completion.changed().await.unwrap();
+    }
+    assert_eq!(
+        runtime.core_generation(),
+        generation,
+        "dropping all action waiters never invokes Stop"
+    );
+    assert!(!runtime.status().starting);
+}
+
+#[tokio::test]
+async fn different_config_cannot_join_and_old_completion_cannot_follow_successor() {
+    let (runtime, _dir) = runtime();
+    let state_gate = runtime.mesh.tailscale_state_gate().await;
+    let mut first = runtime.normal_start_completion(Value::Null).unwrap();
+    while matches!(
+        &*first.borrow_and_update(),
+        NormalStartCompletion::Pending(_)
+    ) {
+        first.changed().await.unwrap();
+    }
+    let mut second = runtime
+        .normal_start_completion(serde_json::json!(false))
+        .unwrap();
+    assert!(!first.same_channel(&second));
+    while matches!(
+        &*second.borrow_and_update(),
+        NormalStartCompletion::Pending(_)
+    ) {
+        second.changed().await.unwrap();
+    }
+    drop(state_gate);
+    while !matches!(
+        &*first.borrow_and_update(),
+        NormalStartCompletion::Superseded
+    ) {
+        first.changed().await.unwrap();
+    }
+    while !matches!(
+        &*second.borrow_and_update(),
+        NormalStartCompletion::Finished(Err(_), _)
+    ) {
+        second.changed().await.unwrap();
+    }
+    assert!(runtime.ready_main.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn explicit_same_config_replaces_pending_action_producer_before_dispatch() {
+    let (runtime, _dir) = runtime();
+    let state_gate = runtime.mesh.tailscale_state_gate().await;
+    let base = runtime.core_generation();
+    // Neither producer can run yet on the current-thread executor. Explicit Start must
+    // replace even an identical pending action producer; subsequent actions join the new one.
+    let mut action = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut explicit = runtime.explicit_start_completion(Value::Null).unwrap();
+    let joined_action = runtime.normal_start_completion(Value::Null).unwrap();
+    assert!(!action.same_channel(&explicit));
+    assert!(explicit.same_channel(&joined_action));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(
+            &*action.borrow_and_update(),
+            NormalStartCompletion::Superseded
+        ) {
+            action.changed().await.unwrap();
+        }
+        while matches!(
+            &*explicit.borrow_and_update(),
+            NormalStartCompletion::Pending(_)
+        ) {
+            explicit.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the pending producer must yield to explicit Start");
+    assert_eq!(runtime.core_generation(), base + 1);
+    drop(state_gate);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(
+            &*explicit.borrow_and_update(),
+            NormalStartCompletion::Finished(Err(_), _)
+        ) {
+            explicit.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("invalid mock input must complete without starting a core");
+    assert_eq!(runtime.core_generation(), base + 1);
+    assert!(!runtime.status().starting);
+}
+
+#[tokio::test]
+async fn latest_different_config_registered_before_dispatch_wins_once() {
+    let (runtime, _dir) = runtime();
+    let state_gate = runtime.mesh.tailscale_state_gate().await;
+    let base = runtime.core_generation();
+    // Current-thread runtime cannot poll either producer until both requests are registered.
+    let mut first = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut second = runtime
+        .normal_start_completion(serde_json::json!(false))
+        .unwrap();
+    assert!(!first.same_channel(&second));
+    while !matches!(
+        &*first.borrow_and_update(),
+        NormalStartCompletion::Superseded
+    ) {
+        first.changed().await.unwrap();
+    }
+    while matches!(
+        &*second.borrow_and_update(),
+        NormalStartCompletion::Pending(_)
+    ) {
+        second.changed().await.unwrap();
+    }
+    assert_eq!(
+        runtime.core_generation(),
+        base + 1,
+        "superseded queued Start cannot claim a generation"
+    );
+    drop(state_gate);
+    while !matches!(
+        &*second.borrow_and_update(),
+        NormalStartCompletion::Finished(Err(_), _)
+    ) {
+        second.changed().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stop_between_pending_and_dispatch_then_new_start_uses_new_producer() {
+    let (runtime, _dir) = runtime();
+    let state_gate = runtime.mesh.tailscale_state_gate().await;
+    let mut old = runtime.normal_start_completion(Value::Null).unwrap();
+    let stop_generation = runtime
+        .gate
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
+        .unwrap();
+    let mut new = runtime.normal_start_completion(Value::Null).unwrap();
+    assert!(
+        !old.same_channel(&new),
+        "the new explicit action cannot join Stop's obsolete pending producer"
+    );
+    while !matches!(&*old.borrow_and_update(), NormalStartCompletion::Superseded) {
+        old.changed().await.unwrap();
+    }
+    while matches!(&*new.borrow_and_update(), NormalStartCompletion::Pending(_)) {
+        new.changed().await.unwrap();
+    }
+    assert_eq!(runtime.core_generation(), stop_generation + 1);
+    drop(state_gate);
+    while !matches!(
+        &*new.borrow_and_update(),
+        NormalStartCompletion::Finished(Err(_), _)
+    ) {
+        new.changed().await.unwrap();
+    }
+}

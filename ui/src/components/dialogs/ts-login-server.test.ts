@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsLoginMainCoreView, tsLoginFailureKey } from './ts-login-server';
+import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsLoginFailureKey } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -190,24 +190,6 @@ describe('移动登录：保存后的重试与安全授权状态', () => {
     expect(official.server.tailscaleSettings?.controlUrl).toBeUndefined();
     expect(first.server.tailscaleSettings?.controlUrl).toBe('https://control.example.test');
   });
-  const frame = (serverId: string, backendState = 'Running', loggedIn = true, expired = false, authURL?: string) => ({
-    serverId, backendState, loggedIn, expired, authURL, tailscaleIPs: [], peers: [], canShareFiles: false,
-    waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0,
-  });
-  it('陈旧 STATUS、其它节点、启动过渡不能宣称授权；当前 Running 才可确认主核身份', () => {
-    expect(tsLoginMainCoreView('a', { connected: false, statuses: [frame('a')] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('b')] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'NoState', false)] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'Starting')] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a')] }, null).state).toBe('authorized');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'Running', true, true)] }, null).state).toBe('needs-login');
-  });
-  it('主核 NeedsLogin 的 URL 可显示；授权后的新鲜帧压过旧 URL', () => {
-    const url = 'https://login.example.test/authorize';
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'NeedsLogin', false, false, url)] }, null)).toEqual({ state: 'url', authUrl: url });
-    expect(tsLoginMainCoreView('a', null, url)).toEqual({ state: 'url', authUrl: url });
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a')] }, url)).toEqual({ state: 'authorized', authUrl: null });
-  });
   it('只按稳定错误码分类，秘密/URL/path 的原始错误不进入展示键', () => {
     expect(tsLoginFailureKey({ code: 'TAILSCALE_LOGIN_FAILED', message: 'tskey-secret https://private /data/user' })).toBe('ts.loginStartFailed');
     expect(tsLoginFailureKey({ code: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', message: 'private' })).toBe('errors.androidNativeCapacityClosed');
@@ -223,4 +205,5 @@ it.each(['android', 'windows', 'macos', undefined])('keeps account actions on %s
 });
 it('guards standalone iOS account actions', () => {
   expect(supportsTsAccountActions('ios')).toBe(false);
+  expect(supportsTsLoginActions()).toBe(true);
 });

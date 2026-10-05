@@ -15,10 +15,16 @@ describe('iOS active system session guidance', () => {
     expect(writeErrorsFromProxyStatus(errors, { running: false, errorCode: ProxyErrorCode.IOS_SESSION_ACTIVE }, t)).toBe(errors);
     expect(writeErrorsFromProxyStatus({}, { running: true, errorCode: ProxyErrorCode.IOS_SESSION_ACTIVE }, t)).toEqual({});
   });
-  it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('supplies %s guidance and honest configuration-only save text', (locale) => {
+  it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('supplies %s system session, normal first-login and identity-retirement guidance', (locale) => {
     const text = JSON.parse(readFileSync(new URL(`../i18n/locales/${locale}.json`, import.meta.url), 'utf8'));
     expect(text.errors.iosSessionActive).toBeTruthy();
     expect(text.ts.iosAccountActionsUnavailable).toBeTruthy();
-    expect(text.ts.iosConfigurationSaved).toBeTruthy();
+    expect(text.ts.identityRetirementRequired).toBeTruthy();
+    expect(text.prerequisite.preparingConnection).toBeTruthy();
+    expect(text.prerequisite.waitingForReady).toBeTruthy();
+    expect(text.prerequisite.permissionDenied).toBeTruthy();
+    expect(text.prerequisite.foregroundRequired).toBeTruthy();
+    expect(text.prerequisite.cancelFailed).toBeTruthy();
+    expect(text.ts.iosConfigurationSaved).toBeUndefined();
   });
 });

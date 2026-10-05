@@ -78,7 +78,7 @@ import { handleProxyErrorEvent } from '@/domain/proxy-error-routing';
 import { isDefinitiveTsLoginFrame } from '@/domain/tailscale-conn-state';
 import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
 import {
-  authorizeFromMainFrame, claimLoginUrl, loginAttemptActive, mainAuthUrlOwner, openLoginUrl,
+  claimLoginUrl, loginAttemptActive, mainAuthUrlOwner, openLoginUrl,
 } from '@/domain/tailscale-login-progress';
 import { toast } from '@/lib/error-handler';
 import { notifyDesktop, setDesktopNotificationsEnabled } from '@/lib/desktop-notify';
@@ -337,34 +337,19 @@ export function startMobileAppWiring(t: WiringT): () => void {
   offs.push(
     api.proxy.onTailscaleStatus((data) => {
       store().setTailscaleStatus(data);
-      const progress = useTailscaleLoginProgressStore.getState();
-      const authorized = authorizeFromMainFrame(progress.attempts[data.serverId], data);
-      if (authorized) {
-        progress.apply(authorized);
-        store().setTailscaleAuthUrl(data.serverId, null);
-        store().setTailscaleLoginInitiated(data.serverId, false);
-      }
-      const active = progress.attempts[data.serverId];
-      const owner = mainAuthUrlOwner(active);
-      if (!authorized && active?.phase === 'mainCore' && owner && validatedTailscaleAuthUrl(data.authURL)) {
-        progress.apply({ ...active, url: data.authURL! });
-        store().setTailscaleAuthUrl(data.serverId, data.authURL!);
-        openAuthUrl(data.serverId, owner, data.authURL!);
-      }
       if (!isDefinitiveTsLoginFrame(data)) return;
       store().setTailscaleLoginState(data.serverId, data.loggedIn);
     }),
   );
 
-  /* 主核 AUTH 帧不带 transient attemptId；只允许当前 mainCore attempt 或无 attempt 的
-     旧主核流。已取消/已失败 attempt 的迟到 URL 不得写 store 或重新打开浏览器。 */
+  /* 主核 AUTH 帧不带 attemptId，仅供没有请求记录的旧主核流。
+     当前或终态请求都只能消费带绑定的 producer progress。 */
   offs.push(
     api.proxy.onTailscaleAuth((data) => {
       if (data.transient || !validatedTailscaleAuthUrl(data.url)) return;
       const current = data.serverId ? useTailscaleLoginProgressStore.getState().attempts[data.serverId] : undefined;
       const owner = mainAuthUrlOwner(current);
       if (!owner) return;
-      if (current) useTailscaleLoginProgressStore.getState().apply({ ...current, url: data.url });
       if (data.serverId) store().setTailscaleAuthUrl(data.serverId, data.url);
       openAuthUrl(data.serverId || UNOWNED_TAILSCALE_AUTH_KEY, owner, data.url);
     }),

@@ -90,15 +90,48 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const [hasState, setHasState] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [dirty, setDirty] = useState(false);
-  const [pendingServerId, setPendingServerId] = useState<string | null>(null);
+  const [pendingRequest, setPendingRequest] = useState<{ serverId: string; attemptId: string } | null>(null);
   const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
-    pendingServerId ? s.attempts[pendingServerId] : undefined,
-    activeRequest.current,
+    pendingRequest ? s.attempts[pendingRequest.serverId] : undefined,
+    pendingRequest,
   ));
-  const cachedAuthUrl = useAppStore((s) => pendingServerId ? s.tailscaleAuthUrls[pendingServerId] : undefined);
-  const authUrl = validatedTailscaleAuthUrl( progress?.phase === 'awaitingAuth' ? progress.url :
-    progress?.phase === 'mainCore' && !progress.reason ? cachedAuthUrl : null);
+  const authUrl = validatedTailscaleAuthUrl(progress?.phase === 'awaitingAuth' || progress?.phase === 'mainCore'
+    ? progress.url : null);
   const loginTimedOut = progress?.phase === 'timedOut' || progress?.phase === 'failed';
+
+  useEffect(() => {
+    if (progress && !loginAttemptActive(progress.phase)) setSubmitting(false);
+  }, [progress?.phase]);
+
+  useEffect(() => {
+    const request = pendingRequest;
+    if (!request) return;
+    let disposed = false;
+    let revision = 0;
+    const reconcile = async () => {
+      const observed = ++revision;
+      try {
+        const receipt = await api.server.tailscaleLoginProgress(request.serverId, request.attemptId);
+        if (disposed || observed !== revision || activeRequest.current?.attemptId !== request.attemptId
+          || !receipt || (receipt.url && !validatedTailscaleAuthUrl(receipt.url))) return;
+        if (!useTailscaleLoginProgressStore.getState().apply(receipt)) return;
+        const store = useAppStore.getState();
+        store.setTailscaleLoginInitiated(receipt.serverId, loginAttemptActive(receipt.phase));
+        store.setTailscaleAuthUrl(receipt.serverId, loginAttemptActive(receipt.phase) ? receipt.url ?? null : null);
+        if (receipt.phase === 'authorized') store.setTailscaleLoginState(receipt.serverId, true);
+      } catch {
+        if (!disposed && observed === revision) toast.error(t('ts.loginProgressReadFailed'));
+      }
+    };
+    const onVisible = () => { if (!document.hidden) void reconcile(); };
+    window.addEventListener('focus', reconcile);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      disposed = true;
+      window.removeEventListener('focus', reconcile);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [pendingRequest?.serverId, pendingRequest?.attemptId, t]);
 
   const discardPendingLogin = () => {
     const request = activeRequest.current;
@@ -112,7 +145,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
         void api.server.tailscaleLoginCancel(request.serverId, request.attemptId).catch(() => {});
       }
     }
-    setPendingServerId(null);
+    setPendingRequest(null);
   };
 
   useEffect(() => () => {
@@ -182,11 +215,15 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
     const request = { serverId: server.id, attemptId: crypto.randomUUID() };
     activeRequest.current = request;
     useTailscaleLoginProgressStore.getState().begin(server.id, request.attemptId);
-    setPendingServerId(server.id);
+    setPendingRequest(request);
     setTailscaleAuthUrl(server.id, null);
     setTailscaleLoginInitiated(server.id, true);
     setSubmitting(true);
-    const stillActive = () => activeRequest.current?.attemptId === request.attemptId;
+    const stillActive = () => {
+      const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
+      return activeRequest.current?.attemptId === request.attemptId && current?.attemptId === request.attemptId
+        && !['failed', 'timedOut', 'cancelled'].includes(current.phase);
+    };
     const outcome = await executeTsLogin({
       isActive: stillActive,
       prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId),
@@ -211,7 +248,11 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
         if (mirrored?.name !== server.name) throw new Error('TS_NAME_REFRESH_FAILED');
       },
       start: () => api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode }),
-      cancel: () => api.server.tailscaleLoginCancel(server.id, request.attemptId),
+      cancel: async () => {
+        const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
+        if (current?.attemptId === request.attemptId && current.phase === 'authorized') return;
+        await api.server.tailscaleLoginCancel(server.id, request.attemptId);
+      },
     });
     if (stillActive()) {
       if (outcome.phase === 'failed') {
@@ -307,6 +348,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
       </div>
 
       {saved && <div className="card-sub" role="status">{t('ts.nodeSaved')}</div>}
+      {(progress?.phase === 'preparingConnection' || progress?.phase === 'waitingForReady') && <div className="card-sub" role="status">{t(progress.phase === 'preparingConnection' ? 'prerequisite.preparingConnection' : 'prerequisite.waitingForReady')}</div>}
       {progress?.phase === 'authorized' && <div className="card-sub" role="status">{t('ts.authorizationComplete')}</div>}
       {progress?.phase === 'mainCore' && <div className="card-sub" role="status">{t(progress.reason === 'configurationPending' ? 'ts.loginInMainCoreNeedsRestart' : 'ts.mainCoreAwaitingAuthorization')}</div>}
       {mode === 'authkey' && progress && loginAttemptActive(progress.phase) && <div className="card-sub" role="status">{t('ts.authorizing')}</div>}

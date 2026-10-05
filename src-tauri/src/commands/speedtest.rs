@@ -60,6 +60,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 测速计时用 [`tokio::time::Instant`] 而非 `std::time::Instant`。
@@ -85,7 +86,10 @@ use polaris_net_stack::subscription::server_fingerprint;
 
 use crate::events::channel::{EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT};
 use crate::response::ApiResponse;
-use crate::runtime::proxy::{LocalHttpProxy, ProxyRuntime, SpeedProbeTargets};
+use crate::runtime::proxy::{
+    ActionBinding, ActionRequirement, LocalHttpProxy, NormalMainAction, ProxyRuntime,
+    ReadyMainTicket, SpeedProbeTargets,
+};
 use crate::runtime::speedtest::{
     emit_speed_test_done, is_temp_core_superseded, plan_temp_core_with_bindings, InterruptReason,
     TempCoreDeps, TempCoreOutcome, TempCoreSession,
@@ -184,30 +188,6 @@ const CODE_IN_FLIGHT: &str = "SPEEDTEST_IN_FLIGHT";
 /// 走主核测速池，路径都不同）。渲染端对未知 code 走 `default` 直显本层文案，故新码零 UI 改动即可用。
 const CODE_CORE_STARTING: &str = "SPEEDTEST_CORE_STARTING";
 
-/// iOS can measure through the connected packet tunnel, but cannot spawn a separate test core.
-const CODE_REQUIRES_CONNECTION_ON_IOS: &str = "SPEEDTEST_REQUIRES_CONNECTION_ON_IOS";
-
-fn ios_speed_test_unavailable(
-    is_ios: bool,
-    running: bool,
-    starting: bool,
-) -> Option<ApiResponse<Value>> {
-    if !is_ios || running {
-        return None;
-    }
-    Some(if starting {
-        ApiResponse::err_with_code(
-            "代理内核正在启动，请等待连接完成后再测速",
-            CODE_CORE_STARTING,
-        )
-    } else {
-        ApiResponse::err_with_code(
-            "iOS 测速需要已连接的 Polaris VPN；请先连接后再测速",
-            CODE_REQUIRES_CONNECTION_ON_IOS,
-        )
-    })
-}
-
 /// 测速进程级单飞闸（审查 MED「前后端均无 busy/single-flight」的后端半）。
 ///
 /// 托盘浮层与主窗（首页 / 节点页）是**独立 JS 堆**，各自的「测速中」灰态只锁本窗按钮，拦不住跨窗口
@@ -252,6 +232,44 @@ fn speed_test_run_payload(mut payload: Value, run_id: &str) -> Value {
         object.insert("runId".to_string(), Value::String(run_id.to_string()));
     }
     payload
+}
+
+fn speed_test_measurement_payload(payload: Value, run_id: &str, context: Option<&Value>) -> Value {
+    let mut payload = speed_test_run_payload(payload, run_id);
+    if let (Some(object), Some(context)) = (payload.as_object_mut(), context) {
+        object.insert("measurementContext".into(), context.clone());
+    }
+    payload
+}
+
+fn measurement_context(ticket: &ReadyMainTicket, run_id: &str) -> Value {
+    json!({"runId":run_id, "requestId":ticket.request_id(),
+        "mainGeneration":ticket.generation(), "startTime":ticket.start_time()})
+}
+
+/// Validate each real selector/measurement before dispatch and after completion. A lost
+/// binding is an interruption, never a measured timeout that could be reported as -1.
+async fn bound_speed_io<Check, CheckFuture, Io, IoFuture, T>(
+    check: Check,
+    invalid: &AtomicBool,
+    io: Io,
+) -> Option<T>
+where
+    Check: Fn() -> CheckFuture,
+    CheckFuture: Future<Output = bool>,
+    Io: FnOnce() -> IoFuture,
+    IoFuture: Future<Output = T>,
+{
+    if !check().await {
+        invalid.store(true, Ordering::SeqCst);
+        return None;
+    }
+    let result = io().await;
+    if !check().await {
+        invalid.store(true, Ordering::SeqCst);
+        return None;
+    }
+    Some(result)
 }
 
 /// 本波测速裁定（纯逻辑：请求集 × 当前活跃出口 × 本层可测范围 → 测谁 / 谁缺席 / 还是零可测）。
@@ -1017,16 +1035,84 @@ pub async fn server_speed_test(
     state: State<'_, AppRuntime>,
     server_ids: Option<Vec<String>>,
 ) -> Result<ApiResponse<Value>, ()> {
-    let status = state.proxy().status();
-    // A configured executable path does not grant iOS an independent core owner.
-    // Reject before taking the test slot, reading config, or resolving a binary.
-    if let Some(response) =
-        ios_speed_test_unavailable(cfg!(target_os = "ios"), status.running, status.starting)
+    // The real request and single-flight slot exist before any system authorization wait.
+    let Some(_guard) = SpeedTestGuard::acquire() else {
+        return Ok(ApiResponse::err_with_code(
+            "已有测速进行中，请等待当前测速完成",
+            CODE_IN_FLIGHT,
+        ));
+    };
+    let Some(run_id) = next_speed_test_run_id(&SPEED_TEST_RUN_SEQUENCE) else {
+        return Ok(ApiResponse::err("测速运行序列已耗尽，请重启应用"));
+    };
+    let proxy = state.proxy.clone();
+    let saved = match state.config().current() {
+        Ok(saved) => saved,
+        Err(error) => return Ok(ApiResponse::err(error.to_string())),
+    };
+    let ticket = if NormalMainAction::ManualSpeedTest
+        .requirement(polaris_helper_proto::Platform::current())
+        == ActionRequirement::NormalMainRequired
     {
-        return Ok(response);
+        let requested = server_ids.clone().unwrap_or_else(|| all_server_ids(&saved));
+        if requested.is_empty() {
+            return Ok(ApiResponse::err("没有可测速的节点"));
+        }
+        let targets = requested
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let binding = match ActionBinding::new(
+            NormalMainAction::ManualSpeedTest,
+            run_id.clone(),
+            &saved,
+            targets,
+            None,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => return Ok(ApiResponse::err_with_code(error.to_string(), error.code())),
+        };
+        let _ = app.emit(
+            EVENT_SPEED_TEST_PROGRESS,
+            json!({"runId":run_id,"phase":"preparingConnection"}),
+        );
+        let _ = app.emit(
+            EVENT_SPEED_TEST_PROGRESS,
+            json!({"runId":run_id,"phase":"waitingForReady"}),
+        );
+        match proxy.await_normal_main(binding).await {
+            Ok(ticket) => Some(ticket),
+            Err(error) => return Ok(ApiResponse::err_with_code(error.to_string(), error.code())),
+        }
+    } else {
+        None
+    };
+    // Read every runtime resource again after the exact committed ready receipt.
+    let config = match state.config().current() {
+        Ok(saved) => saved,
+        Err(error) => return Ok(ApiResponse::err(error.to_string())),
+    };
+    if let Some(ticket) = ticket.as_ref() {
+        if let Err(error) = proxy.validate_ready_main(ticket).await {
+            return Ok(ApiResponse::err_with_code(error.to_string(), error.code()));
+        }
+    }
+    let status = proxy.status();
+    let context = ticket
+        .as_ref()
+        .map(|ticket| measurement_context(ticket, &run_id));
+    if let Some(context) = context.as_ref() {
+        let _ = app.emit(
+            EVENT_SPEED_TEST_PROGRESS,
+            json!({"runId":run_id,"phase":"measuring","measurementContext":context}),
+        );
     }
     // 本机 http 代理入站（桌面 `mixed-in` / Android `probe-proxy-in`）的取址：本函数的回退腿用它测活跃出口。
-    let local_proxy = state.proxy().local_http_proxy();
+    let local_proxy = match ticket.as_ref() {
+        Some(ticket) => ticket.local_http_proxy(),
+        None => proxy.local_http_proxy(),
+    };
     // 核在跑却没有可用的本机 http 代理入站（分配失败的半态）→ 本层确实无从测：临时核腿在此形态下会被
     // 让位判据（`running == true`）当场掐掉，硬走只会空转一轮。如实 clean error，绝不回假延迟。
     // **文案不得说「核未运行」**：核正跑着，缺的是本地代理端口。说反了会把用户支去点「连接」（他已经连着），
@@ -1054,28 +1140,14 @@ pub async fn server_speed_test(
         ));
     }
 
-    // 单飞闸：并发测速（跨窗口连点）只放行一条，其余立即返 CODE_IN_FLIGHT（不 emit 事件，前端 catch
-    // 复位自身灰态）。`_guard` 持有至函数返回（含下面的 await 测量）→ 释放后方可再测。
-    // **必须在临时核腿之前抢**：临时核会起真进程 + 占 N 个回环端口，两条并发跑等于同时起两个临时核。
-    let Some(_guard) = SpeedTestGuard::acquire() else {
-        return Ok(ApiResponse::err_with_code(
-            "已有测速进行中，请等待当前测速完成",
-            CODE_IN_FLIGHT,
-        ));
-    };
-
-    let Some(run_id) = next_speed_test_run_id(&SPEED_TEST_RUN_SEQUENCE) else {
-        return Ok(ApiResponse::err("测速运行序列已耗尽，请重启应用"));
-    };
-
-    // 当前活跃节点 + 测速 URL（同步读；取值后不再借 state，避免跨 await 持有）。
-    let config = state.config().current().unwrap_or_default();
-
     // ── 临时核腿（主核**未运行**）：起一个瞬态 sing-box 逐节点量 warm-TTFB，测完即杀 ──
     // 「先测速比较延迟、再选最快的连上去」是常规使用序；没有这条腿，用户必须先盲选一个节点连上才能测别的。
     // 隔离/让位/收尾语义全在 `runtime::speedtest` 的模块文档（独立配置文件 + 独立端口 + 不写主核生命周期槽；
     // 主核一起来立刻让路）。
     if !status.running {
+        if ticket.is_some() || cfg!(target_os = "ios") {
+            return Ok(ApiResponse::err_with_code("superseded", "superseded"));
+        }
         return Ok(run_temp_core_speed_test(&app, &state, &config, server_ids, &run_id).await);
     }
     let active = config
@@ -1087,8 +1159,6 @@ pub async fn server_speed_test(
     let all = all_server_ids(&config);
     let tailscale_ids = tailscale_server_ids(&config);
     let current_fingerprints = current_server_fingerprints(&config);
-    // owned Arc：跨 await（分波热切/测量）持有，不借 State。
-    let proxy = state.proxy.clone();
 
     // §15 主核探测池分波测速（池就绪 → 「批量比较多节点延迟选优」核心路径）：把请求的 N 个节点按 K 分波，
     // 逐波经 gRPC select_outbound 热切各槽到本波节点、经 probe-in-k 端口量 warm-TTFB。详见模块文档路径①。
@@ -1119,7 +1189,15 @@ pub async fn server_speed_test(
             ts_reasons: &ts_reasons,
         };
         return Ok(run_pool_speed_test(
-            &app, &proxy, &targets, &requested, &url, &prefilter, &run_id,
+            &app,
+            &proxy,
+            &targets,
+            &requested,
+            &url,
+            &prefilter,
+            &run_id,
+            ticket.as_ref(),
+            context.as_ref(),
         )
         .await);
     }
@@ -1161,7 +1239,14 @@ pub async fn server_speed_test(
     // §15.11 让位（超代）基准：**回退腿同样须守**（此前本腿零 `superseded()` 覆盖，见
     // [`drive_fallback_measure`] 文档）。`gen0` 必须在 await **之前**捕获，判据与池路径共用 [`is_superseded`]。
     let gen0 = proxy.core_generation();
-    let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running);
+    let invalid = AtomicBool::new(false);
+    let superseded = || {
+        invalid.load(Ordering::SeqCst)
+            || is_superseded(proxy.core_generation(), gen0, proxy.status().running)
+            || ticket
+                .as_ref()
+                .is_some_and(|ticket| proxy.check_ready_main(ticket).is_err())
+    };
 
     // 入口已判过 `running && local_proxy.is_none()` ⇒ 走到这里（running 为真）必有值；
     // 仍按 `Option` 取而不 `expect`：判据写在别处，这里不押注它。
@@ -1173,15 +1258,32 @@ pub async fn server_speed_test(
     let (results, outcome) = drive_fallback_measure(
         &active,
         &superseded,
-        || measure_via_local_proxy(local_proxy.port, local_proxy.auth.as_ref(), &url),
+        || async {
+            bound_speed_io(
+                || async {
+                    match ticket.as_ref() {
+                        Some(ticket) => proxy.validate_ready_main(ticket).await.is_ok(),
+                        None => true,
+                    }
+                },
+                &invalid,
+                || measure_via_local_proxy(local_proxy.port, local_proxy.auth.as_ref(), &url),
+            )
+            .await
+            .flatten()
+        },
         &mut |event, payload| {
-            let _ = app.emit(event, speed_test_run_payload(payload, &run_id));
+            let _ = app.emit(
+                event,
+                speed_test_measurement_payload(payload, &run_id, context.as_ref()),
+            );
         },
     )
     .await;
 
     Ok(ApiResponse::ok(json!({
         "runId": run_id,
+        "measurementContext": context,
         "results": results,
         // completed：本次入参已全部裁定（测的测了、缺席的进 notInPool）；interrupted：被核跃迁/崩溃打断，
         // 该节点**缺席**（前端据此保留旧值，见 contracts/speed-test.ts SpeedTestOutcome）。
@@ -1284,14 +1386,17 @@ where
 ///
 /// **禁本机碰宿主网络**：真延迟走真核真出站 = 真机门；本函数的分波/分区/热切编排纯逻辑已由
 /// [`plan_waves`]/[`partition_pool`] 单测，真数值只在真机验。
+#[allow(clippy::too_many_arguments)]
 async fn run_pool_speed_test(
     app: &AppHandle,
-    proxy: &ProxyRuntime,
+    proxy: &Arc<ProxyRuntime>,
     targets: &SpeedProbeTargets,
     requested: &[String],
     url: &str,
     prefilter: &PoolPrefilter<'_>,
     run_id: &str,
+    ticket: Option<&ReadyMainTicket>,
+    context: Option<&Value>,
 ) -> ApiResponse<Value> {
     let k = targets.pool_ports.len();
     let PoolPartition {
@@ -1324,21 +1429,66 @@ async fn run_pool_speed_test(
 
     // §15.11 让位（超代）基准：本轮归属的核世代。三检查点均以它比对（见 [`drive_pool_waves`]）。
     let gen0 = proxy.core_generation();
-    let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running);
+    let invalid = Arc::new(AtomicBool::new(false));
+    let superseded = || {
+        invalid.load(Ordering::SeqCst)
+            || is_superseded(proxy.core_generation(), gen0, proxy.status().running)
+            || ticket.is_some_and(|ticket| proxy.check_ready_main(ticket).is_err())
+    };
 
     let (results, outcome) = drive_pool_waves(
         &waves,
         total,
         &superseded,
-        |slot, tag: String| async move { proxy.probe_select_slot(slot, &tag).await },
+        |slot, tag: String| {
+            let invalid = Arc::clone(&invalid);
+            async move {
+                bound_speed_io(
+                    || async {
+                        match ticket {
+                            Some(ticket) => proxy.validate_ready_main(ticket).await.is_ok(),
+                            None => true,
+                        }
+                    },
+                    &invalid,
+                    || async {
+                        match ticket {
+                            Some(ticket) => proxy.probe_select_slot_bound(ticket, slot, &tag).await,
+                            None => proxy.probe_select_slot(slot, &tag).await,
+                        }
+                    },
+                )
+                .await
+                .unwrap_or(false)
+            }
+        },
         |port| {
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
-            async move { measure_via_local_proxy(port, auth.as_ref(), &url).await }
+            let runtime = Arc::clone(proxy);
+            let ticket = ticket.cloned();
+            let invalid = Arc::clone(&invalid);
+            async move {
+                bound_speed_io(
+                    || async {
+                        match ticket.as_ref() {
+                            Some(ticket) => runtime.validate_ready_main(ticket).await.is_ok(),
+                            None => true,
+                        }
+                    },
+                    &invalid,
+                    || measure_via_local_proxy(port, auth.as_ref(), &url),
+                )
+                .await
+                .flatten()
+            }
         },
         &mut |event, payload| {
-            let _ = app.emit(event, speed_test_run_payload(payload, run_id));
+            let _ = app.emit(
+                event,
+                speed_test_measurement_payload(payload, run_id, context),
+            );
         },
         targets.pool_ports.as_slice(),
     )
@@ -1346,6 +1496,7 @@ async fn run_pool_speed_test(
 
     ApiResponse::ok(json!({
         "runId": run_id,
+        "measurementContext": context,
         "results": results,
         // completed：本次入参已全部裁定（在池的测了、notInPool 如实缺席）；interrupted：被核跃迁/崩溃打断，
         // 未测节点**缺席**（前端据此保留旧值，见 contracts/speed-test.ts SpeedTestOutcome）。

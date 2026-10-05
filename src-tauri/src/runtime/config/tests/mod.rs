@@ -6,6 +6,58 @@ fn temp_dir(tag: &str) -> TestDir {
 }
 
 #[test]
+fn saved_commit_is_warm_only_and_never_waits_for_a_config_writer() {
+    let directory = temp_dir("saved-commit");
+    let config = ConfigManager::new(directory.clone());
+    let called = std::sync::atomic::AtomicBool::new(false);
+    assert!(config
+        .try_with_saved_commit(|_| called.store(true, std::sync::atomic::Ordering::SeqCst))
+        .is_err());
+    assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        !directory.join("config.json").exists(),
+        "cold commit cannot load/migrate/write disk"
+    );
+    config.current().unwrap();
+    let writer = config.hold_write_lock_for_test();
+    assert!(config.try_with_saved_commit(|_| ()).is_err());
+    drop(writer);
+    assert!(config.try_with_saved_commit(|_| ()).is_ok());
+}
+
+#[test]
+fn saved_commit_excludes_the_actual_deferred_config_writer() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    let directory = temp_dir("saved-commit-writer");
+    let config = Arc::new(ConfigManager::new(directory.clone()));
+    let saved = config.current().unwrap();
+    let mut next = saved.clone();
+    next["logLevel"] = serde_json::json!("debug");
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let writer_config = Arc::clone(&config);
+    let writer = config
+        .try_with_saved_commit(|current| {
+            assert_eq!(current, &saved);
+            let writer = std::thread::spawn(move || {
+                attempt_tx.send(()).unwrap();
+                writer_config
+                    .save_full_deferred_cleanup(&saved, &next)
+                    .unwrap();
+                done_tx.send(()).unwrap();
+            });
+            attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            writer
+        })
+        .unwrap();
+    done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    writer.join().unwrap();
+    assert_eq!(config.current().unwrap()["logLevel"], "debug");
+}
+
+#[test]
 fn legacy_start_admission_reads_raw_disk_and_rejects_uncertain_mode() {
     let dir = temp_dir("legacy-start-admission");
     let manager = ConfigManager::new(dir.clone());

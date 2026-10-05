@@ -214,7 +214,7 @@ struct FakeEmitter {
 }
 
 #[test]
-fn progress_receipt_never_returns_an_auth_url_or_native_diagnostic() {
+fn terminal_progress_receipt_never_returns_an_auth_url_or_native_diagnostic() {
     let attempts = Attempts::default();
     let attempt = attempts.prepare("ts1", "request-a").unwrap();
     let emitter = AttemptReceiptEmitter {
@@ -234,6 +234,115 @@ fn progress_receipt_never_returns_an_auth_url_or_native_diagnostic() {
     let serialized = serde_json::to_string(&receipt).unwrap();
     assert!(!serialized.contains("https://"));
     assert!(!serialized.contains("token"));
+}
+
+#[test]
+fn active_progress_receipt_retains_only_validated_url_and_emits_terminal_once() {
+    let attempts = Attempts::default();
+    let attempt = attempts.prepare("ts1", "bound-progress").unwrap();
+    attempt.bind_main(27, Some("identity-token".into()));
+    let captured = Arc::new(FakeEmitter::default());
+    let emitter = AttemptReceiptEmitter {
+        inner: captured.clone(),
+        attempt: attempt.clone(),
+        attempt_id: "bound-progress".into(),
+    };
+    emitter.progress(
+        "ts1",
+        "bound-progress",
+        "mainCore",
+        None,
+        Some("https://headscale.example/auth"),
+    );
+    let receipt = attempts.progress("ts1", "bound-progress").unwrap();
+    assert_eq!(
+        receipt.url.as_deref(),
+        Some("https://headscale.example/auth")
+    );
+    assert_eq!(receipt.main_generation, Some(27));
+    assert_eq!(receipt.identity_epoch.as_deref(), Some("identity-token"));
+    emitter.progress(
+        "ts1",
+        "bound-progress",
+        "mainCore",
+        None,
+        Some("https://headscale.example/auth"),
+    );
+    assert_eq!(captured.progress.lock().unwrap().len(), 1);
+    emitter.progress("ts1", "bound-progress", "authorized", None, None);
+    emitter.progress(
+        "ts1",
+        "bound-progress",
+        "failed",
+        Some("mainCoreChanged"),
+        None,
+    );
+    assert_eq!(captured.progress.lock().unwrap().len(), 2);
+    assert_eq!(
+        attempts.progress("ts1", "bound-progress").unwrap().phase,
+        "authorized"
+    );
+    assert!(attempts
+        .progress("ts1", "bound-progress")
+        .unwrap()
+        .url
+        .is_none());
+
+    let cancelled = attempts.prepare("ts1", "cancelled-progress").unwrap();
+    let emitter = AttemptReceiptEmitter {
+        inner: captured.clone(),
+        attempt: cancelled.clone(),
+        attempt_id: "cancelled-progress".into(),
+    };
+    cancelled.cancel();
+    emitter.progress("ts1", "cancelled-progress", "authorized", None, None);
+    assert!(attempts.progress("ts1", "cancelled-progress").is_none());
+    emitter.progress(
+        "ts1",
+        "cancelled-progress",
+        "cancelled",
+        None,
+        Some("https://headscale.example/auth"),
+    );
+    assert!(attempts
+        .progress("ts1", "cancelled-progress")
+        .unwrap()
+        .url
+        .is_none());
+}
+
+#[test]
+fn dropped_attempt_preserves_terminal_and_transient_process_custody() {
+    let attempts = Attempts::default();
+    for (id, phase, process_owned) in [
+        ("already-authorized", "authorized", false),
+        ("already-failed", "failed", false),
+        ("owned-transient", "awaitingAuth", true),
+    ] {
+        let attempt = attempts.prepare("ts1", id).unwrap();
+        attempt.process_owned.store(process_owned, Ordering::SeqCst);
+        let emitter = AttemptReceiptEmitter {
+            inner: Arc::new(FakeEmitter::default()),
+            attempt: attempt.clone(),
+            attempt_id: id.into(),
+        };
+        emitter.progress(
+            "ts1",
+            id,
+            phase,
+            None,
+            Some("https://headscale.example/auth"),
+        );
+        drop(AttemptGuard(attempt.clone(), false));
+        assert_eq!(attempt.process_owned.load(Ordering::SeqCst), process_owned);
+        assert_eq!(attempt.is_finished(), !process_owned);
+        let receipt = attempts.progress("ts1", id).unwrap();
+        assert_eq!(
+            receipt.phase,
+            if process_owned { "cancelled" } else { phase }
+        );
+        assert!(receipt.url.is_none());
+    }
 }
 impl AuthUrlEmitter for FakeEmitter {
     fn progress(

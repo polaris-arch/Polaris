@@ -1594,7 +1594,7 @@ async fn steady_main_running_is_confirmed_by_fresh_initial_frame_without_global_
 }
 
 #[tokio::test]
-async fn fresh_main_query_exposes_headscale_url_and_drops_its_stream() {
+async fn fresh_main_observer_recovers_headscale_url_and_waits_until_authorized() {
     let (reg, sub, ud) = owned_main_registry(Duration::from_secs(60)).await;
     reg.prepare("ts1", "main-url").await.unwrap();
     let emitter = Arc::new(FakeEmitter::default());
@@ -1618,7 +1618,27 @@ async fn fresh_main_query_exposes_headscale_url_and_drops_its_stream() {
             "https://headscale.example/custom-register",
         ),
     );
-    assert!(matches!(task.await.unwrap(), StartLoginOutcome::InMainCore));
+    wait_until(|| {
+        reg.login_progress("ts1", "main-url")
+            .is_some_and(|receipt| receipt.url.is_some())
+    })
+    .await;
+    assert!(
+        !task.is_finished(),
+        "fresh NeedsLogin must keep the observer alive"
+    );
+    assert!(!sub.senders.lock().unwrap()[0].is_closed());
+    let receipt = reg.login_progress("ts1", "main-url").unwrap();
+    assert_eq!(
+        receipt.url.as_deref(),
+        Some("https://headscale.example/custom-register")
+    );
+    assert_eq!(receipt.main_generation, Some(10));
+    // Normal Stop can acquire this gate while the browser owns the foreground.
+    let gate = tokio::time::timeout(Duration::from_millis(100), reg.state_gate())
+        .await
+        .unwrap();
+    drop(gate);
     assert!(emitter
         .progress
         .lock()
@@ -1627,7 +1647,76 @@ async fn fresh_main_query_exposes_headscale_url_and_drops_its_stream() {
         .any(|p| p.2 == "mainCore"
             && p.3.is_none()
             && p.4.as_deref() == Some("https://headscale.example/custom-register")));
+    sub.push(0, frame("actual-generated-tag", "Running", ""));
+    assert!(matches!(task.await.unwrap(), StartLoginOutcome::InMainCore));
+    let receipt = reg.login_progress("ts1", "main-url").unwrap();
+    assert_eq!(receipt.phase, "authorized");
+    assert!(receipt.url.is_none());
+    assert!(reg.main_owns("ts1", true));
+    assert_eq!(
+        emitter
+            .progress
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.2 == "authorized")
+            .count(),
+        1
+    );
     assert!(sub.senders.lock().unwrap()[0].is_closed());
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn dropping_main_login_future_retires_active_url_and_preserves_exact_context() {
+    let (reg, sub, ud) = owned_main_registry(Duration::from_secs(60)).await;
+    reg.prepare("ts1", "dropped-main-url").await.unwrap();
+    let attempt = reg.attempts.get("ts1", "dropped-main-url").unwrap();
+    attempt.bind_main(10, Some("identity-drop-token".into()));
+    let (reg2, ud2) = (reg.clone(), ud.clone());
+    let task = tokio::spawn(async move {
+        reg2.start_attempt(
+            &ts_server("ts1", "myts"),
+            &ud2,
+            request("dropped-main-url"),
+            &|| main_snapshot(10),
+            Arc::new(FakeEmitter::default()),
+        )
+        .await
+    });
+    wait_until(|| !sub.senders.lock().unwrap().is_empty()).await;
+    sub.push(
+        0,
+        frame(
+            "actual-generated-tag",
+            "NeedsLogin",
+            "https://headscale.example/active-auth",
+        ),
+    );
+    wait_until(|| {
+        reg.login_progress("ts1", "dropped-main-url")
+            .is_some_and(|p| p.url.is_some())
+    })
+    .await;
+    task.abort();
+    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+    let receipt = reg.login_progress("ts1", "dropped-main-url").unwrap();
+    assert_eq!(receipt.server_id, "ts1");
+    assert_eq!(receipt.attempt_id, "dropped-main-url");
+    assert_eq!(receipt.phase, "cancelled");
+    assert!(receipt.url.is_none());
+    assert_eq!(receipt.main_generation, Some(10));
+    assert_eq!(
+        receipt.identity_epoch.as_deref(),
+        Some("identity-drop-token")
+    );
+    assert!(attempt.is_finished());
+    assert!(sub.senders.lock().unwrap()[0].is_closed());
+    assert!(
+        reg.main_owns("ts1", true),
+        "future Drop cannot stop the normal main"
+    );
+    assert!(reg.inflight_login_pids().is_empty());
     std::fs::remove_dir_all(ud).unwrap();
 }
 
@@ -1722,6 +1811,271 @@ async fn fresh_main_query_timeout_is_terminal_and_releases_subscription() {
         .iter()
         .any(|p| p.2 == "timedOut"));
     assert!(sub.senders.lock().unwrap()[0].is_closed());
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn main_observer_rejects_saved_identity_change_without_waiting_for_another_frame() {
+    let (reg, sub, ud) = owned_main_registry(Duration::from_secs(60)).await;
+    let requested = ts_server("ts1", "myts");
+    let saved = Arc::new(Mutex::new(requested.clone()));
+    let emitter = Arc::new(FakeEmitter::default());
+    reg.prepare("ts1", "identity-change").await.unwrap();
+    let (reg2, ud2, saved2, emitter2) = (reg.clone(), ud.clone(), saved.clone(), emitter.clone());
+    let task = tokio::spawn(async move {
+        reg2.start_attempt_with_saved(
+            &requested,
+            &ud2,
+            request("identity-change"),
+            &|| Ok(saved2.lock().unwrap().clone()),
+            &|| main_snapshot(10),
+            emitter2,
+        )
+        .await
+    });
+    wait_until(|| !sub.senders.lock().unwrap().is_empty()).await;
+    sub.push(
+        0,
+        frame(
+            "actual-generated-tag",
+            "NeedsLogin",
+            "https://headscale.example/auth",
+        ),
+    );
+    wait_until(|| {
+        reg.login_progress("ts1", "identity-change")
+            .is_some_and(|p| p.url.is_some())
+    })
+    .await;
+    saved.lock().unwrap().tailscale_settings = Some(Box::new(
+        polaris_config_engine::user_config::server_config::TailscaleSettings {
+            hostname: Some("replacement".into()),
+            ..Default::default()
+        },
+    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(outcome, StartLoginOutcome::Failed(reason) if reason == "savedTailscaleIdentityChanged")
+    );
+    let receipt = reg.login_progress("ts1", "identity-change").unwrap();
+    assert_eq!(receipt.phase, "failed");
+    assert!(receipt.url.is_none());
+    assert!(sub.senders.lock().unwrap()[0].is_closed());
+    assert!(reg.main_owns("ts1", true));
+    assert!(emitter
+        .progress
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|p| p.2 != "authorized"));
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn main_observer_rejects_generation_change_without_a_status_frame() {
+    let (reg, sub, ud) = owned_main_registry(Duration::from_secs(60)).await;
+    let generation = Arc::new(AtomicU64::new(10));
+    reg.prepare("ts1", "quiet-supersession").await.unwrap();
+    let (reg2, ud2, generation2) = (reg.clone(), ud.clone(), generation.clone());
+    let task = tokio::spawn(async move {
+        reg2.start_attempt(
+            &ts_server("ts1", "myts"),
+            &ud2,
+            request("quiet-supersession"),
+            &|| main_snapshot(generation2.load(Ordering::SeqCst)),
+            Arc::new(FakeEmitter::default()),
+        )
+        .await
+    });
+    wait_until(|| !sub.senders.lock().unwrap().is_empty()).await;
+    generation.store(11, Ordering::SeqCst);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome, StartLoginOutcome::Failed(reason) if reason == "mainCoreChanged"));
+    assert!(sub.senders.lock().unwrap()[0].is_closed());
+    assert!(reg.main_owns("ts1", true));
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_main_attempt_cannot_create_another_observer_or_authorize() {
+    let (reg, sub, ud) = owned_main_registry(Duration::from_secs(60)).await;
+    reg.prepare("ts1", "single-observer").await.unwrap();
+    let (reg2, ud2) = (reg.clone(), ud.clone());
+    let task = tokio::spawn(async move {
+        reg2.start_attempt(
+            &ts_server("ts1", "myts"),
+            &ud2,
+            request("single-observer"),
+            &|| main_snapshot(10),
+            Arc::new(FakeEmitter::default()),
+        )
+        .await
+    });
+    wait_until(|| !sub.senders.lock().unwrap().is_empty()).await;
+    let duplicate = reg
+        .start_attempt(
+            &ts_server("ts1", "myts"),
+            &ud,
+            request("single-observer"),
+            &|| main_snapshot(10),
+            Arc::new(FakeEmitter::default()),
+        )
+        .await;
+    assert!(
+        matches!(duplicate, StartLoginOutcome::Failed(reason) if reason == "attemptAlreadyUsed")
+    );
+    assert_eq!(sub.senders.lock().unwrap().len(), 1);
+    reg.cancel_attempt("ts1", "single-observer").await.unwrap();
+    assert!(matches!(task.await.unwrap(), StartLoginOutcome::Cancelled));
+    assert!(reg.main_owns("ts1", true));
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn expired_running_main_cannot_authorize_and_invalid_needs_login_url_is_terminal() {
+    for invalid in [false, true] {
+        let (reg, sub, ud) = owned_main_registry(Duration::from_secs(60)).await;
+        reg.prepare("ts1", "untrusted-main-frame").await.unwrap();
+        let emitter = Arc::new(FakeEmitter::default());
+        let (reg2, ud2, emitter2) = (reg.clone(), ud.clone(), emitter.clone());
+        let task = tokio::spawn(async move {
+            reg2.start_attempt(
+                &ts_server("ts1", "myts"),
+                &ud2,
+                request("untrusted-main-frame"),
+                &|| main_snapshot(10),
+                emitter2,
+            )
+            .await
+        });
+        wait_until(|| !sub.senders.lock().unwrap().is_empty()).await;
+        if invalid {
+            sub.push(
+                0,
+                frame("actual-generated-tag", "NeedsLogin", "javascript:unsafe"),
+            );
+            assert!(
+                matches!(task.await.unwrap(), StartLoginOutcome::Failed(reason) if reason == "invalidAuthUrl")
+            );
+        } else {
+            let mut update = frame(
+                "actual-generated-tag",
+                "Running",
+                "https://headscale.example/auth",
+            );
+            update.endpoints[0].self_ = Some(daemon::TailscalePeer {
+                expired: true,
+                ..Default::default()
+            });
+            sub.push(0, update);
+            wait_until(|| {
+                reg.login_progress("ts1", "untrusted-main-frame")
+                    .is_some_and(|p| p.url.is_some())
+            })
+            .await;
+            assert!(!task.is_finished());
+            reg.cancel_attempt("ts1", "untrusted-main-frame")
+                .await
+                .unwrap();
+            assert!(matches!(task.await.unwrap(), StartLoginOutcome::Cancelled));
+        }
+        assert!(emitter
+            .progress
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| p.2 != "authorized"));
+        assert!(sub.senders.lock().unwrap()[0].is_closed());
+        assert!(reg.main_owns("ts1", true));
+        std::fs::remove_dir_all(ud).unwrap();
+    }
+}
+
+struct MockBoundMain(AtomicBool);
+#[async_trait]
+impl MainLoginBinding for MockBoundMain {
+    async fn validate(&self) -> Result<(), String> {
+        if self.0.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("READY_MAIN_UNKNOWN".into())
+        }
+    }
+    fn target_tag(&self, _: &str) -> Option<&str> {
+        Some("actual-generated-tag")
+    }
+}
+
+#[tokio::test]
+async fn main_observer_checks_bound_session_again_before_accepting_running_frame() {
+    let (reg, sub, ud) = owned_main_registry(Duration::from_secs(60)).await;
+    reg.prepare("ts1", "native-bound").await.unwrap();
+    let attempt = reg.attempts.get("ts1", "native-bound").unwrap();
+    attempt.claimed.store(true, Ordering::SeqCst);
+    attempt.bind_main(10, Some("epoch-token".into()));
+    let bound = Arc::new(MockBoundMain(AtomicBool::new(true)));
+    let emitter = Arc::new(FakeEmitter::default());
+    let (reg2, bound2, emitter2, attempt2) =
+        (reg.clone(), bound.clone(), emitter.clone(), attempt.clone());
+    let task = tokio::spawn(async move {
+        let server = ts_server("ts1", "myts");
+        reg2.confirm_main_request(
+            &server,
+            &request("native-bound"),
+            &attempt2,
+            &main_snapshot(10),
+            &|| main_snapshot(10),
+            &|| Ok(server.clone()),
+            Some(bound2.as_ref()),
+            Arc::new(AttemptReceiptEmitter {
+                inner: emitter2,
+                attempt: attempt2.clone(),
+                attempt_id: "native-bound".into(),
+            }),
+        )
+        .await
+    });
+    wait_until(|| !sub.senders.lock().unwrap().is_empty()).await;
+    sub.push(
+        0,
+        frame(
+            "actual-generated-tag",
+            "NeedsLogin",
+            "https://headscale.example/auth",
+        ),
+    );
+    wait_until(|| {
+        reg.login_progress("ts1", "native-bound")
+            .is_some_and(|p| p.url.is_some())
+    })
+    .await;
+    assert_eq!(
+        reg.login_progress("ts1", "native-bound")
+            .unwrap()
+            .identity_epoch
+            .as_deref(),
+        Some("epoch-token")
+    );
+    bound.0.store(false, Ordering::SeqCst);
+    sub.push(0, frame("actual-generated-tag", "Running", ""));
+    assert!(
+        matches!(task.await.unwrap(), StartLoginOutcome::Failed(reason) if reason == "READY_MAIN_UNKNOWN")
+    );
+    assert!(emitter
+        .progress
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|p| p.2 != "authorized"));
+    assert!(sub.senders.lock().unwrap()[0].is_closed());
+    assert!(reg.main_owns("ts1", true));
+    attempt.finish();
     std::fs::remove_dir_all(ud).unwrap();
 }
 

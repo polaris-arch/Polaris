@@ -16,7 +16,7 @@
 
 import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
-import { authorizeFromMainFrame, claimLoginUrl, loginAttemptActive, mainAuthUrlOwner, openLoginUrl } from '@/domain/tailscale-login-progress';
+import { claimLoginUrl, loginAttemptActive, mainAuthUrlOwner, openLoginUrl } from '@/domain/tailscale-login-progress';
 import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { normalizePendingChanges, useAppStore, useEffectiveConfig } from './store/app-store';
@@ -350,23 +350,6 @@ export default function App() {
   useEffect(() => {
     const off = api.proxy.onTailscaleStatus((data) => {
       useAppStore.getState().setTailscaleStatus(data);
-      const progress = useTailscaleLoginProgressStore.getState();
-      const authorized = authorizeFromMainFrame(progress.attempts[data.serverId], data);
-      if (authorized) {
-        progress.apply(authorized);
-        useAppStore.getState().setTailscaleAuthUrl(data.serverId, null);
-        useAppStore.getState().setTailscaleLoginInitiated(data.serverId, false);
-      }
-      const active = useTailscaleLoginProgressStore.getState().attempts[data.serverId];
-      const owner = mainAuthUrlOwner(active);
-      if (!authorized && active?.phase === 'mainCore' && owner && validatedTailscaleAuthUrl(data.authURL)) {
-        progress.apply({ ...active, url: data.authURL! });
-        useAppStore.getState().setTailscaleAuthUrl(data.serverId, data.authURL!);
-        if (claimLoginUrl(tsAuthSeen.current, data.serverId, owner, data.authURL!)) {
-          void openLoginUrl(data.authURL!, api.system.openExternal, () => toast.error(t('ts.browserOpenFailed')));
-          void notifyDesktop(t('notify.tsLogin.title'), t('notify.tsLogin.body'));
-        }
-      }
       if (!isDefinitiveTsLoginFrame(data)) return;
       useAppStore.getState().setTailscaleLoginState(data.serverId, data.loggedIn);
     });
@@ -389,7 +372,6 @@ export default function App() {
       const current = data.serverId ? useTailscaleLoginProgressStore.getState().attempts[data.serverId] : undefined;
       const owner = mainAuthUrlOwner(current);
       if (!owner) return;
-      if (current) useTailscaleLoginProgressStore.getState().apply({ ...current, url: data.url });
       if (data.serverId) setTailscaleAuthUrl(data.serverId, data.url);
       if (!claimLoginUrl(tsAuthSeen.current, data.serverId || UNOWNED_TAILSCALE_AUTH_KEY, owner, data.url)) return;
       void openLoginUrl(data.url, api.system.openExternal, () => toast.error(t('ts.browserOpenFailed')));

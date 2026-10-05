@@ -102,6 +102,10 @@ impl LiveClaimGuard<'_> {
         self.inner.generation
     }
 
+    pub fn is_busy(&self) -> bool {
+        self.inner.depth > 0
+    }
+
     pub fn owner(&self) -> Option<LifecycleKind> {
         self.inner.generation_owner
     }

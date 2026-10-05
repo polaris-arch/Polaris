@@ -3472,7 +3472,7 @@ fn deferred_debt_is_cleared_where_the_startup_snapshot_is_written_and_cleared() 
     let src = module_code("runtime/proxy");
     let started = method_body(&src, "    pub(super) async fn start_inner(");
     assert!(
-        started.contains("*snap = Some(config);")
+        started.contains("*snap = Some(config.clone());")
             && started.contains("restart_deferred.store(false"),
         "起核就绪腿必须与写 startup_snapshot 同刻清账 —— 否则核已按新配置起来了，条上还挂着「待应用」"
     );
@@ -3505,7 +3505,10 @@ fn pending_changes_push_is_wired_on_both_sides_of_the_diff() {
         "分子侧（落盘/切节点）必须推 —— 否则改完配置条根本不出现"
     );
     // 分母侧（运行核换了）：start 成功终态 / stop 拆除终态。
-    let started = method_body(&src, "    pub(super) async fn start_guarded(");
+    let started = method_body(
+        &src,
+        "    pub(super) async fn start_guarded_with_completion(",
+    );
     assert!(
         started.contains("self.push_pending_changes();"),
         "起核就绪腿必须推 —— 否则「立即应用」引发的重启落地后没人告诉 UI 差集已清，条停在「立即应用」"

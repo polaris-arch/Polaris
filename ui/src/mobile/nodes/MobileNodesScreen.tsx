@@ -70,12 +70,12 @@ import { withProxyStartClaim } from '@/lib/proxy-start-claim';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import {
   speedTestableIds,
+  manualSpeedTestCaps,
   type SpeedTestCaps,
 } from '@/domain/endpoint-routes';
 import { isMeshNode, meshAllowsInternet } from '@/domain/endpoint-routes';
 import { deriveTsExitWarning } from '@/domain/tailscale-exit-warning';
 import { tsExitAction } from '../ts-exit-action';
-import { loginAttemptActive } from '@/domain/tailscale-login-progress';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
 import { deriveMeshTunnelHealth } from '@/domain/mesh-tunnel-health';
 import { invalidNodeReasonText } from '@/domain/invalid-node-reason';
@@ -199,7 +199,7 @@ export function MobileNodesScreen(): ReactElement {
   }, [activeGroup]);
 
   const stagedOnly = useMemo(() => stagedOnlyIds(servers, diskServers), [servers, diskServers]);
-  const speedTestCaps = useMemo<SpeedTestCaps>(() => ({ mainCorePool: proxyRunning }), [proxyRunning]);
+  const speedTestCaps = useMemo<SpeedTestCaps>(() => manualSpeedTestCaps(proxyRunning), [proxyRunning]);
   const invalidIndex = useMemo(() => invalidNodeIndex(invalidNodes), [invalidNodes]);
   /* 新报告带运行代和加载证据；旧 absorbed 仅精确字串去重，不能充当本层归属。 */
   const [meshRoute, setMeshRoute] = useState<{
@@ -498,14 +498,16 @@ export function MobileNodesScreen(): ReactElement {
   /** Match the action to the warning, not merely the presence of an auth URL. */
   const onTsExitAction = useCallback(() => {
     if (tsId === undefined) return;
-    const storeUrl = !tsLoginAttempt || loginAttemptActive(tsLoginAttempt.phase) ? tsAuthUrl : null;
-    const action = tsExitAction(tsExitWarning, tsStatus?.authURL, storeUrl);
+    const action = tsExitAction(tsExitWarning, {
+      liveUrl: tsStatus?.authURL, storeUrl: tsAuthUrl, attempt: tsLoginAttempt,
+      normalMainRequired: speedTestCaps.normalMainRequired,
+    });
     if (action.kind !== 'login-url') {
       openMobileForm({ kind: action.kind === 'login-panel' ? 'ts-login' : 'ts-exit', serverId: tsId });
       return;
     }
     void runWrite(() => api.system.openExternal(action.url), () => t('errors.operationFailed'));
-  }, [tsExitWarning, tsStatus?.authURL, tsAuthUrl, tsLoginAttempt, tsId, runWrite, t, openMobileForm]);
+  }, [tsExitWarning, tsStatus?.authURL, tsAuthUrl, tsLoginAttempt, tsId, runWrite, t, openMobileForm, speedTestCaps.normalMainRequired]);
 
   // ── 组网隧道健康：只在组网分组（IA 裁定 #3 后半）────────────────────────────
   const openVpnStatus = useVpnStatusStore((s) => (selectedServer ? s.openVpn[selectedServer.id] : undefined));

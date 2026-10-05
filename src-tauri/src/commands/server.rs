@@ -857,7 +857,7 @@ pub async fn tailscale_login_progress(
 
 /// Authorize the persisted node with an explicit browser/AuthKey mode and prepared attempt identity.
 /// `started` denotes process startup only; request-scoped STATUS progress confirms Running after reap.
-/// A matching primary owner is queried once for fresh STATUS; a changed configuration remains pending.
+/// A matching primary owner is observed until fresh authorization; iOS uses normal main readiness.
 /// Real control-plane authorization is outside the mock/check-only test boundary.
 #[tauri::command]
 pub async fn tailscale_login(
@@ -866,12 +866,6 @@ pub async fn tailscale_login(
     server: Value,
     request: crate::runtime::tailscale_login_core::LoginRequest,
 ) -> Result<ApiResponse<Value>, ()> {
-    if cfg!(target_os = "ios") {
-        return Ok(ApiResponse::err_with_code(
-            "Independent Tailscale login is unavailable in the iOS packet tunnel",
-            "TAILSCALE_LOGIN_UNSUPPORTED_ON_IOS",
-        ));
-    }
     let Ok(requested) = serde_json::from_value::<ServerConfig>(server) else {
         return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node",
@@ -887,13 +881,50 @@ pub async fn tailscale_login(
             "TAILSCALE_LOGIN_BAD_SERVER",
         ));
     }
-    // Resolve only after the registry takes the TS state gate. A renderer request may have
+    let saved = match state.config().current() {
+        Ok(saved) => saved,
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "Cannot read the saved Tailscale node",
+                "TAILSCALE_LOGIN_FAILED",
+            ))
+        }
+    };
+    let identity_epoch = match saved_tailscale_identity_epoch(&saved, &requested.id) {
+        Ok(epoch) => epoch,
+        Err(reason) => return Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED")),
+    };
+    if cfg!(target_os = "ios")
+        && request.mode == crate::runtime::tailscale_login_core::LoginMode::Authkey
+    {
+        let existing_identity = state
+            .mesh()
+            .tailscale_state_dir(&requested.id)
+            .and_then(|path| tailscale_state_exists_at(&path, true));
+        match existing_identity {
+            Ok(false) => {}
+            Ok(true) => return Ok(ApiResponse::err_with_code(
+                "Retire the existing Tailscale identity before replacing its authentication key",
+                "TAILSCALE_IDENTITY_RETIREMENT_REQUIRED",
+            )),
+            Err(_) => {
+                return Ok(ApiResponse::err_with_code(
+                    "Cannot verify the existing Tailscale identity",
+                    "TAILSCALE_STATE_QUERY_FAILED",
+                ))
+            }
+        }
+    }
+    // Resolve again after the registry takes the TS state gate. A renderer request may have
     // waited through an identity retirement after this command was dispatched.
     let saved_server = || -> Result<ServerConfig, String> {
         let saved = state
             .config()
             .current()
             .map_err(|_| "Cannot read the saved Tailscale node".to_string())?;
+        if saved_tailscale_identity_epoch(&saved, &requested.id)? != identity_epoch {
+            return Err("Saved Tailscale identity epoch changed".into());
+        }
         let nodes = saved
             .get("servers")
             .and_then(Value::as_array)
@@ -963,11 +994,27 @@ pub async fn tailscale_login(
             mixed_port: cfg.as_ref().and_then(|c| c.mixed_port),
         }
     };
-    match state
-        .mesh()
-        .start_tailscale_login(app, &requested, request, &saved_server, &main_core)
-        .await
-    {
+    let outcome = if cfg!(target_os = "ios") {
+        state
+            .mesh()
+            .start_tailscale_login_with_normal_main(
+                app,
+                &requested,
+                request,
+                &saved_server,
+                &main_core,
+                &state.proxy,
+                &saved,
+                identity_epoch.clone(),
+            )
+            .await
+    } else {
+        state
+            .mesh()
+            .start_tailscale_login(app, &requested, request, &saved_server, &main_core)
+            .await
+    };
+    match outcome {
         StartLoginOutcome::Started => Ok(ApiResponse::ok(json!({"started": true}))),
         StartLoginOutcome::InMainCore => Ok(ApiResponse::ok(
             json!({"started": false, "reason": "inMainCore"}),
@@ -982,13 +1029,43 @@ pub async fn tailscale_login(
             error.to_string(),
             crate::runtime::proxy::code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED,
         )),
+        StartLoginOutcome::PrerequisiteFailed { reason, code } => {
+            Ok(ApiResponse::err_with_code(reason, code))
+        }
         StartLoginOutcome::Failed(reason) => {
             Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED"))
         }
     }
 }
 
-/// 上游 `TAILSCALE_LOGIN_CANCEL`：取消一个请求，等待其核收割后注销。
+fn saved_tailscale_identity_epoch(
+    saved: &Value,
+    server_id: &str,
+) -> Result<Option<String>, String> {
+    use polaris_config_engine::user_config::mesh_route_state::{MeshBindingState, MeshRouteState};
+    let Some(raw) = saved.get("meshRouteState") else {
+        return Ok(None);
+    };
+    let state: MeshRouteState = serde_json::from_value(raw.clone())
+        .map_err(|_| "Saved mesh identity ledger is invalid".to_owned())?;
+    let active: Vec<_> = state
+        .identities
+        .iter()
+        .filter(|identity| {
+            identity.server_id == server_id
+                && matches!(
+                    identity.binding_state,
+                    MeshBindingState::Bound | MeshBindingState::Unbound
+                )
+        })
+        .collect();
+    let [identity] = active.as_slice() else {
+        return Err("Saved Tailscale identity epoch is unavailable".into());
+    };
+    Ok(Some(identity.identity_epoch.clone()))
+}
+
+/// 取消精确登录请求：瞬态核等待收割；正常主核仅撤销本次观察，连接继续由用户控制。
 /// 幂等：取消一个不存在的登录不算错（对齐 Polaris handler 的静默 ok）。
 #[allow(
     clippy::needless_pass_by_value,
@@ -1000,12 +1077,6 @@ pub async fn tailscale_login_cancel(
     server_id: String,
     attempt_id: String,
 ) -> Result<ApiResponse<()>, ()> {
-    if cfg!(target_os = "ios") {
-        return Ok(ApiResponse::err_with_code(
-            "Independent Tailscale login cancellation is unavailable in the iOS packet tunnel",
-            "TAILSCALE_LOGIN_UNSUPPORTED_ON_IOS",
-        ));
-    }
     Ok(
         match state
             .mesh()

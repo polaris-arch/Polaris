@@ -12,7 +12,11 @@
  * 「渲染端自带 id 落盘」是后端明确支持的契约（其单测名即 `..._keeps_existing`）。
  */
 import type { ServerConfig } from '@/contracts/types';
-import type { TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
+
+/** Login can use the normal main proxy on every platform; identity deletion is a separate capability. */
+export function supportsTsLoginActions(): boolean {
+  return true;
+}
 
 /** iOS has the main Packet Tunnel only, with no standalone account session owner. */
 export function supportsTsAccountActions(mobileOs = typeof document === 'undefined'
@@ -70,24 +74,6 @@ export function tsLoginBrowserView(
   if (timedOut) return 'timeout';
   if (pendingServerId !== null) return 'awaiting';
   return 'hint';
-}
-
-/** 主核存在不等于已授权；仅消费本次主动读取/订阅得到的活态，禁止用历史登录缓存。 */
-export function tsLoginMainCoreView(
-  serverId: string,
-  snapshot: TailscaleStatusSnapshot | null,
-  receivedUrl: string | null,
-): { state: 'unknown' | 'authorized' | 'needs-login' | 'url'; authUrl: string | null } {
-  const frame = snapshot?.connected ? snapshot.statuses.find((s) => s.serverId === serverId) : undefined;
-  if (frame?.loggedIn && !frame.expired && frame.backendState === 'Running') {
-    return { state: 'authorized', authUrl: null };
-  }
-  const authUrl = frame?.authURL?.trim() || receivedUrl;
-  if (authUrl) return { state: 'url', authUrl };
-  if (frame && (frame.expired || ['NeedsLogin', 'NeedsMachineAuth'].includes(frame.backendState))) {
-    return { state: 'needs-login', authUrl: null };
-  }
-  return { state: 'unknown', authUrl: null };
 }
 
 /** 错误只用稳定码分类；message 可能包含 auth key、控制面 URL 或本地路径。 */
@@ -240,12 +226,16 @@ export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 
     if (!input.isActive()) return { phase: 'cancelled' };
     stage = 'authorizationRequestFailed';
     const result = await input.start();
-    if (!input.isActive()) return { phase: 'cancelled' };
     handedOff = result.started || result.reason === 'inMainCore';
+    if (!input.isActive()) return { phase: 'cancelled' };
     return { phase: handedOff ? 'handedOff' : 'cancelled' };
   } catch (error) {
     const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
-    if (code === 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED') return { phase: 'failed', reason: code };
+    if (typeof code === 'string' && ['ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED',
+      'IOS_FOREGROUND_REQUIRED', 'IOS_VPN_PERMISSION_DENIED', 'IOS_READY_UNKNOWN', 'IOS_START_CANCELLED',
+      'readyUnknown', 'unsavedConfiguration', 'configurationPending', 'superseded', 'targetNotInMain'].includes(code)) {
+      return { phase: 'failed', reason: code };
+    }
     return { phase: 'failed', reason: code === 'TAILSCALE_LOGOUT_MAIN_CORE' ? 'mainCoreInUse' : stage };
   } finally {
     if (!handedOff) await input.cancel().catch(() => {});

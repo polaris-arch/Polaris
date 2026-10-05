@@ -14,6 +14,8 @@ use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
 use polaris_config_engine::user_config::dns_constants::{BLOCK_SERVER_ID, DIRECT_SERVER_ID};
 use polaris_net_stack::safe_redirect::{safe_redirect_fetch, HttpClient, SafeRedirectFetchOptions};
 
+use crate::commands::manual_network::{GuardedHttp, ManualBindingGuard, ManualCheckFailure};
+
 const IPINFO_TIMEOUT_MS: u64 = 8_000;
 /// trace 响应体上限（cdn-cgi/trace 仅数百字节，64 KiB 足够且防滥用）。
 const IPINFO_MAX_BODY: usize = 64 * 1024;
@@ -298,6 +300,120 @@ fn commit_ipinfo_snapshot(epoch: u64, seq: u64, snap: &Value) -> Option<Value> {
         return None;
     }
     Some(state.publish(snap.clone(), true))
+}
+
+struct ManualIpinfoBinding<'a, G> {
+    main: &'a G,
+    epoch: u64,
+    seq: u64,
+}
+
+#[async_trait::async_trait]
+impl<G: ManualBindingGuard> ManualBindingGuard for ManualIpinfoBinding<'_, G> {
+    fn check(&self) -> Result<(), ManualCheckFailure> {
+        self.main.check()?;
+        self.check_local()
+    }
+    fn check_local(&self) -> Result<(), ManualCheckFailure> {
+        if !ipinfo_probe_is_current(self.epoch, self.seq) {
+            return Err(ManualCheckFailure::new("superseded"));
+        }
+        Ok(())
+    }
+    fn commit<T>(
+        &self,
+        commit: impl FnOnce() -> Result<T, ManualCheckFailure>,
+    ) -> Result<T, ManualCheckFailure> {
+        self.main.commit(commit)
+    }
+    async fn validate(&self) -> Result<(), ManualCheckFailure> {
+        self.main.validate().await?;
+        self.check()
+    }
+}
+
+fn commit_bound_ipinfo<G: ManualBindingGuard>(
+    guard: &G,
+    snapshot: &Value,
+) -> Result<Value, ManualCheckFailure> {
+    guard.commit(|| {
+        let mut state = ipinfo_state().lock().unwrap();
+        // Main/config/cancel were checked under producer locks. Only local epoch/seq here.
+        guard.check_local()?;
+        Ok(state.publish(snapshot.clone(), true))
+    })
+}
+
+/// Original retry budgets and explicit direct/proxy fields; only the proxy transport can fill proxy.
+/// Injecting the two fetch closures makes this actual production round testable without DNS/network.
+async fn bound_ipinfo_round<G, D, DFut, P, PFut>(
+    guard: &G,
+    direct: D,
+    proxy: P,
+) -> Result<Value, ManualCheckFailure>
+where
+    G: ManualBindingGuard,
+    D: FnMut() -> DFut,
+    DFut: std::future::Future<Output = Result<Value, String>>,
+    P: FnMut() -> PFut,
+    PFut: std::future::Future<Output = Result<Value, String>>,
+{
+    guard.check()?;
+    let direct = with_ipinfo_retry(direct, IPINFO_DIRECT_ATTEMPTS, IPINFO_DIRECT_RETRY_MS).await;
+    guard.check()?;
+    let proxy = with_ipinfo_retry(proxy, IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS).await;
+    guard.check()?;
+    let proxy_failed = proxy.is_err();
+    let direct_failed = direct.is_err();
+    let mut snapshot = json!({
+        "direct": direct.unwrap_or(Value::Null),
+        "proxy": proxy.unwrap_or(Value::Null),
+        "proxyReachability": if proxy_failed { "unreachable" } else { "reachable" },
+        "updatedAt": u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX),
+    });
+    if direct_failed || proxy_failed {
+        snapshot["error"] = json!("ipInfoFailed");
+    }
+    Ok(snapshot)
+}
+
+/// Explicit manual consumer; it never reads a newer live endpoint or substitutes a direct result.
+pub(in crate::commands) async fn run_bound_ipinfo<G: ManualBindingGuard>(
+    app: &AppHandle,
+    direct: &HttpRuntime,
+    local_proxy: &LocalHttpProxy,
+    main: &G,
+) -> Result<Value, ManualCheckFailure> {
+    main.check()?;
+    let (epoch, seq) = begin_manual_probe();
+    let guard = ManualIpinfoBinding { main, epoch, seq };
+    guard.check()?;
+    let proxy = HttpRuntime::via_local_proxy(local_proxy.port, local_proxy.auth.as_ref())
+        .map_err(|_| ManualCheckFailure::new("ipInfoFailed"))?;
+    let direct = GuardedHttp {
+        http: direct,
+        guard: &guard,
+    };
+    let proxy = GuardedHttp {
+        http: &proxy,
+        guard: &guard,
+    };
+    let snapshot = bound_ipinfo_round(
+        &guard,
+        || fetch_ipip_ipinfo(&direct),
+        || fetch_trace_ipinfo(&proxy),
+    )
+    .await?;
+    guard.validate().await?;
+    let snapshot = commit_bound_ipinfo(&guard, &snapshot)?;
+    guard.check()?;
+    crate::events::broadcast(
+        app,
+        crate::events::channel::EVENT_IP_INFO_UPDATED,
+        snapshot.clone(),
+    );
+    // Background IP probes keep their existing warm RTT path. This explicit action has only IP/unlock.
+    Ok(snapshot)
 }
 
 /// `peek=true` 的零探测读取：原样返回最近一次权威帧，不重新生成时间戳或 revision。

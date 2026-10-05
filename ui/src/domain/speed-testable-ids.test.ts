@@ -14,7 +14,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { speedTestableIds } from './endpoint-routes';
+import { manualSpeedTestCaps, speedTestableIds } from './endpoint-routes';
 import type { ServerConfig } from '@/contracts/types';
 
 const srv = (id: string, extra: Partial<ServerConfig> = {}): ServerConfig =>
@@ -55,6 +55,16 @@ describe('speedTestableIds：过滤口径 = isSpeedTestable（不产假数值）
     expect(speedTestableIds(servers, { mainCorePool: false })).toEqual(['ok']);
     // 代理在跑 → 池可用 → 纳入
     expect(speedTestableIds(servers, { mainCorePool: true })).toEqual(['ok', 'ts']);
+  });
+
+  it('iOS explicit stopped actions may prepare normal main; PC and Android retain independent eligibility', () => {
+    const servers = [srv('ok'), srv('ts', { protocol: 'tailscale', tailscaleSettings: { exitNode: 'node-x' } } as Partial<ServerConfig>), srv('ts-lan', { protocol: 'tailscale' } as Partial<ServerConfig>)];
+    expect(speedTestableIds(servers, manualSpeedTestCaps(false, 'ios'))).toEqual(['ok', 'ts']);
+    for (const platform of ['android', 'windows', 'macos']) {
+      expect(speedTestableIds(servers, manualSpeedTestCaps(false, platform))).toEqual(['ok']);
+    }
+    expect(speedTestableIds(servers, manualSpeedTestCaps(true, 'android'))).toEqual(['ok', 'ts']);
+    expect(speedTestableIds(servers, manualSpeedTestCaps(false, 'ios'), new Set(['ts']))).toEqual(['ok']);
   });
 
   it('TS-mesh-only（无 exitNode）恒排除：公网黑洞必假超时，池可用也不测', () => {

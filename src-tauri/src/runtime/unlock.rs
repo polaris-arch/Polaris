@@ -199,6 +199,18 @@ struct InvalidatedPayload {
 /// 这样组合面门能证「事件真 emit」而无需 Tauri 运行时。对齐本仓「纯逻辑 + 注入 I/O」架构
 /// （`events.rs` 是被注入的那一侧）。
 pub trait UnlockEventSink {
+    /// Explicit manual consumers bind I/O and commit to the private main ticket.
+    /// Ordinary/background consumers retain their existing epoch-only contract.
+    fn is_current(&self) -> bool {
+        true
+    }
+
+    /// Runs only a short memory commit. Bound consumers hold their real main/config
+    /// fence here; default ordinary consumers retain the existing epoch contract.
+    fn with_current_commit(&self, commit: &mut dyn FnMut() -> bool) -> bool {
+        self.is_current() && commit()
+    }
+
     /// 单服务 settle 逐个点亮（`EVENT_UNLOCK_PROGRESS`）。
     fn progress(&self, service_id: &str, result: &UnlockResult);
     /// 一轮完成的完整终态快照（`EVENT_UNLOCK_UPDATED`）。
@@ -345,6 +357,8 @@ pub fn selected_exit_changed(old_selected: Option<&str>, new_selected: Option<&s
 ///
 /// 持有 epoch（归属 bracket）+ 快照缓存；每轮使用的出口 pin HTTP 由调用方显式注入 `run`。
 pub struct UnlockRuntime {
+    /// Serializes all detector commits with invalidate. Never held across await or events.
+    commit_lock: Mutex<()>,
     /// 归属世代：invalidate 递增，作废在飞轮的 commit（别把旧出口结果标给新出口）。
     epoch: AtomicU64,
     /// 最近一轮的终态快照（TTL 内 `unlock_get` 零网络水合）。
@@ -371,14 +385,14 @@ pub struct UnlockRuntime {
     /// **出口漂移连击计数**（熔断器状态，见 [`MAX_CONSECUTIVE_DRIFT`]）：轮尾 egress 与轮首不符**且 epoch 未变**
     /// 时递增；任何落定终态（正常 commit / notReady commit / 熔断 commit）或「epoch 真变了」都清零。
     ///
-    /// 刻意**不在 [`UnlockRuntime::invalidate`] 里清零** —— 漂移丢弃腿自己就调 invalidate，在那里清零会让
-    /// 计数恒为 1、熔断永不触发，即「加了熔断却没有牙」。清零点只放在上面列的那几处。
+    /// 外部 invalidate 清零；漂移丢弃腿的 invalidate_keep_run_at 保留连击，避免每轮归零令熔断失效。
     drift_streak: AtomicU64,
 }
 
 impl Default for UnlockRuntime {
     fn default() -> Self {
         Self {
+            commit_lock: Mutex::new(()),
             epoch: AtomicU64::new(0),
             cache: Mutex::new(None),
             run_lock: tokio::sync::Mutex::new(()),
@@ -441,6 +455,7 @@ impl UnlockRuntime {
 
     /// 读最近提交的终态快照（S-gate / force-min 用；与 TTL `cache` 分离，无 TTL 约束）。
     fn last_snapshot(&self) -> Option<UnlockSnapshot> {
+        let _commit = self.commit_lock.lock().ok()?;
         self.last_snapshot.lock().ok().and_then(|g| g.clone())
     }
 
@@ -461,10 +476,37 @@ impl UnlockRuntime {
     }
 
     /// 写最近提交的终态快照。
-    fn set_last_snapshot(&self, snap: Option<UnlockSnapshot>) {
+    fn set_last_snapshot_locked(&self, snap: Option<UnlockSnapshot>) {
         if let Ok(mut g) = self.last_snapshot.lock() {
             *g = snap;
         }
+    }
+
+    #[cfg(test)]
+    fn set_last_snapshot(&self, snap: Option<UnlockSnapshot>) {
+        let _commit = self.commit_lock.lock().unwrap();
+        self.set_last_snapshot_locked(snap);
+    }
+
+    fn commit_epoch<S: UnlockEventSink>(
+        &self,
+        sink: &S,
+        epoch: u64,
+        commit: impl FnOnce(),
+    ) -> bool {
+        let mut commit = Some(commit);
+        sink.with_current_commit(&mut || {
+            let Ok(_guard) = self.commit_lock.lock() else {
+                return false;
+            };
+            if self.epoch() != epoch {
+                return false;
+            }
+            if let Some(commit) = commit.take() {
+                commit();
+            }
+            true
+        })
     }
 
     /// 当前归属世代。
@@ -483,6 +525,7 @@ impl UnlockRuntime {
     /// 无需 epoch 校验：invalidate 已在切节点/起停时清缓存，故非空缓存恒是当前出口的合法结果。
     #[must_use]
     pub fn peek(&self, now_ms: u64) -> Option<UnlockSnapshot> {
+        let _commit = self.commit_lock.lock().ok()?;
         let guard = self.cache.lock().ok()?;
         let cached = guard.as_ref()?;
         if now_ms < cached.stored_at_ms.saturating_add(cached.ttl_ms) {
@@ -509,19 +552,30 @@ impl UnlockRuntime {
     /// 「丢弃 → 排自跑 → 再丢弃」这条边是有界的：漂移丢弃腿由 [`MAX_CONSECUTIVE_DRIFT`] 熔断，连续 N 轮后
     /// 改落低置信终态且**不再经过本函数**（不排新的自跑）。本函数自身不设限流，边界由调用侧的丢弃腿承担。
     pub fn invalidate<S: UnlockEventSink>(&self, sink: &S, running: bool, exit_blocked: bool) {
+        let token = {
+            let _commit = self
+                .commit_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.invalidate_locked(false)
+        };
+        sink.invalidated(running, exit_blocked);
+        // 去抖自跑：先递增世代取 token，再交给 sink 排程。递增必须在 `schedule_self_run` **之前**——否则
+        // 并发 invalidate 可能拿到相同 token，两轮都判「最新」而双跑。
+        sink.schedule_self_run(token);
+    }
+
+    fn invalidate_locked(&self, keep_run_at: bool) -> u64 {
         self.bump_epoch();
         if let Ok(mut guard) = self.cache.lock() {
             *guard = None;
         }
-        // S-gate / force-min 内存态一并复位（切节点/起停 = 一切真状态变化的解除通道，对齐 上游 invalidate：
-        // 清 lastSnapshot + lastRunAt）——否则 notReady 终态会锁死 S-gate、旧 lastRunAt 会误挡新出口的首次 force。
-        self.set_last_snapshot(None);
-        self.last_run_at.store(0, Ordering::SeqCst);
-        sink.invalidated(running, exit_blocked);
-        // 去抖自跑：先递增世代取 token，再交给 sink 排程。递增必须在 `schedule_self_run` **之前**——否则
-        // 并发 invalidate 可能拿到相同 token，两轮都判「最新」而双跑。
-        let token = self.self_run_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        sink.schedule_self_run(token);
+        self.set_last_snapshot_locked(None);
+        if !keep_run_at {
+            self.last_run_at.store(0, Ordering::SeqCst);
+            self.drift_streak.store(0, Ordering::SeqCst);
+        }
+        self.self_run_seq.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// 丢弃腿专用的失效：语义同 [`Self::invalidate`]，但**保留 `last_run_at`**。
@@ -543,14 +597,19 @@ impl UnlockRuntime {
         sink: &S,
         running: bool,
         exit_blocked: bool,
+        epoch: u64,
     ) {
-        let ran_at = self.last_run_at.load(Ordering::SeqCst);
-        self.invalidate(sink, running, exit_blocked);
-        self.last_run_at.store(ran_at, Ordering::SeqCst);
+        let mut token = None;
+        if self.commit_epoch(sink, epoch, || {
+            token = Some(self.invalidate_locked(true));
+        }) {
+            sink.invalidated(running, exit_blocked);
+            sink.schedule_self_run(token.unwrap());
+        }
     }
 
     /// 写缓存（commit 后）。
-    fn store(&self, snapshot: UnlockSnapshot, stored_at_ms: u64, ttl_ms: u64) {
+    fn store_locked(&self, snapshot: UnlockSnapshot, stored_at_ms: u64, ttl_ms: u64) {
         if let Ok(mut guard) = self.cache.lock() {
             *guard = Some(Cached {
                 snapshot,
@@ -558,6 +617,12 @@ impl UnlockRuntime {
                 ttl_ms,
             });
         }
+    }
+
+    #[cfg(test)]
+    fn store(&self, snapshot: UnlockSnapshot, stored_at_ms: u64, ttl_ms: u64) {
+        let _commit = self.commit_lock.lock().unwrap();
+        self.store_locked(snapshot, stored_at_ms, ttl_ms);
     }
 
     /// **编排核心**（注入 http/sink/clock，天然可单测；生产由 command 注入 `via_local_proxy` 出口 pin 客户端）。
@@ -616,6 +681,9 @@ impl UnlockRuntime {
     {
         // ── item 7 单飞：串行化并发 run（第二者等第一者 commit 后走下方 TTL 快路，避免双网络往返）──
         let _run_guard = self.run_lock.lock().await;
+        if !sink.is_current() {
+            return UnlockSnapshot::default();
+        }
 
         // ── TTL 快路：非 force 且缓存未过期 → 直接返回（零网络），并广播 UPDATED 让新监听者点亮 ──
         if !force {
@@ -659,11 +727,11 @@ impl UnlockRuntime {
 
         // ── item 2 就绪门退避：egress trace 兼作「inbound 已就绪」探针（首次即时探 + 失败退避重试 7 次 +
         //    B1 flap 确认）。拿到有效 egress = 就绪，兼作轮首出口锚（bracket）。──
-        let egress0 = match self.probe_ready(http, epoch0, deadline).await {
+        let egress0 = match self.probe_ready(http, sink, epoch0, deadline).await {
             Some(e) => e,
             None => {
                 // 退避期/探测期被 invalidate（epoch 变）→ 丢弃本轮（陈旧，不提交 notReady 污染新出口）。
-                if self.epoch() != epoch0 {
+                if self.epoch() != epoch0 || !sink.is_current() {
                     log::debug!("解锁检测：就绪门期间被 invalidate → 丢弃本轮（由自跑重跑）");
                     return UnlockSnapshot::default();
                 }
@@ -674,28 +742,47 @@ impl UnlockRuntime {
                 );
                 // 就绪门耗尽 → 提交 notReady 终态（checkedAt=null，不伪造；S-gate 兜住不重扫）。lastRunAt 置位
                 // （本轮真跑了整轮就绪门网络 → force 15s 硬下限据此生效）。egress=null → 天然不入 TTL 缓存。
-                self.last_run_at.store(now(), Ordering::SeqCst);
+                let ran_at = now();
+                if self.epoch() != epoch0 || !sink.is_current() {
+                    return UnlockSnapshot::default();
+                }
                 let snap = UnlockSnapshot {
                     not_ready: Some(true),
                     ..Default::default()
                 };
                 // 落定终态 → 漂移连击清零（本轮连 checker 都没跑，谈不上漂移；且已有终态收口，无自持循环）。
-                self.drift_streak.store(0, Ordering::SeqCst);
-                self.set_last_snapshot(Some(snap.clone()));
+                if !self.commit_epoch(sink, epoch0, || {
+                    self.last_run_at.store(ran_at, Ordering::SeqCst);
+                    self.drift_streak.store(0, Ordering::SeqCst);
+                    self.set_last_snapshot_locked(Some(snap.clone()));
+                }) {
+                    return UnlockSnapshot::default();
+                }
                 sink.updated(&snap);
                 return snap;
             }
         };
 
-        self.last_run_at.store(now(), Ordering::SeqCst);
+        if self.epoch() != epoch0 || !sink.is_current() {
+            return UnlockSnapshot::default();
+        }
+        let ran_at = now();
+        if !self.commit_epoch(sink, epoch0, || {
+            self.last_run_at.store(ran_at, Ordering::SeqCst)
+        }) {
+            return UnlockSnapshot::default();
+        }
         // 受限出口（CN）：海外服务 timeout 是结构性预期、非低置信瞬态 → 跳过 settle-retry + 用正常 30min TTL
         // + 不标 low_confidence（就绪门已过 → egress 必非空，此值贯穿本轮）。
         let restricted = is_restricted_egress_region(egress0.region.as_deref());
 
         // ── item 3 checker 主轮（单 checker 截止点 = min(CHECKER_BUDGET_MS, 整轮剩余)）：逐 settle emit progress ──
-        let mut results =
-            run_checkers_budgeted(http, ServiceId::ALL, deadline, |id, r| sink.progress(id, r))
-                .await;
+        let mut results = run_checkers_budgeted(http, ServiceId::ALL, deadline, |id, r| {
+            if sink.is_current() {
+                sink.progress(id, r);
+            }
+        })
+        .await;
 
         // ── item 4 轮内 settle-retry：就绪门只证「单点连通」非「各端点已热」→ 首轮个别 checker 撞冷隧道 8s
         //    超时。commit 前仅对 timeout 项退避补测 ≤2 轮（保留高置信结果、只重打灰的，对端友好）。受限出口
@@ -714,7 +801,7 @@ impl UnlockRuntime {
                 if timeout_ids.is_empty() {
                     break; // 全部高置信 → 快路径零额外开销
                 }
-                if self.epoch() != epoch0 {
+                if self.epoch() != epoch0 || !sink.is_current() {
                     break; // 本轮已作废 → 下方 bracket 守卫会丢弃
                 }
                 // deadline 判在**发 checking 之前**：跨界就直接停、保留已有 timeout 终态。若先发了 checking
@@ -729,11 +816,13 @@ impl UnlockRuntime {
                     sink.progress(id.as_str(), &UnlockResult::new(UnlockStatus::Checking));
                 }
                 tokio::time::sleep(backoff).await;
-                if self.epoch() != epoch0 {
+                if self.epoch() != epoch0 || !sink.is_current() {
                     break; // 退避期间被 invalidate → 放弃本轮补测
                 }
                 let fresh = run_checkers_budgeted(http, &timeout_ids, deadline, |id, r| {
-                    sink.progress(id, r)
+                    if sink.is_current() {
+                        sink.progress(id, r);
+                    }
                 })
                 .await;
                 for (id, r) in fresh {
@@ -758,16 +847,25 @@ impl UnlockRuntime {
         // ── 归属校验：epoch 变了（并发 invalidate）或出口漂移 → 丢弃，不 commit，广播失效自动重跑 ──
         // **这是「决不把 A 出口的结果标给 B 出口」的门**。
         let epoch_changed = self.epoch() != epoch0;
+        if !sink.is_current() {
+            return UnlockSnapshot::default();
+        }
         if epoch_changed || egress_moved {
             // epoch 变 = 外部真状态变化（起停/切节点），不是漂移 → 连击清零，别让「用户切了三次节点」
             // 被误算成「出口在抖」而错误熔断。
             if epoch_changed {
-                self.drift_streak.store(0, Ordering::SeqCst);
+                // The completed external invalidate already cleared state. Never mutate its successor.
+                return UnlockSnapshot::default();
             }
             // ── 漂移熔断（见 [`MAX_CONSECUTIVE_DRIFT`]）：连续 N 轮纯漂移 → 停止自持循环，落低置信终态 ──
             // 只有「纯漂移」（epoch 未变）才计数：epoch 变那条腿本就有外部触发源，不会自持。
             if egress_moved && !epoch_changed {
-                let streak = self.drift_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut streak = 0;
+                if !self.commit_epoch(sink, epoch0, || {
+                    streak = self.drift_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                }) {
+                    return UnlockSnapshot::default();
+                }
                 if streak >= MAX_CONSECUTIVE_DRIFT {
                     // 真机 logLevel=warn ⇒ warn：这是「为什么徽章突然不转了、且标着低置信」的唯一线索。
                     log::warn!(
@@ -782,9 +880,16 @@ impl UnlockRuntime {
                         not_ready: None,
                         low_confidence: Some(true),
                     };
+                    if self.epoch() != epoch0 || !sink.is_current() {
+                        return UnlockSnapshot::default();
+                    }
                     // 落定即清零：熔断掐断的是自持循环，不是把检测永久闩死。
-                    self.drift_streak.store(0, Ordering::SeqCst);
-                    self.set_last_snapshot(Some(snapshot.clone()));
+                    if !self.commit_epoch(sink, epoch0, || {
+                        self.drift_streak.store(0, Ordering::SeqCst);
+                        self.set_last_snapshot_locked(Some(snapshot.clone()));
+                    }) {
+                        return UnlockSnapshot::default();
+                    }
                     // low_confidence 不入 TTL 缓存（沿用既有规则）→ 下一次真触发即重检。
                     // **必须 emit UPDATED**：这是 UI 脱离「检测中」的唯一出口（丢弃腿本身从不 emit 终态）。
                     sink.updated(&snapshot);
@@ -797,11 +902,10 @@ impl UnlockRuntime {
                 "解锁检测：归属校验失败（epoch 变={epoch_changed}，出口漂移={egress_moved}）→ 丢弃本轮结果，排自跑重测"
             );
             // 保留 `last_run_at`：本轮真跑过整轮网络，force 15s 硬下限必须继续生效（见 `invalidate_keep_run_at`）。
-            self.invalidate_keep_run_at(sink, true, false);
+            self.invalidate_keep_run_at(sink, true, false, epoch0);
             return UnlockSnapshot::default();
         }
         // 归属校验通过 → 本轮出口稳定，漂移连击中断。
-        self.drift_streak.store(0, Ordering::SeqCst);
 
         // ── commit ──
         let egress = egress1.or(Some(egress0));
@@ -820,9 +924,11 @@ impl UnlockRuntime {
             not_ready: None,
             low_confidence: low_confidence.then_some(true),
         };
+        if self.epoch() != epoch0 || !sink.is_current() {
+            return UnlockSnapshot::default();
+        }
 
         // lastSnapshot 恒记（含 lowConfidence，供 S-gate/force-min 读）；TTL `cache` 仅高置信入。
-        self.set_last_snapshot(Some(snapshot.clone()));
         // TTL 挂置信度：含 timeout 且非受限 → 2min；否则（含受限全超）→ 30min（受限不 churn）。
         let ttl = if has_timeout && !restricted {
             TIMEOUT_TTL_MS
@@ -831,8 +937,14 @@ impl UnlockRuntime {
         };
         // low_confidence（全超瞬态、非受限）不写缓存：避免垃圾快照锁 30min（Polaris：未写 egressIp 缓存）。
         // 下一真触发即重检。仍返回 + emit UPDATED（UI 如实显、但不入缓存）。
-        if !low_confidence {
-            self.store(snapshot.clone(), checked_at, ttl);
+        if !self.commit_epoch(sink, epoch0, || {
+            self.drift_streak.store(0, Ordering::SeqCst);
+            self.set_last_snapshot_locked(Some(snapshot.clone()));
+            if !low_confidence {
+                self.store_locked(snapshot.clone(), checked_at, ttl);
+            }
+        }) {
+            return UnlockSnapshot::default();
         }
         // info 级：正常收口。真机 logLevel=warn 看不到本条 —— 刻意如此，「成功落终态」不是排查线索；
         // 排查靠上面那几条 warn（没落终态的路径）+ 「没有 warn」这个事实本身。
@@ -854,14 +966,18 @@ impl UnlockRuntime {
     /// `None`（→ 调用方提交 notReady 终态），不空等。这是 上游「deadline 本身即上限」语义的就绪门那一段：
     /// 默认 10s 预算下累进退避在第 5 攻（累计 11.6s）越界收口，故 schedule 末段 +4/+8s 尾在默认预算下不可达，
     /// 仅作 headroom 供预算调大时启用。
-    async fn probe_ready<H: UnlockHttp + ?Sized>(
+    async fn probe_ready<H: UnlockHttp + ?Sized, S: UnlockEventSink>(
         &self,
         http: &H,
+        sink: &S,
         epoch0: u64,
         deadline: tokio::time::Instant,
     ) -> Option<UnlockEgress> {
         let mut ever_failed = false; // 是否曾有一攻失败（触发 B1 确认，疑似 flap）
         for attempt in 0..READINESS_MAX_ATTEMPTS {
+            if self.epoch() != epoch0 || !sink.is_current() {
+                return None;
+            }
             if attempt > 0 {
                 let backoff = Duration::from_millis(
                     READINESS_BACKOFF_SCHEDULE_MS
@@ -874,7 +990,7 @@ impl UnlockRuntime {
                     return None;
                 }
                 tokio::time::sleep(backoff).await;
-                if self.epoch() != epoch0 {
+                if self.epoch() != epoch0 || !sink.is_current() {
                     return None; // 退避期间被 invalidate → 放弃本轮
                 }
             }
@@ -882,7 +998,7 @@ impl UnlockRuntime {
                 return None; // 预算耗尽
             }
             let egress = probe_with_deadline(http, deadline).await;
-            if self.epoch() != epoch0 {
+            if self.epoch() != epoch0 || !sink.is_current() {
                 return None; // 探测期间被 invalidate → 放弃本轮
             }
             match egress {
@@ -897,11 +1013,11 @@ impl UnlockRuntime {
                         return Some(e);
                     }
                     tokio::time::sleep(confirm_gap).await;
-                    if self.epoch() != epoch0 {
+                    if self.epoch() != epoch0 || !sink.is_current() {
                         return None;
                     }
                     let confirm = probe_with_deadline(http, deadline).await;
-                    if self.epoch() != epoch0 {
+                    if self.epoch() != epoch0 || !sink.is_current() {
                         return None;
                     }
                     if confirm.is_some() {
@@ -934,8 +1050,14 @@ impl UnlockRuntime {
         // item 7 单飞：与 run 共用锁——补测不与并发 run 抢网络（command 层在 run 完成后 5s spawn 本腿，
         // 正常已无竞争；持锁兜并发触发面）。
         let _run_guard = self.run_lock.lock().await;
+        if self.epoch() != epoch0 || !sink.is_current() {
+            return false;
+        }
         // 取当前缓存快照 + 其 timeout 服务集（快照可能已被 invalidate 清空 → no-op）。
         let (mut snapshot, timeout_ids) = {
+            let Ok(_commit) = self.commit_lock.lock() else {
+                return false;
+            };
             let guard = match self.cache.lock() {
                 Ok(g) => g,
                 Err(_) => return false,
@@ -968,15 +1090,17 @@ impl UnlockRuntime {
         let fresh = run_checkers_budgeted(http, &timeout_ids, deadline, |_, _| {}).await;
 
         // epoch 守卫：补测期间有 invalidate → 丢弃（归属 bracket 的补测腿），一个 emit 都不发。
-        if self.epoch() != epoch0 {
+        if self.epoch() != epoch0 || !sink.is_current() {
             return false;
         }
 
         for (id, result) in &fresh {
-            sink.progress(id, result);
             snapshot.results.insert(id.clone(), result.clone());
         }
         let t = now();
+        if self.epoch() != epoch0 || !sink.is_current() {
+            return false;
+        }
         snapshot.checked_at = Some(t);
         let has_timeout = snapshot
             .results
@@ -991,8 +1115,15 @@ impl UnlockRuntime {
         };
         // lastSnapshot 同步（补测复过的 timeout 已是可信终态，供 S-gate/force-min）；TTL cache 恒写（含 timeout
         // 由 R3 短 TTL 兜底，2min 后可再自然重检）。
-        self.set_last_snapshot(Some(snapshot.clone()));
-        self.store(snapshot.clone(), t, ttl);
+        if !self.commit_epoch(sink, epoch0, || {
+            self.set_last_snapshot_locked(Some(snapshot.clone()));
+            self.store_locked(snapshot.clone(), t, ttl);
+        }) {
+            return false;
+        }
+        for (id, result) in &fresh {
+            sink.progress(id, result);
+        }
         sink.updated(&snapshot);
         true
     }

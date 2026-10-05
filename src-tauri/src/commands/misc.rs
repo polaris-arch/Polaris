@@ -16,6 +16,7 @@ pub use dashboard::{
     get_singbox_dashboard_connection, open_singbox_dashboard, refresh_singbox_dashboard,
 };
 pub use ipinfo::ipinfo_get;
+pub(super) use ipinfo::run_bound_ipinfo;
 pub use ipinfo::IPINFO_SETTLE_DELAY_MS;
 pub(crate) use ipinfo::{
     ipinfo_probe_is_current, mark_ipinfo_proxy_blocked, schedule_ipinfo_refresh,

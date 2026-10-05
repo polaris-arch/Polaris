@@ -1,4 +1,408 @@
 use super::*;
+use polaris_core_supervisor::{PortAllocator, PortExclusions};
+use polaris_singbox_grpc::tonic;
+use tonic::codegen::{http, Body as HttpBody, BoxFuture, Service};
+
+struct PrimaryApiCandidates(Mutex<std::collections::VecDeque<Option<u16>>>);
+
+impl PrimaryApiCandidates {
+    fn new(ports: impl IntoIterator<Item = Option<u16>>) -> Self {
+        Self(Mutex::new(ports.into_iter().collect()))
+    }
+}
+
+impl polaris_core_supervisor::port_bookkeeping::FreePortProvider for PrimaryApiCandidates {
+    fn try_allocate(&self) -> Option<u16> {
+        self.0.lock().unwrap().pop_front().flatten()
+    }
+}
+
+#[test]
+fn primary_api_startup_retires_candidates_fallback_and_exhaustion_on_all_platforms() {
+    use polaris_core_supervisor::port_bookkeeping::PrimaryApiPortLedger;
+    let body = method_body(
+        &crate::test_support::crate_code("runtime/proxy/startup.rs"),
+        "    pub(super) fn resolve_start_ports(",
+    );
+    assert!(body.contains("static USED_PRIMARY_API_PORTS: OnceLock<PrimaryApiPortLedger>"));
+    assert!(body.contains("allocate_primary_api_port("));
+    assert!(
+        !body.contains("cfg("),
+        "retirement must apply to every platform"
+    );
+    assert!(!body.contains("resolve_tailscale_api_port("));
+
+    let ledger = PrimaryApiPortLedger::default();
+    let excluded = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let allocator = PortAllocator::new(PrimaryApiCandidates::new([
+        Some(20_001),
+        Some(20_001),
+        Some(20_002),
+    ]));
+    assert_eq!(
+        allocate_primary_api_port(&ledger, &allocator, &excluded)
+            .unwrap()
+            .port,
+        20_001
+    );
+    assert_eq!(
+        allocate_primary_api_port(&ledger, &allocator, &excluded)
+            .unwrap()
+            .port,
+        20_002
+    );
+    let fallback = allocate_primary_api_port(&ledger, &allocator, &excluded).unwrap();
+    assert_eq!(fallback.port, 9091);
+    assert!(fallback.used_fallback);
+    let error = allocate_primary_api_port(&ledger, &allocator, &excluded).unwrap_err();
+    assert_eq!(error, "管理 API 端口已耗尽；请完全退出应用后重试");
+    assert!(allocate_primary_api_port(&ledger, &allocator, &excluded).is_err());
+}
+
+// This mock records the actual h2c SelectOutbound request at the receiving endpoint.
+// It uses the existing tonic re-export and reqwest body, without another dependency.
+type SelectorRpcCalls = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+#[derive(Clone)]
+struct SelectorRpcWitness {
+    secret: String,
+    calls: SelectorRpcCalls,
+}
+
+impl tonic::server::NamedService for SelectorRpcWitness {
+    const NAME: &'static str = "daemon.StartedService";
+}
+
+impl Service<http::Request<tonic::body::Body>> for SelectorRpcWitness {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        let witness = self.clone();
+        Box::pin(async move {
+            let authenticated = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                == Some(format!("Bearer {}", witness.secret).as_str());
+            let path = request.uri().path().to_owned();
+            let mut body = request.into_body();
+            let mut bytes = Vec::new();
+            let received = matches!(
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while let Some(frame) =
+                        futures::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+                            .await
+                    {
+                        let frame = frame.map_err(|_| ())?;
+                        if let Ok(data) = frame.into_data() {
+                            bytes.extend_from_slice(&data);
+                        }
+                    }
+                    Ok::<_, ()>(())
+                })
+                .await,
+                Ok(Ok(()))
+            );
+            let status = if !authenticated {
+                "16"
+            } else if !received {
+                "4"
+            } else {
+                "0"
+            };
+            if authenticated && received && path == "/daemon.StartedService/SelectOutbound" {
+                witness.calls.lock().unwrap().push((witness.secret, bytes));
+            }
+            // Empty protobuf is a valid Empty or default ClashModeStatus message.
+            Ok(http::Response::builder()
+                .header("content-type", "application/grpc")
+                .header("grpc-status", status)
+                .body(tonic::body::Body::new(reqwest::Body::from(vec![0u8; 5])))
+                .unwrap())
+        })
+    }
+}
+
+struct SelectorRpcServer(tokio::task::JoinHandle<()>);
+
+impl SelectorRpcServer {
+    async fn start(
+        listener: tokio::net::TcpListener,
+        secret: &str,
+        calls: SelectorRpcCalls,
+    ) -> Self {
+        let incoming = tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let service = SelectorRpcWitness {
+            secret: secret.into(),
+            calls,
+        };
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let server = tonic::transport::Server::builder();
+            let _ = ready.send(());
+            server.serve_with_incoming(service, incoming).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        Self(task)
+    }
+
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for SelectorRpcServer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+async fn ticket_at_mock_rpc(runtime: &Arc<ProxyRuntime>, port: u16) -> (ReadyMainTicket, Value) {
+    let saved = runtime.config.current().unwrap();
+    let effective: UserConfig = serde_json::from_value(saved.clone()).unwrap();
+    let deps = runtime.generate_deps(port, 0, 0, None, &[20_010], &saved, false);
+    let emitted = polaris_config_engine::builder::generate_sing_box_config(
+        &effective,
+        &BTreeMap::new(),
+        &deps,
+    )
+    .unwrap();
+    *runtime.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+        &effective, &emitted, &deps,
+    ));
+    let status = ProxyStatus {
+        running: true,
+        clash_api_port: port,
+        ..Default::default()
+    };
+    *runtime.status.write().unwrap() = status.clone();
+    let emitted = serde_json::to_value(emitted).unwrap();
+    runtime
+        .capture_ready_main(
+            runtime.core_generation(),
+            &saved,
+            &effective,
+            &emitted,
+            &status,
+        )
+        .unwrap();
+    assert!(runtime.publish_committed_ready_main(runtime.core_generation(), || {}));
+    let binding = ActionBinding::new(
+        NormalMainAction::ManualSpeedTest,
+        "mock-rpc".into(),
+        &saved,
+        vec!["node-a".into(), "node-b".into()],
+        None,
+    )
+    .unwrap();
+    let ticket = tokio::time::timeout(Duration::from_secs(2), runtime.await_normal_main(binding))
+        .await
+        .unwrap()
+        .unwrap();
+    (ticket, emitted)
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn primary_api_fallback_is_emitted_and_captured_in_ready_ticket_mock_rpc() {
+    use polaris_core_supervisor::port_bookkeeping::PrimaryApiPortLedger;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ledger = PrimaryApiPortLedger::default();
+    let allocator = PortAllocator::new(PrimaryApiCandidates::new([]));
+    let exclusions = PortExclusions::for_primary_api(Some(port - 1), None, None, None);
+    let fallback = allocate_primary_api_port(&ledger, &allocator, &exclusions).unwrap();
+    assert!(fallback.used_fallback);
+    assert_eq!(fallback.port, port);
+    let _server =
+        SelectorRpcServer::start(listener, "saved-secret", SelectorRpcCalls::default()).await;
+    let (runtime, _directory) = test_runtime();
+    let mut saved = two_node_config(7890, "node-a");
+    saved["clashApiSecret"] = serde_json::json!("saved-secret");
+    runtime.config.save_full(&saved).unwrap();
+    let (ticket, emitted) = ticket_at_mock_rpc(&runtime, fallback.port).await;
+    let api = emitted["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|service| service["type"] == "api")
+        .unwrap();
+    assert_eq!(api["listen_port"], port);
+    assert_eq!(api["secret"], ticket.api_secret());
+    assert_eq!(ticket.api_port(), port);
+    assert!(allocate_primary_api_port(&ledger, &allocator, &exclusions).is_err());
+}
+
+struct PausedSelectorRpc {
+    api: crate::runtime::management_api::GrpcManagementApi,
+    before_rpc: Arc<tokio::sync::Barrier>,
+    resume_rpc: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl polaris_switch_engine::ManagementApi for PausedSelectorRpc {
+    async fn select_outbound(
+        &self,
+        selector: &str,
+        member: &str,
+    ) -> Result<(), polaris_switch_engine::ManagementError> {
+        self.before_rpc.wait().await;
+        self.resume_rpc.wait().await;
+        self.api.select_outbound(selector, member).await
+    }
+    async fn close_connection(
+        &self,
+        _: &str,
+    ) -> Result<(), polaris_switch_engine::ManagementError> {
+        panic!("selector witness must not close connections")
+    }
+    async fn first_connection_snapshot(
+        &self,
+    ) -> Result<
+        Vec<polaris_switch_engine::ConnectionSnapshot>,
+        polaris_switch_engine::ManagementError,
+    > {
+        panic!("selector witness must not query connections")
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn retired_primary_api_mock_rpc_witness_blocks_lazy_selector_from_successor() {
+    use polaris_core_supervisor::port_bookkeeping::PrimaryApiPortLedger;
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    let port_b = listener_b.local_addr().unwrap().port();
+    let allocator = PortAllocator::new(PrimaryApiCandidates::new([
+        Some(port_a),
+        Some(port_a),
+        Some(port_b),
+    ]));
+    let ledger = PrimaryApiPortLedger::default();
+    let exclusions = PortExclusions::default();
+    assert_eq!(
+        allocate_primary_api_port(&ledger, &allocator, &exclusions)
+            .unwrap()
+            .port,
+        port_a
+    );
+    let writes_a = SelectorRpcCalls::default();
+    let writes_b = SelectorRpcCalls::default();
+    let server_a = SelectorRpcServer::start(listener_a, "saved-secret", writes_a.clone()).await;
+    let (runtime, _directory) = test_runtime();
+    let mut saved = two_node_config(7890, "node-a");
+    saved["clashApiSecret"] = serde_json::json!("saved-secret");
+    runtime.config.save_full(&saved).unwrap();
+    let (ticket_a, _) = ticket_at_mock_rpc(&runtime, port_a).await;
+    let alias_control = ProxyRuntime::management_api_at(port_a, "saved-secret".into()).await;
+    let before_rpc = Arc::new(tokio::sync::Barrier::new(2));
+    let resume_rpc = Arc::new(tokio::sync::Barrier::new(2));
+    let mut stale = tokio::task::JoinSet::new();
+    {
+        let runtime = runtime.clone();
+        let before_rpc = before_rpc.clone();
+        let resume_rpc = resume_rpc.clone();
+        stale.spawn(async move {
+            super::super::prerequisite::select_ticket_probe(
+                &ticket_a,
+                0,
+                "Node A",
+                || runtime.check_ready_main(&ticket_a).is_ok(),
+                |port, secret| async move {
+                    PausedSelectorRpc {
+                        api: ProxyRuntime::management_api_at(port, secret).await,
+                        before_rpc,
+                        resume_rpc,
+                    }
+                },
+            )
+            .await
+        });
+    }
+    // Both producer checks passed, but the real lazy channel has not sent a selector RPC.
+    tokio::time::timeout(Duration::from_secs(2), before_rpc.wait())
+        .await
+        .unwrap();
+    assert!(writes_a.lock().unwrap().is_empty());
+    server_a.stop().await;
+    runtime.gate.bump_generation();
+    let successor = allocate_primary_api_port(&ledger, &allocator, &exclusions)
+        .unwrap()
+        .port;
+    assert_eq!(
+        successor, port_b,
+        "the same-port successor candidate must be rejected"
+    );
+    let _server_b = SelectorRpcServer::start(listener_b, "saved-secret", writes_b.clone()).await;
+    let (ticket_b, _) = ticket_at_mock_rpc(&runtime, successor).await;
+    assert_eq!(ticket_b.api_secret(), "saved-secret");
+    tokio::time::timeout(Duration::from_secs(2), resume_rpc.wait())
+        .await
+        .unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(2), stale.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    assert!(
+        writes_b.lock().unwrap().is_empty(),
+        "an obsolete lazy RPC must never mutate successor B"
+    );
+    assert!(tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.probe_select_slot_bound(&ticket_b, 0, "Node B")
+    )
+    .await
+    .unwrap());
+    {
+        let calls = writes_b.lock().unwrap();
+        assert_eq!(calls.len(), 1, "the current selector must remain usable");
+        assert_eq!(calls[0].0, "saved-secret");
+        assert!(calls[0]
+            .1
+            .windows(b"probe-selector-0".len())
+            .any(|bytes| bytes == b"probe-selector-0"));
+        assert!(calls[0]
+            .1
+            .windows(b"Node B".len())
+            .any(|bytes| bytes == b"Node B"));
+    }
+
+    // Negative control: deliberately violate the production retirement rule. The
+    // same pre-Stop lazy transport must now reach a new owner on that same port
+    // with the same saved secret, proving this witness models address ownership.
+    let alias_listener = tokio::net::TcpListener::bind(("127.0.0.1", port_a))
+        .await
+        .unwrap();
+    let alias_writes = SelectorRpcCalls::default();
+    let _alias_server =
+        SelectorRpcServer::start(alias_listener, "saved-secret", alias_writes.clone()).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        alias_control.select_outbound("probe-selector-0", "Node A"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(alias_writes.lock().unwrap().len(), 1);
+}
 
 /// **R4 就绪门参数钉死**：轮询间隔调细的同时，**等待预算的下限一格都不许缩**。
 ///
@@ -664,6 +1068,39 @@ async fn helper_gate_suppression_scopes_nest() {
     );
 }
 
+/// A shared producer outlives its registering caller's task-local scope. Joining it from an
+/// interactive caller must not authorize a prompt that the original request suppressed.
+#[tokio::test]
+async fn normal_producer_keeps_suppression_after_caller_scope_and_interactive_join() {
+    let (rt, _dir, calls) = test_runtime_gated(HelperGateDecision::Abort);
+    let mut producer =
+        with_helper_gate_suppressed(async { rt.normal_start_completion(tun_config()).unwrap() })
+            .await;
+    assert!(
+        helper_gate_interactive(),
+        "the caller's suppression scope ended"
+    );
+    let joined = rt.normal_start_completion(tun_config()).unwrap();
+    assert!(producer.same_channel(&joined));
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let state = producer.borrow_and_update().clone();
+            if let super::super::prerequisite::NormalStartCompletion::Finished(result, _) = state {
+                break result;
+            }
+            producer.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the mock helper producer must complete");
+    assert_eq!(result.unwrap_err().code, Some(code::HELPER_NOT_INSTALLED));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let explicit = rt.start(tun_config()).await.unwrap_err();
+    assert_eq!(explicit.code, Some(code::HELPER_GATE_ABORTED));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 /// **A1：陈旧全局错误码不得污染下一次失败的分类。**
 ///
 /// 真机复现路径：TUN + helper 未装 → 点连接 → 门弹出 → 取消 ⇒ 全局 `error_code` 留下
@@ -1284,7 +1721,7 @@ async fn start_lands_custom_rule_files_before_generate() {
 fn public_start_arms_network_settle_before_any_await() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub(super) async fn start_guarded(",
+        "    pub(super) async fn start_guarded_with_completion(",
     );
     let arm = body
         .find("let _network_settle = self.network_settle.begin(\"proxy-start\")")

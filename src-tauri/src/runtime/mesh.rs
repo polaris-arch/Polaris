@@ -606,6 +606,38 @@ impl MeshRuntime {
             .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "normal login retains the frozen saved-config and epoch binding"
+    )]
+    pub async fn start_tailscale_login_with_normal_main(
+        &self,
+        app: AppHandle,
+        server: &ServerConfig,
+        request: crate::runtime::tailscale_login_core::LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> crate::runtime::tailscale_login_core::MainLoginSnapshot
+              + Send
+              + Sync),
+        proxy: &Arc<crate::runtime::proxy::ProxyRuntime>,
+        saved: &serde_json::Value,
+        identity_epoch: Option<String>,
+    ) -> StartLoginOutcome {
+        self.login_registry
+            .start_attempt_with_normal_main(
+                server,
+                &self.config_dir,
+                request,
+                saved_server,
+                main_core,
+                Arc::new(AppHandleEmitter { app }),
+                proxy,
+                saved,
+                identity_epoch,
+            )
+            .await
+    }
+
     pub async fn cancel_tailscale_login_attempt(
         &self,
         server_id: &str,

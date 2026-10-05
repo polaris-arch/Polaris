@@ -2026,8 +2026,8 @@
     "errUnknown": "Не удалось выполнить операцию."
   },
   "ts": {
-    "iosAccountActionsUnavailable": "iOS does not yet support separate login sessions, switching accounts, or logout. You can save node settings and an Auth Key; authorization uses a login URL returned by the main VPN.",
-    "iosConfigurationSaved": "Settings saved; login has not been confirmed. Connect or reconnect the main VPN from Home. Saving a new Auth Key does not clear an existing account session.",
+    "identityRetirementRequired": "Замена Auth Key требует безопасного удаления прежней личности. На iOS это пока недоступно.",
+    "iosAccountActionsUnavailable": "iOS пока не поддерживает безопасное удаление прежней личности, смену учётной записи или выход. Первый вход использует обычное подключение VPN.",
     "acceptDefaultResolvers": "Принимать DNS-резолверы tailnet по умолчанию",
     "acceptDefaultResolversHint": "Дополнительно принимать DNS-резолверы, раздаваемые tailnet (split-DNS). Необязательно.",
     "acceptRoutes": "Принимать маршруты подсетей",
@@ -2141,10 +2141,8 @@
     "loginAttemptFailed": "Ошибка этого запроса на вход. Повторите попытку.",
     "loginCancelFailed": "Не удалось отменить вход. Повторите попытку.",
     "loginSubmitted": "Запрос на вход отправлен. Дождитесь завершения авторизации.",
-    "loginMainCoreStatus": "Проверка авторизации этого узла в основном подключении.",
     "loginMainCoreAuthorized": "Этот узел авторизован в основном подключении; новые сохранённые настройки авторизации могут ещё требовать применения.",
     "loginMainCoreAwaiting": "Узлу нужна авторизация. Получение адреса страницы входа…",
-    "loginMainCoreUnknown": "Авторизация этого узла в основном подключении пока не подтверждена. Повторите проверку.",
     "loginUrlTimeout": "Истекло время получения адреса страницы входа. Повторите попытку.",
     "loginSessionReadFailed": "Не удалось проверить предыдущий сеанс. Новая авторизация не запущена. Повторите попытку.",
     "loginProgressReadFailed": "Пока не удалось проверить результат этой авторизации. Она может ещё выполняться; при возврате в приложение проверка повторится.",
@@ -2970,5 +2968,17 @@
       "other": "Других сведений пока нет."
     },
     "legacy": "Эта версия не даёт проверяемого отчёта о владельцах маршрутов."
+  },
+  "prerequisite": {
+    "preparingConnection": "Подготовка подключения прокси. Подтвердите системный запрос разрешения.",
+    "waitingForReady": "Ожидание готовности прокси…",
+    "foregroundRequired": "Вернитесь в приложение и повторите попытку.",
+    "permissionDenied": "Разрешение VPN отклонено. Повторите попытку и разрешите системный запрос.",
+    "readyUnknown": "Готовность подключения не подтверждена. Проверьте подключение и повторите попытку.",
+    "cancelled": "Действие отменено. Можно повторить попытку.",
+    "cancelFailed": "Не удалось отменить действие. Повторите попытку.",
+    "saveConfiguration": "Сначала сохраните настройки и повторите попытку.",
+    "ipInfoFailed": "Не удалось обновить сведения об IP. Повторите проверку сети.",
+    "unlockFailed": "Не удалось проверить доступность сервисов. Повторите проверку сети."
   }
 }

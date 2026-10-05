@@ -590,6 +590,12 @@ describe('④ 写失败必有可见回显（IA 裁定 #14）', () => {
     );
   });
 
+  it('手动准备失败仅按稳定 code 本地化，不显示后台诊断', () => {
+    expect(writeFailureText(t as never, { code: 'IOS_VPN_PERMISSION_DENIED', message: 'private endpoint' })).toBe('prerequisite.permissionDenied');
+    expect(writeFailureText(t as never, { code: 'readyUnknown', message: 'private endpoint' })).toBe('prerequisite.readyUnknown');
+    expect(writeFailureText(t as never, { code: 'unknown', message: 'private endpoint' })).toBe('errors.operationFailed');
+  });
+
   it('每一颗登记的控件都渲染得出来，且它的错误与它**同处一张卡**', () => {
     for (const id of WRITE_CONTROLS) {
       const html = render({

@@ -31,6 +31,15 @@ const t = ((key: string, opts?: unknown) => {
 }) as unknown as TFunction;
 
 describe('speedTestErrorMessage', () => {
+  it.each([
+    ['IOS_FOREGROUND_REQUIRED', 'prerequisite.foregroundRequired'],
+    ['IOS_VPN_PERMISSION_DENIED', 'prerequisite.permissionDenied'],
+    ['readyUnknown', 'prerequisite.readyUnknown'],
+    ['cancelled', 'prerequisite.cancelled'],
+    ['configurationPending', 'prerequisite.saveConfiguration'],
+  ])('preparation %s gives an actionable localized reason', (code, key) => {
+    expect(speedTestErrorMessage(new IpcError('server_speed_test', 'private diagnostics', code), t)).toBe(key);
+  });
   it('容量拒绝提示完整重启应用，raw 相同文案仍走旧错误类别', () => {
     expect(speedTestErrorMessage(new IpcError('server_speed_test', 'private', 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED'), t)).toBe('errors.androidNativeCapacityClosed');
     expect(speedTestErrorMessage(new IpcError('server_speed_test', 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', 'SPEEDTEST_TEMP_CORE_FAILED'), t)).toBe('nodes.speedTestInterrupted');

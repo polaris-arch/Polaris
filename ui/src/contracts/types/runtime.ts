@@ -9,6 +9,8 @@ import type { LogLevel } from '../types';
  */
 export interface ProxyStatus {
   running: boolean;
+  /** Shared lifecycle generation from getStatus; used to reject results from a replaced main. */
+  mainGeneration?: number;
   pid?: number;
   /** 起核**就绪**时刻（epoch ms；未运行则缺省）。运行时长的唯一真值 —— 要让时长自己走字，
    *  用它在渲染端本地 tick，别依赖 `uptime`（理由见该字段）。 */
@@ -55,6 +57,8 @@ export interface ProxyStatus {
 
 export enum ProxyErrorCode {
   IOS_SESSION_ACTIVE = 'IOS_SESSION_ACTIVE',
+  IOS_FOREGROUND_REQUIRED = 'IOS_FOREGROUND_REQUIRED',
+  IOS_VPN_PERMISSION_DENIED = 'IOS_VPN_PERMISSION_DENIED',
   // 连接类 → ErrorCategory.Connection
   DEST_CONNECTION_REFUSED = 'DEST_CONNECTION_REFUSED', // 'report handshake success: connection refused'
   CONNECTION_REFUSED = 'CONNECTION_REFUSED', // 'connection refused'

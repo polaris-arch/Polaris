@@ -1,7 +1,7 @@
 import type { TFunction } from 'i18next';
 import type { ServerConfig } from '@/contracts/types';
 import type { SpeedTestInvokeResult } from '@/contracts/speed-test';
-import { speedTestableIds } from '@/domain/endpoint-routes';
+import { manualSpeedTestCaps, speedTestableIds } from '@/domain/endpoint-routes';
 import { stagedOnlyIds } from '@/lib/staged-config';
 import { notInPoolMessage } from '@/components/screens/shared/speedtest-feedback';
 
@@ -13,7 +13,7 @@ export function planAllHomeSpeedTest(
 ): string[] {
   return speedTestableIds(
     servers,
-    { mainCorePool },
+    manualSpeedTestCaps(mainCorePool),
     stagedOnlyIds(servers, diskServers),
   );
 }

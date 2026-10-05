@@ -1684,6 +1684,29 @@ impl ConfigManager {
         Ok(f(&cfg))
     }
 
+    /// Warm saved-state commit fence. This shares the real writer mutex, never loads or
+    /// migrates from disk, and fails immediately while a writer is active. The callback
+    /// must only commit memory and must not reenter configuration or emit events.
+    pub(crate) fn try_with_saved_commit<T>(
+        &self,
+        commit: impl FnOnce(&Value) -> T,
+    ) -> Result<T, StoreError> {
+        deny_inside_projection("try_with_saved_commit");
+        let _writer = self
+            .write_lock
+            .try_lock()
+            .map_err(|_| StoreError::validation("saved commit unavailable"))?;
+        let cache = self
+            .cache
+            .try_read()
+            .map_err(|_| StoreError::validation("saved commit unavailable"))?;
+        let saved = cache
+            .as_ref()
+            .ok_or_else(|| StoreError::validation("saved commit unavailable"))?;
+        let _probe = ReentrancyProbe::enter();
+        Ok(commit(saved))
+    }
+
     /// 保存配置（再跑 sanitize+validate + 原子写）+ 刷缓存。上游 `saveConfig`。
     ///
     /// 顺带在此唯一汇流点做**图标缓存驱逐 reconcile**：diff 旧/新 `customAppPresets` 的 id 集，

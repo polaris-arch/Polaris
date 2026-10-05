@@ -2351,8 +2351,8 @@
     "errUnknown": "操作失败。"
   },
   "ts": {
-    "iosAccountActionsUnavailable": "iOS 暂不支持独立登录会话、切换账户或退出登录。可保存节点配置和 Auth Key；授权使用主 VPN 返回的登录地址。",
-    "iosConfigurationSaved": "配置已保存，尚未确认登录。请在首页连接或重新连接主 VPN；保存新 Auth Key 不会清除已有账户会话。",
+    "identityRetirementRequired": "更换 Auth Key 前需安全清理已有身份；iOS 暂不支持此操作。",
+    "iosAccountActionsUnavailable": "iOS 暂不支持安全清理已有身份、切换账户或退出登录。首次登录会通过正常 VPN 连接完成授权。",
     "acceptDefaultResolvers": "接受 tailnet 默认解析器",
     "acceptDefaultResolversHint": "额外接受 tailnet 下发的默认 DNS 解析器（split-DNS）。可选。",
     "acceptRoutes": "接受子网路由",
@@ -2466,10 +2466,8 @@
     "loginAttemptFailed": "本次登录请求失败。请重试。",
     "loginCancelFailed": "取消登录失败，请重试。",
     "loginSubmitted": "已提交登录请求。请等待授权完成。",
-    "loginMainCoreStatus": "正在读取主连接中该节点的授权状态。",
     "loginMainCoreAuthorized": "主连接中的该节点已授权；这不代表新保存的认证设置已生效。",
     "loginMainCoreAwaiting": "该节点需要授权。正在获取登录页地址…",
-    "loginMainCoreUnknown": "尚无法确认主连接中该节点的授权状态，可重试读取。",
     "loginUrlTimeout": "获取登录页地址超时。请重试。",
     "loginSessionReadFailed": "无法读取旧登录会话，未发起新的授权。请重试。",
     "loginProgressReadFailed": "暂时无法核对本次授权结果。授权可能仍在进行；返回应用时会重试。",
@@ -2970,5 +2968,17 @@
       "other": "其他证据暂不可用。"
     },
     "legacy": "当前版本无法提供可核实的路由归属报告。"
+  },
+  "prerequisite": {
+    "preparingConnection": "正在准备代理连接，请完成系统授权。",
+    "waitingForReady": "等待代理就绪…",
+    "foregroundRequired": "请返回应用前台后重试。",
+    "permissionDenied": "VPN 授权未获允许，请重试并允许系统请求。",
+    "readyUnknown": "无法确认连接已就绪，请检查连接后重试。",
+    "cancelled": "本次操作已取消，可重试。",
+    "cancelFailed": "未能取消这次操作，请重试。",
+    "saveConfiguration": "请先保存配置，再重试。",
+    "ipInfoFailed": "IP 信息未能刷新，请重试网络检测。",
+    "unlockFailed": "服务可用性未能检测，请重试网络检测。"
   }
 }

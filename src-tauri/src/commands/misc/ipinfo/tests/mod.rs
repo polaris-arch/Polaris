@@ -1,4 +1,142 @@
 use super::*;
+#[cfg(not(target_os = "ios"))]
+use std::sync::Arc;
+
+struct BoundIpTestGuard(std::sync::Mutex<Option<&'static str>>);
+#[async_trait::async_trait]
+impl ManualBindingGuard for BoundIpTestGuard {
+    fn check(&self) -> Result<(), ManualCheckFailure> {
+        self.0
+            .lock()
+            .unwrap()
+            .map_or(Ok(()), |code| Err(ManualCheckFailure::new(code)))
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+struct ProducerIpCommitGuard {
+    proxy: Arc<crate::runtime::proxy::ProxyRuntime>,
+    ticket: crate::runtime::proxy::ReadyMainTicket,
+    checked: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(not(target_os = "ios"))]
+#[async_trait::async_trait]
+impl ManualBindingGuard for ProducerIpCommitGuard {
+    fn check(&self) -> Result<(), ManualCheckFailure> {
+        self.proxy
+            .check_ready_main(&self.ticket)
+            .map_err(ManualCheckFailure::from)
+    }
+    fn commit<T>(
+        &self,
+        commit: impl FnOnce() -> Result<T, ManualCheckFailure>,
+    ) -> Result<T, ManualCheckFailure> {
+        self.check()?;
+        self.checked.wait();
+        self.resume.wait();
+        self.proxy
+            .with_ready_main_commit(&self.ticket, commit)
+            .map_err(ManualCheckFailure::from)?
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+#[test]
+fn actual_saved_writer_between_last_ticket_check_and_ip_publish_rejects() {
+    let (proxy, ticket, _directory) =
+        crate::runtime::proxy::ProxyRuntime::ready_commit_fixture_for_test();
+    let guard = Arc::new(ProducerIpCommitGuard {
+        proxy: Arc::clone(&proxy),
+        ticket,
+        checked: std::sync::Barrier::new(2),
+        resume: std::sync::Barrier::new(2),
+    });
+    let publishing = Arc::clone(&guard);
+    let publish = std::thread::spawn(move || {
+        commit_bound_ipinfo(
+            &*publishing,
+            &json!({"proxy":{"ip":"stale-config-commit-test"}}),
+        )
+    });
+    guard.checked.wait();
+    let before = proxy.config_for_commit_test().current().unwrap();
+    let mut next = before.clone();
+    next["logLevel"] = json!("debug");
+    proxy
+        .config_for_commit_test()
+        .save_full_deferred_cleanup(&before, &next)
+        .unwrap();
+    guard.resume.wait();
+    assert_eq!(
+        publish.join().unwrap().unwrap_err().code,
+        "configurationPending"
+    );
+    assert_ne!(
+        peek_ipinfo_snapshot()["proxy"]["ip"],
+        "stale-config-commit-test"
+    );
+}
+
+#[tokio::test]
+async fn bound_manual_ip_round_keeps_direct_and_proxy_results_distinct() {
+    let guard = BoundIpTestGuard(std::sync::Mutex::new(None));
+    let result = bound_ipinfo_round(
+        &guard,
+        || async { Ok(json!({"ip":"1.1.1.1"})) },
+        || async { Ok(json!({"ip":"9.9.9.9"})) },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["direct"]["ip"], "1.1.1.1");
+    assert_eq!(result["proxy"]["ip"], "9.9.9.9");
+    assert_eq!(result["proxyReachability"], "reachable");
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_pinned_proxy_never_falls_back_to_the_direct_result() {
+    let guard = BoundIpTestGuard(std::sync::Mutex::new(None));
+    let result = bound_ipinfo_round(
+        &guard,
+        || async { Ok(json!({"ip":"1.1.1.1"})) },
+        || async { Err("private proxy diagnostic".into()) },
+    )
+    .await;
+    let result = result.unwrap();
+    assert_eq!(result["direct"]["ip"], "1.1.1.1");
+    assert!(result["proxy"].is_null());
+    assert_eq!(result["proxyReachability"], "unreachable");
+    assert_eq!(result["error"], "ipInfoFailed");
+}
+
+#[tokio::test]
+async fn stop_or_configuration_change_between_ip_legs_prevents_proxy_io() {
+    for code in ["superseded", "configurationPending"] {
+        let guard = BoundIpTestGuard(std::sync::Mutex::new(None));
+        let proxy_calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = bound_ipinfo_round(
+            &guard,
+            || async {
+                *guard.0.lock().unwrap() = Some(code);
+                Ok(json!({"ip":"1.1.1.1"}))
+            },
+            || async {
+                proxy_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ip":"9.9.9.9"}))
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code, code);
+        assert_eq!(proxy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            commit_bound_ipinfo(&guard, &json!({"proxy":{"ip":"old"}}))
+                .unwrap_err()
+                .code,
+            code
+        );
+    }
+}
 
 #[test]
 fn running_probe_attributes_warm_rtt_to_runtime_exit_not_saved_selection() {
