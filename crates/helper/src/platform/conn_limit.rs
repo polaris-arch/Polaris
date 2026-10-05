@@ -49,7 +49,7 @@ impl ConnLimiter {
     /// 而阻塞 accept 会让合法客户端也连不上。
     pub fn try_acquire(self: &Arc<Self>) -> Option<ConnPermit> {
         self.live
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.max).then_some(n + 1)
             })
             .ok()?;

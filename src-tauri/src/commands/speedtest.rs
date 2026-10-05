@@ -240,7 +240,7 @@ static SPEED_TEST_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn next_speed_test_run_id(sequence: &AtomicU64) -> Option<String> {
     sequence
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             value.checked_add(1)
         })
         .ok()
