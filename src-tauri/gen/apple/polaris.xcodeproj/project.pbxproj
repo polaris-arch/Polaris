@@ -14,6 +14,7 @@
 		43F1B7FC779C4E8E15AAE78F /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36EB1D67D26FFA4E0CD6E123 /* QuartzCore.framework */; };
 		4CBB6507B26D14C019090502 /* libresolv.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 4BC81E0516CF5726E2BCA158 /* libresolv.tbd */; };
 		512C07E83E63C43BFF02C67D /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F1A9898F0BA7182C054F1965 /* UIKit.framework */; };
+		5D3D714B22D372FB6A93EC48 /* TunnelMonitorSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C147806F728892CFAF6E0B3 /* TunnelMonitorSession.swift */; };
 		5F73E39DD73E19D99593FD0C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8C160D99DFD6ABFC30863688 /* Assets.xcassets */; };
 		674C58B69755F85566038C23 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2724467F57C1439529328B2 /* PacketTunnelProvider.swift */; };
 		67D7C13087D75201CCB86FE0 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 0CA7AA900CC100C71D04085E /* assets */; };
@@ -210,6 +211,7 @@
 		76790814F29EC574EABCB892 /* csp_contract.rs */ = {isa = PBXFileReference; path = csp_contract.rs; sourceTree = "<group>"; };
 		7765F4772EE8B27F3C66FAA5 /* stats.rs */ = {isa = PBXFileReference; path = stats.rs; sourceTree = "<group>"; };
 		77C7D4A7C31B454A0A3129FA /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
+		7C147806F728892CFAF6E0B3 /* TunnelMonitorSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelMonitorSession.swift; sourceTree = "<group>"; };
 		7C4A16B80B8B37F9EBE68D71 /* optimistic_concurrency_tests.rs */ = {isa = PBXFileReference; path = optimistic_concurrency_tests.rs; sourceTree = "<group>"; };
 		7DDA5F17915957B762181799 /* process_supervision.rs */ = {isa = PBXFileReference; path = process_supervision.rs; sourceTree = "<group>"; };
 		7ECE3FCD22DC7EC524A2D4CF /* android_tls.rs */ = {isa = PBXFileReference; path = android_tls.rs; sourceTree = "<group>"; };
@@ -1947,6 +1949,7 @@
 			children = (
 				C2724467F57C1439529328B2 /* PacketTunnelProvider.swift */,
 				6EF5B592A8945C05471F5684 /* TunnelLifecycle.swift */,
+				7C147806F728892CFAF6E0B3 /* TunnelMonitorSession.swift */,
 				A40ED7778D6F11A2D3238AF7 /* TunnelPlatform.swift */,
 			);
 			path = PacketTunnel;
@@ -2139,6 +2142,7 @@
 			files = (
 				674C58B69755F85566038C23 /* PacketTunnelProvider.swift in Sources */,
 				11C29A64ECE411AB7C589196 /* TunnelLifecycle.swift in Sources */,
+				5D3D714B22D372FB6A93EC48 /* TunnelMonitorSession.swift in Sources */,
 				8863DA729135025175C10E16 /* TunnelPlatform.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

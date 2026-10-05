@@ -7,7 +7,7 @@ import NetworkExtension
 final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCommandServerHandlerProtocol {
     private unowned let provider: PacketTunnelProvider
     private let monitorQueue = DispatchQueue(label: "com.polaris.tunnel-path")
-    private var monitor: NWPathMonitor?
+    private let monitors = TunnelMonitorSession<NWPathMonitor, LibboxInterfaceUpdateListenerProtocol>()
     private var settings: NEPacketTunnelNetworkSettings?
     private let stateLock = NSLock()
     private let settingsOperation = NSLock()
@@ -99,36 +99,51 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
 
     func startDefaultInterfaceMonitor(_ listener: LibboxInterfaceUpdateListenerProtocol?) throws {
         guard let listener else { throw tunnelError("Missing interface listener") }
-        resetMonitor()
+        let incarnation = nativeMonitorIdentity(listener)
         let pathMonitor = NWPathMonitor()
         let token = provider.settingsGeneration()
-        let first = DispatchSemaphore(value: 0)
-        pathMonitor.pathUpdateHandler = { path in
-            guard self.provider.acceptsSettings(token) else { first.signal(); return }
+        guard provider.acceptsSettings(token) else { throw tunnelError("Default interface observation was superseded") }
+        let publication = try monitors.publish(incarnation, monitor: pathMonitor, listener: listener, generation: token)
+        guard publication.inserted else { return }
+        cancelMonitor(publication.previous)
+        let record = publication.record
+        pathMonitor.pathUpdateHandler = { [weak self, weak record] path in
+            guard let self, let record else { return }
+            guard self.provider.acceptsSettings(record.generation) else {
+                // Revoke this incarnation only; an old path handler cannot cancel its successor.
+                self.cancelMonitor(try? self.monitors.close(String(record.incarnation)))
+                return
+            }
+            guard let target = self.monitors.beginDelivery(record) else { return }
+            var observed = false
+            defer { self.monitors.finishDelivery(record, observed: observed) }
             let interface = path.status == .satisfied ? path.availableInterfaces.first : nil
-            listener.updateDefaultInterface(interface?.name ?? "", interfaceIndex: interface.map { Int32($0.index) } ?? -1, isExpensive: path.isExpensive, isConstrained: path.isConstrained)
-            listener.updateNetworkPath("\(path.status); ipv4=\(path.supportsIPv4); ipv6=\(path.supportsIPv6)")
-            first.signal()
+            // The local target belongs to the admitted record even if Close/Reload races Go.
+            target.updateDefaultInterface(interface?.name ?? "", interfaceIndex: interface.map { Int32($0.index) } ?? -1, isExpensive: path.isExpensive, isConstrained: path.isConstrained)
+            target.updateNetworkPath("\(path.status); ipv4=\(path.supportsIPv4); ipv6=\(path.supportsIPv6)")
+            observed = self.provider.acceptsSettings(record.generation)
         }
-        stateLock.lock(); monitor = pathMonitor; stateLock.unlock()
+        guard monitors.beginRegistration(record) else {
+            throw tunnelError("Default interface observation was superseded before SDK start")
+        }
         pathMonitor.start(queue: monitorQueue)
-        guard first.wait(timeout: .now() + 5) == .success else {
-            pathMonitor.cancel()
-            stateLock.lock()
-            if monitor === pathMonitor { monitor = nil }
-            stateLock.unlock()
+        monitors.finishRegistration(record)?.cancel()
+        guard record.first.wait(timeout: .now() + 5) == .success else {
+            cancelMonitor(try monitors.close(incarnation))
             throw tunnelError("Reading the default network interface timed out")
         }
-        guard provider.acceptsSettings(token) else {
-            pathMonitor.cancel()
+        guard provider.acceptsSettings(token), monitors.hasObservation(record) else {
+            cancelMonitor(try monitors.close(incarnation))
             throw tunnelError("Default interface observation was superseded")
         }
     }
 
-    func closeDefaultInterfaceMonitor(_ listener: LibboxInterfaceUpdateListenerProtocol?) throws { resetMonitor() }
+    func closeDefaultInterfaceMonitor(_ listener: LibboxInterfaceUpdateListenerProtocol?) throws {
+        guard let listener else { throw tunnelError("Missing interface listener") }
+        cancelMonitor(try monitors.close(nativeMonitorIdentity(listener)))
+    }
     func getInterfaces() throws -> LibboxNetworkInterfaceIteratorProtocol {
-        stateLock.lock(); let monitor = self.monitor; stateLock.unlock()
-        guard let monitor else { throw tunnelError("Interface monitor is not running") }
+        guard let monitor = monitors.current()?.monitor else { throw tunnelError("Interface monitor is not running") }
         return InterfaceIterator(monitor.currentPath.availableInterfaces.map { item in
             let result = LibboxNetworkInterface()
             result.name = item.name
@@ -145,8 +160,14 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
         })
     }
     private func resetMonitor() {
-        stateLock.lock(); let previous = monitor; monitor = nil; stateLock.unlock()
-        previous?.cancel()
+        cancelMonitor(monitors.reset())
+    }
+    private func nativeMonitorIdentity(_ listener: LibboxInterfaceUpdateListenerProtocol) -> String {
+        let value: String? = LibboxInterfaceUpdateListenerIdentity(listener)
+        return value ?? "" // Empty/foreign/saturated native identities are rejected by the gate.
+    }
+    private func cancelMonitor(_ record: TunnelMonitorSession<NWPathMonitor, LibboxInterfaceUpdateListenerProtocol>.Record?) {
+        if let record { monitors.takeCancellation(record)?.cancel() }
     }
     func reset() { resetMonitor(); stateLock.lock(); settings = nil; stateLock.unlock() }
     func clearDNSCache() {

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Final iOS source admission and explicit historical six-patch verification."""
+"""Apple shared-source admission and explicit historical six-patch verification."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parent.parent
 PATCH_DIR = ROOT / 'scripts/libbox-ios-patches'
 MANIFEST = PATCH_DIR / 'source-manifest.json'
@@ -21,6 +24,21 @@ RECEIPT = OUTPUT / 'libbox-build-receipt.json'
 SCRIPT = Path(__file__).resolve()
 SHARED_MANIFEST = ROOT / 'scripts/libbox-patches/source-manifest.json'
 PROVIDER = ROOT / 'scripts/core-source-provision.py'
+SOURCE_HELPERS = ROOT / 'scripts/libbox-patches/android-source.py'
+CORE_MANIFEST = ROOT / 'src-tauri/core-manifest.json'
+APPLE_POLICY = PATCH_DIR / 'apple-source-policy.json'
+COMMON_FIELDS = ('sourceManifestSha256', 'provisionerSha256', 'sourceReceiptFingerprint',
+                 'moduleGraphSha256', 'patchedSourceTree', 'buildTree', 'version',
+                 'dependencyModules', 'transportPins', 'graphScope',
+                 'mainGoModSha256', 'mainGoSumSha256')
+ARTIFACT_REQUIREMENTS = ('Apple SDK/compiler identities', 'per-target linked module partitions',
+                         'generated Objective-C/Swift ABI', 'Framework carrier source BuildID',
+                         'final appex static-link provenance')
+APPLE_TARGETS = {
+    'ios-arm64': {'goos': 'ios', 'goarch': 'arm64', 'cgo': '1', 'sdk': 'iphoneos', 'variant': None},
+    'ios-arm64-simulator': {'goos': 'ios', 'goarch': 'arm64', 'cgo': '1', 'sdk': 'iphonesimulator', 'variant': 'simulator'},
+    'ios-x86_64-simulator': {'goos': 'ios', 'goarch': 'amd64', 'cgo': '1', 'sdk': 'iphonesimulator', 'variant': 'simulator'},
+}
 HISTORICAL_MANIFEST_SHA256 = '1468d594ca51c4ae82823fae0a4d363453962b1c3ab0a15a8c14963d6589f942'
 HISTORICAL_SCRIPT_SHA256 = '2c8dd8e6ad7a8b2c1906f3cf51f5a9787ebc077d7a04d110cd4b298a45f5657e'
 HISTORICAL_ENTRY_SHA256 = '1768d8b0e0426ce5d036533fd6b85379e975dfb968739d69bdabea242923790e'
@@ -42,52 +60,108 @@ def run(args, cwd=None, env=None, capture=False):
                           text=True, stdout=subprocess.PIPE if capture else None).stdout
 
 
-def final_preflight(manifest=None):
-    """Read declarations only; no tool, repository, cache or artifact access.
+def source_helpers():
+    """Reuse existing platform-neutral validators without Android tool/admit calls."""
+    specification = importlib.util.spec_from_file_location('apple_source_contract', SOURCE_HELPERS)
+    helper = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(helper)
+    return helper
 
-    Matching declarations cannot supply the missing Apple provider integration,
-    source receipt validation or linked-module policy. This gate stays closed
-    until that implementation is reviewed; no manifest flag can enable it.
-    """
+
+def final_preflight():
+    """Admit source declarations only; no tools, repositories, caches or artifacts."""
     try:
-        manifest = manifest if manifest is not None else json.loads(MANIFEST.read_bytes())
         shared = json.loads(SHARED_MANIFEST.read_bytes())
-        core = json.loads((ROOT / 'src-tauri/core-manifest.json').read_bytes())
-        differences = []
-        for key in ('sourceCommit', 'goVersion'):
-            if manifest.get(key) != shared.get(key):
-                differences.append('shared ' + key + ' differs')
-        series = lambda source: [(patch['file'], patch['sha256']) for patch in source.get('patches', [])]
-        if series(manifest) != series(shared):
-            differences.append('ordered shared patch series differs')
-        dependency_fields = ('name', 'module', 'sourceURL', 'upstreamVersion', 'upstreamCommit',
-                             'patchFile', 'patchSha256', 'patchedTree', 'candidateCommit')
-        dependencies = lambda source: [tuple(dep.get(key) for key in dependency_fields)
-                                       for dep in source.get('dependencyPatches', [])]
-        if dependencies(manifest) != dependencies(shared):
-            differences.append('shared dependency source declarations differ')
-        spec = core.get('sourceBuild', {})
-        if (digest(SHARED_MANIFEST.read_bytes()) != spec.get('sourceManifestSha256')
-                or digest(PROVIDER.read_bytes()) != spec.get('provisionerSha256')):
-            differences.append('shared source manifest/provider hash differs')
-        apple_spec = manifest.get('sourceBuild', {})
-        for key in ('sourceManifestSha256', 'provisionerSha256', 'sourceReceiptFingerprint',
-                    'moduleGraphSha256', 'patchedSourceTree', 'buildTree', 'version',
-                    'dependencyModules', 'transportPins', 'graphScope',
-                    'mainGoModSha256', 'mainGoSumSha256'):
-            if key not in spec or apple_spec.get(key) != spec[key]:
-                differences.append('Apple common source pins differ: ' + key)
-        # Apple tags, gomobile, SDK, deployment and linker settings are not
-        # Android source-admission credentials and are intentionally not copied.
-        differences.append('Apple provider/dependency adapter and linked-module policy are not implemented')
-        raise RuntimeError('Apple final source inputs not migrated: ' + '; '.join(differences))
+        core = json.loads(CORE_MANIFEST.read_bytes())
+        policy = json.loads(APPLE_POLICY.read_bytes())
+        helper = source_helpers()
+        spec = core['sourceBuild']
+        require(all(helper.match('[0-9a-f]{64}', spec.get(key)) for key in
+                    ('sourceManifestSha256', 'provisionerSha256', 'sourceReceiptFingerprint',
+                     'moduleGraphSha256', 'mainGoModSha256', 'mainGoSumSha256'))
+                and all(helper.match('[0-9a-f]{40}', spec.get(key)) for key in ('patchedSourceTree', 'buildTree')),
+                'complete common source pins required')
+        require(helper.match(re.escape(core['bundledCoreVersion']) + r'\.polaris\.[1-9][0-9]*', spec.get('version'))
+                and spec.get('graphScope') == 'declared-patched-modules', 'common source version/scope differs')
+        require(helper.file_hash(SHARED_MANIFEST) == spec['sourceManifestSha256']
+                and helper.file_hash(PROVIDER) == spec['provisionerSha256'], 'shared manifest/provider hash differs')
+        require(set(policy) == {'schema', 'evidenceScope', 'sourceHelperSha256', 'commonSource',
+                               'binding', 'targets', 'moduleInventory', 'validationCleanupContract',
+                               'unresolvedArtifactEvidence'}, 'unsupported Apple source policy fields')
+        require(policy['schema'] == 'polaris-apple-source-policy-v1'
+                and policy['evidenceScope'] == 'source-inputs-only', 'unsupported Apple source policy scope')
+        require(policy['sourceHelperSha256'] == helper.file_hash(SOURCE_HELPERS), 'shared source helper hash differs')
+        require(policy['commonSource'] == {key: spec[key] for key in COMMON_FIELDS}, 'Apple common source pins differ')
+        require(helper.match('[0-9a-f]{40}', shared.get('sourceCommit'))
+                and helper.match(r'\d+\.\d+\.\d+', shared.get('goVersion')), 'invalid common source/toolchain pin')
+        patches, dependencies = shared['patches'], shared['dependencyPatches']
+        require(isinstance(patches, list) and patches and len({p['file'] for p in patches}) == len(patches),
+                'invalid ordered common patch inventory')
+        require(isinstance(dependencies, list) and dependencies
+                and len({d['name'] for d in dependencies}) == len(dependencies)
+                and len({d['module'] for d in dependencies}) == len(dependencies), 'invalid dependency inventory')
+        inventory, transport = spec['dependencyModules'], spec['transportPins']
+        require(isinstance(inventory, list) and inventory and len(set(inventory)) == len(inventory)
+                and sorted(d['module'] for d in dependencies) == sorted(inventory), 'common dependency inventory differs')
+        require(isinstance(transport, dict) and transport and all(helper.match('[A-Za-z0-9._/-]+', module)
+                and helper.match('v[0-9A-Za-z.+-]+', version) for module, version in transport.items()),
+                'common transport pins differ')
+        for dependency in dependencies:
+            require(helper.match('[a-z0-9][a-z0-9-]*', dependency['name'])
+                    and helper.match(r'v\S+', dependency['upstreamVersion'])
+                    and all(helper.match('[0-9a-f]{40}', dependency[key]) for key in
+                            ('upstreamCommit', 'patchedTree', 'candidateCommit'))
+                    and helper.match(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?', dependency['sourceURL']),
+                    'invalid dependency source declaration')
+        for patch in patches + dependencies:
+            filename, expected = patch.get('file', patch.get('patchFile')), patch.get('sha256', patch.get('patchSha256'))
+            require(helper.match(r'[a-z0-9-]+\.patch', filename) and helper.match('[0-9a-f]{64}', expected)
+                    and helper.file_hash(SHARED_MANIFEST.parent / filename) == expected, 'ordered common patch hash differs')
+        historical, _ = inputs(historical=True)
+        binding = policy['binding']
+        require(helper.canonical(binding) == helper.canonical({
+                            'target': historical['bindTarget'], 'libname': 'box', 'trimpath': True,
+                            'buildVCS': False, 'gomobileVersion': historical['gomobileVersion'],
+                            'iosMinimumVersion': historical['iosMinimumVersion'], 'appMinimumVersion': '17.0',
+                            'buildTags': historical['buildTags'], 'nonMacOSTags': historical['nonMacOSTags']}),
+                'Apple binding/tags/deployment policy differs')
+        require(shared['goVersion'] == historical['goVersion'], 'Apple Go declaration differs')
+        require(policy['targets'] == APPLE_TARGETS, 'Apple source target policy differs')
+        require(policy['moduleInventory'] == {'patched': inventory, 'transport': sorted(transport)},
+                'Apple source module inventory differs')
+        require(helper.canonical(policy['validationCleanupContract']) == helper.canonical(historical['validationCleanupContract']),
+                'Apple cleanup contract differs')
+        require(policy['unresolvedArtifactEvidence'] == list(ARTIFACT_REQUIREMENTS),
+                'Apple artifact evidence requirements differ')
+        return shared, core, policy
     except (OSError, KeyError, TypeError, ValueError, AttributeError) as error:
         raise RuntimeError('Apple final source inputs not migrated: invalid source declarations') from error
 
 
+def artifact_preflight():
+    final_preflight()
+    # No declaration can assert an implemented carrier reader or final linker proof.
+    raise RuntimeError('Apple final artifact evidence not implemented: ' + '; '.join(ARTIFACT_REQUIREMENTS))
+
+
+def provision_source(source, checkout, module_source, go):
+    """Prepare exactly the shared graph, without binding or publishing a Framework."""
+    shared, core, _ = final_preflight()
+    helper = source_helpers()
+    repositories = helper.module_sources(module_source, shared)
+    require(go is not None and Path(go).is_file(), 'pinned Go executable required')
+    provider = helper.provider()
+    receipt = provider.provision(SHARED_MANIFEST, source, checkout, repositories, go)
+    helper.validate_source_receipt(receipt, shared, core)
+    require(all(receipt.get(key) == core['sourceBuild'][key] for key in ('graphScope', 'mainGoModSha256', 'mainGoSumSha256')),
+            'shared receipt main module/scope binding differs')
+    helper.verify_checkout(checkout, receipt, provider)
+    return receipt
+
+
 def inputs(historical=False):
     if not historical:
-        final_preflight()
+        artifact_preflight()
     raw = MANIFEST.read_bytes()
     require(digest(raw) == HISTORICAL_MANIFEST_SHA256, 'Historical six-patch source manifest differs')
     manifest = json.loads(raw)
@@ -342,18 +416,31 @@ def main(argv=None):
     checker.add_argument('--framework', type=Path, default=OUTPUT / 'Libbox.xcframework')
     checker.add_argument('--receipt', type=Path, default=RECEIPT)
     input_checker = sub.add_parser('check-inputs')
+    preparer = sub.add_parser('prepare-source', help='Prepare shared source only; no Framework or App build')
+    preparer.add_argument('source', type=Path)
+    preparer.add_argument('--checkout', type=Path, required=True)
+    preparer.add_argument('--module-source', action='append', default=[], metavar='MODULE=REPOSITORY')
+    preparer.add_argument('--go', type=Path, required=True)
     for command in (builder, checker, input_checker):
         command.add_argument('--historical', action='store_true',
                              help='Explicitly use the frozen six-patch history; never final source evidence')
     args = parser.parse_args(argv)
-    if args.action == 'build':
+    if args.action == 'prepare-source':
+        receipt = provision_source(args.source, args.checkout, args.module_source, args.go)
+        print(json.dumps({'evidenceScope': 'source-only', 'sourceReceipt': receipt,
+                          'unresolvedArtifactEvidence': list(ARTIFACT_REQUIREMENTS)}, sort_keys=True))
+    elif args.action == 'build':
         build(args.source, args.offline, historical=args.historical)
     elif args.action == 'verify':
         verify(args.framework, args.receipt, native=None, historical=args.historical)
         print('Verified historical-only iOS build receipt; runtime cleanup remains unknown.')
     else:
-        inputs(historical=args.historical)
-        print('Verified historical-only six-patch hashes and source manifest.')
+        if args.historical:
+            inputs(historical=True)
+            print('Verified historical-only six-patch hashes and source manifest.')
+        else:
+            final_preflight()
+            print('Apple shared source inputs admitted (source-inputs-only); Framework/App linkage and runtime remain unverified.')
 
 
 if __name__ == '__main__':

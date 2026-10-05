@@ -2394,12 +2394,22 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/lib.rs",
         "mobile",
-        3,
+        4,
         IosSide::WithAndroid,
         "🔵 **移动端装载面**：`window_config.url = \"mobile.html\"`、`mobile_entry_point`、\
          移动端托盘缺席。这一格是 `builder/inbounds.rs` 里 `strict_route` 那条 iOS 判据的\
-         **依据本身** —— 「Android 与 iOS 共用同一份移动端 UI」正是靠这三处成立的\
-         （`mobile = ios | android`）。两个平台同侧，且这一次连理由都真的相同。",
+         **依据本身** —— 「Android 与 iOS 共用同一份移动端 UI」正是靠前三处成立的\
+         （`mobile = ios | android`）。第四处是主窗 `WindowEvent::Resumed` 的前台补更挂钩，\
+         两个平台都调用同一个规则资源调度器。四处均同侧。",
+    ),
+    (
+        "src-tauri/src/runtime/rule_resource_scheduler.rs",
+        "mobile",
+        1,
+        IosSide::WithAndroid,
+        "移动应用返回前台时的 `on_resume`：iOS 与 Android 同用 `mobile` 编译此入口，\
+         调用共享 `run_due_updates`，沿用总开关、到期间隔、退避和单飞门。\
+         只作前台补查，不增加后台保活。",
     ),
     (
         "src-tauri/src/tray.rs",
@@ -3343,12 +3353,15 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 2026-10-05: Android install permission adds three Android cfg sites and one non-Android
 /// explicit unsupported stub (+4 DiffersRight). Desktop-only startup popup adds one
 /// WithAndroid site; both mobile platforms keep inline updates. Existing iOS debt is unchanged.
+/// 2026-10-06：补登记共享移动资源前台补更的两处 `mobile`（`lib.rs` 的主窗 resumed 挂钩、
+/// `rule_resource_scheduler.rs` 的 `on_resume`），`WithAndroid` 59→61。
+/// 两端同侧；没有改变任何既有判决或具名债条目。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
     ("DiffersRight", 169),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 78),
-    ("WithAndroid", 59),
+    ("WithAndroid", 61),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
