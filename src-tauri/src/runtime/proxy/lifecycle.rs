@@ -545,6 +545,8 @@ impl ProxyRuntime {
             let leg = self
                 .start_guarded_with_completion(config, expected_generation, Some(&claim))
                 .await;
+            claim.finish_dispatch();
+            self.prune_normal_producers();
             claim.completion.send_replace(match &leg {
                 StartLeg::Finished(result, generation) => {
                     super::prerequisite::NormalStartCompletion::Finished(
@@ -717,6 +719,7 @@ impl ProxyRuntime {
             };
             let requested_generation = expected_generation.or(explicit_generation).unwrap();
             if let Some(claim) = completion {
+                claim.admitted(requested_generation);
                 claim.completion.send_replace(
                     super::prerequisite::NormalStartCompletion::Starting(requested_generation),
                 );
@@ -828,6 +831,7 @@ impl ProxyRuntime {
                 return StartLeg::Superseded;
             };
             if let Some(claim) = completion {
+                claim.admitted(generation);
                 claim.completion.send_replace(
                     super::prerequisite::NormalStartCompletion::Starting(generation),
                 );

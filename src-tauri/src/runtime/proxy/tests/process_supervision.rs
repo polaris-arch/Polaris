@@ -3163,3 +3163,64 @@ fn helper_created_token_detects_reuse_and_degrades_honestly() {
         PidIdentity::Unobservable
     );
 }
+
+#[test]
+fn local_native_birth_and_terminal_facts_follow_actual_production_edges() {
+    let startup = module_code("runtime/proxy/startup");
+    let start = method_body(&startup, "    pub(super) async fn start_inner(");
+    assert!(
+        start.find("self.admitted_native_producer(my_gen)").unwrap()
+            < start.find("self.spawn_direct_native(").unwrap()
+    );
+    assert_eq!(start.matches("TokioSpawner::new()").count(), 1);
+    assert!(start.contains("StdioPolicy::drain("));
+    let admission = method_body(&startup, "    pub(super) fn spawn_direct_native(");
+    assert!(admission.contains("producer.belongs_to(&self.stop_domain, birth_generation)"));
+    assert!(admission.contains("self.gate.generation() != birth_generation"));
+    assert!(
+        !admission.contains("normal_start"),
+        "no reverse catalog lock in protected admission"
+    );
+    let source = module_code("runtime/proxy/process_supervision/direct_custody");
+    let spawn = method_body(
+        &source,
+        "    pub(in crate::runtime::proxy) fn spawn_native(",
+    );
+    assert!(spawn.find("producer.enter_factory(").unwrap() < spawn.find("factory_call()").unwrap());
+    assert!(
+        spawn.find("factory_call()").unwrap()
+            < spawn.find("SealedNativeMembers::attached(").unwrap()
+    );
+    assert!(
+        spawn.find("SealedNativeMembers::attached(").unwrap()
+            < spawn
+                .find("self.slot.state = SlotState::Running(run)")
+                .unwrap()
+    );
+    let wait = method_body(
+        &source,
+        "    pub(in crate::runtime::proxy) fn poll_native_wait(",
+    );
+    assert_eq!(wait.matches("members.observe_exit(").count(), 1);
+    assert!(
+        wait.find("Poll::Ready(Ok(status))").unwrap() < wait.find("members.observe_exit(").unwrap()
+    );
+    let retire = method_body(
+        &source,
+        "    pub(in crate::runtime::proxy) fn retire_native_stop(",
+    );
+    let validate = retire.find("members.consume_native_exit(").unwrap();
+    let release = retire.find("release_main(token)?").unwrap();
+    let terminal = retire.find("validation.retire()").unwrap();
+    let empty = retire.find("self.state = SlotState::Empty").unwrap();
+    assert!(validate < release && release < terminal && terminal < empty);
+    assert!(!retire[release + "release_main(token)?".len()..].contains(".lock("));
+    assert!(!retire[release + "release_main(token)?".len()..].contains("?"));
+    let stop = method_body(
+        &module_code("runtime/proxy/process_supervision"),
+        "    pub(super) async fn kill_direct_core_with_io(",
+    );
+    assert!(
+        stop.find("*pid = None").unwrap() < stop.find("self.prune_normal_producers()").unwrap()
+    );
+}

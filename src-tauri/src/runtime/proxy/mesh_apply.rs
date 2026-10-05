@@ -10,6 +10,7 @@ pub(crate) mod candidate;
 pub(crate) mod closure;
 mod file_snapshot;
 pub(crate) mod materialize;
+pub(in crate::runtime::proxy) mod owner_proof;
 pub(crate) mod owner_scope;
 pub(crate) mod preflight;
 // Managed opt-in is off; the birth permit intentionally has no producer yet.

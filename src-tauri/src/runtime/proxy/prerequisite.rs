@@ -14,6 +14,7 @@ use polaris_helper_proto::Platform;
 use serde_json::Value;
 use tokio::sync::watch;
 
+use super::mesh_apply::owner_proof::ProducerCell;
 use super::{lifecycle::StartLeg, LocalHttpProxy, ProxyRuntime, ProxyStatus, StartError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,16 +190,54 @@ pub(super) enum NormalStartCompletion {
 pub(super) struct NormalStart {
     digest: String,
     completion: watch::Sender<NormalStartCompletion>,
-    identity: Arc<()>,
+    identity: Arc<ProducerCell>,
+}
+
+/// Current observer and retained producer responsibilities share the original short lock.
+#[derive(Default)]
+pub(super) struct NormalStarts {
+    current: Option<NormalStart>,
+    retained: Vec<Arc<ProducerCell>>,
+}
+
+impl NormalStarts {
+    pub(super) fn as_ref(&self) -> Option<&NormalStart> {
+        self.current.as_ref()
+    }
+
+    fn replace(&mut self, start: NormalStart) {
+        self.prune();
+        self.retained.push(Arc::clone(&start.identity));
+        self.current = Some(start);
+    }
+
+    fn prune(&mut self) {
+        self.retained.retain(|producer| !producer.reclaimable());
+    }
+
+    fn admitted(&self, generation: u64) -> Option<Arc<ProducerCell>> {
+        self.retained
+            .iter()
+            .find(|producer| producer.has_generation(generation))
+            .cloned()
+    }
 }
 
 pub(super) struct NormalStartClaim {
     pub(super) completion: watch::Sender<NormalStartCompletion>,
     pub(super) expected: u64,
-    identity: Arc<()>,
+    identity: Arc<ProducerCell>,
 }
 
 impl NormalStartClaim {
+    pub(super) fn admitted(&self, generation: u64) {
+        self.identity.admitted(generation);
+    }
+
+    pub(super) fn finish_dispatch(&self) {
+        self.identity.finish_dispatch();
+    }
+
     pub(super) fn owns(&self, current: Option<&NormalStart>) -> bool {
         current.is_some_and(|current| Arc::ptr_eq(&current.identity, &self.identity))
     }
@@ -470,8 +509,8 @@ impl ProxyRuntime {
             }
         }
         let (completion, receiver) = watch::channel(NormalStartCompletion::Pending(base));
-        let identity = Arc::new(());
-        *current = Some(NormalStart {
+        let identity = ProducerCell::queued(Arc::clone(&self.stop_domain), base);
+        current.replace(NormalStart {
             digest: config_digest,
             completion: completion.clone(),
             identity: Arc::clone(&identity),
@@ -610,8 +649,8 @@ impl ProxyRuntime {
             }
         }
         let (completion, receiver) = watch::channel(NormalStartCompletion::Pending(base));
-        let identity = Arc::new(());
-        *current = Some(NormalStart {
+        let identity = ProducerCell::queued(Arc::clone(&self.stop_domain), base);
+        current.replace(NormalStart {
             digest: config_digest,
             completion: completion.clone(),
             identity: Arc::clone(&identity),
@@ -632,6 +671,8 @@ impl ProxyRuntime {
             } else {
                 super::startup::with_helper_gate_suppressed(start).await
             };
+            claim.finish_dispatch();
+            runtime.prune_normal_producers();
             completion.send_replace(match leg {
                 StartLeg::Finished(result, generation) => {
                     NormalStartCompletion::Finished(result, generation)
@@ -640,6 +681,23 @@ impl ProxyRuntime {
             });
         });
         Ok(receiver)
+    }
+
+    /// Capture before entering native custody; overwritten admitted A stays discoverable.
+    pub(super) fn admitted_native_producer(
+        &self,
+        generation: u64,
+    ) -> Result<Option<Arc<ProducerCell>>, StartError> {
+        self.normal_start
+            .lock()
+            .map(|starts| starts.admitted(generation))
+            .map_err(|_| StartError::from("normal Start completion poisoned".to_owned()))
+    }
+
+    pub(super) fn prune_normal_producers(&self) {
+        if let Ok(mut starts) = self.normal_start.lock() {
+            starts.prune();
+        }
     }
 
     pub(crate) async fn await_normal_main(

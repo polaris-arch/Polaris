@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apple shared-source admission and explicit historical six-patch verification."""
+"""Apple shared-source admission, carrier inspection and explicit six-patch history."""
 import argparse
 import hashlib
 import importlib.util
@@ -140,8 +140,18 @@ def final_preflight():
 
 def artifact_preflight():
     final_preflight()
-    # No declaration can assert an implemented carrier reader or final linker proof.
+    # Source declarations do not prove production carrier/ABI or final linkage.
     raise RuntimeError('Apple final artifact evidence not implemented: ' + '; '.join(ARTIFACT_REQUIREMENTS))
+
+
+def inspect_source_carrier(binary, expected_targets, source_receipt, build_policy, tools=None, scratch=None):
+    """Producer/cache share C1 inspection; C2 policy and final admission remain separate."""
+    shared, core, _ = final_preflight()
+    spec = importlib.util.spec_from_file_location('apple_carrier_contract', SCRIPT.with_name('apple-carrier.py'))
+    carrier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(carrier)
+    return carrier.inspect_carrier(binary, expected_targets, source_receipt, shared, core,
+                                   build_policy, tools, scratch)
 
 
 def provision_source(source, checkout, module_source, go):

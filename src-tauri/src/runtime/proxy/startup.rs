@@ -1116,6 +1116,58 @@ impl ProxyRuntime {
     }
 
     /// start 主体（错误路径统一由 [`Self::start`] 收口 `end`）。
+    /// Production startup and harmless local fixtures share this exact protected
+    /// synchronous factory/attachment seam. The captured opaque producer is never
+    /// rediscovered through current while Child/check/desktop locks are held.
+    pub(super) fn spawn_direct_native(
+        &self,
+        producer: Option<&Arc<super::mesh_apply::owner_proof::ProducerCell>>,
+        birth_generation: u64,
+        factory_call: impl FnOnce()
+            -> Result<tokio::process::Child, polaris_core_supervisor::SpawnError>,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+        before_factory: impl FnOnce(),
+    ) -> Result<Option<(u32, super::process_supervision::RunIdentity)>, StartError> {
+        let closing = self
+            .desktop_shutdown
+            .lock()
+            .map_err(|_| StartError::from("proxy shutdown admission poisoned".to_owned()))?;
+        if *closing {
+            return Err(StartError::from("proxy is shutting down".to_owned()));
+        }
+        polaris_core_supervisor::with_check_admission(|| {
+            let mut slot = self
+                .child
+                .lock()
+                .map_err(StartError::direct_slot_poisoned)?;
+            if self.gate.generation() != birth_generation {
+                return Ok(None);
+            }
+            if slot.has_helper_start() || self.core_via_helper.load(Ordering::SeqCst) {
+                return Err(StartError::direct_slot_occupied());
+            }
+            let empty = slot
+                .empty_for_install()
+                .ok_or_else(StartError::direct_slot_occupied)?;
+            let producer = producer
+                .filter(|producer| producer.belongs_to(&self.stop_domain, birth_generation))
+                .ok_or_else(|| {
+                    StartError::from("direct native producer binding is missing".to_owned())
+                })?;
+            self.core_via_helper.store(false, Ordering::SeqCst);
+            empty
+                .spawn_native(
+                    producer,
+                    birth_generation,
+                    factory_call,
+                    main_token,
+                    before_factory,
+                )
+                .map(Some)
+        })
+        .map_err(|error| StartError::from(error.to_string()))?
+    }
+
     pub(super) async fn start_inner(
         self: &Arc<Self>,
         config: Value,
@@ -1128,6 +1180,9 @@ impl ProxyRuntime {
             log::info!("起核入口即被接管（世代 {my_gen}）→ 让位");
             return Ok(self.status());
         }
+        // Snapshot under normal_start before any desktop/check/Child/live lock.
+        // This is the recorded final admission, not the watch's requested generation.
+        let native_producer = self.admitted_native_producer(my_gen)?;
         if let Ok(mut route) = self.mesh_route_run.write() {
             *route = None;
         }
@@ -1740,102 +1795,54 @@ impl ProxyRuntime {
                 // 竞态不变式：stop() 先 bump 世代、再取 child 锁；本处在**持锁期间**判世代。
                 //   · 本判定先于 stop 的 bump → 本腿 spawn 并存 child；stop 随后取到 child 并杀 → 无孤儿。
                 //   · stop 的 bump 先于本判定 → 本腿直接让位、**根本不 spawn** → 无孤儿。
-                let direct_spawn = {
-                    let closing = self
-                        .desktop_shutdown
-                        .lock()
-                        .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
-                    if *closing {
-                        return Err(StartError::from("proxy is shutting down".to_owned()));
-                    }
-                    polaris_core_supervisor::with_check_admission(|| {
-                        let mut guard = self
-                            .child
-                            .lock()
-                            .map_err(|e| format!("child lock poisoned: {e}"))?;
-                        if self.gate.generation() != my_gen {
-                            log::info!(
-                                "起核在 spawn 前被接管（世代 {my_gen} → {}）→ 让位",
-                                self.gate.generation()
-                            );
-                            return Ok(None);
-                        }
-                        if guard.has_helper_start() || self.core_via_helper.load(Ordering::SeqCst) {
-                            return Err(StartError::direct_slot_occupied());
-                        }
-                        let empty_slot = guard
-                            .empty_for_install()
-                            .ok_or_else(StartError::direct_slot_occupied)?;
-                        self.core_via_helper.store(false, Ordering::SeqCst);
-                        // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
-                        // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
-                        // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
-                        // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
-                        // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
-                        // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
-                        // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
-                        // FATAL 分类（见 `pipe_to_log` 文档）。
-                        let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
-                        let sink_handoff = Arc::clone(&handoff);
-                        let sink_fatal = Arc::clone(&fatal_slot);
-                        let mut req = SpawnRequest::new(
-                            &binary,
-                            &config_path,
-                            StdioPolicy::drain(move |stdout, stderr| {
-                                pipe_to_log(
-                                    stdout,
-                                    SING_BOX_TARGET,
-                                    None,
-                                    Some(Arc::clone(&sink_handoff)),
-                                );
-                                pipe_to_log(
-                                    stderr,
-                                    SING_BOX_TARGET,
-                                    Some(sink_fatal),
-                                    Some(sink_handoff),
-                                );
-                            }),
+                // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
+                // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
+                // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
+                // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
+                // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
+                // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
+                // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
+                // FATAL 分类（见 `pipe_to_log` 文档）。
+                let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
+                let sink_handoff = Arc::clone(&handoff);
+                let sink_fatal = Arc::clone(&fatal_slot);
+                let mut req = SpawnRequest::new(
+                    &binary,
+                    &config_path,
+                    StdioPolicy::drain(move |stdout, stderr| {
+                        pipe_to_log(
+                            stdout,
+                            SING_BOX_TARGET,
+                            None,
+                            Some(Arc::clone(&sink_handoff)),
                         );
-                        // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
-                        req.extra_args = vec!["--disable-color".to_string()];
-                        // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
-                        // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
-                        req.working_dir = Some(self.config.dir().to_path_buf());
-                        // Mint before spawn: even a failed OS random source must not
-                        // leave a successfully spawned Child without its run token.
-                        let run_identity = super::process_supervision::RunIdentity::new();
-                        main_reservation.arm_external_start();
-                        match TokioSpawner::new().spawn(req) {
-                            Ok(spawned) => {
-                                let pid = spawned.pid().unwrap_or(0);
-                                let run = if let Some(token) = main_claim_token.clone() {
-                                    super::process_supervision::DirectCoreRun::with_main_token(
-                                        spawned.child,
-                                        run_identity,
-                                        token,
-                                    )
-                                } else {
-                                    super::process_supervision::DirectCoreRun::with_identity(
-                                        spawned.child,
-                                        run_identity,
-                                    )
-                                };
-                                let identity = run.identity.clone();
-                                // The empty-slot permit retains this mutex guard
-                                // through spawn, so this cannot discard a Child.
-                                empty_slot.install_running(run);
-                                Ok(Some((pid, handoff, identity)))
-                            }
-                            Err(e) => {
-                                main_reservation.confirmed_no_external_writer();
-                                Err(StartError::from(format!("{e}")))
-                            }
-                        }
-                    })
-                    .map_err(|error| StartError::from(error.to_string()))?
-                };
+                        pipe_to_log(
+                            stderr,
+                            SING_BOX_TARGET,
+                            Some(sink_fatal),
+                            Some(sink_handoff),
+                        );
+                    }),
+                );
+                // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
+                req.extra_args = vec!["--disable-color".to_string()];
+                // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
+                // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
+                req.working_dir = Some(self.config.dir().to_path_buf());
+                let direct_spawn = self.spawn_direct_native(
+                    native_producer.as_ref(),
+                    my_gen,
+                    || TokioSpawner::new().spawn(req).map(|spawned| spawned.child),
+                    main_claim_token.clone(),
+                    || main_reservation.arm_external_start(),
+                );
+                if direct_spawn.is_err() {
+                    // Returned Err means this invocation never returned a live Child;
+                    // the protected factory marks its definite spawn Err separately.
+                    main_reservation.confirmed_no_external_writer();
+                }
                 match direct_spawn {
-                    Ok(Some((pid, handoff, identity))) => {
+                    Ok(Some((pid, identity))) => {
                         log_pipe_handoff = Some(handoff);
                         direct_run_identity = Some(identity);
                         pid

@@ -5,7 +5,7 @@
 //! `win_console.rs`），façade 必须 `pub(crate) use` 再导出（§B.3）。
 
 #[allow(dead_code)] // The managed exact supervisor remains dormant.
-mod direct_custody;
+pub(in crate::runtime::proxy) mod direct_custody;
 #[allow(dead_code)] // No production commit bridge exists in this slice.
 mod direct_stop;
 pub(crate) use direct_custody::DirectCoreSlot;
@@ -270,6 +270,7 @@ pub(super) struct DirectCoreRun {
     #[allow(dead_code)] // Read when the managed coordinator's exact stop gate is wired.
     pub(super) origin: DirectRunOrigin,
     pub(super) main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    pub(super) native_members: Option<super::mesh_apply::owner_proof::SealedNativeMembers>,
 }
 
 /// The legacy constructor records Legacy. A future managed coordinator must
@@ -304,6 +305,7 @@ impl DirectCoreRun {
             identity,
             origin: DirectRunOrigin::Legacy,
             main_token: None,
+            native_members: None,
         }
     }
 
@@ -381,6 +383,7 @@ impl DirectCoreRun {
         self.child.as_mut().expect("custody Child retained")
     }
 
+    #[cfg(test)]
     pub(super) fn with_main_token(
         child: Child,
         identity: RunIdentity,
@@ -867,6 +870,8 @@ impl ProxyRuntime {
             })?;
             *pid = None;
         }
+        // Metadata reclamation is outside Child/pid/registry custody and cannot undo retire.
+        self.prune_normal_producers();
         log::info!("停核完成：owned Child 已退出并收割（exit={exit}）");
         Ok(())
     }
