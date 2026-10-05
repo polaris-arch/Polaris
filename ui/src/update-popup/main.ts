@@ -143,7 +143,7 @@ function render(state: UpdatePopupState): void {
           <div class="bar"><i style="width:${pct}%"></i></div>
           <div class="row between">
             <span class="sub">${esc(bytesText(state.receivedBytes, state.totalBytes) ?? `${pct}%`)}</span>
-            <button class="btn ghost" data-act="cancel">${esc(t('updatePopup.cancel'))}</button>
+            <button class="btn ghost" data-act="cancel">${esc(t('updatePopup.continueInBackground'))}</button>
           </div>
         </div>`;
       break;

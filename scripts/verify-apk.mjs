@@ -54,8 +54,8 @@
  * `.srs` 不只判「有」，还与工作树份数相等且要求工作树份数非零（否则 `0 == 0` 恒真）；
  * 死字节不只判「不许太大」，而是**算出实际比值并要求它落在带内** —— 带的下沿 `1.0` 守的正是
  * 「条目尺寸读成了 0 / 读错了包」那类取材面塌陷，纯上限判据在那种输入上是恒绿的；
- * 剥符号不只判「不许有 `.debug_*`」，而是先要求节表**解析得出、且含 `.text` 与 `.dynsym`**，
- * 再要求 debug 节数为 0 —— 少了前半句，「一个字节都没解析出来」就是一条免费的绿。
+ * 剥符号先要求节表**解析得出、且含 `.text` / `.dynamic` / `.dynsym` / `.dynstr`**，
+ * 再要求 debug 节与非运行静态符号表均为 0；native 条目还必须实际使用 DEFLATE。
  *
  * 权限那条（判据 ⑦）不只判「不许有没登记的」，而是**两个方向的差集**加一条下限：
  * 只判「多的」会被「一份读不出来的输出」骗过（空集里没有多的），只判「少的」会漏掉
@@ -162,12 +162,13 @@ export function parseArgs(argv) {
 }
 
 /**
- * `lib/<ABI>/` 下必须存在的原生库。两条都要：
+ * `lib/<ABI>/` 下必须存在的原生库。三份都要：
  *  - `libbox.so` —— sing-box 内核（libbox.aar 的 jni 被 AGP 合并进来）；
  *  - `libpolaris_lib.so` —— 应用自己的 Rust 侧。缺它说明 tauri 那一步铺的 jniLibs 没进包，
- *    而那种情况下 `libbox.so` 可能仍在（它来自 aar 这条**另一条**路径）⇒ 必须分别断言。
+ *    而那种情况下 `libbox.so` 可能仍在（它来自 aar 这条**另一条**路径）⇒ 必须分别断言；
+ *  - `libc++_shared.so` —— NDK C++ runtime，保留其动态导出，禁止为缩包删库。
  */
-export const NATIVE_LIBS = Object.freeze(['libbox.so', 'libpolaris_lib.so']);
+export const NATIVE_LIBS = Object.freeze(['libbox.so', 'libpolaris_lib.so', 'libc++_shared.so']);
 
 /**
  * `libbox.so` 里的构建 tag 指纹。阈值与形状抄 `scripts/build-libbox.sh` 尾部的 aar 开箱验，
@@ -256,6 +257,50 @@ export function deadByteReport({ names, fileSize, entriesCompressedTotal }) {
   return { fileSize, entriesTotal: entriesCompressedTotal, nonEntry, bound, dead, ratio, hi };
 }
 
+/** APK uses ordinary ZIP entries; compare both headers instead of trusting a textual listing. */
+export function parseZipEntries(buf) {
+  const need = (ok, why) => { if (!ok) throw new Error(`APK ZIP: ${why}`); };
+  let eocd = -1;
+  for (let p = buf.length - 22; p >= Math.max(0, buf.length - 22 - 65535); p--) {
+    if (buf.readUInt32LE(p) === 0x06054b50 && p + 22 + buf.readUInt16LE(p + 20) === buf.length) {
+      eocd = p;
+      break;
+    }
+  }
+  need(eocd >= 0, 'EOCD missing or truncated');
+  need(buf.readUInt16LE(eocd + 4) === 0 && buf.readUInt16LE(eocd + 6) === 0, 'split ZIP is unsupported');
+  const count = buf.readUInt16LE(eocd + 10);
+  const size = buf.readUInt32LE(eocd + 12);
+  const start = buf.readUInt32LE(eocd + 16);
+  need(count !== 0xffff && size !== 0xffffffff && start !== 0xffffffff, 'ZIP64 is unsupported for APK');
+  need(count === buf.readUInt16LE(eocd + 8) && start + size <= eocd, 'central directory bounds differ');
+  const entries = new Map();
+  let p = start;
+  for (let i = 0; i < count; i++) {
+    need(p + 46 <= start + size && buf.readUInt32LE(p) === 0x02014b50, 'central entry missing or truncated');
+    const nameLength = buf.readUInt16LE(p + 28);
+    const length = 46 + nameLength + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32);
+    need(p + length <= start + size, 'central entry extends beyond directory');
+    const nameBytes = buf.subarray(p + 46, p + 46 + nameLength);
+    const name = nameBytes.toString('utf8');
+    need(!entries.has(name), `duplicate entry ${name}`);
+    const local = buf.readUInt32LE(p + 42);
+    const method = buf.readUInt16LE(p + 10);
+    const compressedSize = buf.readUInt32LE(p + 20);
+    const uncompressedSize = buf.readUInt32LE(p + 24);
+    need(local + 30 <= start && buf.readUInt32LE(local) === 0x04034b50, `${name}: local header missing`);
+    const localNameLength = buf.readUInt16LE(local + 26);
+    const dataOffset = local + 30 + localNameLength + buf.readUInt16LE(local + 28);
+    need(dataOffset + compressedSize <= start, `${name}: data extends beyond central directory`);
+    need(buf.readUInt16LE(local + 8) === method && localNameLength === nameLength &&
+      buf.subarray(local + 30, local + 30 + localNameLength).equals(nameBytes), `${name}: local and central headers differ`);
+    entries.set(name, { method, compressedSize, uncompressedSize, dataOffset });
+    p += length;
+  }
+  need(p === start + size, 'central directory length differs');
+  return entries;
+}
+
 /**
  * `.so` 里被认定为「调试信息」的节区名前缀。两种拼写都要：
  *  - `.debug_*` —— DWARF 的标准节名（未压缩，或 SHF_COMPRESSED 压缩后**节名不变**）；
@@ -269,7 +314,7 @@ export const DEBUG_SECTION_PREFIXES = Object.freeze(['.debug_', '.zdebug_']);
  * 没有它，「`.debug_*` 数为 0」会被「一个字节都没解析出来」满足 —— 截断的读、
  * 读错的成员、解析器写反了，在纯否定式判据下全是绿。
  */
-export const REQUIRED_ELF_SECTIONS = Object.freeze(['.text', '.dynsym']);
+export const REQUIRED_ELF_SECTIONS = Object.freeze(['.text', '.dynamic', '.dynsym', '.dynstr']);
 
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -458,7 +503,7 @@ const MIN_ELF_SECTIONS = 5;
  * 而垃圾解析出来的节名清单里当然没有 `.debug_` —— 又是一条假绿。字节序同理。
  *
  * @param {Buffer} buf
- * @returns {{ok: true, names: string[], bytes: number[]} | {ok: false, why: string}}
+ * @returns {{ok: true, names: string[], bytes: number[], details: object[]} | {ok: false, why: string}}
  */
 /**
  * 读 ELF 的 `EI_CLASS` 与 `e_machine`——「这份 `.so` 真的是这个 ABI 的」由它取值。
@@ -566,18 +611,26 @@ export function elfSectionNames(buf) {
 
   const names = [];
   const bytes = [];
+  const details = [];
   for (let i = 0; i < shnum; i += 1) {
     const nameOff = sh(i, 'name');
-    if (nameOff >= strtab.length) {
-      names.push('');
-      bytes.push(0);
-      continue;
-    }
     const end = strtab.indexOf(0, nameOff);
-    names.push(strtab.subarray(nameOff, end < 0 ? strtab.length : end).toString('latin1'));
-    bytes.push(sh(i, 'size'));
+    const name = nameOff < strtab.length
+      ? strtab.subarray(nameOff, end < 0 ? strtab.length : end).toString('latin1') : '';
+    names.push(name);
+    bytes.push(nameOff < strtab.length ? sh(i, 'size') : 0);
+    const base = shoff + i * shentsize;
+    details.push({
+      name,
+      type: u32(base + 4),
+      flags: is64 ? (le ? buf.readBigUInt64LE(base + 8) : buf.readBigUInt64BE(base + 8)) : BigInt(u32(base + 8)),
+      address: is64 ? (le ? buf.readBigUInt64LE(base + 16) : buf.readBigUInt64BE(base + 16)) : BigInt(u32(base + 12)),
+      offset: sh(i, 'offset'),
+      size: sh(i, 'size'),
+      alignment: is64 ? u64(base + 48) : u32(base + 32),
+    });
   }
-  return { ok: true, names, bytes };
+  return { ok: true, names, bytes, details };
 }
 
 /** 节名是不是调试信息节。 */
@@ -588,12 +641,12 @@ export function isDebugSection(name) {
 /**
  * 一份 `.so` 的「剥没剥过」判定。红时报文要能直接指向**改哪儿**，故按成员名给出处。
  *
- * @returns {{ok: boolean, why: string|null, sections: number, debug: string[], debugBytes: number}}
+ * @returns {{ok: boolean, why: string|null, sections: number, debug: string[], debugBytes: number, staticSymbols?: string[], staticBytes?: number}}
  */
 export function strippedReport(buf) {
   const parsed = elfSectionNames(buf);
   if (!parsed.ok) return { ok: false, why: `节表读不出来：${parsed.why}`, sections: 0, debug: [], debugBytes: 0 };
-  const { names, bytes } = parsed;
+  const { names, bytes, details } = parsed;
   // ── 正面那一半：解析出来的东西必须**像**一份真的共享库 ──
   if (names.length < MIN_ELF_SECTIONS) {
     return {
@@ -618,7 +671,13 @@ export function strippedReport(buf) {
   }
   const debug = names.filter(isDebugSection);
   const debugBytes = names.reduce((sum, n, i) => (isDebugSection(n) ? sum + bytes[i] : sum), 0);
-  return { ok: debug.length === 0, why: null, sections: names.length, debug, debugBytes };
+  const staticSymbols = details.filter((s) => ['.symtab', '.strtab'].includes(s.name) && (s.flags & 2n) === 0n);
+  return {
+    ok: debug.length === 0 && staticSymbols.length === 0,
+    why: null, sections: names.length, debug, debugBytes,
+    staticSymbols: staticSymbols.map((s) => s.name),
+    staticBytes: staticSymbols.reduce((sum, s) => sum + s.size, 0),
+  };
 }
 
 /** 某份 `.so` 的调试信息该由谁负责 —— 红的时候直接把人送到改动点，不让他再去找。 */
@@ -643,6 +702,7 @@ function debugOwnerHint(lib) {
  * @param {number} input.fileSize      APK 文件本身的字节数（`stat`）
  * @param {number} input.entriesCompressedTotal 全部条目**压缩后**字节数之和（`unzip -Zt`）
  * @param {string} input.abi          按哪个 ABI 判（`ABIS` 的键；未知取值当场抛，不静默按缺省走）
+ * @param {Map<string, object>} input.zipEntries 当前 APK 中央目录与本地头对拍后的条目元数据
  * @returns {string[]} 违反项（空数组 = 全部判据成立）
  */
 export function apkViolations({
@@ -654,6 +714,7 @@ export function apkViolations({
   entriesCompressedTotal,
   abi,
   permissions,
+  zipEntries,
 }) {
   // 未知 / 漏传的 abi 在这里抛（不是 fail 一条）：判据的**取材面参数**错了时，
   // 下面每一条的结论都无意义，报成「某某不在包里」等于把参数错误伪装成产物缺陷。
@@ -704,7 +765,7 @@ export function apkViolations({
     }
   }
 
-  // ── ② 原生库：两条都在、都是真 ELF ───────────────────────────────────────────
+  // ── ② 原生库：三份都在、都是真 ELF ───────────────────────────────────────────
   for (const lib of NATIVE_LIBS) {
     const entry = `lib/${abi}/${lib}`;
     if (!present.has(entry)) {
@@ -822,6 +883,9 @@ export function apkViolations({
   //       · ⑥ 断言的是「在场的每一份都得剥过」，枚举就意味着**新加一份原生库自动免检**。
   //     故本条扫 `lib/<ABI>/` 下的每一个 `.so`，扫到几份就报几份。
   const soEntries = names.filter((n) => n.startsWith(`lib/${abi}/`) && n.endsWith('.so'));
+  if (!(zipEntries instanceof Map)) {
+    fail('ZIP 压缩方式读不出来 —— 必须从当前 APK 的中央目录与本地头对拍，不能跳过 native DEFLATE 校验');
+  }
   if (soEntries.length === 0) {
     fail(
       `APK 里 lib/${abi}/ 下一个 .so 都没扫到 —— 取材面塌了（ABI 前缀写错？分包出的不是这个 ABI？），` +
@@ -829,6 +893,13 @@ export function apkViolations({
     );
   }
   for (const entry of soEntries) {
+    if (zipEntries instanceof Map) {
+      const zip = zipEntries.get(entry);
+      if (!zip || zip.method !== 8) {
+        fail(`${entry} 必须用 DEFLATE（ZIP method 8）压缩，实得 ${zip?.method ?? '条目缺失'}；检查 build.gradle.kts 的 jniLibs.useLegacyPackaging = true`);
+      }
+      // DEFLATE 库安装时解压到文件；其 ZIP 数据偏移无需支持直接 mmap，ELF LOAD 仍须 16 KB。
+    }
     if (elfIdent(readMember(entry)).ok) {
       const alignment = elfPageAlignment(readMember(entry));
       if (!alignment.ok) fail(`${entry}: ${alignment.why}`);
@@ -839,14 +910,16 @@ export function apkViolations({
       fail(`${entry} ${r.why}`);
       continue;
     }
-    if (!r.ok) {
+    if (r.debug.length > 0) {
       fail(
         `${entry} 里还留着 ${r.debug.length} 个调试信息节（共 ${r.debugBytes} 字节 / ${mib(r.debugBytes)}）：` +
           `${r.debug.join(' ')} —— 这份原生库没有被剥过。\n` +
-          `  该包按未压缩（\`stor\`）存放原生库，所以这 ${mib(r.debugBytes)} 一字节不少地进了 APK，` +
-          '而它在真机上零消费者（`.debug_*` 不带 SHF_ALLOC，加载器根本不映射）。\n' +
+          '  调试节增加传输与安装体积，且在真机上零消费者（`.debug_*` 不带 SHF_ALLOC，加载器根本不映射）。\n' +
           `  看这里：${debugOwnerHint(lib)}。`,
       );
+    }
+    if (r.staticSymbols.length > 0) {
+      fail(`${entry} 还留着非运行静态符号表 ${r.staticSymbols.join(' / ')}（${r.staticBytes} 字节）；检查 release StripDebugSymbolsTask 的 scripts/strip-android-release-native.mjs 步骤，动态导出与 Go 运行元数据必须保留`);
     }
   }
 
@@ -999,6 +1072,7 @@ function main() {
   const permissions = apkPermissions(apk);
   // `null`（解析不出汇总行）原样传下去 —— `apkViolations` 会红在取材面而不是判绿。
   const entriesCompressedTotal = apkCompressedTotal(apk, names.length);
+  const zipEntries = parseZipEntries(readFileSync(apk));
   const violations = apkViolations({
     names,
     readMember: (name) => apkMember(apk, name),
@@ -1011,6 +1085,7 @@ function main() {
     entriesCompressedTotal,
     abi,
     permissions,
+    zipEntries,
   });
 
   // 收据：不管红绿都把**实际数到的东西**打出来。只打印 "ok" 的门，红的时候没人知道它平时在看什么。
@@ -1069,7 +1144,7 @@ function main() {
     const tail =
       r.why !== null
         ? r.why
-        : `节区 ${r.sections} 个，调试信息节 ${r.debug.length} 个` +
+        : `节区 ${r.sections} 个，静态符号表 ${r.staticSymbols.length} 个，ZIP method ${zipEntries.get(entry)?.method}，调试信息节 ${r.debug.length} 个` +
           (r.debug.length > 0 ? `（${r.debug.join(' ')}，${mib(r.debugBytes)}）` : '');
     console.log(`      ${r.ok ? '✔' : '✘'} ${entry.padEnd(34)} ${tail}`);
   }

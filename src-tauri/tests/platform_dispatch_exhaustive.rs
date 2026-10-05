@@ -2234,6 +2234,13 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
+    (
+        "src-tauri/src/runtime/startup_tasks.rs",
+        "desktop",
+        1,
+        IosSide::WithAndroid,
+        "Only desktop opens a secondary update window. Both mobile platforms retain their inline update entry, checking and optional automatic download.",
+    ),
     // ── crates ──
     (
         "crates/helper-proto/src/lib.rs",
@@ -2439,7 +2446,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
         "target_os = \"android\"",
-        31,
+        34,
         IosSide::DiffersRight,
         "整条 Rust ↔ Kotlin/libbox 桥（`PluginHandle`、JNI 调用、`VpnService` 授权查询）。\
          iOS 不编译它是**对的**：这是 Android 的插件 API，iOS 上一个符号都不存在。\
@@ -2466,7 +2473,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
         "not(target_os = \"android\")",
-        13,
+        14,
         IosSide::DiffersRight,
         "本文件的非 Android 桩：每一处都返 `Err(\"Android 起核桥在本平台不存在\")` 或等价的\
          `Unknown`（含 `VpnAuthState` 那条 `cfg_attr(not(android), allow(dead_code))`）。\
@@ -3333,12 +3340,15 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// iOS 现状已知不适用 73、同侧 40；下表与具名债清单分别防数量和位置漂移。
 /// 2026-10-01：新增 95 处实际分派并逐点登记；所有既有判决/债条目保留。
 /// 新增债仍是债；本次未取得 iOS 编译或真机收据，未还清任何 iOS 支持债。
+/// 2026-10-05: Android install permission adds three Android cfg sites and one non-Android
+/// explicit unsupported stub (+4 DiffersRight). Desktop-only startup popup adds one
+/// WithAndroid site; both mobile platforms keep inline updates. Existing iOS debt is unchanged.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
-    ("DiffersRight", 165),
+    ("DiffersRight", 169),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 78),
-    ("WithAndroid", 58),
+    ("WithAndroid", 59),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

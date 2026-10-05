@@ -1266,6 +1266,7 @@ pub fn run() {
             // 更新卡重挂载后回读最后一帧进度（切页/窗口重建后不再退回 idle）。
             update_get_progress,
             update_install,
+            update_request_install_permission,
             update_skip,
             // D14：IPC 通道 update:openReleases 已随 D12 从前端退役，但本命令仍被
             // updater/app_update.rs 的 PopupAction::ViewLog / ManualDownload 分支直接 Rust 内部

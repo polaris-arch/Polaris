@@ -11,6 +11,9 @@ import android.content.pm.ResolveInfo
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.result.ActivityResult
@@ -124,6 +127,12 @@ class InstallApkArgs {
      * 然后把它交给系统安装器。多写一份下载/校验就是第二份真值。
      */
     lateinit var apkPath: String
+    var expiresAtEpochMs: Long = 0
+}
+
+@InvokeArg
+class ApkInstallPermissionArgs {
+    var expiresAtEpochMs: Long = 0
 }
 
 @InvokeArg
@@ -333,8 +342,8 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     /** 授权独立于起核：用户阅读系统弹窗的时间不占用 Rust 的 30 秒起核预算。 */
     @Command
     fun requestVpnPermission(invoke: Invoke) {
-        if (pendingVpnPermission != null) {
-            invoke.reject("VPN 授权窗口已打开，请先完成当前授权", ERR_VPN_PERMISSION_DENIED)
+        if (pendingVpnPermission != null || apkInstallFlow.busy()) {
+            invoke.reject("系统授权或安装窗口已打开，请先完成当前操作", ERR_VPN_PERMISSION_DENIED)
             return
         }
         try {
@@ -388,7 +397,23 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     override fun onDestroy(activity: AppCompatActivity) {
         cancelVpnPermission()
         pendingVpnPermission = null
+        apkInstallFlow.destroy()?.reject("安装授权已中断，请再次点击安装重试")
+        clearApkPermissionTimeout()
         super.onDestroy(activity)
+    }
+
+    override fun onPause() {
+        apkInstallFlow.paused()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        apkInstallFlow.resumed()
+        // AppCompat's lifecycle becomes RESUMED after its onResume dispatch has finished.
+        apkPermissionHandler.post {
+            if (installActivityResumed()) completeApkInstallPermission()
+        }
     }
 
     /**
@@ -766,8 +791,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      *
      * | 情形 | 回包 `reason` | 用户的下一步 |
      * |---|---|---|
-     * | 没授予「安装未知应用」（API 26+ 按应用授权） | [REASON_UNKNOWN_SOURCES_DENIED] | 本命令**已经把他送到那一页**，授权后重来 |
-     * | 同上，且设置页也打不开（定制 ROM 摘了那个 Activity） | [REASON_UNKNOWN_SOURCES_NO_SETTINGS] | 只能自己去系统设置里找 |
+     * | 安装前授权已撤销（API 26+ 按应用授权） | [REASON_UNKNOWN_SOURCES_DENIED] | 再次点击安装请求授权 |
      * | 本机没有能处理安装 intent 的组件 | [REASON_NO_INSTALLER] | 本机装不了，去别处装 |
      * | 路径不在应用私有 cache 目录里 | [REASON_NOT_APP_PRIVATE] | 这是接线错误，不是用户能修的 |
      * | 路径上没有这个文件 | [REASON_PACKAGE_MISSING] | 先下载 |
@@ -780,8 +804,8 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      * # 为什么这里可以有副作用（对比 [vpnAuthStatus] 的「读状态不许弹窗」）
      *
      * [vpnAuthStatus] 是按**节奏**被调的只读腿，它弹任何东西都是骚扰。本命令相反：它由用户
-     * 亲手按下「安装」引出，一次用户动作对一次跳转。把用户送到「安装未知应用」那一页
-     * 正是那次动作的**延续**，不是意外 —— 反过来，只回一个错误码而不给路，才是把人晾在原地。
+     * 亲手按下「安装」引出。授权设置由 [requestApkInstallPermission] 独立等待；本命令只交付
+     * 已授权的包，且再次检查授权，防止两条命令之间权限被撤销。
      *
      * # 为什么不用 `PackageInstaller` 会话式
      *
@@ -795,23 +819,124 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      */
     @Command
     fun installApk(invoke: Invoke) {
-        val apkPath = invoke.parseArgs(InstallApkArgs::class.java).apkPath
-        Thread({
+        val args = invoke.parseArgs(InstallApkArgs::class.java)
+        activity.runOnUiThread {
+            if (System.currentTimeMillis() >= args.expiresAtEpochMs ||
+                !installActivityResumed() || pendingVpnPermission != null || !apkInstallFlow.beginInstall()
+            ) {
+                invoke.reject("请回到应用完成当前安装操作后重试")
+                return@runOnUiThread
+            }
             try {
-                val outcome = handOffToSystemInstaller(apkPath)
+                val outcome = handOffToSystemInstaller(args.apkPath, args.expiresAtEpochMs)
+                apkInstallFlow.finishInstall(outcome.handedOff)
                 val result = JSObject()
                 result.put("handedOff", outcome.handedOff)
                 result.put("reason", outcome.reason)
                 invoke.resolve(result)
             } catch (e: Throwable) {
+                apkInstallFlow.finishInstall(false)
                 // 走到这里说明连「为什么交不出去」都没算出来（FileProvider 授权面没配、
                 // canonicalFile 触到 I/O 错误…）。原样回传，Rust 侧会落成一个有原因的失败 ——
                 // 吞掉它就又回到「点了更新什么都没发生」。
                 Log.e(TAG, "交系统安装器失败", e)
                 invoke.reject(e.message ?: e.toString())
             }
-        }, "polaris-install-apk").start()
+        }
     }
+
+    private val apkInstallFlow = ApkInstallPermissionFlow<Invoke>()
+    private val apkPermissionHandler = Handler(Looper.getMainLooper())
+    private var apkPermissionTimeout: Runnable? = null
+
+    /** This command only grants permission; the waiting user click still owns installation. */
+    @Command
+    fun requestApkInstallPermission(invoke: Invoke) {
+        val args = invoke.parseArgs(ApkInstallPermissionArgs::class.java)
+        activity.runOnUiThread {
+            val remaining = (args.expiresAtEpochMs - System.currentTimeMillis()).coerceAtMost(90_000L)
+            if (remaining <= 0 || !installActivityResumed()) {
+                invoke.reject("安装授权请求已过期或应用不在前台，请重试")
+                return@runOnUiThread
+            }
+            if (pendingVpnPermission != null ||
+                !apkInstallFlow.beginPermission(invoke, SystemClock.elapsedRealtime() + remaining)
+            ) {
+                invoke.reject("系统授权或安装窗口已打开，请先完成当前操作")
+                return@runOnUiThread
+            }
+            try {
+                if (canInstallPackages()) {
+                    completeApkInstallPermission(invoke)
+                    return@runOnUiThread
+                }
+                val timeout = Runnable {
+                    apkInstallFlow.expire(invoke, SystemClock.elapsedRealtime())?.let {
+                        clearApkPermissionTimeout()
+                        it.reject("等待安装授权超时，请完成授权后再次点击安装")
+                    }
+                }
+                apkPermissionTimeout = timeout
+                apkPermissionHandler.postDelayed(timeout, remaining)
+                openUnknownSourcesSettings(invoke)
+            } catch (e: ActivityNotFoundException) {
+                apkInstallFlow.takeReturned(invoke)
+                clearApkPermissionTimeout()
+                resolveApkInstallPermission(invoke, false, REASON_UNKNOWN_SOURCES_NO_SETTINGS)
+            } catch (e: Exception) {
+                apkInstallFlow.takeReturned(invoke)
+                clearApkPermissionTimeout()
+                invoke.reject("无法打开或确认安装授权：${e.message}")
+            }
+        }
+    }
+
+    @ActivityCallback
+    fun apkInstallPermissionResult(invoke: Invoke, @Suppress("UNUSED_PARAMETER") result: ActivityResult) {
+        // Settings has no reliable RESULT_OK contract. Query the actual permission on return.
+        if (installActivityResumed()) completeApkInstallPermission(invoke)
+    }
+
+    private fun completeApkInstallPermission(invoke: Invoke? = null) {
+        val pending = apkInstallFlow.takeReturned(invoke) ?: return
+        clearApkPermissionTimeout()
+        if (SystemClock.elapsedRealtime() >= pending.deadline) {
+            pending.invoke.reject("等待安装授权超时，请再次点击安装")
+            return
+        }
+        try {
+            val granted = canInstallPackages()
+            if (SystemClock.elapsedRealtime() >= pending.deadline) {
+                pending.invoke.reject("等待安装授权超时，请再次点击安装")
+                return
+            }
+            resolveApkInstallPermission(
+                pending.invoke,
+                granted,
+                if (granted) null else REASON_UNKNOWN_SOURCES_DENIED,
+            )
+        } catch (e: Exception) {
+            pending.invoke.reject("无法确认安装授权：${e.message}")
+        }
+    }
+
+    private fun clearApkPermissionTimeout() {
+        apkPermissionTimeout?.let(apkPermissionHandler::removeCallbacks)
+        apkPermissionTimeout = null
+    }
+
+    private fun resolveApkInstallPermission(invoke: Invoke, granted: Boolean, reason: String? = null) {
+        val result = JSObject()
+        result.put("granted", granted)
+        result.put("reason", reason)
+        invoke.resolve(result)
+    }
+
+    private fun canInstallPackages(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+        activity.packageManager.canRequestPackageInstalls()
+
+    private fun installActivityResumed(): Boolean = !activity.isFinishing && !activity.isDestroyed &&
+        (activity as? LifecycleOwner)?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
 
     // ── 上面两条命令的实现腿（**刻意放在 `@Command` 方法体之外**）────────────────
     //
@@ -885,7 +1010,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     /** [installApk] 的实现腿（结局表见该命令的文档）。 */
-    private fun handOffToSystemInstaller(apkPath: String): Handoff {
+    private fun handOffToSystemInstaller(apkPath: String, expiresAtEpochMs: Long): Handoff {
         val apk = File(apkPath).canonicalFile
         val cacheRoot = activity.cacheDir.canonicalFile
         // 🔴 只认应用私有 cache 目录下的包。**这一条前缀判据是唯一的落点约束** ——
@@ -915,7 +1040,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             !activity.packageManager.canRequestPackageInstalls()
         ) {
-            return Handoff(false, openUnknownSourcesSettings())
+            return Handoff(false, REASON_UNKNOWN_SOURCES_DENIED)
         }
 
         val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", apk)
@@ -923,9 +1048,12 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
             .setDataAndType(uri, APK_MIME)
             // content:// 的一次性读授权。少了它，安装器拿到 uri 也读不动。
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            // 本方法跑在工作线程、且从非 Activity 上下文语义起跳，必须显式给新任务栈。
+            // 保持系统安装器独立的任务栈；授权等待在另一条命令里结算。
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return try {
+            check(System.currentTimeMillis() < expiresAtEpochMs) {
+                "安装请求已过期，请再次点击安装"
+            }
             activity.startActivity(intent)
             Handoff(true, null)
         } catch (e: ActivityNotFoundException) {
@@ -934,28 +1062,11 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    /**
-     * 把用户送到「安装未知应用」那一页，并回报本次为什么没装成。
-     *
-     * 两个码不许合并：[REASON_UNKNOWN_SOURCES_DENIED] 是「按一下开关就能解决，而且我已经把你
-     * 送到那个开关面前了」，[REASON_UNKNOWN_SOURCES_NO_SETTINGS] 是「这条路走不通，你得自己去
-     * 系统设置里找」。折成一个码等于对后一种情形的用户说一句做不到的话。
-     */
-    private fun openUnknownSourcesSettings(): String {
-        // API < 26 上没有按应用的「安装未知应用」这个对象（那时是一个全局开关），
-        // 调用点也不会走到这里（那一支被 SDK_INT 判据挡在外面）。留这一行是为了让本函数
-        // 自己是全的：它不依赖调用点替它守版本。
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return REASON_UNKNOWN_SOURCES_DENIED
+    /** Permission settings only. The result/resume path observes permission, never installs. */
+    private fun openUnknownSourcesSettings(invoke: Invoke) {
         val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
             .setData(Uri.parse("package:${activity.packageName}"))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return try {
-            activity.startActivity(intent)
-            REASON_UNKNOWN_SOURCES_DENIED
-        } catch (e: ActivityNotFoundException) {
-            Log.e(TAG, "打不开「安装未知应用」设置页", e)
-            REASON_UNKNOWN_SOURCES_NO_SETTINGS
-        }
+        startActivityForResult(invoke, intent, "apkInstallPermissionResult")
     }
 
     // ── 数据面：连接列表 + 流量统计 ──────────────────────────────────────────────
@@ -1058,7 +1169,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         /** APK 的 MIME —— 系统安装器就是靠它认领 `ACTION_VIEW` 的。 */
         const val APK_MIME = "application/vnd.android.package-archive"
 
-        /** 没授予「安装未知应用」；本次已把用户送到那一页，授权后重来即可。 */
+        /** 从设置返回后仍未授予，或安装前授权已经撤销。 */
         const val REASON_UNKNOWN_SOURCES_DENIED = "unknown-sources-denied"
 
         /** 没授予，且连那一页都打不开（定制 ROM 摘掉了那个 Activity）。 */

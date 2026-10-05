@@ -819,11 +819,12 @@ fn installer_checks_permission_before_handing_the_package_over() {
          startActivity 在没授权时不抛异常，系统只是不装，用户看到的是「点了更新什么都没发生」。"
     );
 
-    // 没授权那一支必须**返回一个原因**，不是 return 一个裸 false、也不是往下走。
+    // 设置由独立授权命令完成；授权被撤销时交付必须拒绝，不能再次打开设置或继续安装。
     let denied = &body[gate..handoff];
     assert!(
-        denied.contains("openUnknownSourcesSettings()"),
-        "没授权那一支没有走引导腿 —— 只回一个错误码而不给路，是把人晾在原地"
+        denied.contains("REASON_UNKNOWN_SOURCES_DENIED")
+            && !denied.contains("openUnknownSourcesSettings("),
+        "安装前授权已经撤销时必须拒绝，不得隐式再开设置或继续交付"
     );
     assert!(
         denied.contains("Handoff(false,"),
@@ -846,15 +847,76 @@ fn unknown_sources_branch_guides_the_user_and_distinguishes_a_dead_end() {
         "引导腿没有打开「安装未知应用」那一页 —— 可读的引导就是这一跳本身"
     );
     assert!(
-        body.contains("activity.startActivity("),
+        body.contains("startActivityForResult(invoke, intent, \"apkInstallPermissionResult\")"),
         "引导腿没有真的起跳"
     );
     assert!(
-        body.contains("REASON_UNKNOWN_SOURCES_DENIED")
-            && body.contains("REASON_UNKNOWN_SOURCES_NO_SETTINGS"),
-        "「按一下开关就能继续」与「这条路走不通」必须是两个码：\
-         折成一个等于对后一种情形的用户说一句做不到的话"
+        body.contains("package:${activity.packageName}"),
+        "授权必须定向到本应用的安装来源设置"
     );
+    let request = kotlin_fn_body(&kt, "requestApkInstallPermission");
+    assert!(request.contains("REASON_UNKNOWN_SOURCES_NO_SETTINGS"));
+    assert!(request.contains("openUnknownSourcesSettings(invoke)"));
+    assert!(request.contains("installActivityResumed()"));
+    assert!(request.contains("remaining <= 0"));
+    assert!(request.contains("apkInstallFlow.beginPermission("));
+    assert!(request.contains("apkInstallFlow.expire(invoke,"));
+    assert!(!request.contains("handOffToSystemInstaller("));
+}
+
+#[test]
+fn installation_permission_callbacks_cannot_install_or_accept_expired_receipts() {
+    let kt = polaris_source_probe::mask_comments(&polaris_source_probe::expect_marker(
+        polaris_source_probe::repo_file!(PLUGIN_KT),
+        PLUGIN_KT,
+        "class PolarisVpnPlugin",
+    ));
+    let complete = kotlin_fn_body(&kt, "completeApkInstallPermission");
+    let expiry = complete.get_or_panic("SystemClock.elapsedRealtime() >= pending.deadline");
+    let query = complete.get_or_panic("canInstallPackages()");
+    assert!(expiry < query, "迟到授权回执必须先拒绝，再查询当前许可");
+    assert!(complete.contains("apkInstallFlow.takeReturned(invoke)"));
+    assert!(complete.contains("REASON_UNKNOWN_SOURCES_DENIED"));
+    for name in [
+        "apkInstallPermissionResult",
+        "completeApkInstallPermission",
+        "onResume",
+    ] {
+        let body = kotlin_fn_body(&kt, name);
+        assert!(!body.contains("handOffToSystemInstaller("));
+        assert!(!body.contains("FileProvider.getUriForFile"));
+        assert!(!body.contains("startActivity("));
+    }
+    let destroy = kotlin_fn_body(&kt, "onDestroy");
+    assert!(destroy.contains("apkInstallFlow.destroy()?.reject("));
+}
+
+#[test]
+fn installer_rejects_expired_dispatch_and_system_dialogs_are_mutually_exclusive() {
+    let kt = polaris_source_probe::mask_comments(&polaris_source_probe::expect_marker(
+        polaris_source_probe::repo_file!(PLUGIN_KT),
+        PLUGIN_KT,
+        "class PolarisVpnPlugin",
+    ));
+    let install = kotlin_fn_body(&kt, "installApk");
+    assert!(
+        install.get_or_panic("System.currentTimeMillis() >= args.expiresAtEpochMs")
+            < install.get_or_panic("handOffToSystemInstaller(")
+    );
+    assert!(install.contains("pendingVpnPermission != null"));
+    assert!(install.contains("apkInstallFlow.beginInstall()"));
+    let handoff = kotlin_fn_body(&kt, "handOffToSystemInstaller");
+    assert!(
+        handoff.get_or_panic("check(System.currentTimeMillis() < expiresAtEpochMs)")
+            < handoff.get_or_panic("activity.startActivity(intent)")
+    );
+    let vpn = kotlin_fn_body(&kt, "requestVpnPermission");
+    assert!(
+        vpn.get_or_panic("apkInstallFlow.busy()")
+            < vpn.get_or_panic("VpnService.prepare(activity)")
+    );
+    let permission = kotlin_fn_body(&kt, "requestApkInstallPermission");
+    assert!(permission.contains("pendingVpnPermission != null"));
 }
 
 /// 结局必须一路走到回包：`installApk` 的 `@Command` 体里必须把 `reason` 发出去。
@@ -883,10 +945,10 @@ fn the_reason_reaches_the_response() {
 /// 🔴 **没有一个 catch 是空的。**
 ///
 /// 吞异常是「静默失败」最直接的实现方式，而它在 Kotlin 里只要两个字符（`{}`）。
-/// 判据：本批三个函数体里每一个 `catch (…) {` 的块体，都必须至少做一件**可观测**的事 ——
+/// 判据：枚举的授权/安装函数体里每一个 `catch (…) {` 都必须有可观测结果 ——
 /// 记日志、拒掉这次调用、或返回一个带原因的结局。
 ///
-/// 射程如实登记：本条只覆盖这三个函数，且只按文本判「块体里有没有那几样东西」。
+/// 射程如实登记：本条只覆盖下面枚举的函数，且只按文本判「块体里有没有那几样东西」。
 /// 它抓不到「记了日志但吞掉了控制流」（那由上面两条次序/回包断言覆盖），
 /// 也抓不到别的文件里的空 catch。
 #[test]
@@ -903,6 +965,8 @@ fn no_swallowed_exceptions_on_the_install_legs() {
         "listInstalledApps",
         "handOffToSystemInstaller",
         "openUnknownSourcesSettings",
+        "requestApkInstallPermission",
+        "completeApkInstallPermission",
     ] {
         let body = kotlin_fn_body(&kt, name);
         let mut rest = body.as_str();
@@ -942,11 +1006,11 @@ fn no_swallowed_exceptions_on_the_install_legs() {
             rest = &tail[open..];
         }
     }
-    // 正面断言（FLOOR）：本批这四个函数里确实有 catch 要审。扫到 0 个 ⇒ 取材塌了，
+    // 原安装/枚举三处 + 授权请求两处 + 返回回查一处。不得因拆分授权漏掉错误路径。
     // 而「一个空 catch 都没找到」与「一个 catch 都没找到」在没有这条时不可区分。
     assert!(
-        checked >= 4,
-        "只审到 {checked} 个 catch（下限 4）—— 取材面塌了，不是真的没有 catch"
+        checked >= 6,
+        "只审到 {checked} 个 catch（下限 6）—— 取材面塌了，不是真的没有 catch"
     );
 }
 
@@ -978,9 +1042,11 @@ fn every_declared_reason_code_has_a_return_path() {
     );
 
     let impl_face = format!(
-        "{}{}",
+        "{}{}{}{}",
         kotlin_fn_body(&kt, "handOffToSystemInstaller"),
         kotlin_fn_body(&kt, "openUnknownSourcesSettings"),
+        kotlin_fn_body(&kt, "requestApkInstallPermission"),
+        kotlin_fn_body(&kt, "completeApkInstallPermission"),
     );
     for code in &declared {
         assert!(

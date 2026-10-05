@@ -292,19 +292,24 @@ fn spawn_auto_check_update(app: AppHandle) {
             return;
         };
         log::info!("发现新版本: {version}");
-        let current = app.package_info().version.to_string();
-        let r = crate::commands::update_popup_show(
-            app.clone(),
-            version,
-            current,
-            Some(include_prerelease),
-        )
-        .await;
-        if !r.success {
-            log::warn!(
-                "更新提醒弹窗打开失败: {}",
-                r.error.as_deref().unwrap_or("未知错误")
-            );
+        // Mobile uses its existing inline update entry; Tauri mobile has no secondary windows.
+        // Checking and optional background downloading remain enabled on every platform.
+        #[cfg(desktop)]
+        {
+            let current = app.package_info().version.to_string();
+            let r = crate::commands::update_popup_show(
+                app.clone(),
+                version,
+                current,
+                Some(include_prerelease),
+            )
+            .await;
+            if !r.success {
+                log::warn!(
+                    "更新提醒弹窗打开失败: {}",
+                    r.error.as_deref().unwrap_or("未知错误")
+                );
+            }
         }
         // 「自动下载更新」——只下载，不安装（见 spawn_auto_download）。
         spawn_auto_download(&app, &config, data.get("updateInfo").cloned());

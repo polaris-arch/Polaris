@@ -23,6 +23,7 @@ import {
 } from './Primitives';
 import { releaseShipsDigest } from './settings-logic';
 import { useAppUpdate } from './use-app-update';
+import { useProgressDisclosure } from '@/lib/use-progress-disclosure';
 
 export interface AppUpdateCardProps {
   config: UserConfig;
@@ -49,6 +50,8 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
   } = useAppUpdate(includePrerelease);
   const releaseDigestMissing = !releaseShipsDigest(updateInfo);
   const downloadUnverified = downloadIntegrity === 'unverified';
+  const progressActive = us === 'checking' || us === 'downloading';
+  const progressView = useProgressDisclosure(progressActive);
 
   return (
     <Card className="core-card" id="app-update-card">
@@ -83,7 +86,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
         </div>
       )}
 
-      {us === 'checking' && (
+      {us === 'checking' && !progressView.hidden && (
         <div className="us-state" data-us="checking">
           <div className="core-ver">
             <Spinner />
@@ -154,7 +157,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
         </div>
       )}
 
-      {us === 'downloading' && (
+      {us === 'downloading' && !progressView.hidden && (
         <div className="us-state" data-us="downloading">
           <div className="core-ver">
             <Spinner />
@@ -169,6 +172,17 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
             {((receivedBytes ?? 0) / 1024 / 1024).toFixed(1)} /{' '}
             {((updateInfo?.fileSize ?? 0) / 1024 / 1024).toFixed(1)} MB
           </div>
+        </div>
+      )}
+
+      {progressActive && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+          <CardSub style={{ flex: 1 }}>
+            {t(progressView.hidden ? 'settings.update.backgroundProgress' : 'settings.update.hideProgressHint')}
+          </CardSub>
+          <Button variant="ghost" size="sm" onClick={progressView.hidden ? progressView.show : progressView.hide}>
+            {t(progressView.hidden ? 'settings.update.showProgress' : 'settings.update.hideProgress')}
+          </Button>
         </div>
       )}
 

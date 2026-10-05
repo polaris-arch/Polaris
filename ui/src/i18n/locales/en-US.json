@@ -738,6 +738,10 @@
       "noTelemetry": "Zero telemetry — no automatic upload of crash reports or analytics"
     },
     "update": {
+      "hideProgress": "Hide progress",
+      "showProgress": "Show progress",
+      "backgroundProgress": "The update is still running",
+      "hideProgressHint": "Hiding progress keeps the task running",
       "ruleResourceAutoStatusOn": "Scheduled refresh",
       "ruleResourceAutoStatusManual": "Manual only",
       "formMismatch": "The update package does not match the current install form; handed to the system",
