@@ -518,6 +518,17 @@ def pure_tests():
         tool_observer_tests(Path(temp))
 
 
+
+def command_hook_tests():
+    commands = collector.Commands(Path('/unused'), {}, {'/go': 'go', '/usr/bin/xcrun': 'xcrun'})
+    check(commands._allowed_command(['/go', 'version'], Path('/unused'), {}), 'private allowance changed original go version')
+    for argv in (['/go', 'build', '-buildmode=c-archive', '-o', '/owned.a', '.'],
+                 ['/go', 'build', '-a', '.'], ['/usr/bin/xcrun', 'libtool', '-static', '-o', '/owned.a', '/input.a'],
+                 ['/usr/bin/xcrun', 'lipo', '/input.a', '-create', '-o', '/owned.a'],
+                 ['/go', 'list', '-deps', '-f', '{{range .CgoLDFLAGS}}{{println .}}{{end}}', '-tags=ios', collector.BOUND]):
+        check(not commands._allowed_command(argv, Path('/unused'), {}), 'C2 default allowance expanded for component operation')
+        rejected(lambda argv=argv: commands.run('component-forbidden', argv, Path('/unused')), 'forbidden tool')
+
 if __name__ == '__main__':
     # Tool subprocesses are forbidden throughout every fixture/mutation case.
     with mock.patch.object(collector.subprocess, 'run', side_effect=AssertionError('unexpected tool invocation')), \
@@ -525,4 +536,5 @@ if __name__ == '__main__':
             mock.patch.object(collector.os, 'killpg', side_effect=AssertionError('unexpected process group signal')), \
             mock.patch.object(collector.shutil, 'disk_usage', return_value=SimpleNamespace(free=10 * 1024**3)):
         pure_tests()
+        command_hook_tests()
     print(f'{COUNT} Apple source input unit cases passed; no compiler, Framework or App built.')

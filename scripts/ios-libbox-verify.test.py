@@ -387,6 +387,18 @@ def preflight_tests():
         builder.main(['check-inputs'])
         assert 'source-inputs-only' in output.getvalue()
     count += 1
+    with mock.patch.object(builder, 'observe_component', return_value={
+            'evidenceScope': 'C3-source-compiler-observations-only', 'status': 'mock-only', 'pending': ['actual contract']}) as observed, \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')), redirect_stdout(io.StringIO()) as output:
+        builder.main(['observe-component', '/prepared', '--source-receipt', '/receipt', '--go', '/go',
+                      '--mobile-bin', '/mobile', '--developer-dir', '/developer', '--evidence-dir', '/evidence'])
+        assert observed.call_count == 1 and json.loads(output.getvalue())['carrierAdmission'] is False
+    count += 1
+    with mock.patch.object(builder, 'observe_component', side_effect=AssertionError('component observer reached')), \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')):
+        rejected(lambda: builder.main(['build']), 'artifact evidence not implemented')
+        rejected(lambda: builder.main(['verify']), 'artifact evidence not implemented')
+    count += 2
     print(f'{count} source-admission/producer/structure unit cases passed; no Framework or App built.')
 
 

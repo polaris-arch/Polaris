@@ -2948,6 +2948,43 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"ios\")", 1, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"android\"", 7, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留。管理API的ledger/import三处分派已消除，所有平台同进程禁止主端口跨代复用。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"ios\"", 6, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
+    // PC temp native-only slice: preserve the original 21/2 debt subcounts and reasons.
+    // The verdict belongs to the whole (file, predicate) group, not each new representation.
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
+        8,
+        IosSide::DiffersWrongToday,
+        "同谓词组仍含 iOS 不适用的桌面 Child 起核/收割链，保守保留组级债。新增八处是 typed imports、原 PID registration/retirement 表示、dispatch impl、prepared/native_bound/PC spawned 与 ordinary Err cleanup 分流；不是八个新增运行错误。iOS 产品入口仍先取得正常 Main ticket，停态拒绝独立 temp；这不把编译面中的 PC native proof 变成 iOS 能力或 disposal 证明。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
+        8,
+        IosSide::DiffersWrongToday,
+        "同谓词组仍含 iOS 不适用的桌面 Tokio 登录核链，原两处债不重判。新增八处是 PC typed reexport、custody/birth identity 字段、validated/local terminal 表示、bind/validation/retire 封闭 consumer；这些 opaque 表示本身不是八个新增语义错误，仍作为未闭合组成员登记。ordinary spawn 明确 None，不发行 temp native fact；iOS 正常 Main 功能与拒独立 temp 负门保持，未取得 iOS 运行/NoOwner 证明。",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "all(test, not(target_os = \"android\"))",
+        1,
+        IosSide::WithAndroid,
+        "has_native_terminal 只供 host tests 检查原 registration；eval_cfg 的 test 在 release/debug 两环境均为 false，两移动端同不编译。该 getter 仍供非 Unix 的 Some-prepared 负门使用，不是 native positive producer。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "all(test, not(target_os = \"android\"))",
+        6,
+        IosSide::WithAndroid,
+        "两 Foreign variant 与四 getter/corruption/replay assertion helper 是 Unix-only tests；独立 cfg(unix) 与本 test/non-Android 谓词合取，等价保留原构型。eval_cfg 的 test 在 release/debug 均 false，两移动端同侧；不向跨 mobile 谓词词表添加 unix。",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersRight,
+        "PC prepared 分流后的 Android spawned 仍调用原进程内 libbox spawner，Android Err 仍执行原 config cleanup；两处保持原 Android 行为，不进入 PC native booking，也不把默认 None/普通 close 当 native fact。iOS 不引用 Android JNI；其独立 temp 由原产品负门拒绝。",
+    ),
 ];
 
 // ── cfg 轴的取材与求值 ──
@@ -3377,12 +3414,18 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// fixture accessor，all(test,not(ios)) 1→3；实到 366→368 / 99 对，WithAndroid 62→64。
 /// canonical tests 目录迁移不改变生产取材面；显式 Start/共享动作及 helper task-local
 /// 传播修复没有新增 cfg 分派。既有所有判决与 26 条/103 处具名债保持。
+/// 2026-10-06（PC temp native-only integration）：逐点消费 25 个新增/未登记站点后，
+/// 实到 368→393 / 101 对；两个保留 Android spawn/Err cleanup 为 Right，七个 test-only
+/// 谓词为 WithAndroid。其余 16 个表示/consumer/dispatch 站点加入已有未闭合谓词组，
+/// WrongToday 78→94；不声称 opaque 表示自身错误或新增 16 个 iOS 运行错误。
+/// 原 26 行债全部保留，新增两个子计数行：共 28 行、24 个唯一组、119 处；
+/// iOS 正常 Main/拒独立 temp 保持，没有债被还清或重判，未取得 iOS 运行/disposal 证明。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
-    ("DiffersRight", 177),
+    ("DiffersRight", 179),
     ("DiffersUndecided", 25),
-    ("DiffersWrongToday", 78),
-    ("WithAndroid", 64),
+    ("DiffersWrongToday", 94),
+    ("WithAndroid", 71),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -3475,6 +3518,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/speedtest.rs",
         "not(target_os = \"android\")",
+        8,
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
         21,
     ),
     (
@@ -3516,6 +3564,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/runtime/tailscale_login_core.rs",
         "not(target_os = \"android\")",
         2,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
+        8,
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",

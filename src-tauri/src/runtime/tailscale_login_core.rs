@@ -182,6 +182,10 @@ pub trait LoginCoreChild: Send {
     /// [`LoginCoreRegistry::inflight_login_pids`] 据此喂 `ProxyRuntime::cleanup_stale_cores`
     /// 的排除表 —— 返错 pid 会让清扫放过一个真孤儿，返 `None` 只会让本核在飞时失去保护。
     fn pid(&self) -> Option<u32>;
+    /// An opaque fact from this exact native-bound temporary Child, never ordinary Close Ok.
+    fn native_exit(&self) -> Option<NativeTransientExit> {
+        None
+    }
     /// 等子进程自然退出并收割（cancel-safe：可在 `select!` 中反复创建/丢弃）。
     async fn wait(&mut self);
     /// Only an explicit implementation may attest that its owned child exited. The legacy
@@ -210,6 +214,272 @@ pub trait LoginCoreSpawner: Send + Sync {
     /// **按值收请求**（与 [`SingBoxSpawner`] 同）：请求里的排空回调是 `FnOnce`，spawner 必须能
     /// 消费掉它。假 spawner 也一样要把自己那两条内存流喂给同一个回调，测试才走的是生产接线。
     async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError>;
+    /// Preparation has no OS effect and supplies no exit/no-child evidence.
+    fn prepare_temp_native_birth(&self) -> Option<PreparedTempNativeBirth> {
+        None
+    }
+    /// Some booking stays strict even if an injected implementation uses legacy spawn.
+    /// None lets the concrete adapter reuse this factory for ordinary unbound login.
+    async fn spawn_with_temp_native_birth(
+        &self,
+        req: SpawnRequest,
+        _prepared: Option<PreparedTempNativeBirth>,
+    ) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        self.spawn(req).await
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) use temp_native::{LocalTempNativeTerminal, TempNativeBirthRef};
+pub use temp_native::{NativeTransientExit, PreparedTempNativeBirth};
+
+/// Private issuer data lives in the existing transient adapter, not a second registry.
+mod temp_native {
+    use std::process::ExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NativeRole {
+        Temp,
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        Foreign,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NativeScope {
+        SingleTempNativeChildV1,
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        Foreign,
+    }
+    struct Binding {
+        #[cfg(not(target_os = "android"))]
+        custody: Arc<()>,
+        #[cfg(not(target_os = "android"))]
+        birth: Arc<()>,
+    }
+    enum NoChildReturn {
+        FactoryReturned,
+        AdmissionRejected,
+    }
+    #[derive(Default)]
+    struct NativeCell {
+        binding: OnceLock<Binding>,
+        factory_entered: AtomicBool,
+        no_child: OnceLock<NoChildReturn>,
+        member: OnceLock<Arc<()>>,
+        status: OnceLock<ExitStatus>,
+        retired: AtomicBool,
+    }
+    /// Dispatch authority is move-only. Its constructors and native issuer are private.
+    pub struct PreparedTempNativeBirth(Arc<NativeCell>);
+    #[derive(Clone)]
+    pub(crate) struct TempNativeBirthRef(Arc<NativeCell>);
+    pub(super) struct NativeAttachment {
+        birth: TempNativeBirthRef,
+        member: Arc<()>,
+    }
+    #[derive(Clone)]
+    pub struct NativeTransientExit {
+        birth: TempNativeBirthRef,
+        member: Arc<()>,
+        role: NativeRole,
+        scope: NativeScope,
+        status: ExitStatus,
+    }
+    #[cfg(not(target_os = "android"))]
+    pub(crate) struct ValidatedTempNativeExit(NativeTransientExit);
+    #[cfg(not(target_os = "android"))]
+    pub(crate) struct LocalTempNativeTerminal {
+        _exit: NativeTransientExit,
+    }
+
+    impl PreparedTempNativeBirth {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(NativeCell::default()))
+        }
+        #[cfg(not(target_os = "android"))]
+        pub(crate) fn bind(
+            &self,
+            custody: &Arc<()>,
+            birth: &Arc<()>,
+        ) -> Result<TempNativeBirthRef, String> {
+            if self.0.factory_entered.load(Ordering::SeqCst)
+                || self.0.no_child.get().is_some()
+                || self.0.member.get().is_some()
+                || self.0.retired.load(Ordering::SeqCst)
+            {
+                return Err("测速临时核 native birth 已进入或退休".into());
+            }
+            self.0
+                .binding
+                .set(Binding {
+                    custody: custody.clone(),
+                    birth: birth.clone(),
+                })
+                .map_err(|_| "测速临时核 native birth 禁止重复绑定")?;
+            Ok(TempNativeBirthRef(self.0.clone()))
+        }
+        pub(super) fn enter_factory(&self) -> Result<(), String> {
+            if self.0.binding.get().is_none()
+                || self.0.retired.load(Ordering::SeqCst)
+                || self.0.no_child.get().is_some()
+                || self
+                    .0
+                    .factory_entered
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                return Err("测速临时核 native factory 未绑定或重复进入".into());
+            }
+            Ok(())
+        }
+        pub(super) fn factory_returned_no_child(&self) {
+            let _ = self.0.no_child.set(NoChildReturn::FactoryReturned);
+        }
+        pub(super) fn admission_rejected(&self) {
+            let _ = self.0.no_child.set(NoChildReturn::AdmissionRejected);
+        }
+        pub(super) fn attach(&self) -> NativeAttachment {
+            // Only the concrete factory's returned physical Child reaches this issuer.
+            let member = Arc::new(());
+            let _ = self.0.member.set(member.clone());
+            NativeAttachment {
+                birth: TempNativeBirthRef(self.0.clone()),
+                member,
+            }
+        }
+    }
+    impl NativeAttachment {
+        pub(super) fn observe(&self, status: ExitStatus) -> NativeTransientExit {
+            let status = *self.birth.0.status.get_or_init(|| status);
+            NativeTransientExit {
+                birth: self.birth.clone(),
+                member: self.member.clone(),
+                role: NativeRole::Temp,
+                scope: NativeScope::SingleTempNativeChildV1,
+                status,
+            }
+        }
+    }
+    impl NativeTransientExit {
+        pub(super) fn matches_cell(&self) -> bool {
+            self.birth.0.factory_entered.load(Ordering::SeqCst)
+                && self.birth.0.no_child.get().is_none()
+                && self
+                    .birth
+                    .0
+                    .member
+                    .get()
+                    .is_some_and(|member| Arc::ptr_eq(member, &self.member))
+                && self.role == NativeRole::Temp
+                && self.scope == NativeScope::SingleTempNativeChildV1
+                && self.birth.0.status.get() == Some(&self.status)
+        }
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn status_for_test(&self) -> ExitStatus {
+            self.status
+        }
+        /// Negative consumer input only: never used to create a native acceptance positive.
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn corrupted_for_test(&self, fault: &str, foreign: &Self) -> Self {
+            let mut fact = self.clone();
+            match fault {
+                "member" => fact.member = foreign.member.clone(),
+                "role" => fact.role = NativeRole::Foreign,
+                "scope" => fact.scope = NativeScope::Foreign,
+                "status" => fact.status = foreign.status,
+                _ => panic!("unknown negative native fact fault"),
+            }
+            fact
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    impl TempNativeBirthRef {
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn replayed_preparation_for_test(&self) -> PreparedTempNativeBirth {
+            PreparedTempNativeBirth(self.0.clone())
+        }
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn factory_entered_for_test(&self) -> bool {
+            self.0.factory_entered.load(Ordering::SeqCst)
+        }
+        fn validate_binding(&self, custody: &Arc<()>, birth: &Arc<()>) -> Result<(), String> {
+            let binding = self
+                .0
+                .binding
+                .get()
+                .ok_or("测速临时核 native birth 未绑定")?;
+            if !Arc::ptr_eq(&binding.custody, custody)
+                || !Arc::ptr_eq(&binding.birth, birth)
+                || self.0.retired.load(Ordering::SeqCst)
+            {
+                return Err("测速临时核 native 回执不属于原 custody/birth".into());
+            }
+            Ok(())
+        }
+        pub(crate) fn validate_exit(
+            &self,
+            fact: Option<NativeTransientExit>,
+            custody: &Arc<()>,
+            birth: &Arc<()>,
+        ) -> Result<ValidatedTempNativeExit, String> {
+            self.validate_binding(custody, birth)?;
+            let fact = fact.ok_or("测速临时核 native 退出事实缺失")?;
+            if !self.0.factory_entered.load(Ordering::SeqCst)
+                || self.0.no_child.get().is_some()
+                || !Arc::ptr_eq(&self.0, &fact.birth.0)
+                || !self
+                    .0
+                    .member
+                    .get()
+                    .is_some_and(|member| Arc::ptr_eq(member, &fact.member))
+                || fact.role != NativeRole::Temp
+                || fact.scope != NativeScope::SingleTempNativeChildV1
+                || self.0.status.get() != Some(&fact.status)
+            {
+                return Err("测速临时核 native 成员或退出状态不匹配".into());
+            }
+            // Clone/move every sealed reference before the original custody commit.
+            Ok(ValidatedTempNativeExit(fact))
+        }
+        pub(crate) fn validate_no_child(
+            &self,
+            custody: &Arc<()>,
+            birth: &Arc<()>,
+        ) -> Result<(), String> {
+            self.validate_binding(custody, birth)?;
+            let entered = self.0.factory_entered.load(Ordering::SeqCst);
+            let returned =
+                matches!(self.0.no_child.get(), Some(NoChildReturn::FactoryReturned)) && entered;
+            let rejected = matches!(
+                self.0.no_child.get(),
+                Some(NoChildReturn::AdmissionRejected)
+            ) && !entered;
+            if (!returned && !rejected)
+                || self.0.member.get().is_some()
+                || self.0.status.get().is_some()
+            {
+                return Err("测速临时核 native factory 责任尚未确认".into());
+            }
+            Ok(())
+        }
+        pub(crate) fn retire_no_child(&self) {
+            self.0.retired.store(true, Ordering::SeqCst);
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    impl ValidatedTempNativeExit {
+        pub(crate) fn retire(self) -> LocalTempNativeTerminal {
+            self.0.birth.0.retired.store(true, Ordering::SeqCst);
+            LocalTempNativeTerminal { _exit: self.0 }
+        }
+    }
 }
 
 /// `sing-box check` 抽象：spawn 前先验配置形状（fail-fast）。生产真跑 `sing-box check -c <file>`，测试 mock。
@@ -411,6 +681,8 @@ pub struct TokioLoginCoreChild {
     reaped: bool,
     /// ECHILD loses the Unix wait identity. A reused numeric PID can never repair this birth.
     wait_identity_lost: bool,
+    native_attachment: Option<temp_native::NativeAttachment>,
+    native_exit: Option<NativeTransientExit>,
 }
 
 impl Drop for TokioLoginCoreChild {
@@ -437,6 +709,12 @@ impl LoginCoreChild for TokioLoginCoreChild {
     fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(tokio::process::Child::id)
     }
+    fn native_exit(&self) -> Option<NativeTransientExit> {
+        self.native_exit
+            .as_ref()
+            .filter(|fact| fact.matches_cell())
+            .cloned()
+    }
     async fn wait(&mut self) {
         if let Err(error) = self.wait_result().await {
             log::error!("{error}");
@@ -450,13 +728,20 @@ impl LoginCoreChild for TokioLoginCoreChild {
             return Err("瞬态登录核等待身份已丢失，退出未确认".into());
         }
         let child = self.child.as_mut().ok_or("瞬态登录核句柄不可用")?;
-        if let Err(error) = child.wait().await {
-            #[cfg(unix)]
-            if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
-                self.wait_identity_lost = true;
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(error) => {
+                #[cfg(unix)]
+                if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
+                    self.wait_identity_lost = true;
+                }
+                return Err(format!("等待瞬态登录核退出失败: {error}"));
             }
-            return Err(format!("等待瞬态登录核退出失败: {error}"));
-        }
+        };
+        self.native_exit = self
+            .native_attachment
+            .as_ref()
+            .map(|native| native.observe(status));
         self.reaped = true;
         Ok(())
     }
@@ -481,13 +766,13 @@ impl LoginCoreChild for TokioLoginCoreChild {
         }
         // The registry's exclusive Child lock covers this whole close. Probe before a
         // synchronous SIGTERM; a native wait error must never schedule a later PID signal.
-        let exited = match self
+        let status = match self
             .child
             .as_mut()
             .ok_or("瞬态登录核句柄不可用")?
             .try_wait()
         {
-            Ok(status) => status.is_some(),
+            Ok(status) => status,
             Err(error) => {
                 #[cfg(unix)]
                 if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
@@ -496,8 +781,13 @@ impl LoginCoreChild for TokioLoginCoreChild {
                 return Err(format!("查询瞬态登录核退出失败: {error}"));
             }
         };
-        if exited {
-            return self.wait_result().await;
+        if let Some(status) = status {
+            self.native_exit = self
+                .native_attachment
+                .as_ref()
+                .map(|native| native.observe(status));
+            self.reaped = true;
+            return Ok(());
         }
         #[cfg(unix)]
         if let Some(pid) = self.pid().filter(|pid| *pid != 0) {
@@ -526,24 +816,61 @@ pub struct TokioLoginCoreSpawner;
 #[async_trait]
 impl LoginCoreSpawner for TokioLoginCoreSpawner {
     async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
-        // 装箱适配：把 `SpawnedChild` 换成 `LoginCoreChild`。请求原样透传 —— 排空回调在
-        // `TokioSpawner::spawn` 内部就被调用完了，到这里 child 已经不带管道。
+        self.spawn_with_temp_native_birth(req, None).await
+    }
+    fn prepare_temp_native_birth(&self) -> Option<PreparedTempNativeBirth> {
+        Some(PreparedTempNativeBirth::new())
+    }
+    async fn spawn_with_temp_native_birth(
+        &self,
+        req: SpawnRequest,
+        prepared: Option<PreparedTempNativeBirth>,
+    ) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        let bin = req.binary.clone();
         // This central guard linearizes OS spawn admission, not the outer registry publication.
         // Login/speedtest keep their own admission gate across this ready return and synchronously
         // publish the owned Child without another await or fallible branch before shutdown can drain.
-        let bin = req.binary.clone();
-        polaris_core_supervisor::with_check_admission(|| {
-            let spawned = TokioSpawner::new().spawn(req)?;
+        let admitted = polaris_core_supervisor::with_check_admission(|| {
+            if let Some(prepared) = &prepared {
+                prepared
+                    .enter_factory()
+                    .map_err(|error| SpawnError::Spawn {
+                        bin: bin.clone(),
+                        source: std::io::Error::other(error),
+                    })?;
+            }
+            // Drain executes after OS birth, before this call returns. A panic leaves entered
+            // responsibility booked; only this concrete call's actual Err issues no-child.
+            let spawned = match TokioSpawner::new().spawn(req) {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    if let Some(prepared) = &prepared {
+                        prepared.factory_returned_no_child();
+                    }
+                    return Err(error);
+                }
+            };
             Ok(Box::new(TokioLoginCoreChild {
                 child: Some(spawned.child),
                 reaped: false,
                 wait_identity_lost: false,
+                native_attachment: prepared.as_ref().map(PreparedTempNativeBirth::attach),
+                native_exit: None,
             }) as Box<dyn LoginCoreChild>)
-        })
-        .map_err(|error| SpawnError::Spawn {
-            bin,
-            source: std::io::Error::other(error),
-        })?
+        });
+        match admitted {
+            Ok(result) => result,
+            Err(error) => {
+                // Central admission rejected without invoking the factory closure.
+                if let Some(prepared) = &prepared {
+                    prepared.admission_rejected();
+                }
+                Err(SpawnError::Spawn {
+                    bin,
+                    source: std::io::Error::other(error),
+                })
+            }
+        }
     }
 }
 

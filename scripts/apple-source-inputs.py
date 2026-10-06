@@ -142,9 +142,7 @@ class Commands:
             row['groupDrainError'], row['groupDrained'] = str(error), False
         self.cleanup_allowed = all(item.get('groupDrained') is not False for item in self.rows)
 
-    def run(self, name, args, cwd, env=None):
-        args = [str(arg) for arg in args]
-        require(len(args) >= 2, 'forbidden tool operation')
+    def _allowed_command(self, args, cwd, env):
         kind = self.executables.get(args[0])
         go_args = args[1:]
         swift_sources = [str(ROOT / 'src-tauri/gen/apple/PacketTunnel' / name) for name in CONSUMERS]
@@ -152,7 +150,7 @@ class Commands:
                          and args[3] in ('arm64-apple-ios17.0', 'arm64-apple-ios17.0-simulator', 'x86_64-apple-ios17.0-simulator')
                          and args[4] == '-sdk' and args[6] == '-F' and args[8] == '-module-cache-path'
                          and args[10:14] == swift_sources and Path(args[14]).name == 'abi-witness.swift')
-        allowed = ((kind == 'go' and (go_args == ['version'] or (len(go_args) == 3 and go_args[:2] == ['version', '-m'])
+        return ((kind == 'go' and (go_args == ['version'] or (len(go_args) == 3 and go_args[:2] == ['version', '-m'])
                    or go_args == ['env', '-json', 'GOROOT', 'GOPATH', 'GOMODCACHE', 'GOCACHE', 'GOHOSTOS', 'GOHOSTARCH', 'GOOS', 'GOARCH']
                    or go_args == ['env', '-json']
                    or go_args == ['list', '-m', '-json', 'github.com/sagernet/gomobile']
@@ -168,11 +166,16 @@ class Commands:
                        and args[3] in ('--show-sdk-path', '--show-sdk-version', '--show-sdk-build-version'))
                    or (kind == 'xcrun' and args[1:3] in (['--sdk', 'iphoneos'], ['--sdk', 'iphonesimulator'])
                        and args[3:] in (['--find', 'clang'], ['--find', 'swiftc'])))
-        require(allowed, 'forbidden tool operation')
+
+    def run(self, name, args, cwd, env=None):
+        args = [str(arg) for arg in args]
+        require(len(args) >= 2, 'forbidden tool operation')
+        effective_env = env or self.env
+        require(self._allowed_command(args, cwd, effective_env), 'forbidden tool operation')
         require(self.cleanup_allowed, 'process group drain unknown; source tools stopped')
         require(time.monotonic() - self.started < 45 * 60, 'source window time budget exhausted')
         require(shutil.disk_usage(self.evidence).free >= 5 * 1024**3, 'less than 5 GiB free; source tools stopped')
-        env = env or self.env
+        env = effective_env
         index = len(self.rows) + 1
         row = {'name': name, 'argv': args, 'cwd': str(cwd), 'env': dict(env), 'exit': None,
                'stdout': f'{index:03d}.stdout', 'stderr': f'{index:03d}.stderr'}

@@ -181,6 +181,20 @@ def observe_source(checkout, receipt_path, go, mobile, developer, evidence):
     return collector.collect(final_preflight, source_helpers, checkout, receipt, go, mobile, developer, evidence)
 
 
+
+def component_module():
+    specification = importlib.util.spec_from_file_location('apple_component', SCRIPT.with_name('apple-component.py'))
+    component = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(component)
+    return component
+
+
+def observe_component(checkout, receipt_path, go, mobile, developer, evidence):
+    final_preflight()
+    raw = component_module().read_json(receipt_path)
+    return component_module().observe_component(checkout, raw.get('sourceReceipt', raw), go, mobile, developer, evidence)
+
+
 def inputs(historical=False):
     if not historical:
         artifact_preflight()
@@ -450,11 +464,39 @@ def main(argv=None):
     observer.add_argument('--mobile-bin', type=Path, required=True)
     observer.add_argument('--developer-dir', type=Path, required=True)
     observer.add_argument('--evidence-dir', type=Path, required=True)
+    component_observer = sub.add_parser('observe-component', help='Explicit C3 archive compiler observations; no Framework/publish/App')
+    component_observer.add_argument('checkout', type=Path)
+    for flag in ('source-receipt', 'go', 'mobile-bin', 'developer-dir', 'evidence-dir'):
+        component_observer.add_argument('--' + flag, type=Path, required=True)
+    for action in ('verify-component', 'resolve-component'):
+        command = sub.add_parser(action, help='Strict independently frozen component predicate; no final App admission')
+        command.add_argument('--build-policy', type=Path, required=True)
+        command.add_argument('--tools', type=Path, required=True)
+        if action == 'verify-component':
+            command.add_argument('--framework', type=Path, required=True)
+            command.add_argument('--receipt', type=Path, required=True)
+        else:
+            command.add_argument('--output-root', type=Path, required=True)
     for command in (builder, checker, input_checker):
         command.add_argument('--historical', action='store_true',
                              help='Explicitly use the frozen six-patch history; never final source evidence')
     args = parser.parse_args(argv)
-    if args.action == 'observe-source':
+    if args.action == 'observe-component':
+        observation = observe_component(args.checkout, args.source_receipt, args.go, args.mobile_bin, args.developer_dir, args.evidence_dir)
+        print(json.dumps({'evidenceScope': observation['evidenceScope'], 'status': observation['status'],
+                          'evidenceDirectory': str(args.evidence_dir), 'pending': observation['pending'], 'carrierAdmission': False}, sort_keys=True))
+    elif args.action in ('verify-component', 'resolve-component'):
+        final_preflight()
+        component = component_module()
+        policy, tools = component.read_json(args.build_policy), component.read_json(args.tools)
+        if args.action == 'verify-component':
+            receipt = component.read_json(args.receipt)
+            result = component.verify_component(args.framework, receipt, receipt['appleInput'], policy, tools)
+            print(json.dumps({'evidenceScope': result['evidenceScope'], 'outputFingerprint': result['outputFingerprint']}, sort_keys=True))
+        else:
+            result = component.resolve_component(args.output_root, policy, tools)
+            print(json.dumps(result, sort_keys=True))
+    elif args.action == 'observe-source':
         observation = observe_source(args.checkout, args.source_receipt, args.go, args.mobile_bin,
                                      args.developer_dir, args.evidence_dir)
         print(json.dumps({'evidenceScope': observation['evidenceScope'], 'status': observation['status'],
