@@ -489,6 +489,13 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/proxy/android_bridge/tailscale_store.rs': {
+    why: '原 android_bridge.rs 的 scoped store 模块外移后，父声明 cfg(any(android,test)) 使本文件在 '
+      + 'production 中只参与 Android 编译；原实际 dep-info 的 Android − host 差集已确认该精确文件。'
+      + '同父模块、同 public API、原 decoder/body 与 Android 调用保持，文件字节进入 APK 的 Rust cdylib，'
+      + '必须点亮 Android 编译/链接与打包腿。whole Android crossClippy/check 覆盖目标编译，host decoder '
+      + 'tests 与 check-android-bridge.mjs 覆盖原 37 个命令；这些门不签实际 JNI 调用、设备或 NoOwner 语义。',
+  },
   'scripts/core-source-provision.py': {
     why: '共同 core/dependency source provider 须点亮 Android AAR/APK 来源腿，避免共同来源变更静默沿用桌面豁免。'
       + 'Android builder 直接消费原 provider checkout，prelookup 与 cached/fresh 共享完整来源和实际工具/SDK 谓词。'
@@ -545,6 +552,21 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   },
   'src-tauri/src/runtime/tailscale_login_core.rs': {
     why: 'Android-only production adapter starts and closes an independent libbox login instance through the native bridge; APK compilation verifies this cfg branch and Java factory ABI.',
+  },
+  'src-tauri/src/runtime/mesh.rs': {
+    why: 'Android Logout dispatch and strict auth-state retirement consume the original native store custody and held target reservation. '
+      + 'These Android production branches enter the linked Rust cdylib and require fresh APK cfg/bridge compilation; '
+      + 'host FileStore tests cannot verify packaged JNI behavior or actual writer retirement.',
+  },
+  'src-tauri/src/runtime/proxy/prerequisite.rs': {
+    why: 'Android credential actions bind the original Main raw-config digest, complete claim scope, selected current runtime run and exact Stop. '
+      + 'These cfg branches enter the APK Rust cdylib and must compile against the packaged native bridge; '
+      + 'host selection negatives do not attest Android SDK execution or native cleanup.',
+  },
+  'src-tauri/src/runtime/tailscale_login_core/attempts.rs': {
+    why: 'The original Android Attempt retains private Main/Login custody or an exact Warm tuple and same-Entry action reservation across cancellation and unknown completion. '
+      + 'These production cfg fields and consumers enter the APK Rust cdylib; fresh APK compilation covers their native adapter types, '
+      + 'while host bookkeeping tests cannot prove on-device terminal or reservation release.',
   },
   'src-tauri/src/android_tls.rs': {
     why:
@@ -754,11 +776,18 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 在剥掉字符串的面上也还在，否则那是内联夹具的字符串在喂判据），加上声明了 JNI 导出的文件。
  * 「只在 android 上编译、而文件自己不含 `target_os` 字样」的那一类**不在本表的取材面上** ——
  * 那是 dep-info 对差门的射程，两者互补。
- * 只在注释里提过 android 的文件（今天是 `src-tauri/src/runtime/mesh.rs`、
- * `src-tauri/src/runtime/route_binding.rs`）**不进表** —— 把它们登记进来等于承认判据被自己的注释喂饱，
- * 那正是完备性门 C 组断言要证伪的形态。
+ * 只在注释里提过 android 的文件**不进表** —— 把它们登记进来等于承认判据被自己的注释喂饱，
+ * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/tailscale_login_core/tests/attempt_lifecycle.rs':
+    '原 cfg(test) 登录动作回归，只由 ci.yml 的 host cargo test --workspace 执行纯 Attempt/CAS 与源码绑定负门，测试代码不进入 APK。'
+    + 'Android cargo check -p polaris 不带 --all-targets，APK 构建也不构建 test target，因此其中 Android test cfg 编译/运行没有被 APK 腿保证；'
+    + '点亮 APK 腿不能补成这些测试的实际 Android 覆盖或 scoped writer 证明。',
+  'src-tauri/src/runtime/tailscale_login_core/tests/process_exit.rs':
+    '原 cfg(test) Child/supervisor 回归在 ci.yml 的 host cargo test --workspace 核真实 mock close/retry 与保留 Entry/config 的负门，不随 APK 发布。'
+    + 'Android cargo check -p polaris 未包含测试目标，APK 构建同样不编 test target；Android test cfg 的编译/运行缺口仍如实保留，'
+    + 'host close fixture 不能签 JNI terminal、实际 native retirement 或设备验收。',
   'src-tauri/src/commands/android_batch_qa.rs':
     '单一 Debug Android 批次入口；android+debug_assertions 分支走已有预算 plugin 桥，其他构型零资源 disabled stub。'
     + 'Android cargo check 守 cfg 类型，check-android-bridge A15 守 release guard/实际 BoxService 观察接线；'

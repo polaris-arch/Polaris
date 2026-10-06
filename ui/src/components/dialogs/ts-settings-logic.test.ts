@@ -14,11 +14,14 @@ import {
   initTsDraft,
   invalidTsCidrs,
   peersForTsNode,
+  tsCredentialClearIntent,
+  tsCredentialSource,
+  tsCredentialSaveErrorKey,
   EXIT_CUSTOM,
   type ExitNodeLabels,
 } from './ts-settings-logic';
 
-function node(ts: TailscaleSettings): ServerConfig {
+function node(ts: NonNullable<ServerConfig['tailscaleSettings']>): ServerConfig {
   return { id: 'ts1', name: 'TS', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: ts };
 }
 
@@ -536,5 +539,49 @@ describe('exitNodeOptions：排序与去重（Csel 靠 value 唯一定位选中�
     const input = [peer({ hostName: 'b' }), peer({ hostName: 'a' })];
     exitNodeOptions(input, '', L);
     expect(input.map((p) => p.hostName)).toEqual(['b', 'a']);
+  });
+});
+
+
+describe('credential clear intent and settings projection', () => {
+  it('captures the original active-or-retained revision without re-signing a changed saved node', () => {
+    const saved = node({ retainedAuthKeyAvailable: false, tailscaleCredentialRevision: 'revision-A' });
+    const intent = tsCredentialClearIntent(saved);
+    expect(intent).toEqual({ action: 'clear', expectedCredentialRevision: 'revision-A' });
+    saved.tailscaleSettings = { retainedAuthKeyAvailable: true, tailscaleCredentialRevision: 'revision-B' };
+    expect(intent?.expectedCredentialRevision).toBe('revision-A');
+    expect(tsCredentialClearIntent(node({}))).toBeUndefined();
+    expect(tsCredentialClearIntent(node({ authKey: 'synthetic', tailscaleCredentialRevision: 'legacy-active' }))).toEqual({ action: 'clear', expectedCredentialRevision: 'legacy-active' });
+  });
+
+  it('editable settings strip raw retained secrets and metadata while preserving ordinary active keys and source tags', () => {
+    const raw = { authKey: 'synthetic-active', sourceTag: 'source', retainedAuthKey: { authKey: 'synthetic-retained', controlAuthority: 'https://issuer.example' },
+      retainedAuthKeyAvailable: false, tailscaleCredentialRevision: 'revision-A' };
+    const settings = raw as unknown as TailscaleSettings;
+    const output = buildTsSettings(settings, initTsDraft(node(settings)));
+    expect(output.authKey).toBe('synthetic-active');
+    expect(output.sourceTag).toBe('source');
+    expect(output).not.toHaveProperty('retainedAuthKey');
+    expect(output).not.toHaveProperty('retainedAuthKeyAvailable');
+    expect(output).not.toHaveProperty('tailscaleCredentialRevision');
+    expect(buildTsSettings(settings, initTsDraft(node(settings)), true)).not.toHaveProperty('authKey');
+    expect(raw.retainedAuthKey.authKey).toBe('synthetic-retained');
+  });
+
+  it('recovers presentation metadata for the same staged target without borrowing another node or source', () => {
+    const saved = node({ sourceTag: 'A', retainedAuthKeyAvailable: false, tailscaleCredentialRevision: 'revision-A' });
+    const staged = { ...saved, tailscaleSettings: { sourceTag: 'A', hostname: 'edited' } };
+    expect(tsCredentialSource(staged, [saved])).toBe(saved);
+    const other = { ...saved, id: 'other' };
+    expect(tsCredentialSource(staged, [other])).toBe(staged);
+    const imported = { ...staged, tailscaleSettings: { sourceTag: 'B' } };
+    expect(tsCredentialSource(imported, [saved])).toBe(imported);
+  });
+
+  it('credential errors only expose the exact finite safe reason', () => {
+    expect(tsCredentialSaveErrorKey({ message: 'credentialRevisionChanged' })).toBe('ts.reasonCredentialChanged');
+    expect(tsCredentialSaveErrorKey({ message: 'invalidCredentialIntent' })).toBe('ts.reasonCredentialIntent');
+    expect(tsCredentialSaveErrorKey({ message: 'credentialRevisionChanged synthetic-private' })).toBe('common.saveFailed');
+    expect(tsCredentialSaveErrorKey('invalidCredentialIntent')).toBe('common.saveFailed');
   });
 });

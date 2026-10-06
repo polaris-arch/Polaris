@@ -44,6 +44,7 @@ internal class TransientLoginHostState(
     private val maxInstances: Int = 8,
 ) {
     interface Engine {
+        fun bindTailscaleStore(store: AndroidTailscaleStoreCustody) {}
         fun prepare(validationTicket: AndroidNativeAdmission.Ticket, stage: (String) -> Unit, cancelled: () -> Boolean)
         fun start()
         /** Same operational native/network/cache cleanup as the production adapter. */
@@ -104,8 +105,9 @@ internal class TransientLoginHostState(
         }
         val directories = try {
             requireSupported(config)
-            parseDirectories(config)
+            parseDirectories(config).also { if (ledger.isWarmLogin(nativeOwner.ticket)) ledger.bindWarmConfig(nativeOwner.ticket, config) }
         } catch (error: Throwable) {
+            ledger.finishWarmPreparation(nativeOwner.ticket)
             nativeOwner.cancel()
             reply(if (error is SystemEndpointGuard.Unsupported) {
                 TransientLoginHost.SystemInterfaceFailure()
@@ -120,12 +122,17 @@ internal class TransientLoginHostState(
             } else Entry(id, directories, nativeOwner).also { entries[id] = it }
         }
         if (entry == null) {
+            ledger.finishWarmPreparation(nativeOwner.ticket)
             nativeOwner.cancel()
             reply(TransientLoginHost.GeneralFailure("Android 登录实例标识重复或并发上限已到"))
             return
         }
         try {
-            nativeOwner.enqueue({ queue(it) }) { validationTicket ->
+            val enqueue: ((AndroidNativeAdmission.Ticket) -> Unit) -> Unit = { action ->
+                if (ledger.isWarmLogin(nativeOwner.ticket)) AndroidNativeValidation.enqueueWarm(ledger, nativeOwner.ticket, { queue(it) }, action)
+                else nativeOwner.enqueue({ queue(it) }) { validationTicket -> action(validationTicket) }
+            }
+            enqueue { validationTicket ->
                 var stage = "ownership"
                 val failure = synchronized(ownershipLock) { runCatching {
                     if (!ledger.birthAllowed(entry.nativeOwner.ticket)) throw ledger.admissionRejection()
@@ -142,6 +149,7 @@ internal class TransientLoginHostState(
                     entry.nativeOwner.construct {
                         val engine = createEngine(id, config, entry.stateDirectories) { close(entry) {} }
                         entry.engine = engine
+                        engine.bindTailscaleStore(entry.nativeOwner.bindTailscaleStore())
                         engine.prepare(validationTicket, { stage = it }, { entry.cancelled })
                         stage = "start"
                         engine.start()
@@ -171,6 +179,7 @@ internal class TransientLoginHostState(
                 } else reply(null)
             }
         } catch (error: Throwable) {
+            ledger.finishWarmPreparation(nativeOwner.ticket)
             nativeOwner.cancel()
             synchronized(entries) { if (entries[id] === entry) entries.remove(id) }
             reply(startFailure(error, "Android 独立登录失败 [admission/UNAVAILABLE]"))
@@ -218,6 +227,22 @@ internal class TransientLoginHostState(
     }
 
     fun running(id: String): Boolean = synchronized(entries) { entries[id]?.running == true }
+
+    /** Select once by full original binding; completion cannot look up a successor by ID. */
+    fun closeTailscale(binding: org.json.JSONObject, done: (AndroidNativeFailure?) -> Unit) {
+        val warm = binding.optString("contractVersion") == "polaris-android-ts-cold-warm-v1"
+        val warmTicket = if (warm) runCatching { ledger.warmTicket(binding) }.getOrNull() else null
+        // A claimed Start may still be parsing before its Host.Entry exists.
+        // Cancel that exact reserved ticket; a born factory stays Unknown and closes below.
+        warmTicket?.let { ledger.cancelBeforeBirth(it) }
+        val original = if (warm) null else ledger.readTailscaleOwner(binding)
+        val entry = synchronized(entries) { entries[binding.optString("logicalInstanceId")]?.takeIf {
+            it.nativeOwner.ticket.id == (warmTicket?.id ?: binding.optString("nativeTicketId"))
+        } }
+        if ((warm && warmTicket == null) || (!warm && original == null)) { done(AndroidNativeFailure("nativeRetirementUnknown")); return }
+        if (entry == null) { done(null); return } // Only the retained original Entry supplies the later receipt.
+        close(entry) { done(it?.let(::AndroidNativeFailure)) }
+    }
 
     /** Close acknowledgements are sent only after this instance's Go service and network callback are gone. */
     private fun dispose(entry: Entry): String? {

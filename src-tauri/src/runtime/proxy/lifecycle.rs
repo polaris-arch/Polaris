@@ -696,10 +696,17 @@ impl ProxyRuntime {
                     {
                         return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
                     }
-                    let Some(generation) = self.claim_generation(
-                        completion.map(|claim| claim.expected),
-                        LifecycleKind::Start,
-                    ) else {
+                    let claim_generation = || {
+                        self.claim_generation(
+                            completion.map(|claim| claim.expected),
+                            LifecycleKind::Start,
+                        )
+                    };
+                    let generation = match completion {
+                        Some(claim) => claim.while_active(claim_generation).flatten(),
+                        None => claim_generation(),
+                    };
+                    let Some(generation) = generation else {
                         return StartLeg::Superseded;
                     };
                     crash.reset_user_aborted();
@@ -959,6 +966,56 @@ impl ProxyRuntime {
         Ok(())
     }
 
+    /// The account action uses the original Stop dispatcher but must observe
+    /// an actual commit. Ordinary Stop's superseded Ok(None) is insufficient.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    pub(crate) async fn stop_for_tailscale_action(
+        self: &Arc<Self>,
+        expected: u64,
+        attempt: &crate::runtime::tailscale_login_core::Attempt,
+    ) -> Result<u64, String> {
+        let generation = {
+            let mut crash = self.crash_lock();
+            let generation = attempt
+                .while_active(|| self.claim_generation(Some(expected), LifecycleKind::Stop))
+                .flatten()
+                .ok_or("mainCoreChanged")?;
+            crash.mark_user_aborted();
+            generation
+        };
+        #[cfg(target_os = "ios")]
+        tauri_plugin_polaris_ios::revoke_pending_start_through(expected, generation).await?;
+        if self
+            .stop_inner(StopClaim::AlreadyClaimed(generation))
+            .await?
+            != Some(generation)
+        {
+            return Err("mainCoreChanged".into());
+        }
+        self.process_deferred_config_deletions().await;
+        self.clear_system_proxy().await;
+        if self.core_generation() != generation || attempt.cancelled() {
+            return Err("mainCoreChanged".into());
+        }
+        Ok(generation)
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(super) fn claim_cancelled_normal_start(
+        &self,
+        claim: &super::prerequisite::NormalStartClaim,
+    ) -> Option<(u64, u64)> {
+        let current = self.normal_start.lock().ok()?;
+        let original = self.core_generation();
+        if !claim.owns(current.as_ref()) || !claim.has_generation(original) {
+            return None;
+        }
+        let mut crash = self.crash_lock();
+        let stopped = self.claim_generation(Some(original), LifecycleKind::Stop)?;
+        crash.mark_user_aborted();
+        Some((original, stopped))
+    }
+
     /// Enter the shared stop teardown while the caller still holds the Tailscale state gate.
     /// Its generation was claimed before entry; this leg neither reclaims nor reacquires.
     #[allow(dead_code, reason = "reserved for the state-gated stop path")]
@@ -1101,10 +1158,8 @@ impl ProxyRuntime {
         if let Ok(mut ready) = self.ready_main.write() {
             *ready = None;
         }
-        #[cfg(target_os = "ios")]
-        if let Ok(mut receipt) = self.ios_ready_session.write() {
-            *receipt = None;
-        }
+        // Keep the original iOS Ready identity and scoped Stop receipt in
+        // custody. Clearing presentation state cannot certify writer disposal.
         if let Ok(mut route) = self.mesh_route_run.write() {
             *route = None;
         }

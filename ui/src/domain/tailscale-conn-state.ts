@@ -77,6 +77,16 @@ export function hasTsAuthKey(node: ServerConfig | undefined): boolean {
   return !!node?.tailscaleSettings?.authKey?.trim();
 }
 
+/** Record presence also includes an issuer-mismatched retained key; this is presentation only. */
+export function hasTsRetainedAuthKey(node: ServerConfig | undefined): boolean {
+  return typeof node?.tailscaleSettings?.retainedAuthKeyAvailable === 'boolean';
+}
+
+export function canReuseTsAuthKey(node: ServerConfig | undefined): boolean {
+  return node?.tailscaleSettings?.retainedAuthKeyAvailable === true
+    && !!node.tailscaleSettings.tailscaleCredentialRevision;
+}
+
 export function deriveTsCardState(
   tsNode: ServerConfig | undefined,
   loggedIn: boolean | undefined,

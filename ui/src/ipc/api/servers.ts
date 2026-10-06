@@ -67,25 +67,27 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PROGRESS, { serverId, attemptId });
   },
 
-  async tailscaleLogin(server: ServerConfig, request: { attemptId: string; mode: 'browser' | 'authkey' }): Promise<{
+  async tailscaleLogin(server: ServerConfig, request: { attemptId: string; mode: 'browser' | 'authkey'; replaceIdentity?: boolean;
+    reuseRetainedAuthKey?: boolean; expectedCredentialRevision?: string }): Promise<{
     started: boolean;
     reason?: 'inMainCore' | 'cancelled';
     configurationPending?: boolean;
   }> {
-    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server, request });
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server, request: { ...request, replaceIdentity: request.replaceIdentity ?? false,
+      reuseRetainedAuthKey: request.reuseRetainedAuthKey ?? false } });
   },
 
-  /** Resolves only after the cancelled request no longer owns a process/state writer. */
+  /** Cancels this exact login request; it does not certify retirement of the main proxy. */
   async tailscaleLoginCancel(serverId: string, attemptId: string): Promise<void> {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_CANCEL, { serverId, attemptId });
   },
 
-  /** 退出登录：清该节点 Tailscale 持久登录会话（state 目录）。 */
+  /** 退出登录：只清目标认证记录，保留 Taildrop；iOS 的正常连接/停止由后端负责。 */
   async tailscaleLogout(serverId: string, keepAttemptId?: string): Promise<{ runningNeedsRestart: boolean }> {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGOUT, { serverId, keepAttemptId });
   },
 
-  /** Default: physical state for safe replacement. Opt-in: cached sessions for presentation only. */
+  /** Default: directory presence. Opt-in: cached identity presence; neither is writer retirement proof. */
   async tailscaleStateExists(serverIds: string[], cachedSessionOnly = false): Promise<Record<string, boolean>> {
     return invoke(IPC_CHANNELS.TAILSCALE_STATE_EXISTS, { serverIds, cachedSessionOnly });
   },

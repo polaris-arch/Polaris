@@ -1,6 +1,6 @@
 import { MobileInfo } from '../MobileInfo';
 /**
- * 移动 Tailscale 接入：先保存配置，再发起授权。保存成功后的重试复用同一节点。
+ * 移动 Tailscale 接入：空凭据登录先保存；明确凭据动作与 iOS 切换由同一后端请求处理后刷新。
  * URL 自动打开归 app-wiring；本面板保留复制/重开入口。瞬态进度按 attempt 接受后端
  * 授权结局与 URL；全局 STATUS 只展示账号状态，不证明本次请求成功。
  */
@@ -14,14 +14,17 @@ import {
   nextTsNodeName,
   planTsLoginSubmit,
   supportsTsLoginActions,
+  tsLoginUsesBackendReplacement,
+  tsLoginUsesBackendCredentials,
   type TsLoginMode,
 } from '@/components/dialogs/ts-login-server';
 import type { ServerConfig } from '@/contracts/types';
 import { controlUrlReject } from '@/domain/control-url';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
+import { canReuseTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
 import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
-import { copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
+import { copyLoginUrl, loginAttemptActive, loginConnectionProgressKey, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
@@ -31,13 +34,17 @@ import { useMobileFormStore } from './form-store';
 export function TsLoginPanel({
   instanceId,
   serverId,
+  replaceIdentity = false,
 }: {
   instanceId: string;
   serverId?: string;
+  replaceIdentity?: boolean;
 }): ReactElement {
   const { t } = useTranslation();
   const accountActionsSupported = supportsTsAccountActions();
   const loginActionsSupported = supportsTsLoginActions();
+  const backendReplacement = tsLoginUsesBackendReplacement(replaceIdentity);
+  const isIOS = tsLoginUsesBackendReplacement(true);
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -65,6 +72,9 @@ export function TsLoginPanel({
   const [errName, setErrName] = useState(false);
   const [mode, setMode] = useState<TsLoginMode>('browser');
   const [authKey, setAuthKey] = useState('');
+  const [reuseCredentialRevision, setReuseCredentialRevision] = useState<string>();
+  const reuseRetainedAuthKey = !!reuseCredentialRevision;
+  const credentialNode = savedServer ?? existingTs;
   const [errKey, setErrKey] = useState(false);
   /* 自建控制面地址。**登录表必须有这一格**：登录核确实透传它
      （`crates/mesh/src/tailscale_login.rs`），但此前只有「TS 设置」表有控件，而那张表要求节点
@@ -301,7 +311,7 @@ export function TsLoginPanel({
       return;
     }
     setName(submittedName);
-    if (mode === 'authkey' && authKey.trim() === '') {
+    if (mode === 'authkey' && authKey.trim() === '' && !reuseRetainedAuthKey) {
       setErrKey(true);
       return;
     }
@@ -314,6 +324,9 @@ export function TsLoginPanel({
     }
     setErrControl(null);
     const submissionRevision = editRevisionRef.current;
+    const backendCredentials = tsLoginUsesBackendCredentials(submissionBase, reuseRetainedAuthKey);
+    const backendOwned = backendReplacement || backendCredentials;
+    const expectedCredentialRevision = reuseCredentialRevision ?? submissionBase?.tailscaleSettings?.tailscaleCredentialRevision;
     const submission = ++submissionRef.current;
     setSubmitting(true);
     setNotice(undefined);
@@ -321,12 +334,12 @@ export function TsLoginPanel({
     try {
       if (!await discardPendingLogin()) return;
       const { server, persist } = planTsLoginSubmit({
-        // The fresh state query occurs after prepare and before save. This preview flag does
-        // not decide logout; executeTsLogin consumes only the fresh result below.
-        existing: submissionBase, name: submittedName, mode, authKey, controlUrl, hasState: false,
+        // Presence is presentation metadata. Only an explicit switch selects replacement;
+        // the backend owns the writer/identity gates in both platform flows.
+        existing: submissionBase, name: submittedName, mode, authKey, reuseRetainedAuthKey, controlUrl, hasState: false,
         mintId: () => crypto.randomUUID(),
       });
-      persisted = persist === 'none';
+      persisted = !backendOwned && persist === 'none';
       const request: PendingLogin = { serverId: server.id, attemptId: crypto.randomUUID(), source: 'pending', persisted };
       pendingRef.current = request;
       setPending(request);
@@ -340,11 +353,23 @@ export function TsLoginPanel({
           && phase.phase !== 'timedOut' && phase.phase !== 'failed' && phase.phase !== 'cancelled';
       };
       let startResult: Awaited<ReturnType<typeof api.server.tailscaleLogin>> | undefined;
+      const recordSaved = (actual: ServerConfig, matchesCandidate = true): void => {
+        persisted = true;
+        if (pendingRef.current?.attemptId !== request.attemptId || !hasInstance(instanceId)) return;
+        setSavedServer(actual);
+        const savedRequest = { ...pendingRef.current, persisted: true };
+        pendingRef.current = savedRequest;
+        setPending(savedRequest);
+        editedAfterSaveRef.current = editRevisionRef.current !== submissionRevision;
+        if (matchesCandidate && stillActive() && !editedAfterSaveRef.current) setDirty(false);
+      };
       const outcome = await executeTsLogin({
+        backendReplacement,
+        backendCredentials,
         isActive: stillActive,
         prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId),
-        verifyState: mode === 'authkey' && accountActionsSupported ? async () => {
-          const states = await api.server.tailscaleStateExists([server.id]);
+        verifyState: !isIOS && (mode === 'authkey' || replaceIdentity) ? async () => {
+          const states = await api.server.tailscaleStateExists([server.id], true);
           if (typeof states[server.id] !== 'boolean') throw new Error('STATE_QUERY_UNAVAILABLE');
           if (stillActive()) setHasState(states[server.id]);
           return states[server.id];
@@ -354,23 +379,21 @@ export function TsLoginPanel({
           if (persist === 'add') await api.server.add(server);
           else if (persist === 'update') await api.server.update(server);
         },
-        onSaved: () => {
-          // A successful write is retained across a later refresh or login failure.
-          persisted = true;
-          setSavedServer(server);
-          if (pendingRef.current?.attemptId === request.attemptId) {
-            const savedRequest = { ...pendingRef.current, persisted: true };
-            pendingRef.current = savedRequest;
-            setPending(savedRequest);
-          }
-          editedAfterSaveRef.current = editRevisionRef.current !== submissionRevision;
-          if (stillActive() && !editedAfterSaveRef.current) setDirty(false);
-        },
+        onSaved: () => recordSaved(server),
         refresh: async () => {
-          if (persist === 'none') return;
+          if (!backendOwned && persist === 'none') return;
           await loadConfig(true);
           const mirrored = useAppStore.getState().servers.find((s) => s.id === server.id);
-          if (!mirrored || mirrored.name !== server.name
+          const matches = mirrored && mirrored.name === server.name
+            && mirrored.tailscaleSettings?.controlUrl === server.tailscaleSettings?.controlUrl
+            && (backendOwned || mirrored.tailscaleSettings?.authKey === server.tailscaleSettings?.authKey)
+            && mirrored.tailscaleSettings?.sourceTag === server.tailscaleSettings?.sourceTag;
+          if (backendOwned) {
+            // A failed/cancelled backend request may have committed its candidate already.
+            // Read the saved mirror even after close; only this live request may update the panel.
+            if (mirrored) recordSaved(mirrored, !!matches && !!(startResult?.started || startResult?.reason === 'inMainCore'));
+            if (!matches && (startResult?.started || startResult?.reason === 'inMainCore')) throw new Error('TS_CONFIG_REFRESH_FAILED');
+          } else if (!mirrored || mirrored.name !== server.name
             || mirrored.tailscaleSettings?.controlUrl !== server.tailscaleSettings?.controlUrl
             || mirrored.tailscaleSettings?.authKey !== server.tailscaleSettings?.authKey
             || mirrored.tailscaleSettings?.sourceTag !== server.tailscaleSettings?.sourceTag) {
@@ -378,7 +401,7 @@ export function TsLoginPanel({
           }
         },
         start: async () => {
-          startResult = await api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode });
+          startResult = await api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode, replaceIdentity, reuseRetainedAuthKey, expectedCredentialRevision });
           return startResult;
         },
         cancel: async () => {
@@ -387,6 +410,7 @@ export function TsLoginPanel({
           await api.server.tailscaleLoginCancel(server.id, request.attemptId);
         },
       });
+      if (outcome.refreshFailed) toast.error(t('ts.loginRefreshFailed'));
       if (!stillActive()) return;
       const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
       if (outcome.phase === 'failed') {
@@ -471,6 +495,7 @@ export function TsLoginPanel({
           placeholder="https://controlplane.tailscale.com"
           onChange={(e) => {
             setControlUrl(e.target.value);
+            setReuseCredentialRevision(undefined);
             setErrControl(null);
             setDirty(true);
             editedAfterSaveRef.current = true;
@@ -497,7 +522,7 @@ export function TsLoginPanel({
             aria-pressed={mode === 'browser'}
             disabled={submitting}
             onClick={() => {
-              void discardPendingLogin().then((ok) => { if (ok) { setMode('browser'); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
+              void discardPendingLogin().then((ok) => { if (ok) { setMode('browser'); setReuseCredentialRevision(undefined); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
             }}
           >
             {t('ts.browserLogin')}
@@ -508,7 +533,7 @@ export function TsLoginPanel({
             aria-pressed={mode === 'authkey'}
             disabled={submitting}
             onClick={() => {
-              void discardPendingLogin().then((ok) => { if (ok) { setMode('authkey'); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
+              void discardPendingLogin().then((ok) => { if (ok) { setMode('authkey'); setReuseCredentialRevision(undefined); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
             }}
           >
             {t('ts.authKey')}
@@ -534,12 +559,24 @@ export function TsLoginPanel({
             placeholder="YOUR_TAILSCALE_AUTH_KEY"
             onChange={(e) => {
               setAuthKey(e.target.value);
+              setReuseCredentialRevision(undefined);
               setErrKey(false);
               setDirty(true);
               editedAfterSaveRef.current = true;
               editRevisionRef.current++;
             }}
           />
+          {canReuseTsAuthKey(credentialNode) && controlUrl === (credentialNode?.tailscaleSettings?.controlUrl ?? '') && (
+            <button type="button" className={`m-form-btn${reuseRetainedAuthKey ? ' primary' : ''}`} disabled={submitting}
+              aria-pressed={reuseRetainedAuthKey} onClick={() => {
+                setReuseCredentialRevision(reuseRetainedAuthKey ? undefined : credentialNode?.tailscaleSettings?.tailscaleCredentialRevision);
+                setAuthKey(''); setErrKey(false); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++;
+              }}>{t('ts.reuseSavedAuthKey')}</button>
+          )}
+          {hasTsRetainedAuthKey(credentialNode) && <p className="m-form-hint" role="status">
+            {t(credentialNode?.tailscaleSettings?.retainedAuthKeyAvailable && controlUrl === (credentialNode.tailscaleSettings.controlUrl ?? '')
+              ? 'ts.retainedAuthKeyHint' : 'ts.retainedAuthKeyAuthorityHint')}
+          </p>}
           <p className="m-form-hint">{t('ts.authkeyHint')}</p>
           {errKey && <p className="m-form-err">{t('ts.errKey')}</p>}
           {hasState === true && <div className="m-form-hint"><MobileInfo title={t('ts.authKeyLabel')} summary={t('mobileHelp.tsAuthKeySwitch')} details={t(accountActionsSupported ? 'ts.authKeySwitchLogoutNote' : 'ts.identityRetirementRequired')} /></div>}
@@ -547,6 +584,7 @@ export function TsLoginPanel({
         </div>
       )}
 
+      {backendReplacement && <p className="m-form-hint">{t('ts.switchAccountNote')}</p>}
       {(mode === 'browser' || progress !== undefined) && (progress?.phase === 'authorized' ? (
         <p className="m-form-hint">{t('ts.loginMainCoreAuthorized')}</p>
       ) : authUrl !== null ? (
@@ -584,8 +622,8 @@ export function TsLoginPanel({
             {t('ts.retryLogin')}
           </button>
         </div>
-      ) : progress?.phase === 'preparingConnection' || progress?.phase === 'waitingForReady' ? (
-        <p className="m-form-hint" role="status">{t(progress.phase === 'preparingConnection' ? 'prerequisite.preparingConnection' : 'prerequisite.waitingForReady')}</p>
+      ) : loginConnectionProgressKey(progress?.phase) ? (
+        <p className="m-form-hint" role="status">{t(loginConnectionProgressKey(progress?.phase)!)}</p>
       ) : progress?.phase === 'starting' ? (
         <p className="m-form-hint">{t('ts.awaitingUrl')}</p>
       ) : progress?.phase === 'mainCore' && !progress.reason ? (

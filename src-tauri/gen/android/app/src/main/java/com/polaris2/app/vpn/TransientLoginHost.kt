@@ -40,6 +40,7 @@ internal object TransientLoginHost {
     fun close(id: String, done: (String?) -> Unit) = state.close(id, done)
     fun closeCoded(id: String, done: (AndroidNativeFailure?) -> Unit) = state.closeCoded(id, done)
     fun running(id: String): Boolean = state.running(id)
+    fun closeTailscale(binding: JSONObject, done: (AndroidNativeFailure?) -> Unit) = state.closeTailscale(binding, done)
 
     private fun stateDirectories(config: String): Set<String> {
         val endpoints = JSONObject(config).optJSONArray("endpoints") ?: return emptySet()
@@ -58,9 +59,13 @@ internal object TransientLoginHost {
         private var server: CommandServer? = null
         private var network: TransientLoginNetwork? = null
         private var cache: File? = null
+        private var store: AndroidTailscaleStoreCustody? = null
         private val cleanup = TransientHostCleanup(
             beginResolverClose = { network?.beginResolverClose() },
-            closeService = { server?.let { server -> server.closeService() } },
+            closeService = { server?.let { server ->
+                try { server.closeService() }
+                finally { store?.closed { AndroidTailscaleStoreCustody.export(server) } }
+            } },
             closeServer = { server?.let { server -> server.close() } },
             closeNetwork = { network?.close() },
             nativeClosed = { server = null },
@@ -70,6 +75,8 @@ internal object TransientLoginHost {
                 cache = null
             },
         )
+
+        override fun bindTailscaleStore(store: AndroidTailscaleStoreCustody) { check(this.store == null); this.store = store }
 
         override fun prepare(validationTicket: AndroidNativeAdmission.Ticket, stage: (String) -> Unit, cancelled: () -> Boolean) {
             val value = checkNotNull(config)
@@ -96,7 +103,12 @@ internal object TransientLoginHost {
         }
 
         override fun start() {
-            try { checkNotNull(server).startOrReloadService(checkNotNull(config), OverrideOptions()) }
+            try {
+                val original = checkNotNull(server)
+                checkNotNull(store).invoke(checkNotNull(config), { AndroidTailscaleStoreCustody.export(original) }) {
+                    original.startOrReloadService(checkNotNull(config), OverrideOptions())
+                }
+            }
             finally { config = null }
         }
 

@@ -3224,3 +3224,220 @@ fn local_native_birth_and_terminal_facts_follow_actual_production_edges() {
         stop.find("*pid = None").unwrap() < stop.find("self.prune_normal_producers()").unwrap()
     );
 }
+
+#[test]
+fn writer_retirement_requires_every_original_run_and_node() {
+    let node = |tag: &str| WriterNodeScope {
+        tag: tag.into(),
+        directory: format!("/private/state/{tag}"),
+        file: format!("/private/state/{tag}/tailscaled.state"),
+        terminal: false,
+    };
+    let original = vec![
+        WriterRunScope {
+            nonce: "a".repeat(64),
+            digest: "1".repeat(64),
+            terminal: false,
+            complete: false,
+            nodes: vec![node("target"), node("other")],
+        },
+        WriterRunScope {
+            nonce: "b".repeat(64),
+            digest: "2".repeat(64),
+            terminal: true,
+            complete: true,
+            nodes: vec![node("retained")],
+        },
+    ];
+    let expected: Vec<_> = original[0]
+        .nodes
+        .iter()
+        .map(|node| (node.tag.clone(), node.directory.clone(), node.file.clone()))
+        .collect();
+    let mut retired = original.clone();
+    for run in &mut retired {
+        run.terminal = true;
+        run.complete = true;
+        for node in &mut run.nodes {
+            node.terminal = true;
+        }
+    }
+    assert!(verify_writer_census(&original, &retired, &"1".repeat(64), &expected).is_ok());
+    for mutation in 0..9 {
+        let mut bad = retired.clone();
+        match mutation {
+            0 => {
+                bad.pop();
+            }
+            1 => {
+                bad[0].nodes.pop();
+            }
+            2 => {
+                bad[1].complete = false;
+            }
+            3 => {
+                bad[1].terminal = false;
+            }
+            4 => {
+                bad[0].nodes[1].terminal = false;
+            }
+            5 => {
+                bad[0].nonce = "c".repeat(64);
+            }
+            6 => {
+                bad[0].digest = "3".repeat(64);
+            }
+            7 => {
+                bad[0].nodes[0].directory = "/private/other".into();
+            }
+            _ => {
+                bad.push(bad[0].clone());
+            }
+        }
+        assert!(
+            verify_writer_census(&original, &bad, &"1".repeat(64), &expected).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    assert!(verify_writer_census(&[], &[], &"1".repeat(64), &expected).is_err());
+    assert!(verify_writer_census(&original, &retired, &"9".repeat(64), &expected).is_err());
+    assert!(verify_writer_census(&original, &retired, &"1".repeat(64), &expected[..1]).is_err());
+}
+
+#[test]
+fn pre_ready_retirement_uses_original_full_claim_without_a_ready_baseline() {
+    let node = |tag: &str| WriterNodeScope {
+        tag: tag.into(),
+        directory: format!("/private/state/{tag}"),
+        file: format!("/private/state/{tag}/tailscaled.state"),
+        terminal: true,
+    };
+    let retired = vec![WriterRunScope {
+        nonce: "a".repeat(64),
+        digest: "1".repeat(64),
+        terminal: true,
+        complete: true,
+        nodes: vec![node("target"), node("other")],
+    }];
+    let expected: Vec<_> = retired[0]
+        .nodes
+        .iter()
+        .map(|node| (node.tag.clone(), node.directory.clone(), node.file.clone()))
+        .collect();
+    assert!(verify_pre_ready_writer_census(&retired, &"1".repeat(64), &expected).is_ok());
+    for mutation in 0..9 {
+        let mut bad = retired.clone();
+        match mutation {
+            0 => bad.clear(),
+            1 => {
+                bad[0].nodes.pop();
+            }
+            2 => bad[0].complete = false,
+            3 => bad[0].terminal = false,
+            4 => bad[0].nodes[1].terminal = false,
+            5 => {
+                let mut historic = bad[0].clone();
+                historic.nonce = "b".repeat(64);
+                historic.digest = "2".repeat(64);
+                bad.push(historic);
+            }
+            6 => bad.push(bad[0].clone()),
+            7 => bad[0].nodes[0].file = "/private/other/tailscaled.state".into(),
+            _ => bad[0].nodes[0].directory = "relative/path".into(),
+        }
+        assert!(
+            verify_pre_ready_writer_census(&bad, &"1".repeat(64), &expected).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    assert!(verify_pre_ready_writer_census(&retired, &"1".repeat(64), &[]).is_err());
+    assert!(verify_pre_ready_writer_census(&retired, &"1".repeat(64), &expected[..1]).is_err());
+}
+
+#[test]
+fn ios_cold_and_pre_ready_consumers_keep_original_custody_and_strict_stop() {
+    let proxy = module_code("runtime/proxy");
+    let custody = method_body(&proxy, "    fn allows_successor(&self) -> bool {");
+    assert!(custody.contains("self.main_token.is_none()"));
+    assert!(custody.contains("self.stopped.is_some()"));
+    assert!(custody.contains("IosMainOrigin::LocalStart(start)"));
+    assert!(custody.contains("receipt.belongs_to(start)"));
+    assert!(
+        !custody.contains("IosMainOrigin::Observed"),
+        "observed token=None is not closure"
+    );
+    let source = module_code("runtime/proxy/prerequisite");
+    let attach = method_body(
+        &source,
+        "    pub(crate) async fn prepare_tailscale_action_origin(",
+    );
+    assert!(attach.contains("self.core_generation() != generation"));
+    let attach_compact: String = attach.split_whitespace().collect();
+    assert!(attach_compact.contains("observe_current_session().await"));
+    assert!(attach_compact.contains("attempt.while_active(||"));
+    assert!(attach.contains("with_current_generation(generation"));
+    assert!(attach_compact.contains("ifslot.is_some()"));
+    assert!(attach_compact.contains("main_token:None"));
+    assert!(!attach.contains("mint_tailscale_main_birth"));
+    assert!(
+        attach.find("drop(gate)").unwrap()
+            < attach
+                .rfind("stop_for_tailscale_action(generation, attempt)")
+                .unwrap()
+    );
+    let stop = method_body(
+        &module_code("runtime/proxy/process_supervision"),
+        "    pub(super) async fn kill_core_and_release_main(",
+    );
+    assert!(stop.contains("stop_observed(observed).await"));
+    let stop_compact: String = stop.split_whitespace().collect();
+    assert!(stop_compact.contains("source_extension_generation()!=observed.extension_generation()"));
+    assert!(stop_compact
+        .contains("verify_pre_ready_writer_census(&retired,&owner.config_digest,&expected,)"));
+    assert!(stop.contains("current.same_origin(&owner)"));
+    assert!(
+        !stop.contains("ReadySessionReceipt::"),
+        "no fabricated Ready for failed Start"
+    );
+    let startup = method_body(
+        &module_code("runtime/proxy/startup"),
+        "    pub(super) async fn start_inner(",
+    );
+    assert!(startup.contains("!owner.allows_successor()"));
+    assert!(
+        startup.find("!owner.allows_successor()").unwrap()
+            < startup
+                .find("tauri_plugin_polaris_ios::prepare_start(")
+                .unwrap()
+    );
+}
+
+#[test]
+fn post_logout_sign_in_requires_original_normal_ready_and_fresh_status() {
+    let login = module_code("runtime/tailscale_login_core");
+    let ordinary = method_body(&login, "    async fn launch_normal_main_attempt(");
+    let compact: String = ordinary.split_whitespace().collect();
+    assert!(compact.contains("prepare_tailscale_action_origin(normal.action_generation,attempt)"));
+    assert!(compact.contains("binding.for_attempt(action_generation,Arc::clone(attempt))"));
+    assert!(compact.contains("normal.proxy.await_normal_main(binding)"));
+    assert!(compact.contains("self.confirm_main_request("));
+    assert!(
+        !compact.contains("cached_session_exists"),
+        "readonly absence must not bypass normal Ready"
+    );
+    let logout = method_body(&login, "    pub(crate) async fn logout_with_normal_main(");
+    let compact: String = logout.split_whitespace().collect();
+    assert!(compact.contains("prepare_tailscale_action_origin(generation,&attempt)"));
+    assert!(compact.contains("proxy.await_normal_main(binding)"));
+    assert!(compact.contains("retire_tailscale_account(&ready,server_id,&attempt,&saved,None)"));
+    assert_eq!(
+        compact.matches("proxy.await_normal_main(binding)").count(),
+        1,
+        "standalone logout has only the old saved prerequisite, no successor Start"
+    );
+    assert!(!compact.contains("confirm_main_request"));
+    assert!(
+        compact.contains("error.code().to_owned()"),
+        "normal permission failures keep their structured code"
+    );
+}

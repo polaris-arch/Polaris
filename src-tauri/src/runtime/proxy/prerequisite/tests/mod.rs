@@ -446,6 +446,36 @@ pub(super) fn runtime() -> (Arc<ProxyRuntime>, crate::test_support::TestDir) {
     (runtime, dir)
 }
 
+pub(super) fn credential_runtime(
+    registry: crate::runtime::tailscale_login_core::LoginCoreRegistry,
+) -> (
+    Arc<ProxyRuntime>,
+    Arc<crate::runtime::mesh::MeshRuntime>,
+    crate::test_support::TestDir,
+    Arc<polaris_core_supervisor::LifecycleGate>,
+) {
+    let dir = crate::test_support::TestDir::new("polaris-credential-");
+    let mesh = Arc::new(
+        crate::runtime::mesh::MeshRuntime::with_login_registry_for_test(
+            dir.to_path_buf(),
+            registry,
+        ),
+    );
+    let runtime = Arc::new(ProxyRuntime::new(
+        Arc::new(crate::runtime::config::ConfigManager::new(
+            dir.to_path_buf(),
+        )),
+        Arc::new(
+            crate::runtime::helper::HelperRuntime::never_installed_for_tests(dir.to_path_buf()),
+        ),
+        Arc::clone(&mesh),
+        Box::new(NoSystemProxy),
+        Arc::new(NoNetwork),
+    ));
+    let gate = Arc::clone(&runtime.gate);
+    (runtime, mesh, dir, gate)
+}
+
 pub(super) fn ready_for(runtime: &ProxyRuntime) -> (Arc<ReadyMainCore>, ActionBinding) {
     let saved = runtime.config.current().unwrap();
     let binding = ActionBinding::new(
@@ -724,6 +754,7 @@ fn finished_same_generation_producer_remains_joinable_while_outer_operation_sett
         digest: digest(&saved).unwrap(),
         completion,
         identity: ProducerCell::queued(Arc::clone(&runtime.stop_domain), core.generation),
+        attempt: None,
     });
     runtime.gate.begin();
     assert!(runtime.join_current_normal_start(&saved).unwrap().is_some());
@@ -820,7 +851,7 @@ async fn different_config_cannot_join_and_old_completion_cannot_follow_successor
             .unwrap()
             .retained
             .iter()
-            .any(|cell| Arc::ptr_eq(cell, &old_cell)),
+            .any(|cell| Arc::ptr_eq(&cell.identity, &old_cell)),
         "current B replacement cannot erase admitted A"
     );
     while matches!(
@@ -1057,4 +1088,291 @@ async fn completed_prebirth_normal_requests_do_not_accumulate_native_catalog_ent
             "completed nonnative request creates no permanent single-Child obligations"
         );
     }
+}
+
+#[test]
+fn candidate_cas_preserves_other_nodes_and_saved_provenance() {
+    let mut original = saved();
+    original["servers"][1]["sourceTag"] = serde_json::json!("original-import");
+    original["servers"][1]["unknownField"] = serde_json::json!({"keep": true});
+    let candidate = serde_json::json!({"id":"second", "name":"Candidate", "protocol":"tailscale", "sourceTag":"renderer", "tailscaleSettings":{"authKey":"synthetic-new"}});
+    let mut actual = original.clone();
+    merge_tailscale_candidate(&mut actual, &original, &candidate).unwrap();
+    assert_eq!(actual["servers"][0], original["servers"][0]);
+    assert_eq!(actual["selectedServerId"], original["selectedServerId"]);
+    assert_eq!(
+        actual["servers"][1]["sourceTag"],
+        original["servers"][1]["sourceTag"]
+    );
+    assert_eq!(
+        actual["servers"][1]["unknownField"],
+        original["servers"][1]["unknownField"]
+    );
+    assert_eq!(
+        actual["servers"][1]["tailscaleSettings"],
+        candidate["tailscaleSettings"]
+    );
+    let mut changed = original.clone();
+    changed["unrelatedConcurrentWriter"] = serde_json::json!(true);
+    let before = changed.clone();
+    assert!(merge_tailscale_candidate(&mut changed, &original, &candidate).is_err());
+    assert_eq!(changed, before);
+    let mut duplicated = original.clone();
+    duplicated["servers"]
+        .as_array_mut()
+        .unwrap()
+        .push(original["servers"][1].clone());
+    assert!(merge_tailscale_candidate(&mut duplicated.clone(), &duplicated, &candidate).is_err());
+}
+
+#[tokio::test]
+async fn action_producer_cannot_rebase_after_stop_or_cancellation() {
+    let (runtime, _directory) = runtime();
+    let registry = runtime.mesh.login_registry_for_test();
+    registry.prepare("first", "scoped-action").await.unwrap();
+    let attempt = registry.prepared_attempt_for_test("first", "scoped-action");
+    let captured = runtime.core_generation();
+    let stopped = runtime
+        .gate
+        .claim_generation(Some(captured), polaris_core_supervisor::LifecycleKind::Stop)
+        .unwrap();
+    assert!(runtime
+        .register_normal_start(
+            serde_json::json!(false),
+            true,
+            Some((captured, Arc::clone(&attempt)))
+        )
+        .is_err());
+    assert_eq!(runtime.core_generation(), stopped);
+    assert!(runtime.normal_start.lock().unwrap().as_ref().is_none());
+    attempt.cancel();
+    assert!(runtime
+        .register_normal_start(serde_json::json!(false), true, Some((stopped, attempt)))
+        .is_err());
+    assert_eq!(runtime.core_generation(), stopped);
+    assert!(runtime.normal_start.lock().unwrap().as_ref().is_none());
+}
+
+#[tokio::test]
+async fn cancellation_after_queue_before_dispatch_cannot_birth_a_producer() {
+    let (runtime, _directory) = runtime();
+    let registry = runtime.mesh.login_registry_for_test();
+    registry.prepare("first", "queued-action").await.unwrap();
+    let attempt = registry.prepared_attempt_for_test("first", "queued-action");
+    let captured = runtime.core_generation();
+    let mut completion = runtime
+        .register_normal_start(
+            serde_json::json!(false),
+            true,
+            Some((captured, Arc::clone(&attempt))),
+        )
+        .unwrap();
+    attempt.cancel();
+    while matches!(
+        &*completion.borrow_and_update(),
+        NormalStartCompletion::Pending(_) | NormalStartCompletion::Starting(_)
+    ) {
+        completion.changed().await.unwrap();
+    }
+    assert!(matches!(
+        &*completion.borrow(),
+        NormalStartCompletion::Superseded
+    ));
+    assert_eq!(runtime.core_generation(), captured);
+}
+
+#[test]
+fn browser_candidate_removes_old_key_and_preserves_unmodeled_ts_fields() {
+    let mut original = saved();
+    original["servers"][1]["tailscaleSettings"] = serde_json::json!({
+        "authKey":"synthetic-old", "sourceTag":"original-ts-source",
+        "unknownSetting":{"keep":true}, "exitNode":"synthetic-old-exit"
+    });
+    let candidate = serde_json::json!({"id":"second","protocol":"tailscale",
+        "tailscaleSettings":{"hostname":"candidate", "sourceTag":"renderer"}});
+    let mut actual = original.clone();
+    merge_tailscale_candidate(&mut actual, &original, &candidate).unwrap();
+    assert!(actual["servers"][1]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert!(actual["servers"][1]["tailscaleSettings"]
+        .get("exitNode")
+        .is_none());
+    assert_eq!(
+        actual["servers"][1]["tailscaleSettings"]["unknownSetting"],
+        original["servers"][1]["tailscaleSettings"]["unknownSetting"]
+    );
+    assert_eq!(
+        actual["servers"][1]["tailscaleSettings"]["sourceTag"],
+        original["servers"][1]["tailscaleSettings"]["sourceTag"]
+    );
+}
+
+#[test]
+fn credential_logout_rejects_partial_local_start_before_cold_reclassification() {
+    assert_eq!(check_tailscale_logout_cold(false, false), Ok(true));
+    assert_eq!(check_tailscale_logout_cold(true, false), Ok(false));
+    for running in [false, true] {
+        assert_eq!(
+            check_tailscale_logout_cold(running, true),
+            Err(MainPrerequisiteError::ReadyUnknown)
+        );
+    }
+}
+
+fn android_retirement_fixture() -> (
+    Vec<polaris_mesh::tailscale_state::retirement::ObservedTailscaleStoreRun>,
+    Value,
+) {
+    use polaris_mesh::tailscale_state::retirement::{
+        ObservedTailscaleStoreRun, ObservedTailscaleStoreScope,
+    };
+    let scope = ObservedTailscaleStoreScope {
+        tag: "selected".into(),
+        state_directory: "/owned/tailscale/node".into(),
+        state_file: "/owned/tailscale/node/tailscaled.state".into(),
+    };
+    let observed: Vec<_> = ['a', 'b']
+        .into_iter()
+        .map(|nonce| ObservedTailscaleStoreRun {
+            run_nonce: nonce.to_string().repeat(64),
+            config_digest: "c".repeat(64),
+            scopes: vec![scope.clone()],
+        })
+        .collect();
+    let instances: Vec<_> = observed.iter().map(|run| serde_json::json!({
+        "runNonce":run.run_nonce, "configDigest":run.config_digest, "terminal":"SealedDrained", "censusComplete":true,
+        "nodes":[{"tag":scope.tag, "stateDirectory":scope.state_directory, "stateFile":scope.state_file,
+            "writerState":"SealedDrained", "stateFileState":"Regular", "stateFileRevision":"d".repeat(64),
+            "profileState":"Bound", "profileFingerprint":"e".repeat(64)}]
+    })).collect();
+    (
+        observed,
+        serde_json::json!({"contractVersion":"polaris-ts-auth-writer-retirement-v1",
+        "globalCleanupEvidence":"CleanupUnknown", "instances":instances}),
+    )
+}
+
+#[test]
+fn android_auth_selects_only_original_current_run_never_historical_bound() {
+    use polaris_mesh::tailscale_state::retirement::{TailscaleProfileState, TailscaleStoreExport};
+    let (observed, mut raw) = android_retirement_fixture();
+    raw["instances"][1]["nodes"][0]["profileState"] = serde_json::json!("Unknown");
+    raw["instances"][1]["nodes"][0]["profileFingerprint"] = serde_json::json!("");
+    let export: TailscaleStoreExport = serde_json::from_value(raw.clone()).unwrap();
+    let node = ProxyRuntime::selected_android_auth_node(
+        &observed,
+        &"c".repeat(64),
+        "selected",
+        "/owned/tailscale/node",
+        &export,
+    )
+    .unwrap();
+    assert_eq!(node.profile_state, TailscaleProfileState::Unknown);
+    assert!(node.profile_fingerprint.is_empty());
+    assert!(ProxyRuntime::selected_android_auth_node(
+        &observed,
+        &"f".repeat(64),
+        "selected",
+        "/owned/tailscale/node",
+        &export
+    )
+    .is_err());
+    assert!(ProxyRuntime::selected_android_auth_node(
+        &observed,
+        &"c".repeat(64),
+        "selected",
+        "/foreign/tailscale/node",
+        &export
+    )
+    .is_err());
+    raw["instances"].as_array_mut().unwrap().pop();
+    let export = serde_json::from_value(raw).unwrap();
+    assert!(ProxyRuntime::selected_android_auth_node(
+        &observed,
+        &"c".repeat(64),
+        "selected",
+        "/owned/tailscale/node",
+        &export
+    )
+    .is_err());
+}
+
+#[test]
+fn android_auth_rejects_partial_foreign_or_live_family_before_selecting_bound() {
+    use polaris_mesh::tailscale_state::retirement::TailscaleStoreExport;
+    let (observed, original) = android_retirement_fixture();
+    let export: TailscaleStoreExport = serde_json::from_value(original.clone()).unwrap();
+    assert!(ProxyRuntime::selected_android_auth_node(
+        &observed,
+        &"c".repeat(64),
+        "selected",
+        "/owned/tailscale/node",
+        &export
+    )
+    .is_ok());
+    for (key, value) in [
+        ("censusComplete", serde_json::json!(false)),
+        ("runNonce", serde_json::json!("f".repeat(64))),
+        ("terminal", serde_json::json!("Unknown")),
+        ("configDigest", serde_json::json!("f".repeat(64))),
+    ] {
+        let mut raw = original.clone();
+        raw["instances"][0][key] = value;
+        let export = serde_json::from_value(raw).unwrap();
+        assert!(
+            ProxyRuntime::selected_android_auth_node(
+                &observed,
+                &"c".repeat(64),
+                "selected",
+                "/owned/tailscale/node",
+                &export
+            )
+            .is_err(),
+            "{key}"
+        );
+    }
+    let mut missing = observed.clone();
+    missing[0].scopes.clear();
+    assert!(ProxyRuntime::selected_android_auth_node(
+        &missing,
+        &"c".repeat(64),
+        "selected",
+        "/owned/tailscale/node",
+        &export
+    )
+    .is_err());
+}
+
+#[test]
+fn android_main_retirement_binds_raw_config_whole_claim_and_one_original_stop() {
+    let source = crate::test_support::crate_source("runtime/proxy/prerequisite.rs");
+    let main = source
+        .split("pub(crate) async fn stop_android_tailscale_main_origin(")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) fn ")
+        .next()
+        .unwrap();
+    assert!(main.contains("core.committed.load"));
+    assert!(main.contains("tailscale_main_scope_if_token"));
+    assert!(main.contains("ticket.core.raw_config_digest"));
+    assert!(main.contains("owner.birth.same(&birth)"));
+    assert!(main.find("observe_main").unwrap() < main.find("stop_for_tailscale_action").unwrap());
+    assert!(
+        main.find("stop_for_tailscale_action").unwrap()
+            < main.find("read_main_retirement").unwrap()
+    );
+    assert_eq!(main.matches("stop_for_tailscale_action(").count(), 1);
+    let raw = source
+        .split("let raw_config_digest = {")
+        .nth(1)
+        .unwrap()
+        .split("let ios_receipt")
+        .next()
+        .unwrap();
+    assert!(raw.contains("File::open(self.runtime_config_path())"));
+    assert!(raw.contains("actual == emitted"));
+    assert!(raw.contains("sha256_hex(&bytes)"));
+    assert!(raw.contains("take(4 * 1024 * 1024 + 1)"));
 }

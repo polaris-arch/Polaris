@@ -896,3 +896,23 @@ fn 红线_tailcat_服务端公钥打码_disco_key保留() {
     assert_eq!(out["outbounds"][0]["server_public_key"], json!(REDACTED));
     assert_eq!(out["outbounds"][0]["server_disco_key"], json!("TC_DISCO"));
 }
+
+#[test]
+fn retained_auth_key_parent_record_is_entirely_redacted() {
+    let value = json!({"servers":[{"tailscaleSettings":{"retainedAuthKey":{
+        "authKey":"retained-synthetic-secret","controlAuthority":"https://private-issuer.invalid",
+        "futureSecret":"future-synthetic-secret"},"hostname":"visible-node"}}]});
+    let out = redact(&value);
+    assert_no_plaintext(
+        &out,
+        &[
+            "retained-synthetic-secret",
+            "private-issuer.invalid",
+            "future-synthetic-secret",
+        ],
+    );
+    assert_eq!(
+        out["servers"][0]["tailscaleSettings"]["hostname"],
+        "visible-node"
+    );
+}

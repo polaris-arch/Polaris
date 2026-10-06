@@ -18,7 +18,11 @@ describe('iOS active system session guidance', () => {
   it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('supplies %s system session, normal first-login and identity-retirement guidance', (locale) => {
     const text = JSON.parse(readFileSync(new URL(`../i18n/locales/${locale}.json`, import.meta.url), 'utf8'));
     expect(text.errors.iosSessionActive).toBeTruthy();
-    expect(text.ts.iosAccountActionsUnavailable).toBeTruthy();
+    expect(text.ts.iosAccountActionsUnavailable).toBeUndefined();
+    for (const key of ['stoppingConnection', 'retiringIdentity', 'savingCandidate', 'startingConnection',
+      'reasonIdentityRetirement', 'reasonSessionChanged', 'reasonConfigurationChanged', 'loginRefreshFailed']) {
+      expect(text.ts[key]).toBeTruthy();
+    }
     expect(text.ts.identityRetirementRequired).toBeTruthy();
     expect(text.prerequisite.preparingConnection).toBeTruthy();
     expect(text.prerequisite.waitingForReady).toBeTruthy();

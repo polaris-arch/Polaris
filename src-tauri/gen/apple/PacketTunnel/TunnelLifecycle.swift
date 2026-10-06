@@ -12,6 +12,8 @@ struct TunnelReport: Encodable {
     let lifecycle: String
     let runtimeStopped: Bool?
     let operationRequestID: String?
+    let stopSourceGeneration: UInt64?
+    let tailscaleStoreScope: String?
     let uncertainSettingsGeneration: UInt64?
     // Neither a nil Go instance nor NE disconnected proves resource disposal.
     let cleanupEvidence = "CleanupUnknown"
@@ -37,6 +39,9 @@ final class TunnelLifecycle {
     private var lastError: String?
     private var operationRequestID: String?
     private var uncertainSettingsGeneration: UInt64?
+    private var stopSourceGeneration: UInt64?
+    private var tailscaleStoreScope: String?
+    private var stopObservation: (nonce: String, callback: (TunnelObservation) -> Void)?
 
     func start(_ identity: TunnelIdentity) throws -> UInt64 {
         lock.lock(); defer { lock.unlock() }
@@ -48,6 +53,8 @@ final class TunnelLifecycle {
         operationRequestID = identity.requestID
         phase = "starting"
         runtimeStopped = false
+        stopSourceGeneration = nil
+        tailscaleStoreScope = nil
         lastError = nil
         return generation
     }
@@ -63,7 +70,7 @@ final class TunnelLifecycle {
 
     func reload() throws -> UInt64 {
         lock.lock(); defer { lock.unlock() }
-        guard !quarantined, !stopPending, phase == "running" else {
+        guard !quarantined, !stopPending, stopObservation == nil, phase == "running" else {
             throw lifecycleError("The tunnel cannot accept reload while a lifecycle operation is active or uncertain")
         }
         generation += 1
@@ -72,11 +79,26 @@ final class TunnelLifecycle {
         return generation
     }
 
-    func prepareStop(identity: TunnelIdentity, requestID: String) -> Bool {
+    func prepareStop(identity: TunnelIdentity, requestID: String, nonce: String? = nil,
+                     expectedGeneration: UInt64? = nil, observation: ((TunnelObservation) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard self.identity == identity, !requestID.isEmpty, !stopPending else { return false }
+        guard self.identity == identity, !requestID.isEmpty, !stopPending, stopObservation == nil,
+              expectedGeneration == nil || generation == expectedGeneration else { return false }
+        if let observation {
+            guard let nonce, !nonce.isEmpty else { return false }
+            stopObservation = (nonce, observation)
+        }
         operationRequestID = requestID
+        stopSourceGeneration = generation
         return true
+    }
+
+    /// The original serial worker alone reads the original held CommandServer.
+    /// This is a scope snapshot, not a resource or writer terminal assertion.
+    func retainTailscaleStoreScope(_ value: String, identity: TunnelIdentity) {
+        lock.lock(); defer { lock.unlock() }
+        guard self.identity == identity, value.utf8.count <= 256 * 1024 else { return }
+        tailscaleStoreScope = value
     }
 
     func currentGeneration() -> UInt64 { lock.lock(); defer { lock.unlock() }; return generation }
@@ -88,13 +110,18 @@ final class TunnelLifecycle {
 
     @discardableResult
     func complete(_ token: UInt64, phase: String, stopped: Bool?, error: String? = nil, cleanup: String? = nil) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard generation == token else { return false }
+        lock.lock()
+        guard generation == token else { lock.unlock(); return false }
         if phase == "stopped" { stopPending = false }
         self.phase = quarantined ? "uncertain" : phase
         runtimeStopped = stopped
         if let error { lastError = error }
         if let cleanup { cleanupError = cleanup }
+        let pending = phase == "stopped" ? stopObservation : nil
+        if pending != nil { stopObservation = nil }
+        let observed = pending.map { TunnelObservation(observationNonce: $0.nonce, report: reportLocked()) }
+        lock.unlock()
+        if let pending, let observed { pending.callback(observed) }
         return true
     }
 
@@ -143,6 +170,7 @@ final class TunnelLifecycle {
     private func reportLocked() -> TunnelReport {
         return TunnelReport(identity: identity, generation: generation, lifecycle: phase,
                             runtimeStopped: runtimeStopped, operationRequestID: operationRequestID,
+                            stopSourceGeneration: stopSourceGeneration, tailscaleStoreScope: tailscaleStoreScope,
                             uncertainSettingsGeneration: uncertainSettingsGeneration,
                             cleanupError: cleanupError, lastError: lastError)
     }

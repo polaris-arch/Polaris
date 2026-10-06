@@ -866,7 +866,8 @@ pub async fn tailscale_login(
     server: Value,
     request: crate::runtime::tailscale_login_core::LoginRequest,
 ) -> Result<ApiResponse<Value>, ()> {
-    let Ok(requested) = serde_json::from_value::<ServerConfig>(server) else {
+    let action_generation = state.proxy().core_generation();
+    let Ok(mut requested) = serde_json::from_value::<ServerConfig>(server.clone()) else {
         return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node",
             "TAILSCALE_LOGIN_BAD_SERVER",
@@ -890,12 +891,29 @@ pub async fn tailscale_login(
             ))
         }
     };
+    let (server, credential_transaction) =
+        match crate::runtime::tailscale_login_core::resolve_tailscale_credential_candidate(
+            &saved, &server, &request,
+        ) {
+            Ok(result) => result,
+            Err(reason) => return Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED")),
+        };
+    requested = match serde_json::from_value(server.clone()) {
+        Ok(server) => server,
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "invalidCredentialIntent",
+                "TAILSCALE_LOGIN_FAILED",
+            ))
+        }
+    };
     let identity_epoch = match saved_tailscale_identity_epoch(&saved, &requested.id) {
         Ok(epoch) => epoch,
         Err(reason) => return Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED")),
     };
-    if cfg!(target_os = "ios")
+    if (cfg!(target_os = "ios") || credential_transaction)
         && request.mode == crate::runtime::tailscale_login_core::LoginMode::Authkey
+        && !request.replace_identity
     {
         let existing_identity = state
             .mesh()
@@ -994,7 +1012,7 @@ pub async fn tailscale_login(
             mixed_port: cfg.as_ref().and_then(|c| c.mixed_port),
         }
     };
-    let outcome = if cfg!(target_os = "ios") {
+    let outcome = if cfg!(target_os = "ios") || credential_transaction {
         state
             .mesh()
             .start_tailscale_login_with_normal_main(
@@ -1006,6 +1024,8 @@ pub async fn tailscale_login(
                 &state.proxy,
                 &saved,
                 identity_epoch.clone(),
+                &server,
+                action_generation,
             )
             .await
     } else {
@@ -1042,27 +1062,7 @@ fn saved_tailscale_identity_epoch(
     saved: &Value,
     server_id: &str,
 ) -> Result<Option<String>, String> {
-    use polaris_config_engine::user_config::mesh_route_state::{MeshBindingState, MeshRouteState};
-    let Some(raw) = saved.get("meshRouteState") else {
-        return Ok(None);
-    };
-    let state: MeshRouteState = serde_json::from_value(raw.clone())
-        .map_err(|_| "Saved mesh identity ledger is invalid".to_owned())?;
-    let active: Vec<_> = state
-        .identities
-        .iter()
-        .filter(|identity| {
-            identity.server_id == server_id
-                && matches!(
-                    identity.binding_state,
-                    MeshBindingState::Bound | MeshBindingState::Unbound
-                )
-        })
-        .collect();
-    let [identity] = active.as_slice() else {
-        return Err("Saved Tailscale identity epoch is unavailable".into());
-    };
-    Ok(Some(identity.identity_epoch.clone()))
+    crate::runtime::tailscale_login_core::saved_tailscale_identity_epoch(saved, server_id)
 }
 
 /// 取消精确登录请求：瞬态核等待收割；正常主核仅撤销本次观察，连接继续由用户控制。
@@ -1101,17 +1101,71 @@ pub async fn tailscale_logout(
     server_id: String,
     keep_attempt_id: Option<String>,
 ) -> Result<ApiResponse<Value>, ()> {
-    if cfg!(target_os = "ios") {
-        return Ok(ApiResponse::err_with_code(
-            "Tailscale state deletion is unavailable while iOS session ownership is unknown",
-            "TAILSCALE_LOGOUT_UNSUPPORTED_ON_IOS",
-        ));
+    #[cfg(target_os = "ios")]
+    {
+        let generation = state.proxy().core_generation();
+        if keep_attempt_id.is_some() {
+            return Ok(ApiResponse::err_with_code(
+                "A standalone iOS logout cannot consume another login request",
+                "TAILSCALE_LOGOUT_FAILED",
+            ));
+        }
+        let saved = match state.config().current() {
+            Ok(saved) => saved,
+            Err(_) => {
+                return Ok(ApiResponse::err_with_code(
+                    "Cannot read the saved Tailscale node",
+                    "TAILSCALE_LOGOUT_FAILED",
+                ))
+            }
+        };
+        let id_valid = saved
+            .get("servers")
+            .and_then(Value::as_array)
+            .is_some_and(|nodes| {
+                nodes
+                    .iter()
+                    .filter(|node| {
+                        node.get("id").and_then(Value::as_str) == Some(&server_id)
+                            && node.get("protocol").and_then(Value::as_str) == Some("tailscale")
+                    })
+                    .count()
+                    == 1
+            });
+        if !id_valid {
+            return Ok(ApiResponse::err_with_code(
+                "Invalid Tailscale node",
+                "TAILSCALE_LOGOUT_INVALID_SERVER_ID",
+            ));
+        }
+        return Ok(
+            match state
+                .mesh()
+                .logout_tailscale_with_normal_main(&server_id, &state.proxy, &saved, generation)
+                .await
+            {
+                Ok(()) => ApiResponse::ok(json!({ "runningNeedsRestart": false })),
+                Err((reason, code)) => ApiResponse::err_with_code(reason, code),
+            },
+        );
     }
+    let generation = state.proxy().core_generation();
+    let saved = match state.config().current() {
+        Ok(saved) => saved,
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "Cannot read the saved Tailscale node",
+                "TAILSCALE_LOGOUT_FAILED",
+            ))
+        }
+    };
     match state
         .mesh()
-        .logout_tailscale_safely(
+        .logout_tailscale_with_credentials(
             &server_id,
-            &|| state.proxy().tailscale_writer_alive(),
+            &state.proxy,
+            &saved,
+            generation,
             keep_attempt_id.as_deref(),
         )
         .await
@@ -1232,7 +1286,7 @@ fn tailscale_state_exists_at(
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err(unknown());
     }
-    polaris_mesh::tailscale_state::cached_session_exists(&bytes)
+    polaris_mesh::tailscale_state::cached_session_exists_for_presentation(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 

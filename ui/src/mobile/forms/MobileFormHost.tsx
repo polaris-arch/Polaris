@@ -70,7 +70,7 @@ function renderPanel(entry: MobileFormEntry): ReactElement {
     case 'warp':
       return <WarpPanel instanceId={entry.instanceId} edit={entry.edit} />;
     case 'ts-login':
-      return <TsLoginPanel instanceId={entry.instanceId} serverId={entry.serverId} />;
+      return <TsLoginPanel instanceId={entry.instanceId} serverId={entry.serverId} replaceIdentity={entry.replaceIdentity} />;
     case 'ts-settings':
       return <TsSettingsPanel instanceId={entry.instanceId} serverId={entry.serverId} />;
     case 'wg':

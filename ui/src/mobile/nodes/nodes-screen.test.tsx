@@ -1016,7 +1016,9 @@ describe('⑥-c 添加 / 订阅更多 / 组网接入：桌面 ↔ 登记表 ↔ 
    * 这样那一支哪天被删掉，减数会自己归零。下面另有一条自检钉住「那一支里确实只有一个 `<Choice`」——
    * 没有它，这个减法就可能悄悄减多。
    */
-  const meshJoinSrc = strip(read(join(SRC, 'components', 'dialogs', 'MeshJoinDialog.tsx')));
+  const meshJoinPath = join(SRC, 'components', 'dialogs', 'MeshJoinDialog.tsx');
+  const meshJoinRaw = read(meshJoinPath);
+  const meshJoinSrc = strip(meshJoinRaw);
   const meshChoiceTags = (meshJoinSrc.match(/<Choice\b/g) ?? []).length;
   const perNodeBranches = (meshJoinSrc.match(/tsNodes\.map\(/g) ?? []).length;
   // 已有 TS 账号的逐节点卡片与单账号卡片是设置入口；新增接入项由另一张卡承担。
@@ -1179,8 +1181,85 @@ describe('⑥-c 添加 / 订阅更多 / 组网接入：桌面 ↔ 登记表 ↔ 
    * 故与 `ROW_ACTIONS` / `BATCH_ACTIONS` 同形登记，并在这里与桌面对差。
    */
   describe('⑥-c-2 组网接入面的次动作：桌面 ↔ 登记表', () => {
-    /** 桌面那两处 `actions={…}` 里的 `btn ghost sm` 颗数。 */
-    const desktopActions = (meshJoinSrc.match(/className="btn ghost sm/g) ?? []).length;
+    /** Only the same-node Switch/SignIn ternary is one mutually exclusive action slot. */
+    function actionSlots(source: string, fileName = 'mesh-join-action-fixture.tsx') {
+      const sf = ts.parseSourceFile(fileName, source);
+      const isNodeId = (node: ts.Node | undefined): boolean => !!node
+        && ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)
+        && node.expression.text === 'node' && ts.isIdentifier(node.name) && node.name.text === 'id';
+      const actionButton = (node: ts.Node): node is ts.JsxElement => ts.isJsxElement(node)
+        && ts.isIdentifier(node.openingElement.tagName) && node.openingElement.tagName.text === 'button'
+        && node.openingElement.attributes.properties.some((attribute) => ts.isJsxAttribute(attribute)
+          && ts.isIdentifier(attribute.name) && attribute.name.text === 'className'
+          && attribute.initializer && ts.isStringLiteral(attribute.initializer)
+          && /^btn ghost sm(?:\s|$)/.test(attribute.initializer.text));
+      const isAccountBranch = (node: ts.Node, replaceIdentity: boolean): boolean => {
+        if (!actionButton(node)) return false;
+        const click = node.openingElement.attributes.properties.find((attribute) =>
+          ts.isJsxAttribute(attribute) && ts.isIdentifier(attribute.name) && attribute.name.text === 'onClick');
+        if (!click || !ts.isJsxAttribute(click) || !click.initializer || !ts.isJsxExpression(click.initializer)
+          || !click.initializer.expression || !ts.isArrowFunction(click.initializer.expression)) return false;
+        const call = click.initializer.expression.body;
+        if (!ts.isCallExpression(call) || !ts.isIdentifier(call.expression) || call.expression.text !== 'go'
+          || call.arguments.length !== 1 || !ts.isObjectLiteralExpression(call.arguments[0])) return false;
+        const properties = new Map<string, ts.Expression>();
+        for (const property of call.arguments[0].properties) {
+          if (!ts.isPropertyAssignment(property) || !ts.isIdentifier(property.name)
+            || properties.has(property.name.text)) return false;
+          properties.set(property.name.text, property.initializer);
+        }
+        const kind = properties.get('kind');
+        if (!kind || !ts.isStringLiteral(kind) || kind.text !== 'ts-login'
+          || !isNodeId(properties.get('serverId')) || properties.size !== (replaceIdentity ? 3 : 2)
+          || (replaceIdentity ? properties.get('replaceIdentity')?.kind !== ts.SyntaxKind.TrueKeyword
+            : properties.has('replaceIdentity'))) return false;
+        return node.children.some((child) => ts.isJsxExpression(child) && child.expression
+          && ts.isCallExpression(child.expression) && ts.isIdentifier(child.expression.expression)
+          && child.expression.expression.text === 't' && child.expression.arguments.length === 1
+          && ts.isStringLiteral(child.expression.arguments[0])
+          && child.expression.arguments[0].text === (replaceIdentity ? 'meshJoin.switchAccount' : 'ts.signIn'));
+      };
+      let renderSites = 0;
+      let exclusiveAccountSlots = 0;
+      const walk = (node: ts.Node): void => {
+        if (actionButton(node)) renderSites++;
+        if (ts.isConditionalExpression(node) && ts.isBinaryExpression(node.condition)
+          && node.condition.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
+          && node.condition.right.kind === ts.SyntaxKind.TrueKeyword
+          && ts.isElementAccessExpression(node.condition.left)
+          && ts.isIdentifier(node.condition.left.expression) && node.condition.left.expression.text === 'tsStates'
+          && isNodeId(node.condition.left.argumentExpression)
+          && isAccountBranch(node.whenTrue, true) && isAccountBranch(node.whenFalse, false)) {
+          exclusiveAccountSlots++;
+        }
+        ts.forEachChild(node, walk);
+      };
+      walk(sf);
+      return { renderSites, exclusiveAccountSlots, logicalSlots: renderSites - exclusiveAccountSlots };
+    }
+    const desktopSlots = actionSlots(meshJoinRaw, meshJoinPath);
+    const desktopActions = desktopSlots.logicalSlots;
+
+    it('只合并原同节点账号状态分支；独立动作或任一绑定漂移仍使精确登记门变红', () => {
+      expect(desktopSlots).toEqual({ renderSites: 6, exclusiveAccountSlots: 1, logicalSlots: 5 });
+      const extra = meshJoinRaw.replace('return (\n      <>',
+        'return (\n      <>\n        <button className="btn ghost sm">new action</button>');
+      expect(extra).not.toBe(meshJoinRaw);
+      expect(actionSlots(extra).logicalSlots).toBe(desktopActions + 1);
+      expect(actionSlots(extra).logicalSlots).not.toBe(MESH_JOIN_ACTIONS.length);
+      for (const [from, to] of [
+        ['tsStates[node.id] === true ?', 'true ?'],
+        ["serverId: node.id, replaceIdentity: true", "serverId: other.id, replaceIdentity: true"],
+        ["serverId: node.id, replaceIdentity: true", "serverId: node.id, replaceIdentity: false"],
+        ["t('meshJoin.switchAccount')", "t('other.action')"],
+      ]) {
+        const changed = meshJoinRaw.replace(from, to);
+        expect(changed, from).not.toBe(meshJoinRaw);
+        expect(actionSlots(changed), from).toEqual({ renderSites: 6, exclusiveAccountSlots: 0, logicalSlots: 6 });
+      }
+      expect(actionSlots('const buttons = condition ? <button className="btn ghost sm">A</button> : <button className="btn ghost sm">B</button>;'))
+        .toEqual({ renderSites: 2, exclusiveAccountSlots: 0, logicalSlots: 2 });
+    });
 
     it('自检：桌面取材面有量级（为 0 会让下面的等式恒绿）', () => {
       expect(desktopActions, '桌面组网卡片上一颗次动作都没数到').toBeGreaterThan(3);

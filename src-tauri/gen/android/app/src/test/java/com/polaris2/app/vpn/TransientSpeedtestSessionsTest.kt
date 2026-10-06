@@ -1020,4 +1020,34 @@ class TransientSpeedtestSessionsTest {
         assertTrue(nextResult.get()!!.contains("忙"))
         assertEquals(0, untouched.get())
     }
+
+    @Test fun finalNativeSnapshotWaitsForTheOriginalPendingStartEvenAfterCloseReturned() {
+        val ledger = ledger()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val operationalClose = CountDownLatch(1)
+        val finalSnapshot = CountDownLatch(1)
+        val stages = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val sessions = TransientSpeedtestSessions(nativeAdmission = ledger)
+        val ticket = sessions.reserveOwner(id(1))
+        val engine = object : TransientSpeedtestSessions.Engine {
+            override fun prepare() {}
+            override fun start() { entered.countDown(); await(release); stages.add("start-left") }
+            override fun close() { stages.add("close-returned"); operationalClose.countDown() }
+            override fun finishClose() { stages.add("final-native-snapshot"); finalSnapshot.countDown() }
+        }
+        val (started, _) = startNative(sessions, 1, engine, ticket)
+        await(entered)
+        val (closed, result) = close(sessions, id(1))
+        await(operationalClose)
+        assertFalse(finalSnapshot.await(30, TimeUnit.MILLISECONDS))
+        assertFalse(closed.await(30, TimeUnit.MILLISECONDS))
+        release.countDown()
+        await(started); await(closed); await(finalSnapshot)
+        assertEquals(null, result.get())
+        assertTrue(stages.indexOf("start-left") < stages.indexOf("final-native-snapshot"))
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
+        assertTrue(TransientSpeedtestSessions.capabilities.isEmpty())
+    }
+
 }

@@ -37,9 +37,18 @@ async fn cached_session_disappears_after_guarded_logout_and_empty_reopen() {
     let root = TestDir::new("polaris-ts-cached-logout-");
     let mesh = crate::runtime::mesh::MeshRuntime::new(root.to_path_buf());
     let state = mesh.tailscale_state_dir("node").unwrap();
-    std::fs::create_dir_all(&state).unwrap();
-    let bytes = br#"{"_current-profile":"cHJvZmlsZS1hYjEy","_profiles":"eyJhYjEyIjp7IklEIjoiYWIxMiIsIktleSI6InByb2ZpbGUtYWIxMiJ9fQ==","profile-ab12":"eyJXYW50UnVubmluZyI6ZmFsc2UsIkxvZ2dlZE91dCI6ZmFsc2UsIkNvbmZpZyI6eyJOb2RlSUQiOiJuLWZpeHR1cmUiLCJVc2VyUHJvZmlsZSI6eyJMb2dpbk5hbWUiOiJmaXh0dXJlQGV4YW1wbGUuaW52YWxpZCJ9fX0="}"#;
-    std::fs::write(state.join("tailscaled.state"), bytes).unwrap();
+    std::fs::create_dir_all(state.join("taildrop")).unwrap();
+    let bytes = polaris_source_probe::repo_bytes_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "crates/mesh/src/tailscale_state/auth_projection/tests/synthetic-sealed-state.json",
+    );
+    let mut original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // The projection fixture's prefs omit persisted account Config. Retain the
+    // original query test's synthetic NodeID/LoginName before checking presence.
+    original["profile-a123"] = serde_json::json!("eyJXYW50UnVubmluZyI6ZmFsc2UsIkxvZ2dlZE91dCI6ZmFsc2UsIkNvbmZpZyI6eyJOb2RlSUQiOiJuLWZpeHR1cmUiLCJVc2VyUHJvZmlsZSI6eyJMb2dpbk5hbWUiOiJmaXh0dXJlQGV4YW1wbGUuaW52YWxpZCJ9fX0=");
+    let bytes = serde_json::to_vec(&original).unwrap();
+    std::fs::write(state.join("tailscaled.state"), &bytes).unwrap();
+    std::fs::write(state.join("taildrop/user-file"), b"preserved user file").unwrap();
     assert!(tailscale_state_exists_at(&state, true).unwrap());
     assert_eq!(
         std::fs::read(state.join("tailscaled.state")).unwrap(),
@@ -49,9 +58,36 @@ async fn cached_session_disappears_after_guarded_logout_and_empty_reopen() {
         .await
         .unwrap();
     assert!(!tailscale_state_exists_at(&state, true).unwrap());
-    std::fs::create_dir(&state).unwrap();
+    assert!(state.is_dir());
+    let retired = std::fs::read(state.join("tailscaled.state")).unwrap();
+    let projected: serde_json::Value = serde_json::from_slice(&retired).unwrap();
+    assert!(projected.get("profile-a123").is_none());
+    for key in [
+        "_current-profile",
+        "_machinekey",
+        "profile-b456",
+        "_taildrop-received",
+        "ipn-go-bridge",
+        "unknown-user-value",
+    ] {
+        assert_eq!(projected[key], original[key], "preserve {key}");
+    }
+    assert!(polaris_mesh::tailscale_state::cached_session_exists(&retired).is_err());
+    // A fresh runtime reopens the retained retired store; it does not recreate
+    // an empty directory or choose the preserved historical profile.
+    drop(mesh);
+    let reopened = crate::runtime::mesh::MeshRuntime::new(root.to_path_buf());
+    assert_eq!(reopened.tailscale_state_dir("node").unwrap(), state);
     assert!(!tailscale_state_exists_at(&state, true).unwrap());
     assert!(tailscale_state_exists_at(&state, false).unwrap());
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        retired
+    );
+    assert_eq!(
+        std::fs::read(state.join("taildrop/user-file")).unwrap(),
+        b"preserved user file"
+    );
 }
 
 #[test]

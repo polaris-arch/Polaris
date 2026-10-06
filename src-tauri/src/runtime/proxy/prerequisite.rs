@@ -52,6 +52,8 @@ pub(crate) struct ActionBinding {
     saved_digest: String,
     target_ids: Vec<String>,
     identity_epoch: Option<String>,
+    expected_generation: Option<u64>,
+    attempt: Option<Arc<crate::runtime::tailscale_login_core::Attempt>>,
 }
 
 impl ActionBinding {
@@ -87,7 +89,19 @@ impl ActionBinding {
             saved_digest: digest(saved)?,
             target_ids,
             identity_epoch,
+            expected_generation: None,
+            attempt: None,
         })
+    }
+
+    pub(crate) fn for_attempt(
+        mut self,
+        expected_generation: u64,
+        attempt: Arc<crate::runtime::tailscale_login_core::Attempt>,
+    ) -> Self {
+        self.expected_generation = Some(expected_generation);
+        self.attempt = Some(attempt);
+        self
     }
 }
 
@@ -135,6 +149,8 @@ pub(super) struct ReadyMainCore {
     committed: AtomicBool,
     #[cfg(target_os = "ios")]
     ios_receipt: tauri_plugin_polaris_ios::ReadySessionReceipt,
+    #[cfg(target_os = "android")]
+    raw_config_digest: Option<String>,
 }
 
 /// Producer-only fields; bools, events and cached status cannot mint this value.
@@ -187,17 +203,19 @@ pub(super) enum NormalStartCompletion {
     Superseded,
 }
 
+#[derive(Clone)]
 pub(super) struct NormalStart {
     digest: String,
     completion: watch::Sender<NormalStartCompletion>,
     identity: Arc<ProducerCell>,
+    attempt: Option<Arc<crate::runtime::tailscale_login_core::Attempt>>,
 }
 
 /// Current observer and retained producer responsibilities share the original short lock.
 #[derive(Default)]
 pub(super) struct NormalStarts {
     current: Option<NormalStart>,
-    retained: Vec<Arc<ProducerCell>>,
+    retained: Vec<NormalStart>,
 }
 
 impl NormalStarts {
@@ -207,19 +225,20 @@ impl NormalStarts {
 
     fn replace(&mut self, start: NormalStart) {
         self.prune();
-        self.retained.push(Arc::clone(&start.identity));
+        self.retained.push(start.clone());
         self.current = Some(start);
     }
 
     fn prune(&mut self) {
-        self.retained.retain(|producer| !producer.reclaimable());
+        self.retained
+            .retain(|producer| !producer.identity.reclaimable());
     }
 
     fn admitted(&self, generation: u64) -> Option<Arc<ProducerCell>> {
         self.retained
             .iter()
-            .find(|producer| producer.has_generation(generation))
-            .cloned()
+            .find(|producer| producer.identity.has_generation(generation))
+            .map(|producer| Arc::clone(&producer.identity))
     }
 }
 
@@ -227,11 +246,23 @@ pub(super) struct NormalStartClaim {
     pub(super) completion: watch::Sender<NormalStartCompletion>,
     pub(super) expected: u64,
     identity: Arc<ProducerCell>,
+    attempt: Option<Arc<crate::runtime::tailscale_login_core::Attempt>>,
 }
 
 impl NormalStartClaim {
+    pub(super) fn while_active<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        match &self.attempt {
+            Some(attempt) => attempt.while_active(action),
+            None => Some(action()),
+        }
+    }
     pub(super) fn admitted(&self, generation: u64) {
         self.identity.admitted(generation);
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(super) fn has_generation(&self, generation: u64) -> bool {
+        self.identity.has_generation(generation)
     }
 
     pub(super) fn finish_dispatch(&self) {
@@ -247,6 +278,83 @@ fn digest(value: &Value) -> Result<String, MainPrerequisiteError> {
     serde_json::to_vec(value)
         .map(|bytes| polaris_updater::sha256_hex(&bytes))
         .map_err(|_| MainPrerequisiteError::ReadyUnknown)
+}
+
+pub(super) fn merge_tailscale_candidate(
+    current: &mut Value,
+    saved: &Value,
+    candidate: &Value,
+) -> Result<(), String> {
+    if current != saved {
+        return Err("candidateConfigurationChanged".into());
+    }
+    let candidate = candidate
+        .as_object()
+        .ok_or("candidateConfigurationChanged")?;
+    let id = candidate
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or("candidateConfigurationChanged")?;
+    if candidate.get("protocol").and_then(Value::as_str) != Some("tailscale") {
+        return Err("candidateConfigurationChanged".into());
+    }
+    if candidate
+        .get("tailscaleSettings")
+        .and_then(Value::as_object)
+        .is_none()
+    {
+        return Err("candidateConfigurationChanged".into());
+    }
+    let servers = current
+        .get_mut("servers")
+        .and_then(Value::as_array_mut)
+        .ok_or("candidateConfigurationChanged")?;
+    let matches: Vec<_> = servers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, server)| {
+            (server.get("id").and_then(Value::as_str) == Some(id)).then_some(index)
+        })
+        .collect();
+    let [index] = matches.as_slice() else {
+        return Err("candidateConfigurationChanged".into());
+    };
+    let server = servers[*index]
+        .as_object_mut()
+        .ok_or("candidateConfigurationChanged")?;
+    if server.get("protocol").and_then(Value::as_str) != Some("tailscale") {
+        return Err("candidateConfigurationChanged".into());
+    }
+    for (key, value) in candidate {
+        // Provenance belongs to the original saved node, not the renderer.
+        if key == "sourceTag" {
+            continue;
+        }
+        if key == "tailscaleSettings" {
+            let mut replacement = value
+                .as_object()
+                .ok_or("candidateConfigurationChanged")?
+                .clone();
+            if let Some(previous) = server.get(key).and_then(Value::as_object) {
+                // Modeled candidate settings replace the old values, including
+                // omission of authKey for browser login. Preserve unmodeled data.
+                use polaris_config_engine::user_config::server_config::TAILSCALE_CANDIDATE_SETTINGS_FIELDS;
+                for (name, old) in previous {
+                    if name == "sourceTag"
+                        || !TAILSCALE_CANDIDATE_SETTINGS_FIELDS.contains(&name.as_str())
+                            && !replacement.contains_key(name)
+                    {
+                        replacement.insert(name.clone(), old.clone());
+                    }
+                }
+            }
+            server.insert(key.clone(), Value::Object(replacement));
+        } else {
+            server.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn final_targets(effective: &UserConfig, emitted: &Value) -> BTreeMap<String, String> {
@@ -338,6 +446,17 @@ fn check_binding(
     Ok(())
 }
 
+#[cfg(any(target_os = "ios", test))]
+fn check_tailscale_logout_cold(
+    running: bool,
+    local_pending: bool,
+) -> Result<bool, MainPrerequisiteError> {
+    if local_pending {
+        return Err(MainPrerequisiteError::ReadyUnknown);
+    }
+    Ok(!running)
+}
+
 #[async_trait]
 trait MainReadinessProbe: Sync {
     async fn observe(&self, core: &ReadyMainCore) -> Result<(), MainPrerequisiteError>;
@@ -376,9 +495,585 @@ impl MainReadinessProbe for ProxyRuntime {
 }
 
 impl ProxyRuntime {
+    /// Select only the current run captured before Close. Historical Bound profiles
+    /// and validation runs cannot substitute for the selected runtime's identity.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn selected_android_auth_node(
+        observed: &[polaris_mesh::tailscale_state::retirement::ObservedTailscaleStoreRun],
+        actual_digest: &str,
+        tag: &str,
+        directory: &str,
+        export: &polaris_mesh::tailscale_state::retirement::TailscaleStoreExport,
+    ) -> Result<polaris_mesh::tailscale_state::retirement::TailscaleStoreRetirementNode, String>
+    {
+        use polaris_mesh::tailscale_state::retirement::{
+            TailscaleProfileState, TailscaleWriterState,
+        };
+        export
+            .validate_observed_runs(observed, true)
+            .map_err(|_| "nativeRetirementUnknown")?;
+        let current = observed
+            .last()
+            .filter(|run| run.config_digest == actual_digest)
+            .ok_or("profileBindingUnknown")?;
+        let file = std::path::Path::new(directory).join("tailscaled.state");
+        let file = file.to_str().ok_or("profileBindingUnknown")?;
+        let selected: Vec<_> = current
+            .scopes
+            .iter()
+            .filter(|scope| {
+                scope.tag == tag && scope.state_directory == directory && scope.state_file == file
+            })
+            .collect();
+        if selected.len() != 1 {
+            return Err("profileBindingUnknown".into());
+        }
+        let node = export
+            .instances()
+            .iter()
+            .find(|run| run.run_nonce == current.run_nonce && run.config_digest == actual_digest)
+            .and_then(|run| {
+                run.nodes.iter().find(|node| {
+                    node.tag == tag && node.state_directory == directory && node.state_file == file
+                })
+            })
+            .ok_or("profileBindingUnknown")?;
+        if node.profile_state == TailscaleProfileState::Bound
+            && node.writer_state != TailscaleWriterState::SealedDrained
+        {
+            return Err("profileBindingUnknown".into());
+        }
+        Ok(node.clone())
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn android_tailscale_user_data(&self) -> &std::path::Path {
+        self.config.dir()
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn android_tailscale_auth_directory(
+        &self,
+        id: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        crate::runtime::tailscale_login_core::canonical_tailscale_claim_directory(
+            &self
+                .mesh
+                .tailscale_state_dir(id)
+                .map_err(|_| "profileBindingUnknown")?,
+        )
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn retire_android_tailscale_auth(
+        &self,
+        id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
+        node: &polaris_mesh::tailscale_state::retirement::TailscaleStoreRetirementNode,
+    ) -> Result<(), String> {
+        self.mesh
+            .tailscale_retire_android_auth_under_gate(id, gate, attempt, node)
+            .map_err(|_| "stateRevisionChanged".into())
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) async fn stop_android_tailscale_main_origin(
+        self: &Arc<Self>,
+        id: &str,
+        saved: &Value,
+        generation: u64,
+        request_id: &str,
+        attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
+    ) -> Result<
+        Option<(
+            super::android_bridge::tailscale_store::AndroidStoreCustody,
+            u64,
+            String,
+        )>,
+        String,
+    > {
+        use super::android_bridge::tailscale_store;
+        // An absent Rust running flag only chooses a route. The separate cold
+        // admission protocol must establish native writer facts before warm birth.
+        let birth = self
+            .android_main_token
+            .lock()
+            .map_err(|_| "nativeRetirementUnknown")?
+            .as_ref()
+            .map(|owner| {
+                if owner.stop_only
+                    || !owner.start_confirmed
+                    || owner.historic_unknown
+                    || owner.stop_inflight.is_some()
+                {
+                    return Err("nativeRetirementUnknown");
+                }
+                Ok((
+                    owner.birth.clone(),
+                    owner
+                        .exact_target
+                        .clone()
+                        .ok_or("nativeRetirementUnknown")?,
+                ))
+            })
+            .transpose()?;
+        let Some((birth, target)) = birth else {
+            return if self.tailscale_writer_alive() {
+                Err("nativeRetirementUnknown".into())
+            } else {
+                Ok(None)
+            };
+        };
+        let core = self
+            .ready_main_for_generation(generation)
+            .map_err(|_| "nativeRetirementUnknown")?;
+        if !core.committed.load(Ordering::SeqCst) {
+            return Err("nativeRetirementUnknown".into());
+        }
+        if !core.targets.contains_key(id) {
+            // A completed unrelated main is not this account's identity source.
+            // Its writer membership must still pass the native family begin census.
+            return Ok(None);
+        }
+        let binding = ActionBinding::new(
+            NormalMainAction::TailscaleLogin,
+            request_id.to_owned(),
+            saved,
+            vec![id.to_owned()],
+            None,
+        )
+        .map_err(|_| "nativeRetirementUnknown")?
+        .for_attempt(generation, attempt.clone());
+        let ticket = ReadyMainTicket { core, binding };
+        self.check_ready_main(&ticket)
+            .map_err(|error| error.code().to_owned())?;
+        let tag = ticket.target_tag(id).ok_or("targetNotInMain")?.to_owned();
+        let token = birth.main_token.as_ref().ok_or("nativeRetirementUnknown")?;
+        let gate = self.mesh.tailscale_state_gate().await;
+        let expected: BTreeSet<_> = self
+            .mesh
+            .tailscale_main_scope_if_token(token, &gate)?
+            .into_iter()
+            .collect();
+        let original = tailscale_store::observe_main(Some(&target)).await?;
+        if Some(original.original().actual_config_digest.as_str())
+            != ticket.core.raw_config_digest.as_deref()
+            || original
+                .original()
+                .original_observed_runs
+                .last()
+                .is_none_or(|run| {
+                    run.config_digest != original.original().actual_config_digest
+                        || run
+                            .scopes
+                            .iter()
+                            .map(|scope| {
+                                (
+                                    scope.tag.clone(),
+                                    scope.state_directory.clone(),
+                                    scope.state_file.clone(),
+                                )
+                            })
+                            .collect::<BTreeSet<_>>()
+                            != expected
+                        || run.scopes.len() != expected.len()
+                })
+            || !self
+                .android_main_token
+                .lock()
+                .map_err(|_| "nativeRetirementUnknown")?
+                .as_ref()
+                .is_some_and(|owner| owner.birth.same(&birth))
+        {
+            return Err("nativeRetirementUnknown".into());
+        }
+        self.check_ready_main(&ticket)
+            .map_err(|_| "mainCoreChanged")?;
+        attempt.record_android_store(original.clone())?;
+        drop(gate);
+        let stopped = self.stop_for_tailscale_action(generation, attempt).await?;
+        // The ordinary Stop ACK is not a scoped receipt. Read the original Entry
+        // after the one original Stop, without a second targetless native Stop.
+        let retired = tailscale_store::read_main_retirement(&original).await?;
+        Ok(Some((retired, stopped, tag)))
+    }
+
+    pub(crate) fn merged_tailscale_candidate(
+        saved: &Value,
+        candidate: &Value,
+    ) -> Result<Value, String> {
+        let mut preview = saved.clone();
+        merge_tailscale_candidate(&mut preview, saved, candidate)?;
+        let id = candidate
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("candidateConfigurationChanged")?;
+        preview
+            .get("servers")
+            .and_then(Value::as_array)
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|node| node.get("id").and_then(Value::as_str) == Some(id))
+            })
+            .cloned()
+            .ok_or_else(|| "candidateConfigurationChanged".to_owned())
+    }
+    #[cfg(target_os = "ios")]
+    pub(crate) fn tailscale_action_saved_config(&self) -> Result<Value, String> {
+        self.config
+            .current()
+            .map_err(|_| "candidateConfigurationChanged".into())
+    }
+
+    pub(crate) fn tailscale_action_lease(
+        &self,
+    ) -> Result<crate::runtime::config::LegacyStartLease, String> {
+        self.config
+            .lease_legacy_start()
+            .map_err(|_| "Managed mesh account retirement requires its managed proof".into())
+    }
+
+    pub(crate) fn tailscale_candidate_preflight(
+        &self,
+        saved: &Value,
+        candidate: &Value,
+    ) -> Result<(), String> {
+        let mut preview = saved.clone();
+        merge_tailscale_candidate(&mut preview, saved, candidate)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn saved_android_credential_target(
+        &self,
+        saved: &Value,
+        id: &str,
+        generation: u64,
+        attempt: &crate::runtime::tailscale_login_core::Attempt,
+    ) -> Result<polaris_config_engine::user_config::server_config::ServerConfig, String> {
+        attempt
+            .while_active(|| {
+                self.gate.with_current_generation(generation, |_| {
+                    let current = self
+                        .config
+                        .current()
+                        .map_err(|_| "credentialRevisionChanged")?;
+                    if current != *saved {
+                        return Err("credentialRevisionChanged".to_owned());
+                    }
+                    let nodes: Vec<_> = current
+                        .get("servers")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|node| node.get("id").and_then(Value::as_str) == Some(id))
+                        .collect();
+                    let [node] = nodes.as_slice() else {
+                        return Err("credentialRevisionChanged".into());
+                    };
+                    serde_json::from_value((*node).clone())
+                        .map_err(|_| "credentialRevisionChanged".into())
+                })
+            })
+            .flatten()
+            .ok_or_else(|| "mainCoreChanged".to_owned())?
+    }
+
+    pub(crate) fn retire_pc_tailscale_auth(
+        &self,
+        id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        keep: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
+    ) -> Result<(), String> {
+        self.mesh
+            .tailscale_retire_pc_auth_under_gate(id, gate, keep)
+            .map_err(|_| "stateRevisionChanged".to_owned())
+    }
+
+    /// The caller still holds its original TS state gate and has closed the actual owner.
+    /// This only fences the current action generation/cancel cell and original saved CAS.
+    pub(crate) fn commit_tailscale_credential(
+        &self,
+        saved: &Value,
+        id: &str,
+        generation: u64,
+        attempt: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
+        commit: impl FnOnce(&mut Value) -> Result<(), String>,
+    ) -> Result<Value, String> {
+        let action = || {
+            self.gate
+                .with_current_generation(generation, |_| {
+                    let (result, saved) = self
+                        .config
+                        .update_tailscale_credential(saved, id, |current| match commit(current) {
+                            Ok(()) => crate::runtime::config::Decision::Write(Ok(())),
+                            Err(error) => crate::runtime::config::Decision::Skip(Err(error)),
+                        })
+                        .map_err(|_| "credentialRevisionChanged".to_owned())?;
+                    result?;
+                    saved.ok_or_else(|| "credentialRevisionChanged".to_owned())
+                })
+                .ok_or_else(|| "mainCoreChanged".to_owned())?
+        };
+        match attempt {
+            Some(attempt) => attempt
+                .while_active(action)
+                .ok_or_else(|| "cancelled".to_owned())?,
+            None => action(),
+        }
+    }
+
+    /// Admit only the first synchronous poll of this original producer. A Pending
+    /// result is already in flight and must be joined through its existing custody.
+    pub(crate) fn with_tailscale_credential_birth<T>(
+        &self,
+        generation: u64,
+        attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
+        poll: impl FnOnce() -> T,
+    ) -> Option<T> {
+        attempt
+            .while_active(|| self.gate.with_current_generation(generation, |_| poll()))
+            .flatten()
+    }
+
+    /// Attach an already active provider to the existing custody slot, without
+    /// inventing a local birth token. Its original scoped Stop precedes any new
+    /// normal Start. An unresolved slot stays occupied even without a token.
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn prepare_tailscale_action_origin(
+        self: &Arc<Self>,
+        generation: u64,
+        attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
+    ) -> Result<u64, String> {
+        if attempt.cancelled() || self.core_generation() != generation {
+            return Err("mainCoreChanged".into());
+        }
+        let existing = self
+            .ios_ready_session
+            .read()
+            .map_err(|_| "nativeRetirementUnknown")?
+            .clone();
+        if let Some(owner) = existing {
+            if owner.allows_successor()
+                || matches!(&owner.origin, super::IosMainOrigin::LocalStart(_))
+                    && owner.ready.is_some()
+                    && self.core_running()
+            {
+                return Ok(generation);
+            }
+            return self.stop_for_tailscale_action(generation, attempt).await;
+        }
+        let status = tauri_plugin_polaris_ios::status()
+            .await
+            .map_err(|_| "nativeRetirementUnknown")?;
+        if !status.active {
+            return if !attempt.cancelled() && self.core_generation() == generation {
+                Ok(generation)
+            } else {
+                Err("mainCoreChanged".into())
+            };
+        }
+        let observed = tauri_plugin_polaris_ios::observe_current_session()
+            .await
+            .map_err(|_| "nativeRetirementUnknown")?;
+        let gate = self.mesh.tailscale_state_gate().await;
+        self.mesh.assert_tailscale_main_claims_drained(&gate)?;
+        attempt
+            .while_active(|| {
+                self.gate.with_current_generation(generation, |_| {
+                    let mut slot = self
+                        .ios_ready_session
+                        .write()
+                        .map_err(|_| "nativeRetirementUnknown")?;
+                    if slot.is_some() {
+                        return Err("nativeRetirementUnknown".to_owned());
+                    }
+                    *slot = Some(super::IosMainCustody {
+                        generation,
+                        config_digest: observed.config_digest().to_owned(),
+                        origin: super::IosMainOrigin::Observed(observed),
+                        main_token: None,
+                        ready: None,
+                        stopped: None,
+                    });
+                    Ok(())
+                })
+            })
+            .flatten()
+            .ok_or("mainCoreChanged")??;
+        drop(gate);
+        self.stop_for_tailscale_action(generation, attempt).await
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn retire_tailscale_account(
+        self: &Arc<Self>,
+        ticket: &ReadyMainTicket,
+        id: &str,
+        attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
+        saved: &Value,
+        candidate: Option<&Value>,
+    ) -> Result<(u64, Option<Value>), String> {
+        self.validate_ready_main(ticket)
+            .await
+            .map_err(|_| "mainCoreChanged")?;
+        let stopped_generation = self
+            .stop_for_tailscale_action(ticket.generation(), attempt)
+            .await?;
+        let gate = self.mesh.tailscale_state_gate().await;
+        self.mesh
+            .retire_tailscale_other_attempts_under_gate(id, &gate, attempt)
+            .await?;
+        let tag = ticket.target_tag(id).ok_or("profileBindingUnknown")?;
+        let (fingerprint, revision) = {
+            use tauri_plugin_polaris_ios::{
+                TailscaleProfileState, TailscaleStateFileState, TailscaleWriterState,
+            };
+            let owner = self
+                .ios_ready_session
+                .read()
+                .map_err(|_| "nativeRetirementUnknown")?;
+            let owner = owner
+                .as_ref()
+                .filter(|owner| {
+                    owner.generation == ticket.generation() && owner.main_token.is_none()
+                })
+                .ok_or("nativeRetirementUnknown")?;
+            let ready = owner
+                .ready
+                .as_ref()
+                .filter(|ready| ready.request_id() == ticket.core.ios_receipt.request_id())
+                .ok_or("nativeRetirementUnknown")?;
+            let receipt = owner
+                .stopped
+                .as_ref()
+                .and_then(|stopped| stopped.retirement())
+                .filter(|receipt| {
+                    receipt.start_request_id() == ready.request_id()
+                        && receipt.session_id() == ready.session_id()
+                        && receipt.config_digest() == ready.config_digest()
+                        && receipt.source_extension_generation() == ready.extension_generation()
+                })
+                .ok_or("nativeRetirementUnknown")?;
+            let original: Vec<_> = ready
+                .original_instances()
+                .iter()
+                .filter(|run| {
+                    run.config_digest == owner.config_digest
+                        && run.terminal == TailscaleWriterState::Unknown
+                        && run.nodes.iter().any(|node| node.tag == tag)
+                })
+                .collect();
+            let [original] = original.as_slice() else {
+                return Err("profileBindingUnknown".into());
+            };
+            let run = receipt
+                .instances()
+                .iter()
+                .find(|run| {
+                    run.run_nonce == original.run_nonce
+                        && run.config_digest == original.config_digest
+                })
+                .ok_or("nativeRetirementUnknown")?;
+            let nodes: Vec<_> = run.nodes.iter().filter(|node| node.tag == tag).collect();
+            let [node] = nodes.as_slice() else {
+                return Err("profileBindingUnknown".into());
+            };
+            if node.writer_state != TailscaleWriterState::SealedDrained
+                || node.state_file_state != TailscaleStateFileState::Regular
+                || node.state_file_revision.len() != 64
+                || !node
+                    .state_file_revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("profileBindingUnknown".into());
+            }
+            let fingerprint = if node.profile_state == TailscaleProfileState::Bound {
+                if node.profile_fingerprint.len() != 64
+                    || !node
+                        .profile_fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err("profileBindingUnknown".into());
+                }
+                Some(node.profile_fingerprint.clone())
+            } else {
+                None
+            };
+            (fingerprint, node.state_file_revision.clone())
+        };
+        attempt
+            .while_active(|| {
+                self.gate.with_current_generation(stopped_generation, |_| {
+                    if self
+                        .config
+                        .current()
+                        .map_err(|_| "candidateConfigurationChanged")?
+                        != *saved
+                    {
+                        return Err("candidateConfigurationChanged".into());
+                    }
+                    let provenance = fingerprint.as_deref().map_or(
+                polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences,
+                polaris_mesh::tailscale_state::AuthProjectionProvenance::BoundFingerprint);
+                    use crate::runtime::config::Decision;
+                    let (result, saved) = self
+                        .config
+                        .update_tailscale_credential(saved, id, |current| {
+                            if self
+                                .mesh
+                                .tailscale_retire_auth_under_gate(
+                                    id,
+                                    &gate,
+                                    Some(attempt),
+                                    provenance,
+                                    Some(&revision),
+                                )
+                                .is_err()
+                            {
+                                return Decision::Skip(Err("stateRevisionChanged".to_owned()));
+                            }
+                            let result = match candidate {
+                                Some(candidate) => {
+                                    merge_tailscale_candidate(current, saved, candidate)
+                                }
+                                None => {
+                                    crate::runtime::tailscale_login_core::park_saved_tailscale_key(
+                                        current, id,
+                                    )
+                                }
+                            };
+                            match result {
+                                Ok(()) => Decision::Write(Ok(())),
+                                Err(error) => Decision::Skip(Err(error)),
+                            }
+                        })
+                        .map_err(|_| "candidateConfigurationChanged")?;
+                    result?;
+                    Ok((stopped_generation, saved))
+                })
+            })
+            .flatten()
+            .ok_or("mainCoreChanged")?
+    }
     #[cfg(all(test, not(target_os = "ios")))]
     pub(crate) fn config_for_commit_test(&self) -> &crate::runtime::config::ConfigManager {
         &self.config
+    }
+
+    #[cfg(all(test, not(target_os = "ios")))]
+    pub(crate) fn credential_fixture_for_test(
+        registry: crate::runtime::tailscale_login_core::LoginCoreRegistry,
+    ) -> (
+        Arc<Self>,
+        Arc<crate::runtime::mesh::MeshRuntime>,
+        crate::test_support::TestDir,
+        Arc<polaris_core_supervisor::LifecycleGate>,
+    ) {
+        tests::credential_runtime(registry)
     }
     #[cfg(all(test, not(target_os = "ios")))]
     pub(crate) fn ready_commit_fixture_for_test(
@@ -514,6 +1209,7 @@ impl ProxyRuntime {
             digest: config_digest,
             completion: completion.clone(),
             identity: Arc::clone(&identity),
+            attempt: None,
         });
         Ok((
             receiver,
@@ -521,6 +1217,7 @@ impl ProxyRuntime {
                 completion,
                 expected: base,
                 identity,
+                attempt: None,
             }),
         ))
     }
@@ -533,6 +1230,18 @@ impl ProxyRuntime {
         emitted: &Value,
         status: &ProxyStatus,
     ) -> Result<(), StartError> {
+        #[cfg(target_os = "android")]
+        let raw_config_digest = {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(self.runtime_config_path())
+                .ok()
+                .and_then(|file| file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).ok())
+                .filter(|_| bytes.len() <= 4 * 1024 * 1024)
+                .and_then(|_| serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|actual| actual == emitted)
+                .map(|_| polaris_updater::sha256_hex(&bytes))
+        };
         #[cfg(target_os = "ios")]
         let ios_receipt = self
             .ios_ready_session
@@ -541,8 +1250,8 @@ impl ProxyRuntime {
             .and_then(|receipt| {
                 receipt
                     .as_ref()
-                    .filter(|(owner, _)| *owner == generation)
-                    .map(|(_, receipt)| receipt.clone())
+                    .filter(|owner| owner.generation == generation)
+                    .and_then(|owner| owner.ready.clone())
             })
             .ok_or_else(|| StartError::from("readyUnknown".to_owned()))?;
         let core = Arc::new(ReadyMainCore {
@@ -565,6 +1274,8 @@ impl ProxyRuntime {
             committed: AtomicBool::new(false),
             #[cfg(target_os = "ios")]
             ios_receipt,
+            #[cfg(target_os = "android")]
+            raw_config_digest,
         });
         self.gate.with_current_generation(generation, |_live| {
             if let Ok(mut evidence) = self.ready_main.write() {
@@ -612,7 +1323,7 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         config: Value,
     ) -> Result<watch::Receiver<NormalStartCompletion>, StartError> {
-        self.register_normal_start(config, true)
+        self.register_normal_start(config, true, None)
     }
 
     /// Explicit Start is a new user intent, even when its configuration is unchanged.
@@ -620,67 +1331,131 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         config: Value,
     ) -> Result<watch::Receiver<NormalStartCompletion>, StartError> {
-        self.register_normal_start(config, false)
+        self.register_normal_start(config, false, None)
     }
 
     fn register_normal_start(
         self: &Arc<Self>,
         config: Value,
         join_existing: bool,
+        scope: Option<(u64, Arc<crate::runtime::tailscale_login_core::Attempt>)>,
     ) -> Result<watch::Receiver<NormalStartCompletion>, StartError> {
         let config_digest = digest(&config).map_err(|error| StartError::from(error.to_string()))?;
         let mut current = self
             .normal_start
             .lock()
             .map_err(|_| StartError::from("normal Start completion poisoned".to_owned()))?;
-        // Capture under the same short lock held by admission/claim/Starting publication.
-        let base = self.core_generation();
-        if let Some(start) = current
-            .as_ref()
-            .filter(|start| join_existing && start.digest == config_digest)
-        {
-            let join = match &*start.completion.borrow() {
-                NormalStartCompletion::Pending(generation) => *generation == base,
-                NormalStartCompletion::Starting(generation) => *generation == base,
-                _ => false,
-            };
-            if join {
-                return Ok(start.completion.subscribe());
+        let attempt = scope.as_ref().map(|(_, attempt)| Arc::clone(attempt));
+        let register = || {
+            // Capture under the same short lock held by admission/claim/Starting publication.
+            let base = self.core_generation();
+            if scope
+                .as_ref()
+                .is_some_and(|(expected, _)| *expected != base)
+            {
+                return Err(StartError::from("superseded".to_owned()));
             }
-        }
-        let (completion, receiver) = watch::channel(NormalStartCompletion::Pending(base));
-        let identity = ProducerCell::queued(Arc::clone(&self.stop_domain), base);
-        current.replace(NormalStart {
-            digest: config_digest,
-            completion: completion.clone(),
-            identity: Arc::clone(&identity),
-        });
-        let runtime = Arc::clone(self);
-        // The spawned producer continues this request, rather than inheriting unrelated
-        // tasks' interactivity or reauthorizing a suppressed background helper prompt.
-        let interactive = super::startup::helper_gate_interactive();
-        tokio::spawn(async move {
-            let claim = NormalStartClaim {
-                completion: completion.clone(),
-                expected: base,
-                identity,
-            };
-            let start = runtime.start_guarded_with_completion(config, None, Some(&claim));
-            let leg = if interactive {
-                start.await
-            } else {
-                super::startup::with_helper_gate_suppressed(start).await
-            };
-            claim.finish_dispatch();
-            runtime.prune_normal_producers();
-            completion.send_replace(match leg {
-                StartLeg::Finished(result, generation) => {
-                    NormalStartCompletion::Finished(result, generation)
+            if let Some(start) = current
+                .as_ref()
+                .filter(|start| join_existing && start.digest == config_digest)
+            {
+                let join = match &*start.completion.borrow() {
+                    NormalStartCompletion::Pending(generation) => *generation == base,
+                    NormalStartCompletion::Starting(generation) => *generation == base,
+                    _ => false,
+                };
+                if join {
+                    return Ok(start.completion.subscribe());
                 }
-                StartLeg::Superseded => NormalStartCompletion::Superseded,
+            }
+            let (completion, receiver) = watch::channel(NormalStartCompletion::Pending(base));
+            let identity = ProducerCell::queued(Arc::clone(&self.stop_domain), base);
+            current.replace(NormalStart {
+                digest: config_digest,
+                completion: completion.clone(),
+                identity: Arc::clone(&identity),
+                attempt: attempt.clone(),
             });
-        });
-        Ok(receiver)
+            let runtime = Arc::clone(self);
+            // The spawned producer continues this request, rather than inheriting unrelated
+            // tasks' interactivity or reauthorizing a suppressed background helper prompt.
+            let interactive = super::startup::helper_gate_interactive();
+            tokio::spawn(async move {
+                let claim = NormalStartClaim {
+                    completion: completion.clone(),
+                    expected: base,
+                    identity,
+                    attempt,
+                };
+                let start = runtime.start_guarded_with_completion(config, None, Some(&claim));
+                let start = async {
+                    if interactive {
+                        start.await
+                    } else {
+                        super::startup::with_helper_gate_suppressed(start).await
+                    }
+                };
+                tokio::pin!(start);
+                #[cfg(target_os = "ios")]
+                let leg = if let Some(attempt) = &claim.attempt {
+                    tokio::select! {
+                        biased;
+                        () = attempt.cancellation() => {
+                            // Retain and await the original producer. Dropping its waiter
+                            // would strand custody during a permission/native callback.
+                            let stop = runtime.claim_cancelled_normal_start(&claim);
+                            if let Some((original, generation)) = stop {
+                                let _ = tauri_plugin_polaris_ios::revoke_pending_start_through(original, generation).await;
+                            }
+                            let leg = start.await;
+                            if let Some((_, generation)) = stop {
+                                if runtime.stop_inner(super::lifecycle::StopClaim::AlreadyClaimed(generation)).await
+                                    .is_ok_and(|commit| commit == Some(generation)) {
+                                    runtime.clear_system_proxy().await;
+                                }
+                            }
+                            leg
+                        }
+                        leg = &mut start => leg,
+                    }
+                } else {
+                    start.await
+                };
+                #[cfg(not(target_os = "ios"))]
+                let leg = start.await;
+                claim.finish_dispatch();
+                runtime.prune_normal_producers();
+                completion.send_replace(match leg {
+                    StartLeg::Finished(result, generation) => {
+                        NormalStartCompletion::Finished(result, generation)
+                    }
+                    StartLeg::Superseded => NormalStartCompletion::Superseded,
+                });
+            });
+            Ok(receiver)
+        };
+        match scope.as_ref().map(|(_, attempt)| attempt) {
+            Some(attempt) => attempt
+                .while_active(register)
+                .ok_or_else(|| StartError::from("cancelled".to_owned()))?,
+            None => register(),
+        }
+    }
+
+    pub(super) fn normal_start_attempt(
+        &self,
+        generation: u64,
+    ) -> Result<Option<Arc<crate::runtime::tailscale_login_core::Attempt>>, StartError> {
+        self.normal_start
+            .lock()
+            .map(|starts| {
+                starts
+                    .retained
+                    .iter()
+                    .find(|start| start.identity.has_generation(generation))
+                    .and_then(|start| start.attempt.clone())
+            })
+            .map_err(|_| StartError::from("normal Start completion poisoned".to_owned()))
     }
 
     /// Capture before entering native custody; overwritten admitted A stays discoverable.
@@ -704,6 +1479,16 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         binding: ActionBinding,
     ) -> Result<ReadyMainTicket, MainPrerequisiteError> {
+        if binding
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.cancelled())
+            || binding
+                .expected_generation
+                .is_some_and(|expected| expected != self.core_generation())
+        {
+            return Err(MainPrerequisiteError::Superseded);
+        }
         let saved = self
             .config
             .current()
@@ -732,8 +1517,11 @@ impl ProxyRuntime {
                 self.join_current_normal_start(&saved)?
                     .ok_or(MainPrerequisiteError::ReadyUnknown)?
             } else {
-                self.normal_start_completion(saved)
-                    .map_err(MainPrerequisiteError::Failed)?
+                match binding.expected_generation.zip(binding.attempt.clone()) {
+                    Some(scope) => self.register_normal_start(saved, true, Some(scope)),
+                    None => self.normal_start_completion(saved),
+                }
+                .map_err(MainPrerequisiteError::Failed)?
             };
             let deadline = tokio::time::sleep(Duration::from_secs(90));
             tokio::pin!(deadline);
@@ -782,6 +1570,59 @@ impl ProxyRuntime {
         let ticket = ReadyMainTicket { core, binding };
         self.validate_ready_main(&ticket).await?;
         Ok(ticket)
+    }
+
+    /// Hot credential logout may use only this original completed live producer. A stopped
+    /// runtime selects the separately fenced cold leg; a partial live producer is Unknown.
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn live_tailscale_main(
+        &self,
+        binding: ActionBinding,
+    ) -> Result<Option<ReadyMainTicket>, MainPrerequisiteError> {
+        let generation = binding
+            .expected_generation
+            .ok_or(MainPrerequisiteError::ReadyUnknown)?;
+        let attempt = binding
+            .attempt
+            .as_ref()
+            .ok_or(MainPrerequisiteError::ReadyUnknown)?;
+        let cold = attempt
+            .while_active(|| {
+                self.gate.with_current_generation(generation, |_| {
+                    let owner = self
+                        .ios_ready_session
+                        .read()
+                        .map_err(|_| MainPrerequisiteError::ReadyUnknown)?;
+                    let committed = self
+                        .ready_main
+                        .read()
+                        .map_err(|_| MainPrerequisiteError::ReadyUnknown)?
+                        .as_ref()
+                        .is_some_and(|ready| {
+                            ready.generation == generation && ready.committed.load(Ordering::SeqCst)
+                        });
+                    let local_pending = owner.as_ref().is_some_and(|owner| {
+                        matches!(&owner.origin, super::IosMainOrigin::LocalStart(_))
+                            && !owner.allows_successor()
+                            && (owner.ready.is_none() || !committed)
+                    });
+                    let running = self
+                        .status
+                        .read()
+                        .map_err(|_| MainPrerequisiteError::ReadyUnknown)?
+                        .running;
+                    check_tailscale_logout_cold(running, local_pending)
+                })
+            })
+            .flatten()
+            .ok_or(MainPrerequisiteError::Superseded)??;
+        if cold {
+            return Ok(None);
+        }
+        let core = self.ready_main_for_generation(generation)?;
+        let ticket = ReadyMainTicket { core, binding };
+        self.validate_ready_main(&ticket).await?;
+        Ok(Some(ticket))
     }
 
     pub(crate) fn check_ready_main(

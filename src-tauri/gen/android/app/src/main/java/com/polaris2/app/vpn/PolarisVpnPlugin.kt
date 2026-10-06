@@ -38,6 +38,19 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import org.json.JSONArray
+import org.json.JSONObject
+
+@InvokeArg
+class TailscaleStoreArgs {
+    lateinit var operation: String
+    var binding: String? = null
+    var instanceId: String? = null
+    var expectedActualConfigDigest: String? = null
+    var runId: String? = null
+    var birthNonce: String? = null
+    var stateFile: String? = null
+    var actionRequestId: String? = null
+}
 
 @InvokeArg
 class DebugReportArgs {
@@ -167,6 +180,70 @@ class PollArgs {
  */
 @TauriPlugin
 class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
+    /** Scoped TS facts only; ordinary ACK/global ledger state remain unchanged. */
+    @Command
+    fun tailscaleStoreCustody(invoke: Invoke) {
+        val args = invoke.parseArgs(TailscaleStoreArgs::class.java)
+        Thread({
+            val ledger = AndroidNativeAdmissionGate.ledger
+            try {
+                fun originalNativeBinding(): JSONObject { return JSONObject(checkNotNull(args.binding)) }
+                fun respond(value: JSONObject) { invoke.resolve(JSObject().put("envelope", value.toString())) }
+                val value = when (args.operation) {
+                    "observeLogin" -> checkNotNull(ledger.observeTailscaleOwner(AndroidNativeAdmission.Kind.Login,
+                        checkNotNull(args.instanceId))).also { original ->
+                        check(original.getString("actualConfigDigest") == args.expectedActualConfigDigest)
+                    }
+                    "observeMain" -> {
+                        val attempt = checkNotNull(MainKernelAttemptRegistry.ownerForDrain()).attempt
+                        synchronized(attempt.operationLock) {
+                            check(MainKernelAttemptRegistry.isCurrent(attempt))
+                            check((args.runId == null && args.birthNonce == null) ||
+                                (args.runId == attempt.runId && args.birthNonce == attempt.birthNonce))
+                            checkNotNull(attempt.tailscaleStore).wire()
+                        }
+                    }
+                    "readMain", "readLogin" -> checkNotNull(ledger.readTailscaleOwner(originalNativeBinding())).also {
+                        check(it.getString("producerKind") == if (args.operation == "readMain") "Main" else "Login")
+                    }
+                    "closeLogin" -> {
+                        val original = originalNativeBinding()
+                        check(original.getString("producerKind") == "Login")
+                        val request = checkNotNull(args.actionRequestId)
+                        ledger.beginTailscaleClose(original, request)
+                        TransientLoginHost.closeTailscale(original) { failure ->
+                            respond(tailscaleStoreClosed(request, failure == null, ledger.readTailscaleOwner(original)))
+                        }
+                        return@Thread
+                    }
+                    "beginWarm" -> ledger.beginWarm(originalNativeBinding())
+                    "readWarm" -> ledger.readWarm(originalNativeBinding())
+                    "finishWarm" -> ledger.finishWarm(originalNativeBinding())
+                    "closeWarm" -> {
+                        val tuple = originalNativeBinding()
+                        ledger.beginWarmClose(tuple, checkNotNull(args.actionRequestId))
+                        TransientLoginHost.closeTailscale(tuple) { _ ->
+                            runCatching { respond(ledger.readWarm(tuple)) }.onFailure { invoke.reject("nativeRetirementUnknown", "TAILSCALE_LOGIN_FAILED") }
+                        }
+                        return@Thread
+                    }
+                    "query", "begin", "finish" -> ledger.tailscaleTargetAction(originalNativeBinding(), checkNotNull(args.stateFile),
+                        checkNotNull(args.actionRequestId), args.operation)
+                    else -> error("nativeRetirementUnknown")
+                }
+                respond(value)
+            } catch (_: Throwable) {
+                // No original config, URL, key or native error text crosses this scoped channel.
+                invoke.reject("nativeRetirementUnknown", "TAILSCALE_LOGIN_FAILED")
+            }
+        }, "polaris-ts-store-custody").start()
+    }
+
+    private fun tailscaleStoreClosed(request: String, closed: Boolean, store: JSONObject?): JSONObject {
+        return JSONObject().put("originalCloseRequestId", request).put("ordinaryCloseState", if (closed) "Closed" else "Unknown")
+            .also { reply -> store?.let { reply.put("store", it) } }
+    }
+
     @Command
     fun listBindableInterfaces(invoke: Invoke) {
         Thread {
@@ -536,6 +613,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
                     AndroidNativeValidation.check(ticket, cfg)
                 }.exceptionOrNull()
                 val result = JSObject()
+                AndroidNativeAdmissionGate.ledger.validationOwner(ticket)?.let { result.put("tailscaleValidationEnvelope", it.toString()) }
                 if (err != null) {
                     result.put("error", err.message ?: err.toString())
                     if (err is AndroidNativeAdmission.CapacityClosed) result.put("errorCode", AndroidNativeAdmission.CAPACITY_CODE)

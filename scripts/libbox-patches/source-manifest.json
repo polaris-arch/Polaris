@@ -47,7 +47,7 @@
     },
     {
       "file": "stopped-speed-strict-cleanup.patch",
-      "sha256": "af5a0dc89dbcd0c7cd9e4d055b8565cd39c1a9cef51a7b89e45896150755e474"
+      "sha256": "839cfff957264aec8d4a85bb9e4efd272c4cfc6ad08de5eeb33d4c8f8c6e55b5"
     },
     {
       "file": "api-service-close.patch",
@@ -59,7 +59,7 @@
     },
     {
       "file": "construction-validation.patch",
-      "sha256": "f699001b797fdc473f20ad8738ee674f7244371ed34e383367b3cfa33bad7ec5"
+      "sha256": "6730a5d42eca14543719418ff75361e808af12d01792e196837d8bad669d67ae"
     },
     {
       "file": "dns-cancellation-lifecycle.patch",

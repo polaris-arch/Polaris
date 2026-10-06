@@ -113,6 +113,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(POLARIS_BUNDLE_ID).PacketTunnel
         PRODUCT_NAME: PolarisPacketTunnel
         APPLICATION_EXTENSION_API_ONLY: true
+        FRAMEWORK_SEARCH_PATHS: $(inherited) "$(POLARIS_LIBBOX_GENERATION_ROOT)"
         SKIP_INSTALL: true
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_BITCODE: false
@@ -132,7 +133,7 @@ targets:
         com.apple.developer.networking.networkextension: [packet-tunnel-provider]
         com.apple.security.application-groups: [$(POLARIS_APP_GROUP)]
     dependencies:
-      - framework: Frameworks/Libbox.xcframework
+      - framework: $(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework
         embed: false
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
@@ -141,6 +142,12 @@ targets:
     preBuildScripts:
       - name: Verify iOS Core
         script: |
-          test -d "$SRCROOT/Frameworks/Libbox.xcframework" || { echo "error: Run bash scripts/build-libbox-ios.sh before building iOS."; exit 1; }
-          python3 "$SRCROOT/../../../scripts/ios-libbox.py" verify
+          python3 "$SRCROOT/../../../scripts/ios-libbox.py" verify --component-for-link \
+            --generation-root "${POLARIS_LIBBOX_GENERATION_ROOT:?approved immutable Libbox generation required}" \
+            --output-fingerprint "${POLARIS_LIBBOX_OUTPUT_FINGERPRINT:?approved component fingerprint required}" \
+            --receipt-sha256 "${POLARIS_LIBBOX_RECEIPT_SHA256:?approved receipt SHA256 required}" \
+            --build-policy "${POLARIS_LIBBOX_BUILD_POLICY:?approved M1 policy required}" \
+            --build-policy-sha256 "${POLARIS_LIBBOX_BUILD_POLICY_SHA256:?approved M1 policy SHA256 required}" \
+            --tools "${POLARIS_LIBBOX_TOOLS:?approved tools required}" \
+            --tools-sha256 "${POLARIS_LIBBOX_TOOLS_SHA256:?approved tools SHA256 required}"
         basedOnDependencyAnalysis: false

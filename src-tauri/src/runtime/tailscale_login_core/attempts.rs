@@ -26,6 +26,12 @@ pub(super) const RETIRED_LIMIT_ERROR: &str =
 pub struct LoginRequest {
     pub attempt_id: String,
     pub mode: LoginMode,
+    #[serde(default)]
+    pub replace_identity: bool,
+    #[serde(default)]
+    pub reuse_retained_auth_key: bool,
+    #[serde(default)]
+    pub expected_credential_revision: Option<String>,
 }
 
 /// Last native progress for one renderer-minted request. A read cannot infer authorization
@@ -46,7 +52,7 @@ pub struct LoginProgressReceipt {
     pub identity_epoch: Option<String>,
 }
 
-pub(super) struct Attempt {
+pub(crate) struct Attempt {
     pub server_id: String,
     pub claimed: AtomicBool,
     pub process_owned: AtomicBool,
@@ -54,9 +60,165 @@ pub(super) struct Attempt {
     done: watch::Sender<bool>,
     progress: Mutex<Option<LoginProgressReceipt>>,
     main_context: Mutex<Option<(u64, Option<String>)>>,
+    credential_activation: Mutex<Option<CredentialActivation>>,
+    #[cfg(target_os = "android")]
+    android_store:
+        Mutex<Option<crate::runtime::proxy::android_bridge::tailscale_store::AndroidStoreCustody>>,
+    #[cfg(any(target_os = "android", test))]
+    android_action: Mutex<Option<Arc<AndroidTargetAction>>>,
+}
+
+/// The original request keeps an unresolved native reservation reachable. This
+/// cell is not a writer receipt; only the private bridge's begin/finish may
+/// establish or release the native action.
+#[cfg(any(target_os = "android", test))]
+pub(crate) struct AndroidTargetAction {
+    pub(crate) state_file: String,
+    pub(crate) action_id: String,
+    pub(crate) active: AtomicBool,
+    #[cfg(target_os = "android")]
+    pub(crate) original: AndroidActionOrigin,
+}
+
+/// Original opaque native handles; neither variant manufactures native scope or
+/// terminal evidence. Warm also remains manageable before a Store exists.
+#[cfg(target_os = "android")]
+pub(crate) enum AndroidActionOrigin {
+    Runtime(crate::runtime::proxy::android_bridge::tailscale_store::AndroidStoreCustody),
+    Warm(crate::runtime::proxy::android_bridge::tailscale_store::AndroidWarmTuple),
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) struct AndroidActionActivity(pub(crate) Arc<AndroidTargetAction>);
+
+#[cfg(any(target_os = "android", test))]
+impl Drop for AndroidActionActivity {
+    fn drop(&mut self) {
+        // This only transfers the Rust operation back to its retained token. It
+        // never claims that a pending native begin or finish has completed.
+        self.0.active.store(false, Ordering::SeqCst);
+    }
+}
+
+/// In-memory exact saved CAS for this request, not a producer terminal or a new state machine.
+#[derive(Clone)]
+pub(super) struct CredentialActivation {
+    pub proxy: std::sync::Weak<crate::runtime::proxy::ProxyRuntime>,
+    pub saved: serde_json::Value,
+    pub generation: u64,
 }
 
 impl Attempt {
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn reserve_android_action(
+        &self,
+        action: Arc<AndroidTargetAction>,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .android_action
+            .lock()
+            .map_err(|_| "nativeRetirementUnknown")?;
+        if slot.is_some() {
+            return Err("nativeRetirementUnknown".into());
+        }
+        *slot = Some(action);
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn android_action(&self) -> Result<Option<Arc<AndroidTargetAction>>, String> {
+        self.android_action
+            .lock()
+            .map(|slot| slot.clone())
+            .map_err(|_| "nativeRetirementUnknown".into())
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn release_android_action(
+        &self,
+        original: &Arc<AndroidTargetAction>,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .android_action
+            .lock()
+            .map_err(|_| "nativeRetirementUnknown")?;
+        if !slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, original))
+        {
+            return Err("nativeRetirementUnknown".into());
+        }
+        *slot = None;
+        Ok(())
+    }
+
+    fn has_unresolved_action(&self) -> bool {
+        #[cfg(any(target_os = "android", test))]
+        {
+            self.android_action
+                .lock()
+                .map_or(true, |slot| slot.is_some())
+        }
+        #[cfg(not(any(target_os = "android", test)))]
+        {
+            false
+        }
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn record_android_store(
+        &self,
+        original: crate::runtime::proxy::android_bridge::tailscale_store::AndroidStoreCustody,
+    ) -> Result<(), String> {
+        *self
+            .android_store
+            .lock()
+            .map_err(|_| "nativeRetirementUnknown")? = Some(original);
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn android_store(
+        &self,
+    ) -> Result<crate::runtime::proxy::android_bridge::tailscale_store::AndroidStoreCustody, String>
+    {
+        self.android_store
+            .lock()
+            .map_err(|_| "nativeRetirementUnknown")?
+            .clone()
+            .ok_or_else(|| "nativeRetirementUnknown".to_owned())
+    }
+
+    pub(super) fn record_credential_activation(
+        &self,
+        proxy: &Arc<crate::runtime::proxy::ProxyRuntime>,
+        saved: serde_json::Value,
+        generation: u64,
+    ) {
+        *self
+            .credential_activation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(CredentialActivation {
+            proxy: Arc::downgrade(proxy),
+            saved,
+            generation,
+        });
+    }
+
+    pub(super) fn credential_activation(&self) -> Option<CredentialActivation> {
+        self.credential_activation.lock().ok()?.clone()
+    }
+    /// The existing cancellation cell also serializes each synchronous action
+    /// admission. Cancellation that wins this lock cannot be cleared by Start.
+    pub(crate) fn while_active<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let mut result = None;
+        self.cancel.send_if_modified(|cancelled| {
+            if !*cancelled && !self.is_finished() {
+                result = Some(action());
+            }
+            false
+        });
+        result
+    }
     pub fn cancelled(&self) -> bool {
         *self.cancel.borrow()
     }
@@ -206,7 +368,9 @@ impl Attempts {
             if state.retired_ids.contains(id) && !attempt.cancelled() {
                 return Err(());
             }
-            if attempt.is_finished() {
+            if attempt.has_unresolved_action() {
+                busy = true;
+            } else if attempt.is_finished() {
                 if attempt.process_owned.load(Ordering::SeqCst) {
                     return Err(());
                 }
@@ -229,7 +393,9 @@ impl Attempts {
             .entries
             .values()
             .any(|a| {
-                a.server_id == server_id && a.claimed.load(Ordering::SeqCst) && !a.is_finished()
+                a.server_id == server_id
+                    && (a.has_unresolved_action()
+                        || a.claimed.load(Ordering::SeqCst) && !a.is_finished())
             })
     }
 
@@ -243,11 +409,49 @@ impl Attempts {
         server_id: &str,
         keep: Option<&str>,
     ) -> Result<Vec<Arc<Attempt>>, String> {
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        self.retire_node_except_inner(server_id, keep, None)
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    pub fn retire_node_except_claimed(
+        &self,
+        server_id: &str,
+        keep: &Arc<Attempt>,
+    ) -> Result<Vec<Arc<Attempt>>, String> {
+        self.retire_node_except_inner(server_id, None, Some(keep))
+    }
+
+    fn retire_node_except_inner(
+        &self,
+        server_id: &str,
+        keep_id: Option<&str>,
+        keep_claimed: Option<&Arc<Attempt>>,
+    ) -> Result<Vec<Arc<Attempt>>, String> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| "Login request ownership is unknown")?;
+        if let Some(keep) = keep_claimed {
+            if keep.server_id != server_id
+                || !keep.claimed.load(Ordering::SeqCst)
+                || keep.cancelled()
+                || keep.is_finished()
+                || !state
+                    .entries
+                    .iter()
+                    .any(|(id, entry)| Arc::ptr_eq(entry, keep) && !state.retired_ids.contains(id))
+            {
+                return Err("Login request ownership changed".into());
+            }
+        }
         let ids: Vec<_> = state
             .entries
             .iter()
-            .filter(|(id, a)| a.server_id == server_id && keep != Some(id.as_str()))
+            .filter(|(id, a)| {
+                a.server_id == server_id
+                    && keep_id != Some(id.as_str())
+                    && !keep_claimed.is_some_and(|keep| Arc::ptr_eq(a, keep))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         let new_ids = ids
@@ -273,6 +477,39 @@ impl Attempts {
             }
         }
         Ok(attempts)
+    }
+
+    pub fn owns_state_except(
+        &self,
+        server_id: &str,
+        keep: Option<&Arc<Attempt>>,
+    ) -> Result<bool, String> {
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| "Login request ownership is unknown")?;
+        Ok(state.entries.values().any(|attempt| {
+            attempt.server_id == server_id
+                && (attempt.has_unresolved_action()
+                    || attempt.claimed.load(Ordering::SeqCst) && !attempt.is_finished())
+                && !keep.is_some_and(|keep| Arc::ptr_eq(attempt, keep))
+        }))
+    }
+
+    /// Read the original cancelled/finished row without weakening get's ordinary admission.
+    /// Any newer unretired row for the node prevents compensation, even when unclaimed.
+    pub(super) fn original_credential_row(&self, id: &str, original: &Arc<Attempt>) -> bool {
+        self.0.lock().is_ok_and(|state| {
+            state
+                .entries
+                .get(id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, original))
+                && !state.entries.iter().any(|(other_id, entry)| {
+                    entry.server_id == original.server_id
+                        && !Arc::ptr_eq(entry, original)
+                        && !state.retired_ids.contains(other_id)
+                })
+        })
     }
 
     pub fn get(&self, server_id: &str, id: &str) -> Result<Arc<Attempt>, String> {
@@ -310,7 +547,9 @@ impl Attempts {
             };
         }
         if state.entries.len() >= 512 {
-            state.entries.retain(|_, a| !*a.done.borrow());
+            state
+                .entries
+                .retain(|_, a| !*a.done.borrow() || a.has_unresolved_action());
         }
         if state.entries.len() >= 512 {
             return Err("Too many pending login requests".into());
@@ -325,6 +564,11 @@ impl Attempts {
             done,
             progress: Mutex::new(None),
             main_context: Mutex::new(None),
+            credential_activation: Mutex::new(None),
+            #[cfg(target_os = "android")]
+            android_store: Mutex::new(None),
+            #[cfg(any(target_os = "android", test))]
+            android_action: Mutex::new(None),
         });
         state.entries.insert(id.into(), attempt.clone());
         Ok(attempt)
@@ -348,7 +592,9 @@ impl Attempts {
                 return Ok(None);
             }
             if state.entries.len() >= 512 {
-                state.entries.retain(|_, a| !a.is_finished());
+                state
+                    .entries
+                    .retain(|_, a| !a.is_finished() || a.has_unresolved_action());
             }
             if state.entries.len() >= 512 {
                 return Err("Too many pending login requests".into());
@@ -363,6 +609,11 @@ impl Attempts {
                 done,
                 progress: Mutex::new(None),
                 main_context: Mutex::new(None),
+                credential_activation: Mutex::new(None),
+                #[cfg(target_os = "android")]
+                android_store: Mutex::new(None),
+                #[cfg(any(target_os = "android", test))]
+                android_action: Mutex::new(None),
             });
             state.entries.insert(id.into(), attempt.clone());
             attempt

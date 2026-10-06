@@ -1,9 +1,30 @@
 import { describe, expect, it, vi } from 'vitest';
-import { acceptLoginProgress, copyLoginUrl, claimLoginUrl, mainAuthUrlOwner, openLoginUrl, loginAttemptActive, loginFailureReasonKey, progressForLoginRequest, type TailscaleLoginProgress } from './tailscale-login-progress';
+import { acceptLoginProgress, copyLoginUrl, claimLoginUrl, mainAuthUrlOwner, openLoginUrl, loginAttemptActive, loginConnectionProgressKey, loginFailureReasonKey, progressForLoginRequest, type TailscaleLoginProgress } from './tailscale-login-progress';
 import { validatedTailscaleAuthUrl } from './tailscale-auth-url';
 
 const current: TailscaleLoginProgress = { serverId: 'ts1', attemptId: 'new', phase: 'starting' };
 describe('Tailscale login request identity and result', () => {
+  it('replacement phases remain active until a fresh producer binds, then late unbound callbacks are rejected', () => {
+    let progress = current;
+    for (const phase of ['stoppingConnection', 'retiringIdentity', 'savingCandidate', 'startingConnection', 'preparingConnection', 'waitingForReady'] as const) {
+      const next = { ...current, phase };
+      expect(loginAttemptActive(phase)).toBe(true);
+      expect(loginConnectionProgressKey(phase)).toBeTruthy();
+      expect(acceptLoginProgress(progress, next)).toBe(true);
+      expect(mainAuthUrlOwner(next)).toBeNull();
+      progress = next;
+    }
+    const fresh: TailscaleLoginProgress = { ...current, phase: 'mainCore', mainGeneration: 8, identityEpoch: 'fresh' };
+    expect(acceptLoginProgress(progress, fresh)).toBe(true);
+    expect(acceptLoginProgress(fresh, progress)).toBe(false);
+    expect(acceptLoginProgress(fresh, { ...fresh, phase: 'authorized', mainGeneration: 7, identityEpoch: 'old' })).toBe(false);
+    expect(acceptLoginProgress(fresh, { ...fresh, phase: 'authorized' })).toBe(true);
+    expect(loginConnectionProgressKey('authorized')).toBeUndefined();
+    expect(loginFailureReasonKey('nativeRetirementUnknown')).toBe('ts.reasonIdentityRetirement');
+    expect(loginFailureReasonKey('profileBindingUnknown')).toBe('ts.reasonIdentityRetirement');
+    expect(loginFailureReasonKey('stateRevisionChanged')).toBe('ts.reasonSessionChanged');
+    expect(loginFailureReasonKey('candidateConfigurationChanged')).toBe('ts.reasonConfigurationChanged');
+  });
   it('an older panel cannot display the URL or result of a newer attempt on the same node', () => {
     const a = { serverId: 'ts1', attemptId: 'A' };
     const b = { serverId: 'ts1', attemptId: 'B' };

@@ -12,7 +12,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
 
 test('managed build rejects missing output pins before downloading or replacing anything', () => {
-  for (const binarySha256 of ['', undefined, 'abc']) {
+  for (const binarySha256 of [null, '', undefined, 'abc']) {
     assert.throws(() => buildWindowsCore(root,
       { ...manifest, windowsBuild: { ...manifest.windowsBuild, binarySha256 } },
       '/must-not-be-written', false), /Invalid pinned/);
@@ -20,10 +20,21 @@ test('managed build rejects missing output pins before downloading or replacing 
 });
 
 test('patch changes require a new pin even when a cached core exists', () => {
-  assert.throws(() => buildWindowsCore(root,
-    { ...manifest, windowsBuild: { ...manifest.windowsBuild, patchSha256: '0'.repeat(64) } },
-    join(root, 'resources/win/sing-box.exe'), false), /SHA-256 mismatch/);
-  verifyHash(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), manifest.windowsBuild.patchSha256);
+  const work = mkdtempSync(join(tmpdir(), 'polaris-windows-patch-test-'));
+  try {
+    const cachedCore = Buffer.from('MZ synthetic cached Windows core');
+    const dest = join(work, 'sing-box.exe');
+    writeFileSync(dest, cachedCore);
+    // Source-only manifests leave output pins null. This complete mock pin
+    // lets the test reach the patch gate without weakening the null-pin gate.
+    const pinned = { ...manifest, windowsBuild: { ...manifest.windowsBuild,
+      binarySha256: createHash('sha256').update(cachedCore).digest('hex'),
+      patchSha256: '0'.repeat(64) } };
+    assert.throws(() => buildWindowsCore(root, pinned, dest, false,
+      () => assert.fail('Patch mismatch must reject before invoking native tools')), /SHA-256 mismatch/);
+    assert.deepEqual(readFileSync(dest), cachedCore);
+    verifyHash(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), manifest.windowsBuild.patchSha256);
+  } finally { rmSync(work, { recursive: true, force: true }); }
 });
 
 test('same-size executable corruption fails SHA verification', () => {

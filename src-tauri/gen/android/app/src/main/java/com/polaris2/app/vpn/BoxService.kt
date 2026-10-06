@@ -224,6 +224,7 @@ class BoxService(
             if (bridgeConfig != null) SystemStart.requireLegacyAllowed(service)
             SystemEndpointGuard.requireSupported(config)
             val nativeTicket = checkNotNull(attempt.nativeTicket) { "android: 主核原生准入票缺失" }
+            attempt.bindTailscaleStore(AndroidNativeAdmissionGate.ledger)
             AndroidNativeMain.enterBirth(nativeTicket)
             PolarisApplication.ensureSetup()
             // Reserve before native birth. A failed/cancelled birth can still leave a
@@ -409,7 +410,7 @@ class BoxService(
         }.getOrNull() else null
         if (BuildConfig.DEBUG && token == null) runCatching { DebugAppliedInputs.witness.seal(attempt) }
         try {
-            nativeCall()
+            checkNotNull(attempt.tailscaleStore).invoke(config, { AndroidTailscaleStoreCustody.export(server) }, nativeCall)
             if (token != null) runCatching {
                 DebugAppliedInputs.witness.returned(token, current() && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt))
             }
@@ -606,7 +607,10 @@ class BoxService(
                                 // descriptor can be released; OpenInterface duplicates it afterwards.
                                 closeStage = "native-service"
                                 try { server?.closeService() }
-                                finally { runCatching { detachedTun?.close() } }
+                                finally {
+                                    server?.let { original -> attempt.tailscaleStore?.closed { AndroidTailscaleStoreCustody.export(original) } }
+                                    runCatching { detachedTun?.close() }
+                                }
                                 closeStage = "native-command"
                                 server?.close()
                             }

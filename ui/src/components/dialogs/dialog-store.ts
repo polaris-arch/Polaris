@@ -67,7 +67,7 @@ export type DialogDesc =
   | { kind: 'sub-create-task'; operationId: string }
   | { kind: 'warp'; edit?: boolean } // WARP 单例槽，无 serverId（弹窗自查现有节点）
   // ts-login 身兼新建与编辑：带 serverId = 给该既有节点换 key / 换控制面；不带 = 新建（无节点可编）。
-  | { kind: 'ts-login'; serverId?: string }
+  | { kind: 'ts-login'; serverId?: string; replaceIdentity?: boolean }
   // Tailscale 不再是单例（meshSingletonConflict 已放宽），必须按 serverId 寻址，否则多节点时
   // 弹窗会自查到任意一个（通常是第一个）而非调用方想编辑的那个 —— 见 node-edit-routing.ts 的教训。
   | { kind: 'ts-settings'; serverId: string }

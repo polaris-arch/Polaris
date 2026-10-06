@@ -3,13 +3,13 @@
   "evidenceScope": "source-inputs-only",
   "sourceHelperSha256": "f41b7ea2ba57301d8810b940e2c5788735d2d851788463ee42babef40e622e1a",
   "commonSource": {
-    "sourceManifestSha256": "1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a",
+    "sourceManifestSha256": "9f269083f002cc7dea49e5151c4e150e6ba1d26dc173d4601614dd2cb557b7fd",
     "provisionerSha256": "5ad89596ee5b4e320c6bfec710933af6219318fff6c66fb4d911475240deaa5b",
-    "sourceReceiptFingerprint": "b0eb6c10e5883b70016d22c0f5aa1f5e95700df1a194fcebba10d1928b06b257",
+    "sourceReceiptFingerprint": "287b3d7a85b777e1a3f379f05171f26ee1e4f96803c1f4aaabe3e8116dc21b54",
     "moduleGraphSha256": "c4f92118f017f76bfe0bed59ffd5517123e9da6e27318e9968f3abb1c0f62512",
-    "patchedSourceTree": "1f6bf34b1e12d6bcef7750453c4eeff7040ca533",
-    "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
-    "version": "1.15.0-alpha.8.polaris.2",
+    "patchedSourceTree": "e6612c102a54fa66505ed4d358f2f673a4579a88",
+    "buildTree": "3b2910bb44c94cf494fc49203071aad195ef7e80",
+    "version": "1.15.0-alpha.8.polaris.3",
     "dependencyModules": [
       "github.com/sagernet/sing-tun",
       "github.com/sagernet/nftables"

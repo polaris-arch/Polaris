@@ -283,4 +283,26 @@ class TransientLoginNativeOwnerTest {
         assertTrue(login.contains("close_transient_login(instance_id).await"))
         assertEquals(2, login.split("instance_id: instance_id.to_owned()").size - 1)
     }
+
+    @Test fun scopedStoreRetainsTheOriginalNativeOwnerAfterOrdinaryCloseWithoutChangingCoverage() {
+        val ledger = ledger()
+        val old = reserve(ledger)
+        val store = old.bindTailscaleStore()
+        assertTrue(store === old.bindTailscaleStore())
+        var native = ScopedNativeFixture.export()
+        val run = ScopedNativeFixture.run("a", "login", listOf("one"))
+        old.construct { store.invoke("login", { native }) { native = ScopedNativeFixture.export(run) } }
+        val binding = store.wire()
+        store.closed { ScopedNativeFixture.export(ScopedNativeFixture.retired(run)) }
+        old.closedWithoutProof()
+        val next = reserve(ledger, "login-B")
+        assertTrue(next.enterBirth())
+        assertEquals(old.ticket.id, ledger.readTailscaleOwner(binding)!!.getString("nativeTicketId"))
+        assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(old.ticket))
+        assertEquals(AndroidNativeAdmission.State.BirthEntered, ledger.state(next.ticket))
+        assertFalse(TransientLoginNativeOwner.capabilities.isNotEmpty())
+        val foreign = org.json.JSONObject(binding.toString()).put("nativeTicketId", next.ticket.id)
+        assertEquals(null, ledger.readTailscaleOwner(foreign))
+    }
+
 }

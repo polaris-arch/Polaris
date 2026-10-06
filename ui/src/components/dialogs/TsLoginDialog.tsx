@@ -1,22 +1,23 @@
-/** Tailscale nodes are saved before authorization. Request-scoped progress confirms Running,
- * cancellation awaits process reap, and retries retain the same saved node identity. */
+/** Empty-credential login saves first; explicit credential actions and iOS replacement use one backend transaction.
+ * Request-scoped progress confirms authorization, and retries retain the same saved node identity. */
 
 import { useEffect, useRef, useState } from 'react';
 import type { ServerConfig } from '@/contracts/types';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
-import { copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
+import { copyLoginUrl, loginAttemptActive, loginConnectionProgressKey, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
 import { useTranslation } from 'react-i18next';
 import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
-import { executeTsLogin, nextTsNodeName, planTsLoginSubmit } from './ts-login-server';
+import { executeTsLogin, nextTsNodeName, planTsLoginSubmit, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import { TsLoginModeSwitch } from './TsLoginModeSwitch';
 import { controlUrlReject } from '@/domain/control-url';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { InfoIcon } from '@/components/InfoIcon';
+import { canReuseTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
 import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
 
 function TsIcon() {
@@ -27,8 +28,10 @@ function TsIcon() {
   );
 }
 
-export function TsLoginDialog({ serverId }: { serverId?: string }) {
+export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?: string; replaceIdentity?: boolean }) {
   const { t } = useTranslation();
+  const backendReplacement = tsLoginUsesBackendReplacement(replaceIdentity);
+  const isIOS = tsLoginUsesBackendReplacement(true);
   const open = useDialogStore((s) => s.open);
   const close = useDialogStore((s) => s.close);
   const servers = useAppStore((s) => s.servers);
@@ -43,6 +46,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   // 否则多节点时会把登录写进任意一个既有节点，重犯 node-edit-routing 那条缺陷）。
   const savedServer = useRef<ServerConfig | undefined>(undefined);
   const activeRequest = useRef<{ serverId: string; attemptId: string } | null>(null);
+  const editRevision = useRef(0);
   const [saved, setSaved] = useState(Boolean(serverId));
   const existingTs = servers.find((s) => s.id === (serverId ?? savedServer.current?.id)) ?? savedServer.current;
   const meshNames = groupServersBySubscription(visibleServers, subscriptions)
@@ -50,11 +54,13 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   const [name, setName] = useState(() => existingTs?.name ?? nextTsNodeName(meshNames));
   const [nameEdited, setNameEdited] = useState(false);
   const [errName, setErrName] = useState(false);
+  const [dirty, setDirty] = useState(false);
 
   // 回显既有控制面地址（再次进入本弹窗时不该看起来像「没配过」）。
   useEffect(() => {
+    if (dirty) return;
     setControlUrl(existingTs?.tailscaleSettings?.controlUrl ?? '');
-  }, [existingTs?.id, existingTs?.tailscaleSettings?.controlUrl]);
+  }, [dirty, existingTs?.id, existingTs?.tailscaleSettings?.controlUrl]);
 
   // 此查询只用于展示提示；AuthKey 提交会重新查询，失败时停止，不使用这里的缓存决定登出。
   useEffect(() => {
@@ -79,6 +85,8 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
 
   const [mode, setMode] = useState<'browser' | 'authkey'>('browser');
   const [authKey, setAuthKey] = useState('');
+  const [reuseCredentialRevision, setReuseCredentialRevision] = useState<string>();
+  const reuseRetainedAuthKey = !!reuseCredentialRevision;
   const [errKey, setErrKey] = useState(false);
   // 自建控制面地址。**登录弹窗必须有这个字段**：登录核确实透传它
   // （`crates/mesh/src/tailscale_login.rs`），但此前只有「TS 设置」弹窗有控件，
@@ -89,7 +97,6 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
   // 就不会去用 `auth_key`，于是「填了新 key、提交成功、身份一动不动」。
   const [hasState, setHasState] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [dirty, setDirty] = useState(false);
   const [pendingRequest, setPendingRequest] = useState<{ serverId: string; attemptId: string } | null>(null);
   const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
     pendingRequest ? s.attempts[pendingRequest.serverId] : undefined,
@@ -189,7 +196,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
       return;
     }
     setName(submittedName);
-    if (mode === 'authkey' && !authKey.trim()) {
+    if (mode === 'authkey' && !authKey.trim() && !reuseRetainedAuthKey) {
       setErrKey(true);
       return;
     }
@@ -201,11 +208,16 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
       return;
     }
     setErrControl(null);
+    const submissionRevision = editRevision.current;
+    const backendCredentials = tsLoginUsesBackendCredentials(existingTs, reuseRetainedAuthKey);
+    const backendOwned = backendReplacement || backendCredentials;
+    const expectedCredentialRevision = reuseCredentialRevision ?? existingTs?.tailscaleSettings?.tailscaleCredentialRevision;
     const { server, persist } = planTsLoginSubmit({
       existing: existingTs,
       name: submittedName,
       mode,
       authKey,
+      reuseRetainedAuthKey,
       controlUrl,
       hasState,
       mintId: () => crypto.randomUUID(),
@@ -219,16 +231,20 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
     setTailscaleAuthUrl(server.id, null);
     setTailscaleLoginInitiated(server.id, true);
     setSubmitting(true);
+    if (backendOwned) setSaved(false);
     const stillActive = () => {
       const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
       return activeRequest.current?.attemptId === request.attemptId && current?.attemptId === request.attemptId
         && !['failed', 'timedOut', 'cancelled'].includes(current.phase);
     };
+    let startResult: Awaited<ReturnType<typeof api.server.tailscaleLogin>> | undefined;
     const outcome = await executeTsLogin({
+      backendReplacement,
+      backendCredentials,
       isActive: stillActive,
       prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId),
-      verifyState: mode === 'authkey' ? async () => {
-        const states = await api.server.tailscaleStateExists([server.id]);
+      verifyState: !isIOS && (mode === 'authkey' || replaceIdentity) ? async () => {
+        const states = await api.server.tailscaleStateExists([server.id], true);
         if (typeof states[server.id] !== 'boolean') throw new Error('STATE_QUERY_UNAVAILABLE');
         return states[server.id];
       } : undefined,
@@ -239,21 +255,37 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
       },
       onSaved: () => {
         savedServer.current = server;
-        if (stillActive()) { setSaved(true); setDirty(false); }
+        if (stillActive()) { setSaved(true); if (editRevision.current === submissionRevision) setDirty(false); }
       },
       refresh: async () => {
-        if (persist === 'none') return;
+        if (!backendOwned && persist === 'none') return;
         await loadConfig(true);
         const mirrored = useAppStore.getState().servers.find((item) => item.id === server.id);
-        if (mirrored?.name !== server.name) throw new Error('TS_NAME_REFRESH_FAILED');
+        const matches = mirrored && mirrored.name === server.name
+          && mirrored.tailscaleSettings?.controlUrl === server.tailscaleSettings?.controlUrl
+          && (backendOwned || mirrored.tailscaleSettings?.authKey === server.tailscaleSettings?.authKey)
+          && mirrored.tailscaleSettings?.sourceTag === server.tailscaleSettings?.sourceTag;
+        if (backendOwned) {
+          if (mirrored && activeRequest.current?.attemptId === request.attemptId) {
+            savedServer.current = mirrored;
+            setSaved(true);
+            if (matches && (startResult?.started || startResult?.reason === 'inMainCore')
+              && stillActive() && editRevision.current === submissionRevision) setDirty(false);
+          }
+          if (!matches && (startResult?.started || startResult?.reason === 'inMainCore')) throw new Error('TS_CONFIG_REFRESH_FAILED');
+        } else if (!matches) throw new Error('TS_CONFIG_REFRESH_FAILED');
       },
-      start: () => api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode }),
+      start: async () => {
+        startResult = await api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode, replaceIdentity, reuseRetainedAuthKey, expectedCredentialRevision });
+        return startResult;
+      },
       cancel: async () => {
         const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
         if (current?.attemptId === request.attemptId && current.phase === 'authorized') return;
         await api.server.tailscaleLoginCancel(server.id, request.attemptId);
       },
     });
+    if (outcome.refreshFailed) toast.error(t('ts.loginRefreshFailed'));
     if (stillActive()) {
       if (outcome.phase === 'failed') {
         const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
@@ -309,6 +341,7 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
             setNameEdited(true);
             setErrName(false);
             setDirty(true);
+            editRevision.current++;
           }}
         />
         {errName && <div className="err-line">{t('ts.errName')}</div>}
@@ -325,8 +358,10 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
           value={controlUrl}
           onChange={(e) => {
             setControlUrl(e.target.value);
+            setReuseCredentialRevision(undefined);
             setErrControl(null);
             setDirty(true);
+            editRevision.current++;
           }}
           placeholder="https://controlplane.tailscale.com"
         />
@@ -344,14 +379,15 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
         <label className="fld-l">{t('ts.method')}</label>
         <TsLoginModeSwitch mode={mode} submitting={submitting} label={t('ts.method')}
           browserLabel={t('ts.browserLogin')} authkeyLabel={t('ts.authKey')}
-          onChange={(next) => { setMode(next); discardPendingLogin(); setDirty(true); }} />
+          onChange={(next) => { setMode(next); setReuseCredentialRevision(undefined); discardPendingLogin(); setDirty(true); editRevision.current++; }} />
       </div>
 
       {saved && <div className="card-sub" role="status">{t('ts.nodeSaved')}</div>}
-      {(progress?.phase === 'preparingConnection' || progress?.phase === 'waitingForReady') && <div className="card-sub" role="status">{t(progress.phase === 'preparingConnection' ? 'prerequisite.preparingConnection' : 'prerequisite.waitingForReady')}</div>}
+      {backendReplacement && <div className="card-sub">{t('ts.switchAccountNote')}</div>}
+      {loginConnectionProgressKey(progress?.phase) && <div className="card-sub" role="status">{t(loginConnectionProgressKey(progress?.phase)!)}</div>}
       {progress?.phase === 'authorized' && <div className="card-sub" role="status">{t('ts.authorizationComplete')}</div>}
       {progress?.phase === 'mainCore' && <div className="card-sub" role="status">{t(progress.reason === 'configurationPending' ? 'ts.loginInMainCoreNeedsRestart' : 'ts.mainCoreAwaitingAuthorization')}</div>}
-      {mode === 'authkey' && progress && loginAttemptActive(progress.phase) && <div className="card-sub" role="status">{t('ts.authorizing')}</div>}
+      {mode === 'authkey' && progress && loginAttemptActive(progress.phase) && !loginConnectionProgressKey(progress.phase) && <div className="card-sub" role="status">{t('ts.authorizing')}</div>}
       {mode === 'authkey' && loginTimedOut && <div className="dlg-err" role="alert">{t(saved ? 'ts.authorizationIncomplete' : 'ts.nodeSaveFailed')} {t(loginFailureReasonKey(progress?.reason))}</div>}
       {mode === 'browser' ? (
         authUrl ? (
@@ -422,14 +458,28 @@ export function TsLoginDialog({ serverId }: { serverId?: string }) {
             <input
               id="ts-authkey"
               className="input mono"
+              type="password"
               value={authKey}
               onChange={(e) => {
                 setAuthKey(e.target.value);
+                setReuseCredentialRevision(undefined);
                 setErrKey(false);
                 setDirty(true);
+                editRevision.current++;
               }}
               placeholder="YOUR_TAILSCALE_AUTH_KEY"
             />
+            {canReuseTsAuthKey(existingTs) && controlUrl === (existingTs?.tailscaleSettings?.controlUrl ?? '') && (
+              <button type="button" className={`btn sm ${reuseRetainedAuthKey ? 'flow' : 'ghost'}`} disabled={submitting}
+                aria-pressed={reuseRetainedAuthKey} onClick={() => {
+                  setReuseCredentialRevision(reuseRetainedAuthKey ? undefined : existingTs?.tailscaleSettings?.tailscaleCredentialRevision);
+                  setAuthKey(''); setErrKey(false); setDirty(true); editRevision.current++;
+                }}>{t('ts.reuseSavedAuthKey')}</button>
+            )}
+            {hasTsRetainedAuthKey(existingTs) && <div className="card-sub" role="status">
+              {t(existingTs?.tailscaleSettings?.retainedAuthKeyAvailable && controlUrl === (existingTs.tailscaleSettings.controlUrl ?? '')
+                ? 'ts.retainedAuthKeyHint' : 'ts.retainedAuthKeyAuthorityHint')}
+            </div>}
             {errKey && <div className="err-line">{t('ts.errKey')}</div>}
             <div className="card-sub" style={{ marginTop: 6 }}>
               {t('ts.authKeyEphemeralHint')}

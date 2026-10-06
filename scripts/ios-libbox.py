@@ -195,6 +195,89 @@ def observe_component(checkout, receipt_path, go, mobile, developer, evidence):
     return component_module().observe_component(checkout, raw.get('sourceReceipt', raw), go, mobile, developer, evidence)
 
 
+def approved_component_json(component, path, expected, name):
+    """Use the caller's independent raw hash; never infer approval from a receipt."""
+    require(isinstance(path, Path) and path.is_absolute() and path.is_file() and not path.is_symlink(),
+            'approved ' + name + ' file required')
+    require(isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected),
+            'approved ' + name + ' SHA256 required')
+    raw = path.read_bytes()
+    require(digest(raw) == expected, 'approved ' + name + ' SHA256 differs')
+    rows = component.inputs.json_stream(raw.decode('utf-8'))
+    require(len(rows) == 1 and isinstance(rows[0], dict), 'one approved ' + name + ' object required')
+    return rows[0]
+
+
+def approved_component_inputs(component, args):
+    return (approved_component_json(component, args.build_policy, args.build_policy_sha256, 'build policy'),
+            approved_component_json(component, args.tools, args.tools_sha256, 'tools'))
+
+
+def build_component(args):
+    require(not args.historical and args.source is None and not args.offline,
+            'component build cannot use historical/source/offline options')
+    require(args.phase in ('assemble', 'publish'), 'explicit component assemble/publish phase required')
+    final_preflight()
+    component = component_module()
+    policy, tools = approved_component_inputs(component, args)
+    require(args.source_receipt is not None and args.apple_input is not None, 'original source receipt/Apple input required')
+    raw = component.read_json(args.source_receipt)
+    require(isinstance(raw, dict), 'original source receipt object required')
+    source_receipt, apple_input = raw.get('sourceReceipt', raw), component.read_json(args.apple_input)
+    if args.phase == 'assemble':
+        require(args.evidence_dir is not None and args.staged_generation is None and args.output_root is None
+                and args.output_fingerprint is None and not any((args.previous_build_policy, args.previous_build_policy_sha256,
+                                                               args.previous_tools, args.previous_tools_sha256)),
+                'assemble requires fresh evidence only; publish inputs forbidden')
+        # First assembly is retained for independent inventory/command approval.
+        # It is never repeated to manufacture a receipt with different scratch argv.
+        require(policy.get('componentInventory') == [] and policy.get('assembly') == {},
+                'first assembly requires pending inventory/assembly policy')
+        return component.assemble_component(apple_input, source_receipt, policy, tools, args.evidence_dir)
+    require(args.evidence_dir is None and isinstance(args.staged_generation, Path)
+            and args.staged_generation.is_absolute() and args.staged_generation.is_dir()
+            and not args.staged_generation.is_symlink() and args.staged_generation.resolve(strict=True) == args.staged_generation
+            and args.output_root is not None and isinstance(args.output_fingerprint, str)
+            and re.fullmatch('[0-9a-f]{64}', args.output_fingerprint), 'retained stage/output/fingerprint required')
+    previous = (args.previous_build_policy, args.previous_build_policy_sha256, args.previous_tools, args.previous_tools_sha256)
+    require(not any(previous) or all(previous), 'complete approved previous policy/tools required')
+    previous_policy = approved_component_json(component, previous[0], previous[1], 'previous build policy') if all(previous) else None
+    previous_tools = approved_component_json(component, previous[2], previous[3], 'previous tools') if all(previous) else None
+    receipt = component.make_receipt(args.staged_generation / 'Libbox.xcframework', source_receipt, apple_input, policy, tools)
+    require(receipt['outputFingerprint'] == args.output_fingerprint, 'approved component output fingerprint differs')
+    return component.publish_component(args.staged_generation, receipt, args.output_root, build_policy=policy, tools=tools,
+                                       previous_policy=previous_policy, previous_tools=previous_tools)
+
+
+def component_for_link(args, resolve=False):
+    """Pin an approved immutable component only; final App/appex admission stays closed."""
+    require(not getattr(args, 'historical', False), 'historical is not component-for-link evidence')
+    require(isinstance(args.output_fingerprint, str) and re.fullmatch('[0-9a-f]{64}', args.output_fingerprint)
+            and isinstance(args.receipt_sha256, str) and re.fullmatch('[0-9a-f]{64}', args.receipt_sha256),
+            'approved component output fingerprint/receipt SHA256 required')
+    final_preflight()
+    component = component_module()
+    policy, tools = approved_component_inputs(component, args)
+    if resolve:
+        # The original resolver reads current exactly once and returns a fixed generation.
+        result = component.resolve_component(args.output_root, policy, tools)
+    else:
+        require(args.framework is None and args.receipt is None, 'component-for-link consumes only its fixed generation pair')
+        generation = args.generation_root
+        require(isinstance(generation, Path) and generation.is_absolute() and generation.parent.name == '.libbox-generations'
+                and generation.name == args.output_fingerprint, 'approved immutable generation required')
+        root, _ = component.safe_output_root(generation.parent.parent)
+        selected = component.selected_generation(root, '.libbox-generations/' + generation.name)
+        require(selected == generation, 'approved generation path differs')
+        require(digest((selected / 'libbox-build-receipt.json').read_bytes()) == args.receipt_sha256,
+                'approved component receipt SHA256 differs')
+        result = component.snapshot(selected, policy, tools)
+    require(result['componentOutputFingerprint'] == args.output_fingerprint
+            and digest(Path(result['receiptPath']).read_bytes()) == args.receipt_sha256,
+            'approved component output fingerprint/receipt SHA256 differs')
+    return result
+
+
 def inputs(historical=False):
     if not historical:
         artifact_preflight()
@@ -448,9 +531,24 @@ def main(argv=None):
     builder = sub.add_parser('build')
     builder.add_argument('source', nargs='?', type=Path)
     builder.add_argument('--offline', action='store_true', help='Require all locked modules to be cached')
+    builder.add_argument('--component', action='store_true', help='Explicit M1 assemble/publish; no final App admission')
+    builder.add_argument('--phase', choices=('assemble', 'publish'))
+    for flag in ('source-receipt', 'apple-input', 'evidence-dir', 'staged-generation', 'output-root',
+                 'previous-build-policy', 'previous-tools'):
+        builder.add_argument('--' + flag, type=Path)
+    for flag in ('previous-build-policy-sha256', 'previous-tools-sha256'):
+        builder.add_argument('--' + flag)
     checker = sub.add_parser('verify')
-    checker.add_argument('--framework', type=Path, default=OUTPUT / 'Libbox.xcframework')
-    checker.add_argument('--receipt', type=Path, default=RECEIPT)
+    checker.add_argument('--framework', type=Path)
+    checker.add_argument('--receipt', type=Path)
+    checker.add_argument('--component-for-link', action='store_true', help='Strict fixed component prerequisite; no final App/appex admission')
+    checker.add_argument('--generation-root', type=Path)
+    checker.add_argument('--receipt-sha256')
+    for command in (builder, checker):
+        for flag in ('build-policy', 'tools'):
+            command.add_argument('--' + flag, type=Path)
+        for flag in ('build-policy-sha256', 'tools-sha256', 'output-fingerprint'):
+            command.add_argument('--' + flag)
     input_checker = sub.add_parser('check-inputs')
     preparer = sub.add_parser('prepare-source', help='Prepare shared source only; no Framework or App build')
     preparer.add_argument('source', type=Path)
@@ -477,6 +575,8 @@ def main(argv=None):
             command.add_argument('--receipt', type=Path, required=True)
         else:
             command.add_argument('--output-root', type=Path, required=True)
+            for flag in ('build-policy-sha256', 'tools-sha256', 'output-fingerprint', 'receipt-sha256'):
+                command.add_argument('--' + flag, required=True)
     for command in (builder, checker, input_checker):
         command.add_argument('--historical', action='store_true',
                              help='Explicitly use the frozen six-patch history; never final source evidence')
@@ -485,17 +585,15 @@ def main(argv=None):
         observation = observe_component(args.checkout, args.source_receipt, args.go, args.mobile_bin, args.developer_dir, args.evidence_dir)
         print(json.dumps({'evidenceScope': observation['evidenceScope'], 'status': observation['status'],
                           'evidenceDirectory': str(args.evidence_dir), 'pending': observation['pending'], 'carrierAdmission': False}, sort_keys=True))
-    elif args.action in ('verify-component', 'resolve-component'):
+    elif args.action == 'verify-component':
         final_preflight()
         component = component_module()
         policy, tools = component.read_json(args.build_policy), component.read_json(args.tools)
-        if args.action == 'verify-component':
-            receipt = component.read_json(args.receipt)
-            result = component.verify_component(args.framework, receipt, receipt['appleInput'], policy, tools)
-            print(json.dumps({'evidenceScope': result['evidenceScope'], 'outputFingerprint': result['outputFingerprint']}, sort_keys=True))
-        else:
-            result = component.resolve_component(args.output_root, policy, tools)
-            print(json.dumps(result, sort_keys=True))
+        receipt = component.read_json(args.receipt)
+        result = component.verify_component(args.framework, receipt, receipt['appleInput'], policy, tools)
+        print(json.dumps({'evidenceScope': result['evidenceScope'], 'outputFingerprint': result['outputFingerprint']}, sort_keys=True))
+    elif args.action == 'resolve-component':
+        print(json.dumps(component_for_link(args, resolve=True), sort_keys=True))
     elif args.action == 'observe-source':
         observation = observe_source(args.checkout, args.source_receipt, args.go, args.mobile_bin,
                                      args.developer_dir, args.evidence_dir)
@@ -507,10 +605,24 @@ def main(argv=None):
         print(json.dumps({'evidenceScope': 'source-only', 'sourceReceipt': receipt,
                           'unresolvedArtifactEvidence': list(ARTIFACT_REQUIREMENTS)}, sort_keys=True))
     elif args.action == 'build':
-        build(args.source, args.offline, historical=args.historical)
+        if args.component:
+            print(json.dumps(build_component(args), sort_keys=True))
+        else:
+            require(not any((args.phase, args.source_receipt, args.apple_input, args.evidence_dir, args.staged_generation,
+                             args.output_root, args.build_policy, args.build_policy_sha256, args.tools, args.tools_sha256,
+                             args.output_fingerprint, args.previous_build_policy, args.previous_build_policy_sha256,
+                             args.previous_tools, args.previous_tools_sha256)), 'component build requires explicit --component')
+            build(args.source, args.offline, historical=args.historical)
     elif args.action == 'verify':
-        verify(args.framework, args.receipt, native=None, historical=args.historical)
-        print('Verified historical-only iOS build receipt; runtime cleanup remains unknown.')
+        if args.component_for_link:
+            result = component_for_link(args)
+            print(json.dumps({'evidenceScope': 'component-for-link-only', 'generationRoot': result['generationRoot'],
+                              'componentOutputFingerprint': result['componentOutputFingerprint'], 'finalArtifactAdmission': False}, sort_keys=True))
+        else:
+            require(not any((args.generation_root, args.receipt_sha256, args.build_policy, args.build_policy_sha256,
+                             args.tools, args.tools_sha256, args.output_fingerprint)), 'component verification requires explicit --component-for-link')
+            verify(args.framework or OUTPUT / 'Libbox.xcframework', args.receipt or RECEIPT, native=None, historical=args.historical)
+            print('Verified historical-only iOS build receipt; runtime cleanup remains unknown.')
     else:
         if args.historical:
             inputs(historical=True)

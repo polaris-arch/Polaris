@@ -106,6 +106,15 @@ def inspect_aar(aar, checkout, manifest, core, policy, tool, source_receipt):
         for getter in ['RequestID', 'ConfigDigest', 'ContractVersion', 'Validation', 'Cleanup', 'ValidationError', 'CleanupError']:
             require(f'java.lang.String get{getter}()' in signatures['ConfigValidationResult'], f'Config validation getter {getter} is missing')
             require(f'set{getter}(' not in signatures['ConfigValidationResult'], f'Config validation field {getter} must be read-only')
+        # Accepted Go receiver APIs return only string; pinned gomobile emits
+        # public native instance methods. Require declarations, not suffix text.
+        for name, method in [('ConfigValidationResult', 'getTailscaleStoreRetirement'),
+                             ('ConfigValidationResult', 'getTailscaleStoreMembership'),
+                             ('CommandServer', 'exportTailscaleStoreRetirement')]:
+            declaration = r'(?m)^[ \t]*public native java\.lang\.String ' + re.escape(method) + r'\(\);[ \t]*$'
+            require(re.search(declaration, signatures[name]), f'Scoped Tailscale Java ABI differs: {name}.{method}')
+        for getter in ['TailscaleStoreRetirement', 'TailscaleStoreMembership']:
+            require(f'set{getter}(' not in signatures['ConfigValidationResult'], f'Config validation field {getter} must be read-only')
         dns_methods = {
             'ExchangeContext': ['void errnoCode(int)', 'void errorCode(int)',
                                 'void onCancel(io.nekohasekai.libbox.Func)',

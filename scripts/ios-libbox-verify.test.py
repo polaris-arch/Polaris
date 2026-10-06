@@ -78,6 +78,56 @@ def monitor_source_wiring(project, declaration):
                     and 'TunnelMonitorSession.swift' not in sources.group(1), 'monitor source wiring generated folder source')
 
 
+def component_source_wiring(project, declaration):
+    """Trace the fixed Framework reference and verifier through the actual target."""
+    clean = re.sub(r'/\*.*?\*/', '', project, flags=re.S)
+    entries = re.findall(r'^\t\t([0-9A-F]{24})\s*=\s*\{(.*?)\};(?=\n)', clean, re.M | re.S)
+    objects = dict(entries)
+    builder.require(len(objects) == len(entries), 'component source wiring duplicate object')
+    def field(body, name):
+        value = re.search(r'\b' + name + r'\s*=\s*([^;]+);', body)
+        return value[1].strip() if value else None
+    def members(body, name):
+        value = re.search(r'\b' + name + r'\s*=\s*\((.*?)\);', body, re.S)
+        return re.findall(r'\b[0-9A-F]{24}\b', value[1]) if value else []
+    def kind(name):
+        return {key: body for key, body in objects.items() if field(body, 'isa') == name}
+    refs = {key: body for key, body in kind('PBXFileReference').items() if field(body, 'name') == 'Libbox.xcframework'}
+    builder.require(len(refs) == 1, 'component source wiring reference')
+    reference, body = next(iter(refs.items()))
+    builder.require(field(body, 'path') == '"$(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework"'
+                    and field(body, 'sourceTree') == '"<absolute>"', 'component source wiring fixed path')
+    builds = [key for key, body in kind('PBXBuildFile').items() if field(body, 'fileRef') == reference]
+    targets = [body for body in kind('PBXNativeTarget').values() if field(body, 'name') == 'polaris_PacketTunnel']
+    builder.require(len(builds) == 1 and len(targets) == 1, 'component source wiring target/build reference')
+    phases = members(targets[0], 'buildPhases')
+    linked = [key for key in phases if key in kind('PBXFrameworksBuildPhase') and builds[0] in members(objects[key], 'files')]
+    verified = [key for key in phases if key in kind('PBXShellScriptBuildPhase') and field(objects[key], 'name') == '"Verify iOS Core"']
+    builder.require(len(linked) == len(verified) == 1 and phases.index(verified[0]) < phases.index(linked[0]),
+                    'component source wiring verifier/link phase')
+    hook = json.loads(field(objects[verified[0]], 'shellScript'))
+    target = re.search(r'^  polaris_PacketTunnel:\n(.*?)(?=^  \S|\Z)', declaration, re.M | re.S)
+    builder.require(target is not None and re.search(r'^      - framework: \$\(POLARIS_LIBBOX_GENERATION_ROOT\)/Libbox\.xcframework\n        embed: false$', target[1], re.M),
+                    'component source wiring generated fixed dependency')
+    script = re.search(r'^        script: \|\n(.*?)(?=^        \S|\Z)', target[1], re.M | re.S)
+    builder.require(script is not None and hook == ''.join(line[10:] + '\n' for line in script[1].splitlines()),
+                    'component source wiring hooks differ')
+    builder.require('scripts/ios-libbox.py" verify --component-for-link' in hook
+                    and all(token not in hook for token in ('--historical', '.libbox-current', 'Frameworks/Libbox')),
+                    'component source wiring verifier scope')
+    for flag, setting in [('generation-root', 'GENERATION_ROOT'), ('output-fingerprint', 'OUTPUT_FINGERPRINT'),
+                          ('receipt-sha256', 'RECEIPT_SHA256'), ('build-policy', 'BUILD_POLICY'),
+                          ('build-policy-sha256', 'BUILD_POLICY_SHA256'), ('tools', 'TOOLS'), ('tools-sha256', 'TOOLS_SHA256')]:
+        builder.require('--' + flag + ' "${POLARIS_LIBBOX_' + setting + ':?' in hook,
+                        'component source wiring approved argument: ' + flag)
+    configs = objects[field(targets[0], 'buildConfigurationList')]
+    configurations = members(configs, 'buildConfigurations')
+    builder.require(len(configurations) == 2, 'component source wiring configurations')
+    for key in configurations:
+        builder.require('"$(POLARIS_LIBBOX_GENERATION_ROOT)"' in objects[key]
+                        and '"\\\"Frameworks\\\""' not in objects[key], 'component source wiring fixed search path')
+
+
 def preflight_tests():
     """No Mac, source checkout, Framework or IPA is needed for these tests."""
     count = 0
@@ -257,7 +307,8 @@ def preflight_tests():
         with mock.patch.object(builder, 'source_helpers', return_value=reused), \
                 mock.patch.object(builder, 'final_preflight', return_value=(shared, synthetic_core, policy)), \
                 mock.patch.object(builder, 'run', side_effect=AssertionError('Fixture executed a tool')):
-            assert builder.provision_source(source_repo, checkout, arguments, go) == receipt
+            produced = builder.provision_source(source_repo, checkout, arguments, go)
+            assert produced == receipt
             provider.provision.assert_called_once_with(builder.SHARED_MANIFEST, source_repo, checkout, repositories, go)
             verify_checkout.assert_called_once_with(checkout, receipt, provider)
             count += 1
@@ -330,7 +381,8 @@ def preflight_tests():
             rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'evidence scope')
             count += 1
 
-    # Both checked-in Xcode hooks must consume the default final verifier.
+    # Both checked-in hooks explicitly verify the component prerequisite. The
+    # unqualified final artifact gate remains closed and is tested above.
     for file in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
         hook = (builder.ROOT / file).read_text()
         assert 'scripts/ios-libbox.py' in hook and ' verify' in hook and '--historical' not in hook
@@ -339,6 +391,17 @@ def preflight_tests():
     project = (builder.ROOT / 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj').read_text()
     declaration = (builder.ROOT / 'src-tauri/gen/apple/project.yml').read_text()
     monitor_source_wiring(project, declaration)
+    count += 1
+    component_source_wiring(project, declaration)
+    count += 1
+    for old, new in [('path = "$(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework"', 'path = Frameworks/Libbox.xcframework'),
+                     ('sourceTree = "<absolute>"', 'sourceTree = "<group>"'),
+                     ('--component-for-link', ''), ('--receipt-sha256', '--ignored-receipt'),
+                     ('"$(POLARIS_LIBBOX_GENERATION_ROOT)"', '"\\\"Frameworks\\\""')]:
+        rejected(lambda: component_source_wiring(project.replace(old, new), declaration), 'component source wiring')
+        count += 1
+    rejected(lambda: component_source_wiring(project, declaration.replace('framework: $(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework',
+                                                                         'framework: Frameworks/Libbox.xcframework')), 'component source wiring')
     count += 1
     # Counterexamples disconnect each of the four required source relationships.
     for marker in ('PBXBuildFile;', 'PBXFileReference;', '/* TunnelMonitorSession.swift */,',

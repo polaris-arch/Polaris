@@ -316,3 +316,76 @@ fn locked_rejects_set_and_clear_without_touching_storage() {
         "锁屏态清密码请求被拒后，密码必须仍在"
     );
 }
+
+#[test]
+fn retained_credentials_stay_raw_while_real_frontend_projection_and_version_are_stable() {
+    let dir = temp_dir("retained-view");
+    let manager = ConfigManager::new(dir.to_path_buf());
+    let mut raw = manager.current().unwrap();
+    raw["servers"] = json!([{"id":"retained", "name":"Retained", "protocol":"tailscale",
+        "tailscaleSettings":{"retainedAuthKey":{"authKey":"ipc-private-retained-sentinel", "controlAuthority":"https://controlplane.tailscale.com"}, "unknown":"keep"}}]);
+    manager.save_full(&raw).unwrap();
+    let raw = manager.current().unwrap();
+    assert!(raw.to_string().contains("ipc-private-retained-sentinel"));
+    let mut view = raw.clone();
+    apply_frontend_view(&mut view);
+    assert!(!view.to_string().contains("ipc-private-retained-sentinel"));
+    assert!(view["servers"][0]["tailscaleSettings"]
+        .get("retainedAuthKey")
+        .is_none());
+    assert_eq!(
+        view["servers"][0]["tailscaleSettings"]["retainedAuthKeyAvailable"],
+        true
+    );
+    assert!(
+        view["servers"][0]["tailscaleSettings"]["tailscaleCredentialRevision"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(config_version(&raw), config_version(&view));
+    let once = view.clone();
+    apply_frontend_view(&mut view);
+    assert_eq!(once, view);
+    view["logLevel"] = json!("debug");
+    config_save_core(&manager, &mut view, None, false).unwrap();
+    let saved = manager.current().unwrap();
+    assert_eq!(
+        saved["servers"][0]["tailscaleSettings"]["retainedAuthKey"],
+        raw["servers"][0]["tailscaleSettings"]["retainedAuthKey"]
+    );
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("tailscaleCredentialRevision")
+        .is_none());
+    // All frontend-returning config paths share this projection. The actual
+    // broadcast is only a signal; server save and login don't return raw nodes.
+    let source = crate::test_support::crate_source("commands/config.rs");
+    let event = source
+        .split("pub(crate) fn emit_config_changed_signal")
+        .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
+        .unwrap();
+    assert!(event.contains("app.emit(EVENT_CONFIG_CHANGED, json!({}))"));
+    assert!(!event.contains("new_value"));
+    let server = crate::test_support::crate_source("commands/server.rs");
+    let update = server
+        .split("pub fn server_update(")
+        .nth(1)
+        .unwrap()
+        .split("pub fn server_delete")
+        .next()
+        .unwrap();
+    assert!(update.contains("ApiResponse<()>"));
+    assert!(update.contains("ok_void()"));
+    let login = server
+        .split("pub async fn tailscale_login(")
+        .nth(1)
+        .unwrap()
+        .split("pub async fn tailscale_logout")
+        .next()
+        .unwrap();
+    assert!(!login.contains("ApiResponse::ok(server)"));
+    assert!(!login.contains("ApiResponse::ok(saved)"));
+    assert!(login.contains("json!({\"started\": true})"));
+}

@@ -157,4 +157,88 @@ class AndroidNativeValidationTest {
             assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth, ledger.state(requireNotNull(captured)))
         }
     }
+
+    @Test fun completeMembershipIsIndependentOfOuterCleanupAndNeverClosesRelatedWriters() {
+        val request = "original-validation"
+        val result = ScopedNativeFixture.validation(request, "config", listOf("one"))
+        val scope = AndroidTailscaleValidationScope.capture(request, "config", result)
+        assertEquals(false, scope.related(ScopedNativeFixture.file("other")))
+        assertEquals(null, scope.related(ScopedNativeFixture.file("one")))
+        val retired = ScopedNativeFixture.validation(request, "config", listOf("one"), writerTerminal = true)
+        val sealed = AndroidTailscaleValidationScope.capture(request, "config", retired)
+        assertEquals(true, sealed.related(ScopedNativeFixture.file("one")))
+        assertEquals(false, sealed.related(ScopedNativeFixture.file("other")))
+    }
+
+    @Test fun missingGetterUnknownSchemaAndOriginalBindingMismatchCannotExcludeATarget() {
+        val request = "original-validation"
+        assertTrue(runCatching { AndroidTailscaleValidationScope.capture(request, "config", Any()) }.isFailure)
+        for (mutation in listOf("request", "digest", "nonce", "schema", "targets", "unknown", "empty-export", "rejected")) {
+            val result = ScopedNativeFixture.validation(request, "config", emptyList())
+            val member = org.json.JSONObject(result.member)
+            when (mutation) {
+                "request" -> member.put("requestID", "successor")
+                "digest" -> member.put("configDigest", "e".repeat(64))
+                "nonce" -> member.put("runNonce", "e".repeat(64))
+                "schema" -> member.put("extra", true)
+                "targets" -> member.put("targets", org.json.JSONArray().put(ScopedNativeFixture.node("other")))
+                "unknown" -> member.put("membershipState", "Unknown")
+                "empty-export" -> result.retirement = ScopedNativeFixture.export()
+                "rejected" -> result.validationState = "Rejected"
+            }
+            result.member = member.toString()
+            val scope = runCatching { AndroidTailscaleValidationScope.capture(request, "config", result) }.getOrNull()
+            assertTrue("$mutation was used as empty membership", scope == null || scope.related(ScopedNativeFixture.file("one")) == null)
+        }
+    }
+
+    @Test fun actualRejectedNoConstructionExcludesOnlyThatValidationTicketAndCannotSelectWarm() {
+        val request = "original-rejected"
+        val result = ScopedNativeFixture.validation(request, "invalid-input", emptyList())
+        result.validationState = "Rejected"; result.cleanupState = "NoConstruction"
+        result.member = org.json.JSONObject(result.member).put("membershipState", "Unknown").toString()
+        result.retirement = ScopedNativeFixture.export()
+        val scope = AndroidTailscaleValidationScope.capture(request, "invalid-input", result)
+        assertEquals(false, scope.related(ScopedNativeFixture.file("one")))
+        assertFalse(scope.selectsWarm(ScopedNativeFixture.file("one")))
+        for (mutation in listOf("accepted", "partial", "panic", "complete", "targets", "nonce", "request", "digest")) {
+            val bad = ScopedNativeFixture.validation(request, "invalid-input", emptyList())
+            bad.validationState = "Rejected"; bad.cleanupState = "NoConstruction"
+            val member = org.json.JSONObject(bad.member).put("membershipState", "Unknown")
+            when (mutation) {
+                "accepted" -> bad.validationState = "Accepted"
+                "partial" -> bad.cleanupState = "CleanupUnknown"
+                "panic" -> bad.validationState = "InternalFailure"
+                "complete" -> member.put("membershipState", "Complete")
+                "targets" -> member.put("targets", org.json.JSONArray(listOf(org.json.JSONObject().put("tag", "one").put("stateDirectory", "/data/polaris/one").put("stateFile", ScopedNativeFixture.file("one")))))
+                "nonce" -> member.put("runNonce", "not-a-nonce")
+                "request" -> member.put("requestID", "other-original")
+                "digest" -> member.put("configDigest", "f".repeat(64))
+            }
+            bad.member = member.toString(); bad.retirement = ScopedNativeFixture.export()
+            assertEquals(mutation, null, runCatching { AndroidTailscaleValidationScope.capture(request, "invalid-input", bad).related(ScopedNativeFixture.file("one")) }.getOrNull())
+        }
+        assertTrue(runCatching { AndroidTailscaleValidationScope.capture("other", "invalid-input", result) }.isFailure)
+        assertTrue(runCatching { AndroidTailscaleValidationScope.capture(request, "other", result) }.isFailure)
+    }
+
+    @Test fun warmChildIsRegisteredBeforeDispatchAndFailedQueueCancelsThatExactChild() {
+        val ledger = AndroidNativeAdmission("warm-adapter").also { it.bootstrap(RequiredMarkerProof.Absent) }
+        val tuple = ScopedNativeFixture.warm(ledger, "warm-child")
+        ledger.beginWarm(tuple)
+        val parent = ledger.reserveOwner(AndroidNativeAdmission.Kind.Login, "warm-child")
+        ledger.bindWarmConfig(parent, ScopedNativeFixture.warmConfig)
+        var child: AndroidNativeAdmission.Ticket? = null
+        assertTrue(runCatching { AndroidNativeValidation.enqueueWarm(ledger, parent, queue = {
+            val management = ledger.readWarm(tuple)
+            assertFalse(management.getBoolean("childRegistrationOpen"))
+            assertTrue(management.getString("childNativeTicketId").isNotEmpty())
+            child = ledger.seal("dispatch-fence").captured.single { it.ticket.id == management.getString("childNativeTicketId") }.ticket
+            error("queue rejected before execution")
+        }) { error("native work must not execute") } }.isFailure)
+        assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth, ledger.state(checkNotNull(child)))
+        assertTrue(ledger.finishWarm(tuple).getBoolean("released"))
+        assertFalse(ledger.enterBirth(parent)); assertFalse(ledger.enterBirth(checkNotNull(child)))
+    }
+
 }

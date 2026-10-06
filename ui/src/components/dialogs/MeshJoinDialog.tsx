@@ -120,7 +120,6 @@ export function MeshJoinDialogView({ onTsLogout, onWarpReregister, onWarpDeregis
    */
   const tsActions = (node: ServerConfig) => {
     const unread = taildropBadgeCount(tailscaleStatuses[node.id]);
-    const accountActionLabel = tsStates[node.id] === true ? t('meshJoin.switchAccount') : t('ts.signIn');
     return (
       <>
         <button
@@ -131,13 +130,14 @@ export function MeshJoinDialogView({ onTsLogout, onWarpReregister, onWarpDeregis
           {t('meshJoin.taildrop')}
           {unread > 0 && <span className="tdrop-badge">{unread}</span>}
         </button>
-        <button
+        {tsStates[node.id] === true ? <button
           type="button"
           className="btn ghost sm"
-          onClick={() => go({ kind: 'ts-login', serverId: node.id })}
+          onClick={() => go({ kind: 'ts-login', serverId: node.id, replaceIdentity: true })}
         >
-          {accountActionLabel}
-        </button>
+          {t('meshJoin.switchAccount')}
+        </button> : <button type="button" className="btn ghost sm"
+          onClick={() => go({ kind: 'ts-login', serverId: node.id })}>{t('ts.signIn')}</button>}
         {tsStates[node.id] === true && <button type="button" className="btn ghost sm danger-text" onClick={() => action(() => onTsLogout(node))}>
           {t('meshJoin.logout')}
         </button>}

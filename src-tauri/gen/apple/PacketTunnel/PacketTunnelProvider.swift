@@ -11,6 +11,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private lazy var platform = TunnelPlatform(provider: self)
     // These handles and config bytes are only accessed on worker.
     private var commandServer: LibboxCommandServer?
+    private var commandIdentity: TunnelIdentity?
     private var configContent: String?
     private var reportURL: URL?
     private let reportLock = NSLock()
@@ -61,12 +62,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     // Construction already owns OOM/power resources. Retain the handle
                     // before checking the error or Start so failure can close that owner.
                     self.commandServer = server
+                    self.commandIdentity = identity
                     if let error { throw error }
                     try server.start()
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start was superseded") }
                     try server.startOrReloadService(supplied, options: LibboxOverrideOptions())
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start finished after cancellation/timeout") }
                     self.configContent = supplied
+                    self.lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: identity)
                     self.lifecycle.complete(token, phase: "running", stopped: false)
                     self.publishReport()
                     completion.finish(nil)
@@ -111,9 +114,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 lifecycle.retainCleanupFailure(error.localizedDescription)
                 logger.error("Core close failed: \(error.localizedDescription, privacy: .public)")
             }
+            // The Go export preserves all original runs, including failed/reloaded
+            // runs. Collect its immutable terminal before losing this exact handle.
+            if let commandIdentity {
+                lifecycle.retainTailscaleStoreScope(commandServer.exportTailscaleStoreRetirement(), identity: commandIdentity)
+            }
             commandServer.close() // closes listener/OOM/power even if Start failed
         }
         commandServer = nil
+        commandIdentity = nil
         configContent = nil
         platform.reset()
         return failure
@@ -137,6 +146,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.reasserting = true
                 defer { self.reasserting = false }
                 try server.startOrReloadService(config, options: LibboxOverrideOptions())
+                if let commandIdentity = self.commandIdentity {
+                    self.lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: commandIdentity)
+                }
                 guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel reload finished after cancellation/timeout") }
                 self.lifecycle.complete(token, phase: "running", stopped: false)
                 self.publishReport()
@@ -171,8 +183,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler?(try? JSONEncoder().encode(observation))
                 return
             }
-            guard command == "prepareStop", let requestID = object["stopRequestID"] as? String,
-                  lifecycle.prepareStop(identity: identity, requestID: requestID) else { completionHandler?(nil); return }
+            guard command == "prepareStop", let requestID = object["stopRequestID"] as? String else { completionHandler?(nil); return }
+            if let nonce = object["observationNonce"] as? String {
+                guard lifecycle.prepareStop(identity: identity, requestID: requestID, nonce: nonce,
+                    expectedGeneration: (object["extensionGeneration"] as? NSNumber)?.uint64Value,
+                    observation: { observation in completionHandler?(try? JSONEncoder().encode(observation)) })
+                else { completionHandler?(nil); return }
+                publishReport()
+                return // Completed by the actual normal Stop worker, never this ACK.
+            }
+            guard lifecycle.prepareStop(identity: identity, requestID: requestID) else { completionHandler?(nil); return }
             publishReport()
         }
         // The Go worker may be blocked; status is a lock-protected observation.
