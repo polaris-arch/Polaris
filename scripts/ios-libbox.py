@@ -169,6 +169,18 @@ def provision_source(source, checkout, module_source, go):
     return receipt
 
 
+def observe_source(checkout, receipt_path, go, mobile, developer, evidence):
+    """Explicit C2 source window only; default/cache artifact admission stays closed."""
+    final_preflight()
+    raw = json.loads(Path(receipt_path).read_bytes())
+    require(isinstance(raw, dict), 'source receipt object required')
+    receipt = raw.get('sourceReceipt', raw)
+    specification = importlib.util.spec_from_file_location('apple_source_inputs', SCRIPT.with_name('apple-source-inputs.py'))
+    collector = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(collector)
+    return collector.collect(final_preflight, source_helpers, checkout, receipt, go, mobile, developer, evidence)
+
+
 def inputs(historical=False):
     if not historical:
         artifact_preflight()
@@ -431,11 +443,24 @@ def main(argv=None):
     preparer.add_argument('--checkout', type=Path, required=True)
     preparer.add_argument('--module-source', action='append', default=[], metavar='MODULE=REPOSITORY')
     preparer.add_argument('--go', type=Path, required=True)
+    observer = sub.add_parser('observe-source', help='Explicit C2 source compiler window; no Framework/App or carrier admission')
+    observer.add_argument('checkout', type=Path)
+    observer.add_argument('--source-receipt', type=Path, required=True)
+    observer.add_argument('--go', type=Path, required=True)
+    observer.add_argument('--mobile-bin', type=Path, required=True)
+    observer.add_argument('--developer-dir', type=Path, required=True)
+    observer.add_argument('--evidence-dir', type=Path, required=True)
     for command in (builder, checker, input_checker):
         command.add_argument('--historical', action='store_true',
                              help='Explicitly use the frozen six-patch history; never final source evidence')
     args = parser.parse_args(argv)
-    if args.action == 'prepare-source':
+    if args.action == 'observe-source':
+        observation = observe_source(args.checkout, args.source_receipt, args.go, args.mobile_bin,
+                                     args.developer_dir, args.evidence_dir)
+        print(json.dumps({'evidenceScope': observation['evidenceScope'], 'status': observation['status'],
+                          'evidenceDirectory': str(args.evidence_dir), 'C3Required': observation['C3Required'],
+                          'carrierAdmission': False}, sort_keys=True))
+    elif args.action == 'prepare-source':
         receipt = provision_source(args.source, args.checkout, args.module_source, args.go)
         print(json.dumps({'evidenceScope': 'source-only', 'sourceReceipt': receipt,
                           'unresolvedArtifactEvidence': list(ARTIFACT_REQUIREMENTS)}, sort_keys=True))

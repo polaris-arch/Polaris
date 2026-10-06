@@ -144,7 +144,94 @@ impl OutputCapture {
     }
 }
 
+// These identities attest only this custody's admitted native Child. They carry
+// no App lifecycle generation, Go disposal claim or broader resource authority.
+#[derive(Default)]
+struct ValidationIssuerIdentity;
+struct CheckRequestIdentity;
+struct ValidationBirthIdentity;
+struct ValidationMemberIdentity;
+
+#[derive(Clone)]
+struct CheckRequestRef {
+    id: u64,
+    issuer: Arc<ValidationIssuerIdentity>,
+    identity: Arc<CheckRequestIdentity>,
+}
+
+impl CheckRequestRef {
+    fn same(&self, other: &Self) -> bool {
+        self.id == other.id
+            && Arc::ptr_eq(&self.issuer, &other.issuer)
+            && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValidationRole {
+    Validation,
+    #[cfg(all(test, unix))]
+    Foreign,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValidationScope {
+    SingleValidationNativeChildV1,
+    #[cfg(all(test, unix))]
+    Foreign,
+}
+
+#[derive(Clone)]
+struct ValidationNativeMembers {
+    request: CheckRequestRef,
+    birth: Arc<ValidationBirthIdentity>,
+    member: Arc<ValidationMemberIdentity>,
+    role: ValidationRole,
+    scope: ValidationScope,
+}
+
+impl ValidationNativeMembers {
+    fn same(&self, other: &Self) -> bool {
+        self.request.same(&other.request)
+            && Arc::ptr_eq(&self.birth, &other.birth)
+            && Arc::ptr_eq(&self.member, &other.member)
+            && self.role == ValidationRole::Validation
+            && other.role == self.role
+            && self.scope == ValidationScope::SingleValidationNativeChildV1
+            && other.scope == self.scope
+    }
+}
+
+enum NativeFactoryObservation {
+    PreFactory,
+    Entered,
+    ReturnedNoChild,
+    Attached(ValidationNativeMembers),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeExitSource {
+    PollWait,
+    TryWait,
+}
+
+#[derive(Clone)]
+struct ValidationNativeExited {
+    members: ValidationNativeMembers,
+    status: ExitStatus,
+    source: NativeExitSource,
+}
+
+struct ValidatedCheckNativeExit(ValidationNativeExited);
+struct LocalValidationNativeTerminal {
+    _native_exit: ValidationNativeExited,
+}
+
 struct CheckRun {
+    request: CheckRequestRef,
+    factory: NativeFactoryObservation,
+    native_exited: Option<ValidationNativeExited>,
+    native_terminal: Option<LocalValidationNativeTerminal>,
     child: Option<Child>,
     snapshot: PathBuf,
     exit: Option<ExitStatus>,
@@ -154,6 +241,59 @@ struct CheckRun {
 }
 
 impl CheckRun {
+    fn cache_native_exit(
+        &mut self,
+        status: ExitStatus,
+        source: NativeExitSource,
+    ) -> io::Result<()> {
+        self.exit = Some(status);
+        let NativeFactoryObservation::Attached(members) = &self.factory else {
+            self.debt = true;
+            return Err(io::Error::other("native exit has no attached binding"));
+        };
+        self.native_exited = Some(ValidationNativeExited {
+            members: members.clone(),
+            status,
+            source,
+        });
+        Ok(())
+    }
+
+    fn validate_retirement(
+        &self,
+    ) -> Result<Option<ValidatedCheckNativeExit>, ValidationLifecycleError> {
+        if self.native_terminal.is_some() || self.lost_wait_ownership {
+            return Err(unknown("validation native ownership is unavailable"));
+        }
+        match &self.factory {
+            NativeFactoryObservation::PreFactory | NativeFactoryObservation::ReturnedNoChild
+                if self.child.is_none() && self.exit.is_none() && self.native_exited.is_none() =>
+            {
+                Ok(None) // Own snapshot cleanup, never a native terminal.
+            }
+            NativeFactoryObservation::Attached(members) => {
+                let Some(fact) = &self.native_exited else {
+                    return Err(unknown("same Child native exit has not been confirmed"));
+                };
+                if self.child.is_none()
+                    || !members.request.same(&self.request)
+                    || !members.same(&fact.members)
+                    || self.exit != Some(fact.status)
+                    || !matches!(
+                        fact.source,
+                        NativeExitSource::PollWait | NativeExitSource::TryWait
+                    )
+                {
+                    return Err(unknown("validation native exit binding does not match"));
+                }
+                // Clone before the last fallible cleanup step; tail failure retains
+                // the original Child, binding and fact for the next attempt.
+                Ok(Some(ValidatedCheckNativeExit(fact.clone())))
+            }
+            _ => Err(unknown("validation factory responsibility remains unknown")),
+        }
+    }
+
     fn record_error(&mut self, _error: &io::Error) {
         self.debt = true;
         // ECHILD is 10 on the supported Unix PC targets (Linux and Darwin).
@@ -166,6 +306,9 @@ impl CheckRun {
 
     fn poll_exit(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<ExitStatus>> {
         if let Some(exit) = self.exit {
+            if self.native_exited.is_none() {
+                return Poll::Ready(Err(io::Error::other("cached native exit has no binding")));
+            }
             return Poll::Ready(Ok(exit));
         }
         if self.lost_wait_ownership {
@@ -175,10 +318,10 @@ impl CheckRun {
             return Poll::Ready(Err(io::Error::other("validation has no born Child")));
         };
         match self.io.poll_wait(child, cx) {
-            Poll::Ready(Ok(exit)) => {
-                self.exit = Some(exit);
-                Poll::Ready(Ok(exit))
-            }
+            Poll::Ready(Ok(exit)) => Poll::Ready(
+                self.cache_native_exit(exit, NativeExitSource::PollWait)
+                    .map(|()| exit),
+            ),
             Poll::Ready(Err(error)) => {
                 self.record_error(&error);
                 Poll::Ready(Err(error))
@@ -200,8 +343,7 @@ impl CheckRun {
             .try_wait(self.child.as_mut().expect("retained Child"));
         match result {
             Ok(Some(exit)) => {
-                self.exit = Some(exit);
-                return Ok(());
+                return self.cache_native_exit(exit, NativeExitSource::TryWait);
             }
             Err(error) => {
                 self.record_error(&error);
@@ -235,11 +377,27 @@ struct CheckState {
 
 #[derive(Default)]
 struct CheckCustody {
+    issuer: Arc<ValidationIssuerIdentity>,
     state: Mutex<CheckState>,
     cleanup_gate: tokio::sync::Mutex<()>,
 }
 
 impl CheckCustody {
+    fn run_mut<'a>(
+        &self,
+        state: &'a mut CheckState,
+        request: &CheckRequestRef,
+    ) -> Result<Option<&'a mut CheckRun>, ValidationLifecycleError> {
+        if !Arc::ptr_eq(&self.issuer, &request.issuer) {
+            return Err(unknown("validation request belongs to another custody"));
+        }
+        let run = state.runs.get_mut(&request.id);
+        if run.as_ref().is_some_and(|run| !run.request.same(request)) {
+            return Err(unknown("validation request identity does not match"));
+        }
+        Ok(run)
+    }
+
     fn assert_admission(&self) -> Result<(), ValidationLifecycleError> {
         let state = self.state.lock().map_err(unknown)?;
         Self::admit(&state)
@@ -260,13 +418,20 @@ impl CheckCustody {
         Ok(())
     }
 
-    async fn wait_exit(&self, request: u64) -> Result<ExitStatus, ValidationLifecycleError> {
+    async fn wait_exit(
+        &self,
+        request: &CheckRequestRef,
+    ) -> Result<ExitStatus, ValidationLifecycleError> {
         poll_fn(|cx| {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
                 Err(error) => return Poll::Ready(Err(unknown(error))),
             };
-            let Some(run) = state.runs.get_mut(&request) else {
+            let run = match self.run_mut(&mut state, request) {
+                Ok(run) => run,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let Some(run) = run else {
                 return Poll::Ready(Err(unknown("validation birth was already retired")));
             };
             run.poll_exit(cx).map_err(unknown)
@@ -274,22 +439,20 @@ impl CheckCustody {
         .await
     }
 
-    fn request_close(&self, request: u64) -> Result<(), ValidationLifecycleError> {
+    fn request_close(&self, request: &CheckRequestRef) -> Result<(), ValidationLifecycleError> {
         let mut state = self.state.lock().map_err(unknown)?;
-        let Some(run) = state.runs.get_mut(&request) else {
+        let Some(run) = self.run_mut(&mut state, request)? else {
             return Ok(()); // the exact request has already retired; never address a replacement
         };
         run.request_close().map_err(unknown)
     }
 
-    fn retire(&self, request: u64) -> Result<(), ValidationLifecycleError> {
+    fn retire(&self, request: &CheckRequestRef) -> Result<(), ValidationLifecycleError> {
         let mut state = self.state.lock().map_err(unknown)?;
-        let Some(run) = state.runs.get_mut(&request) else {
+        let Some(run) = self.run_mut(&mut state, request)? else {
             return Ok(());
         };
-        if run.child.is_some() && run.exit.is_none() {
-            return Err(unknown("same Child native exit has not been confirmed"));
-        }
+        let validated = run.validate_retirement()?;
         match std::fs::remove_file(&run.snapshot) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -298,19 +461,25 @@ impl CheckCustody {
                 return Err(unknown(error));
             }
         }
-        state.runs.remove(&request);
+        // Snapshot removal above is the LAST fallible step. No new lookup, lock,
+        // validation or allocation follows it; commit only this exact run.
+        run.native_terminal = validated.map(|validated| LocalValidationNativeTerminal {
+            _native_exit: validated.0,
+        });
+        state.runs.remove(&request.id);
         Ok(())
     }
 
-    async fn close_confirmed(&self, request: u64) -> Result<(), ValidationLifecycleError> {
+    async fn close_confirmed(
+        &self,
+        request: &CheckRequestRef,
+    ) -> Result<(), ValidationLifecycleError> {
         self.request_close(request)?;
-        let born = self
-            .state
-            .lock()
-            .map_err(unknown)?
-            .runs
-            .get(&request)
-            .is_some_and(|run| run.child.is_some());
+        let born = {
+            let mut state = self.state.lock().map_err(unknown)?;
+            self.run_mut(&mut state, request)?
+                .is_some_and(|run| run.child.is_some())
+        };
         if born {
             tokio::time::timeout(CLEANUP_BUDGET, self.wait_exit(request))
                 .await
@@ -333,8 +502,8 @@ impl CheckCustody {
             .lock()
             .map_err(unknown)?
             .runs
-            .keys()
-            .copied()
+            .values()
+            .map(|run| run.request.clone())
             .collect();
         self.drain_requests(requests).await?;
         if !self.state.lock().map_err(unknown)?.runs.is_empty() {
@@ -359,9 +528,9 @@ impl CheckCustody {
             state.settling = true;
             state
                 .runs
-                .iter()
-                .filter(|(_, run)| run.debt)
-                .map(|(id, _)| *id)
+                .values()
+                .filter(|run| run.debt)
+                .map(|run| run.request.clone())
                 .collect()
         };
         let booking = SettlementBooking(self);
@@ -370,16 +539,19 @@ impl CheckCustody {
         self.assert_admission()
     }
 
-    async fn drain_requests(&self, requests: Vec<u64>) -> Result<(), ValidationLifecycleError> {
+    async fn drain_requests(
+        &self,
+        requests: Vec<CheckRequestRef>,
+    ) -> Result<(), ValidationLifecycleError> {
         let mut errors = Vec::new();
         // Request all closes before the first wait, even when one native wait is lost.
         for request in &requests {
-            if let Err(error) = self.request_close(*request) {
+            if let Err(error) = self.request_close(request) {
                 errors.push(error.to_string());
             }
         }
         for request in requests {
-            if let Err(error) = self.close_confirmed(request).await {
+            if let Err(error) = self.close_confirmed(&request).await {
                 errors.push(error.to_string());
             }
         }
@@ -395,21 +567,24 @@ impl CheckCustody {
         binary: &Path,
         config: &Path,
         io: Arc<dyn CheckIo>,
-    ) -> Result<Result<(u64, Arc<OutputCapture>), String>, ValidationLifecycleError> {
+    ) -> Result<Result<(CheckRequestRef, Arc<OutputCapture>), String>, ValidationLifecycleError>
+    {
         // Closing, copy, synchronous spawn and publication share one admission lock.
         // No cancel point can expose a born but unregistered Child.
         let mut state = self.state.lock().map_err(unknown)?;
         Self::admit(&state)?;
-        let request = NEXT_REQUEST.fetch_add(1, Ordering::SeqCst);
+        let id = NEXT_REQUEST.fetch_add(1, Ordering::SeqCst);
+        let request = CheckRequestRef {
+            id,
+            issuer: Arc::clone(&self.issuer),
+            identity: Arc::new(CheckRequestIdentity),
+        };
         let parent = config
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let name = config.file_name().unwrap_or_default().to_string_lossy();
-        let snapshot = parent.join(format!(
-            ".polaris-check-{}-{request}-{name}",
-            std::process::id()
-        ));
+        let snapshot = parent.join(format!(".polaris-check-{}-{id}-{name}", std::process::id()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -421,7 +596,11 @@ impl CheckCustody {
             Ok(file) => file,
             Err(error) => return Ok(Err(error.to_string())),
         };
-        let mut run = CheckRun {
+        let run = CheckRun {
+            request: request.clone(),
+            factory: NativeFactoryObservation::PreFactory,
+            native_exited: None,
+            native_terminal: None,
             child: None,
             snapshot: snapshot.clone(),
             exit: None,
@@ -429,14 +608,17 @@ impl CheckCustody {
             lost_wait_ownership: false,
             io,
         };
+        // Retain the original admission before entering the synchronous factory.
+        // A panic/unreturned factory cannot become no-child from an empty slot.
+        state.runs.insert(id, run);
+        let run = state.runs.get_mut(&id).expect("admitted validation run");
         let copied =
             File::open(config).and_then(|mut source| io::copy(&mut source, &mut destination));
         drop(destination);
         if let Err(error) = copied {
             run.debt = true;
-            state.runs.insert(request, run);
             drop(state);
-            self.retire(request)?;
+            self.retire(&request)?;
             return Ok(Err(error.to_string()));
         }
         let mut builder = tokio::process::Command::new(binary);
@@ -450,20 +632,28 @@ impl CheckCustody {
             .stderr(std::process::Stdio::piped());
         #[cfg(windows)]
         builder.creation_flags(0x0800_0000);
-        let mut child = match builder.spawn() {
+        run.factory = NativeFactoryObservation::Entered;
+        let child = match builder.spawn() {
             Ok(child) => child,
             Err(error) => {
                 run.debt = true;
-                state.runs.insert(request, run);
+                run.factory = NativeFactoryObservation::ReturnedNoChild;
                 drop(state);
-                self.retire(request)?;
+                self.retire(&request)?;
                 return Ok(Err(error.to_string()));
             }
         };
+        run.child = Some(child);
+        run.factory = NativeFactoryObservation::Attached(ValidationNativeMembers {
+            request: request.clone(),
+            birth: Arc::new(ValidationBirthIdentity),
+            member: Arc::new(ValidationMemberIdentity),
+            role: ValidationRole::Validation,
+            scope: ValidationScope::SingleValidationNativeChildV1,
+        });
+        let child = run.child.as_mut().expect("attached validation Child");
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        run.child = Some(child);
-        state.runs.insert(request, run);
         let output = Arc::new(OutputCapture::default());
         output.read(stdout, false);
         output.read(stderr, true);
@@ -483,22 +673,22 @@ impl CheckCustody {
         };
         let mut booking = CheckBooking {
             custody: Arc::clone(self),
-            request,
+            request: request.clone(),
             active: true,
         };
         let wait = async {
-            let exit = self.wait_exit(request).await?;
+            let exit = self.wait_exit(&request).await?;
             output.finished().await;
             Ok::<_, ValidationLifecycleError>(output.result(exit.success()))
         };
         let raw = match tokio::time::timeout(timeout, wait).await {
             Ok(Ok(raw)) => {
-                self.retire(request)?;
+                self.retire(&request)?;
                 raw
             }
             Ok(Err(error)) => return Err(error),
             Err(_) => {
-                self.close_confirmed(request).await?;
+                self.close_confirmed(&request).await?;
                 RawCheck::TimedOut {
                     after_secs: timeout.as_secs_f32(),
                 }
@@ -511,7 +701,7 @@ impl CheckCustody {
 
 struct CheckBooking {
     custody: Arc<CheckCustody>,
-    request: u64,
+    request: CheckRequestRef,
     active: bool,
 }
 
@@ -526,7 +716,7 @@ impl Drop for SettlementBooking<'_> {
 impl Drop for CheckBooking {
     fn drop(&mut self) {
         if self.active {
-            let _ = self.custody.request_close(self.request);
+            let _ = self.custody.request_close(&self.request);
         }
     }
 }
