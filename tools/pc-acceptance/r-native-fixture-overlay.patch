@@ -1,0 +1,43 @@
+diff --git a/route_native_receipt_linux_test.go b/route_native_receipt_linux_test.go
+--- a/route_native_receipt_linux_test.go
++++ b/route_native_receipt_linux_test.go
+@@ -697,10 +697,13 @@
+ 	return nil
+ }
+ 
+-func rNativeLauncherBinding(rNativeCase) (*rNativeLauncherInputs, error) {
+-	// One finite seam for G to bind after its FD graph/profile review. An env
+-	// variable or a source-profile executionReady flag cannot activate it.
+-	return nil, errRNativeGSeamPending
++func rNativeLauncherBinding(c rNativeCase) (*rNativeLauncherInputs, error) {
++	// Direct callers retain the same deny-before-FD boundary as rNativeRunGroup.
++	// G's source/profile admission remains with the original launcher.
++	if err := rNativeAdmission(os.Getenv("POLARIS_NO_KERNEL_RUN"), os.Getenv("POLARIS_R_NATIVE_RUN"), nil); err != nil {
++		return nil, err
++	}
++	return rNativeConsumeFixedFDGraph(c)
+ }
+ 
+ func rNativeConsumeFixedFDGraph(c rNativeCase) (*rNativeLauncherInputs, error) {
+@@ -1330,9 +1333,18 @@
+ 	if !errors.Is(rNativeAdmission("", "1", errRNativeGSeamPending), errRNativeGSeamPending) {
+ 		t.Fatal("G seam absence washed")
+ 	}
+-	// Binding itself performs no FD reads or effects; opt-in cannot issue it.
+-	if input, err := rNativeLauncherBinding(rNativeCase{}); input != nil || !errors.Is(err, errRNativeGSeamPending) {
+-		t.Fatal("unissued launcher activated")
++	// The direct binding rejects before it can consume any inherited FD.
++	t.Setenv("POLARIS_R_NATIVE_RUN", "1")
++	for _, deny := range []string{"1", "0"} {
++		t.Setenv("POLARIS_NO_KERNEL_RUN", deny)
++		if input, err := rNativeLauncherBinding(rNativeCase{}); input != nil || err == nil || !strings.Contains(err.Error(), "NO_KERNEL_RUN") {
++			t.Fatal("direct binding consumed FDs despite the deny marker")
++		}
++	}
++	t.Setenv("POLARIS_NO_KERNEL_RUN", "")
++	t.Setenv("POLARIS_R_NATIVE_RUN", "")
++	if input, err := rNativeLauncherBinding(rNativeCase{}); input != nil || err == nil || !strings.Contains(err.Error(), "opt-in") {
++		t.Fatal("direct binding consumed FDs without explicit opt-in")
+ 	}
+ }
+ 

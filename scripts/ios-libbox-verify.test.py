@@ -374,6 +374,19 @@ def preflight_tests():
         archive_checker.verify_archive(missing, historical=True)
     assert 'Historical structure-only' in output.getvalue() and 'final source/linkage' in output.getvalue()
     count += 1
+    # Only the explicit observer action dispatches C2; normal admission never probes tools.
+    with mock.patch.object(builder, 'observe_source', return_value={
+            'evidenceScope': 'C2-source-observations-only', 'status': 'mock-only', 'C3Required': ['actual source carrier']}) as observed, \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')), redirect_stdout(io.StringIO()) as output:
+        builder.main(['observe-source', '/prepared', '--source-receipt', '/receipt', '--go', '/go',
+                      '--mobile-bin', '/mobile', '--developer-dir', '/developer', '--evidence-dir', '/evidence'])
+        assert observed.call_count == 1 and json.loads(output.getvalue())['carrierAdmission'] is False
+    count += 1
+    with mock.patch.object(builder, 'observe_source', side_effect=AssertionError('observer reached')), \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')), redirect_stdout(io.StringIO()) as output:
+        builder.main(['check-inputs'])
+        assert 'source-inputs-only' in output.getvalue()
+    count += 1
     print(f'{count} source-admission/producer/structure unit cases passed; no Framework or App built.')
 
 

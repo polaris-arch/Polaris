@@ -8,8 +8,8 @@ import { classifyImpact } from './classify-ci-impact.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-function runSuite(script, args, summary, minimum) {
-  const result = spawnSync('python3', ['-B', script, ...args], {
+function runSuite(script, args, summary, minimum, optimized = false) {
+  const result = spawnSync('python3', [...(optimized ? ['-O', '-B'] : ['-B']), script, ...args], {
     cwd: root,
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', POLARIS_NO_KERNEL_RUN: '1' },
     encoding: 'utf8',
@@ -25,10 +25,11 @@ function runSuite(script, args, summary, minimum) {
 
 test('Apple source admission keeps its existing pure predicates in the host CI gate', () => {
   runSuite('scripts/ios-libbox-verify.test.py', ['--preflight-only'],
-    /^(\d+) source-admission\/producer\/structure unit cases passed; no Framework or App built\.$/m, 475);
+    /^(\d+) source-admission\/producer\/structure unit cases passed; no Framework or App built\.$/m, 477);
   const impact = classifyImpact([
     'scripts/ios-libbox.py', 'scripts/ios-libbox-verify.test.py',
     'scripts/apple-carrier.py', 'scripts/apple-carrier.test.py',
+    'scripts/apple-source-inputs.py', 'scripts/apple-source-inputs.test.py',
     'scripts/apple-source-unit.test.mjs',
   ]);
   assert.equal(impact.kernel, false);
@@ -36,6 +37,16 @@ test('Apple source admission keeps its existing pure predicates in the host CI g
   assert.equal(impact.hasPackage, false);
   assert.deepEqual(impact.platforms, []);
   assert.deepEqual(impact.unregisteredScopes, []);
+});
+
+test('Apple C2 source observations exercise finite pure tool, graph and header rejection gates', () => {
+  runSuite('scripts/apple-source-inputs.test.py', [],
+    /^(\d+) Apple source input unit cases passed; no compiler, Framework or App built\.$/m, 186);
+});
+
+test('Apple C2 source predicates retain every pure counterexample with Python optimization', () => {
+  runSuite('scripts/apple-source-inputs.test.py', [],
+    /^(\d+) Apple source input unit cases passed; no compiler, Framework or App built\.$/m, 186, true);
 });
 
 test('Apple carrier predicates execute nonempty pure format and provenance counterexamples', () => {
