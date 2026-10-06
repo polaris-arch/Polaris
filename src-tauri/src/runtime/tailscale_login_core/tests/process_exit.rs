@@ -21,6 +21,10 @@ async fn legacy_void_methods_and_missing_pid_cannot_attest_cleanup() {
     let mut child = UnprovenChild(terminations.clone());
     assert!(child.wait_result().await.is_err());
     assert!(child.after_exit().await.is_err());
+    assert!(
+        child.native_exit().is_none(),
+        "unbound login cannot issue a temp native fact"
+    );
     assert!(child.close_confirmed().await.is_err());
     assert_eq!(terminations.load(Ordering::SeqCst), 1);
     assert!(child.close_confirmed().await.is_err());
@@ -419,6 +423,8 @@ async fn pc_child_requires_native_wait_even_when_pid_is_absent_and_repeated_clos
         child: Some(child),
         reaped: false,
         wait_identity_lost: false,
+        native_attachment: None,
+        native_exit: None,
     };
     assert!(child.after_exit().await.is_err());
     // Simulate a prior caller of native Child::wait without this wrapper's receipt.
@@ -434,6 +440,7 @@ async fn pc_child_requires_native_wait_even_when_pid_is_absent_and_repeated_clos
     child.after_exit().await.unwrap();
     child.close_confirmed().await.unwrap();
     child.wait_result().await.unwrap();
+    assert!(child.native_exit().is_none());
 }
 
 #[cfg(unix)]
@@ -455,6 +462,8 @@ async fn dropping_native_close_future_keeps_the_child_and_never_mints_an_exit_re
         child: Some(process),
         reaped: false,
         wait_identity_lost: false,
+        native_attachment: None,
+        native_exit: None,
     };
     let mut close = child.close_confirmed();
     assert!(
@@ -464,11 +473,13 @@ async fn dropping_native_close_future_keeps_the_child_and_never_mints_an_exit_re
     );
     drop(close);
     assert!(!child.reaped);
+    assert!(child.native_exit().is_none());
     assert!(child.after_exit().await.is_err());
     assert!(child.child.as_mut().unwrap().try_wait().unwrap().is_none());
     child.child.as_mut().unwrap().start_kill().unwrap();
     child.wait_result().await.unwrap();
     child.after_exit().await.unwrap();
+    assert!(child.native_exit().is_none());
 }
 
 #[cfg(unix)]
@@ -483,6 +494,8 @@ async fn native_echild_is_an_error_and_permanently_quarantines_the_numeric_wait_
         child: Some(process),
         reaped: false,
         wait_identity_lost: false,
+        native_attachment: None,
+        native_exit: None,
     };
     // Existing nix safely reaps this exact stand-in outside Tokio. Its own native wait must
     // now return ECHILD; no mock can make a swallowed OS error turn this regression green.
@@ -498,6 +511,7 @@ async fn native_echild_is_an_error_and_permanently_quarantines_the_numeric_wait_
     assert!(child.wait_result().await.is_err());
     assert!(!child.reaped);
     assert!(child.wait_identity_lost);
+    assert!(child.native_exit().is_none());
     assert!(child.after_exit().await.is_err());
     assert!(child.close_confirmed().await.is_err());
     assert!(
@@ -507,4 +521,41 @@ async fn native_echild_is_an_error_and_permanently_quarantines_the_numeric_wait_
     // Drop quarantines this invalid native wait handle; it may neither signal the old PID
     // nor hand it to Tokio's orphan queue for another waitpid after PID reuse.
     drop(child);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_tokio_factory_drains_both_streams_without_a_temp_native_fact() {
+    use tokio::io::AsyncReadExt;
+
+    let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("crates/core-supervisor/src/config_gate/check_custody/tests/fixtures/exit-seven.sh");
+    let (drained, drainage) = tokio::sync::oneshot::channel();
+    let req = SpawnRequest::new(
+        binary,
+        PathBuf::from("owned-stand-in-unused-config.json"),
+        StdioPolicy::drain(move |mut stdout, mut stderr| {
+            tokio::spawn(async move {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let result =
+                    tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err),);
+                drained.send(result).unwrap();
+            });
+        }),
+    );
+    let mut child = TokioLoginCoreSpawner.spawn(req).await.unwrap();
+    assert!(child.native_exit().is_none());
+    child.wait_result().await.unwrap();
+    child.after_exit().await.unwrap();
+    child.close_confirmed().await.unwrap();
+    assert!(child.native_exit().is_none());
+    let (stdout, stderr) = tokio::time::timeout(LOGIN_REAP_TIMEOUT, drainage)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stdout.unwrap(), 0);
+    assert_eq!(stderr.unwrap(), 0);
 }

@@ -31,8 +31,10 @@ test('Apple source admission keeps its existing pure predicates in the host CI g
     'scripts/apple-carrier.py', 'scripts/apple-carrier.test.py',
     'scripts/apple-source-inputs.py', 'scripts/apple-source-inputs.test.py',
     'scripts/apple-source-unit.test.mjs',
+    'scripts/apple-component.py', 'scripts/apple-component.test.py',
   ]);
   assert.equal(impact.kernel, false);
+  assert.equal(impact.preflight, false);
   assert.equal(impact.android, false);
   assert.equal(impact.hasPackage, false);
   assert.deepEqual(impact.platforms, []);
@@ -52,4 +54,15 @@ test('Apple C2 source predicates retain every pure counterexample with Python op
 test('Apple carrier predicates execute nonempty pure format and provenance counterexamples', () => {
   runSuite('scripts/apple-carrier.test.py', [],
     /^(\d+) Apple carrier unit cases passed; no Framework or App built\.$/m, 170);
+});
+
+
+test('Apple C3 component/compiler and publication predicates execute finite pure failure gates', () => {
+  runSuite('scripts/apple-component.test.py', [],
+    /^(\d+) Apple component unit cases passed; no compiler, Framework or App built\.$/m, 359);
+});
+
+test('Apple C3 component predicates retain counterexamples under Python optimization', () => {
+  runSuite('scripts/apple-component.test.py', [],
+    /^(\d+) Apple component unit cases passed; no compiler, Framework or App built\.$/m, 359, true);
 });
